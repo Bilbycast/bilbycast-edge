@@ -76,6 +76,15 @@ pub struct CatalogStream {
     /// code (and the future PID-bus assembler) simple to author
     /// without re-implementing the stream_type table.
     pub kind: CatalogStreamKind,
+    /// Raw ES_info descriptor bytes from the source PMT, hex-encoded
+    /// (empty when the loop was empty). 0x06 private-PES streams are
+    /// unidentifiable without these — the DVB AC-3 / E-AC-3 / AAC /
+    /// teletext / subtitling descriptors are the only codec signal —
+    /// so they drive descriptor-aware `kind` classification here and
+    /// are copied through onto assembled-output PMTs so downstream
+    /// receivers can bind a decoder to the ES.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub descriptors_hex: String,
 }
 
 /// Broad categorisation of an ES. Same distinction the PID-bus
@@ -120,6 +129,67 @@ fn classify_stream_type(stream_type: u8) -> (&'static str, CatalogStreamKind) {
     }
 }
 
+/// Descriptor-aware classification. For `stream_type 0x06` (PES private)
+/// the bare stream_type table can only say "data" — the real identity
+/// lives in the ES_info descriptor loop (DVB AC-3 0x6A, E-AC-3 0x7A,
+/// DTS 0x7B, AAC 0x7C, registration 0x05, AC-4 via 0x7F/0x15, teletext
+/// 0x56, subtitling 0x59). Without this, descriptor-tagged DVB audio
+/// catalogues as `kind: data` and every kind-matched bus operation
+/// (switcher Take → bus_route, matrix Swap) skips the audio slot.
+/// Text services are checked FIRST so a teletext/subtitle ES can never
+/// classify as audio (mirrors the pid_overrides binder discipline).
+fn classify_stream(stream_type: u8, descriptors: &[u8]) -> (String, CatalogStreamKind) {
+    use crate::engine::ts_parse::{
+        descriptor_audio_kind, descriptors_indicate_text_service, PrivateEsAudioKind,
+    };
+    if stream_type == 0x06 && !descriptors.is_empty() {
+        if descriptors_indicate_text_service(descriptors) {
+            return ("DVB text (teletext/subtitles)".to_string(), CatalogStreamKind::Subtitle);
+        }
+        if let Some(kind) = descriptor_audio_kind(descriptors) {
+            let name = match kind {
+                PrivateEsAudioKind::Ac3 => "AC-3 (DVB)",
+                PrivateEsAudioKind::Eac3 => "E-AC-3 (DVB)",
+                PrivateEsAudioKind::AacLatm => "AAC-LATM (DVB)",
+                PrivateEsAudioKind::Dts => "DTS (DVB)",
+                PrivateEsAudioKind::Opus => "Opus (DVB)",
+                PrivateEsAudioKind::Smpte302m => "SMPTE 302M",
+                PrivateEsAudioKind::Ac4 => "AC-4 (DVB)",
+            };
+            return (name.to_string(), CatalogStreamKind::Audio);
+        }
+    }
+    let (name, kind) = classify_stream_type(stream_type);
+    (name.to_string(), kind)
+}
+
+/// Minimal hex codec for `CatalogStream::descriptors_hex` — avoids a new
+/// crate dependency for a field that is a few dozen bytes per ES.
+pub fn hex_encode(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        use std::fmt::Write;
+        let _ = write!(s, "{b:02x}");
+    }
+    s
+}
+
+/// Tolerant inverse of [`hex_encode`] — odd-length or non-hex input
+/// yields `None` (callers treat that as "no descriptors").
+pub fn hex_decode(s: &str) -> Option<Vec<u8>> {
+    if s.len() % 2 != 0 {
+        return None;
+    }
+    let mut out = Vec::with_capacity(s.len() / 2);
+    let bytes = s.as_bytes();
+    for pair in bytes.chunks_exact(2) {
+        let hi = (pair[0] as char).to_digit(16)?;
+        let lo = (pair[1] as char).to_digit(16)?;
+        out.push(((hi << 4) | lo) as u8);
+    }
+    Some(out)
+}
+
 /// Per-input store. Cloneable and cheap to read on the stats snapshot
 /// path. Writes happen only on PAT/PMT version bumps.
 #[derive(Default)]
@@ -129,6 +199,16 @@ pub struct PsiCatalogStore {
     /// Monotonic tick bumped on every catalog update — lets the stats
     /// layer decide whether to re-serialise.
     update_counter: AtomicU64,
+}
+
+impl std::fmt::Debug for PsiCatalogStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Stores ride inside `PlanCommand` (Debug-derived); dumping the
+        // whole catalogue would spam logs — the tick identifies state.
+        f.debug_struct("PsiCatalogStore")
+            .field("tick", &self.tick())
+            .finish_non_exhaustive()
+    }
 }
 
 impl PsiCatalogStore {
@@ -424,7 +504,7 @@ fn complete_pmt_section(
 fn apply_parsed_pmt(
     version: u8,
     pcr_pid: u16,
-    streams: Vec<(u8, u16)>,
+    streams: Vec<(u8, u16, Vec<u8>)>,
     pmt_pid: u16,
     state: &mut ObserverState,
     store: &PsiCatalogStore,
@@ -446,13 +526,14 @@ fn apply_parsed_pmt(
     };
     slot.streams = streams
         .into_iter()
-        .map(|(stream_type, pid)| {
-            let (codec, kind) = classify_stream_type(stream_type);
+        .map(|(stream_type, pid, descriptors)| {
+            let (codec, kind) = classify_stream(stream_type, &descriptors);
             CatalogStream {
                 pid,
                 stream_type,
-                codec: codec.to_string(),
+                codec,
                 kind,
+                descriptors_hex: hex_encode(&descriptors),
             }
         })
         .collect();
@@ -485,8 +566,9 @@ fn read_pat_header(pkt: &[u8]) -> Option<(u8, u16)> {
 }
 
 /// Parse a complete PMT section (bytes from `table_id`, any length up to
-/// the 4096-byte section cap) into `(version, pcr_pid, streams)`.
-fn parse_pmt_from_section(sec: &[u8]) -> Option<(u8, u16, Vec<(u8, u16)>)> {
+/// the 4096-byte section cap) into `(version, pcr_pid, streams)` where
+/// each stream entry is `(stream_type, pid, es_info_descriptor_bytes)`.
+fn parse_pmt_from_section(sec: &[u8]) -> Option<(u8, u16, Vec<(u8, u16, Vec<u8>)>)> {
     if sec.len() < 16 || sec[0] != 0x02 {
         return None;
     }
@@ -504,7 +586,12 @@ fn parse_pmt_from_section(sec: &[u8]) -> Option<(u8, u16, Vec<(u8, u16)>)> {
         let stream_type = sec[pos];
         let pid = ((sec[pos + 1] as u16 & 0x1F) << 8) | sec[pos + 2] as u16;
         let es_info_length = (((sec[pos + 3] & 0x0F) as usize) << 8) | (sec[pos + 4] as usize);
-        streams.push((stream_type, pid));
+        // Clamp the descriptor slice to the section body — a corrupt
+        // es_info_length must not read into the CRC or past the buffer.
+        let es_start = pos + 5;
+        let es_end = (es_start + es_info_length).min(data_end);
+        let descriptors = sec.get(es_start..es_end).map(|s| s.to_vec()).unwrap_or_default();
+        streams.push((stream_type, pid, descriptors));
         pos += 5 + es_info_length;
     }
     Some((version, pcr_pid, streams))
@@ -775,5 +862,123 @@ mod tests {
         let cat = store.load().expect("catalog present");
         assert_eq!(cat.programs.len(), 1);
         assert_eq!(cat.programs[0].program_number, 1);
+    }
+
+    // ── descriptor-aware 0x06 classification ───────────────────────────
+
+    /// Build a raw PMT section (not a TS packet) with per-ES descriptor
+    /// loops, CRC appended, for `parse_pmt_from_section`.
+    fn build_pmt_section(streams: &[(u8, u16, &[u8])], pcr_pid: u16, version: u8) -> Vec<u8> {
+        let es_total: usize = streams.iter().map(|(_, _, d)| 5 + d.len()).sum();
+        let section_length = 9 + es_total + 4;
+        let mut sec = Vec::new();
+        sec.push(0x02);
+        sec.push(0xB0 | (((section_length >> 8) as u8) & 0x0F));
+        sec.push((section_length & 0xFF) as u8);
+        sec.extend_from_slice(&[0x00, 0x01]); // program_number
+        sec.push(0xC1 | ((version & 0x1F) << 1));
+        sec.extend_from_slice(&[0x00, 0x00]); // section/last_section
+        sec.push(0xE0 | (((pcr_pid >> 8) as u8) & 0x1F));
+        sec.push((pcr_pid & 0xFF) as u8);
+        sec.extend_from_slice(&[0xF0, 0x00]); // program_info_length = 0
+        for (st, pid, desc) in streams {
+            sec.push(*st);
+            sec.push(0xE0 | (((pid >> 8) as u8) & 0x1F));
+            sec.push((pid & 0xFF) as u8);
+            sec.push(0xF0 | (((desc.len() >> 8) as u8) & 0x0F));
+            sec.push((desc.len() & 0xFF) as u8);
+            sec.extend_from_slice(desc);
+        }
+        let crc = mpeg2_crc32(&sec);
+        sec.extend_from_slice(&crc.to_be_bytes());
+        sec
+    }
+
+    #[test]
+    fn parse_pmt_section_captures_es_descriptors() {
+        let ac3_desc: &[u8] = &[0x6A, 0x01, 0x00]; // DVB AC-3 descriptor
+        let sec = build_pmt_section(&[(0x1B, 0x101, &[]), (0x06, 0x102, ac3_desc)], 0x101, 3);
+        let (version, pcr_pid, streams) = parse_pmt_from_section(&sec).expect("parses");
+        assert_eq!(version, 3);
+        assert_eq!(pcr_pid, 0x101);
+        assert_eq!(streams.len(), 2);
+        assert_eq!(streams[0], (0x1B, 0x101, vec![]));
+        assert_eq!(streams[1], (0x06, 0x102, ac3_desc.to_vec()));
+    }
+
+    #[test]
+    fn classify_0x06_descriptor_audio_as_audio() {
+        let (codec, kind) = classify_stream(0x06, &[0x6A, 0x00]);
+        assert_eq!(kind, CatalogStreamKind::Audio);
+        assert_eq!(codec, "AC-3 (DVB)");
+        let (codec, kind) = classify_stream(0x06, &[0x7A, 0x00]);
+        assert_eq!(kind, CatalogStreamKind::Audio);
+        assert_eq!(codec, "E-AC-3 (DVB)");
+        let (codec, kind) = classify_stream(0x06, &[0x7C, 0x00]);
+        assert_eq!(kind, CatalogStreamKind::Audio);
+        assert_eq!(codec, "AAC-LATM (DVB)");
+    }
+
+    #[test]
+    fn classify_0x06_text_service_wins_over_audio() {
+        // Teletext tag present → Subtitle even if an audio tag follows.
+        let (_, kind) = classify_stream(0x06, &[0x56, 0x00, 0x6A, 0x00]);
+        assert_eq!(kind, CatalogStreamKind::Subtitle);
+        // Subtitling descriptor.
+        let (_, kind) = classify_stream(0x06, &[0x59, 0x00]);
+        assert_eq!(kind, CatalogStreamKind::Subtitle);
+    }
+
+    #[test]
+    fn classify_0x06_bare_stays_data() {
+        let (codec, kind) = classify_stream(0x06, &[]);
+        assert_eq!(kind, CatalogStreamKind::Data);
+        assert_eq!(codec, "PES private");
+        // Unrecognised descriptor → still data.
+        let (_, kind) = classify_stream(0x06, &[0x0A, 0x04, 0x65, 0x6E, 0x67, 0x00]);
+        assert_eq!(kind, CatalogStreamKind::Data);
+    }
+
+    #[test]
+    fn hex_codec_round_trips() {
+        let bytes = [0x6A, 0x01, 0xFF, 0x00];
+        let s = hex_encode(&bytes);
+        assert_eq!(s, "6a01ff00");
+        assert_eq!(hex_decode(&s).as_deref(), Some(&bytes[..]));
+        assert_eq!(hex_decode("zz"), None);
+        assert_eq!(hex_decode("abc"), None);
+    }
+
+    #[test]
+    fn end_to_end_0x06_audio_lands_in_catalogue_with_kind_audio() {
+        // Full observer path: PAT + single-packet PMT carrying a 0x06 ES
+        // with a DVB AC-3 descriptor. This is the Ten.ts shape that made
+        // the input invisible to kind-matched bus routing.
+        let mut state = ObserverState::default();
+        let store = PsiCatalogStore::new();
+        let ac3: &[u8] = &[0x6A, 0x00];
+        let none: &[u8] = &[];
+        let sec = build_pmt_section(&[(0x1B, 0x100, none), (0x06, 0x101, ac3)], 0x100, 0);
+        // Wrap the section into one TS packet on PMT PID 0x20.
+        let mut pkt = [0xFFu8; TS_PACKET_SIZE];
+        pkt[0] = TS_SYNC_BYTE;
+        pkt[1] = 0x40 | 0x00;
+        pkt[2] = 0x20;
+        pkt[3] = 0x10;
+        pkt[4] = 0x00; // pointer
+        pkt[5..5 + sec.len()].copy_from_slice(&sec);
+
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&build_pat(&[(1, 0x20)], 0));
+        buf.extend_from_slice(&pkt);
+        drive(&mut state, &store, &buf);
+
+        let cat = store.load().expect("catalog present");
+        let streams = &cat.programs[0].streams;
+        assert_eq!(streams.len(), 2);
+        assert_eq!(streams[1].stream_type, 0x06);
+        assert_eq!(streams[1].kind, CatalogStreamKind::Audio);
+        assert_eq!(streams[1].codec, "AC-3 (DVB)");
+        assert_eq!(streams[1].descriptors_hex, "6a00");
     }
 }

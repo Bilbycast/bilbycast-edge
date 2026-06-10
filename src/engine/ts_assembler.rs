@@ -351,7 +351,25 @@ pub enum PlanCommand {
     /// fan-ins for added/changed slots, cancels fan-ins for removed
     /// slots, bumps per-program PMT versions where composition changed,
     /// and bumps PAT version when the set of programs itself changed.
-    ReplacePlan { plan: AssemblyPlan },
+    ReplacePlan {
+        plan: AssemblyPlan,
+        /// Per-swap splice request carried through from the manager's
+        /// `update_flow_assembly` command (a bus_route Swap / assembled
+        /// Take). Slot retargeting via plan replacement is inherently a
+        /// PMT-bump-style cut (old fan-in cancelled, new fan-in spawned,
+        /// PMT version bump + DI armed) — `Some(PmtBump)` and `None` are
+        /// therefore no-ops. `Some(PesAligned)` cannot be honoured on
+        /// this path (the PES splice state machine only drives
+        /// Switch-slot legs); the assembler emits a Warning
+        /// `splice_override_ignored` so the operator's request is never
+        /// silently dropped.
+        splice_mode_override: Option<crate::config::models::SpliceMode>,
+        /// Per-input PSI catalogue handles for the NEW plan's sources —
+        /// replaces the assembler's descriptor-copy-through map so swap
+        /// targets unknown at spawn time resolve their ES descriptors.
+        /// Empty in tests (descriptor-less PMTs, yesterday's shape).
+        catalogs: HashMap<String, Arc<crate::engine::ts_psi_catalog::PsiCatalogStore>>,
+    },
     /// Operator-driven switch-slot retarget. Sent by
     /// `engine::manager::FlowManager::switch_active_input` when an
     /// `ActivateInput` arrives for a flow running in assembly mode.
@@ -552,7 +570,11 @@ pub struct AssemblerHandle {
 // `EventSender`. `flow_id` is stamped on every emitted event
 // (empty in tests). `health_cell` receives the 1 Hz per-slot
 // `AssemblyHealth` snapshot for `FlowStats.assembly_health`; `None`
-// skips publication (tests / legacy callers).
+// skips publication (tests / legacy callers). `catalogs` maps each
+// member input to its live PSI catalogue store — the assembler copies
+// whitelisted source-PMT ES descriptors onto the emitted PMT per slot
+// (DVB 0x06 audio is unidentifiable downstream without them); an empty
+// map (tests / legacy callers) emits descriptor-less PMTs as before.
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_spts_assembler(
     plan: AssemblyPlan,
@@ -563,6 +585,7 @@ pub fn spawn_spts_assembler(
     flow_id: String,
     av_sync_pacer: Option<Arc<crate::engine::av_sync_mux::AvSyncPacer>>,
     health_cell: Option<Arc<AssemblyHealthCell>>,
+    catalogs: HashMap<String, Arc<crate::engine::ts_psi_catalog::PsiCatalogStore>>,
 ) -> AssemblerHandle {
     // Channel depth 16: plan updates are rare (operator-triggered), so a
     // small bounded buffer is plenty and keeps back-pressure observable
@@ -582,7 +605,7 @@ pub fn spawn_spts_assembler(
     let thread_handle = crate::engine::dedicated_runtime::spawn_dedicated(
         crate::engine::dedicated_runtime::DedicatedRuntimeConfig::new(who, "BILBYCAST_PID_BUS_CPUS"),
         async move {
-            run_assembler(plan, bus, broadcast_tx, cancel, plan_rx, event_sender, flow_id, av_sync_pacer, health_cell).await;
+            run_assembler(plan, bus, broadcast_tx, cancel, plan_rx, event_sender, flow_id, av_sync_pacer, health_cell, catalogs).await;
         },
     );
     // The original `AssemblerHandle.join` is a `tokio::task::JoinHandle<()>`.
@@ -638,6 +661,7 @@ async fn run_assembler(
     flow_id: String,
     av_sync_pacer: Option<Arc<crate::engine::av_sync_mux::AvSyncPacer>>,
     health_cell: Option<Arc<AssemblyHealthCell>>,
+    mut catalogs: HashMap<String, Arc<crate::engine::ts_psi_catalog::PsiCatalogStore>>,
 ) {
     // Muxer-mode rewriter on the assembled output. Single shared
     // anchor across every input contributing to the program — fixes
@@ -741,6 +765,16 @@ async fn run_assembler(
     let mut active_leg_input: std::collections::HashMap<(usize, u16), String> =
         std::collections::HashMap::new();
 
+    // Copy-through ES descriptors per `(program_number, out_pid)`,
+    // resolved from each slot's current source against the per-input
+    // PSI catalogues. Refreshed on plan install/replace and on every
+    // PSI tick (cheap — Arc load + small decode per slot at 10 Hz) so
+    // a catalogue that arrives after flow start, or a switch-leg flip,
+    // converges within one PSI cadence. A descriptor change bumps the
+    // owning program's PMT version like any other composition change.
+    let mut es_info_by_slot: std::collections::HashMap<(u16, u16), Vec<u8>> =
+        std::collections::HashMap::new();
+
     // Egress bundle buffer + per-out-PID CC counter + PAT/PMT CC.
     let mut buf = BytesMut::with_capacity(BUNDLE_BYTES);
     let mut cc: std::collections::HashMap<u16, u8> = std::collections::HashMap::new();
@@ -769,6 +803,7 @@ async fn run_assembler(
         &flow_id,
     );
     sync_slot_vitals(&plan, &mut slot_vitals, assembler_start);
+    let _ = refresh_slot_es_info(&plan, &catalogs, &mut es_info_by_slot, false);
 
     let mut psi_tick = interval(PSI_INTERVAL);
     psi_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -789,7 +824,7 @@ async fn run_assembler(
         &mut pmt_cc,
         &broadcast_tx,
         &mut bundle_seq,
-
+        &es_info_by_slot,
         pts_rewriter.as_mut(),
     );
 
@@ -802,7 +837,13 @@ async fn run_assembler(
             }
             Some(cmd) = plan_rx.recv() => {
                 match cmd {
-                    PlanCommand::ReplacePlan { plan: new_plan } => {
+                    PlanCommand::ReplacePlan { plan: new_plan, splice_mode_override, catalogs: new_catalogs } => {
+                        // Adopt the new plan's catalogue handles so
+                        // retargeted slots resolve descriptors from
+                        // their (possibly brand-new) sources.
+                        if !new_catalogs.is_empty() {
+                            catalogs = new_catalogs;
+                        }
                         apply_plan_replacement(
                             &mut plan,
                             new_plan,
@@ -822,6 +863,42 @@ async fn run_assembler(
                         // Drop vitals for removed slots; fresh grace
                         // anchor for hot-swapped-in ones.
                         sync_slot_vitals(&plan, &mut slot_vitals, Instant::now());
+                        // Re-resolve copy-through descriptors against the
+                        // (possibly retargeted) slot sources before the
+                        // immediate PSI push, so the swap-time PMT already
+                        // identifies the new sources' codecs. Version
+                        // bumps for changed slots happened inside
+                        // `apply_plan_replacement` (slots differ).
+                        let _ = refresh_slot_es_info(&plan, &catalogs, &mut es_info_by_slot, false);
+                        // A bus_route Swap is a plan replacement — old
+                        // fan-in cancelled, new fan-in spawned, PMT bump +
+                        // DI. `PesAligned` cannot be honoured here (the
+                        // PES splice machine only drives Switch-slot
+                        // legs); say so instead of silently dropping the
+                        // operator's request.
+                        if matches!(
+                            splice_mode_override,
+                            Some(crate::config::models::SpliceMode::PesAligned)
+                        ) {
+                            if let Some(es_) = &event_sender {
+                                es_.emit_flow_with_details(
+                                    crate::manager::events::EventSeverity::Warning,
+                                    crate::manager::events::category::FLOW,
+                                    format!(
+                                        "Flow '{flow_id}': splice override 'pes_aligned' ignored — \
+                                         this switch re-pinned slot sources (bus_route swap), which \
+                                         is inherently a PMT-bump cut. PES-aligned splicing needs a \
+                                         Switch slot with both inputs as legs."
+                                    ),
+                                    &flow_id,
+                                    serde_json::json!({
+                                        "error_code": "splice_override_ignored",
+                                        "requested_mode": "pes_aligned",
+                                        "reason": "bus_route_slot_retarget",
+                                    }),
+                                );
+                            }
+                        }
                         // Arm DI on every out_pid — the next PCR-bearing
                         // TS packet on each will carry
                         // `discontinuity_indicator = 1`. Without this,
@@ -849,7 +926,7 @@ async fn run_assembler(
                             &mut pmt_cc,
                             &broadcast_tx,
                             &mut bundle_seq,
-
+                            &es_info_by_slot,
                             pts_rewriter.as_mut(),
                         );
                     }
@@ -1059,7 +1136,7 @@ async fn run_assembler(
                                 &mut pmt_cc,
                                 &broadcast_tx,
                                 &mut bundle_seq,
-
+                                &es_info_by_slot,
                                 pts_rewriter.as_mut(),
                             );
                         }
@@ -1243,7 +1320,7 @@ async fn run_assembler(
                                     &mut pmt_cc,
                                     &broadcast_tx,
                                     &mut bundle_seq,
-
+                                    &es_info_by_slot,
                                     pts_rewriter.as_mut(),
                                 );
                                 if let Some(es_) = &event_sender {
@@ -1306,7 +1383,7 @@ async fn run_assembler(
                                     &mut pmt_cc,
                                     &broadcast_tx,
                                     &mut bundle_seq,
-
+                                    &es_info_by_slot,
                                     pts_rewriter.as_mut(),
                                 );
                                 if let Some(es_) = &event_sender {
@@ -1428,7 +1505,7 @@ async fn run_assembler(
                                     &mut pmt_cc,
                                     &broadcast_tx,
                                     &mut bundle_seq,
-
+                                    &es_info_by_slot,
                                     pts_rewriter.as_mut(),
                                 );
                                 if let Some(es_) = &event_sender {
@@ -1496,7 +1573,7 @@ async fn run_assembler(
                                     &mut pmt_cc,
                                     &broadcast_tx,
                                     &mut bundle_seq,
-
+                                    &es_info_by_slot,
                                     pts_rewriter.as_mut(),
                                 );
                                 if let Some(es_) = &event_sender {
@@ -1643,6 +1720,22 @@ async fn run_assembler(
                 }
             }
             _ = psi_tick.tick() => {
+                // Converge copy-through descriptors against catalogues
+                // that updated since the last tick (late PSI discovery
+                // on a cold-started input, source PMT change, deferred
+                // PES-splice leg commits). `keep_nonempty_on_miss` so a
+                // briefly-empty catalogue (input restart) doesn't flap
+                // the PMT version. A real change bumps the owning
+                // program's PMT version before this tick's PSI goes out.
+                for pn in refresh_slot_es_info(&plan, &catalogs, &mut es_info_by_slot, true) {
+                    if let Some(pidx) =
+                        plan.programs.iter().position(|p| p.program_number == pn)
+                    {
+                        if let Some(v) = pmt_versions.get_mut(pidx) {
+                            *v = v.wrapping_add(1) & 0x1F;
+                        }
+                    }
+                }
                 push_psi(
                     &mut buf,
                     &plan,
@@ -1653,7 +1746,7 @@ async fn run_assembler(
                     &mut pmt_cc,
                     &broadcast_tx,
                     &mut bundle_seq,
-
+                    &es_info_by_slot,
                     pts_rewriter.as_mut(),
                 );
             }
@@ -1728,7 +1821,7 @@ async fn run_assembler(
                             &mut pmt_cc,
                             &broadcast_tx,
                             &mut bundle_seq,
-
+                            &es_info_by_slot,
                             pts_rewriter.as_mut(),
                         );
                     }
@@ -2254,6 +2347,7 @@ fn push_psi(
     pmt_cc: &mut std::collections::HashMap<u16, u8>,
     broadcast_tx: &broadcast::Sender<RtpPacket>,
     bundle_seq: &mut u16,
+    es_info: &std::collections::HashMap<(u16, u16), Vec<u8>>,
     rewriter: Option<&mut crate::engine::ts_pts_rewriter::TsPtsRewriter>,
 ) {
     // PAT: one entry per program. PAT lives on PID 0x0000 with its own
@@ -2287,6 +2381,7 @@ fn push_psi(
             &prog.slots,
             pmt_version,
             *cc_entry,
+            es_info,
         );
         *cc_entry = cc_entry.wrapping_add(1) & 0x0F;
         append_ts(buf, &pmt, broadcast_tx, bundle_seq, rewriter.as_deref_mut());
@@ -2409,6 +2504,14 @@ fn build_pat(
     pkt
 }
 
+/// Largest `section_length` that keeps the whole PMT section inside one
+/// TS packet: 188 − 4 (TS header) − 1 (pointer_field) − 3 (table_id +
+/// section_length bytes) = 180. The assembler emits single-packet PMTs;
+/// copy-through descriptors that would overflow are dropped per slot
+/// (codec-identifying tags are small — overflow needs many slots with
+/// fat descriptor loops).
+const PMT_MAX_SECTION_LENGTH: usize = 180;
+
 fn build_pmt(
     program_number: u16,
     pmt_pid: u16,
@@ -2416,6 +2519,7 @@ fn build_pmt(
     slots: &[AssemblySlot],
     version: u8,
     cc: u8,
+    es_info: &std::collections::HashMap<(u16, u16), Vec<u8>>,
 ) -> [u8; TS_PACKET_SIZE] {
     let mut pkt = [0xFFu8; TS_PACKET_SIZE];
     pkt[0] = TS_SYNC_BYTE;
@@ -2423,11 +2527,30 @@ fn build_pmt(
     pkt[2] = (pmt_pid & 0xFF) as u8;
     pkt[3] = 0x10 | (cc & 0x0F);
     pkt[4] = 0x00; // pointer_field
+    // Per-slot copy-through descriptors, greedily admitted in slot order
+    // while the section still fits in one packet. A slot whose loop
+    // doesn't fit emits with es_info_length = 0 (yesterday's behaviour)
+    // rather than splitting the section.
+    let mut kept: Vec<&[u8]> = Vec::with_capacity(slots.len());
+    let mut es_total: usize = 0;
+    let base_len = 9 + 5 * slots.len() + 4;
+    for slot in slots {
+        let d = es_info
+            .get(&(program_number, slot.out_pid))
+            .map(|v| v.as_slice())
+            .unwrap_or(&[]);
+        if !d.is_empty() && d.len() <= 0x3FF && base_len + es_total + d.len() <= PMT_MAX_SECTION_LENGTH {
+            kept.push(d);
+            es_total += d.len();
+        } else {
+            kept.push(&[]);
+        }
+    }
     // Section body length (after `section_length` field):
     //   9 bytes header (program_number..program_info_length)
-    //   + 5 bytes per ES entry
+    //   + 5 bytes per ES entry + per-entry descriptor bytes
     //   + 4 bytes CRC
-    let section_length: u16 = (9 + 5 * slots.len() as u16) + 4;
+    let section_length: u16 = (base_len + es_total) as u16;
     pkt[5] = 0x02; // table_id PMT
     pkt[6] = 0xB0 | (((section_length >> 8) & 0x0F) as u8);
     pkt[7] = (section_length & 0xFF) as u8;
@@ -2441,13 +2564,14 @@ fn build_pmt(
     pkt[15] = 0xF0; // reserved + program_info_length hi (=0)
     pkt[16] = 0x00;
     let mut pos = 17;
-    for slot in slots {
+    for (slot, desc) in slots.iter().zip(kept.iter()) {
         pkt[pos] = slot.stream_type;
         pkt[pos + 1] = 0xE0 | (((slot.out_pid >> 8) as u8) & 0x1F);
         pkt[pos + 2] = (slot.out_pid & 0xFF) as u8;
-        pkt[pos + 3] = 0xF0; // reserved + es_info_length hi (=0)
-        pkt[pos + 4] = 0x00;
-        pos += 5;
+        pkt[pos + 3] = 0xF0 | (((desc.len() >> 8) as u8) & 0x0F);
+        pkt[pos + 4] = (desc.len() & 0xFF) as u8;
+        pkt[pos + 5..pos + 5 + desc.len()].copy_from_slice(desc);
+        pos += 5 + desc.len();
     }
     // CRC spans from table_id (byte 5) to just before the 4 CRC bytes.
     let crc_end = 5 + 3 + section_length as usize; // == pos + 4
@@ -2458,6 +2582,94 @@ fn build_pmt(
     pkt[pos + 2] = (crc >> 8) as u8;
     pkt[pos + 3] = crc as u8;
     pkt
+}
+
+/// Copy-through whitelist for source-PMT ES descriptors onto the
+/// assembled output. Codec identity (DVB AC-3 0x6A / E-AC-3 0x7A / DTS
+/// 0x7B / AAC 0x7C / registration 0x05 / extension 0x7F), language
+/// (ISO-639 0x0A), stream identifier (0x52), and teletext / subtitling
+/// composition (0x56 / 0x59) survive; CA and network-private tags must
+/// not ride through — the assembled mux is not the source mux.
+fn es_descriptor_whitelisted(tag: u8) -> bool {
+    matches!(
+        tag,
+        0x05 | 0x0A | 0x52 | 0x56 | 0x59 | 0x6A | 0x7A | 0x7B | 0x7C | 0x7F
+    )
+}
+
+/// Filter a raw ES_info descriptor loop through the whitelist,
+/// preserving order. Truncated loops drop the malformed tail.
+fn filter_es_descriptors(raw: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut pos = 0;
+    while pos + 2 <= raw.len() {
+        let tag = raw[pos];
+        let len = raw[pos + 1] as usize;
+        if pos + 2 + len > raw.len() {
+            break;
+        }
+        if es_descriptor_whitelisted(tag) {
+            out.extend_from_slice(&raw[pos..pos + 2 + len]);
+        }
+        pos += 2 + len;
+    }
+    out
+}
+
+/// Re-resolve every slot's copy-through ES descriptors from the
+/// per-input PSI catalogues. Keyed `(program_number, out_pid)` to match
+/// `build_pmt`'s lookup. Returns the `program_number`s whose descriptor
+/// set changed so the caller can bump those PMT versions (skipped on
+/// install / plan replacement where versions are already handled).
+///
+/// `keep_nonempty_on_miss`: when the slot's source has no catalogue
+/// entry *right now* (input restarting, catalogue not yet observed),
+/// keep the previously-resolved bytes instead of flapping to empty —
+/// used by the periodic tick. Plan-change callers pass `false` so a
+/// retargeted slot never inherits the old source's descriptors.
+fn refresh_slot_es_info(
+    plan: &AssemblyPlan,
+    catalogs: &HashMap<String, Arc<crate::engine::ts_psi_catalog::PsiCatalogStore>>,
+    es_info: &mut std::collections::HashMap<(u16, u16), Vec<u8>>,
+    keep_nonempty_on_miss: bool,
+) -> Vec<u16> {
+    let mut changed: Vec<u16> = Vec::new();
+    let mut next: std::collections::HashMap<(u16, u16), Vec<u8>> =
+        std::collections::HashMap::with_capacity(es_info.len());
+    for prog in &plan.programs {
+        for slot in &prog.slots {
+            let key = (prog.program_number, slot.out_pid);
+            // `Some(bytes)` = source ES found in its catalogue (bytes may
+            // legitimately be empty); `None` = no catalogue / ES missing.
+            let resolved: Option<Vec<u8>> = catalogs
+                .get(&slot.source.0)
+                .and_then(|store| store.load())
+                .and_then(|cat| {
+                    cat.programs
+                        .iter()
+                        .flat_map(|p| p.streams.iter())
+                        .find(|s| s.pid == slot.source.1)
+                        .map(|s| {
+                            crate::engine::ts_psi_catalog::hex_decode(&s.descriptors_hex)
+                                .unwrap_or_default()
+                        })
+                })
+                .map(|raw| filter_es_descriptors(&raw));
+            let bytes = match resolved {
+                Some(b) => b,
+                None if keep_nonempty_on_miss => {
+                    es_info.get(&key).cloned().unwrap_or_default()
+                }
+                None => Vec::new(),
+            };
+            if es_info.get(&key) != Some(&bytes) && !changed.contains(&prog.program_number) {
+                changed.push(prog.program_number);
+            }
+            next.insert(key, bytes);
+        }
+    }
+    *es_info = next;
+    changed
 }
 
 // Keep the null-pid reference live (used in tests + for future filtering).
@@ -2712,6 +2924,73 @@ mod tests {
         }
     }
 
+    // ── PMT descriptor copy-through ────────────────────────────────────
+
+    #[test]
+    fn build_pmt_carries_copy_through_descriptors() {
+        let slots = vec![
+            slot("a", 0x100, 0x100, 0x1B),
+            slot("a", 0x101, 0x101, 0x06), // DVB private PES (e.g. AC-3)
+        ];
+        let mut es_info = std::collections::HashMap::new();
+        es_info.insert((1u16, 0x101u16), vec![0x6A, 0x01, 0x00]); // AC-3 descriptor
+        let pkt = build_pmt(1, 0x1000, 0x100, &slots, 0, 0, &es_info);
+        // Entries start at byte 17. Entry 0: video, empty loop.
+        assert_eq!(pkt[17], 0x1B);
+        assert_eq!(((pkt[20] as usize & 0x0F) << 8) | pkt[21] as usize, 0);
+        // Entry 1 at 22: stream_type 0x06, 3-byte descriptor loop.
+        assert_eq!(pkt[22], 0x06);
+        assert_eq!(((pkt[25] as usize & 0x0F) << 8) | pkt[26] as usize, 3);
+        assert_eq!(&pkt[27..30], &[0x6A, 0x01, 0x00]);
+        // CRC valid over the section.
+        let section_length = (((pkt[6] & 0x0F) as usize) << 8) | pkt[7] as usize;
+        let crc_start = 5 + 3 + section_length - 4;
+        let want = u32::from_be_bytes([
+            pkt[crc_start],
+            pkt[crc_start + 1],
+            pkt[crc_start + 2],
+            pkt[crc_start + 3],
+        ]);
+        assert_eq!(mpeg2_crc32(&pkt[5..crc_start]), want);
+    }
+
+    #[test]
+    fn build_pmt_without_descriptors_matches_legacy_shape() {
+        let slots = vec![slot("a", 0x100, 0x100, 0x1B)];
+        let pkt = build_pmt(1, 0x1000, 0x100, &slots, 0, 0, &std::collections::HashMap::new());
+        let section_length = (((pkt[6] & 0x0F) as usize) << 8) | pkt[7] as usize;
+        assert_eq!(section_length, 9 + 5 + 4);
+        assert_eq!(((pkt[20] as usize & 0x0F) << 8) | pkt[21] as usize, 0);
+    }
+
+    #[test]
+    fn build_pmt_drops_descriptor_loops_that_overflow_one_packet() {
+        let slots = vec![slot("a", 0x100, 0x100, 0x06)];
+        let mut es_info = std::collections::HashMap::new();
+        es_info.insert((1u16, 0x100u16), vec![0x0A; 200]); // can't fit in 180
+        let pkt = build_pmt(1, 0x1000, 0x100, &slots, 0, 0, &es_info);
+        let section_length = (((pkt[6] & 0x0F) as usize) << 8) | pkt[7] as usize;
+        assert_eq!(section_length, 9 + 5 + 4, "oversized loop must be dropped");
+        assert_eq!(((pkt[20] as usize & 0x0F) << 8) | pkt[21] as usize, 0);
+    }
+
+    #[test]
+    fn filter_es_descriptors_keeps_codec_tags_strips_ca() {
+        // CA descriptor (0x09) must not ride through; AC-3 (0x6A) +
+        // ISO-639 language (0x0A) must.
+        let raw = [
+            0x09, 0x04, 0x12, 0x34, 0xE0, 0x01, // CA — stripped
+            0x6A, 0x00, // AC-3
+            0x0A, 0x04, 0x65, 0x6E, 0x67, 0x00, // eng
+        ];
+        assert_eq!(
+            filter_es_descriptors(&raw),
+            vec![0x6A, 0x00, 0x0A, 0x04, 0x65, 0x6E, 0x67, 0x00]
+        );
+        // Truncated tail dropped.
+        assert_eq!(filter_es_descriptors(&[0x6A, 0x05, 0x00]), Vec::<u8>::new());
+    }
+
     fn make_mpts_plan() -> AssemblyPlan {
         AssemblyPlan {
             programs: vec![
@@ -2779,7 +3058,7 @@ mod tests {
     #[test]
     fn pmt_has_valid_crc_and_expected_pcr_pid() {
         let slots = vec![slot("x", 0, 0x200, 0x1B), slot("x", 0, 0x201, 0x0F)];
-        let pmt = build_pmt(42, 0x1000, 0x200, &slots, 0, 0);
+        let pmt = build_pmt(42, 0x1000, 0x200, &slots, 0, 0, &std::collections::HashMap::new());
         assert_eq!(ts_pid(&pmt), 0x1000);
         assert!(ts_pusi(&pmt));
         let section_length = (((pmt[6] & 0x0F) as usize) << 8) | pmt[7] as usize;
@@ -2942,7 +3221,7 @@ mod tests {
         let bus = Arc::new(NodeEsBus::new());
         let (tx, mut rx) = broadcast::channel::<RtpPacket>(16);
         let cancel = CancellationToken::new();
-        let handle = spawn_spts_assembler(make_plan(), bus.clone(), tx.clone(), cancel.clone(), None, String::new(), None, None).join;
+        let handle = spawn_spts_assembler(make_plan(), bus.clone(), tx.clone(), cancel.clone(), None, String::new(), None, None, Default::default()).join;
 
         // Drain one bundle — startup path emits PAT + PMT immediately.
         let bundle = tokio::time::timeout(Duration::from_millis(500), rx.recv())
@@ -2964,7 +3243,7 @@ mod tests {
         let bus = Arc::new(NodeEsBus::new());
         let (tx, mut rx) = broadcast::channel::<RtpPacket>(32);
         let cancel = CancellationToken::new();
-        let handle = spawn_spts_assembler(make_plan(), bus.clone(), tx.clone(), cancel.clone(), None, String::new(), None, None).join;
+        let handle = spawn_spts_assembler(make_plan(), bus.clone(), tx.clone(), cancel.clone(), None, String::new(), None, None, Default::default()).join;
 
         // Wait for startup PSI, then publish enough ES packets on each
         // slot to fill a full bundle.
@@ -3034,7 +3313,7 @@ mod tests {
         let bus = Arc::new(NodeEsBus::new());
         let (tx, mut rx) = broadcast::channel::<RtpPacket>(32);
         let cancel = CancellationToken::new();
-        let handle = spawn_spts_assembler(make_mpts_plan(), bus.clone(), tx.clone(), cancel.clone(), None, String::new(), None, None).join;
+        let handle = spawn_spts_assembler(make_mpts_plan(), bus.clone(), tx.clone(), cancel.clone(), None, String::new(), None, None, Default::default()).join;
 
         // Collect bundles for ~250 ms — long enough to see the startup
         // PSI emission plus at least one tick of the 100 ms PSI cadence.
@@ -3077,7 +3356,7 @@ mod tests {
         let bus = Arc::new(NodeEsBus::new());
         let (tx, _rx) = broadcast::channel::<RtpPacket>(4);
         let cancel = CancellationToken::new();
-        let handle = spawn_spts_assembler(make_plan(), bus.clone(), tx.clone(), cancel.clone(), None, String::new(), None, None).join;
+        let handle = spawn_spts_assembler(make_plan(), bus.clone(), tx.clone(), cancel.clone(), None, String::new(), None, None, Default::default()).join;
         tokio::time::sleep(Duration::from_millis(30)).await;
         cancel.cancel();
         tokio::time::timeout(Duration::from_millis(500), handle)
@@ -3100,7 +3379,7 @@ mod tests {
 
         // Initial plan: in-a → out 0x200, in-b → out 0x201.
         let initial = make_plan();
-        let handle = spawn_spts_assembler(initial, bus.clone(), tx.clone(), cancel.clone(), None, String::new(), None, None);
+        let handle = spawn_spts_assembler(initial, bus.clone(), tx.clone(), cancel.clone(), None, String::new(), None, None, Default::default());
 
         // Capture startup PMT version (should be 0).
         let mut v0: Option<u8> = None;
@@ -3134,7 +3413,7 @@ mod tests {
         };
         handle
             .plan_tx
-            .send(PlanCommand::ReplacePlan { plan: new_plan })
+            .send(PlanCommand::ReplacePlan { plan: new_plan, splice_mode_override: None, catalogs: Default::default() })
             .await
             .expect("plan_tx send");
 
@@ -3206,7 +3485,7 @@ mod tests {
         let bus = Arc::new(NodeEsBus::new());
         let (tx, mut rx) = broadcast::channel::<RtpPacket>(32);
         let cancel = CancellationToken::new();
-        let handle = spawn_spts_assembler(make_plan(), bus.clone(), tx.clone(), cancel.clone(), None, String::new(), None, None);
+        let handle = spawn_spts_assembler(make_plan(), bus.clone(), tx.clone(), cancel.clone(), None, String::new(), None, None, Default::default());
 
         // Drain startup PMT.
         let deadline = tokio::time::Instant::now() + Duration::from_millis(200);
@@ -3227,7 +3506,7 @@ mod tests {
         // Replace with a structurally identical plan.
         handle
             .plan_tx
-            .send(PlanCommand::ReplacePlan { plan: make_plan() })
+            .send(PlanCommand::ReplacePlan { plan: make_plan(), splice_mode_override: None, catalogs: Default::default() })
             .await
             .expect("plan_tx send");
 
@@ -3265,6 +3544,7 @@ mod tests {
             stream_type,
             codec: "test".to_string(),
             kind,
+            descriptors_hex: String::new(),
         }
     }
 
@@ -3875,6 +4155,7 @@ mod tests {
             String::new(),
             None,
             Some(cell.clone()),
+            Default::default(),
         );
         // The stall-scan interval's first tick fires shortly after
         // start; poll the cell instead of sleeping a fixed amount.

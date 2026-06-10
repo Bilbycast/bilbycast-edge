@@ -402,7 +402,7 @@ pub async fn update_flow_assembly(
     }
 
     runtime
-        .replace_assembly(new_assembly.clone())
+        .replace_assembly(new_assembly.clone(), None)
         .await
         .map_err(|e| ApiError::BadRequest(e.to_string()))?;
 

@@ -1514,6 +1514,7 @@ impl FlowRuntime {
     pub async fn replace_assembly(
         &self,
         new_assembly: crate::config::models::FlowAssembly,
+        splice_mode_override: Option<crate::config::models::SpliceMode>,
     ) -> Result<()> {
         let flow_id = &self.config.config.id;
         let handle = self
@@ -1822,10 +1823,21 @@ impl FlowRuntime {
         }
         self.stats.set_pid_routing(routing);
 
+        // Fresh catalogue handles for the new plan — a swap can retarget
+        // slots onto inputs the assembler has never seen (descriptor
+        // copy-through needs their PSI catalogues).
+        let catalogs = self
+            .flow_manager_weak
+            .upgrade()
+            .map(|fm| collect_psi_catalogs_for_plan(&build.plan, &self.stats, &fm))
+            .unwrap_or_default();
+
         handle
             .plan_tx
             .send(crate::engine::ts_assembler::PlanCommand::ReplacePlan {
                 plan: build.plan,
+                splice_mode_override,
+                catalogs,
             })
             .await
             .map_err(|_| anyhow::anyhow!("flow '{}' assembler receiver closed", flow_id))?;
@@ -4654,6 +4666,19 @@ async fn finalize_spts_assembler(
     }
     flow_stats.set_pid_routing(routing);
 
+    // 4.5. Per-input PSI catalogue handles for the assembler's
+    //      descriptor copy-through. Every member input is included (a
+    //      later bus_route swap can retarget a slot onto any of them);
+    //      foreign-flow sources referenced by the initial plan resolve
+    //      via the node-wide registry, same pattern as essence
+    //      resolution above. Sources whose catalogue isn't registered
+    //      yet simply contribute no descriptors; the assembler
+    //      re-checks on every PSI tick so a late-arriving catalogue
+    //      converges within one cadence. `replace_assembly` ships a
+    //      fresh map with each ReplacePlan so swap targets unknown at
+    //      start are covered too.
+    let psi_catalogs = collect_psi_catalogs_for_plan(&build.plan, flow_stats, flow_manager);
+
     // 5. The assembler itself — single publisher onto broadcast_tx.
     //    Pass the per-flow A/V sync pacer so the assembler can run
     //    its own muxer-mode rewriter on the assembled output (single
@@ -4669,7 +4694,45 @@ async fn finalize_spts_assembler(
         flow_id.to_string(),
         av_sync_pacer.clone(),
         Some(flow_stats.assembly_health.clone()),
+        psi_catalogs,
     ))
+}
+
+/// Build the `input_id → PsiCatalogStore` map handed to the assembler
+/// for PMT descriptor copy-through. Includes every own-flow input (any
+/// of them is a legal bus_route swap target) plus any foreign-flow
+/// source the plan references (cross-flow assembly slots / switch
+/// legs), resolved through the node-wide `FlowManager` registry.
+fn collect_psi_catalogs_for_plan(
+    plan: &crate::engine::ts_assembler::AssemblyPlan,
+    flow_stats: &Arc<FlowStatsAccumulator>,
+    flow_manager: &Arc<crate::engine::manager::FlowManager>,
+) -> std::collections::HashMap<String, Arc<crate::engine::ts_psi_catalog::PsiCatalogStore>> {
+    let mut map: std::collections::HashMap<
+        String,
+        Arc<crate::engine::ts_psi_catalog::PsiCatalogStore>,
+    > = std::collections::HashMap::new();
+    for entry in flow_stats.per_input_counters.iter() {
+        map.entry(entry.key().clone())
+            .or_insert_with(|| entry.value().psi_catalog.clone());
+    }
+    for prog in &plan.programs {
+        for slot in &prog.slots {
+            let ids: Vec<&str> = slot
+                .switch_legs
+                .as_ref()
+                .map(|legs| legs.iter().map(|(id, _)| id.as_str()).collect())
+                .unwrap_or_else(|| vec![slot.source.0.as_str()]);
+            for id in ids {
+                if !map.contains_key(id) {
+                    if let Some(c) = flow_manager.psi_catalog_for_input(id) {
+                        map.insert(id.to_string(), c);
+                    }
+                }
+            }
+        }
+    }
+    map
 }
 
 /// Classify an [`InputConfig`] against Phase 5/6/6.5 compatibility rules.

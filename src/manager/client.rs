@@ -1894,6 +1894,20 @@ async fn execute_command(
             let flow_id = action["flow_id"].as_str().ok_or("Missing flow_id")?;
             let new_assembly: FlowAssembly = serde_json::from_value(action["assembly"].clone())
                 .map_err(|e| format!("Invalid assembly: {e}"))?;
+            // Optional per-swap splice request (additive field; absent on
+            // older managers). Slot retargeting via plan replacement is
+            // inherently a PMT-bump cut — `pes_aligned` can't be honoured
+            // there and the assembler emits `splice_override_ignored` so
+            // the operator's choice is never silently dropped.
+            let splice_mode_override: Option<crate::config::models::SpliceMode> =
+                action.get("splice_mode_override").and_then(|v| match v {
+                    serde_json::Value::String(s) => match s.as_str() {
+                        "pmt_bump" => Some(crate::config::models::SpliceMode::PmtBump),
+                        "pes_aligned" => Some(crate::config::models::SpliceMode::PesAligned),
+                        _ => None,
+                    },
+                    _ => None,
+                });
             // Schema validation — the hot-swap path bypasses validate_flow
             // (config-load / create_flow / update_flow only), so without
             // this an assembly with out-of-range PIDs or out_pid/pmt_pid
@@ -1942,7 +1956,10 @@ async fn execute_command(
             // a specific assembly-editor field. Without this, the UI
             // banner says the right thing but no field gets highlighted.
             let swap_start = std::time::Instant::now();
-            if let Err(e) = runtime.replace_assembly(new_assembly.clone()).await {
+            if let Err(e) = runtime
+                .replace_assembly(new_assembly.clone(), splice_mode_override)
+                .await
+            {
                 let code = runtime
                     .event_sender
                     .take_recent_critical_for_flow(flow_id, swap_start)
