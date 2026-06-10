@@ -1561,24 +1561,51 @@ impl FlowRuntime {
                 (effective_pcr_input(cur), effective_pcr_input(&new_assembly))
             {
                 if old_in != new_in {
-                    let msg = format!(
-                        "flow '{flow_id}': update_flow_assembly rejected — effective \
-                         pcr_source input changed ('{old_in}' → '{new_in}'). The master \
-                         clock is pinned to the pcr_source input at flow start; use \
-                         update_flow (full restart) to re-clock the flow.",
+                    // Only refuse when the master clock is actually GENLOCKED
+                    // to the pcr_source input (the SourcePcrPll family — the
+                    // PLL sampler, fallback watcher, and C4 attribution key
+                    // to that input at start and can't re-key in place).
+                    // Under Wallclock / PTP / AudioMaster / Passthrough
+                    // masters the pinned pcr_source only decides which slot
+                    // CARRIES PCR in the mux — the assembler synthesises PCR
+                    // values from the master clock regardless — so a cross-
+                    // input re-point (a bus_route Swap, the Node Bus matrix's
+                    // headline operation) is safe to hot-swap. Multi-input
+                    // assembled flows resolve to Wallclock under the auto
+                    // policy precisely so this path stays hot.
+                    let genlocked = matches!(
+                        self.master_clock.kind(),
+                        crate::engine::master_clock::MasterClockKind::SourcePcrPll
                     );
-                    self.event_sender.emit_flow_with_details(
-                        EventSeverity::Critical,
-                        category::FLOW,
-                        msg.clone(),
-                        flow_id,
-                        serde_json::json!({
-                            "error_code": "pid_bus_pcr_source_change_requires_restart",
-                            "old_input_id": old_in,
-                            "new_input_id": new_in,
-                        }),
+                    if genlocked {
+                        let msg = format!(
+                            "flow '{flow_id}': update_flow_assembly rejected — effective \
+                             pcr_source input changed ('{old_in}' → '{new_in}') while the \
+                             master clock is genlocked to it (source-PCR PLL). Use \
+                             update_flow (full restart) to re-clock the flow, or set \
+                             master_clock.kind = \"wallclock\" on the flow to make it \
+                             hot-retargetable.",
+                        );
+                        self.event_sender.emit_flow_with_details(
+                            EventSeverity::Critical,
+                            category::FLOW,
+                            msg.clone(),
+                            flow_id,
+                            serde_json::json!({
+                                "error_code": "pid_bus_pcr_source_change_requires_restart",
+                                "old_input_id": old_in,
+                                "new_input_id": new_in,
+                                "master_clock_kind": "source_pcr_pll",
+                            }),
+                        );
+                        bail!(msg);
+                    }
+                    tracing::info!(
+                        "flow '{flow_id}': pcr_source input re-pointed '{old_in}' → \
+                         '{new_in}' (master clock {:?} is not genlocked to it — \
+                         hot-swap allowed)",
+                        self.master_clock.kind(),
                     );
-                    bail!(msg);
                 }
             }
         }
@@ -6171,9 +6198,16 @@ fn build_master_clock(
     // output for ~30 s on every start/cut). Industry-standard tier-1 mapping:
     //
     //   • ST 2110 / MXL essence  → PTP (PTP-disciplined transport).
-    //   • PID-bus assembled flow → PLL cascade — the assembler synthesises
-    //                              output PCR from the master, so it needs the
-    //                              recovered source clock to stay coherent.
+    //   • PID-bus assembled flow → SINGLE-input: PLL cascade — the assembler
+    //                              synthesises output PCR from the master, so
+    //                              it genlocks to the one designated source.
+    //                              MULTI-input (a switch / retarget target —
+    //                              switch-slot legs or bus_route swaps):
+    //                              Wallclock, same reasoning as the switcher
+    //                              row — pinning the clock to one input would
+    //                              step the output clock on every retarget
+    //                              (and forced the hot-swap refusal that made
+    //                              every cross-input swap require a restart).
     //   • SINGLE-source live      → PLL cascade (lock-then-promote): genlock to
     //     contribution              the source so passthrough/transcode is
     //     (SRT/RTP/UDP/RIST/        bit-rate transparent (zero clock slip). The
@@ -6212,7 +6246,7 @@ fn build_master_clock(
                             | InputConfig::Rtsp(_)
                     )
                 );
-            if cfg.assembly.is_some() || single_live_contribution {
+            if (cfg.assembly.is_some() && !is_switcher) || single_live_contribution {
                 return build_auto_cascade(cfg, clock_source, event_sender, cancel_token);
             }
             // Switcher / file / replay / WebRTC / test-pattern / bonded /

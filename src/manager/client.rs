@@ -2272,18 +2272,53 @@ async fn execute_command(
                     "Input '{input_id}' is not a member of flow '{flow_id}'"
                 )));
             }
+            // Assembled flows: activate_input only drives Switch-slot legs.
+            // A flow whose slots are all pinned (Pid / Essence / Hitless)
+            // used to ACK success and emit "active input switched" while
+            // the media kept playing the pinned source — a silent lie that
+            // made the switcher look broken. Refuse with a structured code
+            // so the manager can route the Take through a bus_route swap
+            // (its activate-input proxy does this for SPTS) or tell the
+            // operator to re-point via the Node Bus matrix.
+            if let Some(asm) = cfg.flows[flow_idx].assembly.as_ref().filter(|a| {
+                !matches!(a.kind, crate::config::models::AssemblyKind::Passthrough)
+            }) {
+                let has_matching_leg = asm.programs.iter().any(|p| {
+                    p.streams.iter().any(|s| match &s.source {
+                        crate::config::models::SlotSource::Switch { legs, .. } => {
+                            legs.iter().any(|l| l.input_id() == input_id)
+                        }
+                        _ => false,
+                    })
+                });
+                if !has_matching_leg {
+                    return Err(CommandError::with_code(
+                        format!(
+                            "Flow '{flow_id}' is assembled and no switch slot carries a \
+                             leg for input '{input_id}' — activate_input would have no \
+                             effect on the media. Re-point the program via the Node Bus \
+                             Swap (bus_route), or author switch legs on the slots."
+                        ),
+                        "pid_bus_activate_input_no_switch_slots",
+                    ));
+                }
+            }
+            // Drive the runtime switch BEFORE flipping the config's active
+            // flags — a failed switch must not persist a config that claims
+            // the new input is active (and the error must reach the ack
+            // instead of being swallowed into a tracing::warn).
+            if flow_manager.is_running(&flow_id) {
+                flow_manager
+                    .switch_active_input(&flow_id, &input_id, splice_mode_override)
+                    .await
+                    .map_err(|e| {
+                        CommandError::new(format!("activate_input failed: {e}"))
+                    })?;
+            }
             let member_ids: Vec<String> = cfg.flows[flow_idx].input_ids.clone();
             for def in cfg.inputs.iter_mut() {
                 if member_ids.contains(&def.id) {
                     def.active = def.id == input_id;
-                }
-            }
-            if flow_manager.is_running(&flow_id) {
-                if let Err(e) = flow_manager
-                    .switch_active_input(&flow_id, &input_id, splice_mode_override)
-                    .await
-                {
-                    tracing::warn!("switch_active_input failed for '{flow_id}': {e}");
                 }
             }
             persist_config(&cfg, config_path, secrets_path).await;
