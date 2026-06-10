@@ -210,9 +210,27 @@ struct ObserverState {
     /// Latest per-PMT version seen, keyed by PMT PID. `None` means not
     /// yet observed on the wire.
     pmt_versions: std::collections::HashMap<u16, u8>,
+    /// In-flight cross-packet PMT sections, keyed by PMT PID. A PMT for a
+    /// real DVB program (video + several audio + subs + teletext, each
+    /// with descriptors) routinely exceeds the 184-byte single-packet
+    /// payload — without reassembly those programs sat in the catalogue
+    /// with an empty stream list FOREVER (periodic re-emission never
+    /// helps; the section never fits in one packet).
+    pmt_partials: std::collections::HashMap<u16, PartialPmtSection>,
     /// Partial catalog accumulated as each PMT arrives. Published when
     /// it changes.
     current: PsiCatalog,
+}
+
+/// One PMT section mid-reassembly: bytes from `table_id` onward, the total
+/// length promised by the 3-byte section header, and the continuity
+/// counter of the last packet folded in (a CC gap aborts the partial —
+/// latching a stream list assembled across a loss would be worse than
+/// staying empty until the next emission).
+struct PartialPmtSection {
+    buf: Vec<u8>,
+    needed: usize,
+    last_cc: u8,
 }
 
 fn observe_packet(pkt: &RtpPacket, state: &mut ObserverState, store: &PsiCatalogStore) {
@@ -236,8 +254,10 @@ fn observe_packet(pkt: &RtpPacket, state: &mut ObserverState, store: &PsiCatalog
         let pid = ts_pid(ts);
         if pid == PAT_PID && ts_pusi(ts) {
             handle_pat(ts, state, store);
-        } else if ts_pusi(ts) && state.pmt_by_program.iter().any(|(_, p)| *p == pid) {
-            handle_pmt(ts, pid, state, store);
+        } else if state.pmt_by_program.iter().any(|(_, p)| *p == pid) {
+            // PUSI and continuation packets both route through the
+            // reassembler — multi-packet PMT sections need the latter.
+            handle_pmt_packet(ts, pid, state, store);
         }
     }
 }
@@ -286,15 +306,129 @@ fn handle_pat(pkt: &[u8], state: &mut ObserverState, store: &PsiCatalogStore) {
     let live: std::collections::HashSet<u16> =
         state.pmt_by_program.iter().map(|(_, pid)| *pid).collect();
     state.pmt_versions.retain(|pid, _| live.contains(pid));
+    state.pmt_partials.retain(|pid, _| live.contains(pid));
 
     store.store(state.current.clone());
 }
 
-fn handle_pmt(pkt: &[u8], pmt_pid: u16, state: &mut ObserverState, store: &PsiCatalogStore) {
-    let (version, pcr_pid, streams) = match parse_pmt_section(pkt) {
+/// Route one TS packet on a PMT PID into the section reassembler.
+fn handle_pmt_packet(pkt: &[u8], pmt_pid: u16, state: &mut ObserverState, store: &PsiCatalogStore) {
+    if !ts_has_payload(pkt) {
+        return;
+    }
+    let cc = ts_cc(pkt);
+    let off = ts_payload_offset(pkt);
+    if off >= TS_PACKET_SIZE {
+        state.pmt_partials.remove(&pmt_pid);
+        return;
+    }
+
+    if ts_pusi(pkt) {
+        let pointer = pkt[off] as usize;
+        let tail_start = off + 1;
+        let sec_start = tail_start + pointer;
+        if sec_start > TS_PACKET_SIZE {
+            state.pmt_partials.remove(&pmt_pid);
+            return;
+        }
+        // Bytes before the pointer target are the TAIL of the previous
+        // section — fold them into an in-flight partial if CC is contiguous.
+        if let Some(mut part) = state.pmt_partials.remove(&pmt_pid) {
+            if pointer > 0 && cc == ((part.last_cc + 1) & 0x0F) {
+                part.buf.extend_from_slice(&pkt[tail_start..sec_start]);
+                if part.buf.len() >= part.needed {
+                    complete_pmt_section(part.buf, part.needed, true, pmt_pid, state, store);
+                }
+            }
+            // CC gap or no tail → the partial is unrecoverable; drop it.
+        }
+        start_pmt_section(&pkt[sec_start..TS_PACKET_SIZE], cc, pmt_pid, state, store);
+    } else if let Some(part) = state.pmt_partials.get_mut(&pmt_pid) {
+        if cc != ((part.last_cc + 1) & 0x0F) {
+            // Lost a middle packet — abort rather than latch garbage.
+            state.pmt_partials.remove(&pmt_pid);
+            return;
+        }
+        part.last_cc = cc;
+        part.buf.extend_from_slice(&pkt[off..TS_PACKET_SIZE]);
+        if part.buf.len() >= part.needed {
+            let part = state
+                .pmt_partials
+                .remove(&pmt_pid)
+                .expect("partial present — just mutated");
+            complete_pmt_section(part.buf, part.needed, true, pmt_pid, state, store);
+        }
+    }
+}
+
+/// Begin a fresh section at a PUSI packet's pointer target. Sections that
+/// fit entirely in this packet complete immediately (the pre-reassembly
+/// fast path, CRC not enforced to match historical behaviour); longer ones
+/// are stashed for the continuation packets.
+fn start_pmt_section(
+    sec: &[u8],
+    cc: u8,
+    pmt_pid: u16,
+    state: &mut ObserverState,
+    store: &PsiCatalogStore,
+) {
+    if sec.len() < 3 || sec[0] != 0x02 {
+        return;
+    }
+    let section_length = (((sec[1] & 0x0F) as usize) << 8) | sec[2] as usize;
+    let needed = 3 + section_length;
+    if needed <= sec.len() {
+        complete_pmt_section(sec[..needed].to_vec(), needed, false, pmt_pid, state, store);
+    } else {
+        state.pmt_partials.insert(
+            pmt_pid,
+            PartialPmtSection { buf: sec.to_vec(), needed, last_cc: cc },
+        );
+    }
+}
+
+/// Finalise a fully-buffered section: trim stuffing, CRC-verify when the
+/// section was reassembled across packets (a CC gap we failed to notice
+/// must not latch a garbage stream list under the version dedup), then
+/// parse + publish.
+fn complete_pmt_section(
+    mut buf: Vec<u8>,
+    needed: usize,
+    verify_crc: bool,
+    pmt_pid: u16,
+    state: &mut ObserverState,
+    store: &PsiCatalogStore,
+) {
+    if buf.len() < needed || needed < 16 {
+        return;
+    }
+    buf.truncate(needed);
+    if verify_crc {
+        let want = u32::from_be_bytes([
+            buf[needed - 4],
+            buf[needed - 3],
+            buf[needed - 2],
+            buf[needed - 1],
+        ]);
+        if mpeg2_crc32(&buf[..needed - 4]) != want {
+            return;
+        }
+    }
+    let (version, pcr_pid, streams) = match parse_pmt_from_section(&buf) {
         Some(v) => v,
         None => return,
     };
+    apply_parsed_pmt(version, pcr_pid, streams, pmt_pid, state, store);
+}
+
+fn apply_parsed_pmt(
+    version: u8,
+    pcr_pid: u16,
+    streams: Vec<(u8, u16)>,
+    pmt_pid: u16,
+    state: &mut ObserverState,
+    store: &PsiCatalogStore,
+) {
     if state.pmt_versions.get(&pmt_pid) == Some(&version) {
         return;
     }
@@ -350,45 +484,26 @@ fn read_pat_header(pkt: &[u8]) -> Option<(u8, u16)> {
     Some((version, ts_id))
 }
 
-/// Parse a whole-packet PMT into `(version, pcr_pid, streams)`. Returns
-/// `None` when the section is malformed or spans multiple TS packets
-/// (rare; we rely on periodic re-emission for recovery).
-fn parse_pmt_section(pkt: &[u8]) -> Option<(u8, u16, Vec<(u8, u16)>)> {
-    let mut sec_off = 4;
-    if ts_has_adaptation(pkt) {
-        let af_len = pkt[4] as usize;
-        sec_off = 5 + af_len;
-    }
-    if sec_off >= TS_PACKET_SIZE {
+/// Parse a complete PMT section (bytes from `table_id`, any length up to
+/// the 4096-byte section cap) into `(version, pcr_pid, streams)`.
+fn parse_pmt_from_section(sec: &[u8]) -> Option<(u8, u16, Vec<(u8, u16)>)> {
+    if sec.len() < 16 || sec[0] != 0x02 {
         return None;
     }
-    let pointer = pkt[sec_off] as usize;
-    sec_off += 1 + pointer;
-    if sec_off + 12 > TS_PACKET_SIZE {
-        return None;
-    }
-    if pkt[sec_off] != 0x02 {
-        return None;
-    }
-    let section_length =
-        (((pkt[sec_off + 1] & 0x0F) as usize) << 8) | (pkt[sec_off + 2] as usize);
-    let version = (pkt[sec_off + 5] >> 1) & 0x1F;
-    let pcr_pid = ((pkt[sec_off + 8] as u16 & 0x1F) << 8) | pkt[sec_off + 9] as u16;
-    let program_info_length =
-        (((pkt[sec_off + 10] & 0x0F) as usize) << 8) | (pkt[sec_off + 11] as usize);
+    let section_length = (((sec[1] & 0x0F) as usize) << 8) | (sec[2] as usize);
+    let version = (sec[5] >> 1) & 0x1F;
+    let pcr_pid = ((sec[8] as u16 & 0x1F) << 8) | sec[9] as u16;
+    let program_info_length = (((sec[10] & 0x0F) as usize) << 8) | (sec[11] as usize);
 
-    let data_start = sec_off + 12 + program_info_length;
-    let data_end = (sec_off + 3 + section_length)
-        .min(TS_PACKET_SIZE)
-        .saturating_sub(4);
+    let data_start = 12 + program_info_length;
+    let data_end = (3 + section_length).min(sec.len()).saturating_sub(4);
 
     let mut streams = Vec::new();
     let mut pos = data_start;
     while pos + 5 <= data_end {
-        let stream_type = pkt[pos];
-        let pid = ((pkt[pos + 1] as u16 & 0x1F) << 8) | pkt[pos + 2] as u16;
-        let es_info_length =
-            (((pkt[pos + 3] & 0x0F) as usize) << 8) | (pkt[pos + 4] as usize);
+        let stream_type = sec[pos];
+        let pid = ((sec[pos + 1] as u16 & 0x1F) << 8) | sec[pos + 2] as u16;
+        let es_info_length = (((sec[pos + 3] & 0x0F) as usize) << 8) | (sec[pos + 4] as usize);
         streams.push((stream_type, pid));
         pos += 5 + es_info_length;
     }
@@ -459,6 +574,65 @@ mod tests {
         pkt
     }
 
+    /// Build a PMT section of arbitrary length (valid CRC32) split across
+    /// as many 188-byte TS packets as needed — PUSI + pointer_field on the
+    /// first, sequential CC throughout.
+    fn build_pmt_multi(
+        pmt_pid: u16,
+        streams: &[(u8, u16)],
+        pcr_pid: u16,
+        version: u8,
+        start_cc: u8,
+    ) -> Vec<[u8; TS_PACKET_SIZE]> {
+        let section_data_len = 9 + 5 * streams.len() + 4;
+        let mut sec = Vec::with_capacity(3 + section_data_len);
+        sec.push(0x02);
+        sec.push(0xB0 | (((section_data_len >> 8) as u8) & 0x0F));
+        sec.push((section_data_len & 0xFF) as u8);
+        sec.extend_from_slice(&[0x00, 0x01]);
+        sec.push(0xC1 | ((version & 0x1F) << 1));
+        sec.push(0x00);
+        sec.push(0x00);
+        sec.push(0xE0 | (((pcr_pid >> 8) as u8) & 0x1F));
+        sec.push((pcr_pid & 0xFF) as u8);
+        sec.push(0xF0);
+        sec.push(0x00);
+        for (st, pid) in streams {
+            sec.push(*st);
+            sec.push(0xE0 | (((pid >> 8) as u8) & 0x1F));
+            sec.push((pid & 0xFF) as u8);
+            sec.push(0xF0);
+            sec.push(0x00);
+        }
+        let crc = mpeg2_crc32(&sec);
+        sec.extend_from_slice(&crc.to_be_bytes());
+
+        let mut pkts = Vec::new();
+        let mut off = 0usize;
+        let mut cc = start_cc;
+        let mut first = true;
+        while off < sec.len() {
+            let mut pkt = [0xFFu8; TS_PACKET_SIZE];
+            pkt[0] = TS_SYNC_BYTE;
+            pkt[1] = (if first { 0x40 } else { 0x00 }) | (((pmt_pid >> 8) as u8) & 0x1F);
+            pkt[2] = (pmt_pid & 0xFF) as u8;
+            pkt[3] = 0x10 | (cc & 0x0F);
+            let payload_start = if first {
+                pkt[4] = 0x00; // pointer_field
+                5
+            } else {
+                4
+            };
+            let n = (TS_PACKET_SIZE - payload_start).min(sec.len() - off);
+            pkt[payload_start..payload_start + n].copy_from_slice(&sec[off..off + n]);
+            off += n;
+            cc = (cc + 1) & 0x0F;
+            first = false;
+            pkts.push(pkt);
+        }
+        pkts
+    }
+
     fn drive(state: &mut ObserverState, store: &PsiCatalogStore, bytes: &[u8]) {
         let pkt = RtpPacket {
             data: bytes::Bytes::copy_from_slice(bytes),
@@ -499,6 +673,53 @@ mod tests {
         let p2 = &cat.programs[1];
         assert_eq!(p2.streams[0].codec, "H.265 / HEVC");
         assert_eq!(p2.streams[1].codec, "AC-3 (ATSC)");
+    }
+
+    #[test]
+    fn catalog_reassembles_multi_packet_pmt() {
+        let mut state = ObserverState::default();
+        let store = PsiCatalogStore::new();
+        drive(&mut state, &store, &build_pat(&[(1, 0x100)], 0));
+
+        // 40 ES entries → 216-byte section → spans 2 TS packets. This is
+        // the shape the old single-packet parser permanently dropped.
+        let streams: Vec<(u8, u16)> = (0..40).map(|i| (0x0F, 0x101 + i as u16)).collect();
+        let pkts = build_pmt_multi(0x100, &streams, 0x101, 0, 0);
+        assert!(pkts.len() >= 2, "section must span multiple packets");
+        for p in &pkts {
+            drive(&mut state, &store, p);
+        }
+
+        let cat = store.load().expect("catalog present");
+        assert_eq!(cat.programs[0].streams.len(), 40);
+        assert_eq!(cat.programs[0].pcr_pid, Some(0x101));
+        assert_eq!(cat.programs[0].streams[39].pid, 0x101 + 39);
+    }
+
+    #[test]
+    fn multi_packet_pmt_cc_gap_aborts_then_recovers() {
+        let mut state = ObserverState::default();
+        let store = PsiCatalogStore::new();
+        drive(&mut state, &store, &build_pat(&[(1, 0x100)], 0));
+
+        // 80 ES entries → 416-byte section → 3 TS packets.
+        let streams: Vec<(u8, u16)> = (0..80).map(|i| (0x0F, 0x101 + i as u16)).collect();
+        let pkts = build_pmt_multi(0x100, &streams, 0x101, 0, 0);
+        assert!(pkts.len() >= 3, "section must span three packets");
+
+        // Drop the middle packet — the partial must abort, not latch garbage.
+        drive(&mut state, &store, &pkts[0]);
+        drive(&mut state, &store, &pkts[2]);
+        let cat = store.load().expect("catalog present");
+        assert!(cat.programs[0].streams.is_empty(), "CC gap must not produce streams");
+
+        // The next complete emission (fresh CC run) parses fine.
+        let pkts2 = build_pmt_multi(0x100, &streams, 0x101, 0, 4);
+        for p in &pkts2 {
+            drive(&mut state, &store, p);
+        }
+        let cat = store.load().expect("catalog present");
+        assert_eq!(cat.programs[0].streams.len(), 80);
     }
 
     #[test]

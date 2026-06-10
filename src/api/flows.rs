@@ -386,6 +386,14 @@ pub async fn update_flow_assembly(
         .get_runtime(&flow_id)
         .ok_or_else(|| ApiError::NotFound(format!("Flow '{flow_id}' is not running")))?;
 
+    // Schema validation — same guard as the WS update_flow_assembly arm; the
+    // hot-swap path otherwise bypasses every rule in validate_flow_assembly.
+    crate::config::validation::validate_assembly_for_hotswap(
+        &new_assembly,
+        &format!("Flow '{flow_id}'"),
+    )
+    .map_err(|e| ApiError::BadRequest(format!("Invalid assembly: {e}")))?;
+
     if let Some(cur) = runtime.current_assembly().await {
         if cur == new_assembly {
             tracing::info!("update_flow_assembly '{flow_id}': no-op (unchanged)");

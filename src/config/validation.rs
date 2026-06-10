@@ -2846,6 +2846,23 @@ fn validate_name(name: &str, context: &str) -> Result<()> {
 /// - `SlotSource::Hitless` cannot nest another `Hitless`.
 /// - When `kind != Passthrough`, `pcr_source` is required and its
 ///   `input_id` must also be on the flow.
+///
+/// Hot-swap callers (WS `update_flow_assembly` + REST
+/// `PUT /api/v1/flows/{id}/assembly`) go through
+/// [`validate_assembly_for_hotswap`] — without it, the schema rules above
+/// (PID range, duplicate `out_pid`, `out_pid`-vs-`pmt_pid` collisions,
+/// spts-exactly-one-program, pcr_source resolution) only ran on config
+/// load / create_flow / update_flow, so the path operators actually use
+/// could install a corrupt-mux plan unchecked.
+pub(crate) fn validate_assembly_for_hotswap(
+    assembly: &crate::config::models::FlowAssembly,
+    context: &str,
+) -> Result<()> {
+    // Cross-flow ES refs are legal (PES Switch Phase 2.1c lifted the
+    // membership check) — the input-ids arg is ignored inside.
+    validate_flow_assembly(assembly, &[], context)
+}
+
 fn validate_flow_assembly(
     assembly: &crate::config::models::FlowAssembly,
     flow_input_ids: &[String],

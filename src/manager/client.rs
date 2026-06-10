@@ -761,8 +761,13 @@ async fn try_connect(
 
 /// Build the auth message sent as the first WebSocket frame.
 /// Contains either registration_token OR node_id + node_secret.
-/// WebSocket protocol version. Sent in auth payload so the manager can detect mismatches.
-const WS_PROTOCOL_VERSION: u32 = 1;
+/// WebSocket protocol version. Sent in auth payload so the manager can detect
+/// mismatches. MUST track `bilbycast-manager/crates/manager-core/src/models/
+/// ws_protocol.rs::WS_PROTOCOL_VERSION` — this edge ships the v3 surface
+/// (capability bits, direction-tagged VAAPI caps, assembly hot-swap, hot
+/// add/remove input), but advertising the stale `1` made the manager log a
+/// mismatch warning + insert a Warning compatibility event on EVERY connect.
+const WS_PROTOCOL_VERSION: u32 = 3;
 
 fn build_auth_message(config: &ManagerConfig) -> serde_json::Value {
     if let (Some(node_id), Some(node_secret)) = (&config.node_id, &config.node_secret) {
@@ -1889,6 +1894,15 @@ async fn execute_command(
             let flow_id = action["flow_id"].as_str().ok_or("Missing flow_id")?;
             let new_assembly: FlowAssembly = serde_json::from_value(action["assembly"].clone())
                 .map_err(|e| format!("Invalid assembly: {e}"))?;
+            // Schema validation — the hot-swap path bypasses validate_flow
+            // (config-load / create_flow / update_flow only), so without
+            // this an assembly with out-of-range PIDs or out_pid/pmt_pid
+            // collisions reached the running assembler unchecked.
+            crate::config::validation::validate_assembly_for_hotswap(
+                &new_assembly,
+                &format!("Flow '{flow_id}'"),
+            )
+            .map_err(|e| CommandError::from_validation("Invalid assembly", e))?;
             tracing::info!(
                 "Manager command: update_flow_assembly '{flow_id}' (kind={:?}, programs={})",
                 new_assembly.kind,
