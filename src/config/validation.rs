@@ -5006,6 +5006,20 @@ fn validate_bond_congestion(
             ));
         }
     }
+    if let Some(v) = c.probe_cap_mult {
+        if !(1.1..=10.0).contains(&v) || v.is_nan() {
+            return Err(anyhow::anyhow!(
+                "{ctx}: congestion.probe_cap_mult must be in [1.1, 10.0]"
+            ));
+        }
+    }
+    if let Some(v) = c.rtt_min_window_ms {
+        if !(1_000..=120_000).contains(&v) {
+            return Err(anyhow::anyhow!(
+                "{ctx}: congestion.rtt_min_window_ms must be in [1000, 120000]"
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -6778,6 +6792,33 @@ mod tests {
                 serde_json::from_str(&s).unwrap_or_else(|e| panic!("parse {path}: {e}"));
             validate_config(&cfg).unwrap_or_else(|e| panic!("validate {path}: {e}"));
         }
+    }
+
+    /// Adaptive-scheduler evidence-bound knobs (`probe_cap_mult` +
+    /// `rtt_min_window_ms`): in-range accepted, out-of-range rejected,
+    /// absent = library default.
+    #[test]
+    fn bond_congestion_probe_cap_and_rtt_window_bounds() {
+        use crate::config::models::BondCongestionConfig;
+        fn cfg(probe: Option<f64>, window: Option<u64>) -> Option<BondCongestionConfig> {
+            Some(BondCongestionConfig {
+                probe_cap_mult: probe,
+                rtt_min_window_ms: window,
+                ..Default::default()
+            })
+        }
+        assert!(validate_bond_congestion(&None, "ctx").is_ok());
+        assert!(validate_bond_congestion(&cfg(None, None), "ctx").is_ok());
+        // Range edges (contract: [1.1, 10.0] / [1000, 120000]).
+        assert!(validate_bond_congestion(&cfg(Some(1.1), Some(1_000)), "ctx").is_ok());
+        assert!(validate_bond_congestion(&cfg(Some(10.0), Some(120_000)), "ctx").is_ok());
+        assert!(validate_bond_congestion(&cfg(Some(2.0), Some(10_000)), "ctx").is_ok());
+        // Out of range / NaN.
+        assert!(validate_bond_congestion(&cfg(Some(1.0), None), "ctx").is_err());
+        assert!(validate_bond_congestion(&cfg(Some(10.5), None), "ctx").is_err());
+        assert!(validate_bond_congestion(&cfg(Some(f64::NAN), None), "ctx").is_err());
+        assert!(validate_bond_congestion(&cfg(None, Some(999)), "ctx").is_err());
+        assert!(validate_bond_congestion(&cfg(None, Some(120_001)), "ctx").is_err());
     }
 
     /// Helper: build a single-program map for tests.

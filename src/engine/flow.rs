@@ -1236,6 +1236,12 @@ impl FlowRuntime {
             .and_then(crate::engine::audio_transcode::InputFormat::from_input_config);
         let compressed_audio_input = active_input_cfg
             .map_or(false, crate::engine::audio_decode::input_can_carry_ts_audio);
+        // Any bonded input in the flow's set (not just the active one)
+        // flips UDP/RTP outputs with unset `egress_pacing` to `pcr`.
+        let flow_has_bonded_input = config
+            .inputs
+            .iter()
+            .any(|i| matches!(i.config, InputConfig::Bonded(_)));
         // Loop over the *active* outputs only. Passive outputs are persisted
         // in config but do not get a running task until the operator flips
         // them active via the API.
@@ -1264,6 +1270,7 @@ impl FlowRuntime {
                 &config.config.id,
                 input_audio_format,
                 compressed_audio_input,
+                flow_has_bonded_input,
                 #[cfg(feature = "webrtc")]
                 whep_rx,
                 frame_rate_rx.clone(),
@@ -1887,6 +1894,13 @@ impl FlowRuntime {
         flow_id: &str,
         input_audio_format: Option<crate::engine::audio_transcode::InputFormat>,
         compressed_audio_input: bool,
+        // True when the flow's input set contains a `bonded` input.
+        // Drives the auto-resolution of an unset `egress_pacing` on
+        // UDP/RTP-family outputs (auto → `pcr` on bonded flows: the
+        // reassembly buffer delivers in hold-time bursts, so the wire
+        // emitter must re-pace against PCR instead of forwarding the
+        // burst cadence). See `EgressPacingMode::resolve_auto`.
+        flow_has_bonded_input: bool,
         #[cfg(feature = "webrtc")]
         whep_session_rx: Option<tokio::sync::mpsc::Receiver<crate::api::webrtc::registry::NewSessionMsg>>,
         frame_rate_rx: Option<tokio::sync::watch::Receiver<Option<f64>>>,
@@ -1919,8 +1933,16 @@ impl FlowRuntime {
                     "rtp".to_string(),
                 );
 
+                let mut rtp_config = rtp_config.clone();
+                rtp_config.egress_pacing = resolve_egress_pacing_auto(
+                    rtp_config.egress_pacing,
+                    flow_has_bonded_input,
+                    &rtp_config.id,
+                    flow_id,
+                    &output_stats,
+                );
                 let handle = spawn_rtp_output(
-                    rtp_config.clone(),
+                    rtp_config,
                     broadcast_tx,
                     output_stats.clone(),
                     output_cancel.clone(),
@@ -1943,8 +1965,16 @@ impl FlowRuntime {
                     "udp".to_string(),
                 );
 
+                let mut udp_config = udp_config.clone();
+                udp_config.egress_pacing = resolve_egress_pacing_auto(
+                    udp_config.egress_pacing,
+                    flow_has_bonded_input,
+                    &udp_config.id,
+                    flow_id,
+                    &output_stats,
+                );
                 let handle = spawn_udp_output(
-                    udp_config.clone(),
+                    udp_config,
                     broadcast_tx,
                     output_stats.clone(),
                     output_cancel.clone(),
@@ -2418,6 +2448,14 @@ impl FlowRuntime {
             .and_then(crate::engine::audio_transcode::InputFormat::from_input_config);
         let compressed_audio_input = active_input_cfg
             .map_or(false, crate::engine::audio_decode::input_can_carry_ts_audio);
+        // Honour hot-added inputs: any bonded member of the live input
+        // set drives the unset-`egress_pacing` → `pcr` auto-resolution.
+        let flow_has_bonded_input = {
+            let inputs = self.live_inputs.read().await;
+            inputs
+                .iter()
+                .any(|d| matches!(d.config, crate::config::models::InputConfig::Bonded(_)))
+        };
         let av_sync_pacer = Some(Arc::new(
             crate::engine::av_sync_mux::AvSyncPacer::new(self.master_clock.clone()),
         ));
@@ -2430,6 +2468,7 @@ impl FlowRuntime {
             &self.config.config.id,
             input_audio_format,
             compressed_audio_input,
+            flow_has_bonded_input,
             #[cfg(feature = "webrtc")]
             None,
             self.frame_rate_rx.clone(),
@@ -2581,6 +2620,69 @@ impl FlowRuntime {
         }
     }
 
+    /// Warn when a hot input-set edit flipped the flow's bonded-input
+    /// membership while auto-paced UDP/RTP outputs are running.
+    ///
+    /// `egress_pacing` auto-resolution (`pcr` iff the flow has a bonded
+    /// input) is evaluated once at output spawn; the surgical
+    /// `add_input` / `remove_input` paths deliberately do NOT restart
+    /// outputs, so an output spawned before the flip keeps its old
+    /// resolution — a bonded input hot-added onto `forward` outputs
+    /// puts the reassembly hold-time bursts straight onto the wire,
+    /// and a bonded input hot-removed leaves outputs re-pacing at
+    /// `pcr` for no reason. Auto-restarting the outputs here would
+    /// break the hot-swap contract (outputs keep running across the
+    /// edit), so the operator gets a loud Warning instead.
+    ///
+    /// `now_bonded` is the membership AFTER the edit. No-op when the
+    /// flow has no running UDP/RTP output with an unset (auto)
+    /// `egress_pacing`.
+    async fn warn_egress_pacing_auto_stale(&self, now_bonded: bool) {
+        let affected: Vec<String> = {
+            let handles = self.output_handles.read().await;
+            self.config
+                .outputs
+                .iter()
+                .filter_map(|o| match o {
+                    OutputConfig::Udp(c) if c.egress_pacing.is_none() => Some(c.id.clone()),
+                    OutputConfig::Rtp(c) if c.egress_pacing.is_none() => Some(c.id.clone()),
+                    _ => None,
+                })
+                .filter(|id| handles.contains_key(id))
+                .collect()
+        };
+        if affected.is_empty() {
+            return;
+        }
+        let (running, resolved_now) = if now_bonded {
+            ("forward", "pcr")
+        } else {
+            ("pcr", "forward")
+        };
+        self.event_sender.emit_flow_with_details(
+            EventSeverity::Warning,
+            category::FLOW,
+            format!(
+                "Flow '{}' {} a bonded input; {} running UDP/RTP output(s) with unset \
+                 egress_pacing keep their spawn-time '{running}' pacing — auto would now \
+                 resolve to '{resolved_now}'. Restart the output(s) or the flow to \
+                 re-resolve: {}",
+                self.config.config.id,
+                if now_bonded { "gained" } else { "lost" },
+                affected.len(),
+                affected.join(", ")
+            ),
+            &self.config.config.id,
+            serde_json::json!({
+                "error_code": "egress_pacing_auto_stale",
+                "flow_id": self.config.config.id,
+                "output_ids": affected,
+                "running_mode": running,
+                "resolved_mode_now": resolved_now,
+            }),
+        );
+    }
+
     /// Add an input to a running flow (hot-add).
     ///
     /// Spawns the input task graph (input task, forwarder or refcounted
@@ -2680,8 +2782,14 @@ impl FlowRuntime {
         // Persist live state in the same order as start:
         //   live_inputs (config snapshot) → input_handles (runtime) →
         //   registered_input_ids (unregister bookkeeping).
+        let added_bonded = matches!(input_def.config, InputConfig::Bonded(_));
+        let bonded_flipped;
         {
             let mut live = self.live_inputs.write().await;
+            bonded_flipped = added_bonded
+                && !live
+                    .iter()
+                    .any(|d| matches!(d.config, InputConfig::Bonded(_)));
             live.push(input_def);
         }
         {
@@ -2697,6 +2805,11 @@ impl FlowRuntime {
             spawned.input_id,
             self.config.config.id
         );
+        // The flow just gained its first bonded input: running auto-paced
+        // UDP/RTP outputs are now stale (see the helper's doc).
+        if bonded_flipped {
+            self.warn_egress_pacing_auto_stale(true).await;
+        }
         Ok(HotAddedInputInfo {
             input_id: spawned.input_id,
             #[cfg(feature = "webrtc")]
@@ -2868,9 +2981,17 @@ impl FlowRuntime {
         }
 
         // Drop from live_inputs + registered_input_ids.
+        let bonded_flipped;
         {
             let mut live = self.live_inputs.write().await;
+            let removed_bonded = live.iter().any(|d| {
+                d.id == input_id && matches!(d.config, InputConfig::Bonded(_))
+            });
             live.retain(|d| d.id != input_id);
+            bonded_flipped = removed_bonded
+                && !live
+                    .iter()
+                    .any(|d| matches!(d.config, InputConfig::Bonded(_)));
         }
         if let Ok(mut ids) = self.registered_input_ids.lock() {
             ids.retain(|id| id != input_id);
@@ -2881,6 +3002,11 @@ impl FlowRuntime {
             input_id,
             self.config.config.id
         );
+        // The flow just lost its last bonded input: running auto-paced
+        // UDP/RTP outputs are now stale (see the helper's doc).
+        if bonded_flipped {
+            self.warn_egress_pacing_auto_stale(false).await;
+        }
         Ok(())
     }
 
@@ -5031,6 +5157,38 @@ fn spawn_ts_es_demuxer_consumer(
 ///
 /// Used both at initial flow creation and when hot-adding outputs so that
 /// stats snapshots always reflect the current output address/port.
+/// Resolve a UDP/RTP-family output's `egress_pacing` at spawn time:
+/// explicit operator values pass through; unset (`None` = auto)
+/// resolves via [`EgressPacingMode::resolve_auto`] — `pcr` when the
+/// flow has a bonded input, else `forward` (the historical default).
+/// Records the decision on `OutputStats.egress_pacing_effective`
+/// ("auto (pcr)" vs a bare explicit mode) so the manager UI shows what
+/// an auto output actually landed on. Returns `Some` always so the
+/// spawn modules' `unwrap_or_default()` sites see the resolved mode.
+fn resolve_egress_pacing_auto(
+    explicit: Option<crate::config::models::EgressPacingMode>,
+    flow_has_bonded_input: bool,
+    output_id: &str,
+    flow_id: &str,
+    stats: &crate::stats::collector::OutputStatsAccumulator,
+) -> Option<crate::config::models::EgressPacingMode> {
+    use crate::config::models::EgressPacingMode;
+    if let Some(mode) = explicit {
+        stats.set_egress_pacing_effective(mode.as_str().to_string());
+        return explicit;
+    }
+    let resolved = EgressPacingMode::resolve_auto(None, flow_has_bonded_input);
+    stats.set_egress_pacing_effective(format!("auto ({})", resolved.as_str()));
+    if resolved == EgressPacingMode::Pcr {
+        tracing::info!(
+            "output '{output_id}' (flow '{flow_id}'): egress_pacing unset → auto-resolved \
+             to 'pcr' (flow has a bonded input; reassembly burst cadence is re-paced \
+             against PCR)"
+        );
+    }
+    Some(resolved)
+}
+
 fn build_output_config_meta(config: &OutputConfig) -> OutputConfigMeta {
     match config {
         OutputConfig::Srt(c) => OutputConfigMeta {

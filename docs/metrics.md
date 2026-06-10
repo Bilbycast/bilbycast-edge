@@ -270,6 +270,7 @@ ignore unknown fields.
 | Field | Meaning |
 |---|---|
 | `wire_pacing_tier` | Active release tier, set once at output start: `"so_txtime"` / `"clock_nanosleep_fifo"` / `"clock_nanosleep"` / `"unpaced"`. |
+| `egress_pacing_effective` | Egress pacing mode this output actually runs, resolved at spawn (UDP/RTP-family only). Bare `"forward"` / `"pcr"` / `"servo"` for an explicit config value; `"auto (pcr)"` / `"auto (forward)"` when `egress_pacing` was unset and the engine resolved it (`pcr` iff the flow had a `bonded` input at spawn). |
 | `wire_pacing_late` | Datagrams the kernel rejected as late on the SO_TXTIME path. Always 0 on the userspace-sleep paths. |
 | `wire_pacing_pinned_cpu` | CPU index the wire-emit thread was pinned to (`BILBYCAST_WIRE_EMIT_CPUS`); `None` when not pinned. |
 | `egress_shed` | Datagrams shed by the egress residence cap (compressed / `Lossless` outputs). Non-zero means the release-rate servo hit its ±authority ceiling and the buffer was trimmed to stay inside the receiver T-STD; the receiver re-clocked from PCR. Always 0 on ST 2110 / protocol-paced outputs. |

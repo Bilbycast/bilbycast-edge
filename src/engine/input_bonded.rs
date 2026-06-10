@@ -105,6 +105,8 @@ pub fn spawn_bonded_input(
             scheduler: String::new(), // receivers don't schedule
             conn_stats: socket.stats(),
             paths: path_handles,
+            // Sender-side counter; stays 0 on the receiver.
+            oversize_payloads: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         });
 
         tracing::info!(

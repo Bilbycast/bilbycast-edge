@@ -131,6 +131,15 @@ pub struct OutputStatsAccumulator {
     //   "clock_nanosleep" — userspace SCHED_OTHER (no rt grant)
     //   "unpaced" — no pacing (probe-fail at high rates)
     pub wire_pacing_tier: OnceLock<String>,
+    /// The egress pacing mode this output actually runs, resolved at
+    /// spawn time. Explicit operator values report the bare mode
+    /// ("forward" / "pcr" / "servo"); an unset (auto) field reports
+    /// "auto (pcr)" / "auto (forward)" so an operator diagnosing a
+    /// post-upgrade latency change can see what auto resolved to —
+    /// the resolution depends on whether the flow had a bonded input
+    /// at spawn. Only set on UDP/RTP-family outputs (the knob exists
+    /// only there).
+    pub egress_pacing_effective: OnceLock<String>,
     /// EOVERFLOW count from the SO_TXTIME error queue: kernel rejected
     /// the datagram because its target tx time landed in the past.
     /// Incremented from the wire thread on each errqueue drain.
@@ -689,6 +698,7 @@ impl OutputStatsAccumulator {
             av_interleave: crate::stats::av_interleave::AvInterleaveSampler::new(),
             av_skew: std::sync::OnceLock::new(),
             wire_pacing_tier: OnceLock::new(),
+            egress_pacing_effective: OnceLock::new(),
             wire_pacing_late: AtomicU64::new(0),
             wire_pacing_pinned_cpu: AtomicI32::new(-1),
             egress_shed: AtomicU64::new(0),
@@ -701,6 +711,13 @@ impl OutputStatsAccumulator {
     /// are no-ops (first wins).
     pub fn set_wire_pacing_tier(&self, tier: &'static str) {
         let _ = self.wire_pacing_tier.set(tier.to_string());
+    }
+
+    /// Register the resolved egress pacing mode for this output.
+    /// Called once at output spawn by `engine::flow::start_output`
+    /// (UDP/RTP-family only). Subsequent calls are no-ops (first wins).
+    pub fn set_egress_pacing_effective(&self, label: String) {
+        let _ = self.egress_pacing_effective.set(label);
     }
 
     /// Register the wire-emit queue-depth gauge so the snapshot path can
@@ -1211,6 +1228,7 @@ impl OutputStatsAccumulator {
             av_skew: self.av_skew.get().map(|r| r.snapshot()),
             display_stats,
             wire_pacing_tier: self.wire_pacing_tier.get().cloned(),
+            egress_pacing_effective: self.egress_pacing_effective.get().cloned(),
             wire_pacing_late: self.wire_pacing_late.load(Ordering::Relaxed),
             wire_pacing_pinned_cpu: {
                 let v = self.wire_pacing_pinned_cpu.load(Ordering::Relaxed);
@@ -3587,6 +3605,10 @@ pub struct BondStatsHandle {
     pub scheduler: String,
     pub conn_stats: Arc<bonding_protocol::stats::BondConnStats>,
     pub paths: Vec<BondPathStatsHandle>,
+    /// Sender side: payloads over the per-datagram MTU budget, counted
+    /// by the bonded output's send loop (the bond layer neither drops
+    /// nor fragments them). Stays 0 on the receiver side.
+    pub oversize_payloads: Arc<std::sync::atomic::AtomicU64>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -3647,6 +3669,7 @@ pub fn bond_handle_to_leg_stats(h: &BondStatsHandle) -> BondLegStats {
                 retransmits_received: ps.retransmits_received,
                 keepalives_sent: ps.keepalives_sent,
                 keepalives_received: ps.keepalives_received,
+                rebuilds: ps.rebuilds,
                 // Gateway-mode legs report "gateway"; interface-mode
                 // legs report the kernel primitive that actually bound
                 // them (so_bindtodevice vs the unprivileged hint).
@@ -3690,6 +3713,15 @@ pub fn bond_handle_to_leg_stats(h: &BondStatsHandle) -> BondLegStats {
         role,
         scheduler: h.scheduler.clone(),
         throughput_bps,
+        // The receiver hold servo owns `current_hold_ms` (written on
+        // init + every retarget); senders never write it, so report it
+        // receiver-side only rather than a misleading 0.
+        hold_ms: match h.role {
+            BondStatsRole::Receiver => Some(snap.current_hold_ms),
+            BondStatsRole::Sender => None,
+        },
+        session_resets: snap.session_resets,
+        oversize_payloads: h.oversize_payloads.load(Ordering::Relaxed),
         packets_sent: snap.packets_sent,
         bytes_sent: snap.bytes_sent,
         packets_retransmitted: snap.packets_retransmitted,
@@ -4110,6 +4142,7 @@ mod bond_throughput_tests {
                 BondPathStatsHandle::new(0, "5G".to_string(), "udp".to_string(), p0.clone()),
                 BondPathStatsHandle::new(1, "starlink".to_string(), "udp".to_string(), p1.clone()),
             ],
+            oversize_payloads: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         };
 
         // The estimator caches for 1 s, so sample once, wait past the
@@ -4155,6 +4188,7 @@ mod bond_throughput_tests {
                 "udp".to_string(),
                 p0.clone(),
             )],
+            oversize_payloads: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         };
 
         let _ = bond_handle_to_leg_stats(&handle);
@@ -4168,5 +4202,51 @@ mod bond_throughput_tests {
             legs.paths[0].throughput_bps
         );
         assert_eq!(legs.throughput_bps, legs.paths[0].throughput_bps);
+    }
+
+    /// New wire fields: a receiver bond reports the hold servo's
+    /// `current_hold_ms` as `hold_ms` plus `session_resets`; a sender
+    /// reports its MTU-oversize counter and per-path `rebuilds`, and
+    /// omits `hold_ms` entirely (the servo never writes it on the
+    /// sender side).
+    #[test]
+    fn hold_resets_rebuilds_and_oversize_fields_serialize() {
+        let conn = Arc::new(BondConnStats::default());
+        conn.current_hold_ms.store(840, Ordering::Relaxed);
+        conn.session_resets.store(2, Ordering::Relaxed);
+        let p0 = PathStats::new();
+        p0.rebuilds.fetch_add(3, Ordering::Relaxed);
+
+        let mut handle = BondStatsHandle {
+            flow_id: 11,
+            role: BondStatsRole::Receiver,
+            scheduler: String::new(),
+            conn_stats: conn,
+            paths: vec![BondPathStatsHandle::new(
+                0,
+                "lte-0".to_string(),
+                "udp".to_string(),
+                p0,
+            )],
+            oversize_payloads: Arc::new(std::sync::atomic::AtomicU64::new(5)),
+        };
+
+        let legs = bond_handle_to_leg_stats(&handle);
+        assert_eq!(legs.hold_ms, Some(840));
+        assert_eq!(legs.session_resets, 2);
+        assert_eq!(legs.oversize_payloads, 5);
+        assert_eq!(legs.paths[0].rebuilds, 3);
+        let json = serde_json::to_value(&legs).unwrap();
+        assert_eq!(json["hold_ms"], 840);
+        assert_eq!(json["session_resets"], 2);
+        assert_eq!(json["oversize_payloads"], 5);
+        assert_eq!(json["paths"][0]["rebuilds"], 3);
+
+        // Sender role: hold_ms must be absent on the wire, not 0.
+        handle.role = BondStatsRole::Sender;
+        let legs = bond_handle_to_leg_stats(&handle);
+        assert_eq!(legs.hold_ms, None);
+        let json = serde_json::to_value(&legs).unwrap();
+        assert!(json.get("hold_ms").is_none());
     }
 }

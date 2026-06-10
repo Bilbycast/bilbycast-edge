@@ -75,6 +75,7 @@ Events are queued in an unbounded in-memory channel. When the edge is not connec
 | info | Input '{id}' removed from flow '{flow_id}' | Input hot-detached from a running flow via the `remove_input` WS command (or the `update_flow` / `update_config` diff). The fixer's per-input PSI cache is evicted so a later re-add under the same id doesn't carry stale PAT/PMT. Cross-flow subscribers see `RecvError::Closed` cleanly. |
 | warning | Input '{id}' failed to add to flow '{flow_id}': {error} | Hot-add refusal. Carries structured `error_code` on `command_ack`: `active_input_in_use`, `pid_bus_input_in_use`, `hitless_leg_change_requires_restart`, `input_already_member`, `input_not_member`, `input_resource_critical`, or `port_conflict` / `bind_failed` (caught by the 600 ms bind-failure window on listener inputs). |
 | warning | Master clock source input '{id}' is being removed from flow '{flow_id}' | **R5**. The input being removed is the operator-declared master-clock source (`flow.master_clock`). The PCR PLL coasts on its last-known frequency; the master clock's auto-resolver picks the next active input and re-locks. Output PCR may briefly drift until lock. Details: `{ error_code: "master_clock_input_removed", input_id, flow_id }`. |
+| warning | Flow '{id}' gained/lost a bonded input; N running UDP/RTP output(s) with unset egress_pacing keep their spawn-time '{mode}' pacing | A hot `add_input` / `remove_input` (or the `update_flow` input-set delta) flipped whether the flow's input set contains a `bonded` input, while UDP/RTP outputs whose `egress_pacing` is unset (auto) are running. Auto-resolution (`pcr` iff the flow has a bonded input) is evaluated once at output spawn and the surgical input hot-swap paths deliberately don't restart outputs, so the running pacing is stale until the operator restarts the listed outputs (or the flow). What runs right now is on `OutputStats.egress_pacing_effective`. Details: `{ error_code: "egress_pacing_auto_stale", flow_id, output_ids, running_mode, resolved_mode_now }`. |
 
 | warning | Edge-added A/V skew {n} ms on flow '{id}' exceeds the EBU R37 ±40 ms limit … | The exact lip-sync error introduced by this edge's PTS-touching stages (`FlowStats.av_skew`) exceeded ±40 ms for two consecutive 5 s polls. Details: `{ error_code: "av_skew_exceeded", skew_ms, worst_abs_ms, lipsync_trim_ms, threshold_ms }`. The configured lipsync trim counts toward the skew (a ±100 ms deliberate trim WILL alarm — by design, the operator asked for an offset that large). |
 | info | Edge-added A/V skew on flow '{id}' recovered to {n} ms | Skew back under 30 ms (hysteresis). Details: `{ error_code: "av_skew_recovered", skew_ms }`. |
@@ -164,14 +165,28 @@ meant to complement the live stats pane.
 | warning | bonded {input\|output} degraded — 1/N paths up (redundancy lost) | Bond dropped from ≥ 2 alive paths to exactly one | `{ path_id, path_name, scope, alive_count, total }` |
 | critical | bonded {input\|output} down — 0/N paths up (media plane offline) | Every path went dead | `{ path_id, path_name, scope, alive_count: 0, total }` |
 | info | bonded {input\|output} recovered — M/N paths up | Bond returned to ≥ 2 alive paths after a Degraded or Down state | `{ path_id, path_name, scope, alive_count, total }` |
+| warning | bonded {input\|output} bond sender restarted — reassembly re-anchored (epoch X → Y) | A *different* nonzero session epoch arrived on 2 consecutive control packets — the sender process restarted and the receiver dropped its reassembly anchor, pending NACKs, and FEC state. `old_epoch = 0` means no epoch had been adopted yet (first contact with an epoch-aware sender). Counted on `BondLegStats.session_resets` | `{ error_code: "bond_session_reset", old_epoch, new_epoch, path_id, path_name, scope }` |
+| warning | bonded {input\|output} path '{name}' (#{id}) socket rebuilt: {reason} | The interface watcher re-created, re-pinned, and swapped a UDP leg's socket in place. `reason` is one of `interface_changed` (ifindex churn — USB dongle re-plug / NIC re-enumeration), `interface_restored` (pinned NIC or source address came back), `send_errors` (a run of consecutive ENODEV / EADDRNOTAVAIL / ENETUNREACH / EHOSTUNREACH on send). Gateway-mode legs additionally get their policy route re-programmed. Counted per path on `BondPathLegStats.rebuilds` | `{ error_code: "bond_path_rebuilt", reason, path_id, path_name, scope }` |
+| warning | bonded {input\|output} path '{name}' (#{id}) interface lost — pinned NIC or source address disappeared | The pinned interface (or bound source address) vanished under a UDP leg. Emitted once per disappearance; a later `PathDead` (keepalive timeout) and an eventual `socket rebuilt: interface_restored` follow independently | `{ error_code: "bond_interface_lost", path_id, path_name, scope }` |
+| warning | bonded output '{id}': payload N B exceeds the per-datagram budget M B | A payload handed to the bond exceeded the per-datagram wire budget (1400 − 12 bond header − 29 AEAD envelope when `encryption_key` is set) — IP fragmentation is likely on WAN legs, and one lost fragment costs the whole datagram. The payload is sent anyway (never dropped or fragmented by the edge); emitted **once per output**, with the running count on `BondLegStats.oversize_payloads` | `{ error_code: "bond_payload_exceeds_mtu", output_id, payload_bytes, budget_bytes }` |
+| critical | bonded output '{id}': gateway route for path '{name}' (via {gw}) is gone and re-programming failed | The 5 s route-integrity re-assert (`BondRouteManager::is_intact`) found the leg's policy route missing (kernel flushes the private table on link-down / device-destroy without any watcher-visible signal) and `program()` failed — usually because the device is still absent (USB re-enumeration). Emitted once per failing streak; the re-assert keeps retrying every 5 s and logs a warn on the eventual repair. Until repaired the leg rides the main default route (cosmetic bond) | `{ error_code: "bond_gateway_route_lost", output_id, path_id, path_name, gateway }` |
 
-**`reason`** is one of `keepalive_timeout`, `receive_timeout`,
-`transport_error`. Per-path events are **flap-deduped with a 2 s
-grace window** — an alive↔dead transition arriving within 2 s of the
-opposite transition for the same path is suppressed so a flapping
-link doesn't flood the events feed (stats still reflect reality via
-`PathStats.dead`). Bond-aggregate events (`degraded` / `down` /
-`recovered`) always emit and are not flap-deduped.
+**`reason`** (on path-dead events) is one of `keepalive_timeout`,
+`receive_timeout`, `transport_error`. Per-path alive/dead events are
+**flap-deduped with a 2 s grace window** — an alive↔dead transition
+arriving within 2 s of the opposite transition for the same path is
+suppressed so a flapping link doesn't flood the events feed (stats
+still reflect reality via `PathStats.dead`). Bond-aggregate events
+(`degraded` / `down` / `recovered` / `session reset`) always emit and
+are not flap-deduped; rebuild / interface-lost events are rate-limited
+inside the bonding library (1 s minimum rebuild interval with
+exponential backoff up to 64 s while send-error rebuilds fail to clear
+the error run, 2 s watcher cadence) rather than deduped here.
+`send_errors` rebuilds on a path **already marked dead** are not
+emitted at all — a persistently unreachable gateway would otherwise
+produce one warning per backoff interval forever; the PathDead /
+PathAlive transitions are the operator's signal there (stats still
+count every rebuild via `BondPathLegStats.rebuilds`).
 
 **Source**: `src/engine/input_bonded.rs`,
 `src/engine/output_bonded.rs`, forwarder helper in
@@ -582,7 +597,7 @@ These are generated server-side in `bilbycast-manager/crates/manager-server/src/
 | `rtp` | 2 | RTP input bind and lifecycle |
 | `udp` | 2 | UDP input bind and lifecycle |
 | `rist` | 4 | RIST Simple Profile connection lifecycle |
-| `bond` | 5 | Bonded input/output — per-path alive/dead + bond-aggregate degraded/down/recovered |
+| `bond` | 9 | Bonded input/output — per-path alive/dead, bond-aggregate degraded/down/recovered, session reset (`bond_session_reset`), socket rebuild (`bond_path_rebuilt`), interface lost (`bond_interface_lost`), MTU-budget exceedance (`bond_payload_exceeds_mtu`) |
 | `ptp` | — | SMPTE ST 2110 PTP slave clock state changes (Phase 1) |
 | `network_leg` | — | SMPTE 2022-7 Red/Blue per-leg loss / recovery (Phase 1) |
 | `nmos` | — | NMOS IS-04 / IS-05 / IS-08 controller activity (Phase 1) |

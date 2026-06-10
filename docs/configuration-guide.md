@@ -1102,7 +1102,7 @@ Sends RTP-wrapped MPEG-TS packets to a unicast or multicast destination. Support
 | `dscp` | integer | No | `46` | DSCP value for QoS marking (RP 2129 C10). Range 0-63. Default 46 = Expedited Forwarding (RFC 4594). |
 | `program_number` | integer | No | `null` | MPTS → SPTS program filter. `null` = full MPTS passthrough; `Some(N)` = forward only program N as a rewritten single-program TS. Applied before FEC, so the receiver's FEC protects the filtered SPTS. Must be `> 0`. See [MPTS → SPTS filtering](#mpts--spts-filtering). |
 | `delay` | object | No | `null` | Output delay for stream synchronization. Modes: `{"mode":"fixed","ms":N}` adds constant delay; `{"mode":"target_ms","ms":N}` targets end-to-end latency (self-adjusting); `{"mode":"target_frames","frames":N,"fallback_ms":M}` targets latency in video frames (auto-detected fps). |
-| `egress_pacing` | string | No | `"forward"` | Egress pacing model for the wire emitter: `"forward"` (default — emit at input cadence, no re-pacing; lowest latency, recommended), `"pcr"` (open-loop re-pacing at PCR-implied instants, for SMPTE 2022-7 dual-leg coherence / strict-T-STD receivers), `"servo"` (closed-loop release-rate servo for a genuinely bursty unpaced ingress). A bounded residence cap guards against latency runaway in every mode. Manager-configurable; UI gated on the `egress_pacing` capability. |
+| `egress_pacing` | string | No | auto | Egress pacing model for the wire emitter: `"forward"` (emit at input cadence, no re-pacing; lowest latency, recommended for clean upstreams), `"pcr"` (open-loop re-pacing at PCR-implied instants, for SMPTE 2022-7 dual-leg coherence / strict-T-STD receivers / bond-reassembled cadence), `"servo"` (closed-loop release-rate servo for a genuinely bursty unpaced ingress). **Unset = auto**: resolves to `"pcr"` when the flow has a `bonded` input, else `"forward"` (see [Egress pacing auto-resolution](#egress-pacing-auto-resolution)). A bounded residence cap guards against latency runaway in every mode. Manager-configurable; UI gated on the `egress_pacing` capability. |
 | `egress_buffer_ms` | integer | No | `null` | Servo de-jitter cushion (ms of content). **Only valid with `egress_pacing: "servo"`** — rejected otherwise. Seeds and holds ~this much content in the egress queue, absorbing arrival jitter at the cost of that latency. Range 20-2000. `null` = no cushion (servo rate-trims only). |
 
 **Validation rules:**
@@ -1112,6 +1112,30 @@ Sends RTP-wrapped MPEG-TS packets to a unicast or multicast destination. Support
 - `program_number` must be `> 0` if set (program_number 0 is reserved for the NIT).
 - `delay`: `fixed` ms 0-10000; `target_ms` ms 1-10000; `target_frames` frames 0.01-300, fallback_ms 0-10000.
 - `egress_buffer_ms` requires `egress_pacing: "servo"` and must be 20-2000 ms.
+
+#### Egress pacing auto-resolution
+
+An **unset** `egress_pacing` on a UDP or RTP output is *auto*, resolved at
+output spawn: it becomes `"pcr"` when the flow's input set contains a
+`bonded` input — the bond reassembly buffer releases recovered packets in
+hold-time bursts, so forwarding at input cadence would put that burst
+structure straight onto the wire — and `"forward"` otherwise (exactly the
+pre-auto default, so non-bonded configs behave identically). **Upgrade
+note:** an existing bonded flow whose UDP/RTP outputs never set
+`egress_pacing` changes from `forward` to `pcr` on the release introducing
+auto-resolution — pin `"forward"` explicitly before upgrading to keep the
+old wire behaviour. The resolution is logged at `info` when it picks
+`"pcr"`, surfaced per output on `OutputStats.egress_pacing_effective`
+(`"auto (pcr)"` / `"auto (forward)"` vs a bare explicit mode), and is never
+written back to the config; an explicit `"forward"` / `"pcr"` / `"servo"`
+always wins, bonded or not.
+
+Because the resolution happens at output spawn, a **hot** input-set edit
+(`add_input` / `remove_input` / `update_flow` input delta) that flips the
+flow's bonded-input membership does NOT re-pace running outputs — they keep
+their spawn-time resolution and the edge emits a Warning
+(`egress_pacing_auto_stale`) listing the affected outputs; restart them (or
+the flow) to re-resolve.
 
 ### UDP Output
 
@@ -1138,7 +1162,7 @@ Sends raw MPEG-TS over UDP without RTP headers. Datagrams are TS-aligned (7×188
 | `dscp` | integer | No | `46` | DSCP value for QoS marking. Range 0-63. |
 | `program_number` | integer | No | `null` | MPTS → SPTS program filter. `null` = full MPTS passthrough; `Some(N)` = forward only program N as a rewritten single-program TS. Must be `> 0`. See [MPTS → SPTS filtering](#mpts--spts-filtering). |
 | `delay` | object | No | `null` | Output delay for stream synchronization (same modes as RTP output). Incompatible with `transport_mode: "audio_302m"`. |
-| `egress_pacing` | string | No | `"forward"` | Egress pacing model for the wire emitter: `"forward"` (default — emit at input cadence, no re-pacing; lowest latency, recommended), `"pcr"` (open-loop re-pacing at PCR-implied instants, for SMPTE 2022-7 dual-leg coherence / strict-T-STD receivers), `"servo"` (closed-loop release-rate servo for a genuinely bursty unpaced ingress). A bounded residence cap guards against latency runaway in every mode. Manager-configurable; UI gated on the `egress_pacing` capability. |
+| `egress_pacing` | string | No | auto | Egress pacing model for the wire emitter: `"forward"` (emit at input cadence, no re-pacing; lowest latency, recommended for clean upstreams), `"pcr"` (open-loop re-pacing at PCR-implied instants, for SMPTE 2022-7 dual-leg coherence / strict-T-STD receivers / bond-reassembled cadence), `"servo"` (closed-loop release-rate servo for a genuinely bursty unpaced ingress). **Unset = auto**: resolves to `"pcr"` when the flow has a `bonded` input, else `"forward"` (see [Egress pacing auto-resolution](#egress-pacing-auto-resolution)). A bounded residence cap guards against latency runaway in every mode. Manager-configurable; UI gated on the `egress_pacing` capability. |
 | `egress_buffer_ms` | integer | No | `null` | Servo de-jitter cushion (ms of content). **Only valid with `egress_pacing: "servo"`** — rejected otherwise. Seeds and holds ~this much content in the egress queue, absorbing arrival jitter at the cost of that latency. Range 20-2000. `null` = no cushion (servo rate-trims only). |
 
 **Validation rules:**

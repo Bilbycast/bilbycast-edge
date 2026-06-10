@@ -2971,9 +2971,11 @@ pub struct RtpOutputConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub interface_binding: Option<InterfaceBinding>,
     /// Egress pacing model for this compressed RTP output. See
-    /// [`EgressPacingMode`]. `None` → `forward` (emit at input cadence,
-    /// no re-pacing — the default every output should keep unless it has
-    /// a genuinely bursty unpaced ingress or a strict-T-STD receiver).
+    /// [`EgressPacingMode`]. `None` → auto: `pcr` when the flow has a
+    /// bonded input (re-smooths the reassembly burst cadence), else
+    /// `forward` (emit at input cadence — the default every other
+    /// output should keep unless it has a genuinely bursty unpaced
+    /// ingress or a strict-T-STD receiver).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub egress_pacing: Option<EgressPacingMode>,
     /// Egress de-jitter buffer setpoint (ms of content). See
@@ -2987,15 +2989,22 @@ pub struct RtpOutputConfig {
 /// Egress pacing model for compressed (MPEG-TS) UDP/RTP outputs — how
 /// `engine::wire_emit` times each datagram's release onto the wire.
 ///
-/// - **`forward`** (default): emit at the input's own cadence — no edge
+/// An **unset** field (`None` on the config struct) means **auto**: the
+/// engine resolves it per flow via [`EgressPacingMode::resolve_auto`] —
+/// `pcr` when the flow has a bonded input (the bond reassembly buffer
+/// delivers in hold-time bursts that nothing upstream has smoothed),
+/// otherwise `forward` (the historical default, unchanged).
+///
+/// - **`forward`**: emit at the input's own cadence — no edge
 ///   re-pacing. The upstream (SRT/RIST TSBPD, `media_player` pacer, a clean
 ///   encoder) has already paced the stream and the receiver re-clocks from
 ///   PCR, so re-metering only adds latency and holds I-frame bursts
 ///   (measured: receiver-buffer underrun → periodic freezing on a clean
 ///   feed). Lowest latency; output PCR accuracy ≈ input PDV.
 /// - **`pcr`**: open-loop PCR-delta re-pacing — emit each packet at its
-///   PCR-implied wall instant. For 2022-7 dual-leg coherence or a
-///   strict-T-STD receiver that can't ride input burst cadence.
+///   PCR-implied wall instant. For 2022-7 dual-leg coherence, a
+///   strict-T-STD receiver that can't ride input burst cadence, or a
+///   bond-reassembled cadence.
 /// - **`servo`**: closed-loop release-rate servo (leaky bucket at the
 ///   recovered source rate, ±5 % authority). For a genuinely bursty raw-UDP
 ///   ingress that nothing upstream has smoothed. Pair with
@@ -3008,7 +3017,8 @@ pub struct RtpOutputConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EgressPacingMode {
-    /// Emit at input cadence (no re-pacing). The default.
+    /// Emit at input cadence (no re-pacing). The auto-resolution default
+    /// for non-bonded flows.
     #[default]
     Forward,
     /// Open-loop PCR-delta re-pacing.
@@ -3016,6 +3026,33 @@ pub enum EgressPacingMode {
     /// Closed-loop release-rate servo (optionally cushioned via
     /// `egress_buffer_ms`).
     Servo,
+}
+
+impl EgressPacingMode {
+    /// Resolve an unset (`auto`) per-output `egress_pacing` for a
+    /// wire-emit (UDP/RTP-family) TS output. An explicit operator value
+    /// always wins; absent resolves to `pcr` when the output's flow has
+    /// at least one bonded input — the bond reassembly buffer releases
+    /// recovered packets in hold-time bursts, so forwarding at input
+    /// cadence would put that burst structure straight onto the wire —
+    /// and to `forward` (the historical default) otherwise.
+    pub fn resolve_auto(explicit: Option<Self>, flow_has_bonded_input: bool) -> Self {
+        match explicit {
+            Some(mode) => mode,
+            None if flow_has_bonded_input => Self::Pcr,
+            None => Self::Forward,
+        }
+    }
+
+    /// Stable lowercase label, matching the serde wire form. Used by
+    /// telemetry (`OutputStats.egress_pacing_effective`).
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Forward => "forward",
+            Self::Pcr => "pcr",
+            Self::Servo => "servo",
+        }
+    }
 }
 
 /// Configurable output delay for stream synchronization.
@@ -3163,9 +3200,11 @@ pub struct UdpOutputConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub interface_binding: Option<InterfaceBinding>,
     /// Egress pacing model for this compressed UDP output. See
-    /// [`EgressPacingMode`]. `None` → `forward` (emit at input cadence,
-    /// no re-pacing — the default every output should keep unless it has
-    /// a genuinely bursty unpaced ingress or a strict-T-STD receiver).
+    /// [`EgressPacingMode`]. `None` → auto: `pcr` when the flow has a
+    /// bonded input (re-smooths the reassembly burst cadence), else
+    /// `forward` (emit at input cadence — the default every other
+    /// output should keep unless it has a genuinely bursty unpaced
+    /// ingress or a strict-T-STD receiver).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub egress_pacing: Option<EgressPacingMode>,
     /// Egress de-jitter buffer setpoint, in milliseconds of content. Seeds
@@ -3977,6 +4016,19 @@ pub struct BondCongestionConfig {
     /// Token-bucket burst depth, milliseconds of capacity.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub burst_ms: Option<u32>,
+    /// Evidence bound on the probed capacity: once a delivered rate has
+    /// been measured, a link's estimate never exceeds
+    /// `delivered × probe_cap_mult` — bounds undersubscribed-bond
+    /// inflation while still letting the estimate grow after a failover.
+    /// Default 2.0. Valid [1.1, 10.0].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub probe_cap_mult: Option<f64>,
+    /// Window over which each link's minimum RTT baseline is tracked
+    /// (BBR-style), milliseconds — a route change that shifts the RTT
+    /// floor ages out of the window instead of reading as permanent
+    /// congestion. Default 10000. Valid [1000, 120000].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rtt_min_window_ms: Option<u64>,
 }
 
 /// Proactive FEC geometry for a bonded link (interleaved XOR). Off by
@@ -5958,6 +6010,62 @@ pub struct MxlAncOutputConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `egress_pacing` is tri-state on the wire: absent = auto (`None`),
+    /// explicit `forward` / `pcr` survive untouched. Existing configs
+    /// that never set the field keep deserializing to `None` (and
+    /// re-serialize without it) — the auto-resolution must never be
+    /// persisted back into the config.
+    #[test]
+    fn egress_pacing_tri_state_serde_back_compat() {
+        let base = r#"{
+            "id": "udp-1",
+            "name": "UDP out",
+            "dest_addr": "239.1.2.3:5004"
+        }"#;
+        let parsed: UdpOutputConfig = serde_json::from_str(base).expect("parse absent");
+        assert_eq!(parsed.egress_pacing, None, "absent field must stay None (auto)");
+        let reser = serde_json::to_string(&parsed).unwrap();
+        assert!(
+            !reser.contains("egress_pacing"),
+            "auto (None) must not be persisted: {reser}"
+        );
+
+        for (literal, expect) in [
+            ("forward", EgressPacingMode::Forward),
+            ("pcr", EgressPacingMode::Pcr),
+            ("servo", EgressPacingMode::Servo),
+        ] {
+            let json = format!(
+                r#"{{
+                    "id": "udp-1",
+                    "name": "UDP out",
+                    "dest_addr": "239.1.2.3:5004",
+                    "egress_pacing": "{literal}"
+                }}"#
+            );
+            let parsed: UdpOutputConfig =
+                serde_json::from_str(&json).unwrap_or_else(|e| panic!("parse {literal}: {e}"));
+            assert_eq!(parsed.egress_pacing, Some(expect));
+            let reser = serde_json::to_string(&parsed).unwrap();
+            assert!(reser.contains(&format!("\"egress_pacing\":\"{literal}\"")));
+        }
+    }
+
+    /// The auto-resolution rule: explicit always wins; unset resolves to
+    /// `pcr` only when the flow carries a bonded input, else `forward`
+    /// (the historical default).
+    #[test]
+    fn egress_pacing_auto_resolution_rule() {
+        use EgressPacingMode::*;
+        assert_eq!(EgressPacingMode::resolve_auto(None, false), Forward);
+        assert_eq!(EgressPacingMode::resolve_auto(None, true), Pcr);
+        // Explicit settings are never overridden — bonded or not.
+        for mode in [Forward, Pcr, Servo] {
+            assert_eq!(EgressPacingMode::resolve_auto(Some(mode), true), mode);
+            assert_eq!(EgressPacingMode::resolve_auto(Some(mode), false), mode);
+        }
+    }
 
     /// `DisplayScalingMode` defaults to `MatchSource` (today's runtime
     /// behaviour) and serializes snake_case so the JSON wire shape

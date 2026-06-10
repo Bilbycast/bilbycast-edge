@@ -1124,10 +1124,11 @@ fn edge_capabilities() -> Vec<&'static str> {
         // Per-output egress pacing model: compressed UDP/RTP outputs accept
         // `egress_pacing: forward | pcr | servo` (+ `egress_buffer_ms`
         // cushion, servo-only) as plain config — fully manager-configurable,
-        // no env vars. Edges WITHOUT this bit silently ignore the field on
-        // config push (serde unknown-field tolerance), so the manager UI
-        // MUST gate the pacing dropdown on this capability to avoid the
-        // silent-no-op trap.
+        // no env vars. Unset = auto, resolved at flow start (`pcr` when the
+        // flow has a bonded input, else `forward`). Edges WITHOUT this bit
+        // silently ignore the field on config push (serde unknown-field
+        // tolerance), so the manager UI MUST gate the pacing dropdown on
+        // this capability to avoid the silent-no-op trap.
         "egress_pacing",
         // Ingress de-jitter: raw UDP / RTP inputs run the ingress
         // counterpart to the egress servo — recover the source rate from
@@ -1147,6 +1148,17 @@ fn edge_capabilities() -> Vec<&'static str> {
         // this. Always present from this release on; the strict
         // companion below is conditional on CAP_NET_RAW.
         "interface-binding",
+        // Media-aware multi-path bonding (bilbycast-bonding): `bonded`
+        // input/output types, adaptive capacity scheduler + congestion
+        // knobs, gateway-mode policy routing, session-epoch reset,
+        // interface-watcher rebuilds, hold telemetry (`hold_ms`), and
+        // the bond stats block on Input/OutputStats. NOTE: the manager
+        // UI must NOT hide the bonded surface when this bit is absent
+        // — the bonded engine shipped releases before the bit did, so
+        // absence is the normal state for already-deployed bonding-
+        // capable edges. The bit exists so a future manager can gate
+        // NEW bonding sub-features (introduced alongside it) cleanly.
+        "bonding",
     ];
     // Strict mode (`SO_BINDTODEVICE`) requires `CAP_NET_RAW`. Probed
     // once at startup; advertised only when the setsockopt actually

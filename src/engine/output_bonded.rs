@@ -21,7 +21,7 @@
 //!   duplicates them across the two lowest-RTT paths.
 
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
@@ -29,8 +29,8 @@ use tokio_util::sync::CancellationToken;
 
 use bonding_transport::{
     BondSocket, BondSocketConfig, CapacityAwareScheduler, CongestionConfig, FecParams, PacketHints,
-    PathConfig as BondPathTxCfg, PathPrior, PathTransport as BondPathTxTransport,
-    RoundRobinScheduler, WeightedRttScheduler,
+    PathConfig as BondPathTxCfg, PathEvent, PathEventKind, PathPrior,
+    PathTransport as BondPathTxTransport, RoundRobinScheduler, WeightedRttScheduler,
 };
 
 use crate::config::models::{BondCongestionConfig, BondedOutputConfig, BondSchedulerKind};
@@ -45,6 +45,18 @@ use super::ts_pid_remapper::TsPidRemapper;
 use super::ts_program_filter::TsProgramFilter;
 
 const RTP_HEADER_MIN_SIZE: usize = 12;
+
+/// Conservative per-datagram wire budget for a bonded leg, bytes.
+/// 1400 clears the common WAN MTU floor (PPPoE / LTE carrier tunnels /
+/// Starlink) under the 1500-byte ethernet default — a bonded payload
+/// above the derived budget fragments at the IP layer, and one lost
+/// fragment costs the whole datagram on a lossy cellular leg.
+const BOND_WIRE_MTU: usize = 1400;
+/// Bond wire header size (`bonding-protocol` `packet.rs`).
+const BOND_HEADER_SIZE: usize = 12;
+/// ChaCha20-Poly1305 envelope overhead when `encryption_key` is set:
+/// 1 (0xBD magic) + 12 (nonce) + 16 (tag).
+const BOND_CRYPTO_OVERHEAD: usize = 29;
 
 /// Spawn a bonded output task.
 pub fn spawn_bonded_output(
@@ -164,6 +176,201 @@ async fn teardown_gateway_paths(flow_id: &str, path_ids: &[u8]) {
     }
 }
 
+/// Routing facts for one gateway-mode leg, captured at output start so
+/// the rebuild handler can re-program without re-parsing config.
+struct GatewayLeg {
+    path_id: u8,
+    name: String,
+    interface: String,
+    source: super::bond_routing::SourceNet,
+    gateway: std::net::IpAddr,
+}
+
+/// Extract the gateway-mode legs from a bonded output config. Parse
+/// failures are skipped — validation already rejected them, and
+/// `program_gateway_paths` applies the same rule.
+fn gateway_legs(config: &BondedOutputConfig) -> Vec<GatewayLeg> {
+    use crate::config::models::BondPathTransportConfig;
+    config
+        .paths
+        .iter()
+        .filter_map(|p| {
+            let BondPathTransportConfig::Udp {
+                interface,
+                gateway: Some(gw),
+                source: Some(src),
+                ..
+            } = &p.transport
+            else {
+                return None;
+            };
+            Some(GatewayLeg {
+                path_id: p.id,
+                name: p.name.clone(),
+                interface: interface.clone().unwrap_or_default(),
+                source: super::bond_routing::SourceNet::parse(src).ok()?,
+                gateway: gw.parse().ok()?,
+            })
+        })
+        .collect()
+}
+
+/// How often the re-program task verifies each gateway leg's policy
+/// route is still in effect (`BondRouteManager::is_intact`). Covers the
+/// kernel-silent failures: link-down flushes the private table without
+/// touching the address or ifindex (no watcher signal, sends still
+/// succeed via the main default route — cosmetic bond), and a failed
+/// re-program retries here until the device returns.
+const GATEWAY_ROUTE_REASSERT_INTERVAL: std::time::Duration =
+    std::time::Duration::from_secs(5);
+
+/// Re-program a gateway-mode leg's policy route when the bond watcher
+/// rebuilds its socket (`PathRebuilt`) or loses its watch target
+/// (`InterfaceLost`), plus a periodic integrity re-assert. Failure is
+/// loud: a leg whose route can't be restored silently falls through to
+/// the default route and collapses onto another leg's router.
+///
+/// `InterfaceLost` matters for the circularity it breaks: the leg's
+/// source address is added by `program()` itself, so after a USB
+/// modem re-plug drops it, the watcher polls `NoChange` forever (it
+/// only rebuilds when the target RETURNS) and `PathRebuilt` can never
+/// fire. Re-running `program()` (idempotent) re-adds the address; the
+/// watcher's next tick then sees it restored and rebuilds the socket.
+async fn run_gateway_route_reprogram(
+    mut rx: broadcast::Receiver<PathEvent>,
+    legs: Vec<GatewayLeg>,
+    output_id: String,
+    flow_id: String,
+    events: EventSender,
+    cancel: CancellationToken,
+) {
+    // Per-leg "re-assert already failing" latch so the periodic tick
+    // emits one Critical on entry into the failing state, not one per
+    // 5 s retry.
+    let mut reassert_failed = vec![false; legs.len()];
+    let mut reassert = tokio::time::interval(GATEWAY_ROUTE_REASSERT_INTERVAL);
+    reassert.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    reassert.tick().await; // swallow the immediate t=0 tick
+    loop {
+        tokio::select! {
+            _ = cancel.cancelled() => return,
+            _ = reassert.tick() => {
+                let Ok(mgr) = super::bond_routing::BondRouteManager::global().await else {
+                    continue;
+                };
+                for (i, leg) in legs.iter().enumerate() {
+                    if mgr.is_intact(&flow_id, leg.path_id).await {
+                        reassert_failed[i] = false;
+                        continue;
+                    }
+                    match mgr
+                        .program(&flow_id, leg.path_id, &leg.interface, leg.source, leg.gateway)
+                        .await
+                    {
+                        Ok(()) => {
+                            reassert_failed[i] = false;
+                            tracing::warn!(
+                                "bonded output '{output_id}': gateway route for path '{}' \
+                                 (#{}) was missing (link flap / device re-plug / route \
+                                 flush) — re-programmed",
+                                leg.name,
+                                leg.path_id
+                            );
+                        }
+                        Err(e) => {
+                            if !reassert_failed[i] {
+                                reassert_failed[i] = true;
+                                events.emit_flow_with_details(
+                                    EventSeverity::Critical,
+                                    category::MEDIA,
+                                    format!(
+                                        "bonded output '{output_id}': gateway route for path \
+                                         '{}' (via {}) is gone and re-programming failed: {e}. \
+                                         Retrying every {}s; until it succeeds this leg rides \
+                                         the default route (cosmetic bond).",
+                                        leg.name,
+                                        leg.gateway,
+                                        GATEWAY_ROUTE_REASSERT_INTERVAL.as_secs()
+                                    ),
+                                    &flow_id,
+                                    serde_json::json!({
+                                        "error_code": "bond_gateway_route_lost",
+                                        "output_id": output_id,
+                                        "path_id": leg.path_id,
+                                        "path_name": leg.name,
+                                        "gateway": leg.gateway.to_string(),
+                                    }),
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+            res = rx.recv() => match res {
+                Ok(ev) => {
+                    let rebuilt = match ev.kind {
+                        PathEventKind::PathRebuilt { .. } => true,
+                        // Source address vanished — re-add it so the
+                        // watcher can rebuild (see fn doc).
+                        PathEventKind::InterfaceLost => false,
+                        _ => continue,
+                    };
+                    let Some(leg) = legs.iter().find(|l| l.path_id == ev.path_id) else {
+                        continue;
+                    };
+                    let cause = if rebuilt { "socket rebuild" } else { "interface lost" };
+                    let result = match super::bond_routing::BondRouteManager::global().await {
+                        Ok(mgr) => {
+                            mgr.program(
+                                &flow_id,
+                                leg.path_id,
+                                &leg.interface,
+                                leg.source,
+                                leg.gateway,
+                            )
+                            .await
+                        }
+                        Err(e) => Err(e),
+                    };
+                    match result {
+                        Ok(()) => tracing::info!(
+                            "bonded output '{output_id}': re-programmed gateway route for \
+                             path '{}' (#{}) after {cause}",
+                            leg.name,
+                            leg.path_id
+                        ),
+                        // InterfaceLost commonly means the device is
+                        // still gone (USB re-enumeration takes seconds)
+                        // — the periodic re-assert above retries and
+                        // owns the Critical-on-persistent-failure
+                        // latch, so only a rebuild-triggered failure
+                        // is loud here.
+                        Err(e) if rebuilt => events.emit_flow(
+                            EventSeverity::Critical,
+                            category::MEDIA,
+                            format!(
+                                "bonded output '{output_id}': failed to re-program gateway \
+                                 route for path '{}' (via {}) after socket rebuild: {e}",
+                                leg.name, leg.gateway
+                            ),
+                            &flow_id,
+                        ),
+                        Err(e) => tracing::warn!(
+                            "bonded output '{output_id}': gateway route re-program for \
+                             path '{}' after {cause} failed ({e}); periodic re-assert \
+                             will retry",
+                            leg.name
+                        ),
+                    }
+                }
+                // Lagged: rebuild events are sparse; the next one re-syncs.
+                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(broadcast::error::RecvError::Closed) => return,
+            }
+        }
+    }
+}
+
 async fn bonded_output_run(
     config: &BondedOutputConfig,
     rx: &mut broadcast::Receiver<RtpPacket>,
@@ -261,12 +468,18 @@ async fn bonded_output_run(
             );
         }
     }
+    // Counts payloads that exceeded the per-datagram MTU budget (sent
+    // anyway — see the budget computation below). Shared with the bond
+    // stats handle so the snapshot surfaces it as
+    // `BondLegStats.oversize_payloads`.
+    let oversize_payloads = Arc::new(AtomicU64::new(0));
     stats.set_bond_stats(crate::stats::collector::BondStatsHandle {
         flow_id: config.bond_flow_id,
         role: crate::stats::collector::BondStatsRole::Sender,
         scheduler: scheduler_label,
         conn_stats: socket.stats(),
         paths: path_handles,
+        oversize_payloads: oversize_payloads.clone(),
     });
 
     tracing::info!(
@@ -297,6 +510,28 @@ async fn bonded_output_run(
         cancel.clone(),
     ));
 
+    // Gateway-mode legs lose their source address + policy route when
+    // the underlying device bounces (the kernel flushes both on
+    // link-down), so a watcher-driven socket rebuild alone would leave
+    // the leg riding the default route — collapsing it onto another
+    // leg's router. Re-program the leg's route on every PathRebuilt
+    // AND on InterfaceLost (the address is edge-programmed, so nothing
+    // else ever re-adds it and the watcher's rebuild is gated on its
+    // return), plus a periodic is_intact re-assert for kernel-silent
+    // route flushes. `program()` is idempotent per (flow_id, path_id)
+    // and re-ensures the source address on the NIC.
+    let gw_legs = gateway_legs(config);
+    if !gw_legs.is_empty() {
+        tokio::spawn(run_gateway_route_reprogram(
+            socket.subscribe_events(),
+            gw_legs,
+            config.id.clone(),
+            flow_id.to_string(),
+            events.clone(),
+            cancel.clone(),
+        ));
+    }
+
     // Optional media-aware NAL-priority tagging — used by both the
     // legacy MediaAware policy and the new Adaptive policy.
     let mut media_sched = match config.scheduler {
@@ -323,6 +558,20 @@ async fn bonded_output_run(
         }
     });
     let mut remap_scratch: Vec<u8> = Vec::new();
+
+    // Per-datagram payload budget under the WAN MTU floor: bond header
+    // plus (when encryption is on) the AEAD envelope ride on every
+    // datagram. Oversize payloads are sent anyway (the bond layer
+    // neither drops nor fragments) but flagged once per output —
+    // IP-layer fragmentation on a lossy cellular leg multiplies loss.
+    let payload_budget = BOND_WIRE_MTU
+        - BOND_HEADER_SIZE
+        - if config.encryption_key.is_some() {
+            BOND_CRYPTO_OVERHEAD
+        } else {
+            0
+        };
+    let mtu_warned = AtomicBool::new(false);
 
     loop {
         tokio::select! {
@@ -359,6 +608,35 @@ async fn bonded_output_run(
                     } else {
                         filtered
                     };
+
+                    // MTU guard: flag (never drop or fragment) payloads
+                    // that will exceed the per-datagram wire budget.
+                    // One Warning per output; the running count rides
+                    // on `BondLegStats.oversize_payloads`.
+                    if remapped.len() > payload_budget {
+                        oversize_payloads.fetch_add(1, Ordering::Relaxed);
+                        if !mtu_warned.swap(true, Ordering::Relaxed) {
+                            events.emit_flow_with_details(
+                                EventSeverity::Warning,
+                                category::BOND,
+                                format!(
+                                    "bonded output '{}': payload {} B exceeds the per-datagram \
+                                     budget {} B — IP fragmentation likely on WAN legs \
+                                     (reported once; see bond stats oversize_payloads)",
+                                    config.id,
+                                    remapped.len(),
+                                    payload_budget
+                                ),
+                                flow_id,
+                                serde_json::json!({
+                                    "error_code": "bond_payload_exceeds_mtu",
+                                    "output_id": config.id,
+                                    "payload_bytes": remapped.len(),
+                                    "budget_bytes": payload_budget,
+                                }),
+                            );
+                        }
+                    }
 
                     // Decide priority / marker from media-aware
                     // scheduler (or fall back to defaults).
@@ -452,6 +730,12 @@ fn build_congestion(c: &BondCongestionConfig) -> CongestionConfig {
     }
     if let Some(v) = c.burst_ms {
         cc.burst_secs = v as f32 / 1000.0;
+    }
+    if let Some(v) = c.probe_cap_mult {
+        cc.probe_cap_mult = v;
+    }
+    if let Some(v) = c.rtt_min_window_ms {
+        cc.rtt_min_window = std::time::Duration::from_millis(v);
     }
     cc
 }

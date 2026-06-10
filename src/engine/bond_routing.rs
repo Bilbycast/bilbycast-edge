@@ -306,6 +306,36 @@ impl BondRouteManager {
         Ok(())
     }
 
+    /// Whether a leg's programmed routing is still in effect: the
+    /// `(flow_id, path_id)` key is active AND its private table still
+    /// holds at least one route. The kernel silently empties the table
+    /// on link-down / device-destroy (USB modem re-plug) without any
+    /// event the socket watcher can see — the `from <source>` rule then
+    /// falls through to the main default route and the leg collapses
+    /// onto another leg's router while sends keep succeeding. `false`
+    /// also covers a `program()` that never succeeded (key not active).
+    pub async fn is_intact(&self, flow_id: &str, path_id: u8) -> bool {
+        let key = (flow_id.to_string(), path_id);
+        let table = match self.active.lock().await.get(&key) {
+            Some(route) => route.slot.table,
+            None => return false,
+        };
+        use rtnetlink::RouteMessageBuilder;
+        let filters = [
+            RouteMessageBuilder::<Ipv4Addr>::new().build(),
+            RouteMessageBuilder::<Ipv6Addr>::new().build(),
+        ];
+        for filter in filters {
+            let mut routes = self.handle.route().get(filter).execute();
+            while let Ok(Some(route)) = routes.try_next().await {
+                if route_table(&route) == table {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
     /// Remove a leg's rule + flush its table. Idempotent; never errors
     /// (best-effort teardown). The source address is intentionally
     /// left in place.

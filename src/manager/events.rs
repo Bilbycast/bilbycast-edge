@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::{broadcast, mpsc};
 use tokio_util::sync::CancellationToken;
 
-use bonding_transport::{PathDeadReason, PathEvent, PathEventKind, PathId};
+use bonding_transport::{PathDeadReason, PathEvent, PathEventKind, PathId, PathRebuildReason};
 
 /// Capacity of the manager event channel. Events are infrequent relative to
 /// stats; this size lets a manager outage of several minutes pass without
@@ -799,6 +799,49 @@ fn translate_path_event(
             ),
             serde_json::json!({ "alive_count": alive_count, "total": total }),
         ),
+        PathEventKind::SessionReset { old_epoch, new_epoch } => (
+            // Receiver-side: a different nonzero session epoch arrived on
+            // 2 consecutive control packets — the sender restarted and the
+            // reassembly buffer / FEC / pending-NACK state was dropped.
+            EventSeverity::Warning,
+            format!(
+                "{scope_label} bond sender restarted — reassembly re-anchored \
+                 (epoch {old_epoch} → {new_epoch})"
+            ),
+            serde_json::json!({
+                "error_code": "bond_session_reset",
+                "old_epoch": old_epoch,
+                "new_epoch": new_epoch,
+            }),
+        ),
+        PathEventKind::PathRebuilt { reason } => (
+            // The leg's UDP socket was re-created, re-pinned, and swapped
+            // in place (interface churn / a run of route or device send
+            // errors). Not flap-deduped: the library rate-limits rebuilds
+            // itself (SEND_ERR_REBUILD_MIN_INTERVAL / watcher cadence).
+            EventSeverity::Warning,
+            format!(
+                "{scope_label} path {path_label} socket rebuilt: {}",
+                reason.as_str()
+            ),
+            serde_json::json!({
+                "error_code": "bond_path_rebuilt",
+                "reason": path_rebuild_reason_tag(reason),
+            }),
+        ),
+        PathEventKind::InterfaceLost => (
+            // The pinned NIC or bound source address disappeared under a
+            // UDP leg (USB dongle pull, DHCP loss). Distinct from the later
+            // PathDead (keepalive timeout) so the operator sees the root
+            // cause immediately; PathRebuilt { interface_restored } fires
+            // when it returns.
+            EventSeverity::Warning,
+            format!(
+                "{scope_label} path {path_label} interface lost — pinned NIC \
+                 or source address disappeared"
+            ),
+            serde_json::json!({ "error_code": "bond_interface_lost" }),
+        ),
     };
 
     let mut details = serde_json::json!({
@@ -837,6 +880,14 @@ fn path_dead_reason_tag(reason: &PathDeadReason) -> &'static str {
         PathDeadReason::KeepaliveTimeout => "keepalive_timeout",
         PathDeadReason::ReceiveTimeout => "receive_timeout",
         PathDeadReason::TransportError => "transport_error",
+    }
+}
+
+fn path_rebuild_reason_tag(reason: &PathRebuildReason) -> &'static str {
+    match reason {
+        PathRebuildReason::InterfaceChanged => "interface_changed",
+        PathRebuildReason::InterfaceRestored => "interface_restored",
+        PathRebuildReason::SendErrors => "send_errors",
     }
 }
 
@@ -1143,6 +1194,81 @@ mod tests {
             &mut last,
         );
         assert!(ev.is_some(), "different path must not inherit another path's grace");
+    }
+
+    /// `SessionReset` emits a Warning with `error_code =
+    /// "bond_session_reset"` and the old/new epochs in details — the
+    /// manager UI keys the "sender restarted" banner off this shape.
+    #[test]
+    fn session_reset_event_shape() {
+        let mut last = HashMap::new();
+        let ev = translate_path_event(
+            &make_event(
+                2,
+                PathEventKind::SessionReset {
+                    old_epoch: 0xDEAD,
+                    new_epoch: 0xBEEF,
+                },
+            ),
+            BondEventScope::Input,
+            "in-1",
+            "flow-1",
+            &mut last,
+        )
+        .unwrap();
+        assert_eq!(ev.severity, EventSeverity::Warning);
+        assert_eq!(ev.category, category::BOND);
+        assert_eq!(ev.flow_id.as_deref(), Some("flow-1"));
+        assert_eq!(ev.input_id.as_deref(), Some("in-1"));
+        assert!(ev.message.contains("re-anchored"));
+        let details = ev.details.unwrap();
+        assert_eq!(details["error_code"], "bond_session_reset");
+        assert_eq!(details["old_epoch"], 0xDEAD);
+        assert_eq!(details["new_epoch"], 0xBEEF);
+    }
+
+    /// `PathRebuilt` / `InterfaceLost` emit per-path Warnings with
+    /// stable error codes; rebuilds bypass the alive/dead flap-dedup
+    /// (the library rate-limits them itself).
+    #[test]
+    fn path_rebuilt_and_interface_lost_event_shapes() {
+        let mut last = HashMap::new();
+        // Seed a fresh per-path marker — rebuild events must not be
+        // suppressed by the alive/dead grace window.
+        last.insert(3, (PathEventKindMarker::Dead, Instant::now()));
+
+        let ev = translate_path_event(
+            &make_event(
+                3,
+                PathEventKind::PathRebuilt {
+                    reason: PathRebuildReason::InterfaceChanged,
+                },
+            ),
+            BondEventScope::Output,
+            "out-1",
+            "flow-1",
+            &mut last,
+        )
+        .unwrap();
+        assert_eq!(ev.severity, EventSeverity::Warning);
+        assert_eq!(ev.output_id.as_deref(), Some("out-1"));
+        assert!(ev.message.contains("rebuilt"));
+        let details = ev.details.unwrap();
+        assert_eq!(details["error_code"], "bond_path_rebuilt");
+        assert_eq!(details["reason"], "interface_changed");
+
+        let ev = translate_path_event(
+            &make_event(3, PathEventKind::InterfaceLost),
+            BondEventScope::Output,
+            "out-1",
+            "flow-1",
+            &mut last,
+        )
+        .unwrap();
+        assert_eq!(ev.severity, EventSeverity::Warning);
+        let details = ev.details.unwrap();
+        assert_eq!(details["error_code"], "bond_interface_lost");
+        assert_eq!(details["path_id"], 3);
     }
 }
 

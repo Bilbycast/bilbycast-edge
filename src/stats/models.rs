@@ -880,6 +880,16 @@ pub struct OutputStats {
     /// Backward-compatible additive field — old managers ignore it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wire_pacing_tier: Option<String>,
+    /// The egress pacing mode this output actually runs, resolved at
+    /// spawn. Bare mode ("forward" / "pcr" / "servo") for an explicit
+    /// operator value; "auto (pcr)" / "auto (forward)" when the config
+    /// field was unset and the engine resolved it (pcr iff the flow had
+    /// a bonded input at spawn). Lets an operator see which mode an
+    /// auto output landed on after an upgrade or an input-set change.
+    /// Only present on UDP/RTP-family outputs. Backward-compatible
+    /// additive field — old managers ignore it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub egress_pacing_effective: Option<String>,
     /// Number of datagrams the kernel rejected as late (target tx time
     /// landed in the past) on the SO_TXTIME release path. Always 0 on
     /// the userspace-sleep release paths. Backward-compatible additive
@@ -1772,6 +1782,22 @@ pub struct BondLegStats {
     /// Older edges omit this (serde default `0`).
     #[serde(default)]
     pub throughput_bps: u64,
+    /// Receiver side only: the adaptive hold servo's **current**
+    /// reorder/recovery budget in milliseconds (floor `hold_ms`,
+    /// ceiling `hold_max_ms`; fixed at `hold_ms` when no ceiling is
+    /// configured). `None` on the sender side and on older edges.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hold_ms: Option<u64>,
+    /// Receiver side: times the bond dropped its reassembly anchor
+    /// because the sender restarted with a new session epoch. Older
+    /// edges omit this (serde default `0`).
+    #[serde(default)]
+    pub session_resets: u64,
+    /// Sender side: payloads that exceeded the per-datagram MTU budget
+    /// (sent anyway — the bond layer neither drops nor fragments; see
+    /// the `bond_payload_exceeds_mtu` event). Older edges omit this.
+    #[serde(default)]
+    pub oversize_payloads: u64,
 
     // ── Aggregate sender-side counters ──
     pub packets_sent: u64,
@@ -1838,6 +1864,11 @@ pub struct BondPathLegStats {
     pub retransmits_received: u64,
     pub keepalives_sent: u64,
     pub keepalives_received: u64,
+    /// Socket rebuilds performed on this leg by the interface watcher
+    /// (UDP paths only — interface churn / send-error runs). Older
+    /// edges omit this (serde default `0`).
+    #[serde(default)]
+    pub rebuilds: u64,
     /// How this leg's egress is pinned to its link:
     /// `"gateway"` (edge-programmed policy route via a router),
     /// `"so_bindtodevice"` (hard NIC bind, needs CAP_NET_RAW),
