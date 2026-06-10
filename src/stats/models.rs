@@ -995,6 +995,14 @@ pub struct DisplayStats {
     pub frames_repeated: u64,
     /// ALSA xrun (`EPIPE`) count over the output's lifetime.
     pub audio_underruns: u64,
+    /// True when the audio decode stage delivered blocks at some point
+    /// and the counter has since frozen for ≥ 5 s while the output runs —
+    /// audio-only death (dropped audio PID, silent demux). Distinct from
+    /// `audio_underruns`, which only counts inside an ALSA write attempt
+    /// and stays 0 when no audio reaches the writer at all. Always false
+    /// for sources that never carried audio.
+    #[serde(default)]
+    pub audio_stalled: bool,
     /// EMA of the signed video-vs-audio offset (positive = video late
     /// relative to the audio master clock), in milliseconds.
     pub av_sync_offset_ms: i32,
@@ -1516,8 +1524,17 @@ pub struct Tr101290Stats {
 
     // ── Summary ──
 
-    /// `true` when all Priority 1 error counters are zero.
+    /// `true` when all Priority 1 error counters are zero AND no
+    /// PMT-referenced continuous-media PID is currently missing
+    /// (`missing_continuous_pids == 0` — P1 PID_error is a state, so the
+    /// flag holds false for the duration of the outage, not just the
+    /// snapshot the latch fired in).
     pub priority1_ok: bool,
+    /// GAUGE: PMT-referenced continuous-media PIDs (video/audio,
+    /// descriptor-classified 0x06) currently absent from the stream.
+    /// Sparse essences (teletext / subtitles / SCTE-35) never count.
+    #[serde(default)]
+    pub missing_continuous_pids: u64,
     /// `true` when all Priority 2 error counters are zero.
     pub priority2_ok: bool,
     /// `true` when all Priority 3 error counters (P2-extended + P3) are

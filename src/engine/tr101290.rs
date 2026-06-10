@@ -639,6 +639,28 @@ fn is_data_only_stream_type(stream_type: u8) -> bool {
     matches!(stream_type, 0x05 | 0x0B | 0x0C | 0x0D | 0x14)
 }
 
+/// Whether a PMT ES entry carries CONTINUOUS media — i.e. its absence is
+/// always a fault, never a quiet period. Feeds the persistent
+/// `missing_continuous_pids` gauge: only these PIDs may hold
+/// `priority1_ok` false while latched in `es_errored`. Sparse essences —
+/// teletext / DVB subtitles (0x06 without an audio descriptor), SCTE-35
+/// (0x86), anything unrecognised — still fire the one-shot `pid_errors`
+/// counter but must not pin flow health to Error between bursts.
+/// 0x06 is descriptor-classified via [`crate::engine::ts_parse::descriptor_audio_kind`]
+/// (DVB AC-3 0x6A / E-AC-3 0x7A / AAC 0x7C → continuous audio).
+fn is_continuous_media_es(stream_type: u8, descriptors: &[u8]) -> bool {
+    match stream_type {
+        // Video: MPEG-1/2, MPEG-4 part 2, H.264 (+SVC/MVC), HEVC,
+        // JPEG-2000, AVS, VC-1
+        0x01 | 0x02 | 0x10 | 0x1B | 0x1F | 0x20 | 0x21 | 0x24 | 0x42 | 0xEA => true,
+        // Audio: MPEG-1/2 layer I/II, AAC ADTS, AAC LATM, ATSC AC-3 / E-AC-3
+        0x03 | 0x04 | 0x0F | 0x11 | 0x81 | 0x87 => true,
+        // Private PES: audio only when descriptor-tagged.
+        0x06 => crate::engine::ts_parse::descriptor_audio_kind(descriptors).is_some(),
+        _ => false,
+    }
+}
+
 /// Extract elementary stream PIDs from a PMT section and register them
 /// for PID error tracking (TR-101290 Priority 1). Data-only stream types
 /// (DSM-CC carousels, private sections) are filtered out — see
@@ -695,6 +717,17 @@ fn extract_es_pids_from_pmt(pkt: &[u8], state: &mut crate::stats::collector::Tr1
             new_es_pids.insert(es_pid);
             // Register A/V ES PID if not already tracked
             state.es_pids.entry(es_pid).or_insert(None);
+            // Continuous-media classification for the persistent
+            // missing-PID gauge (descriptor-aware for 0x06).
+            let desc_end = (pos + 5 + es_info_length).min(data_end);
+            let descriptors = if pos + 5 <= desc_end {
+                &pkt[pos + 5..desc_end]
+            } else {
+                &[][..]
+            };
+            state
+                .es_pid_continuous
+                .insert(es_pid, is_continuous_media_es(stream_type, descriptors));
         }
         pos += 5 + es_info_length;
     }
@@ -719,6 +752,9 @@ fn extract_es_pids_from_pmt(pkt: &[u8], state: &mut crate::stats::collector::Tr1
         .retain(|pid, _| new_es_pids.contains(pid));
     state
         .pcr_tracker
+        .retain(|pid, _| new_es_pids.contains(pid));
+    state
+        .es_pid_continuous
         .retain(|pid, _| new_es_pids.contains(pid));
     // Drop error latches for PIDs that are no longer referenced; if they
     // ever come back, they get a fresh chance to fire one error.
@@ -869,6 +905,19 @@ fn check_pat_pmt_timeouts(stats: &Tr101290Accumulator) {
         stats.window_pid_errors.fetch_add(1, Ordering::Relaxed);
         state.es_errored.insert(pid);
     }
+    // Refresh the persistent missing-PID gauge every sweep (not only when
+    // a new latch fired) so it also FALLS when a PID resumes — the
+    // observe path clears `es_errored` per-PID; this picks that up within
+    // one 500 ms sweep. Only continuous-media PIDs count: sparse essences
+    // latch the one-shot counter above but never hold health in Error.
+    let missing_continuous = state
+        .es_errored
+        .iter()
+        .filter(|pid| state.es_pid_continuous.get(pid).copied().unwrap_or(false))
+        .count() as u64;
+    stats
+        .missing_continuous_pids
+        .store(missing_continuous, Ordering::Relaxed);
 
     // ── P2-extended timeouts ──
     // PCR repetition (§5.2.2): a PCR-bearing PID must emit a PCR within
@@ -977,6 +1026,23 @@ fn check_pat_pmt_timeouts(stats: &Tr101290Accumulator) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn continuous_media_classification() {
+        // Video + audio stream types are continuous regardless of descriptors.
+        assert!(is_continuous_media_es(0x1B, &[]));
+        assert!(is_continuous_media_es(0x24, &[]));
+        assert!(is_continuous_media_es(0x0F, &[]));
+        assert!(is_continuous_media_es(0x81, &[]));
+        // 0x06 private PES: continuous ONLY with a DVB audio descriptor
+        // (AC-3 0x6A here) — bare/teletext/subtitle 0x06 is sparse.
+        assert!(is_continuous_media_es(0x06, &[0x6A, 0x01, 0x44]));
+        assert!(!is_continuous_media_es(0x06, &[]));
+        assert!(!is_continuous_media_es(0x06, &[0x56, 0x05, 0, 0, 0, 0, 0])); // teletext
+        // SCTE-35 and unknown/private types never hold health.
+        assert!(!is_continuous_media_es(0x86, &[]));
+        assert!(!is_continuous_media_es(0xC0, &[]));
+    }
 
     /// Build a minimal 188-byte TS packet.
     fn make_ts_packet(pid: u16, cc: u8, payload_flag: bool) -> Vec<u8> {

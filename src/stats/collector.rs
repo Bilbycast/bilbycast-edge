@@ -178,6 +178,13 @@ pub struct OutputStatsAccumulator {
     // does NOT restart outputs) would report `active` forever off the
     // lifetime counter.
     display_frames_fresh: crate::stats::throughput::CounterFreshness,
+    // Same prev-sample tracker over the audio decode stage's cumulative
+    // `output_blocks` counter. Catches AUDIO-ONLY death on a display
+    // output (video keeps rendering, ALSA goes silent — e.g. the source
+    // drops its audio PID, or the demux stops producing audio PES):
+    // `audio_underruns` only counts inside a write attempt, so a starved
+    // audio task that never reaches `writei` registers nothing at all.
+    display_audio_fresh: crate::stats::throughput::CounterFreshness,
 }
 
 /// A display output whose `frames_displayed` counter has not advanced for
@@ -729,6 +736,7 @@ impl OutputStatsAccumulator {
             egress_shed: AtomicU64::new(0),
             wire_emit_depth: OnceLock::new(),
             display_frames_fresh: crate::stats::throughput::CounterFreshness::new(),
+            display_audio_fresh: crate::stats::throughput::CounterFreshness::new(),
         }
     }
 
@@ -1120,11 +1128,24 @@ impl OutputStatsAccumulator {
                 source_stream_type: h.stats.source_stream_type.load(Ordering::Relaxed),
             }
         });
+        // Audio-only stall on a display output: the decode stage delivered
+        // blocks at some point, then the counter froze for the stall
+        // window. The `> 0` guard keeps a legitimately video-only source
+        // from reading as stalled (it never had audio to lose).
+        let display_audio_blocks = audio_decode_stats
+            .as_ref()
+            .map(|a| a.output_blocks)
+            .unwrap_or(0);
+        let display_audio_stalled = display_audio_blocks > 0
+            && !self
+                .display_audio_fresh
+                .advanced_within(display_audio_blocks, DISPLAY_FRAMES_STALL_WINDOW);
         let display_stats = self.display_stats.get().map(|h| crate::stats::models::DisplayStats {
             frames_displayed: h.counters.frames_displayed.load(Ordering::Relaxed),
             frames_dropped_late: h.counters.frames_dropped_late.load(Ordering::Relaxed),
             frames_repeated: h.counters.frames_repeated.load(Ordering::Relaxed),
             audio_underruns: h.counters.audio_underruns.load(Ordering::Relaxed),
+            audio_stalled: display_audio_stalled,
             av_sync_offset_ms: h.counters.load_av_offset_ms(),
             current_resolution: h.current_resolution.clone(),
             current_refresh_hz: h.current_refresh_hz,
@@ -1392,6 +1413,14 @@ pub struct Tr101290State {
     pub pmt_errored: std::collections::HashSet<u16>,
     /// Same latch but for ES PIDs. See `pmt_errored`.
     pub es_errored: std::collections::HashSet<u16>,
+    /// Per-ES-PID continuous-media flag from the PMT (stream_type +
+    /// descriptor classification — 0x06 counts only when descriptor-tagged
+    /// as DVB audio). Only continuous PIDs feed the persistent
+    /// `missing_continuous_pids` gauge: sparse essences (teletext,
+    /// subtitles, SCTE-35) latch `es_errored` for the one-shot counter but
+    /// must never hold flow health in Error. Pruned in lockstep with
+    /// `es_pids`.
+    pub es_pid_continuous: HashMap<u16, bool>,
     /// Latch for `pcr_repetition_errors` — same one-fire-per-stall semantic.
     pub pcr_repetition_errored: std::collections::HashSet<u16>,
     /// Latch for `pts_errors` — same one-fire-per-stall semantic.
@@ -1446,6 +1475,7 @@ impl Default for Tr101290State {
             pcr_repetition_errored: std::collections::HashSet::new(),
             pts_errored: std::collections::HashSet::new(),
             first_pat_time: None,
+            es_pid_continuous: HashMap::new(),
         }
     }
 }
@@ -1506,6 +1536,17 @@ pub struct Tr101290Accumulator {
     pub window_rst_errors: AtomicU64,
     pub window_tdt_errors: AtomicU64,
 
+    // ── Gauges (current state, not counters) ──
+    /// Number of PMT-referenced CONTINUOUS-media PIDs (video/audio,
+    /// descriptor-classified for 0x06) currently latched missing in
+    /// `es_errored`. Unlike the windowed `pid_errors` counter — which
+    /// fires once per stall and lets `priority1_ok` recover within one
+    /// snapshot — this gauge holds while the PID stays absent, so a flow
+    /// whose advertised video/audio never arrives (PSI-only assembled
+    /// output, dead passthrough PID) reads Error persistently instead of
+    /// flickering for ~1 s. Sparse essences are excluded by construction.
+    pub missing_continuous_pids: AtomicU64,
+
     // Internal state
     pub state: Mutex<Tr101290State>,
 }
@@ -1554,6 +1595,7 @@ impl Tr101290Accumulator {
             window_eit_errors: AtomicU64::new(0),
             window_rst_errors: AtomicU64::new(0),
             window_tdt_errors: AtomicU64::new(0),
+            missing_continuous_pids: AtomicU64::new(0),
             state: Mutex::new(Tr101290State::default()),
         }
     }
@@ -1612,7 +1654,18 @@ impl Tr101290Accumulator {
 
         // Priority flags based on windowed counters (current health, not historical)
         let in_sync = { self.state.lock().unwrap().in_sync };
-        let priority1_ok = in_sync && w_cc == 0 && w_pat == 0 && w_pmt == 0 && w_pid == 0;
+        // `missing_continuous_pids` is a GAUGE, not a windowed counter: it
+        // holds priority1_ok false for as long as an advertised video/audio
+        // PID stays absent (TR 101 290 P1 PID_error is a state, not an
+        // edge). Without it, the one-shot latched `pid_errors` lets P1
+        // recover within one snapshot while the PID is still missing.
+        let missing_continuous = self.missing_continuous_pids.load(Ordering::Relaxed);
+        let priority1_ok = in_sync
+            && w_cc == 0
+            && w_pat == 0
+            && w_pmt == 0
+            && w_pid == 0
+            && missing_continuous == 0;
         let priority2_ok = w_tei == 0
             && w_crc == 0
             && w_pcr_disc == 0
@@ -1659,6 +1712,7 @@ impl Tr101290Accumulator {
             window_pcr_discontinuity_errors: w_pcr_disc,
             window_pcr_accuracy_errors: w_pcr_acc,
             priority1_ok,
+            missing_continuous_pids: missing_continuous,
             priority2_ok,
             priority3_ok,
             pts_errors: pts,
@@ -3180,7 +3234,15 @@ impl FlowStatsAccumulator {
         let packets_lost = self.input_loss.load(Ordering::Relaxed).max(rist_loss);
         let bw_exceeded = self.bandwidth_exceeded.load(Ordering::Relaxed);
         let bw_blocked = self.bandwidth_blocked.load(Ordering::Relaxed);
-        let health = derive_flow_health(input_bitrate, packets_lost, &tr101290_snap, bw_exceeded, bw_blocked);
+        let assembly_health_snap = self.assembly_health.read().ok().and_then(|g| g.clone());
+        let health = derive_flow_health(
+            input_bitrate,
+            packets_lost,
+            &tr101290_snap,
+            bw_exceeded,
+            bw_blocked,
+            assembly_health_snap.as_ref(),
+        );
 
         let active_input_id = self
             .active_input_id
@@ -4100,6 +4162,7 @@ fn derive_flow_health(
     tr101290: &Option<Tr101290Stats>,
     bandwidth_exceeded: bool,
     bandwidth_blocked: bool,
+    assembly_health: Option<&crate::stats::models::AssemblyHealth>,
 ) -> FlowHealth {
     if let Some(tr) = tr101290 {
         // Critical: sync loss or sustained errors
@@ -4108,6 +4171,19 @@ fn derive_flow_health(
         }
         // Error: P1 errors (CC, PAT, PMT)
         if !tr.priority1_ok {
+            return FlowHealth::Error;
+        }
+    }
+
+    // Assembled flows: the flow-level input bitrate is the SUM over every
+    // referenced input, so live-but-unwired inputs keep it > 0 while the
+    // assembly's actual sources are dead — the bitrate term below can't
+    // see that. Judge the plan's own slot liveness instead: every slot
+    // stalled = no media leaving the assembler (Error); a partial stall
+    // degrades (Warning). Stall detection is already stream-type-aware,
+    // so sparse essences never trip this.
+    if let Some(ah) = assembly_health {
+        if ah.total_slots > 0 && ah.stalled_slot_count >= ah.total_slots {
             return FlowHealth::Error;
         }
     }
@@ -4130,6 +4206,14 @@ fn derive_flow_health(
     // Warning: bandwidth exceeded (alarm mode)
     if bandwidth_exceeded {
         return FlowHealth::Warning;
+    }
+
+    // Warning: some (not all) assembly slots stalled — output is running
+    // but a wired source is dead.
+    if let Some(ah) = assembly_health {
+        if ah.stalled_slot_count > 0 {
+            return FlowHealth::Warning;
+        }
     }
 
     // Warning: P2 errors or minor loss
@@ -4201,6 +4285,53 @@ impl StatsCollector {
 #[cfg(test)]
 mod input_state_tests {
     use super::*;
+
+    fn ah(total: u32, stalled: u32) -> crate::stats::models::AssemblyHealth {
+        crate::stats::models::AssemblyHealth {
+            total_slots: total,
+            stalled_slot_count: stalled,
+            stalled_slots: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn flow_health_all_slots_stalled_is_error_despite_live_input_bytes() {
+        // The incident shape: 5 live-but-unwired inputs keep flow input
+        // bitrate > 0 while the assembly's only sources are dead.
+        let h = derive_flow_health(10_000_000, 0, &None, false, false, Some(&ah(2, 2)));
+        assert_eq!(h, FlowHealth::Error);
+    }
+
+    #[test]
+    fn flow_health_partial_stall_is_warning() {
+        let h = derive_flow_health(10_000_000, 0, &None, false, false, Some(&ah(3, 1)));
+        assert_eq!(h, FlowHealth::Warning);
+    }
+
+    #[test]
+    fn flow_health_assembly_clean_is_healthy() {
+        let h = derive_flow_health(10_000_000, 0, &None, false, false, Some(&ah(2, 0)));
+        assert_eq!(h, FlowHealth::Healthy);
+    }
+
+    #[test]
+    fn flow_health_partial_stall_does_not_mask_no_data_critical() {
+        // bitrate 0 must stay Critical even with a partial assembly stall.
+        let h = derive_flow_health(0, 0, &None, false, false, Some(&ah(3, 1)));
+        assert_eq!(h, FlowHealth::Critical);
+    }
+
+    #[test]
+    fn flow_health_passthrough_unchanged_without_assembly() {
+        assert_eq!(
+            derive_flow_health(10_000_000, 0, &None, false, false, None),
+            FlowHealth::Healthy
+        );
+        assert_eq!(
+            derive_flow_health(0, 0, &None, false, false, None),
+            FlowHealth::Critical
+        );
+    }
 
     #[test]
     fn derive_input_state_precedence() {
