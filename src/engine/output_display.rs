@@ -36,7 +36,7 @@
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use bytes::Bytes;
@@ -891,6 +891,9 @@ fn demux_decode_loop(
     // referencing the old stream's reference frames and either emits
     // glitched output or stalls until its internal IDR-anchor recycles.
     let mut last_video_pts: Option<u64> = None;
+    // Keyframe gate — armed at startup, re-armed by every decoder flush
+    // in `flush_decoders_for_switch`. See [`KeyframeGate`].
+    let mut keyframe_gate = KeyframeGate::new();
     // Operator-visible "input switch in flight" tracking. Set when the
     // demuxer emits `DemuxedFrame::Discontinuity` (PMT version_number
     // changed — the monotonic stamp `TsContinuityFixer::on_switch`
@@ -934,6 +937,7 @@ fn demux_decode_loop(
                     &mut hw_open_state,
                     &counters,
                     &mut last_video_pts,
+                    &mut keyframe_gate,
                     &frame_gen,
                     "lagged",
                 );
@@ -981,7 +985,7 @@ fn demux_decode_loop(
         let frames_before = counters.frames_received_since_open.load(Ordering::Relaxed);
         for frame in frames {
             match frame {
-                DemuxedFrame::H264 { nalus, pts, .. } => {
+                DemuxedFrame::H264 { nalus, pts, is_keyframe } => {
                     let stream_ids = StreamIds {
                         video_pid: demuxer.video_pid(),
                         audio_pid: demuxer.audio_pid(),
@@ -990,8 +994,10 @@ fn demux_decode_loop(
                     handle_video_au(
                         &nalus,
                         pts,
+                        is_keyframe,
                         VideoCodec::H264,
                         &mut last_video_pts,
+                        &mut keyframe_gate,
                         &mut video_decoder,
                         &mut current_video_codec,
                         &mut aac_decoder,
@@ -1011,7 +1017,7 @@ fn demux_decode_loop(
                         &output_stats,
                     );
                 }
-                DemuxedFrame::H265 { nalus, pts, .. } => {
+                DemuxedFrame::H265 { nalus, pts, is_keyframe } => {
                     let stream_ids = StreamIds {
                         video_pid: demuxer.video_pid(),
                         audio_pid: demuxer.audio_pid(),
@@ -1020,8 +1026,10 @@ fn demux_decode_loop(
                     handle_video_au(
                         &nalus,
                         pts,
+                        is_keyframe,
                         VideoCodec::Hevc,
                         &mut last_video_pts,
+                        &mut keyframe_gate,
                         &mut video_decoder,
                         &mut current_video_codec,
                         &mut aac_decoder,
@@ -1041,7 +1049,7 @@ fn demux_decode_loop(
                         &output_stats,
                     );
                 }
-                DemuxedFrame::Mpeg2 { es, pts, .. } => {
+                DemuxedFrame::Mpeg2 { es, pts, is_keyframe } => {
                     // MPEG-2 has no NAL framing — wrap the ES in a single
                     // synthetic "NALU" so we reuse the existing
                     // PTS-jump / decoder-ensure / drain pipeline. The
@@ -1059,8 +1067,10 @@ fn demux_decode_loop(
                     handle_video_au(
                         &synthetic,
                         pts,
+                        is_keyframe,
                         VideoCodec::Mpeg2,
                         &mut last_video_pts,
+                        &mut keyframe_gate,
                         &mut video_decoder,
                         &mut current_video_codec,
                         &mut aac_decoder,
@@ -1205,6 +1215,7 @@ fn demux_decode_loop(
                         &mut hw_open_state,
                         &counters,
                         &mut last_video_pts,
+                        &mut keyframe_gate,
                         &frame_gen,
                         "switch",
                     );
@@ -1577,6 +1588,86 @@ fn reset_decoder_open_window(state: &mut HwOpenState, counters: &DisplayStatsCou
         .store(0, Ordering::Relaxed);
 }
 
+/// Post-flush keyframe gate for the demux loop's video path.
+///
+/// While armed (startup, and re-armed by every decoder flush in
+/// [`flush_decoders_for_switch`]), video AUs are shed until the first
+/// keyframe: a freshly-opened/flushed decoder has no reference frames, so
+/// pre-IDR slices are guaranteed `send_packet` rejections. Feeding them
+/// anyway produced the sporadic AVERROR_INVALIDDATA / EINVAL warnings on
+/// every mid-GOP join AND left a latent false HW→CPU demotion — a
+/// long-GOP source whose decoder rejects every pre-IDR slice runs
+/// `consecutive_send_errors` past [`RUNTIME_FAIL_DEMOTE_THRESHOLD`]
+/// before the IDR arrives, demoting a healthy HW backend for the rest of
+/// the run.
+///
+/// The escape hatch for IDR-less H.264 sources (gradual intra refresh
+/// signals decodability via a recovery-point SEI the demuxer doesn't
+/// parse — `is_keyframe` would stay `false` forever) is **time-based**:
+/// [`KEYFRAME_GATE_MAX_WAIT`] after arming, the gate opens
+/// unconditionally, restoring the pre-gate behaviour (libavcodec
+/// error-conceals its way to a clean picture). Time, not AU count, so
+/// the worst-case black period is fps-independent — a 5 fps image
+/// source and a 50 fps contribution feed both recover within the same
+/// wall-clock bound, close to the pre-gate ~1 intra-refresh-cycle
+/// latency. The AU budget remains as a belt-and-braces secondary bound.
+/// Broadcast outputs must come back to picture.
+struct KeyframeGate {
+    waiting: bool,
+    skipped: u32,
+    armed_at: Instant,
+}
+
+/// Wall-clock budget per gate episode before giving up on seeing a
+/// keyframe — past any sane broadcast GOP (≤ 5 s would be unusual; most
+/// are ≤ 2 s), and close to the pre-gate recovery latency of an
+/// intra-refresh source.
+const KEYFRAME_GATE_MAX_WAIT: Duration = Duration::from_secs(3);
+
+/// Secondary AU-count bound (≈ 10 s at 30 fps) in case the wall clock
+/// misbehaves; first bound to trip wins.
+const KEYFRAME_GATE_MAX_SKIPPED_AUS: u32 = 300;
+
+impl KeyframeGate {
+    fn new() -> Self {
+        Self { waiting: true, skipped: 0, armed_at: Instant::now() }
+    }
+
+    /// Re-arm the gate (decoder was just flushed).
+    fn arm(&mut self) {
+        self.waiting = true;
+        self.skipped = 0;
+        self.armed_at = Instant::now();
+    }
+
+    /// `true` when the AU should be fed to the decoder. The first
+    /// admitted keyframe opens the gate until the next [`Self::arm`].
+    fn admit(&mut self, is_keyframe: bool) -> bool {
+        if !self.waiting {
+            return true;
+        }
+        if is_keyframe {
+            self.waiting = false;
+            return true;
+        }
+        self.skipped += 1;
+        if self.armed_at.elapsed() >= KEYFRAME_GATE_MAX_WAIT
+            || self.skipped >= KEYFRAME_GATE_MAX_SKIPPED_AUS
+        {
+            self.waiting = false;
+            tracing::info!(
+                skipped = self.skipped,
+                waited_ms = self.armed_at.elapsed().as_millis() as u64,
+                "display keyframe gate: no keyframe within the budget \
+                 (IDR-less intra-refresh source?) — feeding the decoder \
+                 anyway",
+            );
+            return true;
+        }
+        false
+    }
+}
+
 /// Shared decoder flush. Used by every "the upstream stream just changed"
 /// trigger:
 ///   - `RecvError::Lagged` (subscriber fell behind, packets were dropped)
@@ -1587,8 +1678,11 @@ fn reset_decoder_open_window(state: &mut HwOpenState, counters: &DisplayStatsCou
 ///
 /// `last_video_pts` is cleared so the *next* PTS becomes the fresh anchor
 /// without the pts_jump path firing a redundant flush on the same event.
-/// `reason` rides into the trace so the field is greppable across log
-/// lines for the three triggers.
+/// The keyframe gate is re-armed so the demux loop sheds pre-IDR AUs
+/// instead of feeding a reference-frame-less decoder guaranteed
+/// `send_packet` rejections. `reason` rides into the trace so the field
+/// is greppable across log lines for the three triggers.
+#[allow(clippy::too_many_arguments)]
 fn flush_decoders_for_switch(
     video_decoder: &mut Option<VideoDecoder>,
     aac_decoder: &mut Option<AacDecoder>,
@@ -1596,6 +1690,7 @@ fn flush_decoders_for_switch(
     state: &mut HwOpenState,
     counters: &DisplayStatsCounters,
     last_video_pts: &mut Option<u64>,
+    keyframe_gate: &mut KeyframeGate,
     frame_gen: &AtomicU64,
     reason: &'static str,
 ) {
@@ -1610,6 +1705,7 @@ fn flush_decoders_for_switch(
         d.flush();
     }
     *last_video_pts = None;
+    keyframe_gate.arm();
     // Bump the shared generation counter so any decoded frames already
     // queued in the demux→display + demux→audio mpscs get dropped on
     // arrival instead of bleeding the previous stream's last second of
@@ -1686,8 +1782,10 @@ fn force_cpu_fallback(
 fn handle_video_au(
     nalus: &[Vec<u8>],
     pts: u64,
+    is_keyframe: bool,
     codec: VideoCodec,
     last_video_pts: &mut Option<u64>,
+    keyframe_gate: &mut KeyframeGate,
     video_decoder: &mut Option<VideoDecoder>,
     current_video_codec: &mut Option<VideoCodec>,
     aac_decoder: &mut Option<AacDecoder>,
@@ -1706,10 +1804,6 @@ fn handle_video_au(
     video_decode_counters: &VideoDecodeStats,
     output_stats: &OutputStatsAccumulator,
 ) {
-    // Count the access unit as a decode-stage input frame the moment we
-    // resolve a decoder for it. Output frames are bumped per
-    // `receive_frame` success inside `drain_video_frames`.
-    video_decode_counters.inc_input();
     if pts_jump(*last_video_pts, pts) {
         // Section 5: count + log every PTS jump so the operator can
         // tell whether the Reolink "degraded picture" is the
@@ -1733,11 +1827,33 @@ fn handle_video_au(
             hw_open_state,
             counters,
             last_video_pts,
+            keyframe_gate,
             frame_gen,
             "pts_jump",
         );
     }
     *last_video_pts = Some(pts);
+    // Keyframe gate (armed at startup + re-armed by every flush above,
+    // including the pts_jump one this very AU may have triggered): shed
+    // AUs until the stream's next keyframe — a flushed decoder has no
+    // reference frames, so feeding it pre-IDR slices only manufactures
+    // send_packet errors. A keyframe AU that itself trips pts_jump
+    // flushes and is then fed immediately, so a clean cut switch costs
+    // zero extra frames. `last_video_pts` is still advanced for skipped
+    // AUs (above) so the jump detector stays anchored to the live stream
+    // while the gate is closed.
+    if !keyframe_gate.admit(is_keyframe) {
+        counters
+            .aus_skipped_awaiting_keyframe
+            .fetch_add(1, Ordering::Relaxed);
+        return;
+    }
+    // Count the access unit as a decode-stage input frame the moment we
+    // resolve a decoder for it. Output frames are bumped per
+    // `receive_frame` success inside `drain_video_frames`. Gated AUs
+    // (above) are tracked on `aus_skipped_awaiting_keyframe` instead —
+    // they never reach the decoder.
+    video_decode_counters.inc_input();
     ensure_video_decoder(
         video_decoder,
         current_video_codec,
@@ -3614,5 +3730,69 @@ mod tests {
                 panic!("expected SemiPlanar arm")
             }
         }
+    }
+
+    /// The keyframe gate starts armed: pre-IDR AUs are shed, the first
+    /// keyframe is admitted and opens the gate for everything after it.
+    #[test]
+    fn keyframe_gate_sheds_until_first_keyframe() {
+        let mut gate = KeyframeGate::new();
+        assert!(!gate.admit(false));
+        assert!(!gate.admit(false));
+        assert!(gate.admit(true));
+        // Open — non-keyframes flow through.
+        assert!(gate.admit(false));
+        assert!(gate.admit(false));
+    }
+
+    /// `arm()` (decoder flush) closes an open gate and resets the skip
+    /// budget; a keyframe AU presented while armed is admitted
+    /// immediately (clean-cut switch costs zero extra frames).
+    #[test]
+    fn keyframe_gate_rearms_on_flush() {
+        let mut gate = KeyframeGate::new();
+        assert!(gate.admit(true));
+        assert!(gate.admit(false));
+        gate.arm();
+        assert!(!gate.admit(false));
+        assert!(gate.admit(true));
+        assert!(gate.admit(false));
+        // Flush landing exactly on a keyframe: admitted straight away.
+        gate.arm();
+        assert!(gate.admit(true));
+    }
+
+    /// Escape hatch: an IDR-less source (gradual intra refresh — the
+    /// demuxer never flags `is_keyframe`) must not stay black forever.
+    /// Past the skip budget the gate opens unconditionally.
+    #[test]
+    fn keyframe_gate_gives_up_after_skip_budget() {
+        let mut gate = KeyframeGate::new();
+        for _ in 0..KEYFRAME_GATE_MAX_SKIPPED_AUS - 1 {
+            assert!(!gate.admit(false));
+        }
+        // The budget-exhausting AU is fed, and the gate stays open.
+        assert!(gate.admit(false));
+        assert!(gate.admit(false));
+        // A later flush re-arms with a fresh budget.
+        gate.arm();
+        assert!(!gate.admit(false));
+        assert!(gate.admit(true));
+    }
+
+    /// The primary escape hatch is wall-clock based so the worst-case
+    /// black period is fps-independent: 3 s after arming, the next AU is
+    /// fed regardless of how few AUs a low-fps source produced.
+    #[test]
+    fn keyframe_gate_gives_up_after_wall_clock_budget() {
+        let mut gate = KeyframeGate::new();
+        assert!(!gate.admit(false), "fresh gate sheds non-keyframes");
+        // Backdate the arm time past the budget — a 5 fps source has
+        // produced only ~15 AUs by now, far under the AU budget.
+        gate.armed_at = Instant::now() - KEYFRAME_GATE_MAX_WAIT - Duration::from_millis(1);
+        assert!(gate.admit(false), "time budget opens the gate");
+        assert!(gate.admit(false), "gate stays open");
+        gate.arm();
+        assert!(!gate.admit(false), "re-arm restores a fresh time budget");
     }
 }

@@ -308,11 +308,17 @@ EOF
         systemd-sysusers
     else
         useradd --system --home /var/lib/bilbycast/edge --shell /usr/sbin/nologin bilbycast
-        for grp in video render audio; do
-            getent group "${grp}" > /dev/null && usermod -aG "${grp}" bilbycast || true
-        done
     fi
 fi
+
+# Reconcile supplementary groups on every run (idempotent) — not just on
+# user creation. Covers upgrades from installer versions that granted
+# fewer groups, and hosts where the user pre-existed. Without `audio`
+# the display output renders video but ALSA opens fail (the alsa-lib
+# symptom is a misleading "Cannot get card index for N").
+for grp in video render audio; do
+    getent group "${grp}" > /dev/null && usermod -aG "${grp}" bilbycast || true
+done
 
 chown -R bilbycast:bilbycast "${INSTALL_ROOT}" "${DATA_ROOT}"
 

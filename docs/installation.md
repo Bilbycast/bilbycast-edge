@@ -662,6 +662,31 @@ sudo apt install libasound2-dev
 cargo build --release           # display is on by default in release
 ```
 
+**Device permissions.** The display output opens `/dev/dri/*` (KMS +
+VAAPI) and `/dev/snd/*` (ALSA), which are group-gated on every Linux
+distribution (`video` / `render` / `audio`). The packaged service
+install handles this — `bilbycast-edge.service` carries
+`SupplementaryGroups=video render audio` plus class-based
+`DeviceAllow=` entries, and `install-edge.sh` adds the `bilbycast`
+user to all three groups on every run. **If you run the binary
+manually** (dev box, testbed, custom unit), the running user needs
+the same membership:
+
+```sh
+sudo usermod -aG video,render,audio <user>   # takes effect on next login
+```
+
+Without `audio`, the failure is deceptive: desktop logins often work
+anyway because systemd-logind grants a temporary ACL on `/dev/snd`
+to the active local seat — which vanishes on reboot or when only SSH
+sessions exist. Video keeps rendering (DRM is a separate path) while
+every ALSA open fails, and alsa-lib reports the misleading
+`ALSA lib confmisc.c: (snd_config_get_card) Cannot get card index for N`
+— that is EACCES on `/dev/snd/controlCN`, not a missing sound card.
+The edge raises Critical `display_audio_open_failed` events and, after
+10 consecutive failures, `display_audio_disabled_persistent_failure`
+(see the event catalogue).
+
 The schema is unconditional on every host (configs round-trip
 cleanly), but the runtime spawner is `cfg(all(feature = "display",
 target_os = "linux"))`. macOS dev builds reject `display` outputs at

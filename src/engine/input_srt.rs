@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 /// Maximum time we wait for the SMPTE 2022-7 leg-2 socket to complete its
@@ -21,9 +21,10 @@ use crate::manager::events::{EventSender, EventSeverity, category};
 use crate::redundancy::merger::{ActiveLeg, HitlessMerger};
 use crate::srt::connection::{
     accept_srt_connection, bind_srt_listener_for_bonded_input,
-    bind_srt_listener_for_input, bind_srt_listener_for_redundancy, connect_srt_group,
-    connect_srt_input, connect_srt_redundancy_leg, spawn_srt_group_stats_poller,
-    spawn_srt_socket_group_stats_poller, spawn_srt_stats_poller, SrtConnectionParams,
+    bind_srt_listener_for_input, bind_srt_listener_for_redundancy, connect_srt_group_observed,
+    connect_srt_redundancy_leg, connect_srt_with_retry_observed,
+    spawn_srt_group_stats_poller, spawn_srt_socket_group_stats_poller,
+    spawn_srt_stats_poller, SrtConnectionParams, CONNECT_FAILED_THRESHOLD,
 };
 use crate::stats::collector::FlowStatsAccumulator;
 use crate::util::rtp_parse::{is_likely_rtp, parse_rtp_sequence_number, parse_rtp_timestamp};
@@ -340,11 +341,11 @@ pub fn spawn_srt_input(
         );
 
         let result = if config.bonding.is_some() {
-            srt_input_bonded_loop(config, publisher, stats, cancel, &event_sender, &flow_id, &mut transcoder, &mut post).await
+            srt_input_bonded_loop(config, publisher, stats, cancel, &event_sender, &flow_id, &input_id, &mut transcoder, &mut post).await
         } else if config.redundancy.is_some() {
-            srt_input_redundant_loop(config, publisher, stats, cancel, &event_sender, &flow_id, &mut transcoder, &mut post).await
+            srt_input_redundant_loop(config, publisher, stats, cancel, &event_sender, &flow_id, &input_id, &mut transcoder, &mut post).await
         } else {
-            srt_input_loop(config, publisher, stats, cancel, &event_sender, &flow_id, &mut transcoder, &mut post).await
+            srt_input_loop(config, publisher, stats, cancel, &event_sender, &flow_id, &input_id, &mut transcoder, &mut post).await
         };
         if let Err(e) = result {
             tracing::error!("SRT input task exited with error: {e}");
@@ -364,12 +365,13 @@ async fn srt_input_loop(
     cancel: CancellationToken,
     events: &EventSender,
     flow_id: &str,
+    input_id: &str,
     transcoder: &mut Option<InputTranscoder>,
     post: &mut Option<InputPostProcess>,
 ) -> anyhow::Result<()> {
     match config.mode {
         SrtMode::Listener => srt_input_listener_loop(config, publisher, stats, cancel, events, flow_id, transcoder, post).await,
-        _ => srt_input_caller_loop(config, publisher, stats, cancel, events, flow_id, transcoder, post).await,
+        _ => srt_input_caller_loop(config, publisher, stats, cancel, events, flow_id, input_id, transcoder, post).await,
     }
 }
 
@@ -482,6 +484,51 @@ async fn srt_input_listener_loop(
     }
 }
 
+/// Record one failed caller connect attempt on the shared per-input counter
+/// and report whether this attempt just crossed [`CONNECT_FAILED_THRESHOLD`]
+/// — i.e. whether the latched Critical should fire. Exactly one `true` per
+/// connect cycle: the count keeps climbing past the threshold and only
+/// resets (via the caller loop) on a successful connect.
+fn record_connect_failure(attempts: u32, counter: &AtomicU32) -> bool {
+    counter.store(attempts, Ordering::Relaxed);
+    attempts == CONNECT_FAILED_THRESHOLD
+}
+
+/// Build the per-attempt connect-failure observer shared by every SRT
+/// caller-mode connect path (plain, 2022-7 leg 1, bonded group): bumps the
+/// per-input counter (→ state `connect_failed` past the threshold) and
+/// emits the latched Critical once per connect cycle. `static_details`
+/// carries the path-specific fields (mode / remote_addr / leg / endpoints).
+fn connect_failure_observer<'a>(
+    connect_failures: &'a Arc<AtomicU32>,
+    events: &'a EventSender,
+    flow_id: &'a str,
+    input_id: &'a str,
+    static_details: serde_json::Value,
+) -> impl FnMut(u32, &anyhow::Error) + Send + 'a {
+    move |attempts: u32, e: &anyhow::Error| {
+        if !record_connect_failure(attempts, connect_failures) {
+            return;
+        }
+        tracing::error!(
+            "SRT input '{input_id}' connection failed {attempts} consecutive times: {e}"
+        );
+        let mut details = static_details.clone();
+        if let Some(map) = details.as_object_mut() {
+            map.insert("error".into(), serde_json::json!(e.to_string()));
+            map.insert("input_id".into(), serde_json::json!(input_id));
+            map.insert("consecutive_failures".into(), serde_json::json!(attempts));
+        }
+        events.emit_flow_with_details(
+            EventSeverity::Critical,
+            category::SRT,
+            format!("SRT input connection failed: {e}"),
+            flow_id,
+            details,
+        );
+    }
+}
+
 /// Caller-mode input: reconnects with exponential back-off on disconnect.
 async fn srt_input_caller_loop(
     config: SrtInputConfig,
@@ -490,6 +537,7 @@ async fn srt_input_caller_loop(
     cancel: CancellationToken,
     events: &EventSender,
     flow_id: &str,
+    input_id: &str,
     transcoder: &mut Option<InputTranscoder>,
     post: &mut Option<InputPostProcess>,
 ) -> anyhow::Result<()> {
@@ -498,28 +546,59 @@ async fn srt_input_caller_loop(
     let mut raw_ts_seq_counter: u16 = 0;
     let mut raw_ts_timestamp: u32 = 0;
 
+    // Per-input consecutive-connect-failure counter, registered by
+    // `spawn_input_runtime` before this task starts. The snapshot path maps
+    // it to state "connect_failed"; the detached fallback only exists for
+    // callers that never registered counters (tests).
+    let connect_failures = stats
+        .per_input_counters
+        .get(input_id)
+        .map(|c| c.connect_failures.clone())
+        .unwrap_or_default();
+
     loop {
-        let socket = match connect_srt_input(&config, &cancel).await {
-            Ok(s) => s,
-            Err(e) => {
-                if cancel.is_cancelled() {
-                    tracing::info!("SRT input stopping (cancelled during connect)");
-                    return Ok(());
-                }
-                tracing::error!("SRT input connection failed: {e}");
-                events.emit_flow_with_details(
-                    EventSeverity::Critical, category::SRT,
-                    format!("SRT input connection failed: {e}"), flow_id,
-                    serde_json::json!({
-                        "mode": format!("{:?}", config.mode),
-                        "remote_addr": config.remote_addr.as_deref().unwrap_or(""),
-                        "stream_id": config.stream_id.as_deref().unwrap_or(""),
-                        "error": e.to_string(),
-                    }),
-                );
-                return Err(e);
+        // Surface a never-connecting peer while the retry loop is still
+        // running (it only ever returns on success or cancellation): bump
+        // the shared counter per attempt and emit the Critical exactly once
+        // per connect cycle when the threshold is crossed. A successful
+        // connect resets the counter, re-arming the latch.
+        let mut on_attempt_failed = |attempts: u32, e: &anyhow::Error| {
+            if !record_connect_failure(attempts, &connect_failures) {
+                return;
             }
+            tracing::error!(
+                "SRT input '{input_id}' connection failed {attempts} consecutive times: {e}"
+            );
+            events.emit_flow_with_details(
+                EventSeverity::Critical, category::SRT,
+                format!("SRT input connection failed: {e}"), flow_id,
+                serde_json::json!({
+                    "mode": format!("{:?}", config.mode),
+                    "remote_addr": config.remote_addr.as_deref().unwrap_or(""),
+                    "stream_id": config.stream_id.as_deref().unwrap_or(""),
+                    "error": e.to_string(),
+                    "input_id": input_id,
+                    "consecutive_failures": attempts,
+                }),
+            );
         };
+        let params = SrtConnectionParams::from(&config);
+        let socket =
+            match connect_srt_with_retry_observed(&params, &cancel, &mut on_attempt_failed).await {
+                Ok(s) => s,
+                Err(e) => {
+                    if cancel.is_cancelled() {
+                        tracing::info!("SRT input stopping (cancelled during connect)");
+                        return Ok(());
+                    }
+                    // Unreachable today — the retry loop errors only on
+                    // cancellation; never-connecting peers surface through
+                    // the threshold observer above.
+                    tracing::error!("SRT input connection failed: {e}");
+                    return Err(e);
+                }
+            };
+        connect_failures.store(0, Ordering::Relaxed);
 
         tracing::info!(
             "SRT input connected: mode={:?} local={}",
@@ -725,6 +804,7 @@ async fn srt_input_redundant_loop(
     cancel: CancellationToken,
     events: &EventSender,
     flow_id: &str,
+    input_id: &str,
     transcoder: &mut Option<InputTranscoder>,
     post: &mut Option<InputPostProcess>,
 ) -> anyhow::Result<()> {
@@ -732,6 +812,16 @@ async fn srt_input_redundant_loop(
         .redundancy
         .as_ref()
         .expect("redundancy config must be present");
+
+    // Primary-leg consecutive-connect-failure counter (contract C3 /
+    // `connect_failed` state). Leg 1 only: leg 2 has its own budgeted
+    // single-leg fallback + Warning, and a healthy leg 1 must not be
+    // reported `connect_failed` because leg 2 is down.
+    let connect_failures = stats
+        .per_input_counters
+        .get(input_id)
+        .map(|c| c.connect_failures.clone())
+        .unwrap_or_default();
 
     // Bind persistent listeners for any legs in listener mode.
     // Both stay bound across outer reconnect cycles.
@@ -790,7 +880,20 @@ async fn srt_input_redundant_loop(
                 }
             }
         } else {
-            match connect_srt_input(&config, &cancel).await {
+            let mut on_attempt_failed = connect_failure_observer(
+                &connect_failures,
+                events,
+                flow_id,
+                input_id,
+                serde_json::json!({
+                    "mode": format!("{:?}", config.mode),
+                    "remote_addr": config.remote_addr.as_deref().unwrap_or(""),
+                    "stream_id": config.stream_id.as_deref().unwrap_or(""),
+                    "leg": 1,
+                }),
+            );
+            let params = SrtConnectionParams::from(&config);
+            match connect_srt_with_retry_observed(&params, &cancel, &mut on_attempt_failed).await {
                 Ok(s) => s,
                 Err(e) => {
                     if cancel.is_cancelled() {
@@ -804,6 +907,7 @@ async fn srt_input_redundant_loop(
                 }
             }
         };
+        connect_failures.store(0, Ordering::Relaxed);
         tracing::info!(
             "SRT input leg1 connected: mode={:?} local={}",
             config.mode,
@@ -1274,6 +1378,7 @@ async fn srt_input_bonded_loop(
     cancel: CancellationToken,
     events: &EventSender,
     flow_id: &str,
+    input_id: &str,
     transcoder: &mut Option<InputTranscoder>,
     post: &mut Option<InputPostProcess>,
 ) -> anyhow::Result<()> {
@@ -1286,7 +1391,7 @@ async fn srt_input_bonded_loop(
         }
         _ => {
             srt_input_bonded_caller_loop(
-                config, publisher, stats, cancel, events, flow_id, transcoder, post,
+                config, publisher, stats, cancel, events, flow_id, input_id, transcoder, post,
             )
             .await
         }
@@ -1300,6 +1405,7 @@ async fn srt_input_bonded_caller_loop(
     cancel: CancellationToken,
     events: &EventSender,
     flow_id: &str,
+    input_id: &str,
     transcoder: &mut Option<InputTranscoder>,
     post: &mut Option<InputPostProcess>,
 ) -> anyhow::Result<()> {
@@ -1309,9 +1415,29 @@ async fn srt_input_bonded_caller_loop(
     let mut raw_ts_seq_counter: u16 = 0;
     let mut raw_ts_timestamp: u32 = 0;
 
+    // Group-connect consecutive-failure counter (contract C3 /
+    // `connect_failed` state) — one counter per input, bumped per
+    // group-connect attempt.
+    let connect_failures = stats
+        .per_input_counters
+        .get(input_id)
+        .map(|c| c.connect_failures.clone())
+        .unwrap_or_default();
+
     loop {
         let params = SrtConnectionParams::from(&config);
-        let group = match connect_srt_group(&params, &bond, &cancel).await {
+        let mut on_attempt_failed = connect_failure_observer(
+            &connect_failures,
+            events,
+            flow_id,
+            input_id,
+            serde_json::json!({
+                "mode": "caller-bonded",
+                "bonding_mode": format!("{:?}", bond.mode),
+                "endpoints": bond.endpoints.iter().map(|e| &e.addr).collect::<Vec<_>>(),
+            }),
+        );
+        let group = match connect_srt_group_observed(&params, &bond, &cancel, &mut on_attempt_failed).await {
             Ok(g) => g,
             Err(e) => {
                 if cancel.is_cancelled() {
@@ -1333,6 +1459,7 @@ async fn srt_input_bonded_caller_loop(
                 return Err(e);
             }
         };
+        connect_failures.store(0, Ordering::Relaxed);
 
         tracing::info!(
             "SRT bonded input connected: mode=caller bonding={:?} endpoints={}",
@@ -1598,6 +1725,37 @@ async fn srt_bonded_group_recv_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn connect_failure_threshold_fires_once_per_cycle() {
+        let counter = AtomicU32::new(0);
+        let fired = (1..=20)
+            .filter(|&attempts| record_connect_failure(attempts, &counter))
+            .count();
+        assert_eq!(fired, 1, "Critical must fire exactly once per cycle");
+        assert_eq!(counter.load(Ordering::Relaxed), 20);
+
+        // Successful connect resets the counter (the caller loop stores 0)…
+        counter.store(0, Ordering::Relaxed);
+        // …so the next never-connecting cycle fires exactly once again.
+        let fired = (1..=7)
+            .filter(|&attempts| record_connect_failure(attempts, &counter))
+            .count();
+        assert_eq!(fired, 1, "latch must re-arm after a successful connect");
+    }
+
+    #[test]
+    fn connect_failure_below_threshold_never_fires() {
+        let counter = AtomicU32::new(0);
+        for attempts in 1..CONNECT_FAILED_THRESHOLD {
+            assert!(!record_connect_failure(attempts, &counter));
+        }
+        assert_eq!(
+            counter.load(Ordering::Relaxed),
+            CONNECT_FAILED_THRESHOLD - 1,
+            "counter must track every failed attempt for the stats snapshot"
+        );
+    }
 
     #[test]
     fn failover_first_packet_sets_active() {

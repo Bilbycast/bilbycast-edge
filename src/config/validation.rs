@@ -2836,8 +2836,10 @@ fn validate_name(name: &str, context: &str) -> Result<()> {
 ///   be absent — passthrough is a runtime hint, not a muxer plan.
 /// - Every referenced `input_id` must appear in `flow.input_ids`.
 /// - PIDs (`pmt_pid`, `out_pid`) must be in 0x0010..=0x1FFE.
-/// - Within each program, `out_pid`s are unique and none equal the
-///   program's `pmt_pid`.
+/// - `out_pid`s are unique **mux-wide** (PIDs are global per MPEG-TS
+///   mux, so cross-program duplicates corrupt the output just as
+///   within-program ones do) and no `out_pid` equals *any* program's
+///   `pmt_pid` — not just its own program's.
 /// - `program_number > 0` (NIT is reserved).
 /// - `service_name` length capped at 128 chars (DVB 64-byte limit
 ///   leaves headroom for UTF-8).
@@ -2954,6 +2956,22 @@ fn validate_flow_assembly(
     // resolution tables are built **per-program** so the per-program
     // pcr_source cross-check respects the H.222.0 rule that a
     // program's PCR_PID must reside in that program's own ES set.
+    //
+    // PIDs are global per mux, so two mux-wide tables are pre-built /
+    // accumulated across the program loop: `all_pmt_pids` lets each
+    // stream's `out_pid` be checked against EVERY program's PMT PID
+    // (the manager's PMT-PID and out_pid allocators share the 0x100
+    // base, so "+ Add program" can mint a pmt_pid colliding with a
+    // sibling program's ES out_pid — interleaved PSI + PES on one PID
+    // is a corrupt TS), and `mux_out_pids` rejects cross-program
+    // out_pid duplicates that the per-program `seen_out` set misses.
+    let all_pmt_pids: std::collections::HashMap<u16, u16> = assembly
+        .programs
+        .iter()
+        .map(|p| (p.pmt_pid, p.program_number))
+        .collect();
+    let mut mux_out_pids: std::collections::HashMap<u16, u16> =
+        std::collections::HashMap::new();
     let mut seen_pn = std::collections::HashSet::new();
     let mut seen_pmt = std::collections::HashSet::new();
     for prog in &assembly.programs {
@@ -2993,10 +3011,19 @@ fn validate_flow_assembly(
         let mut seen_out = std::collections::HashSet::new();
         for stream in &prog.streams {
             check_pid(stream.out_pid, "stream.out_pid")?;
-            if stream.out_pid == prog.pmt_pid {
+            if let Some(&owner_pn) = all_pmt_pids.get(&stream.out_pid) {
+                if owner_pn == prog.program_number {
+                    bail!(
+                        "{context}: stream.out_pid 0x{:04X} collides with pmt_pid of its own program",
+                        stream.out_pid
+                    );
+                }
                 bail!(
-                    "{context}: stream.out_pid 0x{:04X} collides with pmt_pid of its own program",
-                    stream.out_pid
+                    "{context}: stream.out_pid 0x{:04X} in program {} collides with pmt_pid \
+                     of program {} — PIDs are global per mux",
+                    stream.out_pid,
+                    prog.program_number,
+                    owner_pn
                 );
             }
             if !seen_out.insert(stream.out_pid) {
@@ -3006,6 +3033,16 @@ fn validate_flow_assembly(
                     prog.program_number
                 );
             }
+            if let Some(&other_pn) = mux_out_pids.get(&stream.out_pid) {
+                bail!(
+                    "{context}: stream.out_pid 0x{:04X} duplicated across programs {} and {} \
+                     — PIDs are global per mux",
+                    stream.out_pid,
+                    other_pn,
+                    prog.program_number
+                );
+            }
+            mux_out_pids.insert(stream.out_pid, prog.program_number);
             if let Some(ref label) = stream.label {
                 if label.len() > 256 {
                     bail!(
@@ -7260,6 +7297,79 @@ mod tests {
     }
 
     #[test]
+    fn assembly_rejects_out_pid_colliding_with_sibling_programs_pmt_pid() {
+        // PIDs are global per mux: the manager's PMT-PID allocator and
+        // out_pid allocator share the 0x100 base, so '+ Add program'
+        // can mint a pmt_pid equal to a sibling program's ES out_pid.
+        // Pre-fix, both validators only checked a stream's out_pid
+        // against its OWN program's pmt_pid and this corrupt MPTS
+        // passed clean.
+        let mut a = spts_assembly("in-a");
+        a.kind = AssemblyKind::Mpts;
+        let mut p2 = a.programs[0].clone();
+        p2.program_number = 2;
+        p2.pmt_pid = 0x100; // == program 1's ES out_pid
+        p2.streams[0].out_pid = 0x300;
+        p2.streams[0].source = SlotSource::Pid {
+            input_id: "in-a".into(),
+            source_pid: 0x300,
+        };
+        p2.pcr_source = Some(PcrSource {
+            input_id: "in-a".into(),
+            pid: 0x300,
+        });
+        a.programs.push(p2);
+        let err = validate_flow_assembly(&a, &["in-a".into()], "test").unwrap_err();
+        assert!(
+            err.to_string().contains("collides with pmt_pid of program"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn assembly_rejects_duplicate_out_pid_across_programs() {
+        // Cross-program out_pid duplicates were invisible pre-fix: the
+        // uniqueness set was scoped per program, but the assembler
+        // stamps independent CC sequences from both sources onto one
+        // PID — a corrupt mux.
+        let mut a = spts_assembly("in-a");
+        a.kind = AssemblyKind::Mpts;
+        let mut p2 = a.programs[0].clone();
+        p2.program_number = 2;
+        p2.pmt_pid = 0x1001;
+        // streams[0].out_pid stays 0x100 — same as program 1's.
+        a.programs.push(p2);
+        let err = validate_flow_assembly(&a, &["in-a".into()], "test").unwrap_err();
+        assert!(
+            err.to_string().contains("duplicated across programs"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn assembly_accepts_disjoint_mpts_pids() {
+        // Sanity: a well-formed two-program MPTS with disjoint PMT and
+        // ES PIDs still validates after the mux-wide checks.
+        let mut a = spts_assembly("in-a");
+        a.kind = AssemblyKind::Mpts;
+        let mut p2 = a.programs[0].clone();
+        p2.program_number = 2;
+        p2.pmt_pid = 0x1001;
+        p2.streams[0].out_pid = 0x300;
+        p2.streams[0].source = SlotSource::Pid {
+            input_id: "in-a".into(),
+            source_pid: 0x300,
+        };
+        p2.pcr_source = Some(PcrSource {
+            input_id: "in-a".into(),
+            pid: 0x300,
+        });
+        a.programs.push(p2);
+        validate_flow_assembly(&a, &["in-a".into()], "test")
+            .expect("disjoint MPTS PIDs must pass");
+    }
+
+    #[test]
     fn assembly_rejects_nested_hitless() {
         let inner = SlotSource::Hitless {
             primary: Box::new(SlotSource::Pid {
@@ -7336,10 +7446,14 @@ mod tests {
         a.kind = AssemblyKind::Mpts;
         // Flow-level pcr already set by spts_assembly(). Program 2 has no
         // per-program override and must inherit from the flow level.
+        // (Distinct out_pid — out_pids are unique mux-wide; the PCR
+        // fallback cross-check keys on the slot's SOURCE pid, which
+        // stays in-a/0x100.)
         let mut p2 = a.programs[0].clone();
         p2.program_number = 2;
         p2.pmt_pid = 0x1001;
         p2.pcr_source = None;
+        p2.streams[0].out_pid = 0x300;
         a.programs.push(p2);
         validate_flow_assembly(&a, &["in-a".into()], "test")
             .expect("MPTS with flow-level pcr fallback must pass");

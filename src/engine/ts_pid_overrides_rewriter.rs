@@ -107,6 +107,12 @@ pub struct TsPidOverridesRewriter {
     has_any_remap: bool,
     /// Last observed PAT `version_number`; skips dup parses.
     last_pat_version: Option<u8>,
+    /// True once the unmatched-override-key warning has fired. Override
+    /// keys are program_numbers; a key absent from the live PAT is a
+    /// silent no-op (the ES stays on its source PIDs even with the feed
+    /// up), so it gets one loud warning per config application — the
+    /// rewriter is rebuilt whenever the input config changes.
+    warned_unmatched_overrides: bool,
 }
 
 const NO_REMAP: u16 = 0xFFFF;
@@ -127,6 +133,7 @@ impl TsPidOverridesRewriter {
             pid_remap_table: Box::new([NO_REMAP; 8192]),
             has_any_remap: false,
             last_pat_version: None,
+            warned_unmatched_overrides: false,
         }
     }
 
@@ -224,7 +231,32 @@ impl TsPidOverridesRewriter {
         }
         self.last_pat_version = version;
         self.pmt_pid_to_program.clear();
-        for (program_number, source_pmt_pid) in parse_pat_programs(pkt) {
+        let pat_programs = parse_pat_programs(pkt);
+        // Override keys that match no program in the observed PAT are a
+        // silent no-op: discovery never runs for them, the ES stays on
+        // its source PIDs, and any assembly slot keyed on the override's
+        // target PIDs stays permanently empty even with the feed UP.
+        // Warn once per config application (single-section PAT
+        // assumption — matches the parsing above).
+        if !self.warned_unmatched_overrides {
+            let unmatched: Vec<u16> = self
+                .overrides
+                .keys()
+                .filter(|pn| !pat_programs.iter().any(|(p, _)| p == *pn))
+                .copied()
+                .collect();
+            if !unmatched.is_empty() {
+                self.warned_unmatched_overrides = true;
+                let observed: Vec<u16> =
+                    pat_programs.iter().map(|(p, _)| *p).collect();
+                tracing::warn!(
+                    "pid_overrides: configured program_number(s) {unmatched:?} not present \
+                     in the source PAT (observed program(s): {observed:?}) — these overrides \
+                     will never apply and their target PIDs will carry no data"
+                );
+            }
+        }
+        for (program_number, source_pmt_pid) in pat_programs {
             self.pmt_pid_to_program
                 .insert(source_pmt_pid, program_number);
             // Bring up per-program state if not already present, and seed
@@ -725,6 +757,44 @@ mod tests {
         let _r = TsPidOverridesRewriter::new(&m);
         // Behaviour verified by integration: an MPTS with programs 1+7
         // would re-PID program 1's audio while program 7 flows unchanged.
+    }
+
+    #[test]
+    fn unmatched_override_key_warns_once() {
+        // Override keyed on program 1332, but the live PAT only carries
+        // program 1 — pre-fix this was a totally silent no-op that left
+        // downstream assembly slots permanently empty with the feed UP.
+        let mut m = TsPidOverridesMap::new();
+        m.insert(1332, TsPidOverridesEntry { video_pid: Some(0x100), ..Default::default() });
+        let mut r = TsPidOverridesRewriter::new(&m);
+        assert!(!r.warned_unmatched_overrides);
+        let pat = build_pat_packet(&[(1, 0x100)], 0);
+        let mut out = Vec::new();
+        r.process(&pat, &mut out);
+        assert!(
+            r.warned_unmatched_overrides,
+            "override key absent from the PAT must latch the warn-once flag"
+        );
+        // Re-observing (new PAT version, still no program 1332) must not
+        // reset the latch — exactly one warning per config application.
+        let pat2 = build_pat_packet(&[(1, 0x100)], 1);
+        let mut out2 = Vec::new();
+        r.process(&pat2, &mut out2);
+        assert!(r.warned_unmatched_overrides);
+    }
+
+    #[test]
+    fn matched_override_key_does_not_warn() {
+        let mut m = TsPidOverridesMap::new();
+        m.insert(1, TsPidOverridesEntry { video_pid: Some(0x200), ..Default::default() });
+        let mut r = TsPidOverridesRewriter::new(&m);
+        let pat = build_pat_packet(&[(1, 0x100)], 0);
+        let mut out = Vec::new();
+        r.process(&pat, &mut out);
+        assert!(
+            !r.warned_unmatched_overrides,
+            "a PAT-matched override key must not trip the warning"
+        );
     }
 
     /// Build a synthetic PAT packet (lifted from ts_program_filter tests).

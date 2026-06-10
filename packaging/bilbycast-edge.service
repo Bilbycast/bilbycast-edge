@@ -32,12 +32,12 @@ TimeoutStopSec=20
 # ── Hardening ──
 NoNewPrivileges=true
 # Allow opening DRI render nodes (VAAPI, KMS scanout for `display`)
-# and ALSA devices when those features are compiled in.
-DeviceAllow=/dev/dri/card0 rwm
-DeviceAllow=/dev/dri/card1 rwm
-DeviceAllow=/dev/dri/renderD128 rwm
-DeviceAllow=/dev/dri/renderD129 rwm
-DeviceAllow=/dev/snd/* rwm
+# and ALSA devices when those features are compiled in. Class-based
+# (`char-<name>` per /proc/devices) rather than node paths: covers any
+# number of GPUs / sound cards and survives hotplug renumbering, where
+# a hardcoded /dev/dri/cardN list breaks on the third GPU.
+DeviceAllow=char-drm rwm
+DeviceAllow=char-alsa rwm
 SupplementaryGroups=video render audio
 # CAP_NET_ADMIN — required by kernel ≥ 6.x for setsockopt(SO_TXTIME)
 # with CLOCK_TAI. Without it, wire-emit falls back to clock_nanosleep.

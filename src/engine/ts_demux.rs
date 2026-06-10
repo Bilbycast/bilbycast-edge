@@ -817,13 +817,15 @@ impl TsDemuxer {
                     return Vec::new();
                 }
                 // HEVC NAL unit type is bits 1..6 of the first header byte.
-                // IDR_W_RADL = 19, IDR_N_LP = 20, CRA_NUT = 21 are keyframes.
+                // All IRAP types are valid random-access points: BLA_W_LP = 16,
+                // BLA_W_RADL = 17, BLA_N_LP = 18 (bitstream splicers emit
+                // these), IDR_W_RADL = 19, IDR_N_LP = 20, CRA_NUT = 21.
                 let is_keyframe = nalus.iter().any(|n| {
                     if n.is_empty() {
                         return false;
                     }
                     let nt = (n[0] >> 1) & 0x3F;
-                    matches!(nt, 19 | 20 | 21)
+                    matches!(nt, 16..=21)
                 });
                 vec![DemuxedFrame::H265 {
                     nalus,

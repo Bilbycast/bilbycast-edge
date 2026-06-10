@@ -674,11 +674,13 @@ impl FlowRuntime {
         // its bytes would be a self-referential loop). For non-
         // assembled flows this is `None` and the active input drives
         // the master clock as before.
-        let clock_source_input_cfg: Option<&crate::config::models::InputConfig> =
+        let pinned_clock_source_id: Option<String> =
             crate::engine::master_clock::resolve_pcr_source_input_id(
                 &config.config,
             )
-            .and_then(|id| {
+            .map(String::from);
+        let clock_source_input_cfg: Option<&crate::config::models::InputConfig> =
+            pinned_clock_source_id.as_deref().and_then(|id| {
                 config
                     .inputs
                     .iter()
@@ -1189,6 +1191,11 @@ impl FlowRuntime {
             let mc = master_clock.clone();
             let acc = flow_stats.clone();
             let cancel = cancel_token.child_token();
+            // Assembled flows: the clock identity is the designated
+            // `assembly.pcr_source` input (stamped by the PLL wrapper's
+            // telemetry), never the switcher's active input — skip the
+            // back-fill so a Take doesn't relabel the clock source.
+            let clock_pinned = pinned_clock_source_id.is_some();
             tokio::spawn(async move {
                 let mut interval =
                     tokio::time::interval(std::time::Duration::from_secs(1));
@@ -1206,7 +1213,7 @@ impl FlowRuntime {
                             // failing on <input_id>". `acc` holds the
                             // canonical active-input under an RwLock —
                             // empty string maps to None.
-                            if t.active_input_id.is_none() {
+                            if !clock_pinned && t.active_input_id.is_none() {
                                 if let Ok(g) = acc.active_input_id.read() {
                                     if !g.is_empty() {
                                         t.active_input_id = Some(g.clone());
@@ -1526,6 +1533,55 @@ impl FlowRuntime {
                 flow_id
             ))?
             .clone();
+
+        // Refuse a hot-swap that moves the effective `pcr_source` to a
+        // different INPUT. The master-clock plumbing (PCR ingress
+        // sampler subscription, the fallback watcher's pinned input id,
+        // and the C4 telemetry attribution) is resolved once at
+        // `FlowRuntime::start` and cannot re-key in place — accepting
+        // the swap would keep clocking the flow from the de-designated
+        // input while every telemetry surface confidently names the new
+        // one. Same shape as `hitless_leg_change_requires_restart`: the
+        // manager must route this edit through a full `update_flow`.
+        // (PID-only changes on the same input are fine — the sampler
+        // subscribes per input, not per PID.)
+        fn effective_pcr_input(asm: &crate::config::models::FlowAssembly) -> Option<&str> {
+            asm.pcr_source
+                .as_ref()
+                .map(|s| s.input_id.as_str())
+                .or_else(|| {
+                    asm.programs
+                        .first()
+                        .and_then(|p| p.pcr_source.as_ref())
+                        .map(|s| s.input_id.as_str())
+                })
+        }
+        if let Some(cur) = self.current_assembly.lock().await.as_ref() {
+            if let (Some(old_in), Some(new_in)) =
+                (effective_pcr_input(cur), effective_pcr_input(&new_assembly))
+            {
+                if old_in != new_in {
+                    let msg = format!(
+                        "flow '{flow_id}': update_flow_assembly rejected — effective \
+                         pcr_source input changed ('{old_in}' → '{new_in}'). The master \
+                         clock is pinned to the pcr_source input at flow start; use \
+                         update_flow (full restart) to re-clock the flow.",
+                    );
+                    self.event_sender.emit_flow_with_details(
+                        EventSeverity::Critical,
+                        category::FLOW,
+                        msg.clone(),
+                        flow_id,
+                        serde_json::json!({
+                            "error_code": "pid_bus_pcr_source_change_requires_restart",
+                            "old_input_id": old_in,
+                            "new_input_id": new_in,
+                        }),
+                    );
+                    bail!(msg);
+                }
+            }
+        }
 
         // Build the new plan against the current `ResolvedFlow.inputs`.
         // `build_assembly_plan` emits Critical events on every failure
@@ -4575,6 +4631,8 @@ async fn finalize_spts_assembler(
     //    Pass the per-flow A/V sync pacer so the assembler can run
     //    its own muxer-mode rewriter on the assembled output (single
     //    shared anchor, master-clock PCR/PTS, TR 101 290 compliance).
+    //    The health cell receives the 1 Hz per-slot stall snapshot for
+    //    `FlowStats.assembly_health`.
     Ok(spawn_spts_assembler(
         build.plan,
         bus.clone(),
@@ -4583,6 +4641,7 @@ async fn finalize_spts_assembler(
         Some(event_sender.clone()),
         flow_id.to_string(),
         av_sync_pacer.clone(),
+        Some(flow_stats.assembly_health.clone()),
     ))
 }
 
@@ -5986,7 +6045,7 @@ fn input_encode_blocks(
 /// output never rides an unlocked CLOCK_REALTIME and never oscillates epochs.
 fn build_auto_cascade(
     cfg: &crate::config::models::FlowConfig,
-    active_input_rx: tokio::sync::watch::Receiver<String>,
+    clock_source: crate::engine::master_clock::ClockSourceWatch,
     event_sender: &EventSender,
     cancel_token: &CancellationToken,
 ) -> (
@@ -6040,11 +6099,13 @@ fn build_auto_cascade(
     };
     let has_ptp_rung = ptp_handle.is_some();
 
-    let wrapper = Arc::new(PcrPllWithFallback::new_cascade(
-        pll_inner.clone(),
-        ptp_fallback,
-        "auto",
-    ));
+    let wrapper = PcrPllWithFallback::new_cascade(pll_inner.clone(), ptp_fallback, "auto");
+    // Assembled flows: pin telemetry + degraded-chip semantics to the
+    // designated `assembly.pcr_source` input (contract C4).
+    let wrapper = Arc::new(match clock_source.pinned_input_id() {
+        Some(id) => wrapper.with_clock_source_input(id),
+        None => wrapper,
+    });
     // Same fallback watcher as the PLL path — it drives the PLL→fallback
     // decision; `activate_fallback` picks PTP-vs-wallclock internally.
     let timeout_s = cfg
@@ -6055,7 +6116,7 @@ fn build_auto_cascade(
     crate::engine::master_clock::spawn_pll_fallback_watcher(
         wrapper.clone(),
         cfg.id.clone(),
-        active_input_rx,
+        clock_source,
         timeout_s,
         event_sender.clone(),
         cancel_token.child_token(),
@@ -6088,7 +6149,20 @@ fn build_master_clock(
 ) {
     use crate::config::models::MasterClockKindConfig;
     use crate::engine::master_clock::{
-        MasterClockHandle, MasterClockKind, SourcePcrPllMaster, WallclockMaster,
+        ClockSourceWatch, MasterClockHandle, MasterClockKind, SourcePcrPllMaster,
+        WallclockMaster,
+    };
+
+    // Assembled (PID-bus) flows pin the fallback watcher + telemetry to
+    // the operator-designated `assembly.pcr_source` input — a switcher
+    // Take changes which leg feeds a Switch slot, not the clock source,
+    // so it must not reset the PLL anchor (which would hard-unlock the
+    // PLL and demote the flow to wallclock-hold until re-lock).
+    // Non-assembled flows keep the active-input watch: there the active
+    // input IS the clock source.
+    let clock_source = match crate::engine::master_clock::resolve_pcr_source_input_id(cfg) {
+        Some(id) => ClockSourceWatch::Pinned(id.to_string()),
+        None => ClockSourceWatch::ActiveInput(active_input_rx),
     };
 
     // `auto` is the DEFAULT (a flow with no explicit `master_clock` behaves
@@ -6139,7 +6213,7 @@ fn build_master_clock(
                     )
                 );
             if cfg.assembly.is_some() || single_live_contribution {
-                return build_auto_cascade(cfg, active_input_rx, event_sender, cancel_token);
+                return build_auto_cascade(cfg, clock_source, event_sender, cancel_token);
             }
             // Switcher / file / replay / WebRTC / test-pattern / bonded /
             // rtp_audio → stable wallclock.
@@ -6260,9 +6334,15 @@ fn build_master_clock(
             // wallclock if the PLL never locks. The wrapper owns both
             // clocks behind a single `MasterClock` impl; `now_27mhz()`
             // dispatches based on an internal atomic flag.
-            let wrapper = Arc::new(
-                crate::engine::master_clock::PcrPllWithFallback::new(pll_inner.clone()),
-            );
+            let wrapper =
+                crate::engine::master_clock::PcrPllWithFallback::new(pll_inner.clone());
+            // Assembled flows with an explicit PLL pin still key
+            // telemetry + the degraded chip to the designated
+            // `assembly.pcr_source` input (contract C4).
+            let wrapper = Arc::new(match clock_source.pinned_input_id() {
+                Some(id) => wrapper.with_clock_source_input(id),
+                None => wrapper,
+            });
             // Spawn the fallback watcher unless the operator opted out
             // by setting `pll_lock_timeout_s: 0`. Default 30 s.
             let timeout_s = cfg
@@ -6270,14 +6350,15 @@ fn build_master_clock(
                 .as_ref()
                 .and_then(|m| m.pll_lock_timeout_s)
                 .unwrap_or(30);
-            // The watcher tracks the active input via the shared
-            // `active_input_rx` watch — it sees switches as they happen
-            // and restarts the grace window so the new input gets a
-            // fresh `timeout_s` to acquire lock.
+            // The watcher follows `clock_source`: the active-input watch
+            // for non-assembled flows (switches restart the grace window
+            // so the new input gets a fresh `timeout_s` to acquire lock),
+            // or the pinned `assembly.pcr_source` input for assembled
+            // flows (switcher Takes leave the PLL anchor alone).
             crate::engine::master_clock::spawn_pll_fallback_watcher(
                 wrapper.clone(),
                 cfg.id.clone(),
-                active_input_rx,
+                clock_source,
                 timeout_s,
                 event_sender.clone(),
                 cancel_token.child_token(),

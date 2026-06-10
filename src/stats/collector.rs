@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
@@ -168,7 +168,21 @@ pub struct OutputStatsAccumulator {
     /// Registered once at output startup by `wire_emit::spawn_wire_emitter`.
     /// Read (single atomic load) on snapshot to surface `wire_emit_depth`.
     wire_emit_depth: OnceLock<Arc<std::sync::atomic::AtomicUsize>>,
+
+    // ── Display-output liveness ──────────────────────────────────────
+    // Prev-sample tracker over the cumulative `frames_displayed` counter
+    // (the display analogue of the byte-delta bitrate estimator that
+    // decays network outputs to `idle`). Sampled only from `snapshot()`
+    // — never on the render path. Without it a panel frozen mid-run
+    // (e.g. an `UpdateFlowAssembly` hot-swap onto a dead slot, which
+    // does NOT restart outputs) would report `active` forever off the
+    // lifetime counter.
+    display_frames_fresh: crate::stats::throughput::CounterFreshness,
 }
+
+/// A display output whose `frames_displayed` counter has not advanced for
+/// this long reads as `idle` instead of `active` in [`derive_output_state`].
+const DISPLAY_FRAMES_STALL_WINDOW: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Registered handle to a per-output decode stage's counters plus the
 /// steady-state descriptors the snapshot path needs to build a
@@ -420,6 +434,17 @@ pub struct DisplayStatsCounters {
     /// PTS that trip our flush heuristic — the targeted fix is a
     /// hysteresis on the jump detection.
     pub pts_jumps_observed: AtomicU64,
+    /// Video access units the demux loop dropped because a decoder
+    /// flush (startup, operator switch, broadcast Lagged, pts_jump) was
+    /// pending and the AU was not a keyframe. A freshly-flushed decoder
+    /// has no reference frames, so pre-IDR slices are guaranteed
+    /// `send_packet` rejections — skipping them removes the
+    /// AVERROR_INVALIDDATA warn-spam at every mid-GOP join AND the
+    /// false HW→CPU demotion a long pre-IDR error run could trip.
+    /// Steady growth bounded by one GOP per switch is healthy; sustained
+    /// steady-state growth means the flush triggers are firing
+    /// spuriously (audit `pts_jumps_observed` / `subscriber_lag_events`).
+    pub aus_skipped_awaiting_keyframe: AtomicU64,
     /// Decoded frames whose `frame.pts()` was `None` (decoder didn't
     /// emit a display-order PTS), so the display loop fell back to the
     /// most recent input PTS. Bumped from `drain_video_frames`. Should
@@ -703,6 +728,7 @@ impl OutputStatsAccumulator {
             wire_pacing_pinned_cpu: AtomicI32::new(-1),
             egress_shed: AtomicU64::new(0),
             wire_emit_depth: OnceLock::new(),
+            display_frames_fresh: crate::stats::throughput::CounterFreshness::new(),
         }
     }
 
@@ -1113,6 +1139,10 @@ impl OutputStatsAccumulator {
                 .frames_received_since_open
                 .load(Ordering::Relaxed),
             pts_jumps_observed: h.counters.pts_jumps_observed.load(Ordering::Relaxed),
+            aus_skipped_awaiting_keyframe: h
+                .counters
+                .aus_skipped_awaiting_keyframe
+                .load(Ordering::Relaxed),
             frame_pts_fallbacks: h.counters.frame_pts_fallbacks.load(Ordering::Relaxed),
             frames_dropped_unsupported_pixfmt: h
                 .counters
@@ -1173,6 +1203,15 @@ impl OutputStatsAccumulator {
 
         let packets_sent = self.packets_sent.load(Ordering::Relaxed);
         let packets_dropped = self.packets_dropped.load(Ordering::Relaxed);
+        let display_frames_displayed =
+            display_stats.as_ref().map(|d| d.frames_displayed).unwrap_or(0);
+        // Frames flipped recently — the display "bitrate". The `> 0` guard
+        // keeps the tracker's startup window (last_advance = construction
+        // time) from reading a never-displayed output as fresh.
+        let display_frames_advancing = display_frames_displayed > 0
+            && self
+                .display_frames_fresh
+                .advanced_within(display_frames_displayed, DISPLAY_FRAMES_STALL_WINDOW);
 
         OutputStats {
             output_id: self.output_id.clone(),
@@ -1182,7 +1221,8 @@ impl OutputStatsAccumulator {
                 bitrate_bps,
                 packets_sent,
                 packets_dropped,
-                display_stats.as_ref().map(|d| d.frames_displayed).unwrap_or(0),
+                display_frames_displayed,
+                display_frames_advancing,
             ),
             mode: None,
             remote_addr: None,
@@ -2099,6 +2139,15 @@ pub struct PerInputCounters {
     pub bytes: AtomicU64,
     pub packets: AtomicU64,
     pub throughput: ThroughputEstimator,
+    /// Consecutive failed connect attempts on the input's caller-mode
+    /// connection (SRT caller today). `Arc` so the input task's retry
+    /// observer can hold the counter directly; written from the retry
+    /// loop (once per back-off tick), read by the 1 Hz snapshot — never
+    /// on the packet path. At or above
+    /// [`crate::srt::connection::CONNECT_FAILED_THRESHOLD`] the input's
+    /// reported state becomes `"connect_failed"`; reset to 0 on a
+    /// successful connect.
+    pub connect_failures: Arc<AtomicU32>,
     /// Per-input topology/address metadata, captured at registration so
     /// the snapshot path can fill `PerInputLive.{mode, local_addr, ...}`
     /// for every configured input — not only the single active one.
@@ -2146,10 +2195,19 @@ impl PerInputCounters {
             bytes: AtomicU64::new(0),
             packets: AtomicU64::new(0),
             throughput: ThroughputEstimator::new(),
+            connect_failures: Arc::new(AtomicU32::new(0)),
             meta,
             psi_catalog,
             psi_catalog_cache: std::sync::Mutex::new((0, None)),
         }
+    }
+
+    /// Whether this input has crossed the consecutive-connect-failure
+    /// threshold — the snapshot path maps `true` to state
+    /// `"connect_failed"`.
+    pub fn connect_failed(&self) -> bool {
+        self.connect_failures.load(Ordering::Relaxed)
+            >= crate::srt::connection::CONNECT_FAILED_THRESHOLD
     }
 
     /// Snapshot the catalogue with tick-based drop-equal caching. Returns
@@ -2464,6 +2522,11 @@ pub struct FlowStatsAccumulator {
     /// the (rare) write doesn't add a hot-path atomic.
     pub master_clock_state:
         std::sync::RwLock<Option<crate::stats::models::MasterClockStats>>,
+    /// Per-slot assembly liveness, published at 1 Hz by the running TS
+    /// assembler (`engine::ts_assembler`). Stays `None` on passthrough
+    /// flows so `FlowStats.assembly_health` is absent for them. `Arc`'d
+    /// because the assembler runs on its own dedicated thread.
+    pub assembly_health: Arc<crate::engine::ts_assembler::AssemblyHealthCell>,
 }
 
 /// Per-elementary-stream accumulator. One instance per `(input_id, source_pid)`
@@ -2603,6 +2666,7 @@ impl FlowStatsAccumulator {
             per_es_stats: DashMap::new(),
             pid_routing: std::sync::RwLock::new(std::collections::HashMap::new()),
             master_clock_state: std::sync::RwLock::new(None),
+            assembly_health: Arc::new(std::sync::RwLock::new(None)),
         }
     }
 
@@ -3150,7 +3214,7 @@ impl FlowStatsAccumulator {
                 PerInputLive {
                     input_id,
                     input_type: c.input_type.clone(),
-                    state: derive_input_state(bitrate, packets),
+                    state: derive_input_state(bitrate, packets, c.connect_failed()),
                     packets_received: packets,
                     bytes_received: bytes,
                     bitrate_bps: bitrate,
@@ -3364,9 +3428,18 @@ impl FlowStatsAccumulator {
                 );
 
                 let total_input_packets = self.input_packets.load(Ordering::Relaxed);
+                // Flow-level state mirrors the ACTIVE input's connect-failure
+                // latch. NB: `input_bitrate` is the sum across every running
+                // input, so sibling traffic can still mask a dead active input
+                // here — `inputs_live[]` is the per-input honest surface.
+                let active_connect_failed = self
+                    .per_input_counters
+                    .get(active_key)
+                    .map(|c| c.connect_failed())
+                    .unwrap_or(false);
                 InputStats {
                     input_type,
-                    state: derive_input_state(input_bitrate, total_input_packets),
+                    state: derive_input_state(input_bitrate, total_input_packets, active_connect_failed),
                     mode: meta.and_then(|m| m.mode.clone()),
                     local_addr: meta.and_then(|m| m.local_addr.clone()),
                     remote_addr: meta.and_then(|m| m.remote_addr.clone()),
@@ -3466,6 +3539,7 @@ impl FlowStatsAccumulator {
             #[cfg(not(feature = "replay"))]
             recording: None,
             master_clock: self.master_clock_snapshot(),
+            assembly_health: self.assembly_health.read().ok().and_then(|g| g.clone()),
         }
     }
 }
@@ -3970,9 +4044,16 @@ fn build_pipeline_summary(
 
 /// Derive input connection state from counters.
 /// Called during the 1/sec snapshot — zero hot-path impact.
-fn derive_input_state(bitrate_bps: u64, packets_received: u64) -> String {
+///
+/// `connect_failed` is the per-input consecutive-connect-failure latch
+/// ([`PerInputCounters::connect_failed`]) — it outranks `idle`/`waiting`
+/// (the connection is provably down, not merely quiet) but never
+/// `receiving` (live bytes mean the latch is about to reset).
+fn derive_input_state(bitrate_bps: u64, packets_received: u64, connect_failed: bool) -> String {
     if bitrate_bps > 0 {
         "receiving"
+    } else if connect_failed {
+        "connect_failed"
     } else if packets_received > 0 {
         "idle"
     } else {
@@ -3984,19 +4065,24 @@ fn derive_input_state(bitrate_bps: u64, packets_received: u64) -> String {
 /// Derive output connection state from counters.
 /// Called during the 1/sec snapshot — zero hot-path impact.
 ///
-/// `display_frames_displayed` lets display outputs (which never increment
-/// `packets_sent` because they render locally rather than send over a
-/// network) report `active` once the renderer has put a frame on the
-/// connector. Pass `0` for non-display outputs.
+/// Display outputs never increment `packets_sent` / `bytes_sent` (they
+/// render locally rather than send over a network), so their two signals
+/// mirror the network pair: `display_frames_advancing` (frames flipped
+/// within [`DISPLAY_FRAMES_STALL_WINDOW`] — the bitrate analogue) drives
+/// `active`, and the cumulative `display_frames_displayed` (the
+/// `packets_sent` analogue) decays a panel frozen mid-run to `idle`
+/// instead of latching `active` forever off the lifetime counter. Pass
+/// `(0, false)` for non-display outputs — their derivation is unchanged.
 fn derive_output_state(
     bitrate_bps: u64,
     packets_sent: u64,
     packets_dropped: u64,
     display_frames_displayed: u64,
+    display_frames_advancing: bool,
 ) -> String {
-    if bitrate_bps > 0 || display_frames_displayed > 0 {
+    if bitrate_bps > 0 || display_frames_advancing {
         "active"
-    } else if packets_sent > 0 {
+    } else if packets_sent > 0 || display_frames_displayed > 0 {
         "idle"
     } else if packets_dropped > 0 {
         "dropping"
@@ -4109,6 +4195,49 @@ impl StatsCollector {
     /// Snapshot a single flow by ID. Returns `None` if the flow is not registered.
     pub fn flow_snapshot(&self, flow_id: &str) -> Option<FlowStats> {
         self.flow_stats.get(flow_id).map(|entry| entry.snapshot())
+    }
+}
+
+#[cfg(test)]
+mod input_state_tests {
+    use super::*;
+
+    #[test]
+    fn derive_input_state_precedence() {
+        // Live bytes always win — even with the failure latch still set
+        // (the retry loop resets it on the connect that produced them).
+        assert_eq!(derive_input_state(1_000, 10, true), "receiving");
+        assert_eq!(derive_input_state(1_000, 10, false), "receiving");
+        // No traffic + threshold crossed → connect_failed, regardless of
+        // whether an earlier session ever produced packets.
+        assert_eq!(derive_input_state(0, 0, true), "connect_failed");
+        assert_eq!(derive_input_state(0, 10, true), "connect_failed");
+        // Pre-existing semantics unchanged below the threshold.
+        assert_eq!(derive_input_state(0, 10, false), "idle");
+        assert_eq!(derive_input_state(0, 0, false), "waiting");
+    }
+
+    #[test]
+    fn derive_output_state_wire_outputs_unchanged() {
+        // Network outputs pass (0, false) for the display pair — the
+        // pre-existing derivation must be bit-identical.
+        assert_eq!(derive_output_state(1_000, 10, 0, 0, false), "active");
+        assert_eq!(derive_output_state(0, 10, 0, 0, false), "idle");
+        assert_eq!(derive_output_state(0, 0, 5, 0, false), "dropping");
+        assert_eq!(derive_output_state(0, 0, 0, 0, false), "waiting");
+    }
+
+    #[test]
+    fn derive_output_state_display_freezes_to_idle() {
+        // Frames still advancing → active, exactly as before.
+        assert_eq!(derive_output_state(0, 0, 0, 100, true), "active");
+        // Frozen mid-run (lifetime counter > 0, no advance within the
+        // stall window) → idle, NOT the latched-active the cumulative
+        // counter used to produce.
+        assert_eq!(derive_output_state(0, 0, 0, 100, false), "idle");
+        // Never displayed a frame → waiting (registration alone isn't
+        // activity).
+        assert_eq!(derive_output_state(0, 0, 0, 0, false), "waiting");
     }
 }
 

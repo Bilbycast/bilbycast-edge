@@ -415,6 +415,13 @@ pub async fn connect_srt(p: &SrtConnectionParams<'_>) -> Result<Arc<SrtSocket>> 
     }
 }
 
+/// Consecutive failed connect attempts after which a caller-mode input is
+/// considered connect-failed: the input's reported stats state flips to
+/// `"connect_failed"` and the latched Critical event fires. Shared by the
+/// retry observer in `engine::input_srt` and the snapshot path in
+/// `stats::collector`.
+pub const CONNECT_FAILED_THRESHOLD: u32 = 5;
+
 /// Connect with retry logic and exponential back-off.
 ///
 /// Retries indefinitely until the connection succeeds or the
@@ -422,6 +429,19 @@ pub async fn connect_srt(p: &SrtConnectionParams<'_>) -> Result<Arc<SrtSocket>> 
 pub async fn connect_srt_with_retry(
     p: &SrtConnectionParams<'_>,
     cancel: &CancellationToken,
+) -> Result<Arc<SrtSocket>> {
+    connect_srt_with_retry_observed(p, cancel, &mut |_, _| {}).await
+}
+
+/// Like [`connect_srt_with_retry`], invoking `on_attempt_failed` with the
+/// consecutive-failure count after every failed attempt (before the
+/// back-off sleep). The loop never returns `Err` except on cancellation,
+/// so the observer is the only way a caller can surface a never-connecting
+/// peer while retries continue.
+pub async fn connect_srt_with_retry_observed(
+    p: &SrtConnectionParams<'_>,
+    cancel: &CancellationToken,
+    on_attempt_failed: &mut (dyn FnMut(u32, &anyhow::Error) + Send),
 ) -> Result<Arc<SrtSocket>> {
     let mut attempt = 0u32;
     let max_delay = Duration::from_secs(30);
@@ -439,6 +459,7 @@ pub async fn connect_srt_with_retry(
                     "SRT connection attempt {attempt} failed: {e}. Retrying in {:.1}s",
                     delay.as_secs_f64()
                 );
+                on_attempt_failed(attempt, &e);
 
                 tokio::select! {
                     _ = cancel.cancelled() => {
@@ -479,8 +500,18 @@ pub async fn connect_srt_redundancy_leg(
     redundancy: &SrtRedundancyConfig,
     cancel: &CancellationToken,
 ) -> Result<Arc<SrtSocket>> {
+    connect_srt_redundancy_leg_observed(redundancy, cancel, &mut |_, _| {}).await
+}
+
+/// Like [`connect_srt_redundancy_leg`], with the per-attempt failure
+/// observer (see [`connect_srt_with_retry_observed`]).
+pub async fn connect_srt_redundancy_leg_observed(
+    redundancy: &SrtRedundancyConfig,
+    cancel: &CancellationToken,
+    on_attempt_failed: &mut (dyn FnMut(u32, &anyhow::Error) + Send),
+) -> Result<Arc<SrtSocket>> {
     let p = SrtConnectionParams::from(redundancy);
-    connect_srt_with_retry(&p, cancel).await
+    connect_srt_with_retry_observed(&p, cancel, on_attempt_failed).await
 }
 
 // ---------------------------------------------------------------------------
@@ -802,6 +833,18 @@ pub async fn connect_srt_group(
     bond: &SrtBondingConfig,
     cancel: &CancellationToken,
 ) -> Result<Arc<SrtGroup>> {
+    connect_srt_group_observed(p, bond, cancel, &mut |_, _| {}).await
+}
+
+/// Like [`connect_srt_group`], with the per-attempt failure observer
+/// (see [`connect_srt_with_retry_observed`]) so a never-connecting bonded
+/// caller can surface `connect_failed` state + the latched Critical event.
+pub async fn connect_srt_group_observed(
+    p: &SrtConnectionParams<'_>,
+    bond: &SrtBondingConfig,
+    cancel: &CancellationToken,
+    on_attempt_failed: &mut (dyn FnMut(u32, &anyhow::Error) + Send),
+) -> Result<Arc<SrtGroup>> {
     if !matches!(p.mode, SrtMode::Caller) {
         bail!("SRT bonding caller-connect requires caller mode");
     }
@@ -816,6 +859,7 @@ pub async fn connect_srt_group(
 
     // Retry with exponential back-off, same shape as single-socket connect.
     let mut delay_ms: u64 = 250;
+    let mut attempts = 0u32;
     loop {
         if cancel.is_cancelled() {
             bail!("cancelled before SRT group connect");
@@ -831,7 +875,10 @@ pub async fn connect_srt_group(
         match attempt {
             Ok(group) => return Ok(group),
             Err(e) => {
+                attempts += 1;
                 tracing::warn!("SRT group connect failed: {e}; retrying in {delay_ms}ms");
+                let err = anyhow::anyhow!("{e}");
+                on_attempt_failed(attempts, &err);
                 tokio::select! {
                     _ = cancel.cancelled() => bail!("cancelled during SRT group reconnect"),
                     _ = tokio::time::sleep(Duration::from_millis(delay_ms)) => {}

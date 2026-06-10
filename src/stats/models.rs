@@ -120,6 +120,49 @@ pub struct FlowStats {
     /// addition; old manager builds ignore unknown fields.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub master_clock: Option<MasterClockStats>,
+    /// Per-slot liveness rollup for assembled (PID-bus) flows: total
+    /// slot count plus the subset currently stalled (no ES packet for
+    /// ≥ 5 s, with a 10 s grace after flow start). Published at 1 Hz by
+    /// the running TS assembler. Absent on passthrough flows so the
+    /// JSON shape is unchanged for them. Backward-compatible addition;
+    /// old manager builds ignore unknown fields.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assembly_health: Option<AssemblyHealth>,
+}
+
+/// Assembly-slot liveness rollup surfaced on [`FlowStats`] for assembled
+/// flows. A "slot" here is one configured `(program, out_pid)` entry of
+/// the assembly plan; for Switch slots, only the currently-active leg
+/// counts as data. Stall detection lives in `engine::ts_assembler` —
+/// this is the wire shape only.
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct AssemblyHealth {
+    /// Number of slots in the running plan, across every program.
+    pub total_slots: u32,
+    /// Number of entries in `stalled_slots`.
+    pub stalled_slot_count: u32,
+    /// One entry per currently-stalled slot. Empty when every slot is
+    /// receiving ES data (the healthy steady state).
+    pub stalled_slots: Vec<StalledSlotStats>,
+}
+
+/// One stalled assembly slot within [`AssemblyHealth`].
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct StalledSlotStats {
+    /// MPEG-TS program number the slot belongs to.
+    pub program_number: u16,
+    /// Egress PID the slot rewrites onto.
+    pub out_pid: u16,
+    /// Source input feeding the slot. For Switch slots this is the
+    /// currently-active leg.
+    pub input_id: String,
+    /// Source PID on `input_id` the slot subscribes to (post
+    /// `pid_overrides`).
+    pub source_pid: u16,
+    /// Seconds since the slot last forwarded an ES packet. For slots
+    /// that have never received data, seconds since the slot was
+    /// registered (flow start or hot-swap).
+    pub seconds_since_data: u64,
 }
 
 /// Master-clock telemetry surfaced on `FlowStats`. Mirror of
@@ -452,6 +495,9 @@ pub struct PerEsStats {
 pub struct PerInputLive {
     pub input_id: String,
     pub input_type: String,
+    /// Same state vocabulary as [`InputStats::state`], including
+    /// `"connect_failed"` for caller-mode inputs whose consecutive
+    /// connect failures crossed the threshold.
     pub state: String,
     pub packets_received: u64,
     pub bytes_received: u64,
@@ -618,7 +664,10 @@ pub enum FlowState {
 pub struct InputStats {
     /// Transport protocol type, e.g. `"srt"`, `"udp"`, `"rtmp"`.
     pub input_type: String,
-    /// Human-readable connection state, e.g. `"receiving"`, `"connecting"`.
+    /// Human-readable connection state: `"receiving"`, `"idle"`,
+    /// `"waiting"`, or `"connect_failed"` (caller-mode connection has
+    /// failed `CONNECT_FAILED_THRESHOLD` consecutive connect attempts;
+    /// resets on a successful connect).
     pub state: String,
     /// SRT mode: "caller", "listener", or "rendezvous" (for topology display).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -991,6 +1040,16 @@ pub struct DisplayStats {
     /// PTS that trip the 1 s flush threshold.
     #[serde(default)]
     pub pts_jumps_observed: u64,
+    /// Video access units skipped while waiting for the first keyframe
+    /// after a decoder flush (startup, operator switch, broadcast
+    /// Lagged, pts_jump). Pre-IDR slices are guaranteed `send_packet`
+    /// rejections on a flushed decoder, so the demux loop sheds them
+    /// instead of feeding them. Bounded by one GOP per switch in the
+    /// healthy case; sustained steady-state growth means the flush
+    /// triggers are firing spuriously. Additive field — older managers
+    /// ignore it.
+    #[serde(default)]
+    pub aus_skipped_awaiting_keyframe: u64,
     /// Decoded frames whose `frame.pts()` was `None`, forcing the
     /// display loop to fall back to the most recent input PTS. Growth
     /// implicates the B-frame display-PTS plumbing.

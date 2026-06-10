@@ -201,9 +201,12 @@ pub struct MasterClockTelemetry {
     /// ID of the input currently feeding the clock. For
     /// `source_pcr_pll` this is the active input whose PCR samples the
     /// PLL is tracking (refreshes on operator-driven input switches
-    /// without re-creating the master). `None` for clock kinds that
-    /// don't take their rate from a single ingress stream
-    /// (`ptp`, bare `wallclock`). Additive — older managers ignore it.
+    /// without re-creating the master). For assembled (PID-bus) flows
+    /// this is the operator-designated `assembly.pcr_source` input —
+    /// the clock identity never follows the switcher's active input.
+    /// `None` for clock kinds that don't take their rate from a single
+    /// ingress stream (`ptp`, bare `wallclock`). Additive — older
+    /// managers ignore it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_input_id: Option<String>,
     /// Which rate-sample source last fed the PLL. `"sender_timestamp"`
@@ -625,6 +628,17 @@ pub struct PcrPllWithFallback {
     /// cascade so the UI renders "Auto → PTP/Wallclock"; `None` for the
     /// classic wrapper (which reports `source_pcr_pll`).
     configured_kind: Option<&'static str>,
+    /// Assembled (PID-bus) flows only: the operator-designated
+    /// `assembly.pcr_source` input id. When set, telemetry (a) stamps
+    /// `active_input_id` with it so the manager UI attributes clock
+    /// state to the clock-source input rather than the switcher's
+    /// active input, and (b) reports `fallback_active = true` whenever
+    /// the PLL is unlocked — even on the PTP / wallclock cascade rungs
+    /// that suppress the chip for contribution flows. For assembly the
+    /// pcr_source is an explicit operator designation; it failing is a
+    /// genuine degradation, not an acceptable floor. `None` = classic
+    /// behaviour, unchanged.
+    clock_source_input: Option<String>,
     source_id: String,
 }
 
@@ -639,6 +653,7 @@ impl PcrPllWithFallback {
             fallback_uses_ptp: AtomicBool::new(false),
             fallback_reason: std::sync::RwLock::new(None),
             configured_kind: None,
+            clock_source_input: None,
             source_id,
         }
     }
@@ -661,8 +676,18 @@ impl PcrPllWithFallback {
             fallback_uses_ptp: AtomicBool::new(false),
             fallback_reason: std::sync::RwLock::new(None),
             configured_kind: Some(label),
+            clock_source_input: None,
             source_id,
         }
+    }
+
+    /// Pin the wrapper to an assembled flow's designated
+    /// `assembly.pcr_source` input ([`resolve_pcr_source_input_id`]).
+    /// See the `clock_source_input` field docs for the telemetry
+    /// semantics this enables. Call before the `Arc` wrap.
+    pub fn with_clock_source_input(mut self, input_id: impl Into<String>) -> Self {
+        self.clock_source_input = Some(input_id.into());
+        self
     }
 
     pub fn pll_master(&self) -> Arc<SourcePcrPllMaster> {
@@ -729,6 +754,62 @@ impl PcrPllWithFallback {
         self.pll_master.reset_anchor();
         self.deactivate_fallback();
     }
+
+    /// Telemetry for whichever rung currently drives `now_27mhz`,
+    /// before the assembled-flow degraded overlay in
+    /// [`MasterClock::telemetry`] is applied.
+    fn rung_telemetry(&self) -> MasterClockTelemetry {
+        if self.fallback_active.load(Ordering::Acquire) {
+            // Self-heal here too so the 1 Hz telemetry tick guarantees
+            // the manager UI clears the fallback chip the moment the
+            // PLL has re-locked — without waiting for the next emit-path
+            // `now_27mhz` to trigger it.
+            if self.pll_master.is_locked() {
+                self.deactivate_fallback();
+                return self.pll_master.telemetry();
+            }
+            // Cascade PTP rung active → report its real servo telemetry,
+            // labelled `auto`. PTP is a legitimate resolved rung, not an
+            // alarm, so `fallback_active` stays false (the "Auto → PTP"
+            // label tells the story). Assembled flows re-raise the chip
+            // in the overlay — their pcr_source designation is failing.
+            let on_ptp = self.fallback_uses_ptp.load(Ordering::Acquire)
+                && self
+                    .ptp_fallback
+                    .as_ref()
+                    .map_or(false, |p| p.is_locked());
+            if on_ptp {
+                let mut t = self.ptp_fallback.as_ref().unwrap().telemetry();
+                t.configured_kind =
+                    Some(self.configured_kind.unwrap_or("auto").to_string());
+                t.fallback_active = false;
+                return t;
+            }
+            // Wallclock rung. The classic wrapper surfaces the alarm chip +
+            // reason ("Wallclock (fallback from source_pcr_pll)"); the
+            // cascade treats wallclock as its expected floor (the
+            // "Auto → Wallclock" label communicates it) and does not
+            // alarm — except for assembled flows, where the overlay in
+            // `telemetry()` re-raises the chip.
+            let is_cascade = self.configured_kind.is_some();
+            let mut t = self.wallclock.telemetry();
+            t.kind = MasterClockKind::Wallclock.as_str().to_string();
+            t.configured_kind = Some(
+                self.configured_kind
+                    .unwrap_or(MasterClockKind::SourcePcrPll.as_str())
+                    .to_string(),
+            );
+            t.fallback_active = !is_cascade;
+            t.fallback_reason = if is_cascade {
+                None
+            } else {
+                self.fallback_reason.read().ok().and_then(|g| g.clone())
+            };
+            t
+        } else {
+            self.pll_master.telemetry()
+        }
+    }
 }
 
 impl MasterClock for PcrPllWithFallback {
@@ -785,8 +866,11 @@ impl MasterClock for PcrPllWithFallback {
                 self.deactivate_fallback();
                 return true;
             }
-            // Wallclock fallback is always "locked" — operator sees the
-            // fallback chip on the UI but consumers see a usable clock.
+            // Wallclock fallback is always "locked" — consumers see a
+            // usable clock. The UI story rides on telemetry: the classic
+            // wrapper raises the fallback chip, the cascade renders the
+            // "Auto → PTP/Wallclock" label, and assembled flows re-raise
+            // the chip via the `clock_source_input` overlay.
             true
         } else {
             self.pll_master.is_locked()
@@ -794,57 +878,62 @@ impl MasterClock for PcrPllWithFallback {
     }
 
     fn telemetry(&self) -> MasterClockTelemetry {
-        if self.fallback_active.load(Ordering::Acquire) {
-            // Self-heal here too so the 1 Hz telemetry tick guarantees
-            // the manager UI clears the fallback chip the moment the
-            // PLL has re-locked — without waiting for the next emit-path
-            // `now_27mhz` to trigger it.
-            if self.pll_master.is_locked() {
-                self.deactivate_fallback();
-                return self.pll_master.telemetry();
+        let mut t = self.rung_telemetry();
+        // Assembled-flow overlay (contract C4): the clock identity is
+        // the operator-designated `assembly.pcr_source` input, and an
+        // unlocked PLL means the assembler is generating output PCR off
+        // a fallback rung — surface the degraded chip on BOTH cascade
+        // rungs (and during the lock-then-promote wallclock hold before
+        // the watcher fires), where contribution flows suppress it.
+        if let Some(src) = &self.clock_source_input {
+            t.active_input_id = Some(src.clone());
+            if !self.pll_master.is_locked() {
+                t.fallback_active = true;
+                if t.fallback_reason.is_none() {
+                    t.fallback_reason = Some(
+                        self.fallback_reason
+                            .read()
+                            .ok()
+                            .and_then(|g| g.clone())
+                            .unwrap_or_else(|| "pll_unlocked".to_string()),
+                    );
+                }
             }
-            // Cascade PTP rung active → report its real servo telemetry,
-            // labelled `auto`. PTP is a legitimate resolved rung, not an
-            // alarm, so `fallback_active` stays false (the "Auto → PTP"
-            // label tells the story).
-            let on_ptp = self.fallback_uses_ptp.load(Ordering::Acquire)
-                && self
-                    .ptp_fallback
-                    .as_ref()
-                    .map_or(false, |p| p.is_locked());
-            if on_ptp {
-                let mut t = self.ptp_fallback.as_ref().unwrap().telemetry();
-                t.configured_kind =
-                    Some(self.configured_kind.unwrap_or("auto").to_string());
-                t.fallback_active = false;
-                return t;
-            }
-            // Wallclock rung. The classic wrapper surfaces the alarm chip +
-            // reason ("Wallclock (fallback from source_pcr_pll)"); the
-            // cascade treats wallclock as its expected floor (the
-            // "Auto → Wallclock" label communicates it) and does not alarm.
-            let is_cascade = self.configured_kind.is_some();
-            let mut t = self.wallclock.telemetry();
-            t.kind = MasterClockKind::Wallclock.as_str().to_string();
-            t.configured_kind = Some(
-                self.configured_kind
-                    .unwrap_or(MasterClockKind::SourcePcrPll.as_str())
-                    .to_string(),
-            );
-            t.fallback_active = !is_cascade;
-            t.fallback_reason = if is_cascade {
-                None
-            } else {
-                self.fallback_reason.read().ok().and_then(|g| g.clone())
-            };
-            t
-        } else {
-            self.pll_master.telemetry()
         }
+        t
     }
 
     fn lipsync_offset_90k(&self) -> i64 {
         self.pll_master.lipsync_offset_90k()
+    }
+}
+
+/// Identifies the input whose stream drives the PLL that
+/// [`spawn_pll_fallback_watcher`] monitors.
+///
+/// Non-assembled flows follow the flow's active input: an operator
+/// `activate_input` genuinely changes the clock source, so the watcher
+/// resets the PLL anchor and restarts the lock grace window. Assembled
+/// (PID-bus) flows pin the clock to the operator-designated
+/// `assembly.pcr_source` input ([`resolve_pcr_source_input_id`]) — a
+/// switcher Take changes which leg feeds a Switch slot, not the clock
+/// source, so the watcher must leave the PLL anchor alone (resetting it
+/// would hard-unlock the PLL and, under lock-then-promote, demote the
+/// flow to wallclock-hold on every Take).
+pub enum ClockSourceWatch {
+    /// Follow the flow's active-input watch channel.
+    ActiveInput(tokio::sync::watch::Receiver<String>),
+    /// Pinned to the named input for the flow's lifetime.
+    Pinned(String),
+}
+
+impl ClockSourceWatch {
+    /// The pinned clock-source input id, when this is `Pinned`.
+    pub fn pinned_input_id(&self) -> Option<&str> {
+        match self {
+            Self::Pinned(id) => Some(id),
+            Self::ActiveInput(_) => None,
+        }
     }
 }
 
@@ -862,17 +951,20 @@ impl MasterClock for PcrPllWithFallback {
 ///    again. Self-heal also fires from `now_27mhz` / `telemetry`, this
 ///    branch is the belt-and-braces backstop and emits the recovery
 ///    event.
-/// 3. **Input switch**: when `active_input_rx` publishes a new ID, the
-///    grace window restarts so the new input has a fresh
-///    `timeout_s` to acquire lock before re-falling-back. The monitor
-///    also calls `PcrPllWithFallback::on_input_switch` to reset the
-///    PLL anchor + clear stale fallback state.
+/// 3. **Input switch** ([`ClockSourceWatch::ActiveInput`] only): when
+///    the watch publishes a new ID, the grace window restarts so the
+///    new input has a fresh `timeout_s` to acquire lock before
+///    re-falling-back. The monitor also calls
+///    `PcrPllWithFallback::on_input_switch` to reset the PLL anchor +
+///    clear stale fallback state. In [`ClockSourceWatch::Pinned`] mode
+///    (assembled flows) switches are ignored entirely and events
+///    attribute to the pinned `pcr_source` input.
 ///
 /// `timeout_s == 0` disables the monitor entirely (strict-PLL mode).
 pub fn spawn_pll_fallback_watcher(
     wrapper: Arc<PcrPllWithFallback>,
     flow_id: String,
-    mut active_input_rx: tokio::sync::watch::Receiver<String>,
+    clock_source: ClockSourceWatch,
     timeout_s: u32,
     events: crate::manager::events::EventSender,
     cancel: tokio_util::sync::CancellationToken,
@@ -884,21 +976,36 @@ pub fn spawn_pll_fallback_watcher(
         }
         let deadline = std::time::Duration::from_secs(timeout_s as u64);
         let poll_interval = std::time::Duration::from_millis(500);
-        // Grace-window anchor. Reset on every input switch so the new
-        // input gets a fresh `timeout_s` before re-falling-back. Seeded
-        // at spawn so the first input also gets the grace window.
+        // Grace-window anchor. Reset on every input switch (ActiveInput
+        // mode only) so the new input gets a fresh `timeout_s` before
+        // re-falling-back. Seeded at spawn so the first input also gets
+        // the grace window.
         let mut window_start = std::time::Instant::now();
-        let mut current_input = active_input_rx.borrow().clone();
+        let (mut active_input_rx, mut current_input) = match clock_source {
+            ClockSourceWatch::ActiveInput(rx) => {
+                let current = rx.borrow().clone();
+                (Some(rx), current)
+            }
+            ClockSourceWatch::Pinned(id) => (None, id),
+        };
         loop {
             tokio::select! {
                 _ = cancel.cancelled() => return,
                 _ = tokio::time::sleep(poll_interval) => {}
-                res = active_input_rx.changed() => {
-                    if res.is_err() {
+                changed = async {
+                    match active_input_rx.as_mut() {
+                        Some(rx) => {
+                            let res = rx.changed().await;
+                            res.map(|()| rx.borrow().clone())
+                        }
+                        // Unreachable — the branch is gated on `is_some()`.
+                        None => std::future::pending().await,
+                    }
+                }, if active_input_rx.is_some() => {
+                    let Ok(new_input) = changed else {
                         // sender dropped → flow shutting down
                         return;
-                    }
-                    let new_input = active_input_rx.borrow().clone();
+                    };
                     if new_input != current_input {
                         tracing::info!(
                             flow_id = %flow_id,
@@ -1639,5 +1746,196 @@ mod tests {
             [a.label(), b.label(), c.label()]
         );
         assert_eq!(labels.len(), 3, "labels must distinguish each variant");
+    }
+
+    // ─── Assembled-flow degraded overlay + pinned watcher (contract C4) ──
+
+    /// Always-locked stand-in for the cascade's PTP rung.
+    struct LockedPtpStub;
+    impl MasterClock for LockedPtpStub {
+        fn now_27mhz(&self) -> u64 {
+            1
+        }
+        fn source_id(&self) -> &str {
+            "ptp:stub"
+        }
+        fn is_locked(&self) -> bool {
+            true
+        }
+        fn telemetry(&self) -> MasterClockTelemetry {
+            MasterClockTelemetry {
+                kind: MasterClockKind::Ptp.as_str().to_string(),
+                ..Default::default()
+            }
+        }
+    }
+
+    /// Drive the wrapper's inner PLL to locked with perfect samples
+    /// (mirrors pcr_pll's `feed_perfect`: 130 samples at 40 ms ≫
+    /// MIN_SAMPLES_FOR_LOCK with zero jitter).
+    fn lock_inner_pll(w: &PcrPllWithFallback) {
+        let inner = w.pll_master().pll();
+        for i in 0u64..130 {
+            inner.record_sample(i * 1_080_000, (i as u128) * 40_000_000);
+        }
+        assert!(inner.is_locked(), "perfect input must lock the PLL");
+    }
+
+    #[test]
+    fn assembled_cascade_wallclock_rung_raises_degraded_chip() {
+        let pll = Arc::new(SourcePcrPllMaster::new("test-asm-wallclock"));
+        let w = PcrPllWithFallback::new_cascade(pll, None, "auto")
+            .with_clock_source_input("pcr-src-input");
+        w.activate_fallback("no_pcr_observed");
+        let t = w.telemetry();
+        assert_eq!(t.kind, "wallclock");
+        assert_eq!(t.configured_kind.as_deref(), Some("auto"));
+        assert!(
+            t.fallback_active,
+            "assembled flow must raise the chip on the wallclock rung"
+        );
+        assert_eq!(t.fallback_reason.as_deref(), Some("no_pcr_observed"));
+        assert_eq!(t.active_input_id.as_deref(), Some("pcr-src-input"));
+    }
+
+    #[test]
+    fn assembled_cascade_ptp_rung_raises_degraded_chip() {
+        let stub: Arc<dyn MasterClock> = Arc::new(LockedPtpStub);
+        let pll = Arc::new(SourcePcrPllMaster::new("test-asm-ptp"));
+        let w = PcrPllWithFallback::new_cascade(pll, Some(stub.clone()), "auto")
+            .with_clock_source_input("pcr-src-input");
+        w.activate_fallback("jitter_too_high");
+        let t = w.telemetry();
+        assert_eq!(t.kind, "ptp", "fallback latched onto the locked PTP rung");
+        assert!(
+            t.fallback_active,
+            "assembled flow must raise the chip even on a healthy PTP rung"
+        );
+        assert_eq!(t.fallback_reason.as_deref(), Some("jitter_too_high"));
+        assert_eq!(t.active_input_id.as_deref(), Some("pcr-src-input"));
+
+        // Non-assembled cascade on the same rung keeps the suppression —
+        // PTP is its legitimate resolved rung, not an alarm.
+        let pll2 = Arc::new(SourcePcrPllMaster::new("test-contrib-ptp"));
+        let w2 = PcrPllWithFallback::new_cascade(pll2, Some(stub), "auto");
+        w2.activate_fallback("jitter_too_high");
+        let t2 = w2.telemetry();
+        assert_eq!(t2.kind, "ptp");
+        assert!(!t2.fallback_active, "contribution cascade must not alarm");
+    }
+
+    #[test]
+    fn assembled_unlocked_pll_degrades_before_fallback_fires() {
+        // Lock-then-promote rides the wallclock hold while the PLL
+        // acquires — for an assembled flow that hold already means the
+        // assembler synthesises PCR off a clock that isn't the
+        // designated source, so the chip shows from the first tick.
+        let pll = Arc::new(SourcePcrPllMaster::new("test-asm-acquiring"));
+        let w = PcrPllWithFallback::new_cascade(pll, None, "auto")
+            .with_clock_source_input("pcr-src-input");
+        assert!(!w.is_fallback_active());
+        let t = w.telemetry();
+        assert!(t.fallback_active);
+        assert_eq!(t.fallback_reason.as_deref(), Some("pll_unlocked"));
+        assert_eq!(t.active_input_id.as_deref(), Some("pcr-src-input"));
+
+        // Non-assembled cascade unchanged: silent while acquiring.
+        let pll2 = Arc::new(SourcePcrPllMaster::new("test-contrib-acquiring"));
+        let w2 = PcrPllWithFallback::new_cascade(pll2, None, "auto");
+        let t2 = w2.telemetry();
+        assert!(!t2.fallback_active);
+        assert_eq!(t2.active_input_id, None);
+    }
+
+    #[test]
+    fn assembled_locked_pll_clears_chip_and_keeps_clock_source_id() {
+        let pll = Arc::new(SourcePcrPllMaster::new("test-asm-locked"));
+        let w = PcrPllWithFallback::new_cascade(pll, None, "auto")
+            .with_clock_source_input("pcr-src-input");
+        lock_inner_pll(&w);
+        let t = w.telemetry();
+        assert!(!t.fallback_active, "locked PLL clears the degraded chip");
+        assert_eq!(t.fallback_reason, None);
+        assert_eq!(t.active_input_id.as_deref(), Some("pcr-src-input"));
+
+        // Fallback fired, then the PLL locks → the telemetry self-heal
+        // clears the chip but keeps attributing to the pcr_source.
+        w.activate_fallback("jitter_too_high");
+        let t = w.telemetry();
+        assert!(!t.fallback_active, "self-heal must clear the chip on re-lock");
+        assert_eq!(t.active_input_id.as_deref(), Some("pcr-src-input"));
+        assert!(!w.is_fallback_active());
+    }
+
+    #[tokio::test]
+    async fn pinned_watcher_attributes_fallback_to_pcr_source_input() {
+        let (events, mut rx) = crate::manager::events::event_channel();
+        let pll = Arc::new(SourcePcrPllMaster::new("test-pinned-watch"));
+        let wrapper = Arc::new(
+            PcrPllWithFallback::new_cascade(pll, None, "auto")
+                .with_clock_source_input("srt-plain-9000"),
+        );
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let _h = spawn_pll_fallback_watcher(
+            wrapper.clone(),
+            "flow-asm".to_string(),
+            ClockSourceWatch::Pinned("srt-plain-9000".to_string()),
+            1, // 1 s grace — no PCR ever arrives
+            events,
+            cancel.clone(),
+        );
+        let event = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+            .await
+            .expect("fallback event within 5 s")
+            .expect("event channel open");
+        let details = event.details.expect("fallback event carries details");
+        assert_eq!(
+            details.get("error_code").and_then(|v| v.as_str()),
+            Some("master_clock_pll_fallback")
+        );
+        assert_eq!(
+            details.get("input_id").and_then(|v| v.as_str()),
+            Some("srt-plain-9000"),
+            "event must attribute to the pinned pcr_source input"
+        );
+        assert!(wrapper.is_fallback_active());
+        cancel.cancel();
+    }
+
+    #[tokio::test]
+    async fn active_input_watcher_still_resets_on_switch() {
+        // Non-assembled regression guard for the ClockSourceWatch
+        // refactor: an active-input change must keep clearing fallback
+        // via on_input_switch (the clock source genuinely changed).
+        let (events, _rx) = crate::manager::events::event_channel();
+        let pll = Arc::new(SourcePcrPllMaster::new("test-active-watch"));
+        let wrapper = Arc::new(PcrPllWithFallback::new(pll));
+        let (tx, rx) = tokio::sync::watch::channel("input-a".to_string());
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let _h = spawn_pll_fallback_watcher(
+            wrapper.clone(),
+            "flow-passthrough".to_string(),
+            ClockSourceWatch::ActiveInput(rx),
+            30, // long grace so the poll body never fires here
+            events,
+            cancel.clone(),
+        );
+        // Let the watcher task run once so it seeds current_input from
+        // the watch BEFORE the switch is published (mirrors production,
+        // where the watcher spawns at flow start).
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        wrapper.activate_fallback("no_pcr_observed");
+        assert!(wrapper.is_fallback_active());
+        tx.send("input-b".to_string()).expect("watcher alive");
+        let deadline =
+            std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while wrapper.is_fallback_active() && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert!(
+            !wrapper.is_fallback_active(),
+            "active-input switch must clear fallback (non-assembled behaviour)"
+        );
+        cancel.cancel();
     }
 }

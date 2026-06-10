@@ -71,6 +71,64 @@ impl ThroughputEstimator {
     }
 }
 
+/// Lock-free staleness tracker for a monotonically increasing counter.
+///
+/// Sibling of [`ThroughputEstimator`]: same prev-sample idiom, but instead
+/// of a rate it answers "has the counter advanced within the last `window`?".
+/// Used by the stats snapshot to decay a display output's derived state from
+/// `active` to `idle` when the renderer stops flipping frames (frozen panel)
+/// — network outputs get the same decay for free from the byte-delta bitrate
+/// estimator, display outputs have no byte counter to estimate from.
+///
+/// All state is atomics; safe for concurrent snapshot callers (dashboard +
+/// API + Prometheus). A lost race on `last_advance_us` is benign — both
+/// writers store a "now" from the same poll interval.
+#[derive(Debug)]
+pub struct CounterFreshness {
+    last_value: AtomicU64,
+    /// Monotonic micros (vs `baseline`) at which the counter was last
+    /// observed to advance. Starts at 0 (= baseline), so a counter that
+    /// never advances goes stale `window` after construction.
+    last_advance_us: AtomicU64,
+    baseline: Instant,
+}
+
+impl CounterFreshness {
+    pub fn new() -> Self {
+        Self {
+            last_value: AtomicU64::new(0),
+            last_advance_us: AtomicU64::new(0),
+            baseline: Instant::now(),
+        }
+    }
+
+    /// Sample the counter; returns `true` when it advanced since the
+    /// previous sample or within the last `window`.
+    ///
+    /// Detection latency is bounded by the caller's poll cadence: an
+    /// advancing counter is always fresh regardless of how rarely it is
+    /// sampled (the advance itself is observed on the next poll), and a
+    /// frozen one reads stale at the first poll past `window`.
+    pub fn advanced_within(&self, current: u64, window: std::time::Duration) -> bool {
+        let now_us = self.baseline.elapsed().as_micros() as u64;
+        let prev = self.last_value.swap(current, Ordering::Relaxed);
+        if current > prev {
+            self.last_advance_us.store(now_us, Ordering::Relaxed);
+            return true;
+        }
+        // Unchanged (or reset backwards — treat as stale until it advances
+        // again): fresh only while inside the window of the last advance.
+        now_us.saturating_sub(self.last_advance_us.load(Ordering::Relaxed))
+            < window.as_micros() as u64
+    }
+}
+
+impl Default for CounterFreshness {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -115,5 +173,45 @@ mod tests {
         // Immediate second call should return cached value, not recompute
         let bps2 = est.sample(125_000);
         assert_eq!(bps1, bps2);
+    }
+
+    #[test]
+    fn freshness_advance_is_fresh() {
+        let f = CounterFreshness::new();
+        // First advance is always fresh, regardless of window.
+        assert!(f.advanced_within(1, Duration::from_millis(0)));
+        // Subsequent advances stay fresh.
+        assert!(f.advanced_within(2, Duration::from_millis(0)));
+    }
+
+    #[test]
+    fn freshness_frozen_counter_goes_stale_after_window() {
+        let f = CounterFreshness::new();
+        assert!(f.advanced_within(10, Duration::from_millis(40)));
+        // Unchanged but still inside the window — fresh.
+        assert!(f.advanced_within(10, Duration::from_millis(40)));
+        thread::sleep(Duration::from_millis(60));
+        // Unchanged past the window — stale.
+        assert!(!f.advanced_within(10, Duration::from_millis(40)));
+        // Counter moves again — fresh immediately.
+        assert!(f.advanced_within(11, Duration::from_millis(40)));
+    }
+
+    #[test]
+    fn freshness_never_advanced_goes_stale() {
+        let f = CounterFreshness::new();
+        thread::sleep(Duration::from_millis(60));
+        assert!(!f.advanced_within(0, Duration::from_millis(40)));
+    }
+
+    #[test]
+    fn freshness_backwards_reset_is_stale_until_next_advance() {
+        let f = CounterFreshness::new();
+        assert!(f.advanced_within(100, Duration::from_millis(40)));
+        thread::sleep(Duration::from_millis(60));
+        // Counter went backwards (restart) — stale, not a phantom advance.
+        assert!(!f.advanced_within(5, Duration::from_millis(40)));
+        // …until it moves forward from the new base.
+        assert!(f.advanced_within(6, Duration::from_millis(40)));
     }
 }

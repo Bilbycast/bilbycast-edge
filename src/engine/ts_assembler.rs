@@ -37,7 +37,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bytes::{Bytes, BytesMut};
 use tokio::sync::{broadcast, mpsc};
@@ -67,6 +67,211 @@ const PSI_INTERVAL: Duration = Duration::from_millis(100);
 /// idle, thumbnail gaps, etc.) we still push partially-filled bundles so
 /// downstream sockets see regular traffic. 10 ms keeps latency tight.
 const FLUSH_INTERVAL: Duration = Duration::from_millis(10);
+
+/// A slot is declared stalled once it has forwarded no ES packet for
+/// this long. PSI keeps flowing regardless (the assembler synthesises
+/// PAT/PMT on its own cadence), which is exactly why a byte-level
+/// liveness check on the flow output can never catch a dead slot —
+/// the stall must be measured per slot, here.
+const SLOT_STALL_THRESHOLD: Duration = Duration::from_secs(5);
+
+/// No stall is declared during the first 10 s after assembler start —
+/// sources are still connecting at flow bring-up. Hot-swapped-in slots
+/// get their own implicit grace via `SlotVitals.registered_at`.
+const SLOT_STALL_START_GRACE: Duration = Duration::from_secs(10);
+
+/// Cadence of the per-slot stall scan + `AssemblyHealth` publication.
+const STALL_SCAN_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Shared cell the assembler publishes its per-slot health snapshot
+/// into. Written by the assembler at the 1 Hz stall scan, read by
+/// `FlowStatsAccumulator::snapshot()` — both sides touch it at ~1 Hz,
+/// never on the packet path, so a plain `RwLock` matches the existing
+/// `master_clock_state` idiom.
+pub type AssemblyHealthCell =
+    std::sync::RwLock<Option<crate::stats::models::AssemblyHealth>>;
+
+/// Per-slot liveness state, keyed `(program_number, out_pid)` — NOT the
+/// positional `(program_idx, out_pid)` used by `active_leg_input`,
+/// because a `ReplacePlan` that inserts or reorders programs must not
+/// reset surviving slots' stall history (program_number is validated
+/// unique per mux; out_pid is mux-global-unique). Owned exclusively by
+/// the assembler task — the forward path bumps `packets`, the 1 Hz scan
+/// derives `last_data` from the counter delta — so no atomics or locks
+/// are needed (single-task ownership keeps the packet path lock-free,
+/// and the counter approach avoids a clock read per packet).
+#[derive(Debug)]
+struct SlotVitals {
+    /// When the slot entered the running plan (assembler start, or the
+    /// `ReplacePlan` that introduced it). Stall anchor until the first
+    /// ES packet arrives.
+    registered_at: Instant,
+    /// ES packets forwarded on the slot's `out_pid`. For Switch slots
+    /// only the active leg forwards, so a dead active leg stalls the
+    /// slot even while passive legs carry traffic on the bus.
+    packets: u64,
+    /// `packets` as of the previous stall scan.
+    scanned_packets: u64,
+    /// Wall time of the scan that last observed the counter moving.
+    /// `None` until the first ES packet (granularity = scan cadence,
+    /// plenty for a 5 s threshold).
+    last_data: Option<Instant>,
+    /// Latched stall flag: set by the scan when the threshold is
+    /// crossed (fires `pid_bus_slot_stalled` once), cleared by the
+    /// forward path on the first ES packet after the stall (fires
+    /// `pid_bus_slot_recovered`).
+    stalled: bool,
+}
+
+impl SlotVitals {
+    fn new(now: Instant) -> Self {
+        Self {
+            registered_at: now,
+            packets: 0,
+            scanned_packets: 0,
+            last_data: None,
+            stalled: false,
+        }
+    }
+}
+
+/// Whether a slot's stream type carries continuous media that is
+/// expected to flow at all times — the only class the stall scan may
+/// judge. Sparse essences (SCTE-35 cues, DVB subtitles/teletext on
+/// 0x06, private sections, generic data) are legitimately silent for
+/// minutes between bursts; scanning them latches false
+/// `pid_bus_slot_stalled` alarms that permanently degrade
+/// `assembly_health` and train operators to ignore the signal. 0x06 is
+/// exempt wholesale: the plan carries no descriptor info, so a 0x06
+/// slot cannot be distinguished between DVB AC-3 (continuous) and
+/// teletext (sparse) here — false negatives beat false alarms.
+fn stall_scan_eligible(stream_type: u8) -> bool {
+    matches!(
+        stream_type,
+        // Video: MPEG-1/2, MPEG-4 part 2, H.264 (+SVC/MVC), HEVC, JPEG-2000, AVS, VC-1
+        0x01 | 0x02 | 0x10 | 0x1B | 0x1F | 0x20 | 0x21 | 0x24 | 0x42 | 0xEA
+        // Audio: MPEG-1/2 layer I/II, AAC ADTS, AAC LATM, ATSC AC-3 / E-AC-3
+        | 0x03 | 0x04 | 0x0F | 0x11 | 0x81 | 0x87
+    )
+}
+
+/// Pure stall predicate. Returns `Some(seconds_since_data)` when the
+/// slot crosses the stall threshold, `None` while healthy or inside the
+/// post-start grace window.
+fn stall_seconds(now: Instant, assembler_start: Instant, v: &SlotVitals) -> Option<u64> {
+    if now.duration_since(assembler_start) < SLOT_STALL_START_GRACE {
+        return None;
+    }
+    let anchor = v.last_data.unwrap_or(v.registered_at);
+    let since = now.duration_since(anchor);
+    (since >= SLOT_STALL_THRESHOLD).then_some(since.as_secs())
+}
+
+/// Reconcile the vitals map against the (possibly just-replaced) plan:
+/// drop entries for slots no longer present, register fresh entries
+/// (with a fresh grace anchor) for slots that just appeared. Entries
+/// that survive a `ReplacePlan` keep their history so an already-stalled
+/// slot doesn't silently reset on an unrelated plan edit.
+fn sync_slot_vitals(
+    plan: &AssemblyPlan,
+    vitals: &mut HashMap<(u16, u16), SlotVitals>,
+    now: Instant,
+) {
+    let keys: std::collections::HashSet<(u16, u16)> = plan
+        .programs
+        .iter()
+        .flat_map(|prog| {
+            prog.slots
+                .iter()
+                .map(move |s| (prog.program_number, s.out_pid))
+        })
+        .collect();
+    vitals.retain(|k, _| keys.contains(k));
+    for k in keys {
+        vitals.entry(k).or_insert_with(|| SlotVitals::new(now));
+    }
+}
+
+/// Resolve the `(input_id, source_pid)` identity a slot's health should
+/// report: the active leg for Switch slots, the fixed source otherwise.
+fn slot_health_identity(
+    slot: &AssemblySlot,
+    key: (usize, u16),
+    active_leg_input: &HashMap<(usize, u16), String>,
+) -> (String, u16) {
+    if let (Some(legs), Some(active)) = (&slot.switch_legs, active_leg_input.get(&key)) {
+        if let Some((iid, pid)) = legs.iter().find(|(iid, _)| iid == active) {
+            return (iid.clone(), *pid);
+        }
+    }
+    slot.source.clone()
+}
+
+/// 1 Hz stall scan. Advances `last_data` for slots whose forward counter
+/// moved since the previous scan, latches newly-stalled slots, and
+/// builds the [`AssemblyHealth`] wire snapshot. Returns the snapshot
+/// plus the slots that *newly* stalled on this scan (the caller emits
+/// one `pid_bus_slot_stalled` event per entry — latched, so a dead slot
+/// alarms once, re-arming only after recovery).
+fn scan_slot_stalls(
+    plan: &AssemblyPlan,
+    active_leg_input: &HashMap<(usize, u16), String>,
+    vitals: &mut HashMap<(u16, u16), SlotVitals>,
+    now: Instant,
+    assembler_start: Instant,
+) -> (
+    crate::stats::models::AssemblyHealth,
+    Vec<crate::stats::models::StalledSlotStats>,
+) {
+    use crate::stats::models::{AssemblyHealth, StalledSlotStats};
+    let mut health = AssemblyHealth::default();
+    let mut newly_stalled: Vec<StalledSlotStats> = Vec::new();
+    for (pidx, prog) in plan.programs.iter().enumerate() {
+        for slot in &prog.slots {
+            health.total_slots += 1;
+            let Some(v) = vitals.get_mut(&(prog.program_number, slot.out_pid)) else {
+                continue; // unsynced entry — next sync_slot_vitals heals it
+            };
+            if v.packets != v.scanned_packets {
+                v.scanned_packets = v.packets;
+                v.last_data = Some(now);
+                continue; // moving — recovery latch clears on the forward path
+            }
+            if !stall_scan_eligible(slot.stream_type) {
+                continue; // sparse essence (SCTE-35/subs/teletext/data) — never judged
+            }
+            let key = (pidx, slot.out_pid);
+            let (was_stalled, since) =
+                match (v.stalled, stall_seconds(now, assembler_start, v)) {
+                    // Already latched: keep reporting with a fresh age.
+                    (true, _) => (
+                        true,
+                        now.duration_since(v.last_data.unwrap_or(v.registered_at))
+                            .as_secs(),
+                    ),
+                    (false, Some(secs)) => {
+                        v.stalled = true;
+                        (false, secs)
+                    }
+                    (false, None) => continue,
+                };
+            let (input_id, source_pid) = slot_health_identity(slot, key, active_leg_input);
+            let entry = StalledSlotStats {
+                program_number: prog.program_number,
+                out_pid: slot.out_pid,
+                input_id,
+                source_pid,
+                seconds_since_data: since,
+            };
+            if !was_stalled {
+                newly_stalled.push(entry.clone());
+            }
+            health.stalled_slot_count += 1;
+            health.stalled_slots.push(entry);
+        }
+    }
+    (health, newly_stalled)
+}
 
 /// Pre-resolved plan the assembler executes. The runtime expands
 /// [`crate::config::models::FlowAssembly`] into this shape (resolving
@@ -345,7 +550,10 @@ pub struct AssemblerHandle {
 // to the manager (PES Switch Phase 4). Tests pass `None`; the production
 // site in `flow.rs::finalize_spts_assembler` wires the flow's real
 // `EventSender`. `flow_id` is stamped on every emitted event
-// (empty in tests).
+// (empty in tests). `health_cell` receives the 1 Hz per-slot
+// `AssemblyHealth` snapshot for `FlowStats.assembly_health`; `None`
+// skips publication (tests / legacy callers).
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_spts_assembler(
     plan: AssemblyPlan,
     bus: Arc<NodeEsBus>,
@@ -354,6 +562,7 @@ pub fn spawn_spts_assembler(
     event_sender: Option<crate::manager::events::EventSender>,
     flow_id: String,
     av_sync_pacer: Option<Arc<crate::engine::av_sync_mux::AvSyncPacer>>,
+    health_cell: Option<Arc<AssemblyHealthCell>>,
 ) -> AssemblerHandle {
     // Channel depth 16: plan updates are rare (operator-triggered), so a
     // small bounded buffer is plenty and keeps back-pressure observable
@@ -373,7 +582,7 @@ pub fn spawn_spts_assembler(
     let thread_handle = crate::engine::dedicated_runtime::spawn_dedicated(
         crate::engine::dedicated_runtime::DedicatedRuntimeConfig::new(who, "BILBYCAST_PID_BUS_CPUS"),
         async move {
-            run_assembler(plan, bus, broadcast_tx, cancel, plan_rx, event_sender, flow_id, av_sync_pacer).await;
+            run_assembler(plan, bus, broadcast_tx, cancel, plan_rx, event_sender, flow_id, av_sync_pacer, health_cell).await;
         },
     );
     // The original `AssemblerHandle.join` is a `tokio::task::JoinHandle<()>`.
@@ -418,6 +627,7 @@ struct FlatSlot {
     stream_type: u8,
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_assembler(
     mut plan: AssemblyPlan,
     bus: Arc<NodeEsBus>,
@@ -427,6 +637,7 @@ async fn run_assembler(
     event_sender: Option<crate::manager::events::EventSender>,
     flow_id: String,
     av_sync_pacer: Option<Arc<crate::engine::av_sync_mux::AvSyncPacer>>,
+    health_cell: Option<Arc<AssemblyHealthCell>>,
 ) {
     // Muxer-mode rewriter on the assembled output. Single shared
     // anchor across every input contributing to the program — fixes
@@ -537,6 +748,12 @@ async fn run_assembler(
     let mut pmt_cc: std::collections::HashMap<u16, u8> = std::collections::HashMap::new();
     let mut bundle_seq: u16 = 0;
 
+    // Per-slot liveness, keyed `(program_idx, out_pid)`. Forward path
+    // bumps the counter; the 1 Hz stall scan latches stalls and
+    // publishes `AssemblyHealth` into `health_cell`.
+    let assembler_start = Instant::now();
+    let mut slot_vitals: HashMap<(u16, u16), SlotVitals> = HashMap::new();
+
     // Prime fan-ins + PCR + snapshot for the initial plan.
     install_plan(
         &plan,
@@ -551,11 +768,14 @@ async fn run_assembler(
         &event_sender,
         &flow_id,
     );
+    sync_slot_vitals(&plan, &mut slot_vitals, assembler_start);
 
     let mut psi_tick = interval(PSI_INTERVAL);
     psi_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut flush_tick = interval(FLUSH_INTERVAL);
     flush_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    let mut stall_tick = interval(STALL_SCAN_INTERVAL);
+    stall_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
     // First tick fires immediately — emit PSI on startup so receivers
     // lock on before the first ES arrives.
     psi_tick.tick().await;
@@ -599,6 +819,9 @@ async fn run_assembler(
                             &event_sender,
                             &flow_id,
                         );
+                        // Drop vitals for removed slots; fresh grace
+                        // anchor for hot-swapped-in ones.
+                        sync_slot_vitals(&plan, &mut slot_vitals, Instant::now());
                         // Arm DI on every out_pid — the next PCR-bearing
                         // TS packet on each will carry
                         // `discontinuity_indicator = 1`. Without this,
@@ -1357,6 +1580,46 @@ async fn run_assembler(
                 }
                 // From here on: forward the packet (was active leg with
                 // splice forwarding A, or B's first committed PES).
+                //
+                // Slot liveness: count the forwarded packet. The first
+                // ES packet after a latched stall fires the recovery
+                // event and re-arms stall detection for the slot.
+                let vitals_program_number = plan
+                    .programs
+                    .get(slot.program_idx)
+                    .map(|p| p.program_number)
+                    .unwrap_or(0);
+                if let Some(v) = slot_vitals.get_mut(&(vitals_program_number, slot.out_pid)) {
+                    v.packets = v.packets.wrapping_add(1);
+                    if v.stalled {
+                        v.stalled = false;
+                        v.last_data = Some(Instant::now());
+                        if let Some(es_) = &event_sender {
+                            let program_number = vitals_program_number;
+                            es_.emit_flow_with_details(
+                                crate::manager::events::EventSeverity::Info,
+                                crate::manager::events::category::FLOW,
+                                format!(
+                                    "Flow '{flow_id}': assembly slot recovered — input '{}' \
+                                     source_pid 0x{:04X} resumed (program {program_number} \
+                                     out_pid 0x{:04X})",
+                                    slot.source.0,
+                                    slot.source.1,
+                                    slot.out_pid,
+                                ),
+                                &flow_id,
+                                serde_json::json!({
+                                    "error_code": "pid_bus_slot_recovered",
+                                    "flow_id": flow_id,
+                                    "program_number": program_number,
+                                    "out_pid": slot.out_pid,
+                                    "input_id": slot.source.0,
+                                    "source_pid": slot.source.1,
+                                }),
+                            );
+                        }
+                    }
+                }
                 let mut rewritten = rewrite_es_packet(&es.payload, slot.out_pid, &mut cc);
                 // After a plan swap or switch-slot flip, the first
                 // PCR-bearing TS packet on the affected out_pid carries
@@ -1468,6 +1731,57 @@ async fn run_assembler(
 
                             pts_rewriter.as_mut(),
                         );
+                    }
+                }
+            }
+            _ = stall_tick.tick() => {
+                // Per-slot stall scan + AssemblyHealth publication. A
+                // slot with no ES packet for ≥ SLOT_STALL_THRESHOLD
+                // (after the start grace) latches stalled and alarms
+                // once; recovery is detected on the forward path. This
+                // is the flow-level signal the 2026-06 'srt-to-udp'
+                // incident lacked — a dead source behind an assembled
+                // flow used to emit PSI-only with zero events.
+                let now = Instant::now();
+                let (health, newly_stalled) = scan_slot_stalls(
+                    &plan,
+                    &active_leg_input,
+                    &mut slot_vitals,
+                    now,
+                    assembler_start,
+                );
+                if let Some(es_) = &event_sender {
+                    for s in &newly_stalled {
+                        es_.emit_flow_with_details(
+                            crate::manager::events::EventSeverity::Warning,
+                            crate::manager::events::category::FLOW,
+                            format!(
+                                "Flow '{flow_id}': assembly slot stalled — no ES data from \
+                                 input '{}' source_pid 0x{:04X} for {} s (program {} \
+                                 out_pid 0x{:04X}). Outputs carry PSI-only for this slot \
+                                 until the source resumes",
+                                s.input_id,
+                                s.source_pid,
+                                s.seconds_since_data,
+                                s.program_number,
+                                s.out_pid,
+                            ),
+                            &flow_id,
+                            serde_json::json!({
+                                "error_code": "pid_bus_slot_stalled",
+                                "flow_id": flow_id,
+                                "program_number": s.program_number,
+                                "out_pid": s.out_pid,
+                                "input_id": s.input_id,
+                                "source_pid": s.source_pid,
+                                "seconds_since_data": s.seconds_since_data,
+                            }),
+                        );
+                    }
+                }
+                if let Some(cell) = &health_cell {
+                    if let Ok(mut g) = cell.write() {
+                        *g = Some(health);
                     }
                 }
             }
@@ -2537,7 +2851,7 @@ mod tests {
     fn ts_af_only(src_pid: u16) -> Bytes {
         let mut pkt = [0u8; TS_PACKET_SIZE];
         pkt[0] = TS_SYNC_BYTE;
-        pkt[1] = (((src_pid >> 8) as u8) & 0x1F);
+        pkt[1] = ((src_pid >> 8) as u8) & 0x1F;
         pkt[2] = (src_pid & 0xFF) as u8;
         pkt[3] = 0x20; // AFC = 0b10 (AF only, no payload), CC = 0
         pkt[4] = 183; // AF length = 183 (fills remaining 188-5)
@@ -2628,7 +2942,7 @@ mod tests {
         let bus = Arc::new(NodeEsBus::new());
         let (tx, mut rx) = broadcast::channel::<RtpPacket>(16);
         let cancel = CancellationToken::new();
-        let handle = spawn_spts_assembler(make_plan(), bus.clone(), tx.clone(), cancel.clone(), None, String::new(), None).join;
+        let handle = spawn_spts_assembler(make_plan(), bus.clone(), tx.clone(), cancel.clone(), None, String::new(), None, None).join;
 
         // Drain one bundle — startup path emits PAT + PMT immediately.
         let bundle = tokio::time::timeout(Duration::from_millis(500), rx.recv())
@@ -2650,7 +2964,7 @@ mod tests {
         let bus = Arc::new(NodeEsBus::new());
         let (tx, mut rx) = broadcast::channel::<RtpPacket>(32);
         let cancel = CancellationToken::new();
-        let handle = spawn_spts_assembler(make_plan(), bus.clone(), tx.clone(), cancel.clone(), None, String::new(), None).join;
+        let handle = spawn_spts_assembler(make_plan(), bus.clone(), tx.clone(), cancel.clone(), None, String::new(), None, None).join;
 
         // Wait for startup PSI, then publish enough ES packets on each
         // slot to fill a full bundle.
@@ -2720,7 +3034,7 @@ mod tests {
         let bus = Arc::new(NodeEsBus::new());
         let (tx, mut rx) = broadcast::channel::<RtpPacket>(32);
         let cancel = CancellationToken::new();
-        let handle = spawn_spts_assembler(make_mpts_plan(), bus.clone(), tx.clone(), cancel.clone(), None, String::new(), None).join;
+        let handle = spawn_spts_assembler(make_mpts_plan(), bus.clone(), tx.clone(), cancel.clone(), None, String::new(), None, None).join;
 
         // Collect bundles for ~250 ms — long enough to see the startup
         // PSI emission plus at least one tick of the 100 ms PSI cadence.
@@ -2763,7 +3077,7 @@ mod tests {
         let bus = Arc::new(NodeEsBus::new());
         let (tx, _rx) = broadcast::channel::<RtpPacket>(4);
         let cancel = CancellationToken::new();
-        let handle = spawn_spts_assembler(make_plan(), bus.clone(), tx.clone(), cancel.clone(), None, String::new(), None).join;
+        let handle = spawn_spts_assembler(make_plan(), bus.clone(), tx.clone(), cancel.clone(), None, String::new(), None, None).join;
         tokio::time::sleep(Duration::from_millis(30)).await;
         cancel.cancel();
         tokio::time::timeout(Duration::from_millis(500), handle)
@@ -2786,7 +3100,7 @@ mod tests {
 
         // Initial plan: in-a → out 0x200, in-b → out 0x201.
         let initial = make_plan();
-        let handle = spawn_spts_assembler(initial, bus.clone(), tx.clone(), cancel.clone(), None, String::new(), None);
+        let handle = spawn_spts_assembler(initial, bus.clone(), tx.clone(), cancel.clone(), None, String::new(), None, None);
 
         // Capture startup PMT version (should be 0).
         let mut v0: Option<u8> = None;
@@ -2892,7 +3206,7 @@ mod tests {
         let bus = Arc::new(NodeEsBus::new());
         let (tx, mut rx) = broadcast::channel::<RtpPacket>(32);
         let cancel = CancellationToken::new();
-        let handle = spawn_spts_assembler(make_plan(), bus.clone(), tx.clone(), cancel.clone(), None, String::new(), None);
+        let handle = spawn_spts_assembler(make_plan(), bus.clone(), tx.clone(), cancel.clone(), None, String::new(), None, None);
 
         // Drain startup PMT.
         let deadline = tokio::time::Instant::now() + Duration::from_millis(200);
@@ -3291,5 +3605,294 @@ mod tests {
         // plan rather than spuriously rejecting.
         check_assembly_clock_compatibility(&plan, &map)
             .expect("missing-map-entry must not cause spurious rejection");
+    }
+
+    // ── Slot-stall detection (pid_bus_slot_stalled / _recovered) ──
+
+    #[test]
+    fn stall_scan_respects_start_grace() {
+        let plan = make_plan();
+        let active = HashMap::new();
+        let mut vitals = HashMap::new();
+        let start = Instant::now();
+        sync_slot_vitals(&plan, &mut vitals, start);
+        // 9 s in: inside the 10 s grace — nothing stalls even though
+        // no slot has ever received data.
+        let (health, newly) = scan_slot_stalls(
+            &plan,
+            &active,
+            &mut vitals,
+            start + Duration::from_secs(9),
+            start,
+        );
+        assert_eq!(health.total_slots, 2);
+        assert_eq!(health.stalled_slot_count, 0);
+        assert!(health.stalled_slots.is_empty());
+        assert!(newly.is_empty());
+    }
+
+    #[test]
+    fn stall_scan_latches_never_fed_slot_after_grace() {
+        // The 'srt-to-udp' incident shape: a slot whose source never
+        // delivers a single ES packet must alarm once the grace ends.
+        let plan = make_plan();
+        let active = HashMap::new();
+        let mut vitals = HashMap::new();
+        let start = Instant::now();
+        sync_slot_vitals(&plan, &mut vitals, start);
+        let now = start + Duration::from_secs(11);
+        let (health, newly) = scan_slot_stalls(&plan, &active, &mut vitals, now, start);
+        assert_eq!(health.total_slots, 2);
+        assert_eq!(health.stalled_slot_count, 2);
+        assert_eq!(newly.len(), 2, "both never-fed slots latch on the same scan");
+        let video = newly.iter().find(|s| s.out_pid == 0x200).unwrap();
+        assert_eq!(video.program_number, 1);
+        assert_eq!(video.input_id, "in-a");
+        assert_eq!(video.source_pid, 0x100);
+        assert!(video.seconds_since_data >= 11);
+        // Next scan: still stalled but latched — reported in the
+        // snapshot, NOT re-announced as newly stalled.
+        let (health2, newly2) = scan_slot_stalls(
+            &plan,
+            &active,
+            &mut vitals,
+            now + Duration::from_secs(1),
+            start,
+        );
+        assert_eq!(health2.stalled_slot_count, 2);
+        assert!(newly2.is_empty(), "stall events are latched per slot");
+    }
+
+    #[test]
+    fn stall_scan_measures_from_last_data_not_start() {
+        let plan = make_plan();
+        let active = HashMap::new();
+        let mut vitals = HashMap::new();
+        let start = Instant::now();
+        sync_slot_vitals(&plan, &mut vitals, start);
+        // Both slots forward packets before the t=12 scan — the moved
+        // counter advances last_data to the scan time.
+        for v in vitals.values_mut() {
+            v.packets += 7;
+        }
+        let (h, n) = scan_slot_stalls(
+            &plan,
+            &active,
+            &mut vitals,
+            start + Duration::from_secs(12),
+            start,
+        );
+        assert_eq!(h.stalled_slot_count, 0);
+        assert!(n.is_empty());
+        // t=16: only 4 s of silence — under the 5 s threshold.
+        let (h, _) = scan_slot_stalls(
+            &plan,
+            &active,
+            &mut vitals,
+            start + Duration::from_secs(16),
+            start,
+        );
+        assert_eq!(h.stalled_slot_count, 0);
+        // t=17: 5 s of silence — both slots latch with the honest age.
+        let (h, n) = scan_slot_stalls(
+            &plan,
+            &active,
+            &mut vitals,
+            start + Duration::from_secs(17),
+            start,
+        );
+        assert_eq!(h.stalled_slot_count, 2);
+        assert_eq!(n.len(), 2);
+        assert_eq!(n[0].seconds_since_data, 5);
+    }
+
+    #[test]
+    fn stall_relatches_after_recovery() {
+        let plan = make_plan();
+        let active = HashMap::new();
+        let mut vitals = HashMap::new();
+        let start = Instant::now();
+        sync_slot_vitals(&plan, &mut vitals, start);
+        let (_, n) = scan_slot_stalls(
+            &plan,
+            &active,
+            &mut vitals,
+            start + Duration::from_secs(11),
+            start,
+        );
+        assert_eq!(n.len(), 2);
+        // Simulate the forward-path recovery on the video slot exactly
+        // as the fanin arm performs it: counter bump + latch clear +
+        // last_data refresh.
+        {
+            let v = vitals.get_mut(&(1, 0x200)).unwrap();
+            v.packets += 1;
+            v.stalled = false;
+            v.last_data = Some(start + Duration::from_secs(12));
+        }
+        let (h, n) = scan_slot_stalls(
+            &plan,
+            &active,
+            &mut vitals,
+            start + Duration::from_secs(13),
+            start,
+        );
+        assert_eq!(h.stalled_slot_count, 1, "only the audio slot stays stalled");
+        assert!(n.is_empty());
+        // Silence resumes on the recovered slot: it must re-latch (and
+        // re-announce) 5 s after the t=13 scan observed its movement.
+        let (h, n) = scan_slot_stalls(
+            &plan,
+            &active,
+            &mut vitals,
+            start + Duration::from_secs(18),
+            start,
+        );
+        assert_eq!(h.stalled_slot_count, 2);
+        assert_eq!(n.len(), 1, "recovered-then-dead slot re-arms the latch");
+        assert_eq!(n[0].out_pid, 0x200);
+    }
+
+    #[test]
+    fn stalled_slot_reports_active_switch_leg() {
+        let mut plan = make_plan();
+        plan.programs[0].slots[0].switch_legs = Some(vec![
+            ("in-a".to_string(), 0x100),
+            ("in-c".to_string(), 0x300),
+        ]);
+        let mut active = HashMap::new();
+        active.insert((0usize, 0x200u16), "in-c".to_string());
+        let mut vitals = HashMap::new();
+        let start = Instant::now();
+        sync_slot_vitals(&plan, &mut vitals, start);
+        let (_, newly) = scan_slot_stalls(
+            &plan,
+            &active,
+            &mut vitals,
+            start + Duration::from_secs(11),
+            start,
+        );
+        let s = newly.iter().find(|s| s.out_pid == 0x200).unwrap();
+        assert_eq!(s.input_id, "in-c", "switch slots report the ACTIVE leg");
+        assert_eq!(s.source_pid, 0x300);
+    }
+
+    #[test]
+    fn sync_slot_vitals_reconciles_plan_changes() {
+        let plan = make_plan();
+        let mut vitals = HashMap::new();
+        let t0 = Instant::now();
+        sync_slot_vitals(&plan, &mut vitals, t0);
+        assert_eq!(vitals.len(), 2);
+        // State survives a no-op re-sync (an unrelated ReplacePlan must
+        // not reset an already-latched stall).
+        vitals.get_mut(&(1, 0x200)).unwrap().stalled = true;
+        sync_slot_vitals(&plan, &mut vitals, t0 + Duration::from_secs(30));
+        assert!(vitals.get(&(1, 0x200)).unwrap().stalled);
+        // Swap the audio slot: old key dropped, new key registered with
+        // a fresh grace anchor at the swap time.
+        let mut plan2 = make_plan();
+        plan2.programs[0].slots[1] = slot("in-c", 0x400, 0x401, 0x0F);
+        let t_swap = t0 + Duration::from_secs(60);
+        sync_slot_vitals(&plan2, &mut vitals, t_swap);
+        assert_eq!(vitals.len(), 2);
+        assert!(!vitals.contains_key(&(1, 0x201)));
+        let fresh = vitals.get(&(1, 0x401)).unwrap();
+        assert_eq!(fresh.registered_at, t_swap);
+        assert!(!fresh.stalled);
+    }
+
+    #[test]
+    fn stall_scan_exempts_sparse_data_slots() {
+        // SCTE-35 / DVB-subtitle / teletext slots are legitimately
+        // silent between bursts — they must never latch a stall, while
+        // continuous-media siblings in the same program still do.
+        let mut plan = make_plan();
+        plan.programs[0]
+            .slots
+            .push(slot("in-d", 0x500, 0x501, 0x86)); // SCTE-35
+        plan.programs[0]
+            .slots
+            .push(slot("in-d", 0x510, 0x511, 0x06)); // private PES (subs/teletext)
+        let active = HashMap::new();
+        let mut vitals = HashMap::new();
+        let start = Instant::now();
+        sync_slot_vitals(&plan, &mut vitals, start);
+        let (health, newly) = scan_slot_stalls(
+            &plan,
+            &active,
+            &mut vitals,
+            start + Duration::from_secs(60),
+            start,
+        );
+        assert_eq!(health.total_slots, 4, "exempt slots still count in total");
+        assert_eq!(
+            health.stalled_slot_count, 2,
+            "only the video + audio slots may stall"
+        );
+        assert!(newly.iter().all(|s| s.out_pid == 0x200 || s.out_pid == 0x201));
+    }
+
+    #[test]
+    fn stall_state_survives_program_reorder() {
+        // ReplacePlan that prepends a program must not reset surviving
+        // slots' stall history (vitals are keyed by program_number, not
+        // positional index).
+        let plan = make_plan();
+        let mut vitals = HashMap::new();
+        let t0 = Instant::now();
+        sync_slot_vitals(&plan, &mut vitals, t0);
+        vitals.get_mut(&(1, 0x200)).unwrap().stalled = true;
+        let mut plan2 = AssemblyPlan {
+            programs: vec![ProgramPlan {
+                program_number: 2,
+                pmt_pid: 0x1010,
+                pcr_source: ("in-e".to_string(), 0x600),
+                slots: vec![slot("in-e", 0x600, 0x601, 0x1B)],
+            }],
+        };
+        plan2.programs.extend(plan.programs.clone());
+        sync_slot_vitals(&plan2, &mut vitals, t0 + Duration::from_secs(30));
+        assert!(
+            vitals.get(&(1, 0x200)).unwrap().stalled,
+            "latched stall survives the reorder"
+        );
+        assert!(vitals.contains_key(&(2, 0x601)), "new program registered");
+    }
+
+    #[tokio::test]
+    async fn assembler_publishes_health_snapshot() {
+        let bus = Arc::new(NodeEsBus::new());
+        let (tx, _rx) = broadcast::channel::<RtpPacket>(16);
+        let cancel = CancellationToken::new();
+        let cell: Arc<AssemblyHealthCell> = Arc::new(std::sync::RwLock::new(None));
+        let handle = spawn_spts_assembler(
+            make_plan(),
+            bus.clone(),
+            tx.clone(),
+            cancel.clone(),
+            None,
+            String::new(),
+            None,
+            Some(cell.clone()),
+        );
+        // The stall-scan interval's first tick fires shortly after
+        // start; poll the cell instead of sleeping a fixed amount.
+        let mut published = None;
+        for _ in 0..100 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            if let Some(h) = cell.read().ok().and_then(|g| g.clone()) {
+                published = Some(h);
+                break;
+            }
+        }
+        cancel.cancel();
+        handle.join.await.unwrap();
+        let h = published.expect("assembler must publish AssemblyHealth within ~2 s of start");
+        assert_eq!(h.total_slots, 2);
+        assert_eq!(
+            h.stalled_slot_count, 0,
+            "inside the start grace nothing may be reported stalled"
+        );
     }
 }
