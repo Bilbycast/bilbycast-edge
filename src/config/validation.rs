@@ -1653,6 +1653,19 @@ fn validate_bonded_input(c: &crate::config::models::BondedInputConfig) -> Result
             ));
         }
     }
+    if let Some(ms) = c.hold_max_ms {
+        if !(10..=30_000).contains(&ms) {
+            return Err(anyhow::anyhow!(
+                "bonded input hold_max_ms must be in [10, 30000], got {ms}"
+            ));
+        }
+        let floor = c.hold_ms.unwrap_or(500);
+        if ms < floor {
+            return Err(anyhow::anyhow!(
+                "bonded input hold_max_ms ({ms}) must be >= hold_ms ({floor})"
+            ));
+        }
+    }
     validate_bond_encryption_key(&c.encryption_key, "bonded input")?;
     validate_bond_fec(&c.fec, "bonded input")?;
     Ok(())

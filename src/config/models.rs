@@ -3834,9 +3834,19 @@ pub struct BondedInputConfig {
     pub bond_flow_id: u32,
     /// Paths to bind on.
     pub paths: Vec<BondPathConfig>,
-    /// Reassembly hold time in milliseconds. Default 500 ms.
+    /// Reassembly hold time in milliseconds. Default 500 ms. When
+    /// `hold_max_ms` is set, this is the floor the adaptive servo grows
+    /// up from.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hold_ms: Option<u32>,
+    /// Optional adaptive hold-time **ceiling** in milliseconds. When set
+    /// above `hold_ms`, the receiver grows the reorder/recovery budget
+    /// toward the realized recovery latency (×1.5) within
+    /// `[hold_ms, hold_max_ms]` and decays back as the links calm —
+    /// latency tracks the links instead of a fixed guess. Unset = fixed
+    /// `hold_ms` (default behaviour).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hold_max_ms: Option<u32>,
     /// Base NACK delay in milliseconds. Default 30 ms.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub nack_delay_ms: Option<u32>,

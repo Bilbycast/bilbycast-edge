@@ -209,6 +209,9 @@ pub(crate) fn build_receiver_cfg(cfg: &BondedInputConfig) -> anyhow::Result<Bond
     if let Some(ms) = cfg.hold_ms {
         out.hold_time = Duration::from_millis(ms as u64);
     }
+    if let Some(ms) = cfg.hold_max_ms {
+        out.hold_max = Some(Duration::from_millis(ms as u64));
+    }
     if let Some(ms) = cfg.keepalive_ms {
         out.keepalive_interval = Duration::from_millis(ms as u64);
     }

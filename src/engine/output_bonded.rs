@@ -175,6 +175,10 @@ async fn bonded_output_run(
     let socket_cfg = build_sender_cfg(config)?;
     let path_ids: Vec<u8> = socket_cfg.paths.iter().map(|p| p.id).collect();
 
+    // Shared handles to the adaptive scheduler's discovered per-leg
+    // capacity (bits/sec) — empty for the non-adaptive policies.
+    let mut capacity_handles: Vec<(u8, std::sync::Arc<std::sync::atomic::AtomicU64>)> = Vec::new();
+
     // Pick scheduler. MediaAware/Adaptive add NAL awareness on top of
     // the inner path-selection policy; see engine::bonded_scheduler.
     let socket = match config.scheduler {
@@ -215,7 +219,9 @@ async fn bonded_output_run(
                 .as_ref()
                 .map(build_congestion)
                 .unwrap_or_default();
-            BondSocket::sender(socket_cfg, CapacityAwareScheduler::with_paths(priors, cong))
+            let sched = CapacityAwareScheduler::with_paths(priors, cong);
+            capacity_handles = sched.capacity_handles();
+            BondSocket::sender(socket_cfg, sched)
                 .await
                 .map_err(|e| anyhow::anyhow!("bonded sender setup: {e}"))?
         }
@@ -239,6 +245,10 @@ async fn bonded_output_run(
                 &p.transport,
                 crate::config::models::BondPathTransportConfig::Udp { gateway: Some(_), .. }
             );
+            let cap_est = capacity_handles
+                .iter()
+                .find(|(id, _)| *id == p.id)
+                .map(|(_, a)| a.clone());
             path_handles.push(
                 crate::stats::collector::BondPathStatsHandle::new(
                     p.id,
@@ -246,7 +256,8 @@ async fn bonded_output_run(
                     super::input_bonded::bond_transport_label(&p.transport),
                     ps,
                 )
-                .with_gateway_mode(gateway_mode),
+                .with_gateway_mode(gateway_mode)
+                .with_capacity_est(cap_est),
             );
         }
     }

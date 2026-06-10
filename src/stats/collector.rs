@@ -3535,6 +3535,10 @@ pub struct BondPathStatsHandle {
     /// otherwise the resolved NIC-pin mechanism from `PathStats` is
     /// reported.
     pub gateway_mode: bool,
+    /// Shared handle to the adaptive scheduler's discovered capacity for
+    /// this leg (bits/sec). `None` for the non-adaptive policies, which
+    /// don't model per-leg capacity.
+    pub capacity_est: Option<Arc<std::sync::atomic::AtomicU64>>,
 }
 
 impl BondPathStatsHandle {
@@ -3554,12 +3558,22 @@ impl BondPathStatsHandle {
             stats,
             bitrate_est: Arc::new(crate::stats::throughput::ThroughputEstimator::new()),
             gateway_mode: false,
+            capacity_est: None,
         }
     }
 
     /// Mark this leg as gateway-mode (builder style).
     pub fn with_gateway_mode(mut self, gateway: bool) -> Self {
         self.gateway_mode = gateway;
+        self
+    }
+
+    /// Attach the adaptive scheduler's per-leg capacity handle (builder).
+    pub fn with_capacity_est(
+        mut self,
+        cap: Option<Arc<std::sync::atomic::AtomicU64>>,
+    ) -> Self {
+        self.capacity_est = cap;
         self
     }
 }
@@ -3615,6 +3629,13 @@ pub fn bond_handle_to_leg_stats(h: &BondStatsHandle) -> BondLegStats {
                 // controller's ground truth, now written by the bonding
                 // crate from the v2 keepalive byte feedback.
                 delivered_bps: ps.throughput_bps,
+                // Adaptive scheduler's discovered capacity for this leg
+                // (0 for non-adaptive policies / the receiver side).
+                capacity_bps: p
+                    .capacity_est
+                    .as_ref()
+                    .map(|a| a.load(Ordering::Relaxed))
+                    .unwrap_or(0),
                 queue_depth: ps.queue_depth,
                 packets_sent: ps.packets_sent,
                 bytes_sent: ps.bytes_sent,

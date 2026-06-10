@@ -1821,6 +1821,12 @@ pub struct BondPathLegStats {
     /// edges (serde default).
     #[serde(default)]
     pub delivered_bps: u64,
+    /// The adaptive scheduler's **discovered usable capacity** for this
+    /// link (bits/sec) — what the congestion controller believes the
+    /// link can carry and fills it toward. 0 for the non-adaptive
+    /// policies, the receiver side, and legacy edges (serde default).
+    #[serde(default)]
+    pub capacity_bps: u64,
     pub queue_depth: u64,
     pub packets_sent: u64,
     pub bytes_sent: u64,
