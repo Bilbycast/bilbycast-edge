@@ -3851,6 +3851,9 @@ pub struct BondedInputConfig {
     /// [`BondedOutputConfig::encryption_key`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub encryption_key: Option<String>,
+    /// Optional proactive FEC — must match the bonded output's geometry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fec: Option<BondFecConfig>,
 }
 
 /// Bonded output — subscribes to the flow's broadcast channel, frames each
@@ -3879,6 +3882,11 @@ pub struct BondedOutputConfig {
     /// Optional congestion-control tuning for the `adaptive` scheduler.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub congestion: Option<BondCongestionConfig>,
+    /// Optional proactive FEC (off by default). Recovers sparse loss
+    /// without a NACK round-trip; the bonded input must use the same
+    /// geometry. Costs `1/rows` bandwidth overhead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fec: Option<BondFecConfig>,
     /// Optional 64-hex-char (32-byte) AEAD key. When set, every UDP/RIST
     /// leg of this bond is ChaCha20-Poly1305 encrypted; the matching
     /// bonded input must carry the same key. QUIC legs are already TLS.
@@ -3959,6 +3967,16 @@ pub struct BondCongestionConfig {
     /// Token-bucket burst depth, milliseconds of capacity.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub burst_ms: Option<u32>,
+}
+
+/// Proactive FEC geometry for a bonded link (interleaved XOR). Off by
+/// default; both edges must use the same geometry. `columns` is the
+/// interleave depth (burst tolerance); `rows` is packets per column, so
+/// overhead is `1/rows`. A block is `columns × rows` packets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BondFecConfig {
+    pub columns: u16,
+    pub rows: u16,
 }
 
 /// Transport enum for a single bond leg.

@@ -28,7 +28,7 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use bonding_transport::{
-    BondSocket, BondSocketConfig, CapacityAwareScheduler, CongestionConfig, PacketHints,
+    BondSocket, BondSocketConfig, CapacityAwareScheduler, CongestionConfig, FecParams, PacketHints,
     PathConfig as BondPathTxCfg, PathPrior, PathTransport as BondPathTxTransport,
     RoundRobinScheduler, WeightedRttScheduler,
 };
@@ -401,6 +401,12 @@ fn build_sender_cfg(cfg: &BondedOutputConfig) -> anyhow::Result<BondSocketConfig
             super::input_bonded::decode_bond_key(hex_key)
                 .map_err(|e| anyhow::anyhow!("bonded output '{}': {e}", cfg.id))?,
         );
+    }
+    if let Some(f) = &cfg.fec {
+        out.fec = Some(FecParams {
+            columns: f.columns,
+            rows: f.rows,
+        });
     }
     for p in &cfg.paths {
         out.paths.push(BondPathTxCfg {

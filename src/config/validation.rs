@@ -1654,6 +1654,7 @@ fn validate_bonded_input(c: &crate::config::models::BondedInputConfig) -> Result
         }
     }
     validate_bond_encryption_key(&c.encryption_key, "bonded input")?;
+    validate_bond_fec(&c.fec, "bonded input")?;
     Ok(())
 }
 
@@ -4902,6 +4903,7 @@ fn validate_bonded_output(c: &crate::config::models::BondedOutputConfig) -> Resu
     }
     validate_bond_encryption_key(&c.encryption_key, &format!("bonded output '{}'", c.id))?;
     validate_bond_congestion(&c.congestion, &format!("bonded output '{}'", c.id))?;
+    validate_bond_fec(&c.fec, &format!("bonded output '{}'", c.id))?;
     validate_pid_map(c.pid_map.as_ref(), &format!("bonded output '{}'", c.id))?;
     Ok(())
 }
@@ -4988,6 +4990,30 @@ fn validate_bond_congestion(
         if !(1..=5_000).contains(&v) {
             return Err(anyhow::anyhow!(
                 "{ctx}: congestion.burst_ms must be in [1, 5000]"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Validate optional proactive-FEC geometry (matches the library's
+/// `FecParams::is_valid`).
+fn validate_bond_fec(
+    c: &Option<crate::config::models::BondFecConfig>,
+    ctx: &str,
+) -> Result<()> {
+    if let Some(f) = c {
+        if !(1..=64).contains(&f.columns) {
+            return Err(anyhow::anyhow!("{ctx}: fec.columns must be in [1, 64]"));
+        }
+        if !(2..=64).contains(&f.rows) {
+            return Err(anyhow::anyhow!(
+                "{ctx}: fec.rows must be in [2, 64] (rows < 2 recovers nothing)"
+            ));
+        }
+        if (f.columns as u32) * (f.rows as u32) > 4096 {
+            return Err(anyhow::anyhow!(
+                "{ctx}: fec block (columns × rows) must be ≤ 4096"
             ));
         }
     }

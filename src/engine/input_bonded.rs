@@ -25,7 +25,7 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use bonding_transport::{
-    BondSocket, BondSocketConfig, PathConfig as BondPathTxCfg,
+    BondSocket, BondSocketConfig, FecParams, PathConfig as BondPathTxCfg,
     PathTransport as BondPathTxTransport, QuicRole as BondQuicRoleTx, QuicTlsMode as BondQuicTlsTx,
     RistRole as BondRistRoleTx,
 };
@@ -220,6 +220,12 @@ pub(crate) fn build_receiver_cfg(cfg: &BondedInputConfig) -> anyhow::Result<Bond
     }
     if let Some(hex_key) = &cfg.encryption_key {
         out.encryption_key = Some(decode_bond_key(hex_key)?);
+    }
+    if let Some(f) = &cfg.fec {
+        out.fec = Some(FecParams {
+            columns: f.columns,
+            rows: f.rows,
+        });
     }
     for p in &cfg.paths {
         out.paths.push(BondPathTxCfg {
