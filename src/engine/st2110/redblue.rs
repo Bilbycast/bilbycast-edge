@@ -397,11 +397,41 @@ impl RedBluePair {
             None => None,
         };
 
+        // ST 2110-20 rates drain the 4 MB default SO_RCVBUF (8 MB
+        // effective) in ~8 ms at 2160p50 — one descheduling of the
+        // ingest thread, or one degraded-pacing burst from a sender
+        // without RT priority, overflows it straight into kernel drops
+        // (`ss -ulnm` skmem `d` counter). Request a deep buffer; the
+        // kernel clamps to net.core.rmem_max and the warning tells the
+        // operator which sysctl to raise.
+        const INGEST_RCVBUF: usize = 64 * 1024 * 1024;
+        let raise_rcvbuf = |leg: &str, s: &std::net::UdpSocket| {
+            let sref = socket2::SockRef::from(s);
+            if let Err(e) = sref.set_recv_buffer_size(INGEST_RCVBUF) {
+                tracing::warn!("ST 2110 ingest {leg} leg: SO_RCVBUF raise failed: {e}");
+            }
+            let got = sref.recv_buffer_size().unwrap_or(0);
+            if got < INGEST_RCVBUF {
+                tracing::warn!(
+                    "ST 2110 ingest {leg} leg: SO_RCVBUF {got} bytes (requested \
+                     {INGEST_RCVBUF}) — raise net.core.rmem_max for full burst headroom"
+                );
+            }
+        };
+        raise_rcvbuf("red", &red_std);
+        if let Some(b) = blue_std.as_ref() {
+            raise_rcvbuf("blue", b);
+        }
+
         let stats = self.stats.clone();
         let events = self.events.clone();
         Ok(tokio::task::spawn_blocking(move || {
             use std::os::fd::AsRawFd;
             const BATCH: usize = 64;
+            // RT priority so sender-side bursts can't outrun a consumer
+            // stuck behind tokio blocking-pool peers. Best-effort — the
+            // helper warns when CAP_SYS_NICE / RLIMIT_RTPRIO is missing.
+            let _ = crate::util::runtime_diag::apply_sched_fifo("st2110-ingest", 50);
             let red_fd = red_std.as_raw_fd();
             let blue_fd = blue_std.as_ref().map(|s| s.as_raw_fd());
             let dual_leg = blue_fd.is_some();
@@ -466,8 +496,25 @@ impl RedBluePair {
                 if pr == 0 {
                     continue; // timeout — re-check cancel
                 }
+                // Drain each ready leg until it runs dry, alternating legs
+                // between rounds for fairness. A full batch means the
+                // socket queue likely holds more; a short batch means
+                // drained. One-batch-per-wake (the previous shape) pays an
+                // extra poll() per batch and lets a burst — sender pacing
+                // jitter, or this thread getting descheduled — pile up
+                // toward the SO_RCVBUF cliff. Rounds are bounded so the
+                // cancel check stays responsive (64 × 2 legs × 64 packets
+                // ≈ 39 ms worst-case at 2160p50 dual-leg rates).
+                const MAX_DRAIN_ROUNDS: usize = 64;
+                let mut leg_ready = [false; 2];
                 for li in 0..pollfds.len() {
-                    if pollfds[li].revents & (libc::POLLIN | libc::POLLERR) == 0 {
+                    leg_ready[li] =
+                        pollfds[li].revents & (libc::POLLIN | libc::POLLERR) != 0;
+                }
+                for _round in 0..MAX_DRAIN_ROUNDS {
+                    let mut any_full_batch = false;
+                    for li in 0..pollfds.len() {
+                    if !leg_ready[li] {
                         continue;
                     }
                     let fd = pollfds[li].fd;
@@ -484,6 +531,7 @@ impl RedBluePair {
                     };
                     if n < 0 {
                         let err = std::io::Error::last_os_error();
+                        leg_ready[li] = false;
                         match err.kind() {
                             std::io::ErrorKind::WouldBlock
                             | std::io::ErrorKind::TimedOut
@@ -495,6 +543,11 @@ impl RedBluePair {
                         }
                     }
                     let n = n as usize;
+                    if n == BATCH {
+                        any_full_batch = true;
+                    } else {
+                        leg_ready[li] = false;
+                    }
                     let batch_t0 = std::time::Instant::now();
                     let (leg_stats, leg_name, first_seen, up_msg, switch_msg) =
                         if leg == ActiveLeg::Leg1 {
@@ -581,6 +634,10 @@ impl RedBluePair {
                     diag_pkts += n as u64;
                     diag_batches += 1;
                     diag_busy += batch_t0.elapsed();
+                    }
+                    if !any_full_batch {
+                        break;
+                    }
                 }
                 if diag_last.elapsed() >= std::time::Duration::from_secs(5) {
                     let el = diag_last.elapsed().as_secs_f64();
