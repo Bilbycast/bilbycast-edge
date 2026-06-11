@@ -380,6 +380,111 @@ pub fn parse_pat_pmt_pids(pkt: &[u8]) -> Vec<u16> {
     parse_pat_programs(pkt).into_iter().map(|(_, pid)| pid).collect()
 }
 
+/// Parse a complete PAT **section** (starting at `table_id`, as produced
+/// by [`SectionAssembler::feed`]) into `(program_number, pmt_pid)` pairs.
+/// Unlike [`parse_pat_programs`] this is not limited to what fits in one
+/// 188-byte TS packet — big cable / DTT muxes carry more programs than a
+/// single packet holds.
+pub fn parse_pat_section_programs(section: &[u8]) -> Vec<(u16, u16)> {
+    let mut programs = Vec::new();
+    if section.len() < 12 || section[0] != 0x00 {
+        return programs;
+    }
+    let section_length = (((section[1] as usize) & 0x0F) << 8) | section[2] as usize;
+    if 3 + section_length > section.len() || section_length < 9 {
+        return programs;
+    }
+    let body_end = 3 + section_length - 4; // strip CRC
+    let mut pos = 8;
+    while pos + 4 <= body_end {
+        let program_number = ((section[pos] as u16) << 8) | section[pos + 1] as u16;
+        let pid = ((section[pos + 2] as u16 & 0x1F) << 8) | section[pos + 3] as u16;
+        if program_number != 0 {
+            programs.push((program_number, pid));
+        }
+        pos += 4;
+    }
+    programs
+}
+
+// ── PSI section reassembly ──────────────────────────────────────────────
+
+/// PSI sections are capped at 1024 bytes for PAT / PMT (ISO 13818-1
+/// §2.4.4); anything past this is corruption — drop and resync.
+pub const PSI_SECTION_CAP: usize = 1024;
+
+/// Reassembles a PSI section that spans multiple TS packets.
+///
+/// Packet-level PAT / PMT parsers silently drop any section longer than
+/// ~180 bytes — real broadcast MPTS PMTs (10+ ES entries with AC-3 /
+/// teletext / subtitle descriptors) routinely exceed that, leaving a
+/// consumer with zero audio PIDs on those muxes. One assembler instance
+/// per PSI PID; `feed` returns `Some(section)` (starting at `table_id`)
+/// once the declared `section_length` is satisfied. Single-packet
+/// sections complete on the PUSI packet itself — the common ffmpeg-SPTS
+/// case pays one length compare and no copy beyond the existing slice.
+pub struct SectionAssembler {
+    buf: Vec<u8>,
+    assembling: bool,
+}
+
+impl Default for SectionAssembler {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SectionAssembler {
+    pub fn new() -> Self {
+        Self { buf: Vec::with_capacity(256), assembling: false }
+    }
+
+    pub fn reset(&mut self) {
+        self.buf.clear();
+        self.assembling = false;
+    }
+
+    /// Feed one TS packet's payload for this PSI PID. `pusi` starts a
+    /// fresh section (honouring the pointer_field); continuation
+    /// packets append. Returns the complete section when its
+    /// `section_length` is satisfied.
+    pub fn feed(&mut self, pusi: bool, payload: &[u8]) -> Option<&[u8]> {
+        if pusi {
+            if payload.is_empty() {
+                self.reset();
+                return None;
+            }
+            let pointer = payload[0] as usize;
+            if 1 + pointer >= payload.len() {
+                self.reset();
+                return None;
+            }
+            self.buf.clear();
+            self.buf.extend_from_slice(&payload[1 + pointer..]);
+            self.assembling = true;
+        } else {
+            if !self.assembling {
+                return None;
+            }
+            self.buf.extend_from_slice(payload);
+        }
+        if self.buf.len() > PSI_SECTION_CAP {
+            self.reset();
+            return None;
+        }
+        if self.buf.len() < 3 {
+            return None;
+        }
+        let section_length = (((self.buf[1] as usize) & 0x0F) << 8) | self.buf[2] as usize;
+        let total = 3 + section_length;
+        if self.buf.len() >= total {
+            self.assembling = false;
+            return Some(&self.buf[..total]);
+        }
+        None
+    }
+}
+
 // ── PMT ES-info descriptor classification ───────────────────────────────
 //
 // `stream_type = 0x06` (ISO/IEC 13818-1 "PES private data") is the DVB
@@ -425,6 +530,7 @@ pub enum PrivateEsAudioKind {
 /// - `registration_descriptor` (tag 0x05) with `format_identifier`
 ///   "AC-3" / "EAC3" / "DTS1" / "DTS2" / "DTS3" / "Opus" / "BSSD"
 /// - DVB extension descriptor (tag 0x7F) with extension tag 0x15 (AC-4)
+/// - ATSC AC-4 descriptor (tag 0xAC, A/342-2 § 6.2)
 pub fn descriptor_audio_kind(descriptors: &[u8]) -> Option<PrivateEsAudioKind> {
     let mut pos = 0;
     while pos + 2 <= descriptors.len() {
@@ -446,6 +552,7 @@ pub fn descriptor_audio_kind(descriptors: &[u8]) -> Option<PrivateEsAudioKind> {
                     b"DTS1" | b"DTS2" | b"DTS3" => return Some(PrivateEsAudioKind::Dts),
                     b"Opus" => return Some(PrivateEsAudioKind::Opus),
                     b"BSSD" => return Some(PrivateEsAudioKind::Smpte302m),
+                    b"AC-4" => return Some(PrivateEsAudioKind::Ac4),
                     _ => {}
                 }
             }
@@ -456,6 +563,9 @@ pub fn descriptor_audio_kind(descriptors: &[u8]) -> Option<PrivateEsAudioKind> {
                     return Some(PrivateEsAudioKind::Ac4);
                 }
             }
+            // ATSC AC-4 descriptor (A/342-2 § 6.2) — tag 0xAC directly,
+            // the non-DVB signalling flavour.
+            0xAC => return Some(PrivateEsAudioKind::Ac4),
             _ => {}
         }
         pos += 2 + len;

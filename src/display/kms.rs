@@ -477,6 +477,22 @@ pub struct KmsDisplay {
     /// EOPNOTSUPP or a first-commit EINVAL — see `present_prime`.
     use_atomic: bool,
     atomic: Option<AtomicSetup>,
+    /// Has ANY atomic commit succeeded this session? Discriminates a
+    /// genuine "driver refuses our atomic property set" first-commit
+    /// EINVAL (→ permanent legacy fallback) from a transient EINVAL on
+    /// a re-modeset commit after `invalidate_atomic_modeset()` — the
+    /// pre-fix classifier treated both as Unsupported, so one flaky
+    /// commit at an auto-match seam (observed live on a 4K Take,
+    /// 2026-06-11) permanently killed atomic AND with it the bars
+    /// overlay composition, while every health flag still read green.
+    atomic_ever_succeeded: bool,
+    /// Consecutive `Other`-class atomic failures since the last
+    /// success. A persistent post-modeset rejection escapes to the
+    /// legacy `set_crtc` path (with the bars overlay torn down so the
+    /// CPU-bake fallback engages) after
+    /// `ATOMIC_CONSECUTIVE_FAILURE_LIMIT` instead of erroring every
+    /// frame forever.
+    atomic_consecutive_failures: u32,
     /// Has the connector seen at least one successful atomic commit
     /// with `ALLOW_MODESET`? Subsequent flips skip the
     /// CRTC.ACTIVE / CRTC.MODE_ID / CONNECTOR.CRTC_ID writes (the
@@ -495,6 +511,19 @@ pub struct KmsDisplay {
     /// from our CRTC, or when the legacy `set_crtc` fallback is in
     /// effect (multi-plane composition needs atomic commit).
     bars_overlay: Option<BarsOverlay>,
+    /// The operator asked for the bars overlay this session (a
+    /// successful or attempted `enable_bars_overlay()`). Drives the
+    /// self-heal: when `true` and `bars_overlay` is `None`,
+    /// `maybe_reheal_bars_overlay` periodically re-attempts the enable
+    /// instead of leaving the composition path degraded for the rest
+    /// of the task's lifetime ("bars never come back until restart").
+    bars_overlay_wanted: bool,
+    /// When the overlay was last torn down (commit-failure arm, panel
+    /// resize bail, or a failed enable). Re-enable attempts are
+    /// cooldown-gated on this so a host that persistently rejects the
+    /// bars plane retries once per `BARS_REHEAL_COOLDOWN`, not per
+    /// frame.
+    bars_overlay_lost_at: Option<std::time::Instant>,
     /// Currently-programmed HDR output metadata. The next atomic
     /// commit writes this onto the connector's `HDR_OUTPUT_METADATA`
     /// property. `None` when SDR (the connector is unset by writing
@@ -635,9 +664,13 @@ impl KmsDisplay {
             prime_state: None,
             use_atomic,
             atomic: atomic_setup,
+            atomic_ever_succeeded: false,
+            atomic_consecutive_failures: 0,
             atomic_modeset_done: false,
             atomic_fallback_reason: None,
             bars_overlay: None,
+            bars_overlay_wanted: false,
+            bars_overlay_lost_at: None,
             hdr_state: None,
             hdr_dirty: false,
         })
@@ -770,6 +803,19 @@ impl KmsDisplay {
     /// the CPU-blit bars-rasterise path inside the dumb buffer (the
     /// caller checks the return value and routes accordingly).
     pub fn enable_bars_overlay(&mut self) -> Result<()> {
+        self.bars_overlay_wanted = true;
+        let result = self.enable_bars_overlay_inner();
+        match &result {
+            Ok(()) => self.bars_overlay_lost_at = None,
+            // Arm the reheal cooldown so `maybe_reheal_bars_overlay`
+            // keeps retrying on hosts where the failure is transient
+            // (EDID re-probe flake, plane briefly claimed elsewhere).
+            Err(_) => self.bars_overlay_lost_at = Some(std::time::Instant::now()),
+        }
+        result
+    }
+
+    fn enable_bars_overlay_inner(&mut self) -> Result<()> {
         if self.bars_overlay.is_some() {
             return Ok(());
         }
@@ -860,6 +906,12 @@ impl KmsDisplay {
         let Some(bars) = self.bars_overlay.take() else {
             return;
         };
+        // Every internal caller is a failure / degradation path (commit
+        // rejection, panel shrank below the strip minimum) — arm the
+        // self-heal so the overlay isn't gone for the rest of the
+        // session. An operator runtime-toggle path that wants the
+        // overlay to STAY off must clear `bars_overlay_wanted` too.
+        self.bars_overlay_lost_at = Some(std::time::Instant::now());
         if bars.committed {
             // Detach the plane from our CRTC: a tiny atomic commit
             // with FB_ID = 0 + CRTC_ID = 0. Failure is non-fatal —
@@ -880,6 +932,52 @@ impl KmsDisplay {
         }
     }
 
+    /// Re-attempt `enable_bars_overlay` after an earlier teardown.
+    /// Returns `true` when the overlay is live on return (already
+    /// enabled, or the re-enable just succeeded).
+    ///
+    /// Cheap no-op guards make this safe to call per frame: bars never
+    /// requested → false; overlay already live → true; cooldown since
+    /// the teardown not elapsed (`force = false`) → false. Pass
+    /// `force = true` after a mode change — the constraint environment
+    /// that rejected the plane has been rebuilt, so an immediate
+    /// attempt is justified.
+    ///
+    /// Without this, any transient atomic-commit rejection that hit the
+    /// disable-and-retry arm removed the bars strip for the remainder
+    /// of the display task's lifetime — the operator-reported "bars
+    /// never come back until reboot" (2026-06-11).
+    pub fn maybe_reheal_bars_overlay(&mut self, force: bool) -> bool {
+        if self.bars_overlay.is_some() {
+            return true;
+        }
+        if !self.bars_overlay_wanted {
+            return false;
+        }
+        if !force {
+            let due = self
+                .bars_overlay_lost_at
+                .map(|t| t.elapsed() >= BARS_REHEAL_COOLDOWN)
+                .unwrap_or(true);
+            if !due {
+                return false;
+            }
+        }
+        match self.enable_bars_overlay() {
+            Ok(()) => {
+                tracing::info!(
+                    "audio-bars overlay re-enabled after earlier teardown — \
+                     hardware composition restored"
+                );
+                true
+            }
+            Err(e) => {
+                tracing::debug!("audio-bars overlay re-enable attempt failed: {e:#}");
+                false
+            }
+        }
+    }
+
     /// Reallocate the bars-overlay dumb buffer to match the panel's
     /// **current** width and a strip height derived from the current
     /// panel height. No-op when the overlay isn't enabled or when the
@@ -895,6 +993,11 @@ impl KmsDisplay {
     /// the leftmost bar(s) instead of the full strip.
     fn resync_bars_overlay_to_panel(&mut self) -> Result<()> {
         if self.bars_overlay.is_none() {
+            // A mode change rebuilt the constraint environment that may
+            // have rejected the bars plane earlier — re-attempt the
+            // enable immediately (cooldown bypassed). No-op when bars
+            // were never requested.
+            self.maybe_reheal_bars_overlay(true);
             return Ok(());
         }
         let new_strip_h = match super::audio_bars::compute_strip_height(self.height) {
@@ -1056,15 +1159,46 @@ impl KmsDisplay {
 
         let new_a = alloc_dumb_buffer(&self.card, new_w, new_h)?;
         let new_b = alloc_dumb_buffer(&self.card, new_w, new_h)?;
-        self.card
-            .set_crtc(
+        // The legacy SETCRTC can collide with a just-submitted
+        // nonblocking atomic flip (EBUSY window is one vblank). One
+        // short-delay retry absorbs that race; a real driver rejection
+        // fails both attempts and propagates.
+        let mut modeset = self.card.set_crtc(
+            self.crtc,
+            Some(new_a.fb),
+            (0, 0),
+            &[self.connector],
+            Some(new_mode),
+        );
+        if let Err(first) = &modeset {
+            tracing::warn!(
+                "auto-match modeset to {}x{}@{} failed ({first}); retrying once after 50 ms",
+                new_w,
+                new_h,
+                new_mode.vrefresh(),
+            );
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            modeset = self.card.set_crtc(
                 self.crtc,
                 Some(new_a.fb),
                 (0, 0),
                 &[self.connector],
                 Some(new_mode),
-            )
-            .context("display_mode_set_failed: auto-match re-modeset")?;
+            );
+        }
+        if let Err(e) = modeset {
+            // Free the buffers we allocated for the mode we failed to
+            // reach — the current mode keeps scanning out of the
+            // existing pair.
+            for buf in [new_a, new_b] {
+                let DumbBuffer { mapping, fb, handle } = buf;
+                drop(mapping);
+                let _ = self.card.destroy_framebuffer(fb);
+                let _ = self.card.destroy_dumb_buffer(handle);
+            }
+            return Err(anyhow::Error::new(e)
+                .context("display_mode_set_failed: auto-match re-modeset"));
+        }
         let old_bufs = std::mem::replace(&mut self.bufs, [new_a, new_b]);
         for old in old_bufs {
             // Drop the persistent mapping (munmap) before destroying the
@@ -1081,12 +1215,37 @@ impl KmsDisplay {
         self.height = new_h;
         self.front_idx = 0;
         self.invalidate_atomic_modeset();
+        self.rearm_atomic_after_mode_change();
+        tracing::info!(
+            "display auto-match modeset: panel now {}x{}@{}Hz",
+            new_w,
+            new_h,
+            new_mode.vrefresh(),
+        );
         if let Err(e) = self.resync_bars_overlay_to_panel() {
             tracing::warn!(
                 "audio-bars overlay resync after match-source modeset failed: {e:#}"
             );
         }
         Ok(())
+    }
+
+    /// A mode change rebuilt the scanout environment — if atomic
+    /// commits had been working earlier this session but escaped to the
+    /// legacy fallback (persistent rejection in the PREVIOUS mode, e.g.
+    /// a 4K P010 modeset commit the driver refused), give atomic
+    /// another go in the new mode. Bounded: a still-broken atomic path
+    /// re-escapes after `ATOMIC_CONSECUTIVE_FAILURE_LIMIT` frames.
+    /// No-op on hosts where atomic never worked (genuine first-commit
+    /// refusal — `atomic_ever_succeeded` is false there).
+    fn rearm_atomic_after_mode_change(&mut self) {
+        if !self.use_atomic && self.atomic_ever_succeeded {
+            tracing::info!(
+                "re-arming atomic commits after mode change (legacy fallback had engaged)"
+            );
+            self.use_atomic = true;
+            self.atomic_consecutive_failures = 0;
+        }
     }
 
     /// A legacy `set_crtc` modeset has just landed. Free the cached
@@ -1171,6 +1330,7 @@ impl KmsDisplay {
         self.height = new_h;
         self.front_idx = 0;
         self.invalidate_atomic_modeset();
+        self.rearm_atomic_after_mode_change();
         if let Err(e) = self.resync_bars_overlay_to_panel() {
             tracing::warn!(
                 "audio-bars overlay resync after monitor-native modeset failed: {e:#}"
@@ -1592,6 +1752,21 @@ impl HdrEotf {
 /// place. CTA-861-G primary / white-point quantisation: x = round(x ×
 /// 50 000); luminance is in nits (max) or 1/10 000 nit (min).
 const HDR_METADATA_BLOB_SIZE: usize = 30;
+
+/// Minimum interval between bars-overlay re-enable attempts after a
+/// teardown (`maybe_reheal_bars_overlay` with `force = false`). Long
+/// enough that a host which persistently rejects the bars plane pays
+/// one failed plane-discovery + commit per cooldown rather than per
+/// frame; short enough that a transient rejection heals without
+/// operator action.
+const BARS_REHEAL_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Consecutive `Other`-class atomic-commit failures tolerated before
+/// the display escapes to the legacy `set_crtc` path. ~2 s at 50 fps —
+/// long enough to ride out a transient post-modeset rejection window,
+/// short enough that a genuinely incompatible driver doesn't black the
+/// panel for long.
+const ATOMIC_CONSECUTIVE_FAILURE_LIMIT: u32 = 100;
 
 #[allow(clippy::too_many_arguments)]
 fn build_hdr_output_metadata_blob(
@@ -2406,6 +2581,11 @@ impl KmsDisplay {
                         self.use_atomic = false;
                         self.atomic_fallback_reason
                             .get_or_insert_with(|| format!("atomic discovery failed: {e:#}"));
+                        // Legacy set_crtc can't compose the overlay
+                        // plane — tear it down so the display loop
+                        // engages the CPU-bake bars fallback instead
+                        // of believing bars are live.
+                        self.disable_bars_overlay();
                     }
                 }
             }
@@ -2433,6 +2613,12 @@ impl KmsDisplay {
                     self.use_atomic = false;
                     self.atomic_fallback_reason
                         .get_or_insert_with(|| format!("atomic_commit unsupported: {e}"));
+                    // Legacy set_crtc can't compose the overlay plane —
+                    // tear it down so the display loop engages the
+                    // CPU-bake bars fallback (and the reheal arms for a
+                    // later mode change) instead of believing bars are
+                    // live while nothing composes them.
+                    self.disable_bars_overlay();
                     if let Err(e2) = self.set_crtc_prime(new_fb) {
                         let _ = self.card.destroy_framebuffer(new_fb);
                         return Err(e2);
@@ -2563,6 +2749,14 @@ impl KmsDisplay {
                 setup.connector_props.hdr_output_metadata,
             )
         };
+        // Modeset boundary: land the modeset triplet in its OWN commit
+        // (with the proven-safe linear dumb FB on the primary plane)
+        // before flipping the content FB. See `commit_modeset_only` for
+        // why combining them EINVALs on i915 with tiled prime FBs.
+        if !self.atomic_modeset_done {
+            self.commit_modeset_only(plane, &plane_props, &crtc_props, &connector_props)?;
+        }
+
         let pp = &plane_props;
         let mut req = AtomicModeReq::new();
         req.add_property(plane, pp.fb_id, property::Value::Framebuffer(Some(new_fb)));
@@ -2714,58 +2908,11 @@ impl KmsDisplay {
         }
         } // bars skip on first modeset commit
 
-        if !self.atomic_modeset_done {
-            // First commit (or first after a legacy modeset): re-arm
-            // the modeset triplet and ask the kernel for permission to
-            // do a modeset under this commit.
-            let blob_id = match mode_blob_loaded {
-                Some(id) => id,
-                None => {
-                    let blob = self
-                        .card
-                        .create_property_blob(&self.mode)
-                        .map_err(|e| AtomicCommitError::Other {
-                            msg: io_to_string(&e),
-                            bars_included,
-                        })?;
-                    let id = match blob {
-                        property::Value::Blob(id) => id,
-                        _ => {
-                            return Err(AtomicCommitError::Other {
-                                msg: "create_property_blob returned non-Blob value".into(),
-                                bars_included,
-                            })
-                        }
-                    };
-                    if let Some(setup) = self.atomic.as_mut() {
-                        setup.mode_blob_id = Some(id);
-                    }
-                    id
-                }
-            };
-            req.add_property(self.crtc, crtc_props.active, property::Value::Boolean(true));
-            req.add_property(self.crtc, crtc_props.mode_id, property::Value::Blob(blob_id));
-            req.add_property(
-                self.connector,
-                connector_props.crtc_id,
-                property::Value::CRTC(Some(self.crtc)),
-            );
-            flags |= AtomicCommitFlags::ALLOW_MODESET;
-            // Re-arm commits run BLOCKING (drop NONBLOCK). They follow
-            // hot on the heels of a legacy `set_crtc` (auto-match at an
-            // input-switch seam, `release_prime_state`), and a
-            // nonblocking ALLOW_MODESET commit racing that in-flight
-            // modeset returns EBUSY — observed killing the bars overlay
-            // one minute into a session (2026-06-11). Blocking here just
-            // moves the wait from the `wait_page_flip` read into the
-            // ioctl itself; the PAGE_FLIP_EVENT is still posted and
-            // consumed by the same wait loop afterwards.
-            flags &= !AtomicCommitFlags::NONBLOCK;
-        }
-
         match self.card.atomic_commit(flags, req) {
             Ok(()) => {
                 self.atomic_modeset_done = true;
+                self.atomic_ever_succeeded = true;
+                self.atomic_consecutive_failures = 0;
                 self.hdr_dirty = false;
                 // Only count this success toward the bars plane when the
                 // request actually carried the bars props — the modeset
@@ -2799,16 +2946,141 @@ impl KmsDisplay {
                 }
                 Ok(())
             }
-            Err(e) => {
-                use std::io::ErrorKind;
-                let raw = e.raw_os_error();
-                let unsupported = matches!(e.kind(), ErrorKind::Unsupported)
-                    || raw == Some(libc_eopnotsupp())
-                    || raw == Some(libc_enosys())
-                    // First-commit EINVAL: driver / plane combo refuses
-                    // our property set. The plain set_crtc path may
-                    // still work (different ioctl).
-                    || (!self.atomic_modeset_done && raw == Some(libc_einval()));
+            Err(e) => Err(self.classify_atomic_commit_err(e, bars_included)),
+        }
+    }
+
+    /// Submit a modeset-only atomic commit: the modeset triplet
+    /// (CRTC.ACTIVE / CRTC.MODE_ID / CONNECTOR.CRTC_ID) plus the primary
+    /// plane showing the linear XRGB8888 **dumb buffer** — the FB shape
+    /// the legacy `set_crtc` path has already proven against this
+    /// driver. The caller then flips the real content FB (VAAPI prime,
+    /// possibly tiled NV12 / P010) in a separate plain commit.
+    ///
+    /// Combining ALLOW_MODESET with a tiled prime FB in ONE commit is
+    /// what i915 rejected on a 4K-first session start (EINVAL on the
+    /// very first atomic commit → permanent legacy fallback → bars
+    /// overlay dead, observed live 2026-06-11). Splitting costs one
+    /// extra blocking commit per modeset boundary and one frame of the
+    /// (blanked-anyway) dumb buffer on the panel.
+    ///
+    /// Runs BLOCKING (no NONBLOCK, no PAGE_FLIP_EVENT): re-arm commits
+    /// follow hot on the heels of a legacy `set_crtc` and a nonblocking
+    /// ALLOW_MODESET commit racing that in-flight modeset returns EBUSY
+    /// — observed killing the bars overlay one minute into a session
+    /// (2026-06-11).
+    fn commit_modeset_only(
+        &mut self,
+        plane: drm::control::plane::Handle,
+        pp: &PlanePropIds,
+        crtc_props: &CrtcPropIds,
+        connector_props: &ConnectorPropIds,
+    ) -> std::result::Result<(), AtomicCommitError> {
+        let blob_id = {
+            let loaded = self.atomic.as_ref().and_then(|s| s.mode_blob_id);
+            match loaded {
+                Some(id) => id,
+                None => {
+                    let blob = self
+                        .card
+                        .create_property_blob(&self.mode)
+                        .map_err(|e| AtomicCommitError::Other {
+                            msg: io_to_string(&e),
+                            bars_included: false,
+                        })?;
+                    let id = match blob {
+                        property::Value::Blob(id) => id,
+                        _ => {
+                            return Err(AtomicCommitError::Other {
+                                msg: "create_property_blob returned non-Blob value".into(),
+                                bars_included: false,
+                            })
+                        }
+                    };
+                    if let Some(setup) = self.atomic.as_mut() {
+                        setup.mode_blob_id = Some(id);
+                    }
+                    id
+                }
+            }
+        };
+        let dumb_fb = self.bufs[self.front_idx].fb;
+        let mut req = AtomicModeReq::new();
+        req.add_property(plane, pp.fb_id, property::Value::Framebuffer(Some(dumb_fb)));
+        req.add_property(plane, pp.crtc_id, property::Value::CRTC(Some(self.crtc)));
+        req.add_property(plane, pp.src_x, property::Value::UnsignedRange(0));
+        req.add_property(plane, pp.src_y, property::Value::UnsignedRange(0));
+        req.add_property(
+            plane,
+            pp.src_w,
+            property::Value::UnsignedRange((self.width as u64) << 16),
+        );
+        req.add_property(
+            plane,
+            pp.src_h,
+            property::Value::UnsignedRange((self.height as u64) << 16),
+        );
+        req.add_property(plane, pp.crtc_x, property::Value::SignedRange(0));
+        req.add_property(plane, pp.crtc_y, property::Value::SignedRange(0));
+        req.add_property(
+            plane,
+            pp.crtc_w,
+            property::Value::UnsignedRange(self.width as u64),
+        );
+        req.add_property(
+            plane,
+            pp.crtc_h,
+            property::Value::UnsignedRange(self.height as u64),
+        );
+        req.add_property(self.crtc, crtc_props.active, property::Value::Boolean(true));
+        req.add_property(self.crtc, crtc_props.mode_id, property::Value::Blob(blob_id));
+        req.add_property(
+            self.connector,
+            connector_props.crtc_id,
+            property::Value::CRTC(Some(self.crtc)),
+        );
+        match self
+            .card
+            .atomic_commit(AtomicCommitFlags::ALLOW_MODESET, req)
+        {
+            Ok(()) => {
+                self.atomic_modeset_done = true;
+                self.atomic_ever_succeeded = true;
+                self.atomic_consecutive_failures = 0;
+                Ok(())
+            }
+            Err(e) => Err(self.classify_atomic_commit_err(e, false)),
+        }
+    }
+
+    /// Map a failed `atomic_commit` onto the [`AtomicCommitError`]
+    /// taxonomy, with all the session book-keeping that goes with it
+    /// (first-bars-commit diagnostics, consecutive-failure escape to
+    /// the legacy path).
+    fn classify_atomic_commit_err(
+        &mut self,
+        e: std::io::Error,
+        bars_included: bool,
+    ) -> AtomicCommitError {
+        use std::io::ErrorKind;
+        let raw = e.raw_os_error();
+        let unsupported = matches!(e.kind(), ErrorKind::Unsupported)
+            || raw == Some(libc_eopnotsupp())
+            || raw == Some(libc_enosys())
+            // First-commit-EVER EINVAL: driver / plane combo
+            // refuses our property set; the plain set_crtc path
+            // may still work (different ioctl). Keyed on
+            // `atomic_ever_succeeded`, NOT `atomic_modeset_done`
+            // — after a legacy auto-match modeset the latter is
+            // false again, and the pre-fix key turned ONE
+            // transient EINVAL on the re-modeset commit into a
+            // permanent legacy fallback (bars overlay dead for
+            // the session, observed live on a 4K Take
+            // 2026-06-11). A re-modeset EINVAL now classifies
+            // as `Other` and the next frame retries; persistent
+            // rejection escapes via the consecutive-failure
+            // limit below.
+            || (!self.atomic_ever_succeeded && raw == Some(libc_einval()));
                 // Surface every bars-bearing commit failure on its first
                 // occurrence so an operator debugging "bars don't show"
                 // can see whether the bars plane property set caused the
@@ -2829,16 +3101,43 @@ impl KmsDisplay {
                         }
                     }
                 }
-                if unsupported {
-                    Err(AtomicCommitError::Unsupported(e))
-                } else if raw == Some(libc_ebusy()) {
-                    Err(AtomicCommitError::Busy(io_to_string(&e)))
-                } else {
-                    Err(AtomicCommitError::Other {
-                        msg: io_to_string(&e),
-                        bars_included,
-                    })
-                }
+        if unsupported {
+            AtomicCommitError::Unsupported(e)
+        } else if raw == Some(libc_ebusy()) {
+            AtomicCommitError::Busy(io_to_string(&e))
+        } else {
+            self.atomic_consecutive_failures =
+                self.atomic_consecutive_failures.saturating_add(1);
+            if self.atomic_consecutive_failures >= ATOMIC_CONSECUTIVE_FAILURE_LIMIT {
+                // Persistent rejection (every frame for ~2 s) —
+                // this driver genuinely won't take our atomic
+                // requests in the current mode. Escape to the
+                // legacy set_crtc path AND tear the bars
+                // overlay down explicitly: legacy can't compose
+                // a second plane, and leaving `bars_overlay`
+                // Some makes the display loop believe bars are
+                // live while nothing composes them. The
+                // teardown flips the loop onto the CPU-bake
+                // fallback (bars survive on ≤1080p sources) and
+                // arms the reheal for a later mode change.
+                tracing::warn!(
+                    failures = self.atomic_consecutive_failures,
+                    "atomic commits failing persistently — falling back to legacy set_crtc (bars overlay torn down, CPU-bake fallback engages)"
+                );
+                self.use_atomic = false;
+                self.atomic_fallback_reason.get_or_insert_with(|| {
+                    format!(
+                        "atomic_commit failed {} consecutive times: {}",
+                        self.atomic_consecutive_failures,
+                        io_to_string(&e)
+                    )
+                });
+                self.disable_bars_overlay();
+                return AtomicCommitError::Unsupported(e);
+            }
+            AtomicCommitError::Other {
+                msg: io_to_string(&e),
+                bars_included,
             }
         }
     }

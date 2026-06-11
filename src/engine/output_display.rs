@@ -2681,6 +2681,13 @@ fn display_loop(
     // Resolution autodetect state. Re-armed on PTS jump (input switch)
     // or on any mid-stream source resolution change.
     let mut matched_dims: Option<(u32, u32)> = None;
+    // When the auto-match modeset fails (EBUSY race with an in-flight
+    // flip, transient EDID re-probe returning no modes), re-arm the
+    // match at this instant instead of latching the failed attempt as
+    // "matched" forever — the pre-fix behaviour pinned the panel at the
+    // old mode until the next source-dims change (2026-06-11: 4K Take
+    // left the panel at 1080p for the rest of the session).
+    let mut automatch_retry_at: Option<Instant> = None;
     let mut stats_registered = false;
     // Debounce timestamp for the CPU-blit-ceiling Warning event: emit
     // at most once per 30 s while the condition holds, otherwise the
@@ -2850,11 +2857,27 @@ fn display_loop(
         // switched from 1080p to 720p, etc).
         if let Some((mw, mh)) = matched_dims {
             if mw != next.width || mh != next.height {
+                tracing::info!(
+                    output_id = %output_id,
+                    "display source resolution changed {mw}x{mh} → {}x{} — re-arming panel mode match",
+                    next.width,
+                    next.height,
+                );
                 matched_dims = None;
+                automatch_retry_at = None;
                 wall_anchor = None;
                 fps_locked = false;
                 frames_since_period_reset = 0;
             }
+        }
+        // A previous auto-match attempt failed — retry once the backoff
+        // elapses (the failure was transient more often than not:
+        // SETCRTC-vs-flip EBUSY, EDID probe flake).
+        if matched_dims.is_some()
+            && automatch_retry_at.is_some_and(|t| Instant::now() >= t)
+        {
+            matched_dims = None;
+            automatch_retry_at = None;
         }
         // Re-fire the auto-match exactly once after the source fps has
         // stabilised. Without this, a 25 fps source on a panel that
@@ -2911,13 +2934,13 @@ fn display_loop(
                 ),
             };
             match modeset {
-                Ok(()) => emit_event(
-                    &event_sender,
-                    EventSeverity::Info,
-                    ok_code,
-                    &flow_id,
-                    &output_id,
-                    &format!(
+                Ok(()) => {
+                    // Mirror onto tracing — manager events are
+                    // best-effort (dropped while the WS is down), and a
+                    // mode decision is exactly what an operator greps
+                    // the local log for when the panel looks wrong.
+                    tracing::info!(
+                        output_id = %output_id,
                         "display {} for source {}x{} → {}x{}@{}Hz",
                         ok_verb,
                         next.width,
@@ -2925,16 +2948,45 @@ fn display_loop(
                         kms.width(),
                         kms.height(),
                         kms.refresh_hz(),
-                    ),
-                ),
-                Err(e) => emit_event(
-                    &event_sender,
-                    EventSeverity::Warning,
-                    err_code,
-                    &flow_id,
-                    &output_id,
-                    &format!("display {err_verb}: {e}"),
-                ),
+                    );
+                    emit_event(
+                        &event_sender,
+                        EventSeverity::Info,
+                        ok_code,
+                        &flow_id,
+                        &output_id,
+                        &format!(
+                            "display {} for source {}x{} → {}x{}@{}Hz",
+                            ok_verb,
+                            next.width,
+                            next.height,
+                            kms.width(),
+                            kms.height(),
+                            kms.refresh_hz(),
+                        ),
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        output_id = %output_id,
+                        "display {err_verb} (source {}x{}, panel stays {}x{}@{}Hz, retrying in 2 s): {e:#}",
+                        next.width,
+                        next.height,
+                        kms.width(),
+                        kms.height(),
+                        kms.refresh_hz(),
+                    );
+                    emit_event(
+                        &event_sender,
+                        EventSeverity::Warning,
+                        err_code,
+                        &flow_id,
+                        &output_id,
+                        &format!("display {err_verb}: {e}"),
+                    );
+                    automatch_retry_at =
+                        Some(Instant::now() + std::time::Duration::from_secs(2));
+                }
             }
             // Register / refresh the stats handle with the post-modeset
             // resolution so the manager UI shows the active mode.
@@ -3119,6 +3171,28 @@ fn display_loop(
             counters
                 .bars_overlay_enabled
                 .store(false, Ordering::Relaxed);
+        }
+        // Self-heal: while degraded (overlay torn down mid-session →
+        // CPU-bake fallback engaged above), periodically re-attempt the
+        // overlay enable. KMS gates the retry on a cooldown so this
+        // per-frame call is a cheap flag check almost always. A mode
+        // change heals through `resync_bars_overlay_to_panel` instead;
+        // this arm catches it either way because it keys on the live
+        // overlay state, not on who restored it. Without the heal, the
+        // CPU bake kept bars on ≤1080p sources but 4K zero-copy sources
+        // (over the SW-blit ceiling) showed no bars for the rest of the
+        // session.
+        if meter.is_some() && force_cpu_blit_signal.load(Ordering::Relaxed)
+            && kms.maybe_reheal_bars_overlay(false)
+        {
+            force_cpu_blit_signal.store(false, Ordering::Relaxed);
+            counters
+                .bars_overlay_enabled
+                .store(true, Ordering::Relaxed);
+            tracing::info!(
+                output_id = %output_id,
+                "audio-bars overlay restored — leaving CPU-blit fallback, hardware composition re-engaged"
+            );
         }
         let blit_us = blit_start.elapsed().as_micros() as u64;
         counters.blit_count.fetch_add(1, Ordering::Relaxed);

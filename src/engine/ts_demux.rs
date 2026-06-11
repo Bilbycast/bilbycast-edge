@@ -37,6 +37,10 @@ enum PrivateAudioKind {
     Eac3,
     /// Opus — registration descriptor `0x05` with `Opus` identifier.
     Opus,
+    /// LATM/LOAS AAC — DVB AAC descriptor (tag `0x7C`) on a private
+    /// stream. Routed as effective `stream_type = 0x11` so the LATM
+    /// PES + decoder paths handle it.
+    AacLatm,
     /// Dolby AC-4 — ETSI TS 101 154 § 5.7 / ATSC A/342-2, descriptor
     /// tag `0xAC` (also signalled via registration descriptor `0x05`
     /// with `AC-4` identifier). Always carried on `stream_type = 0x06`;
@@ -205,6 +209,14 @@ pub struct TsDemuxer {
     /// change) and a [`DemuxedFrame::Discontinuity`] is owed at the head of
     /// the next `demux()` return Vec. Cleared after that emission.
     pending_discontinuity: bool,
+    /// Cross-packet section reassembly for the PAT. Without this, a PAT
+    /// or PMT spanning more than one TS packet (real broadcast MPTS
+    /// muxes — e.g. a 214-byte PMT with HEVC + AC-4 + 3× E-AC-3 +
+    /// subtitle descriptor loops) silently truncated at 188 bytes and
+    /// the demuxer never discovered the audio PIDs.
+    pat_section: crate::engine::ts_parse::SectionAssembler,
+    /// Cross-packet section reassembly for the selected PMT.
+    pmt_section: crate::engine::ts_parse::SectionAssembler,
 }
 
 impl TsDemuxer {
@@ -233,6 +245,8 @@ impl TsDemuxer {
             cached_aac_config: None,
             pmt_version: None,
             pending_discontinuity: false,
+            pat_section: crate::engine::ts_parse::SectionAssembler::new(),
+            pmt_section: crate::engine::ts_parse::SectionAssembler::new(),
         }
     }
 
@@ -262,6 +276,8 @@ impl TsDemuxer {
             cached_aac_config: None,
             pmt_version: None,
             pending_discontinuity: false,
+            pat_section: crate::engine::ts_parse::SectionAssembler::new(),
+            pmt_section: crate::engine::ts_parse::SectionAssembler::new(),
         }
     }
 
@@ -365,12 +381,39 @@ impl TsDemuxer {
         frames
     }
 
+    /// Extract a TS packet's PSI payload slice (after the adaptation
+    /// field, pointer_field still included — `SectionAssembler::feed`
+    /// honours it), or `None` when the packet carries no payload.
+    fn psi_payload(pkt: &[u8]) -> Option<&[u8]> {
+        if !ts_has_payload(pkt) {
+            return None;
+        }
+        let offset = if ts_has_adaptation(pkt) {
+            5 + pkt[4] as usize
+        } else {
+            4
+        };
+        if offset >= TS_PACKET_SIZE {
+            return None;
+        }
+        Some(&pkt[offset..])
+    }
+
     fn process_ts_packet(&mut self, pkt: &[u8]) -> Vec<DemuxedFrame> {
         let pid = ts_pid(pkt);
 
-        // PAT — pick the program we want to lock onto.
-        if pid == PAT_PID && ts_pusi(pkt) {
-            let mut programs = parse_pat_programs(pkt);
+        // PAT — pick the program we want to lock onto. Sections are
+        // reassembled across TS packets so muxes whose PAT / PMT exceed
+        // one packet (big DTT / cable line-ups) still parse.
+        if pid == PAT_PID {
+            let Some(payload) = Self::psi_payload(pkt) else {
+                return Vec::new();
+            };
+            let Some(section) = self.pat_section.feed(ts_pusi(pkt), payload) else {
+                return Vec::new();
+            };
+            let mut programs =
+                crate::engine::ts_parse::parse_pat_section_programs(section);
             if programs.is_empty() {
                 return Vec::new();
             }
@@ -413,8 +456,13 @@ impl TsDemuxer {
         }
 
         // PMT — only honour the PMT for our locked program.
-        if Some(pid) == self.selected_pmt_pid && ts_pusi(pkt) {
-            self.parse_pmt(pkt);
+        if Some(pid) == self.selected_pmt_pid {
+            if let Some(payload) = Self::psi_payload(pkt) {
+                if let Some(section) = self.pmt_section.feed(ts_pusi(pkt), payload) {
+                    let section = section.to_vec();
+                    self.parse_pmt(&section);
+                }
+            }
             return Vec::new();
         }
 
@@ -431,32 +479,25 @@ impl TsDemuxer {
         Vec::new()
     }
 
-    /// Parse PMT to discover video and audio PIDs.
+    /// Parse a complete PMT **section** (starting at `table_id`, as
+    /// delivered by the `SectionAssembler`) to discover video and audio
+    /// PIDs. Multi-packet PMTs parse in full — the previous
+    /// packet-level parser truncated at 188 bytes and never saw ES
+    /// entries past the first packet on real broadcast MPTS muxes.
     ///
     /// Collects all audio elementary streams in PMT order, then selects the
     /// one at `audio_track_index` (or the first if unset / out of range).
     fn parse_pmt(&mut self, pkt: &[u8]) {
-        let mut offset = 4;
-        if ts_has_adaptation(pkt) {
-            let af_len = pkt[4] as usize;
-            offset = 5 + af_len;
-        }
-        if offset >= TS_PACKET_SIZE {
-            return;
-        }
-
-        let pointer = pkt[offset] as usize;
-        offset += 1 + pointer;
-
-        if offset + 12 > TS_PACKET_SIZE {
-            return;
-        }
-        if pkt[offset] != 0x02 {
-            return; // Not PMT
+        let offset = 0usize;
+        if pkt.len() < 16 || pkt[offset] != 0x02 {
+            return; // Not a complete PMT section
         }
 
         let section_length =
             (((pkt[offset + 1] & 0x0F) as usize) << 8) | (pkt[offset + 2] as usize);
+        if offset + 3 + section_length > pkt.len() || section_length < 13 {
+            return;
+        }
         // PMT version_number — 5 bits at offset+5, bits [5:1].
         // `TsContinuityFixer::on_switch` advances this monotonically (mod 32)
         // on every operator switch, including switches to dead inputs, so any
@@ -481,7 +522,7 @@ impl TsDemuxer {
 
         let data_start = offset + 12 + program_info_length;
         let data_end = (offset + 3 + section_length)
-            .min(TS_PACKET_SIZE)
+            .min(pkt.len())
             .saturating_sub(4);
 
         // Collect all audio tracks in PMT order for track selection.
@@ -518,6 +559,7 @@ impl TsDemuxer {
                 Some(PrivateAudioKind::Ac3) => 0x81,
                 Some(PrivateAudioKind::Eac3) => 0x87,
                 Some(PrivateAudioKind::Opus) => STREAM_TYPE_PRIVATE,
+                Some(PrivateAudioKind::AacLatm) => STREAM_TYPE_AAC_LATM,
                 Some(PrivateAudioKind::Ac4) => SYNTHETIC_STREAM_TYPE_AC4,
                 None => stream_type,
             };
@@ -675,42 +717,32 @@ impl TsDemuxer {
     }
 
     /// Inspect the ES-info descriptor loop for an audio codec carried on
-    /// `stream_type = 0x06` (private_data). Recognised:
+    /// `stream_type = 0x06` (private_data).
     ///
-    /// - DVB AC-3 descriptor (tag `0x6A`, ETSI TS 101 154 § 5.3)
-    /// - DVB E-AC-3 descriptor (tag `0x7A`, ETSI TS 101 154 § 5.3)
-    /// - Dolby AC-4 descriptor (tag `0xAC`, ETSI TS 101 154 § 5.7 /
-    ///   ATSC A/342-2 § 6.2)
-    /// - Opus registration descriptor (tag `0x05` with `Opus` ident)
-    /// - AC-4 registration descriptor (tag `0x05` with `AC-4` ident)
+    /// Delegates to the shared `ts_parse::descriptor_audio_kind` — the
+    /// classifier the PSI catalogue / pid-override rewriter / PTS
+    /// rewriter already use — so every TS pipeline in this binary
+    /// surfaces the same audio PIDs. The hand-rolled parser this
+    /// replaces missed the `registration_descriptor` forms ("AC-3" /
+    /// "EAC3" / DVB AAC 0x7C…), which is what ffmpeg's `mpegts` muxer
+    /// emits — the display path went silent on every such source while
+    /// the catalogue happily classified it as audio (2026-06-11).
     ///
-    /// Returns `None` for any other private stream — those PIDs are not
-    /// surfaced to the audio path.
+    /// Returns `None` for non-audio private streams and for audio
+    /// families with no decode path here (DTS, SMPTE 302M) — those PIDs
+    /// are not surfaced to the audio path.
     fn detect_private_audio_descriptor(&self, descriptors: &[u8]) -> Option<PrivateAudioKind> {
-        let mut pos = 0;
-        while pos + 2 <= descriptors.len() {
-            let tag = descriptors[pos];
-            let len = descriptors[pos + 1] as usize;
-            if pos + 2 + len > descriptors.len() {
-                break;
-            }
-            match tag {
-                0x6A => return Some(PrivateAudioKind::Ac3),
-                0x7A => return Some(PrivateAudioKind::Eac3),
-                0xAC => return Some(PrivateAudioKind::Ac4),
-                0x05 if len >= 4 => {
-                    let id = &descriptors[pos + 2..pos + 6];
-                    match id {
-                        b"Opus" => return Some(PrivateAudioKind::Opus),
-                        b"AC-4" => return Some(PrivateAudioKind::Ac4),
-                        _ => {}
-                    }
-                }
-                _ => {}
-            }
-            pos += 2 + len;
+        use crate::engine::ts_parse::PrivateEsAudioKind;
+        match crate::engine::ts_parse::descriptor_audio_kind(descriptors)? {
+            PrivateEsAudioKind::Ac3 => Some(PrivateAudioKind::Ac3),
+            PrivateEsAudioKind::Eac3 => Some(PrivateAudioKind::Eac3),
+            PrivateEsAudioKind::Opus => Some(PrivateAudioKind::Opus),
+            PrivateEsAudioKind::AacLatm => Some(PrivateAudioKind::AacLatm),
+            PrivateEsAudioKind::Ac4 => Some(PrivateAudioKind::Ac4),
+            // No decoder in this binary — don't surface to the audio
+            // path (PES would route to a decoder that can't open).
+            PrivateEsAudioKind::Dts | PrivateEsAudioKind::Smpte302m => None,
         }
-        None
     }
 
     /// Process a TS packet belonging to a known ES PID (video or audio).
@@ -1385,6 +1417,117 @@ mod tests {
         assert_eq!(demux.audio_pid, Some(0x300));
         let assembler = demux.pes_assemblers.get(&0x300).expect("E-AC-3 PID");
         assert_eq!(assembler.stream_type, 0x87);
+    }
+
+    /// E-AC-3 signalled ONLY via a registration descriptor (`0x05` with
+    /// `"EAC3"` — what ffmpeg's mpegts muxer and the flow assembler's
+    /// descriptor copy-through emit) must route exactly like the DVB
+    /// `0x7A` flavour. The pre-fix parser recognised only `Opus` /
+    /// `AC-4` registration identifiers, so the display path was silent
+    /// (no audio PID, no meter levels) on every such source
+    /// (2026-06-11, S4 / France-mux Take).
+    #[test]
+    fn registration_eac3_descriptor_routes_audio_pid() {
+        let mut demux = TsDemuxer::new(None);
+        let _ = demux.demux(&build_pat(0x100));
+        let pmt = build_pmt_private_audio(0x100, 0x200, 0x300, 0x05, b"EAC3");
+        let _ = demux.demux(&pmt);
+        assert_eq!(demux.audio_pid, Some(0x300), "reg-EAC3 PID must be locked");
+        let assembler = demux.pes_assemblers.get(&0x300).expect("reg-EAC3 PID");
+        assert_eq!(assembler.stream_type, 0x87);
+    }
+
+    /// A PMT section spanning two TS packets must reassemble and parse
+    /// in full. The pre-fix packet-level parser truncated at 188 bytes,
+    /// so ES entries in the continuation packet — the audio on every
+    /// real broadcast MPTS with fat descriptor loops — were never
+    /// discovered.
+    #[test]
+    fn multi_packet_pmt_reassembles_and_discovers_audio() {
+        // Build a PMT section: video ES with a fat (170-byte) descriptor
+        // loop pushing the audio ES entry into the second TS packet.
+        let video_pid: u16 = 0x200;
+        let audio_pid: u16 = 0x300;
+        let fat = vec![0xEEu8; 168]; // descriptor body
+        let mut es_loop: Vec<u8> = Vec::new();
+        es_loop.extend_from_slice(&[
+            0x1B,
+            0xE0 | ((video_pid >> 8) as u8 & 0x1F),
+            (video_pid & 0xFF) as u8,
+            0xF0 | (((fat.len() + 2) >> 8) as u8 & 0x0F),
+            ((fat.len() + 2) & 0xFF) as u8,
+            0x0E, // maximum_bitrate descriptor tag (opaque to routing)
+            fat.len() as u8,
+        ]);
+        es_loop.extend_from_slice(&fat);
+        es_loop.extend_from_slice(&[
+            STREAM_TYPE_PRIVATE,
+            0xE0 | ((audio_pid >> 8) as u8 & 0x1F),
+            (audio_pid & 0xFF) as u8,
+            0xF0,
+            0x03, // es_info_length = 3
+            0x7A, // DVB E-AC-3 descriptor
+            0x01,
+            0x00,
+        ]);
+        let section_length = 9 + es_loop.len() + 4;
+        let mut section: Vec<u8> = vec![
+            0x02,
+            0xB0 | ((section_length >> 8) as u8 & 0x0F),
+            (section_length & 0xFF) as u8,
+            0x00,
+            0x01, // program 1
+            0xC1,
+            0x00,
+            0x00,
+            0xE0 | ((video_pid >> 8) as u8 & 0x1F),
+            (video_pid & 0xFF) as u8, // PCR PID
+            0xF0,
+            0x00,
+        ];
+        section.extend_from_slice(&es_loop);
+        section.extend_from_slice(&[0, 0, 0, 0]); // CRC (not validated)
+        assert!(
+            section.len() > 184,
+            "test PMT must exceed one TS packet to exercise reassembly"
+        );
+
+        // Split into PUSI + continuation TS packets on PID 0x100.
+        let mut pkt1 = [0xFFu8; TS_PACKET_SIZE];
+        pkt1[0] = TS_SYNC_BYTE;
+        pkt1[1] = 0x40 | 0x01; // PUSI, PID 0x100
+        pkt1[2] = 0x00;
+        pkt1[3] = 0x10;
+        pkt1[4] = 0x00; // pointer_field
+        let first_len = TS_PACKET_SIZE - 5;
+        pkt1[5..].copy_from_slice(&section[..first_len]);
+        let mut pkt2 = [0xFFu8; TS_PACKET_SIZE];
+        pkt2[0] = TS_SYNC_BYTE;
+        pkt2[1] = 0x01; // continuation, PID 0x100
+        pkt2[2] = 0x00;
+        pkt2[3] = 0x11;
+        let rest = &section[first_len..];
+        pkt2[4..4 + rest.len()].copy_from_slice(rest);
+
+        let mut demux = TsDemuxer::new(None);
+        let _ = demux.demux(&build_pat(0x100));
+        let _ = demux.demux(&pkt1);
+        assert_eq!(
+            demux.audio_pid, None,
+            "audio must not resolve from a truncated first packet"
+        );
+        let _ = demux.demux(&pkt2);
+        assert_eq!(demux.video_pid, Some(video_pid));
+        assert_eq!(
+            demux.audio_pid,
+            Some(audio_pid),
+            "audio ES in the continuation packet must be discovered"
+        );
+        assert_eq!(
+            demux.pes_assemblers.get(&audio_pid).unwrap().stream_type,
+            0x87,
+            "descriptor-resolved E-AC-3 must survive reassembly"
+        );
     }
 
     /// Opus reg descriptor (tag `0x05` with `Opus` identifier) keeps the

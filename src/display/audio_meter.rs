@@ -29,7 +29,7 @@ use crate::engine::audio_decode::AacDecoder;
 use crate::engine::packet::RtpPacket;
 use crate::engine::ts_parse::{
     ts_adaptation_field_control, ts_has_payload, ts_pid, ts_pusi, PAT_PID, RTP_HEADER_MIN_SIZE,
-    TS_PACKET_SIZE, TS_SYNC_BYTE,
+    SectionAssembler, TS_PACKET_SIZE, TS_SYNC_BYTE,
 };
 
 use super::audio_bars::{
@@ -126,76 +126,9 @@ async fn run_meter(
     Ok(())
 }
 
-/// Reassembles a PSI section that spans multiple TS packets. The PAT /
-/// PMT parsers used to read only the PUSI packet's payload, silently
-/// dropping any section longer than ~180 bytes — real broadcast MPTS
-/// PMTs (10+ ES entries with AC-3 / teletext / subtitle descriptors)
-/// routinely exceed that, leaving the meter with zero audio PIDs and
-/// the operator with a permanently empty bars strip on those inputs.
-///
-/// `feed` returns `Some(section)` (starting at `table_id`) once the
-/// declared `section_length` is satisfied. Single-packet sections
-/// complete on the PUSI packet itself — the common ffmpeg-SPTS case
-/// pays one length compare and no copy beyond the existing slice.
-struct SectionAssembler {
-    buf: Vec<u8>,
-    assembling: bool,
-}
-
-/// PSI sections are capped at 1024 bytes for PAT/PMT (ISO 13818-1
-/// §2.4.4); anything past this is corruption — drop and resync.
-const PSI_SECTION_CAP: usize = 1024;
-
-impl SectionAssembler {
-    fn new() -> Self {
-        Self { buf: Vec::with_capacity(256), assembling: false }
-    }
-
-    fn reset(&mut self) {
-        self.buf.clear();
-        self.assembling = false;
-    }
-
-    /// Feed one TS packet's payload for this PSI PID. `pusi` starts a
-    /// fresh section (honouring the pointer_field); continuation
-    /// packets append. Returns the complete section when its
-    /// `section_length` is satisfied.
-    fn feed(&mut self, pusi: bool, payload: &[u8]) -> Option<&[u8]> {
-        if pusi {
-            if payload.is_empty() {
-                self.reset();
-                return None;
-            }
-            let pointer = payload[0] as usize;
-            if 1 + pointer >= payload.len() {
-                self.reset();
-                return None;
-            }
-            self.buf.clear();
-            self.buf.extend_from_slice(&payload[1 + pointer..]);
-            self.assembling = true;
-        } else {
-            if !self.assembling {
-                return None;
-            }
-            self.buf.extend_from_slice(payload);
-        }
-        if self.buf.len() > PSI_SECTION_CAP {
-            self.reset();
-            return None;
-        }
-        if self.buf.len() < 3 {
-            return None;
-        }
-        let section_length = (((self.buf[1] as usize) & 0x0F) << 8) | self.buf[2] as usize;
-        let total = 3 + section_length;
-        if self.buf.len() >= total {
-            self.assembling = false;
-            return Some(&self.buf[..total]);
-        }
-        None
-    }
-}
+// PSI section reassembly lives in `engine::ts_parse::SectionAssembler`
+// — shared with `ts_demux` so both TS pipelines tolerate PAT / PMT
+// sections spanning multiple TS packets (real broadcast MPTS muxes).
 
 struct MeterState {
     target_program: Option<u16>,
@@ -657,42 +590,35 @@ fn is_audio_stream_type(st: u8) -> bool {
 /// `stream_type = 0x06` (PES private_data). Returns the synthetic
 /// stream_type the meter's `drain` dispatch + `ff_codec_for_stream_type`
 /// can consume, or `None` for non-audio private streams (e.g. ARIB
-/// caption / DVB subtitling carried on the same private-data marker).
+/// caption / DVB subtitling carried on the same private-data marker)
+/// and for audio families this binary has no decoder for (AC-4, DTS,
+/// SMPTE 302M).
 ///
-/// Keeps the same descriptor parser behaviour as
-/// `ts_demux::detect_private_audio_descriptor` so the two TS pipelines
-/// in this binary surface the same audio PIDs.
+/// Delegates to the shared `ts_parse::descriptor_audio_kind` — the same
+/// classifier the PSI catalogue, the pid-override rewriter, and the PTS
+/// rewriter use — so the meter recognises every signalling style they
+/// do. The hand-rolled parser this replaces missed the
+/// `registration_descriptor` forms (`"AC-3"` / `"EAC3"` / `"DTS1"`…),
+/// which is exactly what an ffmpeg `mpegts` re-mux emits for E-AC-3:
+/// the meter classified the PID as non-audio, dropped it from the
+/// snapshot, and the operator watched the bars strip go empty after
+/// every Take onto such a source (2026-06-11, S4 / France-mux feed).
 fn resolve_private_audio_stream_type(descriptors: &[u8]) -> Option<u8> {
-    let mut pos = 0;
-    while pos + 2 <= descriptors.len() {
-        let tag = descriptors[pos];
-        let len = descriptors[pos + 1] as usize;
-        if pos + 2 + len > descriptors.len() {
-            break;
-        }
-        match tag {
-            // DVB AC-3 descriptor — ETSI TS 101 154 § 5.3.
-            0x6A => return Some(0x81),
-            // DVB E-AC-3 descriptor — ETSI TS 101 154 § 5.3.
-            0x7A => return Some(0x87),
-            // AC-4 descriptor — ETSI TS 101 154 § 5.7. AC-4 has no
-            // open-source decoder; skip from the meter so we don't
-            // open a libavcodec decoder that won't decode anything.
-            0xAC => return None,
-            // Registration descriptor — used for Opus and AC-4.
-            0x05 if len >= 4 => {
-                let id = &descriptors[pos + 2..pos + 6];
-                match id {
-                    b"Opus" => return Some(0x06), // drain_ff routes via Opus
-                    b"AC-4" => return None,        // no decoder
-                    _ => {}
-                }
-            }
-            _ => {}
-        }
-        pos += 2 + len;
+    use crate::engine::ts_parse::PrivateEsAudioKind;
+    match crate::engine::ts_parse::descriptor_audio_kind(descriptors)? {
+        PrivateEsAudioKind::Ac3 => Some(0x81),
+        PrivateEsAudioKind::Eac3 => Some(0x87),
+        // LATM/LOAS AAC — drain dispatch routes 0x11 through drain_ff
+        // (libavcodec AAC_LATM); ADTS sync-scan would never lock.
+        PrivateEsAudioKind::AacLatm => Some(0x11),
+        // drain_ff routes bare 0x06 via Opus.
+        PrivateEsAudioKind::Opus => Some(0x06),
+        // No decoder in this binary — keep the PID off the meter so we
+        // don't open a libavcodec context that can't produce levels.
+        PrivateEsAudioKind::Ac4
+        | PrivateEsAudioKind::Dts
+        | PrivateEsAudioKind::Smpte302m => None,
     }
-    None
 }
 
 fn codec_label(stream_type: u8) -> &'static str {
@@ -765,6 +691,76 @@ mod tests {
         state.parse_pmt(&pmt_section(0x81, 0x101), &mut publisher);
         assert_eq!(state.audio_pids.get(&0x101).unwrap().stream_type, 0x81);
         assert_eq!(state.audio_pids.len(), 1);
+    }
+
+    /// Like [`pmt_section`] but with an ES-info descriptor loop, so the
+    /// tests can express DVB/ffmpeg-style `stream_type = 0x06` audio.
+    fn pmt_section_with_descs(stream_type: u8, es_pid: u16, descs: &[u8]) -> Vec<u8> {
+        let mut es_loop = vec![
+            stream_type,
+            0xE0 | ((es_pid >> 8) as u8 & 0x1F),
+            (es_pid & 0xFF) as u8,
+            0xF0 | ((descs.len() >> 8) as u8 & 0x0F),
+            (descs.len() & 0xFF) as u8,
+        ];
+        es_loop.extend_from_slice(descs);
+        let section_length = 9 + es_loop.len() + 4;
+        let mut s = vec![
+            0x02,
+            0xB0 | ((section_length >> 8) as u8 & 0x0F),
+            (section_length & 0xFF) as u8,
+            0x00,
+            0x01,
+            0xC1,
+            0x00,
+            0x00,
+            0xE1,
+            0x00,
+            0xF0,
+            0x00,
+        ];
+        s.extend_from_slice(&es_loop);
+        s.extend_from_slice(&[0, 0, 0, 0]);
+        s
+    }
+
+    /// `stream_type = 0x06` audio signalled ONLY via a registration
+    /// descriptor (the shape ffmpeg's mpegts muxer emits for E-AC-3,
+    /// and what the assembler copy-through forwards) must be metered.
+    /// The pre-fix parser recognised only DVB 0x6A/0x7A tags — the PID
+    /// was classified non-audio, dropped from the snapshot, and the
+    /// operator watched the bars strip go blank after a Take onto such
+    /// a source, indistinguishable from "overlay died" (2026-06-11).
+    #[test]
+    fn registration_descriptor_audio_is_discovered() {
+        let mut state = MeterState::new(None);
+        let mut publisher = MeterPublisher::new(new_shared_meter());
+        // reg "EAC3" + ISO-639 'fre' — the captured assembled-PMT shape.
+        let descs: &[u8] = &[
+            0x05, 0x04, b'E', b'A', b'C', b'3', // registration "EAC3"
+            0x0A, 0x04, b'f', b'r', b'e', 0x00, // ISO-639 language
+        ];
+        state.parse_pmt(&pmt_section_with_descs(0x06, 0x102, descs), &mut publisher);
+        let pid = state.audio_pids.get(&0x102).expect("PID must be discovered");
+        assert_eq!(pid.stream_type, 0x87, "reg EAC3 must map to E-AC-3");
+
+        // reg "AC-3" likewise.
+        let mut state = MeterState::new(None);
+        let descs: &[u8] = &[0x05, 0x04, b'A', b'C', b'-', b'3'];
+        state.parse_pmt(&pmt_section_with_descs(0x06, 0x103, descs), &mut publisher);
+        assert_eq!(state.audio_pids.get(&0x103).unwrap().stream_type, 0x81);
+
+        // DVB AAC descriptor (0x7C) → LATM routing.
+        let mut state = MeterState::new(None);
+        let descs: &[u8] = &[0x7C, 0x01, 0x00];
+        state.parse_pmt(&pmt_section_with_descs(0x06, 0x104, descs), &mut publisher);
+        assert_eq!(state.audio_pids.get(&0x104).unwrap().stream_type, 0x11);
+
+        // AC-4 (no decoder) must stay OFF the meter.
+        let mut state = MeterState::new(None);
+        let descs: &[u8] = &[0x05, 0x04, b'A', b'C', b'-', b'4'];
+        state.parse_pmt(&pmt_section_with_descs(0x06, 0x105, descs), &mut publisher);
+        assert!(state.audio_pids.is_empty(), "AC-4 must not be metered");
     }
 
     /// A PSI section spanning multiple TS packets must reassemble; the

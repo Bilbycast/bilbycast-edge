@@ -399,6 +399,16 @@ impl DisplayCodecLabel {
 #[allow(dead_code)]
 #[derive(Debug, Default)]
 pub struct DisplayStatsCounters {
+    /// Live panel mode, updated on every auto-match / modeset. The
+    /// snapshot path prefers these (when nonzero) over the
+    /// `DisplayStatsHandle` strings — the handle is a set-once
+    /// `OnceLock`, so its mode fields freeze at the FIRST registration
+    /// and silently misreport every later mode change (a 4K→1080p
+    /// auto-match kept showing "3840x2160" for the rest of the
+    /// session, 2026-06-11).
+    pub panel_width: AtomicU64,
+    pub panel_height: AtomicU64,
+    pub panel_refresh_hz: AtomicU64,
     pub frames_displayed: AtomicU64,
     pub frames_dropped_late: AtomicU64,
     pub frames_repeated: AtomicU64,
@@ -980,9 +990,25 @@ impl OutputStatsAccumulator {
         pixel_format: impl Into<String>,
         decoder_kind: impl Into<String>,
     ) {
+        // The handle itself is set-once (the counters Arc + static
+        // descriptors), but the panel mode changes at runtime
+        // (auto-match modesets) — mirror it onto the counters atomics
+        // so the snapshot path reports the LIVE mode, not the mode at
+        // first registration.
+        let resolution = current_resolution.into();
+        if let Some((w, h)) = resolution
+            .split_once('x')
+            .and_then(|(w, h)| Some((w.parse::<u64>().ok()?, h.parse::<u64>().ok()?)))
+        {
+            counters.panel_width.store(w, Ordering::Relaxed);
+            counters.panel_height.store(h, Ordering::Relaxed);
+        }
+        counters
+            .panel_refresh_hz
+            .store(current_refresh_hz as u64, Ordering::Relaxed);
         let _ = self.display_stats.set(DisplayStatsHandle {
             counters,
-            current_resolution: current_resolution.into(),
+            current_resolution: resolution,
             current_refresh_hz,
             pixel_format: pixel_format.into(),
             decoder_kind: decoder_kind.into(),
@@ -1147,8 +1173,19 @@ impl OutputStatsAccumulator {
             audio_underruns: h.counters.audio_underruns.load(Ordering::Relaxed),
             audio_stalled: display_audio_stalled,
             av_sync_offset_ms: h.counters.load_av_offset_ms(),
-            current_resolution: h.current_resolution.clone(),
-            current_refresh_hz: h.current_refresh_hz,
+            current_resolution: {
+                let w = h.counters.panel_width.load(Ordering::Relaxed);
+                let ph = h.counters.panel_height.load(Ordering::Relaxed);
+                if w > 0 && ph > 0 {
+                    format!("{w}x{ph}")
+                } else {
+                    h.current_resolution.clone()
+                }
+            },
+            current_refresh_hz: {
+                let hz = h.counters.panel_refresh_hz.load(Ordering::Relaxed);
+                if hz > 0 { hz as u32 } else { h.current_refresh_hz }
+            },
             pixel_format: h.pixel_format.clone(),
             decoder_kind: h.decoder_kind.clone(),
             video_codec: h.counters.load_video_codec_label().as_str().to_string(),
