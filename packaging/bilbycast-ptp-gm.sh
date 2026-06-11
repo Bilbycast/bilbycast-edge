@@ -567,15 +567,15 @@ cmd_start() {
                 # SMPTE domain 127 (same failure shape as the AppArmor
                 # denial above; both were present here).
                 log "starting phc2sys (NIC PHC <- system clock; chrony keeps owning CLOCK_REALTIME):"
-                log "  $PHC2SYS_BIN -c $iface -s CLOCK_REALTIME -w -n $domain -m"
-                nohup "$PHC2SYS_BIN" -c "$iface" -s CLOCK_REALTIME -w -n "$domain" -m >>"$PHC2SYS_LOG" 2>&1 &
+                log "  $PHC2SYS_BIN -c $iface -s CLOCK_REALTIME -w -n $domain -S 1.0 -m"
+                nohup "$PHC2SYS_BIN" -c "$iface" -s CLOCK_REALTIME -w -n "$domain" -S 1.0 -m >>"$PHC2SYS_LOG" 2>&1 &
                 ;;
             slave-only)
                 # NTP daemons were stopped above (stop_ntp_for_slave) —
                 # phc2sys is the sole CLOCK_REALTIME owner from here.
                 # -n <domain>: see the grandmaster arm.
-                log "starting phc2sys (system clock <- fabric PHC): $PHC2SYS_BIN -a -r -n $domain -m"
-                nohup "$PHC2SYS_BIN" -a -r -n "$domain" -m >>"$PHC2SYS_LOG" 2>&1 &
+                log "starting phc2sys (system clock <- fabric PHC): $PHC2SYS_BIN -a -r -n $domain -S 1.0 -m"
+                nohup "$PHC2SYS_BIN" -a -r -n "$domain" -S 1.0 -m >>"$PHC2SYS_LOG" 2>&1 &
                 ;;
             *) fail "phc2sys start: unknown role '$role'" ;;
         esac
