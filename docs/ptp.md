@@ -172,22 +172,42 @@ Notes:
 ```bash
 python3 - <<'EOF'
 import time
-t = time.clock_gettime(time.CLOCK_TAI); m = time.monotonic()
-time.sleep(10)
-d = (time.clock_gettime(time.CLOCK_TAI)-t) - (time.monotonic()-m)
-print(f"REALTIME/TAI vs MONOTONIC rate offset: {d/10*1e6:+.0f} ppm")
+def bracketed():
+    # Bracket REALTIME between two MONOTONIC reads and reject samples
+    # where the bracket is wide — a scheduler preemption between
+    # sequential clock reads otherwise shows up as a phantom
+    # hundreds-of-ppm "slew" (the reads are not atomic).
+    while True:
+        m0 = time.monotonic(); r = time.clock_gettime(time.CLOCK_REALTIME)
+        m1 = time.monotonic()
+        if m1 - m0 < 50e-6:
+            return (m0 + m1) / 2, r
+samples = []
+for _ in range(4):
+    samples.append(bracketed()); time.sleep(5)
+(m_a, r_a), (m_b, r_b) = samples[0], samples[-1]
+ppm = ((r_b - r_a) - (m_b - m_a)) / (m_b - m_a) * 1e6
+print(f"REALTIME vs MONOTONIC rate offset: {ppm:+.1f} ppm")
 EOF
 ```
 
-Steady-state should be within a few ppm. Sustained readings near
-±500–1000 ppm mean an offset slew is in progress; if they persist or
-alternate sign, two servos are fighting. Check
-`ps aux | grep -E 'chronyd|phc2sys|timesyncd'` and apply the table
-above. History: a link-down grandmaster NIC plus the old
-unconditional `phc2sys -a -r -r` invocation produced exactly this on
-the ms02 testbed — phc2sys grabbed the clock toward the free-running
-PHC whenever the port flapped good, then chrony slewed it back, for
-days (2026-06-11).
+Steady-state under a healthy single servo is within a few ppm (NTP
+slews are gentle). Sustained or sign-alternating readings of tens to
+hundreds of ppm mean a large offset correction is in progress or two
+servos are trading corrections. Check
+`ps aux | grep -E 'chronyd|phc2sys|timesyncd'`, `chronyc tracking`
+(Frequency / Skew / Last offset), and apply the table above.
+
+Measurement caveat learned the hard way: naive back-to-back
+`clock_gettime` reads of two clocks are not atomic — a preemption
+between them on a loaded host fabricates a slew that looks exactly
+like a clock fight. The bracketed read above rejects those samples.
+History (ms02 testbed, 2026-06-11): the old unconditional
+`phc2sys -a -r -r` never actually engaged on the link-down GM port
+(38 h of "Waiting for ptp4l", zero adjustments) — the chrony conflict
+here was latent, not active. It becomes real the moment a slave-mode
+phc2sys engages alongside an NTP daemon, which is what the role-aware
+direction + NTP handoff prevent.
 
 ## Files + binaries reference
 
