@@ -333,22 +333,31 @@ impl RedBluePair {
 const MAX_DGRAM: usize = 9000 + 216; // jumbo-frame payloads (ST 2110-20 UHD plants run 9000-MTU fabrics; sender validation allows payload_budget ≤ 8952) + RTP/RFC4175 header headroom
 
 impl RedBluePair {
-    /// Single-leg dedicated-thread receive loop (Linux only).
+    /// Dedicated-thread receive loop (Linux only) — single or dual leg.
     ///
-    /// `recvmmsg(2)` batches up to 64 datagrams per syscall on a blocking
-    /// `std` socket owned by a `spawn_blocking` thread. Required for
-    /// ST 2110-20 uncompressed-video packet rates (1080p50 ≈ 146 kpps,
-    /// 2160p50 ≈ 580 kpps) — a per-packet `tokio::select!` recv loop tops
-    /// out well below those rates and the kernel drops the excess at the
-    /// socket buffer. Counter + event semantics mirror [`Self::recv_loop`]
-    /// (received / forwarded / duplicate, "Red leg up" info event on the
-    /// first forwarded packet), with counter updates batched per syscall.
+    /// `recvmmsg(2)` batches up to 64 datagrams per syscall per leg on
+    /// non-blocking `std` sockets owned by one `spawn_blocking` thread;
+    /// `poll(2)` (100 ms timeout) provides readiness across both legs
+    /// plus the cancel-token check while the wire is silent. Required
+    /// for ST 2110-20 uncompressed-video packet rates (1080p50 ≈
+    /// 146 kpps per leg, 2160p50 ≈ 580 kpps) — a per-packet
+    /// `tokio::select!` recv loop tops out around ~34 kpps and the
+    /// kernel drops the excess at the socket buffer.
     ///
-    /// Callers with a Blue (2022-7) leg keep [`Self::recv_loop`] — the
-    /// merge path needs both sockets in one select. `on_packet` receives
-    /// a borrowed payload — no per-packet `Bytes` allocation.
+    /// Dual-leg (2022-7) runs Red and Blue on the SAME thread feeding
+    /// one [`HitlessMerger`], so dedup + counter + event semantics are
+    /// identical to [`Self::recv_loop`]: per-leg received / forwarded /
+    /// duplicate counters (batched per syscall), one "leg up" info
+    /// event on each leg's first forwarded packet, and a Warning +
+    /// `leg_switches` increment on every active-leg transition. The
+    /// merger's 1024-slot gap-fill window dwarfs the 64-packet batch
+    /// interleave between legs, so cross-leg loss recovery behaves the
+    /// same as the per-packet path.
+    ///
+    /// `on_packet` receives a borrowed payload — no per-packet `Bytes`
+    /// allocation.
     #[cfg(target_os = "linux")]
-    pub fn spawn_dedicated_single_leg_loop<F>(
+    pub fn spawn_dedicated_loop<F>(
         self,
         cancel: CancellationToken,
         mut on_packet: F,
@@ -356,30 +365,36 @@ impl RedBluePair {
     where
         F: FnMut(&[u8], ActiveLeg, u16) -> bool + Send + 'static,
     {
-        anyhow::ensure!(
-            self.blue.is_none(),
-            "dedicated single-leg loop requires no Blue leg"
-        );
         let red_std = self
             .red
             .into_std()
             .context("red leg into_std for dedicated ingest loop")?;
         red_std
-            .set_nonblocking(false)
-            .context("red leg set_nonblocking(false)")?;
-        // recvmmsg's own timeout argument is only checked between
-        // datagrams; SO_RCVTIMEO bounds the initial blocking wait so the
-        // thread can poll `cancel` while the wire is silent.
-        red_std
-            .set_read_timeout(Some(std::time::Duration::from_millis(100)))
-            .context("red leg SO_RCVTIMEO")?;
+            .set_nonblocking(true)
+            .context("red leg set_nonblocking(true)")?;
+        let blue_std = match self.blue {
+            Some(b) => {
+                let s = b
+                    .into_std()
+                    .context("blue leg into_std for dedicated ingest loop")?;
+                s.set_nonblocking(true)
+                    .context("blue leg set_nonblocking(true)")?;
+                Some(s)
+            }
+            None => None,
+        };
 
         let stats = self.stats.clone();
         let events = self.events.clone();
         Ok(tokio::task::spawn_blocking(move || {
             use std::os::fd::AsRawFd;
             const BATCH: usize = 64;
-            let fd = red_std.as_raw_fd();
+            let red_fd = red_std.as_raw_fd();
+            let blue_fd = blue_std.as_ref().map(|s| s.as_raw_fd());
+            let dual_leg = blue_fd.is_some();
+
+            // One shared batch buffer set — each leg's batch is fully
+            // consumed before the next recvmmsg call reuses it.
             let mut bufs = vec![[0u8; MAX_DGRAM]; BATCH];
             let mut iovecs: Vec<libc::iovec> = bufs
                 .iter_mut()
@@ -399,94 +414,174 @@ impl RedBluePair {
                 .collect();
 
             let mut merger = HitlessMerger::new();
-            let mut first_seen = false;
+            let mut last_active = ActiveLeg::None;
+            let mut red_first_seen = false;
+            let mut blue_first_seen = false;
             let event_sender = events.as_ref().map(|c| &c.sender);
             let event_flow_id = events.as_ref().map(|c| c.flow_id.as_str());
 
-            tracing::info!("ST 2110 dedicated single-leg ingest started (recvmmsg batch {BATCH})");
+            let mut pollfds: Vec<libc::pollfd> = Vec::with_capacity(2);
+            pollfds.push(libc::pollfd { fd: red_fd, events: libc::POLLIN, revents: 0 });
+            if let Some(bfd) = blue_fd {
+                pollfds.push(libc::pollfd { fd: bfd, events: libc::POLLIN, revents: 0 });
+            }
+
+            tracing::info!(
+                "ST 2110 dedicated ingest started (recvmmsg batch {BATCH}, {} leg{})",
+                pollfds.len(),
+                if dual_leg { "s + hitless merge" } else { "" },
+            );
             let mut diag_last = std::time::Instant::now();
             let mut diag_pkts: u64 = 0;
             let mut diag_batches: u64 = 0;
             let mut diag_busy = std::time::Duration::ZERO;
             while !cancel.is_cancelled() {
-                let n = unsafe {
-                    libc::recvmmsg(
-                        fd,
-                        hdrs.as_mut_ptr(),
-                        BATCH as libc::c_uint,
-                        libc::MSG_WAITFORONE,
-                        std::ptr::null_mut(),
-                    )
+                for p in pollfds.iter_mut() {
+                    p.revents = 0;
+                }
+                let pr = unsafe {
+                    libc::poll(pollfds.as_mut_ptr(), pollfds.len() as libc::nfds_t, 100)
                 };
-                if n < 0 {
+                if pr < 0 {
                     let err = std::io::Error::last_os_error();
-                    match err.kind() {
-                        std::io::ErrorKind::WouldBlock
-                        | std::io::ErrorKind::TimedOut
-                        | std::io::ErrorKind::Interrupted => continue,
-                        _ => {
-                            tracing::warn!("ST 2110 dedicated ingest recvmmsg error: {err}");
-                            continue;
-                        }
-                    }
-                }
-                let n = n as usize;
-                let batch_t0 = std::time::Instant::now();
-                let mut bytes: u64 = 0;
-                let mut forwarded: u64 = 0;
-                let mut dups: u64 = 0;
-                for i in 0..n {
-                    let len = hdrs[i].msg_len as usize;
-                    bytes += len as u64;
-                    let payload = &bufs[i][..len];
-                    let Some(seq) = parse_rtp_seq(payload) else {
+                    if err.kind() == std::io::ErrorKind::Interrupted {
                         continue;
-                    };
-                    if merger.try_merge(seq, ActiveLeg::Leg1).is_some() {
-                        forwarded += 1;
-                        if !first_seen {
-                            first_seen = true;
-                            emit_leg_event(
-                                event_sender,
-                                event_flow_id,
-                                EventSeverity::Info,
-                                "red",
-                                "Red leg up (first packet received)",
-                                false,
-                            );
-                        }
-                        if !on_packet(payload, ActiveLeg::Leg1, seq) {
-                            return;
-                        }
-                    } else {
-                        dups += 1;
                     }
+                    tracing::warn!("ST 2110 dedicated ingest poll error: {err}");
+                    continue;
                 }
-                stats.red.packets_received.fetch_add(n as u64, Ordering::Relaxed);
-                stats.red.bytes_received.fetch_add(bytes, Ordering::Relaxed);
-                if forwarded > 0 {
-                    stats
-                        .red
-                        .packets_forwarded
-                        .fetch_add(forwarded, Ordering::Relaxed);
+                if pr == 0 {
+                    continue; // timeout — re-check cancel
                 }
-                if dups > 0 {
-                    stats
-                        .red
-                        .packets_duplicate
-                        .fetch_add(dups, Ordering::Relaxed);
+                for li in 0..pollfds.len() {
+                    if pollfds[li].revents & (libc::POLLIN | libc::POLLERR) == 0 {
+                        continue;
+                    }
+                    let fd = pollfds[li].fd;
+                    // Index 0 is always Red; index 1 exists only when Blue does.
+                    let leg = if li == 0 { ActiveLeg::Leg1 } else { ActiveLeg::Leg2 };
+                    let n = unsafe {
+                        libc::recvmmsg(
+                            fd,
+                            hdrs.as_mut_ptr(),
+                            BATCH as libc::c_uint,
+                            0,
+                            std::ptr::null_mut(),
+                        )
+                    };
+                    if n < 0 {
+                        let err = std::io::Error::last_os_error();
+                        match err.kind() {
+                            std::io::ErrorKind::WouldBlock
+                            | std::io::ErrorKind::TimedOut
+                            | std::io::ErrorKind::Interrupted => continue,
+                            _ => {
+                                tracing::warn!("ST 2110 dedicated ingest recvmmsg error: {err}");
+                                continue;
+                            }
+                        }
+                    }
+                    let n = n as usize;
+                    let batch_t0 = std::time::Instant::now();
+                    let (leg_stats, leg_name, first_seen, up_msg, switch_msg) =
+                        if leg == ActiveLeg::Leg1 {
+                            (
+                                &stats.red,
+                                "red",
+                                &mut red_first_seen,
+                                "Red leg up (first packet received)",
+                                "2022-7 active leg switched to Red",
+                            )
+                        } else {
+                            (
+                                &stats.blue,
+                                "blue",
+                                &mut blue_first_seen,
+                                "Blue leg up (first packet received)",
+                                "2022-7 active leg switched to Blue",
+                            )
+                        };
+                    let mut bytes: u64 = 0;
+                    let mut forwarded: u64 = 0;
+                    let mut dups: u64 = 0;
+                    for i in 0..n {
+                        let len = hdrs[i].msg_len as usize;
+                        bytes += len as u64;
+                        let payload = &bufs[i][..len];
+                        let Some(seq) = parse_rtp_seq(payload) else {
+                            continue;
+                        };
+                        if let Some(active) = merger.try_merge(seq, leg) {
+                            forwarded += 1;
+                            if !*first_seen {
+                                *first_seen = true;
+                                emit_leg_event(
+                                    event_sender,
+                                    event_flow_id,
+                                    EventSeverity::Info,
+                                    leg_name,
+                                    up_msg,
+                                    dual_leg,
+                                );
+                            }
+                            if last_active != ActiveLeg::None && last_active != active {
+                                stats.leg_switches.fetch_add(1, Ordering::Relaxed);
+                                emit_leg_event(
+                                    event_sender,
+                                    event_flow_id,
+                                    EventSeverity::Warning,
+                                    leg_name,
+                                    switch_msg,
+                                    dual_leg,
+                                );
+                            }
+                            last_active = active;
+                            if !on_packet(payload, active, seq) {
+                                // Flush the partial batch's counters before
+                                // exiting so received/forwarded stay honest.
+                                leg_stats
+                                    .packets_received
+                                    .fetch_add((i + 1) as u64, Ordering::Relaxed);
+                                leg_stats.bytes_received.fetch_add(bytes, Ordering::Relaxed);
+                                leg_stats
+                                    .packets_forwarded
+                                    .fetch_add(forwarded, Ordering::Relaxed);
+                                if dups > 0 {
+                                    leg_stats
+                                        .packets_duplicate
+                                        .fetch_add(dups, Ordering::Relaxed);
+                                }
+                                return;
+                            }
+                        } else {
+                            dups += 1;
+                        }
+                    }
+                    leg_stats.packets_received.fetch_add(n as u64, Ordering::Relaxed);
+                    leg_stats.bytes_received.fetch_add(bytes, Ordering::Relaxed);
+                    if forwarded > 0 {
+                        leg_stats.packets_forwarded.fetch_add(forwarded, Ordering::Relaxed);
+                    }
+                    if dups > 0 {
+                        leg_stats.packets_duplicate.fetch_add(dups, Ordering::Relaxed);
+                    }
+                    diag_pkts += n as u64;
+                    diag_batches += 1;
+                    diag_busy += batch_t0.elapsed();
                 }
-                diag_pkts += n as u64;
-                diag_batches += 1;
-                diag_busy += batch_t0.elapsed();
                 if diag_last.elapsed() >= std::time::Duration::from_secs(5) {
                     let el = diag_last.elapsed().as_secs_f64();
+                    let red = stats.red.snapshot();
+                    let blue = stats.blue.snapshot();
                     tracing::info!(
-                        "st2110 ingest diag: {:.0} pps  {:.0} batch/s  avg_batch={:.1}  consume_busy={:.1}%",
+                        "st2110 ingest diag: {:.0} pps  {:.0} batch/s  avg_batch={:.1}  consume_busy={:.1}%  red_rx={}  blue_rx={}  dups={}",
                         diag_pkts as f64 / el,
                         diag_batches as f64 / el,
                         diag_pkts as f64 / diag_batches.max(1) as f64,
                         100.0 * diag_busy.as_secs_f64() / el,
+                        red.packets_received,
+                        blue.packets_received,
+                        red.packets_duplicate + blue.packets_duplicate,
                     );
                     diag_last = std::time::Instant::now();
                     diag_pkts = 0;
@@ -494,7 +589,7 @@ impl RedBluePair {
                     diag_busy = std::time::Duration::ZERO;
                 }
             }
-            tracing::debug!("ST 2110 dedicated single-leg ingest loop cancelled");
+            tracing::debug!("ST 2110 dedicated ingest loop cancelled");
         }))
     }
 }
@@ -709,6 +804,114 @@ mod tests {
             + stats.blue.packets_duplicate.load(Ordering::Relaxed);
         assert_eq!(total_forwarded, 3);
         assert_eq!(total_dupe, 3);
+    }
+
+    /// Dedicated single-leg recvmmsg loop forwards every unique packet
+    /// (parity with the recv_loop contract).
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn test_dedicated_single_leg_forwards_all() {
+        let (red_recv, _blue_unused, red_addr, _) = ephemeral_pair().await;
+        let pair = RedBluePair {
+            red: red_recv,
+            blue: None,
+            stats: Arc::new(RedBlueStats::default()),
+            events: None,
+        };
+        let stats = pair.stats.clone();
+        let cancel = CancellationToken::new();
+
+        let received = Arc::new(parking_lot_lite::Mutex::new(Vec::<u16>::new()));
+        let received_clone = received.clone();
+        let handle = pair
+            .spawn_dedicated_loop(cancel.clone(), move |_payload, _leg, seq| {
+                let mut v = received_clone.lock();
+                v.push(seq);
+                v.len() < 3
+            })
+            .expect("spawn dedicated loop");
+
+        let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        for seq in [10u16, 11, 12] {
+            sender.send_to(&rtp_pkt(seq), red_addr).await.unwrap();
+        }
+        // on_packet returns false after the 3rd forward — the thread exits.
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), handle)
+            .await
+            .unwrap();
+        cancel.cancel();
+
+        let mut v = received.lock().clone();
+        v.sort_unstable();
+        assert_eq!(v, vec![10, 11, 12]);
+        assert_eq!(stats.red.packets_received.load(Ordering::Relaxed), 3);
+        assert_eq!(stats.red.packets_forwarded.load(Ordering::Relaxed), 3);
+        assert_eq!(stats.red.packets_duplicate.load(Ordering::Relaxed), 0);
+    }
+
+    /// Dedicated dual-leg recvmmsg loop dedups across Red + Blue with the
+    /// same totals contract as the select-based recv_loop: each unique
+    /// sequence forwarded exactly once, forwarded + duplicate == received.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn test_dedicated_dual_leg_dedup_drops_duplicates() {
+        let (red_recv, blue_recv, red_addr, blue_addr) = ephemeral_pair().await;
+        let pair = RedBluePair {
+            red: red_recv,
+            blue: Some(blue_recv),
+            stats: Arc::new(RedBlueStats::default()),
+            events: None,
+        };
+        let stats = pair.stats.clone();
+        let cancel = CancellationToken::new();
+
+        let received = Arc::new(parking_lot_lite::Mutex::new(Vec::<u16>::new()));
+        let received_clone = received.clone();
+        let handle = pair
+            .spawn_dedicated_loop(cancel.clone(), move |_payload, _leg, seq| {
+                received_clone.lock().push(seq);
+                true
+            })
+            .expect("spawn dedicated loop");
+
+        let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        // Same sequences on both legs; the shared merger must forward each
+        // exactly once. Alternate which leg leads so both legs forward at
+        // least one packet (exercises per-leg counters + gap-fill).
+        for seq in [100u16, 101, 102, 103] {
+            let (first, second) = if seq % 2 == 0 {
+                (red_addr, blue_addr)
+            } else {
+                (blue_addr, red_addr)
+            };
+            sender.send_to(&rtp_pkt(seq), first).await.unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            sender.send_to(&rtp_pkt(seq), second).await.unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        // Let the loop drain, then cancel (poll timeout is 100 ms).
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        cancel.cancel();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), handle)
+            .await
+            .unwrap();
+
+        let mut v = received.lock().clone();
+        v.sort_unstable();
+        assert_eq!(v, vec![100, 101, 102, 103]);
+
+        let total_received = stats.red.packets_received.load(Ordering::Relaxed)
+            + stats.blue.packets_received.load(Ordering::Relaxed);
+        assert_eq!(total_received, 8);
+        let total_forwarded = stats.red.packets_forwarded.load(Ordering::Relaxed)
+            + stats.blue.packets_forwarded.load(Ordering::Relaxed);
+        let total_dupe = stats.red.packets_duplicate.load(Ordering::Relaxed)
+            + stats.blue.packets_duplicate.load(Ordering::Relaxed);
+        assert_eq!(total_forwarded, 4);
+        assert_eq!(total_dupe, 4);
+        // Alternating lead leg means both legs forwarded at least once.
+        assert!(stats.red.packets_forwarded.load(Ordering::Relaxed) >= 1);
+        assert!(stats.blue.packets_forwarded.load(Ordering::Relaxed) >= 1);
     }
 
     #[tokio::test]

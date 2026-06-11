@@ -385,17 +385,19 @@ pub async fn run_st2110_20_input(
         );
     });
 
-    // Single-leg Linux ingest runs on a dedicated recvmmsg thread —
-    // ST 2110-20 packet rates (146 kpps at 1080p50, 580 kpps at 2160p50)
-    // exceed what the per-packet tokio recv loop drains, and the excess
-    // is dropped in-kernel at the socket buffer. Dual-leg (2022-7)
-    // keeps the select-based recv_loop below.
+    // Linux ingest runs on a dedicated recvmmsg thread — ST 2110-20
+    // packet rates (146 kpps at 1080p50, 580 kpps at 2160p50) exceed
+    // what the per-packet tokio recv loop drains, and the excess is
+    // dropped in-kernel at the socket buffer. Dual-leg (2022-7) rides
+    // the same thread: both sockets feed one HitlessMerger, so dedup +
+    // per-leg stats/events semantics match the select-based recv_loop
+    // that non-Linux targets keep below.
     #[cfg(target_os = "linux")]
-    if pair.blue.is_none() {
+    {
         let mut depkr =
             Rfc4175Depacketizer::new(config.width, config.height, fmt, config.payload_type);
         let stats_rl = stats.clone();
-        let handle = pair.spawn_dedicated_single_leg_loop(
+        let handle = pair.spawn_dedicated_loop(
             cancel.clone(),
             move |payload: &[u8], _leg, _seq| -> bool {
                 match depkr.feed(payload) {
@@ -416,33 +418,37 @@ pub async fn run_st2110_20_input(
             },
         )?;
         let _ = handle.await;
-        return Ok(());
+        Ok(())
     }
 
-    // Depacketizer runs on the tokio reactor.
-    let mut depkr = Rfc4175Depacketizer::new(config.width, config.height, fmt, config.payload_type);
-    let cancel_loop = cancel.clone();
-    let stats_rl = stats.clone();
-    pair.recv_loop(cancel_loop, move |payload: Bytes, _leg, _seq| -> bool {
-        match depkr.feed(&payload) {
-            Ok(DepacketizeOutcome::Frame(frame)) => {
-                let _ = frame_tx.try_send(frame);
+    // Depacketizer runs on the tokio reactor (non-Linux fallback).
+    #[cfg(not(target_os = "linux"))]
+    {
+        let mut depkr =
+            Rfc4175Depacketizer::new(config.width, config.height, fmt, config.payload_type);
+        let cancel_loop = cancel.clone();
+        let stats_rl = stats.clone();
+        pair.recv_loop(cancel_loop, move |payload: Bytes, _leg, _seq| -> bool {
+            match depkr.feed(&payload) {
+                Ok(DepacketizeOutcome::Frame(frame)) => {
+                    let _ = frame_tx.try_send(frame);
+                }
+                Ok(DepacketizeOutcome::Continue) => {}
+                Ok(DepacketizeOutcome::Dropped { reason, dropped_bytes }) => {
+                    tracing::debug!(reason, dropped_bytes, "ST 2110-20 input dropped partial frame");
+                    stats_rl.input_filtered.fetch_add(1, Ordering::Relaxed);
+                }
+                Err(e) => {
+                    tracing::debug!(error=?e, "ST 2110-20 input RFC 4175 parse error");
+                    stats_rl.input_filtered.fetch_add(1, Ordering::Relaxed);
+                }
             }
-            Ok(DepacketizeOutcome::Continue) => {}
-            Ok(DepacketizeOutcome::Dropped { reason, dropped_bytes }) => {
-                tracing::debug!(reason, dropped_bytes, "ST 2110-20 input dropped partial frame");
-                stats_rl.input_filtered.fetch_add(1, Ordering::Relaxed);
-            }
-            Err(e) => {
-                tracing::debug!(error=?e, "ST 2110-20 input RFC 4175 parse error");
-                stats_rl.input_filtered.fetch_add(1, Ordering::Relaxed);
-            }
-        }
-        true
-    })
-    .await;
+            true
+        })
+        .await;
 
-    Ok(())
+        Ok(())
+    }
 }
 
 #[cfg(feature = "media-codecs")]
