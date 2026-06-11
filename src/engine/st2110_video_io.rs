@@ -68,6 +68,22 @@ use crate::util::socket::{create_udp_output};
 const INGRESS_FRAME_QUEUE: usize = 4;
 const EGRESS_NALUS_QUEUE: usize = 16;
 const EGRESS_FRAME_QUEUE: usize = 4;
+/// HW-encoder pipeline depth for the ST 2110-20/-23 ingest encode
+/// worker (frames in flight; QSV-only today). 4 matches ffmpeg's own
+/// QSV default and takes hevc_qsv 2160p50 from ~30 fps (per-frame
+/// sync) to wire rate on Intel iGPU. See
+/// `ScaledVideoEncoder::set_async_depth`.
+const ST2110_INGEST_HW_ASYNC_DEPTH: u32 = 4;
+/// Source pixel rate (width × height × fps) above which the ingest
+/// encode worker enables HW pipelining. Pipelining costs ~`depth - 1`
+/// frames of emission latency (60 ms at 50p with depth 4), so rasters
+/// the synchronous path already sustains at wire rate — measured
+/// 56 fps for hevc_qsv at 2160p in isolation, several× that at 1080p —
+/// keep the one-frame-latency behaviour. Threshold is 1080p60-class:
+/// 720p/1080p stay synchronous, 2160p25 and up pipeline (live 4K sync
+/// throughput was ~30 fps under full ingest load, so even 2160p25 has
+/// too little headroom without the pipeline).
+const ST2110_INGEST_HW_PIPELINE_MIN_PIXEL_RATE: u64 = 1920 * 1080 * 60;
 const MAX_DGRAM: usize = 10_000; // jumbo-safe: 10 Gbps-class NICs often use 9000 MTU
 
 fn pgroup_for(fmt: St2110VideoPixelFormat) -> PgroupFormat {
@@ -488,6 +504,26 @@ fn encode_worker(
         false,
         "ST 2110-20 input".to_string(),
     );
+    // ST 2110 ingest is a paced raster source — pipeline the HW encoder
+    // on high-pixel-rate rasters so they sustain wire speed. A per-frame
+    // submit-then-sync round trip caps hevc_qsv at ~30 fps for 2160p50
+    // on Intel iGPU; with 4 frames in flight the same silicon runs at
+    // wire rate (ffmpeg's own qsv default is also async_depth=4). Cost
+    // is ~3 frames of emission latency — PTS pass through unchanged, so
+    // A/V alignment is unaffected — which is why low-rate rasters that
+    // the synchronous path already handles keep depth 1 (this rig's
+    // standing requirement is ~1 frame of output latency). Only the QSV
+    // backends honour the value.
+    let pixel_rate = width as u64 * height as u64 * (fps_num.max(1) as u64)
+        / (fps_den.max(1) as u64);
+    if pixel_rate > ST2110_INGEST_HW_PIPELINE_MIN_PIXEL_RATE {
+        pipeline.set_async_depth(ST2110_INGEST_HW_ASYNC_DEPTH);
+        tracing::info!(
+            width, height, pixel_rate,
+            "ST 2110 ingest: HW encoder pipelining enabled (async_depth {})",
+            ST2110_INGEST_HW_ASYNC_DEPTH,
+        );
+    }
     let mut ts_mux = TsMuxer::new();
     if let Some(po) = pid_overrides.as_ref() {
         if let Some(entry) = po.get(&1) {
@@ -686,6 +722,37 @@ fn encode_worker(
                 stats.input_packets.fetch_add(1, Ordering::Relaxed);
                 stats.input_bytes.fetch_add(ts_len, Ordering::Relaxed);
                 let _ = broadcast_tx.send(pkt);
+            }
+        }
+    }
+
+    // Drain the encoder's pipeline tail on the way out. Pipelined HW
+    // submission (ST2110_INGEST_HW_ASYNC_DEPTH) keeps up to depth-1
+    // frames in flight; synchronous backends drain nothing here. Only
+    // matters when downstream subscribers are still up during teardown,
+    // but it keeps output_frames == input_frames at end of stream.
+    if pipeline.is_open() {
+        if let Ok(frames) = pipeline.flush() {
+            for ef in frames {
+                encode_stats.output_frames.fetch_add(1, Ordering::Relaxed);
+                let ts_packets =
+                    ts_mux.mux_video(&ef.data, ef.pts as u64, ef.dts as u64, ef.keyframe);
+                for ts in ts_packets {
+                    let ts_len = ts.len() as u64;
+                    let pkt = RtpPacket {
+                        data: ts,
+                        sequence_number: 0,
+                        rtp_timestamp: ef.pts as u32,
+                        recv_time_us: crate::util::time::now_us(),
+                        is_raw_ts: true,
+                        upstream_seq: None,
+                        upstream_leg_id: None,
+                        sender_timestamp_us: None,
+                    };
+                    stats.input_packets.fetch_add(1, Ordering::Relaxed);
+                    stats.input_bytes.fetch_add(ts_len, Ordering::Relaxed);
+                    let _ = broadcast_tx.send(pkt);
+                }
             }
         }
     }

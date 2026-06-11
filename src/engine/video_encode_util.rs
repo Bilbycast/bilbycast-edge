@@ -140,6 +140,11 @@ pub fn build_encoder_config(
         color_matrix: cfg.color_matrix.clone().unwrap_or_default(),
         color_range: cfg.color_range.clone().unwrap_or_default(),
         global_header,
+        // Synchronous one-frame-in/one-frame-out by default — live
+        // transcode outputs keep their one-frame latency. Throughput-
+        // critical ingest call sites (ST 2110-20/-23) override this via
+        // `ScaledVideoEncoder::set_async_depth` at lazy-open.
+        async_depth: 0,
     }
 }
 
@@ -267,6 +272,13 @@ pub struct ScaledVideoEncoder {
     // downstream stats can surface the actually-opened backend after
     // an Auto-chain demote. `None` means no caller cares.
     resolved_backend_sink: Option<std::sync::Arc<ResolvedBackendCell>>,
+    // HW-encoder pipeline depth applied at lazy-open (0 = synchronous,
+    // the default). Honoured by the QSV backends only today; see
+    // `VideoEncoderConfig::async_depth`. Set by throughput-critical
+    // ingest call sites (ST 2110-20/-23) where the source is a paced
+    // raster and a per-frame submit-then-sync round trip caps the
+    // encoder below wire rate.
+    async_depth: u32,
 }
 
 #[cfg(feature = "media-codecs")]
@@ -321,7 +333,17 @@ impl ScaledVideoEncoder {
             dst_h: 0,
             log_tag: log_tag.into(),
             resolved_backend_sink: None,
+            async_depth: 0,
         }
+    }
+
+    /// Request pipelined HW submission (`depth` frames in flight) at
+    /// lazy-open. Honoured by the QSV backends only today; the other
+    /// backends ignore the value. Must be called before the first
+    /// encode — once the encoder has lazy-opened the depth is locked in
+    /// (libavcodec has no mid-stream pipeline reconfigure).
+    pub fn set_async_depth(&mut self, depth: u32) {
+        self.async_depth = depth;
     }
 
     /// Plumb a [`ResolvedBackendCell`] that the encoder writes to on
@@ -549,7 +571,7 @@ impl ScaledVideoEncoder {
         let mut last_err = String::new();
         let total = self.backend_chain.len();
         for (idx, &candidate) in self.backend_chain.iter().enumerate() {
-            let enc_cfg = build_encoder_config(
+            let mut enc_cfg = build_encoder_config(
                 &self.encode_cfg,
                 candidate,
                 src_w,
@@ -558,6 +580,7 @@ impl ScaledVideoEncoder {
                 self.fps_den,
                 self.global_header,
             );
+            enc_cfg.async_depth = self.async_depth;
             let dst_w = enc_cfg.width;
             let dst_h = enc_cfg.height;
             match video_engine::VideoEncoder::open(&enc_cfg) {

@@ -2355,7 +2355,7 @@ dependencies = [
 
 [[package]]
 name = "libffmpeg-video-sys"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "bindgen",
  "cmake",
@@ -5033,14 +5033,14 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "video-codec"
-version = "0.8.1"
+version = "0.9.0"
 dependencies = [
  "thiserror 2.0.18",
 ]
 
 [[package]]
 name = "video-engine"
-version = "0.14.1"
+version = "0.15.0"
 dependencies = [
  "bytes",
  "libffmpeg-video-sys",
