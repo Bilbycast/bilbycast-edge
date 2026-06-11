@@ -56,6 +56,15 @@ What to install on a Linux host before running or building bilbycast-edge,
 broken down by release variant and architecture. Tested on Ubuntu 24.04 LTS
 (glibc 2.39+); equivalent packages exist on Debian 12+.
 
+> **Kernel tuning:** the installer drops
+> `/etc/sysctl.d/90-bilbycast-edge.conf` (from
+> `packaging/90-bilbycast-edge.conf`) setting
+> `net.core.rmem_max = 67108864` — the `SO_RCVBUF` ceiling the
+> ST 2110-20 ingest needs for burst headroom at uncompressed-video
+> rates (distro defaults clamp it to 4 MB ≈ 8 ms at 2160p50). Manual
+> installs should apply the same file; see
+> [st2110.md → Host kernel tuning](st2110.md#host-kernel-tuning-receive-side).
+
 ### Default variant (`*-linux`) — runtime
 
 The default binary statically bundles SRT, AAC (fdk-aac), and the FFmpeg

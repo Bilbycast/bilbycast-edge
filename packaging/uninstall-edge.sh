@@ -39,6 +39,7 @@ fi
 echo "Stopping bilbycast-edge…"
 systemctl disable --now bilbycast-edge 2>/dev/null || true
 rm -f "${SYSTEMD_UNIT_DIR}/bilbycast-edge.service"
+rm -f /etc/sysctl.d/90-bilbycast-edge.conf
 systemctl daemon-reload
 
 echo "Removing binaries from ${INSTALL_ROOT}…"

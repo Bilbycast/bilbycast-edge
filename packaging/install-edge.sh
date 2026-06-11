@@ -378,6 +378,18 @@ if [[ -f "${VERSION_DIR}/packaging/bilbycast-etf-qdisc@.service" ]]; then
     install -m 0644 "${VERSION_DIR}/packaging/bilbycast-etf-qdisc@.service" "${ETF_UNIT_DEST}"
 fi
 
+# ── Kernel tuning (sysctl.d) ──────────────────────────────────────────
+# net.core.rmem_max: SO_RCVBUF ceiling. The ST 2110-20 ingest requests
+# 64 MB per leg (the distro-default 4 MB cap holds ~8 ms at 2160p50 —
+# one scheduler hiccup overflows it into kernel drops). Installed as a
+# persistent sysctl.d drop-in and applied immediately; harmless for
+# non-2110 deployments (a ceiling, not an allocation).
+SYSCTL_DEST="/etc/sysctl.d/90-bilbycast-edge.conf"
+if [[ -f "${VERSION_DIR}/packaging/90-bilbycast-edge.conf" ]]; then
+    install -m 0644 "${VERSION_DIR}/packaging/90-bilbycast-edge.conf" "${SYSCTL_DEST}"
+    sysctl -p "${SYSCTL_DEST}" >/dev/null 2>&1 || true
+fi
+
 # ── Enable ETF qdisc per NIC (when --output-nics is provided) ────────
 ETF_ENABLED_COUNT=0
 if [[ -n "${OUTPUT_NICS}" ]]; then
