@@ -110,8 +110,16 @@ pub async fn bind_udp_input(
 }
 
 /// Bind a multicast receive socket.
-/// For multicast input we bind to 0.0.0.0:<port> (or [::]:<port>) with SO_REUSEADDR,
-/// then join the multicast group (ASM by default, SSM when `source_addr` is set).
+///
+/// On Linux the socket is bound to `<group>:<port>` so the kernel only
+/// delivers datagrams addressed to *this* group. Binding the wildcard
+/// (the historical behaviour, still used on non-Linux and as a fallback)
+/// makes the socket receive traffic for **every** multicast group any
+/// socket on the host has joined on the same port — two inputs on the
+/// same port but different groups would each see both groups' packets
+/// (cross-delivery). SO_REUSEADDR stays on so several inputs can still
+/// share one `<group>:<port>` deliberately. The group join (ASM by
+/// default, SSM when `source_addr` is set) happens after bind as before.
 async fn bind_multicast_input(
     mcast_addr: SocketAddr,
     interface_addr: Option<&str>,
@@ -136,13 +144,35 @@ async fn bind_multicast_input(
         }
     }
 
-    let bind_to: SocketAddr = match mcast_addr {
+    let wildcard: SocketAddr = match mcast_addr {
         SocketAddr::V4(v4) => SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), v4.port()),
         SocketAddr::V6(v6) => SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), v6.port()),
     };
-    socket
-        .bind(&SockAddr::from(bind_to))
-        .with_context(|| format!("Failed to bind multicast socket to {bind_to}"))?;
+    #[cfg(target_os = "linux")]
+    let bound_to: SocketAddr = match socket.bind(&SockAddr::from(mcast_addr)) {
+        Ok(()) => mcast_addr,
+        Err(e) => {
+            // Group-address bind is Linux-standard, but fall back to the
+            // wildcard rather than failing the input outright — the
+            // operator loses same-port group isolation, not the stream.
+            tracing::warn!(
+                "Multicast group-address bind to {mcast_addr} failed ({e}); \
+                 falling back to wildcard {wildcard} (no same-port group isolation)"
+            );
+            socket
+                .bind(&SockAddr::from(wildcard))
+                .with_context(|| format!("Failed to bind multicast socket to {wildcard}"))?;
+            wildcard
+        }
+    };
+    #[cfg(not(target_os = "linux"))]
+    let bound_to: SocketAddr = {
+        socket
+            .bind(&SockAddr::from(wildcard))
+            .with_context(|| format!("Failed to bind multicast socket to {wildcard}"))?;
+        wildcard
+    };
+    tracing::debug!("Multicast input socket bound to {bound_to}");
 
     match (mcast_addr.ip(), source_addr) {
         (IpAddr::V4(group), None) => {
@@ -664,6 +694,78 @@ mod tests {
         let a = probe_strict_binding_supported();
         let b = probe_strict_binding_supported();
         assert_eq!(a, b);
+    }
+
+    /// Two multicast inputs on the SAME port but DIFFERENT groups must not
+    /// cross-deliver. On Linux the receive socket binds the group address,
+    /// so the kernel filters by destination group; the historical wildcard
+    /// bind delivered BOTH groups' traffic to each socket.
+    ///
+    /// Uses loopback multicast (IP_MULTICAST_LOOP is on by default and the
+    /// sender pins `IP_MULTICAST_IF` to 127.0.0.1). Some sandboxed kernels
+    /// refuse loopback multicast entirely — if no packet arrives at all the
+    /// test logs and returns rather than failing on the environment.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn multicast_same_port_different_groups_isolated() {
+        // The cross-delivery scenario needs both sockets on one port, so a
+        // fixed (PID-salted) port instead of an ephemeral one.
+        let port = 50000 + (std::process::id() % 10000) as u16;
+        let group_a: Ipv4Addr = "239.255.77.10".parse().unwrap();
+        let group_b: Ipv4Addr = "239.255.77.11".parse().unwrap();
+        let sock_a = bind_udp_input(&format!("{group_a}:{port}"), Some("127.0.0.1"), None, None)
+            .await
+            .expect("bind group A");
+        let sock_b = bind_udp_input(&format!("{group_b}:{port}"), Some("127.0.0.1"), None, None)
+            .await
+            .expect("bind group B");
+
+        let sender = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        {
+            let sref = socket2::SockRef::from(&sender);
+            sref.set_multicast_if_v4(&Ipv4Addr::new(127, 0, 0, 1)).unwrap();
+            sref.set_multicast_loop_v4(true).unwrap();
+        }
+        for _ in 0..5 {
+            sender.send_to(b"GROUP-A", (group_a, port)).await.unwrap();
+            sender.send_to(b"GROUP-B", (group_b, port)).await.unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+
+        // Drain each socket for a bounded window and collect payloads.
+        async fn drain(sock: &UdpSocket) -> Vec<Vec<u8>> {
+            let mut got = Vec::new();
+            let mut buf = [0u8; 64];
+            loop {
+                match tokio::time::timeout(
+                    std::time::Duration::from_millis(200),
+                    sock.recv_from(&mut buf),
+                )
+                .await
+                {
+                    Ok(Ok((n, _))) => got.push(buf[..n].to_vec()),
+                    _ => break,
+                }
+            }
+            got
+        }
+        let got_a = drain(&sock_a).await;
+        let got_b = drain(&sock_b).await;
+
+        if got_a.is_empty() && got_b.is_empty() {
+            eprintln!("loopback multicast unavailable in this environment; skipping assertions");
+            return;
+        }
+        assert!(
+            got_a.iter().all(|p| p.as_slice() == b"GROUP-A"),
+            "socket A received another group's traffic: {got_a:?}"
+        );
+        assert!(
+            got_b.iter().all(|p| p.as_slice() == b"GROUP-B"),
+            "socket B received another group's traffic: {got_b:?}"
+        );
+        assert!(!got_a.is_empty(), "socket A received nothing while B did");
+        assert!(!got_b.is_empty(), "socket B received nothing while A did");
     }
 
     /// SSM IPv4 join via socket2 — uses the loopback group 232.0.0.1 and
