@@ -23,9 +23,16 @@
 #                  deployments.
 #
 # Tiers picked automatically based on the interface:
-#   HW PHC NIC (eno1/eno2/eno4 here)  -> NIC PHC is master, phc2sys
-#                                        disciplines CLOCK_REALTIME from
-#                                        the PHC. Sub-microsecond floor;
+#   HW PHC NIC (eno1/eno2/eno4 here)  -> hardware timestamping. phc2sys
+#                                        direction depends on the role:
+#                                        grandmaster = PHC <- system
+#                                        clock (chrony/NTP stays the
+#                                        sole CLOCK_REALTIME owner);
+#                                        slave-only = CLOCK_REALTIME <-
+#                                        fabric PHC (NTP daemons must
+#                                        be disabled — see the
+#                                        "System-clock ownership" note
+#                                        in docs/ptp.md). Sub-µs floor;
 #                                        right for ST 2110-21 narrow VRX
 #                                        and tier-1 PCR_AC measurement.
 #   Software-only NIC (eno3 here)     -> kernel software timestamping.
@@ -394,15 +401,49 @@ cmd_start() {
         sleep 0.2
     done
 
+    # ── System-clock ownership rule: exactly ONE servo may adjust
+    # CLOCK_REALTIME. Two servos (e.g. chrony + phc2sys both writing
+    # adjtimex) trade max-rate (~1000 ppm) slews back and forth, which
+    # wrecks every wallclock-anchored media path on the box (PCR
+    # accuracy, A/V regulation on the display output, wire pacing) —
+    # not just ST 2110. Direction therefore depends on the role:
+    #
+    #   grandmaster — WE are the time source. chrony (NTP) stays the
+    #     CLOCK_REALTIME owner; phc2sys runs in the opposite direction
+    #     (NIC PHC <- system clock) so the fabric is served
+    #     NTP-coherent time and nothing fights chrony. This is the
+    #     standard linuxptp/RHEL "serve system time over PTP" recipe.
+    #     Safe even when the port has no carrier — the system clock is
+    #     never touched.
+    #
+    #   slave-only — the fabric grandmaster is the time source.
+    #     phc2sys disciplines CLOCK_REALTIME from the PHC (-a -r); NTP
+    #     daemons MUST NOT also control the clock. We warn loudly; the
+    #     operator disables chrony or integrates both under one servo
+    #     with timemaster(8).
     if [ "$mode" = "hw" ]; then
-        if systemctl is-active --quiet chronyd 2>/dev/null \
-           || systemctl is-active --quiet chrony 2>/dev/null; then
-            log "NOTE: chronyd is active. phc2sys will discipline CLOCK_REALTIME"
-            log "      from the NIC PHC; chrony's NTP correction may oscillate."
-            log "      For tier-B precision: sudo systemctl stop chrony"
-        fi
-        log "starting phc2sys: $PHC2SYS_BIN -a -r -r -m"
-        nohup "$PHC2SYS_BIN" -a -r -r -m >>"$PHC2SYS_LOG" 2>&1 &
+        case "$role" in
+            grandmaster)
+                log "starting phc2sys (NIC PHC <- system clock; chrony keeps owning CLOCK_REALTIME):"
+                log "  $PHC2SYS_BIN -c $iface -s CLOCK_REALTIME -w -m"
+                nohup "$PHC2SYS_BIN" -c "$iface" -s CLOCK_REALTIME -w -m >>"$PHC2SYS_LOG" 2>&1 &
+                ;;
+            slave-only)
+                if systemctl is-active --quiet chronyd 2>/dev/null \
+                   || systemctl is-active --quiet chrony 2>/dev/null; then
+                    log "WARNING: chronyd is active and also disciplines CLOCK_REALTIME."
+                    log "         In slave mode phc2sys syncs the system clock from the"
+                    log "         fabric grandmaster — two servos on one clock WILL fight"
+                    log "         (alternating ~1000 ppm slews; broken PCR/A-V pacing)."
+                    log "         Pick one owner:"
+                    log "           sudo systemctl disable --now chrony     # PTP owns the clock"
+                    log "         or integrate PTP+NTP under one servo with timemaster(8)."
+                fi
+                log "starting phc2sys (system clock <- fabric PHC): $PHC2SYS_BIN -a -r -m"
+                nohup "$PHC2SYS_BIN" -a -r -m >>"$PHC2SYS_LOG" 2>&1 &
+                ;;
+            *) fail "phc2sys start: unknown role '$role'" ;;
+        esac
         echo $! > "$PHC2SYS_PID"
         sleep 0.5
         is_running "$PHC2SYS_PID" || fail "phc2sys failed to start; see $PHC2SYS_LOG"

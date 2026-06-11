@@ -133,6 +133,62 @@ it watches one file and execs one script.
 - **Hand-editable** — operator on the box can drop into `/var/lib/bilbycast/ptp.conf` with vi and the same 1 Hz poll applies the change. No `systemctl reload`, no manager round-trip required.
 - **No dbus / polkit dependency** — works in minimal container images and stripped-down distros where dbus isn't installed.
 
+## System-clock ownership (PTP vs NTP/chrony)
+
+**Rule: exactly one servo may adjust `CLOCK_REALTIME`.** Stock distros
+ship an NTP client (chrony on Ubuntu/RHEL, systemd-timesyncd elsewhere)
+that is enabled by default and disciplines the system clock. `phc2sys`
+can also discipline the system clock. If both run in the same
+direction-conflicting configuration, they trade kernel `adjtimex`
+corrections back and forth at the maximum slew rate (~1000 ppm). That
+does not just hurt ST 2110 — **every wallclock-anchored media path on
+the box degrades**: PCR accuracy on TS outputs, `wire_emit` pacing
+(CLOCK_TAI), the local-display A/V regulator, capture tooling. The
+symptom is intermittent and looks like anything but a clock problem.
+
+`bilbycast-ptp-gm.sh` therefore wires `phc2sys` per role:
+
+| Role | Time authority | phc2sys direction | NTP daemon |
+|---|---|---|---|
+| **Grandmaster** | This host's system clock (NTP-true via chrony) | `phc2sys -c <iface> -s CLOCK_REALTIME -w` — NIC PHC **follows** the system clock; the fabric is served NTP-coherent time | **Keep running.** chrony remains the only `CLOCK_REALTIME` owner; there is nothing to fight. |
+| **Slave only** | The fabric grandmaster | `phc2sys -a -r` — system clock **follows** the fabric PHC | **Must not control the clock.** `sudo systemctl disable --now chrony`, or integrate PTP+NTP under a single servo with `timemaster(8)`. The script logs a loud warning if chrony is active. |
+| **Auto** | Resolved at start | Whichever of the two rows the scan resolves to | Per resolved role |
+| **Off** | System clock (NTP) | phc2sys not running | Keep running |
+
+Notes:
+
+- The grandmaster direction is the standard linuxptp recipe for
+  "serve system time over PTP" and is safe even when the PTP port has
+  no carrier — the system clock is never written by phc2sys.
+- In slave mode the edge's `master_clock` PTP backend, `wire_emit`'s
+  `CLOCK_TAI` pacing, and the ST 2110-21 raster pacer all inherit the
+  fabric grandmaster through the system clock — which is exactly what
+  a 2110 plant expects.
+- TS-only deployments (no ST 2110 / MXL) don't need PTP at all: mode
+  `off`, chrony owns the clock, every flow type works.
+
+**Detecting a clock fight** (run on the suspect host):
+
+```bash
+python3 - <<'EOF'
+import time
+t = time.clock_gettime(time.CLOCK_TAI); m = time.monotonic()
+time.sleep(10)
+d = (time.clock_gettime(time.CLOCK_TAI)-t) - (time.monotonic()-m)
+print(f"REALTIME/TAI vs MONOTONIC rate offset: {d/10*1e6:+.0f} ppm")
+EOF
+```
+
+Steady-state should be within a few ppm. Sustained readings near
+±500–1000 ppm mean an offset slew is in progress; if they persist or
+alternate sign, two servos are fighting. Check
+`ps aux | grep -E 'chronyd|phc2sys|timesyncd'` and apply the table
+above. History: a link-down grandmaster NIC plus the old
+unconditional `phc2sys -a -r -r` invocation produced exactly this on
+the ms02 testbed — phc2sys grabbed the clock toward the free-running
+PHC whenever the port flapped good, then chrony slewed it back, for
+days (2026-06-11).
+
 ## Files + binaries reference
 
 | Path | Role |
