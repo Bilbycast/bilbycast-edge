@@ -1444,7 +1444,10 @@ struct HwOpenState {
 /// broadcast packet errors (SRT-FEC repair, momentary stream
 /// corruption) without flapping back to CPU on every transient. The
 /// reset in `drain_video_frames` is what makes that work — a single
-/// good frame proves the decode path is live.
+/// good frame proves the decode path is live. Errors accumulated while
+/// the keyframe gate is timeout-opened (speculative feed of
+/// non-keyframe-anchored AUs) are exempt — see
+/// [`KeyframeGate::opened_by_timeout`] and [`SPECULATIVE_DEMOTE_GRACE`].
 const RUNTIME_FAIL_DEMOTE_THRESHOLD: u32 = 30;
 
 /// Watchdog deadline for "decoder accepted packets but never produced
@@ -1616,6 +1619,21 @@ struct KeyframeGate {
     waiting: bool,
     skipped: u32,
     armed_at: Instant,
+    /// `true` when the gate opened via the time / AU budget rather than
+    /// a real keyframe — from that point the demux loop is
+    /// **speculatively** feeding non-keyframe-anchored AUs. CPU
+    /// (libavcodec) error-conceals its way to a picture from those; a
+    /// HW decoder (VAAPI / QSV / NVDEC) legitimately rejects every one
+    /// of them with INVALIDDATA. Those rejections say nothing about
+    /// the backend's health, so while this flag is set (bounded by
+    /// [`SPECULATIVE_DEMOTE_GRACE`]) they must not count toward the
+    /// HW→CPU demotion threshold — counting them demoted a perfectly
+    /// healthy VAAPI backend on *every* join of a long-GOP source
+    /// (gate budget 3 s < GOP, observed 2026-06-11 with a ~4.4 s GOP:
+    /// `hw_decode: vaapi` silently ran CPU on every session). Cleared
+    /// by the first real keyframe that flows through [`Self::admit`],
+    /// which re-anchors the stream and restarts error accounting.
+    opened_by_timeout: bool,
 }
 
 /// Wall-clock budget per gate episode before giving up on seeing a
@@ -1628,9 +1646,25 @@ const KEYFRAME_GATE_MAX_WAIT: Duration = Duration::from_secs(3);
 /// misbehaves; first bound to trip wins.
 const KEYFRAME_GATE_MAX_SKIPPED_AUS: u32 = 300;
 
+/// Upper bound on the speculative-feed demotion immunity. While the
+/// gate is timeout-opened, HW `send_packet` rejections are expected and
+/// don't count toward [`RUNTIME_FAIL_DEMOTE_THRESHOLD`]; past this
+/// budget (measured from the gate arming) the immunity lapses so a
+/// genuinely IDR-less source on a HW backend still demotes to CPU —
+/// libavcodec's error concealment is the only path to a picture there.
+/// 15 s comfortably covers real broadcast GOPs (almost always ≤ 5 s,
+/// rarely up to ~10 s) while keeping the worst-case black period on an
+/// intra-refresh source bounded.
+const SPECULATIVE_DEMOTE_GRACE: Duration = Duration::from_secs(15);
+
 impl KeyframeGate {
     fn new() -> Self {
-        Self { waiting: true, skipped: 0, armed_at: Instant::now() }
+        Self {
+            waiting: true,
+            skipped: 0,
+            armed_at: Instant::now(),
+            opened_by_timeout: false,
+        }
     }
 
     /// Re-arm the gate (decoder was just flushed).
@@ -1638,16 +1672,30 @@ impl KeyframeGate {
         self.waiting = true;
         self.skipped = 0;
         self.armed_at = Instant::now();
+        self.opened_by_timeout = false;
     }
 
     /// `true` when the AU should be fed to the decoder. The first
-    /// admitted keyframe opens the gate until the next [`Self::arm`].
+    /// admitted keyframe opens the gate until the next [`Self::arm`]
+    /// (and ends a speculative-feed window if the gate had previously
+    /// opened by timeout).
     fn admit(&mut self, is_keyframe: bool) -> bool {
         if !self.waiting {
+            if is_keyframe && self.opened_by_timeout {
+                // First real keyframe after a timeout-open: the stream
+                // is now properly anchored — subsequent send errors are
+                // meaningful again.
+                self.opened_by_timeout = false;
+                tracing::debug!(
+                    "display keyframe gate: keyframe arrived after timeout-open — \
+                     stream re-anchored, HW demotion accounting resumes",
+                );
+            }
             return true;
         }
         if is_keyframe {
             self.waiting = false;
+            self.opened_by_timeout = false;
             return true;
         }
         self.skipped += 1;
@@ -1655,6 +1703,7 @@ impl KeyframeGate {
             || self.skipped >= KEYFRAME_GATE_MAX_SKIPPED_AUS
         {
             self.waiting = false;
+            self.opened_by_timeout = true;
             tracing::info!(
                 skipped = self.skipped,
                 waited_ms = self.armed_at.elapsed().as_millis() as u64,
@@ -1665,6 +1714,19 @@ impl KeyframeGate {
             return true;
         }
         false
+    }
+
+    /// `true` while the gate is timeout-opened and the demux loop is
+    /// feeding non-keyframe-anchored AUs the decoder may legitimately
+    /// reject. Read by the demotion check in `handle_video_au`.
+    fn speculative_feed(&self) -> bool {
+        self.opened_by_timeout
+    }
+
+    /// Wall-clock since the gate was last armed. Bounds the
+    /// speculative-feed demotion immunity.
+    fn armed_elapsed(&self) -> Duration {
+        self.armed_at.elapsed()
     }
 }
 
@@ -1842,11 +1904,25 @@ fn handle_video_au(
     // zero extra frames. `last_video_pts` is still advanced for skipped
     // AUs (above) so the jump detector stays anchored to the live stream
     // while the gate is closed.
+    let was_speculative = keyframe_gate.speculative_feed();
     if !keyframe_gate.admit(is_keyframe) {
         counters
             .aus_skipped_awaiting_keyframe
             .fetch_add(1, Ordering::Relaxed);
         return;
+    }
+    if was_speculative && is_keyframe {
+        // The stream just re-anchored on a real keyframe after a
+        // timeout-opened (speculative) feed window. Whatever
+        // send_packet rejections the garbage AUs accumulated say
+        // nothing about the backend — start the demotion window fresh
+        // from this anchor so only post-keyframe failures count. The
+        // no-frames watchdog timer re-arms too: it may have started on
+        // an *accepted* garbage send seconds ago, and letting that
+        // stale anchor count down would demote a healthy HW backend
+        // during the IDR's legitimate first-frame latency.
+        hw_open_state.consecutive_send_errors = 0;
+        hw_open_state.first_send_after_open = None;
     }
     // Count the access unit as a decode-stage input frame the moment we
     // resolve a decoder for it. Output frames are bumped per
@@ -1914,9 +1990,20 @@ fn handle_video_au(
         .decode_us_max
         .fetch_max(decode_us, Ordering::Relaxed);
 
-    // Section 1: sustained send_packet errors → demote.
+    // Section 1: sustained send_packet errors → demote. Suspended while
+    // the keyframe gate is timeout-opened (speculative feed): a HW
+    // decoder rejecting non-keyframe-anchored AUs is behaving
+    // correctly, and demoting on those rejections permanently kicked
+    // `hw_decode: vaapi` to CPU on every join of a long-GOP source
+    // (gate budget < GOP length). The immunity is bounded by
+    // SPECULATIVE_DEMOTE_GRACE so an IDR-less intra-refresh source on
+    // a HW backend still falls back to CPU (which can error-conceal)
+    // rather than staying black forever.
+    let speculative_grace = keyframe_gate.speculative_feed()
+        && keyframe_gate.armed_elapsed() < SPECULATIVE_DEMOTE_GRACE;
     if hw_open_state.consecutive_send_errors >= RUNTIME_FAIL_DEMOTE_THRESHOLD
         && !matches!(hw_open_state.backend, DecoderBackend::Cpu)
+        && !speculative_grace
     {
         force_cpu_fallback(
             video_decoder,
@@ -1932,9 +2019,16 @@ fn handle_video_au(
         return;
     }
 
-    // Section 3: watchdog for "decoder opened, no frames".
+    // Section 3: watchdog for "decoder opened, no frames". Also
+    // suspended during the bounded speculative-feed window: a HW
+    // decoder that accepts non-keyframe-anchored AUs without producing
+    // frames is behaving correctly (nothing decodable has been fed
+    // yet) — pre-gate builds demoted healthy VAAPI through exactly
+    // this path on every mid-GOP join ("accepted packets but produced
+    // no frame in ~2.5 s").
     if !matches!(hw_open_state.backend, DecoderBackend::Cpu)
         && !hw_open_state.fell_back_to_cpu
+        && !speculative_grace
         && counters.frames_received_since_open.load(Ordering::Relaxed) == 0
     {
         if let Some(first_send) = hw_open_state.first_send_after_open {
@@ -2593,6 +2687,14 @@ fn display_loop(
     // log floods with one Critical per dropped frame on a 4K stream
     // running on a CPU-only host.
     let mut last_sw_ceiling_warn_at: Option<Instant> = None;
+    // Throttle for the per-frame blit/present failure warn below. The
+    // prime path logs its own failures inside `blit_and_present`; the
+    // CPU-blit path's errors (scaler init, libswscale, atomic_commit,
+    // page_flip) previously vanished into `.is_ok()` — a host where
+    // every CPU present fails showed a frozen panel with zero log
+    // evidence. One line per second keeps a hard-broken present path
+    // visible without flooding.
+    let mut last_blit_err_warn_at: Option<Instant> = None;
     // Tracks whether the panel mode currently in force was picked with
     // a stabilised source-fps hint. The first frame fires a modeset
     // with `frame_period_ms = 33` (default) — fine for picking the
@@ -2985,14 +3087,31 @@ fn display_loop(
         // frame.
         compose_stream_header(&mut header_buf, &next, frame_period_ms);
         let blit_start = Instant::now();
-        let blit_ok = blit_and_present(
+        let blit_ok = match blit_and_present(
             &mut kms,
             &next,
             &mut scaler,
             meter.as_ref(),
             &header_buf,
-        )
-        .is_ok();
+        ) {
+            Ok(()) => true,
+            Err(e) => {
+                let now = Instant::now();
+                let due = last_blit_err_warn_at
+                    .map(|t| now.duration_since(t) >= std::time::Duration::from_secs(1))
+                    .unwrap_or(true);
+                if due {
+                    last_blit_err_warn_at = Some(now);
+                    tracing::warn!(
+                        output_id = %output_id,
+                        zero_copy = next.prime.is_some(),
+                        bars_overlay = kms.bars_overlay_dims().is_some(),
+                        "display blit/present failed: {e:#}",
+                    );
+                }
+                false
+            }
+        };
         if meter.is_some() && kms.bars_overlay_dims().is_none()
             && !force_cpu_blit_signal.load(Ordering::Relaxed)
         {
@@ -3778,6 +3897,44 @@ mod tests {
         gate.arm();
         assert!(!gate.admit(false));
         assert!(gate.admit(true));
+    }
+
+    /// A timeout-opened gate marks the feed as speculative (HW
+    /// send_packet rejections are expected and must not demote); the
+    /// first real keyframe re-anchors the stream and clears the flag.
+    #[test]
+    fn keyframe_gate_speculative_flag_set_by_timeout_cleared_by_keyframe() {
+        let mut gate = KeyframeGate::new();
+        assert!(!gate.speculative_feed());
+        for _ in 0..KEYFRAME_GATE_MAX_SKIPPED_AUS - 1 {
+            assert!(!gate.admit(false));
+        }
+        assert!(gate.admit(false)); // budget exhausted — opens speculatively
+        assert!(gate.speculative_feed());
+        assert!(gate.admit(false)); // still speculative across non-keyframes
+        assert!(gate.speculative_feed());
+        assert!(gate.admit(true)); // real keyframe → anchored
+        assert!(!gate.speculative_feed());
+    }
+
+    /// A gate opened by a real keyframe is never speculative, and a
+    /// flush (`arm`) clears a lingering speculative flag.
+    #[test]
+    fn keyframe_gate_speculative_flag_clean_paths() {
+        let mut gate = KeyframeGate::new();
+        assert!(gate.admit(true));
+        assert!(!gate.speculative_feed());
+        assert!(gate.admit(false));
+        assert!(!gate.speculative_feed());
+
+        // Timeout-open, then flush before any keyframe: arm() resets.
+        let mut gate = KeyframeGate::new();
+        for _ in 0..KEYFRAME_GATE_MAX_SKIPPED_AUS {
+            let _ = gate.admit(false);
+        }
+        assert!(gate.speculative_feed());
+        gate.arm();
+        assert!(!gate.speculative_feed());
     }
 
     /// The primary escape hatch is wall-clock based so the worst-case

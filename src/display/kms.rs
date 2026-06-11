@@ -419,16 +419,19 @@ struct BarsOverlay {
     /// from a stale FB after a teardown.
     committed: bool,
     /// Optional `zpos` (Z-position / stacking order) property handle.
-    /// `None` when the driver doesn't expose `zpos` on this plane —
-    /// in that case the kernel uses registration-order zpos and the
-    /// bars composition relies on driver default. Set this property
-    /// to `primary_zpos + 1` so the bars plane is **above** the
-    /// primary plane (the VAAPI prime FB carrying the video) — without
-    /// it, several drivers (notably some AMD `amdgpu` configurations
-    /// and certain Intel `i915` revisions) place an Overlay plane
-    /// **under** the Primary plane in registration order, hiding the
-    /// bars + header strip behind the video frame even though the
-    /// rasterise wrote opaque pixels to the buffer.
+    /// `Some` only when the property exists AND is **mutable** — the
+    /// next atomic commit then writes `primary_zpos + 1` so the bars
+    /// plane composes **above** the primary (the FB carrying the
+    /// video); without it, several drivers (notably some AMD `amdgpu`
+    /// configurations) place an Overlay plane **under** the Primary in
+    /// registration order, hiding the strip behind the video frame.
+    /// `None` when the driver doesn't expose `zpos` (kernel uses
+    /// registration order) or when it's **immutable** with a pinned
+    /// value already above the primary (i915 pins every plane's zpos
+    /// to `[v, v]`; writing an immutable property — even with its
+    /// current value — EINVALs the whole commit, which is the bug that
+    /// froze bars-enabled displays on Intel hosts, 2026-06-11).
+    /// Immutable-and-below-primary planes are rejected at discovery.
     zpos: Option<property::Handle>,
     /// Z-position value to drive into `zpos`. Computed at discovery
     /// time as `primary_zpos.saturating_add(1)` — small, positive,
@@ -815,9 +818,12 @@ impl KmsDisplay {
             bars_plane = format!("{:?}", plane_h),
             primary_plane = format!("{:?}", primary_plane),
             primary_zpos = ?primary_zpos_raw,
-            bars_zpos_exposed = zpos.is_some(),
+            // `false` is normal on i915: zpos there is immutable and
+            // already pinned above the primary, so no write is needed
+            // (and writing would EINVAL every commit).
+            zpos_write_armed = zpos.is_some(),
             bars_zpos_value = zpos_value,
-            blend_mode_exposed = pixel_blend_mode.is_some(),
+            blend_write_armed = pixel_blend_mode.is_some(),
             blend_coverage_value = pixel_blend_coverage_value,
             strip_w = self.width,
             strip_h,
@@ -1234,9 +1240,62 @@ impl KmsDisplay {
                 );
                 self.present()
             }
-            Err(AtomicCommitError::Other(e)) => Err(anyhow::anyhow!(
-                "display_page_flip_failed: atomic_commit: {e}"
-            )),
+            Err(AtomicCommitError::Busy(e)) => {
+                // Transient: a previous nonblocking commit (or a legacy
+                // modeset from the auto-match path) is still in flight.
+                // Drop this frame and let the next one — a frame period
+                // later, long past the pending vblank — retry. Never
+                // disable the bars overlay for EBUSY: the overlay can't
+                // cause a busy pipeline, and tearing it down on a
+                // one-frame collision permanently downgrades the
+                // composition path. Persistent EBUSY stays loud via the
+                // display loop's throttled blit-failure warn.
+                Err(anyhow::anyhow!(
+                    "display_page_flip_failed: atomic_commit busy (frame dropped): {e}"
+                ))
+            }
+            Err(AtomicCommitError::Other { msg, bars_included }) => {
+                // Mirror `present_prime`'s recovery: when the bars
+                // overlay plane is part of the failing property set,
+                // drop the overlay and retry the flip without it rather
+                // than hard-failing every frame. On the CPU-blit path
+                // this costs NOTHING visually — `blit_and_present`
+                // bakes the bars + header into the primary dumb buffer
+                // as a backstop on every frame, so the strip survives
+                // on the primary plane; only the (redundant here)
+                // hardware composition is lost. Without this arm, a
+                // driver that rejects any bars-plane property froze the
+                // panel on the last presented frame while audio kept
+                // playing (i915 immutable-zpos, 2026-06-11). Gated on
+                // `bars_included` — a failing bars-LESS commit (e.g.
+                // the post-modeset re-arm) says nothing about the bars
+                // plane and must not tear it down.
+                if bars_included && self.bars_overlay.is_some() {
+                    tracing::warn!(
+                        "atomic_commit failed with bars overlay included on CPU-blit flip ({msg}) — \
+                         disabling overlay and retrying without bars (strip stays via the \
+                         dumb-buffer bake)"
+                    );
+                    self.disable_bars_overlay();
+                    self.invalidate_atomic_modeset();
+                    match self.atomic_present(new_fb, width, height) {
+                        Ok(()) => {
+                            self.wait_page_flip()
+                                .context("display_page_flip_failed: receive_events (bars-retry)")?;
+                            self.front_idx = back_idx;
+                            Ok(())
+                        }
+                        Err(retry_err) => Err(anyhow::anyhow!(
+                            "display_page_flip_failed: atomic_commit \
+                             (also failed without bars): {retry_err:?}"
+                        )),
+                    }
+                } else {
+                    Err(anyhow::anyhow!(
+                        "display_page_flip_failed: atomic_commit: {msg}"
+                    ))
+                }
+            }
         }
     }
 
@@ -1661,6 +1720,34 @@ fn optional_prop(
     Ok(None)
 }
 
+/// `(handle, mutable, current_value)` for a named property, or `None`
+/// when the object doesn't expose it. The mutability bit matters:
+/// writing an **immutable** property in an atomic commit fails the
+/// whole commit with EINVAL — even when the written value equals the
+/// current one (the DRM core rejects the property *write*, not the
+/// value). i915 pins every plane's `zpos` this way (range `[v, v]`,
+/// immutable), which is exactly the case the bars-overlay discovery
+/// has to detect rather than blindly writing `zpos` per commit.
+fn optional_prop_state(
+    card: &CardFile,
+    handle: impl drm::control::ResourceHandle,
+    name: &str,
+) -> Result<Option<(property::Handle, bool, u64)>> {
+    let set = card
+        .get_properties(handle)
+        .context("get_properties for prop-state discovery")?;
+    let (ids, vals) = set.as_props_and_values();
+    for (id, val) in ids.iter().zip(vals.iter()) {
+        let info = card
+            .get_property(*id)
+            .context("get_property for prop-state discovery")?;
+        if info.name().to_bytes() == name.as_bytes() {
+            return Ok(Some((*id, info.mutable(), *val)));
+        }
+    }
+    Ok(None)
+}
+
 /// Read the `type` enum value off a plane. Returns the raw value
 /// (0 = Overlay, 1 = Primary, 2 = Cursor per `DRM_PLANE_TYPE_*`).
 fn read_plane_type(card: &CardFile, plane_h: plane::Handle) -> Result<u64> {
@@ -1849,13 +1936,61 @@ fn discover_bars_overlay_blend_props(
     bars_plane: plane::Handle,
     primary_plane: plane::Handle,
 ) -> Result<(Option<property::Handle>, u64, Option<property::Handle>, u64)> {
-    let zpos = optional_prop(card, bars_plane, "zpos")?;
     let primary_zpos = read_property_u64(card, primary_plane, "zpos").unwrap_or(0);
     let zpos_value = primary_zpos.saturating_add(1);
-    let pixel_blend_mode = optional_prop(card, bars_plane, "pixel blend mode")?;
-    let coverage_value = pixel_blend_mode
-        .map(|_| read_enum_value(card, bars_plane, "pixel blend mode", "Coverage").unwrap_or(0))
-        .unwrap_or(0);
+    // Write `zpos` only when the property is MUTABLE. An immutable
+    // `zpos` (i915 pins every plane to a fixed normalized value with
+    // range `[v, v]`) EINVALs the whole atomic commit on any write —
+    // including a write of the current value — which froze the display
+    // on every bars-bearing commit (2026-06-11, ms02 Meteor Lake).
+    // When immutable, the fixed value decides for us:
+    //   - above the primary → composition is already bars-over-video;
+    //     simply don't write the property.
+    //   - at/below the primary → the plane would composite UNDER the
+    //     video and the strip could never show. Bail so
+    //     `enable_bars_overlay` reports the overlay unavailable and
+    //     the caller falls back to the CPU-blit bake path.
+    let zpos = match optional_prop_state(card, bars_plane, "zpos")? {
+        None => None,
+        Some((handle, true, _current)) => Some(handle),
+        Some((_handle, false, current)) => {
+            if current > primary_zpos {
+                None
+            } else {
+                anyhow::bail!(
+                    "bars plane zpos is immutable at {current} (primary zpos {primary_zpos}) — \
+                     plane would composite under the video"
+                );
+            }
+        }
+    };
+    // Same mutability rule for `pixel blend mode`. When immutable, the
+    // pinned value decides: `Coverage` and `Pre-multiplied` both honour
+    // our alpha layout (opaque bars/labels, translucent-black
+    // background); a pinned `None` would scan the strip out as an
+    // opaque box, so treat the plane as unusable and fall back.
+    let (pixel_blend_mode, coverage_value) =
+        match optional_prop_state(card, bars_plane, "pixel blend mode")? {
+            None => (None, 0),
+            Some((handle, true, _current)) => {
+                let coverage = read_enum_value(card, bars_plane, "pixel blend mode", "Coverage")
+                    .unwrap_or(0);
+                (Some(handle), coverage)
+            }
+            Some((_handle, false, current)) => {
+                let coverage = read_enum_value(card, bars_plane, "pixel blend mode", "Coverage");
+                let premult =
+                    read_enum_value(card, bars_plane, "pixel blend mode", "Pre-multiplied");
+                if Some(current) == coverage || Some(current) == premult {
+                    (None, 0)
+                } else {
+                    anyhow::bail!(
+                        "bars plane 'pixel blend mode' is immutable at value {current} \
+                         (neither Coverage nor Pre-multiplied) — strip would render opaque"
+                    );
+                }
+            }
+        };
     Ok((zpos, zpos_value, pixel_blend_mode, coverage_value))
 }
 
@@ -2094,19 +2229,33 @@ const DRM_FORMAT_MOD_LINEAR: u64 = 0;
 
 /// Outcome of an `atomic_commit` attempt. `Unsupported` triggers the
 /// permanent fallback to legacy `set_crtc` with a one-shot
-/// `display_atomic_unavailable` Warning. `Other` is a transient error
-/// the caller propagates as a normal display-path failure (the FB is
-/// torn down, the keepalive is held briefly, and the next frame
-/// retries the same atomic path).
+/// `display_atomic_unavailable` Warning. `Busy` (EBUSY) is a transient
+/// scheduling collision — a previous nonblocking commit (or a legacy
+/// modeset fired by the auto-match path at an input-switch seam) was
+/// still in flight; the caller drops the frame and the next attempt a
+/// frame-period later goes through. It is **never** attributed to the
+/// bars overlay — disabling the overlay can't unwedge a busy pipeline,
+/// and doing so on the first transient EBUSY permanently downgraded
+/// bars to the CPU-bake path mid-session (observed 2026-06-11).
+/// `Other` is any remaining error the caller propagates as a normal
+/// display-path failure; `bars_included` records whether the failing
+/// request actually carried the bars-plane property set, so the
+/// disable-bars-and-retry recovery only fires when the bars plane
+/// could plausibly be the cause.
 #[derive(Debug)]
 enum AtomicCommitError {
     Unsupported(std::io::Error),
-    Other(String),
+    Busy(String),
+    Other { msg: String, bars_included: bool },
 }
 
 #[inline]
 fn libc_einval() -> i32 {
     22
+}
+#[inline]
+fn libc_ebusy() -> i32 {
+    16
 }
 #[inline]
 fn libc_enosys() -> i32 {
@@ -2289,10 +2438,28 @@ impl KmsDisplay {
                         return Err(e2);
                     }
                 }
-                Err(AtomicCommitError::Other(e)) => {
-                    if self.bars_overlay.is_some() {
+                Err(AtomicCommitError::Busy(e)) => {
+                    // Transient EBUSY — a previous nonblocking commit or
+                    // a legacy modeset (auto-match at an input-switch
+                    // seam) is still in flight. Drop this frame; the
+                    // next one retries a frame period later. Never tear
+                    // the bars overlay down for EBUSY: the overlay can't
+                    // cause a busy pipeline, and doing so on a one-frame
+                    // collision permanently downgraded the composition
+                    // path mid-session (observed 2026-06-11).
+                    let _ = self.card.destroy_framebuffer(new_fb);
+                    return Err(anyhow::anyhow!(
+                        "display_prime_page_flip_failed: atomic_commit busy (frame dropped): {e}"
+                    ));
+                }
+                Err(AtomicCommitError::Other { msg, bars_included }) => {
+                    // Disable-and-retry only when the failing request
+                    // actually carried the bars plane props — a failing
+                    // bars-LESS commit (e.g. the post-modeset re-arm)
+                    // says nothing about the bars plane.
+                    if bars_included && self.bars_overlay.is_some() {
                         tracing::warn!(
-                            "atomic_commit failed with bars overlay active ({e}) — \
+                            "atomic_commit failed with bars overlay included ({msg}) — \
                              disabling overlay and retrying without bars"
                         );
                         self.disable_bars_overlay();
@@ -2317,7 +2484,7 @@ impl KmsDisplay {
                     } else {
                         let _ = self.card.destroy_framebuffer(new_fb);
                         return Err(anyhow::anyhow!(
-                            "display_prime_page_flip_failed: atomic_commit: {e}"
+                            "display_prime_page_flip_failed: atomic_commit: {msg}"
                         ));
                     }
                 }
@@ -2455,8 +2622,18 @@ impl KmsDisplay {
         // Intel i915 on Arrow Lake rejects a first ALLOW_MODESET commit
         // that simultaneously binds a new overlay plane. Adding the bars
         // on the second commit (after the modeset has landed) works.
+        //
+        // `bars_included` records whether THIS request actually carries
+        // the bars plane props — the success/failure book-keeping below
+        // must key off it, not off `self.bars_overlay.is_some()`. The
+        // earlier revision marked `bars.committed = true` (and logged
+        // "first atomic_commit OK") on the bars-LESS modeset commit
+        // this guard skips, which made the log claim the bars plane
+        // had landed on hosts where every real bars commit was failing.
+        let mut bars_included = false;
         if self.atomic_modeset_done {
         if let Some(bars) = self.bars_overlay.as_mut() {
+            bars_included = true;
             let bp = &bars.plane_props;
             // Reference the BACK buffer — the one the rasteriser just
             // wrote into and that the kernel hasn't been scanning out.
@@ -2547,13 +2724,17 @@ impl KmsDisplay {
                     let blob = self
                         .card
                         .create_property_blob(&self.mode)
-                        .map_err(|e| AtomicCommitError::Other(io_to_string(&e)))?;
+                        .map_err(|e| AtomicCommitError::Other {
+                            msg: io_to_string(&e),
+                            bars_included,
+                        })?;
                     let id = match blob {
                         property::Value::Blob(id) => id,
                         _ => {
-                            return Err(AtomicCommitError::Other(
-                                "create_property_blob returned non-Blob value".into(),
-                            ))
+                            return Err(AtomicCommitError::Other {
+                                msg: "create_property_blob returned non-Blob value".into(),
+                                bars_included,
+                            })
                         }
                     };
                     if let Some(setup) = self.atomic.as_mut() {
@@ -2570,34 +2751,51 @@ impl KmsDisplay {
                 property::Value::CRTC(Some(self.crtc)),
             );
             flags |= AtomicCommitFlags::ALLOW_MODESET;
+            // Re-arm commits run BLOCKING (drop NONBLOCK). They follow
+            // hot on the heels of a legacy `set_crtc` (auto-match at an
+            // input-switch seam, `release_prime_state`), and a
+            // nonblocking ALLOW_MODESET commit racing that in-flight
+            // modeset returns EBUSY — observed killing the bars overlay
+            // one minute into a session (2026-06-11). Blocking here just
+            // moves the wait from the `wait_page_flip` read into the
+            // ioctl itself; the PAGE_FLIP_EVENT is still posted and
+            // consumed by the same wait loop afterwards.
+            flags &= !AtomicCommitFlags::NONBLOCK;
         }
 
         match self.card.atomic_commit(flags, req) {
             Ok(()) => {
                 self.atomic_modeset_done = true;
                 self.hdr_dirty = false;
-                if let Some(bars) = self.bars_overlay.as_mut() {
-                    // First successful commit that programmed the bars
-                    // plane: log so an operator debugging "bars don't show
-                    // on the panel" can confirm the atomic_commit path
-                    // accepted the property set (vs being rejected
-                    // silently — in practice the kernel surfaces EINVAL
-                    // here, but a silent driver-side clip is the next
-                    // failure mode if zpos / pixel-blend-mode discovery
-                    // came up wrong).
-                    if !bars.committed {
-                        tracing::info!(
-                            bars_plane = format!("{:?}", bars.plane),
-                            strip_w = bars.width,
-                            strip_h = bars.height,
-                            strip_top_y = self.height.saturating_sub(bars.height),
-                            zpos_set = bars.zpos.is_some(),
-                            zpos_value = bars.zpos_value,
-                            blend_mode_set = bars.pixel_blend_mode.is_some(),
-                            "audio-bars overlay first atomic_commit OK"
-                        );
+                // Only count this success toward the bars plane when the
+                // request actually carried the bars props — the modeset
+                // commit above skips them, and crediting it here used to
+                // log "first atomic_commit OK" (and set `committed`) on
+                // hosts where every real bars-bearing commit was failing.
+                if bars_included {
+                    if let Some(bars) = self.bars_overlay.as_mut() {
+                        // First successful commit that programmed the bars
+                        // plane: log so an operator debugging "bars don't show
+                        // on the panel" can confirm the atomic_commit path
+                        // accepted the property set (vs being rejected
+                        // silently — in practice the kernel surfaces EINVAL
+                        // here, but a silent driver-side clip is the next
+                        // failure mode if zpos / pixel-blend-mode discovery
+                        // came up wrong).
+                        if !bars.committed {
+                            tracing::info!(
+                                bars_plane = format!("{:?}", bars.plane),
+                                strip_w = bars.width,
+                                strip_h = bars.height,
+                                strip_top_y = self.height.saturating_sub(bars.height),
+                                zpos_set = bars.zpos.is_some(),
+                                zpos_value = bars.zpos_value,
+                                blend_mode_set = bars.pixel_blend_mode.is_some(),
+                                "audio-bars overlay first atomic_commit OK"
+                            );
+                        }
+                        bars.committed = true;
                     }
-                    bars.committed = true;
                 }
                 Ok(())
             }
@@ -2616,21 +2814,30 @@ impl KmsDisplay {
                 // can see whether the bars plane property set caused the
                 // rejection. `bars.committed` flips true on the first
                 // success; while still false, we haven't yet seen the
-                // bars plane land on the panel.
-                if let Some(bars) = self.bars_overlay.as_ref() {
-                    if !bars.committed {
-                        tracing::warn!(
-                            bars_plane = format!("{:?}", bars.plane),
-                            errno = ?raw,
-                            unsupported,
-                            "audio-bars overlay first atomic_commit FAILED — bars plane property set may be wrong for this driver"
-                        );
+                // bars plane land on the panel. Gated on `bars_included`
+                // so a failing bars-less modeset commit doesn't get
+                // mis-blamed on the bars plane.
+                if bars_included {
+                    if let Some(bars) = self.bars_overlay.as_ref() {
+                        if !bars.committed {
+                            tracing::warn!(
+                                bars_plane = format!("{:?}", bars.plane),
+                                errno = ?raw,
+                                unsupported,
+                                "audio-bars overlay first atomic_commit FAILED — bars plane property set may be wrong for this driver"
+                            );
+                        }
                     }
                 }
                 if unsupported {
                     Err(AtomicCommitError::Unsupported(e))
+                } else if raw == Some(libc_ebusy()) {
+                    Err(AtomicCommitError::Busy(io_to_string(&e)))
                 } else {
-                    Err(AtomicCommitError::Other(io_to_string(&e)))
+                    Err(AtomicCommitError::Other {
+                        msg: io_to_string(&e),
+                        bars_included,
+                    })
                 }
             }
         }

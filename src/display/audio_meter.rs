@@ -126,6 +126,77 @@ async fn run_meter(
     Ok(())
 }
 
+/// Reassembles a PSI section that spans multiple TS packets. The PAT /
+/// PMT parsers used to read only the PUSI packet's payload, silently
+/// dropping any section longer than ~180 bytes — real broadcast MPTS
+/// PMTs (10+ ES entries with AC-3 / teletext / subtitle descriptors)
+/// routinely exceed that, leaving the meter with zero audio PIDs and
+/// the operator with a permanently empty bars strip on those inputs.
+///
+/// `feed` returns `Some(section)` (starting at `table_id`) once the
+/// declared `section_length` is satisfied. Single-packet sections
+/// complete on the PUSI packet itself — the common ffmpeg-SPTS case
+/// pays one length compare and no copy beyond the existing slice.
+struct SectionAssembler {
+    buf: Vec<u8>,
+    assembling: bool,
+}
+
+/// PSI sections are capped at 1024 bytes for PAT/PMT (ISO 13818-1
+/// §2.4.4); anything past this is corruption — drop and resync.
+const PSI_SECTION_CAP: usize = 1024;
+
+impl SectionAssembler {
+    fn new() -> Self {
+        Self { buf: Vec::with_capacity(256), assembling: false }
+    }
+
+    fn reset(&mut self) {
+        self.buf.clear();
+        self.assembling = false;
+    }
+
+    /// Feed one TS packet's payload for this PSI PID. `pusi` starts a
+    /// fresh section (honouring the pointer_field); continuation
+    /// packets append. Returns the complete section when its
+    /// `section_length` is satisfied.
+    fn feed(&mut self, pusi: bool, payload: &[u8]) -> Option<&[u8]> {
+        if pusi {
+            if payload.is_empty() {
+                self.reset();
+                return None;
+            }
+            let pointer = payload[0] as usize;
+            if 1 + pointer >= payload.len() {
+                self.reset();
+                return None;
+            }
+            self.buf.clear();
+            self.buf.extend_from_slice(&payload[1 + pointer..]);
+            self.assembling = true;
+        } else {
+            if !self.assembling {
+                return None;
+            }
+            self.buf.extend_from_slice(payload);
+        }
+        if self.buf.len() > PSI_SECTION_CAP {
+            self.reset();
+            return None;
+        }
+        if self.buf.len() < 3 {
+            return None;
+        }
+        let section_length = (((self.buf[1] as usize) & 0x0F) << 8) | self.buf[2] as usize;
+        let total = 3 + section_length;
+        if self.buf.len() >= total {
+            self.assembling = false;
+            return Some(&self.buf[..total]);
+        }
+        None
+    }
+}
+
 struct MeterState {
     target_program: Option<u16>,
     /// Map of program_number → PMT PID, populated from the latest PAT.
@@ -135,6 +206,9 @@ struct MeterState {
     selected_pmt_pid: Option<u16>,
     /// Per-PID metering state (decoder + PES buffer + codec label).
     audio_pids: HashMap<u16, MeterPidState>,
+    /// Cross-packet section reassembly for the PAT / selected PMT.
+    pat_section: SectionAssembler,
+    pmt_section: SectionAssembler,
 }
 
 impl MeterState {
@@ -144,6 +218,8 @@ impl MeterState {
             pmt_pids: HashMap::new(),
             selected_pmt_pid: None,
             audio_pids: HashMap::new(),
+            pat_section: SectionAssembler::new(),
+            pmt_section: SectionAssembler::new(),
         }
     }
 
@@ -152,6 +228,10 @@ impl MeterState {
             pid.pes_buf.clear();
             pid.capturing_pes = false;
         }
+        // A broadcast Lagged dropped packets — any half-assembled PSI
+        // section is no longer continuable.
+        self.pat_section.reset();
+        self.pmt_section.reset();
     }
 
     fn process_packet(
@@ -191,13 +271,17 @@ impl MeterState {
         }
         let payload = &pkt[payload_offset..];
         if pid == PAT_PID {
-            if pusi {
-                self.parse_pat(payload, publisher);
+            if let Some(section) = self.pat_section.feed(pusi, payload) {
+                let section = section.to_vec();
+                self.parse_pat(&section, publisher);
             }
             return;
         }
-        if Some(pid) == self.selected_pmt_pid && pusi {
-            self.parse_pmt(payload, publisher);
+        if Some(pid) == self.selected_pmt_pid {
+            if let Some(section) = self.pmt_section.feed(pusi, payload) {
+                let section = section.to_vec();
+                self.parse_pmt(&section, publisher);
+            }
             return;
         }
         if let Some(pid_state) = self.audio_pids.get_mut(&pid) {
@@ -205,16 +289,10 @@ impl MeterState {
         }
     }
 
-    fn parse_pat(&mut self, payload: &[u8], publisher: &mut MeterPublisher) {
-        if payload.is_empty() {
-            return;
-        }
-        let pointer = payload[0] as usize;
-        if 1 + pointer + 8 > payload.len() {
-            return;
-        }
-        let section = &payload[1 + pointer..];
-        if section.is_empty() || section[0] != 0x00 {
+    /// Parse a complete PAT section (starting at `table_id`), as
+    /// delivered by [`SectionAssembler::feed`].
+    fn parse_pat(&mut self, section: &[u8], publisher: &mut MeterPublisher) {
+        if section.len() < 12 || section[0] != 0x00 {
             return;
         }
         let section_length = (((section[1] as usize) & 0x0F) << 8) | section[2] as usize;
@@ -254,16 +332,10 @@ impl MeterState {
         }
     }
 
-    fn parse_pmt(&mut self, payload: &[u8], publisher: &mut MeterPublisher) {
-        if payload.is_empty() {
-            return;
-        }
-        let pointer = payload[0] as usize;
-        if 1 + pointer + 12 > payload.len() {
-            return;
-        }
-        let section = &payload[1 + pointer..];
-        if section.is_empty() || section[0] != 0x02 {
+    /// Parse a complete PMT section (starting at `table_id`), as
+    /// delivered by [`SectionAssembler::feed`].
+    fn parse_pmt(&mut self, section: &[u8], publisher: &mut MeterPublisher) {
+        if section.len() < 16 || section[0] != 0x02 {
             return;
         }
         let section_length = (((section[1] as usize) & 0x0F) << 8) | section[2] as usize;
@@ -313,9 +385,27 @@ impl MeterState {
             i += 5 + es_info_length;
         }
         for (pid, stype) in discovered.iter() {
-            self.audio_pids
-                .entry(*pid)
-                .or_insert_with(|| MeterPidState::new(*pid, *stype));
+            match self.audio_pids.get(pid) {
+                // Same PID, same codec — keep the warmed-up decoder +
+                // PES assembly state.
+                Some(existing) if existing.stream_type == *stype => {}
+                // New PID, or the SAME PID re-announced with a
+                // DIFFERENT codec. The latter is the normal shape of an
+                // input switch on this edge: remuxed SPTS sources all
+                // put audio on the same PID (ffmpeg defaults to 0x101),
+                // so an AAC → AC-3 switch arrives as "0x101 changed
+                // stream_type". The old `entry().or_insert_with()`
+                // kept the stale decoder, which then scanned the new
+                // codec's bytes for the old codec's sync words forever
+                // — the operator saw the bars freeze empty after every
+                // cross-codec switch (2026-06-11). Replacing the state
+                // drops the stale decoder + PES buffer so the next PES
+                // on the PID relatches cleanly.
+                _ => {
+                    self.audio_pids
+                        .insert(*pid, MeterPidState::new(*pid, *stype));
+                }
+            }
         }
         // Drop the PMT-removed PIDs from the published snapshot
         // explicitly so the operator sees them disappear at the moment
@@ -525,8 +615,13 @@ fn pes_payload_offset(payload: &[u8]) -> usize {
     if payload[0] != 0 || payload[1] != 0 || payload[2] != 1 {
         return 0;
     }
+    // 0xC0–0xDF: MPEG audio stream ids (MP2 / AAC). 0xBD:
+    // private_stream_1 — how DVB / ATSC carry AC-3, E-AC-3, DTS and
+    // LPCM (same PES header layout). Without 0xBD every AC-3 PES
+    // header rode into the ES buffer as leading garbage and the
+    // sync-word splitter had to resync past it on every PES.
     let stream_id = payload[3];
-    if !(0xC0..=0xEF).contains(&stream_id) {
+    if !((0xC0..=0xEF).contains(&stream_id) || stream_id == 0xBD) {
         return 0;
     }
     let hdr_len = payload[8] as usize;
@@ -618,3 +713,108 @@ fn codec_label(stream_type: u8) -> &'static str {
 // Suppress unused-Arc lint when feature compiled as a no-op shim.
 #[allow(dead_code)]
 fn _hold_arc(_: Arc<()>) {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Minimal PMT section: one ES entry, no descriptors, fake CRC.
+    fn pmt_section(stream_type: u8, es_pid: u16) -> Vec<u8> {
+        let es_loop = vec![
+            stream_type,
+            0xE0 | ((es_pid >> 8) as u8 & 0x1F),
+            (es_pid & 0xFF) as u8,
+            0xF0,
+            0x00, // es_info_length = 0
+        ];
+        // section_length = fixed-after-length (9) + es_loop + CRC (4)
+        let section_length = 9 + es_loop.len() + 4;
+        let mut s = vec![
+            0x02,
+            0xB0 | ((section_length >> 8) as u8 & 0x0F),
+            (section_length & 0xFF) as u8,
+            0x00,
+            0x01, // program_number 1
+            0xC1, // version/current_next
+            0x00,
+            0x00, // section / last_section
+            0xE1,
+            0x00, // PCR PID
+            0xF0,
+            0x00, // program_info_length = 0
+        ];
+        s.extend_from_slice(&es_loop);
+        s.extend_from_slice(&[0, 0, 0, 0]); // CRC (not validated)
+        s
+    }
+
+    /// An input switch that re-announces the SAME audio PID with a
+    /// DIFFERENT codec must replace the per-PID state (decoder +
+    /// framing), not keep the stale one — the keep-stale behaviour left
+    /// the bars empty after every cross-codec switch.
+    #[test]
+    fn pmt_codec_change_on_same_pid_replaces_state() {
+        let mut state = MeterState::new(None);
+        let mut publisher = MeterPublisher::new(new_shared_meter());
+        state.parse_pmt(&pmt_section(0x0F, 0x101), &mut publisher);
+        assert_eq!(state.audio_pids.get(&0x101).unwrap().stream_type, 0x0F);
+        // Same codec re-announce: state object is kept.
+        state.parse_pmt(&pmt_section(0x0F, 0x101), &mut publisher);
+        assert_eq!(state.audio_pids.get(&0x101).unwrap().stream_type, 0x0F);
+        // Cross-codec switch (AAC → AC-3) on the same PID: replaced.
+        state.parse_pmt(&pmt_section(0x81, 0x101), &mut publisher);
+        assert_eq!(state.audio_pids.get(&0x101).unwrap().stream_type, 0x81);
+        assert_eq!(state.audio_pids.len(), 1);
+    }
+
+    /// A PSI section spanning multiple TS packets must reassemble; the
+    /// old parse-PUSI-packet-only behaviour dropped every PMT longer
+    /// than one packet (real MPTS muxes), leaving zero audio PIDs.
+    #[test]
+    fn section_assembler_reassembles_multi_packet_sections() {
+        let mut asm = SectionAssembler::new();
+        // 300-byte section_length → 303 total bytes.
+        let mut section = vec![0x02, 0xB1, 0x2C];
+        section.resize(303, 0xAB);
+        // PUSI packet carries pointer_field 0 + first 183 bytes.
+        let mut first = vec![0u8];
+        first.extend_from_slice(&section[..183]);
+        assert!(asm.feed(true, &first).is_none());
+        // Continuation completes it.
+        let got = asm.feed(false, &section[183..]).expect("complete").to_vec();
+        assert_eq!(got.len(), 303);
+        assert_eq!(got[..3], section[..3]);
+
+        // Single-packet section completes immediately (with pointer).
+        let small = pmt_section(0x0F, 0x101);
+        let mut pkt = vec![0u8];
+        pkt.extend_from_slice(&small);
+        let got = asm.feed(true, &pkt).expect("single-packet complete");
+        assert_eq!(got.len(), small.len());
+
+        // Continuation without a PUSI start is ignored.
+        asm.reset();
+        assert!(asm.feed(false, &[0xAB; 100]).is_none());
+    }
+
+    /// AC-3 / E-AC-3 / DTS ride PES private_stream_1 (0xBD); the header
+    /// must be stripped exactly like the 0xC0–0xEF MPEG audio ids.
+    #[test]
+    fn pes_payload_offset_handles_private_stream_1() {
+        // 00 00 01 BD len len flags flags hdr_len(5) [5 hdr bytes] ES…
+        let pes = [
+            0x00, 0x00, 0x01, 0xBD, 0x00, 0x20, 0x80, 0x80, 0x05, 0x21, 0x00, 0x01, 0x00,
+            0x01, 0x0B, 0x77, 0xAA,
+        ];
+        assert_eq!(pes_payload_offset(&pes), 14);
+        assert_eq!(pes[pes_payload_offset(&pes)], 0x0B); // AC-3 sync starts the ES
+        // MPEG audio id still works.
+        let mut mp2 = pes;
+        mp2[3] = 0xC0;
+        assert_eq!(pes_payload_offset(&mp2), 14);
+        // Video-range id is accepted (existing behaviour), unknown ids are not.
+        let mut other = pes;
+        other[3] = 0xBE; // padding_stream
+        assert_eq!(pes_payload_offset(&other), 0);
+    }
+}
