@@ -74,6 +74,19 @@ const EGRESS_FRAME_QUEUE: usize = 4;
 /// sync) to wire rate on Intel iGPU. See
 /// `ScaledVideoEncoder::set_async_depth`.
 const ST2110_INGEST_HW_ASYNC_DEPTH: u32 = 4;
+/// Largest credible step between consecutive video timestamps on the
+/// 90 kHz media clock (500 ms ≈ 12–25 frames — generous headroom for
+/// legitimate gaps from upstream frame drops). Anything larger is a
+/// source discontinuity — file-loop seams, ad-stitch PTS jumps (the S4
+/// test source leaps +1.1–1.3 s every 32.5 s loop) — and must NOT
+/// propagate: receivers key playout and lip-sync off these timestamps
+/// against the separately-continuous audio essence, so a forward leap
+/// parks video "ahead" of audio by the jump size *permanently* (the
+/// HDMI display's audio-master pacer then throttles to a crawl waiting
+/// for audio to catch up). Used by the 2110-20 egress wire-timestamp
+/// generator and the 2110-20/-23 ingest PES PTS accumulator.
+const MAX_PTS_STEP_90K: i64 = 45_000;
+
 /// Source pixel rate (width × height × fps) above which the ingest
 /// encode worker enables HW pipelining. Pipelining costs ~`depth - 1`
 /// frames of emission latency (60 ms at 50p with depth 4), so rasters
@@ -665,11 +678,14 @@ fn encode_worker(
         // frame-index stepping (`pts += 1`) emits PES PTS 1 tick apart,
         // which no downstream decoder can pace. Wrapping diff keeps the
         // timeline monotonic across the u32 RTP wrap (~13.2 h); a
-        // non-positive delta (sender restart) falls back to one nominal
-        // frame duration.
+        // non-positive delta (sender restart) OR a leap beyond
+        // `MAX_PTS_STEP_90K` (sender-side source discontinuity that the
+        // sender failed to conceal) falls back to one nominal frame
+        // duration so our PES PTS stays continuous against the audio
+        // essence.
         if let Some(prev) = last_rtp_ts {
             let delta = frame.pts_90k.wrapping_sub(prev) as i32;
-            if delta > 0 {
+            if delta > 0 && (delta as i64) <= MAX_PTS_STEP_90K {
                 pts += delta as i64;
             } else {
                 pts += (90_000i64 * fps_den.max(1) as i64) / fps_num.max(1) as i64;
@@ -984,6 +1000,15 @@ fn decode_worker(
     // ingress — `media-codecs` decoder always supplies one). Bumped
     // per emitted frame so receivers never see a backwards step.
     let mut synth_pts: i64 = 0;
+    // RFC 4175 wire-timestamp continuity (see `MAX_PTS_STEP_90K`):
+    // accumulate bounded source-PTS deltas instead of emitting source
+    // PES PTS verbatim, so file-loop seams / ad-stitch jumps never
+    // reach the wire. `last_step` remembers the most recent accepted
+    // cadence and stands in for the delta across a discontinuity, so
+    // the guard self-adapts to any frame rate without config plumbing.
+    let mut last_src_pts: Option<i64> = None;
+    let mut wire_pts_acc: i64 = 0;
+    let mut last_step: i64 = 1800; // one frame at 50 fps until measured
 
     // Dedicated pack stage. pgroup packing costs 6–10 ms per 2160p
     // frame, and decode-pull + scale alone consume most of the 20 ms
@@ -1098,6 +1123,32 @@ fn decode_worker(
                 synth_pts += 1;
                 synth_pts
             });
+            // Project the source PTS onto a continuous wire timeline —
+            // pass real cadence through, bridge discontinuities with the
+            // last accepted step (33-bit PES wrap lands here too).
+            let wire_pts = match last_src_pts {
+                None => {
+                    wire_pts_acc = frame_pts;
+                    frame_pts
+                }
+                Some(prev) => {
+                    let delta = frame_pts - prev;
+                    let step = if delta > 0 && delta <= MAX_PTS_STEP_90K {
+                        last_step = delta;
+                        delta
+                    } else {
+                        tracing::debug!(
+                            delta,
+                            bridged_step = last_step,
+                            "ST 2110-20 output: source PTS discontinuity bridged on the wire timeline"
+                        );
+                        last_step
+                    };
+                    wire_pts_acc += step;
+                    wire_pts_acc
+                }
+            };
+            last_src_pts = Some(frame_pts);
             if scaler.is_none() {
                 scaler = Some(
                     match VideoScaler::new_with_dst_format(
@@ -1121,7 +1172,7 @@ fn decode_worker(
             };
             // Hand off to the pack thread (zero-copy — ScaledFrame owns
             // its AVFrame). Drop the frame when packing is behind.
-            let _ = pack_tx.try_send((scaled, frame_pts));
+            let _ = pack_tx.try_send((scaled, wire_pts));
         }
     }
 
