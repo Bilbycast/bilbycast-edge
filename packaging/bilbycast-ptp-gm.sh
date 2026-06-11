@@ -95,6 +95,7 @@ PHC2SYS_LOG="$LOG_DIR/phc2sys.log"
 IFACE_FILE="$RUN_DIR/iface"
 MODE_FILE="$RUN_DIR/mode"
 ROLE_FILE="$RUN_DIR/role"
+NTP_MARKER="$RUN_DIR/ntp-units-stopped"
 
 # Pull defaults from /etc/default/bilbycast-ptp when the systemd unit
 # wraps us. Operator-facing override of every env var.
@@ -113,6 +114,62 @@ need_root() {
 ensure_dirs() {
     install -d -m 0755 "$RUN_DIR" "$LOG_DIR"
     install -d -m 0755 "$(dirname "$STAGED_CONF")"
+}
+
+# ── NTP-daemon handoff for slave mode ─────────────────────────────────
+#
+# In slave-only mode the fabric grandmaster owns time: phc2sys (HW) or
+# ptp4l itself (SW timestamping) disciplines CLOCK_REALTIME. A stock
+# NTP daemon (chrony / chronyd / systemd-timesyncd) also disciplining
+# the clock produces alternating max-rate (~1000 ppm) slews that wreck
+# every wallclock-anchored media path. So on entering slave mode we
+# stop active NTP units (recording which, so leaving slave mode
+# restores exactly what we stopped). Opt out with
+# BILBYCAST_PTP_KEEP_NTP=1 if site policy forbids touching NTP — but
+# then YOU must guarantee single clock ownership some other way
+# (timemaster(8), or chrony configured not to control the clock).
+#
+# Under the production systemd unit the script runs unprivileged
+# (User=bilbycast) and `systemctl stop` will fail — we then fall back
+# to a loud warning. PTP-slaved production sites should disable NTP
+# clock control in provisioning.
+stop_ntp_for_slave() {
+    if [ "${BILBYCAST_PTP_KEEP_NTP:-0}" = "1" ]; then
+        log "BILBYCAST_PTP_KEEP_NTP=1 — leaving NTP daemons running."
+        log "WARNING: ensure only ONE servo adjusts CLOCK_REALTIME (timemaster(8)"
+        log "         or chrony without clock control) or pacing WILL degrade."
+        return 0
+    fi
+    local stopped=""
+    for unit in chrony chronyd systemd-timesyncd; do
+        if systemctl is-active --quiet "$unit" 2>/dev/null; then
+            if systemctl stop "$unit" 2>/dev/null; then
+                log "slave mode: stopped $unit (PTP fabric owns CLOCK_REALTIME now)"
+                stopped="$stopped$unit\n"
+            else
+                log "WARNING: $unit is active but could not be stopped (not root?)."
+                log "         Two servos on one clock WILL fight. Run:"
+                log "             sudo systemctl disable --now $unit"
+            fi
+        fi
+    done
+    if [ -n "$stopped" ]; then
+        printf '%b' "$stopped" > "$NTP_MARKER"
+        log "slave mode: will auto-restore stopped NTP unit(s) on role change / stop"
+    fi
+}
+
+restore_ntp_if_stopped() {
+    [ -f "$NTP_MARKER" ] || return 0
+    while IFS= read -r unit; do
+        [ -n "$unit" ] || continue
+        if systemctl start "$unit" 2>/dev/null; then
+            log "restored NTP unit: $unit"
+        else
+            log "WARNING: failed to restart NTP unit $unit — restart it manually"
+        fi
+    done < "$NTP_MARKER"
+    rm -f "$NTP_MARKER"
 }
 
 iface_has_hw_ptp() {
@@ -372,6 +429,14 @@ cmd_start() {
     fi
     log "timestamping mode: $mode  role: $role  priority1: $priority1  domain: $domain"
 
+    # One clock owner per role (see the phc2sys block below): entering
+    # slave mode hands CLOCK_REALTIME to the PTP fabric (stop NTP);
+    # entering grandmaster mode hands it back to NTP.
+    case "$role" in
+        slave-only)  stop_ntp_for_slave ;;
+        grandmaster) restore_ntp_if_stopped ;;
+    esac
+
     if is_running "$PTP4L_PID"; then
         log "ptp4l already running (pid $(cat "$PTP4L_PID")); restarting"
         stop_pid "$PTP4L_PID" ptp4l
@@ -429,16 +494,8 @@ cmd_start() {
                 nohup "$PHC2SYS_BIN" -c "$iface" -s CLOCK_REALTIME -w -m >>"$PHC2SYS_LOG" 2>&1 &
                 ;;
             slave-only)
-                if systemctl is-active --quiet chronyd 2>/dev/null \
-                   || systemctl is-active --quiet chrony 2>/dev/null; then
-                    log "WARNING: chronyd is active and also disciplines CLOCK_REALTIME."
-                    log "         In slave mode phc2sys syncs the system clock from the"
-                    log "         fabric grandmaster — two servos on one clock WILL fight"
-                    log "         (alternating ~1000 ppm slews; broken PCR/A-V pacing)."
-                    log "         Pick one owner:"
-                    log "           sudo systemctl disable --now chrony     # PTP owns the clock"
-                    log "         or integrate PTP+NTP under one servo with timemaster(8)."
-                fi
+                # NTP daemons were stopped above (stop_ntp_for_slave) —
+                # phc2sys is the sole CLOCK_REALTIME owner from here.
                 log "starting phc2sys (system clock <- fabric PHC): $PHC2SYS_BIN -a -r -m"
                 nohup "$PHC2SYS_BIN" -a -r -m >>"$PHC2SYS_LOG" 2>&1 &
                 ;;
@@ -469,6 +526,7 @@ cmd_stop() {
     need_root
     stop_pid "$PHC2SYS_PID" phc2sys
     stop_pid "$PTP4L_PID"   ptp4l
+    restore_ntp_if_stopped
     rm -f "$IFACE_FILE" "$MODE_FILE" "$ROLE_FILE" "$STAGED_CONF"
     log "stopped"
 }

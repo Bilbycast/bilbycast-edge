@@ -151,7 +151,7 @@ symptom is intermittent and looks like anything but a clock problem.
 | Role | Time authority | phc2sys direction | NTP daemon |
 |---|---|---|---|
 | **Grandmaster** | This host's system clock (NTP-true via chrony) | `phc2sys -c <iface> -s CLOCK_REALTIME -w` — NIC PHC **follows** the system clock; the fabric is served NTP-coherent time | **Keep running.** chrony remains the only `CLOCK_REALTIME` owner; there is nothing to fight. |
-| **Slave only** | The fabric grandmaster | `phc2sys -a -r` — system clock **follows** the fabric PHC | **Must not control the clock.** `sudo systemctl disable --now chrony`, or integrate PTP+NTP under a single servo with `timemaster(8)`. The script logs a loud warning if chrony is active. |
+| **Slave only** | The fabric grandmaster | `phc2sys -a -r` — system clock **follows** the fabric PHC | **Must not control the clock.** The script stops active NTP units (chrony / chronyd / systemd-timesyncd) automatically on entering slave mode and restores them on leaving it; opt out with `BILBYCAST_PTP_KEEP_NTP=1` (then use `timemaster(8)` or chrony without clock control). Under the unprivileged production systemd unit the stop may fail — the script warns loudly; PTP-slaved sites should disable NTP clock control in provisioning. |
 | **Auto** | Resolved at start | Whichever of the two rows the scan resolves to | Per resolved role |
 | **Off** | System clock (NTP) | phc2sys not running | Keep running |
 
