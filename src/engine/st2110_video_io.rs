@@ -55,7 +55,7 @@ use crate::engine::rtmp::ts_mux::TsMuxer;
 use crate::engine::st2110::pacer::{St2110_21Pacer, St2110_21Profile};
 use crate::engine::st2110::redblue::RedBluePair;
 use crate::engine::st2110::video::{
-    pack_yuv422_8bit, partition_frame, unpack_yuv422_10bit,
+    pack_yuv422_8bit, partition_frame,
     unpack_yuv422_8bit, DepacketizeOutcome, PacketizerConfig, PgroupFormat, RawVideoFrame,
     Rfc4175Depacketizer, Rfc4175MultiStreamReassembler, Rfc4175Packetizer,
     St2110_23PartitionMode, VideoField,
