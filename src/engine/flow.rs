@@ -6226,6 +6226,30 @@ fn build_auto_cascade(
     (handle, Some(pll_inner), ptp_handle)
 }
 
+/// Clock domain carried by a PTP-native input (ST 2110 / MXL), if any.
+///
+/// Used by the `Ptp` master-clock arm: the flow-level `clock_domain` is
+/// optional and rarely set — in practice the domain lives on the 2110 /
+/// MXL input config. PTP management responses are domain-tagged, so
+/// polling ptp4l with the wrong domain fails silently; before this
+/// fallback a flow without a flow-level domain spawned the master
+/// clock's reporter on domain 0, which then pre-claimed the
+/// `FlowStatsAccumulator.ptp_state` slot and blocked the input's
+/// correctly-domained reporter — `ptp_state` stayed Unavailable forever.
+fn input_clock_domain(cfg: &crate::config::models::InputConfig) -> Option<u8> {
+    use crate::config::models::InputConfig as I;
+    match cfg {
+        I::St2110_30(c) | I::St2110_31(c) => c.clock_domain,
+        I::St2110_40(c) => c.clock_domain,
+        I::St2110_20(c) => c.clock_domain,
+        I::St2110_23(c) => c.clock_domain,
+        I::MxlVideo(c) => c.clock_domain,
+        I::MxlAudio(c) => c.clock_domain,
+        I::MxlAnc(c) => c.clock_domain,
+        _ => None,
+    }
+}
+
 fn build_master_clock(
     cfg: &crate::config::models::FlowConfig,
     active_input: Option<&crate::config::models::InputConfig>,
@@ -6464,7 +6488,10 @@ fn build_master_clock(
             (h, Some(pll_inner), None)
         }
         MasterClockKind::Ptp => {
-            let domain = cfg.clock_domain.unwrap_or(0);
+            let domain = cfg
+                .clock_domain
+                .or_else(|| active_input.and_then(input_clock_domain))
+                .unwrap_or(0);
             let state = Arc::new(
                 crate::engine::st2110::ptp::PtpStateReporter::spawn(
                     crate::engine::st2110::ptp::PtpReporterConfig {
