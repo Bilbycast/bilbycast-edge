@@ -157,6 +157,24 @@ symptom is intermittent and looks like anything but a clock problem.
 
 Notes:
 
+- **Slave mode adopts the fabric's ABSOLUTE time.** If the fabric
+  grandmaster has no real time source (GPS / NTP), it free-runs from
+  the PTP epoch and the slaved host's wallclock follows it — observed
+  on ms02 2026-06-11: a lab switch GM with no time source stepped the
+  host to January 1970 the moment the discipline chain came up.
+  Phase/frequency lock was perfect; absolute time was garbage. Before
+  selecting Slave-only, confirm the house GM carries true time
+  (ST 2059-2 plants are expected to be TAI-traceable). If it doesn't,
+  either give the GM a time source or run this node as Grandmaster so
+  the fabric inherits NTP-true time from here instead.
+- **`-n <domain>` is mandatory on phc2sys** (the script passes it):
+  phc2sys's and pmc's management clients default to domain 0, and
+  ptp4l silently drops mismatched-domain management messages. On our
+  SMPTE default (127) an un-domained phc2sys loops
+  "Waiting for ptp4l..." forever and pmc reads as "no response" —
+  indistinguishable from the AppArmor denial below, and both were
+  present when this was root-caused. `cmd_status` likewise passes
+  `-d` from the recorded domain.
 - The grandmaster direction is the standard linuxptp recipe for
   "serve system time over PTP" and is safe even when the PTP port has
   no carrier — the system clock is never written by phc2sys.

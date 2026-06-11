@@ -95,6 +95,7 @@ PHC2SYS_LOG="$LOG_DIR/phc2sys.log"
 IFACE_FILE="$RUN_DIR/iface"
 MODE_FILE="$RUN_DIR/mode"
 ROLE_FILE="$RUN_DIR/role"
+DOMAIN_FILE="$RUN_DIR/domain"
 NTP_MARKER="$RUN_DIR/ntp-units-stopped"
 
 # Pull defaults from /etc/default/bilbycast-ptp when the systemd unit
@@ -114,6 +115,72 @@ need_root() {
 ensure_dirs() {
     install -d -m 0755 "$RUN_DIR" "$LOG_DIR"
     install -d -m 0755 "$(dirname "$STAGED_CONF")"
+}
+
+# ── AppArmor local overrides for linuxptp ─────────────────────────────
+#
+# Ubuntu's stock linuxptp profiles (enforce mode) are too tight for a
+# working ptp4l + phc2sys pair:
+#
+#   - usr.sbin.phc2sys only grants the READ-ONLY management socket
+#     (@{run}/ptp4lro). phc2sys -a autoconfiguration needs SUBSCRIBE on
+#     the read-write @{run}/ptp4l — in enforce it loops
+#     "Waiting for ptp4l..." forever (observed: 38 h / 724k log lines
+#     on ms02 before this was root-caused, 2026-06-12).
+#   - usr.sbin.ptp4l cannot write to management clients' filesystem
+#     sockets (@{run}/pmc.*, @{run}/phc2sys.*), so replies are dropped
+#     and `pmc` times out. (bilbycast-edge itself is unaffected — it
+#     uses abstract sockets, which bypass path-based mediation.)
+#
+# The distro profiles `include if exists <local/...>` for exactly this
+# purpose, so we install idempotent local overrides and reload the
+# profiles — which stay in ENFORCE. This replaces the old aa-complain
+# boot-time workaround, which reverted on every reboot / profile reload
+# and failed silently.
+#
+# Upstream quirk: Ubuntu's usr.sbin.phc2sys includes
+# <local/usr.sbin.ptp4l> (copy-paste typo, not its own local file), so
+# the union of rules is written to BOTH local files to be correct
+# whether or not the typo is ever fixed.
+ensure_apparmor_overrides() {
+    local apparmor_dir="/etc/apparmor.d"
+    [ -f "$apparmor_dir/usr.sbin.ptp4l" ] || return 0
+    local marker="# managed by bilbycast-ptp-gm.sh (v1)"
+    local rules
+    rules=$(cat <<'EOF'
+  # Management clients bind datagram sockets under @{run}; ptp4l must
+  # reply to them, and phc2sys must reach the read-write management
+  # socket (SUBSCRIBE for -a autoconfiguration — the stock profile only
+  # grants the read-only @{run}/ptp4lro).
+  @{run}/ptp4l rw,
+  @{run}/ptp4lro rw,
+  @{run}/pmc.[0-9]* rw,
+  @{run}/phc2sys.[0-9]* rw,
+EOF
+)
+    local changed=0 f target
+    for f in usr.sbin.ptp4l usr.sbin.phc2sys; do
+        target="$apparmor_dir/local/$f"
+        if ! grep -qF "$marker" "$target" 2>/dev/null; then
+            if printf '%s\n%s\n' "$marker" "$rules" > "$target" 2>/dev/null; then
+                log "AppArmor: installed local override $target"
+                changed=1
+            else
+                log "WARNING: could not write $target (not root?). In enforce mode"
+                log "         phc2sys cannot reach ptp4l's management socket and"
+                log "         pmc gets no replies. Install the overrides manually."
+                return 0
+            fi
+        fi
+    done
+    if [ "$changed" = "1" ]; then
+        if apparmor_parser -r "$apparmor_dir/usr.sbin.ptp4l" "$apparmor_dir/usr.sbin.phc2sys" 2>/dev/null; then
+            log "AppArmor: reloaded linuxptp profiles (enforce + local overrides)"
+        else
+            log "WARNING: apparmor_parser reload failed — apply manually:"
+            log "    sudo apparmor_parser -r $apparmor_dir/usr.sbin.ptp4l $apparmor_dir/usr.sbin.phc2sys"
+        fi
+    fi
 }
 
 # ── NTP-daemon handoff for slave mode ─────────────────────────────────
@@ -429,6 +496,10 @@ cmd_start() {
     fi
     log "timestamping mode: $mode  role: $role  priority1: $priority1  domain: $domain"
 
+    # Make the distro AppArmor profiles workable BEFORE the daemons
+    # start (idempotent — a no-op once the local overrides exist).
+    ensure_apparmor_overrides
+
     # One clock owner per role (see the phc2sys block below): entering
     # slave mode hands CLOCK_REALTIME to the PTP fabric (stop NTP);
     # entering grandmaster mode hands it back to NTP.
@@ -489,15 +560,22 @@ cmd_start() {
     if [ "$mode" = "hw" ]; then
         case "$role" in
             grandmaster)
+                # -n <domain> is REQUIRED: phc2sys's management client
+                # defaults to domain 0 and ptp4l silently drops
+                # mismatched-domain management messages — without it
+                # phc2sys loops "Waiting for ptp4l..." forever on our
+                # SMPTE domain 127 (same failure shape as the AppArmor
+                # denial above; both were present here).
                 log "starting phc2sys (NIC PHC <- system clock; chrony keeps owning CLOCK_REALTIME):"
-                log "  $PHC2SYS_BIN -c $iface -s CLOCK_REALTIME -w -m"
-                nohup "$PHC2SYS_BIN" -c "$iface" -s CLOCK_REALTIME -w -m >>"$PHC2SYS_LOG" 2>&1 &
+                log "  $PHC2SYS_BIN -c $iface -s CLOCK_REALTIME -w -n $domain -m"
+                nohup "$PHC2SYS_BIN" -c "$iface" -s CLOCK_REALTIME -w -n "$domain" -m >>"$PHC2SYS_LOG" 2>&1 &
                 ;;
             slave-only)
                 # NTP daemons were stopped above (stop_ntp_for_slave) —
                 # phc2sys is the sole CLOCK_REALTIME owner from here.
-                log "starting phc2sys (system clock <- fabric PHC): $PHC2SYS_BIN -a -r -m"
-                nohup "$PHC2SYS_BIN" -a -r -m >>"$PHC2SYS_LOG" 2>&1 &
+                # -n <domain>: see the grandmaster arm.
+                log "starting phc2sys (system clock <- fabric PHC): $PHC2SYS_BIN -a -r -n $domain -m"
+                nohup "$PHC2SYS_BIN" -a -r -n "$domain" -m >>"$PHC2SYS_LOG" 2>&1 &
                 ;;
             *) fail "phc2sys start: unknown role '$role'" ;;
         esac
@@ -506,9 +584,10 @@ cmd_start() {
         is_running "$PHC2SYS_PID" || fail "phc2sys failed to start; see $PHC2SYS_LOG"
     fi
 
-    echo "$iface" > "$IFACE_FILE"
-    echo "$mode"  > "$MODE_FILE"
-    echo "$role"  > "$ROLE_FILE"
+    echo "$iface"  > "$IFACE_FILE"
+    echo "$mode"   > "$MODE_FILE"
+    echo "$role"   > "$ROLE_FILE"
+    echo "$domain" > "$DOMAIN_FILE"
 
     log "started OK (role=$role)"
     echo
@@ -527,7 +606,7 @@ cmd_stop() {
     stop_pid "$PHC2SYS_PID" phc2sys
     stop_pid "$PTP4L_PID"   ptp4l
     restore_ntp_if_stopped
-    rm -f "$IFACE_FILE" "$MODE_FILE" "$ROLE_FILE" "$STAGED_CONF"
+    rm -f "$IFACE_FILE" "$MODE_FILE" "$ROLE_FILE" "$DOMAIN_FILE" "$STAGED_CONF"
     log "stopped"
 }
 
@@ -553,14 +632,19 @@ cmd_status() {
     fi
 
     if is_running "$PTP4L_PID" && [ -x "$PMC_BIN" ]; then
+        # pmc defaults to domain 0; ptp4l silently drops
+        # mismatched-domain management messages, so -d must match the
+        # running daemon or every query reads as "(no response)".
+        local pmc_domain
+        pmc_domain=$(cat "$DOMAIN_FILE" 2>/dev/null || echo 127)
         echo
-        echo "  --- pmc PARENT_DATA_SET (live) ---"
-        "$PMC_BIN" -u -b 1 "GET PARENT_DATA_SET" 2>/dev/null \
+        echo "  --- pmc PARENT_DATA_SET (live, domain $pmc_domain) ---"
+        "$PMC_BIN" -u -b 1 -d "$pmc_domain" "GET PARENT_DATA_SET" 2>/dev/null \
             | grep -E "grandmasterIdentity|grandmasterPriority1|grandmasterClockClass|grandmasterClockQuality" \
             | sed 's/^/    /' \
             || echo "    (no response — ptp4l may still be initialising)"
         echo "  --- pmc TIME_PROPERTIES_DATA_SET ---"
-        "$PMC_BIN" -u -b 1 "GET TIME_PROPERTIES_DATA_SET" 2>/dev/null \
+        "$PMC_BIN" -u -b 1 -d "$pmc_domain" "GET TIME_PROPERTIES_DATA_SET" 2>/dev/null \
             | grep -E "currentUtcOffset|timeSource|ptpTimescale" \
             | sed 's/^/    /' \
             || true
