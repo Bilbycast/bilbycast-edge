@@ -2417,6 +2417,21 @@ fn validate_st2110_video_input(c: &St2110VideoInputConfig) -> Result<()> {
         for s in sources {
             validate_ip_addr(s, &format!("{LABEL} allowed_sources"))?;
         }
+        // The -20 ingest path (recvmmsg dedicated thread; see
+        // engine::st2110::redblue) does not capture sender addresses
+        // and has never enforced this list — unlike the -30/-31/-40
+        // audio/data inputs which do. Warn loudly rather than reject:
+        // rejecting would break configs that have carried the field
+        // harmlessly. Tracked for enforcement via msg_name plumbing.
+        if !sources.is_empty() {
+            tracing::warn!(
+                "SECURITY: {LABEL}: allowed_sources is configured but NOT yet \
+                 enforced on ST 2110-20 video inputs — the ingress source \
+                 allow-list currently applies to ST 2110-30/-31/-40 and \
+                 RTP/rtp_audio inputs only. Use kernel-level SSM \
+                 (source_addr) for source pinning on -20 in the meantime."
+            );
+        }
     }
     if let Some(rate) = c.max_bitrate_mbps {
         if rate <= 0.0 || rate > 100_000.0 {

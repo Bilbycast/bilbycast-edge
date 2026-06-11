@@ -60,8 +60,12 @@ pub enum ActiveLeg {
     None,
 }
 
-/// Number of past sequence numbers to track in the gap-fill bitmap.
-/// Must be a multiple of 64.
+/// Default number of past sequence numbers to track in the gap-fill
+/// bitmap. Sized for TS-class packet rates (≈0.4 s at 2400 pps — see
+/// the module doc). High-rate consumers (ST 2110-20 uncompressed video
+/// at 146–580 kpps per leg, where 1024 slots is only 1.8–7 ms of
+/// wallclock — less than 2022-7 Class A's 10 ms path-differential
+/// budget) construct via [`HitlessMerger::with_window`] instead.
 const REORDER_WINDOW: u16 = 1024;
 
 /// Hitless merger state. Tracks emitted RTP sequence numbers in a sliding
@@ -85,12 +89,34 @@ pub struct HitlessMerger {
     active_leg: ActiveLeg,
     /// Whether we've forwarded at least one packet.
     initialized: bool,
+    /// Gap-fill window size in slots. Power of two in `[64, 16384]` so
+    /// `seq % window` stays consistent across the u16 sequence wrap
+    /// (65536 must be divisible by the window).
+    window: u16,
 }
 
 impl HitlessMerger {
-    /// Create a new merger in the un-initialized state.
+    /// Create a new merger in the un-initialized state with the default
+    /// TS-class window ([`REORDER_WINDOW`]).
     pub fn new() -> Self {
-        let words = (REORDER_WINDOW as usize) / 64;
+        Self::with_window(REORDER_WINDOW)
+    }
+
+    /// Create a merger with an explicit gap-fill window.
+    ///
+    /// `window` must be a power of two in `[64, 16384]`: powers of two
+    /// keep `seq % window` consistent across the u16 wrap, 64 is the
+    /// bitmap word granularity, and 16384 preserves a sane band between
+    /// "behind the window" and "forward stream-reset" (both bounds are
+    /// asserted). Used by ST 2110-20 ingest where 2022-7 Class A allows
+    /// 10 ms of inter-leg path differential — at 580 kpps (2160p50)
+    /// the 1024-slot default covers only ~1.8 ms.
+    pub fn with_window(window: u16) -> Self {
+        assert!(
+            (64..=16384).contains(&window) && window.is_power_of_two(),
+            "HitlessMerger window must be a power of two in [64, 16384], got {window}"
+        );
+        let words = (window as usize) / 64;
         let mut emitted = VecDeque::with_capacity(words);
         for _ in 0..words {
             emitted.push_back(0u64);
@@ -100,13 +126,14 @@ impl HitlessMerger {
             emitted,
             active_leg: ActiveLeg::None,
             initialized: false,
+            window,
         }
     }
 
     /// Test the bitmap for a given seq.
     #[inline]
     fn is_emitted(&self, seq: u16) -> bool {
-        let idx = (seq % REORDER_WINDOW) as usize;
+        let idx = (seq % self.window) as usize;
         let word = idx / 64;
         let bit = idx % 64;
         (self.emitted[word] >> bit) & 1 == 1
@@ -115,7 +142,7 @@ impl HitlessMerger {
     /// Set the bitmap bit for a given seq.
     #[inline]
     fn mark_emitted(&mut self, seq: u16) {
-        let idx = (seq % REORDER_WINDOW) as usize;
+        let idx = (seq % self.window) as usize;
         let word = idx / 64;
         let bit = idx % 64;
         self.emitted[word] |= 1u64 << bit;
@@ -129,7 +156,7 @@ impl HitlessMerger {
     fn clear_slots(&mut self, start: u16, count: u16) {
         let mut s = start;
         for _ in 0..count {
-            let idx = (s % REORDER_WINDOW) as usize;
+            let idx = (s % self.window) as usize;
             let word = idx / 64;
             let bit = idx % 64;
             self.emitted[word] &= !(1u64 << bit);
@@ -168,7 +195,7 @@ impl HitlessMerger {
             // If the gap is larger than the reorder window, treat it as a
             // stream reset (e.g. publisher restarted with a new ISN). Reset
             // the bitmap and re-anchor.
-            if forward as u16 >= REORDER_WINDOW {
+            if forward as u16 >= self.window {
                 for w in self.emitted.iter_mut() {
                     *w = 0;
                 }
@@ -187,7 +214,7 @@ impl HitlessMerger {
             self.mark_emitted(seq);
             self.active_leg = leg;
             Some(leg)
-        } else if backward < REORDER_WINDOW {
+        } else if backward < self.window {
             // ── Within the gap-fill window ──
             //
             // Either a duplicate (bit already set — drop) or a missing
@@ -217,6 +244,56 @@ mod tests {
         let mut merger = HitlessMerger::new();
         let result = merger.try_merge(0, ActiveLeg::Leg1);
         assert_eq!(result, Some(ActiveLeg::Leg1));
+    }
+
+    /// A widened window (ST 2110-20 class) gap-fills a slow leg that
+    /// lags beyond the 1024-slot TS-class default. With the default
+    /// window the same arrival is dropped as too-far-behind — that
+    /// contrast is asserted too, so this test pins the behavioural
+    /// difference the window parameter exists for.
+    #[test]
+    fn test_wide_window_gap_fills_beyond_default_window() {
+        let lag: u16 = 5000; // > 1024 default, < 16384 wide
+
+        let mut wide = HitlessMerger::with_window(16384);
+        assert_eq!(wide.try_merge(1000, ActiveLeg::Leg1), Some(ActiveLeg::Leg1));
+        // Fast leg races ahead; seq 1001 lost on the fast leg.
+        assert_eq!(
+            wide.try_merge(1000u16.wrapping_add(lag), ActiveLeg::Leg1),
+            Some(ActiveLeg::Leg1)
+        );
+        // Slow leg delivers the missing seq from far behind: gap-fill.
+        assert_eq!(wide.try_merge(1001, ActiveLeg::Leg2), Some(ActiveLeg::Leg2));
+        // ...exactly once.
+        assert_eq!(wide.try_merge(1001, ActiveLeg::Leg2), None);
+
+        let mut narrow = HitlessMerger::new();
+        assert_eq!(narrow.try_merge(1000, ActiveLeg::Leg1), Some(ActiveLeg::Leg1));
+        // Beyond the narrow window the same forward jump is a stream
+        // reset (>= window), so the late gap-fill is dropped.
+        assert_eq!(
+            narrow.try_merge(1000u16.wrapping_add(lag), ActiveLeg::Leg1),
+            Some(ActiveLeg::Leg1)
+        );
+        assert_eq!(narrow.try_merge(1001, ActiveLeg::Leg2), None);
+    }
+
+    /// Wide window stays consistent across the u16 sequence wrap
+    /// (window divides 65536, so `seq % window` indexing can't alias).
+    #[test]
+    fn test_wide_window_across_u16_wrap() {
+        let mut merger = HitlessMerger::with_window(16384);
+        assert_eq!(merger.try_merge(65530, ActiveLeg::Leg1), Some(ActiveLeg::Leg1));
+        assert_eq!(merger.try_merge(2, ActiveLeg::Leg1), Some(ActiveLeg::Leg1)); // wrap
+        assert_eq!(merger.try_merge(65531, ActiveLeg::Leg2), Some(ActiveLeg::Leg2)); // fill behind wrap
+        assert_eq!(merger.try_merge(65531, ActiveLeg::Leg2), None); // dup
+        assert_eq!(merger.try_merge(2, ActiveLeg::Leg2), None); // dup of post-wrap
+    }
+
+    #[test]
+    #[should_panic(expected = "power of two")]
+    fn test_window_rejects_non_power_of_two() {
+        let _ = HitlessMerger::with_window(1000);
     }
 
     #[test]

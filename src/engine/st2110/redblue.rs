@@ -332,6 +332,15 @@ impl RedBluePair {
 
 const MAX_DGRAM: usize = 9000 + 216; // jumbo-frame payloads (ST 2110-20 UHD plants run 9000-MTU fabrics; sender validation allows payload_budget ≤ 8952) + RTP/RFC4175 header headroom
 
+/// Gap-fill window for the dedicated-thread (ST 2110-20-class) merger.
+/// The window bounds the inter-leg path differential 2022-7 recovery
+/// can absorb: 16384 slots is 28 ms at 580 kpps (2160p50) and 112 ms
+/// at 146 kpps (1080p50) — comfortably over Class A's 10 ms budget,
+/// where the 1024-slot TS-class default would be 1.8–7 ms. Costs 2 KB
+/// of bitmap. The select-based [`RedBluePair::recv_loop`] (audio / ANC
+/// / non-Linux, ≤ a few kpps) keeps the default.
+const ST2110_MERGE_WINDOW: u16 = 16384;
+
 impl RedBluePair {
     /// Dedicated-thread receive loop (Linux only) — single or dual leg.
     ///
@@ -350,9 +359,13 @@ impl RedBluePair {
     /// duplicate counters (batched per syscall), one "leg up" info
     /// event on each leg's first forwarded packet, and a Warning +
     /// `leg_switches` increment on every active-leg transition. The
-    /// merger's 1024-slot gap-fill window dwarfs the 64-packet batch
-    /// interleave between legs, so cross-leg loss recovery behaves the
-    /// same as the per-packet path.
+    /// merger runs a widened gap-fill window
+    /// ([`ST2110_MERGE_WINDOW`] = 16384 slots vs the TS-class 1024
+    /// default) because the window is the inter-leg **path
+    /// differential** budget: at ST 2110-20 rates 1024 slots is only
+    /// 1.8 ms (2160p50, 580 kpps) to 7 ms (1080p50, 146 kpps) — under
+    /// 2022-7 Class A's 10 ms — while 16384 gives 28–112 ms. The
+    /// 64-packet batch interleave between legs is noise at either size.
     ///
     /// `on_packet` receives a borrowed payload — no per-packet `Bytes`
     /// allocation.
@@ -413,7 +426,7 @@ impl RedBluePair {
                 })
                 .collect();
 
-            let mut merger = HitlessMerger::new();
+            let mut merger = HitlessMerger::with_window(ST2110_MERGE_WINDOW);
             let mut last_active = ActiveLeg::None;
             let mut red_first_seen = false;
             let mut blue_first_seen = false;
