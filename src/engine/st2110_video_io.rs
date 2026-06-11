@@ -55,7 +55,7 @@ use crate::engine::rtmp::ts_mux::TsMuxer;
 use crate::engine::st2110::pacer::{St2110_21Pacer, St2110_21Profile};
 use crate::engine::st2110::redblue::RedBluePair;
 use crate::engine::st2110::video::{
-    pack_yuv422_10bit, pack_yuv422_8bit, partition_frame, unpack_yuv422_10bit,
+    pack_yuv422_8bit, partition_frame, unpack_yuv422_10bit,
     unpack_yuv422_8bit, DepacketizeOutcome, PacketizerConfig, PgroupFormat, RawVideoFrame,
     Rfc4175Depacketizer, Rfc4175MultiStreamReassembler, Rfc4175Packetizer,
     St2110_23PartitionMode, VideoField,
@@ -385,6 +385,40 @@ pub async fn run_st2110_20_input(
         );
     });
 
+    // Single-leg Linux ingest runs on a dedicated recvmmsg thread —
+    // ST 2110-20 packet rates (146 kpps at 1080p50, 580 kpps at 2160p50)
+    // exceed what the per-packet tokio recv loop drains, and the excess
+    // is dropped in-kernel at the socket buffer. Dual-leg (2022-7)
+    // keeps the select-based recv_loop below.
+    #[cfg(target_os = "linux")]
+    if pair.blue.is_none() {
+        let mut depkr =
+            Rfc4175Depacketizer::new(config.width, config.height, fmt, config.payload_type);
+        let stats_rl = stats.clone();
+        let handle = pair.spawn_dedicated_single_leg_loop(
+            cancel.clone(),
+            move |payload: &[u8], _leg, _seq| -> bool {
+                match depkr.feed(payload) {
+                    Ok(DepacketizeOutcome::Frame(frame)) => {
+                        let _ = frame_tx.try_send(frame);
+                    }
+                    Ok(DepacketizeOutcome::Continue) => {}
+                    Ok(DepacketizeOutcome::Dropped { reason, dropped_bytes }) => {
+                        tracing::debug!(reason, dropped_bytes, "ST 2110-20 input dropped partial frame");
+                        stats_rl.input_filtered.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Err(e) => {
+                        tracing::debug!(error=?e, "ST 2110-20 input RFC 4175 parse error");
+                        stats_rl.input_filtered.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+                true
+            },
+        )?;
+        let _ = handle.await;
+        return Ok(());
+    }
+
     // Depacketizer runs on the tokio reactor.
     let mut depkr = Rfc4175Depacketizer::new(config.width, config.height, fmt, config.payload_type);
     let cancel_loop = cancel.clone();
@@ -455,6 +489,7 @@ fn encode_worker(
             }
     }
     let mut pts: i64 = 0;
+    let mut last_rtp_ts: Option<u32> = None;
 
     // Target chroma / bit depth chosen by the operator via video_encode
     // (defaults: 4:2:0 8-bit for parity with pre-Phase-4 behaviour). When
@@ -541,74 +576,23 @@ fn encode_worker(
                 v_bytes = &cr_scratch;
             }
             PgroupFormat::Yuv422_10bit => {
-                let (y10, cb10, cr10) =
-                    unpack_yuv422_10bit(&frame.pixels, frame.width, frame.height);
+                // Fused unpack + convert — one pass from pgroup bytes
+                // straight into the encoder scratch planes. See
+                // unpack_yuv422_10bit_into_planes for why the previous
+                // two-step path was too slow for 2160p50.
                 let cw = w / 2;
                 let bps = if target_10bit { 2 } else { 1 };
-                // Y plane (byte form).
-                y_bytes_scratch.resize(w * h * bps, 0);
-                if target_10bit {
-                    // Little-endian u16 pairs (pix_fmt YUV422P10LE).
-                    for (i, &s) in y10.iter().enumerate() {
-                        let b = s.to_le_bytes();
-                        y_bytes_scratch[i * 2] = b[0];
-                        y_bytes_scratch[i * 2 + 1] = b[1];
-                    }
-                } else {
-                    for (i, &s) in y10.iter().enumerate() {
-                        y_bytes_scratch[i] = (s >> 2) as u8;
-                    }
-                }
-
                 let c_rows_out = if downsample_rows { h / 2 } else { h };
-                cb_scratch.resize(cw * c_rows_out * bps, 0);
-                cr_scratch.resize(cw * c_rows_out * bps, 0);
-
-                match (downsample_rows, target_10bit) {
-                    (false, false) => {
-                        for row in 0..h {
-                            for x in 0..cw {
-                                cb_scratch[row * cw + x] = (cb10[row * cw + x] >> 2) as u8;
-                                cr_scratch[row * cw + x] = (cr10[row * cw + x] >> 2) as u8;
-                            }
-                        }
-                    }
-                    (false, true) => {
-                        for (i, &s) in cb10.iter().enumerate() {
-                            let b = s.to_le_bytes();
-                            cb_scratch[i * 2] = b[0];
-                            cb_scratch[i * 2 + 1] = b[1];
-                        }
-                        for (i, &s) in cr10.iter().enumerate() {
-                            let b = s.to_le_bytes();
-                            cr_scratch[i * 2] = b[0];
-                            cr_scratch[i * 2 + 1] = b[1];
-                        }
-                    }
-                    (true, false) => {
-                        for row in 0..c_rows_out {
-                            for x in 0..cw {
-                                cb_scratch[row * cw + x] =
-                                    (cb10[row * 2 * cw + x] >> 2) as u8;
-                                cr_scratch[row * cw + x] =
-                                    (cr10[row * 2 * cw + x] >> 2) as u8;
-                            }
-                        }
-                    }
-                    (true, true) => {
-                        for row in 0..c_rows_out {
-                            for x in 0..cw {
-                                let s_cb = cb10[row * 2 * cw + x].to_le_bytes();
-                                let s_cr = cr10[row * 2 * cw + x].to_le_bytes();
-                                cb_scratch[(row * cw + x) * 2] = s_cb[0];
-                                cb_scratch[(row * cw + x) * 2 + 1] = s_cb[1];
-                                cr_scratch[(row * cw + x) * 2] = s_cr[0];
-                                cr_scratch[(row * cw + x) * 2 + 1] = s_cr[1];
-                            }
-                        }
-                    }
-                }
-
+                crate::engine::st2110::video::unpack_yuv422_10bit_into_planes(
+                    &frame.pixels,
+                    frame.width,
+                    frame.height,
+                    target_10bit,
+                    downsample_rows,
+                    &mut y_bytes_scratch,
+                    &mut cb_scratch,
+                    &mut cr_scratch,
+                );
                 enc_y_stride = w * bps;
                 enc_c_stride = cw * bps;
                 enc_c_rows = c_rows_out;
@@ -634,6 +618,22 @@ fn encode_worker(
                 0i32,
             ),
         };
+        // Advance the PES timeline by the RTP-timestamp delta (90 kHz,
+        // RFC 4175 §5.1) so encoded PES PTS reflects real sender time —
+        // frame-index stepping (`pts += 1`) emits PES PTS 1 tick apart,
+        // which no downstream decoder can pace. Wrapping diff keeps the
+        // timeline monotonic across the u32 RTP wrap (~13.2 h); a
+        // non-positive delta (sender restart) falls back to one nominal
+        // frame duration.
+        if let Some(prev) = last_rtp_ts {
+            let delta = frame.pts_90k.wrapping_sub(prev) as i32;
+            if delta > 0 {
+                pts += delta as i64;
+            } else {
+                pts += (90_000i64 * fps_den.max(1) as i64) / fps_num.max(1) as i64;
+            }
+        }
+        last_rtp_ts = Some(frame.pts_90k);
         let enc_out = pipeline.encode_raw_planes(
             src_w_hint,
             src_h_hint,
@@ -646,7 +646,6 @@ fn encode_worker(
             enc_c_stride,
             Some(pts),
         );
-        pts += 1;
         let frames = match enc_out {
             Ok(f) => f,
             Err(e) => {
@@ -913,6 +912,54 @@ fn decode_worker(
     // per emitted frame so receivers never see a backwards step.
     let mut synth_pts: i64 = 0;
 
+    // Dedicated pack stage. pgroup packing costs 6–10 ms per 2160p
+    // frame, and decode-pull + scale alone consume most of the 20 ms
+    // frame budget at 2160p50 — serialized they cap egress below the
+    // raster rate. `ScaledFrame` owns its AVFrame and is `Send`, so the
+    // handoff is zero-copy; a single pack thread preserves frame order.
+    // `sync_channel(3)` bounds memory (each entry holds one full
+    // uncompressed frame); when packing falls behind, the frame is
+    // dropped at `try_send` exactly as the old in-line path dropped at
+    // the `frame_tx` queue.
+    let (pack_tx, pack_rx) =
+        std::sync::mpsc::sync_channel::<(video_engine::ScaledFrame, i64)>(3);
+    let pack_fmt = fmt;
+    let pack_handle = std::thread::Builder::new()
+        .name("st2110-pack".into())
+        .spawn(move || {
+            while let Ok((scaled, frame_pts)) = pack_rx.recv() {
+                let pixels = match pack_fmt {
+                    PgroupFormat::Yuv422_8bit => {
+                        let (y, ys) = scaled.plane(0).unwrap();
+                        let (cb, cs) = scaled.plane(1).unwrap();
+                        let (cr, _) = scaled.plane(2).unwrap();
+                        pack_yuv422_8bit(y, ys, cb, cs, cr, cs, width, height)
+                    }
+                    PgroupFormat::Yuv422_10bit => {
+                        // Planes are 16-bit little-endian; pack pgroups
+                        // straight from the byte planes (no intermediate
+                        // u16 temporaries — see pack_yuv422_10bit_le_bytes).
+                        let (y_b, ys) = scaled.plane(0).unwrap();
+                        let (cb_b, cs) = scaled.plane(1).unwrap();
+                        let (cr_b, _) = scaled.plane(2).unwrap();
+                        crate::engine::st2110::video::pack_yuv422_10bit_le_bytes(
+                            y_b, ys, cb_b, cs, cr_b, cs, width, height,
+                        )
+                    }
+                };
+                let raw = RawVideoFrame {
+                    pixels,
+                    width,
+                    height,
+                    format: pack_fmt,
+                    pts_90k: frame_pts as u32,
+                    field: VideoField::Progressive,
+                };
+                let _ = frame_tx.try_send(raw);
+            }
+        })
+        .expect("spawn st2110-pack thread");
+
     while !cancel.is_cancelled() {
         let frame = match nalu_rx.blocking_recv() {
             Some(f) => f,
@@ -920,12 +967,17 @@ fn decode_worker(
         };
         let (nalus, is_h264, pts) = match frame {
             DemuxedFrame::H264 { nalus, pts, .. } => (nalus, true, pts),
+            DemuxedFrame::H265 { nalus, pts, .. } => (nalus, false, pts),
             _ => continue,
         };
         let codec = if is_h264 { VideoCodec::H264 } else { VideoCodec::Hevc };
         if current_codec != Some(codec) {
             current_codec = Some(codec);
-            decoder = Some(match VideoDecoder::open(codec) {
+            // Auto-threaded decode: UHD HEVC at 50 fps exceeds what a
+            // single libavcodec thread sustains. The frames-deep
+            // pipeline delay is a constant offset, absorbed by the
+            // receiver's VRX buffer — throughput is what matters here.
+            decoder = Some(match VideoDecoder::open_threaded(codec) {
                 Ok(d) => d,
                 Err(e) => {
                     tracing::error!(error = %e, "ST 2110-20 output decoder open failed");
@@ -994,45 +1046,14 @@ fn decode_worker(
                     continue;
                 }
             };
-            // Pack planes to pgroup bytes.
-            let pixels = match fmt {
-                PgroupFormat::Yuv422_8bit => {
-                    let (y, ys) = scaled.plane(0).unwrap();
-                    let (cb, cs) = scaled.plane(1).unwrap();
-                    let (cr, _) = scaled.plane(2).unwrap();
-                    pack_yuv422_8bit(y, ys, cb, cs, cr, cs, width, height)
-                }
-                PgroupFormat::Yuv422_10bit => {
-                    // Planes are 16-bit little-endian; convert to u16.
-                    let (y_b, ys) = scaled.plane(0).unwrap();
-                    let (cb_b, cs) = scaled.plane(1).unwrap();
-                    let (cr_b, _) = scaled.plane(2).unwrap();
-                    let y16 = bytes_le_to_u16(y_b, ys, width as usize, height as usize);
-                    let cb16 = bytes_le_to_u16(cb_b, cs, (width / 2) as usize, height as usize);
-                    let cr16 = bytes_le_to_u16(cr_b, cs, (width / 2) as usize, height as usize);
-                    pack_yuv422_10bit(
-                        &y16,
-                        width as usize,
-                        &cb16,
-                        (width / 2) as usize,
-                        &cr16,
-                        (width / 2) as usize,
-                        width,
-                        height,
-                    )
-                }
-            };
-            let raw = RawVideoFrame {
-                pixels,
-                width,
-                height,
-                format: fmt,
-                pts_90k: frame_pts as u32,
-                field: VideoField::Progressive,
-            };
-            let _ = frame_tx.try_send(raw);
+            // Hand off to the pack thread (zero-copy — ScaledFrame owns
+            // its AVFrame). Drop the frame when packing is behind.
+            let _ = pack_tx.try_send((scaled, frame_pts));
         }
     }
+
+    drop(pack_tx);
+    let _ = pack_handle.join();
 }
 
 #[cfg(not(feature = "media-codecs"))]

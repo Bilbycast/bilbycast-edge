@@ -250,6 +250,122 @@ pub fn pack_yuv422_10bit(
     out.freeze()
 }
 
+/// Pack 10-bit 4:2:2 pgroups directly from little-endian 16-bit byte
+/// planes (libswscale `yuv422p10le` layout: 2 bytes per sample, strides
+/// in bytes). Skips the intermediate `Vec<u16>` per plane that
+/// [`pack_yuv422_10bit`] requires — at 2160p50 those three temporaries
+/// cost ~33 MB of allocation plus an extra full pass over every sample
+/// per frame, which alone pushes the egress worker past the 20 ms frame
+/// budget.
+pub fn pack_yuv422_10bit_le_bytes(
+    y: &[u8],
+    y_stride: usize,
+    cb: &[u8],
+    cb_stride: usize,
+    cr: &[u8],
+    cr_stride: usize,
+    width: u32,
+    height: u32,
+) -> Bytes {
+    #[inline(always)]
+    fn s(plane: &[u8], idx: usize) -> u64 {
+        (u16::from_le_bytes([plane[idx * 2], plane[idx * 2 + 1]]) & 0x3FF) as u64
+    }
+    let w = width as usize;
+    let h = height as usize;
+    let cw = w / 2;
+    let row_bytes = (w / 2) * 5;
+    let mut out = BytesMut::with_capacity(row_bytes * h);
+    out.resize(row_bytes * h, 0);
+    for row in 0..h {
+        let y_row = &y[row * y_stride..row * y_stride + w * 2];
+        let cb_row = &cb[row * cb_stride..row * cb_stride + cw * 2];
+        let cr_row = &cr[row * cr_stride..row * cr_stride + cw * 2];
+        let dst = &mut out[row * row_bytes..(row + 1) * row_bytes];
+        for i in 0..cw {
+            // Pack Cb Y0 Cr Y1 (each 10 bits) into 40 bits / 5 bytes, MSB-first.
+            let packed: u64 =
+                (s(cb_row, i) << 30) | (s(y_row, i * 2) << 20) | (s(cr_row, i) << 10) | s(y_row, i * 2 + 1);
+            dst[i * 5] = ((packed >> 32) & 0xFF) as u8;
+            dst[i * 5 + 1] = ((packed >> 24) & 0xFF) as u8;
+            dst[i * 5 + 2] = ((packed >> 16) & 0xFF) as u8;
+            dst[i * 5 + 3] = ((packed >> 8) & 0xFF) as u8;
+            dst[i * 5 + 4] = (packed & 0xFF) as u8;
+        }
+    }
+    out.freeze()
+}
+
+/// Unpack RFC 4175 10-bit 4:2:2 pgroups directly into encoder-ready byte
+/// planes, fusing unpack + bit-depth + chroma-row conversion into one
+/// pass. The two-step path (`unpack_yuv422_10bit` into three `Vec<u16>`
+/// temporaries, then a second conversion pass) costs ~60 MB of extra
+/// allocation + memory traffic per 2160p frame — enough on its own to
+/// push the ST 2110-20 ingress encode worker past the 20 ms frame budget
+/// at 2160p50.
+///
+/// `out_10bit_le` selects 2-byte little-endian samples (low 10 bits —
+/// the `yuv422p10le` / `yuv420p10le` layout) vs 8-bit (`sample >> 2`).
+/// `downsample_chroma_rows` keeps even chroma rows only (4:2:2 → 4:2:0
+/// vertical decimation, matching the encode worker's previous loops).
+#[allow(clippy::too_many_arguments)]
+pub fn unpack_yuv422_10bit_into_planes(
+    pixels: &[u8],
+    width: u32,
+    height: u32,
+    out_10bit_le: bool,
+    downsample_chroma_rows: bool,
+    y_out: &mut Vec<u8>,
+    cb_out: &mut Vec<u8>,
+    cr_out: &mut Vec<u8>,
+) {
+    let w = width as usize;
+    let h = height as usize;
+    let cw = w / 2;
+    let row_bytes = cw * 5;
+    let bps = if out_10bit_le { 2 } else { 1 };
+    let c_rows = if downsample_chroma_rows { h / 2 } else { h };
+    y_out.resize(w * h * bps, 0);
+    cb_out.resize(cw * c_rows * bps, 0);
+    cr_out.resize(cw * c_rows * bps, 0);
+    for row in 0..h {
+        let src = &pixels[row * row_bytes..(row + 1) * row_bytes];
+        let keep_chroma = !downsample_chroma_rows || row % 2 == 0;
+        let c_row = if downsample_chroma_rows { row / 2 } else { row };
+        for i in 0..cw {
+            let p = &src[i * 5..i * 5 + 5];
+            let packed: u64 = ((p[0] as u64) << 32)
+                | ((p[1] as u64) << 24)
+                | ((p[2] as u64) << 16)
+                | ((p[3] as u64) << 8)
+                | (p[4] as u64);
+            let cb = ((packed >> 30) & 0x3FF) as u16;
+            let y0 = ((packed >> 20) & 0x3FF) as u16;
+            let cr = ((packed >> 10) & 0x3FF) as u16;
+            let y1 = (packed & 0x3FF) as u16;
+            if out_10bit_le {
+                let yi = (row * w + i * 2) * 2;
+                y_out[yi..yi + 2].copy_from_slice(&y0.to_le_bytes());
+                y_out[yi + 2..yi + 4].copy_from_slice(&y1.to_le_bytes());
+                if keep_chroma {
+                    let ci = (c_row * cw + i) * 2;
+                    cb_out[ci..ci + 2].copy_from_slice(&cb.to_le_bytes());
+                    cr_out[ci..ci + 2].copy_from_slice(&cr.to_le_bytes());
+                }
+            } else {
+                let yi = row * w + i * 2;
+                y_out[yi] = (y0 >> 2) as u8;
+                y_out[yi + 1] = (y1 >> 2) as u8;
+                if keep_chroma {
+                    let ci = c_row * cw + i;
+                    cb_out[ci] = (cb >> 2) as u8;
+                    cr_out[ci] = (cr >> 2) as u8;
+                }
+            }
+        }
+    }
+}
+
 /// Unpack RFC 4175 pgroup 10-bit 4:2:2 into planar u16 YUV (low 10 bits).
 pub fn unpack_yuv422_10bit(
     pixels: &[u8],
@@ -886,6 +1002,65 @@ impl Rfc4175MultiStreamReassembler {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fused_10bit_unpack_matches_two_step() {
+        let (w, h) = (8u32, 4u32);
+        let (wu, cu) = (w as usize, (w / 2) as usize);
+        let mk = |n: usize, salt: u16| -> Vec<u16> {
+            (0..n).map(|i| ((i as u16).wrapping_mul(617).wrapping_add(salt)) & 0x3FF).collect()
+        };
+        let y = mk(wu * h as usize, 3);
+        let cb = mk(cu * h as usize, 5);
+        let cr = mk(cu * h as usize, 7);
+        let pixels = pack_yuv422_10bit(&y, wu, &cb, cu, &cr, cu, w, h);
+
+        for (out10, downsample) in
+            [(false, false), (false, true), (true, false), (true, true)]
+        {
+            let (mut fy, mut fcb, mut fcr) = (Vec::new(), Vec::new(), Vec::new());
+            unpack_yuv422_10bit_into_planes(
+                &pixels, w, h, out10, downsample, &mut fy, &mut fcb, &mut fcr,
+            );
+            // Reference: full unpack, then the conversion the encode
+            // worker used to do.
+            let (ry, rcb, rcr) = unpack_yuv422_10bit(&pixels, w, h);
+            let rows: Vec<usize> =
+                if downsample { (0..h as usize).step_by(2).collect() } else { (0..h as usize).collect() };
+            let conv = |v: &[u16]| -> Vec<u8> {
+                if out10 {
+                    v.iter().flat_map(|s| s.to_le_bytes()).collect()
+                } else {
+                    v.iter().map(|s| (s >> 2) as u8).collect()
+                }
+            };
+            assert_eq!(fy, conv(&ry), "y out10={out10} ds={downsample}");
+            let pick = |v: &[u16]| -> Vec<u16> {
+                rows.iter().flat_map(|&r| v[r * cu..(r + 1) * cu].to_vec()).collect()
+            };
+            assert_eq!(fcb, conv(&pick(&rcb)), "cb out10={out10} ds={downsample}");
+            assert_eq!(fcr, conv(&pick(&rcr)), "cr out10={out10} ds={downsample}");
+        }
+    }
+
+    #[test]
+    fn pack_10bit_le_bytes_matches_u16_pack() {
+        let (w, h) = (8u32, 4u32);
+        let (wu, cu) = (w as usize, (w / 2) as usize);
+        // Pseudo-random 10-bit samples per plane.
+        let mk = |n: usize, salt: u16| -> Vec<u16> {
+            (0..n).map(|i| ((i as u16).wrapping_mul(797).wrapping_add(salt)) & 0x3FF).collect()
+        };
+        let y = mk(wu * h as usize, 11);
+        let cb = mk(cu * h as usize, 23);
+        let cr = mk(cu * h as usize, 37);
+        let to_le = |v: &[u16]| -> Vec<u8> { v.iter().flat_map(|s| s.to_le_bytes()).collect() };
+        let reference = pack_yuv422_10bit(&y, wu, &cb, cu, &cr, cu, w, h);
+        let direct = pack_yuv422_10bit_le_bytes(
+            &to_le(&y), wu * 2, &to_le(&cb), cu * 2, &to_le(&cr), cu * 2, w, h,
+        );
+        assert_eq!(reference, direct);
+    }
 
     fn sample_frame(w: u32, h: u32, format: PgroupFormat, pts: u32) -> RawVideoFrame {
         let row_bytes = format.bytes_for_pixels(w as usize);

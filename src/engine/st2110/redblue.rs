@@ -330,7 +330,174 @@ impl RedBluePair {
     }
 }
 
-const MAX_DGRAM: usize = 1500 + 28; // jumbo headroom + IP/UDP overhead
+const MAX_DGRAM: usize = 9000 + 216; // jumbo-frame payloads (ST 2110-20 UHD plants run 9000-MTU fabrics; sender validation allows payload_budget ≤ 8952) + RTP/RFC4175 header headroom
+
+impl RedBluePair {
+    /// Single-leg dedicated-thread receive loop (Linux only).
+    ///
+    /// `recvmmsg(2)` batches up to 64 datagrams per syscall on a blocking
+    /// `std` socket owned by a `spawn_blocking` thread. Required for
+    /// ST 2110-20 uncompressed-video packet rates (1080p50 ≈ 146 kpps,
+    /// 2160p50 ≈ 580 kpps) — a per-packet `tokio::select!` recv loop tops
+    /// out well below those rates and the kernel drops the excess at the
+    /// socket buffer. Counter + event semantics mirror [`Self::recv_loop`]
+    /// (received / forwarded / duplicate, "Red leg up" info event on the
+    /// first forwarded packet), with counter updates batched per syscall.
+    ///
+    /// Callers with a Blue (2022-7) leg keep [`Self::recv_loop`] — the
+    /// merge path needs both sockets in one select. `on_packet` receives
+    /// a borrowed payload — no per-packet `Bytes` allocation.
+    #[cfg(target_os = "linux")]
+    pub fn spawn_dedicated_single_leg_loop<F>(
+        self,
+        cancel: CancellationToken,
+        mut on_packet: F,
+    ) -> Result<tokio::task::JoinHandle<()>>
+    where
+        F: FnMut(&[u8], ActiveLeg, u16) -> bool + Send + 'static,
+    {
+        anyhow::ensure!(
+            self.blue.is_none(),
+            "dedicated single-leg loop requires no Blue leg"
+        );
+        let red_std = self
+            .red
+            .into_std()
+            .context("red leg into_std for dedicated ingest loop")?;
+        red_std
+            .set_nonblocking(false)
+            .context("red leg set_nonblocking(false)")?;
+        // recvmmsg's own timeout argument is only checked between
+        // datagrams; SO_RCVTIMEO bounds the initial blocking wait so the
+        // thread can poll `cancel` while the wire is silent.
+        red_std
+            .set_read_timeout(Some(std::time::Duration::from_millis(100)))
+            .context("red leg SO_RCVTIMEO")?;
+
+        let stats = self.stats.clone();
+        let events = self.events.clone();
+        Ok(tokio::task::spawn_blocking(move || {
+            use std::os::fd::AsRawFd;
+            const BATCH: usize = 64;
+            let fd = red_std.as_raw_fd();
+            let mut bufs = vec![[0u8; MAX_DGRAM]; BATCH];
+            let mut iovecs: Vec<libc::iovec> = bufs
+                .iter_mut()
+                .map(|b| libc::iovec {
+                    iov_base: b.as_mut_ptr() as *mut libc::c_void,
+                    iov_len: MAX_DGRAM,
+                })
+                .collect();
+            let mut hdrs: Vec<libc::mmsghdr> = iovecs
+                .iter_mut()
+                .map(|iov| {
+                    let mut h: libc::mmsghdr = unsafe { std::mem::zeroed() };
+                    h.msg_hdr.msg_iov = iov as *mut libc::iovec;
+                    h.msg_hdr.msg_iovlen = 1;
+                    h
+                })
+                .collect();
+
+            let mut merger = HitlessMerger::new();
+            let mut first_seen = false;
+            let event_sender = events.as_ref().map(|c| &c.sender);
+            let event_flow_id = events.as_ref().map(|c| c.flow_id.as_str());
+
+            tracing::info!("ST 2110 dedicated single-leg ingest started (recvmmsg batch {BATCH})");
+            let mut diag_last = std::time::Instant::now();
+            let mut diag_pkts: u64 = 0;
+            let mut diag_batches: u64 = 0;
+            let mut diag_busy = std::time::Duration::ZERO;
+            while !cancel.is_cancelled() {
+                let n = unsafe {
+                    libc::recvmmsg(
+                        fd,
+                        hdrs.as_mut_ptr(),
+                        BATCH as libc::c_uint,
+                        libc::MSG_WAITFORONE,
+                        std::ptr::null_mut(),
+                    )
+                };
+                if n < 0 {
+                    let err = std::io::Error::last_os_error();
+                    match err.kind() {
+                        std::io::ErrorKind::WouldBlock
+                        | std::io::ErrorKind::TimedOut
+                        | std::io::ErrorKind::Interrupted => continue,
+                        _ => {
+                            tracing::warn!("ST 2110 dedicated ingest recvmmsg error: {err}");
+                            continue;
+                        }
+                    }
+                }
+                let n = n as usize;
+                let batch_t0 = std::time::Instant::now();
+                let mut bytes: u64 = 0;
+                let mut forwarded: u64 = 0;
+                let mut dups: u64 = 0;
+                for i in 0..n {
+                    let len = hdrs[i].msg_len as usize;
+                    bytes += len as u64;
+                    let payload = &bufs[i][..len];
+                    let Some(seq) = parse_rtp_seq(payload) else {
+                        continue;
+                    };
+                    if merger.try_merge(seq, ActiveLeg::Leg1).is_some() {
+                        forwarded += 1;
+                        if !first_seen {
+                            first_seen = true;
+                            emit_leg_event(
+                                event_sender,
+                                event_flow_id,
+                                EventSeverity::Info,
+                                "red",
+                                "Red leg up (first packet received)",
+                                false,
+                            );
+                        }
+                        if !on_packet(payload, ActiveLeg::Leg1, seq) {
+                            return;
+                        }
+                    } else {
+                        dups += 1;
+                    }
+                }
+                stats.red.packets_received.fetch_add(n as u64, Ordering::Relaxed);
+                stats.red.bytes_received.fetch_add(bytes, Ordering::Relaxed);
+                if forwarded > 0 {
+                    stats
+                        .red
+                        .packets_forwarded
+                        .fetch_add(forwarded, Ordering::Relaxed);
+                }
+                if dups > 0 {
+                    stats
+                        .red
+                        .packets_duplicate
+                        .fetch_add(dups, Ordering::Relaxed);
+                }
+                diag_pkts += n as u64;
+                diag_batches += 1;
+                diag_busy += batch_t0.elapsed();
+                if diag_last.elapsed() >= std::time::Duration::from_secs(5) {
+                    let el = diag_last.elapsed().as_secs_f64();
+                    tracing::info!(
+                        "st2110 ingest diag: {:.0} pps  {:.0} batch/s  avg_batch={:.1}  consume_busy={:.1}%",
+                        diag_pkts as f64 / el,
+                        diag_batches as f64 / el,
+                        diag_pkts as f64 / diag_batches.max(1) as f64,
+                        100.0 * diag_busy.as_secs_f64() / el,
+                    );
+                    diag_last = std::time::Instant::now();
+                    diag_pkts = 0;
+                    diag_batches = 0;
+                    diag_busy = std::time::Duration::ZERO;
+                }
+            }
+            tracing::debug!("ST 2110 dedicated single-leg ingest loop cancelled");
+        }))
+    }
+}
 
 /// Dispatch a `network_leg` event when an event sender is configured.
 ///

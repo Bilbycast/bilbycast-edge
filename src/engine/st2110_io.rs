@@ -66,7 +66,7 @@ use super::st2110::ptp::{PtpReporterConfig, PtpStateReporter};
 use super::st2110::redblue::RedBluePair;
 use super::st2110::scte104::{SpliceOpcode, is_scte104_packet, parse_scte104};
 
-const MAX_DGRAM: usize = 1500 + 28; // jumbo headroom + IP/UDP overhead
+const MAX_DGRAM: usize = 9000 + 216; // jumbo-frame payloads (ST 2110-20 UHD plants run 9000-MTU fabrics; sender validation allows payload_budget ≤ 8952) + RTP/RFC4175 header headroom
 
 /// Convert a configured `bit_depth` to a [`PcmFormat`]. Defaults to L24 when
 /// the value is unrecognized; validation upstream rejects anything other than
