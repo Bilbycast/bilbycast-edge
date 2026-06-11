@@ -5464,6 +5464,13 @@ pub struct St2110VideoOutputConfig {
     /// Pin this ST 2110-20 video output to a physical NIC. See [`InterfaceBinding`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub interface_binding: Option<InterfaceBinding>,
+    /// HW backend for the egress video decode (the output decodes the
+    /// flow's H.264/HEVC and packetizes raw RFC 4175). Same enum and
+    /// semantics as the transcode/display `hw_decode`: unset = `auto`
+    /// (best available probed backend, VAAPI ≻ NVDEC ≻ QSV ≻ CPU);
+    /// `cpu` forces the auto-threaded software decoder.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hw_decode: Option<HwDecodePreference>,
 }
 
 /// Per-sub-stream bind (ST 2110-23 input). Each sub-stream is a valid -20
@@ -5561,6 +5568,10 @@ pub struct St2110_23OutputConfig {
     /// `interface_addr`; this is the parent fallback. See [`InterfaceBinding`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub interface_binding: Option<InterfaceBinding>,
+    /// HW backend for the egress video decode — same semantics as
+    /// [`St2110VideoOutputConfig::hw_decode`]. Unset = `auto`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hw_decode: Option<HwDecodePreference>,
 }
 
 fn default_st2110_video_pt() -> u8 {

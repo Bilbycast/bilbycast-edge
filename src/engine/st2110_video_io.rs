@@ -843,9 +843,10 @@ pub async fn run_st2110_20_output(
 
     let width = config.width;
     let height = config.height;
+    let hw_decode = config.hw_decode.unwrap_or_default();
     let worker_cancel = cancel.clone();
     let _decode_handle = tokio::task::spawn_blocking(move || {
-        decode_worker(width, height, fmt, nalu_rx, frame_tx, worker_cancel);
+        decode_worker(width, height, fmt, hw_decode, nalu_rx, frame_tx, worker_cancel);
     });
 
     let cfg = PacketizerConfig {
@@ -981,6 +982,7 @@ fn decode_worker(
     width: u32,
     height: u32,
     fmt: PgroupFormat,
+    hw_decode: crate::config::models::HwDecodePreference,
     mut nalu_rx: mpsc::Receiver<DemuxedFrame>,
     frame_tx: mpsc::Sender<RawVideoFrame>,
     cancel: CancellationToken,
@@ -1071,11 +1073,56 @@ fn decode_worker(
         let codec = if is_h264 { VideoCodec::H264 } else { VideoCodec::Hevc };
         if current_codec != Some(codec) {
             current_codec = Some(codec);
-            // Auto-threaded decode: UHD HEVC at 50 fps exceeds what a
-            // single libavcodec thread sustains. The frames-deep
-            // pipeline delay is a constant offset, absorbed by the
-            // receiver's VRX buffer — throughput is what matters here.
-            decoder = Some(match VideoDecoder::open_threaded(codec) {
+            // Resolve the operator's `hw_decode` preference (unset =
+            // Auto: VAAPI ≻ NVDEC ≻ QSV ≻ CPU against the startup probe):
+            // 2160p50 HEVC software decode is the egress throughput
+            // ceiling (~44 fps on a host also running the encode side),
+            // while the iGPU's decode block is otherwise idle. QSV /
+            // NVDEC frames auto-download to sysmem (NV12 / P010) and
+            // feed the existing scaler unchanged; VAAPI hwframes are
+            // downloaded explicitly in the receive loop below. Any
+            // probe / open failure falls back to auto-threaded software
+            // decode — UHD HEVC at 50 fps exceeds a single libavcodec
+            // thread, and the frames-deep pipeline delay either way is
+            // a constant offset absorbed by the receiver's VRX buffer.
+            let backend = match crate::engine::hardware_probe::static_capabilities() {
+                Some(caps) => crate::engine::hardware_probe::resolve_transcode_decoder(
+                    &hw_decode,
+                    Some(&caps),
+                )
+                .map(|r| r.as_backend())
+                .unwrap_or_else(|e| {
+                    tracing::warn!(
+                        ?hw_decode,
+                        error = ?e,
+                        "ST 2110-20 output: hw_decode preference unavailable — using software decode"
+                    );
+                    video_engine::DecoderBackend::Cpu
+                }),
+                None => video_engine::DecoderBackend::Cpu,
+            };
+            let opened = if matches!(backend, video_engine::DecoderBackend::Cpu) {
+                VideoDecoder::open_threaded(codec)
+            } else {
+                match VideoDecoder::open_with_backend(codec, backend) {
+                    Ok(d) => {
+                        tracing::info!(
+                            ?backend,
+                            "ST 2110-20 output: opened HW decoder"
+                        );
+                        Ok(d)
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            ?backend,
+                            error = %e,
+                            "ST 2110-20 output: HW decoder open failed — falling back to threaded software decode"
+                        );
+                        VideoDecoder::open_threaded(codec)
+                    }
+                }
+            };
+            decoder = Some(match opened {
                 Ok(d) => d,
                 Err(e) => {
                     tracing::error!(error = %e, "ST 2110-20 output decoder open failed");
@@ -1109,6 +1156,24 @@ fn decode_worker(
             let dec_frame = match dec.receive_frame() {
                 Ok(f) => f,
                 Err(_) => break,
+            };
+            // VAAPI hwframes live on the GPU — `yuv_planes()` is None and
+            // the scaler can't read them. Download to sysmem (NV12 / P010,
+            // one copy on iGPU shared memory). QSV / NVDEC decoders already
+            // deliver sysmem frames and skip this.
+            let dec_frame = if dec_frame.is_vaapi() {
+                match dec_frame.download_to_sysmem() {
+                    Ok(f) => f,
+                    Err(e) => {
+                        tracing::warn!(
+                            error = ?e,
+                            "ST 2110-20 output: VAAPI hwframe download failed — frame dropped"
+                        );
+                        continue;
+                    }
+                }
+            } else {
+                dec_frame
             };
             let src_w = dec_frame.width();
             let src_h = dec_frame.height();
@@ -1185,6 +1250,7 @@ fn decode_worker(
     _width: u32,
     _height: u32,
     _fmt: PgroupFormat,
+    _hw_decode: crate::config::models::HwDecodePreference,
     _nalu_rx: mpsc::Receiver<DemuxedFrame>,
     _frame_tx: mpsc::Sender<RawVideoFrame>,
     _cancel: CancellationToken,
@@ -1447,9 +1513,10 @@ pub async fn run_st2110_23_output(
     let (nalu_tx, nalu_rx) = mpsc::channel::<DemuxedFrame>(EGRESS_NALUS_QUEUE);
     let width = config.width;
     let height = config.height;
+    let hw_decode = config.hw_decode.unwrap_or_default();
     let worker_cancel = cancel.clone();
     let _decode_handle = tokio::task::spawn_blocking(move || {
-        decode_worker(width, height, fmt, nalu_rx, frame_tx, worker_cancel);
+        decode_worker(width, height, fmt, hw_decode, nalu_rx, frame_tx, worker_cancel);
     });
 
     let sender_cancel = cancel.clone();
