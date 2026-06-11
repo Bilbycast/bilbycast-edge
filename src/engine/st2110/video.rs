@@ -64,6 +64,27 @@ pub enum PgroupFormat {
 }
 
 impl PgroupFormat {
+    /// One pgroup of chroma-neutral black (Y = 16/64, Cb = Cr = 128/512
+    /// in 8/10-bit). Used to pre-fill the depacketizer's frame
+    /// accumulator so regions never covered by a received packet render
+    /// as BLACK. Zero-filled YCbCr (Y=0, Cb=0, Cr=0) converts to a
+    /// saturated GREEN — packet loss used to paint green fields across
+    /// the picture; black is the broadcast-conventional concealment.
+    pub fn neutral_black_pgroup(self) -> &'static [u8] {
+        match self {
+            // Wire order Cb0 Y0 Cr0 Y1 with Y=0x10, Cb=Cr=0x80.
+            PgroupFormat::Yuv422_8bit => &[0x80, 0x10, 0x80, 0x10],
+            // MSB-first bit-packed Cb0(10) Y0(10) Cr0(10) Y1(10) with
+            // Y=0x040, Cb=Cr=0x200:
+            //   b0 = Cb[9:2]            = 0x80
+            //   b1 = Cb[1:0]·Y0[9:4]    = 0x04
+            //   b2 = Y0[3:0]·Cr[9:6]    = 0x08
+            //   b3 = Cr[5:0]·Y1[9:8]    = 0x00
+            //   b4 = Y1[7:0]            = 0x40
+            PgroupFormat::Yuv422_10bit => &[0x80, 0x04, 0x08, 0x00, 0x40],
+        }
+    }
+
     /// Bytes per pgroup.
     pub fn pgroup_bytes(self) -> usize {
         match self {
@@ -639,6 +660,13 @@ pub struct Rfc4175Depacketizer {
     format: PgroupFormat,
     expected_pt: u8,
     row_bytes: usize,
+    // One raster row of chroma-neutral black (see
+    // `PgroupFormat::neutral_black_pgroup`), built once at construction.
+    // Fresh frame accumulators are filled from this so any region a lost
+    // packet never covers renders BLACK — a zero-filled buffer renders
+    // saturated GREEN (Y=0/Cb=0/Cr=0), which is what packet loss used to
+    // paint across the picture.
+    row_template: Vec<u8>,
     // Accumulating frame buffer; `None` until the first packet of a frame arrives.
     acc: Option<AccFrame>,
 }
@@ -650,15 +678,36 @@ struct AccFrame {
     bytes_written: usize,
 }
 
+/// Fresh frame accumulator pre-filled with chroma-neutral black, one
+/// cached row at a time (height memcpys — same order of cost as the
+/// zero-memset it replaces). Free function rather than a method so the
+/// call sites inside `feed`'s `match &mut self.acc` can borrow
+/// `self.row_template` disjointly.
+fn neutral_frame_buf(row_template: &[u8], rows: usize) -> BytesMut {
+    let mut b = BytesMut::with_capacity(row_template.len() * rows);
+    for _ in 0..rows {
+        b.extend_from_slice(row_template);
+    }
+    b
+}
+
 impl Rfc4175Depacketizer {
     pub fn new(width: u32, height: u32, format: PgroupFormat, expected_pt: u8) -> Self {
         let row_bytes = format.bytes_for_pixels(width as usize);
+        // row_bytes is an exact multiple of pgroup_bytes (bytes_for_pixels
+        // rounds through whole pgroups), so the repeat lands exactly.
+        let pat = format.neutral_black_pgroup();
+        let mut row_template = Vec::with_capacity(row_bytes);
+        while row_template.len() < row_bytes {
+            row_template.extend_from_slice(pat);
+        }
         Self {
             width,
             height,
             format,
             expected_pt,
             row_bytes,
+            row_template,
             acc: None,
         }
     }
@@ -737,11 +786,7 @@ impl Rfc4175Depacketizer {
         match &mut self.acc {
             None => {
                 self.acc = Some(AccFrame {
-                    pixels: {
-                        let mut b = BytesMut::with_capacity(self.row_bytes * self.height as usize);
-                        b.resize(self.row_bytes * self.height as usize, 0);
-                        b
-                    },
+                    pixels: neutral_frame_buf(&self.row_template, self.height as usize),
                     pts_90k: ts,
                     field: incoming_field,
                     bytes_written: 0,
@@ -751,12 +796,7 @@ impl Rfc4175Depacketizer {
                 if existing.pts_90k != ts {
                     let bytes = existing.bytes_written;
                     self.acc = Some(AccFrame {
-                        pixels: {
-                            let mut b =
-                                BytesMut::with_capacity(self.row_bytes * self.height as usize);
-                            b.resize(self.row_bytes * self.height as usize, 0);
-                            b
-                        },
+                        pixels: neutral_frame_buf(&self.row_template, self.height as usize),
                         pts_90k: ts,
                         field: incoming_field,
                         bytes_written: 0,
@@ -792,6 +832,18 @@ impl Rfc4175Depacketizer {
 
         if m_bit {
             let done = self.acc.take().unwrap();
+            let expected = self.row_bytes * self.height as usize;
+            if done.bytes_written < expected {
+                // Lost packet(s) mid-frame but the marker survived. The
+                // uncovered regions carry the neutral-black fill; surface
+                // the shortfall for loss diagnosis (kernel drops upstream
+                // show up here before anywhere else).
+                tracing::debug!(
+                    bytes_written = done.bytes_written,
+                    expected,
+                    "RFC4175 depacketizer: frame completed with uncovered regions (packet loss) — holes render black"
+                );
+            }
             let frame = RawVideoFrame {
                 pixels: done.pixels.freeze(),
                 width: self.width,
@@ -1101,6 +1153,58 @@ mod tests {
         assert_eq!(got.height, frame.height);
         assert_eq!(got.pts_90k, frame.pts_90k);
         assert_eq!(got.pixels, frame.pixels);
+    }
+
+    /// Packet loss mid-frame must paint the uncovered region with
+    /// chroma-neutral BLACK, not zeros — zero-filled YCbCr renders as
+    /// saturated green on screen, which is exactly the "green fields"
+    /// artefact seen on the HDMI confidence monitor whenever the 2110-20
+    /// ingest dropped packets.
+    #[test]
+    fn lost_packet_region_fills_neutral_black_not_green() {
+        let frame = sample_frame(64, 4, PgroupFormat::Yuv422_8bit, 777);
+        let mut pkr = Rfc4175Packetizer::new(PacketizerConfig {
+            payload_budget: 200,
+            payload_type: 96,
+            ssrc: 7,
+        });
+        let mut pkts: Vec<Vec<u8>> = Vec::new();
+        pkr.packetize(&frame, |pkt| pkts.push(pkt.to_vec()));
+        assert!(
+            pkts.len() >= 3,
+            "need >=3 packets to lose a middle one, got {}",
+            pkts.len()
+        );
+
+        let mut depkr = Rfc4175Depacketizer::new(64, 4, PgroupFormat::Yuv422_8bit, 96);
+        let lost = 1usize;
+        let mut out_frame: Option<RawVideoFrame> = None;
+        for (i, pkt) in pkts.iter().enumerate() {
+            if i == lost {
+                continue; // the "network" eats the middle packet
+            }
+            if let Ok(DepacketizeOutcome::Frame(f)) = depkr.feed(pkt) {
+                out_frame = Some(f);
+            }
+        }
+        let got = out_frame.expect("marker packet still completes the frame");
+
+        // Every byte must be either the source byte (covered) or the
+        // neutral-black fill (the hole) — and the hole must exist.
+        let pat = PgroupFormat::Yuv422_8bit.neutral_black_pgroup();
+        let mut hole_bytes = 0usize;
+        for (i, (&g, &s)) in got.pixels.iter().zip(frame.pixels.iter()).enumerate() {
+            if g == s {
+                continue;
+            }
+            assert_eq!(
+                g,
+                pat[i % pat.len()],
+                "byte {i} is neither source nor neutral fill"
+            );
+            hole_bytes += 1;
+        }
+        assert!(hole_bytes > 0, "expected a hole from the lost packet");
     }
 
     #[test]
