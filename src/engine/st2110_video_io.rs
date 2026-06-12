@@ -1420,6 +1420,34 @@ fn decode_worker(
                 video_engine::DecoderBackend::Cpu
             } else {
                 match crate::engine::hardware_probe::static_capabilities() {
+                    Some(caps)
+                        if matches!(
+                            hw_decode,
+                            crate::config::models::HwDecodePreference::Auto
+                        ) =>
+                    {
+                        // Auto order for THIS path: NVDEC ≻ QSV ≻ VAAPI
+                        // ≻ CPU — NOT the display path's VAAPI-first.
+                        // The egress packer needs sysmem frames; NVDEC
+                        // and QSV deliver them natively, while VAAPI
+                        // hwframes take an explicit download that
+                        // measured 46 fps at 2160p50 10-bit on Intel
+                        // iGPU (QSV: full 50 on the same host,
+                        // 2026-06-12). VAAPI stays in the chain for
+                        // AMD hosts, where it's the only HW decode.
+                        use crate::config::models::HwDecodePreference as P;
+                        [P::Nvdec, P::Qsv, P::Vaapi]
+                            .iter()
+                            .find_map(|p| {
+                                crate::engine::hardware_probe::resolve_transcode_decoder(
+                                    p,
+                                    Some(&caps),
+                                )
+                                .ok()
+                            })
+                            .map(|r| r.as_backend())
+                            .unwrap_or(video_engine::DecoderBackend::Cpu)
+                    }
                     Some(caps) => crate::engine::hardware_probe::resolve_transcode_decoder(
                         &hw_decode,
                         Some(&caps),

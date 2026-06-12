@@ -819,7 +819,19 @@ impl AudioEncoder {
                 ..
             } => {
                 if !*pts_anchor_set {
-                    *pts_90k = pts;
+                    // Content-true anchoring: the decoded content of
+                    // each output frame starts `codec_delay` samples
+                    // earlier than the input submitted for it (fdk
+                    // AAC-LC ≈ 2600 samples ≈ 54 ms at 48 kHz).
+                    // Anchoring at the raw input PTS labels every frame
+                    // late by exactly that, which a lip-sync measure
+                    // sees as a constant audio-late offset per encode
+                    // hop (the 2026-06-12 2110 chain carried two hops
+                    // ≈ +108 ms of its +160 ms).
+                    let sr = self.params.target_sample_rate.max(1) as u64;
+                    let delay_ticks =
+                        (encoder.codec_delay_samples() as u64) * 90_000 / sr;
+                    *pts_90k = pts.saturating_sub(delay_ticks);
                     *pts_anchor_set = true;
                 }
 
