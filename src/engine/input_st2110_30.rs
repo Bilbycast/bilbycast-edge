@@ -28,6 +28,7 @@ pub fn spawn_st2110_30_input(
     cancel: CancellationToken,
     event_sender: EventSender,
     flow_id: String,
+    media_timeline: Option<Arc<super::st2110::timeline::SharedMediaTimeline>>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         if let Err(e) = run_st2110_audio_input(
@@ -39,6 +40,7 @@ pub fn spawn_st2110_30_input(
             cancel,
             Some(event_sender),
             Some(flow_id),
+            media_timeline,
         )
         .await
         {

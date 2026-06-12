@@ -1028,7 +1028,31 @@ pub struct TranscodeStage {
     encode_buf: BytesMut,
     // TPDF dither RNG.
     rng: TpdfRng,
+    // Source-PES-timeline → output-RTP-timestamp mapping for the
+    // compressed-audio (TS → 2110-30) bridge. `None` until the first
+    // frame arrives with a source PTS; pure-PCM callers never populate
+    // it and keep the free-running RFC 3550 counter.
+    src_ts_map: Option<SrcTsMap>,
 }
+
+/// Continuity-bridged source PES PTS accumulator. Mirrors the video
+/// egress wire-timestamp model in `st2110_video_io` (bounded deltas
+/// pass through; loop seams / ad-stitch jumps are bridged with the last
+/// accepted cadence) so the audio and video essences of one flow keep
+/// mutually-consistent wire timestamps across source discontinuities.
+struct SrcTsMap {
+    /// Last raw 33-bit source PES PTS observed.
+    last_raw_pts: u64,
+    /// Continuity timeline in 90 kHz ticks, starting at the first raw PTS.
+    acc_90k: i64,
+    /// Last accepted inter-frame step (bridges discontinuities).
+    last_step_90k: i64,
+}
+
+/// Largest credible step between consecutive audio source PTS values
+/// (90 kHz, 500 ms) — anything larger is a source discontinuity and is
+/// bridged. Matches `MAX_PTS_STEP_90K` on the video egress side.
+const MAX_SRC_PTS_STEP_90K: i64 = 45_000;
 
 impl TranscodeStage {
     /// Build a new transcode stage.
@@ -1091,6 +1115,7 @@ impl TranscodeStage {
             out_samples_per_packet,
             encode_buf: BytesMut::with_capacity(4096),
             rng: TpdfRng::new(0xCAFE_BABE),
+            src_ts_map: None,
         }
     }
 
@@ -1312,6 +1337,25 @@ impl TranscodeStage {
     /// fully-formed RTP-PCM frames at the configured target rate / depth /
     /// channel count, ready to send to the wire.
     pub fn process_planar(&mut self, planar: &[Vec<f32>], recv_time_us: u64) -> Vec<Bytes> {
+        self.process_planar_with_pts(planar, recv_time_us, None)
+    }
+
+    /// [`process_planar`](Self::process_planar) plus the decoded frame's
+    /// source PES PTS (90 kHz). When supplied, the outgoing RTP
+    /// timestamps are derived from the source PES timeline instead of
+    /// free-running from a random origin — required for ST 2110-30
+    /// outputs so receivers can correlate the audio essence against the
+    /// 2110-20 video essence (whose RFC 4175 timestamps already ride
+    /// the same source timeline). Without this, the audio
+    /// decode→PCM→packetization latency is baked into the wire
+    /// timestamps as a constant audio-late offset (measured +160 ms on
+    /// the 2026-06-12 full-chain validation).
+    pub fn process_planar_with_pts(
+        &mut self,
+        planar: &[Vec<f32>],
+        recv_time_us: u64,
+        src_pts_90k: Option<u64>,
+    ) -> Vec<Bytes> {
         self.stats.inc_input();
 
         if planar.len() != self.input.channels as usize {
@@ -1325,6 +1369,55 @@ impl TranscodeStage {
         if planar.iter().any(|c| c.len() != n_frames) {
             self.stats.inc_dropped();
             return Vec::new();
+        }
+
+        // ── Source-timeline RTP timestamping ─────────────────────────
+        // Continuity-bridge the source PTS, then steer the packetizer's
+        // next timestamp to `acc × out_rate / 90000 − pending`, where
+        // `pending` are already-accumulated samples (earlier media)
+        // still waiting to be drained. In steady state both sides
+        // advance by the same sample count, so the correction settles
+        // to zero and only steps on loss, SRC drift, or seams.
+        if let Some(raw_pts) = src_pts_90k {
+            let map = match self.src_ts_map.as_mut() {
+                Some(m) => {
+                    let mut delta = raw_pts as i64 - m.last_raw_pts as i64;
+                    // 33-bit PES wrap correction.
+                    if delta < -(1i64 << 32) {
+                        delta += 1i64 << 33;
+                    } else if delta > (1i64 << 32) {
+                        delta -= 1i64 << 33;
+                    }
+                    if delta > 0 && delta <= MAX_SRC_PTS_STEP_90K {
+                        m.acc_90k += delta;
+                        m.last_step_90k = delta;
+                    } else {
+                        m.acc_90k += m.last_step_90k;
+                    }
+                    m.last_raw_pts = raw_pts;
+                    m
+                }
+                None => {
+                    let nominal = (n_frames as i64) * 90_000 / (self.input.sample_rate.max(1) as i64);
+                    self.src_ts_map = Some(SrcTsMap {
+                        last_raw_pts: raw_pts,
+                        acc_90k: raw_pts as i64,
+                        last_step_90k: nominal.max(1),
+                    });
+                    self.src_ts_map.as_mut().unwrap()
+                }
+            };
+            let pending = self.out_accum.first().map(|c| c.len()).unwrap_or(0) as i64;
+            let desired = ((map.acc_90k as i128 * self.cfg.out_sample_rate as i128) / 90_000)
+                as i64
+                - pending;
+            let err =
+                (desired as u32).wrapping_sub(self.packetizer.next_timestamp()) as i32;
+            // 1 ms tolerance so SRC rounding never causes flapping.
+            let tolerance = (self.cfg.out_sample_rate / 1_000).max(1);
+            if err.unsigned_abs() > tolerance {
+                self.packetizer.set_next_timestamp(desired as u32);
+            }
         }
 
         // Mirror the existing process() pipeline starting at "apply channel

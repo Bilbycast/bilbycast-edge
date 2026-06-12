@@ -144,6 +144,7 @@ pub async fn run_st2110_audio_input(
     cancel: CancellationToken,
     event_sender: Option<EventSender>,
     flow_id: Option<String>,
+    media_timeline: Option<Arc<super::st2110::timeline::SharedMediaTimeline>>,
 ) -> Result<()> {
     let label = if is_aes3 { "ST2110-31" } else { "ST2110-30" };
 
@@ -220,9 +221,15 @@ pub async fn run_st2110_audio_input(
             label,
             config.pid_overrides.as_ref(),
         ) {
-            Ok(p) => {
-                if p.is_some() {
+            Ok(mut p) => {
+                if let Some(proc_) = p.as_mut() {
                     tracing::info!("{label} input: ingress PCM processor active");
+                    // 2110 flows: anchor the synthesised PES timeline on
+                    // the flow-shared cross-essence timeline so audio
+                    // PES PTS line up with the -20 video essence.
+                    if let Some(tl) = media_timeline.clone() {
+                        proc_.set_media_timeline(tl);
+                    }
                 }
                 p
             }
@@ -1040,7 +1047,7 @@ fn run_compressed_audio_step(
 
     let mut emitted: Vec<Bytes> = Vec::new();
     for frame in frames {
-        let DemuxedFrame::Aac { data, pts: _ } = frame else {
+        let DemuxedFrame::Aac { data, pts } = frame else {
             // H.264 / Opus / other elementary streams: ignored. Audio
             // outputs are AAC-only in Phase A.
             continue;
@@ -1138,7 +1145,11 @@ fn run_compressed_audio_step(
         match dec.decode_frame(&data) {
             Ok(planar) => {
                 decode_stats.inc_output();
-                let pkts = stage.process_planar(&planar, packet.recv_time_us);
+                // Carry the source PES PTS into the packetizer so the
+                // -30 RTP timestamps ride the same source timeline as
+                // the -20 video essence (A/V correlation at receivers).
+                let pkts =
+                    stage.process_planar_with_pts(&planar, packet.recv_time_us, Some(pts));
                 emitted.extend(pkts);
             }
             Err(e) => {
@@ -1287,7 +1298,7 @@ mod tests {
             let stats = flow_stats.clone();
             let cfg = input_config.clone();
             async move {
-                let _ = run_st2110_audio_input(cfg, "test-input".to_string(), false, tx, stats, in_cancel, None, None).await;
+                let _ = run_st2110_audio_input(cfg, "test-input".to_string(), false, tx, stats, in_cancel, None, None, None).await;
             }
         });
 
@@ -1406,7 +1417,7 @@ mod tests {
             let cfg = input_config.clone();
             let c = cancel.child_token();
             async move {
-                let _ = run_st2110_audio_input(cfg, "test-input".to_string(), false, tx, stats, c, None, None).await;
+                let _ = run_st2110_audio_input(cfg, "test-input".to_string(), false, tx, stats, c, None, None, None).await;
             }
         });
 
@@ -1666,7 +1677,7 @@ mod tests {
         let stats_clone = flow_stats.clone();
         let cancel_inner = cancel.child_token();
         let handle = tokio::spawn(async move {
-            let _ = run_st2110_audio_input(cfg, "test-input".to_string(), false, tx, stats_clone, cancel_inner, None, None).await;
+            let _ = run_st2110_audio_input(cfg, "test-input".to_string(), false, tx, stats_clone, cancel_inner, None, None, None).await;
         });
 
         // Give the spawn helper time to bind sockets and publish handles.

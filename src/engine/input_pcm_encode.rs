@@ -190,6 +190,15 @@ struct AacSynth {
     /// Monotonic 90 kHz PTS counter. Advances by `n_frames * 90_000 / sample_rate`
     /// per input PCM packet — mirrors the cadence the transcode stage uses.
     pts_90khz: u64,
+    /// Per-flow cross-essence media-timeline anchor (ST 2110 flows).
+    /// When set, the first packet's RTP timestamp resolves the PES
+    /// timeline origin onto the flow-shared timeline so the audio
+    /// essence's PES PTS line up with the 2110-20 video essence's.
+    /// `None` (legacy / non-2110 callers) keeps the historic
+    /// 0-at-first-packet anchor.
+    media_timeline: Option<Arc<crate::engine::st2110::timeline::SharedMediaTimeline>>,
+    /// `true` once the first packet anchored the PES timeline.
+    anchored: bool,
     /// Cancellation token given to `AudioEncoder::spawn` — dropped with
     /// the processor to clean up any subprocess supervisor (ffmpeg path).
     #[allow(dead_code)]
@@ -309,6 +318,18 @@ impl PcmInputProcessor {
             synth: None,
             stats,
         }))
+    }
+
+    /// Attach the flow-shared cross-essence media timeline (ST 2110
+    /// flows). Must be called before the first packet; affects only the
+    /// AAC synth backend's PES timeline origin.
+    pub fn set_media_timeline(
+        &mut self,
+        timeline: Arc<crate::engine::st2110::timeline::SharedMediaTimeline>,
+    ) {
+        if let Some(SynthBackend::Aac(s)) = self.synth.as_mut() {
+            s.media_timeline = Some(timeline);
+        }
     }
 
     /// Push one input RTP packet through the processor, returning zero or more
@@ -467,6 +488,8 @@ fn build_synth(
         frame_size,
         planar_scratch,
         pts_90khz: 0,
+        media_timeline: None,
+        anchored: false,
         cancel,
     }))
 }
@@ -491,6 +514,24 @@ impl AacSynth {
         let header_len = 12 + cc * 4;
         if data.len() < header_len {
             return Vec::new();
+        }
+
+        // Anchor the synthesised PES timeline on the flow-shared media
+        // timeline (2110 flows). The downstream AAC encoder latches the
+        // FIRST submitted PTS as its framer anchor and self-advances by
+        // sample count, so this one-shot anchor is the entire mapping.
+        // Legacy callers (no timeline) keep the historic 0 origin.
+        if !self.anchored {
+            self.anchored = true;
+            if let Some(tl) = &self.media_timeline {
+                let raw_ts =
+                    u32::from_be_bytes([data[4], data[5], data[6], data[7]]);
+                let rate = self.sample_rate.max(1);
+                let raw_90k = (raw_ts as i128 * 90_000 / rate as i128) as i64;
+                let modulus_90k = 4_294_967_296.0 * 90_000.0 / rate as f64;
+                let pts0 = tl.resolve(raw_90k, modulus_90k, "ST 2110-30 input");
+                self.pts_90khz = pts0.max(0) as u64;
+            }
         }
         let payload = &data[header_len..];
         if payload.is_empty() || payload.len() % self.frame_size != 0 {

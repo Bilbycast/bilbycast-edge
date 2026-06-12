@@ -151,6 +151,92 @@ pub enum DemuxedFrame {
     },
 }
 
+/// ADTS `sampling_frequency_index` → Hz (ISO/IEC 14496-3 Table 1.18).
+/// Indices 13–15 are reserved/escape (the 24-bit explicit-rate escape
+/// never appears in ADTS) — mapped to 0 so callers fall back.
+const ADTS_SAMPLE_RATES: [u32; 16] = [
+    96_000, 88_200, 64_000, 48_000, 44_100, 32_000, 24_000, 22_050, 16_000, 12_000, 11_025,
+    8_000, 7_350, 0, 0, 0,
+];
+
+/// Verdict of [`sniff_annexb_codec`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SniffedVideoCodec {
+    H264,
+    Hevc,
+}
+
+/// Best-effort H.264-vs-HEVC discrimination from one access unit's
+/// Annex-B NAL units, independent of the PMT `stream_type` byte.
+///
+/// The demuxer labels access units purely from the PMT, so a PMT that
+/// lies (assembly config typo, external encoder fault, source codec
+/// change without a PMT update) feeds wrong-codec NALs to downstream
+/// decoders, which fail silently. This sniffer gives consumers an
+/// independent opinion so they can raise an event and recover.
+///
+/// Scoring uses NAL-header shapes that are valid in one codec and
+/// invalid (or spec-reserved) in the other:
+/// - H.264 (1-byte header `f(1) | nal_ref_idc(2) | type(5)`): SPS (7),
+///   PPS (8) and IDR (5) must carry `nal_ref_idc != 0`; the equivalent
+///   byte values land on reserved HEVC types (50–52).
+/// - HEVC (2-byte header `f(1) | type(6) | layer(6) | tid+1(3)`):
+///   VPS/SPS/PPS/AUD (32–35) and IRAP slices (16–21) with a valid
+///   `nuh_temporal_id_plus1 != 0` and `layer_id == 0`; their first
+///   bytes decode as H.264 types that either violate `nal_ref_idc`
+///   constraints (e.g. SEI with ref_idc set) or are rare partitions.
+///
+/// Returns `None` when the AU carries no decisive NALU (pure
+/// inter-frame AUs without parameter sets often don't) — callers
+/// accumulate over multiple AUs.
+pub fn sniff_annexb_codec(nalus: &[Vec<u8>]) -> Option<SniffedVideoCodec> {
+    let mut h264: u32 = 0;
+    let mut hevc: u32 = 0;
+    for nalu in nalus {
+        if nalu.len() < 2 {
+            continue;
+        }
+        let b0 = nalu[0];
+        if b0 & 0x80 != 0 {
+            continue; // forbidden_zero_bit set — corrupt either way
+        }
+        let h264_type = b0 & 0x1F;
+        let h264_ref_idc = (b0 >> 5) & 0x03;
+        let hevc_type = (b0 >> 1) & 0x3F;
+        let hevc_layer_id = ((b0 & 0x01) << 5) | (nalu[1] >> 3);
+        let hevc_tid_ok = nalu[1] & 0x07 != 0;
+
+        if matches!(h264_type, 5 | 7 | 8) && h264_ref_idc != 0 {
+            h264 += 2;
+        }
+        if hevc_tid_ok && hevc_layer_id == 0 {
+            if matches!(hevc_type, 32..=35) {
+                hevc += 2;
+            } else if matches!(hevc_type, 16..=21) {
+                hevc += 1;
+            }
+        }
+    }
+    // Unanimous evidence decides outright; otherwise require a strong
+    // majority. The majority arm matters because one decisive HEVC NAL
+    // aliases an H.264-voting byte: IDR_N_LP (type 20, layer 0) is
+    // first-byte 0x28 = H.264 PPS with nal_ref_idc=1 — so an AUD-less
+    // closed-GOP HEVC IRAP AU ([VPS, SPS, PPS, IDR_N_LP] = hevc 7,
+    // h264 2) would never reach a unanimous verdict and a lying PMT
+    // over that bitstream class would stay undetected forever.
+    if h264 >= 2 && hevc == 0 {
+        Some(SniffedVideoCodec::H264)
+    } else if hevc >= 2 && h264 == 0 {
+        Some(SniffedVideoCodec::Hevc)
+    } else if h264 >= 4 && h264 >= 3 * hevc {
+        Some(SniffedVideoCodec::H264)
+    } else if hevc >= 4 && hevc >= 3 * h264 {
+        Some(SniffedVideoCodec::Hevc)
+    } else {
+        None
+    }
+}
+
 /// Per-PID PES reassembly state.
 struct PesAssembler {
     /// Accumulated PES data.
@@ -985,8 +1071,21 @@ impl TsDemuxer {
             let raw_end = offset + frame_length;
 
             if raw_start < raw_end {
-                // Estimate PTS offset for subsequent frames (~21.3ms per 1024 samples at 48kHz)
-                let pts = base_pts + (frame_index as u64) * 1920; // 1920 = 1024*90000/48000
+                // PTS offset for subsequent frames in the same PES: one
+                // ADTS frame is 1024 samples at the header-signalled
+                // (core) rate — also correct for HE-AAC, whose SBR
+                // doubling scales rate and samples together. The old
+                // hardcoded 1920-tick step (48 kHz only) fed a
+                // sawtooth into consumers that pace off these values
+                // (the ST 2110-30 RTP-timestamp steering) on 44.1/32 kHz
+                // and HE-AAC sources.
+                let adts_rate = ADTS_SAMPLE_RATES
+                    .get(sample_rate_idx as usize)
+                    .copied()
+                    .filter(|&r| r > 0)
+                    .unwrap_or(48_000) as u64;
+                let frame_ticks = 1024 * 90_000 / adts_rate;
+                let pts = base_pts + (frame_index as u64) * frame_ticks;
                 frames.push(DemuxedFrame::Aac {
                     data: data[raw_start..raw_end].to_vec(),
                     pts,
@@ -1103,6 +1202,55 @@ fn parse_pts(data: &[u8]) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// H.264 parameter sets + IDR (SPS 0x67 / PPS 0x68 / IDR 0x65)
+    /// sniff decisively as H.264; HEVC VPS/SPS/PPS (0x40/0x42/0x44 with
+    /// valid tid) sniff as HEVC; non-decisive slices return None.
+    #[test]
+    fn sniff_annexb_codec_discriminates() {
+        let h264_idr_au: Vec<Vec<u8>> = vec![
+            vec![0x67, 0x64, 0x00, 0x28], // SPS
+            vec![0x68, 0xEB, 0xEC, 0xB2], // PPS
+            vec![0x65, 0x88, 0x84, 0x00], // IDR slice
+        ];
+        assert_eq!(sniff_annexb_codec(&h264_idr_au), Some(SniffedVideoCodec::H264));
+
+        let hevc_idr_au: Vec<Vec<u8>> = vec![
+            vec![0x40, 0x01, 0x0C, 0x01], // VPS
+            vec![0x42, 0x01, 0x01, 0x01], // SPS
+            vec![0x44, 0x01, 0xC1, 0x72], // PPS
+            vec![0x26, 0x01, 0xAF, 0x06], // IDR_W_RADL
+        ];
+        assert_eq!(sniff_annexb_codec(&hevc_idr_au), Some(SniffedVideoCodec::Hevc));
+
+        // Pure inter AUs carry no decisive markers.
+        let h264_p_au: Vec<Vec<u8>> = vec![vec![0x41, 0x9A, 0x00, 0x01]];
+        assert_eq!(sniff_annexb_codec(&h264_p_au), None);
+        let hevc_trail_au: Vec<Vec<u8>> = vec![vec![0x02, 0x01, 0xD0, 0x09]];
+        assert_eq!(sniff_annexb_codec(&hevc_trail_au), None);
+
+        // AUD-less closed-GOP HEVC: IDR_N_LP (0x28) aliases an
+        // H.264-PPS-shaped byte, so unanimity is impossible — the
+        // strong-majority arm must still call it HEVC (x265
+        // no-open-gop output through our own TsMuxer looks like this).
+        let hevc_idr_n_lp_au: Vec<Vec<u8>> = vec![
+            vec![0x40, 0x01, 0x0C, 0x01], // VPS
+            vec![0x42, 0x01, 0x01, 0x01], // SPS
+            vec![0x44, 0x01, 0xC1, 0x72], // PPS
+            vec![0x28, 0x01, 0xAF, 0x06], // IDR_N_LP
+        ];
+        assert_eq!(
+            sniff_annexb_codec(&hevc_idr_n_lp_au),
+            Some(SniffedVideoCodec::Hevc)
+        );
+        // An IDR_N_LP slice alone stays ambiguous (it IS ambiguous).
+        let lone_idr_n_lp: Vec<Vec<u8>> = vec![vec![0x28, 0x01, 0xAF, 0x06]];
+        assert_eq!(sniff_annexb_codec(&lone_idr_n_lp), None);
+
+        // Corrupt (forbidden bit) NALUs never vote.
+        let corrupt: Vec<Vec<u8>> = vec![vec![0xE7, 0x64, 0x00, 0x28]];
+        assert_eq!(sniff_annexb_codec(&corrupt), None);
+    }
 
     #[test]
     fn test_annex_b_nalu_extraction() {

@@ -20,6 +20,7 @@ pub fn spawn_st2110_20_output(
     broadcast_tx: &broadcast::Sender<RtpPacket>,
     output_stats: Arc<OutputStatsAccumulator>,
     cancel: CancellationToken,
+    event_sender: Option<crate::manager::events::EventSender>,
 ) -> JoinHandle<()> {
     let rx = broadcast_tx.subscribe();
     let id = config.id.clone();
@@ -31,7 +32,8 @@ pub fn spawn_st2110_20_output(
         ..Default::default()
     });
     tokio::spawn(async move {
-        if let Err(e) = run_st2110_20_output(config, rx, output_stats, cancel).await {
+        if let Err(e) = run_st2110_20_output(config, rx, output_stats, cancel, event_sender).await
+        {
             tracing::error!("ST 2110-20 output '{id}' exited with error: {e}");
         }
     })

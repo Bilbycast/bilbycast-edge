@@ -21,9 +21,13 @@ pub fn spawn_st2110_23_input(
     broadcast_tx: broadcast::Sender<RtpPacket>,
     stats: Arc<FlowStatsAccumulator>,
     cancel: CancellationToken,
+    media_timeline: Option<Arc<super::st2110::timeline::SharedMediaTimeline>>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
-        if let Err(e) = run_st2110_23_input(config, input_id, broadcast_tx, stats, cancel).await {
+        if let Err(e) =
+            run_st2110_23_input(config, input_id, broadcast_tx, stats, cancel, media_timeline)
+                .await
+        {
             tracing::error!("ST 2110-23 input task exited with error: {e}");
         }
     })

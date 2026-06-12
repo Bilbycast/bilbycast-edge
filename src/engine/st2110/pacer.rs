@@ -114,11 +114,35 @@ impl St2110_21Pacer {
     /// `current_tai_ns`. Idempotent; safe to call from a PTP reporter
     /// task on every successful sample. Sets `ptp_anchored = true`.
     pub fn anchor_to_ptp(&self, current_tai_ns: u64) {
-        // Round up to the next frame boundary so the pacer never tries
-        // to emit at a target in the past.
-        let snapped = align_up(current_tai_ns, self.frame_period_ns);
-        self.frame_epoch_tai_ns.store(snapped, Ordering::Relaxed);
+        self.rebase_for_frame(0, current_tai_ns);
         self.ptp_anchored.store(true, Ordering::Relaxed);
+    }
+
+    /// Re-anchor the schedule so that frame `frame_index`'s raster slot
+    /// starts at the next frame boundary at or after `current_tai_ns`.
+    ///
+    /// The constructor sets the epoch at output-task startup, but the
+    /// first decoded frame reaches the paced sender only after demux
+    /// warm-up plus decoder open (HW backends take ~0.5 s + a
+    /// multi-frame pipeline) — without a rebase every frame would be
+    /// permanently behind its slot and the wire ring sheds. The sender
+    /// calls this on the first frame and again whenever lateness
+    /// persists (source stall recovery, source-vs-TAI rate drift).
+    /// Rounding up keeps frame boundaries on the same epoch-aligned
+    /// grid as construction, so a rebase is a phase step of less than
+    /// one frame period for receivers.
+    pub fn rebase_for_frame(&self, frame_index: u64, current_tai_ns: u64) {
+        let snapped = align_up(current_tai_ns, self.frame_period_ns);
+        let epoch =
+            snapped.saturating_sub(frame_index.saturating_mul(self.frame_period_ns));
+        self.frame_epoch_tai_ns.store(epoch, Ordering::Relaxed);
+    }
+
+    /// Current `CLOCK_TAI` time in ns — the clock the schedule lives on.
+    /// Exposed so callers measure frame lateness against the same clock
+    /// the targets are computed from.
+    pub fn now_tai_ns() -> u64 {
+        current_tai_ns()
     }
 
     /// `true` once a PTP sample has been used to anchor the frame
@@ -257,6 +281,35 @@ mod tests {
         let min = *deltas.iter().min().unwrap();
         let max = *deltas.iter().max().unwrap();
         assert!(max - min <= 1, "uneven pacing: min={min} max={max}");
+    }
+
+    /// `rebase_for_frame` puts the given frame's slot at the next frame
+    /// boundary ≥ now, on the same boundary grid as construction, and
+    /// is exact for non-zero frame indices.
+    #[test]
+    fn rebase_for_frame_realigns_schedule() {
+        let p = St2110_21Pacer::new(20_000_000, 4320, St2110_21Profile::NarrowLinear);
+        let now = 1_700_000_000_123_456_789u64;
+        p.rebase_for_frame(250, now);
+        let slot = p.target_for_packet(250, 0);
+        assert!(slot >= now, "rebased slot must not be in the past");
+        assert!(slot - now < 20_000_000, "rebased slot within one period of now");
+        assert_eq!(slot % 20_000_000, 0, "slot stays on the frame-boundary grid");
+        // The next frame advances by exactly one period.
+        assert_eq!(p.target_for_packet(251, 0), slot + 20_000_000);
+    }
+
+    /// `anchor_to_ptp` is `rebase_for_frame(0, ..)` plus the anchored flag.
+    #[test]
+    fn anchor_to_ptp_matches_rebase_zero() {
+        let a = St2110_21Pacer::new(20_000_000, 4320, St2110_21Profile::NarrowLinear);
+        let b = St2110_21Pacer::new(20_000_000, 4320, St2110_21Profile::NarrowLinear);
+        let now = 1_700_000_000_000_000_001u64;
+        a.anchor_to_ptp(now);
+        b.rebase_for_frame(0, now);
+        assert_eq!(a.target_for_packet(0, 0), b.target_for_packet(0, 0));
+        assert!(a.is_ptp_anchored());
+        assert!(!b.is_ptp_anchored());
     }
 
     /// `align_up` rounds correctly and is idempotent on aligned input.

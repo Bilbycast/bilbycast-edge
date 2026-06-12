@@ -40,6 +40,9 @@ pub fn spawn_st2110_31_input(
             cancel,
             Some(event_sender),
             Some(flow_id),
+            // -31 is AES3-transparent (s302m synth) — the AAC-synth
+            // timeline anchor doesn't apply.
+            None,
         )
         .await
         {

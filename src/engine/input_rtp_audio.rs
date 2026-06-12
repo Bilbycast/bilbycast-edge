@@ -72,6 +72,9 @@ pub fn spawn_rtp_audio_input(
             cancel,
             event_sender,
             flow_id,
+            // `rtp_audio` is the no-PTP / non-2110 variant — keep the
+            // historic 0-at-first-packet PES origin.
+            None,
         )
         .await
         {

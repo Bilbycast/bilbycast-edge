@@ -106,6 +106,174 @@ fn pgroup_for(fmt: St2110VideoPixelFormat) -> PgroupFormat {
     }
 }
 
+/// A frame is "late" when its raster slot start is more than one full
+/// frame period in the past at packetization time; this many consecutive
+/// non-improving late frames trigger a schedule rebase. One-off lateness
+/// (scheduler blip, B-frame reorder burst) rides through without touching
+/// the anchor, and a DRAINING backlog (delivery clump — lateness shrinks
+/// by ~a period per frame as the emitter catches up) resets the count so
+/// it recovers losslessly instead of ratcheting the schedule later.
+const RASTER_REANCHOR_CONSECUTIVE_LATE: u32 = 3;
+/// Non-improving lateness (or, in `pace_to_schedule`, earliness) beyond
+/// this many frame periods is a step, not drift — source stall recovery
+/// or a TAI clock step — and rebases on the second consecutive
+/// observation instead of waiting out the full consecutive-late count.
+const RASTER_REANCHOR_IMMEDIATE_PERIODS: u64 = 4;
+
+/// Heals the ST 2110-21 raster schedule when decoded frames run
+/// persistently behind their slots.
+///
+/// The pacer's epoch is set at output-task startup, but the first frame
+/// reaches the sender only after demux warm-up plus decoder open — ~ms
+/// for threaded software decode, ~0.5 s plus a multi-frame pipeline for
+/// the HW backends (`hw_decode` auto/vaapi/qsv/nvdec). `frame_index` is
+/// an arrival count, so without a rebase every frame's target stays that
+/// far in the past forever: the emitter loses all pacing slack and the
+/// wire ring pins full and sheds (the 2026-06-12 defect — ~69 % shed at
+/// 1080p50 on both VAAPI and QSV). Anchoring at the first frame absorbs
+/// the open latency; the persistent-lateness rebase covers source stalls
+/// and source-vs-TAI rate drift afterwards.
+struct RasterScheduleGuard {
+    anchored: bool,
+    consecutive_late: u32,
+    prev_late_ns: u64,
+    rebases: u64,
+    last_log_ns: u64,
+}
+
+impl RasterScheduleGuard {
+    fn new() -> Self {
+        Self {
+            anchored: false,
+            consecutive_late: 0,
+            prev_late_ns: 0,
+            rebases: 0,
+            last_log_ns: 0,
+        }
+    }
+
+    /// Called once per decoded frame, before packetization.
+    fn observe_frame(&mut self, pacer: &St2110_21Pacer, frame_index: u64, id: &str) {
+        let now = St2110_21Pacer::now_tai_ns();
+        let period = pacer.frame_period_ns();
+        if !self.anchored {
+            pacer.rebase_for_frame(frame_index, now);
+            self.anchored = true;
+            tracing::info!(
+                "ST 2110 output '{id}': raster schedule anchored at first decoded frame"
+            );
+            return;
+        }
+        let frame_start = pacer.target_for_packet(frame_index, 0);
+        let late_ns = now.saturating_sub(frame_start);
+        let improving = late_ns.saturating_add(period / 2) < self.prev_late_ns;
+        self.prev_late_ns = late_ns;
+        if late_ns <= period || improving {
+            // On time, or a backlog actively draining through the
+            // emitter's send-ASAP catch-up — leave the schedule alone
+            // so the clump recovers without adding latency.
+            self.consecutive_late = 0;
+            return;
+        }
+        self.consecutive_late += 1;
+        let immediate = late_ns > RASTER_REANCHOR_IMMEDIATE_PERIODS.saturating_mul(period)
+            && self.consecutive_late >= 2;
+        if immediate || self.consecutive_late >= RASTER_REANCHOR_CONSECUTIVE_LATE {
+            pacer.rebase_for_frame(frame_index, now);
+            self.rebases += 1;
+            self.consecutive_late = 0;
+            // Rate-limited: a config-vs-source frame-rate mismatch makes
+            // every frame late and would otherwise log per rebase.
+            if now.saturating_sub(self.last_log_ns) >= 1_000_000_000 {
+                tracing::info!(
+                    late_ms = late_ns / 1_000_000,
+                    rebases = self.rebases,
+                    "ST 2110 output '{id}': raster schedule re-anchored — frames persistently behind their slots"
+                );
+                self.last_log_ns = now;
+            }
+        }
+    }
+}
+
+/// Producer pacing: hold packetization until at most one frame period
+/// before the frame's raster slot.
+///
+/// The wire ring holds < 3 frames at HD payload budgets, while the
+/// decode side can burst several frames at once (HW decoders drain
+/// their queued input far faster than realtime). Pushing a multi-frame
+/// burst into the ring at once tail-drops mid-frame — RFC 4175
+/// receivers then discard the whole partial frame. Sleeping here keeps
+/// ring occupancy bounded by construction and lets the bounded
+/// upstream channels (pack(3) + in-flight + frame(4) ≈ 9 decoded
+/// frames; the decoder drains the 16-AU NALU queue immediately once
+/// open, so it doesn't add decoded-frame cushion) absorb bursts up to
+/// that depth losslessly; beyond it, whole frames drop at the
+/// upstream `try_send` points (clean frame skips, logged rate-limited
+/// in `decode_worker`).
+///
+/// A frame more than `RASTER_REANCHOR_IMMEDIATE_PERIODS` early can only
+/// mean the schedule stepped ahead of the clock (backward TAI step) —
+/// rebase instead of stalling the output for the step size. Returns
+/// `true` when that backward rebase happened so the caller can reset
+/// its monotonic target floor (otherwise the floor would pin every
+/// post-step target to the stale pre-step future and stall the wire
+/// for the full step anyway).
+#[must_use]
+fn pace_to_schedule(
+    pacer: &St2110_21Pacer,
+    frame_index: u64,
+    cancel: &CancellationToken,
+    id: &str,
+) -> bool {
+    let period = pacer.frame_period_ns();
+    loop {
+        if cancel.is_cancelled() {
+            return false;
+        }
+        let now = St2110_21Pacer::now_tai_ns();
+        let frame_start = pacer.target_for_packet(frame_index, 0);
+        let lead = frame_start.saturating_sub(now);
+        if lead <= period {
+            return false;
+        }
+        if lead > RASTER_REANCHOR_IMMEDIATE_PERIODS.saturating_mul(period) {
+            tracing::warn!(
+                lead_ms = lead / 1_000_000,
+                "ST 2110 output '{id}': raster schedule ahead of clock — re-anchoring (TAI step?)"
+            );
+            pacer.rebase_for_frame(frame_index, now);
+            return true;
+        }
+        let sleep_ns = (lead - period).min(50_000_000);
+        std::thread::sleep(std::time::Duration::from_nanos(sleep_ns));
+    }
+}
+
+/// Hold the sender until the wire ring has room for this frame's
+/// packets (or ~250 ms passes — emitter wedged, fall back to the
+/// drop-at-try_send behaviour). A late backlog (delivery clump, stall
+/// recovery) is drained by the emitter at wire speed; without this
+/// wait, packetizing the backlog straight into the < 3-frame-deep ring
+/// tail-drops mid-frame and RFC 4175 receivers discard every partial
+/// frame. The bounded upstream channels absorb the held frames.
+fn wait_for_ring_capacity(
+    depth: &std::sync::atomic::AtomicUsize,
+    pkts_needed: usize,
+    cancel: &CancellationToken,
+) {
+    use crate::engine::wire_emit::WIRE_CHANNEL_CAP;
+    let free_needed = pkts_needed.saturating_add(64).min(WIRE_CHANNEL_CAP / 2);
+    let mut waited_ms = 0u32;
+    while depth.load(Ordering::Relaxed) > WIRE_CHANNEL_CAP.saturating_sub(free_needed) {
+        if cancel.is_cancelled() || waited_ms >= 250 {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+        waited_ms += 1;
+    }
+}
+
 /// Compute the ST 2110-21 pacer parameters for a -20 output and
 /// return a fresh pacer. Frame period derives from
 /// `frame_rate_num / frame_rate_den`; packets-per-frame is
@@ -157,23 +325,36 @@ fn run_paced_sender(
     wire_blue: Option<crate::engine::wire_emit::WireTxHandle>,
     stats: Arc<OutputStatsAccumulator>,
 ) {
-    let _ = id;
     let mut frame_index: u64 = 0;
+    let mut guard = RasterScheduleGuard::new();
+    // Per-socket monotonic floor on target tx times. The schedule is
+    // monotonic by construction except across a backward rebase (TAI
+    // step recovery) — clamping keeps the kernel etf qdisc from
+    // rejecting reordered launch times on the SO_TXTIME tier.
+    let mut last_target_ns: u64 = 0;
     while !cancel.is_cancelled() {
         let frame = match frame_rx.blocking_recv() {
             Some(f) => f,
             None => break,
         };
+        guard.observe_frame(&pacer, frame_index, &id);
+        if pace_to_schedule(&pacer, frame_index, &cancel, &id) {
+            // Backward rebase (TAI step) — drop the monotonic floor or
+            // every post-step target stays pinned to the stale future.
+            last_target_ns = 0;
+        }
         let mut out_pkts: Vec<Bytes> = Vec::with_capacity(16);
         packetizer.packetize(&frame, |pkt| out_pkts.push(pkt));
         let total_pkts = out_pkts.len() as u64;
         let mut total_bytes = 0u64;
         let pkts_in_frame = pacer.packets_per_frame();
+        wait_for_ring_capacity(&wire_red.depth_handle(), out_pkts.len(), &cancel);
         let recv_us = crate::util::time::now_us();
         for (idx, pkt) in out_pkts.iter().enumerate() {
             total_bytes += pkt.len() as u64;
             let pkt_idx = (idx as u32).min(pkts_in_frame.saturating_sub(1));
-            let target_ns = pacer.target_for_packet(frame_index, pkt_idx);
+            let target_ns = pacer.target_for_packet(frame_index, pkt_idx).max(last_target_ns);
+            last_target_ns = target_ns;
             // Both legs receive the same Bytes (refcount bump only).
             let dg_red = WireDatagram {
                 bytes: pkt.clone(),
@@ -368,6 +549,7 @@ pub async fn run_st2110_20_input(
     broadcast_tx: broadcast::Sender<RtpPacket>,
     stats: Arc<FlowStatsAccumulator>,
     cancel: CancellationToken,
+    media_timeline: Option<Arc<crate::engine::st2110::timeline::SharedMediaTimeline>>,
 ) -> Result<()> {
     let fmt = pgroup_for(config.pixel_format);
     let pair = RedBluePair::bind_input(
@@ -397,6 +579,7 @@ pub async fn run_st2110_20_input(
     let stats_for_worker = stats.clone();
     let worker_cancel = cancel.clone();
     let pid_overrides = config.pid_overrides.clone();
+    let worker_timeline = media_timeline.clone();
     let _enc_handle = tokio::task::spawn_blocking(move || {
         encode_worker(
             enc_cfg,
@@ -411,6 +594,7 @@ pub async fn run_st2110_20_input(
             encode_stats,
             worker_cancel,
             pid_overrides,
+            worker_timeline,
         );
     });
 
@@ -481,6 +665,7 @@ pub async fn run_st2110_20_input(
 }
 
 #[cfg(feature = "media-codecs")]
+#[allow(clippy::too_many_arguments)]
 fn encode_worker(
     enc: VideoEncodeConfig,
     width: u32,
@@ -494,6 +679,7 @@ fn encode_worker(
     encode_stats: Arc<crate::engine::ts_video_replace::VideoEncodeStats>,
     cancel: CancellationToken,
     pid_overrides: Option<crate::config::models::TsPidOverridesMap>,
+    media_timeline: Option<Arc<crate::engine::st2110::timeline::SharedMediaTimeline>>,
 ) {
     // Build an encoder config once up-front — used for chroma/bit-depth
     // decisions below and to spot backend-not-compiled-in errors
@@ -690,6 +876,16 @@ fn encode_worker(
             } else {
                 pts += (90_000i64 * fps_den.max(1) as i64) / fps_num.max(1) as i64;
             }
+        } else if let Some(tl) = media_timeline.as_ref() {
+            // First frame: anchor the synthesised PES timeline on the
+            // flow-shared cross-essence timeline so the video PES PTS
+            // share an origin with the sibling -30 audio essence (the
+            // legacy 0-at-first-frame origin froze the sender's
+            // audio-vs-video path latency into every PES label). Video
+            // RTP already ticks at 90 kHz; its wrap modulus is 2³².
+            pts = tl
+                .resolve(frame.pts_90k as i64, 4_294_967_296.0, "ST 2110-20 input")
+                .max(0);
         }
         last_rtp_ts = Some(frame.pts_90k);
         let enc_out = pipeline.encode_raw_planes(
@@ -775,6 +971,7 @@ fn encode_worker(
 }
 
 #[cfg(not(feature = "media-codecs"))]
+#[allow(clippy::too_many_arguments)]
 fn encode_worker(
     _enc: VideoEncodeConfig,
     _width: u32,
@@ -788,6 +985,7 @@ fn encode_worker(
     _encode_stats: Arc<crate::engine::ts_video_replace::VideoEncodeStats>,
     _cancel: CancellationToken,
     _pid_overrides: Option<crate::config::models::TsPidOverridesMap>,
+    _media_timeline: Option<Arc<crate::engine::st2110::timeline::SharedMediaTimeline>>,
 ) {
     tracing::error!(
         "ST 2110-20 input requires the media-codecs and a video-encoder-* feature \
@@ -802,6 +1000,7 @@ pub async fn run_st2110_20_output(
     mut rx: broadcast::Receiver<RtpPacket>,
     stats: Arc<OutputStatsAccumulator>,
     cancel: CancellationToken,
+    event_sender: Option<crate::manager::events::EventSender>,
 ) -> Result<()> {
     let fmt = pgroup_for(config.pixel_format);
     let dest_red: SocketAddr = config
@@ -845,8 +1044,13 @@ pub async fn run_st2110_20_output(
     let height = config.height;
     let hw_decode = config.hw_decode.unwrap_or_default();
     let worker_cancel = cancel.clone();
+    let worker_output_id = config.id.clone();
+    let worker_events = event_sender.clone();
     let _decode_handle = tokio::task::spawn_blocking(move || {
-        decode_worker(width, height, fmt, hw_decode, nalu_rx, frame_tx, worker_cancel);
+        decode_worker(
+            width, height, fmt, hw_decode, nalu_rx, frame_tx, worker_cancel,
+            worker_output_id, worker_events,
+        );
     });
 
     let cfg = PacketizerConfig {
@@ -977,7 +1181,19 @@ pub async fn run_st2110_20_output(
     Ok(())
 }
 
+/// Egress decode stall watchdog: this many access units fed to the
+/// decoder with zero frames out (≈4 s at 50p) declares the decoder
+/// dead — a wrong-codec PMT the sniffer couldn't confirm, or a HW
+/// backend that opened but never produces. Raises an operator event
+/// and retries (sniffed codec if available, else one CPU fallback).
+const EGRESS_DECODE_STALL_AUS: u64 = 200;
+/// Bitstream-sniff window: decide PMT-vs-bitstream codec agreement
+/// after this many decisive AU verdicts (parameter sets ride on GOP
+/// heads, so a verdict lands at least once per GOP).
+const EGRESS_SNIFF_DECISIVE_AUS: u32 = 4;
+
 #[cfg(feature = "media-codecs")]
+#[allow(clippy::too_many_arguments)]
 fn decode_worker(
     width: u32,
     height: u32,
@@ -986,6 +1202,8 @@ fn decode_worker(
     mut nalu_rx: mpsc::Receiver<DemuxedFrame>,
     frame_tx: mpsc::Sender<RawVideoFrame>,
     cancel: CancellationToken,
+    output_id: String,
+    event_sender: Option<crate::manager::events::EventSender>,
 ) {
     use video_codec::{ScalerDstFormat, VideoCodec};
     use video_engine::{VideoDecoder, VideoScaler};
@@ -998,6 +1216,36 @@ fn decode_worker(
     let mut current_codec: Option<VideoCodec> = None;
     let mut decoder: Option<VideoDecoder> = None;
     let mut scaler: Option<VideoScaler> = None;
+
+    // ── PMT-vs-bitstream codec mismatch detection ────────────────────
+    // The demuxer labels AUs purely from the PMT stream_type; a lying
+    // PMT (assembly typo, external encoder fault, source codec change
+    // without a PMT bump) silently kills video — the wrong decoder
+    // never errors loudly, it just stops producing frames. Sniff the
+    // NAL headers independently; on a confirmed mismatch decode with
+    // the sniffed codec and raise `st2110_video_codec_mismatch`. A
+    // stall watchdog backstops the cases the sniffer can't decide.
+    let mut last_label: Option<VideoCodec> = None;
+    let mut codec_override: Option<VideoCodec> = None;
+    let mut sniff_h264: u32 = 0;
+    let mut sniff_hevc: u32 = 0;
+    // Cumulative decisive-AU verdicts since the last PMT label change —
+    // feeds the stall watchdog's gate and its retry-codec choice.
+    let mut evidence_h264: u32 = 0;
+    let mut evidence_hevc: u32 = 0;
+    let mut aus_since_open: u64 = 0;
+    let mut frames_since_open: u64 = 0;
+    // libavcodec emits nothing until parameter sets + a keyframe arrive
+    // (mid-GOP join), so the stall counter only runs once a keyframe AU
+    // has been fed — otherwise joining a healthy long-GOP stream (ffmpeg
+    // default keyint is 250) would trip the watchdog and permanently
+    // demote a working HW decoder (the display subsystem's watchdog
+    // learned this exact lesson).
+    let mut keyframe_fed_since_open: bool = false;
+    let mut stalled: bool = false;
+    let mut force_cpu_fallback: bool = false;
+    let mut cpu_retry_done: bool = false;
+    let mut opposite_retry_done: bool = false;
     // Monotonic fallback when the source omits PTS (very rare on TS
     // ingress — `media-codecs` decoder always supplies one). Bumped
     // per emitted frame so receivers never see a backwards step.
@@ -1024,6 +1272,16 @@ fn decode_worker(
     let (pack_tx, pack_rx) =
         std::sync::mpsc::sync_channel::<(video_engine::ScaledFrame, i64)>(3);
     let pack_fmt = fmt;
+    // Rate-limited visibility for whole-frame drops at the bounded
+    // hand-off points (pack queue + frame queue). These are clean
+    // frame skips by design — the producer-paced sender holds the
+    // schedule and bursts beyond the ~9-frame cushion shed here — but
+    // they must not be silent (the pre-fix wire-ring shed was at least
+    // counted).
+    let mut pack_drops: u64 = 0;
+    let mut pack_drop_log_at = std::time::Instant::now();
+    let pack_frame_tx_drops = Arc::new(AtomicU64::new(0));
+    let pack_thread_drops = pack_frame_tx_drops.clone();
     let pack_handle = std::thread::Builder::new()
         .name("st2110-pack".into())
         .spawn(move || {
@@ -1055,7 +1313,9 @@ fn decode_worker(
                     pts_90k: frame_pts as u32,
                     field: VideoField::Progressive,
                 };
-                let _ = frame_tx.try_send(raw);
+                if frame_tx.try_send(raw).is_err() {
+                    pack_thread_drops.fetch_add(1, Ordering::Relaxed);
+                }
             }
         })
         .expect("spawn st2110-pack thread");
@@ -1065,14 +1325,84 @@ fn decode_worker(
             Some(f) => f,
             None => break,
         };
-        let (nalus, is_h264, pts) = match frame {
-            DemuxedFrame::H264 { nalus, pts, .. } => (nalus, true, pts),
-            DemuxedFrame::H265 { nalus, pts, .. } => (nalus, false, pts),
+        let (nalus, is_h264, pts, au_is_keyframe) = match frame {
+            DemuxedFrame::H264 { nalus, pts, is_keyframe } => (nalus, true, pts, is_keyframe),
+            DemuxedFrame::H265 { nalus, pts, is_keyframe } => (nalus, false, pts, is_keyframe),
             _ => continue,
         };
-        let codec = if is_h264 { VideoCodec::H264 } else { VideoCodec::Hevc };
+        let labeled = if is_h264 { VideoCodec::H264 } else { VideoCodec::Hevc };
+        if last_label != Some(labeled) {
+            // PMT changed (assembler correction, source PMT bump) —
+            // trust the fresh label and restart the sniff window.
+            last_label = Some(labeled);
+            codec_override = None;
+            sniff_h264 = 0;
+            sniff_hevc = 0;
+            evidence_h264 = 0;
+            evidence_hevc = 0;
+            force_cpu_fallback = false;
+            cpu_retry_done = false;
+            opposite_retry_done = false;
+        }
+        match crate::engine::ts_demux::sniff_annexb_codec(&nalus) {
+            Some(crate::engine::ts_demux::SniffedVideoCodec::H264) => {
+                sniff_h264 += 1;
+                evidence_h264 = evidence_h264.saturating_add(1);
+            }
+            Some(crate::engine::ts_demux::SniffedVideoCodec::Hevc) => {
+                sniff_hevc += 1;
+                evidence_hevc = evidence_hevc.saturating_add(1);
+            }
+            None => {}
+        }
+        if sniff_h264 + sniff_hevc >= EGRESS_SNIFF_DECISIVE_AUS {
+            let sniffed = if sniff_h264 > 0 && sniff_hevc == 0 {
+                Some(VideoCodec::H264)
+            } else if sniff_hevc > 0 && sniff_h264 == 0 {
+                Some(VideoCodec::Hevc)
+            } else {
+                None // mixed evidence — keep whatever we're doing
+            };
+            sniff_h264 = 0;
+            sniff_hevc = 0;
+            if let Some(s) = sniffed {
+                if s != labeled && codec_override != Some(s) {
+                    codec_override = Some(s);
+                    tracing::warn!(
+                        output_id = %output_id,
+                        declared = ?labeled,
+                        detected = ?s,
+                        "ST 2110 output: PMT stream_type contradicts the bitstream — decoding with the detected codec"
+                    );
+                    if let Some(es) = &event_sender {
+                        es.emit_output_with_details(
+                            crate::manager::events::EventSeverity::Warning,
+                            crate::manager::events::category::FLOW,
+                            format!(
+                                "ST 2110 output '{output_id}': PMT declares {labeled:?} but the \
+                                 elementary stream is {s:?} — decoding with the detected codec. \
+                                 Fix the assembly/source PMT stream_type.",
+                            ),
+                            &output_id,
+                            serde_json::json!({
+                                "error_code": "st2110_video_codec_mismatch",
+                                "declared_codec": format!("{labeled:?}"),
+                                "detected_codec": format!("{s:?}"),
+                            }),
+                        );
+                    }
+                } else if s == labeled {
+                    codec_override = None;
+                }
+            }
+        }
+        let codec = codec_override.unwrap_or(labeled);
         if current_codec != Some(codec) {
             current_codec = Some(codec);
+            aus_since_open = 0;
+            frames_since_open = 0;
+            keyframe_fed_since_open = false;
+            stalled = false;
             // Resolve the operator's `hw_decode` preference (unset =
             // Auto: VAAPI ≻ NVDEC ≻ QSV ≻ CPU against the startup probe):
             // 2160p50 HEVC software decode is the egress throughput
@@ -1085,21 +1415,25 @@ fn decode_worker(
             // decode — UHD HEVC at 50 fps exceeds a single libavcodec
             // thread, and the frames-deep pipeline delay either way is
             // a constant offset absorbed by the receiver's VRX buffer.
-            let backend = match crate::engine::hardware_probe::static_capabilities() {
-                Some(caps) => crate::engine::hardware_probe::resolve_transcode_decoder(
-                    &hw_decode,
-                    Some(&caps),
-                )
-                .map(|r| r.as_backend())
-                .unwrap_or_else(|e| {
-                    tracing::warn!(
-                        ?hw_decode,
-                        error = ?e,
-                        "ST 2110-20 output: hw_decode preference unavailable — using software decode"
-                    );
-                    video_engine::DecoderBackend::Cpu
-                }),
-                None => video_engine::DecoderBackend::Cpu,
+            let backend = if force_cpu_fallback {
+                video_engine::DecoderBackend::Cpu
+            } else {
+                match crate::engine::hardware_probe::static_capabilities() {
+                    Some(caps) => crate::engine::hardware_probe::resolve_transcode_decoder(
+                        &hw_decode,
+                        Some(&caps),
+                    )
+                    .map(|r| r.as_backend())
+                    .unwrap_or_else(|e| {
+                        tracing::warn!(
+                            ?hw_decode,
+                            error = ?e,
+                            "ST 2110-20 output: hw_decode preference unavailable — using software decode"
+                        );
+                        video_engine::DecoderBackend::Cpu
+                    }),
+                    None => video_engine::DecoderBackend::Cpu,
+                }
             };
             let opened = if matches!(backend, video_engine::DecoderBackend::Cpu) {
                 VideoDecoder::open_threaded(codec)
@@ -1147,9 +1481,21 @@ fn decode_worker(
         // `DemuxedFrame::H264::pts` is u64 (TS PES PTS in 90 kHz, 33-bit).
         // libavcodec wants i64; the high bit is always 0 for a 33-bit
         // value, so a plain cast is safe.
+        if au_is_keyframe {
+            keyframe_fed_since_open = true;
+        }
+        // The keyframe flag rides the demuxer's PMT-derived codec label,
+        // so a lying PMT can suppress it forever — opposite-codec sniff
+        // evidence opens the stall gate too.
+        let opposite_evidence = match labeled {
+            VideoCodec::H264 => evidence_hevc,
+            _ => evidence_h264,
+        };
+        if keyframe_fed_since_open || opposite_evidence > 0 {
+            aus_since_open += 1;
+        }
         if let Err(e) = dec.send_packet_with_pts(&nalu_bytes, pts as i64) {
             tracing::debug!(error = %e, "ST 2110-20 output decoder send_packet error");
-            continue;
         }
 
         loop {
@@ -1157,6 +1503,8 @@ fn decode_worker(
                 Ok(f) => f,
                 Err(_) => break,
             };
+            frames_since_open += 1;
+            stalled = false;
             // VAAPI hwframes live on the GPU — `yuv_planes()` is None and
             // the scaler can't read them. Download to sysmem (NV12 / P010,
             // one copy on iGPU shared memory). QSV / NVDEC decoders already
@@ -1237,7 +1585,100 @@ fn decode_worker(
             };
             // Hand off to the pack thread (zero-copy — ScaledFrame owns
             // its AVFrame). Drop the frame when packing is behind.
-            let _ = pack_tx.try_send((scaled, wire_pts));
+            if pack_tx.try_send((scaled, wire_pts)).is_err() {
+                pack_drops += 1;
+            }
+        }
+
+        // Rate-limited drop reporting (≤ 1 log / 5 s) covering both
+        // bounded hand-off points.
+        let ft_drops = pack_frame_tx_drops.load(Ordering::Relaxed);
+        if (pack_drops > 0 || ft_drops > 0)
+            && pack_drop_log_at.elapsed() >= std::time::Duration::from_secs(5)
+        {
+            tracing::warn!(
+                output_id = %output_id,
+                pack_queue_drops = pack_drops,
+                frame_queue_drops = ft_drops,
+                "ST 2110 output: decoded frames dropped at bounded hand-off queues (burst beyond cushion)"
+            );
+            pack_drop_log_at = std::time::Instant::now();
+        }
+
+        // ── Decode stall watchdog ────────────────────────────────────
+        // A decoder that consumes AUs but never produces frames is the
+        // silent-video failure shape: a wrong-codec PMT the sniffer
+        // couldn't confirm, or a HW backend that opened but is broken
+        // on this host. Raise the event once, then retry with one
+        // forced-CPU reopen (the sniffer override path handles the
+        // confirmed-mismatch case independently).
+        if frames_since_open == 0 && aus_since_open >= EGRESS_DECODE_STALL_AUS {
+            aus_since_open = 0;
+            if !stalled {
+                stalled = true;
+                tracing::warn!(
+                    output_id = %output_id,
+                    codec = ?codec,
+                    "ST 2110 output: decoder consumed {EGRESS_DECODE_STALL_AUS} access units with zero frames out — decode stalled"
+                );
+                if let Some(es) = &event_sender {
+                    es.emit_output_with_details(
+                        crate::manager::events::EventSeverity::Warning,
+                        crate::manager::events::category::FLOW,
+                        format!(
+                            "ST 2110 output '{output_id}': video decoder is consuming \
+                             {codec:?} access units but producing no frames — wrong \
+                             PMT stream_type or a broken decode backend. Retrying.",
+                        ),
+                        &output_id,
+                        serde_json::json!({
+                            "error_code": "st2110_egress_decode_stalled",
+                            "codec": format!("{codec:?}"),
+                        }),
+                    );
+                }
+            }
+            if !cpu_retry_done {
+                cpu_retry_done = true;
+                force_cpu_fallback = true;
+                current_codec = None; // force reopen on the next AU
+                decoder = None;
+                scaler = None;
+                tracing::warn!(
+                    output_id = %output_id,
+                    "ST 2110 output: retrying stalled decode with the threaded software decoder"
+                );
+            } else if !opposite_retry_done {
+                // Still nothing on CPU — the codec itself is wrong but
+                // the sniffer couldn't reach a confirmed verdict
+                // (genuinely ambiguous bitstreams exist). Try the other
+                // codec once, preferring whichever direction the
+                // accumulated partial evidence leans.
+                opposite_retry_done = true;
+                let opposite = match labeled {
+                    VideoCodec::H264 => VideoCodec::Hevc,
+                    _ => VideoCodec::H264,
+                };
+                let retry = if evidence_h264 > evidence_hevc {
+                    VideoCodec::H264
+                } else if evidence_hevc > evidence_h264 {
+                    VideoCodec::Hevc
+                } else {
+                    opposite
+                };
+                if retry != codec {
+                    codec_override = Some(retry);
+                    force_cpu_fallback = false; // let the HW backend re-resolve
+                    current_codec = None;
+                    decoder = None;
+                    scaler = None;
+                    tracing::warn!(
+                        output_id = %output_id,
+                        ?retry,
+                        "ST 2110 output: decode still stalled — retrying with the alternate codec"
+                    );
+                }
+            }
         }
     }
 
@@ -1246,6 +1687,7 @@ fn decode_worker(
 }
 
 #[cfg(not(feature = "media-codecs"))]
+#[allow(clippy::too_many_arguments)]
 fn decode_worker(
     _width: u32,
     _height: u32,
@@ -1254,6 +1696,8 @@ fn decode_worker(
     _nalu_rx: mpsc::Receiver<DemuxedFrame>,
     _frame_tx: mpsc::Sender<RawVideoFrame>,
     _cancel: CancellationToken,
+    _output_id: String,
+    _event_sender: Option<crate::manager::events::EventSender>,
 ) {
     tracing::error!(
         "ST 2110-20 output requires the media-codecs feature to be compiled in; \
@@ -1281,6 +1725,7 @@ pub async fn run_st2110_23_input(
     broadcast_tx: broadcast::Sender<RtpPacket>,
     stats: Arc<FlowStatsAccumulator>,
     cancel: CancellationToken,
+    media_timeline: Option<Arc<crate::engine::st2110::timeline::SharedMediaTimeline>>,
 ) -> Result<()> {
     let fmt = pgroup_for(config.pixel_format);
     let mode = partition_mode_for(config.partition_mode);
@@ -1298,6 +1743,7 @@ pub async fn run_st2110_23_input(
     let stats_for_worker = stats.clone();
     let worker_cancel = cancel.clone();
     let pid_overrides = config.pid_overrides.clone();
+    let worker_timeline = media_timeline.clone();
     let _enc_handle = tokio::task::spawn_blocking(move || {
         encode_worker(
             enc_cfg,
@@ -1312,6 +1758,7 @@ pub async fn run_st2110_23_input(
             encode_stats,
             worker_cancel,
             pid_overrides,
+            worker_timeline,
         );
     });
 
@@ -1390,6 +1837,7 @@ pub async fn run_st2110_23_output(
     mut rx: broadcast::Receiver<RtpPacket>,
     stats: Arc<OutputStatsAccumulator>,
     cancel: CancellationToken,
+    event_sender: Option<crate::manager::events::EventSender>,
 ) -> Result<()> {
     let fmt = pgroup_for(config.pixel_format);
     let mode = partition_mode_for(config.partition_mode);
@@ -1515,30 +1963,58 @@ pub async fn run_st2110_23_output(
     let height = config.height;
     let hw_decode = config.hw_decode.unwrap_or_default();
     let worker_cancel = cancel.clone();
+    let worker_output_id = config.id.clone();
+    let worker_events = event_sender.clone();
     let _decode_handle = tokio::task::spawn_blocking(move || {
-        decode_worker(width, height, fmt, hw_decode, nalu_rx, frame_tx, worker_cancel);
+        decode_worker(
+            width, height, fmt, hw_decode, nalu_rx, frame_tx, worker_cancel,
+            worker_output_id, worker_events,
+        );
     });
 
     let sender_cancel = cancel.clone();
     let sender_stats = stats.clone();
     let sender_pacer = shared_pacer.clone();
+    let sender_id = config.id.clone();
     let sender_handle = tokio::task::spawn_blocking(move || {
         let mut frame_rx = frame_rx;
         let mut frame_index: u64 = 0;
+        let mut guard = RasterScheduleGuard::new();
+        // Monotonic floor per sink — each sub-stream restarts the same
+        // target sequence every frame, so the clamp must be per-socket
+        // (a shared floor would flatten sub-streams 1..n onto the end
+        // of sub-stream 0's frame).
+        let mut last_target_ns: Vec<u64> = vec![0; sinks.len()];
         while !sender_cancel.is_cancelled() {
             let frame = match frame_rx.blocking_recv() {
                 Some(f) => f,
                 None => break,
             };
+            guard.observe_frame(&sender_pacer, frame_index, &sender_id);
+            if pace_to_schedule(&sender_pacer, frame_index, &sender_cancel, &sender_id) {
+                // Backward rebase (TAI step) — drop every sink's
+                // monotonic floor (see the -20 sender).
+                for floor in last_target_ns.iter_mut() {
+                    *floor = 0;
+                }
+            }
             let subs = partition_frame(&frame, mode, n);
             let recv_us = crate::util::time::now_us();
             for (i, sub_frame) in subs.into_iter().enumerate() {
                 let mut out_pkts: Vec<Bytes> = Vec::with_capacity(16);
                 sinks[i].pkt.packetize(&sub_frame, |pkt| out_pkts.push(pkt));
                 let pkts_per_frame = sender_pacer.packets_per_frame();
+                wait_for_ring_capacity(
+                    &sinks[i].wire_red.depth_handle(),
+                    out_pkts.len(),
+                    &sender_cancel,
+                );
                 for (idx, pkt) in out_pkts.iter().enumerate() {
                     let pkt_idx = (idx as u32).min(pkts_per_frame.saturating_sub(1));
-                    let target_ns = sender_pacer.target_for_packet(frame_index, pkt_idx);
+                    let target_ns = sender_pacer
+                        .target_for_packet(frame_index, pkt_idx)
+                        .max(last_target_ns[i]);
+                    last_target_ns[i] = target_ns;
                     let dg_red = WireDatagram {
                         bytes: pkt.clone(),
                         recv_time_us: recv_us,

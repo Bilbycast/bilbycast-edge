@@ -21,6 +21,8 @@
 //! - [`pacer`]: ST 2110-21 raster pacer producing `target_tx_time_ns` per
 //!   RFC 4175 packet, anchored on `CLOCK_TAI` when PTP is locked.
 //! - [`redblue`]: SMPTE 2022-7 dual-network ("Red"/"Blue") bind helpers.
+//! - [`timeline`]: per-flow cross-essence media-timeline anchor so the
+//!   2110 inputs' synthesised PES timelines share one origin (A/V sync).
 //! - Packetisers (`audio`, `ancillary`, `scte104`, `timecode`, `captions`,
 //!   `video`) and the SDP module.
 
@@ -33,4 +35,5 @@ pub mod redblue;
 pub mod scte104;
 pub mod sdp;
 pub mod timecode;
+pub mod timeline;
 pub mod video;

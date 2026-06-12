@@ -775,6 +775,12 @@ async fn run_assembler(
     let mut es_info_by_slot: std::collections::HashMap<(u16, u16), Vec<u8>> =
         std::collections::HashMap::new();
 
+    // Declared-vs-source stream_type mismatch debounce, keyed
+    // `(program_number, out_pid)` → `(observed stream_type, ticks seen)`.
+    // See `reconcile_slot_stream_types`.
+    let mut st_mismatch_stability: std::collections::HashMap<(u16, u16), (u8, u8)> =
+        std::collections::HashMap::new();
+
     // Egress bundle buffer + per-out-PID CC counter + PAT/PMT CC.
     let mut buf = BytesMut::with_capacity(BUNDLE_BYTES);
     let mut cc: std::collections::HashMap<u16, u8> = std::collections::HashMap::new();
@@ -1720,6 +1726,64 @@ async fn run_assembler(
                 }
             }
             _ = psi_tick.tick() => {
+                // Reconcile declared video stream_types against the live
+                // source PMTs. An applied correction propagates to the
+                // flat fan-in view (PES-splice sentinels key off it),
+                // bumps the program's PMT version so every downstream
+                // TS demuxer rebuilds for the new codec, and raises an
+                // operator event — the config still declares the stale
+                // byte, so the operator should fix the assembly.
+                for (pidx, out_pid, declared, observed, source) in
+                    reconcile_slot_stream_types(&mut plan, &catalogs, &mut st_mismatch_stability)
+                {
+                    for f in flat.iter_mut() {
+                        if f.program_idx == pidx && f.out_pid == out_pid {
+                            f.stream_type = observed;
+                        }
+                    }
+                    if let Some(v) = pmt_versions.get_mut(pidx) {
+                        *v = v.wrapping_add(1) & 0x1F;
+                    }
+                    let program_number = plan
+                        .programs
+                        .get(pidx)
+                        .map(|p| p.program_number)
+                        .unwrap_or_default();
+                    tracing::warn!(
+                        flow_id = %flow_id,
+                        program_number,
+                        out_pid,
+                        declared_stream_type = declared,
+                        observed_stream_type = observed,
+                        source_input_id = %source.0,
+                        source_pid = source.1,
+                        "Flow assembly: PMT stream_type corrected to match the live source codec"
+                    );
+                    if let Some(es) = &event_sender {
+                        es.emit_flow_with_details(
+                            crate::manager::events::EventSeverity::Warning,
+                            crate::manager::events::category::FLOW,
+                            format!(
+                                "Flow '{flow_id}': assembly slot out_pid 0x{out_pid:04X} \
+                                 (program {program_number}) declares stream_type 0x{declared:02X} \
+                                 but input '{}' PID 0x{:04X} carries 0x{observed:02X} — \
+                                 PMT corrected to the source codec. Update the assembly config \
+                                 to clear this warning.",
+                                source.0, source.1,
+                            ),
+                            &flow_id,
+                            serde_json::json!({
+                                "error_code": "pid_bus_stream_type_mismatch",
+                                "program_number": program_number,
+                                "out_pid": out_pid,
+                                "declared_stream_type": declared,
+                                "observed_stream_type": observed,
+                                "source_input_id": source.0,
+                                "source_pid": source.1,
+                            }),
+                        );
+                    }
+                }
                 // Converge copy-through descriptors against catalogues
                 // that updated since the last tick (late PSI discovery
                 // on a cold-started input, source PMT change, deferred
@@ -2672,6 +2736,102 @@ fn refresh_slot_es_info(
     changed
 }
 
+/// MPEG-TS video `stream_type`s the assembler will auto-correct between
+/// when the declared slot value contradicts the live source PMT. Kept to
+/// the unambiguous video family — the correction must never move a slot
+/// across the audio/video boundary (the PES-splice state machines key
+/// their audio-vs-video map disjointness on `slot.stream_type`), and DVB
+/// audio signalling (0x06 + descriptor) is legitimately declared under a
+/// different byte than ATSC-style sources, so audio is out of scope.
+fn is_correctable_video_stream_type(st: u8) -> bool {
+    matches!(st, 0x01 | 0x02 | 0x1B | 0x24)
+}
+
+/// Live source PMT `stream_type` for `source`, from the per-input PSI
+/// catalogue. `None` when the input has no catalogue yet (cold start,
+/// synthesised PCM/AES3 carriers) or the PID isn't in its PMT.
+fn observed_source_stream_type(
+    catalogs: &HashMap<String, Arc<crate::engine::ts_psi_catalog::PsiCatalogStore>>,
+    source: &(String, u16),
+) -> Option<u8> {
+    catalogs.get(&source.0)?.load().and_then(|cat| {
+        cat.programs
+            .iter()
+            .flat_map(|p| p.streams.iter())
+            .find(|s| s.pid == source.1)
+            .map(|s| s.stream_type)
+    })
+}
+
+/// Reconcile every video slot's declared `stream_type` against the live
+/// source PMT (PSI-tick cadence). An assembly declaring 0x24 (HEVC) over
+/// an H.264 ES feeds H.264 NALs to downstream HEVC decoders — video
+/// idles silently while audio keeps running (2026-06-12 defect #3). The
+/// same path heals a live source codec change under an unchanged
+/// assembly: the PMT correction bumps the program's version, so every
+/// TS-demuxing consumer rebuilds its PES assembler and decoder without a
+/// flow restart.
+///
+/// Corrections are debounced — the same observed value must hold for two
+/// consecutive ticks (catalogue updates are already PMT-version-gated)
+/// — and constrained to the video family in both directions. Returns
+/// `(program_idx, out_pid, declared, observed, source)` per applied
+/// correction; the caller mutates the flat view, bumps PMT versions and
+/// emits the operator event.
+fn reconcile_slot_stream_types(
+    plan: &mut AssemblyPlan,
+    catalogs: &HashMap<String, Arc<crate::engine::ts_psi_catalog::PsiCatalogStore>>,
+    stability: &mut std::collections::HashMap<(u16, u16), (u8, u8)>,
+) -> Vec<(usize, u16, u8, u8, (String, u16))> {
+    let mut corrections = Vec::new();
+    for (pidx, prog) in plan.programs.iter_mut().enumerate() {
+        for slot in prog.slots.iter_mut() {
+            if !is_correctable_video_stream_type(slot.stream_type) {
+                continue;
+            }
+            // Switch slots: `slot.source` holds the INITIAL leg forever
+            // (SwitchActiveInput mutates only `active_leg_input`), so a
+            // catalogue comparison here would judge the declared byte
+            // against an idle leg and could rewrite a PMT that is
+            // correct for the live one. Leg codec compatibility is the
+            // Take path's job — skip.
+            if slot.switch_legs.is_some() {
+                continue;
+            }
+            let key = (prog.program_number, slot.out_pid);
+            let observed = match observed_source_stream_type(catalogs, &slot.source) {
+                Some(o) => o,
+                None => {
+                    stability.remove(&key);
+                    continue;
+                }
+            };
+            if observed == slot.stream_type || !is_correctable_video_stream_type(observed) {
+                stability.remove(&key);
+                continue;
+            }
+            let entry = stability.entry(key).or_insert((observed, 0));
+            if entry.0 != observed {
+                *entry = (observed, 0);
+            }
+            entry.1 = entry.1.saturating_add(1);
+            if entry.1 < 2 {
+                continue;
+            }
+            stability.remove(&key);
+            corrections.push((
+                pidx,
+                slot.out_pid,
+                slot.stream_type,
+                observed,
+                slot.source.clone(),
+            ));
+            slot.stream_type = observed;
+        }
+    }
+    corrections
+}
+
 // Keep the null-pid reference live (used in tests + for future filtering).
 const _: u16 = NULL_PID;
 const _: u16 = PAT_PID;
@@ -2922,6 +3082,77 @@ mod tests {
                 ],
             }],
         }
+    }
+
+    // ── Declared-vs-source stream_type reconciliation ───────────────────
+
+    fn seed_catalog(input: &str, pid: u16, stream_type: u8) -> HashMap<String, Arc<crate::engine::ts_psi_catalog::PsiCatalogStore>> {
+        use crate::engine::ts_psi_catalog::*;
+        let store = PsiCatalogStore::new();
+        PsiCatalogStore::seed_for_test(
+            &store,
+            PsiCatalog {
+                programs: vec![CatalogProgram {
+                    program_number: 1,
+                    pmt_pid: 0x1000,
+                    pcr_pid: Some(pid),
+                    streams: vec![CatalogStream {
+                        pid,
+                        stream_type,
+                        codec: "test".to_string(),
+                        kind: CatalogStreamKind::Video,
+                        descriptors_hex: String::new(),
+                    }],
+                }],
+                last_updated_us: 1,
+            },
+        );
+        let mut m = HashMap::new();
+        m.insert(input.to_string(), Arc::new(store));
+        m
+    }
+
+    /// A video slot declaring HEVC over an H.264 source corrects after
+    /// two consecutive ticks (debounce) and reports the correction once.
+    #[test]
+    fn reconcile_corrects_video_stream_type_after_debounce() {
+        let mut plan = make_plan(); // slot 0: in-a 0x100 → out 0x200, declared 0x1B
+        plan.programs[0].slots[0].stream_type = 0x24; // operator typo: HEVC
+        let catalogs = seed_catalog("in-a", 0x100, 0x1B); // source is H.264
+        let mut stability = std::collections::HashMap::new();
+
+        // Tick 1: observed but debounced — no correction yet.
+        let c1 = reconcile_slot_stream_types(&mut plan, &catalogs, &mut stability);
+        assert!(c1.is_empty());
+        assert_eq!(plan.programs[0].slots[0].stream_type, 0x24);
+
+        // Tick 2: correction applied.
+        let c2 = reconcile_slot_stream_types(&mut plan, &catalogs, &mut stability);
+        assert_eq!(c2.len(), 1);
+        let (pidx, out_pid, declared, observed, source) = &c2[0];
+        assert_eq!((*pidx, *out_pid, *declared, *observed), (0, 0x200, 0x24, 0x1B));
+        assert_eq!(source, &("in-a".to_string(), 0x100));
+        assert_eq!(plan.programs[0].slots[0].stream_type, 0x1B);
+
+        // Tick 3: agreement — nothing further.
+        let c3 = reconcile_slot_stream_types(&mut plan, &catalogs, &mut stability);
+        assert!(c3.is_empty());
+    }
+
+    /// Audio slots and non-video observations never correct; missing
+    /// catalogues (synthesised PCM carriers) are skipped entirely.
+    #[test]
+    fn reconcile_ignores_audio_and_missing_catalogs() {
+        let mut plan = make_plan(); // slot 1: in-b audio 0x0F
+        // Audio slot mismatching is out of scope even if a catalogue says so.
+        let catalogs = seed_catalog("in-b", 0x200, 0x1B);
+        let mut stability = std::collections::HashMap::new();
+        for _ in 0..3 {
+            assert!(reconcile_slot_stream_types(&mut plan, &catalogs, &mut stability).is_empty());
+        }
+        assert_eq!(plan.programs[0].slots[1].stream_type, 0x0F);
+        // Video slot with NO catalogue for its input: skipped.
+        assert_eq!(plan.programs[0].slots[0].stream_type, 0x1B);
     }
 
     // ── PMT descriptor copy-through ────────────────────────────────────

@@ -231,6 +231,11 @@ pub struct FlowRuntime {
     /// build their per-input broadcast channel at the same size as
     /// the start-time inputs.
     pub broadcast_capacity: usize,
+    /// Per-flow cross-essence media-timeline anchor for ST 2110 inputs
+    /// (see [`crate::engine::st2110::timeline::SharedMediaTimeline`]).
+    /// Created at flow start; hot-added inputs join the same timeline
+    /// so the -20/-30 essences keep one PES origin.
+    pub st2110_timeline: Arc<crate::engine::st2110::timeline::SharedMediaTimeline>,
     /// Watch channel receiver for the detected video frame rate (fps).
     /// Created when media analysis is enabled so that hot-added outputs
     /// with `TargetFrames` delay mode can subscribe to frame rate updates
@@ -580,6 +585,8 @@ impl FlowRuntime {
             bandwidth_profile,
             broadcast_capacity,
         );
+        let st2110_timeline =
+            Arc::new(crate::engine::st2110::timeline::SharedMediaTimeline::new());
 
         // The broadcast channel is bounded to `broadcast_capacity` slots
         // (set by the flow's bandwidth profile).
@@ -756,6 +763,7 @@ impl FlowRuntime {
             ffmpeg_available,
             thumbnail_enabled: config.config.thumbnail,
             flow_clock_domain: config.config.clock_domain,
+            st2110_timeline: &st2110_timeline,
             broadcast_capacity,
             #[cfg(feature = "replay")]
             replay_command_txs: &replay_command_txs,
@@ -1442,6 +1450,7 @@ impl FlowRuntime {
             global_stats,
             ffmpeg_available,
             broadcast_capacity,
+            st2110_timeline,
             frame_rate_rx,
             pid_bus_assembler_handle,
             es_bus,
@@ -2320,6 +2329,7 @@ impl FlowRuntime {
                     broadcast_tx,
                     output_stats.clone(),
                     output_cancel.clone(),
+                    Some(event_sender.clone()),
                 );
                 Ok(OutputRuntime {
                     handle,
@@ -2338,6 +2348,7 @@ impl FlowRuntime {
                     broadcast_tx,
                     output_stats.clone(),
                     output_cancel.clone(),
+                    Some(event_sender.clone()),
                 );
                 Ok(OutputRuntime {
                     handle,
@@ -2867,6 +2878,7 @@ impl FlowRuntime {
             ffmpeg_available: self.ffmpeg_available,
             thumbnail_enabled: self.config.config.thumbnail,
             flow_clock_domain: self.config.config.clock_domain,
+            st2110_timeline: &self.st2110_timeline,
             broadcast_capacity: self.broadcast_capacity,
             #[cfg(feature = "replay")]
             replay_command_txs: &self.replay_command_txs,
@@ -3340,6 +3352,7 @@ fn spawn_single_input(
     force_idr: &Arc<std::sync::atomic::AtomicBool>,
     flow_clock_domain: Option<u8>,
     av_sync_pacer: Option<Arc<crate::engine::av_sync_mux::AvSyncPacer>>,
+    st2110_timeline: &Arc<crate::engine::st2110::timeline::SharedMediaTimeline>,
     #[cfg(feature = "replay")]
     replay_command_txs: &dashmap::DashMap<String, tokio::sync::mpsc::Sender<crate::replay::ReplayCommand>>,
 ) -> (JoinHandle<()>, Option<WhipSessionInfo>) {
@@ -3419,6 +3432,7 @@ fn spawn_single_input(
             super::input_st2110_30::spawn_st2110_30_input(
                 c, input_id.clone(), per_input_tx.clone(), flow_stats.clone(),
                 input_cancel.clone(), event_sender.clone(), flow_id.to_string(),
+                Some(st2110_timeline.clone()),
             )
         }
         InputConfig::St2110_31(c) => {
@@ -3448,6 +3462,7 @@ fn spawn_single_input(
             super::input_st2110_20::spawn_st2110_20_input(
                 c, input_id.clone(), per_input_tx.clone(),
                 flow_stats.clone(), input_cancel.clone(),
+                Some(st2110_timeline.clone()),
             )
         }
         InputConfig::St2110_23(c) => {
@@ -3456,6 +3471,7 @@ fn spawn_single_input(
             super::input_st2110_23::spawn_st2110_23_input(
                 c, input_id.clone(), per_input_tx.clone(),
                 flow_stats.clone(), input_cancel.clone(),
+                Some(st2110_timeline.clone()),
             )
         }
         InputConfig::Bonded(c) => super::input_bonded::spawn_bonded_input(
@@ -3583,6 +3599,11 @@ pub(crate) struct InputSpawnContext<'a> {
     pub ffmpeg_available: bool,
     pub thumbnail_enabled: bool,
     pub flow_clock_domain: Option<u8>,
+    /// Per-flow cross-essence media-timeline anchor shared by every
+    /// ST 2110 input so their synthesised PES timelines share one
+    /// origin (A/V alignment across the -20/-30 pair). Hot-added
+    /// inputs join the same timeline.
+    pub st2110_timeline: &'a Arc<crate::engine::st2110::timeline::SharedMediaTimeline>,
     /// Per-flow per-input broadcast capacity (slots). Derived from the
     /// flow's [`crate::config::models::BandwidthProfile`] in
     /// [`FlowRuntime::start`]; passed through here so the hot-add path
@@ -3655,6 +3676,7 @@ pub(crate) fn spawn_input_runtime(
         &force_idr,
         ctx.flow_clock_domain,
         ctx.av_sync_pacer.clone(),
+        ctx.st2110_timeline,
         #[cfg(feature = "replay")]
         ctx.replay_command_txs,
     );

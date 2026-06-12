@@ -195,6 +195,16 @@ impl PcmPacketizer {
         self.timestamp
     }
 
+    /// Override the RTP timestamp the next packet will carry. Used by
+    /// the compressed-audio bridge to keep the outgoing 2110-30
+    /// timestamps on the source PES timeline (it advances the value by
+    /// `samples_per_packet()` between packets exactly as the free-run
+    /// path does, so a caller that stays silent sees unchanged
+    /// behaviour).
+    pub fn set_next_timestamp(&mut self, timestamp: u32) {
+        self.timestamp = timestamp;
+    }
+
     /// Packetize as many full packets as possible from `samples` (a buffer
     /// of interleaved PCM samples in the configured format), pushing each
     /// emitted packet onto `out`. Returns the leftover slice that did not
