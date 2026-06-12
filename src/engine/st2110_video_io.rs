@@ -1279,6 +1279,7 @@ fn decode_worker(
     // they must not be silent (the pre-fix wire-ring shed was at least
     // counted).
     let mut pack_drops: u64 = 0;
+    let mut pack_drops_logged: u64 = 0;
     let mut pack_drop_log_at = std::time::Instant::now();
     let pack_frame_tx_drops = Arc::new(AtomicU64::new(0));
     let pack_thread_drops = pack_frame_tx_drops.clone();
@@ -1590,10 +1591,11 @@ fn decode_worker(
             }
         }
 
-        // Rate-limited drop reporting (≤ 1 log / 5 s) covering both
-        // bounded hand-off points.
+        // Rate-limited drop reporting (≤ 1 log / 5 s, only when the
+        // count advanced) covering both bounded hand-off points.
         let ft_drops = pack_frame_tx_drops.load(Ordering::Relaxed);
-        if (pack_drops > 0 || ft_drops > 0)
+        let total_drops = pack_drops.saturating_add(ft_drops);
+        if total_drops > pack_drops_logged
             && pack_drop_log_at.elapsed() >= std::time::Duration::from_secs(5)
         {
             tracing::warn!(
@@ -1602,6 +1604,7 @@ fn decode_worker(
                 frame_queue_drops = ft_drops,
                 "ST 2110 output: decoded frames dropped at bounded hand-off queues (burst beyond cushion)"
             );
+            pack_drops_logged = total_drops;
             pack_drop_log_at = std::time::Instant::now();
         }
 
