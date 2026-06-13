@@ -1,0 +1,30 @@
+[Unit]
+Description=bilbycast cellular bond leg — bring up + hold a USB modem path (ModemManager)
+Documentation=https://docs.bilbycast.com/edge/bonding-cellular-modem/
+# ModemManager must be up so `mmcli` can enable + connect the modem, and the
+# network stack must be online so routing writes succeed. Start before the edge
+# so the bond leg's interface + route exist by the time the edge pins to it.
+After=ModemManager.service network-online.target
+Wants=ModemManager.service network-online.target
+Before=bilbycast-edge.service
+
+# This unit is OPT-IN. packaging/install-cellular-modem.sh installs it but does
+# NOT enable it unless you pass --enable. Enable explicitly only on hosts that
+# use a USB cellular modem as a bond leg:
+#   sudo systemctl enable --now bilbycast-cellular-modem.service
+
+[Service]
+Type=simple
+# APN (required) + MODEM_INDEX / MODEM_IFACE / IP_TYPE / TABLE / RULE_PREF /
+# WATCH_INTERVAL come from this file. The leading '-' tolerates its absence.
+EnvironmentFile=-/etc/default/bilbycast-cellular-modem
+ExecStart=/opt/bilbycast/edge/current/packaging/setup-cellular-modem.sh --watch
+# --watch loops internally (re-checks every WATCH_INTERVAL, reconnects the
+# bearer + re-applies the route on drop). Restart only covers a hard crash.
+Restart=on-failure
+RestartSec=10
+# modem connect + `ip route`/`ip rule` need CAP_NET_ADMIN; runs as root.
+User=root
+
+[Install]
+WantedBy=multi-user.target

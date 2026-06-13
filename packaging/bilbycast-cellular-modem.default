@@ -1,0 +1,29 @@
+# EnvironmentFile for bilbycast-cellular-modem.service
+# Installed to /etc/default/bilbycast-cellular-modem. Edit, then:
+#   sudo systemctl enable --now bilbycast-cellular-modem.service
+#
+# Only APN is required. Everything else auto-detects sensibly.
+
+# Data APN for your SIM (REQUIRED). Examples: connect, truphone.com, internet.
+# Wrong APN = the bearer won't connect. If unsure, check your carrier/SIM.
+APN=
+
+# ModemManager modem index. Leave blank to use the first modem (`mmcli -L`).
+# Set explicitly if the host has more than one modem.
+#MODEM_INDEX=
+
+# WWAN net interface (e.g. wwan0, wwp0s20u4i4). Leave blank to auto-detect from
+# the modem/bearer. Set only if auto-detection picks the wrong one.
+#MODEM_IFACE=
+
+# IP family for the data bearer: ipv4 (default), ipv6, or ipv4v6.
+#IP_TYPE=ipv4
+
+# Dedicated routing table + ip-rule priority for this path. Change only if they
+# collide with another policy-routing setup on the host.
+#TABLE=70
+#RULE_PREF=1070
+
+# Health-check interval (seconds) in --watch mode — how often the daemon
+# re-checks the bearer/interface and reconnects if the carrier dropped it.
+#WATCH_INTERVAL=30

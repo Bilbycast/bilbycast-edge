@@ -570,6 +570,15 @@ echo "  sudo install -m 0644 ${VERSION_DIR}/packaging/strict-binding.conf \\"
 echo "      /etc/systemd/system/bilbycast-edge.service.d/strict-binding.conf"
 echo "  sudo systemctl daemon-reload && sudo systemctl restart bilbycast-edge"
 
+# ── Optional: USB cellular modem as a bond leg ─────────────────────────
+# Only relevant if a USB cellular modem (ModemManager-managed) is one of
+# this host's bonding uplinks. Opt-in keep-alive daemon — not enabled by
+# default. Print the pointer so operators discover it during install.
+echo
+echo "Optional — USB cellular modem as a bonding path (keep-alive daemon):"
+echo "  sudo APN=<your-apn> ${VERSION_DIR}/packaging/install-cellular-modem.sh --enable"
+echo "  https://docs.bilbycast.com/edge/bonding-cellular-modem/"
+
 # ── SO_TXTIME wire-pacing status ──────────────────────────────────────
 if [[ "${ETF_ENABLED_COUNT}" -gt 0 ]]; then
     echo
