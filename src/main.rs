@@ -648,6 +648,18 @@ async fn main() -> anyhow::Result<()> {
     // Shared shutdown token for coordinated graceful shutdown
     let shutdown_token = CancellationToken::new();
 
+    // Cellular uplink telemetry — auto-detects ModemManager modems and polls
+    // any configured RutOS routers, off the data path. The cache is shared with
+    // the manager client (joined onto network_interfaces + drives the
+    // `"cellular"` capability). No-op overhead when no modem / uplink is present.
+    let cellular_cache = std::sync::Arc::new(util::cellular::CellularCache::new());
+    let _cellular_poller_handle = util::cellular::spawn_cellular_poller(
+        state.config.clone(),
+        cellular_cache.clone(),
+        event_sender.clone(),
+        shutdown_token.clone(),
+    );
+
     // Spawn system resource monitor (CPU, RAM, optional NVIDIA GPU util)
     let _resource_monitor_handle = engine::resource_monitor::spawn_resource_monitor(
         app_config.resource_limits.clone(),
@@ -729,6 +741,7 @@ async fn main() -> anyhow::Result<()> {
                 static_capabilities.clone(),
                 live_gpu_state.clone(),
                 Some(standby_listeners.clone()),
+                cellular_cache.clone(),
                 state.start_time,
             );
         }

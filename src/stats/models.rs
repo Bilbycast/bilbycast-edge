@@ -1952,6 +1952,13 @@ pub struct BondPathLegStats {
     /// `"ip_bound_if"` (Apple/BSD bind), or `"none"` (kernel default route).
     #[serde(default)]
     pub binding: String,
+    /// Kernel netdev this leg egresses on (interface-mode UDP legs only).
+    /// Lets the manager UI join the leg to its `network_interfaces[].cellular`
+    /// radio state and draw a signal strip on the leg row. `None` for
+    /// gateway-mode legs (the gateway IP + policy route do the steering), for
+    /// the receiver side, for QUIC/RIST legs, and on older edges.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interface: Option<String>,
 }
 
 // ── Media Analysis ────────────────────────────────────────────────────────

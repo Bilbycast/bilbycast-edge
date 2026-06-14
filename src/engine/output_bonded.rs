@@ -464,6 +464,7 @@ async fn bonded_output_run(
                     ps,
                 )
                 .with_gateway_mode(gateway_mode)
+                .with_interface(super::input_bonded::bond_path_interface(&p.transport))
                 .with_capacity_est(cap_est),
             );
         }

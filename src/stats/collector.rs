@@ -3730,6 +3730,10 @@ pub struct BondPathStatsHandle {
     /// this leg (bits/sec). `None` for the non-adaptive policies, which
     /// don't model per-leg capacity.
     pub capacity_est: Option<Arc<std::sync::atomic::AtomicU64>>,
+    /// Kernel netdev this leg egresses on (interface-mode UDP legs). Surfaced
+    /// as `BondPathLegStats.interface` so the manager UI can join a leg to its
+    /// cellular radio state. `None` for gateway-mode / QUIC / RIST / receiver.
+    pub interface: Option<String>,
 }
 
 impl BondPathStatsHandle {
@@ -3750,12 +3754,19 @@ impl BondPathStatsHandle {
             bitrate_est: Arc::new(crate::stats::throughput::ThroughputEstimator::new()),
             gateway_mode: false,
             capacity_est: None,
+            interface: None,
         }
     }
 
     /// Mark this leg as gateway-mode (builder style).
     pub fn with_gateway_mode(mut self, gateway: bool) -> Self {
         self.gateway_mode = gateway;
+        self
+    }
+
+    /// Attach the kernel netdev this leg egresses on (builder style).
+    pub fn with_interface(mut self, interface: Option<String>) -> Self {
+        self.interface = interface;
         self
     }
 
@@ -3850,6 +3861,14 @@ pub fn bond_handle_to_leg_stats(h: &BondStatsHandle) -> BondLegStats {
                     "gateway".to_string()
                 } else {
                     ps.pin_mechanism_label().to_string()
+                },
+                // Interface-mode legs carry the egress netdev so the UI can
+                // join the leg to its cellular radio state; gateway-mode legs
+                // leave it `None` (the "gateway" binding label tells that story).
+                interface: if p.gateway_mode {
+                    None
+                } else {
+                    p.interface.clone()
                 },
             }
         })

@@ -454,6 +454,13 @@ nvml-wrapper = { version = "0.12", optional = true }
 drm = { version = "0.15", optional = true }
 alsa = { version = "0.11", optional = true }
 
+# Pure-Rust D-Bus client for reading cellular modem state from ModemManager
+# (org.freedesktop.ModemManager1) — powers util::cellular's zero-config USB /
+# PCIe modem telemetry. The `tokio` feature runs it on the existing runtime;
+# no C deps, so testbed/check-binary-purity.sh stays green. Linux-only (D-Bus
+# + ModemManager); the RutOS HTTP source (reqwest) is cross-platform.
+zbus = { version = "5", default-features = false, features = ["tokio"] }
+
 # ---------------------------------------------------------------------------
 # BILBYCAST PATCH: vendored `is` 0.9.0 with the strict-PRIORITY check on ICE
 # Binding Requests removed. Originally vendored against `is` 0.8.0 (2026-04-09);

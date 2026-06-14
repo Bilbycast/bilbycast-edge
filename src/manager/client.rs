@@ -209,13 +209,14 @@ pub fn start_manager_client(
     static_caps: Arc<crate::engine::hardware_probe::StaticCapabilities>,
     live_gpu: Arc<crate::engine::hardware_probe::LiveUtilizationState>,
     standby_listeners: Option<Arc<crate::engine::standby_listeners::StandbyListenerManager>>,
+    cellular_cache: Arc<crate::util::cellular::CellularCache>,
     start_time: Instant,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         manager_client_loop(
             config, flow_manager, tunnel_manager, ws_stats_rx, app_config, config_path,
             secrets_path, api_addr, monitor_addr, webrtc_sessions, event_rx, resource_state,
-            static_caps, live_gpu, standby_listeners, start_time,
+            static_caps, live_gpu, standby_listeners, cellular_cache, start_time,
         ).await;
     })
 }
@@ -236,6 +237,7 @@ async fn manager_client_loop(
     static_caps: Arc<crate::engine::hardware_probe::StaticCapabilities>,
     live_gpu: Arc<crate::engine::hardware_probe::LiveUtilizationState>,
     standby_listeners: Option<Arc<crate::engine::standby_listeners::StandbyListenerManager>>,
+    cellular_cache: Arc<crate::util::cellular::CellularCache>,
     start_time: Instant,
 ) {
     // If we already have a node_id from config, set it on the tunnel manager
@@ -281,6 +283,7 @@ async fn manager_client_loop(
             &static_caps,
             &live_gpu,
             &standby_listeners,
+            &cellular_cache,
             start_time,
         )
         .await
@@ -347,6 +350,7 @@ async fn try_connect(
     static_caps: &Arc<crate::engine::hardware_probe::StaticCapabilities>,
     live_gpu: &Arc<crate::engine::hardware_probe::LiveUtilizationState>,
     standby_listeners: &Option<Arc<crate::engine::standby_listeners::StandbyListenerManager>>,
+    cellular_cache: &Arc<crate::util::cellular::CellularCache>,
     start_time: Instant,
 ) -> Result<ConnectResult, String> {
     // Enforce TLS — only wss:// connections are allowed
@@ -522,7 +526,8 @@ async fn try_connect(
     // iface) lives here so deltas survive across health ticks. The
     // first sample after auth has no prior counters, so rx_bps / tx_bps
     // come back as None on tick #1; from tick #2 onwards they're real.
-    let mut network_sampler = crate::util::network_interfaces::NetworkSampler::new();
+    let mut network_sampler =
+        crate::util::network_interfaces::NetworkSampler::with_cellular_cache(cellular_cache.clone());
 
     // Send initial health
     let health = build_health_message(
@@ -533,6 +538,7 @@ async fn try_connect(
         static_caps,
         live_gpu,
         Some(&mut network_sampler),
+        Some(cellular_cache),
         start_time,
     );
     if let Ok(json) = serde_json::to_string(&health) {
@@ -710,6 +716,7 @@ async fn try_connect(
                         static_caps,
                         live_gpu,
                         Some(&mut network_sampler),
+                        Some(cellular_cache),
                         start_time,
                     )
                 });
@@ -805,12 +812,13 @@ fn build_health_message(
     static_caps: &crate::engine::hardware_probe::StaticCapabilities,
     live_gpu: &crate::engine::hardware_probe::LiveUtilizationState,
     network_sampler: Option<&mut crate::util::network_interfaces::NetworkSampler>,
+    cellular_cache: Option<&Arc<crate::util::cellular::CellularCache>>,
     start_time: Instant,
 ) -> serde_json::Value {
     serde_json::json!({
         "type": "health",
         "timestamp": chrono::Utc::now().to_rfc3339(),
-        "payload": build_health_payload(flow_manager, api_addr, monitor_addr, resource_state, static_caps, live_gpu, network_sampler, start_time)
+        "payload": build_health_payload(flow_manager, api_addr, monitor_addr, resource_state, static_caps, live_gpu, network_sampler, cellular_cache, start_time)
     })
 }
 
@@ -822,8 +830,17 @@ pub(crate) fn build_health_payload(
     static_caps: &crate::engine::hardware_probe::StaticCapabilities,
     live_gpu: &crate::engine::hardware_probe::LiveUtilizationState,
     network_sampler: Option<&mut crate::util::network_interfaces::NetworkSampler>,
+    cellular_cache: Option<&Arc<crate::util::cellular::CellularCache>>,
     start_time: Instant,
 ) -> serde_json::Value {
+    // Capabilities are mostly compile-time/probe-derived; the `"cellular"` bit
+    // is runtime — advertised whenever the poller has at least one source
+    // (configured RutOS uplink or auto-detected modem), independent of whether
+    // a snapshot is currently fresh, so it stays stable while data ages out.
+    let mut caps = edge_capabilities();
+    if cellular_cache.map(|c| c.has_sources()).unwrap_or(false) {
+        caps.push("cellular");
+    }
     #[allow(unused_mut)]
     let mut payload = serde_json::json!({
         "status": "ok",
@@ -839,7 +856,7 @@ pub(crate) fn build_health_payload(
         // include this field are treated as "no advertised features" by
         // the manager — the field is `Option` with `serde(default)` on
         // the manager side.
-        "capabilities": edge_capabilities(),
+        "capabilities": caps,
         "system_resources": build_system_resources_payload(resource_state),
         // Static + live HW / SW resource budget. Manager UI keys off the
         // `"resources"` capability string to render the Resources card

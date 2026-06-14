@@ -240,6 +240,7 @@ mod tests {
             logging: None,
             nmos_registration: None,
             upgrades: None,
+            cellular_uplinks: Vec::new(),
             inputs: vec![InputDefinition {
                 active: true,
                 group: None,

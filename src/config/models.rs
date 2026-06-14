@@ -85,6 +85,62 @@ pub struct AppConfig {
     /// binary. Off by default — operators opt in per node.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub upgrades: Option<UpgradeConfig>,
+    /// Optional cellular-uplink telemetry sources (RutOS routers). Modems
+    /// managed by ModemManager are auto-detected and need **no** entry here.
+    /// Read-only; off the data path. See `docs/cellular.md`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cellular_uplinks: Vec<CellularUplinkConfig>,
+}
+
+/// One opt-in cellular-uplink telemetry source. Only RutOS routers need an
+/// entry (`kind = "rutos"`); USB/PCIe modems are auto-detected via ModemManager.
+/// The radio state read from this source is attached, read-only, to the kernel
+/// `interface` it annotates (`HealthPayload.network_interfaces[].cellular`).
+///
+/// The `password` is an **infrastructure secret**: it lives only in
+/// `secrets.json` (keyed by `interface`), is stripped from `GetConfig`, and is
+/// re-merged on `UpdateConfig` — the manager never round-trips it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CellularUplinkConfig {
+    /// Kernel netdev this annotates, e.g. `"eno4"`.
+    pub interface: String,
+    /// Source kind. Only `"rutos"` is read by this source today; other values
+    /// are ignored here (modems auto-detect).
+    #[serde(default = "default_cellular_kind")]
+    pub kind: String,
+    /// `"http"` | `"https"` (default `"https"`).
+    #[serde(default = "default_cellular_scheme")]
+    pub scheme: String,
+    /// Router host or IP (no scheme), e.g. `"192.168.1.1"`.
+    pub address: String,
+    /// `"ubus"` (default, broad compatibility) | `"rest"` (RutOS 7.x).
+    #[serde(default = "default_cellular_api")]
+    pub api: String,
+    /// Read-only RutOS username.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub username: Option<String>,
+    /// Read-only RutOS password. **Secret** — stored in `secrets.json`,
+    /// stripped from `GetConfig`. Never set in `config.json`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub password: Option<String>,
+    /// Verify the router's TLS chain. Defaults `false` because RutOS ships a
+    /// self-signed cert; prefer a `cert_fingerprint` pin over CA validation.
+    #[serde(default)]
+    pub verify_tls: bool,
+    /// Optional SHA-256 cert fingerprint pin (hex, `:`-separators allowed).
+    /// Stronger than CA validation for a self-signed router.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cert_fingerprint: Option<String>,
+}
+
+fn default_cellular_kind() -> String {
+    "rutos".to_string()
+}
+fn default_cellular_scheme() -> String {
+    "https".to_string()
+}
+fn default_cellular_api() -> String {
+    "ubus".to_string()
 }
 
 impl Default for AppConfig {
@@ -107,6 +163,7 @@ impl Default for AppConfig {
             flow_groups: Vec::new(),
             nmos_registration: None,
             upgrades: None,
+            cellular_uplinks: Vec::new(),
         }
     }
 }
@@ -6329,6 +6386,7 @@ mod tests {
             flow_groups: Vec::new(),
             nmos_registration: None,
             upgrades: None,
+            cellular_uplinks: Vec::new(),
             inputs: vec![InputDefinition {
                 active: true,
                 group: None,

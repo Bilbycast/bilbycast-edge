@@ -67,6 +67,9 @@ pub fn validate_config(config: &AppConfig) -> Result<()> {
         validate_logging_config(logging)?;
     }
 
+    // Validate cellular-uplink telemetry sources (read-only RutOS routers).
+    validate_cellular_uplinks(&config.cellular_uplinks)?;
+
     // Validate TLS config if present
     if let Some(ref tls) = config.server.tls {
         if tls.cert_path.is_empty() {
@@ -2836,6 +2839,67 @@ fn validate_name(name: &str, context: &str) -> Result<()> {
     }
     if name.len() > 256 {
         bail!("{context} name must be at most 256 characters");
+    }
+    Ok(())
+}
+
+/// Validate the optional `cellular_uplinks` list (read-only RutOS telemetry).
+/// Bounds every operator-supplied string and rejects duplicate interfaces.
+fn validate_cellular_uplinks(uplinks: &[crate::config::models::CellularUplinkConfig]) -> Result<()> {
+    let mut seen = std::collections::HashSet::new();
+    for u in uplinks {
+        let ctx = format!("cellular_uplink '{}'", u.interface);
+        // Interface name — kernel netdev, ≤ 64 chars, non-empty.
+        if u.interface.trim().is_empty() {
+            bail!("cellular_uplink: interface cannot be empty");
+        }
+        if u.interface.len() > 64 {
+            bail!("{ctx}: interface must be at most 64 characters");
+        }
+        if !seen.insert(u.interface.as_str()) {
+            bail!("cellular_uplink: duplicate interface '{}'", u.interface);
+        }
+        // kind — bounded; only "rutos" is read today (others are inert here).
+        if u.kind.len() > 32 {
+            bail!("{ctx}: kind must be at most 32 characters");
+        }
+        // scheme / api enums.
+        if !u.scheme.eq_ignore_ascii_case("http") && !u.scheme.eq_ignore_ascii_case("https") {
+            bail!("{ctx}: scheme must be \"http\" or \"https\", got \"{}\"", u.scheme);
+        }
+        if !u.api.eq_ignore_ascii_case("ubus") && !u.api.eq_ignore_ascii_case("rest") {
+            bail!("{ctx}: api must be \"ubus\" or \"rest\", got \"{}\"", u.api);
+        }
+        // address — a bare host or IP (no scheme/port), DNS-style bounds.
+        let addr = u.address.trim();
+        if addr.is_empty() {
+            bail!("{ctx}: address cannot be empty");
+        }
+        if addr.len() > 253 {
+            bail!("{ctx}: address must be at most 253 characters");
+        }
+        if addr.contains("://") || addr.contains('/') {
+            bail!("{ctx}: address must be a bare host or IP (no scheme or path)");
+        }
+        if let Some(ref user) = u.username {
+            if user.len() > 64 {
+                bail!("{ctx}: username must be at most 64 characters");
+            }
+        }
+        if let Some(ref pass) = u.password {
+            if pass.len() > 256 {
+                bail!("{ctx}: password must be at most 256 characters");
+            }
+        }
+        // cert_fingerprint — SHA-256 hex (32 bytes), optional `:` separators.
+        if let Some(ref fp) = u.cert_fingerprint {
+            let hex: String = fp.chars().filter(|c| !c.is_whitespace() && *c != ':').collect();
+            if hex.len() != 64 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
+                bail!(
+                    "{ctx}: cert_fingerprint must be a SHA-256 hex string (64 hex chars, optional ':' separators)"
+                );
+            }
+        }
     }
     Ok(())
 }

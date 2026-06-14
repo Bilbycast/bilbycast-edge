@@ -66,6 +66,10 @@ pub struct SecretsConfig {
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub tunnels: HashMap<String, TunnelSecrets>,
 
+    // -- Per-cellular-uplink secrets, keyed by interface name --
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub cellular_uplinks: HashMap<String, CellularUplinkSecrets>,
+
     // -- Legacy per-flow secrets (v1 migration only) --
     // Flow secrets were moved back to config.json in v2. This field exists
     // solely to deserialize old secrets.json files during migration.
@@ -90,6 +94,20 @@ pub struct TunnelSecrets {
     pub tls_cert_pem: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tls_key_pem: Option<String>,
+}
+
+/// Secret fields for a single cellular uplink (RutOS router credential).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CellularUplinkSecrets {
+    /// Read-only RutOS password.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub password: Option<String>,
+}
+
+impl CellularUplinkSecrets {
+    fn is_empty(&self) -> bool {
+        self.password.is_none()
+    }
 }
 
 /// Secret fields for a single flow (input + outputs).
@@ -169,6 +187,7 @@ impl SecretsConfig {
             && self.setup_token.is_none()
             && self.nmos_registration_bearer_token.is_none()
             && self.tunnels.is_empty()
+            && self.cellular_uplinks.is_empty()
             && self.flows.is_empty()
     }
 
@@ -214,6 +233,18 @@ impl SecretsConfig {
             };
             if !ts.is_empty() {
                 secrets.tunnels.insert(tunnel.id.clone(), ts);
+            }
+        }
+
+        // Cellular-uplink secrets (RutOS router passwords), keyed by interface.
+        for uplink in &config.cellular_uplinks {
+            let cs = CellularUplinkSecrets {
+                password: uplink.password.clone(),
+            };
+            if !cs.is_empty() {
+                secrets
+                    .cellular_uplinks
+                    .insert(uplink.interface.clone(), cs);
             }
         }
 
@@ -280,6 +311,15 @@ impl SecretsConfig {
                 }
                 if ts.tls_key_pem.is_some() && tunnel.tls_key_pem.is_none() {
                     tunnel.tls_key_pem = ts.tls_key_pem.clone();
+                }
+            }
+        }
+
+        // Cellular-uplink secrets (keyed by interface).
+        for uplink in &mut config.cellular_uplinks {
+            if let Some(cs) = self.cellular_uplinks.get(&uplink.interface) {
+                if cs.password.is_some() && uplink.password.is_none() {
+                    uplink.password = cs.password.clone();
                 }
             }
         }
@@ -467,6 +507,11 @@ impl AppConfig {
             tunnel.tls_key_pem = None;
         }
 
+        // Cellular-uplink router passwords — infrastructure secret.
+        for uplink in &mut self.cellular_uplinks {
+            uplink.password = None;
+        }
+
         // Flow parameters are NOT stripped — they are user-configured values
         // that need to be visible in the manager UI and survive round-trip updates.
     }
@@ -505,6 +550,11 @@ impl AppConfig {
             tunnel.tunnel_psk = None;
             tunnel.tls_cert_pem = None;
             tunnel.tls_key_pem = None;
+        }
+
+        // Cellular-uplink router passwords — internal.
+        for uplink in &mut self.cellular_uplinks {
+            uplink.password = None;
         }
 
         // Flow parameters are NOT masked — users need to see their configured
@@ -550,6 +600,13 @@ pub fn has_secrets(config: &AppConfig) -> bool {
             || tunnel.tls_cert_pem.is_some()
             || tunnel.tls_key_pem.is_some()
         {
+            return true;
+        }
+    }
+
+    // Cellular-uplink router passwords
+    for uplink in &config.cellular_uplinks {
+        if uplink.password.is_some() {
             return true;
         }
     }
@@ -612,6 +669,50 @@ mod tests {
             ingress_delay_ms: None,
             passthrough_clock: None,
         }
+    }
+
+    #[test]
+    fn cellular_uplink_password_extract_strip_merge() {
+        // Build a config with one RutOS uplink carrying a router password.
+        let mut config = AppConfig {
+            cellular_uplinks: vec![CellularUplinkConfig {
+                interface: "eno4".to_string(),
+                kind: "rutos".to_string(),
+                scheme: "https".to_string(),
+                address: "192.168.1.1".to_string(),
+                api: "ubus".to_string(),
+                username: Some("monitor".to_string()),
+                password: Some("s3cret-pass".to_string()),
+                verify_tls: false,
+                cert_fingerprint: None,
+            }],
+            ..Default::default()
+        };
+
+        // has_secrets detects the router password.
+        assert!(has_secrets(&config));
+
+        // extract_from pulls the password into secrets, keyed by interface.
+        let secrets = SecretsConfig::extract_from(&config);
+        assert_eq!(
+            secrets
+                .cellular_uplinks
+                .get("eno4")
+                .and_then(|c| c.password.as_deref()),
+            Some("s3cret-pass")
+        );
+
+        // strip_secrets (GetConfig path) blanks the password.
+        config.strip_secrets();
+        assert!(config.cellular_uplinks[0].password.is_none());
+        assert!(!has_secrets(&config));
+
+        // merge_into (UpdateConfig path) restores it from secrets.
+        secrets.merge_into(&mut config);
+        assert_eq!(
+            config.cellular_uplinks[0].password.as_deref(),
+            Some("s3cret-pass")
+        );
     }
 
     #[test]
@@ -683,6 +784,7 @@ mod tests {
             flow_groups: vec![],
             nmos_registration: None,
             upgrades: None,
+            cellular_uplinks: vec![],
         };
 
         // Extract secrets — only infrastructure secrets, not flow params

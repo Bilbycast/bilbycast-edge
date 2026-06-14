@@ -19,8 +19,11 @@
 use serde::Serialize;
 use std::collections::HashMap;
 use std::net::IpAddr;
+use std::sync::Arc;
 #[cfg(target_os = "linux")]
 use std::time::Instant;
+
+use crate::util::cellular::{CellularCache, CellularMetrics};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct NetworkInterfaceInfo {
@@ -54,6 +57,12 @@ pub struct NetworkInterfaceInfo {
     pub rx_errors: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tx_errors: Option<u64>,
+    /// Live cellular radio state when this interface is a mobile uplink
+    /// (a USB/PCIe modem ModemManager owns, or a RutOS router's modem the
+    /// edge polls). Joined from the cellular poller's cache at sample time;
+    /// `None` for non-cellular interfaces and on edges without the poller.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cellular: Option<CellularMetrics>,
 }
 
 /// Per-tick state needed to derive bandwidth rates from the kernel's
@@ -63,6 +72,10 @@ pub struct NetworkInterfaceInfo {
 pub struct NetworkSampler {
     #[cfg(target_os = "linux")]
     last_samples: HashMap<String, LastSample>,
+    /// Optional handle to the cellular poller's lock-free cache. When present,
+    /// `sample()` joins per-interface radio state onto each entry. `None` on
+    /// the monitor `/health` path and on edges without the poller.
+    cellular_cache: Option<Arc<CellularCache>>,
 }
 
 #[cfg(target_os = "linux")]
@@ -73,8 +86,13 @@ struct LastSample {
 }
 
 impl NetworkSampler {
-    pub fn new() -> Self {
-        Self::default()
+    /// Construct a sampler that joins cellular state from the poller's cache.
+    /// (A cache-less sampler is `NetworkSampler::default()`.)
+    pub fn with_cellular_cache(cache: Arc<CellularCache>) -> Self {
+        Self {
+            cellular_cache: Some(cache),
+            ..Default::default()
+        }
     }
 
     /// Enumerate interfaces and, on Linux, populate rate / drop / error
@@ -120,6 +138,14 @@ impl NetworkSampler {
             // unbounded across hot-add/remove cycles (USB NICs, container veth).
             self.last_samples.retain(|name, _| seen.contains(name));
         }
+        // Join cellular radio state from the poller cache (cross-platform —
+        // RutOS sources work on any host). Pure lock-free reads; no added
+        // latency on the health tick.
+        if let Some(cache) = &self.cellular_cache {
+            for entry in out.iter_mut() {
+                entry.cellular = cache.get(&entry.name);
+            }
+        }
         out
     }
 }
@@ -159,6 +185,7 @@ pub fn enumerate() -> Vec<NetworkInterfaceInfo> {
                 tx_dropped: None,
                 rx_errors: None,
                 tx_errors: None,
+                cellular: None,
             });
         match iface.ip() {
             IpAddr::V4(v4) => entry.ipv4.push(v4.to_string()),
@@ -176,12 +203,40 @@ pub fn enumerate() -> Vec<NetworkInterfaceInfo> {
             .and_then(|s| s.parse::<i64>().ok())
             .filter(|n| *n > 0)
             .map(|n| n as u64);
-        entry.is_up = read_sysfs_string(&format!("{base}/operstate")).map(|s| s == "up");
+        // `operstate` is authoritative for "up"/"down", but many drivers leave
+        // it "unknown" even when the link is live — notably WWAN raw-IP cellular
+        // modems (ARPHRD_NONE) and loopback. Mapping "unknown" → DOWN is wrong
+        // (a registered modem with carrier shows DOWN), so fall back to the
+        // `carrier` flag rather than declaring a false DOWN.
+        entry.is_up = operstate_to_is_up(
+            read_sysfs_string(&format!("{base}/operstate")).as_deref(),
+            read_sysfs_string(&format!("{base}/carrier")).as_deref(),
+        );
     }
 
     let mut out: Vec<NetworkInterfaceInfo> = by_name.into_values().collect();
     out.sort_by(|a, b| a.name.cmp(&b.name));
     out
+}
+
+/// Map sysfs `operstate` + `carrier` to an operational up/down.
+///
+/// `operstate` is authoritative when it says "up"/"down"/"lowerlayerdown".
+/// When it's "unknown"/"dormant"/"notpresent"/missing — which WWAN raw-IP
+/// modems and loopback report even while live — fall back to `carrier`
+/// (`1` = link present, `0` = no link; unreadable when admin-down → `None`),
+/// so a registered modem with carrier isn't mislabelled DOWN.
+#[cfg(target_os = "linux")]
+fn operstate_to_is_up(operstate: Option<&str>, carrier: Option<&str>) -> Option<bool> {
+    match operstate {
+        Some("up") => Some(true),
+        Some("down") | Some("lowerlayerdown") => Some(false),
+        _ => match carrier {
+            Some("1") => Some(true),
+            Some("0") => Some(false),
+            _ => None,
+        },
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -245,6 +300,7 @@ mod tests {
             tx_dropped: Some(0),
             rx_errors: Some(0),
             tx_errors: Some(0),
+            cellular: None,
         };
         let v = serde_json::to_value(&info).unwrap();
         assert_eq!(v["name"], "eth0");
@@ -276,9 +332,14 @@ mod tests {
             tx_dropped: None,
             rx_errors: None,
             tx_errors: None,
+            cellular: None,
         };
         let v = serde_json::to_value(&info).unwrap();
         assert!(v.get("mac").is_none(), "mac should be omitted when None");
+        assert!(
+            v.get("cellular").is_none(),
+            "cellular should be omitted when None"
+        );
         assert!(v.get("mtu").is_none(), "mtu should be omitted when None");
         assert!(v.get("link_speed_mbps").is_none(), "link_speed_mbps should be omitted when None");
         assert!(v.get("is_up").is_none(), "is_up should be omitted when None");
@@ -288,9 +349,25 @@ mod tests {
         assert!(v.get("rx_errors").is_none());
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn operstate_carrier_up_down_mapping() {
+        // Ethernet: operstate is authoritative.
+        assert_eq!(operstate_to_is_up(Some("up"), Some("1")), Some(true));
+        assert_eq!(operstate_to_is_up(Some("down"), Some("0")), Some(false));
+        assert_eq!(operstate_to_is_up(Some("lowerlayerdown"), Some("0")), Some(false));
+        // WWAN raw-IP modem / loopback: operstate "unknown" but carrier present
+        // → UP (the bug: was reported DOWN). This is the wwp151s0u1i4 case.
+        assert_eq!(operstate_to_is_up(Some("unknown"), Some("1")), Some(true));
+        assert_eq!(operstate_to_is_up(Some("unknown"), Some("0")), Some(false));
+        // Indeterminate (admin-down → carrier read fails) → None, not DOWN.
+        assert_eq!(operstate_to_is_up(Some("unknown"), None), None);
+        assert_eq!(operstate_to_is_up(None, None), None);
+    }
+
     #[test]
     fn sampler_first_call_has_no_rate() {
-        let mut sampler = NetworkSampler::new();
+        let mut sampler = NetworkSampler::default();
         let snap = sampler.sample();
         // First call: no prior counters → rx_bps / tx_bps must be None
         // for every interface, regardless of OS.

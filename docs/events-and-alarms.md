@@ -476,6 +476,22 @@ can grep on a stable string.
 | critical | `NMOS registration of <type> at <url> failed: HTTP <status> <error>` | A registration POST returned 4xx/5xx. The client retries with exponential backoff. | `nmos_registration_failed` |
 | warning | `NMOS registry <url> unreachable: <error>` | Network / DNS / TLS error reaching the registry. The client retries with exponential backoff. | `nmos_registry_unreachable` |
 
+### Cellular uplink events (`cellular`)
+
+Surfaced by the cellular telemetry poller (`src/util/cellular`) for mobile
+uplinks (a USB/PCIe modem via ModemManager, or a RutOS router the edge polls).
+Node-level (no `flow_id`); all carry `details.error_code` + `details.interface`.
+Debounced so a flapping link doesn't spam the feed. See
+[`docs/cellular.md`](cellular.md).
+
+| Severity | Message | Trigger | `details.error_code` |
+|----------|---------|---------|----------------------|
+| info / warning | `cellular uplink '<iface>' registration <from> → <to>` | Registration state transition. Warning when the new state is `denied` / `sim_missing` / `sim_pin_required`, else info. | `cellular_registration_changed` |
+| warning | `cellular uplink '<iface>' signal degraded (<n>/5 bars)` | Bars drop to ≤ 1 (enter the degraded state; hysteresis). | `cellular_signal_degraded` |
+| info | `cellular uplink '<iface>' signal recovered (<n>/5 bars)` | Bars climb back to ≥ 3 (leave the degraded state). | `cellular_signal_recovered` |
+| warning | `cellular uplink '<iface>' unreachable` | A RutOS poll has failed 3 cycles in a row. | `cellular_uplink_unreachable` |
+| info | `cellular uplink '<iface>' reachable again` | A RutOS poll succeeds after being unreachable. | `cellular_uplink_recovered` |
+
 ### Configuration (`config`)
 
 | Severity | Message | Trigger |

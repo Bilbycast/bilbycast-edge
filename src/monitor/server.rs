@@ -74,7 +74,8 @@ async fn monitor_health(State(state): State<MonitorState>) -> Json<serde_json::V
         &state.app.resource_state,
         &state.static_caps,
         &state.live_gpu,
-        None,
+        None, // network sampler — stateless enumeration on the monitor path
+        None, // cellular cache — capability advertised via the manager path
         state.app.start_time,
     );
     Json(payload)

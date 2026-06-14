@@ -91,6 +91,10 @@ pub fn spawn_bonded_input(
             Vec::with_capacity(config.paths.len());
         for p in &config.paths {
             if let Some(ps) = socket.path_stats(p.id) {
+                // Receiver legs bind a listening port (inbound only) — there is
+                // no meaningful egress interface, so leave it `None` (the
+                // cellular signal join is a sender-side concern). See the
+                // BondPathStatsHandle.interface contract.
                 path_handles.push(crate::stats::collector::BondPathStatsHandle::new(
                     p.id,
                     p.name.clone(),
@@ -352,5 +356,18 @@ pub(crate) fn bond_transport_label(t: &BondPathTransportConfig) -> String {
         BondPathTransportConfig::Udp { .. } => "udp".to_string(),
         BondPathTransportConfig::Rist { .. } => "rist".to_string(),
         BondPathTransportConfig::Quic { .. } => "quic".to_string(),
+    }
+}
+
+/// The kernel netdev an interface-mode UDP leg egresses on, for the bond-leg
+/// stats join (cellular signal strip). `None` for gateway-mode legs (the
+/// gateway IP + policy route do the steering, not a NIC pin) and for
+/// QUIC / RIST legs.
+pub(crate) fn bond_path_interface(t: &BondPathTransportConfig) -> Option<String> {
+    match t {
+        BondPathTransportConfig::Udp {
+            interface, gateway, ..
+        } if gateway.is_none() => interface.clone(),
+        _ => None,
     }
 }

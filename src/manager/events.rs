@@ -635,6 +635,14 @@ pub mod category {
     /// machine-readable reason matching the codes documented in
     /// `src/upgrade/mod.rs::error_codes`.
     pub const UPGRADE: &str = "upgrade";
+
+    /// Cellular uplink telemetry (modem / RutOS). `info` for registration
+    /// changes + signal recovery, `warning` for signal degraded / uplink
+    /// unreachable / SIM denied. `details.error_code` is one of
+    /// `cellular_registration_changed` / `cellular_signal_degraded` /
+    /// `cellular_signal_recovered` / `cellular_uplink_unreachable` /
+    /// `cellular_uplink_recovered`.
+    pub const CELLULAR: &str = "cellular";
 }
 
 /// Scope label passed to [`run_bond_event_forwarder`] so generated
