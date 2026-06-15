@@ -105,10 +105,54 @@ pub struct CellularMetrics {
     /// Configured data cap in bytes, when known.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub data_limit_bytes: Option<u64>,
+    /// Last poll-failure reason for a configured uplink that isn't responding
+    /// (auth rejected / unreachable / unexpected response). When set, the UI
+    /// renders the row as errored with this cause instead of a blank "no data"
+    /// row, so a misconfigured router is diagnosable at a glance. `None` on a
+    /// healthy sample.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+    /// Whether the host-side cellular keep-alive daemon
+    /// (`bilbycast-cellular-modem.service`) is currently running, detected via
+    /// its status-file heartbeat. Only meaningful for `modem_manager` sources
+    /// (a RutOS router keeps its own bearer) — `None` otherwise. Drives the UI's
+    /// "keeper active" indicator and whether a Wake control can do anything.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keeper_active: Option<bool>,
     /// Unix milliseconds when this snapshot was sampled (drives staleness +
     /// the UI "age" hint).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sampled_at_unix_ms: Option<u64>,
+}
+
+impl CellularMetrics {
+    /// Failure placeholder for a configured RutOS uplink whose poll failed, so
+    /// the UI surfaces the configured router with its error cause instead of a
+    /// blank row. Carries only source + reason + timestamp.
+    pub fn unreachable(
+        source: CellularSourceKind,
+        reason: String,
+        sampled_at_unix_ms: u64,
+    ) -> Self {
+        Self {
+            source,
+            state: CellularRegState::Unknown,
+            access_tech: None,
+            operator: None,
+            plmn: None,
+            band: None,
+            cell_id: None,
+            signal: None,
+            roaming: None,
+            sim_slot: None,
+            temperature_c: None,
+            data_used_bytes: None,
+            data_limit_bytes: None,
+            last_error: Some(reason),
+            keeper_active: None,
+            sampled_at_unix_ms: Some(sampled_at_unix_ms),
+        }
+    }
 }
 
 /// Per-metric signal figures. All `Option` — sources populate what they have.
@@ -352,6 +396,165 @@ pub fn normalize_access_tech(raw: &str) -> Option<String> {
     Some(s)
 }
 
+// ── Cellular control: request/execute file-IPC with the host keeper ──
+//
+// The cellular telemetry above is strictly read-only, and the edge has no
+// privilege to drive ModemManager (polkit `Device.Control` is
+// `allow_inactive=no`, so a headless service is denied). To let an operator
+// wake a dormant USB-modem bond leg from the manager UI *without a shell*, the
+// edge drops a small *request* file that the opt-in root keep-alive daemon
+// (`packaging/bilbycast-cellular-modem.service`) executes — it runs
+// `mmcli --simple-connect`, re-applies the lease + route, and writes back a
+// nonce-matched *status* file. The edge only ever touches a bilbycast-owned
+// file; it gains no modem privilege. See `docs/cellular.md`
+// ("request/execute split"). This mirrors the PTP helper file-IPC
+// (`/var/lib/bilbycast/ptp.conf`).
+
+/// Default shared dir for the request/status files (also home to `ptp.conf`).
+/// Overridable via `BILBYCAST_CELLULAR_WAKE_DIR` for tests / non-standard layouts.
+const WAKE_DIR_DEFAULT: &str = "/var/lib/bilbycast";
+/// A keeper status heartbeat newer than this means the daemon is alive. Generous
+/// (≈4× the keeper's default 30 s watch interval) so it doesn't flap on a single
+/// missed cycle.
+const KEEPER_FRESH: Duration = Duration::from_secs(120);
+/// How long [`request_wake`] waits for the keeper to confirm a terminal result.
+const WAKE_CONFIRM_TIMEOUT: Duration = Duration::from_secs(8);
+
+fn wake_dir() -> std::path::PathBuf {
+    std::env::var_os("BILBYCAST_CELLULAR_WAKE_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from(WAKE_DIR_DEFAULT))
+}
+fn wake_req_path() -> std::path::PathBuf {
+    wake_dir().join("cellular-wake.req")
+}
+fn wake_status_path() -> std::path::PathBuf {
+    wake_dir().join("cellular-wake.status")
+}
+
+/// Result of a wake request, returned to the manager.
+#[derive(Debug, Clone, Serialize)]
+pub struct WakeOutcome {
+    /// `"connected"` (bearer up), `"failed"` (see `detail`), or `"requested"`
+    /// (keeper accepted the request but didn't confirm a terminal state within
+    /// the wait — its watch loop keeps retrying).
+    pub state: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    /// Lease address the keeper applied, when it reported one (e.g. CGNAT IP).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub addr: Option<String>,
+}
+
+/// True when the host keeper's status-file heartbeat is fresh — i.e. the
+/// `bilbycast-cellular-modem.service` daemon is running and able to service a
+/// wake request. A bare stat of one file; safe on the slow poll path.
+pub fn keeper_heartbeat_fresh() -> bool {
+    let Ok(meta) = std::fs::metadata(wake_status_path()) else {
+        return false;
+    };
+    let Ok(modified) = meta.modified() else {
+        return false;
+    };
+    modified.elapsed().map(|age| age <= KEEPER_FRESH).unwrap_or(false)
+}
+
+/// Whether an operator can usefully issue a wake from the manager — true exactly
+/// when a keeper is running to service it. Gates the `cellular-control`
+/// capability so the UI never shows a Wake control that can't work.
+pub fn wake_control_available() -> bool {
+    keeper_heartbeat_fresh()
+}
+
+/// Monotonic-ish nonce so a status read can be matched to *this* request.
+fn next_wake_nonce() -> String {
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("{}-{}", now_unix_ms(), n)
+}
+
+/// Write the request file in place. Deliberately NOT temp+rename: in production
+/// the installer pre-creates this file owned by the edge's service account
+/// (`bilbycast`), so an in-place write needs write permission on the FILE only —
+/// not on the root-owned `/var/lib/bilbycast` directory (the edge can't write
+/// that dir; this mirrors how the PTP helper's `ptp.conf` is seeded + rewritten
+/// in place). The body is a single small `write(2)`, and the keeper re-reads on
+/// mtime change + matches a nonce, so a torn read self-corrects on the next
+/// poll rather than acting on stale bytes.
+fn write_wake_request(nonce: &str, iface: &str, apn: Option<&str>) -> std::io::Result<()> {
+    let body = format!(
+        "nonce={nonce}\niface={iface}\napn={}\nts={}\n",
+        apn.unwrap_or(""),
+        now_unix_ms()
+    );
+    std::fs::write(wake_req_path(), body)
+}
+
+/// Parse the keeper's status file body into `(nonce, state, detail, addr)`.
+/// Pure (no I/O) so the contract is unit-testable.
+fn parse_wake_status(text: &str) -> Option<(String, String, Option<String>, Option<String>)> {
+    let mut nonce = None;
+    let mut state = None;
+    let mut detail = None;
+    let mut addr = None;
+    for line in text.lines() {
+        let Some((k, v)) = line.split_once('=') else {
+            continue;
+        };
+        let v = v.trim();
+        match k.trim() {
+            "nonce" => nonce = Some(v.to_string()),
+            "state" => state = Some(v.to_string()),
+            "detail" if !v.is_empty() => detail = Some(v.to_string()),
+            "addr" if !v.is_empty() && v != "-" => addr = Some(v.to_string()),
+            _ => {}
+        }
+    }
+    Some((nonce?, state?, detail, addr))
+}
+
+fn read_wake_status() -> Option<(String, String, Option<String>, Option<String>)> {
+    parse_wake_status(&std::fs::read_to_string(wake_status_path()).ok()?)
+}
+
+/// Ask the host keeper to wake/connect `iface` (optionally setting `apn`), then
+/// wait briefly for it to confirm. Returns `Err` only when the IPC itself can't
+/// be used (no keeper running / can't write the request); a keeper-reported
+/// connect failure comes back as `Ok(WakeOutcome { state: "failed", .. })`.
+pub async fn request_wake(iface: &str, apn: Option<&str>) -> Result<WakeOutcome, String> {
+    if !wake_control_available() {
+        return Err(
+            "cellular_wake_unavailable: no cellular keep-alive daemon running on this host \
+             (install + enable bilbycast-cellular-modem.service)"
+                .to_string(),
+        );
+    }
+    let nonce = next_wake_nonce();
+    write_wake_request(&nonce, iface, apn)
+        .map_err(|e| format!("cellular_wake_unavailable: cannot write wake request: {e}"))?;
+
+    // Poll for the keeper to echo our nonce with a terminal state. Fast poll
+    // (250 ms) against an 8 s budget — well inside the keeper's 30 s heartbeat,
+    // so a heartbeat write never clobbers our response before we read it.
+    let deadline = tokio::time::Instant::now() + WAKE_CONFIRM_TIMEOUT;
+    loop {
+        if let Some((sn, state, detail, addr)) = read_wake_status() {
+            if sn == nonce && (state == "connected" || state == "failed") {
+                return Ok(WakeOutcome { state, detail, addr });
+            }
+        }
+        if tokio::time::Instant::now() >= deadline {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    Ok(WakeOutcome {
+        state: "requested".to_string(),
+        detail: Some("keeper accepted the request but did not confirm within 8s".to_string()),
+        addr: None,
+    })
+}
+
 // ── Background poller ──
 
 /// Spawn the cellular poller under the app's cancellation tree. Returns the
@@ -379,6 +582,10 @@ struct CellEventState {
     fail_count: u32,
     /// True while an unreachable Warning is outstanding (so we emit once).
     unreachable: bool,
+    /// Consecutive cycles a modem source has been dormant with no keeper.
+    keeper_miss_count: u32,
+    /// True while a `cellular_keeper_missing` Warning is outstanding.
+    keeper_missing: bool,
 }
 
 async fn cellular_poller_loop(
@@ -416,6 +623,7 @@ async fn cellular_poller_loop(
         }
 
         let mut produced: Vec<(String, CellularMetrics)> = Vec::new();
+        let mut failed: Vec<(String, String)> = Vec::new();
         let mut source_ifaces: HashSet<String> = HashSet::new();
 
         // 3. ModemManager (Linux, zero-config auto-detection).
@@ -444,28 +652,51 @@ async fn cellular_poller_loop(
             }
         }
 
-        // 4. RutOS routers (opt-in). Each sample is time-bounded; a failure
-        //    drops the snapshot (it ages out → UI shows "no data") and feeds
-        //    the unreachable-event debounce.
+        // 4. RutOS routers (opt-in). Each sample is time-bounded; a failure is
+        //    cached as an error placeholder (so the UI shows the configured
+        //    router with its cause, not a blank row) and feeds the
+        //    unreachable-event debounce.
         for (iface, src) in rutos_sources.iter() {
             source_ifaces.insert(iface.clone());
-            let res = tokio::time::timeout(SAMPLE_TIMEOUT, src.sample()).await;
-            match res {
-                Ok(Some(m)) => {
+            match tokio::time::timeout(SAMPLE_TIMEOUT, src.sample()).await {
+                Ok(Ok(m)) => {
                     produced.push((iface.clone(), m));
                 }
-                Ok(None) | Err(_) => {
+                Ok(Err(reason)) => {
+                    tracing::warn!("cellular uplink '{iface}': {reason}");
+                    failed.push((iface.clone(), reason));
+                    note_unreachable(&events, &mut ev_state, iface);
+                }
+                Err(_) => {
+                    failed.push((
+                        iface.clone(),
+                        format!("no response within {}s", SAMPLE_TIMEOUT.as_secs()),
+                    ));
                     note_unreachable(&events, &mut ev_state, iface);
                 }
             }
         }
 
-        // 5. Publish snapshots + emit state-change events.
+        // 5. Publish snapshots + emit state-change events. Stamp the host
+        //    keeper's liveness onto modem sources (RutOS keeps its own bearer,
+        //    so the flag is irrelevant there and left None).
         let now_ms = now_unix_ms();
+        let keeper_fresh = keeper_heartbeat_fresh();
         for (iface, mut m) in produced {
             m.sampled_at_unix_ms = Some(now_ms);
+            if m.source == CellularSourceKind::ModemManager {
+                m.keeper_active = Some(keeper_fresh);
+            }
             note_success(&events, &mut ev_state, &iface, &m);
             cache.insert(iface, m);
+        }
+        // Publish failure placeholders so a configured-but-unreachable uplink
+        // surfaces its error cause in the UI instead of vanishing to "no data".
+        for (iface, reason) in failed {
+            cache.insert(
+                iface,
+                CellularMetrics::unreachable(CellularSourceKind::Rutos, reason, now_ms),
+            );
         }
 
         // 6. Age out stale snapshots; publish the managed-source count.
@@ -566,6 +797,41 @@ fn note_success(
             );
         }
     }
+
+    // Keeper-missing: a host-owned (ModemManager) modem stuck Disabled/Searching
+    // with no keep-alive daemon running can't be woken from the manager UI —
+    // surface it (debounced) so the operator knows to provision the keeper.
+    // RutOS routers keep their own bearer, so this never applies to them.
+    if m.source == CellularSourceKind::ModemManager {
+        let dormant = matches!(
+            m.state,
+            CellularRegState::Disabled | CellularRegState::Searching
+        );
+        if dormant && m.keeper_active == Some(false) {
+            st.keeper_miss_count = st.keeper_miss_count.saturating_add(1);
+            if st.keeper_miss_count >= UNREACHABLE_FAILS && !st.keeper_missing {
+                st.keeper_missing = true;
+                events.emit_with_details(
+                    EventSeverity::Warning,
+                    category::CELLULAR,
+                    format!(
+                        "cellular uplink '{iface}' is {} with no keep-alive daemon — install \
+                         bilbycast-cellular-modem.service to wake it from the manager",
+                        m.state.as_str()
+                    ),
+                    None,
+                    serde_json::json!({
+                        "error_code": "cellular_keeper_missing",
+                        "interface": iface,
+                        "state": m.state.as_str(),
+                    }),
+                );
+            }
+        } else {
+            st.keeper_miss_count = 0;
+            st.keeper_missing = false;
+        }
+    }
 }
 
 /// On a failed RutOS sample: bump the consecutive-failure counter and emit a
@@ -653,6 +919,8 @@ mod tests {
             temperature_c: None,
             data_used_bytes: None,
             data_limit_bytes: None,
+            last_error: None,
+            keeper_active: None,
             sampled_at_unix_ms: Some(1_000),
         };
         cache.insert("eno4".into(), m.clone());
@@ -689,6 +957,8 @@ mod tests {
             temperature_c: Some(41.5),
             data_used_bytes: Some(1234),
             data_limit_bytes: None,
+            last_error: None,
+            keeper_active: Some(true),
             sampled_at_unix_ms: Some(42),
         };
         let json = serde_json::to_string(&m).unwrap();
@@ -699,5 +969,26 @@ mod tests {
         assert_eq!(v, CellularSourceKind::Unknown);
         let s: CellularRegState = serde_json::from_str("\"some_new_state\"").unwrap();
         assert_eq!(s, CellularRegState::Unknown);
+    }
+
+    #[test]
+    fn wake_status_parsing() {
+        let s = "nonce=123-4\nstate=connected\ndetail=\naddr=10.155.3.152/28\nts=99\n";
+        let (nonce, state, detail, addr) = parse_wake_status(s).unwrap();
+        assert_eq!(nonce, "123-4");
+        assert_eq!(state, "connected");
+        assert_eq!(detail, None); // empty detail → None
+        assert_eq!(addr.as_deref(), Some("10.155.3.152/28"));
+
+        // failed with a reason, no address ("-" placeholder → None).
+        let s = "nonce=9\nstate=failed\ndetail=registration denied\naddr=-\n";
+        let (_, state, detail, addr) = parse_wake_status(s).unwrap();
+        assert_eq!(state, "failed");
+        assert_eq!(detail.as_deref(), Some("registration denied"));
+        assert_eq!(addr, None);
+
+        // Missing required keys → None (not a usable status).
+        assert!(parse_wake_status("state=connected\n").is_none());
+        assert!(parse_wake_status("garbage").is_none());
     }
 }

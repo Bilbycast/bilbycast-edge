@@ -78,6 +78,25 @@ fi
 # 4. reload.
 systemctl daemon-reload
 
+# 4b. Seed the request/execute IPC the edge + keeper share. The edge writes the
+#     REQUEST file in place (it runs unprivileged and can't write the root-owned
+#     dir), so it must be owned by the edge's service account. The STATUS file is
+#     created by THIS daemon (root) at runtime — deliberately not seeded, so its
+#     absence keeps the edge from advertising `cellular-control` until the keeper
+#     is actually running. Mirrors the PTP helper's ptp.conf seeding.
+WAKE_DIR="/var/lib/bilbycast"
+WAKE_REQ="$WAKE_DIR/cellular-wake.req"
+mkdir -p "$WAKE_DIR"
+[[ -e "$WAKE_REQ" ]] || : >"$WAKE_REQ"
+chmod 0664 "$WAKE_REQ" 2>/dev/null || true
+if id bilbycast >/dev/null 2>&1; then
+    chown bilbycast:bilbycast "$WAKE_REQ" 2>/dev/null || chown bilbycast "$WAKE_REQ" 2>/dev/null || true
+    log "seeded $WAKE_REQ (writable by the bilbycast edge account)"
+else
+    log "note: 'bilbycast' user not found — $WAKE_REQ left root-owned. Run install-edge.sh"
+    log "      first so the edge can write wake requests (else the Wake button can't post)."
+fi
+
 # 5. opt-in enable.
 if [[ "$ENABLE" -eq 1 ]]; then
     if ! grep -qE '^APN=.+' "$ENV_DEST"; then

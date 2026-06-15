@@ -147,6 +147,63 @@ HTTPS-only + LAN; remote access off; optionally disable RMS (cloud). Do **not**
 use Modbus (unauthenticated) for this; SNMP v3 only if ever used. The only
 credential in play is read-only, so the blast radius is small.
 
+## Waking a dormant USB modem (request/execute split)
+
+> The telemetry module is **read-only** (above). This section adds a *control*
+> surface that stays faithful to that: the edge **requests** a wake; a separate
+> opt-in root daemon **executes** it. The edge never drives the modem.
+
+A USB modem with no traffic drops to RRC-idle and the carrier may tear the
+bearer down; signal sampling can also lapse on a re-enumeration. An operator who
+only has the manager UI (no shell, no `sudo`) then can't start a flow over that
+leg — there's no traffic to wake it and the edge has no rights to. (The edge
+*can't* call `mmcli`/`Modem.Enable`/`Simple.Connect` itself: ModemManager's
+`Device.Control` polkit action is `allow_inactive=no`, so a headless service is
+denied — which is why the read-only `Modem.Signal.Setup` warm-up call is a
+best-effort, error-swallowed write. And even a successful `Simple.Connect`
+doesn't apply the lease IP/route to a raw-IP WWAN netdev, so the bond leg's
+source-bind would still have nothing to bind.)
+
+The fix is a **request/execute split**, mirroring the PTP-helper file-IPC
+(`/var/lib/bilbycast/ptp.conf`):
+
+1. **Host keeper (executes).** `packaging/bilbycast-cellular-modem.service` runs
+   `setup-cellular-modem.sh --watch` as root (opt-in;
+   `install-cellular-modem.sh --enable`). Every `WATCH_INTERVAL` (30 s) it runs
+   `mmcli --simple-connect` (enables + registers + connects — pulling the modem
+   out of idle with **zero media traffic**), applies the lease + policy route in
+   table 70, re-arms `--signal-setup=5`, and writes a status **heartbeat**. It is
+   ordered `Before=bilbycast-edge.service` so the leg's IP exists before the edge
+   pins it. With the keeper enabled the bearer is held up 24/7 — the steady-state
+   answer to dormancy.
+
+2. **Edge (requests).** The `wake_uplink { interface, apn? }` WS command (operator
+   role) writes `/var/lib/bilbycast/cellular-wake.req` (a few `key=value` lines
+   with a nonce, written **in place** into an installer-seeded, edge-owned file —
+   the edge can't write the root-owned dir) and polls
+   `cellular-wake.status` (~8 s) for the keeper to echo its nonce with a terminal
+   `state` (`connected` / `failed`), returning `{ state, detail?, addr? }`. The
+   edge gains **no** modem privilege — it only touches a `bilbycast`-owned file.
+   An optional `apn` rides the request so the operator can fix a wrong APN from
+   the UI (the keeper's env-file APN is the fallback).
+
+3. **Liveness + visibility (read-only).** The keeper's status-file mtime is a
+   heartbeat: fresh (≤ 120 s) ⇒ the daemon is running. The edge surfaces this as
+   `CellularMetrics.keeper_active` (modem sources only) and advertises the
+   `cellular-control` capability only while it's fresh — so the manager shows a
+   **Wake** button (Network Interfaces card + bond-leg row) that can never be
+   dead. A modem stuck `disabled`/`searching` with no keeper raises the debounced
+   `cellular_keeper_missing` Warning so the operator knows to provision the
+   keeper (one `sudo install-cellular-modem.sh --enable` at rack time).
+
+What stays read-only: `src/util/cellular/modem_manager.rs` gains **no**
+`Enable`/`Connect`/`CreateBearer`/`set_property` — the only edge-side motion is a
+control *request* (a file write) plus the `cellular-control` capability bit. APN
+authoring and the connect itself live in the root keeper (host provisioning),
+exactly as `APN / band-lock / reboot / SIM-switch` were always out of the edge's
+scope. The "No writes to the devices" line above is RutOS-specific (a RutOS
+router keeps its own bearer — Wake is hidden for `rutos` sources) and unchanged.
+
 ## Events
 
 Node-level, category `cellular`, debounced (catalogued in
@@ -159,6 +216,7 @@ Node-level, category `cellular`, debounced (catalogued in
 | `cellular_signal_recovered` | info | bars climb to ≥ 3 (leave) |
 | `cellular_uplink_unreachable` | warning | a RutOS poll fails 3 cycles running |
 | `cellular_uplink_recovered` | info | a RutOS poll succeeds after being unreachable |
+| `cellular_keeper_missing` | warning | a modem is `disabled`/`searching` for 3 cycles with no host keep-alive daemon running (can't be woken from the UI — provision `bilbycast-cellular-modem.service`) |
 
 ## Signal thresholds (UI colour)
 
@@ -171,12 +229,20 @@ colour first (green ≥ 4 bars, amber 2–3, red ≤ 1), numbers on hover.
 ## Code map
 
 - Edge: `src/util/cellular/{mod.rs, modem_manager.rs, rutos.rs}` (types, cache,
-  poller, sources), `src/util/network_interfaces.rs` (`cellular` field + join),
+  poller, sources; `mod.rs` also holds the wake file-IPC — `request_wake`,
+  `keeper_heartbeat_fresh`/`wake_control_available`, `cellular_keeper_missing`;
+  `modem_manager.rs` `pick_plausible_tech` is the NSA NR→LTE sentinel
+  fall-through), `src/util/network_interfaces.rs` (`cellular` field + join),
   `src/config/models.rs` (`CellularUplinkConfig`), `src/config/secrets.rs`
   (`CellularUplinkSecrets` split), `src/config/validation.rs`
-  (`validate_cellular_uplinks`), `src/manager/client.rs` (`"cellular"`
-  capability), `src/stats/{models,collector}.rs` +
+  (`validate_cellular_uplinks`, `validate_interface_name`), `src/manager/client.rs`
+  (`"cellular"` + `"cellular-control"` capabilities, `wake_uplink` command),
+  `src/stats/{models,collector}.rs` +
   `src/engine/{output_bonded,input_bonded}.rs` (per-leg `interface` for the join).
+- Host keeper (execute side): `packaging/{bilbycast-cellular-modem.service,
+  setup-cellular-modem.sh, install-cellular-modem.sh, bilbycast-cellular-modem.default}`
+  (root daemon: `--simple-connect` keep-alive + `--signal-setup` + wake-request
+  servicing + status heartbeat). File-IPC at `/var/lib/bilbycast/cellular-wake.{req,status}`.
 - Manager: `crates/manager-core/src/models/ws_protocol.rs` (mirror),
   `crates/manager-server/src/ui/static/js/detail/flows.js`
   (`renderCellularStrip` + bond-leg + Network Interfaces card),

@@ -6276,16 +6276,42 @@ pub fn validate_interface_binding(
     binding: &crate::config::models::InterfaceBinding,
     context: &str,
 ) -> Result<()> {
-    let name = binding.name.as_str();
+    validate_interface_name(binding.name.as_str(), context)
+}
+
+/// Validate a Linux network-interface name against the kernel `IFNAMSIZ`
+/// constraint (1..=15 bytes; alphanumeric + `.` / `_` / `-`). Shared by
+/// [`validate_interface_binding`] and the cellular `wake_uplink` command.
+pub fn validate_interface_name(name: &str, context: &str) -> Result<()> {
     if name.is_empty() || name.len() > 15 {
         anyhow::bail!(
-            "{context}: interface_binding.name must be 1..=15 bytes (Linux IFNAMSIZ); got {} bytes",
+            "{context}: interface name must be 1..=15 bytes (Linux IFNAMSIZ); got {} bytes",
             name.len()
         );
     }
     if !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'_' || b == b'-') {
         anyhow::bail!(
-            "{context}: interface_binding.name '{name}' contains invalid characters \
+            "{context}: interface name '{name}' contains invalid characters \
+             (allowed: alphanumeric, '.', '_', '-')"
+        );
+    }
+    Ok(())
+}
+
+/// Validate an operator-supplied cellular data APN (e.g. on the `wake_uplink`
+/// command). APNs are short host-label-style identifiers; the constrained
+/// character set is also a hard injection guard — the value flows into the host
+/// keeper's newline-delimited request file and into its
+/// `mmcli --simple-connect="apn=<apn>,ip-type=..."` argument, so a comma,
+/// newline, quote, space, or control char could corrupt the request or inject
+/// extra connect parameters. Reject all of them.
+pub fn validate_apn(apn: &str, context: &str) -> Result<()> {
+    if apn.is_empty() || apn.len() > 100 {
+        anyhow::bail!("{context}: APN must be 1..=100 chars; got {}", apn.len());
+    }
+    if !apn.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-' || b == b'_') {
+        anyhow::bail!(
+            "{context}: APN '{apn}' contains invalid characters \
              (allowed: alphanumeric, '.', '_', '-')"
         );
     }
@@ -6908,6 +6934,31 @@ mod tests {
         AssembledProgram, AssembledStream, AssemblyKind, EssenceKind, FlowAssembly, PcrSource,
         SlotSource, TsPidOverridesEntry, TsPidOverridesMap,
     };
+
+    #[test]
+    fn apn_validation_accepts_real_apns_rejects_injection() {
+        // Real-world APNs.
+        for ok in ["connect", "telstra.internet", "truphone.com", "iot_4g", "3g-data"] {
+            assert!(validate_apn(ok, "t").is_ok(), "should accept {ok}");
+        }
+        // Empty / too long.
+        assert!(validate_apn("", "t").is_err());
+        assert!(validate_apn(&"a".repeat(101), "t").is_err());
+        // Injection vectors that must be rejected (reach the keeper's request
+        // file + mmcli --simple-connect arg): comma, newline, space, quotes,
+        // shell metachars.
+        for bad in [
+            "connect,allow-roaming=yes", // simple-connect param injection
+            "connect\nnonce=evil",        // request-file line injection
+            "a b",
+            "a\"b",
+            "a'b",
+            "a;rm -rf /",
+            "a$(touch x)",
+        ] {
+            assert!(validate_apn(bad, "t").is_err(), "should reject {bad:?}");
+        }
+    }
 
     /// The customer-scenario adaptive-bond testbed configs (SRT in →
     /// adaptive bonded over 4x LTE + 2x Starlink → SRT out) must parse

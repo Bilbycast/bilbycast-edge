@@ -491,6 +491,7 @@ Debounced so a flapping link doesn't spam the feed. See
 | info | `cellular uplink '<iface>' signal recovered (<n>/5 bars)` | Bars climb back to ≥ 3 (leave the degraded state). | `cellular_signal_recovered` |
 | warning | `cellular uplink '<iface>' unreachable` | A RutOS poll has failed 3 cycles in a row. | `cellular_uplink_unreachable` |
 | info | `cellular uplink '<iface>' reachable again` | A RutOS poll succeeds after being unreachable. | `cellular_uplink_recovered` |
+| warning | `cellular uplink '<iface>' is <state> with no keep-alive daemon …` | A modem source is `disabled`/`searching` for 3 cycles with no host keeper running, so it can't be woken from the UI. Provision `bilbycast-cellular-modem.service`. Also carries `details.state`. | `cellular_keeper_missing` |
 
 ### Configuration (`config`)
 

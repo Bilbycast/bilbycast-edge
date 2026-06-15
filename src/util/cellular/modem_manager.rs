@@ -115,6 +115,8 @@ pub fn snapshot_to_metrics(s: &ModemSnapshot) -> CellularMetrics {
         temperature_c: None, // not exposed by the standard MM interfaces
         data_used_bytes: None,
         data_limit_bytes: None,
+        last_error: None, // a present modem isn't a poll failure
+        keeper_active: None, // stamped by the poller (host-keeper liveness)
         sampled_at_unix_ms: None, // stamped by the poller
     }
 }
@@ -131,9 +133,21 @@ fn derive_state(s: &ModemSnapshot) -> CellularRegState {
     if !s.has_sim || s.state_failed_reason == MM_FAILED_REASON_SIM_MISSING {
         return CellularRegState::SimMissing;
     }
-    // A SIM PIN/PUK lock — surface it regardless of how the coarse `State`
-    // happens to read (`UnlockRequired` is the authoritative signal).
-    if (MM_LOCK_SIM_PIN..=MM_LOCK_SIM_PUK2).contains(&s.unlock_required) {
+    // A SIM PIN/PUK lock blocks registration — but only trust `UnlockRequired`
+    // while the modem hasn't gotten past enable. Some firmwares leave a stale
+    // sim-pin `UnlockRequired` set on an already-connected modem; a modem that
+    // is ENABLED/REGISTERED/CONNECTED demonstrably has an unlocked SIM (you
+    // can't register past a locked one), so the connection state wins — else a
+    // working modem mis-reports as `sim_pin_required`.
+    let past_enable = matches!(
+        s.state,
+        MM_STATE_ENABLED
+            | MM_STATE_REGISTERED
+            | MM_STATE_DISCONNECTING
+            | MM_STATE_CONNECTING
+            | MM_STATE_CONNECTED
+    );
+    if !past_enable && (MM_LOCK_SIM_PIN..=MM_LOCK_SIM_PUK2).contains(&s.unlock_required) {
         return CellularRegState::SimPinRequired;
     }
     match s.state {
@@ -221,12 +235,49 @@ fn band_label(bands: &[u32], access_tech: u32) -> Option<String> {
     bands.iter().find_map(|&v| nr(v))
 }
 
+// ModemManager reports an out-of-range sentinel (e.g. i16::MIN → -32768, or
+// -3276.8 once the 0.1 scale is applied) for any metric it isn't currently
+// measuring — typically before extended signal sampling (`--signal-setup`) has
+// warmed up, or for an idle 5G-NSA NR carrier whose secondary cell the network
+// hasn't added (no data demand). These ranges are the physically-plausible
+// window for each metric; readings outside are dropped to None so the UI shows
+// "—" instead of a bogus -32768 dBm (which would also poison the bar derivation
+// and the degraded-signal alarm).
+const RSRP_RANGE: (f32, f32) = (-156.0, -30.0);
+const RSRQ_RANGE: (f32, f32) = (-45.0, 0.0);
+const SINR_RANGE: (f32, f32) = (-30.0, 50.0);
+const RSSI_RANGE: (f32, f32) = (-130.0, -30.0);
+
+/// Keep `v` only when it falls inside `range`; otherwise it's a sentinel → None.
+fn in_range(v: Option<f32>, range: (f32, f32)) -> Option<f32> {
+    v.filter(|x| (range.0..=range.1).contains(x))
+}
+
+/// One radio tech's raw `(rsrp, rsrq, snr, rssi)` readings as published by
+/// ModemManager's per-tech `Modem.Signal` dict.
+pub(crate) type SignalReads = (Option<f32>, Option<f32>, Option<f32>, Option<f32>);
+
+/// Pick the first tech (candidates are in preference order, e.g.
+/// `Nr5g ≻ Lte ≻ Umts ≻ Gsm`) carrying at least one physically-plausible
+/// reading. Returns its raw readings, or `None` when no tech has a usable
+/// figure (extended sampling not warmed up). This is what lets an idle 5G-NSA
+/// modem — whose NR dict is present but all-sentinel while the LTE anchor is
+/// live — fall through to LTE instead of blanking the figures.
+pub(crate) fn pick_plausible_tech(candidates: &[SignalReads]) -> Option<SignalReads> {
+    candidates.iter().copied().find(|&(rsrp, rsrq, snr, rssi)| {
+        in_range(rsrp, RSRP_RANGE).is_some()
+            || in_range(rsrq, RSRQ_RANGE).is_some()
+            || in_range(snr, SINR_RANGE).is_some()
+            || in_range(rssi, RSSI_RANGE).is_some()
+    })
+}
+
 fn build_signal(s: &ModemSnapshot) -> Option<CellularSignal> {
     let mut sig = CellularSignal {
-        rsrp_dbm: s.rsrp_dbm,
-        rsrq_db: s.rsrq_db,
-        sinr_db: s.snr_db,
-        rssi_dbm: s.rssi_dbm,
+        rsrp_dbm: in_range(s.rsrp_dbm, RSRP_RANGE),
+        rsrq_db: in_range(s.rsrq_db, RSRQ_RANGE),
+        sinr_db: in_range(s.snr_db, SINR_RANGE),
+        rssi_dbm: in_range(s.rssi_dbm, RSSI_RANGE),
         bars: None,
     };
     sig.bars = derive_bars(&sig);
@@ -363,10 +414,19 @@ mod dbus {
         Ok(Some((netdev, snapshot_to_metrics(&snap))))
     }
 
-    /// Read the best per-tech signal dict (`Nr5g` ≻ `Lte` ≻ `Umts` ≻ `Gsm`).
-    /// Reading is unprivileged; if every dict is empty, best-effort `Setup` to
-    /// enable polling for next time (ignoring PermissionDenied).
+    /// Read the per-tech signal dicts in preference order (`Nr5g` ≻ `Lte` ≻
+    /// `Umts` ≻ `Gsm`) and keep the first that carries a real reading. Reading
+    /// is unprivileged; if nothing plausible is published (sampling not warmed
+    /// up), best-effort `Setup` to enable polling for next time (ignoring
+    /// PermissionDenied).
+    ///
+    /// We collect all techs rather than committing to the first non-empty dict,
+    /// because an idle 5G-NSA modem publishes its NR carrier as all-sentinel
+    /// (the network only adds the NR secondary cell under data demand) while the
+    /// LTE anchor reports live figures — [`pick_plausible_tech`] then falls
+    /// through NR → LTE instead of blanking RSRP/RSRQ/SINR.
     async fn fill_signal(signal: &zbus::Proxy<'_>, snap: &mut ModemSnapshot) {
+        let mut candidates: Vec<SignalReads> = Vec::with_capacity(4);
         for tech in ["Nr5g", "Lte", "Umts", "Gsm"] {
             let Ok(dict) = signal
                 .get_property::<HashMap<String, OwnedValue>>(tech)
@@ -377,14 +437,21 @@ mod dbus {
             if dict.is_empty() {
                 continue;
             }
-            snap.rsrp_dbm = dict_f32(&dict, "rsrp");
-            snap.rsrq_db = dict_f32(&dict, "rsrq");
-            snap.snr_db = dict_f32(&dict, "snr");
-            snap.rssi_dbm = dict_f32(&dict, "rssi");
-            // First non-empty (best) tech wins.
+            candidates.push((
+                dict_f32(&dict, "rsrp"),
+                dict_f32(&dict, "rsrq"),
+                dict_f32(&dict, "snr"),
+                dict_f32(&dict, "rssi"),
+            ));
+        }
+        if let Some((rsrp, rsrq, snr, rssi)) = pick_plausible_tech(&candidates) {
+            snap.rsrp_dbm = rsrp;
+            snap.rsrq_db = rsrq;
+            snap.snr_db = snr;
+            snap.rssi_dbm = rssi;
             return;
         }
-        // Nothing published — try to enable extended sampling (5 s rate).
+        // Nothing plausible published — try to enable extended sampling (5 s).
         let _ = signal.call::<_, _, ()>("Setup", &(5u32)).await;
     }
 
@@ -497,6 +564,21 @@ mod tests {
     }
 
     #[test]
+    fn stale_pin_lock_on_connected_modem_is_ignored() {
+        // A connected modem that still reports a residual sim-pin UnlockRequired
+        // must read as registered, NOT sim_pin_required — you can't register a
+        // locked SIM, so the connection state is authoritative.
+        let mut s = base();
+        s.state = MM_STATE_CONNECTED;
+        s.unlock_required = 2; // stale SIM-PIN flag
+        s.reg_state = Some(MM_REG_HOME);
+        assert_eq!(snapshot_to_metrics(&s).state, CellularRegState::RegisteredHome);
+        // But a genuinely locked modem (not past enable) still surfaces the lock.
+        s.state = MM_STATE_DISABLED;
+        assert_eq!(snapshot_to_metrics(&s).state, CellularRegState::SimPinRequired);
+    }
+
+    #[test]
     fn searching_and_disabled() {
         let mut s = base();
         s.state = MM_STATE_SEARCHING;
@@ -515,5 +597,27 @@ mod tests {
         let sig = m.signal.unwrap();
         assert_eq!(sig.rsrp_dbm, None);
         assert_eq!(sig.bars, Some(4));
+    }
+
+    #[test]
+    fn signal_falls_through_sentinel_nr_to_lte() {
+        // Idle 5G-NSA: the NR carrier publishes only sentinels while the LTE
+        // anchor is live. We must skip NR and report the real LTE figures.
+        let nr_idle: SignalReads = (
+            Some(-32768.0),
+            Some(-3276.8),
+            Some(-3276.8),
+            Some(-32768.0),
+        );
+        let lte_live: SignalReads = (Some(-100.0), Some(-13.0), Some(-2.0), Some(-70.0));
+        assert_eq!(pick_plausible_tech(&[nr_idle, lte_live]), Some(lte_live));
+
+        // When the NR carrier IS measured, it's preferred (first in order).
+        let nr_live: SignalReads = (Some(-85.0), Some(-11.0), Some(15.0), Some(-60.0));
+        assert_eq!(pick_plausible_tech(&[nr_live, lte_live]), Some(nr_live));
+
+        // All sentinel → None (caller then best-effort re-arms sampling).
+        assert_eq!(pick_plausible_tech(&[nr_idle]), None);
+        assert_eq!(pick_plausible_tech(&[]), None);
     }
 }

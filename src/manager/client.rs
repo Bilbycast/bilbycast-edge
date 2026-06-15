@@ -840,6 +840,13 @@ pub(crate) fn build_health_payload(
     let mut caps = edge_capabilities();
     if cellular_cache.map(|c| c.has_sources()).unwrap_or(false) {
         caps.push("cellular");
+        // `cellular-control` advertises that an operator can wake a dormant
+        // USB-modem bond leg from the manager — true only when the host
+        // keep-alive daemon is running to service the request (status-file
+        // heartbeat fresh). Gated so the UI never shows a dead Wake button.
+        if crate::util::cellular::wake_control_available() {
+            caps.push("cellular-control");
+        }
     }
     #[allow(unused_mut)]
     let mut payload = serde_json::json!({
@@ -2745,6 +2752,17 @@ async fn execute_command(
                 cfg.flow_groups = new_config.flow_groups.clone();
                 cfg.device_name = new_config.device_name.clone();
                 cfg.resource_limits = new_config.resource_limits.clone();
+                // Cellular monitoring uplinks (RutOS routers). The slow poller
+                // reads these from the live AppConfig each cycle; without this
+                // copy a manager-added uplink is parsed + ACKed but silently
+                // dropped on apply (never reaches the poller or config.json).
+                cfg.cellular_uplinks = new_config.cellular_uplinks.clone();
+                // Same silent-drop class as cellular_uplinks above: these were
+                // restored-if-None from old_config earlier, but a manager-pushed
+                // NEW value must also be applied here or it's ACKed yet lost.
+                cfg.logging = new_config.logging.clone();
+                cfg.nmos_registration = new_config.nmos_registration.clone();
+                cfg.upgrades = new_config.upgrades.clone();
                 if let Err(e) = save_config_split_async(config_path.clone(), secrets_path.clone(), cfg.clone()).await {
                     tracing::warn!("Failed to persist config after manager command: {e}");
                     tunnel_manager.event_sender().emit(
@@ -2781,6 +2799,103 @@ async fn execute_command(
                 None => serde_json::json!({}),
             };
             Ok(Some(data))
+        }
+        // ── Cellular monitoring: one-shot reachability probe ──
+        // Powers the manager UI "Test reachability" button: builds a transient
+        // RutOS source from the supplied (or stored) credentials, performs
+        // login + modem-status fetch, and returns pass/fail with the exact
+        // cause — so creds / API access are validated at config time instead of
+        // save-and-pray.
+        "test_cellular_uplink" => {
+            use crate::config::models::CellularUplinkConfig;
+            let interface = action["interface"]
+                .as_str()
+                .filter(|s| !s.is_empty())
+                .unwrap_or("test")
+                .to_string();
+            let address = action["address"]
+                .as_str()
+                .filter(|s| !s.is_empty())
+                .ok_or("test_cellular_uplink: missing 'address'")?
+                .to_string();
+            let username = action["username"].as_str().map(|s| s.to_string());
+            // Password: use the supplied one; if blank, fall back to the stored
+            // secret for this interface (edit-mode "leave blank to keep").
+            let mut password = action["password"]
+                .as_str()
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string());
+            if password.is_none() {
+                let cfg = app_config.read().await;
+                password = cfg
+                    .cellular_uplinks
+                    .iter()
+                    .find(|u| u.interface == interface)
+                    .and_then(|u| u.password.clone());
+            }
+            let probe = CellularUplinkConfig {
+                interface: interface.clone(),
+                kind: "rutos".to_string(),
+                scheme: action["scheme"].as_str().unwrap_or("https").to_string(),
+                address,
+                api: action["api"].as_str().unwrap_or("ubus").to_string(),
+                username,
+                password,
+                verify_tls: action["verify_tls"].as_bool().unwrap_or(false),
+                cert_fingerprint: action["cert_fingerprint"]
+                    .as_str()
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.to_string()),
+            };
+            let sources =
+                crate::util::cellular::rutos::build_sources(std::slice::from_ref(&probe));
+            let src = sources
+                .values()
+                .next()
+                .ok_or("test_cellular_uplink: could not build probe (check interface/address)")?;
+            let result = match src.sample().await {
+                Ok(m) => serde_json::json!({
+                    "ok": true,
+                    "operator": m.operator,
+                    "access_tech": m.access_tech,
+                    "band": m.band,
+                    "signal": m.signal,
+                    "state": m.state,
+                }),
+                Err(reason) => serde_json::json!({ "ok": false, "error": reason }),
+            };
+            Ok(Some(result))
+        }
+        // ── Cellular control: wake / connect a host-owned USB-modem bond leg ──
+        // The cellular telemetry path is read-only and the edge can't drive
+        // ModemManager directly (polkit Device.Control denies a headless
+        // service). Instead the edge drops a request file that the opt-in root
+        // keep-alive daemon (bilbycast-cellular-modem.service) executes, then
+        // reports back the result. See docs/cellular.md ("request/execute
+        // split"). The edge gains no modem privilege — it only touches a
+        // bilbycast-owned file. Gated by the `cellular-control` capability.
+        "wake_uplink" => {
+            let interface = action["interface"]
+                .as_str()
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .ok_or("wake_uplink: missing 'interface'")?;
+            crate::config::validation::validate_interface_name(interface, "wake_uplink")
+                .map_err(|e| e.to_string())?;
+            // Optional APN override — the operator can fix a wrong APN from the
+            // UI; the keeper's env-file APN is the fallback when this is unset.
+            // Validated (incl. as an injection guard — it reaches the keeper's
+            // request file + mmcli --simple-connect arg).
+            let apn = action["apn"]
+                .as_str()
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty());
+            if let Some(a) = apn {
+                crate::config::validation::validate_apn(a, "wake_uplink")
+                    .map_err(|e| e.to_string())?;
+            }
+            let outcome = crate::util::cellular::request_wake(interface, apn).await?;
+            Ok(Some(serde_json::to_value(&outcome).unwrap_or_default()))
         }
         // ── Media library commands (file-backed media-player input) ──
         "list_media" => {

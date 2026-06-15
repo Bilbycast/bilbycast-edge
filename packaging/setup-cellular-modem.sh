@@ -79,11 +79,37 @@ TABLE="${TABLE:-70}"
 RULE_PREF="${RULE_PREF:-1070}"
 WATCH_INTERVAL="${WATCH_INTERVAL:-30}"
 
+# Request/execute file-IPC with bilbycast-edge: the edge (running unprivileged,
+# no rights to drive ModemManager) drops a wake REQUEST here; this daemon (root)
+# executes it and writes back a nonce-matched STATUS. The edge polls the status
+# file's mtime as a liveness heartbeat too. Keep this dir + the file names in
+# sync with util::cellular in the edge. Overridable for tests.
+WAKE_DIR="${BILBYCAST_CELLULAR_WAKE_DIR:-/var/lib/bilbycast}"
+WAKE_REQ="$WAKE_DIR/cellular-wake.req"
+WAKE_STATUS="$WAKE_DIR/cellular-wake.status"
+
 WATCH=0
 [[ "${1:-}" == "--watch" ]] && WATCH=1
 
 log() { echo "setup-cellular-modem: $*"; }
 die() { echo "setup-cellular-modem: $*" >&2; exit 1; }
+
+# Atomically write the status file (temp + rename) so the edge never reads a
+# half-written file. Args: nonce state detail addr
+write_status() {
+    [[ -d "$WAKE_DIR" ]] || return 0
+    local tmp="$WAKE_STATUS.tmp.$$"
+    {
+        echo "nonce=${1:-watch}"
+        echo "state=${2:-unknown}"
+        echo "detail=${3:-}"
+        echo "addr=${4:--}"
+        echo "ts=$(date +%s)"
+    } >"$tmp" 2>/dev/null && mv -f "$tmp" "$WAKE_STATUS" 2>/dev/null || { rm -f "$tmp" 2>/dev/null || true; return 0; }
+    # The edge (unprivileged 'bilbycast') reads this; force 0644 so a hardened
+    # root umask (077) doesn't leave it unreadable.
+    chmod 0644 "$WAKE_STATUS" 2>/dev/null || true
+}
 
 [[ $EUID -eq 0 ]] || die "must run as root (modem connect + ip routing need CAP_NET_ADMIN)"
 [[ -n "$APN" ]]   || die "APN is required — set APN=<your-apn> (e.g. APN=connect)"
@@ -136,6 +162,14 @@ bring_up() {
     [[ -n "$MODEM" ]] || die "no ModemManager modem found (mmcli -L) — is the stick plugged in?"
 
     ensure_connected
+
+    # Keep extended signal sampling armed (5 s) so the edge's read-only telemetry
+    # shows live RSRP/RSRQ/SINR. ModemManager clears this on a re-enumeration /
+    # MM restart; re-asserting it here every cycle is the host-side counterpart
+    # the edge can't reliably do (its Signal.Setup call is polkit-denied for a
+    # headless service). Idempotent + best-effort.
+    mmcli -m "$MODEM" --signal-setup=5 >/dev/null 2>&1 || true
+
     local bearer kv addr prefix gw mtu
     bearer="$(pick_bearer)" || die "no connected IPv4 bearer on Modem/$MODEM after connect"
     kv="$(mmcli -b "$bearer" -K)"
@@ -180,13 +214,52 @@ bring_up() {
     ip route show default | sed 's/^/setup-cellular-modem:   /'
 }
 
+# Read the current request nonce (empty if no request file / no nonce line).
+read_req_nonce() {
+    [[ -f "$WAKE_REQ" ]] || { echo ""; return 0; }
+    sed -n 's/^nonce=//p' "$WAKE_REQ" 2>/dev/null | head -n1 || true
+}
+
 if [[ "$WATCH" -eq 1 ]]; then
     log "watch mode — keeping the cellular bond leg up (every ${WATCH_INTERVAL}s)"
+    # Track the last *serviced* nonce (not mtime): mtime is 1 s-granular, so two
+    # wake requests in the same second would otherwise be coalesced. The edge's
+    # nonce is unique per request, so this catches every one.
+    last_nonce=""
     while true; do
-        # Subshell so a transient die() (modem briefly gone, bearer mid-reconnect)
-        # only ends this cycle, not the daemon — we retry on the next tick.
-        ( bring_up ) || log "bring_up failed this cycle — retrying in ${WATCH_INTERVAL}s"
-        sleep "$WATCH_INTERVAL"
+        # Pick up a pending wake request from the edge (with optional APN
+        # override so the operator can fix a wrong APN from the manager UI).
+        req_nonce=""; req_apn=""
+        cur_nonce="$(read_req_nonce)"
+        if [[ -n "$cur_nonce" && "$cur_nonce" != "$last_nonce" ]]; then
+            last_nonce="$cur_nonce"
+            req_nonce="$cur_nonce"
+            req_apn="$(sed -n 's/^apn=//p' "$WAKE_REQ" 2>/dev/null | head -n1 || true)"
+        fi
+        run_apn="$APN"; [[ -n "$req_apn" ]] && run_apn="$req_apn"
+
+        # bring_up runs in a subshell ($()) so a transient die() (modem briefly
+        # gone, bearer mid-reconnect) only ends this cycle, not the daemon.
+        if out="$( APN="$run_apn" bring_up 2>&1 )"; then rc=0; else rc=$?; fi
+        addr="$(printf '%s\n' "$out" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/[0-9]+' | head -n1 || true)"
+        if [[ "$rc" -eq 0 ]]; then
+            write_status "${req_nonce:-watch}" connected "" "$addr"
+            [[ -n "$req_nonce" ]] && log "serviced wake request → connected (${addr:-?})"
+        else
+            detail="$(printf '%s' "$out" | tail -n1)"
+            write_status "${req_nonce:-watch}" failed "$detail" "$addr"
+            log "bring_up failed this cycle: ${detail:-unknown} — retrying in ${WATCH_INTERVAL}s"
+        fi
+
+        # Sleep WATCH_INTERVAL, but wake within ~1 s if a fresh request lands so
+        # the manager Wake button feels responsive.
+        waited=0
+        while [[ "$waited" -lt "$WATCH_INTERVAL" ]]; do
+            sleep 1
+            waited=$((waited + 1))
+            nn="$(read_req_nonce)"
+            if [[ -n "$nn" && "$nn" != "$last_nonce" ]]; then break; fi
+        done
     done
 else
     bring_up

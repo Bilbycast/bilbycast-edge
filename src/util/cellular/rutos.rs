@@ -34,7 +34,6 @@ use crate::config::models::CellularUplinkConfig;
 
 /// A built, ready-to-poll RutOS uplink.
 pub struct RutosSource {
-    iface: String,
     base_url: String,
     client: reqwest::Client,
     api: RutosApi,
@@ -82,7 +81,6 @@ pub fn build_sources(uplinks: &[CellularUplinkConfig]) -> HashMap<String, RutosS
         out.insert(
             u.interface.clone(),
             RutosSource {
-                iface: u.interface.clone(),
                 base_url: format!("{scheme}://{}", u.address.trim_end_matches('/')),
                 client,
                 api,
@@ -119,19 +117,20 @@ fn build_client(verify_tls: bool, fingerprint: Option<&str>) -> anyhow::Result<r
 }
 
 impl RutosSource {
-    /// Best-effort single sample. Returns `None` on any failure (the poller
-    /// loop is the retry; a `None` ages the cache entry out → UI "no data").
-    pub async fn sample(&self) -> Option<CellularMetrics> {
+    /// Single sample. `Ok(metrics)` on success; `Err(reason)` carries a
+    /// human-readable failure cause (surfaced on the failing-uplink UI row and
+    /// the "Test reachability" button) rather than a silent `None`.
+    pub async fn sample(&self) -> Result<CellularMetrics, String> {
         let record = match self.api {
             RutosApi::Ubus => self.sample_ubus().await,
             RutosApi::Rest => self.sample_rest().await,
         }?;
-        Some(json_to_metrics(&record))
+        Ok(json_to_metrics(&record))
     }
 
     /// ubus JSON-RPC: `session login` → token, then merge `gsm.modem0 info` +
     /// `get_signal_query` results into one record.
-    async fn sample_ubus(&self) -> Option<Value> {
+    async fn sample_ubus(&self) -> Result<Value, String> {
         let url = format!("{}/ubus", self.base_url);
         // 1. Login.
         let login = serde_json::json!({
@@ -148,7 +147,8 @@ impl RutosSource {
             .and_then(|a| a.get(1))
             .and_then(|o| o.get("ubus_rpc_session"))
             .and_then(|t| t.as_str())
-            .map(|s| s.to_string())?;
+            .map(|s| s.to_string())
+            .ok_or_else(|| "ubus login rejected (check username/password)".to_string())?;
 
         let mut merged = serde_json::Map::new();
         // 2. Pull info + signal; merge (signal wins on overlap).
@@ -157,7 +157,7 @@ impl RutosSource {
                 "jsonrpc": "2.0", "id": 2, "method": "call",
                 "params": [token, "gsm.modem0", method, {}]
             });
-            if let Some(resp) = self.post_json::<Value>(&url, &call).await {
+            if let Ok(resp) = self.post_json::<Value>(&url, &call).await {
                 if let Some(obj) = resp
                     .get("result")
                     .and_then(|r| r.as_array())
@@ -172,13 +172,13 @@ impl RutosSource {
             }
         }
         if merged.is_empty() {
-            return None;
+            return Err("ubus login ok but modem returned no info/signal data".to_string());
         }
-        Some(Value::Object(merged))
+        Ok(Value::Object(merged))
     }
 
     /// RutOS 7.x REST: `POST /api/login` → bearer → `GET /api/modems/status`.
-    async fn sample_rest(&self) -> Option<Value> {
+    async fn sample_rest(&self) -> Result<Value, String> {
         let login_url = format!("{}/api/login", self.base_url);
         let body = serde_json::json!({ "username": self.username, "password": self.password });
         let resp: Value = self.post_json(&login_url, &body).await?;
@@ -188,7 +188,8 @@ impl RutosSource {
             .or_else(|| resp.pointer("/data/access_token"))
             .or_else(|| resp.get("token"))
             .and_then(|t| t.as_str())
-            .map(|s| s.to_string())?;
+            .map(|s| s.to_string())
+            .ok_or_else(|| "login ok but no token in response (unexpected API shape)".to_string())?;
 
         let status_url = format!("{}/api/modems/status", self.base_url);
         let resp = self
@@ -197,32 +198,46 @@ impl RutosSource {
             .bearer_auth(&token)
             .send()
             .await
-            .ok()?;
+            .map_err(|e| format!("GET /api/modems/status failed: {e}"))?;
         if !resp.status().is_success() {
-            return None;
+            return Err(format!(
+                "GET /api/modems/status returned HTTP {} (the token user may lack API access)",
+                resp.status()
+            ));
         }
-        let v: Value = resp.json().await.ok()?;
+        let v: Value = resp
+            .json()
+            .await
+            .map_err(|e| format!("modems/status response was not JSON: {e}"))?;
         // data is usually an array of modems (take the first) or an object.
         let record = match v.get("data") {
             Some(Value::Array(a)) => a.first().cloned(),
             Some(Value::Object(o)) => Some(Value::Object(o.clone())),
             _ => Some(v.clone()),
         };
-        record.filter(|r| r.is_object())
+        record
+            .filter(|r| r.is_object())
+            .ok_or_else(|| "modems/status carried no modem record".to_string())
     }
 
-    async fn post_json<T: serde::de::DeserializeOwned>(&self, url: &str, body: &Value) -> Option<T> {
-        let resp = self.client.post(url).json(body).send().await.ok()?;
+    async fn post_json<T: serde::de::DeserializeOwned>(
+        &self,
+        url: &str,
+        body: &Value,
+    ) -> Result<T, String> {
+        let resp = self
+            .client
+            .post(url)
+            .json(body)
+            .send()
+            .await
+            .map_err(|e| format!("POST {url} failed: {e}"))?;
         if !resp.status().is_success() {
-            tracing::debug!(
-                "cellular uplink '{}': {} returned HTTP {}",
-                self.iface,
-                url,
-                resp.status()
-            );
-            return None;
+            return Err(format!("POST {url} returned HTTP {}", resp.status()));
         }
-        resp.json::<T>().await.ok()
+        resp.json::<T>()
+            .await
+            .map_err(|e| format!("POST {url} response was not JSON: {e}"))
     }
 }
 
@@ -289,6 +304,8 @@ pub fn json_to_metrics(record: &Value) -> CellularMetrics {
             .map(|f| f as u64),
         data_limit_bytes: num(&map, &["data_limit", "data_limit_bytes", "limit_bytes"])
             .map(|f| f as u64),
+        last_error: None,
+        keeper_active: None, // RutOS keeps its own bearer — keeper flag N/A
         sampled_at_unix_ms: None, // stamped by the poller
     }
 }
@@ -658,7 +675,7 @@ mod tests {
         let addr = spawn_server(app).await;
         let sources = build_sources(&[http_uplink(addr)]);
         let src = sources.get("eno4").unwrap();
-        assert!(src.sample().await.is_none());
+        assert!(src.sample().await.is_err());
     }
 
     #[tokio::test]
@@ -666,7 +683,7 @@ mod tests {
         // Nothing listening on this port → connect fails → None.
         let sources = build_sources(&[http_uplink("127.0.0.1:1".into())]);
         let src = sources.get("eno4").unwrap();
-        assert!(src.sample().await.is_none());
+        assert!(src.sample().await.is_err());
     }
 
     #[test]
