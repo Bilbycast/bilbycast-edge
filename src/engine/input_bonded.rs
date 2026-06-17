@@ -371,3 +371,30 @@ pub(crate) fn bond_path_interface(t: &BondPathTransportConfig) -> Option<String>
         _ => None,
     }
 }
+
+#[cfg(test)]
+mod bonded_input_tests {
+    use super::*;
+
+    #[test]
+    fn bond_transport_label_names_each_transport() {
+        let udp: crate::config::models::BondPathTransportConfig =
+            serde_json::from_str(r#"{ "type": "udp", "bind": "0.0.0.0:7400" }"#).unwrap();
+        assert_eq!(bond_transport_label(&udp).as_str(), "udp");
+    }
+
+    #[test]
+    fn build_receiver_cfg_maps_paths_and_flow_id() {
+        let cfg: crate::config::models::BondedInputConfig = serde_json::from_str(
+            r#"{ "bond_flow_id": 6016,
+                 "paths": [
+                   { "id": 0, "name": "a", "transport": { "type": "udp", "bind": "0.0.0.0:7400" } },
+                   { "id": 1, "name": "b", "transport": { "type": "udp", "bind": "0.0.0.0:7401" } }
+                 ] }"#,
+        )
+        .unwrap();
+        let sock = build_receiver_cfg(&cfg).expect("receiver cfg builds");
+        assert_eq!(sock.flow_id, 6016);
+        assert_eq!(sock.paths.len(), 2);
+    }
+}

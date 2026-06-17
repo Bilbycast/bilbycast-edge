@@ -420,16 +420,24 @@ Path-up / path-down transitions fire as `info` / `warning`; bond-idle
   An SRT path adapter would give per-leg ARQ + encryption without the
   bond layer reimplementing them; tracked in the `bilbycast-bonding`
   repo as Phase 3.
-- **No congestion control.** The bond layer does not probe or back off
-  on path saturation. Use the scheduler's `weight_hint` to shape a
-  known bandwidth ceiling, or rely on path-layer congestion control
-  where available (QUIC, RIST).
-- **No cross-path encryption aggregate.** Each path's confidentiality
-  is independent: QUIC legs are TLS-encrypted, UDP legs are plaintext,
-  RIST legs are plaintext until the RIST library ships Main Profile
-  encryption. Wrap an already-encrypted inner protocol (SRT-encrypted
-  TS) if end-to-end confidentiality matters and you can't use QUIC for
-  all legs.
+- **Congestion control: on by default.** The `adaptive`
+  (`CapacityAwareScheduler`) scheduler — the edge default — runs a
+  per-path hybrid loss + delay controller that discovers each leg's
+  usable bitrate and splits traffic capacity-proportionally, backing
+  off on RTT inflation / loss. Tune it via the per-output `congestion`
+  block (`min_rate_kbps`, `delay_inflation_ms`, `loss_high_pct`,
+  `rtt_min_window_ms`, …) and cap a metered leg with the per-path
+  `max_bitrate_bps`. The older `media_aware` / static schedulers do
+  **not** congestion-control — pick `adaptive` for heterogeneous
+  cellular/satellite links.
+- **Cross-path encryption is opt-in and OFF by default.** Set a
+  64-hex-char `encryption_key` (same value both ends) to ChaCha20-
+  Poly1305-encrypt every UDP and RIST leg of the bond. **Without it,
+  UDP/RIST legs are plaintext.** QUIC legs are always TLS-encrypted and
+  ignore the key. For confidentiality either set `encryption_key`, use
+  QUIC for all legs, or wrap an already-encrypted inner protocol
+  (SRT-with-passphrase TS). A bond carrying non-QUIC legs with no
+  `encryption_key` set logs a startup warning (`bond_legs_unencrypted`).
 - **Web UI does not yet render the stats in real time on the topology
   view.** The node detail page shows full per-path tables; topology
   only shows aggregate `up/degraded/idle` state.

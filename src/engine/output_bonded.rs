@@ -483,6 +483,48 @@ async fn bonded_output_run(
         oversize_payloads: oversize_payloads.clone(),
     });
 
+    // Security visibility: encryption is OPT-IN and OFF by default. A bond
+    // carrying plaintext UDP legs with no `encryption_key` ships media in
+    // the clear. Warn once at bring-up so the unsafe default is visible.
+    // `encryption_key` ChaCha20-encrypts every UDP leg; QUIC legs are
+    // always TLS (so a pure-QUIC bond is fine without a key).
+    if config.encryption_key.is_none() {
+        let udp_legs = config
+            .paths
+            .iter()
+            .filter(|p| {
+                matches!(
+                    p.transport,
+                    crate::config::models::BondPathTransportConfig::Udp { .. }
+                )
+            })
+            .count();
+        if udp_legs > 0 {
+            tracing::warn!(
+                "bonded output '{}': {} UDP leg(s) are UNENCRYPTED — no encryption_key set, \
+                 media transits in the clear. Set a 64-hex-char encryption_key (same value on \
+                 the bonded input) to ChaCha20-encrypt UDP legs; QUIC legs are always TLS.",
+                config.id,
+                udp_legs,
+            );
+            events.emit_flow_with_details(
+                EventSeverity::Warning,
+                category::MEDIA,
+                format!(
+                    "bonded output '{}': {} UDP leg(s) unencrypted — set encryption_key for confidentiality",
+                    config.id, udp_legs
+                ),
+                flow_id,
+                serde_json::json!({
+                    "error_code": "bond_legs_unencrypted",
+                    "component": "bonded_output",
+                    "output_id": config.id,
+                    "udp_legs": udp_legs,
+                }),
+            );
+        }
+    }
+
     tracing::info!(
         "bonded output '{}' up: {} path(s), scheduler={:?}",
         config.id,
@@ -806,4 +848,38 @@ fn translate_transport_for_sender(
             tls: translate_tls(tls)?,
         },
     })
+}
+
+#[cfg(test)]
+mod bonded_output_tests {
+    use super::*;
+
+    #[test]
+    fn build_congestion_maps_operator_knobs_to_library_units() {
+        let c = crate::config::models::BondCongestionConfig {
+            min_rate_kbps: Some(1200),
+            delay_inflation_ms: Some(250),
+            loss_high_pct: Some(6.0),
+            ..Default::default()
+        };
+        let cc = build_congestion(&c);
+        assert_eq!(cc.min_rate_bps, 1_200_000, "kbps → bps ×1000");
+        assert_eq!(cc.delay_inflation, std::time::Duration::from_millis(250));
+        assert!((cc.loss_high - 0.06).abs() < 1e-6, "pct → fraction");
+    }
+
+    #[test]
+    fn build_sender_cfg_maps_every_path_and_flow_id() {
+        let cfg: crate::config::models::BondedOutputConfig = serde_json::from_str(
+            r#"{ "id": "o1", "name": "bond", "bond_flow_id": 6016, "keepalive_ms": 200,
+                 "paths": [
+                   { "id": 0, "name": "a", "transport": { "type": "udp", "remote": "1.2.3.4:7400" } },
+                   { "id": 1, "name": "b", "transport": { "type": "udp", "remote": "1.2.3.4:7401" } }
+                 ] }"#,
+        )
+        .unwrap();
+        let sock = build_sender_cfg(&cfg).expect("sender cfg builds");
+        assert_eq!(sock.flow_id, 6016);
+        assert_eq!(sock.paths.len(), 2);
+    }
 }
