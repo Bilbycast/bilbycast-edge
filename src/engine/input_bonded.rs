@@ -330,8 +330,29 @@ pub(crate) fn translate_tls(tls: &BondQuicTls) -> anyhow::Result<BondQuicTlsTx> 
 }
 
 pub(crate) fn parse_sockaddr(s: &str) -> anyhow::Result<SocketAddr> {
-    s.parse::<SocketAddr>()
-        .map_err(|e| anyhow::anyhow!("invalid socket address '{s}': {e}"))
+    // Fast path: a literal `ip:port`.
+    if let Ok(addr) = s.parse::<SocketAddr>() {
+        return Ok(addr);
+    }
+    // Fall back to DNS for a `host:port` remote so an operator can point a
+    // bond leg at a hostname (e.g. `home.example.com:7400`) instead of a
+    // bare IP literal that has to be hand-edited every time the address
+    // changes. Resolved once here at flow-build time — an IP change after
+    // that needs a flow restart, same as any resolve-at-connect transport.
+    // This runs at flow start, never on the data path. Prefer an IPv4
+    // record (bond cellular / CGNAT legs are v4) and fall back to the
+    // first record of any family.
+    use std::net::ToSocketAddrs;
+    let resolved: Vec<SocketAddr> = s
+        .to_socket_addrs()
+        .map_err(|e| anyhow::anyhow!("invalid or unresolvable socket address '{s}': {e}"))?
+        .collect();
+    resolved
+        .iter()
+        .find(|a| a.is_ipv4())
+        .or_else(|| resolved.first())
+        .copied()
+        .ok_or_else(|| anyhow::anyhow!("socket address '{s}' resolved to no records"))
 }
 
 /// Decode a 64-hex-char bond AEAD key into its 32 raw bytes. Shared by
@@ -385,6 +406,20 @@ mod bonded_input_tests {
         let udp: crate::config::models::BondPathTransportConfig =
             serde_json::from_str(r#"{ "type": "udp", "bind": "0.0.0.0:7400" }"#).unwrap();
         assert_eq!(bond_transport_label(&udp).as_str(), "udp");
+    }
+
+    #[test]
+    fn parse_sockaddr_takes_literal_then_resolves_hostnames() {
+        // Literal ip:port — the fast path, byte-exact.
+        let lit = parse_sockaddr("203.0.113.7:7400").unwrap();
+        assert_eq!(lit, "203.0.113.7:7400".parse::<SocketAddr>().unwrap());
+        // Hostname:port resolves (localhost is in /etc/hosts → no network),
+        // preferring the IPv4 record.
+        let host = parse_sockaddr("localhost:7400").unwrap();
+        assert_eq!(host.port(), 7400);
+        assert!(host.ip().is_loopback());
+        // A bare host with no port is rejected.
+        assert!(parse_sockaddr("localhost").is_err());
     }
 
     #[test]

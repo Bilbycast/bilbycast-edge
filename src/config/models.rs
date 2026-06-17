@@ -4067,9 +4067,20 @@ pub struct BondCongestionConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub loss_high_pct: Option<f32>,
     /// RTT inflation over a link's own minimum treated as queue-building
-    /// congestion (delay-based signal), milliseconds.
+    /// congestion (delay-based signal), milliseconds. When
+    /// `delay_inflation_auto` is set this is the floor of the
+    /// auto-derived per-link threshold rather than a fixed value.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delay_inflation_ms: Option<u32>,
+    /// Auto-derive the queue-building delay threshold per link from its
+    /// own measured baseline RTT instead of using a fixed
+    /// `delay_inflation_ms`. A bufferbloated cellular link (high
+    /// baseline) gets a proportionally looser threshold automatically —
+    /// removing the per-link hand-tuning such links otherwise need —
+    /// while a terrestrial link keeps the tight `delay_inflation_ms`
+    /// floor. Opt-in; default off (fixed threshold).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delay_inflation_auto: Option<bool>,
     /// Token-bucket burst depth, milliseconds of capacity.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub burst_ms: Option<u32>,

@@ -780,6 +780,9 @@ fn build_congestion(c: &BondCongestionConfig) -> CongestionConfig {
     if let Some(v) = c.rtt_min_window_ms {
         cc.rtt_min_window = std::time::Duration::from_millis(v);
     }
+    if let Some(v) = c.delay_inflation_auto {
+        cc.delay_inflation_auto = v;
+    }
     cc
 }
 
