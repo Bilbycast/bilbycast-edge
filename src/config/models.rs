@@ -4160,6 +4160,19 @@ pub enum BondPathTransportConfig {
         #[serde(default)]
         server_name: String,
         tls: BondQuicTls,
+        /// Client-only local source bind `ip:port` (port usually 0) to
+        /// pin egress on a multi-homed sender. Without it the QUIC
+        /// client binds `0.0.0.0:0` and every leg collapses onto the
+        /// kernel default route (cosmetic bond). Set to a source IP
+        /// that policy-routes out the intended uplink. Ignored on the
+        /// server role (it binds `addr`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        bind: Option<String>,
+        /// NIC pin (e.g. `"eno4"`, `"wwan0"`) — same `SO_BINDTODEVICE`
+        /// → `IP_UNICAST_IF` mechanism as the UDP leg. Applies to both
+        /// roles. `None` leaves egress to the routing table / `bind`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        interface: Option<String>,
     },
 }
 

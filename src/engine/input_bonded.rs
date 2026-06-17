@@ -286,6 +286,8 @@ fn translate_transport_for_receiver(
             addr,
             server_name,
             tls,
+            bind,
+            interface,
         } => BondPathTxTransport::Quic {
             role: match role {
                 BondQuicRole::Client => BondQuicRoleTx::Client,
@@ -294,6 +296,8 @@ fn translate_transport_for_receiver(
             addr: parse_sockaddr(addr)?,
             server_name: server_name.clone(),
             tls: translate_tls(tls)?,
+            bind: bind.as_deref().map(parse_sockaddr).transpose()?,
+            interface: interface.clone(),
         },
     })
 }

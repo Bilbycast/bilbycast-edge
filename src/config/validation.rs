@@ -1853,6 +1853,8 @@ fn validate_bond_path_transport(
             addr,
             server_name,
             tls,
+            bind,
+            interface,
         } => {
             let expected = if sender_mode {
                 BondQuicRole::Client
@@ -1877,6 +1879,22 @@ fn validate_bond_path_transport(
                 return Err(anyhow::anyhow!(
                     "bonded QUIC client path '{path_name}' requires server_name"
                 ));
+            }
+            // Per-leg source bind is client-only (the server binds `addr`).
+            if let Some(b) = bind {
+                if !matches!(role, BondQuicRole::Client) {
+                    return Err(anyhow::anyhow!(
+                        "bonded QUIC path '{path_name}': `bind` is client-only (server binds `addr`)"
+                    ));
+                }
+                validate_socket_addr(b, "bonded QUIC path bind")?;
+            }
+            if let Some(iface) = interface {
+                if iface.is_empty() || iface.len() > 64 {
+                    return Err(anyhow::anyhow!(
+                        "bonded QUIC path '{path_name}': interface name must be 1..=64 chars"
+                    ));
+                }
             }
             validate_bond_tls(tls, path_name)?;
         }
@@ -10256,5 +10274,44 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("same address family"), "got: {err}");
+    }
+
+    #[test]
+    fn bond_quic_leg_pinning_fields_roundtrip_and_validate() {
+        use crate::config::models::BondPathTransportConfig;
+        // Exact shape gen-bond-variants.py emits for a source-bound QUIC
+        // client leg (TRM500) — proves serde field names match the model.
+        let client_json = serde_json::json!({
+            "type": "quic", "role": "client", "addr": "111.118.193.172:7400",
+            "server_name": "edge6", "tls": {"mode": "self_signed"}, "bind": "10.185.46.37:0"
+        });
+        let leg: BondPathTransportConfig = serde_json::from_value(client_json).unwrap();
+        match &leg {
+            BondPathTransportConfig::Quic { bind, interface, .. } => {
+                assert_eq!(bind.as_deref(), Some("10.185.46.37:0"));
+                assert!(interface.is_none());
+            }
+            _ => panic!("expected quic leg"),
+        }
+        super::validate_bond_path_transport(&leg, true, "trm500").unwrap();
+
+        // Interface-pinned QUIC client leg (OTD500 shape) also validates.
+        let iface_json = serde_json::json!({
+            "type": "quic", "role": "client", "addr": "111.118.193.172:7401",
+            "server_name": "edge6", "tls": {"mode": "self_signed"}, "interface": "eno4"
+        });
+        let leg2: BondPathTransportConfig = serde_json::from_value(iface_json).unwrap();
+        super::validate_bond_path_transport(&leg2, true, "otd500").unwrap();
+
+        // `bind` on a server-role leg is rejected (client-only).
+        let bad_json = serde_json::json!({
+            "type": "quic", "role": "server", "addr": "0.0.0.0:7400",
+            "tls": {"mode": "self_signed"}, "bind": "0.0.0.0:0"
+        });
+        let bad: BondPathTransportConfig = serde_json::from_value(bad_json).unwrap();
+        let err = super::validate_bond_path_transport(&bad, false, "srv")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("client-only"), "got: {err}");
     }
 }
