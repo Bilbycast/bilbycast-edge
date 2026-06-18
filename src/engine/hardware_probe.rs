@@ -1319,6 +1319,12 @@ impl NvmlPoller {
 /// | content_analysis = audio_full                       | 20            |
 /// | content_analysis = video_full                       | 50            |
 /// | recording (replay) enabled                          | 5             |
+/// | thumbnail (per generator @ 5 s default)             | 3             |
+///
+/// Thumbnail cost scales with cadence (work ∝ 1/interval) and with the
+/// number of concurrent generators a flow runs — one flow-level preview
+/// plus one per input. `derive_cost_plan` folds both into the precomputed
+/// [`FlowCostPlan::thumbnail_units`]; see [`thumbnail_units_per_decoder`].
 ///
 /// `scale` for video_encode = (width × height × fps) / (1920 × 1080 × 30)
 ///   × 1.5 if 10-bit
@@ -1332,6 +1338,31 @@ impl NvmlPoller {
 ///
 /// All flows pay the base passthrough cost (1) regardless of shape.
 /// Transcoding / analysis / recording add on top.
+/// Thumbnail cost-model anchors. Mirror `engine::thumbnail`'s 5 s default,
+/// kept local so the cost model doesn't depend on that module's privates.
+const THUMBNAIL_DEFAULT_INTERVAL_SECS: u32 = 5;
+/// Units for one thumbnail generator at the 5 s default cadence. A generator
+/// decodes a frame + downscales to 320×180 + JPEG-encodes + computes
+/// luminance every interval — a real decode, so it sits above
+/// `content_analysis_lite` (2, compressed-domain only) and well below
+/// `content_analysis_video_full` (50, a 1 Hz decode plus pixel metrics).
+const THUMBNAIL_UNITS_AT_DEFAULT: u32 = 3;
+
+/// Cost units for ONE thumbnail generator at the given capture cadence.
+/// Decode work is roughly constant per tick and ticks run at `1/interval`,
+/// so cost scales linearly with frequency: `round(3 × 5 / interval)`, floored
+/// at 1. `None` = the 5 s default (3 units). The interval is clamped to the
+/// validated `1..=60` range. Multiply by the generator count (flow-level +
+/// per-input) for the flow total — see `derive_cost_plan`.
+pub fn thumbnail_units_per_decoder(interval_secs: Option<u32>) -> u32 {
+    let secs = interval_secs
+        .map(|s| s.clamp(1, 60))
+        .unwrap_or(THUMBNAIL_DEFAULT_INTERVAL_SECS);
+    let numer = THUMBNAIL_UNITS_AT_DEFAULT * THUMBNAIL_DEFAULT_INTERVAL_SECS;
+    // Integer round-half-up, then floor at 1.
+    ((numer + secs / 2) / secs).max(1)
+}
+
 pub fn compute_flow_cost_units(plan: &FlowCostPlan) -> u32 {
     let mut units: u32 = 1; // base
     units = units.saturating_add(plan.hw_video_encode_units);
@@ -1368,6 +1399,9 @@ pub fn compute_flow_cost_units(plan: &FlowCostPlan) -> u32 {
     if plan.recording_enabled {
         units = units.saturating_add(5);
     }
+    // Thumbnail preview generation — precomputed in `derive_cost_plan`
+    // (number of concurrent generators × per-generator cadence cost).
+    units = units.saturating_add(plan.thumbnail_units);
     units
 }
 
@@ -1422,6 +1456,11 @@ pub struct FlowCostPlan {
     pub content_analysis_audio_full: bool,
     pub content_analysis_video_full: bool,
     pub recording_enabled: bool,
+    /// Precomputed thumbnail-preview cost: number of concurrent generators
+    /// (flow-level + one per input) × per-generator cadence cost. Zero when
+    /// the flow has thumbnails disabled or no inputs. See
+    /// `thumbnail_units_per_decoder` and `derive_cost_plan`.
+    pub thumbnail_units: u32,
     /// Per-family encoder session counts derived from the flow's
     /// output codecs. Sums across HW outputs by family — H.264 and
     /// HEVC share the engine on every supported backend, so a flow
@@ -2709,6 +2748,31 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(compute_flow_cost_units(&plan), 1 + 5);
+    }
+
+    #[test]
+    fn cost_thumbnail_per_decoder_scales_with_cadence() {
+        // round(3 × 5 / interval), floored at 1. None = the 5 s default.
+        assert_eq!(thumbnail_units_per_decoder(None), 3);
+        assert_eq!(thumbnail_units_per_decoder(Some(5)), 3);
+        assert_eq!(thumbnail_units_per_decoder(Some(1)), 15);
+        assert_eq!(thumbnail_units_per_decoder(Some(2)), 8);
+        assert_eq!(thumbnail_units_per_decoder(Some(10)), 2);
+        assert_eq!(thumbnail_units_per_decoder(Some(30)), 1);
+        // Out-of-range values clamp rather than divide-by-zero / overflow.
+        assert_eq!(thumbnail_units_per_decoder(Some(0)), 15); // clamps to 1 s
+        assert_eq!(thumbnail_units_per_decoder(Some(1000)), 1); // clamps to 60 s
+    }
+
+    #[test]
+    fn cost_thumbnail_units_add_to_total() {
+        // A precomputed thumbnail cost (e.g. 2 generators × 3 units @ 5 s)
+        // lands on the flow total on top of the base passthrough cost.
+        let plan = FlowCostPlan {
+            thumbnail_units: 6,
+            ..Default::default()
+        };
+        assert_eq!(compute_flow_cost_units(&plan), 1 + 6);
     }
 
     #[test]

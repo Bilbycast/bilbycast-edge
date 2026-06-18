@@ -279,6 +279,7 @@ mod tests {
                 media_analysis: true,
                 thumbnail: true,
                 thumbnail_program_number: None,
+                thumbnail_interval_secs: None,
                 bandwidth_limit: None,
                 flow_group_id: None,
                 clock_domain: None,

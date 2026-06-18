@@ -1729,7 +1729,7 @@ async fn execute_command(
                     // the new flag is persisted for the *next* start-up, but
                     // toggling mid-flight is not yet wired through the
                     // FlowManager, so we avoid the disruptive restart here.
-                    let input_changed = old_flow.input_ids != new_flow.input_ids;
+                    let input_changed = input_set_changed(&old_flow.input_ids, &new_flow.input_ids);
                     // `content_analysis` tier toggles are baked in at
                     // `FlowRuntime::start` (the analyser tasks are spawned
                     // there). Toggling them mid-flight requires a flow
@@ -1770,10 +1770,11 @@ async fn execute_command(
                         || assembly_changed;
                     let persist_only_meta_changed = old_flow.name != new_flow.name
                         || old_flow.media_analysis != new_flow.media_analysis
-                        || old_flow.thumbnail != new_flow.thumbnail;
+                        || old_flow.thumbnail != new_flow.thumbnail
+                        || old_flow.thumbnail_interval_secs != new_flow.thumbnail_interval_secs;
                     if persist_only_meta_changed && !(input_changed || restart_required) {
                         tracing::info!(
-                            "Update flow '{flow_id}': metadata-only change (name/thumbnail/media_analysis) — persisting without restart; new thumbnail/media_analysis flag takes effect at next flow restart"
+                            "Update flow '{flow_id}': metadata-only change (name/thumbnail/thumbnail_interval/media_analysis) — persisting without restart; thumbnail_interval applies live (below), thumbnail on/off + media_analysis take effect at next flow restart"
                         );
                     }
 
@@ -1855,6 +1856,27 @@ async fn execute_command(
                         );
                         let cfg = app_config.read().await;
                         diff_outputs(flow_manager, flow_id, &new_flow.output_ids, &cfg).await;
+                    }
+
+                    // Thumbnail cadence applies LIVE — push it to the running
+                    // generators so it takes effect immediately instead of at
+                    // the next flow restart. Skip when the flow was restarted
+                    // above (a restart respawns the generators with the new
+                    // config already).
+                    if !force_restart
+                        && old_flow.thumbnail_interval_secs != new_flow.thumbnail_interval_secs
+                    {
+                        match flow_manager
+                            .apply_thumbnail_interval(flow_id, new_flow.thumbnail_interval_secs)
+                        {
+                            Ok(()) => tracing::info!(
+                                "Update flow '{flow_id}': applied thumbnail cadence live ({:?})",
+                                new_flow.thumbnail_interval_secs
+                            ),
+                            Err(e) => {
+                                tracing::debug!("Live thumbnail cadence apply skipped: {e}")
+                            }
+                        }
                     }
                 } else if was_running && !new_flow.enabled {
                     // Disable
@@ -2617,14 +2639,15 @@ async fn execute_command(
                             // toggles just persist (they take effect at next
                             // start-up, since mid-flight subscriber toggle
                             // is not yet wired through FlowManager).
-                            let input_changed = old_flow.input_ids != new_flow.input_ids;
+                            let input_changed = input_set_changed(&old_flow.input_ids, &new_flow.input_ids);
                             let restart_required = old_flow.bandwidth_limit != new_flow.bandwidth_limit;
                             let persist_only_meta_changed = old_flow.name != new_flow.name
                                 || old_flow.media_analysis != new_flow.media_analysis
-                                || old_flow.thumbnail != new_flow.thumbnail;
+                                || old_flow.thumbnail != new_flow.thumbnail
+                                || old_flow.thumbnail_interval_secs != new_flow.thumbnail_interval_secs;
                             if persist_only_meta_changed && !(input_changed || restart_required) {
                                 tracing::info!(
-                                    "Config diff: flow '{id}' metadata-only change — persisting without restart; thumbnail/media_analysis toggles apply at next flow restart"
+                                    "Config diff: flow '{id}' metadata-only change — persisting without restart; thumbnail/media_analysis settings apply at next flow restart"
                                 );
                             }
 
@@ -4424,6 +4447,59 @@ async fn diff_outputs(
 /// helper continues processing the remaining deltas rather than aborting
 /// the whole reconcile — a `port_conflict` on one input shouldn't block
 /// applying changes to another.
+/// Whether two `input_ids` lists differ as **sets** (order-insensitive).
+///
+/// The manager's flow modal rebuilds `input_ids` from the checkbox DOM, which
+/// is rendered in the node's *global inputs* order — not the flow's stored
+/// `input_ids` order. So a metadata-only edit (e.g. changing the thumbnail
+/// cadence) can re-serialise `input_ids` in a different order with no real
+/// membership change. An ordered `!=` comparison would treat that as an input
+/// change and route the edit through the hitless-check + surgical reconcile
+/// (or even a full restart) path, momentarily disturbing the active input —
+/// the flow "freezes" until the operator re-activates a source in the
+/// switcher. Input order carries no runtime meaning (`diff_inputs`, the
+/// active-input selection, and hitless legs are all keyed by id, not
+/// position), so a pure reorder must be a no-op.
+fn input_set_changed(old: &[String], new: &[String]) -> bool {
+    if old.len() != new.len() {
+        return true;
+    }
+    let mut a: Vec<&str> = old.iter().map(|s| s.as_str()).collect();
+    let mut b: Vec<&str> = new.iter().map(|s| s.as_str()).collect();
+    a.sort_unstable();
+    b.sort_unstable();
+    a != b
+}
+
+#[cfg(test)]
+mod input_diff_tests {
+    use super::input_set_changed;
+
+    fn v(ids: &[&str]) -> Vec<String> {
+        ids.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn reorder_is_not_a_change() {
+        // The freeze regression: the flow modal re-serialises input_ids in a
+        // different order on a metadata-only edit. A pure reorder must NOT
+        // register as an input-set change.
+        assert!(!input_set_changed(&v(&["a", "b"]), &v(&["b", "a"])));
+        assert!(!input_set_changed(&v(&["a", "b", "c"]), &v(&["c", "a", "b"])));
+        assert!(!input_set_changed(&v(&["a"]), &v(&["a"])));
+        assert!(!input_set_changed(&v(&[]), &v(&[])));
+    }
+
+    #[test]
+    fn add_or_remove_is_a_change() {
+        assert!(input_set_changed(&v(&["a"]), &v(&["a", "b"]))); // added
+        assert!(input_set_changed(&v(&["a", "b"]), &v(&["a"]))); // removed
+        assert!(input_set_changed(&v(&["a"]), &v(&["b"]))); // swapped
+        assert!(input_set_changed(&v(&[]), &v(&["a"]))); // empty → one
+        assert!(input_set_changed(&v(&["a"]), &v(&[]))); // one → empty (drops all)
+    }
+}
+
 async fn diff_inputs(
     flow_manager: &Arc<FlowManager>,
     flow_id: &str,

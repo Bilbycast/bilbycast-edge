@@ -3263,9 +3263,16 @@ and transcode cost notes in this file and the root `CLAUDE.md`:
 | `content_analysis = audio_full`         | 20    |
 | `content_analysis = video_full`         | 50    |
 | `recording` (replay) enabled            | 5     |
+| `thumbnail` (per generator @ 5 s)       | 3     |
 
 ST 2110-20 / -23 outputs always incur the SW video-encode cost — the
 RFC 4175 packetiser feeds an internal x264 / x265 pass.
+
+Thumbnail cost scales two ways: with cadence (`thumbnail_interval_secs`,
+work ∝ 1/interval → 15 units at 1 s, 3 at the 5 s default, 1 at 30 s) and
+with the number of concurrent generators a flow runs — one flow-level
+preview plus one per input. A 2-input flow at the default adds
+`(1 + 2) × 3 = 9` units; a flow with thumbnails off or no inputs adds 0.
 
 ### Total budget capacity
 

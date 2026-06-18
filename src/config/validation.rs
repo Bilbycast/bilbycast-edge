@@ -490,6 +490,19 @@ pub fn validate_flow(flow: &FlowConfig) -> Result<()> {
         &format!("Flow '{}' thumbnail", flow.id),
     )?;
 
+    // Validate thumbnail capture cadence. The edge accepts any sane value in
+    // 1..=60 s (the manager UI offers a curated subset); the freeze /
+    // no-signal windows in `engine::thumbnail` scale with whatever lands here.
+    if let Some(secs) = flow.thumbnail_interval_secs {
+        if !(1..=60).contains(&secs) {
+            bail!(
+                "Flow '{}' thumbnail_interval_secs must be between 1 and 60 (got {})",
+                flow.id,
+                secs
+            );
+        }
+    }
+
     // Validate optional PID-bus assembly plan (schema-only — runtime is
     // not yet implemented and `FlowRuntime::start` refuses to bring up
     // flows carrying one until Phase 4/5 lands).
@@ -7851,6 +7864,7 @@ mod tests {
             media_analysis: true,
             thumbnail: true,
             thumbnail_program_number: None,
+            thumbnail_interval_secs: None,
             bandwidth_limit: None,
             flow_group_id: None,
             clock_domain: None,
@@ -7882,6 +7896,7 @@ mod tests {
             media_analysis: true,
             thumbnail: true,
             thumbnail_program_number: None,
+            thumbnail_interval_secs: None,
             bandwidth_limit: None,
             flow_group_id: None,
             clock_domain: None,
@@ -8131,6 +8146,7 @@ mod tests {
             media_analysis: true,
             thumbnail: true,
             thumbnail_program_number: None,
+            thumbnail_interval_secs: None,
             bandwidth_limit: None,
             flow_group_id: None,
             clock_domain: None,
@@ -8149,6 +8165,7 @@ mod tests {
             media_analysis: true,
             thumbnail: true,
             thumbnail_program_number: None,
+            thumbnail_interval_secs: None,
             bandwidth_limit: None,
             flow_group_id: None,
             clock_domain: None,
@@ -8271,6 +8288,7 @@ mod tests {
             media_analysis: true,
             thumbnail: true,
             thumbnail_program_number: None,
+            thumbnail_interval_secs: None,
             bandwidth_limit: None,
             flow_group_id: None,
             clock_domain: None,
@@ -8346,6 +8364,7 @@ mod tests {
             media_analysis: true,
             thumbnail: true,
             thumbnail_program_number: None,
+            thumbnail_interval_secs: None,
             bandwidth_limit: None,
             flow_group_id: None,
             clock_domain: None,
@@ -8450,6 +8469,7 @@ mod tests {
             media_analysis: true,
             thumbnail: true,
             thumbnail_program_number: None,
+            thumbnail_interval_secs: None,
             bandwidth_limit: None,
             flow_group_id: None,
             clock_domain: None,
@@ -8525,6 +8545,7 @@ mod tests {
             media_analysis: true,
             thumbnail: true,
             thumbnail_program_number: None,
+            thumbnail_interval_secs: None,
             bandwidth_limit: None,
             flow_group_id: None,
             clock_domain: None,
@@ -8600,6 +8621,7 @@ mod tests {
             media_analysis: true,
             thumbnail: true,
             thumbnail_program_number: None,
+            thumbnail_interval_secs: None,
             bandwidth_limit: None,
             flow_group_id: None,
             clock_domain: None,
@@ -8816,6 +8838,7 @@ mod tests {
             media_analysis: false,
             thumbnail: false,
             thumbnail_program_number: None,
+            thumbnail_interval_secs: None,
             bandwidth_limit: None,
             flow_group_id: Some("group-1".to_string()),
             clock_domain: Some(0),
@@ -8873,6 +8896,7 @@ mod tests {
             media_analysis: false,
             thumbnail: false,
             thumbnail_program_number: None,
+            thumbnail_interval_secs: None,
             bandwidth_limit: None,
             flow_group_id: Some("group-1".to_string()),
             clock_domain: Some(0),
@@ -8897,6 +8921,7 @@ mod tests {
             media_analysis: false,
             thumbnail: false,
             thumbnail_program_number: None,
+            thumbnail_interval_secs: None,
             bandwidth_limit: None,
             flow_group_id: None,
             clock_domain: None,
@@ -8928,6 +8953,7 @@ mod tests {
             media_analysis: false,
             thumbnail: false,
             thumbnail_program_number: None,
+            thumbnail_interval_secs: None,
             bandwidth_limit: None,
             flow_group_id: Some("group-1".to_string()),
             clock_domain: Some(0),

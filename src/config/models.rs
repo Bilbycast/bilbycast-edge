@@ -616,6 +616,14 @@ pub struct FlowConfig {
     /// program). Must be > 0 if set; program_number 0 is reserved for the NIT.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thumbnail_program_number: Option<u16>,
+    /// How often (in seconds) to capture a fresh thumbnail. `None` keeps the
+    /// 5 s default. Lower = more frequent previews at proportionally higher
+    /// decode CPU cost. Validated to `1..=60`; the manager UI offers a
+    /// curated set (1 / 2 / 5 / 10 / 30 s). The freeze and no-signal
+    /// detection windows scale with this value so the alarms stay correct
+    /// at any cadence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thumbnail_interval_secs: Option<u32>,
     /// Optional bandwidth limit for trust boundary enforcement (RP 2129).
     /// When configured, the node monitors the flow's input bitrate and takes
     /// the specified action if it exceeds the limit for the grace period.
@@ -6469,6 +6477,7 @@ mod tests {
                 media_analysis: true,
                 thumbnail: true,
                 thumbnail_program_number: None,
+                thumbnail_interval_secs: None,
                 bandwidth_limit: None,
                 flow_group_id: None,
                 clock_domain: None,
@@ -6546,6 +6555,7 @@ mod tests {
                 media_analysis: true,
                 thumbnail: true,
                 thumbnail_program_number: None,
+                thumbnail_interval_secs: None,
                 bandwidth_limit: None,
                 flow_group_id: None,
                 clock_domain: None,
@@ -6577,6 +6587,7 @@ mod tests {
                 media_analysis: true,
                 thumbnail: true,
                 thumbnail_program_number: None,
+                thumbnail_interval_secs: None,
                 bandwidth_limit: None,
                 flow_group_id: None,
                 clock_domain: None,
@@ -6656,6 +6667,7 @@ mod tests {
                 media_analysis: true,
                 thumbnail: true,
                 thumbnail_program_number: None,
+                thumbnail_interval_secs: None,
                 bandwidth_limit: None,
                 flow_group_id: None,
                 clock_domain: None,

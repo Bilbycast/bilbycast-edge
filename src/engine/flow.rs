@@ -295,6 +295,11 @@ pub struct FlowRuntime {
     /// display output's `hw_decode` or an output's `video_encode`
     /// codec see the Resources card update on the next health tick.
     pub cost_units: std::sync::atomic::AtomicU32,
+    /// The thumbnail-preview portion of `cost_units`, tracked separately so a
+    /// live cadence change (`apply_thumbnail_interval`) can adjust the total
+    /// without re-deriving the whole plan — the Resources card then reflects
+    /// the new cadence on the next health tick, matching the modal's preview.
+    pub thumbnail_cost_units: std::sync::atomic::AtomicU32,
     /// Per-family hardware encoder + decoder session counts
     /// attributable to this flow's outputs. Each HW `video_encode`
     /// output adds one session against its family's slot
@@ -762,6 +767,7 @@ impl FlowRuntime {
             global_stats: &global_stats,
             ffmpeg_available,
             thumbnail_enabled: config.config.thumbnail,
+            thumbnail_interval_secs: config.config.thumbnail_interval_secs,
             flow_clock_domain: config.config.clock_domain,
             st2110_timeline: &st2110_timeline,
             broadcast_capacity,
@@ -1019,6 +1025,7 @@ impl FlowRuntime {
                 thumb_acc,
                 cancel_token.child_token(),
                 config.config.thumbnail_program_number,
+                config.config.thumbnail_interval_secs,
             ))
         } else {
             None
@@ -1409,6 +1416,8 @@ impl FlowRuntime {
             },
         );
         let cost_units = std::sync::atomic::AtomicU32::new(cost_units);
+        let thumbnail_cost_units =
+            std::sync::atomic::AtomicU32::new(cost_plan.thumbnail_units);
         // Snapshot per-output contributions so hot-remove can subtract
         // exactly what each output added at spawn time. Hot-add inserts
         // into this map alongside the resource-totals delta; hot-edit
@@ -1460,6 +1469,7 @@ impl FlowRuntime {
             #[cfg(feature = "replay")]
             replay_command_txs,
             cost_units,
+            thumbnail_cost_units,
             hw_session_usage,
             output_contributions,
             #[cfg(all(feature = "display", target_os = "linux"))]
@@ -1884,6 +1894,22 @@ impl FlowRuntime {
             );
         }
         drop(handles);
+
+        // No-op when the requested input is already the active one. Re-sending
+        // on the `active_input_tx` watch channel would re-run the full switch
+        // cascade in the forwarder (TsContinuityFixer PSI version bump + output
+        // CC reset → downstream receivers resync), glitching the output for no
+        // reason. The manager re-asserts the active input on every flow-config
+        // save (`applyFlow` → `activate-input`), so a metadata-only edit (e.g.
+        // changing the thumbnail cadence) must not disturb the running flow.
+        if self.active_input_tx.borrow().as_str() == new_input_id {
+            // Still nudge the thumbnail for a fresh preview — harmless.
+            if let Some(thumb) = self.stats.per_input_thumbnails.get(new_input_id) {
+                thumb.request_refresh();
+            }
+            return Ok(());
+        }
+
         self.active_input_tx
             .send(new_input_id.to_string())
             .map_err(|_| anyhow::anyhow!("active_input watch channel closed"))?;
@@ -1919,6 +1945,44 @@ impl FlowRuntime {
             new_input_id
         );
         Ok(())
+    }
+
+    /// Apply a new thumbnail capture cadence to all of this flow's running
+    /// generators — the flow-level preview plus every per-input generator —
+    /// **without** a restart and without touching the media path. The
+    /// generators pick it up on their next loop iteration (woken immediately
+    /// via the accumulator's refresh trigger). `None` resets to the default.
+    pub fn apply_thumbnail_interval(&self, new_interval_secs: Option<u32>) {
+        use std::sync::atomic::Ordering;
+
+        if let Some(acc) = self.stats.thumbnail.get() {
+            acc.set_configured_interval(new_interval_secs);
+        }
+        for entry in self.stats.per_input_thumbnails.iter() {
+            entry.value().set_configured_interval(new_interval_secs);
+        }
+
+        // Keep the rolled-up resource budget honest: re-cost the thumbnail
+        // contribution at the new cadence and swap it into the flow total, so
+        // the Resources card tracks the modal's live preview. Mirrors the
+        // thumbnail term in `derive_cost_plan` (1 flow-level + 1 per-input
+        // generator, scaled by cadence) exactly.
+        let new_thumb = if self.config.config.thumbnail && !self.config.inputs.is_empty() {
+            let generators = 1u32.saturating_add(self.config.inputs.len() as u32);
+            generators.saturating_mul(
+                crate::engine::hardware_probe::thumbnail_units_per_decoder(new_interval_secs),
+            )
+        } else {
+            0
+        };
+        let old_thumb = self.thumbnail_cost_units.swap(new_thumb, Ordering::Relaxed);
+        if new_thumb != old_thumb {
+            let _ = self
+                .cost_units
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |total| {
+                    Some(total.saturating_sub(old_thumb).saturating_add(new_thumb))
+                });
+        }
     }
 
     /// Toggle an output between active (running task) and passive (no task).
@@ -2877,6 +2941,7 @@ impl FlowRuntime {
             global_stats: &self.global_stats,
             ffmpeg_available: self.ffmpeg_available,
             thumbnail_enabled: self.config.config.thumbnail,
+            thumbnail_interval_secs: self.config.config.thumbnail_interval_secs,
             flow_clock_domain: self.config.config.clock_domain,
             st2110_timeline: &self.st2110_timeline,
             broadcast_capacity: self.broadcast_capacity,
@@ -3598,6 +3663,7 @@ pub(crate) struct InputSpawnContext<'a> {
     pub global_stats: &'a Arc<crate::stats::collector::StatsCollector>,
     pub ffmpeg_available: bool,
     pub thumbnail_enabled: bool,
+    pub thumbnail_interval_secs: Option<u32>,
     pub flow_clock_domain: Option<u8>,
     /// Per-flow cross-essence media-timeline anchor shared by every
     /// ST 2110 input so their synthesised PES timelines share one
@@ -3736,6 +3802,7 @@ pub(crate) fn spawn_input_runtime(
             thumb_acc,
             input_cancel.child_token(),
             None,
+            ctx.thumbnail_interval_secs,
         ))
     } else {
         None
@@ -5876,6 +5943,22 @@ fn derive_cost_plan(flow: &ResolvedFlow) -> crate::engine::hardware_probe::FlowC
         .map(|r| r.enabled)
         .unwrap_or(false);
 
+    // Thumbnail preview cost. When enabled, a flow runs one flow-level
+    // generator (the active output preview) plus one per input (each
+    // source's received preview) — every one is an independent decode at
+    // the configured cadence. A flow with no inputs spawns neither (the
+    // flow-level generator needs an active input). Slightly conservative
+    // for audio-only inputs, whose generator decodes nothing.
+    plan.thumbnail_units = if flow.config.thumbnail && !flow.inputs.is_empty() {
+        let generators = 1u32.saturating_add(flow.inputs.len() as u32);
+        let per = crate::engine::hardware_probe::thumbnail_units_per_decoder(
+            flow.config.thumbnail_interval_secs,
+        );
+        generators.saturating_mul(per)
+    } else {
+        0
+    };
+
     plan
 }
 
@@ -6769,6 +6852,68 @@ mod cost_plan_tests {
         assert_eq!(plan.vaapi_sessions_4k, 1);
         assert_eq!(plan.vaapi_decode_sessions, 1);
         assert_eq!(plan.vaapi_decode_sessions_4k, 1);
+    }
+
+    /// Build a ResolvedFlow with thumbnails configured (the shared `flow()`
+    /// helper hardcodes `thumbnail: false`).
+    fn flow_with_thumbnail(
+        inputs: Vec<InputDefinition>,
+        thumbnail: bool,
+        interval_secs: Option<u32>,
+    ) -> ResolvedFlow {
+        let input_ids: Vec<String> = inputs.iter().map(|i| i.id.clone()).collect();
+        let outputs = vec![rtp_output("o1", None)];
+        let mut j = serde_json::json!({
+            "id": "f1", "name": "f1", "enabled": true,
+            "media_analysis": false, "thumbnail": thumbnail,
+            "input_ids": input_ids, "output_ids": ["o1"],
+        });
+        if let Some(s) = interval_secs {
+            j["thumbnail_interval_secs"] = serde_json::json!(s);
+        }
+        let config: FlowConfig = serde_json::from_value(j).unwrap();
+        ResolvedFlow { config, inputs, outputs }
+    }
+
+    #[test]
+    fn thumbnail_cost_counts_flow_level_plus_per_input() {
+        // thumbnail on, 2 inputs, default cadence → (1 flow-level + 2 inputs)
+        // × 3 units = 9.
+        let inputs = vec![rtp_input("i1", None, None), rtp_input("i2", None, None)];
+        let plan = derive_cost_plan(&flow_with_thumbnail(inputs, true, None));
+        assert_eq!(plan.thumbnail_units, 9);
+    }
+
+    #[test]
+    fn thumbnail_cost_scales_with_cadence() {
+        // 1 input @ 1 s → (1 + 1) × 15 = 30; @ 30 s → (1 + 1) × 1 = 2.
+        let fast = derive_cost_plan(&flow_with_thumbnail(
+            vec![rtp_input("i1", None, None)],
+            true,
+            Some(1),
+        ));
+        assert_eq!(fast.thumbnail_units, 30);
+        let slow = derive_cost_plan(&flow_with_thumbnail(
+            vec![rtp_input("i1", None, None)],
+            true,
+            Some(30),
+        ));
+        assert_eq!(slow.thumbnail_units, 2);
+    }
+
+    #[test]
+    fn thumbnail_cost_zero_when_off_or_no_inputs() {
+        // Disabled → 0 even with inputs present.
+        let off = derive_cost_plan(&flow_with_thumbnail(
+            vec![rtp_input("i1", None, None)],
+            false,
+            None,
+        ));
+        assert_eq!(off.thumbnail_units, 0);
+        // Enabled but no inputs → 0 (the flow-level generator needs an active
+        // input, and there are no per-input generators).
+        let no_inputs = derive_cost_plan(&flow_with_thumbnail(vec![], true, None));
+        assert_eq!(no_inputs.thumbnail_units, 0);
     }
 }
 

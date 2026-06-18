@@ -2063,11 +2063,6 @@ impl MediaAnalysisAccumulator {
 
 // ── Thumbnail Accumulator ─────────────────────────────────────────────────
 
-/// Number of consecutive identical thumbnail captures before raising a
-/// "frozen" alarm. At 5 s per capture this corresponds to ~30 s — tuned
-/// for fast operator feedback on flow changes.
-const FREEZE_THRESHOLD: u64 = 6;
-
 /// Thumbnail generation accumulator. The thumbnail task writes the latest
 /// JPEG bytes; the 1/sec snapshot path reads the counters.
 pub struct ThumbnailAccumulator {
@@ -2105,6 +2100,13 @@ pub struct ThumbnailAccumulator {
     /// hook the WS send loop polls and can sit up to 5s on a stale frame
     /// after an input switch or signal-state change.
     update_notify: Option<Arc<tokio::sync::Notify>>,
+    /// Live-configurable capture cadence (seconds). `0` == use the generator's
+    /// spawn-time default; `1..=60` == an operator override applied without a
+    /// respawn. The thumbnail loop re-reads this each iteration and rebuilds
+    /// its interval when it changes (see `engine::thumbnail::thumbnail_loop`),
+    /// so changing the cadence on a running flow takes effect immediately
+    /// rather than at the next flow restart.
+    configured_interval_secs: AtomicU32,
 }
 
 impl ThumbnailAccumulator {
@@ -2112,6 +2114,7 @@ impl ThumbnailAccumulator {
         Self {
             latest_jpeg: Mutex::new(None),
             generation: AtomicU64::new(0),
+            configured_interval_secs: AtomicU32::new(0),
             total_captured: AtomicU64::new(0),
             capture_errors: AtomicU64::new(0),
             last_error: Mutex::new(None),
@@ -2139,6 +2142,34 @@ impl ThumbnailAccumulator {
         self.refresh_trigger.notify_one();
     }
 
+    fn encode_interval(secs: Option<u32>) -> u32 {
+        secs.map(|s| s.clamp(1, 60)).unwrap_or(0)
+    }
+
+    /// Seed the live cadence to the generator's spawn-time value **without**
+    /// waking the loop. Called once at loop start so the first re-read matches.
+    pub fn init_configured_interval(&self, secs: Option<u32>) {
+        self.configured_interval_secs
+            .store(Self::encode_interval(secs), Ordering::Relaxed);
+    }
+
+    /// Change the live capture cadence and wake the generator so it applies
+    /// immediately rather than on the next (possibly slow) tick. `None` resets
+    /// to the spawn-time default. Safe to call from any task.
+    pub fn set_configured_interval(&self, secs: Option<u32>) {
+        self.configured_interval_secs
+            .store(Self::encode_interval(secs), Ordering::Relaxed);
+        self.refresh_trigger.notify_one();
+    }
+
+    /// The current live cadence — `None` means the spawn-time default.
+    pub fn configured_interval(&self) -> Option<u32> {
+        match self.configured_interval_secs.load(Ordering::Relaxed) {
+            0 => None,
+            n => Some(n),
+        }
+    }
+
     /// Store a newly captured thumbnail.
     pub fn store(&self, jpeg_data: bytes::Bytes) {
         *self.latest_jpeg.lock().unwrap() = Some((jpeg_data, Instant::now()));
@@ -2161,13 +2192,15 @@ impl ThumbnailAccumulator {
 
     /// Check whether the current JPEG hash matches the previous one and
     /// update the freeze counter accordingly. Returns `true` when the
-    /// frame has been identical for [`FREEZE_THRESHOLD`] consecutive
-    /// captures.
-    pub fn check_freeze(&self, jpeg_hash: u64) -> bool {
+    /// frame has been identical for `threshold` consecutive captures. The
+    /// caller derives `threshold` from the configured capture cadence (see
+    /// `engine::thumbnail::resolve_thumbnail_timing`) so "frozen" fires at a
+    /// consistent ~30 s wall-clock window regardless of interval.
+    pub fn check_freeze(&self, jpeg_hash: u64, threshold: u64) -> bool {
         let mut prev = self.prev_jpeg_hash.lock().unwrap();
         if *prev == Some(jpeg_hash) {
             let count = self.freeze_count.fetch_add(1, Ordering::Relaxed) + 1;
-            count >= FREEZE_THRESHOLD
+            count >= threshold
         } else {
             *prev = Some(jpeg_hash);
             self.freeze_count.store(1, Ordering::Relaxed);

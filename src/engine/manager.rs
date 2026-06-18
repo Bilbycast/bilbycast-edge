@@ -901,6 +901,22 @@ impl FlowManager {
     ///
     /// Returns an error if the flow is not running or `new_input_id` is not
     /// a member of the flow.
+    /// Apply a new thumbnail capture cadence to a running flow's generators
+    /// (flow-level + per-input) live, without a restart. Errors only if the
+    /// flow isn't currently running.
+    pub fn apply_thumbnail_interval(
+        &self,
+        flow_id: &str,
+        new_interval_secs: Option<u32>,
+    ) -> Result<()> {
+        let runtime = self
+            .flows
+            .get(flow_id)
+            .ok_or_else(|| anyhow::anyhow!("Flow '{}' is not running", flow_id))?;
+        runtime.apply_thumbnail_interval(new_interval_secs);
+        Ok(())
+    }
+
     pub async fn switch_active_input(
         &self,
         flow_id: &str,
