@@ -123,6 +123,13 @@ pub struct MediaScanResult {
     /// delta. Useful for the picker UI to render a `mm:ss` hint.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub duration_ms: Option<u64>,
+    /// On-wire TS packet stride in bytes when `is_ts` — 188 (canonical
+    /// MPEG-TS), 192 (M2TS / AVCHD / Blu-ray BDAV, 4-byte arrival-timestamp
+    /// prefix), or 204 (DVB Reed-Solomon parity-suffixed capture). `None`
+    /// for non-TS files. Lets the manager UI label the container precisely
+    /// (MPEG-TS / M2TS / DVB-TS) in the media-info panel.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ts_packet_bytes: Option<u16>,
 }
 
 #[inline]
@@ -136,27 +143,71 @@ fn is_false(b: &bool) -> bool { !*b }
 pub(crate) fn detect_ts_stride(buf: &[u8]) -> Option<(usize, usize)> {
     use crate::engine::ts_parse::{TS_PACKET_SIZE, TS_SYNC_BYTE};
     const STRIDE_CANDIDATES: [usize; 3] = [TS_PACKET_SIZE, 192, 204];
+    // A two-byte "sync, then sync `stride` bytes later" match is NOT a
+    // reliable stride confirmation: 0x47 occurs at ~1/256 density in
+    // compressed payload / M2TS timestamp prefixes / DVB Reed-Solomon parity,
+    // so on the real 512 KiB probe window an *incidental* 188-apart 0x47 pair
+    // is essentially guaranteed and would let the canonical 188 candidate win
+    // before 192 (M2TS) / 204 (DVB) are even tried — mis-labelling the
+    // container AND mis-walking the file from a bogus off-grid offset.
+    //
+    // Instead, confirm each candidate by the length of the unbroken run of
+    // sync bytes it produces (`start, start+stride, start+2·stride, …`). A
+    // genuine capture yields a run spanning the whole window; an incidental
+    // coincidence almost never extends past two or three. We keep the
+    // (stride, start) with the LONGEST run of at least `MIN_RUN` packets, so
+    // the smallest stride no longer gets to short-circuit the search. 188 is
+    // listed first only so it wins a genuine tie.
+    const MIN_RUN: usize = 5;
+    // A well-formed capture's first sync lands within the first packet or two
+    // even allowing for a partial leading packet or the 4-byte M2TS prefix, so
+    // bound where a run may BEGIN (the run itself still walks to end-of-buffer
+    // via `sync_run_len`). Keeps the start scan cheap on the 512 KiB head and
+    // shrinks the incidental-match surface.
+    let start_limit = buf.len().min(16 * 1024);
+
+    let mut best: Option<(usize, usize, usize)> = None; // (run_len, stride, start)
     for &stride in &STRIDE_CANDIDATES {
         let mut start = 0usize;
-        while start + 2 * stride <= buf.len() {
+        while start < start_limit && start + stride < buf.len() {
             if buf[start] == TS_SYNC_BYTE && buf[start + stride] == TS_SYNC_BYTE {
-                return Some((stride, start));
+                let run = sync_run_len(buf, stride, start);
+                if run >= MIN_RUN && best.map_or(true, |(best_run, _, _)| run > best_run) {
+                    best = Some((run, stride, start));
+                }
             }
             start += 1;
         }
-        // Tail-of-buffer fallback: a single confirmed sync byte counts if
-        // there isn't room for two strides. Only the canonical 188 case
-        // gets this concession (small files), to keep 192/204 detection
-        // strict.
-        if stride == TS_PACKET_SIZE && buf.len() >= TS_PACKET_SIZE {
-            for s in 0..=buf.len() - TS_PACKET_SIZE {
-                if buf[s] == TS_SYNC_BYTE {
-                    return Some((TS_PACKET_SIZE, s));
-                }
+    }
+    if let Some((_, stride, start)) = best {
+        return Some((stride, start));
+    }
+
+    // Tail-of-buffer fallback: too few packets to confirm a run (tiny files).
+    // A single confirmed sync byte counts, canonical 188 only.
+    if buf.len() >= TS_PACKET_SIZE {
+        for s in 0..=buf.len() - TS_PACKET_SIZE {
+            if buf[s] == TS_SYNC_BYTE {
+                return Some((TS_PACKET_SIZE, s));
             }
         }
     }
     None
+}
+
+/// Length, in packets, of the unbroken run of TS sync bytes at
+/// `start, start+stride, start+2·stride, …`. Used by [`detect_ts_stride`] to
+/// confirm a candidate stride: a genuine capture's run spans the probe
+/// window, while an incidental 0x47 coincidence dies after a packet or two.
+fn sync_run_len(buf: &[u8], stride: usize, start: usize) -> usize {
+    use crate::engine::ts_parse::TS_SYNC_BYTE;
+    let mut run = 0usize;
+    let mut off = start;
+    while off < buf.len() && buf[off] == TS_SYNC_BYTE {
+        run += 1;
+        off += stride;
+    }
+    run
 }
 
 /// Walk a TS-shaped byte buffer and return the first PAT's program list,
@@ -179,6 +230,7 @@ pub fn scan_programs_in_buf(buf: &[u8]) -> MediaScanResult {
                 file_size_bytes: None,
                 bitrate_bps: None,
                 duration_ms: None,
+                ts_packet_bytes: None,
             };
         }
     };
@@ -213,6 +265,7 @@ pub fn scan_programs_in_buf(buf: &[u8]) -> MediaScanResult {
             file_size_bytes: None,
             bitrate_bps: None,
             duration_ms: None,
+            ts_packet_bytes: Some(stride as u16),
         };
     }
 
@@ -250,6 +303,7 @@ pub fn scan_programs_in_buf(buf: &[u8]) -> MediaScanResult {
         file_size_bytes: None,
         bitrate_bps: None,
         duration_ms: None,
+        ts_packet_bytes: Some(stride as u16),
     }
 }
 
@@ -396,6 +450,7 @@ impl MediaLibrary {
                     file_size_bytes: None,
                     bitrate_bps: None,
                     duration_ms: None,
+                    ts_packet_bytes: None,
                 });
             }
             Err(e) => return Err(anyhow!("open {}: {e}", path.display())),
@@ -792,6 +847,7 @@ mod tests {
         assert!(!res.is_ts);
         assert!(res.programs.is_empty());
         assert!(!res.not_found);
+        assert_eq!(res.ts_packet_bytes, None);
     }
 
     #[test]
@@ -812,6 +868,7 @@ mod tests {
         assert_eq!(res.programs.len(), 1);
         assert_eq!(res.programs[0].program_number, 101);
         assert_eq!(res.programs[0].pmt_pid, 0x1000);
+        assert_eq!(res.ts_packet_bytes, Some(188));
     }
 
     #[test]
@@ -856,23 +913,29 @@ mod tests {
     #[test]
     fn scan_in_buf_finds_program_in_204_byte_dvb_capture() {
         let pat = build_pat_packet(&[(23584, 0x1100)]);
-        let mut buf = Vec::with_capacity(204 * 4);
-        buf.extend_from_slice(&pat);
-        buf.extend_from_slice(&[0xDEu8; 16]); // synthetic RS parity
-
         let mut null = [0xFFu8; 188];
         null[0] = 0x47;
         null[1] = 0x1F;
         null[2] = 0xFF;
         null[3] = 0x10;
-        buf.extend_from_slice(&null);
-        buf.extend_from_slice(&[0xDEu8; 16]);
+        // Eight 204-byte DVB packets (each = 188 B TS + 16 B RS parity) so the
+        // consecutive-sync run confirms the 204 stride. The PAT leads.
+        let mut buf = Vec::with_capacity(204 * 8);
+        for i in 0..8u8 {
+            if i == 0 {
+                buf.extend_from_slice(&pat);
+            } else {
+                buf.extend_from_slice(&null);
+            }
+            buf.extend_from_slice(&[0xDEu8; 16]); // synthetic RS parity
+        }
 
         let res = scan_programs_in_buf(&buf);
         assert!(res.is_ts);
         assert_eq!(res.programs.len(), 1);
         assert_eq!(res.programs[0].program_number, 23584);
         assert_eq!(res.programs[0].pmt_pid, 0x1100);
+        assert_eq!(res.ts_packet_bytes, Some(204));
     }
 
     /// 192-byte M2TS / AVCHD: every TS packet is prefixed with 4 bytes
@@ -882,23 +945,86 @@ mod tests {
     #[test]
     fn scan_in_buf_finds_program_in_192_byte_m2ts_capture() {
         let pat = build_pat_packet(&[(7, 0x1007)]);
-        let mut buf = Vec::with_capacity(192 * 4);
-        // 4-byte timestamp prefix on the PAT packet.
-        buf.extend_from_slice(&[0x12, 0x34, 0x56, 0x78]);
-        buf.extend_from_slice(&pat);
-
         let mut null = [0xFFu8; 188];
         null[0] = 0x47;
         null[1] = 0x1F;
         null[2] = 0xFF;
         null[3] = 0x10;
-        buf.extend_from_slice(&[0x12, 0x34, 0x56, 0x79]);
-        buf.extend_from_slice(&null);
+        // Eight M2TS packets (each = 4-byte arrival-timestamp prefix + 188-byte
+        // TS packet). Stride detection confirms a candidate by its
+        // consecutive-sync run length (>= MIN_RUN packets), so the buffer must
+        // span several packets. The PAT leads so program detection still works.
+        let mut buf = Vec::with_capacity(192 * 8);
+        for i in 0..8u8 {
+            buf.extend_from_slice(&[0x12, 0x34, 0x56, i]);
+            if i == 0 {
+                buf.extend_from_slice(&pat);
+            } else {
+                buf.extend_from_slice(&null);
+            }
+        }
 
         let res = scan_programs_in_buf(&buf);
         assert!(res.is_ts);
         assert_eq!(res.programs.len(), 1);
         assert_eq!(res.programs[0].program_number, 7);
         assert_eq!(res.programs[0].pmt_pid, 0x1007);
+        assert_eq!(res.ts_packet_bytes, Some(192));
+    }
+
+    /// Deterministic xorshift64 fill — gives the ~1/256 incidental 0x47
+    /// density of real compressed payload / RS parity, so the regression tests
+    /// below exercise the same incidental-match pressure that defeats a naive
+    /// two-byte stride confirmation on the production-sized probe window.
+    fn pseudo_fill(buf: &mut [u8], mut x: u64) {
+        if x == 0 {
+            x = 0x9E37_79B9_7F4A_7C15;
+        }
+        for b in buf.iter_mut() {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            *b = (x & 0xFF) as u8;
+        }
+    }
+
+    #[test]
+    fn detect_stride_picks_192_over_incidental_188_on_large_buffer() {
+        // 200 M2TS packets with pseudo-random prefixes + payload, so incidental
+        // 188-apart 0x47 pairs are essentially guaranteed — exactly the case
+        // that mis-detected as stride 188 before run-length confirmation. The
+        // true 192 grid still yields the longest sync run and must win.
+        let n = 200usize;
+        let mut buf = vec![0u8; 192 * n];
+        pseudo_fill(&mut buf, 0x0123_4567_89AB_CDEF);
+        for i in 0..n {
+            buf[i * 192 + 4] = 0x47; // real sync at each 192-grid slot (offset 4)
+        }
+        assert_eq!(detect_ts_stride(&buf).map(|(stride, _)| stride), Some(192));
+    }
+
+    #[test]
+    fn detect_stride_picks_204_over_incidental_on_large_buffer() {
+        // 200 DVB packets with pseudo-random payload + parity; the true 204
+        // grid must beat any incidental 188/192-apart coincidence.
+        let n = 200usize;
+        let mut buf = vec![0u8; 204 * n];
+        pseudo_fill(&mut buf, 0xDEAD_BEEF_F00D_1234);
+        for i in 0..n {
+            buf[i * 204] = 0x47; // real sync at each 204-grid slot
+        }
+        assert_eq!(detect_ts_stride(&buf).map(|(stride, _)| stride), Some(204));
+    }
+
+    #[test]
+    fn detect_stride_picks_188_on_large_clean_buffer() {
+        // Canonical 188 with pseudo-random payload must still resolve to 188.
+        let n = 200usize;
+        let mut buf = vec![0u8; 188 * n];
+        pseudo_fill(&mut buf, 0xABCD_1234_5678_9F00);
+        for i in 0..n {
+            buf[i * 188] = 0x47;
+        }
+        assert_eq!(detect_ts_stride(&buf).map(|(stride, _)| stride), Some(188));
     }
 }
