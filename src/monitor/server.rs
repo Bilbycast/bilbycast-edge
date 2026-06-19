@@ -78,6 +78,19 @@ async fn monitor_health(State(state): State<MonitorState>) -> Json<serde_json::V
         None, // cellular cache — capability advertised via the manager path
         state.app.start_time,
     );
+    // Inject the device-local manager-link indicator. This is the edge's OWN
+    // view of its link to the manager (NOT part of the payload sent UP to the
+    // manager — `build_health_payload` above is untouched). The dashboard SPA
+    // renders a green/red "Manager" badge off this field. Keyed `"manager"`
+    // with the same typed `ManagerLinkStatus` shape the REST `/health` endpoint
+    // exposes, so both local surfaces present an identical JSON object.
+    let mut payload = payload;
+    if let serde_json::Value::Object(ref mut map) = payload {
+        map.insert(
+            "manager".to_string(),
+            state.app.manager_link.snapshot_json(),
+        );
+    }
     Json(payload)
 }
 

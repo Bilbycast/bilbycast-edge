@@ -12,6 +12,7 @@
 pub mod client;
 pub mod config;
 pub mod events;
+pub mod link_state;
 
 pub use config::ManagerConfig;
 pub use events::event_channel;

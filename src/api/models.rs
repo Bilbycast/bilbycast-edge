@@ -215,6 +215,29 @@ pub struct SystemStats {
     pub version: String,
 }
 
+/// Device-local manager-link status, embedded in [`HealthResponse`].
+///
+/// This is the edge's OWN view of its connection to the manager, surfaced on
+/// the local `/health` endpoint so an operator at the device can see a lost
+/// link. It is independent of the top-level `status` field (which reflects the
+/// edge's own health) and does not ride the manager↔node WebSocket protocol.
+#[derive(Serialize)]
+pub struct ManagerLinkStatus {
+    /// Whether a manager client is configured/enabled on this node at all.
+    /// `false` on a standalone edge — the indicator means "not managed", not
+    /// "disconnected".
+    pub enabled: bool,
+    /// Whether an authenticated WS session to the manager is currently live.
+    pub connected: bool,
+    /// Seconds since the link went down. `None` while connected, or before the
+    /// first successful connection (boot — render as "connecting").
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub disconnected_secs: Option<u64>,
+    /// `true` when a manager is enabled but the link is currently down — the
+    /// client loop is always retrying in that state.
+    pub reconnecting: bool,
+}
+
 /// Response body for `GET /health`.
 ///
 /// Provides a quick snapshot of application liveness and high-level capacity.
@@ -222,6 +245,9 @@ pub struct SystemStats {
 #[derive(Serialize)]
 pub struct HealthResponse {
     /// Health status string. Currently always `"ok"` when the server is responsive.
+    /// **This reflects the edge's OWN health** — it is intentionally NOT flipped
+    /// to an error state merely because the manager link is down. The
+    /// manager-link state is carried in the separate `manager` sub-object.
     pub status: String,
     /// Application version string (e.g., `"0.1.0"`).
     pub version: String,
@@ -231,4 +257,7 @@ pub struct HealthResponse {
     pub active_flows: usize,
     /// Total number of flows defined in the configuration.
     pub total_flows: usize,
+    /// Device-local manager-link state (additive). Lets an operator at the
+    /// device see whether the manager link is up without reading logs.
+    pub manager: ManagerLinkStatus,
 }

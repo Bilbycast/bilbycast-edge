@@ -104,7 +104,8 @@ details[open] summary::before{content:"▾ "}
 <header>
   <h1>BilbyCast Edge Monitor</h1>
   <div class="meta">
-    <span id="conn-state"><span class="dot dot-slate"></span>connecting…</span>
+    <span id="manager-link" title="Link from this device to the bilbycast manager"><span class="dot dot-slate"></span>Manager: …</span>
+    <span id="conn-state" title="This dashboard's connection to the edge"><span class="dot dot-slate"></span>connecting…</span>
     <span id="version" class="mono"></span>
   </div>
 </header>
@@ -219,6 +220,7 @@ async function refreshHealth() {
     renderSystemBar();
     renderCapabilities();
     renderResources();
+    renderManagerLink();
   } catch (e) {
     /* /api/health is optional on older edges; keep going */
   }
@@ -276,6 +278,40 @@ function setConn(kind, detail) {
       banner.textContent = `Connection: ${detail}`;
       banner.classList.add('visible');
     }
+  }
+}
+
+// Device-local manager-link indicator (this device → the bilbycast manager).
+// Distinct from `conn-state`, which is THIS dashboard's link to the edge.
+// Source: /api/health → manager { enabled, connected, disconnected_secs,
+// reconnecting } — same shape + key as the REST /health endpoint.
+function fmtDownDuration(secs) {
+  if (secs == null) return '';
+  const s = Math.max(0, secs | 0);
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  const sec = s % 60;
+  const pad = (n) => String(n).padStart(2, '0');
+  return h > 0 ? `${h}:${pad(m)}:${pad(sec)}` : `${pad(m)}:${pad(sec)}`;
+}
+function renderManagerLink() {
+  const el = document.getElementById('manager-link');
+  if (!el) return;
+  const ml = state.health?.manager;
+  // Older edges (no manager field) → leave a neutral state.
+  if (!ml) {
+    el.innerHTML = '<span class="dot dot-slate"></span>Manager: —';
+    return;
+  }
+  if (!ml.enabled) {
+    el.innerHTML = '<span class="dot dot-slate"></span>Manager: not configured';
+  } else if (ml.connected) {
+    el.innerHTML = '<span class="dot dot-green"></span>Manager: Connected';
+  } else {
+    const dur = fmtDownDuration(ml.disconnected_secs);
+    const label = dur ? `Manager: DISCONNECTED ${dur}` : 'Manager: connecting…';
+    const cls = dur ? 'dot-red' : 'dot-amber';
+    el.innerHTML = `<span class="dot ${cls}"></span>${escapeHtml(label)}`;
   }
 }
 

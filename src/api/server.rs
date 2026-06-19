@@ -61,6 +61,12 @@ pub struct AppState {
     pub standby_listeners: Option<Arc<crate::engine::standby_listeners::StandbyListenerManager>>,
     /// Per-IP rate limiter for the `/oauth/token` endpoint (None = no limiting).
     pub token_rate_limiter: Option<Arc<auth::TokenEndpointRateLimiter>>,
+    /// Device-local manager-link state. Written by the manager-client loop on
+    /// connect/disconnect; read by the local `/health` endpoint + monitor
+    /// dashboard so an operator at the device sees a lost manager link. This
+    /// is a purely local indicator — it never rides the WS protocol and does
+    /// not affect the health payload sent UP to the manager.
+    pub manager_link: Arc<crate::manager::link_state::ManagerLinkState>,
 }
 
 /// Constructs the main Axum [`Router`] with all API routes, auth middleware, and layers.

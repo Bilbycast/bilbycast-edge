@@ -537,6 +537,18 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
+    // Device-local manager-link indicator. Shared between the manager-client
+    // loop (writer) and the local /health + monitor dashboard (readers).
+    // `enabled` reflects whether a manager client is configured at all so a
+    // standalone edge shows "not managed" instead of a red "disconnected".
+    let manager_link = manager::link_state::ManagerLinkState::new(
+        app_config
+            .manager
+            .as_ref()
+            .map(|m| m.enabled)
+            .unwrap_or(false),
+    );
+
     let state = AppState {
         config: Arc::new(RwLock::new(app_config.clone())),
         config_path: cli.config.clone(),
@@ -559,6 +571,7 @@ async fn main() -> anyhow::Result<()> {
         resource_state: resource_state.clone(),
         standby_listeners: Some(standby_listeners.clone()),
         token_rate_limiter,
+        manager_link: manager_link.clone(),
     };
 
     // Start all enabled flows from config
@@ -743,6 +756,7 @@ async fn main() -> anyhow::Result<()> {
                 Some(standby_listeners.clone()),
                 cellular_cache.clone(),
                 state.start_time,
+                manager_link.clone(),
             );
         }
     }

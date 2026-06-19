@@ -211,12 +211,13 @@ pub fn start_manager_client(
     standby_listeners: Option<Arc<crate::engine::standby_listeners::StandbyListenerManager>>,
     cellular_cache: Arc<crate::util::cellular::CellularCache>,
     start_time: Instant,
+    manager_link: Arc<crate::manager::link_state::ManagerLinkState>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         manager_client_loop(
             config, flow_manager, tunnel_manager, ws_stats_rx, app_config, config_path,
             secrets_path, api_addr, monitor_addr, webrtc_sessions, event_rx, resource_state,
-            static_caps, live_gpu, standby_listeners, cellular_cache, start_time,
+            static_caps, live_gpu, standby_listeners, cellular_cache, start_time, manager_link,
         ).await;
     })
 }
@@ -239,6 +240,7 @@ async fn manager_client_loop(
     standby_listeners: Option<Arc<crate::engine::standby_listeners::StandbyListenerManager>>,
     cellular_cache: Arc<crate::util::cellular::CellularCache>,
     start_time: Instant,
+    manager_link: Arc<crate::manager::link_state::ManagerLinkState>,
 ) {
     // If we already have a node_id from config, set it on the tunnel manager
     // so relay tunnels can identify this edge before the first manager connection.
@@ -285,6 +287,7 @@ async fn manager_client_loop(
             &standby_listeners,
             &cellular_cache,
             start_time,
+            &manager_link,
         )
         .await
         {
@@ -316,6 +319,11 @@ async fn manager_client_loop(
             }
         }
 
+        // The session ended (closed, registered-then-closed, or failed to
+        // connect). Reflect the lost link on the device's local surfaces
+        // before we back off and retry. Idempotent if already disconnected.
+        manager_link.set_disconnected();
+
         cursor = cursor.wrapping_add(1);
         tracing::info!(
             "Reconnecting to next manager URL in {}s...",
@@ -333,6 +341,18 @@ enum ConnectResult {
     },
 }
 
+/// Establish one manager session: connect, authenticate, then pump until the
+/// session ends.
+///
+/// **Link-state invariant:** on a successful `auth_ok` / `register_ack` this
+/// calls `manager_link.set_connected()` mid-function (it does NOT mark the link
+/// disconnected on any of its return paths). The caller (`manager_client_loop`)
+/// is responsible for calling `manager_link.set_disconnected()` after every
+/// `try_connect` return — both `Ok` and `Err`. If a future early-return is
+/// added AFTER the `set_connected()` calls below, it must preserve this
+/// contract: leave the disconnect to the caller's unconditional
+/// `set_disconnected()`, or the local `/health` + monitor surfaces will
+/// latch a stale "Connected" state after the session has actually ended.
 async fn try_connect(
     current_url: &str,
     config: &ManagerConfig,
@@ -352,6 +372,7 @@ async fn try_connect(
     standby_listeners: &Option<Arc<crate::engine::standby_listeners::StandbyListenerManager>>,
     cellular_cache: &Arc<crate::util::cellular::CellularCache>,
     start_time: Instant,
+    manager_link: &Arc<crate::manager::link_state::ManagerLinkState>,
 ) -> Result<ConnectResult, String> {
     // Enforce TLS — only wss:// connections are allowed
     if !current_url.starts_with("wss://") {
@@ -460,6 +481,9 @@ async fn try_connect(
             match response["type"].as_str().unwrap_or("") {
                 "auth_ok" => {
                     tracing::info!("Authenticated with manager");
+                    // Device-local link indicator: an authenticated session is
+                    // now live. Surfaced on the edge's own /health + monitor UI.
+                    manager_link.set_connected();
                     tunnel_manager.event_sender().emit(
                         EventSeverity::Info,
                         category::MANAGER,
@@ -484,6 +508,9 @@ async fn try_connect(
                         .unwrap_or("")
                         .to_string();
                     tracing::info!("Registered with manager: node_id={node_id}");
+                    // Device-local link indicator: registration counts as an
+                    // authenticated session for the operator-facing surfaces.
+                    manager_link.set_connected();
                     tunnel_manager.event_sender().emit(
                         EventSeverity::Info,
                         category::MANAGER,

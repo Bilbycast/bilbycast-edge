@@ -205,12 +205,14 @@ pub async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
     let uptime = state.start_time.elapsed().as_secs();
     let active = state.flow_manager.active_flow_count();
 
+    let link = &state.manager_link;
     Json(HealthResponse {
         status: "ok".to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),
         uptime_secs: uptime,
         active_flows: active,
         total_flows: config.flows.len(),
+        manager: link.status(),
     })
 }
 
