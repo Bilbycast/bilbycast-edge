@@ -83,6 +83,17 @@ pub struct PtpSettings {
     /// 1..=60 at runtime; the manager UI's slider should clamp too.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scan_timeout: Option<u8>,
+    /// Emit a manager Warning event when the **absolute** PTP master offset
+    /// exceeds this many nanoseconds while slaved to a grandmaster. `None`
+    /// (or `0`) disables the threshold. Consumed by the node-level PTP
+    /// monitor (`engine::st2110::ptp`), **not** by `ptp4l` — the helper
+    /// ignores it. See [`crate::engine::st2110::ptp`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub offset_warn_ns: Option<i64>,
+    /// Emit a manager Warning event when the PTP mean path delay exceeds
+    /// this many nanoseconds. `None` (or `0`) disables the threshold.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path_delay_warn_ns: Option<i64>,
 }
 
 impl PtpSettings {
@@ -107,6 +118,14 @@ impl PtpSettings {
         out.push_str(&format!(
             "scan_timeout = {}\n",
             self.scan_timeout.map(|s| s.to_string()).unwrap_or_default()
+        ));
+        out.push_str(&format!(
+            "offset_warn_ns = {}\n",
+            self.offset_warn_ns.map(|s| s.to_string()).unwrap_or_default()
+        ));
+        out.push_str(&format!(
+            "path_delay_warn_ns = {}\n",
+            self.path_delay_warn_ns.map(|s| s.to_string()).unwrap_or_default()
         ));
         out
     }
@@ -137,6 +156,10 @@ impl PtpSettings {
                 "domain" => out.domain = val.parse().ok(),
                 "priority1" | "priority_1" => out.priority1 = val.parse().ok(),
                 "scan_timeout" | "scan-timeout" => out.scan_timeout = val.parse().ok(),
+                "offset_warn_ns" | "offset-warn-ns" => out.offset_warn_ns = val.parse().ok(),
+                "path_delay_warn_ns" | "path-delay-warn-ns" => {
+                    out.path_delay_warn_ns = val.parse().ok()
+                }
                 _ => {} // tolerate unknown keys
             }
         }
@@ -152,6 +175,14 @@ impl PtpSettings {
             if !(1..=60).contains(&t) {
                 self.scan_timeout = Some(t.clamp(1, 60));
             }
+        }
+        // Treat an explicit 0 as "disabled" so the on-disk `= 0` form and an
+        // empty value mean the same thing.
+        if self.offset_warn_ns == Some(0) {
+            self.offset_warn_ns = None;
+        }
+        if self.path_delay_warn_ns == Some(0) {
+            self.path_delay_warn_ns = None;
         }
         self
     }
@@ -186,6 +217,18 @@ impl PtpSettings {
                 return Err(format!(
                     "scan_timeout {t}s out of range (1..=60)"
                 ));
+            }
+        }
+        // Monitoring thresholds are absolute-nanosecond bounds — must be
+        // non-negative and within a sane ceiling (1 s).
+        for (name, v) in [
+            ("offset_warn_ns", self.offset_warn_ns),
+            ("path_delay_warn_ns", self.path_delay_warn_ns),
+        ] {
+            if let Some(v) = v {
+                if !(0..=1_000_000_000).contains(&v) {
+                    return Err(format!("{name} {v} out of range (0..=1_000_000_000 ns)"));
+                }
             }
         }
         Ok(())
@@ -313,6 +356,8 @@ mod tests {
             domain: Some(127),
             priority1: None,
             scan_timeout: Some(10),
+            offset_warn_ns: Some(750),
+            path_delay_warn_ns: Some(250_000),
         };
         let rendered = original.render();
         let parsed = PtpSettings::parse(&rendered);
@@ -320,6 +365,8 @@ mod tests {
         assert_eq!(parsed.iface, "eno4");
         assert_eq!(parsed.domain, Some(127));
         assert_eq!(parsed.scan_timeout, Some(10));
+        assert_eq!(parsed.offset_warn_ns, Some(750));
+        assert_eq!(parsed.path_delay_warn_ns, Some(250_000));
     }
 
     #[test]
@@ -366,6 +413,7 @@ mod tests {
             domain: None,
             priority1: None,
             scan_timeout: None,
+            ..Default::default()
         };
         assert!(bad.validate().is_err(), "newline in iface must be rejected");
     }
@@ -378,6 +426,7 @@ mod tests {
             domain: None,
             priority1: None,
             scan_timeout: None,
+            ..Default::default()
         };
         assert!(bad.validate().is_err(), "iface >15 bytes must be rejected");
     }
@@ -391,6 +440,7 @@ mod tests {
                 domain: None,
                 priority1: None,
                 scan_timeout: None,
+                ..Default::default()
             };
             assert!(
                 bad.validate().is_err(),
@@ -408,6 +458,7 @@ mod tests {
                 domain: Some(127),
                 priority1: None,
                 scan_timeout: Some(5),
+                ..Default::default()
             };
             assert!(s.validate().is_ok(), "should accept: {good}");
         }
@@ -430,6 +481,7 @@ mod tests {
             domain: Some(127),
             priority1: Some(64),
             scan_timeout: None,
+            ..Default::default()
         };
         save_to(&path, &original).unwrap();
         let reloaded = load_from(&path);
@@ -438,5 +490,39 @@ mod tests {
         assert_eq!(reloaded.domain, Some(127));
         assert_eq!(reloaded.priority1, Some(64));
         assert_eq!(reloaded.scan_timeout, None);
+    }
+
+    #[test]
+    fn warn_thresholds_parse_normalise_and_validate() {
+        // Explicit 0 normalises to None ("disabled").
+        let parsed = PtpSettings::parse(
+            "mode = slave-only\noffset_warn_ns = 0\npath_delay_warn_ns = 0\n",
+        )
+        .normalised();
+        assert_eq!(parsed.offset_warn_ns, None);
+        assert_eq!(parsed.path_delay_warn_ns, None);
+
+        // Real values parse and validate.
+        let parsed = PtpSettings::parse(
+            "mode = slave-only\noffset_warn_ns = 1000\npath_delay_warn_ns = 500000\n",
+        )
+        .normalised();
+        assert_eq!(parsed.offset_warn_ns, Some(1000));
+        assert_eq!(parsed.path_delay_warn_ns, Some(500_000));
+        assert!(parsed.validate().is_ok());
+
+        // Negative / over-ceiling are rejected.
+        let bad = PtpSettings {
+            mode: PtpMode::SlaveOnly,
+            offset_warn_ns: Some(-1),
+            ..Default::default()
+        };
+        assert!(bad.validate().is_err(), "negative threshold must be rejected");
+        let bad = PtpSettings {
+            mode: PtpMode::SlaveOnly,
+            path_delay_warn_ns: Some(2_000_000_000),
+            ..Default::default()
+        };
+        assert!(bad.validate().is_err(), "over-ceiling threshold must be rejected");
     }
 }

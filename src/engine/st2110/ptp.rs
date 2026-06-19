@@ -296,6 +296,44 @@ impl PtpStateReporter {
         handle
     }
 
+    /// Spawn the **node-level PTP monitor**.
+    ///
+    /// Unlike [`Self::spawn_with_events`] (which a single ST 2110 flow spawns
+    /// against a fixed domain), this monitor runs once per node, independent
+    /// of any flow, and **reloads `ptp.conf` on every poll** so domain and
+    /// warn-threshold changes from the Time page take effect live. It:
+    ///
+    /// - keeps a [`PtpStateHandle`] fresh for the Prometheus `/metrics` surface
+    ///   (read non-blocking, no extra `ptp4l` round-trip per scrape),
+    /// - emits node-scoped lock-state **transition** events (previously a node
+    ///   with no ST 2110 flow emitted no PTP events at all),
+    /// - emits a **grandmaster-change** event when the upstream GM id changes,
+    /// - emits **offset / path-delay threshold** events (edge-triggered with
+    ///   hysteresis) when the operator has configured `offset_warn_ns` /
+    ///   `path_delay_warn_ns`.
+    ///
+    /// When PTP mode is `off` the monitor reports `Unavailable` and stays
+    /// silent (no event spam for an intentionally-disabled clock).
+    pub fn spawn_node_monitor(
+        poll_interval: Duration,
+        cancel: CancellationToken,
+        event_sender: EventSender,
+    ) -> PtpStateHandle {
+        // Resolve the config path ONCE — `config_path()` does a directory
+        // writability probe (create + unlink a temp file), which must not run
+        // on every poll. The path is stable for the process lifetime.
+        let conf_path = crate::util::ptp_config::config_path();
+        let domain = crate::util::ptp_config::load_from(&conf_path)
+            .domain
+            .unwrap_or(127);
+        let handle = PtpStateHandle::new(domain);
+        let writer = handle.clone();
+        tokio::spawn(async move {
+            node_monitor_loop(poll_interval, conf_path, writer, cancel, event_sender).await;
+        });
+        handle
+    }
+
     /// Placeholder for the optional `--features ptp-internal` path that will
     /// host an in-process `statime` slave clock.
     ///
@@ -439,6 +477,242 @@ fn emit_ptp_event(
     tx.emit_with_details(severity, category::PTP, message, flow_id, details);
 }
 
+/// Render a [`PtpLockState`] as the lowercase string used in event details.
+fn lock_state_str(s: PtpLockState) -> &'static str {
+    match s {
+        PtpLockState::Unavailable => "unavailable",
+        PtpLockState::Acquiring => "acquiring",
+        PtpLockState::Locked => "locked",
+        PtpLockState::Holdover => "holdover",
+        PtpLockState::Master => "master",
+        PtpLockState::Unknown => "unknown",
+    }
+}
+
+/// Per-poll state the node monitor carries across iterations for
+/// edge-triggered (hysteresis) threshold + grandmaster-change events.
+#[derive(Default)]
+struct MonitorState {
+    last_lock: PtpLockState,
+    emitted_initial: bool,
+    last_gm_id: Option<GrandmasterId>,
+    offset_excursion: bool,
+    path_delay_excursion: bool,
+}
+
+/// Poll loop behind [`PtpStateReporter::spawn_node_monitor`].
+async fn node_monitor_loop(
+    poll_interval: Duration,
+    conf_path: PathBuf,
+    handle: PtpStateHandle,
+    cancel: CancellationToken,
+    events: EventSender,
+) {
+    let mut st = MonitorState::default();
+    loop {
+        tokio::select! {
+            _ = cancel.cancelled() => {
+                tracing::debug!("PTP node monitor cancelled, exiting");
+                break;
+            }
+            _ = tokio::time::sleep(poll_interval) => {}
+        }
+
+        // Reload settings every poll so Time-page edits (domain, thresholds,
+        // mode) take effect without restarting the edge. Uses the cached path
+        // (no per-poll writability probe).
+        let settings = crate::util::ptp_config::load_from(&conf_path);
+        let domain = settings.domain.unwrap_or(127);
+
+        // PTP intentionally off → report Unavailable, stay silent, and reset
+        // so we re-announce cleanly if it is turned back on.
+        if settings.mode == crate::util::ptp_config::PtpMode::Off {
+            handle.set(PtpState::unavailable(domain));
+            st = MonitorState::default();
+            continue;
+        }
+
+        let cfg = PtpReporterConfig {
+            domain,
+            ..PtpReporterConfig::default()
+        };
+        let tol_ns = cfg.lock_tolerance_ns;
+        let mut state = tokio::task::spawn_blocking(move || poll_once(&cfg))
+            .await
+            .unwrap_or_else(|e| Err(PtpPollError::Internal(e.to_string())))
+            .unwrap_or_else(|_| PtpState::unavailable(domain));
+
+        // Damp Locked<->Holdover flapping before any event/telemetry decision,
+        // so a near-tolerance offset doesn't spam lock events every poll.
+        state.lock_state =
+            debounce_slave_lock(st.last_lock, state.lock_state, state.offset_ns, tol_ns);
+
+        // 1) Lock-state transitions (node-scoped: flow_id = None). Also fires
+        //    once on the first poll so the operator sees the current state.
+        if !st.emitted_initial || state.lock_state != st.last_lock {
+            emit_ptp_event(&events, &state, st.last_lock, None);
+            st.emitted_initial = true;
+        }
+
+        // Offset / path delay are only meaningful while slaved to a GM.
+        let slaved = matches!(
+            state.lock_state,
+            PtpLockState::Locked | PtpLockState::Holdover
+        );
+
+        // 2) Grandmaster change.
+        if slaved {
+            if let Some(gm) = state.grandmaster_id {
+                if let Some(prev) = st.last_gm_id {
+                    if prev != gm {
+                        emit_gm_change(&events, prev, gm, domain);
+                    }
+                }
+                st.last_gm_id = Some(gm);
+            }
+        } else {
+            st.last_gm_id = None;
+        }
+
+        // 3) Threshold excursions (hysteresis, edge-triggered).
+        if slaved {
+            check_threshold(
+                &events,
+                ThresholdKind::Offset,
+                settings.offset_warn_ns,
+                state.offset_ns.map(|v| v.unsigned_abs()),
+                domain,
+                state.lock_state,
+                &mut st.offset_excursion,
+            );
+            check_threshold(
+                &events,
+                ThresholdKind::PathDelay,
+                settings.path_delay_warn_ns,
+                state.mean_path_delay_ns.map(|v| v.unsigned_abs()),
+                domain,
+                state.lock_state,
+                &mut st.path_delay_excursion,
+            );
+        } else {
+            // Lost the SLAVE lock — clear excursion flags silently; the
+            // holdover/acquiring transition event already tells the story.
+            st.offset_excursion = false;
+            st.path_delay_excursion = false;
+        }
+
+        st.last_lock = state.lock_state;
+        handle.set(state);
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ThresholdKind {
+    Offset,
+    PathDelay,
+}
+
+impl ThresholdKind {
+    fn label(self) -> &'static str {
+        match self {
+            ThresholdKind::Offset => "master offset",
+            ThresholdKind::PathDelay => "mean path delay",
+        }
+    }
+    fn enter_code(self) -> &'static str {
+        match self {
+            ThresholdKind::Offset => "ptp_offset_high",
+            ThresholdKind::PathDelay => "ptp_path_delay_high",
+        }
+    }
+    fn recover_code(self) -> &'static str {
+        match self {
+            ThresholdKind::Offset => "ptp_offset_recovered",
+            ThresholdKind::PathDelay => "ptp_path_delay_recovered",
+        }
+    }
+}
+
+/// Edge-triggered threshold check with 80% hysteresis. Emits one Warning when
+/// the value first crosses `warn_ns`, and one Info when it falls back below
+/// 80% of it. `excursion` carries the latched state across polls so steady
+/// state never re-fires.
+fn check_threshold(
+    events: &EventSender,
+    kind: ThresholdKind,
+    warn_ns: Option<i64>,
+    value_abs: Option<u64>,
+    domain: u8,
+    lock_state: PtpLockState,
+    excursion: &mut bool,
+) {
+    // Threshold disabled or no measurement → drop any standing excursion
+    // silently (don't fire a phantom "recovered" when monitoring is turned
+    // off or the measurement simply becomes unavailable).
+    let (Some(thr), Some(val)) = (warn_ns, value_abs) else {
+        *excursion = false;
+        return;
+    };
+    if thr <= 0 {
+        *excursion = false;
+        return;
+    }
+    let thr = thr as u64;
+    let clear = thr - thr / 5; // 80% hysteresis band — stops boundary flapping
+    if !*excursion && val > thr {
+        *excursion = true;
+        events.emit_with_details(
+            EventSeverity::Warning,
+            category::PTP,
+            format!(
+                "PTP {} {val} ns exceeds warn threshold {thr} ns (domain {domain})",
+                kind.label()
+            ),
+            None,
+            serde_json::json!({
+                "error_code": kind.enter_code(),
+                "domain": domain,
+                "value_ns": val,
+                "threshold_ns": thr,
+                "lock_state": lock_state_str(lock_state),
+            }),
+        );
+    } else if *excursion && val <= clear {
+        *excursion = false;
+        events.emit_with_details(
+            EventSeverity::Info,
+            category::PTP,
+            format!(
+                "PTP {} recovered ({val} ns) on domain {domain}",
+                kind.label()
+            ),
+            None,
+            serde_json::json!({
+                "error_code": kind.recover_code(),
+                "domain": domain,
+                "value_ns": val,
+                "threshold_ns": thr,
+            }),
+        );
+    }
+}
+
+/// Emit a grandmaster-change event (node-scoped).
+fn emit_gm_change(events: &EventSender, prev: GrandmasterId, cur: GrandmasterId, domain: u8) {
+    events.emit_with_details(
+        EventSeverity::Info,
+        category::PTP,
+        format!("PTP grandmaster changed on domain {domain}: {prev} \u{2192} {cur}"),
+        None,
+        serde_json::json!({
+            "error_code": "ptp_grandmaster_changed",
+            "domain": domain,
+            "grandmaster_id": cur.to_string(),
+            "previous_grandmaster_id": prev.to_string(),
+        }),
+    );
+}
+
 /// Errors that can occur during a single ptp4l poll.
 #[derive(Debug)]
 enum PtpPollError {
@@ -529,25 +803,43 @@ fn poll_once(config: &PtpReporterConfig) -> Result<PtpState, PtpPollError> {
         Err(_) => None,
     };
 
-    // Query PORT_DATA_SET to detect whether this node is master.
+    // Query PORT_DATA_SET to read this port's PTP state-machine state.
     // Layout (IEEE 1588-2008 §15.5.3.7):
     //   portIdentity   10 bytes (clockIdentity 8 + portNumber 2)
-    //   portState       1 byte  (6 = MASTER, 9 = SLAVE, ...)
-    let port_state_master = {
-        let req_port = build_management_get(MANAGEMENT_ID_PORT_DATA_SET, config.domain);
-        let _ = sock.send(&req_port);
-        let mut buf3 = [0u8; 1500];
-        recv_management_response(&sock, &mut buf3, MANAGEMENT_ID_PORT_DATA_SET)
-            .ok()
-            .map(|(_, data)| data.len() > 10 && data[10] == 6)
-            .unwrap_or(false)
+    //   portState       1 byte  (4 = LISTENING, 6 = MASTER, 9 = SLAVE, ...)
+    //
+    // The port state is authoritative for *what* the clock is doing. We must
+    // NOT infer "locked" from the master offset alone: a node with no
+    // grandmaster on the wire (e.g. slave-only with the GM switched off) sits
+    // in LISTENING with offsetFromMaster == 0, which classify_lock() would
+    // otherwise mis-report as Locked — the "Locked to the grandmaster" false
+    // positive operators were seeing on the Time page.
+    //
+    // Best-effort with one retry: the UDS round-trip is local and reliable,
+    // so a missing reply almost always means the daemon genuinely isn't
+    // answering the port query (→ `Unknown`). The retry exists only so a
+    // single dropped datagram can't flap a genuinely-locked SLAVE to Unknown.
+    let port_state: Option<u8> = {
+        let mut found = None;
+        for _ in 0..2 {
+            let req_port = build_management_get(MANAGEMENT_ID_PORT_DATA_SET, config.domain);
+            if sock.send(&req_port).is_err() {
+                break;
+            }
+            let mut buf3 = [0u8; 1500];
+            if let Ok((_, data)) =
+                recv_management_response(&sock, &mut buf3, MANAGEMENT_ID_PORT_DATA_SET)
+            {
+                if data.len() > 10 {
+                    found = Some(data[10]);
+                    break;
+                }
+            }
+        }
+        found
     };
 
-    let lock_state = if port_state_master {
-        PtpLockState::Master
-    } else {
-        classify_lock(offset_ns, config.lock_tolerance_ns)
-    };
+    let lock_state = classify_from_port_state(port_state, offset_ns, config.lock_tolerance_ns);
     let last_update_unix_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .ok()
@@ -574,6 +866,99 @@ fn classify_lock(offset_ns: i64, tolerance_ns: i64) -> PtpLockState {
         PtpLockState::Locked
     } else {
         PtpLockState::Holdover
+    }
+}
+
+// PTP port state-machine values (IEEE 1588-2008 Table 8 / §9.2.5). Only the
+// states we branch on are named; everything else (INITIALIZING=1, FAULTY=2,
+// DISABLED=3, PASSIVE=7) falls through to `Acquiring` — "running but not
+// synchronised to a grandmaster yet".
+const PORT_STATE_LISTENING: u8 = 4;
+const PORT_STATE_PRE_MASTER: u8 = 5;
+const PORT_STATE_MASTER: u8 = 6;
+const PORT_STATE_UNCALIBRATED: u8 = 8;
+const PORT_STATE_SLAVE: u8 = 9;
+
+/// Derive [`PtpLockState`] from ptp4l's port state plus the master offset.
+///
+/// The port state from `PORT_DATA_SET` is authoritative for *what* the clock
+/// is doing; the master offset only refines a `SLAVE` port into `Locked` vs
+/// `Holdover`. This is deliberately **not** offset-only classification:
+///
+/// - `MASTER` → [`PtpLockState::Master`]: this node is the grandmaster (its
+///   own internal reference). There is no external time source.
+/// - `SLAVE` → [`classify_lock`]: locked to an external grandmaster, refined
+///   by the measured offset (`Locked` within tolerance, else `Holdover`).
+/// - `UNCALIBRATED` / `PRE_MASTER` / `LISTENING` (and other transient states)
+///   → [`PtpLockState::Acquiring`]: running but with no usable lock yet. This
+///   is where a slave-only node sits when its grandmaster is switched off —
+///   `offsetFromMaster` reads `0` there because the servo never ran, **not**
+///   because the clock is perfectly locked. Classifying on offset alone is
+///   what produced the false "Locked to the grandmaster" report.
+/// - port state unavailable (the daemon answered `CURRENT_DATA_SET` but not
+///   the port query, even after a retry) → [`PtpLockState::Unknown`]: better
+///   than guessing `Locked`.
+fn classify_from_port_state(
+    port_state: Option<u8>,
+    offset_ns: i64,
+    tolerance_ns: i64,
+) -> PtpLockState {
+    match port_state {
+        Some(PORT_STATE_MASTER) => PtpLockState::Master,
+        Some(PORT_STATE_SLAVE) => classify_lock(offset_ns, tolerance_ns),
+        // LISTENING (incl. slave-only with the GM off), UNCALIBRATED,
+        // PRE_MASTER, and the remaining transient states are all "not locked
+        // to anything yet".
+        Some(_) => PtpLockState::Acquiring,
+        None => PtpLockState::Unknown,
+    }
+}
+
+/// Hysteresis on the SLAVE `Locked` ⇄ `Holdover` boundary.
+///
+/// [`classify_lock`] is a single-sample hard threshold at the lock tolerance,
+/// so a slave whose master offset noisily straddles the tolerance (common on
+/// software-timestamped or marginal-network slaves, where the 1 µs default
+/// boundary sits) would flip `Locked`⇄`Holdover` on every poll and spam lock
+/// events. This damps it: **leaving** `Locked` needs the offset to exceed 1.5×
+/// tolerance; **re-entering** `Locked` needs it back within tolerance. Only the
+/// `Locked`⇄`Holdover` pair is debounced — every other transition (to/from
+/// `Acquiring` / `Master` / `Unavailable` / `Unknown`) passes through
+/// immediately so genuine lock loss is never masked.
+fn debounce_slave_lock(
+    prev: PtpLockState,
+    raw: PtpLockState,
+    offset_ns: Option<i64>,
+    tolerance_ns: i64,
+) -> PtpLockState {
+    // Only the Locked<->Holdover boundary gets hysteresis.
+    if !matches!(prev, PtpLockState::Locked | PtpLockState::Holdover)
+        || !matches!(raw, PtpLockState::Locked | PtpLockState::Holdover)
+    {
+        return raw;
+    }
+    let Some(off) = offset_ns else {
+        return raw;
+    };
+    let mag = off.unsigned_abs();
+    let tol = tolerance_ns.max(0) as u64;
+    match prev {
+        // Stay Locked until the offset is clearly out (1.5× tolerance).
+        PtpLockState::Locked => {
+            if mag > tol.saturating_mul(3) / 2 {
+                PtpLockState::Holdover
+            } else {
+                PtpLockState::Locked
+            }
+        }
+        // Holdover → re-lock only once back within tolerance.
+        _ => {
+            if mag <= tol {
+                PtpLockState::Locked
+            } else {
+                PtpLockState::Holdover
+            }
+        }
     }
 }
 
@@ -884,6 +1269,82 @@ mod tests {
     }
 
     #[test]
+    fn test_classify_from_port_state_master() {
+        // A node that IS the grandmaster (auto self-elected or GM mode).
+        assert_eq!(
+            classify_from_port_state(Some(PORT_STATE_MASTER), 0, 1000),
+            PtpLockState::Master
+        );
+    }
+
+    #[test]
+    fn test_classify_from_port_state_slave_locked_vs_holdover() {
+        // Only a SLAVE port can be "Locked", refined by the offset.
+        assert_eq!(
+            classify_from_port_state(Some(PORT_STATE_SLAVE), 500, 1000),
+            PtpLockState::Locked
+        );
+        assert_eq!(
+            classify_from_port_state(Some(PORT_STATE_SLAVE), 5000, 1000),
+            PtpLockState::Holdover
+        );
+    }
+
+    #[test]
+    fn test_classify_from_port_state_listening_no_gm_is_acquiring_not_locked() {
+        // REGRESSION GUARD for the "Locked to the grandmaster" false positive:
+        // a slave-only node with no grandmaster on the wire sits in LISTENING
+        // with offsetFromMaster == 0. It MUST report Acquiring, never Locked.
+        assert_eq!(
+            classify_from_port_state(Some(PORT_STATE_LISTENING), 0, 1000),
+            PtpLockState::Acquiring
+        );
+    }
+
+    #[test]
+    fn test_classify_from_port_state_transient_states_are_acquiring() {
+        for st in [PORT_STATE_UNCALIBRATED, PORT_STATE_PRE_MASTER, 1, 7] {
+            assert_eq!(
+                classify_from_port_state(Some(st), 0, 1000),
+                PtpLockState::Acquiring,
+                "port state {st} should be Acquiring"
+            );
+        }
+    }
+
+    #[test]
+    fn test_classify_from_port_state_missing_is_unknown() {
+        // Daemon didn't answer PORT_DATA_SET even after a retry — don't guess
+        // Locked.
+        assert_eq!(
+            classify_from_port_state(None, 0, 1000),
+            PtpLockState::Unknown
+        );
+    }
+
+    #[test]
+    fn test_debounce_slave_lock_hysteresis() {
+        use PtpLockState::*;
+        let tol = 1000;
+        // Within the band (tol < |off| <= 1.5×tol): stay Locked, no flap.
+        assert_eq!(debounce_slave_lock(Locked, Holdover, Some(1200), tol), Locked);
+        assert_eq!(debounce_slave_lock(Locked, Holdover, Some(-1400), tol), Locked);
+        // Clearly out (> 1.5×tol): drop to Holdover.
+        assert_eq!(debounce_slave_lock(Locked, Holdover, Some(2000), tol), Holdover);
+        // Holdover re-locks only once back within tolerance.
+        assert_eq!(debounce_slave_lock(Holdover, Holdover, Some(1200), tol), Holdover);
+        assert_eq!(debounce_slave_lock(Holdover, Locked, Some(800), tol), Locked);
+        // Steady Locked stays Locked.
+        assert_eq!(debounce_slave_lock(Locked, Locked, Some(500), tol), Locked);
+        // Non-slave transitions pass through immediately (never mask lock loss).
+        assert_eq!(debounce_slave_lock(Locked, Acquiring, Some(0), tol), Acquiring);
+        assert_eq!(debounce_slave_lock(Acquiring, Locked, Some(10), tol), Locked);
+        assert_eq!(debounce_slave_lock(Locked, Unavailable, None, tol), Unavailable);
+        // Missing offset → trust the raw classification.
+        assert_eq!(debounce_slave_lock(Locked, Holdover, None, tol), Holdover);
+    }
+
+    #[test]
     fn test_handle_round_trip() {
         let h = PtpStateHandle::new(0);
         assert_eq!(h.snapshot().lock_state, PtpLockState::Unavailable);
@@ -1007,10 +1468,11 @@ mod tests {
         server.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
         server.set_write_timeout(Some(Duration::from_secs(2))).unwrap();
 
-        // Spawn a thread that responds to up to 2 GET requests (current + parent).
+        // Spawn a thread that responds to up to 3 GET requests
+        // (current + parent + port).
         let server_thread = std::thread::spawn(move || {
             let mut buf = [0u8; 1500];
-            for _ in 0..2 {
+            for _ in 0..3 {
                 let (n, peer) = match server.recv_from(&mut buf) {
                     Ok(x) => x,
                     Err(_) => return,
@@ -1020,8 +1482,12 @@ mod tests {
                 let mgmt_id = u16::from_be_bytes([req[id_off], req[id_off + 1]]);
                 let response = if mgmt_id == MANAGEMENT_ID_CURRENT_DATA_SET {
                     build_response_current_data_set(0, 5, 250, 1500)
-                } else {
+                } else if mgmt_id == MANAGEMENT_ID_PARENT_DATA_SET {
                     build_response_parent_data_set_gm(0, [0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17])
+                } else {
+                    // PORT_DATA_SET → report SLAVE(9) so the in-tolerance
+                    // offset (250 ns) classifies as Locked.
+                    build_response_port_data_set(0, PORT_STATE_SLAVE)
                 };
                 // Client may have bound an abstract or filesystem path. On
                 // Linux post-fix the client uses abstract addresses, so we
@@ -1142,6 +1608,45 @@ mod tests {
         buf.extend_from_slice(&PTP_TLV_TYPE_MANAGEMENT.to_be_bytes());
         buf.extend_from_slice(&tlv_value_len.to_be_bytes());
         buf.extend_from_slice(&MANAGEMENT_ID_PARENT_DATA_SET.to_be_bytes());
+        buf.extend_from_slice(&data);
+        buf
+    }
+
+    /// Build a synthetic PORT_DATA_SET RESPONSE carrying a chosen portState.
+    /// dataField layout (IEEE 1588-2008 §15.5.3.7): portIdentity[10] then
+    /// portState at offset 10 — the reader only inspects byte 10.
+    fn build_response_port_data_set(domain: u8, port_state: u8) -> Vec<u8> {
+        let mut data = vec![0u8; 11];
+        data[10] = port_state;
+
+        let data_len = data.len() as u16;
+        let tlv_value_len = PTP_TLV_MGMT_ID_FIELD_LEN as u16 + data_len;
+        let total_len: u16 = (PTP_HEADER_LEN + PTP_MGMT_HEADER_LEN + PTP_TLV_TLV_HEADER_LEN) as u16
+            + tlv_value_len;
+
+        let mut buf = Vec::with_capacity(total_len as usize);
+        buf.push(PTP_MSG_TYPE_MANAGEMENT);
+        buf.push(PTP_VERSION);
+        buf.extend_from_slice(&total_len.to_be_bytes());
+        buf.push(domain);
+        buf.push(0);
+        buf.extend_from_slice(&[0u8; 2]);
+        buf.extend_from_slice(&[0u8; 8]);
+        buf.extend_from_slice(&[0u8; 4]);
+        buf.extend_from_slice(b"ptp4l\x00\x00\x00");
+        buf.extend_from_slice(&1u16.to_be_bytes());
+        buf.extend_from_slice(&0u16.to_be_bytes());
+        buf.push(0x04);
+        buf.push(0x7F);
+        buf.extend_from_slice(&[0xff; 8]);
+        buf.extend_from_slice(&0xffffu16.to_be_bytes());
+        buf.push(0);
+        buf.push(0);
+        buf.push(PTP_ACTION_RESPONSE);
+        buf.push(0);
+        buf.extend_from_slice(&PTP_TLV_TYPE_MANAGEMENT.to_be_bytes());
+        buf.extend_from_slice(&tlv_value_len.to_be_bytes());
+        buf.extend_from_slice(&MANAGEMENT_ID_PORT_DATA_SET.to_be_bytes());
         buf.extend_from_slice(&data);
         buf
     }

@@ -639,7 +639,7 @@ mapping:
 
 | Category | Typical severity | Triggers |
 |----------|------------------|----------|
-| `ptp` | info / warning / critical | `ptp_lock_acquired`, `ptp_lock_lost`, `ptp_holdover`, `ptp_unavailable` |
+| `ptp` | info / warning / critical | Lock state (each carries `details.lock_state` = `acquiring` / `locked` / `holdover` / `master` / `unavailable`): `ptp_acquiring` (running but not yet locked — e.g. slave-only with the grandmaster off), `ptp_lock_acquired`, `ptp_lock_lost`, `ptp_holdover`, `ptp_unavailable`. Clock-quality monitoring (from the node-level PTP monitor, `details.error_code`): `ptp_offset_high` / `ptp_offset_recovered` (absolute offset crossed the operator's `offset_warn_ns`, 80 % hysteresis), `ptp_path_delay_high` / `ptp_path_delay_recovered` (mean path delay crossed `path_delay_warn_ns`), `ptp_grandmaster_changed` (`details.grandmaster_id` / `previous_grandmaster_id`). Thresholds are off by default; the continuous offset/path-delay trend is on the edge's Prometheus `/metrics` (`bilbycast_edge_ptp_*`) |
 | `network_leg` | warning / critical | `red_leg_lost`, `blue_leg_lost`, `leg_recovered`, `both_legs_lost` |
 | `nmos` | info | NMOS controller IS-05 activations, IS-08 channel-map changes |
 | `scte104` | info | Cue-out / cue-in / cancel splice messages parsed from ANC |

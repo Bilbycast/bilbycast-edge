@@ -549,6 +549,19 @@ async fn main() -> anyhow::Result<()> {
             .unwrap_or(false),
     );
 
+    // Shared shutdown token for coordinated graceful shutdown.
+    let shutdown_token = CancellationToken::new();
+
+    // Node-level PTP monitor: keeps a fresh PtpStateHandle for the Prometheus
+    // `/metrics` surface and emits PTP lock-transition / grandmaster-change /
+    // offset + path-delay threshold events. Polls every 5 s and reloads
+    // `ptp.conf` each tick so Time-page edits take effect live.
+    let ptp_node_state = engine::st2110::ptp::PtpStateReporter::spawn_node_monitor(
+        std::time::Duration::from_secs(5),
+        shutdown_token.clone(),
+        event_sender.clone(),
+    );
+
     let state = AppState {
         config: Arc::new(RwLock::new(app_config.clone())),
         config_path: cli.config.clone(),
@@ -572,6 +585,7 @@ async fn main() -> anyhow::Result<()> {
         standby_listeners: Some(standby_listeners.clone()),
         token_rate_limiter,
         manager_link: manager_link.clone(),
+        ptp_node_state,
     };
 
     // Start all enabled flows from config
@@ -657,9 +671,6 @@ async fn main() -> anyhow::Result<()> {
             https,
         )
     };
-
-    // Shared shutdown token for coordinated graceful shutdown
-    let shutdown_token = CancellationToken::new();
 
     // Cellular uplink telemetry — auto-detects ModemManager modems and polls
     // any configured RutOS routers, off the data path. The cache is shared with

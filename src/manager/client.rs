@@ -4202,6 +4202,8 @@ async fn execute_command(
                 "domain": settings.domain,
                 "priority1": settings.priority1,
                 "scan_timeout": settings.scan_timeout,
+                "offset_warn_ns": settings.offset_warn_ns,
+                "path_delay_warn_ns": settings.path_delay_warn_ns,
                 "config_path": crate::util::ptp_config::config_path().display().to_string(),
                 "available_ifaces": ifaces,
             })))
@@ -4238,12 +4240,16 @@ async fn execute_command(
             let scan_timeout = action["scan_timeout"]
                 .as_u64()
                 .and_then(|s| u8::try_from(s).ok());
+            let offset_warn_ns = action["offset_warn_ns"].as_i64();
+            let path_delay_warn_ns = action["path_delay_warn_ns"].as_i64();
             let settings = PtpSettings {
                 mode,
                 iface,
                 domain,
                 priority1,
                 scan_timeout,
+                offset_warn_ns,
+                path_delay_warn_ns,
             }
             .normalised();
             // Defense-in-depth — iface goes via a file the privileged
@@ -4277,6 +4283,8 @@ async fn execute_command(
                 "domain": settings.domain,
                 "priority1": settings.priority1,
                 "scan_timeout": settings.scan_timeout,
+                "offset_warn_ns": settings.offset_warn_ns,
+                "path_delay_warn_ns": settings.path_delay_warn_ns,
                 "config_path": crate::util::ptp_config::config_path().display().to_string(),
             })))
         }

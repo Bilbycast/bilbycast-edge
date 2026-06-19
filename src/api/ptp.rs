@@ -27,6 +27,10 @@ pub struct SetPtpRequest {
     pub priority1: Option<u8>,
     #[serde(default)]
     pub scan_timeout: Option<u8>,
+    #[serde(default)]
+    pub offset_warn_ns: Option<i64>,
+    #[serde(default)]
+    pub path_delay_warn_ns: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -36,6 +40,8 @@ pub struct PtpStatusPayload {
     pub domain: Option<u8>,
     pub priority1: Option<u8>,
     pub scan_timeout: Option<u8>,
+    pub offset_warn_ns: Option<i64>,
+    pub path_delay_warn_ns: Option<i64>,
     pub config_path: String,
 }
 
@@ -47,6 +53,8 @@ impl From<PtpSettings> for PtpStatusPayload {
             domain: s.domain,
             priority1: s.priority1,
             scan_timeout: s.scan_timeout,
+            offset_warn_ns: s.offset_warn_ns,
+            path_delay_warn_ns: s.path_delay_warn_ns,
             config_path: ptp_config::config_path().display().to_string(),
         }
     }
@@ -76,6 +84,8 @@ pub async fn put_ptp(
         domain: req.domain,
         priority1: req.priority1,
         scan_timeout: req.scan_timeout,
+        offset_warn_ns: req.offset_warn_ns,
+        path_delay_warn_ns: req.path_delay_warn_ns,
     }
     .normalised();
     settings

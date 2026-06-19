@@ -49,6 +49,28 @@ transport. Legs appear as `leg="primary"` or `leg="leg2"` (2022-7).
 Labels: `flow_id,leg_role="input|output",leg="primary|leg2"` plus
 `output_id` on outputs.
 
+## PTP clock metrics
+
+Node-level, sampled by the PTP monitor task (every 5 s) which reads
+`ptp4l` over its management socket. Always present (even with no ST 2110
+flow). All labeled by `domain`. Graph `offset_ns` / `mean_path_delay_ns`
+over time to spot clock excursions, asymmetry, or grandmaster drift; alert
+on `bilbycast_edge_ptp_locked == 0`.
+
+| Metric | Type | Labels | Notes |
+|--------|------|--------|-------|
+| `bilbycast_edge_ptp_locked` | gauge | `domain` | 1 when the clock is healthy (`locked` slave **or** `master`), else 0. |
+| `bilbycast_edge_ptp_state` | gauge | `domain,state` | State-set: the active `state` label (`locked` / `holdover` / `master` / `acquiring` / `unavailable` / `unknown`) carries value 1. |
+| `bilbycast_edge_ptp_offset_ns` | gauge | `domain` | Offset from the grandmaster (ns). **Only emitted while slaved** (`locked`/`holdover`) — the field is meaningless in other states, so the series gaps honestly rather than reporting a stale 0. |
+| `bilbycast_edge_ptp_mean_path_delay_ns` | gauge | `domain` | Mean path delay (ns). Slaved-only (same gating). |
+| `bilbycast_edge_ptp_steps_removed` | gauge | `domain` | Hops from the grandmaster (BMCA). Slaved-only. |
+
+Discrete excursions also surface as `ptp` events (`ptp_offset_high` /
+`ptp_path_delay_high` + recovery, `ptp_grandmaster_changed`) when the
+operator sets the `offset_warn_ns` / `path_delay_warn_ns` thresholds on the
+Time page — see [`events-and-alarms.md`](events-and-alarms.md) and
+[`ptp.md`](ptp.md).
+
 ## Bonding metrics (`bilbycast-bonding` + libsrt socket groups)
 
 The custom bonding transport (`bilbycast-bonding`) and native libsrt

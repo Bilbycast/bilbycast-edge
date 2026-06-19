@@ -67,6 +67,11 @@ pub struct AppState {
     /// is a purely local indicator — it never rides the WS protocol and does
     /// not affect the health payload sent UP to the manager.
     pub manager_link: Arc<crate::manager::link_state::ManagerLinkState>,
+    /// Live node-level PTP clock state, kept fresh by the node PTP monitor
+    /// task (`engine::st2110::ptp::PtpStateReporter::spawn_node_monitor`).
+    /// Read non-blocking by the Prometheus `/metrics` handler so a scrape
+    /// never has to do its own `ptp4l` round-trip.
+    pub ptp_node_state: crate::engine::st2110::ptp::PtpStateHandle,
 }
 
 /// Constructs the main Axum [`Router`] with all API routes, auth middleware, and layers.

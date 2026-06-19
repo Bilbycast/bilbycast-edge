@@ -310,6 +310,73 @@ pub async fn prometheus_metrics(State(state): State<AppState>) -> impl IntoRespo
         output.push_str(&format!("bilbycast_edge_system_resources_critical {critical}\n"));
     }
 
+    // PTP clock (node-level monitor) — offset / path-delay over time so an
+    // operator (via Prometheus + Grafana) can see PTP excursions historically.
+    {
+        use crate::engine::st2110::ptp::PtpLockState;
+        let ptp = state.ptp_node_state.snapshot();
+        let domain = ptp.domain;
+        let lock_str = match ptp.lock_state {
+            PtpLockState::Unavailable => "unavailable",
+            PtpLockState::Acquiring => "acquiring",
+            PtpLockState::Locked => "locked",
+            PtpLockState::Holdover => "holdover",
+            PtpLockState::Master => "master",
+            PtpLockState::Unknown => "unknown",
+        };
+        let healthy = matches!(ptp.lock_state, PtpLockState::Locked | PtpLockState::Master);
+        // Offset / path delay / steps removed are only meaningful while slaved
+        // to a grandmaster.
+        let slaved = matches!(ptp.lock_state, PtpLockState::Locked | PtpLockState::Holdover);
+
+        output.push_str(
+            "\n# HELP bilbycast_edge_ptp_locked Whether the PTP clock is locked/healthy (1) or not (0)\n",
+        );
+        output.push_str("# TYPE bilbycast_edge_ptp_locked gauge\n");
+        output.push_str(&format!(
+            "bilbycast_edge_ptp_locked{{domain=\"{domain}\"}} {}\n",
+            u8::from(healthy)
+        ));
+
+        output.push_str(
+            "# HELP bilbycast_edge_ptp_state Current PTP lock state (the active state label carries value 1)\n",
+        );
+        output.push_str("# TYPE bilbycast_edge_ptp_state gauge\n");
+        output.push_str(&format!(
+            "bilbycast_edge_ptp_state{{domain=\"{domain}\",state=\"{lock_str}\"}} 1\n"
+        ));
+
+        if slaved {
+            if let Some(off) = ptp.offset_ns {
+                output.push_str(
+                    "# HELP bilbycast_edge_ptp_offset_ns PTP offset from master in nanoseconds\n",
+                );
+                output.push_str("# TYPE bilbycast_edge_ptp_offset_ns gauge\n");
+                output.push_str(&format!(
+                    "bilbycast_edge_ptp_offset_ns{{domain=\"{domain}\"}} {off}\n"
+                ));
+            }
+            if let Some(mpd) = ptp.mean_path_delay_ns {
+                output.push_str(
+                    "# HELP bilbycast_edge_ptp_mean_path_delay_ns PTP mean path delay in nanoseconds\n",
+                );
+                output.push_str("# TYPE bilbycast_edge_ptp_mean_path_delay_ns gauge\n");
+                output.push_str(&format!(
+                    "bilbycast_edge_ptp_mean_path_delay_ns{{domain=\"{domain}\"}} {mpd}\n"
+                ));
+            }
+            if let Some(steps) = ptp.steps_removed {
+                output.push_str(
+                    "# HELP bilbycast_edge_ptp_steps_removed Steps removed from the grandmaster\n",
+                );
+                output.push_str("# TYPE bilbycast_edge_ptp_steps_removed gauge\n");
+                output.push_str(&format!(
+                    "bilbycast_edge_ptp_steps_removed{{domain=\"{domain}\"}} {steps}\n"
+                ));
+            }
+        }
+    }
+
     // Per-flow input metrics
     if !flow_snapshots.is_empty() {
         output.push_str("\n# HELP bilbycast_edge_flow_input_packets_total Total RTP packets received\n");

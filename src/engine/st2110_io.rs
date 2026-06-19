@@ -107,8 +107,14 @@ fn maybe_spawn_ptp_reporter(
     clock_domain: Option<u8>,
     stats: &Arc<FlowStatsAccumulator>,
     cancel: &CancellationToken,
-    event_sender: Option<&EventSender>,
-    flow_id: Option<&str>,
+    // Intentionally not forwarded: the per-flow reporter maintains the
+    // PtpStateHandle for `FlowStats.ptp_state` (per-flow telemetry) but must
+    // NOT emit lock-transition events. The node-level PTP monitor
+    // (`engine::st2110::ptp::PtpStateReporter::spawn_node_monitor`) is the
+    // single authoritative emitter of node PTP events (lock / threshold /
+    // grandmaster), so flows sharing one ptp4l domain don't double-alarm.
+    _event_sender: Option<&EventSender>,
+    _flow_id: Option<&str>,
 ) {
     let Some(domain) = clock_domain else {
         return;
@@ -120,12 +126,7 @@ fn maybe_spawn_ptp_reporter(
         domain,
         ..PtpReporterConfig::default()
     };
-    let handle = PtpStateReporter::spawn_with_events(
-        cfg,
-        cancel.child_token(),
-        event_sender.cloned(),
-        flow_id.map(|s| s.to_string()),
-    );
+    let handle = PtpStateReporter::spawn(cfg, cancel.child_token());
     let _ = stats.ptp_state.set(handle);
 }
 

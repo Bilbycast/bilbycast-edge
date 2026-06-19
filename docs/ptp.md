@@ -253,9 +253,58 @@ curl https://edge:8443/api/v1/ptp -H "Authorization: Bearer $TOKEN"
 ```
 
 A successful slave shows `lock_state: locked`, a non-empty
-`grandmaster_id`, and `offset_ns` settling in the low-nanoseconds range
-within a few seconds. Grandmaster mode reports `lock_state: locked`
-with `offset_ns: 0` (the node is its own reference).
+`grandmaster_id` (the **external** grandmaster's identity), and
+`offset_ns` settling in the low-nanoseconds range within a few seconds.
+
+The lock state is derived from ptp4l's **port state**, not from the
+offset alone — so the reported value answers "what is this clock actually
+following?":
+
+| `lock_state` | ptp4l port state | What it means |
+|---|---|---|
+| `locked` | `SLAVE`, offset in tolerance | Slaved to an external grandmaster (`grandmaster_id`) |
+| `holdover` | `SLAVE`, offset out of tolerance | Was locked, now drifting from the grandmaster |
+| `master` | `MASTER` | **This node is the grandmaster** — its own internal clock is the reference; there is **no external time source**. Grandmaster mode always lands here; Auto mode lands here when no other GM is present |
+| `acquiring` | `LISTENING` / `UNCALIBRATED` / `PRE_MASTER` | Running but **not synchronised to anything yet** — e.g. Slave-only with the grandmaster switched off, or Auto still listening |
+| `unavailable` | (daemon not reachable) | `ptp4l` isn't running; TS flows fall back to the system wallclock |
+
+A Slave-only node whose grandmaster is off therefore reports
+`acquiring`, **not** `locked` — `offsetFromMaster` reads `0` there only
+because the servo never ran, not because the clock is perfectly locked.
+The manager Time page's "Synchronised to" row spells the source out in
+plain language so an operator can tell at a glance whether an external
+grandmaster is present.
+
+## Monitoring PTP health over time
+
+A node-level **PTP monitor** runs whenever the mode is not `off`
+(independent of any ST 2110 flow). It polls `ptp4l` every 5 s, re-reading
+`ptp.conf` each tick so Time-page edits take effect live, and feeds two
+surfaces so you can see "did we have clock issues along the way?":
+
+**1. Prometheus `/metrics` (continuous trend).** `bilbycast_edge_ptp_offset_ns`,
+`bilbycast_edge_ptp_mean_path_delay_ns`, `bilbycast_edge_ptp_steps_removed`
+(slaved-only), plus `bilbycast_edge_ptp_locked` and a `bilbycast_edge_ptp_state`
+state-set. Scrape into Prometheus and graph in Grafana for the historical
+view; alert on e.g. `abs(bilbycast_edge_ptp_offset_ns) > 1000` sustained.
+Full list: [`metrics.md`](metrics.md#ptp-clock-metrics).
+
+**2. Events (discrete forensics, in the manager's Events feed + backups).**
+Always on: lock-state transitions (`ptp_acquiring` / `ptp_lock_acquired` /
+`ptp_lock_lost` / `ptp_holdover` / `ptp_unavailable`) and
+`ptp_grandmaster_changed`. Opt-in magnitude alarms fire when you set the two
+thresholds on the Time page (blank / `0` = off):
+
+| Field (`ptp.conf` key) | Fires |
+|---|---|
+| **Offset warn** (`offset_warn_ns`) | `ptp_offset_high` when the absolute offset exceeds it while slaved; `ptp_offset_recovered` when it falls back under 80 % of it (hysteresis) |
+| **Path-delay warn** (`path_delay_warn_ns`) | `ptp_path_delay_high` / `ptp_path_delay_recovered`, same shape, on mean path delay |
+
+Thresholds are edge-triggered with an 80 % hysteresis band, so steady-state
+operation never re-fires. Start the offset warn around your facility's lock
+tolerance (e.g. `1000` = 1 µs) and the path-delay warn at your measured
+baseline plus margin (it has no universal default — read your normal
+`mean_path_delay_ns` off `/metrics` first).
 
 ## Operator UX rule of thumb
 
