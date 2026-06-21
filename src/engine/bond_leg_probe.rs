@@ -769,7 +769,12 @@ mod tests {
             .expect("responder starts");
         eprintln!("responder bound, local port {port} ({resp_bind})");
         let responder: SocketAddr = target.parse().expect("BOND_WAN_TARGET ip:port");
-        let sock = UdpSocket::bind("0.0.0.0:0").await.unwrap();
+        // Optional source bind to pin the probe onto a specific uplink
+        // (e.g. a 5G modem with a pre-existing policy route).
+        let src = std::env::var("BOND_WAN_SRC").unwrap_or_else(|_| "0.0.0.0:0".into());
+        let bind_addr = if src.contains(':') { src } else { format!("{src}:0") };
+        eprintln!("probe source bind: {bind_addr}");
+        let sock = UdpSocket::bind(&bind_addr).await.unwrap();
         sock.connect(responder).await.unwrap();
         let sock = Arc::new(sock);
 
