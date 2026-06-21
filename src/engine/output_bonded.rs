@@ -379,6 +379,14 @@ async fn bonded_output_run(
     events: &EventSender,
     flow_id: &str,
 ) -> anyhow::Result<()> {
+    // Register this output's legs as "in use" so a per-leg capacity probe
+    // refuses to saturate a physical link this flow is using (zero-impact
+    // guarantee). Dropped on every return path → leg freed.
+    let _active_legs = super::bond_leg_probe::register_active_legs(
+        flow_id,
+        super::bond_leg_probe::leg_keys_for_paths(&config.paths),
+    );
+
     let socket_cfg = build_sender_cfg(config)?;
     let path_ids: Vec<u8> = socket_cfg.paths.iter().map(|p| p.id).collect();
 

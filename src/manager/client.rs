@@ -1228,6 +1228,14 @@ fn edge_capabilities() -> Vec<&'static str> {
     if cfg!(feature = "ptp-internal") {
         caps.push("ptp-internal");
     }
+    // Bond leg pre-flight test (Phase 1): the manager UI gates the "Test
+    // leg" button on this. Emits zero packets, never touches live traffic.
+    caps.push("bond-leg-test");
+    // Bond leg active capacity probe + peer responder (Phase 2): gates the
+    // "Measure capacity" flow. Idle-gated + bounded + isolated — see
+    // engine::bond_leg_probe + docs/leg-bandwidth-test.md.
+    caps.push("bond-leg-capacity");
+    caps.push("bond-probe-responder");
     if cfg!(feature = "replay") {
         // Replay-server: continuous flow recording + clip-based playback.
         // The manager UI gates the Replay tab on the presence of this string.
@@ -2946,6 +2954,104 @@ async fn execute_command(
             }
             let outcome = crate::util::cellular::request_wake(interface, apn).await?;
             Ok(Some(serde_json::to_value(&outcome).unwrap_or_default()))
+        }
+        // ── Bond leg pre-flight test (zero-impact usability check) ──
+        // Powers the manager UI "Test leg" button. Validates that a bond
+        // leg is correctly wired (NIC up, source IP present, egresses the
+        // intended interface and doesn't collapse onto the default route,
+        // first-hop reachable) WITHOUT putting any media on the wire and
+        // WITHOUT touching a live BondSocket/scheduler/route — so it is
+        // safe to run even while the bond is carrying live traffic. The
+        // active throughput probe (Phase 2) is idle-gated and lives
+        // elsewhere. See engine::bond_leg_test + the bonding project's
+        // docs/leg-bandwidth-test.md.
+        "test_bond_leg" => {
+            use crate::config::models::BondPathTransportConfig;
+            let transport: BondPathTransportConfig =
+                serde_json::from_value(action["transport"].clone())
+                    .map_err(|e| format!("test_bond_leg: invalid 'transport': {e}"))?;
+            let mode = action["mode"].as_str().unwrap_or("usability");
+            match mode {
+                // ── Phase 1: usability (zero packets) ──
+                "usability" => {
+                    let leg_live = action["leg_live"].as_bool().unwrap_or(false);
+                    let report = tokio::task::spawn_blocking(move || {
+                        crate::engine::bond_leg_test::test_leg(&transport, leg_live)
+                    })
+                    .await
+                    .map_err(|e| format!("test_bond_leg: probe task failed: {e}"))?;
+                    Ok(Some(serde_json::to_value(&report).unwrap_or_default()))
+                }
+                // ── Phase 2: active probe against a peer responder ──
+                "reachability" | "capacity" => {
+                    use crate::engine::bond_leg_probe::{self, CapacityOpts, ProbeMode};
+                    let responder_str = action["responder"].as_str().ok_or(
+                        "test_bond_leg: 'responder' (ip:port) is required for reachability/capacity mode",
+                    )?;
+                    let responder: std::net::SocketAddr = responder_str.parse().map_err(|_| {
+                        format!("test_bond_leg: invalid responder address '{responder_str}'")
+                    })?;
+                    let net = crate::engine::bond_leg_test::normalize(&transport);
+                    let pm = if mode == "capacity" {
+                        ProbeMode::Capacity
+                    } else {
+                        ProbeMode::Reachability
+                    };
+                    // Zero-impact gate: refuse a capacity ramp that would
+                    // share a physical link with a running bonded flow.
+                    if pm == ProbeMode::Capacity {
+                        let busy = bond_leg_probe::busy_keys();
+                        if let Some(reason) = bond_leg_probe::capacity_conflict(&net, &busy) {
+                            return Err(CommandError::with_code(
+                                format!("capacity probe refused (would affect live traffic): {reason}"),
+                                "bond_leg_test_unsafe_link_busy",
+                            ));
+                        }
+                    }
+                    let dur = action["duration_secs"].as_u64().unwrap_or(8).clamp(1, 60);
+                    let max_bps = action["max_bitrate_bps"].as_u64().filter(|v| *v > 0);
+                    let opts = CapacityOpts {
+                        duration: std::time::Duration::from_secs(dur),
+                        max_bps,
+                        ..CapacityOpts::default()
+                    };
+                    let report = bond_leg_probe::run_leg_probe(net, responder, pm, opts).await;
+                    Ok(Some(serde_json::to_value(&report).unwrap_or_default()))
+                }
+                other => Err(CommandError::new(format!(
+                    "test_bond_leg: unknown mode '{other}' (use usability | reachability | capacity)"
+                ))),
+            }
+        }
+        // ── Bond probe responder (the cooperating far end for a capacity
+        //    test). Stateless echo on its own socket/port; auto-expires;
+        //    isolated from every live media socket. ──
+        "start_bond_probe_responder" => {
+            let bind_str = action["bind"].as_str().unwrap_or("0.0.0.0:0");
+            let bind: std::net::SocketAddr = bind_str
+                .parse()
+                .map_err(|_| format!("start_bond_probe_responder: invalid bind '{bind_str}'"))?;
+            let dur = action["duration_secs"].as_u64().unwrap_or(30).clamp(1, 120);
+            let port = crate::engine::bond_leg_probe::start_responder(
+                bind,
+                std::time::Duration::from_secs(dur),
+            )
+            .await?;
+            Ok(Some(serde_json::json!({
+                "ok": true,
+                "port": port,
+                "bind": bind_str,
+                "expires_in_secs": dur,
+            })))
+        }
+        "stop_bond_probe_responder" => {
+            let port = action["port"]
+                .as_u64()
+                .filter(|p| *p <= u16::MAX as u64)
+                .ok_or("stop_bond_probe_responder: valid 'port' required")?
+                as u16;
+            let stopped = crate::engine::bond_leg_probe::stop_responder(port);
+            Ok(Some(serde_json::json!({ "ok": true, "stopped": stopped })))
         }
         // ── Media library commands (file-backed media-player input) ──
         "list_media" => {

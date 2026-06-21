@@ -54,6 +54,14 @@ pub fn spawn_bonded_input(
     input_id: String,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
+        // Register this input's legs as "in use" (held for the task's
+        // life) so a per-leg capacity probe won't saturate a link this
+        // flow is receiving on. See engine::bond_leg_probe.
+        let _active_legs = super::bond_leg_probe::register_active_legs(
+            &flow_id,
+            super::bond_leg_probe::leg_keys_for_paths(&config.paths),
+        );
+
         let socket_cfg = match build_receiver_cfg(&config) {
             Ok(c) => c,
             Err(e) => {
