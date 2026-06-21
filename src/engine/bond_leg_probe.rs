@@ -747,4 +747,69 @@ mod tests {
     async fn stop_responder_unknown_port_is_false() {
         assert!(!stop_responder(1));
     }
+
+    /// Live WAN test over a real firewall hairpin. Inert unless
+    /// `BOND_WAN_TARGET` is set (e.g. `111.118.193.172:7400`). The
+    /// responder binds the DNAT target locally; the probe egresses to the
+    /// public IP and the firewall hairpins it back to the responder, so
+    /// the round-trip traverses the real WAN path.
+    #[tokio::test]
+    #[ignore = "requires a live WAN hairpin; set BOND_WAN_TARGET (+ BOND_WAN_RESP_BIND)"]
+    async fn wan_hairpin_capacity_probe() {
+        let target = match std::env::var("BOND_WAN_TARGET") {
+            Ok(v) => v,
+            Err(_) => {
+                eprintln!("skip: set BOND_WAN_TARGET=ip:port");
+                return;
+            }
+        };
+        let resp_bind = std::env::var("BOND_WAN_RESP_BIND").unwrap_or_else(|_| "0.0.0.0:7400".into());
+        let port = start_responder(resp_bind.parse().unwrap(), Duration::from_secs(25))
+            .await
+            .expect("responder starts");
+        eprintln!("responder bound, local port {port} ({resp_bind})");
+        let responder: SocketAddr = target.parse().expect("BOND_WAN_TARGET ip:port");
+        let sock = UdpSocket::bind("0.0.0.0:0").await.unwrap();
+        sock.connect(responder).await.unwrap();
+        let sock = Arc::new(sock);
+
+        let reach = probe_reachability(sock.clone()).await;
+        eprintln!(
+            "REACHABILITY: ok={} loss={:.1}% rtt={:.2}ms (min {:.2}ms) — {}",
+            reach.ok, reach.loss_pct, reach.rtt_ms, reach.rtt_ms_min, reach.note
+        );
+
+        let cap = probe_capacity(
+            sock,
+            CapacityOpts {
+                duration: Duration::from_secs(6),
+                max_bps: Some(80_000_000),
+                start_bps: 2_000_000,
+                packet_bytes: 1200,
+            },
+        )
+        .await;
+        eprintln!(
+            "CAPACITY: ok={} measured={:.1} Mbps knee={:?} loss={:.2}% rtt={:.2}ms (min {:.2}ms)\n  note: {}",
+            cap.ok,
+            cap.measured_bps as f64 / 1e6,
+            cap.knee_bps.map(|k| (k as f64 / 1e6 * 10.0).round() / 10.0),
+            cap.loss_pct,
+            cap.rtt_ms,
+            cap.rtt_ms_min,
+            cap.note
+        );
+        for s in &cap.samples {
+            eprintln!(
+                "  round {:>2}: target {:>5.1} Mbps  delivered {:>5.1} Mbps  loss {:>4.1}%  rtt {:>5.1}ms",
+                s.round,
+                s.target_bps as f64 / 1e6,
+                s.delivered_bps as f64 / 1e6,
+                s.loss_pct,
+                s.rtt_ms
+            );
+        }
+        stop_responder(port);
+        assert!(reach.ok, "WAN hairpin reachability should succeed");
+    }
 }
