@@ -331,6 +331,10 @@ struct RecvState {
     echoes: u64,
     rtt_us_min: u64,
     rtt_us_last: u64,
+    /// EWMA of RTT — smooths single-sample jitter so the inflation knee
+    /// reacts to sustained bufferbloat, not a lone late echo (critical on
+    /// cellular, where per-sample RTT jitter is routinely ±100 ms).
+    rtt_us_smooth: u64,
     rtts: Vec<u64>,
 }
 
@@ -355,6 +359,7 @@ fn spawn_receiver(sock: Arc<UdpSocket>, state: Arc<StdMutex<RecvState>>, cancel:
                     s.recv_bytes = s.recv_bytes.max(rb);
                     s.echoes += 1;
                     s.rtt_us_last = rtt;
+                    s.rtt_us_smooth = if s.rtt_us_smooth == 0 { rtt } else { (s.rtt_us_smooth * 7 + rtt) / 8 };
                     s.rtt_us_min = if s.rtt_us_min == 0 { rtt } else { s.rtt_us_min.min(rtt) };
                     if s.rtts.len() < 256 {
                         s.rtts.push(rtt);
@@ -425,11 +430,33 @@ pub async fn probe_reachability(sock: Arc<UdpSocket>) -> ProbeReport {
 /// Capacity ramp: increase the offered rate each round until loss or
 /// RTT-inflation appears (the knee), reporting the best clean delivered
 /// rate. Bounded by `opts.duration` and `opts.max_bps`.
+/// RTT-inflation knee floor (low-latency links). The real budget scales with
+/// the link's baseline RTT in [`rtt_inflated`].
+const RTT_INFLATION_FLOOR_US: u64 = 50_000; // 50 ms
+
+/// Cellular-aware RTT-inflation knee. Trips only when the smoothed RTT rises
+/// well above the link's *own* baseline — the inflation budget scales with
+/// `rtt_min` (floored for low-latency wired links), so a high-RTT cellular
+/// leg (~360 ms with ±100 ms jitter) doesn't false-trip on jitter, only on
+/// genuine bufferbloat (the queue building under overload). The old absolute
+/// 50 ms threshold made the probe knee on normal cellular jitter and badly
+/// under-report 5G capacity.
+fn rtt_inflated(rtt_min_us: u64, rtt_smooth_us: u64) -> bool {
+    if rtt_min_us == 0 {
+        return false;
+    }
+    let budget = RTT_INFLATION_FLOOR_US.max(rtt_min_us);
+    rtt_smooth_us > rtt_min_us.saturating_add(budget)
+}
+
 pub async fn probe_capacity(sock: Arc<UdpSocket>, opts: CapacityOpts) -> ProbeReport {
     const ROUND_MS: u64 = 100;
     const SETTLE_MS: u64 = 40;
-    const LOSS_HIGH: f64 = 0.02;
-    const RTT_INFLATION_US: u64 = 50_000; // 50 ms
+    // Loss knee. Cellular routinely loses a few % of raw UDP that the bond
+    // recovers via ARQ/FEC, so a 2% knee under-reported badly — the bond's
+    // own congestion controller tolerates ~6%. 5% gives a representative
+    // usable figure without declaring capacity at absurd loss.
+    const LOSS_HIGH: f64 = 0.05;
     const GROWTH: f64 = 1.4;
     const HARD_MAX_BPS: u64 = 1_000_000_000;
     const MAX_PKTS_PER_ROUND: u64 = 6000;
@@ -441,14 +468,57 @@ pub async fn probe_capacity(sock: Arc<UdpSocket>, opts: CapacityOpts) -> ProbeRe
     let cancel = CancellationToken::new();
     spawn_receiver(sock.clone(), state.clone(), cancel.clone());
 
-    let started = Instant::now();
+    // ── RTT bootstrap ── learn the baseline RTT with a few light pings before
+    // ramping, so every ramp round can settle for ≥ RTT. Without this, a
+    // high-RTT cellular link (RTT ≫ the round time) measures each round's
+    // loss/delivered against echoes that haven't returned yet → phantom loss
+    // and a collapsed result. Polls for the first echo, so a low-RTT link
+    // bootstraps in milliseconds and a high-RTT one waits at most ~1.2 s.
     let mut seq: u32 = 0;
+    for _ in 0..8u32 {
+        let _ = sock.send(&make_probe(seq, opts.packet_bytes)).await;
+        seq = seq.wrapping_add(1);
+        tokio::time::sleep(Duration::from_millis(15)).await;
+    }
+    {
+        let boot = Instant::now();
+        while boot.elapsed() < Duration::from_millis(1200) {
+            if state.lock().unwrap().rtt_us_min > 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+    // Settle each round long enough for THIS round's echoes to come back
+    // (RTT + 80 ms margin, capped), so per-round loss/delivered is real rather
+    // than lagging one or more rounds behind the offered rate.
+    let settle = {
+        let rtt0 = state.lock().unwrap().rtt_us_min;
+        if rtt0 > 0 {
+            Duration::from_micros((rtt0 + 80_000).min(2_000_000))
+        } else {
+            Duration::from_millis(SETTLE_MS)
+        }
+    };
+
+    let started = Instant::now();
     let mut target = opts.start_bps.clamp(100_000, ceiling);
     let mut best_clean: u64 = 0;
+    let mut last_clean_target: u64 = 0;
     let mut knee: Option<u64> = None;
     let mut samples: Vec<ProbeSample> = Vec::new();
+    let mut sustain_samples: Vec<u64> = Vec::new();
     let mut empty_rounds = 0u32;
     let mut round = 0u32;
+    // Two phases in one loop. RAMP grows the offered rate ×1.4 per round to
+    // find the operating point (loss/RTT knee, or the ceiling). SUSTAIN then
+    // holds the last clean rate for the REST of the requested duration. The
+    // sustain phase is what makes the operator's "Seconds" matter: without it
+    // the probe returned the instant it found the knee (one ~100 ms round on a
+    // lossy cellular link), so "Seconds" was ignored and the result was a
+    // single blip. Sustain runs the full window and reports the median held
+    // throughput — robust, and a proof the rate actually holds.
+    let mut sustaining = false;
 
     while started.elapsed() < opts.duration {
         round += 1;
@@ -462,13 +532,18 @@ pub async fn probe_capacity(sock: Arc<UdpSocket>, opts: CapacityOpts) -> ProbeRe
             (s.recv_count, s.recv_bytes)
         };
 
-        // Send the round's packets in bursts so we don't issue thousands
-        // of sub-ms sleeps. ~20 pacing points per round.
-        let burst = (want_pkts / 20).max(1);
-        let pace = Duration::from_micros((ROUND_MS * 1000) / 20);
+        // Send the whole round in ~10 small bursts spread over ~ROUND_MS —
+        // paced enough for cellular (never one big burst), but reliably
+        // OFFERS the target rate. Per-packet userspace sleeps were a mistake:
+        // they overshoot badly below ~10 ms and throttled the probe's own send
+        // rate (a clean link then read ~1 Mbps). We send ALL want_pkts (no
+        // early time-cut) so the offered rate actually matches `target`.
+        let ticks = 10u64;
+        let burst = want_pkts.div_ceil(ticks).max(1);
+        let pace = Duration::from_micros((ROUND_MS * 1000) / ticks);
         let round_start = Instant::now();
         let mut sent: u64 = 0;
-        while sent < want_pkts && round_start.elapsed() < Duration::from_millis(ROUND_MS) {
+        while sent < want_pkts {
             for _ in 0..burst {
                 if sent >= want_pkts {
                     break;
@@ -477,14 +552,21 @@ pub async fn probe_capacity(sock: Arc<UdpSocket>, opts: CapacityOpts) -> ProbeRe
                 seq = seq.wrapping_add(1);
                 sent += 1;
             }
-            tokio::time::sleep(pace).await;
+            if sent < want_pkts {
+                tokio::time::sleep(pace).await;
+            }
         }
+        // The offered-rate window is the SEND duration only (not the settle).
+        // delivered_bps divides by this, so it reflects the rate we offered.
+        let send_secs = (round_start.elapsed().as_micros() as f64 / 1_000_000.0).max(0.001);
 
-        tokio::time::sleep(Duration::from_millis(SETTLE_MS)).await;
+        // Settle ≥ RTT so this round's echoes return before we read the
+        // counters (the core fix for high-RTT cellular phantom loss).
+        tokio::time::sleep(settle).await;
 
-        let (rc1, rb1, rtt_min, rtt_last, echoes) = {
+        let (rc1, rb1, rtt_min, rtt_last, rtt_smooth, echoes) = {
             let s = state.lock().unwrap();
-            (s.recv_count, s.recv_bytes, s.rtt_us_min, s.rtt_us_last, s.echoes)
+            (s.recv_count, s.recv_bytes, s.rtt_us_min, s.rtt_us_last, s.rtt_us_smooth, s.echoes)
         };
 
         if echoes == 0 {
@@ -500,30 +582,56 @@ pub async fn probe_capacity(sock: Arc<UdpSocket>, opts: CapacityOpts) -> ProbeRe
         }
         empty_rounds = 0;
 
-        let elapsed_secs = (round_start.elapsed().as_micros() as f64 / 1_000_000.0).max(0.001);
-        let delivered_bps = (((rb1.saturating_sub(rb0)) as f64) * 8.0 / elapsed_secs) as u64;
+        let delivered_bps = (((rb1.saturating_sub(rb0)) as f64) * 8.0 / send_secs) as u64;
         let loss = if sent > 0 {
             (1.0 - (rc1.saturating_sub(rc0) as f64 / sent as f64)).clamp(0.0, 1.0)
         } else {
             0.0
         };
-        samples.push(ProbeSample {
-            round,
-            target_bps: target,
-            delivered_bps,
-            loss_pct: loss * 100.0,
-            rtt_ms: rtt_last as f64 / 1000.0,
-        });
-
-        let inflated = rtt_min > 0 && rtt_last > rtt_min + RTT_INFLATION_US;
-        if loss > LOSS_HIGH || inflated {
-            knee = Some(target);
-            break;
+        if samples.len() < 240 {
+            samples.push(ProbeSample {
+                round,
+                target_bps: target,
+                delivered_bps,
+                loss_pct: loss * 100.0,
+                rtt_ms: rtt_last as f64 / 1000.0,
+            });
         }
+        // `delivered_bps` is what actually got through this round — a valid
+        // usable-capacity figure even at the knee. Record it unconditionally
+        // (a knee on round 1 must not report 0).
         best_clean = best_clean.max(delivered_bps);
 
+        // ── Sustain/hold phase ── already holding the operating rate: keep
+        // sampling for the rest of the window so the result is the sustained
+        // throughput over the operator's requested duration, not one round.
+        if sustaining {
+            sustain_samples.push(delivered_bps);
+            continue;
+        }
+
+        // ── Ramp phase ──
+        let inflated = rtt_inflated(rtt_min, rtt_smooth);
+        if loss > LOSS_HIGH || inflated {
+            // Knee found. Back off to the last clean rate (or one growth step
+            // below the knee if even the first round lost) and SUSTAIN it for
+            // the remainder of the requested duration.
+            knee = Some(target);
+            target = if last_clean_target > 0 {
+                last_clean_target
+            } else {
+                ((target as f64 / GROWTH) as u64).clamp(100_000, ceiling)
+            };
+            sustaining = true;
+            continue;
+        }
+
+        // Clean round — remember it, then keep ramping.
+        last_clean_target = target;
         if target >= ceiling {
-            break; // hit the configured ceiling cleanly
+            // Carried the ceiling cleanly; hold it for the rest of the window.
+            sustaining = true;
+            continue;
         }
         target = ((target as f64 * GROWTH) as u64).min(ceiling);
     }
@@ -535,16 +643,35 @@ pub async fn probe_capacity(sock: Arc<UdpSocket>, opts: CapacityOpts) -> ProbeRe
     };
     let last_loss = samples.last().map(|s| s.loss_pct).unwrap_or(0.0);
 
-    let note = if knee.is_some() {
+    // Report the MEDIAN sustained delivered rate — robust over the whole
+    // requested window. Fall back to the ramp best only when the window was
+    // too short to enter the sustain phase (duration ran out mid-ramp).
+    let measured_bps = if sustain_samples.is_empty() {
+        best_clean
+    } else {
+        sustain_samples.sort_unstable();
+        sustain_samples[sustain_samples.len() / 2]
+    };
+    let held_secs = sustain_samples.len() as f64 * ((ROUND_MS + SETTLE_MS) as f64 / 1000.0);
+
+    let note = if sustain_samples.is_empty() {
         format!(
-            "Usable ≈ {:.1} Mbps (knee at {:.1} Mbps where loss/latency rose). Approximate — userspace pacing + point-in-time; cellular/satellite capacity varies.",
-            best_clean as f64 / 1e6,
+            "Reached ≈ {:.1} Mbps when the {:.0}s window elapsed mid-ramp — raise Seconds (or set Max Mbps) to let it find and hold the knee. Approximate.",
+            measured_bps as f64 / 1e6,
+            opts.duration.as_secs_f64()
+        )
+    } else if knee.is_some() {
+        format!(
+            "Usable ≈ {:.1} Mbps held for ~{:.0}s (knee at {:.1} Mbps where loss/latency rose). Approximate — userspace pacing; cellular/satellite capacity varies.",
+            measured_bps as f64 / 1e6,
+            held_secs,
             knee.unwrap() as f64 / 1e6
         )
     } else {
         format!(
-            "Carried ≈ {:.1} Mbps cleanly up to the test ceiling (no loss/latency knee hit). Approximate — raise the ceiling to find the real limit.",
-            best_clean as f64 / 1e6
+            "Carried ≈ {:.1} Mbps held for ~{:.0}s up to the test ceiling (no loss/latency knee). Approximate — raise Max Mbps to find the real limit.",
+            measured_bps as f64 / 1e6,
+            held_secs
         )
     };
 
@@ -552,7 +679,7 @@ pub async fn probe_capacity(sock: Arc<UdpSocket>, opts: CapacityOpts) -> ProbeRe
         ok: total_echoes > 0,
         mode: "capacity".to_string(),
         error: None,
-        measured_bps: best_clean,
+        measured_bps,
         knee_bps: knee,
         loss_pct: last_loss,
         rtt_ms: rtt_last as f64 / 1000.0,
@@ -746,6 +873,220 @@ mod tests {
     #[tokio::test]
     async fn stop_responder_unknown_port_is_false() {
         assert!(!stop_responder(1));
+    }
+
+    #[test]
+    fn rtt_knee_is_relative_to_baseline() {
+        // Low-latency wired: the ~50 ms floor keeps it sensitive.
+        assert!(!rtt_inflated(10_000, 55_000), "55ms < 10+50 floor");
+        assert!(rtt_inflated(10_000, 70_000), "70ms > 60ms");
+        // High-latency cellular: budget scales with rtt_min, so normal jitter
+        // (the old absolute 50 ms knee's false-trip cause) is ignored.
+        assert!(!rtt_inflated(360_000, 450_000), "+90ms jitter is not congestion");
+        assert!(!rtt_inflated(360_000, 700_000), "still under the doubled baseline");
+        assert!(rtt_inflated(360_000, 760_000), ">2x baseline = real bufferbloat");
+        // Unknown baseline never trips.
+        assert!(!rtt_inflated(0, 999_000));
+    }
+
+    /// Echo responder that silently ignores every other probe — simulates a
+    /// lossy link (cellular/satellite). The sender sees loss ≈ 50 %, so the
+    /// capacity ramp trips its knee on the very first round.
+    async fn lossy_responder() -> (u16, CancellationToken) {
+        let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let port = sock.local_addr().unwrap().port();
+        let token = CancellationToken::new();
+        let t2 = token.clone();
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; 2048];
+            let (mut recv_count, mut recv_bytes, mut seen): (u64, u64, u64) = (0, 0, 0);
+            loop {
+                tokio::select! {
+                    _ = t2.cancelled() => break,
+                    r = sock.recv_from(&mut buf) => {
+                        let (n, from) = match r { Ok(v) => v, Err(_) => continue };
+                        if n < PROBE_HDR || &buf[0..4] != MAGIC || buf[4] != PKT_PROBE { continue; }
+                        seen += 1;
+                        if seen % 2 == 0 { continue; } // drop: don't count, don't echo
+                        recv_count += 1;
+                        recv_bytes += n as u64;
+                        let mut echo = [0u8; ECHO_LEN];
+                        echo[0..4].copy_from_slice(MAGIC);
+                        echo[4] = PKT_ECHO;
+                        echo[5..9].copy_from_slice(&buf[5..9]);
+                        echo[9..17].copy_from_slice(&buf[9..17]);
+                        echo[17..25].copy_from_slice(&recv_count.to_be_bytes());
+                        echo[25..33].copy_from_slice(&recv_bytes.to_be_bytes());
+                        let _ = sock.send_to(&echo, from).await;
+                    }
+                }
+            }
+        });
+        (port, token)
+    }
+
+    #[tokio::test]
+    async fn capacity_reports_delivered_when_knee_hits_first_round() {
+        // Regression for the live-cellular "✓ 0.0 Mbps usable" bug: a lossy
+        // (but reachable) path trips the loss knee on round 1. Echoes return
+        // (ok=true), so the probe MUST report the delivered rate, not 0.
+        let (port, token) = lossy_responder().await;
+        let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        sock.connect(("127.0.0.1", port)).await.unwrap();
+        let sock = Arc::new(sock);
+
+        let cap = probe_capacity(
+            sock,
+            CapacityOpts {
+                duration: Duration::from_millis(600),
+                max_bps: Some(50_000_000),
+                start_bps: 2_000_000,
+                packet_bytes: 1200,
+            },
+        )
+        .await;
+        token.cancel();
+
+        assert!(cap.ok, "echoes should return on a lossy-but-reachable path: {cap:?}");
+        assert!(cap.knee_bps.is_some(), "≈50% loss should trip the knee: {cap:?}");
+        assert!(
+            cap.measured_bps > 0,
+            "must report the delivered rate at the knee, not 0: {cap:?}"
+        );
+    }
+
+    /// Echo responder that delays every echo by `rtt_ms` (simulates a
+    /// high-latency cellular link where RTT >> the probe's round time) and
+    /// optionally drops 1-in-`drop_every` probes.
+    async fn delayed_responder(rtt_ms: u64, drop_every: u64) -> (u16, CancellationToken) {
+        let sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let port = sock.local_addr().unwrap().port();
+        let token = CancellationToken::new();
+        let t2 = token.clone();
+        let s2 = sock.clone();
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; 2048];
+            let (mut recv_count, mut recv_bytes, mut seen): (u64, u64, u64) = (0, 0, 0);
+            loop {
+                tokio::select! {
+                    _ = t2.cancelled() => break,
+                    r = s2.recv_from(&mut buf) => {
+                        let (n, from) = match r { Ok(v) => v, Err(_) => continue };
+                        if n < PROBE_HDR || &buf[0..4] != MAGIC || buf[4] != PKT_PROBE { continue; }
+                        seen += 1;
+                        if drop_every > 0 && seen % drop_every == 0 { continue; }
+                        recv_count += 1;
+                        recv_bytes += n as u64;
+                        let mut echo = [0u8; ECHO_LEN];
+                        echo[0..4].copy_from_slice(MAGIC);
+                        echo[4] = PKT_ECHO;
+                        echo[5..9].copy_from_slice(&buf[5..9]);
+                        echo[9..17].copy_from_slice(&buf[9..17]);
+                        echo[17..25].copy_from_slice(&recv_count.to_be_bytes());
+                        echo[25..33].copy_from_slice(&recv_bytes.to_be_bytes());
+                        let s3 = s2.clone();
+                        tokio::spawn(async move {
+                            tokio::time::sleep(Duration::from_millis(rtt_ms)).await;
+                            let _ = s3.send_to(&echo, from).await;
+                        });
+                    }
+                }
+            }
+        });
+        (port, token)
+    }
+
+    #[tokio::test]
+    async fn capacity_probe_high_rtt_clean_link() {
+        // A clean but high-latency link (≈300ms RTT, no loss) — the cellular
+        // regime where RTT ≫ the round time. The probe must NOT collapse: with
+        // a 10 Mbps ceiling and zero real loss it should ramp to ~ceiling, not
+        // report ~1 Mbps (the per-packet-pacing throttle + RTT-phantom-loss
+        // bug that made the live test read "even lower than before").
+        let (port, token) = delayed_responder(300, 0).await;
+        let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        sock.connect(("127.0.0.1", port)).await.unwrap();
+        let sock = Arc::new(sock);
+        let cap = probe_capacity(
+            sock,
+            CapacityOpts {
+                duration: Duration::from_secs(5),
+                max_bps: Some(10_000_000),
+                start_bps: 2_000_000,
+                packet_bytes: 1200,
+            },
+        )
+        .await;
+        token.cancel();
+        assert!(cap.ok, "should get echoes despite RTT: {cap:?}");
+        assert!(
+            cap.measured_bps > 4_000_000,
+            "clean 300ms-RTT link (10M ceiling, 0 loss) must not collapse — got {:.2}M: {cap:?}",
+            cap.measured_bps as f64 / 1e6
+        );
+    }
+
+    #[tokio::test]
+    async fn capacity_probe_high_rtt_with_loss() {
+        // High RTT (≈300ms) AND real loss (1-in-3 dropped ≈ 33%). The probe
+        // should knee on the genuine loss and still report a sane delivered
+        // rate — neither collapsing to 0 nor reporting the full offered rate.
+        let (port, token) = delayed_responder(300, 3).await;
+        let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        sock.connect(("127.0.0.1", port)).await.unwrap();
+        let sock = Arc::new(sock);
+        let cap = probe_capacity(
+            sock,
+            CapacityOpts {
+                duration: Duration::from_secs(4),
+                max_bps: Some(10_000_000),
+                start_bps: 2_000_000,
+                packet_bytes: 1200,
+            },
+        )
+        .await;
+        token.cancel();
+        assert!(cap.ok, "echoes return despite RTT + loss: {cap:?}");
+        assert!(cap.measured_bps > 0, "must report a delivered rate, not 0: {cap:?}");
+        assert!(
+            cap.measured_bps < 9_000_000,
+            "a 33%-loss link must not report ~the full offered rate: {cap:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn capacity_probe_honors_requested_duration() {
+        // The operator's "Seconds" must govern the test window. Even on a
+        // lossy link that trips the knee on round 1, the probe holds the
+        // operating rate (sustain phase) for the rest of the duration instead
+        // of returning after ~100 ms. Regression for "seems like a very quick
+        // test" — pre-sustain this returned in ~140 ms regardless of Seconds.
+        let (port, token) = lossy_responder().await;
+        let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        sock.connect(("127.0.0.1", port)).await.unwrap();
+        let sock = Arc::new(sock);
+
+        let t0 = std::time::Instant::now();
+        let cap = probe_capacity(
+            sock,
+            CapacityOpts {
+                duration: Duration::from_millis(1500),
+                max_bps: Some(50_000_000),
+                start_bps: 2_000_000,
+                packet_bytes: 1200,
+            },
+        )
+        .await;
+        let elapsed = t0.elapsed();
+        token.cancel();
+
+        assert!(
+            elapsed >= Duration::from_millis(1200),
+            "probe must run ~the full requested duration (sustain phase), ran {elapsed:?}: {cap:?}"
+        );
+        assert!(cap.measured_bps > 0, "should report a sustained rate: {cap:?}");
+        // Multiple sustain rounds → multiple samples, not a single blip.
+        assert!(cap.samples.len() >= 3, "should sample across the window: {cap:?}");
     }
 
     /// Live WAN test over a real firewall hairpin. Inert unless
