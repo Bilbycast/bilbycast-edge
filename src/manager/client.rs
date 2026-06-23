@@ -981,19 +981,6 @@ pub(crate) fn build_health_payload(
                 .map(|o| o.insert("clock_sync".into(), v));
         }
     }
-    // In-process PHC clock status. Present only when a PTP role is configured
-    // and the NIC PHC is readable — i.e. PCR generation is disciplined to the
-    // grandmaster while the host date stays on NTP. Surfaces device / healthy /
-    // freq_ppb / last_offset_ns so the operator can confirm the PHC discipline
-    // is locked independently of the calendar clock. Gated by the `"phc-clock"`
-    // capability so older managers / non-PTP nodes hide the card.
-    if let Some(phc) = crate::util::phc_clock::shared() {
-        if let Ok(v) = serde_json::to_value(phc.telemetry()) {
-            payload
-                .as_object_mut()
-                .map(|o| o.insert("phc_clock".into(), v));
-        }
-    }
     payload
 }
 
@@ -1386,12 +1373,6 @@ fn edge_capabilities() -> Vec<&'static str> {
     // underlying CLOCK_MONOTONIC is disciplined or free-running.
     if crate::util::clock_sync::probe().is_some() {
         caps.push("clock-sync");
-    }
-    // In-process PHC discipline active (PTP role + readable NIC PHC). Tells the
-    // manager this node's PTP media/wire timing is decoupled from its calendar
-    // date, so the date can stay on NTP while still slaved to the grandmaster.
-    if crate::util::phc_clock::shared().is_some() {
-        caps.push("phc-clock");
     }
     // MXL (Media eXchange Layer) — advertised per-essence only when the
     // `mxl` Cargo feature is on AND the boot probe successfully dlopen'd
@@ -4441,9 +4422,6 @@ async fn execute_command(
                 .and_then(|s| u8::try_from(s).ok());
             let offset_warn_ns = action["offset_warn_ns"].as_i64();
             let path_delay_warn_ns = action["path_delay_warn_ns"].as_i64();
-            // Slave-only PHC-only decoupling (keep CLOCK_REALTIME on NTP).
-            // Absent → None → helper applies the recommended default (on).
-            let slave_phc_only = action["slave_phc_only"].as_bool();
             let settings = PtpSettings {
                 mode,
                 iface,
@@ -4452,7 +4430,6 @@ async fn execute_command(
                 scan_timeout,
                 offset_warn_ns,
                 path_delay_warn_ns,
-                slave_phc_only,
             }
             .normalised();
             // Defense-in-depth — iface goes via a file the privileged

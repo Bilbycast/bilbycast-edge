@@ -467,8 +467,12 @@ impl MasterClock for PtpMasterClock {
         let dur = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default();
-        let ns = dur.as_nanos();
-        let ticks = (ns as u64).saturating_mul(27) / 1000;
+        // The ×27 MUST be done in u128: SystemTime returns absolute epoch ns
+        // (~1.78e18 in 2026), and 1.78e18 × 27 ≈ 4.8e19 overflows u64::MAX
+        // (1.84e19). A u64 multiply (even saturating) pins the result to a
+        // constant, freezing the PCR. u128 keeps it exact (~4.8e16, fits u64
+        // before the modulo).
+        let ticks = (dur.as_nanos() * 27 / 1000) as u64;
         const PCR_MODULUS: u64 = (1u64 << 33) * 300;
         ticks % PCR_MODULUS
     }
@@ -1669,9 +1673,19 @@ mod tests {
         let m = PtpMasterClock::new(state);
         assert!(!m.is_locked(), "PTP master without GM should not be locked");
         assert!(m.source_id().starts_with("ptp:domain=0"));
-        // now_27mhz returns a sensible-sized value driven by SystemTime.
-        let now = m.now_27mhz();
-        assert!(now > 0);
+        // now_27mhz must ADVANCE — the ×27 on absolute epoch ns has to be done
+        // in u128. A u64 multiply saturates (1.78e18 × 27 > u64::MAX) and pins
+        // the PCR to a frozen value; this regression guard catches that (the
+        // old `now > 0` assertion passed even when frozen).
+        const PCR_MODULUS: u64 = (1u64 << 33) * 300;
+        let a = m.now_27mhz();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let b = m.now_27mhz();
+        assert!(a < PCR_MODULUS && b < PCR_MODULUS, "PCR must be within modulus");
+        assert!(
+            b > a && (b - a) > 27_000,
+            "PCR must advance ~27k ticks/ms (not saturated/frozen)"
+        );
     }
 
     #[test]
