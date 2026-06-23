@@ -371,6 +371,77 @@ async fn run_gateway_route_reprogram(
     }
 }
 
+/// Auto-diagnose a leg the instant it goes down / starts re-dialing, and emit
+/// the plain-English verdict (`bond_leg_test::test_leg`) as an operator event
+/// — so the operator is told WHY a leg failed without clicking "Test leg".
+/// Zero-impact (the probe puts nothing on the wire); debounced per leg.
+async fn run_bond_leg_autodiagnose(
+    mut rx: broadcast::Receiver<PathEvent>,
+    legs: Vec<(u8, crate::config::models::BondPathTransportConfig)>,
+    output_id: String,
+    flow_id: String,
+    events: EventSender,
+    cancel: CancellationToken,
+) {
+    const DEBOUNCE: std::time::Duration = std::time::Duration::from_secs(30);
+    let mut last: std::collections::HashMap<u8, std::time::Instant> =
+        std::collections::HashMap::new();
+    loop {
+        tokio::select! {
+            _ = cancel.cancelled() => return,
+            res = rx.recv() => match res {
+                Ok(ev) => {
+                    if !matches!(
+                        ev.kind,
+                        PathEventKind::PathDead { .. } | PathEventKind::PathReconnecting { .. }
+                    ) {
+                        continue;
+                    }
+                    let Some((_, transport)) = legs.iter().find(|(id, _)| *id == ev.path_id)
+                    else {
+                        continue;
+                    };
+                    let now = std::time::Instant::now();
+                    if let Some(t) = last.get(&ev.path_id) {
+                        if now.duration_since(*t) < DEBOUNCE {
+                            continue;
+                        }
+                    }
+                    last.insert(ev.path_id, now);
+                    let report = crate::engine::bond_leg_test::test_leg(transport, false);
+                    let sev = if report.ok {
+                        EventSeverity::Info
+                    } else {
+                        EventSeverity::Warning
+                    };
+                    let message = format!(
+                        "bonded output '{output_id}' leg '{}' (#{}) diagnosis: {}",
+                        ev.path_name, ev.path_id, report.headline
+                    );
+                    events.emit_output_with_details(
+                        sev,
+                        category::BOND,
+                        message,
+                        &output_id,
+                        serde_json::json!({
+                            "error_code": "bond_leg_diagnosis",
+                            "path_id": ev.path_id,
+                            "path_name": ev.path_name,
+                            "headline": report.headline,
+                            "suggested_fix": report.suggested_fix,
+                            "checks": report.checks,
+                            "chosen_egress_interface": report.chosen_egress_interface,
+                            "flow_id": flow_id,
+                        }),
+                    );
+                }
+                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(broadcast::error::RecvError::Closed) => return,
+            }
+        }
+    }
+}
+
 async fn bonded_output_run(
     config: &BondedOutputConfig,
     rx: &mut broadcast::Receiver<RtpPacket>,
@@ -558,6 +629,19 @@ async fn bonded_output_run(
         flow_id.to_string(),
         BondEventScope::Output,
         config.id.clone(),
+        cancel.clone(),
+    ));
+
+    // Auto-diagnose a leg the instant it goes down / starts re-dialing and
+    // emit the plain-English verdict as an operator event — so the operator
+    // is told WHY a leg failed without having to click "Test leg". The probe
+    // is zero-impact (no packets on the wire) and debounced per leg.
+    tokio::spawn(run_bond_leg_autodiagnose(
+        socket.subscribe_events(),
+        config.paths.iter().map(|p| (p.id, p.transport.clone())).collect(),
+        config.id.clone(),
+        flow_id.to_string(),
+        events.clone(),
         cancel.clone(),
     ));
 

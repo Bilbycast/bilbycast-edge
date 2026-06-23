@@ -87,6 +87,12 @@ pub struct LegTestReport {
     /// active probe.
     pub leg_live: bool,
     pub checks: Vec<LegCheck>,
+    /// One-line operator verdict composed from `checks` — the first failing
+    /// (or warning) check, or "all checks pass". The plain-English answer to
+    /// "why won't this leg come up", for an operator who isn't a developer.
+    pub headline: String,
+    /// Actionable hint for the headline issue, when one is known.
+    pub suggested_fix: Option<String>,
     pub note: String,
 }
 
@@ -320,6 +326,49 @@ fn neighbor_reachable(gw: &str) -> (CheckStatus, String) {
 
 /// Run the zero-impact pre-flight on one leg. Synchronous (sysfs +
 /// socket syscalls); call via `spawn_blocking` from async contexts.
+/// Compose a one-line operator verdict + an actionable fix from the per-check
+/// results: the first `Fail` (most actionable), else the first `Warn`, else
+/// "all checks pass". This is the plain-English answer to "why won't this leg
+/// come up" — for an operator who isn't a developer.
+fn compose_verdict(checks: &[LegCheck]) -> (String, Option<String>) {
+    if let Some(c) = checks.iter().find(|c| c.status == CheckStatus::Fail) {
+        (format!("UNUSABLE — {} [{}]", c.detail, c.name), suggested_fix(c.name))
+    } else if let Some(c) = checks.iter().find(|c| c.status == CheckStatus::Warn) {
+        (
+            format!("usable, with a caveat — {} [{}]", c.detail, c.name),
+            suggested_fix(c.name),
+        )
+    } else {
+        ("all checks pass — leg looks healthy".to_string(), None)
+    }
+}
+
+/// Plain-English next step for the named failing/warning check.
+fn suggested_fix(check: &str) -> Option<String> {
+    Some(
+        match check {
+            "interface_link" => {
+                "Bring the NIC up — check the cable / modem / USB dongle — then re-test."
+            }
+            "source_ip" => {
+                "The bound source IP is no longer on any NIC (DHCP lease changed?). Pin the \
+                 leg by interface name instead of a fixed source IP."
+            }
+            "egress_route" => {
+                "This leg egresses the wrong interface. Add an interface policy route so its \
+                 traffic leaves the pinned NIC (see the Bonding Network Setup docs)."
+            }
+            "first_hop" => "First-hop gateway unreachable — the uplink is likely down.",
+            "reachability" | "handshake" | "responder" => {
+                "Peer/firewall unreachable — the uplink is down, or the bond port isn't \
+                 forwarded to the receiver."
+            }
+            _ => return None,
+        }
+        .to_string(),
+    )
+}
+
 pub fn test_leg(transport: &BondPathTransportConfig, leg_live: bool) -> LegTestReport {
     let net = normalize(transport);
     let nics = network_interfaces::enumerate();
@@ -501,6 +550,7 @@ pub fn test_leg(transport: &BondPathTransportConfig, leg_live: bool) -> LegTestR
         "Usability only (zero packets sent). To measure throughput, run the active capacity probe (Phase 2) on this idle leg.".to_string()
     };
 
+    let (headline, suggested_fix) = compose_verdict(&checks);
     LegTestReport {
         ok,
         transport: net.transport.to_string(),
@@ -513,6 +563,8 @@ pub fn test_leg(transport: &BondPathTransportConfig, leg_live: bool) -> LegTestR
         link_speed_mbps,
         leg_live,
         checks,
+        headline,
+        suggested_fix,
         note,
     }
 }
@@ -521,6 +573,31 @@ pub fn test_leg(transport: &BondPathTransportConfig, leg_live: bool) -> LegTestR
 mod tests {
     use super::*;
     use crate::config::models::{BondPathTransportConfig, BondQuicRole, BondRistRole};
+
+    #[test]
+    fn verdict_picks_first_fail_with_fix() {
+        let checks = vec![
+            LegCheck::new("interface_link", CheckStatus::Pass, "NIC 'wlo5' up"),
+            LegCheck::new(
+                "source_ip",
+                CheckStatus::Fail,
+                "source 10.1.2.3 is not present on any NIC — leg cannot bind it",
+            ),
+            LegCheck::new("egress_route", CheckStatus::Warn, "minor"),
+        ];
+        let (headline, fix) = compose_verdict(&checks);
+        assert!(headline.starts_with("UNUSABLE"), "{headline}");
+        assert!(headline.contains("source 10.1.2.3"), "{headline}");
+        assert!(fix.is_some(), "a known failing check must carry a fix hint");
+    }
+
+    #[test]
+    fn verdict_all_pass_has_no_fix() {
+        let checks = vec![LegCheck::new("interface_link", CheckStatus::Pass, "NIC up")];
+        let (headline, fix) = compose_verdict(&checks);
+        assert!(headline.contains("all checks pass"), "{headline}");
+        assert!(fix.is_none());
+    }
 
     #[test]
     fn ip_only_strips_port_and_prefix() {
