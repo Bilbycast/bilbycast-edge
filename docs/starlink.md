@@ -110,27 +110,52 @@ There are **no secrets** — the dish gRPC is unauthenticated, so nothing is spl
 into `secrets.json`.
 
 In the manager UI, configure dishes via **Node config → Starlink Monitoring →
-Add Dish**. Use **Test reachability** to validate the endpoint (and the host
-route, below) before saving — it runs one live `get_status` and reports the
-decoded state + key figures, or the exact failure cause.
+Add Dish**. Use **Test reachability** to validate the endpoint before saving — it
+runs one live `get_status` and reports the decoded state + key figures, or the
+exact failure cause.
 
-## Host prerequisite — a route to the dish
+## Route to the dish (maintained automatically)
 
 The dish's link telemetry lives at the **dish** gRPC (`192.168.100.1:9200`), not
 the Starlink router. On a Starlink Mini / router the dish management address sits
-on its own subnet, so the edge host usually needs a route to it via the Starlink
-LAN gateway. For example, with a Wi-Fi leg `wlo5` on the Starlink LAN whose
-gateway is `192.168.4.1`:
+on its own `/24`, off the box's default route, so the edge host needs a route to
+it via the Starlink LAN gateway.
 
-```bash
-sudo ip route add 192.168.100.0/24 via 192.168.4.1 dev wlo5
-```
+**The edge programs and maintains this route itself — you do not add it by
+hand.** Once a Starlink uplink is configured, the poller re-asserts
+`192.168.100.0/24` (the dish address's `/24`) via the leg's gateway, in the
+**main** routing table, on **every poll cycle** (10 s), with `replace` semantics
+so it is idempotent and survives a Wi-Fi re-associate or DHCP lease change with no
+operator action. The gateway is resolved in this order:
 
-Persist it in netplan (`routes:` under the interface) so it survives a reboot.
-The poll reaches the dish **by address** (it does not bind the interface), so the
-interface field is only the join key for the UI strip — the route is what makes
-the dish reachable. If the dish can't be reached, the row shows the failure cause
-and a `starlink_uplink_unreachable` event fires (below).
+1. an explicit `gateway` on the uplink config, if set;
+2. otherwise the interface's **kernel default-route next-hop** (read from
+   `/proc/net/route`, so it works on any subnet — no assumption about your
+   addressing);
+3. as a last resort, `.1` of the leg's `/24`.
+
+The `interface` field is both the UI join key **and** the `dev` the route is
+programmed against, so it must name the leg the dish is on. Route programming uses
+`CAP_NET_ADMIN`, which the packaged **systemd unit grants** (ambient) — so on a
+normal install there is nothing to set up.
+
+> **Manual fallback.** If you run the binary outside systemd without
+> `CAP_NET_ADMIN` (e.g. a bare `cargo run` as an unprivileged user), the netlink
+> route-add fails, the edge logs it at debug and carries on, and the dish stays
+> unreachable until a route exists. Add the equivalent by hand — for a Wi-Fi leg
+> `wlo5` on the Starlink LAN whose gateway is `192.168.4.1`:
+>
+> ```bash
+> sudo ip route add 192.168.100.0/24 via 192.168.4.1 dev wlo5
+> ```
+>
+> Persist it in netplan (`routes:` under the interface) so it survives a reboot.
+> Because the edge uses `replace`, a stale hand-added route is harmless once the
+> capability is restored.
+
+The poll reaches the dish **by address** (it does not bind the interface), so if
+the dish still can't be reached, the row shows the failure cause and a
+`starlink_uplink_unreachable` event fires (below).
 
 > Pointing the address at the Starlink **router** endpoint (e.g. `:9000` on the
 > Mini) returns `wifi_get_status`, not `dish_get_status`; the decoder reports a
@@ -157,7 +182,11 @@ from that source IP out the right interface:
 ]
 ```
 
-Host setup (one routing table per leg — the same pattern as bonding legs):
+Host setup — **this part is manual.** The automatic main-table route above covers
+the *single*-dish case; a single `192.168.100.0/24` route can only point one way,
+so it can't disambiguate two dishes that share `192.168.100.1`. The edge binds
+each poll to its `source_address` but does **not** install per-leg policy routes,
+so you own these (one routing table per leg — the same pattern as bonding legs):
 
 ```bash
 # leg 1 — wlo5
