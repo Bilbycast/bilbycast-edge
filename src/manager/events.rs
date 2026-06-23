@@ -793,6 +793,19 @@ fn translate_path_event(
                 }),
             )
         }
+        PathEventKind::PathReconnecting { reason } => (
+            // The leg's link dropped or is failing to (re)establish and the
+            // transport is re-dialing in the background (QUIC self-redial).
+            // Carries the SPECIFIC cause so the operator sees WHY a leg won't
+            // come up — beyond the generic keepalive-timeout PathDead. Not
+            // flap-deduped: emitted once per down-episode by the transport.
+            EventSeverity::Warning,
+            format!("{scope_label} path {path_label} reconnecting: {reason}"),
+            serde_json::json!({
+                "error_code": "bond_leg_reconnecting",
+                "reason": reason,
+            }),
+        ),
         PathEventKind::BondDegraded { alive_count, total } => (
             EventSeverity::Warning,
             format!(
@@ -1054,6 +1067,29 @@ mod tests {
             &mut last,
         );
         assert!(ev.is_none(), "flap should be suppressed within grace");
+    }
+
+    #[test]
+    fn path_reconnecting_emits_warning_with_cause() {
+        let mut last: HashMap<PathId, (PathEventKindMarker, Instant)> = HashMap::new();
+        let ev = make_event(
+            2,
+            PathEventKind::PathReconnecting {
+                reason: "handshake timed out (6s)".to_string(),
+            },
+        );
+        let out = translate_path_event(&ev, BondEventScope::Output, "out-1", "flow-1", &mut last)
+            .expect("reconnecting must emit an event");
+        assert_eq!(out.severity, EventSeverity::Warning);
+        assert_eq!(out.category, category::BOND);
+        assert!(
+            out.message.contains("reconnecting") && out.message.contains("handshake timed out"),
+            "message must name the specific cause: {}",
+            out.message
+        );
+        let d = out.details.expect("details present");
+        assert_eq!(d["error_code"], "bond_leg_reconnecting");
+        assert_eq!(d["reason"], "handshake timed out (6s)");
     }
 
     #[test]
