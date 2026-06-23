@@ -713,6 +713,7 @@ mod tests {
             interface: "wlo5".into(),
             address: "192.168.100.1:9200".into(),
             source_address: None,
+            gateway: None,
         }];
         let sources = build_sources(&cfgs);
         let src = sources.get("wlo5").expect("source built");
@@ -748,11 +749,13 @@ mod tests {
                 interface: "wlo5".into(),
                 address: "192.168.100.1:9200".into(),
                 source_address: None,
+                gateway: None,
             },
             StarlinkUplinkConfig {
                 interface: "  ".into(),
                 address: "x".into(),
                 source_address: None,
+                gateway: None,
             },
         ];
         let sources = build_sources(&cfgs);
@@ -775,11 +778,13 @@ mod tests {
                 interface: "wlo5".into(),
                 address: "192.168.100.1:9200".into(),
                 source_address: Some("192.168.4.102".into()),
+                gateway: None,
             },
             StarlinkUplinkConfig {
                 interface: "eth2".into(),
                 address: "192.168.100.1:9200".into(),
                 source_address: Some("192.168.5.102".into()),
+                gateway: None,
             },
         ];
         let sources = build_sources(&cfgs);
@@ -794,6 +799,7 @@ mod tests {
             interface: "wlo5".into(),
             address: "192.168.100.1:9200".into(),
             source_address: Some("not-an-ip".into()),
+            gateway: None,
         }]);
         assert_eq!(degraded.len(), 1);
     }

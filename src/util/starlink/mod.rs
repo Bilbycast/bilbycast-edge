@@ -347,6 +347,73 @@ struct DishEventState {
     unreachable: bool,
 }
 
+/// The `/24` network address (subnet) for an IPv4.
+fn slash24(ip: std::net::Ipv4Addr) -> std::net::Ipv4Addr {
+    let o = ip.octets();
+    std::net::Ipv4Addr::new(o[0], o[1], o[2], 0)
+}
+
+/// `.1` of an IPv4's `/24` — the conventional Wi-Fi/router gateway address.
+fn gateway_dot_one(ip: std::net::Ipv4Addr) -> std::net::Ipv4Addr {
+    let o = ip.octets();
+    std::net::Ipv4Addr::new(o[0], o[1], o[2], 1)
+}
+
+/// Derive the Wi-Fi gateway as `.1` of the interface's primary IPv4 `/24`.
+/// `None` if the interface is absent or has no IPv4 yet.
+fn derive_gateway(interface: &str) -> Option<std::net::Ipv4Addr> {
+    let nics = crate::util::network_interfaces::enumerate();
+    let nic = nics.iter().find(|n| n.name == interface)?;
+    let ip = nic
+        .ipv4
+        .iter()
+        .find_map(|a| a.split('/').next().and_then(|s| s.trim().parse().ok()))?;
+    Some(gateway_dot_one(ip))
+}
+
+/// Ensure the host route to a dish's management subnet exists — the edge owns
+/// it (CAP_NET_ADMIN) so the operator never re-adds it by hand after the Wi-Fi
+/// link cycles. Idempotent (add-or-replace) + best-effort: logs at debug and
+/// moves on if it can't program (interface down, no derivable gateway, no
+/// privilege, non-IPv4 dish address).
+async fn ensure_dish_route(uplink: &crate::config::models::StarlinkUplinkConfig) {
+    use std::net::Ipv4Addr;
+    if uplink.interface.trim().is_empty() {
+        return;
+    }
+    let host = uplink
+        .address
+        .split(':')
+        .next()
+        .unwrap_or(uplink.address.as_str());
+    let Ok(dish_ip) = host.trim().parse::<Ipv4Addr>() else {
+        return;
+    };
+    let subnet = slash24(dish_ip);
+    let Some(gateway) = uplink
+        .gateway
+        .as_deref()
+        .and_then(|g| g.trim().parse::<Ipv4Addr>().ok())
+        .or_else(|| derive_gateway(&uplink.interface))
+    else {
+        return;
+    };
+    match crate::engine::bond_routing::BondRouteManager::global().await {
+        Ok(mgr) => {
+            if let Err(e) = mgr
+                .program_dish_route(subnet, 24, gateway, &uplink.interface)
+                .await
+            {
+                tracing::debug!(
+                    "starlink '{}': dish route {subnet}/24 via {gateway} not programmed: {e}",
+                    uplink.interface
+                );
+            }
+        }
+        Err(e) => tracing::debug!("starlink: bond route manager unavailable: {e}"),
+    }
+}
+
 async fn starlink_poller_loop(
     app_config: Arc<RwLock<AppConfig>>,
     cache: Arc<StarlinkCache>,
@@ -374,6 +441,13 @@ async fn starlink_poller_loop(
         if sources_sig.as_deref() != Some(sig.as_str()) {
             sources = grpc::build_sources(&uplinks);
             sources_sig = Some(sig);
+        }
+
+        // 2.5. Keep each dish's host route programmed (the edge owns it so the
+        //      operator never re-adds it by hand after a Wi-Fi link cycle —
+        //      the dish sits off-subnet via the Wi-Fi gateway). Idempotent.
+        for u in &uplinks {
+            ensure_dish_route(u).await;
         }
 
         let mut produced: Vec<(String, StarlinkMetrics)> = Vec::new();
@@ -558,6 +632,17 @@ fn note_unreachable(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::Ipv4Addr;
+
+    #[test]
+    fn dish_route_subnet_and_gateway_derivation() {
+        // Dish 192.168.100.1 → /24 subnet 192.168.100.0, gateway .1.
+        let dish: Ipv4Addr = "192.168.100.1".parse().unwrap();
+        assert_eq!(slash24(dish), Ipv4Addr::new(192, 168, 100, 0));
+        // wlo5's address 192.168.4.102 → Wi-Fi gateway 192.168.4.1.
+        let wlo5_ip: Ipv4Addr = "192.168.4.102".parse().unwrap();
+        assert_eq!(gateway_dot_one(wlo5_ip), Ipv4Addr::new(192, 168, 4, 1));
+    }
 
     fn connected(drop_rate: Option<f32>, obstruction: Option<f32>) -> StarlinkMetrics {
         StarlinkMetrics {

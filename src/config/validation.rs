@@ -2925,6 +2925,18 @@ fn validate_starlink_uplinks(
                 bail!("{ctx}: source_address must be a valid IP address, got '{s}'");
             }
         }
+        // gateway (optional) — must be a valid IP when set (the edge programs
+        // the dish-subnet route via it).
+        if let Some(g) = u
+            .gateway
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            if g.parse::<std::net::IpAddr>().is_err() {
+                bail!("{ctx}: gateway must be a valid IP address, got '{g}'");
+            }
+        }
         by_address
             .entry(addr.to_string())
             .or_default()
@@ -7056,6 +7068,7 @@ mod tests {
             interface: iface.into(),
             address: addr.into(),
             source_address: src.map(|s| s.into()),
+            gateway: None,
         };
         // Single dish, default address, no source bind → OK (the common case).
         assert!(validate_starlink_uplinks(&[mk("wlo5", "192.168.100.1:9200", None)]).is_ok());

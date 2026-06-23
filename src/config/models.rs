@@ -177,6 +177,14 @@ pub struct StarlinkUplinkConfig {
     /// See `docs/starlink.md` ("Multiple dishes on one host").
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_address: Option<String>,
+    /// Optional gateway (the Starlink Wi-Fi router) for the dish's management
+    /// subnet, e.g. `"192.168.4.1"`. When set, the edge programs + re-asserts
+    /// the route to the dish subnet (`<dish>/24 via <gateway> dev <interface>`,
+    /// MAIN table) itself — so the operator never re-adds it by hand after the
+    /// Wi-Fi link cycles. When unset, the edge derives `.1` of the interface's
+    /// IPv4 subnet (the usual Starlink router address).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gateway: Option<String>,
 }
 
 /// The well-known Starlink dish gRPC management endpoint. SpaceX fixes this to

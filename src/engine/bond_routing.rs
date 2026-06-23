@@ -375,6 +375,37 @@ impl BondRouteManager {
         self.handle.route().add(msg).execute().await
     }
 
+    /// Program (add-or-replace, idempotent) a scoped IPv4 route to a
+    /// dish/management subnet via `gateway` out `if_index`, in the MAIN table.
+    /// Keeps the Starlink dish telemetry reachable (e.g. `192.168.100.0/24`
+    /// via the Wi-Fi gateway on `wlo5`) without the operator re-adding the
+    /// route by hand every time the Wi-Fi link cycles. Scoped to a `/24`-ish
+    /// subnet in `main` (never a default route + never a policy rule) so it
+    /// can't shadow the operator's own default route.
+    pub async fn program_dish_route(
+        &self,
+        dest: Ipv4Addr,
+        prefix: u8,
+        gateway: Ipv4Addr,
+        interface: &str,
+    ) -> Result<()> {
+        let if_index = if_index(interface)?;
+        use rtnetlink::RouteMessageBuilder;
+        let msg = RouteMessageBuilder::<Ipv4Addr>::new()
+            .destination_prefix(dest, prefix)
+            .gateway(gateway)
+            .output_interface(if_index)
+            .build();
+        self.handle
+            .route()
+            .add(msg)
+            .replace()
+            .execute()
+            .await
+            .with_context(|| format!("program dish route {dest}/{prefix} via {gateway}"))?;
+        Ok(())
+    }
+
     async fn add_rule(
         &self,
         source: IpAddr,
