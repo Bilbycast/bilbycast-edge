@@ -24,6 +24,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use crate::util::cellular::{CellularCache, CellularMetrics};
+use crate::util::starlink::{StarlinkCache, StarlinkMetrics};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct NetworkInterfaceInfo {
@@ -63,6 +64,12 @@ pub struct NetworkInterfaceInfo {
     /// `None` for non-cellular interfaces and on edges without the poller.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cellular: Option<CellularMetrics>,
+    /// Live Starlink dish state when this interface egresses over a Starlink
+    /// terminal. Joined from the Starlink poller's cache at sample time;
+    /// `None` for non-Starlink interfaces and on edges without the poller.
+    /// Mirror of `bilbycast_edge::util::starlink::StarlinkMetrics`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub starlink: Option<StarlinkMetrics>,
 }
 
 /// Per-tick state needed to derive bandwidth rates from the kernel's
@@ -76,6 +83,9 @@ pub struct NetworkSampler {
     /// `sample()` joins per-interface radio state onto each entry. `None` on
     /// the monitor `/health` path and on edges without the poller.
     cellular_cache: Option<Arc<CellularCache>>,
+    /// Optional handle to the Starlink poller's lock-free cache, joined onto
+    /// `NetworkInterfaceInfo.starlink` the same way as `cellular_cache`.
+    starlink_cache: Option<Arc<StarlinkCache>>,
 }
 
 #[cfg(target_os = "linux")]
@@ -86,11 +96,13 @@ struct LastSample {
 }
 
 impl NetworkSampler {
-    /// Construct a sampler that joins cellular state from the poller's cache.
-    /// (A cache-less sampler is `NetworkSampler::default()`.)
-    pub fn with_cellular_cache(cache: Arc<CellularCache>) -> Self {
+    /// Construct a sampler that joins both cellular and Starlink radio/link
+    /// state from the pollers' caches. (A cache-less sampler is
+    /// `NetworkSampler::default()`.)
+    pub fn with_caches(cellular: Arc<CellularCache>, starlink: Arc<StarlinkCache>) -> Self {
         Self {
-            cellular_cache: Some(cache),
+            cellular_cache: Some(cellular),
+            starlink_cache: Some(starlink),
             ..Default::default()
         }
     }
@@ -146,6 +158,12 @@ impl NetworkSampler {
                 entry.cellular = cache.get(&entry.name);
             }
         }
+        // Join Starlink dish state the same way — lock-free, off the data path.
+        if let Some(cache) = &self.starlink_cache {
+            for entry in out.iter_mut() {
+                entry.starlink = cache.get(&entry.name);
+            }
+        }
         out
     }
 }
@@ -186,6 +204,7 @@ pub fn enumerate() -> Vec<NetworkInterfaceInfo> {
                 rx_errors: None,
                 tx_errors: None,
                 cellular: None,
+                starlink: None,
             });
         match iface.ip() {
             IpAddr::V4(v4) => entry.ipv4.push(v4.to_string()),
@@ -301,6 +320,7 @@ mod tests {
             rx_errors: Some(0),
             tx_errors: Some(0),
             cellular: None,
+            starlink: None,
         };
         let v = serde_json::to_value(&info).unwrap();
         assert_eq!(v["name"], "eth0");
@@ -333,12 +353,17 @@ mod tests {
             rx_errors: None,
             tx_errors: None,
             cellular: None,
+            starlink: None,
         };
         let v = serde_json::to_value(&info).unwrap();
         assert!(v.get("mac").is_none(), "mac should be omitted when None");
         assert!(
             v.get("cellular").is_none(),
             "cellular should be omitted when None"
+        );
+        assert!(
+            v.get("starlink").is_none(),
+            "starlink should be omitted when None"
         );
         assert!(v.get("mtu").is_none(), "mtu should be omitted when None");
         assert!(v.get("link_speed_mbps").is_none(), "link_speed_mbps should be omitted when None");

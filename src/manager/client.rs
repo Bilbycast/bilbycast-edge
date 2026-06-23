@@ -210,6 +210,7 @@ pub fn start_manager_client(
     live_gpu: Arc<crate::engine::hardware_probe::LiveUtilizationState>,
     standby_listeners: Option<Arc<crate::engine::standby_listeners::StandbyListenerManager>>,
     cellular_cache: Arc<crate::util::cellular::CellularCache>,
+    starlink_cache: Arc<crate::util::starlink::StarlinkCache>,
     start_time: Instant,
     manager_link: Arc<crate::manager::link_state::ManagerLinkState>,
 ) -> tokio::task::JoinHandle<()> {
@@ -217,7 +218,8 @@ pub fn start_manager_client(
         manager_client_loop(
             config, flow_manager, tunnel_manager, ws_stats_rx, app_config, config_path,
             secrets_path, api_addr, monitor_addr, webrtc_sessions, event_rx, resource_state,
-            static_caps, live_gpu, standby_listeners, cellular_cache, start_time, manager_link,
+            static_caps, live_gpu, standby_listeners, cellular_cache, starlink_cache, start_time,
+            manager_link,
         ).await;
     })
 }
@@ -239,6 +241,7 @@ async fn manager_client_loop(
     live_gpu: Arc<crate::engine::hardware_probe::LiveUtilizationState>,
     standby_listeners: Option<Arc<crate::engine::standby_listeners::StandbyListenerManager>>,
     cellular_cache: Arc<crate::util::cellular::CellularCache>,
+    starlink_cache: Arc<crate::util::starlink::StarlinkCache>,
     start_time: Instant,
     manager_link: Arc<crate::manager::link_state::ManagerLinkState>,
 ) {
@@ -286,6 +289,7 @@ async fn manager_client_loop(
             &live_gpu,
             &standby_listeners,
             &cellular_cache,
+            &starlink_cache,
             start_time,
             &manager_link,
         )
@@ -371,6 +375,7 @@ async fn try_connect(
     live_gpu: &Arc<crate::engine::hardware_probe::LiveUtilizationState>,
     standby_listeners: &Option<Arc<crate::engine::standby_listeners::StandbyListenerManager>>,
     cellular_cache: &Arc<crate::util::cellular::CellularCache>,
+    starlink_cache: &Arc<crate::util::starlink::StarlinkCache>,
     start_time: Instant,
     manager_link: &Arc<crate::manager::link_state::ManagerLinkState>,
 ) -> Result<ConnectResult, String> {
@@ -553,8 +558,10 @@ async fn try_connect(
     // iface) lives here so deltas survive across health ticks. The
     // first sample after auth has no prior counters, so rx_bps / tx_bps
     // come back as None on tick #1; from tick #2 onwards they're real.
-    let mut network_sampler =
-        crate::util::network_interfaces::NetworkSampler::with_cellular_cache(cellular_cache.clone());
+    let mut network_sampler = crate::util::network_interfaces::NetworkSampler::with_caches(
+        cellular_cache.clone(),
+        starlink_cache.clone(),
+    );
 
     // Send initial health
     let health = build_health_message(
@@ -566,6 +573,7 @@ async fn try_connect(
         live_gpu,
         Some(&mut network_sampler),
         Some(cellular_cache),
+        Some(starlink_cache),
         start_time,
     );
     if let Ok(json) = serde_json::to_string(&health) {
@@ -744,6 +752,7 @@ async fn try_connect(
                         live_gpu,
                         Some(&mut network_sampler),
                         Some(cellular_cache),
+                        Some(starlink_cache),
                         start_time,
                     )
                 });
@@ -840,12 +849,13 @@ fn build_health_message(
     live_gpu: &crate::engine::hardware_probe::LiveUtilizationState,
     network_sampler: Option<&mut crate::util::network_interfaces::NetworkSampler>,
     cellular_cache: Option<&Arc<crate::util::cellular::CellularCache>>,
+    starlink_cache: Option<&Arc<crate::util::starlink::StarlinkCache>>,
     start_time: Instant,
 ) -> serde_json::Value {
     serde_json::json!({
         "type": "health",
         "timestamp": chrono::Utc::now().to_rfc3339(),
-        "payload": build_health_payload(flow_manager, api_addr, monitor_addr, resource_state, static_caps, live_gpu, network_sampler, cellular_cache, start_time)
+        "payload": build_health_payload(flow_manager, api_addr, monitor_addr, resource_state, static_caps, live_gpu, network_sampler, cellular_cache, starlink_cache, start_time)
     })
 }
 
@@ -858,6 +868,7 @@ pub(crate) fn build_health_payload(
     live_gpu: &crate::engine::hardware_probe::LiveUtilizationState,
     network_sampler: Option<&mut crate::util::network_interfaces::NetworkSampler>,
     cellular_cache: Option<&Arc<crate::util::cellular::CellularCache>>,
+    starlink_cache: Option<&Arc<crate::util::starlink::StarlinkCache>>,
     start_time: Instant,
 ) -> serde_json::Value {
     // Capabilities are mostly compile-time/probe-derived; the `"cellular"` bit
@@ -874,6 +885,12 @@ pub(crate) fn build_health_payload(
         if crate::util::cellular::wake_control_available() {
             caps.push("cellular-control");
         }
+    }
+    // `"starlink"` is the dish-telemetry sibling of `"cellular"` — advertised
+    // whenever the Starlink poller has at least one configured dish, so the UI
+    // gates the dish signal strip + bond-leg strip on it.
+    if starlink_cache.map(|c| c.has_sources()).unwrap_or(false) {
+        caps.push("starlink");
     }
     #[allow(unused_mut)]
     let mut payload = serde_json::json!({
@@ -2815,6 +2832,10 @@ async fn execute_command(
                 // copy a manager-added uplink is parsed + ACKed but silently
                 // dropped on apply (never reaches the poller or config.json).
                 cfg.cellular_uplinks = new_config.cellular_uplinks.clone();
+                // Starlink dish telemetry sources — same live-poller + silent-drop
+                // class as cellular_uplinks above; the poller re-reads these from
+                // the live AppConfig each cycle.
+                cfg.starlink_uplinks = new_config.starlink_uplinks.clone();
                 // Same silent-drop class as cellular_uplinks above: these were
                 // restored-if-None from old_config earlier, but a manager-pushed
                 // NEW value must also be applied here or it's ACKed yet lost.
@@ -2919,6 +2940,58 @@ async fn execute_command(
                     "band": m.band,
                     "signal": m.signal,
                     "state": m.state,
+                }),
+                Err(reason) => serde_json::json!({ "ok": false, "error": reason }),
+            };
+            Ok(Some(result))
+        }
+        // Probe a Starlink dish's reachability without persisting — mirrors
+        // `test_cellular_uplink`. Runs one `get_status` gRPC round-trip against
+        // the supplied (or stored) address and returns the decoded link state or
+        // the failure cause, so the dish endpoint / route are validated at config
+        // time instead of save-and-pray.
+        "test_starlink_uplink" => {
+            use crate::config::models::StarlinkUplinkConfig;
+            let interface = action["interface"]
+                .as_str()
+                .filter(|s| !s.is_empty())
+                .unwrap_or("test")
+                .to_string();
+            let address = action["address"]
+                .as_str()
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .unwrap_or(crate::config::models::DEFAULT_DISH_ADDR)
+                .to_string();
+            let source_address = action["source_address"]
+                .as_str()
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string());
+            let probe = StarlinkUplinkConfig {
+                interface,
+                address,
+                source_address,
+            };
+            let sources = crate::util::starlink::grpc::build_sources(std::slice::from_ref(&probe));
+            let src = sources
+                .values()
+                .next()
+                .ok_or("test_starlink_uplink: could not build probe (check interface/address)")?;
+            let result = match src.sample().await {
+                Ok(m) => serde_json::json!({
+                    "ok": true,
+                    "state": m.state,
+                    "software_version": m.software_version,
+                    "hardware_version": m.hardware_version,
+                    "device_id": m.device_id,
+                    "obstruction_fraction": m.obstruction_fraction,
+                    "pop_ping_latency_ms": m.pop_ping_latency_ms,
+                    "pop_ping_drop_rate": m.pop_ping_drop_rate,
+                    "downlink_bps": m.downlink_bps,
+                    "uplink_bps": m.uplink_bps,
+                    "bars": m.bars,
+                    "alerts": m.alerts,
                 }),
                 Err(reason) => serde_json::json!({ "ok": false, "error": reason }),
             };

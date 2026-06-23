@@ -70,6 +70,9 @@ pub fn validate_config(config: &AppConfig) -> Result<()> {
     // Validate cellular-uplink telemetry sources (read-only RutOS routers).
     validate_cellular_uplinks(&config.cellular_uplinks)?;
 
+    // Validate Starlink dish telemetry sources (read-only, no credential).
+    validate_starlink_uplinks(&config.starlink_uplinks)?;
+
     // Validate TLS config if present
     if let Some(ref tls) = config.server.tls {
         if tls.cert_path.is_empty() {
@@ -2876,6 +2879,86 @@ fn validate_name(name: &str, context: &str) -> Result<()> {
 
 /// Validate the optional `cellular_uplinks` list (read-only RutOS telemetry).
 /// Bounds every operator-supplied string and rejects duplicate interfaces.
+/// Validate the optional `starlink_uplinks` list (read-only dish telemetry).
+/// Bounds the interface + address strings and rejects duplicate interfaces.
+/// There is no credential to validate — the dish gRPC is unauthenticated.
+fn validate_starlink_uplinks(
+    uplinks: &[crate::config::models::StarlinkUplinkConfig],
+) -> Result<()> {
+    let mut seen = std::collections::HashSet::new();
+    // Track which source_addresses are bound to each dish address, so a
+    // multi-dish config that would collide (two dishes at the same address with
+    // no — or duplicate — source binding) is rejected at config time.
+    let mut by_address: std::collections::HashMap<String, Vec<Option<String>>> =
+        std::collections::HashMap::new();
+    for u in uplinks {
+        let ctx = format!("starlink_uplink '{}'", u.interface);
+        if u.interface.trim().is_empty() {
+            bail!("starlink_uplink: interface cannot be empty");
+        }
+        if u.interface.len() > 64 {
+            bail!("{ctx}: interface must be at most 64 characters");
+        }
+        if !seen.insert(u.interface.as_str()) {
+            bail!("starlink_uplink: duplicate interface '{}'", u.interface);
+        }
+        // address — a bare host or host:port (no scheme/path), DNS-style bounds.
+        let addr = u.address.trim();
+        if addr.is_empty() {
+            bail!("{ctx}: address cannot be empty");
+        }
+        if addr.len() > 253 {
+            bail!("{ctx}: address must be at most 253 characters");
+        }
+        if addr.contains("://") || addr.contains('/') {
+            bail!("{ctx}: address must be a bare host or host:port (no scheme or path)");
+        }
+        // source_address (optional) — must be a valid IP when set (it is bound
+        // via local_address, so a hostname is not valid here).
+        let src = u
+            .source_address
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        if let Some(s) = src {
+            if s.parse::<std::net::IpAddr>().is_err() {
+                bail!("{ctx}: source_address must be a valid IP address, got '{s}'");
+            }
+        }
+        by_address
+            .entry(addr.to_string())
+            .or_default()
+            .push(src.map(str::to_string));
+    }
+    // Collision rule: when >1 dish shares the same address (the common case —
+    // every Starlink dish uses the same management IP), each MUST carry a
+    // distinct source_address so a per-leg policy route can disambiguate egress.
+    for (addr, srcs) in &by_address {
+        if srcs.len() < 2 {
+            continue;
+        }
+        let mut distinct = std::collections::HashSet::new();
+        for s in srcs {
+            match s {
+                None => bail!(
+                    "starlink_uplink: {} dishes share address '{addr}' — every Starlink dish \
+                     uses the same management IP, so each needs a distinct source_address (the \
+                     leg's source IP) plus a per-leg policy route to disambiguate egress",
+                    srcs.len()
+                ),
+                Some(ip) => {
+                    if !distinct.insert(ip) {
+                        bail!(
+                            "starlink_uplink: duplicate source_address '{ip}' for address '{addr}'"
+                        );
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 fn validate_cellular_uplinks(uplinks: &[crate::config::models::CellularUplinkConfig]) -> Result<()> {
     let mut seen = std::collections::HashSet::new();
     for u in uplinks {
@@ -6965,6 +7048,54 @@ mod tests {
         AssembledProgram, AssembledStream, AssemblyKind, EssenceKind, FlowAssembly, PcrSource,
         SlotSource, TsPidOverridesEntry, TsPidOverridesMap,
     };
+
+    #[test]
+    fn starlink_uplinks_multi_dish_collision_rules() {
+        use crate::config::models::StarlinkUplinkConfig;
+        let mk = |iface: &str, addr: &str, src: Option<&str>| StarlinkUplinkConfig {
+            interface: iface.into(),
+            address: addr.into(),
+            source_address: src.map(|s| s.into()),
+        };
+        // Single dish, default address, no source bind → OK (the common case).
+        assert!(validate_starlink_uplinks(&[mk("wlo5", "192.168.100.1:9200", None)]).is_ok());
+        // Two dishes at the same address, each with a distinct source IP → OK.
+        assert!(
+            validate_starlink_uplinks(&[
+                mk("wlo5", "192.168.100.1:9200", Some("192.168.4.102")),
+                mk("eth2", "192.168.100.1:9200", Some("192.168.5.102")),
+            ])
+            .is_ok()
+        );
+        // Same address, one leg missing source_address → collision, rejected.
+        assert!(
+            validate_starlink_uplinks(&[
+                mk("wlo5", "192.168.100.1:9200", Some("192.168.4.102")),
+                mk("eth2", "192.168.100.1:9200", None),
+            ])
+            .is_err()
+        );
+        // Same address with duplicate source_address → rejected.
+        assert!(
+            validate_starlink_uplinks(&[
+                mk("wlo5", "192.168.100.1:9200", Some("192.168.4.102")),
+                mk("eth2", "192.168.100.1:9200", Some("192.168.4.102")),
+            ])
+            .is_err()
+        );
+        // Distinct addresses don't need source binding.
+        assert!(
+            validate_starlink_uplinks(&[
+                mk("wlo5", "192.168.100.1:9200", None),
+                mk("eth2", "10.9.9.1:9200", None),
+            ])
+            .is_ok()
+        );
+        // Invalid source IP → rejected.
+        assert!(
+            validate_starlink_uplinks(&[mk("wlo5", "192.168.100.1:9200", Some("nope"))]).is_err()
+        );
+    }
 
     #[test]
     fn apn_validation_accepts_real_apns_rejects_injection() {

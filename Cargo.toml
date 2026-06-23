@@ -418,8 +418,10 @@ default-features = false
 #  - WebRTC WHIP client signaling (feature-gated imports inside engine::webrtc)
 #  - CMAF output HTTP push ingest (segment / init / manifest PUTs)
 # rustls is the only TLS backend; `stream` enables Body::wrap_stream for
-# streaming uploads (CMAF-LL chunked transfer).
-features = ["rustls", "stream"]
+# streaming uploads (CMAF-LL chunked transfer). `http2` carries cleartext
+# HTTP/2 (h2c) prior-knowledge support for the hand-rolled Starlink dish
+# gRPC client in util::starlink (no tonic/prost — pure-Rust, purity holds).
+features = ["rustls", "stream", "http2"]
 
 [dependencies.retina]
 version = "0.4.19"

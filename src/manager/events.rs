@@ -643,6 +643,14 @@ pub mod category {
     /// `cellular_signal_recovered` / `cellular_uplink_unreachable` /
     /// `cellular_uplink_recovered`.
     pub const CELLULAR: &str = "cellular";
+
+    /// Starlink dish telemetry. `info` for state changes + obstruction-cleared
+    /// + uplink recovery, `warning` for obstruction / hardware alert / uplink
+    /// unreachable. `details.error_code` is one of `starlink_state_changed` /
+    /// `starlink_obstructed` / `starlink_obstruction_cleared` /
+    /// `starlink_alert` / `starlink_uplink_unreachable` /
+    /// `starlink_uplink_recovered`.
+    pub const STARLINK: &str = "starlink";
 }
 
 /// Scope label passed to [`run_bond_event_forwarder`] so generated

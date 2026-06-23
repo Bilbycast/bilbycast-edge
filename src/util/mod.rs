@@ -19,6 +19,7 @@ pub mod ptp_config;
 pub mod rtp_parse;
 pub mod runtime_diag;
 pub mod socket;
+pub mod starlink;
 pub mod time;
 pub mod tls;
 pub mod url_parse;

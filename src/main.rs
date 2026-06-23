@@ -684,6 +684,18 @@ async fn main() -> anyhow::Result<()> {
         shutdown_token.clone(),
     );
 
+    // Starlink dish telemetry — polls any configured dish over its local gRPC
+    // (off the data path). Sibling to the cellular poller: the cache is shared
+    // with the manager client (joined onto network_interfaces + drives the
+    // `"starlink"` capability). No-op overhead when no dish is configured.
+    let starlink_cache = std::sync::Arc::new(util::starlink::StarlinkCache::new());
+    let _starlink_poller_handle = util::starlink::spawn_starlink_poller(
+        state.config.clone(),
+        starlink_cache.clone(),
+        event_sender.clone(),
+        shutdown_token.clone(),
+    );
+
     // Spawn system resource monitor (CPU, RAM, optional NVIDIA GPU util)
     let _resource_monitor_handle = engine::resource_monitor::spawn_resource_monitor(
         app_config.resource_limits.clone(),
@@ -766,6 +778,7 @@ async fn main() -> anyhow::Result<()> {
                 live_gpu_state.clone(),
                 Some(standby_listeners.clone()),
                 cellular_cache.clone(),
+                starlink_cache.clone(),
                 state.start_time,
                 manager_link.clone(),
             );

@@ -493,6 +493,23 @@ Debounced so a flapping link doesn't spam the feed. See
 | info | `cellular uplink '<iface>' reachable again` | A RutOS poll succeeds after being unreachable. | `cellular_uplink_recovered` |
 | warning | `cellular uplink '<iface>' is <state> with no keep-alive daemon …` | A modem source is `disabled`/`searching` for 3 cycles with no host keeper running, so it can't be woken from the UI. Provision `bilbycast-cellular-modem.service`. Also carries `details.state`. | `cellular_keeper_missing` |
 
+### Starlink dish events (`starlink`)
+
+Surfaced by the Starlink telemetry poller (`src/util/starlink`) for an interface
+that egresses over a Starlink terminal (the edge polls the dish's local gRPC).
+Node-level (no `flow_id`); all carry `details.error_code` + `details.interface`.
+Debounced so a flapping link doesn't spam the feed. See
+[`docs/starlink.md`](starlink.md).
+
+| Severity | Message | Trigger | `details.error_code` |
+|----------|---------|---------|----------------------|
+| info / warning | `starlink uplink '<iface>' <from> → <to>` | Dish connectivity-state transition. Warning when the new state is `unknown` (an unmapped dish state), else info. A dish that stops responding surfaces via `starlink_uplink_unreachable`, not as an offline transition here. Carries `details.from` / `details.to`. | `starlink_state_changed` |
+| warning | `starlink uplink '<iface>' obstructed` | The dish reports a current sky obstruction (enter; hysteresis). Carries `details.obstruction_fraction`. | `starlink_obstructed` |
+| info | `starlink uplink '<iface>' obstruction cleared` | The obstruction clears and the rolling fraction is low. | `starlink_obstruction_cleared` |
+| warning | `starlink uplink '<iface>' alert: <name>` | A dish hardware alert (e.g. `thermal_throttle`, `motors_stuck`) becomes active — once per newly-raised alert. Carries `details.alert`. | `starlink_alert` |
+| warning | `starlink uplink '<iface>' unreachable` | The dish gRPC poll has failed 3 cycles in a row. | `starlink_uplink_unreachable` |
+| info | `starlink uplink '<iface>' reachable again` | The dish poll succeeds after being unreachable. | `starlink_uplink_recovered` |
+
 ### Configuration (`config`)
 
 | Severity | Message | Trigger |

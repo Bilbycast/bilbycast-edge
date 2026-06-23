@@ -76,6 +76,7 @@ async fn monitor_health(State(state): State<MonitorState>) -> Json<serde_json::V
         &state.live_gpu,
         None, // network sampler — stateless enumeration on the monitor path
         None, // cellular cache — capability advertised via the manager path
+        None, // starlink cache — capability advertised via the manager path
         state.app.start_time,
     );
     // Inject the device-local manager-link indicator. This is the edge's OWN

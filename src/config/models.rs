@@ -90,6 +90,13 @@ pub struct AppConfig {
     /// Read-only; off the data path. See `docs/cellular.md`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub cellular_uplinks: Vec<CellularUplinkConfig>,
+    /// Optional Starlink dish telemetry sources. Each entry names the kernel
+    /// netdev to annotate and the dish gRPC address (default
+    /// `192.168.100.1:9200`). Read-only; off the data path. No credential is
+    /// needed — the dish gRPC is unauthenticated on the LAN. See
+    /// `docs/starlink.md`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub starlink_uplinks: Vec<StarlinkUplinkConfig>,
 }
 
 /// One opt-in cellular-uplink telemetry source. Only RutOS routers need an
@@ -143,6 +150,47 @@ fn default_cellular_api() -> String {
     "ubus".to_string()
 }
 
+/// One opt-in Starlink dish telemetry source. The dish link state read from
+/// this source is attached, read-only, to the kernel `interface` it annotates
+/// (`HealthPayload.network_interfaces[].starlink`).
+///
+/// Unlike [`CellularUplinkConfig`] there is **no credential / secret** — the
+/// dish gRPC is unauthenticated on the LAN, so this whole struct lives in
+/// `config.json` with nothing split into `secrets.json`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct StarlinkUplinkConfig {
+    /// Kernel netdev this annotates, e.g. `"wlo5"`.
+    pub interface: String,
+    /// Dish gRPC endpoint `host[:port]` (no scheme / path). Defaults to the
+    /// well-known dish management address `192.168.100.1:9200`; the port
+    /// defaults to 9200 when omitted.
+    #[serde(default = "default_starlink_address")]
+    pub address: String,
+    /// Optional source IP to bind this dish's poll to. **Only needed for more
+    /// than one dish on the same host:** every Starlink dish hard-codes the
+    /// identical management address (`192.168.100.1:9200`), so two dishes on
+    /// different interfaces collide on the host route. Set each leg's source IP
+    /// here (the edge binds the poll to it via `local_address`) and add a
+    /// per-leg policy route on the host (`ip rule from <source_address> table N`
+    /// + the dish route in table N) so each poll egresses the right interface.
+    /// Unset (single dish) → no bind; the main-table route is used (unchanged).
+    /// See `docs/starlink.md` ("Multiple dishes on one host").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_address: Option<String>,
+}
+
+/// The well-known Starlink dish gRPC management endpoint. SpaceX fixes this to
+/// the same value on every terminal, so it's a sensible default — but it is only
+/// a default: each uplink's `address` is fully operator-overridable (e.g. a
+/// re-IP'd dish, a different management address, or a NATed reach). The single
+/// source of truth referenced by the config default, the gRPC probe fallback,
+/// and the manager `test_starlink_uplink` handler.
+pub const DEFAULT_DISH_ADDR: &str = "192.168.100.1:9200";
+
+fn default_starlink_address() -> String {
+    DEFAULT_DISH_ADDR.to_string()
+}
+
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
@@ -164,6 +212,7 @@ impl Default for AppConfig {
             nmos_registration: None,
             upgrades: None,
             cellular_uplinks: Vec::new(),
+            starlink_uplinks: Vec::new(),
         }
     }
 }
@@ -6419,6 +6468,7 @@ mod tests {
             nmos_registration: None,
             upgrades: None,
             cellular_uplinks: Vec::new(),
+            starlink_uplinks: Vec::new(),
             inputs: vec![InputDefinition {
                 active: true,
                 group: None,
