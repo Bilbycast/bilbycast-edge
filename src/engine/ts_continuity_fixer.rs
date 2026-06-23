@@ -488,18 +488,31 @@ impl TsContinuityFixer {
             let needs_di = self.pending_di_on_pcr && extract_pcr(pkt).is_some();
 
             if !ts_has_payload(pkt) {
-                // Adaptation-only packets: CC does not increment per spec.
-                // Pass through unchanged unless we need to set DI.
+                // Adaptation-only packets: CC MUST NOT increment per
+                // H.222.0 §2.4.3.3 — it must carry the same CC as the last
+                // PAYLOAD-bearing packet on this PID. While we re-stamp
+                // payload CC (post-switch / post-source-discontinuity), our
+                // emitted payload CC diverges from the source CC, so passing
+                // the source CC through here drifts by the count of
+                // dropped-and-not-recovered payload packets and trips a
+                // TR 101 290 continuity_count_error on every PCR-only packet.
+                // Pin to our own emitted last_out_cc (mirrors the AF-only
+                // handling in input_media_player::rewrite_cc / ts_assembler).
+                let mut ts_pkt = [0u8; TS_PACKET_SIZE];
+                ts_pkt.copy_from_slice(pkt);
+                if let Some(state) = self.pid_state.get(&pid) {
+                    let pinned = state.last_out_cc & 0x0F;
+                    if (ts_pkt[3] & 0x0F) != pinned {
+                        ts_pkt[3] = (ts_pkt[3] & 0xF0) | pinned;
+                        modified = true;
+                    }
+                }
                 if needs_di {
-                    let mut ts_pkt = [0u8; TS_PACKET_SIZE];
-                    ts_pkt.copy_from_slice(pkt);
                     set_discontinuity_indicator(&mut ts_pkt);
                     self.pending_di_on_pcr = false;
                     modified = true;
-                    out.extend_from_slice(&ts_pkt);
-                } else {
-                    out.extend_from_slice(pkt);
                 }
+                out.extend_from_slice(&ts_pkt);
                 continue;
             }
 
