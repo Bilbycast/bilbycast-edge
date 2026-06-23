@@ -67,7 +67,10 @@
 #   BILBYCAST_PTP_FORCE_SW     set =1 to force software timestamping
 #   BILBYCAST_PTP_MODE         grandmaster | slave-only | auto (--mode wins)
 #   BILBYCAST_PTP_DOMAIN       PTP domain number (--domain wins; config default 127)
-#   BILBYCAST_PTP_PRIORITY1    BMCA priority1 (--priority1 wins; default 128 for GM, 255 for slave)
+#   BILBYCAST_PTP_PRIORITY1    BMCA priority1 for grandmaster/auto-GM (--priority1
+#                              wins; default 128). IGNORED for slave-only — always
+#                              forced to 255 so the node never wins BMCA against
+#                              the external grandmaster.
 #   BILBYCAST_PTP_SCAN_TIMEOUT seconds the auto-mode listener waits for Announce (default 5)
 #   BILBYCAST_PTP_RUN_DIR      PID dir (default /var/run/bilbycast-ptp)
 #   BILBYCAST_PTP_LOG_DIR      log dir (default /var/log/bilbycast-ptp)
@@ -470,10 +473,27 @@ cmd_start() {
         *) fail "unknown --mode '$role' (expected: auto, grandmaster, slave-only, off)" ;;
     esac
 
-    # Default priority1 per role; --priority1 overrides.
-    local default_priority1=128
-    [ "$role" = "slave-only" ] && default_priority1=255
-    local priority1="${PRIORITY1_FLAG:-${BILBYCAST_PTP_PRIORITY1:-$default_priority1}}"
+    # priority1 by role. For slave-only the value is FORCED to 255 (max /
+    # worst) and any operator override is IGNORED: priority1 is compared
+    # BEFORE clockClass in the BMCA dataset comparison, so a lower value
+    # makes a slaveOnly clock "win" against a real grandmaster — ptp4l then
+    # logs "master state recommended in slave only mode" /
+    # "defaultDS.priority1 probably misconfigured" and flaps forever,
+    # never locking. An operator --priority1 is honoured only for
+    # grandmaster, where a lower value is how you intentionally win BMCA.
+    # `auto` is resolved to a concrete role above, so an auto-that-becomes-
+    # slave lands here as slave-only and is likewise pinned to 255. This is
+    # the bedrock guarantee — it also corrects a hand-edited ptp.conf that
+    # left a stale grandmaster priority1 in place. See docs/ptp.md.
+    local priority1
+    if [ "$role" = "slave-only" ]; then
+        priority1=255
+        if [ -n "$PRIORITY1_FLAG" ] && [ "$PRIORITY1_FLAG" != "255" ]; then
+            log "slave-only: ignoring priority1=$PRIORITY1_FLAG and forcing 255 (a lower value would stop this node locking to the external grandmaster)"
+        fi
+    else
+        priority1="${PRIORITY1_FLAG:-${BILBYCAST_PTP_PRIORITY1:-128}}"
+    fi
     local domain="${DOMAIN_FLAG:-${BILBYCAST_PTP_DOMAIN:-127}}"
 
     stage_conf "$role" "$priority1"

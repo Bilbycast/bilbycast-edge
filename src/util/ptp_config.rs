@@ -17,7 +17,8 @@
 //! mode         = auto | grandmaster | slave-only | off
 //! iface        = eno4              # blank → script auto-picks
 //! domain       = 127               # blank → 127 (SMPTE)
-//! priority1    =                   # blank → role default (128 / 255)
+//! priority1    =                   # grandmaster/auto tunable (blank → 128);
+//!                                  # slave-only is ALWAYS 255 (any value ignored)
 //! scan_timeout = 5                 # auto-mode listener window
 //! ```
 //!
@@ -97,6 +98,27 @@ pub struct PtpSettings {
 }
 
 impl PtpSettings {
+    /// The BMCA `priority1` actually written to ptp4l for the current mode.
+    ///
+    /// A slave-only clock MUST never win BMCA, so it is pinned to **255**
+    /// (max / worst) and any operator value is ignored: `priority1` is
+    /// compared *before* `clockClass` in the BMCA dataset comparison, so a
+    /// lower value (e.g. a grandmaster priority left over from a mode
+    /// switch) makes the `slaveOnly` clock "win" against a real grandmaster.
+    /// ptp4l then logs `master state recommended in slave only mode` /
+    /// `defaultDS.priority1 probably misconfigured` and flaps forever,
+    /// never locking. For every other mode the operator value is honoured
+    /// (a lower value is how you intentionally win as grandmaster); blank
+    /// falls through to the helper script's role default (128 for GM). `auto`
+    /// is deliberately NOT forced here — the helper resolves it to a concrete
+    /// role and pins 255 itself if it lands on slave.
+    pub fn effective_priority1(&self) -> Option<u8> {
+        match self.mode {
+            PtpMode::SlaveOnly => Some(255),
+            _ => self.priority1,
+        }
+    }
+
     /// Render to the on-disk KEY=VALUE format. Stable enough that
     /// hand-editors and the manager UI can both produce/consume it.
     pub fn render(&self) -> String {
@@ -113,7 +135,7 @@ impl PtpSettings {
         ));
         out.push_str(&format!(
             "priority1    = {}\n",
-            self.priority1.map(|p| p.to_string()).unwrap_or_default()
+            self.effective_priority1().map(|p| p.to_string()).unwrap_or_default()
         ));
         out.push_str(&format!(
             "scan_timeout = {}\n",
@@ -171,6 +193,12 @@ impl PtpSettings {
     /// stored value silently — manager UI should pre-clamp too so
     /// the operator sees the clamped value.
     pub fn normalised(mut self) -> Self {
+        // Pin slave-only to priority1=255 (see `effective_priority1`) so the
+        // persisted value, the echo returned to the manager UI, and the file
+        // the helper reads all agree. Both edge entry points (`set_ptp_mode`
+        // WS + the REST mirror) call this before validate + save, so a stale
+        // grandmaster priority1 carried into slave-only never reaches ptp4l.
+        self.priority1 = self.effective_priority1();
         if let Some(t) = self.scan_timeout {
             if !(1..=60).contains(&t) {
                 self.scan_timeout = Some(t.clamp(1, 60));
@@ -395,6 +423,64 @@ mod tests {
     fn unknown_mode_falls_back_to_off() {
         let parsed = PtpSettings::parse("mode = sometimes\n");
         assert_eq!(parsed.mode, PtpMode::Off);
+    }
+
+    #[test]
+    fn slave_only_forces_priority1_255() {
+        // A stale grandmaster priority1 (e.g. 100) carried into slave-only
+        // must be pinned to 255 — priority1 is compared before clockClass, so
+        // a lower value makes the slaveOnly clock win BMCA and never lock.
+        let s = PtpSettings {
+            mode: PtpMode::SlaveOnly,
+            priority1: Some(100),
+            ..Default::default()
+        };
+        assert_eq!(s.effective_priority1(), Some(255));
+        let n = s.normalised();
+        assert_eq!(n.priority1, Some(255));
+        assert!(n.render().contains("priority1    = 255"));
+    }
+
+    #[test]
+    fn slave_only_blank_priority1_renders_255() {
+        // Even an unset priority1 renders 255 on disk for slave-only, so the
+        // helper passes --priority1 255 instead of relying on a default.
+        let s = PtpSettings {
+            mode: PtpMode::SlaveOnly,
+            priority1: None,
+            ..Default::default()
+        };
+        assert!(s.render().contains("priority1    = 255"));
+        assert_eq!(s.normalised().priority1, Some(255));
+    }
+
+    #[test]
+    fn grandmaster_priority1_preserved() {
+        // Grandmaster is where a low priority1 is meaningful (win BMCA) — it
+        // must NOT be clobbered by the slave-only rule.
+        let s = PtpSettings {
+            mode: PtpMode::Grandmaster,
+            priority1: Some(100),
+            ..Default::default()
+        };
+        assert_eq!(s.effective_priority1(), Some(100));
+        assert!(s.render().contains("priority1    = 100"));
+        assert_eq!(s.normalised().priority1, Some(100));
+    }
+
+    #[test]
+    fn auto_priority1_not_forced() {
+        // `auto` resolves its role in the helper script; the edge must not pin
+        // it (a node that auto-resolves to grandmaster keeps its tuned value;
+        // the helper forces 255 itself if it resolves to slave).
+        let s = PtpSettings {
+            mode: PtpMode::Auto,
+            priority1: Some(64),
+            ..Default::default()
+        };
+        assert_eq!(s.effective_priority1(), Some(64));
+        assert!(s.render().contains("priority1    = 64"));
+        assert_eq!(s.normalised().priority1, Some(64));
     }
 
     #[test]

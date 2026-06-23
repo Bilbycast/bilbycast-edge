@@ -114,9 +114,26 @@ impl PtpConfig {
             args.push("--domain".into());
             args.push(self.domain.clone().into());
         }
-        if !self.priority1.is_empty() {
+        // A slave-only clock MUST forward priority1=255 (max / worst). BMCA
+        // compares priority1 before clockClass, so a lower value makes the
+        // slaveOnly node win against a real grandmaster and then refuse the
+        // master role — it flaps and never locks. Force it here so the helper
+        // self-heals a hand-edited ptp.conf that left a stale grandmaster
+        // priority1, and so an OLDER bilbycast-ptp-gm.sh (e.g. on a node whose
+        // script wasn't refreshed by a remote binary upgrade) still receives
+        // 255. The script forces 255 too; this is the forwarding-layer
+        // belt-and-braces. Mirrors PtpSettings::effective_priority1.
+        let effective_priority1 = if matches!(
+            self.mode.to_ascii_lowercase().as_str(),
+            "slave-only" | "slave"
+        ) {
+            "255".to_string()
+        } else {
+            self.priority1.clone()
+        };
+        if !effective_priority1.is_empty() {
             args.push("--priority1".into());
-            args.push(self.priority1.clone().into());
+            args.push(effective_priority1.into());
         }
         if !self.scan_timeout.is_empty() {
             args.push("--scan-timeout".into());
@@ -325,5 +342,70 @@ fn main() {
     if let Err(e) = result {
         eprintln!("[bilbycast-ptp-helper] {e}");
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn arg_after(args: &[OsString], flag: &str) -> Option<String> {
+        args.iter()
+            .position(|a| a == flag)
+            .and_then(|i| args.get(i + 1))
+            .map(|s| s.to_string_lossy().into_owned())
+    }
+
+    #[test]
+    fn slave_only_forwards_priority1_255_even_with_stale_value() {
+        // A hand-edited ptp.conf left a grandmaster priority1 on a slave-only
+        // node; the helper must still forward 255 (a lower value never locks).
+        let cfg = PtpConfig {
+            mode: "slave-only".to_string(),
+            priority1: "100".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(arg_after(&cfg.to_start_args(), "--priority1").as_deref(), Some("255"));
+    }
+
+    #[test]
+    fn slave_only_blank_priority1_forwards_255() {
+        let cfg = PtpConfig {
+            mode: "slave-only".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(arg_after(&cfg.to_start_args(), "--priority1").as_deref(), Some("255"));
+    }
+
+    #[test]
+    fn grandmaster_priority1_passed_through() {
+        let cfg = PtpConfig {
+            mode: "grandmaster".to_string(),
+            priority1: "100".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(arg_after(&cfg.to_start_args(), "--priority1").as_deref(), Some("100"));
+    }
+
+    #[test]
+    fn grandmaster_blank_priority1_omits_flag() {
+        // Blank → let the script apply its role default (128); no flag forwarded.
+        let cfg = PtpConfig {
+            mode: "grandmaster".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(arg_after(&cfg.to_start_args(), "--priority1"), None);
+    }
+
+    #[test]
+    fn auto_priority1_not_forced() {
+        // auto is resolved to a concrete role by the script; the helper must
+        // pass the operator value through unchanged.
+        let cfg = PtpConfig {
+            mode: "auto".to_string(),
+            priority1: "64".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(arg_after(&cfg.to_start_args(), "--priority1").as_deref(), Some("64"));
     }
 }

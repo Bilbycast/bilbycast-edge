@@ -15,12 +15,37 @@ scenes, and how the pieces fit together. For the underlying clock model
 |---|---|---|
 | **Auto** | Mixed sites — you don't know in advance whether a grandmaster is on the LAN | Listen for a PTP Announce for `scan_timeout` seconds. If heard, become a slave; otherwise become the grandmaster. The plug-and-play default. |
 | **Grandmaster** | You control the LAN and want this node to provide time | `priority1=128`, `masterOnly=1`, `clockClass=248` |
-| **Slave only** | The customer requires that we never be the time source | `priority1=255`, `slaveOnly=1`, `clockClass=255`. Refuses to ever become master under BMCA. |
+| **Slave only** | The customer requires that we never be the time source | `priority1=255`, `slaveOnly=1`, `clockClass=255`. Refuses to ever become master under BMCA. **`priority1` is forced to 255 — see note below.** |
 | **Off** | You're not using ST 2110 / MXL and don't want PTP traffic on the wire | No `ptp4l` / `phc2sys` running. TS-class flows run on system wallclock; ST 2110 / MXL flows refuse to start. |
 
 **Default on a fresh install is `off`.** PTP packets at a customer site
 without their knowledge would be noisy — the operator opts in
 explicitly.
+
+> **Why `priority1` is forced to 255 in slave-only mode.** In the BMCA
+> dataset comparison, `priority1` is checked **before** `clockClass`, and
+> the lower value wins. A slave-only clock with a `priority1` lower than the
+> external grandmaster's (e.g. a `128` GM and a leftover `100` from a
+> previous grandmaster config) therefore *beats* the grandmaster in BMCA —
+> but because it is `slaveOnly` it cannot take the master role, so ptp4l logs
+> `master state recommended in slave only mode` /
+> `defaultDS.priority1 probably misconfigured` and flaps indefinitely,
+> **never locking**. To make this impossible, slave-only pins `priority1=255`
+> (max / worst) at every layer: the manager UI locks the field, the edge
+> normalises it on write, and `bilbycast-ptp-gm.sh` forces it at apply time
+> (also correcting a hand-edited file or an `auto` mode that resolves to
+> slave). An operator-set `priority1` only takes effect in **grandmaster**
+> mode, where a lower value is how you intentionally win BMCA.
+>
+> The manager-UI / REST / WS write path is enforced on **every** edge
+> version — the manager forces `255` on the wire, so even an older edge locks.
+> The on-edge layers (helper + `bilbycast-ptp-gm.sh`) require those components
+> to be current; a *remote binary upgrade* swaps only the main edge binary, so
+> a node that auto-upgraded keeps its installed helper + script until the next
+> full reinstall (`install-edge.sh`). The only configuration that can still
+> mis-lock is therefore a **hand-edited** `ptp.conf` (`mode=slave-only` +
+> a low `priority1`) on a remote-upgraded node that was never re-saved through
+> the manager — saving the mode once via the Time page corrects it.
 
 ## How to change it
 
