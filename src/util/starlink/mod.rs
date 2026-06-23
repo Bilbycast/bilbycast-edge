@@ -359,9 +359,39 @@ fn gateway_dot_one(ip: std::net::Ipv4Addr) -> std::net::Ipv4Addr {
     std::net::Ipv4Addr::new(o[0], o[1], o[2], 1)
 }
 
-/// Derive the Wi-Fi gateway as `.1` of the interface's primary IPv4 `/24`.
-/// `None` if the interface is absent or has no IPv4 yet.
+/// Parse a little-endian hex IPv4 (the form in `/proc/net/route`).
+fn le_hex_to_ipv4(hex: &str) -> Option<std::net::Ipv4Addr> {
+    let raw = u32::from_str_radix(hex, 16).ok()?;
+    let [a, b, c, d] = raw.to_le_bytes();
+    Some(std::net::Ipv4Addr::new(a, b, c, d))
+}
+
+/// Read the interface's REAL default-route gateway from the kernel
+/// (`/proc/net/route`) — network-agnostic, no subnet/prefix assumption,
+/// works on any customer's network. `None` when the interface has no
+/// installed default route (e.g. a `use-routes: false` Wi-Fi leg) or the
+/// table can't be read.
+fn kernel_gateway_for(interface: &str) -> Option<std::net::Ipv4Addr> {
+    let table = std::fs::read_to_string("/proc/net/route").ok()?;
+    for line in table.lines().skip(1) {
+        let mut f = line.split_whitespace();
+        let (iface, dest, gw) = (f.next()?, f.next()?, f.next()?);
+        if iface == interface && dest == "00000000" && gw != "00000000" {
+            return le_hex_to_ipv4(gw);
+        }
+    }
+    None
+}
+
+/// Resolve a dish's Wi-Fi gateway, network-agnostically: the interface's REAL
+/// default-route next-hop from the kernel, falling back to `.1` of its IPv4
+/// /24 ONLY when no default route is installed (a `use-routes: false` leg).
+/// An explicit `gateway` in config overrides both (resolved at the call site).
+/// `None` if the interface is absent / has no IPv4 yet.
 fn derive_gateway(interface: &str) -> Option<std::net::Ipv4Addr> {
+    if let Some(gw) = kernel_gateway_for(interface) {
+        return Some(gw);
+    }
     let nics = crate::util::network_interfaces::enumerate();
     let nic = nics.iter().find(|n| n.name == interface)?;
     let ip = nic
@@ -639,9 +669,14 @@ mod tests {
         // Dish 192.168.100.1 → /24 subnet 192.168.100.0, gateway .1.
         let dish: Ipv4Addr = "192.168.100.1".parse().unwrap();
         assert_eq!(slash24(dish), Ipv4Addr::new(192, 168, 100, 0));
-        // wlo5's address 192.168.4.102 → Wi-Fi gateway 192.168.4.1.
+        // wlo5's address 192.168.4.102 → .1 fallback gateway 192.168.4.1.
         let wlo5_ip: Ipv4Addr = "192.168.4.102".parse().unwrap();
         assert_eq!(gateway_dot_one(wlo5_ip), Ipv4Addr::new(192, 168, 4, 1));
+        // The real gateway read from /proc/net/route is little-endian hex —
+        // network-agnostic, works on any customer subnet (here 192.168.4.1).
+        assert_eq!(le_hex_to_ipv4("0104A8C0"), Some(Ipv4Addr::new(192, 168, 4, 1)));
+        // A non-.1 gateway is handled too (10.20.30.254).
+        assert_eq!(le_hex_to_ipv4("FE1E140A"), Some(Ipv4Addr::new(10, 20, 30, 254)));
     }
 
     fn connected(drop_rate: Option<f32>, obstruction: Option<f32>) -> StarlinkMetrics {
