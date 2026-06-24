@@ -853,13 +853,8 @@ fn build_sender_cfg(cfg: &BondedOutputConfig) -> anyhow::Result<BondSocketConfig
     // non-empty map selects per-leg mode on the sender.
     for p in &cfg.paths {
         if let Some(f) = &p.fec {
-            out.per_path_fec.insert(
-                p.id,
-                FecParams {
-                    columns: f.columns,
-                    rows: f.rows,
-                },
-            );
+            out.per_path_fec
+                .insert(p.id, super::input_bonded::build_per_leg_fec(f));
         }
     }
     for p in &cfg.paths {

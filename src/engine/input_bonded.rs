@@ -26,13 +26,29 @@ use tokio_util::sync::CancellationToken;
 
 use bonding_transport::{
     BondSocket, BondSocketConfig, FecParams, PathConfig as BondPathTxCfg,
-    PathTransport as BondPathTxTransport, QuicRole as BondQuicRoleTx, QuicTlsMode as BondQuicTlsTx,
-    RistRole as BondRistRoleTx,
+    PathTransport as BondPathTxTransport, PerLegFecKind, QuicRole as BondQuicRoleTx,
+    QuicTlsMode as BondQuicTlsTx, RistRole as BondRistRoleTx,
 };
 
 use crate::config::models::{
-    BondPathTransportConfig, BondQuicRole, BondQuicTls, BondRistRole, BondedInputConfig,
+    BondFecAlgorithm, BondFecConfig, BondPathTransportConfig, BondQuicRole, BondQuicTls,
+    BondRistRole, BondedInputConfig,
 };
+
+/// Map an edge per-leg [`BondFecConfig`] to the bonding layer's
+/// [`PerLegFecKind`] — shared by the bonded input + output builders.
+pub(crate) fn build_per_leg_fec(f: &BondFecConfig) -> PerLegFecKind {
+    match f.algorithm.unwrap_or_default() {
+        BondFecAlgorithm::Xor => PerLegFecKind::Xor(FecParams {
+            columns: f.columns,
+            rows: f.rows,
+        }),
+        BondFecAlgorithm::ReedSolomon => PerLegFecKind::ReedSolomon {
+            data: f.columns,
+            parity: f.rows,
+        },
+    }
+}
 use crate::manager::events::{
     BondEventScope, EventSender, EventSeverity, category, run_bond_event_forwarder,
 };
@@ -249,13 +265,7 @@ pub(crate) fn build_receiver_cfg(cfg: &BondedInputConfig) -> anyhow::Result<Bond
     // with the combined `fec` above). A non-empty map selects per-leg mode.
     for p in &cfg.paths {
         if let Some(f) = &p.fec {
-            out.per_path_fec.insert(
-                p.id,
-                FecParams {
-                    columns: f.columns,
-                    rows: f.rows,
-                },
-            );
+            out.per_path_fec.insert(p.id, build_per_leg_fec(f));
         }
     }
     for p in &cfg.paths {

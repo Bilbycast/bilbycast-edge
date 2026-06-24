@@ -5198,7 +5198,7 @@ fn validate_bond_path_common(
             ));
         }
     }
-    validate_bond_fec(&p.fec, &format!("{ctx} path '{}' (per-leg)", p.name))?;
+    validate_bond_fec_inner(&p.fec, &format!("{ctx} path '{}' (per-leg)", p.name), true)?;
     Ok(())
 }
 
@@ -5324,23 +5324,58 @@ fn validate_bond_congestion(
 
 /// Validate optional proactive-FEC geometry (matches the library's
 /// `FecParams::is_valid`).
-fn validate_bond_fec(
+fn validate_bond_fec(c: &Option<crate::config::models::BondFecConfig>, ctx: &str) -> Result<()> {
+    validate_bond_fec_inner(c, ctx, false)
+}
+
+/// `allow_rs` = whether the Reed-Solomon algorithm is permitted (per-leg
+/// only; the bond-wide combined FEC is XOR-only).
+fn validate_bond_fec_inner(
     c: &Option<crate::config::models::BondFecConfig>,
     ctx: &str,
+    allow_rs: bool,
 ) -> Result<()> {
+    use crate::config::models::BondFecAlgorithm;
     if let Some(f) = c {
-        if !(1..=64).contains(&f.columns) {
-            return Err(anyhow::anyhow!("{ctx}: fec.columns must be in [1, 64]"));
-        }
-        if !(2..=64).contains(&f.rows) {
-            return Err(anyhow::anyhow!(
-                "{ctx}: fec.rows must be in [2, 64] (rows < 2 recovers nothing)"
-            ));
-        }
-        if (f.columns as u32) * (f.rows as u32) > 4096 {
-            return Err(anyhow::anyhow!(
-                "{ctx}: fec block (columns × rows) must be ≤ 4096"
-            ));
+        match f.algorithm.unwrap_or_default() {
+            BondFecAlgorithm::ReedSolomon => {
+                if !allow_rs {
+                    return Err(anyhow::anyhow!(
+                        "{ctx}: reed_solomon FEC is per-leg only — the bond-wide `fec` is XOR"
+                    ));
+                }
+                // columns = data shards (k), rows = parity shards (m).
+                if !(1..=64).contains(&f.columns) {
+                    return Err(anyhow::anyhow!(
+                        "{ctx}: reed_solomon fec.columns (data shards) must be in [1, 64]"
+                    ));
+                }
+                if !(1..=64).contains(&f.rows) {
+                    return Err(anyhow::anyhow!(
+                        "{ctx}: reed_solomon fec.rows (parity shards) must be in [1, 64]"
+                    ));
+                }
+                if (f.columns as u32) + (f.rows as u32) > 256 {
+                    return Err(anyhow::anyhow!(
+                        "{ctx}: reed_solomon block (data + parity) must be ≤ 256"
+                    ));
+                }
+            }
+            BondFecAlgorithm::Xor => {
+                if !(1..=64).contains(&f.columns) {
+                    return Err(anyhow::anyhow!("{ctx}: fec.columns must be in [1, 64]"));
+                }
+                if !(2..=64).contains(&f.rows) {
+                    return Err(anyhow::anyhow!(
+                        "{ctx}: fec.rows must be in [2, 64] (rows < 2 recovers nothing)"
+                    ));
+                }
+                if (f.columns as u32) * (f.rows as u32) > 4096 {
+                    return Err(anyhow::anyhow!(
+                        "{ctx}: fec block (columns × rows) must be ≤ 4096"
+                    ));
+                }
+            }
         }
     }
     Ok(())
@@ -7238,19 +7273,41 @@ mod tests {
             },
         };
         // Per-leg geometry is bounded exactly like combined FEC.
-        assert!(validate_bond_path_common(&path(Some(BondFecConfig { columns: 8, rows: 4 })), "ctx").is_ok());
-        assert!(validate_bond_path_common(&path(Some(BondFecConfig { columns: 0, rows: 4 })), "ctx").is_err());
-        assert!(validate_bond_path_common(&path(Some(BondFecConfig { columns: 8, rows: 1 })), "ctx").is_err());
+        assert!(validate_bond_path_common(&path(Some(BondFecConfig { columns: 8, rows: 4, algorithm: None })), "ctx").is_ok());
+        assert!(validate_bond_path_common(&path(Some(BondFecConfig { columns: 0, rows: 4, algorithm: None })), "ctx").is_err());
+        assert!(validate_bond_path_common(&path(Some(BondFecConfig { columns: 8, rows: 1, algorithm: None })), "ctx").is_err());
         assert!(validate_bond_path_common(&path(None), "ctx").is_ok());
 
         // Combined `fec` and any per-leg `path.fec` are mutually exclusive.
-        let combined = Some(BondFecConfig { columns: 10, rows: 10 });
-        let leg = vec![path(Some(BondFecConfig { columns: 8, rows: 4 }))];
+        let combined = Some(BondFecConfig { columns: 10, rows: 10, algorithm: None });
+        let leg = vec![path(Some(BondFecConfig { columns: 8, rows: 4, algorithm: None }))];
         let plain = vec![path(None)];
         assert!(validate_bond_fec_exclusive(&None, &plain, "ctx").is_ok());
         assert!(validate_bond_fec_exclusive(&combined, &plain, "ctx").is_ok(), "combined alone ok");
         assert!(validate_bond_fec_exclusive(&None, &leg, "ctx").is_ok(), "per-leg alone ok");
         assert!(validate_bond_fec_exclusive(&combined, &leg, "ctx").is_err(), "both → reject");
+    }
+
+    #[test]
+    fn per_leg_reed_solomon_validation() {
+        use crate::config::models::{BondFecAlgorithm, BondFecConfig};
+        let rs = |k: u16, m: u16| {
+            Some(BondFecConfig {
+                columns: k,
+                rows: m,
+                algorithm: Some(BondFecAlgorithm::ReedSolomon),
+            })
+        };
+        // RS is valid per-leg, with data+parity ≤ 256 and parity ≥ 1.
+        assert!(validate_bond_fec_inner(&rs(8, 4), "ctx", true).is_ok());
+        assert!(validate_bond_fec_inner(&rs(64, 64), "ctx", true).is_ok());
+        assert!(validate_bond_fec_inner(&rs(8, 1), "ctx", true).is_ok(), "m=1 ok for RS");
+        assert!(validate_bond_fec_inner(&rs(0, 4), "ctx", true).is_err(), "k=0 rejected");
+        // RS rejected for the combined (bond-wide) FEC.
+        assert!(validate_bond_fec_inner(&rs(8, 4), "ctx", false).is_err(), "RS combined rejected");
+        // Combined XOR still validates either way.
+        let xor = Some(BondFecConfig { columns: 10, rows: 10, algorithm: None });
+        assert!(validate_bond_fec_inner(&xor, "ctx", false).is_ok());
     }
 
     #[test]

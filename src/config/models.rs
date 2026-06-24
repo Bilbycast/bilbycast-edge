@@ -4180,14 +4180,32 @@ pub struct BondCongestionConfig {
     pub rtt_min_window_ms: Option<u64>,
 }
 
-/// Proactive FEC geometry for a bonded link (interleaved XOR). Off by
-/// default; both edges must use the same geometry. `columns` is the
-/// interleave depth (burst tolerance); `rows` is packets per column, so
-/// overhead is `1/rows`. A block is `columns × rows` packets.
+/// FEC algorithm for a bonded link.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum BondFecAlgorithm {
+    /// Interleaved XOR (SMPTE 2022-1 column model) — recovers one loss per
+    /// column. The only algorithm for the bond-wide (combined) FEC.
+    #[default]
+    Xor,
+    /// Reed-Solomon — recovers up to `parity` losses per `data+parity`
+    /// block. **Per-leg only** (not valid for the combined `fec`).
+    ReedSolomon,
+}
+
+/// Proactive FEC geometry for a bonded link. Off by default; both ends must
+/// use the same geometry. For **XOR** (default), `columns` is the interleave
+/// depth (burst tolerance) and `rows` is packets per column (overhead
+/// `1/rows`). For **Reed-Solomon** (per-leg only), `columns` = data shards
+/// (k) and `rows` = parity shards (m): recovers up to `m` losses per `k+m`
+/// block at `m/k` overhead.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BondFecConfig {
     pub columns: u16,
     pub rows: u16,
+    /// FEC algorithm. Absent = `xor` (back-compatible).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub algorithm: Option<BondFecAlgorithm>,
 }
 
 /// Packet-redundancy mode for a bonded output.
