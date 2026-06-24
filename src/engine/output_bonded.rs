@@ -28,12 +28,16 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use bonding_transport::{
-    BondSocket, BondSocketConfig, CapacityAwareScheduler, CongestionConfig, FecParams, PacketHints,
-    PathConfig as BondPathTxCfg, PathEvent, PathEventKind, PathPrior,
-    PathTransport as BondPathTxTransport, RoundRobinScheduler, WeightedRttScheduler,
+    BondScheduler, BondSocket, BondSocketConfig, CapacityAwareScheduler, CongestionConfig,
+    FecParams, PacketHints, PathConfig as BondPathTxCfg, PathEvent, PathEventKind, PathPrior,
+    PathTransport as BondPathTxTransport, Priority, RedundancyMode, RedundancyPolicy,
+    RoundRobinScheduler, WeightedRttScheduler,
 };
 
-use crate::config::models::{BondCongestionConfig, BondedOutputConfig, BondSchedulerKind};
+use crate::config::models::{
+    BondCongestionConfig, BondedOutputConfig, BondRedundancyConfig, BondRedundancyMode,
+    BondRedundancyPriority, BondSchedulerKind,
+};
 use crate::manager::events::{
     BondEventScope, EventSender, EventSeverity, category, run_bond_event_forwarder,
 };
@@ -465,16 +469,24 @@ async fn bonded_output_run(
     // capacity (bits/sec) — empty for the non-adaptive policies.
     let mut capacity_handles: Vec<(u8, std::sync::Arc<std::sync::atomic::AtomicU64>)> = Vec::new();
 
+    // Operator redundancy policy (replicate across N best legs). Off →
+    // default no-op; each scheduler still does its own Critical/IDR dup.
+    let redundancy = build_redundancy(&config.redundancy);
+
     // Pick scheduler. MediaAware/Adaptive add NAL awareness on top of
     // the inner path-selection policy; see engine::bonded_scheduler.
     let socket = match config.scheduler {
         BondSchedulerKind::RoundRobin => {
-            BondSocket::sender(socket_cfg, RoundRobinScheduler::new(path_ids.clone()))
+            let mut sched = RoundRobinScheduler::new(path_ids.clone());
+            sched.set_redundancy(redundancy);
+            BondSocket::sender(socket_cfg, sched)
                 .await
                 .map_err(|e| anyhow::anyhow!("bonded sender setup: {e}"))?
         }
         BondSchedulerKind::WeightedRtt => {
-            BondSocket::sender(socket_cfg, WeightedRttScheduler::new(path_ids.clone()))
+            let mut sched = WeightedRttScheduler::new(path_ids.clone());
+            sched.set_redundancy(redundancy);
+            BondSocket::sender(socket_cfg, sched)
                 .await
                 .map_err(|e| anyhow::anyhow!("bonded sender setup: {e}"))?
         }
@@ -483,7 +495,9 @@ async fn bonded_output_run(
             // to send(); the inner scheduler is WeightedRtt so
             // `Critical`-priority packets duplicate across the two
             // lowest-RTT paths.
-            BondSocket::sender(socket_cfg, WeightedRttScheduler::new(path_ids.clone()))
+            let mut sched = WeightedRttScheduler::new(path_ids.clone());
+            sched.set_redundancy(redundancy);
+            BondSocket::sender(socket_cfg, sched)
                 .await
                 .map_err(|e| anyhow::anyhow!("bonded sender setup: {e}"))?
         }
@@ -505,8 +519,9 @@ async fn bonded_output_run(
                 .as_ref()
                 .map(build_congestion)
                 .unwrap_or_default();
-            let sched = CapacityAwareScheduler::with_paths(priors, cong);
+            let mut sched = CapacityAwareScheduler::with_paths(priors, cong);
             capacity_handles = sched.capacity_handles();
+            sched.set_redundancy(redundancy);
             BondSocket::sender(socket_cfg, sched)
                 .await
                 .map_err(|e| anyhow::anyhow!("bonded sender setup: {e}"))?
@@ -861,6 +876,30 @@ fn build_sender_cfg(cfg: &BondedOutputConfig) -> anyhow::Result<BondSocketConfig
 /// Translate the edge's operator-facing congestion knobs into the
 /// library `CongestionConfig`, leaving any unset field at its
 /// broadcast-tuned default.
+/// Map the edge's bonded-output `redundancy` config to the bonding layer's
+/// [`RedundancyPolicy`]. Absent / `off` → no extra replication.
+fn build_redundancy(c: &Option<BondRedundancyConfig>) -> RedundancyPolicy {
+    let Some(c) = c else {
+        return RedundancyPolicy::default();
+    };
+    let mode = match c.mode {
+        BondRedundancyMode::Off => RedundancyMode::Off,
+        BondRedundancyMode::All => RedundancyMode::All,
+        BondRedundancyMode::Threshold => {
+            let p = match c.min_priority.unwrap_or(BondRedundancyPriority::High) {
+                BondRedundancyPriority::Normal => Priority::Normal,
+                BondRedundancyPriority::High => Priority::High,
+                BondRedundancyPriority::Critical => Priority::Critical,
+            };
+            RedundancyMode::AtOrAbove(p)
+        }
+    };
+    RedundancyPolicy {
+        mode,
+        replicas: c.replicas.unwrap_or(2).max(2) as usize,
+    }
+}
+
 fn build_congestion(c: &BondCongestionConfig) -> CongestionConfig {
     let mut cc = CongestionConfig::default();
     if let Some(v) = c.min_rate_kbps {

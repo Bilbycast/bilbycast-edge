@@ -4058,6 +4058,13 @@ pub struct BondedOutputConfig {
     /// geometry. Costs `1/rows` bandwidth overhead.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fec: Option<BondFecConfig>,
+    /// Optional packet **redundancy** (off by default). Replicates packets
+    /// across the N best legs so a copy survives as long as any one leg
+    /// delivers it — the strongest loss-resilience, at N× the bandwidth for
+    /// the replicated traffic. Sender-side only (the bonded input dedups
+    /// duplicates). See [`BondRedundancyConfig`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub redundancy: Option<BondRedundancyConfig>,
     /// Optional 64-hex-char (32-byte) AEAD key. When set, every UDP/RIST
     /// leg of this bond is ChaCha20-Poly1305 encrypted; the matching
     /// bonded input must carry the same key. QUIC legs are already TLS.
@@ -4181,6 +4188,44 @@ pub struct BondCongestionConfig {
 pub struct BondFecConfig {
     pub columns: u16,
     pub rows: u16,
+}
+
+/// Packet-redundancy mode for a bonded output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum BondRedundancyMode {
+    /// No extra replication (only Critical/IDR keyframes still duplicate).
+    #[default]
+    Off,
+    /// Replicate every packet across the N best legs (N× bandwidth).
+    All,
+    /// Replicate only packets at/above `min_priority` across the N best legs.
+    Threshold,
+}
+
+/// Priority threshold for `threshold`-mode redundancy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BondRedundancyPriority {
+    Normal,
+    High,
+    Critical,
+}
+
+/// Optional packet redundancy on a bonded output — replicate packets across
+/// several legs for max loss-resilience over flaky links. Off by default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BondRedundancyConfig {
+    #[serde(default)]
+    pub mode: BondRedundancyMode,
+    /// For `threshold` mode: replicate packets at/above this priority.
+    /// Defaults to `high` when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_priority: Option<BondRedundancyPriority>,
+    /// Number of legs to replicate across (2–8). Default 2. Clamped at
+    /// runtime to the live leg count.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replicas: Option<u8>,
 }
 
 /// Transport enum for a single bond leg.

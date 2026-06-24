@@ -5178,6 +5178,7 @@ fn validate_bonded_output(c: &crate::config::models::BondedOutputConfig) -> Resu
     validate_bond_congestion(&c.congestion, &format!("bonded output '{}'", c.id))?;
     validate_bond_fec(&c.fec, &format!("bonded output '{}'", c.id))?;
     validate_bond_fec_exclusive(&c.fec, &c.paths, &format!("bonded output '{}'", c.id))?;
+    validate_bond_redundancy(&c.redundancy, &format!("bonded output '{}'", c.id))?;
     validate_pid_map(c.pid_map.as_ref(), &format!("bonded output '{}'", c.id))?;
     Ok(())
 }
@@ -5198,6 +5199,23 @@ fn validate_bond_path_common(
         }
     }
     validate_bond_fec(&p.fec, &format!("{ctx} path '{}' (per-leg)", p.name))?;
+    Ok(())
+}
+
+/// Validate a bonded output's optional redundancy config.
+fn validate_bond_redundancy(
+    c: &Option<crate::config::models::BondRedundancyConfig>,
+    ctx: &str,
+) -> Result<()> {
+    if let Some(r) = c {
+        if let Some(n) = r.replicas {
+            if !(2..=8).contains(&n) {
+                return Err(anyhow::anyhow!(
+                    "{ctx}: redundancy.replicas must be in [2, 8], got {n}"
+                ));
+            }
+        }
+    }
     Ok(())
 }
 
@@ -7233,6 +7251,24 @@ mod tests {
         assert!(validate_bond_fec_exclusive(&combined, &plain, "ctx").is_ok(), "combined alone ok");
         assert!(validate_bond_fec_exclusive(&None, &leg, "ctx").is_ok(), "per-leg alone ok");
         assert!(validate_bond_fec_exclusive(&combined, &leg, "ctx").is_err(), "both → reject");
+    }
+
+    #[test]
+    fn bond_redundancy_replicas_bounds() {
+        use crate::config::models::{BondRedundancyConfig, BondRedundancyMode};
+        let r = |replicas: Option<u8>| {
+            Some(BondRedundancyConfig {
+                mode: BondRedundancyMode::All,
+                min_priority: None,
+                replicas,
+            })
+        };
+        assert!(validate_bond_redundancy(&None, "ctx").is_ok());
+        assert!(validate_bond_redundancy(&r(None), "ctx").is_ok());
+        assert!(validate_bond_redundancy(&r(Some(2)), "ctx").is_ok());
+        assert!(validate_bond_redundancy(&r(Some(8)), "ctx").is_ok());
+        assert!(validate_bond_redundancy(&r(Some(1)), "ctx").is_err(), "replicas < 2 rejected");
+        assert!(validate_bond_redundancy(&r(Some(9)), "ctx").is_err(), "replicas > 8 rejected");
     }
 
     /// Helper: build a single-program map for tests.
