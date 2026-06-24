@@ -370,10 +370,30 @@ bonded input or output carries a `bond_stats` field with:
 **Per-path fields** (`paths` array, one entry per leg):
 
 `id`, `name`, `transport`, `state` (`"alive"` or `"dead"`), `rtt_ms`,
-`jitter_us`, `loss_fraction`, `throughput_bps`, `queue_depth`,
-`packets_sent`, `bytes_sent`, `packets_received`, `bytes_received`,
-`nacks_sent`, `nacks_received`, `retransmits_sent`, `retransmits_received`,
-`keepalives_sent`, `keepalives_received`.
+`jitter_us`, `loss_fraction`, `throughput_bps`, `fec_throughput_bps`,
+`wire_throughput_bps`, `queue_depth`, `packets_sent`, `bytes_sent`,
+`packets_received`, `bytes_received`, `nacks_sent`, `nacks_received`,
+`retransmits_sent`, `retransmits_received`, `keepalives_sent`,
+`keepalives_received`.
+
+The three bandwidth fields decompose a leg's send-direction wire load
+(sender side; all `0` on the receiver):
+
+- **`throughput_bps`** — media payload rate off the byte counter the
+  congestion controller manages: media + ARQ retransmits + duplicated
+  (Critical / redundancy) packets + the 12-byte bond header. This is the
+  "Bitrate" column.
+- **`fec_throughput_bps`** — proactive **FEC repair** rate (combined or
+  per-leg XOR / Reed-Solomon). Pure redundancy *on top of* the media
+  rate; deliberately kept out of `throughput_bps` so folding it in can't
+  read as loss (sent > delivered) to the controller. `0` when FEC is off.
+- **`wire_throughput_bps`** — the honest **total** on the leg's wire:
+  media + retransmits + duplicates + FEC repair, each including its bond
+  header and (on an encrypted UDP leg) the 29-byte AEAD envelope. Equals
+  `throughput_bps` + FEC + encryption overhead; excludes only the
+  OS-level UDP/QUIC/IP framing below the bond. The aggregate
+  `BondLegStats` carries the bond-wide sums of the FEC + wire rates
+  alongside `throughput_bps`.
 
 **Prometheus counters** (labels: `flow_id`, `output_id`, `leg_role`,
 `path_id`, `path_name`, `transport`):

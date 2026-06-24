@@ -3754,6 +3754,15 @@ pub struct BondPathStatsHandle {
     /// the edge derives the rate here — same delta/elapsed×8 model the
     /// per-input/output bitrate uses.
     pub bitrate_est: Arc<crate::stats::throughput::ThroughputEstimator>,
+    /// Per-path FEC-repair bitrate estimator — sampled off
+    /// `PathStats::fec_bytes_sent` the same 1 Hz delta/elapsed×8 way as
+    /// `bitrate_est`. Surfaces the proactive redundancy the media counter
+    /// deliberately omits. Sender side only.
+    pub fec_bitrate_est: Arc<crate::stats::throughput::ThroughputEstimator>,
+    /// Per-path true-wire bitrate estimator — sampled off
+    /// `PathStats::wire_bytes_sent` (media + retx + dup + FEC + AEAD
+    /// envelope). The honest gross wire load of the leg. Sender side only.
+    pub wire_bitrate_est: Arc<crate::stats::throughput::ThroughputEstimator>,
     /// True when this leg uses gateway-mode path selection (the edge
     /// programmed a policy route). Reported as `binding = "gateway"`;
     /// otherwise the resolved NIC-pin mechanism from `PathStats` is
@@ -3785,6 +3794,8 @@ impl BondPathStatsHandle {
             transport,
             stats,
             bitrate_est: Arc::new(crate::stats::throughput::ThroughputEstimator::new()),
+            fec_bitrate_est: Arc::new(crate::stats::throughput::ThroughputEstimator::new()),
+            wire_bitrate_est: Arc::new(crate::stats::throughput::ThroughputEstimator::new()),
             gateway_mode: false,
             capacity_est: None,
             interface: None,
@@ -3855,6 +3866,17 @@ pub fn bond_handle_to_leg_stats(h: &BondStatsHandle) -> BondLegStats {
                 BondStatsRole::Sender => p.bitrate_est.sample(ps.bytes_sent),
                 BondStatsRole::Receiver => p.bitrate_est.sample(ps.bytes_received),
             };
+            // FEC repair + true-wire rates are sender-side concepts (FEC
+            // is emitted by the sender; the wire counter is the send
+            // direction). On the receiver side they stay 0 — the UI shows
+            // these columns sender-side only.
+            let (fec_throughput_bps, wire_throughput_bps) = match h.role {
+                BondStatsRole::Sender => (
+                    p.fec_bitrate_est.sample(ps.fec_bytes_sent),
+                    p.wire_bitrate_est.sample(ps.wire_bytes_sent),
+                ),
+                BondStatsRole::Receiver => (0, 0),
+            };
             BondPathLegStats {
                 id: p.id,
                 name: p.name.clone(),
@@ -3864,6 +3886,8 @@ pub fn bond_handle_to_leg_stats(h: &BondStatsHandle) -> BondLegStats {
                 jitter_us: ps.jitter_us,
                 loss_fraction: ps.loss_fraction(),
                 throughput_bps,
+                fec_throughput_bps,
+                wire_throughput_bps,
                 // Receiver-fed delivered rate (sender side): the capacity
                 // controller's ground truth, now written by the bonding
                 // crate from the v2 keepalive byte feedback.
@@ -3932,6 +3956,11 @@ pub fn bond_handle_to_leg_stats(h: &BondStatsHandle) -> BondLegStats {
     // leg before reassembly dedup. Goodput is visible separately via the
     // aggregate `packets_delivered` / `duplicates_received` counters.
     let throughput_bps: u64 = paths.iter().map(|p| p.throughput_bps).sum();
+    // Bond-wide redundancy + true-wire rollups: sum the per-leg rates so
+    // the aggregate decomposes the same way each leg does (media vs FEC
+    // vs total wire). Sender side only (per-leg values are 0 on receive).
+    let fec_throughput_bps: u64 = paths.iter().map(|p| p.fec_throughput_bps).sum();
+    let wire_throughput_bps: u64 = paths.iter().map(|p| p.wire_throughput_bps).sum();
 
     BondLegStats {
         state,
@@ -3939,6 +3968,8 @@ pub fn bond_handle_to_leg_stats(h: &BondStatsHandle) -> BondLegStats {
         role,
         scheduler: h.scheduler.clone(),
         throughput_bps,
+        fec_throughput_bps,
+        wire_throughput_bps,
         // The receiver hold servo owns `current_hold_ms` (written on
         // init + every retarget); senders never write it, so report it
         // receiver-side only rather than a misleading 0.

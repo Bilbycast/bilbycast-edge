@@ -1858,6 +1858,19 @@ pub struct BondLegStats {
     /// Older edges omit this (serde default `0`).
     #[serde(default)]
     pub throughput_bps: u64,
+    /// Aggregate proactive **FEC repair** bandwidth across all legs
+    /// (bits/sec) — sum of the per-leg `fec_throughput_bps`. Redundancy
+    /// overhead on top of `throughput_bps`. Sender side only; 0 on the
+    /// receiver side and on older edges (serde default).
+    #[serde(default)]
+    pub fec_throughput_bps: u64,
+    /// Aggregate **total** wire bandwidth across all legs (bits/sec) —
+    /// sum of the per-leg `wire_throughput_bps` (media + retransmits +
+    /// duplicates + FEC + AEAD envelope). The honest gross wire load of
+    /// the whole bond. Sender side only; 0 on the receiver side and on
+    /// older edges (serde default).
+    #[serde(default)]
+    pub wire_throughput_bps: u64,
     /// Receiver side only: the adaptive hold servo's **current**
     /// reorder/recovery budget in milliseconds (floor `hold_ms`,
     /// ceiling `hold_max_ms`; fixed at `hold_ms` when no ceiling is
@@ -1923,6 +1936,23 @@ pub struct BondPathLegStats {
     /// edges (serde default).
     #[serde(default)]
     pub delivered_bps: u64,
+    /// Proactive **FEC repair** bandwidth this edge adds on the leg
+    /// (bits/sec) — combined or per-leg XOR / Reed-Solomon. This is pure
+    /// redundancy *on top of* `throughput_bps`: it is deliberately NOT
+    /// part of the media byte counter (folding it in would read as loss
+    /// to the congestion controller). 0 when FEC is off, on the receiver
+    /// side, and on legacy edges (serde default).
+    #[serde(default)]
+    pub fec_throughput_bps: u64,
+    /// **Total** bandwidth actually on this leg's wire (bits/sec) in the
+    /// send direction: media + retransmits + duplicates + FEC repair,
+    /// each including its bond header and (on an encrypted UDP leg) the
+    /// 29-byte AEAD envelope. The honest wire load — `throughput_bps`
+    /// plus the FEC + encryption overhead the media counter omits;
+    /// excludes only the OS-level UDP/QUIC/IP framing below the bond.
+    /// Sender side only; 0 on the receiver side and on legacy edges.
+    #[serde(default)]
+    pub wire_throughput_bps: u64,
     /// The adaptive scheduler's **discovered usable capacity** for this
     /// link (bits/sec) — what the congestion controller believes the
     /// link can carry and fills it toward. 0 for the non-adaptive
