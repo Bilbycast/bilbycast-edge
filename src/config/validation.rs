@@ -5360,6 +5360,19 @@ fn validate_bond_fec_inner(
                         "{ctx}: reed_solomon block (data + parity) must be ≤ 256"
                     ));
                 }
+                if let Some(pmax) = f.parity_max {
+                    if pmax < f.rows {
+                        return Err(anyhow::anyhow!(
+                            "{ctx}: reed_solomon parity_max ({pmax}) must be ≥ rows/parity ({})",
+                            f.rows
+                        ));
+                    }
+                    if !(1..=64).contains(&pmax) || (f.columns as u32) + (pmax as u32) > 256 {
+                        return Err(anyhow::anyhow!(
+                            "{ctx}: reed_solomon parity_max must be in [1, 64] with data + parity_max ≤ 256"
+                        ));
+                    }
+                }
             }
             BondFecAlgorithm::Xor => {
                 if !(1..=64).contains(&f.columns) {
@@ -7273,14 +7286,14 @@ mod tests {
             },
         };
         // Per-leg geometry is bounded exactly like combined FEC.
-        assert!(validate_bond_path_common(&path(Some(BondFecConfig { columns: 8, rows: 4, algorithm: None })), "ctx").is_ok());
-        assert!(validate_bond_path_common(&path(Some(BondFecConfig { columns: 0, rows: 4, algorithm: None })), "ctx").is_err());
-        assert!(validate_bond_path_common(&path(Some(BondFecConfig { columns: 8, rows: 1, algorithm: None })), "ctx").is_err());
+        assert!(validate_bond_path_common(&path(Some(BondFecConfig { columns: 8, rows: 4, algorithm: None, parity_max: None })), "ctx").is_ok());
+        assert!(validate_bond_path_common(&path(Some(BondFecConfig { columns: 0, rows: 4, algorithm: None, parity_max: None })), "ctx").is_err());
+        assert!(validate_bond_path_common(&path(Some(BondFecConfig { columns: 8, rows: 1, algorithm: None, parity_max: None })), "ctx").is_err());
         assert!(validate_bond_path_common(&path(None), "ctx").is_ok());
 
         // Combined `fec` and any per-leg `path.fec` are mutually exclusive.
-        let combined = Some(BondFecConfig { columns: 10, rows: 10, algorithm: None });
-        let leg = vec![path(Some(BondFecConfig { columns: 8, rows: 4, algorithm: None }))];
+        let combined = Some(BondFecConfig { columns: 10, rows: 10, algorithm: None, parity_max: None });
+        let leg = vec![path(Some(BondFecConfig { columns: 8, rows: 4, algorithm: None, parity_max: None }))];
         let plain = vec![path(None)];
         assert!(validate_bond_fec_exclusive(&None, &plain, "ctx").is_ok());
         assert!(validate_bond_fec_exclusive(&combined, &plain, "ctx").is_ok(), "combined alone ok");
@@ -7296,6 +7309,7 @@ mod tests {
                 columns: k,
                 rows: m,
                 algorithm: Some(BondFecAlgorithm::ReedSolomon),
+                parity_max: None,
             })
         };
         // RS is valid per-leg, with data+parity ≤ 256 and parity ≥ 1.
@@ -7306,7 +7320,7 @@ mod tests {
         // RS rejected for the combined (bond-wide) FEC.
         assert!(validate_bond_fec_inner(&rs(8, 4), "ctx", false).is_err(), "RS combined rejected");
         // Combined XOR still validates either way.
-        let xor = Some(BondFecConfig { columns: 10, rows: 10, algorithm: None });
+        let xor = Some(BondFecConfig { columns: 10, rows: 10, algorithm: None, parity_max: None });
         assert!(validate_bond_fec_inner(&xor, "ctx", false).is_ok());
     }
 

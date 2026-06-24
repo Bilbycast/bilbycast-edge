@@ -46,6 +46,8 @@ pub(crate) fn build_per_leg_fec(f: &BondFecConfig) -> PerLegFecKind {
         BondFecAlgorithm::ReedSolomon => PerLegFecKind::ReedSolomon {
             data: f.columns,
             parity: f.rows,
+            // parity_max defaults to the parity floor (= fixed).
+            parity_max: f.parity_max.unwrap_or(f.rows).max(f.rows),
         },
     }
 }

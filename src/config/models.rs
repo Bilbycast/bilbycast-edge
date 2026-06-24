@@ -4206,6 +4206,11 @@ pub struct BondFecConfig {
     /// FEC algorithm. Absent = `xor` (back-compatible).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub algorithm: Option<BondFecAlgorithm>,
+    /// Reed-Solomon **adaptive** parity ceiling. When set above `rows`
+    /// (= the parity floor), the leg's RS parity scales between
+    /// `[rows, parity_max]` with its measured loss. Ignored for XOR.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parity_max: Option<u16>,
 }
 
 /// Packet-redundancy mode for a bonded output.
