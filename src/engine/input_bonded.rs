@@ -31,9 +31,32 @@ use bonding_transport::{
 };
 
 use crate::config::models::{
-    BondFecAlgorithm, BondFecConfig, BondPathTransportConfig, BondQuicRole, BondQuicTls,
-    BondRistRole, BondedInputConfig,
+    BondEqualizationMode, BondFecAlgorithm, BondFecConfig, BondPathTransportConfig, BondQuicRole,
+    BondQuicTls, BondRistRole, BondedInputConfig,
 };
+
+/// Equalization latency budget (= the bonding-latency knob) applied when a
+/// bonded input/output enables equalization but leaves both
+/// `max_bonding_latency_ms` and `hold_max_ms` unset. Generous on purpose: it
+/// must cover the worst-case inter-leg one-way-delay skew the equalizer aligns
+/// out (a Starlink or slow-5G leg vs. a fast cellular leg). Matches the bonding
+/// layer's default `max_bonding_latency_us` (1 s) so the receiver's alignment
+/// budget and the sender's demote budget agree by default.
+pub(crate) const DEFAULT_EQUALIZATION_BUDGET_MS: u64 = 1000;
+
+/// Map the edge's tri-state [`BondEqualizationMode`] (absent → `auto`) to the
+/// bonding layer's [`bonding_transport::EqualizationMode`]. Shared by the
+/// bonded input (receiver) and output (sender) builders.
+pub(crate) fn map_equalization_mode(
+    m: Option<BondEqualizationMode>,
+) -> bonding_transport::EqualizationMode {
+    use bonding_transport::EqualizationMode as Tx;
+    match m.unwrap_or_default() {
+        BondEqualizationMode::Auto => Tx::Auto,
+        BondEqualizationMode::Off => Tx::Off,
+        BondEqualizationMode::On => Tx::On,
+    }
+}
 
 /// Map an edge per-leg [`BondFecConfig`] to the bonding layer's
 /// [`PerLegFecKind`] — shared by the bonded input + output builders.
@@ -167,6 +190,23 @@ pub fn spawn_bonded_input(
             cancel.clone(),
         ));
 
+        // Optional ingress de-jitter: the bond reassembler releases in
+        // bond-order but in HOL-gated bursts (a straggler on a slow leg
+        // stalls the head, then a clump flushes). Without smoothing, that
+        // burstiness is forwarded verbatim to the HDMI display + egress and
+        // shows up as jerk / PCR jitter. When `ingress_dejitter_ms` is set,
+        // route the published stream through the same rate-paced de-jitter
+        // drainer the UDP/RIST inputs use; otherwise it's a zero-overhead
+        // direct passthrough. The publisher owns `broadcast_tx` from here.
+        let publisher = crate::engine::ingress_publisher::IngressPublisher::new(
+            None,
+            config.ingress_dejitter_ms,
+            broadcast_tx,
+            &input_id,
+            cancel.clone(),
+            stats.clone(),
+        );
+
         let mut seq_counter: u16 = 0;
         let mut ts_counter: u32 = 0;
 
@@ -181,7 +221,7 @@ pub fn spawn_bonded_input(
                     Some(payload) => {
                         publish(
                             &payload,
-                            &broadcast_tx,
+                            &publisher,
                             &stats,
                             &mut seq_counter,
                             &mut ts_counter,
@@ -199,7 +239,7 @@ pub fn spawn_bonded_input(
 
 fn publish(
     data: &Bytes,
-    broadcast_tx: &broadcast::Sender<RtpPacket>,
+    publisher: &crate::engine::ingress_publisher::IngressPublisher,
     stats: &Arc<FlowStatsAccumulator>,
     seq_counter: &mut u16,
     ts_counter: &mut u32,
@@ -227,7 +267,12 @@ fn publish(
         upstream_leg_id: None,
         sender_timestamp_us: None,
     };
-    let _ = broadcast_tx.send(packet);
+    if !publisher.send(packet) {
+        // De-jitter / delay drainer mpsc full — drop rather than block the
+        // bond receive loop (bounded-buffer overflow, surfaced via the
+        // de-jitter stage's own shed telemetry).
+        stats.input_filtered.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 /// Translate an edge `BondedInputConfig` into a
@@ -252,6 +297,35 @@ pub(crate) fn build_receiver_cfg(cfg: &BondedInputConfig) -> anyhow::Result<Bond
     }
     if let Some(n) = cfg.max_nack_retries {
         out.max_nack_retries = n;
+    }
+    // Per-leg equalization mode (receiver side). `auto` is the self-configuring
+    // default: measure always, align only when the inter-leg skew is worth the
+    // latency, within budget.
+    let eq_mode = map_equalization_mode(cfg.equalization);
+    out.equalization = eq_mode;
+    // The single bonding-latency budget = max_bonding_latency_ms (the one knob),
+    // falling back to the legacy hold_max_ms, else the default. It is the
+    // receiver's alignment ceiling + loss-recovery deadline (`hold_max`). The
+    // jitter floor (`hold_time`) stays separate, from `hold_ms`. Only injected
+    // when equalization measures — `off` keeps the legacy servo-ceiling
+    // semantics of hold_max_ms.
+    if eq_mode.measures() {
+        let budget_ms = cfg
+            .max_bonding_latency_ms
+            .map(|m| m as u64)
+            .or(cfg.hold_max_ms.map(|m| m as u64))
+            .unwrap_or(DEFAULT_EQUALIZATION_BUDGET_MS);
+        out.hold_max = Some(Duration::from_millis(budget_ms));
+        // Log the effective budget so a cross-end mismatch (the matching bonded
+        // output's max_bonding_latency_ms set to a different value on the other
+        // node) is visible — the two should be equal for the single-knob model.
+        tracing::info!(
+            "bonded input (flow {}): equalization={:?}, latency budget {} ms — \
+             set the matching bonded output's max_bonding_latency_ms to the same value",
+            cfg.bond_flow_id,
+            eq_mode,
+            budget_ms
+        );
     }
     if let Some(hex_key) = &cfg.encryption_key {
         out.encryption_key = Some(decode_bond_key(hex_key)?);
@@ -469,5 +543,51 @@ mod bonded_input_tests {
         let sock = build_receiver_cfg(&cfg).expect("receiver cfg builds");
         assert_eq!(sock.flow_id, 6016);
         assert_eq!(sock.paths.len(), 2);
+    }
+
+    #[test]
+    fn equalization_mode_maps_and_derives_the_single_budget() {
+        use bonding_transport::EqualizationMode as Tx;
+        let leg = r#""paths":[{"id":0,"name":"a","transport":{"type":"udp","bind":"0.0.0.0:7400"}}]"#;
+        let build = |json: &str| {
+            let cfg: crate::config::models::BondedInputConfig =
+                serde_json::from_str(json).unwrap();
+            build_receiver_cfg(&cfg).expect("receiver cfg builds")
+        };
+
+        // Legacy `true` → Auto; no budget set → defaults to 1000.
+        let s = build(&format!(r#"{{ "bond_flow_id":7, "equalization":true, {leg} }}"#));
+        assert_eq!(s.equalization, Tx::Auto);
+        assert_eq!(s.hold_max, Some(Duration::from_millis(DEFAULT_EQUALIZATION_BUDGET_MS)));
+
+        // Absent equalization → Auto (the self-configuring default).
+        let s = build(&format!(r#"{{ "bond_flow_id":7, {leg} }}"#));
+        assert_eq!(s.equalization, Tx::Auto);
+        assert_eq!(s.hold_max, Some(Duration::from_millis(1000)));
+
+        // The single knob max_bonding_latency_ms takes precedence over hold_max_ms.
+        let s = build(&format!(
+            r#"{{ "bond_flow_id":7, "equalization":"auto", "max_bonding_latency_ms":800, "hold_max_ms":1200, {leg} }}"#
+        ));
+        assert_eq!(s.hold_max, Some(Duration::from_millis(800)));
+
+        // No max_bonding_latency_ms → falls back to the legacy hold_max_ms (the
+        // edge6 case: hold_max_ms:800 keeps its 800 ms budget).
+        let s = build(&format!(
+            r#"{{ "bond_flow_id":7, "equalization":true, "hold_max_ms":800, {leg} }}"#
+        ));
+        assert_eq!(s.hold_max, Some(Duration::from_millis(800)));
+
+        // `off` → never measures, no budget injected (legacy aggregate-only).
+        let s = build(&format!(r#"{{ "bond_flow_id":7, "equalization":"off", {leg} }}"#));
+        assert_eq!(s.equalization, Tx::Off);
+        assert_eq!(s.hold_max, None);
+        // legacy `false` also maps to Off.
+        let s = build(&format!(r#"{{ "bond_flow_id":7, "equalization":false, {leg} }}"#));
+        assert_eq!(s.equalization, Tx::Off);
+
+        // `on` → force-engage mode.
+        let s = build(&format!(r#"{{ "bond_flow_id":7, "equalization":"on", {leg} }}"#));
+        assert_eq!(s.equalization, Tx::On);
     }
 }

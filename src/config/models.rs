@@ -4025,6 +4025,81 @@ pub struct BondedInputConfig {
     /// Optional proactive FEC — must match the bonded output's geometry.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fec: Option<BondFecConfig>,
+    /// Optional ingress de-jitter depth in milliseconds applied to the
+    /// reassembled bond stream before it reaches the flow's outputs
+    /// (HDMI display, UDP/RTP egress). The bond reassembler releases
+    /// in-order but in HOL-gated bursts (a straggler on a slow leg stalls
+    /// the head, then a clump flushes); without smoothing that burstiness
+    /// is forwarded verbatim and shows up as display jerk / egress PCR
+    /// jitter. Mirrors the UDP/RIST inputs' `ingress_dejitter_ms`. Unset /
+    /// 0 = pass through unchanged (default). Typical 150–250 ms.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ingress_dejitter_ms: Option<u32>,
+    /// Per-leg latency/jitter **equalization** mode on this bonded input (see
+    /// `bilbycast-bonding/docs/per-leg-equalization.md`). The receiver measures
+    /// each leg's relative one-way delay (from the sender's v2 header
+    /// timestamps) and, in `auto`/`on`, time-aligns the legs so heterogeneous
+    /// high-latency/jitter legs (5G + Starlink + ISP) AGGREGATE their bandwidth
+    /// in-order instead of head-of-line-blocking. See [`BondEqualizationMode`].
+    /// Defaults to `auto` (self-configuring). The latency budget is
+    /// [`Self::max_bonding_latency_ms`].
+    #[serde(
+        default,
+        deserialize_with = "de_bond_equalization_mode",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub equalization: Option<BondEqualizationMode>,
+    /// Equalization latency budget in milliseconds — the ceiling for how far a
+    /// fast leg is held to align a slow one, and the loss-recovery deadline
+    /// while aligned. The single bonding-latency knob; should match the bonded
+    /// output's value. When unset, derived from `hold_max_ms`, else defaults to
+    /// 1000. Kept distinct from `hold_ms` (the jitter floor).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_bonding_latency_ms: Option<u32>,
+}
+
+/// Per-leg equalization mode for a bonded input/output. Self-configuring by
+/// default. Deserializes from `"auto"` / `"off"` / `"on"`, and — for
+/// backward-compatibility with configs predating the tri-state — from the
+/// legacy boolean (`true` → `auto`, `false` → `off`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum BondEqualizationMode {
+    /// Stamp + measure always; engage alignment only when the measured
+    /// inter-leg skew is worth the latency, within budget, and the sender isn't
+    /// ride-fastest. The self-configuring aggregation default.
+    #[default]
+    Auto,
+    /// Never stamp/measure/align — legacy aggregate-but-never-align (the
+    /// latency-critical escape hatch: a slow leg's reorder is ARQ/FEC-recovered
+    /// rather than absorbed by alignment latency).
+    Off,
+    /// Force-engage alignment whenever a leg is warm, overriding the
+    /// ride-fastest (duplicate-all) suppression.
+    On,
+}
+
+/// Deserialize [`BondEqualizationMode`] accepting the tri-state string or the
+/// legacy boolean (`true` → `auto`, `false` → `off`). Absent → `None` (the
+/// mapping then applies the `auto` default).
+fn de_bond_equalization_mode<'de, D>(
+    d: D,
+) -> Result<Option<BondEqualizationMode>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Raw {
+        Bool(bool),
+        Mode(BondEqualizationMode),
+    }
+    Ok(match Option::<Raw>::deserialize(d)? {
+        None => None,
+        Some(Raw::Bool(true)) => Some(BondEqualizationMode::Auto),
+        Some(Raw::Bool(false)) => Some(BondEqualizationMode::Off),
+        Some(Raw::Mode(m)) => Some(m),
+    })
 }
 
 /// Bonded output — subscribes to the flow's broadcast channel, frames each
@@ -4075,6 +4150,27 @@ pub struct BondedOutputConfig {
     /// Sender retransmit buffer capacity in packets. Default 8192.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retransmit_capacity: Option<usize>,
+    /// Per-leg latency/jitter **equalization** mode (see
+    /// `bilbycast-bonding/docs/per-leg-equalization.md`). In `auto`/`on` the
+    /// sender stamps each data packet with a v2 (16-byte) header timestamp so
+    /// the receiver can measure each leg's relative one-way delay and
+    /// time-align the legs into one aggregated in-order stream. See
+    /// [`BondEqualizationMode`]. Defaults to `auto` (self-configuring). The
+    /// matching bonded input should use the same mode + budget.
+    #[serde(
+        default,
+        deserialize_with = "de_bond_equalization_mode",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub equalization: Option<BondEqualizationMode>,
+    /// Equalization latency budget in milliseconds — the single bonding-latency
+    /// knob (default 1000). A leg whose relative one-way delay would exceed this
+    /// is benched from carrying unique media (still used for redundancy/FEC)
+    /// rather than aligning the whole flow to it; it is also the receiver's
+    /// alignment ceiling + loss-recovery deadline. Should match the bonded
+    /// input's value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_bonding_latency_ms: Option<u32>,
     /// Keepalive interval in milliseconds. Default 200 ms.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub keepalive_ms: Option<u32>,
@@ -4178,6 +4274,16 @@ pub struct BondCongestionConfig {
     /// congestion. Default 10000. Valid [1000, 120000].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rtt_min_window_ms: Option<u64>,
+    /// Smoothed interarrival jitter (milliseconds) above which a link is
+    /// demoted from carrying UNIQUE media — it keeps carrying redundancy /
+    /// FEC copies (late copies are harmless insurance) but can no longer
+    /// head-of-line-block the in-order reassembly of the whole flow. A
+    /// catastrophically jittery link (a bufferbloated retail modem at
+    /// 300 ms+) otherwise stalls delivery for every leg. Re-admits when its
+    /// jitter recovers. `0` disables demotion (jitter still soft-deweights
+    /// the split). Default 150 ms. Valid [0, 5000].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jitter_demote_ms: Option<u32>,
 }
 
 /// FEC algorithm for a bonded link.

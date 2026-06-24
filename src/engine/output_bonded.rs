@@ -375,6 +375,75 @@ async fn run_gateway_route_reprogram(
     }
 }
 
+/// Bond data-header version that carries the equalization send-stamp. A leg
+/// whose far receiver advertises a version below this while we are stamping is
+/// a media-blackout risk (it can't parse our v2 headers).
+const BOND_PROTOCOL_V2: u64 = 2;
+
+/// Periodic per-leg bond protocol-version alarm. When this output is
+/// equalization-stamping v2 but a leg's far receiver has advertised an older
+/// version (it has equalization off, or is a genuinely-old build), it cannot
+/// parse our 16-byte headers and media on that leg can blackhole. Fires one
+/// Warning per leg (advisory — the negotiation still keeps that leg on v1, so
+/// this is a "you configured the two ends differently" heads-up, not a fault).
+async fn run_bond_version_alarm(
+    legs: Vec<(u8, String, Arc<bonding_protocol::stats::PathStats>)>,
+    measures: bool,
+    output_id: String,
+    flow_id: String,
+    events: EventSender,
+    cancel: CancellationToken,
+) {
+    // Nothing to alarm about if we never stamp (equalization off) or no legs.
+    if !measures || legs.is_empty() {
+        return;
+    }
+    let mut tick = tokio::time::interval(std::time::Duration::from_secs(5));
+    tick.tick().await; // swallow the immediate t=0 tick
+    let mut alarmed: std::collections::HashSet<u8> = std::collections::HashSet::new();
+    loop {
+        tokio::select! {
+            _ = cancel.cancelled() => return,
+            _ = tick.tick() => {
+                for (id, name, ps) in &legs {
+                    let v = ps.peer_protocol_version.load(Ordering::Relaxed);
+                    // 0 = no keepalive-ack yet (don't alarm on the sentinel);
+                    // >= v2 = fine; in between = old/equalization-off peer while
+                    // we intend to stamp. One-shot per leg.
+                    if v != 0 && v < BOND_PROTOCOL_V2 && alarmed.insert(*id) {
+                        tracing::warn!(
+                            "bonded output '{output_id}' leg '{name}': peer advertises bond \
+                             protocol v{v} but this output equalization-stamps v2 — peer can't \
+                             parse v2; that leg stays on v1 (no equalization). Align both ends."
+                        );
+                        events.emit_output_with_details(
+                            EventSeverity::Warning,
+                            category::BOND,
+                            format!(
+                                "bonded output '{output_id}' leg '{name}': bond protocol version \
+                                 mismatch — peer reports v{v}, this end equalization-stamps v2. \
+                                 Equalization won't engage on this leg until the matching bonded \
+                                 input also has equalization enabled (auto/on)."
+                            ),
+                            &output_id,
+                            serde_json::json!({
+                                "error_code": "bond_protocol_version_mismatch",
+                                "component": "bonded_output",
+                                "output_id": output_id,
+                                "path_id": id,
+                                "path_name": name,
+                                "peer_version": v,
+                                "local_version": BOND_PROTOCOL_V2,
+                                "flow_id": flow_id,
+                            }),
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Auto-diagnose a leg the instant it goes down / starts re-dialing, and emit
 /// the plain-English verdict (`bond_leg_test::test_leg`) as an operator event
 /// — so the operator is told WHY a leg failed without clicking "Test leg".
@@ -514,11 +583,26 @@ async fn bonded_output_run(
                     ceiling_bps: p.max_bitrate_bps,
                 })
                 .collect();
-            let cong = config
+            let mut cong = config
                 .congestion
                 .as_ref()
                 .map(build_congestion)
                 .unwrap_or_default();
+            // Equalization latency budget (top-level output knob, not a
+            // congestion sub-field): the sender-side un-equalizable demote.
+            if let Some(ms) = config.max_bonding_latency_ms {
+                cong.max_bonding_latency_us = ms as u64 * 1000;
+            }
+            // Surface the effective sender demote budget so a cross-end mismatch
+            // with the bonded input's budget is visible (they should be equal).
+            if super::input_bonded::map_equalization_mode(config.equalization).measures() {
+                tracing::info!(
+                    "bonded output '{}': equalization demote budget {} ms — set the matching \
+                     bonded input's max_bonding_latency_ms to the same value",
+                    config.id,
+                    cong.max_bonding_latency_us / 1000
+                );
+            }
             let mut sched = CapacityAwareScheduler::with_paths(priors, cong);
             capacity_handles = sched.capacity_handles();
             sched.set_redundancy(redundancy);
@@ -682,6 +766,22 @@ async fn bonded_output_run(
         ));
     }
 
+    // Per-leg bond protocol-version alarm: warn (once per leg) if we stamp v2
+    // for equalization but a leg's far receiver advertises an older version.
+    let version_legs: Vec<(u8, String, Arc<bonding_protocol::stats::PathStats>)> = config
+        .paths
+        .iter()
+        .filter_map(|p| socket.path_stats(p.id).map(|ps| (p.id, p.name.clone(), ps)))
+        .collect();
+    tokio::spawn(run_bond_version_alarm(
+        version_legs,
+        super::input_bonded::map_equalization_mode(config.equalization).measures(),
+        config.id.clone(),
+        flow_id.to_string(),
+        events.clone(),
+        cancel.clone(),
+    ));
+
     // Optional media-aware NAL-priority tagging — used by both the
     // legacy MediaAware policy and the new Adaptive policy.
     let mut media_sched = match config.scheduler {
@@ -714,8 +814,18 @@ async fn bonded_output_run(
     // datagram. Oversize payloads are sent anyway (the bond layer
     // neither drops nor fragments) but flagged once per output —
     // IP-layer fragmentation on a lossy cellular leg multiplies loss.
+    // When equalization measures, the header is the 16-byte v2 form (4 extra
+    // bytes of send-timestamp), so budget against that to avoid a payload at
+    // the boundary silently fragmenting once stamping is active.
+    let bond_header_size = if super::input_bonded::map_equalization_mode(config.equalization)
+        .measures()
+    {
+        BOND_HEADER_SIZE + 4
+    } else {
+        BOND_HEADER_SIZE
+    };
     let payload_budget = BOND_WIRE_MTU
-        - BOND_HEADER_SIZE
+        - bond_header_size
         - if config.encryption_key.is_some() {
             BOND_CRYPTO_OVERHEAD
         } else {
@@ -835,6 +945,17 @@ fn build_sender_cfg(cfg: &BondedOutputConfig) -> anyhow::Result<BondSocketConfig
     if let Some(cap) = cfg.retransmit_capacity {
         out.retransmit_capacity = cap;
     }
+    // Per-leg equalization (sender side): in auto/on, stamp data packets so the
+    // receiver can measure relative one-way delay and time-align the legs.
+    out.equalization = super::input_bonded::map_equalization_mode(cfg.equalization);
+    // Ride-fastest (duplicate-all redundancy) → signal the receiver to suppress
+    // alignment: holding the fast copy to align a slow duplicate the receiver
+    // would deliver immediately defeats the point. Threshold redundancy keeps
+    // alignment on (only the duplicated minority pays a small intended hold).
+    out.align_suppress = matches!(
+        cfg.redundancy.as_ref().map(|r| r.mode),
+        Some(BondRedundancyMode::All)
+    );
     if let Some(hex_key) = &cfg.encryption_key {
         out.encryption_key = Some(
             super::input_bonded::decode_bond_key(hex_key)
@@ -923,6 +1044,9 @@ fn build_congestion(c: &BondCongestionConfig) -> CongestionConfig {
     }
     if let Some(v) = c.delay_inflation_auto {
         cc.delay_inflation_auto = v;
+    }
+    if let Some(v) = c.jitter_demote_ms {
+        cc.jitter_demote_us = v as u64 * 1000;
     }
     cc
 }
@@ -1029,5 +1153,39 @@ mod bonded_output_tests {
         let sock = build_sender_cfg(&cfg).expect("sender cfg builds");
         assert_eq!(sock.flow_id, 6016);
         assert_eq!(sock.paths.len(), 2);
+    }
+
+    #[test]
+    fn sender_align_suppress_and_equalization_mode() {
+        use bonding_transport::EqualizationMode as Tx;
+        let legs = r#""paths":[{"id":0,"name":"a","transport":{"type":"udp","remote":"1.2.3.4:7400"}}]"#;
+        let build = |json: &str| {
+            let cfg: crate::config::models::BondedOutputConfig =
+                serde_json::from_str(json).unwrap();
+            build_sender_cfg(&cfg).expect("sender cfg builds")
+        };
+
+        // Default (no equalization, no redundancy) → Auto, no suppression.
+        let s = build(&format!(r#"{{ "id":"o","name":"b","bond_flow_id":1, {legs} }}"#));
+        assert_eq!(s.equalization, Tx::Auto);
+        assert!(!s.align_suppress);
+
+        // Duplicate-all redundancy → align_suppress set (ride-fastest).
+        let s = build(&format!(
+            r#"{{ "id":"o","name":"b","bond_flow_id":1, "redundancy":{{"mode":"all"}}, {legs} }}"#
+        ));
+        assert!(s.align_suppress, "duplicate-all must suppress alignment");
+
+        // Threshold redundancy → NOT suppressed (the bulk still aggregates).
+        let s = build(&format!(
+            r#"{{ "id":"o","name":"b","bond_flow_id":1, "redundancy":{{"mode":"threshold","min_priority":"high"}}, {legs} }}"#
+        ));
+        assert!(!s.align_suppress, "threshold redundancy keeps alignment on");
+
+        // `off` mode + legacy `false` map through.
+        let s = build(&format!(r#"{{ "id":"o","name":"b","bond_flow_id":1, "equalization":"off", {legs} }}"#));
+        assert_eq!(s.equalization, Tx::Off);
+        let s = build(&format!(r#"{{ "id":"o","name":"b","bond_flow_id":1, "equalization":false, {legs} }}"#));
+        assert_eq!(s.equalization, Tx::Off);
     }
 }

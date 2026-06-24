@@ -1906,7 +1906,12 @@ pub struct BondLegStats {
     pub gaps_recovered: u64,
     pub gaps_lost: u64,
     pub duplicates_received: u64,
-    pub reassembly_overflow: u64,
+    /// Datagrams that arrived too late to use (already-delivered/aged-out
+    /// `bond_seq`, or out of the ring window) — a leg contributing copies
+    /// too late to help, NOT reassembly-ring exhaustion. Formerly
+    /// `reassembly_overflow`; aliased for back-compat on ingest.
+    #[serde(alias = "reassembly_overflow")]
+    pub late_stale_drops: u64,
 
     /// Per-path detail. One entry per path registered at socket
     /// creation. Order matches the config.
@@ -1924,6 +1929,11 @@ pub struct BondPathLegStats {
     pub state: String,
     pub rtt_ms: f64,
     pub jitter_us: u64,
+    /// Per-leg equalization: receiver-measured relative one-way delay (µs) —
+    /// how much later this leg's packets land than the fastest eligible leg.
+    /// 0 when equalization is off / this leg is the fastest / un-measured.
+    #[serde(default)]
+    pub relative_owd_us: u64,
     pub loss_fraction: f64,
     /// Rate the sender **put on** this link (bits/sec, off the byte
     /// counter for the bond's active direction).

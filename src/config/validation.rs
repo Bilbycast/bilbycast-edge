@@ -1685,6 +1685,29 @@ fn validate_bonded_input(c: &crate::config::models::BondedInputConfig) -> Result
             ));
         }
     }
+    if let Some(ms) = c.max_bonding_latency_ms {
+        if !(50..=5000).contains(&ms) {
+            return Err(anyhow::anyhow!(
+                "bonded input max_bonding_latency_ms must be in [50, 5000], got {ms}"
+            ));
+        }
+        // The budget is the equalization ceiling; it must sit above the jitter
+        // floor (hold_ms) or alignment would clamp below the floor and the
+        // adaptive servo's relationship breaks.
+        let floor = c.hold_ms.unwrap_or(500);
+        if ms < floor {
+            return Err(anyhow::anyhow!(
+                "bonded input max_bonding_latency_ms ({ms}) must be >= hold_ms ({floor})"
+            ));
+        }
+    }
+    if let Some(ms) = c.ingress_dejitter_ms {
+        if ms != 0 && !(20..=2000).contains(&ms) {
+            return Err(anyhow::anyhow!(
+                "bonded input ingress_dejitter_ms must be 0 or in [20, 2000], got {ms}"
+            ));
+        }
+    }
     validate_bond_encryption_key(&c.encryption_key, "bonded input")?;
     validate_bond_fec(&c.fec, "bonded input")?;
     validate_bond_fec_exclusive(&c.fec, &c.paths, "bonded input")?;
@@ -5166,6 +5189,14 @@ fn validate_bonded_output(c: &crate::config::models::BondedOutputConfig) -> Resu
         validate_bond_path_transport(&p.transport, /* sender_mode */ true, &p.name)?;
         validate_bond_path_common(p, &format!("bonded output '{}'", c.id))?;
     }
+    if let Some(ms) = c.max_bonding_latency_ms {
+        if !(50..=5_000).contains(&ms) {
+            return Err(anyhow::anyhow!(
+                "bonded output '{}': max_bonding_latency_ms must be in [50, 5000]",
+                c.id
+            ));
+        }
+    }
     if let Some(pn) = c.program_number {
         if pn == 0 {
             return Err(anyhow::anyhow!(
@@ -5316,6 +5347,13 @@ fn validate_bond_congestion(
         if !(1_000..=120_000).contains(&v) {
             return Err(anyhow::anyhow!(
                 "{ctx}: congestion.rtt_min_window_ms must be in [1000, 120000]"
+            ));
+        }
+    }
+    if let Some(v) = c.jitter_demote_ms {
+        if v > 5_000 {
+            return Err(anyhow::anyhow!(
+                "{ctx}: congestion.jitter_demote_ms must be in [0, 5000] (0 disables)"
             ));
         }
     }

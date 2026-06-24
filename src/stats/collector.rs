@@ -3884,6 +3884,7 @@ pub fn bond_handle_to_leg_stats(h: &BondStatsHandle) -> BondLegStats {
                 state: if ps.dead { "dead" } else { "alive" }.to_string(),
                 rtt_ms: ps.rtt_ms(),
                 jitter_us: ps.jitter_us,
+                relative_owd_us: ps.relative_owd_us,
                 loss_fraction: ps.loss_fraction(),
                 throughput_bps,
                 fec_throughput_bps,
@@ -3990,7 +3991,7 @@ pub fn bond_handle_to_leg_stats(h: &BondStatsHandle) -> BondLegStats {
         gaps_recovered: snap.gaps_recovered,
         gaps_lost: snap.gaps_lost,
         duplicates_received: snap.duplicates_received,
-        reassembly_overflow: snap.reassembly_overflow,
+        late_stale_drops: snap.late_stale_drops,
         paths,
     }
 }

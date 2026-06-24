@@ -96,6 +96,8 @@ Each edge runs **one flow**. The `bonded_output` on edge A and
 | `nack_delay_ms` | u32 | 30 | Base NACK delay after detecting a gap. Gives natural out-of-order arrivals a chance to fill before an ARQ round-trip |
 | `max_nack_retries` | u32 | 8 | Max NACK retries per gap before giving up |
 | `keepalive_ms` | u32 | 200 | Keepalive interval; drives per-path RTT / liveness |
+| `equalization` | enum | `auto` | Per-leg latency equalization mode: `auto` (measure always, time-align legs only when the inter-leg skew is worth the latency — self-configuring, a no-op on a homogeneous bond), `off` (aggregate but never align — lowest latency), `on` (force-align). Accepts the legacy boolean (`true`→`auto`, `false`→`off`). Use the same mode + budget on the matching bonded **output**. See [`bilbycast-bonding/docs/per-leg-equalization.md`](../../bilbycast-bonding/docs/per-leg-equalization.md) |
+| `max_bonding_latency_ms` | u32 | 1000 | The single bonding-latency budget — how far a fast leg may be held to align a slow one, and the loss-recovery deadline. Distinct from `hold_ms` (the residual-jitter floor). Should equal the bonded output's value. Falls back to `hold_max_ms` when unset |
 
 ### Bonded output (`BondedOutputConfig`)
 
@@ -121,6 +123,8 @@ Each edge runs **one flow**. The `bonded_output` on edge A and
 | `scheduler` | enum | `media_aware` | `round_robin`, `weighted_rtt`, or `media_aware` (see [Scheduler](#scheduler)) |
 | `retransmit_capacity` | usize | 8192 | Sender retransmit buffer capacity (packets). Must exceed `send_rate_pps × max_nack_round_trip_s` |
 | `keepalive_ms` | u32 | 200 | Keepalive interval |
+| `equalization` | enum | `auto` | Per-leg latency equalization mode (`auto`/`off`/`on`; legacy bool accepted). In `auto`/`on` the sender stamps a 16-byte v2 header so the receiver can time-align legs. Duplicate-all redundancy auto-suppresses alignment (ride-fastest); `on` overrides. Use the same mode + budget on the matching bonded **input** |
+| `max_bonding_latency_ms` | u32 | 1000 | The single bonding-latency budget. A leg whose one-way delay would exceed this is benched from carrying unique media (still used for redundancy/FEC) rather than aligning the whole flow to it. Should equal the bonded input's value |
 | `program_number` | u16 | — | Optional MPTS → SPTS filter applied before bonding (same semantics as other TS-native outputs) |
 
 ### Path transports
@@ -365,7 +369,7 @@ bonded input or output carries a `bond_stats` field with:
 | `gaps_recovered` | receiver | Gaps filled by ARQ or a second path |
 | `gaps_lost` | receiver | Gaps that exceeded `hold_ms` — packet loss |
 | `duplicates_received` | receiver | Duplicates absorbed by reassembly |
-| `reassembly_overflow` | receiver | Sequence space exceeded buffer — tune `hold_ms` down or fix a path |
+| `late_stale_drops` (was `reassembly_overflow`) | receiver | Datagrams that arrived too late to use — `bond_seq` already delivered or aged out (a slow-leg copy or retransmit that lost the race), or out of the ring window. NOT ring exhaustion (the ring is fixed at 64k slots). High = a leg is contributing copies too late to help; demote or fix that leg, not the buffer. |
 
 **Per-path fields** (`paths` array, one entry per leg):
 
