@@ -4104,6 +4104,15 @@ pub struct BondPathConfig {
     /// cost control. Unset = auto-discover with no ceiling.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_bitrate_bps: Option<u64>,
+    /// Optional **per-leg** FEC for this path (interleaved XOR). When set,
+    /// this leg runs its own FEC over only the packets it carries, so a leg
+    /// burst (e.g. a Starlink satellite handoff) is recovered locally
+    /// instead of clustering in the combined stream and overrunning a shared
+    /// column. Mutually exclusive with the bond-level `fec` (combined): a
+    /// bond uses one model or the other. The matching end (input ↔ output)
+    /// must list the same geometry for this leg.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fec: Option<BondFecConfig>,
     /// Transport flavour.
     pub transport: BondPathTransportConfig,
 }

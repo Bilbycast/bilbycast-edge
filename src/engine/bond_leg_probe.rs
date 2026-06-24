@@ -826,6 +826,7 @@ mod tests {
             name: "q".into(),
             weight_hint: 1,
             max_bitrate_bps: None,
+            fec: None,
             transport: BondPathTransportConfig::Quic {
                 role: BondQuicRole::Client,
                 addr: "203.0.113.9:7400".into(),

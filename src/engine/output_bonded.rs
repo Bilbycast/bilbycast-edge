@@ -832,6 +832,21 @@ fn build_sender_cfg(cfg: &BondedOutputConfig) -> anyhow::Result<BondSocketConfig
             rows: f.rows,
         });
     }
+    // Per-leg FEC: each path that carries its own `fec` runs an independent
+    // encoder over only that leg's packets, emitting repairs on the same leg
+    // (validation rejects mixing this with the combined `fec` above). A
+    // non-empty map selects per-leg mode on the sender.
+    for p in &cfg.paths {
+        if let Some(f) = &p.fec {
+            out.per_path_fec.insert(
+                p.id,
+                FecParams {
+                    columns: f.columns,
+                    rows: f.rows,
+                },
+            );
+        }
+    }
     for p in &cfg.paths {
         out.paths.push(BondPathTxCfg {
             id: p.id,

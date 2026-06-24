@@ -244,6 +244,20 @@ pub(crate) fn build_receiver_cfg(cfg: &BondedInputConfig) -> anyhow::Result<Bond
             rows: f.rows,
         });
     }
+    // Per-leg FEC: each path that carries its own `fec` runs an independent
+    // decoder over only that leg's packets (validation rejects mixing this
+    // with the combined `fec` above). A non-empty map selects per-leg mode.
+    for p in &cfg.paths {
+        if let Some(f) = &p.fec {
+            out.per_path_fec.insert(
+                p.id,
+                FecParams {
+                    columns: f.columns,
+                    rows: f.rows,
+                },
+            );
+        }
+    }
     for p in &cfg.paths {
         out.paths.push(BondPathTxCfg {
             id: p.id,

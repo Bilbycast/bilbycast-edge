@@ -1687,6 +1687,7 @@ fn validate_bonded_input(c: &crate::config::models::BondedInputConfig) -> Result
     }
     validate_bond_encryption_key(&c.encryption_key, "bonded input")?;
     validate_bond_fec(&c.fec, "bonded input")?;
+    validate_bond_fec_exclusive(&c.fec, &c.paths, "bonded input")?;
     Ok(())
 }
 
@@ -5176,6 +5177,7 @@ fn validate_bonded_output(c: &crate::config::models::BondedOutputConfig) -> Resu
     validate_bond_encryption_key(&c.encryption_key, &format!("bonded output '{}'", c.id))?;
     validate_bond_congestion(&c.congestion, &format!("bonded output '{}'", c.id))?;
     validate_bond_fec(&c.fec, &format!("bonded output '{}'", c.id))?;
+    validate_bond_fec_exclusive(&c.fec, &c.paths, &format!("bonded output '{}'", c.id))?;
     validate_pid_map(c.pid_map.as_ref(), &format!("bonded output '{}'", c.id))?;
     Ok(())
 }
@@ -5194,6 +5196,26 @@ fn validate_bond_path_common(
                 p.name
             ));
         }
+    }
+    validate_bond_fec(&p.fec, &format!("{ctx} path '{}' (per-leg)", p.name))?;
+    Ok(())
+}
+
+/// Reject configuring BOTH the bond-level combined `fec` and any per-leg
+/// `path.fec` — they are different recovery models (combined protects the
+/// global striped stream; per-leg protects each leg independently) and the
+/// wire mode is one or the other.
+fn validate_bond_fec_exclusive(
+    combined: &Option<crate::config::models::BondFecConfig>,
+    paths: &[crate::config::models::BondPathConfig],
+    ctx: &str,
+) -> Result<()> {
+    if combined.is_some() && paths.iter().any(|p| p.fec.is_some()) {
+        return Err(anyhow::anyhow!(
+            "{ctx}: combined `fec` and per-leg `path.fec` are mutually exclusive — \
+             use one FEC model (per-leg recovers each leg's burst locally; \
+             combined protects the global striped stream)"
+        ));
     }
     Ok(())
 }
@@ -7178,6 +7200,39 @@ mod tests {
         assert!(validate_bond_congestion(&cfg(Some(f64::NAN), None), "ctx").is_err());
         assert!(validate_bond_congestion(&cfg(None, Some(999)), "ctx").is_err());
         assert!(validate_bond_congestion(&cfg(None, Some(120_001)), "ctx").is_err());
+    }
+
+    #[test]
+    fn per_leg_fec_bounds_and_mutual_exclusion() {
+        use crate::config::models::{BondFecConfig, BondPathConfig, BondPathTransportConfig};
+        let path = |fec: Option<BondFecConfig>| BondPathConfig {
+            id: 0,
+            name: "starlink".into(),
+            weight_hint: 1,
+            max_bitrate_bps: None,
+            fec,
+            transport: BondPathTransportConfig::Udp {
+                bind: None,
+                remote: Some("203.0.113.9:7400".into()),
+                interface: None,
+                gateway: None,
+                source: None,
+            },
+        };
+        // Per-leg geometry is bounded exactly like combined FEC.
+        assert!(validate_bond_path_common(&path(Some(BondFecConfig { columns: 8, rows: 4 })), "ctx").is_ok());
+        assert!(validate_bond_path_common(&path(Some(BondFecConfig { columns: 0, rows: 4 })), "ctx").is_err());
+        assert!(validate_bond_path_common(&path(Some(BondFecConfig { columns: 8, rows: 1 })), "ctx").is_err());
+        assert!(validate_bond_path_common(&path(None), "ctx").is_ok());
+
+        // Combined `fec` and any per-leg `path.fec` are mutually exclusive.
+        let combined = Some(BondFecConfig { columns: 10, rows: 10 });
+        let leg = vec![path(Some(BondFecConfig { columns: 8, rows: 4 }))];
+        let plain = vec![path(None)];
+        assert!(validate_bond_fec_exclusive(&None, &plain, "ctx").is_ok());
+        assert!(validate_bond_fec_exclusive(&combined, &plain, "ctx").is_ok(), "combined alone ok");
+        assert!(validate_bond_fec_exclusive(&None, &leg, "ctx").is_ok(), "per-leg alone ok");
+        assert!(validate_bond_fec_exclusive(&combined, &leg, "ctx").is_err(), "both → reject");
     }
 
     /// Helper: build a single-program map for tests.
