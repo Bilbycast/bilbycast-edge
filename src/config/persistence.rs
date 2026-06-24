@@ -165,6 +165,21 @@ fn load_secrets(path: &Path, machine_seed: &str) -> Result<SecretsConfig> {
     let raw = std::fs::read_to_string(path)
         .with_context(|| format!("Failed to read secrets file: {}", path.display()))?;
 
+    // An empty (0-byte) or whitespace-only secrets.json means "no secrets yet"
+    // — treat it exactly like a missing file rather than failing to parse with
+    // "EOF while parsing a value". Installers / operators sometimes pre-create
+    // the file to pin ownership + 0600 perms before the edge first writes it;
+    // the edge's own atomic temp-write-then-rename never leaves a 0-byte file.
+    // `merge_into` is additive, so merging the resulting empty secrets never
+    // clobbers a registration token already present in config.json.
+    if raw.trim().is_empty() {
+        tracing::info!(
+            "secrets.json at {} is empty — treating as no secrets (first-time setup)",
+            path.display()
+        );
+        return Ok(SecretsConfig::default());
+    }
+
     let json_str = if crypto::is_encrypted(&raw) {
         crypto::decrypt_secrets(&raw, machine_seed)
             .with_context(|| format!("Failed to decrypt secrets file: {}", path.display()))?
@@ -222,6 +237,29 @@ mod tests {
         let config = load_config(path).unwrap();
         assert!(config.flows.is_empty());
         assert_eq!(config.version, 2);
+    }
+
+    #[test]
+    fn test_empty_secrets_file_returns_default_not_error() {
+        // A 0-byte secrets.json (e.g. an installer pre-creating the file to pin
+        // ownership + 0600 perms before the edge first runs) must be treated as
+        // "no secrets yet", not a hard `EOF while parsing a value` error.
+        let tmp = NamedTempFile::new().unwrap(); // created empty (0 bytes)
+        let secrets = load_secrets(tmp.path(), "test-seed")
+            .expect("empty secrets file must load as default, not error");
+        assert!(secrets.is_empty(), "0-byte file should yield empty secrets");
+
+        // Whitespace-only behaves the same.
+        std::fs::write(tmp.path(), "  \n\t ").unwrap();
+        let secrets = load_secrets(tmp.path(), "test-seed")
+            .expect("whitespace-only secrets file must load as default");
+        assert!(secrets.is_empty());
+
+        // A plaintext `{}` (what the fixed installer now writes) also parses.
+        std::fs::write(tmp.path(), "{}\n").unwrap();
+        let secrets = load_secrets(tmp.path(), "test-seed")
+            .expect("`{}` secrets file must parse");
+        assert!(secrets.is_empty());
     }
 
     #[test]
