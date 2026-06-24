@@ -192,14 +192,17 @@ ensure_cosign() {
         x86_64-linux)  cosign_arch="amd64";;
         aarch64-linux) cosign_arch="arm64";;
     esac
-    local url="https://github.com/sigstore/cosign/releases/download/${COSIGN_VERSION}/cosign-linux-${cosign_arch}"
-    local checksum_url="${url}.sha256"
+    local asset="cosign-linux-${cosign_arch}"
+    local url="https://github.com/sigstore/cosign/releases/download/${COSIGN_VERSION}/${asset}"
+    # cosign publishes ONE aggregate checksum file (goreleaser style:
+    # `<sha256hex>  <filename>`), not per-binary `<file>.sha256` assets — so
+    # match the asset's line out of cosign_checksums.txt.
+    local checksum_url="https://github.com/sigstore/cosign/releases/download/${COSIGN_VERSION}/cosign_checksums.txt"
     curl -fsSL -o /tmp/cosign "${url}"
-    # The .sha256 file format is `<hex>  <filename>` — pull just the hex.
     local expected
-    expected="$(curl -fsSL "${checksum_url}" | awk '{print $1}')"
+    expected="$(curl -fsSL "${checksum_url}" | awk -v a="${asset}" '$2 == a {print $1}')"
     if [[ -z "${expected}" ]]; then
-        echo "Could not fetch cosign checksum from ${checksum_url}" >&2
+        echo "Could not fetch cosign checksum for ${asset} from ${checksum_url}" >&2
         exit 1
     fi
     local got
@@ -352,7 +355,13 @@ EOF
 fi
 
 if [[ ! -f "${SECRETS_FILE}" ]]; then
-    : > "${SECRETS_FILE}"
+    # Initialise to an empty JSON object, NOT a 0-byte file — the edge parses
+    # secrets.json as JSON at startup, and an empty file fails with
+    # "Failed to parse secrets file: EOF while parsing a value". `{}` is a
+    # valid empty (unencrypted) secrets doc; the edge re-writes it encrypted on
+    # first manager registration. We pre-create it here only to pin ownership +
+    # 0600 perms before the edge first runs.
+    printf '{}\n' > "${SECRETS_FILE}"
     chown bilbycast:bilbycast "${SECRETS_FILE}"
     chmod 0600 "${SECRETS_FILE}"
 fi
