@@ -3887,6 +3887,7 @@ pub fn bond_handle_to_leg_stats(h: &BondStatsHandle) -> BondLegStats {
                 keepalives_sent: ps.keepalives_sent,
                 keepalives_received: ps.keepalives_received,
                 rebuilds: ps.rebuilds,
+                fec_recovered: ps.fec_recovered,
                 // Gateway-mode legs report "gateway"; interface-mode
                 // legs report the kernel primitive that actually bound
                 // them (so_bindtodevice vs the unprivileged hint).

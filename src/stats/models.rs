@@ -1945,6 +1945,12 @@ pub struct BondPathLegStats {
     /// edges omit this (serde default `0`).
     #[serde(default)]
     pub rebuilds: u64,
+    /// Packets recovered by THIS leg's per-leg FEC (XOR or Reed-Solomon).
+    /// 0 when the leg has no per-leg FEC. Distinct from the bond-aggregate
+    /// `gaps_recovered` — lets the operator see each leg's proactive FEC
+    /// at work. Older edges omit this (serde default `0`).
+    #[serde(default)]
+    pub fec_recovered: u64,
     /// How this leg's egress is pinned to its link:
     /// `"gateway"` (edge-programmed policy route via a router),
     /// `"so_bindtodevice"` (hard NIC bind, needs CAP_NET_RAW),
