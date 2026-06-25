@@ -200,6 +200,50 @@ if ! command -v ptp4l > /dev/null 2>&1; then
     fi
 fi
 
+# ── Runtime media libraries (variant-aware) ───────────────────────────
+# The edge binary STATICALLY links libx264 / libx265 (full variant) and
+# vendors FFmpeg + libopus, so NO codec runtime packages are needed for
+# software encode/decode — and the binary is not tied to any distro's
+# ABI-versioned libx264.so.<build> / libx265.so.<build> SONAME (which bump
+# every release: Ubuntu 24.04 ships .164/.199, 26.04 ships .165/.215).
+#
+# A few SYSTEM libraries are still linked dynamically and MUST be present
+# or the binary won't start (these are the deps a fresh Ubuntu 26.04 node
+# is missing):
+#   - libasound2        (ALSA)  — `display` output, linked by all variants
+#   - libva2 + libva-drm2       — VAAPI HW encode/decode (full variant)
+#   - libdrm2                   — VAAPI DMA-BUF export (full variant; FFmpeg
+#                                 is built --enable-libdrm)
+#   - libvpl2  (x86_64 only)    — Intel QSV HW encode/decode (full variant)
+#   - libnuma1                  — belt-and-braces: the binary static-links
+#                                 libnuma, but a build that fell back to a
+#                                 dynamic numa link would NEED libnuma.so.1
+# All have STABLE major SONAMEs (.1/.2) that do not churn across distro
+# releases, so the plain package name resolves on Ubuntu 22.04 → 26.04+.
+# Installed best-effort; the actual HW *drivers* (mesa-va-drivers /
+# intel-media-va-driver / libmfx-gen1.2 / NVIDIA driver) are an operator
+# concern — without them the runtime probe simply skips that backend.
+if command -v apt-get > /dev/null 2>&1; then
+    echo "Installing runtime media libraries for variant '${VARIANT}'…"
+    DEBIAN_FRONTEND=noninteractive apt-get update -qq || true
+    # ALSA: Ubuntu 24.04+ renamed libasound2 → libasound2t64 (time_t
+    # transition); try the new name first, fall back to the old.
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq libasound2t64 \
+        || DEBIAN_FRONTEND=noninteractive apt-get install -y -qq libasound2 || true
+    if [[ "${VARIANT}" == "full" ]]; then
+        DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+            libva2 libva-drm2 libdrm2 libnuma1 || true
+        if [[ "${ARCH}" == "x86_64-linux" ]]; then
+            DEBIAN_FRONTEND=noninteractive apt-get install -y -qq libvpl2 || true
+        fi
+    fi
+else
+    echo "WARNING: apt-get unavailable — ensure libasound2 (all variants) and,"
+    echo "         for the full variant, libva2 / libva-drm2 / libdrm2 / libnuma1"
+    echo "         / libvpl2 (x86_64) are installed, or the binary may fail to"
+    echo "         start. See docs.bilbycast.com/edge/installation/."
+fi
+
 ensure_cosign() {
     if command -v cosign > /dev/null 2>&1; then
         echo "Using existing cosign: $(command -v cosign)"

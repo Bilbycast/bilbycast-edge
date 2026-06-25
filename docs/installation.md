@@ -126,22 +126,38 @@ the manager.
 
 ### Full variant (`*-linux-full`) — runtime
 
-The full binary dynamically links libx264 + libx265. NVENC (NVIDIA) and QSV
-(Intel) use `dlopen()` so they don't add build-link dependencies, but they
-do require driver / runtime packages on the host.
+The full binary **statically links libx264 + libx265** (the software
+H.264 / HEVC encoders), so it needs **no `libx264` / `libx265` runtime
+package** and is *not* tied to any distro's ABI-versioned
+`libx264.so.<build>` / `libx265.so.<build>` SONAME. Those SONAMEs are the
+upstream build number and bump on every distro release — Ubuntu 24.04
+ships `libx264.so.164` / `libx265.so.199`, 26.04 ships `.165` / `.215`,
+which are ABI-incompatible (x264 even bakes the build number into its
+exported symbol names, so a soname symlink fails too) — so a
+dynamically-linked build only runs on the exact release it was built on.
+Static linking removes that fragility entirely.
 
-**All architectures (x86_64 + aarch64) — software encoders:**
+NVENC (NVIDIA) and NVDEC `dlopen()` the proprietary driver at runtime, so
+they add no link-time dependency either.
+
+The libraries that **do** remain dynamically linked all have **stable
+major SONAMEs** (`.2`) that don't churn across distro releases, so the
+plain package name resolves on Ubuntu 22.04 → 26.04+:
+
+**All architectures — VAAPI HW encode/decode + the display output:**
 
 ```bash
 sudo apt-get update
-sudo apt-get install -y libx264-dev libx265-dev libnuma1
+# libasound2: Ubuntu 24.04+ renamed it libasound2t64 (time_t transition).
+sudo apt-get install -y libva2 libva-drm2 libasound2t64 \
+  || sudo apt-get install -y libva2 libva-drm2 libasound2
 ```
 
-> The `*-dev` metapackages depend on the matching runtime `.so` packages,
-> so they cover both build and runtime use. If you want runtime-only
-> packages, replace them with the versioned names on your release
-> (`apt-cache search libx264` — e.g. `libx264-164`, `libx265-199` on
-> Ubuntu 24.04).
+> The `curl … | install-edge.sh` bundle installs these automatically for
+> the variant it lays down; the list above is for plain tarball installs.
+> A working VAAPI *driver* (`mesa-va-drivers` for AMD, `intel-media-va-driver`
+> for Intel) is still needed to actually *use* VAAPI — without it the
+> runtime probe just skips the backend; the binary still starts.
 
 **x86_64 only — Intel QuickSync (QSV):**
 
@@ -173,18 +189,31 @@ needs the local-display dev header (`libasound2-dev`) since the
 sudo apt-get update
 sudo apt-get install -y build-essential cmake make clang \
                         libclang-dev pkg-config libssl-dev g++ \
-                        libasound2-dev
+                        libasound2-dev nasm
 
 # Rust toolchain
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 source "$HOME/.cargo/env"
 ```
 
-The full variant additionally needs the encoder development headers:
+The full variant additionally needs the encoder development headers. The
+build **statically links libx264 + libx265** (so the resulting binary has
+no `libx264.so` / `libx265.so` runtime dependency):
 
 ```bash
-# All architectures: x264 + x265 + libnuma (x265's link-time dep)
-sudo apt-get install -y libx264-dev libx265-dev libnuma-dev
+# x265: libx265-dev ships libx265.a (multilib 8/10/12-bit) — statically
+# linked directly. libnuma-dev satisfies x265's `-lnuma` at static link.
+sudo apt-get install -y libx265-dev libnuma-dev
+
+# x264: Debian/Ubuntu's libx264-dev ships only libx264.so (no .a), so build
+# a static libx264.a from source and put its prefix on PKG_CONFIG_PATH.
+# build.rs prefers a static libx264.a; if none is found it falls back to a
+# DYNAMIC link and prints a loud warning (the binary then won't run on a
+# distro with a different x264 build — see "Full variant runtime" above).
+git clone --depth 1 https://code.videolan.org/videolan/x264.git /tmp/x264
+( cd /tmp/x264 && ./configure --prefix="$HOME/x264-static" \
+    --enable-static --enable-pic --disable-cli && make -j"$(nproc)" && make install )
+export PKG_CONFIG_PATH="$HOME/x264-static/lib/pkgconfig:$PKG_CONFIG_PATH"
 
 # x86_64 only: Intel oneVPL (QSV)
 sudo apt-get install -y libvpl-dev
@@ -221,13 +250,16 @@ cd bilbycast-edge-${VER#v}-${ARCH}-linux
 ./bilbycast-edge --config /path/to/config.json
 ```
 
-**Full variant** — install the libx264 / libx265 runtime libraries
-first (NVENC works automatically on NVIDIA hosts; no extra packages
-required beyond the NVIDIA driver):
+**Full variant** — libx264 / libx265 are statically linked, so **no
+codec runtime packages are required**. Install the remaining
+stable-SONAME runtime libraries (HW-accel + display); NVENC works
+automatically on NVIDIA hosts with just the driver:
 
 ```bash
 sudo apt update
-sudo apt install libx264-dev libx265-dev
+sudo apt install libva2 libva-drm2 libasound2t64 \
+  || sudo apt install libva2 libva-drm2 libasound2
+sudo apt install libvpl2     # x86_64 only — Intel QSV
 
 VER=vX.Y.Z
 ARCH=x86_64   # or aarch64
@@ -238,12 +270,15 @@ cd bilbycast-edge-${VER#v}-${ARCH}-linux-full
 ./bilbycast-edge --config /path/to/config.json
 ```
 
-> **Why `-dev` packages for a runtime install?** The `-dev` metapackages
-> depend on the matching runtime `.so` packages and guarantee you get
-> the version the binary was built against. If you prefer runtime-only
-> packages, check `apt-cache search libx264` for the specific versioned
-> name on your Ubuntu release (e.g. `libx264-163` on 22.04,
-> `libx264-164` on 24.04).
+> **Ubuntu 26.04+ note.** Earlier releases dynamically linked libx264 /
+> libx265, which broke on each new Ubuntu LTS because the ABI-versioned
+> `libx264.so.<build>` / `libx265.so.<build>` SONAME bumps every release
+> (24.04 `.164` / `.199` → 26.04 `.165` / `.215`, ABI-incompatible). The
+> current full binary statically links both, so this class of failure is
+> gone — you no longer need to hunt for a matching `libx264-NNN` package
+> or pull an older one from a previous release's pool. The packages above
+> all carry stable `.2` SONAMEs available on every supported Ubuntu /
+> Debian release.
 
 Verify checksums:
 
@@ -603,7 +638,7 @@ Common build-time dependencies:
 ```bash
 sudo apt update
 sudo apt install build-essential pkg-config cmake clang libclang-dev \
-                  make libssl-dev
+                  make libssl-dev nasm
 ```
 
 Rust toolchain:
@@ -614,11 +649,19 @@ source "$HOME/.cargo/env"
 ```
 
 For the full variant, also install the video encoder development
-packages:
+packages. libx264 + libx265 are **statically linked** (no runtime
+`.so` dependency on the resulting binary):
 
 ```bash
-# All architectures: x264, x265, libnuma (x265's link-time dep)
-sudo apt install libx264-dev libx265-dev libnuma-dev
+# x265: libx265-dev ships libx265.a; libnuma-dev covers x265's `-lnuma`.
+sudo apt install libx265-dev libnuma-dev
+# x264: libx264-dev has no static .a on Debian/Ubuntu — build one from
+# source and expose it on PKG_CONFIG_PATH (else build.rs warns and falls
+# back to a non-portable dynamic link):
+git clone --depth 1 https://code.videolan.org/videolan/x264.git /tmp/x264
+( cd /tmp/x264 && ./configure --prefix="$HOME/x264-static" \
+    --enable-static --enable-pic --disable-cli && make -j"$(nproc)" && make install )
+export PKG_CONFIG_PATH="$HOME/x264-static/lib/pkgconfig:$PKG_CONFIG_PATH"
 # x86_64 only: Intel oneVPL (QSV)
 sudo apt install libvpl-dev
 
@@ -753,13 +796,19 @@ AGPL-only.
 
 ```bash
 file bilbycast-edge
-ldd bilbycast-edge | grep -E 'libx264|libx265'
-# Hits → this is a `*-full` (AGPL+GPL combined) binary.
-# No hits → this is a `*-default` (AGPL only) binary.
+# libx264/libx265 are STATICALLY linked into the full variant, so `ldd`
+# can no longer tell the variants apart (the full binary has no
+# libx264.so/libx265.so dependency — that's the whole point). Check for the
+# baked-in encoder symbols instead:
+nm bilbycast-edge 2>/dev/null | grep -qE ' [Tt] x26[45]_encoder_open' \
+  && echo 'full (AGPL+GPL combined — libx264/libx265 statically linked in)' \
+  || echo 'default (AGPL only — no software video encoders)'
+# (On a stripped binary `nm` shows nothing — fall back to the bundled NOTICE.)
 ```
 
-The `NOTICE` file inside each tarball contains the authoritative
-bundled-library manifest.
+The `NOTICE` file inside each tarball is the authoritative bundled-library
+manifest: the full variant ships `NOTICE.full` (lists libx264 / libx265 +
+the GPL terms), the default variant ships the AGPL-only `NOTICE`.
 
 ---
 

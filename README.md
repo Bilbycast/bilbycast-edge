@@ -99,7 +99,7 @@ salvo export to a Switcher preset.
    sudo apt install build-essential cmake make clang libclang-dev pkg-config \
                     libssl-dev g++ libasound2-dev
    ```
-   `libasound2-dev` is the link-time dep of the on-by-default `display` Cargo feature (HDMI / DisplayPort + ALSA confidence-monitor playout); `drm-rs` is a pure-Rust ioctl crate (no libdrm-dev needed) and connector enumeration walks `/sys/class/drm` via std::fs (no libudev-dev needed). Building the `*-linux-full` variant additionally needs `libx264-dev libx265-dev libnuma-dev` (and `libvpl-dev` on x86_64 for QSV) — full per-variant matrix in [docs/installation.md](docs/installation.md).
+   `libasound2-dev` is the link-time dep of the on-by-default `display` Cargo feature (HDMI / DisplayPort + ALSA confidence-monitor playout); `drm-rs` is a pure-Rust ioctl crate (no libdrm-dev needed) and connector enumeration walks `/sys/class/drm` via std::fs (no libudev-dev needed). Building the `*-linux-full` variant additionally needs `libx265-dev libnuma-dev` (libx265 + libnuma are statically linked) plus a from-source static `libx264.a` (Debian/Ubuntu's `libx264-dev` ships no static archive), and `libvpl-dev` on x86_64 for QSV — full per-variant matrix in [docs/installation.md](docs/installation.md).
 
 2. **Build**:
    ```bash
@@ -322,7 +322,7 @@ Two variants are published on each tagged release, for Linux x86_64 and Linux AR
 
 The `*-linux-full` binary also includes NVENC for NVIDIA hardware on both architectures, plus QSV (Intel oneVPL) on x86_64 — select `codec: "h264_nvenc"` / `"hevc_nvenc"` / `"h264_qsv"` / `"hevc_qsv"` in your flow config on a matching host; x264/x265 handle everything else.
 
-Both variants are dynamic glibc 2.39+ builds (Ubuntu 24.04 / Debian 12+) and need a few runtime apt packages — at minimum `libasound2` (for the on-by-default local-display output), plus `libx264-dev libx265-dev libnuma1` for the full variant and `libvpl2 intel-media-va-driver-non-free` for QSV on x86_64. NVENC needs only the proprietary NVIDIA driver. See [docs/installation.md](docs/installation.md) for download URLs and the per-variant install matrix.
+Both variants link glibc 2.39+ dynamically (built on Ubuntu 24.04 / Debian 12+). libx264 + libx265 (and libnuma) are **statically linked** into the full variant, so it needs **no codec runtime package** and is *not* tied to a distro's ABI-versioned `libx264.so`/`libx265.so` SONAME — which is exactly what broke earlier full builds on new Ubuntu releases (24.04 ships `libx264.so.164`, 26.04 ships `.165`, ABI-incompatible). The runtime apt packages it still needs are the stable-SONAME system libs: `libasound2` (on-by-default local-display output, all variants), plus `libva2 libva-drm2 libdrm2` for the full variant and `libvpl2 intel-media-va-driver-non-free` for QSV on x86_64. NVENC needs only the proprietary NVIDIA driver. `install-edge.sh` installs these automatically. See [docs/installation.md](docs/installation.md) for download URLs and the per-variant install matrix.
 
 **Commercial-licence customers**: a Softside Tech commercial licence covers the bilbycast source only — it cannot relicense libx264 / libx265, which remain GPL-2.0-or-later in the `*-linux-full` variant. Commercial deployments that need to avoid GPL copyleft should use the default (`*-linux`) variant or build with `video-encoder-nvenc` only (LGPL API layer; NVIDIA covers H.264/H.265 patents at the hardware layer). See [LICENSE.commercial](LICENSE.commercial) for the full scope statement.
 

@@ -363,8 +363,8 @@ See the licensing notes in the main `bilbycast-edge/CLAUDE.md`:
 
 | Backend       | Feature flag              | Library needed (Linux)       | License impact            |
 |---------------|---------------------------|------------------------------|---------------------------|
-| `x264`        | `video-encoder-x264`      | `apt install libx264-dev`    | **GPL v2+** — binary becomes AGPL-3.0-or-later combined work (see `NOTICE.full`). |
-| `x265`        | `video-encoder-x265`      | `apt install libx265-dev`    | **GPL v2+** — same implications as x264. |
+| `x264`        | `video-encoder-x264`      | `apt install libx264-dev` (dev/à-la-carte). **Portable/release builds static-link x264** — build a static `libx264.a` from source (Debian's `libx264-dev` has none) and put it on `PKG_CONFIG_PATH`; otherwise build.rs falls back to a dynamic link tied to the host SONAME. | **GPL v2+** — binary becomes AGPL-3.0-or-later combined work (see `NOTICE.full`). |
+| `x265`        | `video-encoder-x265`      | `apt install libx265-dev` (ships `libx265.a` — static-linked) + `libnuma-dev`. | **GPL v2+** — same implications as x264. |
 | `h264_nvenc`  | `video-encoder-nvenc`     | Build: `nv-codec-headers`. Runtime: NVIDIA proprietary driver (provides `libnvidia-encode.so.1` + `libcuda.so.1`). Nouveau is **not** sufficient. | Royalty-free; API-layer LGPL-compatible. No GPL bundle. |
 | `hevc_nvenc`  | `video-encoder-nvenc`     | same                         | same                      |
 | `h264_qsv`    | `video-encoder-qsv`       | Build: `libvpl-dev` (x86_64). Runtime: **`libvpl2`** + **`libmfx-gen1.2`** (the GPU runtime — most-commonly-missed) + **`intel-media-va-driver-non-free`** (or `intel-media-va-driver`). Intel iGPU (Broadwell / 5th gen+) or Arc dGPU. | Royalty-free; libvpl headers MIT, dispatcher Apache 2.0. No GPL bundle. No `--enable-nonfree` needed. |
@@ -471,15 +471,27 @@ bundled `NOTICE.full` for the full scope statement.
 # Linux — default build (no video encoders, matches *-linux release):
 cargo build --release
 
+# libx264 + libx265 are STATICALLY linked (the binary then has no
+# libx264.so/libx265.so runtime dependency and isn't tied to a distro's
+# ABI-versioned SONAME). libx265-dev ships libx265.a + libnuma is its dep;
+# Debian/Ubuntu's libx264-dev has NO static .a, so build one from source
+# and expose it on PKG_CONFIG_PATH (else build.rs warns and falls back to a
+# non-portable DYNAMIC libx264 link). nasm is required for the x264 asm.
+sudo apt install nasm libx265-dev libnuma-dev
+git clone --depth 1 https://code.videolan.org/videolan/x264.git /tmp/x264
+( cd /tmp/x264 && ./configure --prefix="$HOME/x264-static" \
+    --enable-static --enable-pic --disable-cli && make -j"$(nproc)" && make install )
+export PKG_CONFIG_PATH="$HOME/x264-static/lib/pkgconfig:$PKG_CONFIG_PATH"
+
 # Linux x86_64 — full build (bundles x264 + x265 + NVENC + QSV + VAAPI
 # encoders, plus NVDEC + QSV-decode + VAAPI-decode for the display +
 # transcode-input paths; matches *-x86_64-linux-full release):
-sudo apt install libx264-dev libx265-dev nv-codec-headers libvpl-dev libva-dev
+sudo apt install nv-codec-headers libvpl-dev libva-dev libdrm-dev
 cargo build --release --features video-encoders-full
 
 # Linux aarch64 — full build minus QSV encode + decode (Intel iGPU is
-# x86_64-only):
-sudo apt install libx264-dev libx265-dev nv-codec-headers libva-dev
+# x86_64-only). Same static-x264/x265 prerequisites as above.
+sudo apt install nv-codec-headers libva-dev libdrm-dev
 cargo build --release --features "video-encoder-x264 video-encoder-x265 video-encoder-nvenc video-encoder-vaapi video-decoder-nvdec video-decoder-vaapi"
 
 # Linux — individual opt-ins (à la carte):

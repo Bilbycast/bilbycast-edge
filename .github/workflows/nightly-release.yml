@@ -111,6 +111,11 @@ jobs:
           submodules: recursive
 
       - name: Checkout bilbycast-ffmpeg-video-rs (path dependency)
+        # NOTE: the full-variant STATIC libx264/libx265 link lives in this
+        # repo's libffmpeg-video-sys/build.rs. It's checked out at default-branch
+        # HEAD (no pinned ref); if a tag is cut before that build.rs is merged
+        # here, the build links DYNAMIC and the "Verify binary" ldd gate fails
+        # the release (safe, but the failure reason is otherwise opaque).
         uses: actions/checkout@v6
         with:
           repository: Bilbycast/bilbycast-ffmpeg-video-rs
@@ -157,10 +162,53 @@ jobs:
       - name: Install video-encoder build dependencies
         if: matrix.variant == 'full'
         run: |
-          # libnuma-dev is required because Ubuntu's x265.pc declares `-lnuma`
-          # in Libs.private — FFmpeg configure's link-test for x265 fails with
-          # `ld: cannot find -lnuma` without the -dev symlink.
-          sudo apt-get install -y libx264-dev libx265-dev libnuma-dev
+          # libx264 / libx265 are linked STATICALLY into the binary (see
+          # libffmpeg-video-sys/build.rs) so the release artefact carries no
+          # runtime DT_NEEDED on libx264.so.<build> / libx265.so.<build>. Those
+          # SONAMEs *are* the upstream build number and bump on every distro
+          # release (Ubuntu 24.04 ships libx264.so.164 / libx265.so.199; 26.04
+          # ships .165 / .215, ABI-incompatible), so a dynamically-linked binary
+          # only runs on the exact release it was built on. Static linking is
+          # GPL-neutral — this is already an AGPL-3.0+/GPL-2.0+ combined work.
+          #
+          # x265: libx265-dev ships libx265.a (multilib 8/10/12-bit) which we
+          # static-link directly. libnuma-dev satisfies x265's Libs.private
+          # `-lnuma` at the final static link.
+          sudo apt-get install -y libx265-dev libnuma-dev
+          # x264: Debian/Ubuntu's libx264-dev ships only libx264.so (no .a), so
+          # build a static libx264.a from source and link that.
+          #
+          # REPRODUCIBILITY / GPL: x264 publishes no version tags, only the
+          # moving `stable` branch. For a fully byte-reproducible release you
+          # should pin X264_REF to an immutable commit SHA (then clone + `git
+          # checkout <sha>` since `--branch` only accepts refs/tags). Until
+          # then, we clone `stable` and RECORD the exact resolved SHA into the
+          # artefact (SOURCES-x264.txt, copied into the tarball by the Package
+          # step) so the GPL §3 corresponding-source obligation for the bundled
+          # libx264 is satisfiable for every published build.
+          X264_REF="stable"
+          X264_PREFIX="$HOME/x264-static"
+          # Retry the clone — a single-host upstream failure shouldn't fail the
+          # whole release build (fail-fast:false only isolates per-arch).
+          for attempt in 1 2 3; do
+            git clone --depth 1 --branch "${X264_REF}" \
+              https://code.videolan.org/videolan/x264.git /tmp/x264 && break
+            echo "x264 clone attempt ${attempt} failed; retrying…"; sleep 5
+          done
+          X264_SHA="$(git -C /tmp/x264 rev-parse HEAD)"
+          echo "x264 source: https://code.videolan.org/videolan/x264.git ref=${X264_REF} sha=${X264_SHA}"
+          printf 'libx264 corresponding source\nrepo: https://code.videolan.org/videolan/x264.git\nref:  %s\nsha:  %s\nbuilt: static (--enable-static --enable-pic --disable-cli)\n' \
+            "${X264_REF}" "${X264_SHA}" > "$HOME/x264-SOURCES.txt"
+          echo "X264_SOURCES_FILE=$HOME/x264-SOURCES.txt" >> "$GITHUB_ENV"
+          ( cd /tmp/x264 \
+            && ./configure --prefix="${X264_PREFIX}" --enable-static --enable-pic --disable-cli \
+            && make -j"$(nproc)" \
+            && make install )
+          # Prepend the static x264 prefix so build.rs's pkg-config probe finds
+          # this x264.pc (with a real -L the static-archive detector can see)
+          # ahead of any system copy. Persists to the "Build release binary"
+          # step via $GITHUB_ENV.
+          echo "PKG_CONFIG_PATH=${X264_PREFIX}/lib/pkgconfig:${PKG_CONFIG_PATH:-}" >> "$GITHUB_ENV"
           # nv-codec-headers is not packaged for Ubuntu 24.04 (noble); install
           # from source. Header-only package — `make install` drops headers +
           # ffnvcodec.pc into $PREFIX. Pinned to a tag compatible with vendored
@@ -226,12 +274,36 @@ jobs:
           echo "=== Dynamic dependencies ==="
           ldd "${BINARY}" 2>&1 || true
 
-          echo "=== Checking for libx264/libx265 ==="
-          if ! ldd "${BINARY}" | grep -qE 'libx264|libx265'; then
-            echo "ERROR: binary is missing libx264 or libx265 linkage"
+          echo "=== Checking libx264/libx265 are STATICALLY linked (no runtime .so) ==="
+          # The GPL encoders are static-linked so the artefact has no runtime
+          # dependency on libx264.so.<build> / libx265.so.<build> — those SONAMEs
+          # bump every distro release (24.04 .164/.199 vs 26.04 .165/.215,
+          # ABI-incompatible) and a dynamically-linked binary breaks on a host
+          # shipping a different build. A NEEDED entry here is a regression
+          # (e.g. build.rs fell back to a dynamic link because no static .a was
+          # on the path — check the $HOME/x264-static prefix + libx265-dev).
+          if ldd "${BINARY}" | grep -qE 'libx264|libx265'; then
+            echo "ERROR: binary dynamically links libx264/libx265 — expected a static link:"
+            ldd "${BINARY}" | grep -E 'libx264|libx265' || true
             exit 1
           fi
-          echo "OK: links libx264 and libx265"
+          echo "OK: libx264/libx265 statically linked (no libx264.so/libx265.so NEEDED)"
+
+          echo "=== Positive check: x264/x265 encoders actually baked in ==="
+          # The inverted ldd gate proves the encoders aren't DYNAMIC; this
+          # proves they're actually PRESENT (statically linked) — catches a
+          # hypothetical build that compiled the feature but pulled neither
+          # archive. The release binary is not stripped, so `nm` sees the
+          # static text symbols (x264_encoder_open_NNN / x265_encoder_open_NNN).
+          if ! nm "${BINARY}" 2>/dev/null | grep -qE ' [Tt] x264_encoder_open'; then
+            echo "ERROR: x264 encoder symbol not found in binary (static link missing?)"
+            exit 1
+          fi
+          if ! nm "${BINARY}" 2>/dev/null | grep -qE ' [Tt] x265_encoder_open'; then
+            echo "ERROR: x265 encoder symbol not found in binary (static link missing?)"
+            exit 1
+          fi
+          echo "OK: x264 + x265 encoder symbols defined in the binary (statically linked)"
 
           echo "=== Checking QSV (x86_64 only) ==="
           if [ "${{ matrix.target }}" = "x86_64-unknown-linux-gnu" ]; then
@@ -290,6 +362,13 @@ jobs:
           cp bilbycast-edge/README.md          "${STAGE}/README.md"
           cp bilbycast-edge/NOTICE.full "${STAGE}/NOTICE"
           cp bilbycast-edge/COPYING.GPL "${STAGE}/COPYING.GPL"
+
+          # Record the exact statically-linked libx264 source revision so the
+          # GPL §3 corresponding-source obligation is satisfiable per-build
+          # (libx264 is built from source on the runner; see the x264 step).
+          if [ -n "${X264_SOURCES_FILE:-}" ] && [ -f "${X264_SOURCES_FILE}" ]; then
+            cp "${X264_SOURCES_FILE}" "${STAGE}/SOURCES-x264.txt"
+          fi
 
           # Fill in `{VER}` and `<org>` placeholders in the NOTICE so the
           # shipped file points at the actual tag + repo.
@@ -442,7 +521,7 @@ jobs:
           **MXL** (Media eXchange Layer) support is compiled in. MXL is a shared-memory IPC protocol — the edge discovers the system-installed \`libmxl.so\` at runtime via \`dlopen\` and advertises MXL capabilities only when the library is present. Install MXL system-wide so all MXL-speaking applications on the host share the same library.
 
           ### Runtime dependencies
-          Install \`libx264\`, \`libx265\`, and \`libva\` runtime packages before running: \`sudo apt install libx264-dev libx265-dev libva2 libva-drm2\`. No extra packages needed for NVENC beyond the NVIDIA driver. **For QSV (x86_64 only)**: \`sudo apt install libvpl2 intel-media-va-driver-non-free\` (or \`intel-media-driver\`). **For VAAPI**: install a vendor driver — \`mesa-va-drivers\` for AMD or \`intel-media-va-driver-non-free\` for Intel — then add the running user to the \`render\` group so the edge can open \`/dev/dri/renderD*\`.
+          libx264 / libx265 are **statically linked** into this binary — no \`libx264\` / \`libx265\` runtime package is required, and the binary is not tied to a distro's ABI-versioned \`libx264.so.<build>\` / \`libx265.so.<build>\` SONAME (so it runs on Ubuntu 24.04, 26.04+, Debian, etc. without hunting for a matching \`libx264-NNN\` package). Install the remaining stable-SONAME runtime libraries before running: \`sudo apt install libva2 libva-drm2 libasound2t64\` (use \`libasound2\` on Ubuntu 22.04 / Debian 12). No extra packages needed for NVENC beyond the NVIDIA driver. **For QSV (x86_64 only)**: \`sudo apt install libvpl2 intel-media-va-driver-non-free\` (or \`intel-media-driver\`). **For VAAPI**: install a vendor driver — \`mesa-va-drivers\` for AMD or \`intel-media-va-driver-non-free\` for Intel — then add the running user to the \`render\` group so the edge can open \`/dev/dri/renderD*\`. (\`install-edge.sh\` installs these automatically.)
 
           ## Verify checksums
           \`\`\`
