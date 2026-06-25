@@ -92,6 +92,13 @@ pub struct MediaProgramInfo {
     /// Audio elementary streams declared by the PMT, in PMT order.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub audio_streams: Vec<MediaAudioStreamInfo>,
+    /// Estimated average bitrate of this whole program in bits/sec — the
+    /// summed share of its video + audio + PCR PIDs in the head probe
+    /// window times the whole-mux rate. `None` when no whole-mux rate was
+    /// derivable. Filled by [`MediaLibrary::scan_programs`], not the
+    /// synchronous PAT/PMT walk.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bitrate_bps: Option<u64>,
 }
 
 /// Result of [`MediaLibrary::scan_programs`].
@@ -291,6 +298,7 @@ pub fn scan_programs_in_buf(buf: &[u8]) -> MediaScanResult {
                 pcr_pid: pmt.pcr_pid,
                 video_streams: pmt.video_streams,
                 audio_streams: pmt.audio_streams,
+                bitrate_bps: None,
             }
         })
         .collect();
@@ -304,6 +312,73 @@ pub fn scan_programs_in_buf(buf: &[u8]) -> MediaScanResult {
         bitrate_bps: None,
         duration_ms: None,
         ts_packet_bytes: Some(stride as u16),
+    }
+}
+
+/// Distribute a whole-mux average bitrate across each program and its
+/// elementary streams by each PID's share of the TS packets counted in
+/// the head probe window. Mutates `programs` in place — sets each
+/// stream's `bitrate_bps` and each program's `bitrate_bps` (the summed
+/// share of its owned video + audio + PCR PIDs).
+///
+/// Each PID is attributed to at most ONE program — the first (in
+/// program_number order) that references it owns its bandwidth. A PID
+/// shared across PMTs (a common PCR PID, or a simulcast ES carried once on
+/// the wire) would otherwise be counted for every referencing program and
+/// push the per-program rates above the mux. With single ownership — plus
+/// stuffing (null PID 0x1FFF) / PSI attributed to no program — the
+/// per-program rates sum to at most the mux rate. A reference to an
+/// already-owned PID reports `None` (the bandwidth shows under its owner).
+///
+/// The split is an ESTIMATE sampled from the head window only: for VBR
+/// content, or a file whose head isn't representative (a slate / ad break
+/// at the top), a program's share can drift from its file-wide average.
+fn assign_stream_bitrates(
+    programs: &mut [MediaProgramInfo],
+    counts: &std::collections::HashMap<u16, u64>,
+    total_packets: u64,
+    mux_bitrate_bps: u64,
+) {
+    if total_packets == 0 {
+        return;
+    }
+    let bps_per_packet = mux_bitrate_bps as f64 / total_packets as f64;
+    let to_bps = |pkts: u64| -> u64 { (pkts as f64 * bps_per_packet) as u64 };
+    // PIDs already attributed to an earlier program. `programs` arrives
+    // sorted by program_number, so the lowest-numbered program owns a
+    // PID shared across PMTs.
+    let mut claimed: std::collections::HashSet<u16> = std::collections::HashSet::new();
+    for prog in programs.iter_mut() {
+        let mut prog_packets = 0u64;
+        for v in &mut prog.video_streams {
+            v.bitrate_bps = if claimed.insert(v.pid) {
+                let pkts = counts.get(&v.pid).copied();
+                prog_packets += pkts.unwrap_or(0);
+                pkts.map(|p| to_bps(p))
+            } else {
+                None
+            };
+        }
+        for a in &mut prog.audio_streams {
+            a.bitrate_bps = if claimed.insert(a.pid) {
+                let pkts = counts.get(&a.pid).copied();
+                prog_packets += pkts.unwrap_or(0);
+                pkts.map(|p| to_bps(p))
+            } else {
+                None
+            };
+        }
+        if let Some(pcr) = prog.pcr_pid {
+            // A dedicated PCR-only PID carries packets too; count it once.
+            if claimed.insert(pcr) {
+                prog_packets += counts.get(&pcr).copied().unwrap_or(0);
+            }
+        }
+        prog.bitrate_bps = if prog_packets > 0 {
+            Some(to_bps(prog_packets))
+        } else {
+            None
+        };
     }
 }
 
@@ -473,6 +548,10 @@ impl MediaLibrary {
         let mut result = scan_programs_in_buf(&head);
         result.file_size_bytes = Some(file_size);
 
+        // Stride detection is reused for both the PCR probe below and the
+        // per-PID packet tally that splits the mux bitrate per program.
+        let head_stride = detect_ts_stride(&head);
+
         // Bitrate / duration estimate via PCR delta. Pick the first
         // program's PCR PID — for an MPTS every program shares the wire
         // clock, so any one is fine. Skip cleanly when no PCR is
@@ -483,7 +562,7 @@ impl MediaLibrary {
             .iter()
             .find_map(|p| p.pcr_pid);
         if let Some(pcr_pid) = pcr_pid {
-            if let Some((stride, start)) = detect_ts_stride(&head) {
+            if let Some((stride, start)) = head_stride {
                 let first_pcr = probe::find_first_pcr(&head, stride, start, pcr_pid);
                 if let Some(first_pcr) = first_pcr {
                     let tail_window = TAIL_PROBE_BYTES.min(file_size as usize) as u64;
@@ -530,6 +609,14 @@ impl MediaLibrary {
                     }
                 }
             }
+        }
+
+        // Per-program / per-stream bitrate split. Only meaningful once a
+        // whole-mux rate is known; each PID gets its share of the counted
+        // head-window packets. Estimate — sampled from the head window only.
+        if let (Some(mux_bps), Some((stride, start))) = (result.bitrate_bps, head_stride) {
+            let (counts, total) = probe::count_packets_per_pid(&head, stride, start);
+            assign_stream_bitrates(&mut result.programs, &counts, total, mux_bps);
         }
 
         Ok(result)
@@ -970,6 +1057,110 @@ mod tests {
         assert_eq!(res.programs[0].program_number, 7);
         assert_eq!(res.programs[0].pmt_pid, 0x1007);
         assert_eq!(res.ts_packet_bytes, Some(192));
+    }
+
+    #[test]
+    fn assign_stream_bitrates_splits_mux_by_pid_share() {
+        let mut programs = vec![MediaProgramInfo {
+            program_number: 1,
+            pmt_pid: 0x1000,
+            pcr_pid: Some(0x100),
+            video_streams: vec![MediaVideoStreamInfo {
+                pid: 0x100,
+                codec: "H.264/AVC".into(),
+                stream_type: 0x1B,
+                width: None,
+                height: None,
+                bitrate_bps: None,
+            }],
+            audio_streams: vec![MediaAudioStreamInfo {
+                pid: 0x101,
+                codec: "AAC".into(),
+                stream_type: 0x0F,
+                language: None,
+                bitrate_bps: None,
+            }],
+            bitrate_bps: None,
+        }];
+        let mut counts: std::collections::HashMap<u16, u64> = std::collections::HashMap::new();
+        counts.insert(0x100, 90); // video PID — 90 packets
+        counts.insert(0x101, 10); // audio PID — 10 packets
+        counts.insert(0x1FFF, 50); // stuffing — counted in total, unowned
+        // total = 150 packets, mux = 15 Mbps → 100 kbps per packet.
+        assign_stream_bitrates(&mut programs, &counts, 150, 15_000_000);
+        assert_eq!(programs[0].video_streams[0].bitrate_bps, Some(9_000_000));
+        assert_eq!(programs[0].audio_streams[0].bitrate_bps, Some(1_000_000));
+        // program = video(0x100) + audio(0x101); PCR PID 0x100 dedups against
+        // the video PID → 100 packets → 10 Mbps. Stuffing is excluded.
+        assert_eq!(programs[0].bitrate_bps, Some(10_000_000));
+    }
+
+    #[test]
+    fn assign_stream_bitrates_shared_pid_attributed_once() {
+        // Two programs share audio PID 0x200 (e.g. a common commentary ES)
+        // and each carries its own video. The shared PID must be counted
+        // for exactly one program so the per-program rates never sum above
+        // the mux.
+        let mk_prog = |num: u16, vpid: u16| MediaProgramInfo {
+            program_number: num,
+            pmt_pid: 0x1000 + num,
+            pcr_pid: Some(vpid),
+            video_streams: vec![MediaVideoStreamInfo {
+                pid: vpid,
+                codec: "H.264/AVC".into(),
+                stream_type: 0x1B,
+                width: None,
+                height: None,
+                bitrate_bps: None,
+            }],
+            audio_streams: vec![MediaAudioStreamInfo {
+                pid: 0x200,
+                codec: "AAC".into(),
+                stream_type: 0x0F,
+                language: None,
+                bitrate_bps: None,
+            }],
+            bitrate_bps: None,
+        };
+        let mut programs = vec![mk_prog(1, 0x100), mk_prog(2, 0x110)];
+        let mut counts: std::collections::HashMap<u16, u64> = std::collections::HashMap::new();
+        counts.insert(0x100, 40); // program 1 video
+        counts.insert(0x110, 40); // program 2 video
+        counts.insert(0x200, 20); // shared audio
+        // total = 100 packets, mux = 10 Mbps → 100 kbps per packet.
+        assign_stream_bitrates(&mut programs, &counts, 100, 10_000_000);
+        // Program 1 (lower number) owns the shared audio: 40 video + 20 audio.
+        assert_eq!(programs[0].bitrate_bps, Some(6_000_000));
+        assert_eq!(programs[0].audio_streams[0].bitrate_bps, Some(2_000_000));
+        // Program 2 sees the shared audio already claimed → not counted, None.
+        assert_eq!(programs[1].bitrate_bps, Some(4_000_000));
+        assert_eq!(programs[1].audio_streams[0].bitrate_bps, None);
+        // Invariant: per-program rates sum to at most the mux rate.
+        let sum = programs[0].bitrate_bps.unwrap() + programs[1].bitrate_bps.unwrap();
+        assert!(sum <= 10_000_000, "per-program sum {sum} exceeds mux");
+    }
+
+    #[test]
+    fn assign_stream_bitrates_noop_on_zero_total() {
+        let mut programs = vec![MediaProgramInfo {
+            program_number: 1,
+            pmt_pid: 0x1000,
+            pcr_pid: None,
+            video_streams: vec![MediaVideoStreamInfo {
+                pid: 0x100,
+                codec: "H.264/AVC".into(),
+                stream_type: 0x1B,
+                width: None,
+                height: None,
+                bitrate_bps: None,
+            }],
+            audio_streams: vec![],
+            bitrate_bps: None,
+        }];
+        let counts: std::collections::HashMap<u16, u64> = std::collections::HashMap::new();
+        assign_stream_bitrates(&mut programs, &counts, 0, 15_000_000);
+        assert_eq!(programs[0].bitrate_bps, None);
+        assert_eq!(programs[0].video_streams[0].bitrate_bps, None);
     }
 
     /// Deterministic xorshift64 fill — gives the ~1/256 incidental 0x47

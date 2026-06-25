@@ -31,6 +31,13 @@ pub struct MediaVideoStreamInfo {
     pub width: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub height: Option<u32>,
+    /// Estimated average bitrate of this elementary stream in bits/sec —
+    /// the PID's share of TS packets in the probe window times the
+    /// whole-mux rate. `None` when no whole-mux rate was derivable or the
+    /// PID was absent from the probe window. Filled by the async wrapper
+    /// ([`super::MediaLibrary::scan_programs`]), not the PMT walk.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bitrate_bps: Option<u64>,
 }
 
 /// One audio elementary stream inside a program. Language pulled from the
@@ -42,6 +49,13 @@ pub struct MediaAudioStreamInfo {
     pub stream_type: u8,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub language: Option<String>,
+    /// Estimated average bitrate of this elementary stream in bits/sec —
+    /// the PID's share of TS packets in the probe window times the
+    /// whole-mux rate. `None` when no whole-mux rate was derivable or the
+    /// PID was absent from the probe window. Filled by the async wrapper
+    /// ([`super::MediaLibrary::scan_programs`]), not the PMT walk.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bitrate_bps: Option<u64>,
 }
 
 /// Result of [`scan_pmt_in_buf`].
@@ -118,6 +132,32 @@ pub fn find_last_pcr(buf: &[u8], stride: usize, start: usize, pcr_pid: u16) -> O
         }
     }
     last
+}
+
+/// Tally TS packets per PID across the buffer at the given stride, plus
+/// the total number of sync-aligned packets seen. The media-library scan
+/// uses this to split a whole-mux bitrate into per-program / per-stream
+/// estimates by each PID's share of the probe window. Null-PID stuffing
+/// (0x1FFF) and PSI are counted toward `total` but, being unowned by any
+/// program, simply don't get attributed downstream.
+pub fn count_packets_per_pid(
+    buf: &[u8],
+    stride: usize,
+    start: usize,
+) -> (std::collections::HashMap<u16, u64>, u64) {
+    let mut counts: std::collections::HashMap<u16, u64> = std::collections::HashMap::new();
+    let mut total = 0u64;
+    let mut offset = start;
+    while offset + TS_PACKET_SIZE <= buf.len() {
+        let pkt = &buf[offset..offset + TS_PACKET_SIZE];
+        offset += stride;
+        if pkt[0] != TS_SYNC_BYTE {
+            continue;
+        }
+        total += 1;
+        *counts.entry(ts_pid(pkt)).or_insert(0) += 1;
+    }
+    (counts, total)
 }
 
 /// Walk a TS buffer at the given stride, accumulate the elementary stream
@@ -233,6 +273,7 @@ fn parse_pmt_packet(pkt: &[u8]) -> Option<PmtScanResult> {
                 stream_type,
                 width: None,
                 height: None,
+                bitrate_bps: None,
             }),
             0x24 => res.video_streams.push(MediaVideoStreamInfo {
                 pid: es_pid,
@@ -240,6 +281,7 @@ fn parse_pmt_packet(pkt: &[u8]) -> Option<PmtScanResult> {
                 stream_type,
                 width: None,
                 height: None,
+                bitrate_bps: None,
             }),
             0x01 => res.video_streams.push(MediaVideoStreamInfo {
                 pid: es_pid,
@@ -247,6 +289,7 @@ fn parse_pmt_packet(pkt: &[u8]) -> Option<PmtScanResult> {
                 stream_type,
                 width: None,
                 height: None,
+                bitrate_bps: None,
             }),
             0x02 => res.video_streams.push(MediaVideoStreamInfo {
                 pid: es_pid,
@@ -254,6 +297,7 @@ fn parse_pmt_packet(pkt: &[u8]) -> Option<PmtScanResult> {
                 stream_type,
                 width: None,
                 height: None,
+                bitrate_bps: None,
             }),
             0x61 => res.video_streams.push(MediaVideoStreamInfo {
                 pid: es_pid,
@@ -261,42 +305,49 @@ fn parse_pmt_packet(pkt: &[u8]) -> Option<PmtScanResult> {
                 stream_type,
                 width: None,
                 height: None,
+                bitrate_bps: None,
             }),
             0x03 | 0x04 => res.audio_streams.push(MediaAudioStreamInfo {
                 pid: es_pid,
                 codec: "MPEG Audio".into(),
                 stream_type,
                 language: parse_language_descriptor(desc),
+                bitrate_bps: None,
             }),
             0x0F => res.audio_streams.push(MediaAudioStreamInfo {
                 pid: es_pid,
                 codec: "AAC".into(),
                 stream_type,
                 language: parse_language_descriptor(desc),
+                bitrate_bps: None,
             }),
             0x11 => res.audio_streams.push(MediaAudioStreamInfo {
                 pid: es_pid,
                 codec: "AAC-LATM".into(),
                 stream_type,
                 language: parse_language_descriptor(desc),
+                bitrate_bps: None,
             }),
             0x81 => res.audio_streams.push(MediaAudioStreamInfo {
                 pid: es_pid,
                 codec: "AC-3".into(),
                 stream_type,
                 language: parse_language_descriptor(desc),
+                bitrate_bps: None,
             }),
             0x87 => res.audio_streams.push(MediaAudioStreamInfo {
                 pid: es_pid,
                 codec: "E-AC-3".into(),
                 stream_type,
                 language: parse_language_descriptor(desc),
+                bitrate_bps: None,
             }),
             0xAC => res.audio_streams.push(MediaAudioStreamInfo {
                 pid: es_pid,
                 codec: "AC-4".into(),
                 stream_type,
                 language: parse_language_descriptor(desc),
+                bitrate_bps: None,
             }),
             0x06 => {
                 if let Some(codec) = detect_private_stream_codec(desc) {
@@ -305,6 +356,7 @@ fn parse_pmt_packet(pkt: &[u8]) -> Option<PmtScanResult> {
                         codec,
                         stream_type,
                         language: parse_language_descriptor(desc),
+                        bitrate_bps: None,
                     });
                 }
             }
@@ -708,5 +760,34 @@ mod tests {
     fn mpeg2_seq_dims_returns_none_without_marker() {
         let es = [0xCC; 64];
         assert_eq!(find_mpeg2_seq_dims(&es), None);
+    }
+
+    /// Build a TS packet carrying only the given PID (adaptation/payload
+    /// flags are irrelevant — the counter keys purely on the PID field).
+    fn pid_packet(pid: u16) -> [u8; 188] {
+        let mut pkt = [0xFFu8; 188];
+        pkt[0] = TS_SYNC_BYTE;
+        pkt[1] = ((pid >> 8) & 0x1F) as u8;
+        pkt[2] = (pid & 0xFF) as u8;
+        pkt[3] = 0x10;
+        pkt
+    }
+
+    #[test]
+    fn count_packets_per_pid_tallies_and_totals() {
+        let mut buf = Vec::new();
+        for _ in 0..3 {
+            buf.extend_from_slice(&pid_packet(0x100));
+        }
+        buf.extend_from_slice(&pid_packet(0x101));
+        for _ in 0..2 {
+            buf.extend_from_slice(&pid_packet(0x1FFF)); // null stuffing
+        }
+        let (counts, total) = count_packets_per_pid(&buf, 188, 0);
+        assert_eq!(total, 6);
+        assert_eq!(counts.get(&0x100), Some(&3));
+        assert_eq!(counts.get(&0x101), Some(&1));
+        assert_eq!(counts.get(&0x1FFF), Some(&2));
+        assert_eq!(counts.get(&0x200), None);
     }
 }
