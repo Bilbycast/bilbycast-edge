@@ -422,10 +422,12 @@ async fn main() -> anyhow::Result<()> {
     // output's `hw_decode` field). Idempotent — only the first call
     // wins for the lifetime of the process.
     engine::hardware_probe::install_static_capabilities(static_capabilities.clone());
-    // Local-display enumeration. Linux-only; the cache is consulted by
+    // Local-display enumeration. Linux-only; the snapshot is consulted by
     // both the capability advertisement and the HealthPayload
-    // `display_devices` field. Empty when the box has no DRI nodes —
-    // the `"display"` capability simply isn't advertised in that case.
+    // `display_devices` field, and refreshed live by the display poller
+    // (spawned below) so monitor hot-plug is picked up without a restart.
+    // Empty when the box has no DRI nodes — the `"display"` capability
+    // simply isn't advertised in that case.
     #[cfg(all(feature = "display", target_os = "linux"))]
     {
         let displays = display::init_displays();
@@ -695,6 +697,13 @@ async fn main() -> anyhow::Result<()> {
         event_sender.clone(),
         shutdown_token.clone(),
     );
+
+    // Local-display connector refresh — re-enumerates KMS connectors off the
+    // data path so a monitor hot-plugged after boot appears in the manager
+    // UI connector picker (and re-arms the `"display"` capability) without an
+    // edge restart. Sibling to the cellular / starlink pollers.
+    #[cfg(all(feature = "display", target_os = "linux"))]
+    let _display_poller_handle = display::spawn_display_poller(shutdown_token.clone());
 
     // Spawn system resource monitor (CPU, RAM, optional NVIDIA GPU util)
     let _resource_monitor_handle = engine::resource_monitor::spawn_resource_monitor(

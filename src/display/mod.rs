@@ -6,22 +6,31 @@
 // - `DisplayDevice` / `DisplayMode` / `DisplayKind` types (mirror of the
 //   manager-side enumeration shape; serialised onto
 //   `HealthPayload.display_devices`).
-// - `enumerate_displays()` — one-shot KMS connector probe at edge
-//   startup. Returns an empty Vec on a headless build server so the
-//   `"display"` capability isn't advertised when there's nothing to
-//   render to.
-// - `cached_displays()` — `OnceLock<Vec<DisplayDevice>>` populated once
-//   at startup; consumed by `manager::client` (HealthPayload) and
-//   the REST endpoint.
+// - `enumerate_displays()` — a single KMS connector probe (walk every
+//   `/dev/dri/cardN`, force-probe each connector). Returns an empty Vec on
+//   a headless build server so the `"display"` capability isn't advertised
+//   when there's nothing to render to.
+// - `cached_displays()` — lock-free snapshot of the latest probe
+//   (`ArcSwap<Vec<DisplayDevice>>`). Seeded synchronously at startup by
+//   `init_displays()` and refreshed every `POLL_INTERVAL` by the background
+//   `spawn_display_poller` task, so a monitor hot-plugged after boot shows
+//   up in `HealthPayload.display_devices` (and the manager UI connector
+//   picker) without an edge restart. Consumed by `manager::client`
+//   (HealthPayload + the `"display"` capability gate).
+// - `spawn_display_poller()` — the background re-enumeration task.
 // - `kms` — KMS / DRM CRTC + dumb-buffer + page-flip rendering loop
 //   used by `engine::output_display`.
 // - `audio` — ALSA blocking PCM writer that *is* the master clock.
 // - `clock` — lock-free `AudioClock` shared between display + audio
 //   children.
 
+use std::sync::Arc;
 use std::sync::OnceLock;
+use std::time::Duration;
 
+use arc_swap::ArcSwap;
 use serde::{Deserialize, Serialize};
+use tokio_util::sync::CancellationToken;
 
 pub mod audio;
 pub mod audio_bars;
@@ -90,25 +99,41 @@ pub struct DisplayDevice {
     pub alsa_device: Option<String>,
 }
 
-static CACHED_DISPLAYS: OnceLock<Vec<DisplayDevice>> = OnceLock::new();
+/// How often [`spawn_display_poller`] re-enumerates KMS connectors —
+/// matches the cellular / starlink telemetry cadence, a little faster than
+/// the ~15 s health tick so a fresh snapshot is usually waiting when the
+/// tick reads it. Each pass is one short open + force-probe of every
+/// `/dev/dri/cardN` (~1–5 ms), wholly off the data path.
+const POLL_INTERVAL: Duration = Duration::from_secs(10);
 
-/// Return the startup-time cached connector list. Empty on platforms
-/// where the feature is off, on Linux without `/dev/dri/cardN`, or on
-/// boxes with no graphics adapter at all. Callers should treat the
-/// emptiness as authoritative — the `"display"` capability advertisement
-/// is gated on this being non-empty.
-pub fn cached_displays() -> &'static [DisplayDevice] {
-    CACHED_DISPLAYS
-        .get()
-        .map(|v| v.as_slice())
-        .unwrap_or(&[])
+/// Latest connector snapshot. Seeded by [`init_displays`] at startup and
+/// swapped by [`spawn_display_poller`] each poll cycle. The `OnceLock` only
+/// guards lazy creation of the `ArcSwap` container itself — the connector
+/// list inside is fully mutable across the process lifetime.
+static CACHED_DISPLAYS: OnceLock<ArcSwap<Vec<DisplayDevice>>> = OnceLock::new();
+
+fn store() -> &'static ArcSwap<Vec<DisplayDevice>> {
+    CACHED_DISPLAYS.get_or_init(|| ArcSwap::from_pointee(Vec::new()))
 }
 
-/// Probe the local KMS subsystem once and cache the result. Idempotent —
-/// safe to call multiple times. Subsequent calls return the same slice
-/// reference.
-pub fn init_displays() -> &'static [DisplayDevice] {
-    CACHED_DISPLAYS.get_or_init(enumerate_displays).as_slice()
+/// Return the latest connector snapshot — a lock-free atomic load + `Arc`
+/// clone, cheap enough to call on every health tick. Empty before
+/// [`init_displays`] runs, on platforms where the feature is off, on Linux
+/// without `/dev/dri/cardN`, or on boxes with no graphics adapter at all.
+/// Callers treat emptiness as authoritative — the `"display"` capability is
+/// gated on this being non-empty.
+pub fn cached_displays() -> Arc<Vec<DisplayDevice>> {
+    store().load_full()
+}
+
+/// Probe the local KMS subsystem synchronously and publish the result into
+/// the snapshot. Called once at startup so the first health tick + the
+/// capability advertisement have data before the background poller's first
+/// cycle. Returns the freshly probed snapshot.
+pub fn init_displays() -> Arc<Vec<DisplayDevice>> {
+    let store = store();
+    store.store(Arc::new(enumerate_displays()));
+    store.load_full()
 }
 
 /// Walk every `/dev/dri/cardN` under the system, query each connector,
@@ -117,6 +142,45 @@ pub fn init_displays() -> &'static [DisplayDevice] {
 /// headless build boxes simply won't see the `"display"` capability.
 pub fn enumerate_displays() -> Vec<DisplayDevice> {
     kms::enumerate_displays_kms()
+}
+
+/// Spawn the background connector-refresh poller under the app's
+/// cancellation tree. Re-enumerates KMS connectors every [`POLL_INTERVAL`]
+/// and swaps the result into the snapshot when it changes, so the manager
+/// UI's connector list and the `"display"` capability track monitor
+/// hot-plug / unplug without an edge restart. Enumeration is blocking
+/// syscalls (`open(/dev/dri/cardN)` + DRM ioctls), so each pass runs on a
+/// blocking thread and never stalls the async runtime. No-op cost on
+/// headless hosts — `enumerate_displays` returns empty and an unchanged
+/// snapshot is not re-stored.
+pub fn spawn_display_poller(cancel: CancellationToken) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = cancel.cancelled() => break,
+                _ = tokio::time::sleep(POLL_INTERVAL) => {}
+            }
+            // Enumeration is blocking file / ioctl work — keep it off the
+            // reactor. A panic inside the `drm` crate must not take the
+            // poller (or the runtime) down with it.
+            let devs = match tokio::task::spawn_blocking(enumerate_displays).await {
+                Ok(d) => d,
+                Err(e) => {
+                    tracing::warn!("display: connector re-enumeration task failed: {e}");
+                    continue;
+                }
+            };
+            let prev = store().load_full();
+            if *prev != devs {
+                tracing::info!(
+                    "display: connector list changed — {} connector(s), {} with a monitor attached",
+                    devs.len(),
+                    devs.iter().filter(|d| d.connected).count(),
+                );
+                store().store(Arc::new(devs));
+            }
+        }
+    })
 }
 
 #[cfg(test)]
