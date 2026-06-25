@@ -972,6 +972,15 @@ are stored on the edge. Resolution order:
 3. `$HOME/.bilbycast/media/`.
 4. `./media/` (cwd fallback).
 
+> **Packaged installs** pin `BILBYCAST_MEDIA_DIR` (and `BILBYCAST_REPLAY_DIR`)
+> to `<data-root>/{media,replay}` (default `/var/lib/bilbycast/edge/…`) in
+> `/etc/bilbycast/edge.env` and create those dirs owned by the `bilbycast`
+> service account. This is deliberate: the `bilbycast` system user typically
+> has no writable home, so the `$HOME`-based fallbacks (steps 2–3) resolve to
+> a path the service can't create — every upload then fails with
+> `Permission denied (os error 13)`. If you create the service user by hand
+> (outside `install-edge.sh`), set `BILBYCAST_MEDIA_DIR` yourself.
+
 Files are written `0644`. Per-asset cap: **4 GiB** (`MAX_FILE_BYTES`).
 Library cap: **16 GiB** total (`MAX_TOTAL_BYTES`). Partial uploads stage
 under `<media_dir>/.tmp/<name>.<session_id>` and are reaped after 1 hour

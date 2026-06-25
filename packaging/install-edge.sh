@@ -578,8 +578,16 @@ if [[ ! -f "${ENV_FILE}" ]]; then
 # bilbycast-edge runtime environment.
 # Tunable via systemctl restart bilbycast-edge (no daemon-reload needed).
 RUST_LOG=info
-# BILBYCAST_REPLAY_DIR=/var/lib/bilbycast/edge/replay
-# BILBYCAST_MEDIA_DIR=/var/lib/bilbycast/edge/media
+
+# Media library + replay storage roots. Pinned to the service state dir so
+# uploads + recordings never depend on the bilbycast user's \$HOME. A system
+# account usually has no writable home, and the binary's default fallback
+# (\$XDG_DATA_HOME → \$HOME/.bilbycast/{media,replay} → ./...) then fails every
+# upload with "Permission denied (os error 13)". These dirs are created
+# bilbycast-owned by this installer. Set on fresh installs only — an existing
+# node keeps whatever location it already uses (re-runs never rewrite this).
+BILBYCAST_MEDIA_DIR=${DATA_ROOT}/media
+BILBYCAST_REPLAY_DIR=${DATA_ROOT}/replay
 
 # Self-signed / untrusted manager TLS cert. The edge refuses to connect to a
 # manager whose cert isn't publicly trusted UNLESS both this env var is set to
@@ -614,6 +622,12 @@ BILBYCAST_MLOCKALL=1
 ${TXTIME_LINE}
 EOF
     chmod 0640 "${ENV_FILE}"
+    # Create the pinned media + replay roots (bilbycast-owned) so uploads +
+    # recordings work on first boot without depending on the service user's
+    # $HOME. Fresh-install only — coupled to the env pins written above; an
+    # existing node keeps whatever location it already uses.
+    install -d -o bilbycast -g bilbycast -m 0755 "${DATA_ROOT}/media"
+    install -d -o bilbycast -g bilbycast -m 0755 "${DATA_ROOT}/replay"
 else
     # Env file pre-exists (operator may have customised it) — only flip the
     # specific knobs this run asks for, idempotently. Never clobber the file.
