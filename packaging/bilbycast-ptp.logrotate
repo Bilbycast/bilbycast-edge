@@ -1,0 +1,25 @@
+# /etc/logrotate.d/bilbycast-ptp
+#
+# The three main bilbycast services (edge, relay, gateway) log to
+# journald and need NO logrotate config — journald rotates itself
+# (see journald.conf: SystemMaxUse / MaxRetentionSec).
+#
+# This file exists only for the third-party linuxptp daemons that the
+# bilbycast PTP helper (bilbycast-ptp-gm.sh) spawns: ptp4l and phc2sys
+# append directly to plain files under /var/log/bilbycast-ptp/, which
+# would otherwise grow unbounded over days/weeks of runtime.
+#
+# copytruncate is required: the daemons are started via `nohup ... >>`
+# and hold the file open in append mode with no log-reopen signal, so
+# a rename-based rotation would leave them writing to the rotated inode.
+/var/log/bilbycast-ptp/*.log {
+    daily
+    rotate 7
+    maxsize 100M
+    missingok
+    notifempty
+    compress
+    delaycompress
+    copytruncate
+    su bilbycast bilbycast
+}

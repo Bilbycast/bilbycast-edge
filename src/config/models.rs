@@ -460,10 +460,17 @@ pub struct TlsConfig {
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
-            listen_addr: "0.0.0.0".to_string(),
-            // Dual-stack by default for new installs. Existing configs
-            // without this field keep `listen_addr`-only behaviour.
-            listen_addrs: Some(vec!["0.0.0.0".to_string(), "[::]".to_string()]),
+            // Loopback-only by default (defense-in-depth). The local HTTP
+            // API + setup wizard ship with auth disabled, and the edge's
+            // control plane is the OUTBOUND manager WebSocket — it needs no
+            // inbound listener to be managed. Operators who want LAN/remote
+            // access override with `--bind-addrs 0.0.0.0,[::]` (or set
+            // `server.listen_addrs` in config.json) and should also enable
+            // `server.auth`. Only affects fresh configs — existing
+            // config.json files keep their explicit address (loopback IPv4 +
+            // IPv6 here so the dual-stack listener path stays exercised).
+            listen_addr: "127.0.0.1".to_string(),
+            listen_addrs: Some(vec!["127.0.0.1".to_string(), "[::1]".to_string()]),
             listen_port: 8080,
             tls: None,
             auth: None,

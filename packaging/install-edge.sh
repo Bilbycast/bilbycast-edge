@@ -405,7 +405,8 @@ if [[ "${UPGRADE_INSTALLER}" -eq 0 || ! -f "${CONFIG_FILE}" ]]; then
 {
   "version": 2,
   "server": {
-    "listen_addr": "0.0.0.0",
+    "_comment": "Loopback-only by default: the API + setup wizard ship with auth off, and the edge is managed via the OUTBOUND manager WebSocket (no inbound needed). To expose on the LAN, set listen_addr/listen_addrs to 0.0.0.0 and enable server.auth.",
+    "listen_addr": "127.0.0.1",
     "listen_port": 8080
   },
   "manager": {
@@ -582,6 +583,15 @@ install -d -o bilbycast -g bilbycast -m 0755 /var/log/bilbycast-ptp
 # @{etc_ro}/linuxptp/** so the staged path lives there.
 install -d -m 0755 /etc/linuxptp
 
+# logrotate for the ptp4l / phc2sys file logs under /var/log/bilbycast-ptp.
+# The edge/relay/gateway services log to journald (self-rotating); only
+# these third-party linuxptp daemons write unbounded plain files, so this
+# is the only logrotate config we ship.
+PTP_LOGROTATE_SRC="${VERSION_DIR}/packaging/bilbycast-ptp.logrotate"
+if [[ -d /etc/logrotate.d && -f "${PTP_LOGROTATE_SRC}" ]]; then
+    install -m 0644 "${PTP_LOGROTATE_SRC}" /etc/logrotate.d/bilbycast-ptp
+fi
+
 # AppArmor local override — lets ptp4l reply to bilbycast / pmc
 # client sockets under /tmp/. Belt-and-braces alongside the F4
 # abstract-socket fix in edge 0.89.0+.
@@ -697,6 +707,17 @@ fi
 
 systemctl daemon-reload
 systemctl enable --now bilbycast-edge
+
+# ── Local HTTP API bind notice ─────────────────────────────────────────
+# The seeded config binds the local API to 127.0.0.1 (auth ships off).
+# The edge is managed over the outbound manager WS, so this is fine for
+# the registration flow above. Print how to expose it for operators who
+# want the on-box dashboard/API from another machine.
+echo
+echo "Local HTTP API: bound to 127.0.0.1:8080 (loopback only, auth disabled)."
+echo "  Reach it on-box, or via an SSH tunnel: ssh -L 8080:127.0.0.1:8080 <host>"
+echo "  To expose on the LAN, set server.listen_addr/listen_addrs in"
+echo "  ${CONFIG_FILE} and enable server.auth — see docs/api-security.md."
 
 # ── Optional: per-interface strict binding ─────────────────────────────
 # Strict mode (`SO_BINDTODEVICE` on each input/output socket) requires
