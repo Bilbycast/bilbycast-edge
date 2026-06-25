@@ -4412,6 +4412,13 @@ pub enum BondPathTransportConfig {
     },
     /// QUIC path (TLS 1.3 + DATAGRAM extension). Full-duplex.
     Quic {
+        /// QUIC role. **Auto-derived from the side** — a bonded *output*
+        /// (sender) leg is always the `client`, a bonded *input* (receiver)
+        /// leg is always the `server`. Optional in config (defaults to
+        /// `client`) and any explicit value is overridden by the side at
+        /// build time, so operators never need to set it. Kept as a field
+        /// only for back-compat with configs that still carry it.
+        #[serde(default)]
         role: BondQuicRole,
         /// Client: remote `host:port`. Server: local bind.
         addr: String,
@@ -4442,9 +4449,12 @@ pub enum BondRistRole {
     Receiver,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum BondQuicRole {
+    /// Default — overridden by the leg's side at build time (output → client,
+    /// input → server). The value is never authoritative.
+    #[default]
     Client,
     Server,
 }

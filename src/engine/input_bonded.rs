@@ -31,8 +31,8 @@ use bonding_transport::{
 };
 
 use crate::config::models::{
-    BondEqualizationMode, BondFecAlgorithm, BondFecConfig, BondPathTransportConfig, BondQuicRole,
-    BondQuicTls, BondRistRole, BondedInputConfig,
+    BondEqualizationMode, BondFecAlgorithm, BondFecConfig, BondPathTransportConfig, BondQuicTls,
+    BondRistRole, BondedInputConfig,
 };
 
 /// Equalization latency budget (= the bonding-latency knob) applied when a
@@ -390,17 +390,16 @@ fn translate_transport_for_receiver(
             }
         }
         BondPathTransportConfig::Quic {
-            role,
+            role: _,
             addr,
             server_name,
             tls,
             bind,
             interface,
         } => BondPathTxTransport::Quic {
-            role: match role {
-                BondQuicRole::Client => BondQuicRoleTx::Client,
-                BondQuicRole::Server => BondQuicRoleTx::Server,
-            },
+            // Role is auto-derived from the side: a bonded input (receiver) leg is
+            // always the QUIC server. Any value carried in the config is ignored.
+            role: BondQuicRoleTx::Server,
             addr: parse_sockaddr(addr)?,
             server_name: server_name.clone(),
             tls: translate_tls(tls)?,

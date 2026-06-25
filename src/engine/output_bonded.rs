@@ -933,6 +933,28 @@ async fn bonded_output_run(
     }
 }
 
+/// Derive the sender retransmit-buffer capacity (in packets) from the bonding
+/// latency budget and the aggregate per-leg send ceiling, per the library's
+/// own sizing guidance (send rate × longest acceptable NACK round-trip).
+/// Floored at the library default so it never regresses below the old fixed
+/// 8192-packet behaviour, and capped so a fat/long-budget bond can't request an
+/// unbounded ring.
+fn derive_retransmit_capacity(cfg: &BondedOutputConfig) -> usize {
+    const DEFAULT_CAPACITY: usize = 8192;
+    const MAX_CAPACITY: usize = 262_144; // ~345 MB ring ceiling
+    const BUNDLE_BYTES: u64 = 1316; // 7 × 188 B TS bundle per bond packet
+    const ASSUMED_LEG_BPS: u64 = 20_000_000; // when a leg declares no ceiling
+    let budget_ms = cfg.max_bonding_latency_ms.unwrap_or(1000) as u64;
+    let aggregate_bps: u64 = cfg
+        .paths
+        .iter()
+        .map(|p| p.max_bitrate_bps.unwrap_or(ASSUMED_LEG_BPS))
+        .sum();
+    let bits_in_flight = aggregate_bps.saturating_mul(budget_ms) / 1000;
+    let derived = (bits_in_flight / (BUNDLE_BYTES * 8)) as usize;
+    derived.clamp(DEFAULT_CAPACITY, MAX_CAPACITY)
+}
+
 fn build_sender_cfg(cfg: &BondedOutputConfig) -> anyhow::Result<BondSocketConfig> {
     let mut out = BondSocketConfig {
         flow_id: cfg.bond_flow_id,
@@ -942,9 +964,15 @@ fn build_sender_cfg(cfg: &BondedOutputConfig) -> anyhow::Result<BondSocketConfig
     if let Some(ms) = cfg.keepalive_ms {
         out.keepalive_interval = std::time::Duration::from_millis(ms as u64);
     }
-    if let Some(cap) = cfg.retransmit_capacity {
-        out.retransmit_capacity = cap;
-    }
+    // Retransmit-buffer capacity: an explicit operator value wins; otherwise
+    // derive it the way the library asks the caller to — send rate × the
+    // longest acceptable NACK round-trip (the bonding latency budget). We size
+    // it from the aggregate per-leg ceiling (max_bitrate_bps, or a generous
+    // 20 Mbps/leg assumption when a leg has no cap) over the budget, floored at
+    // the library default so we never go below today's behaviour.
+    out.retransmit_capacity = cfg
+        .retransmit_capacity
+        .unwrap_or_else(|| derive_retransmit_capacity(cfg));
     // Per-leg equalization (sender side): in auto/on, stamp data packets so the
     // receiver can measure relative one-way delay and time-align the legs.
     out.equalization = super::input_bonded::map_equalization_mode(cfg.equalization);
@@ -1054,7 +1082,7 @@ fn build_congestion(c: &BondCongestionConfig) -> CongestionConfig {
 fn translate_transport_for_sender(
     t: &crate::config::models::BondPathTransportConfig,
 ) -> anyhow::Result<BondPathTxTransport> {
-    use crate::config::models::{BondPathTransportConfig, BondQuicRole, BondRistRole};
+    use crate::config::models::{BondPathTransportConfig, BondRistRole};
     use bonding_transport::{QuicRole as BondQuicRoleTx, RistRole as BondRistRoleTx};
     Ok(match t {
         BondPathTransportConfig::Udp {
@@ -1102,17 +1130,16 @@ fn translate_transport_for_sender(
             buffer_ms: *buffer_ms,
         },
         BondPathTransportConfig::Quic {
-            role,
+            role: _,
             addr,
             server_name,
             tls,
             bind,
             interface,
         } => BondPathTxTransport::Quic {
-            role: match role {
-                BondQuicRole::Client => BondQuicRoleTx::Client,
-                BondQuicRole::Server => BondQuicRoleTx::Server,
-            },
+            // Role is auto-derived from the side: a bonded output (sender) leg is
+            // always the QUIC client. Any value carried in the config is ignored.
+            role: BondQuicRoleTx::Client,
             addr: parse_sockaddr(addr)?,
             server_name: server_name.clone(),
             tls: translate_tls(tls)?,

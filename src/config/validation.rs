@@ -1755,7 +1755,7 @@ fn validate_bond_path_transport(
     sender_mode: bool,
     path_name: &str,
 ) -> Result<()> {
-    use crate::config::models::{BondPathTransportConfig, BondQuicRole, BondRistRole};
+    use crate::config::models::{BondPathTransportConfig, BondRistRole};
     match t {
         BondPathTransportConfig::Udp {
             bind,
@@ -1896,35 +1896,23 @@ fn validate_bond_path_transport(
             bind,
             interface,
         } => {
-            let expected = if sender_mode {
-                BondQuicRole::Client
-            } else {
-                BondQuicRole::Server
-            };
-            if *role != expected {
-                return Err(anyhow::anyhow!(
-                    "bonded QUIC path '{path_name}' role mismatch: side expects {} but got {}",
-                    match expected {
-                        BondQuicRole::Client => "client",
-                        BondQuicRole::Server => "server",
-                    },
-                    match role {
-                        BondQuicRole::Client => "client",
-                        BondQuicRole::Server => "server",
-                    }
-                ));
-            }
+            // `role` is auto-derived from the side (output → client, input →
+            // server) and overridden at build time, so we don't reject a
+            // mismatching or absent role; the side is authoritative. The
+            // client-only checks below key off `sender_mode`, not the field.
+            let _ = role;
             validate_socket_addr(addr, "bonded QUIC path addr")?;
-            if matches!(role, BondQuicRole::Client) && server_name.is_empty() {
+            if sender_mode && server_name.is_empty() {
                 return Err(anyhow::anyhow!(
-                    "bonded QUIC client path '{path_name}' requires server_name"
+                    "bonded QUIC client (output) path '{path_name}' requires server_name"
                 ));
             }
             // Per-leg source bind is client-only (the server binds `addr`).
             if let Some(b) = bind {
-                if !matches!(role, BondQuicRole::Client) {
+                if !sender_mode {
                     return Err(anyhow::anyhow!(
-                        "bonded QUIC path '{path_name}': `bind` is client-only (server binds `addr`)"
+                        "bonded QUIC path '{path_name}': `bind` is client-only — only a bonded \
+                         output (sender/client) leg pins a source bind (the server binds `addr`)"
                     ));
                 }
                 validate_socket_addr(b, "bonded QUIC path bind")?;
@@ -1946,18 +1934,23 @@ fn validate_bond_path_transport(
 /// the port-conflict check can spot bonded inputs colliding with
 /// other services. Returns `None` for paths that don't pin a port
 /// (sender-role RIST, QUIC client, UDP sender-mode with no bind).
-fn bond_path_bind_addr(t: &crate::config::models::BondPathTransportConfig) -> Option<String> {
-    use crate::config::models::{BondPathTransportConfig, BondQuicRole, BondRistRole};
+///
+/// `sender_mode` is the leg's side (true on a bonded output). It is
+/// authoritative for QUIC because the QUIC `role` field is auto-derived
+/// from the side now — a receiver-side (input) QUIC leg is the server and
+/// binds `addr`, regardless of any value the field still carries.
+fn bond_path_bind_addr(
+    t: &crate::config::models::BondPathTransportConfig,
+    sender_mode: bool,
+) -> Option<String> {
+    use crate::config::models::{BondPathTransportConfig, BondRistRole};
     match t {
         BondPathTransportConfig::Udp { bind, .. } => bind.clone(),
         BondPathTransportConfig::Rist {
             role, local_bind, ..
         } if *role == BondRistRole::Receiver => local_bind.clone(),
-        BondPathTransportConfig::Quic {
-            role: BondQuicRole::Server,
-            addr,
-            ..
-        } => Some(addr.clone()),
+        // Receiver-side QUIC leg is the server → it binds `addr`.
+        BondPathTransportConfig::Quic { addr, .. } if !sender_mode => Some(addr.clone()),
         _ => None,
     }
 }
@@ -5413,6 +5406,16 @@ fn validate_bond_fec_inner(
                 }
             }
             BondFecAlgorithm::Xor => {
+                // `parity_max` is a Reed-Solomon-only (per-leg) knob — it has no
+                // meaning for XOR and the combined bond-wide FEC ignores it. Reject
+                // it rather than silently drop it, mirroring how `reed_solomon` is
+                // rejected on the combined path above.
+                if !allow_rs && f.parity_max.is_some() {
+                    return Err(anyhow::anyhow!(
+                        "{ctx}: parity_max is a per-leg Reed-Solomon knob — it has no effect on \
+                         the bond-wide XOR `fec`"
+                    ));
+                }
                 if !(1..=64).contains(&f.columns) {
                     return Err(anyhow::anyhow!("{ctx}: fec.columns must be in [1, 64]"));
                 }
@@ -7021,7 +7024,7 @@ fn validate_port_conflicts(config: &AppConfig) -> Result<()> {
             // pre-register for conflict detection.
             InputConfig::Bonded(cfg) => {
                 for (i, p) in cfg.paths.iter().enumerate() {
-                    if let Some(bind) = bond_path_bind_addr(&p.transport) {
+                    if let Some(bind) = bond_path_bind_addr(&p.transport, /* sender_mode */ false) {
                         register(
                             &bind,
                             Proto::Udp,
@@ -7153,7 +7156,7 @@ fn validate_port_conflicts(config: &AppConfig) -> Result<()> {
             }
             OutputConfig::Bonded(cfg) => {
                 for (i, p) in cfg.paths.iter().enumerate() {
-                    if let Some(bind) = bond_path_bind_addr(&p.transport) {
+                    if let Some(bind) = bond_path_bind_addr(&p.transport, /* sender_mode */ true) {
                         register(
                             &bind,
                             Proto::Udp,
@@ -7360,6 +7363,47 @@ mod tests {
         // Combined XOR still validates either way.
         let xor = Some(BondFecConfig { columns: 10, rows: 10, algorithm: None, parity_max: None });
         assert!(validate_bond_fec_inner(&xor, "ctx", false).is_ok());
+        // parity_max is a per-leg RS-only knob: silently ignored on the combined
+        // bond-wide XOR before, now rejected so it can't read as a no-op.
+        let xor_pm =
+            Some(BondFecConfig { columns: 10, rows: 10, algorithm: None, parity_max: Some(20) });
+        assert!(
+            validate_bond_fec_inner(&xor_pm, "ctx", false).is_err(),
+            "parity_max on combined XOR rejected"
+        );
+        // ...but parity_max is fine on a per-leg leg (allow_rs = true) where XOR
+        // ignores it without harm (RS uses it).
+        assert!(validate_bond_fec_inner(&xor_pm, "ctx", true).is_ok());
+    }
+
+    #[test]
+    fn bonded_quic_role_is_optional_and_side_authoritative() {
+        use crate::config::models::OutputConfig;
+        // A bonded OUTPUT (sender) QUIC leg with NO `role` field — it must
+        // deserialize (serde default) and validate; the side makes it a client.
+        let no_role = r#"{
+            "type": "bonded", "id": "bo1", "name": "bond",
+            "bond_flow_id": 1,
+            "paths": [{ "id": 0, "name": "q", "transport": {
+                "type": "quic", "addr": "203.0.113.9:9000",
+                "server_name": "peer", "tls": { "mode": "self_signed" }
+            }}]
+        }"#;
+        let out: OutputConfig = serde_json::from_str(no_role).expect("deserialize without role");
+        assert!(validate_output(&out).is_ok(), "QUIC leg with omitted role validates");
+
+        // A bonded output leg that still carries the *wrong* role ("server")
+        // no longer errors — the side is authoritative and overrides it.
+        let wrong_role = r#"{
+            "type": "bonded", "id": "bo2", "name": "bond",
+            "bond_flow_id": 1,
+            "paths": [{ "id": 0, "name": "q", "transport": {
+                "type": "quic", "role": "server", "addr": "203.0.113.9:9000",
+                "server_name": "peer", "tls": { "mode": "self_signed" }
+            }}]
+        }"#;
+        let out: OutputConfig = serde_json::from_str(wrong_role).expect("deserialize wrong role");
+        assert!(validate_output(&out).is_ok(), "stale wrong role no longer rejected");
     }
 
     #[test]
