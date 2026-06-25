@@ -41,7 +41,7 @@ jobs:
       should_release: ${{ steps.check_release.outputs.should_release }}
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Get version from Cargo.toml
         id: get_version
@@ -97,14 +97,14 @@ jobs:
     runs-on: ${{ matrix.runner }}
     steps:
       - name: Checkout bilbycast-libsrt-rs (path dependency)
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           repository: Bilbycast/bilbycast-libsrt-rs
           path: bilbycast-libsrt-rs
           submodules: recursive
 
       - name: Checkout bilbycast-fdk-aac-rs (path dependency)
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           repository: Bilbycast/bilbycast-fdk-aac-rs
           path: bilbycast-fdk-aac-rs
@@ -116,7 +116,7 @@ jobs:
         # HEAD (no pinned ref); if a tag is cut before that build.rs is merged
         # here, the build links DYNAMIC and the "Verify binary" ldd gate fails
         # the release (safe, but the failure reason is otherwise opaque).
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           repository: Bilbycast/bilbycast-ffmpeg-video-rs
           path: bilbycast-ffmpeg-video-rs
@@ -124,27 +124,27 @@ jobs:
           fetch-depth: 0
 
       - name: Checkout bilbycast-rist (path dependency)
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           repository: Bilbycast/bilbycast-rist
           path: bilbycast-rist
           submodules: recursive
 
       - name: Checkout bilbycast-bonding (path dependency)
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           repository: Bilbycast/bilbycast-bonding
           path: bilbycast-bonding
 
       - name: Checkout bilbycast-mxl-rs (path dependency)
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           repository: Bilbycast/bilbycast-mxl-rs
           path: bilbycast-mxl-rs
           submodules: recursive
 
       - name: Checkout bilbycast-edge
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           path: bilbycast-edge
 
@@ -413,7 +413,7 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           path: bilbycast-edge
 
