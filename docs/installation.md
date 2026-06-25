@@ -771,6 +771,90 @@ The edge raises Critical `display_audio_open_failed` events and, after
 10 consecutive failures, `display_audio_disabled_persistent_failure`
 (see the event catalogue).
 
+**Host prerequisites (NVIDIA GPUs + desktop systems).** The display
+output is a bare KMS/DRM page-flip renderer — it programs a connector's
+CRTC directly. Three host-level conditions trip up first-time setup;
+none is a bilbycast bug, but all are required for the connector to light
+up. (These are separate from, and additional to, the NVENC/NVDEC
+transcoding prerequisites in *Running on an NVIDIA host* above.)
+
+1. **NVIDIA: enable DRM kernel modesetting (`nvidia-drm.modeset=1`).**
+   On hosts driving the panel through the NVIDIA proprietary driver, DRM
+   modesetting is **off** unless the kernel was booted with
+   `nvidia-drm.modeset=1`. Without it the `nvidia_drm` node comes up
+   without KMS, so the edge's connector enumeration finds nothing: the
+   connector does not appear in the manager's display dropdown and a
+   configured display output fails with `display_device_invalid`. (If a
+   connector *does* enumerate but the modeset is then rejected, you'll
+   see Critical `display_mode_set_failed` instead.) Either way the panel
+   never lights up. This is a general NVIDIA-on-Linux
+   KMS requirement (every Wayland/DRM app needs it). AMD (`amdgpu`) and
+   Intel (`i915`/`xe`) enable KMS by default and need no equivalent flag.
+
+   ```sh
+   # /etc/modprobe.d/nvidia-drm.conf
+   options nvidia-drm modeset=1
+   # rebuild initramfs (Debian/Ubuntu) and reboot:
+   sudo update-initramfs -u && sudo reboot
+   # verify after reboot (must print Y):
+   cat /sys/module/nvidia_drm/parameters/modeset
+   ```
+
+   (Alternatively add `nvidia-drm.modeset=1` to `GRUB_CMDLINE_LINUX_DEFAULT`
+   in `/etc/default/grub` and run `sudo update-grub`.)
+
+   **Use a current NVIDIA driver.** Older driver branches paired with a
+   newer kernel can initialise KMS but then fail to deliver page-flip
+   completion interrupts — dmesg shows `[nvidia-drm] Flip event timeout
+   on head 0` and the panel stays black. The edge now bounds the flip
+   wait and raises a Warning `display_flip_timeout` (it no longer hangs)
+   but cannot work around a driver that never completes flips. If you see
+   `display_flip_timeout`, upgrade to a current driver branch
+   (e.g. `nvidia-driver-580` or newer on recent kernels) and reboot.
+
+2. **Stop the desktop compositor — it holds the DRM master.** Only one
+   process can be DRM master of a connector at a time, and a running
+   graphical session (GDM / a Wayland compositor / an X server) already
+   holds it. While a compositor is active the edge cannot program the
+   CRTC: it parks in a retry loop, emitting a Warning `display_output_waiting`
+   event (`reason: "kms_busy"`) whose `kms_error_code` is `display_master_busy`
+   ("another DRM master … already owns connector …"). **Run the edge on a
+   headless host (no display manager), or stop the compositor first:**
+
+   ```sh
+   sudo systemctl stop gdm            # or gdm3 / sddm / lightdm
+   # keep it off across reboots (recommended for a dedicated monitor):
+   sudo systemctl set-default multi-user.target
+   ```
+
+   To return the box to a desktop later, **stop the edge first** — it
+   holds the DRM master + CRTC for the lifetime of the display output and
+   releases only on shutdown. If `bilbycast-edge` is still running, Xorg/
+   GDM fails to acquire modesetting permission and GDM crash-loops:
+
+   ```sh
+   sudo systemctl stop bilbycast-edge
+   sleep 2                            # let the DRM master release propagate
+   sudo systemctl start gdm
+   ```
+
+3. **Console / VT noise (cosmetic).** The edge does not take over the
+   Linux virtual terminal or the kernel console. After you stop the
+   desktop session, the framebuffer console (fbcon) keeps owning the
+   active VT (tty1) and the kernel `printk` ring keeps routing messages
+   to it, so VT text and kernel DRM messages can appear over the picture.
+   This is generic Linux behaviour. Tidy it at the OS level:
+
+   ```sh
+   sudo chvt 2                                   # move the text console off the displayed VT
+   sudo sysctl -w kernel.printk='1 4 1 7'        # quiet kernel console logging
+   # persist: echo "kernel.printk = 1 4 1 7" | sudo tee /etc/sysctl.d/99-bilbycast-display.conf
+   ```
+
+   For an unattended confidence monitor you can also pass `quiet`,
+   `vt.global_cursor_default=0`, and/or `fbcon=map:1` on the kernel
+   command line.
+
 The schema is unconditional on every host (configs round-trip
 cleanly), but the runtime spawner is `cfg(all(feature = "display",
 target_os = "linux"))`. macOS dev builds reject `display` outputs at

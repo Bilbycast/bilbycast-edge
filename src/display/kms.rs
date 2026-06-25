@@ -567,6 +567,19 @@ struct DumbBuffer {
     fb: framebuffer::Handle,
 }
 
+/// Upper bound on how long [`KmsDisplay::wait_page_flip`] waits for a
+/// queued page flip's `DRM_EVENT_FLIP_COMPLETE` before declaring the
+/// GPU/driver wedged and returning a distinct `display_flip_timeout`
+/// error. The DRM fd is opened blocking (no `O_NONBLOCK`), so without a
+/// bound a driver that has stopped posting vblank-completion events
+/// (e.g. broken `nvidia-drm` flip IRQs — dmesg "Flip event timeout on
+/// head 0") would hang the display thread forever with no event. 500 ms
+/// is ~12 vblanks at 24 Hz / ~30 at 60 Hz — generous against any real
+/// broadcast panel (so it never false-fires on a healthy-but-busy host)
+/// while still bounding a true hang to sub-second, keeping the display
+/// loop responsive to its cancel token.
+const FLIP_EVENT_TIMEOUT_MS: u64 = 500;
+
 impl KmsDisplay {
     /// Open the KMS card backing `connector_name`, drm-master the device,
     /// pick the requested mode (or the connector's preferred mode when
@@ -586,8 +599,20 @@ impl KmsDisplay {
         let (card_path, connector) = locate_connector(connector_name)?;
         let card = open_card(&card_path)?;
         // drm-master is required for atomic modeset; on most distributions
-        // a regular user gets it via `seat0` automatically.
-        let _ = card.acquire_master_lock();
+        // a regular user gets it via `seat0`/logind automatically. Don't
+        // silently discard the result: when a desktop compositor / display
+        // manager already owns the device this fails, the modeset below then
+        // returns EACCES, and we turn that into a clear `display_master_busy`
+        // (see `set_crtc` handling below) instead of the misleading
+        // "rejected the mode".
+        if let Err(e) = card.acquire_master_lock() {
+            tracing::debug!(
+                "display: could not explicitly acquire DRM master on '{}' ({e}); \
+                 relying on logind/seat auto-grant — a compositor-held master \
+                 surfaces as EACCES at modeset",
+                connector_name
+            );
+        }
         // Universal planes + atomic must both be enabled before
         // `plane_handles()` returns Primary planes and before the
         // atomic_commit ioctl is willing to accept our requests. Either
@@ -623,8 +648,28 @@ impl KmsDisplay {
         let mut b = alloc_dumb_buffer(&card, w as u32, h as u32)?;
 
         // Program the initial mode-set on framebuffer A.
-        card.set_crtc(crtc, Some(a.fb), (0, 0), &[connector], Some(mode))
-            .context("display_mode_set_failed: drmModeSetCrtc rejected the mode")?;
+        if let Err(e) = card.set_crtc(crtc, Some(a.fb), (0, 0), &[connector], Some(mode)) {
+            // EACCES / EPERM here is the signature of another DRM master
+            // (a desktop compositor / display manager — GDM, gnome-shell,
+            // an X server) already owning the connector: the kernel refuses
+            // a modeset from a non-master. Surface a distinct, actionable
+            // `display_master_busy` so the operator stops the compositor or
+            // runs headless, rather than the misleading "rejected the mode"
+            // (which reads like a bad resolution). A genuinely unsupported
+            // mode fails with EINVAL / ENOSPC and keeps `display_mode_set_failed`.
+            let denied = matches!(e.raw_os_error(), Some(libc::EACCES) | Some(libc::EPERM));
+            return Err(anyhow::Error::new(e).context(if denied {
+                format!(
+                    "display_master_busy: another DRM master (a desktop compositor / \
+                     display manager such as GDM) already owns connector '{}' — stop it \
+                     (e.g. `sudo systemctl stop gdm`) or run the edge on a headless host; \
+                     see docs/installation.md (Local-display output)",
+                    connector_name
+                )
+            } else {
+                "display_mode_set_failed: drmModeSetCrtc rejected the mode".to_string()
+            }));
+        }
 
         // Drop the unused borrow guard so the helper compiles; the
         // dumb-buffer destructors clean up on `Drop`.
@@ -1465,10 +1510,11 @@ impl KmsDisplay {
     /// at the next vblank without reprogramming the CRTC. Cost is
     /// microseconds, not the 10–30 ms of `drmModeSetCrtc`.
     ///
-    /// The DRM fd is opened in blocking mode (no `O_NONBLOCK`), so the
-    /// `read()` inside `receive_events()` blocks until events arrive.
-    /// The loop guards against unrelated events (e.g. a vblank request
-    /// from another consumer) being drained ahead of our flip event.
+    /// Completion is awaited via [`Self::wait_page_flip`], which polls the
+    /// (blocking-mode) DRM fd with a [`FLIP_EVENT_TIMEOUT_MS`] bound so a
+    /// driver that has stopped posting flip-completion events can't hang
+    /// the display thread forever — it returns `display_flip_timeout`
+    /// instead.
     pub fn present(&mut self) -> Result<()> {
         let back_idx = 1 - self.front_idx;
         self.card
@@ -1479,23 +1525,7 @@ impl KmsDisplay {
                 None,
             )
             .context("display_page_flip_failed: page_flip queue")?;
-        loop {
-            let events = self
-                .card
-                .receive_events()
-                .context("display_page_flip_failed: receive_events")?;
-            let mut flipped = false;
-            for ev in events {
-                if let Event::PageFlip(p) = ev {
-                    if p.crtc == self.crtc {
-                        flipped = true;
-                    }
-                }
-            }
-            if flipped {
-                break;
-            }
-        }
+        self.wait_page_flip()?;
         self.front_idx = back_idx;
         Ok(())
     }
@@ -3154,8 +3184,55 @@ impl KmsDisplay {
             .map_err(|e| anyhow::Error::new(e).context("display_prime_page_flip_failed: set_crtc"))
     }
 
+    /// Block until the kernel posts `DRM_EVENT_FLIP_COMPLETE` for our
+    /// CRTC, OR [`FLIP_EVENT_TIMEOUT_MS`] elapses with no completion.
+    ///
+    /// The DRM fd is blocking (no `O_NONBLOCK`), so a bare `receive_events()`
+    /// would `read()`-block forever if the driver stopped posting the
+    /// vblank-completion event (broken `nvidia-drm` flip IRQs, a wedged
+    /// GPU). We `poll()` the fd against a deadline first so that case
+    /// returns a distinct `display_flip_timeout` error — the display loop
+    /// then drops the frame, emits a throttled `display_flip_timeout`
+    /// event, and keeps trying (cancel-aware) instead of dead-locking the
+    /// thread. The loop still guards against unrelated events being drained
+    /// ahead of our flip.
     fn wait_page_flip(&self) -> Result<()> {
+        use std::os::fd::{AsFd, AsRawFd};
+        let raw = self.card.as_fd().as_raw_fd();
+        let deadline =
+            std::time::Instant::now() + std::time::Duration::from_millis(FLIP_EVENT_TIMEOUT_MS);
         loop {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                anyhow::bail!(
+                    "display_flip_timeout: no DRM page-flip completion event within {} ms — \
+                     the GPU/driver has stopped posting vblank completions (a black or frozen \
+                     panel). On NVIDIA, verify `nvidia-drm.modeset=1` is set and the driver \
+                     version is current; see docs/installation.md (Local-display output)",
+                    FLIP_EVENT_TIMEOUT_MS
+                );
+            }
+            // `.max(1)`: a sub-millisecond remainder must block for ~1 ms in
+            // poll() rather than return instantly — `Duration::as_millis()`
+            // floors, so without it the last <1 ms of the budget would
+            // busy-spin (poll(timeout=0) returns immediately). The
+            // top-of-loop `is_zero()` check still bounds the total wait
+            // (deadline overrun ≤ one ~1 ms slice).
+            let slice = remaining.as_millis().max(1).min(i32::MAX as u128) as libc::c_int;
+            let mut pfd = libc::pollfd { fd: raw, events: libc::POLLIN, revents: 0 };
+            // SAFETY: single initialised pollfd; the kernel only writes `revents`.
+            let rc = unsafe { libc::poll(&mut pfd as *mut libc::pollfd, 1, slice) };
+            if rc < 0 {
+                let err = std::io::Error::last_os_error();
+                if err.kind() == std::io::ErrorKind::Interrupted {
+                    continue; // EINTR — re-poll against the same deadline
+                }
+                return Err(anyhow::Error::new(err)
+                    .context("display_page_flip_failed: poll(drm_fd)"));
+            }
+            if rc == 0 {
+                continue; // slice expired with no event — the deadline check ends it
+            }
             let events = self
                 .card
                 .receive_events()
@@ -3167,6 +3244,8 @@ impl KmsDisplay {
                     }
                 }
             }
+            // Unrelated event(s) drained ahead of ours — re-poll for the
+            // remaining budget.
         }
     }
 

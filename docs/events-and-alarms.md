@@ -811,14 +811,15 @@ the offending output row on a multi-output flow.
 |---|---|---|---|
 | `display_started` | Info | Modeset succeeded, ALSA opened (or muted), first frame queued | `details = { error_code: "ok", output_id, … }` |
 | `display_stopped` | Info | Cancellation token fired; CRTC + framebuffers + ALSA released | Includes lifetime `frames_displayed` / `late_drops` / `audio_underruns` |
-| `display_output_waiting` | Info | Another flow's display output already holds the targeted `(device, audio_device)` pair. The output has registered as a FCFS waiter on the per-edge `DisplayClaimRegistry` and parks here until the holder releases or the per-output cancel token fires. `KmsDisplay::open` has not been attempted yet. | `details = { error_code: "display_output_waiting", output_id, device, audio_device, holder_flow_id, holder_output_id, queue_position }` |
+| `display_output_waiting` | Info / Warning | **Two cases.** (1) Another flow's display output on THIS edge already holds the `(device, audio_device)` pair: the output registers as a FCFS waiter on the per-edge `DisplayClaimRegistry` and parks until the holder releases (Info). (2) `KmsDisplay::open` itself failed and is being retried on a 500 ms cancel-aware backoff (Warning, `reason: "kms_busy"`) — most often because another process (a desktop compositor / display manager holding the DRM master, or a second edge on the host) owns the connector. A successful open after retries emits `display_output_acquired`. | (1) `details = { error_code: "display_output_waiting", output_id, device, audio_device, holder_flow_id, holder_output_id, queue_position }`. (2) `details = { error_code: "display_output_waiting", output_id, device, audio_device, reason: "kms_busy", kms_error_code, kms_error_message }` — `kms_error_code` is `display_master_busy` when a compositor/display-manager holds the DRM master (stop it, e.g. `systemctl stop gdm`, or run headless) |
 | `display_output_acquired` | Info | The per-edge `DisplayClaimRegistry` promoted this output to be the new holder of the `(device, audio_device)` pair. Always follows a `display_output_waiting` for the same `(flow_id, output_id)`; pairs with the existing `display_started` event a moment later (after the KMS modeset). | `details = { error_code: "display_output_acquired", output_id, device, audio_device, previous_holder_flow_id, previous_holder_output_id }` |
 | `display_auto_matched` | Info | `scaling_mode: match_source` modeset to the source-covering mode succeeded | Fires on first decoded frame and again on every source-shape change |
 | `display_auto_match_failed` | Warning | `scaling_mode: match_source` modeset rejected by KMS — output keeps running at the startup mode | Lifts whatever `display_*` error string KMS returned |
 | `display_monitor_native_set` | Info | `scaling_mode: monitor_native` modeset to the connector-preferred (panel-native) mode succeeded | Fires once per output start; usually a no-op since KMS opened at preferred |
 | `display_monitor_native_set_failed` | Warning | `scaling_mode: monitor_native` modeset rejected by KMS — output keeps running at the startup mode | Same shape as `display_auto_match_failed` |
 | `display_device_unavailable` | Critical | KMS connector vanished mid-flow (cable unplug observed via udev or `drmModeGetConnector` `connection != connected`) | Surfaces `error_code: display_device_unavailable` |
-| `display_mode_set_failed` | Critical | `drmModeSetCrtc` returned `EINVAL` / `ENOSPC` for the chosen resolution / refresh | `error_code: display_resolution_unsupported` or `display_mode_set_failed` |
+| `display_mode_set_failed` | Critical | `drmModeSetCrtc` returned `EINVAL` / `ENOSPC` for the chosen resolution / refresh on an enumerated connector | `error_code: display_resolution_unsupported` or `display_mode_set_failed`. Note: a missing `nvidia-drm.modeset=1` usually fails *earlier* — the connector doesn't enumerate at all, surfacing `display_device_invalid` (below), not this. This fires when a connector enumerated but the chosen mode was rejected |
+| `display_flip_timeout` | Warning | A queued page flip's `DRM_EVENT_FLIP_COMPLETE` did not arrive within `FLIP_EVENT_TIMEOUT_MS` (500 ms) — the GPU/driver stopped posting vblank completions (black/frozen panel; classic dmesg `[nvidia-drm] Flip event timeout on head 0` on an older NVIDIA driver + newer kernel). The display thread no longer hangs: it drops the frame, keeps retrying (cancel-aware), and recovers automatically if completions resume. Throttled to ~one event / 30 s. | `details = { error_code: "display_flip_timeout", output_id }`. Remediation: upgrade to a current NVIDIA driver branch and verify `nvidia-drm.modeset=1` |
 | `display_audio_open_failed` | Critical | `snd_pcm_open` returned non-zero, or ALSA `writei` returned `ENODEV` mid-stream | `error_code: display_audio_device_invalid` / `display_audio_open_failed` |
 | `display_decoder_overload` | Warning | `frames_dropped_late` > 5 % over a 5-s rolling window | Indicates the SW video decoder can't keep up — recommend HW decode (v2) or a smaller resolution |
 | `display_av_drift` | Warning | `|av_sync_offset_ms|` > 100 ms sustained ≥ 3 s | Audio-vs-video drift exceeded the dup/drop window |
@@ -843,6 +844,22 @@ Operator-driven `command_ack.error_code` values (lifted from
 | `display_audio_track_not_found` | Configured `audio_track_index` exceeds the PMT's audio-stream count |
 | `display_device_busy` | Reserved for future use. The previous "static-config rejection on duplicate `(device, audio_device)`" semantics no longer apply: the validator now logs a `warn!` and allows duplicates so the runtime `DisplayClaimRegistry` can serialise them via take-over. Runtime contention emits `display_output_waiting` / `display_output_acquired` instead |
 | `display_decoder_overload_predicted` | Validation-time warning when 4K60 is requested without HW decode — does NOT block save; surfaced as a hint in the manager UI |
+
+**Display diagnostic codes that do *not* ride `command_ack`** (listed
+here for lookup; they appear in event `details`, not as a command
+response):
+
+- `display_master_busy` — another DRM master (a desktop compositor /
+  display manager such as GDM, gnome-shell, or an X server) already owns
+  the connector, so `drmModeSetCrtc` returned `EACCES`/`EPERM`. Distinct
+  from `display_mode_set_failed` (a genuinely unsupported mode →
+  `EINVAL`/`ENOSPC`). Rides as the `kms_error_code` field inside the
+  `kms_busy` variant of the `display_output_waiting` event. Remediation:
+  stop the compositor (`sudo systemctl stop gdm`) or run the edge headless.
+- `display_flip_timeout` — the standalone Warning event above: a queued
+  page flip's completion never arrived within 500 ms (the GPU/driver
+  stopped posting vblank completions). Remediation: a current NVIDIA
+  driver + `nvidia-drm.modeset=1`.
 
 Configuration schema and operator-visible knobs live in
 [`docs/configuration-guide.md`](configuration-guide.md) under

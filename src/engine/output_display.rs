@@ -500,6 +500,14 @@ async fn run_display_output(
     let force_cpu_blit_for_bars = Arc::new(AtomicBool::new(
         meter_snapshot.is_some() && !bars_overlay_active,
     ));
+    // Sticky cross-task demotion: set by the display task the first time a
+    // zero-copy (PRIME) framebuffer import is rejected by the kernel (addfb
+    // EINVAL — e.g. an NV12 tiling modifier the scanout plane won't accept,
+    // classic on Intel Gen9 Yf_TILED on kernel >= 6.2). Once set, the decode
+    // task downloads VAAPI surfaces to sysmem so every subsequent frame takes
+    // the working CPU-blit path instead of black-screening on a doomed prime
+    // present. Mirrors the `force_cpu_blit_for_bars` sharing pattern.
+    let prime_scanout_failed = Arc::new(AtomicBool::new(false));
 
     // Display is a terminal consumer — it decodes the flow's broadcast
     // channel and renders to KMS + ALSA. No encoder runs, so register a
@@ -566,6 +574,7 @@ async fn run_display_output(
     // `HDR_OUTPUT_METADATA` on the connector (panel does HDR).
     let demux_panel_hdr_capable = kms.panel_hdr_capable();
     let demux_force_cpu_blit_for_bars = Arc::clone(&force_cpu_blit_for_bars);
+    let demux_prime_scanout_failed = Arc::clone(&prime_scanout_failed);
     let demux_output_stats = Arc::clone(&output_stats);
     let demux_audio_decode_counters = Arc::clone(&audio_decode_counters);
     let demux_video_decode_counters = Arc::clone(&video_decode_counters);
@@ -587,6 +596,7 @@ async fn run_display_output(
             demux_frame_gen,
             demux_panel_hdr_capable,
             demux_force_cpu_blit_for_bars,
+            demux_prime_scanout_failed,
             demux_output_stats,
             demux_audio_decode_counters,
             demux_video_decode_counters,
@@ -608,16 +618,20 @@ async fn run_display_output(
     // active mode (e.g. "display (3840x2160@60Hz · vaapi-zerocopy)").
     // Static strings — the resolver runs once per output.
     //
-    // VAAPI in this codebase is **always** the zero-copy DMA-BUF +
-    // KMS-PRIME scanout path: the decoder produces VAAPI surfaces, the
-    // demux loop maps each to an `AVDRMFrameDescriptor`, and the
-    // display task atomic-page-flips onto the imported framebuffer
-    // without any libswscale or dumb-buffer copy. There is no
-    // VAAPI-decode-then-sysmem-blit configuration today (that mode
-    // would only be useful if a future driver refused PRIME export
-    // for a particular stream profile; at that point a `vaapi`
-    // (sysmem) label can be added beside `vaapi-zerocopy` and the
-    // runtime can track which engaged).
+    // VAAPI starts on the zero-copy DMA-BUF + KMS-PRIME scanout path: the
+    // decoder produces VAAPI surfaces, the demux loop maps each to an
+    // `AVDRMFrameDescriptor`, and the display task atomic-page-flips onto
+    // the imported framebuffer without any libswscale or dumb-buffer copy.
+    // The label below is therefore the *initial* mode. If the kernel later
+    // rejects the PRIME framebuffer import (addfb EINVAL on a tiling
+    // modifier the scanout plane won't accept — e.g. Intel Gen9 NV12
+    // Yf_TILED on kernel >= 6.2), the display task sets `prime_scanout_failed`
+    // and the decode loop demotes to a VAAPI-decode-then-sysmem-blit path for
+    // the rest of the run (download_to_sysmem + libswscale + dumb buffer). The
+    // static label stays `vaapi-zerocopy`; the one-shot
+    // `display_prime_fallback_engaged` Warning event is the operator's signal
+    // that the demotion engaged. (A dynamic `vaapi (sysmem)` label could be
+    // surfaced off `prime_scanout_failed` later if the UI needs it.)
     let decoder_kind_label: &'static str = match (resolved, hw_unavailable_reason) {
         // Soft-fallback path: operator asked for HW but the host can't
         // do it. We're running CPU but the UI must reflect *why* — so
@@ -635,6 +649,7 @@ async fn run_display_output(
     };
     let display_frame_gen = Arc::clone(&frame_gen);
     let display_force_cpu_blit = Arc::clone(&force_cpu_blit_for_bars);
+    let display_prime_scanout_failed = Arc::clone(&prime_scanout_failed);
     let display_handle = tokio::task::spawn_blocking(move || {
         display_loop(
             kms,
@@ -651,6 +666,7 @@ async fn run_display_output(
             display_scaling_mode,
             display_frame_gen,
             display_force_cpu_blit,
+            display_prime_scanout_failed,
         );
     });
 
@@ -848,6 +864,7 @@ fn demux_decode_loop(
     frame_gen: Arc<AtomicU64>,
     panel_hdr_capable: bool,
     force_cpu_blit_for_bars: Arc<AtomicBool>,
+    prime_scanout_failed: Arc<AtomicBool>,
     output_stats: Arc<OutputStatsAccumulator>,
     audio_decode_counters: Arc<DecodeStats>,
     video_decode_counters: Arc<VideoDecodeStats>,
@@ -1012,6 +1029,7 @@ fn demux_decode_loop(
                         &frame_gen,
                         panel_hdr_capable,
                         &force_cpu_blit_for_bars,
+                        &prime_scanout_failed,
                         stream_ids,
                         &video_decode_counters,
                         &output_stats,
@@ -1044,6 +1062,7 @@ fn demux_decode_loop(
                         &frame_gen,
                         panel_hdr_capable,
                         &force_cpu_blit_for_bars,
+                        &prime_scanout_failed,
                         stream_ids,
                         &video_decode_counters,
                         &output_stats,
@@ -1085,6 +1104,7 @@ fn demux_decode_loop(
                         &frame_gen,
                         panel_hdr_capable,
                         &force_cpu_blit_for_bars,
+                        &prime_scanout_failed,
                         stream_ids,
                         &video_decode_counters,
                         &output_stats,
@@ -1862,6 +1882,7 @@ fn handle_video_au(
     frame_gen: &AtomicU64,
     panel_hdr_capable: bool,
     force_cpu_blit_for_bars: &AtomicBool,
+    prime_scanout_failed: &AtomicBool,
     stream_ids: StreamIds,
     video_decode_counters: &VideoDecodeStats,
     output_stats: &OutputStatsAccumulator,
@@ -1977,6 +1998,7 @@ fn handle_video_au(
         codec,
         panel_hdr_capable,
         force_cpu_blit_for_bars,
+        prime_scanout_failed,
         stream_ids,
         video_decode_counters,
         output_stats,
@@ -2091,6 +2113,21 @@ fn pts_jump(prev: Option<u64>, pts: u64) -> bool {
     forward.min(backward) > PTS_JUMP_THRESHOLD_90K
 }
 
+/// Classify a `blit_and_present` error string (a zero-copy PRIME frame's
+/// `present_prime` failure): `true` when it is a PERMANENT scanout
+/// rejection that will fail identically on every future frame — the kernel
+/// refused the PRIME framebuffer import (`addfb` EINVAL on a tiling
+/// modifier the scanout plane won't accept, e.g. Intel Gen9 NV12 Yf_TILED)
+/// or the descriptor was malformed. The display task demotes to the
+/// CPU-blit (sysmem-download) path on `true`. Transient page-flip failures
+/// (`display_prime_page_flip_failed`, typically EBUSY) return `false` — they
+/// self-heal on the next frame and must NOT tear down zero-copy for the
+/// rest of the session.
+fn prime_scanout_permanently_rejected(err_msg: &str) -> bool {
+    err_msg.contains("display_prime_addfb_failed")
+        || err_msg.contains("display_prime_invalid")
+}
+
 fn feed_video_decoder(
     decoder: &mut VideoDecoder,
     nalus: &[Vec<u8>],
@@ -2185,6 +2222,7 @@ fn drain_video_frames(
     codec: VideoCodec,
     panel_hdr_capable: bool,
     force_cpu_blit_for_bars: &AtomicBool,
+    prime_scanout_failed: &AtomicBool,
     stream_ids: StreamIds,
     video_decode_counters: &VideoDecodeStats,
     output_stats: &OutputStatsAccumulator,
@@ -2316,10 +2354,16 @@ fn drain_video_frames(
         // and the display task's CPU-blit path takes over.
         let over_sw_ceiling =
             frame.width() > 1920 || frame.height() > 1080;
+        // Sticky demotion wins over the SW-blit ceiling: once the display
+        // task has reported that zero-copy PRIME scanout is rejected on this
+        // host, sysmem download + CPU-blit is the ONLY way to a picture, so
+        // we pay the libswscale cost even above 1080p rather than black-screen.
+        let prime_dead = prime_scanout_failed.load(Ordering::Relaxed);
         let need_sysmem = frame.is_vaapi()
-            && !over_sw_ceiling
-            && ((source_is_hdr && !panel_hdr_capable)
-                || force_cpu_blit_for_bars.load(Ordering::Relaxed));
+            && (prime_dead
+                || (!over_sw_ceiling
+                    && ((source_is_hdr && !panel_hdr_capable)
+                        || force_cpu_blit_for_bars.load(Ordering::Relaxed))));
         let frame =
             if need_sysmem {
                 match frame.download_to_sysmem() {
@@ -2658,6 +2702,7 @@ fn display_loop(
     scaling_mode: DisplayScalingMode,
     frame_gen: Arc<AtomicU64>,
     force_cpu_blit_signal: Arc<AtomicBool>,
+    prime_scanout_failed: Arc<AtomicBool>,
 ) {
     // Frame period derived from the observed PTS deltas — used to size
     // the late-drop threshold. 33 ms (30 fps) until we've seen enough
@@ -2702,6 +2747,14 @@ fn display_loop(
     // evidence. One line per second keeps a hard-broken present path
     // visible without flooding.
     let mut last_blit_err_warn_at: Option<Instant> = None;
+    // Wedge tracking for the dedicated `display_flip_timeout` event. Only
+    // the FIRST frame after the GPU stops posting completions carries the
+    // `display_flip_timeout` string; while the flip stays pending every
+    // later frame fails with EBUSY instead. `flip_wedged` latches the
+    // condition (cleared by the next successful present) so the event
+    // emits as a throttled heartbeat for the whole wedge, not a one-shot.
+    let mut flip_wedged = false;
+    let mut last_flip_timeout_warn_at: Option<Instant> = None;
     // Tracks whether the panel mode currently in force was picked with
     // a stabilised source-fps hint. The first frame fires a modeset
     // with `frame_period_ms = 33` (default) — fine for picking the
@@ -3146,9 +3199,79 @@ fn display_loop(
             meter.as_ref(),
             &header_buf,
         ) {
-            Ok(()) => true,
+            Ok(()) => {
+                // A successful flip clears any wedge latch so a later
+                // recurrence re-fires the heartbeat immediately (rather than
+                // waiting out a stale 30 s throttle).
+                if flip_wedged {
+                    flip_wedged = false;
+                    last_flip_timeout_warn_at = None;
+                }
+                true
+            }
             Err(e) => {
+                let msg = format!("{e:#}");
+                // A zero-copy (PRIME) frame whose framebuffer import the
+                // kernel rejected (addfb EINVAL on a tiling modifier the
+                // scanout plane won't accept — classic on Intel Gen9 NV12
+                // Yf_TILED, or a malformed descriptor) can never scan out on
+                // this host. Demote ONCE: signal the decode task to download
+                // VAAPI surfaces to sysmem from here on, so the next frame
+                // arrives as a CPU frame and takes the libswscale blit path.
+                // Transient page-flip failures (EBUSY) are NOT a demotion
+                // trigger — they self-heal on the next frame.
+                let import_rejected =
+                    next.prime.is_some() && prime_scanout_permanently_rejected(&msg);
+                if import_rejected
+                    && !prime_scanout_failed.swap(true, Ordering::Relaxed)
+                {
+                    emit_event(
+                        &event_sender,
+                        EventSeverity::Warning,
+                        "display_prime_fallback_engaged",
+                        &flow_id,
+                        &output_id,
+                        &format!(
+                            "display zero-copy (PRIME) scanout rejected by the kernel — \
+                             demoting to CPU-blit (sysmem download) for the rest of this run: {msg}"
+                        ),
+                    );
+                }
+                // A bounded page-flip wait that elapsed with no completion
+                // event means the GPU/driver has stopped posting vblank
+                // completions (wedged scanout — e.g. broken nvidia-drm flip
+                // IRQs). Only the FIRST such frame carries the
+                // `display_flip_timeout` string; while that flip stays pending
+                // every later frame fails with EBUSY ("page_flip queue" /
+                // "atomic_commit busy") instead — so latch the wedge in
+                // `flip_wedged` (cleared by the next successful present above)
+                // and emit a throttled (~one / 30 s) `display_flip_timeout`
+                // heartbeat for its whole duration, not a single blip. The
+                // loop keeps trying and stays cancel-responsive; it recovers
+                // automatically once the driver resumes firing completions.
                 let now = Instant::now();
+                if msg.contains("display_flip_timeout") {
+                    flip_wedged = true;
+                }
+                if flip_wedged {
+                    let timeout_due = last_flip_timeout_warn_at
+                        .map(|t| now.duration_since(t) >= std::time::Duration::from_secs(30))
+                        .unwrap_or(true);
+                    if timeout_due {
+                        last_flip_timeout_warn_at = Some(now);
+                        emit_event(
+                            &event_sender,
+                            EventSeverity::Warning,
+                            "display_flip_timeout",
+                            &flow_id,
+                            &output_id,
+                            "display page flips are not completing — the GPU/driver stopped \
+                             posting vblank completions (a black or frozen panel). On NVIDIA, \
+                             verify `nvidia-drm.modeset=1` is set and the driver version is \
+                             current; see docs/installation.md (Local-display output)",
+                        );
+                    }
+                }
                 let due = last_blit_err_warn_at
                     .map(|t| now.duration_since(t) >= std::time::Duration::from_secs(1))
                     .unwrap_or(true);
@@ -3158,7 +3281,7 @@ fn display_loop(
                         output_id = %output_id,
                         zero_copy = next.prime.is_some(),
                         bars_overlay = kms.bars_overlay_dims().is_some(),
-                        "display blit/present failed: {e:#}",
+                        "display blit/present failed: {msg}",
                     );
                 }
                 false
@@ -3827,6 +3950,11 @@ fn audio_loop(
 fn classify_kms_error(msg: &str) -> &'static str {
     if msg.contains("display_resolution_unsupported") {
         "display_resolution_unsupported"
+    } else if msg.contains("display_master_busy") {
+        // A compositor / display manager holds the DRM master — checked
+        // before display_mode_set_failed because both ride the set_crtc
+        // path; the EACCES variant is the master-busy one.
+        "display_master_busy"
     } else if msg.contains("display_mode_set_failed") {
         "display_mode_set_failed"
     } else if msg.contains("display_device_invalid") {
@@ -3855,6 +3983,67 @@ fn emit_event(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The KMS-open error classifier must map a compositor-held DRM master
+    /// (the `display_master_busy` context string emitted by `KmsDisplay::open`
+    /// on EACCES) to its own code — checked BEFORE `display_mode_set_failed`
+    /// because both ride the `set_crtc` path — so the operator-facing
+    /// `display_output_waiting` event lifts the actionable "stop the
+    /// compositor" code rather than the misleading "rejected the mode".
+    #[test]
+    fn classify_kms_error_distinguishes_master_busy_from_mode_set_failed() {
+        assert_eq!(
+            classify_kms_error(
+                "display_master_busy: another DRM master (a desktop compositor / display \
+                 manager such as GDM) already owns connector 'HDMI-A-1' — stop it"
+            ),
+            "display_master_busy"
+        );
+        assert_eq!(
+            classify_kms_error("display_mode_set_failed: drmModeSetCrtc rejected the mode"),
+            "display_mode_set_failed"
+        );
+        assert_eq!(
+            classify_kms_error("display_resolution_unsupported: 4096x2160@60"),
+            "display_resolution_unsupported"
+        );
+        // A master-busy string that also happens to mention the mode must
+        // still classify as master_busy (ordering guarantee).
+        assert_eq!(
+            classify_kms_error(
+                "display_master_busy: ... — see display_mode_set_failed troubleshooting"
+            ),
+            "display_master_busy"
+        );
+    }
+
+    /// The PRIME-scanout demotion (option 2, Gen9 NV12 Yf_TILED black-screen
+    /// fix) must engage on a permanent framebuffer-import rejection but stay
+    /// dormant for a transient page-flip EBUSY — otherwise a one-frame EBUSY
+    /// collision would permanently downgrade a working zero-copy output to
+    /// the CPU-blit path. Error strings mirror the `context()` / `bail!`
+    /// messages produced by `KmsDisplay::present_prime` in `display::kms`.
+    #[test]
+    fn prime_scanout_demotes_on_addfb_einval_not_on_page_flip_ebusy() {
+        // Permanent — the modifier / descriptor is rejected on every frame.
+        assert!(prime_scanout_permanently_rejected(
+            "display zero-copy present failed: display_prime_addfb_failed: \
+             add_planar_framebuffer: Invalid argument (os error 22)"
+        ));
+        assert!(prime_scanout_permanently_rejected(
+            "display_prime_invalid: descriptor has no planes"
+        ));
+        // Transient — a previous nonblocking commit is still in flight; the
+        // next frame retries. Must NOT demote.
+        assert!(!prime_scanout_permanently_rejected(
+            "display_prime_page_flip_failed: atomic_commit busy (frame dropped): \
+             Device or resource busy (os error 16)"
+        ));
+        // Unrelated CPU-blit-path errors are not a zero-copy signal either.
+        assert!(!prime_scanout_permanently_rejected(
+            "display back-buffer unavailable"
+        ));
+    }
 
     /// Smoke test for the chroma discriminator. The display blit
     /// matches on `VideoFrameChroma`, so the enum must keep its two

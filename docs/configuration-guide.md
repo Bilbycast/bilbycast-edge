@@ -1505,7 +1505,7 @@ output.
 ```
 
 - **`device`** (required) — KMS connector name from
-  [`HealthPayload.display_devices`](events-and-alarms.md#display-events).
+  [`HealthPayload.display_devices`](events-and-alarms.md#display-output-events-display).
   Validated against the canonical KMS pattern `^[A-Z][A-Z0-9-]{0,63}$`
   (e.g. `HDMI-A-1`, `DP-2`, `DVI-D-1`).
 - **`audio_device`** — ALSA device id (`hw:N,M` / `plughw:N,M` /
@@ -1630,11 +1630,24 @@ for the KMS render). 4K60 outputs scale to ≈1025 — comparable to a
   validator no longer rejects duplicates — it logs a `warn!` and
   lets the runtime queue handle it.
 
-See [`docs/events-and-alarms.md`](events-and-alarms.md#display-events)
+**Host prerequisites (NVIDIA / desktop systems).** Because the display
+output programs the connector's CRTC directly, the host must satisfy a
+few KMS/DRM conditions before a picture appears — most commonly
+`nvidia-drm.modeset=1` on NVIDIA GPUs, and **no desktop compositor**
+holding the DRM master (stop GDM / run headless). A compositor-held
+master surfaces as a Warning `display_output_waiting` event carrying
+`kms_error_code: display_master_busy`; a driver that stops posting
+page-flip completions surfaces as the Warning `display_flip_timeout` event.
+The full setup recipe (NVIDIA modeset, driver currency, stopping/
+restoring the desktop, console/VT noise) lives in
+[`docs/installation.md`](installation.md#local-display-output-display-feature-linux-only)
+under *Host prerequisites (NVIDIA GPUs + desktop systems)*.
+
+See [`docs/events-and-alarms.md`](events-and-alarms.md#display-output-events-display)
 for the full event catalogue, including `display_device_unavailable`,
-`display_mode_set_failed`, `display_audio_open_failed`,
-`display_decoder_overload`, `display_av_drift`,
-`display_subscriber_lagged`.
+`display_mode_set_failed`, `display_master_busy`, `display_flip_timeout`,
+`display_audio_open_failed`, `display_decoder_overload`,
+`display_av_drift`, `display_subscriber_lagged`.
 
 ### Bonded Output
 
