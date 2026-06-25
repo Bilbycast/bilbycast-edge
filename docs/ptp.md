@@ -364,7 +364,7 @@ rejects any `iface` containing characters outside `[A-Za-z0-9._-]` or
 longer than 15 bytes (Linux `IFNAMSIZ`). Same rule is enforced both
 on the manager (front-stops with HTTP 400) and on the edge (defence
 in depth, returns `invalid_value`). Unit-tested by
-`util::ptp_config::tests::validate_rejects_*` (5 cases).
+`util::ptp_config::tests::validate_rejects_*` (3 cases).
 
 **2. Shell injection via `iface` to the privileged script.** The
 helper builds argv with `Command::args(OsString)`, which doesn't

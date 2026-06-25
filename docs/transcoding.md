@@ -49,7 +49,7 @@ anything documented below for outputs applies to inputs verbatim.
 | **Media player** | ✅ | ✅ (requires `audio_encode`) | ✅ | All three source kinds (raw TS / MP4 / image slate) emit MPEG-TS, then re-encode through the same `InputTranscoder` plumbing as the live inputs. Useful for normalising a mixed-codec playlist to a single output codec before fan-out. |
 | **Replay** | ✅ | ✅ (requires `audio_encode`) | ✅ | Recorded TS segments are paced from disk and routed through `InputTranscoder` — useful when the destination needs a different codec from the captured bitstream. Speed-shifted playback (`speed != 1.0`) rewrites PCR/PTS first; the transcoder then sees the rewritten timestamps. |
 | **ST 2110-20 / -23** | ❌ | ❌ | ✅ (**required**) | Uncompressed RFC 4175 → H.264/HEVC on ingest — mandatory, was shipped in Phase 2. |
-| **ST 2110-30** | ⏳ (see below) | ✅ (native PCM reshape) | ❌ | `transcode` reshapes linear PCM in place. `audio_encode` changes the broadcast-channel shape to TS (rejects PCM-only outputs on the same flow); runtime muxer lands in a follow-up and currently returns `AudioEncodeNotYetImplemented`, falling back to passthrough with a loud log. |
+| **ST 2110-30** | ⏳ (see below) | ✅ (native PCM reshape) | ❌ | `transcode` reshapes linear PCM in place. `audio_encode` changes the broadcast-channel shape to TS (rejects PCM-only outputs on the same flow); the AAC family (`aac_lc` / `he_aac_v1` / `he_aac_v2`) + `s302m` are wired, while `mp2` / `ac3` are deferred — picking one returns `PcmInputError::UnsupportedAudioEncodeCodec` and the flow surfaces a Critical `pid_bus_audio_encode_codec_not_supported_on_input` event. |
 | **`rtp_audio`** | ⏳ | ✅ | ❌ | Same story as ST 2110-30. |
 | **ST 2110-31** | ❌ | ❌ | ❌ | AES3 opaque — validation rejects any transcode/encode; would destroy SMPTE 337M metadata. |
 | **ST 2110-40** | ❌ | ❌ | ❌ | Ancillary data. |
@@ -101,12 +101,14 @@ publish_input_packet(&mut transcoder, &broadcast_tx, packet);
 ```
 
 Group B (PCM-only) inputs use
-`engine::input_pcm_encode::PcmInputProcessor`, which wraps the existing
-`engine::audio_transcode::TranscodeStage` for the PCM → PCM path. The
-runtime audio-encode path for PCM inputs is scaffolded but currently
-returns `PcmInputError::AudioEncodeNotYetImplemented` — the input task
-logs a clear warning and falls back to passthrough so the flow still
-runs.
+`engine::input_pcm_encode`, which wraps the existing
+`engine::audio_transcode` path for the PCM → PCM reshape. The
+runtime audio-encode path for PCM inputs is wired for the AAC family
+(`aac_lc` / `he_aac_v1` / `he_aac_v2`) plus `s302m`; `mp2` / `ac3` are
+deferred and return `PcmInputError::UnsupportedAudioEncodeCodec`, which
+flow bring-up translates into a Critical
+`pid_bus_audio_encode_codec_not_supported_on_input` event before the
+input task runs.
 
 ### Force-IDR on input switch (multi-input flows)
 

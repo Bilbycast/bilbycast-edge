@@ -502,7 +502,7 @@ pub fn spawn_xxx_output(
 When a flow's `FlowConfig.assembly` selects `spts` or `mpts`, the flow no longer forwards the active input's bytes. Instead, a parallel ES-level data plane builds a fresh MPEG-TS from elementary streams pulled off **any of the flow's inputs** and publishes it onto the same broadcast channel every existing output subscribes to — so UDP, RTP (with / without 2022-1 FEC, 2022-7), SRT (incl. bonded / 2022-7), RIST (incl. ARQ), RTMP, HLS, CMAF, WebRTC all consume the assembled TS unchanged.
 
 ```
-  Input A (TS)                                  FlowEsBus (keyed by (input_id, source_pid))
+  Input A (TS)                                  NodeEsBus (keyed by (input_id, source_pid))
     ├── forwarder → broadcast_tx                 ┌──────────────────────────────────────────┐
     └── TsEsDemuxer ──────────publishes──────────►  (A, 0x100) → broadcast<EsPacket>          │
                                                 │  (A, 0x101) → broadcast<EsPacket>          │
@@ -541,7 +541,7 @@ The runtime never forwards the inputs' original TS bytes directly onto `broadcas
 ### Per-ES bus primitives (`engine/ts_es_bus.rs`)
 
 - **`EsPacket`** — one 188-byte TS packet (source bytes untouched) + `source_pid`, PMT `stream_type`, PUSI flag, `has_pcr`, extracted 27 MHz PCR value (when present), and the upstream `recv_time_us`. The source CC stays in-band for the assembler to rewrite.
-- **`FlowEsBus`** — per-flow `DashMap<(input_id, source_pid), broadcast::Sender<EsPacket>>`. Lazily creates the channel on first observation of a PID; channel capacity is 2048 TS packets per PID. Slow consumers see `RecvError::Lagged(n)` and drop — no cascade backpressure. PAT / PMT / NULL-PID packets are not published.
+- **`NodeEsBus`** — node-wide `DashMap<(input_id, source_pid), broadcast::Sender<EsPacket>>`. Lazily creates the channel on first observation of a PID; channel capacity is stream-type aware (see `bus_capacity_for_stream_type` — 8192 slots for video, 1024 for audio/data, 512 for SCTE-35). Slow consumers see `RecvError::Lagged(n)` and drop — no cascade backpressure. PAT / PMT / NULL-PID packets are not published.
 - **`TsEsDemuxer`** — the per-input bridge. Parses the input's TS, maintains a per-input PSI catalogue via `ts_psi_catalog` (Phase 2), and publishes every ES packet onto its bus key. One demuxer per input; active whenever the flow is assembled.
 
 ### Decoded-ES cache for non-TS audio (`engine/input_pcm_encode.rs`)

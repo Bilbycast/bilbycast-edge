@@ -45,7 +45,7 @@ bilbycast-edge is a media gateway supporting multiple transport protocols for pr
 ### RIST Simple Profile (VSF TR-06-1:2020)
 - **Direction:** Input and Output
 - **Transport:** UDP (RTP on even port P, RTCP on P+1) with RTCP NACK retransmission
-- **Implementation:** Pure-Rust `bilbycast-rist` v0.2.0 (zero C deps, wire-verified interop with librist 0.2.11 `ristsender` / `ristreceiver`)
+- **Implementation:** Pure-Rust `bilbycast-rist` v0.3.1 (zero C deps, wire-verified interop with librist 0.2.11 `ristsender` / `ristreceiver`)
 - **Features:**
   - Reliable RTP transport with NACK-based retransmission, configurable jitter / retransmit buffer depth
   - RTCP SR/RR/SDES and RTT echo, TR-06-1-compliant (RTCP interval ≤ 100 ms)
@@ -165,7 +165,7 @@ bilbycast-edge is a media gateway supporting multiple transport protocols for pr
 ### RIST Simple Profile (VSF TR-06-1:2020)
 - **Direction:** Output
 - **Transport:** UDP (RTP on even port P, RTCP on P+1) with RTCP NACK retransmission
-- **Implementation:** Pure-Rust `bilbycast-rist` v0.2.0 (zero C deps, wire-verified against librist 0.2.11)
+- **Implementation:** Pure-Rust `bilbycast-rist` v0.3.1 (zero C deps, wire-verified against librist 0.2.11)
 - **Features:**
   - Reliable RTP transmission, NACK-driven retransmit with configurable buffer depth
   - RTCP SR/SDES emission, RTT echo, NTP-aligned RTP timestamps for precise receiver output timing

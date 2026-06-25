@@ -80,7 +80,7 @@ Replace the open-loop PCR integration with a **leaky-bucket release servo + hard
 5. **Hard residence cap** (controlled overflow, IRD-style): when residence (`now − oldest
    recv_time`, = `last_latency_us`) exceeds the cap, **shed oldest** datagrams (count them) and
    snap forward — bounds latency by construction. The receiver re-clocks from the untouched PCR.
-   *(Shipped: the cap is `max(4×setpoint, 250)` ms — 250 ms only at the 60 ms default setpoint —
+   *(Shipped: the cap is `max(4×setpoint, 1000)` ms — 1000 ms at the 60 ms default setpoint —
    and the shed fires on `dejitter.enabled` regardless of releaser, not just on the
    `clock_nanosleep` path.)*
 

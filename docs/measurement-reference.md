@@ -144,7 +144,7 @@ for TS-layer loss visibility.
 
 | Field | Source | Verdict | Reference tool | Notes |
 |---|---|---|---|---|
-| Decoded resolution / mean Y | [`engine/content_analysis/video_full.rs:282–339`](../src/engine/content_analysis/video_full.rs) (libavcodec decode under `block_in_place`, then pure-Rust Y-plane analysis) | Matches | `ffmpeg -vf cropdetect`, ImageMagick `identify` | Sampled at 1 Hz default (`video_full_hz`, clamped 0.0–30.0). |
+| Decoded resolution / mean Y | [`engine/content_analysis/video_full.rs:282–339`](../src/engine/content_analysis/video_full.rs) (libavcodec decode under `block_in_place`, then pure-Rust Y-plane analysis) | Matches | `ffmpeg -vf cropdetect`, ImageMagick `identify` | Sampled at 1 Hz default (`video_full_hz`, clamped 0.1–30.0). |
 | YUV-SAD freeze | per-pixel SAD vs previous Y plane | **Heuristic** | Telestream Vidchecker (proprietary), Tektronix Aurora | Useful for trend alarms — value is not portable across tools. |
 | Blur (Laplacian variance) | 3×3 Laplacian on stride-4 Y sample | **Heuristic** | OmniTek OTM, Vidchecker | Lower = blurrier. |
 | Blockiness | 8×8 boundary-gradient (Wang/Sheikh-style) | **Heuristic** | Vidchecker, Aurora | |

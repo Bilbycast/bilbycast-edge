@@ -1,6 +1,6 @@
 # BilbyCast Edge API Reference
 
-Complete REST API reference for bilbycast-edge. The API server listens on the address and port configured in `server.listen_addr` and `server.listen_port` (default `0.0.0.0:8080`).
+Complete REST API reference for bilbycast-edge. The API server listens on the addresses and port configured in `server.listen_addrs` / `server.listen_addr` and `server.listen_port` (new installs default to loopback only — `127.0.0.1` + `[::1]` on port `8080`; expose on the LAN with `--bind-addrs 0.0.0.0,[::]` and enable `server.auth`).
 
 All successful responses use a standard envelope:
 

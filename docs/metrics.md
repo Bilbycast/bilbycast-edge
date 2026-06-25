@@ -51,7 +51,7 @@ Labels: `flow_id,leg_role="input|output",leg="primary|leg2"` plus
 
 ## PTP clock metrics
 
-Node-level, sampled by the PTP monitor task (every 5 s) which reads
+Node-level, sampled by the PTP monitor task (every 1 s) which reads
 `ptp4l` over its management socket. Always present (even with no ST 2110
 flow). All labeled by `domain`. Graph `offset_ns` / `mean_path_delay_ns`
 over time to spot clock excursions, asymmetry, or grandmaster drift; alert
