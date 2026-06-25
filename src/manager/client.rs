@@ -728,6 +728,18 @@ async fn try_connect(
                             ).await;
                         });
                     }
+                    Some(Ok(Message::Binary(bytes))) => {
+                        // Binary frames carry media-upload chunks with no
+                        // base64 inflation. Spawn per-frame like the Text arm
+                        // so a slow disk write never parks the receive loop;
+                        // the `command_ack` reply rides `out_tx` (single-owner
+                        // writer rule).
+                        let tunnel_manager = tunnel_manager.clone();
+                        let out_tx = out_tx.clone();
+                        tokio::spawn(async move {
+                            handle_manager_binary(&bytes, &tunnel_manager, &out_tx).await;
+                        });
+                    }
                     Some(Ok(Message::Ping(data))) => {
                         let _ = ws_write.send(Message::Pong(data)).await;
                     }
@@ -806,11 +818,13 @@ async fn try_connect(
 /// Contains either registration_token OR node_id + node_secret.
 /// WebSocket protocol version. Sent in auth payload so the manager can detect
 /// mismatches. MUST track `bilbycast-manager/crates/manager-core/src/models/
-/// ws_protocol.rs::WS_PROTOCOL_VERSION` — this edge ships the v3 surface
-/// (capability bits, direction-tagged VAAPI caps, assembly hot-swap, hot
-/// add/remove input), but advertising the stale `1` made the manager log a
-/// mismatch warning + insert a Warning compatibility event on EVERY connect.
-const WS_PROTOCOL_VERSION: u32 = 3;
+/// ws_protocol.rs::WS_PROTOCOL_VERSION` — this edge ships the v4 surface:
+/// v3 (capability bits, direction-tagged VAAPI caps, assembly hot-swap, hot
+/// add/remove input) PLUS the binary media-upload frame (`Message::Binary`
+/// chunk transport, no base64). The manager gates binary-frame sends on
+/// `protocol_version >= 4`, so a stale advertisement would make media uploads
+/// fail loudly with a compatibility alarm instead of using the binary path.
+const WS_PROTOCOL_VERSION: u32 = 4;
 
 fn build_auth_message(config: &ManagerConfig) -> serde_json::Value {
     if let (Some(node_id), Some(node_secret)) = (&config.node_id, &config.node_secret) {
@@ -961,7 +975,7 @@ pub(crate) fn build_health_payload(
     {
         let devs = crate::display::cached_displays();
         if !devs.is_empty() {
-            if let Ok(json) = serde_json::to_value(devs) {
+            if let Ok(json) = serde_json::to_value(devs.as_slice()) {
                 payload
                     .as_object_mut()
                     .map(|o| o.insert("display_devices".into(), json));
@@ -1515,6 +1529,136 @@ where
         }
     }
     Ok(())
+}
+
+/// Magic byte prefixing every manager→edge binary WS frame (sanity guard so a
+/// stray binary frame from a buggy/old peer is rejected loudly, not misparsed).
+const BINARY_FRAME_MAGIC: u8 = 0xBC;
+/// Binary frame kind: a single media-library upload chunk.
+const BINARY_FRAME_KIND_MEDIA_CHUNK: u8 = 0x01;
+
+/// Handle a binary WS frame from the manager. The only binary frame defined
+/// today is a media-upload chunk, framed as:
+///
+/// ```text
+/// [0]        magic   = 0xBC
+/// [1]        kind    = 0x01 (media upload chunk)
+/// [2..6]     header_len: u32 big-endian
+/// [6..6+L]   header JSON: { command_id, name, chunk_index, total_chunks, total_bytes }
+/// [6+L..]    raw chunk bytes (no base64)
+/// ```
+///
+/// A structurally unparseable / unknown-kind frame raises a Warning event (the
+/// compatibility alarm) and is dropped — there is no `command_id` to ack
+/// against, so the manager's per-chunk timeout surfaces the failure. A frame
+/// that parses but whose write fails replies with a `command_ack`
+/// `success: false` so the manager fails fast instead of waiting out the
+/// timeout. Reply rides `out_tx` (single-owner writer rule).
+async fn handle_manager_binary(
+    frame: &[u8],
+    tunnel_manager: &Arc<TunnelManager>,
+    out_tx: &mpsc::Sender<String>,
+) {
+    let alarm = |msg: String| {
+        tracing::warn!("{msg}");
+        tunnel_manager
+            .event_sender()
+            .emit(EventSeverity::Warning, category::MANAGER, msg);
+    };
+
+    if frame.len() < 6 {
+        alarm(format!(
+            "manager binary frame too short ({} bytes, need ≥ 6)",
+            frame.len()
+        ));
+        return;
+    }
+    if frame[0] != BINARY_FRAME_MAGIC {
+        alarm(format!(
+            "manager binary frame bad magic 0x{:02x} (expected 0x{BINARY_FRAME_MAGIC:02x})",
+            frame[0]
+        ));
+        return;
+    }
+    if frame[1] != BINARY_FRAME_KIND_MEDIA_CHUNK {
+        alarm(format!(
+            "manager binary frame unknown kind 0x{:02x} — edge cannot handle it (upgrade mismatch?)",
+            frame[1]
+        ));
+        return;
+    }
+    let header_len = u32::from_be_bytes([frame[2], frame[3], frame[4], frame[5]]) as usize;
+    let header_end = 6usize.saturating_add(header_len);
+    if header_end > frame.len() {
+        alarm(format!(
+            "manager binary frame header_len {header_len} exceeds frame size {}",
+            frame.len()
+        ));
+        return;
+    }
+    let header: serde_json::Value = match serde_json::from_slice(&frame[6..header_end]) {
+        Ok(h) => h,
+        Err(e) => {
+            alarm(format!("manager binary frame header is not valid JSON: {e}"));
+            return;
+        }
+    };
+    let command_id = header["command_id"].as_str().unwrap_or("").to_string();
+    if command_id.is_empty() {
+        alarm("manager binary frame header missing 'command_id'".to_string());
+        return;
+    }
+    let payload = &frame[header_end..];
+
+    // Past this point we have a command_id, so any failure acks success:false
+    // (fail fast) rather than letting the manager time out.
+    let result = apply_binary_media_chunk(&header, payload).await;
+
+    let mut ack_payload = serde_json::json!({
+        "command_id": command_id,
+        "success": result.is_ok(),
+    });
+    match result {
+        Ok(data) => {
+            ack_payload["data"] = data;
+        }
+        Err(e) => {
+            ack_payload["error"] = serde_json::Value::String(e);
+        }
+    }
+    let ack = serde_json::json!({
+        "type": "command_ack",
+        "timestamp": chrono::Utc::now().to_rfc3339(),
+        "payload": ack_payload,
+    });
+    if let Ok(json) = serde_json::to_string(&ack) {
+        let _ = out_tx.send(json).await;
+    }
+}
+
+/// Parse the media-upload header fields and apply the raw chunk to the library.
+/// Returns the serialised `UploadProgress` for the ack's `data` field.
+async fn apply_binary_media_chunk(
+    header: &serde_json::Value,
+    payload: &[u8],
+) -> Result<serde_json::Value, String> {
+    let name = header["name"]
+        .as_str()
+        .ok_or("binary upload: missing 'name'")?;
+    let chunk_index = header["chunk_index"]
+        .as_u64()
+        .ok_or("binary upload: missing or invalid 'chunk_index'")? as u32;
+    let total_chunks = header["total_chunks"]
+        .as_u64()
+        .ok_or("binary upload: missing or invalid 'total_chunks'")? as u32;
+    let total_bytes = header["total_bytes"]
+        .as_u64()
+        .ok_or("binary upload: missing or invalid 'total_bytes'")?;
+    let progress = crate::media::global()
+        .apply_chunk_raw(name, chunk_index, total_chunks, total_bytes, payload)
+        .await
+        .map_err(|e| format!("binary upload failed: {e}"))?;
+    Ok(serde_json::to_value(&progress).unwrap_or_default())
 }
 
 /// Handle a message from the manager.

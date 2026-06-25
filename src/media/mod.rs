@@ -634,8 +634,11 @@ impl MediaLibrary {
         }
     }
 
-    /// Apply one chunk of an upload. Returns `true` when the final chunk
-    /// fsyncs + renames into place.
+    /// Apply one base64-encoded chunk of an upload (text-WS `upload_media_chunk`
+    /// path). Decodes `data_b64` and delegates to [`Self::apply_chunk_bytes`].
+    /// The browser→manager→edge media-upload path is binary end-to-end now (see
+    /// [`Self::apply_chunk_raw`]); this base64 entry point is kept for the
+    /// legacy text command + unit tests.
     pub async fn apply_chunk(
         &self,
         name: &str,
@@ -643,6 +646,40 @@ impl MediaLibrary {
         total_chunks: u32,
         total_bytes: u64,
         data_b64: &str,
+    ) -> Result<UploadProgress> {
+        // Decode up front so a malformed encode fails fast before any disk work.
+        let chunk = BASE64
+            .decode(data_b64)
+            .map_err(|e| anyhow!("upload_media_chunk: base64 decode failed: {e}"))?;
+        self.apply_chunk_bytes(name, chunk_index, total_chunks, total_bytes, chunk)
+            .await
+    }
+
+    /// Apply one raw (un-encoded) chunk of an upload — the binary media-upload
+    /// fast path. The manager forwards the operator's bytes verbatim inside a
+    /// `Message::Binary` WS frame (no base64 inflation), so we take `&[u8]`
+    /// directly and share the same write/validate/finalize core.
+    pub async fn apply_chunk_raw(
+        &self,
+        name: &str,
+        chunk_index: u32,
+        total_chunks: u32,
+        total_bytes: u64,
+        raw: &[u8],
+    ) -> Result<UploadProgress> {
+        self.apply_chunk_bytes(name, chunk_index, total_chunks, total_bytes, raw.to_vec())
+            .await
+    }
+
+    /// Shared chunk write/validate/finalize state machine. Returns
+    /// `UploadProgress::Complete` when the final chunk renames into place.
+    async fn apply_chunk_bytes(
+        &self,
+        name: &str,
+        chunk_index: u32,
+        total_chunks: u32,
+        total_bytes: u64,
+        chunk: Vec<u8>,
     ) -> Result<UploadProgress> {
         crate::config::validation::validate_media_filename(name, "upload_media_chunk")?;
         if total_chunks == 0 {
@@ -661,12 +698,6 @@ impl MediaLibrary {
 
         Self::ensure_dirs()?;
         Self::reap_stale_staging().await;
-
-        // Decode and verify chunk size before touching disk so we fail
-        // fast on a malformed encode.
-        let chunk = BASE64
-            .decode(data_b64)
-            .map_err(|e| anyhow!("upload_media_chunk: base64 decode failed: {e}"))?;
 
         // Library-footprint guard: existing finalised bytes + this upload's
         // declared size must not breach the cap. Counting `total_bytes` (not
