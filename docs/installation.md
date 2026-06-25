@@ -20,6 +20,70 @@ Optional flags: `--channel stable|nightly|beta`, `--variant default|full`,
 (refresh the script + service unit without touching config or installed
 binaries).
 
+### What the installer does for you
+
+`install-edge.sh` is the authoritative, idempotent deployment path — the same
+script the project tests, and the same signed-artefact source the manager's
+remote upgrade consumes. A single run on a fresh node performs **all** of the
+following, so a standard node needs **no manual post-install steps**:
+
+1. **Detects the CPU architecture** (`x86_64-linux` / `aarch64-linux`) and
+   fails fast on anything else, then prints a **host OS + glibc advisory** —
+   an early, clear warning when the host is older than the glibc 2.39 the
+   release binaries need, instead of a cryptic linker abort at first start
+   (advisory only; never blocks — silence with `BILBYCAST_SKIP_OS_CHECK=1`).
+2. **Installs `cosign`** if absent (a pinned, checksum-verified version —
+   pinning the tool that verifies your supply chain is deliberate; see
+   [Troubleshooting](#troubleshooting--known-issues)) and **Sigstore-verifies**
+   the release `manifest.json` against the compiled-in signer allowlist before
+   trusting anything it points to.
+3. **Downloads the release tarball**, verifies its SHA-256 against the signed
+   manifest, and lays out `/opt/bilbycast/edge/` (`versions/<v>/`,
+   `current →` symlink, `state.json`).
+4. **Creates the `bilbycast` system user/group** and **adds it to the `video`,
+   `render`, and `audio` groups** — required for GPU-based encode/decode
+   (`/dev/dri/renderD*`) and the local-display output's ALSA device. Reconciled
+   on every run, so it is correct even for a pre-existing user.
+5. **Writes `/opt/bilbycast/edge/config.json`** with your `--manager` URL +
+   `--registration-token` (loopback-only API on `127.0.0.1:8080`, auth off —
+   the node is driven over the outbound manager WebSocket).
+6. **Initialises `/opt/bilbycast/edge/secrets.json` to `{}`** (`0600`,
+   bilbycast-owned). A 0-byte file would crash the edge at startup with
+   `Failed to parse secrets file: EOF while parsing a value`; the edge rewrites
+   it encrypted on first registration.
+7. **Pins `BILBYCAST_MEDIA_DIR` + `BILBYCAST_REPLAY_DIR`** in
+   `/etc/bilbycast/edge.env` to `/var/lib/bilbycast/edge/{media,replay}` and
+   **creates those dirs** bilbycast-owned — so media-player uploads and replay
+   recording work on first boot instead of failing `EACCES` against the service
+   account's empty `$HOME`.
+8. **Installs the systemd unit** and runs `systemctl enable --now
+   bilbycast-edge` (plus the ETF-qdisc + PTP-helper units, dormant until you
+   opt in).
+9. **Polls `http://127.0.0.1:8080/health` for up to 60 s**, gated on
+   `.manager.connected == true` — so "success" means *registered with the
+   manager*, not merely "HTTP server up". On a registration timeout it prints
+   the likely cause and exits 0 (not a misleading failure).
+
+**Resulting on-disk layout:**
+
+| Path | Contents | Perms |
+|---|---|---|
+| `/opt/bilbycast/edge/current/` | running binary + bundled `packaging/` | — |
+| `/opt/bilbycast/edge/config.json` | operational config (manager URL, token) | `0640` |
+| `/opt/bilbycast/edge/secrets.json` | encrypted secrets (`{}` until registration) | `0600` |
+| `/etc/bilbycast/edge.env` | systemd `EnvironmentFile` (dirs, `RUST_LOG`, tuning) | `0640` |
+| `/var/lib/bilbycast/edge/{media,replay}` | media-player library + replay store | bilbycast-owned |
+
+**Re-running is safe.** A bare re-run on an already-installed node short-circuits
+(`Already installed … use --upgrade-installer`) and changes nothing. Pass
+`--upgrade-installer` to refresh the install script + systemd unit and
+re-reconcile the groups without touching `config.json`, `secrets.json`, or the
+installed binary; advance the *binary* from the manager UI's Upgrade button. One
+nuance on the `BILBYCAST_MEDIA_DIR` / `REPLAY_DIR` env pins: they're written on a
+**fresh** install, and a re-run via `--upgrade-installer` **adds** them only if
+your `edge.env` has no media/replay setting at all (healing a node installed
+before the pins existed). A path you've already set is never overwritten.
+
 ### Manager with a self-signed / untrusted TLS cert
 
 The edge connects to the manager over `wss://` and validates its certificate
@@ -167,6 +231,10 @@ sudo apt-get install -y libvpl2 intel-media-va-driver-non-free
 sudo usermod -aG render "$USER"
 # log out + back in for the group change to take effect
 ```
+
+> Installed with `install-edge.sh`? The `bilbycast` **service** user is already
+> added to `video` / `render` / `audio` on every run — this `usermod` is only
+> needed when you run the binary **manually** as your own login user.
 
 QSV needs a 5th-gen (Broadwell) Intel Core CPU or newer for H.264; HEVC
 needs 7th-gen (Kaby Lake) or newer.
@@ -378,6 +446,10 @@ sudo apt install libvpl2 libmfx-gen1.2 intel-media-va-driver-non-free
 sudo usermod -aG render "$USER"
 # log out + back in for the group change to take effect
 ```
+
+> Installed with `install-edge.sh`? The `bilbycast` **service** user is already
+> in `video` / `render` / `audio`; the `usermod` above is only for running the
+> binary **manually** as your own login user.
 
 Verify:
 
@@ -869,6 +941,37 @@ Configuration reference:
 [`docs/configuration-guide.md`](configuration-guide.md#display-output-hdmi--displayport--alsa).
 Event catalogue:
 [`docs/events-and-alarms.md`](events-and-alarms.md#display-output-events-display).
+
+---
+
+## Troubleshooting / known issues
+
+Most first-install problems come from a *manual* install missing a step the
+`install-edge.sh` path already automates (see
+[What the installer does for you](#what-the-installer-does-for-you)). This table
+maps the common symptoms to cause and fix, and notes which the installer handles
+for you.
+
+| Symptom | Cause | Fix | Installer |
+|---|---|---|---|
+| Node starts but never appears in the manager | Registration token expired / already used, manager URL unreachable, or the manager's TLS cert isn't publicly trusted | Mint a fresh token; confirm the `wss://` URL is reachable from the node; for a self-signed/lab manager re-run with `--accept-self-signed`. Watch `journalctl -u bilbycast-edge -f`. | Health poll names the exact cause |
+| `Failed to parse secrets file: EOF while parsing a value` at startup | `secrets.json` is a 0-byte file (e.g. `touch`ed by hand), not valid JSON | `printf '{}\n' > /opt/bilbycast/edge/secrets.json` then `chown bilbycast:bilbycast` + `chmod 0600` it | Seeds `{}` automatically |
+| Media-player upload or replay recording fails with `Permission denied (os error 13)` | The `bilbycast` system account has no writable `$HOME`, so the binary's default media/replay path can't be created | Set `BILBYCAST_MEDIA_DIR` + `BILBYCAST_REPLAY_DIR` in `/etc/bilbycast/edge.env` to a bilbycast-owned dir (e.g. `/var/lib/bilbycast/edge/{media,replay}`), create them, `systemctl restart bilbycast-edge` | Pins both + creates the dirs (fresh install; `--upgrade-installer` heals an older node that has none) |
+| HW encode/decode fails at session open (`EACCES`; QSV warns loudly; `vainfo` empty) | The running user isn't in the `render` (and `video`) group, so `/dev/dri/renderD*` is inaccessible | `sudo usermod -aG video,render <user>` and re-login (or restart the service) | Adds `bilbycast` to `video`/`render`/`audio` every run |
+| Local-display ALSA opens fail (`Cannot get card index`), often only after a reboot or over SSH | Missing `audio` group membership — a desktop login masks it with a transient logind ACL that vanishes when headless | `sudo usermod -aG audio <user>` and re-login | Adds `audio` automatically |
+| Full binary won't start on Ubuntu 26.04 / a newer LTS (missing `libx264.so.NNN` / `libx265.so.NNN`) | **Historical.** Older releases dynamically linked the codecs against an ABI-versioned SONAME that bumps every distro release | Use a current `*-linux-full` build — libx264/libx265 are now statically linked, so this failure class is gone | Downloads the current static-linked full variant |
+| `cosign: command not found` / signature verify fails on an air-gapped host | No outbound access to fetch cosign or the Fulcio/Rekor roots | Pre-install `cosign` (`apt install cosign` or a pinned release) on the image; for fully offline installs, mirror the release assets and use the manual tarball path | Installs a pinned, checksum-verified cosign |
+
+> **Why cosign is pinned, not "latest".** The installer downloads a specific
+> `cosign` version (overridable via `COSIGN_VERSION=…`) and verifies it against
+> that release's `cosign_checksums.txt` before trusting it. cosign is the tool
+> that verifies the entire supply chain, so pinning + checksumming it is
+> deliberate — "always fetch latest" would auto-pull a future release with no
+> integrity gate. If a pinned version is ever yanked upstream, override
+> `COSIGN_VERSION` or pre-install cosign from your distro.
+
+When filing a report, include `journalctl -u bilbycast-edge -b --no-pager` and
+the `--manager` URL + channel/variant you installed with.
 
 ---
 

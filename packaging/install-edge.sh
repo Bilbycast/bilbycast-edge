@@ -159,6 +159,41 @@ if [[ "${ACCEPT_SELF_SIGNED}" -eq 1 ]]; then
 fi
 echo
 
+# ── Host OS / glibc advisory ──────────────────────────────────────────
+# Release binaries are built on Ubuntu 24.04 and link glibc 2.39+. Surface a
+# likely-incompatible host EARLY (before the multi-hundred-MB download) with a
+# clear message, instead of a cryptic `version 'GLIBC_2.39' not found` abort at
+# first start. Advisory ONLY — it never blocks (the dynamic linker stays the
+# final word, so a borderline-but-working host is not refused). Silence the
+# whole check with BILBYCAST_SKIP_OS_CHECK=1.
+ver_ge() { [[ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | tail -n1)" == "$1" ]]; }
+
+if [[ "${BILBYCAST_SKIP_OS_CHECK:-0}" != "1" ]]; then
+    OS_ID="" OS_VER="" OS_PRETTY=""
+    if [[ -r /etc/os-release ]]; then
+        OS_ID="$(awk -F= '$1=="ID"{gsub(/"/,"",$2);print $2;exit}' /etc/os-release)"
+        OS_VER="$(awk -F= '$1=="VERSION_ID"{gsub(/"/,"",$2);print $2;exit}' /etc/os-release)"
+        OS_PRETTY="$(awk -F= '$1=="PRETTY_NAME"{gsub(/"/,"",$2);print $2;exit}' /etc/os-release)"
+    fi
+    GLIBC_VER="$(ldd --version 2>/dev/null | awk 'NR==1{print $NF}')"
+    echo "  Host OS    : ${OS_PRETTY:-${OS_ID:-unknown} ${OS_VER}}${GLIBC_VER:+ (glibc ${GLIBC_VER})}"
+    case "${OS_ID}" in
+        ubuntu|debian|"") ;;  # tested family (or undetectable — glibc check below still applies)
+        *)
+            echo "  NOTE: ${OS_PRETTY:-${OS_ID}} is untested. The release binaries need glibc 2.39+," >&2
+            echo "        and HW-accel runtime libs are auto-installed on apt-based hosts only." >&2
+            ;;
+    esac
+    # The one numeric gate: a binary linked against glibc 2.39 cannot start on an
+    # older glibc. Warn (don't exit) — musl/unparseable ldd output skips this.
+    if [[ "${GLIBC_VER}" =~ ^[0-9]+\.[0-9]+$ ]] && ! ver_ge "${GLIBC_VER}" 2.39; then
+        echo "  WARNING: glibc ${GLIBC_VER} is older than the 2.39 the release binaries are built" >&2
+        echo "           against — the edge may fail to start with a GLIBC_2.39 linker error." >&2
+        echo "           Build from source for this host, or set BILBYCAST_SKIP_OS_CHECK=1 to silence." >&2
+    fi
+    echo
+fi
+
 # ── Idempotency guard ─────────────────────────────────────────────────
 if [[ -e "${INSTALL_ROOT}/current" && "${UPGRADE_INSTALLER}" -eq 0 ]]; then
     echo "Already installed at ${INSTALL_ROOT}/current → $(readlink -f "${INSTALL_ROOT}/current")."
@@ -317,6 +352,20 @@ if [[ -z "${ARTEFACT_URL}" || "${ARTEFACT_URL}" == "null" ]]; then
     jq -r '.artefacts[] | "  \(.arch) / \(.variant)"' manifest.json >&2
     exit 1
 fi
+
+# Defence-in-depth: the tarball SHA-256 is already pinned inside the
+# Sigstore-verified manifest, so a swapped artefact fails the hash check
+# below regardless. This host allowlist is a second layer — it stops a
+# (hypothetically tampered) manifest from pointing the download at a host
+# outside GitHub-controlled infrastructure. Mirrors install-relay.sh.
+ARTEFACT_HOST="$(awk -F[/:] '{ print $4 }' <<< "${ARTEFACT_URL}")"
+case "${ARTEFACT_HOST}" in
+    github.com|objects.githubusercontent.com) ;;
+    *)
+        echo "Manifest artefact URL host '${ARTEFACT_HOST}' is not in the allowlist." >&2
+        exit 1
+        ;;
+esac
 
 echo "Downloading ${ARTEFACT_URL}…"
 curl -fsSL -o release.tar.gz "${ARTEFACT_URL}"
@@ -702,6 +751,25 @@ else
             echo "BILBYCAST_ALLOW_INSECURE=1" >> "${ENV_FILE}"
             echo "  Added BILBYCAST_ALLOW_INSECURE=1 to ${ENV_FILE}"
         fi
+    fi
+    # Heal a node whose env predates the media/replay dir pins: if the key is
+    # ENTIRELY absent (neither set nor commented), the node falls back to the
+    # binary's $HOME-based default, which fails every upload/recording with
+    # EACCES under the nologin bilbycast account. Add the pins + create the dirs.
+    # We act ONLY when the key is wholly missing, so an operator's custom path is
+    # never overridden. (Reachable on a re-run via --upgrade-installer.)
+    if ! grep -qE '^[# ]*BILBYCAST_MEDIA_DIR=' "${ENV_FILE}"; then
+        {
+            echo ""
+            echo "# Media library + replay storage roots (added on upgrade; see the fresh-install"
+            echo "# block for the full rationale). Pinned to the service state dir so uploads +"
+            echo "# recordings don't depend on the bilbycast user's \$HOME."
+            echo "BILBYCAST_MEDIA_DIR=${DATA_ROOT}/media"
+            echo "BILBYCAST_REPLAY_DIR=${DATA_ROOT}/replay"
+        } >> "${ENV_FILE}"
+        install -d -o bilbycast -g bilbycast -m 0755 "${DATA_ROOT}/media"
+        install -d -o bilbycast -g bilbycast -m 0755 "${DATA_ROOT}/replay"
+        echo "  Added BILBYCAST_MEDIA_DIR + BILBYCAST_REPLAY_DIR to ${ENV_FILE} (pre-pin node heal)"
     fi
 fi
 
