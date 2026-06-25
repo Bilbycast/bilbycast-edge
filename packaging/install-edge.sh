@@ -32,8 +32,15 @@
 #      registration token.
 #   8. Installs the systemd unit, runs `systemctl daemon-reload` and
 #      `systemctl enable --now`.
-#   9. Polls the local edge HTTP health endpoint for ~30 s waiting for
-#      successful manager registration.
+#   9. Polls the local edge HTTP health endpoint for up to 60 s, checking the
+#      `.manager.connected` field so success means "registered with the
+#      manager", not merely "HTTP server up". A running-but-unregistered node
+#      exits 0 with an actionable message (not a misleading failure).
+#
+# Self-signed manager TLS: pass --accept-self-signed to write both
+# manager.accept_self_signed_cert=true (config.json) and
+# BILBYCAST_ALLOW_INSECURE=1 (edge.env) so the node registers without a
+# publicly trusted cert. Disables ALL cert validation — dev / lab only.
 
 set -euo pipefail
 
@@ -50,6 +57,7 @@ VARIANT=""    # auto-detect from arch unless overridden
 MANAGER_URL=""
 REGISTRATION_TOKEN=""
 UPGRADE_INSTALLER=0
+ACCEPT_SELF_SIGNED=0   # --accept-self-signed: trust an untrusted manager TLS cert
 OUTPUT_NICS=""  # comma-separated NIC list for ETF qdisc + SO_TXTIME
 
 # ── Argument parsing ──────────────────────────────────────────────────
@@ -67,6 +75,13 @@ Options:
                                unit and BILBYCAST_ENABLE_TXTIME=1 is set in the env
                                file. Requires ≥ 3 HW tx queues per NIC (validated).
                                Omit to stay on the default clock_nanosleep tier.
+  --accept-self-signed         Trust an untrusted / self-signed manager TLS cert.
+                               Writes manager.accept_self_signed_cert=true into
+                               config.json AND BILBYCAST_ALLOW_INSECURE=1 into the
+                               env file so the edge can register without a publicly
+                               trusted cert. SECURITY: disables ALL cert validation
+                               (MITM risk) — dev / lab / testing only. Prefer
+                               cert_fingerprint pinning or a real CA for production.
   --upgrade-installer          Refresh service unit + install script,
                                leave config and versions/ untouched
   -h, --help                   Show this message
@@ -80,6 +95,7 @@ while [[ $# -gt 0 ]]; do
         --channel) CHANNEL="$2"; shift 2;;
         --variant) VARIANT="$2"; shift 2;;
         --output-nics) OUTPUT_NICS="$2"; shift 2;;
+        --accept-self-signed) ACCEPT_SELF_SIGNED=1; shift;;
         --upgrade-installer) UPGRADE_INSTALLER=1; shift;;
         -h|--help) usage; exit 0;;
         *) echo "Unknown argument: $1" >&2; usage; exit 1;;
@@ -138,6 +154,9 @@ echo "  Channel    : ${CHANNEL}"
 echo "  Arch       : ${ARCH}"
 echo "  Variant    : ${VARIANT}"
 echo "  Install at : ${INSTALL_ROOT}"
+if [[ "${ACCEPT_SELF_SIGNED}" -eq 1 ]]; then
+    echo "  Manager TLS: SELF-SIGNED ACCEPTED (cert validation DISABLED — dev/lab only)"
+fi
 echo
 
 # ── Idempotency guard ─────────────────────────────────────────────────
@@ -329,6 +348,14 @@ chown -R bilbycast:bilbycast "${INSTALL_ROOT}" "${DATA_ROOT}"
 CONFIG_FILE="${INSTALL_ROOT}/config.json"
 SECRETS_FILE="${INSTALL_ROOT}/secrets.json"
 
+# When --accept-self-signed is set, add the field to the manager block. The
+# edge ALSO requires BILBYCAST_ALLOW_INSECURE=1 in the env (set below) — the
+# config flag alone is inert without it (a deliberate two-part safety guard).
+MANAGER_SELF_SIGNED_FIELD=""
+if [[ "${ACCEPT_SELF_SIGNED}" -eq 1 ]]; then
+    MANAGER_SELF_SIGNED_FIELD=$'\n    "accept_self_signed_cert": true,'
+fi
+
 if [[ "${UPGRADE_INSTALLER}" -eq 0 || ! -f "${CONFIG_FILE}" ]]; then
     cat > "${CONFIG_FILE}.tmp" <<EOF
 {
@@ -338,7 +365,7 @@ if [[ "${UPGRADE_INSTALLER}" -eq 0 || ! -f "${CONFIG_FILE}" ]]; then
     "listen_port": 8080
   },
   "manager": {
-    "enabled": true,
+    "enabled": true,${MANAGER_SELF_SIGNED_FIELD}
     "urls": ["${MANAGER_URL}"],
     "registration_token": "${REGISTRATION_TOKEN}"
   },
@@ -352,6 +379,25 @@ EOF
     mv -f "${CONFIG_FILE}.tmp" "${CONFIG_FILE}"
     chown bilbycast:bilbycast "${CONFIG_FILE}"
     chmod 0640 "${CONFIG_FILE}"
+fi
+
+# If --accept-self-signed was requested but the config already existed (the
+# heredoc above is skipped under --upgrade-installer or a re-run over a prior
+# install), ensure the field is present without disturbing the rest of the
+# file. The fresh-install heredoc already wrote it, so this is a no-op there.
+if [[ "${ACCEPT_SELF_SIGNED}" -eq 1 && -f "${CONFIG_FILE}" ]]; then
+    if ! jq -e '.manager.accept_self_signed_cert == true' "${CONFIG_FILE}" > /dev/null 2>&1; then
+        SS_TMP="$(mktemp)"
+        if jq '.manager.accept_self_signed_cert = true' "${CONFIG_FILE}" > "${SS_TMP}" 2>/dev/null; then
+            # Truncate-in-place so the file keeps its bilbycast:bilbycast / 0640
+            # owner + perms (a `mv` would land it root-owned).
+            cat "${SS_TMP}" > "${CONFIG_FILE}"
+            echo "  Set manager.accept_self_signed_cert=true in ${CONFIG_FILE}"
+        else
+            echo "WARNING: could not patch ${CONFIG_FILE} — add \"accept_self_signed_cert\": true under \"manager\" manually." >&2
+        fi
+        rm -f "${SS_TMP}"
+    fi
 fi
 
 if [[ ! -f "${SECRETS_FILE}" ]]; then
@@ -517,6 +563,11 @@ systemctl enable --now bilbycast-ptp.service 2>/dev/null || true
 # Default env file (RUST_LOG etc.). Only seed it if missing — operators
 # may have customised it.
 ENV_FILE="${CONFIG_DIR}/edge.env"
+if [[ "${ACCEPT_SELF_SIGNED}" -eq 1 ]]; then
+    INSECURE_LINE="BILBYCAST_ALLOW_INSECURE=1"
+else
+    INSECURE_LINE="# BILBYCAST_ALLOW_INSECURE=1"
+fi
 if [[ ! -f "${ENV_FILE}" ]]; then
     if [[ "${ETF_ENABLED_COUNT}" -gt 0 ]]; then
         TXTIME_LINE="BILBYCAST_ENABLE_TXTIME=1"
@@ -529,6 +580,15 @@ if [[ ! -f "${ENV_FILE}" ]]; then
 RUST_LOG=info
 # BILBYCAST_REPLAY_DIR=/var/lib/bilbycast/edge/replay
 # BILBYCAST_MEDIA_DIR=/var/lib/bilbycast/edge/media
+
+# Self-signed / untrusted manager TLS cert. The edge refuses to connect to a
+# manager whose cert isn't publicly trusted UNLESS both this env var is set to
+# 1 AND manager.accept_self_signed_cert=true in config.json (a two-part safety
+# guard). Set together by the installer's --accept-self-signed flag.
+# SECURITY: enabling this disables ALL certificate validation, exposing the
+# manager link to man-in-the-middle attacks. Dev / lab / testing only — prefer
+# cert_fingerprint pinning or a real CA in production.
+${INSECURE_LINE}
 
 # Lock all current + future memory pages into RAM at startup via
 # \`mlockall(MCL_CURRENT | MCL_FUTURE)\`. Eliminates major-page-fault
@@ -554,13 +614,26 @@ BILBYCAST_MLOCKALL=1
 ${TXTIME_LINE}
 EOF
     chmod 0640 "${ENV_FILE}"
-elif [[ "${ETF_ENABLED_COUNT}" -gt 0 ]]; then
-    if grep -q '^# *BILBYCAST_ENABLE_TXTIME=' "${ENV_FILE}"; then
-        sed -i 's/^# *BILBYCAST_ENABLE_TXTIME=.*/BILBYCAST_ENABLE_TXTIME=1/' "${ENV_FILE}"
-        echo "  Enabled BILBYCAST_ENABLE_TXTIME=1 in ${ENV_FILE}"
-    elif ! grep -q '^BILBYCAST_ENABLE_TXTIME=' "${ENV_FILE}"; then
-        echo "BILBYCAST_ENABLE_TXTIME=1" >> "${ENV_FILE}"
-        echo "  Added BILBYCAST_ENABLE_TXTIME=1 to ${ENV_FILE}"
+else
+    # Env file pre-exists (operator may have customised it) — only flip the
+    # specific knobs this run asks for, idempotently. Never clobber the file.
+    if [[ "${ETF_ENABLED_COUNT}" -gt 0 ]]; then
+        if grep -q '^# *BILBYCAST_ENABLE_TXTIME=' "${ENV_FILE}"; then
+            sed -i 's/^# *BILBYCAST_ENABLE_TXTIME=.*/BILBYCAST_ENABLE_TXTIME=1/' "${ENV_FILE}"
+            echo "  Enabled BILBYCAST_ENABLE_TXTIME=1 in ${ENV_FILE}"
+        elif ! grep -q '^BILBYCAST_ENABLE_TXTIME=' "${ENV_FILE}"; then
+            echo "BILBYCAST_ENABLE_TXTIME=1" >> "${ENV_FILE}"
+            echo "  Added BILBYCAST_ENABLE_TXTIME=1 to ${ENV_FILE}"
+        fi
+    fi
+    if [[ "${ACCEPT_SELF_SIGNED}" -eq 1 ]]; then
+        if grep -q '^# *BILBYCAST_ALLOW_INSECURE=' "${ENV_FILE}"; then
+            sed -i 's/^# *BILBYCAST_ALLOW_INSECURE=.*/BILBYCAST_ALLOW_INSECURE=1/' "${ENV_FILE}"
+            echo "  Enabled BILBYCAST_ALLOW_INSECURE=1 in ${ENV_FILE}"
+        elif ! grep -q '^BILBYCAST_ALLOW_INSECURE=' "${ENV_FILE}"; then
+            echo "BILBYCAST_ALLOW_INSECURE=1" >> "${ENV_FILE}"
+            echo "  Added BILBYCAST_ALLOW_INSECURE=1 to ${ENV_FILE}"
+        fi
     fi
 fi
 
@@ -607,19 +680,66 @@ else
 fi
 
 # ── Wait for first manager registration ────────────────────────────────
+# The local /health endpoint returns 200 as soon as the edge's own HTTP
+# server is up — it is NOT gated on manager registration (its `status` is
+# always "ok"). The manager-link state lives in the separate
+# `.manager.connected` field, which flips true only after a successful
+# AUTHENTICATED registration. We poll that field, not just the 200, so we
+# don't print a false "registered" success while the node is silently
+# failing to reach the manager (untrusted cert, bad/used token, manager
+# unreachable). Older edges that predate the `.manager` block can't report
+# link state — there we fall back to "HTTP 200 == up" and say so.
 echo
 echo "Waiting up to 60 s for bilbycast-edge to come up + register with the manager…"
+EDGE_UP=0
 for _ in $(seq 1 30); do
     if systemctl is-active --quiet bilbycast-edge; then
-        if curl -fsS http://127.0.0.1:8080/health > /dev/null 2>&1; then
-            echo "bilbycast-edge is up. Verify in the manager UI under /admin/nodes."
-            exit 0
+        HEALTH_JSON="$(curl -fsS http://127.0.0.1:8080/health 2>/dev/null)" || HEALTH_JSON=""
+        if [[ -n "${HEALTH_JSON}" ]]; then
+            EDGE_UP=1
+            if printf '%s' "${HEALTH_JSON}" | jq -e 'has("manager")' > /dev/null 2>&1; then
+                if printf '%s' "${HEALTH_JSON}" | jq -e '.manager.connected == true' > /dev/null 2>&1; then
+                    echo "bilbycast-edge is up and registered with the manager."
+                    echo "Verify in the manager UI under /admin/nodes."
+                    exit 0
+                fi
+                # Up but not yet registered — keep waiting out the window.
+            else
+                # Edge too old to report manager-link state; 200 is all we have.
+                echo "bilbycast-edge is up. Verify in the manager UI under /admin/nodes."
+                exit 0
+            fi
         fi
     fi
     sleep 2
 done
 
 echo
+if [[ "${EDGE_UP}" -eq 1 ]]; then
+    # The binary + service are installed and the local API is healthy, but the
+    # node has NOT completed manager registration within 60 s. This is NOT a
+    # failed install — the edge keeps retrying registration in the background —
+    # so exit 0, but say plainly what's incomplete and why, instead of the old
+    # misleading "bilbycast-edge is up" success.
+    echo "bilbycast-edge is RUNNING but has NOT registered with the manager yet."
+    MGR_STATE="$(curl -fsS http://127.0.0.1:8080/health 2>/dev/null \
+        | jq -r '.manager | "enabled=\(.enabled) connected=\(.connected) reconnecting=\(.reconnecting)"' 2>/dev/null || true)"
+    [[ -n "${MGR_STATE}" ]] && echo "  Manager link: ${MGR_STATE}"
+    echo "  Common causes:"
+    echo "    • Registration token expired or already used — mint a fresh one in the manager UI."
+    echo "    • Manager URL unreachable from this host (firewall / DNS / wrong port)."
+    if [[ "${ACCEPT_SELF_SIGNED}" -eq 1 ]]; then
+        echo "    • Self-signed cert accepted, but check BILBYCAST_ALLOW_INSECURE=1 took effect:"
+        echo "        grep BILBYCAST_ALLOW_INSECURE ${ENV_FILE}"
+    else
+        echo "    • Manager uses a self-signed / untrusted TLS cert — re-run the installer with"
+        echo "      --accept-self-signed (dev/lab only; disables cert validation)."
+    fi
+    echo "  Watch registration attempts live:"
+    echo "    journalctl -u bilbycast-edge -f"
+    exit 0
+fi
+
 echo "bilbycast-edge service didn't reach a healthy state in 60 s."
 echo "Inspect:"
 echo "  journalctl -u bilbycast-edge -e"

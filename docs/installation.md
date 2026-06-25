@@ -16,8 +16,40 @@ curl -fsSL https://github.com/Bilbycast/bilbycast-edge/releases/latest/download/
 ```
 
 Optional flags: `--channel stable|nightly|beta`, `--variant default|full`,
-`--upgrade-installer` (refresh the script + service unit without touching
-config or installed binaries).
+`--output-nics <nic1,nic2>` (enable SO_TXTIME wire pacing), `--upgrade-installer`
+(refresh the script + service unit without touching config or installed
+binaries).
+
+### Manager with a self-signed / untrusted TLS cert
+
+The edge connects to the manager over `wss://` and validates its certificate
+against the public CA roots. For a **lab or dev** manager using a self-signed
+cert, pass `--accept-self-signed`:
+
+```bash
+curl -fsSL https://github.com/Bilbycast/bilbycast-edge/releases/latest/download/install-edge.sh | \
+    sudo bash -s -- \
+        --manager wss://manager.lab.internal:8443 \
+        --registration-token <token-from-manager-ui> \
+        --accept-self-signed
+```
+
+This writes both halves of the safety guard the edge requires —
+`manager.accept_self_signed_cert = true` in `config.json` **and**
+`BILBYCAST_ALLOW_INSECURE=1` in `/etc/bilbycast/edge.env` — so the node
+registers without hand-patching after install.
+
+> **Security:** `--accept-self-signed` disables **all** certificate validation,
+> exposing the manager link to man-in-the-middle attacks. Use it only on
+> trusted lab networks. For production behind a private CA, install the CA in
+> the system trust store instead; to pin a specific cert, set
+> `manager.cert_fingerprint` (SHA-256) — both keep validation on.
+
+The installer's post-start check waits up to 60 s for the node to *register*
+(not merely for the local HTTP server to answer). If the service is running but
+registration hasn't completed in that window, it exits 0 with the manager-link
+state and the likely cause (expired token, unreachable manager URL, or an
+untrusted cert needing `--accept-self-signed`) rather than a misleading failure.
 
 Once registered, the manager UI's per-node **Upgrade** button drives
 future upgrades remotely — see [`docs/upgrade.md`](upgrade.md) for the
