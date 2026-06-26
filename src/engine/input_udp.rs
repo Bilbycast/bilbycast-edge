@@ -74,6 +74,7 @@ pub fn spawn_udp_input(
             transcoder.as_mut(),
             config.audio_encode.as_ref(),
             config.video_encode.as_ref(),
+            &event_sender,
         );
         let passthrough_clock = config.passthrough_clock.unwrap_or(false);
         let av_skew_for_post = stats.as_ref().av_skew_reporter_for_input(&input_id);

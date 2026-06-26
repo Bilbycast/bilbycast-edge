@@ -216,6 +216,23 @@ impl InputTranscoder {
         }
     }
 
+    /// Wire the decode-stall watchdog onto the inner video replacer so an
+    /// ingress video transcode whose decoder consumes input but produces no
+    /// frames surfaces a one-shot `video_transcode_decode_stalled` Warning
+    /// (input-scoped) instead of silently shipping audio-only TS — the field
+    /// report's `media_player` input + `video_encode` QSV-decode-fails case.
+    /// No-op when this input has no video stage. Mirrors the output-side wiring
+    /// in `transcode_chain::build_for_output`.
+    pub fn set_decode_stall_watchdog(
+        &mut self,
+        event_sender: crate::manager::events::EventSender,
+        input_id: impl Into<String>,
+    ) {
+        if let Some(v) = self.video.as_mut() {
+            v.set_decode_stall_watchdog_input(event_sender, input_id);
+        }
+    }
+
     /// Wire the **per-input** PCR forward-jump signal channel onto
     /// the audio replacer (the video replacer doesn't silence-pad —
     /// video PES values follow the source PCR jump). The
@@ -418,6 +435,7 @@ pub fn register_ingress_stats(
     transcoder: Option<&mut InputTranscoder>,
     audio_encode: Option<&AudioEncodeConfig>,
     video_encode: Option<&VideoEncodeConfig>,
+    event_sender: &crate::manager::events::EventSender,
 ) {
     use crate::stats::collector::EgressMediaSummaryStatic;
 
@@ -436,6 +454,10 @@ pub fn register_ingress_stats(
         has_audio_stage_via_transcoder = t.has_audio();
         has_video_stage_via_transcoder = t.has_video();
         t.set_av_skew_reporter(av_skew.clone());
+        // Wire the decode-stall watchdog (input-scoped) so a silent ingress
+        // video-decode failure raises a `video_transcode_decode_stalled`
+        // Warning instead of shipping audio only. No-op without a video stage.
+        t.set_decode_stall_watchdog(event_sender.clone(), input_id);
 
         // ── Audio: register decode + encode handles when an audio stage
         // is active so the manager UI's inputs-live snapshot carries both

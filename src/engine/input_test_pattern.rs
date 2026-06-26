@@ -135,6 +135,7 @@ async fn run_inner(
         transcoder.as_mut(),
         config.audio_encode.as_ref(),
         config.video_encode.as_ref(),
+        &events,
     );
     // Synthetic-TS — TsMuxer handles pid_overrides. No `passthrough_clock`
     // on TestPatternInputConfig: the pattern generator already controls

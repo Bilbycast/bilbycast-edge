@@ -248,6 +248,29 @@ impl TsVideoReplacer {
             let _ = (event_sender, output_id);
         }
     }
+
+    /// Ingress variant of [`Self::set_decode_stall_watchdog`]. Wires the same
+    /// one-shot decode-stall watchdog but emits the Warning **input-scoped**
+    /// (keyed on `input_id`) so the manager attributes a silent ingress
+    /// transcode failure to the input rather than a phantom output. Used by
+    /// `engine::input_transcode::register_ingress_stats` — the path a
+    /// `media_player` / RTP / SRT / … input with a `video_encode` block takes.
+    pub fn set_decode_stall_watchdog_input(
+        &mut self,
+        event_sender: crate::manager::events::EventSender,
+        input_id: impl Into<String>,
+    ) {
+        #[cfg(feature = "media-codecs")]
+        {
+            self.inner.event_sender = Some(event_sender);
+            self.inner.output_id = input_id.into();
+            self.inner.decode_stall_input_scope = true;
+        }
+        #[cfg(not(feature = "media-codecs"))]
+        {
+            let _ = (event_sender, input_id);
+        }
+    }
 }
 
 impl TsVideoReplacer {
@@ -589,8 +612,16 @@ mod inner {
         /// audio-only-output failure shape. `None` keeps the replacer silent
         /// (tests / ingress callers that don't wire events).
         pub event_sender: Option<crate::manager::events::EventSender>,
-        /// Output id this replacer serves — scopes the stall event.
+        /// Entity id this replacer serves — scopes the stall event. Holds an
+        /// output id by default, or an input id when the watchdog was wired via
+        /// [`TsVideoReplacer::set_decode_stall_watchdog_input`] (ingress path).
         pub output_id: String,
+        /// When `true` the decode-stall Warning is emitted input-scoped
+        /// (ingress transcoder, keyed on the input id); the default `false`
+        /// keeps it output-scoped (the output transcode path). Set by the
+        /// outer [`TsVideoReplacer::set_decode_stall_watchdog_input`], hence
+        /// `pub` like the other watchdog fields.
+        pub decode_stall_input_scope: bool,
         /// One-shot guard so the decode-stall event fires once per stall;
         /// re-armed when the decoder starts producing frames again.
         decode_stall_warned: bool,
@@ -800,6 +831,7 @@ mod inner {
                 out_psi_version: 1,
                 event_sender: None,
                 output_id: String::new(),
+                decode_stall_input_scope: false,
                 decode_stall_warned: false,
                 last_output_frames_seen: 0,
                 input_frames_at_last_output: 0,
@@ -1076,27 +1108,47 @@ mod inner {
                      decoded output — video transcode decode stalled; output is \
                      carrying audio only"
                 );
-                es.emit_output_with_details(
-                    crate::manager::events::EventSeverity::Warning,
-                    crate::manager::events::category::FLOW,
-                    format!(
-                        "Output '{}': the video transcoder is consuming input but \
-                         producing no decoded frames ({errors} decode errors over \
-                         {gap} input frames) — the output is carrying audio only. \
-                         Likely a decode-backend failure for this source; try a \
-                         different decoder backend or remove video_encode to use \
-                         passthrough.",
-                        self.output_id,
-                    ),
-                    &self.output_id,
-                    serde_json::json!({
-                        "error_code": "video_transcode_decode_stalled",
-                        "input_frames": inp,
-                        "output_frames": out,
-                        "decode_errors": errors,
-                        "source_stream_type": self.source_stream_type,
-                    }),
+                // Same event either way; only the scoping noun + the
+                // input/output id slot on the Event differ. Output scope keeps
+                // the exact wording the output transcode path always emitted.
+                let (noun, subject) = if self.decode_stall_input_scope {
+                    ("Input", "this input")
+                } else {
+                    ("Output", "the output")
+                };
+                let message = format!(
+                    "{noun} '{}': the video transcoder is consuming input but \
+                     producing no decoded frames ({errors} decode errors over \
+                     {gap} input frames) — {subject} is carrying audio only. \
+                     Likely a decode-backend failure for this source; try a \
+                     different decoder backend or remove video_encode to use \
+                     passthrough.",
+                    self.output_id,
                 );
+                let details = serde_json::json!({
+                    "error_code": "video_transcode_decode_stalled",
+                    "input_frames": inp,
+                    "output_frames": out,
+                    "decode_errors": errors,
+                    "source_stream_type": self.source_stream_type,
+                });
+                if self.decode_stall_input_scope {
+                    es.emit_input_with_details(
+                        crate::manager::events::EventSeverity::Warning,
+                        crate::manager::events::category::FLOW,
+                        message,
+                        &self.output_id,
+                        details,
+                    );
+                } else {
+                    es.emit_output_with_details(
+                        crate::manager::events::EventSeverity::Warning,
+                        crate::manager::events::category::FLOW,
+                        message,
+                        &self.output_id,
+                        details,
+                    );
+                }
             }
         }
 

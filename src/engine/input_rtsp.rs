@@ -74,6 +74,7 @@ pub fn spawn_rtsp_input(
             transcoder.as_mut(),
             config.audio_encode.as_ref(),
             config.video_encode.as_ref(),
+            &event_sender,
         );
         // Synthetic-TS input — pid_overrides handled by TsMuxer.
         let passthrough_clock = config.passthrough_clock.unwrap_or(false);

@@ -132,6 +132,7 @@ pub fn spawn_rtmp_input(
             transcoder.as_mut(),
             config.audio_encode.as_ref(),
             config.video_encode.as_ref(),
+            &event_sender,
         );
         let pid_overrides_for_mux = config.pid_overrides.clone();
         // Synthetic-TS input: TsMuxer already applies pid_overrides[1].

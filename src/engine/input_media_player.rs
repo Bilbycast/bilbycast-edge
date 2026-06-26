@@ -262,6 +262,7 @@ async fn run(
         transcoder.as_mut(),
         config.audio_encode.as_ref(),
         config.video_encode.as_ref(),
+        &events,
     );
     // Media-player CAN play MPTS files — full post-process chain wires
     // up program_filter / pid_overrides_rewriter / pid_map. Synthetic-TS

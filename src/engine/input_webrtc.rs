@@ -80,6 +80,7 @@ pub fn spawn_whip_input(
             transcoder.as_mut(),
             config.audio_encode.as_ref(),
             config.video_encode.as_ref(),
+            &event_sender,
         );
         // Synthetic-TS input — TsMuxer handles pid_overrides; the post-
         // process only does program_filter (no-op) + pid_map. No
@@ -346,6 +347,7 @@ pub fn spawn_whep_input(
             transcoder.as_mut(),
             config.audio_encode.as_ref(),
             config.video_encode.as_ref(),
+            &event_sender,
         );
         let av_skew_for_post = stats.as_ref().av_skew_reporter_for_input(&input_id);
         let mut post = InputPostProcess::from_config(&InputPostProcessConfig {

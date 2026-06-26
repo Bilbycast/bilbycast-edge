@@ -334,25 +334,34 @@ Critical events emitted by `build_assembly_plan()` at flow bring-up and by `Flow
 ### Video Encoder (`video_encode`)
 
 In-process video transcoding lifecycle for TS outputs (SRT, RIST, RTP, UDP).
-Emitted at `TsVideoReplacer::new()` call sites in each output module.
+The `started` / `failed` lifecycle pair is emitted at `TsVideoReplacer::new()`
+call sites in each output module; the `video_transcode_decode_stalled`
+watchdog additionally fires for **input**-side `video_encode` transcode
+(ingress), keyed on the input id — see that row's note.
 
 | Severity | Message | Trigger | Details |
 |----------|---------|---------|---------|
 | info | Video encoder started: output '{id}' | TsVideoReplacer created successfully. `output_id` set on event | `{ codec }` |
 | critical | Video encoder failed: output '{id}': {error} | TsVideoReplacer construction rejected (missing feature, unsupported codec). `output_id` set on event | `{ error }` |
-| warning | Output '{id}': the video transcoder is consuming input but producing no decoded frames … | Decode-stall watchdog: the internal decoder consumed ≥ `DECODE_STALL_INPUT_FRAMES` (200) input frames with **zero** decoded output — the silent audio-only-output failure (e.g. a HW decode backend that opened but fails on every frame: `decode_errors == input_frames`, `output_frames == 0`). One-shot, re-armed when the decoder starts producing frames again. `output_id` set on event. | `{ error_code: "video_transcode_decode_stalled", input_frames, output_frames, decode_errors, source_stream_type }` |
+| warning | Output '{id}' / Input '{id}': the video transcoder is consuming input but producing no decoded frames … | Decode-stall watchdog: the internal decoder consumed ≥ `DECODE_STALL_INPUT_FRAMES` (200) input frames with **zero** decoded output — the silent audio-only-output failure (e.g. a HW decode backend that opened but fails on every frame: `decode_errors == input_frames`, `output_frames == 0`). One-shot, re-armed when the decoder starts producing frames again. Fires on **both** transcode sides: an **output** with a `video_encode` block (`output_id` set on event, "Output '{id}'" wording) **and** an **input** with a `video_encode` block — `media_player` / RTP / SRT / RIST / UDP / RTMP / RTSP / WebRTC ingress transcode, plus ST 2110-20/-23 which require `video_encode` (`input_id` set on event, "Input '{id}'" wording). | `{ error_code: "video_transcode_decode_stalled", input_frames, output_frames, decode_errors, source_stream_type }` |
 
 The decode-stall window (200 frames ≈ 4 s @ 50 fps, 8 s @ 25 fps) is sized
 above every legitimate transient where output lags input (first-IDR wait,
 B-frame reorder, the deferred-encoder-open window) so it never false-fires at
 startup or across an input switch. Mirrors the ST 2110 egress watchdog
 (`st2110_egress_decode_stalled`). The manager surfaces this on the flow's
-event feed so a transcode dropping to audio-only no longer requires inspecting
-the raw stats API to catch.
+event feed **and** as an amber "Video: not present (decode stalled)" badge on
+the node-detail flow card + a "NO VIDEO" badge on the dashboard flow tile, so a
+transcode dropping to audio-only no longer requires inspecting the raw stats
+API to catch.
 
-**Source**: `src/engine/output_srt.rs`, `src/engine/output_rist.rs`,
-`src/engine/output_rtp.rs`, `src/engine/output_udp.rs`,
-`src/engine/ts_video_replace.rs` (`Inner::check_decode_stall`).
+**Source**: output side — `src/engine/output_srt.rs`,
+`src/engine/output_rist.rs`, `src/engine/output_rtp.rs`,
+`src/engine/output_udp.rs` (via `transcode_chain::build_for_output`); input
+side — `src/engine/input_transcode.rs::register_ingress_stats` (every Group A
+input + `media_player` / `replay` / `test_pattern`); both bottom out in
+`src/engine/ts_video_replace.rs` (`Inner::check_decode_stall`, scoped by
+`set_decode_stall_watchdog` / `set_decode_stall_watchdog_input`).
 
 ### Encoder runtime diagnostics
 

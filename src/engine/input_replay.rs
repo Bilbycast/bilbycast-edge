@@ -127,6 +127,7 @@ async fn run(
         transcoder.as_mut(),
         config.audio_encode.as_ref(),
         config.video_encode.as_ref(),
+        &events,
     );
     // Replay reads stored TS files (possibly MPTS) — full post-process chain.
     let passthrough_clock = config.passthrough_clock.unwrap_or(false);
