@@ -646,6 +646,7 @@ fn build_transcode_chain_for_srt(
         stats,
         av_sync_pacer,
         None, // SRT has its own protocol-layer pacing, no wire_emit
+        Some(events),
     ) {
         Ok(chain) => {
             if let Some(ref c) = chain {

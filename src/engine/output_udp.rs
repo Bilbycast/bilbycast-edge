@@ -337,6 +337,7 @@ async fn udp_output_loop(
         &stats,
         av_sync_pacer.as_ref(),
         backpressure,
+        Some(events),
     ) {
         Ok(chain) => {
             if let Some(ref c) = chain {

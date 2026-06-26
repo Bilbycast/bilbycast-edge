@@ -349,6 +349,7 @@ impl TranscodeChain {
 ///   `chain.try_submit` + `chain.try_recv` in its main loop.
 /// - `Err(_)` — one of the replacers failed to construct. The caller's
 ///   existing error-event emission path handles this.
+#[allow(clippy::too_many_arguments)]
 pub fn build_for_output(
     output_id: &str,
     audio_encode: Option<&crate::config::models::AudioEncodeConfig>,
@@ -357,6 +358,7 @@ pub fn build_for_output(
     stats: &Arc<crate::stats::collector::OutputStatsAccumulator>,
     av_sync_pacer: Option<&Arc<crate::engine::av_sync_mux::AvSyncPacer>>,
     backpressure: Option<WireBackpressure>,
+    event_sender: Option<&crate::manager::events::EventSender>,
 ) -> Result<Option<TranscodeChain>, TranscodeChainError> {
     // Output-local edge-added A/V skew reporter: this output's own
     // re-encode stages shift PTS independently of the input path, so
@@ -422,6 +424,14 @@ pub fn build_for_output(
             stats.set_video_decode_stats(r.decode_stats_handle(), "", 0, 0, 0.0);
             if let Some(p) = av_sync_pacer {
                 r.set_av_sync_pacer(p.clone());
+            }
+            // Wire the decode-stall watchdog so a transcode whose decoder
+            // produces no frames surfaces a Warning instead of silently
+            // shipping audio-only output (field report: QSV H.264 decode
+            // failed for every frame during transcode while the SRT output
+            // showed Running with video_bitrate_bps == 0).
+            if let Some(es) = event_sender {
+                r.set_decode_stall_watchdog(es.clone(), output_id);
             }
             r.set_av_skew_reporter(av_skew.clone());
             Some(r)

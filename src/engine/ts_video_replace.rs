@@ -227,6 +227,27 @@ impl TsVideoReplacer {
             let _ = floor;
         }
     }
+
+    /// Wire the manager event sender + output id so the replacer can emit a
+    /// one-shot `video_transcode_decode_stalled` Warning when the decoder
+    /// consumes input but produces no frames (silent audio-only output).
+    /// Safe to call zero or one time before `process()` runs. `None`-event
+    /// callers (the audio-only / ingress paths) simply never call this.
+    pub fn set_decode_stall_watchdog(
+        &mut self,
+        event_sender: crate::manager::events::EventSender,
+        output_id: impl Into<String>,
+    ) {
+        #[cfg(feature = "media-codecs")]
+        {
+            self.inner.event_sender = Some(event_sender);
+            self.inner.output_id = output_id.into();
+        }
+        #[cfg(not(feature = "media-codecs"))]
+        {
+            let _ = (event_sender, output_id);
+        }
+    }
 }
 
 impl TsVideoReplacer {
@@ -468,6 +489,15 @@ mod inner {
         di
     }
 
+    /// Input frames the decoder may consume with **zero** decoded output
+    /// before [`Inner::check_decode_stall`] declares a decode stall. Sized
+    /// comfortably above every legitimate transient where output lags input
+    /// (first-IDR wait, B-frame reorder, the deferred-encoder-open window of
+    /// ~60 PES) so the watchdog never false-fires at startup or across an
+    /// input switch. Matches the ST 2110 egress watchdog's precedent
+    /// (`EGRESS_DECODE_STALL_AUS = 200`): ~4 s at 50 fps, ~8 s at 25 fps.
+    const DECODE_STALL_INPUT_FRAMES: u64 = 200;
+
     pub struct Inner {
         #[allow(dead_code)]
         target_family: VideoCodec,
@@ -552,6 +582,24 @@ mod inner {
         /// Checked once per `process()` entry; on `true` we run
         /// `reset_source_state("input switched")` and clear the flag.
         external_reset: Arc<AtomicBool>,
+        /// Optional manager event sender for the decode-stall watchdog. When
+        /// set, [`Inner::check_decode_stall`] emits a one-shot Warning
+        /// (`video_transcode_decode_stalled`) if the decoder consumes input
+        /// but produces no frames for a sustained window — the silent
+        /// audio-only-output failure shape. `None` keeps the replacer silent
+        /// (tests / ingress callers that don't wire events).
+        pub event_sender: Option<crate::manager::events::EventSender>,
+        /// Output id this replacer serves — scopes the stall event.
+        pub output_id: String,
+        /// One-shot guard so the decode-stall event fires once per stall;
+        /// re-armed when the decoder starts producing frames again.
+        decode_stall_warned: bool,
+        /// Highest `output_frames` count observed — the progress detector
+        /// that drives the re-arm.
+        last_output_frames_seen: u64,
+        /// `input_frames` value when output last advanced; the stall window
+        /// is `current input_frames − this`.
+        input_frames_at_last_output: u64,
         /// PTS (90 kHz) of the previous emitted output frame. Used to
         /// detect epoch jumps — when the next emit's PTS differs from
         /// this by more than `PTS_JUMP_THRESHOLD_90K`, the
@@ -750,6 +798,11 @@ mod inner {
                 passthrough_audio_pts: 0,
                 input_decode_handle: None,
                 out_psi_version: 1,
+                event_sender: None,
+                output_id: String::new(),
+                decode_stall_warned: false,
+                last_output_frames_seen: 0,
+                input_frames_at_last_output: 0,
             })
         }
 
@@ -976,6 +1029,74 @@ mod inner {
                     }
                 }
                 output.extend_from_slice(pkt);
+            }
+
+            // Surface the silent audio-only-output failure: a decoder that
+            // consumes input but never produces frames (decode_errors
+            // saturating, or a broken HW decode backend on this host).
+            self.check_decode_stall();
+        }
+
+        /// One-shot decode-stall watchdog.
+        ///
+        /// Fires a Warning event (`video_transcode_decode_stalled`) when the
+        /// internal decoder has consumed input frames but produced no output
+        /// for a sustained window — the failure the field report described,
+        /// where the SRT output silently carries audio only and
+        /// `video_decode_stats` shows `output_frames == 0` with
+        /// `decode_errors == input_frames`. Keyed on input-vs-output
+        /// *progress* (not a raw `output == 0` test) so it catches both the
+        /// "never produced a frame" and the "stalled mid-stream" cases, and
+        /// re-arms once the decoder starts producing frames again.
+        fn check_decode_stall(&mut self) {
+            let Some(es) = self.event_sender.as_ref() else {
+                return;
+            };
+            let inp = self.decode_stats.input_frames.load(Ordering::Relaxed);
+            let out = self.decode_stats.output_frames.load(Ordering::Relaxed);
+
+            // Decoder is producing — record the progress point and re-arm.
+            if out > self.last_output_frames_seen {
+                self.last_output_frames_seen = out;
+                self.input_frames_at_last_output = inp;
+                self.decode_stall_warned = false;
+                return;
+            }
+
+            let gap = inp.saturating_sub(self.input_frames_at_last_output);
+            if gap >= DECODE_STALL_INPUT_FRAMES && !self.decode_stall_warned {
+                self.decode_stall_warned = true;
+                let errors = self.decode_stats.decode_errors.load(Ordering::Relaxed);
+                tracing::warn!(
+                    output_id = %self.output_id,
+                    input_frames = inp,
+                    output_frames = out,
+                    decode_errors = errors,
+                    "ts_video_replace: decoder consumed {gap} input frames with no \
+                     decoded output — video transcode decode stalled; output is \
+                     carrying audio only"
+                );
+                es.emit_output_with_details(
+                    crate::manager::events::EventSeverity::Warning,
+                    crate::manager::events::category::FLOW,
+                    format!(
+                        "Output '{}': the video transcoder is consuming input but \
+                         producing no decoded frames ({errors} decode errors over \
+                         {gap} input frames) — the output is carrying audio only. \
+                         Likely a decode-backend failure for this source; try a \
+                         different decoder backend or remove video_encode to use \
+                         passthrough.",
+                        self.output_id,
+                    ),
+                    &self.output_id,
+                    serde_json::json!({
+                        "error_code": "video_transcode_decode_stalled",
+                        "input_frames": inp,
+                        "output_frames": out,
+                        "decode_errors": errors,
+                        "source_stream_type": self.source_stream_type,
+                    }),
+                );
             }
         }
 

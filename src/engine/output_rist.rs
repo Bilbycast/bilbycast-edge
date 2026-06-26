@@ -311,6 +311,7 @@ async fn rist_output_loop(
         &stats,
         av_sync_pacer.as_ref(),
         None, // RIST backpressure not yet wired
+        Some(events),
     ) {
         Ok(chain) => {
             if let Some(ref c) = chain {
