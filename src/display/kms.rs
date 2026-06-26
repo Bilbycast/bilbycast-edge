@@ -51,6 +51,46 @@ impl std::os::fd::AsFd for CardFile {
 impl Device for CardFile {}
 impl ControlDevice for CardFile {}
 
+impl CardFile {
+    /// `dup(2)` the card fd into an independent `CardFile`. The clone
+    /// refers to the SAME open file description (so it shares this card's
+    /// DRM master status), but is a distinct fd we own outright — closing
+    /// it does not disturb the original. Used to build a
+    /// [`MasterReleaseHandle`] the supervisor can keep even after the live
+    /// `KmsDisplay` is moved into a (possibly wedge-prone) render thread.
+    fn try_clone(&self) -> std::io::Result<CardFile> {
+        Ok(CardFile(self.0.try_clone()?))
+    }
+}
+
+/// Independent handle that can relinquish a display's DRM master lease
+/// without touching the (possibly wedged) render thread that owns the live
+/// [`KmsDisplay`]. Built via [`KmsDisplay::master_release_handle`] from a
+/// `dup(2)` of the card fd: the dup shares the same open file description,
+/// so a `DROP_MASTER` ioctl issued through it releases the master held by
+/// the original fd. The display orchestrator keeps one of these so that if
+/// its blocking children fail to drain on teardown (e.g. ALSA `writei`
+/// wedged on a yanked sink — `spawn_blocking` threads are detached from
+/// `JoinHandle::abort`), it can still free the connector for the next
+/// opener instead of leaking the master until the process exits.
+pub struct MasterReleaseHandle {
+    card: CardFile,
+}
+
+impl MasterReleaseHandle {
+    /// Best-effort `DROP_MASTER`. Safe to call when we are not (or no
+    /// longer) the master — the kernel returns `EINVAL`/`EACCES`, which we
+    /// swallow. Only call once the live display is being torn down: a
+    /// successful drop pulls master out from under any concurrent flip on
+    /// the original fd, so it must not race a healthy render path.
+    pub fn force_drop_master(&self) {
+        match self.card.release_master_lock() {
+            Ok(()) => tracing::debug!("display: force DROP_MASTER succeeded"),
+            Err(e) => tracing::debug!("display: force DROP_MASTER best-effort failed: {e}"),
+        }
+    }
+}
+
 fn open_card(path: &PathBuf) -> Result<CardFile> {
     let file = std::fs::OpenOptions::new()
         .read(true)
@@ -581,6 +621,22 @@ struct DumbBuffer {
 const FLIP_EVENT_TIMEOUT_MS: u64 = 500;
 
 impl KmsDisplay {
+    /// Duplicate the card fd into a standalone [`MasterReleaseHandle`] so a
+    /// supervisor can drop this display's DRM master even when the thread
+    /// owning the live `KmsDisplay` is wedged in a blocking syscall and
+    /// never drops it itself. Returns `None` if `dup(2)` fails.
+    pub fn master_release_handle(&self) -> Option<MasterReleaseHandle> {
+        match self.card.try_clone() {
+            Ok(card) => Some(MasterReleaseHandle { card }),
+            Err(e) => {
+                tracing::debug!(
+                    "display: could not dup card fd for master-release handle: {e}"
+                );
+                None
+            }
+        }
+    }
+
     /// Open the KMS card backing `connector_name`, drm-master the device,
     /// pick the requested mode (or the connector's preferred mode when
     /// `(width, height, refresh_hz)` is `None`), allocate two XRGB8888

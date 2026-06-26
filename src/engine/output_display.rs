@@ -75,6 +75,28 @@ use crate::stats::collector::{DisplayStatsCounters, OutputStatsAccumulator};
 const MPSC_VIDEO_DEPTH: usize = 24;
 const MPSC_AUDIO_DEPTH: usize = 64;
 
+/// Grace period the orchestrator waits — AFTER cancellation — for its
+/// blocking render children to drain and drop the live `KmsDisplay`
+/// (closing the card fd, which releases DRM master). If they don't drain
+/// within this window (a child wedged in a blocking syscall the cancel
+/// token can't interrupt — `spawn_blocking` threads are detached from
+/// `JoinHandle::abort`), the orchestrator force-releases DRM master
+/// through a dup'd fd so switching this output to another connector on
+/// the same GPU isn't blocked until a process restart. Kept under
+/// `FlowRuntime::remove_output`'s 5 s teardown-await so the orchestrator
+/// returns on its own (emitting a clean `display_stopped`) instead of
+/// being `abort()`ed mid-drain.
+const DISPLAY_DRAIN_GRACE: Duration = Duration::from_secs(3);
+
+/// Number of consecutive failed `KmsDisplay::open` attempts (each spaced
+/// ~500 ms) after which the open-retry loop escalates ONCE from the
+/// initial Warning to a Critical alarm. The connector is being held by
+/// another DRM master (a desktop compositor, another edge, or a prior
+/// display task wedged on the same GPU) and the picture will stay dark
+/// until that clears — the operator needs a persistent, actionable
+/// signal rather than a single easy-to-miss Warning. ~10 s at 500 ms.
+const KMS_BUSY_CRITICAL_ATTEMPTS: u32 = 20;
+
 // ── Public spawner ────────────────────────────────────────────────
 
 /// Spawn the orchestrator task for one `display` output. The returned
@@ -279,6 +301,7 @@ async fn run_display_output(
     let mut kms = {
         let mut attempt: u32 = 0;
         let mut emitted_waiting = false;
+        let mut emitted_critical = false;
         loop {
             let device = config.device.clone();
             let open_res = tokio::task::spawn_blocking(move || {
@@ -343,15 +366,50 @@ async fn run_display_output(
                             }),
                         );
                         emitted_waiting = true;
-                    } else if attempt % 60 == 0 {
-                        // Throttled progress log every ~30 s so an
-                        // operator who left the wait running sees that
-                        // we're still trying, without spamming the event
-                        // log.
-                        tracing::debug!(
-                            "display output '{}' still waiting on {} after {} attempts: {}",
-                            config.id, config.device, attempt, msg,
-                        );
+                    } else {
+                        if !emitted_critical && attempt >= KMS_BUSY_CRITICAL_ATTEMPTS {
+                            // The connector still won't open ~10 s in. The
+                            // lone Warning above is easy to miss and the loop
+                            // would otherwise retry silently forever, so
+                            // escalate ONCE to Critical: the picture stays
+                            // dark until the holder (a desktop compositor,
+                            // another edge, or a prior display task wedged on
+                            // the same GPU) releases the connector — often a
+                            // restart is required. `code` carries the precise
+                            // classified cause (`display_master_busy` /
+                            // `display_device_invalid` / …).
+                            event_sender.emit_with_details(
+                                EventSeverity::Critical,
+                                "display",
+                                format!(
+                                    "display output '{}' still cannot open {} after {} attempts: \
+                                     {} — the picture will stay dark until the connector is freed; \
+                                     if it is held by a desktop compositor or a prior display task \
+                                     on the same GPU, stop that holder or restart the edge",
+                                    config.id, config.device, attempt, msg,
+                                ),
+                                Some(&flow_id),
+                                serde_json::json!({
+                                    "error_code": code,
+                                    "output_id": config.id,
+                                    "device": config.device,
+                                    "audio_device": config.audio_device.clone().unwrap_or_default(),
+                                    "reason": "kms_busy_persistent",
+                                    "kms_error_message": msg,
+                                    "attempts": attempt,
+                                }),
+                            );
+                            emitted_critical = true;
+                        } else if attempt % 60 == 0 {
+                            // Throttled progress log every ~30 s so an
+                            // operator who left the wait running sees that
+                            // we're still trying, without spamming the event
+                            // log.
+                            tracing::debug!(
+                                "display output '{}' still waiting on {} after {} attempts: {}",
+                                config.id, config.device, attempt, msg,
+                            );
+                        }
                     }
                     attempt = attempt.saturating_add(1);
                     // Sleep with cancel — exit immediately if the flow
@@ -650,6 +708,11 @@ async fn run_display_output(
     let display_frame_gen = Arc::clone(&frame_gen);
     let display_force_cpu_blit = Arc::clone(&force_cpu_blit_for_bars);
     let display_prime_scanout_failed = Arc::clone(&prime_scanout_failed);
+    // Independent DRM-master release handle (a dup of the card fd) captured
+    // before the live `kms` moves into the render thread below. Lets the
+    // orchestrator free the connector on teardown even if that thread later
+    // wedges and never drops `kms` itself (see DISPLAY_DRAIN_GRACE).
+    let master_release = kms.master_release_handle();
     let display_handle = tokio::task::spawn_blocking(move || {
         display_loop(
             kms,
@@ -698,11 +761,65 @@ async fn run_display_output(
         );
     });
 
-    // Wait for all children to drain (cancellation cascade). The audio
-    // meter is optional; await it only when it was spawned.
-    let _ = tokio::join!(demux_handle, display_handle, audio_handle);
-    if let Some(handle) = meter_handle {
-        let _ = handle.await;
+    // Wait for all children to drain (cancellation cascade). On exit each
+    // child drops its share of the pipeline; the display child drops the
+    // live `KmsDisplay`, closing the card fd and releasing DRM master so
+    // the next opener of this connector/CRTC can take over with no process
+    // restart.
+    //
+    // A `spawn_blocking` child can wedge in a syscall the cancel token
+    // can't interrupt (ALSA `snd_pcm_writei` on a yanked sink is the
+    // classic case) and `JoinHandle::abort` does not reap blocking threads.
+    // If that thread is the one holding the card fd it would keep DRM
+    // master forever, so an operator who switches this output to another
+    // connector on the same GPU sees the new connector stay dark until the
+    // edge process exits — exactly the "had to restart the node" symptom.
+    // Once cancellation is requested, give the children a bounded grace
+    // period to drain cleanly; if they don't, force-release DRM master
+    // through the dup'd fd so the connector is freed for the next opener.
+    // The wedged thread is abandoned (it dies with the process) but no
+    // longer holds the hardware hostage.
+    let drain = async {
+        let _ = tokio::join!(demux_handle, display_handle, audio_handle);
+        if let Some(handle) = meter_handle {
+            let _ = handle.await;
+        }
+    };
+    tokio::pin!(drain);
+    tokio::select! {
+        _ = &mut drain => {}
+        _ = cancel.cancelled() => {
+            if tokio::time::timeout(DISPLAY_DRAIN_GRACE, &mut drain).await.is_err() {
+                if let Some(mr) = master_release.as_ref() {
+                    mr.force_drop_master();
+                }
+                tracing::warn!(
+                    "display output '{}' on {}: render threads did not drain within {}s of \
+                     cancel — force-released DRM master so the connector is free for the next \
+                     opener (a wedged blocking thread is abandoned and dies with the process)",
+                    config.id,
+                    config.device,
+                    DISPLAY_DRAIN_GRACE.as_secs(),
+                );
+                event_sender.emit_with_details(
+                    EventSeverity::Warning,
+                    "display",
+                    format!(
+                        "display output '{}' teardown wedged on {}; force-released DRM master to \
+                         free the connector for the next opener",
+                        config.id, config.device,
+                    ),
+                    Some(&flow_id),
+                    serde_json::json!({
+                        "error_code": "display_teardown_forced_release",
+                        "output_id": config.id,
+                        "device": config.device,
+                        "audio_device": config.audio_device.clone().unwrap_or_default(),
+                        "grace_seconds": DISPLAY_DRAIN_GRACE.as_secs(),
+                    }),
+                );
+            }
+        }
     }
 
     emit_event(

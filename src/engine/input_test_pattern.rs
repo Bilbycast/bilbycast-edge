@@ -211,9 +211,21 @@ async fn run_inner(
     // AV_PIX_FMT_YUV420P == 0
     const AV_PIX_FMT_YUV420P: i32 = 0;
 
-    // Build the audio encoder if enabled.
+    // Build the audio encoder if enabled. Channel-ident announcements only
+    // apply when the A/V-sync beep isn't claiming the audio (av_sync_marker
+    // takes precedence — a sync test needs the pip on every channel).
+    let channel_ident = !config.av_sync_marker
+        && matches!(
+            config.audio_content,
+            crate::config::models::TestPatternAudioContent::ChannelIdent
+        );
     let audio_ctx = if config.audio_enabled {
-        Some(build_audio_encoder(config.tone_hz, config.tone_dbfs)?)
+        Some(build_audio_encoder(
+            config.tone_hz,
+            config.tone_dbfs,
+            config.audio_channels.max(1) as usize,
+            channel_ident,
+        )?)
     } else {
         None
     };
@@ -272,8 +284,27 @@ async fn run_inner(
         y_plane.copy_from_slice(&y_base);
         draw_bouncing_box(&mut y_plane, width as usize, height as usize, frame_idx);
         draw_timecode(&mut y_plane, width as usize, height as usize, frame_idx, fps);
+        if let Some(id) = config.screen_id.as_deref() {
+            if !id.is_empty() {
+                draw_screen_id(&mut y_plane, width as usize, height as usize, id);
+            }
+        }
         if config.av_sync_marker {
-            draw_av_sync_marker(&mut y_plane, width as usize, height as usize, burst_active);
+            match config.av_sync_style {
+                crate::config::models::TestPatternAvSyncStyle::Flash => {
+                    draw_av_sync_marker(&mut y_plane, width as usize, height as usize, burst_active);
+                }
+                crate::config::models::TestPatternAvSyncStyle::Sweep => {
+                    draw_av_sync_sweep(
+                        &mut y_plane,
+                        width as usize,
+                        height as usize,
+                        frame_in_second,
+                        fps,
+                        burst_active,
+                    );
+                }
+            }
         }
 
         // ── Video ── encode one frame of bars.
@@ -311,28 +342,50 @@ async fn run_inner(
             let pos_base = (frame_in_second as usize) * samples_needed;
             let mut planar: Vec<Vec<f32>> = vec![Vec::with_capacity(samples_needed); ctx.channels];
             for i in 0..samples_needed {
-                let env: f32 = if !config.av_sync_marker {
-                    1.0
-                } else if !burst_active {
-                    0.0
-                } else {
-                    let pos = pos_base + i;
-                    if pos < ramp_samples {
-                        0.5 * (1.0 - (std::f32::consts::PI * pos as f32 / ramp_samples as f32).cos())
-                    } else if pos + ramp_samples >= total_burst_samples {
-                        let tail = total_burst_samples - pos;
-                        0.5 * (1.0 - (std::f32::consts::PI * tail as f32 / ramp_samples as f32).cos())
+                if config.av_sync_marker {
+                    // Sync mode: gated sine burst, identical on every
+                    // channel — the pip the operator aligns to the flash /
+                    // sweep dot.
+                    let env: f32 = if !burst_active {
+                        0.0
                     } else {
-                        1.0
+                        let pos = pos_base + i;
+                        if pos < ramp_samples {
+                            0.5 * (1.0 - (std::f32::consts::PI * pos as f32 / ramp_samples as f32).cos())
+                        } else if pos + ramp_samples >= total_burst_samples {
+                            let tail = total_burst_samples.saturating_sub(pos);
+                            0.5 * (1.0 - (std::f32::consts::PI * tail as f32 / ramp_samples as f32).cos())
+                        } else {
+                            1.0
+                        }
+                    };
+                    let v = (ctx.phase.sin() as f32) * ctx.amplitude * env;
+                    for ch in planar.iter_mut() {
+                        ch.push(v);
                     }
-                };
-                let v = (ctx.phase.sin() as f32) * ctx.amplitude * env;
-                for ch in planar.iter_mut() {
-                    ch.push(v);
-                }
-                ctx.phase += ctx.step;
-                if ctx.phase > std::f64::consts::TAU {
-                    ctx.phase -= std::f64::consts::TAU;
+                    ctx.phase += ctx.step;
+                    if ctx.phase > std::f64::consts::TAU {
+                        ctx.phase -= std::f64::consts::TAU;
+                    }
+                } else if let Some(ident) = ctx.ident.as_mut() {
+                    // Channel-ident: each channel reads from its own looped
+                    // announcement buffer (voice digit or counted beeps),
+                    // all sharing one period so they stay phase-aligned.
+                    let idx = ident.pos % ident.period;
+                    for (ch, buf) in planar.iter_mut().zip(ident.buffers.iter()) {
+                        ch.push(buf.get(idx).copied().unwrap_or(0.0));
+                    }
+                    ident.pos = ident.pos.wrapping_add(1);
+                } else {
+                    // Continuous line-up tone, identical on every channel.
+                    let v = (ctx.phase.sin() as f32) * ctx.amplitude;
+                    for ch in planar.iter_mut() {
+                        ch.push(v);
+                    }
+                    ctx.phase += ctx.step;
+                    if ctx.phase > std::f64::consts::TAU {
+                        ctx.phase -= std::f64::consts::TAU;
+                    }
                 }
             }
             ctx.accumulate(planar);
@@ -504,11 +557,49 @@ const TC_FONT: [[u8; 7]; 11] = [
     [0b00000, 0b00110, 0b00110, 0b00000, 0b00110, 0b00110, 0b00000], // :
 ];
 
+/// 5×7 bitmap font for A–Z. Same row encoding as [`TC_FONT`] (low 5 bits,
+/// MSB = leftmost pixel). Used by the screen-ID overlay.
 #[cfg(all(feature = "media-codecs", feature = "fdk-aac"))]
-fn tc_glyph_index(ch: char) -> Option<usize> {
+const LETTER_FONT: [[u8; 7]; 26] = [
+    [0b01110, 0b10001, 0b10001, 0b11111, 0b10001, 0b10001, 0b10001], // A
+    [0b11110, 0b10001, 0b10001, 0b11110, 0b10001, 0b10001, 0b11110], // B
+    [0b01110, 0b10001, 0b10000, 0b10000, 0b10000, 0b10001, 0b01110], // C
+    [0b11110, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b11110], // D
+    [0b11111, 0b10000, 0b10000, 0b11110, 0b10000, 0b10000, 0b11111], // E
+    [0b11111, 0b10000, 0b10000, 0b11110, 0b10000, 0b10000, 0b10000], // F
+    [0b01110, 0b10001, 0b10000, 0b10111, 0b10001, 0b10001, 0b01111], // G
+    [0b10001, 0b10001, 0b10001, 0b11111, 0b10001, 0b10001, 0b10001], // H
+    [0b01110, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b01110], // I
+    [0b00111, 0b00010, 0b00010, 0b00010, 0b00010, 0b10010, 0b01100], // J
+    [0b10001, 0b10010, 0b10100, 0b11000, 0b10100, 0b10010, 0b10001], // K
+    [0b10000, 0b10000, 0b10000, 0b10000, 0b10000, 0b10000, 0b11111], // L
+    [0b10001, 0b11011, 0b10101, 0b10101, 0b10001, 0b10001, 0b10001], // M
+    [0b10001, 0b11001, 0b10101, 0b10011, 0b10001, 0b10001, 0b10001], // N
+    [0b01110, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01110], // O
+    [0b11110, 0b10001, 0b10001, 0b11110, 0b10000, 0b10000, 0b10000], // P
+    [0b01110, 0b10001, 0b10001, 0b10001, 0b10101, 0b10010, 0b01101], // Q
+    [0b11110, 0b10001, 0b10001, 0b11110, 0b10100, 0b10010, 0b10001], // R
+    [0b01111, 0b10000, 0b10000, 0b01110, 0b00001, 0b00001, 0b11110], // S
+    [0b11111, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100], // T
+    [0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01110], // U
+    [0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01010, 0b00100], // V
+    [0b10001, 0b10001, 0b10001, 0b10101, 0b10101, 0b11011, 0b10001], // W
+    [0b10001, 0b10001, 0b01010, 0b00100, 0b01010, 0b10001, 0b10001], // X
+    [0b10001, 0b10001, 0b01010, 0b00100, 0b00100, 0b00100, 0b00100], // Y
+    [0b11111, 0b00001, 0b00010, 0b00100, 0b01000, 0b10000, 0b11111], // Z
+];
+
+/// Resolve a character to its 5×7 glyph rows. Covers digits, `:`, A–Z, and
+/// a few symbols; unknown characters return `None` (caller skips them).
+#[cfg(all(feature = "media-codecs", feature = "fdk-aac"))]
+fn glyph_5x7(ch: char) -> Option<[u8; 7]> {
     match ch {
-        '0'..='9' => Some((ch as u8 - b'0') as usize),
-        ':' => Some(10),
+        '0'..='9' => Some(TC_FONT[(ch as u8 - b'0') as usize]),
+        ':' => Some(TC_FONT[10]),
+        'A'..='Z' => Some(LETTER_FONT[(ch as u8 - b'A') as usize]),
+        ' ' => Some([0; 7]),
+        '-' => Some([0, 0, 0, 0b11111, 0, 0, 0]),
+        '.' => Some([0, 0, 0, 0, 0, 0b00110, 0b00110]),
         _ => None,
     }
 }
@@ -527,8 +618,7 @@ fn fill_rect_y(y: &mut [u8], stride: usize, height: usize, x0: usize, y0: usize,
 
 #[cfg(all(feature = "media-codecs", feature = "fdk-aac"))]
 fn draw_glyph(y: &mut [u8], stride: usize, height: usize, ch: char, x0: usize, y0: usize, scale: usize, luma: u8) {
-    let Some(idx) = tc_glyph_index(ch) else { return; };
-    let glyph = &TC_FONT[idx];
+    let Some(glyph) = glyph_5x7(ch) else { return; };
     for (row, bits) in glyph.iter().enumerate() {
         for col in 0..5u8 {
             if (bits >> (4 - col)) & 1 != 0 {
@@ -593,6 +683,106 @@ fn draw_av_sync_marker(y: &mut [u8], width: usize, height: usize, flash_on: bool
     fill_rect_y(y, width, height, x0 + border, y0 + border, inner_size, inner_size, inner_luma);
 }
 
+/// Burned-in identifier label, drawn large + centred near the top of the
+/// frame with a black backing well. Uppercased; characters the 5×7 font
+/// can't draw are skipped. Scale shrinks to keep the label inside the frame.
+#[cfg(all(feature = "media-codecs", feature = "fdk-aac"))]
+fn draw_screen_id(y: &mut [u8], width: usize, height: usize, label: &str) {
+    let text: String = label
+        .chars()
+        .flat_map(|c| c.to_uppercase())
+        .filter(|c| glyph_5x7(*c).is_some())
+        .collect();
+    if text.is_empty() {
+        return;
+    }
+    let n = text.chars().count();
+    // Aim for a prominent label (~1/10 of frame height) but shrink to fit.
+    let mut scale = (height / 72).max(3);
+    while scale > 1 {
+        let total_w = n * 5 * scale + n.saturating_sub(1) * scale;
+        if total_w + scale * 8 <= width {
+            break;
+        }
+        scale -= 1;
+    }
+    let glyph_w = 5 * scale;
+    let glyph_h = 7 * scale;
+    let gap = scale;
+    let total_w = n * glyph_w + n.saturating_sub(1) * gap;
+    if total_w >= width {
+        return;
+    }
+    let x0 = (width - total_w) / 2;
+    let y0 = (height / 12).max(scale * 2);
+    let pad = scale * 2;
+    let bg_x0 = x0.saturating_sub(pad);
+    let bg_y0 = y0.saturating_sub(pad);
+    let bg_w = (total_w + 2 * pad).min(width.saturating_sub(bg_x0));
+    let bg_h = (glyph_h + 2 * pad).min(height.saturating_sub(bg_y0));
+    fill_rect_y(y, width, height, bg_x0, bg_y0, bg_w, bg_h, 16);
+    let mut cx = x0;
+    for ch in text.chars() {
+        draw_glyph(y, width, height, ch, cx, y0, scale, 235);
+        cx += glyph_w + gap;
+    }
+}
+
+/// A/V-sync "sweep" marker: a dot orbits a ring once per second, and the
+/// beep fires as it crosses the 12 o'clock notch. The operator reads skew
+/// from where the dot sits when the pip is heard — more intuitive than a
+/// flash. Drawn upper-right so it stays clear of the centre box, the bottom
+/// timecode, and the top screen-ID label.
+#[cfg(all(feature = "media-codecs", feature = "fdk-aac"))]
+fn draw_av_sync_sweep(
+    y: &mut [u8],
+    width: usize,
+    height: usize,
+    frame_in_second: u64,
+    fps: u32,
+    flash_on: bool,
+) {
+    let r = (height.min(width) / 6).max(20) as i64;
+    let w = width as i64;
+    let h = height as i64;
+    if r * 2 + 8 >= w || r * 2 + 8 >= h {
+        return;
+    }
+    let cx = (w * 3 / 4).clamp(r + 4, w - r - 4);
+    let cy = (h / 2).clamp(r + 4, h - r - 4);
+    let plot = |buf: &mut [u8], px: i64, py: i64, luma: u8| {
+        if px >= 0 && px < w && py >= 0 && py < h {
+            buf[(py as usize) * width + (px as usize)] = luma;
+        }
+    };
+    // Ring outline (2 px) + a bright notch at 12 o'clock (the beep mark).
+    let steps = ((2.0 * std::f64::consts::PI * r as f64) as i64).max(64);
+    for s in 0..steps {
+        let a = 2.0 * std::f64::consts::PI * (s as f64) / (steps as f64);
+        let px = cx + (r as f64 * a.sin()) as i64;
+        let py = cy - (r as f64 * a.cos()) as i64;
+        plot(y, px, py, 180);
+        plot(y, px + 1, py, 180);
+    }
+    for d in 0..(r / 4).max(1) {
+        plot(y, cx, cy - r + d, 235);
+        plot(y, cx + 1, cy - r + d, 235);
+    }
+    // Dot sweeps once per second; angle 0 = 12 o'clock, clockwise.
+    let theta = 2.0 * std::f64::consts::PI * (frame_in_second as f64) / (fps.max(1) as f64);
+    let dx = cx + (r as f64 * theta.sin()) as i64;
+    let dy = cy - (r as f64 * theta.cos()) as i64;
+    let dot_r = (r / 7).max(3);
+    let luma = if flash_on { 235 } else { 200 };
+    for oy in -dot_r..=dot_r {
+        for ox in -dot_r..=dot_r {
+            if ox * ox + oy * oy <= dot_r * dot_r {
+                plot(y, dx + ox, dy + oy, luma);
+            }
+        }
+    }
+}
+
 /// Solid white box that ping-pongs diagonally. Triangle wave in X and Y
 /// with coprime-ish speeds so the trajectory covers the frame rather
 /// than cycling on a short orbit.
@@ -627,6 +817,20 @@ struct AudioContext {
     accumulator: Vec<Vec<f32>>,
     accumulated: usize,
     pts_90k: u64,
+    /// Per-channel looped number-announcement buffers. `Some` only in
+    /// channel-ident mode (see [`build_ident_bank`]).
+    ident: Option<IdentBank>,
+}
+
+/// Per-channel "say the channel number" loop sources. Every channel's
+/// buffer is the same `period` length and starts its announcement at the
+/// top of the period, so all channels stay phase-aligned and a single
+/// running `pos` indexes them all.
+#[cfg(all(feature = "media-codecs", feature = "fdk-aac"))]
+struct IdentBank {
+    buffers: Vec<Vec<f32>>,
+    period: usize,
+    pos: usize,
 }
 
 #[cfg(all(feature = "media-codecs", feature = "fdk-aac"))]
@@ -672,14 +876,26 @@ impl AudioContext {
 }
 
 #[cfg(all(feature = "media-codecs", feature = "fdk-aac"))]
-fn build_audio_encoder(tone_hz: f32, tone_dbfs: f32) -> Result<AudioContext, String> {
+fn build_audio_encoder(
+    tone_hz: f32,
+    tone_dbfs: f32,
+    channels: usize,
+    channel_ident: bool,
+) -> Result<AudioContext, String> {
     let sample_rate = 48_000usize;
-    let channels = 2usize;
+    // Validation already constrains this to {1,2,6,8}; clamp defensively so
+    // a stray value can never reach the encoder's channel-mode mapping.
+    let channels = channels.clamp(1, 8);
+    // Scale bitrate with channel count (128 kbps for stereo line-up; more
+    // for 5.1 / 7.1 so each bed channel keeps a sane allocation).
+    let bitrate = 64_000u32
+        .saturating_mul(channels as u32)
+        .clamp(96_000, 512_000);
     let cfg = aac_codec::EncoderConfig {
         profile: aac_codec::AacProfile::AacLc,
         sample_rate: sample_rate as u32,
         channels: channels as u8,
-        bitrate: 128_000,
+        bitrate,
         afterburner: true,
         sbr_signaling: aac_codec::SbrSignaling::default(),
         transport: aac_codec::TransportType::Adts,
@@ -693,6 +909,12 @@ fn build_audio_encoder(tone_hz: f32, tone_dbfs: f32) -> Result<AudioContext, Str
     let amplitude = 10f32.powf(clamped_db / 20.0).min(0.95);
     let step = std::f64::consts::TAU * (tone_hz as f64) / sample_rate as f64;
 
+    let ident = if channel_ident {
+        Some(build_ident_bank(channels, sample_rate, amplitude))
+    } else {
+        None
+    };
+
     Ok(AudioContext {
         encoder,
         sample_rate,
@@ -704,5 +926,277 @@ fn build_audio_encoder(tone_hz: f32, tone_dbfs: f32) -> Result<AudioContext, Str
         accumulator: vec![Vec::with_capacity(frame_size); channels],
         accumulated: 0,
         pts_90k: 0,
+        ident,
     })
+}
+
+/// Resolve the directory operators drop per-digit voice clips into.
+/// `BILBYCAST_TESTGEN_VOICE_DIR` overrides; otherwise `<media_dir>/testgen_voice/`.
+/// Clips are named `1.wav` … `8.wav` (the channel number). Missing clips
+/// fall back to counted beeps, so the feature works before any are added.
+#[cfg(all(feature = "media-codecs", feature = "fdk-aac"))]
+fn testgen_voice_dir() -> std::path::PathBuf {
+    if let Ok(d) = std::env::var("BILBYCAST_TESTGEN_VOICE_DIR") {
+        if !d.trim().is_empty() {
+            return std::path::PathBuf::from(d);
+        }
+    }
+    crate::media::media_dir().join("testgen_voice")
+}
+
+/// Build the per-channel announcement loop. Channel `i` (0-based) announces
+/// the number `i + 1`: a spoken-digit voice clip if `<dir>/<n>.wav` exists,
+/// otherwise `n` counted beeps. All channels share one period (longest
+/// utterance + a gap, rounded to whole seconds, ≥ 2 s) so they loop in lock-step.
+#[cfg(all(feature = "media-codecs", feature = "fdk-aac"))]
+fn build_ident_bank(channels: usize, sample_rate: usize, amplitude: f32) -> IdentBank {
+    let dir = testgen_voice_dir();
+    let mut contents: Vec<Vec<f32>> = Vec::with_capacity(channels);
+    let mut voice_hits = 0usize;
+    let mut override_hits = 0usize;
+    for ch in 0..channels {
+        let digit = ch + 1;
+        // Resolution: runtime override dir → compiled-in default → beeps.
+        let clip = match load_voice_clip(&dir, digit, sample_rate, amplitude) {
+            Some(v) => {
+                override_hits += 1;
+                Some(v)
+            }
+            None => embedded_voice_clip(digit, sample_rate, amplitude),
+        };
+        match clip {
+            Some(v) => {
+                voice_hits += 1;
+                contents.push(v);
+            }
+            None => contents.push(render_counted_beeps(digit, sample_rate, amplitude)),
+        }
+    }
+    tracing::info!(
+        "Test-pattern channel-ident: {channels} channel(s); {voice_hits} voice clip(s) ({override_hits} from override dir {}, rest built-in), {} channel(s) on counted-beep fallback",
+        dir.display(),
+        channels - voice_hits
+    );
+
+    let gap = (sample_rate as f64 * 0.6) as usize;
+    let one_sec = sample_rate.max(1);
+    let max_len = contents.iter().map(|c| c.len()).max().unwrap_or(0) + gap;
+    let mut period = max_len.div_ceil(one_sec) * one_sec;
+    if period < 2 * one_sec {
+        period = 2 * one_sec;
+    }
+    let buffers: Vec<Vec<f32>> = contents
+        .into_iter()
+        .map(|mut c| {
+            c.resize(period, 0.0);
+            c
+        })
+        .collect();
+    IdentBank {
+        buffers,
+        period,
+        pos: 0,
+    }
+}
+
+/// `digit` short 1 kHz beeps (raised-cosine edges to avoid clicks),
+/// separated by short gaps — the counted-beep channel identifier.
+#[cfg(all(feature = "media-codecs", feature = "fdk-aac"))]
+fn render_counted_beeps(digit: usize, sample_rate: usize, amplitude: f32) -> Vec<f32> {
+    let beep_n = (sample_rate * 150 / 1000).max(1);
+    let gap_n = sample_rate * 120 / 1000;
+    let ramp = (sample_rate * 5 / 1000).max(1);
+    let freq = 1000.0f64;
+    let mut out: Vec<f32> = Vec::with_capacity(digit * (beep_n + gap_n));
+    for b in 0..digit {
+        for i in 0..beep_n {
+            let env = if i < ramp {
+                0.5 * (1.0 - (std::f64::consts::PI * i as f64 / ramp as f64).cos())
+            } else if i + ramp >= beep_n {
+                let tail = beep_n - i;
+                0.5 * (1.0 - (std::f64::consts::PI * tail as f64 / ramp as f64).cos())
+            } else {
+                1.0
+            };
+            let t = i as f64 / sample_rate as f64;
+            out.push(((2.0 * std::f64::consts::PI * freq * t).sin() * env) as f32 * amplitude);
+        }
+        if b + 1 < digit {
+            out.extend(std::iter::repeat(0.0f32).take(gap_n));
+        }
+    }
+    out
+}
+
+/// Peak-normalise a clip to the configured level so the voice sits at
+/// roughly the same loudness as the tone / beeps regardless of how it was
+/// recorded.
+#[cfg(all(feature = "media-codecs", feature = "fdk-aac"))]
+fn peak_normalize(pcm: &mut [f32], amplitude: f32) {
+    let peak = pcm.iter().fold(0.0f32, |m, &s| m.max(s.abs()));
+    if peak > 1e-6 {
+        let g = amplitude / peak;
+        for s in pcm.iter_mut() {
+            *s *= g;
+        }
+    }
+}
+
+/// Load a per-digit **override** clip from the runtime voice directory,
+/// decoded + resampled to 48 kHz mono and peak-normalised. Returns `None`
+/// (→ built-in voice, then beeps) when the file is absent or unreadable.
+#[cfg(all(feature = "media-codecs", feature = "fdk-aac"))]
+fn load_voice_clip(
+    dir: &std::path::Path,
+    digit: usize,
+    sample_rate: usize,
+    amplitude: f32,
+) -> Option<Vec<f32>> {
+    let path = dir.join(format!("{digit}.wav"));
+    let bytes = std::fs::read(&path).ok()?;
+    match decode_wav(&bytes, sample_rate) {
+        Ok(mut pcm) => {
+            peak_normalize(&mut pcm, amplitude);
+            Some(pcm)
+        }
+        Err(e) => {
+            tracing::warn!(
+                "Test-pattern: voice clip {} ignored ({e}); falling back to the built-in voice / beeps for that channel",
+                path.display()
+            );
+            None
+        }
+    }
+}
+
+/// Built-in spoken-digit voice prompts, compiled into the binary so
+/// channel-ident works with zero setup on a fresh install. Digits 1–8 (the
+/// max channel count); operators override any of them by dropping `<n>.wav`
+/// into the runtime voice directory.
+#[cfg(all(feature = "media-codecs", feature = "fdk-aac"))]
+fn embedded_voice_bytes(digit: usize) -> Option<&'static [u8]> {
+    let b: &'static [u8] = match digit {
+        1 => include_bytes!("../../assets/testgen_voice/1.wav"),
+        2 => include_bytes!("../../assets/testgen_voice/2.wav"),
+        3 => include_bytes!("../../assets/testgen_voice/3.wav"),
+        4 => include_bytes!("../../assets/testgen_voice/4.wav"),
+        5 => include_bytes!("../../assets/testgen_voice/5.wav"),
+        6 => include_bytes!("../../assets/testgen_voice/6.wav"),
+        7 => include_bytes!("../../assets/testgen_voice/7.wav"),
+        8 => include_bytes!("../../assets/testgen_voice/8.wav"),
+        _ => return None,
+    };
+    Some(b)
+}
+
+/// Decode + normalise the compiled-in voice prompt for `digit`.
+#[cfg(all(feature = "media-codecs", feature = "fdk-aac"))]
+fn embedded_voice_clip(digit: usize, sample_rate: usize, amplitude: f32) -> Option<Vec<f32>> {
+    let bytes = embedded_voice_bytes(digit)?;
+    match decode_wav(bytes, sample_rate) {
+        Ok(mut pcm) => {
+            peak_normalize(&mut pcm, amplitude);
+            Some(pcm)
+        }
+        Err(e) => {
+            // Our own asset — a decode failure here is a build/asset bug.
+            tracing::error!("Test-pattern: built-in voice clip {digit} failed to decode ({e})");
+            None
+        }
+    }
+}
+
+/// Minimal RIFF/WAVE decoder → 48 kHz mono f32. Handles 16/24-bit PCM and
+/// 32-bit float, mono or multi (downmixed by averaging), any sample rate
+/// (linear-resampled). Deliberately tiny — voice idents are tiny files.
+#[cfg(all(feature = "media-codecs", feature = "fdk-aac"))]
+fn decode_wav(bytes: &[u8], target_sr: usize) -> Result<Vec<f32>, String> {
+    if bytes.len() < 12 || &bytes[0..4] != b"RIFF" || &bytes[8..12] != b"WAVE" {
+        return Err("not a RIFF/WAVE file".into());
+    }
+    let mut pos = 12usize;
+    let mut fmt: Option<(u16, u16, u32, u16)> = None; // (format, channels, sr, bits)
+    let mut data: Option<&[u8]> = None;
+    while pos + 8 <= bytes.len() {
+        let id = &bytes[pos..pos + 4];
+        let sz = u32::from_le_bytes([bytes[pos + 4], bytes[pos + 5], bytes[pos + 6], bytes[pos + 7]])
+            as usize;
+        let body_start = pos + 8;
+        let body_end = body_start.saturating_add(sz).min(bytes.len());
+        if id == b"fmt " && body_end - body_start >= 16 {
+            let b = &bytes[body_start..body_end];
+            fmt = Some((
+                u16::from_le_bytes([b[0], b[1]]),
+                u16::from_le_bytes([b[2], b[3]]),
+                u32::from_le_bytes([b[4], b[5], b[6], b[7]]),
+                u16::from_le_bytes([b[14], b[15]]),
+            ));
+        } else if id == b"data" {
+            data = Some(&bytes[body_start..body_end]);
+        }
+        // Chunks are word-aligned (pad byte when size is odd).
+        pos = body_start + sz + (sz & 1);
+    }
+    let (af, channels, sr, bits) = fmt.ok_or("missing fmt chunk")?;
+    let data = data.ok_or("missing data chunk")?;
+    let channels = (channels.max(1)) as usize;
+    let mut mono: Vec<f32> = Vec::new();
+    match (af, bits) {
+        (1, 16) => {
+            for f in data.chunks_exact(2 * channels) {
+                let mut acc = 0.0f32;
+                for c in 0..channels {
+                    acc += i16::from_le_bytes([f[c * 2], f[c * 2 + 1]]) as f32 / 32768.0;
+                }
+                mono.push(acc / channels as f32);
+            }
+        }
+        (1, 24) => {
+            for f in data.chunks_exact(3 * channels) {
+                let mut acc = 0.0f32;
+                for c in 0..channels {
+                    let mut v = (f[c * 3] as i32) | ((f[c * 3 + 1] as i32) << 8) | ((f[c * 3 + 2] as i32) << 16);
+                    if v & 0x0080_0000 != 0 {
+                        v |= !0x00FF_FFFF;
+                    }
+                    acc += v as f32 / 8_388_608.0;
+                }
+                mono.push(acc / channels as f32);
+            }
+        }
+        (3, 32) => {
+            for f in data.chunks_exact(4 * channels) {
+                let mut acc = 0.0f32;
+                for c in 0..channels {
+                    acc += f32::from_le_bytes([f[c * 4], f[c * 4 + 1], f[c * 4 + 2], f[c * 4 + 3]]);
+                }
+                mono.push(acc / channels as f32);
+            }
+        }
+        _ => {
+            return Err(format!(
+                "unsupported WAV (format={af}, bits={bits}); use 16/24-bit PCM or 32-bit float"
+            ));
+        }
+    }
+    if mono.is_empty() {
+        return Err("empty audio data".into());
+    }
+    let src_sr = sr.max(1) as usize;
+    if src_sr == target_sr {
+        return Ok(mono);
+    }
+    // Linear resample to the target rate.
+    let out_len = mono.len() * target_sr / src_sr;
+    let mut out = Vec::with_capacity(out_len);
+    let last = mono.len() - 1;
+    for i in 0..out_len {
+        let p = i as f64 * src_sr as f64 / target_sr as f64;
+        let idx = p.floor() as usize;
+        let frac = (p - idx as f64) as f32;
+        let a = mono[idx.min(last)];
+        let b = mono[(idx + 1).min(last)];
+        out.push(a + (b - a) * frac);
+    }
+    Ok(out)
 }

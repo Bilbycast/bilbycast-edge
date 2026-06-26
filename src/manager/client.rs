@@ -2657,14 +2657,49 @@ async fn execute_command(
                 .ok_or_else(|| format!("Output '{output_id}' not found"))?;
             let old_output = cfg.outputs[idx].clone();
             cfg.outputs[idx] = output.clone();
-            // Hot-swap on running flow if the config actually changed
+            // Hot-swap on the running flow if the config actually changed.
+            // Surface a failed swap to the operator instead of swallowing it
+            // with `let _ =`: a silent failure leaves the runtime on the OLD
+            // definition (or with no output at all, if remove succeeded but
+            // add failed) while the manager believes the edit applied — the
+            // exact trap behind "I changed the display connector and nothing
+            // happened, had to restart the node".
+            let mut swap_error: Option<String> = None;
             if let Some(flow) = cfg.flow_using_output(output_id).cloned() {
                 if flow_manager.is_running(&flow.id) && old_output != output {
-                    let _ = flow_manager.remove_output(&flow.id, output_id).await;
-                    let _ = flow_manager.add_output(&flow.id, output).await;
+                    if let Err(e) = flow_manager.remove_output(&flow.id, output_id).await {
+                        tracing::warn!(
+                            "update_output '{output_id}': remove_output on flow '{}' failed: {e}",
+                            flow.id
+                        );
+                    }
+                    if let Err(e) = flow_manager.add_output(&flow.id, output.clone()).await {
+                        tracing::warn!(
+                            "update_output '{output_id}': add_output on flow '{}' failed: {e}",
+                            flow.id
+                        );
+                        swap_error = Some(e.to_string());
+                    }
                 }
             }
+            // Persist regardless: config.json is the operator's stated intent
+            // and the change still takes effect at the next (re)start even if
+            // the live hot-swap failed.
             persist_config(&cfg, config_path, secrets_path).await?;
+            if let Some(e) = &swap_error {
+                flow_manager.event_sender().emit_output(
+                    EventSeverity::Warning, category::FLOW,
+                    format!("Output '{output_id}' saved but live hot-swap failed: {e}"),
+                    output_id,
+                );
+                return Err(CommandError::with_code(
+                    format!(
+                        "output '{output_id}' configuration saved but the running output could \
+                         not be restarted with the new settings: {e}"
+                    ),
+                    "output_hotswap_failed",
+                ));
+            }
             flow_manager.event_sender().emit_output(
                 EventSeverity::Info, category::FLOW,
                 format!("Output '{}' updated", output_id), output_id,
@@ -5044,6 +5079,10 @@ async fn diff_outputs_inner(
             tracing::info!("Config diff: adding output '{id}' to flow '{flow_id}'");
             if let Err(e) = flow_manager.add_output(flow_id, new_output.clone()).await {
                 tracing::warn!("Failed to add output '{id}' to flow '{flow_id}': {e}");
+                flow_manager.event_sender().emit_output(
+                    EventSeverity::Warning, category::FLOW,
+                    format!("Output '{id}' could not start during config sync: {e}"), id,
+                );
             }
         } else {
             // Running — check whether the config actually changed and replace if so
@@ -5059,6 +5098,10 @@ async fn diff_outputs_inner(
                     }
                     if let Err(e) = flow_manager.add_output(flow_id, new_output.clone()).await {
                         tracing::warn!("Failed to re-add output '{id}' after replacement: {e}");
+                        flow_manager.event_sender().emit_output(
+                            EventSeverity::Warning, category::FLOW,
+                            format!("Output '{id}' could not restart with new settings during config sync: {e}"), id,
+                        );
                     }
                 }
                 Some(_) => {
@@ -5073,6 +5116,10 @@ async fn diff_outputs_inner(
                     }
                     if let Err(e) = flow_manager.add_output(flow_id, new_output.clone()).await {
                         tracing::warn!("Failed to add output '{id}' to flow '{flow_id}': {e}");
+                        flow_manager.event_sender().emit_output(
+                            EventSeverity::Warning, category::FLOW,
+                            format!("Output '{id}' could not restart during config sync: {e}"), id,
+                        );
                     }
                 }
             }

@@ -1662,6 +1662,33 @@ pub struct ReplayInputConfig {
     pub passthrough_clock: Option<bool>,
 }
 
+/// What each synthetic audio channel carries in a test-pattern input.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum TestPatternAudioContent {
+    /// Classic line-up: the same sine tone on every channel.
+    #[default]
+    Tone,
+    /// Each channel announces its own 1-based number so an operator can
+    /// tell channels apart by ear — a looped spoken digit when a voice
+    /// clip is available in the testgen-voice directory, otherwise N
+    /// counted beeps per cycle as a built-in fallback.
+    ChannelIdent,
+}
+
+/// Visual style of the A/V-sync marker when `av_sync_marker` is on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum TestPatternAvSyncStyle {
+    /// Corner luma patch that flashes on the beep (EBU R 49 / 2-pop).
+    #[default]
+    Flash,
+    /// A dot orbits a ring once per second; the beep fires as it crosses
+    /// 12 o'clock. Read A/V skew from the dot's position when you hear the
+    /// pip — more intuitive than a flash for eyeballing offset.
+    Sweep,
+}
+
 /// Configuration for an in-process synthetic test-pattern input.
 ///
 /// Requires the edge binary to be built with `video-encoder-x264` (H.264
@@ -1751,9 +1778,31 @@ pub struct TestPatternInputConfig {
         with = "crate::config::pid_overrides_serde"
     )]
     pub pid_overrides: Option<TsPidOverridesMap>,
+    /// Optional burned-in identifier drawn large near the top of the frame
+    /// so multiple generators are distinguishable on a multiviewer.
+    /// Rendered uppercase; characters outside A–Z / 0–9 / space / `-` /
+    /// `.` / `:` are dropped. Capped at 32 chars. Empty / unset → no label
+    /// (the timecode + bouncing box still prove liveness).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub screen_id: Option<String>,
+    /// Number of audio channels to synthesise. AAC-native configs only:
+    /// 1 (mono), 2 (stereo), 6 (5.1), 8 (7.1). Default 2. Ignored when
+    /// `audio_enabled = false`.
+    #[serde(default = "default_tp_audio_channels")]
+    pub audio_channels: u8,
+    /// What each audio channel carries — a shared tone (default) or a
+    /// per-channel number announcement. See [`TestPatternAudioContent`].
+    /// Overridden by the A/V-sync beep when `av_sync_marker = true`.
+    #[serde(default)]
+    pub audio_content: TestPatternAudioContent,
+    /// A/V-sync marker style when `av_sync_marker = true`. See
+    /// [`TestPatternAvSyncStyle`].
+    #[serde(default)]
+    pub av_sync_style: TestPatternAvSyncStyle,
 }
 
 fn default_tp_width() -> u16 { 1280 }
+fn default_tp_audio_channels() -> u8 { 2 }
 fn default_tp_height() -> u16 { 720 }
 fn default_tp_fps() -> u16 { 25 }
 fn default_tp_video_bitrate() -> u32 { 2000 }

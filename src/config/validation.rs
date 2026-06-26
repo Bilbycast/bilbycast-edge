@@ -1545,6 +1545,23 @@ fn validate_test_pattern_input(c: &crate::config::models::TestPatternInputConfig
             "test-pattern: av_sync_marker requires audio_enabled = true (a silent flash has no audio reference to align against)"
         ));
     }
+    if let Some(id) = c.screen_id.as_ref() {
+        let n = id.chars().count();
+        if n > 32 {
+            return Err(anyhow::anyhow!(
+                "test-pattern: screen_id must be at most 32 characters (got {n})"
+            ));
+        }
+    }
+    // AAC-native channel configs only — the fdk-aac encoder maps these to
+    // MODE_1 / MODE_2 / MODE_1_2_2_1 (5.1) / MODE_7_1_BACK (7.1). 7 has no
+    // AAC channel mode, so it's rejected here rather than failing at open.
+    if !matches!(c.audio_channels, 1 | 2 | 6 | 8) {
+        return Err(anyhow::anyhow!(
+            "test-pattern: audio_channels must be one of 1, 2, 6, 8 (got {})",
+            c.audio_channels
+        ));
+    }
     validate_input_transcode_group_a(
         c.audio_encode.as_ref(),
         c.transcode.as_ref(),

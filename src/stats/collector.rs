@@ -3305,12 +3305,13 @@ impl FlowStatsAccumulator {
         let bw_exceeded = self.bandwidth_exceeded.load(Ordering::Relaxed);
         let bw_blocked = self.bandwidth_blocked.load(Ordering::Relaxed);
         let assembly_health_snap = self.assembly_health.read().ok().and_then(|g| g.clone());
-        let health = derive_flow_health(
+        let (health, health_reasons) = derive_flow_health(
             input_bitrate,
             packets_lost,
             &tr101290_snap,
             bw_exceeded,
             bw_blocked,
+            self.bandwidth_limit_mbps.get().copied(),
             assembly_health_snap.as_ref(),
         );
 
@@ -3624,6 +3625,7 @@ impl FlowStatsAccumulator {
             uptime_secs: self.started_at.elapsed().as_secs(),
             tr101290: tr101290_snap,
             health,
+            health_reasons,
             iat,
             pdv_jitter_us,
             media_analysis,
@@ -4278,77 +4280,211 @@ fn derive_output_state(
 
 /// Derive flow health from available metrics (RP 2129 M6).
 /// Called during the 1/sec snapshot — zero hot-path impact.
+/// Derive a flow's overall [`FlowHealth`] **and** the structured list of
+/// reasons that explain it. Each triggered condition becomes one
+/// [`HealthReason`] carrying its own severity; the returned badge is the
+/// maximum severity across them (`Healthy` when none fire), so the badge and
+/// its explanation can never disagree.
+///
+/// This is a behaviour-preserving rework of the previous priority-ordered
+/// early-return chain: every condition the old code checked still maps to a
+/// reason of the same severity, and because the badge is the max, the result
+/// is identical in every realistic case. The only divergence is two
+/// physically-contradictory "no data flowing" combinations (zero bitrate
+/// *and* a Priority-1 or all-slots-stalled fault, which can't co-occur — a
+/// dead feed has no packets to throw CC/PMT errors): there the badge now
+/// resolves to `Critical` instead of `Error`, i.e. strictly more severe and
+/// fail-safe, never masking.
 fn derive_flow_health(
     bitrate_bps: u64,
     packets_lost: u64,
     tr101290: &Option<Tr101290Stats>,
     bandwidth_exceeded: bool,
     bandwidth_blocked: bool,
+    bandwidth_limit_mbps: Option<f64>,
     assembly_health: Option<&crate::stats::models::AssemblyHealth>,
-) -> FlowHealth {
+) -> (FlowHealth, Vec<crate::stats::models::HealthReason>) {
+    use crate::stats::models::HealthReason;
+    let mut reasons: Vec<HealthReason> = Vec::new();
+
+    // ── TR-101290 Priority 1 — the most severe transport faults ──
     if let Some(tr) = tr101290 {
-        // Critical: sync loss or sustained errors
         if tr.sync_loss_count > 0 {
-            return FlowHealth::Critical;
-        }
-        // Error: P1 errors (CC, PAT, PMT)
-        if !tr.priority1_ok {
-            return FlowHealth::Error;
+            reasons.push(HealthReason {
+                code: "tr101290_sync_loss".to_string(),
+                severity: FlowHealth::Critical,
+                detail: "TS sync loss — input signal lost or unparseable (TR-101290 Priority 1)"
+                    .to_string(),
+            });
+        } else if !tr.priority1_ok {
+            // Name the implicated P1 category from the WINDOWED counters
+            // (plus the missing-PID gauge) — these are exactly the terms
+            // `priority1_ok` gates on, so the detail describes what is
+            // failing *now*. The cumulative lifetime totals would instead
+            // list every category that ever fired (e.g. a long-resolved
+            // start-up CC glitch surfacing during an unrelated PID outage).
+            let mut parts: Vec<&str> = Vec::new();
+            if tr.window_pat_errors > 0 {
+                parts.push("PAT timeout");
+            }
+            if tr.window_pmt_errors > 0 {
+                parts.push("PMT timeout");
+            }
+            if tr.window_pid_errors > 0 || tr.missing_continuous_pids > 0 {
+                parts.push("missing ES PID");
+            }
+            if tr.window_cc_errors > 0 {
+                parts.push("continuity-counter errors");
+            }
+            let detail = if parts.is_empty() {
+                "Transport errors (TR-101290 Priority 1)".to_string()
+            } else {
+                format!("{} (TR-101290 Priority 1)", parts.join(", "))
+            };
+            reasons.push(HealthReason {
+                code: "tr101290_p1".to_string(),
+                severity: FlowHealth::Error,
+                detail,
+            });
         }
     }
 
-    // Assembled flows: the flow-level input bitrate is the SUM over every
-    // referenced input, so live-but-unwired inputs keep it > 0 while the
-    // assembly's actual sources are dead — the bitrate term below can't
-    // see that. Judge the plan's own slot liveness instead: every slot
-    // stalled = no media leaving the assembler (Error); a partial stall
-    // degrades (Warning). Stall detection is already stream-type-aware,
-    // so sparse essences never trip this.
+    // ── No data flowing — distinct from a bandwidth block (handled below) ──
+    if bitrate_bps == 0 && !bandwidth_blocked {
+        reasons.push(HealthReason {
+            code: "no_data".to_string(),
+            severity: FlowHealth::Critical,
+            detail: "No data flowing — input bitrate is zero".to_string(),
+        });
+    }
+
+    // ── Bandwidth-limit enforcement: a hard block dominates a soft exceed ──
+    if bandwidth_blocked {
+        reasons.push(HealthReason {
+            code: "bandwidth_blocked".to_string(),
+            severity: FlowHealth::Error,
+            detail: "Flow blocked — packets dropped by bandwidth-limit enforcement".to_string(),
+        });
+    } else if bandwidth_exceeded {
+        let detail = match bandwidth_limit_mbps {
+            Some(limit) => format!(
+                "Ingest {:.1} Mbps exceeds the {:.0} Mbps limit",
+                bitrate_bps as f64 / 1_000_000.0,
+                limit
+            ),
+            None => "Ingest bitrate exceeds the configured bandwidth limit".to_string(),
+        };
+        reasons.push(HealthReason {
+            code: "bandwidth_exceeded".to_string(),
+            severity: FlowHealth::Warning,
+            detail,
+        });
+    }
+
+    // ── Packet loss: high loss is significant, any loss is a warning ──
+    if packets_lost > 100 {
+        reasons.push(HealthReason {
+            code: "packet_loss_high".to_string(),
+            severity: FlowHealth::Error,
+            detail: format!("High packet loss — {} packets lost", packets_lost),
+        });
+    } else if packets_lost > 0 {
+        reasons.push(HealthReason {
+            code: "packet_loss".to_string(),
+            severity: FlowHealth::Warning,
+            detail: format!("Packet loss — {} packets lost", packets_lost),
+        });
+    }
+
+    // ── Assembly slot liveness (assembled / PID-bus flows only) ──
+    //
+    // The flow-level input bitrate is the SUM over every referenced input,
+    // so live-but-unwired inputs keep it > 0 while the assembly's actual
+    // sources are dead — the bitrate term can't see that. Judge the plan's
+    // own slot liveness instead: every slot stalled = no media leaving the
+    // assembler (Error); a partial stall degrades (Warning). Stall
+    // detection is stream-type-aware, so sparse essences never trip this.
     if let Some(ah) = assembly_health {
         if ah.total_slots > 0 && ah.stalled_slot_count >= ah.total_slots {
-            return FlowHealth::Error;
+            reasons.push(HealthReason {
+                code: "assembly_all_stalled".to_string(),
+                severity: FlowHealth::Error,
+                detail: format!(
+                    "All {} assembly slot(s) stalled — no media leaving the assembler",
+                    ah.total_slots
+                ),
+            });
+        } else if ah.stalled_slot_count > 0 {
+            let slots: Vec<String> = ah
+                .stalled_slots
+                .iter()
+                .take(4)
+                .map(|s| format!("program {} (PID 0x{:04X})", s.program_number, s.out_pid))
+                .collect();
+            let detail = if slots.is_empty() {
+                format!(
+                    "{} of {} assembly slot(s) stalled",
+                    ah.stalled_slot_count, ah.total_slots
+                )
+            } else {
+                format!(
+                    "{} of {} assembly slot(s) stalled: {}",
+                    ah.stalled_slot_count,
+                    ah.total_slots,
+                    slots.join(", ")
+                )
+            };
+            reasons.push(HealthReason {
+                code: "assembly_slot_stalled".to_string(),
+                severity: FlowHealth::Warning,
+                detail,
+            });
         }
     }
 
-    // Critical: no data flowing
-    if bitrate_bps == 0 && !bandwidth_blocked {
-        return FlowHealth::Critical;
-    }
-
-    // Error: flow is actively blocked by bandwidth enforcement
-    if bandwidth_blocked {
-        return FlowHealth::Error;
-    }
-
-    // Error: significant packet loss
-    if packets_lost > 100 {
-        return FlowHealth::Error;
-    }
-
-    // Warning: bandwidth exceeded (alarm mode)
-    if bandwidth_exceeded {
-        return FlowHealth::Warning;
-    }
-
-    // Warning: some (not all) assembly slots stalled — output is running
-    // but a wired source is dead.
-    if let Some(ah) = assembly_health {
-        if ah.stalled_slot_count > 0 {
-            return FlowHealth::Warning;
-        }
-    }
-
-    // Warning: P2 errors or minor loss
+    // ── TR-101290 Priority 2 — PCR/PTS accuracy, CRC, TEI ──
     if let Some(tr) = tr101290 {
         if !tr.priority2_ok {
-            return FlowHealth::Warning;
+            // Windowed counters again — match the `priority2_ok` gate so the
+            // named categories reflect the current window, not lifetime totals.
+            let mut parts: Vec<&str> = Vec::new();
+            if tr.window_pcr_accuracy_errors > 0 {
+                parts.push("PCR accuracy");
+            }
+            if tr.window_pcr_discontinuity_errors > 0 {
+                parts.push("PCR discontinuity");
+            }
+            if tr.window_pts_errors > 0 {
+                parts.push("PTS accuracy");
+            }
+            if tr.window_crc_errors > 0 {
+                parts.push("CRC");
+            }
+            if tr.window_tei_errors > 0 {
+                parts.push("transport-error-indicator");
+            }
+            let detail = if parts.is_empty() {
+                "PCR / PTS accuracy errors (TR-101290 Priority 2)".to_string()
+            } else {
+                format!("{} errors (TR-101290 Priority 2)", parts.join(", "))
+            };
+            reasons.push(HealthReason {
+                code: "tr101290_p2".to_string(),
+                severity: FlowHealth::Warning,
+                detail,
+            });
         }
     }
-    if packets_lost > 0 {
-        return FlowHealth::Warning;
-    }
 
-    FlowHealth::Healthy
+    // Most-severe-first so the UI leads with the dominant cause; the badge
+    // is the worst contributing severity (Healthy when there are none).
+    reasons.sort_by(|a, b| b.severity.cmp(&a.severity));
+    let health = reasons
+        .iter()
+        .map(|r| r.severity.clone())
+        .max()
+        .unwrap_or(FlowHealth::Healthy);
+    (health, reasons)
 }
 
 /// Global statistics registry that holds all flow stats accumulators.
@@ -4420,39 +4556,101 @@ mod input_state_tests {
     fn flow_health_all_slots_stalled_is_error_despite_live_input_bytes() {
         // The incident shape: 5 live-but-unwired inputs keep flow input
         // bitrate > 0 while the assembly's only sources are dead.
-        let h = derive_flow_health(10_000_000, 0, &None, false, false, Some(&ah(2, 2)));
+        let (h, reasons) = derive_flow_health(10_000_000, 0, &None, false, false, None, Some(&ah(2, 2)));
         assert_eq!(h, FlowHealth::Error);
+        assert_eq!(reasons.len(), 1);
+        assert_eq!(reasons[0].code, "assembly_all_stalled");
+        assert_eq!(reasons[0].severity, FlowHealth::Error);
     }
 
     #[test]
     fn flow_health_partial_stall_is_warning() {
-        let h = derive_flow_health(10_000_000, 0, &None, false, false, Some(&ah(3, 1)));
+        let (h, reasons) = derive_flow_health(10_000_000, 0, &None, false, false, None, Some(&ah(3, 1)));
         assert_eq!(h, FlowHealth::Warning);
+        assert_eq!(reasons[0].code, "assembly_slot_stalled");
     }
 
     #[test]
     fn flow_health_assembly_clean_is_healthy() {
-        let h = derive_flow_health(10_000_000, 0, &None, false, false, Some(&ah(2, 0)));
+        let (h, reasons) = derive_flow_health(10_000_000, 0, &None, false, false, None, Some(&ah(2, 0)));
         assert_eq!(h, FlowHealth::Healthy);
+        assert!(reasons.is_empty());
     }
 
     #[test]
     fn flow_health_partial_stall_does_not_mask_no_data_critical() {
         // bitrate 0 must stay Critical even with a partial assembly stall.
-        let h = derive_flow_health(0, 0, &None, false, false, Some(&ah(3, 1)));
+        let (h, _) = derive_flow_health(0, 0, &None, false, false, None, Some(&ah(3, 1)));
         assert_eq!(h, FlowHealth::Critical);
     }
 
     #[test]
     fn flow_health_passthrough_unchanged_without_assembly() {
         assert_eq!(
-            derive_flow_health(10_000_000, 0, &None, false, false, None),
+            derive_flow_health(10_000_000, 0, &None, false, false, None, None).0,
             FlowHealth::Healthy
         );
         assert_eq!(
-            derive_flow_health(0, 0, &None, false, false, None),
+            derive_flow_health(0, 0, &None, false, false, None, None).0,
             FlowHealth::Critical
         );
+    }
+
+    #[test]
+    fn flow_health_badge_is_max_severity_with_concurrent_reasons() {
+        // Bandwidth exceeded (Warning) + high packet loss (Error) ride
+        // together: the badge is the worst, but both reasons are surfaced,
+        // most-severe first.
+        let (h, reasons) =
+            derive_flow_health(24_100_000, 250, &None, true, false, Some(20.0), None);
+        assert_eq!(h, FlowHealth::Error);
+        assert_eq!(reasons.len(), 2);
+        assert_eq!(reasons[0].severity, FlowHealth::Error);
+        assert_eq!(reasons[0].code, "packet_loss_high");
+        assert_eq!(reasons[1].code, "bandwidth_exceeded");
+        // The live numbers ride along in the detail string.
+        assert!(reasons[1].detail.contains("24.1 Mbps"));
+        assert!(reasons[1].detail.contains("20 Mbps"));
+    }
+
+    #[test]
+    fn flow_health_p1_reason_names_live_cause_not_lifetime_totals() {
+        use crate::stats::models::Tr101290Stats;
+        // Start-up CC glitch left cc_errors = 5 forever, but this window is
+        // clean; the flow is P1-red solely because an advertised PID is
+        // currently missing (a sustained gauge). The reason must name the
+        // live cause, not the long-resolved CC errors — the windowed
+        // counters are exactly what priority1_ok gates on.
+        let tr = Some(Tr101290Stats {
+            priority1_ok: false,
+            priority2_ok: true,
+            cc_errors: 5,        // cumulative lifetime — must NOT be named
+            window_cc_errors: 0, // clean this window
+            missing_continuous_pids: 1,
+            ..Default::default()
+        });
+        let (h, reasons) = derive_flow_health(10_000_000, 0, &tr, false, false, None, None);
+        assert_eq!(h, FlowHealth::Error);
+        let p1 = reasons
+            .iter()
+            .find(|r| r.code == "tr101290_p1")
+            .expect("a P1 reason");
+        assert!(p1.detail.contains("missing ES PID"), "got: {}", p1.detail);
+        assert!(
+            !p1.detail.contains("continuity"),
+            "named a long-resolved lifetime CC error: {}",
+            p1.detail
+        );
+    }
+
+    #[test]
+    fn flow_health_blocked_suppresses_no_data_and_exceeded() {
+        // A hard bandwidth block is the single dominant reason even when
+        // bitrate has been throttled to zero and the exceed flag is set.
+        let (h, reasons) = derive_flow_health(0, 0, &None, true, true, Some(20.0), None);
+        assert_eq!(h, FlowHealth::Error);
+        assert_eq!(reasons.len(), 1);
+        assert_eq!(reasons[0].code, "bandwidth_blocked");
     }
 
     #[test]

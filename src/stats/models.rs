@@ -128,6 +128,16 @@ pub struct FlowStats {
     /// old manager builds ignore unknown fields.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub assembly_health: Option<AssemblyHealth>,
+    /// Structured explanation of the current `health` value: one entry per
+    /// triggered condition, most-severe first, each carrying a stable
+    /// `code`, its own `severity`, and an operator-facing `detail` string.
+    /// Empty when the flow is `Healthy`. `health` equals the maximum
+    /// `severity` across these reasons, so the badge and its explanation
+    /// stay consistent. Lets the manager surface *why* a flow is degraded
+    /// without a second round-trip to the event log. Backward-compatible
+    /// addition; old manager builds ignore unknown fields.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub health_reasons: Vec<HealthReason>,
 }
 
 /// Assembly-slot liveness rollup surfaced on [`FlowStats`] for assembled
@@ -636,7 +646,11 @@ pub struct IatStats {
 }
 
 /// Flow health/alarm state derived from monitoring metrics (RP 2129 M6).
-#[derive(Debug, Clone, Serialize, Default, PartialEq)]
+///
+/// Variant order is severity order — `derive_flow_health` relies on the
+/// derived `Ord` (`Healthy < Warning < Error < Critical`) to roll the
+/// per-reason severities up into the overall badge via `Iterator::max`.
+#[derive(Debug, Clone, Serialize, Default, PartialEq, Eq, PartialOrd, Ord)]
 pub enum FlowHealth {
     /// No errors, bitrate > 0, stream healthy.
     #[default]
@@ -647,6 +661,28 @@ pub enum FlowHealth {
     Error,
     /// Sustained failures: input disconnected or zero bitrate for extended period.
     Critical,
+}
+
+/// One structured explanation of *why* a flow is at its current
+/// [`FlowHealth`]. Surfaced as `FlowStats.health_reasons` so the manager UI
+/// can let an operator click the health badge and see the specific
+/// condition(s) driving it instead of just the coarse colour. The overall
+/// `FlowStats.health` equals the maximum `severity` across these reasons
+/// (or `Healthy` when the list is empty), so the badge and its explanation
+/// can never disagree.
+#[derive(Debug, Clone, Serialize)]
+pub struct HealthReason {
+    /// Stable machine-readable identifier for the condition, suitable for
+    /// keying UI tooltips and for correlating with the matching `error_code`
+    /// on the event stream (e.g. `"bandwidth_exceeded"`,
+    /// `"tr101290_p1"`, `"assembly_slot_stalled"`, `"packet_loss"`).
+    pub code: String,
+    /// Severity this single condition contributes to the overall badge —
+    /// one of `Warning` / `Error` / `Critical` (never `Healthy`).
+    pub severity: FlowHealth,
+    /// Human-readable, operator-facing description, carrying live numbers
+    /// where available (e.g. "Ingest 24.1 Mbps exceeds the 20 Mbps limit").
+    pub detail: String,
 }
 
 /// Lifecycle state of a media flow.
