@@ -703,16 +703,39 @@ function renderEgressSummary(s, label) {
   if (s.audio_codec) v.push(`<b>${escapeHtml(s.audio_codec)}</b> ${s.audio_sample_rate_hz?`${s.audio_sample_rate_hz}Hz`:''} ${s.audio_channels?`${s.audio_channels}ch`:''}${s.audio_bitrate_kbps?` ${s.audio_bitrate_kbps}kbps`:''}`);
   if (s.transport_mode) v.push(`<span class="muted">${escapeHtml(s.transport_mode)}</span>`);
   if (s.program_number != null) v.push(`<span class="muted">prog ${s.program_number}</span>`);
-  const pipe = (s.pipeline||[]).length
-    ? `<div class="pipeline" style="margin-top:4px">${s.pipeline.map(p=>{
+  // Collapse a (decode + encode) pair on the same media into the synthetic
+  // `*_transcode` tag — the same fold the manager UI applies — so a bare
+  // `video_encode` (e.g. an ST 2110 first-encode from uncompressed essence)
+  // reads "Video Encode" and only a real decode+encode pair reads "Video
+  // Transcode". Previously every `*_encode` was hard-labelled "Transcode",
+  // which over-claimed for pure encodes and disagreed with the manager.
+  // Labels + colours kept aligned with the manager's canonical maps
+  // (detail/flows.js `pipelineBadgeStyles` + config/live.js `_PIPELINE_BADGES`).
+  const _foldPipeline = (arr) => {
+    const t = (arr || []).slice();
+    const fold = (d, e, x) => {
+      const di = t.indexOf(d), ei = t.indexOf(e);
+      if (di === -1 || ei === -1) return;
+      t.splice(Math.max(di, ei), 1);
+      t.splice(Math.min(di, ei), 1, x);
+    };
+    fold('audio_decode', 'audio_encode', 'audio_transcode');
+    fold('video_decode', 'video_encode', 'video_transcode');
+    return t;
+  };
+  const _tags = _foldPipeline(s.pipeline);
+  const pipe = _tags.length
+    ? `<div class="pipeline" style="margin-top:4px">${_tags.map(p=>{
         const styles={
           passthrough:        {label:'Passthrough',           color:'#8b949e'},
           program_filter:     {label:'Program Filter',         color:'#60a5fa'},
           audio_decode:       {label:'Audio Decode',           color:'#a78bfa'},
-          audio_encode:       {label:'Audio Transcode',        color:'#34d399'},
+          audio_encode:       {label:'Audio Encode',           color:'#34d399'},
+          audio_transcode:    {label:'Audio Transcode',        color:'#34d399'},
           audio_transcode_pcm:{label:'Channels & Sample Rate', color:'#60a5fa'},
           audio_302m:         {label:'SMPTE 302M',             color:'#60a5fa'},
-          video_encode:       {label:'Video Transcode',        color:'#f59e0b'},
+          video_encode:       {label:'Video Encode',           color:'#e879f9'},
+          video_transcode:    {label:'Video Transcode',        color:'#e879f9'},
           video_decode:       {label:'Video Decode',           color:'#a78bfa'},
           ts_audio_replace:   {label:'TS Audio Mux',           color:'#60a5fa'},
           ts_video_replace:   {label:'TS Video Mux',           color:'#60a5fa'}

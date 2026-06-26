@@ -5564,73 +5564,109 @@ fn build_output_config_meta(config: &OutputConfig) -> OutputConfigMeta {
     }
 }
 
-/// Bump the matching decoder family on a `FlowCostPlan` for an encoder
-/// family — every transcoder decodes the source before re-encoding, so
-/// every HW-encoded video session also charges one HW-decoded session
-/// against the co-located decoder family. NVENC ↔ NVDEC, QSV-encode ↔
-/// QSV-decode, VAAPI-encode ↔ VAAPI-decode. AMF and VideoToolbox have
-/// no separate decoder counter today, so they no-op. Mixed-vendor hosts
-/// (e.g. NVIDIA encode + Intel decode) will mis-attribute under this
-/// pairing — out of scope until transcoding configs grow an explicit
-/// `hw_decode` field.
-fn pair_decoder_sessions_for_encoder(
+/// Resolve the decoder backend a video transcode will actually use at
+/// runtime — the same [`hardware_probe::resolve_transcode_decoder`] call
+/// the `TsVideoReplacer` / input transcoder make at first frame — so the
+/// cost plan and live usage book the source-decode session against the
+/// *real* backend instead of blindly mirroring the encoder family.
+///
+/// Returns the resolved decoder family, or `None` when the decode lands
+/// on CPU (no HW decoder compiled, driver missing, or an explicit
+/// `hw_decode` that can't be honoured). Two consequences this fixes:
+/// (1) a QSV encode under `hw_decode: auto` may decode on VAAPI on an
+/// Intel host, so the decode session is now attributed to VAAPI rather
+/// than QSV; (2) a default (non-`full`) build compiles no HW decoder, so
+/// the source decode runs on CPU and **no** HW decode session is charged
+/// — `qsv_decode_in_use` no longer reports a fictional hardware session
+/// for a CPU-decoded transcode. (Mixed-vendor encode/decode hosts are
+/// now attributed correctly too.)
+fn resolved_transcode_decoder_family(
+    ve: Option<&crate::config::models::VideoEncodeConfig>,
+) -> Option<crate::engine::hardware_probe::HwDecoderFamily> {
+    let pref = ve.map(|v| v.hw_decode.unwrap_or_default()).unwrap_or_default();
+    let caps = crate::engine::hardware_probe::static_capabilities();
+    crate::engine::hardware_probe::resolve_transcode_decoder(&pref, caps.as_deref())
+        .unwrap_or(crate::engine::hardware_probe::ResolvedDisplayDecoder::Cpu)
+        .family()
+}
+
+/// Charge a video transcode's source-decode session onto a `FlowCostPlan`,
+/// keyed to the runtime-resolved decoder backend
+/// ([`resolved_transcode_decoder_family`]). CPU decode → no session.
+fn pair_resolved_decoder_sessions(
     plan: &mut crate::engine::hardware_probe::FlowCostPlan,
-    family: crate::engine::hardware_probe::HwEncoderFamily,
+    ve: Option<&crate::config::models::VideoEncodeConfig>,
     is_4k: bool,
 ) {
-    use crate::engine::hardware_probe::HwEncoderFamily;
-    match family {
-        HwEncoderFamily::Nvenc => {
+    use crate::engine::hardware_probe::HwDecoderFamily;
+    match resolved_transcode_decoder_family(ve) {
+        Some(HwDecoderFamily::Nvdec) => {
             plan.nvdec_sessions = plan.nvdec_sessions.saturating_add(1);
             if is_4k {
                 plan.nvdec_sessions_4k = plan.nvdec_sessions_4k.saturating_add(1);
             }
         }
-        HwEncoderFamily::Qsv => {
+        Some(HwDecoderFamily::Qsv) => {
             plan.qsv_decode_sessions = plan.qsv_decode_sessions.saturating_add(1);
             if is_4k {
                 plan.qsv_decode_sessions_4k = plan.qsv_decode_sessions_4k.saturating_add(1);
             }
         }
-        HwEncoderFamily::Vaapi => {
+        Some(HwDecoderFamily::Vaapi) => {
             plan.vaapi_decode_sessions = plan.vaapi_decode_sessions.saturating_add(1);
             if is_4k {
                 plan.vaapi_decode_sessions_4k = plan.vaapi_decode_sessions_4k.saturating_add(1);
             }
         }
-        HwEncoderFamily::Amf | HwEncoderFamily::VideoToolbox => {}
+        None => {}
     }
 }
 
-/// Sibling of `pair_decoder_sessions_for_encoder` that operates on the
-/// runtime `HwSessionUsage` (`*_in_use` fields) used by hot-add /
-/// hot-remove of outputs. Same family co-location rule.
-fn pair_decoder_usage_for_encoder(
+/// Sibling of [`pair_resolved_decoder_sessions`] over the runtime
+/// `HwSessionUsage` (`*_in_use`), used by hot-add / hot-remove of
+/// outputs. Same resolved-backend rule so live usage and the cost plan
+/// stay in agreement.
+fn pair_resolved_decoder_usage(
     usage: &mut crate::engine::hardware_probe::HwSessionUsage,
-    family: crate::engine::hardware_probe::HwEncoderFamily,
+    ve: Option<&crate::config::models::VideoEncodeConfig>,
     is_4k: bool,
 ) {
-    use crate::engine::hardware_probe::HwEncoderFamily;
-    match family {
-        HwEncoderFamily::Nvenc => {
+    use crate::engine::hardware_probe::HwDecoderFamily;
+    match resolved_transcode_decoder_family(ve) {
+        Some(HwDecoderFamily::Nvdec) => {
             usage.nvdec_in_use = usage.nvdec_in_use.saturating_add(1);
             if is_4k {
                 usage.nvdec_in_use_4k = usage.nvdec_in_use_4k.saturating_add(1);
             }
         }
-        HwEncoderFamily::Qsv => {
+        Some(HwDecoderFamily::Qsv) => {
             usage.qsv_decode_in_use = usage.qsv_decode_in_use.saturating_add(1);
             if is_4k {
                 usage.qsv_decode_in_use_4k = usage.qsv_decode_in_use_4k.saturating_add(1);
             }
         }
-        HwEncoderFamily::Vaapi => {
+        Some(HwDecoderFamily::Vaapi) => {
             usage.vaapi_decode_in_use = usage.vaapi_decode_in_use.saturating_add(1);
             if is_4k {
                 usage.vaapi_decode_in_use_4k = usage.vaapi_decode_in_use_4k.saturating_add(1);
             }
         }
-        HwEncoderFamily::Amf | HwEncoderFamily::VideoToolbox => {}
+        None => {}
+    }
+}
+
+/// `true` when an input's `video_encode` is a *transcode* (decodes a
+/// compressed source before re-encoding) rather than a first-encode of
+/// uncompressed essence. ST 2110-20/-23 and MXL video carry raw
+/// RFC 4175 / MXL frames — their mandatory `video_encode` never decodes,
+/// so it charges no source-decode session.
+fn input_video_encode_is_transcode(inp: &crate::config::models::InputDefinition) -> bool {
+    use crate::config::models::InputConfig;
+    match &inp.config {
+        InputConfig::St2110_20(_) | InputConfig::St2110_23(_) => false,
+        #[cfg(feature = "mxl")]
+        InputConfig::MxlVideo(_) => false,
+        _ => true,
     }
 }
 
@@ -5773,12 +5809,12 @@ fn derive_cost_plan(flow: &ResolvedFlow) -> crate::engine::hardware_probe::FlowC
                     }
                     None => {} // is_hw + no family — defensive, unreachable today
                 }
-                // Pair the decoder slot — every transcoder decodes
-                // before encoding, so the same session pair shows up
-                // on the host's decoder family alongside the encoder.
-                if let Some(family) = hw_family {
-                    pair_decoder_sessions_for_encoder(&mut plan, family, is_4k);
-                }
+                // Pair the decoder slot — every transcoder decodes the
+                // compressed source before re-encoding. Charge it to the
+                // backend the runtime resolver will actually pick
+                // (CPU → none; may differ from the encoder family under
+                // `hw_decode: auto`), not the encoder family.
+                pair_resolved_decoder_sessions(&mut plan, ve, is_4k);
             } else {
                 plan.sw_video_encode_units = plan.sw_video_encode_units.saturating_add(units);
             }
@@ -5922,8 +5958,12 @@ fn derive_cost_plan(flow: &ResolvedFlow) -> crate::engine::hardware_probe::FlowC
                     }
                     None => {} // is_hw + no family — defensive, unreachable today
                 }
-                if let Some(family) = hw_family {
-                    pair_decoder_sessions_for_encoder(&mut plan, family, is_4k);
+                // Pair the source-decode session (resolved backend,
+                // CPU → none) — but only for transcodes. ST 2110 / MXL
+                // video inputs encode from uncompressed essence and
+                // never decode, so they charge no decode session.
+                if input_video_encode_is_transcode(inp) {
+                    pair_resolved_decoder_sessions(&mut plan, ve, is_4k);
                 }
             } else {
                 plan.sw_video_encode_units =
@@ -5989,49 +6029,62 @@ fn output_resource_contribution(
         // (2160). Outputs without an explicit resolution stay 1080p.
         let (w, h) = output_video_encode_dims(output);
         let is_4k = w.map_or(false, |w| w >= 3840) || h.map_or(false, |h| h >= 2160);
-        let family = crate::engine::hardware_probe::HwEncoderFamily::classify(codec);
-        match family {
-            Some(crate::engine::hardware_probe::HwEncoderFamily::Nvenc) => {
-                units = units.saturating_add(100);
-                usage.nvenc_in_use = usage.nvenc_in_use.saturating_add(1);
-                if is_4k {
-                    usage.nvenc_in_use_4k = usage.nvenc_in_use_4k.saturating_add(1);
-                }
-            }
-            Some(crate::engine::hardware_probe::HwEncoderFamily::Qsv) => {
-                units = units.saturating_add(100);
-                usage.qsv_in_use = usage.qsv_in_use.saturating_add(1);
-                if is_4k {
-                    usage.qsv_in_use_4k = usage.qsv_in_use_4k.saturating_add(1);
-                }
-            }
-            Some(crate::engine::hardware_probe::HwEncoderFamily::VideoToolbox) => {
-                units = units.saturating_add(100);
-                usage.videotoolbox_in_use = usage.videotoolbox_in_use.saturating_add(1);
-            }
-            Some(crate::engine::hardware_probe::HwEncoderFamily::Amf) => {
-                units = units.saturating_add(100);
-                usage.amf_in_use = usage.amf_in_use.saturating_add(1);
-                if is_4k {
-                    usage.amf_in_use_4k = usage.amf_in_use_4k.saturating_add(1);
-                }
-            }
-            Some(crate::engine::hardware_probe::HwEncoderFamily::Vaapi) => {
-                units = units.saturating_add(100);
-                usage.vaapi_in_use = usage.vaapi_in_use.saturating_add(1);
-                if is_4k {
-                    usage.vaapi_in_use_4k = usage.vaapi_in_use_4k.saturating_add(1);
-                }
-            }
+        // Resolve the encoder backend the runtime will actually pick, the
+        // same way `derive_cost_plan` does — string classify returns None
+        // for `*_auto` codecs and would mis-cost them as software, so
+        // hot-add and flow-start would disagree for an auto output. Fall
+        // back to classify only when the static probe isn't installed yet
+        // (early boot / unit tests). Flat 100/500 unit weights as before
+        // (pixel-rate weighting lives in `derive_cost_plan`).
+        let ve = output_video_encode_block(output);
+        let resolved = ve.and_then(|v| {
+            crate::engine::hardware_probe::resolve_for_video_encode_config(v).ok()
+        });
+        let (is_hw, hw_family) = match resolved {
+            Some(r) => (!r.is_software(), r.hw_family()),
             None => {
-                units = units.saturating_add(500);
+                let f = crate::engine::hardware_probe::HwEncoderFamily::classify(codec);
+                (f.is_some(), f)
             }
-        }
-        // Pair the decoder slot — see `pair_decoder_usage_for_encoder`.
-        // Hot-remove of this output runs the same path in reverse, so
-        // the decoder counter stays symmetric with the encoder.
-        if let Some(f) = family {
-            pair_decoder_usage_for_encoder(&mut usage, f, is_4k);
+        };
+        if is_hw {
+            units = units.saturating_add(100);
+            match hw_family {
+                Some(crate::engine::hardware_probe::HwEncoderFamily::Nvenc) => {
+                    usage.nvenc_in_use = usage.nvenc_in_use.saturating_add(1);
+                    if is_4k {
+                        usage.nvenc_in_use_4k = usage.nvenc_in_use_4k.saturating_add(1);
+                    }
+                }
+                Some(crate::engine::hardware_probe::HwEncoderFamily::Qsv) => {
+                    usage.qsv_in_use = usage.qsv_in_use.saturating_add(1);
+                    if is_4k {
+                        usage.qsv_in_use_4k = usage.qsv_in_use_4k.saturating_add(1);
+                    }
+                }
+                Some(crate::engine::hardware_probe::HwEncoderFamily::VideoToolbox) => {
+                    usage.videotoolbox_in_use = usage.videotoolbox_in_use.saturating_add(1);
+                }
+                Some(crate::engine::hardware_probe::HwEncoderFamily::Amf) => {
+                    usage.amf_in_use = usage.amf_in_use.saturating_add(1);
+                    if is_4k {
+                        usage.amf_in_use_4k = usage.amf_in_use_4k.saturating_add(1);
+                    }
+                }
+                Some(crate::engine::hardware_probe::HwEncoderFamily::Vaapi) => {
+                    usage.vaapi_in_use = usage.vaapi_in_use.saturating_add(1);
+                    if is_4k {
+                        usage.vaapi_in_use_4k = usage.vaapi_in_use_4k.saturating_add(1);
+                    }
+                }
+                None => {} // is_hw + no family — defensive, unreachable today
+            }
+            // Pair the source-decode session — keyed to the runtime-resolved
+            // decoder backend (CPU → none). Hot-remove runs the same path in
+            // reverse, so the decoder counter stays symmetric.
+            pair_resolved_decoder_usage(&mut usage, ve, is_4k);
+        } else {
+            units = units.saturating_add(500);
         }
     }
     if matches!(
@@ -6079,11 +6132,14 @@ fn output_resource_contribution(
 /// Pull the `(width, height)` from an output's `video_encode` block,
 /// when one exists. Used by `output_resource_contribution` to decide
 /// whether a session counts against the 4K tier.
-fn output_video_encode_dims(
+/// The `video_encode` block for the output types that carry one
+/// (Srt/Rtp/Udp/Rist/Rtmp/Cmaf/Webrtc). `None` for passthrough and
+/// ST 2110 outputs. Shared by the hot-add usage path and dimension probe.
+fn output_video_encode_block(
     output: &crate::config::models::OutputConfig,
-) -> (Option<u32>, Option<u32>) {
+) -> Option<&crate::config::models::VideoEncodeConfig> {
     use crate::config::models::OutputConfig::*;
-    let ve = match output {
+    match output {
         Rtp(c) => c.video_encode.as_ref(),
         Udp(c) => c.video_encode.as_ref(),
         Srt(c) => c.video_encode.as_ref(),
@@ -6092,8 +6148,13 @@ fn output_video_encode_dims(
         Cmaf(c) => c.video_encode.as_ref(),
         Webrtc(c) => c.video_encode.as_ref(),
         _ => None,
-    };
-    match ve {
+    }
+}
+
+fn output_video_encode_dims(
+    output: &crate::config::models::OutputConfig,
+) -> (Option<u32>, Option<u32>) {
+    match output_video_encode_block(output) {
         Some(v) => (v.width, v.height),
         None => (None, None),
     }
@@ -6751,23 +6812,38 @@ mod cost_plan_tests {
         ResolvedFlow { config, inputs, outputs }
     }
 
+    // The paired transcode decode session is now charged to the *resolved*
+    // decoder backend (`resolved_transcode_decoder_family`) — the same
+    // resolver TsVideoReplacer / the input transcoder use at runtime —
+    // rather than unconditionally to the encoder's family. In this default
+    // test build NO `video-decoder-*` feature is compiled, so the source
+    // decode resolves to CPU and **no HW decode session** is charged
+    // (the encoder session still is). These tests pin that contract: a
+    // regression to unconditional encoder-family pairing would re-introduce
+    // the fictional `qsv_decode_in_use` the manager Resources card used to
+    // show for a CPU-decoded transcode. (The positive HW-decode path needs
+    // the `video-decoder-*` features and is covered by feature-gated CI.)
+
     #[test]
-    fn output_transcoder_pairs_decoder_session() {
+    fn output_transcoder_charges_encoder_cpu_decode_no_hw_session() {
         let out = rtp_output("o1", Some(ve("h264_nvenc")));
         let (_units, usage) = output_resource_contribution(&out);
         assert_eq!(usage.nvenc_in_use, 1);
-        assert_eq!(usage.nvdec_in_use, 1);
+        // CPU-resolved decode (no HW decoder feature) → no HW decode session.
+        assert_eq!(usage.nvdec_in_use, 0);
         assert_eq!(usage.qsv_in_use, 0);
         assert_eq!(usage.qsv_decode_in_use, 0);
         assert_eq!(usage.vaapi_decode_in_use, 0);
     }
 
     #[test]
-    fn output_transcoder_qsv_pairs_qsv_decode() {
+    fn output_transcoder_qsv_no_fictional_qsv_decode_on_cpu_build() {
         let out = rtp_output("o1", Some(ve("h264_qsv")));
         let (_units, usage) = output_resource_contribution(&out);
         assert_eq!(usage.qsv_in_use, 1);
-        assert_eq!(usage.qsv_decode_in_use, 1);
+        // The crux of the fix: no fictional QSV decode session when the
+        // source decode actually runs on CPU.
+        assert_eq!(usage.qsv_decode_in_use, 0);
         assert_eq!(usage.nvdec_in_use, 0);
     }
 
@@ -6782,24 +6858,25 @@ mod cost_plan_tests {
     }
 
     #[test]
-    fn output_transcoder_4k_pairs_4k_decoder() {
+    fn output_transcoder_4k_encoder_only_no_hw_decode_on_cpu_build() {
         let out = rtp_output("o1", Some(ve_4k("hevc_nvenc")));
         let (_units, usage) = output_resource_contribution(&out);
         assert_eq!(usage.nvenc_in_use, 1);
         assert_eq!(usage.nvenc_in_use_4k, 1);
-        assert_eq!(usage.nvdec_in_use, 1);
-        assert_eq!(usage.nvdec_in_use_4k, 1);
+        // CPU decode → no HW decode session at either tier.
+        assert_eq!(usage.nvdec_in_use, 0);
+        assert_eq!(usage.nvdec_in_use_4k, 0);
     }
 
     #[test]
-    fn input_transcoder_charges_encoder_and_decoder() {
+    fn input_transcoder_charges_encoder_cpu_decode_no_hw_session() {
         let f = flow(
             vec![rtp_input("i1", Some(ve("h264_qsv")), None)],
             vec![rtp_output("o1", None)],
         );
         let plan = derive_cost_plan(&f);
         assert_eq!(plan.qsv_sessions, 1);
-        assert_eq!(plan.qsv_decode_sessions, 1);
+        assert_eq!(plan.qsv_decode_sessions, 0);
         assert_eq!(plan.nvenc_sessions, 0);
         assert_eq!(plan.nvdec_sessions, 0);
     }
@@ -6818,31 +6895,32 @@ mod cost_plan_tests {
     }
 
     #[test]
-    fn output_transcoder_in_derive_cost_plan_pairs_decoder() {
+    fn output_transcoder_in_derive_cost_plan_encoder_only_on_cpu_build() {
         let f = flow(
             vec![rtp_input("i1", None, None)],
             vec![rtp_output("o1", Some(ve("h264_nvenc")))],
         );
         let plan = derive_cost_plan(&f);
         assert_eq!(plan.nvenc_sessions, 1);
-        assert_eq!(plan.nvdec_sessions, 1);
+        assert_eq!(plan.nvdec_sessions, 0);
     }
 
     #[test]
-    fn input_qsv_plus_output_nvenc_bump_independently() {
+    fn input_qsv_plus_output_nvenc_bump_encoders_independently() {
         let f = flow(
             vec![rtp_input("i1", Some(ve("h264_qsv")), None)],
             vec![rtp_output("o1", Some(ve("h264_nvenc")))],
         );
         let plan = derive_cost_plan(&f);
         assert_eq!(plan.qsv_sessions, 1);
-        assert_eq!(plan.qsv_decode_sessions, 1);
         assert_eq!(plan.nvenc_sessions, 1);
-        assert_eq!(plan.nvdec_sessions, 1);
+        // Both decode halves resolve to CPU here → no HW decode sessions.
+        assert_eq!(plan.qsv_decode_sessions, 0);
+        assert_eq!(plan.nvdec_sessions, 0);
     }
 
     #[test]
-    fn input_4k_vaapi_pairs_4k_vaapi_decode() {
+    fn input_4k_vaapi_encoder_only_no_hw_decode_on_cpu_build() {
         let f = flow(
             vec![rtp_input("i1", Some(ve_4k("h264_vaapi")), None)],
             vec![rtp_output("o1", None)],
@@ -6850,8 +6928,8 @@ mod cost_plan_tests {
         let plan = derive_cost_plan(&f);
         assert_eq!(plan.vaapi_sessions, 1);
         assert_eq!(plan.vaapi_sessions_4k, 1);
-        assert_eq!(plan.vaapi_decode_sessions, 1);
-        assert_eq!(plan.vaapi_decode_sessions_4k, 1);
+        assert_eq!(plan.vaapi_decode_sessions, 0);
+        assert_eq!(plan.vaapi_decode_sessions_4k, 0);
     }
 
     /// Build a ResolvedFlow with thumbnails configured (the shared `flow()`
