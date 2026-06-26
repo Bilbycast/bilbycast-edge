@@ -1894,7 +1894,7 @@ async fn execute_command(
             // Persist to config
             let mut cfg = app_config.write().await;
             cfg.flows.push(flow);
-            persist_config(&cfg, config_path, secrets_path).await;
+            persist_config(&cfg, config_path, secrets_path).await?;
             Ok(None)
         }
         "update_flow" => {
@@ -2129,7 +2129,7 @@ async fn execute_command(
             } else {
                 cfg.flows.push(new_flow);
             }
-            persist_config(&cfg, config_path, secrets_path).await;
+            persist_config(&cfg, config_path, secrets_path).await?;
             Ok(None)
         }
         "update_flow_assembly" => {
@@ -2217,7 +2217,7 @@ async fn execute_command(
             if let Some(flow) = cfg.flows.iter_mut().find(|f| f.id == flow_id) {
                 flow.assembly = Some(new_assembly);
             }
-            persist_config(&cfg, config_path, secrets_path).await;
+            persist_config(&cfg, config_path, secrets_path).await?;
             Ok(None)
         }
         "delete_flow" => {
@@ -2232,7 +2232,7 @@ async fn execute_command(
             // Remove from config
             let mut cfg = app_config.write().await;
             cfg.flows.retain(|f| f.id != flow_id);
-            persist_config(&cfg, config_path, secrets_path).await;
+            persist_config(&cfg, config_path, secrets_path).await?;
             Ok(None)
         }
         "stop_flow" => {
@@ -2247,7 +2247,7 @@ async fn execute_command(
             if let Some(flow) = cfg.flows.iter_mut().find(|f| f.id == flow_id) {
                 flow.enabled = false;
             }
-            persist_config(&cfg, config_path, secrets_path).await;
+            persist_config(&cfg, config_path, secrets_path).await?;
             Ok(None)
         }
         "start_flow" | "restart_flow" => {
@@ -2279,7 +2279,7 @@ async fn execute_command(
             if let Some(flow) = cfg.flows.iter_mut().find(|f| f.id == flow_id) {
                 flow.enabled = true;
             }
-            persist_config(&cfg, config_path, secrets_path).await;
+            persist_config(&cfg, config_path, secrets_path).await?;
             Ok(None)
         }
         "add_output" => {
@@ -2306,7 +2306,7 @@ async fn execute_command(
                     flow.output_ids.push(output_id);
                 }
             }
-            persist_config(&cfg, config_path, secrets_path).await;
+            persist_config(&cfg, config_path, secrets_path).await?;
             Ok(None)
         }
         "remove_output" => {
@@ -2327,7 +2327,7 @@ async fn execute_command(
             if !still_referenced {
                 cfg.outputs.retain(|o| o.id() != output_id);
             }
-            persist_config(&cfg, config_path, secrets_path).await;
+            persist_config(&cfg, config_path, secrets_path).await?;
             Ok(None)
         }
         "add_input" => {
@@ -2405,7 +2405,7 @@ async fn execute_command(
                     flow.input_ids.push(input_id.clone());
                 }
             }
-            persist_config(&cfg, config_path, secrets_path).await;
+            persist_config(&cfg, config_path, secrets_path).await?;
             Ok(None)
         }
         "remove_input" => {
@@ -2441,7 +2441,7 @@ async fn execute_command(
             if !still_referenced {
                 cfg.inputs.retain(|i| i.id != input_id);
             }
-            persist_config(&cfg, config_path, secrets_path).await;
+            persist_config(&cfg, config_path, secrets_path).await?;
             Ok(None)
         }
         // ── Independent input CRUD ──
@@ -2456,7 +2456,7 @@ async fn execute_command(
             }
             let id = input.id.clone();
             cfg.inputs.push(input);
-            persist_config(&cfg, config_path, secrets_path).await;
+            persist_config(&cfg, config_path, secrets_path).await?;
             flow_manager.event_sender().emit_input(
                 EventSeverity::Info, category::FLOW,
                 format!("Input '{}' created", id), &id,
@@ -2490,7 +2490,7 @@ async fn execute_command(
                     }
                 }
             }
-            persist_config(&cfg, config_path, secrets_path).await;
+            persist_config(&cfg, config_path, secrets_path).await?;
             flow_manager.event_sender().emit_input(
                 EventSeverity::Info, category::FLOW,
                 format!("Input '{}' updated", input_id), input_id,
@@ -2580,7 +2580,7 @@ async fn execute_command(
                     def.active = def.id == input_id;
                 }
             }
-            persist_config(&cfg, config_path, secrets_path).await;
+            persist_config(&cfg, config_path, secrets_path).await?;
             Ok(None)
         }
         "activate_output" => {
@@ -2605,7 +2605,7 @@ async fn execute_command(
                     tracing::warn!("set_output_active failed for '{flow_id}': {e}");
                 }
             }
-            persist_config(&cfg, config_path, secrets_path).await;
+            persist_config(&cfg, config_path, secrets_path).await?;
             Ok(None)
         }
         "delete_input" => {
@@ -2620,7 +2620,7 @@ async fn execute_command(
             if cfg.inputs.len() == before {
                 return Err(CommandError::new(format!("Input '{input_id}' not found")));
             }
-            persist_config(&cfg, config_path, secrets_path).await;
+            persist_config(&cfg, config_path, secrets_path).await?;
             flow_manager.event_sender().emit_input(
                 EventSeverity::Info, category::FLOW,
                 format!("Input '{}' deleted", input_id), input_id,
@@ -2639,7 +2639,7 @@ async fn execute_command(
             }
             let id = output.id().to_string();
             cfg.outputs.push(output);
-            persist_config(&cfg, config_path, secrets_path).await;
+            persist_config(&cfg, config_path, secrets_path).await?;
             flow_manager.event_sender().emit_output(
                 EventSeverity::Info, category::FLOW,
                 format!("Output '{}' created", id), &id,
@@ -2664,7 +2664,7 @@ async fn execute_command(
                     let _ = flow_manager.add_output(&flow.id, output).await;
                 }
             }
-            persist_config(&cfg, config_path, secrets_path).await;
+            persist_config(&cfg, config_path, secrets_path).await?;
             flow_manager.event_sender().emit_output(
                 EventSeverity::Info, category::FLOW,
                 format!("Output '{}' updated", output_id), output_id,
@@ -2683,7 +2683,7 @@ async fn execute_command(
             if cfg.outputs.len() == before {
                 return Err(CommandError::new(format!("Output '{output_id}' not found")));
             }
-            persist_config(&cfg, config_path, secrets_path).await;
+            persist_config(&cfg, config_path, secrets_path).await?;
             flow_manager.event_sender().emit_output(
                 EventSeverity::Info, category::FLOW,
                 format!("Output '{}' deleted", output_id), output_id,
@@ -2707,7 +2707,7 @@ async fn execute_command(
             } else {
                 cfg.tunnels.push(tunnel);
             }
-            persist_config(&cfg, config_path, secrets_path).await;
+            persist_config(&cfg, config_path, secrets_path).await?;
             Ok(None)
         }
         "delete_tunnel" => {
@@ -2720,7 +2720,7 @@ async fn execute_command(
             // Remove from config
             let mut cfg = app_config.write().await;
             cfg.tunnels.retain(|t| t.id != tunnel_id);
-            persist_config(&cfg, config_path, secrets_path).await;
+            persist_config(&cfg, config_path, secrets_path).await?;
             Ok(None)
         }
         "update_config" => {
@@ -2987,12 +2987,22 @@ async fn execute_command(
                 cfg.nmos_registration = new_config.nmos_registration.clone();
                 cfg.upgrades = new_config.upgrades.clone();
                 if let Err(e) = save_config_split_async(config_path.clone(), secrets_path.clone(), cfg.clone()).await {
-                    tracing::warn!("Failed to persist config after manager command: {e}");
+                    tracing::error!("Failed to persist config after manager command: {e}");
                     tunnel_manager.event_sender().emit(
                         EventSeverity::Warning,
                         category::CONFIG,
                         format!("Failed to persist configuration: {e}"),
                     );
+                    // Surface the failure to the manager rather than acking
+                    // success: the diff was applied to the live engine + the
+                    // in-memory config, but config.json on disk is now stale, so
+                    // a restart would revert it (e.g. resurrect a removed
+                    // tunnel) — the same Issue-16 divergence the dedicated
+                    // create/delete_tunnel handlers now guard against.
+                    return Err(CommandError::with_code(
+                        format!("config change applied in memory but failed to persist to disk: {e}"),
+                        "config_persist_failed",
+                    ));
                 }
             }
 
@@ -3637,7 +3647,7 @@ async fn execute_command(
                 } else {
                     return Err("No manager config present to update secret".into());
                 }
-                persist_config(&cfg, config_path, secrets_path).await;
+                persist_config(&cfg, config_path, secrets_path).await?;
             }
 
             tracing::info!("Node secret rotated and persisted to secrets.json");
@@ -5074,8 +5084,66 @@ async fn diff_outputs_inner(
 ///
 /// Offloads blocking file I/O to the Tokio blocking thread pool to avoid
 /// stalling the async manager client loop.
-async fn persist_config(config: &AppConfig, config_path: &PathBuf, secrets_path: &PathBuf) {
-    if let Err(e) = save_config_split_async(config_path.clone(), secrets_path.clone(), config.clone()).await {
-        tracing::warn!("Failed to persist config after manager command: {e}");
+/// Persist the in-memory config to disk after a manager command mutated it.
+///
+/// Returns the failure as a `CommandError` (code `config_persist_failed`) so the
+/// caller propagates it into the `command_ack` rather than silently acking
+/// success. A swallowed persist failure is exactly the Issue-16 trap: the live
+/// engine + in-memory `AppConfig` reflect the change (e.g. a deleted tunnel) but
+/// `config.json` on disk still holds the old entry, so the next restart
+/// resurrects it while the manager believes the mutation stuck. Surfacing the
+/// error lets the manager/operator see the on-disk/runtime divergence
+/// immediately — the local REST tunnel handlers (`api::tunnels`) already behave
+/// this way; this brings the manager-WS path to parity.
+async fn persist_config(
+    config: &AppConfig,
+    config_path: &PathBuf,
+    secrets_path: &PathBuf,
+) -> Result<(), CommandError> {
+    if let Err(e) =
+        save_config_split_async(config_path.clone(), secrets_path.clone(), config.clone()).await
+    {
+        tracing::error!("Failed to persist config after manager command: {e}");
+        return Err(CommandError::with_code(
+            format!("config change applied in memory but failed to persist to disk: {e}"),
+            "config_persist_failed",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod persist_config_tests {
+    use super::persist_config;
+    use crate::config::models::AppConfig;
+    use std::path::PathBuf;
+
+    /// Issue-16 guard: a manager command that mutates config but then fails to
+    /// write config.json must surface a `config_persist_failed` CommandError, not
+    /// silently ack success. Previously the failure was swallowed (warn-only), so
+    /// the manager believed e.g. a tunnel deletion stuck while config.json on disk
+    /// still held it — resurrecting it on the next restart. Here an unwritable
+    /// path (parent dir absent → atomic temp-write fails) stands in for the
+    /// real-world permission/disk-full cause the customer hit.
+    #[tokio::test]
+    async fn persist_failure_surfaces_command_error() {
+        let bad = PathBuf::from("/nonexistent-bilbycast-persist-test-dir/config.json");
+        let bad_secrets = PathBuf::from("/nonexistent-bilbycast-persist-test-dir/secrets.json");
+        let err = persist_config(&AppConfig::default(), &bad, &bad_secrets)
+            .await
+            .expect_err("persist to a nonexistent directory must fail, not be swallowed");
+        assert_eq!(err.code.as_deref(), Some("config_persist_failed"));
+    }
+
+    /// The happy path returns Ok and actually writes config.json to disk.
+    #[tokio::test]
+    async fn persist_success_writes_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg_path = dir.path().join("config.json");
+        let secrets_path = dir.path().join("secrets.json");
+        persist_config(&AppConfig::default(), &cfg_path, &secrets_path)
+            .await
+            .expect("persist to a writable directory must succeed");
+        assert!(cfg_path.exists(), "config.json should be written on the success path");
     }
 }
