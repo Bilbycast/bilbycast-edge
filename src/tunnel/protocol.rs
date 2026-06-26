@@ -120,10 +120,17 @@ pub enum PeerMessage {
 // ── Direction / Protocol enums (relay wire format) ──
 
 /// Direction as sent over the relay wire protocol.
+///
+/// Edge/relay-internal perspective, which is the OPPOSITE of the bilbycast-manager
+/// UI naming: the manager's "ingress node" (the media *source*) binds as
+/// [`RelayDirection::Egress`] here. See `crate::tunnel::udp_forwarder`
+/// (`run_egress` = sender / source, `run_ingress` = receiver / destination).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RelayDirection {
+    /// Destination side: receives tunnel traffic and forwards it to a local consumer.
     #[serde(rename = "ingress")]
     Ingress,
+    /// Source side: captures local traffic and sends it INTO the tunnel.
     #[serde(rename = "egress")]
     Egress,
 }
