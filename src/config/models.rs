@@ -2222,7 +2222,11 @@ pub struct SrtInputConfig {
     /// SRT connection mode
     pub mode: SrtMode,
     /// Local bind address, e.g. "0.0.0.0:9000".
-    /// Required for listener/rendezvous. Optional for caller (defaults to "0.0.0.0:0").
+    /// Required for listener/rendezvous (the listen address). For **caller** this
+    /// is the **source** socket (bind-then-connect), not the destination — optional,
+    /// defaults to "0.0.0.0:0" (ephemeral). Never set a caller's `local_addr` equal
+    /// to `remote_addr` (validation rejects the self-connect) or to a co-located
+    /// egress tunnel's port (caught by the port-conflict preflight).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub local_addr: Option<String>,
     /// Optional public `host:port` reachable from outside this node's network
@@ -3367,7 +3371,11 @@ pub struct SrtOutputConfig {
     /// SRT connection mode
     pub mode: SrtMode,
     /// Local bind address.
-    /// Required for listener/rendezvous. Optional for caller (defaults to "0.0.0.0:0").
+    /// Required for listener/rendezvous (the listen address). For **caller** this
+    /// is the **source** socket (bind-then-connect), not the destination — optional,
+    /// defaults to "0.0.0.0:0" (ephemeral). Never set a caller's `local_addr` equal
+    /// to `remote_addr` (validation rejects the self-connect) or to a co-located
+    /// egress tunnel's port (caught by the port-conflict preflight).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub local_addr: Option<String>,
     /// Optional public `host:port` reachable from outside this node's network.

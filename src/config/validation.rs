@@ -1239,6 +1239,11 @@ fn validate_input(input: &InputConfig) -> Result<()> {
                 SrtMode::Caller => {
                     if let Some(ref addr) = srt.local_addr {
                         validate_socket_addr(addr, "SRT input local_addr")?;
+                        reject_srt_caller_self_connect(
+                            addr,
+                            srt.remote_addr.as_deref(),
+                            "SRT input",
+                        )?;
                     }
                 }
             }
@@ -1930,10 +1935,17 @@ fn validate_bond_path_transport(
     Ok(())
 }
 
-/// Extract the local UDP port to register (receiver-side paths) so
-/// the port-conflict check can spot bonded inputs colliding with
-/// other services. Returns `None` for paths that don't pin a port
-/// (sender-role RIST, QUIC client, UDP sender-mode with no bind).
+/// Extract the local UDP port a bonded leg binds, so the port-conflict
+/// check can spot a bonded path colliding with other services (e.g. a
+/// co-located egress tunnel). Returns `None` only for legs that don't pin
+/// a port (the ephemeral cases — `register` itself also skips `:0`).
+///
+/// Every leg type binds a real OS socket on the side it's used: UDP binds
+/// `bind` (sender-side optional/ephemeral), RIST binds `local_bind` on both
+/// the sender (optional source) and receiver (required) side, and QUIC binds
+/// its source `bind` as a client (sender) or `addr` as a server (receiver).
+/// All of those are registered when pinned — a pinned sender-side source port
+/// that collides is otherwise only discovered at runtime as a bind failure.
 ///
 /// `sender_mode` is the leg's side (true on a bonded output). It is
 /// authoritative for QUIC because the QUIC `role` field is auto-derived
@@ -1943,15 +1955,21 @@ fn bond_path_bind_addr(
     t: &crate::config::models::BondPathTransportConfig,
     sender_mode: bool,
 ) -> Option<String> {
-    use crate::config::models::{BondPathTransportConfig, BondRistRole};
+    use crate::config::models::BondPathTransportConfig;
     match t {
         BondPathTransportConfig::Udp { bind, .. } => bind.clone(),
-        BondPathTransportConfig::Rist {
-            role, local_bind, ..
-        } if *role == BondRistRole::Receiver => local_bind.clone(),
-        // Receiver-side QUIC leg is the server → it binds `addr`.
-        BondPathTransportConfig::Quic { addr, .. } if !sender_mode => Some(addr.clone()),
-        _ => None,
+        // RIST binds `local_bind` on both sides (required receiver, optional
+        // sender source). Register whichever is pinned.
+        BondPathTransportConfig::Rist { local_bind, .. } => local_bind.clone(),
+        // QUIC server (receiver) binds `addr`; QUIC client (sender) binds its
+        // optional source `bind` (usually ephemeral, occasionally pinned).
+        BondPathTransportConfig::Quic { addr, bind, .. } => {
+            if sender_mode {
+                bind.clone()
+            } else {
+                Some(addr.clone())
+            }
+        }
     }
 }
 
@@ -4650,6 +4668,11 @@ pub fn validate_output_with_input(
                 SrtMode::Caller => {
                     if let Some(ref addr) = srt.local_addr {
                         validate_socket_addr(addr, "SRT output local_addr")?;
+                        reject_srt_caller_self_connect(
+                            addr,
+                            srt.remote_addr.as_deref(),
+                            &format!("SRT output '{}'", srt.id),
+                        )?;
                     }
                 }
             }
@@ -6012,6 +6035,11 @@ fn validate_srt_redundancy(red: &SrtRedundancyConfig, context: &str) -> Result<(
         SrtMode::Caller => {
             if let Some(ref addr) = red.local_addr {
                 validate_socket_addr(addr, &format!("{context} redundancy local_addr"))?;
+                reject_srt_caller_self_connect(
+                    addr,
+                    red.remote_addr.as_deref(),
+                    &format!("{context} redundancy"),
+                )?;
             }
         }
     }
@@ -6799,6 +6827,50 @@ fn ports_conflict(a: &BoundPort, b: &BoundPort) -> bool {
         && (a.wildcard || b.wildcard || a.ip == b.ip)
 }
 
+/// Human-readable role of an SRT endpoint's `local_addr` bind, for
+/// port-conflict messages. A caller binds `local_addr` as its *source*
+/// socket (bind-then-connect); listener/rendezvous bind it as the listen
+/// address. Used only to label registered binds.
+fn srt_bind_role(mode: SrtMode) -> &'static str {
+    match mode {
+        SrtMode::Caller => "caller source bind",
+        SrtMode::Listener => "listener",
+        SrtMode::Rendezvous => "rendezvous",
+    }
+}
+
+/// Reject the self-connect config: a caller binds `local_addr` as its source
+/// socket and then connects to `remote_addr`, so identical values make it dial
+/// itself — the classic `connecting 127.0.0.1:9001 -> 127.0.0.1:9001` with no
+/// usable output (`bitrate_bps: 0`) and an endless reconnect loop. Only a
+/// caller can hit this (listener/rendezvous don't connect outbound from
+/// `local_addr`). Port *collisions* against other local binds (a co-located
+/// egress tunnel, another caller's pinned source port) are caught separately
+/// by [`validate_port_conflicts`]; this guard is the exact-equality net.
+fn reject_srt_caller_self_connect(
+    local_addr: &str,
+    remote_addr: Option<&str>,
+    context: &str,
+) -> Result<()> {
+    let Some(remote) = remote_addr else {
+        return Ok(());
+    };
+    if let (Ok(local_sa), Ok(remote_sa)) = (
+        local_addr.parse::<SocketAddr>(),
+        remote.parse::<SocketAddr>(),
+    ) && local_sa == remote_sa
+    {
+        bail!(
+            "{context}: local_addr ({local_addr}) must not equal remote_addr — a caller \
+             binds local_addr as its source socket and connects to remote_addr, so identical \
+             values make it dial itself and produce no output. For a caller, local_addr is the \
+             source socket: leave it ephemeral (0.0.0.0:0) unless you must pin a source \
+             interface/port, and never set it to the destination."
+        );
+    }
+    Ok(())
+}
+
 /// Validates that no two components in the config try to bind the same local
 /// port.  Called at the end of [`validate_config`] after individual component
 /// validation has already passed.
@@ -6907,21 +6979,26 @@ fn validate_port_conflicts(config: &AppConfig) -> Result<()> {
                 register(&cfg.bind_addr, Proto::Udp, format!("{label_prefix} (UDP)"))?;
             }
             InputConfig::Srt(cfg) => {
-                // Only listener and rendezvous modes bind a specific port.
-                if cfg.mode != SrtMode::Caller {
-                    if let Some(ref addr) = cfg.local_addr {
-                        register(addr, Proto::Udp, format!("{label_prefix} (SRT listener)"))?;
-                    }
+                // Every mode binds local_addr: listener/rendezvous bind the
+                // listen port; a caller binds its *source* socket too (defaults
+                // to ephemeral 0.0.0.0:0, which `register` skips). Register
+                // whatever is pinned so a caller's pinned source port colliding
+                // with a co-located egress tunnel is caught here, not at runtime
+                // as an endless reconnect with no output.
+                if let Some(ref addr) = cfg.local_addr {
+                    register(
+                        addr,
+                        Proto::Udp,
+                        format!("{label_prefix} (SRT {})", srt_bind_role(cfg.mode)),
+                    )?;
                 }
                 if let Some(ref red) = cfg.redundancy {
-                    if red.mode != SrtMode::Caller {
-                        if let Some(ref addr) = red.local_addr {
-                            register(
-                                addr,
-                                Proto::Udp,
-                                format!("{label_prefix} (SRT redundancy leg 2)"),
-                            )?;
-                        }
+                    if let Some(ref addr) = red.local_addr {
+                        register(
+                            addr,
+                            Proto::Udp,
+                            format!("{label_prefix} (SRT redundancy leg 2)"),
+                        )?;
                     }
                 }
             }
@@ -7016,8 +7093,17 @@ fn validate_port_conflicts(config: &AppConfig) -> Result<()> {
                     }
                 }
             }
-            // RTSP, WebRTC, and WHEP inputs don't bind specific local ports.
-            InputConfig::Rtsp(_) | InputConfig::Webrtc(_) | InputConfig::Whep(_) => {}
+            // WebRTC WHIP-server input binds `bind_addr` (its ICE/UDP socket).
+            // A pinned port can collide with a co-located tunnel, so register
+            // it. The unset/default case binds 0.0.0.0:0 — `register` skips
+            // ephemeral. WHEP (client pull) and RTSP (client pull) dial out and
+            // don't pin a local port.
+            InputConfig::Webrtc(cfg) => {
+                if let Some(ref addr) = cfg.bind_addr {
+                    register(addr, Proto::Udp, format!("{label_prefix} (WebRTC WHIP)"))?;
+                }
+            }
+            InputConfig::Rtsp(_) | InputConfig::Whep(_) => {}
             // Bonded inputs bind per-path — register each receiver-role
             // path's local port. Client / sender-role paths don't
             // occupy a specific local port so there's nothing to
@@ -7055,13 +7141,20 @@ fn validate_port_conflicts(config: &AppConfig) -> Result<()> {
         let label_prefix = format!("Output '{}' [{}]", output.name(), output.id());
         match output {
             OutputConfig::Srt(cfg) => {
-                if cfg.mode != SrtMode::Caller
-                    && let Some(ref addr) = cfg.local_addr
-                {
-                    register(addr, Proto::Udp, format!("{label_prefix} (SRT listener)"))?;
+                // Register local_addr for every mode — a caller binds its
+                // *source* socket too (ephemeral 0.0.0.0:0 is skipped by
+                // `register`; only a pinned source port is checked), so a caller
+                // colliding with a co-located egress tunnel is caught here. The
+                // local==remote self-connect case is rejected separately in the
+                // SRT output validator (reject_srt_caller_self_connect).
+                if let Some(ref addr) = cfg.local_addr {
+                    register(
+                        addr,
+                        Proto::Udp,
+                        format!("{label_prefix} (SRT {})", srt_bind_role(cfg.mode)),
+                    )?;
                 }
                 if let Some(ref red) = cfg.redundancy
-                    && red.mode != SrtMode::Caller
                     && let Some(ref addr) = red.local_addr
                 {
                     register(
@@ -10511,6 +10604,246 @@ mod tests {
         let err = validate_config(&config).unwrap_err().to_string();
         assert!(err.contains("[in-1]"), "should include input id: {err}");
         assert!(err.contains("[out-1]"), "should include output id: {err}");
+    }
+
+    // ── SRT caller `local_addr` (source-bind) tests — Issue 12 ──
+    //
+    // A caller binds `local_addr` as its *source* socket and connects to
+    // `remote_addr`. Two failure modes: (a) `local_addr == remote_addr` makes
+    // the caller dial itself (no output); (b) a pinned source port colliding
+    // with a co-located egress tunnel was previously invisible at preflight
+    // because caller mode was skipped, only surfacing as a runtime bind loop.
+
+    fn srt_caller_output(id: &str, local_addr: Option<&str>, remote_addr: &str) -> OutputConfig {
+        OutputConfig::Srt(SrtOutputConfig {
+            id: id.to_string(),
+            name: format!("SRT {id}"),
+            active: true,
+            group: None,
+            mode: SrtMode::Caller,
+            local_addr: local_addr.map(str::to_string),
+            external_address: None,
+            remote_addr: Some(remote_addr.to_string()),
+            latency_ms: 200,
+            recv_latency_ms: None,
+            peer_latency_ms: None,
+            peer_idle_timeout_secs: 30,
+            passphrase: None,
+            aes_key_len: None,
+            crypto_mode: None,
+            max_rexmit_bw: None,
+            stream_id: None,
+            packet_filter: None,
+            max_bw: None,
+            input_bw: None,
+            overhead_bw: None,
+            enforced_encryption: None,
+            connect_timeout_secs: None,
+            flight_flag_size: None,
+            send_buffer_size: None,
+            recv_buffer_size: None,
+            ip_tos: None,
+            retransmit_algo: None,
+            send_drop_delay: None,
+            loss_max_ttl: None,
+            km_refresh_rate: None,
+            km_pre_announce: None,
+            payload_size: None,
+            mss: None,
+            tlpkt_drop: None,
+            ip_ttl: None,
+            redundancy: None,
+            bonding: None,
+            program_number: None,
+            pid_map: None,
+            transport_mode: None,
+            delay: None,
+            audio_encode: None,
+            transcode: None,
+            video_encode: None,
+            pid_overrides: None,
+            cbr_pad_to_kbps: None,
+            interface_binding: None,
+        })
+    }
+
+    fn srt_caller_input(id: &str, local_addr: Option<&str>, remote_addr: &str) -> InputDefinition {
+        InputDefinition {
+            active: true,
+            group: None,
+            id: id.to_string(),
+            name: format!("SRT {id}"),
+            config: InputConfig::Srt(SrtInputConfig {
+                mode: SrtMode::Caller,
+                local_addr: local_addr.map(str::to_string),
+                external_address: None,
+                remote_addr: Some(remote_addr.to_string()),
+                latency_ms: 200,
+                recv_latency_ms: None,
+                peer_latency_ms: None,
+                peer_idle_timeout_secs: 30,
+                passphrase: None,
+                aes_key_len: None,
+                crypto_mode: None,
+                max_rexmit_bw: None,
+                stream_id: None,
+                packet_filter: None,
+                max_bw: None,
+                input_bw: None,
+                overhead_bw: None,
+                enforced_encryption: None,
+                connect_timeout_secs: None,
+                flight_flag_size: None,
+                send_buffer_size: None,
+                recv_buffer_size: None,
+                ip_tos: None,
+                retransmit_algo: None,
+                send_drop_delay: None,
+                loss_max_ttl: None,
+                km_refresh_rate: None,
+                km_pre_announce: None,
+                payload_size: None,
+                mss: None,
+                tlpkt_drop: None,
+                ip_ttl: None,
+                redundancy: None,
+                bonding: None,
+                transport_mode: None,
+                audio_encode: None,
+                transcode: None,
+                video_encode: None,
+                program_number: None,
+                pid_map: None,
+                pid_overrides: None,
+                interface_binding: None,
+                ingress_delay_ms: None,
+                passthrough_clock: None,
+            }),
+        }
+    }
+
+    /// (a) A caller whose `local_addr` equals `remote_addr` dials itself —
+    /// must be rejected (output side).
+    #[test]
+    fn srt_caller_output_self_connect_rejected() {
+        let mut config = make_config_with_rtp("0.0.0.0:5000", "127.0.0.1:5004");
+        config.outputs[0] = srt_caller_output("out-1", Some("127.0.0.1:9001"), "127.0.0.1:9001");
+        let err = validate_config(&config).unwrap_err().to_string();
+        assert!(err.contains("must not equal remote_addr"), "got: {err}");
+    }
+
+    /// (a) Same self-connect guard on the input side.
+    #[test]
+    fn srt_caller_input_self_connect_rejected() {
+        let mut config = make_config_with_rtp("0.0.0.0:5000", "127.0.0.1:5004");
+        config.inputs[0] = srt_caller_input("in-1", Some("203.0.113.5:9001"), "203.0.113.5:9001");
+        let err = validate_config(&config).unwrap_err().to_string();
+        assert!(err.contains("must not equal remote_addr"), "got: {err}");
+    }
+
+    /// (b) The Issue 12 topology: a caller output pins its source port to the
+    /// same port a co-located egress tunnel binds. Must be caught at preflight.
+    #[test]
+    fn port_conflict_srt_caller_output_pinned_local_vs_egress_tunnel() {
+        use crate::tunnel::config::{TunnelDirection, TunnelProtocol};
+        let mut config = make_config_with_rtp("0.0.0.0:5000", "127.0.0.1:5004");
+        // Caller pins its SOURCE port to 9001; the real destination is elsewhere.
+        config.outputs[0] = srt_caller_output("out-1", Some("127.0.0.1:9001"), "203.0.113.9:7000");
+        // Co-located egress tunnel binds 0.0.0.0:9001/udp — the collision.
+        config.tunnels.push(make_test_tunnel(
+            "egress",
+            "0.0.0.0:9001",
+            TunnelProtocol::Udp,
+            TunnelDirection::Egress,
+        ));
+        let err = validate_config(&config).unwrap_err().to_string();
+        assert!(err.contains("Port conflict"), "got: {err}");
+        assert!(err.contains("9001"), "got: {err}");
+    }
+
+    /// No false positive on the *correct* co-located topology: the caller sends
+    /// TO the tunnel (`remote_addr` = tunnel bind) and leaves its source socket
+    /// ephemeral. It does not bind the tunnel's port, so there is no conflict —
+    /// whether `local_addr` is unset or an explicit `0.0.0.0:0`.
+    #[test]
+    fn no_port_conflict_srt_caller_output_ephemeral_source_colocated_tunnel() {
+        use crate::tunnel::config::{TunnelDirection, TunnelProtocol};
+        let mut config = make_config_with_rtp("0.0.0.0:5000", "127.0.0.1:5004");
+        config.tunnels.push(make_test_tunnel(
+            "egress",
+            "0.0.0.0:9001",
+            TunnelProtocol::Udp,
+            TunnelDirection::Egress,
+        ));
+        // Unset source (recommended).
+        config.outputs[0] = srt_caller_output("out-1", None, "127.0.0.1:9001");
+        validate_config(&config).expect("unset caller source must not conflict with its tunnel");
+        // Explicit ephemeral source — `register` skips port 0.
+        config.outputs[0] = srt_caller_output("out-1", Some("0.0.0.0:0"), "127.0.0.1:9001");
+        validate_config(&config).expect("ephemeral caller source must not conflict with its tunnel");
+    }
+
+    /// The same source-bind preflight gap existed for the WebRTC WHIP-server
+    /// input: a pinned `bind_addr` colliding with a co-located egress tunnel.
+    #[test]
+    fn port_conflict_webrtc_whip_input_bind_vs_egress_tunnel() {
+        use crate::tunnel::config::{TunnelDirection, TunnelProtocol};
+        let mut config = make_config_with_rtp("0.0.0.0:5000", "127.0.0.1:5004");
+        config.inputs[0] = InputDefinition {
+            active: true,
+            group: None,
+            id: "in-1".to_string(),
+            name: "WHIP In".to_string(),
+            config: InputConfig::Webrtc(WebrtcInputConfig {
+                bind_addr: Some("0.0.0.0:8000".to_string()),
+                bearer_token: None,
+                video_only: false,
+                public_ip: None,
+                stun_server: None,
+                audio_encode: None,
+                transcode: None,
+                video_encode: None,
+                program_number: None,
+                pid_map: None,
+                pid_overrides: None,
+            }),
+        };
+        config.tunnels.push(make_test_tunnel(
+            "egress",
+            "0.0.0.0:8000",
+            TunnelProtocol::Udp,
+            TunnelDirection::Egress,
+        ));
+        let err = validate_config(&config).unwrap_err().to_string();
+        assert!(err.contains("Port conflict"), "got: {err}");
+        assert!(err.contains("8000"), "got: {err}");
+    }
+
+    /// Bonded sender-side legs bind a real OS source socket too: a QUIC client
+    /// binds its `bind`, a RIST sender binds its `local_bind`. `bond_path_bind_addr`
+    /// must surface those for conflict detection (it previously returned `None`).
+    #[test]
+    fn bond_path_bind_addr_registers_sender_source_binds() {
+        let quic = BondPathTransportConfig::Quic {
+            role: BondQuicRole::Client,
+            addr: "203.0.113.9:7000".into(),
+            server_name: String::new(),
+            tls: BondQuicTls::SelfSigned,
+            bind: Some("192.168.10.2:5555".into()),
+            interface: None,
+        };
+        // Sender (client) → its source `bind`; receiver (server) → `addr`.
+        assert_eq!(bond_path_bind_addr(&quic, true).as_deref(), Some("192.168.10.2:5555"));
+        assert_eq!(bond_path_bind_addr(&quic, false).as_deref(), Some("203.0.113.9:7000"));
+
+        let rist = BondPathTransportConfig::Rist {
+            role: BondRistRole::Sender,
+            remote: Some("203.0.113.9:7000".into()),
+            local_bind: Some("0.0.0.0:6000".into()),
+            buffer_ms: None,
+        };
+        // Sender-side RIST source bind is now registered (was None before).
+        assert_eq!(bond_path_bind_addr(&rist, true).as_deref(), Some("0.0.0.0:6000"));
     }
 
     // ── Dual-relay validation tests ──

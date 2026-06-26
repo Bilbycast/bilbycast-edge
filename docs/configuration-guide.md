@@ -828,7 +828,7 @@ Receives RTP encapsulated in SRT. Supports caller, listener, and rendezvous mode
 |-------|------|----------|---------|-------------|
 | `type` | string | Yes | - | Must be `"srt"`. |
 | `mode` | string | Yes | - | SRT connection mode: `"caller"`, `"listener"`, or `"rendezvous"`. See [SRT Connection Modes](#srt-connection-modes). |
-| `local_addr` | string | Yes | - | Local socket address to bind (`ip:port`). |
+| `local_addr` | string | Conditional | `0.0.0.0:0` | Local socket address to bind (`ip:port`). For **listener/rendezvous** this is the **listen address** (required). For **caller** it is the **source socket** (bind-then-connect), *not* the destination — leave unset / `0.0.0.0:0` (ephemeral) unless you must pin a source interface/port. |
 | `remote_addr` | string | Conditional | `null` | Remote address to connect to. Required for `caller` and `rendezvous` modes. |
 | `latency_ms` | integer | No | `120` | SRT receive latency buffer in milliseconds. Higher values provide more resilience to network jitter at the cost of increased delay. |
 | `passphrase` | string | No | `null` | AES encryption passphrase. Must be 10-79 characters. When `null`, encryption is disabled. |
@@ -839,6 +839,7 @@ Receives RTP encapsulated in SRT. Supports caller, listener, and rendezvous mode
 **Validation rules:**
 - `local_addr` must be a valid socket address.
 - `remote_addr` is required for `caller` and `rendezvous` modes and must be a valid socket address.
+- In `caller` mode, `local_addr` must **not** equal `remote_addr` — a caller binds `local_addr` as its source socket and connects to `remote_addr`, so identical values make it dial itself and produce no output. A pinned `local_addr` port is also checked against every other bind on the node (inputs, outputs, **co-located tunnels**) and rejected with `port_conflict` on collision.
 - `passphrase` must be 10-79 characters.
 - `aes_key_len` must be 16, 24, or 32.
 - `crypto_mode` must be `"aes-ctr"` or `"aes-gcm"`. AES-GCM with `aes_key_len` 24 is rejected.
@@ -1214,7 +1215,7 @@ Sends RTP encapsulated in SRT.
 | `id` | string | Yes | - | Unique output ID. Cannot be empty. |
 | `name` | string | Yes | - | Human-readable display name. |
 | `mode` | string | Yes | - | SRT connection mode: `"caller"`, `"listener"`, or `"rendezvous"`. |
-| `local_addr` | string | Yes | - | Local socket address to bind. Use `"0.0.0.0:0"` for caller mode (ephemeral port). |
+| `local_addr` | string | Conditional | `0.0.0.0:0` | Local socket address to bind. For **caller** this is the **source socket** (bind-then-connect), not the destination — use `"0.0.0.0:0"` (ephemeral) unless pinning a source interface/port, and **never** set it equal to `remote_addr` or to a co-located egress tunnel's port. Required as the listen address for **listener/rendezvous**. A pinned port is checked against every other bind on the node (including tunnels) and rejected with `port_conflict` on collision. |
 | `remote_addr` | string | Conditional | `null` | Remote address. Required for `caller` and `rendezvous`. |
 | `latency_ms` | integer | No | `120` | SRT send latency in milliseconds. |
 | `passphrase` | string | No | `null` | AES encryption passphrase (10-79 characters). |
@@ -2092,6 +2093,15 @@ SRT inputs and outputs also support **native libsrt socket-group bonding** via a
 | `caller` | This endpoint connects to a remote listener | Yes | Sending to a known destination. Most common for outputs. |
 | `listener` | This endpoint waits for incoming connections | No | Accepting streams from remote callers. Most common for inputs (ingest servers). |
 | `rendezvous` | Both sides connect simultaneously | Yes | NAT traversal. Both sides must use rendezvous mode and know each other's address. |
+
+### `local_addr` semantics by mode
+
+`local_addr` means different things depending on `mode`:
+
+- **listener / rendezvous** — the **listen address** the endpoint binds (required).
+- **caller** — the **source socket** the endpoint binds *before* connecting to `remote_addr` (bind-then-connect). It is **not** the destination. Leave it unset / `"0.0.0.0:0"` so the OS picks an ephemeral source port; pin it only when you must source from a specific interface/port (a firewall pinhole, multi-homed host). `interface_binding` resolves to a pinned source IP with an ephemeral port automatically.
+
+**Co-locating a caller with an egress tunnel.** A common topology sends an SRT *output* (caller) into a co-located IP tunnel: the tunnel's egress leg binds e.g. `0.0.0.0:9001` and the SRT output's `remote_addr` is `127.0.0.1:9001`. In that setup leave the SRT output's `local_addr` ephemeral — do **not** set it to `127.0.0.1:9001`. Pinning the caller's *source* port to the tunnel's port makes the caller bind a port the tunnel already owns (and, if also equal to `remote_addr`, dial itself), so the stream never establishes — the edge logs `SRT caller connecting 127.0.0.1:9001 -> 127.0.0.1:9001` and the output sits at `bitrate_bps: 0`. Validation now rejects `local_addr == remote_addr` for callers and flags a pinned `local_addr` that collides with a tunnel (or any other bind) as `port_conflict`.
 
 ---
 
