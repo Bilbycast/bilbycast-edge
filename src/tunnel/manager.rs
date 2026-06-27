@@ -18,10 +18,11 @@ use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use super::config::{TunnelConfig, TunnelDirection, TunnelMode, TunnelProtocol};
+use super::config::{TunnelConfig, TunnelDirection, TunnelMode, TunnelProtocol, TunnelTransport};
 use super::relay_client::{self, RelayTunnelParams, RelayTunnelState};
 use super::tcp_forwarder::{self, TcpForwarderStats};
 use super::udp_forwarder::{self, UdpForwarderStats};
+use super::udp_relay_client::{self, NativeRelayParams};
 use crate::manager::events::{EventSender, EventSeverity, category};
 use crate::stats::throughput::ThroughputEstimator;
 
@@ -141,23 +142,44 @@ impl TunnelManager {
             None
         };
 
-        let active_relay_idx_rx = match config.mode {
-            TunnelMode::Relay => {
-                let rx = self
-                    .start_relay_tunnel(
-                        &config, tunnel_id, cancel.clone(), state_tx,
-                        udp_stats.clone(), tcp_stats.clone(),
+        let active_relay_idx_rx = match config.transport {
+            // Native plain-UDP carrier (no QUIC): SRT/RIST over relay / direct.
+            TunnelTransport::Udp => match config.mode {
+                TunnelMode::Relay => {
+                    let rx = self
+                        .start_native_relay_tunnel(
+                            &config, tunnel_id, cancel.clone(), state_tx, udp_stats.clone(),
+                        )
+                        .await?;
+                    Some(rx)
+                }
+                TunnelMode::Direct => {
+                    self.start_native_direct_tunnel(
+                        &config, tunnel_id, cancel.clone(), state_tx, udp_stats.clone(),
                     )
                     .await?;
-                Some(rx)
-            }
-            TunnelMode::Direct => {
-                self.start_direct_tunnel(
-                    &config, tunnel_id, cancel.clone(), state_tx,
-                    udp_stats.clone(), tcp_stats.clone(),
-                ).await?;
-                None
-            }
+                    None
+                }
+            },
+            // Legacy QUIC carrier (unchanged).
+            TunnelTransport::Quic => match config.mode {
+                TunnelMode::Relay => {
+                    let rx = self
+                        .start_relay_tunnel(
+                            &config, tunnel_id, cancel.clone(), state_tx,
+                            udp_stats.clone(), tcp_stats.clone(),
+                        )
+                        .await?;
+                    Some(rx)
+                }
+                TunnelMode::Direct => {
+                    self.start_direct_tunnel(
+                        &config, tunnel_id, cancel.clone(), state_tx,
+                        udp_stats.clone(), tcp_stats.clone(),
+                    ).await?;
+                    None
+                }
+            },
         };
 
         let tunnel_name = config.name.clone();
@@ -397,6 +419,182 @@ impl TunnelManager {
             #[allow(unreachable_code)]
             {
                 let _ = tunnels;
+            }
+        });
+
+        Ok(())
+    }
+
+    /// Start a native plain-UDP **relay** tunnel (no QUIC) — SRT/RIST over relay.
+    async fn start_native_relay_tunnel(
+        &self,
+        config: &TunnelConfig,
+        tunnel_id: Uuid,
+        cancel: CancellationToken,
+        state_tx: watch::Sender<RelayTunnelState>,
+        udp_stats: Option<Arc<UdpForwarderStats>>,
+    ) -> anyhow::Result<watch::Receiver<usize>> {
+        let relay_addrs: Vec<String> = config
+            .effective_relays()
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        if relay_addrs.is_empty() {
+            anyhow::bail!("at least one relay address required for native-UDP relay mode");
+        }
+        let local_addr: SocketAddr = config
+            .local_addr
+            .parse()
+            .map_err(|e| anyhow::anyhow!("Invalid local_addr: {e}"))?;
+
+        // Native relay carries no QUIC TLS — the AEAD is the only confidentiality
+        // layer, so the encryption key is mandatory (enforced by validation).
+        let key = config.tunnel_encryption_key.as_deref().ok_or_else(|| {
+            anyhow::anyhow!("tunnel_encryption_key is required for native-UDP relay mode")
+        })?;
+        let cipher = Some(Arc::new(
+            super::crypto::TunnelCipher::new(key)
+                .map_err(|e| anyhow::anyhow!("Failed to create tunnel cipher: {e}"))?,
+        ));
+
+        let params = NativeRelayParams {
+            tunnel_id,
+            relay_addrs,
+            direction: config.direction,
+            tunnel_bind_secret: config.tunnel_bind_secret.clone(),
+        };
+        let stats = udp_stats.unwrap_or_else(|| Arc::new(UdpForwarderStats::default()));
+        let (active_idx_tx, active_idx_rx) = watch::channel(0usize);
+
+        let config_id = config.id.clone();
+        let config_name = config.name.clone();
+        let tunnels = self.tunnels.clone();
+        let event_sender = self.event_sender.clone();
+
+        tokio::spawn(async move {
+            let result = udp_relay_client::run_native_relay_tunnel(
+                params,
+                local_addr,
+                state_tx,
+                active_idx_tx,
+                cancel.clone(),
+                stats,
+                cipher,
+                event_sender.clone(),
+            )
+            .await;
+
+            if let Err(e) = result {
+                if !cancel.is_cancelled() {
+                    tracing::error!(tunnel_id = %config_id, "Native-UDP relay tunnel failed: {e}");
+                    event_sender.emit_flow_with_details(
+                        EventSeverity::Critical,
+                        category::TUNNEL,
+                        format!("Tunnel '{}' failed: {e}", config_name),
+                        &config_id,
+                        serde_json::json!({ "tunnel_name": config_name, "transport": "udp" }),
+                    );
+                    tunnels.remove(&config_id);
+                }
+            }
+        });
+
+        Ok(active_idx_rx)
+    }
+
+    /// Start a native plain-UDP **direct** tunnel (no QUIC) — peer-to-peer.
+    async fn start_native_direct_tunnel(
+        &self,
+        config: &TunnelConfig,
+        tunnel_id: Uuid,
+        cancel: CancellationToken,
+        state_tx: watch::Sender<RelayTunnelState>,
+        udp_stats: Option<Arc<UdpForwarderStats>>,
+    ) -> anyhow::Result<()> {
+        let local_addr: SocketAddr = config
+            .local_addr
+            .parse()
+            .map_err(|e| anyhow::anyhow!("Invalid local_addr: {e}"))?;
+        let tunnel_psk = config
+            .tunnel_psk
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("tunnel_psk required for direct mode"))?;
+        // Direct mode: encryption optional (defense-in-depth) — but recommended.
+        let cipher = match config.tunnel_encryption_key.as_deref() {
+            Some(key) => Some(Arc::new(
+                super::crypto::TunnelCipher::new(key)
+                    .map_err(|e| anyhow::anyhow!("Failed to create tunnel cipher: {e}"))?,
+            )),
+            None => None,
+        };
+
+        let direction = config.direction;
+        let peer_addr = config.peer_addr.clone();
+        let direct_listen_addr = config.direct_listen_addr.clone();
+        let stats = udp_stats.unwrap_or_else(|| Arc::new(UdpForwarderStats::default()));
+        let config_id = config.id.clone();
+        let config_name = config.name.clone();
+        let tunnels = self.tunnels.clone();
+        let event_sender = self.event_sender.clone();
+
+        tokio::spawn(async move {
+            let mut attempt: u32 = 0;
+            let max_delay = std::time::Duration::from_secs(30);
+            loop {
+                if cancel.is_cancelled() {
+                    return;
+                }
+                let result = udp_relay_client::run_native_direct_tunnel(
+                    tunnel_id,
+                    direction,
+                    local_addr,
+                    peer_addr.clone(),
+                    direct_listen_addr.clone(),
+                    tunnel_psk.clone(),
+                    state_tx.clone(),
+                    cancel.clone(),
+                    stats.clone(),
+                    cipher.clone(),
+                )
+                .await;
+
+                if cancel.is_cancelled() {
+                    return;
+                }
+                match result {
+                    Ok(()) => attempt = 0,
+                    Err(e) => {
+                        if crate::util::port_error::anyhow_is_addr_in_use(&e) {
+                            tracing::error!(tunnel_id = %tunnel_id, "Native-UDP direct tunnel port conflict: {e}");
+                            event_sender.emit_flow_with_details(
+                                EventSeverity::Critical,
+                                category::PORT_CONFLICT,
+                                format!("Tunnel '{}' stopped: {e}", config_name),
+                                &config_id,
+                                serde_json::json!({
+                                    "error_code": "port_conflict",
+                                    "component": format!("Tunnel '{}'", config_name),
+                                    "tunnel_name": config_name,
+                                    "transport": "udp",
+                                    "error": e.to_string(),
+                                }),
+                            );
+                            tunnels.remove(&config_id);
+                            return;
+                        }
+                        tracing::warn!(tunnel_id = %tunnel_id, "Native-UDP direct attempt {} failed: {e}", attempt + 1);
+                        attempt = attempt.saturating_add(1);
+                    }
+                }
+
+                let delay = std::cmp::min(
+                    std::time::Duration::from_millis(500 * 2u64.pow(attempt.min(6))),
+                    max_delay,
+                );
+                tokio::select! {
+                    _ = cancel.cancelled() => return,
+                    _ = tokio::time::sleep(delay) => {}
+                }
             }
         });
 
@@ -888,11 +1086,29 @@ async fn run_forwarder(
     match (protocol, direction) {
         (TunnelProtocol::Udp, TunnelDirection::Egress) => {
             let stats = udp_stats.unwrap_or_else(|| Arc::new(UdpForwarderStats::default()));
-            udp_forwarder::run_egress(tunnel_id, local_addr, conn, stats, cancel, cipher).await?;
+            // Wrap the QUIC connection as a DatagramLink; the native-UDP path
+            // (transport=udp) uses a PlainUdpLink instead — see udp_relay_client.
+            udp_forwarder::run_egress(
+                tunnel_id,
+                local_addr,
+                udp_forwarder::QuicLink(conn),
+                stats,
+                cancel,
+                cipher,
+            )
+            .await?;
         }
         (TunnelProtocol::Udp, TunnelDirection::Ingress) => {
             let stats = udp_stats.unwrap_or_else(|| Arc::new(UdpForwarderStats::default()));
-            udp_forwarder::run_ingress(tunnel_id, local_addr, conn, stats, cancel, cipher).await?;
+            udp_forwarder::run_ingress(
+                tunnel_id,
+                local_addr,
+                udp_forwarder::QuicLink(conn),
+                stats,
+                cancel,
+                cipher,
+            )
+            .await?;
         }
         (TunnelProtocol::Tcp, TunnelDirection::Egress) => {
             let stats = tcp_stats.unwrap_or_else(|| Arc::new(TcpForwarderStats::default()));

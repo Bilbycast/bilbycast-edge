@@ -18,6 +18,15 @@ pub struct TunnelConfig {
 
     /// Transport protocol for tunneled data.
     pub protocol: TunnelProtocol,
+    /// Outer transport carrying the tunnel.
+    ///
+    /// - [`TunnelTransport::Quic`] (default, back-compat): the legacy QUIC carrier —
+    ///   TCP rides QUIC streams, UDP rides QUIC datagrams. Unchanged behaviour.
+    /// - [`TunnelTransport::Udp`]: a plain-UDP carrier (no QUIC) for native SRT/RIST,
+    ///   avoiding QUIC's per-packet overhead and its congestion control fighting
+    ///   SRT/RIST's own ARQ. Only valid with `protocol = udp`.
+    #[serde(default)]
+    pub transport: TunnelTransport,
     /// Tunnel connectivity mode.
     pub mode: TunnelMode,
     /// This edge's role in the tunnel.
@@ -160,6 +169,19 @@ pub enum TunnelProtocol {
     Udp,
 }
 
+/// Outer transport carrying the tunnel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum TunnelTransport {
+    /// QUIC carrier (legacy default). TCP → QUIC streams, UDP → QUIC datagrams.
+    #[default]
+    #[serde(rename = "quic")]
+    Quic,
+    /// Plain-UDP carrier (no QUIC). For native SRT/RIST over relay / direct — avoids
+    /// QUIC overhead + double congestion control. Only valid with `protocol = udp`.
+    #[serde(rename = "udp")]
+    Udp,
+}
+
 /// Tunnel connectivity mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TunnelMode {
@@ -186,6 +208,15 @@ impl std::fmt::Display for TunnelProtocol {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Tcp => write!(f, "tcp"),
+            Self::Udp => write!(f, "udp"),
+        }
+    }
+}
+
+impl std::fmt::Display for TunnelTransport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Quic => write!(f, "quic"),
             Self::Udp => write!(f, "udp"),
         }
     }
@@ -219,6 +250,7 @@ mod tests {
             name: "t".to_string(),
             enabled: true,
             protocol: TunnelProtocol::Udp,
+            transport: TunnelTransport::Quic,
             mode: TunnelMode::Relay,
             direction: TunnelDirection::Ingress,
             local_addr: "127.0.0.1:9000".to_string(),

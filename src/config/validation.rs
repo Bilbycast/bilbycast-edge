@@ -6692,6 +6692,18 @@ pub fn validate_tunnel(tunnel: &crate::tunnel::TunnelConfig) -> Result<()> {
     // Validate local address
     validate_socket_addr(&tunnel.local_addr, "Tunnel local_addr")?;
 
+    // The native plain-UDP transport (no QUIC) only carries UDP media
+    // (SRT/RIST). TCP tunnels require QUIC's reliable streams.
+    if tunnel.transport == crate::tunnel::config::TunnelTransport::Udp
+        && tunnel.protocol != crate::tunnel::config::TunnelProtocol::Udp
+    {
+        bail!(
+            "Tunnel '{}': transport=udp (native, no QUIC) requires protocol=udp — \
+             TCP tunnels must use the QUIC transport",
+            tunnel.id
+        );
+    }
+
     // Mode-specific validation
     match tunnel.mode {
         crate::tunnel::config::TunnelMode::Relay => {
@@ -10299,6 +10311,7 @@ mod tests {
             name: name.to_string(),
             enabled: true,
             protocol,
+            transport: crate::tunnel::config::TunnelTransport::Quic,
             mode: crate::tunnel::config::TunnelMode::Relay,
             direction,
             local_addr: local_addr.to_string(),

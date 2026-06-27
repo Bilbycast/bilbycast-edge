@@ -1246,6 +1246,12 @@ fn edge_capabilities() -> Vec<&'static str> {
         // capable edges. The bit exists so a future manager can gate
         // NEW bonding sub-features (introduced alongside it) cleanly.
         "bonding",
+        // Native plain-UDP tunnel transport (no QUIC): `TunnelConfig.transport
+        // = "udp"` carries SRT/RIST over the relay's UDP rendezvous plane (or
+        // direct) without QUIC's overhead / second congestion controller.
+        // Manager UI gates the "Native (no QUIC)" relay option on this so it's
+        // never pushed to an older edge that would reject the transport.
+        "native-udp-tunnel",
     ];
     // Strict mode (`SO_BINDTODEVICE`) requires `CAP_NET_RAW`. Probed
     // once at startup; advertised only when the setsockopt actually

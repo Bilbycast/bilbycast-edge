@@ -766,6 +766,7 @@ mod tests {
                 name: "Test Tunnel".to_string(),
                 enabled: true,
                 protocol: crate::tunnel::config::TunnelProtocol::Udp,
+                transport: crate::tunnel::config::TunnelTransport::Quic,
                 mode: crate::tunnel::config::TunnelMode::Relay,
                 direction: crate::tunnel::config::TunnelDirection::Ingress,
                 local_addr: "127.0.0.1:9000".to_string(),

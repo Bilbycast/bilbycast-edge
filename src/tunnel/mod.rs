@@ -36,5 +36,6 @@ pub mod quic;
 pub mod relay_client;
 pub mod tcp_forwarder;
 pub mod udp_forwarder;
+pub mod udp_relay_client;
 
 pub use config::*;

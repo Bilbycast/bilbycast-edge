@@ -9,8 +9,9 @@
 //! When a `TunnelCipher` is provided, all payloads are encrypted end-to-end
 //! before being sent through the relay. The relay sees only ciphertext.
 
+use std::future::Future;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::sync::atomic::{AtomicU16, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -21,13 +22,116 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use super::crypto::TunnelCipher;
-use super::protocol;
+use super::protocol::{self, try_decode_udp_control, UdpRelayControl};
+
+/// A bidirectional datagram carrier the UDP forwarder rides.
+///
+/// Each datagram is already framed (`[16-byte tunnel_id][AEAD payload]` via
+/// [`protocol::encode_udp_datagram`]). This trait lets [`run_egress`] /
+/// [`run_ingress`] work over either the legacy QUIC carrier ([`QuicLink`]) or
+/// the native plain-UDP carrier ([`PlainUdpLink`]) with one implementation —
+/// the encrypt / frame / `AtomicPeerAddr` / stats logic is transport-agnostic.
+pub trait DatagramLink: Send + Sync {
+    /// Send one framed datagram. Best-effort: a full buffer is dropped (not an
+    /// error) just like QUIC datagrams — media transports own their own recovery.
+    fn send_datagram(&self, data: Bytes) -> Result<()>;
+    /// Receive the next inbound framed media datagram. Control datagrams (the
+    /// nil-UUID-prefixed [`UdpRelayControl`]) are consumed internally and never
+    /// surface here.
+    fn recv_datagram(&self) -> impl Future<Output = Result<Bytes>> + Send;
+}
+
+/// QUIC carrier — the legacy tunnel data plane. Thin wrapper over a
+/// [`quinn::Connection`] so it satisfies [`DatagramLink`].
+pub struct QuicLink(pub Connection);
+
+impl DatagramLink for QuicLink {
+    fn send_datagram(&self, data: Bytes) -> Result<()> {
+        self.0
+            .send_datagram(data)
+            .map_err(|e| anyhow::anyhow!("quic datagram send: {e}"))
+    }
+
+    fn recv_datagram(&self) -> impl Future<Output = Result<Bytes>> + Send {
+        async move {
+            self.0
+                .read_datagram()
+                .await
+                .map_err(|e| anyhow::anyhow!("quic datagram recv: {e}"))
+        }
+    }
+}
+
+/// Plain-UDP carrier — native SRT/RIST over relay / direct without QUIC.
+///
+/// Wraps a `UdpSocket` *connected* to the relay (or direct peer), so the same
+/// 5-tuple carries both the registration/keepalive control datagrams (sent by a
+/// sibling task — see `udp_relay_client`) and the media. `recv_datagram` peels
+/// off control acks (updating liveness state used for failover) and returns
+/// only media.
+pub struct PlainUdpLink {
+    sock: Arc<UdpSocket>,
+    /// Set true once the relay/peer acks with both sides latched.
+    pub ready: Arc<AtomicBool>,
+    /// Epoch-ms of the last control ack (0 = none). Drives relay-liveness /
+    /// failover decisions in the register task.
+    pub last_ack_ms: Arc<AtomicU64>,
+}
+
+impl PlainUdpLink {
+    pub fn new(sock: Arc<UdpSocket>) -> Self {
+        Self {
+            sock,
+            ready: Arc::new(AtomicBool::new(false)),
+            last_ack_ms: Arc::new(AtomicU64::new(0)),
+        }
+    }
+}
+
+/// Wall-clock epoch in milliseconds (saturating to 0 before 1970).
+pub(crate) fn now_epoch_ms() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+impl DatagramLink for PlainUdpLink {
+    fn send_datagram(&self, data: Bytes) -> Result<()> {
+        match self.sock.try_send(&data) {
+            Ok(_) => Ok(()),
+            // Buffer full → drop, matching QUIC datagram best-effort semantics.
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(()),
+            Err(e) => Err(anyhow::anyhow!("udp datagram send: {e}")),
+        }
+    }
+
+    fn recv_datagram(&self) -> impl Future<Output = Result<Bytes>> + Send {
+        async move {
+            let mut buf = vec![0u8; 2048];
+            loop {
+                let n = self.sock.recv(&mut buf).await?;
+                let data = &buf[..n];
+                // Control plane (acks) → update liveness, keep looping for media.
+                if let Some(ctrl) = try_decode_udp_control(data) {
+                    if let UdpRelayControl::Ack { ready, .. } = ctrl {
+                        self.ready.store(ready, Ordering::Relaxed);
+                        self.last_ack_ms.store(now_epoch_ms(), Ordering::Relaxed);
+                    }
+                    continue;
+                }
+                return Ok(Bytes::copy_from_slice(data));
+            }
+        }
+    }
+}
 
 /// Lock-free peer address cache using atomics.
 ///
 /// Stores a `SocketAddr` (IPv4 or IPv6) as atomic fields so the UDP forwarder
 /// can update and read the peer address on every packet without locking.
-struct AtomicPeerAddr {
+pub struct AtomicPeerAddr {
     /// 0 = unset, 4 = IPv4, 6 = IPv6
     family: AtomicU8,
     /// IPv4: 4 bytes in network order stored in low 32 bits.
@@ -38,7 +142,7 @@ struct AtomicPeerAddr {
 }
 
 impl AtomicPeerAddr {
-    fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             family: AtomicU8::new(0),
             ip_high: AtomicU64::new(0),
@@ -47,7 +151,7 @@ impl AtomicPeerAddr {
         }
     }
 
-    fn store(&self, addr: SocketAddr) {
+    pub fn store(&self, addr: SocketAddr) {
         match addr.ip() {
             IpAddr::V4(v4) => {
                 let bits = u32::from(v4) as u64;
@@ -69,7 +173,7 @@ impl AtomicPeerAddr {
         }
     }
 
-    fn load(&self) -> Option<SocketAddr> {
+    pub fn load(&self) -> Option<SocketAddr> {
         let fam = self.family.load(Ordering::Acquire);
         if fam == 0 {
             return None;
@@ -104,10 +208,10 @@ pub struct UdpForwarderStats {
 /// Egress: listen on `local_addr` for UDP packets from local applications,
 /// wrap each in a QUIC datagram with tunnel_id prefix, and send to the relay/peer.
 /// Also receive QUIC datagrams from relay/peer and forward to the last-seen local sender.
-pub async fn run_egress(
+pub async fn run_egress<L: DatagramLink>(
     tunnel_id: Uuid,
     local_addr: SocketAddr,
-    conn: Connection,
+    link: L,
     stats: Arc<UdpForwarderStats>,
     cancel: CancellationToken,
     cipher: Option<Arc<TunnelCipher>>,
@@ -148,20 +252,20 @@ pub async fn run_egress(
                     buf[..len].to_vec()
                 };
                 let datagram = protocol::encode_udp_datagram(&tunnel_id, &payload);
-                match conn.send_datagram(Bytes::from(datagram)) {
+                match link.send_datagram(Bytes::from(datagram)) {
                     Ok(()) => {
                         stats.packets_sent.fetch_add(1, Ordering::Relaxed);
                         stats.bytes_sent.fetch_add(len as u64, Ordering::Relaxed);
                     }
                     Err(e) => {
                         stats.send_errors.fetch_add(1, Ordering::Relaxed);
-                        tracing::debug!(tunnel_id = %tunnel_id, "QUIC datagram send error: {e}");
+                        tracing::debug!(tunnel_id = %tunnel_id, "tunnel datagram send error: {e}");
                     }
                 }
             }
 
-            // QUIC → Local: receive QUIC datagram, decrypt, forward to last-seen local sender
-            result = conn.read_datagram() => {
+            // Carrier → Local: receive a framed datagram, decrypt, forward to last-seen local sender
+            result = link.recv_datagram() => {
                 let datagram = result?;
                 if let Some((_tid, encrypted_payload)) = protocol::decode_udp_datagram(&datagram) {
                     let payload = if let Some(ref c) = cipher {
@@ -198,10 +302,10 @@ pub async fn run_egress(
 /// Ingress: receive QUIC datagrams from relay/peer, decrypt the payload,
 /// and forward to `forward_addr`. Also listen for return UDP traffic and
 /// send it back through the QUIC connection.
-pub async fn run_ingress(
+pub async fn run_ingress<L: DatagramLink>(
     tunnel_id: Uuid,
     forward_addr: SocketAddr,
-    conn: Connection,
+    link: L,
     stats: Arc<UdpForwarderStats>,
     cancel: CancellationToken,
     cipher: Option<Arc<TunnelCipher>>,
@@ -221,8 +325,8 @@ pub async fn run_ingress(
 
     loop {
         tokio::select! {
-            // QUIC → Local: receive datagram from relay, decrypt, forward to local app
-            result = conn.read_datagram() => {
+            // Carrier → Local: receive a framed datagram, decrypt, forward to local app
+            result = link.recv_datagram() => {
                 let datagram = result?;
                 if let Some((_tid, encrypted_payload)) = protocol::decode_udp_datagram(&datagram) {
                     let payload = if let Some(ref c) = cipher {
@@ -242,7 +346,7 @@ pub async fn run_ingress(
                 }
             }
 
-            // Local → QUIC: receive return traffic from local app, encrypt, send back
+            // Local → Carrier: receive return traffic from local app, encrypt, send back
             result = socket.recv_from(&mut buf) => {
                 let (len, _from_addr) = result?;
                 let payload = if let Some(ref c) = cipher {
@@ -258,14 +362,14 @@ pub async fn run_ingress(
                     buf[..len].to_vec()
                 };
                 let datagram = protocol::encode_udp_datagram(&tunnel_id, &payload);
-                match conn.send_datagram(Bytes::from(datagram)) {
+                match link.send_datagram(Bytes::from(datagram)) {
                     Ok(()) => {
                         stats.packets_sent.fetch_add(1, Ordering::Relaxed);
                         stats.bytes_sent.fetch_add(len as u64, Ordering::Relaxed);
                     }
                     Err(e) => {
                         stats.send_errors.fetch_add(1, Ordering::Relaxed);
-                        tracing::debug!(tunnel_id = %tunnel_id, "QUIC datagram send error: {e}");
+                        tracing::debug!(tunnel_id = %tunnel_id, "tunnel datagram send error: {e}");
                     }
                 }
             }
