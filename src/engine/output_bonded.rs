@@ -587,7 +587,7 @@ async fn bonded_output_run(
                 .congestion
                 .as_ref()
                 .map(build_congestion)
-                .unwrap_or_default();
+                .unwrap_or_else(edge_default_congestion);
             // Equalization latency budget (top-level output knob, not a
             // congestion sub-field): the sender-side un-equalizable demote.
             if let Some(ms) = config.max_bonding_latency_ms {
@@ -1044,8 +1044,23 @@ fn build_redundancy(c: &Option<BondRedundancyConfig>) -> RedundancyPolicy {
     }
 }
 
+/// The edge's baseline congestion tuning. Differs from the library default
+/// in ONE field: `delay_inflation_auto` is ON. The edge's headline bond is a
+/// heterogeneous cellular + satellite contribution bond, where a leg's RTT
+/// baseline (5G ~100 ms, Starlink ~600 ms) is far above the fixed 40 ms
+/// `delay_inflation` floor; auto-deriving the queue-building threshold from
+/// each leg's own windowed baseline stops normal radio jitter from reading as
+/// congestion (a terrestrial low-RTT leg still keeps the tight 40 ms floor).
+/// An operator can still force it off with `delay_inflation_auto: false`.
+fn edge_default_congestion() -> CongestionConfig {
+    CongestionConfig {
+        delay_inflation_auto: true,
+        ..CongestionConfig::default()
+    }
+}
+
 fn build_congestion(c: &BondCongestionConfig) -> CongestionConfig {
-    let mut cc = CongestionConfig::default();
+    let mut cc = edge_default_congestion();
     if let Some(v) = c.min_rate_kbps {
         cc.min_rate_bps = v as u64 * 1000;
     }
@@ -1165,6 +1180,18 @@ mod bonded_output_tests {
         assert_eq!(cc.min_rate_bps, 1_200_000, "kbps → bps ×1000");
         assert_eq!(cc.delay_inflation, std::time::Duration::from_millis(250));
         assert!((cc.loss_high - 0.06).abs() < 1e-6, "pct → fraction");
+        // Edge default: auto delay threshold ON (heterogeneous cellular+sat
+        // bond) unless the operator explicitly turns it off.
+        assert!(cc.delay_inflation_auto, "edge default enables delay_inflation_auto");
+        assert!(
+            edge_default_congestion().delay_inflation_auto,
+            "edge_default_congestion() base enables delay_inflation_auto"
+        );
+        let off = build_congestion(&crate::config::models::BondCongestionConfig {
+            delay_inflation_auto: Some(false),
+            ..Default::default()
+        });
+        assert!(!off.delay_inflation_auto, "operator can still force it off");
     }
 
     #[test]
