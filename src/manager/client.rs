@@ -1252,6 +1252,15 @@ fn edge_capabilities() -> Vec<&'static str> {
         // Manager UI gates the "Native (no QUIC)" relay option on this so it's
         // never pushed to an older edge that would reject the transport.
         "native-udp-tunnel",
+        // Per-tunnel uplink (NIC) pinning on the native plain-UDP carrier:
+        // `TunnelConfig.{interface, source, gateway}` send each tunnel out a
+        // specific interface / source IP / gateway — same SO_BINDTODEVICE +
+        // policy-route mechanism as a bonded UDP leg. Lets a path-aggregation
+        // bond carried over per-leg tunnels use a distinct uplink (5G vs
+        // Starlink vs ISP) per leg instead of collapsing onto the default
+        // route. Manager UI gates the per-tunnel uplink picker on this so the
+        // fields are never pushed to an older edge that would ignore them.
+        "tunnel-nic-pin",
     ];
     // Strict mode (`SO_BINDTODEVICE`) requires `CAP_NET_RAW`. Probed
     // once at startup; advertised only when the setsockopt actually

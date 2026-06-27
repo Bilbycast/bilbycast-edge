@@ -101,6 +101,40 @@ pub struct TunnelConfig {
     /// TLS key PEM for direct mode listener (auto-generated if absent).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tls_key_pem: Option<String>,
+
+    // ── Per-tunnel uplink (NIC) pinning ──
+    //
+    // Only honoured on the native plain-UDP carrier (`transport = udp`).
+    // Same semantics as a bonded UDP leg (`BondPathTransportConfig::Udp`),
+    // so a path-aggregation bond carried over per-leg tunnels can send each
+    // tunnel out its own uplink (5G vs Starlink vs ISP). On the QUIC carrier
+    // these fields are ignored (validation only accepts them on udp).
+    /// Optional NIC pin (e.g. `"eth0"`, `"wwan0"`). Applies
+    /// `setsockopt(SO_BINDTODEVICE, name)` before bind so this tunnel's UDP
+    /// socket egresses on a specific interface regardless of the routing
+    /// table. Without it, multiple tunnels sharing a destination typically
+    /// collapse onto the kernel default route (useless for bonding). Strict
+    /// kernel pin — requires `CAP_NET_RAW`.
+    ///
+    /// This is **interface-mode** path selection. For the dumb-switch /
+    /// single-NIC topology use `gateway` instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interface: Option<String>,
+    /// Source address (`ip` or `ip/prefix`, e.g. `192.168.10.2/24`) this
+    /// tunnel's UDP socket binds to. On its own it pins the egress source
+    /// IP; in `gateway` mode it also keys the policy rule. Parsed by
+    /// `engine::bond_routing::SourceNet::parse`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    /// **Gateway-mode** path selection. The router / next-hop this tunnel
+    /// egresses through. The edge programs a dedicated policy route
+    /// (`ip rule from <source> → table → default via <gateway>`) via
+    /// netlink, so several tunnels on one NIC each go out their own router.
+    /// Requires `source` (and `interface`). Best-effort: if the host
+    /// already has policy routing the program step logs a warning and
+    /// continues. See `docs/bonding-gateway-routing.md`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gateway: Option<String>,
 }
 
 fn default_true() -> bool {
@@ -264,7 +298,31 @@ mod tests {
             tunnel_psk: None,
             tls_cert_pem: None,
             tls_key_pem: None,
+            interface: None,
+            source: None,
+            gateway: None,
         }
+    }
+
+    #[test]
+    fn nic_pin_fields_default_to_none_and_round_trip() {
+        let t = make_relay_tunnel();
+        assert!(t.interface.is_none());
+        assert!(t.source.is_none());
+        assert!(t.gateway.is_none());
+        // Omitted on serialize (skip_serializing_if), accepted on deserialize.
+        let json = serde_json::to_string(&t).unwrap();
+        assert!(!json.contains("interface"), "json={json}");
+        assert!(!json.contains("gateway"), "json={json}");
+        let mut pinned = make_relay_tunnel();
+        pinned.interface = Some("eth0".to_string());
+        pinned.source = Some("192.168.10.2/24".to_string());
+        pinned.gateway = Some("192.168.10.1".to_string());
+        let back: TunnelConfig =
+            serde_json::from_str(&serde_json::to_string(&pinned).unwrap()).unwrap();
+        assert_eq!(back.interface.as_deref(), Some("eth0"));
+        assert_eq!(back.source.as_deref(), Some("192.168.10.2/24"));
+        assert_eq!(back.gateway.as_deref(), Some("192.168.10.1"));
     }
 
     #[test]

@@ -6815,6 +6815,81 @@ pub fn validate_tunnel(tunnel: &crate::tunnel::TunnelConfig) -> Result<()> {
         validate_socket_addr(addr, &format!("Tunnel '{}' direct_listen_addr", tunnel.id))?;
     }
 
+    // ── Per-tunnel uplink (NIC) pinning ──────────────────────────────────
+    // Honoured only on the native plain-UDP carrier — the QUIC carrier has no
+    // per-socket pin, so accepting these there would be a silent no-op.
+    let has_pin =
+        tunnel.interface.is_some() || tunnel.source.is_some() || tunnel.gateway.is_some();
+    if has_pin && tunnel.transport != crate::tunnel::config::TunnelTransport::Udp {
+        bail!(
+            "Tunnel '{}': interface/source/gateway uplink pinning is only supported on \
+             transport=udp (the native plain-UDP carrier); the QUIC carrier has no per-socket pin",
+            tunnel.id
+        );
+    }
+    // A direct ingress (listener) tunnel never applies the pin: the Ingress arm
+    // of run_native_direct_tunnel binds a listener on the host default route, so
+    // a pin here would be a silent no-op. Reject it loudly. Relay mode (both
+    // directions) and direct egress DO apply the pin, so leave those untouched.
+    if has_pin
+        && tunnel.mode == crate::tunnel::config::TunnelMode::Direct
+        && tunnel.direction == crate::tunnel::config::TunnelDirection::Ingress
+    {
+        bail!(
+            "Tunnel '{}': interface/source/gateway are not honoured on a direct ingress (listener) \
+             tunnel — the listener uses the host default route; pin the egress/source side instead",
+            tunnel.id
+        );
+    }
+    // Mirror the bonded UDP leg rules (BondPathTransportConfig::Udp).
+    if let Some(iface) = &tunnel.interface {
+        // IFNAMSIZ is 16 on Linux (15 chars + NUL). Portable limit so configs
+        // validate identically on every platform.
+        if iface.is_empty() || iface.len() > 15 {
+            bail!("Tunnel '{}': interface name must be 1..=15 chars", tunnel.id);
+        }
+        if iface.contains('\0') {
+            bail!("Tunnel '{}': interface must not contain NUL", tunnel.id);
+        }
+    }
+    if let Some(gw) = &tunnel.gateway {
+        let gw_ip: std::net::IpAddr = gw
+            .parse()
+            .map_err(|_| anyhow::anyhow!("Tunnel '{}': invalid gateway IP '{gw}'", tunnel.id))?;
+        let src = tunnel.source.as_deref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "Tunnel '{}': `gateway` mode requires `source` (this box's address in the \
+                 gateway's subnet, e.g. 192.168.10.2/24)",
+                tunnel.id
+            )
+        })?;
+        let src_net = crate::engine::bond_routing::SourceNet::parse(src)
+            .map_err(|e| anyhow::anyhow!("Tunnel '{}': {e}", tunnel.id))?;
+        if src_net.addr.is_ipv4() != gw_ip.is_ipv4() {
+            bail!(
+                "Tunnel '{}': gateway and source must be the same IP family",
+                tunnel.id
+            );
+        }
+        if !same_subnet(src_net.addr, gw_ip, src_net.prefix) {
+            bail!(
+                "Tunnel '{}': gateway {gw} is not inside the source subnet {src}/{} — it would be unreachable",
+                tunnel.id,
+                src_net.prefix
+            );
+        }
+        if tunnel.interface.is_none() {
+            bail!(
+                "Tunnel '{}': `gateway` mode requires `interface` (the NIC the routers are reachable on)",
+                tunnel.id
+            );
+        }
+    } else if let Some(src) = &tunnel.source {
+        // Source-only: pins the egress source IP without policy routing. Must parse.
+        crate::engine::bond_routing::SourceNet::parse(src)
+            .map_err(|e| anyhow::anyhow!("Tunnel '{}': {e}", tunnel.id))?;
+    }
+
     Ok(())
 }
 
@@ -10325,6 +10400,9 @@ mod tests {
             tunnel_psk: None,
             tls_cert_pem: None,
             tls_key_pem: None,
+            interface: None,
+            source: None,
+            gateway: None,
         }
     }
 
@@ -10891,6 +10969,126 @@ mod tests {
         // encryption key required for relay mode
         t.tunnel_encryption_key = Some("a".repeat(64));
         t
+    }
+
+    /// A native plain-UDP relay tunnel — the only carrier that honours the
+    /// per-tunnel uplink (NIC) pinning fields.
+    fn make_native_udp_tunnel() -> crate::tunnel::TunnelConfig {
+        let mut t = make_dual_relay_tunnel(vec!["127.0.0.1:4433"]);
+        t.transport = crate::tunnel::config::TunnelTransport::Udp;
+        t
+    }
+
+    #[test]
+    fn tunnel_nic_pin_interface_only_ok() {
+        let mut t = make_native_udp_tunnel();
+        t.interface = Some("eth0".to_string());
+        validate_tunnel(&t).unwrap();
+    }
+
+    #[test]
+    fn tunnel_nic_pin_source_only_ok() {
+        let mut t = make_native_udp_tunnel();
+        t.source = Some("192.168.10.2/24".to_string());
+        validate_tunnel(&t).unwrap();
+    }
+
+    #[test]
+    fn tunnel_nic_pin_gateway_full_ok() {
+        let mut t = make_native_udp_tunnel();
+        t.interface = Some("eth0".to_string());
+        t.source = Some("192.168.10.2/24".to_string());
+        t.gateway = Some("192.168.10.1".to_string());
+        validate_tunnel(&t).unwrap();
+    }
+
+    #[test]
+    fn tunnel_nic_pin_gateway_requires_source() {
+        let mut t = make_native_udp_tunnel();
+        t.interface = Some("eth0".to_string());
+        t.gateway = Some("192.168.10.1".to_string());
+        let err = validate_tunnel(&t).unwrap_err().to_string();
+        assert!(err.contains("requires `source`"), "got: {err}");
+    }
+
+    #[test]
+    fn tunnel_nic_pin_gateway_requires_interface() {
+        let mut t = make_native_udp_tunnel();
+        t.source = Some("192.168.10.2/24".to_string());
+        t.gateway = Some("192.168.10.1".to_string());
+        let err = validate_tunnel(&t).unwrap_err().to_string();
+        assert!(err.contains("requires `interface`"), "got: {err}");
+    }
+
+    #[test]
+    fn tunnel_nic_pin_gateway_outside_subnet_rejected() {
+        let mut t = make_native_udp_tunnel();
+        t.interface = Some("eth0".to_string());
+        t.source = Some("192.168.10.2/24".to_string());
+        t.gateway = Some("10.0.0.1".to_string()); // not inside /24
+        let err = validate_tunnel(&t).unwrap_err().to_string();
+        assert!(err.contains("not inside the source subnet"), "got: {err}");
+    }
+
+    #[test]
+    fn tunnel_nic_pin_source_parse_rejected() {
+        let mut t = make_native_udp_tunnel();
+        t.source = Some("not-an-ip".to_string());
+        assert!(validate_tunnel(&t).is_err());
+    }
+
+    #[test]
+    fn tunnel_nic_pin_rejected_on_quic_transport() {
+        // transport stays Quic (the default from make_test_tunnel).
+        let mut t = make_dual_relay_tunnel(vec!["127.0.0.1:4433"]);
+        t.interface = Some("eth0".to_string());
+        let err = validate_tunnel(&t).unwrap_err().to_string();
+        assert!(err.contains("transport=udp"), "got: {err}");
+    }
+
+    #[test]
+    fn tunnel_nic_pin_rejected_on_direct_ingress() {
+        use crate::tunnel::config::{
+            TunnelDirection, TunnelMode, TunnelProtocol, TunnelTransport,
+        };
+        // A direct ingress (listener) tunnel never applies the pin — the Ingress
+        // arm binds on the host default route, so a pin would be a silent no-op.
+        let mut t = make_test_tunnel(
+            "direct-ingress",
+            "127.0.0.1:9000",
+            TunnelProtocol::Udp,
+            TunnelDirection::Ingress,
+        );
+        t.mode = TunnelMode::Direct;
+        t.transport = TunnelTransport::Udp; // past the transport=udp gate
+        t.relay_addrs = vec![];
+        t.direct_listen_addr = Some("0.0.0.0:9001".to_string());
+        t.source = Some("192.168.10.2/24".to_string());
+        let err = validate_tunnel(&t).unwrap_err().to_string();
+        assert!(
+            err.contains("direct ingress (listener) tunnel"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn tunnel_nic_pin_accepted_on_direct_egress() {
+        use crate::tunnel::config::{
+            TunnelDirection, TunnelMode, TunnelProtocol, TunnelTransport,
+        };
+        // Direct egress DOES apply the pin — must not be rejected.
+        let mut t = make_test_tunnel(
+            "direct-egress",
+            "127.0.0.1:9000",
+            TunnelProtocol::Udp,
+            TunnelDirection::Egress,
+        );
+        t.mode = TunnelMode::Direct;
+        t.transport = TunnelTransport::Udp;
+        t.relay_addrs = vec![];
+        t.peer_addr = Some("203.0.113.5:9001".to_string());
+        t.source = Some("192.168.10.2/24".to_string());
+        validate_tunnel(&t).unwrap();
     }
 
     #[test]

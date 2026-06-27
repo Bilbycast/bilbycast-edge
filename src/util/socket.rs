@@ -583,6 +583,73 @@ pub fn apply_strict_binding(_socket: &Socket, _name: &str) -> Result<()> {
     anyhow::bail!("interface_binding strict mode is only supported on Linux");
 }
 
+/// Pin a socket's egress to `iface`, preferring strict `SO_BINDTODEVICE`
+/// (needs `CAP_NET_RAW`) and **falling back to the unprivileged
+/// `IP_UNICAST_IF` / `IPV6_UNICAST_IF` egress hint** on `EPERM`/`EACCES`.
+/// Mirrors the bonded UDP leg's NIC pin
+/// (`bonding-transport::path::udp::bind_to_interface`) so a relayed bond
+/// leg's tunnel pins to its uplink **with or without the capability** — the
+/// edge process normally has neither cap, so the strict path alone would
+/// EPERM and collapse every leg onto the default route. Call BEFORE `bind()`.
+#[cfg(target_os = "linux")]
+pub fn apply_nic_pin(socket: &Socket, iface: &str, is_ipv6: bool) -> Result<()> {
+    match socket.bind_device(Some(iface.as_bytes())) {
+        Ok(()) => Ok(()),
+        Err(e) if matches!(e.raw_os_error(), Some(libc::EPERM) | Some(libc::EACCES)) => {
+            set_unicast_if(socket, iface, is_ipv6).with_context(|| {
+                format!("IP_UNICAST_IF({iface}) fallback after SO_BINDTODEVICE denied")
+            })?;
+            tracing::info!(
+                "tunnel NIC pin: SO_BINDTODEVICE('{iface}') denied (no CAP_NET_RAW); \
+                 using unprivileged IP_UNICAST_IF"
+            );
+            Ok(())
+        }
+        Err(e) => Err(anyhow::Error::from(e)).with_context(|| format!("SO_BINDTODEVICE({iface})")),
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn apply_nic_pin(_socket: &Socket, iface: &str, _is_ipv6: bool) -> Result<()> {
+    anyhow::bail!("NIC pinning (interface='{iface}') is not supported on this platform");
+}
+
+/// Unprivileged egress-interface hint via `IP_UNICAST_IF` (v4) /
+/// `IPV6_UNICAST_IF` (v6). The v4 option takes the ifindex in **network byte
+/// order** (kernel quirk); the v6 option takes it in host order. No
+/// capability required.
+#[cfg(target_os = "linux")]
+fn set_unicast_if(socket: &Socket, iface: &str, is_ipv6: bool) -> Result<()> {
+    use std::os::unix::io::AsRawFd;
+    let cname = std::ffi::CString::new(iface)
+        .with_context(|| format!("invalid interface name '{iface}' (NUL byte)"))?;
+    // SAFETY: cname is a valid NUL-terminated C string.
+    let idx = unsafe { libc::if_nametoindex(cname.as_ptr()) };
+    if idx == 0 {
+        anyhow::bail!("interface '{iface}' not found (if_nametoindex returned 0)");
+    }
+    let (level, optname, optval) = if is_ipv6 {
+        (libc::IPPROTO_IPV6, libc::IPV6_UNICAST_IF, idx as libc::c_int)
+    } else {
+        (libc::IPPROTO_IP, libc::IP_UNICAST_IF, idx.to_be() as libc::c_int)
+    };
+    // SAFETY: optval is a valid c_int and optlen matches its size.
+    let rc = unsafe {
+        libc::setsockopt(
+            socket.as_raw_fd(),
+            level,
+            optname,
+            &optval as *const libc::c_int as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        )
+    };
+    if rc != 0 {
+        return Err(anyhow::Error::from(std::io::Error::last_os_error()))
+            .with_context(|| format!("setsockopt IP_UNICAST_IF({iface})"));
+    }
+    Ok(())
+}
+
 /// SRT/RIST loose binding adapter.
 ///
 /// When `interface_binding` is set on an SRT/RIST surface, we resolve the

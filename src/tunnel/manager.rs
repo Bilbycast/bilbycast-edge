@@ -462,6 +462,9 @@ impl TunnelManager {
             relay_addrs,
             direction: config.direction,
             tunnel_bind_secret: config.tunnel_bind_secret.clone(),
+            interface: config.interface.clone(),
+            source: config.source.clone(),
+            gateway: config.gateway.clone(),
         };
         let stats = udp_stats.unwrap_or_else(|| Arc::new(UdpForwarderStats::default()));
         let (active_idx_tx, active_idx_rx) = watch::channel(0usize);
@@ -531,6 +534,9 @@ impl TunnelManager {
         let direction = config.direction;
         let peer_addr = config.peer_addr.clone();
         let direct_listen_addr = config.direct_listen_addr.clone();
+        let interface = config.interface.clone();
+        let source = config.source.clone();
+        let gateway = config.gateway.clone();
         let stats = udp_stats.unwrap_or_else(|| Arc::new(UdpForwarderStats::default()));
         let config_id = config.id.clone();
         let config_name = config.name.clone();
@@ -550,6 +556,9 @@ impl TunnelManager {
                     local_addr,
                     peer_addr.clone(),
                     direct_listen_addr.clone(),
+                    interface.clone(),
+                    source.clone(),
+                    gateway.clone(),
                     tunnel_psk.clone(),
                     state_tx.clone(),
                     cancel.clone(),

@@ -67,6 +67,18 @@ pub struct NativeRelayParams {
     pub relay_addrs: Vec<String>,
     pub direction: TunnelDirection,
     pub tunnel_bind_secret: Option<String>,
+    /// Optional NIC pin (SO_BINDTODEVICE) for the outbound relay socket —
+    /// same mechanism as a bonded UDP leg. `None` → kernel default route.
+    pub interface: Option<String>,
+    /// Optional source address (`ip` or `ip/prefix`) the outbound relay
+    /// socket binds to. On its own pins the egress source IP; in gateway
+    /// mode it also keys the policy rule.
+    pub source: Option<String>,
+    /// Optional gateway-mode next-hop. When set (requires `source` +
+    /// `interface`) the edge programs a `from <source>` policy route via
+    /// the gateway before the socket binds, so this tunnel egresses out a
+    /// specific uplink on a shared NIC.
+    pub gateway: Option<String>,
 }
 
 fn relay_direction(d: TunnelDirection) -> RelayDirection {
@@ -83,17 +95,119 @@ fn direction_str(d: TunnelDirection) -> &'static str {
     }
 }
 
-/// Bind an ephemeral UDP socket of the same address family as `remote` and
-/// `connect` it so it only sends to / receives from the relay/peer.
-async fn connect_socket(remote: SocketAddr) -> Result<Arc<UdpSocket>> {
-    let bind: SocketAddr = if remote.is_ipv6() {
-        "[::]:0".parse().unwrap()
+/// Bind a UDP socket of the same address family as `remote` and `connect`
+/// it so it only sends to / receives from the relay/peer.
+///
+/// Optionally NIC-pinned exactly like a bonded UDP leg: `interface` applies
+/// `setsockopt(SO_BINDTODEVICE)` BEFORE bind; `source` binds the egress
+/// source IP (port 0). With both `None` this is byte-for-byte the previous
+/// ephemeral `0.0.0.0:0` / `[::]:0` behaviour. Construction mirrors
+/// `util::socket::create_udp_output`.
+async fn connect_socket(
+    remote: SocketAddr,
+    interface: Option<&str>,
+    source: Option<&str>,
+) -> Result<Arc<UdpSocket>> {
+    use socket2::{Domain, Protocol, SockAddr, Socket, Type};
+
+    let domain = if remote.is_ipv6() {
+        Domain::IPV6
     } else {
-        "0.0.0.0:0".parse().unwrap()
+        Domain::IPV4
     };
-    let sock = UdpSocket::bind(bind).await?;
-    sock.connect(remote).await?;
+    let socket = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))?;
+    socket.set_nonblocking(true)?;
+    socket.set_reuse_address(true)?;
+
+    // NIC pin must precede bind. Prefer SO_BINDTODEVICE, fall back to the
+    // unprivileged IP_UNICAST_IF hint when the edge lacks CAP_NET_RAW (the
+    // normal case) — identical to how a bonded UDP leg pins its uplink.
+    if let Some(name) = interface {
+        crate::util::socket::apply_nic_pin(&socket, name, remote.is_ipv6())?;
+    }
+
+    // Bind the source IP (ephemeral port) when set, else the family wildcard.
+    let bind: SocketAddr = match source {
+        Some(src) => {
+            let net = crate::engine::bond_routing::SourceNet::parse(src)?;
+            SocketAddr::new(net.addr, 0)
+        }
+        None => {
+            if remote.is_ipv6() {
+                "[::]:0".parse().unwrap()
+            } else {
+                "0.0.0.0:0".parse().unwrap()
+            }
+        }
+    };
+    socket.bind(&SockAddr::from(bind))?;
+    // UDP connect performs no handshake — returns immediately on a
+    // non-blocking socket — so it just latches the default peer.
+    socket.connect(&SockAddr::from(remote))?;
+
+    let std_sock: std::net::UdpSocket = socket.into();
+    let sock = UdpSocket::from_std(std_sock)?;
     Ok(Arc::new(sock))
+}
+
+/// Best-effort gateway-mode policy-route programming for a native-UDP
+/// tunnel. Mirrors the bonded-output path: ensure the source address is on
+/// the NIC, install `default via <gateway>` in a private table, and a
+/// `from <source>` rule. The tunnel socket binds `source` so its packets
+/// match the rule. Returns `true` if a route was programmed (caller must
+/// tear it down on exit). On error logs a warning and returns `false` — the
+/// host may already have policy routing, so we never hard-fail the tunnel.
+///
+/// `path_id` is always `0` for a tunnel (one leg per tunnel); the
+/// `(tunnel_id, 0)` key namespaces it within `BondRouteManager`.
+async fn program_tunnel_gateway(
+    tunnel_id: &Uuid,
+    interface: &str,
+    source: &str,
+    gateway: &str,
+) -> bool {
+    let gw_ip: std::net::IpAddr = match gateway.parse() {
+        Ok(ip) => ip,
+        Err(_) => return false, // validation already rejected this
+    };
+    let src_net = match crate::engine::bond_routing::SourceNet::parse(source) {
+        Ok(n) => n,
+        Err(_) => return false,
+    };
+    let mgr = match crate::engine::bond_routing::BondRouteManager::global().await {
+        Ok(m) => m,
+        Err(e) => {
+            tracing::warn!(
+                %tunnel_id,
+                "native-UDP tunnel: gateway routing unavailable ({e}) — continuing without \
+                 policy route (host may already route {source} via {gateway})"
+            );
+            return false;
+        }
+    };
+    if let Err(e) = mgr
+        .program(&tunnel_id.to_string(), 0u8, interface, src_net, gw_ip)
+        .await
+    {
+        tracing::warn!(
+            %tunnel_id,
+            "native-UDP tunnel: failed to program gateway route ({source} via {gateway} dev \
+             {interface}): {e} — continuing (host may already route it)"
+        );
+        return false;
+    }
+    tracing::info!(
+        %tunnel_id,
+        "native-UDP tunnel: programmed gateway route {source} via {gateway} dev {interface}"
+    );
+    true
+}
+
+/// Tear down a tunnel's gateway-mode policy route. Best-effort, idempotent.
+async fn teardown_tunnel_gateway(tunnel_id: &Uuid) {
+    if let Ok(mgr) = crate::engine::bond_routing::BondRouteManager::global().await {
+        mgr.teardown(&tunnel_id.to_string(), 0u8).await;
+    }
 }
 
 /// Run a native plain-UDP **relay** tunnel: connect outbound to the relay,
@@ -122,10 +236,23 @@ pub async fn run_native_relay_tunnel(
         )
     });
 
+    // Gateway-mode policy routing (best-effort) BEFORE any socket binds the
+    // source IP. Tracked so we tear it down on every exit path below.
+    let gateway_programmed = match (
+        params.gateway.as_deref(),
+        params.source.as_deref(),
+        params.interface.as_deref(),
+    ) {
+        (Some(gw), Some(src), Some(iface)) => {
+            program_tunnel_gateway(&params.tunnel_id, iface, src, gw).await
+        }
+        _ => false,
+    };
+
     let mut idx = 0usize;
-    loop {
+    let outcome: Result<()> = 'outer: loop {
         if cancel.is_cancelled() {
-            return Ok(());
+            break 'outer Ok(());
         }
         let relay_addr = params.relay_addrs[idx % params.relay_addrs.len()].clone();
         let _ = active_idx_tx.send(idx % params.relay_addrs.len());
@@ -140,7 +267,13 @@ pub async fn run_native_relay_tunnel(
                 continue;
             }
         };
-        let sock = match connect_socket(resolved).await {
+        let sock = match connect_socket(
+            resolved,
+            params.interface.as_deref(),
+            params.source.as_deref(),
+        )
+        .await
+        {
             Ok(s) => s,
             Err(e) => {
                 tracing::warn!(tunnel_id = %params.tunnel_id, "native-UDP relay: bind/connect to {resolved} failed: {e}");
@@ -248,13 +381,18 @@ pub async fn run_native_relay_tunnel(
 
         state_tx.send_replace(RelayTunnelState::Down);
         if cancel.is_cancelled() {
-            return Ok(());
+            break 'outer Ok(());
         }
         if let Err(e) = fwd {
             tracing::debug!(tunnel_id = %params.tunnel_id, "native-UDP forwarder exited: {e}");
         }
         rotate_after(&cancel, &mut idx).await;
+    };
+
+    if gateway_programmed {
+        teardown_tunnel_gateway(&params.tunnel_id).await;
     }
+    outcome
 }
 
 /// Advance the relay index and sleep the retry delay (cancel-aware).
@@ -281,6 +419,9 @@ pub async fn run_native_direct_tunnel(
     local_addr: SocketAddr,
     peer_addr: Option<String>,
     direct_listen_addr: Option<String>,
+    interface: Option<String>,
+    source: Option<String>,
+    gateway: Option<String>,
     tunnel_psk: String,
     state_tx: watch::Sender<RelayTunnelState>,
     cancel: CancellationToken,
@@ -289,43 +430,64 @@ pub async fn run_native_direct_tunnel(
 ) -> Result<()> {
     match direction {
         TunnelDirection::Egress => {
-            let peer = peer_addr.ok_or_else(|| anyhow::anyhow!("peer_addr required for direct egress"))?;
-            let resolved = lookup_host(&peer)
-                .await?
-                .next()
-                .ok_or_else(|| anyhow::anyhow!("cannot resolve peer '{peer}'"))?;
-            let sock = connect_socket(resolved).await?;
-            let link = PlainUdpLink::new(sock.clone());
+            // Gateway-mode policy routing (best-effort) before the source bind.
+            // Tracked so it's torn down on every exit path of the egress run.
+            let gateway_programmed = match (
+                gateway.as_deref(),
+                source.as_deref(),
+                interface.as_deref(),
+            ) {
+                (Some(gw), Some(src), Some(iface)) => {
+                    program_tunnel_gateway(&tunnel_id, iface, src, gw).await
+                }
+                _ => false,
+            };
 
-            // PSK-authenticated register/keepalive toward the listener.
-            let token = super::auth::generate_token(&tunnel_id.to_string(), &tunnel_psk);
-            let attempt_cancel = cancel.child_token();
-            {
-                let reg_sock = sock.clone();
-                let reg_cancel = attempt_cancel.clone();
-                tokio::spawn(async move {
-                    let register = match encode_udp_control(&UdpRelayControl::Register {
-                        tunnel_id,
-                        direction: RelayDirection::Egress,
-                        bind_token: Some(token),
-                        protocol_version: TUNNEL_PROTOCOL_VERSION,
-                    }) {
-                        Ok(b) => b,
-                        Err(_) => return,
-                    };
-                    let _ = reg_sock.send(&register).await;
-                    let mut tick = tokio::time::interval(KEEPALIVE_INTERVAL);
-                    tick.tick().await;
-                    loop {
-                        tokio::select! {
-                            _ = reg_cancel.cancelled() => return,
-                            _ = tick.tick() => { let _ = reg_sock.send(&register).await; }
+            let result: Result<()> = async {
+                let peer = peer_addr.ok_or_else(|| anyhow::anyhow!("peer_addr required for direct egress"))?;
+                let resolved = lookup_host(&peer)
+                    .await?
+                    .next()
+                    .ok_or_else(|| anyhow::anyhow!("cannot resolve peer '{peer}'"))?;
+                let sock = connect_socket(resolved, interface.as_deref(), source.as_deref()).await?;
+                let link = PlainUdpLink::new(sock.clone());
+
+                // PSK-authenticated register/keepalive toward the listener.
+                let token = super::auth::generate_token(&tunnel_id.to_string(), &tunnel_psk);
+                let attempt_cancel = cancel.child_token();
+                {
+                    let reg_sock = sock.clone();
+                    let reg_cancel = attempt_cancel.clone();
+                    tokio::spawn(async move {
+                        let register = match encode_udp_control(&UdpRelayControl::Register {
+                            tunnel_id,
+                            direction: RelayDirection::Egress,
+                            bind_token: Some(token),
+                            protocol_version: TUNNEL_PROTOCOL_VERSION,
+                        }) {
+                            Ok(b) => b,
+                            Err(_) => return,
+                        };
+                        let _ = reg_sock.send(&register).await;
+                        let mut tick = tokio::time::interval(KEEPALIVE_INTERVAL);
+                        tick.tick().await;
+                        loop {
+                            tokio::select! {
+                                _ = reg_cancel.cancelled() => return,
+                                _ = tick.tick() => { let _ = reg_sock.send(&register).await; }
+                            }
                         }
-                    }
-                });
+                    });
+                }
+                state_tx.send_replace(RelayTunnelState::Ready);
+                udp_forwarder::run_egress(tunnel_id, local_addr, link, stats, attempt_cancel, cipher).await
             }
-            state_tx.send_replace(RelayTunnelState::Ready);
-            udp_forwarder::run_egress(tunnel_id, local_addr, link, stats, attempt_cancel, cipher).await
+            .await;
+
+            if gateway_programmed {
+                teardown_tunnel_gateway(&tunnel_id).await;
+            }
+            result
         }
         TunnelDirection::Ingress => {
             let listen = direct_listen_addr
