@@ -190,17 +190,44 @@ pub fn spawn_bonded_input(
             cancel.clone(),
         ));
 
-        // Optional ingress de-jitter: the bond reassembler releases in
-        // bond-order but in HOL-gated bursts (a straggler on a slow leg
-        // stalls the head, then a clump flushes). Without smoothing, that
-        // burstiness is forwarded verbatim to the HDMI display + egress and
-        // shows up as jerk / PCR jitter. When `ingress_dejitter_ms` is set,
-        // route the published stream through the same rate-paced de-jitter
-        // drainer the UDP/RIST inputs use; otherwise it's a zero-overhead
-        // direct passthrough. The publisher owns `broadcast_tx` from here.
+        // A bonded input is deliberately NOT routed through the rate-paced
+        // ingress de-jitter servo. The bond reassembler releases in HOL-gated
+        // bursts (a straggler on a slow leg stalls the head, then a clump
+        // flushes up to the hold budget — potentially seconds). That servo is
+        // sized for small UDP PDV with only ±5% rate authority, so it cannot
+        // drain a multi-second clump: the buffer backs up and the residence-cap
+        // *sheds* 15–30% of the bond's media (measured `ingress_dejitter_shed`
+        // in the thousands; delivery down to ~64–82%). The bond already delivers
+        // in order, and output pacing is handled losslessly downstream — the
+        // egress wire-emit servo (UDP/RTP) and the display A/V clock (HDMI) both
+        // re-time the bursty stream. So we pass it through directly. If an
+        // operator set `ingress_dejitter_ms` on a bonded input, it is ignored
+        // (it would only shed) — warn and point them at hold/latency knobs.
+        if config.ingress_dejitter_ms.filter(|v| *v > 0).is_some() {
+            tracing::warn!(
+                "bonded input '{}': ingress_dejitter_ms is IGNORED on a bonded input — the \
+                 rate-paced de-jitter servo would shed the bond's bursty delivery (15–30% loss); \
+                 the bond reassembly + egress/display pacing already smooth the stream. Use \
+                 hold_ms / max_bonding_latency_ms to control bond latency.",
+                input_id
+            );
+            event_sender.emit_flow_with_details(
+                EventSeverity::Warning,
+                category::BOND,
+                format!(
+                    "ingress_dejitter_ms ignored on bonded input '{input_id}' (would shed bond bursts)"
+                ),
+                &flow_id,
+                serde_json::json!({
+                    "error_code": "bond_ingress_dejitter_ignored",
+                    "input_id": input_id.clone(),
+                }),
+            );
+        }
+        // Direct passthrough — no rate-paced de-jitter on a bonded input (see above).
         let publisher = crate::engine::ingress_publisher::IngressPublisher::new(
             None,
-            config.ingress_dejitter_ms,
+            None,
             broadcast_tx,
             &input_id,
             cancel.clone(),
