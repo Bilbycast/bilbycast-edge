@@ -109,7 +109,7 @@ Each edge runs **one flow**. The `bonded_output` on edge A and
   "active": true,
   "bond_flow_id": 42,
   "paths": [ { ... }, ... ],
-  "scheduler": "media_aware",
+  "scheduler": "adaptive",
   "retransmit_capacity": 8192,
   "keepalive_ms": 200,
   "program_number": null
@@ -120,7 +120,8 @@ Each edge runs **one flow**. The `bonded_output` on edge A and
 |---|---|---|---|
 | `bond_flow_id` | u32 | *required* | Must match the receiver end |
 | `paths` | array | *required, ≥1* | Paths to transmit across |
-| `scheduler` | enum | `media_aware` | `round_robin`, `weighted_rtt`, or `media_aware` (see [Scheduler](#scheduler)) |
+| `scheduler` | enum | `adaptive` | `adaptive` (default), `media_aware`, `weighted_rtt`, or `round_robin` (see [Scheduler](#scheduler)) |
+| `congestion` | object | — | Optional congestion-control tuning for the `adaptive` scheduler (see [Adaptive scheduler & congestion control](#adaptive-scheduler--congestion-control)) |
 | `retransmit_capacity` | usize | 8192 | Sender retransmit buffer capacity (packets). Must exceed `send_rate_pps × max_nack_round_trip_s` |
 | `keepalive_ms` | u32 | 200 | Keepalive interval |
 | `equalization` | enum | `auto` | Per-leg latency equalization mode (`auto`/`off`/`on`; legacy bool accepted). In `auto`/`on` the sender stamps a 16-byte v2 header so the receiver can time-align legs. Duplicate-all redundancy auto-suppresses alignment (ride-fastest); `on` overrides. Use the same mode + budget on the matching bonded **input** |
@@ -160,12 +161,17 @@ Receiver: `bind` required, `remote` ignored.
 specific NIC (e.g. `"wwan0"`, `"eth0"`). Critical when multiple paths
 share a destination IP: without pinning, the kernel routing table
 collapses them onto the same default route and the bond is cosmetic.
-Linux uses `SO_BINDTODEVICE` and requires `CAP_NET_RAW` — grant with
-`sudo setcap cap_net_raw+ep /path/to/bilbycast-edge` or a systemd
-`AmbientCapabilities=CAP_NET_RAW` line; the edge itself does not need
-root. macOS / FreeBSD use `IP_BOUND_IF` and are unprivileged. Omit
-the field to let the kernel decide (or to use source-IP binding +
-`ip rule` policy routing instead). Full reference:
+On Linux the leg first tries the hard `SO_BINDTODEVICE` bind
+(`CAP_NET_RAW`); **if the capability is absent (the normal case for the
+edge process) it automatically falls back to the unprivileged
+`IP_UNICAST_IF` / `IPV6_UNICAST_IF` egress hint** — so the pin works
+with or without the capability (the active mechanism is reported in the
+per-leg stats). Granting `CAP_NET_RAW` (via `setcap cap_net_raw+ep` or a
+systemd `AmbientCapabilities=CAP_NET_RAW` line) additionally pins the
+*receive* side; the edge never needs root. macOS / FreeBSD use
+`IP_BOUND_IF` and are unprivileged. Omit the field to let the kernel
+decide (or to use source-IP binding + `ip rule` policy routing instead).
+Full reference:
 [`bilbycast-bonding/docs/nic-pinning.md`](../../bilbycast-bonding/docs/nic-pinning.md).
 
 **RIST path** (unidirectional at the bond layer; per-leg ARQ from the RIST
@@ -219,17 +225,80 @@ PEM mode:
 ALPN `bilbycast-bond` is negotiated automatically; other protocols on the
 same UDP port (HTTP/3, bilbycast-relay tunnels) stay isolated.
 
+### Relayed and NIC-pinned legs
+
+Each leg is independent: it can go **direct** (point its `remote` / `addr`
+at the far edge's public address) or **over a relay**, in any
+combination, and both ends can be behind NAT.
+
+A **relayed leg** is just a UDP leg whose `remote` points at a local
+**native plain-UDP tunnel** (`transport: "udp"`, see
+[CONFIGURATION.md → Native SRT/RIST over relay](CONFIGURATION.md#native-srtrist-over-relay-plain-udp-carrier))
+that is loopback-bridged to the leg. The bond's ARQ / FEC / reordering
+still run **end-to-end edge ↔ edge**; the relay only forwards
+`[tunnel_id][AEAD]` opaquely and cannot read bond traffic. Because both
+the tunnel and the far edge dial the relay outbound, a relayed leg
+traverses NAT on both ends, and each leg's tunnel can carry a primary +
+backup relay for failover. The manager wires this up automatically when
+you mark a leg "via relay"; there is no bond-side terminate/re-originate
+("bond bridge") — the relay is a generic per-path forwarder for every
+path type (tunnels, native SRT/RIST, and individual bond legs alike).
+
+**Per-leg uplink pinning** on a relayed (or direct) UDP leg uses the same
+`interface` / `source` / `gateway` fields as any UDP leg, with the same
+`SO_BINDTODEVICE` → unprivileged `IP_UNICAST_IF` fallback, so each leg can
+egress out its own uplink (5G vs Starlink vs ISP) even on a box with no
+`CAP_NET_RAW`.
+
 ### Scheduler
 
 | Value | Behaviour |
 |---|---|
 | `round_robin` | Equal-weight rotation. Fine when path health is near-identical (two matched fibre legs) |
 | `weighted_rtt` | RTT-weighted rotation — sends more traffic to lower-RTT paths. `Critical`-priority packets (set by upstream tagging, rare without media awareness) are duplicated across the two lowest-RTT paths |
-| **`media_aware`** (default) | `weighted_rtt` plus NAL walking: detects H.264 and HEVC IDR frames (H.264 types 5/7/8; HEVC 19/20/21/32/33/34) inside the outbound TS and duplicates them across the two best paths. Non-IDR frames go single-path. **This is the broadcast default** — it gives Peplink-class failover on IDR boundaries without doubling the whole stream |
+| `media_aware` | `weighted_rtt` plus NAL walking: detects H.264 and HEVC IDR frames (H.264 types 5/7/8; HEVC 19/20/21/32/33/34) inside the outbound TS and duplicates them across the two best paths. Non-IDR frames go single-path. Gives Peplink-class failover on IDR boundaries without doubling the whole stream, but does **not** congestion-control — superseded by `adaptive` |
+| **`adaptive`** (default) | The same NAL-aware IDR duplication as `media_aware`, layered on the **capacity-aware congestion controller** (`CapacityAwareScheduler`). Each leg discovers its usable bitrate and is filled to (not past) it, so the split is proportional to *measured* capacity and a saturated leg spills to one with headroom. **This is the broadcast default** and the right policy for heterogeneous cellular + satellite bonds. Tune it via the per-output [`congestion`](#adaptive-scheduler--congestion-control) block |
 
 On an 84/16 theoretical split (5G vs Starlink in testing), the
-`media_aware` scheduler delivers **zero lost gaps** under 200 ms RTT /
-3 % loss on the Starlink leg because every IDR rides both paths.
+`media_aware` / `adaptive` IDR duplication delivers **zero lost gaps**
+under 200 ms RTT / 3 % loss on the Starlink leg because every IDR rides
+both paths.
+
+### Adaptive scheduler & congestion control
+
+The default `adaptive` scheduler runs a per-leg hybrid loss + delay
+controller that *discovers* each link's usable bitrate — probing up while
+the link is clean and backing off toward the delivered rate the instant
+loss or queue-building delay appears. The split is then proportional to
+measured capacity, not RTT. Tune it with the optional per-output
+`congestion` block; every field is optional and falls back to the
+broadcast-tuned default:
+
+| Field | Unit | Default | Meaning |
+|---|---|---|---|
+| `min_rate_kbps` | kbps | lib default | Floor a leg's capacity estimate never drops below (while it still carries unique media) |
+| `start_rate_kbps` | kbps | lib default | Starting estimate for a unit-weight leg before measurement |
+| `loss_low_pct` | % | 0.5 | Below this loss a leg is "clean" and probes up |
+| `loss_high_pct` | % | lib default | At/above this loss a leg backs off hard |
+| `delay_inflation_ms` | ms | 40 | RTT inflation over the leg's own minimum treated as queue-building congestion. With `delay_inflation_auto` on, this is the *floor* of the auto-derived threshold |
+| `delay_inflation_auto` | bool | **on (edge bonded outputs)** | Derive the queue-build threshold per leg from its own windowed baseline RTT instead of a fixed `delay_inflation_ms`. A bufferbloated cellular leg (5G ~100 ms, Starlink ~600 ms baseline) gets a proportionally looser threshold so normal radio jitter doesn't read as congestion; a terrestrial low-RTT leg keeps the tight 40 ms floor. The library default is **off**, but the edge enables it for bonded outputs — set `false` to force the fixed threshold |
+| `burst_ms` | ms | lib default | Token-bucket burst depth |
+| `probe_cap_mult` | × | 2.0 | Evidence bound — a leg's estimate never exceeds `delivered × this` (except while it's the clean bottleneck). Valid [1.1, 10.0] |
+| `rtt_min_window_ms` | ms | 10000 | Window the per-leg minimum-RTT baseline is tracked over (BBR-style). Valid [1000, 120000] |
+| `jitter_demote_ms` | ms | 150 | Smoothed jitter above which a leg stops carrying *unique* media (keeps carrying redundancy/FEC copies) so it can't head-of-line-block reassembly. `0` disables. Valid [0, 5000] |
+
+**Clean-bottleneck capacity discovery.** A clean but RTT-jittery radio leg
+(5G / Starlink, whose smoothed RTT sits tens of ms above its windowed
+minimum even at zero loss) is **no longer pinned at `min_rate`**. The
+discovery signal is *delivered-rate vs the current estimate*, not RTT:
+when a leg delivers ≥ 85 % of its capacity estimate **and** loss is below
+`loss_low`, it's treated as capacity-limited and the estimate probes up
+(slow-start, so a starved leg reaches real capacity in ~1 s of control
+rounds). Radio jitter in the band between "clean" and full congestion no
+longer masquerades as congestion. **Loss is the safety bound** — the
+instant probing up induces real loss the controller backs off toward the
+delivered rate, so discovery cannot run away. A leg delivering well *under*
+its estimate is merely under-offered and holds its estimate.
 
 ## Worked examples
 
@@ -434,9 +503,16 @@ Path-up / path-down transitions fire as `info` / `warning`; bond-idle
   Default 8192 is fine for typical broadcast bitrates.
 - **`keepalive_ms`**: faster keepalives detect dead paths sooner but
   consume more bandwidth. 200 ms is a reasonable default.
-- **Scheduler choice**: `media_aware` is the right default for video
-  flows carried over MPEG-TS. Use `round_robin` for bonded non-video
-  data (e.g. bulk file transfers) where IDR detection is a no-op.
+- **Scheduler choice**: `adaptive` is the right default for video flows
+  over heterogeneous links — it congestion-controls per leg. Use
+  `media_aware` only if you want IDR duplication without capacity
+  discovery, or `round_robin` for bonded non-video data (e.g. bulk file
+  transfers) where IDR detection is a no-op.
+- **ARQ accounting**: under the `adaptive` scheduler, NACK-driven
+  retransmits are charged their real byte size against each leg's
+  capacity token bucket, so a NACK storm can't silently self-amplify load
+  on a leg that is already dropping. No tuning knob — this just keeps the
+  capacity estimate honest under loss.
 
 ## Limitations
 
@@ -449,11 +525,21 @@ Path-up / path-down transitions fire as `info` / `warning`; bond-idle
   per-path hybrid loss + delay controller that discovers each leg's
   usable bitrate and splits traffic capacity-proportionally, backing
   off on RTT inflation / loss. Tune it via the per-output `congestion`
-  block (`min_rate_kbps`, `delay_inflation_ms`, `loss_high_pct`,
-  `rtt_min_window_ms`, …) and cap a metered leg with the per-path
-  `max_bitrate_bps`. The older `media_aware` / static schedulers do
-  **not** congestion-control — pick `adaptive` for heterogeneous
-  cellular/satellite links.
+  block and cap a metered leg with the per-path `max_bitrate_bps` — full
+  field reference in [Adaptive scheduler & congestion
+  control](#adaptive-scheduler--congestion-control). The older
+  `media_aware` / static schedulers do **not** congestion-control — pick
+  `adaptive` for heterogeneous cellular/satellite links.
+- **`ingress_dejitter_ms` is ignored on a bonded input.** The bond
+  reassembler releases in HOL-gated bursts (a straggler on a slow leg
+  stalls the head, then a clump flushes), which the rate-paced ingress
+  de-jitter servo can't drain — it would *shed* 15–30 % of the media.
+  The bond already delivers in order, and the downstream egress wire-emit
+  servo (UDP/RTP) and display A/V clock (HDMI) re-time the bursty stream,
+  so a bonded input passes through directly. Setting `ingress_dejitter_ms`
+  on a bonded input logs a Warning (`bond_ingress_dejitter_ignored`) and
+  has no effect — use `hold_ms` / `max_bonding_latency_ms` to control bond
+  latency instead.
 - **Cross-path encryption is opt-in and OFF by default.** Set a
   64-hex-char `encryption_key` (same value both ends) to ChaCha20-
   Poly1305-encrypt every UDP and RIST leg of the bond. **Without it,

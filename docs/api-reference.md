@@ -1393,6 +1393,8 @@ Create a new IP tunnel. The tunnel configuration is validated before creation.
 
 `relay_addrs` is an ordered list (primary first, optional backup second). A single-relay tunnel uses a one-element list. The legacy single-field `"relay_addr": "host:port"` form is still accepted and migrated automatically.
 
+For a native SRT/RIST stream that should avoid QUIC, add `"transport": "udp"` (requires `"protocol": "udp"`) for a plain-UDP carrier, and optionally pin the tunnel's uplink with `"interface"` / `"source"` / `"gateway"` (UDP carrier only). See [Native SRT/RIST over relay](configuration-guide.md#native-srtrist-over-relay) and [Per-tunnel uplink pinning](configuration-guide.md#per-tunnel-uplink-pinning).
+
 **Response (201 Created):**
 
 ```json

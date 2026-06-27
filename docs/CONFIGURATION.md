@@ -251,6 +251,7 @@ An array of IP tunnel definitions. Tunnels create encrypted point-to-point links
 | `name`                 | `string`  | --      | Human-readable tunnel name |
 | `enabled`              | `bool`    | `true`  | Whether this tunnel is active |
 | `protocol`             | `string`  | --      | Transport protocol: `"tcp"` (reliable, ordered — QUIC streams) or `"udp"` (unreliable — QUIC datagrams, best for SRT/media) |
+| `transport`            | `string`  | `"quic"`| Outer carrier. `"quic"` (default): TCP rides QUIC streams, UDP rides QUIC datagrams. `"udp"`: a **native plain-UDP carrier (no QUIC)** for native SRT/RIST over relay or direct — avoids QUIC's per-packet overhead and its congestion control fighting SRT/RIST's own ARQ. `"udp"` is only valid with `protocol = "udp"`. See [Native SRT/RIST over relay](#native-srtrist-over-relay-plain-udp-carrier). |
 | `mode`                 | `string`  | --      | Connectivity mode: `"relay"` (both edges behind NAT, traffic via relay) or `"direct"` (direct QUIC between edges) |
 | `direction`            | `string`  | --      | This edge's role: `"ingress"` (receives tunnel traffic, forwards to `local_addr`) or `"egress"` (listens on `local_addr`, sends into tunnel) |
 | `local_addr`           | `string`  | --      | Local address. For **egress**: listen address for local traffic to tunnel (e.g. `"0.0.0.0:9000"`). For **ingress**: forward address for received tunnel traffic (e.g. `"127.0.0.1:9000"`). |
@@ -264,6 +265,9 @@ An array of IP tunnel definitions. Tunnels create encrypted point-to-point links
 | `tunnel_psk`           | `string?` | `null`  | Pre-shared key for direct mode HMAC-SHA256 authentication (hex-encoded, 64 chars). Both edges must share the same PSK. **Stored in `secrets.json`.** |
 | `tls_cert_pem`         | `string?` | `null`  | TLS certificate PEM for direct mode listener. Auto-generated if absent. **Stored in `secrets.json`.** |
 | `tls_key_pem`          | `string?` | `null`  | TLS key PEM for direct mode listener. Auto-generated if absent. **Stored in `secrets.json`.** |
+| `interface`            | `string?` | `null`  | **Per-tunnel uplink pin.** NIC this tunnel's UDP socket egresses on (e.g. `"wwan0"`, `"eth0"`), 1–15 chars. Only honoured on `transport = "udp"`. Applied via `SO_BINDTODEVICE`, **falling back to the unprivileged `IP_UNICAST_IF` egress hint** when the edge lacks `CAP_NET_RAW` (the normal case) — so the pin works with or without the capability. See [Per-tunnel uplink pinning](#per-tunnel-uplink-pinning). |
+| `source`               | `string?` | `null`  | Source address (`ip` or `ip/prefix`, e.g. `192.168.10.2/24`) the tunnel's UDP socket binds to. On its own, pins the egress source IP; in gateway mode it also keys the policy rule. Only on `transport = "udp"`. |
+| `gateway`              | `string?` | `null`  | **Gateway-mode** next-hop the tunnel egresses through (dumb-switch / single-NIC topology). The edge programs a `from <source> → default via <gateway>` policy route via netlink (needs `CAP_NET_ADMIN`). Requires `source` and `interface`. Only on `transport = "udp"`. See [`bonding-gateway-routing.md`](bonding-gateway-routing.md). |
 
 ### Relay Mode Example
 
@@ -354,7 +358,25 @@ One edge has a public IP. Direct QUIC connection — no relay needed.
 - `peer_addr` required when `mode` is `direct` and `direction` is `egress`
 - `direct_listen_addr` required when `mode` is `direct` and `direction` is `ingress`
 - `tunnel_psk` must be exactly 64 hex chars if present
+- `transport = "udp"` requires `protocol = "udp"` (TCP tunnels must use the QUIC carrier)
+- `interface` / `source` / `gateway` are only accepted on `transport = "udp"`, and never on a direct **ingress** (listener) tunnel — the listener uses the host default route, so a pin there would be a silent no-op (relay mode both directions, and direct egress, do apply the pin)
+- `interface` is 1–15 chars and contains no NUL; gateway-mode requires both `source` and `interface`; `gateway` must be a valid IP inside the `source` subnet and the same address family
 - All address fields must be valid socket addresses
+
+### Native SRT/RIST over relay (plain-UDP carrier)
+
+Set `transport: "udp"` (with `protocol: "udp"`) to carry a single SRT or RIST stream over a **plain-UDP** tunnel instead of QUIC. Both edges still dial the relay outbound (so both ends can be behind NAT), but the relay forwards the datagrams verbatim with no QUIC framing or second congestion controller — the inner SRT/RIST ARQ owns recovery end-to-end.
+
+RIST uses an even RTP port plus the next odd RTCP port; a native-RIST service is provisioned as a **pair** of these single-port tunnels (one per port) so RTCP/NACK retransmission traverses correctly. The manager creates the pair automatically.
+
+### Per-tunnel uplink pinning
+
+On the plain-UDP carrier (`transport: "udp"`) a tunnel can be pinned to a specific uplink so several tunnels on one box each egress out their own NIC (5G vs Starlink vs ISP) — the same mechanism a bonded UDP leg uses:
+
+- **Interface mode** — set `interface` (e.g. `"wwan0"`). The socket pins to that NIC via `SO_BINDTODEVICE`, falling back to the unprivileged `IP_UNICAST_IF` hint when the edge lacks `CAP_NET_RAW` (so it works without granting the capability). Optionally add `source` to also pin the egress source IP.
+- **Gateway mode** — for a dumb-switch / single-NIC topology, set `source` + `interface` + `gateway`; the edge programs a `from <source> → default via <gateway>` policy route (needs `CAP_NET_ADMIN`). See [`bonding-gateway-routing.md`](bonding-gateway-routing.md).
+
+This is also how a **bonded leg can ride a relay**: each relayed leg is its own native-UDP tunnel, loopback-bridged to the bond leg, so any combination of legs can go direct or over any relay (with primary + backup) and both ends can be behind NAT. See [`bonding.md`](bonding.md#relayed-and-nic-pinned-legs).
 
 ---
 
