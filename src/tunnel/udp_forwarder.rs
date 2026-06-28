@@ -201,6 +201,13 @@ pub struct UdpForwarderStats {
     pub bytes_sent: AtomicU64,
     pub bytes_received: AtomicU64,
     pub send_errors: AtomicU64,
+    /// AEAD (ChaCha20-Poly1305) decrypt failures on the inbound path. A handful
+    /// is normal on a lossy/duplicated link, but a sustained count climbing
+    /// while `packets_received` stays flat is the unambiguous signature of a
+    /// `tunnel_encryption_key` mismatch between the two edges — every packet is
+    /// dropped silently with no media. The tunnel manager's stats watchdog
+    /// keys its Critical `tunnel_decrypt_failure` event off exactly that shape.
+    pub decrypt_errors: AtomicU64,
 }
 
 /// Run the UDP forwarder for an **egress** tunnel.
@@ -272,6 +279,7 @@ pub async fn run_egress<L: DatagramLink>(
                         match c.decrypt(encrypted_payload) {
                             Ok(decrypted) => decrypted,
                             Err(e) => {
+                                stats.decrypt_errors.fetch_add(1, Ordering::Relaxed);
                                 tracing::debug!(tunnel_id = %tunnel_id, "Decryption error: {e}");
                                 continue;
                             }
@@ -333,6 +341,7 @@ pub async fn run_ingress<L: DatagramLink>(
                         match c.decrypt(encrypted_payload) {
                             Ok(decrypted) => decrypted,
                             Err(e) => {
+                                stats.decrypt_errors.fetch_add(1, Ordering::Relaxed);
                                 tracing::debug!(tunnel_id = %tunnel_id, "Decryption error: {e}");
                                 continue;
                             }

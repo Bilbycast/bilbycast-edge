@@ -73,6 +73,9 @@ pub struct TunnelStatsSnapshot {
     pub bitrate_in_bps: u64,
     pub bitrate_out_bps: u64,
     pub send_errors: u64,
+    /// Inbound AEAD decrypt failures (native-UDP carrier). Sustained growth
+    /// with flat `packets_received` ⇒ `tunnel_encryption_key` mismatch.
+    pub decrypt_errors: u64,
     pub connections_total: u64,
     pub connections_active: u64,
 }
@@ -184,6 +187,10 @@ impl TunnelManager {
 
         let tunnel_name = config.name.clone();
         let tunnel_id_str = config.id.clone();
+        // Clones for the decrypt-skew watchdog, captured before `cancel` /
+        // `udp_stats` are moved into the runtime below.
+        let watchdog_cancel = cancel.clone();
+        let watchdog_stats = udp_stats.clone();
         self.tunnels.insert(
             config.id.clone(),
             TunnelRuntime {
@@ -203,8 +210,22 @@ impl TunnelManager {
             category::TUNNEL,
             format!("Tunnel '{}' started", tunnel_name),
             &tunnel_id_str,
-            serde_json::json!({ "tunnel_name": tunnel_name }),
+            serde_json::json!({ "tunnel_name": tunnel_name.clone() }),
         );
+
+        // Phase 1 loud-failure: on the native-UDP carrier (SRT/RIST/bond legs
+        // over relay or direct), spawn a per-tunnel watchdog that turns a silent
+        // key-mismatch (every packet drops on AEAD decrypt) into a Critical
+        // event. Cancelled with the tunnel.
+        if let Some(stats) = watchdog_stats {
+            tokio::spawn(decrypt_skew_watchdog(
+                tunnel_id_str,
+                tunnel_name,
+                stats,
+                self.event_sender.clone(),
+                watchdog_cancel,
+            ));
+        }
 
         Ok(())
     }
@@ -665,6 +686,7 @@ fn build_status(runtime: &TunnelRuntime) -> TunnelStatus {
         stats.bytes_sent = udp.bytes_sent.load(Ordering::Relaxed);
         stats.bytes_received = udp.bytes_received.load(Ordering::Relaxed);
         stats.send_errors = udp.send_errors.load(Ordering::Relaxed);
+        stats.decrypt_errors = udp.decrypt_errors.load(Ordering::Relaxed);
     }
     if let Some(ref tcp) = runtime.tcp_stats {
         stats.bytes_sent = tcp.bytes_sent.load(Ordering::Relaxed);
@@ -699,6 +721,81 @@ fn build_status(runtime: &TunnelRuntime) -> TunnelStatus {
         active_relay_idx,
         active_relay_addr,
         stats,
+    }
+}
+
+/// Decision core of the decrypt-skew watchdog, factored out so it can be
+/// unit-tested without driving a real timer. Skew = errors at/above the
+/// threshold AND nothing delivered in the window. Any delivery clears it (a
+/// lossy link still delivers some packets — only a key mismatch delivers none).
+fn is_decrypt_skew(d_decrypt: u64, d_received: u64, threshold: u64) -> bool {
+    d_received == 0 && d_decrypt >= threshold
+}
+
+/// Per-tunnel inbound-decrypt skew watchdog (Phase 1 loud-failure).
+///
+/// Samples the native-UDP forwarder's atomics on a fixed cadence — strictly off
+/// the data path — and raises one Critical `tunnel_decrypt_failure` event when
+/// AEAD decrypt errors climb while zero packets are delivered: the unambiguous
+/// signature of a `tunnel_encryption_key` mismatch between the two edges (every
+/// packet dropped, no media, no other error). Sporadic link loss never trips it
+/// because a lossy link still delivers *some* packets (delta_received > 0). The
+/// alarm rearms once healthy traffic resumes, so a transient never latches.
+async fn decrypt_skew_watchdog(
+    tunnel_id: String,
+    tunnel_name: String,
+    stats: Arc<UdpForwarderStats>,
+    event_sender: EventSender,
+    cancel: CancellationToken,
+) {
+    const WINDOW: Duration = Duration::from_secs(10);
+    // A lossy/duplicated link produces a trickle of decrypt errors; key skew
+    // produces a flood with zero delivery. 50 per window with no delivered
+    // packet separates the two cleanly.
+    const SKEW_THRESHOLD: u64 = 50;
+
+    let mut last_decrypt = stats.decrypt_errors.load(Ordering::Relaxed);
+    let mut last_received = stats.packets_received.load(Ordering::Relaxed);
+    let mut fired = false;
+    let mut tick = tokio::time::interval(WINDOW);
+    tick.tick().await; // consume the immediate first tick
+
+    loop {
+        tokio::select! {
+            _ = cancel.cancelled() => return,
+            _ = tick.tick() => {
+                let cur_decrypt = stats.decrypt_errors.load(Ordering::Relaxed);
+                let cur_received = stats.packets_received.load(Ordering::Relaxed);
+                let d_decrypt = cur_decrypt.saturating_sub(last_decrypt);
+                let d_received = cur_received.saturating_sub(last_received);
+                last_decrypt = cur_decrypt;
+                last_received = cur_received;
+
+                if d_received > 0 {
+                    // Healthy traffic is flowing — rearm so a future episode fires.
+                    fired = false;
+                } else if is_decrypt_skew(d_decrypt, d_received, SKEW_THRESHOLD) && !fired {
+                    fired = true;
+                    event_sender.emit_flow_with_details(
+                        EventSeverity::Critical,
+                        category::TUNNEL,
+                        format!(
+                            "Tunnel '{tunnel_name}': {d_decrypt} decrypt failures and zero packets \
+                             delivered in {}s — likely tunnel_encryption_key mismatch between edges",
+                            WINDOW.as_secs()
+                        ),
+                        &tunnel_id,
+                        serde_json::json!({
+                            "error_code": "tunnel_decrypt_failure",
+                            "tunnel_name": tunnel_name,
+                            "decrypt_errors_window": d_decrypt,
+                            "packets_delivered_window": d_received,
+                            "window_secs": WINDOW.as_secs(),
+                        }),
+                    );
+                }
+            }
+        }
     }
 }
 
@@ -1129,4 +1226,32 @@ async fn run_forwarder(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod decrypt_skew_tests {
+    use super::is_decrypt_skew;
+
+    const T: u64 = 50;
+
+    #[test]
+    fn key_mismatch_floods_errors_with_zero_delivery() {
+        // Every packet failing AEAD, nothing delivered → skew.
+        assert!(is_decrypt_skew(50, 0, T));
+        assert!(is_decrypt_skew(100_000, 0, T));
+    }
+
+    #[test]
+    fn lossy_link_still_delivers_so_never_skew() {
+        // A lossy/duplicated link produces some decrypt errors but still
+        // delivers packets — must NOT trip the key-mismatch alarm.
+        assert!(!is_decrypt_skew(50, 1, T));
+        assert!(!is_decrypt_skew(10_000, 100, T));
+    }
+
+    #[test]
+    fn quiet_or_sub_threshold_is_not_skew() {
+        assert!(!is_decrypt_skew(0, 0, T)); // idle tunnel
+        assert!(!is_decrypt_skew(49, 0, T)); // a few stray errors, below floor
+    }
 }

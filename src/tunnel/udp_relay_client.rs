@@ -558,7 +558,13 @@ async fn run_native_direct_listener(
                 if caller.load() != Some(from) { continue; }
                 if let Some((_id, enc)) = protocol::decode_udp_datagram(data) {
                     let payload = match &cipher {
-                        Some(c) => match c.decrypt(enc) { Ok(p) => p, Err(_) => continue },
+                        Some(c) => match c.decrypt(enc) {
+                            Ok(p) => p,
+                            Err(_) => {
+                                stats.decrypt_errors.fetch_add(1, Ordering::Relaxed);
+                                continue;
+                            }
+                        },
                         None => enc.to_vec(),
                     };
                     let _ = loop_sock.send_to(&payload, forward_addr).await;
