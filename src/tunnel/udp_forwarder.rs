@@ -24,6 +24,31 @@ use uuid::Uuid;
 use super::crypto::TunnelCipher;
 use super::protocol::{self, try_decode_udp_control, UdpRelayControl};
 
+/// 32 MB socket buffers on the loopback bridge sockets. High-bitrate
+/// contribution overruns the kernel default (~200 KB) — the same gate-#11
+/// hazard the relay already sizes for — and an overrun on the loopback hop
+/// shows up downstream as spurious loss + retransmit jitter on a Tier-1 path.
+const FORWARDER_SOCK_BUF_BYTES: usize = 32 * 1024 * 1024;
+
+/// Bind a UDP socket with large send/recv buffers (best-effort; the kernel may
+/// clamp to `net.core.{r,w}mem_max`). Mirrors the relay's `build_relay_udp_socket`.
+fn bind_buffered_udp(addr: SocketAddr) -> std::io::Result<UdpSocket> {
+    use socket2::{Domain, Protocol, Socket, Type};
+    let domain = match addr.ip() {
+        IpAddr::V4(_) => Domain::IPV4,
+        IpAddr::V6(_) => Domain::IPV6,
+    };
+    let socket = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))?;
+    if matches!(addr.ip(), IpAddr::V6(_)) {
+        let _ = socket.set_only_v6(true);
+    }
+    let _ = socket.set_recv_buffer_size(FORWARDER_SOCK_BUF_BYTES);
+    let _ = socket.set_send_buffer_size(FORWARDER_SOCK_BUF_BYTES);
+    socket.set_nonblocking(true)?;
+    socket.bind(&addr.into())?;
+    UdpSocket::from_std(socket.into())
+}
+
 /// A bidirectional datagram carrier the UDP forwarder rides.
 ///
 /// Each datagram is already framed (`[16-byte tunnel_id][AEAD payload]` via
@@ -223,7 +248,7 @@ pub async fn run_egress<L: DatagramLink>(
     cancel: CancellationToken,
     cipher: Option<Arc<TunnelCipher>>,
 ) -> Result<()> {
-    let socket = UdpSocket::bind(local_addr).await.map_err(|e| {
+    let socket = bind_buffered_udp(local_addr).map_err(|e| {
         crate::util::port_error::annotate_bind_error(e, local_addr, "UDP tunnel egress")
     })?;
     tracing::info!(
@@ -318,8 +343,8 @@ pub async fn run_ingress<L: DatagramLink>(
     cancel: CancellationToken,
     cipher: Option<Arc<TunnelCipher>>,
 ) -> Result<()> {
-    // Bind an ephemeral port for sending to the forward address
-    let socket = UdpSocket::bind("0.0.0.0:0").await?;
+    // Bind an ephemeral port for sending to the forward address (32 MB buffers).
+    let socket = bind_buffered_udp("0.0.0.0:0".parse().expect("valid wildcard addr"))?;
     tracing::info!(
         tunnel_id = %tunnel_id,
         forward_addr = %forward_addr,
