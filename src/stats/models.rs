@@ -1907,6 +1907,14 @@ pub struct BondLegStats {
     /// older edges (serde default).
     #[serde(default)]
     pub wire_throughput_bps: u64,
+    /// Sender side: the adaptive scheduler's **discovered aggregate usable
+    /// capacity** (bits/sec) — the sum of the per-leg capacity estimates
+    /// across alive legs. This is the bond's currently-usable bonded bitrate:
+    /// the number to keep a fixed external encoder (RTP/SRT/UDP from a tier-1
+    /// encoder the edge cannot throttle) at or below. 0 on the receiver side
+    /// (no scheduler), for non-adaptive policies, and on older edges.
+    #[serde(default)]
+    pub aggregate_capacity_bps: u64,
     /// Receiver side only: the adaptive hold servo's **current**
     /// reorder/recovery budget in milliseconds (floor `hold_ms`,
     /// ceiling `hold_max_ms`; fixed at `hold_ms` when no ceiling is

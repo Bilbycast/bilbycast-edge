@@ -3973,6 +3973,10 @@ pub fn bond_handle_to_leg_stats(h: &BondStatsHandle) -> BondLegStats {
         throughput_bps,
         fec_throughput_bps,
         wire_throughput_bps,
+        // Discovered aggregate usable capacity (sum of alive legs' estimates) —
+        // the operator-facing "available bonded bitrate" for provisioning a
+        // fixed external encoder. Sender side only (0 on the receiver).
+        aggregate_capacity_bps: snap.aggregate_capacity_bps,
         // The receiver hold servo owns `current_hold_ms` (written on
         // init + every retarget); senders never write it, so report it
         // receiver-side only rather than a misleading 0.
