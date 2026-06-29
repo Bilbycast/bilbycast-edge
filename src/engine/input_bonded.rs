@@ -31,9 +31,145 @@ use bonding_transport::{
 };
 
 use crate::config::models::{
-    BondEqualizationMode, BondFecAlgorithm, BondFecConfig, BondPathTransportConfig, BondQuicTls,
-    BondRistRole, BondedInputConfig,
+    BondEqualizationMode, BondFecAlgorithm, BondFecConfig, BondPathConfig, BondPathTransportConfig,
+    BondQuicTls, BondRistRole, BondedInputConfig,
 };
+use crate::tunnel::config::TunnelDirection;
+use crate::tunnel::crypto::TunnelCipher;
+use crate::tunnel::udp_forwarder::UdpForwarderStats;
+use crate::tunnel::udp_relay_client::NativeRelayParams;
+
+use bonding_transport::{AttachedBridgeEnds, AttachedChannels};
+
+/// Synthetic placeholder peer for an in-process **attached** (relay) bond leg.
+/// The edge bridge owns the single real relay peer, so `AttachedPath::send_to`
+/// ignores its `to` arg — but `primary_peer` must be `Some(_)` or the bond
+/// drops the leg from aggregation (see `bonding-transport` `sender.rs`). The
+/// value is never put on a wire; `127.0.0.1:9` (discard) is a stable sentinel.
+pub(crate) const SYNTHETIC_ATTACHED_PEER: &str = "127.0.0.1:9";
+
+/// Output of [`build_receiver_cfg`] / [`build_sender_cfg`]: the bond socket
+/// config plus, for any relay legs, the in-process bridge ends + the path-side
+/// attachment channels keyed by `PathId`. The caller spawns one
+/// `run_native_relay_leg_inproc` per [`RelayLegBridge`] and hands `attachments`
+/// to `BondSocket::{receiver,sender}_attached`.
+pub(crate) struct BondBuild {
+    pub cfg: BondSocketConfig,
+    pub attachments: std::collections::HashMap<u8, AttachedChannels>,
+    pub bridges: Vec<RelayLegBridge>,
+}
+
+/// One relay leg's bridge setup — everything `run_native_relay_leg_inproc`
+/// needs, paired with the leg name for logging.
+pub(crate) struct RelayLegBridge {
+    pub params: NativeRelayParams,
+    /// Conditional tunnel AEAD: `Some` only when the bond is UNKEYED (the leg's
+    /// `tunnel_encryption_key` is the single layer); `None` when the bond's own
+    /// `0xBD` key is the single layer (the attached path seals it).
+    pub cipher: Option<Arc<TunnelCipher>>,
+    pub stats: Arc<UdpForwarderStats>,
+    pub bridge: AttachedBridgeEnds,
+    pub leg_name: String,
+}
+
+/// Build the bridge + attachment channels for one relay leg, and the
+/// `Attached` path-transport that goes into the bond socket config.
+///
+/// `bond_has_key` is whether the bond carries its own `encryption_key`. This is
+/// the **fail-closed conditional-AEAD decision** — and it MUST be identical on
+/// the output (sender) and input (receiver) legs (validation enforces the
+/// single-layer rule on both ends together): bond-keyed ⇒ the bridge cipher is
+/// `None` and the attached path seals `0xBD`; bond-unkeyed ⇒ the bridge cipher
+/// is the leg's `TunnelCipher` and the attached path is plaintext.
+pub(crate) fn prepare_relay_leg(
+    p: &BondPathConfig,
+    bond_has_key: bool,
+    direction: TunnelDirection,
+) -> anyhow::Result<(AttachedChannels, RelayLegBridge, BondPathTxTransport)> {
+    let BondPathTransportConfig::Relay {
+        tunnel_id,
+        relay_addrs,
+        tunnel_bind_secret,
+        tunnel_encryption_key,
+        interface,
+        source,
+        gateway,
+    } = &p.transport
+    else {
+        anyhow::bail!("internal: prepare_relay_leg called on a non-relay leg");
+    };
+
+    let tunnel_uuid = uuid::Uuid::parse_str(tunnel_id.trim())
+        .map_err(|e| anyhow::anyhow!("relay bond leg '{}': invalid tunnel_id: {e}", p.name))?;
+    if relay_addrs.is_empty() {
+        anyhow::bail!("relay bond leg '{}': at least one relay address required", p.name);
+    }
+
+    // Conditional cipher — fail-closed single-layer (see fn docs). Validation
+    // already rejected "neither" and "both"; this mirrors that decision.
+    let cipher = if bond_has_key {
+        None
+    } else {
+        let key = tunnel_encryption_key.as_deref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "relay bond leg '{}': bond is unencrypted and the leg has no \
+                 tunnel_encryption_key (would blackhole — validation should have caught this)",
+                p.name
+            )
+        })?;
+        Some(Arc::new(TunnelCipher::new(key.trim()).map_err(|e| {
+            anyhow::anyhow!("relay bond leg '{}': invalid tunnel_encryption_key: {e}", p.name)
+        })?))
+    };
+
+    let (att, ends) = AttachedChannels::new();
+    let params = NativeRelayParams {
+        tunnel_id: tunnel_uuid,
+        relay_addrs: relay_addrs.clone(),
+        direction,
+        tunnel_bind_secret: tunnel_bind_secret.clone(),
+        interface: interface.clone(),
+        source: source.clone(),
+        gateway: gateway.clone(),
+    };
+    let bridge = RelayLegBridge {
+        params,
+        cipher,
+        stats: Arc::new(UdpForwarderStats::default()),
+        bridge: ends,
+        leg_name: p.name.clone(),
+    };
+    let synthetic = parse_sockaddr(SYNTHETIC_ATTACHED_PEER)?;
+    Ok((att, bridge, BondPathTxTransport::Attached { primary_peer: synthetic }))
+}
+
+/// Spawn one in-process relay bridge per relay leg under a child of `cancel`.
+/// Shared by the bonded input (ingress legs) and output (egress legs). Each
+/// bridge drains `from_bond` → relay and pumps relay → `to_bond`, drop-on-full
+/// both directions; it self-redials the relay on failover without tearing down
+/// the leg channels.
+pub(crate) fn spawn_relay_leg_bridges(bridges: Vec<RelayLegBridge>, cancel: &CancellationToken) {
+    for b in bridges {
+        let RelayLegBridge {
+            params,
+            cipher,
+            stats,
+            bridge,
+            leg_name,
+        } = b;
+        let AttachedBridgeEnds { to_bond, from_bond } = bridge;
+        let leg_cancel = cancel.child_token();
+        tokio::spawn(async move {
+            if let Err(e) = crate::tunnel::udp_relay_client::run_native_relay_leg_inproc(
+                params, leg_cancel, stats, cipher, to_bond, from_bond,
+            )
+            .await
+            {
+                tracing::warn!("relay bond leg '{leg_name}' bridge exited: {e}");
+            }
+        });
+    }
+}
 
 /// Equalization latency budget (= the bonding-latency knob) applied when a
 /// bonded input/output enables equalization but leaves both
@@ -103,7 +239,7 @@ pub fn spawn_bonded_input(
             super::bond_leg_probe::leg_keys_for_paths(&config.paths),
         );
 
-        let socket_cfg = match build_receiver_cfg(&config) {
+        let build = match build_receiver_cfg(&config) {
             Ok(c) => c,
             Err(e) => {
                 tracing::error!("bonded input '{}': config translation failed: {}", input_id, e);
@@ -116,8 +252,20 @@ pub fn spawn_bonded_input(
                 return;
             }
         };
+        let BondBuild {
+            cfg: socket_cfg,
+            attachments,
+            bridges,
+        } = build;
 
-        let socket = match BondSocket::receiver(socket_cfg).await {
+        // Spawn one in-process relay bridge per relay leg BEFORE the socket
+        // binds — each owns its relay socket (Register/keepalive + failover)
+        // and pumps the attached leg's channels with no loopback hop. The
+        // bridge task lives under the input's cancel token; relay rotation
+        // re-Registers on a fresh socket but the leg channels persist.
+        spawn_relay_leg_bridges(bridges, &cancel);
+
+        let socket = match BondSocket::receiver_attached(socket_cfg, attachments).await {
             Ok(s) => s,
             Err(e) => {
                 tracing::error!("bonded input '{}': bind failed: {}", input_id, e);
@@ -304,12 +452,16 @@ fn publish(
 
 /// Translate an edge `BondedInputConfig` into a
 /// `bonding_transport::BondSocketConfig` for the receiver side.
-pub(crate) fn build_receiver_cfg(cfg: &BondedInputConfig) -> anyhow::Result<BondSocketConfig> {
+pub(crate) fn build_receiver_cfg(cfg: &BondedInputConfig) -> anyhow::Result<BondBuild> {
     let mut out = BondSocketConfig {
         flow_id: cfg.bond_flow_id,
         paths: Vec::with_capacity(cfg.paths.len()),
         ..Default::default()
     };
+    let bond_has_key = cfg.encryption_key.is_some();
+    let mut attachments: std::collections::HashMap<u8, AttachedChannels> =
+        std::collections::HashMap::new();
+    let mut bridges: Vec<RelayLegBridge> = Vec::new();
     if let Some(ms) = cfg.hold_ms {
         out.hold_time = Duration::from_millis(ms as u64);
     }
@@ -372,20 +524,40 @@ pub(crate) fn build_receiver_cfg(cfg: &BondedInputConfig) -> anyhow::Result<Bond
         }
     }
     for p in &cfg.paths {
+        // A bonded INPUT relay leg registers `ingress` with the relay (it
+        // receives media; the matching bonded output leg registers `egress`).
+        let transport = if matches!(&p.transport, BondPathTransportConfig::Relay { .. }) {
+            let (att, bridge, t) =
+                prepare_relay_leg(p, bond_has_key, TunnelDirection::Ingress)?;
+            attachments.insert(p.id, att);
+            bridges.push(bridge);
+            t
+        } else {
+            translate_transport_for_receiver(&p.transport)?
+        };
         out.paths.push(BondPathTxCfg {
             id: p.id,
             name: p.name.clone(),
             weight_hint: p.weight_hint,
-            transport: translate_transport_for_receiver(&p.transport)?,
+            transport,
         });
     }
-    Ok(out)
+    Ok(BondBuild {
+        cfg: out,
+        attachments,
+        bridges,
+    })
 }
 
 fn translate_transport_for_receiver(
     t: &BondPathTransportConfig,
 ) -> anyhow::Result<BondPathTxTransport> {
     Ok(match t {
+        // Relay legs are translated via `prepare_relay_leg` (they need bridge
+        // channels), never here.
+        BondPathTransportConfig::Relay { .. } => {
+            anyhow::bail!("internal: relay bond leg must be prepared via prepare_relay_leg")
+        }
         BondPathTransportConfig::Udp {
             bind,
             remote,
@@ -513,6 +685,7 @@ pub(crate) fn decode_bond_key(hex: &str) -> anyhow::Result<Vec<u8>> {
 pub(crate) fn bond_transport_label(t: &BondPathTransportConfig) -> String {
     match t {
         BondPathTransportConfig::Udp { .. } => "udp".to_string(),
+        BondPathTransportConfig::Relay { .. } => "relay".to_string(),
         BondPathTransportConfig::Rist { .. } => "rist".to_string(),
         BondPathTransportConfig::Quic { .. } => "quic".to_string(),
     }
@@ -525,6 +698,12 @@ pub(crate) fn bond_transport_label(t: &BondPathTransportConfig) -> String {
 pub(crate) fn bond_path_interface(t: &BondPathTransportConfig) -> Option<String> {
     match t {
         BondPathTransportConfig::Udp {
+            interface, gateway, ..
+        } if gateway.is_none() => interface.clone(),
+        // A relay leg's bridge egresses the configured NIC (interface-mode);
+        // surface it for the cellular signal-strip join. Gateway-mode legs
+        // steer via the policy route, not a NIC pin, so report None there.
+        BondPathTransportConfig::Relay {
             interface, gateway, ..
         } if gateway.is_none() => interface.clone(),
         _ => None,
@@ -566,7 +745,7 @@ mod bonded_input_tests {
                  ] }"#,
         )
         .unwrap();
-        let sock = build_receiver_cfg(&cfg).expect("receiver cfg builds");
+        let sock = build_receiver_cfg(&cfg).expect("receiver cfg builds").cfg;
         assert_eq!(sock.flow_id, 6016);
         assert_eq!(sock.paths.len(), 2);
     }
@@ -578,7 +757,7 @@ mod bonded_input_tests {
         let build = |json: &str| {
             let cfg: crate::config::models::BondedInputConfig =
                 serde_json::from_str(json).unwrap();
-            build_receiver_cfg(&cfg).expect("receiver cfg builds")
+            build_receiver_cfg(&cfg).expect("receiver cfg builds").cfg
         };
 
         // Legacy `true` → Auto; no budget set → defaults to 1000.

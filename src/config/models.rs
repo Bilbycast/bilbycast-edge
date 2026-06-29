@@ -4460,6 +4460,53 @@ pub enum BondPathTransportConfig {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         source: Option<String>,
     },
+    /// **Relayed** leg — this bond leg rides a native plain-UDP relay tunnel
+    /// **in-process** (no `127.0.0.1` loopback hop). The edge bridge owns the
+    /// relay socket: the same Register/keepalive rendezvous + failover the
+    /// native SRT/RIST relay tunnel uses, plus the 16-byte `tunnel_id` prefix —
+    /// so `bilbycast-relay` needs **zero** changes (it still demuxes by prefix
+    /// and forwards verbatim). The leg's direction is auto-derived from the
+    /// side: a bonded **output** leg registers `egress`, a bonded **input** leg
+    /// `ingress` (like the QUIC leg's client/server).
+    ///
+    /// **Fail-closed encryption** (enforced by validation): a relay leg must
+    /// carry **exactly one** encryption layer — the bond's own
+    /// [`BondedOutputConfig::encryption_key`] / [`BondedInputConfig::encryption_key`]
+    /// (`0xBD` AEAD, sealed inside the bond) **or** this leg's
+    /// `tunnel_encryption_key` (the tunnel AEAD the bridge applies under the
+    /// prefix). Neither = silent blackhole; both = wasteful double-encrypt.
+    Relay {
+        /// Relay tunnel id (UUID) — stamped by the manager FK; both ends share
+        /// it so the relay pairs the ingress + egress halves.
+        tunnel_id: String,
+        /// Relay address(es) `host:port`. ≥1 required; extra entries are a
+        /// failover list (the bridge rotates on a dead relay).
+        relay_addrs: Vec<String>,
+        /// Optional 64-hex (32-byte) relay bind secret → HMAC-SHA256 bind token
+        /// in the `Register` (same auth the native SRT/RIST relay tunnel uses).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tunnel_bind_secret: Option<String>,
+        /// Optional 64-hex (32-byte) per-leg tunnel AEAD key. Present **iff**
+        /// the bond is unkeyed (fail-closed — see the variant docs). When set,
+        /// the bridge ChaCha20-Poly1305-seals each datagram under the prefix.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tunnel_encryption_key: Option<String>,
+        /// Optional NIC pin (`"wwan0"`, `"eno4"`) for the bridge's outbound
+        /// relay socket — same `SO_BINDTODEVICE` → `IP_UNICAST_IF` mechanism as
+        /// the UDP leg.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        interface: Option<String>,
+        /// Optional source address (`ip` or `ip/prefix`) the bridge socket
+        /// binds to. Pins the egress source IP; in gateway mode it also keys
+        /// the policy rule.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source: Option<String>,
+        /// Optional gateway-mode next-hop. Requires `source` + `interface`; the
+        /// bridge programs a `from <source>` policy route via the gateway so
+        /// this leg egresses a specific uplink on a shared NIC.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        gateway: Option<String>,
+    },
     /// RIST Simple Profile leg. Unidirectional at the bond layer; set
     /// `role` to match the bonded-input-or-output side of this path.
     Rist {

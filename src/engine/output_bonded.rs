@@ -28,10 +28,10 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use bonding_transport::{
-    BondScheduler, BondSocket, BondSocketConfig, CapacityAwareScheduler, CongestionConfig,
-    FecParams, PacketHints, PathConfig as BondPathTxCfg, PathEvent, PathEventKind, PathPrior,
-    PathTransport as BondPathTxTransport, Priority, RedundancyMode, RedundancyPolicy,
-    RoundRobinScheduler, WeightedRttScheduler,
+    AttachedChannels, BondScheduler, BondSocket, BondSocketConfig, CapacityAwareScheduler,
+    CongestionConfig, FecParams, PacketHints, PathConfig as BondPathTxCfg, PathEvent,
+    PathEventKind, PathPrior, PathTransport as BondPathTxTransport, Priority, RedundancyMode,
+    RedundancyPolicy, RoundRobinScheduler, WeightedRttScheduler,
 };
 
 use crate::config::models::{
@@ -43,7 +43,11 @@ use crate::manager::events::{
 };
 use crate::stats::collector::OutputStatsAccumulator;
 
-use super::input_bonded::{parse_sockaddr, translate_tls};
+use super::input_bonded::{
+    parse_sockaddr, prepare_relay_leg, spawn_relay_leg_bridges, translate_tls, BondBuild,
+    RelayLegBridge,
+};
+use crate::tunnel::config::TunnelDirection;
 use super::packet::RtpPacket;
 use super::ts_pid_remapper::TsPidRemapper;
 use super::ts_program_filter::TsProgramFilter;
@@ -531,8 +535,19 @@ async fn bonded_output_run(
         super::bond_leg_probe::leg_keys_for_paths(&config.paths),
     );
 
-    let socket_cfg = build_sender_cfg(config)?;
+    let BondBuild {
+        cfg: socket_cfg,
+        attachments,
+        bridges,
+    } = build_sender_cfg(config)?;
     let path_ids: Vec<u8> = socket_cfg.paths.iter().map(|p| p.id).collect();
+
+    // Spawn one in-process relay bridge per relay leg BEFORE the socket binds —
+    // each owns its relay socket (Register/keepalive + failover) and pumps the
+    // attached leg's channels with no loopback hop. The bridge tasks live under
+    // the output's cancel token; a relay rotation re-Registers on a fresh socket
+    // but the leg channels persist (the bond leg is never torn down).
+    spawn_relay_leg_bridges(bridges, &cancel);
 
     // Shared handles to the adaptive scheduler's discovered per-leg
     // capacity (bits/sec) — empty for the non-adaptive policies.
@@ -548,14 +563,14 @@ async fn bonded_output_run(
         BondSchedulerKind::RoundRobin => {
             let mut sched = RoundRobinScheduler::new(path_ids.clone());
             sched.set_redundancy(redundancy);
-            BondSocket::sender(socket_cfg, sched)
+            BondSocket::sender_attached(socket_cfg, sched, attachments)
                 .await
                 .map_err(|e| anyhow::anyhow!("bonded sender setup: {e}"))?
         }
         BondSchedulerKind::WeightedRtt => {
             let mut sched = WeightedRttScheduler::new(path_ids.clone());
             sched.set_redundancy(redundancy);
-            BondSocket::sender(socket_cfg, sched)
+            BondSocket::sender_attached(socket_cfg, sched, attachments)
                 .await
                 .map_err(|e| anyhow::anyhow!("bonded sender setup: {e}"))?
         }
@@ -566,7 +581,7 @@ async fn bonded_output_run(
             // lowest-RTT paths.
             let mut sched = WeightedRttScheduler::new(path_ids.clone());
             sched.set_redundancy(redundancy);
-            BondSocket::sender(socket_cfg, sched)
+            BondSocket::sender_attached(socket_cfg, sched, attachments)
                 .await
                 .map_err(|e| anyhow::anyhow!("bonded sender setup: {e}"))?
         }
@@ -606,7 +621,7 @@ async fn bonded_output_run(
             let mut sched = CapacityAwareScheduler::with_paths(priors, cong);
             capacity_handles = sched.capacity_handles();
             sched.set_redundancy(redundancy);
-            BondSocket::sender(socket_cfg, sched)
+            BondSocket::sender_attached(socket_cfg, sched, attachments)
                 .await
                 .map_err(|e| anyhow::anyhow!("bonded sender setup: {e}"))?
         }
@@ -955,12 +970,19 @@ fn derive_retransmit_capacity(cfg: &BondedOutputConfig) -> usize {
     derived.clamp(DEFAULT_CAPACITY, MAX_CAPACITY)
 }
 
-fn build_sender_cfg(cfg: &BondedOutputConfig) -> anyhow::Result<BondSocketConfig> {
+fn build_sender_cfg(cfg: &BondedOutputConfig) -> anyhow::Result<BondBuild> {
     let mut out = BondSocketConfig {
         flow_id: cfg.bond_flow_id,
         paths: Vec::with_capacity(cfg.paths.len()),
         ..Default::default()
     };
+    // Fail-closed conditional-AEAD decision (must match the bonded INPUT leg):
+    // bond-keyed ⇒ the attached path seals 0xBD and the bridge cipher is None;
+    // bond-unkeyed ⇒ the leg's tunnel_encryption_key is the single layer.
+    let bond_has_key = cfg.encryption_key.is_some();
+    let mut attachments: std::collections::HashMap<u8, AttachedChannels> =
+        std::collections::HashMap::new();
+    let mut bridges: Vec<RelayLegBridge> = Vec::new();
     if let Some(ms) = cfg.keepalive_ms {
         out.keepalive_interval = std::time::Duration::from_millis(ms as u64);
     }
@@ -1007,14 +1029,33 @@ fn build_sender_cfg(cfg: &BondedOutputConfig) -> anyhow::Result<BondSocketConfig
         }
     }
     for p in &cfg.paths {
+        // A bonded OUTPUT relay leg registers `egress` with the relay (it sends
+        // media; the matching bonded input leg registers `ingress`). Relay legs
+        // need in-process bridge channels, so they go through `prepare_relay_leg`
+        // rather than the plain transport translation.
+        let transport = if matches!(
+            &p.transport,
+            crate::config::models::BondPathTransportConfig::Relay { .. }
+        ) {
+            let (att, bridge, t) = prepare_relay_leg(p, bond_has_key, TunnelDirection::Egress)?;
+            attachments.insert(p.id, att);
+            bridges.push(bridge);
+            t
+        } else {
+            translate_transport_for_sender(&p.transport)?
+        };
         out.paths.push(BondPathTxCfg {
             id: p.id,
             name: p.name.clone(),
             weight_hint: p.weight_hint,
-            transport: translate_transport_for_sender(&p.transport)?,
+            transport,
         });
     }
-    Ok(out)
+    Ok(BondBuild {
+        cfg: out,
+        attachments,
+        bridges,
+    })
 }
 
 /// Translate the edge's operator-facing congestion knobs into the
@@ -1100,6 +1141,11 @@ fn translate_transport_for_sender(
     use crate::config::models::{BondPathTransportConfig, BondRistRole};
     use bonding_transport::{QuicRole as BondQuicRoleTx, RistRole as BondRistRoleTx};
     Ok(match t {
+        // Relay legs carry in-process bridge channels and are translated via
+        // `prepare_relay_leg` (which builds the `Attached` transport), never here.
+        BondPathTransportConfig::Relay { .. } => {
+            anyhow::bail!("internal: relay bond leg must be prepared via prepare_relay_leg")
+        }
         BondPathTransportConfig::Udp {
             bind,
             remote,
@@ -1204,7 +1250,7 @@ mod bonded_output_tests {
                  ] }"#,
         )
         .unwrap();
-        let sock = build_sender_cfg(&cfg).expect("sender cfg builds");
+        let sock = build_sender_cfg(&cfg).expect("sender cfg builds").cfg;
         assert_eq!(sock.flow_id, 6016);
         assert_eq!(sock.paths.len(), 2);
     }
@@ -1216,7 +1262,7 @@ mod bonded_output_tests {
         let build = |json: &str| {
             let cfg: crate::config::models::BondedOutputConfig =
                 serde_json::from_str(json).unwrap();
-            build_sender_cfg(&cfg).expect("sender cfg builds")
+            build_sender_cfg(&cfg).expect("sender cfg builds").cfg
         };
 
         // Default (no equalization, no redundancy) → Auto, no suppression.

@@ -1686,6 +1686,15 @@ fn validate_bonded_input(c: &crate::config::models::BondedInputConfig) -> Result
         }
         validate_bond_path_transport(&p.transport, /* sender_mode */ false, &p.name)?;
         validate_bond_path_common(p, "bonded input")?;
+        // Fail-closed: a relayed leg must carry exactly one encryption layer.
+        // `is_some()` mirrors the runtime conditional-AEAD decision in
+        // `engine::input_bonded::prepare_relay_leg`.
+        validate_relay_leg_encryption(
+            c.encryption_key.is_some(),
+            &p.transport,
+            "bonded input",
+            &p.name,
+        )?;
     }
     if let Some(ms) = c.hold_ms {
         if !(10..=30_000).contains(&ms) {
@@ -1779,6 +1788,112 @@ fn validate_bond_path_transport(
 ) -> Result<()> {
     use crate::config::models::{BondPathTransportConfig, BondRistRole};
     match t {
+        BondPathTransportConfig::Relay {
+            tunnel_id,
+            relay_addrs,
+            tunnel_bind_secret,
+            tunnel_encryption_key,
+            interface,
+            source,
+            gateway,
+        } => {
+            // Carrier tunnel id must be a valid UUID — the relay pairs the
+            // ingress + egress halves by it (the manager FK stamps both ends).
+            uuid::Uuid::parse_str(tunnel_id.trim()).map_err(|e| {
+                anyhow::anyhow!(
+                    "bonded relay path '{path_name}': invalid tunnel_id '{tunnel_id}': {e}"
+                )
+            })?;
+            if relay_addrs.is_empty() {
+                return Err(anyhow::anyhow!(
+                    "bonded relay path '{path_name}': at least one relay address required"
+                ));
+            }
+            let mut seen = std::collections::HashSet::new();
+            for (idx, addr) in relay_addrs.iter().enumerate() {
+                validate_dialable_host_port(
+                    addr,
+                    &format!("bonded relay path '{path_name}' relay_addrs[{idx}]"),
+                )?;
+                if !seen.insert(addr.as_str()) {
+                    return Err(anyhow::anyhow!(
+                        "bonded relay path '{path_name}': duplicate relay address '{addr}'"
+                    ));
+                }
+            }
+            // Optional 64-hex secrets/keys. The bond-vs-tunnel single-layer
+            // invariant is cross-checked against the bond's encryption_key in
+            // `validate_relay_leg_encryption` (it needs both sides of the
+            // choice); here we only check structural form.
+            if let Some(secret) = tunnel_bind_secret {
+                let s = secret.trim();
+                if s.len() != 64 || !s.bytes().all(|b| b.is_ascii_hexdigit()) {
+                    return Err(anyhow::anyhow!(
+                        "bonded relay path '{path_name}': tunnel_bind_secret must be 64 hex chars (32 bytes)"
+                    ));
+                }
+            }
+            if let Some(key) = tunnel_encryption_key {
+                let k = key.trim();
+                if k.len() != 64 || !k.bytes().all(|b| b.is_ascii_hexdigit()) {
+                    return Err(anyhow::anyhow!(
+                        "bonded relay path '{path_name}': tunnel_encryption_key must be 64 hex chars (32 bytes)"
+                    ));
+                }
+            }
+            if let Some(iface) = interface {
+                if iface.is_empty() || iface.len() > 15 {
+                    return Err(anyhow::anyhow!(
+                        "bonded relay path '{path_name}' interface name must be 1..=15 chars"
+                    ));
+                }
+                if iface.contains('\0') {
+                    return Err(anyhow::anyhow!(
+                        "bonded relay path '{path_name}' interface must not contain NUL"
+                    ));
+                }
+            }
+            // Gateway mode is valid on BOTH sides — both ends of a relay leg
+            // dial OUT to the relay, so each can pin its own egress uplink (a
+            // plain UDP leg restricts gateway to the sender). Requires
+            // source + interface, same family, gateway inside the source subnet.
+            let _ = sender_mode;
+            if let Some(gw) = gateway {
+                let gw_ip: std::net::IpAddr = gw.parse().map_err(|_| {
+                    anyhow::anyhow!("bonded relay path '{path_name}': invalid gateway IP '{gw}'")
+                })?;
+                let src = source.as_deref().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "bonded relay path '{path_name}': `gateway` mode requires `source` \
+                         (the box's address in the gateway's subnet, e.g. 192.168.10.2/24)"
+                    )
+                })?;
+                let src_net = crate::engine::bond_routing::SourceNet::parse(src)
+                    .map_err(|e| anyhow::anyhow!("bonded relay path '{path_name}': {e}"))?;
+                if src_net.addr.is_ipv4() != gw_ip.is_ipv4() {
+                    return Err(anyhow::anyhow!(
+                        "bonded relay path '{path_name}': gateway and source must be the same IP family"
+                    ));
+                }
+                if !same_subnet(src_net.addr, gw_ip, src_net.prefix) {
+                    return Err(anyhow::anyhow!(
+                        "bonded relay path '{path_name}': gateway {gw} is not inside the source \
+                         subnet {src}/{} — it would be unreachable",
+                        src_net.prefix
+                    ));
+                }
+                if interface.is_none() {
+                    return Err(anyhow::anyhow!(
+                        "bonded relay path '{path_name}': `gateway` mode requires `interface` \
+                         (the NIC the relay is reachable on)"
+                    ));
+                }
+            } else if source.is_some() {
+                return Err(anyhow::anyhow!(
+                    "bonded relay path '{path_name}': `source` is only meaningful with `gateway`"
+                ));
+            }
+        }
         BondPathTransportConfig::Udp {
             bind,
             remote,
@@ -1975,6 +2090,10 @@ fn bond_path_bind_addr(
     use crate::config::models::BondPathTransportConfig;
     match t {
         BondPathTransportConfig::Udp { bind, .. } => bind.clone(),
+        // A relay leg's bridge binds an ephemeral (or source-pinned, port 0)
+        // socket to DIAL the relay — there is no fixed local listen port that
+        // could collide with another managed entity, so nothing to register.
+        BondPathTransportConfig::Relay { .. } => None,
         // RIST binds `local_bind` on both sides (required receiver, optional
         // sender source). Register whichever is pinned.
         BondPathTransportConfig::Rist { local_bind, .. } => local_bind.clone(),
@@ -5221,6 +5340,15 @@ fn validate_bonded_output(c: &crate::config::models::BondedOutputConfig) -> Resu
         }
         validate_bond_path_transport(&p.transport, /* sender_mode */ true, &p.name)?;
         validate_bond_path_common(p, &format!("bonded output '{}'", c.id))?;
+        // Fail-closed: a relayed leg must carry exactly one encryption layer.
+        // `is_some()` mirrors the runtime conditional-AEAD decision in
+        // `engine::input_bonded::prepare_relay_leg`.
+        validate_relay_leg_encryption(
+            c.encryption_key.is_some(),
+            &p.transport,
+            &format!("bonded output '{}'", c.id),
+            &p.name,
+        )?;
     }
     if let Some(ms) = c.max_bonding_latency_ms {
         if !(50..=5_000).contains(&ms) {
@@ -5300,6 +5428,54 @@ fn validate_bond_fec_exclusive(
         ));
     }
     Ok(())
+}
+
+/// Fail-closed encryption invariant for a **relayed** bonded leg: exactly ONE
+/// encryption layer must protect it — the bond's own `encryption_key` (`0xBD`
+/// AEAD, sealed inside the bond and applied on the attached path) XOR this
+/// leg's `tunnel_encryption_key` (the tunnel AEAD the bridge applies under the
+/// 16-byte prefix). Neither = media transits the public relay in the clear (a
+/// silent confidentiality blackhole if the operator believed it was protected);
+/// both = a wasteful double-encrypt AND a real footgun (the two ends must agree
+/// which layer is live — a mismatch is total blackout). The manager FK stamps
+/// the choice on both ends together; this rejects an inconsistent hand-authored
+/// config. Non-relay legs are unaffected (the bond key, or none, governs).
+///
+/// `bond_has_key` must mirror the runtime decision in
+/// `engine::input_bonded::prepare_relay_leg` (`encryption_key.is_some()`).
+fn validate_relay_leg_encryption(
+    bond_has_key: bool,
+    transport: &crate::config::models::BondPathTransportConfig,
+    ctx: &str,
+    path_name: &str,
+) -> Result<()> {
+    use crate::config::models::BondPathTransportConfig;
+    let BondPathTransportConfig::Relay {
+        tunnel_encryption_key,
+        ..
+    } = transport
+    else {
+        return Ok(());
+    };
+    let leg_has_key = tunnel_encryption_key
+        .as_deref()
+        .map(|k| !k.trim().is_empty())
+        .unwrap_or(false);
+    match (bond_has_key, leg_has_key) {
+        (true, true) => Err(anyhow::anyhow!(
+            "{ctx} relay path '{path_name}': both the bond `encryption_key` and the leg \
+             `tunnel_encryption_key` are set — a relayed bonded leg must carry EXACTLY ONE \
+             encryption layer (double-encrypt wastes a ChaCha20 pass and risks a layer-mismatch \
+             blackout). Drop the leg's `tunnel_encryption_key`; the bond key already protects it."
+        )),
+        (false, false) => Err(anyhow::anyhow!(
+            "{ctx} relay path '{path_name}': neither the bond `encryption_key` nor the leg \
+             `tunnel_encryption_key` is set — media would transit the public relay in the clear. \
+             Set the bond `encryption_key` (protects every leg) OR this leg's \
+             `tunnel_encryption_key`."
+        )),
+        _ => Ok(()),
+    }
 }
 
 /// Validate a 64-hex-char bond AEAD key, if present.
@@ -9615,11 +9791,12 @@ mod tests {
             if path.extension().and_then(|e| e.to_str()) != Some("json") {
                 continue;
             }
-            // Edge configs only — skip the relay config (different
-            // shape) and the encrypted secrets file (opaque v1: blob,
-            // not JSON).
+            // Edge configs only — skip relay configs (`relay.json` +
+            // `relay-*.json`: a different schema with no `version`, e.g. the
+            // bond-over-relay test relays) and the encrypted secrets file
+            // (opaque `v1:` blob, not JSON). No edge config is named `relay*`.
             let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-            if name == "relay.json" || name == "secrets.json" {
+            if name == "secrets.json" || name.starts_with("relay") {
                 continue;
             }
             let raw = fs::read_to_string(&path)
@@ -11288,5 +11465,180 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("client-only"), "got: {err}");
+    }
+
+    // ── Relayed bonded leg (loopback-free in-process bridge) ──────────────
+
+    #[test]
+    fn bond_relay_leg_serde_and_structural_validation() {
+        use crate::config::models::BondPathTransportConfig;
+        // Canonical relay leg the manager wizard emits (bond-keyed bond, so the
+        // leg carries NO tunnel_encryption_key — the single layer is the bond).
+        let j = serde_json::json!({
+            "type": "relay",
+            "tunnel_id": "550e8400-e29b-41d4-a716-446655440000",
+            "relay_addrs": ["relay.example.com:7000", "203.0.113.9:7000"]
+        });
+        let leg: BondPathTransportConfig = serde_json::from_value(j).unwrap();
+        assert!(matches!(leg, BondPathTransportConfig::Relay { .. }));
+        // Valid on BOTH sides (both ends dial out to the relay).
+        super::validate_bond_path_transport(&leg, true, "leg-a").unwrap();
+        super::validate_bond_path_transport(&leg, false, "leg-a").unwrap();
+        // Stats label + no local-port registration (the bridge dials out).
+        assert_eq!(
+            crate::engine::input_bonded::bond_transport_label(&leg),
+            "relay"
+        );
+        assert!(
+            super::bond_path_bind_addr(&leg, true).is_none(),
+            "relay leg pins no local listen port"
+        );
+        // Duplicate relay address rejected.
+        let dup: BondPathTransportConfig = serde_json::from_value(serde_json::json!({
+            "type": "relay", "tunnel_id": "550e8400-e29b-41d4-a716-446655440000",
+            "relay_addrs": ["1.2.3.4:7000", "1.2.3.4:7000"]
+        }))
+        .unwrap();
+        let e = super::validate_bond_path_transport(&dup, true, "x")
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("duplicate relay address"), "got: {e}");
+    }
+
+    #[test]
+    fn bond_relay_leg_rejects_bad_uuid_and_empty_addrs() {
+        use crate::config::models::BondPathTransportConfig;
+        let bad_uuid: BondPathTransportConfig = serde_json::from_value(serde_json::json!({
+            "type": "relay", "tunnel_id": "not-a-uuid", "relay_addrs": ["1.2.3.4:7000"]
+        }))
+        .unwrap();
+        let e = super::validate_bond_path_transport(&bad_uuid, true, "x")
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("invalid tunnel_id"), "got: {e}");
+
+        let no_addr: BondPathTransportConfig = serde_json::from_value(serde_json::json!({
+            "type": "relay", "tunnel_id": "550e8400-e29b-41d4-a716-446655440000", "relay_addrs": []
+        }))
+        .unwrap();
+        let e = super::validate_bond_path_transport(&no_addr, true, "x")
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("at least one relay address"), "got: {e}");
+    }
+
+    #[test]
+    fn bond_relay_leg_gateway_requires_source_and_interface() {
+        use crate::config::models::BondPathTransportConfig;
+        // gateway without source → reject.
+        let g: BondPathTransportConfig = serde_json::from_value(serde_json::json!({
+            "type": "relay", "tunnel_id": "550e8400-e29b-41d4-a716-446655440000",
+            "relay_addrs": ["1.2.3.4:7000"], "gateway": "192.168.10.1"
+        }))
+        .unwrap();
+        let e = super::validate_bond_path_transport(&g, true, "x")
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("requires `source`"), "got: {e}");
+
+        // gateway + source + interface, gateway inside source subnet → ok, both sides.
+        let ok: BondPathTransportConfig = serde_json::from_value(serde_json::json!({
+            "type": "relay", "tunnel_id": "550e8400-e29b-41d4-a716-446655440000",
+            "relay_addrs": ["1.2.3.4:7000"], "gateway": "192.168.10.1",
+            "source": "192.168.10.2/24", "interface": "eno4"
+        }))
+        .unwrap();
+        super::validate_bond_path_transport(&ok, true, "x").unwrap();
+        super::validate_bond_path_transport(&ok, false, "x").unwrap();
+
+        // source without gateway → reject (only meaningful with gateway).
+        let s: BondPathTransportConfig = serde_json::from_value(serde_json::json!({
+            "type": "relay", "tunnel_id": "550e8400-e29b-41d4-a716-446655440000",
+            "relay_addrs": ["1.2.3.4:7000"], "source": "192.168.10.2/24"
+        }))
+        .unwrap();
+        let e = super::validate_bond_path_transport(&s, true, "x")
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("only meaningful with `gateway`"), "got: {e}");
+    }
+
+    #[test]
+    fn bond_relay_fail_closed_encryption_invariant() {
+        use crate::config::models::BondPathTransportConfig;
+        let relay = |tunnel_key: Option<&str>| -> BondPathTransportConfig {
+            let mut v = serde_json::json!({
+                "type": "relay", "tunnel_id": "550e8400-e29b-41d4-a716-446655440000",
+                "relay_addrs": ["1.2.3.4:7000"]
+            });
+            if let Some(k) = tunnel_key {
+                v["tunnel_encryption_key"] = serde_json::json!(k);
+            }
+            serde_json::from_value(v).unwrap()
+        };
+        let key = "a".repeat(64);
+
+        // BOTH layers → reject (double-encrypt / mismatch footgun).
+        let e = super::validate_relay_leg_encryption(true, &relay(Some(&key)), "ctx", "p")
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("EXACTLY ONE"), "both → reject: {e}");
+
+        // NEITHER layer → reject (cleartext over the public relay).
+        let e = super::validate_relay_leg_encryption(false, &relay(None), "ctx", "p")
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("in the clear"), "neither → reject: {e}");
+
+        // Exactly one layer → OK, either way.
+        super::validate_relay_leg_encryption(true, &relay(None), "ctx", "p").unwrap();
+        super::validate_relay_leg_encryption(false, &relay(Some(&key)), "ctx", "p").unwrap();
+
+        // Non-relay legs are unaffected by the relay rule.
+        let udp: BondPathTransportConfig = serde_json::from_value(serde_json::json!({
+            "type": "udp", "bind": "0.0.0.0:7400"
+        }))
+        .unwrap();
+        super::validate_relay_leg_encryption(false, &udp, "ctx", "p").unwrap();
+    }
+
+    #[test]
+    fn bonded_input_output_relay_leg_end_to_end_validation() {
+        // bond-keyed + leg has NO tunnel key → exactly one layer → accepted.
+        let bond_key = "b".repeat(64);
+        let cfg: crate::config::models::BondedInputConfig =
+            serde_json::from_value(serde_json::json!({
+                "bond_flow_id": 42,
+                "encryption_key": bond_key,
+                "paths": [{
+                    "id": 0, "name": "relay-leg",
+                    "transport": {
+                        "type": "relay",
+                        "tunnel_id": "550e8400-e29b-41d4-a716-446655440000",
+                        "relay_addrs": ["relay.example.com:7000"]
+                    }
+                }]
+            }))
+            .unwrap();
+        super::validate_bonded_input(&cfg).expect("bond-keyed relay input validates");
+
+        // bond-keyed + leg ALSO carries a tunnel key → double-encrypt → rejected.
+        let cfg: crate::config::models::BondedOutputConfig =
+            serde_json::from_value(serde_json::json!({
+                "id": "o1", "name": "bond", "bond_flow_id": 42,
+                "encryption_key": bond_key,
+                "paths": [{
+                    "id": 0, "name": "relay-leg",
+                    "transport": {
+                        "type": "relay",
+                        "tunnel_id": "550e8400-e29b-41d4-a716-446655440000",
+                        "relay_addrs": ["relay.example.com:7000"],
+                        "tunnel_encryption_key": "c".repeat(64)
+                    }
+                }]
+            }))
+            .unwrap();
+        let e = super::validate_bonded_output(&cfg).unwrap_err().to_string();
+        assert!(e.contains("EXACTLY ONE"), "double-encrypt relay output rejected: {e}");
     }
 }

@@ -33,8 +33,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
+use bytes::Bytes;
 use tokio::net::{lookup_host, UdpSocket};
-use tokio::sync::watch;
+use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -45,7 +46,7 @@ use super::protocol::{
     TUNNEL_PROTOCOL_VERSION,
 };
 use super::relay_client::RelayTunnelState;
-use super::udp_forwarder::{self, PlainUdpLink, UdpForwarderStats};
+use super::udp_forwarder::{self, DatagramLink, PlainUdpLink, UdpForwarderStats};
 use crate::manager::events::EventSender;
 
 /// How often the edge re-sends a `Register` (keepalive) to maintain the relay's
@@ -402,6 +403,245 @@ async fn rotate_after(cancel: &CancellationToken, idx: &mut usize) {
         _ = cancel.cancelled() => {}
         _ = tokio::time::sleep(RETRY_DELAY) => {}
     }
+}
+
+/// Run a native plain-UDP **relay bond leg** entirely in-process: connect
+/// outbound to the relay, Register/keepalive, and bridge the bond's framed
+/// datagrams ↔ the relay socket over `from_bond` / `to_bond` channels — with
+/// NO `127.0.0.1` loopback hop and NO `TunnelManager` loopback tunnel.
+///
+/// This shares the relay-socket lifecycle (resolve → connect → Register /
+/// keepalive → liveness-watchdog → failover rotation → gateway routing) with
+/// [`run_native_relay_tunnel`]; only the forwarder differs. Instead of
+/// `udp_forwarder::run_egress`/`run_ingress` (which own a loopback UDP socket),
+/// the in-process pump:
+///   - drains `from_bond` (datagrams the bond scheduler emitted on this leg),
+///     conditionally tunnel-AEAD-encrypts, prepends the 16-byte `tunnel_id`
+///     ([`protocol::encode_udp_datagram`]) and writes the relay socket —
+///     **byte-identical** to `run_egress`, so `bilbycast-relay` is unchanged;
+///   - reads the relay socket ([`PlainUdpLink::recv_datagram`], which peels
+///     control acks), decodes the prefix, conditionally decrypts, and
+///     `to_bond.try_send`s the inner datagram to the bond receiver.
+///
+/// Both directions are pumped regardless of `direction` (a bonded leg carries
+/// media one way and the NACK/keepalive back-channel the other); `direction`
+/// only sets the `Register` direction so the relay pairs the two halves.
+///
+/// **Conditional AEAD** (`cipher`): `Some` ONLY when the bond is UNKEYED (the
+/// leg's `tunnel_encryption_key` is the single layer the bridge applies);
+/// `None` when the bond's own `0xBD` key is the single layer (the attached path
+/// seals/opens it). This decision MUST match the peer edge's leg — a mismatch
+/// is a total blackout, surfaced via `decrypt_errors` (the key-skew watchdog).
+///
+/// **Relay rotation**: the bond leg channels (`from_bond` / `to_bond`) PERSIST
+/// across a relay failover — only the socket + Register task are rebuilt; the
+/// bond leg is never torn down for a relay rotation. Returns only on
+/// cancellation or when the bond drops its end (leg removed).
+#[allow(clippy::too_many_arguments)]
+pub async fn run_native_relay_leg_inproc(
+    params: NativeRelayParams,
+    cancel: CancellationToken,
+    stats: Arc<UdpForwarderStats>,
+    cipher: Option<Arc<TunnelCipher>>,
+    to_bond: mpsc::Sender<Bytes>,
+    mut from_bond: mpsc::Receiver<Bytes>,
+) -> Result<()> {
+    if params.relay_addrs.is_empty() {
+        anyhow::bail!("native-UDP relay bond leg requires at least one relay address");
+    }
+
+    let bind_token = params.tunnel_bind_secret.as_deref().map(|secret| {
+        super::auth::compute_bind_token(
+            &params.tunnel_id.to_string(),
+            direction_str(params.direction),
+            secret,
+        )
+    });
+
+    // Gateway-mode policy routing (best-effort) BEFORE any socket binds the
+    // source IP. Tracked so it's torn down on every exit path below. Unlike a
+    // UDP leg (sender-only gateway), BOTH ends of a relay leg dial out, so
+    // gateway mode is valid on either direction.
+    let gateway_programmed = match (
+        params.gateway.as_deref(),
+        params.source.as_deref(),
+        params.interface.as_deref(),
+    ) {
+        (Some(gw), Some(src), Some(iface)) => {
+            program_tunnel_gateway(&params.tunnel_id, iface, src, gw).await
+        }
+        _ => false,
+    };
+
+    let mut idx = 0usize;
+    let outcome: Result<()> = 'outer: loop {
+        if cancel.is_cancelled() {
+            break 'outer Ok(());
+        }
+        let relay_addr = params.relay_addrs[idx % params.relay_addrs.len()].clone();
+
+        let resolved = match lookup_host(&relay_addr).await.ok().and_then(|mut it| it.next()) {
+            Some(a) => a,
+            None => {
+                tracing::warn!(tunnel_id = %params.tunnel_id, "native-UDP relay bond leg: cannot resolve '{relay_addr}'");
+                rotate_after(&cancel, &mut idx).await;
+                continue;
+            }
+        };
+        let sock = match connect_socket(
+            resolved,
+            params.interface.as_deref(),
+            params.source.as_deref(),
+        )
+        .await
+        {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(tunnel_id = %params.tunnel_id, "native-UDP relay bond leg: bind/connect to {resolved} failed: {e}");
+                rotate_after(&cancel, &mut idx).await;
+                continue;
+            }
+        };
+
+        tracing::info!(
+            tunnel_id = %params.tunnel_id,
+            relay = %resolved,
+            direction = %params.direction,
+            encrypted = cipher.is_some(),
+            "native-UDP relay bond leg connecting"
+        );
+
+        let link = PlainUdpLink::new(sock.clone());
+        let last_ack = link.last_ack_ms.clone();
+        // Seed liveness to "now" — PlainUdpLink::new leaves last_ack at 0, which
+        // the watchdog would read as silent-forever and rotate instantly.
+        last_ack.store(udp_forwarder::now_epoch_ms(), Ordering::Relaxed);
+
+        let attempt_cancel = cancel.child_token();
+
+        // Register / keepalive + liveness watchdog (mirrors run_native_relay_tunnel,
+        // minus the RelayTunnelState watch — bond leg health is the bond's own job).
+        {
+            let reg_sock = sock.clone();
+            let reg_cancel = attempt_cancel.clone();
+            let tunnel_id = params.tunnel_id;
+            let direction = relay_direction(params.direction);
+            let bind_token = bind_token.clone();
+            let last_ack = last_ack.clone();
+            tokio::spawn(async move {
+                let register = match encode_udp_control(&UdpRelayControl::Register {
+                    tunnel_id,
+                    direction,
+                    bind_token,
+                    protocol_version: TUNNEL_PROTOCOL_VERSION,
+                }) {
+                    Ok(b) => b,
+                    Err(_) => return,
+                };
+                let _ = reg_sock.send(&register).await;
+                let mut tick = tokio::time::interval(KEEPALIVE_INTERVAL);
+                tick.tick().await; // consume the immediate first tick
+                loop {
+                    tokio::select! {
+                        _ = reg_cancel.cancelled() => return,
+                        _ = tick.tick() => {
+                            let _ = reg_sock.send(&register).await;
+                            let since = udp_forwarder::now_epoch_ms()
+                                .saturating_sub(last_ack.load(Ordering::Relaxed));
+                            if since > RELAY_DEAD_TIMEOUT_MS {
+                                tracing::warn!(%tunnel_id, "native-UDP relay bond leg silent for {since} ms — rotating");
+                                reg_cancel.cancel();
+                                return;
+                            }
+                        }
+                    }
+                }
+            });
+        }
+
+        // In-process pump until the attempt is cancelled (relay dead / outer
+        // shutdown), the link errors, or the bond drops its end (leg removed).
+        loop {
+            tokio::select! {
+                _ = attempt_cancel.cancelled() => break,
+                // Bond → relay. `from_bond` yields an already-bond-framed datagram
+                // (0xBD-sealed when the bond is keyed, else plaintext 0xBC). The
+                // `await` here is the DRAIN side, not a backpressure injection on
+                // the bond sender (the bond `try_send`'d into the path channel and
+                // drops on full), so it is safe — never stalls the bond.
+                maybe = from_bond.recv() => {
+                    let Some(frame) = maybe else {
+                        // Bond dropped its sender → this leg is gone for good.
+                        break 'outer Ok(());
+                    };
+                    let payload = if let Some(c) = &cipher {
+                        match c.encrypt(frame.as_ref()) {
+                            Ok(p) => p,
+                            Err(e) => {
+                                stats.send_errors.fetch_add(1, Ordering::Relaxed);
+                                tracing::debug!(tunnel_id = %params.tunnel_id, "relay bond leg encrypt error: {e}");
+                                continue;
+                            }
+                        }
+                    } else {
+                        frame.to_vec()
+                    };
+                    // Byte-identical framing to udp_forwarder::run_egress so the
+                    // relay forwards it verbatim with zero changes.
+                    let datagram = protocol::encode_udp_datagram(&params.tunnel_id, &payload);
+                    match link.send_datagram(Bytes::from(datagram)) {
+                        Ok(()) => {
+                            stats.packets_sent.fetch_add(1, Ordering::Relaxed);
+                            stats.bytes_sent.fetch_add(frame.len() as u64, Ordering::Relaxed);
+                        }
+                        Err(e) => {
+                            stats.send_errors.fetch_add(1, Ordering::Relaxed);
+                            tracing::debug!(tunnel_id = %params.tunnel_id, "relay bond leg send error: {e}");
+                        }
+                    }
+                }
+                // Relay → bond.
+                res = link.recv_datagram() => {
+                    let datagram = match res {
+                        Ok(d) => d,
+                        Err(e) => {
+                            tracing::debug!(tunnel_id = %params.tunnel_id, "relay bond leg recv error: {e}");
+                            break;
+                        }
+                    };
+                    if let Some((_tid, enc)) = protocol::decode_udp_datagram(&datagram) {
+                        let payload = if let Some(c) = &cipher {
+                            match c.decrypt(enc) {
+                                Ok(p) => p,
+                                Err(_) => {
+                                    stats.decrypt_errors.fetch_add(1, Ordering::Relaxed);
+                                    continue;
+                                }
+                            }
+                        } else {
+                            enc.to_vec()
+                        };
+                        stats.packets_received.fetch_add(1, Ordering::Relaxed);
+                        stats.bytes_received.fetch_add(payload.len() as u64, Ordering::Relaxed);
+                        // Drop-on-full — the bond owns recovery (cross-leg ARQ/FEC).
+                        // NEVER await: the attached-path recv loop drains this and
+                        // a full channel is leg loss like any other.
+                        let _ = to_bond.try_send(Bytes::from(payload));
+                    }
+                }
+            }
+        }
+
+        if cancel.is_cancelled() {
+            break 'outer Ok(());
+        }
+        rotate_after(&cancel, &mut idx).await;
+    };
+
+    if gateway_programmed {
+        teardown_tunnel_gateway(&params.tunnel_id).await;
+    }
+    outcome
 }
 
 // ── Direct mode (peer-to-peer, no relay) ──

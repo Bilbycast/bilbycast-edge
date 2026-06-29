@@ -127,6 +127,18 @@ pub(crate) fn normalize(t: &BondPathTransportConfig) -> LegNet {
             gateway: None,
             remote: remote.clone(),
         },
+        BondPathTransportConfig::Relay {
+            relay_addrs, interface, source, gateway, ..
+        } => LegNet {
+            // The bridge's outbound relay socket is the leg's real egress: it
+            // pins/binds exactly like a UDP leg and dials the relay as its
+            // "remote", so reachability/egress checks target the relay.
+            transport: "relay",
+            interface: interface.clone(),
+            source: source.clone(),
+            gateway: gateway.clone(),
+            remote: relay_addrs.first().cloned(),
+        },
         BondPathTransportConfig::Quic { role, addr, bind, interface, .. } => {
             // Client role dials `addr`; server role *binds* it (listener).
             let is_client = matches!(role, crate::config::models::BondQuicRole::Client);
