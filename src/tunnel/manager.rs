@@ -632,11 +632,23 @@ impl TunnelManager {
     }
 
     /// Destroy (stop) a tunnel by ID.
-    pub async fn destroy_tunnel(&self, id: &str) -> anyhow::Result<()> {
-        let (_, runtime) = self
-            .tunnels
-            .remove(id)
-            .ok_or_else(|| anyhow::anyhow!("Tunnel '{id}' not found"))?;
+    ///
+    /// Returns `Ok(true)` when a live runtime tunnel was found and cancelled,
+    /// or `Ok(false)` when no such tunnel was in the registry. A tunnel can
+    /// self-evict from the registry on a connect failure (relay unreachable,
+    /// port-bind conflict), so "already gone" is the *expected* end state of a
+    /// delete, not an error — callers reconcile `config.json` regardless.
+    /// Keeping this idempotent lets the surgical `delete_tunnel` paths clean an
+    /// orphaned config entry instead of failing with "Tunnel not found" (and
+    /// then resurrecting it on the next restart).
+    pub async fn destroy_tunnel(&self, id: &str) -> anyhow::Result<bool> {
+        let Some((_, runtime)) = self.tunnels.remove(id) else {
+            tracing::debug!(
+                tunnel_id = %id,
+                "destroy_tunnel: no live tunnel in registry (already stopped / self-evicted)"
+            );
+            return Ok(false);
+        };
 
         let tunnel_name = runtime.config.name.clone();
         runtime.cancel.cancel();
@@ -650,7 +662,7 @@ impl TunnelManager {
             serde_json::json!({ "tunnel_name": tunnel_name }),
         );
 
-        Ok(())
+        Ok(true)
     }
 
     /// Get the status of a specific tunnel.
@@ -1253,5 +1265,29 @@ mod decrypt_skew_tests {
     fn quiet_or_sub_threshold_is_not_skew() {
         assert!(!is_decrypt_skew(0, 0, T)); // idle tunnel
         assert!(!is_decrypt_skew(49, 0, T)); // a few stray errors, below floor
+    }
+}
+
+#[cfg(test)]
+mod destroy_tunnel_tests {
+    use super::TunnelManager;
+    use crate::manager::events::event_channel;
+
+    /// Deleting a tunnel that is not in the runtime registry — because it was
+    /// never started, or self-evicted on a connect failure — must report
+    /// `Ok(false)` rather than erroring. The surgical `delete_tunnel` handlers
+    /// rely on this to still reconcile `config.json` (and not resurrect the
+    /// orphan on restart) instead of bailing with "Tunnel not found".
+    #[tokio::test]
+    async fn destroy_absent_tunnel_is_ok_false_not_error() {
+        let (tx, _rx) = event_channel();
+        let mgr = TunnelManager::new(tx);
+        let r = mgr
+            .destroy_tunnel("bbbb0000-0000-4000-8000-000000000000")
+            .await;
+        assert!(
+            matches!(r, Ok(false)),
+            "deleting an absent tunnel should be Ok(false), got {r:?}"
+        );
     }
 }

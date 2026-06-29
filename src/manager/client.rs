@@ -2763,14 +2763,22 @@ async fn execute_command(
         "delete_tunnel" => {
             let tunnel_id = action["tunnel_id"].as_str().ok_or("Missing tunnel_id")?;
             tracing::info!("Manager command: delete tunnel '{tunnel_id}'");
-            tunnel_manager
+            // Tolerate a tunnel that already self-evicted from the runtime
+            // registry (failed to establish): destroy_tunnel returns Ok(false)
+            // rather than erroring, so we still reconcile it out of config.json
+            // and persist. Otherwise an orphaned entry could never be deleted
+            // ("Tunnel not found") and would resurrect on the next restart.
+            let was_live = tunnel_manager
                 .destroy_tunnel(tunnel_id)
                 .await
                 .map_err(|e| e.to_string())?;
-            // Remove from config
             let mut cfg = app_config.write().await;
+            let before = cfg.tunnels.len();
             cfg.tunnels.retain(|t| t.id != tunnel_id);
-            persist_config(&cfg, config_path, secrets_path).await?;
+            let removed_from_config = cfg.tunnels.len() != before;
+            if was_live || removed_from_config {
+                persist_config(&cfg, config_path, secrets_path).await?;
+            }
             Ok(None)
         }
         "update_config" => {

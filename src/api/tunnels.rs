@@ -79,25 +79,44 @@ pub async fn delete_tunnel(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    match state.tunnel_manager.destroy_tunnel(&id).await {
-        Ok(()) => {
-            let mut cfg = state.config.write().await;
-            cfg.tunnels.retain(|t| t.id != id);
-            if let Err(e) = save_config_split_async(
-                state.config_path.clone(),
-                state.secrets_path.clone(),
-                cfg.clone(),
+    // Idempotent: a tunnel that already self-evicted from the runtime registry
+    // (e.g. a connect failure) returns Ok(false) from destroy_tunnel rather than
+    // erroring, so we still reconcile it out of config.json and persist. Without
+    // this an orphaned config entry could never be deleted via REST and would
+    // resurrect on the next restart.
+    let was_live = match state.tunnel_manager.destroy_tunnel(&id).await {
+        Ok(v) => v,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": e.to_string() })),
             )
-            .await
-            {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(serde_json::json!({ "error": format!("tunnel destroyed but config persist failed: {e}") })),
-                )
-                    .into_response();
-            }
-            Json(serde_json::json!({ "status": "deleted" })).into_response()
+                .into_response();
         }
-        Err(e) => (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": e.to_string() }))).into_response(),
+    };
+    let mut cfg = state.config.write().await;
+    let before = cfg.tunnels.len();
+    cfg.tunnels.retain(|t| t.id != id);
+    let removed_from_config = cfg.tunnels.len() != before;
+    if was_live || removed_from_config {
+        if let Err(e) = save_config_split_async(
+            state.config_path.clone(),
+            state.secrets_path.clone(),
+            cfg.clone(),
+        )
+        .await
+        {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": format!("tunnel destroyed but config persist failed: {e}") })),
+            )
+                .into_response();
+        }
     }
+    Json(serde_json::json!({
+        "status": "deleted",
+        "was_live": was_live,
+        "removed_from_config": removed_from_config
+    }))
+    .into_response()
 }
