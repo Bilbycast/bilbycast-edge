@@ -219,12 +219,20 @@ async fn run_inner(
             config.audio_content,
             crate::config::models::TestPatternAudioContent::ChannelIdent
         );
+    // Sequential = round-robin announcements (one channel per second);
+    // simultaneous = every channel at once. Only consulted when
+    // `channel_ident` is on.
+    let ident_sequential = matches!(
+        config.channel_ident_layout,
+        crate::config::models::TestPatternChannelIdentLayout::Sequential
+    );
     let audio_ctx = if config.audio_enabled {
         Some(build_audio_encoder(
             config.tone_hz,
             config.tone_dbfs,
             config.audio_channels.max(1) as usize,
             channel_ident,
+            ident_sequential,
         )?)
     } else {
         None
@@ -823,9 +831,10 @@ struct AudioContext {
 }
 
 /// Per-channel "say the channel number" loop sources. Every channel's
-/// buffer is the same `period` length and starts its announcement at the
-/// top of the period, so all channels stay phase-aligned and a single
-/// running `pos` indexes them all.
+/// buffer is the same `period` length so a single running `pos` indexes
+/// them all; each channel's announcement sits at the top of the period
+/// (simultaneous layout) or at its own `i × 1 s` offset (sequential
+/// layout). See [`build_ident_bank`].
 #[cfg(all(feature = "media-codecs", feature = "fdk-aac"))]
 struct IdentBank {
     buffers: Vec<Vec<f32>>,
@@ -881,6 +890,7 @@ fn build_audio_encoder(
     tone_dbfs: f32,
     channels: usize,
     channel_ident: bool,
+    ident_sequential: bool,
 ) -> Result<AudioContext, String> {
     let sample_rate = 48_000usize;
     // Validation already constrains this to {1,2,6,8}; clamp defensively so
@@ -910,7 +920,12 @@ fn build_audio_encoder(
     let step = std::f64::consts::TAU * (tone_hz as f64) / sample_rate as f64;
 
     let ident = if channel_ident {
-        Some(build_ident_bank(channels, sample_rate, amplitude))
+        Some(build_ident_bank(
+            channels,
+            sample_rate,
+            amplitude,
+            ident_sequential,
+        ))
     } else {
         None
     };
@@ -946,10 +961,28 @@ fn testgen_voice_dir() -> std::path::PathBuf {
 
 /// Build the per-channel announcement loop. Channel `i` (0-based) announces
 /// the number `i + 1`: a spoken-digit voice clip if `<dir>/<n>.wav` exists,
-/// otherwise `n` counted beeps. All channels share one period (longest
-/// utterance + a gap, rounded to whole seconds, ≥ 2 s) so they loop in lock-step.
+/// otherwise `n` counted beeps.
+///
+/// Two time layouts, selected by `sequential`:
+/// * **sequential** (default) — round-robin: channel `i` announces in its
+///   own 1-second slot starting at `t = i s`, so the operator hears the
+///   numbers one at a time even on a downmix (BLITS/GLITS-style). The loop
+///   is `channels` seconds long. If a clip is longer than its slot (only the
+///   counted-beep fallback on high channel numbers), every slot widens to
+///   whole seconds so announcements never overlap.
+/// * **simultaneous** — every channel announces at the top of one shared
+///   period (longest utterance + a gap, rounded to whole seconds, ≥ 2 s).
+///
+/// Either way all channels share one `period` and a single running `pos`
+/// indexes them — sequential just places each channel's clip at a different
+/// offset inside the buffer.
 #[cfg(all(feature = "media-codecs", feature = "fdk-aac"))]
-fn build_ident_bank(channels: usize, sample_rate: usize, amplitude: f32) -> IdentBank {
+fn build_ident_bank(
+    channels: usize,
+    sample_rate: usize,
+    amplitude: f32,
+    sequential: bool,
+) -> IdentBank {
     let dir = testgen_voice_dir();
     let mut contents: Vec<Vec<f32>> = Vec::with_capacity(channels);
     let mut voice_hits = 0usize;
@@ -973,25 +1006,54 @@ fn build_ident_bank(channels: usize, sample_rate: usize, amplitude: f32) -> Iden
         }
     }
     tracing::info!(
-        "Test-pattern channel-ident: {channels} channel(s); {voice_hits} voice clip(s) ({override_hits} from override dir {}, rest built-in), {} channel(s) on counted-beep fallback",
+        "Test-pattern channel-ident ({}): {channels} channel(s); {voice_hits} voice clip(s) ({override_hits} from override dir {}, rest built-in), {} channel(s) on counted-beep fallback",
+        if sequential { "sequential, 1 s/channel" } else { "simultaneous" },
         dir.display(),
         channels - voice_hits
     );
 
-    let gap = (sample_rate as f64 * 0.6) as usize;
     let one_sec = sample_rate.max(1);
-    let max_len = contents.iter().map(|c| c.len()).max().unwrap_or(0) + gap;
-    let mut period = max_len.div_ceil(one_sec) * one_sec;
-    if period < 2 * one_sec {
-        period = 2 * one_sec;
-    }
-    let buffers: Vec<Vec<f32>> = contents
-        .into_iter()
-        .map(|mut c| {
-            c.resize(period, 0.0);
-            c
-        })
-        .collect();
+    let n = contents.len().max(1);
+    let longest = contents.iter().map(|c| c.len()).max().unwrap_or(0);
+
+    let (buffers, period): (Vec<Vec<f32>>, usize) = if sequential {
+        // Round-robin: one channel per 1-second slot so the numbers are
+        // heard one at a time. Channel i announces at t = i seconds, so N
+        // channels cycle in N seconds. Widen the slot to whole seconds only
+        // if a clip can't fit (counted-beep fallback on high channels) so
+        // announcements never bleed into the next channel's slot.
+        let slot = one_sec.max(longest.div_ceil(one_sec) * one_sec);
+        let period = slot.saturating_mul(n).max(one_sec);
+        let buffers = contents
+            .into_iter()
+            .enumerate()
+            .map(|(i, clip)| {
+                let mut buf = vec![0.0f32; period];
+                let off = (i * slot).min(period);
+                let len = clip.len().min(period - off);
+                buf[off..off + len].copy_from_slice(&clip[..len]);
+                buf
+            })
+            .collect();
+        (buffers, period)
+    } else {
+        // Simultaneous: every channel announces at the top of one shared
+        // period (longest utterance + a 0.6 s gap, rounded up, ≥ 2 s).
+        let gap = (sample_rate as f64 * 0.6) as usize;
+        let mut period = (longest + gap).div_ceil(one_sec) * one_sec;
+        if period < 2 * one_sec {
+            period = 2 * one_sec;
+        }
+        let buffers = contents
+            .into_iter()
+            .map(|mut c| {
+                c.resize(period, 0.0);
+                c
+            })
+            .collect();
+        (buffers, period)
+    };
+
     IdentBank {
         buffers,
         period,

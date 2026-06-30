@@ -1689,6 +1689,25 @@ pub enum TestPatternAvSyncStyle {
     Sweep,
 }
 
+/// How the per-channel number idents are arranged in time when
+/// `audio_content = channel_ident`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum TestPatternChannelIdentLayout {
+    /// Round-robin: channel N announces in its own one-second slot, so the
+    /// numbers are heard one at a time even on a summed / downmixed monitor
+    /// (the BLITS / GLITS approach to surround channel identification). N
+    /// channels take N seconds per loop. Default — matches the common
+    /// "let me hear them all" workflow.
+    #[default]
+    Sequential,
+    /// Every channel announces its number at the same instant. Best when
+    /// soloing / routing one channel at a time (each self-identifies
+    /// whenever you listen to it alone); a cacophony on a downmix. This was
+    /// the original behaviour before the sequential layout was added.
+    Simultaneous,
+}
+
 /// Configuration for an in-process synthetic test-pattern input.
 ///
 /// Requires the edge binary to be built with `video-encoder-x264` (H.264
@@ -1799,6 +1818,15 @@ pub struct TestPatternInputConfig {
     /// [`TestPatternAvSyncStyle`].
     #[serde(default)]
     pub av_sync_style: TestPatternAvSyncStyle,
+    /// When `audio_content = channel_ident`, how the per-channel
+    /// announcements are laid out in time. See
+    /// [`TestPatternChannelIdentLayout`]. `sequential` (default) plays one
+    /// channel per second so an operator can hear them one at a time even
+    /// on a downmix; `simultaneous` fires every channel at once (better for
+    /// solo monitoring). Ignored for `tone` content and when
+    /// `av_sync_marker = true`.
+    #[serde(default)]
+    pub channel_ident_layout: TestPatternChannelIdentLayout,
 }
 
 fn default_tp_width() -> u16 { 1280 }
