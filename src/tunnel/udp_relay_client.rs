@@ -151,6 +151,56 @@ async fn connect_socket(
     Ok(Arc::new(sock))
 }
 
+/// Resolve a relay/peer `host:port` to all candidate socket addresses,
+/// ordered **IPv4 first**.
+///
+/// `tokio::net::lookup_host` (getaddrinfo) returns the AAAA record before the A
+/// record on a dual-stack host (RFC 6724 source-address ordering). But our
+/// relay binds its UDP rendezvous on IPv4 (`0.0.0.0`) and a bond leg pinned to
+/// an IPv4-only uplink (a cellular modem, say) has *no* IPv6 route at all — so
+/// dialing the AAAA first is either unreachable (`ENETUNREACH` at `connect`) or
+/// silently unanswered. Ordering IPv4 first and letting the caller try each
+/// candidate in turn fixes both; an IPv6-only relay (no A record) still works
+/// because IPv6 is then the only candidate.
+async fn resolve_candidates(addr: &str) -> Vec<SocketAddr> {
+    let mut addrs: Vec<SocketAddr> = match lookup_host(addr).await {
+        Ok(it) => it.collect(),
+        Err(_) => Vec::new(),
+    };
+    // Stable sort: IPv4 (`is_ipv6() == false`) sorts before IPv6 (`true`).
+    addrs.sort_by_key(|a| a.is_ipv6());
+    addrs
+}
+
+/// Connect to the first reachable candidate, trying each address family in
+/// turn. `family_offset` rotates the starting candidate (driven by the caller's
+/// relay-rotation counter) so a leg that keeps failing on the preferred family
+/// eventually attempts the other one. Returns the connected socket and the
+/// address it latched, or `None` if every candidate failed to bind/connect.
+async fn connect_any(
+    candidates: &[SocketAddr],
+    family_offset: usize,
+    interface: Option<&str>,
+    source: Option<&str>,
+    tunnel_id: &Uuid,
+) -> Option<(SocketAddr, Arc<UdpSocket>)> {
+    let n = candidates.len();
+    if n == 0 {
+        return None;
+    }
+    for k in 0..n {
+        let cand = candidates[family_offset.wrapping_add(k) % n];
+        match connect_socket(cand, interface, source).await {
+            Ok(sock) => return Some((cand, sock)),
+            Err(e) => tracing::warn!(
+                %tunnel_id,
+                "native-UDP relay: bind/connect to {cand} failed: {e} — trying next address"
+            ),
+        }
+    }
+    None
+}
+
 /// Best-effort gateway-mode policy-route programming for a native-UDP
 /// tunnel. Mirrors the bonded-output path: ensure the source address is on
 /// the NIC, install `default via <gateway>` in a private table, and a
@@ -259,25 +309,26 @@ pub async fn run_native_relay_tunnel(
         let _ = active_idx_tx.send(idx % params.relay_addrs.len());
         state_tx.send_replace(RelayTunnelState::Connecting);
 
-        // Resolve + connect.
-        let resolved = match lookup_host(&relay_addr).await.ok().and_then(|mut it| it.next()) {
-            Some(a) => a,
-            None => {
-                tracing::warn!(tunnel_id = %params.tunnel_id, "native-UDP relay: cannot resolve '{relay_addr}'");
-                rotate_after(&cancel, &mut idx).await;
-                continue;
-            }
-        };
-        let sock = match connect_socket(
-            resolved,
+        // Resolve all candidate addresses (IPv4 first) and connect to the first
+        // reachable one, falling back across address families.
+        let candidates = resolve_candidates(&relay_addr).await;
+        if candidates.is_empty() {
+            tracing::warn!(tunnel_id = %params.tunnel_id, "native-UDP relay: cannot resolve '{relay_addr}'");
+            rotate_after(&cancel, &mut idx).await;
+            continue;
+        }
+        let (resolved, sock) = match connect_any(
+            &candidates,
+            idx,
             params.interface.as_deref(),
             params.source.as_deref(),
+            &params.tunnel_id,
         )
         .await
         {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::warn!(tunnel_id = %params.tunnel_id, "native-UDP relay: bind/connect to {resolved} failed: {e}");
+            Some(pair) => pair,
+            None => {
+                tracing::warn!(tunnel_id = %params.tunnel_id, "native-UDP relay: all addresses for '{relay_addr}' failed to connect");
                 rotate_after(&cancel, &mut idx).await;
                 continue;
             }
@@ -480,24 +531,24 @@ pub async fn run_native_relay_leg_inproc(
         }
         let relay_addr = params.relay_addrs[idx % params.relay_addrs.len()].clone();
 
-        let resolved = match lookup_host(&relay_addr).await.ok().and_then(|mut it| it.next()) {
-            Some(a) => a,
-            None => {
-                tracing::warn!(tunnel_id = %params.tunnel_id, "native-UDP relay bond leg: cannot resolve '{relay_addr}'");
-                rotate_after(&cancel, &mut idx).await;
-                continue;
-            }
-        };
-        let sock = match connect_socket(
-            resolved,
+        let candidates = resolve_candidates(&relay_addr).await;
+        if candidates.is_empty() {
+            tracing::warn!(tunnel_id = %params.tunnel_id, "native-UDP relay bond leg: cannot resolve '{relay_addr}'");
+            rotate_after(&cancel, &mut idx).await;
+            continue;
+        }
+        let (resolved, sock) = match connect_any(
+            &candidates,
+            idx,
             params.interface.as_deref(),
             params.source.as_deref(),
+            &params.tunnel_id,
         )
         .await
         {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::warn!(tunnel_id = %params.tunnel_id, "native-UDP relay bond leg: bind/connect to {resolved} failed: {e}");
+            Some(pair) => pair,
+            None => {
+                tracing::warn!(tunnel_id = %params.tunnel_id, "native-UDP relay bond leg: all addresses for '{relay_addr}' failed to connect");
                 rotate_after(&cancel, &mut idx).await;
                 continue;
             }
@@ -685,11 +736,16 @@ pub async fn run_native_direct_tunnel(
 
             let result: Result<()> = async {
                 let peer = peer_addr.ok_or_else(|| anyhow::anyhow!("peer_addr required for direct egress"))?;
-                let resolved = lookup_host(&peer)
-                    .await?
-                    .next()
-                    .ok_or_else(|| anyhow::anyhow!("cannot resolve peer '{peer}'"))?;
-                let sock = connect_socket(resolved, interface.as_deref(), source.as_deref()).await?;
+                let candidates = resolve_candidates(&peer).await;
+                let (_resolved, sock) = connect_any(
+                    &candidates,
+                    0,
+                    interface.as_deref(),
+                    source.as_deref(),
+                    &tunnel_id,
+                )
+                .await
+                .ok_or_else(|| anyhow::anyhow!("cannot resolve/connect peer '{peer}'"))?;
                 let link = PlainUdpLink::new(sock.clone());
 
                 // PSK-authenticated register/keepalive toward the listener.
