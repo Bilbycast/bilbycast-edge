@@ -94,8 +94,13 @@ Edge UpgradeCoordinator (src/upgrade/mod.rs)
     │
     ├── 3. Construct release URL deterministically:
     │        https://github.com/Bilbycast/bilbycast-edge/releases/download/v<version>/...
-    │      Manager has zero input on URL or hash. URL host validated against
-    │      ALLOWED_URL_HOSTS = ["github.com", "objects.githubusercontent.com"].
+    │      Manager has zero input on URL or hash. Constructed/declared URL
+    │      hosts are validated against the exact-match ALLOWED_URL_HOSTS
+    │      (github.com + the CDN hosts). GitHub 302-redirects the download to
+    │      its content CDN; those redirect targets are followed within the
+    │      *.githubusercontent.com family (manifest::redirect_host_allowed) —
+    │      GitHub renamed the CDN objects.* → release-assets.*, so the redirect
+    │      allowlist is a suffix match, not a pinned host.
     │
     ├── 4. Fetch manifest.json + manifest.sig.bundle (capped at 1 MiB each,
     │      reqwest streaming + system rustls roots, retries with backoff).

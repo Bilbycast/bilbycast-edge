@@ -161,8 +161,13 @@ fn build_client(timeout: Duration) -> Result<reqwest::Client> {
             version = env!("CARGO_PKG_VERSION")
         ))
         .redirect(reqwest::redirect::Policy::custom(|attempt| {
-            // GitHub's release CDN redirects to objects.githubusercontent.com;
-            // both hosts are in the whitelist, so we accept up to 5 hops.
+            // GitHub 302-redirects release-asset downloads to its content CDN
+            // (release-assets.githubusercontent.com today; objects.* on older
+            // / Enterprise flows). We follow within the *.githubusercontent.com
+            // family — see `manifest::redirect_host_allowed` for why that's
+            // safe (GitHub-controlled domain + SHA-256-verified body) and why
+            // it must be looser than the exact-match ALLOWED_URL_HOSTS. Cap at
+            // 5 hops.
             if attempt.previous().len() >= 5 {
                 attempt.error("too many redirects")
             } else {
@@ -172,7 +177,7 @@ fn build_client(timeout: Duration) -> Result<reqwest::Client> {
                 }
                 let host_ok = url
                     .host_str()
-                    .map(|h| super::manifest::ALLOWED_URL_HOSTS.iter().any(|a| h == *a))
+                    .map(super::manifest::redirect_host_allowed)
                     .unwrap_or(false);
                 if host_ok {
                     attempt.follow()
@@ -218,5 +223,27 @@ mod tests {
         .await
         .unwrap_err();
         assert!(err.to_string().contains("64 hex chars"));
+    }
+
+    /// Network E2E: proves the redirect policy actually follows the real
+    /// `github.com` → `release-assets.githubusercontent.com` hop that broke
+    /// fleet upgrades. Ignored by default (hits the public internet); run
+    /// with `cargo test --lib upgrade::download -- --ignored`.
+    #[tokio::test]
+    #[ignore = "hits the public internet; run with --ignored"]
+    async fn follows_real_github_release_cdn_redirect() {
+        // A small, stable public release asset. `github.com` answers with a
+        // 302 to the githubusercontent CDN; a correct policy follows it.
+        let body = fetch_text(
+            "https://github.com/cli/cli/releases/download/v2.62.0/gh_2.62.0_checksums.txt",
+            Duration::from_secs(30),
+        )
+        .await
+        .expect("must follow github.com -> *.githubusercontent.com redirect");
+        assert!(
+            body.contains("gh_2.62.0"),
+            "unexpected checksums body (first 200 bytes): {:.200}",
+            body
+        );
     }
 }

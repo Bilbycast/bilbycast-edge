@@ -589,7 +589,7 @@ Surface for the `upgrade_binary` lifecycle. Manager UI gates the per-node "Upgra
 | warning | `upgrade_version_too_old` | Requested version is below `min_version` or further back than `rollback_grace`. |
 | warning | `upgrade_sequence_too_old` | Manifest's `sequence` is `≤` the last installed sequence — replay defence. |
 | warning | `upgrade_in_progress` | A second `upgrade_binary` arrived while the first was still staging. |
-| warning | `upgrade_url_invalid` | Manifest tarball URL host is not in the upgrade host whitelist (`github.com` / `objects.githubusercontent.com`). |
+| warning | `upgrade_url_invalid` | Manifest tarball URL host is not in the upgrade host whitelist (`github.com` + the `*.githubusercontent.com` release-asset CDN). |
 | warning | `upgrade_checksum_mismatch` | Downloaded tarball SHA-256 did not match the value in the verified manifest. |
 | warning | `upgrade_extract_failed` | Tarball extracted but the binary couldn't be located, hoisted, or made executable. |
 | warning | `upgrade_disk_full` | `ENOSPC` while extracting. |

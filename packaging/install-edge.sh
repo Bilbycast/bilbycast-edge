@@ -360,7 +360,7 @@ fi
 # outside GitHub-controlled infrastructure. Mirrors install-relay.sh.
 ARTEFACT_HOST="$(awk -F[/:] '{ print $4 }' <<< "${ARTEFACT_URL}")"
 case "${ARTEFACT_HOST}" in
-    github.com|objects.githubusercontent.com) ;;
+    github.com|release-assets.githubusercontent.com|objects.githubusercontent.com) ;;
     *)
         echo "Manifest artefact URL host '${ARTEFACT_HOST}' is not in the allowlist." >&2
         exit 1
