@@ -22,7 +22,7 @@ use anyhow::{Result, anyhow};
 use bytes::BytesMut;
 use tokio::time::{Duration, Instant, MissedTickBehavior, interval_at};
 
-use super::{BUNDLE_SIZE, PlayerSession, emit_bundle};
+use super::{PlayerSession, emit_bundle};
 use crate::config::models::VideoEncodeConfig;
 use crate::engine::rtmp::ts_mux::TsMuxer;
 use crate::engine::video_encode_util::ScaledVideoEncoder;
@@ -225,7 +225,7 @@ async fn encode_loop(
     let start = Instant::now();
     let mut ticker = interval_at(start, frame_duration);
     ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
-    let mut bundle = BytesMut::with_capacity(BUNDLE_SIZE);
+    let mut bundle = BytesMut::with_capacity(session.bundle_size);
     let mut frame_idx: u64 = 0;
     let mut out_rtp_ts: u32 = 0;
 
@@ -266,7 +266,7 @@ async fn encode_loop(
             out_rtp_ts = pts_out as u32;
             for ts_pkt in ts_mux.mux_video(&ef.data, pts_out, pts_out, ef.keyframe) {
                 bundle.extend_from_slice(&ts_pkt);
-                if bundle.len() >= BUNDLE_SIZE {
+                if bundle.len() >= session.bundle_size {
                     emit_bundle(&mut bundle, session, out_rtp_ts);
                 }
             }
@@ -281,7 +281,7 @@ async fn encode_loop(
                 }
                 for ts_pkt in ts_mux.mux_audio_pre_adts(&adts, apts_out) {
                     bundle.extend_from_slice(&ts_pkt);
-                    if bundle.len() >= BUNDLE_SIZE {
+                    if bundle.len() >= session.bundle_size {
                         emit_bundle(&mut bundle, session, out_rtp_ts);
                     }
                 }

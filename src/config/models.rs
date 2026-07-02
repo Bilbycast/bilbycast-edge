@@ -1989,10 +1989,24 @@ pub struct MediaPlayerInputConfig {
     /// [`RtpInputConfig::passthrough_clock`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub passthrough_clock: Option<bool>,
+    /// Maximum number of 188-byte MPEG-TS packets bundled into each output
+    /// datagram (`RtpPacket`) published onto the flow. Default 7 → 7 × 188 =
+    /// 1316 B, the SRT payload size and the internet-safe MTU (it fits inside
+    /// a 1500-byte MTU with IP/UDP headers, so routers don't fragment it).
+    /// Lower it (3–6) for a constrained / low-MTU path; raise it (8+) only
+    /// for a LAN / jumbo-frame link. Bounded 1..=348 (348 × 188 = 65 424 B,
+    /// the largest that fits one UDP datagram). Applies to every source kind
+    /// (ts / mp4 / image). Independent of downstream UDP/RTP/SRT outputs,
+    /// which re-chunk to their own fixed 1316 B wire size — this knob governs
+    /// the raw published feed and the QUIC/UDP tunnel path, which forward
+    /// each datagram unchanged.
+    #[serde(default = "default_mp_ts_packets_per_datagram")]
+    pub ts_packets_per_datagram: u16,
 }
 
 fn default_image_fps() -> u8 { 5 }
 fn default_image_bitrate_kbps() -> u32 { 250 }
+fn default_mp_ts_packets_per_datagram() -> u16 { 7 }
 
 impl InputConfig {
     /// Returns the type name string (e.g. "srt", "rtp", "udp").

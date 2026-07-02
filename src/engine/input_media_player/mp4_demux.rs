@@ -23,7 +23,7 @@ use bytes::BytesMut;
 use mp4::{AudioObjectType, MediaType, SampleFreqIndex, TrackType};
 use tokio::time::{Duration, Instant};
 
-use super::{BUNDLE_SIZE, PlayerSession, emit_bundle};
+use super::{PlayerSession, emit_bundle};
 use crate::engine::rtmp::ts_mux::TsMuxer;
 
 /// Stream type byte stamped on the synthesised PMT for AAC ADTS audio.
@@ -340,7 +340,7 @@ async fn play_demuxed(d: DemuxResult, session: &mut PlayerSession<'_>) -> Result
     let audio_samples = d.audio.as_ref().map(|t| &t.samples);
 
     let start_wall = Instant::now();
-    let mut bundle = BytesMut::with_capacity(BUNDLE_SIZE);
+    let mut bundle = BytesMut::with_capacity(session.bundle_size);
     let mut out_rtp_ts: u32 = 0;
 
     while let Some(it) = heap.pop() {
@@ -393,7 +393,7 @@ async fn play_demuxed(d: DemuxResult, session: &mut PlayerSession<'_>) -> Result
 
         for ts_pkt in chunks {
             bundle.extend_from_slice(&ts_pkt);
-            if bundle.len() >= BUNDLE_SIZE {
+            if bundle.len() >= session.bundle_size {
                 emit_bundle(&mut bundle, session, out_rtp_ts);
             }
         }

@@ -301,6 +301,11 @@ async fn run(
             shuffle_indices(&mut order);
         }
 
+        // Datagram packetization: bundle at most this many bytes (an integer
+        // multiple of 188) into each emitted RtpPacket. Default 7 × 188 =
+        // 1316 B (SRT payload size / internet-safe MTU). See
+        // `MediaPlayerInputConfig::ts_packets_per_datagram`.
+        let bundle_size = (config.ts_packets_per_datagram.max(1) as usize) * TS_PACKET;
         for idx in order {
             if cancel.is_cancelled() {
                 return;
@@ -321,6 +326,7 @@ async fn run(
                 pid_overrides: config.pid_overrides.as_ref(),
                 post: &mut post,
                 splice_gap_signal: gap_signal,
+                bundle_size,
             };
             let result = play_source(source, &config, &mut session).await;
             if let Err(e) = result {
@@ -393,6 +399,15 @@ pub(super) struct PlayerSession<'a> {
     /// output PTS to match the video timeline at the loop boundary.
     /// `None` in tests or when no transcoder is active.
     pub(super) splice_gap_signal: Option<&'a std::sync::Arc<std::sync::atomic::AtomicI64>>,
+    /// Maximum size in bytes of each emitted datagram (`RtpPacket`) — always
+    /// an integer multiple of 188 (the TS packet size). Set once from
+    /// [`crate::config::models::MediaPlayerInputConfig::ts_packets_per_datagram`]
+    /// (default 7 × 188 = 1316 B, the SRT payload size / internet-safe MTU).
+    /// The per-source bundling loops flush at this threshold, so it caps every
+    /// datagram uniformly across the ts / mp4 / image source kinds: smaller →
+    /// more, smaller datagrams for a low-MTU / tunnel path; larger → jumbo
+    /// datagrams for a LAN. Tests construct with the module [`BUNDLE_SIZE`].
+    pub(super) bundle_size: usize,
 }
 
 /// 30 ms gap inserted between the previous file's last emitted PTS and the
@@ -730,7 +745,7 @@ async fn play_ts_file(
     let trailer_len = stride - TS_PACKET;
     let mut trailer_buf = [0u8; MAX_TS_TRAILER];
 
-    let mut bundle = BytesMut::with_capacity(BUNDLE_SIZE);
+    let mut bundle = BytesMut::with_capacity(session.bundle_size);
     let mut packet = [0u8; TS_PACKET];
 
     // ── OS-thread pacer (CLOCK_TAI + clock_nanosleep on SCHED_FIFO) ──
@@ -1070,8 +1085,11 @@ async fn play_ts_file(
         }
 
         bundle.extend_from_slice(&packet);
-        if bundle.len() >= BUNDLE_SIZE {
-            bytes_emitted = bytes_emitted.saturating_add(BUNDLE_SIZE as u64);
+        if bundle.len() >= session.bundle_size {
+            // Credit the exact bytes about to leave (== session.bundle_size at
+            // this threshold, since appends are whole 188-byte packets) so the
+            // windowed bitrate estimator stays correct for any datagram size.
+            bytes_emitted = bytes_emitted.saturating_add(bundle.len() as u64);
             if !emit_to_pacer(
                 &mut bundle,
                 session,
@@ -1740,7 +1758,7 @@ pub(super) fn emit_bundle(
         return;
     }
     let total_len = bundle.len();
-    let data: Bytes = std::mem::replace(bundle, BytesMut::with_capacity(BUNDLE_SIZE)).freeze();
+    let data: Bytes = std::mem::replace(bundle, BytesMut::with_capacity(session.bundle_size)).freeze();
     let pkt = RtpPacket {
         data,
         sequence_number: *session.seq_num,
@@ -1804,7 +1822,7 @@ async fn emit_to_pacer(
         return true;
     }
     let total_len = bundle.len();
-    let data: Bytes = std::mem::replace(bundle, BytesMut::with_capacity(BUNDLE_SIZE)).freeze();
+    let data: Bytes = std::mem::replace(bundle, BytesMut::with_capacity(session.bundle_size)).freeze();
     // `recv_time_us` is filled in by the OS-thread pacer right before
     // the broadcast send so the downstream `output_latency` metric
     // measures only wire_emit's queue + pacer time, not the extra
@@ -2405,6 +2423,7 @@ mod tests {
                 pid_overrides: None,
                 post: &mut None,
                 splice_gap_signal: None,
+                bundle_size: BUNDLE_SIZE,
             };
             play_ts_file(&path, None, None, &mut session).await.unwrap();
         }
@@ -2594,6 +2613,7 @@ mod tests {
                 pid_overrides: None,
                 post: &mut None,
                 splice_gap_signal: None,
+                bundle_size: BUNDLE_SIZE,
             };
             play_ts_file(&path, None, None, &mut session).await.unwrap();
         }
@@ -2611,6 +2631,7 @@ mod tests {
                 pid_overrides: None,
                 post: &mut None,
                 splice_gap_signal: None,
+                bundle_size: BUNDLE_SIZE,
             };
             play_ts_file(&path, None, None, &mut session).await.unwrap();
         }

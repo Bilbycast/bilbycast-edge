@@ -1640,6 +1640,16 @@ fn validate_media_player_input(c: &crate::config::models::MediaPlayerInputConfig
             );
         }
     }
+    // Datagram packetization: how many 188-byte TS packets ride in each
+    // published RtpPacket. 7 × 188 = 1316 B is the default (SRT payload size,
+    // internet-safe MTU); 348 × 188 = 65 424 B is the largest that fits a
+    // single UDP datagram (65 507 B max payload).
+    if c.ts_packets_per_datagram < 1 || c.ts_packets_per_datagram > 348 {
+        bail!(
+            "media-player input: ts_packets_per_datagram must be in 1..=348 (each unit is one 188-byte TS packet; 7 × 188 = 1316 B is the default/SRT size, 348 × 188 = 65424 B is the max that fits a single UDP datagram; got {})",
+            c.ts_packets_per_datagram
+        );
+    }
     Ok(())
 }
 
