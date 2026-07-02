@@ -292,12 +292,15 @@ pub fn spawn_bonded_input(
                 // no meaningful egress interface, so leave it `None` (the
                 // cellular signal join is a sender-side concern). See the
                 // BondPathStatsHandle.interface contract.
-                path_handles.push(crate::stats::collector::BondPathStatsHandle::new(
-                    p.id,
-                    p.name.clone(),
-                    bond_transport_label(&p.transport),
-                    ps,
-                ));
+                path_handles.push(
+                    crate::stats::collector::BondPathStatsHandle::new(
+                        p.id,
+                        p.name.clone(),
+                        bond_transport_label(&p.transport),
+                        ps,
+                    )
+                    .with_tunnel_id(bond_path_tunnel_id(&p.transport)),
+                );
             }
         }
         stats.set_input_bond_stats(crate::stats::collector::BondStatsHandle {
@@ -710,6 +713,17 @@ pub(crate) fn bond_path_interface(t: &BondPathTransportConfig) -> Option<String>
     }
 }
 
+/// The relay tunnel id (UUID) for a `Relay` leg — surfaced on
+/// `BondPathLegStats.tunnel_id` so the manager can join this live leg to the
+/// relay `udp_session` forwarding it (per-leg edge-send vs relay-forward
+/// correlation). `None` for direct UDP / QUIC / RIST legs.
+pub(crate) fn bond_path_tunnel_id(t: &BondPathTransportConfig) -> Option<String> {
+    match t {
+        BondPathTransportConfig::Relay { tunnel_id, .. } => Some(tunnel_id.clone()),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod bonded_input_tests {
     use super::*;
@@ -719,6 +733,27 @@ mod bonded_input_tests {
         let udp: crate::config::models::BondPathTransportConfig =
             serde_json::from_str(r#"{ "type": "udp", "bind": "0.0.0.0:7400" }"#).unwrap();
         assert_eq!(bond_transport_label(&udp).as_str(), "udp");
+    }
+
+    #[test]
+    fn bond_path_tunnel_id_only_for_relay_legs() {
+        // A relay leg surfaces its tunnel id (the manager joins it to the
+        // relay's udp_session by this UUID).
+        let relay: crate::config::models::BondPathTransportConfig = serde_json::from_str(
+            r#"{ "type": "relay", "tunnel_id": "11111111-2222-3333-4444-555555555555",
+                 "relay_addrs": ["relay.example.com:4434"] }"#,
+        )
+        .unwrap();
+        assert_eq!(bond_transport_label(&relay).as_str(), "relay");
+        assert_eq!(
+            bond_path_tunnel_id(&relay).as_deref(),
+            Some("11111111-2222-3333-4444-555555555555")
+        );
+
+        // A direct UDP leg carries no relay tunnel id.
+        let udp: crate::config::models::BondPathTransportConfig =
+            serde_json::from_str(r#"{ "type": "udp", "remote": "203.0.113.7:7400" }"#).unwrap();
+        assert_eq!(bond_path_tunnel_id(&udp), None);
     }
 
     #[test]

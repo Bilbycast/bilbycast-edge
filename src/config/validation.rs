@@ -1922,7 +1922,10 @@ fn validate_bond_path_transport(
             source,
         } => {
             if let Some(r) = remote {
-                validate_socket_addr(r, "bonded UDP path remote")?;
+                // Dial-out destination: accept an IP literal OR a DNS
+                // hostname (resolved at dial time by parse_sockaddr). A
+                // strict SocketAddr parse here would reject `host:port`.
+                validate_dialable_host_port(r, "bonded UDP path remote")?;
             }
             if let Some(iface) = interface {
                 // IFNAMSIZ is 16 on Linux (15 chars + NUL). Keep this
@@ -2026,7 +2029,9 @@ fn validate_bond_path_transport(
                     let r = remote.as_ref().ok_or_else(|| {
                         anyhow::anyhow!("bonded RIST path '{path_name}' sender role requires remote")
                     })?;
-                    validate_socket_addr(r, "bonded RIST path remote")?;
+                    // Dial-out destination: accept an IP literal OR a DNS
+                    // hostname (resolved at dial time). See UDP remote above.
+                    validate_dialable_host_port(r, "bonded RIST path remote")?;
                 }
                 BondRistRole::Receiver => {
                     let b = local_bind.as_ref().ok_or_else(|| {
@@ -2058,7 +2063,16 @@ fn validate_bond_path_transport(
             // mismatching or absent role; the side is authoritative. The
             // client-only checks below key off `sender_mode`, not the field.
             let _ = role;
-            validate_socket_addr(addr, "bonded QUIC path addr")?;
+            // QUIC `addr` is the client dial-out on the sender (output) side but
+            // the server *bind* on the receiver (input) side. Only the dial-out
+            // may be a DNS hostname; the bind must still allow the unspecified
+            // all-interfaces address (0.0.0.0 / [::]) that
+            // validate_dialable_host_port rejects.
+            if sender_mode {
+                validate_dialable_host_port(addr, "bonded QUIC path addr")?;
+            } else {
+                validate_socket_addr(addr, "bonded QUIC path addr")?;
+            }
             if sender_mode && server_name.is_empty() {
                 return Err(anyhow::anyhow!(
                     "bonded QUIC client (output) path '{path_name}' requires server_name"
@@ -5374,6 +5388,17 @@ fn validate_bonded_output(c: &crate::config::models::BondedOutputConfig) -> Resu
         if !(50..=5_000).contains(&ms) {
             return Err(anyhow::anyhow!(
                 "bonded output '{}': max_bonding_latency_ms must be in [50, 5000]",
+                c.id
+            ));
+        }
+    }
+    if let Some(mtu) = c.path_mtu {
+        // 576 = conservative IPv4 floor (leaves ≥2 TS packets of budget under
+        // worst-case overheads); 9000 = jumbo frames.
+        if !(576..=9_000).contains(&mtu) {
+            return Err(anyhow::anyhow!(
+                "bonded output '{}': path_mtu must be in [576, 9000] (smallest per-leg \
+                 IP path MTU in bytes)",
                 c.id
             ));
         }
@@ -11660,5 +11685,91 @@ mod tests {
             .unwrap();
         let e = super::validate_bonded_output(&cfg).unwrap_err().to_string();
         assert!(e.contains("EXACTLY ONE"), "double-encrypt relay output rejected: {e}");
+    }
+
+    #[test]
+    fn bonded_udp_leg_remote_accepts_hostname_or_ip() {
+        // A DIRECT UDP leg dialing a DNS hostname (the public-IP / port-forward
+        // case) must validate — the name is resolved at dial time, not at config
+        // load. Previously rejected by a strict SocketAddr parse.
+        let cfg: crate::config::models::BondedOutputConfig =
+            serde_json::from_value(serde_json::json!({
+                "id": "o1", "name": "bond", "bond_flow_id": 42,
+                "encryption_key": "b".repeat(64),
+                "paths": [{
+                    "id": 1, "name": "leg-hostname",
+                    "transport": { "type": "udp", "remote": "home.rezabase.com:7402" }
+                }]
+            }))
+            .unwrap();
+        super::validate_bonded_output(&cfg).expect("hostname remote on a bonded UDP leg validates");
+
+        // An IP literal still validates.
+        let cfg: crate::config::models::BondedOutputConfig =
+            serde_json::from_value(serde_json::json!({
+                "id": "o2", "name": "bond", "bond_flow_id": 42,
+                "encryption_key": "b".repeat(64),
+                "paths": [{
+                    "id": 1, "name": "leg-ip",
+                    "transport": { "type": "udp", "remote": "203.0.113.5:7402" }
+                }]
+            }))
+            .unwrap();
+        super::validate_bonded_output(&cfg).expect("IP remote on a bonded UDP leg validates");
+
+        // A remote with no port is still rejected (host:port required).
+        let cfg: crate::config::models::BondedOutputConfig =
+            serde_json::from_value(serde_json::json!({
+                "id": "o3", "name": "bond", "bond_flow_id": 42,
+                "encryption_key": "b".repeat(64),
+                "paths": [{
+                    "id": 1, "name": "leg-bad",
+                    "transport": { "type": "udp", "remote": "no-port-here" }
+                }]
+            }))
+            .unwrap();
+        assert!(
+            super::validate_bonded_output(&cfg).is_err(),
+            "a bonded UDP leg remote without a port is rejected"
+        );
+    }
+
+    #[test]
+    fn bonded_quic_leg_addr_hostname_out_but_unspecified_bind_in() {
+        // Sender (output) QUIC leg dials `addr` → hostname must validate.
+        let cfg: crate::config::models::BondedOutputConfig =
+            serde_json::from_value(serde_json::json!({
+                "id": "o1", "name": "bond", "bond_flow_id": 7,
+                "encryption_key": "b".repeat(64),
+                "paths": [{
+                    "id": 1, "name": "quic-out",
+                    "transport": {
+                        "type": "quic", "role": "client",
+                        "addr": "relay.example.com:7400", "server_name": "relay.example.com",
+                        "tls": { "mode": "self_signed" }
+                    }
+                }]
+            }))
+            .unwrap();
+        super::validate_bonded_output(&cfg).expect("QUIC sender hostname addr validates");
+
+        // Receiver (input) QUIC leg BINDS `addr` → the all-interfaces bind
+        // (0.0.0.0:port) must still validate. Regression guard: gating the
+        // hostname relaxation on sender_mode keeps this legal.
+        let cfg: crate::config::models::BondedInputConfig =
+            serde_json::from_value(serde_json::json!({
+                "bond_flow_id": 7,
+                "encryption_key": "b".repeat(64),
+                "paths": [{
+                    "id": 0, "name": "quic-in",
+                    "transport": {
+                        "type": "quic", "role": "server",
+                        "addr": "0.0.0.0:7400",
+                        "tls": { "mode": "self_signed" }
+                    }
+                }]
+            }))
+            .unwrap();
+        super::validate_bonded_input(&cfg).expect("QUIC server 0.0.0.0 bind validates");
     }
 }

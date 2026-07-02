@@ -49,17 +49,31 @@ use super::input_bonded::{
 };
 use crate::tunnel::config::TunnelDirection;
 use super::packet::RtpPacket;
+use super::ts_parse::TS_PACKET_SIZE;
 use super::ts_pid_remapper::TsPidRemapper;
 use super::ts_program_filter::TsProgramFilter;
 
 const RTP_HEADER_MIN_SIZE: usize = 12;
 
-/// Conservative per-datagram wire budget for a bonded leg, bytes.
-/// 1400 clears the common WAN MTU floor (PPPoE / LTE carrier tunnels /
-/// Starlink) under the 1500-byte ethernet default — a bonded payload
-/// above the derived budget fragments at the IP layer, and one lost
-/// fragment costs the whole datagram on a lossy cellular leg.
-const BOND_WIRE_MTU: usize = 1400;
+/// Default per-leg IP path MTU assumed when `path_mtu` is unset: standard
+/// 1500-byte ethernet. The derived TS re-chunk quantum under every
+/// header / crypto combination is 7 × 188 = 1316 B — the classic SRT /
+/// assembler datagram that internet paths carry unfragmented.
+const DEFAULT_PATH_MTU: usize = 1500;
+/// IPv4 (20) + UDP (8) header bytes per datagram.
+const IPV4_UDP_OVERHEAD: usize = 28;
+/// IPv6 (40) + UDP (8) header bytes per datagram.
+const IPV6_UDP_OVERHEAD: usize = 48;
+/// Relay-leg carrier framing: the 16-byte `tunnel_id` prefix the in-process
+/// bridge prepends to every datagram (`tunnel::protocol::encode_udp_datagram`).
+const RELAY_TUNNEL_ID_OVERHEAD: usize = 16;
+/// Relay-leg tunnel AEAD (12 nonce + 16 tag) — applied by the bridge only
+/// when the bond itself is unkeyed (the fail-closed single-encryption-layer
+/// rule; bond-keyed relay legs carry the 29 B `0xBD` envelope instead).
+const RELAY_TUNNEL_CRYPTO_OVERHEAD: usize = 28;
+/// RIST-leg carrier framing: RIST Simple Profile wraps each bond frame in
+/// its own 12-byte RTP header (`bonding-transport` `path/rist.rs`).
+const RIST_RTP_OVERHEAD: usize = 12;
 /// Bond wire header size (`bonding-protocol` `packet.rs`).
 const BOND_HEADER_SIZE: usize = 12;
 /// ChaCha20-Poly1305 envelope overhead when `encryption_key` is set:
@@ -658,6 +672,7 @@ async fn bonded_output_run(
                 )
                 .with_gateway_mode(gateway_mode)
                 .with_interface(super::input_bonded::bond_path_interface(&p.transport))
+                .with_tunnel_id(super::input_bonded::bond_path_tunnel_id(&p.transport))
                 .with_capacity_est(cap_est),
             );
         }
@@ -824,28 +839,20 @@ async fn bonded_output_run(
     });
     let mut remap_scratch: Vec<u8> = Vec::new();
 
-    // Per-datagram payload budget under the WAN MTU floor: bond header
-    // plus (when encryption is on) the AEAD envelope ride on every
-    // datagram. Oversize payloads are sent anyway (the bond layer
-    // neither drops nor fragments) but flagged once per output —
-    // IP-layer fragmentation on a lossy cellular leg multiplies loss.
-    // When equalization measures, the header is the 16-byte v2 form (4 extra
-    // bytes of send-timestamp), so budget against that to avoid a payload at
-    // the boundary silently fragmenting once stamping is active.
-    let bond_header_size = if super::input_bonded::map_equalization_mode(config.equalization)
-        .measures()
-    {
-        BOND_HEADER_SIZE + 4
-    } else {
-        BOND_HEADER_SIZE
-    };
-    let payload_budget = BOND_WIRE_MTU
-        - bond_header_size
-        - if config.encryption_key.is_some() {
-            BOND_CRYPTO_OVERHEAD
-        } else {
-            0
-        };
+    // Per-datagram sizing: from the configured (or default 1500) path MTU,
+    // resolve the payload budget and the N×188 re-chunk quantum. Oversized
+    // TS payloads are re-chunked in the send loop below so nothing this
+    // output emits fragments at the IP layer on the narrowest leg.
+    let (payload_budget, chunk_bytes) = resolve_datagram_budget(config);
+    tracing::info!(
+        "bonded output '{}': path MTU {} → per-datagram payload budget {} B → \
+         {} × 188 B TS packet(s) ({} B) per datagram",
+        config.id,
+        config.path_mtu.unwrap_or(DEFAULT_PATH_MTU as u32),
+        payload_budget,
+        chunk_bytes / TS_PACKET_SIZE,
+        chunk_bytes
+    );
     let mtu_warned = AtomicBool::new(false);
 
     loop {
@@ -884,10 +891,65 @@ async fn bonded_output_run(
                         filtered
                     };
 
-                    // MTU guard: flag (never drop or fragment) payloads
-                    // that will exceed the per-datagram wire budget.
-                    // One Warning per output; the running count rides
-                    // on `BondLegStats.oversize_payloads`.
+                    // Decide priority / marker once per source payload from
+                    // the media-aware scheduler (or fall back to defaults).
+                    // When the payload is re-chunked below, every chunk
+                    // shares this whole-payload hint, so an IDR-bearing
+                    // payload duplicates ALL of its chunks across the two
+                    // best legs — keyframe protection covers the whole
+                    // frame. (The bond sender re-stamps `hints.size` per
+                    // datagram itself.)
+                    let hints = match media_sched.as_mut() {
+                        Some(s) => s.hints_for(remapped),
+                        None => PacketHints::default(),
+                    };
+
+                    if remapped.len() > chunk_bytes
+                        && remapped.len() % TS_PACKET_SIZE == 0
+                    {
+                        // Re-chunk oversized TS payloads at TS-packet
+                        // boundaries so every bond datagram — header, AEAD
+                        // and carrier framing included — fits the smallest
+                        // leg's path MTU. An IP-fragmented datagram is lost
+                        // wholesale on cellular CGNAT paths (fragments
+                        // dropped, PMTU discovery black-holed), so fitting
+                        // the MTU beats fragment-and-recover. The receiver
+                        // drains in bond_seq order, so the TS byte stream
+                        // reassembles identically with no receiver change.
+                        let payload = bytes::Bytes::copy_from_slice(remapped);
+                        let mut off = 0;
+                        let mut sent_all = true;
+                        while off < payload.len() {
+                            let end = (off + chunk_bytes).min(payload.len());
+                            if let Err(e) =
+                                socket.send(payload.slice(off..end), hints).await
+                            {
+                                tracing::warn!(
+                                    "bonded output '{}' send error: {e}",
+                                    config.id
+                                );
+                                sent_all = false;
+                                break;
+                            }
+                            stats.packets_sent.fetch_add(1, Ordering::Relaxed);
+                            stats
+                                .bytes_sent
+                                .fetch_add((end - off) as u64, Ordering::Relaxed);
+                            off = end;
+                        }
+                        if sent_all {
+                            stats.record_latency(packet.recv_time_us);
+                        }
+                        continue;
+                    }
+
+                    // Not re-chunkable: either the payload already fits, or
+                    // it is not 188-byte-aligned TS (non-TS essence) and
+                    // slicing it would corrupt downstream framing. A payload
+                    // over budget here is sent whole (never dropped) and
+                    // flagged — one Warning per output, running count on
+                    // `BondLegStats.oversize_payloads` — because it will
+                    // IP-fragment on a leg whose MTU it exceeds.
                     if remapped.len() > payload_budget {
                         oversize_payloads.fetch_add(1, Ordering::Relaxed);
                         if !mtu_warned.swap(true, Ordering::Relaxed) {
@@ -896,8 +958,9 @@ async fn bonded_output_run(
                                 category::BOND,
                                 format!(
                                     "bonded output '{}': payload {} B exceeds the per-datagram \
-                                     budget {} B — IP fragmentation likely on WAN legs \
-                                     (reported once; see bond stats oversize_payloads)",
+                                     budget {} B and is not 188-byte-aligned TS, so it cannot \
+                                     be re-chunked — sent whole; IP fragmentation likely on \
+                                     WAN legs (reported once; see bond stats oversize_payloads)",
                                     config.id,
                                     remapped.len(),
                                     payload_budget
@@ -912,13 +975,6 @@ async fn bonded_output_run(
                             );
                         }
                     }
-
-                    // Decide priority / marker from media-aware
-                    // scheduler (or fall back to defaults).
-                    let hints = match media_sched.as_mut() {
-                        Some(s) => s.hints_for(remapped),
-                        None => PacketHints::default(),
-                    };
 
                     // Emit via bond socket. We clone into a fresh Bytes
                     // so the bond layer owns its own refcount; if the
@@ -948,6 +1004,124 @@ async fn bonded_output_run(
     }
 }
 
+/// Resolve the per-datagram sizing for a bonded output from its configured
+/// (or default 1500) `path_mtu`: `(payload_budget, chunk_bytes)`.
+///
+/// `payload_budget` is the largest bond payload whose full wire datagram —
+/// IP/UDP + carrier framing + bond header + AEAD envelope — fits the
+/// smallest leg's path MTU. `chunk_bytes` is the largest whole-TS-packet
+/// (N × 188) size within that budget: the re-chunk quantum for oversized TS
+/// payloads in the send loop.
+///
+/// Sized to the WORST leg: the scheduler picks a leg only after `send()`
+/// (and a retransmit may ride any leg), so every datagram must fit all of
+/// them. Per-datagram overheads:
+/// - IP/UDP: 28 B (IPv4), or 48 B when any leg dials an IPv6 literal OR a
+///   hostname — `parse_sockaddr` prefers A records but falls back to any
+///   family, so an AAAA-only hostname genuinely dials IPv6; the
+///   conservative deduction costs at most one TS packet at boundary MTUs
+///   and nothing at all at the common ones (1500 and ~1000 both derive the
+///   same N either way).
+/// - Relay legs: 16 B `tunnel_id` prefix, plus the 28 B tunnel AEAD when
+///   the bond itself is unkeyed (fail-closed single-layer rule — a
+///   bond-keyed relay leg carries the 29 B `0xBD` envelope counted below
+///   instead).
+/// - RIST legs: 12 B RIST/RTP framing around each bond frame.
+/// - Bond header: 16 B v2 when equalization measures (the default), else
+///   12 B v1 — budget against v2 so a boundary-sized chunk doesn't silently
+///   fragment once send-stamping activates.
+/// - Bond AEAD envelope: 29 B when `encryption_key` is set. QUIC legs skip
+///   the envelope but carry ~30 B of their own QUIC framing, so the same
+///   deduction is approximately right there; quinn additionally hard-fails
+///   (never fragments) anything over its discovered datagram MTU.
+/// - FEC repair headroom: a repair datagram carries framing ON TOP of the
+///   largest media chunk it protects (combined XOR `FecRepair`: +14 B;
+///   per-leg XOR `PerLegRepair`: +10 + 4·rows B seq list; per-leg RS
+///   `PerLegRsRepair`: +12 + 4·columns B) — reserve it so repairs fit the
+///   MTU too, else FEC silently fragments (and dies) on exactly the
+///   constrained path it is meant to protect.
+///
+/// The 1500 default derives 7 × 188 = 1316 B chunks under every header /
+/// crypto combination (without FEC) — today's assembler/SRT datagram, so
+/// normal-MTU bonds are unchanged.
+fn resolve_datagram_budget(cfg: &BondedOutputConfig) -> (usize, usize) {
+    use crate::config::models::{BondFecAlgorithm, BondPathTransportConfig as T};
+    let path_mtu = cfg.path_mtu.unwrap_or(DEFAULT_PATH_MTU as u32) as usize;
+
+    // IPv4 literal → 28; IPv6 literal or unresolved hostname → 48
+    // (conservative: the dial path falls back to AAAA when A is absent).
+    let addr_needs_v6 = |addr: &str| {
+        match addr.parse::<std::net::SocketAddr>() {
+            Ok(a) => a.is_ipv6(),
+            Err(_) => true, // hostname — may resolve to IPv6
+        }
+    };
+    let mut any_v6 = false;
+    let mut relay_overhead = 0usize;
+    let mut rist_overhead = 0usize;
+    for p in &cfg.paths {
+        match &p.transport {
+            T::Udp { remote, .. } => {
+                any_v6 |= remote.as_deref().map(addr_needs_v6).unwrap_or(false);
+            }
+            T::Quic { addr, .. } => {
+                any_v6 |= addr_needs_v6(addr);
+            }
+            T::Rist { remote, .. } => {
+                any_v6 |= remote.as_deref().map(addr_needs_v6).unwrap_or(false);
+                rist_overhead = RIST_RTP_OVERHEAD;
+            }
+            T::Relay { relay_addrs, .. } => {
+                any_v6 |= relay_addrs.iter().any(|a| addr_needs_v6(a));
+                relay_overhead = RELAY_TUNNEL_ID_OVERHEAD
+                    + if cfg.encryption_key.is_some() {
+                        0
+                    } else {
+                        RELAY_TUNNEL_CRYPTO_OVERHEAD
+                    };
+            }
+        }
+    }
+    let mut fec_headroom = 0usize;
+    if cfg.fec.is_some() {
+        fec_headroom = 14;
+    }
+    for p in &cfg.paths {
+        if let Some(f) = &p.fec {
+            fec_headroom = fec_headroom.max(match f.algorithm {
+                Some(BondFecAlgorithm::ReedSolomon) => 12 + 4 * f.columns as usize,
+                _ => 10 + 4 * f.rows as usize,
+            });
+        }
+    }
+    let ip_udp = if any_v6 {
+        IPV6_UDP_OVERHEAD
+    } else {
+        IPV4_UDP_OVERHEAD
+    };
+    let bond_header = if super::input_bonded::map_equalization_mode(cfg.equalization).measures() {
+        BOND_HEADER_SIZE + 4
+    } else {
+        BOND_HEADER_SIZE
+    };
+    let crypto = if cfg.encryption_key.is_some() {
+        BOND_CRYPTO_OVERHEAD
+    } else {
+        0
+    };
+    // Floor at one TS packet: validation keeps path_mtu ≥ 576 so this only
+    // guards a hand-authored pathological config.
+    let payload_budget = path_mtu
+        .saturating_sub(ip_udp)
+        .saturating_sub(relay_overhead.max(rist_overhead))
+        .saturating_sub(bond_header)
+        .saturating_sub(crypto)
+        .saturating_sub(fec_headroom)
+        .max(TS_PACKET_SIZE);
+    let chunk_bytes = (payload_budget / TS_PACKET_SIZE) * TS_PACKET_SIZE;
+    (payload_budget, chunk_bytes)
+}
+
 /// Derive the sender retransmit-buffer capacity (in packets) from the bonding
 /// latency budget and the aggregate per-leg send ceiling, per the library's
 /// own sizing guidance (send rate × longest acceptable NACK round-trip).
@@ -957,8 +1131,15 @@ async fn bonded_output_run(
 fn derive_retransmit_capacity(cfg: &BondedOutputConfig) -> usize {
     const DEFAULT_CAPACITY: usize = 8192;
     const MAX_CAPACITY: usize = 262_144; // ~345 MB ring ceiling
-    const BUNDLE_BYTES: u64 = 1316; // 7 × 188 B TS bundle per bond packet
     const ASSUMED_LEG_BPS: u64 = 20_000_000; // when a leg declares no ceiling
+    // The ring is counted in packets, so size against the typical datagram:
+    // a low path_mtu re-chunks everything smaller (more packets in the same
+    // NACK window → deeper ring), but a jumbo path_mtu does NOT make
+    // datagrams bigger — inputs still emit ≤ 1316 B bundles and small
+    // payloads are never coalesced up — so cap the divisor at the classic
+    // 7 × 188 bundle or the ring would cover only a fraction of the window.
+    let (_, chunk_bytes) = resolve_datagram_budget(cfg);
+    let typical_datagram = chunk_bytes.min(7 * TS_PACKET_SIZE);
     let budget_ms = cfg.max_bonding_latency_ms.unwrap_or(1000) as u64;
     let aggregate_bps: u64 = cfg
         .paths
@@ -966,7 +1147,7 @@ fn derive_retransmit_capacity(cfg: &BondedOutputConfig) -> usize {
         .map(|p| p.max_bitrate_bps.unwrap_or(ASSUMED_LEG_BPS))
         .sum();
     let bits_in_flight = aggregate_bps.saturating_mul(budget_ms) / 1000;
-    let derived = (bits_in_flight / (BUNDLE_BYTES * 8)) as usize;
+    let derived = (bits_in_flight / (typical_datagram as u64 * 8)) as usize;
     derived.clamp(DEFAULT_CAPACITY, MAX_CAPACITY)
 }
 
@@ -1253,6 +1434,195 @@ mod bonded_output_tests {
         let sock = build_sender_cfg(&cfg).expect("sender cfg builds").cfg;
         assert_eq!(sock.flow_id, 6016);
         assert_eq!(sock.paths.len(), 2);
+    }
+
+    fn budget_cfg(json: &str) -> crate::config::models::BondedOutputConfig {
+        serde_json::from_str(json).unwrap()
+    }
+
+    #[test]
+    fn datagram_budget_default_mtu_derives_1316_chunks() {
+        // Encrypted + default (auto) equalization — the wizard's common shape.
+        // 1500 − 28 (IPv4/UDP) − 16 (v2 header) − 29 (AEAD) = 1427 → 7 × 188.
+        let cfg = budget_cfg(
+            r#"{ "id":"o","name":"b","bond_flow_id":1,
+                 "encryption_key":"00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff",
+                 "paths":[{"id":0,"name":"a","transport":{"type":"udp","remote":"1.2.3.4:7400"}}] }"#,
+        );
+        assert_eq!(resolve_datagram_budget(&cfg), (1427, 1316));
+
+        // Cleartext + equalization off (v1 12 B header): 1500 − 28 − 12 = 1460
+        // → still 7 packets. Every default-MTU combination lands on 1316.
+        let cfg = budget_cfg(
+            r#"{ "id":"o","name":"b","bond_flow_id":1, "equalization":"off",
+                 "paths":[{"id":0,"name":"a","transport":{"type":"udp","remote":"1.2.3.4:7400"}}] }"#,
+        );
+        assert_eq!(resolve_datagram_budget(&cfg), (1460, 1316));
+    }
+
+    #[test]
+    fn datagram_budget_cellular_1000_mtu() {
+        // The live odt500 case: measured path MTU ≈ 1000, encrypted, v2
+        // header. 1000 − 28 − 16 − 29 = 927 → 4 × 188 = 752 B datagrams
+        // (825 B on the wire — no fragmentation).
+        let cfg = budget_cfg(
+            r#"{ "id":"o","name":"b","bond_flow_id":1, "path_mtu":1000,
+                 "encryption_key":"00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff",
+                 "paths":[{"id":0,"name":"a","transport":{"type":"udp","remote":"1.2.3.4:7400"}}] }"#,
+        );
+        assert_eq!(resolve_datagram_budget(&cfg), (927, 752));
+    }
+
+    #[test]
+    fn datagram_budget_relay_leg_overheads() {
+        // Bond-keyed relay leg: +16 tunnel_id only (bond envelope is the one
+        // crypto layer). 1500 − 28 − 16 − 16 − 29 = 1411 → 1316.
+        let keyed = budget_cfg(
+            r#"{ "id":"o","name":"b","bond_flow_id":1,
+                 "encryption_key":"00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff",
+                 "paths":[{"id":0,"name":"r","transport":{"type":"relay",
+                   "tunnel_id":"9f8b3c1e-0000-4000-8000-000000000001",
+                   "relay_addrs":["203.0.113.9:4434"]}}] }"#,
+        );
+        assert_eq!(resolve_datagram_budget(&keyed), (1411, 1316));
+
+        // Bond-unkeyed relay leg: +16 tunnel_id +28 leg AEAD, no bond
+        // envelope. 1500 − 28 − 44 − 16 = 1412 → 1316.
+        let unkeyed = budget_cfg(
+            r#"{ "id":"o","name":"b","bond_flow_id":1,
+                 "paths":[{"id":0,"name":"r","transport":{"type":"relay",
+                   "tunnel_id":"9f8b3c1e-0000-4000-8000-000000000001",
+                   "relay_addrs":["203.0.113.9:4434"],
+                   "tunnel_encryption_key":"00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff"}}] }"#,
+        );
+        assert_eq!(resolve_datagram_budget(&unkeyed), (1412, 1316));
+
+        // Mixed direct + relay at cellular MTU sizes to the worst (relay) leg:
+        // 1000 − 28 − 16 − 16 − 29 = 911 → 4 × 188 = 752.
+        let mixed = budget_cfg(
+            r#"{ "id":"o","name":"b","bond_flow_id":1, "path_mtu":1000,
+                 "encryption_key":"00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff",
+                 "paths":[
+                   {"id":0,"name":"d","transport":{"type":"udp","remote":"1.2.3.4:7400"}},
+                   {"id":1,"name":"r","transport":{"type":"relay",
+                     "tunnel_id":"9f8b3c1e-0000-4000-8000-000000000001",
+                     "relay_addrs":["203.0.113.9:4434"]}}] }"#,
+        );
+        assert_eq!(resolve_datagram_budget(&mixed), (911, 752));
+    }
+
+    #[test]
+    fn datagram_budget_ipv6_literal_leg() {
+        // An IPv6-literal leg costs 20 B more of IP header. At a boundary MTU
+        // this drops one TS packet: 1024 − 28 − 16 − 29 = 951 → 5 packets on
+        // v4, but 1024 − 48 − 16 − 29 = 931 → 4 packets on v6.
+        let v4 = budget_cfg(
+            r#"{ "id":"o","name":"b","bond_flow_id":1, "path_mtu":1024,
+                 "encryption_key":"00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff",
+                 "paths":[{"id":0,"name":"a","transport":{"type":"udp","remote":"1.2.3.4:7400"}}] }"#,
+        );
+        assert_eq!(resolve_datagram_budget(&v4), (951, 940));
+        let v6 = budget_cfg(
+            r#"{ "id":"o","name":"b","bond_flow_id":1, "path_mtu":1024,
+                 "encryption_key":"00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff",
+                 "paths":[{"id":0,"name":"a","transport":{"type":"udp","remote":"[2001:db8::1]:7400"}}] }"#,
+        );
+        assert_eq!(resolve_datagram_budget(&v6), (931, 752));
+    }
+
+    #[test]
+    fn datagram_budget_hostname_leg_assumes_ipv6() {
+        // A hostname remote may resolve AAAA-only (parse_sockaddr falls back
+        // to any family), so the budget must deduct the IPv6 header size.
+        // At the same 1024 boundary as the literal test: 1024−48−16−29 = 931
+        // → 4 packets (vs 5 for a v4 literal).
+        let cfg = budget_cfg(
+            r#"{ "id":"o","name":"b","bond_flow_id":1, "path_mtu":1024,
+                 "encryption_key":"00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff",
+                 "paths":[{"id":0,"name":"a","transport":{"type":"udp","remote":"relay.example.com:7400"}}] }"#,
+        );
+        assert_eq!(resolve_datagram_budget(&cfg), (931, 752));
+    }
+
+    #[test]
+    fn datagram_budget_reserves_fec_repair_headroom() {
+        // Combined XOR FEC repairs carry chunk+14 of bond payload; without
+        // headroom a zero-slack budget (1013−28−16−29 = 940 = 5×188 exactly)
+        // would emit repairs that fragment on exactly the constrained path.
+        // With the 14 B reserve: 940−14 = 926 → 4 × 188 = 752.
+        let combined = budget_cfg(
+            r#"{ "id":"o","name":"b","bond_flow_id":1, "path_mtu":1013,
+                 "encryption_key":"00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff",
+                 "fec": { "columns": 10, "rows": 10 },
+                 "paths":[{"id":0,"name":"a","transport":{"type":"udp","remote":"1.2.3.4:7400"}}] }"#,
+        );
+        assert_eq!(resolve_datagram_budget(&combined), (926, 752));
+
+        // Per-leg XOR repairs additionally carry the 4·rows seq list:
+        // headroom 10 + 4×5 = 30 → 1500−28−16−29−30 = 1397 → 7 × 188 still.
+        let per_leg = budget_cfg(
+            r#"{ "id":"o","name":"b","bond_flow_id":1,
+                 "encryption_key":"00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff",
+                 "paths":[{"id":0,"name":"a",
+                   "fec": { "columns": 5, "rows": 5 },
+                   "transport":{"type":"udp","remote":"1.2.3.4:7400"}}] }"#,
+        );
+        assert_eq!(resolve_datagram_budget(&per_leg), (1397, 1316));
+    }
+
+    #[test]
+    fn datagram_budget_rist_leg_rtp_framing() {
+        // A RIST leg wraps each bond frame in its own 12 B RTP header.
+        // 1000−28−12−16−29 = 915 → 4 × 188 = 752 (budget drops by 12 vs the
+        // plain-UDP 927).
+        let cfg = budget_cfg(
+            r#"{ "id":"o","name":"b","bond_flow_id":1, "path_mtu":1000,
+                 "encryption_key":"00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff",
+                 "paths":[{"id":0,"name":"r","transport":{"type":"rist","role":"sender","remote":"1.2.3.4:7400"}}] }"#,
+        );
+        assert_eq!(resolve_datagram_budget(&cfg), (915, 752));
+    }
+
+    #[test]
+    fn retransmit_capacity_jumbo_mtu_does_not_shrink_ring() {
+        // Inputs still emit ≤1316 B bundles under a jumbo path_mtu — the
+        // NACK ring must be sized against the typical datagram, not the
+        // (never-reached) jumbo chunk ceiling.
+        let mk = |mtu: &str| {
+            budget_cfg(&format!(
+                r#"{{ "id":"o","name":"b","bond_flow_id":1, {mtu}
+                     "max_bonding_latency_ms": 2000,
+                     "paths":[{{"id":0,"name":"a","max_bitrate_bps":100000000,
+                       "transport":{{"type":"udp","remote":"1.2.3.4:7400"}}}}] }}"#
+            ))
+        };
+        assert_eq!(
+            derive_retransmit_capacity(&mk(r#""path_mtu":9000,"#)),
+            derive_retransmit_capacity(&mk("")),
+            "jumbo path_mtu must not undersize the retransmit ring"
+        );
+    }
+
+    #[test]
+    fn retransmit_capacity_grows_when_datagrams_shrink() {
+        // Same bitrate + latency budget: a 1000 B path MTU halves-ish the
+        // datagram size, so the packet-counted NACK ring must grow to cover
+        // the same wallclock window.
+        let mk = |mtu: &str| {
+            budget_cfg(&format!(
+                r#"{{ "id":"o","name":"b","bond_flow_id":1, {mtu}
+                     "max_bonding_latency_ms": 2000,
+                     "paths":[{{"id":0,"name":"a","max_bitrate_bps":100000000,
+                       "transport":{{"type":"udp","remote":"1.2.3.4:7400"}}}}] }}"#
+            ))
+        };
+        let default_ring = derive_retransmit_capacity(&mk(""));
+        let cellular_ring = derive_retransmit_capacity(&mk(r#""path_mtu":1000,"#));
+        assert!(
+            cellular_ring > default_ring,
+            "smaller datagrams need a deeper packet-counted ring \
+             ({cellular_ring} vs {default_ring})"
+        );
     }
 
     #[test]

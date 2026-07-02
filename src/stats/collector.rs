@@ -3778,6 +3778,10 @@ pub struct BondPathStatsHandle {
     /// as `BondPathLegStats.interface` so the manager UI can join a leg to its
     /// cellular radio state. `None` for gateway-mode / QUIC / RIST / receiver.
     pub interface: Option<String>,
+    /// Relay tunnel id (UUID) for a `transport == "relay"` leg. Surfaced as
+    /// `BondPathLegStats.tunnel_id` so the manager can join this leg to the
+    /// relay `udp_session` forwarding it. `None` for direct legs.
+    pub tunnel_id: Option<String>,
 }
 
 impl BondPathStatsHandle {
@@ -3801,6 +3805,7 @@ impl BondPathStatsHandle {
             gateway_mode: false,
             capacity_est: None,
             interface: None,
+            tunnel_id: None,
         }
     }
 
@@ -3813,6 +3818,12 @@ impl BondPathStatsHandle {
     /// Attach the kernel netdev this leg egresses on (builder style).
     pub fn with_interface(mut self, interface: Option<String>) -> Self {
         self.interface = interface;
+        self
+    }
+
+    /// Attach the relay tunnel id for a relay leg (builder style).
+    pub fn with_tunnel_id(mut self, tunnel_id: Option<String>) -> Self {
+        self.tunnel_id = tunnel_id;
         self
     }
 
@@ -3931,6 +3942,9 @@ pub fn bond_handle_to_leg_stats(h: &BondStatsHandle) -> BondLegStats {
                 } else {
                     p.interface.clone()
                 },
+                // Relay legs carry their tunnel id so the manager can join the
+                // leg to the relay session forwarding it. `None` for direct legs.
+                tunnel_id: p.tunnel_id.clone(),
             }
         })
         .collect();

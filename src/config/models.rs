@@ -4296,6 +4296,20 @@ pub struct BondedOutputConfig {
     /// Keepalive interval in milliseconds. Default 200 ms.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub keepalive_ms: Option<u32>,
+    /// Smallest IP-layer path MTU (bytes) across this bond's legs. The
+    /// output re-chunks outbound TS payloads at 188-byte packet boundaries
+    /// into datagrams that fit this MTU after every per-datagram overhead
+    /// (IP/UDP, bond header, AEAD envelope, relay tunnel framing), so no
+    /// leg emits an IP-fragmented datagram — cellular CGNAT paths routinely
+    /// drop fragments and black-hole PMTU discovery, so a fragmented
+    /// datagram is lost wholesale. Measure the constrained leg with a DF
+    /// ping sweep (`ping -M do -s <n>`). Default 1500 (standard ethernet),
+    /// which derives the classic 1316-byte (7 × 188) TS datagram; lower it
+    /// to the measured value for cellular / satellite legs (e.g. ~1000 on
+    /// some carrier-NAT bearers → 4 × 188 = 752 B datagrams). Valid
+    /// [576, 9000]. Sender-side only — the bonded input needs no change.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path_mtu: Option<u32>,
     /// Optional MPTS `program_number` filter applied before bonding (mirrors
     /// other TS-native outputs).
     #[serde(default, skip_serializing_if = "Option::is_none")]

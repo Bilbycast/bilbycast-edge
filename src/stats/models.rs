@@ -1967,8 +1967,19 @@ pub struct BondLegStats {
 pub struct BondPathLegStats {
     pub id: u8,
     pub name: String,
-    /// `"udp"`, `"quic"`, or `"rist"`.
+    /// `"udp"`, `"quic"`, `"rist"`, or `"relay"` (a leg that rides a native
+    /// plain-UDP relay tunnel in-process).
     pub transport: String,
+    /// Relay tunnel id (UUID) for a `transport == "relay"` leg — the same
+    /// value the manager stamped on the leg config and that the relay keys its
+    /// `udp_sessions[]` on. Lets the manager join this live leg directly to the
+    /// relay session forwarding it (so the UI can show, per leg, both what this
+    /// edge is *sending* and what the relay is *forwarding* — the single most
+    /// useful bond-over-relay troubleshooting correlation). `None` for direct
+    /// UDP / QUIC / RIST legs, the receiver side's non-relay legs, and older
+    /// edges (serde default).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tunnel_id: Option<String>,
     /// `"alive"` or `"dead"`.
     pub state: String,
     pub rtt_ms: f64,
