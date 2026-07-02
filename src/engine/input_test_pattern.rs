@@ -161,6 +161,11 @@ async fn run_inner(
     let fps = config.fps.max(1) as u32;
     let frame_duration = Duration::from_nanos(1_000_000_000 / fps as u64);
 
+    // Datagram packetization: bundle at most this many 188-byte TS packets
+    // into each emitted RtpPacket. Default 7 → 1316 B, the SRT payload size
+    // and the internet-safe MTU. See `TestPatternInputConfig::ts_packets_per_datagram`.
+    let packets_per_datagram = config.ts_packets_per_datagram.max(1) as usize;
+
     // Select an available video encoder backend. x264 is the most
     // common; fall back to x265 or NVENC if only those are compiled in.
     let backend = select_video_backend()
@@ -334,7 +339,7 @@ async fn run_inner(
             // in-process encoders already emit Annex-B when global_header
             // is false.
             let ts_chunks = ts_muxer.mux_video(&ef.data, ef.pts as u64, ef.pts as u64, ef.keyframe);
-            publish_chunks(ts_chunks, &mut seq_num, stats, per_input_tx, pts_90khz, &mut transcoder, &mut post);
+            publish_chunks(ts_chunks, &mut seq_num, stats, per_input_tx, pts_90khz, &mut transcoder, &mut post, packets_per_datagram);
         }
 
         // ── Audio ── generate + encode ~1 frame-duration's worth of tone.
@@ -400,7 +405,7 @@ async fn run_inner(
             let frames_ready = ctx.encode_pending()?;
             for (adts, apts) in frames_ready {
                 let ts_chunks = ts_muxer.mux_audio_pre_adts(&adts, apts);
-                publish_chunks(ts_chunks, &mut seq_num, stats, per_input_tx, apts, &mut transcoder, &mut post);
+                publish_chunks(ts_chunks, &mut seq_num, stats, per_input_tx, apts, &mut transcoder, &mut post, packets_per_datagram);
             }
         }
 
@@ -417,39 +422,52 @@ fn publish_chunks(
     pts_90khz: u64,
     transcoder: &mut Option<crate::engine::input_transcode::InputTranscoder>,
     post: &mut Option<crate::engine::input_post_process::InputPostProcess>,
+    packets_per_datagram: usize,
 ) {
-    // Bundle all TS packets from this video/audio frame into a single
-    // RtpPacket — one TsMuxer call per frame produces ~dozens of 188 B
-    // chunks, and publishing each one as its own RtpPacket saturates the
-    // 2048-slot broadcast channel, starving the thumbnail / analyzer
-    // subscribers and making the test pattern invisible downstream.
-    // See `input_rtmp.rs` for the same bundling pattern.
+    // Bundle this video/audio frame's 188 B TS packets into datagram-sized
+    // RtpPackets of at most `packets_per_datagram` × 188 B each (default
+    // 7 × 188 = 1316 B, the SRT payload size and the internet-safe MTU).
+    //
+    // Two failure modes bracket this: publishing each 188 B packet as its
+    // own RtpPacket saturates the flow broadcast channel and starves the
+    // thumbnail / analyzer subscribers; bundling a whole frame per RtpPacket
+    // (the pre-2026-07 behaviour) emits oversized ~2 KB+ datagrams that get
+    // IP-fragmented or dropped over the public internet and the QUIC/UDP
+    // tunnel path (which forward each RtpPacket as one datagram, unchanged).
+    // Grouping N packets is the middle ground: one datagram per N packets,
+    // the frame's tail as a short final datagram (harmless — a max size, not
+    // a fixed one, exactly like SRT flushing at a frame boundary). Downstream
+    // UDP/RTP/SRT outputs re-chunk to their own 1316 B wire size regardless.
+    // See `input_rtmp.rs` for the per-frame bundling pattern.
     if ts_chunks.is_empty() {
         return;
     }
-    let total_len: usize = ts_chunks.iter().map(|c| c.len()).sum();
-    let mut combined = bytes::BytesMut::with_capacity(total_len);
-    for chunk in &ts_chunks {
-        combined.extend_from_slice(chunk);
+    let group = packets_per_datagram.max(1);
+    for batch in ts_chunks.chunks(group) {
+        let total_len: usize = batch.iter().map(|c| c.len()).sum();
+        let mut combined = bytes::BytesMut::with_capacity(total_len);
+        for chunk in batch {
+            combined.extend_from_slice(chunk);
+        }
+        let pkt = RtpPacket {
+            data: combined.freeze(),
+            sequence_number: *seq_num,
+            rtp_timestamp: pts_90khz as u32,
+            recv_time_us: crate::util::time::now_us(),
+            is_raw_ts: true,
+            upstream_seq: None,
+            upstream_leg_id: None,
+            sender_timestamp_us: None,
+        };
+        *seq_num = seq_num.wrapping_add(1);
+        stats.input_packets.fetch_add(1, Ordering::Relaxed);
+        stats.input_bytes.fetch_add(total_len as u64, Ordering::Relaxed);
+        // Route through the optional ingress transcoder. None ⇒ passthrough
+        // (single broadcast send, no copy). Some ⇒ block_in_place re-encode
+        // before publish. A lagging subscriber sees RecvError::Lagged inside
+        // the helper — not our problem.
+        crate::engine::input_transcode::publish_input_packet_with_post(transcoder, post, per_input_tx, pkt);
     }
-    let pkt = RtpPacket {
-        data: combined.freeze(),
-        sequence_number: *seq_num,
-        rtp_timestamp: pts_90khz as u32,
-        recv_time_us: crate::util::time::now_us(),
-        is_raw_ts: true,
-        upstream_seq: None,
-        upstream_leg_id: None,
-        sender_timestamp_us: None,
-    };
-    *seq_num = seq_num.wrapping_add(1);
-    stats.input_packets.fetch_add(1, Ordering::Relaxed);
-    stats.input_bytes.fetch_add(total_len as u64, Ordering::Relaxed);
-    // Route through the optional ingress transcoder. None ⇒ passthrough
-    // (single broadcast send, no copy). Some ⇒ block_in_place re-encode
-    // before publish. A lagging subscriber sees RecvError::Lagged inside
-    // the helper — not our problem.
-    crate::engine::input_transcode::publish_input_packet_with_post(transcoder, post, per_input_tx, pkt);
 }
 
 #[cfg(all(feature = "media-codecs", feature = "fdk-aac"))]

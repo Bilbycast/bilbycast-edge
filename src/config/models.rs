@@ -1827,6 +1827,21 @@ pub struct TestPatternInputConfig {
     /// `av_sync_marker = true`.
     #[serde(default)]
     pub channel_ident_layout: TestPatternChannelIdentLayout,
+    /// Maximum number of 188-byte MPEG-TS packets bundled into each output
+    /// datagram (`RtpPacket`) this generator emits. Default 7 → 7 × 188 =
+    /// 1316 B, the SRT payload size and the safe maximum for the public
+    /// internet (it fits inside a 1500-byte MTU with IP/UDP headers, so
+    /// routers don't fragment it). Lower it (e.g. 3–6) to test a
+    /// constrained / low-MTU path; raise it (8+) to test jumbo datagrams on
+    /// a LAN. Bounded 1..=348 (348 × 188 = 65 424 B, the largest that fits
+    /// one UDP datagram). Independent of any downstream UDP/RTP/SRT output,
+    /// which re-chunk to their own fixed 1316 B wire size — this knob
+    /// governs the raw generator feed and the QUIC/UDP tunnel path, which
+    /// forward each datagram unchanged. Before this field, the generator
+    /// bundled a whole frame per datagram (~2 KB+), which fragmented or
+    /// dropped over the internet.
+    #[serde(default = "default_tp_ts_packets_per_datagram")]
+    pub ts_packets_per_datagram: u16,
 }
 
 fn default_tp_width() -> u16 { 1280 }
@@ -1836,6 +1851,7 @@ fn default_tp_fps() -> u16 { 25 }
 fn default_tp_video_bitrate() -> u32 { 2000 }
 fn default_tp_tone_hz() -> f32 { 1000.0 }
 fn default_tp_tone_dbfs() -> f32 { -20.0 }
+fn default_tp_ts_packets_per_datagram() -> u16 { 7 }
 
 /// One asset inside a [`MediaPlayerInputConfig`]. The edge's media library
 /// stores files by sanitised `name` under the configured media directory
