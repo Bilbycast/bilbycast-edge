@@ -975,6 +975,7 @@ of the local file kicks in transparently.
 | `loop_playback` | boolean | No | `true` | Restart at the head of the playlist when the last source ends. Leave on for fallback duty. |
 | `shuffle` | boolean | No | `false` | Randomise source order each time the playlist starts. |
 | `paced_bitrate_bps` | integer | No | `null` | TS-only override for the egress pacer when the source has no usable PCR. Range 100 000 – 200 000 000 (100 kbps – 200 Mbps). Leave `null` to pace from PCR (default for any healthy TS asset). |
+| `ts_packets_per_datagram` | integer | No | `7` | How many 188-byte MPEG-TS packets the player bundles into each UDP datagram on the flow broadcast channel and the QUIC/UDP tunnel path (both forward each datagram unchanged). Applies to every source kind (`ts` / `mp4` / `image`). `7 × 188 = 1316 B` is the standard / SRT datagram size. Range `[1, 348]` (`348 × 188 = 65 424 B`, the largest that fits one UDP datagram; `0` is rejected). **Lower** it (e.g. `4`–`5`) for constrained / low-MTU internet or cellular paths where a big datagram IP-fragments and drops; **raise** it (`8`+) for jumbo datagrams on a LAN. Independent of any downstream UDP/RTP/SRT output, which re-chunks to its own fixed 1316 B wire size. |
 
 **Source variants** (tagged by `kind`):
 
@@ -1065,6 +1066,7 @@ legacy interlace stand-ins; `2160`/`3840` widths work too for UHD.
 | `tone_hz` | f32 | `1000.0` | Audio tone frequency. Range `[50, 8000]`. |
 | `tone_dbfs` | f32 | `-20.0` | Audio level in dBFS. `-20 dBFS` is the broadcast reference level. |
 | `av_sync_marker` | bool | `false` | A/V-sync test mode (EBU R 49 / SMPTE 2-pop style). When `true`, the tone gates into a ~80 ms burst on the timecode second boundary and a luma flash patch appears next to the timecode on the same frames. Offset between audible pip and visible flash reads off directly as A/V skew. Requires `audio_enabled = true`. |
+| `ts_packets_per_datagram` | u16 | `7` | How many 188-byte MPEG-TS packets the generator bundles into each UDP datagram on the flow broadcast channel and the QUIC/UDP tunnel path (both forward each datagram unchanged). `7 × 188 = 1316 B` is the standard / SRT datagram size. Range `[1, 348]` (`348 × 188 = 65 424 B`, the largest that fits one UDP datagram; `0` is rejected). **Lower** it (e.g. `4`–`5`) for constrained / low-MTU internet or cellular paths where a big datagram IP-fragments and drops; **raise** it (`8`+) to test jumbo datagrams on a LAN. Independent of any downstream UDP/RTP/SRT output, which re-chunks to its own fixed 1316 B wire size. |
 
 Requires the edge build to include the `media-codecs` and
 `fdk-aac` features (both on by default). Software-encoded — counts

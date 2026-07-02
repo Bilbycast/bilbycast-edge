@@ -211,8 +211,30 @@ gate 8 (long soak) → gate 7 (real receiver). A layer is "in" only when
 all four pass at the expected envelope; never report aggregate results
 (see `feedback_broadcast_quality_testing.md` rationale).
 
+## Tuning a bonded output for a cellular / low-MTU path
+
+The pacing ladder above targets a LAN-attached contribution encoder. A
+bonded contribution path over cellular / satellite bearers has a
+different failure mode: a carrier-NAT (CGNAT) leg silently drops IP
+fragments and black-holes PMTU discovery, so an oversized datagram (a
+whole I-frame) is lost wholesale — the leg reports `state=alive` with a
+healthy RTT yet delivers only ~10–15 % of bytes (video absent / heavily
+pixelated). The fix is the bonded output's **`path_mtu`** knob: it
+re-chunks the outbound TS at 188-byte boundaries into datagrams that fit
+the smallest per-leg path MTU *after* all overhead, so no leg ever
+fragments. Measure the constrained leg with a DF ping sweep
+(`ping -M do -s <n>`) and set `path_mtu` to the largest size that gets
+through — the default 1500 derives the classic 1316 B (7 × 188) datagram,
+a measured ~1000 B cellular bearer derives 752 B (4 × 188). Full field
+reference (overhead breakdown, range `[576, 9000]`, non-TS handling):
+[`bonding.md`](bonding.md) config table. This is a bonding-path tuning
+axis, independent of the wire-pacing tiers here.
+
 ## Cross-references
 
+- [`bonding.md`](bonding.md) — multi-path bonding config, including the
+  `path_mtu` re-chunking knob for constrained cellular / satellite legs
+  (see the subsection above).
 - [`wire-pacing.md`](wire-pacing.md) — the wire pacer's design, tier
   table, and why userspace timers are unreliable below ~1 ms.
 - [`clocking.md`](clocking.md) — per-flow master clock model
