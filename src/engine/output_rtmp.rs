@@ -1003,6 +1003,8 @@ fn resolve_backend(
         "hevc_qsv" => Some(video_codec::VideoEncoderCodec::HevcQsv),
         "h264_vaapi" => Some(video_codec::VideoEncoderCodec::H264Vaapi),
         "hevc_vaapi" => Some(video_codec::VideoEncoderCodec::HevcVaapi),
+        "h264_rkmpp" => Some(video_codec::VideoEncoderCodec::H264Rkmpp),
+        "hevc_rkmpp" => Some(video_codec::VideoEncoderCodec::HevcRkmpp),
         other => {
             let msg = format!(
                 "RTMP output '{}': video_encode unknown codec '{other}'",
@@ -1369,6 +1371,9 @@ fn open_video_active(
         }
         video_codec::VideoEncoderCodec::H264Vaapi | video_codec::VideoEncoderCodec::HevcVaapi => {
             "vaapi"
+        }
+        video_codec::VideoEncoderCodec::H264Rkmpp | video_codec::VideoEncoderCodec::HevcRkmpp => {
+            "rkmpp"
         }
     };
     let target_codec = match target_family {

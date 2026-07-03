@@ -1620,6 +1620,8 @@ mod inner {
             "hevc_qsv" => Ok(VideoEncoderCodec::HevcQsv),
             "h264_vaapi" => Ok(VideoEncoderCodec::H264Vaapi),
             "hevc_vaapi" => Ok(VideoEncoderCodec::HevcVaapi),
+            "h264_rkmpp" => Ok(VideoEncoderCodec::H264Rkmpp),
+            "hevc_rkmpp" => Ok(VideoEncoderCodec::HevcRkmpp),
             other => Err(TsVideoReplaceError::UnknownCodec(other.to_string())),
         }
     }

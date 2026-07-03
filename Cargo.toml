@@ -285,6 +285,19 @@ video-encoder-qsv = ["media-codecs", "video-engine/video-encoder-qsv"]
 # VAAPI surface layouts but each demands a distinct upload packer that
 # is staged for a follow-up.
 video-encoder-vaapi = ["media-codecs", "video-engine/video-encoder-vaapi"]
+# RKMPP (Rockchip Media Process Platform) hardware H.264/HEVC encode on
+# ARM Rockchip SoCs (RK3568 / RK3588). Adds `--enable-rkmpp
+# --enable-libdrm --enable-encoder=h264_rkmpp/hevc_rkmpp` to the vendored
+# FFmpeg build and links `librockchip_mpp` + `libdrm`. Both encoders are
+# 8-bit 4:2:0 only. Royalty-free (MPP is LGPLv3, FFmpeg's wrapper is
+# LGPL — no GPL/nonfree). Build prereqs: the Rockchip BSP
+# `librockchip-mpp-dev` (>= 1.3.8, ships `rockchip_mpp.pc`) + `libdrm-dev`;
+# runtime needs the MPP kernel driver (`/dev/mpp_service`). Deliberately
+# NOT in `video-encoders-full` (that composite targets x86_64, which has
+# no `rockchip_mpp`) — the aarch64 `*-full` release job lists it
+# explicitly alongside the other aarch64 features. Off by default; only
+# buildable on a native aarch64 Rockchip host.
+video-encoder-rkmpp = ["media-codecs", "video-engine/video-encoder-rkmpp"]
 # Bundle every video codec backend the edge knows about — encoders
 # (x264 + x265 + NVENC + QSV + VAAPI) AND HW decoders for the display
 # output (NVDEC + QSV-decode + VAAPI-decode). Used by the GitHub

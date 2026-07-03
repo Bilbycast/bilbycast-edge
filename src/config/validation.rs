@@ -3945,13 +3945,13 @@ fn validate_video_encode(
 ) -> anyhow::Result<()> {
     match enc.codec.as_str() {
         "x264" | "x265" | "h264_nvenc" | "hevc_nvenc" | "h264_qsv" | "hevc_qsv"
-        | "h264_vaapi" | "hevc_vaapi"
+        | "h264_vaapi" | "hevc_vaapi" | "h264_rkmpp" | "hevc_rkmpp"
         // Auto strings — resolved per-host at flow start.
         | "h264_auto" | "hevc_auto" | "auto" => {}
         other => bail!(
             "{context}: video_encode.codec '{other}' is not recognised; \
              expected one of x264, x265, h264_nvenc, hevc_nvenc, h264_qsv, hevc_qsv, \
-             h264_vaapi, hevc_vaapi, h264_auto, hevc_auto"
+             h264_vaapi, hevc_vaapi, h264_rkmpp, hevc_rkmpp, h264_auto, hevc_auto"
         ),
     }
     // Reject codecs whose backend wasn't compiled into this build. Runtime
@@ -3978,6 +3978,9 @@ fn validate_video_encode(
         "h264_vaapi" | "hevc_vaapi" => {
             if cfg!(feature = "video-encoder-vaapi") { None } else { Some("video-encoder-vaapi") }
         }
+        "h264_rkmpp" | "hevc_rkmpp" => {
+            if cfg!(feature = "video-encoder-rkmpp") { None } else { Some("video-encoder-rkmpp") }
+        }
         "h264_auto" | "hevc_auto" | "auto" => {
             // Auto needs at least one encoder family in the build to land
             // somewhere. Reject only when nothing is present.
@@ -3986,10 +3989,11 @@ fn validate_video_encode(
                 || cfg!(feature = "video-encoder-nvenc")
                 || cfg!(feature = "video-encoder-qsv")
                 || cfg!(feature = "video-encoder-vaapi")
+                || cfg!(feature = "video-encoder-rkmpp")
             {
                 None
             } else {
-                Some("video-encoder-x264 (or x265 / nvenc / qsv / vaapi)")
+                Some("video-encoder-x264 (or x265 / nvenc / qsv / vaapi / rkmpp)")
             }
         }
         _ => None,
@@ -4157,6 +4161,27 @@ fn validate_video_encode(
         ("h264_vaapi" | "hevc_vaapi", Some("yuv444p"), _) => bail!(
             "{context}: VAAPI backends do not support chroma=yuv444p (NV24 packer staged for follow-up); \
              use x264 or x265 instead"
+        ),
+        _ => {}
+    }
+    // RKMPP (Rockchip VPU) backend restrictions — BOTH h264_rkmpp and
+    // hevc_rkmpp are 8-bit 4:2:0 ONLY (unlike VAAPI/QSV/NVENC, whose HEVC
+    // variants allow 10-bit). The RK3568 / RK3588 VEPU has no 4:2:2, no
+    // 4:4:4, and no 10-bit encode path (10-bit on RK3588 is decode-only).
+    // Mirrors the runtime gate in `video_engine/src/video_encoder.rs::open()`
+    // — this is what protects the "must not regress 10-bit" contract when an
+    // operator explicitly selects RKMPP for a 10-bit / 4:2:2 flow.
+    match (enc.codec.as_str(), chroma_str, enc.bit_depth) {
+        ("h264_rkmpp" | "hevc_rkmpp", _, Some(10)) => bail!(
+            "{context}: RKMPP encoders are 8-bit only (the Rockchip VEPU has no 10-bit encode path); \
+             use x265 for 10-bit HEVC (or x264) — or pick `hevc_auto` / `h264_auto` and let the resolver choose"
+        ),
+        ("h264_rkmpp" | "hevc_rkmpp", Some("yuv422p"), _) => bail!(
+            "{context}: RKMPP encoders are 4:2:0 only (the Rockchip VEPU is 4:2:0); \
+             use x264 or x265 for 4:2:2 — or pick `hevc_auto` / `h264_auto`"
+        ),
+        ("h264_rkmpp" | "hevc_rkmpp", Some("yuv444p"), _) => bail!(
+            "{context}: RKMPP encoders do not support chroma=yuv444p; use x264 or x265 instead"
         ),
         _ => {}
     }
@@ -5316,8 +5341,9 @@ pub fn validate_output_with_input(
                 // backend; `h264_auto` is allowed (the resolver picks an
                 // H.264 backend per host).
                 match ve.codec.as_str() {
-                    "x265" | "hevc_nvenc" | "hevc_qsv" | "hevc_vaapi" | "hevc_auto" => bail!(
-                        "WebRTC output '{}': video_encode.codec '{}' is not supported — WebRTC browsers only decode H.264 (use 'x264', 'h264_nvenc', 'h264_qsv', 'h264_vaapi', or 'h264_auto')",
+                    "x265" | "hevc_nvenc" | "hevc_qsv" | "hevc_vaapi" | "hevc_rkmpp"
+                    | "hevc_auto" => bail!(
+                        "WebRTC output '{}': video_encode.codec '{}' is not supported — WebRTC browsers only decode H.264 (use 'x264', 'h264_nvenc', 'h264_qsv', 'h264_vaapi', 'h264_rkmpp', or 'h264_auto')",
                         webrtc.id, ve.codec,
                     ),
                     _ => {}

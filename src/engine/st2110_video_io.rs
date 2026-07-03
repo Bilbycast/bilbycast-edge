@@ -444,6 +444,8 @@ pub(crate) fn build_encoder_config(
         ResolvedVideoEncoder::HevcQsv => VideoEncoderCodec::HevcQsv,
         ResolvedVideoEncoder::H264Vaapi => VideoEncoderCodec::H264Vaapi,
         ResolvedVideoEncoder::HevcVaapi => VideoEncoderCodec::HevcVaapi,
+        ResolvedVideoEncoder::H264Rkmpp => VideoEncoderCodec::H264Rkmpp,
+        ResolvedVideoEncoder::HevcRkmpp => VideoEncoderCodec::HevcRkmpp,
     };
     // Try the host-capability resolver first. This unwraps `*_auto`
     // strings AND validates fixed backends against the runtime

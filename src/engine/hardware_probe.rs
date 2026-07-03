@@ -61,6 +61,14 @@ pub struct HwCodecCapability {
     pub h264_vaapi: bool,
     #[serde(default)]
     pub hevc_vaapi: bool,
+    /// RKMPP (Rockchip Media Process Platform) on ARM Rockchip SoCs
+    /// (RK3568 / RK3588). Encoder side only — `h264_rkmpp` / `hevc_rkmpp`
+    /// are 8-bit 4:2:0. Older managers ignore the unknown field; newer
+    /// managers light up the RKMPP row on the Resources card.
+    #[serde(default)]
+    pub h264_rkmpp: bool,
+    #[serde(default)]
+    pub hevc_rkmpp: bool,
 }
 
 impl HwCodecCapability {
@@ -77,6 +85,8 @@ impl HwCodecCapability {
             || self.hevc_amf
             || self.h264_vaapi
             || self.hevc_vaapi
+            || self.h264_rkmpp
+            || self.hevc_rkmpp
     }
 }
 
@@ -150,6 +160,15 @@ pub struct HwSessionLimits {
     pub amf_max_sessions_4k: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub vaapi_max_sessions_4k: Option<u32>,
+    /// RKMPP (Rockchip VPU) encoder session ceiling. RK3568 is 1080p60-max
+    /// (no 4K encode → `rkmpp_max_sessions_4k` stays `None`); RK3588 encodes
+    /// up to 8K30 and is throughput-bound, so the probed count is an estimate
+    /// of concurrent 1080p / 4K sessions the single VEPU sustains. Older
+    /// managers omit these fields (serde skips `None`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rkmpp_max_sessions: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rkmpp_max_sessions_4k: Option<u32>,
 }
 
 impl HwSessionLimits {
@@ -165,6 +184,8 @@ impl HwSessionLimits {
             && self.qsv_max_sessions_4k.is_none()
             && self.amf_max_sessions_4k.is_none()
             && self.vaapi_max_sessions_4k.is_none()
+            && self.rkmpp_max_sessions.is_none()
+            && self.rkmpp_max_sessions_4k.is_none()
     }
 }
 
@@ -772,6 +793,38 @@ fn probe_encoder_session_limits(hw: &HwCodecCapability) -> HwSessionLimits {
             }
         }
     }
+    if hw.h264_rkmpp || hw.hevc_rkmpp {
+        // RKMPP uses the generic session counter (sysmem NV12, no hwdevice)
+        // — same path as NVENC/QSV/AMF, unlike VAAPI. The single Rockchip
+        // VEPU is throughput-bound, so this measures how many concurrent
+        // sessions it sustains at the probe resolution.
+        let probe_codec = if hw.h264_rkmpp { "h264_rkmpp" } else { "hevc_rkmpp" };
+        let n_1080p = video_engine::count_max_encoder_sessions(
+            probe_codec,
+            SESSION_PROBE_UPPER_BOUND,
+            video_engine::PROBE_WIDTH_1080P,
+            video_engine::PROBE_HEIGHT_1080P,
+        );
+        if n_1080p > 0 {
+            tracing::info!("rkmpp encoder 1080p session capacity probed: {n_1080p}");
+            out.rkmpp_max_sessions = Some(n_1080p);
+            if probe_4k {
+                // RK3568 has no 4K encode path at all — this probe returns
+                // 0 there so `rkmpp_max_sessions_4k` stays `None`. RK3588
+                // (4K/8K encode) returns a real count.
+                let n_4k = video_engine::count_max_encoder_sessions(
+                    probe_codec,
+                    FOUR_K_UPPER_BOUND,
+                    video_engine::PROBE_WIDTH_4K,
+                    video_engine::PROBE_HEIGHT_4K,
+                );
+                if n_4k > 0 {
+                    tracing::info!("rkmpp encoder 4K session capacity probed: {n_4k}");
+                    out.rkmpp_max_sessions_4k = Some(n_4k);
+                }
+            }
+        }
+    }
     out
 }
 
@@ -895,6 +948,13 @@ fn probe_hw_encoders() -> HwCodecCapability {
         // before `avcodec_open2`.
         h264_vaapi: probe_runtime_vaapi_encoder("h264_vaapi"),
         hevc_vaapi: probe_runtime_vaapi_encoder("hevc_vaapi"),
+        // RKMPP (Rockchip VPU) uses the generic no-hwdevice probe path:
+        // the encoder accepts a plain sysmem NV12 frame and auto-creates
+        // its own MPP device internally, so `probe_runtime_encoder`'s
+        // avcodec_open2 round-trip suffices (unlike VAAPI). Returns false
+        // on non-Rockchip / non-rkmpp builds (encoder not compiled in).
+        h264_rkmpp: probe_rkmpp_encoder("h264_rkmpp"),
+        hevc_rkmpp: probe_rkmpp_encoder("hevc_rkmpp"),
     }
 }
 
@@ -924,6 +984,12 @@ fn probe_hw_decoders() -> HwCodecCapability {
         // VAAPI device twice in the probe.
         h264_vaapi: probe_runtime_vaapi_device(),
         hevc_vaapi: probe_runtime_vaapi_device(),
+        // RKMPP decode is not wired into a codec-selection path in this
+        // pass (the Rockchip VPU has capable h264/hevc/av1 decoders, but
+        // neither the transcode input-decode nor the display output selects
+        // rkmpp decode yet). Stubbed `false` like AMF on the decoder side.
+        h264_rkmpp: false,
+        hevc_rkmpp: false,
     }
 }
 
@@ -1111,6 +1177,55 @@ fn probe_qsv_encoder(name: &str) -> bool {
 
 #[cfg(not(feature = "media-codecs"))]
 fn probe_qsv_encoder(_: &str) -> bool {
+    false
+}
+
+/// RKMPP (Rockchip MPP) encoder probe with a `/dev/mpp_service`
+/// diagnostic. Uses the generic `probe_open_encoder` avcodec_open2
+/// round-trip — the rkmpp encoder accepts a plain sysmem NV12 frame and
+/// auto-creates its own MPP device internally, so no VAAPI-style hwdevice
+/// pre-setup is needed. On non-Rockchip / non-rkmpp builds the encoder
+/// isn't compiled into FFmpeg (`NotCompiled` → false). When the MPP kernel
+/// node is present but the open fails, the running user usually lacks
+/// access to `/dev/mpp_service` (add them to the `video` group) or
+/// librockchip_mpp is older than 1.3.8 — surface that loudly, mirroring
+/// the QSV `EACCES` diagnostic.
+#[cfg(feature = "media-codecs")]
+fn probe_rkmpp_encoder(name: &str) -> bool {
+    match video_engine::probe_open_encoder(name) {
+        Ok(()) => {
+            tracing::debug!("rkmpp probe ok: {name}");
+            true
+        }
+        Err(video_engine::ProbeError::NotCompiled) => {
+            tracing::trace!("rkmpp not compiled in: {name}");
+            false
+        }
+        Err(video_engine::ProbeError::PermissionDenied) => {
+            tracing::warn!(
+                "rkmpp probe denied for {name}: EACCES on the Rockchip MPP device. \
+                Add the running user to the 'video' group (or grant access to \
+                /dev/mpp_service) and restart."
+            );
+            false
+        }
+        Err(e) => {
+            if std::path::Path::new("/dev/mpp_service").exists() {
+                tracing::warn!(
+                    "rkmpp probe failed for {name}: {e}. The MPP kernel node \
+                    /dev/mpp_service is present — check that librockchip_mpp is \
+                    >= 1.3.8 and the VPU driver is loaded."
+                );
+            } else {
+                tracing::debug!("rkmpp probe failed: {name}: {e}");
+            }
+            false
+        }
+    }
+}
+
+#[cfg(not(feature = "media-codecs"))]
+fn probe_rkmpp_encoder(_: &str) -> bool {
     false
 }
 
@@ -1487,6 +1602,11 @@ pub struct FlowCostPlan {
     pub qsv_sessions_4k: u32,
     pub amf_sessions_4k: u32,
     pub vaapi_sessions_4k: u32,
+    /// RKMPP (Rockchip VPU) encoder sessions on this flow. RK3568 caps at
+    /// 1080p (4K sessions always 0); RK3588 supports 4K, counted in both
+    /// `rkmpp_sessions` and `rkmpp_sessions_4k`.
+    pub rkmpp_sessions: u32,
+    pub rkmpp_sessions_4k: u32,
     /// Per-family decoder session counts charged by HW-decoded
     /// `display` outputs on this flow. NVDEC and QSV-decode are
     /// tracked separately even though QSV-decode shares an iGPU with
@@ -1537,6 +1657,11 @@ pub struct HwSessionUsage {
     pub amf_in_use_4k: u32,
     #[serde(default, skip_serializing_if = "is_zero_u32")]
     pub vaapi_in_use_4k: u32,
+    /// RKMPP (Rockchip VPU) encoder sessions in use across every flow.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub rkmpp_in_use: u32,
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub rkmpp_in_use_4k: u32,
     /// Active hardware-decoder sessions. Charged today only by
     /// HW-decoded `display` outputs (`hw_decode` resolved to NVDEC /
     /// QSV / VAAPI). When future input-side HW decode lands the same
@@ -1572,6 +1697,9 @@ pub enum HwEncoderFamily {
     VideoToolbox,
     Amf,
     Vaapi,
+    /// Rockchip MPP (RK3568 / RK3588 VPU). H.264 + HEVC share the single
+    /// on-chip VEPU engine, so one family covers both.
+    Rkmpp,
 }
 
 impl HwEncoderFamily {
@@ -1591,6 +1719,8 @@ impl HwEncoderFamily {
             Some(HwEncoderFamily::Amf)
         } else if c.contains("vaapi") {
             Some(HwEncoderFamily::Vaapi)
+        } else if c.contains("rkmpp") {
+            Some(HwEncoderFamily::Rkmpp)
         } else {
             None
         }
@@ -1988,6 +2118,10 @@ pub enum ResolvedVideoEncoder {
     HevcQsv,
     H264Vaapi,
     HevcVaapi,
+    /// Rockchip MPP H.264 hardware encoder (ARM RK3568 / RK3588).
+    H264Rkmpp,
+    /// Rockchip MPP HEVC hardware encoder (ARM RK3568 / RK3588).
+    HevcRkmpp,
 }
 
 impl ResolvedVideoEncoder {
@@ -2004,6 +2138,8 @@ impl ResolvedVideoEncoder {
             ResolvedVideoEncoder::HevcQsv => "hevc_qsv",
             ResolvedVideoEncoder::H264Vaapi => "h264_vaapi",
             ResolvedVideoEncoder::HevcVaapi => "hevc_vaapi",
+            ResolvedVideoEncoder::H264Rkmpp => "h264_rkmpp",
+            ResolvedVideoEncoder::HevcRkmpp => "hevc_rkmpp",
         }
     }
 
@@ -2013,11 +2149,13 @@ impl ResolvedVideoEncoder {
             ResolvedVideoEncoder::X264
             | ResolvedVideoEncoder::H264Nvenc
             | ResolvedVideoEncoder::H264Qsv
-            | ResolvedVideoEncoder::H264Vaapi => EncoderFamily::H264,
+            | ResolvedVideoEncoder::H264Vaapi
+            | ResolvedVideoEncoder::H264Rkmpp => EncoderFamily::H264,
             ResolvedVideoEncoder::X265
             | ResolvedVideoEncoder::HevcNvenc
             | ResolvedVideoEncoder::HevcQsv
-            | ResolvedVideoEncoder::HevcVaapi => EncoderFamily::Hevc,
+            | ResolvedVideoEncoder::HevcVaapi
+            | ResolvedVideoEncoder::HevcRkmpp => EncoderFamily::Hevc,
         }
     }
 
@@ -2034,6 +2172,9 @@ impl ResolvedVideoEncoder {
             }
             ResolvedVideoEncoder::H264Vaapi | ResolvedVideoEncoder::HevcVaapi => {
                 Some(HwEncoderFamily::Vaapi)
+            }
+            ResolvedVideoEncoder::H264Rkmpp | ResolvedVideoEncoder::HevcRkmpp => {
+                Some(HwEncoderFamily::Rkmpp)
             }
         }
     }
@@ -2063,6 +2204,8 @@ impl ResolvedVideoEncoder {
             ResolvedVideoEncoder::HevcQsv => VideoEncoderCodec::HevcQsv,
             ResolvedVideoEncoder::H264Vaapi => VideoEncoderCodec::H264Vaapi,
             ResolvedVideoEncoder::HevcVaapi => VideoEncoderCodec::HevcVaapi,
+            ResolvedVideoEncoder::H264Rkmpp => VideoEncoderCodec::H264Rkmpp,
+            ResolvedVideoEncoder::HevcRkmpp => VideoEncoderCodec::HevcRkmpp,
         }
     }
 }
@@ -2374,6 +2517,27 @@ fn host_supports_encoder(
                 _ => false, // 4:4:4 (NV24 packer) deferred
             }
         }
+        ResolvedVideoEncoder::H264Rkmpp => {
+            if !cfg!(feature = "video-encoder-rkmpp") {
+                return false;
+            }
+            // Rockchip VEPU is 8-bit 4:2:0 only (no 4:2:2, no 4:4:4, no
+            // 10-bit) — this is what keeps a 10-bit / 4:2:2 request from
+            // ever resolving to RKMPP on the auto chain.
+            caps.hw_encoders.h264_rkmpp
+                && chroma == VideoChroma::Yuv420
+                && bit_depth == 8
+        }
+        ResolvedVideoEncoder::HevcRkmpp => {
+            if !cfg!(feature = "video-encoder-rkmpp") {
+                return false;
+            }
+            // hevc_rkmpp is 8-bit 4:2:0 only as well — the RK3588 VEPU has
+            // no 10-bit encode path (10-bit is decode-only).
+            caps.hw_encoders.hevc_rkmpp
+                && chroma == VideoChroma::Yuv420
+                && bit_depth == 8
+        }
     }
 }
 
@@ -2395,7 +2559,11 @@ fn auto_priority_chain(
         // close second on Intel iGPU; VAAPI is the AMD/iHD path; x264
         // is the fallback that always works.
         (EncoderFamily::H264, VideoChroma::Yuv420, 8) => {
-            &[H264Nvenc, H264Qsv, H264Vaapi, X264]
+            // RKMPP leads on aarch64 Rockchip boards (it's the only HW
+            // encoder there); on every other host `host_supports_encoder`
+            // filters it out (feature off or probe false) and the resolver
+            // falls straight through to NVENC/QSV/VAAPI/x264 as before.
+            &[H264Rkmpp, H264Nvenc, H264Qsv, H264Vaapi, X264]
         }
         // H.264 + anything else → libx264 (no HW H.264 encoder
         // supports 4:2:2, 10-bit, or 4:4:4).
@@ -2405,7 +2573,9 @@ fn auto_priority_chain(
         // 4:2:0 8-bit: NVENC ≻ QSV ≻ VAAPI ≻ libx265. Same shape as
         // H.264 baseline distribution.
         (EncoderFamily::Hevc, VideoChroma::Yuv420, 8) => {
-            &[HevcNvenc, HevcQsv, HevcVaapi, X265]
+            // RKMPP leads on Rockchip; filtered out elsewhere (see the
+            // H.264 4:2:0/8 arm above).
+            &[HevcRkmpp, HevcNvenc, HevcQsv, HevcVaapi, X265]
         }
         // 4:2:0 10-bit: NVENC ≻ VAAPI ≻ QSV ≻ libx265. NVENC Main10
         // is mature on Pascal+; VAAPI Main10 works on Intel iHD
@@ -2489,6 +2659,8 @@ pub fn resolve_video_encoder(
         "hevc_qsv" => ResolvedVideoEncoder::HevcQsv,
         "h264_vaapi" => ResolvedVideoEncoder::H264Vaapi,
         "hevc_vaapi" => ResolvedVideoEncoder::HevcVaapi,
+        "h264_rkmpp" => ResolvedVideoEncoder::H264Rkmpp,
+        "hevc_rkmpp" => ResolvedVideoEncoder::HevcRkmpp,
         other => return Err(EncoderResolutionError::UnknownCodec(other.to_string())),
     };
 
@@ -2504,6 +2676,9 @@ pub fn resolve_video_encoder(
         }
         ResolvedVideoEncoder::H264Vaapi | ResolvedVideoEncoder::HevcVaapi => {
             cfg!(feature = "video-encoder-vaapi")
+        }
+        ResolvedVideoEncoder::H264Rkmpp | ResolvedVideoEncoder::HevcRkmpp => {
+            cfg!(feature = "video-encoder-rkmpp")
         }
     };
     if !feature_ok {
@@ -2522,6 +2697,8 @@ pub fn resolve_video_encoder(
         ResolvedVideoEncoder::HevcQsv => caps.hw_encoders.hevc_qsv,
         ResolvedVideoEncoder::H264Vaapi => caps.hw_encoders.h264_vaapi,
         ResolvedVideoEncoder::HevcVaapi => caps.hw_encoders.hevc_vaapi,
+        ResolvedVideoEncoder::H264Rkmpp => caps.hw_encoders.h264_rkmpp,
+        ResolvedVideoEncoder::HevcRkmpp => caps.hw_encoders.hevc_rkmpp,
     };
     if !baseline_available {
         return Err(EncoderResolutionError::DriverMissing {

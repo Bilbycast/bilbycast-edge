@@ -1403,10 +1403,12 @@ impl FlowRuntime {
                 videotoolbox_in_use: cost_plan.videotoolbox_sessions,
                 amf_in_use: cost_plan.amf_sessions,
                 vaapi_in_use: cost_plan.vaapi_sessions,
+                rkmpp_in_use: cost_plan.rkmpp_sessions,
                 nvenc_in_use_4k: cost_plan.nvenc_sessions_4k,
                 qsv_in_use_4k: cost_plan.qsv_sessions_4k,
                 amf_in_use_4k: cost_plan.amf_sessions_4k,
                 vaapi_in_use_4k: cost_plan.vaapi_sessions_4k,
+                rkmpp_in_use_4k: cost_plan.rkmpp_sessions_4k,
                 nvdec_in_use: cost_plan.nvdec_sessions,
                 qsv_decode_in_use: cost_plan.qsv_decode_sessions,
                 vaapi_decode_in_use: cost_plan.vaapi_decode_sessions,
@@ -2676,10 +2678,12 @@ impl FlowRuntime {
                 .saturating_add(delta_usage.videotoolbox_in_use);
             g.amf_in_use = g.amf_in_use.saturating_add(delta_usage.amf_in_use);
             g.vaapi_in_use = g.vaapi_in_use.saturating_add(delta_usage.vaapi_in_use);
+            g.rkmpp_in_use = g.rkmpp_in_use.saturating_add(delta_usage.rkmpp_in_use);
             g.nvenc_in_use_4k = g.nvenc_in_use_4k.saturating_add(delta_usage.nvenc_in_use_4k);
             g.qsv_in_use_4k = g.qsv_in_use_4k.saturating_add(delta_usage.qsv_in_use_4k);
             g.amf_in_use_4k = g.amf_in_use_4k.saturating_add(delta_usage.amf_in_use_4k);
             g.vaapi_in_use_4k = g.vaapi_in_use_4k.saturating_add(delta_usage.vaapi_in_use_4k);
+            g.rkmpp_in_use_4k = g.rkmpp_in_use_4k.saturating_add(delta_usage.rkmpp_in_use_4k);
             g.nvdec_in_use = g.nvdec_in_use.saturating_add(delta_usage.nvdec_in_use);
             g.qsv_decode_in_use = g
                 .qsv_decode_in_use
@@ -2763,10 +2767,12 @@ impl FlowRuntime {
                         .saturating_sub(usage.videotoolbox_in_use);
                     g.amf_in_use = g.amf_in_use.saturating_sub(usage.amf_in_use);
                     g.vaapi_in_use = g.vaapi_in_use.saturating_sub(usage.vaapi_in_use);
+                    g.rkmpp_in_use = g.rkmpp_in_use.saturating_sub(usage.rkmpp_in_use);
                     g.nvenc_in_use_4k = g.nvenc_in_use_4k.saturating_sub(usage.nvenc_in_use_4k);
                     g.qsv_in_use_4k = g.qsv_in_use_4k.saturating_sub(usage.qsv_in_use_4k);
                     g.amf_in_use_4k = g.amf_in_use_4k.saturating_sub(usage.amf_in_use_4k);
                     g.vaapi_in_use_4k = g.vaapi_in_use_4k.saturating_sub(usage.vaapi_in_use_4k);
+                    g.rkmpp_in_use_4k = g.rkmpp_in_use_4k.saturating_sub(usage.rkmpp_in_use_4k);
                     g.nvdec_in_use = g.nvdec_in_use.saturating_sub(usage.nvdec_in_use);
                     g.qsv_decode_in_use = g
                         .qsv_decode_in_use
@@ -5807,6 +5813,12 @@ fn derive_cost_plan(flow: &ResolvedFlow) -> crate::engine::hardware_probe::FlowC
                             plan.vaapi_sessions_4k = plan.vaapi_sessions_4k.saturating_add(1);
                         }
                     }
+                    Some(crate::engine::hardware_probe::HwEncoderFamily::Rkmpp) => {
+                        plan.rkmpp_sessions = plan.rkmpp_sessions.saturating_add(1);
+                        if is_4k {
+                            plan.rkmpp_sessions_4k = plan.rkmpp_sessions_4k.saturating_add(1);
+                        }
+                    }
                     None => {} // is_hw + no family — defensive, unreachable today
                 }
                 // Pair the decoder slot — every transcoder decodes the
@@ -5956,6 +5968,13 @@ fn derive_cost_plan(flow: &ResolvedFlow) -> crate::engine::hardware_probe::FlowC
                                 plan.vaapi_sessions_4k.saturating_add(1);
                         }
                     }
+                    Some(crate::engine::hardware_probe::HwEncoderFamily::Rkmpp) => {
+                        plan.rkmpp_sessions = plan.rkmpp_sessions.saturating_add(1);
+                        if is_4k {
+                            plan.rkmpp_sessions_4k =
+                                plan.rkmpp_sessions_4k.saturating_add(1);
+                        }
+                    }
                     None => {} // is_hw + no family — defensive, unreachable today
                 }
                 // Pair the source-decode session (resolved backend,
@@ -6075,6 +6094,12 @@ fn output_resource_contribution(
                     usage.vaapi_in_use = usage.vaapi_in_use.saturating_add(1);
                     if is_4k {
                         usage.vaapi_in_use_4k = usage.vaapi_in_use_4k.saturating_add(1);
+                    }
+                }
+                Some(crate::engine::hardware_probe::HwEncoderFamily::Rkmpp) => {
+                    usage.rkmpp_in_use = usage.rkmpp_in_use.saturating_add(1);
+                    if is_4k {
+                        usage.rkmpp_in_use_4k = usage.rkmpp_in_use_4k.saturating_add(1);
                     }
                 }
                 None => {} // is_hw + no family — defensive, unreachable today

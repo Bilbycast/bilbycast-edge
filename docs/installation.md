@@ -296,6 +296,43 @@ sudo make -C /tmp/nv-codec-headers PREFIX=/usr/local install
 This matches the package set the GitHub Actions release workflow uses to
 build `*-linux` and `*-linux-full` artefacts.
 
+### ARM Rockchip SBCs (RK3568 / RK3588) — RKMPP hardware encode
+
+Rockchip boards (NanoPi R5S/R6S, Orange Pi 5, Radxa Rock 5B, …) have an
+on-chip VPU reachable through the Rockchip **Media Process Platform (MPP)**.
+Building with `--features video-encoder-rkmpp` adds the `h264_rkmpp` /
+`hevc_rkmpp` FFmpeg encoders (both **8-bit 4:2:0 only**). The build must run
+**on the aarch64 Rockchip host itself** — there is no `rockchip_mpp` on
+x86_64, so this feature cannot be cross-compiled from an x86 runner.
+
+```bash
+# Rockchip BSP dev packages (ship rockchip_mpp.pc >= 1.3.8) + libdrm
+sudo apt-get install -y librockchip-mpp-dev libdrm-dev nasm cmake clang pkg-config
+
+# Build on the board:
+cd bilbycast-edge && cargo build --release --features video-encoder-rkmpp
+
+# Runtime: the running user must be able to open the MPP kernel node.
+ls -l /dev/mpp_service            # expect root:video 0660 (or 0666)
+sudo usermod -aG video bilbycast  # then restart the service
+```
+
+At runtime the edge probes `avcodec_open2("h264_rkmpp")` and only advertises
+`video-encoder-rkmpp` on `HealthPayload.capabilities` when the VPU opens. If
+`/dev/mpp_service` exists but the probe fails, the startup log names the
+likely cause (user not in `video`, or `librockchip_mpp < 1.3.8`).
+
+**Headless hardening — mask sleep targets on BSP desktop images.** The
+FriendlyELEC / vendor Ubuntu BSP images ship a full GNOME desktop whose
+default power policy suspends the machine after inactivity. On a headless
+edge node this looks like an unexplained shutdown: the suspend kills
+`bilbycast-edge` and it does not recover on resume. Mask the sleep targets
+once after provisioning:
+
+```bash
+sudo systemctl mask sleep.target suspend.target hibernate.target hybrid-sleep.target
+```
+
 ---
 
 ## Running a pre-built binary

@@ -410,10 +410,12 @@ impl FlowManager {
                 .saturating_add(f.videotoolbox_in_use);
             acc.amf_in_use = acc.amf_in_use.saturating_add(f.amf_in_use);
             acc.vaapi_in_use = acc.vaapi_in_use.saturating_add(f.vaapi_in_use);
+            acc.rkmpp_in_use = acc.rkmpp_in_use.saturating_add(f.rkmpp_in_use);
             acc.nvenc_in_use_4k = acc.nvenc_in_use_4k.saturating_add(f.nvenc_in_use_4k);
             acc.qsv_in_use_4k = acc.qsv_in_use_4k.saturating_add(f.qsv_in_use_4k);
             acc.amf_in_use_4k = acc.amf_in_use_4k.saturating_add(f.amf_in_use_4k);
             acc.vaapi_in_use_4k = acc.vaapi_in_use_4k.saturating_add(f.vaapi_in_use_4k);
+            acc.rkmpp_in_use_4k = acc.rkmpp_in_use_4k.saturating_add(f.rkmpp_in_use_4k);
             acc.nvdec_in_use = acc.nvdec_in_use.saturating_add(f.nvdec_in_use);
             acc.qsv_decode_in_use = acc.qsv_decode_in_use.saturating_add(f.qsv_decode_in_use);
             acc.vaapi_decode_in_use = acc

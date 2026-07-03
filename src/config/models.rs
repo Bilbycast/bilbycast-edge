@@ -5144,6 +5144,13 @@ pub struct WebrtcOutputConfig {
 /// - `video-encoder-nvenc` → `h264_nvenc` / `hevc_nvenc` (NVIDIA iGPU/dGPU).
 /// - `video-encoder-qsv` → `h264_qsv` / `hevc_qsv` (Intel iGPU/Arc dGPU,
 ///   x86_64 only, via Intel oneVPL).
+/// - `video-encoder-vaapi` → `h264_vaapi` / `hevc_vaapi` (AMD Mesa
+///   radeonsi or Intel iHD via libva, Linux only).
+/// - `video-encoder-rkmpp` → `h264_rkmpp` / `hevc_rkmpp` (ARM Rockchip
+///   RK3568 / RK3588 VPU; 8-bit 4:2:0 only).
+///
+/// Plus the per-host auto strings `h264_auto` / `hevc_auto`, which resolve
+/// to the cheapest backend the host can actually run at flow start.
 ///
 /// Validation in `config::validation` enforces field bounds at config
 /// load time. Unavailable backends are surfaced as a runtime error when
@@ -5151,7 +5158,8 @@ pub struct WebrtcOutputConfig {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct VideoEncodeConfig {
     /// Encoder backend. One of: `x264`, `x265`, `h264_nvenc`, `hevc_nvenc`,
-    /// `h264_qsv`, `hevc_qsv`.
+    /// `h264_qsv`, `hevc_qsv`, `h264_vaapi`, `hevc_vaapi`, `h264_rkmpp`,
+    /// `hevc_rkmpp`, `h264_auto`, `hevc_auto`.
     pub codec: String,
     /// Optional source video PID to transcode. When unset (default), the
     /// replacer locks onto the **first** video stream in the active

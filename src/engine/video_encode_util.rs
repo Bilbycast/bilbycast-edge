@@ -29,7 +29,7 @@ use video_codec::{
 
 /// Lock-free cell that publishes the backend a [`ScaledVideoEncoder`]
 /// actually opened with after lazy-open. `0` = unset (encoder not yet
-/// opened); `1..=8` map to the eight [`VideoEncoderCodec`] variants.
+/// opened); `1..=10` map to the ten [`VideoEncoderCodec`] variants.
 /// Snapshot path maps the value back to the operator-facing label so
 /// the manager-UI badge tracks the resolved backend after Auto-chain
 /// demotion (e.g., NVENC → x264 fallback).
@@ -61,6 +61,8 @@ fn codec_to_u8(c: VideoEncoderCodec) -> u8 {
         VideoEncoderCodec::HevcQsv => 6,
         VideoEncoderCodec::H264Vaapi => 7,
         VideoEncoderCodec::HevcVaapi => 8,
+        VideoEncoderCodec::H264Rkmpp => 9,
+        VideoEncoderCodec::HevcRkmpp => 10,
     }
 }
 
@@ -74,6 +76,8 @@ fn u8_to_codec(v: u8) -> Option<VideoEncoderCodec> {
         6 => Some(VideoEncoderCodec::HevcQsv),
         7 => Some(VideoEncoderCodec::H264Vaapi),
         8 => Some(VideoEncoderCodec::HevcVaapi),
+        9 => Some(VideoEncoderCodec::H264Rkmpp),
+        10 => Some(VideoEncoderCodec::HevcRkmpp),
         _ => None,
     }
 }
@@ -85,6 +89,7 @@ fn backend_label(c: VideoEncoderCodec) -> &'static str {
         VideoEncoderCodec::H264Nvenc | VideoEncoderCodec::HevcNvenc => "nvenc",
         VideoEncoderCodec::H264Qsv | VideoEncoderCodec::HevcQsv => "qsv",
         VideoEncoderCodec::H264Vaapi | VideoEncoderCodec::HevcVaapi => "vaapi",
+        VideoEncoderCodec::H264Rkmpp | VideoEncoderCodec::HevcRkmpp => "rkmpp",
     }
 }
 

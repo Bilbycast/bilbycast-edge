@@ -18,9 +18,9 @@ combination. The resolver chain is:
 
 | Family + chroma + bit-depth | Resolver chain (head → tail) |
 |---|---|
-| H.264 + 4:2:0 + 8-bit (the dominant distribution path) | NVENC ≻ QSV ≻ VAAPI ≻ libx264 |
+| H.264 + 4:2:0 + 8-bit (the dominant distribution path) | RKMPP (Rockchip) ≻ NVENC ≻ QSV ≻ VAAPI ≻ libx264 |
 | H.264 + anything else | libx264 (no HW H.264 supports 4:2:2 / 10-bit / 4:4:4) |
-| HEVC + 4:2:0 + 8-bit | NVENC ≻ QSV ≻ VAAPI ≻ libx265 |
+| HEVC + 4:2:0 + 8-bit | RKMPP (Rockchip) ≻ NVENC ≻ QSV ≻ VAAPI ≻ libx265 |
 | HEVC + 4:2:0 + 10-bit | NVENC ≻ VAAPI ≻ QSV ≻ libx265 |
 | HEVC + 4:2:2 + 8-bit | VAAPI (Intel iHD) ≻ libx265 |
 | HEVC + 4:2:2 + 10-bit | VAAPI (Intel iHD) ≻ libx265 |
@@ -43,6 +43,8 @@ the chroma + bit-depth combo before flow start.
 | **h264_vaapi** (Linux, `video-encoder-vaapi`) | ✓ | ✗ | ✗ | ✗ | ✗ |
 | **hevc_vaapi** (Intel iHD Tiger Lake+) | ✓ | ✓ | ✓ | ✓ | ✗ (NV24 deferred) |
 | **hevc_vaapi** (AMD radeonsi) | ✓ | usually ✗ | ✓ | usually ✗ | ✗ |
+| **h264_rkmpp** (ARM Rockchip RK3568/RK3588, `video-encoder-rkmpp`) | ✓ | ✗ | ✗ | ✗ | ✗ |
+| **hevc_rkmpp** (ARM Rockchip RK3568/RK3588) | ✓ | ✗ | ✗ | ✗ | ✗ |
 
 **Implication for broadcast 4:2:2 contribution:** on NVIDIA-only and
 AMD-only hosts there is no GPU path for 4:2:2 10-bit; libx265 is the
@@ -97,10 +99,36 @@ benefits from offloading decode to dedicated silicon.
 | x86_64 Intel iGPU Linux | same | QSV + VAAPI (encode + decode) + (x264 / x265) |
 | aarch64 NVIDIA (Jetson) | x264 + x265 + NVENC + NVDEC + VAAPI + VAAPI-dec (no QSV — Intel iGPU is x86_64-only) | NVENC + NVDEC + (x264 / x265) |
 | aarch64 AMD APU SBC | same | VAAPI + (x264 / x265) |
+| aarch64 Rockchip (RK3568 / RK3588) | x264 + x265 + **RKMPP** (no NVENC / QSV / VAAPI — none exist on Rockchip) | RKMPP + (x264 / x265) |
 | Apple Silicon (`aarch64-apple-darwin`) | VideoToolbox compiles cleanly via `cfg(target_os = "macos")` but is not in the release matrix today | (n/a) |
 
 The aarch64-no-QSV decision is correct (Intel iGPU is x86-only).
 Apple Silicon CI is a planned artefact channel.
+
+**Rockchip (RKMPP).** `h264_rkmpp` / `hevc_rkmpp` (present in upstream FFmpeg
+since 8.1) are **8-bit 4:2:0 only** — the RK3568 / RK3588 VEPU has no 4:2:2,
+no 4:4:4, and no 10-bit encode path (10-bit on RK3588 is a *decode*-only
+capability, which the VPU also does but bilbycast doesn't yet select). A
+10-bit or 4:2:2 request on a Rockchip box therefore falls back to libx265
+(SW) — the `h264_auto` / `hevc_auto` resolver places `rkmpp` first in the
+4:2:0-8-bit chains only, so it can never be picked for a format it can't do.
+`video-encoder-rkmpp` must be built on a **native aarch64 Rockchip host**
+(the build links `librockchip_mpp` >= 1.3.8 via pkg-config; there is no
+`rockchip_mpp` on x86_64) and is deliberately excluded from the x86_64
+`video-encoders-full` composite — the aarch64 Rockchip `*-full` release job
+lists it explicitly. Runtime needs the Rockchip BSP kernel's MPP driver
+(`/dev/mpp_service`) and the running user in the `video` group.
+
+**Known RKMPP limitation — on-demand forced IDR.** The seamless-input-switch
+path asks the encoder for an immediate keyframe (`force_next_keyframe()` →
+`AVFrame.pict_type = AV_PICTURE_TYPE_I`). NVENC / QSV / VAAPI / libx264 /
+libx265 honour that; the Rockchip MPP encoders do **not** — upstream
+`rkmppenc.c` has no input-side forced-IDR path (it needs the out-of-band
+`MPP_ENC_SET_IDR_FRAME` control call). So on RKMPP an input switch resyncs on
+the encoder's next GOP IDR instead of instantly. Mitigation: keep `gop_size`
+modest on Rockchip flows that switch inputs often. A vendored `rkmppenc`
+patch to wire the forced-IDR control is tracked as a hardware-verified
+follow-up.
 
 ## Capability strings on `HealthPayload.capabilities`
 
@@ -112,12 +140,13 @@ tooltip.
 
 | Capability | Source | Meaning |
 |---|---|---|
-| `video-encode` | `video-encoder-{x264,x265,nvenc,qsv,vaapi}` (any) | Edge can re-encode video |
+| `video-encode` | `video-encoder-{x264,x265,nvenc,qsv,rkmpp}` (any) | Edge can re-encode video |
 | `video-encoder-x264` | `video-encoder-x264` | libx264 available |
 | `video-encoder-x265` | `video-encoder-x265` | libx265 available |
 | `video-encoder-nvenc` | `video-encoder-nvenc` | h264_nvenc / hevc_nvenc available |
 | `video-encoder-qsv` | `video-encoder-qsv` | h264_qsv / hevc_qsv available |
 | `video-encoder-vaapi` | `video-encoder-vaapi` | h264_vaapi / hevc_vaapi available |
+| `video-encoder-rkmpp` | `video-encoder-rkmpp` + runtime probe | h264_rkmpp / hevc_rkmpp available (Rockchip RK3568/RK3588) |
 | `video-decoder-nvdec` | `video-decoder-nvdec` + runtime probe | NVDEC decode available (transcode + display) |
 | `video-decoder-qsv` | `video-decoder-qsv` + runtime probe | QSV decode available |
 | `video-decoder-vaapi` | `video-decoder-vaapi` + runtime probe | VAAPI decode available |

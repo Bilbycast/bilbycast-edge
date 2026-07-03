@@ -180,6 +180,9 @@ fn resolve_webrtc_video_backend(
         "h264_nvenc" => Some(video_codec::VideoEncoderCodec::H264Nvenc),
         "h264_qsv" => Some(video_codec::VideoEncoderCodec::H264Qsv),
         "h264_vaapi" => Some(video_codec::VideoEncoderCodec::H264Vaapi),
+        // h264_rkmpp produces baseline/main/high H.264 — browser-decodable.
+        // (hevc_rkmpp is intentionally omitted; WebRTC is H.264-only here.)
+        "h264_rkmpp" => Some(video_codec::VideoEncoderCodec::H264Rkmpp),
         other => {
             let msg = format!(
                 "WebRTC output '{}': video_encode codec '{other}' not supported — WebRTC browsers only decode H.264",
@@ -258,6 +261,7 @@ fn open_webrtc_video_active(
         video_codec::VideoEncoderCodec::H264Nvenc => "nvenc",
         video_codec::VideoEncoderCodec::H264Qsv => "qsv",
         video_codec::VideoEncoderCodec::H264Vaapi => "vaapi",
+        video_codec::VideoEncoderCodec::H264Rkmpp => "rkmpp",
         _ => "unknown",
     };
     output_stats.set_video_encode_stats(

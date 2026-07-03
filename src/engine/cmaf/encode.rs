@@ -375,6 +375,8 @@ impl VideoReencoder {
             "hevc_qsv" => video_codec::VideoEncoderCodec::HevcQsv,
             "h264_vaapi" => video_codec::VideoEncoderCodec::H264Vaapi,
             "hevc_vaapi" => video_codec::VideoEncoderCodec::HevcVaapi,
+            "h264_rkmpp" => video_codec::VideoEncoderCodec::H264Rkmpp,
+            "hevc_rkmpp" => video_codec::VideoEncoderCodec::HevcRkmpp,
             other => bail!("unknown video codec: {other}"),
         };
         let (fps_num, fps_den) = match (cfg.fps_num, cfg.fps_den) {

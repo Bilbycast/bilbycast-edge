@@ -1308,7 +1308,8 @@ fn edge_capabilities() -> Vec<&'static str> {
         feature = "video-encoder-x264",
         feature = "video-encoder-x265",
         feature = "video-encoder-nvenc",
-        feature = "video-encoder-qsv"
+        feature = "video-encoder-qsv",
+        feature = "video-encoder-rkmpp"
     )) {
         caps.push("video-encode");
     }
@@ -1326,6 +1327,9 @@ fn edge_capabilities() -> Vec<&'static str> {
     }
     if cfg!(feature = "video-encoder-vaapi") {
         caps.push("video-encoder-vaapi");
+    }
+    if cfg!(feature = "video-encoder-rkmpp") {
+        caps.push("video-encoder-rkmpp");
     }
     // HW decoder capability strings — used by both the display output
     // and the transcode input-decode path. Advertised when the matching
