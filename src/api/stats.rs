@@ -142,6 +142,7 @@ pub async fn gather_all_stats(state: &AppState) -> AllStatsResponse {
         flows: flow_stats,
         inputs,
         outputs,
+        bond_leg_contention: crate::engine::bond_leg_broker::broker().contention_snapshot(),
     }
 }
 

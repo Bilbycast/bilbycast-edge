@@ -73,6 +73,9 @@ pub fn validate_config(config: &AppConfig) -> Result<()> {
     // Validate Starlink dish telemetry sources (read-only, no credential).
     validate_starlink_uplinks(&config.starlink_uplinks)?;
 
+    // Validate shared-leg capacity-broker uplink declarations.
+    validate_bond_uplinks(&config.bond_uplinks)?;
+
     // Validate TLS config if present
     if let Some(ref tls) = config.server.tls {
         if tls.cert_path.is_empty() {
@@ -3170,6 +3173,53 @@ fn validate_starlink_uplinks(
                         );
                     }
                 }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Validate the optional `bond_uplinks` list (shared-leg capacity broker).
+/// Each entry is an optional hard policy cap on one physical NIC — a ceiling the
+/// broker's auto-discovered capacity never probes past (for metered / rate-limited
+/// links). `pub(crate)` so the `set_bond_uplinks` WS command can revalidate before
+/// persisting.
+pub(crate) fn validate_bond_uplinks(
+    uplinks: &[crate::config::models::BondUplinkConfig],
+) -> Result<()> {
+    let mut seen = std::collections::HashSet::new();
+    for (i, u) in uplinks.iter().enumerate() {
+        let iface = u.interface.trim();
+        if iface.is_empty() {
+            bail!("bond_uplinks[{i}]: interface cannot be empty");
+        }
+        if iface.len() > 64 {
+            bail!("bond_uplinks[{i}]: interface must be at most 64 characters");
+        }
+        if !seen.insert(iface) {
+            bail!("bond_uplinks[{i}]: duplicate interface '{iface}'");
+        }
+        // Sane physical-uplink range: 100 kbps .. 400 Gbps.
+        if u.capacity_bps < 100_000 || u.capacity_bps > 400_000_000_000 {
+            bail!(
+                "bond_uplinks[{i}] ('{iface}'): capacity_bps must be in [100_000, 400_000_000_000], got {}",
+                u.capacity_bps
+            );
+        }
+        if let Some(mv) = u.min_viable_bps {
+            if mv == 0 || mv > u.capacity_bps {
+                bail!(
+                    "bond_uplinks[{i}] ('{iface}'): min_viable_bps must be in (0, capacity_bps={}], got {mv}",
+                    u.capacity_bps
+                );
+            }
+        }
+        if let Some(da) = u.demand_active_bps {
+            if da == 0 || da > u.capacity_bps {
+                bail!(
+                    "bond_uplinks[{i}] ('{iface}'): demand_active_bps must be in (0, capacity_bps={}], got {da}",
+                    u.capacity_bps
+                );
             }
         }
     }

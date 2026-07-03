@@ -280,6 +280,8 @@ mod tests {
             upgrades: None,
             cellular_uplinks: Vec::new(),
             starlink_uplinks: Vec::new(),
+            bond_uplinks: Vec::new(),
+            shared_leg_broker: None,
             inputs: vec![InputDefinition {
                 active: true,
                 group: None,

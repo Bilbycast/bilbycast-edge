@@ -5,6 +5,36 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
+/// Host-level physical-uplink capacity declaration for the shared-leg
+/// capacity broker (`engine::bond_leg_broker`). Names a NIC and its real
+/// usable uplink bandwidth so the broker can divide it fairly across the
+/// bonded flows that share it. For cellular / Starlink links whose capacity
+/// varies, this is the safe upper bound the broker's adaptive estimate never
+/// probes past (see `../bilbycast-bonding/docs/shared-leg-capacity-broker.md`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BondUplinkConfig {
+    /// NIC name the bonded legs pin to (e.g. `"eno4"`, `"wwp151s0u1i4"`,
+    /// `"wlo5"`). Matched against each bonded leg's `interface`.
+    pub interface: String,
+    /// Physical uplink capacity, bits/sec — the amount divided across all
+    /// bonded flows sharing this NIC.
+    pub capacity_bps: u64,
+    /// Optional per-flow minimum-viable rate on this leg, bits/sec. When the
+    /// sum of viable minimums across the flows on the leg exceeds
+    /// `capacity_bps`, the broker flags admission pressure. Default 200 kbps.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_viable_bps: Option<u64>,
+    /// Optional per-uplink override of the broker's activity-grace threshold,
+    /// bits/sec — a flow delivering at least this on the leg keeps its
+    /// min-viable reservation; below it (once the grace window lapses) it
+    /// releases its share so a co-flow that actually wants the leg can use it.
+    /// Unset → broker default (50 kbps). Raise it when sporadic keyframe-dup
+    /// traffic on a leg a flow doesn't really use holds an unused reservation
+    /// and under-utilises the leg for the flow that does want it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub demand_active_bps: Option<u64>,
+}
+
 /// Root configuration, persisted to config.json
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
@@ -51,6 +81,24 @@ pub struct AppConfig {
     /// when thresholds are exceeded. See [`ResourceLimitConfig`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resource_limits: Option<ResourceLimitConfig>,
+    /// OPTIONAL host-level policy caps for the shared-leg capacity broker — one
+    /// hard ceiling per physical NIC that the broker's auto-discovered capacity
+    /// estimate must never probe past. Only needed for a metered / rate-limited
+    /// link whose ceiling the broker can't infer from packet loss; on a normal
+    /// link leave this empty and the broker self-discovers the capacity. Listing
+    /// an uplink is NOT what enables the broker — it is on by default (see
+    /// `shared_leg_broker`). See `engine::bond_leg_broker` /
+    /// `../bilbycast-bonding/docs/shared-leg-capacity-broker.md`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub bond_uplinks: Vec<BondUplinkConfig>,
+    /// Explicit on/off for the shared-leg broker. `None` → ON (the default): the
+    /// broker runs, auto-discovers each shared NIC's capacity, and reserves it
+    /// across co-located bonded flows by each flow's priority — `bond_uplinks`
+    /// emptiness has no bearing on whether it is enabled. `Some(false)` disables
+    /// it (revert to uncoordinated per-bond contention). A lone flow on a leg is
+    /// never throttled regardless.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shared_leg_broker: Option<bool>,
     /// Optional structured-JSON log shipper for SIEM / NMS / observability
     /// pickup (Splunk, Skyline DataMiner, generic JSON-line ingesters). When
     /// configured, every operational event the edge emits is also written as
@@ -221,6 +269,8 @@ impl Default for AppConfig {
             upgrades: None,
             cellular_uplinks: Vec::new(),
             starlink_uplinks: Vec::new(),
+            bond_uplinks: Vec::new(),
+            shared_leg_broker: None,
         }
     }
 }
@@ -4322,6 +4372,14 @@ pub struct BondedOutputConfig {
         with = "crate::config::pid_map_serde"
     )]
     pub pid_map: Option<BTreeMap<u16, u16>>,
+    /// QoS priority tier for the shared-leg capacity broker (default
+    /// `best_effort`). When several bonded flows share one physical uplink,
+    /// the guaranteed tiers (`critical`, then `normal`) reserve their live
+    /// (VBR-tracking) demand ahead of best-effort flows. No bandwidth number
+    /// required — the broker measures demand. See [`BondPriority`] /
+    /// `engine::bond_leg_broker`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub priority: Option<BondPriority>,
 }
 
 /// A single bond leg definition.
@@ -4655,6 +4713,25 @@ pub enum BondQuicTls {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         client_trust_root_path: Option<String>,
     },
+}
+
+/// QoS priority tier for a bonded flow, used by the shared-leg capacity broker
+/// when several bonded flows share one physical uplink. Guaranteed tiers
+/// (`Critical`, then `Normal`) reserve their live, VBR-tracking demand first —
+/// in that order — and `BestEffort` flows share whatever is left. Strict
+/// priority *between* tiers; weighted-fair *within* a tier. No bandwidth number
+/// required: the broker measures each flow's demand. See
+/// `engine::bond_leg_broker`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum BondPriority {
+    /// Highest — reserved before everything else (the main programme feed).
+    Critical,
+    /// Guaranteed, but yields to `Critical` under contention.
+    Normal,
+    /// Spare-only — takes whatever capacity the guaranteed flows leave.
+    #[default]
+    BestEffort,
 }
 
 /// Scheduling policy for a bonded output.
@@ -6861,6 +6938,8 @@ mod tests {
             upgrades: None,
             cellular_uplinks: Vec::new(),
             starlink_uplinks: Vec::new(),
+            bond_uplinks: Vec::new(),
+            shared_leg_broker: None,
             inputs: vec![InputDefinition {
                 active: true,
                 group: None,

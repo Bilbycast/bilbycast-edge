@@ -791,6 +791,8 @@ mod tests {
             upgrades: None,
             cellular_uplinks: vec![],
             starlink_uplinks: vec![],
+            bond_uplinks: vec![],
+            shared_leg_broker: None,
         };
 
         // Extract secrets — only infrastructure secrets, not flow params

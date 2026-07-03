@@ -155,6 +155,11 @@ pub struct AllStatsResponse {
     pub inputs: Vec<InputStatusEntry>,
     /// Independent output inventory with live stats (when assigned to a running flow).
     pub outputs: Vec<OutputStatusEntry>,
+    /// Shared-leg capacity-broker contention: one entry per physical uplink
+    /// shared by ≥1 bonded flow, with each flow's demand vs. its fair-share
+    /// allocation. Empty when the broker is off. See `engine::bond_leg_broker`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub bond_leg_contention: Vec<crate::engine::bond_leg_broker::LegContention>,
 }
 
 /// Status entry for a single top-level input, with live stats when assigned to a flow.

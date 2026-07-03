@@ -22,6 +22,7 @@ for library-internal architecture see
   - [Bonded output](#bonded-output-bondedoutputconfig)
   - [Path transports](#path-transports)
   - [Scheduler](#scheduler)
+- [Shared uplink priority (the broker)](#shared-uplink-priority-the-broker)
 - [Worked examples](#worked-examples)
   - [Edge-to-edge SRT over two UDP paths](#edge-to-edge-srt-over-two-udp-paths)
   - [QUIC + UDP hybrid (public internet + LTE)](#quic--udp-hybrid-public-internet--lte)
@@ -128,6 +129,7 @@ Each edge runs **one flow**. The `bonded_output` on edge A and
 | `max_bonding_latency_ms` | u32 | 1000 | The single bonding-latency budget. A leg whose one-way delay would exceed this is benched from carrying unique media (still used for redundancy/FEC) rather than aligning the whole flow to it. Should equal the bonded input's value |
 | `path_mtu` | u32 | 1500 | Smallest IP-layer path MTU across the legs, `[576, 9000]`. The sender re-chunks outbound TS payloads at 188-byte boundaries into datagrams that fit this MTU after every per-datagram overhead (IP/UDP 28 B, or 48 B when a leg dials an IPv6 literal or a hostname; relay tunnel framing 16/44 B; RIST/RTP framing 12 B; bond header 12/16 B; AEAD envelope 29 B; FEC repair headroom when `fec` / per-leg FEC is set), so no leg emits an IP-fragmented datagram — cellular CGNAT paths drop fragments and black-hole PMTU discovery, losing oversized datagrams wholesale. The 1500 default derives the classic 1316 B (7 × 188) datagram; a measured ~1000 B cellular bearer derives 752 B (4 × 188). Measure with a DF ping sweep (`ping -M do -s <n>`) over the constrained leg. Sender-side only; the bonded input reassembles in `bond_seq` order regardless of datagram size. Payloads that are not 188-aligned (non-TS essence) cannot be re-chunked and are sent whole (flagged via `oversize_payloads` + the `bond_payload_exceeds_mtu` event) |
 | `program_number` | u16 | — | Optional MPTS → SPTS filter applied before bonding (same semantics as other TS-native outputs) |
+| `priority` | enum | `best_effort` | QoS tier for the [shared-uplink broker](#shared-uplink-priority-the-broker) when several bonded flows share one physical NIC: `critical` / `normal` / `best_effort`. No effect on a dedicated (unshared) leg. Sender-side only |
 
 ### Path transports
 
@@ -300,6 +302,85 @@ longer masquerades as congestion. **Loss is the safety bound** — the
 instant probing up induces real loss the controller backs off toward the
 delivered rate, so discovery cannot run away. A leg delivering well *under*
 its estimate is merely under-offered and holds its estimate.
+
+## Shared uplink priority (the broker)
+
+The scheduler above aggregates **one flow's** legs. When **several bonded
+flows share the same physical uplink** (e.g. three bonds all pinned to one
+5G modem, or six cameras over three shared legs), a second layer decides how
+that shared link is split *between* flows: the **shared-leg broker**.
+
+It's on by default and needs no configuration in the common case — you set
+one field, `priority`, on each bonded output. Full design + telemetry:
+[`bilbycast-bonding/docs/shared-leg-capacity-broker.md`](../../bilbycast-bonding/docs/shared-leg-capacity-broker.md).
+
+### Two layers, working together
+
+- **Scheduler** (per flow, across its legs) — routes packets, discovers
+  per-leg capacity, recovers loss. **This is the bonding**; it does all the
+  packet work. See [Scheduler](#scheduler) above.
+- **Broker** (per host, across flows) — touches no packets. It answers the
+  one question a single flow's scheduler can't see: *when two flows both
+  want `eno4`, how much does each get?* It writes each flow a **ceiling**
+  per shared leg; the scheduler then aggregates within that ceiling.
+
+A lone flow on a leg gets no ceiling (unconstrained) — the broker is a no-op
+until a leg is genuinely shared. Neither layer replaces the other: remove the
+scheduler and bonding stops; remove the broker and flows fight over shared
+uplinks again.
+
+### Priority tiers
+
+Set `priority` on each bonded **output**:
+
+| Tier | Meaning |
+|---|---|
+| `critical` | Reserved first — gets its measured demand before anything else. The main programme feed. |
+| `normal` | Guaranteed, but yields to `critical` under contention. |
+| `best_effort` (default) | Takes only the spare capacity the guaranteed tiers leave. Previews, confidence feeds, file transfers. |
+
+Capacity is handed out strictly by tier (all `critical`, then all `normal`,
+then `best_effort`), weighted-fair *within* a tier (`weight_hint` breaks
+intra-tier ties only). **No bitrate is ever typed** — the broker measures
+each flow's demand live and tracks its VBR peaks, so a guaranteed flow holds
+its reservation through the troughs of a variable stream.
+
+If every flow is the same tier (e.g. 5 equally-critical cameras), the tiers
+don't differentiate — but the broker still divides the shared link **evenly**
+(instead of first-mover-wins starvation) and alarms when it can't carry them.
+
+### Capacity is auto-discovered — don't declare it
+
+For 5G / Starlink / ISP links whose top rate varies and you can't know it,
+**declare nothing**: the broker discovers each shared leg's capacity live and
+tracks it up and down. The optional host-level `bond_uplinks` block is a
+**policy cap** only — a fixed limit the broker can't see as packet loss (a
+metered data plan, a contracted CIR/SLA rate, or headroom you're reserving
+for other traffic). It's a number you know from a contract, not one you
+measure; skip it on un-metered links.
+
+```json
+// AppConfig root — optional; only for a metered/rate-limited NIC:
+"bond_uplinks": [ { "interface": "eno4", "capacity_bps": 10000000 } ],
+"shared_leg_broker": true   // optional; unset = ON by default
+```
+
+### Honest limit
+
+The broker can't manufacture bandwidth. If the guaranteed flows together need
+more than a shared link physically carries, it protects them in priority order
+and raises `bond_leg_oversubscribed` (with `guaranteed_unmet_bps`) on the
+shortfall — the degradation is predictable and visible, not a random camera
+breaking up. Best-effort shortfall is by design and does not alarm. The fix
+for genuine under-provisioning is provisioning (dedicated legs, more capacity,
+lower bitrate).
+
+### Telemetry
+
+When a leg is shared, the edge emits `bond_leg_contention` on health and the
+manager renders the node-detail **Shared Uplink Contention** card: a
+Critical/Normal/Best-effort pill and a protected ✓ / degraded ⚠ marker per
+flow, plus a "PRIORITY BREACH" / "PRIORITIES HONOURED" leg badge.
 
 ## Worked examples
 

@@ -33,6 +33,7 @@ pub mod input_media_player;
 /// config surface, [`crate::replay`] for the on-disk store.
 #[cfg(feature = "replay")]
 pub mod input_replay;
+pub mod bond_leg_broker;
 pub mod bond_leg_probe;
 pub mod bond_leg_test;
 pub mod bond_routing;

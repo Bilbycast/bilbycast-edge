@@ -267,6 +267,21 @@ async fn main() -> anyhow::Result<()> {
         return Err(e);
     }
 
+    // Install the shared-leg broker. Enabled BY DEFAULT (unless explicitly
+    // disabled via `shared_leg_broker: false`); capacity is auto-discovered and
+    // `bond_uplinks` is only an optional hard-cap. When several bonded flows
+    // share a physical NIC it reserves capacity by each flow's priority tier.
+    // A lone flow on a leg is never throttled. See engine::bond_leg_broker.
+    engine::bond_leg_broker::broker()
+        .configure(&app_config.bond_uplinks, app_config.shared_leg_broker);
+    if !app_config.bond_uplinks.is_empty() {
+        tracing::info!(
+            "shared-leg capacity broker: {} uplink(s) configured, enabled={}",
+            app_config.bond_uplinks.len(),
+            engine::bond_leg_broker::broker().enabled()
+        );
+    }
+
     // Apply CLI overrides
     if let Some(port) = cli.port {
         app_config.server.listen_port = port;
@@ -344,6 +359,10 @@ async fn main() -> anyhow::Result<()> {
     // Create shared state
     let (ws_stats_tx, _) = broadcast::channel::<String>(64);
     let (mut event_sender, event_rx) = manager::event_channel();
+
+    // Give the shared-leg capacity broker an event sink so it can surface
+    // admission-pressure events (over-subscribed shared uplinks).
+    engine::bond_leg_broker::broker().set_event_sender(event_sender.clone());
 
     // Boot watchdog for staged upgrades. Runs *before* any flow init so a
     // crash-loop on the new binary triggers the symlink-revert on the

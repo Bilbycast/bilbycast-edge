@@ -906,6 +906,13 @@ pub(crate) fn build_health_payload(
     if starlink_cache.map(|c| c.has_sources()).unwrap_or(false) {
         caps.push("starlink");
     }
+    // `"bond-broker"` advertises the shared-leg broker is active (on by
+    // default) so the manager UI can render the priority-aware Shared Uplink
+    // Contention card. The card itself only appears once a leg is actually
+    // shared by ≥2 flows (non-empty `bond_leg_contention`).
+    if crate::engine::bond_leg_broker::broker().enabled() {
+        caps.push("bond-broker");
+    }
     #[allow(unused_mut)]
     let mut payload = serde_json::json!({
         "status": "ok",
@@ -965,6 +972,20 @@ pub(crate) fn build_health_payload(
                 payload
                     .as_object_mut()
                     .map(|o| o.insert("network_interfaces".into(), v));
+            }
+        }
+    }
+    // Shared-leg capacity-broker contention — one entry per physical uplink
+    // shared by ≥1 bonded flow, each flow's demand vs. its fair-share
+    // allocation. Empty → omit. Manager UI gates on the "bond-broker"
+    // capability (additive field; older managers ignore it).
+    {
+        let contention = crate::engine::bond_leg_broker::broker().contention_snapshot();
+        if !contention.is_empty() {
+            if let Ok(v) = serde_json::to_value(&contention) {
+                payload
+                    .as_object_mut()
+                    .map(|o| o.insert("bond_leg_contention".into(), v));
             }
         }
     }
@@ -2785,6 +2806,50 @@ async fn execute_command(
             }
             Ok(None)
         }
+        "set_bond_uplinks" => {
+            // Merge/upsert (or replace) the host-level `bond_uplinks` the
+            // shared-leg capacity broker uses, WITHOUT a whole-config round-trip
+            // — the edge mutates its own running config so real secrets stay
+            // intact (no redaction/clobber hazard). Drives the bonded-link
+            // wizard's uplink-capacity capture + the AI configurator's
+            // `set_bond_uplinks` action. Applies live on the broker's next tick.
+            let replace = action["replace"].as_bool().unwrap_or(false);
+            let incoming: Vec<crate::config::models::BondUplinkConfig> = serde_json::from_value(
+                action.get("bond_uplinks").cloned().unwrap_or(serde_json::json!([])),
+            )
+            .map_err(|e| format!("Invalid bond_uplinks: {e}"))?;
+            let mut cfg = app_config.write().await;
+            if replace {
+                cfg.bond_uplinks = incoming;
+            } else {
+                for u in incoming {
+                    if let Some(ex) =
+                        cfg.bond_uplinks.iter_mut().find(|x| x.interface == u.interface)
+                    {
+                        *ex = u;
+                    } else {
+                        cfg.bond_uplinks.push(u);
+                    }
+                }
+            }
+            if let Some(v) = action.get("shared_leg_broker") {
+                if v.is_null() {
+                    cfg.shared_leg_broker = None;
+                } else if let Some(b) = v.as_bool() {
+                    cfg.shared_leg_broker = Some(b);
+                }
+            }
+            crate::config::validation::validate_bond_uplinks(&cfg.bond_uplinks)
+                .map_err(|e| e.to_string())?;
+            persist_config(&cfg, config_path, secrets_path).await?;
+            crate::engine::bond_leg_broker::broker()
+                .configure(&cfg.bond_uplinks, cfg.shared_leg_broker);
+            let n = cfg.bond_uplinks.len();
+            drop(cfg);
+            tracing::info!("Manager command: set_bond_uplinks → {n} uplink(s), broker enabled={}",
+                crate::engine::bond_leg_broker::broker().enabled());
+            Ok(Some(serde_json::json!({ "bond_uplinks_count": n })))
+        }
         "update_config" => {
             let mut new_config: AppConfig = serde_json::from_value(action["config"].clone())
                 .map_err(|e| format!("Invalid config: {e}"))?;
@@ -2830,6 +2895,14 @@ async fn execute_command(
             tracing::info!("Config diff: old={} flows/{} tunnels, new={} flows/{} tunnels",
                 old_config.flows.len(), old_config.tunnels.len(),
                 new_config.flows.len(), new_config.tunnels.len());
+
+            // Re-apply shared-leg capacity-broker uplinks so bond_uplinks /
+            // shared_leg_broker edits take effect on reload (not just at boot).
+            // Runs before the flow diff so restarted bonded flows register
+            // against the new config; a disable reverts live legs to
+            // unconstrained.
+            crate::engine::bond_leg_broker::broker()
+                .configure(&new_config.bond_uplinks, new_config.shared_leg_broker);
 
             // --- Diff flows ---
             let old_flow_map: HashMap<&str, &FlowConfig> =
@@ -3042,6 +3115,13 @@ async fn execute_command(
                 // class as cellular_uplinks above; the poller re-reads these from
                 // the live AppConfig each cycle.
                 cfg.starlink_uplinks = new_config.starlink_uplinks.clone();
+                // Shared-leg broker config — same silent-drop class. `configure()`
+                // was already re-applied live above, but without copying these the
+                // in-memory config + config.json keep the OLD value, so a UI
+                // add/edit/remove of a policy cap (or the broker toggle) is ACKed
+                // yet reverts on the next config fetch / restart.
+                cfg.bond_uplinks = new_config.bond_uplinks.clone();
+                cfg.shared_leg_broker = new_config.shared_leg_broker;
                 // Same silent-drop class as cellular_uplinks above: these were
                 // restored-if-None from old_config earlier, but a manager-pushed
                 // NEW value must also be applied here or it's ACKed yet lost.

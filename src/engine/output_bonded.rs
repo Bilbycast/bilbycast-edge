@@ -566,6 +566,9 @@ async fn bonded_output_run(
     // Shared handles to the adaptive scheduler's discovered per-leg
     // capacity (bits/sec) — empty for the non-adaptive policies.
     let mut capacity_handles: Vec<(u8, std::sync::Arc<std::sync::atomic::AtomicU64>)> = Vec::new();
+    // Shared handles the shared-leg capacity broker writes each flow's
+    // fair-share ceiling into (bits/sec) — empty for non-adaptive policies.
+    let mut ceiling_handles: Vec<(u8, std::sync::Arc<std::sync::atomic::AtomicU64>)> = Vec::new();
 
     // Operator redundancy policy (replicate across N best legs). Off →
     // default no-op; each scheduler still does its own Critical/IDR dup.
@@ -634,10 +637,75 @@ async fn bonded_output_run(
             }
             let mut sched = CapacityAwareScheduler::with_paths(priors, cong);
             capacity_handles = sched.capacity_handles();
+            ceiling_handles = sched.ceiling_handles();
             sched.set_redundancy(redundancy);
             BondSocket::sender_attached(socket_cfg, sched, attachments)
                 .await
                 .map_err(|e| anyhow::anyhow!("bonded sender setup: {e}"))?
+        }
+    };
+
+    // Shared-leg capacity broker: register this flow's legs so a host-level
+    // fair-share arbiter divides each shared physical uplink across all
+    // bonded flows on it (writing each leg's ceiling atomic every ~100 ms).
+    // No-op unless the broker is enabled (bond_uplinks configured). The guard
+    // deregisters on teardown. Only the Adaptive scheduler exposes ceilings.
+    let _broker_reg = {
+        let b = super::bond_leg_broker::broker();
+        if b.enabled() && !ceiling_handles.is_empty() {
+            let leg_keys = super::bond_leg_probe::leg_keys_for_paths(&config.paths);
+            let mut regs = Vec::new();
+            for (i, p) in config.paths.iter().enumerate() {
+                let leg_key = match leg_keys
+                    .get(i)
+                    .and_then(|k| super::bond_leg_broker::leg_key_from_probe(k))
+                {
+                    Some(k) => k,
+                    None => continue,
+                };
+                let demand = capacity_handles
+                    .iter()
+                    .find(|(id, _)| *id == p.id)
+                    .map(|(_, a)| a.clone());
+                let ceiling = ceiling_handles
+                    .iter()
+                    .find(|(id, _)| *id == p.id)
+                    .map(|(_, a)| a.clone());
+                if let (Some(demand), Some(ceiling)) = (demand, ceiling) {
+                    regs.push(super::bond_leg_broker::MemberReg {
+                        leg_key,
+                        flow_id: config.bond_flow_id,
+                        path_id: p.id,
+                        weight_hint: p.weight_hint,
+                        max_bitrate_bps: p.max_bitrate_bps,
+                        priority: config.priority.unwrap_or_default(),
+                        demand,
+                        ceiling,
+                        path_stats: socket.path_stats(p.id),
+                    });
+                }
+            }
+            // P4 admission check (advisory by default; refuses only under
+            // strict mode). Surfaces when this flow lands on a shared uplink
+            // that can't give every co-resident its min-viable rate.
+            if let Some(leg) = b.admission_conflict(&regs) {
+                events.emit_with_details(
+                    crate::manager::events::EventSeverity::Warning,
+                    "bonding",
+                    format!(
+                        "bonded flow admitted onto over-subscribed shared uplink '{leg}' \
+                         — combined min-viable rates exceed its capacity"
+                    ),
+                    Some(flow_id),
+                    serde_json::json!({
+                        "error_code": "bond_leg_admission_pressure",
+                        "leg": leg,
+                    }),
+                );
+            }
+            Some(b.register(regs))
+        } else {
+            None
         }
     };
 
