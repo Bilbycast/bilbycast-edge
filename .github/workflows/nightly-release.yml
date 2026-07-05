@@ -450,13 +450,24 @@ jobs:
           cat artifacts/manifest.json
           echo
 
-      # Install cosign so we can keyless-sign the manifest. The action
-      # is a thin shim — installs the cosign binary into PATH and pins
-      # the version reproducibly.
+      # Pinned manual install instead of sigstore/cosign-installer@v3: that
+      # action's bootstrap download has no retry, so a transient GitHub CDN
+      # hiccup (curl exit 56 — "failure receiving network data") failed a
+      # relay release job while edge/manager passed the identical step the
+      # same second. curl --retry-all-errors makes the download resilient and
+      # the pinned SHA-256 gives a strong integrity check. The release job is
+      # x86_64-only (runs-on: ubuntu-24.04), so amd64 is the only asset needed.
       - name: Install cosign
-        uses: sigstore/cosign-installer@v3
-        with:
-          cosign-release: "v2.4.1"
+        run: |
+          COSIGN_VERSION="v2.4.1"
+          COSIGN_SHA256="8b24b946dd5809c6bd93de08033bcf6bc0ed7d336b7785787c080f574b89249b"
+          curl -fsSL --retry 6 --retry-all-errors --retry-delay 5 \
+            -o cosign \
+            "https://github.com/sigstore/cosign/releases/download/${COSIGN_VERSION}/cosign-linux-amd64"
+          echo "${COSIGN_SHA256}  cosign" | sha256sum -c -
+          sudo install -m 0755 cosign /usr/local/bin/cosign
+          rm -f cosign
+          cosign version
 
       # Sign the manifest with Sigstore keyless. `cosign sign-blob`
       # requests a short-lived OIDC token from GitHub Actions, hands it
