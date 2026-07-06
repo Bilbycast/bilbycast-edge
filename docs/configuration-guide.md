@@ -983,6 +983,8 @@ of the local file kicks in transparently.
 |-------|------|----------|---------|------------|-------------|
 | `kind` | string | Yes | - | all | `"ts"`, `"mp4"`, or `"image"`. |
 | `name` | string | Yes | - | all | Filename within the media library. ASCII alphanumeric plus `._- ` only, 1–255 chars, no leading dot, no path separators. |
+
+> **`mp4` sources must be plain (unfragmented) H.264 + AAC.** Fragmented MP4 (fMP4 — `moof`/`traf` boxes, as produced by `ffmpeg -movflags frag_keyframe+empty_moov`, browser MediaRecorder / MSE, and DASH/HLS/CMAF packagers) is **rejected** with a Critical `media_player_source_unsupported` event, because the pure-Rust demuxer cannot address samples inside movie-fragment boxes and would otherwise emit an undecodable stream. Re-mux to a plain MP4 first — `ffmpeg -i in.mp4 -c copy -movflags +faststart out.mp4` — or transcode to MPEG-TS and use a `"ts"` source (the lowest-CPU path). HEVC-in-MP4 is likewise out of scope; transcode to `.ts`.
 | `fps` | integer | No | `5` | `image` | Frames per second to render. Range 1–60. |
 | `bitrate_kbps` | integer | No | `250` | `image` | Encoded video bitrate. Range 50–50 000 (50 kbps – 50 Mbps). |
 | `audio_silence` | boolean | No | `true` | `image` | Pair the rendered video with silent stereo AAC so downstream demuxers don't complain about a missing audio PID. |

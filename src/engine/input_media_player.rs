@@ -585,6 +585,7 @@ pub(super) fn classify_playback_error(err: &anyhow::Error) -> &'static str {
     if msg_lc.contains("no sync byte")
         || msg_lc.contains("not mpeg-ts")
         || msg_lc.contains("severely corrupt")
+        || msg_lc.contains("fragmented mp4")
     {
         return "media_player_source_unsupported";
     }
@@ -2081,6 +2082,15 @@ mod tests {
     fn classify_no_sync_byte_is_unsupported() {
         let err = anyhow!(
             "TS file has no sync byte in 1 MiB of slop — file is not MPEG-TS or is severely corrupt"
+        );
+        assert_eq!(classify_playback_error(&err), "media_player_source_unsupported");
+    }
+
+    #[test]
+    fn classify_fragmented_mp4_is_unsupported() {
+        let err = anyhow!(
+            "fragmented MP4 (fMP4 / moof) is not supported by the media player: /media/clip.mp4 \
+             stores its coded frames in movie-fragment boxes the demuxer cannot address"
         );
         assert_eq!(classify_playback_error(&err), "media_player_source_unsupported");
     }

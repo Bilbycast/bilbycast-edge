@@ -14,6 +14,19 @@
 //! VPS/SPS/PPS we'd need for a clean Annex-B emit. Operators with HEVC
 //! masters can transcode to .ts and use a [`MediaPlayerSource::Ts`] entry
 //! instead, which is the lowest-CPU path anyway.
+//!
+//! **Fragmented MP4 (fMP4 — `moof`/`traf`/`trun`) is also out of scope**
+//! and is rejected up-front (see [`demux_file`]): the `mp4` crate (0.14)
+//! cannot address samples that live in movie-fragment boxes — its
+//! `sample_offset()` returns `tfhd.base_data_offset.unwrap_or(0)` for
+//! every sample, which is `0` under the near-universal `default_base_moof`
+//! flag, so every "sample" is read from file offset 0 and the real coded
+//! slices are lost. Left unchecked that produces an *undecodable* TS
+//! (SPS/PPS/SEI but no picture slices → receivers report "unspecified
+//! size") emitted at wire speed (fragment sample durations decode as 0, so
+//! nothing paces the player). Same remedy as HEVC: re-mux to a plain MP4
+//! (`ffmpeg -i in.mp4 -c copy -movflags +faststart out.mp4`) or to a `.ts`
+//! source.
 
 use std::collections::BinaryHeap;
 use std::path::Path;
@@ -83,6 +96,30 @@ fn demux_file(path: &Path) -> Result<DemuxResult> {
     let reader = std::io::BufReader::new(f);
     let mut mp4 = mp4::Mp4Reader::read_header(reader, size)
         .map_err(|e| anyhow!("mp4 header parse {}: {e}", path.display()))?;
+
+    // Reject fragmented MP4 (fMP4) BEFORE reading any samples. Movie
+    // fragments (`moof`/`traf`/`trun`) are parsed into `Mp4Track::trafs` by
+    // the `mp4` crate, but its sample addressing for them is broken:
+    // `sample_offset()` returns `tfhd.base_data_offset.unwrap_or(0)` — the
+    // same value for every sample, and `0` under the `default_base_moof`
+    // flag that `ffmpeg -movflags frag_keyframe+empty_moov`,
+    // MSE/MediaRecorder and DASH/HLS/CMAF packagers all emit — so every
+    // sample is read from file offset 0 (the `ftyp` box) and the coded
+    // slices never make it out. Playing it anyway yields a TS carrying only
+    // SPS/PPS/SEI and no picture slices (undecodable — ffprobe/mediamtx
+    // report "unspecified size" / profile unknown), emitted at wire speed
+    // because fragment sample durations decode as 0. Fail loudly with an
+    // actionable remedy instead.
+    if mp4.tracks().values().any(|t| !t.trafs.is_empty()) {
+        return Err(anyhow!(
+            "fragmented MP4 (fMP4 / moof) is not supported by the media player: {} \
+             stores its coded frames in movie-fragment boxes the demuxer cannot address, \
+             which would emit an undecodable stream. Re-mux to a plain (unfragmented) MP4 \
+             with `ffmpeg -i in.mp4 -c copy -movflags +faststart out.mp4`, or transcode to \
+             MPEG-TS and use a `ts` source instead",
+            path.display()
+        ));
+    }
 
     let mut video = None;
     let mut audio = None;
