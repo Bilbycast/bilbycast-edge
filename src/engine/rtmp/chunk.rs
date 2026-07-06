@@ -43,6 +43,15 @@ pub const DEFAULT_CHUNK_SIZE: u32 = 128;
 /// 4096 is a common choice that reduces header overhead.
 pub const DESIRED_CHUNK_SIZE: u32 = 4096;
 
+/// Hard cap on the length of any single RTMP message we will reassemble. The
+/// RTMP `message_length` field is 24-bit, so a valid message can never exceed
+/// this — the cap therefore NEVER rejects a conformant stream (media,
+/// aggregate, command, or data). It is a per-connection memory backstop only;
+/// the actual DoS protections are the AMF0 recursion-depth limit (which stops
+/// nested-object stack-overflow regardless of message size) plus the
+/// connection cap + read timeouts in `server.rs`.
+const MAX_RTMP_MSG_LEN: usize = 16 * 1024 * 1024;
+
 /// RTMP message type IDs.
 pub mod msg_type {
     /// Set Chunk Size (protocol control, chunk stream 2).
@@ -329,6 +338,15 @@ impl ChunkReader {
             };
             if needs_ext {
                 state.timestamp = read_u32_be(stream).await?;
+            }
+
+            // -- Per-connection memory backstop (never rejects valid RTMP) --
+            if state.msg_len as usize > MAX_RTMP_MSG_LEN {
+                bail!(
+                    "RTMP message length {} exceeds protocol maximum {}",
+                    state.msg_len,
+                    MAX_RTMP_MSG_LEN
+                );
             }
 
             // -- Read chunk payload --

@@ -247,6 +247,31 @@ struct PesAssembler {
     stream_type: u8,
 }
 
+/// Hard cap on a single PES reassembly buffer for a video elementary stream.
+/// A stream that stops emitting a payload-unit-start (PUSI) — malformed or
+/// adversarial — would otherwise grow this buffer at line rate until the
+/// process is OOM-killed.
+///
+/// This bounds ONE coded access unit (frame), not throughput: 100s-of-Mbps
+/// feeds pass through fine because each frame is flushed on the next PUSI.
+/// The cap is sized well above the largest single I-frame of a high-bitrate
+/// (~500 Mbps, long-GOP, low-fps) contribution feed (~20–25 MiB worst case),
+/// while still fully defeating the unbounded-growth DoS.
+const PES_ASSEMBLER_CAP_VIDEO: usize = 64 * 1024 * 1024;
+
+/// Hard cap for non-video (audio / data / subtitle) PES reassembly. These
+/// access units are small; the cap only exists to bound the same DoS.
+const PES_ASSEMBLER_CAP_OTHER: usize = 1024 * 1024;
+
+/// Cap for a PES buffer given its PMT `stream_type`.
+fn pes_assembler_cap(stream_type: u8) -> usize {
+    match stream_type {
+        // MPEG-1/2 video, MPEG-4 part 2, H.264, HEVC, VVC, AVS2/AVS3, VC-1.
+        0x01 | 0x02 | 0x10 | 0x1B | 0x24 | 0x33 | 0x42 | 0xD1 | 0xEA => PES_ASSEMBLER_CAP_VIDEO,
+        _ => PES_ASSEMBLER_CAP_OTHER,
+    }
+}
+
 /// MPEG-TS demuxer that extracts elementary stream frames.
 pub struct TsDemuxer {
     /// Optional MPEG-TS program_number selector. If `None`, the demuxer
@@ -873,7 +898,20 @@ impl TsDemuxer {
                 assembler.buffer.extend_from_slice(payload);
                 assembler.started = true;
             } else if assembler.started {
-                assembler.buffer.extend_from_slice(payload);
+                if assembler
+                    .buffer
+                    .len()
+                    .saturating_add(payload.len())
+                    > pes_assembler_cap(assembler.stream_type)
+                {
+                    // No PUSI arrived to flush this PES — malformed or
+                    // adversarial. Drop the partial buffer and resync on the
+                    // next PUSI rather than growing without bound (OOM guard).
+                    assembler.buffer.clear();
+                    assembler.started = false;
+                } else {
+                    assembler.buffer.extend_from_slice(payload);
+                }
             }
         }
 

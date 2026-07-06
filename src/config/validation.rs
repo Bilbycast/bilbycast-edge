@@ -5103,6 +5103,19 @@ pub fn validate_output_with_input(
             if !hls.ingest_url.starts_with("http://") && !hls.ingest_url.starts_with("https://") {
                 bail!("HLS output '{}': ingest_url must start with http:// or https://", hls.id);
             }
+            // The HLS uploader has no TLS. We ACCEPT https:// at validation so an
+            // existing config still loads (rejecting here would fail the whole
+            // config load), but the uploader refuses to transmit over cleartext
+            // at runtime (see engine::output_hls::http_put) so the bearer token
+            // is never sent unencrypted. Surface the misconfiguration at load.
+            if hls.ingest_url.starts_with("https://") {
+                tracing::warn!(
+                    "SECURITY: HLS output '{}' uses https:// but the HLS uploader has no TLS — \
+                     uploads will be refused at runtime to avoid sending the auth_token in cleartext. \
+                     Use http:// to a trusted network, or terminate TLS at a local reverse proxy.",
+                    hls.id
+                );
+            }
             if hls.ingest_url.len() > 2048 {
                 bail!("HLS output '{}': ingest_url must be at most 2048 characters", hls.id);
             }
@@ -10147,7 +10160,9 @@ mod tests {
             group: None,
             id: "hls1".into(),
             name: "hls 1".into(),
-            ingest_url: "https://example.com/hls".into(),
+            // http:// — the uploader has no TLS; https:// is rejected (see
+            // validate_output_hls_rejects_https_ingest).
+            ingest_url: "http://example.com/hls".into(),
             segment_duration_secs: 2.0,
             auth_token: None,
             max_segments: 5,
@@ -10190,17 +10205,41 @@ mod tests {
             audio_encode: None,
             transcode: None,
         });
-        assert!(validate_output(&make("https://example.com/hls")).is_ok());
-        let err = validate_output(&make("https://example.com/hls\r\nX-Injected: 1"))
+        assert!(validate_output(&make("http://example.com/hls")).is_ok());
+        let err = validate_output(&make("http://example.com/hls\r\nX-Injected: 1"))
             .unwrap_err()
             .to_string();
         assert!(err.contains("ASCII control"), "unexpected error: {err}");
         assert!(
-            validate_output(&make("https://example.com/hls\nfoo")).is_err()
+            validate_output(&make("http://example.com/hls\nfoo")).is_err()
         );
         assert!(
-            validate_output(&make("https://example.com/hls\0null")).is_err()
+            validate_output(&make("http://example.com/hls\0null")).is_err()
         );
+    }
+
+    #[test]
+    fn validate_output_hls_accepts_both_schemes_without_bricking() {
+        use crate::config::models::{HlsOutputConfig, OutputConfig};
+        let make = |url: &str| OutputConfig::Hls(HlsOutputConfig {
+            active: true,
+            group: None,
+            id: "hls1".into(),
+            name: "hls 1".into(),
+            ingest_url: url.into(),
+            segment_duration_secs: 2.0,
+            auth_token: Some("s3cr3t".into()),
+            max_segments: 5,
+            program_number: None,
+            pid_map: None,
+            audio_encode: None,
+            transcode: None,
+        });
+        // Both schemes VALIDATE (rejecting https:// here would fail the whole
+        // config load). The uploader refuses https:// at runtime instead, so
+        // the token is never sent in cleartext — see engine::output_hls.
+        assert!(validate_output(&make("http://example.com/hls")).is_ok());
+        assert!(validate_output(&make("https://example.com/hls")).is_ok());
     }
 
     #[test]
@@ -10220,9 +10259,11 @@ mod tests {
             audio_encode: None,
             transcode: None,
         });
+        // IPv6 literal host parsing — scheme is http:// because the HLS
+        // uploader has no TLS (https:// is rejected; see the dedicated test).
         assert!(validate_output(&make("http://[::1]:8080/hls")).is_ok());
-        assert!(validate_output(&make("https://[2001:db8::1]/hls")).is_ok());
-        assert!(validate_output(&make("https://[2001:db8::1]:8443/hls/seg.ts?token=abc")).is_ok());
+        assert!(validate_output(&make("http://[2001:db8::1]/hls")).is_ok());
+        assert!(validate_output(&make("http://[2001:db8::1]:8443/hls/seg.ts?token=abc")).is_ok());
     }
 
     #[test]
@@ -10278,7 +10319,7 @@ mod tests {
             group: None,
             id: "hls1".into(),
             name: "hls 1".into(),
-            ingest_url: "https://example.com/hls".into(),
+            ingest_url: "http://example.com/hls".into(),
             segment_duration_secs: 2.0,
             auth_token: Some(token.into()),
             max_segments: 5,

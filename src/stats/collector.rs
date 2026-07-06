@@ -142,8 +142,18 @@ pub struct OutputStatsAccumulator {
     pub egress_pacing_effective: OnceLock<String>,
     /// EOVERFLOW count from the SO_TXTIME error queue: kernel rejected
     /// the datagram because its target tx time landed in the past.
-    /// Incremented from the wire thread on each errqueue drain.
+    /// Incremented from the wire thread on each errqueue drain. This is a
+    /// SO_TXTIME-path signal and stays 0 on the default `clock_nanosleep`
+    /// release path.
     pub wire_pacing_late: AtomicU64,
+    /// Datagrams dropped by a **partial `sendmmsg` short-write** (kernel
+    /// accepted fewer messages than submitted, e.g. transient ENOBUFS / socket
+    /// buffer pressure on the batch send path). Distinct from `wire_pacing_late`
+    /// (SO_TXTIME EOVERFLOW) so a socket-backpressure event on the default path
+    /// is not misread as a PCR/pacing-lateness alarm. Distinct from
+    /// `egress_shed` (residence-cap latency shed) and `packets_dropped`
+    /// (broadcast-channel lag).
+    pub wire_short_write: AtomicU64,
     /// CPU index the wire-emit thread is pinned to via
     /// `pthread_setaffinity_np` (operator-configured via
     /// `BILBYCAST_WIRE_EMIT_CPUS`). `-1` means not pinned (the kernel
@@ -742,6 +752,7 @@ impl OutputStatsAccumulator {
             wire_pacing_tier: OnceLock::new(),
             egress_pacing_effective: OnceLock::new(),
             wire_pacing_late: AtomicU64::new(0),
+            wire_short_write: AtomicU64::new(0),
             wire_pacing_pinned_cpu: AtomicI32::new(-1),
             egress_shed: AtomicU64::new(0),
             wire_emit_depth: OnceLock::new(),
@@ -1328,6 +1339,7 @@ impl OutputStatsAccumulator {
             wire_pacing_tier: self.wire_pacing_tier.get().cloned(),
             egress_pacing_effective: self.egress_pacing_effective.get().cloned(),
             wire_pacing_late: self.wire_pacing_late.load(Ordering::Relaxed),
+            wire_short_write: self.wire_short_write.load(Ordering::Relaxed),
             wire_pacing_pinned_cpu: {
                 let v = self.wire_pacing_pinned_cpu.load(Ordering::Relaxed);
                 if v < 0 { None } else { Some(v as u32) }

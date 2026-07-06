@@ -20,20 +20,24 @@
 //!
 //! 1. Parse the bundle JSON and extract the cert + signature + Rekor
 //!    payload.
-//! 2. Verify the cert chains to the compiled-in Fulcio root.
+//! 2. Verify the leaf cert chains to (is signed by) a compiled-in/TUF
+//!    Fulcio CA. This is the load-bearing anti-forgery check.
 //! 3. Verify the cert's SAN URI matches one of the entries in
 //!    [`super::trust::ALLOWED_SIGNERS`].
-//! 4. Verify the Rekor inclusion proof against the compiled-in Rekor
-//!    public key, and that the entry's `integratedTime` falls within
-//!    the cert's validity window.
+//! 4. Verify the Rekor entry: (a) the entry body binds this manifest's
+//!    SHA-256 and this exact certificate; (b) the Signed Entry Timestamp
+//!    verifies under a trusted Rekor public key; (c) the entry's
+//!    `integratedTime` falls within the cert's validity window.
 //! 5. Verify the signature is valid over the manifest bytes using the
 //!    pubkey embedded in the cert.
 //!
-//! Implementation note: the heavy crypto (cert chain validation, Rekor
-//! proof) lives inside the `sigstore` crate. This module wraps it in a
-//! single `verify_manifest_bundle` entry point that returns clear
-//! `error_code`-friendly errors so the manager UI can render targeted
-//! failures.
+//! Implementation note: sigstore-rs 0.14 keeps its chain / Rekor
+//! verifiers `pub(crate)`, so the checks above are performed in-tree
+//! against the crate's public primitives (`SigstoreTrustRoot::{fulcio_certs,
+//! rekor_keys}`, `CosignVerificationKey`). `verify_manifest_bundle` is the
+//! single entry point and returns clear `error_code`-friendly errors so the
+//! manager UI can render targeted failures. Any failure — including an
+//! unreachable/malformed trust root — is fatal (fail-closed).
 
 use anyhow::{anyhow, bail, Context, Result};
 use serde::Deserialize;
@@ -70,10 +74,12 @@ pub async fn verify_manifest_bundle(
         .as_deref()
         .ok_or_else(|| anyhow!("bundle missing 'base64Signature'"))?;
 
-    // 2. Use the sigstore crate's verifier to chain the cert to Fulcio +
-    //    verify the Rekor proof.
-    crate::upgrade::verify::sigstore_inner::verify_cert_and_rekor(
+    // 2. Chain the cert to a trusted Fulcio CA, check its validity window
+    //    against the Rekor integrated time, and bind the Rekor entry to THIS
+    //    manifest + certificate (plus verify the Rekor SET signature).
+    sigstore_inner::verify_cert_and_rekor(
         cert_pem,
+        manifest_bytes,
         bundle.rekor_bundle.as_ref(),
     )
     .await
@@ -186,47 +192,224 @@ pub(crate) mod sigstore_inner {
     /// `cargo update` without code changes.
     pub async fn verify_cert_and_rekor(
         cert_pem: &str,
+        manifest_bytes: &[u8],
         rekor_bundle: Option<&super::RekorBundle>,
     ) -> Result<()> {
-        let _ = cert_pem;
-        let _ = rekor_bundle;
         use sigstore::trust::TrustRoot;
-        // Build the trust root (loads Fulcio CA + Rekor pubkey from the
-        // sigstore crate's bundled TUF data). The result is cached by the
-        // crate so repeat calls don't re-fetch.
+
+        // Build the trust root — loads the Fulcio CA certs + Rekor public
+        // keys from the sigstore crate's TUF data (embedded snapshot,
+        // refreshed from the Sigstore TUF repo). These are the roots of
+        // trust; verification below is entirely against them.
         let trust_root = sigstore::trust::sigstore::SigstoreTrustRoot::new(None)
             .await
             .context("failed to load Sigstore trust root (Fulcio + Rekor)")?;
-
-        // Cert chain check via the cached trust root.
-        let _certs = trust_root
+        let fulcio_certs = trust_root
             .fulcio_certs()
             .map_err(|e| anyhow!("Fulcio cert bundle unavailable: {e}"))?;
-        let _rekor_keys = trust_root
+        let rekor_keys = trust_root
             .rekor_keys()
             .map_err(|e| anyhow!("Rekor public key unavailable: {e}"))?;
 
-        // Parse the leaf cert. We rely on the `x509-cert` crate (a
-        // sigstore-rs transitive dep) for DER parsing; sigstore-rs does
-        // the actual chain validation when we hand it a parsed bundle in
-        // `verify_blob_signature`.
-        let _leaf = parse_x509_pem(cert_pem)?;
+        // Rekor inclusion is mandatory — a bundle without it cannot be
+        // transparency-verified, and its absence must never pass.
+        let rekor = rekor_bundle
+            .ok_or_else(|| anyhow!("rekor bundle missing — every release must be logged in Rekor"))?;
 
-        // Rekor proof: we require the bundle to be present (defence
-        // against omitting the proof to escape transparency).
-        if rekor_bundle.is_none() {
-            bail!("rekor bundle missing — every release must be logged in Rekor");
-        }
-        // Sigstore-rs validates the inclusion proof + SET inside its
-        // own verifier. The cosign sign-blob path is a slice of the
-        // crate's bundle verifier; if upstream stabilises a public
-        // `verify_blob_with_bundle` API we wire it here, otherwise we
-        // re-implement the SET check in tree against `_rekor_keys`.
-        // The current crate exposes `Bundle::verify` for the OCI
-        // signing path; the blob-path equivalent is straightforward
-        // since the Rekor entry body already carries the signature
-        // over the manifest hash.
+        let leaf_der = pem_to_der(cert_pem)?;
+
+        // (a) Chain: the leaf MUST be signed by a trusted Fulcio CA. This is
+        //     the load-bearing anti-forgery check — without it an attacker can
+        //     self-sign a certificate carrying the allowed workflow identity
+        //     and pass the SAN allowlist below.
+        verify_cert_chain(&leaf_der, &fulcio_certs)
+            .context("Fulcio certificate-chain verification failed")?;
+
+        // (b) The signing cert's validity window must contain the Rekor
+        //     integrated time (the cosign/Fulcio short-lived-cert model).
+        verify_validity_window(&leaf_der, rekor.payload.integrated_time)
+            .context("certificate validity window does not contain the Rekor integrated time")?;
+
+        // (c) The Rekor entry body must bind THIS manifest hash AND THIS
+        //     certificate — otherwise a valid entry for some other artifact
+        //     could be replayed alongside a forged manifest.
+        verify_rekor_body_binding(&rekor.payload.body, manifest_bytes, &leaf_der)
+            .context("Rekor entry body does not bind this manifest and certificate")?;
+
+        // (d) The Signed Entry Timestamp must verify under a trusted Rekor
+        //     public key (proves Rekor actually logged this entry).
+        verify_rekor_set(rekor, &rekor_keys)
+            .context("Rekor SignedEntryTimestamp verification failed")?;
+
         Ok(())
+    }
+
+    /// Map an X.509 signature-algorithm OID to a sigstore signing scheme.
+    fn scheme_for_oid(oid: &str) -> Result<sigstore::crypto::SigningScheme> {
+        use sigstore::crypto::SigningScheme;
+        match oid {
+            "1.2.840.10045.4.3.2" => Ok(SigningScheme::ECDSA_P256_SHA256_ASN1), // ecdsa-with-SHA256
+            "1.2.840.10045.4.3.3" => Ok(SigningScheme::ECDSA_P384_SHA384_ASN1), // ecdsa-with-SHA384
+            other => bail!("unsupported certificate signature algorithm OID {other}"),
+        }
+    }
+
+    /// Verify that `leaf_der` is signed by (i.e. chains to) one of the trusted
+    /// Fulcio CA certificates. Only the true issuer's public key verifies the
+    /// leaf's signature over its TBSCertificate, so trying every CA and
+    /// requiring one success is a sound chain check for Fulcio's short chain.
+    fn verify_cert_chain<C: AsRef<[u8]>>(leaf_der: &[u8], fulcio_certs: &[C]) -> Result<()> {
+        use sigstore::crypto::{CosignVerificationKey, Signature};
+        use x509_cert::der::{Decode, Encode};
+        use x509_cert::Certificate;
+
+        let leaf = Certificate::from_der(leaf_der)
+            .map_err(|e| anyhow!("leaf X.509 DER parse error: {e}"))?;
+        // The exact bytes Fulcio signed: the leaf's TBSCertificate DER.
+        let tbs_der = leaf
+            .tbs_certificate
+            .to_der()
+            .map_err(|e| anyhow!("re-encode leaf TBSCertificate: {e}"))?;
+        let sig = leaf
+            .signature
+            .as_bytes()
+            .ok_or_else(|| anyhow!("leaf signature is not octet-aligned"))?;
+        let scheme = scheme_for_oid(&leaf.signature_algorithm.oid.to_string())?;
+
+        for ca_der in fulcio_certs {
+            let Ok(ca) = Certificate::from_der(ca_der.as_ref()) else {
+                continue;
+            };
+            let Ok(spki_der) = ca.tbs_certificate.subject_public_key_info.to_der() else {
+                continue;
+            };
+            let Ok(key) = CosignVerificationKey::from_der(&spki_der, &scheme) else {
+                continue;
+            };
+            if key.verify_signature(Signature::Raw(sig), &tbs_der).is_ok() {
+                return Ok(());
+            }
+        }
+        bail!(
+            "leaf certificate does not chain to any trusted Fulcio CA \
+             (possible forged or self-signed certificate)"
+        )
+    }
+
+    /// Require the Rekor `integrated_time` to fall within the leaf cert's
+    /// `[notBefore, notAfter]` validity window.
+    fn verify_validity_window(leaf_der: &[u8], integrated_time: i64) -> Result<()> {
+        use x509_cert::der::Decode;
+        use x509_cert::Certificate;
+        let leaf = Certificate::from_der(leaf_der)
+            .map_err(|e| anyhow!("leaf X.509 DER parse error: {e}"))?;
+        let nb = leaf
+            .tbs_certificate
+            .validity
+            .not_before
+            .to_unix_duration()
+            .as_secs() as i64;
+        let na = leaf
+            .tbs_certificate
+            .validity
+            .not_after
+            .to_unix_duration()
+            .as_secs() as i64;
+        if integrated_time < nb || integrated_time > na {
+            bail!("Rekor integratedTime {integrated_time} is outside certificate validity [{nb}, {na}]");
+        }
+        Ok(())
+    }
+
+    /// Verify the Rekor `hashedrekord` entry body binds the exact manifest we
+    /// fetched (by SHA-256) and the exact certificate we verified.
+    fn verify_rekor_body_binding(
+        body_b64: &str,
+        manifest_bytes: &[u8],
+        leaf_der: &[u8],
+    ) -> Result<()> {
+        let body_bytes = base64::engine::general_purpose::STANDARD
+            .decode(body_b64)
+            .context("rekor body is not valid base64")?;
+        let body: serde_json::Value =
+            serde_json::from_slice(&body_bytes).context("rekor body is not valid JSON")?;
+
+        // spec.data.hash.value == hex(sha256(manifest))
+        let entry_hash = body
+            .pointer("/spec/data/hash/value")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("rekor body missing spec.data.hash.value"))?;
+        let want_hash = sha256_hex(manifest_bytes);
+        if !entry_hash.eq_ignore_ascii_case(&want_hash) {
+            bail!("rekor entry data hash {entry_hash} != manifest sha256 {want_hash}");
+        }
+
+        // spec.signature.publicKey.content == base64(PEM of the signing cert)
+        let pk_b64 = body
+            .pointer("/spec/signature/publicKey/content")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("rekor body missing spec.signature.publicKey.content"))?;
+        let pk_pem = base64::engine::general_purpose::STANDARD
+            .decode(pk_b64)
+            .context("rekor body publicKey.content is not valid base64")?;
+        let pk_pem = std::str::from_utf8(&pk_pem)
+            .context("rekor body publicKey is not UTF-8 PEM")?;
+        let entry_cert_der = pem_to_der(pk_pem)
+            .context("rekor body publicKey PEM did not parse")?;
+        if entry_cert_der != leaf_der {
+            bail!("rekor entry certificate does not match the bundle's signing certificate");
+        }
+        Ok(())
+    }
+
+    /// Verify the Rekor Signed Entry Timestamp (an ECDSA-P256 signature over
+    /// the canonical JSON of the log entry) against a trusted Rekor key.
+    fn verify_rekor_set(
+        rekor: &super::RekorBundle,
+        rekor_keys: &std::collections::BTreeMap<String, &[u8]>,
+    ) -> Result<()> {
+        use sigstore::crypto::{CosignVerificationKey, Signature, SigningScheme};
+
+        let set_sig = base64::engine::general_purpose::STANDARD
+            .decode(&rekor.signed_entry_timestamp)
+            .context("SignedEntryTimestamp is not valid base64")?;
+
+        // The canonical JSON Rekor signs: keys sorted, no whitespace. The
+        // string fields (`body` base64, `logID` hex) contain no characters
+        // needing JSON escaping, so this reproduces the signed bytes exactly.
+        let canonical = format!(
+            "{{\"body\":\"{}\",\"integratedTime\":{},\"logID\":\"{}\",\"logIndex\":{}}}",
+            rekor.payload.body,
+            rekor.payload.integrated_time,
+            rekor.payload.log_id,
+            rekor.payload.log_index
+        );
+
+        for spki in rekor_keys.values().copied() {
+            if let Ok(key) =
+                CosignVerificationKey::from_der(spki, &SigningScheme::ECDSA_P256_SHA256_ASN1)
+            {
+                if key
+                    .verify_signature(Signature::Raw(&set_sig), canonical.as_bytes())
+                    .is_ok()
+                {
+                    return Ok(());
+                }
+            }
+        }
+        bail!("SignedEntryTimestamp did not verify against any trusted Rekor public key")
+    }
+
+    /// Lowercase hex of SHA-256(`data`).
+    fn sha256_hex(data: &[u8]) -> String {
+        use sha2::{Digest, Sha256};
+        use std::fmt::Write;
+        let digest = Sha256::digest(data);
+        let mut out = String::with_capacity(64);
+        for b in digest {
+            let _ = write!(out, "{b:02x}");
+        }
+        out
     }
 
     /// Verify the cosign blob signature over `blob` using the pubkey
@@ -336,10 +519,6 @@ pub(crate) mod sigstore_inner {
         Some(rest[..end].to_string())
     }
 
-    fn parse_x509_pem(cert_pem: &str) -> Result<Vec<u8>> {
-        pem_to_der(cert_pem)
-    }
-
     fn pem_to_der(cert_pem: &str) -> Result<Vec<u8>> {
         let trimmed = cert_pem.trim();
         let stripped = trimmed
@@ -350,6 +529,97 @@ pub(crate) mod sigstore_inner {
         base64::engine::general_purpose::STANDARD
             .decode(cleaned)
             .context("PEM body is not valid base64")
+    }
+
+    #[cfg(test)]
+    mod chain_tests {
+        use super::*;
+
+        // Fixtures generated offline with OpenSSL (P-256, ecdsa-with-SHA256):
+        //  * CA_PEM        — a self-signed test CA (stands in for a Fulcio CA).
+        //  * LEAF_PEM      — a leaf issued *by* that CA.
+        //  * OTHER_CA_PEM  — an unrelated self-signed CA.
+        //  * FORGED_PEM    — an attacker-self-signed cert with the same subject
+        //                    as LEAF but NOT issued by CA (the forgery the
+        //                    chain check exists to stop).
+        const CA_PEM: &str = r#"-----BEGIN CERTIFICATE-----
+MIIBhjCCAS2gAwIBAgIURxdwF6sp5xqzl7rx8RKgWkvhh4YwCgYIKoZIzj0EAwIw
+GTEXMBUGA1UEAwwOVGVzdCBGdWxjaW8gQ0EwHhcNMjYwNzA2MDI1ODMxWhcNMzYw
+NzAzMDI1ODMxWjAZMRcwFQYDVQQDDA5UZXN0IEZ1bGNpbyBDQTBZMBMGByqGSM49
+AgEGCCqGSM49AwEHA0IABAHNMvfuUdk4y/VA74k2YhXbUpAPOiwiMD9Xq+rYriSf
+cPcaZwy36MG6fVVZYMWOhl20RZx13PcUk4Tlm9kubP+jUzBRMB0GA1UdDgQWBBR7
+YpMmucviS/rKNfvh5nQnYeULvDAfBgNVHSMEGDAWgBR7YpMmucviS/rKNfvh5nQn
+YeULvDAPBgNVHRMBAf8EBTADAQH/MAoGCCqGSM49BAMCA0cAMEQCIF8NNUK0b+Ho
+CwOeL99LrNZJHKE1F6FXjK7juqRZhs7tAiB4WxB/BosQF2/U3W6Mlm0P6hy2K1Nj
+3sbZxuywV3xVSw==
+-----END CERTIFICATE-----"#;
+
+        const LEAF_PEM: &str = r#"-----BEGIN CERTIFICATE-----
+MIIBbDCCARKgAwIBAgIUack56LkOqBV3bH7TCvFYEhf+oHIwCgYIKoZIzj0EAwIw
+GTEXMBUGA1UEAwwOVGVzdCBGdWxjaW8gQ0EwHhcNMjYwNzA2MDI1ODMxWhcNMjcw
+NzA2MDI1ODMxWjAPMQ0wCwYDVQQDDARsZWFmMFkwEwYHKoZIzj0CAQYIKoZIzj0D
+AQcDQgAEAXclNg9sf5hNuqiqxe4voL5sXVi8pccpprcDpueQIvp4j4KHv5wza7LT
+ykGo4FRVpx6Zggk0rN/Sca7siAFkv6NCMEAwHQYDVR0OBBYEFNCUvLZDwM0sxQYH
+toVAKni9r/t+MB8GA1UdIwQYMBaAFHtikya5y+JL+so1++HmdCdh5Qu8MAoGCCqG
+SM49BAMCA0gAMEUCIGoE4eNGJB2BSBR6+IFNlakoKcEPB66LyXOnGWX/EDonAiEA
+zXkAMcVKpLiuTmuWzC/vuzBmQpdkQ6UW+fVqx7oOkQQ=
+-----END CERTIFICATE-----"#;
+
+        const OTHER_CA_PEM: &str = r#"-----BEGIN CERTIFICATE-----
+MIIBezCCASGgAwIBAgIUWhSyw1aTo3dEwELL17bV6tSKi0gwCgYIKoZIzj0EAwIw
+EzERMA8GA1UEAwwIT3RoZXIgQ0EwHhcNMjYwNzA2MDI1ODMxWhcNMzYwNzAzMDI1
+ODMxWjATMREwDwYDVQQDDAhPdGhlciBDQTBZMBMGByqGSM49AgEGCCqGSM49AwEH
+A0IABMx7E1n0dB8spO0H+TQ7KKkOsqCGeHRqRE2grnYUUw/Yetakeq6seHTRYwQE
+bH3Kb+Jw/z8Nd1CUHTIorBUDWBCjUzBRMB0GA1UdDgQWBBQ1ppALy2883CHbgdNc
+U0UuzKwBbjAfBgNVHSMEGDAWgBQ1ppALy2883CHbgdNcU0UuzKwBbjAPBgNVHRMB
+Af8EBTADAQH/MAoGCCqGSM49BAMCA0gAMEUCICLtGS9cN9LYNU0Wq9HM3iWSdFrd
+ZHof+F2ASqbZYjMcAiEAhb4m/Swc5NRYK/Pp3eJs94IzNcKrwvqUrvvs+tSwDW4=
+-----END CERTIFICATE-----"#;
+
+        const FORGED_PEM: &str = r#"-----BEGIN CERTIFICATE-----
+MIIBczCCARmgAwIBAgIUPwjMF8WEIi+PJhojP1mBQfN7CDgwCgYIKoZIzj0EAwIw
+DzENMAsGA1UEAwwEbGVhZjAeFw0yNjA3MDYwMjU4MzFaFw0yNzA3MDYwMjU4MzFa
+MA8xDTALBgNVBAMMBGxlYWYwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAASc8rjQ
+ovJh4PWjJhGATFHiFWCM5nSFxbTkZP/JEEoBwLvcX59tmRdtQr2N0jsg+Y5lE7nA
+YBfM5tRdtUmhtz3+o1MwUTAdBgNVHQ4EFgQUhLYz0CN431vzfNhd2F8+sPDpXnIw
+HwYDVR0jBBgwFoAUhLYz0CN431vzfNhd2F8+sPDpXnIwDwYDVR0TAQH/BAUwAwEB
+/zAKBggqhkjOPQQDAgNIADBFAiEA7dRB7EGCkC7ulfYQE7EdhBsA0ym/LGvJAIbY
+YWzC7nACIBXD/yRzFUPRFLc9i6BWdgKLnH0Q63jwgsuDIfcgcppk
+-----END CERTIFICATE-----"#;
+
+        #[test]
+        fn leaf_chains_to_its_issuing_ca() {
+            let leaf = pem_to_der(LEAF_PEM).unwrap();
+            let ca = pem_to_der(CA_PEM).unwrap();
+            assert!(verify_cert_chain(&leaf, &[ca]).is_ok());
+        }
+
+        #[test]
+        fn forged_self_signed_cert_is_rejected() {
+            // This is the RCE the whole fix exists to stop: an attacker
+            // self-signs a cert with the allowed identity and hands it over.
+            // Without the chain check it would pass the SAN allowlist; the
+            // chain check rejects it because it isn't issued by the CA.
+            let forged = pem_to_der(FORGED_PEM).unwrap();
+            let ca = pem_to_der(CA_PEM).unwrap();
+            assert!(verify_cert_chain(&forged, &[ca]).is_err());
+        }
+
+        #[test]
+        fn leaf_rejected_against_unrelated_ca() {
+            let leaf = pem_to_der(LEAF_PEM).unwrap();
+            let other = pem_to_der(OTHER_CA_PEM).unwrap();
+            assert!(verify_cert_chain(&leaf, &[other]).is_err());
+        }
+
+        #[test]
+        fn validity_window_bounds_integrated_time() {
+            // LEAF validity: 2026-07-06 .. 2027-07-06 (unix ~1.783e9 .. 1.815e9).
+            let leaf = pem_to_der(LEAF_PEM).unwrap();
+            assert!(verify_validity_window(&leaf, 1_790_000_000).is_ok());
+            assert!(verify_validity_window(&leaf, 100).is_err()); // 1970, before notBefore
+            assert!(verify_validity_window(&leaf, 1_900_000_000).is_err()); // after notAfter
+        }
     }
 }
 

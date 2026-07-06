@@ -15,16 +15,49 @@
 //! - Wirecast, vMix, etc.
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use bytes::{Bytes, BytesMut, BufMut};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpListener;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Semaphore};
 use tokio_util::sync::CancellationToken;
 
 use super::amf0::{self, Amf0Value};
 use super::chunk::{ChunkReader, ChunkWriter, msg_type, DESIRED_CHUNK_SIZE};
+
+/// Maximum number of concurrent RTMP client connections. Bounds FD / memory /
+/// task usage against an unauthenticated flood (slowloris). RTMP publish is a
+/// single-source contribution protocol, so a small cap is ample; excess
+/// connections are dropped immediately.
+const MAX_RTMP_CONNECTIONS: usize = 8;
+
+/// Time budget for the server-side handshake. A peer that connects and then
+/// stalls mid-handshake is dropped rather than parking a task forever. The
+/// handshake is a quick fixed exchange, so 15 s is far above any legitimate
+/// timing.
+const RTMP_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Per-message time budget for the pre-publish command phase (connect →
+/// createStream → publish). Defeats a slowloris that dribbles bytes before
+/// authenticating, but is deliberately generous (60 s) so an armed-and-waiting
+/// contribution encoder that connects before it starts publishing is not
+/// dropped. Slowloris resource use is bounded by MAX_RTMP_CONNECTIONS
+/// regardless, so we can afford the margin.
+const RTMP_PREPUBLISH_READ_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Idle-read timeout once publishing: if the publisher stops sending media
+/// (and never closes the socket) we reclaim the connection instead of parking
+/// on a bare read forever. Sized for broadcast source-loss ride-through — many
+/// hardware contribution encoders (Haivision/Elemental) stop emitting RTMP
+/// media on SDI/upstream loss but hold the session open and resume seamlessly
+/// on the SAME session when the source returns; a shorter window would force an
+/// avoidable full reconnect + IDR/GOP re-alignment on every source switch. The
+/// DoS pressure is bounded by MAX_RTMP_CONNECTIONS (single publisher per input,
+/// 8x headroom), and a clean FIN/RST reconnect frees its permit immediately, so
+/// a long idle window is safe.
+const RTMP_MEDIA_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// Media data received from the RTMP publisher.
 #[derive(Debug, Clone)]
@@ -68,6 +101,8 @@ pub async fn run_rtmp_server(
 
     tracing::info!("RTMP server listening on {}", config.listen_addr);
 
+    let conn_sem = Arc::new(Semaphore::new(MAX_RTMP_CONNECTIONS));
+
     loop {
         tokio::select! {
             _ = cancel.cancelled() => {
@@ -77,6 +112,19 @@ pub async fn run_rtmp_server(
             result = listener.accept() => {
                 match result {
                     Ok((stream, addr)) => {
+                        // Bound concurrent connections. If we're at capacity,
+                        // drop the newcomer immediately rather than spawning an
+                        // unbounded task (slowloris / FD-exhaustion guard).
+                        let permit = match conn_sem.clone().try_acquire_owned() {
+                            Ok(p) => p,
+                            Err(_) => {
+                                tracing::warn!(
+                                    "RTMP connection limit ({MAX_RTMP_CONNECTIONS}) reached; rejecting {addr}"
+                                );
+                                drop(stream);
+                                continue;
+                            }
+                        };
                         tracing::info!("RTMP client connected from {addr}");
                         stream.set_nodelay(true).ok();
 
@@ -87,6 +135,8 @@ pub async fn run_rtmp_server(
                         let is_pub = is_publishing.clone();
 
                         tokio::spawn(async move {
+                            // Hold the permit for the connection's lifetime.
+                            let _permit = permit;
                             if let Err(e) = handle_rtmp_client(
                                 stream, addr, &expected_app, expected_key.as_deref(),
                                 media_tx, is_pub.clone(), cancel,
@@ -116,8 +166,11 @@ async fn handle_rtmp_client<S: AsyncRead + AsyncWrite + Unpin + Send>(
     is_publishing: Arc<AtomicBool>,
     cancel: CancellationToken,
 ) -> Result<()> {
-    // 1. RTMP handshake (server side)
-    server_handshake(&mut stream).await?;
+    // 1. RTMP handshake (server side), time-bounded so a stalled peer can't
+    //    park this task indefinitely.
+    tokio::time::timeout(RTMP_HANDSHAKE_TIMEOUT, server_handshake(&mut stream))
+        .await
+        .map_err(|_| anyhow::anyhow!("RTMP handshake timed out after {RTMP_HANDSHAKE_TIMEOUT:?}"))??;
     tracing::debug!("RTMP handshake complete with {addr}");
 
     let mut writer = ChunkWriter::new();
@@ -145,7 +198,14 @@ async fn handle_rtmp_client<S: AsyncRead + AsyncWrite + Unpin + Send>(
     loop {
         let msg = tokio::select! {
             _ = cancel.cancelled() => return Ok(()),
-            r = reader.read_message(&mut stream) => r?,
+            r = tokio::time::timeout(
+                RTMP_PREPUBLISH_READ_TIMEOUT,
+                reader.read_message(&mut stream),
+            ) => {
+                r.map_err(|_| anyhow::anyhow!(
+                    "RTMP {addr}: timed out waiting for command (pre-publish slowloris guard)"
+                ))??
+            }
         };
 
         match msg.msg_type {
@@ -310,10 +370,16 @@ async fn receive_media_loop<S: AsyncRead + AsyncWrite + Unpin + Send>(
     loop {
         let msg = tokio::select! {
             _ = cancel.cancelled() => return Ok(()),
-            r = reader.read_message(stream) => {
+            r = tokio::time::timeout(RTMP_MEDIA_IDLE_TIMEOUT, reader.read_message(stream)) => {
                 match r {
-                    Ok(m) => m,
-                    Err(e) => {
+                    Err(_) => {
+                        tracing::info!(
+                            "RTMP publisher idle for {RTMP_MEDIA_IDLE_TIMEOUT:?} — closing connection"
+                        );
+                        return Ok(());
+                    }
+                    Ok(Ok(m)) => m,
+                    Ok(Err(e)) => {
                         tracing::debug!("RTMP read error: {e}");
                         return Ok(()); // Publisher disconnected
                     }

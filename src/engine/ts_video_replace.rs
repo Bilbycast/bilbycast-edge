@@ -1222,7 +1222,17 @@ mod inner {
                 self.pes_buffer.extend_from_slice(payload);
                 self.pes_started = true;
             } else if self.pes_started {
-                self.pes_buffer.extend_from_slice(payload);
+                // DoS guard: a stream that stops emitting PUSI would otherwise
+                // grow this video PES buffer without bound. Drop + resync.
+                // Bounds one coded frame, not throughput; sized above the
+                // largest single I-frame of a high-bitrate contribution feed.
+                const PES_CAP: usize = 64 * 1024 * 1024;
+                if self.pes_buffer.len().saturating_add(payload.len()) > PES_CAP {
+                    self.pes_buffer.clear();
+                    self.pes_started = false;
+                } else {
+                    self.pes_buffer.extend_from_slice(payload);
+                }
             }
         }
 

@@ -386,19 +386,57 @@ fn generate_m3u8(
 
 // ── Minimal async HTTP PUT client ──────────────────────────────────────────
 
+/// Base network time budget for a single segment/playlist PUT. Without a bound
+/// a destination that accepts the TCP connection but never responds (or
+/// black-holes SYNs) would wedge the HLS output task for the OS TCP timeout
+/// (~2 min) or indefinitely, silently taking the leg dark. The effective
+/// budget scales with body size (see `http_put`) so a large high-bitrate
+/// segment on a slow-but-working link isn't clipped.
+const HLS_PUT_TIMEOUT_BASE: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// Perform an HTTP PUT request using a raw TCP stream.
 ///
 /// This is a minimal implementation that avoids heavy HTTP client dependencies.
-/// It does NOT support TLS (https:// URLs will connect without encryption),
-/// redirects, or chunked transfer encoding. For production use, consider
-/// switching to `reqwest` once it is added to Cargo.toml.
+/// It does NOT support TLS — `https://` URLs are rejected at config validation
+/// (they would connect in cleartext and leak the bearer token), so this path
+/// only ever sees `http://`. No redirects or chunked transfer encoding. For
+/// TLS, terminate at a local reverse proxy or switch to `reqwest`.
 async fn http_put(
     url: &str,
     body: &[u8],
     content_type: &str,
     auth_token: Option<&str>,
 ) -> anyhow::Result<()> {
+    // 30s base + ~1s per MiB of body, so a large segment (e.g. 10s @ 40 Mbps
+    // ≈ 50 MiB) on a slow link gets a proportionate budget instead of being
+    // clipped by a flat timeout — while a stalled/black-holed ingest is still
+    // bounded (drop-and-continue) rather than wedging the leg for ~2 min.
+    let timeout = HLS_PUT_TIMEOUT_BASE
+        .saturating_add(std::time::Duration::from_secs((body.len() / (1024 * 1024)) as u64));
+    tokio::time::timeout(timeout, http_put_inner(url, body, content_type, auth_token))
+        .await
+        .map_err(|_| anyhow::anyhow!("HLS PUT to {url} timed out after {timeout:?}"))?
+}
+
+async fn http_put_inner(
+    url: &str,
+    body: &[u8],
+    content_type: &str,
+    auth_token: Option<&str>,
+) -> anyhow::Result<()> {
     let target = crate::util::url_parse::parse_http_target(url)?;
+
+    // No TLS support here — refuse https:// BEFORE connecting or building the
+    // request, so the bearer token is never transmitted in cleartext. This is a
+    // runtime refusal (the config still loads) rather than a validation error,
+    // so one misconfigured HLS output can't brick the whole edge.
+    if target.scheme.eq_ignore_ascii_case("https") {
+        anyhow::bail!(
+            "HLS output to {url}: https:// is not supported (the HLS uploader has no TLS) — \
+             refusing to send the auth_token in cleartext. Use http:// to a trusted network \
+             or a TLS-terminating reverse proxy."
+        );
+    }
 
     let has_crlf = |s: &str| s.bytes().any(|b| b == b'\r' || b == b'\n');
     if has_crlf(&target.host) || has_crlf(&target.path_and_query) || has_crlf(content_type)

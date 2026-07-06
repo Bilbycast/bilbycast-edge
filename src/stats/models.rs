@@ -981,6 +981,13 @@ pub struct OutputStats {
     /// field — old managers ignore it.
     #[serde(default, skip_serializing_if = "is_zero_u64")]
     pub wire_pacing_late: u64,
+    /// Datagrams dropped by a partial `sendmmsg` short-write (transient
+    /// socket-buffer pressure / ENOBUFS on the batch send path). Separate from
+    /// `wire_pacing_late` so socket backpressure on the default release path is
+    /// not misread as SO_TXTIME pacing lateness. Backward-compatible additive
+    /// field.
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub wire_short_write: u64,
     /// CPU index the wire-emit thread was pinned to at spawn (via
     /// `pthread_setaffinity_np`, configured per-process by
     /// `BILBYCAST_WIRE_EMIT_CPUS`). `None` means not pinned — the

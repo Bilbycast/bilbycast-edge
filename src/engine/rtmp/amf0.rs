@@ -133,12 +133,19 @@ pub fn encode_values(values: &[Amf0Value]) -> Vec<u8> {
 // Decoder
 // ---------------------------------------------------------------------------
 
+/// Maximum AMF0 object/array nesting depth we will decode. AMF0 objects nest
+/// via `decode_object` → `decode_value` → `decode_object`; an unauthenticated
+/// RTMP `connect` payload of deeply-nested empty objects would otherwise
+/// recurse until the thread stack overflows and aborts the whole process.
+/// Real RTMP command payloads nest only a handful of levels.
+const MAX_AMF0_DEPTH: u32 = 32;
+
 /// Decode all AMF0 values from a byte slice.
 pub fn decode_all(data: &[u8]) -> Result<Vec<Amf0Value>> {
     let mut pos = 0;
     let mut values = Vec::new();
     while pos < data.len() {
-        let (val, new_pos) = decode_value(data, pos)?;
+        let (val, new_pos) = decode_value(data, pos, 0)?;
         values.push(val);
         pos = new_pos;
     }
@@ -146,7 +153,11 @@ pub fn decode_all(data: &[u8]) -> Result<Vec<Amf0Value>> {
 }
 
 /// Decode a single AMF0 value starting at `pos`. Returns `(value, new_pos)`.
-fn decode_value(data: &[u8], pos: usize) -> Result<(Amf0Value, usize)> {
+/// `depth` bounds object/array nesting to defeat stack-overflow DoS.
+fn decode_value(data: &[u8], pos: usize, depth: u32) -> Result<(Amf0Value, usize)> {
+    if depth > MAX_AMF0_DEPTH {
+        bail!("AMF0: nesting depth exceeds {MAX_AMF0_DEPTH} — refusing to decode (possible malicious payload)");
+    }
     if pos >= data.len() {
         bail!("AMF0: unexpected end of data at position {pos}");
     }
@@ -167,14 +178,14 @@ fn decode_value(data: &[u8], pos: usize) -> Result<(Amf0Value, usize)> {
             let (s, new_pos) = decode_raw_string(data, pos)?;
             Ok((Amf0Value::String(s), new_pos))
         }
-        MARKER_OBJECT => decode_object(data, pos),
+        MARKER_OBJECT => decode_object(data, pos, depth),
         MARKER_NULL => Ok((Amf0Value::Null, pos)),
         // Ecma Array (marker 0x08) — some servers use this in _result.
         // It has a 4-byte "count" hint followed by key-value pairs + object-end.
         0x08 => {
             ensure_remaining(data, pos, 4)?;
             // Skip the 4-byte count; parse like a regular object.
-            decode_object(data, pos + 4)
+            decode_object(data, pos + 4, depth)
         }
         other => {
             // Skip unknown types gracefully — consume remaining data.
@@ -195,7 +206,9 @@ fn decode_raw_string(data: &[u8], pos: usize) -> Result<(String, usize)> {
 }
 
 /// Decode an AMF0 object (key-value pairs terminated by empty-key + 0x09).
-fn decode_object(data: &[u8], mut pos: usize) -> Result<(Amf0Value, usize)> {
+/// `depth` is the current nesting level; each contained value is decoded at
+/// `depth + 1` so [`decode_value`] can bound total recursion.
+fn decode_object(data: &[u8], mut pos: usize, depth: u32) -> Result<(Amf0Value, usize)> {
     let mut props = Vec::new();
     loop {
         // Check for object-end marker: 0x00 0x00 0x09
@@ -207,7 +220,7 @@ fn decode_object(data: &[u8], mut pos: usize) -> Result<(Amf0Value, usize)> {
             .context("AMF0 object: failed to decode key")?;
         pos = new_pos;
         // Read value.
-        let (val, new_pos) = decode_value(data, pos)
+        let (val, new_pos) = decode_value(data, pos, depth + 1)
             .context("AMF0 object: failed to decode value")?;
         pos = new_pos;
         props.push((key, val));
@@ -237,6 +250,20 @@ fn ensure_remaining(data: &[u8], pos: usize, need: usize) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn deeply_nested_object_is_rejected_not_overflow() {
+        // Each `00 00 03` is an empty-key property whose value is another
+        // object — i.e. one nesting level. Without the depth guard this many
+        // levels overflow the thread stack and abort the process (the
+        // unauthenticated RTMP DoS). With the guard, decode bails cleanly.
+        let mut data = vec![MARKER_OBJECT];
+        for _ in 0..5000 {
+            data.extend_from_slice(&[0x00, 0x00, MARKER_OBJECT]);
+        }
+        let res = decode_all(&data);
+        assert!(res.is_err(), "deeply nested AMF0 must be rejected, not overflow the stack");
+    }
 
     #[test]
     fn round_trip_number() {

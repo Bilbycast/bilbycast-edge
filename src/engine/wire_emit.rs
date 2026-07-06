@@ -1664,6 +1664,33 @@ fn run_emitter(
                         .packets_sent
                         .fetch_add(n_sent as u64, Ordering::Relaxed);
                     stats.bytes_sent.fetch_add(bytes_total, Ordering::Relaxed);
+                    // `sendmmsg` can short-write (ENOBUFS/EINTR after >=1 msg):
+                    // the un-sent tail is dropped when `batch` is cleared next
+                    // iteration. Account for it so a partial send is visible in
+                    // OutputStats instead of silently pixelating the receiver on
+                    // the lossless (no-ARQ) path.
+                    let shortfall = batch.len().saturating_sub(n_sent);
+                    if shortfall > 0 {
+                        // Use the dedicated short-write counter, NOT
+                        // wire_pacing_late — the latter is a SO_TXTIME-path
+                        // signal documented as always 0 on this default
+                        // clock_nanosleep path, so overloading it would trip a
+                        // false PCR/pacing alarm in broadcast-quality monitoring.
+                        stats
+                            .wire_short_write
+                            .fetch_add(shortfall as u64, Ordering::Relaxed);
+                        // debug, not warn: a short-write happens under transient
+                        // socket-buffer pressure (ENOBUFS) and could recur per
+                        // batch — the operational signal is the wire_short_write
+                        // counter in OutputStats, not a per-batch log line.
+                        tracing::debug!(
+                            "wire-emit '{}' partial sendmmsg: {} of {} datagrams unsent \
+                             (kernel short-write) — counted as late/dropped",
+                            id,
+                            shortfall,
+                            batch.len()
+                        );
+                    }
                 }
                 Err(e) => {
                     tracing::warn!(
