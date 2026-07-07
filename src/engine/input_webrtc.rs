@@ -417,15 +417,30 @@ async fn whep_input_loop(
             accept_self_signed: config.accept_self_signed_cert.unwrap_or(true),
             fingerprint: config.cert_fingerprint.clone(),
         };
-        let (answer_sdp, _resource_url) = match crate::engine::webrtc::signaling::whep_post(
-            &config.whep_url,
-            &offer_sdp,
-            config.bearer_token.as_deref(),
-            &tls,
-        ).await {
+        // Cancel-guard the signaling POST so a flow-stop doesn't stall on a
+        // slow/filtered connect (bounded to ~10 s by connect_timeout). The
+        // select! evaluates to the whep_post result, or returns on cancel.
+        let post_result = tokio::select! {
+            _ = cancel.cancelled() => return,
+            r = crate::engine::webrtc::signaling::whep_post(
+                &config.whep_url,
+                &offer_sdp,
+                config.bearer_token.as_deref(),
+                &tls,
+            ) => r,
+        };
+        let (answer_sdp, _resource_url) = match post_result {
             Ok(r) => r,
             Err(e) => {
                 tracing::error!("WHEP signaling failed: {}", e);
+                // Surface the failure in the manager UI — carries the HTTP
+                // status + body, or the connect error for a filtered endpoint.
+                events.emit_flow(
+                    EventSeverity::Warning,
+                    category::WEBRTC,
+                    format!("WHEP signaling failed: {e}"),
+                    flow_id,
+                );
                 tokio::select! {
                     _ = cancel.cancelled() => return,
                     _ = tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)) => {}
@@ -437,6 +452,12 @@ async fn whep_input_loop(
 
         if let Err(e) = session.apply_answer(&answer_sdp, pending) {
             tracing::error!("WHEP: failed to apply SDP answer: {}", e);
+            // Back off before retrying — a bare `continue` spins the loop.
+            tokio::select! {
+                _ = cancel.cancelled() => return,
+                _ = tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)) => {}
+            }
+            backoff_secs = (backoff_secs * 2).min(30);
             continue;
         }
 

@@ -220,7 +220,14 @@ pub fn build_rustls_config(trust: &TlsTrust) -> Result<Option<rustls::ClientConf
 /// Standard paths use reqwest's default config; pinned and insecure
 /// paths use a custom rustls config via `use_preconfigured_tls`.
 pub fn build_reqwest_client(trust: &TlsTrust) -> Result<reqwest::Client, String> {
-    let builder = reqwest::Client::builder();
+    // Bound the TCP connect so a blackholed / filtered signaling endpoint
+    // (e.g. a hypervisor dropping outbound TCP to public IPs) surfaces an
+    // error in ~10 s instead of hanging on the OS default (~127 s on Linux
+    // with tcp_syn_retries=6). Only the WHIP/WHEP HTTP signaling client
+    // goes through here (see signaling.rs), so the manager WSS path — which
+    // uses build_rustls_config directly — is unaffected.
+    let builder = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(10));
     let builder = match build_rustls_config(trust)? {
         Some(cfg) => builder.use_preconfigured_tls(cfg),
         None => builder,
