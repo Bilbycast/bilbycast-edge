@@ -3700,6 +3700,17 @@ pub struct SrtOutputConfig {
     /// inflated stream.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cbr_pad_to_kbps: Option<u32>,
+    /// Force a browser-safe ("WebRTC-compatible") H.264 egress. The report
+    /// scenario is "route this SRT feed to a WebRTC audience" — an external
+    /// WebRTC gateway (mediamtx / Janus) ingesting the SRT feed rejects
+    /// H.264 with B-frames. When true, the edge **always** re-encodes video
+    /// to browser-safe H.264 (zero B-frames, 8-bit 4:2:0, browser-decodable
+    /// profile, inline SPS/PPS) via [`webrtc_safe_video_encode`], regardless
+    /// of the source's GOP structure. Requires an H.264 encoder backend
+    /// compiled in (validation checks). See also
+    /// [`WebrtcOutputConfig::webrtc_compatible`] for the native WHIP/WHEP path.
+    #[serde(default)]
+    pub webrtc_compatible: bool,
     /// Pin this SRT output to a physical NIC. Phase 1: loose only —
     /// strict mode is rejected (libsrt SRTO_BINDTODEVICE plumbing
     /// deferred). When set, the resolved interface IP is used as
@@ -5191,6 +5202,19 @@ pub struct WebrtcOutputConfig {
     /// bitrate/profile transcoding for H.264 sources.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub video_encode: Option<VideoEncodeConfig>,
+    /// Force a browser-safe ("WebRTC-compatible") H.264 egress. When true,
+    /// the edge **always** re-encodes video to a stream a WebRTC audience
+    /// (browser / WHEP SFU / mediamtx / Janus) can decode: H.264, **zero
+    /// B-frames** (the crux — B-frames force non-monotonic RTP timestamps
+    /// that browser jitter buffers freeze on), 8-bit 4:2:0, a
+    /// browser-decodable profile, and inline SPS/PPS on every IDR. Convenience
+    /// wrapper: it synthesises a browser-safe `video_encode` when none is set,
+    /// or pins an operator-supplied one to safe settings (see
+    /// [`webrtc_safe_video_encode`]). An operator wanting to reach a WebRTC
+    /// audience sets this instead of hand-tuning NAL / profile internals.
+    /// Requires an H.264 encoder backend compiled in (validation checks).
+    #[serde(default)]
+    pub webrtc_compatible: bool,
 
     /// Optional MPEG-TS PID overrides for the transcoded output. When set,
     /// the encoded ES is emitted on the override PID and the rewritten PMT
@@ -5363,6 +5387,96 @@ pub struct VideoEncodeConfig {
     /// HW display playout also gets HW transcode decode "for free".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hw_decode: Option<HwDecodePreference>,
+}
+
+/// Build a browser-safe ("WebRTC-compatible") [`VideoEncodeConfig`] from an
+/// optional operator-supplied one.
+///
+/// The `webrtc_compatible` output flag ([`WebrtcOutputConfig::webrtc_compatible`]
+/// / [`SrtOutputConfig::webrtc_compatible`]) routes video through the normal
+/// re-encode path but pins the encoder to settings a WebRTC audience
+/// (browser / WHEP SFU / mediamtx / Janus) can actually decode:
+///
+/// * **H.264** — browsers do not decode HEVC. An HEVC codec (or an empty
+///   codec) is replaced with `h264_auto`; the per-host resolver then picks a
+///   compiled-in H.264 backend, with software libx264 as the fallback tail.
+/// * **Zero B-frames** — the crux of the fix. B-frames are transmitted in
+///   decode order, giving non-monotonic RTP timestamps that browser jitter
+///   buffers and WHEP SFUs freeze on (RFC 7742 mandates Constrained Baseline,
+///   which by definition forbids B-frames). `bframes` is hard-pinned to 0.
+/// * **8-bit 4:2:0** — browsers do not decode 10-bit / 4:2:2 / 4:4:4.
+/// * **Browser-decodable profile** — `high10` / `high422` / `high444` /
+///   `main10` / `main422-10` profiles are downgraded to `main`. `baseline` /
+///   `main` / `high` (all 8-bit) are left as the operator set them; Main or
+///   High **with B-frames disabled** is WebRTC-valid, so baseline is not
+///   forced (which would needlessly cost quality).
+/// * **`zerolatency` tune** — low latency, and independently disables
+///   B-frames in x264.
+///
+/// SPS/PPS travel in-band on every IDR because the re-encode call sites
+/// (`output_webrtc` / `ts_video_replace`) already open the encoder with
+/// `global_header = false`.
+pub fn webrtc_safe_video_encode(existing: Option<&VideoEncodeConfig>) -> VideoEncodeConfig {
+    fn is_hevc(codec: &str) -> bool {
+        matches!(
+            codec,
+            "x265" | "hevc_nvenc" | "hevc_qsv" | "hevc_vaapi" | "hevc_rkmpp" | "hevc_auto"
+        )
+    }
+    let mut enc = match existing {
+        Some(v) => v.clone(),
+        None => VideoEncodeConfig {
+            // `h264_auto` resolves to the cheapest compiled-in H.264 backend
+            // on this host (HW where present, else libx264).
+            codec: "h264_auto".to_string(),
+            source_video_pid: None,
+            width: None,
+            height: None,
+            fps_num: None,
+            fps_den: None,
+            bitrate_kbps: None,
+            gop_size: None,
+            preset: None,
+            profile: None,
+            chroma: None,
+            bit_depth: None,
+            rate_control: None,
+            crf: None,
+            max_bitrate_kbps: None,
+            bframes: None,
+            refs: None,
+            level: None,
+            tune: None,
+            color_primaries: None,
+            color_transfer: None,
+            color_matrix: None,
+            color_range: None,
+            hw_decode: None,
+        },
+    };
+    // Force H.264 — browsers decode H.264 only.
+    if enc.codec.trim().is_empty() || is_hevc(&enc.codec) {
+        enc.codec = "h264_auto".to_string();
+    }
+    // Zero B-frames — the load-bearing constraint (monotonic RTP timestamps).
+    enc.bframes = Some(0);
+    // 8-bit 4:2:0 — the only chroma/depth browsers reliably decode.
+    enc.chroma = Some("yuv420p".to_string());
+    enc.bit_depth = Some(8);
+    // Downgrade profiles that imply >8-bit or >4:2:0 to Main.
+    if let Some(p) = enc.profile.as_deref() {
+        if matches!(
+            p,
+            "high10" | "high422" | "high444" | "main10" | "main422-10" | "main422-10-intra"
+        ) {
+            enc.profile = Some("main".to_string());
+        }
+    }
+    // Low-latency by default (also independently disables B-frames in x264).
+    if enc.tune.is_none() {
+        enc.tune = Some("zerolatency".to_string());
+    }
+    enc
 }
 
 /// Audio encoder configuration block. Used by RTMP, HLS, and WebRTC

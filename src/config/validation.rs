@@ -3989,6 +3989,42 @@ fn validate_pid_overrides_entry(
 /// gop, preset, profile) regardless of which backends the current build
 /// actually has compiled in. Unavailable backends are surfaced as a
 /// runtime error when the output starts.
+/// Validate a `webrtc_compatible` output (SRT / WebRTC). When enabled, the
+/// edge always re-encodes video to browser-safe H.264 via
+/// [`crate::config::models::webrtc_safe_video_encode`], so:
+///  * an explicit HEVC `video_encode.codec` is a contradiction (WebRTC
+///    browsers can't decode HEVC) — reject with a clear message; and
+///  * the synthesised browser-safe encode is validated so a build with no
+///    H.264 encoder backend compiled in fails at config time with a clear
+///    "rebuild with ..." message instead of a runtime Critical event.
+fn validate_webrtc_compatible(
+    enabled: bool,
+    video_encode: Option<&crate::config::models::VideoEncodeConfig>,
+    context: &str,
+) -> anyhow::Result<()> {
+    if !enabled {
+        return Ok(());
+    }
+    if let Some(ve) = video_encode {
+        if matches!(
+            ve.codec.as_str(),
+            "x265" | "hevc_nvenc" | "hevc_qsv" | "hevc_vaapi" | "hevc_rkmpp" | "hevc_auto"
+        ) {
+            bail!(
+                "{context}: webrtc_compatible requires an H.264 output, but video_encode.codec \
+                 '{}' is HEVC — WebRTC browsers can't decode HEVC. Remove the HEVC codec (or pick \
+                 an H.264 one) or turn off webrtc_compatible.",
+                ve.codec
+            );
+        }
+    }
+    // Validate the browser-safe re-encode the edge will actually synthesise,
+    // which also confirms an H.264 encoder backend is compiled in.
+    let effective = crate::config::models::webrtc_safe_video_encode(video_encode);
+    validate_video_encode(&effective, &format!("{context} webrtc_compatible re-encode"))?;
+    Ok(())
+}
+
 fn validate_video_encode(
     enc: &crate::config::models::VideoEncodeConfig,
     context: &str,
@@ -4896,6 +4932,11 @@ pub fn validate_output_with_input(
         OutputConfig::Srt(srt) => {
             validate_id(&srt.id, "SRT output")?;
             validate_name(&srt.name, "SRT output")?;
+            validate_webrtc_compatible(
+                srt.webrtc_compatible,
+                srt.video_encode.as_ref(),
+                &format!("SRT output '{}'", srt.id),
+            )?;
             validate_program_number(srt.program_number, &format!("SRT output '{}'", srt.id))?;
             validate_pid_map(srt.pid_map.as_ref(), &format!("SRT output '{}'", srt.id))?;
             if srt.pid_map.is_some() && srt.transport_mode.as_deref() == Some("audio_302m") {
@@ -5416,6 +5457,11 @@ pub fn validate_output_with_input(
                     &format!("WebRTC output '{}'", webrtc.id),
                 )?;
             }
+            validate_webrtc_compatible(
+                webrtc.webrtc_compatible,
+                webrtc.video_encode.as_ref(),
+                &format!("WebRTC output '{}'", webrtc.id),
+            )?;
         }
         OutputConfig::St2110_30(c) => {
             validate_st2110_audio_output(c, St2110Profile::Pcm, upstream_audio)?
@@ -10346,6 +10392,7 @@ mod tests {
             AudioEncodeConfig, OutputConfig, WebrtcOutputConfig, WebrtcOutputMode,
         };
         let make = |codec: &str, video_only: bool| OutputConfig::Webrtc(WebrtcOutputConfig {
+            webrtc_compatible: false,
             active: true,
             group: None,
             id: "wrtc1".into(),
@@ -10385,6 +10432,84 @@ mod tests {
     }
 
     #[test]
+    fn webrtc_safe_video_encode_forces_browser_safe_settings() {
+        use crate::config::models::{webrtc_safe_video_encode, VideoEncodeConfig};
+
+        // No existing video_encode → synthesise an H.264-auto browser-safe
+        // re-encode (zero B-frames, 8-bit 4:2:0, zerolatency).
+        let synth = webrtc_safe_video_encode(None);
+        assert_eq!(synth.codec, "h264_auto");
+        assert_eq!(synth.bframes, Some(0), "B-frames must be pinned off");
+        assert_eq!(synth.chroma.as_deref(), Some("yuv420p"));
+        assert_eq!(synth.bit_depth, Some(8));
+        assert_eq!(synth.tune.as_deref(), Some("zerolatency"));
+
+        // Explicit HEVC + 10-bit 4:2:2 High → codec forced to H.264, profile
+        // downgraded to main, chroma/depth pinned, B-frames off; operator
+        // dimensions/bitrate preserved.
+        let hevc = VideoEncodeConfig {
+            codec: "x265".into(),
+            profile: Some("high422".into()),
+            chroma: Some("yuv422p".into()),
+            bit_depth: Some(10),
+            bframes: Some(3),
+            bitrate_kbps: Some(6000),
+            width: Some(1920),
+            height: Some(1080),
+            source_video_pid: None,
+            fps_num: None,
+            fps_den: None,
+            gop_size: None,
+            preset: None,
+            rate_control: None,
+            crf: None,
+            max_bitrate_kbps: None,
+            refs: None,
+            level: None,
+            tune: None,
+            color_primaries: None,
+            color_transfer: None,
+            color_matrix: None,
+            color_range: None,
+            hw_decode: None,
+        };
+        let safe = webrtc_safe_video_encode(Some(&hevc));
+        assert_eq!(safe.codec, "h264_auto", "HEVC must be replaced with H.264");
+        assert_eq!(safe.bframes, Some(0));
+        assert_eq!(safe.chroma.as_deref(), Some("yuv420p"));
+        assert_eq!(safe.bit_depth, Some(8));
+        assert_eq!(safe.profile.as_deref(), Some("main"), "high422 → main");
+        assert_eq!(safe.bitrate_kbps, Some(6000), "operator bitrate preserved");
+        assert_eq!(safe.width, Some(1920), "operator width preserved");
+
+        // Already-H.264 High source: codec + profile preserved, B-frames
+        // still forced off (High-without-B is WebRTC-valid, so no needless
+        // downgrade to baseline).
+        let mut h264 = webrtc_safe_video_encode(None);
+        h264.codec = "x264".into();
+        h264.profile = Some("high".into());
+        h264.bframes = Some(2);
+        let safe2 = webrtc_safe_video_encode(Some(&h264));
+        assert_eq!(safe2.codec, "x264");
+        assert_eq!(safe2.profile.as_deref(), Some("high"));
+        assert_eq!(safe2.bframes, Some(0));
+    }
+
+    #[test]
+    fn validate_webrtc_compatible_gating() {
+        // Disabled → always Ok regardless of codec (no re-encode synthesised).
+        let mut ve = crate::config::models::webrtc_safe_video_encode(None);
+        ve.codec = "x265".into();
+        assert!(validate_webrtc_compatible(false, Some(&ve), "test").is_ok());
+        // Enabled + explicit HEVC → reject with a clear message before any
+        // backend check (rebuilding wouldn't help — browsers can't decode HEVC).
+        let err = validate_webrtc_compatible(true, Some(&ve), "test")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("HEVC"), "got: {err}");
+    }
+
+    #[test]
     fn validate_output_webrtc_video_encode_rejects_hevc() {
         // WebRTC browsers don't decode HEVC; the validator must reject
         // H.265-targeting encoders so operators get a clear error at
@@ -10393,6 +10518,7 @@ mod tests {
             OutputConfig, VideoEncodeConfig, WebrtcOutputConfig, WebrtcOutputMode,
         };
         let make = |codec: &str| OutputConfig::Webrtc(WebrtcOutputConfig {
+            webrtc_compatible: false,
             active: true,
             group: None,
             id: "wrtc1".into(),
@@ -10463,6 +10589,7 @@ mod tests {
     fn validate_output_webrtc_cert_fingerprint_format() {
         use crate::config::models::{OutputConfig, WebrtcOutputConfig, WebrtcOutputMode};
         let make = |fp: Option<String>| OutputConfig::Webrtc(WebrtcOutputConfig {
+            webrtc_compatible: false,
             active: true,
             group: None,
             id: "wrtc1".into(),
@@ -11063,6 +11190,7 @@ mod tests {
 
     fn srt_caller_output(id: &str, local_addr: Option<&str>, remote_addr: &str) -> OutputConfig {
         OutputConfig::Srt(SrtOutputConfig {
+            webrtc_compatible: false,
             id: id.to_string(),
             name: format!("SRT {id}"),
             active: true,

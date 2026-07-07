@@ -680,6 +680,47 @@ plugs in via those paths rather than the TS-stream replacer.
   (default 2× fps) drives keyframe cadence. Force-IDR on PLI is tracked
   under a follow-up.
 
+### The `webrtc_compatible` output flag (browser-safe H.264)
+
+`WebRTC` and `SRT` outputs carry a `webrtc_compatible: bool` (default
+`false`). It is a convenience wrapper for operators who need to reach a
+**WebRTC audience** — a browser, the relay WHEP SFU, or an external WebRTC
+gateway (mediamtx / Janus) — without hand-tuning H.264 profile / NAL
+internals.
+
+**Why it exists.** A passthrough output forwards whatever the source
+contains. If the source H.264 carries **B-frames** (any `media_player` file
+or contribution feed encoded with them), RTP timestamps go non-monotonic
+(B-frames are transmitted in decode order) and browser jitter buffers / WHEP
+SFUs freeze — the classic *"WebRTC doesn't support H.264 streams with
+B-frames"* failure. The real constraint is RFC 7742 (WebRTC's mandatory
+Constrained-Baseline profile forbids B-frames), not RFC 6184. Note the
+built-in **test pattern is already B-frame-free** (`bframes = 0`); only
+passthrough of an external / file B-frame source is affected.
+
+**What it does.** When `true`, the edge **always** re-encodes video to a
+browser-safe H.264 stream via `config::models::webrtc_safe_video_encode`:
+
+- **H.264** — `h264_auto` when no `video_encode` is set; an HEVC codec is
+  forced to H.264 (and rejected at validation — browsers can't decode HEVC);
+- **zero B-frames** — `bframes` hard-pinned to `0` (the crux);
+- **8-bit 4:2:0** — `chroma = yuv420p`, `bit_depth = 8`; `high10` / `high422`
+  / `high444` / `main10` profiles downgrade to `main`;
+- **inline SPS/PPS** on every IDR (`global_header = false`, already the TS /
+  WebRTC default);
+- `tune = zerolatency`.
+
+An explicit `video_encode` block is preserved (bitrate / resolution) but
+pinned to the safe settings above. Because it always re-encodes, the flag
+**requires an H.264 encoder backend compiled in** (`video-encoder-x264` or a
+HW H.264 encoder) — validation rejects it with a clear message on an
+encoder-less build. Profile is left at `main` / `high` rather than forced to
+`baseline`: Main/High **without B-frames** is WebRTC-valid and higher quality.
+
+The relay's WHEP SFU is a pure elementary-stream repacketizer with no
+reorder / DTS machinery, so B-frame elimination is enforced **edge-side** (the
+only place it can be) — no relay change is needed.
+
 ### Deferred items (still to implement)
 
 - **Phase 4d — HLS video_encode.** Slot `VideoEncoder` into the HLS

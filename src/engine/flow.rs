@@ -2168,8 +2168,20 @@ impl FlowRuntime {
                     "srt".to_string(),
                 );
 
+                // `webrtc_compatible` synthesises / pins a browser-safe H.264
+                // re-encode (zero B-frames, 8-bit 4:2:0, inline SPS/PPS) so an
+                // external WebRTC gateway ingesting this SRT feed can decode it.
+                // Always re-encode when set — see `webrtc_safe_video_encode`.
+                let mut srt_config = srt_config.clone();
+                if srt_config.webrtc_compatible {
+                    srt_config.video_encode =
+                        Some(crate::config::models::webrtc_safe_video_encode(
+                            srt_config.video_encode.as_ref(),
+                        ));
+                }
+
                 let handle = spawn_srt_output(
-                    srt_config.clone(),
+                    srt_config,
                     broadcast_tx,
                     output_stats.clone(),
                     output_cancel.clone(),
@@ -2285,8 +2297,21 @@ impl FlowRuntime {
                     "webrtc".to_string(),
                 );
 
+                // `webrtc_compatible` forces a browser-safe H.264 re-encode
+                // even when the operator left `video_encode` unset — the
+                // passthrough WHIP/WHEP path would otherwise forward a
+                // B-frame source verbatim (non-monotonic RTP timestamps that
+                // browsers + the relay WHEP SFU freeze on).
+                let mut webrtc_config = webrtc_config.clone();
+                if webrtc_config.webrtc_compatible {
+                    webrtc_config.video_encode =
+                        Some(crate::config::models::webrtc_safe_video_encode(
+                            webrtc_config.video_encode.as_ref(),
+                        ));
+                }
+
                 let handle = spawn_webrtc_output(
-                    webrtc_config.clone(),
+                    webrtc_config,
                     broadcast_tx,
                     output_stats.clone(),
                     output_cancel.clone(),
@@ -5711,6 +5736,18 @@ fn derive_cost_plan(flow: &ResolvedFlow) -> crate::engine::hardware_probe::FlowC
         }
     }
 
+    // True when the output carries the `webrtc_compatible` flag (SRT +
+    // WebRTC today). Such outputs always re-encode to a browser-safe H.264
+    // stream, so `derive_cost_plan` must charge an encoder session even when
+    // `video_encode` is unset.
+    fn output_is_webrtc_compatible(out: &OutputConfig) -> bool {
+        match out {
+            OutputConfig::Srt(c) => c.webrtc_compatible,
+            OutputConfig::Webrtc(c) => c.webrtc_compatible,
+            _ => false,
+        }
+    }
+
     // Sibling of `video_encode_block` for inputs. Used by the input
     // loop below to charge per-input transcoder sessions onto the same
     // per-family counters the output loop uses. ST 2110-20/-23 carry a
@@ -5745,25 +5782,35 @@ fn derive_cost_plan(flow: &ResolvedFlow) -> crate::engine::hardware_probe::FlowC
     }
 
     for out in &flow.outputs {
-        let (audio, video) = output_encode_blocks(out);
+        let (audio, _video) = output_encode_blocks(out);
         if audio.is_some() {
             plan.audio_encode_outputs = plan.audio_encode_outputs.saturating_add(1);
         }
-        if let Some(codec) = video {
-            let ve = video_encode_block(out);
-            let (w, h, fn_, fd, bd, chroma) = match ve {
-                Some(v) => (v.width, v.height, v.fps_num, v.fps_den, v.bit_depth, v.chroma.clone()),
-                None => (None, None, None, None, None, None),
+        // Effective video_encode. `webrtc_compatible` synthesises (or pins)
+        // a browser-safe H.264 re-encode even when `video_encode` is unset,
+        // so charge its encoder session/units here too — otherwise the
+        // Resources card under-reports a webrtc_compatible output.
+        let synth_webrtc_ve;
+        let ve: Option<&crate::config::models::VideoEncodeConfig> =
+            if output_is_webrtc_compatible(out) {
+                synth_webrtc_ve =
+                    crate::config::models::webrtc_safe_video_encode(video_encode_block(out));
+                Some(&synth_webrtc_ve)
+            } else {
+                video_encode_block(out)
             };
+        if let Some(ve) = ve {
+            let codec = ve.codec.as_str();
+            let (w, h, fn_, fd, bd, chroma) =
+                (ve.width, ve.height, ve.fps_num, ve.fps_den, ve.bit_depth, ve.chroma.clone());
             let chroma_ref = chroma.as_deref();
 
             // Prefer the resolver result so `*_auto` codecs get the
             // backend the runtime would actually pick on this node.
             // Fall back to string classification when the static
             // capability snapshot isn't available yet.
-            let resolved = ve.and_then(|v| {
-                crate::engine::hardware_probe::resolve_for_video_encode_config(v).ok()
-            });
+            let resolved =
+                crate::engine::hardware_probe::resolve_for_video_encode_config(ve).ok();
 
             let (is_hw, hw_family) = match resolved {
                 Some(r) => (!r.is_software(), r.hw_family()),
@@ -5826,7 +5873,7 @@ fn derive_cost_plan(flow: &ResolvedFlow) -> crate::engine::hardware_probe::FlowC
                 // backend the runtime resolver will actually pick
                 // (CPU → none; may differ from the encoder family under
                 // `hw_decode: auto`), not the encoder family.
-                pair_resolved_decoder_sessions(&mut plan, ve, is_4k);
+                pair_resolved_decoder_sessions(&mut plan, Some(ve), is_4k);
             } else {
                 plan.sw_video_encode_units = plan.sw_video_encode_units.saturating_add(units);
             }
