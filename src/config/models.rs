@@ -5115,13 +5115,21 @@ pub enum WebrtcOutputMode {
 ///   `/api/v1/flows/{flow_id}/whep`.
 ///
 /// Extracts H.264 NALUs from the MPEG-2 TS stream and repacketizes as
-/// RFC 6184 RTP. Opus audio is passed through when available.
+/// RFC 6184 RTP. Audio is delivered to browser viewers as Opus — the codec
+/// WebRTC requires.
 ///
-/// # Audio limitations
-/// - Only Opus passthrough is supported. AAC→Opus transcoding requires
-///   C libraries and is NOT available in the pure-Rust build.
-/// - If the source TS carries AAC audio, the audio track will be
-///   automatically omitted for WebRTC outputs.
+/// # Audio
+/// - WebRTC always emits **Opus**. Source audio is decoded and re-encoded to
+///   Opus in-process on the default build (`webrtc` + `media-codecs` /
+///   `fdk-aac`): fdk-aac decodes AAC-LC / HE-AAC, and libavcodec/libopus
+///   decodes MP2 / AC-3 / E-AC-3 and performs the Opus encode. A ffmpeg
+///   subprocess is used only as a fallback when `media-codecs` is disabled.
+///   So an AAC-audio source is carried, not omitted — it is transcoded to
+///   Opus (see `engine::output_webrtc`).
+/// - Raw **Opus-in-TS passthrough** (a source already carrying Opus, i.e.
+///   stream_type 0x06 + `Opus` registration descriptor) is not yet wired
+///   through the str0m audio path: those frames are currently dropped with a
+///   one-shot warning rather than passed through.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WebrtcOutputConfig {
     /// Unique output ID within this flow.
