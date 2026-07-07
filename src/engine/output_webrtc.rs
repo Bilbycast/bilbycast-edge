@@ -1213,17 +1213,36 @@ async fn whip_client_loop(
             accept_self_signed: config.accept_self_signed_cert.unwrap_or(true),
             fingerprint: config.cert_fingerprint.clone(),
         };
-        let (answer_sdp, _resource_url) = match super::webrtc::signaling::whip_post(
-            &whip_url,
-            &offer_sdp,
-            config.bearer_token.as_deref(),
-            &tls,
-        ).await {
+        // Cancel-guard the signaling POST: with a bounded connect_timeout it
+        // can still take ~10 s against a filtered endpoint, and without this
+        // guard a flow-stop would stall on that connect. The tokio::select!
+        // evaluates to the whip_post result, or diverges out of the loop on
+        // cancellation.
+        let post_result = tokio::select! {
+            _ = cancel.cancelled() => break 'outer,
+            r = super::webrtc::signaling::whip_post(
+                &whip_url,
+                &offer_sdp,
+                config.bearer_token.as_deref(),
+                &tls,
+            ) => r,
+        };
+        let (answer_sdp, _resource_url) = match post_result {
             Ok(r) => r,
             Err(e) => {
                 tracing::error!("WHIP signaling '{}' failed: {}", config.id, e);
+                // Surface the failure in the manager UI — the error string
+                // carries the HTTP status + body from whip_post, or the
+                // connect error for a filtered/blackholed endpoint. Without
+                // this the output sits silently in the benign "waiting" state.
+                events.emit_flow(
+                    EventSeverity::Warning,
+                    category::WEBRTC,
+                    format!("WHIP signaling failed: {e}"),
+                    flow_id,
+                );
                 tokio::select! {
-                    _ = cancel.cancelled() => break,
+                    _ = cancel.cancelled() => break 'outer,
                     _ = tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)) => {}
                 }
                 backoff_secs = (backoff_secs * 2).min(30);
@@ -1233,6 +1252,13 @@ async fn whip_client_loop(
 
         if let Err(e) = session.apply_answer(&answer_sdp, pending) {
             tracing::error!("WHIP client '{}': SDP answer error: {}", config.id, e);
+            // Back off before retrying — a bare `continue` here spins the
+            // session/offer/POST loop with no delay on a persistent SDP fault.
+            tokio::select! {
+                _ = cancel.cancelled() => break 'outer,
+                _ = tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)) => {}
+            }
+            backoff_secs = (backoff_secs * 2).min(30);
             continue;
         }
 
@@ -1248,6 +1274,14 @@ async fn whip_client_loop(
             match event {
                 SessionEvent::Connected => {
                     tracing::info!("WHIP client '{}' session established", config.id);
+                    // Positive lifecycle signal, symmetric with the WHEP
+                    // client input's "WHEP connected" event.
+                    events.emit_flow(
+                        EventSeverity::Info,
+                        category::WEBRTC,
+                        "WHIP session established",
+                        flow_id,
+                    );
                     break;
                 }
                 SessionEvent::Disconnected => {

@@ -256,6 +256,10 @@ The disconnect event fires **once per connection cycle** — if the RTSP server 
 | info | WHEP disconnected | WHEP client input disconnected |
 | info | WHEP viewer connected | New WHEP viewer joined an output |
 | info | WHEP viewer disconnected | WHEP viewer left an output |
+| info | WHIP session established | WHIP client output completed ICE+DTLS to the remote endpoint |
+| info | WHIP client disconnected | WHIP client output lost its established session |
+| warning | WHIP signaling failed: {error} | WHIP output SDP POST returned non-201 or the connect failed (e.g. TCP to the endpoint filtered); {error} carries the HTTP status + body from `whip_post`, or the connect error |
+| warning | WHEP signaling failed: {error} | WHEP client input SDP POST returned non-201 or the connect failed; {error} carries the HTTP status + body, or the connect error |
 | warning | WebRTC session failed: {error} | ICE failure, DTLS error, or session creation error |
 | warning | WebRTC session creation failed: {error} | Output session could not be created |
 
