@@ -75,6 +75,15 @@
 #   BILBYCAST_PTP_RUN_DIR      PID dir (default /var/run/bilbycast-ptp)
 #   BILBYCAST_PTP_LOG_DIR      log dir (default /var/log/bilbycast-ptp)
 #   BILBYCAST_PTP_CONF         ptp4l config TEMPLATE path (default ./bilbycast-ptp-gm.conf)
+#   BILBYCAST_PTP_KEEP_NTP     =1 to NOT stop NTP daemons in slave mode (you then
+#                              guarantee single CLOCK_REALTIME ownership yourself)
+#   BILBYCAST_PTP_SYSCLOCK     slave-mode system-clock owner: "ptp" (default —
+#                              phc2sys slaves CLOCK_REALTIME to the fabric GM,
+#                              NTP stopped) or "ntp" (DECOUPLE — ptp4l still
+#                              slaves the NIC PHC to the fabric GM for media/PTP
+#                              lock, but phc2sys is NOT started and NTP/chrony
+#                              keeps owning CLOCK_REALTIME; use when the GM's
+#                              wall-time is wrong/untrusted. Implies keep-NTP.)
 
 set -u
 set -o pipefail
@@ -99,6 +108,7 @@ IFACE_FILE="$RUN_DIR/iface"
 MODE_FILE="$RUN_DIR/mode"
 ROLE_FILE="$RUN_DIR/role"
 DOMAIN_FILE="$RUN_DIR/domain"
+SYSCLOCK_FILE="$RUN_DIR/sysclock"
 NTP_MARKER="$RUN_DIR/ntp-units-stopped"
 
 # Pull defaults from /etc/default/bilbycast-ptp when the systemd unit
@@ -110,6 +120,27 @@ fi
 
 log()  { echo "[bilbycast-ptp-gm] $*" >&2; }
 fail() { log "ERROR: $*"; exit 1; }
+
+# ── System-clock ownership in slave mode (decouple knob) ──────────────
+# Who owns CLOCK_REALTIME when this node is a PTP *slave* on a HW-PTP NIC:
+#   ptp (default) — phc2sys disciplines CLOCK_REALTIME from the fabric PHC;
+#                   NTP daemons are stopped (the fabric GM owns wall time).
+#   ntp           — DECOUPLE. ptp4l still slaves the NIC PHC to the fabric GM
+#                   (ST 2110 / MXL / PCR keep their PTP frequency+phase lock),
+#                   but phc2sys is NOT started and NTP/chrony keeps owning
+#                   CLOCK_REALTIME. Use when the fabric GM's wall time is
+#                   wrong/untrusted — otherwise a bad GM steps the system clock
+#                   and breaks TLS/HTTPS/manager. Implies keep-NTP.
+BILBYCAST_PTP_SYSCLOCK="${BILBYCAST_PTP_SYSCLOCK:-ptp}"
+case "$BILBYCAST_PTP_SYSCLOCK" in
+    ptp|ntp) ;;
+    *) log "WARNING: BILBYCAST_PTP_SYSCLOCK='$BILBYCAST_PTP_SYSCLOCK' invalid — using 'ptp'"
+       BILBYCAST_PTP_SYSCLOCK=ptp ;;
+esac
+# Decoupling means NTP must keep owning CLOCK_REALTIME → never stop NTP.
+if [ "$BILBYCAST_PTP_SYSCLOCK" = "ntp" ]; then
+    BILBYCAST_PTP_KEEP_NTP=1
+fi
 
 need_root() {
     [ "$(id -u)" -eq 0 ] || fail "this subcommand needs root (re-run with sudo) — runtime privileges are dropped under the systemd unit (CAP_NET_RAW + CAP_NET_ADMIN ambient caps)"
@@ -205,9 +236,15 @@ EOF
 # clock control in provisioning.
 stop_ntp_for_slave() {
     if [ "${BILBYCAST_PTP_KEEP_NTP:-0}" = "1" ]; then
-        log "BILBYCAST_PTP_KEEP_NTP=1 — leaving NTP daemons running."
-        log "WARNING: ensure only ONE servo adjusts CLOCK_REALTIME (timemaster(8)"
-        log "         or chrony without clock control) or pacing WILL degrade."
+        if [ "${BILBYCAST_PTP_SYSCLOCK:-ptp}" = "ntp" ]; then
+            log "SYSCLOCK=ntp — leaving NTP/chrony as the sole CLOCK_REALTIME owner."
+            log "  phc2sys will NOT be started, so nothing fights chrony; ptp4l still"
+            log "  disciplines the NIC PHC from the fabric GM (media keeps its PTP lock)."
+        else
+            log "BILBYCAST_PTP_KEEP_NTP=1 — leaving NTP daemons running."
+            log "WARNING: ensure only ONE servo adjusts CLOCK_REALTIME (timemaster(8)"
+            log "         or chrony without clock control) or pacing WILL degrade."
+        fi
         return 0
     fi
     local stopped=""
@@ -577,7 +614,28 @@ cmd_start() {
     #     daemons MUST NOT also control the clock. We warn loudly; the
     #     operator disables chrony or integrates both under one servo
     #     with timemaster(8).
-    if [ "$mode" = "hw" ]; then
+    #
+    # DECOUPLE (BILBYCAST_PTP_SYSCLOCK=ntp): skip phc2sys entirely for a
+    # slave. ptp4l already disciplines the NIC PHC from the fabric GM, so
+    # NOT running phc2sys leaves CLOCK_REALTIME to NTP/chrony — a wrong-time
+    # GM then cannot step the system clock (which would break TLS / HTTPS /
+    # the manager connection). The media path is unaffected: it reads the
+    # PHC + /var/run/ptp4l, both still slaved to the GM.
+    local skip_phc2sys=0
+    if [ "$role" = "slave-only" ] && [ "$BILBYCAST_PTP_SYSCLOCK" = "ntp" ]; then
+        skip_phc2sys=1
+        log "SYSCLOCK=ntp: NOT starting phc2sys — CLOCK_REALTIME stays owned by NTP/chrony."
+        log "  ptp4l alone disciplines the $iface PHC from the fabric GM (ST2110/MXL/PCR keep PTP lock)."
+        log "  The fabric GM's wall time is intentionally IGNORED for the system clock."
+        if [ "$mode" != "hw" ]; then
+            log "  WARNING: $iface is in SOFTWARE-timestamping mode — ptp4l (-S) disciplines"
+            log "           CLOCK_REALTIME directly, so the decouple CANNOT hold. Use a HW-PTP"
+            log "           NIC (or fix the GM's time) if the system clock must stay on NTP."
+        fi
+    fi
+    echo "$BILBYCAST_PTP_SYSCLOCK" > "$SYSCLOCK_FILE" 2>/dev/null || true
+
+    if [ "$mode" = "hw" ] && [ "$skip_phc2sys" = "0" ]; then
         case "$role" in
             grandmaster)
                 # -n <domain> is REQUIRED: phc2sys's management client
@@ -626,7 +684,7 @@ cmd_stop() {
     stop_pid "$PHC2SYS_PID" phc2sys
     stop_pid "$PTP4L_PID"   ptp4l
     restore_ntp_if_stopped
-    rm -f "$IFACE_FILE" "$MODE_FILE" "$ROLE_FILE" "$DOMAIN_FILE" "$STAGED_CONF"
+    rm -f "$IFACE_FILE" "$MODE_FILE" "$ROLE_FILE" "$DOMAIN_FILE" "$SYSCLOCK_FILE" "$STAGED_CONF"
     log "stopped"
 }
 
@@ -645,6 +703,8 @@ cmd_status() {
     fi
     if is_running "$PHC2SYS_PID"; then
         printf "  %-15s : running (pid %s)\n" "phc2sys" "$(cat "$PHC2SYS_PID")"
+    elif [ "$(cat "$SYSCLOCK_FILE" 2>/dev/null)" = "ntp" ] && [ "$role" = "slave-only" ]; then
+        printf "  %-15s : n/a (SYSCLOCK=ntp — NTP/chrony owns CLOCK_REALTIME; PHC slaved by ptp4l)\n" "phc2sys"
     elif [ "$mode" = "hw" ]; then
         printf "  %-15s : STOPPED (expected running in HW mode)\n" "phc2sys"
     else
