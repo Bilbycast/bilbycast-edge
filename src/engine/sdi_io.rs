@@ -1,11 +1,29 @@
 //! SDI capture I/O via Blackmagic DeckLink (mirrors `mxl_video_io.rs`).
 //!
 //! Input: captures packed 4:2:2 video (+ embedded PCM audio) from a DeckLink
-//! card via `decklink-rs` (FFmpeg's `decklink` avdevice), unpacks UYVY422 to
-//! planar YUV, encodes to H.264/HEVC, muxes into MPEG-TS, and publishes onto
-//! the flow's broadcast channel. Mirrors the MXL / ST 2110-20 ingress encoder
-//! path. Unlike MXL, a single device handle carries both video and audio, so
-//! this task owns the whole A+V mux.
+//! card via `decklink-rs` (the Blackmagic SDK), unpacks UYVY422 to planar YUV,
+//! encodes to H.264/HEVC, muxes into MPEG-TS, and publishes onto the flow's
+//! broadcast channel. Mirrors the MXL / ST 2110-20 ingress encoder path. Unlike
+//! MXL, a single device handle carries both video and audio, so this task owns
+//! the whole A+V mux.
+//!
+//! # Resilience
+//!
+//! Three distinct failure modes, deliberately handled differently:
+//!
+//! * **Signal loss** (cable pulled, source rebooted, format mismatch). The card
+//!   keeps delivering frames, flagged `signal_present = false`. We keep encoding
+//!   them — holding the transport stream up is what downstream wants — but raise
+//!   a Warning, and an Info when the signal returns. This is the common case and
+//!   it does *not* restart anything.
+//! * **Raster change**, or the device disappearing entirely. The session is torn
+//!   down, a Warning is raised, and the device is re-opened (with
+//!   `format: "auto"` that re-detects the new raster). The MPEG-TS muxer and the
+//!   video/audio clocks persist across re-opens so downstream never sees the PCR
+//!   or continuity counters step backwards.
+//! * **Unrecoverable config** — an unsupported pixel format or chroma, or an
+//!   encoder that will not open. These stop the input, since re-opening would
+//!   just spin.
 //!
 //! Playout (SDI output) lands with `DecklinkPlayout` in a follow-up.
 
@@ -229,6 +247,148 @@ async fn run_sdi_input(
     info!(target: "sdi.in", "{ctx}: capture loop exited");
 }
 
+/// Delay before re-opening the device after a capture session ends. The
+/// DeckLink driver needs a moment to release the input before it can be
+/// re-acquired, and this also bounds the retry rate on a dead device.
+#[cfg(feature = "media-codecs")]
+const SDI_REOPEN_BACKOFF: Duration = Duration::from_millis(500);
+
+/// Build the per-session embedded-audio encode state.
+///
+/// Best-effort by design: an unsupported codec or a failed encoder init warns
+/// and returns `None` so the flow continues video-only rather than dying.
+///
+/// `start_pts_90khz` lets audio timestamps continue across a device re-open, so
+/// downstream never sees the audio clock jump backwards.
+#[cfg(feature = "media-codecs")]
+#[allow(clippy::too_many_arguments)]
+fn setup_audio(
+    ctx: &str,
+    config: &SdiInputConfig,
+    input_id: &str,
+    flow_id: &str,
+    cap: &DecklinkCapture,
+    cancel: &CancellationToken,
+    event_sender: &EventSender,
+    ts_mux: &mut crate::engine::rtmp::ts_mux::TsMuxer,
+    ts_audio_configured: &mut bool,
+    start_pts_90khz: u64,
+) -> Option<SdiAudio> {
+    if config.audio_channels == 0 || cap.audio_channels() == 0 || cap.audio_sample_rate() == 0 {
+        return None;
+    }
+
+    let acodec = config
+        .audio_encode
+        .as_ref()
+        .and_then(|a| AudioCodec::parse(&a.codec))
+        .unwrap_or(AudioCodec::AacLc);
+
+    if !matches!(
+        acodec,
+        AudioCodec::AacLc | AudioCodec::HeAacV1 | AudioCodec::HeAacV2
+    ) {
+        event_sender.emit(
+            EventSeverity::Warning,
+            category::FLOW,
+            format!(
+                "{ctx}: audio_encode.codec '{}' is not supported on an SDI input \
+                 (AAC family only) — continuing video-only \
+                 (error_code: sdi_audio_codec_unsupported)",
+                acodec.as_str()
+            ),
+        );
+        return None;
+    }
+
+    let ach = cap.audio_channels();
+    let ahz = cap.audio_sample_rate();
+    let bitrate = config
+        .audio_encode
+        .as_ref()
+        .and_then(|a| a.bitrate_kbps)
+        .unwrap_or_else(|| acodec.default_bitrate_kbps());
+
+    let params = EncoderParams {
+        codec: acodec,
+        sample_rate: ahz,
+        channels: ach,
+        target_bitrate_kbps: bitrate,
+        target_sample_rate: ahz,
+        target_channels: ach,
+        opus_vbr_mode: None,
+        opus_fec: false,
+        opus_dtx: false,
+        opus_frame_duration_ms: None,
+    };
+    // `AudioEncoder::spawn` wants an OutputStatsAccumulator; this input has no
+    // output identity, so give it a synthetic one (as `input_pcm_encode` does).
+    let encoder_stats = Arc::new(OutputStatsAccumulator::new(
+        format!("sdi-input-encode:{input_id}"),
+        "sdi-input-encode".to_string(),
+        "synthetic".to_string(),
+    ));
+
+    match AudioEncoder::spawn(
+        params,
+        cancel.clone(),
+        flow_id.to_string(),
+        input_id.to_string(),
+        encoder_stats,
+        None,
+    ) {
+        Ok(encoder) => {
+            // AAC in ADTS => stream_type 0x0F, no registration descriptor. Only
+            // stamp the PMT once: re-declaring it on every re-open would churn
+            // the PMT version for no reason.
+            if !*ts_audio_configured {
+                ts_mux.set_has_audio(true);
+                ts_mux.set_audio_stream(0x0F, None);
+                *ts_audio_configured = true;
+            }
+            event_sender.emit(
+                EventSeverity::Info,
+                category::FLOW,
+                format!(
+                    "{ctx}: embedded audio {ach}ch @ {ahz} Hz -> {} {bitrate} kbps \
+                     (error_code: sdi_audio_started)",
+                    acodec.as_str()
+                ),
+            );
+            Some(SdiAudio {
+                encoder,
+                planar: vec![Vec::new(); ach as usize],
+                pts_90khz: start_pts_90khz,
+                sample_rate: ahz,
+                channels: ach,
+            })
+        }
+        Err(e) => {
+            tracing::error!(target: "sdi.in", "{ctx}: audio encoder init failed: {e}");
+            event_sender.emit(
+                EventSeverity::Warning,
+                category::FLOW,
+                format!(
+                    "{ctx}: audio encoder init failed: {e} — continuing video-only \
+                     (error_code: sdi_audio_encoder_init_failed)"
+                ),
+            );
+            None
+        }
+    }
+}
+
+/// Why a capture session ended.
+#[cfg(feature = "media-codecs")]
+enum SessionEnd {
+    /// Flow is shutting down — do not re-open.
+    Cancelled,
+    /// The device errored, or the source raster changed. Re-open and carry on.
+    Retry,
+    /// Unrecoverable (encoder cannot open). Give up; a re-open would spin.
+    Fatal,
+}
+
 #[cfg(feature = "media-codecs")]
 #[allow(clippy::too_many_arguments)]
 fn sdi_input_blocking_loop(
@@ -241,8 +401,7 @@ fn sdi_input_blocking_loop(
     cancel: &CancellationToken,
     event_sender: &EventSender,
 ) {
-    use crate::engine::video_encode_util::ScaledVideoEncoder;
-
+    // ── configuration checks (fatal — re-opening would never fix these) ──
     let pixel_format = match config.pixel_format.as_str() {
         "v210" => DecklinkPixelFormat::V210,
         _ => DecklinkPixelFormat::Uyvy422,
@@ -258,66 +417,11 @@ fn sdi_input_blocking_loop(
         return;
     }
 
-    let cap_cfg = DecklinkCaptureConfig {
-        device: config.device.clone(),
-        format: config.format.clone(),
-        pixel_format,
-        audio_channels: config.audio_channels,
-        audio_sample_rate: 48_000,
-    };
-
-    // Retry the device open until a signal locks or the flow is cancelled.
-    let mut cap = loop {
-        if cancel.is_cancelled() {
-            return;
-        }
-        match DecklinkCapture::open(cap_cfg.clone()) {
-            Ok(c) => break c,
-            Err(e) => {
-                debug!(target: "sdi.in", "{ctx}: open failed: {e}, retrying");
-                std::thread::sleep(Duration::from_millis(500));
-            }
-        }
-    };
-
-    let (width, height) = cap.video_dimensions();
-    let (fr_num, fr_den) = cap.video_frame_rate();
-    event_sender.emit(
-        EventSeverity::Info,
-        category::FLOW,
-        format!("{ctx}: capture opened {width}x{height} @ {fr_num}/{fr_den} (error_code: sdi_capture_opened)"),
-    );
-
     let enc = &config.video_encode;
-    let enc_cfg = match crate::engine::st2110_video_io::build_encoder_config(
-        enc, width, height, fr_num, fr_den,
-    ) {
-        Ok(c) => c,
-        Err(e) => {
-            // Log as well as emit: the event only reaches a connected manager,
-            // so a standalone edge would otherwise fail silently here.
-            tracing::error!(target: "sdi.in", "{ctx}: encoder config failed: {e}");
-            event_sender.emit(
-                EventSeverity::Critical,
-                category::FLOW,
-                format!("{ctx}: encoder config failed: {e} (error_code: sdi_encode_config_failed)"),
-            );
-            return;
-        }
-    };
 
-    let mut pipeline = ScaledVideoEncoder::new(
-        enc.clone(),
-        enc_cfg.codec,
-        fr_num,
-        fr_den,
-        false,
-        format!("SDI input:{ctx}"),
-    );
-
-    // Unpack UYVY422 straight into the encoder's own input layout so the
-    // planes pass through verbatim (no libswscale) AND a 4:2:0 encoder never
-    // silently misreads 4:2:2 chroma planes.
+    // Unpack UYVY422 straight into the encoder's own input layout so the planes
+    // pass through verbatim (no libswscale) AND a 4:2:0 encoder never silently
+    // misreads 4:2:2 chroma planes.
     let target_chroma = crate::engine::video_encode_util::resolve_chroma(enc.chroma.as_deref());
     let bit_depth = enc.bit_depth.unwrap_or(8);
     let chroma_420 = match (target_chroma, bit_depth) {
@@ -334,112 +438,201 @@ fn sdi_input_blocking_loop(
             return;
         }
     };
-    let src_pix_fmt = video_engine::av_pix_fmt_for_yuv(target_chroma, bit_depth);
+    let Some(src_pix_fmt) = video_engine::av_pix_fmt_for_yuv(target_chroma, bit_depth) else {
+        let msg = format!(
+            "{ctx}: no FFmpeg pixel format for chroma={target_chroma:?} bit_depth={bit_depth} \
+             (error_code: sdi_encode_chroma_unsupported)"
+        );
+        tracing::error!(target: "sdi.in", "{msg}");
+        event_sender.emit(EventSeverity::Critical, category::FLOW, msg);
+        return;
+    };
 
+    let cap_cfg = DecklinkCaptureConfig {
+        device: config.device.clone(),
+        format: config.format.clone(),
+        pixel_format,
+        audio_channels: config.audio_channels,
+        audio_sample_rate: 48_000,
+    };
+
+    // ── state that must survive a device re-open ──
+    // Re-creating the muxer or resetting timestamps on every reconnect would
+    // step the PCR/PTS backwards and reset continuity counters, which receivers
+    // see as a stream fault. Keep them across sessions.
     let mut ts_mux = crate::engine::rtmp::ts_mux::TsMuxer::new();
     ts_mux.set_has_video(true);
+    let mut ts_audio_configured = false;
+    let mut pts: i64 = 0;
+    let mut audio_pts_90khz: u64 = 0;
+    let mut session: u64 = 0;
 
-    // ── embedded SDI audio ────────────────────────────────────────────────
-    // One DeckLink handle carries video *and* embedded PCM, so this task also
-    // encodes the audio and muxes it into the same TS. Audio failures are
-    // non-fatal: we warn and continue video-only rather than kill the flow.
-    let mut audio: Option<SdiAudio> = None;
-    if config.audio_channels > 0 && cap.audio_channels() > 0 && cap.audio_sample_rate() > 0 {
-        let acodec = config
-            .audio_encode
-            .as_ref()
-            .and_then(|a| AudioCodec::parse(&a.codec))
-            .unwrap_or(AudioCodec::AacLc);
+    // ── supervision loop: one iteration == one capture session ──
+    // A cable pull, a source reboot or a raster change are routine in a
+    // broadcast plant, so they must not kill the input task.
+    loop {
+        if cancel.is_cancelled() {
+            break;
+        }
+        session += 1;
 
-        if !matches!(
-            acodec,
-            AudioCodec::AacLc | AudioCodec::HeAacV1 | AudioCodec::HeAacV2
+        let Some(cap) = open_capture(ctx, &cap_cfg, session, cancel, event_sender) else {
+            break; // cancelled while retrying
+        };
+
+        match run_capture_session(
+            ctx,
+            config,
+            input_id,
+            flow_id,
+            cap,
+            session,
+            chroma_420,
+            src_pix_fmt,
+            &mut ts_mux,
+            &mut ts_audio_configured,
+            &mut pts,
+            &mut audio_pts_90khz,
+            broadcast_tx,
+            flow_stats,
+            cancel,
+            event_sender,
         ) {
-            event_sender.emit(
-                EventSeverity::Warning,
-                category::FLOW,
-                format!(
-                    "{ctx}: audio_encode.codec '{}' is not supported on an SDI input \
-                     (AAC family only) — continuing video-only \
-                     (error_code: sdi_audio_codec_unsupported)",
-                    acodec.as_str()
-                ),
-            );
-        } else {
-            let ach = cap.audio_channels();
-            let ahz = cap.audio_sample_rate();
-            let bitrate = config
-                .audio_encode
-                .as_ref()
-                .and_then(|a| a.bitrate_kbps)
-                .unwrap_or_else(|| acodec.default_bitrate_kbps());
-
-            let params = EncoderParams {
-                codec: acodec,
-                sample_rate: ahz,
-                channels: ach,
-                target_bitrate_kbps: bitrate,
-                target_sample_rate: ahz,
-                target_channels: ach,
-                opus_vbr_mode: None,
-                opus_fec: false,
-                opus_dtx: false,
-                opus_frame_duration_ms: None,
-            };
-            // `AudioEncoder::spawn` wants an OutputStatsAccumulator; this input
-            // has no output identity, so give it a synthetic one (same trick
-            // `input_pcm_encode` uses).
-            let encoder_stats = Arc::new(OutputStatsAccumulator::new(
-                format!("sdi-input-encode:{input_id}"),
-                "sdi-input-encode".to_string(),
-                "synthetic".to_string(),
-            ));
-            match AudioEncoder::spawn(
-                params,
-                cancel.clone(),
-                flow_id.to_string(),
-                input_id.to_string(),
-                encoder_stats,
-                None,
-            ) {
-                Ok(encoder) => {
-                    // AAC in ADTS => stream_type 0x0F, no registration descriptor.
-                    ts_mux.set_has_audio(true);
-                    ts_mux.set_audio_stream(0x0F, None);
-                    audio = Some(SdiAudio {
-                        encoder,
-                        planar: vec![Vec::new(); ach as usize],
-                        pts_90khz: 0,
-                        sample_rate: ahz,
-                        channels: ach,
-                    });
-                    event_sender.emit(
-                        EventSeverity::Info,
-                        category::FLOW,
-                        format!(
-                            "{ctx}: embedded audio {ach}ch @ {ahz} Hz -> {} {bitrate} kbps \
-                             (error_code: sdi_audio_started)",
-                            acodec.as_str()
-                        ),
-                    );
+            SessionEnd::Cancelled | SessionEnd::Fatal => break,
+            SessionEnd::Retry => {
+                if cancel.is_cancelled() {
+                    break;
                 }
-                Err(e) => {
-                    tracing::error!(target: "sdi.in", "{ctx}: audio encoder init failed: {e}");
+                std::thread::sleep(SDI_REOPEN_BACKOFF);
+            }
+        }
+    }
+}
+
+/// Open the DeckLink input, retrying until it succeeds or the flow is cancelled.
+///
+/// Emits one Warning on the first failure of a session (so an operator sees a
+/// pulled cable) and then stays quiet, to avoid flooding the event bus while a
+/// device is unplugged.
+#[cfg(feature = "media-codecs")]
+fn open_capture(
+    ctx: &str,
+    cap_cfg: &DecklinkCaptureConfig,
+    session: u64,
+    cancel: &CancellationToken,
+    event_sender: &EventSender,
+) -> Option<DecklinkCapture> {
+    let mut announced = false;
+    loop {
+        if cancel.is_cancelled() {
+            return None;
+        }
+        match DecklinkCapture::open(cap_cfg.clone()) {
+            Ok(c) => {
+                let (w, h) = c.video_dimensions();
+                let (n, d) = c.video_frame_rate();
+                info!(
+                    target: "sdi.in",
+                    "{ctx}: capture opened {w}x{h} @ {n}/{d} (session {session})"
+                );
+                event_sender.emit(
+                    EventSeverity::Info,
+                    category::FLOW,
+                    format!(
+                        "{ctx}: capture opened {w}x{h} @ {n}/{d} (session {session}) \
+                         (error_code: sdi_capture_opened)"
+                    ),
+                );
+                return Some(c);
+            }
+            Err(e) => {
+                if !announced {
+                    announced = true;
+                    tracing::warn!(target: "sdi.in", "{ctx}: capture open failed: {e}; retrying");
                     event_sender.emit(
                         EventSeverity::Warning,
                         category::FLOW,
                         format!(
-                            "{ctx}: audio encoder init failed: {e} — continuing video-only \
-                             (error_code: sdi_audio_encoder_init_failed)"
+                            "{ctx}: capture open failed: {e} — retrying until the device \
+                             returns (error_code: sdi_capture_open_failed)"
                         ),
                     );
+                } else {
+                    debug!(target: "sdi.in", "{ctx}: open failed: {e}, retrying");
                 }
+                std::thread::sleep(SDI_REOPEN_BACKOFF);
             }
         }
     }
+}
 
-    let pts_step = 90_000u64 * fr_den as u64 / fr_num.max(1) as u64;
-    let mut pts: i64 = 0;
+/// Drive one capture session to completion, returning why it ended.
+#[cfg(feature = "media-codecs")]
+#[allow(clippy::too_many_arguments)]
+fn run_capture_session(
+    ctx: &str,
+    config: &SdiInputConfig,
+    input_id: &str,
+    flow_id: &str,
+    mut cap: DecklinkCapture,
+    session: u64,
+    chroma_420: bool,
+    src_pix_fmt: i32,
+    ts_mux: &mut crate::engine::rtmp::ts_mux::TsMuxer,
+    ts_audio_configured: &mut bool,
+    pts: &mut i64,
+    audio_pts_90khz: &mut u64,
+    broadcast_tx: &broadcast::Sender<RtpPacket>,
+    flow_stats: &Arc<FlowStatsAccumulator>,
+    cancel: &CancellationToken,
+    event_sender: &EventSender,
+) -> SessionEnd {
+    use crate::engine::video_encode_util::ScaledVideoEncoder;
+
+    let (width, height) = cap.video_dimensions();
+    let (fr_num, fr_den) = cap.video_frame_rate();
+    let enc = &config.video_encode;
+
+    let enc_cfg = match crate::engine::st2110_video_io::build_encoder_config(
+        enc, width, height, fr_num, fr_den,
+    ) {
+        Ok(c) => c,
+        Err(e) => {
+            // Log as well as emit: the event only reaches a connected manager,
+            // so a standalone edge would otherwise fail silently here.
+            tracing::error!(target: "sdi.in", "{ctx}: encoder config failed: {e}");
+            event_sender.emit(
+                EventSeverity::Critical,
+                category::FLOW,
+                format!("{ctx}: encoder config failed: {e} (error_code: sdi_encode_config_failed)"),
+            );
+            return SessionEnd::Fatal;
+        }
+    };
+
+    let mut pipeline = ScaledVideoEncoder::new(
+        enc.clone(),
+        enc_cfg.codec,
+        fr_num,
+        fr_den,
+        false,
+        format!("SDI input:{ctx}"),
+    );
+
+    let mut audio = setup_audio(
+        ctx,
+        config,
+        input_id,
+        flow_id,
+        &cap,
+        cancel,
+        event_sender,
+        ts_mux,
+        ts_audio_configured,
+        *audio_pts_90khz,
+    );
+
+    let pts_step = (90_000u64 * fr_den as u64 / fr_num.max(1) as u64) as i64;
 
     let w = width as usize;
     let h = height as usize;
@@ -453,31 +646,91 @@ fn sdi_input_blocking_loop(
         EventSeverity::Info,
         category::FLOW,
         format!(
-            "{ctx}: capture→encode pipeline started (codec={})",
+            "{ctx}: capture→encode pipeline started (session {session}, codec={})",
             enc.codec
         ),
     );
 
+    // Make sure the audio clock is carried back out even on an early return.
+    macro_rules! save_audio_pts {
+        () => {
+            if let Some(a) = audio.as_ref() {
+                *audio_pts_90khz = a.pts_90khz;
+            }
+        };
+    }
+
+    // `None` until the first frame tells us whether the input is locked.
+    let mut signal_present: Option<bool> = None;
+
     loop {
         if cancel.is_cancelled() {
-            break;
+            save_audio_pts!();
+            return SessionEnd::Cancelled;
         }
         match cap.read_frame() {
             Ok(CapturedFrame::Video(vf)) => {
+                // A raster change means the scratch planes and the encoder are
+                // sized for the wrong geometry. Tear the session down and
+                // re-open: with `format: "auto"` that re-detects the new raster.
+                if vf.width != width || vf.height != height {
+                    save_audio_pts!();
+                    tracing::warn!(
+                        target: "sdi.in",
+                        "{ctx}: source raster changed {width}x{height} -> {}x{}; restarting capture",
+                        vf.width, vf.height,
+                    );
+                    event_sender.emit(
+                        EventSeverity::Warning,
+                        category::FLOW,
+                        format!(
+                            "{ctx}: source raster changed {width}x{height} -> {}x{} — restarting \
+                             capture (error_code: sdi_raster_changed)",
+                            vf.width, vf.height,
+                        ),
+                    );
+                    return SessionEnd::Retry;
+                }
+
+                // Signal presence comes straight from the card
+                // (`bmdFrameHasNoInputSource`). Alarm on the transition, but keep
+                // encoding: the card substitutes bars/black, and holding the TS up
+                // is what downstream decoders and sockets want.
+                match (signal_present, vf.signal_present) {
+                    (Some(true), false) | (None, false) => {
+                        tracing::warn!(target: "sdi.in", "{ctx}: SDI input signal lost");
+                        event_sender.emit(
+                            EventSeverity::Warning,
+                            category::FLOW,
+                            format!(
+                                "{ctx}: SDI input signal lost — no source locked; continuing to \
+                                 emit the card's bars/black (error_code: sdi_signal_lost)"
+                            ),
+                        );
+                    }
+                    (Some(false), true) => {
+                        info!(target: "sdi.in", "{ctx}: SDI input signal restored");
+                        event_sender.emit(
+                            EventSeverity::Info,
+                            category::FLOW,
+                            format!(
+                                "{ctx}: SDI input signal restored (error_code: sdi_signal_restored)"
+                            ),
+                        );
+                    }
+                    _ => {}
+                }
+                signal_present = Some(vf.signal_present);
+
                 // Defensive: `unpack_uyvy422` slices rows directly, so a short or
-                // unexpectedly-strided frame from the driver would panic and kill
-                // this input task. Skip the frame instead — a dropped frame is
-                // always preferable to a dead flow.
+                // unexpectedly-strided frame would panic. Skip it — a dropped
+                // frame is always preferable to a dead flow.
                 let need = vf.stride.saturating_mul(height as usize);
-                if vf.width != width
-                    || vf.height != height
-                    || vf.stride < (width as usize) * 2
-                    || vf.data.len() < need
-                {
+                if vf.stride < w * 2 || vf.data.len() < need {
                     debug!(
                         target: "sdi.in",
-                        "{ctx}: skipping malformed frame ({}x{} stride={} len={}, expected {width}x{height} stride>={} len>={need})",
-                        vf.width, vf.height, vf.stride, vf.data.len(), (width as usize) * 2,
+                        "{ctx}: skipping malformed frame (stride={} len={}, need stride>={} len>={need})",
+                        vf.stride, vf.data.len(), w * 2,
                     );
                     continue;
                 }
@@ -493,25 +746,17 @@ fn sdi_input_blocking_loop(
                     &mut cr_plane,
                 );
 
-                let fmt = match src_pix_fmt {
-                    Some(f) => f,
-                    None => {
-                        debug!(target: "sdi.in", "{ctx}: no src pixel format for YUV422P8");
-                        continue;
-                    }
-                };
-
                 match pipeline.encode_raw_planes(
                     width,
                     height,
-                    fmt,
+                    src_pix_fmt,
                     &y_plane,
                     w,
                     &cb_plane,
                     cw,
                     &cr_plane,
                     cw,
-                    Some(pts),
+                    Some(*pts),
                 ) {
                     Ok(frames) => {
                         for ef in frames {
@@ -526,19 +771,22 @@ fn sdi_input_blocking_loop(
                     }
                     Err(e) => {
                         if !pipeline.is_open() {
+                            // The encoder itself will not open (bad params, no
+                            // GPU session). Re-opening the device would spin.
+                            save_audio_pts!();
                             tracing::error!(target: "sdi.in", "{ctx}: encoder open failed: {e}");
                             event_sender.emit(
                                 EventSeverity::Critical,
                                 category::FLOW,
                                 format!("{ctx}: encoder open failed: {e} (error_code: sdi_encode_failed)"),
                             );
-                            break;
+                            return SessionEnd::Fatal;
                         }
                         debug!(target: "sdi.in", "{ctx}: encode error: {e}");
                     }
                 }
 
-                pts += pts_step as i64;
+                *pts += pts_step;
             }
             Ok(CapturedFrame::Audio(af)) => {
                 let Some(a) = audio.as_mut() else { continue };
@@ -577,8 +825,19 @@ fn sdi_input_blocking_loop(
                 }
             }
             Err(e) => {
-                debug!(target: "sdi.in", "{ctx}: capture ended: {e}");
-                break;
+                // Device error / stream ended — most often a pulled cable or a
+                // source reboot. Surface it and re-open rather than dying.
+                save_audio_pts!();
+                tracing::warn!(target: "sdi.in", "{ctx}: capture ended: {e}; reopening");
+                event_sender.emit(
+                    EventSeverity::Warning,
+                    category::FLOW,
+                    format!(
+                        "{ctx}: capture ended: {e} — reopening device \
+                         (error_code: sdi_capture_lost)"
+                    ),
+                );
+                return SessionEnd::Retry;
             }
         }
     }

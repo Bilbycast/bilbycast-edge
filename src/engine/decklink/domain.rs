@@ -1,7 +1,7 @@
 //! DeckLink device probe + process-wide manager (mirrors `engine::mxl::domain`).
 //!
-//! The boot probe (run in `main.rs`) enumerates DeckLink devices via FFmpeg's
-//! avdevice layer. On success the `sdi-decklink` capability bit joins
+//! The boot probe (run in `main.rs`) enumerates DeckLink devices via the
+//! Blackmagic DeckLink SDK. On success the `sdi-decklink` capability bit joins
 //! `HealthPayload.capabilities` and the flow spawn arms can resolve the
 //! manager via [`global`]. Unlike libmxl, there is no persistent native handle
 //! to own — the manager just holds the enumerated device list for validation
@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use tracing::info;
+use tracing::{info, warn};
 
 /// Set to `true` by [`DecklinkDeviceManager::probe`] on success. Read when
 /// deciding whether to advertise the `sdi-decklink` capability bit.
@@ -28,8 +28,8 @@ pub fn probe_succeeded() -> bool {
 }
 
 /// Process-wide handle installed at boot; the flow spawn arms look it up when
-/// wiring an SDI input. `None` means no DeckLink device (or an FFmpeg without
-/// `--enable-decklink`), so the spawn arm refuses the flow.
+/// wiring an SDI input. `None` means Desktop Video is not installed (no
+/// `libDeckLinkAPI.so`), so the spawn arm refuses the flow.
 static GLOBAL_DECKLINK_MANAGER: OnceLock<Arc<DecklinkDeviceManager>> = OnceLock::new();
 
 /// Install the manager returned by [`DecklinkDeviceManager::probe`]. Called
@@ -50,38 +50,45 @@ pub struct DecklinkDeviceManager {
 }
 
 impl DecklinkDeviceManager {
-    /// Enumerate DeckLink devices via FFmpeg's avdevice layer. Returns `None`
-    /// when none are visible so callers can gate the SDI capability and the
-    /// spawn arms refuse gracefully (parallels `MxlDomainManager::probe`
-    /// returning `None` when libmxl is missing).
+    /// Enumerate DeckLink devices via the SDK.
+    ///
+    /// `enumerate_devices` is infallible: it yields an empty list when Desktop
+    /// Video is not installed or no card is fitted. Both are reported as a
+    /// successful probe with zero devices rather than `None`, because the
+    /// capture task — not the boot probe — is the authority on whether a device
+    /// can be opened. A `None` here would refuse a flow on a host whose card
+    /// appears after boot (hot-plugged Thunderbolt, delayed driver load).
     pub fn probe() -> Option<Arc<Self>> {
-        // NOTE(decklink-enumerate-wedge): `enumerate_devices()` currently
-        // wedges the DeckLink device for the lifetime of the process —
-        // FFmpeg's decklink discovery API is not fully released by
-        // `avdevice_free_list_devices`, so a later `DecklinkCapture::open` on
-        // the same device returns EIO. Since the enumeration is only used for
-        // capability display (never for capture), skip it at boot and
-        // advertise SDI availability whenever the feature is compiled in.
-        // Enumeration can be run on demand once the release path is fixed.
-        info!(
-            target: "sdi.decklink",
-            "SDI (DeckLink) capability enabled (device enumeration deferred — see decklink-enumerate-wedge)"
-        );
+        let devices = decklink_rs::enumerate_devices();
+
+        if devices.is_empty() {
+            warn!(
+                target: "sdi.decklink",
+                "SDI (DeckLink) capability enabled but no devices enumerated — \
+                 is Blackmagic Desktop Video installed and a card fitted?"
+            );
+        } else {
+            for d in &devices {
+                info!(target: "sdi.decklink", "  [{}] {}", d.index, d.name);
+            }
+            info!(
+                target: "sdi.decklink",
+                "SDI (DeckLink) capability enabled — {} device(s)",
+                devices.len()
+            );
+        }
+
         DECKLINK_PROBE_OK.store(true, Ordering::Relaxed);
-        Some(Arc::new(Self {
-            devices: Vec::new(),
-        }))
+        Some(Arc::new(Self { devices }))
     }
 
     /// The enumerated devices, for the hardware-capabilities payload.
     ///
-    /// **Currently always empty** — [`Self::probe`] skips enumeration (see
-    /// `decklink-enumerate-wedge`). Treat an empty list as "unknown", never as
-    /// "no devices present": the card is opened lazily by the capture task.
-    ///
-    /// Deliberately no `has_device()` helper: with enumeration deferred it
-    /// would report `false` for every real device and silently refuse valid
-    /// configs.
+    /// Deliberately no `has_device()` helper. Enumeration names are the SDK's
+    /// display names, while a config's `device` field may legitimately be an
+    /// index or a differently-spelled alias; gating a config on a name match
+    /// here would refuse valid setups. The capture task is the authority on
+    /// whether a device can be opened.
     pub fn devices(&self) -> &[decklink_rs::DecklinkDeviceInfo] {
         &self.devices
     }
