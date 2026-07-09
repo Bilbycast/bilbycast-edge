@@ -1387,6 +1387,7 @@ pub fn clock_identity_for_input(
         InputConfig::MxlAnc(c)   => ClockIdentity::Ptp { domain: c.clock_domain.unwrap_or(0) },
         // Wallclock-only inputs share the host clock.
         InputConfig::Webrtc(_) | InputConfig::Whep(_) => ClockIdentity::Wallclock,
+        InputConfig::Sdi(_) => ClockIdentity::Wallclock,
     }
 }
 
@@ -1520,7 +1521,8 @@ pub fn select_master_kind_for_input(
         | InputConfig::TestPattern(_)
         | InputConfig::Replay(_)
         | InputConfig::RtpAudio(_)
-        | InputConfig::Bonded(_) => MasterClockKind::Wallclock,
+        | InputConfig::Bonded(_)
+        | InputConfig::Sdi(_) => MasterClockKind::Wallclock,
         // ST 2110 + WebRTC handled above; arms here are for completeness
         // of the match (won't be reached).
         InputConfig::Webrtc(_) | InputConfig::Whep(_) => MasterClockKind::Wallclock,

@@ -177,6 +177,10 @@ fn populate_transport_info(input: &InputConfig, state: &mut MediaAnalysisState) 
             state.protocol = "mxl_anc".to_string();
             state.payload_format = "anc".to_string();
         }
+        InputConfig::Sdi(_) => {
+            state.protocol = "sdi".to_string();
+            state.payload_format = "h264_hevc_ts".to_string();
+        }
     }
 }
 

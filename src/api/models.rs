@@ -109,6 +109,7 @@ impl FlowSummary {
             Some(InputConfig::MxlVideo(_)) => ("mxl_video", false),
             Some(InputConfig::MxlAudio(_)) => ("mxl_audio", false),
             Some(InputConfig::MxlAnc(_)) => ("mxl_anc", false),
+            Some(InputConfig::Sdi(_)) => ("sdi", false),
             None => ("none", false),
         };
 

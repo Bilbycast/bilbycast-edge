@@ -103,6 +103,13 @@ video-codec = { path = "../bilbycast-ffmpeg-video-rs/video-codec", optional = tr
 # ────────────────────────────────────────────────────────────────────────
 mxl-rs = { path = "../bilbycast-mxl-rs/mxl-rs", optional = true }
 
+# ── SDI capture/playout via Blackmagic DeckLink (the `sdi-decklink` feature) ─
+# Wraps FFmpeg's libavdevice `decklink` in/out device (see
+# `bilbycast-decklink-rs`). Needs an FFmpeg built with --enable-decklink
+# against the proprietary Blackmagic SDK, so the resulting binary is
+# non-redistributable — intended for private on-prem deployment. Default OFF.
+decklink-rs = { path = "../bilbycast-decklink-rs/decklink-rs", optional = true }
+
 # System resource monitoring (CPU, RAM)
 sysinfo = "0.39.1"
 
@@ -356,6 +363,13 @@ display = [
 # footprint (clang + cmake + ninja + bison + flex + lld + GStreamer dev
 # + vcpkg + `CC=clang CXX=clang++`). Default OFF.
 mxl = ["dep:mxl-rs"]
+# SDI capture/playout via Blackmagic DeckLink (`sdi` input/output type).
+# Pulls the `decklink-rs` wrapper over FFmpeg's libavdevice decklink device.
+# The SDI input encodes captured video (video_encode required) + embedded
+# audio into one A+V MPEG-TS. Needs an --enable-decklink FFmpeg at build
+# time and a video-encoder-* backend. Default OFF. See
+# `bilbycast-decklink-rs/CLAUDE.md`.
+sdi-decklink = ["dep:decklink-rs"]
 # Skip the upstream libmxl C++ cmake build inside mxl-sys. bindgen still
 # generates dlopen-based FFI bindings from the vendored headers; the
 # resulting binary loads libmxl.so at runtime via `libloading`. Used by

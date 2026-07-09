@@ -167,6 +167,11 @@ pub async fn test_input(config: &InputConfig) -> TestResult {
                 format!("MXL ANC input domain={} flow={}", c.mxl.domain_path, c.mxl.flow_name),
                 start.elapsed(),
             ),
+            InputConfig::Sdi(c) => TestResult::ok(
+                "configured",
+                format!("SDI input device={}", c.device),
+                start.elapsed(),
+            ),
         }
     })
     .await;

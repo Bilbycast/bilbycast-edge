@@ -1630,6 +1630,14 @@ pub enum InputConfig {
     /// captions. PTP-required. Gated by the `mxl` Cargo feature.
     #[serde(rename = "mxl_anc")]
     MxlAnc(MxlAncInputConfig),
+    /// Capture SDI directly off a Blackmagic DeckLink card — packed 4:2:2
+    /// video + embedded PCM audio from one device handle, encoded to
+    /// H.264/HEVC and muxed into a single A+V MPEG-TS on the flow's
+    /// broadcast channel. Self-clocked (no PTP requirement, unlike MXL).
+    /// Gated by the `sdi-decklink` Cargo feature; requires a
+    /// `video-encoder-*` backend. See `bilbycast-decklink-rs`.
+    #[serde(rename = "sdi")]
+    Sdi(SdiInputConfig),
 }
 
 /// File-backed replay input. Reads MPEG-TS segments from a local
@@ -2083,6 +2091,7 @@ impl InputConfig {
             InputConfig::MxlVideo(_) => "mxl_video",
             InputConfig::MxlAudio(_) => "mxl_audio",
             InputConfig::MxlAnc(_) => "mxl_anc",
+            InputConfig::Sdi(_) => "sdi",
         }
     }
 
@@ -2139,6 +2148,9 @@ impl InputConfig {
             InputConfig::MxlAudio(c) => c.audio_encode.is_some(),
             // MXL ANC is RFC 8331 data, never TS.
             InputConfig::MxlAnc(_) => false,
+            // SDI always encodes captured video (+ embedded audio) into a
+            // single A+V MPEG-TS — video_encode is required.
+            InputConfig::Sdi(_) => true,
         }
     }
 
@@ -6611,6 +6623,51 @@ pub struct MxlVideoInputConfig {
     /// `-nvenc` / `-qsv` / `-vaapi`) must be compiled in.
     pub video_encode: VideoEncodeConfig,
     /// MPEG-TS PID overrides for the synthesised TS.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "crate::config::pid_overrides_serde"
+    )]
+    pub pid_overrides: Option<TsPidOverridesMap>,
+}
+
+fn default_sdi_format() -> String { "auto".to_string() }
+fn default_sdi_pixel_format() -> String { "uyvy422".to_string() }
+fn default_sdi_audio_channels() -> u8 { 2 }
+
+/// SDI capture input via a Blackmagic DeckLink card (the `sdi` input type,
+/// gated by the `sdi-decklink` Cargo feature). One device handle delivers
+/// packed 4:2:2 video **and** embedded PCM audio; the input task encodes the
+/// video via `video_encode`, optionally re-encodes the audio via
+/// `audio_encode`, and muxes both into a single A+V MPEG-TS on the flow's
+/// broadcast channel. Self-clocked — no PTP requirement (unlike MXL).
+///
+/// `device` is the FFmpeg DeckLink device string, e.g. `"DeckLink Quad (1)"`
+/// (as printed by `ffmpeg -sources decklink`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SdiInputConfig {
+    /// FFmpeg DeckLink device string, e.g. `"DeckLink Quad (1)"`.
+    pub device: String,
+    /// SDI mode: `"auto"` (card input-format detection) or a concrete
+    /// FFmpeg `format_code` such as `"Hi50"` / `"Hp30"`.
+    #[serde(default = "default_sdi_format")]
+    pub format: String,
+    /// Wire pixel format: `"uyvy422"` (8-bit, default) or `"v210"` (10-bit).
+    #[serde(default = "default_sdi_pixel_format")]
+    pub pixel_format: String,
+    /// Embedded-audio channel count to capture (2 / 8 / 16). 0 = video only.
+    #[serde(default = "default_sdi_audio_channels")]
+    pub audio_channels: u8,
+    /// Mandatory ingress video encode (mirrors `MxlVideoInputConfig`). A
+    /// feature-flagged backend (`video-encoder-x264` / `-x265` / `-nvenc` /
+    /// `-qsv` / `-vaapi`) must be compiled in.
+    pub video_encode: VideoEncodeConfig,
+    /// Optional embedded-audio re-encode into the muxed TS audio PID. When
+    /// unset, audio is encoded with a sensible AAC-LC default so the flow
+    /// carries sound; set explicitly to pick codec / bitrate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audio_encode: Option<AudioEncodeConfig>,
+    /// MPEG-TS PID overrides for the synthesised A+V TS.
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",

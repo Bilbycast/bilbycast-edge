@@ -329,6 +329,15 @@ pub mod output_mxl_audio;
 #[cfg(feature = "mxl")]
 pub mod output_mxl_anc;
 
+/// SDI capture/playout via Blackmagic DeckLink. Wraps FFmpeg's `decklink`
+/// avdevice via the sibling `bilbycast-decklink-rs` crate. Boot probe lives in
+/// `engine::decklink::domain::DecklinkDeviceManager::probe`. Off by default —
+/// gated by the `sdi-decklink` Cargo feature. See `bilbycast-decklink-rs/CLAUDE.md`.
+#[cfg(feature = "sdi-decklink")]
+pub mod decklink;
+#[cfg(feature = "sdi-decklink")]
+pub mod sdi_io;
+
 /// Generic RFC 3551 PCM-over-RTP audio input. Wire-identical to ST 2110-30
 /// but with no PTP / RFC 7273 / NMOS clock_domain. Drives the same shared
 /// runtime as the ST 2110 audio modules.

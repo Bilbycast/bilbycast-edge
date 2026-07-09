@@ -838,6 +838,7 @@ fn input_pid_overrides(input: &InputConfig) -> Option<&crate::config::models::Ts
         InputConfig::MxlVideo(c) => c.pid_overrides.as_ref(),
         InputConfig::MxlAudio(c) => c.pid_overrides.as_ref(),
         InputConfig::MxlAnc(_) => None,
+        InputConfig::Sdi(c) => c.pid_overrides.as_ref(),
     }
 }
 
@@ -868,7 +869,8 @@ fn input_program_number(input: &InputConfig) -> Option<u16> {
         // audio_encode set) always emits program 1.
         | InputConfig::MxlVideo(_)
         | InputConfig::MxlAudio(_)
-        | InputConfig::MxlAnc(_) => None,
+        | InputConfig::MxlAnc(_)
+        | InputConfig::Sdi(_) => None,
     }
 }
 
@@ -896,7 +898,8 @@ fn input_pid_map(input: &InputConfig) -> Option<&std::collections::BTreeMap<u16,
         | InputConfig::Bonded(_)
         | InputConfig::MxlVideo(_)
         | InputConfig::MxlAudio(_)
-        | InputConfig::MxlAnc(_) => None,
+        | InputConfig::MxlAnc(_)
+        | InputConfig::Sdi(_) => None,
     }
 }
 
@@ -917,6 +920,7 @@ fn input_audio_encode(input: &InputConfig) -> Option<&crate::config::models::Aud
         InputConfig::St2110_30(c) | InputConfig::St2110_31(c) => c.audio_encode.as_ref(),
         InputConfig::RtpAudio(c) => c.audio_encode.as_ref(),
         InputConfig::MxlAudio(c) => c.audio_encode.as_ref(),
+        InputConfig::Sdi(c) => c.audio_encode.as_ref(),
         InputConfig::St2110_20(_)
         | InputConfig::St2110_23(_)
         | InputConfig::St2110_40(_)
@@ -943,6 +947,7 @@ fn input_video_encode(input: &InputConfig) -> Option<&crate::config::models::Vid
         InputConfig::St2110_20(c) => Some(&c.video_encode),
         InputConfig::St2110_23(c) => Some(&c.video_encode),
         InputConfig::MxlVideo(c) => Some(&c.video_encode),
+        InputConfig::Sdi(c) => Some(&c.video_encode),
         InputConfig::St2110_30(_)
         | InputConfig::St2110_31(_)
         | InputConfig::RtpAudio(_)
@@ -1059,7 +1064,8 @@ fn input_is_synthetic_ts(input: &InputConfig) -> bool {
         | InputConfig::St2110_20(_)
         | InputConfig::St2110_23(_)
         // MXL video always synthesises TS (video_encode mandatory).
-        | InputConfig::MxlVideo(_) => true,
+        | InputConfig::MxlVideo(_)
+        | InputConfig::Sdi(_) => true,
         // PCM inputs become synthetic-TS only when audio_encode is set
         // (turning them into TS carriers via input_pcm_encode + TsMuxer).
         InputConfig::St2110_30(c) | InputConfig::St2110_31(c) => c.audio_encode.is_some(),
@@ -1416,6 +1422,7 @@ fn validate_input(input: &InputConfig) -> Result<()> {
         InputConfig::MxlVideo(c) => validate_mxl_video_input(c)?,
         InputConfig::MxlAudio(c) => validate_mxl_audio_input(c)?,
         InputConfig::MxlAnc(c)   => validate_mxl_anc_input(c)?,
+        InputConfig::Sdi(c) => validate_sdi_input(c)?,
     }
     Ok(())
 }
@@ -6038,6 +6045,22 @@ fn validate_mxl_frame_rate(num: u32, den: u32, ctx: &str) -> Result<()> {
     Ok(())
 }
 
+fn validate_sdi_input(c: &crate::config::models::SdiInputConfig) -> Result<()> {
+    let ctx = format!("SDI input device={:?}", c.device);
+    if c.device.trim().is_empty() {
+        bail!("{ctx}: device must not be empty");
+    }
+    if !matches!(c.audio_channels, 0 | 2 | 8 | 16) {
+        bail!("{ctx}: audio_channels must be 0, 2, 8, or 16 (got {})", c.audio_channels);
+    }
+    if !matches!(c.pixel_format.as_str(), "uyvy422" | "v210") {
+        bail!("{ctx}: pixel_format must be uyvy422 or v210 (got {:?})", c.pixel_format);
+    }
+    // video_encode is mandatory for SDI — same as MXL video / ST 2110-20.
+    validate_video_encode(&c.video_encode, &ctx)?;
+    Ok(())
+}
+
 fn validate_mxl_video_input(c: &crate::config::models::MxlVideoInputConfig) -> Result<()> {
     let ctx = format!("MXL video input domain={:?} flow={:?}", c.mxl.domain_path, c.mxl.flow_name);
     validate_mxl_domain(&c.mxl, &ctx)?;
@@ -7601,7 +7624,7 @@ fn validate_port_conflicts(config: &AppConfig) -> Result<()> {
             // Replay reads from the local replay store — no socket bind.
             InputConfig::Replay(_) => {}
             // MXL inputs attach to a shared-memory domain — no socket bind.
-            InputConfig::MxlVideo(_) | InputConfig::MxlAudio(_) | InputConfig::MxlAnc(_) => {}
+            InputConfig::MxlVideo(_) | InputConfig::MxlAudio(_) | InputConfig::MxlAnc(_) | InputConfig::Sdi(_) => {}
         }
     }
 

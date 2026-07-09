@@ -490,6 +490,7 @@ dependencies = [
  "clap",
  "ctr",
  "dashmap",
+ "decklink-rs",
  "drm",
  "ebur128",
  "flate2",
@@ -1171,6 +1172,14 @@ name = "data-encoding"
 version = "2.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a4ae5f15dda3c708c0ade84bfee31ccab44a3da4f88015ed22f63732abe300c8"
+
+[[package]]
+name = "decklink-rs"
+version = "0.1.0"
+dependencies = [
+ "libdecklink-sys",
+ "thiserror 2.0.18",
+]
 
 [[package]]
 name = "defmt"
@@ -2439,6 +2448,14 @@ name = "libc"
 version = "0.2.186"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "68ab91017fe16c622486840e4c83c9a37afeff978bd239b5293d61ece587de66"
+
+[[package]]
+name = "libdecklink-sys"
+version = "0.1.0"
+dependencies = [
+ "bindgen",
+ "pkg-config",
+]
 
 [[package]]
 name = "libfdk-aac-sys"

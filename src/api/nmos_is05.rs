@@ -871,7 +871,8 @@ fn active_receiver_params(
         // MXL is shared-memory only — no network transport params.
         InputConfig::MxlVideo(_)
         | InputConfig::MxlAudio(_)
-        | InputConfig::MxlAnc(_) => TransportParamSet::default(),
+        | InputConfig::MxlAnc(_)
+        | InputConfig::Sdi(_) => TransportParamSet::default(),
     };
     Ok(TransportParams {
         transport_params: vec![param_set],

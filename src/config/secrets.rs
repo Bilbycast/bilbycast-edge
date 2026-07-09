@@ -411,7 +411,7 @@ impl SecretsConfig {
             InputConfig::Replay(_) => {}
             // MXL inputs reference a shared-memory domain path + flow
             // name. Neither is a secret — the manager UI shows both.
-            InputConfig::MxlVideo(_) | InputConfig::MxlAudio(_) | InputConfig::MxlAnc(_) => {}
+            InputConfig::MxlVideo(_) | InputConfig::MxlAudio(_) | InputConfig::MxlAnc(_) | InputConfig::Sdi(_) => {}
         }
     }
 

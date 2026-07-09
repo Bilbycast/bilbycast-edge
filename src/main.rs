@@ -480,6 +480,24 @@ async fn main() -> anyhow::Result<()> {
             "mxl: probe found no libmxl.so — mxl-* capabilities will not be advertised"
         ),
     }
+
+    // SDI / DeckLink probe — enumerate DeckLink devices via FFmpeg's avdevice
+    // layer. Returns None on hosts without a card (or an FFmpeg lacking
+    // --enable-decklink) so the boot path stays alive; on success the manager
+    // is installed for the SDI flow spawn arms to look up.
+    #[cfg(feature = "sdi-decklink")]
+    match engine::decklink::domain::DecklinkDeviceManager::probe() {
+        Some(mgr) => {
+            tracing::info!(
+                "sdi: DeckLink probe succeeded — {} device(s) available",
+                mgr.devices().len()
+            );
+            engine::decklink::domain::install_global(mgr);
+        }
+        None => tracing::info!(
+            "sdi: no DeckLink devices found — sdi-decklink capability will not be advertised"
+        ),
+    }
     tracing::info!(
         "hardware probe: cpu={} ({}/{} cores, avx={:?}); hw_encoders any={}; sw x264/x265={}/{}",
         static_capabilities.cpu.brand,

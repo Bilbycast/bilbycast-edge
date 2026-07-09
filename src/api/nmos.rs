@@ -147,7 +147,8 @@ fn input_transport(input: &InputConfig) -> &'static str {
         // approach as display outputs / bonded / test_pattern).
         InputConfig::MxlVideo(_)
         | InputConfig::MxlAudio(_)
-        | InputConfig::MxlAnc(_) => "urn:x-nmos:transport:rtp",
+        | InputConfig::MxlAnc(_)
+        | InputConfig::Sdi(_) => "urn:x-nmos:transport:rtp",
     }
 }
 
@@ -318,6 +319,7 @@ fn input_type_str(input: &InputConfig) -> &'static str {
         InputConfig::RtpAudio(_) => "rtp_audio",
         InputConfig::Bonded(_) => "bonded",
         InputConfig::TestPattern(_) => "test_pattern",
+        InputConfig::Sdi(_) => "sdi",
         InputConfig::MediaPlayer(_) => "media_player",
         InputConfig::Replay(_) => "replay",
         InputConfig::MxlVideo(_) => "mxl_video",

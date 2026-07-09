@@ -3437,6 +3437,27 @@ fn spawn_mxl_unavailable(
     })
 }
 
+/// "DeckLink probe found no device at boot" fallback for the SDI input spawn
+/// arm when [`super::decklink::domain::global`] returns `None`.
+#[cfg(feature = "sdi-decklink")]
+fn spawn_sdi_unavailable(
+    input_id: String,
+    cancel: CancellationToken,
+    event_sender: EventSender,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        event_sender.emit(
+            crate::manager::events::EventSeverity::Critical,
+            crate::manager::events::category::FLOW,
+            format!(
+                "SDI input '{input_id}' refused: no DeckLink device found at boot \
+                 (error_code: sdi_decklink_unavailable)"
+            ),
+        );
+        cancel.cancelled().await;
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn spawn_single_input(
     input_def: &InputDefinition,
@@ -3665,6 +3686,34 @@ fn spawn_single_input(
                     format!(
                         "MXL input '{input_id_msg}' requires the `mxl` Cargo feature \
                          (error_code: mxl_feature_disabled)"
+                    ),
+                );
+                cancel.cancelled().await;
+            })
+        }
+        // SDI capture via Blackmagic DeckLink. Self-clocked (no PTP), so
+        // unlike MXL it doesn't inherit the flow clock domain. The device
+        // manager is looked up from the global installed at boot in main.rs.
+        #[cfg(feature = "sdi-decklink")]
+        InputConfig::Sdi(c) => match super::decklink::domain::global() {
+            Some(_mgr) => super::sdi_io::spawn_sdi_input(
+                c.clone(), input_id.clone(), per_input_tx.clone(), flow_stats.clone(),
+                input_cancel.clone(), event_sender.clone(), flow_id.to_string(),
+            ),
+            None => spawn_sdi_unavailable(input_id.clone(), input_cancel.clone(), event_sender.clone()),
+        },
+        #[cfg(not(feature = "sdi-decklink"))]
+        InputConfig::Sdi(_) => {
+            let cancel = input_cancel.clone();
+            let event_sender = event_sender.clone();
+            let input_id_msg = input_id.clone();
+            tokio::spawn(async move {
+                event_sender.emit(
+                    crate::manager::events::EventSeverity::Critical,
+                    crate::manager::events::category::FLOW,
+                    format!(
+                        "SDI input '{input_id_msg}' requires the `sdi-decklink` Cargo feature \
+                         (error_code: sdi_feature_disabled)"
                     ),
                 );
                 cancel.cancelled().await;
@@ -4017,6 +4066,11 @@ fn media_analysis_metadata(input: &InputConfig) -> MediaAnalysisMeta {
             fec_enabled: false, fec_type: None,
             redundancy_enabled: false, redundancy_type: None,
         },
+        InputConfig::Sdi(_) => MediaAnalysisMeta {
+            protocol: "sdi".into(), payload_format: "h264_hevc_ts".into(),
+            fec_enabled: false, fec_type: None,
+            redundancy_enabled: false, redundancy_type: None,
+        },
         InputConfig::MxlAudio(c) => MediaAnalysisMeta {
             protocol: "mxl_audio".into(),
             payload_format: if c.audio_encode.is_some() { "audio_ts".into() } else { "pcm_f32".into() },
@@ -4060,6 +4114,7 @@ fn input_type_str(input: &InputConfig) -> &'static str {
         InputConfig::MxlVideo(_) => "mxl_video",
         InputConfig::MxlAudio(_) => "mxl_audio",
         InputConfig::MxlAnc(_) => "mxl_anc",
+        InputConfig::Sdi(_) => "sdi",
     }
 }
 
@@ -4217,6 +4272,15 @@ fn build_input_config_meta(input: &InputConfig) -> crate::stats::collector::Inpu
                 Some(clip) => format!("replay clip {clip} of {}", c.recording_id),
                 None => format!("replay recording {}", c.recording_id),
             }),
+            local_addr: None,
+            remote_addr: None,
+            listen_addr: None,
+            bind_addr: None,
+            rtsp_url: None,
+            whep_url: None,
+        },
+        InputConfig::Sdi(c) => InputConfigMeta {
+            mode: Some(format!("sdi {}", c.device)),
             local_addr: None,
             remote_addr: None,
             listen_addr: None,
@@ -5771,6 +5835,7 @@ fn derive_cost_plan(flow: &ResolvedFlow) -> crate::engine::hardware_probe::FlowC
             InputConfig::St2110_20(c) => Some(&c.video_encode),
             InputConfig::St2110_23(c) => Some(&c.video_encode),
             InputConfig::MxlVideo(c) => Some(&c.video_encode),
+            InputConfig::Sdi(c) => Some(&c.video_encode),
             InputConfig::St2110_30(_)
             | InputConfig::St2110_31(_)
             | InputConfig::St2110_40(_)
@@ -6350,6 +6415,7 @@ fn input_encode_blocks(
         MxlAudio(c) => (c.audio_encode.as_ref(), None),
         // MXL ANC carries no encode blocks.
         MxlAnc(_) => (None, None),
+        Sdi(c) => (c.audio_encode.as_ref(), Some(c.video_encode.codec.as_str())),
     }
 }
 
