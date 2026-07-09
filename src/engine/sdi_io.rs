@@ -42,6 +42,8 @@ use crate::manager::events::{EventSender, EventSeverity, category};
 use crate::stats::collector::FlowStatsAccumulator;
 
 #[cfg(feature = "media-codecs")]
+use crate::stats::collector::SdiCaptureStats;
+#[cfg(feature = "media-codecs")]
 use bytes::Bytes;
 #[cfg(feature = "media-codecs")]
 use decklink_rs::{CapturedFrame, DecklinkCapture, DecklinkCaptureConfig, DecklinkPixelFormat};
@@ -467,6 +469,17 @@ fn sdi_input_blocking_loop(
     let mut audio_pts_90khz: u64 = 0;
     let mut session: u64 = 0;
 
+    // Telemetry the byte stream cannot express: signal lock, shim frame drops,
+    // session count. Registered before the first open so the manager sees an
+    // honest `signal_present: false` while a device is still being retried.
+    let sdi_stats = Arc::new(SdiCaptureStats::default());
+    flow_stats.set_sdi_capture_stats(input_id, sdi_stats.clone());
+
+    // The shim's drop counter is per-capture-handle and restarts at zero on
+    // every re-open, so carry a base forward to keep the reported figure
+    // cumulative across sessions.
+    let mut dropped_base: u64 = 0;
+
     // ── supervision loop: one iteration == one capture session ──
     // A cable pull, a source reboot or a raster change are routine in a
     // broadcast plant, so they must not kill the input task.
@@ -475,12 +488,13 @@ fn sdi_input_blocking_loop(
             break;
         }
         session += 1;
+        sdi_stats.sessions.store(session, Ordering::Relaxed);
 
         let Some(cap) = open_capture(ctx, &cap_cfg, session, cancel, event_sender) else {
             break; // cancelled while retrying
         };
 
-        match run_capture_session(
+        let end = run_capture_session(
             ctx,
             config,
             input_id,
@@ -495,9 +509,18 @@ fn sdi_input_blocking_loop(
             &mut audio_pts_90khz,
             broadcast_tx,
             flow_stats,
+            &sdi_stats,
+            dropped_base,
             cancel,
             event_sender,
-        ) {
+        );
+        dropped_base = sdi_stats.frames_dropped.load(Ordering::Relaxed);
+
+        // The card is gone or re-opening; it is not locked to a signal until a
+        // frame proves otherwise.
+        sdi_stats.signal_present.store(false, Ordering::Relaxed);
+
+        match end {
             SessionEnd::Cancelled | SessionEnd::Fatal => break,
             SessionEnd::Retry => {
                 if cancel.is_cancelled() {
@@ -584,6 +607,8 @@ fn run_capture_session(
     audio_pts_90khz: &mut u64,
     broadcast_tx: &broadcast::Sender<RtpPacket>,
     flow_stats: &Arc<FlowStatsAccumulator>,
+    sdi_stats: &Arc<SdiCaptureStats>,
+    dropped_base: u64,
     cancel: &CancellationToken,
     event_sender: &EventSender,
 ) -> SessionEnd {
@@ -698,6 +723,7 @@ fn run_capture_session(
                 // is what downstream decoders and sockets want.
                 match (signal_present, vf.signal_present) {
                     (Some(true), false) | (None, false) => {
+                        sdi_stats.signal_losses.fetch_add(1, Ordering::Relaxed);
                         tracing::warn!(target: "sdi.in", "{ctx}: SDI input signal lost");
                         event_sender.emit(
                             EventSeverity::Warning,
@@ -721,6 +747,14 @@ fn run_capture_session(
                     _ => {}
                 }
                 signal_present = Some(vf.signal_present);
+                sdi_stats
+                    .signal_present
+                    .store(vf.signal_present, Ordering::Relaxed);
+                // The shim counts frames it dropped because we fell behind the
+                // SDI cadence — the one drop cause no transport counter sees.
+                sdi_stats
+                    .frames_dropped
+                    .store(dropped_base + cap.dropped_frames(), Ordering::Relaxed);
 
                 // Defensive: `unpack_uyvy422` slices rows directly, so a short or
                 // unexpectedly-strided frame would panic. Skip it — a dropped

@@ -2471,6 +2471,37 @@ impl Default for ContentAnalysisAccumulator {
 
 // ── Per-flow Accumulator ───────────────────────────────────────────────────
 
+/// Lock-free SDI capture telemetry for one input, written by the capture
+/// thread and read by the snapshot path.
+///
+/// Deliberately holds no DeckLink types, so it compiles without the
+/// `sdi-decklink` feature and the collector needs no `cfg` gates.
+#[derive(Debug, Default)]
+pub struct SdiCaptureStats {
+    /// Card is locked to an input signal (`!bmdFrameHasNoInputSource`).
+    /// Starts `false` — an input that has never received a frame is not
+    /// locked, and reporting `true` before the first frame would be a lie.
+    pub signal_present: AtomicBool,
+    /// Cumulative signal-loss transitions.
+    pub signal_losses: AtomicU64,
+    /// Cumulative frames dropped in the capture shim (consumer fell behind).
+    pub frames_dropped: AtomicU64,
+    /// Capture sessions opened (raster change / device re-open increments).
+    pub sessions: AtomicU64,
+}
+
+impl SdiCaptureStats {
+    /// Snapshot into the serialisable form the manager sees.
+    pub fn snapshot(&self) -> SdiInputStats {
+        SdiInputStats {
+            signal_present: self.signal_present.load(Ordering::Relaxed),
+            signal_losses: self.signal_losses.load(Ordering::Relaxed),
+            frames_dropped: self.frames_dropped.load(Ordering::Relaxed),
+            sessions: self.sessions.load(Ordering::Relaxed),
+        }
+    }
+}
+
 /// Per-flow atomic counters for a single media flow (one input, N outputs).
 ///
 /// Holds input-side counters (`input_packets`, `input_bytes`, `input_loss`,
@@ -2520,6 +2551,12 @@ pub struct FlowStatsAccumulator {
     /// [`crate::engine::ingress_dejitter::start`].
     pub ingress_dejitter_stats:
         DashMap<String, Arc<crate::engine::ingress_dejitter::IngressDejitterStats>>,
+    /// SDI (DeckLink) capture telemetry, keyed by `input_id`. Same per-input
+    /// model as `ingress_dejitter_stats`. Registered by
+    /// `crate::engine::sdi_io::spawn_sdi_input`. Not feature-gated: the handle
+    /// is plain atomics with no DeckLink dependency, so builds without
+    /// `sdi-decklink` simply leave the map empty.
+    pub sdi_capture_stats: DashMap<String, Arc<SdiCaptureStats>>,
     // Per-output stats
     pub output_stats: DashMap<String, Arc<OutputStatsAccumulator>>,
     pub input_throughput: ThroughputEstimator,
@@ -2766,6 +2803,7 @@ impl FlowStatsAccumulator {
             source_discontinuities: AtomicU64::new(0),
             buffered_hitless_snapshot: std::sync::RwLock::new(None),
             ingress_dejitter_stats: DashMap::new(),
+            sdi_capture_stats: DashMap::new(),
             output_stats: DashMap::new(),
             input_throughput: ThroughputEstimator::new(),
             tr101290: OnceLock::new(),
@@ -3131,6 +3169,23 @@ impl FlowStatsAccumulator {
         stats: Arc<crate::engine::ingress_dejitter::IngressDejitterStats>,
     ) {
         self.ingress_dejitter_stats.insert(input_id.to_string(), stats);
+    }
+
+    /// Register a per-input SDI capture telemetry handle (keyed by `input_id`)
+    /// so the snapshot can surface the active input's signal lock, shim frame
+    /// drops, and session count. Called once per SDI input at startup by
+    /// `crate::engine::sdi_io::spawn_sdi_input`. Idempotent on re-register
+    /// (e.g. hot re-add) — the latest handle wins.
+    ///
+    /// The only caller lives behind both `sdi-decklink` and `media-codecs`;
+    /// the field and snapshot stay unconditional so the collector needs no
+    /// `cfg` gates.
+    #[cfg_attr(
+        not(all(feature = "sdi-decklink", feature = "media-codecs")),
+        allow(dead_code)
+    )]
+    pub fn set_sdi_capture_stats(&self, input_id: &str, stats: Arc<SdiCaptureStats>) {
+        self.sdi_capture_stats.insert(input_id.to_string(), stats);
     }
 
     /// Replace the header fields (`input_type` + `InputConfigMeta`) that the
@@ -3625,6 +3680,7 @@ impl FlowStatsAccumulator {
                         .ingress_dejitter_stats
                         .get(active_key)
                         .map(|h| h.depth.load(Ordering::Relaxed) as u64),
+                    sdi_stats: self.sdi_capture_stats.get(active_key).map(|h| h.snapshot()),
                     transcode_stats: in_transcode,
                     audio_decode_stats: in_audio_decode,
                     audio_encode_stats: in_audio_encode,

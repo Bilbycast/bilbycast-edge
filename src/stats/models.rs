@@ -820,6 +820,39 @@ pub struct InputStats {
     /// render the ingress pipeline with the same renderer.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ingress_summary: Option<EgressMediaSummary>,
+    /// Per-input SDI (DeckLink) capture statistics. Present only on inputs of
+    /// `type: "sdi"`. Additive — older managers ignore it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sdi_stats: Option<SdiInputStats>,
+}
+
+/// SDI (DeckLink) capture statistics for one input.
+///
+/// Sourced from the card and the capture shim, not inferred from the byte
+/// stream — under an SDI signal loss the card keeps delivering frames (bars or
+/// black), so `bitrate_bps` alone can never tell an operator the input is
+/// unlocked. These fields can.
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct SdiInputStats {
+    /// Is the card currently locked to an input signal? `false` means
+    /// `bmdFrameHasNoInputSource` — cable pulled, source down, or a forced
+    /// `format` that does not match the source. The transport stream keeps
+    /// flowing regardless (the card substitutes bars/black and we keep
+    /// encoding), which is exactly why this needs surfacing.
+    pub signal_present: bool,
+    /// Cumulative signal-loss transitions since the input started. A non-zero
+    /// count on a stream that currently reads `signal_present: true`
+    /// distinguishes a flapping cable from a clean run.
+    pub signal_losses: u64,
+    /// Cumulative frames dropped inside the capture shim because this edge
+    /// fell behind the SDI cadence. Non-zero means the host is not keeping up
+    /// (encoder saturated, thread starved) — distinct from `packets_lost`,
+    /// which is a transport-side measure and cannot see this.
+    pub frames_dropped: u64,
+    /// Capture sessions opened since the input started. Increments on a raster
+    /// change or a device re-open, so `> 1` means the input has been
+    /// re-established at least once.
+    pub sessions: u64,
 }
 
 /// Statistics for a single output leg of a flow.
