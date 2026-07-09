@@ -1003,6 +1003,22 @@ pub(crate) fn build_health_payload(
             }
         }
     }
+    // Per-port DeckLink hardware status (signal lock, genlock, detected raster,
+    // PCIe link). Gated on the `sdi-decklink` Cargo feature; absent on every
+    // other build so older managers / non-SDI edges stay wire-compatible. A
+    // lock-free atomic load — the ~25 ms SDK sweep runs on the background
+    // status poller, never on this tick.
+    #[cfg(feature = "sdi-decklink")]
+    {
+        let ports = crate::engine::decklink::status::cached();
+        if !ports.is_empty() {
+            if let Ok(json) = serde_json::to_value(ports.as_slice()) {
+                payload
+                    .as_object_mut()
+                    .map(|o| o.insert("sdi_devices".into(), json));
+            }
+        }
+    }
     // System-clock discipline (adjtimex read). Inserted only when probe()
     // returns Some — non-Linux hosts and seccomp-blocked adjtimex omit the
     // field, so older managers and clock-less hosts stay wire-compatible.
@@ -1407,6 +1423,18 @@ fn edge_capabilities() -> Vec<&'static str> {
             // between transcode and the display output, so the manager
             // UI keys the display "Video Decoder" dropdown off the
             // same capability strings as the transcode resolver.
+        }
+    }
+    // Native SDI capture via Blackmagic DeckLink. Advertised only when (a) the
+    // `sdi-decklink` Cargo feature is on, AND (b) the boot probe reached the
+    // SDK (Desktop Video installed). A card-less host with Desktop Video still
+    // advertises: the capability says "this edge can do SDI", and the
+    // per-port `sdi_devices` health field says which ports exist and which
+    // have signal. Manager UI gates the SDI input type on this.
+    #[cfg(feature = "sdi-decklink")]
+    {
+        if crate::engine::decklink::domain::probe_succeeded() {
+            caps.push("sdi-decklink");
         }
     }
     // Kernel-paced wire emission via SO_TXTIME — gates the per-output

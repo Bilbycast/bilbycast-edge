@@ -481,10 +481,11 @@ async fn main() -> anyhow::Result<()> {
         ),
     }
 
-    // SDI / DeckLink probe — enumerate DeckLink devices via FFmpeg's avdevice
-    // layer. Returns None on hosts without a card (or an FFmpeg lacking
-    // --enable-decklink) so the boot path stays alive; on success the manager
-    // is installed for the SDI flow spawn arms to look up.
+    // SDI / DeckLink probe — enumerate DeckLink devices via the Blackmagic SDK.
+    // Returns None only when the SDK is unavailable (Desktop Video not
+    // installed), so the boot path stays alive; on success the manager is
+    // installed for the SDI flow spawn arms to look up. The per-port hardware
+    // status snapshot is seeded here too, so the first health tick carries it.
     #[cfg(feature = "sdi-decklink")]
     match engine::decklink::domain::DecklinkDeviceManager::probe() {
         Some(mgr) => {
@@ -493,6 +494,14 @@ async fn main() -> anyhow::Result<()> {
                 mgr.devices().len()
             );
             engine::decklink::domain::install_global(mgr);
+            let ports = engine::decklink::status::init();
+            tracing::info!(
+                "sdi: {} port(s) with signal at boot",
+                ports
+                    .iter()
+                    .filter(|p| p.signal_locked == Some(true))
+                    .count()
+            );
         }
         None => tracing::info!(
             "sdi: no DeckLink devices found — sdi-decklink capability will not be advertised"
@@ -741,6 +750,13 @@ async fn main() -> anyhow::Result<()> {
     // edge restart. Sibling to the cellular / starlink pollers.
     #[cfg(all(feature = "display", target_os = "linux"))]
     let _display_poller_handle = display::spawn_display_poller(shutdown_token.clone());
+
+    // Re-probe DeckLink port status so a cable patched (or pulled) after boot
+    // shows up without an edge restart. Sibling to the display / cellular
+    // pollers; the sweep is blocking SDK work and runs on a blocking thread.
+    #[cfg(feature = "sdi-decklink")]
+    let _sdi_status_poller_handle =
+        engine::decklink::status::spawn_poller(shutdown_token.clone());
 
     // Spawn system resource monitor (CPU, RAM, optional NVIDIA GPU util)
     let _resource_monitor_handle = engine::resource_monitor::spawn_resource_monitor(

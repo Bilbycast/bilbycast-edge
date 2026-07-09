@@ -19,10 +19,8 @@ pub static DECKLINK_PROBE_OK: AtomicBool = AtomicBool::new(false);
 
 /// Has the boot probe run successfully?
 ///
-/// Not yet consumed: this is the capability gate for
-/// `manager::client::edge_capabilities` to advertise `sdi-decklink`, mirroring
-/// `mxl::domain::probe_succeeded`. Kept so the wiring lands in one place.
-#[allow(dead_code)]
+/// The capability gate for `manager::client::edge_capabilities` to advertise
+/// `sdi-decklink`, mirroring `mxl::domain::probe_succeeded`.
 pub fn probe_succeeded() -> bool {
     DECKLINK_PROBE_OK.load(Ordering::Relaxed)
 }
