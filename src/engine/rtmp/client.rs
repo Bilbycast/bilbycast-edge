@@ -23,6 +23,54 @@ pub struct RtmpClient {
     stream_id: u32,
 }
 
+/// Why an RTMP connect/publish attempt failed, when the *server actively
+/// rejected* it (as opposed to a transport-level failure like an
+/// unreachable host, a reset, or a timeout — those stay plain `anyhow`
+/// errors and the caller treats them as a generic connect failure).
+///
+/// This is inserted into the `anyhow` error chain at the rejection sites
+/// so the output task can tell an actionable config problem (a bad or
+/// expired stream key, a wrong app path) apart from "the server is down"
+/// and raise the right operator alarm. Recover it from a returned error
+/// with `err.chain().find_map(|c| c.downcast_ref::<RtmpConnectError>())`.
+#[derive(Debug, Clone)]
+pub struct RtmpConnectError {
+    pub kind: RtmpFailureKind,
+    /// The server-supplied `onStatus` / `_error` code when present
+    /// (e.g. `"NetStream.Publish.BadName"`). RTMP has no dedicated
+    /// "expired key" code — servers signal a bad/expired/duplicate key
+    /// via a generic publish rejection or by dropping the socket.
+    pub server_code: Option<String>,
+}
+
+/// The two server-rejection classes [`RtmpConnectError`] distinguishes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RtmpFailureKind {
+    /// The server rejected the `publish` command. Overwhelmingly this is a
+    /// wrong / expired stream key, but it also covers a key already in use
+    /// (a second concurrent session) or a publish otherwise denied.
+    /// Retrying without fixing the key won't help.
+    PublishRejected,
+    /// The server rejected the `connect` command (app not found / denied) —
+    /// typically a wrong destination URL or app path.
+    ConnectRejected,
+}
+
+impl std::fmt::Display for RtmpConnectError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.kind {
+            RtmpFailureKind::PublishRejected => write!(f, "stream key rejected")?,
+            RtmpFailureKind::ConnectRejected => write!(f, "connect rejected")?,
+        }
+        if let Some(code) = &self.server_code {
+            write!(f, ": {code}")?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for RtmpConnectError {}
+
 impl RtmpClient {
     /// Connect to an RTMP server, perform handshake, and enter publish mode.
     ///
@@ -182,7 +230,11 @@ impl RtmpClient {
                         return Ok(());
                     }
                     if cmd == "_error" && tx_id == expected_tx_id {
-                        bail!("server returned _error for txId={}", expected_tx_id);
+                        return Err(RtmpConnectError {
+                            kind: RtmpFailureKind::ConnectRejected,
+                            server_code: None,
+                        }
+                        .into());
                     }
                 }
             }
@@ -229,14 +281,22 @@ impl RtmpClient {
                                 return Ok(());
                             }
                             if code.contains("Error") || code.contains("Reject") || code.contains("BadName") {
-                                bail!("publish rejected: {}", code);
+                                return Err(RtmpConnectError {
+                                    kind: RtmpFailureKind::PublishRejected,
+                                    server_code: Some(code.to_string()),
+                                }
+                                .into());
                             }
                         }
                         // Some servers send onStatus without code, treat as success
                         return Ok(());
                     }
                     if cmd == "_error" {
-                        bail!("server returned _error during publish");
+                        return Err(RtmpConnectError {
+                            kind: RtmpFailureKind::PublishRejected,
+                            server_code: None,
+                        }
+                        .into());
                     }
                 }
             }

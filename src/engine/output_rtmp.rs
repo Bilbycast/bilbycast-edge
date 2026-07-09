@@ -16,14 +16,14 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::models::{RtmpOutputConfig, VideoEncodeConfig};
-use crate::manager::events::{EventSender, EventSeverity, category};
+use crate::manager::events::{Event, EventSender, EventSeverity, category};
 use crate::stats::collector::OutputStatsAccumulator;
 
 use super::audio_decode::{AacDecoder, DecodeStats, sample_rate_from_index, sr_index_from_hz};
 use super::audio_encode::{AudioCodec, AudioEncoder, AudioEncoderError, EncoderParams};
 use super::audio_silence::SilenceGenerator;
 use super::packet::RtpPacket;
-use super::rtmp::client::RtmpClient;
+use super::rtmp::client::{RtmpClient, RtmpConnectError, RtmpFailureKind};
 use super::ts_demux::{DemuxedFrame, TsDemuxer};
 use super::ts_video_replace::VideoEncodeStats;
 
@@ -162,6 +162,14 @@ pub fn spawn_rtmp_output(
         );
 
         let mut attempt = 0u32;
+        // Dedup key for the operator-facing failure alarm: `Some(error_code)`
+        // while we are in a down-episode, `None` when connected/healthy. A new
+        // failure event is emitted only when the classified `error_code`
+        // changes — so an unreachable receiver (or a bad stream key) raises one
+        // alarm, not one per reconnect-backoff tick. Cleared (with a "connected"
+        // recovery event) on the next successful connect. See
+        // `classify_rtmp_failure` for the taxonomy.
+        let mut signalled_code: Option<&'static str> = None;
         loop {
             if cancel.is_cancelled() {
                 break;
@@ -174,6 +182,17 @@ pub fn spawn_rtmp_output(
                         "RTMP output '{}': exceeded max reconnect attempts ({})",
                         config.id, max,
                     );
+                    event_sender.send(rtmp_output_event(
+                        EventSeverity::Critical,
+                        "rtmp_output_gave_up",
+                        format!(
+                            "RTMP output '{}' gave up after {} failed connection attempts to {}",
+                            config.id, max, config.dest_url,
+                        ),
+                        &config,
+                        &flow_id,
+                        serde_json::json!({ "max_reconnect_attempts": max }),
+                    ));
                     break;
                 }
             }
@@ -189,6 +208,18 @@ pub fn spawn_rtmp_output(
             let mut client = match RtmpClient::connect(&config.dest_url, &config.stream_key).await {
                 Ok(c) => {
                     tracing::info!("RTMP output '{}': connected to {}", config.id, config.dest_url);
+                    // If we had been alarming, clear it with a recovery event
+                    // so the operator's alarm resolves.
+                    if signalled_code.take().is_some() {
+                        event_sender.send(rtmp_output_event(
+                            EventSeverity::Info,
+                            "rtmp_output_connected",
+                            format!("RTMP output '{}' connected to {}", config.id, config.dest_url),
+                            &config,
+                            &flow_id,
+                            serde_json::json!({}),
+                        ));
+                    }
                     attempt = 0; // reset on successful connect
                     c
                 }
@@ -197,6 +228,27 @@ pub fn spawn_rtmp_output(
                         "RTMP output '{}': connection failed: {:#}",
                         config.id, e,
                     );
+                    // Surface the failure to the manager events feed — but only
+                    // once per distinct cause, so backoff retries don't spam.
+                    // Before this, an expired/bad Twitch stream key produced no
+                    // manager event at all; the output just sat in the derived
+                    // "waiting" state, indistinguishable from "no input yet".
+                    let (severity, code, reason, server_code) = classify_rtmp_failure(&e);
+                    if signalled_code != Some(code) {
+                        let mut details = serde_json::json!({ "detail": format!("{:#}", e) });
+                        if let Some(sc) = server_code {
+                            details["server_code"] = serde_json::Value::String(sc);
+                        }
+                        event_sender.send(rtmp_output_event(
+                            severity,
+                            code,
+                            format!("RTMP output '{}' — {}", config.id, reason),
+                            &config,
+                            &flow_id,
+                            details,
+                        ));
+                        signalled_code = Some(code);
+                    }
                     // Bug #10 fix: exponential backoff (1, 2, 4, 8, 16 s,
                     // capped at max(reconnect_delay_secs, 30 s)). The old
                     // code reconnected every reconnect_delay_secs (default
@@ -227,6 +279,26 @@ pub fn spawn_rtmp_output(
                 }
                 Err(e) => {
                     tracing::warn!("RTMP output '{}': publish error: {:#}", config.id, e);
+                    // A mid-stream disconnect after a healthy connection. Shares
+                    // the `rtmp_connect_failed` dedup bucket with the transport
+                    // reconnect failures that follow, so the operator sees one
+                    // "connection lost" alarm, not a "lost" + "can't reconnect"
+                    // pair. The recovery event fires when it reconnects.
+                    let code = "rtmp_connect_failed";
+                    if signalled_code != Some(code) {
+                        event_sender.send(rtmp_output_event(
+                            EventSeverity::Warning,
+                            code,
+                            format!(
+                                "RTMP output '{}' lost its connection to {}",
+                                config.id, config.dest_url,
+                            ),
+                            &config,
+                            &flow_id,
+                            serde_json::json!({ "detail": format!("{:#}", e) }),
+                        ));
+                        signalled_code = Some(code);
+                    }
                     let backoff = rtmp_reconnect_backoff(
                         attempt,
                         config.reconnect_delay_secs,
@@ -2172,6 +2244,102 @@ pub(crate) fn rtmp_reconnect_backoff(
     exponential.min(cap).max(1)
 }
 
+/// Classify a failed [`RtmpClient::connect`] (or publish-loop) error into an
+/// operator-facing alarm: `(severity, error_code, reason, server_code)`.
+///
+/// RTMP gives us no dedicated "expired stream key" signal — a server rejects a
+/// bad/expired/duplicate key with a generic publish rejection (or just drops
+/// the socket). So we surface the two cases we *can* positively distinguish —
+/// a publish rejection (`RtmpFailureKind::PublishRejected`, the stream-key
+/// case) and a connect rejection (wrong URL/app) — from everything else, which
+/// is a transport-level "couldn't reach the server". The typed
+/// [`RtmpConnectError`] is recovered by walking the `anyhow` chain, so the
+/// classification survives the `.context(...)` wrapping applied in
+/// `RtmpClient::connect`.
+///
+/// `error_code` is the stable, machine-readable key the manager UI badges and
+/// the reconnect loop dedups on; `reason` is the human sentence.
+fn classify_rtmp_failure(
+    err: &anyhow::Error,
+) -> (EventSeverity, &'static str, String, Option<String>) {
+    for cause in err.chain() {
+        if let Some(rc) = cause.downcast_ref::<RtmpConnectError>() {
+            return match rc.kind {
+                RtmpFailureKind::PublishRejected => (
+                    EventSeverity::Critical,
+                    "rtmp_publish_rejected",
+                    match &rc.server_code {
+                        Some(c) => format!(
+                            "the server rejected the publish ({c}) — the stream key is \
+                             most likely wrong, expired, or already streaming elsewhere"
+                        ),
+                        None => "the server rejected the publish — the stream key is most \
+                                 likely wrong, expired, or already streaming elsewhere"
+                            .to_string(),
+                    },
+                    rc.server_code.clone(),
+                ),
+                RtmpFailureKind::ConnectRejected => (
+                    EventSeverity::Critical,
+                    "rtmp_connect_rejected",
+                    match &rc.server_code {
+                        Some(c) => format!(
+                            "the server rejected the connection ({c}) — check the \
+                             destination URL and app path"
+                        ),
+                        None => "the server rejected the connection — check the \
+                                 destination URL and app path"
+                            .to_string(),
+                    },
+                    rc.server_code.clone(),
+                ),
+            };
+        }
+    }
+    (
+        EventSeverity::Warning,
+        "rtmp_connect_failed",
+        "could not reach the RTMP server (unreachable, refused, reset, or timed out)"
+            .to_string(),
+        None,
+    )
+}
+
+/// Build an output-scoped RTMP event carrying a stable `error_code` plus the
+/// (secret-free) destination URL, merging any caller-supplied `extra` details.
+/// Flow- and output-scoped so the manager UI can attribute it to the right
+/// flow card and the events feed's RTMP filter picks it up. The `stream_key`
+/// is deliberately never included.
+fn rtmp_output_event(
+    severity: EventSeverity,
+    error_code: &str,
+    message: String,
+    config: &RtmpOutputConfig,
+    flow_id: &str,
+    extra: serde_json::Value,
+) -> Event {
+    let mut details = serde_json::json!({
+        "error_code": error_code,
+        "dest_url": config.dest_url,
+    });
+    if let (serde_json::Value::Object(base), serde_json::Value::Object(extra)) =
+        (&mut details, extra)
+    {
+        for (k, v) in extra {
+            base.insert(k, v);
+        }
+    }
+    Event {
+        severity,
+        category: category::RTMP.to_string(),
+        message,
+        details: Some(details),
+        flow_id: Some(flow_id.to_string()),
+        input_id: None,
+        output_id: Some(config.id.clone()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2278,6 +2446,98 @@ mod tests {
             attempts <= 7,
             "expected ≤ 7 reconnect attempts in 60 s with the new \
              backoff, got {attempts} (elapsed={elapsed}s)"
+        );
+    }
+
+    /// A transport-level failure (no typed `RtmpConnectError` in the chain —
+    /// unreachable host, reset, timeout) classifies as a Warning
+    /// `rtmp_connect_failed` with no server code.
+    #[test]
+    fn classify_transport_failure_is_warning() {
+        let err = anyhow::anyhow!("connection reset by peer");
+        let (sev, code, _reason, server_code) = classify_rtmp_failure(&err);
+        assert_eq!(sev, EventSeverity::Warning);
+        assert_eq!(code, "rtmp_connect_failed");
+        assert!(server_code.is_none());
+    }
+
+    /// The bad/expired-stream-key case: a `PublishRejected` classifies as a
+    /// Critical `rtmp_publish_rejected` carrying the server code, and the
+    /// classification survives the `.context(...)` wrapping that
+    /// `RtmpClient::connect` applies — proving the `anyhow` chain walk works.
+    #[test]
+    fn classify_publish_rejected_survives_context_wrapping() {
+        use anyhow::Context;
+        let err: anyhow::Error = Err::<(), _>(RtmpConnectError {
+            kind: RtmpFailureKind::PublishRejected,
+            server_code: Some("NetStream.Publish.BadName".to_string()),
+        })
+        .context("RTMP: publish rejected by server")
+        .unwrap_err();
+
+        let (sev, code, reason, server_code) = classify_rtmp_failure(&err);
+        assert_eq!(sev, EventSeverity::Critical);
+        assert_eq!(code, "rtmp_publish_rejected");
+        assert_eq!(server_code.as_deref(), Some("NetStream.Publish.BadName"));
+        assert!(
+            reason.contains("stream key"),
+            "reason must name the stream key: {reason}"
+        );
+    }
+
+    /// A `ConnectRejected` (wrong URL / app) classifies as a Critical
+    /// `rtmp_connect_rejected`.
+    #[test]
+    fn classify_connect_rejected_is_critical() {
+        let err: anyhow::Error = RtmpConnectError {
+            kind: RtmpFailureKind::ConnectRejected,
+            server_code: None,
+        }
+        .into();
+        let (sev, code, _reason, _sc) = classify_rtmp_failure(&err);
+        assert_eq!(sev, EventSeverity::Critical);
+        assert_eq!(code, "rtmp_connect_rejected");
+    }
+
+    /// The event carries the flow + output scope and the (secret-free)
+    /// destination URL, and the stream key never appears in the payload.
+    #[test]
+    fn rtmp_output_event_scoped_and_never_leaks_stream_key() {
+        let config: RtmpOutputConfig = serde_json::from_value(serde_json::json!({
+            "id": "out-1",
+            "name": "twitch",
+            "dest_url": "rtmp://live.twitch.tv/app",
+            "stream_key": "live_000_SUPER_SECRET_KEY",
+        }))
+        .expect("minimal RTMP output config deserialises");
+
+        let ev = rtmp_output_event(
+            EventSeverity::Critical,
+            "rtmp_publish_rejected",
+            "RTMP output 'out-1' — the server rejected the publish".to_string(),
+            &config,
+            "flow-xyz",
+            serde_json::json!({ "server_code": "NetStream.Publish.BadName" }),
+        );
+
+        assert_eq!(ev.severity, EventSeverity::Critical);
+        assert_eq!(ev.category, category::RTMP);
+        assert_eq!(ev.flow_id.as_deref(), Some("flow-xyz"));
+        assert_eq!(ev.output_id.as_deref(), Some("out-1"));
+        assert!(ev.input_id.is_none());
+        let details = ev.details.clone().expect("details present");
+        assert_eq!(details["error_code"], "rtmp_publish_rejected");
+        assert_eq!(details["dest_url"], "rtmp://live.twitch.tv/app");
+        assert_eq!(details["server_code"], "NetStream.Publish.BadName");
+
+        let blob = format!(
+            "{} {}",
+            ev.message,
+            serde_json::to_string(&ev.details).unwrap()
+        );
+        assert!(
+            !blob.contains("SUPER_SECRET"),
+            "stream key leaked into event payload: {blob}"
         );
     }
 }

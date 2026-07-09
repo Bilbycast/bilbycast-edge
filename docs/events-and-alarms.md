@@ -212,13 +212,37 @@ and event generation live inside `bilbycast-bonding` at
 
 ### RTMP (`rtmp`)
 
+#### RTMP Input (server)
+
 | Severity | Message | Trigger | Details |
 |----------|---------|---------|---------|
 | info | RTMP publisher connected | Client connected and started publishing | |
 | warning | RTMP publisher disconnected | Publisher disconnected | |
 | critical | RTMP server error: {error} | Server bind or accept failure | `{ error }` |
 
-**Source**: `src/engine/input_rtmp.rs`
+#### RTMP Output (push to Twitch / YouTube / any RTMP ingest)
+
+The output task publishes to a remote RTMP server and reconnects forever with
+exponential backoff (1, 2, 4, 8, 16 s, capped at `max(reconnect_delay_secs, 30 s)`).
+Each event fires **once per distinct cause** — a backoff loop against an
+unreachable server or a bad stream key raises **one** alarm, not one per retry —
+and the dedup latch clears (with a `rtmp_output_connected` recovery event) on the
+next successful connect. `output_id` (and `flow_id`) are set on every event; the
+`stream_key` is never included. RTMP has no dedicated "expired key" code, so a
+bad / expired / duplicate key is reported as a publish rejection.
+
+| Severity | Message | Trigger | Details |
+|----------|---------|---------|---------|
+| info | RTMP output '{id}' connected to {url} | A connect succeeded after a prior failure (clears the alarm) | `{ error_code: "rtmp_output_connected", dest_url }` |
+| warning | RTMP output '{id}' — could not reach the RTMP server (unreachable, refused, reset, or timed out) | TCP connect / handshake failed, or the server dropped the socket (the common way Twitch signals a bad key) | `{ error_code: "rtmp_connect_failed", dest_url, detail }` |
+| warning | RTMP output '{id}' lost its connection to {url} | A previously-healthy publish dropped mid-stream | `{ error_code: "rtmp_connect_failed", dest_url, detail }` |
+| critical | RTMP output '{id}' — the server rejected the publish ({code}) — the stream key is most likely wrong, expired, or already streaming elsewhere | Server returned an `onStatus` error (e.g. `NetStream.Publish.BadName`) or an `_error` to the `publish` command | `{ error_code: "rtmp_publish_rejected", dest_url, server_code, detail }` |
+| critical | RTMP output '{id}' — the server rejected the connection ({code}) — check the destination URL and app path | Server returned `_error` to the `connect` command (wrong app / denied) | `{ error_code: "rtmp_connect_rejected", dest_url, detail }` |
+| critical | RTMP output '{id}' gave up after {n} failed connection attempts to {url} | `max_reconnect_attempts` exhausted (only when the operator sets a finite limit; default is unlimited) | `{ error_code: "rtmp_output_gave_up", dest_url, max_reconnect_attempts }` |
+
+**Source**: `src/engine/input_rtmp.rs` (input), `src/engine/output_rtmp.rs` +
+`src/engine/rtmp/client.rs` (output — `RtmpConnectError` carries the
+publish-vs-connect rejection distinction through the `anyhow` chain)
 
 ---
 
