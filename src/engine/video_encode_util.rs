@@ -88,6 +88,77 @@ fn backend_label(c: VideoEncoderCodec) -> &'static str {
     }
 }
 
+/// libx264 / libx265 tune vocabulary.
+const SW_TUNES: &[&str] = &[
+    "zerolatency",
+    "film",
+    "animation",
+    "grain",
+    "stillimage",
+    "fastdecode",
+    "psnr",
+    "ssim",
+];
+/// NVENC tune vocabulary. Disjoint from [`SW_TUNES`].
+const NVENC_TUNES: &[&str] = &["hq", "ll", "ull", "lossless"];
+
+/// Default `tune` when the operator did not set one.
+///
+/// `zerolatency` is an **x264/x265-only** tune. NVENC exposes a `tune` option
+/// too, but its vocabulary is `hq` / `ll` / `ull` / `lossless`; handing it
+/// `zerolatency` makes `avcodec_open2` fail with `EINVAL (-22)`. Defaulting it
+/// unconditionally therefore broke *every* NVENC user who did not explicitly
+/// set `tune: ""`.
+///
+/// Empty means "don't pass `tune` to the encoder at all" (see
+/// `video_engine::VideoEncoder::open`), which is the right default for the
+/// hardware backends: they are already low-latency by construction.
+fn default_tune_for(backend: VideoEncoderCodec) -> String {
+    match backend {
+        VideoEncoderCodec::X264 | VideoEncoderCodec::X265 => "zerolatency".to_string(),
+        _ => String::new(),
+    }
+}
+
+/// Drop a `tune` the resolved backend cannot accept, rather than letting
+/// `avcodec_open2` fail with an opaque `EINVAL (-22)`.
+///
+/// Config validation is permissive over the union of the vocabularies because
+/// `h264_auto` / `hevc_auto` resolve their backend per-host at flow start: a
+/// tune legal for the x264 one host picks is illegal for the NVENC another host
+/// picks, and neither is knowable at config load. This is the point where the
+/// backend *is* known, so it is the only place the check can be correct.
+///
+/// QSV and VAAPI expose no `tune` option at all — libavcodec ignores unknown
+/// dictionary entries, so passing one is harmless, but dropping it keeps the
+/// encoder's option dictionary honest.
+fn sanitise_tune(backend: VideoEncoderCodec, tune: String) -> String {
+    if tune.is_empty() {
+        return tune;
+    }
+    let acceptable: &[&str] = match backend {
+        VideoEncoderCodec::X264 | VideoEncoderCodec::X265 => SW_TUNES,
+        VideoEncoderCodec::H264Nvenc | VideoEncoderCodec::HevcNvenc => NVENC_TUNES,
+        // QSV / VAAPI: no `tune` option exists.
+        _ => &[],
+    };
+    if acceptable.contains(&tune.as_str()) {
+        return tune;
+    }
+    let accepts = if acceptable.is_empty() {
+        "no tune option".to_string()
+    } else {
+        acceptable.join(", ")
+    };
+    tracing::warn!(
+        error_code = "encoder_tune_not_supported",
+        "video_encode.tune '{tune}' is not supported by the {} backend ({accepts}); \
+         ignoring it — the encoder would otherwise fail to open with EINVAL",
+        backend_label(backend),
+    );
+    String::new()
+}
+
 /// Build a [`VideoEncoderConfig`] from the edge-side [`VideoEncodeConfig`],
 /// runtime-derived source dimensions, and the backend selected by the
 /// caller. `global_header` depends on the container — RTMP needs
@@ -133,7 +204,10 @@ pub fn build_encoder_config(
         crf: cfg.crf.unwrap_or(23),
         max_b_frames: cfg.bframes.unwrap_or(0),
         refs: cfg.refs.unwrap_or(0),
-        tune: cfg.tune.clone().unwrap_or_else(|| "zerolatency".to_string()),
+        tune: sanitise_tune(
+            backend,
+            cfg.tune.clone().unwrap_or_else(|| default_tune_for(backend)),
+        ),
         level: cfg.level.clone().unwrap_or_default(),
         color_primaries: cfg.color_primaries.clone().unwrap_or_default(),
         color_transfer: cfg.color_transfer.clone().unwrap_or_default(),
@@ -705,4 +779,95 @@ fn is_planar_yuv_av_pix_fmt(av_pix_fmt: i32) -> bool {
     // thin shim — the constants live in `libffmpeg-video-sys` which
     // bilbycast-edge does not depend on directly.
     video_engine::is_planar_yuv_av_pix_fmt(av_pix_fmt)
+}
+
+#[cfg(test)]
+mod tune_tests {
+    use super::{default_tune_for, sanitise_tune};
+    use video_codec::VideoEncoderCodec::{self, *};
+
+    const ALL_BACKENDS: &[VideoEncoderCodec] = &[
+        X264, X265, H264Nvenc, HevcNvenc, H264Qsv, HevcQsv, H264Vaapi, HevcVaapi,
+    ];
+
+    /// `zerolatency` is x264-only. Defaulting it for every backend made
+    /// `avcodec_open2` return EINVAL(-22) for every NVENC user who did not
+    /// explicitly set `tune: ""` — i.e. all of them.
+    #[test]
+    fn zerolatency_defaults_only_for_software_backends() {
+        assert_eq!(default_tune_for(X264), "zerolatency");
+        assert_eq!(default_tune_for(X265), "zerolatency");
+        for &b in &[H264Nvenc, HevcNvenc, H264Qsv, HevcQsv, H264Vaapi, HevcVaapi] {
+            assert_eq!(
+                default_tune_for(b),
+                "",
+                "{b:?} must not default to an x264 tune",
+            );
+        }
+    }
+
+    /// The invariant that actually protects the encoder: whatever the operator
+    /// (or the `*_auto` resolver) produces, the tune handed to `avcodec_open2`
+    /// is one that backend accepts — or empty, meaning "not passed at all".
+    #[test]
+    fn no_backend_ever_receives_a_tune_it_rejects() {
+        let every_tune = [
+            "zerolatency",
+            "film",
+            "animation",
+            "grain",
+            "stillimage",
+            "fastdecode",
+            "psnr",
+            "ssim",
+            "hq",
+            "ll",
+            "ull",
+            "lossless",
+            "",
+        ];
+        for &backend in ALL_BACKENDS {
+            let acceptable: &[&str] = match backend {
+                X264 | X265 => super::SW_TUNES,
+                H264Nvenc | HevcNvenc => super::NVENC_TUNES,
+                _ => &[],
+            };
+            for tune in every_tune {
+                let out = sanitise_tune(backend, tune.to_string());
+                assert!(
+                    out.is_empty() || acceptable.contains(&out.as_str()),
+                    "{backend:?} would receive unsupported tune {out:?}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn valid_tunes_survive_sanitisation() {
+        assert_eq!(sanitise_tune(X264, "zerolatency".into()), "zerolatency");
+        assert_eq!(sanitise_tune(X265, "grain".into()), "grain");
+        assert_eq!(sanitise_tune(H264Nvenc, "ll".into()), "ll");
+        assert_eq!(sanitise_tune(HevcNvenc, "hq".into()), "hq");
+    }
+
+    #[test]
+    fn cross_family_tunes_are_dropped_not_passed_through() {
+        // The reported bug, exactly.
+        assert_eq!(sanitise_tune(H264Nvenc, "zerolatency".into()), "");
+        // And its mirror image.
+        assert_eq!(sanitise_tune(X264, "ll".into()), "");
+        // QSV / VAAPI have no tune option at all.
+        assert_eq!(sanitise_tune(H264Qsv, "zerolatency".into()), "");
+        assert_eq!(sanitise_tune(HevcVaapi, "hq".into()), "");
+    }
+
+    /// The SW and NVENC vocabularies must stay disjoint, otherwise
+    /// `sanitise_tune`'s per-family dispatch would silently accept a tune for
+    /// the wrong backend.
+    #[test]
+    fn tune_vocabularies_are_disjoint() {
+        for t in super::NVENC_TUNES {
+            assert!(!super::SW_TUNES.contains(t), "{t} appears in both tables");
+        }
+    }
 }
