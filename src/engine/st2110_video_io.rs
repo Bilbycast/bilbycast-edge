@@ -705,6 +705,15 @@ fn encode_worker(
         false,
         "ST 2110-20 input".to_string(),
     );
+    // The pts fed to this pipeline are 90 kHz ticks resolved from the RTP
+    // timestamp (see the timeline resolver below) so PES PTS carry real
+    // timing. The encoder must be told, or libx264 reads them against a
+    // 1/fps timebase and its VBV rate control segfaults ~one lookahead-depth
+    // of frames after open. This path shipped feeding 90 kHz without
+    // declaring it — every ST 2110-20/-23 ingest with a software encoder
+    // was one flow-start away from that crash; the hardware backends merely
+    // tolerated the mistake.
+    pipeline.set_pts_90k();
     // ST 2110 ingest is a paced raster source — pipeline the HW encoder
     // on high-pixel-rate rasters so they sustain wire speed. A per-frame
     // submit-then-sync round trip caps hevc_qsv at ~30 fps for 2160p50

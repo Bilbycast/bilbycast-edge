@@ -643,6 +643,11 @@ fn run_capture_session(
         false,
         format!("SDI input:{ctx}"),
     );
+    // The pts fed below are 90 kHz ticks (they flow straight into the TS
+    // mux), not a frame counter. Without this, libx264 reads them against a
+    // 1/fps timebase and its VBV rate control segfaults ~one lookahead-depth
+    // of frames in. NVENC merely tolerated the same mistake.
+    pipeline.set_pts_90k();
 
     let mut audio = setup_audio(
         ctx,

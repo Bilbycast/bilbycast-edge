@@ -255,6 +255,11 @@ pub fn build_encoder_config(
         crf: cfg.crf.unwrap_or(23),
         max_b_frames: cfg.bframes.unwrap_or(0),
         refs: cfg.refs.unwrap_or(0),
+        // Default 0/0 = pts is a frame counter in 1/fps ticks (the transcode
+        // outputs' contract). 90 kHz ingest paths override via
+        // `ScaledVideoEncoder::set_pts_90k` at lazy-open.
+        time_base_num: 0,
+        time_base_den: 0,
         tune: sanitise_tune(
             backend,
             cfg.tune.clone().unwrap_or_else(|| default_tune_for(backend)),
@@ -409,6 +414,12 @@ pub struct ScaledVideoEncoder {
     // raster and a per-frame submit-then-sync round trip caps the
     // encoder below wire rate.
     async_depth: u32,
+    /// When set, the encoder is opened with a 1/90000 pts timebase: the pts
+    /// passed to `encode` / `encode_raw_planes` are 90 kHz ticks (MPEG-TS
+    /// ingest paths — SDI, ST 2110-20/-23), not a frame counter. Getting this
+    /// wrong is not cosmetic: libx264's VBV rate control reads 90 kHz ticks
+    /// against a 1/fps timebase as "frames minutes apart" and **segfaults**.
+    pts_90k: bool,
 }
 
 #[cfg(feature = "media-codecs")]
@@ -464,6 +475,7 @@ impl ScaledVideoEncoder {
             log_tag: log_tag.into(),
             resolved_backend_sink: None,
             async_depth: 0,
+            pts_90k: false,
         }
     }
 
@@ -474,6 +486,13 @@ impl ScaledVideoEncoder {
     /// (libavcodec has no mid-stream pipeline reconfigure).
     pub fn set_async_depth(&mut self, depth: u32) {
         self.async_depth = depth;
+    }
+
+    /// Declare that this pipeline's pts values are 90 kHz ticks rather than a
+    /// frame counter. Must be called before the first `encode*` (lazy-open
+    /// reads it). See the `pts_90k` field for why this is load-bearing.
+    pub fn set_pts_90k(&mut self) {
+        self.pts_90k = true;
     }
 
     /// Plumb a [`ResolvedBackendCell`] that the encoder writes to on
@@ -711,6 +730,10 @@ impl ScaledVideoEncoder {
                 self.global_header,
             );
             enc_cfg.async_depth = self.async_depth;
+            if self.pts_90k {
+                enc_cfg.time_base_num = 1;
+                enc_cfg.time_base_den = 90_000;
+            }
             let dst_w = enc_cfg.width;
             let dst_h = enc_cfg.height;
             match video_engine::VideoEncoder::open(&enc_cfg) {
