@@ -876,3 +876,101 @@ fn run_capture_session(
         }
     }
 }
+
+#[cfg(all(test, feature = "media-codecs"))]
+mod tests {
+    use super::unpack_uyvy422;
+    use crate::engine::video_encode_util::resolve_chroma;
+
+    /// Build a UYVY422 buffer with `stride` padding after each row, so the
+    /// tests exercise the real capture case where stride > width * 2.
+    fn uyvy(rows: &[[u8; 4]], stride: usize) -> Vec<u8> {
+        let mut buf = vec![0xAA; rows.len() * stride]; // padding must be ignored
+        for (r, row) in rows.iter().enumerate() {
+            buf[r * stride..r * stride + 4].copy_from_slice(row);
+        }
+        buf
+    }
+
+    // Two 2x2 frames' worth of macropixels: [U, Y0, V, Y1] per two pixels.
+    const ROW0: [u8; 4] = [10, 100, 20, 101];
+    const ROW1: [u8; 4] = [30, 102, 40, 103];
+
+    #[test]
+    fn unpacks_422_preserving_chroma_per_row() {
+        let data = uyvy(&[ROW0, ROW1], 8);
+        let (mut y, mut cb, mut cr) = ([0u8; 4], [0u8; 2], [0u8; 2]);
+        unpack_uyvy422(&data, 8, 2, 2, false, &mut y, &mut cb, &mut cr);
+
+        assert_eq!(y, [100, 101, 102, 103], "luma is full-rate and in order");
+        // 4:2:2 keeps one chroma sample per macropixel on *every* row.
+        assert_eq!(cb, [10, 30]);
+        assert_eq!(cr, [20, 40]);
+    }
+
+    #[test]
+    fn unpacks_420_averaging_vertical_chroma_pairs() {
+        let data = uyvy(&[ROW0, ROW1], 8);
+        let (mut y, mut cb, mut cr) = ([0u8; 4], [0u8; 1], [0u8; 1]);
+        unpack_uyvy422(&data, 8, 2, 2, true, &mut y, &mut cb, &mut cr);
+
+        // Luma is identical to the 4:2:2 case — only chroma is subsampled.
+        assert_eq!(y, [100, 101, 102, 103]);
+        // Averaged over the vertical row pair, truncating: (10+30)>>1, (20+40)>>1.
+        assert_eq!(cb, [20], "Cb averaged down the row pair");
+        assert_eq!(cr, [30], "Cr averaged down the row pair");
+    }
+
+    /// Regression guard for the bug that produced ghosted chroma: taking the
+    /// top row's chroma instead of averaging silently yields plausible-looking
+    /// output, so assert the two layouts genuinely differ on the same input.
+    #[test]
+    fn four_two_zero_is_not_four_two_two_truncated() {
+        let data = uyvy(&[ROW0, ROW1], 8);
+
+        let (mut y2, mut cb2, mut cr2) = ([0u8; 4], [0u8; 2], [0u8; 2]);
+        unpack_uyvy422(&data, 8, 2, 2, false, &mut y2, &mut cb2, &mut cr2);
+
+        let (mut y0, mut cb0, mut cr0) = ([0u8; 4], [0u8; 1], [0u8; 1]);
+        unpack_uyvy422(&data, 8, 2, 2, true, &mut y0, &mut cb0, &mut cr0);
+
+        assert_ne!(cb0[0], cb2[0], "4:2:0 must average, not copy the top row");
+    }
+
+    #[test]
+    fn ignores_stride_padding() {
+        // Same pixels, wider stride. Output must be byte-identical.
+        let tight = uyvy(&[ROW0, ROW1], 4);
+        let padded = uyvy(&[ROW0, ROW1], 16);
+
+        let (mut ya, mut cba, mut cra) = ([0u8; 4], [0u8; 2], [0u8; 2]);
+        unpack_uyvy422(&tight, 4, 2, 2, false, &mut ya, &mut cba, &mut cra);
+        let (mut yb, mut cbb, mut crb) = ([0u8; 4], [0u8; 2], [0u8; 2]);
+        unpack_uyvy422(&padded, 16, 2, 2, false, &mut yb, &mut cbb, &mut crb);
+
+        assert_eq!((ya, cba, cra), (yb, cbb, crb));
+    }
+
+    /// `sdi_input_blocking_loop` derives `chroma_420` from the encoder's
+    /// resolved chroma, then unpacks straight into that layout. If the
+    /// resolver ever grew a chroma the unpacker cannot emit, planes would be
+    /// fed to the encoder in the wrong shape — the exact upstream bug this
+    /// path was written to sidestep. Pin the mapping.
+    #[test]
+    fn chroma_resolution_agrees_with_the_unpacker() {
+        use video_codec::VideoChroma;
+
+        // Config validation rejects everything except these two for SDI, so
+        // these are the only chromas `unpack_uyvy422` must ever service.
+        assert_eq!(resolve_chroma(Some("yuv420p")), VideoChroma::Yuv420);
+        assert_eq!(resolve_chroma(Some("yuv422p")), VideoChroma::Yuv422);
+        // An unset chroma defaults to 4:2:0, which the unpacker supports.
+        assert_eq!(resolve_chroma(None), VideoChroma::Yuv420);
+
+        // And the layouts the unpacker branches on are exactly those two.
+        for (chroma, expect_420) in [("yuv420p", true), ("yuv422p", false)] {
+            let is_420 = matches!(resolve_chroma(Some(chroma)), VideoChroma::Yuv420);
+            assert_eq!(is_420, expect_420, "chroma {chroma} maps to the right branch");
+        }
+    }
+}

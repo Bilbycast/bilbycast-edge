@@ -6642,17 +6642,21 @@ fn default_sdi_audio_channels() -> u8 { 2 }
 /// `audio_encode`, and muxes both into a single A+V MPEG-TS on the flow's
 /// broadcast channel. Self-clocked — no PTP requirement (unlike MXL).
 ///
-/// `device` is the FFmpeg DeckLink device string, e.g. `"DeckLink Quad (1)"`
-/// (as printed by `ffmpeg -sources decklink`).
+/// `device` is the DeckLink SDK display name, e.g. `"DeckLink Quad (1)"`, as
+/// listed by the boot probe and on `HealthPayload.sdi_devices[]`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SdiInputConfig {
-    /// FFmpeg DeckLink device string, e.g. `"DeckLink Quad (1)"`.
+    /// DeckLink device display name, e.g. `"DeckLink Quad (1)"`.
     pub device: String,
-    /// SDI mode: `"auto"` (card input-format detection) or a concrete
-    /// FFmpeg `format_code` such as `"Hi50"` / `"Hp30"`.
+    /// SDI mode: `"auto"` (card input-format detection, **strongly preferred**)
+    /// or a concrete DeckLink mode FourCC such as `"Hi50"` / `"Hp30"`. A forced
+    /// mode that does not match the source makes the card report no signal and
+    /// emit bars, so `"auto"` is the default and the right answer nearly always.
     #[serde(default = "default_sdi_format")]
     pub format: String,
-    /// Wire pixel format: `"uyvy422"` (8-bit, default) or `"v210"` (10-bit).
+    /// Wire pixel format. `"uyvy422"` (8-bit, default) is the only one
+    /// implemented; `"v210"` (10-bit) is accepted by the card but has no
+    /// unpacker yet and is rejected at validation.
     #[serde(default = "default_sdi_pixel_format")]
     pub pixel_format: String,
     /// Embedded-audio channel count to capture (2 / 8 / 16). 0 = video only.

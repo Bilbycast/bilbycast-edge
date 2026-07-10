@@ -6056,8 +6056,39 @@ fn validate_sdi_input(c: &crate::config::models::SdiInputConfig) -> Result<()> {
     if !matches!(c.pixel_format.as_str(), "uyvy422" | "v210") {
         bail!("{ctx}: pixel_format must be uyvy422 or v210 (got {:?})", c.pixel_format);
     }
+    // `v210` is 10-bit and `engine::sdi_io` has no 10-bit unpacker yet — it
+    // would refuse the flow at runtime with a Critical event. Refuse at config
+    // load instead, so an operator finds out before air, not during.
+    if c.pixel_format == "v210" {
+        bail!(
+            "{ctx}: pixel_format=v210 (10-bit) is not implemented yet — use uyvy422"
+        );
+    }
     // video_encode is mandatory for SDI — same as MXL video / ST 2110-20.
     validate_video_encode(&c.video_encode, &ctx)?;
+
+    // SDI capture is 8-bit 4:2:2 (`uyvy422`), and `sdi_io::unpack_uyvy422`
+    // writes straight into the encoder's plane layout to skip a libswscale
+    // pass. The encoder's chroma must therefore be one this unpacker produces.
+    //
+    // Note this is a constraint of the *capture format*, not of any encoder.
+    // Every backend the edge supports — x264 / x265 / NVENC / QSV / VAAPI, and
+    // the `h264_auto` / `hevc_auto` resolver — is reachable from SDI at 8-bit.
+    // 4:4:4 and 10-bit open up once v210 capture is unpacked.
+    let chroma = c.video_encode.chroma.as_deref().unwrap_or("yuv420p");
+    if !matches!(chroma, "yuv420p" | "yuv422p") {
+        bail!(
+            "{ctx}: video_encode.chroma must be yuv420p or yuv422p for SDI \
+             (got {chroma:?}) — SDI capture is 8-bit 4:2:2"
+        );
+    }
+    let bit_depth = c.video_encode.bit_depth.unwrap_or(8);
+    if bit_depth != 8 {
+        bail!(
+            "{ctx}: video_encode.bit_depth must be 8 for SDI (got {bit_depth}) — \
+             SDI capture is 8-bit 4:2:2 (uyvy422); 10-bit requires v210 capture"
+        );
+    }
     Ok(())
 }
 
@@ -12054,5 +12085,120 @@ mod tests {
             }))
             .unwrap();
         super::validate_bonded_input(&cfg).expect("QUIC server 0.0.0.0 bind validates");
+    }
+
+    // ── SDI (DeckLink) input ──────────────────────────────────────────────
+
+    fn sdi_config(
+        pixel_format: &str,
+        codec: &str,
+        chroma: Option<&str>,
+        bit_depth: Option<u8>,
+    ) -> crate::config::models::SdiInputConfig {
+        serde_json::from_value(serde_json::json!({
+            "device": "DeckLink Quad (1)",
+            "format": "auto",
+            "pixel_format": pixel_format,
+            "audio_channels": 2,
+            "video_encode": {
+                "codec": codec,
+                "bitrate_kbps": 10000,
+                "chroma": chroma,
+                "bit_depth": bit_depth,
+            }
+        }))
+        .expect("SDI config fixture must deserialize")
+    }
+
+    /// The capture format, not the encoder, is what bounds SDI to 8-bit.
+    /// `v210` capture would lift this, but its unpacker is unwritten — so
+    /// refuse at config load rather than with a runtime Critical mid-show.
+    #[test]
+    fn sdi_rejects_ten_bit_before_the_flow_starts() {
+        let e = super::validate_sdi_input(&sdi_config("v210", "h264_nvenc", None, None))
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("v210"), "v210 rejected with a useful message: {e}");
+
+        let e = super::validate_sdi_input(&sdi_config(
+            "uyvy422",
+            "hevc_nvenc",
+            Some("yuv420p"),
+            Some(10),
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(e.contains("bit_depth"), "10-bit rejected: {e}");
+
+        // 4:4:4 has no path out of an 8-bit 4:2:2 capture either.
+        let e = super::validate_sdi_input(&sdi_config("uyvy422", "x264", Some("yuv444p"), None))
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("chroma"), "yuv444p rejected: {e}");
+    }
+
+    /// SDI must stay **encoder-agnostic**: it reuses the shared host-capability
+    /// resolver, so at 8-bit it must accept exactly the codecs the generic
+    /// encoder validator accepts — no more, no fewer. A regression here would
+    /// silently strand CPU-only or Intel/AMD hosts on an NVIDIA-shaped path.
+    ///
+    /// Asserting *agreement with `validate_video_encode`* rather than a fixed
+    /// pass-list keeps this honest across builds: an uncompiled backend is
+    /// rightly rejected ("rebuild with video-encoder-x265"), and that rejection
+    /// must come from the encoder validator, never from SDI.
+    #[test]
+    fn sdi_adds_no_encoder_restriction_at_eight_bit() {
+        for codec in [
+            "x264",
+            "x265",
+            "h264_nvenc",
+            "hevc_nvenc",
+            "h264_qsv",
+            "hevc_qsv",
+            "h264_vaapi",
+            "hevc_vaapi",
+            "h264_auto",
+            "hevc_auto",
+        ] {
+            for chroma in [None, Some("yuv420p"), Some("yuv422p")] {
+                let cfg = sdi_config("uyvy422", codec, chroma, None);
+                let sdi_ok = super::validate_sdi_input(&cfg).is_ok();
+                let generic_ok = super::validate_video_encode(&cfg.video_encode, "t").is_ok();
+                assert_eq!(
+                    sdi_ok, generic_ok,
+                    "SDI must neither add nor drop an encoder restriction: \
+                     codec={codec} chroma={chroma:?} (sdi={sdi_ok}, generic={generic_ok})",
+                );
+            }
+        }
+    }
+
+    /// The `*_auto` strings are how a CPU-only or Intel/AMD host gets a working
+    /// SDI flow without knowing the GPU. They must always validate — they are
+    /// resolved per-host at flow start, never at config load.
+    #[test]
+    fn sdi_accepts_auto_encoder_selection() {
+        for codec in ["h264_auto", "hevc_auto"] {
+            let cfg = sdi_config("uyvy422", codec, Some("yuv420p"), None);
+            assert!(
+                super::validate_sdi_input(&cfg).is_ok(),
+                "SDI must accept {codec} so host-agnostic configs work",
+            );
+        }
+    }
+
+    #[test]
+    fn sdi_rejects_bad_device_and_audio_channels() {
+        let mut cfg = sdi_config("uyvy422", "x264", None, None);
+        cfg.device = "  ".into();
+        assert!(
+            super::validate_sdi_input(&cfg).is_err(),
+            "empty device rejected"
+        );
+
+        let mut cfg = sdi_config("uyvy422", "x264", None, None);
+        cfg.audio_channels = 4; // SDI embedded audio is 2 / 8 / 16, or 0
+        let e = super::validate_sdi_input(&cfg).unwrap_err().to_string();
+        assert!(e.contains("audio_channels"), "4ch rejected: {e}");
     }
 }
