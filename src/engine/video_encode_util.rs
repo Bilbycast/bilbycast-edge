@@ -213,7 +213,12 @@ pub fn select_scaler_dst_format(
 ) -> Option<video_codec::ScalerDstFormat> {
     use video_codec::ScalerDstFormat;
     match (chroma, bit_depth) {
-        (VideoChroma::Yuv420, 8) => Some(ScalerDstFormat::Yuvj420p),
+        // Limited-range `Yuv420p8`, not full-range `Yuvj420p`. This function
+        // feeds a video encoder opened as `AV_PIX_FMT_YUV420P`; targeting a
+        // `J` format makes libswscale range-expand the samples, which the
+        // stream then signals as limited range. `Yuvj420p` remains correct for
+        // the MJPEG / thumbnail path, which selects it directly.
+        (VideoChroma::Yuv420, 8) => Some(ScalerDstFormat::Yuv420p8),
         (VideoChroma::Yuv420, 10) => Some(ScalerDstFormat::Yuv420p10le),
         (VideoChroma::Yuv422, 8) => Some(ScalerDstFormat::Yuv422p8),
         (VideoChroma::Yuv422, 10) => Some(ScalerDstFormat::Yuv422p10le),
@@ -646,22 +651,35 @@ impl ScaledVideoEncoder {
         src_h: u32,
         src_pix_fmt: i32,
     ) -> Option<video_engine::VideoScaler> {
-        // Two reasons to build a scaler:
+        // Three reasons to build a scaler:
         //   1. dimensions differ (operator asked for resize), or
-        //   2. source pixel format is not the planar YUV layout the
-        //      SW encoder feed path drains via `yuv_planes()` — e.g.
-        //      `NV12` / `P010LE` / `NV16` / `P210LE` from a HW
-        //      decoder, after the VAAPI sysmem download in
-        //      `ScaledVideoEncoder::encode`.
-        // When neither condition applies, source planes go straight to
-        // the encoder.
-        let dims_match = src_w == self.dst_w && src_h == self.dst_h;
-        let format_planar = is_planar_yuv_av_pix_fmt(src_pix_fmt);
-        if dims_match && format_planar {
-            return None;
-        }
+        //   2. source pixel format is not a planar YUV layout the SW encoder
+        //      feed path can drain via `yuv_planes()` — e.g. `NV12` / `P010LE`
+        //      / `NV16` / `P210LE` from a HW decoder, after the VAAPI sysmem
+        //      download in `ScaledVideoEncoder::encode`, or
+        //   3. the source is planar YUV but a *different* planar layout to the
+        //      one the encoder was opened with.
+        //
+        // (3) is the subtle one. `is_planar_yuv_av_pix_fmt` is equally true for
+        // 4:2:0, 4:2:2 and 4:4:4 — they all carry three planes. But 4:2:2 has
+        // twice the chroma rows of 4:2:0, so handing its planes to a 4:2:0
+        // encoder makes the encoder read chroma from the wrong lines: luma and
+        // geometry come out perfect while colour is ghosted and smeared.
+        // Testing only "both planar" therefore silently corrupts every
+        // same-resolution 4:2:2 → 4:2:0 transcode — which is the default
+        // (`chroma: yuv420p`) for ST 2110-20 and SDI ingest of a 4:2:2 source.
+        //
+        // Skip conversion only when the source's plane geometry is exactly what
+        // the encoder expects.
         let chroma = resolve_chroma(self.encode_cfg.chroma.as_deref());
         let bit_depth = self.encode_cfg.bit_depth.unwrap_or(8);
+
+        let dims_match = src_w == self.dst_w && src_h == self.dst_h;
+        let layout_matches = video_engine::planar_yuv_layout(src_pix_fmt)
+            .is_some_and(|src_layout| src_layout == (chroma, bit_depth));
+        if dims_match && layout_matches {
+            return None;
+        }
         let Some(dst_fmt) = select_scaler_dst_format(chroma, bit_depth) else {
             tracing::warn!(
                 "{}: video_encode target {:?} {}-bit is not supported by VideoScaler; \
@@ -692,17 +710,83 @@ impl ScaledVideoEncoder {
     }
 }
 
-/// `true` when the FFmpeg `AVPixelFormat` integer is one of the planar
-/// YUV layouts the SW-encoder feed path can drain via
-/// `DecodedFrame::yuv_planes()`. See [`video_engine::DecodedFrame::is_planar_yuv`]
-/// for the matching predicate on a live decoded frame; this variant
-/// takes the raw integer as exposed by [`video_engine::DecodedFrame::pixel_format`]
-/// so the lazy-open path can decide whether to insert a scaler before
-/// the first frame is in hand.
-#[cfg(feature = "media-codecs")]
-fn is_planar_yuv_av_pix_fmt(av_pix_fmt: i32) -> bool {
-    // Hand off to a `DecodedFrame::is_planar_yuv` companion through a
-    // thin shim — the constants live in `libffmpeg-video-sys` which
-    // bilbycast-edge does not depend on directly.
-    video_engine::is_planar_yuv_av_pix_fmt(av_pix_fmt)
+// NOTE: the former `is_planar_yuv_av_pix_fmt` shim lived here. `try_build_scaler`
+// was its only caller, and "is this *some* planar YUV?" is precisely the question
+// that let a 4:2:2 source reach a 4:2:0 encoder unconverted. It is replaced by
+// `video_engine::planar_yuv_layout`, which reports the actual plane geometry so
+// the source can be compared against the encoder's.
+
+#[cfg(all(test, feature = "media-codecs"))]
+mod scaler_selection_tests {
+    use super::select_scaler_dst_format;
+    use video_codec::{ScalerDstFormat, VideoChroma};
+
+    /// The encoder is opened as `AV_PIX_FMT_YUV420P` (limited range). Targeting
+    /// the full-range `YUVJ420P` makes libswscale range-expand the samples,
+    /// which the stream then signals as limited — a levels shift on every
+    /// scaled 8-bit 4:2:0 encode. The MJPEG/thumbnail path picks `Yuvj420p`
+    /// directly and is unaffected.
+    #[test]
+    fn eight_bit_420_encoder_feed_is_limited_range() {
+        assert_eq!(
+            select_scaler_dst_format(VideoChroma::Yuv420, 8),
+            Some(ScalerDstFormat::Yuv420p8),
+            "encoder feed must not target a full-range J format",
+        );
+    }
+
+    #[test]
+    fn other_targets_unchanged() {
+        assert_eq!(
+            select_scaler_dst_format(VideoChroma::Yuv420, 10),
+            Some(ScalerDstFormat::Yuv420p10le),
+        );
+        assert_eq!(
+            select_scaler_dst_format(VideoChroma::Yuv422, 8),
+            Some(ScalerDstFormat::Yuv422p8),
+        );
+        assert_eq!(
+            select_scaler_dst_format(VideoChroma::Yuv422, 10),
+            Some(ScalerDstFormat::Yuv422p10le),
+        );
+        // 4:4:4 has no scaler destination today.
+        assert_eq!(select_scaler_dst_format(VideoChroma::Yuv444, 8), None);
+    }
+
+    /// The predicate `try_build_scaler` now uses. A scaler must be built
+    /// whenever the source's plane geometry differs from the encoder's, even at
+    /// identical dimensions — the case the old "both planar" test missed.
+    fn conversion_needed(src_pix_fmt: i32, chroma: VideoChroma, bit_depth: u8) -> bool {
+        !video_engine::planar_yuv_layout(src_pix_fmt)
+            .is_some_and(|src| src == (chroma, bit_depth))
+    }
+
+    #[test]
+    fn same_resolution_422_source_into_420_encoder_needs_conversion() {
+        let src_422 = video_engine::av_pix_fmt_for_yuv(VideoChroma::Yuv422, 8).unwrap();
+        assert!(
+            conversion_needed(src_422, VideoChroma::Yuv420, 8),
+            "4:2:2 planes must never reach a 4:2:0 encoder unconverted \
+             (perfect luma, ghosted chroma)",
+        );
+    }
+
+    #[test]
+    fn matching_layout_still_skips_the_scaler() {
+        let src_420 = video_engine::av_pix_fmt_for_yuv(VideoChroma::Yuv420, 8).unwrap();
+        assert!(
+            !conversion_needed(src_420, VideoChroma::Yuv420, 8),
+            "identical layout must stay zero-copy — no pointless swscale pass",
+        );
+        let src_422 = video_engine::av_pix_fmt_for_yuv(VideoChroma::Yuv422, 8).unwrap();
+        assert!(!conversion_needed(src_422, VideoChroma::Yuv422, 8));
+    }
+
+    #[test]
+    fn bit_depth_mismatch_also_needs_conversion() {
+        let src_8 = video_engine::av_pix_fmt_for_yuv(VideoChroma::Yuv420, 8).unwrap();
+        assert!(conversion_needed(src_8, VideoChroma::Yuv420, 10));
+        let src_10 = video_engine::av_pix_fmt_for_yuv(VideoChroma::Yuv420, 10).unwrap();
+        assert!(conversion_needed(src_10, VideoChroma::Yuv420, 8));
+    }
 }
