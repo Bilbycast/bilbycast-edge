@@ -90,6 +90,27 @@ Events are queued in an unbounded in-memory channel. When the edge is not connec
 > category. The PLL fallback / recovery events below use a separate
 > **`master_clock`** category.
 
+### SDI Input (`flow`, `sdi-decklink` feature)
+
+SDI (DeckLink) capture events ride the `flow` category. The design intent:
+**signal loss never stops the transport stream** — the card substitutes
+bars/black and the edge keeps encoding so downstream sockets and decoder
+state stay warm; the operator gets an alarm instead of a silently
+healthy-looking stream.
+
+| Severity | Message | Notes |
+|----------|---------|-------|
+| warning | SDI input signal lost — no source locked; continuing to emit the card's bars/black | `error_code: sdi_signal_lost`. Cable pulled, source down, or a forced `format` mismatching the source. Nothing restarts. Queryable state on `InputStats.sdi_stats.signal_present`. |
+| info | SDI input signal restored | `error_code: sdi_signal_restored`. |
+| info | capture opened {w}x{h} @ {num}/{den} (session {n}) | `error_code: sdi_capture_opened`. Emitted per capture session, including re-opens. |
+| warning | capture open failed: {e} — retrying until the device returns | `error_code: sdi_capture_open_failed`. One event per session, retried every 500 ms — not one per retry. |
+| warning | source raster changed | `error_code: sdi_raster_changed`. Session re-opens with `auto` re-detection; muxer + PTS state persist so receivers see a clean continuation. |
+| warning | capture ended: {e} — reopening device | `error_code: sdi_capture_lost`. Device error / disappearance; supervision loop re-opens. |
+| critical | encoder open/config failed | `error_code: sdi_encode_failed` / `sdi_encode_config_failed`. Fatal for the flow — a device re-open cannot fix an encoder problem. |
+| warning | embedded-audio encoder init failed; continuing video-only | Audio degrades, video survives. |
+
+Full subsystem reference (config, telemetry, hardware gotchas): `sdi.md`.
+
 ---
 
 ### Master Clock (`master_clock`)
