@@ -159,6 +159,52 @@ fn sanitise_tune(backend: VideoEncoderCodec, tune: String) -> String {
     String::new()
 }
 
+/// Map a preset the resolved backend cannot accept onto its nearest
+/// equivalent, rather than letting `avcodec_open2` fail with `EINVAL (-22)`.
+///
+/// `tune`'s sibling, with one difference: an unsupported tune is safely
+/// *dropped* (the encoder picks its default), but a preset carries the
+/// operator's speed/quality intent, so it is *mapped* — an `ultrafast` ask on
+/// NVENC becomes `fast`, not silence.
+///
+/// Vocabularies, per the vendored FFmpeg n7.1.3:
+/// * libx264 / libx265 accept the full nine-name ladder.
+/// * NVENC's named presets are `slow` / `medium` / `fast` (plus `p1`–`p7` and
+///   legacy names the edge never emits). `ultrafast` et al. ⇒ EINVAL at open.
+/// * QSV accepts `veryfast` … `veryslow` — everything except `ultrafast` /
+///   `superfast`.
+/// * VAAPI exposes no `preset` option; libavcodec ignores the unknown dict
+///   entry, so anything is safe there.
+///
+/// Lives post-resolution for the same reason as [`sanitise_tune`]: with
+/// `h264_auto` / `hevc_auto` the backend — and hence the legal vocabulary —
+/// is only known here.
+fn sanitise_preset(backend: VideoEncoderCodec, preset: VideoPreset) -> VideoPreset {
+    use VideoPreset::*;
+    let mapped = match backend {
+        VideoEncoderCodec::H264Nvenc | VideoEncoderCodec::HevcNvenc => match preset {
+            Ultrafast | Superfast | Veryfast | Faster => Fast,
+            Slower | Veryslow => Slow,
+            ok => return ok,
+        },
+        VideoEncoderCodec::H264Qsv | VideoEncoderCodec::HevcQsv => match preset {
+            Ultrafast | Superfast => Veryfast,
+            ok => return ok,
+        },
+        // x264 / x265 accept the full ladder; VAAPI ignores the option.
+        _ => return preset,
+    };
+    tracing::warn!(
+        error_code = "encoder_preset_not_supported",
+        "video_encode.preset '{}' is not supported by the {} backend; \
+         using '{}' instead — the encoder would otherwise fail to open with EINVAL",
+        preset.as_str(),
+        backend_label(backend),
+        mapped.as_str(),
+    );
+    mapped
+}
+
 /// Build a [`VideoEncoderConfig`] from the edge-side [`VideoEncodeConfig`],
 /// runtime-derived source dimensions, and the backend selected by the
 /// caller. `global_header` depends on the container — RTMP needs
@@ -196,7 +242,7 @@ pub fn build_encoder_config(
         bitrate_kbps,
         max_bitrate_kbps: cfg.max_bitrate_kbps.unwrap_or(0),
         gop_size,
-        preset: resolve_preset(cfg.preset.as_deref()),
+        preset: sanitise_preset(backend, resolve_preset(cfg.preset.as_deref())),
         profile: resolve_profile(cfg.profile.as_deref()),
         chroma: resolve_chroma(cfg.chroma.as_deref()),
         bit_depth: cfg.bit_depth.unwrap_or(8),
@@ -868,6 +914,69 @@ mod tune_tests {
     fn tune_vocabularies_are_disjoint() {
         for t in super::NVENC_TUNES {
             assert!(!super::SW_TUNES.contains(t), "{t} appears in both tables");
+        }
+    }
+}
+
+#[cfg(test)]
+mod preset_tests {
+    use super::sanitise_preset;
+    use video_codec::VideoEncoderCodec::{self, *};
+    use video_codec::VideoPreset::{self, *};
+
+    const ALL_PRESETS: &[VideoPreset] = &[
+        Ultrafast, Superfast, Veryfast, Faster, Fast, Medium, Slow, Slower, Veryslow,
+    ];
+
+    /// The invariant: whatever the operator (or the `*_auto` resolver)
+    /// produces, the preset handed to `avcodec_open2` is one that backend
+    /// accepts. NVENC's named presets are slow/medium/fast; QSV rejects
+    /// ultrafast/superfast. Handing either an x264-only name is EINVAL.
+    #[test]
+    fn no_backend_ever_receives_a_preset_it_rejects() {
+        for &p in ALL_PRESETS {
+            for &b in &[H264Nvenc, HevcNvenc] {
+                assert!(
+                    matches!(sanitise_preset(b, p), Fast | Medium | Slow),
+                    "{b:?} would receive unsupported preset {:?}",
+                    sanitise_preset(b, p),
+                );
+            }
+            for &b in &[H264Qsv, HevcQsv] {
+                assert!(
+                    !matches!(sanitise_preset(b, p), Ultrafast | Superfast),
+                    "{b:?} would receive unsupported preset {:?}",
+                    sanitise_preset(b, p),
+                );
+            }
+        }
+    }
+
+    /// Mapping preserves the operator's speed/quality intent rather than
+    /// silently resetting to a default: fast asks stay fast, slow stay slow.
+    #[test]
+    fn mapping_preserves_speed_intent() {
+        // The reported bug, exactly: ultrafast on NVENC.
+        assert_eq!(sanitise_preset(H264Nvenc, Ultrafast), Fast);
+        assert_eq!(sanitise_preset(HevcNvenc, Veryslow), Slow);
+        assert_eq!(sanitise_preset(H264Qsv, Ultrafast), Veryfast);
+    }
+
+    /// Presets the backend accepts pass through untouched — including on
+    /// x264/x265 (full ladder) and VAAPI (no preset option; harmless).
+    #[test]
+    fn supported_presets_pass_through() {
+        for &p in ALL_PRESETS {
+            assert_eq!(sanitise_preset(X264, p), p);
+            assert_eq!(sanitise_preset(X265, p), p);
+            assert_eq!(sanitise_preset(H264Vaapi, p), p);
+            assert_eq!(sanitise_preset(HevcVaapi, p), p);
+        }
+        for &p in &[Fast, Medium, Slow] {
+            assert_eq!(sanitise_preset(H264Nvenc, p), p);
+        }
+        for &p in &[Veryfast, Faster, Fast, Medium, Slow, Slower, Veryslow] {
+            assert_eq!(sanitise_preset(H264Qsv, p), p);
         }
     }
 }
