@@ -118,6 +118,7 @@ SDI **playout** (output) events, same category:
 | critical | playout refused: unsupported mode/device | `error_code: sdi_playout_mode_unsupported`. Fatal — config problem, retrying would spin. |
 | warning | decoded video is {w}x{h} but the configured mode is {W}x{H} — frames dropped | `error_code: sdi_playout_raster_mismatch`. Throttled to 1/5 s. Fix `mode` or the source. |
 | warning | video decoder open failed | `error_code: sdi_playout_decode_failed`. Throttled. |
+| warning | decoded chroma is not 8-bit 4:2:0/4:2:2 — frames dropped | `error_code: sdi_playout_chroma_unsupported`. Throttled. A 4:4:4 or 10-bit source cannot be packed to UYVY422; frames drop rather than display corrupted. |
 | warning | playout write failed — reopening device | `error_code: sdi_playout_lost`. |
 
 Full subsystem reference (config, telemetry, hardware gotchas): `sdi.md`.

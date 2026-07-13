@@ -368,11 +368,39 @@ fn playout_worker(
             // Chroma layout from evidence, not enum-matching: yuv_planes()
             // returns exact-height slices, so rows = len / stride tells us
             // 4:2:0 (h/2) vs 4:2:2 (h) without new FFI surface.
-            let chroma_rows = if us > 0 { u.len() / us } else { 0 };
+            //
+            // But yuv_planes() also returns Some(..) for 4:4:4 (chroma rows ==
+            // h, indistinguishable from 4:2:2 by height alone) and for 10-bit
+            // planar (chroma rows look 8-bit-shaped). pack_uyvy422 reads w/2
+            // 8-bit chroma samples per row, so feeding it either would silently
+            // corrupt colour rather than drop. Guard on chroma being both
+            // 8-bit and horizontally subsampled: a 4:2:x 8-bit chroma plane has
+            // byte-stride ~w/2 (always < w for a DeckLink raster ≥720 wide),
+            // while 4:4:4-8bit and 10-bit-anything have byte-stride ≥ w.
+            let chroma_rows = u.len().checked_div(us).unwrap_or(0);
+            let chroma_half_width_8bit = us < w as usize;
             let chroma_420 = chroma_rows == (h as usize).div_ceil(2);
-            if !chroma_420 && chroma_rows != h as usize {
+            let chroma_422 = chroma_rows == h as usize;
+            if !chroma_half_width_8bit || !(chroma_420 || chroma_422) {
                 stats.packets_dropped.fetch_add(1, Ordering::Relaxed);
-                continue; // 4:4:4 or something exotic — cannot pack to UYVY
+                throttled(&mut last_decode_warn, || {
+                    warn!(
+                        target: "sdi.out",
+                        "{ctx}: decoded chroma is not 8-bit 4:2:0/4:2:2 (pix_fmt {}); \
+                         dropping frames — only 8-bit 4:2:0/4:2:2 playout is supported",
+                        frame.pixel_format(),
+                    );
+                    event_sender.emit(
+                        EventSeverity::Warning,
+                        category::FLOW,
+                        format!(
+                            "{ctx}: decoded video chroma is unsupported for SDI playout \
+                             (only 8-bit 4:2:0/4:2:2) — frames dropped \
+                             (error_code: sdi_playout_chroma_unsupported)"
+                        ),
+                    );
+                });
+                continue;
             }
 
             pack_uyvy422(
@@ -403,6 +431,16 @@ fn playout_worker(
                             .packets_dropped
                             .fetch_add(card - card_drops_base, Ordering::Relaxed);
                         card_drops_base = card;
+                    }
+                }
+                // Card is behind the SDI cadence or wedged (playback running
+                // but not draining). Not a device failure — skip the frame and
+                // re-check cancellation so a flow stop is honoured promptly
+                // rather than parking this blocking thread on a dead card.
+                Err(decklink_rs::Error::Busy) => {
+                    stats.packets_dropped.fetch_add(1, Ordering::Relaxed);
+                    if cancel.is_cancelled() {
+                        return;
                     }
                 }
                 Err(decklink_rs::Error::Eof) => return,

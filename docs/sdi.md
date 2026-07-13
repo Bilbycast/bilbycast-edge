@@ -192,7 +192,10 @@ sweep element, `late=0 dropped=0` over 3000 frames.
 
 Pipeline: broadcast subscriber → `TsDemuxer` → H.264/HEVC/MPEG-2 decode
 (`VideoDecoder`) → `pack_uyvy422` (the exact inverse of the input's unpacker —
-4:2:0 sources upsample chroma by row duplication) → `DecklinkPlayout`. The
+4:2:0 sources upsample chroma by row duplication) → `DecklinkPlayout`. Only
+**8-bit 4:2:0/4:2:2** decoded video can be packed to UYVY422; a 4:4:4 or 10-bit
+source drops frames with `sdi_playout_chroma_unsupported` rather than displaying
+corrupted colour. The
 card's completion callbacks pace the pipeline; a bounded hand-off channel
 absorbs jitter and drops (counted on `packets_dropped`) rather than buffering
 latency. Card-reported late/dropped completions fold into `packets_dropped`.
