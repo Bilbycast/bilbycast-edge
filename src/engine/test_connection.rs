@@ -235,6 +235,19 @@ pub async fn test_output(config: &OutputConfig) -> TestResult {
                     )
                 }
             }
+            OutputConfig::Sdi(o) => {
+                // Connectivity tests don't apply — SDI playout renders to a
+                // local DeckLink connector; only the runtime spawner can
+                // confirm the device exists and supports the mode.
+                TestResult::ok(
+                    "configured",
+                    format!(
+                        "SDI output configured for device '{}' mode '{}'",
+                        o.device, o.mode,
+                    ),
+                    start.elapsed(),
+                )
+            }
             OutputConfig::Display(d) => {
                 // Connectivity tests don't apply — display outputs render to
                 // a local KMS connector + ALSA device. The runtime spawner is

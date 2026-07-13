@@ -109,6 +109,17 @@ healthy-looking stream.
 | critical | encoder open/config failed | `error_code: sdi_encode_failed` / `sdi_encode_config_failed`. Fatal for the flow — a device re-open cannot fix an encoder problem. |
 | warning | embedded-audio encoder init failed; continuing video-only | Audio degrades, video survives. |
 
+SDI **playout** (output) events, same category:
+
+| Severity | Message | Notes |
+|----------|---------|-------|
+| info | playout opened {w}x{h} @ {num}/{den} | `error_code: sdi_playout_opened`. |
+| warning | playout open failed — retrying until the device returns | `error_code: sdi_playout_open_failed`. One per session, 500 ms retry. |
+| critical | playout refused: unsupported mode/device | `error_code: sdi_playout_mode_unsupported`. Fatal — config problem, retrying would spin. |
+| warning | decoded video is {w}x{h} but the configured mode is {W}x{H} — frames dropped | `error_code: sdi_playout_raster_mismatch`. Throttled to 1/5 s. Fix `mode` or the source. |
+| warning | video decoder open failed | `error_code: sdi_playout_decode_failed`. Throttled. |
+| warning | playout write failed — reopening device | `error_code: sdi_playout_lost`. |
+
 Full subsystem reference (config, telemetry, hardware gotchas): `sdi.md`.
 
 ---

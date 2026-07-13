@@ -336,6 +336,8 @@ pub mod output_mxl_anc;
 #[cfg(feature = "sdi-decklink")]
 pub mod decklink;
 #[cfg(feature = "sdi-decklink")]
+pub mod output_sdi;
+#[cfg(feature = "sdi-decklink")]
 pub mod sdi_io;
 
 /// Generic RFC 3551 PCM-over-RTP audio input. Wire-identical to ST 2110-30

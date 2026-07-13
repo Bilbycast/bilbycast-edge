@@ -15,7 +15,7 @@ crate. Upstream tracking issue:
 | Signal-loss / raster-change / device-loss resilience | **Verified by physically pulling the cable** |
 | Per-port hardware status on `HealthPayload` | **Verified** (all 8 ports, live during capture) |
 | Encoder backends | All of them — x264 / x265 / NVENC / QSV / VAAPI / `h264_auto` / `hevc_auto` (x264 + NVENC hardware-verified; QSV/VAAPI compile-verified) |
-| SDI output (playout) | Crate-level **verified by physical loopback** (bars out one port, captured on another, photographed); edge `OutputConfig::Sdi` integration pending |
+| SDI output (playout), video | Edge-integrated (`OutputConfig::Sdi`): broadcast → demux → decode → UYVY repack → card-clock-scheduled playout. Crate layer **verified by physical loopback** (bars photographed) |
 | SDI output, audio | Pending (video-only playout first) |
 | 10-bit (`v210`) | Rejected at config validation; unpacker not yet written |
 
@@ -171,10 +171,36 @@ pair-partner connector, through a BNC loop into another port, captured
 through the full edge pipeline and photographed — correct colours, moving
 sweep element, `late=0 dropped=0` over 3000 frames.
 
-**Edge integration (`OutputConfig::Sdi`) is not yet written.** The planned
-shape mirrors `output_display.rs`: broadcast subscriber → `TsDemuxer` →
-`VideoDecoder` (all HW/SW backends) → planar→UYVY repack →
-`DecklinkPlayout`.
+### Edge integration (`engine/output_sdi.rs`)
+
+```json
+{
+  "id": "sdi-out1", "name": "SDI monitor", "type": "sdi",
+  "device": "DeckLink Quad (1)",
+  "mode": "Hi50",
+  "pixel_format": "uyvy422",
+  "program_number": null
+}
+```
+
+| Field | Values | Notes |
+|-------|--------|-------|
+| `device` | SDK display name | Same namespace as the input's. Mind the connector-pair routing below. |
+| `mode` | DeckLink mode FourCC, **required** | Playout has nothing to auto-detect from; `"auto"` is rejected at validation. Must match the decoded video's raster — mismatched frames are dropped with `sdi_playout_raster_mismatch`, never displayed garbled. |
+| `pixel_format` | `"uyvy422"` | 10-bit playout not yet implemented. |
+| `program_number` | optional | MPTS down-select, like every other output. |
+
+Pipeline: broadcast subscriber → `TsDemuxer` → H.264/HEVC/MPEG-2 decode
+(`VideoDecoder`) → `pack_uyvy422` (the exact inverse of the input's unpacker —
+4:2:0 sources upsample chroma by row duplication) → `DecklinkPlayout`. The
+card's completion callbacks pace the pipeline; a bounded hand-off channel
+absorbs jitter and drops (counted on `packets_dropped`) rather than buffering
+latency. Card-reported late/dropped completions fold into `packets_dropped`.
+Video-only; keyframe-gated after every decoder (re)open. Failure modes mirror
+the input: unsupported mode/device is **fatal** (`sdi_playout_mode_unsupported`
+— a retry can never fix a config problem); a device that vanishes mid-run
+re-opens with backoff (`sdi_playout_lost` / `sdi_playout_open_failed` /
+`sdi_playout_opened`). Cost model: 275 units (CPU decode, 1080p-class).
 
 ### Hardware gotchas that will cost you a day at a rack
 
@@ -203,7 +229,7 @@ evidence: `bilbycast-decklink-rs/CLAUDE.md`.
 ## Known limitations / roadmap
 
 * 10-bit (`v210`) capture unpack — unlocks the 10-bit HEVC hardware paths.
-* SDI output edge integration, then playout audio.
+* Playout audio (video-only today); HW-decode for the playout path (CPU decode only today).
 * 8/16-channel embedded audio and non-1080i50 rasters are implemented but
   not yet hardware-verified.
 * Genlock: playout free-runs against the card clock today (`reference_locked`

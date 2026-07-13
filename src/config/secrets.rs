@@ -465,6 +465,8 @@ impl SecretsConfig {
             // Display outputs render to local hardware; no infrastructure
             // or content secrets travel with the config.
             OutputConfig::Display(_) => {}
+            // SDI playout renders to a local DeckLink connector; no secrets.
+            OutputConfig::Sdi(_) => {}
             // MXL outputs reference a shared-memory domain + flow name;
             // neither is a secret.
             OutputConfig::MxlVideo(_) | OutputConfig::MxlAudio(_) | OutputConfig::MxlAnc(_) => {}

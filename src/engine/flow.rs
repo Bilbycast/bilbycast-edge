@@ -2467,6 +2467,51 @@ impl FlowRuntime {
                     stats: output_stats,
                 })
             }
+            OutputConfig::Sdi(c) => {
+                // SDI playout is gated by the `sdi-decklink` Cargo feature.
+                // The schema is always present so configs round-trip cleanly
+                // across builds; a build without the feature refuses with a
+                // structured error the manager UI can surface.
+                let output_stats = flow_stats.register_output(
+                    c.id.clone(),
+                    c.name.clone(),
+                    "sdi".to_string(),
+                );
+                output_stats.set_egress_static(
+                    crate::stats::collector::EgressMediaSummaryStatic {
+                        transport_mode: Some("sdi".into()),
+                        video_passthrough: false,
+                        audio_passthrough: false,
+                        audio_only: false,
+                        ..Default::default()
+                    },
+                );
+
+                #[cfg(feature = "sdi-decklink")]
+                {
+                    let handle = super::output_sdi::spawn_sdi_output(
+                        c.clone(),
+                        broadcast_tx,
+                        output_stats.clone(),
+                        output_cancel.clone(),
+                        event_sender.clone(),
+                        flow_id.to_string(),
+                    );
+                    Ok(OutputRuntime {
+                        handle,
+                        cancel_token: output_cancel,
+                        stats: output_stats,
+                    })
+                }
+                #[cfg(not(feature = "sdi-decklink"))]
+                {
+                    let _ = (broadcast_tx, output_stats, output_cancel, event_sender, flow_id);
+                    anyhow::bail!(
+                        "SDI output '{}' not supported: this build was compiled without                          the 'sdi-decklink' Cargo feature (error_code: sdi_playout_unavailable)",
+                        c.id
+                    )
+                }
+            }
             OutputConfig::Display(c) => {
                 // Display output is Linux-only and gated by the `display`
                 // Cargo feature. The schema is always present so configs
@@ -5612,6 +5657,16 @@ fn build_output_config_meta(config: &OutputConfig) -> OutputConfigMeta {
             whip_url: None,
             program_number: c.program_number,
         },
+        OutputConfig::Sdi(c) => OutputConfigMeta {
+            mode: Some(format!("sdi ({} @ {})", c.device, c.mode)),
+            remote_addr: None,
+            dest_addr: None,
+            dest_url: None,
+            ingest_url: None,
+            whip_url: None,
+            local_addr: None,
+            program_number: c.program_number,
+        },
         OutputConfig::Display(c) => OutputConfigMeta {
             mode: Some(format!(
                 "display ({}{}{})",
@@ -6229,6 +6284,11 @@ fn output_resource_contribution(
         OutputConfig::St2110_20(_) | OutputConfig::St2110_23(_)
     ) {
         units = units.saturating_add(500);
+    }
+    // SDI playout decodes the flow's video and repacks it for the card —
+    // CPU decode cost comparable to the display output's decode side.
+    if matches!(output, OutputConfig::Sdi(_)) {
+        units = units.saturating_add(275);
     }
     if let OutputConfig::Display(d) = output {
         let pref = d.hw_decode.unwrap_or_default();

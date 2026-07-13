@@ -25,7 +25,7 @@
 //!   encoder that will not open. These stop the input, since re-opening would
 //!   just spin.
 //!
-//! Playout (SDI output) lands with `DecklinkPlayout` in a follow-up.
+//! Playout (SDI output) lives in `output_sdi.rs`.
 
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -181,6 +181,23 @@ fn unpack_uyvy422(
             *cr = ((a[2] as u16 + b[2] as u16) >> 1) as u8;
         }
     }
+}
+
+/// Test-only re-export so `output_sdi`'s round-trip test can pin
+/// `pack_uyvy422` as the exact inverse of this module's unpacker.
+#[cfg(all(test, feature = "media-codecs"))]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn unpack_uyvy422_for_test(
+    data: &[u8],
+    stride: usize,
+    width: u32,
+    height: u32,
+    chroma_420: bool,
+    y_out: &mut [u8],
+    cb_out: &mut [u8],
+    cr_out: &mut [u8],
+) {
+    unpack_uyvy422(data, stride, width, height, chroma_420, y_out, cb_out, cr_out)
 }
 
 pub fn spawn_sdi_input(

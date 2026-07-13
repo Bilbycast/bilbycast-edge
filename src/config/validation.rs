@@ -977,6 +977,7 @@ fn output_audio_encode(output: &OutputConfig) -> Option<&crate::config::models::
         | OutputConfig::RtpAudio(_)
         | OutputConfig::Bonded(_)
         | OutputConfig::Display(_)
+        | OutputConfig::Sdi(_)
         | OutputConfig::MxlVideo(_)
         | OutputConfig::MxlAudio(_)
         | OutputConfig::MxlAnc(_) => None,
@@ -1002,6 +1003,7 @@ fn output_video_encode(output: &OutputConfig) -> Option<&crate::config::models::
         | OutputConfig::RtpAudio(_)
         | OutputConfig::Bonded(_)
         | OutputConfig::Display(_)
+        | OutputConfig::Sdi(_)
         | OutputConfig::MxlVideo(_)
         | OutputConfig::MxlAudio(_)
         | OutputConfig::MxlAnc(_) => None,
@@ -1110,6 +1112,9 @@ fn output_pid_overrides(output: &OutputConfig) -> Option<&crate::config::models:
         // Local-display playout decodes audio + video into KMS / ALSA —
         // no MPEG-TS leaves the box, so PID overrides do not apply.
         OutputConfig::Display(_) => None,
+        // SDI playout decodes video onto a DeckLink connector — no MPEG-TS
+        // leaves the box, so PID overrides do not apply.
+        OutputConfig::Sdi(_) => None,
         // MXL outputs publish raw essence onto a shared-memory bus —
         // there is no MPEG-TS layer, so PID overrides are not applicable.
         OutputConfig::MxlVideo(_)
@@ -5497,6 +5502,7 @@ pub fn validate_output_with_input(
         OutputConfig::RtpAudio(c) => validate_rtp_audio_output(c, upstream_audio)?,
         OutputConfig::Bonded(c) => validate_bonded_output(c)?,
         OutputConfig::Display(c) => validate_display_output(c)?,
+        OutputConfig::Sdi(c) => validate_sdi_output(c)?,
         OutputConfig::MxlVideo(c) => validate_mxl_video_output(c)?,
         OutputConfig::MxlAudio(c) => validate_mxl_audio_output(c)?,
         OutputConfig::MxlAnc(c)   => validate_mxl_anc_output(c)?,
@@ -6091,6 +6097,46 @@ fn validate_sdi_input(c: &crate::config::models::SdiInputConfig) -> Result<()> {
     }
     Ok(())
 }
+
+/// SDI playout output (`sdi-decklink` feature). Mirrors [`validate_sdi_input`]
+/// where the fields overlap; the key difference is `mode`: playout has
+/// nothing to auto-detect from, so an explicit DeckLink mode FourCC is
+/// REQUIRED — `"auto"` is rejected here rather than failing at open.
+fn validate_sdi_output(c: &crate::config::models::SdiOutputConfig) -> Result<()> {
+    let ctx = format!("SDI output '{}'", c.id);
+    validate_id(&c.id, "SDI output")?;
+    validate_name(&c.name, "SDI output")?;
+    if c.device.trim().is_empty() {
+        bail!("{ctx}: device must not be empty");
+    }
+    // DeckLink modes are literal FourCCs ("Hi50", "Hp25"): exactly 4 ASCII
+    // printable chars. Rejecting "auto" with a specific message beats the
+    // generic length error an operator would otherwise puzzle over.
+    if c.mode.eq_ignore_ascii_case("auto") {
+        bail!(
+            "{ctx}: mode must be an explicit DeckLink mode FourCC (e.g. \"Hi50\") —              playout cannot auto-detect a format"
+        );
+    }
+    if c.mode.len() != 4 || !c.mode.bytes().all(|b| b.is_ascii_graphic() || b == b' ') {
+        bail!(
+            "{ctx}: mode must be a 4-character DeckLink mode FourCC (got {:?})",
+            c.mode
+        );
+    }
+    if c.pixel_format != "uyvy422" {
+        bail!(
+            "{ctx}: pixel_format must be uyvy422 (got {:?}) — 10-bit playout is              not implemented yet",
+            c.pixel_format
+        );
+    }
+    if let Some(p) = c.program_number {
+        if p == 0 {
+            bail!("{ctx}: program_number 0 is reserved for the NIT and never identifies a program");
+        }
+    }
+    Ok(())
+}
+
 
 fn validate_mxl_video_input(c: &crate::config::models::MxlVideoInputConfig) -> Result<()> {
     let ctx = format!("MXL video input domain={:?} flow={:?}", c.mxl.domain_path, c.mxl.flow_name);
@@ -7793,7 +7839,9 @@ fn validate_port_conflicts(config: &AppConfig) -> Result<()> {
             | OutputConfig::Hls(_)
             | OutputConfig::Cmaf(_)
             | OutputConfig::Webrtc(_)
-            | OutputConfig::Display(_) => {}
+            | OutputConfig::Display(_)
+            // SDI playout renders to a local DeckLink connector — no socket.
+            | OutputConfig::Sdi(_) => {}
             // MXL outputs publish onto a shared-memory bus — no socket bind.
             OutputConfig::MxlVideo(_)
             | OutputConfig::MxlAudio(_)

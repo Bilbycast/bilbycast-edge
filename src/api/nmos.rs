@@ -173,6 +173,7 @@ fn output_transport(output: &OutputConfig) -> &'static str {
         // NMOS has no native concept for this; the placeholder transport
         // keeps `output_transport` exhaustive without crashing.
         OutputConfig::Display(_) => "urn:x-nmos:transport:rtp",
+        OutputConfig::Sdi(_) => "urn:x-nmos:transport:rtp",
         OutputConfig::MxlVideo(_)
         | OutputConfig::MxlAudio(_)
         | OutputConfig::MxlAnc(_) => "urn:x-nmos:transport:rtp",
@@ -346,6 +347,7 @@ fn output_id(output: &OutputConfig) -> &str {
         OutputConfig::RtpAudio(c) => &c.id,
         OutputConfig::Bonded(c) => &c.id,
         OutputConfig::Display(c) => &c.id,
+        OutputConfig::Sdi(c) => &c.id,
         OutputConfig::MxlVideo(c) => &c.id,
         OutputConfig::MxlAudio(c) => &c.id,
         OutputConfig::MxlAnc(c) => &c.id,
@@ -370,6 +372,7 @@ fn output_name(output: &OutputConfig) -> &str {
         OutputConfig::RtpAudio(c) => &c.name,
         OutputConfig::Bonded(c) => &c.name,
         OutputConfig::Display(c) => &c.name,
+        OutputConfig::Sdi(c) => &c.name,
         OutputConfig::MxlVideo(c) => &c.name,
         OutputConfig::MxlAudio(c) => &c.name,
         OutputConfig::MxlAnc(c) => &c.name,

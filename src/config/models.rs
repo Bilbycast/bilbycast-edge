@@ -3000,6 +3000,13 @@ pub enum OutputConfig {
     /// is always present so configs round-trip cleanly across platforms.
     #[serde(rename = "display")]
     Display(DisplayOutputConfig),
+    /// Native SDI playout via Blackmagic DeckLink: decode the flow's video
+    /// and schedule it against the card's clock. Video-only today; audio
+    /// joins once the video path has soaked. Gated by the `sdi-decklink`
+    /// Cargo feature; the schema is always present so configs round-trip
+    /// cleanly across builds. See `docs/sdi.md`.
+    #[serde(rename = "sdi")]
+    Sdi(SdiOutputConfig),
     /// Produce a MXL **video** flow — decode the flow's H.264/HEVC TS,
     /// scale + convert to V210 4:2:2 10-bit planar, publish as grains
     /// onto the shared-memory bus. PTP-required. Gated by the `mxl`
@@ -3037,6 +3044,7 @@ impl OutputConfig {
             OutputConfig::RtpAudio(c) => &c.id,
             OutputConfig::Bonded(c) => &c.id,
             OutputConfig::Display(c) => &c.id,
+            OutputConfig::Sdi(c) => &c.id,
             OutputConfig::MxlVideo(c) => &c.id,
             OutputConfig::MxlAudio(c) => &c.id,
             OutputConfig::MxlAnc(c) => &c.id,
@@ -3062,6 +3070,7 @@ impl OutputConfig {
             OutputConfig::RtpAudio(c) => &c.name,
             OutputConfig::Bonded(c) => &c.name,
             OutputConfig::Display(c) => &c.name,
+            OutputConfig::Sdi(c) => &c.name,
             OutputConfig::MxlVideo(c) => &c.name,
             OutputConfig::MxlAudio(c) => &c.name,
             OutputConfig::MxlAnc(c) => &c.name,
@@ -3087,6 +3096,7 @@ impl OutputConfig {
             OutputConfig::RtpAudio(_) => "rtp_audio",
             OutputConfig::Bonded(_) => "bonded",
             OutputConfig::Display(_) => "display",
+            OutputConfig::Sdi(_) => "sdi",
             OutputConfig::MxlVideo(_) => "mxl_video",
             OutputConfig::MxlAudio(_) => "mxl_audio",
             OutputConfig::MxlAnc(_) => "mxl_anc",
@@ -3113,6 +3123,7 @@ impl OutputConfig {
             OutputConfig::RtpAudio(c) => c.active,
             OutputConfig::Bonded(c) => c.active,
             OutputConfig::Display(c) => c.active,
+            OutputConfig::Sdi(c) => c.active,
             OutputConfig::MxlVideo(c) => c.active,
             OutputConfig::MxlAudio(c) => c.active,
             OutputConfig::MxlAnc(c) => c.active,
@@ -3140,6 +3151,7 @@ impl OutputConfig {
             OutputConfig::RtpAudio(c) => c.active = active,
             OutputConfig::Bonded(c) => c.active = active,
             OutputConfig::Display(c) => c.active = active,
+            OutputConfig::Sdi(c) => c.active = active,
             OutputConfig::MxlVideo(c) => c.active = active,
             OutputConfig::MxlAudio(c) => c.active = active,
             OutputConfig::MxlAnc(c) => c.active = active,
@@ -3165,6 +3177,7 @@ impl OutputConfig {
             OutputConfig::RtpAudio(c) => c.group.as_deref(),
             OutputConfig::Bonded(c) => c.group.as_deref(),
             OutputConfig::Display(c) => c.group.as_deref(),
+            OutputConfig::Sdi(c) => c.group.as_deref(),
             OutputConfig::MxlVideo(c) => c.group.as_deref(),
             OutputConfig::MxlAudio(c) => c.group.as_deref(),
             OutputConfig::MxlAnc(c) => c.group.as_deref(),
@@ -6644,6 +6657,48 @@ fn default_sdi_audio_channels() -> u8 { 2 }
 ///
 /// `device` is the DeckLink SDK display name, e.g. `"DeckLink Quad (1)"`, as
 /// listed by the boot probe and on `HealthPayload.sdi_devices[]`.
+/// Native SDI playout output via Blackmagic DeckLink (`sdi-decklink`
+/// feature). Decodes the flow's video elementary stream and schedules the
+/// frames against the DeckLink card's clock. Video-only today.
+///
+/// `device` is the SDK display name (as listed on
+/// `HealthPayload.sdi_devices[]`). `mode` is REQUIRED and explicit — playout
+/// has nothing to auto-detect from — and must match the decoded video's
+/// raster (frames of any other size are dropped with an alarm, so a source
+/// switch cannot emit a garbled picture).
+///
+/// On 8-port Quad cards note the physical↔software connector interleave and
+/// the sub-device pair routing (playout from a sub-device whose own connector
+/// carries an input emerges on its pair partner's connector) — see
+/// `bilbycast-decklink-rs/CLAUDE.md`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SdiOutputConfig {
+    /// Unique output ID within this flow.
+    pub id: String,
+    /// Human-readable name.
+    pub name: String,
+    /// Whether this output is currently active.
+    #[serde(default = "default_true")]
+    pub active: bool,
+    /// Optional free-form group tag (max 64 chars).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
+
+    /// DeckLink device display name, e.g. `"DeckLink Quad (1)"`.
+    pub device: String,
+    /// DeckLink mode FourCC to play out, e.g. `"Hi50"` / `"Hp25"`.
+    /// Required; determines the raster + frame rate the card is opened at.
+    /// Must match the decoded video's raster.
+    pub mode: String,
+    /// Wire pixel format. `"uyvy422"` (8-bit) is the only one implemented.
+    #[serde(default = "default_sdi_pixel_format")]
+    pub pixel_format: String,
+    /// MPEG-TS program filter (1-based). `None` selects the lowest program
+    /// in the PAT.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub program_number: Option<u16>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SdiInputConfig {
     /// DeckLink device display name, e.g. `"DeckLink Quad (1)"`.
