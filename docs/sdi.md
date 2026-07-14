@@ -230,6 +230,46 @@ evidence: `bilbycast-decklink-rs/CLAUDE.md`.
   (e.g. `Hp50` against a 1080i50 feed) — reproduces the whole signal-loss
   path without touching the rack.
 
+## Production readiness
+
+**Verified on hardware** (bilby-z440, DeckLink Quad, live 1080i50 source):
+capture → encode (x264 + NVENC) → A+V TS; signal-loss/reconnect by physically
+pulling the cable; per-port `HealthPayload.sdi_devices[]`; SDI→SDI loopback
+video (photographed clean) and audio (measured continuous, lip-synced by the
+card clock); config validation rejecting bad chroma/bit-depth/mode at load.
+
+**Robustness properties** built in and worth stating for an operator:
+
+* **Signal loss never drops the transport stream** — the card's bars/black are
+  encoded through, an alarm is raised, nothing restarts.
+* **No panics on the media path** — malformed/short frames, decode errors,
+  unsupported chroma, and a wedged card are all handled (drop + throttled
+  alarm, or bounded-wait), never `unwrap`/`panic`. The crate is built for a
+  long-running broadcast binary.
+* **The reactor never does codec work** — all encode/decode runs under
+  `spawn_blocking`; the async feeder only demuxes.
+* **Bounded everywhere** — the hand-off channel drops rather than buffers
+  latency; the playout write times out rather than hanging on a dead card;
+  input switches flush the decoder so they re-anchor on the next keyframe.
+
+**Not yet field-validated** (works in bring-up, wants a real soak / matrix):
+
+* Long-run stability (hours) — the overnight soak covers this.
+* Rasters other than 1080i50 (720p / 1080p50 / 2160p).
+* 8- and 16-channel embedded audio (2-channel verified).
+* QSV / VAAPI encoder backends (compile-verified; no Intel/AMD host to date).
+* Audio lip-sync *tightness* — presence and drift-freedom are verified; the
+  absolute offset was not measured (needs known-sync content on a monitor).
+
+**Operational prerequisites**:
+
+* Blackmagic **Desktop Video** installed (kernel driver + `libDeckLinkAPI.so`).
+* Run with `BILBYCAST_PROBE_SESSION_LIMITS=0` if NVENC session probing stalls
+  startup on this driver.
+* `format: "auto"` on inputs; an explicit `mode` FourCC on outputs.
+* For broadcast-grade wire pacing on TS egress, grant `CAP_SYS_NICE` (the
+  shipped systemd unit does) — unrelated to SDI but logged loudly at boot.
+
 ## Known limitations / roadmap
 
 * 10-bit (`v210`) capture unpack — unlocks the 10-bit HEVC hardware paths.

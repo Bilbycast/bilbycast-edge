@@ -115,6 +115,9 @@ enum AudioPayload {
 enum PlayoutAu {
     Video(VideoAu),
     Audio(AudioAu),
+    /// Upstream input switch (PMT version bump). Flush decoders so the next
+    /// keyframe re-anchors cleanly instead of referencing the old stream.
+    Discontinuity,
 }
 
 pub fn spawn_sdi_output(
@@ -248,6 +251,7 @@ async fn run_sdi_output(
                                     None => continue, // AC-4 / unknown — no decoder
                                 }
                             }
+                            DemuxedFrame::Discontinuity => PlayoutAu::Discontinuity,
                             _ => continue,
                         };
                         if au_tx.try_send(au).is_err() {
@@ -406,6 +410,23 @@ fn playout_worker(
 
         let au = match item {
             PlayoutAu::Video(v) => v,
+            PlayoutAu::Discontinuity => {
+                // Input switch. Flush the video decoder and wait for a fresh
+                // keyframe so it doesn't reference the old stream. Reset the
+                // audio decoders (the new input may carry a different codec /
+                // AAC config) and let audio re-anchor. The card's schedule
+                // clock keeps running, so `anchor_pts` stays — output PTS is
+                // regenerated continuous across switches by the edge's
+                // clocking, so the shared timeline is unbroken.
+                if let Some(d) = decoder.as_mut() {
+                    d.flush();
+                }
+                seen_keyframe = false;
+                aac_dec = None;
+                ff_dec = None;
+                audio_pos = None;
+                continue;
+            }
             PlayoutAu::Audio(a) => {
                 // Can't place audio until the video timeline is anchored.
                 let Some(anchor) = anchor_pts else { continue };
