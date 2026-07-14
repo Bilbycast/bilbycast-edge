@@ -6129,6 +6129,12 @@ fn validate_sdi_output(c: &crate::config::models::SdiOutputConfig) -> Result<()>
             c.pixel_format
         );
     }
+    if !matches!(c.audio_channels, 0 | 2 | 8 | 16) {
+        bail!(
+            "{ctx}: audio_channels must be 0, 2, 8, or 16 (got {})",
+            c.audio_channels
+        );
+    }
     if let Some(p) = c.program_number {
         if p == 0 {
             bail!("{ctx}: program_number 0 is reserved for the NIT and never identifies a program");

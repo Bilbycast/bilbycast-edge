@@ -6693,6 +6693,13 @@ pub struct SdiOutputConfig {
     /// Wire pixel format. `"uyvy422"` (8-bit) is the only one implemented.
     #[serde(default = "default_sdi_pixel_format")]
     pub pixel_format: String,
+    /// Embedded-audio channel count to play out (2 / 8 / 16). 0 = video-only.
+    /// Audio is always scheduled at 48 kHz on the card; a decoded audio track
+    /// at another rate is dropped with an alarm. Source audio is decoded
+    /// (AAC / MP2 / AC-3 / E-AC-3 / Opus), interleaved into this channel
+    /// count, and lip-synced to video via the shared playout clock.
+    #[serde(default = "default_sdi_audio_channels")]
+    pub audio_channels: u8,
     /// MPEG-TS program filter (1-based). `None` selects the lowest program
     /// in the PAT.
     #[serde(default, skip_serializing_if = "Option::is_none")]

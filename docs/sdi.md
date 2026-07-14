@@ -16,7 +16,7 @@ crate. Upstream tracking issue:
 | Per-port hardware status on `HealthPayload` | **Verified** (all 8 ports, live during capture) |
 | Encoder backends | All of them — x264 / x265 / NVENC / QSV / VAAPI / `h264_auto` / `hevc_auto` (x264 + NVENC hardware-verified; QSV/VAAPI compile-verified) |
 | SDI output (playout), video | Edge-integrated (`OutputConfig::Sdi`): broadcast → demux → decode → UYVY repack → card-clock-scheduled playout. Crate layer **verified by physical loopback** (bars photographed) |
-| SDI output, audio | Pending (video-only playout first) |
+| SDI output, audio | Edge-integrated: AAC/MP2/AC-3/E-AC-3 decode → 48 kHz interleaved → timestamped, lip-synced to video on the card's clock. **Verified on hardware** (loopback audio measured). Opus/AC-4 not handled (video-only); non-48 kHz dropped |
 | 10-bit (`v210`) | Rejected at config validation; unpacker not yet written |
 
 ## Why the Blackmagic SDK and not FFmpeg's `decklink` avdevice
@@ -188,6 +188,7 @@ sweep element, `late=0 dropped=0` over 3000 frames.
 | `device` | SDK display name | Same namespace as the input's. Mind the connector-pair routing below. |
 | `mode` | DeckLink mode FourCC, **required** | Playout has nothing to auto-detect from; `"auto"` is rejected at validation. Must match the decoded video's raster — mismatched frames are dropped with `sdi_playout_raster_mismatch`, never displayed garbled. |
 | `pixel_format` | `"uyvy422"` | 10-bit playout not yet implemented. |
+| `audio_channels` | 0 / 2 / 8 / 16 | 0 = video-only. The flow's audio is decoded (AAC / MP2 / AC-3 / E-AC-3), interleaved into this channel count, and lip-synced to video via the shared playout clock. Fixed 48 kHz — a non-48 kHz track drops with an alarm. |
 | `program_number` | optional | MPTS down-select, like every other output. |
 
 Pipeline: broadcast subscriber → `TsDemuxer` → H.264/HEVC/MPEG-2 decode
@@ -199,7 +200,7 @@ corrupted colour. The
 card's completion callbacks pace the pipeline; a bounded hand-off channel
 absorbs jitter and drops (counted on `packets_dropped`) rather than buffering
 latency. Card-reported late/dropped completions fold into `packets_dropped`.
-Video-only; keyframe-gated after every decoder (re)open. Failure modes mirror
+Keyframe-gated after every decoder (re)open. Audio (when `audio_channels > 0`) is decoded in the same worker, interleaved to 48 kHz 32-bit, and scheduled timestamped at `pts - first_video_pts` on the shared 90 kHz clock for hardware A/V sync; the schedule position then advances drift-free by sample count, re-anchoring only on a discontinuity. Failure modes mirror
 the input: unsupported mode/device is **fatal** (`sdi_playout_mode_unsupported`
 — a retry can never fix a config problem); a device that vanishes mid-run
 re-opens with backoff (`sdi_playout_lost` / `sdi_playout_open_failed` /
@@ -232,7 +233,7 @@ evidence: `bilbycast-decklink-rs/CLAUDE.md`.
 ## Known limitations / roadmap
 
 * 10-bit (`v210`) capture unpack — unlocks the 10-bit HEVC hardware paths.
-* Playout audio (video-only today); HW-decode for the playout path (CPU decode only today).
+* HW-decode for the playout path (CPU decode only today); audio resampling (48 kHz-only today); Opus/AC-4 playout audio.
 * 8/16-channel embedded audio and non-1080i50 rasters are implemented but
   not yet hardware-verified.
 * Genlock: playout free-runs against the card clock today (`reference_locked`

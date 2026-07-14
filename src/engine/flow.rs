@@ -5658,7 +5658,16 @@ fn build_output_config_meta(config: &OutputConfig) -> OutputConfigMeta {
             program_number: c.program_number,
         },
         OutputConfig::Sdi(c) => OutputConfigMeta {
-            mode: Some(format!("sdi ({} @ {})", c.device, c.mode)),
+            mode: Some(format!(
+                "sdi ({} @ {}{})",
+                c.device,
+                c.mode,
+                if c.audio_channels > 0 {
+                    format!(", {}ch audio", c.audio_channels)
+                } else {
+                    String::new()
+                }
+            )),
             remote_addr: None,
             dest_addr: None,
             dest_url: None,
