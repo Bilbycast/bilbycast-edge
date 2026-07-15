@@ -244,6 +244,13 @@ pub fn build_encoder_config(
         height,
         fps_num,
         fps_den,
+        // `0 / 0` derives the timebase as `1 / fps` — the historical contract
+        // every caller here relies on (they feed a frame counter as pts).
+        // Ingest paths whose pts are natively 90 kHz call `set_pts_90k()` to
+        // override; feeding 90 kHz ticks into a `1 / fps` timebase segfaults
+        // libx264's VBV. See `VideoEncoderConfig::time_base_num`.
+        time_base_num: 0,
+        time_base_den: 0,
         bitrate_kbps,
         max_bitrate_kbps: cfg.max_bitrate_kbps.unwrap_or(0),
         gop_size,
