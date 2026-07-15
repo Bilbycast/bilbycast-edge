@@ -4359,15 +4359,30 @@ fn validate_video_encode(
             );
         }
     }
+    // `tune` vocabulary is per-backend: x264 / x265 share one table, NVENC has
+    // its own, and QSV / VAAPI expose no `tune` option at all.
+    //
+    // Validation stays permissive over the union, because `*_auto` resolves its
+    // backend per-host at flow start — a tune legal for the x264 this host picks
+    // may be illegal for the NVENC another host picks, and neither is knowable
+    // here. `video_encode_util::sanitise_tune` drops an incompatible tune (with
+    // a warning) once the backend is known, so no config can reach
+    // `avcodec_open2` with a tune that backend would reject.
     if let Some(ref t) = enc.tune {
         match t.as_str() {
             // Empty string = unset (encoder default).
-            "" | "zerolatency" | "film" | "animation" | "grain" | "stillimage"
-            | "fastdecode" | "psnr" | "ssim" => {}
+            "" => {}
+            // libx264 / libx265.
+            "zerolatency" | "film" | "animation" | "grain" | "stillimage" | "fastdecode"
+            | "psnr" | "ssim" => {}
+            // NVENC. Previously unrepresentable: an NVENC operator could not
+            // name a tune their encoder actually understands.
+            "hq" | "ll" | "ull" | "lossless" => {}
             other => bail!(
                 "{context}: video_encode.tune '{other}' is not recognised; \
                  expected one of (empty), zerolatency, film, animation, grain, \
-                 stillimage, fastdecode, psnr, ssim"
+                 stillimage, fastdecode, psnr, ssim (libx264/libx265), \
+                 or hq, ll, ull, lossless (NVENC)"
             ),
         }
     }
