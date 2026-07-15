@@ -4,7 +4,7 @@ bilbycast-edge can capture SDI directly from Blackmagic DeckLink cards —
 video plus embedded audio, encoded in-process and published as a standard
 A+V MPEG-TS flow — with no external SDI→IP converter. Gated behind the
 `sdi-decklink` Cargo feature (default **off**), backed by the sibling
-[`bilbycast-decklink-rs`](https://github.com/AJ-Github-Account/bilbycast-decklink-rs)
+[`bilbycast-decklink-rs`](https://github.com/Bilbycast/bilbycast-decklink-rs)
 crate. Upstream tracking issue:
 [Bilbycast/bilbycast-edge#19](https://github.com/Bilbycast/bilbycast-edge/issues/19).
 
