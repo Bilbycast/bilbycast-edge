@@ -143,6 +143,17 @@ jobs:
           path: bilbycast-mxl-rs
           submodules: recursive
 
+      # Required even though `sdi-decklink` is off in every matrix entry:
+      # cargo reads an optional path dependency's manifest regardless of
+      # whether its feature is enabled. Building the SDI code additionally
+      # needs the Blackmagic SDK headers (DECKLINK_SDK_DIR), which are
+      # EULA-gated and so not fetched here.
+      - name: Checkout bilbycast-decklink-rs (path dependency)
+        uses: actions/checkout@v7
+        with:
+          repository: Bilbycast/bilbycast-decklink-rs
+          path: bilbycast-decklink-rs
+
       - name: Checkout bilbycast-edge
         uses: actions/checkout@v7
         with:
