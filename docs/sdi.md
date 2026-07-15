@@ -179,6 +179,8 @@ sweep element, `late=0 dropped=0` over 3000 frames.
   "device": "DeckLink Quad (1)",
   "mode": "Hi50",
   "pixel_format": "uyvy422",
+  "audio_channels": 2,
+  "audio_offset_ms": 0,
   "program_number": null
 }
 ```
@@ -189,6 +191,7 @@ sweep element, `late=0 dropped=0` over 3000 frames.
 | `mode` | DeckLink mode FourCC, **required** | Playout has nothing to auto-detect from; `"auto"` is rejected at validation. Must match the decoded video's raster — mismatched frames are dropped with `sdi_playout_raster_mismatch`, never displayed garbled. |
 | `pixel_format` | `"uyvy422"` | 10-bit playout not yet implemented. |
 | `audio_channels` | 0 / 2 / 8 / 16 | 0 = video-only. The flow's audio is decoded (AAC / MP2 / AC-3 / E-AC-3), interleaved into this channel count, and lip-synced to video via the shared playout clock. Fixed 48 kHz — a non-48 kHz track drops with an alarm. |
+| `audio_offset_ms` | `-1000..=1000`, default `0` | Operator A/V-sync trim. **Positive delays audio** (plays later — corrects audio-early); **negative advances it** (plays earlier — corrects audio-late). A constant shift on each scheduled audio block's card time; the drift-free sample counter is untouched, so it never accumulates. Use it to null a residual lip-sync offset once measured on a monitor. |
 | `program_number` | optional | MPTS down-select, like every other output. |
 
 Pipeline: broadcast subscriber → `TsDemuxer` → H.264/HEVC/MPEG-2 decode

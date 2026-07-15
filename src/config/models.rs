@@ -6704,6 +6704,15 @@ pub struct SdiOutputConfig {
     /// in the PAT.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub program_number: Option<u16>,
+    /// Operator A/V-sync trim for the embedded audio, in milliseconds.
+    /// **Positive delays audio** (it plays later, correcting audio-early);
+    /// **negative advances it** (it plays earlier, correcting audio-late).
+    /// Applied as a constant shift to every scheduled audio block's card
+    /// stream time; the internal drift-free sample counter is unaffected, so
+    /// the trim never accumulates. `0` (default) = lip-sync straight off the
+    /// shared 90 kHz playout clock. Validated to `-1000..=1000` ms.
+    #[serde(default)]
+    pub audio_offset_ms: i32,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

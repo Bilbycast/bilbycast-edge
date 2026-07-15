@@ -391,6 +391,8 @@ fn playout_worker(
     // dropped. `audio_pos` then advances by exact sample duration (drift-free),
     // re-anchoring to the PTS-derived time only on a discontinuity.
     let audio_out_ch = config.audio_channels as usize; // 0 = video-only
+    // Operator A/V trim on the 90 kHz card timeline (+ delays audio, - advances).
+    let audio_offset_90k = config.audio_offset_ms as i64 * 90;
     let mut anchor_pts: Option<u64> = None;
     let mut aac_dec: Option<AacDecoder> = None;
     let mut ff_dec: Option<(AudioDecoderCodec, FfAudioDecoder)> = None;
@@ -436,6 +438,7 @@ fn playout_worker(
                     a,
                     anchor,
                     audio_out_ch,
+                    audio_offset_90k,
                     &mut aac_dec,
                     &mut ff_dec,
                     &mut audio_pos,
@@ -655,6 +658,7 @@ fn decode_and_schedule_audio(
     au: AudioAu,
     anchor_pts: u64,
     out_ch: usize,
+    audio_offset_90k: i64,
     aac_dec: &mut Option<AacDecoder>,
     ff_dec: &mut Option<(AudioDecoderCodec, FfAudioDecoder)>,
     audio_pos: &mut Option<i64>,
@@ -689,6 +693,7 @@ fn decode_and_schedule_audio(
                             sr,
                             ch,
                             out_ch,
+                            audio_offset_90k,
                             pts,
                             anchor_pts,
                             audio_pos,
@@ -726,6 +731,7 @@ fn decode_and_schedule_audio(
                         decoded.sample_rate,
                         decoded.channels as usize,
                         out_ch,
+                        audio_offset_90k,
                         pts,
                         anchor_pts,
                         audio_pos,
@@ -753,6 +759,7 @@ fn schedule_audio_block(
     sample_rate: u32,
     dec_ch: usize,
     out_ch: usize,
+    audio_offset_90k: i64,
     src_pts: u64,
     anchor_pts: u64,
     audio_pos: &mut Option<i64>,
@@ -796,6 +803,14 @@ fn schedule_audio_block(
     if pos < 0 {
         return;
     }
+    // Apply the operator A/V trim to the scheduled card time only. `audio_pos`
+    // keeps tracking the untrimmed `pos`, so the drift-free advance and the
+    // discontinuity re-anchor are independent of the trim — a constant shift
+    // that never accumulates.
+    let sched = pos + audio_offset_90k;
+    if sched < 0 {
+        return; // a negative (advance) trim placed this block before stream start
+    }
 
     // Interleave into the card's channel layout: copy the decoded channels,
     // zero-fill any extra, truncate any excess.
@@ -812,7 +827,7 @@ fn schedule_audio_block(
         }
     }
 
-    match playout.write_audio(ibuf, pos) {
+    match playout.write_audio(ibuf, sched) {
         Ok(()) => {
             *audio_started = true;
             stats

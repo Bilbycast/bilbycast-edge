@@ -6140,6 +6140,12 @@ fn validate_sdi_output(c: &crate::config::models::SdiOutputConfig) -> Result<()>
             bail!("{ctx}: program_number 0 is reserved for the NIT and never identifies a program");
         }
     }
+    if !(-1000..=1000).contains(&c.audio_offset_ms) {
+        bail!(
+            "{ctx}: audio_offset_ms must be within -1000..=1000 ms (got {})",
+            c.audio_offset_ms
+        );
+    }
     Ok(())
 }
 
@@ -12254,5 +12260,32 @@ mod tests {
         cfg.audio_channels = 4; // SDI embedded audio is 2 / 8 / 16, or 0
         let e = super::validate_sdi_input(&cfg).unwrap_err().to_string();
         assert!(e.contains("audio_channels"), "4ch rejected: {e}");
+    }
+
+    fn sdi_output(offset: i32) -> crate::config::models::SdiOutputConfig {
+        crate::config::models::SdiOutputConfig {
+            id: "o1".into(),
+            name: "SDI out".into(),
+            active: true,
+            group: None,
+            device: "DeckLink Quad (1)".into(),
+            mode: "Hi50".into(),
+            pixel_format: "uyvy422".into(),
+            audio_channels: 2,
+            program_number: None,
+            audio_offset_ms: offset,
+        }
+    }
+
+    #[test]
+    fn sdi_output_audio_offset_bounds() {
+        // The ±1000 ms A/V-sync trim: endpoints valid, one past is rejected.
+        assert!(super::validate_sdi_output(&sdi_output(0)).is_ok());
+        assert!(super::validate_sdi_output(&sdi_output(1000)).is_ok());
+        assert!(super::validate_sdi_output(&sdi_output(-1000)).is_ok());
+        let e = super::validate_sdi_output(&sdi_output(1001)).unwrap_err().to_string();
+        assert!(e.contains("audio_offset_ms"), "+1001 ms rejected: {e}");
+        let e = super::validate_sdi_output(&sdi_output(-1001)).unwrap_err().to_string();
+        assert!(e.contains("audio_offset_ms"), "-1001 ms rejected: {e}");
     }
 }
