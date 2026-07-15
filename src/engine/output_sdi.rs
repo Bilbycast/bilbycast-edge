@@ -380,7 +380,13 @@ fn playout_worker(
     // Decoders need a parameter set before anything decodes; feeding P-frames
     // first just produces reference errors, so gate on the first keyframe.
     let mut seen_keyframe = false;
+    // Per-output SDI playout telemetry, surfaced on `OutputStats.sdi_stats`.
+    // The card's late/dropped counters are cumulative per playout session, so
+    // both bases reset to 0 on a device re-open (below).
+    let sdi = std::sync::Arc::new(crate::stats::collector::SdiPlayoutStats::default());
+    stats.set_sdi_playout_stats(sdi.clone());
     let mut card_drops_base: u64 = 0;
+    let mut card_late_base: u64 = 0;
     let mut last_mismatch_warn: Option<Instant> = None;
     let mut last_decode_warn: Option<Instant> = None;
 
@@ -584,14 +590,25 @@ fn playout_worker(
                     stats
                         .bytes_sent
                         .fetch_add(frame_buf.len() as u64, Ordering::Relaxed);
-                    // Card-reported drops (we fell behind the SDI cadence)
-                    // fold into packets_dropped so the manager sees them.
-                    let card = playout.dropped_frames() + playout.late_frames();
-                    if card > card_drops_base {
-                        stats
-                            .packets_dropped
-                            .fetch_add(card - card_drops_base, Ordering::Relaxed);
-                        card_drops_base = card;
+                    sdi.frames_sent.fetch_add(1, Ordering::Relaxed);
+                    // Late frames were displayed behind their slot but still
+                    // shown — a scheduling-pressure signal, not lost picture.
+                    // Track them separately; do NOT fold into packets_dropped.
+                    let late = playout.late_frames();
+                    if late > card_late_base {
+                        sdi.frames_late
+                            .fetch_add(late - card_late_base, Ordering::Relaxed);
+                        card_late_base = late;
+                    }
+                    // Hard drops (card fell behind the SDI cadence) are real
+                    // lost picture — surface in the SDI breakdown AND fold into
+                    // the generic packets_dropped so every output view sees them.
+                    let hard = playout.dropped_frames();
+                    if hard > card_drops_base {
+                        let d = hard - card_drops_base;
+                        stats.packets_dropped.fetch_add(d, Ordering::Relaxed);
+                        sdi.frames_dropped.fetch_add(d, Ordering::Relaxed);
+                        card_drops_base = hard;
                     }
                 }
                 // Card is behind the SDI cadence or wedged (playback running
@@ -600,6 +617,7 @@ fn playout_worker(
                 // rather than parking this blocking thread on a dead card.
                 Err(decklink_rs::Error::Busy) => {
                     stats.packets_dropped.fetch_add(1, Ordering::Relaxed);
+                    sdi.frames_dropped.fetch_add(1, Ordering::Relaxed);
                     if cancel.is_cancelled() {
                         return;
                     }
@@ -619,7 +637,9 @@ fn playout_worker(
                     match open_playout(ctx, config, cancel, event_sender) {
                         Some(po) => {
                             playout = po;
+                            // New session — the card's cumulative counters restart.
                             card_drops_base = 0;
+                            card_late_base = 0;
                         }
                         None => return,
                     }

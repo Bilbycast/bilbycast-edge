@@ -90,6 +90,10 @@ pub struct OutputStatsAccumulator {
     /// `engine::output_display`. Read by the snapshot path to populate
     /// [`crate::stats::models::DisplayStats`].
     display_stats: OnceLock<DisplayStatsHandle>,
+    /// Optional handle to the per-output SDI playout worker's counters. Set
+    /// once at output startup by `engine::output_sdi`. Read by the snapshot
+    /// path to populate [`crate::stats::models::SdiOutputStats`].
+    sdi_playout_stats: OnceLock<Arc<SdiPlayoutStats>>,
     /// Optional snapshot-time descriptors used to build
     /// [`crate::stats::models::EgressMediaSummary`]. Set once at output
     /// startup with everything that doesn't change at runtime — the dynamic
@@ -741,6 +745,7 @@ impl OutputStatsAccumulator {
             video_encode_stats: OnceLock::new(),
             video_decode_stats: OnceLock::new(),
             display_stats: OnceLock::new(),
+            sdi_playout_stats: OnceLock::new(),
             egress_static: OnceLock::new(),
             latency_min_us: AtomicU64::new(u64::MAX),
             latency_max_us: AtomicU64::new(0),
@@ -1031,6 +1036,13 @@ impl OutputStatsAccumulator {
     #[allow(dead_code)]
     pub fn display_stats_handle(&self) -> Option<&DisplayStatsHandle> {
         self.display_stats.get()
+    }
+
+    /// Register the SDI playout worker's lock-free counters. Set once at output
+    /// startup; the snapshot path reads them into `OutputStats.sdi_stats`.
+    #[allow(dead_code)]
+    pub fn set_sdi_playout_stats(&self, stats: Arc<SdiPlayoutStats>) {
+        let _ = self.sdi_playout_stats.set(stats);
     }
 
     /// Register the static portion of this output's egress media summary.
@@ -1336,6 +1348,7 @@ impl OutputStatsAccumulator {
             av_interleave: self.av_interleave.snapshot(),
             av_skew: self.av_skew.get().map(|r| r.snapshot()),
             display_stats,
+            sdi_stats: self.sdi_playout_stats.get().map(|h| h.snapshot()),
             wire_pacing_tier: self.wire_pacing_tier.get().cloned(),
             egress_pacing_effective: self.egress_pacing_effective.get().cloned(),
             wire_pacing_late: self.wire_pacing_late.load(Ordering::Relaxed),
@@ -2498,6 +2511,30 @@ impl SdiCaptureStats {
             signal_losses: self.signal_losses.load(Ordering::Relaxed),
             frames_dropped: self.frames_dropped.load(Ordering::Relaxed),
             sessions: self.sessions.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// Lock-free SDI playout telemetry for one output, written by the playout
+/// worker and read by the snapshot path. Like [`SdiCaptureStats`], it holds no
+/// DeckLink types so the collector needs no `cfg` gate.
+#[derive(Debug, Default)]
+pub struct SdiPlayoutStats {
+    /// Video frames successfully scheduled onto the card.
+    pub frames_sent: AtomicU64,
+    /// Frames the card displayed late (soft — presented behind their slot).
+    pub frames_late: AtomicU64,
+    /// Frames dropped — never presented (hard loss).
+    pub frames_dropped: AtomicU64,
+}
+
+impl SdiPlayoutStats {
+    /// Snapshot into the serialisable form the manager sees.
+    pub fn snapshot(&self) -> crate::stats::models::SdiOutputStats {
+        crate::stats::models::SdiOutputStats {
+            frames_sent: self.frames_sent.load(Ordering::Relaxed),
+            frames_late: self.frames_late.load(Ordering::Relaxed),
+            frames_dropped: self.frames_dropped.load(Ordering::Relaxed),
         }
     }
 }

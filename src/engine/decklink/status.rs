@@ -68,6 +68,10 @@ pub struct SdiDeviceStatus {
     /// Raster of the house reference signal, when one is patched.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reference_mode: Option<String>,
+    /// Detected dynamic range (`BMDDynamicRange`); `0` = SDR, non-zero = an HDR
+    /// transfer (HLG / PQ). Lets the manager flag an HDR feed on an SDR chain.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detected_dynamic_range: Option<i32>,
 
     /// PCIe generation the card negotiated. A card in an undersized slot is a
     /// common, and otherwise invisible, cause of dropped capture frames.
@@ -123,6 +127,7 @@ fn probe_all() -> Vec<SdiDeviceStatus> {
                     .and_then(|s| s.detected_field_dominance.clone()),
                 sdi_link_config: s.as_ref().and_then(|s| s.sdi_link_config.clone()),
                 reference_mode: s.as_ref().and_then(|s| s.reference_mode.clone()),
+                detected_dynamic_range: s.as_ref().and_then(|s| s.detected_dynamic_range),
                 pcie_link_speed: s.as_ref().and_then(|s| s.pcie_link_speed),
                 pcie_link_width: s.as_ref().and_then(|s| s.pcie_link_width),
             }

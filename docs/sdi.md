@@ -142,14 +142,23 @@ throughout with no session restart.
 | `frames_dropped` | Frames the capture shim dropped because **this edge** fell behind the SDI cadence (encoder saturated, thread starved). Invisible to every transport-side counter. Cumulative across re-opens. |
 | `sessions` | Capture sessions opened; > 1 means at least one raster change / device re-open. |
 
+**Per-output (playout)** — `OutputStats.sdi_stats` (additive; absent on non-SDI
+outputs):
+
+| Field | Meaning |
+|-------|---------|
+| `frames_sent` | Video frames successfully scheduled onto the card. |
+| `frames_late` | Frames the card displayed **late** (behind their slot but still shown) — a scheduling/CPU-pressure signal, **not** lost picture. Deliberately *not* counted as a drop. Cumulative across re-opens. |
+| `frames_dropped` | Frames **dropped** — never presented (card fell behind the cadence, or the edge skipped a frame against a wedged card). Also folded into the generic `packets_dropped`. Cumulative across re-opens. |
+
 **Per-host** — `HealthPayload.sdi_devices[]`, one entry per port, refreshed by
 a 10 s background poller (`IDeckLinkStatus` needs no open handle, so this
 covers **all** ports — idle ones and ports held by other processes — without
 disturbing live flows): signal / reference (genlock) / ancillary lock, busy,
-detected raster + colorimetry + field dominance, SDI link config, PCIe link
-speed and width (an undersized PCIe slot is a classic invisible cause of
-capture drops). Every field is optional on the wire; **absent means "the card
-did not say", never "no"**.
+detected raster + colorimetry + field dominance, detected dynamic range
+(SDR vs HDR), SDI link config, PCIe link speed and width (an undersized PCIe
+slot is a classic invisible cause of capture drops). Every field is optional on
+the wire; **absent means "the card did not say", never "no"**.
 
 **Capability** — `sdi-decklink` on `HealthPayload.capabilities`, gated on the
 boot probe reaching the SDK. A card-less host with Desktop Video still

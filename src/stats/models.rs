@@ -855,6 +855,29 @@ pub struct SdiInputStats {
     pub sessions: u64,
 }
 
+/// SDI (DeckLink) playout statistics for one output.
+///
+/// The card reports two distinct completion outcomes that the generic
+/// `packets_dropped` counter cannot tell apart: a frame **displayed late**
+/// (soft — presented, but behind its slot, a scheduling-pressure signal) and a
+/// frame **dropped** (hard — never presented). Surfacing them separately lets
+/// the manager distinguish "the host is under load" from "we are losing
+/// picture". Sourced from the DeckLink scheduled-playback callbacks, not the
+/// byte stream.
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct SdiOutputStats {
+    /// Cumulative video frames successfully scheduled onto the card.
+    pub frames_sent: u64,
+    /// Cumulative frames the card displayed **late** (behind their scheduled
+    /// slot but still shown). A rising count is scheduling/CPU pressure, not
+    /// lost picture — informational, not counted as a drop.
+    pub frames_late: u64,
+    /// Cumulative frames **dropped** — never presented (card fell behind the
+    /// cadence, or the edge skipped a frame against a wedged card). These are
+    /// also folded into the generic `packets_dropped`.
+    pub frames_dropped: u64,
+}
+
 /// Statistics for a single output leg of a flow.
 #[derive(Debug, Clone, Serialize, Default)]
 pub struct OutputStats {
@@ -991,6 +1014,11 @@ pub struct OutputStats {
     /// Backward-compatible additive field — old managers ignore it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display_stats: Option<DisplayStats>,
+    /// Per-output SDI (DeckLink) playout statistics. Present only when the
+    /// output type is `sdi`; absent on every other output. Additive — older
+    /// managers ignore it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sdi_stats: Option<SdiOutputStats>,
     /// The active wire-pacing release tier for this output, set once at
     /// output startup. One of `so_txtime`, `clock_nanosleep_fifo`,
     /// `clock_nanosleep`, `unpaced`. Absent on outputs that don't own
