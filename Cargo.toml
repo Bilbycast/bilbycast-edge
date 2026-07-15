@@ -104,10 +104,13 @@ video-codec = { path = "../bilbycast-ffmpeg-video-rs/video-codec", optional = tr
 mxl-rs = { path = "../bilbycast-mxl-rs/mxl-rs", optional = true }
 
 # ── SDI capture/playout via Blackmagic DeckLink (the `sdi-decklink` feature) ─
-# Wraps FFmpeg's libavdevice `decklink` in/out device (see
-# `bilbycast-decklink-rs`). Needs an FFmpeg built with --enable-decklink
-# against the proprietary Blackmagic SDK, so the resulting binary is
-# non-redistributable — intended for private on-prem deployment. Default OFF.
+# Talks to the Blackmagic DeckLink SDK directly via a C++ shim (see
+# `bilbycast-decklink-rs`), NOT FFmpeg's libavdevice `decklink` device — the
+# avdevice path hides `bmdFrameHasNoInputSource`, so a pulled cable is
+# indistinguishable from a live feed. Build needs only the SDK headers
+# (`DECKLINK_SDK_DIR`); `libDeckLinkAPI.so` is dlopened at runtime by Desktop
+# Video. No FFmpeg rebuild, no non-free linkage. Default OFF. Sibling-path
+# dependency, mirroring `mxl-rs` (both are Bilbycast-org workspace crates).
 decklink-rs = { path = "../bilbycast-decklink-rs/decklink-rs", optional = true }
 
 # System resource monitoring (CPU, RAM)
@@ -364,10 +367,11 @@ display = [
 # + vcpkg + `CC=clang CXX=clang++`). Default OFF.
 mxl = ["dep:mxl-rs"]
 # SDI capture/playout via Blackmagic DeckLink (`sdi` input/output type).
-# Pulls the `decklink-rs` wrapper over FFmpeg's libavdevice decklink device.
+# Pulls the `decklink-rs` SDK wrapper (direct DeckLink SDK, not libavdevice).
 # The SDI input encodes captured video (video_encode required) + embedded
-# audio into one A+V MPEG-TS. Needs an --enable-decklink FFmpeg at build
-# time and a video-encoder-* backend. Default OFF. See
+# audio into one A+V MPEG-TS; the SDI output decodes the flow and schedules
+# it onto the card. Needs the SDK headers (`DECKLINK_SDK_DIR`) and a
+# video-encoder-* backend. Default OFF. See
 # `bilbycast-decklink-rs/CLAUDE.md`.
 sdi-decklink = ["dep:decklink-rs"]
 # Skip the upstream libmxl C++ cmake build inside mxl-sys. bindgen still
