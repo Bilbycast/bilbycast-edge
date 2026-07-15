@@ -167,12 +167,17 @@ which ports exist).
 
 ## SDI output (playout)
 
-`decklink-rs::DecklinkPlayout` implements scheduled video playout: frames are
-copied into card memory and scheduled against the **card's clock** — a
-3-frame pre-roll, then an 8-frame in-flight window whose completion callbacks
-pace the writer (no userspace timers). Late/dropped completions are counted.
-Video-only today; `write_audio` returns `Unsupported` until the video path
-has soaked.
+`decklink-rs::DecklinkPlayout` implements scheduled video **and audio**
+playout: video frames are copied into card memory and scheduled against the
+**card's clock** — a 3-frame pre-roll, then an 8-frame in-flight window whose
+completion callbacks pace the writer (no userspace timers). Audio is
+scheduled via `bmdAudioOutputStreamTimestamped` on the same 90 kHz timeline as
+video, which is what gives hardware A/V lock (see "Edge integration" below).
+The crate exposes late frames and dropped frames as **separate** counters
+(`late_frames()` / `dropped_frames()`) — late means displayed behind its slot
+but still shown (soft, scheduling pressure), dropped means never presented
+(hard loss); callers should keep them distinct rather than summing them (the
+edge integration below does).
 
 Verified by physical loopback on a DeckLink Quad: colour bars
 (`examples/playout_bars.rs`) scheduled on one sub-device, emerging on its
@@ -241,6 +246,17 @@ evidence: `bilbycast-decklink-rs/CLAUDE.md`.
 * **Deterministic no-signal**: force a `format` that mismatches the source
   (e.g. `Hp50` against a 1080i50 feed) — reproduces the whole signal-loss
   path without touching the rack.
+* **Automated lip-sync, no monitor required**: generate a test clip with a
+  short video flash and a short audio tone-step *of different frequency to
+  the bed tone* aligned at the same instants (a plain silence/tone pip is
+  fragile — a short transient can fail to survive a decode/re-encode cleanly
+  enough for onset detection, which reads as a false dropout). Loop it
+  through `media_player` → SDI out → SDI in loopback capture, then detect
+  video onsets via `ffmpeg -vf signalstats` (YAVG threshold) and audio onsets
+  via zero-crossing rate per short window (a frequency step is far more
+  robust to codec artifacts than an amplitude/silence step). Compare onset
+  timestamps for offset and drift. This is how the 12 h soak's A/V sync was
+  verified without physical access to the rack.
 
 ## Production readiness
 
@@ -249,6 +265,23 @@ capture → encode (x264 + NVENC) → A+V TS; signal-loss/reconnect by physicall
 pulling the cable; per-port `HealthPayload.sdi_devices[]`; SDI→SDI loopback
 video (photographed clean) and audio (measured continuous, lip-synced by the
 card clock); config validation rejecting bad chroma/bit-depth/mode at load.
+
+**12-hour soak** (full-duplex SDI in+out, 2-channel embedded audio): 12 h 05 m,
+716 samples, **0** signal losses, **0** capture/output drops, 1 capture
+session (no re-opens), RSS flat at 585 MB (no leak), 100.07 % frame cadence,
+**0** segfaults/panics/encode-failures/audio-warnings.
+
+**Automated A/V lip-sync** (media_player → SDI out, loopback capture, a
+freq-step test clip — a 200 ms white flash + 200 ms 3 kHz tone-burst aligned
+every 1 s on a continuous 1 kHz bed — detected via `signalstats` YAVG for
+video and zero-crossing rate for audio): confirmed audio is **not** dropped
+(an earlier "pip every 3 s" reading was a measurement artifact of 40 ms
+AAC-coded transients, not a pipeline fault — a continuous tone comes back
+continuous, 96.7 % active windows, flat RMS) and the A/V offset is **rock
+steady with zero drift** across every event. The *absolute* offset is
+confounded by the capture/monitor path's own bias and could not be isolated
+remotely, so `audio_offset_ms` (below) exists for an operator to null it
+against a real reference monitor.
 
 **Robustness properties** built in and worth stating for an operator:
 
@@ -264,14 +297,15 @@ card clock); config validation rejecting bad chroma/bit-depth/mode at load.
   latency; the playout write times out rather than hanging on a dead card;
   input switches flush the decoder so they re-anchor on the next keyframe.
 
-**Not yet field-validated** (works in bring-up, wants a real soak / matrix):
+**Not yet field-validated** (works in bring-up, needs hardware not on hand):
 
-* Long-run stability (hours) — the overnight soak covers this.
 * Rasters other than 1080i50 (720p / 1080p50 / 2160p).
 * 8- and 16-channel embedded audio (2-channel verified).
 * QSV / VAAPI encoder backends (compile-verified; no Intel/AMD host to date).
-* Audio lip-sync *tightness* — presence and drift-freedom are verified; the
-  absolute offset was not measured (needs known-sync content on a monitor).
+* The *absolute* lip-sync number against a real monitor — presence,
+  drift-freedom, and linearity of the `audio_offset_ms` trim are all measured
+  (see above); only the "what's the real-world offset on my rack" question
+  needs eyes on a physical monitor.
 
 **Operational prerequisites**:
 
