@@ -38,6 +38,17 @@ NoNewPrivileges=true
 # a hardcoded /dev/dri/cardN list breaks on the third GPU.
 DeviceAllow=char-drm rwm
 DeviceAllow=char-alsa rwm
+# NVIDIA's CUDA compute stack (NVENC/NVDEC) registers under separate
+# char-major device classes from `drm` — `nvidia`/`nvidiactl`/`nvidia-uvm`
+# per /proc/devices, not covered by char-drm. Without these, `cuInit()`
+# fails with CUDA_ERROR_NO_DEVICE even though /dev/nvidia* exists with
+# correct permissions and the driver is fully functional — DRM/VAAPI
+# display output keeps working (it only needs char-drm) while NVENC/NVDEC
+# silently never do. Harmless no-op on hosts with no NVIDIA driver loaded
+# (the device classes are never registered, so there's nothing to match).
+DeviceAllow=char-nvidia rwm
+DeviceAllow=char-nvidiactl rwm
+DeviceAllow=char-nvidia-uvm rwm
 SupplementaryGroups=video render audio
 # CAP_NET_ADMIN — required by kernel ≥ 6.x for setsockopt(SO_TXTIME)
 # with CLOCK_TAI. Without it, wire-emit falls back to clock_nanosleep.

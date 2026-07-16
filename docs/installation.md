@@ -419,6 +419,33 @@ separate package** for the encoder itself.
 The Nouveau open-source driver does **not** support NVENC — only the
 proprietary driver exposes the NVENC engine.
 
+**Under the packaged systemd service, group membership alone is not
+enough.** `bilbycast-edge.service` sandboxes the process with
+`DeviceAllow=` cgroup rules, which restrict device access by kernel
+device class regardless of file permissions or group membership — even
+root inside the cgroup can't open a device class that isn't explicitly
+allowed. NVIDIA's CUDA compute stack (used by NVENC/NVDEC) registers
+under `nvidia` / `nvidiactl` / `nvidia-uvm`, entirely separate char-major
+classes from `drm` (`/proc/devices`), so a unit that only allows
+`char-drm` blocks NVENC/NVDEC while DRM/VAAPI display output keeps
+working fine — a confusing split where the GPU is clearly detected
+(`nvidia-smi` works, the display path works) but transcoding fails with
+`CUDA_ERROR_NO_DEVICE`. The unit installed by `install-edge.sh` already
+includes the required `char-nvidia` / `char-nvidiactl` / `char-nvidia-uvm`
+`DeviceAllow` entries alongside `char-drm`. If you're running a custom
+unit or one built before this was added, add:
+
+```ini
+DeviceAllow=char-nvidia rwm
+DeviceAllow=char-nvidiactl rwm
+DeviceAllow=char-nvidia-uvm rwm
+```
+
+then `sudo systemctl daemon-reload && sudo systemctl restart bilbycast-edge`.
+These are harmless no-ops on hosts without an NVIDIA driver loaded — the
+device classes are never registered, so there's nothing for the rule to
+match.
+
 ```bash
 # Ubuntu 22.04 / 24.04 — install the recommended driver branch
 sudo ubuntu-drivers autoinstall
