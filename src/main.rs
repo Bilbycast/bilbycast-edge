@@ -504,7 +504,8 @@ async fn main() -> anyhow::Result<()> {
             );
         }
         None => tracing::info!(
-            "sdi: no DeckLink devices found — sdi-decklink capability will not be advertised"
+            "sdi: DeckLink API unreachable (Blackmagic Desktop Video not installed) — \
+             sdi-decklink capability will not be advertised"
         ),
     }
     tracing::info!(

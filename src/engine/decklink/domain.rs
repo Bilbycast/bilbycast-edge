@@ -50,20 +50,32 @@ pub struct DecklinkDeviceManager {
 impl DecklinkDeviceManager {
     /// Enumerate DeckLink devices via the SDK.
     ///
-    /// `enumerate_devices` is infallible: it yields an empty list when Desktop
-    /// Video is not installed or no card is fitted. Both are reported as a
-    /// successful probe with zero devices rather than `None`, because the
-    /// capture task — not the boot probe — is the authority on whether a device
-    /// can be opened. A `None` here would refuse a flow on a host whose card
-    /// appears after boot (hot-plugged Thunderbolt, delayed driver load).
+    /// Gated on the API being reachable, not on a card being present. Zero
+    /// devices with Desktop Video installed is a successful probe: the capture
+    /// task — not the boot probe — is the authority on whether a device can be
+    /// opened, and `None` here would refuse a flow on a host whose card appears
+    /// after boot (hot-plugged Thunderbolt, delayed driver load).
+    ///
+    /// An unreachable API is different in kind. No card can appear on a host
+    /// with no driver, so advertising the capability there would offer SDI on
+    /// every node in a fleet running the same build.
     pub fn probe() -> Option<Arc<Self>> {
+        if !decklink_rs::api_available() {
+            info!(
+                target: "sdi.decklink",
+                "SDI (DeckLink) compiled in but the DeckLink API is unreachable — \
+                 install Blackmagic Desktop Video to use SDI on this host"
+            );
+            return None;
+        }
+
         let devices = decklink_rs::enumerate_devices();
 
         if devices.is_empty() {
             warn!(
                 target: "sdi.decklink",
                 "SDI (DeckLink) capability enabled but no devices enumerated — \
-                 is Blackmagic Desktop Video installed and a card fitted?"
+                 Desktop Video is installed; is a card fitted?"
             );
         } else {
             for d in &devices {
