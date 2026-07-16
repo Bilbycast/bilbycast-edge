@@ -63,6 +63,12 @@ jobs:
           repository: Bilbycast/bilbycast-ffmpeg-video-rs
           path: bilbycast-ffmpeg-video-rs
           submodules: recursive
+          # Full history: the vendored FFmpeg submodule is pinned to a commit
+          # that git.ffmpeg.org will not serve to a shallow request, so a
+          # depth-1 fetch fails with "Server does not allow request for
+          # unadvertised object". The release workflow fetches deep for the
+          # same reason.
+          fetch-depth: 0
 
       - name: Checkout bilbycast-rist (path dependency)
         uses: actions/checkout@v7

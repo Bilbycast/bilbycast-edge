@@ -25,6 +25,17 @@ ignore = [
     # drop this ignore once a patched rsa version ships.
     # https://github.com/RustCrypto/RSA/issues/19
     "RUSTSEC-2023-0071",
+    # paste 1.0.15 — unmaintained (author archived the repo). A compile-time
+    # proc-macro helper with no runtime surface, pulled in transitively by the
+    # netlink stack (netlink-packet-core → netlink-packet-route / rtnetlink)
+    # that backs network-interface enumeration. Not a vulnerability; no patched
+    # version exists, and the netlink crates have not migrated off it.
+    # TODO: drop when the netlink stack moves to `pastey`/`with_builtin_macros`.
+    "RUSTSEC-2024-0436",
+    # proc-macro-error2 2.0.1 — unmaintained. Another compile-time-only
+    # proc-macro helper, transitive via nvml-wrapper / zbus / mdns-sd. Not a
+    # vulnerability; no patched version. TODO: drop when those crates migrate.
+    "RUSTSEC-2026-0173",
 ]
 
 [licenses]
