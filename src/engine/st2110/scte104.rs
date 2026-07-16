@@ -22,24 +22,33 @@
 //! opcode and is then surfaced as `Event::Other`. Operators can hook the raw
 //! bytes via the manager event log if they need richer decoding.
 //!
-//! ## Wire format (SCTE-104 §10)
+//! ## Wire format (ANSI/SCTE 104)
+//!
+//! The leading 16-bit field discriminates the two message framings — a
+//! `single_operation_message` carries a real opID there, a
+//! `multiple_operation_message` carries the `0xFFFF` sentinel. Real ad-splice
+//! inserters emit the multi-op form in VANC; this codec parses both and emits
+//! the multi-op form.
 //!
 //! ```text
-//! 16  message_size                : total bytes including this field
-//!  8  protocol_version            : 0
-//!  8  AS_index                    : authorizing source
-//!  8  message_number              : sender-assigned tag
-//!  8  DPI_PID_index
-//! 16  SCTE35_protocol_version
-//! ...
-//! 16  opID
-//! 16  data_length
-//!  N  payload
+//! single_operation_message()          multiple_operation_message()
+//!   16  opID (≠ 0xFFFF)                  16  rsvd (= 0xFFFF)
+//!   16  message_size                     16  message_size
+//!   16  result                            8  protocol_version
+//!   16  result_extension                  8  AS_index
+//!    8  protocol_version                  8  message_number
+//!    8  AS_index                         16  DPI_PID_index
+//!    8  message_number                    8  SCTE35_protocol_version
+//!   16  DPI_PID_index                        timestamp()   (1 + 0/6/4/2 bytes)
+//!        data()  (the operation)           8  num_ops
+//!                                             num_ops × { 16 opID, 16 data_length, data }
 //! ```
 //!
-//! For single-operation messages the parser only needs the leading
-//! `protocol_version`, the `opID`, and (for cue-out / cue-in) the
-//! `splice_event_id` (32 bits) and `pre_roll_time` (16 bits, milliseconds).
+//! The `splice_request_data()` operation (opID `0x0101`), 14 bytes:
+//! `splice_insert_type(8) splice_event_id(32) unique_program_id(16)
+//! pre_roll_time(16, ms) break_duration(16, tenths of a second) avail_num(8)
+//! avails_expected(8) auto_return_flag(8)`. `splice_null()` is opID `0x0102`.
+//! Field layout and opID values follow the libklvanc reference implementation.
 //!
 //! Pure Rust, no dependencies.
 
@@ -65,47 +74,93 @@ pub enum SpliceOpcode {
     Other(u16),
 }
 
+/// SCTE-104 operation IDs (ANSI/SCTE 104; values match the libklvanc reference
+/// implementation and real broadcast equipment).
+const OPID_SPLICE_REQUEST: u16 = 0x0101; // MO_SPLICE_REQUEST_DATA
+const OPID_SPLICE_NULL: u16 = 0x0102; // MO_SPLICE_NULL_REQUEST_DATA
+/// A `multiple_operation_message` carries this sentinel in the leading 16-bit
+/// field where a `single_operation_message` carries a real (non-0xFFFF) opID.
+const MULTI_OP_SENTINEL: u16 = 0xFFFF;
+
 impl SpliceOpcode {
     fn from_op_id(op: u16, splice_insert_type: Option<u8>) -> Self {
         match (op, splice_insert_type) {
-            (0x0000, _) => SpliceOpcode::SpliceNull,
-            (0x0101, Some(1 | 2)) => SpliceOpcode::SpliceStartNormal,
-            (0x0101, Some(3 | 4)) => SpliceOpcode::SpliceEndNormal,
-            (0x0101, Some(5)) => SpliceOpcode::SpliceCancel,
+            (OPID_SPLICE_NULL, _) => SpliceOpcode::SpliceNull,
+            (OPID_SPLICE_REQUEST, Some(1 | 2)) => SpliceOpcode::SpliceStartNormal,
+            (OPID_SPLICE_REQUEST, Some(3 | 4)) => SpliceOpcode::SpliceEndNormal,
+            (OPID_SPLICE_REQUEST, Some(5)) => SpliceOpcode::SpliceCancel,
             (other, _) => SpliceOpcode::Other(other),
         }
     }
 }
 
-/// Build a byte-aligned single-operation `splice_request_data()` message.
-/// Header routing fields not represented by [`Scte104Message`] are zero.
+/// Build a standard ANSI/SCTE-104 `multiple_operation_message` carrying a
+/// single operation (a `splice_request_data()` or `splice_null()`), ready to
+/// travel in a SMPTE 2010 / RFC 8331 ANC packet (DID/SDID `0x41/0x07`).
+///
+/// This is the framing real broadcast equipment (Evertz, Ross, …) emits and
+/// expects — a multiple-operation message with `num_ops = 1` and a `time_type
+/// = 0` (immediate) timestamp. Routing fields not represented by
+/// [`Scte104Message`] (`AS_index`, `message_number`, `DPI_PID_index`,
+/// `unique_program_id`, `avail_num`) are emitted as zero.
 pub fn build_scte104_message(msg: &Scte104Message) -> Vec<u8> {
+    let (op_id, op_data) = match msg.opcode {
+        SpliceOpcode::SpliceNull => (OPID_SPLICE_NULL, Vec::new()),
+        SpliceOpcode::SpliceStartNormal
+        | SpliceOpcode::SpliceEndNormal
+        | SpliceOpcode::SpliceCancel => (OPID_SPLICE_REQUEST, build_splice_request_data(msg)),
+        SpliceOpcode::Other(op) => (op, Vec::new()),
+    };
+
+    let mut out = Vec::with_capacity(14 + op_data.len());
+    out.extend_from_slice(&MULTI_OP_SENTINEL.to_be_bytes()); // rsvd = 0xFFFF (multi-op)
+    out.extend_from_slice(&0u16.to_be_bytes()); // messageSize placeholder (filled below)
+    out.push(msg.protocol_version); // protocol_version
+    out.push(0); // AS_index
+    out.push(0); // message_number
+    out.extend_from_slice(&0u16.to_be_bytes()); // DPI_PID_index
+    out.push(0); // SCTE35_protocol_version
+    out.push(0); // timestamp: time_type = 0 (none / immediate)
+    out.push(1); // num_ops = 1
+    out.extend_from_slice(&op_id.to_be_bytes()); // opID
+    out.extend_from_slice(&(op_data.len() as u16).to_be_bytes()); // data_length
+    out.extend_from_slice(&op_data);
+
+    // messageSize is the total byte count of the whole message.
+    let size = out.len().min(u16::MAX as usize) as u16;
+    out[2..4].copy_from_slice(&size.to_be_bytes());
+    out
+}
+
+/// Encode the 14-byte `splice_request_data()` operation payload.
+///
+/// `pre_roll_time` is milliseconds and `break_duration` is tenths of a second,
+/// per SCTE-104 (`splice_time = pts + pre_roll × 90`, `duration_90k =
+/// break × 9000`).
+fn build_splice_request_data(msg: &Scte104Message) -> Vec<u8> {
     let immediate = msg.pre_roll_ms.unwrap_or(0) == 0;
-    let splice_type = match msg.opcode {
+    let splice_insert_type = match msg.opcode {
         SpliceOpcode::SpliceStartNormal => if immediate { 2 } else { 1 },
         SpliceOpcode::SpliceEndNormal => if immediate { 4 } else { 3 },
         SpliceOpcode::SpliceCancel => 5,
         _ => 0,
     };
-    let mut payload = Vec::with_capacity(13);
-    payload.push(splice_type);
-    payload.extend_from_slice(&msg.splice_event_id.unwrap_or(0).to_be_bytes());
-    payload.push(0);
-    payload.extend_from_slice(&msg.pre_roll_ms.unwrap_or(0).to_be_bytes());
-    let tenths = msg.break_duration_ms.unwrap_or(0).div_ceil(100).min(u16::MAX as u32);
-    payload.extend_from_slice(&(tenths as u16).to_be_bytes());
-    payload.extend_from_slice(&[0, 0, u8::from(msg.auto_return.unwrap_or(false))]);
+    let tenths = msg
+        .break_duration_ms
+        .unwrap_or(0)
+        .div_ceil(100)
+        .min(u16::MAX as u32) as u16;
 
-    let size = 12 + payload.len();
-    let mut out = Vec::with_capacity(size);
-    out.extend_from_slice(&(size as u16).to_be_bytes());
-    out.push(msg.protocol_version);
-    out.extend_from_slice(&[0, 0, 0]);
-    out.extend_from_slice(&0u16.to_be_bytes());
-    out.extend_from_slice(&0x0101u16.to_be_bytes());
-    out.extend_from_slice(&(payload.len() as u16).to_be_bytes());
-    out.extend_from_slice(&payload);
-    out
+    let mut d = Vec::with_capacity(14);
+    d.push(splice_insert_type); // splice_insert_type (8)
+    d.extend_from_slice(&msg.splice_event_id.unwrap_or(0).to_be_bytes()); // splice_event_id (32)
+    d.extend_from_slice(&0u16.to_be_bytes()); // unique_program_id (16)
+    d.extend_from_slice(&msg.pre_roll_ms.unwrap_or(0).to_be_bytes()); // pre_roll_time (16, ms)
+    d.extend_from_slice(&tenths.to_be_bytes()); // break_duration (16, tenths of a second)
+    d.push(0); // avail_num (8)
+    d.push(0); // avails_expected (8)
+    d.push(u8::from(msg.auto_return.unwrap_or(false))); // auto_return_flag (8)
+    d
 }
 
 /// Decoded SCTE-104 single-operation message.
@@ -129,8 +184,9 @@ pub struct Scte104Message {
 pub enum Scte104Error {
     Truncated,
     UnknownProtocolVersion(u8),
-    /// Parser only handles single-operation messages today.
-    Multiop,
+    /// A `timestamp()` with a `time_type` the parser can't size, so the
+    /// operations that follow it can't be located.
+    UnknownTimeType(u8),
 }
 
 impl std::fmt::Display for Scte104Error {
@@ -140,8 +196,8 @@ impl std::fmt::Display for Scte104Error {
             Scte104Error::UnknownProtocolVersion(v) => {
                 write!(f, "SCTE-104 protocol version {v} not supported")
             }
-            Scte104Error::Multiop => {
-                f.write_str("SCTE-104 multiple-operation messages are not parsed")
+            Scte104Error::UnknownTimeType(t) => {
+                write!(f, "SCTE-104 timestamp time_type {t} not supported")
             }
         }
     }
@@ -155,215 +211,338 @@ pub fn is_scte104_packet(p: &AncPacket) -> bool {
     p.did == 0x41 && p.sdid == 0x07
 }
 
-/// Parse the SCTE-104 message from an [`AncPacket::user_data`] byte slice.
+/// Parse an SCTE-104 message from an [`AncPacket::user_data`] byte slice.
 ///
-/// Only single-operation messages are decoded today. Multi-operation messages
-/// (`opID = 0xFFFF`) return [`Scte104Error::Multiop`] but the caller can still
-/// surface that as a generic event.
+/// Handles both framings: a `single_operation_message` (leading opID ≠
+/// `0xFFFF`) and a `multiple_operation_message` (leading `0xFFFF` sentinel) —
+/// the latter is what real ad-splice inserters emit in VANC. For a multi-op
+/// message the first `splice_request_data` / `splice_null` operation is
+/// decoded; other operations (descriptors, DTMF, segmentation) are skipped,
+/// and a message with no splice operation surfaces as [`SpliceOpcode::Other`]
+/// so the caller can still log it.
 pub fn parse_scte104(udw: &[u8]) -> Result<Scte104Message, Scte104Error> {
-    // The minimum header is 12 bytes (message_size 2, protocol_version 1,
-    // AS_index 1, message_number 1, DPI_PID_index 1, SCTE35_protocol_version 2,
-    // opID 2, data_length 2).
-    if udw.len() < 12 {
+    if udw.len() < 2 {
         return Err(Scte104Error::Truncated);
     }
-    let _message_size = u16::from_be_bytes([udw[0], udw[1]]);
-    let protocol_version = udw[2];
+    if u16::from_be_bytes([udw[0], udw[1]]) == MULTI_OP_SENTINEL {
+        parse_multiple_operation_message(udw)
+    } else {
+        parse_single_operation_message(udw)
+    }
+}
+
+/// `single_operation_message()` header (13 bytes): opID(16), message_size(16),
+/// result(16), result_extension(16), protocol_version(8), AS_index(8),
+/// message_number(8), DPI_PID_index(16). The operation data follows directly.
+fn parse_single_operation_message(udw: &[u8]) -> Result<Scte104Message, Scte104Error> {
+    const HEADER: usize = 13;
+    if udw.len() < HEADER {
+        return Err(Scte104Error::Truncated);
+    }
+    let op_id = u16::from_be_bytes([udw[0], udw[1]]);
+    let protocol_version = udw[8];
     if protocol_version != 0 {
         return Err(Scte104Error::UnknownProtocolVersion(protocol_version));
     }
-    let _as_index = udw[3];
-    let _message_number = udw[4];
-    let _dpi_pid_index = udw[5];
-    let _scte35_pv = u16::from_be_bytes([udw[6], udw[7]]);
-    let op_id = u16::from_be_bytes([udw[8], udw[9]]);
-    let data_length = u16::from_be_bytes([udw[10], udw[11]]) as usize;
+    Ok(decode_operation(op_id, &udw[HEADER..], protocol_version))
+}
 
-    if op_id == 0xFFFF {
-        return Err(Scte104Error::Multiop);
-    }
-
-    // Sanity-check declared data length.
-    let payload_start = 12;
-    let payload_end = payload_start + data_length;
-    if payload_end > udw.len() {
+/// `multiple_operation_message()`: rsvd(16)=`0xFFFF`, message_size(16),
+/// protocol_version(8), AS_index(8), message_number(8), DPI_PID_index(16),
+/// SCTE35_protocol_version(8), `timestamp()`, num_ops(8), then `num_ops` ×
+/// { opID(16), data_length(16), data\[data_length\] }.
+fn parse_multiple_operation_message(udw: &[u8]) -> Result<Scte104Message, Scte104Error> {
+    // Fixed bytes 0..10 are rsvd..SCTE35_protocol_version; the timestamp's
+    // `time_type` is at offset 10.
+    const TS_OFFSET: usize = 10;
+    if udw.len() < TS_OFFSET + 1 {
         return Err(Scte104Error::Truncated);
     }
-    let payload = &udw[payload_start..payload_end];
+    let protocol_version = udw[4];
+    if protocol_version != 0 {
+        return Err(Scte104Error::UnknownProtocolVersion(protocol_version));
+    }
+    let ts_len = timestamp_len(udw[TS_OFFSET])?;
+    let mut pos = TS_OFFSET + 1 + ts_len; // past time_type + timestamp body
+    let num_ops = *udw.get(pos).ok_or(Scte104Error::Truncated)?;
+    pos += 1;
 
-    // splice_request_data layout (SCTE-104 §10.3.3.1):
-    //  8 splice_insert_type
-    // 32 splice_event_id
-    //  8 unique_program_id
-    // 16 pre_roll_time
-    // 16 break_duration (1/10 sec)
-    //  8 avail_num
-    //  8 avails_expected
-    //  8 auto_return_flag
-    let (splice_insert_type, splice_event_id, pre_roll_ms, break_duration_ms, auto_return) =
-        if op_id == 0x0101 {
-            if payload.len() < 1 {
-                (None, None, None, None, None)
-            } else {
-                let sit = payload[0];
-                let event_id = if payload.len() >= 5 {
-                    Some(u32::from_be_bytes(payload[1..5].try_into().unwrap()))
-                } else {
-                    None
-                };
-                let pre_roll = if payload.len() >= 8 {
-                    Some(u16::from_be_bytes([payload[6], payload[7]]))
-                } else {
-                    None
-                };
-                let duration = (payload.len() >= 10)
-                    .then(|| u16::from_be_bytes([payload[8], payload[9]]) as u32 * 100);
-                let duration = duration.filter(|v| *v != 0);
-                let auto_return =
-                    (payload.len() >= 13 && duration.is_some()).then(|| payload[12] != 0);
-                (
-                    Some(sit),
-                    event_id,
-                    pre_roll,
-                    duration,
-                    auto_return,
-                )
-            }
-        } else {
-            (None, None, None, None, None)
-        };
+    let mut first_op_id: Option<u16> = None;
+    for _ in 0..num_ops {
+        if pos + 4 > udw.len() {
+            return Err(Scte104Error::Truncated);
+        }
+        let op_id = u16::from_be_bytes([udw[pos], udw[pos + 1]]);
+        let data_length = u16::from_be_bytes([udw[pos + 2], udw[pos + 3]]) as usize;
+        pos += 4;
+        if pos + data_length > udw.len() {
+            return Err(Scte104Error::Truncated);
+        }
+        let data = &udw[pos..pos + data_length];
+        pos += data_length;
+        first_op_id.get_or_insert(op_id);
+        if op_id == OPID_SPLICE_REQUEST || op_id == OPID_SPLICE_NULL {
+            return Ok(decode_operation(op_id, data, protocol_version));
+        }
+    }
 
+    // A valid multi-op message that carries no splice operation — surface it
+    // generically rather than erroring, so the caller can log the opID.
     Ok(Scte104Message {
-        opcode: SpliceOpcode::from_op_id(op_id, splice_insert_type),
+        opcode: SpliceOpcode::Other(first_op_id.unwrap_or(MULTI_OP_SENTINEL)),
+        splice_event_id: None,
+        pre_roll_ms: None,
+        break_duration_ms: None,
+        auto_return: None,
+        protocol_version,
+    })
+}
+
+/// Byte length of a `timestamp()` body *after* its 1-byte `time_type` field.
+fn timestamp_len(time_type: u8) -> Result<usize, Scte104Error> {
+    match time_type {
+        0 => Ok(0), // none / immediate
+        1 => Ok(6), // UTC_seconds(32) + UTC_microseconds(16)
+        2 => Ok(4), // hours / minutes / seconds / frames, 8 bits each
+        3 => Ok(2), // GPI_number(8) + GPI_edge(8)
+        other => Err(Scte104Error::UnknownTimeType(other)),
+    }
+}
+
+/// Decode one operation's `data` payload into a [`Scte104Message`].
+///
+/// `splice_request_data()` (14 bytes): splice_insert_type(8),
+/// splice_event_id(32), unique_program_id(16), pre_roll_time(16, ms),
+/// break_duration(16, tenths of a second), avail_num(8), avails_expected(8),
+/// auto_return_flag(8). Shorter payloads are decoded as far as they reach.
+fn decode_operation(op_id: u16, data: &[u8], protocol_version: u8) -> Scte104Message {
+    let bare = |opcode| Scte104Message {
+        opcode,
+        splice_event_id: None,
+        pre_roll_ms: None,
+        break_duration_ms: None,
+        auto_return: None,
+        protocol_version,
+    };
+    if op_id == OPID_SPLICE_NULL {
+        return bare(SpliceOpcode::SpliceNull);
+    }
+    if op_id != OPID_SPLICE_REQUEST || data.is_empty() {
+        return bare(SpliceOpcode::Other(op_id));
+    }
+    let sit = data[0];
+    let splice_event_id =
+        (data.len() >= 5).then(|| u32::from_be_bytes(data[1..5].try_into().unwrap()));
+    let pre_roll_ms = (data.len() >= 9).then(|| u16::from_be_bytes([data[7], data[8]]));
+    let break_duration_ms = (data.len() >= 11)
+        .then(|| u16::from_be_bytes([data[9], data[10]]) as u32 * 100)
+        .filter(|v| *v != 0);
+    let auto_return = (data.len() >= 14 && break_duration_ms.is_some()).then(|| data[13] != 0);
+    Scte104Message {
+        opcode: SpliceOpcode::from_op_id(op_id, Some(sit)),
         splice_event_id,
         pre_roll_ms,
         break_duration_ms,
         auto_return,
         protocol_version,
-    })
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// Build a minimal single-op `splice_request_data` payload for tests.
-    fn make_splice_request(splice_type: u8, event_id: u32, pre_roll: u16) -> Vec<u8> {
-        // Header (12 bytes) + payload (13 bytes) = 25 bytes.
-        let mut buf = Vec::with_capacity(25);
-        buf.extend_from_slice(&25u16.to_be_bytes()); // message_size
+    /// The 14-byte `splice_request_data()` operation payload.
+    fn splice_request_data(
+        splice_type: u8,
+        event_id: u32,
+        pre_roll_ms: u16,
+        break_tenths: u16,
+        auto_return: u8,
+    ) -> Vec<u8> {
+        let mut d = Vec::with_capacity(14);
+        d.push(splice_type); // splice_insert_type
+        d.extend_from_slice(&event_id.to_be_bytes()); // splice_event_id
+        d.extend_from_slice(&0u16.to_be_bytes()); // unique_program_id
+        d.extend_from_slice(&pre_roll_ms.to_be_bytes()); // pre_roll_time (ms)
+        d.extend_from_slice(&break_tenths.to_be_bytes()); // break_duration (tenths)
+        d.push(0); // avail_num
+        d.push(0); // avails_expected
+        d.push(auto_return); // auto_return_flag
+        d
+    }
+
+    /// A standard `single_operation_message` carrying one splice op.
+    fn single_op_splice(splice_type: u8, event_id: u32, pre_roll_ms: u16) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&OPID_SPLICE_REQUEST.to_be_bytes()); // opID (≠ 0xFFFF)
+        buf.extend_from_slice(&0u16.to_be_bytes()); // message_size (not validated by parser)
+        buf.extend_from_slice(&0u16.to_be_bytes()); // result
+        buf.extend_from_slice(&0u16.to_be_bytes()); // result_extension
         buf.push(0); // protocol_version
         buf.push(0); // AS_index
         buf.push(0); // message_number
-        buf.push(0); // DPI_PID_index
-        buf.extend_from_slice(&0u16.to_be_bytes()); // SCTE35_protocol_version
-        buf.extend_from_slice(&0x0101u16.to_be_bytes()); // opID
-        buf.extend_from_slice(&13u16.to_be_bytes()); // data_length
+        buf.extend_from_slice(&0u16.to_be_bytes()); // DPI_PID_index
+        buf.extend_from_slice(&splice_request_data(splice_type, event_id, pre_roll_ms, 0, 0));
+        buf
+    }
 
-        buf.push(splice_type); // splice_insert_type
-        buf.extend_from_slice(&event_id.to_be_bytes()); // splice_event_id
-        buf.push(0); // unique_program_id
-        buf.extend_from_slice(&pre_roll.to_be_bytes()); // pre_roll_time
-        buf.extend_from_slice(&0u16.to_be_bytes()); // break_duration
-        buf.push(0); // avail_num
-        buf.push(0); // avails_expected
-        buf.push(0); // auto_return
+    /// A standard `multiple_operation_message` with the given timestamp body
+    /// and operations — the framing real ad-splice inserters emit in VANC.
+    fn multi_op(time_type: u8, ts_body: &[u8], ops: &[(u16, Vec<u8>)]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&MULTI_OP_SENTINEL.to_be_bytes()); // rsvd = 0xFFFF
+        buf.extend_from_slice(&0u16.to_be_bytes()); // message_size
+        buf.push(0); // protocol_version
+        buf.push(0); // AS_index
+        buf.push(0); // message_number
+        buf.extend_from_slice(&0u16.to_be_bytes()); // DPI_PID_index
+        buf.push(0); // SCTE35_protocol_version
+        buf.push(time_type); // timestamp: time_type
+        buf.extend_from_slice(ts_body); // timestamp body
+        buf.push(ops.len() as u8); // num_ops
+        for (op_id, data) in ops {
+            buf.extend_from_slice(&op_id.to_be_bytes());
+            buf.extend_from_slice(&(data.len() as u16).to_be_bytes());
+            buf.extend_from_slice(data);
+        }
         buf
     }
 
     #[test]
-    fn test_parse_break_duration_and_auto_return() {
-        let mut raw = make_splice_request(1, 7, 500);
-        raw[20..22].copy_from_slice(&300u16.to_be_bytes());
-        raw[24] = 1;
-        let msg = parse_scte104(&raw).unwrap();
-        assert_eq!(msg.break_duration_ms, Some(30_000));
-        assert_eq!(msg.auto_return, Some(true));
-    }
-
-    #[test]
-    fn test_parse_cue_out() {
-        let raw = make_splice_request(1, 0xCAFEBABE, 1500);
-        let msg = parse_scte104(&raw).unwrap();
+    fn parse_single_op_cue_out() {
+        let msg = parse_scte104(&single_op_splice(1, 0xCAFEBABE, 1500)).unwrap();
         assert_eq!(msg.opcode, SpliceOpcode::SpliceStartNormal);
         assert_eq!(msg.splice_event_id, Some(0xCAFEBABE));
         assert_eq!(msg.pre_roll_ms, Some(1500));
     }
 
     #[test]
-    fn test_parse_cue_in() {
-        let raw = make_splice_request(4, 1, 0);
-        let msg = parse_scte104(&raw).unwrap();
+    fn parse_single_op_cue_in_immediate() {
+        let msg = parse_scte104(&single_op_splice(4, 1, 0)).unwrap();
         assert_eq!(msg.opcode, SpliceOpcode::SpliceEndNormal);
         assert_eq!(msg.splice_event_id, Some(1));
     }
 
     #[test]
-    fn test_parse_cancel() {
-        let raw = make_splice_request(5, 99, 0);
-        let msg = parse_scte104(&raw).unwrap();
+    fn parse_single_op_cancel() {
+        let msg = parse_scte104(&single_op_splice(5, 99, 0)).unwrap();
         assert_eq!(msg.opcode, SpliceOpcode::SpliceCancel);
+        assert_eq!(msg.splice_event_id, Some(99));
     }
 
     #[test]
-    fn test_build_message_round_trips() {
+    fn parse_break_duration_and_auto_return() {
+        // 300 tenths of a second = 30_000 ms; auto_return flag set.
+        let raw = multi_op(
+            0,
+            &[],
+            &[(OPID_SPLICE_REQUEST, splice_request_data(1, 7, 500, 300, 1))],
+        );
+        let msg = parse_scte104(&raw).unwrap();
+        assert_eq!(msg.break_duration_ms, Some(30_000));
+        assert_eq!(msg.auto_return, Some(true));
+    }
+
+    /// A `multiple_operation_message` as real broadcast equipment emits it:
+    /// `0xFFFF` sentinel, immediate timestamp, one `splice_request_data`.
+    #[test]
+    fn parse_real_multi_op_cue_out() {
+        let raw = multi_op(
+            0,
+            &[],
+            &[(OPID_SPLICE_REQUEST, splice_request_data(1, 0x1234, 2000, 300, 1))],
+        );
+        assert_eq!(&raw[0..2], &[0xFF, 0xFF]); // multi-op sentinel
+        let msg = parse_scte104(&raw).unwrap();
+        assert_eq!(msg.opcode, SpliceOpcode::SpliceStartNormal);
+        assert_eq!(msg.splice_event_id, Some(0x1234));
+        assert_eq!(msg.pre_roll_ms, Some(2000));
+        assert_eq!(msg.break_duration_ms, Some(30_000));
+        assert_eq!(msg.auto_return, Some(true));
+    }
+
+    /// A SMPTE-VITC timestamp (`time_type = 2`, 4 bytes) must be skipped so the
+    /// operations after it are still located.
+    #[test]
+    fn parse_multi_op_skips_vitc_timestamp() {
+        let raw = multi_op(
+            2,
+            &[10, 30, 15, 0], // hh:mm:ss:ff
+            &[(OPID_SPLICE_REQUEST, splice_request_data(2, 42, 0, 0, 0))],
+        );
+        let msg = parse_scte104(&raw).unwrap();
+        assert_eq!(msg.opcode, SpliceOpcode::SpliceStartNormal); // immediate
+        assert_eq!(msg.splice_event_id, Some(42));
+    }
+
+    /// A non-splice operation ahead of the splice must not hide it.
+    #[test]
+    fn parse_multi_op_finds_splice_among_other_ops() {
+        let raw = multi_op(
+            0,
+            &[],
+            &[
+                (0x0108, vec![0xAA, 0xBB]), // insert_descriptor — skipped
+                (OPID_SPLICE_REQUEST, splice_request_data(3, 7, 500, 0, 0)),
+            ],
+        );
+        let msg = parse_scte104(&raw).unwrap();
+        assert_eq!(msg.opcode, SpliceOpcode::SpliceEndNormal);
+        assert_eq!(msg.splice_event_id, Some(7));
+    }
+
+    #[test]
+    fn parse_splice_null_is_opid_0x0102() {
+        // splice_null (opID 0x0102) decodes to SpliceNull in both framings.
+        let mut single = Vec::new();
+        single.extend_from_slice(&OPID_SPLICE_NULL.to_be_bytes());
+        single.extend_from_slice(&[0u8; 11]); // rest of the 13-byte header
+        assert_eq!(parse_scte104(&single).unwrap().opcode, SpliceOpcode::SpliceNull);
+
+        let multi = multi_op(0, &[], &[(OPID_SPLICE_NULL, Vec::new())]);
+        assert_eq!(parse_scte104(&multi).unwrap().opcode, SpliceOpcode::SpliceNull);
+    }
+
+    #[test]
+    fn parse_multi_op_without_splice_is_other() {
+        let raw = multi_op(0, &[], &[(0x0108, vec![0x01, 0x02])]);
+        assert_eq!(
+            parse_scte104(&raw).unwrap().opcode,
+            SpliceOpcode::Other(0x0108)
+        );
+    }
+
+    #[test]
+    fn build_emits_multi_op_and_round_trips() {
         for msg in [
             Scte104Message { opcode: SpliceOpcode::SpliceStartNormal, splice_event_id: Some(1), pre_roll_ms: Some(1500), break_duration_ms: Some(30_000), auto_return: Some(true), protocol_version: 0 },
             Scte104Message { opcode: SpliceOpcode::SpliceStartNormal, splice_event_id: Some(2), pre_roll_ms: Some(0), break_duration_ms: None, auto_return: None, protocol_version: 0 },
             Scte104Message { opcode: SpliceOpcode::SpliceEndNormal, splice_event_id: Some(3), pre_roll_ms: Some(500), break_duration_ms: None, auto_return: None, protocol_version: 0 },
             Scte104Message { opcode: SpliceOpcode::SpliceCancel, splice_event_id: Some(4), pre_roll_ms: Some(0), break_duration_ms: None, auto_return: None, protocol_version: 0 },
+            Scte104Message { opcode: SpliceOpcode::SpliceNull, splice_event_id: None, pre_roll_ms: None, break_duration_ms: None, auto_return: None, protocol_version: 0 },
         ] {
-            assert_eq!(parse_scte104(&build_scte104_message(&msg)).unwrap(), msg);
+            let wire = build_scte104_message(&msg);
+            assert_eq!(&wire[0..2], &[0xFF, 0xFF], "emits the standard multi-op framing");
+            // messageSize is the true total length.
+            assert_eq!(u16::from_be_bytes([wire[2], wire[3]]) as usize, wire.len());
+            assert_eq!(parse_scte104(&wire).unwrap(), msg);
         }
     }
 
     #[test]
-    fn test_parse_null_heartbeat() {
-        let mut buf = Vec::new();
-        buf.extend_from_slice(&13u16.to_be_bytes());
-        buf.push(0); // pv
-        buf.push(0); // AS
-        buf.push(0); // msg num
-        buf.push(0); // DPI
-        buf.extend_from_slice(&0u16.to_be_bytes());
-        buf.extend_from_slice(&0x0000u16.to_be_bytes()); // splice_null opID
-        buf.extend_from_slice(&0u16.to_be_bytes()); // data_length
-        let msg = parse_scte104(&buf).unwrap();
-        assert_eq!(msg.opcode, SpliceOpcode::SpliceNull);
-    }
-
-    #[test]
-    fn test_parse_unknown_opid_other() {
-        let mut buf = Vec::new();
-        buf.extend_from_slice(&13u16.to_be_bytes());
-        buf.push(0);
-        buf.push(0);
-        buf.push(0);
-        buf.push(0);
-        buf.extend_from_slice(&0u16.to_be_bytes());
-        buf.extend_from_slice(&0x0202u16.to_be_bytes());
-        buf.extend_from_slice(&0u16.to_be_bytes());
-        let msg = parse_scte104(&buf).unwrap();
-        assert_eq!(msg.opcode, SpliceOpcode::Other(0x0202));
-    }
-
-    #[test]
-    fn test_parse_multiop_rejected() {
-        let mut buf = Vec::new();
-        buf.extend_from_slice(&13u16.to_be_bytes());
-        buf.push(0);
-        buf.push(0);
-        buf.push(0);
-        buf.push(0);
-        buf.extend_from_slice(&0u16.to_be_bytes());
-        buf.extend_from_slice(&0xFFFFu16.to_be_bytes());
-        buf.extend_from_slice(&0u16.to_be_bytes());
-        assert_eq!(parse_scte104(&buf), Err(Scte104Error::Multiop));
-    }
-
-    #[test]
-    fn test_parse_truncated() {
-        assert_eq!(parse_scte104(&[0u8; 5]), Err(Scte104Error::Truncated));
+    fn parse_rejects_bad_protocol_version_and_truncation() {
+        let mut raw = single_op_splice(1, 1, 0);
+        raw[8] = 9; // single-op protocol_version
+        assert_eq!(
+            parse_scte104(&raw),
+            Err(Scte104Error::UnknownProtocolVersion(9))
+        );
+        assert_eq!(parse_scte104(&[0u8; 1]), Err(Scte104Error::Truncated));
+        assert_eq!(
+            parse_scte104(&[0xFF, 0xFF, 0x00]),
+            Err(Scte104Error::Truncated)
+        );
     }
 
     #[test]

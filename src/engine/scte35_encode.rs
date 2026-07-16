@@ -58,7 +58,11 @@ pub fn build_splice_insert_section(msg: &Scte104Message, current_pts_90k: u64) -
     let section_length = 1 + 5 + 1 + 3 + 1 + command.len() + 2 + 4;
     let mut section = Vec::with_capacity(3 + section_length);
     section.push(0xFC);
-    section.push(((section_length >> 8) & 0x0F) as u8);
+    // section_syntax_indicator=0, private_indicator=0, then sap_type. SCTE 35
+    // 2019+ defines those two bits as sap_type with default '11' (Not
+    // Specified); emitting 00 falsely asserts "Type 1 SAP". Older editions
+    // name them reserved '11'. Either way the correct default is 0b11.
+    section.push((0x30 | ((section_length >> 8) & 0x0F)) as u8);
     section.push(section_length as u8);
     section.push(msg.protocol_version);
     section.extend_from_slice(&[0; 5]); // clear packet, pts_adjustment = 0

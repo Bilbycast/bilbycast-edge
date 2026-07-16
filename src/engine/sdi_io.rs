@@ -672,6 +672,13 @@ fn sdi_input_blocking_loop(
         // The card is gone or re-opening; it is not locked to a signal until a
         // frame proves otherwise.
         sdi_stats.signal_present.store(false, Ordering::Relaxed);
+        // Caption presence and timecode are per-session telemetry ("fresh on
+        // every re-open"). The session-local dedup bools reset each session,
+        // but the *reported* stats are sticky atomics that are only ever set
+        // true — without this reset a switch to an uncaptioned / no-timecode
+        // source keeps reporting the previous session's values forever.
+        sdi_stats.set_captions_present(false, false);
+        sdi_stats.store_timecode(None);
 
         match end {
             SessionEnd::Cancelled | SessionEnd::Fatal => break,

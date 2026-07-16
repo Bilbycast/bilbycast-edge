@@ -685,8 +685,16 @@ impl TsMuxer {
                 0
             })
             + (if self.has_scte35 { 5 } else { 0 });
+        // A SCTE-35-carrying PMT must advertise a program-level 'CUEI'
+        // registration_descriptor (SCTE 35 2020 §8.2 — "shall be carried in
+        // the descriptor loop immediately following the program_info_length
+        // field") so a downstream splicer that discovers SCTE-35 by scanning
+        // program_info recognises the stream. 6 bytes: tag(1) + len(1) +
+        // format_identifier(4). Gated on has_scte35, so a non-SCTE PMT
+        // (RTMP / RTSP / WebRTC) is emitted byte-for-byte unchanged.
+        let program_info_len: u16 = if self.has_scte35 { 6 } else { 0 };
         // section_length covers everything from program_number through CRC.
-        let section_length = 9 + streams_len as u16 + 4;
+        let section_length = 9 + program_info_len + streams_len as u16 + 4;
 
         pkt[pmt_start + 1] = 0xB0 | ((section_length >> 8) as u8 & 0x0F);
         pkt[pmt_start + 2] = section_length as u8;
@@ -708,10 +716,19 @@ impl TsMuxer {
         });
         pkt[pmt_start + 8] = 0xE0 | ((pcr_pid >> 8) as u8 & 0x1F);
         pkt[pmt_start + 9] = pcr_pid as u8;
-        pkt[pmt_start + 10] = 0xF0; // reserved + program_info_length high
-        pkt[pmt_start + 11] = 0x00; // program_info_length low = 0
+        pkt[pmt_start + 10] = 0xF0 | ((program_info_len >> 8) as u8 & 0x0F); // reserved + program_info_length high
+        pkt[pmt_start + 11] = program_info_len as u8; // program_info_length low
 
         let mut pos = pmt_start + 12;
+
+        // Program-level SCTE-35 registration_descriptor ('CUEI'). Only present
+        // when this PMT advertises an SCTE-35 stream; see program_info_len.
+        if self.has_scte35 {
+            pkt[pos] = 0x05; // registration_descriptor tag
+            pkt[pos + 1] = 0x04; // descriptor_length
+            pkt[pos + 2..pos + 6].copy_from_slice(b"CUEI"); // format_identifier
+            pos += 6;
+        }
 
         // Video stream entry (H.264 or H.265)
         if self.has_video {
@@ -1256,6 +1273,17 @@ mod tests {
         muxer.set_scte35_stream(0x01fc);
         let pmt = muxer.build_pmt();
         assert!(pmt.windows(3).any(|w| w == [0x86, 0xe1, 0xfc]));
+
+        // A SCTE-35 PMT carries a program-level 'CUEI' registration_descriptor
+        // (SCTE 35 §8.2). pmt_start = 5, so program_info_length is at [15]/[16]
+        // and the descriptor immediately follows at [17..23].
+        assert_eq!(pmt[15] & 0x0f, 0, "program_info_length high nibble");
+        assert_eq!(pmt[16], 6, "program_info_length = 6 (one 6-byte descriptor)");
+        assert_eq!(&pmt[17..23], &[0x05, 0x04, b'C', b'U', b'E', b'I']);
+        // The whole section (including the added descriptor) must still CRC-verify.
+        let section_length = (((pmt[6] & 0x0f) as usize) << 8) | pmt[7] as usize;
+        let section_end = 5 + 3 + section_length;
+        assert_eq!(crc32_mpeg2(&pmt[5..section_end]), 0, "PMT CRC verifies to 0");
 
         // Mark PSI as already sent so each call returns just its cue packet.
         muxer.pat_pmt_sent = true;
