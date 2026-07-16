@@ -48,13 +48,15 @@ jobs:
           - advisories
           - bans licenses sources
     steps:
-      # bilbycast-edge/Cargo.toml has path dependencies on six sibling
+      # bilbycast-edge/Cargo.toml has path dependencies on seven sibling
       # repos (../bilbycast-fdk-aac-rs, ../bilbycast-ffmpeg-video-rs,
       # ../bilbycast-libsrt-rs, ../bilbycast-rist, ../bilbycast-bonding,
-      # ../bilbycast-mxl-rs). `cargo-deny` runs `cargo metadata` with
-      # --all-features, which fails unless those sibling directories
-      # exist. Mirror the nightly-release layout: check everything out
-      # into peer directories of the workspace root, then point
+      # ../bilbycast-mxl-rs, ../bilbycast-decklink-rs). `cargo metadata`
+      # must read every path dependency's manifest to build the dependency
+      # graph — including `optional = true` ones whose feature is off — so
+      # a missing sibling directory fails the run outright, not just under
+      # --all-features. Mirror the nightly-release layout: check everything
+      # out into peer directories of the workspace root, then point
       # cargo-deny at ./bilbycast-edge/Cargo.toml so the relative `..`
       # references resolve correctly.
       - name: Checkout bilbycast-libsrt-rs (path dependency)
@@ -93,6 +95,12 @@ jobs:
           repository: Bilbycast/bilbycast-mxl-rs
           path: bilbycast-mxl-rs
           submodules: recursive
+
+      - name: Checkout bilbycast-decklink-rs (path dependency)
+        uses: actions/checkout@v7
+        with:
+          repository: Bilbycast/bilbycast-decklink-rs
+          path: bilbycast-decklink-rs
 
       - name: Checkout bilbycast-edge
         uses: actions/checkout@v7

@@ -1,0 +1,125 @@
+name: CI
+
+# Compile-check every pull request.
+#
+# Why this exists: nothing else builds the edge on a PR. codeql.yml runs
+# `build-mode: none`, security-audit.yml only runs `cargo metadata`, and
+# nightly-release.yml builds on tags — so a PR could red the tree and nobody
+# would know until release. That is not hypothetical: ffmpeg-video-rs #3 added
+# two required fields to `VideoEncoderConfig`, which broke `main` outright
+# (E0063 in video_encode_util.rs) and went unnoticed precisely because of this
+# gap. A local checkout hides it whenever the ffmpeg-video-rs sibling is parked
+# on a branch cut before the change.
+#
+# Scope is deliberately the DEFAULT feature set. That is where the sibling-crate
+# API drift bites, and it is what every operator gets from `cargo build`. The
+# GPL / vendor-specific encoder features are left to nightly-release: they add
+# heavy apt deps for little extra API coverage. `sdi-decklink` cannot be built
+# here at all — libdecklink-sys/build.rs hard-requires the Blackmagic SDK
+# headers (DECKLINK_SDK_DIR), which are EULA-gated and deliberately not
+# vendored, so there is no header-free compile path (unlike mxl, which vendors
+# its headers under Apache-2.0 and so can use `mxl-not-built`). The ~2.2k lines
+# behind that feature are therefore NOT covered by CI — see docs/sdi.md.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: cargo check (default features)
+    runs-on: ubuntu-24.04
+    steps:
+      # bilbycast-edge/Cargo.toml path-depends on seven sibling repos. cargo
+      # reads every path dependency's manifest when building the dependency
+      # graph — including `optional = true` ones whose feature is off — so all
+      # of them must exist even for a default-feature check. Peer directories
+      # of the workspace root, so the relative `..` references resolve.
+      - name: Checkout bilbycast-libsrt-rs (path dependency)
+        uses: actions/checkout@v7
+        with:
+          repository: Bilbycast/bilbycast-libsrt-rs
+          path: bilbycast-libsrt-rs
+          submodules: recursive
+
+      - name: Checkout bilbycast-fdk-aac-rs (path dependency)
+        uses: actions/checkout@v7
+        with:
+          repository: Bilbycast/bilbycast-fdk-aac-rs
+          path: bilbycast-fdk-aac-rs
+          submodules: recursive
+
+      - name: Checkout bilbycast-ffmpeg-video-rs (path dependency)
+        uses: actions/checkout@v7
+        with:
+          repository: Bilbycast/bilbycast-ffmpeg-video-rs
+          path: bilbycast-ffmpeg-video-rs
+          submodules: recursive
+
+      - name: Checkout bilbycast-rist (path dependency)
+        uses: actions/checkout@v7
+        with:
+          repository: Bilbycast/bilbycast-rist
+          path: bilbycast-rist
+          submodules: recursive
+
+      - name: Checkout bilbycast-bonding (path dependency)
+        uses: actions/checkout@v7
+        with:
+          repository: Bilbycast/bilbycast-bonding
+          path: bilbycast-bonding
+
+      - name: Checkout bilbycast-mxl-rs (path dependency)
+        uses: actions/checkout@v7
+        with:
+          repository: Bilbycast/bilbycast-mxl-rs
+          path: bilbycast-mxl-rs
+          submodules: recursive
+
+      - name: Checkout bilbycast-decklink-rs (path dependency)
+        uses: actions/checkout@v7
+        with:
+          repository: Bilbycast/bilbycast-decklink-rs
+          path: bilbycast-decklink-rs
+
+      - name: Checkout bilbycast-edge
+        uses: actions/checkout@v7
+        with:
+          path: bilbycast-edge
+
+      - name: Install build dependencies
+        run: |
+          # Same default-feature set as a plain `cargo build`: libsrt (cmake,
+          # clang, openssl), vendored FFmpeg via media-codecs (nasm), and the
+          # `display` output's alsa-sys link (libasound2-dev).
+          sudo apt-get update
+          sudo apt-get install -y cmake make clang libclang-dev pkg-config \
+            libssl-dev g++ libasound2-dev nasm
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      # The vendored FFmpeg build dominates a cold run. Keyed on Cargo.lock with
+      # a prefix restore-key so an unrelated dep bump still reuses the C build.
+      - name: Cache cargo registry and build
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            bilbycast-edge/target
+          key: ci-check-cargo-edge-${{ hashFiles('bilbycast-edge/Cargo.lock') }}
+          restore-keys: |
+            ci-check-cargo-edge-
+
+      - name: cargo check
+        working-directory: bilbycast-edge
+        run: cargo check --all-targets --locked
