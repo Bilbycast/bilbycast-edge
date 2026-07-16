@@ -57,18 +57,36 @@ jobs:
           path: bilbycast-fdk-aac-rs
           submodules: recursive
 
+      # Submodules are fetched in a separate retry step below, not by the
+      # checkout action: the vendored FFmpeg / opus submodules live on
+      # git.ffmpeg.org and gitlab.xiph.org, which return transient 502s often
+      # enough that the action's two immediate retries are not enough. Full
+      # history because git.ffmpeg.org will not serve the pinned commit to a
+      # shallow request ("Server does not allow request for unadvertised
+      # object").
       - name: Checkout bilbycast-ffmpeg-video-rs (path dependency)
         uses: actions/checkout@v7
         with:
           repository: Bilbycast/bilbycast-ffmpeg-video-rs
           path: bilbycast-ffmpeg-video-rs
-          submodules: recursive
-          # Full history: the vendored FFmpeg submodule is pinned to a commit
-          # that git.ffmpeg.org will not serve to a shallow request, so a
-          # depth-1 fetch fails with "Server does not allow request for
-          # unadvertised object". The release workflow fetches deep for the
-          # same reason.
           fetch-depth: 0
+
+      - name: Fetch bilbycast-ffmpeg-video-rs submodules (with retry)
+        working-directory: bilbycast-ffmpeg-video-rs
+        run: |
+          # Ride out a rough patch on the upstream git servers rather than
+          # failing the whole build on one 502.
+          for attempt in 1 2 3 4 5 6; do
+            if git submodule update --init --recursive --jobs 3; then
+              echo "submodules fetched on attempt ${attempt}"
+              exit 0
+            fi
+            echo "submodule fetch attempt ${attempt} failed; retrying in $((attempt * 15))s" >&2
+            sleep $((attempt * 15))
+          done
+          echo "submodule fetch failed after 6 attempts — upstream git servers " \
+               "(git.ffmpeg.org / gitlab.xiph.org) appear to be down." >&2
+          exit 1
 
       - name: Checkout bilbycast-rist (path dependency)
         uses: actions/checkout@v7
