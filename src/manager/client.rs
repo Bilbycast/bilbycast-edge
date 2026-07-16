@@ -1425,15 +1425,18 @@ fn edge_capabilities() -> Vec<&'static str> {
             // same capability strings as the transcode resolver.
         }
     }
-    // Native SDI capture via Blackmagic DeckLink. Advertised only when (a) the
-    // `sdi-decklink` Cargo feature is on, AND (b) the boot probe reached the
-    // SDK (Desktop Video installed). A card-less host with Desktop Video still
-    // advertises: the capability says "this edge can do SDI", and the
-    // per-port `sdi_devices` health field says which ports exist and which
-    // have signal. Manager UI gates the SDI input type on this.
+    // Native SDI capture + playout via Blackmagic DeckLink. Advertised only
+    // when the feature is compiled in, the boot probe reached the SDK (Desktop
+    // Video installed), and a card is present *now* — the device list comes
+    // from the status poller, so it tracks hot-plug in both directions rather
+    // than freezing whatever was true at boot. A host with no card therefore
+    // never offers SDI in the manager UI, and one that gains a card starts
+    // offering it within a poll interval without a restart.
     #[cfg(feature = "sdi-decklink")]
     {
-        if crate::engine::decklink::domain::probe_succeeded() {
+        if crate::engine::decklink::domain::probe_succeeded()
+            && !crate::engine::decklink::status::cached().is_empty()
+        {
             caps.push("sdi-decklink");
         }
     }
