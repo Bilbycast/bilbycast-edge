@@ -3448,6 +3448,15 @@ impl FlowStatsAccumulator {
                     .get(&input_id)
                     .map(|t| (t.current_alarm(), Some(t.snapshot())))
                     .unwrap_or((None, None));
+                // Per-input, not just the active one: an SDI input reports a
+                // pulled cable only through the card, and a passive leg with
+                // no signal is exactly what the operator needs to see before
+                // cutting to it. Absent entry = not an SDI input, which stays
+                // `None` — never `false`.
+                let signal_present = self
+                    .sdi_capture_stats
+                    .get(&input_id)
+                    .map(|h| h.signal_present.load(Ordering::Relaxed));
                 PerInputLive {
                     input_id,
                     input_type: c.input_type.clone(),
@@ -3462,6 +3471,7 @@ impl FlowStatsAccumulator {
                     bind_addr: c.meta.bind_addr.clone(),
                     rtsp_url: c.meta.rtsp_url.clone(),
                     whep_url: c.meta.whep_url.clone(),
+                    signal_present,
                     psi_catalog,
                     psi_catalog_tick: if psi_tick == 0 { None } else { Some(psi_tick) },
                     thumbnail_alarm,

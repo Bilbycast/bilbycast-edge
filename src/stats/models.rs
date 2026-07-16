@@ -529,6 +529,17 @@ pub struct PerInputLive {
     pub rtsp_url: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub whep_url: Option<String>,
+    /// SDI card lock for this input: is the card seeing a signal right now?
+    /// Mirrors [`SdiInputStats::signal_present`] per-input, because an SDI
+    /// input keeps delivering frames (bars / black) with the cable out — so
+    /// `state` and `bitrate_bps` read healthy on a dead feed, and only this
+    /// says otherwise.
+    ///
+    /// **`None` means "not an SDI input, or the card did not say" — never
+    /// "no signal".** Only `Some(false)` is a definitive no-signal. Collapsing
+    /// the two would paint NO SIGNAL onto every non-SDI input.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signal_present: Option<bool>,
     /// Lightweight PAT/PMT catalogue observed on this input. `None` on
     /// non-TS inputs (RTMP / WebRTC / RTP-ES / ST 2110-30/-40) or when
     /// no PSI has arrived yet. Drives the manager UI's per-input "Programs
