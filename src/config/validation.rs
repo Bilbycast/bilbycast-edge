@@ -458,6 +458,9 @@ pub fn validate_config(config: &AppConfig) -> Result<()> {
     // Cross-component display-device uniqueness (KMS exclusivity).
     validate_display_uniqueness(config)?;
 
+    // Cross-component SDI sub-device uniqueness (DeckLink open exclusivity).
+    validate_sdi_uniqueness(config)?;
+
     Ok(())
 }
 
@@ -6051,10 +6054,42 @@ fn validate_mxl_frame_rate(num: u32, den: u32, ctx: &str) -> Result<()> {
     Ok(())
 }
 
+/// Shared `device` check for SDI inputs and outputs.
+///
+/// The DeckLink shim resolves `device` with an exact `strcmp` against the
+/// SDK display name, so no charset rule applies — real names carry spaces and
+/// parentheses (`"DeckLink Quad (1)"`). Only the bound is enforceable here:
+/// enumeration reads names through a 256-byte buffer, so a longer string
+/// cannot name any device that exists.
+fn validate_sdi_device(device: &str, ctx: &str) -> Result<()> {
+    if device.trim().is_empty() {
+        bail!("{ctx}: device must not be empty");
+    }
+    if device.len() > 256 {
+        bail!(
+            "{ctx}: device must be at most 256 chars (got {}) — it is the DeckLink \
+             SDK display name, e.g. \"DeckLink Quad (1)\"",
+            device.len()
+        );
+    }
+    Ok(())
+}
+
 fn validate_sdi_input(c: &crate::config::models::SdiInputConfig) -> Result<()> {
     let ctx = format!("SDI input device={:?}", c.device);
-    if c.device.trim().is_empty() {
-        bail!("{ctx}: device must not be empty");
+    validate_sdi_device(&c.device, &ctx)?;
+    // `"auto"` is the card's input-format detection, not a mode; anything else
+    // is a literal DeckLink mode FourCC ("Hi50", "Hp25"). A typo reaches the
+    // card as an unknown FourCC and comes back as a runtime open failure, so
+    // check the shape here — mid-show is a worse place to learn.
+    if !c.format.eq_ignore_ascii_case("auto")
+        && (c.format.len() != 4 || !c.format.bytes().all(|b| b.is_ascii_graphic() || b == b' '))
+    {
+        bail!(
+            "{ctx}: format must be \"auto\" or a 4-character DeckLink mode FourCC \
+             (e.g. \"Hi50\") (got {:?})",
+            c.format
+        );
     }
     if !matches!(c.audio_channels, 0 | 2 | 8 | 16) {
         bail!("{ctx}: audio_channels must be 0, 2, 8, or 16 (got {})", c.audio_channels);
@@ -6106,15 +6141,14 @@ fn validate_sdi_output(c: &crate::config::models::SdiOutputConfig) -> Result<()>
     let ctx = format!("SDI output '{}'", c.id);
     validate_id(&c.id, "SDI output")?;
     validate_name(&c.name, "SDI output")?;
-    if c.device.trim().is_empty() {
-        bail!("{ctx}: device must not be empty");
-    }
+    validate_sdi_device(&c.device, &ctx)?;
     // DeckLink modes are literal FourCCs ("Hi50", "Hp25"): exactly 4 ASCII
     // printable chars. Rejecting "auto" with a specific message beats the
     // generic length error an operator would otherwise puzzle over.
     if c.mode.eq_ignore_ascii_case("auto") {
         bail!(
-            "{ctx}: mode must be an explicit DeckLink mode FourCC (e.g. \"Hi50\") —              playout cannot auto-detect a format"
+            "{ctx}: mode must be an explicit DeckLink mode FourCC (e.g. \"Hi50\") — \
+             playout cannot auto-detect a format"
         );
     }
     if c.mode.len() != 4 || !c.mode.bytes().all(|b| b.is_ascii_graphic() || b == b' ') {
@@ -6125,7 +6159,8 @@ fn validate_sdi_output(c: &crate::config::models::SdiOutputConfig) -> Result<()>
     }
     if c.pixel_format != "uyvy422" {
         bail!(
-            "{ctx}: pixel_format must be uyvy422 (got {:?}) — 10-bit playout is              not implemented yet",
+            "{ctx}: pixel_format must be uyvy422 (got {:?}) — 10-bit playout is \
+             not implemented yet",
             c.pixel_format
         );
     }
@@ -6280,6 +6315,114 @@ pub(crate) fn validate_display_uniqueness(config: &AppConfig) -> Result<()> {
                 );
             }
         }
+    }
+    Ok(())
+}
+
+/// Which handle an SDI entity opens on a DeckLink sub-device.
+///
+/// A sub-device serves capture and playout independently, so direction is
+/// part of the claim identity, not a detail of it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum SdiDirection {
+    Input,
+    Output,
+}
+
+impl SdiDirection {
+    fn as_str(self) -> &'static str {
+        match self {
+            SdiDirection::Input => "input",
+            SdiDirection::Output => "output",
+        }
+    }
+}
+
+/// A second claim on a `(device, direction)` already claimed by `prev_id`.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct SdiDuplicateClaim<'a> {
+    pub device: &'a str,
+    pub direction: SdiDirection,
+    /// The entity that claimed it first.
+    pub prev_id: &'a str,
+    /// The entity claiming it again.
+    pub id: &'a str,
+}
+
+/// Every duplicate `(device, direction)` claim across SDI inputs + outputs.
+///
+/// Keyed on direction as well as device because a sub-device capturing on its
+/// own connector while playing out is verified working — the playout emerges
+/// on its pair partner's connector (`bilbycast-decklink-rs/CLAUDE.md`), so an
+/// input and an output naming one device are not in conflict.
+///
+/// `device` is compared verbatim. The shim's `find_device` resolves it with an
+/// exact `strcmp` against the SDK display name, so two spellings that differ at
+/// all are two different lookups — and a spelling matching no device opens
+/// nothing rather than contending with anything.
+fn sdi_duplicate_claims(config: &AppConfig) -> Vec<SdiDuplicateClaim<'_>> {
+    use std::collections::HashMap;
+    let mut claimed: HashMap<(&str, SdiDirection), &str> = HashMap::new();
+    let mut dupes = Vec::new();
+
+    for i in &config.inputs {
+        if let InputConfig::Sdi(s) = &i.config {
+            let key = (s.device.as_str(), SdiDirection::Input);
+            if let Some(prev_id) = claimed.insert(key, i.id.as_str()) {
+                dupes.push(SdiDuplicateClaim {
+                    device: key.0,
+                    direction: key.1,
+                    prev_id,
+                    id: i.id.as_str(),
+                });
+            }
+        }
+    }
+    for o in &config.outputs {
+        if let OutputConfig::Sdi(s) = o {
+            let key = (s.device.as_str(), SdiDirection::Output);
+            if let Some(prev_id) = claimed.insert(key, s.id.as_str()) {
+                dupes.push(SdiDuplicateClaim {
+                    device: key.0,
+                    direction: key.1,
+                    prev_id,
+                    id: s.id.as_str(),
+                });
+            }
+        }
+    }
+    dupes
+}
+
+/// Cross-component uniqueness for `sdi` inputs and outputs.
+///
+/// A DeckLink sub-device serves one capture handle and one playout handle at a
+/// time; `dl_open` against a device another handle already holds fails, and
+/// `sdi_io::open_capture` then retries on a 500 ms backoff forever. Two SDI
+/// inputs naming one device therefore cannot both run.
+///
+/// They are still a legal config, so this warns rather than rejects, mirroring
+/// [`validate_display_uniqueness`]: inputs and outputs are first-class entities
+/// that exist independently of any flow, and two flows mapped to one port with
+/// only one running at a time is a normal redundancy pattern. Note the inputs
+/// of a *single* flow all run at once (passive legs stay warm), so within one
+/// flow the duplicate does contend immediately.
+///
+/// Unlike display there is no claim registry — nothing arbitrates, the loser
+/// just retries — which is why the operator needs this at config load: at
+/// runtime the contention surfaces only as one `sdi_capture_open_failed`
+/// Warning that never names the entity holding the device.
+pub(crate) fn validate_sdi_uniqueness(config: &AppConfig) -> Result<()> {
+    for d in sdi_duplicate_claims(config) {
+        tracing::warn!(
+            "SDI {} '{}' claims device '{}' already claimed by '{}'; both will be \
+             allowed but only one can hold the device at a time (no arbitration: \
+             first to open wins, the other retries until the device is released)",
+            d.direction.as_str(),
+            d.id,
+            d.device,
+            d.prev_id,
+        );
     }
     Ok(())
 }
@@ -12288,5 +12431,178 @@ mod tests {
         assert!(e.contains("audio_offset_ms"), "+1001 ms rejected: {e}");
         let e = super::validate_sdi_output(&sdi_output(-1001)).unwrap_err().to_string();
         assert!(e.contains("audio_offset_ms"), "-1001 ms rejected: {e}");
+    }
+
+    /// `"auto"` is the whole point of the field — the card detects the source
+    /// raster, and a forced mode that mismatches gives bars + no signal. It
+    /// must survive any tightening of the shape check.
+    ///
+    /// The accept side asserts *agreement with `validate_video_encode`* rather
+    /// than `is_ok()`: whether the fixture's encoder backend is compiled in is
+    /// not this test's business, and a valid `format` must add no verdict of
+    /// its own either way.
+    #[test]
+    fn sdi_format_accepts_auto_and_fourcc_but_not_typos() {
+        for format in ["auto", "AUTO", "Hi50", "Hp25", "ntsc", "2k24"] {
+            let mut cfg = sdi_config("uyvy422", "x264", None, None);
+            cfg.format = format.into();
+            assert_eq!(
+                super::validate_sdi_input(&cfg).is_ok(),
+                super::validate_video_encode(&cfg.video_encode, "t").is_ok(),
+                "format {format:?} must add no restriction of its own",
+            );
+        }
+        // A mode is a literal FourCC, so anything that is not 4 chars cannot
+        // name one — catch it at load rather than at open. These must fail on
+        // `format` specifically, whatever the encoder validator would say.
+        for format in ["Hi5", "Hi500", "1080i50", "", "auto "] {
+            let mut cfg = sdi_config("uyvy422", "x264", None, None);
+            cfg.format = format.into();
+            let e = super::validate_sdi_input(&cfg).unwrap_err().to_string();
+            assert!(e.contains("format"), "format {format:?} rejected: {e}");
+        }
+    }
+
+    /// `device` is an SDK display name, not an ID: it carries spaces and
+    /// parens, so only its length is checkable. The bound is what enumeration
+    /// can return — a longer string names nothing that exists.
+    #[test]
+    fn sdi_device_length_is_capped_on_input_and_output() {
+        let long = "D".repeat(257);
+
+        let mut cfg = sdi_config("uyvy422", "x264", None, None);
+        cfg.device = long.clone();
+        let e = super::validate_sdi_input(&cfg).unwrap_err().to_string();
+        assert!(e.contains("device"), "257-char input device rejected: {e}");
+
+        let mut cfg = sdi_output(0);
+        cfg.device = long;
+        let e = super::validate_sdi_output(&cfg).unwrap_err().to_string();
+        assert!(e.contains("device"), "257-char output device rejected: {e}");
+
+        // The real names are far shorter than the cap; 256 stays legal — and
+        // the cap is the only thing this asserts, so defer the encoder verdict
+        // to the encoder validator.
+        let mut cfg = sdi_config("uyvy422", "x264", None, None);
+        cfg.device = "D".repeat(256);
+        assert_eq!(
+            super::validate_sdi_input(&cfg).is_ok(),
+            super::validate_video_encode(&cfg.video_encode, "t").is_ok(),
+            "256 chars is the cap, not past it",
+        );
+
+        let mut cfg = sdi_output(0);
+        cfg.device = "D".repeat(256);
+        assert!(super::validate_sdi_output(&cfg).is_ok(), "256 chars is the cap, not past it");
+    }
+
+    // ── SDI device uniqueness ─────────────────────────────────────────────
+
+    fn sdi_uniqueness_config(
+        input_devices: &[(&str, &str)],
+        output_devices: &[(&str, &str)],
+    ) -> AppConfig {
+        let mut config = AppConfig::default();
+        for (id, device) in input_devices {
+            let mut sdi = sdi_config("uyvy422", "x264", None, None);
+            sdi.device = (*device).into();
+            config.inputs.push(InputDefinition {
+                active: true,
+                group: None,
+                id: (*id).to_string(),
+                name: (*id).to_string(),
+                config: InputConfig::Sdi(sdi),
+            });
+        }
+        for (id, device) in output_devices {
+            let mut out = sdi_output(0);
+            out.id = (*id).to_string();
+            out.device = (*device).into();
+            config.outputs.push(OutputConfig::Sdi(out));
+        }
+        config
+    }
+
+    /// Two entities on one sub-device in the same direction cannot both hold
+    /// it — the loser retries forever with nothing naming the holder.
+    #[test]
+    fn sdi_duplicate_device_is_reported_per_direction() {
+        let config = sdi_uniqueness_config(
+            &[("in-a", "DeckLink Quad (1)"), ("in-b", "DeckLink Quad (1)")],
+            &[],
+        );
+        let dupes = super::sdi_duplicate_claims(&config);
+        assert_eq!(dupes.len(), 1, "one duplicate input claim: {dupes:?}");
+        assert_eq!(dupes[0].device, "DeckLink Quad (1)");
+        assert_eq!(dupes[0].direction, super::SdiDirection::Input);
+        assert_eq!(dupes[0].prev_id, "in-a");
+        assert_eq!(dupes[0].id, "in-b");
+
+        // Same story on the playout handle.
+        let config = sdi_uniqueness_config(
+            &[],
+            &[("out-a", "DeckLink Quad (2)"), ("out-b", "DeckLink Quad (2)")],
+        );
+        let dupes = super::sdi_duplicate_claims(&config);
+        assert_eq!(dupes.len(), 1, "one duplicate output claim: {dupes:?}");
+        assert_eq!(dupes[0].direction, super::SdiDirection::Output);
+    }
+
+    #[test]
+    fn sdi_distinct_devices_do_not_collide() {
+        let config = sdi_uniqueness_config(
+            &[("in-a", "DeckLink Quad (1)"), ("in-b", "DeckLink Quad (2)")],
+            &[("out-a", "DeckLink Quad (3)"), ("out-b", "DeckLink Quad (4)")],
+        );
+        assert!(
+            super::sdi_duplicate_claims(&config).is_empty(),
+            "four distinct sub-devices do not contend"
+        );
+    }
+
+    /// An input and an output on one sub-device is verified working — the
+    /// playout emerges on the pair partner's connector while the device's own
+    /// connector carries the input. Flagging it would break a legal config.
+    #[test]
+    fn sdi_input_and_output_may_share_a_sub_device() {
+        let config = sdi_uniqueness_config(
+            &[("in-a", "DeckLink Quad (1)")],
+            &[("out-a", "DeckLink Quad (1)")],
+        );
+        assert!(
+            super::sdi_duplicate_claims(&config).is_empty(),
+            "capture + playout on one sub-device is not a conflict"
+        );
+    }
+
+    /// `device` is resolved by the shim with an exact `strcmp` against the SDK
+    /// display name — there is no index form and no alias table. So `"1"` is
+    /// not another spelling of `"DeckLink Quad (1)"`; it is a name that matches
+    /// no device and opens nothing. Treating the two as one device would
+    /// invent a contention that cannot happen and mask the real fault.
+    #[test]
+    fn sdi_device_identity_is_the_exact_sdk_name() {
+        let config = sdi_uniqueness_config(
+            &[("in-a", "DeckLink Quad (1)"), ("in-b", "1")],
+            &[],
+        );
+        assert!(
+            super::sdi_duplicate_claims(&config).is_empty(),
+            "'1' and 'DeckLink Quad (1)' are different lookups, not one device"
+        );
+
+        // Case and whitespace are just as literal to strcmp.
+        let config = sdi_uniqueness_config(
+            &[
+                ("in-a", "DeckLink Quad (1)"),
+                ("in-b", "decklink quad (1)"),
+                ("in-c", "DeckLink Quad (1) "),
+            ],
+            &[],
+        );
+        assert!(
+            super::sdi_duplicate_claims(&config).is_empty(),
+            "only a byte-identical name is the same device"
+        );
     }
 }

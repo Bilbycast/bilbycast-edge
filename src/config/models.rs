@@ -3046,10 +3046,9 @@ pub enum OutputConfig {
     #[serde(rename = "display")]
     Display(DisplayOutputConfig),
     /// Native SDI playout via Blackmagic DeckLink: decode the flow's video
-    /// and schedule it against the card's clock. Video-only today; audio
-    /// joins once the video path has soaked. Gated by the `sdi-decklink`
-    /// Cargo feature; the schema is always present so configs round-trip
-    /// cleanly across builds. See `docs/sdi.md`.
+    /// and audio and schedule both against the card's clock. Gated by the
+    /// `sdi-decklink` Cargo feature; the schema is always present so configs
+    /// round-trip cleanly across builds. See `docs/sdi.md`.
     #[serde(rename = "sdi")]
     Sdi(SdiOutputConfig),
     /// Produce a MXL **video** flow — decode the flow's H.264/HEVC TS,
@@ -6696,18 +6695,11 @@ fn default_sdi_audio_channels() -> u8 {
     2
 }
 
-/// SDI capture input via a Blackmagic DeckLink card (the `sdi` input type,
-/// gated by the `sdi-decklink` Cargo feature). One device handle delivers
-/// packed 4:2:2 video **and** embedded PCM audio; the input task encodes the
-/// video via `video_encode`, optionally re-encodes the audio via
-/// `audio_encode`, and muxes both into a single A+V MPEG-TS on the flow's
-/// broadcast channel. Self-clocked — no PTP requirement (unlike MXL).
-///
-/// `device` is the DeckLink SDK display name, e.g. `"DeckLink Quad (1)"`, as
-/// listed by the boot probe and on `HealthPayload.sdi_devices[]`.
 /// Native SDI playout output via Blackmagic DeckLink (`sdi-decklink`
 /// feature). Decodes the flow's video elementary stream and schedules the
-/// frames against the DeckLink card's clock. Video-only today.
+/// frames against the DeckLink card's clock; with `audio_channels > 0` the
+/// flow's audio is decoded alongside and scheduled on the same clock, so the
+/// card lip-syncs in hardware.
 ///
 /// `device` is the SDK display name (as listed on
 /// `HealthPayload.sdi_devices[]`). `mode` is REQUIRED and explicit — playout
@@ -6766,6 +6758,15 @@ pub struct SdiOutputConfig {
     pub audio_offset_ms: i32,
 }
 
+/// SDI capture input via a Blackmagic DeckLink card (the `sdi` input type,
+/// gated by the `sdi-decklink` Cargo feature). One device handle delivers
+/// packed 4:2:2 video **and** embedded PCM audio; the input task encodes the
+/// video via `video_encode`, optionally re-encodes the audio via
+/// `audio_encode`, and muxes both into a single A+V MPEG-TS on the flow's
+/// broadcast channel. Self-clocked — no PTP requirement (unlike MXL).
+///
+/// `device` is the DeckLink SDK display name, e.g. `"DeckLink Quad (1)"`, as
+/// listed by the boot probe and on `HealthPayload.sdi_devices[]`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SdiInputConfig {
     /// DeckLink device display name, e.g. `"DeckLink Quad (1)"`.

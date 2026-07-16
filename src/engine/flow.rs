@@ -2507,7 +2507,9 @@ impl FlowRuntime {
                 {
                     let _ = (broadcast_tx, output_stats, output_cancel, event_sender, flow_id);
                     anyhow::bail!(
-                        "SDI output '{}' not supported: this build was compiled without                          the 'sdi-decklink' Cargo feature (error_code: sdi_playout_unavailable)",
+                        "SDI output '{}' not supported: this build was compiled without \
+                         the 'sdi-decklink' Cargo feature \
+                         (error_code: sdi_playout_unavailable)",
                         c.id
                     )
                 }
