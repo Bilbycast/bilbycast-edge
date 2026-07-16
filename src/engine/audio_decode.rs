@@ -210,32 +210,69 @@ pub fn sr_index_from_hz(hz: u32) -> Option<u8> {
 /// outputs).
 pub fn input_can_carry_ts_audio(input: &crate::config::models::InputConfig) -> bool {
     use crate::config::models::InputConfig;
-    matches!(
-        input,
+    // Exhaustive on purpose — no wildcard. The bridge this gates is
+    // opt-in per input type, and a new TS-carrying variant that silently
+    // defaults to "no bridge" forwards raw 188-byte TS packets onto a PCM
+    // bus. Adding a variant must be a compile error, not a silent regression.
+    match input {
         // Contribution / distribution transports that carry MPEG-TS
         // verbatim on the wire.
         InputConfig::Rtp(_)
-            | InputConfig::Udp(_)
-            | InputConfig::Srt(_)
-            | InputConfig::Rtmp(_)
-            | InputConfig::Rtsp(_)
-            // Synthetic / file-backed sources that publish fresh
-            // MPEG-TS onto the broadcast channel. test_pattern always
-            // includes AAC when `audio_enabled = true` (default);
-            // media_player's source file may carry AAC / MP2 / AC-3 /
-            // E-AC-3; replay reads back recorded TS verbatim. All
-            // three feed the `compressed_audio_input` path in
-            // `engine::st2110_io::run_st2110_audio_output` so a PCM-
-            // only audio output (ST 2110-30/-31/rtp_audio) attached
-            // to the same flow gets the de-embedded audio decoded to
-            // PCM. Previously these were absent from the predicate
-            // so ST 2110-30 outputs on test_pattern / media_player /
-            // replay sources only emitted the 250 ms NULL-PID
-            // heartbeat — surfaced as ~107 pps on cellPTP11.
-            | InputConfig::TestPattern(_)
-            | InputConfig::MediaPlayer(_)
-            | InputConfig::Replay(_)
-    )
+        | InputConfig::Udp(_)
+        | InputConfig::Srt(_)
+        | InputConfig::Rist(_)
+        | InputConfig::Rtmp(_)
+        | InputConfig::Rtsp(_)
+        // Bonded carries whatever the sender bonded; the broadcast case
+        // is MPEG-TS, which is why the runtime already treats it as a TS
+        // carrier (`InputConfig::is_ts_carrier`).
+        | InputConfig::Bonded(_)
+        // Synthetic / file-backed sources that publish fresh
+        // MPEG-TS onto the broadcast channel. test_pattern always
+        // includes AAC when `audio_enabled = true` (default);
+        // media_player's source file may carry AAC / MP2 / AC-3 /
+        // E-AC-3; replay reads back recorded TS verbatim. All
+        // three feed the `compressed_audio_input` path in
+        // `engine::st2110_io::run_st2110_audio_output` so a PCM-
+        // only audio output (ST 2110-30/-31/rtp_audio) attached
+        // to the same flow gets the de-embedded audio decoded to
+        // PCM. Previously these were absent from the predicate
+        // so ST 2110-30 outputs on test_pattern / media_player /
+        // replay sources only emitted the 250 ms NULL-PID
+        // heartbeat — surfaced as ~107 pps on cellPTP11.
+        | InputConfig::TestPattern(_)
+        | InputConfig::MediaPlayer(_)
+        | InputConfig::Replay(_)
+        // SDI muxes captured embedded audio into the TS audio PID as AAC
+        // in ADTS (stream_type 0x0F), and audio capture is on by default.
+        | InputConfig::Sdi(_) => true,
+        // WebRTC audio is always Opus, carried as stream_type 0x06 + an
+        // "Opus" registration descriptor — never AAC. The bridge decodes
+        // AAC only and drops every other elementary stream, so claiming
+        // the bridge here would swap the raw-TS forward for silence
+        // without ever producing correct PCM.
+        InputConfig::Webrtc(_) | InputConfig::Whep(_) => false,
+        // Video-only TS: these synthesise an encoded video ES and carry
+        // no audio PID at all (`video_encode` is mandatory, and there is
+        // no `audio_encode` on their config). ST 2110 keeps audio on a
+        // separate -30 essence stream.
+        InputConfig::St2110_20(_)
+        | InputConfig::St2110_23(_)
+        | InputConfig::MxlVideo(_) => false,
+        // PCM / AES3 essence. These become TS carriers only with
+        // `audio_encode` set, and the only shape where this flag is read
+        // is a PCM output on the same flow — i.e. a same-node
+        // PCM → encode → PCM round-trip. Left off until that config is
+        // shown to be real: `audio_encode = s302m` (the only codec -31
+        // accepts) isn't AAC, so the bridge would emit silence rather
+        // than the passthrough these paths deliver today.
+        InputConfig::St2110_30(_)
+        | InputConfig::St2110_31(_)
+        | InputConfig::RtpAudio(_)
+        | InputConfig::MxlAudio(_) => false,
+        // RFC 8331 ancillary data — never MPEG-TS.
+        InputConfig::St2110_40(_) | InputConfig::MxlAnc(_) => false,
+    }
 }
 
 // ── Non-AAC PES helpers (MP2 / AC-3 / E-AC-3) ───────────────────────────────
@@ -1558,5 +1595,56 @@ mod tests {
         assert_eq!(stats.output_blocks.load(Ordering::Relaxed), 1);
         assert_eq!(stats.decode_errors.load(Ordering::Relaxed), 1);
         assert_eq!(stats.dropped_uninit.load(Ordering::Relaxed), 1);
+    }
+
+    // ── input_can_carry_ts_audio ────────────────────────────────────────
+
+    fn input_cfg(json: serde_json::Value) -> crate::config::models::InputConfig {
+        serde_json::from_value(json).expect("input config should deserialize")
+    }
+
+    /// Pins the full decision table. `input_can_carry_ts_audio` gates the
+    /// TS→AAC→PCM bridge; a variant that wrongly reports `false` forwards
+    /// raw 188-byte TS packets onto the ST 2110-30 PCM bus.
+    #[test]
+    fn ts_audio_predicate_decision_table() {
+        let sdi = serde_json::json!({
+            "type": "sdi",
+            "device": "DeckLink Quad (1)",
+            "video_encode": { "codec": "x264" },
+        });
+        // SDI muxes embedded audio as AAC/ADTS and audio is on by default.
+        assert!(input_can_carry_ts_audio(&input_cfg(sdi)));
+
+        // Carries MPEG-TS verbatim — identical in kind to srt / udp / rtp.
+        assert!(input_can_carry_ts_audio(&input_cfg(serde_json::json!({
+            "type": "rist",
+            "bind_addr": "0.0.0.0:5004",
+        }))));
+
+        // WebRTC audio is always Opus; the bridge is AAC-only.
+        assert!(!input_can_carry_ts_audio(&input_cfg(serde_json::json!({
+            "type": "webrtc",
+            "bind_addr": "0.0.0.0:8080",
+        }))));
+
+        // Video-only TS — no audio PID to de-embed.
+        assert!(!input_can_carry_ts_audio(&input_cfg(serde_json::json!({
+            "type": "st2110_20",
+            "bind_addr": "239.0.0.1:20000",
+            "width": 1920,
+            "height": 1080,
+            "frame_rate_num": 25,
+            "frame_rate_den": 1,
+            "pixel_format": "yuv422_10bit",
+            "pid_overrides": null,
+            "video_encode": { "codec": "x264" },
+        }))));
+
+        // RFC 8331 ancillary data is never MPEG-TS.
+        assert!(!input_can_carry_ts_audio(&input_cfg(serde_json::json!({
+            "type": "st2110_40",
+            "bind_addr": "239.0.0.1:20000",
+        }))));
     }
 }

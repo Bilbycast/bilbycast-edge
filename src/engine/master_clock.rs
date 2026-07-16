@@ -1385,9 +1385,16 @@ pub fn clock_identity_for_input(
         InputConfig::MxlVideo(c) => ClockIdentity::Ptp { domain: c.clock_domain.unwrap_or(0) },
         InputConfig::MxlAudio(c) => ClockIdentity::Ptp { domain: c.clock_domain.unwrap_or(0) },
         InputConfig::MxlAnc(c)   => ClockIdentity::Ptp { domain: c.clock_domain.unwrap_or(0) },
+        // SDI is externally clocked — the capture task steps PTS once per
+        // frame the card delivers, so the cadence comes from the incoming
+        // signal, not the host. Two cards that aren't genlocked to a common
+        // reference drift against each other like two independent encoders,
+        // so each SDI input owns its identity.
+        InputConfig::Sdi(_) => ClockIdentity::SourcePcr {
+            input_id: input.id.clone(),
+        },
         // Wallclock-only inputs share the host clock.
         InputConfig::Webrtc(_) | InputConfig::Whep(_) => ClockIdentity::Wallclock,
-        InputConfig::Sdi(_) => ClockIdentity::Wallclock,
     }
 }
 
@@ -1953,5 +1960,49 @@ mod tests {
             "active-input switch must clear fallback (non-assembled behaviour)"
         );
         cancel.cancel();
+    }
+
+    // ── ClockIdentity: SDI coherence ────────────────────────────────────
+
+    fn sdi_input(id: &str) -> crate::config::models::InputDefinition {
+        serde_json::from_value(serde_json::json!({
+            "id": id,
+            "name": id,
+            "type": "sdi",
+            "device": "DeckLink Quad (1)",
+            "video_encode": { "codec": "x264" },
+        }))
+        .expect("sdi input definition should deserialize")
+    }
+
+    #[test]
+    fn two_sdi_inputs_are_not_co_clocked() {
+        // Each card recovers cadence from its own incoming signal. Absent
+        // a genlock reference they drift like two independent encoders, so
+        // the PID-bus guard must refuse to combine them in one program.
+        let a = clock_identity_for_input(&sdi_input("in-sdi-a"));
+        let b = clock_identity_for_input(&sdi_input("in-sdi-b"));
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn sdi_input_is_co_clocked_with_itself() {
+        // Video + audio slots pulled from one card share a clock — the
+        // single-SDI-input assembly must still resolve.
+        let a = clock_identity_for_input(&sdi_input("in-sdi-a"));
+        let same = clock_identity_for_input(&sdi_input("in-sdi-a"));
+        assert_eq!(a, same);
+        assert_eq!(
+            a,
+            ClockIdentity::SourcePcr { input_id: "in-sdi-a".to_string() }
+        );
+    }
+
+    #[test]
+    fn sdi_is_not_co_clocked_with_wallclock_inputs() {
+        // SDI is externally clocked; a host-paced input is not a valid
+        // clock reference for it.
+        let a = clock_identity_for_input(&sdi_input("in-sdi-a"));
+        assert_ne!(a, ClockIdentity::Wallclock);
     }
 }
