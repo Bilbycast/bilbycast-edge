@@ -18,13 +18,19 @@
 //! jitter and overflow drops at the feeder — the broadcast channel is never
 //! blocked.
 //!
-//! **A/V sync**: the first displayed video frame's PTS is schedule-time 0.
-//! Audio for source-PTS `p` is scheduled (timestamped) at `p - anchor` on the
-//! shared 90 kHz playout clock, so the card lip-syncs it to video. `audio_pos`
-//! then advances by exact sample duration (drift-free), re-anchoring only on a
-//! source discontinuity. Audio is fixed at 48 kHz (the card's rate); other
-//! rates drop with an alarm (resampling is a follow-up). Opus and AC-4 are not
-//! handled here — those flows play out video-only.
+//! **A/V sync**: both essences ride one 90 kHz playout clock. The first
+//! displayed video frame's PTS is schedule-time 0; everything is scheduled
+//! (timestamped) at `pts - anchor`, so the card lip-syncs the two. Video is
+//! placed from its own PTS — snapped to the mode's frame grid — and never from
+//! a count of writes that succeeded: a frame this worker drops leaves a hole
+//! the card fills by repeating the previous picture, and every frame after it
+//! still lands where its timestamp says. `audio_pos` advances between blocks
+//! by exact sample duration (drift-free), re-anchoring to the PTS-derived time
+//! only on a source discontinuity. Source PTS are 33-bit and wrap every
+//! ~26.5 h, so `PtsTimeline` lifts both essences onto one continuous
+//! timeline before any of this arithmetic runs. Audio is fixed at 48 kHz (the
+//! card's rate); other rates drop with an alarm (resampling is a follow-up).
+//! Opus and AC-4 are not handled here — those flows play out video-only.
 //!
 //! No scaling — the configured `mode`'s raster must match the decoded video,
 //! and other sizes drop with a throttled alarm so a source switch can never
@@ -67,6 +73,28 @@ const SDI_AUDIO_RATE: u32 = 48_000;
 #[cfg(feature = "media-codecs")]
 const AUDIO_RESYNC_THRESHOLD_90K: i64 = 45_000; // 0.5 s
 
+/// Source PTS are 33-bit (MPEG-2 systems), so they wrap every
+/// `2^33 / 90_000` ≈ 26.5 h.
+#[cfg(feature = "media-codecs")]
+const PTS_WRAP_90K: i64 = 1 << 33;
+
+/// Consecutive video frames that must fail the frame-grid advance test before
+/// the source epoch is re-mapped. One is never enough: the demuxer surfaces a
+/// PES carrying no PTS as `0`, and re-anchoring on a single one of those would
+/// throw the timeline forward by the whole elapsed runtime and freeze playout
+/// until the card's clock caught up. A source running faster than the mode
+/// also lands two frames in one slot, and that must drop the extra frame, not
+/// re-map anything — a successful write resets the streak, so an alternating
+/// pass/fail pattern never reaches this.
+#[cfg(feature = "media-codecs")]
+const REANCHOR_STREAK: u32 = 3;
+
+/// Consecutive `Busy` writes before the card is called out as not draining.
+/// `Busy` is legitimately transient (a decode burst, a scheduling hiccup);
+/// only an unbroken run of them means the card has stopped presenting.
+#[cfg(feature = "media-codecs")]
+const BUSY_ALARM_STREAK: u32 = 25;
+
 /// Backoff between playout re-open attempts after the device vanishes.
 #[cfg(feature = "media-codecs")]
 const SDI_PLAYOUT_REOPEN_BACKOFF: Duration = Duration::from_millis(500);
@@ -82,7 +110,8 @@ struct VideoAu {
     annexb: Vec<u8>,
     codec: VideoCodec,
     is_keyframe: bool,
-    /// Source PTS (90 kHz). The first keyframe's PTS anchors the A/V timeline.
+    /// Source PTS (90 kHz) exactly as the demuxer read it — 33-bit, wrapping,
+    /// and in decode order. [`PtsTimeline`] lifts it onto the playout timeline.
     pts: u64,
 }
 
@@ -90,9 +119,92 @@ struct VideoAu {
 /// so no codec work touches the async reactor.
 #[cfg(feature = "media-codecs")]
 struct AudioAu {
-    /// Source PTS (90 kHz).
+    /// Source PTS (90 kHz), same 33-bit raw form as [`VideoAu::pts`].
     pts: u64,
     payload: AudioPayload,
+}
+
+/// The playout mode's frame grid. The card displays on it, and the SDK demands
+/// strictly ascending display times, so a decoded frame's card time is snapped
+/// to its nearest slot before it is scheduled.
+#[cfg(feature = "media-codecs")]
+struct FrameGrid {
+    /// Mode frame rate as `num / den` frames per second.
+    num: i128,
+    den: i128,
+}
+
+#[cfg(feature = "media-codecs")]
+impl FrameGrid {
+    fn new(fr_num: u32, fr_den: u32) -> Self {
+        // A mode the card declines to describe would divide by zero here.
+        // 25p only mis-snaps frames on a device that cannot play anyway.
+        let (num, den) = if fr_num == 0 || fr_den == 0 {
+            (25, 1)
+        } else {
+            (fr_num, fr_den)
+        };
+        Self {
+            num: num as i128,
+            den: den as i128,
+        }
+    }
+
+    /// Nearest slot index for a card time.
+    fn slot_of(&self, t_90k: i64) -> i64 {
+        div_round(t_90k as i128 * self.num, 90_000 * self.den) as i64
+    }
+
+    /// Card time of a slot, from exact rational arithmetic — never
+    /// `slot * frame_duration`, because the card's frame duration is a whole
+    /// number of ticks and 59.94 needs 1501.5: half a tick lost per frame
+    /// walks video 1.2 s away from audio over an hour on the shared timeline.
+    fn time_of(&self, slot: i64) -> i64 {
+        div_round(slot as i128 * 90_000 * self.den, self.num) as i64
+    }
+}
+
+/// `n / d` rounded to nearest, ties away from zero. `d` must be positive.
+#[cfg(feature = "media-codecs")]
+fn div_round(n: i128, d: i128) -> i128 {
+    if n >= 0 { (n + d / 2) / d } else { (n - d / 2) / d }
+}
+
+/// Lifts 33-bit source PTS onto the continuous timeline both essences share.
+///
+/// Each PTS is measured against the one before it — the only reference close
+/// enough for the modular reduction to carry a sign. A fixed anchor cannot
+/// serve: past half the modulus (~13 h) the distance to it is ambiguous, so at
+/// the 26.5 h wrap a stream anchored near 0 reads as having returned to the
+/// start rather than run a full lap, and everything placed against it is
+/// scheduled 26.5 h into the card's past.
+#[cfg(feature = "media-codecs")]
+#[derive(Default)]
+struct PtsTimeline {
+    last: Option<i64>,
+    epoch: i64,
+}
+
+#[cfg(feature = "media-codecs")]
+impl PtsTimeline {
+    /// Audio and video AUs interleave, and video AUs arrive in decode order,
+    /// so successive PTS step either way by a few frames; only a jump past
+    /// half the modulus reads as a wrap. A source that steps its PTS by more
+    /// than 13 h is genuinely indistinguishable from one that wrapped — the
+    /// worker's frame-grid guard is what catches that.
+    fn unwrap_pts(&mut self, pts: u64) -> i64 {
+        let pts = (pts & (PTS_WRAP_90K as u64 - 1)) as i64;
+        if let Some(last) = self.last {
+            let delta = pts - last;
+            if delta < -(PTS_WRAP_90K / 2) {
+                self.epoch += PTS_WRAP_90K;
+            } else if delta > PTS_WRAP_90K / 2 {
+                self.epoch -= PTS_WRAP_90K;
+            }
+        }
+        self.last = Some(pts);
+        self.epoch + pts
+    }
 }
 
 /// Coded audio + enough to construct/select its decoder in the worker.
@@ -137,14 +249,15 @@ pub fn spawn_sdi_output(
         #[cfg(not(feature = "media-codecs"))]
         {
             let _ = (rx, stats, cancel, flow_id);
-            event_sender.emit(
+            event_sender.emit_output_with_details(
                 EventSeverity::Critical,
-                category::FLOW,
+                category::SDI,
                 format!(
-                    "SDI output '{}' requires the media-codecs feature \
-                     (error_code: sdi_no_media_codecs)",
+                    "SDI output '{}' requires the media-codecs feature",
                     config.id
                 ),
+                &config.id,
+                serde_json::json!({ "error_code": "sdi_no_media_codecs" }),
             );
         }
     })
@@ -314,37 +427,60 @@ fn open_playout(
                 let (w, h) = po.video_dimensions();
                 let (n, d) = po.video_frame_rate();
                 info!(target: "sdi.out", "{ctx}: playout opened {w}x{h} @ {n}/{d}");
-                event_sender.emit(
+                event_sender.emit_output_with_details(
                     EventSeverity::Info,
-                    category::FLOW,
-                    format!(
-                        "{ctx}: playout opened {w}x{h} @ {n}/{d} \
-                         (error_code: sdi_playout_opened)"
-                    ),
+                    category::SDI,
+                    format!("{ctx}: playout opened {w}x{h} @ {n}/{d}"),
+                    &config.id,
+                    serde_json::json!({
+                        "error_code": "sdi_playout_opened",
+                        "device": config.device,
+                        "mode": config.mode,
+                        "width": w,
+                        "height": h,
+                        "frame_rate_num": n,
+                        "frame_rate_den": d,
+                    }),
                 );
                 return Some(po);
             }
             // A mode/device combination the card refuses is a config
             // problem — retrying forever would just spin.
             Err(e @ decklink_rs::Error::Unsupported(_)) => {
-                let msg = format!(
-                    "{ctx}: playout refused: {e} (error_code: sdi_playout_mode_unsupported)"
-                );
+                let msg = format!("{ctx}: playout refused: {e}");
                 tracing::error!(target: "sdi.out", "{msg}");
-                event_sender.emit(EventSeverity::Critical, category::FLOW, msg);
+                event_sender.emit_output_with_details(
+                    EventSeverity::Critical,
+                    category::SDI,
+                    msg,
+                    &config.id,
+                    serde_json::json!({
+                        "error_code": "sdi_playout_mode_unsupported",
+                        "device": config.device,
+                        "mode": config.mode,
+                        "error": e.to_string(),
+                    }),
+                );
                 return None;
             }
             Err(e) => {
                 if !announced {
                     announced = true;
                     warn!(target: "sdi.out", "{ctx}: playout open failed: {e}; retrying");
-                    event_sender.emit(
+                    event_sender.emit_output_with_details(
                         EventSeverity::Warning,
-                        category::FLOW,
+                        category::SDI,
                         format!(
                             "{ctx}: playout open failed: {e} — retrying until the \
-                             device returns (error_code: sdi_playout_open_failed)"
+                             device returns"
                         ),
+                        &config.id,
+                        serde_json::json!({
+                            "error_code": "sdi_playout_open_failed",
+                            "device": config.device,
+                            "mode": config.mode,
+                            "error": e.to_string(),
+                        }),
                     );
                 }
                 std::thread::sleep(SDI_PLAYOUT_REOPEN_BACKOFF);
@@ -371,9 +507,11 @@ fn playout_worker(
     let Some(mut playout) = open_playout(ctx, config, cancel, event_sender) else {
         return; // cancelled, or fatally unsupported (already alarmed)
     };
-    let (out_w, out_h) = playout.video_dimensions();
-    let row_bytes = playout.row_bytes();
+    let (mut out_w, mut out_h) = playout.video_dimensions();
+    let mut row_bytes = playout.row_bytes();
     let mut frame_buf = vec![0u8; row_bytes * out_h as usize];
+    let (fr_num, fr_den) = playout.video_frame_rate();
+    let mut grid = FrameGrid::new(fr_num, fr_den);
 
     let mut decoder: Option<VideoDecoder> = None;
     let mut current_codec: Option<VideoCodec> = None;
@@ -389,17 +527,33 @@ fn playout_worker(
     let mut card_late_base: u64 = 0;
     let mut last_mismatch_warn: Option<Instant> = None;
     let mut last_decode_warn: Option<Instant> = None;
+    let mut last_busy_warn: Option<Instant> = None;
+    let mut last_reanchor_warn: Option<Instant> = None;
+
+    // ── shared playout timeline ──────────────────────────────────────────
+    // Both essences are placed against one anchor on one continuous source
+    // timeline, so anything that shifts the mapping shifts them together and
+    // lip-sync survives it.
+    let mut timeline = PtsTimeline::default();
+    // The source PTS that maps to card time 0 — the first frame actually
+    // written, because the shim starts scheduled playback at 0.
+    let mut anchor_pts: Option<i64> = None;
+    // Last frame-grid slot handed to the card. The SDK refuses a display time
+    // that does not advance, so this guards the write rather than discovering
+    // it from an error.
+    let mut last_slot: Option<i64> = None;
+    let mut backwards_streak: u32 = 0;
+    let mut busy_streak: u32 = 0;
 
     // ── audio state ──────────────────────────────────────────────────────
-    // The first video keyframe's PTS is schedule-time 0; audio for source-PTS
-    // `p` is placed at `p - anchor`. Audio arriving before the anchor (i.e.
-    // before the first displayed frame) has no video to pair with and is
-    // dropped. `audio_pos` then advances by exact sample duration (drift-free),
-    // re-anchoring to the PTS-derived time only on a discontinuity.
+    // Audio for source-PTS `p` is placed at `p - anchor`. Audio arriving before
+    // the anchor (i.e. before the first displayed frame) has no video to pair
+    // with and is dropped. `audio_pos` then advances by exact sample duration
+    // (drift-free), re-anchoring to the PTS-derived time only on a
+    // discontinuity.
     let audio_out_ch = config.audio_channels as usize; // 0 = video-only
     // Operator A/V trim on the 90 kHz card timeline (+ delays audio, - advances).
     let audio_offset_90k = config.audio_offset_ms as i64 * 90;
-    let mut anchor_pts: Option<u64> = None;
     let mut aac_dec: Option<AacDecoder> = None;
     let mut ff_dec: Option<(AudioDecoderCodec, FfAudioDecoder)> = None;
     let mut audio_pos: Option<i64> = None;
@@ -422,10 +576,12 @@ fn playout_worker(
                 // Input switch. Flush the video decoder and wait for a fresh
                 // keyframe so it doesn't reference the old stream. Reset the
                 // audio decoders (the new input may carry a different codec /
-                // AAC config) and let audio re-anchor. The card's schedule
-                // clock keeps running, so `anchor_pts` stays — output PTS is
-                // regenerated continuous across switches by the edge's
-                // clocking, so the shared timeline is unbroken.
+                // AAC config) and let audio re-anchor. `anchor_pts` stays: the
+                // new input's PTS are continuous with the old one whenever the
+                // edge's clocking regenerates them, and when they are not, the
+                // frame-grid guard re-maps the epoch onto the next free slot.
+                // Either way both essences keep reading the same anchor, so a
+                // switch cannot pull them apart.
                 if let Some(d) = decoder.as_mut() {
                     d.flush();
                 }
@@ -436,12 +592,18 @@ fn playout_worker(
                 continue;
             }
             PlayoutAu::Audio(a) => {
+                // Unwrap before the anchor test, so the timeline keeps tracking
+                // the source across a wrap even while audio has no video to
+                // pair with.
+                let src_pts = timeline.unwrap_pts(a.pts);
                 // Can't place audio until the video timeline is anchored.
                 let Some(anchor) = anchor_pts else { continue };
                 decode_and_schedule_audio(
                     ctx,
+                    &config.id,
                     &mut playout,
-                    a,
+                    a.payload,
+                    src_pts,
                     anchor,
                     audio_out_ch,
                     audio_offset_90k,
@@ -457,6 +619,10 @@ fn playout_worker(
                 continue;
             }
         };
+        // Every video AU advances the shared timeline, including the ones this
+        // worker will not decode — skipping one would let a wrap slip past
+        // unseen and strand every later PTS a full lap out.
+        let au_pts = timeline.unwrap_pts(au.pts);
 
         // (Re)open the decoder on first use and on codec change.
         if current_codec != Some(au.codec) {
@@ -469,13 +635,16 @@ fn playout_worker(
                 Err(e) => {
                     throttled(&mut last_decode_warn, || {
                         warn!(target: "sdi.out", "{ctx}: decoder open failed: {e}");
-                        event_sender.emit(
+                        event_sender.emit_output_with_details(
                             EventSeverity::Warning,
-                            category::FLOW,
-                            format!(
-                                "{ctx}: video decoder open failed: {e} \
-                                 (error_code: sdi_playout_decode_failed)"
-                            ),
+                            category::SDI,
+                            format!("{ctx}: video decoder open failed: {e}"),
+                            &config.id,
+                            serde_json::json!({
+                                "error_code": "sdi_playout_decode_failed",
+                                "codec": format!("{:?}", au.codec),
+                                "error": e.to_string(),
+                            }),
                         );
                     });
                     continue;
@@ -487,12 +656,13 @@ fn playout_worker(
                 continue;
             }
             seen_keyframe = true;
-            // First displayed frame → anchor the A/V timeline (set once).
-            anchor_pts.get_or_insert(au.pts);
         }
         let dec = decoder.as_mut().expect("decoder opened above");
 
-        if let Err(e) = dec.send_packet(&au.annexb) {
+        // The AU's PTS rides the packet so the decoder hands it back on the
+        // frame it belongs to: the reorder queue emits display order, which is
+        // the order the card displays in, and B-frames make the two differ.
+        if let Err(e) = dec.send_packet_with_pts(&au.annexb, au_pts) {
             throttled(&mut last_decode_warn, || {
                 warn!(target: "sdi.out", "{ctx}: decode error: {e}");
             });
@@ -508,14 +678,23 @@ fn playout_worker(
                         "{ctx}: decoded {w}x{h} does not match the {out_w}x{out_h} \
                          playout mode; dropping frames"
                     );
-                    event_sender.emit(
+                    event_sender.emit_output_with_details(
                         EventSeverity::Warning,
-                        category::FLOW,
+                        category::SDI,
                         format!(
                             "{ctx}: decoded video is {w}x{h} but the configured mode \
                              is {out_w}x{out_h} — frames dropped; fix `mode` or the \
-                             source (error_code: sdi_playout_raster_mismatch)"
+                             source"
                         ),
+                        &config.id,
+                        serde_json::json!({
+                            "error_code": "sdi_playout_raster_mismatch",
+                            "decoded_width": w,
+                            "decoded_height": h,
+                            "mode_width": out_w,
+                            "mode_height": out_h,
+                            "mode": config.mode,
+                        }),
                     );
                 });
                 continue;
@@ -557,14 +736,43 @@ fn playout_worker(
                          dropping frames — only 8-bit 4:2:0/4:2:2 playout is supported",
                         frame.pixel_format(),
                     );
-                    event_sender.emit(
+                    event_sender.emit_output_with_details(
                         EventSeverity::Warning,
-                        category::FLOW,
+                        category::SDI,
                         format!(
                             "{ctx}: decoded video chroma is unsupported for SDI playout \
-                             (only 8-bit 4:2:0/4:2:2) — frames dropped \
-                             (error_code: sdi_playout_chroma_unsupported)"
+                             (only 8-bit 4:2:0/4:2:2) — frames dropped"
                         ),
+                        &config.id,
+                        serde_json::json!({
+                            "error_code": "sdi_playout_chroma_unsupported",
+                            "pixel_format": frame.pixel_format(),
+                        }),
+                    );
+                });
+                continue;
+            }
+            // `pack_uyvy422` slices rows directly, so a plane shorter or more
+            // narrowly strided than its geometry implies would panic inside
+            // this blocking worker and take the flow down with it. A dropped
+            // frame is always preferable to a dead flow.
+            let cw = w as usize / 2;
+            let rows = h as usize;
+            if ys < w as usize
+                || us < cw
+                || vs < cw
+                || row_bytes < w as usize * 2
+                || y.len() < ys * rows.saturating_sub(1) + w as usize
+                || u.len() < us * chroma_rows.saturating_sub(1) + cw
+                || v.len() < vs * chroma_rows.saturating_sub(1) + cw
+            {
+                stats.packets_dropped.fetch_add(1, Ordering::Relaxed);
+                throttled(&mut last_decode_warn, || {
+                    warn!(
+                        target: "sdi.out",
+                        "{ctx}: skipping malformed {w}x{h} frame (strides y={ys} u={us} \
+                         v={vs}, lens y={} u={} v={}, card pitch {row_bytes})",
+                        y.len(), u.len(), v.len(),
                     );
                 });
                 continue;
@@ -584,8 +792,50 @@ fn playout_worker(
                 &mut frame_buf,
             );
 
-            match playout.write_video(&frame_buf) {
+            // Place the frame from its own PTS. FFmpeg carries the packet PTS
+            // through the reorder queue, so this is the frame's display-order
+            // source time.
+            let frame_pts = frame.pts().unwrap_or_else(|| {
+                // A decoder that doesn't propagate a PTS leaves nothing to
+                // place against: take the next free slot so a picture still
+                // reaches the card. Video then rides AU order and drifts
+                // against audio exactly as a write counter would — but a
+                // drifting picture beats none at all.
+                anchor_pts.unwrap_or(0) + grid.time_of(last_slot.map_or(0, |s| s + 1))
+            });
+            let anchor = *anchor_pts.get_or_insert(frame_pts);
+            let mut slot = grid.slot_of(frame_pts - anchor);
+            // The SDK requires ascending display times. A slot already used
+            // means either an extra frame for it (a source running faster than
+            // the mode — the grid is the truth, drop it) or a source that
+            // stepped its PTS backwards, which only a sustained run proves.
+            if let Some(last) = last_slot
+                && slot <= last
+            {
+                backwards_streak += 1;
+                if backwards_streak < REANCHOR_STREAK {
+                    stats.packets_dropped.fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
+                // Re-map the source epoch so this frame takes the next free
+                // slot. Audio reads the same anchor, so it follows the step
+                // and lip-sync survives it.
+                slot = last + 1;
+                anchor_pts = Some(frame_pts - grid.time_of(slot));
+                backwards_streak = 0;
+                throttled(&mut last_reanchor_warn, || {
+                    warn!(
+                        target: "sdi.out",
+                        "{ctx}: source PTS stepped backwards; re-anchored playout at slot {slot}"
+                    );
+                });
+            }
+
+            match playout.write_video(&frame_buf, grid.time_of(slot)) {
                 Ok(()) => {
+                    last_slot = Some(slot);
+                    backwards_streak = 0;
+                    busy_streak = 0;
                     stats.packets_sent.fetch_add(1, Ordering::Relaxed);
                     stats
                         .bytes_sent
@@ -615,9 +865,40 @@ fn playout_worker(
                 // but not draining). Not a device failure — skip the frame and
                 // re-check cancellation so a flow stop is honoured promptly
                 // rather than parking this blocking thread on a dead card.
+                // `last_slot` is deliberately not advanced: the frame was never
+                // scheduled, so its slot stays free and the shim's own guard
+                // stays in step with this one.
                 Err(decklink_rs::Error::Busy) => {
                     stats.packets_dropped.fetch_add(1, Ordering::Relaxed);
                     sdi.frames_dropped.fetch_add(1, Ordering::Relaxed);
+                    busy_streak += 1;
+                    // An unbroken run means the card has stopped presenting —
+                    // reference/genlock lost is the usual cause. Every frame is
+                    // being dropped at this point, so it cannot stay a counter.
+                    if busy_streak >= BUSY_ALARM_STREAK {
+                        throttled(&mut last_busy_warn, || {
+                            warn!(
+                                target: "sdi.out",
+                                "{ctx}: card not draining scheduled frames \
+                                 ({busy_streak} consecutive); dropping every frame"
+                            );
+                            event_sender.emit_output_with_details(
+                                EventSeverity::Warning,
+                                category::SDI,
+                                format!(
+                                    "{ctx}: the card has stopped draining scheduled \
+                                     frames ({busy_streak} consecutive) — every frame is \
+                                     being dropped; check the card's reference/genlock"
+                                ),
+                                &config.id,
+                                serde_json::json!({
+                                    "error_code": "sdi_playout_card_not_draining",
+                                    "device": config.device,
+                                    "consecutive_busy": busy_streak,
+                                }),
+                            );
+                        });
+                    }
                     if cancel.is_cancelled() {
                         return;
                     }
@@ -625,21 +906,44 @@ fn playout_worker(
                 Err(decklink_rs::Error::Eof) => return,
                 Err(e) => {
                     warn!(target: "sdi.out", "{ctx}: playout write failed: {e}; reopening");
-                    event_sender.emit(
+                    event_sender.emit_output_with_details(
                         EventSeverity::Warning,
-                        category::FLOW,
-                        format!(
-                            "{ctx}: playout write failed: {e} — reopening device \
-                             (error_code: sdi_playout_lost)"
-                        ),
+                        category::SDI,
+                        format!("{ctx}: playout write failed: {e} — reopening device"),
+                        &config.id,
+                        serde_json::json!({
+                            "error_code": "sdi_playout_lost",
+                            "device": config.device,
+                            "error": e.to_string(),
+                        }),
                     );
                     drop(playout);
                     match open_playout(ctx, config, cancel, event_sender) {
                         Some(po) => {
                             playout = po;
-                            // New session — the card's cumulative counters restart.
+                            // A fresh session re-resolves the mode, so the
+                            // raster, pitch and frame grid are re-read rather
+                            // than carried over.
+                            (out_w, out_h) = playout.video_dimensions();
+                            row_bytes = playout.row_bytes();
+                            frame_buf = vec![0u8; row_bytes * out_h as usize];
+                            let (n, d) = playout.video_frame_rate();
+                            grid = FrameGrid::new(n, d);
+                            // The card's cumulative counters restart, and so
+                            // does its schedule clock — the new session starts
+                            // playback at 0. Drop the anchor so the next frame
+                            // written re-establishes the epoch against it;
+                            // carrying the old one would schedule every essence
+                            // a whole session into the new clock's future.
+                            // Audio re-anchors off the same drop.
                             card_drops_base = 0;
                             card_late_base = 0;
+                            anchor_pts = None;
+                            last_slot = None;
+                            backwards_streak = 0;
+                            busy_streak = 0;
+                            audio_pos = None;
+                            audio_started = false;
                         }
                         None => return,
                     }
@@ -665,8 +969,9 @@ fn f32_to_i32(s: f32) -> i32 {
     (s.clamp(-1.0, 1.0) as f64 * 2_147_483_647.0) as i32
 }
 
-/// Decode one audio AU and schedule the resulting sample block(s) on the card,
-/// lip-synced to video via the shared 90 kHz timeline.
+/// Decode one audio AU's payload and schedule the resulting sample block(s) on
+/// the card, lip-synced to video via the shared 90 kHz timeline. `src_pts` is
+/// the AU's source PTS already lifted onto that timeline.
 ///
 /// AAC yields one block per AU; the FFmpeg codecs may yield several — each is
 /// scheduled contiguously by the advancing `audio_pos`.
@@ -674,9 +979,11 @@ fn f32_to_i32(s: f32) -> i32 {
 #[allow(clippy::too_many_arguments)]
 fn decode_and_schedule_audio(
     ctx: &str,
+    output_id: &str,
     playout: &mut DecklinkPlayout,
-    au: AudioAu,
-    anchor_pts: u64,
+    payload: AudioPayload,
+    src_pts: i64,
+    anchor_pts: i64,
     out_ch: usize,
     audio_offset_90k: i64,
     aac_dec: &mut Option<AacDecoder>,
@@ -688,8 +995,7 @@ fn decode_and_schedule_audio(
     last_warn: &mut Option<Instant>,
     event_sender: &EventSender,
 ) {
-    let pts = au.pts;
-    match au.payload {
+    match payload {
         AudioPayload::Aac { data, config } => {
             if aac_dec.is_none() {
                 match AacDecoder::from_adts_config(config.0, config.1, config.2) {
@@ -708,19 +1014,21 @@ fn decode_and_schedule_audio(
                         let (sr, ch) = (d.sample_rate(), d.channels() as usize);
                         schedule_audio_block(
                             ctx,
+                            output_id,
                             playout,
                             &planar,
                             sr,
                             ch,
                             out_ch,
                             audio_offset_90k,
-                            pts,
+                            src_pts,
                             anchor_pts,
                             audio_pos,
                             audio_started,
                             ibuf,
                             stats,
                             last_warn,
+                            event_sender,
                         );
                     }
                     Err(_) => throttled(last_warn, || {
@@ -740,31 +1048,32 @@ fn decode_and_schedule_audio(
                 return;
             };
             for frame_bytes in crate::engine::audio_decode::split_audio_codec_frames(&data, codec) {
-                if d.send_packet(frame_bytes, pts as i64).is_err() {
+                if d.send_packet(frame_bytes, src_pts).is_err() {
                     continue;
                 }
                 while let Ok(decoded) = d.receive_frame() {
                     schedule_audio_block(
                         ctx,
+                        output_id,
                         playout,
                         &decoded.planar,
                         decoded.sample_rate,
                         decoded.channels as usize,
                         out_ch,
                         audio_offset_90k,
-                        pts,
+                        src_pts,
                         anchor_pts,
                         audio_pos,
                         audio_started,
                         ibuf,
                         stats,
                         last_warn,
+                        event_sender,
                     );
                 }
             }
         }
     }
-    let _ = event_sender; // reserved for a future rate-unsupported alarm path
 }
 
 /// Place one decoded planar-f32 block on the card at its lip-synced schedule
@@ -774,19 +1083,21 @@ fn decode_and_schedule_audio(
 #[allow(clippy::too_many_arguments)]
 fn schedule_audio_block(
     ctx: &str,
+    output_id: &str,
     playout: &mut DecklinkPlayout,
     planar: &[Vec<f32>],
     sample_rate: u32,
     dec_ch: usize,
     out_ch: usize,
     audio_offset_90k: i64,
-    src_pts: u64,
-    anchor_pts: u64,
+    src_pts: i64,
+    anchor_pts: i64,
     audio_pos: &mut Option<i64>,
     audio_started: &mut bool,
     ibuf: &mut Vec<i32>,
     stats: &Arc<OutputStatsAccumulator>,
     last_warn: &mut Option<Instant>,
+    event_sender: &EventSender,
 ) {
     // The card runs at a fixed 48 kHz; other rates would need SRC (a follow-up).
     if sample_rate != SDI_AUDIO_RATE {
@@ -804,7 +1115,10 @@ fn schedule_audio_block(
         return;
     }
 
-    let target = src_pts as i64 - anchor_pts as i64;
+    // Both are already on the continuous timeline, so this subtraction needs no
+    // wrap correction of its own — `PtsTimeline` did it against a reference
+    // close enough to keep the sign.
+    let target = src_pts - anchor_pts;
     let pos = match *audio_pos {
         None => {
             if target < 0 {
@@ -820,7 +1134,33 @@ fn schedule_audio_block(
             }
         }
     };
+    // Audio placed before the epoch cannot be scheduled at all, so every block
+    // from here on is silently discarded until something re-anchors. That is a
+    // total loss of audio and must be audible on the event bus, not just in a
+    // counter nobody reads.
     if pos < 0 {
+        throttled(last_warn, || {
+            warn!(
+                target: "sdi.out",
+                "{ctx}: audio schedule position {pos} precedes the playout epoch; \
+                 audio stopped scheduling"
+            );
+            event_sender.emit_output_with_details(
+                EventSeverity::Warning,
+                category::SDI,
+                format!(
+                    "{ctx}: audio is being placed before the start of the playout \
+                     timeline — audio has stopped scheduling and the output is \
+                     silent; the source stepped its PTS behind the first video frame"
+                ),
+                output_id,
+                serde_json::json!({
+                    "error_code": "sdi_playout_audio_stalled",
+                    "position_90k": pos,
+                    "target_90k": target,
+                }),
+            );
+        });
         return;
     }
     // Apply the operator A/V trim to the scheduled card time only. `audio_pos`
@@ -920,7 +1260,122 @@ fn pack_uyvy422(
 
 #[cfg(all(test, feature = "media-codecs"))]
 mod tests {
-    use super::pack_uyvy422;
+    use super::{FrameGrid, PTS_WRAP_90K, PtsTimeline, pack_uyvy422};
+
+    #[test]
+    fn grid_snaps_to_the_nearest_slot() {
+        let g = FrameGrid::new(25_000, 1_000); // 25p → 3600 ticks/frame
+        assert_eq!(g.slot_of(0), 0);
+        assert_eq!(g.slot_of(3600), 1);
+        assert_eq!(g.slot_of(3599), 1, "just under lands on its own slot");
+        assert_eq!(g.slot_of(1799), 0, "under half a frame stays put");
+        assert_eq!(g.slot_of(1801), 1, "over half a frame rounds up");
+        assert_eq!(g.time_of(0), 0);
+        assert_eq!(g.time_of(10), 36_000);
+    }
+
+    /// 59.94 needs 1501.5 ticks/frame. Deriving slot times from a whole-tick
+    /// duration loses half a tick each frame and walks video away from audio;
+    /// the exact rational cannot.
+    #[test]
+    fn grid_does_not_accumulate_error_at_59_94() {
+        let g = FrameGrid::new(60_000, 1_001);
+        // One hour of frames: exact time is slot * 90000 * 1001 / 60000.
+        for slot in [1i64, 2, 3, 1000, 215_784] {
+            let exact = (slot as i128 * 90_000 * 1_001) as f64 / 60_000.0;
+            let got = g.time_of(slot) as f64;
+            assert!(
+                (got - exact).abs() <= 0.5,
+                "slot {slot}: {got} drifted from {exact}"
+            );
+        }
+        // A whole-tick duration would be 1.2 s out by the end of an hour.
+        let naive = 215_784i64 * 1501;
+        assert!(g.time_of(215_784) - naive > 100_000);
+    }
+
+    /// Slot times must strictly ascend — the SDK refuses anything else.
+    #[test]
+    fn grid_slot_times_strictly_ascend_at_59_94() {
+        let g = FrameGrid::new(60_000, 1_001);
+        let mut prev = g.time_of(0);
+        for slot in 1..2_000 {
+            let t = g.time_of(slot);
+            assert!(t > prev, "slot {slot}: {t} did not advance past {prev}");
+            prev = t;
+        }
+    }
+
+    #[test]
+    fn timeline_passes_through_without_a_wrap() {
+        let mut t = PtsTimeline::default();
+        assert_eq!(t.unwrap_pts(0), 0);
+        assert_eq!(t.unwrap_pts(3600), 3600);
+        assert_eq!(t.unwrap_pts(7200), 7200);
+    }
+
+    /// The 26.5 h wrap with the anchor near 0 — the case a fixed-anchor
+    /// subtraction gets wrong, scheduling audio a full lap into the past.
+    ///
+    /// The boundary has to be walked, not jumped: every PTS is read against
+    /// the one before it, so the test feeds the sequence a stream feeds.
+    #[test]
+    fn timeline_continues_across_a_wrap_anchored_near_zero() {
+        const HOUR: u64 = 324_000_000;
+        let mut t = PtsTimeline::default();
+        assert_eq!(t.unwrap_pts(0), 0);
+        let mut raw = 0u64;
+        while raw + HOUR < PTS_WRAP_90K as u64 {
+            raw += HOUR;
+            assert_eq!(t.unwrap_pts(raw), raw as i64, "no wrap yet at {raw}");
+        }
+        // The step that crosses: the source counts back to near zero, but the
+        // elapsed time is a full lap forward.
+        let wrapped = (raw + HOUR) % PTS_WRAP_90K as u64;
+        assert!(wrapped < raw, "this step must cross the boundary");
+        assert_eq!(t.unwrap_pts(wrapped), raw as i64 + HOUR as i64);
+        assert_eq!(t.unwrap_pts(wrapped + 3600), raw as i64 + HOUR as i64 + 3600);
+    }
+
+    /// Audio and video interleave and video arrives in decode order, so PTS
+    /// straddle the boundary in both directions before settling.
+    #[test]
+    fn timeline_handles_essences_straddling_the_wrap() {
+        let mut t = PtsTimeline::default();
+        let pre = (PTS_WRAP_90K - 100) as u64;
+        assert_eq!(t.unwrap_pts(pre), PTS_WRAP_90K - 100);
+        // Video wrapped, audio hasn't yet.
+        assert_eq!(t.unwrap_pts(0), PTS_WRAP_90K);
+        assert_eq!(t.unwrap_pts(pre - 8), PTS_WRAP_90K - 108);
+        assert_eq!(t.unwrap_pts(3600), PTS_WRAP_90K + 3600);
+    }
+
+    /// A source restart is a backwards step, not a wrap: the timeline must
+    /// report it as such so the worker's grid guard can re-anchor.
+    #[test]
+    fn timeline_reports_a_source_restart_as_a_step_back() {
+        let mut t = PtsTimeline::default();
+        assert_eq!(t.unwrap_pts(54_000_000), 54_000_000);
+        assert_eq!(t.unwrap_pts(0), 0, "10-min restart is not half a modulus");
+    }
+
+    /// The failure this whole timeline exists to prevent: a stream anchored
+    /// near 0 that runs past the wrap must keep producing forward-advancing
+    /// card times, never a negative one.
+    #[test]
+    fn audio_target_stays_forward_across_a_wrap() {
+        let mut t = PtsTimeline::default();
+        let anchor = t.unwrap_pts(900); // first video frame, PTS near 0
+        let mut prev = 0;
+        // Walk a whole lap in ~1 h steps, then past it.
+        for step in 0..30 {
+            let raw = (900 + step * 324_000_000u64) % PTS_WRAP_90K as u64;
+            let target = t.unwrap_pts(raw) - anchor;
+            assert!(target >= prev, "step {step}: {target} went backwards");
+            prev = target;
+        }
+        assert!(prev > PTS_WRAP_90K, "the lap did not complete");
+    }
 
     // 2x2 planar fixtures.
     const Y: [u8; 4] = [100, 101, 102, 103];

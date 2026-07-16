@@ -614,6 +614,12 @@ pub mod category {
     /// degradation, HDR-source-on-SDR-panel tonemap fallback, audio
     /// xruns, etc. Scoped to flows that carry a `display` output.
     pub const DISPLAY: &str = "display";
+    /// Native SDI (Blackmagic DeckLink) capture and playout lifecycle:
+    /// device open refused / lost, signal lost / restored, raster or chroma
+    /// the mode cannot carry, a card that stops draining scheduled frames,
+    /// audio that stops scheduling. Scoped to flows that carry an `sdi`
+    /// input or output. Always paired with `details.error_code`.
+    pub const SDI: &str = "sdi";
     /// Generic bind failure (permission denied, no such device, multicast
     /// group rejected, etc.). For EADDRINUSE prefer `PORT_CONFLICT`.
     /// Always paired with `details.error_code = "bind_failed"`.
