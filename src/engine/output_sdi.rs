@@ -50,7 +50,7 @@ use crate::engine::audio_decode::AacDecoder;
 #[cfg(feature = "media-codecs")]
 use crate::engine::ts_demux::{DemuxedFrame, TsDemuxer};
 #[cfg(feature = "media-codecs")]
-use decklink_rs::{DecklinkPixelFormat, DecklinkPlayout, DecklinkPlayoutConfig};
+use decklink_rs::{CapturedAncillaryPacket, DecklinkPixelFormat, DecklinkPlayout, DecklinkPlayoutConfig};
 #[cfg(feature = "media-codecs")]
 use video_codec::{AudioDecoderCodec, VideoCodec};
 #[cfg(feature = "media-codecs")]
@@ -115,6 +115,7 @@ enum AudioPayload {
 enum PlayoutAu {
     Video(VideoAu),
     Audio(AudioAu),
+    Scte35(Vec<u8>),
     /// Upstream input switch (PMT version bump). Flush decoders so the next
     /// keyframe re-anchors cleanly instead of referencing the old stream.
     Discontinuity,
@@ -252,6 +253,9 @@ async fn run_sdi_output(
                                 }
                             }
                             DemuxedFrame::Discontinuity => PlayoutAu::Discontinuity,
+                            DemuxedFrame::Scte35(section) if config.scte35_injection => {
+                                PlayoutAu::Scte35(section)
+                            }
                             _ => continue,
                         };
                         if au_tx.try_send(au).is_err() {
@@ -410,6 +414,8 @@ fn playout_worker(
     // playback) are dropped by design — dropping past audio keeps lip-sync,
     // so those failures are expected and must not alarm.
     let mut audio_started = false;
+    let mut last_video_pts = 0u64;
+    let mut pending_ancillary: Option<(CapturedAncillaryPacket, u8)> = None;
 
     while let Some(item) = au_rx.blocking_recv() {
         if cancel.is_cancelled() {
@@ -417,7 +423,30 @@ fn playout_worker(
         }
 
         let au = match item {
-            PlayoutAu::Video(v) => v,
+            PlayoutAu::Video(v) => {
+                last_video_pts = v.pts;
+                v
+            }
+            PlayoutAu::Scte35(section) => {
+                if let Some(msg) = crate::engine::scte35_encode::decode_splice_insert_to_scte104(
+                    &section,
+                    last_video_pts,
+                ) {
+                    let event_id = msg.splice_event_id.unwrap_or(0);
+                    let opcode = msg.opcode;
+                    pending_ancillary = Some((CapturedAncillaryPacket {
+                        did: 0x41,
+                        sdid: 0x07,
+                        line_number: 0,
+                        data: crate::engine::st2110::scte104::build_scte104_message(&msg),
+                    }, 3));
+                    event_sender.emit(EventSeverity::Info, category::FLOW, format!(
+                        "{ctx}: queued SCTE-104 VANC cue event_id={event_id} opcode={opcode:?} \
+                         (error_code: sdi_scte104_queued)"
+                    ));
+                }
+                continue;
+            }
             PlayoutAu::Discontinuity => {
                 // Input switch. Flush the video decoder and wait for a fresh
                 // keyframe so it doesn't reference the old stream. Reset the
@@ -584,8 +613,21 @@ fn playout_worker(
                 &mut frame_buf,
             );
 
-            match playout.write_video(&frame_buf) {
+            let ancillary = pending_ancillary
+                .as_ref()
+                .map(|(packet, _)| std::slice::from_ref(packet))
+                .unwrap_or(&[]);
+            match playout.write_video_with_ancillary(&frame_buf, ancillary) {
                 Ok(()) => {
+                    if let Some((_, remaining)) = pending_ancillary.as_mut() {
+                        if *remaining == 3 {
+                            sdi.scte35_cues_injected.fetch_add(1, Ordering::Relaxed);
+                        }
+                        *remaining -= 1;
+                        if *remaining == 0 {
+                            pending_ancillary = None;
+                        }
+                    }
                     stats.packets_sent.fetch_add(1, Ordering::Relaxed);
                     stats
                         .bytes_sent

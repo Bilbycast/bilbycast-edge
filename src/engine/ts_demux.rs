@@ -71,6 +71,8 @@ pub enum DemuxedFrame {
     /// Emitted at most once per discontinuity event, at the head of the
     /// `demux()` return Vec.
     Discontinuity,
+    /// Complete SCTE-35 `splice_info_section` from a PMT stream_type 0x86 PID.
+    Scte35(Vec<u8>),
     /// Complete H.264 access unit (one or more NALUs in Annex B format).
     H264 {
         /// NAL units with 0x00000001 start codes stripped.
@@ -291,6 +293,8 @@ pub struct TsDemuxer {
     video_stream_type: u8,
     /// Audio PID discovered from the selected PMT (after track selection).
     audio_pid: Option<u16>,
+    /// SCTE-35 section PID discovered from stream_type 0x86.
+    scte35_pid: Option<u16>,
     /// Per-PID PES reassembly.
     pes_assemblers: HashMap<u16, PesAssembler>,
     /// Cached SPS NALU for late joiners.
@@ -328,6 +332,7 @@ pub struct TsDemuxer {
     pat_section: crate::engine::ts_parse::SectionAssembler,
     /// Cross-packet section reassembly for the selected PMT.
     pmt_section: crate::engine::ts_parse::SectionAssembler,
+    scte35_section: crate::engine::ts_parse::SectionAssembler,
 }
 
 impl TsDemuxer {
@@ -347,6 +352,7 @@ impl TsDemuxer {
             video_pid: None,
             video_stream_type: 0,
             audio_pid: None,
+            scte35_pid: None,
             pes_assemblers: HashMap::new(),
             cached_sps: None,
             cached_pps: None,
@@ -358,6 +364,7 @@ impl TsDemuxer {
             pending_discontinuity: false,
             pat_section: crate::engine::ts_parse::SectionAssembler::new(),
             pmt_section: crate::engine::ts_parse::SectionAssembler::new(),
+            scte35_section: crate::engine::ts_parse::SectionAssembler::new(),
         }
     }
 
@@ -378,6 +385,7 @@ impl TsDemuxer {
             video_pid: None,
             video_stream_type: 0,
             audio_pid: None,
+            scte35_pid: None,
             pes_assemblers: HashMap::new(),
             cached_sps: None,
             cached_pps: None,
@@ -389,6 +397,7 @@ impl TsDemuxer {
             pending_discontinuity: false,
             pat_section: crate::engine::ts_parse::SectionAssembler::new(),
             pmt_section: crate::engine::ts_parse::SectionAssembler::new(),
+            scte35_section: crate::engine::ts_parse::SectionAssembler::new(),
         }
     }
 
@@ -557,6 +566,7 @@ impl TsDemuxer {
                 self.selected_pmt_pid = new_pmt_pid;
                 self.video_pid = None;
                 self.audio_pid = None;
+                self.scte35_pid = None;
                 self.pes_assemblers.clear();
                 self.pmt_version = None;
                 if was_locked {
@@ -585,6 +595,15 @@ impl TsDemuxer {
         // Audio PID
         if Some(pid) == self.audio_pid {
             return self.process_es_packet(pkt, pid);
+        }
+
+        if Some(pid) == self.scte35_pid {
+            let Some(payload) = Self::psi_payload(pkt) else { return Vec::new(); };
+            return self.scte35_section
+                .feed(ts_pusi(pkt), payload)
+                .filter(|section| section.first() == Some(&0xfc))
+                .map(|section| vec![DemuxedFrame::Scte35(section.to_vec())])
+                .unwrap_or_default();
         }
 
         Vec::new()
@@ -676,6 +695,9 @@ impl TsDemuxer {
             };
 
             match stream_type {
+                0x86 => {
+                    self.scte35_pid = Some(es_pid);
+                }
                 STREAM_TYPE_MPEG1_VIDEO | STREAM_TYPE_MPEG2_VIDEO => {
                     let pid_changed = self.video_pid != Some(es_pid);
                     let codec_changed = self.video_stream_type != stream_type;
@@ -1564,6 +1586,23 @@ mod tests {
         pkt[crc_end + 2] = (crc >> 8) as u8;
         pkt[crc_end + 3] = crc as u8;
         pkt
+    }
+
+    #[test]
+    fn surfaces_pmt_announced_scte35_section() {
+        let mut mux = crate::engine::rtmp::ts_mux::TsMuxer::new();
+        mux.set_scte35_stream(0x01fc);
+        let section = crate::engine::scte35_encode::build_splice_insert_section(
+            &crate::engine::st2110::scte104::Scte104Message {
+                opcode: crate::engine::st2110::scte104::SpliceOpcode::SpliceStartNormal,
+                splice_event_id: Some(7), pre_roll_ms: Some(500),
+                break_duration_ms: None, auto_return: None, protocol_version: 0,
+            },
+            90_000,
+        );
+        let wire: Vec<u8> = mux.mux_scte35(&section).into_iter().flatten().collect();
+        let frames = TsDemuxer::new(None).demux(&wire);
+        assert!(frames.iter().any(|f| matches!(f, DemuxedFrame::Scte35(s) if s == &section)));
     }
 
     /// DVB AC-3 sources signal `stream_type = 0x06` plus an AC-3 descriptor

@@ -197,7 +197,9 @@ pub(crate) fn unpack_uyvy422_for_test(
     cb_out: &mut [u8],
     cr_out: &mut [u8],
 ) {
-    unpack_uyvy422(data, stride, width, height, chroma_420, y_out, cb_out, cr_out)
+    unpack_uyvy422(
+        data, stride, width, height, chroma_420, y_out, cb_out, cr_out,
+    )
 }
 
 pub fn spawn_sdi_input(
@@ -481,6 +483,9 @@ fn sdi_input_blocking_loop(
     // see as a stream fault. Keep them across sessions.
     let mut ts_mux = crate::engine::rtmp::ts_mux::TsMuxer::new();
     ts_mux.set_has_video(true);
+    if config.scte35_extraction {
+        ts_mux.set_scte35_stream(crate::engine::rtmp::ts_mux::DEFAULT_SCTE35_PID);
+    }
     let mut ts_audio_configured = false;
     let mut pts: i64 = 0;
     let mut audio_pts_90khz: u64 = 0;
@@ -717,6 +722,59 @@ fn run_capture_session(
         }
         match cap.read_frame() {
             Ok(CapturedFrame::Video(vf)) => {
+                if config.scte35_extraction {
+                    for captured in &vf.ancillary {
+                        let anc = crate::engine::st2110::ancillary::AncPacket::simple(
+                            captured.did,
+                            captured.sdid,
+                            captured.line_number,
+                            captured.data.clone(),
+                        );
+                        if !crate::engine::st2110::scte104::is_scte104_packet(&anc) {
+                            continue;
+                        }
+                        match crate::engine::st2110::scte104::parse_scte104(&anc.user_data) {
+                            Ok(msg)
+                                if matches!(msg.opcode,
+                                crate::engine::st2110::scte104::SpliceOpcode::SpliceStartNormal
+                                | crate::engine::st2110::scte104::SpliceOpcode::SpliceEndNormal
+                                | crate::engine::st2110::scte104::SpliceOpcode::SpliceCancel) =>
+                            {
+                                let section =
+                                    crate::engine::scte35_encode::build_splice_insert_section(
+                                        &msg,
+                                        (*pts).max(0) as u64,
+                                    );
+                                let packets = ts_mux.mux_scte35(&section);
+                                if !packets.is_empty() {
+                                    publish_ts(
+                                        packets,
+                                        (*pts).max(0) as u32,
+                                        broadcast_tx,
+                                        flow_stats,
+                                    );
+                                    sdi_stats
+                                        .scte35_cues_emitted
+                                        .fetch_add(1, Ordering::Relaxed);
+                                    event_sender.emit(
+                                        EventSeverity::Info,
+                                        category::FLOW,
+                                        format!(
+                                            "{ctx}: emitted SCTE-35 cue event_id={} opcode={:?} \
+                                             (error_code: sdi_scte35_emitted)",
+                                            msg.splice_event_id.unwrap_or(0),
+                                            msg.opcode
+                                        ),
+                                    );
+                                }
+                            }
+                            Ok(_) => {}
+                            Err(e) => {
+                                debug!(target: "sdi.in", "{ctx}: invalid SCTE-104 VANC packet: {e}")
+                            }
+                        }
+                    }
+                }
                 // A raster change means the scratch planes and the encoder are
                 // sized for the wrong geometry. Tear the session down and
                 // re-open: with `format: "auto"` that re-detects the new raster.
@@ -992,7 +1050,10 @@ mod tests {
         // And the layouts the unpacker branches on are exactly those two.
         for (chroma, expect_420) in [("yuv420p", true), ("yuv422p", false)] {
             let is_420 = matches!(resolve_chroma(Some(chroma)), VideoChroma::Yuv420);
-            assert_eq!(is_420, expect_420, "chroma {chroma} maps to the right branch");
+            assert_eq!(
+                is_420, expect_420,
+                "chroma {chroma} maps to the right branch"
+            );
         }
     }
 }

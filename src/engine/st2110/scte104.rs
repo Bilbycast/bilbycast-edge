@@ -57,8 +57,7 @@ pub enum SpliceOpcode {
     /// `splice_request_data()` with `splice_insert_type = 1` (start_normal /
     /// cue-out).
     SpliceStartNormal,
-    /// `splice_request_data()` with `splice_insert_type = 2` (end_normal /
-    /// cue-in).
+    /// `splice_request_data()` end_normal/end_immediate (cue-in).
     SpliceEndNormal,
     /// `splice_request_data()` with `splice_insert_type = 5` (cancel).
     SpliceCancel,
@@ -70,12 +69,43 @@ impl SpliceOpcode {
     fn from_op_id(op: u16, splice_insert_type: Option<u8>) -> Self {
         match (op, splice_insert_type) {
             (0x0000, _) => SpliceOpcode::SpliceNull,
-            (0x0101, Some(1)) => SpliceOpcode::SpliceStartNormal,
-            (0x0101, Some(2)) => SpliceOpcode::SpliceEndNormal,
+            (0x0101, Some(1 | 2)) => SpliceOpcode::SpliceStartNormal,
+            (0x0101, Some(3 | 4)) => SpliceOpcode::SpliceEndNormal,
             (0x0101, Some(5)) => SpliceOpcode::SpliceCancel,
             (other, _) => SpliceOpcode::Other(other),
         }
     }
+}
+
+/// Build a byte-aligned single-operation `splice_request_data()` message.
+/// Header routing fields not represented by [`Scte104Message`] are zero.
+pub fn build_scte104_message(msg: &Scte104Message) -> Vec<u8> {
+    let immediate = msg.pre_roll_ms.unwrap_or(0) == 0;
+    let splice_type = match msg.opcode {
+        SpliceOpcode::SpliceStartNormal => if immediate { 2 } else { 1 },
+        SpliceOpcode::SpliceEndNormal => if immediate { 4 } else { 3 },
+        SpliceOpcode::SpliceCancel => 5,
+        _ => 0,
+    };
+    let mut payload = Vec::with_capacity(13);
+    payload.push(splice_type);
+    payload.extend_from_slice(&msg.splice_event_id.unwrap_or(0).to_be_bytes());
+    payload.push(0);
+    payload.extend_from_slice(&msg.pre_roll_ms.unwrap_or(0).to_be_bytes());
+    let tenths = msg.break_duration_ms.unwrap_or(0).div_ceil(100).min(u16::MAX as u32);
+    payload.extend_from_slice(&(tenths as u16).to_be_bytes());
+    payload.extend_from_slice(&[0, 0, u8::from(msg.auto_return.unwrap_or(false))]);
+
+    let size = 12 + payload.len();
+    let mut out = Vec::with_capacity(size);
+    out.extend_from_slice(&(size as u16).to_be_bytes());
+    out.push(msg.protocol_version);
+    out.extend_from_slice(&[0, 0, 0]);
+    out.extend_from_slice(&0u16.to_be_bytes());
+    out.extend_from_slice(&0x0101u16.to_be_bytes());
+    out.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+    out.extend_from_slice(&payload);
+    out
 }
 
 /// Decoded SCTE-104 single-operation message.
@@ -86,6 +116,10 @@ pub struct Scte104Message {
     pub splice_event_id: Option<u32>,
     /// `pre_roll_time` in milliseconds (cue-out/cue-in only).
     pub pre_roll_ms: Option<u16>,
+    /// Break duration in milliseconds, when supplied by splice_request_data.
+    pub break_duration_ms: Option<u32>,
+    /// Whether downstream should return automatically after the break duration.
+    pub auto_return: Option<bool>,
     /// Raw `protocol_version` from the message header.
     pub protocol_version: u8,
 }
@@ -106,7 +140,9 @@ impl std::fmt::Display for Scte104Error {
             Scte104Error::UnknownProtocolVersion(v) => {
                 write!(f, "SCTE-104 protocol version {v} not supported")
             }
-            Scte104Error::Multiop => f.write_str("SCTE-104 multiple-operation messages are not parsed"),
+            Scte104Error::Multiop => {
+                f.write_str("SCTE-104 multiple-operation messages are not parsed")
+            }
         }
     }
 }
@@ -164,31 +200,45 @@ pub fn parse_scte104(udw: &[u8]) -> Result<Scte104Message, Scte104Error> {
     //  8 avail_num
     //  8 avails_expected
     //  8 auto_return_flag
-    let (splice_insert_type, splice_event_id, pre_roll_ms) = if op_id == 0x0101 {
-        if payload.len() < 1 {
-            (None, None, None)
+    let (splice_insert_type, splice_event_id, pre_roll_ms, break_duration_ms, auto_return) =
+        if op_id == 0x0101 {
+            if payload.len() < 1 {
+                (None, None, None, None, None)
+            } else {
+                let sit = payload[0];
+                let event_id = if payload.len() >= 5 {
+                    Some(u32::from_be_bytes(payload[1..5].try_into().unwrap()))
+                } else {
+                    None
+                };
+                let pre_roll = if payload.len() >= 8 {
+                    Some(u16::from_be_bytes([payload[6], payload[7]]))
+                } else {
+                    None
+                };
+                let duration = (payload.len() >= 10)
+                    .then(|| u16::from_be_bytes([payload[8], payload[9]]) as u32 * 100);
+                let duration = duration.filter(|v| *v != 0);
+                let auto_return =
+                    (payload.len() >= 13 && duration.is_some()).then(|| payload[12] != 0);
+                (
+                    Some(sit),
+                    event_id,
+                    pre_roll,
+                    duration,
+                    auto_return,
+                )
+            }
         } else {
-            let sit = payload[0];
-            let event_id = if payload.len() >= 5 {
-                Some(u32::from_be_bytes(payload[1..5].try_into().unwrap()))
-            } else {
-                None
-            };
-            let pre_roll = if payload.len() >= 8 {
-                Some(u16::from_be_bytes([payload[6], payload[7]]))
-            } else {
-                None
-            };
-            (Some(sit), event_id, pre_roll)
-        }
-    } else {
-        (None, None, None)
-    };
+            (None, None, None, None, None)
+        };
 
     Ok(Scte104Message {
         opcode: SpliceOpcode::from_op_id(op_id, splice_insert_type),
         splice_event_id,
         pre_roll_ms,
+        break_duration_ms,
+        auto_return,
         protocol_version,
     })
 }
@@ -199,16 +249,16 @@ mod tests {
 
     /// Build a minimal single-op `splice_request_data` payload for tests.
     fn make_splice_request(splice_type: u8, event_id: u32, pre_roll: u16) -> Vec<u8> {
-        // Header (12 bytes) + payload (12 bytes) = 24 bytes; data_length = 12.
-        let mut buf = Vec::with_capacity(24);
-        buf.extend_from_slice(&24u16.to_be_bytes()); // message_size
+        // Header (12 bytes) + payload (13 bytes) = 25 bytes.
+        let mut buf = Vec::with_capacity(25);
+        buf.extend_from_slice(&25u16.to_be_bytes()); // message_size
         buf.push(0); // protocol_version
         buf.push(0); // AS_index
         buf.push(0); // message_number
         buf.push(0); // DPI_PID_index
         buf.extend_from_slice(&0u16.to_be_bytes()); // SCTE35_protocol_version
         buf.extend_from_slice(&0x0101u16.to_be_bytes()); // opID
-        buf.extend_from_slice(&12u16.to_be_bytes()); // data_length
+        buf.extend_from_slice(&13u16.to_be_bytes()); // data_length
 
         buf.push(splice_type); // splice_insert_type
         buf.extend_from_slice(&event_id.to_be_bytes()); // splice_event_id
@@ -222,6 +272,16 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_break_duration_and_auto_return() {
+        let mut raw = make_splice_request(1, 7, 500);
+        raw[20..22].copy_from_slice(&300u16.to_be_bytes());
+        raw[24] = 1;
+        let msg = parse_scte104(&raw).unwrap();
+        assert_eq!(msg.break_duration_ms, Some(30_000));
+        assert_eq!(msg.auto_return, Some(true));
+    }
+
+    #[test]
     fn test_parse_cue_out() {
         let raw = make_splice_request(1, 0xCAFEBABE, 1500);
         let msg = parse_scte104(&raw).unwrap();
@@ -232,7 +292,7 @@ mod tests {
 
     #[test]
     fn test_parse_cue_in() {
-        let raw = make_splice_request(2, 1, 0);
+        let raw = make_splice_request(4, 1, 0);
         let msg = parse_scte104(&raw).unwrap();
         assert_eq!(msg.opcode, SpliceOpcode::SpliceEndNormal);
         assert_eq!(msg.splice_event_id, Some(1));
@@ -243,6 +303,18 @@ mod tests {
         let raw = make_splice_request(5, 99, 0);
         let msg = parse_scte104(&raw).unwrap();
         assert_eq!(msg.opcode, SpliceOpcode::SpliceCancel);
+    }
+
+    #[test]
+    fn test_build_message_round_trips() {
+        for msg in [
+            Scte104Message { opcode: SpliceOpcode::SpliceStartNormal, splice_event_id: Some(1), pre_roll_ms: Some(1500), break_duration_ms: Some(30_000), auto_return: Some(true), protocol_version: 0 },
+            Scte104Message { opcode: SpliceOpcode::SpliceStartNormal, splice_event_id: Some(2), pre_roll_ms: Some(0), break_duration_ms: None, auto_return: None, protocol_version: 0 },
+            Scte104Message { opcode: SpliceOpcode::SpliceEndNormal, splice_event_id: Some(3), pre_roll_ms: Some(500), break_duration_ms: None, auto_return: None, protocol_version: 0 },
+            Scte104Message { opcode: SpliceOpcode::SpliceCancel, splice_event_id: Some(4), pre_roll_ms: Some(0), break_duration_ms: None, auto_return: None, protocol_version: 0 },
+        ] {
+            assert_eq!(parse_scte104(&build_scte104_message(&msg)).unwrap(), msg);
+        }
     }
 
     #[test]

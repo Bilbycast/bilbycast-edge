@@ -344,11 +344,21 @@ impl Default for UpgradeConfig {
     }
 }
 
-fn default_allowed_channels() -> Vec<String> { vec!["stable".to_string()] }
-fn default_rollback_grace() -> u32 { 1 }
-fn default_install_root() -> std::path::PathBuf { std::path::PathBuf::from("/opt/bilbycast/edge") }
-fn default_boot_health_window_secs() -> u32 { 120 }
-fn default_max_boot_attempts() -> u32 { 3 }
+fn default_allowed_channels() -> Vec<String> {
+    vec!["stable".to_string()]
+}
+fn default_rollback_grace() -> u32 {
+    1
+}
+fn default_install_root() -> std::path::PathBuf {
+    std::path::PathBuf::from("/opt/bilbycast/edge")
+}
+fn default_boot_health_window_secs() -> u32 {
+    120
+}
+fn default_max_boot_attempts() -> u32 {
+    3
+}
 
 /// A standalone input definition, referenceable by flows.
 ///
@@ -401,7 +411,6 @@ impl ResolvedFlow {
     pub fn active_input(&self) -> Option<&InputDefinition> {
         self.inputs.iter().find(|i| i.active)
     }
-
 }
 
 impl AppConfig {
@@ -1030,9 +1039,15 @@ impl Default for RecordingConfig {
     }
 }
 
-fn default_recording_segment_seconds() -> u32 { 10 }
-fn default_recording_retention_seconds() -> u64 { 86_400 }
-fn default_recording_max_bytes() -> u64 { 50 * 1024 * 1024 * 1024 }
+fn default_recording_segment_seconds() -> u32 {
+    10
+}
+fn default_recording_retention_seconds() -> u64 {
+    86_400
+}
+fn default_recording_max_bytes() -> u64 {
+    50 * 1024 * 1024 * 1024
+}
 
 impl FlowConfig {
     /// Resolved content-analysis configuration with defaults filled in.
@@ -1203,17 +1218,11 @@ pub struct AssembledStream {
 pub enum SlotSource {
     /// Explicit PID on a named input. Used when the operator has picked
     /// a concrete PID from that input's PSI catalogue.
-    Pid {
-        input_id: String,
-        source_pid: u16,
-    },
+    Pid { input_id: String, source_pid: u16 },
     /// Broad essence selector — the assembler picks the first stream of
     /// the given kind from the named input's PMT. Useful when the input
     /// is single-program and the operator just wants "its video".
-    Essence {
-        input_id: String,
-        kind: EssenceKind,
-    },
+    Essence { input_id: String, kind: EssenceKind },
     /// Hitless SMPTE 2022-7-style pair. Both legs carry the same ES;
     /// the merger downstream dedupes by RTP sequence. Either nested
     /// source may itself be another `Pid` or `Essence` — nested
@@ -1325,15 +1334,9 @@ impl SpliceMode {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum SwitchLeg {
     /// Explicit PID on a named input.
-    Pid {
-        input_id: String,
-        source_pid: u16,
-    },
+    Pid { input_id: String, source_pid: u16 },
     /// Auto-pick the first stream of a given kind from the input's PMT.
-    Essence {
-        input_id: String,
-        kind: EssenceKind,
-    },
+    Essence { input_id: String, kind: EssenceKind },
 }
 
 impl SwitchLeg {
@@ -1902,14 +1905,30 @@ pub struct TestPatternInputConfig {
     pub ts_packets_per_datagram: u16,
 }
 
-fn default_tp_width() -> u16 { 1280 }
-fn default_tp_audio_channels() -> u8 { 2 }
-fn default_tp_height() -> u16 { 720 }
-fn default_tp_fps() -> u16 { 25 }
-fn default_tp_video_bitrate() -> u32 { 2000 }
-fn default_tp_tone_hz() -> f32 { 1000.0 }
-fn default_tp_tone_dbfs() -> f32 { -20.0 }
-fn default_tp_ts_packets_per_datagram() -> u16 { 7 }
+fn default_tp_width() -> u16 {
+    1280
+}
+fn default_tp_audio_channels() -> u8 {
+    2
+}
+fn default_tp_height() -> u16 {
+    720
+}
+fn default_tp_fps() -> u16 {
+    25
+}
+fn default_tp_video_bitrate() -> u32 {
+    2000
+}
+fn default_tp_tone_hz() -> f32 {
+    1000.0
+}
+fn default_tp_tone_dbfs() -> f32 {
+    -20.0
+}
+fn default_tp_ts_packets_per_datagram() -> u16 {
+    7
+}
 
 /// One asset inside a [`MediaPlayerInputConfig`]. The edge's media library
 /// stores files by sanitised `name` under the configured media directory
@@ -2062,9 +2081,15 @@ pub struct MediaPlayerInputConfig {
     pub ts_packets_per_datagram: u16,
 }
 
-fn default_image_fps() -> u8 { 5 }
-fn default_image_bitrate_kbps() -> u32 { 250 }
-fn default_mp_ts_packets_per_datagram() -> u16 { 7 }
+fn default_image_fps() -> u8 {
+    5
+}
+fn default_image_bitrate_kbps() -> u32 {
+    250
+}
+fn default_mp_ts_packets_per_datagram() -> u16 {
+    7
+}
 
 impl InputConfig {
     /// Returns the type name string (e.g. "srt", "rtp", "udp").
@@ -2279,7 +2304,11 @@ pub struct RtpInputConfig {
     /// both are set). `None` or `0` disables. Renamed from the former
     /// `ingress_smoothing_ms` (accepted as a serde alias for
     /// back-compat). See [`docs/configuration-guide.md`](configuration-guide.md).
-    #[serde(default, alias = "ingress_smoothing_ms", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        alias = "ingress_smoothing_ms",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub ingress_delay_ms: Option<u16>,
     /// Ingress **de-jitter** buffer setpoint, in ms of content. The
     /// ingress counterpart to the per-output `egress_buffer_ms` servo:
@@ -2374,7 +2403,11 @@ pub struct UdpInputConfig {
     pub interface_binding: Option<InterfaceBinding>,
     /// Fixed ingress delay (0..=1000 ms) — a pure delay line, NOT a jitter
     /// buffer (use `ingress_dejitter_ms` to de-jitter). See [`RtpInputConfig::ingress_delay_ms`].
-    #[serde(default, alias = "ingress_smoothing_ms", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        alias = "ingress_smoothing_ms",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub ingress_delay_ms: Option<u16>,
     /// Ingress de-jitter buffer setpoint (20–2000 ms of content). See
     /// [`RtpInputConfig::ingress_dejitter_ms`].
@@ -2581,7 +2614,11 @@ pub struct SrtInputConfig {
     /// buffer it is usually pointless (SRT already re-times); logs a warning
     /// at startup when both are set. See
     /// [`RtpInputConfig::ingress_delay_ms`].
-    #[serde(default, alias = "ingress_smoothing_ms", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        alias = "ingress_smoothing_ms",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub ingress_delay_ms: Option<u16>,
     /// Muxer-mode PCR + PES PTS regeneration opt-out. See
     /// [`RtpInputConfig::passthrough_clock`].
@@ -2669,7 +2706,11 @@ pub struct RtmpInputConfig {
     /// Fixed ingress delay (0..=1000 ms) — a pure delay line, NOT a jitter
     /// buffer (use `ingress_dejitter_ms` to de-jitter). See
     /// [`RtpInputConfig::ingress_delay_ms`].
-    #[serde(default, alias = "ingress_smoothing_ms", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        alias = "ingress_smoothing_ms",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub ingress_delay_ms: Option<u16>,
     /// Muxer-mode PCR + PES PTS regeneration opt-out. See
     /// [`RtpInputConfig::passthrough_clock`].
@@ -2765,7 +2806,11 @@ pub struct RtspInputConfig {
     /// Fixed ingress delay (0..=1000 ms) — a pure delay line, NOT a jitter
     /// buffer (use `ingress_dejitter_ms` to de-jitter). See
     /// [`RtpInputConfig::ingress_delay_ms`].
-    #[serde(default, alias = "ingress_smoothing_ms", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        alias = "ingress_smoothing_ms",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub ingress_delay_ms: Option<u16>,
     /// Muxer-mode PCR + PES PTS regeneration opt-out. See
     /// [`RtpInputConfig::passthrough_clock`].
@@ -4290,9 +4335,7 @@ pub enum BondEqualizationMode {
 /// Deserialize [`BondEqualizationMode`] accepting the tri-state string or the
 /// legacy boolean (`true` → `auto`, `false` → `off`). Absent → `None` (the
 /// mapping then applies the `auto` default).
-fn de_bond_equalization_mode<'de, D>(
-    d: D,
-) -> Result<Option<BondEqualizationMode>, D::Error>
+fn de_bond_equalization_mode<'de, D>(d: D) -> Result<Option<BondEqualizationMode>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
@@ -6098,7 +6141,6 @@ pub enum St2110VideoPixelFormat {
 }
 
 impl St2110VideoPixelFormat {
-
     #[allow(dead_code)]
     pub fn as_str(self) -> &'static str {
         match self {
@@ -6644,9 +6686,15 @@ pub struct MxlVideoInputConfig {
     pub pid_overrides: Option<TsPidOverridesMap>,
 }
 
-fn default_sdi_format() -> String { "auto".to_string() }
-fn default_sdi_pixel_format() -> String { "uyvy422".to_string() }
-fn default_sdi_audio_channels() -> u8 { 2 }
+fn default_sdi_format() -> String {
+    "auto".to_string()
+}
+fn default_sdi_pixel_format() -> String {
+    "uyvy422".to_string()
+}
+fn default_sdi_audio_channels() -> u8 {
+    2
+}
 
 /// SDI capture input via a Blackmagic DeckLink card (the `sdi` input type,
 /// gated by the `sdi-decklink` Cargo feature). One device handle delivers
@@ -6704,6 +6752,9 @@ pub struct SdiOutputConfig {
     /// in the PAT.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub program_number: Option<u16>,
+    /// Translate inbound SCTE-35 cues into SCTE-104 VANC on SDI playout.
+    #[serde(default)]
+    pub scte35_injection: bool,
     /// Operator A/V-sync trim for the embedded audio, in milliseconds.
     /// **Positive delays audio** (it plays later, correcting audio-early);
     /// **negative advances it** (it plays earlier, correcting audio-late).
@@ -6733,6 +6784,9 @@ pub struct SdiInputConfig {
     /// Embedded-audio channel count to capture (2 / 8 / 16). 0 = video only.
     #[serde(default = "default_sdi_audio_channels")]
     pub audio_channels: u8,
+    /// Translate SCTE-104 VANC triggers into an SCTE-35 PID in the egress TS.
+    #[serde(default)]
+    pub scte35_extraction: bool,
     /// Mandatory ingress video encode (mirrors `MxlVideoInputConfig`). A
     /// feature-flagged backend (`video-encoder-x264` / `-x265` / `-nvenc` /
     /// `-qsv` / `-vaapi`) must be compiled in.
@@ -6896,7 +6950,10 @@ mod tests {
             "dest_addr": "239.1.2.3:5004"
         }"#;
         let parsed: UdpOutputConfig = serde_json::from_str(base).expect("parse absent");
-        assert_eq!(parsed.egress_pacing, None, "absent field must stay None (auto)");
+        assert_eq!(
+            parsed.egress_pacing, None,
+            "absent field must stay None (auto)"
+        );
         let reser = serde_json::to_string(&parsed).unwrap();
         assert!(
             !reser.contains("egress_pacing"),
@@ -6945,7 +7002,10 @@ mod tests {
     /// `monitor_native`).
     #[test]
     fn display_scaling_mode_default_and_serde_shape() {
-        assert_eq!(DisplayScalingMode::default(), DisplayScalingMode::MatchSource);
+        assert_eq!(
+            DisplayScalingMode::default(),
+            DisplayScalingMode::MatchSource
+        );
         let s = serde_json::to_string(&DisplayScalingMode::MatchSource).unwrap();
         assert_eq!(s, "\"match_source\"");
         let s = serde_json::to_string(&DisplayScalingMode::MonitorNative).unwrap();
@@ -7048,7 +7108,10 @@ mod tests {
         assert!(matches!(a.kind, AssemblyKind::Mpts));
         assert_eq!(a.programs.len(), 1);
         assert_eq!(a.programs[0].streams.len(), 2);
-        assert!(matches!(&a.programs[0].streams[1].source, SlotSource::Hitless { .. }));
+        assert!(matches!(
+            &a.programs[0].streams[1].source,
+            SlotSource::Hitless { .. }
+        ));
         let reser = serde_json::to_string(&parsed).unwrap();
         let reparsed: FlowConfig = serde_json::from_str(&reser).unwrap();
         assert_eq!(parsed.assembly, reparsed.assembly);
@@ -7079,11 +7142,11 @@ mod tests {
                 Ok(t) => t,
                 Err(_) => continue, // testbed may be absent in CI
             };
-            let parsed: AppConfig = serde_json::from_str(&text)
-                .unwrap_or_else(|e| panic!("parse {p}: {e}"));
+            let parsed: AppConfig =
+                serde_json::from_str(&text).unwrap_or_else(|e| panic!("parse {p}: {e}"));
             let reser = serde_json::to_string(&parsed).unwrap();
-            let reparsed: AppConfig = serde_json::from_str(&reser)
-                .unwrap_or_else(|e| panic!("reparse {p}: {e}"));
+            let reparsed: AppConfig =
+                serde_json::from_str(&reser).unwrap_or_else(|e| panic!("reparse {p}: {e}"));
             // Assembly blocks must survive round-trip byte-identically.
             for (a, b) in parsed.flows.iter().zip(reparsed.flows.iter()) {
                 assert_eq!(a.assembly, b.assembly, "assembly drift in {p}");
@@ -7099,7 +7162,10 @@ mod tests {
         let parsed: FlowConfig = serde_json::from_str(json).unwrap();
         assert!(parsed.assembly.is_none());
         let reser = serde_json::to_string(&parsed).unwrap();
-        assert!(!reser.contains("assembly"), "assembly leaked into JSON: {reser}");
+        assert!(
+            !reser.contains("assembly"),
+            "assembly leaked into JSON: {reser}"
+        );
     }
 
     /// pid_map must round-trip through the JSON wire format on every
@@ -7120,7 +7186,10 @@ mod tests {
             let parsed: OutputConfig = serde_json::from_str(json)
                 .unwrap_or_else(|e| panic!("parse failed for {json}: {e}"));
             let reser = serde_json::to_string(&parsed).unwrap();
-            assert!(reser.contains("\"pid_map\""), "pid_map stripped on reserialise: {reser}");
+            assert!(
+                reser.contains("\"pid_map\""),
+                "pid_map stripped on reserialise: {reser}"
+            );
             let reparsed: OutputConfig = serde_json::from_str(&reser).unwrap();
             let map: BTreeMap<u16, u16> = match reparsed {
                 OutputConfig::Udp(u) => u.pid_map.unwrap(),
@@ -7157,20 +7226,14 @@ mod tests {
         assert!(!parse(
             r#"{"type":"st2110_31","bind_addr":"127.0.0.1:5000","sample_rate":48000,"channels":2,"bit_depth":24,"packet_duration_us":1000}"#
         ).is_ts_carrier());
-        assert!(!parse(
-            r#"{"type":"st2110_40","bind_addr":"127.0.0.1:5000"}"#
-        ).is_ts_carrier());
+        assert!(!parse(r#"{"type":"st2110_40","bind_addr":"127.0.0.1:5000"}"#).is_ts_carrier());
         assert!(!parse(
             r#"{"type":"rtp_audio","bind_addr":"127.0.0.1:5000","sample_rate":48000,"channels":2,"bit_depth":24}"#
         ).is_ts_carrier());
 
         // TS-carrying — analyzer must spawn for these.
-        assert!(parse(
-            r#"{"type":"udp","bind_addr":"127.0.0.1:5000"}"#
-        ).is_ts_carrier());
-        assert!(parse(
-            r#"{"type":"rtp","bind_addr":"127.0.0.1:5000"}"#
-        ).is_ts_carrier());
+        assert!(parse(r#"{"type":"udp","bind_addr":"127.0.0.1:5000"}"#).is_ts_carrier());
+        assert!(parse(r#"{"type":"rtp","bind_addr":"127.0.0.1:5000"}"#).is_ts_carrier());
     }
 
     #[test]
@@ -7213,13 +7276,13 @@ mod tests {
                     audio_encode: None,
                     transcode: None,
                     video_encode: None,
-                                program_number: None,
-                                pid_map: None,
-                                pid_overrides: None,
-                                interface_binding: None,
-                                ingress_delay_ms: None,
-                                ingress_dejitter_ms: None,
-                                passthrough_clock: None,
+                    program_number: None,
+                    pid_map: None,
+                    pid_overrides: None,
+                    interface_binding: None,
+                    ingress_delay_ms: None,
+                    ingress_dejitter_ms: None,
+                    passthrough_clock: None,
                 }),
             }],
             outputs: vec![OutputConfig::Rtp(RtpOutputConfig {
@@ -7239,9 +7302,9 @@ mod tests {
                 audio_encode: None,
                 transcode: None,
                 video_encode: None,
-                        cbr_pad_to_kbps: None,
-                        pid_overrides: None,
-                        interface_binding: None,
+                cbr_pad_to_kbps: None,
+                pid_overrides: None,
+                interface_binding: None,
                 egress_pacing: None,
                 egress_buffer_ms: None,
             })],
@@ -7291,13 +7354,13 @@ mod tests {
                     audio_encode: None,
                     transcode: None,
                     video_encode: None,
-                                program_number: None,
-                                pid_map: None,
-                                pid_overrides: None,
-                                interface_binding: None,
-                                ingress_delay_ms: None,
-                                ingress_dejitter_ms: None,
-                                passthrough_clock: None,
+                    program_number: None,
+                    pid_map: None,
+                    pid_overrides: None,
+                    interface_binding: None,
+                    ingress_delay_ms: None,
+                    ingress_dejitter_ms: None,
+                    passthrough_clock: None,
                 }),
             }],
             outputs: vec![OutputConfig::Rtp(RtpOutputConfig {
@@ -7317,9 +7380,9 @@ mod tests {
                 audio_encode: None,
                 transcode: None,
                 video_encode: None,
-                        cbr_pad_to_kbps: None,
-                        pid_overrides: None,
-                        interface_binding: None,
+                cbr_pad_to_kbps: None,
+                pid_overrides: None,
+                interface_binding: None,
                 egress_pacing: None,
                 egress_buffer_ms: None,
             })],

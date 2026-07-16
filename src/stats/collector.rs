@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
@@ -241,7 +241,8 @@ impl AudioDecodeStatsHandle {
 
     pub fn set_output_shape(&self, sample_rate_hz: u32, channels: u8) {
         use std::sync::atomic::Ordering;
-        self.output_sample_rate_hz.store(sample_rate_hz, Ordering::Relaxed);
+        self.output_sample_rate_hz
+            .store(sample_rate_hz, Ordering::Relaxed);
         self.output_channels.store(channels, Ordering::Relaxed);
     }
 
@@ -557,7 +558,6 @@ pub struct DisplayStatsCounters {
     /// through ALSA fingers the meter as the broken side.
     pub meter_publishes: AtomicU64,
 
-
     /// Largest single `blit_and_present` duration since startup (µs).
     /// Includes libswscale colour-convert, optional HDR LUT, the
     /// audio-bars overlay, and the `kms.present()` vblank wait. On a
@@ -683,7 +683,10 @@ impl EgressMediaSummaryStatic {
     /// summary always reflects the configured target — even if the encoder
     /// fails to open at runtime (e.g. NVENC on a host without the NVIDIA
     /// driver), the operator still sees what the output is *meant to do*.
-    pub fn with_video_encode_target(mut self, enc: &crate::config::models::VideoEncodeConfig) -> Self {
+    pub fn with_video_encode_target(
+        mut self,
+        enc: &crate::config::models::VideoEncodeConfig,
+    ) -> Self {
         let target_codec = match enc.codec.as_str() {
             "x264" | "h264_nvenc" | "h264_qsv" | "h264_vaapi" => "h264",
             "x265" | "hevc_nvenc" | "hevc_qsv" | "hevc_vaapi" => "hevc",
@@ -711,7 +714,10 @@ impl EgressMediaSummaryStatic {
     /// Populate the `audio_target_*` fields from the operator's
     /// `audio_encode` config block. Same intent-vs-runtime contract as the
     /// video helper above.
-    pub fn with_audio_encode_target(mut self, enc: &crate::config::models::AudioEncodeConfig) -> Self {
+    pub fn with_audio_encode_target(
+        mut self,
+        enc: &crate::config::models::AudioEncodeConfig,
+    ) -> Self {
         self.audio_target_codec = Some(enc.codec.clone());
         self.audio_target_sample_rate_hz = enc.sample_rate;
         self.audio_target_channels = enc.channels;
@@ -844,10 +850,7 @@ impl OutputStatsAccumulator {
 
     /// Register the per-output transcoder stats handle. Called once at
     /// output startup. Subsequent calls are no-ops (first wins).
-    pub fn set_transcode_stats(
-        &self,
-        stats: Arc<crate::engine::audio_transcode::TranscodeStats>,
-    ) {
+    pub fn set_transcode_stats(&self, stats: Arc<crate::engine::audio_transcode::TranscodeStats>) {
         let _ = self.transcode_stats.set(stats);
     }
 
@@ -1059,7 +1062,6 @@ impl OutputStatsAccumulator {
         self.egress_static.get()
     }
 
-
     /// Record an end-to-end latency sample. Called on the hot path after
     /// each successful output send. `recv_time_us` is the monotonic receive
     /// time stamped on the packet at the flow's input.
@@ -1105,26 +1107,28 @@ impl OutputStatsAccumulator {
     pub fn snapshot(&self) -> OutputStats {
         let bytes = self.bytes_sent.load(Ordering::Relaxed);
         let bitrate_bps = self.throughput.sample(bytes);
-        let transcode_stats = self.transcode_stats.get().map(|t| {
-            crate::stats::models::TranscodeStatsSnapshot {
-                input_packets: t.input_packets.load(Ordering::Relaxed),
-                output_packets: t.output_packets.load(Ordering::Relaxed),
-                dropped: t.dropped.load(Ordering::Relaxed),
-                format_resets: t.format_resets.load(Ordering::Relaxed),
-                last_latency_us: t.last_latency_us.load(Ordering::Relaxed),
-            }
-        });
-        let audio_decode_stats = self.audio_decode_stats.get().map(|h| {
-            crate::stats::models::DecodeStatsSnapshot {
-                input_frames: h.stats.input_frames.load(Ordering::Relaxed),
-                output_blocks: h.stats.output_blocks.load(Ordering::Relaxed),
-                decode_errors: h.stats.decode_errors.load(Ordering::Relaxed),
-                dropped_uninit: h.stats.dropped_uninit.load(Ordering::Relaxed),
-                input_codec: h.snapshot_input_codec(),
-                output_sample_rate_hz: h.output_sample_rate_hz.load(Ordering::Relaxed),
-                output_channels: h.output_channels.load(Ordering::Relaxed),
-            }
-        });
+        let transcode_stats =
+            self.transcode_stats
+                .get()
+                .map(|t| crate::stats::models::TranscodeStatsSnapshot {
+                    input_packets: t.input_packets.load(Ordering::Relaxed),
+                    output_packets: t.output_packets.load(Ordering::Relaxed),
+                    dropped: t.dropped.load(Ordering::Relaxed),
+                    format_resets: t.format_resets.load(Ordering::Relaxed),
+                    last_latency_us: t.last_latency_us.load(Ordering::Relaxed),
+                });
+        let audio_decode_stats =
+            self.audio_decode_stats
+                .get()
+                .map(|h| crate::stats::models::DecodeStatsSnapshot {
+                    input_frames: h.stats.input_frames.load(Ordering::Relaxed),
+                    output_blocks: h.stats.output_blocks.load(Ordering::Relaxed),
+                    decode_errors: h.stats.decode_errors.load(Ordering::Relaxed),
+                    dropped_uninit: h.stats.dropped_uninit.load(Ordering::Relaxed),
+                    input_codec: h.snapshot_input_codec(),
+                    output_sample_rate_hz: h.output_sample_rate_hz.load(Ordering::Relaxed),
+                    output_channels: h.output_channels.load(Ordering::Relaxed),
+                });
         let audio_encode_stats = self.audio_encode_stats.get().map(|h| {
             // Source-PID telemetry comes from the TsAudioReplacer handle
             // when present. Subprocess-AudioEncoder outputs leave these
@@ -1134,7 +1138,12 @@ impl OutputStatsAccumulator {
             let (src_pid, src_stream_type) = self
                 .audio_replacer_stats
                 .get()
-                .map(|s| (s.source_pid.load(Ordering::Relaxed), s.source_stream_type.load(Ordering::Relaxed)))
+                .map(|s| {
+                    (
+                        s.source_pid.load(Ordering::Relaxed),
+                        s.source_stream_type.load(Ordering::Relaxed),
+                    )
+                })
                 .unwrap_or((0, 0));
             crate::stats::models::EncodeStatsSnapshot {
                 pcm_frames_submitted: h.stats.pcm_frames_submitted.load(Ordering::Relaxed),
@@ -1189,80 +1198,78 @@ impl OutputStatsAccumulator {
             && !self
                 .display_audio_fresh
                 .advanced_within(display_audio_blocks, DISPLAY_FRAMES_STALL_WINDOW);
-        let display_stats = self.display_stats.get().map(|h| crate::stats::models::DisplayStats {
-            frames_displayed: h.counters.frames_displayed.load(Ordering::Relaxed),
-            frames_dropped_late: h.counters.frames_dropped_late.load(Ordering::Relaxed),
-            frames_repeated: h.counters.frames_repeated.load(Ordering::Relaxed),
-            audio_underruns: h.counters.audio_underruns.load(Ordering::Relaxed),
-            audio_stalled: display_audio_stalled,
-            av_sync_offset_ms: h.counters.load_av_offset_ms(),
-            current_resolution: {
-                let w = h.counters.panel_width.load(Ordering::Relaxed);
-                let ph = h.counters.panel_height.load(Ordering::Relaxed);
-                if w > 0 && ph > 0 {
-                    format!("{w}x{ph}")
-                } else {
-                    h.current_resolution.clone()
-                }
-            },
-            current_refresh_hz: {
-                let hz = h.counters.panel_refresh_hz.load(Ordering::Relaxed);
-                if hz > 0 { hz as u32 } else { h.current_refresh_hz }
-            },
-            pixel_format: h.pixel_format.clone(),
-            decoder_kind: h.decoder_kind.clone(),
-            video_codec: h.counters.load_video_codec_label().as_str().to_string(),
-            audio_codec: h.counters.load_audio_codec_label().as_str().to_string(),
-            send_packet_errors: h.counters.send_packet_errors.load(Ordering::Relaxed),
-            decoder_demotions: h.counters.decoder_demotions.load(Ordering::Relaxed),
-            frames_received_since_open: h
-                .counters
-                .frames_received_since_open
-                .load(Ordering::Relaxed),
-            pts_jumps_observed: h.counters.pts_jumps_observed.load(Ordering::Relaxed),
-            aus_skipped_awaiting_keyframe: h
-                .counters
-                .aus_skipped_awaiting_keyframe
-                .load(Ordering::Relaxed),
-            frame_pts_fallbacks: h.counters.frame_pts_fallbacks.load(Ordering::Relaxed),
-            frames_dropped_unsupported_pixfmt: h
-                .counters
-                .frames_dropped_unsupported_pixfmt
-                .load(Ordering::Relaxed),
-            subscriber_lag_events: h.counters.subscriber_lag_events.load(Ordering::Relaxed),
-            frames_dropped_mpsc_full: h
-                .counters
-                .frames_dropped_mpsc_full
-                .load(Ordering::Relaxed),
-            frames_dropped_stale_gen: h
-                .counters
-                .frames_dropped_stale_gen
-                .load(Ordering::Relaxed),
-            audio_dropped_mpsc_full: h
-                .counters
-                .audio_dropped_mpsc_full
-                .load(Ordering::Relaxed),
-            bars_overlay_enabled: h
-                .counters
-                .bars_overlay_enabled
-                .load(Ordering::Relaxed),
-            meter_publishes: h
-                .counters
-                .meter_publishes
-                .load(Ordering::Relaxed),
-            blit_us_max: h.counters.blit_us_max.load(Ordering::Relaxed),
-            blit_us_avg: {
-                let total = h.counters.blit_us_total.load(Ordering::Relaxed);
-                let count = h.counters.blit_count.load(Ordering::Relaxed);
-                if count == 0 { 0 } else { total / count }
-            },
-            decode_us_max: h.counters.decode_us_max.load(Ordering::Relaxed),
-            decode_us_avg: {
-                let total = h.counters.decode_us_total.load(Ordering::Relaxed);
-                let count = h.counters.decode_count.load(Ordering::Relaxed);
-                if count == 0 { 0 } else { total / count }
-            },
-        });
+        let display_stats = self
+            .display_stats
+            .get()
+            .map(|h| crate::stats::models::DisplayStats {
+                frames_displayed: h.counters.frames_displayed.load(Ordering::Relaxed),
+                frames_dropped_late: h.counters.frames_dropped_late.load(Ordering::Relaxed),
+                frames_repeated: h.counters.frames_repeated.load(Ordering::Relaxed),
+                audio_underruns: h.counters.audio_underruns.load(Ordering::Relaxed),
+                audio_stalled: display_audio_stalled,
+                av_sync_offset_ms: h.counters.load_av_offset_ms(),
+                current_resolution: {
+                    let w = h.counters.panel_width.load(Ordering::Relaxed);
+                    let ph = h.counters.panel_height.load(Ordering::Relaxed);
+                    if w > 0 && ph > 0 {
+                        format!("{w}x{ph}")
+                    } else {
+                        h.current_resolution.clone()
+                    }
+                },
+                current_refresh_hz: {
+                    let hz = h.counters.panel_refresh_hz.load(Ordering::Relaxed);
+                    if hz > 0 {
+                        hz as u32
+                    } else {
+                        h.current_refresh_hz
+                    }
+                },
+                pixel_format: h.pixel_format.clone(),
+                decoder_kind: h.decoder_kind.clone(),
+                video_codec: h.counters.load_video_codec_label().as_str().to_string(),
+                audio_codec: h.counters.load_audio_codec_label().as_str().to_string(),
+                send_packet_errors: h.counters.send_packet_errors.load(Ordering::Relaxed),
+                decoder_demotions: h.counters.decoder_demotions.load(Ordering::Relaxed),
+                frames_received_since_open: h
+                    .counters
+                    .frames_received_since_open
+                    .load(Ordering::Relaxed),
+                pts_jumps_observed: h.counters.pts_jumps_observed.load(Ordering::Relaxed),
+                aus_skipped_awaiting_keyframe: h
+                    .counters
+                    .aus_skipped_awaiting_keyframe
+                    .load(Ordering::Relaxed),
+                frame_pts_fallbacks: h.counters.frame_pts_fallbacks.load(Ordering::Relaxed),
+                frames_dropped_unsupported_pixfmt: h
+                    .counters
+                    .frames_dropped_unsupported_pixfmt
+                    .load(Ordering::Relaxed),
+                subscriber_lag_events: h.counters.subscriber_lag_events.load(Ordering::Relaxed),
+                frames_dropped_mpsc_full: h
+                    .counters
+                    .frames_dropped_mpsc_full
+                    .load(Ordering::Relaxed),
+                frames_dropped_stale_gen: h
+                    .counters
+                    .frames_dropped_stale_gen
+                    .load(Ordering::Relaxed),
+                audio_dropped_mpsc_full: h.counters.audio_dropped_mpsc_full.load(Ordering::Relaxed),
+                bars_overlay_enabled: h.counters.bars_overlay_enabled.load(Ordering::Relaxed),
+                meter_publishes: h.counters.meter_publishes.load(Ordering::Relaxed),
+                blit_us_max: h.counters.blit_us_max.load(Ordering::Relaxed),
+                blit_us_avg: {
+                    let total = h.counters.blit_us_total.load(Ordering::Relaxed);
+                    let count = h.counters.blit_count.load(Ordering::Relaxed);
+                    if count == 0 { 0 } else { total / count }
+                },
+                decode_us_max: h.counters.decode_us_max.load(Ordering::Relaxed),
+                decode_us_avg: {
+                    let total = h.counters.decode_us_total.load(Ordering::Relaxed);
+                    let count = h.counters.decode_count.load(Ordering::Relaxed);
+                    if count == 0 { 0 } else { total / count }
+                },
+            });
 
         // Swap latency window and compute min/avg/max.
         let lat_count = self.latency_count.swap(0, Ordering::Relaxed);
@@ -1284,8 +1291,10 @@ impl OutputStatsAccumulator {
 
         let packets_sent = self.packets_sent.load(Ordering::Relaxed);
         let packets_dropped = self.packets_dropped.load(Ordering::Relaxed);
-        let display_frames_displayed =
-            display_stats.as_ref().map(|d| d.frames_displayed).unwrap_or(0);
+        let display_frames_displayed = display_stats
+            .as_ref()
+            .map(|d| d.frames_displayed)
+            .unwrap_or(0);
         // Frames flipped recently — the display "bitrate". The `> 0` guard
         // keeps the tracker's startup window (last_advance = construction
         // time) from reading a never-displayed output as fresh.
@@ -1329,10 +1338,7 @@ impl OutputStatsAccumulator {
                 .rist_leg2_stats_handle
                 .get()
                 .map(|h| rist_conn_to_leg_stats(h.as_ref(), packets_sent > 0)),
-            bond_stats: self
-                .bond_stats_handle
-                .get()
-                .map(bond_handle_to_leg_stats),
+            bond_stats: self.bond_stats_handle.get().map(bond_handle_to_leg_stats),
             transcode_stats,
             audio_decode_stats,
             audio_encode_stats,
@@ -1701,14 +1707,18 @@ impl Tr101290Accumulator {
         let w_pid = self.window_pid_errors.swap(0, Ordering::Relaxed);
         let w_tei = self.window_tei_errors.swap(0, Ordering::Relaxed);
         let w_crc = self.window_crc_errors.swap(0, Ordering::Relaxed);
-        let w_pcr_disc = self.window_pcr_discontinuity_errors.swap(0, Ordering::Relaxed);
+        let w_pcr_disc = self
+            .window_pcr_discontinuity_errors
+            .swap(0, Ordering::Relaxed);
         let w_pcr_acc = self.window_pcr_accuracy_errors.swap(0, Ordering::Relaxed);
         let w_pts = self.window_pts_errors.swap(0, Ordering::Relaxed);
         let w_cat = self.window_cat_errors.swap(0, Ordering::Relaxed);
         let w_pcr_rep = self.window_pcr_repetition_errors.swap(0, Ordering::Relaxed);
         let w_nit = self.window_nit_errors.swap(0, Ordering::Relaxed);
         let w_si_rep = self.window_si_repetition_errors.swap(0, Ordering::Relaxed);
-        let w_unref = self.window_unreferenced_pid_errors.swap(0, Ordering::Relaxed);
+        let w_unref = self
+            .window_unreferenced_pid_errors
+            .swap(0, Ordering::Relaxed);
         let w_sdt = self.window_sdt_errors.swap(0, Ordering::Relaxed);
         let w_eit = self.window_eit_errors.swap(0, Ordering::Relaxed);
         let w_rst = self.window_rst_errors.swap(0, Ordering::Relaxed);
@@ -1832,14 +1842,17 @@ impl Tr101290Accumulator {
         self.window_pid_errors.store(0, Ordering::Relaxed);
         self.window_tei_errors.store(0, Ordering::Relaxed);
         self.window_crc_errors.store(0, Ordering::Relaxed);
-        self.window_pcr_discontinuity_errors.store(0, Ordering::Relaxed);
+        self.window_pcr_discontinuity_errors
+            .store(0, Ordering::Relaxed);
         self.window_pcr_accuracy_errors.store(0, Ordering::Relaxed);
         self.window_pts_errors.store(0, Ordering::Relaxed);
         self.window_cat_errors.store(0, Ordering::Relaxed);
-        self.window_pcr_repetition_errors.store(0, Ordering::Relaxed);
+        self.window_pcr_repetition_errors
+            .store(0, Ordering::Relaxed);
         self.window_nit_errors.store(0, Ordering::Relaxed);
         self.window_si_repetition_errors.store(0, Ordering::Relaxed);
-        self.window_unreferenced_pid_errors.store(0, Ordering::Relaxed);
+        self.window_unreferenced_pid_errors
+            .store(0, Ordering::Relaxed);
         self.window_sdt_errors.store(0, Ordering::Relaxed);
         self.window_eit_errors.store(0, Ordering::Relaxed);
         self.window_rst_errors.store(0, Ordering::Relaxed);
@@ -1986,7 +1999,8 @@ impl MediaAnalysisAccumulator {
                 })
             } else {
                 None
-            }.or_else(|| {
+            }
+            .or_else(|| {
                 // Try to parse from fec_type
                 state.fec_type.as_ref().map(|ft| {
                     // Format: "SMPTE 2022-1 (L=5, D=5)"
@@ -2002,19 +2016,82 @@ impl MediaAnalysisAccumulator {
                             rows = ft[d_start + 2..d_start + 2 + end].parse().unwrap_or(0);
                         }
                     }
-                    FecInfo { standard: "SMPTE 2022-1".to_string(), columns: cols, rows }
+                    FecInfo {
+                        standard: "SMPTE 2022-1".to_string(),
+                        columns: cols,
+                        rows,
+                    }
                 })
             }),
             redundancy: if state.redundancy_enabled {
                 Some(RedundancyInfo {
-                    standard: state.redundancy_type.clone().unwrap_or_else(|| "SMPTE 2022-7".to_string()),
+                    standard: state
+                        .redundancy_type
+                        .clone()
+                        .unwrap_or_else(|| "SMPTE 2022-7".to_string()),
                 })
             } else {
                 None
             },
             program_count: state.programs.len() as u16,
-            programs: state.programs.iter().map(|p| {
-                let video_streams: Vec<VideoStreamInfo> = p.video_streams.iter().map(|v| {
+            programs: state
+                .programs
+                .iter()
+                .map(|p| {
+                    let video_streams: Vec<VideoStreamInfo> = p
+                        .video_streams
+                        .iter()
+                        .map(|v| {
+                            let bitrate = state.pid_bitrates.get(&v.pid).copied().unwrap_or(0);
+                            VideoStreamInfo {
+                                pid: v.pid,
+                                codec: v.codec.clone(),
+                                stream_type: v.stream_type,
+                                resolution: match (v.width, v.height) {
+                                    (Some(w), Some(h)) => Some(format!("{}x{}", w, h)),
+                                    _ => None,
+                                },
+                                frame_rate: v.frame_rate,
+                                profile: v.profile.clone(),
+                                level: v.level.clone(),
+                                bitrate_bps: bitrate,
+                            }
+                        })
+                        .collect();
+                    let audio_streams: Vec<AudioStreamInfo> = p
+                        .audio_streams
+                        .iter()
+                        .map(|a| {
+                            let bitrate = state.pid_bitrates.get(&a.pid).copied().unwrap_or(0);
+                            AudioStreamInfo {
+                                pid: a.pid,
+                                codec: a.codec.clone(),
+                                stream_type: a.stream_type,
+                                sample_rate_hz: a.sample_rate_hz,
+                                channels: a.channels,
+                                language: a.language.clone(),
+                                bitrate_bps: bitrate,
+                            }
+                        })
+                        .collect();
+                    let total_bitrate_bps: u64 =
+                        video_streams.iter().map(|v| v.bitrate_bps).sum::<u64>()
+                            + audio_streams.iter().map(|a| a.bitrate_bps).sum::<u64>();
+                    ProgramInfo {
+                        program_number: p.program_number,
+                        pmt_pid: p.pmt_pid,
+                        video_streams,
+                        audio_streams,
+                        total_bitrate_bps,
+                    }
+                })
+                .collect(),
+            // Backward-compat flat union of all programs' streams.
+            video_streams: state
+                .programs
+                .iter()
+                .flat_map(|p| p.video_streams.iter())
+                .map(|v| {
                     let bitrate = state.pid_bitrates.get(&v.pid).copied().unwrap_or(0);
                     VideoStreamInfo {
                         pid: v.pid,
@@ -2029,8 +2106,13 @@ impl MediaAnalysisAccumulator {
                         level: v.level.clone(),
                         bitrate_bps: bitrate,
                     }
-                }).collect();
-                let audio_streams: Vec<AudioStreamInfo> = p.audio_streams.iter().map(|a| {
+                })
+                .collect(),
+            audio_streams: state
+                .programs
+                .iter()
+                .flat_map(|p| p.audio_streams.iter())
+                .map(|a| {
                     let bitrate = state.pid_bitrates.get(&a.pid).copied().unwrap_or(0);
                     AudioStreamInfo {
                         pid: a.pid,
@@ -2041,46 +2123,8 @@ impl MediaAnalysisAccumulator {
                         language: a.language.clone(),
                         bitrate_bps: bitrate,
                     }
-                }).collect();
-                let total_bitrate_bps: u64 = video_streams.iter().map(|v| v.bitrate_bps).sum::<u64>()
-                    + audio_streams.iter().map(|a| a.bitrate_bps).sum::<u64>();
-                ProgramInfo {
-                    program_number: p.program_number,
-                    pmt_pid: p.pmt_pid,
-                    video_streams,
-                    audio_streams,
-                    total_bitrate_bps,
-                }
-            }).collect(),
-            // Backward-compat flat union of all programs' streams.
-            video_streams: state.programs.iter().flat_map(|p| p.video_streams.iter()).map(|v| {
-                let bitrate = state.pid_bitrates.get(&v.pid).copied().unwrap_or(0);
-                VideoStreamInfo {
-                    pid: v.pid,
-                    codec: v.codec.clone(),
-                    stream_type: v.stream_type,
-                    resolution: match (v.width, v.height) {
-                        (Some(w), Some(h)) => Some(format!("{}x{}", w, h)),
-                        _ => None,
-                    },
-                    frame_rate: v.frame_rate,
-                    profile: v.profile.clone(),
-                    level: v.level.clone(),
-                    bitrate_bps: bitrate,
-                }
-            }).collect(),
-            audio_streams: state.programs.iter().flat_map(|p| p.audio_streams.iter()).map(|a| {
-                let bitrate = state.pid_bitrates.get(&a.pid).copied().unwrap_or(0);
-                AudioStreamInfo {
-                    pid: a.pid,
-                    codec: a.codec.clone(),
-                    stream_type: a.stream_type,
-                    sample_rate_hz: a.sample_rate_hz,
-                    channels: a.channels,
-                    language: a.language.clone(),
-                    bitrate_bps: bitrate,
-                }
-            }).collect(),
+                })
+                .collect(),
             total_bitrate_bps: state.total_bitrate_bps,
         }
     }
@@ -2363,12 +2407,7 @@ impl PerInputCounters {
     /// `(catalog_clone, tick)` where the clone is reused from the cache
     /// whenever the store's tick hasn't advanced since the last snapshot.
     /// `tick == 0` means no PSI has ever been observed.
-    pub fn psi_catalog_snapshot(
-        &self,
-    ) -> (
-        Option<crate::engine::ts_psi_catalog::PsiCatalog>,
-        u64,
-    ) {
+    pub fn psi_catalog_snapshot(&self) -> (Option<crate::engine::ts_psi_catalog::PsiCatalog>, u64) {
         let tick = self.psi_catalog.tick();
         if tick == 0 {
             return (None, 0);
@@ -2458,10 +2497,7 @@ impl ContentAnalysisAccumulator {
     /// Replace the Lite-tier snapshot. Called from the lite analyser task
     /// at the end of each sample interval. The analyser owns the running
     /// state and rebuilds the wire-shaped struct to publish here.
-    pub fn publish_lite(
-        &self,
-        snap: crate::stats::models::ContentAnalysisLiteStats,
-    ) {
+    pub fn publish_lite(&self, snap: crate::stats::models::ContentAnalysisLiteStats) {
         *self.lite.lock().unwrap() = Some(snap);
     }
 
@@ -2501,6 +2537,8 @@ pub struct SdiCaptureStats {
     pub frames_dropped: AtomicU64,
     /// Capture sessions opened (raster change / device re-open increments).
     pub sessions: AtomicU64,
+    /// Cues successfully translated and emitted into the transport stream.
+    pub scte35_cues_emitted: AtomicU64,
 }
 
 impl SdiCaptureStats {
@@ -2511,6 +2549,7 @@ impl SdiCaptureStats {
             signal_losses: self.signal_losses.load(Ordering::Relaxed),
             frames_dropped: self.frames_dropped.load(Ordering::Relaxed),
             sessions: self.sessions.load(Ordering::Relaxed),
+            scte35_cues_emitted: self.scte35_cues_emitted.load(Ordering::Relaxed),
         }
     }
 }
@@ -2526,6 +2565,8 @@ pub struct SdiPlayoutStats {
     pub frames_late: AtomicU64,
     /// Frames dropped — never presented (hard loss).
     pub frames_dropped: AtomicU64,
+    /// SCTE-35 cues translated and injected as SCTE-104 VANC.
+    pub scte35_cues_injected: AtomicU64,
 }
 
 impl SdiPlayoutStats {
@@ -2535,6 +2576,7 @@ impl SdiPlayoutStats {
             frames_sent: self.frames_sent.load(Ordering::Relaxed),
             frames_late: self.frames_late.load(Ordering::Relaxed),
             frames_dropped: self.frames_dropped.load(Ordering::Relaxed),
+            scte35_cues_injected: self.scte35_cues_injected.load(Ordering::Relaxed),
         }
     }
 }
@@ -2687,8 +2729,7 @@ pub struct FlowStatsAccumulator {
     /// sample-rate conversion on the ingest leg). At snapshot time the
     /// collector reads the entry keyed by `active_input_id` so passive inputs'
     /// handles don't leak into the reported ingress pipeline after a switch.
-    input_transcode_stats:
-        DashMap<String, Arc<crate::engine::audio_transcode::TranscodeStats>>,
+    input_transcode_stats: DashMap<String, Arc<crate::engine::audio_transcode::TranscodeStats>>,
     /// Per-input-id edge-added A/V skew reporters (`stats::av_skew`).
     /// Each input's PTS-touching stages (rewriter trim, audio/video
     /// transcode) publish their (output − source) PTS deltas here; the
@@ -2730,8 +2771,7 @@ pub struct FlowStatsAccumulator {
     /// at flow bring-up and on every lipsync trim change. Read by the
     /// snapshot path into `FlowStats.master_clock`. Behind a `RwLock` so
     /// the (rare) write doesn't add a hot-path atomic.
-    pub master_clock_state:
-        std::sync::RwLock<Option<crate::stats::models::MasterClockStats>>,
+    pub master_clock_state: std::sync::RwLock<Option<crate::stats::models::MasterClockStats>>,
     /// Per-slot assembly liveness, published at 1 Hz by the running TS
     /// assembler (`engine::ts_assembler`). Stays `None` on passthrough
     /// flows so `FlowStats.assembly_health` is absent for them. `Arc`'d
@@ -2784,9 +2824,8 @@ impl PerEsAccumulator {
     pub fn kind_for_stream_type(st: u8) -> &'static str {
         match st {
             0x01 | 0x02 | 0x10 | 0x1B | 0x20 | 0x24 | 0x27 | 0x42 | 0xD1 | 0xEA => "video",
-            0x03 | 0x04 | 0x0F | 0x11 | 0x80 | 0x81 | 0x82 | 0x83 | 0x84 | 0x85 | 0x86
-            | 0x87 | 0x88 | 0x89 | 0x8A | 0x8B | 0x8C | 0x8D | 0x8E | 0x8F | 0xA1 | 0xC1
-            | 0xC2 => "audio",
+            0x03 | 0x04 | 0x0F | 0x11 | 0x80 | 0x81 | 0x82 | 0x83 | 0x84 | 0x85 | 0x86 | 0x87
+            | 0x88 | 0x89 | 0x8A | 0x8B | 0x8C | 0x8D | 0x8E | 0x8F | 0xA1 | 0xC1 | 0xC2 => "audio",
             0x06 => "subtitle",
             0x05 | 0x0B | 0x0C | 0x0D | 0x15 | 0x16 => "data",
             _ => "",
@@ -2985,7 +3024,8 @@ impl FlowStatsAccumulator {
         input_id: &str,
         stats: Arc<crate::engine::audio_transcode::TranscodeStats>,
     ) {
-        self.input_transcode_stats.insert(input_id.to_string(), stats);
+        self.input_transcode_stats
+            .insert(input_id.to_string(), stats);
     }
 
     /// Register an input-side audio decode stats handle. Returns the
@@ -3093,13 +3133,8 @@ impl FlowStatsAccumulator {
     /// Register the static portion of an input's ingress media summary.
     /// Called at flow start, once per input, with values derived from that
     /// input's config. Snapshot reads only the active input's entry.
-    pub fn set_ingress_static(
-        &self,
-        input_id: &str,
-        descriptor: EgressMediaSummaryStatic,
-    ) {
-        self.ingress_static
-            .insert(input_id.to_string(), descriptor);
+    pub fn set_ingress_static(&self, input_id: &str, descriptor: EgressMediaSummaryStatic) {
+        self.ingress_static.insert(input_id.to_string(), descriptor);
     }
 
     /// Set or clear the currently active input ID. Called by `FlowRuntime`
@@ -3205,7 +3240,8 @@ impl FlowStatsAccumulator {
         input_id: &str,
         stats: Arc<crate::engine::ingress_dejitter::IngressDejitterStats>,
     ) {
-        self.ingress_dejitter_stats.insert(input_id.to_string(), stats);
+        self.ingress_dejitter_stats
+            .insert(input_id.to_string(), stats);
     }
 
     /// Register a per-input SDI capture telemetry handle (keyed by `input_id`)
@@ -3261,15 +3297,25 @@ impl FlowStatsAccumulator {
             meta,
             psi_catalog,
         ));
-        self.per_input_counters.insert(input_id.to_string(), c.clone());
+        self.per_input_counters
+            .insert(input_id.to_string(), c.clone());
         c
     }
 
     /// Register a new output for this flow and return a shared reference to its
     /// [`OutputStatsAccumulator`]. The accumulator is inserted into the internal
     /// `DashMap` keyed by `output_id`.
-    pub fn register_output(&self, output_id: String, output_name: String, output_type: String) -> Arc<OutputStatsAccumulator> {
-        let acc = Arc::new(OutputStatsAccumulator::new(output_id.clone(), output_name, output_type));
+    pub fn register_output(
+        &self,
+        output_id: String,
+        output_name: String,
+        output_type: String,
+    ) -> Arc<OutputStatsAccumulator> {
+        let acc = Arc::new(OutputStatsAccumulator::new(
+            output_id.clone(),
+            output_name,
+            output_type,
+        ));
         self.output_stats.insert(output_id, acc.clone());
         acc
     }
@@ -3315,19 +3361,29 @@ impl FlowStatsAccumulator {
         let tr101290_snap = self.tr101290.get().map(|acc| acc.snapshot());
 
         // Extract IAT/PDV from the TR-101290 analyzer state
-        let (iat, pdv_jitter_us) = self.tr101290.get()
+        let (iat, pdv_jitter_us) = self
+            .tr101290
+            .get()
             .map(|acc| {
                 let state = acc.state.lock().unwrap();
                 let iat = if state.iat_count > 0 {
                     Some(IatStats {
-                        min_us: if state.iat_min_us == f64::MAX { 0.0 } else { state.iat_min_us },
+                        min_us: if state.iat_min_us == f64::MAX {
+                            0.0
+                        } else {
+                            state.iat_min_us
+                        },
                         max_us: state.iat_max_us,
                         avg_us: state.iat_sum_us / state.iat_count as f64,
                     })
                 } else {
                     None
                 };
-                let pdv = if state.jitter_us > 0.0 { Some(state.jitter_us) } else { None };
+                let pdv = if state.jitter_us > 0.0 {
+                    Some(state.jitter_us)
+                } else {
+                    None
+                };
                 (iat, pdv)
             })
             .unwrap_or((None, None));
@@ -3377,10 +3433,7 @@ impl FlowStatsAccumulator {
         // to drive the generic `input.packets_lost` field for RIST flows
         // (RIST has its own gap/loss accounting, separate from `input_loss`
         // which is wired by RTP/SRT inputs).
-        let rist_input_primary_snapshot = self
-            .input_rist_stats_handle
-            .get()
-            .map(|h| h.snapshot());
+        let rist_input_primary_snapshot = self.input_rist_stats_handle.get().map(|h| h.snapshot());
         let rist_input_leg2_snapshot = self
             .input_rist_leg2_stats_handle
             .get()
@@ -3389,12 +3442,12 @@ impl FlowStatsAccumulator {
             .as_ref()
             .map(|s| s.packets_received > 0)
             .unwrap_or(false);
-        let rist_input_stats = rist_input_primary_snapshot
-            .as_ref()
-            .map(|s| rist_snapshot_to_leg_stats(s, RistStatsRole::Receiver, rist_input_has_packets));
-        let rist_input_leg2_stats = rist_input_leg2_snapshot
-            .as_ref()
-            .map(|s| rist_snapshot_to_leg_stats(s, RistStatsRole::Receiver, s.packets_received > 0));
+        let rist_input_stats = rist_input_primary_snapshot.as_ref().map(|s| {
+            rist_snapshot_to_leg_stats(s, RistStatsRole::Receiver, rist_input_has_packets)
+        });
+        let rist_input_leg2_stats = rist_input_leg2_snapshot.as_ref().map(|s| {
+            rist_snapshot_to_leg_stats(s, RistStatsRole::Receiver, s.packets_received > 0)
+        });
 
         // Derive flow health (RP 2129 M6)
         let rist_loss = rist_input_primary_snapshot
@@ -3469,11 +3522,20 @@ impl FlowStatsAccumulator {
                 }
             })
             .collect();
-        let inputs_live = if inputs_live.is_empty() { None } else { Some(inputs_live) };
+        let inputs_live = if inputs_live.is_empty() {
+            None
+        } else {
+            Some(inputs_live)
+        };
 
         // Per-ES snapshot. Read the routing map once so every entry gets a
         // consistent `out_pid`.
-        let routing = self.pid_routing.read().ok().map(|g| g.clone()).unwrap_or_default();
+        let routing = self
+            .pid_routing
+            .read()
+            .ok()
+            .map(|g| g.clone())
+            .unwrap_or_default();
         let per_es_vec: Vec<crate::stats::models::PerEsStats> = self
             .per_es_stats
             .iter()
@@ -3493,13 +3555,15 @@ impl FlowStatsAccumulator {
                     bytes,
                     bitrate_bps: bitrate,
                     cc_errors: acc.cc_errors.load(Ordering::Relaxed),
-                    pcr_discontinuity_errors: acc
-                        .pcr_discontinuity_errors
-                        .load(Ordering::Relaxed),
+                    pcr_discontinuity_errors: acc.pcr_discontinuity_errors.load(Ordering::Relaxed),
                 }
             })
             .collect();
-        let per_es = if per_es_vec.is_empty() { None } else { Some(per_es_vec) };
+        let per_es = if per_es_vec.is_empty() {
+            None
+        } else {
+            Some(per_es_vec)
+        };
 
         // Flow-level PCR trust rollup. Aggregate every output's sampler
         // snapshot into one. We report the max p50/p95/p99/max across
@@ -3575,80 +3639,76 @@ impl FlowStatsAccumulator {
                 // Empty key = no active input → all lookups return None, so the
                 // UI shows no transcode/encode badges at all (same as idle).
                 let active_key = active_input_id.as_deref().unwrap_or("");
-                let in_transcode =
-                    self.input_transcode_stats.get(active_key).map(|t| {
-                        crate::stats::models::TranscodeStatsSnapshot {
-                            input_packets: t.input_packets.load(Ordering::Relaxed),
-                            output_packets: t.output_packets.load(Ordering::Relaxed),
-                            dropped: t.dropped.load(Ordering::Relaxed),
-                            format_resets: t.format_resets.load(Ordering::Relaxed),
-                            last_latency_us: t.last_latency_us.load(Ordering::Relaxed),
-                        }
-                    });
-                let in_audio_decode =
-                    self.input_audio_decode_stats.get(active_key).map(|h| {
-                        crate::stats::models::DecodeStatsSnapshot {
-                            input_frames: h.stats.input_frames.load(Ordering::Relaxed),
-                            output_blocks: h.stats.output_blocks.load(Ordering::Relaxed),
-                            decode_errors: h.stats.decode_errors.load(Ordering::Relaxed),
-                            dropped_uninit: h.stats.dropped_uninit.load(Ordering::Relaxed),
-                            input_codec: h.snapshot_input_codec(),
-                            output_sample_rate_hz: h.output_sample_rate_hz.load(Ordering::Relaxed),
-                            output_channels: h.output_channels.load(Ordering::Relaxed),
-                        }
-                    });
-                let in_audio_encode =
-                    self.input_audio_encode_stats.get(active_key).map(|h| {
-                        // Input-side source-PID telemetry isn't wired yet
-                        // (no per-input audio replacer stats handle on
-                        // FlowStatsAccumulator). Surface zeros so the
-                        // snapshot serialises consistently with the
-                        // output-side variant — manager UI sees no badge.
-                        crate::stats::models::EncodeStatsSnapshot {
-                            pcm_frames_submitted: h.stats.pcm_frames_submitted.load(Ordering::Relaxed),
-                            pcm_frames_dropped: h.stats.pcm_frames_dropped.load(Ordering::Relaxed),
-                            encoded_frames_out: h.stats.encoded_frames_out.load(Ordering::Relaxed),
-                            supervisor_restarts: h.stats.supervisor_restarts.load(Ordering::Relaxed),
-                            output_codec: h.output_codec.clone(),
-                            target_sample_rate_hz: h.target_sample_rate_hz,
-                            target_channels: h.target_channels,
-                            target_bitrate_kbps: h.target_bitrate_kbps,
-                            source_pid: 0,
-                            source_stream_type: 0,
-                        }
-                    });
+                let in_transcode = self.input_transcode_stats.get(active_key).map(|t| {
+                    crate::stats::models::TranscodeStatsSnapshot {
+                        input_packets: t.input_packets.load(Ordering::Relaxed),
+                        output_packets: t.output_packets.load(Ordering::Relaxed),
+                        dropped: t.dropped.load(Ordering::Relaxed),
+                        format_resets: t.format_resets.load(Ordering::Relaxed),
+                        last_latency_us: t.last_latency_us.load(Ordering::Relaxed),
+                    }
+                });
+                let in_audio_decode = self.input_audio_decode_stats.get(active_key).map(|h| {
+                    crate::stats::models::DecodeStatsSnapshot {
+                        input_frames: h.stats.input_frames.load(Ordering::Relaxed),
+                        output_blocks: h.stats.output_blocks.load(Ordering::Relaxed),
+                        decode_errors: h.stats.decode_errors.load(Ordering::Relaxed),
+                        dropped_uninit: h.stats.dropped_uninit.load(Ordering::Relaxed),
+                        input_codec: h.snapshot_input_codec(),
+                        output_sample_rate_hz: h.output_sample_rate_hz.load(Ordering::Relaxed),
+                        output_channels: h.output_channels.load(Ordering::Relaxed),
+                    }
+                });
+                let in_audio_encode = self.input_audio_encode_stats.get(active_key).map(|h| {
+                    // Input-side source-PID telemetry isn't wired yet
+                    // (no per-input audio replacer stats handle on
+                    // FlowStatsAccumulator). Surface zeros so the
+                    // snapshot serialises consistently with the
+                    // output-side variant — manager UI sees no badge.
+                    crate::stats::models::EncodeStatsSnapshot {
+                        pcm_frames_submitted: h.stats.pcm_frames_submitted.load(Ordering::Relaxed),
+                        pcm_frames_dropped: h.stats.pcm_frames_dropped.load(Ordering::Relaxed),
+                        encoded_frames_out: h.stats.encoded_frames_out.load(Ordering::Relaxed),
+                        supervisor_restarts: h.stats.supervisor_restarts.load(Ordering::Relaxed),
+                        output_codec: h.output_codec.clone(),
+                        target_sample_rate_hz: h.target_sample_rate_hz,
+                        target_channels: h.target_channels,
+                        target_bitrate_kbps: h.target_bitrate_kbps,
+                        source_pid: 0,
+                        source_stream_type: 0,
+                    }
+                });
                 let in_video_decode = self
                     .input_video_decode_stats
                     .get(active_key)
                     .map(|h| h.value().snapshot());
-                let in_video_encode =
-                    self.input_video_encode_stats.get(active_key).map(|h| {
-                        // Prefer the actually-opened backend (after
-                        // Auto-chain demote) over the requested-codec
-                        // label. `None` until the encoder lazy-opens.
-                        let encoder_backend = h
-                            .stats
-                            .resolved_backend
-                            .label()
-                            .map(str::to_owned)
-                            .unwrap_or_else(|| h.encoder_backend.clone());
-                        crate::stats::models::VideoEncodeStatsSnapshot {
-                            input_frames: h.stats.input_frames.load(Ordering::Relaxed),
-                            output_frames: h.stats.output_frames.load(Ordering::Relaxed),
-                            dropped_frames: h.stats.dropped_frames.load(Ordering::Relaxed),
-                            input_codec: h.input_codec.clone(),
-                            output_codec: h.output_codec.clone(),
-                            output_width: h.output_width,
-                            output_height: h.output_height,
-                            output_fps: h.output_fps,
-                            output_bitrate_kbps: h.output_bitrate_kbps,
-                            encoder_backend,
-                            last_latency_us: h.stats.last_latency_us.load(Ordering::Relaxed),
-                            supervisor_restarts: h.stats.supervisor_restarts.load(Ordering::Relaxed),
-                            source_pid: h.stats.source_pid.load(Ordering::Relaxed),
-                            source_stream_type: h.stats.source_stream_type.load(Ordering::Relaxed),
-                        }
-                    });
+                let in_video_encode = self.input_video_encode_stats.get(active_key).map(|h| {
+                    // Prefer the actually-opened backend (after
+                    // Auto-chain demote) over the requested-codec
+                    // label. `None` until the encoder lazy-opens.
+                    let encoder_backend = h
+                        .stats
+                        .resolved_backend
+                        .label()
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| h.encoder_backend.clone());
+                    crate::stats::models::VideoEncodeStatsSnapshot {
+                        input_frames: h.stats.input_frames.load(Ordering::Relaxed),
+                        output_frames: h.stats.output_frames.load(Ordering::Relaxed),
+                        dropped_frames: h.stats.dropped_frames.load(Ordering::Relaxed),
+                        input_codec: h.input_codec.clone(),
+                        output_codec: h.output_codec.clone(),
+                        output_width: h.output_width,
+                        output_height: h.output_height,
+                        output_fps: h.output_fps,
+                        output_bitrate_kbps: h.output_bitrate_kbps,
+                        encoder_backend,
+                        last_latency_us: h.stats.last_latency_us.load(Ordering::Relaxed),
+                        supervisor_restarts: h.stats.supervisor_restarts.load(Ordering::Relaxed),
+                        source_pid: h.stats.source_pid.load(Ordering::Relaxed),
+                        source_stream_type: h.stats.source_stream_type.load(Ordering::Relaxed),
+                    }
+                });
                 let ingress_static_snap = self
                     .ingress_static
                     .get(active_key)
@@ -3676,7 +3736,11 @@ impl FlowStatsAccumulator {
                     .unwrap_or(false);
                 InputStats {
                     input_type,
-                    state: derive_input_state(input_bitrate, total_input_packets, active_connect_failed),
+                    state: derive_input_state(
+                        input_bitrate,
+                        total_input_packets,
+                        active_connect_failed,
+                    ),
                     mode: meta.and_then(|m| m.mode.clone()),
                     local_addr: meta.and_then(|m| m.local_addr.clone()),
                     remote_addr: meta.and_then(|m| m.remote_addr.clone()),
@@ -3700,9 +3764,7 @@ impl FlowStatsAccumulator {
                         .get()
                         .map(bond_handle_to_leg_stats),
                     redundancy_switches: self.redundancy_switches.load(Ordering::Relaxed),
-                    source_discontinuities: self
-                        .source_discontinuities
-                        .load(Ordering::Relaxed),
+                    source_discontinuities: self.source_discontinuities.load(Ordering::Relaxed),
                     buffered_hitless: self
                         .buffered_hitless_snapshot
                         .read()
@@ -3768,10 +3830,8 @@ impl FlowStatsAccumulator {
                     index_entries: s.index_entries.load(Ordering::Relaxed),
                     last_write_unix_ms: s.last_write_unix_ms.load(Ordering::Relaxed),
                     mode: Some(
-                        crate::replay::writer::mode_to_wire_str(
-                            s.mode.load(Ordering::Relaxed),
-                        )
-                        .to_string(),
+                        crate::replay::writer::mode_to_wire_str(s.mode.load(Ordering::Relaxed))
+                            .to_string(),
                     ),
                 }
             }),
@@ -3933,10 +3993,7 @@ impl BondPathStatsHandle {
     }
 
     /// Attach the adaptive scheduler's per-leg capacity handle (builder).
-    pub fn with_capacity_est(
-        mut self,
-        cap: Option<Arc<std::sync::atomic::AtomicU64>>,
-    ) -> Self {
+    pub fn with_capacity_est(mut self, cap: Option<Arc<std::sync::atomic::AtomicU64>>) -> Self {
         self.capacity_est = cap;
         self
     }
@@ -4194,7 +4251,8 @@ fn build_pipeline_summary(
     // If a `program_number` is set, prefer that program's streams; otherwise
     // fall back to the flat union (which is the lowest-program-number default).
     let (src_video, src_audio) = if let Some(ma) = media_analysis {
-        let prog = program_number.and_then(|pn| ma.programs.iter().find(|p| p.program_number == pn));
+        let prog =
+            program_number.and_then(|pn| ma.programs.iter().find(|p| p.program_number == pn));
         let v = prog
             .and_then(|p| p.video_streams.first())
             .or_else(|| ma.video_streams.first());
@@ -4281,10 +4339,11 @@ fn build_pipeline_summary(
             }
         } else if stat_desc.video_target_codec.is_some() {
             summary.video_codec = stat_desc.video_target_codec.clone();
-            summary.video_resolution = match (stat_desc.video_target_width, stat_desc.video_target_height) {
-                (Some(w), Some(h)) if w > 0 && h > 0 => Some(format!("{}x{}", w, h)),
-                _ => src_video.and_then(|v| v.resolution.clone()),
-            };
+            summary.video_resolution =
+                match (stat_desc.video_target_width, stat_desc.video_target_height) {
+                    (Some(w), Some(h)) if w > 0 && h > 0 => Some(format!("{}x{}", w, h)),
+                    _ => src_video.and_then(|v| v.resolution.clone()),
+                };
             summary.video_fps = stat_desc
                 .video_target_fps
                 .or_else(|| src_video.and_then(|v| v.frame_rate.map(|f| f as f32)));
@@ -4638,8 +4697,17 @@ impl StatsCollector {
     /// Register a new flow and return a shared reference to its
     /// [`FlowStatsAccumulator`]. Inserts the accumulator into the global
     /// `DashMap` keyed by `flow_id`.
-    pub fn register_flow(&self, flow_id: String, flow_name: String, input_type: String) -> Arc<FlowStatsAccumulator> {
-        let acc = Arc::new(FlowStatsAccumulator::new(flow_id.clone(), flow_name, input_type));
+    pub fn register_flow(
+        &self,
+        flow_id: String,
+        flow_name: String,
+        input_type: String,
+    ) -> Arc<FlowStatsAccumulator> {
+        let acc = Arc::new(FlowStatsAccumulator::new(
+            flow_id.clone(),
+            flow_name,
+            input_type,
+        ));
         self.flow_stats.insert(flow_id, acc.clone());
         acc
     }
@@ -4679,7 +4747,8 @@ mod input_state_tests {
     fn flow_health_all_slots_stalled_is_error_despite_live_input_bytes() {
         // The incident shape: 5 live-but-unwired inputs keep flow input
         // bitrate > 0 while the assembly's only sources are dead.
-        let (h, reasons) = derive_flow_health(10_000_000, 0, &None, false, false, None, Some(&ah(2, 2)));
+        let (h, reasons) =
+            derive_flow_health(10_000_000, 0, &None, false, false, None, Some(&ah(2, 2)));
         assert_eq!(h, FlowHealth::Error);
         assert_eq!(reasons.len(), 1);
         assert_eq!(reasons[0].code, "assembly_all_stalled");
@@ -4688,14 +4757,16 @@ mod input_state_tests {
 
     #[test]
     fn flow_health_partial_stall_is_warning() {
-        let (h, reasons) = derive_flow_health(10_000_000, 0, &None, false, false, None, Some(&ah(3, 1)));
+        let (h, reasons) =
+            derive_flow_health(10_000_000, 0, &None, false, false, None, Some(&ah(3, 1)));
         assert_eq!(h, FlowHealth::Warning);
         assert_eq!(reasons[0].code, "assembly_slot_stalled");
     }
 
     #[test]
     fn flow_health_assembly_clean_is_healthy() {
-        let (h, reasons) = derive_flow_health(10_000_000, 0, &None, false, false, None, Some(&ah(2, 0)));
+        let (h, reasons) =
+            derive_flow_health(10_000_000, 0, &None, false, false, None, Some(&ah(2, 0)));
         assert_eq!(h, FlowHealth::Healthy);
         assert!(reasons.is_empty());
     }

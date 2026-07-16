@@ -12273,6 +12273,7 @@ mod tests {
             pixel_format: "uyvy422".into(),
             audio_channels: 2,
             program_number: None,
+            scte35_injection: false,
             audio_offset_ms: offset,
         }
     }

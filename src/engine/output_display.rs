@@ -1369,6 +1369,7 @@ fn demux_decode_loop(
                         }),
                     );
                 }
+                DemuxedFrame::Scte35(_) => {}
                 DemuxedFrame::OtherAudio { stream_type, data, pts } => {
                     // AC-4 (synthetic stream_type 0xAC) has no
                     // open-source decoder — surface the codec label so

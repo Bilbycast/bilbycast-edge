@@ -43,6 +43,8 @@ The `mxl` feature (off by default) adds MXL (Media eXchange Layer) input + outpu
 
 The `sdi-decklink` feature (off by default) adds a native `sdi` input type via the sibling `bilbycast-decklink-rs` crate — Blackmagic DeckLink SDI capture (video + embedded audio) without an external SDI→IP converter. Talks to the Blackmagic DeckLink SDK directly, **not** FFmpeg's `decklink` avdevice: avdevice hides `bmdFrameHasNoInputSource`, making a pulled cable indistinguishable from a live feed (verified on hardware). Build needs only the SDK headers (`DECKLINK_SDK_DIR`); `libDeckLinkAPI.so` is dlopened at runtime by Desktop Video. Self-clocked — no PTP requirement (unlike MXL); SDI flows group with TestPattern/MediaPlayer under the Wallclock master-clock policy. The boot probe (`engine::decklink::domain::DecklinkDeviceManager::probe`) enumerates devices and gates the `sdi-decklink` capability bit; per-port hardware status (signal/genlock lock, detected raster, PCIe link) rides `HealthPayload.sdi_devices[]` via a 10 s background poller (`engine::decklink::status`). Full subsystem reference (config, events, telemetry, verification): [`docs/sdi.md`](docs/sdi.md); SDK gotchas + physical port mapping: `../bilbycast-decklink-rs/CLAUDE.md`.
 
+SCTE trigger extraction is opt-in on native SDI inputs via `scte35_extraction`: generic DeckLink VANC packets are filtered and decoded as SCTE-104 in Rust, then translated into a PMT-announced SCTE-35 section PID in the synthesized MPEG-TS.
+
 ## Architecture Overview
 
 Single-crate Rust project on Tokio async runtime. See `docs/architecture.md` for full diagrams.

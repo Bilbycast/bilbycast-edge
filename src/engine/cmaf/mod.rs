@@ -595,7 +595,7 @@ async fn handle_frame(
         // Stream discontinuity is metadata for stateful decoders; the
         // CMAF segmenter advances on its own GoP cadence and re-issues
         // an init segment on codec change.
-        DemuxedFrame::Discontinuity => {}
+        DemuxedFrame::Discontinuity | DemuxedFrame::Scte35(_) => {}
     }
 }
 

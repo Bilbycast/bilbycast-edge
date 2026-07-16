@@ -724,7 +724,7 @@ async fn publish_loop(
                 // that own decoder state. RTMP is a forwarding output —
                 // the FLV writer re-anchors on the next IDR / AAC config
                 // change naturally.
-                DemuxedFrame::Discontinuity => {}
+                DemuxedFrame::Discontinuity | DemuxedFrame::Scte35(_) => {}
             }
         }
 

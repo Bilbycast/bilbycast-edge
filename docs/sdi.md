@@ -12,11 +12,13 @@ crate. Upstream tracking issue:
 |------------|--------|
 | SDI input, video (UYVY422 8-bit, any raster the card detects) | **Verified on hardware** (1080i50, DeckLink Quad) |
 | SDI input, embedded audio (2 ch → AAC) | **Verified on hardware** (8/16 ch untested) |
+| SCTE-104 VANC extraction → SCTE-35 PID | Implemented and unit-verified; live VANC source verification pending |
 | Signal-loss / raster-change / device-loss resilience | **Verified by physically pulling the cable** |
 | Per-port hardware status on `HealthPayload` | **Verified** (all 8 ports, live during capture) |
 | Encoder backends | All of them — x264 / x265 / NVENC / QSV / VAAPI / `h264_auto` / `hevc_auto` (x264 + NVENC hardware-verified; QSV/VAAPI compile-verified) |
 | SDI output (playout), video | Edge-integrated (`OutputConfig::Sdi`): broadcast → demux → decode → UYVY repack → card-clock-scheduled playout. Crate layer **verified by physical loopback** (bars photographed) |
 | SDI output, audio | Edge-integrated: AAC/MP2/AC-3/E-AC-3 decode → 48 kHz interleaved → timestamped, lip-synced to video on the card's clock. **Verified on hardware** (loopback audio measured). Opus/AC-4 not handled (video-only); non-48 kHz dropped |
+| SCTE-35 → SCTE-104 VANC injection | Codec/demux unit verified; generic DeckLink VANC attachment **hardware loopback verified** (1080i50). Full edge TS→SDI→edge loop remains pending |
 | 10-bit (`v210`) | Rejected at config validation; unpacker not yet written |
 
 ## Why the Blackmagic SDK and not FFmpeg's `decklink` avdevice
@@ -92,6 +94,7 @@ capability.
   "format": "auto",
   "pixel_format": "uyvy422",
   "audio_channels": 2,
+  "scte35_extraction": true,
   "video_encode": {
     "codec": "h264_nvenc", "chroma": "yuv420p",
     "tune": "", "preset": "fast", "rate_control": "cbr",
@@ -106,6 +109,7 @@ capability.
 | `format` | `"auto"` (default, **strongly preferred**) or a DeckLink mode FourCC (`"Hi50"`, `"Hp25"`, …) | A forced mode that mismatches the source makes the card report **no signal and emit bars**. Use `auto`. |
 | `pixel_format` | `"uyvy422"` | `"v210"` (10-bit) is rejected at validation — no unpacker yet. |
 | `audio_channels` | 0 / 2 / 8 / 16 | 0 = video-only. AAC family output only; encoder-init failure degrades to video-only with a Warning, never kills the flow. |
+| `scte35_extraction` | boolean (default `false`) | Translate SCTE-104 VANC cue-out/cue-in/cancel into SCTE-35 PID `0x01FC` (stream type `0x86`). |
 | `video_encode` | mandatory | Same schema as everywhere else. `chroma` must be `yuv420p` or `yuv422p` at 8-bit (capture is 8-bit 4:2:2); every backend including `h264_auto`/`hevc_auto` works. |
 
 Validation rejects — at config load, not mid-show — `v210`, `bit_depth: 10`,
@@ -121,6 +125,7 @@ Three failure modes, deliberately handled differently. All events ride the
 | warning | `sdi_signal_lost` | Card reports `bmdFrameHasNoInputSource` (cable pulled, source down, forced-mode mismatch). **The flow keeps encoding** the card's bars/black — holding the TS up is what downstream wants — and alarms. The commonest failure; restarts nothing. |
 | info | `sdi_signal_restored` | Signal came back. |
 | info | `sdi_capture_opened` | Capture (re)opened; message carries raster + rate + session number. |
+| info | `sdi_scte35_emitted` | An SCTE-104 cue was translated and emitted; carries event ID and opcode. |
 | warning | `sdi_capture_open_failed` | Device open failed; retried every 500 ms until it returns (one event per session, not per retry). |
 | warning | `sdi_raster_changed` | Source format changed; session re-opens with `auto` re-detection. Muxer + PTS state persist, so receivers see a clean continuation. |
 | warning | `sdi_capture_lost` | Device delivered an error / vanished; re-open loop begins. |
@@ -141,6 +146,19 @@ throughout with no session restart.
 | `signal_losses` | Cumulative transitions — distinguishes a flapping cable from a clean run. |
 | `frames_dropped` | Frames the capture shim dropped because **this edge** fell behind the SDI cadence (encoder saturated, thread starved). Invisible to every transport-side counter. Cumulative across re-opens. |
 | `sessions` | Capture sessions opened; > 1 means at least one raster change / device re-open. |
+| `scte35_cues_emitted` | SCTE-104 cues successfully translated and emitted on the SCTE-35 PID. |
+
+### SCTE-104 trigger extraction
+
+When enabled, generic VANC packets are copied before the DeckLink SDK frame is
+released. The edge filters DID/SDID `0x41/0x07`, decodes supported single-op
+SCTE-104 messages, and emits SCTE-35 `splice_insert()` sections directly in
+the egress TS. Cue-out, cue-in, cancel, pre-roll, break duration and auto-return
+are preserved; zero pre-roll becomes an immediate splice with no scheduled PTS.
+
+Encoding, CRC and TS carriage are round-trip unit-tested. Capture plumbing still
+needs verification with a live VANC source, and cue semantics have not yet been
+tested with a dedicated SCTE-104 inserter.
 
 **Per-output (playout)** — `OutputStats.sdi_stats` (additive; absent on non-SDI
 outputs):
@@ -150,6 +168,7 @@ outputs):
 | `frames_sent` | Video frames successfully scheduled onto the card. |
 | `frames_late` | Frames the card displayed **late** (behind their slot but still shown) — a scheduling/CPU-pressure signal, **not** lost picture. Deliberately *not* counted as a drop. Cumulative across re-opens. |
 | `frames_dropped` | Frames **dropped** — never presented (card fell behind the cadence, or the edge skipped a frame against a wedged card). Also folded into the generic `packets_dropped`. Cumulative across re-opens. |
+| `scte35_cues_injected` | SCTE-35 cues translated and attached as SCTE-104 VANC (counted once per cue). |
 
 **Per-host** — `HealthPayload.sdi_devices[]`, one entry per port, refreshed by
 a 10 s background poller (`IDeckLinkStatus` needs no open handle, so this
@@ -195,7 +214,8 @@ sweep element, `late=0 dropped=0` over 3000 frames.
   "pixel_format": "uyvy422",
   "audio_channels": 2,
   "audio_offset_ms": 0,
-  "program_number": null
+  "program_number": null,
+  "scte35_injection": true
 }
 ```
 
@@ -207,6 +227,24 @@ sweep element, `late=0 dropped=0` over 3000 frames.
 | `audio_channels` | 0 / 2 / 8 / 16 | 0 = video-only. The flow's audio is decoded (AAC / MP2 / AC-3 / E-AC-3), interleaved into this channel count, and lip-synced to video via the shared playout clock. Fixed 48 kHz — a non-48 kHz track drops with an alarm. |
 | `audio_offset_ms` | `-1000..=1000`, default `0` | Operator A/V-sync trim. **Positive delays audio** (plays later — corrects audio-early); **negative advances it** (plays earlier — corrects audio-late). A constant shift on each scheduled audio block's card time; the drift-free sample counter is untouched, so it never accumulates. Use it to null a residual lip-sync offset once measured on a monitor. |
 | `program_number` | optional | MPTS down-select, like every other output. |
+| `scte35_injection` | boolean (default `false`) | Decode PMT stream type `0x86` cues and attach SCTE-104 DID/SDID `0x41/0x07` to the next three scheduled frames. |
+
+### SCTE-35 trigger injection
+
+When enabled, the selected program's SCTE-35 PID is section-reassembled by
+the shared TS demuxer. CRC-valid `splice_insert()` cues are decoded into the
+same `Scte104Message` model used by extraction, encoded as single-operation
+SCTE-104, and attached to three successfully scheduled SDI frames for receiver
+reliability. Line number `0` asks the DeckLink SDK to auto-place the packet in
+VANC. Component splices, encrypted sections and non-`splice_insert` commands
+are ignored. Event `sdi_scte104_queued` confirms translation and queuing.
+
+The binary codec, CRC validation, section demux and SDK feature build are
+automated-test verified. Generic attachment is hardware-verified: 500 1080i50
+frames carrying a known 25-byte SCTE-104 packet scheduled with zero late/drops,
+and a looped port captured the exact bytes (the SDK placed requested line `0`
+on physical VANC line 9). A full edge TS cue → SDI → edge extraction run remains
+the final system-level verification.
 
 Pipeline: broadcast subscriber → `TsDemuxer` → H.264/HEVC/MPEG-2 decode
 (`VideoDecoder`) → `pack_uyvy422` (the exact inverse of the input's unpacker —

@@ -266,7 +266,7 @@ async fn build_recording_mp4(
             }
             // Stream discontinuity is metadata for stateful decoders; the
             // export pipeline pulls samples in PTS order regardless.
-            DemuxedFrame::Discontinuity => {}
+            DemuxedFrame::Discontinuity | DemuxedFrame::Scte35(_) => {}
         }
     }
     if video_pts.is_empty() {

@@ -19,10 +19,38 @@
 //! - **Redundancy merge** on SRT input (SMPTE 2022-7 de-duplication)
 //! - **Redundancy duplicate** on SRT output (SMPTE 2022-7 dual-leg send)
 
+/// Per-flow A/V sync mux — master-clock-driven PCR pacing helper
+/// consumed by the TS replacers and per-output emit code. See
+/// [`av_sync_mux`] for the architectural rationale (operator chose
+/// "per-output replacer keeps current shape; mux only governs PCR /
+/// emission timing" over the heavier per-flow producer).
+pub mod av_quality_watch;
+pub mod av_sync_mux;
 pub mod bandwidth_monitor;
 pub mod bandwidth_profile;
+pub mod bond_leg_broker;
+pub mod bond_leg_probe;
+pub mod bond_leg_test;
+pub mod bond_routing;
+pub mod bonded_scheduler;
+/// Fragmented-MP4 (CMAF / CMAF-LL) HTTP-push output with optional CENC
+/// ClearKey encryption. Sibling to `output_hls` — same push model but
+/// fMP4 instead of MPEG-TS.
+pub mod cmaf;
+/// In-depth content-analysis subsystem. Three tiers (Lite, Audio Full,
+/// Video Full) gated per-flow on `FlowConfig.content_analysis`. Each
+/// tier is a dedicated broadcast subscriber and cannot add jitter or
+/// backpressure to the data path. See [`content_analysis`] for the full
+/// rationale and tier cost breakdown.
+pub mod content_analysis;
 pub mod degradation_monitor;
-pub mod input_test_pattern;
+pub mod delay_buffer;
+pub mod flow;
+/// Hardware probe + CPU class + software-encode capacity estimate. Powers
+/// the `resource_budget` block on the manager `HealthPayload`. One-shot
+/// probe at startup, no async / no I/O. See [`hardware_probe`].
+pub mod hardware_probe;
+pub mod input_bonded;
 /// File-backed media-player input — TS / MP4 / image fallback source.
 /// See [`crate::config::models::MediaPlayerInputConfig`] for the config
 /// surface and `docs/configuration-guide.md` for the operator-facing
@@ -33,117 +61,90 @@ pub mod input_media_player;
 /// config surface, [`crate::replay`] for the on-disk store.
 #[cfg(feature = "replay")]
 pub mod input_replay;
-pub mod bond_leg_broker;
-pub mod bond_leg_probe;
-pub mod bond_leg_test;
-pub mod bond_routing;
-pub mod bonded_scheduler;
-pub mod delay_buffer;
-pub mod flow;
-pub mod input_switch_watcher;
-/// Hardware probe + CPU class + software-encode capacity estimate. Powers
-/// the `resource_budget` block on the manager `HealthPayload`. One-shot
-/// probe at startup, no async / no I/O. See [`hardware_probe`].
-pub mod hardware_probe;
-pub mod resource_monitor;
-pub mod input_bonded;
+pub mod input_rist;
 pub mod input_rtmp;
+pub mod input_rtp;
 pub mod input_rtsp;
+pub mod input_srt;
+pub mod input_switch_watcher;
+pub mod input_test_pattern;
+pub mod input_udp;
 #[cfg(feature = "webrtc")]
 pub mod input_webrtc;
-pub mod media_analysis;
-pub mod input_rist;
-pub mod input_rtp;
-pub mod input_srt;
-pub mod input_udp;
-pub mod output_bonded;
-/// Local-display output (HDMI / DisplayPort + ALSA). Linux-only,
-/// gated on the `display` Cargo feature.
-#[cfg(all(feature = "display", target_os = "linux"))]
-pub mod output_display;
-pub mod output_rist;
-pub mod output_udp;
 pub mod manager;
-pub mod output_hls;
-/// Fragmented-MP4 (CMAF / CMAF-LL) HTTP-push output with optional CENC
-/// ClearKey encryption. Sibling to `output_hls` — same push model but
-/// fMP4 instead of MPEG-TS.
-pub mod cmaf;
-pub mod output_rtmp;
-pub mod output_rtp;
-pub mod output_srt;
-pub mod output_webrtc;
-pub mod packet;
 /// Master-clock abstraction: the per-flow reference every output paces
 /// against. PCR generation, emission timing, and cross-edge coherence all
 /// bottom out on `MasterClock::now_27mhz`. See [`master_clock`] for the
 /// trait, kind enum, and selection policy. Sibling modules `pcr_pll` and
 /// `av_sync_mux` (Phases 2 + 4) consume this abstraction.
 pub mod master_clock;
+pub mod media_analysis;
+pub mod output_bonded;
+/// Local-display output (HDMI / DisplayPort + ALSA). Linux-only,
+/// gated on the `display` Cargo feature.
+#[cfg(all(feature = "display", target_os = "linux"))]
+pub mod output_display;
+pub mod output_hls;
+pub mod output_rist;
+pub mod output_rtmp;
+pub mod output_rtp;
+pub mod output_srt;
+pub mod output_udp;
+pub mod output_webrtc;
+pub mod packet;
+/// Per-flow ingress PCR sampler — broadcast-channel subscriber that
+/// extracts PCR samples from every TS packet and feeds the source-PCR
+/// PLL. Sibling to `stats::pcr_trust` (egress accuracy).
+pub mod pcr_ingress_sampler;
 /// Software PI-controller PLL recovering source's 27 MHz from incoming
 /// PCR samples. Used by [`master_clock::MasterClockKind::SourcePcrPll`].
 /// See [`pcr_pll`] for the PI loop, lock-state hysteresis, and the
 /// pre-sample wallclock fallback.
 pub mod pcr_pll;
-/// Per-flow ingress PCR sampler — broadcast-channel subscriber that
-/// extracts PCR samples from every TS packet and feeds the source-PCR
-/// PLL. Sibling to `stats::pcr_trust` (egress accuracy).
-pub mod pcr_ingress_sampler;
-/// Per-flow A/V sync mux — master-clock-driven PCR pacing helper
-/// consumed by the TS replacers and per-output emit code. See
-/// [`av_sync_mux`] for the architectural rationale (operator chose
-/// "per-output replacer keeps current shape; mux only governs PCR /
-/// emission timing" over the heavier per-flow producer).
-pub mod av_quality_watch;
-pub mod av_sync_mux;
 pub mod perf;
-pub mod rtmp;
-pub mod thumbnail;
-pub mod tr101290;
-/// In-depth content-analysis subsystem. Three tiers (Lite, Audio Full,
-/// Video Full) gated per-flow on `FlowConfig.content_analysis`. Each
-/// tier is a dedicated broadcast subscriber and cannot add jitter or
-/// backpressure to the data path. See [`content_analysis`] for the full
-/// rationale and tier cost breakdown.
-pub mod content_analysis;
-pub mod ts_demux;
-pub mod ts_parse;
-pub mod ts_continuity_fixer;
-pub mod ts_program_filter;
-pub mod ts_pid_remapper;
-pub mod ts_pid_overrides_rewriter;
-pub mod ts_psi_catalog;
-pub mod ts_es_bus;
-/// Phase 8 PID-bus per-ES analyzer: one lightweight task per
-/// `(input_id, source_pid)` bus key tracking packets, bytes, CC errors,
-/// PCR discontinuity, and last-seen stream_type. Surfaced via
-/// `FlowStats.per_es` alongside the existing flow-level TR-101290
-/// analyzer (which keeps the heavy PES-level work).
-pub mod ts_es_analysis;
-/// Phase 7 PID-bus Hitless merger: pre-bus dedup task that turns one
-/// `SlotSource::Hitless { primary, backup }` slot into a single
-/// synthetic [`ts_es_bus::NodeEsBus`] key the assembler consumes.
-pub mod ts_es_hitless;
-/// Phase 5 PID-bus SPTS assembler: subscribes to elementary streams on
-/// [`ts_es_bus::NodeEsBus`], rewrites PIDs, stamps per-out-PID continuity,
-/// synthesises PAT/PMT, and emits bundled TS `RtpPacket`s onto the flow's
-/// broadcast channel. Consumed by the FlowRuntime when a flow's
-/// `assembly.kind = spts`.
-pub mod ts_assembler;
 /// PES Switch Phase 4 — PES-aligned splice state machines driven by
 /// `SwitchActiveInput { splice_mode: PesAligned }`: audio (PES-boundary
 /// aligned) and video (H.264 / HEVC, IDR-aligned). Slots whose codec
 /// supports neither fall through to the PmtBump path and emit
 /// `pes_splice_degraded`.
 pub mod pes_splice;
+pub mod resource_monitor;
+pub mod rtmp;
+pub mod scte35_encode;
+pub mod thumbnail;
+pub mod tr101290;
+/// Phase 5 PID-bus SPTS assembler: subscribes to elementary streams on
+/// [`ts_es_bus::NodeEsBus`], rewrites PIDs, stamps per-out-PID continuity,
+/// synthesises PAT/PMT, and emits bundled TS `RtpPacket`s onto the flow's
+/// broadcast channel. Consumed by the FlowRuntime when a flow's
+/// `assembly.kind = spts`.
+pub mod ts_assembler;
 pub mod ts_audio_replace;
 pub mod ts_av_realign;
+pub mod ts_continuity_fixer;
+pub mod ts_demux;
+/// Phase 8 PID-bus per-ES analyzer: one lightweight task per
+/// `(input_id, source_pid)` bus key tracking packets, bytes, CC errors,
+/// PCR discontinuity, and last-seen stream_type. Surfaced via
+/// `FlowStats.per_es` alongside the existing flow-level TR-101290
+/// analyzer (which keeps the heavy PES-level work).
+pub mod ts_es_analysis;
+pub mod ts_es_bus;
+/// Phase 7 PID-bus Hitless merger: pre-bus dedup task that turns one
+/// `SlotSource::Hitless { primary, backup }` slot into a single
+/// synthetic [`ts_es_bus::NodeEsBus`] key the assembler consumes.
+pub mod ts_es_hitless;
 pub mod ts_null_padder;
-pub mod ts_video_replace;
+pub mod ts_parse;
+pub mod ts_pid_overrides_rewriter;
+pub mod ts_pid_remapper;
+pub mod ts_program_filter;
+pub mod ts_psi_catalog;
 /// Encoder-style PES PTS/DTS rewriter — byte-level, no decode. Gated
 /// per-input by [`crate::config::models::RtpInputConfig::passthrough_clock`].
 /// Plugs in as the fourth optional stage of [`input_post_process`].
 pub mod ts_pts_rewriter;
+pub mod ts_video_replace;
 /// Per-output wire emission engine. Dedicated `std::thread` (Linux:
 /// `SCHED_FIFO`) that paces TS datagrams onto the wire via PCR-anchored
 /// `clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, ...)`. Decouples wire
@@ -204,6 +205,7 @@ pub mod ingress_dejitter;
 #[cfg(feature = "media-codecs")]
 pub mod video_encode_util;
 
+pub mod input_post_process;
 /// Ingress-side audio + video transcoding composer for TS-carrying inputs.
 /// Wraps [`ts_audio_replace::TsAudioReplacer`] and [`ts_video_replace::TsVideoReplacer`]
 /// in the same audio-first-then-video order the TS outputs already use, so
@@ -211,7 +213,6 @@ pub mod video_encode_util;
 /// its feed once before the flow broadcast channel and amortise codec work
 /// across all attached outputs.
 pub mod input_transcode;
-pub mod input_post_process;
 
 /// Ingress-side PCM-shape processor for raw PCM-RTP inputs (ST 2110-30,
 /// `rtp_audio`). Depacketizes, optionally reshapes via `PlanarAudioTranscoder`
@@ -293,17 +294,23 @@ pub mod st2110_io;
 /// the tokio reactor is never blocked.
 pub mod st2110_video_io;
 
+pub mod input_st2110_20;
+pub mod input_st2110_23;
 pub mod input_st2110_30;
 pub mod input_st2110_31;
 pub mod input_st2110_40;
-pub mod input_st2110_20;
-pub mod input_st2110_23;
+pub mod output_st2110_20;
+pub mod output_st2110_23;
 pub mod output_st2110_30;
 pub mod output_st2110_31;
 pub mod output_st2110_40;
-pub mod output_st2110_20;
-pub mod output_st2110_23;
 
+#[cfg(feature = "mxl")]
+pub mod input_mxl_anc;
+#[cfg(feature = "mxl")]
+pub mod input_mxl_audio;
+#[cfg(feature = "mxl")]
+pub mod input_mxl_video;
 /// MXL (Media eXchange Layer) — same-host cloud-native broadcast composition.
 /// Wraps `dmf-mxl/mxl` v1.0.1 via the sibling `bilbycast-mxl-rs` crate. Boot
 /// probe lives in `engine::mxl::domain::MxlDomainManager::probe`. Off by
@@ -317,17 +324,11 @@ pub mod mxl_io;
 #[cfg(feature = "mxl")]
 pub mod mxl_video_io;
 #[cfg(feature = "mxl")]
-pub mod input_mxl_video;
-#[cfg(feature = "mxl")]
-pub mod input_mxl_audio;
-#[cfg(feature = "mxl")]
-pub mod input_mxl_anc;
-#[cfg(feature = "mxl")]
-pub mod output_mxl_video;
+pub mod output_mxl_anc;
 #[cfg(feature = "mxl")]
 pub mod output_mxl_audio;
 #[cfg(feature = "mxl")]
-pub mod output_mxl_anc;
+pub mod output_mxl_video;
 
 /// SDI capture/playout via Blackmagic DeckLink. Wraps FFmpeg's `decklink`
 /// avdevice via the sibling `bilbycast-decklink-rs` crate. Boot probe lives in
@@ -348,4 +349,3 @@ pub mod input_rtp_audio;
 /// Supports the same `transcode` block as ST 2110-30 outputs and a future
 /// `transport_mode: "audio_302m"` for SMPTE 302M-in-MPEG-TS over RTP.
 pub mod output_rtp_audio;
-

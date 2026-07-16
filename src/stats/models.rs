@@ -222,7 +222,9 @@ pub struct MasterClockStats {
 }
 
 #[inline]
-fn is_false(b: &bool) -> bool { !*b }
+fn is_false(b: &bool) -> bool {
+    !*b
+}
 
 /// Live atomic-counter snapshot of a flow's recording writer.
 #[derive(Debug, Clone, Serialize, Default)]
@@ -853,6 +855,8 @@ pub struct SdiInputStats {
     /// change or a device re-open, so `> 1` means the input has been
     /// re-established at least once.
     pub sessions: u64,
+    /// SCTE-104 cues translated and emitted on the SCTE-35 PID.
+    pub scte35_cues_emitted: u64,
 }
 
 /// SDI (DeckLink) playout statistics for one output.
@@ -876,6 +880,8 @@ pub struct SdiOutputStats {
     /// cadence, or the edge skipped a frame against a wedged card). These are
     /// also folded into the generic `packets_dropped`.
     pub frames_dropped: u64,
+    /// SCTE-35 cues translated and attached to at least one SDI frame.
+    pub scte35_cues_injected: u64,
 }
 
 /// Statistics for a single output leg of a flow.
@@ -1501,9 +1507,13 @@ pub struct VideoDecodeStatsSnapshot {
 }
 
 #[allow(dead_code)]
-fn is_zero_u16(v: &u16) -> bool { *v == 0 }
+fn is_zero_u16(v: &u16) -> bool {
+    *v == 0
+}
 #[allow(dead_code)]
-fn is_zero_u8(v: &u8) -> bool { *v == 0 }
+fn is_zero_u8(v: &u8) -> bool {
+    *v == 0
+}
 
 /// Snapshot-time description of the egress (or ingress) media for a single
 /// output or input. Reused for both legs of a flow — when populated as
@@ -1582,7 +1592,6 @@ pub struct Tr101290Stats {
     pub pmt_count: u64,
 
     // ── Priority 1 (critical) ──
-
     /// Number of times sync was lost (≥5 consecutive missing 0x47 sync bytes).
     pub sync_loss_count: u64,
     /// Individual TS packets where the sync byte was not 0x47.
@@ -1597,7 +1606,6 @@ pub struct Tr101290Stats {
     pub pid_errors: u64,
 
     // ── Priority 2 (important) ──
-
     /// TS packets with the Transport Error Indicator bit set.
     pub tei_errors: u64,
     /// CRC-32 verification failures on PAT/PMT sections.
@@ -1608,7 +1616,6 @@ pub struct Tr101290Stats {
     pub pcr_accuracy_errors: u64,
 
     // ── Windowed counters (reset each snapshot, "errors since last report") ──
-
     /// CC errors in the last reporting window.
     pub window_cc_errors: u64,
     /// PAT timeout errors in the last reporting window.
@@ -1627,7 +1634,6 @@ pub struct Tr101290Stats {
     pub window_pcr_accuracy_errors: u64,
 
     // ── Summary ──
-
     /// `true` when all Priority 1 error counters are zero AND no
     /// PMT-referenced continuous-media PID is currently missing
     /// (`missing_continuous_pids == 0` — P1 PID_error is a state, so the
@@ -1699,7 +1705,6 @@ pub struct Tr101290Stats {
     pub window_tdt_errors: u64,
 
     // ── VSF TR-07 (JPEG XS over MPEG-2 TS per SMPTE ST 2022-2) ──
-
     /// Whether the stream is TR-07 compliant (JPEG XS detected in PMT).
     pub tr07_compliant: bool,
     /// PID of the JPEG XS elementary stream, if detected.
@@ -1724,7 +1729,6 @@ pub struct SrtLegStats {
     pub max_bw_mbps: f64,
 
     // ── Cumulative counters ──
-
     /// Total packets sent (including retransmissions).
     pub pkt_sent_total: i64,
     /// Total packets received.
@@ -1769,7 +1773,6 @@ pub struct SrtLegStats {
     pub byte_recv_unique_total: u64,
 
     // ── ACK/NAK counters ──
-
     /// Total ACK packets sent.
     pub pkt_sent_ack_total: i32,
     /// Total ACK packets received.
@@ -1780,7 +1783,6 @@ pub struct SrtLegStats {
     pub pkt_recv_nak_total: i32,
 
     // ── Flow control / buffer state ──
-
     /// Flow window size in packets.
     pub pkt_flow_window: i32,
     /// Congestion window size in packets.
@@ -1801,7 +1803,6 @@ pub struct SrtLegStats {
     pub ms_recv_tsbpd_delay: i32,
 
     // ── Buffer occupancy ──
-
     /// Unacknowledged packets in sender buffer.
     pub pkt_send_buf: i32,
     /// Unacknowledged bytes in sender buffer.
@@ -1812,12 +1813,10 @@ pub struct SrtLegStats {
     pub byte_recv_buf: i32,
 
     // ── Pacing ──
-
     /// Packet sending period in microseconds (congestion control pacing).
     pub us_pkt_send_period: f64,
 
     // ── Reorder / belated ──
-
     /// Packet reorder distance.
     pub pkt_reorder_distance: i32,
     /// Packet reorder tolerance.
@@ -1828,7 +1827,6 @@ pub struct SrtLegStats {
     pub pkt_recv_avg_belated_time: f64,
 
     // ── FEC (packet filter) statistics ──
-
     /// FEC packets sent (overhead, total).
     pub pkt_send_filter_extra_total: i32,
     /// FEC packets received (total).
