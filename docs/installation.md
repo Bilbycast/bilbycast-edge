@@ -350,9 +350,9 @@ variable — `libdecklink-sys/build.rs` refuses rather than silently
 dropping the feature.
 
 This matches the package set the GitHub Actions release workflow uses to
-build the `*-linux-full` artefacts, which additionally fetch the SDK
-headers from a private location via the `DECKLINK_SDK_URL` repository
-secret so every full release ships SDI.
+build the `*-linux-full` artefacts, which additionally check the SDK
+headers out of a private repository via the `DECKLINK_SDK_TOKEN` secret so
+every full release ships SDI.
 
 ### ARM Rockchip SBCs (RK3568 / RK3588) — RKMPP hardware encode
 
