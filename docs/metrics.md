@@ -552,6 +552,101 @@ rate-limited (one per 5 s under sustained lag) so the events feed
 isn't drowned during a disk hiccup. `packets_dropped` continues to
 increment on every drop so dashboards can chart the real impact.
 
+## SDI telemetry (`sdi_stats` / `sdi_devices`)
+
+Native SDI (Blackmagic DeckLink, `sdi-decklink` Cargo feature) reports on
+three surfaces: per-input capture, per-output playout, and a per-host
+port enumeration. All are additive and absent on non-SDI entities, so
+older managers and non-SDI flows see no field.
+
+The governing property: **an SDI input keeps delivering frames when the
+cable is pulled** — the card substitutes bars/black and the edge encodes
+them deliberately, because holding the transport stream up is what
+downstream wants. So `state`, `bitrate_bps` and every transport-side
+counter read perfectly healthy on a dead feed. The `signal_present` bit
+is the only thing that says otherwise, which is why it exists.
+
+### Per-input capture (`InputStats.sdi_stats`)
+
+Lock-free atomics (`stats::collector::SdiCaptureStats`), snapshotted on
+the regular 1-second cadence. Registered before the first device open,
+so a manager that connects while a device is still being retried sees an
+honest `signal_present: false` rather than a missing input.
+
+| Field | Meaning |
+|---|---|
+| `signal_present` | Card is locked to a signal **right now** (`!bmdFrameHasNoInputSource`). Queryable state, not an edge-triggered event, so a manager that connects after a loss still sees it. Starts `false` — an input that has never received a frame is not locked, and reporting `true` before the first frame would be a lie |
+| `signal_losses` | Cumulative signal-loss transitions since the input started. Non-zero while `signal_present: true` is the flapping-cable signature — a clean run reads `0` |
+| `frames_dropped` | Cumulative frames dropped **in the capture shim** because this edge fell behind the SDI cadence (encoder saturated, thread starved). Invisible to every transport-side counter; distinct from `packets_lost`, which measures the wire. Carried across device re-opens (the shim's own counter restarts per handle, so the edge adds a base) |
+| `sessions` | Capture sessions opened. `> 1` means at least one raster change or device re-open has happened |
+
+`PerInputLive.signal_present` (`Option<bool>`) mirrors the same bit onto
+the per-input live view, for **every** input in the flow rather than just
+the active one — a passive SDI leg with no signal is exactly what an
+operator needs to see *before* cutting to it. **`None` means "not an SDI
+input, or the card did not say" — never "no signal".** Only
+`Some(false)` is a definitive no-signal; collapsing the two would paint
+NO SIGNAL onto every non-SDI input.
+
+### Per-output playout (`OutputStats.sdi_stats`)
+
+Sourced from the DeckLink scheduled-playback completion callbacks, not
+from the byte stream.
+
+| Field | Meaning |
+|---|---|
+| `frames_sent` | Cumulative video frames successfully scheduled onto the card |
+| `frames_late` | Cumulative frames the card displayed **late** — behind their scheduled slot, but still shown. Scheduling/CPU-pressure signal, **not** lost picture. Informational; deliberately **not** counted as a drop and **not** folded into `packets_dropped` |
+| `frames_dropped` | Cumulative frames **dropped** — never presented (card fell behind the cadence, or the edge skipped a frame against a wedged card). Real lost picture, and **also** folded into the generic `packets_dropped` so every output view sees it |
+
+**Keep `frames_late` and `frames_dropped` distinct.** They answer
+different questions — "the host is under load" vs "we are losing
+picture" — and the card reports them as separate outcomes. Summing them
+into one "drops" figure destroys that, and reads a busy-but-correct
+output as a broken one. The edge integration made exactly this mistake
+in its first cut. Both counters are cumulative across device re-opens
+(the card's per-session counters restart at zero, so the edge rebases
+them on re-open).
+
+### Per-host port enumeration (`HealthPayload.sdi_devices[]`)
+
+One entry per DeckLink port, refreshed by a 10 s background poller
+(`engine::decklink::status`). `IDeckLinkStatus` needs no open handle, so
+this covers **all** ports — idle ones and ports held by other processes
+— without disturbing live flows, and reads correctly while another
+process captures from the same port (`busy: true`).
+
+| Field | Meaning |
+|---|---|
+| `index` / `name` | Enumeration index and SDK display name (`"DeckLink Quad (1)"`) — the `name` is what a config's `device` matches |
+| `sdi_channel` | Connector number parsed from the name |
+| `signal_locked` / `reference_locked` / `ancillary_locked` | Input locked to a signal / locked to house reference (genlock) / ANC stream locked. `ancillary_locked` is a **status bit only** — nothing extracts VANC |
+| `busy` | Device is held open by some process, this edge included |
+| `detected_mode` | Detected raster as a DeckLink mode FourCC (`"Hi50"`). The honest one — `CurrentVideoInputMode` returns a bogus `'ntsc'` default on an unlocked port and is deliberately not exposed |
+| `detected_colorspace` / `detected_field_dominance` | e.g. `"r709"` / `"uppr"` |
+| `detected_dynamic_range` | `BMDDynamicRange`; `0` = SDR, non-zero = an HDR transfer (HLG / PQ). Lets the manager flag an HDR feed on an SDR chain |
+| `sdi_link_config` / `reference_mode` | SDI link configuration (`"lcsl"` = single link) / raster of the house reference when one is patched |
+| `pcie_link_speed` / `pcie_link_width` | Negotiated PCIe generation and lane count. A card in an undersized slot is a classic, otherwise-invisible cause of capture drops |
+
+**Every field is optional on the wire, and absent means "the card did not
+say" — never "no".** On an unlocked input every `Detected*` field returns
+`E_FAIL` and several return `bmdModeUnknown` rather than an error, so
+each maps to `Option`. Rendering a missing answer as `false` would
+invent a fact the hardware refused to state.
+
+### Capability
+
+`sdi-decklink` on `HealthPayload.capabilities`, gated on the boot probe
+reaching the SDK. A card-less host with Desktop Video installed still
+advertises it — the capability means "this edge can do SDI"; the
+`sdi_devices[]` list says which ports actually exist. Manager UI gates
+the SDI surfaces on the capability bit, so edges built without the
+feature hide them automatically.
+
+Config schema: [`configuration-guide.md`](configuration-guide.md#sdi-input-blackmagic-decklink).
+Events: [`events-and-alarms.md`](events-and-alarms.md#sdi-input-flow-sdi-decklink-feature).
+Subsystem reference: [`sdi.md`](sdi.md).
+
 ## Display-output metrics (`OutputStats.display_stats`)
 
 Local-display outputs (Linux-only, `display` Cargo feature) populate

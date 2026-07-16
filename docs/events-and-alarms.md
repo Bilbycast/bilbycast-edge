@@ -90,38 +90,78 @@ Events are queued in an unbounded in-memory channel. When the edge is not connec
 > category. The PLL fallback / recovery events below use a separate
 > **`master_clock`** category.
 
-### SDI Input (`flow`, `sdi-decklink` feature)
+### SDI (`sdi` / `flow`, `sdi-decklink` feature)
 
-SDI (DeckLink) capture events ride the `flow` category. The design intent:
-**signal loss never stops the transport stream** — the card substitutes
-bars/black and the edge keeps encoding so downstream sockets and decoder
-state stay warm; the operator gets an alarm instead of a silently
-healthy-looking stream.
+Native SDI (Blackmagic DeckLink) capture and playout. Every event carries an
+`error_code`; match alarm rules on that, never on message text.
 
-| Severity | Message | Notes |
-|----------|---------|-------|
-| warning | SDI input signal lost — no source locked; continuing to emit the card's bars/black | `error_code: sdi_signal_lost`. Cable pulled, source down, or a forced `format` mismatching the source. Nothing restarts. Queryable state on `InputStats.sdi_stats.signal_present`. |
-| info | SDI input signal restored | `error_code: sdi_signal_restored`. |
-| info | capture opened {w}x{h} @ {num}/{den} (session {n}) | `error_code: sdi_capture_opened`. Emitted per capture session, including re-opens. |
-| warning | capture open failed: {e} — retrying until the device returns | `error_code: sdi_capture_open_failed`. One event per session, retried every 500 ms — not one per retry. |
-| warning | source raster changed | `error_code: sdi_raster_changed`. Session re-opens with `auto` re-detection; muxer + PTS state persist so receivers see a clean continuation. |
-| warning | capture ended: {e} — reopening device | `error_code: sdi_capture_lost`. Device error / disappearance; supervision loop re-opens. |
-| critical | encoder open/config failed | `error_code: sdi_encode_failed` / `sdi_encode_config_failed`. Fatal for the flow — a device re-open cannot fix an encoder problem. |
-| warning | embedded-audio encoder init failed; continuing video-only | Audio degrades, video survives. |
+Both halves carry structured `details`. **The category differs**: playout
+(`engine::output_sdi`) emits on the `sdi` category via
+`emit_output_with_details`, while capture (`engine::sdi_io`) emits on the
+`flow` category via its local `emit_sdi` helper (which scopes the event to
+both `flow_id` and `input_id`, so the UI can hang the alarm on the input's
+row). Rules that key off `error_code` work across both; rules that key off
+category must accept `flow` for capture today.
 
-SDI **playout** (output) events, same category:
+The governing design intent: **signal loss never stops the transport stream**.
+The card substitutes bars/black, and the edge keeps encoding them deliberately
+so downstream sockets and decoder state stay warm. The operator gets an alarm
+instead of a silently healthy-looking stream — which is the entire reason this
+path talks to the Blackmagic SDK rather than FFmpeg's `decklink` avdevice, where
+that bit is unavailable.
 
-| Severity | Message | Notes |
-|----------|---------|-------|
-| info | playout opened {w}x{h} @ {num}/{den} | `error_code: sdi_playout_opened`. |
-| warning | playout open failed — retrying until the device returns | `error_code: sdi_playout_open_failed`. One per session, 500 ms retry. |
-| critical | playout refused: unsupported mode/device | `error_code: sdi_playout_mode_unsupported`. Fatal — config problem, retrying would spin. |
-| warning | decoded video is {w}x{h} but the configured mode is {W}x{H} — frames dropped | `error_code: sdi_playout_raster_mismatch`. Throttled to 1/5 s. Fix `mode` or the source. |
-| warning | video decoder open failed | `error_code: sdi_playout_decode_failed`. Throttled. |
-| warning | decoded chroma is not 8-bit 4:2:0/4:2:2 — frames dropped | `error_code: sdi_playout_chroma_unsupported`. Throttled. A 4:4:4 or 10-bit source cannot be packed to UYVY422; frames drop rather than display corrupted. |
-| warning | playout write failed — reopening device | `error_code: sdi_playout_lost`. |
+#### Capture (`engine::sdi_io`, category `flow`, structured `details`)
 
-Full subsystem reference (config, telemetry, hardware gotchas): `sdi.md`.
+| Severity | error_code | Trigger / behaviour |
+|----------|------------|---------------------|
+| warning | `sdi_signal_lost` | Card reports `bmdFrameHasNoInputSource` — cable pulled, source down, or a forced `format` mismatching the source. **Nothing restarts**; the card's bars/black keep being encoded. Emitted on the *transition* (and on a first frame that is already unlocked), not per frame. Queryable state lives on `InputStats.sdi_stats.signal_present` — a manager connecting after the loss still sees it |
+| info | `sdi_signal_restored` | Signal came back. Transition-triggered |
+| info | `sdi_capture_opened` | Capture (re)opened. One per capture session, including re-opens. `details = { error_code, width, height, frame_rate_num, frame_rate_den, session }` |
+| warning | `sdi_capture_open_failed` | Device open failed. Retried every 500 ms until it returns; **one event per session, not one per retry** — an unplugged device must not flood the bus. `details = { error_code, error, session }` |
+| warning | `sdi_raster_changed` | Source raster changed. The session re-opens with `auto` re-detection; the muxer + PTS/audio clocks persist across the re-open, so receivers see a clean continuation rather than a stream reset |
+| warning | `sdi_capture_lost` | Device errored or vanished. Supervision loop re-opens with a 500 ms backoff |
+| info | `sdi_pipeline_started` | Capture→encode pipeline came up for a session. `details = { error_code, session, … }` |
+| info | `sdi_audio_started` | Embedded audio negotiated. `details = { error_code, codec, channels, sample_rate, bitrate_kbps }` |
+| info | `sdi_scte35_emitted` | An SCTE-104 VANC trigger was decoded and translated into an SCTE-35 section on the egress PID. Only with `scte35_extraction: true`, and only for `splice_insert`-family opcodes. `details = { error_code, session, splice_event_id, opcode }` |
+| info | `sdi_captions_detected` | CEA-608 or CEA-708 caption data appeared in VANC. Only with `captions_extraction: true`. Fires on the absent→present transition, **once per caption type per capture session** — a re-open re-arms it. Presence is *detected*, not decoded; queryable state lives on `InputStats.sdi_stats.captions_cea608_present` / `captions_cea708_present`. `details = { error_code, session, caption_type, cc_count }` |
+| warning | `sdi_audio_codec_unsupported` | `audio_encode.codec` is outside the AAC family (the only family an SDI input can mux). **Degrades to video-only** — the flow lives. `details = { error_code, codec }` |
+| warning | `sdi_audio_encoder_init_failed` | Audio encoder would not start. **Degrades to video-only** — deliberately not fatal; losing sound beats losing the feed. `details = { error_code, error }` |
+| critical | `sdi_encode_failed` | Video encoder would not open (bad params, no GPU session). **Fatal for the input** — re-opening the device would just spin on a config problem |
+| critical | `sdi_encode_config_failed` | Encoder config could not be built. Fatal, same reasoning. Also logged locally, because a standalone edge with no manager attached would otherwise fail silently. `details = { error_code, error }` |
+| critical | `sdi_pixfmt_unsupported` | `pixel_format: v210` reached the runtime. Fatal. Defensive — config validation rejects this at load. `details = { error_code, pixel_format }` |
+| critical | `sdi_encode_chroma_unsupported` | Encoder chroma / bit-depth the UYVY422 unpacker cannot produce. Fatal. Defensive — validation rejects this at load. `details = { error_code, chroma, bit_depth }` |
+| critical | `sdi_no_media_codecs` | Build lacks the `media-codecs` feature; the input cannot encode anything |
+
+#### Playout (`engine::output_sdi`, category `sdi`, structured `details`)
+
+| Severity | error_code | Trigger / behaviour |
+|----------|------------|---------------------|
+| info | `sdi_playout_opened` | Playout opened. `details = { error_code, device, mode, width, height, frame_rate_num, frame_rate_den }` |
+| info | `sdi_scte104_queued` | An inbound SCTE-35 section was decoded and re-encoded as SCTE-104 VANC, queued to ride the next scheduled frames. Only with `scte35_injection: true`. The cue is repeated across three frames for wire reliability, and only frames actually written to the card spend a repeat — so a frame dropped against the playout grid never silently consumes one. `details = { error_code, device, splice_event_id, opcode }` |
+| warning | `sdi_playout_open_failed` | Device open failed; retrying on a 500 ms backoff. One event per session, not per retry. `details = { error_code, device, mode, error }` |
+| critical | `sdi_playout_mode_unsupported` | The card refused this mode/device combination. **Fatal** — a retry can never fix a config problem. `details = { error_code, device, mode, error }` |
+| warning | `sdi_playout_raster_mismatch` | Decoded video's raster ≠ the configured `mode`. Frames are **dropped rather than displayed garbled**. Throttled to 1 per 5 s. `details = { error_code, decoded_width, decoded_height, mode_width, mode_height, mode }` |
+| warning | `sdi_playout_chroma_unsupported` | Decoded chroma is not 8-bit 4:2:0/4:2:2, so it cannot be packed to UYVY422. Frames drop rather than show corrupted colour. Throttled. `details = { error_code, pixel_format }` |
+| warning | `sdi_playout_decode_failed` | Video decoder would not open. Throttled. `details = { error_code, codec, error }` |
+| warning | `sdi_playout_card_not_draining` | 25 consecutive frames refused by the card (`Busy`) — playback is running but nothing is being presented, so **every frame is now being dropped**. Usual cause is lost reference/genlock. Escalated from a counter to an alarm precisely because at this point the drop counter alone understates a total outage. Throttled. `details = { error_code, device, consecutive_busy }` |
+| warning | `sdi_playout_audio_stalled` | An audio block's schedule position fell before the playout epoch — the source stepped its PTS behind the first video frame — so **audio has stopped scheduling and the output is silent**. Distinct from the startup case: blocks dropped before the first successful audio write are expected (video pre-roll has already begun playback, and dropping past audio is what preserves lip-sync) and deliberately do **not** alarm |
+| warning | `sdi_playout_lost` | Scheduled write failed. The device is re-opened with backoff; the card's cumulative late/dropped counters restart, so the edge rebases them |
+| critical | `sdi_no_media_codecs` | Build lacks `media-codecs`; the output cannot decode anything. `details = { error_code }` |
+
+#### Flow bring-up gates (`engine::flow`, category `flow`)
+
+| Severity | error_code | Trigger |
+|----------|------------|---------|
+| critical | `sdi_decklink_unavailable` | An `sdi` input was configured but the boot probe found no DeckLink device — the input refuses to start rather than retry forever |
+| critical | `sdi_feature_disabled` | An `sdi` input in a build compiled without the `sdi-decklink` Cargo feature |
+| critical | `sdi_playout_unavailable` | An `sdi` output in a build compiled without the `sdi-decklink` Cargo feature. Surfaces as a flow-start error |
+
+Throttled playout warnings share one 5 s window per cause, so a persistently
+wrong-raster source alarms once per 5 s rather than at frame rate.
+
+Config schema: [`configuration-guide.md`](configuration-guide.md#sdi-input-blackmagic-decklink).
+Telemetry: [`metrics.md`](metrics.md#sdi-telemetry-sdi_stats--sdi_devices).
+Full subsystem reference (hardware gotchas, verification): [`sdi.md`](sdi.md).
 
 ---
 
@@ -723,7 +763,8 @@ These are generated server-side in `bilbycast-manager/crates/manager-server/src/
 | `nmos` | — | NMOS IS-04 / IS-05 / IS-08 controller activity (Phase 1) |
 | `nmos_registry` | 4 | IS-04 registration client lifecycle (registered, heartbeat lost, registration failed, registry unreachable) |
 | `scte104` | — | SCTE-104 splice events parsed from ST 2110-40 ANC (Phase 1) |
-| **Total** | **89** | |
+| `sdi` | 11 | Native SDI (DeckLink) **playout** lifecycle — device open refused / lost, raster or chroma the mode cannot carry, a card that stops draining scheduled frames, audio that stops scheduling. `sdi-decklink` feature. SDI **capture** events still ride `flow`; see the [SDI section](#sdi-sdi--flow-sdi-decklink-feature) |
+| **Total** | **100** | |
 
 ### Phase 1 ST 2110 categories
 

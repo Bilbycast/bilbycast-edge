@@ -27,6 +27,7 @@ Complete reference for the bilbycast-edge JSON configuration file. This guide co
   - [Media Player Input](#media-player-input)
   - [TestPattern Input](#testpattern-input)
   - [Bonded Input](#bonded-input)
+  - [SDI Input (Blackmagic DeckLink)](#sdi-input-blackmagic-decklink)
 - [Output Types](#output-types)
   - [RTP Output](#rtp-output)
   - [SRT Output](#srt-output)
@@ -34,6 +35,7 @@ Complete reference for the bilbycast-edge JSON configuration file. This guide co
   - [HLS Output](#hls-output)
   - [WebRTC Output](#webrtc-output)
   - [Bonded Output](#bonded-output)
+  - [SDI Output (Blackmagic DeckLink playout)](#sdi-output-blackmagic-decklink-playout)
 - **SMPTE ST 2110 audio + ANC** — see the dedicated section near the
   end of this guide and the deep-dive in
   [`audio-gateway.md`](audio-gateway.md). Covers ST 2110-30/-31 audio,
@@ -1097,6 +1099,65 @@ budget, FEC — is covered in [`bilbycast-bonding/CLAUDE.md`](../../bilbycast-bo
 and [`docs/bonding.md`](bonding.md). The bonded sender at the
 other end uses the matching [Bonded Output](#bonded-output).
 
+### SDI Input (Blackmagic DeckLink)
+
+Captures SDI directly off a Blackmagic **DeckLink** card — video plus
+embedded audio — encodes in-process and publishes a standard A+V
+MPEG-TS flow, with no external SDI→IP converter in the path. Gated on
+the `sdi-decklink` Cargo feature (default **off**); the schema is
+always present so configs round-trip on builds without it.
+
+```json
+{
+  "type": "sdi",
+  "id": "sdi1",
+  "name": "SDI 1",
+  "device": "DeckLink Quad (1)",
+  "format": "auto",
+  "pixel_format": "uyvy422",
+  "audio_channels": 2,
+  "video_encode": {
+    "codec": "h264_nvenc", "chroma": "yuv420p",
+    "tune": "", "preset": "fast", "rate_control": "cbr",
+    "bitrate_kbps": 10000, "gop_size": 50
+  }
+}
+```
+
+| Field | Type | Default | Notes |
+|-------|------|---------|-------|
+| `type` | string | — | Always `"sdi"`. |
+| `device` | string | — | **Required**, non-empty. DeckLink display name as listed by the boot probe and [`HealthPayload.sdi_devices[]`](metrics.md#sdi-telemetry-sdi_stats--sdi_devices), e.g. `"DeckLink Quad (1)"`. |
+| `format` | string | `"auto"` | `"auto"` (card input-format detection) or a DeckLink mode FourCC (`"Hi50"`, `"Hp25"`, …). **Use `auto`.** A forced mode that mismatches the source makes the card report no signal and emit bars — a self-inflicted outage that looks like a cable fault. |
+| `pixel_format` | string | `"uyvy422"` | `"uyvy422"` (8-bit) is the only implemented format. `"v210"` parses but is **rejected at config load** — there is no 10-bit unpacker. |
+| `audio_channels` | u8 | `2` | Embedded-audio channels to capture. Must be `0`, `2`, `8` or `16`; `0` = video-only. 8/16 are implemented but not hardware-verified. |
+| `video_encode` | object | — | **Mandatory** (as for MXL video / ST 2110-20). Standard [`video_encode`](transcoding.md) schema. `chroma` must be `yuv420p` or `yuv422p` and `bit_depth` must be `8` — a constraint of the *capture format* (8-bit 4:2:2), not of any encoder: every backend is reachable, including `h264_auto` / `hevc_auto`. |
+| `audio_encode` | object | *(AAC-LC)* | Optional. **AAC family only** — `aac_lc` / `he_aac_v1` / `he_aac_v2`. Unset gives an AAC-LC default so the flow carries sound. Any other codec warns and the flow continues **video-only** rather than dying. |
+| `pid_overrides` | map | — | Accepted and validated, but **not applied on the SDI path today** — `sdi_io` runs no ingress post-process stage. Set PIDs on the output instead (`pid_map`). |
+
+Validation rejects at config load — not mid-show — `v210`, `bit_depth: 10`,
+`chroma: yuv444p`, an empty `device`, and channel counts outside
+{0, 2, 8, 16}.
+
+**Clocking.** SDI needs **no PTP** and the flow's master clock is never
+consulted on this path: every timestamp comes from the card. The flow
+resolves to the `wallclock` master-clock kind. Note that two SDI ports
+are *not* co-clocked unless the card is genlocked — they cannot be
+assembled into one output program. See
+[`sdi.md`](sdi.md#clocking-the-card-is-the-clock).
+
+**Signal loss does not stop the stream** — the card keeps delivering
+frames (bars/black) with the cable out, and the edge keeps encoding
+them deliberately, because holding the transport stream up is what
+downstream wants. This means bitrate and `state` read healthy on a dead
+feed; `InputStats.sdi_stats.signal_present` is the only honest
+indicator. That distinction is the entire reason this path talks to the
+Blackmagic SDK rather than FFmpeg's `decklink` avdevice.
+
+Build prereqs, the per-port health payload, event catalogue, hardware
+gotchas (connector↔device interleaving on Quad cards) and verification
+recipes: [`docs/sdi.md`](sdi.md).
+
 ---
 
 ## Output Types
@@ -1674,6 +1735,48 @@ for the full event catalogue, including `display_device_unavailable`,
 `display_mode_set_failed`, `display_master_busy`, `display_flip_timeout`,
 `display_audio_open_failed`, `display_decoder_overload`,
 `display_av_drift`, `display_subscriber_lagged`.
+
+### SDI Output (Blackmagic DeckLink playout)
+
+Decodes the flow and plays it out of a Blackmagic **DeckLink** SDI
+connector — video plus embedded audio, scheduled on the card's own
+clock. Same Cargo feature gate as the SDI input (`sdi-decklink`,
+default off).
+
+```json
+{
+  "type": "sdi",
+  "id": "sdi-out1",
+  "name": "SDI monitor",
+  "device": "DeckLink Quad (2)",
+  "mode": "Hi50",
+  "pixel_format": "uyvy422",
+  "audio_channels": 2,
+  "audio_offset_ms": 0,
+  "program_number": null
+}
+```
+
+| Field | Type | Default | Notes |
+|-------|------|---------|-------|
+| `type` | string | — | Always `"sdi"`. |
+| `device` | string | — | **Required**, non-empty. Same namespace as the input's. On 8-port Quad cards mind the connector-pair routing — a sub-device playing out while its own connector carries an input emits on its *pair partner's* connector ([`sdi.md`](sdi.md)). |
+| `mode` | string | — | **Required**, and explicit: a 4-character DeckLink mode FourCC (`"Hi50"`, `"Hp25"`, …). `"auto"` is **rejected at validation** — playout has nothing to auto-detect from. Must match the decoded video's raster; mismatched frames are dropped with `sdi_playout_raster_mismatch` rather than displayed garbled. |
+| `pixel_format` | string | `"uyvy422"` | Only `"uyvy422"` (8-bit); anything else is rejected at config load. 10-bit playout is not implemented. |
+| `audio_channels` | u8 | `2` | `0` / `2` / `8` / `16`; `0` = video-only. The flow's audio is decoded (AAC / MP2 / AC-3 / E-AC-3), interleaved to this channel count and lip-synced to video on the shared playout clock. Fixed **48 kHz** — a non-48 kHz track is dropped with an alarm (no resampler yet). Opus and AC-4 are not handled; those flows play out video-only. |
+| `program_number` | u16 | *(lowest in PAT)* | MPTS down-select, like every other output. `0` is rejected (reserved for the NIT). |
+| `audio_offset_ms` | i32 | `0` | Operator A/V-sync trim, validated to `-1000..=1000`. **Positive delays audio** (plays later — corrects audio-early); **negative advances it**. Applied as a constant shift to each scheduled audio block's card time; the drift-free sample counter is untouched, so the trim never accumulates. Use it to null a residual lip-sync offset measured on a real reference monitor. |
+
+Only **8-bit 4:2:0/4:2:2** decoded video can be packed to UYVY422; a
+4:4:4 or 10-bit source drops frames with
+`sdi_playout_chroma_unsupported` rather than displaying corrupted
+colour. An unsupported `mode`/`device` is **fatal** for the output (a
+retry cannot fix a config problem); a device that vanishes mid-run
+re-opens with backoff.
+
+Cost model: **275 units** (CPU decode, 1080p-class) — the same weight
+as a display output. Full pipeline, telemetry, loopback-verification
+notes and the genlock caveat: [`docs/sdi.md`](sdi.md#sdi-output-playout).
 
 ### Bonded Output
 
