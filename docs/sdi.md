@@ -15,9 +15,11 @@ crate. Upstream tracking issue:
 | Signal-loss / raster-change / device-loss resilience | **Verified by physically pulling the cable** |
 | Per-port hardware status on `HealthPayload` | **Verified** (all 8 ports, live during capture) |
 | Encoder backends | All of them — x264 / x265 / NVENC / QSV / VAAPI / `h264_auto` / `hevc_auto` (x264 + NVENC hardware-verified; QSV/VAAPI compile-verified) |
-| SDI output (playout), video | Edge-integrated (`OutputConfig::Sdi`): broadcast → demux → decode → UYVY repack → card-clock-scheduled playout. Crate layer **verified by physical loopback** (bars photographed) |
+| SDI output (playout), video | Edge-integrated (`OutputConfig::Sdi`): broadcast → demux → decode → UYVY repack → PTS-scheduled playout on the card's clock. Crate layer **verified by physical loopback** (bars photographed) |
 | SDI output, audio | Edge-integrated: AAC/MP2/AC-3/E-AC-3 decode → 48 kHz interleaved → timestamped, lip-synced to video on the card's clock. **Verified on hardware** (loopback audio measured). Opus/AC-4 not handled (video-only); non-48 kHz dropped |
 | 10-bit (`v210`) | Rejected at config validation; unpacker not yet written |
+| Embedded audio onto the ST 2110-30/-31 PCM bus | **Not implemented** — capture audio is AAC-coded into the TS. A -30/-31 output on the flow does emit PCM, but via a PCM→AAC→PCM round-trip; there is no bit-transparent de-embed |
+| VANC / ancillary (SCTE-104, SMPTE 12M timecode, CEA-608/708) | **Not implemented** — no extraction anywhere in the stack; `sdi_devices[].ancillary_locked` is a status bit, not data |
 
 ## Why the Blackmagic SDK and not FFmpeg's `decklink` avdevice
 
@@ -49,13 +51,46 @@ engine::sdi_io  ── unpack_uyvy422 (straight into the encoder's chroma layout
 ```
 
 One device handle carries both essences (unlike MXL, where video and audio
-are separate flows). SDI is self-clocked: **no PTP requirement**; SDI flows
-resolve to the Wallclock master-clock policy alongside TestPattern and
-MediaPlayer.
+are separate flows).
 
 The capture loop runs under `tokio::task::block_in_place`; the encoder and
 muxer state (PCR/PTS continuity) survive device re-opens so receivers never
 see a stream reset across a raster change.
+
+### Clocking: the card is the clock
+
+**No PTP requirement** (unlike ST 2110 / MXL), and the flow's master clock is
+**never consulted on the SDI ingest path**. `sdi_io` derives every timestamp
+from the card itself: video PTS advances one frame period per frame the card
+delivers, audio PTS advances by the sample count the card delivers, and
+`TsMuxer` builds PCR from those. There is no `master.now_27mhz()` anchor and no
+`ts_pts_rewriter` — `sdi_io` builds no `InputPostProcess`, so the muxer-mode
+PTS regeneration that TS-carrying inputs get by default does not apply here.
+The rate of the emitted stream is the card's oscillator, whatever the master
+says.
+
+That is why `MasterClockKind::Wallclock` is the auto-default
+(`master_clock.rs`, alongside TestPattern / MediaPlayer / Replay): the master
+still has to exist and be readable by the rest of the flow, and Wallclock is
+always-locked and monotonic. A source-PCR PLL would be pointless here — it
+would try to recover a clock nothing on this path stamps — and PTP would add a
+grandmaster dependency no SDI code reads.
+
+**"Self-clocked" is not "co-clocked", and the difference bites.** Each SDI port
+is its own free-running oscillator unless the card is genlocked to house
+reference, so two SDI inputs on the *same card* are not on the same clock: they
+drift against each other, slowly and silently. That is exactly the failure
+`ClockIdentity` exists to catch — it is the identity the PID-bus assembler
+checks so every slot in one output program comes from genuinely coherent
+inputs. Two un-genlocked SDI ports must therefore report **different**
+identities and be **refused** for assembly into one program
+(`pid_bus_master_clock_mismatch`), because "video from SDI 1 + audio from
+SDI 2" is a lip-sync error that grows without bound and shows up on no counter.
+Note the asymmetry: sharing the Wallclock *kind* is fine — it is a per-flow
+pacing policy — while sharing a Wallclock *identity* would assert a coherence
+the hardware does not provide. `reference_locked` per port (below) is what
+tells an operator whether house reference is actually patched; the edge does
+not read it back to relax this rule.
 
 ### The 90 kHz PTS contract (load-bearing)
 
@@ -168,11 +203,14 @@ which ports exist).
 ## SDI output (playout)
 
 `decklink-rs::DecklinkPlayout` implements scheduled video **and audio**
-playout: video frames are copied into card memory and scheduled against the
-**card's clock** — a 3-frame pre-roll, then an 8-frame in-flight window whose
-completion callbacks pace the writer (no userspace timers). Audio is
-scheduled via `bmdAudioOutputStreamTimestamped` on the same 90 kHz timeline as
-video, which is what gives hardware A/V lock (see "Edge integration" below).
+playout against the **card's clock** — a 3-frame pre-roll, then an 8-frame
+in-flight window whose completion callbacks pace the writer (no userspace
+timers). The caller owns the timeline: `write_video` takes an explicit
+`stream_time_90k`, and audio is scheduled via
+`bmdAudioOutputStreamTimestamped` on that same 90 kHz timeline, which is what
+gives hardware A/V lock (see "One timeline for both essences" below). The card
+requires strictly ascending display times, so a `stream_time_90k` that does not
+advance is refused (`Error::TimeNotMonotonic`) rather than handed over.
 The crate exposes late frames and dropped frames as **separate** counters
 (`late_frames()` / `dropped_frames()`) — late means displayed behind its slot
 but still shown (soft, scheduling pressure), dropped means never presented
@@ -216,12 +254,54 @@ source drops frames with `sdi_playout_chroma_unsupported` rather than displaying
 corrupted colour. The
 card's completion callbacks pace the pipeline; a bounded hand-off channel
 absorbs jitter and drops (counted on `packets_dropped`) rather than buffering
-latency. Card-reported late/dropped completions fold into `packets_dropped`.
-Keyframe-gated after every decoder (re)open. Audio (when `audio_channels > 0`) is decoded in the same worker, interleaved to 48 kHz 32-bit, and scheduled timestamped at `pts - first_video_pts` on the shared 90 kHz clock for hardware A/V sync; the schedule position then advances drift-free by sample count, re-anchoring only on a discontinuity. Failure modes mirror
+latency. Card-reported **dropped** completions fold into `packets_dropped`;
+card-reported **late** completions do **not** — they surface only on
+`sdi_stats.frames_late` (see Telemetry above), because a late frame *was*
+presented and counting it as loss would misreport a busy host as a broken one.
+Keyframe-gated after every decoder (re)open. Failure modes mirror
 the input: unsupported mode/device is **fatal** (`sdi_playout_mode_unsupported`
 — a retry can never fix a config problem); a device that vanishes mid-run
 re-opens with backoff (`sdi_playout_lost` / `sdi_playout_open_failed` /
 `sdi_playout_opened`). Cost model: 275 units (CPU decode, 1080p-class).
+
+#### One timeline for both essences
+
+Video and audio are placed on a **single 90 kHz timeline**, anchored so that
+the first displayed video frame's PTS is time 0. Each is scheduled from **its
+own source PTS**, `pts - anchor`:
+
+* **Video** — the card time comes from the frame's own PTS, snapped to the
+  playout mode's frame grid (`FrameGrid::slot_of` → `time_of`), and the slot
+  must strictly advance or the frame is dropped. `time_of` is exact rational
+  arithmetic (`slot × 90 000 × den / num`), never `slot × frame_duration`: the
+  card's frame duration is a whole number of ticks, but 59.94 needs 1501.5, and
+  half a tick per frame walks video ~1.2 s away from audio over an hour.
+* **Audio** — decoded, interleaved to 48 kHz 32-bit and scheduled timestamped
+  at its own `pts - anchor`. The running position then advances by exact sample
+  count and re-anchors only on a > 0.5 s divergence (a source discontinuity,
+  not accumulated drift).
+
+The "advances drift-free by sample count" property of the audio accumulator is
+a statement about **audio versus its own source PTS** — it says nothing on its
+own about lip-sync. Sync holds because *both* essences are placed from source
+timestamps on the same timeline, so a frame the edge never writes (decode
+error, raster mismatch, `Busy`, a keyframe wait after a discontinuity) leaves a
+**hole** and every later frame still lands where its timestamp says. Deriving
+video's card time from how many writes *succeeded* — as a naive
+`writes × frame_duration` counter would — is what silently and permanently
+desynchronises the two after a single skipped frame, with nothing in the
+telemetry to show it.
+
+Two consequences worth knowing at a rack:
+
+* Audio placed **before** the anchor has no video to pair with and is dropped.
+  At startup this is expected and deliberate (video pre-roll has already
+  started playback, and dropping past audio is what keeps sync), so it does not
+  alarm. A source that steps its PTS *behind* the first video frame mid-run is
+  a real fault and raises `sdi_playout_audio_stalled`.
+* `audio_offset_ms` shifts only the *scheduled* card time; the sample counter
+  tracks the untrimmed position, so the trim is a constant offset that never
+  accumulates.
 
 ### Hardware gotchas that will cost you a day at a rack
 
@@ -266,10 +346,28 @@ pulling the cable; per-port `HealthPayload.sdi_devices[]`; SDI→SDI loopback
 video (photographed clean) and audio (measured continuous, lip-synced by the
 card clock); config validation rejecting bad chroma/bit-depth/mode at load.
 
-**12-hour soak** (full-duplex SDI in+out, 2-channel embedded audio): 12 h 05 m,
-716 samples, **0** signal losses, **0** capture/output drops, 1 capture
-session (no re-opens), RSS flat at 585 MB (no leak), 100.07 % frame cadence,
-**0** segfaults/panics/encode-failures/audio-warnings.
+**12-hour soak** (full-duplex SDI in+out, 2-channel embedded audio,
+**1080i50**): 12 h 05 m, 716 samples, **0** signal losses, **0** capture/output
+drops, 1 capture session (no re-opens), RSS flat at 585 MB (no leak), 100.07 %
+frame cadence, **0** segfaults/panics/encode-failures/audio-warnings. The run
+is real and it is clean — it is the evidence that capture → encode → mux →
+playout holds up for a full shift without leaking, drifting or wedging.
+
+**What the soak does not cover, and why the raster matters.** It ran at
+1080i50, where the 90 kHz timestamp arithmetic divides exactly: the video
+period is `90 000 × 1/25 = 3600` ticks, and each frame's audio block is
+`48 000/25 = 1920` samples = `1920 × 90 000 / 48 000 = 3600` ticks. Both are
+integers, so at this raster there is no per-frame residue to get wrong — a run
+here cannot exercise the timestamp arithmetic that fractional rasters depend
+on, however long it lasts. The fractional (1000/1001) rates are the hard case:
+at 59.94 the video period is `90 000 × 1001/60 000 = 1501.5` ticks, at 23.976
+it is 3753.75, and the SDK's audio block size must vary at the NTSC rates
+(`48 000/29.97 = 1601.6` samples/frame) where the exact factor is 15/8 per
+sample. A truncated per-frame step would compound there — on the order of
+17 s/day at 23.976 and 29 s/day at 59.94 — which is precisely the regime the
+soak says nothing about. Read it as strong evidence for **integer-rate rasters**
+(25 / 50 / 30 / 60), and treat 59.94 / 29.97 / 23.98 as unverified on a card —
+see "Not yet field-validated" below.
 
 **Automated A/V lip-sync** (media_player → SDI out, loopback capture, a
 freq-step test clip — a 200 ms white flash + 200 ms 3 kHz tone-burst aligned
@@ -291,15 +389,26 @@ against a real reference monitor.
   unsupported chroma, and a wedged card are all handled (drop + throttled
   alarm, or bounded-wait), never `unwrap`/`panic`. The crate is built for a
   long-running broadcast binary.
-* **The reactor never does codec work** — all encode/decode runs under
-  `spawn_blocking`; the async feeder only demuxes.
+* **The reactor never does codec work** — playout decode/encode runs on a
+  `spawn_blocking` worker fed by an async demuxer; capture runs its whole
+  blocking loop (card read → unpack → encode → mux) inside
+  `tokio::task::block_in_place`, which hands the reactor off to another worker
+  thread rather than parking it. Neither path does codec work on a reactor
+  thread, but they get there differently — `block_in_place` requires the
+  multi-thread runtime and would panic under a current-thread one rather than
+  degrade.
 * **Bounded everywhere** — the hand-off channel drops rather than buffers
   latency; the playout write times out rather than hanging on a dead card;
   input switches flush the decoder so they re-anchor on the next keyframe.
 
 **Not yet field-validated** (works in bring-up, needs hardware not on hand):
 
-* Rasters other than 1080i50 (720p / 1080p50 / 2160p).
+* Rasters other than 1080i50 (720p / 1080p50 / 2160p). The **fractional-rate
+  (1000/1001) rasters — 59.94 / 29.97 / 23.98 — are the ones to watch**: they
+  are the only rates whose 90 kHz timestamps do not divide exactly, so they
+  exercise timestamp arithmetic no hardware run has yet covered (see the
+  12-hour soak above). Measure A/V drift over hours, not minutes, before
+  trusting one on air.
 * 8- and 16-channel embedded audio (2-channel verified).
 * QSV / VAAPI encoder backends (compile-verified; no Intel/AMD host to date).
 * The *absolute* lip-sync number against a real monitor — presence,
@@ -318,13 +427,46 @@ against a real reference monitor.
 
 ## Known limitations / roadmap
 
+What is **not** delivered from issue #19, stated plainly — these are scope
+gaps, not bugs waiting to be found:
+
+* **Embedded audio lands as AAC-in-MPEG-TS. There is no bit-transparent PCM
+  path onto the ST 2110-30/-31 bus.** `sdi_io` de-embeds the card's PCM and
+  immediately re-encodes it: `setup_audio` accepts the AAC family only
+  (`aac_lc` / `he_aac_v1` / `he_aac_v2`) and stamps `stream_type 0x0F` into the
+  PMT. The SDI input does not route through `engine::input_pcm_encode`, so
+  `s302m` and raw-PCM carriage are unavailable and the samples are lossily
+  coded before any other output sees them. Whatever a downstream PCM output
+  emits is therefore a **PCM → AAC → PCM** round-trip, never the card's
+  original samples — tolerable for monitoring and for many distribution paths,
+  but not what a -30/-31 essence bus implies, and for ST 2110-31 (AES3
+  transparent) the round-trip defeats the point of the standard.
+* **An ST 2110-30 output on an SDI flow does carry audio — but judge it as a
+  coded feed, not an AES3 tie-line.** `InputConfig::Sdi` is in
+  `engine::audio_decode::input_can_carry_ts_audio`, so a PCM-only audio output
+  (ST 2110-30/-31, `rtp_audio`) on the same flow builds the TS→AAC→PCM bridge
+  in `st2110_io::run_st2110_audio_output` and emits real PCM rather than
+  forwarding raw TS at a receiver expecting RFC 3190. What arrives is the
+  round-trip above, with AAC's coding loss and its added latency baked in.
+  There is no configuration that gets the card's original samples onto a -30
+  essence stream.
+* **VANC / ancillary extraction is entirely absent — there is no SDI →
+  ST 2110-40 path.** No SCTE-104, no SMPTE 12M timecode, no CEA-608/708
+  captions. Nothing in the stack decodes VANC: `decklink-rs` exposes no
+  ancillary API at all, and the only ancillary-adjacent field in the whole
+  subsystem is `sdi_devices[].ancillary_locked` — a **status bit** off
+  `IDeckLinkStatus` reporting that the card's ANC stream is locked. It is not
+  extraction, it carries no payload, and `true` there means only that ANC
+  exists on the wire, not that the edge can see it. Captions, timecode and
+  splice markers on an SDI feed are dropped on the floor today.
 * 10-bit (`v210`) capture unpack — unlocks the 10-bit HEVC hardware paths.
 * HW-decode for the playout path (CPU decode only today); audio resampling (48 kHz-only today); Opus/AC-4 playout audio.
 * 8/16-channel embedded audio and non-1080i50 rasters are implemented but
   not yet hardware-verified.
 * Genlock: playout free-runs against the card clock today (`reference_locked`
   is surfaced per-port so an operator can see whether house reference is
-  patched).
+  patched, but nothing reads it back — see "Clocking" above for why that keeps
+  two SDI ports from ever being treated as co-clocked).
 * Device control (input-connection selection, Quad profile switching) is
   deliberately out of scope until an ownership model exists — a profile
   switch reassigns channels under running flows.

@@ -329,10 +329,24 @@ pub mod output_mxl_audio;
 #[cfg(feature = "mxl")]
 pub mod output_mxl_anc;
 
-/// SDI capture/playout via Blackmagic DeckLink. Wraps FFmpeg's `decklink`
-/// avdevice via the sibling `bilbycast-decklink-rs` crate. Boot probe lives in
-/// `engine::decklink::domain::DecklinkDeviceManager::probe`. Off by default —
-/// gated by the `sdi-decklink` Cargo feature. See `bilbycast-decklink-rs/CLAUDE.md`.
+/// SDI capture/playout via Blackmagic DeckLink. Talks to the Blackmagic
+/// DeckLink SDK directly through a C++ shim in the sibling
+/// `bilbycast-decklink-rs` crate — **not** FFmpeg's `decklink` avdevice.
+///
+/// That is the whole reason the crate and its shim exist, so it is not an
+/// implementation detail to be simplified away: libavdevice substitutes colour
+/// bars on `bmdFrameHasNoInputSource` and offers no way to ask whether the
+/// input is locked, which makes **a pulled cable indistinguishable from a live
+/// feed** — proven on hardware, where an unplugged SDI cable produced no error,
+/// no event, and a perfectly healthy-looking 10 Mbps stream. The SDK path
+/// surfaces that bit as `CapturedVideo::signal_present`, which is what
+/// `sdi_io`'s signal-loss alarm and `InputStats.sdi_stats.signal_present` are
+/// built on. Routing this back through avdevice would silently delete the
+/// single most important failure mode in an SDI plant.
+///
+/// Boot probe lives in `engine::decklink::domain::DecklinkDeviceManager::probe`.
+/// Off by default — gated by the `sdi-decklink` Cargo feature. See
+/// `docs/sdi.md` and `bilbycast-decklink-rs/CLAUDE.md`.
 #[cfg(feature = "sdi-decklink")]
 pub mod decklink;
 #[cfg(feature = "sdi-decklink")]
