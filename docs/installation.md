@@ -512,6 +512,49 @@ On a host without an NVIDIA driver, select `codec: "x264"` or
 `"x265"` instead. The same binary supports every compiled-in
 encoder; the choice is per-flow.
 
+#### cgroup device access under the packaged systemd unit
+
+Adding the running user to the `video` group is **necessary but not
+sufficient** when the edge runs under `packaging/bilbycast-edge.service`.
+The hardened unit carries `DeviceAllow=` rules, and any `DeviceAllow=`
+entry implicitly switches the service's `DevicePolicy` to `closed` — the
+cgroup device controller then denies every node not on the allow-list,
+regardless of file permissions or group membership. The unit therefore
+allow-lists the NVIDIA CUDA compute char classes alongside the DRM /
+ALSA ones:
+
+```ini
+DeviceAllow=char-nvidia rwm
+DeviceAllow=char-nvidia-frontend rwm
+DeviceAllow=char-nvidia-uvm rwm
+```
+
+`char-nvidia` covers `/dev/nvidia0`… and `/dev/nvidiactl` (both are
+char-major 195); `char-nvidia-frontend` is the same major under its
+legacy `/proc/devices` group name, present on the proprietary / 470xx
+branches; `char-nvidia-uvm` is the CUDA unified-memory node
+(`/dev/nvidia-uvm`). The display-only `char-nvidia-modeset` class is not
+required for NVENC / NVDEC. If you run the edge under your own unit or a
+drop-in, replicate these lines or NVENC fails at session create with a
+permission error even though `nvidia-smi` works. Keep each rule on its
+own line with no trailing comment — systemd parses a `#` after the value
+as part of the device-rights token and silently drops the rule.
+
+> **`NoNewPrivileges=true` + `/dev/nvidia-uvm`.** The packaged unit sets
+> `NoNewPrivileges=true`, which blocks the setuid `nvidia-modprobe`
+> helper that the CUDA runtime uses to lazily create `/dev/nvidia-uvm`
+> on first use. On a host that does not otherwise bring the UVM node up,
+> it will be **absent** when the edge starts and NVENC fails despite the
+> `DeviceAllow=` rules above. Ensure the node exists before start by
+> enabling `nvidia-persistenced`:
+> ```bash
+> sudo systemctl enable --now nvidia-persistenced
+> ```
+> or preload the kernel module so the device is created at boot:
+> ```bash
+> echo nvidia_uvm | sudo tee /etc/modules-load.d/nvidia-uvm.conf
+> ```
+
 ### Running on an Intel host (QuickSync / QSV)
 
 The `*-x86_64-linux-full` binary also compiles in the FFmpeg →

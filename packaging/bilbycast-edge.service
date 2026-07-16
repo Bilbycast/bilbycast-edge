@@ -38,6 +38,18 @@ NoNewPrivileges=true
 # a hardcoded /dev/dri/cardN list breaks on the third GPU.
 DeviceAllow=char-drm rwm
 DeviceAllow=char-alsa rwm
+# NVIDIA CUDA compute char classes for NVENC / NVDEC. Any DeviceAllow=
+# implicitly flips DevicePolicy to `closed`, so without these the
+# hardened unit blocks /dev/nvidia* even for a user in the `video`
+# group. These are the compute nodes only — display-side
+# char-nvidia-modeset is deliberately omitted.
+#   char-nvidia          — /dev/nvidia0.. + /dev/nvidiactl (char-major 195)
+#   char-nvidia-frontend — legacy/proprietary/470xx drivers: major 195 is
+#                          the 'nvidia-frontend' group, not 'nvidia'
+#   char-nvidia-uvm      — CUDA unified memory (/dev/nvidia-uvm)
+DeviceAllow=char-nvidia rwm
+DeviceAllow=char-nvidia-frontend rwm
+DeviceAllow=char-nvidia-uvm rwm
 SupplementaryGroups=video render audio
 # CAP_NET_ADMIN — required by kernel ≥ 6.x for setsockopt(SO_TXTIME)
 # with CLOCK_TAI. Without it, wire-emit falls back to clock_nanosleep.
