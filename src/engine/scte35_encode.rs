@@ -3,6 +3,13 @@
 
 //! Pure-Rust SCTE-104 single-operation to SCTE-35 `splice_insert` encoder.
 
+// This whole module (the SCTE-35 section codec) is wired only into the SDI VANC
+// SCTE-35 paths — `engine::sdi_io` (extraction) and `engine::output_sdi`
+// (injection), both `#[cfg(feature = "sdi-decklink")]`. Its unit tests run
+// unconditionally, so it stays compiled in every build; silence dead-code only
+// when that consuming feature is compiled out.
+#![cfg_attr(not(feature = "sdi-decklink"), allow(dead_code))]
+
 use crate::engine::st2110::scte104::{Scte104Message, SpliceOpcode};
 use crate::engine::ts_parse::mpeg2_crc32;
 

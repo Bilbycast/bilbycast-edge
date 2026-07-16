@@ -288,12 +288,16 @@ impl TsMuxer {
     }
 
     /// Advertise a raw SCTE-35 section stream (`stream_type 0x86`) in the PMT.
+    // Wired only into the SDI VANC SCTE-35 extraction path (`engine::sdi_io`,
+    // `#[cfg(feature = "sdi-decklink")]`) + unit tests.
+    #[cfg_attr(not(feature = "sdi-decklink"), allow(dead_code))]
     pub fn set_scte35_stream(&mut self, pid: u16) {
         self.scte35_pid = pid;
         self.has_scte35 = true;
     }
 
     /// Packetize a complete SCTE-35 `splice_info_section` directly (no PES).
+    #[cfg_attr(not(feature = "sdi-decklink"), allow(dead_code))] // SDI VANC path only
     pub fn mux_scte35(&mut self, section: &[u8]) -> Vec<Bytes> {
         if !self.has_scte35 || section.is_empty() {
             return Vec::new();

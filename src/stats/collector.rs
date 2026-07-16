@@ -2561,6 +2561,9 @@ impl SdiCaptureStats {
     /// Store the latest decoded timecode (or clear it with `None`) for the
     /// next stats snapshot to pick up. Lock-free — safe to call from the
     /// blocking SDI capture thread on every frame.
+    // Called only by the SDI VANC timecode-extraction path (`engine::sdi_io`,
+    // `#[cfg(feature = "sdi-decklink")]`) + unit tests.
+    #[cfg_attr(not(feature = "sdi-decklink"), allow(dead_code))]
     pub fn store_timecode(&self, tc: Option<crate::engine::st2110::timecode::Timecode>) {
         let packed = match tc {
             None => 0,
@@ -2598,6 +2601,9 @@ impl SdiCaptureStats {
     /// caller's own cumulative-for-this-session view (not just the type of
     /// the packet just decoded), so a CEA-708-only source doesn't get its
     /// CEA-608 flag flapped back to `false` by an unrelated packet.
+    // Called only by the SDI VANC caption-detection path (`engine::sdi_io`,
+    // `#[cfg(feature = "sdi-decklink")]`) + unit tests.
+    #[cfg_attr(not(feature = "sdi-decklink"), allow(dead_code))]
     pub fn set_captions_present(&self, cea608: bool, cea708: bool) {
         self.captions_cea608_present.store(cea608, Ordering::Relaxed);
         self.captions_cea708_present.store(cea708, Ordering::Relaxed);

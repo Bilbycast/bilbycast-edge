@@ -72,6 +72,11 @@ pub enum DemuxedFrame {
     /// `demux()` return Vec.
     Discontinuity,
     /// Complete SCTE-35 `splice_info_section` from a PMT stream_type 0x86 PID.
+    // The section bytes are read only by the SDI VANC SCTE-35 injection path
+    // (`engine::output_sdi`, `#[cfg(feature = "sdi-decklink")]`); every other
+    // consumer matches `Scte35(_)`. The variant is always constructed, so keep
+    // the payload and silence the unused-field lint when SDI is compiled out.
+    #[cfg_attr(not(feature = "sdi-decklink"), allow(dead_code))]
     Scte35(Vec<u8>),
     /// Complete H.264 access unit (one or more NALUs in Annex B format).
     H264 {
