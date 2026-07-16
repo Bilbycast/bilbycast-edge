@@ -446,8 +446,20 @@ pub fn detect_arch() -> String {
 }
 
 /// Detect the running build's variant tag based on compiled-in features.
+///
+/// The tag is matched against the signed manifest's per-artefact `variant`
+/// field (`manifest::pick_artefact`), so a node only ever auto-selects an
+/// artefact built with the same feature class it is running.
 fn default_variant() -> &'static str {
-    if cfg!(any(
+    // Checked FIRST: a build carrying the Rockchip RKMPP encoder reports its
+    // own `rockchip` variant so only real RK3568/RK3588 nodes select the
+    // `aarch64-linux-rockchip` artefact — that binary links librockchip_mpp
+    // dynamically (a NEEDED entry a generic aarch64 host lacks), so a plain
+    // aarch64 node must never pull it. The Rockchip build also bundles
+    // x264/x265, so this branch must win over the `full` check below.
+    if cfg!(feature = "video-encoder-rkmpp") {
+        "rockchip"
+    } else if cfg!(any(
         feature = "video-encoder-x264",
         feature = "video-encoder-x265",
     )) {

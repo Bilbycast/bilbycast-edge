@@ -67,6 +67,18 @@ for sha_file in "${ARTIFACT_DIR}"/*.tar.gz.sha256; do
     bare="${tarball_name#bilbycast-edge-}"
     bare="${bare%.tar.gz}"
     case "${bare}" in
+        *-linux-rockchip)
+            # Rockchip = the aarch64 full bundle PLUS the RK3568/RK3588 RKMPP
+            # HW encoder, shipped as a distinct VARIANT in the SAME arch bucket
+            # (arch stays aarch64-linux). An edge compiled with
+            # `video-encoder-rkmpp` reports variant `rockchip`
+            # (src/upgrade/mod.rs::default_variant) and selects this artefact,
+            # while generic aarch64 nodes keep pulling `full`. Must precede the
+            # `*-linux` arm (which would otherwise not match, but keep it first
+            # for clarity).
+            arch="${bare%-rockchip}"
+            variant="rockchip"
+            ;;
         *-linux-full)
             arch="${bare%-full}"
             variant="full"

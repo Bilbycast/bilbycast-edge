@@ -112,12 +112,19 @@ capability, which the VPU also does but bilbycast doesn't yet select). A
 10-bit or 4:2:2 request on a Rockchip box therefore falls back to libx265
 (SW) — the `h264_auto` / `hevc_auto` resolver places `rkmpp` first in the
 4:2:0-8-bit chains only, so it can never be picked for a format it can't do.
-`video-encoder-rkmpp` must be built on a **native aarch64 Rockchip host**
-(the build links `librockchip_mpp` >= 1.3.8 via pkg-config; there is no
-`rockchip_mpp` on x86_64) and is deliberately excluded from the x86_64
-`video-encoders-full` composite — the aarch64 Rockchip `*-full` release job
-lists it explicitly. Runtime needs the Rockchip BSP kernel's MPP driver
-(`/dev/mpp_service`) and the running user in the `video` group.
+`video-encoder-rkmpp` links `librockchip_mpp` >= 1.3.8 via pkg-config, so it
+builds on **any aarch64 host that has the Rockchip MPP userspace dev package**
+(`librockchip-mpp-dev`) — the VPU / `/dev/mpp_service` is a *runtime* dependency
+only and is **not** needed to compile. There is no `rockchip_mpp` on x86_64, so
+it is excluded from the x86_64 `video-encoders-full` composite. The release
+matrix ships it as a dedicated **`aarch64-linux-rockchip`** artefact (built on a
+stock `ubuntu-24.04-arm` runner with `librockchip-mpp-dev` from
+`ppa:jjriek/rockchip-multimedia`); the generic `aarch64-linux-full` build omits
+it because `librockchip_mpp` links **dynamically** and its `NEEDED` entry would
+otherwise break the binary on non-Rockchip ARM hosts. An edge compiled with
+rkmpp reports upgrade variant `rockchip` and auto-selects that artefact. Runtime
+needs a Rockchip BSP kernel exposing the MPP driver (`/dev/mpp_service`), the
+BSP's `librockchip_mpp.so`, and the running user in the `video` group.
 
 **Known RKMPP limitation — on-demand forced IDR.** The seamless-input-switch
 path asks the encoder for an immediate keyframe (`force_next_keyframe()` →

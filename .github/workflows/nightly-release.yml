@@ -100,6 +100,34 @@ jobs:
             artifact_suffix: aarch64-linux-full
             variant: full
             cargo_features: "video-encoder-x264 video-encoder-x265 video-encoder-nvenc video-encoder-vaapi video-decoder-nvdec video-decoder-vaapi display mxl mxl-not-built sdi-decklink"
+          # ─── Rockchip variant: aarch64 full bundle PLUS the RK3568/RK3588
+          # RKMPP hardware H.264/HEVC encoder (h264_rkmpp / hevc_rkmpp, 8-bit
+          # 4:2:0). Built NATIVELY on the same ubuntu-24.04-arm runner — no
+          # Rockchip hardware is needed to compile: the FFmpeg rkmpp encoder
+          # links against the userspace librockchip_mpp only; the VPU +
+          # /dev/mpp_service are a RUNTIME dependency (see the RKMPP dep step).
+          # Shipped as a SEPARATE artefact rather than folded into
+          # `aarch64-linux-full` because (a) librockchip_mpp is a Rockchip-BSP
+          # userspace lib absent from stock Ubuntu, so it must be materialised
+          # onto the runner, and (b) it links DYNAMICALLY (unlike the static
+          # x264/x265) — a generic aarch64 host without the BSP could not run a
+          # binary carrying that NEEDED entry, so it must not contaminate the
+          # generic aarch64-full build. NVENC / QSV / VAAPI are dropped: none
+          # exist on Rockchip, and dropping VAAPI also sheds the libva.so
+          # runtime NEEDED that a minimal RK3588 BSP rootfs usually lacks.
+          # x264/x265 stay for the documented CPU fallback on 10-bit / 4:2:2
+          # (rkmpp is 8-bit 4:2:0 only — see docs/codec-matrix.md). Suffix
+          # `aarch64-linux-rockchip` → build-manifest.sh emits
+          # (arch=aarch64-linux, variant=rockchip); an edge compiled with rkmpp
+          # reports variant `rockchip` (src/upgrade/mod.rs::default_variant) so
+          # ONLY real Rockchip nodes auto-select it while generic aarch64-full
+          # nodes keep pulling `full`.
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            artifact_suffix: aarch64-linux-rockchip
+            variant: full
+            rkmpp: "true"
+            cargo_features: "video-encoder-x264 video-encoder-x265 video-encoder-rkmpp display mxl mxl-not-built sdi-decklink"
     runs-on: ${{ matrix.runner }}
     steps:
       # Runs before any checkout / apt / x264-from-source / cargo, so a missing
@@ -346,6 +374,43 @@ jobs:
           # the edge's zero-copy KMS scanout (`vaapi_map_to_drm`).
           sudo apt-get install -y libva-dev libdrm-dev
 
+      - name: Install RKMPP (Rockchip MPP) build dependency
+        if: matrix.rkmpp == 'true'
+        run: |
+          # video-encoder-rkmpp needs pkg-config `rockchip_mpp >= 1.3.8`
+          # (ships rockchip_mpp.pc + librockchip_mpp.so) at BUILD time —
+          # libffmpeg-video-sys/build.rs hard-probes it and FFmpeg's
+          # `configure --enable-rkmpp` requires it. NONE of this touches the
+          # VPU: it is a userspace header+symbol/link check, so the encoder
+          # builds fine on this non-Rockchip Ampere/Neoverse runner and only
+          # opens /dev/mpp_service at RUNTIME on a real RK3568/RK3588.
+          # libdrm-dev is already installed by the VAAPI step above (rkmpp
+          # also mandates --enable-libdrm).
+          #
+          # rockchip_mpp is NOT in stock Ubuntu, so add the maintained
+          # `ppa:jjriek/rockchip-multimedia` (Joshua Riek's ubuntu-rockchip),
+          # which publishes librockchip-mpp-dev for noble arm64 at MPP 1.5.0
+          # (>= 1.3.8). It links DYNAMICALLY; the shipped binary carries a
+          # runtime DT_NEEDED on librockchip_mpp.so.1, satisfied by the
+          # Rockchip BSP userspace on the deployed board.
+          #
+          # NOTE (needs a real release run to confirm): if this PPA is ever
+          # unavailable for the runner's series/arch, the fallback is an in-job
+          # cmake build of github.com/rockchip-linux/mpp pinned to a commit
+          # (it vendors its own uapi and builds without the VPU), installed to
+          # a prefix on PKG_CONFIG_PATH — same idiom as the x264 source build.
+          sudo apt-get install -y software-properties-common
+          sudo add-apt-repository -y ppa:jjriek/rockchip-multimedia
+          sudo apt-get update
+          sudo apt-get install -y librockchip-mpp-dev
+          # Record the MPP provenance for the LGPL corresponding-source note
+          # (mirrors x264-SOURCES.txt); MPP is LGPLv2.1+, dynamic-linked.
+          MPP_VER="$(pkg-config --modversion rockchip_mpp 2>/dev/null || echo unknown)"
+          printf 'librockchip_mpp corresponding source (LGPLv2.1+, dynamically linked)\nsource: https://github.com/rockchip-linux/mpp\npackaged-by: ppa:jjriek/rockchip-multimedia (librockchip-mpp-dev)\nversion: %s\n' \
+            "${MPP_VER}" > "$HOME/rockchip-mpp-SOURCES.txt"
+          echo "MPP_SOURCES_FILE=$HOME/rockchip-mpp-SOURCES.txt" >> "$GITHUB_ENV"
+          echo "rockchip_mpp version: ${MPP_VER}"
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -358,9 +423,14 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             bilbycast-edge/target
-          key: ${{ matrix.target }}-${{ matrix.variant }}-cargo-edge-${{ hashFiles('bilbycast-edge/Cargo.lock') }}
+          # Keyed on artifact_suffix, not target+variant: the two aarch64
+          # entries (aarch64-linux-full and aarch64-linux-rockchip) share the
+          # same target AND variant, so a target+variant key would collide their
+          # target/ dirs even though their feature sets (and thus artefacts)
+          # differ. artifact_suffix is unique per matrix entry.
+          key: ${{ matrix.artifact_suffix }}-cargo-edge-${{ hashFiles('bilbycast-edge/Cargo.lock') }}
           restore-keys: |
-            ${{ matrix.target }}-${{ matrix.variant }}-cargo-edge-
+            ${{ matrix.artifact_suffix }}-cargo-edge-
 
       - name: Build release binary
         working-directory: bilbycast-edge
@@ -426,15 +496,28 @@ jobs:
           fi
 
           echo "=== Checking VAAPI ==="
-          if ! ldd "${BINARY}" | grep -qE 'libva\.'; then
-            echo "ERROR: binary is missing libva linkage (VAAPI)"
-            exit 1
+          if [ "${{ matrix.rkmpp }}" = "true" ]; then
+            # The Rockchip variant deliberately drops VAAPI (no VAAPI-capable
+            # GPU on RK3568/RK3588 — Rockchip uses MPP/RGA), which also sheds
+            # the libva.so runtime NEEDED that a minimal RK3588 BSP rootfs
+            # usually lacks. Assert it is genuinely absent.
+            if ldd "${BINARY}" | grep -qE 'libva\.|libva-drm\.'; then
+              echo "ERROR: rockchip binary unexpectedly links libva (VAAPI should be dropped)"
+              ldd "${BINARY}" | grep -E 'libva' || true
+              exit 1
+            fi
+            echo "OK: rockchip variant has no VAAPI linkage (expected)"
+          else
+            if ! ldd "${BINARY}" | grep -qE 'libva\.'; then
+              echo "ERROR: binary is missing libva linkage (VAAPI)"
+              exit 1
+            fi
+            if ! ldd "${BINARY}" | grep -qE 'libva-drm\.'; then
+              echo "ERROR: binary is missing libva-drm linkage (VAAPI render-node backend)"
+              exit 1
+            fi
+            echo "OK: links libva and libva-drm (VAAPI)"
           fi
-          if ! ldd "${BINARY}" | grep -qE 'libva-drm\.'; then
-            echo "ERROR: binary is missing libva-drm linkage (VAAPI render-node backend)"
-            exit 1
-          fi
-          echo "OK: links libva and libva-drm (VAAPI)"
 
           echo "=== Checking display-output linkage (libasound2) ==="
           if ! ldd "${BINARY}" | grep -qE 'libasound\.'; then
@@ -473,6 +556,39 @@ jobs:
           # the mxl-* capability bits accordingly.
           echo "OK: MXL runtime-only (dlopen), no link-time check"
 
+          echo "=== Checking RKMPP (Rockchip) ==="
+          if [ "${{ matrix.rkmpp }}" = "true" ]; then
+            # rkmpp is the ONE dynamic media dep in this variant: FFmpeg's
+            # h264_rkmpp / hevc_rkmpp link librockchip_mpp.so, so a NEEDED entry
+            # here is EXPECTED and correct — the OPPOSITE polarity of the
+            # static x264/x265 gate above. Its presence also proves FFmpeg was
+            # built with --enable-rkmpp; nothing else pulls librockchip_mpp.
+            # At runtime the deployed RK3568/RK3588 board provides the
+            # BSP's librockchip_mpp.so.1 + /dev/mpp_service.
+            if ! ldd "${BINARY}" | grep -qE 'librockchip_mpp'; then
+              echo "ERROR: rockchip binary is missing librockchip_mpp linkage — rkmpp did not compile in."
+              echo "  Check the 'Install RKMPP build dependency' step and the cargo_features list."
+              exit 1
+            fi
+            # Positive symbol check — FFmpeg (and its rkmpp AVCodec descriptors)
+            # is statically linked, so nm sees the encoder symbol; the release
+            # binary is not stripped (same assumption as the x264/x265 check).
+            if ! nm "${BINARY}" 2>/dev/null | grep -qiE 'rkmpp'; then
+              echo "ERROR: no rkmpp symbol found in binary (encoder not wired in?)"
+              exit 1
+            fi
+            echo "OK: RKMPP compiled in (h264_rkmpp/hevc_rkmpp), librockchip_mpp dynamically linked (expected)"
+          else
+            # librockchip_mpp must never leak into the x86_64 or generic
+            # aarch64-full artefacts — those run on hosts without the Rockchip
+            # BSP and a NEEDED entry would make them refuse to start.
+            if ldd "${BINARY}" | grep -qE 'librockchip_mpp'; then
+              echo "ERROR: non-rockchip binary unexpectedly links librockchip_mpp"
+              exit 1
+            fi
+            echo "OK: no RKMPP linkage (expected on non-rockchip variants)"
+          fi
+
       - name: Package tarball
         run: |
           VERSION="${{ needs.check-version.outputs.version }}"
@@ -496,6 +612,12 @@ jobs:
           # (libx264 is built from source on the runner; see the x264 step).
           if [ -n "${X264_SOURCES_FILE:-}" ] && [ -f "${X264_SOURCES_FILE}" ]; then
             cp "${X264_SOURCES_FILE}" "${STAGE}/SOURCES-x264.txt"
+          fi
+
+          # Record the librockchip_mpp provenance for the LGPL corresponding-
+          # source note on the Rockchip artefact (dynamically linked, LGPLv2.1+).
+          if [ -n "${MPP_SOURCES_FILE:-}" ] && [ -f "${MPP_SOURCES_FILE}" ]; then
+            cp "${MPP_SOURCES_FILE}" "${STAGE}/SOURCES-rockchip-mpp.txt"
           fi
 
           # Fill in `{VER}` and `<org>` placeholders in the NOTICE so the
@@ -656,6 +778,7 @@ jobs:
 
           - \`bilbycast-edge-x86_64-linux-full.tar.gz\` — Linux x86_64 (amd64) — encoders: x264 + x265 + NVENC + QSV + VAAPI; display HW decode: NVDEC + QSV + VAAPI
           - \`bilbycast-edge-aarch64-linux-full.tar.gz\` — Linux ARM64 (aarch64) — encoders: x264 + x265 + NVENC + VAAPI; display HW decode: NVDEC + VAAPI
+          - \`bilbycast-edge-aarch64-linux-rockchip.tar.gz\` — Linux ARM64 **Rockchip RK3568/RK3588** (NanoPi R5S/R6S, Orange Pi 5, Radxa Rock 5B…) — adds the **RKMPP** hardware H.264/HEVC encoder (\`h264_rkmpp\` / \`hevc_rkmpp\`, 8-bit 4:2:0) on top of x264 + x265 CPU fallback; **no** NVENC/QSV/VAAPI (none exist on Rockchip). **Runtime prereqs:** a Rockchip **BSP kernel** exposing \`/dev/mpp_service\` plus the BSP's \`librockchip_mpp.so\` (this binary links it dynamically) and the running user in the \`video\` group. Edges compiled with rkmpp auto-select this artefact (upgrade variant \`rockchip\`). See \`docs/installation.md\` §ARM Rockchip.
 
           **MXL** (Media eXchange Layer) support is compiled in. MXL is a shared-memory IPC protocol — the edge discovers the system-installed \`libmxl.so\` at runtime via \`dlopen\` and advertises MXL capabilities only when the library is present. Install MXL system-wide so all MXL-speaking applications on the host share the same library.
 
@@ -691,6 +814,8 @@ jobs:
             artifacts/bilbycast-edge-x86_64-linux-full.tar.gz.sha256 \
             artifacts/bilbycast-edge-aarch64-linux-full.tar.gz \
             artifacts/bilbycast-edge-aarch64-linux-full.tar.gz.sha256 \
+            artifacts/bilbycast-edge-aarch64-linux-rockchip.tar.gz \
+            artifacts/bilbycast-edge-aarch64-linux-rockchip.tar.gz.sha256 \
             artifacts/manifest.json \
             artifacts/manifest.sig.bundle \
             bilbycast-edge/packaging/install-edge.sh \

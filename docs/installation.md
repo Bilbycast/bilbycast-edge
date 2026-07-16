@@ -359,9 +359,22 @@ every full release ships SDI.
 Rockchip boards (NanoPi R5S/R6S, Orange Pi 5, Radxa Rock 5B, …) have an
 on-chip VPU reachable through the Rockchip **Media Process Platform (MPP)**.
 Building with `--features video-encoder-rkmpp` adds the `h264_rkmpp` /
-`hevc_rkmpp` FFmpeg encoders (both **8-bit 4:2:0 only**). The build must run
-**on the aarch64 Rockchip host itself** — there is no `rockchip_mpp` on
-x86_64, so this feature cannot be cross-compiled from an x86 runner.
+`hevc_rkmpp` FFmpeg encoders (both **8-bit 4:2:0 only**).
+
+**Prefer the prebuilt binary.** The release matrix publishes a dedicated
+`bilbycast-edge-aarch64-linux-rockchip.tar.gz` artefact with rkmpp already
+compiled in (plus x264 / x265 CPU fallback for 10-bit / 4:2:2). On a stock
+Rockchip BSP you can install that directly instead of building, and the
+manager's remote-upgrade path auto-selects it for nodes running the Rockchip
+variant. Build from source only when you need a custom feature set.
+
+**Building from source.** rkmpp links `librockchip_mpp` (>= 1.3.8) via
+pkg-config. The build needs that userspace dev package present, but **not** the
+VPU itself — `/dev/mpp_service` is a *runtime* dependency, so a native aarch64
+build works on any aarch64 host with `librockchip-mpp-dev` (a Rockchip board is
+the obvious choice, but not required just to compile). There is no
+`rockchip_mpp` on x86_64, so a plain x86 build is not possible without an
+aarch64 sysroot carrying the MPP libs.
 
 ```bash
 # Rockchip BSP dev packages (ship rockchip_mpp.pc >= 1.3.8) + libdrm
