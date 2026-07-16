@@ -90,18 +90,18 @@ Events are queued in an unbounded in-memory channel. When the edge is not connec
 > category. The PLL fallback / recovery events below use a separate
 > **`master_clock`** category.
 
-### SDI (`sdi` / `flow`, `sdi-decklink` feature)
+### SDI (`sdi`, `sdi-decklink` feature)
 
 Native SDI (Blackmagic DeckLink) capture and playout. Every event carries an
 `error_code`; match alarm rules on that, never on message text.
 
-Both halves carry structured `details`. **The category differs**: playout
-(`engine::output_sdi`) emits on the `sdi` category via
-`emit_output_with_details`, while capture (`engine::sdi_io`) emits on the
-`flow` category via its local `emit_sdi` helper (which scopes the event to
-both `flow_id` and `input_id`, so the UI can hang the alarm on the input's
-row). Rules that key off `error_code` work across both; rules that key off
-category must accept `flow` for capture today.
+Both halves carry structured `details` and emit on the **`sdi`** category:
+playout (`engine::output_sdi`) via `emit_output_with_details`, capture
+(`engine::sdi_io`) via its local `emit_sdi` helper (which additionally scopes
+the event to both `flow_id` and `input_id`, so the UI can hang the alarm on the
+input's row). The manager keys alarm rules on **both** `category` and
+`error_code`, so a single category-scoped `sdi` rule catches capture and
+playout alike; a rule keyed only on `error_code` works regardless.
 
 The governing design intent: **signal loss never stops the transport stream**.
 The card substitutes bars/black, and the edge keeps encoding them deliberately
@@ -110,7 +110,7 @@ instead of a silently healthy-looking stream — which is the entire reason this
 path talks to the Blackmagic SDK rather than FFmpeg's `decklink` avdevice, where
 that bit is unavailable.
 
-#### Capture (`engine::sdi_io`, category `flow`, structured `details`)
+#### Capture (`engine::sdi_io`, category `sdi`, structured `details`)
 
 | Severity | error_code | Trigger / behaviour |
 |----------|------------|---------------------|
@@ -763,7 +763,7 @@ These are generated server-side in `bilbycast-manager/crates/manager-server/src/
 | `nmos` | — | NMOS IS-04 / IS-05 / IS-08 controller activity (Phase 1) |
 | `nmos_registry` | 4 | IS-04 registration client lifecycle (registered, heartbeat lost, registration failed, registry unreachable) |
 | `scte104` | — | SCTE-104 splice events parsed from ST 2110-40 ANC (Phase 1) |
-| `sdi` | 11 | Native SDI (DeckLink) **playout** lifecycle — device open refused / lost, raster or chroma the mode cannot carry, a card that stops draining scheduled frames, audio that stops scheduling. `sdi-decklink` feature. SDI **capture** events still ride `flow`; see the [SDI section](#sdi-sdi--flow-sdi-decklink-feature) |
+| `sdi` | 28 | Native SDI (DeckLink) capture **and** playout lifecycle — signal lost/restored, raster or chroma the mode cannot carry, device open refused / lost, a card that stops draining scheduled frames, audio that stops scheduling. `sdi-decklink` feature. See the [SDI section](#sdi-sdi-sdi-decklink-feature) |
 | **Total** | **100** | |
 
 ### Phase 1 ST 2110 categories

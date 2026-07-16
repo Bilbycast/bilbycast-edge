@@ -58,9 +58,14 @@ use crate::stats::collector::OutputStatsAccumulator;
 
 /// Emit an SDI-input event.
 ///
-/// `details` carries the `error_code`: the manager matches alarm rules against
-/// `details.error_code` alone and never reads the message text. The flow *and*
-/// input scope are both set so the UI can attach the alarm to the input's row.
+/// Emitted under `category::SDI` — the same category the SDI *output* path uses
+/// and the one the `category::SDI` doc contract promises — so a category-scoped
+/// `sdi` alarm rule catches capture events (signal lost/restored, raster change,
+/// capture-open failure) as well as playout events. `details` carries the
+/// `error_code`; the manager keys triggers on **both** `category` and
+/// `error_code`, so the two must agree (a mismatched category silently drops the
+/// alarm). The flow *and* input scope are both set so the UI can attach the
+/// alarm to the input's row.
 fn emit_sdi(
     event_sender: &EventSender,
     severity: EventSeverity,
@@ -71,7 +76,7 @@ fn emit_sdi(
 ) {
     event_sender.send(Event {
         severity,
-        category: category::FLOW.to_string(),
+        category: category::SDI.to_string(),
         message,
         details: Some(details),
         flow_id: Some(flow_id.to_string()),
