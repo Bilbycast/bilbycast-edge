@@ -13,6 +13,7 @@ crate. Upstream tracking issue:
 | SDI input, video (UYVY422 8-bit, any raster the card detects) | **Verified on hardware** (1080i50, DeckLink Quad) |
 | SDI input, embedded audio (2 ch → AAC) | **Verified on hardware** (8/16 ch untested) |
 | SCTE-104 VANC extraction → SCTE-35 PID | Implemented and unit-verified; live VANC source verification pending |
+| SMPTE 12M timecode / CEA-608/708 caption VANC extraction | Implemented and unit-verified (round-trip + presence-transition logic); live VANC source verification pending |
 | Signal-loss / raster-change / device-loss resilience | **Verified by physically pulling the cable** |
 | Per-port hardware status on `HealthPayload` | **Verified** (all 8 ports, live during capture) |
 | Encoder backends | All of them — x264 / x265 / NVENC / QSV / VAAPI / `h264_auto` / `hevc_auto` (x264 + NVENC hardware-verified; QSV/VAAPI compile-verified) |
@@ -95,6 +96,8 @@ capability.
   "pixel_format": "uyvy422",
   "audio_channels": 2,
   "scte35_extraction": true,
+  "timecode_extraction": true,
+  "captions_extraction": true,
   "video_encode": {
     "codec": "h264_nvenc", "chroma": "yuv420p",
     "tune": "", "preset": "fast", "rate_control": "cbr",
@@ -110,6 +113,8 @@ capability.
 | `pixel_format` | `"uyvy422"` | `"v210"` (10-bit) is rejected at validation — no unpacker yet. |
 | `audio_channels` | 0 / 2 / 8 / 16 | 0 = video-only. AAC family output only; encoder-init failure degrades to video-only with a Warning, never kills the flow. |
 | `scte35_extraction` | boolean (default `false`) | Translate SCTE-104 VANC cue-out/cue-in/cancel into SCTE-35 PID `0x01FC` (stream type `0x86`). |
+| `timecode_extraction` | boolean (default `false`) | Decode SMPTE 12M-2 ATC VANC timecode (DID `0x60`) into a live `InputStats.sdi_stats.timecode` field. Continuous state (updates every frame on a locked source), not an event. |
+| `captions_extraction` | boolean (default `false`) | Detect CEA-608/708 caption presence from VANC (DID `0x61`) — presence and cc_count only, not caption text. Fires `sdi_captions_detected` once per session per caption type. |
 | `video_encode` | mandatory | Same schema as everywhere else. `chroma` must be `yuv420p` or `yuv422p` at 8-bit (capture is 8-bit 4:2:2); every backend including `h264_auto`/`hevc_auto` works. |
 
 Validation rejects — at config load, not mid-show — `v210`, `bit_depth: 10`,
@@ -126,6 +131,7 @@ Three failure modes, deliberately handled differently. All events ride the
 | info | `sdi_signal_restored` | Signal came back. |
 | info | `sdi_capture_opened` | Capture (re)opened; message carries raster + rate + session number. |
 | info | `sdi_scte35_emitted` | An SCTE-104 cue was translated and emitted; carries event ID and opcode. |
+| info | `sdi_captions_detected` | CEA-608 or CEA-708 captions seen for the first time this session; carries the caption type and cc_count. Fires once per type per session — no "lost" transition, since caption gaps are normal even on a healthy source. |
 | warning | `sdi_capture_open_failed` | Device open failed; retried every 500 ms until it returns (one event per session, not per retry). |
 | warning | `sdi_raster_changed` | Source format changed; session re-opens with `auto` re-detection. Muxer + PTS state persist, so receivers see a clean continuation. |
 | warning | `sdi_capture_lost` | Device delivered an error / vanished; re-open loop begins. |
@@ -147,6 +153,8 @@ throughout with no session restart.
 | `frames_dropped` | Frames the capture shim dropped because **this edge** fell behind the SDI cadence (encoder saturated, thread starved). Invisible to every transport-side counter. Cumulative across re-opens. |
 | `sessions` | Capture sessions opened; > 1 means at least one raster change / device re-open. |
 | `scte35_cues_emitted` | SCTE-104 cues successfully translated and emitted on the SCTE-35 PID. |
+| `timecode` | Latest decoded SMPTE 12M-2 VANC timecode as `HH:MM:SS:FF` (`;` before FF for drop-frame). `None` if no ATC packet has been seen this session — either the source doesn't carry one, or `timecode_extraction` is off. |
+| `captions_cea608_present` / `captions_cea708_present` | CEA-608/708 captions detected this session. Sticky (set once, never cleared) — mirrors the `sdi_captions_detected` event's "no lost transition" rule. |
 
 ### SCTE-104 trigger extraction
 
@@ -159,6 +167,58 @@ are preserved; zero pre-roll becomes an immediate splice with no scheduled PTS.
 Encoding, CRC and TS carriage are round-trip unit-tested. Capture plumbing still
 needs verification with a live VANC source, and cue semantics have not yet been
 tested with a dedicated SCTE-104 inserter.
+
+### Timecode and caption extraction
+
+Issue [#19](https://github.com/Bilbycast/bilbycast-edge/issues/19) asked for
+VANC demux to cover three things — SCTE-104, SMPTE 12M timecode, and
+CEA-608/708 captions — "the same ancillary bus used by ST 2110-40". The
+timecode and caption **decoders** already existed in this codebase
+(`engine/st2110/timecode.rs`, `engine/st2110/captions.rs`, both fully unit
+tested) but had never been wired to anything — not even ST 2110-40 itself.
+This is that wiring, using the same generic VANC capture loop SCTE-104
+extraction already established (one pass over each frame's ancillary
+packets, filtered by config flag and DID/SDID).
+
+The two are deliberately handled differently, because they behave
+differently on the wire:
+
+* **Timecode** arrives on (typically) every frame on a locked source — an
+  event per packet would flood the event stream at frame rate for the whole
+  duration of the flow. It's surfaced as **live state**
+  (`InputStats.sdi_stats.timecode`), not an event: read it whenever you want
+  the current value, same as `signal_present`.
+* **Captions** fire `sdi_captions_detected` **once per type per session**,
+  on the transition from absent to present — mirroring `sdi_signal_lost`/
+  `sdi_signal_restored`'s transition-based pattern rather than a per-packet
+  flood (CEA-608 in particular can arrive every field). CEA-608 and CEA-708
+  are tracked independently; one being present never masks a later
+  detection of the other.
+
+**Known, deliberate scope limits** — not gaps to be surprised by:
+
+* **No caption text decode.** Only presence + `cc_count`
+  (`CaptionSummary`, as `captions.rs` already produced before this work).
+  `captions.rs`'s own module doc already scoped this out: "the full decoder
+  pipeline can be added behind an opt-in feature later."
+* **No "captions lost" transition.** A gap in caption packets isn't
+  necessarily meaningful — captions are legitimately intermittent even on a
+  healthy source (no dialogue = no CC data for stretches).
+* **ATC SDID `0x60` (LTC) and `0x61` (VITC) are not distinguished** — both
+  decode identically via `is_atc_packet`. If a source carries both
+  simultaneously, whichever arrives is what's stored (no preference logic).
+* **No injection** — this is extraction only, matching the scope of issue
+  #19's original ask. The generic VANC-write path
+  (`write_video_with_ancillary`) already exists from the SCTE-35 injection
+  work, so adding timecode/caption injection later would be a smaller lift
+  than SCTE injection was, but it's not part of this work.
+
+Timecode round-trips (including drop-frame and boundary values) and the
+caption presence-transition logic (fires once per type, types independent,
+no cross-type interference) are unit tested. Hardware verification: SDI
+test-signal generators commonly carry ATC timecode by default, making it
+easier to verify than SCTE-104 was; captions need a real caption-carrying
+source (camera/deck/generator) to verify against, harder to synthesize.
 
 **Per-output (playout)** — `OutputStats.sdi_stats` (additive; absent on non-SDI
 outputs):

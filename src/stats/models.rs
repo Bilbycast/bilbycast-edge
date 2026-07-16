@@ -857,6 +857,21 @@ pub struct SdiInputStats {
     pub sessions: u64,
     /// SCTE-104 cues translated and emitted on the SCTE-35 PID.
     pub scte35_cues_emitted: u64,
+    /// Latest decoded SMPTE 12M-2 VANC timecode as `HH:MM:SS:FF`
+    /// (`;` before FF for drop-frame). `None` if no ATC packet (DID `0x60`)
+    /// has been seen this session, either because the source doesn't carry
+    /// one or `timecode_extraction` is off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timecode: Option<String>,
+    /// CEA-608 captions detected on this input this session. Sticky (no
+    /// "lost" transition) — captions are legitimately intermittent even on
+    /// a healthy source.
+    #[serde(default)]
+    pub captions_cea608_present: bool,
+    /// CEA-708 captions detected on this input this session. Sticky, same
+    /// rule as `captions_cea608_present`.
+    #[serde(default)]
+    pub captions_cea708_present: bool,
 }
 
 /// SDI (DeckLink) playout statistics for one output.

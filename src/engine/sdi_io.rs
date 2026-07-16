@@ -611,6 +611,34 @@ fn open_capture(
     }
 }
 
+/// Decide whether a decoded caption packet is a **new** detection for its
+/// type this session, updating the caller's sticky presence flags. Pure
+/// (no I/O) so the transition logic — fire once, never re-fire, independent
+/// per type — is unit-testable without a capture session.
+///
+/// Returns `Some(kind_label)` exactly on the transition from absent to
+/// present for that type; `None` on every subsequent packet of the same
+/// type, or if `kind` was already present.
+#[cfg(feature = "media-codecs")]
+fn caption_newly_detected(
+    kind: crate::engine::st2110::captions::CaptionType,
+    cea608_present: &mut bool,
+    cea708_present: &mut bool,
+) -> Option<&'static str> {
+    let present = match kind {
+        crate::engine::st2110::captions::CaptionType::Cea608 => cea608_present,
+        crate::engine::st2110::captions::CaptionType::Cea708 => cea708_present,
+    };
+    if *present {
+        return None;
+    }
+    *present = true;
+    Some(match kind {
+        crate::engine::st2110::captions::CaptionType::Cea608 => "CEA-608",
+        crate::engine::st2110::captions::CaptionType::Cea708 => "CEA-708",
+    })
+}
+
 /// Drive one capture session to completion, returning why it ended.
 #[cfg(feature = "media-codecs")]
 #[allow(clippy::too_many_arguments)]
@@ -714,6 +742,11 @@ fn run_capture_session(
 
     // `None` until the first frame tells us whether the input is locked.
     let mut signal_present: Option<bool> = None;
+    // Caption presence is tracked per session (fresh on every re-open, same
+    // as every other per-session state here) so `sdi_captions_detected`
+    // fires once per type per session, not once per packet.
+    let mut cea608_present = false;
+    let mut cea708_present = false;
 
     loop {
         if cancel.is_cancelled() {
@@ -722,7 +755,7 @@ fn run_capture_session(
         }
         match cap.read_frame() {
             Ok(CapturedFrame::Video(vf)) => {
-                if config.scte35_extraction {
+                if config.scte35_extraction || config.timecode_extraction || config.captions_extraction {
                     for captured in &vf.ancillary {
                         let anc = crate::engine::st2110::ancillary::AncPacket::simple(
                             captured.did,
@@ -730,47 +763,86 @@ fn run_capture_session(
                             captured.line_number,
                             captured.data.clone(),
                         );
-                        if !crate::engine::st2110::scte104::is_scte104_packet(&anc) {
-                            continue;
-                        }
-                        match crate::engine::st2110::scte104::parse_scte104(&anc.user_data) {
-                            Ok(msg)
-                                if matches!(msg.opcode,
-                                crate::engine::st2110::scte104::SpliceOpcode::SpliceStartNormal
-                                | crate::engine::st2110::scte104::SpliceOpcode::SpliceEndNormal
-                                | crate::engine::st2110::scte104::SpliceOpcode::SpliceCancel) =>
-                            {
-                                let section =
-                                    crate::engine::scte35_encode::build_splice_insert_section(
-                                        &msg,
-                                        (*pts).max(0) as u64,
-                                    );
-                                let packets = ts_mux.mux_scte35(&section);
-                                if !packets.is_empty() {
-                                    publish_ts(
-                                        packets,
-                                        (*pts).max(0) as u32,
-                                        broadcast_tx,
-                                        flow_stats,
-                                    );
-                                    sdi_stats
-                                        .scte35_cues_emitted
-                                        .fetch_add(1, Ordering::Relaxed);
-                                    event_sender.emit(
-                                        EventSeverity::Info,
-                                        category::FLOW,
-                                        format!(
-                                            "{ctx}: emitted SCTE-35 cue event_id={} opcode={:?} \
-                                             (error_code: sdi_scte35_emitted)",
-                                            msg.splice_event_id.unwrap_or(0),
-                                            msg.opcode
-                                        ),
-                                    );
+                        if config.scte35_extraction
+                            && crate::engine::st2110::scte104::is_scte104_packet(&anc)
+                        {
+                            match crate::engine::st2110::scte104::parse_scte104(&anc.user_data) {
+                                Ok(msg)
+                                    if matches!(msg.opcode,
+                                    crate::engine::st2110::scte104::SpliceOpcode::SpliceStartNormal
+                                    | crate::engine::st2110::scte104::SpliceOpcode::SpliceEndNormal
+                                    | crate::engine::st2110::scte104::SpliceOpcode::SpliceCancel) =>
+                                {
+                                    let section =
+                                        crate::engine::scte35_encode::build_splice_insert_section(
+                                            &msg,
+                                            (*pts).max(0) as u64,
+                                        );
+                                    let packets = ts_mux.mux_scte35(&section);
+                                    if !packets.is_empty() {
+                                        publish_ts(
+                                            packets,
+                                            (*pts).max(0) as u32,
+                                            broadcast_tx,
+                                            flow_stats,
+                                        );
+                                        sdi_stats
+                                            .scte35_cues_emitted
+                                            .fetch_add(1, Ordering::Relaxed);
+                                        event_sender.emit(
+                                            EventSeverity::Info,
+                                            category::FLOW,
+                                            format!(
+                                                "{ctx}: emitted SCTE-35 cue event_id={} opcode={:?} \
+                                                 (error_code: sdi_scte35_emitted)",
+                                                msg.splice_event_id.unwrap_or(0),
+                                                msg.opcode
+                                            ),
+                                        );
+                                    }
+                                }
+                                Ok(_) => {}
+                                Err(e) => {
+                                    debug!(target: "sdi.in", "{ctx}: invalid SCTE-104 VANC packet: {e}")
                                 }
                             }
-                            Ok(_) => {}
-                            Err(e) => {
-                                debug!(target: "sdi.in", "{ctx}: invalid SCTE-104 VANC packet: {e}")
+                        } else if config.timecode_extraction
+                            && crate::engine::st2110::timecode::is_atc_packet(&anc)
+                        {
+                            match crate::engine::st2110::timecode::parse_timecode(&anc.user_data) {
+                                Ok(tc) => sdi_stats.store_timecode(Some(tc)),
+                                Err(e) => {
+                                    debug!(target: "sdi.in", "{ctx}: invalid ATC VANC packet: {e}")
+                                }
+                            }
+                        } else if config.captions_extraction
+                            && crate::engine::st2110::captions::is_caption_packet(&anc)
+                        {
+                            match crate::engine::st2110::captions::parse_caption(&anc) {
+                                Ok(summary) => {
+                                    if let Some(kind_str) = caption_newly_detected(
+                                        summary.kind,
+                                        &mut cea608_present,
+                                        &mut cea708_present,
+                                    ) {
+                                        event_sender.emit(
+                                            EventSeverity::Info,
+                                            category::FLOW,
+                                            format!(
+                                                "{ctx}: {kind_str} captions detected (cc_count={}) \
+                                                 (error_code: sdi_captions_detected)",
+                                                summary.cc_count
+                                            ),
+                                        );
+                                    }
+                                    // Reflect cumulative session presence (both
+                                    // types independently), not just this one
+                                    // packet's kind.
+                                    sdi_stats.set_captions_present(cea608_present, cea708_present);
+                                }
+                                Err(e) => {
+                                    debug!(target: "sdi.in", "{ctx}: invalid caption VANC packet: {e}")
+                                }
                             }
                         }
                     }
@@ -1054,6 +1126,72 @@ mod tests {
                 is_420, expect_420,
                 "chroma {chroma} maps to the right branch"
             );
+        }
+    }
+
+    mod caption_presence {
+        use super::super::caption_newly_detected;
+        use crate::engine::st2110::captions::CaptionType;
+
+        /// The first packet of a type is the only one that reports a
+        /// detection — everything after is `None`, no matter how many more
+        /// packets of the same type arrive in the session.
+        #[test]
+        fn fires_once_per_type_then_stays_silent() {
+            let (mut cea608, mut cea708) = (false, false);
+            assert_eq!(
+                caption_newly_detected(CaptionType::Cea608, &mut cea608, &mut cea708),
+                Some("CEA-608")
+            );
+            assert_eq!(
+                caption_newly_detected(CaptionType::Cea608, &mut cea608, &mut cea708),
+                None,
+                "second CEA-608 packet in the same session must not re-fire"
+            );
+            assert_eq!(
+                caption_newly_detected(CaptionType::Cea608, &mut cea608, &mut cea708),
+                None,
+                "third CEA-608 packet must not re-fire either"
+            );
+        }
+
+        /// CEA-608 and CEA-708 are independent signals — one being present
+        /// must not mask a later detection of the other.
+        #[test]
+        fn types_are_independent() {
+            let (mut cea608, mut cea708) = (false, false);
+            assert_eq!(
+                caption_newly_detected(CaptionType::Cea608, &mut cea608, &mut cea708),
+                Some("CEA-608")
+            );
+            // CEA-708 arriving afterward is still a fresh detection.
+            assert_eq!(
+                caption_newly_detected(CaptionType::Cea708, &mut cea608, &mut cea708),
+                Some("CEA-708")
+            );
+            // Both now present; neither re-fires.
+            assert_eq!(
+                caption_newly_detected(CaptionType::Cea608, &mut cea608, &mut cea708),
+                None
+            );
+            assert_eq!(
+                caption_newly_detected(CaptionType::Cea708, &mut cea608, &mut cea708),
+                None
+            );
+            assert!(cea608 && cea708, "both sticky flags end up set");
+        }
+
+        /// CEA-708-only source: CEA-608 never fires, CEA-708 fires exactly
+        /// once. Guards against a shared/aliased state bug between the two
+        /// independent flags.
+        #[test]
+        fn cea708_only_source_never_touches_cea608() {
+            let (mut cea608, mut cea708) = (false, false);
+            for _ in 0..5 {
+                caption_newly_detected(CaptionType::Cea708, &mut cea608, &mut cea708);
+            }
+            assert!(!cea608, "CEA-608 was never seen, must stay false");
+            assert!(cea708);
         }
     }
 }

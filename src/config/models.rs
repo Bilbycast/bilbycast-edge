@@ -6787,6 +6787,18 @@ pub struct SdiInputConfig {
     /// Translate SCTE-104 VANC triggers into an SCTE-35 PID in the egress TS.
     #[serde(default)]
     pub scte35_extraction: bool,
+    /// Decode SMPTE 12M-2 ATC VANC timecode (DID `0x60`) into a live
+    /// `InputStats.sdi_stats.timecode` field. Continuous state, not an
+    /// event — a real source updates it every frame.
+    #[serde(default)]
+    pub timecode_extraction: bool,
+    /// Detect CEA-608/708 caption presence from VANC (DID `0x61`) —
+    /// presence and cc_count only, not caption text. Fires
+    /// `sdi_captions_detected` once per session per caption type and
+    /// surfaces `InputStats.sdi_stats.captions_cea608_present` /
+    /// `captions_cea708_present`.
+    #[serde(default)]
+    pub captions_extraction: bool,
     /// Mandatory ingress video encode (mirrors `MxlVideoInputConfig`). A
     /// feature-flagged backend (`video-encoder-x264` / `-x265` / `-nvenc` /
     /// `-qsv` / `-vaapi`) must be compiled in.

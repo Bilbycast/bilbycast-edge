@@ -2539,9 +2539,70 @@ pub struct SdiCaptureStats {
     pub sessions: AtomicU64,
     /// Cues successfully translated and emitted into the transport stream.
     pub scte35_cues_emitted: AtomicU64,
+    /// Latest decoded SMPTE 12M-2 VANC timecode, bit-packed for lock-free
+    /// capture-thread writes. Layout (LSB first): hours:5, minutes:6,
+    /// seconds:6, frames:6, drop_frame:1, color_frame:1, present:1 (bit 25 —
+    /// distinguishes "no ATC packet seen yet" from a genuine all-zero
+    /// timecode). See [`Self::store_timecode`]/[`Self::load_timecode`].
+    pub timecode_packed: AtomicU32,
+    /// CEA-608 captions detected this capture session (sticky — set once
+    /// seen, no "lost" transition; captions are legitimately intermittent
+    /// even on a healthy source).
+    pub captions_cea608_present: AtomicBool,
+    /// CEA-708 captions detected this capture session (sticky, same rule).
+    pub captions_cea708_present: AtomicBool,
 }
 
+/// Bit 25 of [`SdiCaptureStats::timecode_packed`] — set only when a real ATC
+/// packet has been decoded; distinguishes "unset" from a genuine 00:00:00:00.
+const TIMECODE_PRESENT_BIT: u32 = 1 << 25;
+
 impl SdiCaptureStats {
+    /// Store the latest decoded timecode (or clear it with `None`) for the
+    /// next stats snapshot to pick up. Lock-free — safe to call from the
+    /// blocking SDI capture thread on every frame.
+    pub fn store_timecode(&self, tc: Option<crate::engine::st2110::timecode::Timecode>) {
+        let packed = match tc {
+            None => 0,
+            Some(tc) => {
+                (tc.hours as u32 & 0x1F)
+                    | ((tc.minutes as u32 & 0x3F) << 5)
+                    | ((tc.seconds as u32 & 0x3F) << 11)
+                    | ((tc.frames as u32 & 0x3F) << 17)
+                    | ((tc.drop_frame as u32) << 23)
+                    | ((tc.color_frame as u32) << 24)
+                    | TIMECODE_PRESENT_BIT
+            }
+        };
+        self.timecode_packed.store(packed, Ordering::Relaxed);
+    }
+
+    /// Decode the packed timecode, or `None` if no ATC packet has been seen
+    /// (this session or ever).
+    pub fn load_timecode(&self) -> Option<crate::engine::st2110::timecode::Timecode> {
+        let packed = self.timecode_packed.load(Ordering::Relaxed);
+        if packed & TIMECODE_PRESENT_BIT == 0 {
+            return None;
+        }
+        Some(crate::engine::st2110::timecode::Timecode {
+            hours: (packed & 0x1F) as u8,
+            minutes: ((packed >> 5) & 0x3F) as u8,
+            seconds: ((packed >> 11) & 0x3F) as u8,
+            frames: ((packed >> 17) & 0x3F) as u8,
+            drop_frame: (packed >> 23) & 1 != 0,
+            color_frame: (packed >> 24) & 1 != 0,
+        })
+    }
+
+    /// Update the sticky per-type caption presence flags. Called with the
+    /// caller's own cumulative-for-this-session view (not just the type of
+    /// the packet just decoded), so a CEA-708-only source doesn't get its
+    /// CEA-608 flag flapped back to `false` by an unrelated packet.
+    pub fn set_captions_present(&self, cea608: bool, cea708: bool) {
+        self.captions_cea608_present.store(cea608, Ordering::Relaxed);
+        self.captions_cea708_present.store(cea708, Ordering::Relaxed);
+    }
+
     /// Snapshot into the serialisable form the manager sees.
     pub fn snapshot(&self) -> SdiInputStats {
         SdiInputStats {
@@ -2550,7 +2611,97 @@ impl SdiCaptureStats {
             frames_dropped: self.frames_dropped.load(Ordering::Relaxed),
             sessions: self.sessions.load(Ordering::Relaxed),
             scte35_cues_emitted: self.scte35_cues_emitted.load(Ordering::Relaxed),
+            timecode: self.load_timecode().map(|tc| tc.to_string()),
+            captions_cea608_present: self.captions_cea608_present.load(Ordering::Relaxed),
+            captions_cea708_present: self.captions_cea708_present.load(Ordering::Relaxed),
         }
+    }
+}
+
+#[cfg(test)]
+mod sdi_capture_stats_tests {
+    use super::*;
+    use crate::engine::st2110::timecode::Timecode;
+
+    #[test]
+    fn timecode_round_trips_including_boundary_values() {
+        let stats = SdiCaptureStats::default();
+        assert_eq!(stats.load_timecode(), None, "unset must be None, not 00:00:00:00");
+
+        let tc = Timecode {
+            hours: 23,
+            minutes: 59,
+            seconds: 59,
+            frames: 29,
+            drop_frame: true,
+            color_frame: true,
+        };
+        stats.store_timecode(Some(tc));
+        assert_eq!(stats.load_timecode(), Some(tc));
+    }
+
+    #[test]
+    fn timecode_all_zero_is_distinguishable_from_unset() {
+        let stats = SdiCaptureStats::default();
+        let zero = Timecode {
+            hours: 0,
+            minutes: 0,
+            seconds: 0,
+            frames: 0,
+            drop_frame: false,
+            color_frame: false,
+        };
+        stats.store_timecode(Some(zero));
+        assert_eq!(
+            stats.load_timecode(),
+            Some(zero),
+            "a genuine 00:00:00:00 must round-trip as Some, not be confused with unset"
+        );
+    }
+
+    #[test]
+    fn timecode_can_be_cleared_back_to_none() {
+        let stats = SdiCaptureStats::default();
+        stats.store_timecode(Some(Timecode {
+            hours: 1,
+            minutes: 2,
+            seconds: 3,
+            frames: 4,
+            drop_frame: false,
+            color_frame: false,
+        }));
+        assert!(stats.load_timecode().is_some());
+        stats.store_timecode(None);
+        assert_eq!(stats.load_timecode(), None);
+    }
+
+    #[test]
+    fn captions_present_flags_are_independent() {
+        let stats = SdiCaptureStats::default();
+        stats.set_captions_present(true, false);
+        let snap = stats.snapshot();
+        assert!(snap.captions_cea608_present);
+        assert!(!snap.captions_cea708_present);
+
+        stats.set_captions_present(true, true);
+        let snap = stats.snapshot();
+        assert!(snap.captions_cea608_present);
+        assert!(snap.captions_cea708_present);
+    }
+
+    #[test]
+    fn snapshot_formats_timecode_via_the_shared_to_string() {
+        let stats = SdiCaptureStats::default();
+        assert_eq!(stats.snapshot().timecode, None);
+        stats.store_timecode(Some(Timecode {
+            hours: 10,
+            minutes: 30,
+            seconds: 45,
+            frames: 12,
+            drop_frame: false,
+            color_frame: false,
+        }));
+        assert_eq!(stats.snapshot().timecode, Some("10:30:45:12".to_string()));
     }
 }
 
