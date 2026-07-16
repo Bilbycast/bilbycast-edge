@@ -330,8 +330,9 @@ pub mod output_mxl_audio;
 #[cfg(feature = "mxl")]
 pub mod output_mxl_video;
 
-/// SDI capture/playout via Blackmagic DeckLink. Wraps FFmpeg's `decklink`
-/// avdevice via the sibling `bilbycast-decklink-rs` crate. Boot probe lives in
+/// SDI capture/playout via Blackmagic DeckLink. Talks to the DeckLink SDK
+/// directly via the sibling `bilbycast-decklink-rs` crate — not FFmpeg's
+/// `decklink` avdevice, which hides signal loss. Boot probe lives in
 /// `engine::decklink::domain::DecklinkDeviceManager::probe`. Off by default —
 /// gated by the `sdi-decklink` Cargo feature. See `bilbycast-decklink-rs/CLAUDE.md`.
 #[cfg(feature = "sdi-decklink")]
