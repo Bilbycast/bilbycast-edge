@@ -373,6 +373,23 @@ mxl = ["dep:mxl-rs"]
 # it onto the card. Needs the SDK headers (`DECKLINK_SDK_DIR`) and a
 # video-encoder-* backend. Default OFF. See
 # `bilbycast-decklink-rs/CLAUDE.md`.
+#
+# Shipped in every `*-full` release artefact — the workflow lists this
+# feature explicitly on both arches and materialises the SDK headers from
+# a repo secret first. Deliberately NOT folded into `video-encoders-full`:
+# that composite is "every video codec backend", and SDI is an I/O type,
+# not a codec. Folding it in would also drag the EULA-gated SDK onto every
+# local `--features video-encoders-full` build (`libdecklink-sys/build.rs`
+# panics without `DECKLINK_SDK_DIR`), so a contributor wanting x264 + x265
+# would have to go and accept a Blackmagic licence first. Same reasoning
+# as `video-encoder-rkmpp`, and the same shape as `mxl` / `display`, which
+# are likewise listed per-arch in the workflow rather than composited.
+#
+# Runtime is autodetect, exactly like NVENC: the SDK's DeckLinkAPIDispatch
+# dlopens `libDeckLinkAPI.so`, so a host without Desktop Video or without a
+# card simply fails the boot probe (`engine::decklink::domain`), the
+# `sdi-decklink` capability never reaches `HealthPayload.capabilities`, and
+# the manager hides SDI for that node. Nothing to configure either way.
 sdi-decklink = ["dep:decklink-rs"]
 # Skip the upstream libmxl C++ cmake build inside mxl-sys. bindgen still
 # generates dlopen-based FFI bindings from the vendored headers; the

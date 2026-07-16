@@ -83,19 +83,87 @@ jobs:
           # is included on top of the codec bundle so the local-display
           # output spawner is compiled in. MXL compiled in with
           # `mxl-not-built` — Rust code ships, libmxl.so discovered at
-          # runtime via dlopen.
+          # runtime via dlopen. `sdi-decklink` ships on both arches — it is
+          # an I/O type, not a codec backend, so it is listed here rather
+          # than folded into the `video-encoders-full` composite. Its SDK
+          # headers come from the DECKLINK_SDK_URL secret (EULA-gated, not
+          # vendorable) and libDeckLinkAPI.so is dlopened at runtime, so a
+          # host with no card / no Desktop Video simply fails the boot probe
+          # and never advertises the capability.
           - runner: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
             artifact_suffix: x86_64-linux-full
             variant: full
-            cargo_features: "video-encoders-full display mxl mxl-not-built"
+            cargo_features: "video-encoders-full display mxl mxl-not-built sdi-decklink"
           - runner: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
             artifact_suffix: aarch64-linux-full
             variant: full
-            cargo_features: "video-encoder-x264 video-encoder-x265 video-encoder-nvenc video-encoder-vaapi video-decoder-nvdec video-decoder-vaapi display mxl mxl-not-built"
+            cargo_features: "video-encoder-x264 video-encoder-x265 video-encoder-nvenc video-encoder-vaapi video-decoder-nvdec video-decoder-vaapi display mxl mxl-not-built sdi-decklink"
     runs-on: ${{ matrix.runner }}
     steps:
+      # Runs before any checkout / apt / x264-from-source / cargo, so a missing
+      # secret costs seconds instead of failing ~40 minutes in. SDI is in every
+      # full artefact by policy: an absent SDK is a release-blocking
+      # misconfiguration, never a reason to quietly publish a "full" binary that
+      # lacks an I/O type operators expect.
+      - name: Preflight - DeckLink SDK secret
+        if: matrix.variant == 'full'
+        env:
+          DECKLINK_SDK_URL: ${{ secrets.DECKLINK_SDK_URL }}
+        run: |
+          if [ -n "${DECKLINK_SDK_URL}" ]; then
+            echo "OK: DECKLINK_SDK_URL is set - SDI (DeckLink) will be built into this artefact."
+            exit 0
+          fi
+          cat >&2 <<'EOF'
+          ======================================================================
+          RELEASE BLOCKED - the DECKLINK_SDK_URL repository secret is not set.
+          ======================================================================
+
+          Every `*-linux-full` artefact ships SDI (Blackmagic DeckLink) support.
+          Building without it would publish a "full" binary silently missing an
+          I/O type operators expect, so the build stops here instead of
+          degrading quietly.
+
+          WHY A SECRET: the DeckLink SDK is EULA-gated. It cannot be committed to
+          this repository or fetched from Blackmagic unattended. Only the SDK
+          *headers* are needed to build - libDeckLinkAPI.so is dlopened at
+          runtime by Desktop Video on the operator's host - but there is no
+          header-free build path: the C++ shim #includes DeckLinkAPI.h, and the
+          SDK's own DeckLinkAPIDispatch.cpp is compiled in.
+
+          ONE-TIME SETUP (do this once; every later release just works):
+
+            1. Download the "Desktop Video SDK" from Blackmagic Design's support
+               site and accept the EULA:
+                 https://www.blackmagicdesign.com/support/
+            2. From the unpacked SDK take the `Linux/include` directory - the one
+               containing BOTH DeckLinkAPI.h and DeckLinkAPIDispatch.cpp - and
+               archive it:
+                 tar czf decklink-sdk-include.tar.gz -C /path/to/SDK/Linux include
+               (a .zip of the same directory works too)
+            3. Upload it somewhere private this workflow can reach unattended -
+               a private GitHub release asset, or object storage behind a
+               pre-signed URL. Do NOT publish it: redistributing the SDK is
+               Blackmagic's call, not ours.
+            4. Add the repository secrets
+               (Settings -> Secrets and variables -> Actions):
+                 DECKLINK_SDK_URL     (required) direct download URL
+                 DECKLINK_SDK_TOKEN   (optional) bearer token, when the URL needs
+                                                 auth - a private GitHub release
+                                                 asset does
+                 DECKLINK_SDK_SHA256  (optional) sha256 of the archive; pins it
+                                                 against silent replacement
+            5. Re-run this workflow.
+
+          The extraction step accepts a .tar.gz or a .zip and finds the include
+          directory itself, so the archive's internal layout does not matter as
+          long as DeckLinkAPI.h and DeckLinkAPIDispatch.cpp sit side by side
+          somewhere inside it.
+          EOF
+          exit 1
+
       - name: Checkout bilbycast-libsrt-rs (path dependency)
         uses: actions/checkout@v7
         with:
@@ -143,6 +211,18 @@ jobs:
           path: bilbycast-mxl-rs
           submodules: recursive
 
+      # Checked out unconditionally, not just for the SDI-bearing variants:
+      # `decklink-rs` is a path dependency and therefore sits in Cargo.lock's
+      # resolve graph even when `sdi-decklink` is off, so cargo fails at
+      # manifest load if the directory is absent. Only the build.rs runs under
+      # the feature; the checkout is cheap either way. Vendors no SDK - the
+      # repo carries first-party shim sources only.
+      - name: Checkout bilbycast-decklink-rs (path dependency)
+        uses: actions/checkout@v7
+        with:
+          repository: Bilbycast/bilbycast-decklink-rs
+          path: bilbycast-decklink-rs
+
       - name: Checkout bilbycast-edge
         uses: actions/checkout@v7
         with:
@@ -157,7 +237,105 @@ jobs:
           # in the link graph either.
           sudo apt-get update
           sudo apt-get install -y cmake make clang libclang-dev pkg-config libssl-dev g++ \
-            libasound2-dev nasm
+            libasound2-dev nasm unzip
+
+      # Materialises the EULA-gated DeckLink SDK headers that
+      # libdecklink-sys/build.rs requires. Placed after the cheap apt step (for
+      # `unzip`) but before the x264-from-source build, so a bad URL / token
+      # fails in seconds rather than after a full compile. The SDK is never
+      # committed here and never fetched from Blackmagic - it comes from a
+      # private location whose EULA the uploader accepted once.
+      - name: Materialise DeckLink SDK headers
+        if: matrix.variant == 'full'
+        env:
+          DECKLINK_SDK_URL: ${{ secrets.DECKLINK_SDK_URL }}
+          DECKLINK_SDK_TOKEN: ${{ secrets.DECKLINK_SDK_TOKEN }}
+          DECKLINK_SDK_SHA256: ${{ secrets.DECKLINK_SDK_SHA256 }}
+        run: |
+          WORK="${RUNNER_TEMP}/decklink-sdk"
+          mkdir -p "${WORK}/extract"
+
+          # The URL is never echoed: a pre-signed URL carries its credential in
+          # the query string, and only the exact registered secret string is
+          # masked in logs. curl reads it from the environment for the same
+          # reason (an argv would surface in a trace).
+          AUTH=()
+          if [ -n "${DECKLINK_SDK_TOKEN:-}" ]; then
+            AUTH=(-H "Authorization: Bearer ${DECKLINK_SDK_TOKEN}"
+                  -H "Accept: application/octet-stream")
+          fi
+          if ! curl -fsSL --retry 6 --retry-all-errors --retry-delay 5 \
+                 "${AUTH[@]}" -o "${WORK}/sdk.archive" "${DECKLINK_SDK_URL}"; then
+            echo "ERROR: could not download the DeckLink SDK archive." >&2
+            echo "  The DECKLINK_SDK_URL secret is set but the fetch failed - the URL may" >&2
+            echo "  have expired (pre-signed URLs do), moved, or need DECKLINK_SDK_TOKEN." >&2
+            echo "  URL withheld from this log because it is a secret." >&2
+            exit 1
+          fi
+
+          # Compared directly rather than via `sha256sum -c`, so a malformed pin
+          # reports as a mismatch with both digests shown instead of as an
+          # unhelpful "no properly formatted checksum lines found".
+          SDK_SHA256="$(sha256sum "${WORK}/sdk.archive" | cut -d' ' -f1)"
+          if [ -n "${DECKLINK_SDK_SHA256:-}" ]; then
+            if [ "${SDK_SHA256}" != "${DECKLINK_SDK_SHA256}" ]; then
+              echo "ERROR: DeckLink SDK archive failed its DECKLINK_SDK_SHA256 check." >&2
+              echo "  Expected: ${DECKLINK_SDK_SHA256}" >&2
+              echo "  Actual:   ${SDK_SHA256}" >&2
+              echo "  Either the archive at DECKLINK_SDK_URL was replaced, or the pin is" >&2
+              echo "  stale / malformed (it must be a bare 64-char hex digest)." >&2
+              exit 1
+            fi
+            echo "OK: SDK archive matches DECKLINK_SDK_SHA256"
+          else
+            echo "NOTE: DECKLINK_SDK_SHA256 is not set - integrity of the SDK archive is"
+            echo "      whatever the hosting location guarantees. Pin it by setting that"
+            echo "      secret to the digest below:"
+            echo "      ${SDK_SHA256}"
+          fi
+
+          # Accept either archive shape - the SDK ships as a .zip from
+          # Blackmagic, but a hand-rolled .tar.gz of just Linux/include is the
+          # smaller thing to host, so both are worth handling.
+          ARCHIVE_TYPE="$(file -b --mime-type "${WORK}/sdk.archive")"
+          case "${ARCHIVE_TYPE}" in
+            application/zip)
+              unzip -q "${WORK}/sdk.archive" -d "${WORK}/extract" ;;
+            application/gzip|application/x-gzip)
+              tar xzf "${WORK}/sdk.archive" -C "${WORK}/extract" ;;
+            application/x-tar)
+              tar xf "${WORK}/sdk.archive" -C "${WORK}/extract" ;;
+            *)
+              echo "ERROR: unrecognised DeckLink SDK archive type '${ARCHIVE_TYPE}'." >&2
+              echo "  Expected a .zip or a .tar.gz. If DECKLINK_SDK_URL points at an HTML" >&2
+              echo "  page (a login redirect, or an expired pre-signed URL returning an" >&2
+              echo "  error document), this is what that looks like." >&2
+              exit 1 ;;
+          esac
+
+          # build.rs wants the directory holding BOTH files, which is the SDK's
+          # Linux/include. Locate it rather than assume a layout: Blackmagic
+          # versions the top-level directory name, and a hand-rolled archive may
+          # have no wrapper at all.
+          API_H="$(find "${WORK}/extract" -type f -name DeckLinkAPI.h -print -quit)"
+          if [ -z "${API_H}" ]; then
+            echo "ERROR: no DeckLinkAPI.h anywhere in the SDK archive." >&2
+            echo "  Archive contents (first 40 entries):" >&2
+            find "${WORK}/extract" -maxdepth 3 | head -40 >&2
+            echo "  Expected the SDK's Linux/include directory somewhere inside." >&2
+            exit 1
+          fi
+          SDK_DIR="$(dirname "${API_H}")"
+          if [ ! -f "${SDK_DIR}/DeckLinkAPIDispatch.cpp" ]; then
+            echo "ERROR: found DeckLinkAPI.h at ${API_H} but no DeckLinkAPIDispatch.cpp" >&2
+            echo "  beside it. libdecklink-sys/build.rs compiles that dispatch file, so" >&2
+            echo "  both must live in the same directory - that is the SDK's Linux/include," >&2
+            echo "  not Linux/include/... or a headers-only subset." >&2
+            exit 1
+          fi
+
+          echo "DECKLINK_SDK_DIR=${SDK_DIR}" >> "$GITHUB_ENV"
+          echo "OK: DeckLink SDK headers at ${SDK_DIR}"
 
       - name: Install video-encoder build dependencies
         if: matrix.variant == 'full'
@@ -337,6 +515,29 @@ jobs:
             exit 1
           fi
           echo "OK: display feature linked (libasound)"
+
+          echo "=== Checking SDI (DeckLink) ==="
+          # Negative: libDeckLinkAPI.so must stay dlopen-only. The SDK's
+          # DeckLinkAPIDispatch.cpp resolves it at runtime; a DT_NEEDED entry
+          # here would mean the link model changed and the artefact would refuse
+          # to start on every host without Desktop Video installed — i.e. most
+          # of them. That is the whole autodetect story, so it is worth a gate.
+          if ldd "${BINARY}" | grep -qE 'libDeckLinkAPI'; then
+            echo "ERROR: binary has a runtime dependency on libDeckLinkAPI — expected dlopen only:"
+            ldd "${BINARY}" | grep -E 'libDeckLinkAPI' || true
+            exit 1
+          fi
+          # Positive: the shim is actually baked in. Same reasoning as the
+          # x264/x265 symbol check — the inverted ldd gate above passes just as
+          # happily on a binary built without the feature at all. The release
+          # binary is not stripped, so the shim's C-ABI symbols are visible.
+          if ! nm "${BINARY}" 2>/dev/null | grep -qE ' [Tt] dl_read_frame'; then
+            echo "ERROR: DeckLink shim symbol not found — sdi-decklink did not compile in."
+            echo "  Every full artefact must ship SDI; check the cargo_features list and"
+            echo "  the Materialise DeckLink SDK headers step."
+            exit 1
+          fi
+          echo "OK: SDI compiled in (dl_read_frame present), libDeckLinkAPI dlopen-only"
 
           echo "=== MXL ==="
           # MXL uses dlopen (libloading) at runtime — no link-time dep.
@@ -531,8 +732,10 @@ jobs:
 
           **MXL** (Media eXchange Layer) support is compiled in. MXL is a shared-memory IPC protocol — the edge discovers the system-installed \`libmxl.so\` at runtime via \`dlopen\` and advertises MXL capabilities only when the library is present. Install MXL system-wide so all MXL-speaking applications on the host share the same library.
 
+          **SDI** (Blackmagic DeckLink capture + playout) is compiled in. Autodetected at runtime exactly like NVENC: the edge \`dlopen\`s \`libDeckLinkAPI.so\` at boot and enumerates cards, so a host without Blackmagic **Desktop Video** installed — or with no DeckLink card fitted — simply does not advertise the \`sdi-decklink\` capability, and the manager UI hides the SDI input / output types for that node. There is nothing to configure and no separate build to install: fit a card, install Desktop Video, restart the edge, and SDI appears.
+
           ### Runtime dependencies
-          libx264 / libx265 are **statically linked** into this binary — no \`libx264\` / \`libx265\` runtime package is required, and the binary is not tied to a distro's ABI-versioned \`libx264.so.<build>\` / \`libx265.so.<build>\` SONAME (so it runs on Ubuntu 24.04, 26.04+, Debian, etc. without hunting for a matching \`libx264-NNN\` package). Install the remaining stable-SONAME runtime libraries before running: \`sudo apt install libva2 libva-drm2 libasound2t64\` (use \`libasound2\` on Ubuntu 22.04 / Debian 12). No extra packages needed for NVENC beyond the NVIDIA driver. **For QSV (x86_64 only)**: \`sudo apt install libvpl2 intel-media-va-driver-non-free\` (or \`intel-media-driver\`). **For VAAPI**: install a vendor driver — \`mesa-va-drivers\` for AMD or \`intel-media-va-driver-non-free\` for Intel — then add the running user to the \`render\` group so the edge can open \`/dev/dri/renderD*\`. (\`install-edge.sh\` installs these automatically.)
+          libx264 / libx265 are **statically linked** into this binary — no \`libx264\` / \`libx265\` runtime package is required, and the binary is not tied to a distro's ABI-versioned \`libx264.so.<build>\` / \`libx265.so.<build>\` SONAME (so it runs on Ubuntu 24.04, 26.04+, Debian, etc. without hunting for a matching \`libx264-NNN\` package). Install the remaining stable-SONAME runtime libraries before running: \`sudo apt install libva2 libva-drm2 libasound2t64\` (use \`libasound2\` on Ubuntu 22.04 / Debian 12). No extra packages needed for NVENC beyond the NVIDIA driver. **For QSV (x86_64 only)**: \`sudo apt install libvpl2 intel-media-va-driver-non-free\` (or \`intel-media-driver\`). **For VAAPI**: install a vendor driver — \`mesa-va-drivers\` for AMD or \`intel-media-va-driver-non-free\` for Intel — then add the running user to the \`render\` group so the edge can open \`/dev/dri/renderD*\`. (\`install-edge.sh\` installs these automatically.) **For SDI (DeckLink)**: install Blackmagic **Desktop Video** (kernel driver + \`libDeckLinkAPI.so\`) from https://www.blackmagicdesign.com/support/ — needed only on hosts with a DeckLink card. The binary carries no link-time dependency on it, so hosts without it run normally and just don't offer SDI.
 
           ## Verify checksums
           \`\`\`
