@@ -246,6 +246,40 @@ which ships with the proprietary NVIDIA driver. Install the driver via
 your distribution's standard mechanism (e.g. `nvidia-driver-550` on
 Ubuntu) and reboot once.
 
+**Both architectures — SDI (Blackmagic DeckLink):**
+
+SDI capture + playout is compiled into every full artefact and behaves
+exactly like NVENC: no apt packages, no link-time dependency, autodetected
+at runtime. The edge `dlopen`s `libDeckLinkAPI.so` at boot and enumerates
+cards. On a host with no DeckLink card — or no Desktop Video installed —
+the probe finds nothing, the `sdi-decklink` capability never reaches the
+manager, and the manager UI hides the SDI input / output types for that
+node. The binary starts and runs normally either way; you do not need a
+different build for SDI and non-SDI hosts.
+
+To *use* SDI, install Blackmagic **Desktop Video** (the kernel driver plus
+`libDeckLinkAPI.so`) from
+<https://www.blackmagicdesign.com/support/> — search "Desktop Video",
+pick the Linux package for your distro — then reboot and restart the edge.
+No bilbycast reinstall or reconfiguration is needed; SDI appears on the
+next boot probe.
+
+```bash
+# Verify Desktop Video is present and the card is visible before
+# expecting SDI in the manager:
+ldconfig -p | grep -i decklink        # libDeckLinkAPI.so must resolve
+lsmod | grep -i blackmagic            # kernel driver loaded
+```
+
+> Desktop Video's kernel module is tied to your running kernel — after a
+> kernel upgrade, Blackmagic's DKMS package rebuilds it on boot. If SDI
+> silently disappears after an unattended upgrade, check `lsmod` first.
+
+Per-port signal / genlock / raster status for every fitted card rides the
+health payload (`sdi_devices[]`) and renders in the manager UI, so a
+pulled cable is visible without shelling into the node. Config reference,
+events, and telemetry: [`sdi.md`](sdi.md).
+
 ### Building from source — additional prerequisites
 
 In addition to whichever runtime set above matches your variant, building
@@ -293,8 +327,32 @@ git clone --depth 1 --branch n12.2.72.0 \
 sudo make -C /tmp/nv-codec-headers PREFIX=/usr/local install
 ```
 
+The full variant also compiles in SDI (`sdi-decklink`), which needs the
+Blackmagic DeckLink SDK **headers** at build time. The SDK is EULA-gated
+and cannot be vendored or downloaded unattended, so it is **not** part of
+the `video-encoders-full` composite — a plain
+`cargo build --features video-encoders-full` needs no SDK and builds
+exactly as before. Add SDI explicitly when you want it:
+
+```bash
+# One-time: download the "Desktop Video SDK" from
+# https://www.blackmagicdesign.com/support/ and accept the EULA.
+# DECKLINK_SDK_DIR is the directory holding BOTH DeckLinkAPI.h and
+# DeckLinkAPIDispatch.cpp — that is the SDK's Linux/include.
+export DECKLINK_SDK_DIR="$HOME/Blackmagic_DeckLink_SDK/Linux/include"
+cargo build --release --features "video-encoders-full display sdi-decklink"
+```
+
+Only the headers are needed: `libDeckLinkAPI.so` is `dlopen`ed at runtime
+by Desktop Video, so the build host needs no card and no driver. Without
+`DECKLINK_SDK_DIR` the build fails fast with a message naming the
+variable — `libdecklink-sys/build.rs` refuses rather than silently
+dropping the feature.
+
 This matches the package set the GitHub Actions release workflow uses to
-build `*-linux` and `*-linux-full` artefacts.
+build the `*-linux-full` artefacts, which additionally fetch the SDK
+headers from a private location via the `DECKLINK_SDK_URL` repository
+secret so every full release ships SDI.
 
 ### ARM Rockchip SBCs (RK3568 / RK3588) — RKMPP hardware encode
 
