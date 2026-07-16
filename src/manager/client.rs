@@ -1119,6 +1119,18 @@ fn build_resource_budget_payload(
                 .map(|o| o.insert("vaapi".into(), v));
         }
     }
+    // Why a compiled-in HW encoder family is unavailable — "blocked" (GPU
+    // present but the sandbox / permissions won't let us open it) vs
+    // "no_driver" (no GPU on this box). Additive; only present when at
+    // least one compiled-in family failed to open, so healthy hosts and
+    // no-HW-encoder builds pay nothing.
+    if let Some(diags) = &static_caps.hw_encoder_diagnostics {
+        if let Ok(v) = serde_json::to_value(diags) {
+            payload
+                .as_object_mut()
+                .map(|o| o.insert("hw_encoder_diagnostics".into(), v));
+        }
+    }
     // Live thread inventory — counts of hot-path OS threads currently
     // running. Surfaces the Stage 1 codec-thread fleet, Stage 2 PID-bus
     // threads (when wired), and Stage 3 PCR PLL sampler threads (when

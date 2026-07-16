@@ -90,6 +90,27 @@ impl HwCodecCapability {
     }
 }
 
+/// Why a compiled-in HW encoder family is unavailable on this host.
+///
+/// The boolean fields on [`HwCodecCapability`] say *whether* a family
+/// works; this says *why not* when it doesn't — letting the manager tell
+/// "there is no GPU here" (`no_driver`) apart from "the GPU is present but
+/// something is blocking us from opening it" (`blocked`, typically a
+/// systemd `DeviceAllow` / cgroup sandbox or a missing group membership).
+/// Only emitted for a family that is compiled into this build yet failed
+/// to open at probe time — working families and families that were never
+/// compiled in produce no entry.
+///
+/// - `family`: `"nvenc"` / `"qsv"` / `"vaapi"`.
+/// - `status`: `"blocked"` / `"no_driver"` / `"busy"` / `"other"`.
+/// - `detail`: operator-facing one-liner pointing at the fix.
+#[derive(Debug, Clone, Serialize)]
+pub struct HwEncoderDiagnostic {
+    pub family: String,
+    pub status: String,
+    pub detail: String,
+}
+
 /// AVX feature class on x86. On non-x86 (aarch64, etc.) `Other` is used as
 /// a placeholder — modern ARM with NEON is roughly Avx2-comparable for
 /// x264, so the SW capacity heuristic treats it as the Avx2 multiplier.
@@ -375,6 +396,12 @@ pub struct StaticCapabilities {
     /// pair, which is mirrored to the same values.
     #[serde(default, skip_serializing_if = "VaapiCapability::is_empty")]
     pub vaapi: VaapiCapability,
+    /// Why a compiled-in HW encoder family is unavailable, when it is.
+    /// `None` on healthy hosts (every compiled family opened) and on
+    /// hosts with no HW encoders compiled in. Additive on the wire —
+    /// older managers ignore the unknown field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hw_encoder_diagnostics: Option<Vec<HwEncoderDiagnostic>>,
     pub cpu: CpuInfo,
     pub sw_capacity: SwCapacityEstimate,
     /// `true` when the kernel accepts `setsockopt(SO_TXTIME)` on a UDP
@@ -469,6 +496,27 @@ pub fn probe_static_capabilities() -> StaticCapabilities {
     let sw_capacity = estimate_sw_capacity(&cpu);
     let hw_encoders = probe_hw_encoders();
     let hw_decoders = probe_hw_decoders();
+    // Classify any compiled-in-but-unavailable encoder family so the
+    // manager can tell "no GPU" from "GPU blocked by the sandbox /
+    // permissions". Empty on healthy hosts (and on builds with no HW
+    // encoders compiled in), which we fold to `None` to keep the field
+    // off the wire entirely.
+    let hw_encoder_diagnostics = {
+        let diags = probe_hw_encoder_diagnostics(&hw_encoders);
+        for d in &diags {
+            tracing::warn!(
+                "hw encoder family {} unavailable ({}): {}",
+                d.family,
+                d.status,
+                d.detail
+            );
+        }
+        if diags.is_empty() {
+            None
+        } else {
+            Some(diags)
+        }
+    };
     let hw_encoder_chroma = probe_encoder_chroma_capability(&hw_encoders);
     // VAAPI direction-tagged view — assembled from the encoder + decoder
     // probe results so older managers (reading the legacy
@@ -510,6 +558,7 @@ pub fn probe_static_capabilities() -> StaticCapabilities {
         hw_decoder_session_limits,
         hw_encoder_chroma,
         vaapi,
+        hw_encoder_diagnostics,
         cpu,
         sw_capacity,
         wire_pacing_txtime,
@@ -956,6 +1005,203 @@ fn probe_hw_encoders() -> HwCodecCapability {
         h264_rkmpp: probe_rkmpp_encoder("h264_rkmpp"),
         hevc_rkmpp: probe_rkmpp_encoder("hevc_rkmpp"),
     }
+}
+
+/// Why a compiled-in HW encoder family failed to open, reduced to the
+/// three axes the diagnostic classifier keys off. Decoupled from
+/// [`video_engine::ProbeError`] so the decision table is unit-testable
+/// without a GPU (or the `media-codecs` feature).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EncoderFailure {
+    /// `EACCES` — the running user can't open the device node.
+    PermissionDenied,
+    /// `EAGAIN` — encode sessions transiently exhausted.
+    Busy,
+    /// Driver / device missing, or an opaque open failure.
+    Other,
+}
+
+/// Map a failure reason plus on-disk device-node presence to the wire
+/// status string. `node_present` is what separates "GPU present but we
+/// can't open it" (`blocked`) from "no GPU on this box at all"
+/// (`no_driver`) — the distinction the manager needs to route the
+/// operator to the right fix.
+fn classify_encoder_status(failure: EncoderFailure, node_present: bool) -> &'static str {
+    match failure {
+        EncoderFailure::PermissionDenied => "blocked",
+        EncoderFailure::Busy => "busy",
+        EncoderFailure::Other if node_present => "blocked",
+        EncoderFailure::Other => "no_driver",
+    }
+}
+
+/// Build the per-family diagnostics for every compiled-in encoder family
+/// that failed to open. Cheap: for each family it's a free registry check
+/// plus (only when that family is compiled-in-and-broken) a single
+/// re-open and a couple of `Path::exists` calls. Healthy hosts and
+/// no-HW-encoder builds pay nothing.
+#[cfg(feature = "media-codecs")]
+fn probe_hw_encoder_diagnostics(hw: &HwCodecCapability) -> Vec<HwEncoderDiagnostic> {
+    [
+        nvenc_unavailable_diagnostic(hw),
+        qsv_unavailable_diagnostic(hw),
+        vaapi_unavailable_diagnostic(hw),
+    ]
+    .into_iter()
+    .flatten()
+    .collect()
+}
+
+#[cfg(not(feature = "media-codecs"))]
+fn probe_hw_encoder_diagnostics(_: &HwCodecCapability) -> Vec<HwEncoderDiagnostic> {
+    Vec::new()
+}
+
+/// Reduce a [`video_engine::ProbeError`] to an [`EncoderFailure`] axis.
+#[cfg(feature = "media-codecs")]
+fn encoder_failure_from(err: &video_engine::ProbeError) -> EncoderFailure {
+    match err {
+        video_engine::ProbeError::PermissionDenied => EncoderFailure::PermissionDenied,
+        video_engine::ProbeError::Busy => EncoderFailure::Busy,
+        _ => EncoderFailure::Other,
+    }
+}
+
+/// `true` when at least one `/dev/dri/renderD*` node exists — a DRM
+/// render node the QSV / VAAPI stack would open. One `read_dir`, only on
+/// a host where the family is already known broken.
+#[cfg(feature = "media-codecs")]
+fn dri_render_node_present() -> bool {
+    std::fs::read_dir("/dev/dri")
+        .map(|entries| {
+            entries
+                .flatten()
+                .any(|e| e.file_name().to_string_lossy().starts_with("renderD"))
+        })
+        .unwrap_or(false)
+}
+
+/// NVENC diagnostic. `None` unless NVENC is compiled in yet unavailable.
+/// Distinguishes a present-but-unopenable NVIDIA stack (`blocked` —
+/// `/dev/nvidia*` on disk but `cuInit` / open fails, the DeviceAllow /
+/// cgroup sandbox case) from a box with no NVIDIA driver at all
+/// (`no_driver`).
+#[cfg(feature = "media-codecs")]
+fn nvenc_unavailable_diagnostic(hw: &HwCodecCapability) -> Option<HwEncoderDiagnostic> {
+    if hw.h264_nvenc || hw.hevc_nvenc {
+        return None;
+    }
+    if !video_engine::is_encoder_available("h264_nvenc")
+        && !video_engine::is_encoder_available("hevc_nvenc")
+    {
+        return None;
+    }
+    let failure = match video_engine::probe_open_encoder("h264_nvenc") {
+        Ok(()) => return None, // recovered since the first probe (was transiently busy)
+        Err(e) => encoder_failure_from(&e),
+    };
+    let node_present = std::path::Path::new("/dev/nvidiactl").exists()
+        || std::path::Path::new("/dev/nvidia0").exists();
+    let status = classify_encoder_status(failure, node_present);
+    let detail = match failure {
+        EncoderFailure::Busy => {
+            "NVENC session slots exhausted — another process is holding all encode sessions"
+        }
+        _ if node_present => {
+            "NVIDIA driver present but device unopenable — check the service \
+             DeviceAllow / cgroup sandbox (see installation.md)"
+        }
+        _ => "no /dev/nvidia* device nodes — the NVIDIA driver is not installed or nvidia.ko \
+              is not loaded",
+    };
+    Some(HwEncoderDiagnostic {
+        family: "nvenc".into(),
+        status: status.into(),
+        detail: detail.into(),
+    })
+}
+
+/// QSV diagnostic. `None` unless QSV is compiled in yet unavailable. The
+/// `EACCES` case (service user not in the `render` group) is the common,
+/// actionable one and reports `blocked` with the group fix.
+#[cfg(feature = "media-codecs")]
+fn qsv_unavailable_diagnostic(hw: &HwCodecCapability) -> Option<HwEncoderDiagnostic> {
+    if hw.h264_qsv || hw.hevc_qsv {
+        return None;
+    }
+    if !video_engine::is_encoder_available("h264_qsv")
+        && !video_engine::is_encoder_available("hevc_qsv")
+    {
+        return None;
+    }
+    let failure = match video_engine::probe_open_encoder("h264_qsv") {
+        Ok(()) => return None,
+        Err(e) => encoder_failure_from(&e),
+    };
+    let node_present = dri_render_node_present();
+    let status = classify_encoder_status(failure, node_present);
+    let detail = match failure {
+        EncoderFailure::PermissionDenied => {
+            "renderD* not accessible — add the service user to the render group"
+        }
+        EncoderFailure::Busy => {
+            "Intel QSV media engine busy — another process holds all encode sessions"
+        }
+        EncoderFailure::Other if node_present => {
+            "Intel render node present but QSV unopenable — check the iHD media driver \
+             and the service DeviceAllow / cgroup sandbox"
+        }
+        EncoderFailure::Other => {
+            "no /dev/dri/renderD* node — no Intel GPU or the i915 driver is not loaded"
+        }
+    };
+    Some(HwEncoderDiagnostic {
+        family: "qsv".into(),
+        status: status.into(),
+        detail: detail.into(),
+    })
+}
+
+/// VAAPI diagnostic. `None` unless VAAPI encode is compiled in yet
+/// unavailable. Same `EACCES` → `blocked` (render group) and
+/// node-present → `blocked` (driver / sandbox) vs node-absent →
+/// `no_driver` split as QSV.
+#[cfg(feature = "media-codecs")]
+fn vaapi_unavailable_diagnostic(hw: &HwCodecCapability) -> Option<HwEncoderDiagnostic> {
+    if hw.h264_vaapi || hw.hevc_vaapi {
+        return None;
+    }
+    if !video_engine::is_encoder_available("h264_vaapi")
+        && !video_engine::is_encoder_available("hevc_vaapi")
+    {
+        return None;
+    }
+    let failure = match video_engine::probe_open_vaapi_encoder("h264_vaapi") {
+        Ok(()) => return None,
+        Err(e) => encoder_failure_from(&e),
+    };
+    let node_present = dri_render_node_present();
+    let status = classify_encoder_status(failure, node_present);
+    let detail = match failure {
+        EncoderFailure::PermissionDenied => {
+            "renderD* not accessible — add the service user to the render group"
+        }
+        EncoderFailure::Busy => {
+            "VAAPI encode engine busy — another process holds the render node"
+        }
+        EncoderFailure::Other if node_present => {
+            "render node present but VAAPI unopenable — check the libva driver \
+             (Mesa radeonsi / iHD) and the service DeviceAllow / cgroup sandbox"
+        }
+        EncoderFailure::Other => {
+            "no /dev/dri/renderD* node — no GPU render node or the DRM driver is not loaded"
+        }
+    };
+    Some(HwEncoderDiagnostic {
+        family: "vaapi".into(),
+        status: status.into(),
+        detail: detail.into(),
+    })
 }
 
 fn probe_hw_decoders() -> HwCodecCapability {
@@ -3093,6 +3339,31 @@ mod tests {
     }
 
     #[test]
+    fn encoder_status_distinguishes_blocked_from_no_driver() {
+        // EACCES is always a permissions block regardless of node state.
+        assert_eq!(
+            classify_encoder_status(EncoderFailure::PermissionDenied, false),
+            "blocked"
+        );
+        assert_eq!(
+            classify_encoder_status(EncoderFailure::PermissionDenied, true),
+            "blocked"
+        );
+        // Busy is its own transient state.
+        assert_eq!(classify_encoder_status(EncoderFailure::Busy, true), "busy");
+        // The node-present axis is what separates "GPU here but blocked"
+        // from "no GPU at all" for an opaque open failure.
+        assert_eq!(
+            classify_encoder_status(EncoderFailure::Other, true),
+            "blocked"
+        );
+        assert_eq!(
+            classify_encoder_status(EncoderFailure::Other, false),
+            "no_driver"
+        );
+    }
+
+    #[test]
     fn hw_session_limits_is_empty_when_no_family_probed() {
         let limits = HwSessionLimits::default();
         assert!(limits.is_empty());
@@ -3136,6 +3407,7 @@ mod tests {
                 ..Default::default()
             },
             vaapi: VaapiCapability::default(),
+            hw_encoder_diagnostics: None,
             cpu: CpuInfo {
                 brand: "Test CPU".into(),
                 physical_cores: 4,
