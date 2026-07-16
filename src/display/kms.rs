@@ -1690,6 +1690,23 @@ fn pick_preferred_mode(info: &drm::control::connector::Info) -> drm::control::Mo
 /// is an integer multiple of the source fps (within ±0.5 Hz tolerance)
 /// rank ahead of others — eliminates the 2:3 / 1:2 pulldown judder a
 /// 25 fps source produces on a 60 Hz panel.
+/// `true` when `refresh_hz` is a clean integer multiple of the source
+/// `fps` — i.e. the panel can present the content judder-free by
+/// repeating each frame a whole number of times.
+///
+/// The tolerance is expressed in Hz against the nearest multiple, not
+/// as a ratio error: a ratio tolerance wide enough to absorb the EMA
+/// fps hint's estimation error (±0.12 at rank-2 multiples) wrongly
+/// classified 50 Hz as a multiple of 24 / 23.976 fps (50/24 = 2.083)
+/// and steered film content onto the judderier cadence. ±0.5 Hz
+/// absorbs both the hint error after 40 frames (< 0.25 Hz) and the
+/// kernel's integer `vrefresh` rounding of fractional NTSC rates
+/// (59.94 → 60), while rejecting 50-vs-48 (2 Hz off) cleanly.
+fn refresh_is_cadence_multiple(refresh_hz: u32, fps: f32) -> bool {
+    let rounded = (refresh_hz as f32 / fps).round();
+    rounded >= 1.0 && (refresh_hz as f32 - rounded * fps).abs() < 0.5
+}
+
 fn pick_mode_for_source_dims_only(
     info: &drm::control::connector::Info,
     src_w: u32,
@@ -1705,16 +1722,9 @@ fn pick_mode_for_source_dims_only(
     // No fps hint → all modes rank A so we fall through to plain
     // highest-refresh ordering.
     let cadence_rank = |refresh_hz: u32| -> u8 {
-        let Some(fps) = src_fps_hint else { return 0 };
-        if fps <= 0.0 {
-            return 0;
-        }
-        let ratio = refresh_hz as f32 / fps;
-        let rounded = ratio.round();
-        if rounded >= 1.0 && (ratio - rounded).abs() < 0.12 {
-            0
-        } else {
-            1
+        match src_fps_hint {
+            Some(fps) if fps > 0.0 && !refresh_is_cadence_multiple(refresh_hz, fps) => 1,
+            _ => 0,
         }
     };
     let exact: Vec<&drm::control::Mode> = modes
@@ -3360,6 +3370,34 @@ mod tests {
         // Environment-dependent (reads /proc/asound) — just assert it
         // returns without panicking on whatever host runs the suite.
         let _ = alsa_hdmi_card_index();
+    }
+
+    #[test]
+    fn cadence_multiple_accepts_clean_multiples() {
+        assert!(refresh_is_cadence_multiple(50, 25.0));
+        assert!(refresh_is_cadence_multiple(50, 50.0));
+        assert!(refresh_is_cadence_multiple(60, 30.0));
+        assert!(refresh_is_cadence_multiple(60, 60.0));
+        assert!(refresh_is_cadence_multiple(48, 24.0));
+        assert!(refresh_is_cadence_multiple(120, 24.0));
+        // Kernel rounds 59.94 Hz modes to vrefresh 60 — a 59.94 fps /
+        // 29.97 fps hint must still rank the "60 Hz" mode as matched.
+        assert!(refresh_is_cadence_multiple(60, 59.94));
+        assert!(refresh_is_cadence_multiple(60, 29.97));
+    }
+
+    #[test]
+    fn cadence_multiple_rejects_pulldown_rates() {
+        // The pre-fix ratio tolerance (|ratio − round| < 0.12) passed
+        // all of these — film content got steered onto 50 Hz.
+        assert!(!refresh_is_cadence_multiple(50, 24.0));
+        assert!(!refresh_is_cadence_multiple(50, 23.976));
+        assert!(!refresh_is_cadence_multiple(60, 25.0));
+        assert!(!refresh_is_cadence_multiple(60, 50.0));
+        assert!(!refresh_is_cadence_multiple(50, 30.0));
+        // Refresh below the source rate can't present every frame.
+        assert!(!refresh_is_cadence_multiple(25, 50.0));
+        assert!(!refresh_is_cadence_multiple(30, 60.0));
     }
 }
 

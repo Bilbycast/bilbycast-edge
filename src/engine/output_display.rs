@@ -72,6 +72,14 @@ use crate::stats::collector::{DisplayStatsCounters, OutputStatsAccumulator};
 // the worst per-frame spike we measured without ballooning latency
 // (the display task still paces against the audio clock, so a deep
 // queue doesn't translate into visible lag).
+/// CPU-blit ceiling: sysmem frames larger than this are refused by the
+/// display loop (a 4K libswscale YUV→BGRA convert into a
+/// write-combining dumb buffer measured ≈7 s/frame). Zero-copy PRIME
+/// frames are exempt. Shared by the top-of-loop gate and the catch-up
+/// drain's park condition.
+const SW_BLIT_MAX_W: u32 = 1920;
+const SW_BLIT_MAX_H: u32 = 1080;
+
 const MPSC_VIDEO_DEPTH: usize = 24;
 const MPSC_AUDIO_DEPTH: usize = 64;
 
@@ -995,6 +1003,7 @@ fn demux_decode_loop(
     let mut demuxer = TsDemuxer::with_audio_track(program_number, audio_track_index);
     let mut video_decoder: Option<VideoDecoder> = None;
     let mut current_video_codec: Option<VideoCodec> = None;
+    let mut deint_state = DeintState::default();
     // HW-decoder open lifecycle. Fresh per flow run, so each flow
     // restart re-attempts the operator's chosen HW backend before
     // falling back to CPU. See `open_video_decoder_with_retry` for
@@ -1069,6 +1078,7 @@ fn demux_decode_loop(
                     &mut aac_decoder,
                     &mut ff_audio_decoder,
                     &mut hw_open_state,
+                    &mut deint_state,
                     &counters,
                     &mut last_video_pts,
                     &mut keyframe_gate,
@@ -1137,6 +1147,7 @@ fn demux_decode_loop(
                         &mut aac_decoder,
                         &mut ff_audio_decoder,
                         &mut hw_open_state,
+                        &mut deint_state,
                         &mut last_unsupported_pixfmt_at,
                         &counters,
                         &vtx,
@@ -1170,6 +1181,7 @@ fn demux_decode_loop(
                         &mut aac_decoder,
                         &mut ff_audio_decoder,
                         &mut hw_open_state,
+                        &mut deint_state,
                         &mut last_unsupported_pixfmt_at,
                         &counters,
                         &vtx,
@@ -1212,6 +1224,7 @@ fn demux_decode_loop(
                         &mut aac_decoder,
                         &mut ff_audio_decoder,
                         &mut hw_open_state,
+                        &mut deint_state,
                         &mut last_unsupported_pixfmt_at,
                         &counters,
                         &vtx,
@@ -1300,6 +1313,12 @@ fn demux_decode_loop(
                         current_ff_codec = Some(AudioDecoderCodec::Opus);
                     }
                     if let Some(decoder) = ff_audio_decoder.as_mut() {
+                        // Per-frame PTS interpolation across the PES — see
+                        // the `OtherAudio` arm below. An Opus PES commonly
+                        // packs ~9 20 ms packets (180 ms), so PES-PTS
+                        // stamping sawtoothed the AudioClock hardest here.
+                        let mut samples_out: u64 = 0;
+                        let mut last_frame_samples: u64 = 0;
                         for frame_bytes in
                             crate::engine::audio_decode::split_opus_frames(&data)
                         {
@@ -1313,9 +1332,18 @@ fn demux_decode_loop(
                                             decoded.channels as u8,
                                         );
                                     }
+                                    let frame_pts = if decoded.sample_rate > 0 {
+                                        pts + samples_out * 90_000
+                                            / decoded.sample_rate as u64
+                                    } else {
+                                        pts
+                                    };
+                                    last_frame_samples =
+                                        decoded.samples_per_channel as u64;
+                                    samples_out += last_frame_samples;
                                     if atx.try_send(AudioBlock {
                                         planar: decoded.planar,
-                                        pts_90k: pts,
+                                        pts_90k: frame_pts,
                                         sample_rate: decoded.sample_rate,
                                         channels: decoded.channels,
                                         frame_gen: frame_gen.load(Ordering::Relaxed),
@@ -1328,6 +1356,9 @@ fn demux_decode_loop(
                                 }
                             } else {
                                 audio_decode_counters.inc_error();
+                                // See the `OtherAudio` arm — a lost frame
+                                // still occupies its mux-schedule slot.
+                                samples_out += last_frame_samples;
                             }
                         }
                     } else {
@@ -1350,6 +1381,7 @@ fn demux_decode_loop(
                         &mut aac_decoder,
                         &mut ff_audio_decoder,
                         &mut hw_open_state,
+                        &mut deint_state,
                         &counters,
                         &mut last_video_pts,
                         &mut keyframe_gate,
@@ -1431,6 +1463,17 @@ fn demux_decode_loop(
                         current_ff_codec = Some(codec);
                     }
                     if let Some(decoder) = ff_audio_decoder.as_mut() {
+                        // Per-frame PTS interpolation across a multi-frame
+                        // PES, mirroring `extract_aac_frames` for ADTS: the
+                        // j-th decoded frame is stamped `pes_pts + decoded
+                        // samples so far / rate`, not the PES PTS. A DVB
+                        // mux packs 2–6 MP2/AC-3 frames per PES; stamping
+                        // them all with one PTS made the AudioClock — the
+                        // video pacing master — under-read true playout by
+                        // (N−1)×frame_duration, a 50–150 ms sawtooth that
+                        // presented as motion judder on non-AAC feeds.
+                        let mut samples_out: u64 = 0;
+                        let mut last_frame_samples: u64 = 0;
                         for frame_bytes in
                             crate::engine::audio_decode::split_audio_codec_frames(&data, codec)
                         {
@@ -1444,9 +1487,18 @@ fn demux_decode_loop(
                                             decoded.channels as u8,
                                         );
                                     }
+                                    let frame_pts = if decoded.sample_rate > 0 {
+                                        pts + samples_out * 90_000
+                                            / decoded.sample_rate as u64
+                                    } else {
+                                        pts
+                                    };
+                                    last_frame_samples =
+                                        decoded.samples_per_channel as u64;
+                                    samples_out += last_frame_samples;
                                     if atx.try_send(AudioBlock {
                                         planar: decoded.planar,
-                                        pts_90k: pts,
+                                        pts_90k: frame_pts,
                                         sample_rate: decoded.sample_rate,
                                         channels: decoded.channels,
                                         frame_gen: frame_gen.load(Ordering::Relaxed),
@@ -1459,6 +1511,14 @@ fn demux_decode_loop(
                                 }
                             } else {
                                 audio_decode_counters.inc_error();
+                                // The undecodable frame still occupied
+                                // its slot in the mux schedule — advance
+                                // the interpolation accumulator so the
+                                // PES's remaining frames aren't stamped
+                                // early (the AudioClock is the video
+                                // pacing master; a skipped slot showed
+                                // up as ±1-frame pacing wobble).
+                                samples_out += last_frame_samples;
                             }
                         }
                     } else {
@@ -1888,6 +1948,7 @@ fn flush_decoders_for_switch(
     aac_decoder: &mut Option<AacDecoder>,
     ff_audio_decoder: &mut Option<FfAudioDecoder>,
     state: &mut HwOpenState,
+    deint: &mut DeintState,
     counters: &DisplayStatsCounters,
     last_video_pts: &mut Option<u64>,
     keyframe_gate: &mut KeyframeGate,
@@ -1905,6 +1966,13 @@ fn flush_decoders_for_switch(
         d.flush();
     }
     *last_video_pts = None;
+    // Drop the deinterlacer's PTS tracking across the epoch boundary so
+    // a cross-stream delta can't corrupt the field-duration estimate;
+    // the estimate itself and the one-shot event gate survive (same
+    // panel, likely the same format family — and re-emitting the
+    // "deinterlace engaged" Info on every switch would be spam).
+    deint.last_pts_90k = None;
+    deint.pending_delta_90k = None;
     keyframe_gate.arm();
     // Bump the shared generation counter so any decoded frames already
     // queued in the demux→display + demux→audio mpscs get dropped on
@@ -1991,6 +2059,7 @@ fn handle_video_au(
     aac_decoder: &mut Option<AacDecoder>,
     ff_audio_decoder: &mut Option<FfAudioDecoder>,
     hw_open_state: &mut HwOpenState,
+    deint: &mut DeintState,
     last_unsupported_pixfmt_at: &mut Option<Instant>,
     counters: &DisplayStatsCounters,
     vtx: &mpsc::Sender<VideoFrame>,
@@ -2026,6 +2095,7 @@ fn handle_video_au(
             aac_decoder,
             ff_audio_decoder,
             hw_open_state,
+            deint,
             counters,
             last_video_pts,
             keyframe_gate,
@@ -2112,6 +2182,7 @@ fn handle_video_au(
         hw_open_state.backend,
         last_unsupported_pixfmt_at,
         hw_open_state,
+        deint,
         frame_gen,
         codec,
         panel_hdr_capable,
@@ -2322,8 +2393,90 @@ fn feed_video_decoder(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-#[allow(clippy::too_many_arguments)]
+/// Deinterlace state for one demux-decode run: a one-shot gate for the
+/// operator event plus the measured field duration used to offset the
+/// second bob field's PTS. Fresh per flow run.
+struct DeintState {
+    engaged_event_emitted: bool,
+    /// Display-order PTS of the previous *interlaced* decoded frame —
+    /// consecutive deltas measure the source frame period.
+    last_pts_90k: Option<u64>,
+    /// Candidate frame-period delta awaiting confirmation. A delta is
+    /// adopted into `field_dur_90k` only when two consecutive deltas
+    /// agree (±12.5 %) — an isolated gap (one lost/undecodable frame,
+    /// a mixed film/video cadence run) would otherwise stamp the next
+    /// frame's second field a full frame period late.
+    pending_delta_90k: Option<u64>,
+    /// One field period in 90 kHz ticks (half the measured frame
+    /// period). Defaults to 1800 (20 ms — 50i) until measured.
+    field_dur_90k: u64,
+}
+
+impl Default for DeintState {
+    fn default() -> Self {
+        Self {
+            engaged_event_emitted: false,
+            last_pts_90k: None,
+            pending_delta_90k: None,
+            field_dur_90k: 1_800,
+        }
+    }
+}
+
+/// Row-replication bob deinterlace of one plane: rebuild a full-height
+/// plane using only the rows of one field (`parity` 0 = top-field rows
+/// 0,2,4…; 1 = bottom-field rows 1,3,5…), replicating each field row
+/// over its missing neighbour. Copies whole rows, so it is
+/// element-width agnostic — safe for every 8/10/12-bit planar and
+/// semi-planar layout the sysmem dispatch produces (including
+/// interleaved-UV rows, whose per-row field parity matches luma).
+fn bob_plane(src: &[u8], stride: usize, parity: usize) -> Vec<u8> {
+    let mut out = src.to_vec();
+    if stride == 0 {
+        return out;
+    }
+    let rows = src.len() / stride;
+    if rows < 2 {
+        return out;
+    }
+    for j in 0..rows {
+        let mut src_row = (j & !1usize) + parity;
+        if src_row >= rows {
+            src_row = rows - 1;
+        }
+        if src_row != j {
+            let (dst_off, src_off) = (j * stride, src_row * stride);
+            out.copy_within(src_off..src_off + stride, dst_off);
+        }
+    }
+    out
+}
+
+/// Bob one field (luma + chroma) out of a prepared sysmem frame. See
+/// [`bob_plane`] for the row semantics.
+fn bob_field(
+    y: &[u8],
+    y_stride: usize,
+    chroma: &VideoFrameChroma,
+    parity: usize,
+) -> (Vec<u8>, VideoFrameChroma) {
+    let by = bob_plane(y, y_stride, parity);
+    let bc = match chroma {
+        VideoFrameChroma::Planar { u, u_stride, v, v_stride } => VideoFrameChroma::Planar {
+            u: bob_plane(u, *u_stride, parity),
+            u_stride: *u_stride,
+            v: bob_plane(v, *v_stride, parity),
+            v_stride: *v_stride,
+        },
+        VideoFrameChroma::SemiPlanar { uv, uv_stride } => VideoFrameChroma::SemiPlanar {
+            uv: bob_plane(uv, *uv_stride, parity),
+            uv_stride: *uv_stride,
+        },
+        VideoFrameChroma::None => VideoFrameChroma::None,
+    };
+    (by, bc)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn drain_video_frames(
     decoder: &mut VideoDecoder,
@@ -2336,6 +2489,7 @@ fn drain_video_frames(
     backend: DecoderBackend,
     last_unsupported_pixfmt_at: &mut Option<Instant>,
     state: &mut HwOpenState,
+    deint: &mut DeintState,
     frame_gen: &AtomicU64,
     codec: VideoCodec,
     panel_hdr_capable: bool,
@@ -2404,6 +2558,55 @@ fn drain_video_frames(
         let color_transfer = frame.color_transfer();
         let full_range = frame.is_full_range();
         let pixel_format = frame.pixel_format();
+        let interlaced = frame.is_interlaced();
+        let top_field_first = frame.top_field_first();
+
+        if interlaced {
+            // Track the source frame period off display-order PTS
+            // deltas; half of it offsets the second bob field below.
+            if let Some(prev) = deint.last_pts_90k {
+                let delta = pts_90k.wrapping_sub(prev);
+                // 10–100 ms of frame period covers 10–100 fps; a delta
+                // outside that is a PTS jump / reorder artefact — keep
+                // the previous estimate. Within range, adopt only after
+                // two consecutive agreeing deltas (see
+                // `pending_delta_90k`).
+                if (900..=9_000).contains(&delta) {
+                    if let Some(prev_delta) = deint.pending_delta_90k
+                        && delta.abs_diff(prev_delta) <= prev_delta / 8
+                    {
+                        deint.field_dur_90k = delta / 2;
+                    }
+                    deint.pending_delta_90k = Some(delta);
+                } else {
+                    deint.pending_delta_90k = None;
+                }
+            }
+            deint.last_pts_90k = Some(pts_90k);
+            // One-shot operator visibility: interlaced content is
+            // rendered by splitting each frame into its two fields
+            // (bob), not by weaving — say so once so a 50-fields/s
+            // presentation of a "25 fps" source isn't a surprise.
+            if !deint.engaged_event_emitted {
+                deint.engaged_event_emitted = true;
+                event_sender.emit_output_with_details(
+                    EventSeverity::Info,
+                    crate::manager::events::category::DISPLAY,
+                    format!(
+                        "Display output '{output_id}': interlaced source detected \
+                         ({width}x{height}) — bob deinterlacing engaged, fields \
+                         presented at 2x frame rate"
+                    ),
+                    output_id,
+                    serde_json::json!({
+                        "error_code": "display_deinterlace_engaged",
+                        "width": width,
+                        "height": height,
+                        "top_field_first": top_field_first,
+                    }),
+                );
+            }
+        }
 
         // ── HDR routing for VAAPI sources ───────────────────────────
         //
@@ -2477,10 +2680,16 @@ fn drain_video_frames(
         // host, sysmem download + CPU-blit is the ONLY way to a picture, so
         // we pay the libswscale cost even above 1080p rather than black-screen.
         let prime_dead = prime_scanout_failed.load(Ordering::Relaxed);
+        // (3. — interlaced source: the PRIME scanout would weave the
+        // two fields into one combing progressive frame; the CPU path
+        // below bob-deinterlaces instead. Interlaced content tops out
+        // at 1080i so the `!over_sw_ceiling` guard never bites in
+        // practice.)
         let need_sysmem = frame.is_vaapi()
             && (prime_dead
                 || (!over_sw_ceiling
                     && ((source_is_hdr && !panel_hdr_capable)
+                        || interlaced
                         || force_cpu_blit_for_bars.load(Ordering::Relaxed))));
         let frame =
             if need_sysmem {
@@ -2723,6 +2932,48 @@ fn drain_video_frames(
             continue;
         };
 
+        // Interlaced sysmem frame → bob deinterlace: present each field
+        // as its own full-height frame (missing rows replicated from
+        // the field's own rows) at 2× the frame rate, the second field
+        // offset by one field duration. Weaving both fields into one
+        // progressive scanout — the pre-fix behaviour — combed every
+        // moving edge and halved the motion rate on 1080i/576i, still
+        // the dominant broadcast emission formats. The display loop's
+        // frame-period EMA measures the field cadence, so the
+        // auto-match mode picker naturally locks the panel to the
+        // *field* rate (50 Hz for 1080i25).
+        if interlaced {
+            let first_parity: usize = if top_field_first { 0 } else { 1 };
+            let cur_gen = frame_gen.load(Ordering::Relaxed);
+            for (i, parity) in [first_parity, 1 - first_parity].into_iter().enumerate() {
+                let (by, bc) = bob_field(&y, y_stride, &chroma, parity);
+                let out_frame = VideoFrame {
+                    y: by,
+                    y_stride,
+                    chroma: bc,
+                    prime: None,
+                    width,
+                    height,
+                    pixel_format: out_pix_fmt,
+                    colorspace,
+                    color_transfer,
+                    full_range,
+                    pts_90k: pts_90k.wrapping_add(i as u64 * deint.field_dur_90k),
+                    frame_gen: cur_gen,
+                    codec,
+                    video_pid: stream_ids.video_pid,
+                    audio_pid: stream_ids.audio_pid,
+                    program_number: stream_ids.program_number,
+                };
+                if vtx.try_send(out_frame).is_err() {
+                    counters
+                        .frames_dropped_mpsc_full
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            continue;
+        }
+
         let out_frame = VideoFrame {
             y,
             y_stride,
@@ -2884,6 +3135,19 @@ fn display_loop(
     // on until the resolution / input switch path resets it.
     let mut fps_locked: bool = false;
     let mut frames_since_period_reset: u32 = 0;
+    // The `(width, height, fps)` hint from the last *fresh*
+    // (EMA-stabilised) fps-locked modeset. Carried across PTS jumps /
+    // input switches as a stale fallback hint: switching between
+    // same-format sources then picks the same mode on the first try and
+    // `match_source_resolution` no-ops — previously every switch paid a
+    // hintless re-pick (often hopping a 50 Hz panel back to 60 Hz)
+    // followed by a second fps-locked re-modeset 40 frames later: two
+    // full HDMI link retrains (0.5–2 s of black each) between identical
+    // 25/50 fps sources. Scoped to the dims it was measured at — a
+    // cross-format switch (720p50 → 1080p29.97) must fall back to the
+    // hintless highest-refresh pick, or the old stream's rate steers
+    // the new dims onto a wrong-cadence mode and buys an extra retrain.
+    let mut last_fps_hint: Option<(u32, u32, f32)> = None;
 
     // Wall-clock pacer used when audio is muted (no `AudioClock` to
     // pace against). Anchors on the first frame's PTS + the wall-clock
@@ -2896,6 +3160,13 @@ fn display_loop(
     // resolution change or large PTS jump so a stream switch starts
     // fresh.
     let mut wall_anchor: Option<(u64, Instant)> = None;
+
+    // One-frame stash for the catch-up drain below: when the drain
+    // pulls a frame that crossed a generation bump or a resolution
+    // change, that frame must run the full per-frame checks at the top
+    // of the loop (stale-gen gate, SW-blit ceiling, mode re-arm), so it
+    // parks here and becomes `next` on the following iteration.
+    let mut pending: Option<VideoFrame> = None;
 
     // Video is paced directly to the measured audio-playout position
     // (`AudioClock`, now driven by `snd_pcm_delay()` in `audio.rs`). We
@@ -2923,9 +3194,12 @@ fn display_loop(
     // buffer instead.
 
     while !cancel.is_cancelled() {
-        let next = match vrx.blocking_recv() {
+        let mut next = match pending.take() {
             Some(f) => f,
-            None => break,
+            None => match vrx.blocking_recv() {
+                Some(f) => f,
+                None => break,
+            },
         };
 
         // Drop frames decoded before the most recent switch / Lagged /
@@ -2966,8 +3240,6 @@ fn display_loop(
         // automatically when `next.prime.is_some()` — the zero-copy
         // path skips libswscale entirely, so 4K HEVC scans out at the
         // panel's native cadence.
-        const SW_BLIT_MAX_W: u32 = 1920;
-        const SW_BLIT_MAX_H: u32 = 1080;
         const SW_CEILING_WARN_INTERVAL: std::time::Duration =
             std::time::Duration::from_secs(30);
         let zero_copy = next.prime.is_some();
@@ -3075,18 +3347,24 @@ fn display_loop(
         //   it's a no-op on the steady-state path.
         if matched_dims.is_none() {
             // Convert the demuxer's running frame-period estimate into
-            // an fps hint. Until we've seen ≥ 2 frames `frame_period_ms`
-            // is the 33 ms (30 fps) default, which would push the
-            // mode-picker toward 60 Hz; once a few frames have arrived
-            // and the EMA settles, the real source fps drives a clean
+            // an fps hint. Until we've seen ≥ 40 frames `frame_period_ms`
+            // is still settling from the 33 ms (30 fps) default; once
+            // the EMA stabilises, the real source fps drives a clean
             // panel-refresh choice (50 Hz for 25/50 fps, 60 Hz for
-            // 30/60 fps). Pass `None` while the period is still at the
-            // default so the picker falls back to highest-refresh and
-            // the auto-match re-fires once the period has stabilised.
-            let src_fps_hint = if frames_since_period_reset >= 40 {
+            // 30/60 fps). While the EMA is still warming, fall back to
+            // the hint from the last fps-locked modeset (`last_fps_hint`)
+            // — an input switch between same-format sources then picks
+            // the same mode immediately and skips the modeset entirely.
+            // Only a genuinely fresh hint sets `fps_locked`, so the
+            // 40-frame re-fire still verifies (and, when the stale hint
+            // was right, no-ops inside `match_source_resolution`).
+            let fresh_fps_hint = frames_since_period_reset >= 40;
+            let src_fps_hint = if fresh_fps_hint {
                 Some(1000.0 / frame_period_ms as f32)
             } else {
-                None
+                last_fps_hint
+                    .filter(|(w, h, _)| *w == next.width && *h == next.height)
+                    .map(|(_, _, fps)| fps)
             };
             let (modeset, ok_code, err_code, ok_verb, err_verb) = match scaling_mode {
                 DisplayScalingMode::MatchSource => (
@@ -3170,12 +3448,14 @@ fn display_loop(
             );
             stats_registered = true;
             matched_dims = Some((next.width, next.height));
-            // The hint we passed was real iff frame_period_ms had
-            // already moved off its default. If it had, the picker has
-            // committed to an fps-aligned panel mode and we don't need
-            // to fire again.
-            if src_fps_hint.is_some() {
+            // Only a *fresh* (EMA-stabilised) hint locks the fps and is
+            // remembered for the next switch — a stale carried hint
+            // leaves `fps_locked` false so the 40-frame re-fire still
+            // verifies the new stream's real rate.
+            if fresh_fps_hint {
                 fps_locked = true;
+                last_fps_hint =
+                    src_fps_hint.map(|fps| (next.width, next.height, fps));
             }
         }
 
@@ -3195,7 +3475,13 @@ fn display_loop(
                 fps_locked = false;
                 frames_since_period_reset = 0;
             } else if (10..=200).contains(&dms) {
-                frame_period_ms = frame_period_ms * 0.875 + dms as f64 * 0.125;
+                // Feed the EMA with *fractional* milliseconds: the
+                // integer-truncated delta biases NTSC-family rates
+                // (59.94 fps = 1501.5 ticks → 16 ms → a 62.5 fps hint)
+                // far past the mode-picker's ±0.5 Hz cadence tolerance,
+                // steering e.g. a 59.94 fps source onto a 75 Hz mode.
+                let dms_f = forward as f64 / 90.0;
+                frame_period_ms = frame_period_ms * 0.875 + dms_f * 0.125;
                 frames_since_period_reset = frames_since_period_reset.saturating_add(1);
             }
         }
@@ -3223,18 +3509,35 @@ fn display_loop(
         // interpolates the audio PTS forward by wall-clock between
         // ALSA writes so the per-frame drift estimate is steady to
         // sub-ms instead of swinging ±20 ms across each period
-        // boundary. Frames so far behind they can't catch up are
-        // still dropped at 2× period — that case still shows up on a
-        // genuinely overloaded host or after a long Lagged event and
-        // displaying a stale frame is more visible than dropping it.
-        // Drop only frames so far behind the audio clock that catching
-        // up by re-pacing isn't realistic. 4× source period (160 ms at
-        // 25 fps, 100 ms at 60 fps).
-        // Drop frames more than this far behind the reference clock — a
-        // hopelessly-late frame (overloaded host, long Lagged burst) is
-        // better skipped than shown stale. Also the cap on the forward
-        // wait below. 4× source period (160 ms at 25 fps, 100 ms at 60 fps).
-        let drop_threshold_ms: i64 = ((frame_period_ms as i64) * 4).max(160);
+        // boundary.
+        //
+        // On the *late* side, a frame is skipped only when a fresher
+        // frame is already queued behind it (the catch-up drain below)
+        // — a late frame with nothing behind it is still the freshest
+        // content we have, and presenting it beats holding the panel on
+        // the previous (even staler) frame. The old policy dropped late
+        // frames unconditionally behind a 4×-period/160 ms floor with
+        // no queue look-ahead: because the present path is serial
+        // (sleep → blit → blocking page-flip), any source whose
+        // delivery rate persistently exceeded the sustainable present
+        // rate (60.00 fps on a 59.94 Hz panel mode, CPU blit + tonemap
+        // over one vblank) latched video 143–160 ms behind audio
+        // *forever* — each drop recovered one period while the backlog
+        // kept refilling.
+        //
+        // `catchup_cap_ms` caps the forward wait below so a large
+        // startup mux interleave (audio buffered ~1 s ahead of the
+        // matching video) converges over ~a second of gentle slow-in
+        // rather than a single long freeze. 4× source period, floored
+        // at 160 ms.
+        let catchup_cap_ms: i64 = ((frame_period_ms as i64) * 4).max(160);
+        // Arms the catch-up drain: a frame further behind the reference
+        // than this, with a fresher frame already queued, is skipped in
+        // O(µs) instead of paying a present slot. 2× source period,
+        // floored at 50 ms — tight enough to bound the worst-case V−A
+        // error at ~2 periods under sustained overload, loose enough
+        // that decoder burst jitter (B-frame reorder) never trips it.
+        let late_skip_ms: i64 = ((frame_period_ms as i64) * 2).max(50);
         // Hand the buffer to KMS a hair before its target vblank — the
         // page-flip blocks for up to one vblank inside `kms.present()`, so
         // over-sleeping by even a millisecond pushes the scan-out a full
@@ -3257,39 +3560,132 @@ fn display_loop(
                 wall_anchor.get_or_insert_with(|| (next.pts_90k, now));
             let pts_delta_ms = (next.pts_90k.wrapping_sub(*anchor_pts) as i64) / 90;
             let wall_delta_ms = now.duration_since(*anchor_at).as_millis() as i64;
-            Some(pts_delta_ms - wall_delta_ms)
+            let drift_ms = pts_delta_ms - wall_delta_ms;
+            // Anchor servo. The source's PTS clock and the host wall
+            // clock are different crystals (MPEG allows ±30 ppm; cheap
+            // encoders exceed it), so against a *fixed* anchor the
+            // offset accumulates without bound — at 30 ppm every frame
+            // fell past the old late-drop band after ~90 min and the
+            // panel silently froze for hours until the drift crossed
+            // the −2 s rebase limit. Outside a one-period deadband,
+            // slew the anchor toward zero drift at ≤ 250 µs per frame:
+            // ~60× the worst-case accumulation rate (100 ppm × 40 ms
+            // = 4 µs/frame), yet far below anything visible. A muted
+            // output has no audio to stay aligned with — a standing
+            // sub-period offset is meaningless; boundedness is what
+            // matters.
+            let deadband_ms = frame_period_ms as i64;
+            if drift_ms.unsigned_abs() as i64 > deadband_ms {
+                let excess_ms = (drift_ms.unsigned_abs() as i64 - deadband_ms) as u64;
+                let step = std::time::Duration::from_micros(250)
+                    .min(std::time::Duration::from_millis(excess_ms));
+                if drift_ms > 0 {
+                    // Frame runs ahead of the wall timeline — pull the
+                    // anchor back so future targets land earlier.
+                    if let Some(adj) = anchor_at.checked_sub(step) {
+                        *anchor_at = adj;
+                    }
+                } else {
+                    *anchor_at += step;
+                }
+            }
+            Some(drift_ms)
         };
 
-        if let Some(raw_drift_ms) = raw_drift_ms_opt {
+        if let Some(mut raw_drift_ms) = raw_drift_ms_opt {
+            // Catch-up drain: this frame is already behind the reference
+            // clock AND fresher frames are queued behind it — fast-forward
+            // to the freshest one instead of paying one present slot per
+            // stale frame. EXCEPT when the frame is so far behind that
+            // this is a clock re-base, not a late frame: on an input
+            // switch the new stream's PTS epoch can sit seconds below the
+            // (still-old-stream) audio playout for the brief window before
+            // the audio task re-anchors. Draining or dropping there would
+            // blank the whole new stream's video; instead present it and
+            // let the measured clock re-converge over the next few frames.
+            const REBASE_LIMIT_MS: i64 = 2_000;
+            let mut drift_is_stale = false;
+            while raw_drift_ms < -late_skip_ms && raw_drift_ms >= -REBASE_LIMIT_MS {
+                let Ok(newer) = vrx.try_recv() else {
+                    // Nothing fresher queued — the late frame is still the
+                    // newest content we have; present it rather than hold
+                    // the panel on the previous (even staler) frame.
+                    break;
+                };
+                // Park-and-break cases: frames the drain must NOT
+                // fast-forward through, because the full per-frame checks
+                // at the top of the loop own them.
+                //  * generation bump / dims change — stale-gen gate +
+                //    mode re-arm;
+                //  * a sysmem frame over the SW-blit ceiling (a 4K
+                //    prime→CPU demotion mid-backlog) — presenting it here
+                //    would wedge the thread in a multi-second libswscale
+                //    blit the top-of-loop gate exists to refuse;
+                //  * a two-sided PTS discontinuity > 1 s — the loop-top
+                //    stream-change detector must see it to reset
+                //    wall_anchor / frame-period EMA / mode match;
+                //    swallowing it here left a muted output pacing
+                //    against a stale anchor epoch for minutes.
+                let jump_fwd = newer.pts_90k.wrapping_sub(next.pts_90k);
+                let jump_back = next.pts_90k.wrapping_sub(newer.pts_90k);
+                if newer.frame_gen != next.frame_gen
+                    || newer.width != next.width
+                    || newer.height != next.height
+                    || (newer.prime.is_none()
+                        && (newer.width > SW_BLIT_MAX_W
+                            || newer.height > SW_BLIT_MAX_H))
+                    || (jump_fwd > 90_000 && jump_back > 90_000)
+                {
+                    pending = Some(newer);
+                    break;
+                }
+                // Keep the frame-period EMA fed with real frame-to-frame
+                // deltas across the skip so the thresholds stay honest.
+                let dms = (newer.pts_90k.wrapping_sub(next.pts_90k) as i64) / 90;
+                if (10..=200).contains(&dms) {
+                    let dms_f = newer.pts_90k.wrapping_sub(next.pts_90k) as f64 / 90.0;
+                    frame_period_ms = frame_period_ms * 0.875 + dms_f * 0.125;
+                    frames_since_period_reset =
+                        frames_since_period_reset.saturating_add(1);
+                }
+                last_pts = Some(newer.pts_90k);
+                counters.frames_dropped_late.fetch_add(1, Ordering::Relaxed);
+                next = newer;
+                raw_drift_ms = if let Some(audio_pts) =
+                    clock.current_pts_90k_smoothed()
+                {
+                    (next.pts_90k as i64 - audio_pts as i64) / 90
+                } else if let Some((anchor_pts, anchor_at)) = wall_anchor.as_ref() {
+                    ((next.pts_90k.wrapping_sub(*anchor_pts) as i64) / 90)
+                        - anchor_at.elapsed().as_millis() as i64
+                } else {
+                    // Pacing reference vanished mid-drain (audio task
+                    // stalled past the staleness cutoff) — present what
+                    // we have and let the next iteration re-anchor.
+                    // `raw_drift_ms` still describes the *skipped*
+                    // frame, so don't report it as this frame's offset.
+                    drift_is_stale = true;
+                    break;
+                };
+            }
             // Surface the raw V−A offset to the operator. We drive this
             // toward zero by present-to-playout (below), so a sustained
             // non-zero value is a real lip-sync problem — not an absorbed
             // baseline as in the previous EMA design.
-            counters.store_av_offset_ms(
-                raw_drift_ms.clamp(i32::MIN as i64, i32::MAX as i64) as i32,
-            );
-            // Negative beyond the drop threshold → the frame is behind the
-            // audio the operator is hearing; drop it. EXCEPT when it's so far
-            // behind that this is a clock re-base, not a late frame: on an
-            // input switch the new stream's PTS epoch can sit seconds below
-            // the (still-old-stream) audio playout for the brief window before
-            // the audio task re-anchors. Dropping there would blank the whole
-            // new stream's video; instead present it and let the measured
-            // clock re-converge over the next few frames.
-            const REBASE_LIMIT_MS: i64 = 2_000;
-            if raw_drift_ms < -drop_threshold_ms && raw_drift_ms >= -REBASE_LIMIT_MS {
-                counters.frames_dropped_late.fetch_add(1, Ordering::Relaxed);
-                continue;
+            if !drift_is_stale {
+                counters.store_av_offset_ms(
+                    raw_drift_ms.clamp(i32::MIN as i64, i32::MAX as i64) as i32,
+                );
             }
             // Positive → this frame is ahead of the audio playout; wait
             // until the sound reaches it so the picture is shown exactly
-            // when its audio plays. Capped at `drop_threshold_ms` so a large
+            // when its audio plays. Capped at `catchup_cap_ms` so a large
             // startup mux interleave (audio buffered ~1 s ahead of the
             // matching video) converges over ~a second of gentle slow-in
             // rather than a single long freeze.
             if raw_drift_ms > PRESENT_MARGIN_MS {
                 let sleep_ms =
-                    (raw_drift_ms - PRESENT_MARGIN_MS).min(drop_threshold_ms) as u64;
+                    (raw_drift_ms - PRESENT_MARGIN_MS).min(catchup_cap_ms) as u64;
                 // Absolute CLOCK_MONOTONIC sleep — eliminates the ±1–2 ms
                 // slop of `std::thread::sleep` on SCHED_OTHER, which at
                 // 60 Hz can push the next page-flip a full vblank late on
@@ -4332,5 +4728,57 @@ mod tests {
         assert!(gate.admit(false), "gate stays open");
         gate.arm();
         assert!(!gate.admit(false), "re-arm restores a fresh time budget");
+    }
+
+    /// Bob deinterlace row semantics: parity 0 rebuilds the plane from
+    /// top-field rows (0,2,4…), parity 1 from bottom-field rows
+    /// (1,3,5…), each field row replicated over its missing neighbour.
+    #[test]
+    fn bob_plane_replicates_field_rows() {
+        // 4 rows × 2 bytes: rows [0,0], [1,1], [2,2], [3,3].
+        let src: Vec<u8> = vec![0, 0, 1, 1, 2, 2, 3, 3];
+        assert_eq!(bob_plane(&src, 2, 0), vec![0, 0, 0, 0, 2, 2, 2, 2]);
+        assert_eq!(bob_plane(&src, 2, 1), vec![1, 1, 1, 1, 3, 3, 3, 3]);
+    }
+
+    /// Odd row counts clamp the replicated source row to the last row
+    /// instead of reading past the plane.
+    #[test]
+    fn bob_plane_clamps_on_odd_row_count() {
+        // 3 rows × 1 byte: [0], [1], [2].
+        let src: Vec<u8> = vec![0, 1, 2];
+        assert_eq!(bob_plane(&src, 1, 0), vec![0, 0, 2]);
+        // Bottom field, row 2 wants row 3 — clamps to row 2.
+        assert_eq!(bob_plane(&src, 1, 1), vec![1, 1, 2]);
+    }
+
+    /// Degenerate shapes must pass through untouched rather than panic:
+    /// zero stride (defensive) and single-row planes.
+    #[test]
+    fn bob_plane_degenerate_shapes_pass_through() {
+        assert_eq!(bob_plane(&[7, 8], 0, 0), vec![7, 8]);
+        assert_eq!(bob_plane(&[7, 8], 2, 1), vec![7, 8]);
+    }
+
+    /// Semi-planar chroma (interleaved UV rows) bobs with the same row
+    /// parity as luma — one UV row per chroma line, so field parity is
+    /// row parity there too.
+    #[test]
+    fn bob_field_covers_semiplanar_chroma() {
+        let y: Vec<u8> = vec![10, 11, 12, 13]; // 4 rows × 1
+        let chroma = VideoFrameChroma::SemiPlanar {
+            uv: vec![20, 21, 22, 23], // 2 rows × 2 (interleaved U,V)
+            uv_stride: 2,
+        };
+        let (by, bc) = bob_field(&y, 1, &chroma, 0);
+        assert_eq!(by, vec![10, 10, 12, 12]);
+        match bc {
+            VideoFrameChroma::SemiPlanar { uv, uv_stride } => {
+                // 2 chroma rows: parity 0 keeps row 0 for both.
+                assert_eq!(uv, vec![20, 21, 20, 21]);
+                assert_eq!(uv_stride, 2);
+            }
+            _ => panic!("chroma layout must be preserved"),
+        }
     }
 }
