@@ -16,11 +16,11 @@
 //!   them — holding the transport stream up is what downstream wants — but raise
 //!   a Warning, and an Info when the signal returns. This is the common case and
 //!   it does *not* restart anything.
-//! * **Raster change**, or the device disappearing entirely. The session is torn
-//!   down, a Warning is raised, and the device is re-opened (with
-//!   `format: "auto"` that re-detects the new raster). The MPEG-TS muxer and the
-//!   video/audio clocks persist across re-opens so downstream never sees the PCR
-//!   or continuity counters step backwards.
+//! * **Format change** (raster or frame rate), or the device disappearing
+//!   entirely. The session is torn down, a Warning is raised, and the device is
+//!   re-opened (with `format: "auto"` that re-detects the new format). The
+//!   MPEG-TS muxer and the video/audio clocks persist across re-opens so
+//!   downstream never sees the PCR or continuity counters step backwards.
 //! * **Unrecoverable config** — an unsupported pixel format or chroma, or an
 //!   encoder that will not open. These stop the input, since re-opening would
 //!   just spin.
@@ -38,8 +38,11 @@ use tracing::{debug, info};
 
 use crate::config::models::SdiInputConfig;
 use crate::engine::packet::RtpPacket;
-use crate::manager::events::{EventSender, EventSeverity, category};
+use crate::manager::events::{Event, EventSender, EventSeverity, category};
 use crate::stats::collector::FlowStatsAccumulator;
+
+#[cfg(feature = "media-codecs")]
+use std::time::Instant;
 
 #[cfg(feature = "media-codecs")]
 use crate::stats::collector::SdiCaptureStats;
@@ -52,6 +55,62 @@ use decklink_rs::{CapturedFrame, DecklinkCapture, DecklinkCaptureConfig, Decklin
 use super::audio_encode::{AudioCodec, AudioEncoder, EncoderParams};
 #[cfg(feature = "media-codecs")]
 use crate::stats::collector::OutputStatsAccumulator;
+
+/// Emit an SDI-input event.
+///
+/// `details` carries the `error_code`: the manager matches alarm rules against
+/// `details.error_code` alone and never reads the message text. The flow *and*
+/// input scope are both set so the UI can attach the alarm to the input's row.
+fn emit_sdi(
+    event_sender: &EventSender,
+    severity: EventSeverity,
+    input_id: &str,
+    flow_id: &str,
+    message: String,
+    details: serde_json::Value,
+) {
+    event_sender.send(Event {
+        severity,
+        category: category::FLOW.to_string(),
+        message,
+        details: Some(details),
+        flow_id: Some(flow_id.to_string()),
+        input_id: Some(input_id.to_string()),
+        output_id: None,
+    });
+}
+
+/// 90 kHz presentation timestamp of capture frame `frame_idx`, on a timeline
+/// based at `base`.
+///
+/// Derived from the frame index against the exact rational frame period rather
+/// than accumulated from a per-frame step: `90_000 * den / num` is not an
+/// integer at 23.976 (3753.75) or 59.94 (1501.5), and a truncated step
+/// accumulates the residue forever — 17.3 s/day and 28.8 s/day respectively.
+/// Nothing downstream of an SDI input re-anchors video, while the AAC encoder
+/// anchors once and self-advances by exact sample count, so every lost tick
+/// lands as permanent lip-sync error. The u128 intermediate cannot overflow at
+/// any reachable frame count.
+#[cfg(feature = "media-codecs")]
+fn frame_pts_90k(base: i64, frame_idx: u64, fr_num: u32, fr_den: u32) -> i64 {
+    let num = fr_num.max(1) as u128;
+    let den = fr_den as u128;
+    base + ((frame_idx as u128 * 90_000 * den) / num) as i64
+}
+
+/// 90 kHz timestamp of the PCM frame at index `samples_total` in a session
+/// based at `base`.
+///
+/// Recomputed from the running sample total for the same reason video is
+/// recomputed from the frame index: at 48 kHz the per-sample factor is 15/8, so
+/// a per-block step is exact only when the block is a multiple of 8 samples.
+/// DeckLink delivers 1920 samples/frame at 25 fps (exact) but the SDK's block
+/// size *must* vary at the NTSC rates (48000/29.97 = 1601.6), and the residue
+/// would seed the next session's encoder anchor via `audio_pts_90khz`.
+#[cfg(feature = "media-codecs")]
+fn audio_pts_90k(base: u64, samples_total: u64, sample_rate: u32) -> u64 {
+    base.wrapping_add((samples_total as u128 * 90_000 / sample_rate.max(1) as u128) as u64)
+}
 
 /// Publish a batch of freshly-muxed 188-byte TS packets onto the flow's
 /// broadcast channel. Shared by the video and audio mux paths so both essences
@@ -93,6 +152,10 @@ struct SdiAudio {
     planar: Vec<Vec<f32>>,
     /// Running audio presentation timestamp in 90 kHz ticks.
     pts_90khz: u64,
+    /// Timeline origin this session's PCM is counted from.
+    pts_base: u64,
+    /// PCM frames submitted to the encoder this session.
+    samples_total: u64,
     sample_rate: u32,
     channels: u8,
 }
@@ -255,10 +318,13 @@ async fn run_sdi_input(
     #[cfg(not(feature = "media-codecs"))]
     {
         let _ = (&config, &broadcast_tx, &flow_stats);
-        event_sender.emit(
+        emit_sdi(
+            &event_sender,
             EventSeverity::Critical,
-            category::FLOW,
-            format!("{ctx}: SDI input requires the media-codecs feature (error_code: sdi_no_media_codecs)"),
+            &input_id,
+            &flow_id,
+            format!("{ctx}: SDI input requires the media-codecs feature"),
+            serde_json::json!({ "error_code": "sdi_no_media_codecs" }),
         );
         cancel.cancelled().await;
     }
@@ -271,6 +337,19 @@ async fn run_sdi_input(
 /// re-acquired, and this also bounds the retry rate on a dead device.
 #[cfg(feature = "media-codecs")]
 const SDI_REOPEN_BACKOFF: Duration = Duration::from_millis(500);
+
+/// How long one frame read waits before the loop checks its cancellation token
+/// again. The read has to be bounded here rather than parked on the card: a
+/// device that has gone away is exactly the case where no frame ever arrives to
+/// return control, and it is also when a flow stop most wants to complete.
+#[cfg(feature = "media-codecs")]
+const SDI_READ_POLL_MS: u32 = 250;
+
+/// Silence this long means the *device* went away, not the signal — a live
+/// input delivers frames continuously, and even an unlocked card keeps emitting
+/// frames flagged no-signal. Re-open on it.
+#[cfg(feature = "media-codecs")]
+const SDI_DEVICE_SILENCE: Duration = Duration::from_secs(5);
 
 /// Build the per-session embedded-audio encode state.
 ///
@@ -307,15 +386,20 @@ fn setup_audio(
         acodec,
         AudioCodec::AacLc | AudioCodec::HeAacV1 | AudioCodec::HeAacV2
     ) {
-        event_sender.emit(
+        emit_sdi(
+            event_sender,
             EventSeverity::Warning,
-            category::FLOW,
+            input_id,
+            flow_id,
             format!(
                 "{ctx}: audio_encode.codec '{}' is not supported on an SDI input \
-                 (AAC family only) — continuing video-only \
-                 (error_code: sdi_audio_codec_unsupported)",
+                 (AAC family only) — continuing video-only",
                 acodec.as_str()
             ),
+            serde_json::json!({
+                "error_code": "sdi_audio_codec_unsupported",
+                "codec": acodec.as_str(),
+            }),
         );
         return None;
     }
@@ -365,32 +449,45 @@ fn setup_audio(
                 ts_mux.set_audio_stream(0x0F, None);
                 *ts_audio_configured = true;
             }
-            event_sender.emit(
+            emit_sdi(
+                event_sender,
                 EventSeverity::Info,
-                category::FLOW,
+                input_id,
+                flow_id,
                 format!(
-                    "{ctx}: embedded audio {ach}ch @ {ahz} Hz -> {} {bitrate} kbps \
-                     (error_code: sdi_audio_started)",
+                    "{ctx}: embedded audio {ach}ch @ {ahz} Hz -> {} {bitrate} kbps",
                     acodec.as_str()
                 ),
+                serde_json::json!({
+                    "error_code": "sdi_audio_started",
+                    "codec": acodec.as_str(),
+                    "channels": ach,
+                    "sample_rate": ahz,
+                    "bitrate_kbps": bitrate,
+                }),
             );
             Some(SdiAudio {
                 encoder,
                 planar: vec![Vec::new(); ach as usize],
                 pts_90khz: start_pts_90khz,
+                pts_base: start_pts_90khz,
+                samples_total: 0,
                 sample_rate: ahz,
                 channels: ach,
             })
         }
         Err(e) => {
             tracing::error!(target: "sdi.in", "{ctx}: audio encoder init failed: {e}");
-            event_sender.emit(
+            emit_sdi(
+                event_sender,
                 EventSeverity::Warning,
-                category::FLOW,
-                format!(
-                    "{ctx}: audio encoder init failed: {e} — continuing video-only \
-                     (error_code: sdi_audio_encoder_init_failed)"
-                ),
+                input_id,
+                flow_id,
+                format!("{ctx}: audio encoder init failed: {e} — continuing video-only"),
+                serde_json::json!({
+                    "error_code": "sdi_audio_encoder_init_failed",
+                    "error": e.to_string(),
+                }),
             );
             None
         }
@@ -428,10 +525,16 @@ fn sdi_input_blocking_loop(
     // v210 (10-bit) unpack is not wired yet — only UYVY422 8-bit is unpacked
     // below. Refuse v210 loudly rather than emit garbage planes.
     if matches!(pixel_format, DecklinkPixelFormat::V210) {
-        event_sender.emit(
+        emit_sdi(
+            event_sender,
             EventSeverity::Critical,
-            category::FLOW,
-            format!("{ctx}: pixel_format=v210 not yet supported; use uyvy422 (error_code: sdi_pixfmt_unsupported)"),
+            input_id,
+            flow_id,
+            format!("{ctx}: pixel_format=v210 not yet supported; use uyvy422"),
+            serde_json::json!({
+                "error_code": "sdi_pixfmt_unsupported",
+                "pixel_format": config.pixel_format,
+            }),
         );
         return;
     }
@@ -449,21 +552,41 @@ fn sdi_input_blocking_loop(
         _ => {
             let msg = format!(
                 "{ctx}: SDI capture is 8-bit 4:2:2 (uyvy422); video_encode chroma={target_chroma:?} \
-                 bit_depth={bit_depth} is unsupported — use yuv420p or yuv422p at 8-bit \
-                 (error_code: sdi_encode_chroma_unsupported)"
+                 bit_depth={bit_depth} is unsupported — use yuv420p or yuv422p at 8-bit"
             );
             tracing::error!(target: "sdi.in", "{msg}");
-            event_sender.emit(EventSeverity::Critical, category::FLOW, msg);
+            emit_sdi(
+                event_sender,
+                EventSeverity::Critical,
+                input_id,
+                flow_id,
+                msg,
+                serde_json::json!({
+                    "error_code": "sdi_encode_chroma_unsupported",
+                    "chroma": format!("{target_chroma:?}"),
+                    "bit_depth": bit_depth,
+                }),
+            );
             return;
         }
     };
     let Some(src_pix_fmt) = video_engine::av_pix_fmt_for_yuv(target_chroma, bit_depth) else {
         let msg = format!(
-            "{ctx}: no FFmpeg pixel format for chroma={target_chroma:?} bit_depth={bit_depth} \
-             (error_code: sdi_encode_chroma_unsupported)"
+            "{ctx}: no FFmpeg pixel format for chroma={target_chroma:?} bit_depth={bit_depth}"
         );
         tracing::error!(target: "sdi.in", "{msg}");
-        event_sender.emit(EventSeverity::Critical, category::FLOW, msg);
+        emit_sdi(
+            event_sender,
+            EventSeverity::Critical,
+            input_id,
+            flow_id,
+            msg,
+            serde_json::json!({
+                "error_code": "sdi_encode_chroma_unsupported",
+                "chroma": format!("{target_chroma:?}"),
+                "bit_depth": bit_depth,
+            }),
+        );
         return;
     };
 
@@ -507,7 +630,15 @@ fn sdi_input_blocking_loop(
         session += 1;
         sdi_stats.sessions.store(session, Ordering::Relaxed);
 
-        let Some(cap) = open_capture(ctx, &cap_cfg, session, cancel, event_sender) else {
+        let Some(cap) = open_capture(
+            ctx,
+            &cap_cfg,
+            input_id,
+            flow_id,
+            session,
+            cancel,
+            event_sender,
+        ) else {
             break; // cancelled while retrying
         };
 
@@ -555,9 +686,12 @@ fn sdi_input_blocking_loop(
 /// pulled cable) and then stays quiet, to avoid flooding the event bus while a
 /// device is unplugged.
 #[cfg(feature = "media-codecs")]
+#[allow(clippy::too_many_arguments)]
 fn open_capture(
     ctx: &str,
     cap_cfg: &DecklinkCaptureConfig,
+    input_id: &str,
+    flow_id: &str,
     session: u64,
     cancel: &CancellationToken,
     event_sender: &EventSender,
@@ -575,13 +709,20 @@ fn open_capture(
                     target: "sdi.in",
                     "{ctx}: capture opened {w}x{h} @ {n}/{d} (session {session})"
                 );
-                event_sender.emit(
+                emit_sdi(
+                    event_sender,
                     EventSeverity::Info,
-                    category::FLOW,
-                    format!(
-                        "{ctx}: capture opened {w}x{h} @ {n}/{d} (session {session}) \
-                         (error_code: sdi_capture_opened)"
-                    ),
+                    input_id,
+                    flow_id,
+                    format!("{ctx}: capture opened {w}x{h} @ {n}/{d} (session {session})"),
+                    serde_json::json!({
+                        "error_code": "sdi_capture_opened",
+                        "width": w,
+                        "height": h,
+                        "frame_rate_num": n,
+                        "frame_rate_den": d,
+                        "session": session,
+                    }),
                 );
                 return Some(c);
             }
@@ -589,13 +730,19 @@ fn open_capture(
                 if !announced {
                     announced = true;
                     tracing::warn!(target: "sdi.in", "{ctx}: capture open failed: {e}; retrying");
-                    event_sender.emit(
+                    emit_sdi(
+                        event_sender,
                         EventSeverity::Warning,
-                        category::FLOW,
+                        input_id,
+                        flow_id,
                         format!(
-                            "{ctx}: capture open failed: {e} — retrying until the device \
-                             returns (error_code: sdi_capture_open_failed)"
+                            "{ctx}: capture open failed: {e} — retrying until the device returns"
                         ),
+                        serde_json::json!({
+                            "error_code": "sdi_capture_open_failed",
+                            "error": e.to_string(),
+                            "session": session,
+                        }),
                     );
                 } else {
                     debug!(target: "sdi.in", "{ctx}: open failed: {e}, retrying");
@@ -643,10 +790,16 @@ fn run_capture_session(
             // Log as well as emit: the event only reaches a connected manager,
             // so a standalone edge would otherwise fail silently here.
             tracing::error!(target: "sdi.in", "{ctx}: encoder config failed: {e}");
-            event_sender.emit(
+            emit_sdi(
+                event_sender,
                 EventSeverity::Critical,
-                category::FLOW,
-                format!("{ctx}: encoder config failed: {e} (error_code: sdi_encode_config_failed)"),
+                input_id,
+                flow_id,
+                format!("{ctx}: encoder config failed: {e}"),
+                serde_json::json!({
+                    "error_code": "sdi_encode_config_failed",
+                    "error": e.to_string(),
+                }),
             );
             return SessionEnd::Fatal;
         }
@@ -679,7 +832,11 @@ fn run_capture_session(
         *audio_pts_90khz,
     );
 
-    let pts_step = (90_000u64 * fr_den as u64 / fr_num.max(1) as u64) as i64;
+    // Video timestamps are derived from a frame index against the session's
+    // rational frame period (see `frame_pts_90k`). `pts_base` carries the
+    // timeline in from the previous session so a re-open continues it.
+    let pts_base: i64 = *pts;
+    let mut frame_idx: u64 = 0;
 
     let w = width as usize;
     let h = height as usize;
@@ -689,13 +846,24 @@ fn run_capture_session(
     let mut cb_plane = vec![0u8; cw * ch];
     let mut cr_plane = vec![0u8; cw * ch];
 
-    event_sender.emit(
+    emit_sdi(
+        event_sender,
         EventSeverity::Info,
-        category::FLOW,
+        input_id,
+        flow_id,
         format!(
             "{ctx}: capture→encode pipeline started (session {session}, codec={})",
             enc.codec
         ),
+        serde_json::json!({
+            "error_code": "sdi_pipeline_started",
+            "session": session,
+            "codec": enc.codec,
+            "width": width,
+            "height": height,
+            "frame_rate_num": fr_num,
+            "frame_rate_den": fr_den,
+        }),
     );
 
     // Make sure the audio clock is carried back out even on an early return.
@@ -709,32 +877,96 @@ fn run_capture_session(
 
     // `None` until the first frame tells us whether the input is locked.
     let mut signal_present: Option<bool> = None;
+    let mut last_frame_at = Instant::now();
 
     loop {
         if cancel.is_cancelled() {
             save_audio_pts!();
             return SessionEnd::Cancelled;
         }
-        match cap.read_frame() {
-            Ok(CapturedFrame::Video(vf)) => {
-                // A raster change means the scratch planes and the encoder are
-                // sized for the wrong geometry. Tear the session down and
-                // re-open: with `format: "auto"` that re-detects the new raster.
-                if vf.width != width || vf.height != height {
+
+        // Device error / stream ended / gone silent — most often a pulled cable
+        // or a source reboot. Surface it and re-open rather than dying.
+        let mut lost: Option<String> = None;
+        let frame = match cap.read_frame_timeout(SDI_READ_POLL_MS) {
+            Ok(Some(f)) => {
+                last_frame_at = Instant::now();
+                Some(f)
+            }
+            Ok(None) => {
+                if last_frame_at.elapsed() >= SDI_DEVICE_SILENCE {
+                    lost = Some(format!("no frame for {} s", SDI_DEVICE_SILENCE.as_secs()));
+                }
+                None
+            }
+            Err(e) => {
+                lost = Some(e.to_string());
+                None
+            }
+        };
+        if let Some(reason) = lost {
+            save_audio_pts!();
+            tracing::warn!(target: "sdi.in", "{ctx}: capture ended: {reason}; reopening");
+            emit_sdi(
+                event_sender,
+                EventSeverity::Warning,
+                input_id,
+                flow_id,
+                format!("{ctx}: capture ended: {reason} — reopening device"),
+                serde_json::json!({
+                    "error_code": "sdi_capture_lost",
+                    "error": reason,
+                    "session": session,
+                }),
+            );
+            return SessionEnd::Retry;
+        }
+        let Some(frame) = frame else { continue };
+
+        match frame {
+            CapturedFrame::Video(vf) => {
+                // A format change means the scratch planes, the encoder and the
+                // PTS cadence are all built for the wrong format. Tear the
+                // session down and re-open: with `format: "auto"` that
+                // re-detects it. The frame rate has to be part of the test —
+                // 1080i50 and 1080p50 are both 1920x1080, so a rate-only change
+                // (a router crosspoint, a source rebooting into another format,
+                // a camera swap) is invisible to a dimension check while every
+                // later timestamp is spaced for the wrong cadence.
+                let (cur_num, cur_den) = cap.video_frame_rate();
+                if vf.width != width
+                    || vf.height != height
+                    || cur_num != fr_num
+                    || cur_den != fr_den
+                {
                     save_audio_pts!();
                     tracing::warn!(
                         target: "sdi.in",
-                        "{ctx}: source raster changed {width}x{height} -> {}x{}; restarting capture",
+                        "{ctx}: source format changed {width}x{height} @ {fr_num}/{fr_den} -> \
+                         {}x{} @ {cur_num}/{cur_den}; restarting capture",
                         vf.width, vf.height,
                     );
-                    event_sender.emit(
+                    emit_sdi(
+                        event_sender,
                         EventSeverity::Warning,
-                        category::FLOW,
+                        input_id,
+                        flow_id,
                         format!(
-                            "{ctx}: source raster changed {width}x{height} -> {}x{} — restarting \
-                             capture (error_code: sdi_raster_changed)",
+                            "{ctx}: source format changed {width}x{height} @ {fr_num}/{fr_den} -> \
+                             {}x{} @ {cur_num}/{cur_den} — restarting capture",
                             vf.width, vf.height,
                         ),
+                        serde_json::json!({
+                            "error_code": "sdi_raster_changed",
+                            "width": vf.width,
+                            "height": vf.height,
+                            "frame_rate_num": cur_num,
+                            "frame_rate_den": cur_den,
+                            "previous_width": width,
+                            "previous_height": height,
+                            "previous_frame_rate_num": fr_num,
+                            "previous_frame_rate_den": fr_den,
+                        }),
                     );
                     return SessionEnd::Retry;
                 }
@@ -747,23 +979,34 @@ fn run_capture_session(
                     (Some(true), false) | (None, false) => {
                         sdi_stats.signal_losses.fetch_add(1, Ordering::Relaxed);
                         tracing::warn!(target: "sdi.in", "{ctx}: SDI input signal lost");
-                        event_sender.emit(
+                        emit_sdi(
+                            event_sender,
                             EventSeverity::Warning,
-                            category::FLOW,
+                            input_id,
+                            flow_id,
                             format!(
                                 "{ctx}: SDI input signal lost — no source locked; continuing to \
-                                 emit the card's bars/black (error_code: sdi_signal_lost)"
+                                 emit the card's bars/black"
                             ),
+                            serde_json::json!({
+                                "error_code": "sdi_signal_lost",
+                                "session": session,
+                                "signal_losses": sdi_stats.signal_losses.load(Ordering::Relaxed),
+                            }),
                         );
                     }
                     (Some(false), true) => {
                         info!(target: "sdi.in", "{ctx}: SDI input signal restored");
-                        event_sender.emit(
+                        emit_sdi(
+                            event_sender,
                             EventSeverity::Info,
-                            category::FLOW,
-                            format!(
-                                "{ctx}: SDI input signal restored (error_code: sdi_signal_restored)"
-                            ),
+                            input_id,
+                            flow_id,
+                            format!("{ctx}: SDI input signal restored"),
+                            serde_json::json!({
+                                "error_code": "sdi_signal_restored",
+                                "session": session,
+                            }),
                         );
                     }
                     _ => {}
@@ -812,7 +1055,7 @@ fn run_capture_session(
                     cw,
                     &cr_plane,
                     cw,
-                    Some(*pts),
+                    Some(frame_pts_90k(pts_base, frame_idx, fr_num, fr_den)),
                 ) {
                     Ok(frames) => {
                         for ef in frames {
@@ -831,10 +1074,16 @@ fn run_capture_session(
                             // GPU session). Re-opening the device would spin.
                             save_audio_pts!();
                             tracing::error!(target: "sdi.in", "{ctx}: encoder open failed: {e}");
-                            event_sender.emit(
+                            emit_sdi(
+                                event_sender,
                                 EventSeverity::Critical,
-                                category::FLOW,
-                                format!("{ctx}: encoder open failed: {e} (error_code: sdi_encode_failed)"),
+                                input_id,
+                                flow_id,
+                                format!("{ctx}: encoder open failed: {e}"),
+                                serde_json::json!({
+                                    "error_code": "sdi_encode_failed",
+                                    "error": e.to_string(),
+                                }),
                             );
                             return SessionEnd::Fatal;
                         }
@@ -842,9 +1091,10 @@ fn run_capture_session(
                     }
                 }
 
-                *pts += pts_step;
+                frame_idx += 1;
+                *pts = frame_pts_90k(pts_base, frame_idx, fr_num, fr_den);
             }
-            Ok(CapturedFrame::Audio(af)) => {
+            CapturedFrame::Audio(af) => {
                 let Some(a) = audio.as_mut() else { continue };
                 let ch = a.channels as usize;
                 if ch == 0 {
@@ -870,9 +1120,8 @@ fn run_capture_session(
                 }
 
                 a.encoder.submit_planar(&a.planar, a.pts_90khz);
-                a.pts_90khz = a
-                    .pts_90khz
-                    .wrapping_add(n_frames as u64 * 90_000 / a.sample_rate.max(1) as u64);
+                a.samples_total = a.samples_total.wrapping_add(n_frames as u64);
+                a.pts_90khz = audio_pts_90k(a.pts_base, a.samples_total, a.sample_rate);
 
                 // `ef.data` is a complete ADTS frame; the muxer wraps it in a PES.
                 for ef in a.encoder.drain() {
@@ -880,29 +1129,159 @@ fn run_capture_session(
                     publish_ts(ts_packets, ef.pts as u32, broadcast_tx, flow_stats);
                 }
             }
-            Err(e) => {
-                // Device error / stream ended — most often a pulled cable or a
-                // source reboot. Surface it and re-open rather than dying.
-                save_audio_pts!();
-                tracing::warn!(target: "sdi.in", "{ctx}: capture ended: {e}; reopening");
-                event_sender.emit(
-                    EventSeverity::Warning,
-                    category::FLOW,
-                    format!(
-                        "{ctx}: capture ended: {e} — reopening device \
-                         (error_code: sdi_capture_lost)"
-                    ),
-                );
-                return SessionEnd::Retry;
-            }
         }
     }
 }
 
 #[cfg(all(test, feature = "media-codecs"))]
 mod tests {
-    use super::unpack_uyvy422;
+    use super::{audio_pts_90k, frame_pts_90k, unpack_uyvy422};
     use crate::engine::video_encode_util::resolve_chroma;
+
+    /// ~4.6 h at 59.94 — long enough that a per-frame residue of half a tick is
+    /// seconds of lip-sync, which is the whole point.
+    const LONG_RUN: u64 = 1_000_000;
+
+    /// Exact 90 kHz tick counts at frame `LONG_RUN`, computed by hand from
+    /// `idx * 90_000 * den / num` (every case divides exactly at 1e6 frames).
+    /// The frame rates come off the card as `(scale, duration)` — 59.94 arrives
+    /// as `(60000, 1001)`, not `(60, 1)`.
+    #[test]
+    fn frame_pts_is_exact_over_a_long_run() {
+        let cases: &[(u32, u32, i64)] = &[
+            (24000, 1001, 3_753_750_000), // 23.976
+            (24, 1, 3_750_000_000),
+            (25, 1, 3_600_000_000),
+            (30000, 1001, 3_003_000_000), // 29.97
+            (30, 1, 3_000_000_000),
+            (50, 1, 1_800_000_000),
+            (60000, 1001, 1_501_500_000), // 59.94
+            (60, 1, 1_500_000_000),
+        ];
+        for &(num, den, expect) in cases {
+            assert_eq!(
+                frame_pts_90k(0, LONG_RUN, num, den),
+                expect,
+                "{num}/{den} at frame {LONG_RUN}"
+            );
+        }
+    }
+
+    /// The regression this guards: `90_000 * den / num` is 3753.75 at 23.976 and
+    /// 1501.5 at 59.94, and accumulating the truncated step loses the residue on
+    /// every frame forever. 500 000 ticks over `LONG_RUN` frames at 59.94 is
+    /// 5.6 s in 4.6 h — 28.8 s/day of lip-sync, since nothing re-anchors SDI
+    /// video and the AAC encoder self-advances by exact sample count.
+    #[test]
+    fn accumulating_a_truncated_step_drifts_where_the_index_does_not() {
+        // (num, den, ticks the accumulating step loses over LONG_RUN frames)
+        let ntsc: &[(u32, u32, i64)] = &[(24000, 1001, 750_000), (60000, 1001, 500_000)];
+        for &(num, den, lost) in ntsc {
+            let step = (90_000u64 * den as u64 / num as u64) as i64;
+            let accumulated = step * LONG_RUN as i64;
+            let exact = frame_pts_90k(0, LONG_RUN, num, den);
+            assert_eq!(exact - accumulated, lost, "{num}/{den}");
+        }
+
+        // The integer rates divide exactly, which is why this only ever bit the
+        // NTSC family — and why it survived a bring-up done at 1080i50.
+        for &(num, den) in &[(24u32, 1u32), (25, 1), (30, 1), (50, 1), (60, 1)] {
+            let step = (90_000u64 * den as u64 / num as u64) as i64;
+            assert_eq!(
+                step * LONG_RUN as i64,
+                frame_pts_90k(0, LONG_RUN, num, den),
+                "{num}/{den} is exact either way"
+            );
+        }
+    }
+
+    /// Consecutive frames stay within a tick of the nominal period: the index
+    /// derivation must not trade accumulated drift for per-frame jitter (the TS
+    /// muxer builds PCR off these timestamps).
+    #[test]
+    fn frame_pts_spacing_never_wanders() {
+        for &(num, den) in &[(24000u32, 1001u32), (30000, 1001), (60000, 1001), (25, 1)] {
+            let nominal = 90_000i64 * den as i64 / num as i64;
+            for i in 0..1_000u64 {
+                let delta = frame_pts_90k(0, i + 1, num, den) - frame_pts_90k(0, i, num, den);
+                assert!(
+                    (delta - nominal).abs() <= 1,
+                    "{num}/{den} frame {i}: delta {delta} vs nominal {nominal}"
+                );
+            }
+        }
+    }
+
+    /// A device re-open re-bases the timeline on the PTS handed back, so the
+    /// only error a session boundary can add is the one-off truncation of the
+    /// frame it stopped on — never more than a tick, and it cannot compound
+    /// inside the new session.
+    #[test]
+    fn re_open_rebase_costs_at_most_one_tick() {
+        for stop in 0..64u64 {
+            let base = frame_pts_90k(0, stop, 60000, 1001);
+            for after in 0..64u64 {
+                let split = frame_pts_90k(base, after, 60000, 1001);
+                let continuous = frame_pts_90k(0, stop + after, 60000, 1001);
+                assert!(
+                    (split - continuous).abs() <= 1,
+                    "stop={stop} after={after}: {split} vs {continuous}"
+                );
+            }
+        }
+        // Frame 0 of the new session lands exactly on the handed-back PTS.
+        let base = frame_pts_90k(0, 900, 60000, 1001);
+        assert_eq!(frame_pts_90k(base, 0, 60000, 1001), base);
+    }
+
+    /// At 48 kHz the per-sample factor is 15/8 — exact only on multiples of 8
+    /// samples. DeckLink hands over 1920/frame at 25 fps (exact) but the SDK's
+    /// block size must vary at the NTSC rates (48000/29.97 = 1601.6).
+    #[test]
+    fn audio_pts_is_exact_over_a_long_run() {
+        let samples: u64 = (0..LONG_RUN)
+            .map(|i| if i % 2 == 0 { 1601 } else { 1602 })
+            .sum();
+        assert_eq!(samples, 1_601_500_000);
+        assert_eq!(audio_pts_90k(0, samples, 48_000), 3_002_812_500);
+    }
+
+    /// Within a session the drifted accumulator was inert (the encoder anchors
+    /// once and self-advances), but it seeded the *next* session's anchor via
+    /// `audio_pts_90khz` — so every re-open stepped audio backwards by the
+    /// accumulated residue. ~9 s over `LONG_RUN` blocks at 29.97 (≈ 9.3 h).
+    #[test]
+    fn accumulating_a_truncated_audio_step_drifts() {
+        let mut accumulated: u64 = 0;
+        let mut samples: u64 = 0;
+        for i in 0..LONG_RUN {
+            let n: u64 = if i % 2 == 0 { 1601 } else { 1602 };
+            accumulated = accumulated.wrapping_add(n * 90_000 / 48_000);
+            samples += n;
+        }
+        assert_eq!(audio_pts_90k(0, samples, 48_000) - accumulated, 812_500);
+
+        // 1920-sample blocks (25 fps) are a multiple of 8, so the old step was
+        // exact there. Bring-up ran at 1080i50 and never saw this either.
+        let pal: u64 = (0..LONG_RUN).map(|_| 1920 * 90_000 / 48_000).sum();
+        assert_eq!(pal, audio_pts_90k(0, 1920 * LONG_RUN, 48_000));
+    }
+
+    /// The next session's AAC encoder anchors on the PTS handed back, so a
+    /// session must start exactly on its base.
+    #[test]
+    fn audio_pts_carries_the_session_anchor() {
+        assert_eq!(audio_pts_90k(12_345, 0, 48_000), 12_345);
+        // 8 samples == 15 ticks exactly, from any base.
+        assert_eq!(audio_pts_90k(12_345, 8, 48_000), 12_360);
+    }
+
+    /// A card that reports nothing must not divide by zero.
+    #[test]
+    fn degenerate_rates_do_not_panic() {
+        assert_eq!(frame_pts_90k(0, 10, 0, 1), 900_000);
+        assert_eq!(audio_pts_90k(0, 10, 0), 900_000);
+    }
 
     /// Build a UYVY422 buffer with `stride` padding after each row, so the
     /// tests exercise the real capture case where stride > width * 2.
