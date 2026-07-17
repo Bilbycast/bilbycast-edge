@@ -393,6 +393,24 @@ At runtime the edge probes `avcodec_open2("h264_rkmpp")` and only advertises
 `/dev/mpp_service` exists but the probe fails, the startup log names the
 likely cause (user not in `video`, or `librockchip_mpp < 1.3.8`).
 
+**Under the packaged systemd service, group membership alone is not
+enough** — same caveat as the NVIDIA/NVENC section above. `bilbycast-edge.service`
+sandboxes the process with `DeviceAllow=` cgroup rules, which restrict device
+access by kernel device class regardless of file permissions or group
+membership. Rockchip's MPP device registers under its own char-major class —
+`241 mpp_service` in `/proc/devices` — entirely separate from `drm`, so a
+unit that doesn't explicitly allow it blocks RKMPP even with `/dev/mpp_service`
+world-writable and the user correctly in `video`: `avcodec_open2` fails with
+`Failed to initialize MPP context (-1)`. The unit installed by `install-edge.sh`
+already includes `DeviceAllow=char-mpp_service rwm`. If you're running a custom
+unit or one built before this was added, add:
+
+```ini
+DeviceAllow=char-mpp_service rwm
+```
+
+then `sudo systemctl daemon-reload && sudo systemctl restart bilbycast-edge`.
+
 **Headless hardening — mask sleep targets on BSP desktop images.** The
 FriendlyELEC / vendor Ubuntu BSP images ship a full GNOME desktop whose
 default power policy suspends the machine after inactivity. On a headless
