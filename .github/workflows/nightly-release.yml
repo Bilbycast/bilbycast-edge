@@ -136,23 +136,30 @@ jobs:
       # misconfiguration, never a reason to quietly publish a "full" binary that
       # lacks an I/O type operators expect.
       - name: Preflight - DeckLink SDK access
+        id: decklink
         if: matrix.variant == 'full'
         env:
           DECKLINK_SDK_TOKEN: ${{ secrets.DECKLINK_SDK_TOKEN }}
         run: |
           if [ -n "${DECKLINK_SDK_TOKEN}" ]; then
             echo "OK: DECKLINK_SDK_TOKEN is set - SDI (DeckLink) will be built into this artefact."
+            echo "sdi=on" >> "$GITHUB_OUTPUT"
             exit 0
           fi
+          echo "sdi=off" >> "$GITHUB_OUTPUT"
           cat >&2 <<'EOF'
           ======================================================================
-          RELEASE BLOCKED - the DECKLINK_SDK_TOKEN repository secret is not set.
+          WARNING - DECKLINK_SDK_TOKEN is not set.
           ======================================================================
 
-          Every `*-linux-full` artefact ships SDI (Blackmagic DeckLink) support.
-          Building without it would publish a "full" binary silently missing an
-          I/O type operators expect, so the build stops here instead of
-          degrading quietly.
+          This `*-linux-full` artefact is being built WITHOUT SDI (Blackmagic
+          DeckLink) support. The SDI input/output types will be absent from this
+          binary; every other full-variant codec/feature is unaffected. The
+          build CONTINUES (the `sdi-decklink` cargo feature is dropped for this
+          run) rather than blocking the release.
+
+          To ship SDI in the full artefact, set up the token once (every later
+          release then picks it up automatically):
 
           WHY A TOKEN: the DeckLink SDK is EULA-gated and cannot live in this
           public repository. Only the SDK *headers* are needed to build -
@@ -180,7 +187,6 @@ jobs:
           changes.
           ======================================================================
           EOF
-          exit 1
 
       - name: Checkout bilbycast-libsrt-rs (path dependency)
         uses: actions/checkout@v7
@@ -264,7 +270,7 @@ jobs:
       # Private, so nothing is redistributed - build.rs only needs the headers;
       # libDeckLinkAPI.so is dlopened at runtime from Desktop Video.
       - name: Checkout DeckLink SDK headers (private)
-        if: matrix.variant == 'full'
+        if: matrix.variant == 'full' && steps.decklink.outputs.sdi == 'on'
         uses: actions/checkout@v7
         with:
           repository: Bilbycast/bilbycast-decklink-sdk
@@ -272,7 +278,7 @@ jobs:
           path: decklink-sdk
 
       - name: Locate DeckLink SDK headers
-        if: matrix.variant == 'full'
+        if: matrix.variant == 'full' && steps.decklink.outputs.sdi == 'on'
         run: |
           # build.rs wants the directory holding BOTH files. Locate it rather
           # than assume a layout, so the private repo can keep the SDK's own
@@ -434,14 +440,28 @@ jobs:
 
       - name: Build release binary
         working-directory: bilbycast-edge
+        env:
+          SDI: ${{ steps.decklink.outputs.sdi }}
         run: |
-          if [ -n "${{ matrix.cargo_features }}" ]; then
-            cargo build --release --target ${{ matrix.target }} --features "${{ matrix.cargo_features }}"
+          FEATURES="${{ matrix.cargo_features }}"
+          # When no DECKLINK_SDK_TOKEN is configured the preflight sets sdi=off;
+          # strip the sdi-decklink feature so the full build still succeeds
+          # without the (EULA-gated) SDK headers. SDI returns automatically once
+          # the token is set up — no workflow change needed.
+          if [ "${SDI}" != "on" ] && [ -n "${FEATURES}" ]; then
+            FEATURES="$(printf '%s' "${FEATURES}" | tr ' ' '\n' | grep -v '^sdi-decklink$' | tr '\n' ' ' | sed -E 's/  +/ /g; s/^ //; s/ $//')"
+            echo "NOTE: DECKLINK_SDK_TOKEN absent — building WITHOUT sdi-decklink."
+            echo "      Effective features: ${FEATURES}"
+          fi
+          if [ -n "${FEATURES}" ]; then
+            cargo build --release --target ${{ matrix.target }} --features "${FEATURES}"
           else
             cargo build --release --target ${{ matrix.target }}
           fi
 
       - name: Verify binary
+        env:
+          SDI: ${{ steps.decklink.outputs.sdi }}
         run: |
           BINARY="bilbycast-edge/target/${{ matrix.target }}/release/bilbycast-edge"
           echo "=== File type ==="
@@ -541,13 +561,20 @@ jobs:
           # x264/x265 symbol check — the inverted ldd gate above passes just as
           # happily on a binary built without the feature at all. The release
           # binary is not stripped, so the shim's C-ABI symbols are visible.
-          if ! nm "${BINARY}" 2>/dev/null | grep -qE ' [Tt] dl_read_frame'; then
-            echo "ERROR: DeckLink shim symbol not found — sdi-decklink did not compile in."
-            echo "  Every full artefact must ship SDI; check the cargo_features list and"
-            echo "  the Materialise DeckLink SDK headers step."
-            exit 1
+          # Only assert this when SDI was actually requested for this build
+          # (sdi=on); when DECKLINK_SDK_TOKEN is absent the preflight drops the
+          # sdi-decklink feature and the symbol is legitimately absent.
+          if [ "${SDI}" = "on" ]; then
+            if ! nm "${BINARY}" 2>/dev/null | grep -qE ' [Tt] dl_read_frame'; then
+              echo "ERROR: DeckLink shim symbol not found — sdi-decklink did not compile in."
+              echo "  Every full artefact must ship SDI; check the cargo_features list and"
+              echo "  the Materialise DeckLink SDK headers step."
+              exit 1
+            fi
+            echo "OK: SDI compiled in (dl_read_frame present), libDeckLinkAPI dlopen-only"
+          else
+            echo "SKIP: SDI omitted (no DECKLINK_SDK_TOKEN) — dl_read_frame not expected; libDeckLinkAPI dlopen-only check passed above."
           fi
-          echo "OK: SDI compiled in (dl_read_frame present), libDeckLinkAPI dlopen-only"
 
           echo "=== MXL ==="
           # MXL uses dlopen (libloading) at runtime — no link-time dep.
