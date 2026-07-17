@@ -33,9 +33,8 @@ use std::path::Path;
 use std::sync::atomic::Ordering;
 
 use anyhow::{Context, Result, anyhow};
-use bytes::BytesMut;
+use bytes::{Bytes, BytesMut};
 use mp4::{AudioObjectType, MediaType, SampleFreqIndex, TrackType};
-use tokio::time::{Duration, Instant};
 
 use super::{
     DEFAULT_FALLBACK_BITRATE_BPS, PACER_QUEUE_CAP, PacerMsg, PlayerSession, emit_to_pacer,
@@ -63,36 +62,35 @@ pub async fn play_mp4_file(
     play_demuxed(path, demux, paced_bitrate_bps, session).await
 }
 
-/// Estimate the file's average muxed-TS bitrate from the demuxed elementary
-/// stream, for OS-thread pacer initialisation. Unlike `play_ts_file` (which
-/// has no ground truth until it observes PCR on the wire), the MP4 path
-/// already holds every sample in memory before playback starts, so this is
-/// computed once, exactly, rather than estimated from a head-scan.
+/// Per-sample presentation duration (µs) for a track, i.e. how long each
+/// sample stays on screen before the next same-track sample. The pacer
+/// spreads a sample's TS bundles across this window so a large frame's
+/// packet burst is smoothed across the frame's own airtime rather than
+/// landing instantaneously (issue #67).
 ///
-/// Elementary-stream bytes under-count the eventual TS byte rate slightly
-/// (PES headers, 4 B TS header per 184 B payload, repeated SPS/PPS on every
-/// IDR) — a flat 10 % headroom keeps the pacer's initial rate from starting
-/// low and momentarily lagging before the first bitrate refinement.
-fn estimate_bitrate_bps(d: &DemuxResult) -> Option<u64> {
-    let mut total_es_bytes: u64 = 0;
-    let mut duration_us: u64 = 0;
-    if let Some(t) = &d.video {
-        total_es_bytes += t.samples.iter().map(|s| s.bytes.len() as u64).sum::<u64>();
-        if let Some(last) = t.samples.iter().map(|s| s.start_time).max() {
-            duration_us = duration_us.max(ts_to_us(last, t.timescale));
-        }
+/// Derived from consecutive `start_time` deltas (in track timescale units).
+/// The final sample has no successor, so it reuses the previous sample's
+/// duration (or a 33 ms ≈ 30 fps default for a single-sample track).
+fn sample_durations_us(samples: &[DemuxedSample], timescale: u32) -> Vec<u64> {
+    let n = samples.len();
+    let mut out = Vec::with_capacity(n);
+    for i in 0..n {
+        let dur = if i + 1 < n {
+            let d = samples[i + 1].start_time.saturating_sub(samples[i].start_time);
+            ts_to_us(d, timescale)
+        } else if i > 0 {
+            // Last sample: reuse the previous inter-sample delta.
+            let d = samples[i].start_time.saturating_sub(samples[i - 1].start_time);
+            ts_to_us(d, timescale)
+        } else {
+            0
+        };
+        // Guard against a zero/degenerate duration (identical timestamps, or
+        // a single-sample track) so the pacer always has a non-zero spread
+        // window — otherwise a whole sample would collapse back to a burst.
+        out.push(if dur == 0 { 33_000 } else { dur });
     }
-    if let Some(t) = &d.audio {
-        total_es_bytes += t.samples.iter().map(|s| s.bytes.len() as u64).sum::<u64>();
-        if let Some(last) = t.samples.iter().map(|s| s.start_time).max() {
-            duration_us = duration_us.max(ts_to_us(last, t.timescale));
-        }
-    }
-    if duration_us == 0 || total_es_bytes == 0 {
-        return None;
-    }
-    let raw_bps = total_es_bytes.saturating_mul(8_000_000) / duration_us;
-    Some(raw_bps.saturating_mul(11) / 10)
+    out
 }
 
 struct DemuxResult {
@@ -397,21 +395,29 @@ async fn play_demuxed(
         });
 
     // Merge video + audio sample lists by emission wall-time. Each `Item`
-    // carries a track tag so we know whether to mux as video or audio.
+    // carries a track tag (so we know whether to mux as video or audio) and
+    // its presentation duration (so the pacer can spread the sample's bundles
+    // across the sample's own airtime — see `sample_durations_us`).
+    let video_durs = d.video.as_ref().map(|t| sample_durations_us(&t.samples, t.timescale));
+    let audio_durs = d.audio.as_ref().map(|t| sample_durations_us(&t.samples, t.timescale));
     let mut heap: BinaryHeap<Item> = BinaryHeap::new();
     if let Some(ref t) = d.video {
+        let durs = video_durs.as_ref().unwrap();
         for (i, s) in t.samples.iter().enumerate() {
             heap.push(Item {
                 wall_us: ts_to_us(s.start_time, t.timescale),
+                dur_us: durs[i],
                 track: Track::Video,
                 index: i,
             });
         }
     }
     if let Some(ref t) = d.audio {
+        let durs = audio_durs.as_ref().unwrap();
         for (i, s) in t.samples.iter().enumerate() {
             heap.push(Item {
                 wall_us: ts_to_us(s.start_time, t.timescale),
+                dur_us: durs[i],
                 track: Track::Audio,
                 index: i,
             });
@@ -421,48 +427,43 @@ async fn play_demuxed(
     let video_samples = d.video.as_ref().map(|t| &t.samples);
     let audio_samples = d.audio.as_ref().map(|t| &t.samples);
 
-    // ── OS-thread pacer (CLOCK_TAI + clock_nanosleep on SCHED_FIFO) ──────
+    // ── Sample-presentation-time-anchored OS-thread pacer ───────────────
     //
-    // See `MEDIA_PLAYER_BURSTY_MP4_ISSUE`: this loop reads whole samples
-    // (already fully decoded off disk into `d`) and muxes them to TS in one
-    // synchronous pass with no `.await` between chunks. A large compressed
-    // sample (e.g. a several-hundred-KB IDR) previously went straight to
-    // `emit_bundle` — hundreds of bundles handed to the broadcast channel
-    // in a single scheduler slice, racing far ahead of any downstream
-    // output's real wire rate. Routing through the same bounded-queue +
-    // OS-thread pacer `play_ts_file` already uses (`emit_to_pacer` /
-    // `run_paced_emitter`) fixes this the same way: the pacer drains at a
-    // paced bitrate and `PACER_QUEUE_CAP` (16 slots) backpressures the
-    // producer via `try_send` + `yield_now` once the queue fills, so a
-    // burst is smoothed into the pacer's own real-time schedule instead of
-    // landing on the wire (and every downstream queue) instantaneously.
+    // See `MEDIA_PLAYER_BURSTY_MP4_ISSUE` (#67): this loop reads whole
+    // samples (already fully demuxed into `d`) and muxes them to TS. A large
+    // compressed sample (e.g. a several-hundred-KB IDR) produces hundreds of
+    // TS packets; emitting them all in one synchronous scheduler slice races
+    // far ahead of any downstream output's real wire rate and can overflow
+    // the broadcast channel / downstream queues (silent playout failure).
     //
-    // Priority mirrors `play_ts_file`: operator override > previous
-    // loop/file's converged rate > this file's own exact content-rate
-    // (known up front — see `estimate_bitrate_bps`) > default fallback.
+    // The fix paces every bundle through the OS-thread pacer, but — unlike
+    // `play_ts_file`'s byte-rate mode — with **explicit per-bundle deadlines
+    // derived from the MP4 sample presentation timeline**:
     //
-    // The carried rate is scoped to a loop of *this exact source* — see
-    // `SpliceContinuity::carried_bitrate_for`. Without this scope check, a
-    // playlist transition to a different MP4 (different bitrate, frame
-    // rate, or GOP structure) would start its pacer at the *previous*
-    // file's rate instead of its own — pacer queue growth / excess
-    // lateness / bursty delivery right at the playlist boundary (issue
-    // #68). For a same-file loop `carried` and `file_estimate` end up
-    // equal anyway (both deterministic from the same content), so this
-    // only changes behaviour on a genuine transition — exactly the case
-    // that needs it.
+    //   * Each sample's FIRST bundle is anchored to the sample's true
+    //     presentation time (`epoch + wall_us`). The muxer puts the PCR in
+    //     the first TS packet of every video frame, so the PCR-bearing
+    //     packet lands at exactly its presentation time → PCR-vs-wall stays
+    //     linear → TR-101290 PCR_AC / PCR_repetition pass (+0).
+    //   * The sample's REMAINING bundles are spread evenly across the
+    //     sample's own presentation duration (`dur_us`), so a large frame's
+    //     packet burst is smoothed across the frame's airtime instead of
+    //     landing instantaneously (#67 fixed).
+    //
+    // Why not the byte-rate pacer used for TS? Byte-rate pacing decouples
+    // packet arrival from the sample-timestamp PCR clock; on VBR content the
+    // byte rate ≠ the instantaneous PCR rate, so PCR-packet arrival drifts
+    // non-linearly and TR-101290 PCR_AC fails. Verified on hardware
+    // (`big_buck_bunny_1080p_h264.mp4`, bilby-bite): byte-rate pacing grew
+    // `pcr_accuracy_errors` continuously through steady playback; this
+    // deadline mode holds them at zero, matching stock's per-sample timing.
+    //
+    // Because the MP4 path no longer paces by a bitrate at all, issue #68's
+    // rate-inheritance concern is structurally moot here — there is no rate
+    // to carry across a playlist transition. (`SpliceContinuity`'s
+    // source-scoped carried rate still protects the TS-passthrough path.)
     let source_id = path.file_name().and_then(|n| n.to_str()).unwrap_or("?");
-    let carried = session.cont.carried_bitrate_for(source_id);
-    let file_estimate = estimate_bitrate_bps(&d);
-    let pacer_initial_bitrate = paced_bitrate_bps
-        .or(carried)
-        .or(file_estimate)
-        .unwrap_or(DEFAULT_FALLBACK_BITRATE_BPS);
-    tracing::info!(
-        "media-player mp4 pacer rate selection: carried={:?}, file_estimate={:?}, chosen={} bps",
-        carried, file_estimate, pacer_initial_bitrate,
-    );
-    session.cont.set_converged_bitrate(source_id, pacer_initial_bitrate);
+    let _ = paced_bitrate_bps; // not consulted in deadline mode
 
     let (pacer_tx, pacer_rx) = std::sync::mpsc::sync_channel::<PacerMsg>(PACER_QUEUE_CAP);
     let broadcast_for_pacer = session.per_input_tx.clone();
@@ -476,7 +477,9 @@ async fn play_demuxed(
                 pacer_thread_name,
                 pacer_rx,
                 broadcast_for_pacer,
-                pacer_initial_bitrate,
+                // Byte-rate is unused in deadline mode; pass a nominal so the
+                // pacer's `bitrate_bps.max(1)` guard never divides by zero.
+                DEFAULT_FALLBACK_BITRATE_BPS,
                 cancel_for_pacer,
                 media_stats_for_pacer,
             );
@@ -484,17 +487,19 @@ async fn play_demuxed(
         .with_context(|| "spawn media-player mp4 pacer thread")?;
     let mut pending_src_bytes: u64 = 0;
 
-    let start_wall = Instant::now();
+    // Wall-clock anchor: presentation time 0 maps to `epoch_ns`. Every
+    // bundle's deadline is `epoch_ns + presentation_offset_ns`. The preroll
+    // keeps the first deadline just far enough in the future that the pacer
+    // thread has received the bundle before its deadline. Both this producer
+    // and the pacer read the same monotonic clock, so the deadlines are
+    // directly comparable across the thread boundary.
+    const PREROLL_NS: u64 = 50_000_000; // 50 ms, matches run_paced_emitter
+    let epoch_ns = crate::engine::wire_emit::monotonic_now_ns().saturating_add(PREROLL_NS);
     let mut bundle = BytesMut::with_capacity(session.bundle_size);
 
-    while let Some(it) = heap.pop() {
+    'sample: while let Some(it) = heap.pop() {
         if session.cancel.is_cancelled() {
             break;
-        }
-        let target = start_wall + Duration::from_micros(it.wall_us);
-        tokio::select! {
-            _ = session.cancel.cancelled() => break,
-            _ = tokio::time::sleep_until(target) => {}
         }
 
         let is_video = matches!(it.track, Track::Video);
@@ -540,25 +545,52 @@ async fn play_demuxed(
             }
         };
 
-        let mut pacer_disconnected = false;
-        for ts_pkt in chunks {
-            bundle.extend_from_slice(&ts_pkt);
-            if bundle.len() >= session.bundle_size
-                && !emit_to_pacer(
+        // Group this sample's TS packets into bundles, flushing any carry so
+        // the sample's FIRST bundle begins with its FIRST TS packet (the
+        // PCR-bearing one for video). Bundles never span a sample boundary,
+        // so per-bundle deadline anchoring stays exact.
+        debug_assert!(bundle.is_empty(), "bundle must be flushed at each sample boundary");
+        let mut sample_bundles: Vec<Bytes> = Vec::new();
+        for ts_pkt in &chunks {
+            bundle.extend_from_slice(ts_pkt);
+            if bundle.len() >= session.bundle_size {
+                let data = std::mem::replace(
                     &mut bundle,
-                    session,
-                    &pacer_tx,
-                    pacer_initial_bitrate,
-                    &mut pending_src_bytes,
+                    BytesMut::with_capacity(session.bundle_size),
                 )
-                .await
-            {
-                pacer_disconnected = true;
-                break;
+                .freeze();
+                sample_bundles.push(data);
             }
         }
-        if pacer_disconnected {
-            break;
+        if !bundle.is_empty() {
+            let data = std::mem::replace(
+                &mut bundle,
+                BytesMut::with_capacity(session.bundle_size),
+            )
+            .freeze();
+            sample_bundles.push(data);
+        }
+
+        // Emit each bundle at `anchor + (i/N) * dur`, so bundle 0 (with the
+        // PCR) lands at the sample's true presentation time and the rest are
+        // spread across the sample's airtime.
+        let n = sample_bundles.len() as u64;
+        let anchor_ns = epoch_ns.saturating_add(it.wall_us.saturating_mul(1_000));
+        let dur_ns = it.dur_us.saturating_mul(1_000);
+        for (i, data) in sample_bundles.into_iter().enumerate() {
+            let target_ns = anchor_ns.saturating_add(dur_ns.saturating_mul(i as u64) / n.max(1));
+            if !emit_to_pacer(
+                data,
+                session,
+                &pacer_tx,
+                0, // byte-rate unused in deadline mode
+                &mut pending_src_bytes,
+                Some(target_ns),
+            )
+            .await
+            {
+                break 'sample;
+            }
         }
 
         let now_ms = crate::util::time::now_us() / 1000;
@@ -569,17 +601,6 @@ async fn play_demuxed(
             session.media_stats.audio_samples_emitted.fetch_add(1, Ordering::Relaxed);
             session.media_stats.last_audio_emit_ms.store(now_ms, Ordering::Relaxed);
         }
-    }
-
-    if !bundle.is_empty() {
-        let _ = emit_to_pacer(
-            &mut bundle,
-            session,
-            &pacer_tx,
-            pacer_initial_bitrate,
-            &mut pending_src_bytes,
-        )
-        .await;
     }
 
     // Tear down the OS-thread pacer: dropping the sender lets the thread's
@@ -607,7 +628,13 @@ async fn play_demuxed(
 
 #[derive(Eq, PartialEq)]
 struct Item {
+    /// Presentation time of this sample, in µs from the file start.
     wall_us: u64,
+    /// Presentation duration of this sample (µs until the next same-track
+    /// sample). The pacer spreads this sample's TS bundles across this
+    /// window so a large sample's packet burst is smoothed across the
+    /// frame's own airtime instead of landing instantaneously.
+    dur_us: u64,
     track: Track,
     index: usize,
 }
@@ -749,56 +776,48 @@ mod tests {
     }
 
     #[test]
-    fn estimate_bitrate_bps_computes_from_es_bytes_with_headroom() {
-        // ~1,000,000 bytes of video over 1 second (timescale 90k). Duration
-        // comes from the sample's own start_time, so a second (empty)
-        // sample 1s later establishes it.
-        let s1 = avc_sample(1_000_000, 0, true);
-        let s2 = avc_sample(0, 90_000, false);
-        let total_es_bytes = (s1.bytes.len() + s2.bytes.len()) as u64;
-        let track = TrackData {
-            timescale: 90_000,
-            samples: vec![s1, s2],
-            extra: TrackExtra::Avc { sps: vec![0x67], pps: vec![0x68] },
-        };
-        let d = DemuxResult { video: Some(track), audio: None };
-        let bps = estimate_bitrate_bps(&d).expect("duration and bytes are both non-zero");
-        // 1 second duration → raw bps == total ES bytes * 8; documented 10%
-        // muxing-overhead headroom on top.
-        let expected = (total_es_bytes * 8) * 11 / 10;
-        assert_eq!(bps, expected);
+    fn sample_durations_us_uses_deltas_and_reuses_last() {
+        // 30 fps @ 90 kHz timescale → 3000 ticks = 33_333 µs per frame.
+        let samples = vec![
+            avc_sample(10, 0, true),
+            avc_sample(10, 3_000, false),
+            avc_sample(10, 6_000, false),
+        ];
+        let durs = sample_durations_us(&samples, 90_000);
+        assert_eq!(durs, vec![33_333, 33_333, 33_333], "each frame ~33.3 ms; last reuses prev");
     }
 
     #[test]
-    fn estimate_bitrate_bps_none_when_no_samples() {
-        let d = DemuxResult { video: None, audio: None };
-        assert_eq!(estimate_bitrate_bps(&d), None);
+    fn sample_durations_us_single_sample_falls_back_to_default() {
+        let samples = vec![avc_sample(10, 0, true)];
+        // No successor and no predecessor → 33 ms default so the pacer still
+        // has a non-zero spread window (never collapses back to a burst).
+        assert_eq!(sample_durations_us(&samples, 90_000), vec![33_000]);
     }
 
-    /// End-to-end regression for the fix: a single oversized IDR (the
-    /// `MEDIA_PLAYER_BURSTY_MP4_ISSUE` failure shape) followed by a normal
-    /// sample 1 second later must have its TS bundles spread across
-    /// meaningful wall-clock time by the OS-thread pacer, not delivered in
-    /// one synchronous burst. Before the fix, `play_demuxed` pushed every
-    /// bundle for a sample straight onto the broadcast channel with no
-    /// `.await` between them — this test would previously see the entire
-    /// ~50 KB IDR's ~38 bundles arrive within microseconds of each other.
+    /// End-to-end regression for #67: a single oversized IDR must have its TS
+    /// bundles spread across real wall-clock time by the deadline pacer, not
+    /// delivered in one synchronous burst. Before the fix, `play_demuxed`
+    /// pushed every bundle for a sample straight onto the broadcast channel
+    /// with no `.await` between them — the entire ~50 KB IDR's ~38 bundles
+    /// arrived within microseconds of each other.
+    ///
+    /// The IDR here has a 100 ms presentation duration (next frame 100 ms
+    /// later), so the deadline pacer spreads its bundles across ~100 ms.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn large_idr_sample_bundles_are_paced_not_bursted() {
         const IDR_BYTES: usize = 49_996; // + 4-byte length prefix = 50_000
         let sps = vec![0x67, 0x42, 0x00, 0x1E];
         let pps = vec![0x68, 0xCE, 0x3C, 0x80];
-        // `avcc_to_annex_b` is size-neutral on the NAL itself (4-byte AVCC
-        // length prefix -> 4-byte Annex-B start code) but prepends SPS+PPS
-        // (each wrapped in their own 4-byte start code) on sync samples —
-        // `largest_video_sample_bytes` records that expanded size, since
-        // that's what actually hits the muxer/pacer.
+        // `avcc_to_annex_b` prepends SPS+PPS (each in its own 4-byte start
+        // code) on sync samples; `largest_video_sample_bytes` records that
+        // expanded size, since that's what hits the muxer/pacer.
         let idr_annex_b_len = IDR_BYTES + 4 + (4 + sps.len()) + (4 + pps.len());
         let video = TrackData {
             timescale: 90_000,
             samples: vec![
                 avc_sample(IDR_BYTES, 0, true),
-                avc_sample(96, 90_000, false), // 1s later — plenty of margin
+                avc_sample(96, 9_000, false), // 100 ms later — the IDR's spread window
             ],
             extra: TrackExtra::Avc { sps, pps },
         };
@@ -843,10 +862,7 @@ mod tests {
                 flow_id: "test-flow",
                 input_id: "test-input",
             };
-            // 2 Mbps operator override: 50_000 B / 2_000_000 bps ≈ 200 ms to
-            // drain the IDR — long enough to assert meaningful spread,
-            // short enough to keep the test fast.
-            play_demuxed(Path::new("synthetic-idr.mp4"), demux, Some(2_000_000), &mut session)
+            play_demuxed(Path::new("synthetic-idr.mp4"), demux, None, &mut session)
                 .await
                 .unwrap();
         }
@@ -869,65 +885,51 @@ mod tests {
             "both video samples must be read"
         );
 
-        // The core regression assertion: bundles belonging to the large
-        // sample must be spread across real wall-clock time, not delivered
-        // in a single scheduler tick. Compare the first arrival against an
-        // arrival well before the tail (leaving margin for the second,
-        // unrelated sample and scheduler jitter).
+        // Core regression assertion: the IDR's bundles must be spread across
+        // real wall-clock time (its ~100 ms presentation window), not
+        // delivered in one scheduler tick. Compare the first arrival against
+        // one well before the tail (margin for scheduler jitter).
         let spread_index = arrivals.len().saturating_sub(5).max(1);
         let spread = arrivals[spread_index].duration_since(arrivals[0]);
         assert!(
-            spread > std::time::Duration::from_millis(50),
+            spread > std::time::Duration::from_millis(30),
             "IDR bundles arrived within {spread:?} of each other — burst was not paced \
-             (expected spread over a meaningful fraction of the ~200 ms drain time)"
+             (expected spread over a meaningful fraction of the ~100 ms sample window)"
         );
     }
 
-    /// 30 fps video track, `num_samples` samples of `bytes_per_sample` each
-    /// (constant size, so the resulting file has a clean, predictable
-    /// average bitrate for the transition test below to compare against).
-    fn constant_bitrate_demux(bytes_per_sample: usize, num_samples: u64) -> DemuxResult {
-        const FRAME_TICKS_90K: u64 = 3_000; // 90_000 / 30fps
-        let samples = (0..num_samples)
-            .map(|i| avc_sample(bytes_per_sample, i * FRAME_TICKS_90K, i == 0))
-            .collect();
-        DemuxResult {
-            video: Some(TrackData {
-                timescale: 90_000,
-                samples,
-                extra: TrackExtra::Avc { sps: vec![0x67, 0x42], pps: vec![0x68, 0xCE] },
-            }),
-            audio: None,
-        }
-    }
-
-    /// Regression for issue #68: playing two different MP4 files back to
-    /// back on the same playlist (`SpliceContinuity` shared across both,
-    /// exactly as `run()`'s playlist loop does) must not let the second
-    /// file's pacer inherit the first file's converged rate. Before the
-    /// `carried_bitrate_for` scope check, `b.mp4` would start pacing at
-    /// `a.mp4`'s rate purely because `SpliceContinuity` persists for the
-    /// whole playlist — producing pacer queue growth / bursty delivery /
-    /// excess lateness right at the boundary the operator actually sees as
-    /// a stutter.
+    /// The deadline pacer must anchor each video sample's FIRST bundle to the
+    /// sample's true presentation time. That is what keeps PCR-packet arrival
+    /// linear vs PCR value (TR-101290 PCR_AC / PCR_repetition pass) — the
+    /// property the byte-rate pacer broke on VBR content (verified regressing
+    /// on hardware). Here we drive three evenly-spaced video frames and assert
+    /// that the wall-clock arrival of each frame's first bundle tracks its
+    /// presentation interval, within a tolerance far tighter than the 100 ms
+    /// TR-101290 threshold.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn playlist_transition_does_not_inherit_previous_files_bitrate() {
-        // Deliberately large gap (10x) so any leakage is unmistakable in
-        // the assertion, not just noise from the 10% muxing headroom.
-        let demux_a = constant_bitrate_demux(20_000, 30);
-        let demux_b = constant_bitrate_demux(2_000, 30);
-        let expected_a_bps = estimate_bitrate_bps(&demux_a).expect("a.mp4 has non-zero duration/bytes");
-        let expected_b_bps = estimate_bitrate_bps(&demux_b).expect("b.mp4 has non-zero duration/bytes");
-        assert!(
-            expected_a_bps > expected_b_bps * 5,
-            "fixture sanity: a.mp4's estimate must be clearly larger than b.mp4's"
-        );
+    async fn first_bundle_of_each_frame_lands_at_its_presentation_time() {
+        // 3 small single-bundle frames, 90 ms apart (8100 ticks @ 90 kHz).
+        const FRAME_TICKS: u64 = 8_100;
+        const FRAME_MS: u128 = 90;
+        let video = TrackData {
+            timescale: 90_000,
+            samples: vec![
+                avc_sample(200, 0, true),
+                avc_sample(200, FRAME_TICKS, false),
+                avc_sample(200, 2 * FRAME_TICKS, false),
+            ],
+            extra: TrackExtra::Avc { sps: vec![0x67, 0x42], pps: vec![0x68, 0xCE] },
+        };
+        let demux = DemuxResult { video: Some(video), audio: None };
 
-        let (tx, mut rx) = broadcast::channel::<RtpPacket>(8192);
-        // Drain continuously in the background so the bounded pacer queue
-        // never backpressures play_demuxed to a stall — this test only
-        // cares about the chosen pacer rate, not wire timing.
-        let _drain = tokio::spawn(async move { while rx.recv().await.is_ok() {} });
+        let (tx, mut rx) = broadcast::channel::<RtpPacket>(1024);
+        let reader = tokio::spawn(async move {
+            let mut arrivals: Vec<std::time::Instant> = Vec::new();
+            while rx.recv().await.is_ok() {
+                arrivals.push(std::time::Instant::now());
+            }
+            arrivals
+        });
 
         let stats = std::sync::Arc::new(crate::stats::collector::FlowStatsAccumulator::new(
             "test-flow".into(),
@@ -941,7 +943,7 @@ mod tests {
         let (events, _events_rx) = crate::manager::events::event_channel();
         let media_stats = std::sync::Arc::new(crate::stats::collector::MediaPlayerStats::default());
 
-        cont.open_file("a.mp4");
+        cont.open_file("three-frames.mp4");
         {
             let mut session = PlayerSession {
                 seq_num: &mut seq_num,
@@ -959,46 +961,24 @@ mod tests {
                 flow_id: "test-flow",
                 input_id: "test-input",
             };
-            play_demuxed(Path::new("a.mp4"), demux_a, None, &mut session).await.unwrap();
+            play_demuxed(Path::new("three-frames.mp4"), demux, None, &mut session)
+                .await
+                .unwrap();
         }
-        assert_eq!(
-            cont.last_converged_bitrate_bps,
-            Some(expected_a_bps),
-            "a.mp4 (cold start, no carry to inherit from) must pace at its own estimate"
-        );
+        drop(tx);
 
-        // Playlist transition to a different source.
-        cont.open_file("b.mp4");
-        {
-            let mut session = PlayerSession {
-                seq_num: &mut seq_num,
-                per_input_tx: &tx,
-                stats: &stats,
-                cancel: &cancel,
-                cont: &mut cont,
-                transcoder: &mut transcoder,
-                pid_overrides: None,
-                post: &mut None,
-                splice_gap_signal: None,
-                bundle_size: super::super::BUNDLE_SIZE,
-                media_stats: &media_stats,
-                events: &events,
-                flow_id: "test-flow",
-                input_id: "test-input",
-            };
-            play_demuxed(Path::new("b.mp4"), demux_b, None, &mut session).await.unwrap();
-        }
-
-        assert_eq!(
-            cont.last_converged_bitrate_source.as_deref(),
-            Some("b.mp4"),
-            "converged-rate scope must track the source that most recently played"
-        );
-        assert_eq!(
-            cont.last_converged_bitrate_bps,
-            Some(expected_b_bps),
-            "b.mp4 must pace at its own estimate, not a.mp4's carried rate — this is the exact \
-             leak issue #68 reports as second-playlist-entry stutter"
+        let arrivals = reader.await.unwrap();
+        // Each frame is small enough to be a single bundle (+ PAT/PMT on the
+        // first), so consecutive arrivals are ~one frame interval apart.
+        assert!(arrivals.len() >= 3, "expected at least one bundle per frame, got {}", arrivals.len());
+        // The gap between the first bundles of consecutive frames should
+        // track the 90 ms presentation interval (generously ±40 ms for
+        // scheduler jitter — still far inside the 100 ms PCR_AC threshold).
+        let gap_1 = arrivals[1].duration_since(arrivals[0]).as_millis();
+        assert!(
+            (FRAME_MS.saturating_sub(40)..=FRAME_MS + 40).contains(&gap_1),
+            "frame-to-frame arrival gap {gap_1} ms should track the {FRAME_MS} ms presentation \
+             interval (anchoring keeps PCR arrival linear)"
         );
     }
 }
