@@ -89,9 +89,32 @@ const PACER_QUEUE_CAP: usize = 16;
 /// one bundle period of any change.
 struct PacerMsg {
     pkt: crate::engine::packet::RtpPacket,
+    /// **Explicit absolute emission deadline** in the pacer's monotonic
+    /// clock domain (`crate::engine::wire_emit::monotonic_now_ns`).
+    ///
+    /// - `Some(t)` — the producer has computed the exact wall time this
+    ///   bundle must hit the wire. The OS thread sleeps to `t` and emits,
+    ///   ignoring `bitrate_bps`/`content_src_bytes`. Used by the **MP4
+    ///   path** (`mp4_demux::play_demuxed`), which anchors each video
+    ///   sample's first (PCR-bearing) bundle to the sample's true
+    ///   presentation time and spreads the sample's remaining bundles
+    ///   across the sample's own duration. This keeps PCR-packet arrival
+    ///   exactly linear in PCR value (TR-101290 PCR_AC / PCR_repetition
+    ///   pass) while still smoothing a large sample's packet burst — the
+    ///   byte-rate mode below can't do both, because byte-rate pacing
+    ///   decouples packet arrival from the sample-timestamp PCR clock and
+    ///   drifts on VBR content (verified on hardware: byte-rate pacing an
+    ///   MP4 grew `pcr_accuracy_errors` continuously, this deadline mode
+    ///   holds them at zero).
+    /// - `None` — byte-rate mode: the OS thread computes the deadline from
+    ///   `bitrate_bps` + `content_src_bytes`. Used by the **TS-passthrough
+    ///   path** (`play_ts_file`), which has no per-sample presentation
+    ///   timeline to anchor to (its PCR is already in the source bytes and
+    ///   real TS files are well-behaved / near-CBR).
+    target_ns: Option<u64>,
     /// Producer's current bitrate estimate (bps) for the file. The OS
     /// thread re-anchors `iter_start_wall` whenever this differs from
-    /// its last-seen value.
+    /// its last-seen value. Ignored when `target_ns` is `Some`.
     bitrate_bps: u64,
     /// Number of **source** TS bytes this message represents — i.e. how
     /// much file-content was consumed to produce `pkt`, *including* bytes
@@ -1160,12 +1183,18 @@ async fn play_ts_file(
             // this threshold, since appends are whole 188-byte packets) so the
             // windowed bitrate estimator stays correct for any datagram size.
             bytes_emitted = bytes_emitted.saturating_add(bundle.len() as u64);
-            if !emit_to_pacer(
+            let data = std::mem::replace(
                 &mut bundle,
+                BytesMut::with_capacity(session.bundle_size),
+            )
+            .freeze();
+            if !emit_to_pacer(
+                data,
                 session,
                 &pacer_tx,
                 current_bitrate_bps,
                 &mut pending_src_bytes,
+                None, // TS passthrough: byte-rate mode
             )
             .await
             {
@@ -1176,12 +1205,18 @@ async fn play_ts_file(
 
     // Flush the trailing partial bundle so we don't lose the file's tail.
     if !bundle.is_empty() {
-        let _ = emit_to_pacer(
+        let data = std::mem::replace(
             &mut bundle,
+            BytesMut::with_capacity(session.bundle_size),
+        )
+        .freeze();
+        let _ = emit_to_pacer(
+            data,
             session,
             &pacer_tx,
             current_bitrate_bps,
             &mut pending_src_bytes,
+            None, // TS passthrough: byte-rate mode
         )
         .await;
     }
@@ -1875,9 +1910,9 @@ fn fake_rtp_ts(_session: &PlayerSession<'_>) -> u32 {
     ((now_us / 1_000) * 90).rem_euclid(0x1_0000_0000) as u32
 }
 
-/// Drain `bundle` into an `RtpPacket`, run the optional input transcoder
-/// + post-processor under `block_in_place`, and push the result to the
-/// OS-thread pacer for absolute-deadline emission. Returns `true` on
+/// Wrap a ready TS `data` bundle into an `RtpPacket`, run the optional input
+/// transcoder + post-processor under `block_in_place`, and push the result to
+/// the OS-thread pacer for absolute-deadline emission. Returns `true` on
 /// success and `false` if the OS thread has shut down (channel
 /// disconnected) — the async loop should bail when that happens.
 ///
@@ -1888,7 +1923,7 @@ fn fake_rtp_ts(_session: &PlayerSession<'_>) -> u32 {
 /// `send()` that could stall a worker for tens of ms when a slow
 /// downstream broadcast subscriber back-pressures the OS thread.
 async fn emit_to_pacer(
-    bundle: &mut BytesMut,
+    data: Bytes,
     session: &mut PlayerSession<'_>,
     pacer_tx: &std::sync::mpsc::SyncSender<PacerMsg>,
     bitrate_bps: u64,
@@ -1896,12 +1931,14 @@ async fn emit_to_pacer(
     // nothing). Carried across calls so the next message that DOES emit is
     // credited with the full source-content it represents — see `PacerMsg`.
     pending_src_bytes: &mut u64,
+    // Explicit absolute emission deadline (MP4 sample-anchored path). `None`
+    // ⇒ byte-rate mode (TS passthrough). See [`PacerMsg::target_ns`].
+    target_ns: Option<u64>,
 ) -> bool {
-    if bundle.is_empty() {
+    if data.is_empty() {
         return true;
     }
-    let total_len = bundle.len();
-    let data: Bytes = std::mem::replace(bundle, BytesMut::with_capacity(session.bundle_size)).freeze();
+    let total_len = data.len();
     // `recv_time_us` is filled in by the OS-thread pacer right before
     // the broadcast send so the downstream `output_latency` metric
     // measures only wire_emit's queue + pacer time, not the extra
@@ -1949,6 +1986,7 @@ async fn emit_to_pacer(
     // the producer typically blocks for at most one bundle period.
     let mut to_send = PacerMsg {
         pkt: processed,
+        target_ns,
         bitrate_bps,
         content_src_bytes,
     };
@@ -2097,43 +2135,58 @@ fn run_paced_emitter(
         // Mirror the producer-side increment in `emit_to_pacer` — this
         // message just left the hand-off queue.
         stats.pacer_queue_depth.fetch_sub(1, Ordering::Relaxed);
-        // Bitrate refinement piggybacks on every bundle so the OS thread
-        // tracks the producer's view of the file rate even when the
-        // bundle channel is steady-state full. Updates affect FUTURE
-        // inter-bundle spacing only; the next target is the previous
-        // target plus the new bundle period. No retroactive shift of
-        // queued targets, so a rate refinement never produces a burst.
-        if msg.bitrate_bps != 0 {
-            bitrate_bps = msg.bitrate_bps;
-        }
-        // Pace by the SOURCE content this message represents, not a fixed
-        // `BUNDLE_SIZE`. In passthrough `content_src_bytes == BUNDLE_SIZE`
-        // (1 message per source bundle) so behaviour is unchanged; with an
-        // input transcoder the count carries any buffered-then-merged source
-        // bundles, so the file plays at true 1.0x instead of ~2 % fast.
-        // Fall back to BUNDLE_SIZE if a producer ever sends 0 (defensive).
-        let content_bytes = if msg.content_src_bytes != 0 {
-            msg.content_src_bytes
+
+        // Two timing modes, selected per-message (a given pacer thread only
+        // ever sees one mode, since play_ts_file and play_demuxed each spawn
+        // their own thread — but branching per message keeps the two paths
+        // sharing one emitter body):
+        let target_ns = if let Some(explicit) = msg.target_ns {
+            // ── MP4 sample-anchored mode ──────────────────────────────────
+            // The producer already computed the exact deadline from the
+            // sample presentation timeline. Emit at it verbatim; the
+            // byte-rate state (`next_target_wall`) is unused in this mode.
+            explicit
         } else {
-            BUNDLE_SIZE as u64
+            // ── Byte-rate mode (TS passthrough) ───────────────────────────
+            // Bitrate refinement piggybacks on every bundle so the OS thread
+            // tracks the producer's view of the file rate even when the
+            // bundle channel is steady-state full. Updates affect FUTURE
+            // inter-bundle spacing only; the next target is the previous
+            // target plus the new bundle period. No retroactive shift of
+            // queued targets, so a rate refinement never produces a burst.
+            if msg.bitrate_bps != 0 {
+                bitrate_bps = msg.bitrate_bps;
+            }
+            // Pace by the SOURCE content this message represents, not a fixed
+            // `BUNDLE_SIZE`. In passthrough `content_src_bytes == BUNDLE_SIZE`
+            // (1 message per source bundle) so behaviour is unchanged; with an
+            // input transcoder the count carries any buffered-then-merged
+            // source bundles, so the file plays at true 1.0x instead of ~2 %
+            // fast. Fall back to BUNDLE_SIZE if a producer ever sends 0.
+            let content_bytes = if msg.content_src_bytes != 0 {
+                msg.content_src_bytes
+            } else {
+                BUNDLE_SIZE as u64
+            };
+            bytes_emitted = bytes_emitted.saturating_add(content_bytes);
+            let bundle_period_ns =
+                content_bytes.saturating_mul(8_000_000_000) / bitrate_bps.max(1);
+            let t = next_target_wall;
+            // Advance the running target for the next bundle. If the actual
+            // fire wallclock catches up to (or passes) `next_target_wall`
+            // — e.g. the channel has been silent for a while and the OS
+            // thread had nothing to send — anchor forward from "now" so the
+            // pacer doesn't burst through a backlog of past targets when a
+            // bundle eventually lands.
+            let now = crate::engine::wire_emit::monotonic_now_ns();
+            next_target_wall = t.max(now).saturating_add(bundle_period_ns);
+            t
         };
-        bytes_emitted = bytes_emitted.saturating_add(content_bytes);
-        let bundle_period_ns =
-            content_bytes.saturating_mul(8_000_000_000) / bitrate_bps.max(1);
-        let target_ns = next_target_wall;
-        // Advance the running target for the next bundle. If the actual
-        // fire wallclock catches up to (or passes) `next_target_wall`
-        // — e.g. the channel has been silent for a while and the OS
-        // thread had nothing to send — anchor forward from "now" so the
-        // pacer doesn't burst through a backlog of past targets when a
-        // bundle eventually lands.
-        let now_check = crate::engine::wire_emit::monotonic_now_ns();
-        let advance_from = target_ns.max(now_check);
-        next_target_wall = advance_from.saturating_add(bundle_period_ns);
         // How far the pacer has already fallen behind this bundle's own
-        // computed deadline, in ms. `0` when on schedule or running ahead.
-        // The closest signal the media player has to "am I keeping up with
-        // the file's own timeline" — see `MediaPlayerStats` doc comment.
+        // deadline, in ms. `0` when on schedule or running ahead. The
+        // closest signal the media player has to "am I keeping up with the
+        // file's own timeline" — see `MediaPlayerStats` doc comment.
+        let now_check = crate::engine::wire_emit::monotonic_now_ns();
         let late_ms = now_check.saturating_sub(target_ns) / 1_000_000;
         stats.record_pacer_lateness_ms(late_ms);
         crate::engine::wire_emit::sleep_until_monotonic_ns(target_ns);
