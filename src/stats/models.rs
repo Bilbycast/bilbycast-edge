@@ -837,6 +837,56 @@ pub struct InputStats {
     /// `type: "sdi"`. Additive — older managers ignore it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sdi_stats: Option<SdiInputStats>,
+    /// Per-input media-player playout statistics. Present only on inputs of
+    /// `type: "media_player"`. Additive — older managers ignore it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub media_player_stats: Option<MediaPlayerInputStats>,
+}
+
+/// Media-player playout statistics for one input.
+///
+/// `play_source()` returning without error only means the demuxer/muxer
+/// didn't error — it does not mean usable video reached the wire (see
+/// `docs/events-and-alarms.md` "Media Player Input" and the
+/// `MEDIA_PLAYER_BURSTY_MP4_ISSUE` writeup). These fields give an operator
+/// visibility into playout progress and pacer health independently of that
+/// return value.
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct MediaPlayerInputStats {
+    /// `"starting"` / `"playing"` / `"stalled"` / `"failed"` / `"exhausted"`.
+    pub state: String,
+    /// Index of the source currently (or most recently) playing within the
+    /// input's playlist.
+    pub current_source_index: u64,
+    /// Video access units read from the container.
+    pub video_samples_read: u64,
+    /// Video access units muxed onto the wire.
+    pub video_samples_emitted: u64,
+    /// Audio access units read from the container.
+    pub audio_samples_read: u64,
+    /// Audio access units muxed onto the wire.
+    pub audio_samples_emitted: u64,
+    /// Largest single compressed video access unit observed this input
+    /// (bytes, pre-Annex-B expansion). A healthy low-bitrate H.264 file's
+    /// IDR is typically ~1-4 KB; values in the hundreds of KB indicate a
+    /// source likely to trigger bursty delivery.
+    pub largest_video_sample_bytes: u64,
+    /// Seconds since the last video sample was muxed onto the wire. `None`
+    /// before the first video sample of the current/most recent source.
+    /// Only meaningful while a video-bearing source is active — stays at
+    /// its last value (growing) once the playlist is idle/exhausted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seconds_since_video: Option<f64>,
+    /// Current occupancy of the OS-thread pacer's bounded hand-off queue.
+    pub pacer_queue_depth: u64,
+    /// How far behind its computed wall-clock deadline the pacer's most
+    /// recently emitted bundle was, in milliseconds.
+    pub pacer_lateness_current_ms: u64,
+    /// High-water-mark of `pacer_lateness_current_ms` since the input started.
+    pub pacer_lateness_max_ms: u64,
+    /// True while the pacer is latched as lagging (see
+    /// `media_player_pacer_lagging` / `media_player_pacer_recovered` events).
+    pub pacer_lagging: bool,
 }
 
 /// SDI (DeckLink) capture statistics for one input.
