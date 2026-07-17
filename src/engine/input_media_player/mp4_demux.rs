@@ -440,7 +440,19 @@ async fn play_demuxed(
     // Priority mirrors `play_ts_file`: operator override > previous
     // loop/file's converged rate > this file's own exact content-rate
     // (known up front — see `estimate_bitrate_bps`) > default fallback.
-    let carried = session.cont.last_converged_bitrate_bps;
+    //
+    // The carried rate is scoped to a loop of *this exact source* — see
+    // `SpliceContinuity::carried_bitrate_for`. Without this scope check, a
+    // playlist transition to a different MP4 (different bitrate, frame
+    // rate, or GOP structure) would start its pacer at the *previous*
+    // file's rate instead of its own — pacer queue growth / excess
+    // lateness / bursty delivery right at the playlist boundary (issue
+    // #68). For a same-file loop `carried` and `file_estimate` end up
+    // equal anyway (both deterministic from the same content), so this
+    // only changes behaviour on a genuine transition — exactly the case
+    // that needs it.
+    let source_id = path.file_name().and_then(|n| n.to_str()).unwrap_or("?");
+    let carried = session.cont.carried_bitrate_for(source_id);
     let file_estimate = estimate_bitrate_bps(&d);
     let pacer_initial_bitrate = paced_bitrate_bps
         .or(carried)
@@ -450,16 +462,13 @@ async fn play_demuxed(
         "media-player mp4 pacer rate selection: carried={:?}, file_estimate={:?}, chosen={} bps",
         carried, file_estimate, pacer_initial_bitrate,
     );
-    session.cont.last_converged_bitrate_bps = Some(pacer_initial_bitrate);
+    session.cont.set_converged_bitrate(source_id, pacer_initial_bitrate);
 
     let (pacer_tx, pacer_rx) = std::sync::mpsc::sync_channel::<PacerMsg>(PACER_QUEUE_CAP);
     let broadcast_for_pacer = session.per_input_tx.clone();
     let cancel_for_pacer = session.cancel.clone();
     let media_stats_for_pacer = session.media_stats.clone();
-    let pacer_thread_name = format!(
-        "media-pacer-{}",
-        path.file_name().and_then(|n| n.to_str()).unwrap_or("?")
-    );
+    let pacer_thread_name = format!("media-pacer-{source_id}");
     let pacer_thread = std::thread::Builder::new()
         .name(pacer_thread_name.clone())
         .spawn(move || {
@@ -871,6 +880,125 @@ mod tests {
             spread > std::time::Duration::from_millis(50),
             "IDR bundles arrived within {spread:?} of each other — burst was not paced \
              (expected spread over a meaningful fraction of the ~200 ms drain time)"
+        );
+    }
+
+    /// 30 fps video track, `num_samples` samples of `bytes_per_sample` each
+    /// (constant size, so the resulting file has a clean, predictable
+    /// average bitrate for the transition test below to compare against).
+    fn constant_bitrate_demux(bytes_per_sample: usize, num_samples: u64) -> DemuxResult {
+        const FRAME_TICKS_90K: u64 = 3_000; // 90_000 / 30fps
+        let samples = (0..num_samples)
+            .map(|i| avc_sample(bytes_per_sample, i * FRAME_TICKS_90K, i == 0))
+            .collect();
+        DemuxResult {
+            video: Some(TrackData {
+                timescale: 90_000,
+                samples,
+                extra: TrackExtra::Avc { sps: vec![0x67, 0x42], pps: vec![0x68, 0xCE] },
+            }),
+            audio: None,
+        }
+    }
+
+    /// Regression for issue #68: playing two different MP4 files back to
+    /// back on the same playlist (`SpliceContinuity` shared across both,
+    /// exactly as `run()`'s playlist loop does) must not let the second
+    /// file's pacer inherit the first file's converged rate. Before the
+    /// `carried_bitrate_for` scope check, `b.mp4` would start pacing at
+    /// `a.mp4`'s rate purely because `SpliceContinuity` persists for the
+    /// whole playlist — producing pacer queue growth / bursty delivery /
+    /// excess lateness right at the boundary the operator actually sees as
+    /// a stutter.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn playlist_transition_does_not_inherit_previous_files_bitrate() {
+        // Deliberately large gap (10x) so any leakage is unmistakable in
+        // the assertion, not just noise from the 10% muxing headroom.
+        let demux_a = constant_bitrate_demux(20_000, 30);
+        let demux_b = constant_bitrate_demux(2_000, 30);
+        let expected_a_bps = estimate_bitrate_bps(&demux_a).expect("a.mp4 has non-zero duration/bytes");
+        let expected_b_bps = estimate_bitrate_bps(&demux_b).expect("b.mp4 has non-zero duration/bytes");
+        assert!(
+            expected_a_bps > expected_b_bps * 5,
+            "fixture sanity: a.mp4's estimate must be clearly larger than b.mp4's"
+        );
+
+        let (tx, mut rx) = broadcast::channel::<RtpPacket>(8192);
+        // Drain continuously in the background so the bounded pacer queue
+        // never backpressures play_demuxed to a stall — this test only
+        // cares about the chosen pacer rate, not wire timing.
+        let _drain = tokio::spawn(async move { while rx.recv().await.is_ok() {} });
+
+        let stats = std::sync::Arc::new(crate::stats::collector::FlowStatsAccumulator::new(
+            "test-flow".into(),
+            "test-flow-name".into(),
+            "media_player".into(),
+        ));
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let mut seq_num: u16 = 0;
+        let mut cont = super::super::SpliceContinuity::default();
+        let mut transcoder: Option<crate::engine::input_transcode::InputTranscoder> = None;
+        let (events, _events_rx) = crate::manager::events::event_channel();
+        let media_stats = std::sync::Arc::new(crate::stats::collector::MediaPlayerStats::default());
+
+        cont.open_file("a.mp4");
+        {
+            let mut session = PlayerSession {
+                seq_num: &mut seq_num,
+                per_input_tx: &tx,
+                stats: &stats,
+                cancel: &cancel,
+                cont: &mut cont,
+                transcoder: &mut transcoder,
+                pid_overrides: None,
+                post: &mut None,
+                splice_gap_signal: None,
+                bundle_size: super::super::BUNDLE_SIZE,
+                media_stats: &media_stats,
+                events: &events,
+                flow_id: "test-flow",
+                input_id: "test-input",
+            };
+            play_demuxed(Path::new("a.mp4"), demux_a, None, &mut session).await.unwrap();
+        }
+        assert_eq!(
+            cont.last_converged_bitrate_bps,
+            Some(expected_a_bps),
+            "a.mp4 (cold start, no carry to inherit from) must pace at its own estimate"
+        );
+
+        // Playlist transition to a different source.
+        cont.open_file("b.mp4");
+        {
+            let mut session = PlayerSession {
+                seq_num: &mut seq_num,
+                per_input_tx: &tx,
+                stats: &stats,
+                cancel: &cancel,
+                cont: &mut cont,
+                transcoder: &mut transcoder,
+                pid_overrides: None,
+                post: &mut None,
+                splice_gap_signal: None,
+                bundle_size: super::super::BUNDLE_SIZE,
+                media_stats: &media_stats,
+                events: &events,
+                flow_id: "test-flow",
+                input_id: "test-input",
+            };
+            play_demuxed(Path::new("b.mp4"), demux_b, None, &mut session).await.unwrap();
+        }
+
+        assert_eq!(
+            cont.last_converged_bitrate_source.as_deref(),
+            Some("b.mp4"),
+            "converged-rate scope must track the source that most recently played"
+        );
+        assert_eq!(
+            cont.last_converged_bitrate_bps,
+            Some(expected_b_bps),
+            "b.mp4 must pace at its own estimate, not a.mp4's carried rate — this is the exact \
+             leak issue #68 reports as second-playlist-entry stutter"
         );
     }
 }

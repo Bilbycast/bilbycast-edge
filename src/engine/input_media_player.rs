@@ -497,12 +497,28 @@ pub(super) struct SpliceContinuity {
     /// preceding stream to be discontinuous from.
     has_played_at_least_one_file: bool,
 
-    /// Converged cumulative bitrate from the previous `play_ts_file` call.
-    /// Carried across loops so the OS-thread pacer starts at the known-good
-    /// rate instead of the head-scan estimate (which overshoots by 10-20%
-    /// on the first second of every loop, accumulating wire_tx excess that
-    /// never drains).
+    /// Converged cumulative bitrate from the previous `play_ts_file` /
+    /// `play_demuxed` call. Carried across loops so the OS-thread pacer
+    /// starts at the known-good rate instead of the head-scan estimate
+    /// (which overshoots by 10-20% on the first second of every loop,
+    /// accumulating wire_tx excess that never drains).
+    ///
+    /// **Only valid for a loop of the same source** — see
+    /// [`Self::last_converged_bitrate_source`]. Read this field directly
+    /// only through a check against that source id; a bare read here would
+    /// reintroduce issue #68 (a playlist transition to a different file
+    /// with a different bitrate starting its pacer at the previous file's
+    /// rate).
     pub(super) last_converged_bitrate_bps: Option<u64>,
+    /// Source identity (matches [`source_name_str`]) that produced
+    /// [`Self::last_converged_bitrate_bps`]. `SpliceContinuity` persists
+    /// for the whole playlist's lifetime, so without this scope check the
+    /// carried rate leaks across a transition to a genuinely different
+    /// file — a materially different bitrate, frame rate, or GOP structure
+    /// then starts the new file's pacer at the wrong rate, producing pacer
+    /// queue growth / excess lateness / bursty delivery right at the
+    /// playlist boundary (issue #68). `None` until the first file closes.
+    pub(super) last_converged_bitrate_source: Option<String>,
 }
 
 impl SpliceContinuity {
@@ -572,6 +588,28 @@ impl SpliceContinuity {
             self.last_layout = Some(new_layout);
         }
         changed
+    }
+
+    /// The carried pacer bitrate, scoped to a loop of `source_id` — `None`
+    /// on a genuine transition to a different source, even though
+    /// [`Self::last_converged_bitrate_bps`] itself is still populated from
+    /// whatever source played last. See the field doc comment and issue
+    /// #68 for why this scope check exists.
+    pub(super) fn carried_bitrate_for(&self, source_id: &str) -> Option<u64> {
+        if self.last_converged_bitrate_source.as_deref() == Some(source_id) {
+            self.last_converged_bitrate_bps
+        } else {
+            None
+        }
+    }
+
+    /// Record the converged pacer bitrate for `source_id`, called at the
+    /// end of each per-format player. Pairs with
+    /// [`Self::carried_bitrate_for`] — always write both fields together so
+    /// they can never disagree about which source the rate belongs to.
+    pub(super) fn set_converged_bitrate(&mut self, source_id: &str, bps: u64) {
+        self.last_converged_bitrate_bps = Some(bps);
+        self.last_converged_bitrate_source = Some(source_id.to_string());
     }
 }
 
@@ -797,7 +835,15 @@ async fn play_ts_file(
     // head scan > default fallback. The carried rate eliminates the
     // 50-second convergence transient that otherwise overshoots on every
     // loop restart and accumulates wire_tx excess.
-    let carried = session.cont.last_converged_bitrate_bps;
+    //
+    // The carried rate is scoped to a loop of *this exact source* — see
+    // `SpliceContinuity::carried_bitrate_for`. `SpliceContinuity` persists
+    // for the whole playlist, so a bare read of `last_converged_bitrate_bps`
+    // would leak the previous (possibly very different) file's rate across
+    // a playlist transition, starting the new file's pacer at the wrong
+    // rate right at the boundary (issue #68).
+    let source_id = path.file_name().and_then(|n| n.to_str()).unwrap_or("?");
+    let carried = session.cont.carried_bitrate_for(source_id);
     let pacer_initial_bitrate = paced_bitrate_bps
         .or(carried)
         .or(head_bitrate)
@@ -811,12 +857,7 @@ async fn play_ts_file(
     let broadcast_for_pacer = session.per_input_tx.clone();
     let cancel_for_pacer = session.cancel.clone();
     let media_stats_for_pacer = session.media_stats.clone();
-    let pacer_thread_name = format!(
-        "media-pacer-{}",
-        path.file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("?")
-    );
+    let pacer_thread_name = format!("media-pacer-{source_id}");
     let pacer_thread = std::thread::Builder::new()
         .name(pacer_thread_name.clone())
         .spawn(move || {
@@ -1145,9 +1186,10 @@ async fn play_ts_file(
         .await;
     }
 
-    // Carry the converged cumulative rate to the next loop so the pacer
-    // starts at the known-good rate instead of the head-scan estimate.
-    session.cont.last_converged_bitrate_bps = Some(current_bitrate_bps);
+    // Carry the converged cumulative rate to the next loop of *this same
+    // source* so the pacer starts at the known-good rate instead of the
+    // head-scan estimate (see `carried_bitrate_for`/issue #68 above).
+    session.cont.set_converged_bitrate(source_id, current_bitrate_bps);
 
     // Tear down the OS-thread pacer: dropping the sender lets the thread's
     // `recv_timeout` poll see `Disconnected` on its next iteration (within
@@ -2734,6 +2776,34 @@ mod tests {
         // Real transition: flag must arm.
         cont.open_file("b.mp4");
         assert!(cont.pending_discontinuity);
+    }
+
+    /// Regression for issue #68: a playlist transition to a different
+    /// source must not inherit the previous source's converged pacer
+    /// bitrate. `SpliceContinuity` persists for the whole playlist, so a
+    /// bare (unscoped) read of `last_converged_bitrate_bps` would leak
+    /// `a.mp4`'s rate into `b.mp4`'s pacer startup, starting the new file
+    /// at the wrong rate right at the boundary.
+    #[test]
+    fn carried_bitrate_is_scoped_to_the_source_that_produced_it() {
+        let mut cont = SpliceContinuity::default();
+
+        // No source has ever converged — nothing carries.
+        assert_eq!(cont.carried_bitrate_for("a.mp4"), None);
+
+        cont.set_converged_bitrate("a.mp4", 4_800_000);
+        // Same source, e.g. a loop: carries.
+        assert_eq!(cont.carried_bitrate_for("a.mp4"), Some(4_800_000));
+        // Different source, e.g. a playlist transition: must NOT carry,
+        // even though `last_converged_bitrate_bps` is still populated.
+        assert_eq!(cont.carried_bitrate_for("b.mp4"), None);
+        assert_eq!(cont.last_converged_bitrate_bps, Some(4_800_000));
+
+        // After b.mp4 converges, a.mp4 no longer carries either — the
+        // scope always tracks the single most recent source, not a set.
+        cont.set_converged_bitrate("b.mp4", 7_200_000);
+        assert_eq!(cont.carried_bitrate_for("b.mp4"), Some(7_200_000));
+        assert_eq!(cont.carried_bitrate_for("a.mp4"), None);
     }
 
     #[test]
