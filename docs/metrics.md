@@ -669,7 +669,7 @@ instead of silent.
 | `audio_samples_read` / `audio_samples_emitted` | Audio access units read from the container / muxed onto the wire |
 | `largest_video_sample_bytes` | Largest single compressed video access unit observed (bytes, pre-Annex-B expansion). A healthy low-bitrate H.264 file's IDR is typically ~1-4 KB; hundreds of KB is the signature of a source likely to trigger bursty delivery |
 | `seconds_since_video` | Seconds since the last video sample was muxed onto the wire. `None` before the first video sample of the current/most recent source |
-| `pacer_queue_depth` | Current occupancy of the OS-thread pacer's bounded hand-off queue (16 slots). Sustained values at capacity mean the producer is generating bundles faster than the pacer can drain them at the paced bitrate |
+| `pacer_queue_depth` | Current occupancy of the OS-thread pacer's bounded hand-off queue (16 slots). Steady-state near capacity is normal (the producer runs a small lookahead ahead of the real-time pacer); it only signals trouble alongside rising `pacer_lateness_*` |
 | `pacer_lateness_current_ms` / `pacer_lateness_max_ms` | How far behind its own computed wall-clock deadline the pacer's most recently emitted bundle was, and the high-water-mark since the input started |
 | `pacer_lagging` | Latched — true while `pacer_lateness_current_ms` has crossed 250 ms and hasn't yet recovered below 100 ms. Mirrors `media_player_pacer_lagging` / `media_player_pacer_recovered` events (see `docs/events-and-alarms.md`) |
 
