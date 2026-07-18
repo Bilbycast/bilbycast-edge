@@ -699,6 +699,14 @@ async fn run_display_output(
     // `display_prime_fallback_engaged` Warning event is the operator's signal
     // that the demotion engaged. (A dynamic `vaapi (sysmem)` label could be
     // surfaced off `prime_scanout_failed` later if the UI needs it.)
+    //
+    // RKMPP mirrors this exactly: `open_video_decoder_with_retry` calls
+    // `set_rkmpp_zero_copy(true)` on every display-path RKMPP decoder,
+    // so the demux loop's `drain_video_frames` maps native
+    // `AV_PIX_FMT_DRM_PRIME` frames straight to the same PRIME scanout
+    // path VAAPI uses (no `av_hwframe_map` needed — RKMPP frames are
+    // already DRM_PRIME) — same sticky `prime_scanout_failed`
+    // fallback, same static label semantics.
     let decoder_kind_label: &'static str = match (resolved, hw_unavailable_reason) {
         // Soft-fallback path: operator asked for HW but the host can't
         // do it. We're running CPU but the UI must reflect *why* — so
@@ -713,7 +721,9 @@ async fn run_display_output(
         (crate::engine::hardware_probe::ResolvedDisplayDecoder::Vaapi, _) => {
             "vaapi-zerocopy"
         }
-        (crate::engine::hardware_probe::ResolvedDisplayDecoder::Rkmpp, _) => "rkmpp",
+        (crate::engine::hardware_probe::ResolvedDisplayDecoder::Rkmpp, _) => {
+            "rkmpp-zerocopy"
+        }
     };
     let display_frame_gen = Arc::clone(&frame_gen);
     let display_force_cpu_blit = Arc::clone(&force_cpu_blit_for_bars);
@@ -1700,12 +1710,20 @@ fn open_video_decoder_with_retry(
             std::thread::sleep(std::time::Duration::from_millis(delay_ms));
         }
         match VideoDecoder::open_with_backend(codec, state.backend) {
-            Ok(d) => {
+            Ok(mut d) => {
                 if attempt_idx > 0 {
                     tracing::info!(
                         "display HW decoder opened on attempt {} (flow='{flow_id}', output='{output_id}')",
                         attempt_idx + 1,
                     );
+                }
+                if matches!(state.backend, DecoderBackend::Rkmpp) {
+                    // Every consumer of this decoder is the display
+                    // output — safe to always request the raw
+                    // DRM_PRIME frame here and route it through the
+                    // zero-copy KMS scanout path below instead of
+                    // paying a sysmem download on every frame.
+                    d.set_rkmpp_zero_copy(true);
                 }
                 return Some(d);
             }
@@ -2686,17 +2704,19 @@ fn drain_video_frames(
             state.hdr_on_sdr_event_emitted = true;
         }
 
-        // Download VAAPI surfaces to sysmem when:
+        // Download VAAPI / RKMPP HW surfaces to sysmem when:
         //   1. HDR source + SDR panel — the display task needs CPU
         //      pixels for the PQ/HLG → SDR tonemap LUT.
         //   2. Bars are configured but the overlay plane couldn't be
         //      programmed (`force_cpu_blit_for_bars`) — the display
         //      task's CPU-blit path is the only way bars reach the
-        //      panel; the VAAPI zero-copy scanout owns the primary
-        //      plane and there's no dumb buffer to bake into.
-        // Either way: download flips `is_vaapi()` to false, the planar
-        // / semi-planar codepath below builds a sysmem `VideoFrame`,
-        // and the display task's CPU-blit path takes over.
+        //      panel; the zero-copy scanout owns the primary plane
+        //      and there's no dumb buffer to bake into.
+        // Either way: download flips `is_vaapi()`/`is_drm_prime()` to
+        // false, the planar / semi-planar codepath below builds a
+        // sysmem `VideoFrame`, and the display task's CPU-blit path
+        // takes over.
+        let is_hw_prime_frame = frame.is_vaapi() || frame.is_drm_prime();
         let over_sw_ceiling =
             frame.width() > 1920 || frame.height() > 1080;
         // Sticky demotion wins over the SW-blit ceiling: once the display
@@ -2709,7 +2729,7 @@ fn drain_video_frames(
         // below bob-deinterlaces instead. Interlaced content tops out
         // at 1080i so the `!over_sw_ceiling` guard never bites in
         // practice.)
-        let need_sysmem = frame.is_vaapi()
+        let need_sysmem = is_hw_prime_frame
             && (prime_dead
                 || (!over_sw_ceiling
                     && ((source_is_hdr && !panel_hdr_capable)
@@ -2721,8 +2741,8 @@ fn drain_video_frames(
                     Ok(sysmem) => sysmem,
                     Err(e) => {
                         // Download failed (rare — driver / format
-                        // mismatch). Pass the VAAPI frame through
-                        // and let the prime path run — the operator
+                        // mismatch). Pass the HW frame through and
+                        // let the prime path run — the operator
                         // either sees un-tonemapped HDR (HDR-on-SDR
                         // case) or no bars (bars-without-overlay
                         // case). Sustained failures trip the existing
@@ -2731,7 +2751,7 @@ fn drain_video_frames(
                             output_id = %output_id,
                             color_transfer,
                             force_cpu_blit_for_bars = force_cpu_blit_for_bars.load(Ordering::Relaxed),
-                            "VAAPI → sysmem download failed ({e:?}) — falling back to zero-copy prime path"
+                            "HW → sysmem download failed ({e:?}) — falling back to zero-copy prime path"
                         );
                         frame
                     }
@@ -2740,23 +2760,40 @@ fn drain_video_frames(
                 frame
             };
 
-        // ── VAAPI zero-copy fast path ──────────────────────────────
+        // ── VAAPI / RKMPP zero-copy fast path ──────────────────────
         //
         // `is_vaapi()` is true exactly when the decoder was opened on
         // the VAAPI backend AND the `get_format` callback negotiated
-        // AV_PIX_FMT_VAAPI for the bitstream profile. Map the decoded
-        // surface to a DRM PRIME descriptor and ship it through the
-        // mpsc with the AVFrame keepalive. The display task imports
-        // the DMA-BUF as a KMS framebuffer and atomic-page-flips
-        // straight onto it — eliminating both the libswscale YUV→BGRA
-        // blit and the system-memory copy through the dumb buffer.
+        // AV_PIX_FMT_VAAPI for the bitstream profile; `is_drm_prime()`
+        // is true when it's RKMPP's native DRM_PRIME output (only
+        // reachable when `set_rkmpp_zero_copy(true)` was set on this
+        // decoder — see `open_video_decoder_with_retry`). Either way,
+        // map the frame to a DRM PRIME descriptor and ship it through
+        // the mpsc with the AVFrame keepalive. The display task
+        // imports the DMA-BUF as a KMS framebuffer and atomic-page-
+        // flips straight onto it — eliminating both the libswscale
+        // YUV→BGRA blit and the system-memory copy through the dumb
+        // buffer (and, for RKMPP, the `av_hwframe_transfer_data`
+        // DRM_PRIME→sysmem download that was previously the dominant
+        // per-frame cost — see the `rkmpp_transfer_us_*` stats this
+        // fix was built to eliminate).
         //
         // On mapping failure (typical: FFmpeg without CONFIG_LIBDRM,
-        // or driver refused to export this profile) we drop the frame
-        // and bump a counter — the runtime watchdog further upstream
-        // will demote the whole decoder to CPU after a window of
-        // sustained zero-copy failures.
-        if frame.is_vaapi() {
+        // or driver refused to export this profile) VAAPI drops the
+        // frame and bumps a counter — the runtime watchdog further
+        // upstream will demote the whole decoder to CPU after a
+        // window of sustained zero-copy failures, a path proven on
+        // Intel/AMD hardware over many prior releases. RKMPP's native
+        // DRM_PRIME export is new code with no equivalent hardware
+        // track record yet, so rather than risk a black/frozen panel
+        // on a bad assumption about the AVDRMFrameDescriptor layout
+        // (see `wrap_rkmpp_drm_prime`'s doc comment), a per-frame
+        // mapping failure falls back to a sysmem download and rides
+        // the existing CPU-blit path below instead of being dropped —
+        // worst case this is exactly the pre-zero-copy behaviour.
+        let frame = if is_hw_prime_frame {
+            let rkmpp_native = frame.is_drm_prime();
+            let zerocopy_kind = if rkmpp_native { "rkmpp-zerocopy" } else { "vaapi-zerocopy" };
             match frame.map_drm_prime() {
                 Ok(prime_frame) => {
                     let descriptor = crate::display::kms::DrmPrimeDescriptor {
@@ -2803,6 +2840,50 @@ fn drain_video_frames(
                     }
                     continue;
                 }
+                Err(e) if rkmpp_native => {
+                    // See the "RKMPP's native DRM_PRIME export" doc
+                    // comment above — new, hardware-unproven code path:
+                    // recover to sysmem instead of dropping.
+                    counters
+                        .frames_dropped_unsupported_pixfmt
+                        .fetch_add(1, Ordering::Relaxed);
+                    let now = Instant::now();
+                    let due = last_unsupported_pixfmt_at
+                        .map(|t| {
+                            now.duration_since(t)
+                                >= std::time::Duration::from_secs(
+                                    UNSUPPORTED_PIXFMT_RE_EMIT_S,
+                                )
+                        })
+                        .unwrap_or(true);
+                    if due {
+                        *last_unsupported_pixfmt_at = Some(now);
+                        event_sender.emit_flow_with_details(
+                            EventSeverity::Warning,
+                            crate::manager::events::category::SYSTEM_RESOURCES,
+                            format!(
+                                "display output '{output_id}': RKMPP DRM PRIME export \
+                                 failed ({e}) — falling back to sysmem CPU-blit for this frame"
+                            ),
+                            flow_id,
+                            serde_json::json!({
+                                "error_code": "display_rkmpp_prime_export_failed",
+                                "output_id": output_id,
+                                "decoder_kind": zerocopy_kind,
+                                "width": width,
+                                "height": height,
+                                "ffmpeg_error": format!("{e}"),
+                            }),
+                        );
+                    }
+                    // Recover to sysmem and fall through to the
+                    // ordinary semi-planar codepath below with it —
+                    // NOT a `continue`, unlike every other arm here.
+                    match frame.download_to_sysmem() {
+                        Ok(sysmem) => sysmem,
+                        Err(_) => continue,
+                    }
+                }
                 Err(e) => {
                     counters
                         .frames_dropped_unsupported_pixfmt
@@ -2829,7 +2910,7 @@ fn drain_video_frames(
                             serde_json::json!({
                                 "error_code": "display_vaapi_prime_export_failed",
                                 "output_id": output_id,
-                                "decoder_kind": "vaapi-zerocopy",
+                                "decoder_kind": zerocopy_kind,
                                 "width": width,
                                 "height": height,
                                 "ffmpeg_error": format!("{e}"),
@@ -2839,7 +2920,9 @@ fn drain_video_frames(
                     continue;
                 }
             }
-        }
+        } else {
+            frame
+        };
 
         // Two arms — each just copies the planes out of the decoder's
         // lifetime and stamps the **decoder's own** pixel format on
