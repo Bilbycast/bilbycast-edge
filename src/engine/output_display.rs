@@ -2504,6 +2504,27 @@ fn drain_video_frames(
 ) {
     while let Ok(frame) = decoder.receive_frame() {
         video_decode_counters.inc_output();
+        // Temporary diagnostic instrumentation (RKMPP display-output
+        // stutter investigation): isolate MPP's own frame-fetch cost
+        // from our DRM_PRIME→sysmem transfer cost, since the existing
+        // decode_us_max/avg counters wrap both plus send_packet.
+        let receive_us = decoder.last_receive_frame_us();
+        counters
+            .receive_frame_us_max
+            .fetch_max(receive_us, Ordering::Relaxed);
+        counters
+            .receive_frame_us_total
+            .fetch_add(receive_us, Ordering::Relaxed);
+        counters.receive_frame_count.fetch_add(1, Ordering::Relaxed);
+        if let Some(transfer_us) = decoder.last_transfer_us() {
+            counters
+                .rkmpp_transfer_us_max
+                .fetch_max(transfer_us, Ordering::Relaxed);
+            counters
+                .rkmpp_transfer_us_total
+                .fetch_add(transfer_us, Ordering::Relaxed);
+            counters.rkmpp_transfer_count.fetch_add(1, Ordering::Relaxed);
+        }
         // Refresh the registered handle's codec / geometry whenever the
         // resolution changes. Cheap: at most one Mutex<String> lock per
         // resolution change (typically just once per flow run).
