@@ -281,6 +281,46 @@ async fn run_display_output(
         };
     let backend = resolved.as_backend();
 
+    // Surface the resolved video-decode backend at startup so an operator can
+    // tell hardware from software decode at a glance. A silent CPU fallback on
+    // a host that *should* be doing VAAPI — GPU present but the libva backend
+    // driver missing, or this binary built without `video-decoder-vaapi` — was
+    // previously invisible: the display output just ran hot on CPU and grabbed
+    // frames under load with nothing in the logs to say why (issue #70). An
+    // explicit `hw_decode` that can't be honoured already emits the
+    // `display_hw_decode_unavailable_falling_back` Warning above; here we cover
+    // the `Auto → CPU` case (which is otherwise silent) and the success case.
+    if matches!(
+        resolved,
+        crate::engine::hardware_probe::ResolvedDisplayDecoder::Cpu
+    ) && matches!(pref, crate::config::models::HwDecodePreference::Auto)
+    {
+        let any_hw_decoder_compiled = cfg!(feature = "video-decoder-vaapi")
+            || cfg!(feature = "video-decoder-nvdec")
+            || cfg!(feature = "video-decoder-qsv")
+            || cfg!(feature = "video-decoder-rkmpp");
+        let hint = if !any_hw_decoder_compiled {
+            "no hardware video-decoder compiled into this build — use a `full` \
+             release variant (or build with e.g. `video-decoder-vaapi`)"
+        } else {
+            "no usable hardware decoder detected at startup — on Intel/AMD \
+             install a VAAPI driver (`va-driver-all`, plus `intel-media-va-driver` \
+             on modern Intel); on NVIDIA the proprietary driver"
+        };
+        tracing::warn!(
+            output_id = %config.id,
+            "display '{}' video decode backend: cpu (auto) — {hint}",
+            config.id,
+        );
+    } else {
+        tracing::info!(
+            output_id = %config.id,
+            "display '{}' video decode backend: {}",
+            config.id,
+            backend_name(backend),
+        );
+    }
+
     // 1. Open KMS at the connector's preferred mode. The actual mode the
     //    panel runs at is decided by `config.scaling_mode`:
     //    - `MatchSource` (default): the display loop re-modesets to the
