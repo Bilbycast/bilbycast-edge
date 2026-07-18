@@ -2329,13 +2329,25 @@ fn pts_jump(prev: Option<u64>, pts: u64) -> bool {
 /// refused the PRIME framebuffer import (`addfb` EINVAL on a tiling
 /// modifier the scanout plane won't accept, e.g. Intel Gen9 NV12 Yf_TILED)
 /// or the descriptor was malformed. The display task demotes to the
-/// CPU-blit (sysmem-download) path on `true`. Transient page-flip failures
-/// (`display_prime_page_flip_failed`, typically EBUSY) return `false` — they
-/// self-heal on the next frame and must NOT tear down zero-copy for the
-/// rest of the session.
+/// CPU-blit (sysmem-download) path on `true`.
+///
+/// Also covers `display_prime_page_flip_failed` — the framebuffer import
+/// succeeded but the kernel refused to actually scan it out (`atomic_commit`
+/// or legacy `set_crtc` rejected the plane update). Confirmed on real
+/// RK3588 hardware: a well-formed linear NV12 PRIME framebuffer was
+/// rejected with EINVAL on every single frame, forever, because this
+/// function originally treated every `display_prime_page_flip_failed`
+/// message as transient (assuming EBUSY) — the display sat black/frozen
+/// with no automatic recovery until manually rolled back. The one case
+/// that IS genuinely transient and self-heals — `EBUSY` (a previous
+/// nonblocking commit still in flight) — carries "busy" in its message
+/// (see the `AtomicCommitError::Busy` arm in `KmsDisplay::present_prime`)
+/// and is excluded explicitly so a one-off pipeline collision doesn't
+/// falsely tear down zero-copy for the rest of the session.
 fn prime_scanout_permanently_rejected(err_msg: &str) -> bool {
     err_msg.contains("display_prime_addfb_failed")
         || err_msg.contains("display_prime_invalid")
+        || (err_msg.contains("display_prime_page_flip_failed") && !err_msg.contains("busy"))
 }
 
 fn feed_video_decoder(

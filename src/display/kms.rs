@@ -391,6 +391,21 @@ struct PlanePropIds {
     crtc_y: property::Handle,
     crtc_w: property::Handle,
     crtc_h: property::Handle,
+    /// `COLOR_ENCODING` / `COLOR_RANGE` — optional on most Intel/AMD
+    /// scanout planes (VAAPI's zero-copy path has shipped without ever
+    /// setting them), but some embedded VOP/VOP2-class drivers
+    /// (confirmed: RK3588 Rockchip VOP2 Cluster window) reject a YUV
+    /// PRIME framebuffer commit with EINVAL unless these are set
+    /// explicitly — RGB commits work fine without them, which is why
+    /// this was never needed before RKMPP's native NV12 zero-copy path.
+    /// `None` when the property doesn't exist on this plane (older
+    /// kernels / drivers that never require it); the resolved `*_value`
+    /// is the numeric enum ID for "ITU-R BT.709 YCbCr" /
+    /// "YCbCr limited range" looked up once at discovery time.
+    color_encoding: Option<property::Handle>,
+    color_encoding_value: u64,
+    color_range: Option<property::Handle>,
+    color_range_value: u64,
 }
 
 struct CrtcPropIds {
@@ -1477,7 +1492,7 @@ impl KmsDisplay {
         let new_fb = self.bufs[back_idx].fb;
         let width = self.width;
         let height = self.height;
-        match self.atomic_present(new_fb, width, height) {
+        match self.atomic_present(new_fb, width, height, false) {
             Ok(()) => {
                 self.wait_page_flip()
                     .context("display_page_flip_failed: receive_events")?;
@@ -1539,7 +1554,7 @@ impl KmsDisplay {
                     );
                     self.disable_bars_overlay();
                     self.invalidate_atomic_modeset();
-                    match self.atomic_present(new_fb, width, height) {
+                    match self.atomic_present(new_fb, width, height, false) {
                         Ok(()) => {
                             self.wait_page_flip()
                                 .context("display_page_flip_failed: receive_events (bars-retry)")?;
@@ -2075,6 +2090,12 @@ fn discover_atomic_setup(
         "CRTC_H",
     ];
     let p = collect_props(card, plane_h, &plane_names)?;
+    let color_encoding = optional_prop(card, plane_h, "COLOR_ENCODING")?;
+    let color_encoding_value =
+        read_enum_value(card, plane_h, "COLOR_ENCODING", "ITU-R BT.709 YCbCr").unwrap_or(0);
+    let color_range = optional_prop(card, plane_h, "COLOR_RANGE")?;
+    let color_range_value =
+        read_enum_value(card, plane_h, "COLOR_RANGE", "YCbCr limited range").unwrap_or(0);
     let plane_props = PlanePropIds {
         fb_id: p[0],
         crtc_id: p[1],
@@ -2086,6 +2107,10 @@ fn discover_atomic_setup(
         crtc_y: p[7],
         crtc_w: p[8],
         crtc_h: p[9],
+        color_encoding,
+        color_encoding_value,
+        color_range,
+        color_range_value,
     };
 
     let c = collect_props(card, crtc, &["MODE_ID", "ACTIVE"])?;
@@ -2179,6 +2204,12 @@ fn discover_bars_overlay_plane(
         crtc_y: p[7],
         crtc_w: p[8],
         crtc_h: p[9],
+        // The bars overlay is always ARGB8888 — never YUV — so these
+        // are never read (see the `is_yuv` gate in `atomic_present`).
+        color_encoding: None,
+        color_encoding_value: 0,
+        color_range: None,
+        color_range_value: 0,
     };
     Ok((plane_h, plane_props, plane_type_name))
 }
@@ -2282,6 +2313,27 @@ fn read_property_u64(
         }
     }
     None
+}
+
+/// `true` for the YUV/semi-planar fourccs bilbycast-edge's zero-copy
+/// PRIME paths (VAAPI, RKMPP) actually produce. Drives whether
+/// `COLOR_ENCODING` / `COLOR_RANGE` plane properties get set on an
+/// atomic commit — see [`PlanePropIds::color_encoding`].
+fn fourcc_is_yuv(fourcc: DrmFourcc) -> bool {
+    matches!(
+        fourcc,
+        DrmFourcc::Nv12
+            | DrmFourcc::Nv21
+            | DrmFourcc::Nv16
+            | DrmFourcc::Nv61
+            | DrmFourcc::Nv24
+            | DrmFourcc::Nv42
+            | DrmFourcc::P010
+            | DrmFourcc::P016
+            | DrmFourcc::P210
+            | DrmFourcc::Yuyv
+            | DrmFourcc::Uyvy
+    )
 }
 
 /// Resolve an enum value by name on a property. KMS enum values are
@@ -2688,7 +2740,7 @@ impl KmsDisplay {
         }
 
         if self.use_atomic && self.atomic.is_some() {
-            match self.atomic_present(new_fb, descriptor.width, descriptor.height) {
+            match self.atomic_present(new_fb, descriptor.width, descriptor.height, fourcc_is_yuv(fourcc)) {
                 Ok(()) => {
                     // Wait for the kernel-posted `DRM_EVENT_FLIP_COMPLETE`
                     // for our CRTC so the next iteration can safely
@@ -2746,7 +2798,7 @@ impl KmsDisplay {
                         );
                         self.disable_bars_overlay();
                         self.invalidate_atomic_modeset();
-                        match self.atomic_present(new_fb, descriptor.width, descriptor.height) {
+                        match self.atomic_present(new_fb, descriptor.width, descriptor.height, fourcc_is_yuv(fourcc)) {
                             Ok(()) => {
                                 if let Err(e2) = self.wait_page_flip() {
                                     let _ = self.card.destroy_framebuffer(new_fb);
@@ -2809,6 +2861,7 @@ impl KmsDisplay {
         new_fb: framebuffer::Handle,
         src_w: u32,
         src_h: u32,
+        is_yuv: bool,
     ) -> std::result::Result<(), AtomicCommitError> {
         // Copy out every Copy field we need from `self.atomic` up-
         // front. This keeps the rest of the function free to take
@@ -2832,6 +2885,10 @@ impl KmsDisplay {
                     crtc_y: setup.plane_props.crtc_y,
                     crtc_w: setup.plane_props.crtc_w,
                     crtc_h: setup.plane_props.crtc_h,
+                    color_encoding: setup.plane_props.color_encoding,
+                    color_encoding_value: setup.plane_props.color_encoding_value,
+                    color_range: setup.plane_props.color_range,
+                    color_range_value: setup.plane_props.color_range_value,
                 },
                 CrtcPropIds {
                     mode_id: setup.crtc_props.mode_id,
@@ -2883,6 +2940,28 @@ impl KmsDisplay {
             pp.crtc_h,
             property::Value::UnsignedRange(self.height as u64),
         );
+        // COLOR_ENCODING / COLOR_RANGE: required by some embedded
+        // VOP/VOP2-class drivers (confirmed: RK3588 Cluster window) to
+        // accept a YUV PRIME framebuffer commit — omitted for RGB since
+        // it's meaningless there and some drivers reject a COLOR_*
+        // property set on a non-YUV plane update. See the field doc on
+        // `PlanePropIds::color_encoding`.
+        if is_yuv {
+            if let Some(enc_prop) = pp.color_encoding {
+                req.add_property(
+                    plane,
+                    enc_prop,
+                    property::Value::UnsignedRange(pp.color_encoding_value),
+                );
+            }
+            if let Some(range_prop) = pp.color_range {
+                req.add_property(
+                    plane,
+                    range_prop,
+                    property::Value::UnsignedRange(pp.color_range_value),
+                );
+            }
+        }
         let _ = connector_props; // suppress unused warning; kept for symmetry with the other prop tables
         let _ = mode_blob_loaded;
 
