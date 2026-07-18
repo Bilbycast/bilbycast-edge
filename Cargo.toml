@@ -418,6 +418,12 @@ video-decoder-qsv = ["video-engine/video-decoder-qsv"]
 # frames either as zero-copy DRM PRIME DMA-BUFs (KMS scanout via the
 # `display` feature) or system-memory NV12/P010 (HDR tonemap path).
 video-decoder-vaapi = ["video-engine/video-decoder-vaapi"]
+# RKMPP HW decode (ARM Rockchip only). Plain named decoder like NVDEC/QSV —
+# system-memory NV12 output, no hwframe-context plumbing needed. Off by
+# default; only buildable on a native aarch64 Rockchip host. Same
+# per-arch listing convention as `video-encoder-rkmpp` (not folded into
+# `video-encoders-full`, which is x86_64-only).
+video-decoder-rkmpp = ["video-engine/video-decoder-rkmpp"]
 # Enable TLS (HTTPS on API + RTMPS) support via rustls/tokio-rustls/axum-server.
 tls = ["dep:tokio-rustls", "dep:axum-server"]
 # Enable WebRTC WHIP/WHEP input and output via str0m (pure Rust, sans-I/O).

@@ -1408,6 +1408,13 @@ fn edge_capabilities() -> Vec<&'static str> {
             }
         }
     }
+    if cfg!(feature = "video-decoder-rkmpp") {
+        if let Some(c) = crate::engine::hardware_probe::static_capabilities() {
+            if c.hw_decoders.h264_rkmpp || c.hw_decoders.hevc_rkmpp {
+                caps.push("video-decoder-rkmpp");
+            }
+        }
+    }
     if cfg!(feature = "fdk-aac") {
         caps.push("fdk-aac");
     }
