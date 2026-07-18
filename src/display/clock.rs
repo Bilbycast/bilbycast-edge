@@ -38,11 +38,32 @@ use std::time::Instant;
 const INTERP_CAP_US: u64 = 120_000;
 
 /// Beyond this many µs since the last `set_position`, treat the clock as
-/// **unavailable** (reads return `None`). At this point the audio task is
-/// genuinely wedged (codec death, ALSA device hang, channel closed without
-/// teardown) and the display loop should fall back to free-running video on
-/// wall-clock rather than pacing to a frozen clock forever.
-const STALE_US: u64 = 2_000_000;
+/// **unavailable** (reads return `None`) so the display loop stops pacing
+/// video to a frozen audio clock and free-runs on wall-clock instead (the
+/// fallback re-seeds from the current frame's PTS, so the switch is
+/// seamless).
+///
+/// This only ever fires when *video frames keep arriving but audio does
+/// not* — a live source that stalls gaps both essences together, so there
+/// are no video frames to pace and this threshold is irrelevant. The one
+/// case it governs is a media player looping a playlist where some clips
+/// carry audio and some don't (or a `.ts` clip with a gappy audio PID):
+/// on the silent clip the audio task stops publishing positions, the clock
+/// freezes at the previous clip's last playout PTS, and every arriving
+/// video frame measures progressively "ahead" of it — so the pacing loop
+/// sleeps up to `catchup_cap_ms` per frame waiting for sound that never
+/// comes, and the panel judders/freezes until this cutoff trips.
+///
+/// It was 2 s, which meant up to ~2 s of frozen/limping video at *every*
+/// audio→silence transition — visible as heavy frame-grabbing on a
+/// mixed-audio playlist. A few ALSA periods (~20–32 ms each) plus xrun
+/// recovery is the most a *live* audio task ever legitimately goes quiet,
+/// so 250 ms cleanly distinguishes "audio momentarily behind" (keep the
+/// clock, ride it out via the `INTERP_CAP_US` freeze) from "audio isn't
+/// coming" (free-run video now). Flipping to wall-clock a touch early on a
+/// rare long hiccup is harmless — video stays smooth and the measured
+/// clock re-locks the instant audio resumes.
+const STALE_US: u64 = 250_000;
 
 /// Measured audio-playout clock. Constructed empty; the audio task calls
 /// [`AudioClock::set_position`] on the first successful ALSA write and
@@ -171,14 +192,33 @@ mod tests {
     fn interpolation_is_capped_on_stall() {
         let c = AudioClock::new();
         c.set_position(Instant::now(), 1_000_000);
-        // Simulate a long stall well past the cap.
-        thread::sleep(Duration::from_millis(200));
+        // A stall past the interpolation cap but still inside the staleness
+        // window (150 ms: > INTERP_CAP_US 120 ms, < STALE_US 250 ms).
+        thread::sleep(Duration::from_millis(150));
         let smoothed = c.current_pts_90k_smoothed().unwrap();
         let delta = smoothed.wrapping_sub(1_000_000);
-        // Capped at INTERP_CAP_US (120 ms) = 10_800 PTS; never the full 200 ms.
+        // Capped at INTERP_CAP_US (120 ms) = 10_800 PTS; never the full 150 ms.
         assert!(
             delta <= 10_800 + 900,
             "interpolation should cap near 120 ms, got {delta} PTS",
+        );
+    }
+
+    #[test]
+    fn goes_stale_quickly_so_display_can_free_run_on_silence() {
+        // A clip with no audio stops advancing the clock. Past STALE_US the
+        // reader must report `None` promptly (not hold a frozen value for
+        // seconds) so the display loop reverts to wall-clock video pacing
+        // instead of juddering against dead audio — the mixed-audio-playlist
+        // frame-grabbing fix.
+        let c = AudioClock::new();
+        c.set_position(Instant::now(), 1_000_000);
+        assert!(c.current_pts_90k_smoothed().is_some());
+        // Just past the 250 ms cutoff (plus margin for a slow sleep).
+        thread::sleep(Duration::from_millis(320));
+        assert!(
+            c.current_pts_90k_smoothed().is_none(),
+            "clock should read stale (None) within ~250 ms of audio going silent",
         );
     }
 
