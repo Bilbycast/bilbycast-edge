@@ -52,14 +52,102 @@ pub async fn play_mp4_file(
     paced_bitrate_bps: Option<u64>,
     session: &mut PlayerSession<'_>,
 ) -> Result<()> {
-    // The `mp4` crate is sync-only — open + parse on a blocking thread,
-    // then drive sample emission back in the async task with paced sleeps.
-    let path_owned = path.to_path_buf();
-    let demux: DemuxResult = tokio::task::spawn_blocking(move || demux_file(&path_owned))
-        .await
-        .map_err(|e| anyhow!("mp4 spawn_blocking join failed: {e}"))??;
+    // Reuse the demuxed sample set across loops of the same file instead of
+    // re-reading the whole file into RAM every loop. `demux_file` loads every
+    // sample up front (~370 MB for a 10-min 1080p MP4); re-doing that each
+    // loop churned glibc's malloc arenas up to ~6 GB RSS on a looping
+    // single-file playlist (the arena never returns the freed sub-heaps to
+    // the OS — worse under `mlockall`, which pins them). Caching the
+    // `Arc<DemuxResult>` turns that per-loop churn into a single bounded
+    // allocation. See `DemuxCache`.
+    let demux = session.demux_cache.get_or_demux(path).await?;
+    play_demuxed(path, &demux, paced_bitrate_bps, session).await
+}
 
-    play_demuxed(path, demux, paced_bitrate_bps, session).await
+/// Bounded LRU cache of demuxed MP4 sample sets, keyed by path (with file
+/// mtime + length so a replaced media-library upload is re-demuxed, never
+/// served stale). One cache lives per media-player input for its lifetime.
+///
+/// The dominant case — a single MP4 looping — keeps exactly one entry, so the
+/// file is demuxed once and its ~370 MB sample set is held steady instead of
+/// re-allocated every loop. A small multi-file playlist keeps each file's set
+/// up to the budget below; anything larger falls back to re-demuxing the LRU
+/// tail (still correct, just not cached), so the cache can never grow
+/// unbounded regardless of playlist size.
+#[derive(Default)]
+pub(in crate::engine) struct DemuxCache {
+    /// Front = most-recently-used.
+    entries: Vec<DemuxCacheEntry>,
+}
+
+struct DemuxCacheEntry {
+    path: std::path::PathBuf,
+    mtime: Option<std::time::SystemTime>,
+    len: u64,
+    demux: std::sync::Arc<DemuxResult>,
+    /// Approximate in-RAM footprint (sum of sample bytes), for the byte budget.
+    bytes: u64,
+}
+
+impl DemuxCache {
+    /// At most this many distinct files cached, and at most this many bytes of
+    /// demuxed sample data total. Whichever binds first evicts the LRU tail.
+    /// 4 files / 1 GiB comfortably covers realistic slate playlists while
+    /// staying far below the multi-GB churn the cache exists to prevent.
+    const MAX_ENTRIES: usize = 4;
+    const MAX_BYTES: u64 = 1 << 30; // 1 GiB
+
+    /// Return the cached demux for `path` if the on-disk file is unchanged
+    /// (same mtime + length), else demux it fresh (off-thread) and cache it.
+    async fn get_or_demux(&mut self, path: &Path) -> Result<std::sync::Arc<DemuxResult>> {
+        // Stat the file so a replaced upload invalidates the entry. A stat
+        // failure here is non-fatal for cache purposes — fall through to the
+        // demux, which will surface the real open error with context.
+        let (mtime, len) = match tokio::fs::metadata(path).await {
+            Ok(m) => (m.modified().ok(), m.len()),
+            Err(_) => (None, 0),
+        };
+
+        if let Some(pos) = self
+            .entries
+            .iter()
+            .position(|e| e.path == path && e.mtime == mtime && e.len == len)
+        {
+            // Hit — promote to front (MRU) and hand back a cheap Arc clone.
+            let entry = self.entries.remove(pos);
+            let demux = entry.demux.clone();
+            self.entries.insert(0, entry);
+            return Ok(demux);
+        }
+
+        // Miss — demux off the async runtime (the `mp4` crate is sync-only).
+        let path_owned = path.to_path_buf();
+        let demux: DemuxResult = tokio::task::spawn_blocking(move || demux_file(&path_owned))
+            .await
+            .map_err(|e| anyhow!("mp4 spawn_blocking join failed: {e}"))??;
+        let bytes = demux.approx_sample_bytes();
+        let arc = std::sync::Arc::new(demux);
+        self.entries.insert(
+            0,
+            DemuxCacheEntry { path: path.to_path_buf(), mtime, len, demux: arc.clone(), bytes },
+        );
+        self.enforce_budget();
+        Ok(arc)
+    }
+
+    /// Evict LRU tail entries until within both the entry-count and byte
+    /// budgets. Never evicts the single front (just-inserted) entry.
+    fn enforce_budget(&mut self) {
+        while self.entries.len() > Self::MAX_ENTRIES {
+            self.entries.pop();
+        }
+        let mut total: u64 = self.entries.iter().map(|e| e.bytes).sum();
+        while total > Self::MAX_BYTES && self.entries.len() > 1 {
+            if let Some(e) = self.entries.pop() {
+                total = total.saturating_sub(e.bytes);
+            }
+        }
+    }
 }
 
 /// Per-sample presentation duration (µs) for a track, i.e. how long each
@@ -96,6 +184,20 @@ fn sample_durations_us(samples: &[DemuxedSample], timescale: u32) -> Vec<u64> {
 struct DemuxResult {
     video: Option<TrackData>,
     audio: Option<TrackData>,
+}
+
+impl DemuxResult {
+    /// Approximate in-RAM footprint: the total demuxed sample-payload bytes
+    /// (the dominant allocation; container/index overhead is negligible).
+    /// Used by [`DemuxCache`] to bound cached memory.
+    fn approx_sample_bytes(&self) -> u64 {
+        let track_bytes = |t: &Option<TrackData>| {
+            t.as_ref()
+                .map(|t| t.samples.iter().map(|s| s.bytes.len() as u64).sum::<u64>())
+                .unwrap_or(0)
+        };
+        track_bytes(&self.video) + track_bytes(&self.audio)
+    }
 }
 
 struct TrackData {
@@ -321,7 +423,7 @@ fn sr_index_to_u8(sr: SampleFreqIndex) -> u8 {
 
 async fn play_demuxed(
     path: &Path,
-    d: DemuxResult,
+    d: &DemuxResult,
     paced_bitrate_bps: Option<u64>,
     session: &mut PlayerSession<'_>,
 ) -> Result<()> {
@@ -776,6 +878,75 @@ mod tests {
     }
 
     #[test]
+    fn approx_sample_bytes_sums_video_and_audio_payloads() {
+        // avc_sample(N,..) allocates a 4-byte length prefix + N payload bytes.
+        let v = TrackData {
+            timescale: 90_000,
+            samples: vec![avc_sample(100, 0, true), avc_sample(50, 3_000, false)],
+            extra: TrackExtra::Avc { sps: vec![], pps: vec![] },
+        };
+        let a = TrackData {
+            timescale: 48_000,
+            samples: vec![avc_sample(20, 0, true)],
+            extra: TrackExtra::Aac { adts_profile: 1, sr_index: 3, ch_config: 2 },
+        };
+        let d = DemuxResult { video: Some(v), audio: Some(a) };
+        // (4+100)+(4+50) video + (4+20) audio = 158 + 24 = 182.
+        assert_eq!(d.approx_sample_bytes(), 182);
+        assert_eq!(DemuxResult { video: None, audio: None }.approx_sample_bytes(), 0);
+    }
+
+    /// A tiny `DemuxResult` whose `approx_sample_bytes` equals `n` (one video
+    /// sample of `n-4` payload bytes), for exercising the cache byte budget.
+    fn demux_of_bytes(n: u64) -> std::sync::Arc<DemuxResult> {
+        let payload = (n as usize).saturating_sub(4);
+        std::sync::Arc::new(DemuxResult {
+            video: Some(TrackData {
+                timescale: 90_000,
+                samples: vec![avc_sample(payload, 0, true)],
+                extra: TrackExtra::Avc { sps: vec![], pps: vec![] },
+            }),
+            audio: None,
+        })
+    }
+
+    fn cache_entry(name: &str, bytes: u64) -> DemuxCacheEntry {
+        DemuxCacheEntry {
+            path: std::path::PathBuf::from(name),
+            mtime: None,
+            len: bytes,
+            demux: demux_of_bytes(bytes),
+            bytes,
+        }
+    }
+
+    #[test]
+    fn enforce_budget_evicts_lru_tail_over_entry_count() {
+        let mut cache = DemuxCache::default();
+        // Front = MRU. Push 5 small entries (well under the byte budget).
+        for i in 0..5 {
+            cache.entries.insert(0, cache_entry(&format!("f{i}.mp4"), 1000));
+        }
+        cache.enforce_budget();
+        assert_eq!(cache.entries.len(), DemuxCache::MAX_ENTRIES, "capped at MAX_ENTRIES");
+        // The oldest (LRU tail, "f0") must have been evicted; newest kept.
+        assert_eq!(cache.entries.first().unwrap().path, std::path::PathBuf::from("f4.mp4"));
+        assert!(cache.entries.iter().all(|e| e.path != std::path::PathBuf::from("f0.mp4")));
+    }
+
+    #[test]
+    fn enforce_budget_evicts_over_byte_budget_but_keeps_front() {
+        let mut cache = DemuxCache::default();
+        // Front entry alone exceeds the byte budget; it must be kept (never
+        // evict the single just-inserted entry), tail evicted.
+        cache.entries.push(cache_entry("old.mp4", 10_000));
+        cache.entries.insert(0, cache_entry("huge.mp4", DemuxCache::MAX_BYTES + 1));
+        cache.enforce_budget();
+        assert_eq!(cache.entries.len(), 1, "tail evicted to fit byte budget");
+        assert_eq!(cache.entries[0].path, std::path::PathBuf::from("huge.mp4"), "front kept");
+    }
+
+    #[test]
     fn sample_durations_us_uses_deltas_and_reuses_last() {
         // 30 fps @ 90 kHz timescale → 3000 ticks = 33_333 µs per frame.
         let samples = vec![
@@ -845,6 +1016,7 @@ mod tests {
         let media_stats = std::sync::Arc::new(crate::stats::collector::MediaPlayerStats::default());
 
         cont.open_file("synthetic-idr.mp4");
+        let mut demux_cache = super::super::DemuxCacheField::default();
         {
             let mut session = PlayerSession {
                 seq_num: &mut seq_num,
@@ -861,8 +1033,9 @@ mod tests {
                 events: &events,
                 flow_id: "test-flow",
                 input_id: "test-input",
+                demux_cache: &mut demux_cache,
             };
-            play_demuxed(Path::new("synthetic-idr.mp4"), demux, None, &mut session)
+            play_demuxed(Path::new("synthetic-idr.mp4"), &demux, None, &mut session)
                 .await
                 .unwrap();
         }
@@ -944,6 +1117,7 @@ mod tests {
         let media_stats = std::sync::Arc::new(crate::stats::collector::MediaPlayerStats::default());
 
         cont.open_file("three-frames.mp4");
+        let mut demux_cache = super::super::DemuxCacheField::default();
         {
             let mut session = PlayerSession {
                 seq_num: &mut seq_num,
@@ -960,8 +1134,9 @@ mod tests {
                 events: &events,
                 flow_id: "test-flow",
                 input_id: "test-input",
+                demux_cache: &mut demux_cache,
             };
-            play_demuxed(Path::new("three-frames.mp4"), demux, None, &mut session)
+            play_demuxed(Path::new("three-frames.mp4"), &demux, None, &mut session)
                 .await
                 .unwrap();
         }

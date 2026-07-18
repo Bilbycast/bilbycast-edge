@@ -77,10 +77,23 @@ LimitMEMLOCK=infinity
 # jitter — too coarse for broadcast PCR_AC).
 LimitRTPRIO=99
 
+# Bound glibc malloc's per-thread-arena retention. The media player
+# re-demuxes an entire MP4 into RAM on every playlist loop (a ~370 MB
+# transient for a 10-min 1080p file); glibc keeps those freed 64 MB arena
+# sub-heaps instead of returning them to the OS, and because each loop's
+# demux tends to land on a fresh thread it accumulates across dozens of
+# arenas — observed climbing to ~6 GB / 95 % RSS on an idle single-flow
+# node over a few hours (worsened by `mlockall`, which pins the retained
+# pages so they can't even be reclaimed). Capping arenas forces reuse and
+# holds RSS flat (~0.7 GB in that case). Set *before* the EnvironmentFile
+# so an operator can override it (e.g. raise to 4 on a high-concurrency
+# transcoding node) via /etc/bilbycast/edge.env.
+Environment=MALLOC_ARENA_MAX=2
+
 # Environment file lets operators set RUST_LOG, BILBYCAST_REPLAY_DIR,
-# BILBYCAST_MLOCKALL=1, BILBYCAST_WIRE_EMIT_CPUS=<set>, etc. without
-# editing the unit. Created (with `BILBYCAST_MLOCKALL=1` seeded) by
-# install-edge.sh.
+# BILBYCAST_MLOCKALL=1, BILBYCAST_WIRE_EMIT_CPUS=<set>, MALLOC_ARENA_MAX=<n>,
+# etc. without editing the unit. Created (with `BILBYCAST_MLOCKALL=1`
+# seeded) by install-edge.sh.
 EnvironmentFile=-/etc/bilbycast/edge.env
 
 [Install]

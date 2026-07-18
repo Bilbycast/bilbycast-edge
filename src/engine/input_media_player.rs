@@ -317,6 +317,10 @@ async fn run(
     // sequence is continuous regardless of how many times we wrap around
     // or move between sources.
     let mut cont = SpliceContinuity::default();
+    // Per-input demux cache — persists across the playlist loop so a looping
+    // MP4 is demuxed once, not re-read into RAM every loop. See
+    // `mp4_demux::DemuxCache` / `DemuxCacheField`.
+    let mut demux_cache = DemuxCacheField::default();
 
     // Playout telemetry for the whole input's lifetime — see
     // `MediaPlayerStats` doc comment for why this exists independently of
@@ -364,6 +368,7 @@ async fn run(
                 events: &events,
                 flow_id: &flow_id,
                 input_id: &input_id,
+                demux_cache: &mut demux_cache,
             };
             let result = play_source(source, &config, &mut session).await;
             if let Err(e) = result {
@@ -457,7 +462,23 @@ pub(super) struct PlayerSession<'a> {
     pub(super) events: &'a EventSender,
     pub(super) flow_id: &'a str,
     pub(super) input_id: &'a str,
+    /// Per-input demux cache — lets a looping MP4 be demuxed once instead of
+    /// re-read into RAM every loop (see `mp4_demux::DemuxCache`). Borrowed
+    /// from the task-level state so it persists across the playlist. `()` on
+    /// builds without MP4 support (the `mp4` source kind errors there anyway).
+    pub(super) demux_cache: &'a mut DemuxCacheField,
 }
+
+/// The demux-cache type threaded through [`PlayerSession`]. Real cache with
+/// MP4 support compiled in; a zero-sized `()` placeholder otherwise (the
+/// `mp4` source kind returns an error without the codecs, so it's never used).
+/// A cfg-selected alias keeps `PlayerSession` and its construction sites free
+/// of `#[cfg]` noise — both variants implement `Default`, so callers just
+/// write `DemuxCacheField::default()`.
+#[cfg(all(feature = "media-codecs", feature = "fdk-aac"))]
+pub(super) type DemuxCacheField = mp4_demux::DemuxCache;
+#[cfg(not(all(feature = "media-codecs", feature = "fdk-aac")))]
+pub(super) type DemuxCacheField = ();
 
 /// 30 ms gap inserted between the previous file's last emitted PTS and the
 /// next file's first emitted PTS. ≥ 1 video frame at every common rate
@@ -2256,6 +2277,7 @@ mod tests {
             test_session_harness();
         let mut seq_num: u16 = 0;
         let mut post = None;
+        let mut demux_cache = DemuxCacheField::default();
         let session = PlayerSession {
             seq_num: &mut seq_num,
             per_input_tx: &tx,
@@ -2271,6 +2293,7 @@ mod tests {
             events: &events,
             flow_id: "test-flow",
             input_id: "test-input",
+            demux_cache: &mut demux_cache,
         };
 
         // Below the warn threshold: no transition, no event.
@@ -2736,6 +2759,7 @@ mod tests {
 
         cont.open_file("dvb-fixture.ts");
         let mut transcoder: Option<crate::engine::input_transcode::InputTranscoder> = None;
+        let mut demux_cache = DemuxCacheField::default();
         {
             let mut session = PlayerSession {
                 seq_num: &mut seq_num,
@@ -2752,6 +2776,7 @@ mod tests {
                 events: &events,
                 flow_id: "test-flow",
                 input_id: "test-input",
+                demux_cache: &mut demux_cache,
             };
             play_ts_file(&path, None, None, &mut session).await.unwrap();
         }
@@ -2957,6 +2982,7 @@ mod tests {
         let mut transcoder: Option<crate::engine::input_transcode::InputTranscoder> = None;
         let (events, _events_rx) = crate::manager::events::event_channel();
         let media_stats = std::sync::Arc::new(MediaPlayerStats::default());
+        let mut demux_cache = DemuxCacheField::default();
 
         // Iteration 1 — cold start.
         cont.open_file("loop-fixture.ts");
@@ -2976,6 +3002,7 @@ mod tests {
                 events: &events,
                 flow_id: "test-flow",
                 input_id: "test-input",
+                demux_cache: &mut demux_cache,
             };
             play_ts_file(&path, None, None, &mut session).await.unwrap();
         }
@@ -2998,6 +3025,7 @@ mod tests {
                 events: &events,
                 flow_id: "test-flow",
                 input_id: "test-input",
+                demux_cache: &mut demux_cache,
             };
             play_ts_file(&path, None, None, &mut session).await.unwrap();
         }
