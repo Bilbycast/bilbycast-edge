@@ -555,6 +555,18 @@ pub struct KmsDisplay {
     /// completes, eliminating the green-flash / stuck-frame artefacts
     /// the VA pool causes when surfaces recycle mid-scanout.
     prime_state: Option<PrimeState>,
+    /// Imported-framebuffer cache keyed by [`dmabuf_identity`] — see
+    /// [`PrimeFbCacheEntry`]. Avoids re-running `prime_fd_to_buffer` +
+    /// `add_planar_framebuffer` for a decode buffer this session has
+    /// already imported (RKMPP recycles a fixed ≤16-buffer pool;
+    /// confirmed on RK3588 that skipping the redundant re-import here
+    /// eliminates the dominant per-frame cost on the zero-copy PRIME
+    /// path — average `present_prime` time dropped from double-digit
+    /// milliseconds to sub-millisecond).
+    prime_fb_cache: std::collections::HashMap<(u64, u64), PrimeFbCacheEntry>,
+    /// Insertion order for [`Self::prime_fb_cache`]'s FIFO eviction —
+    /// see [`PRIME_FB_CACHE_CAPACITY`].
+    prime_fb_cache_order: std::collections::VecDeque<(u64, u64)>,
     /// Atomic-commit page-flip state. `None` until the first PRIME
     /// present, which discovers the primary plane + caches property
     /// IDs. `use_atomic` flips to `false` (and stays there) on
@@ -823,6 +835,8 @@ impl KmsDisplay {
             bufs: [a, b],
             front_idx: 0,
             prime_state: None,
+            prime_fb_cache: std::collections::HashMap::new(),
+            prime_fb_cache_order: std::collections::VecDeque::new(),
             use_atomic,
             atomic: atomic_setup,
             atomic_ever_succeeded: false,
@@ -2740,19 +2754,57 @@ impl PlanarBuffer for PrimePlanarBuffer {
     }
 }
 
-/// State retained across `present_prime` calls — the previous frame's
-/// KMS framebuffer + its source-frame keepalive. Released only when the
-/// *next* page-flip completes (the kernel keeps the previous FB live
-/// until the new one has been fully scanned out at least once, and
-/// VAAPI surfaces stay valid across exactly that boundary).
+/// State retained across `present_prime` calls — the in-flight frame's
+/// source-frame keepalive. Released only when the *next* page-flip
+/// completes (the kernel keeps the previous scanout source live until
+/// the new one has been fully scanned out at least once, and VAAPI /
+/// RKMPP frames stay valid across exactly that boundary). The KMS
+/// framebuffer *object* itself is no longer tracked here — see
+/// [`PrimeFbCacheEntry`]; its lifetime is cache-managed instead of
+/// per-frame-transition-managed.
 #[derive(Default)]
 struct PrimeState {
-    /// FB-id of the framebuffer the kernel is currently scanning out.
-    /// We never destroy the in-flight FB; instead we destroy the
-    /// **previous** FB after the new flip completes.
-    in_flight_fb: Option<framebuffer::Handle>,
-    /// Keepalive on the in-flight VAAPI surface.
+    /// Keepalive on the in-flight decoded frame (VAAPI surface or
+    /// RKMPP DRM_PRIME frame).
     in_flight_keepalive: Option<Arc<dyn PrimeKeepalive>>,
+}
+
+/// Generous headroom above RKMPP's fixed 16-buffer decode pool
+/// (`FRAMEGROUP_MAX_FRAMES` in FFmpeg's `rkmppdec.c`) — in steady-state
+/// playback every recurring buffer fits without ever evicting;
+/// eviction only engages across a decoder restart that introduces new
+/// underlying buffer objects (a resolution change, or a fresh decoder
+/// open after a source switch).
+const PRIME_FB_CACHE_CAPACITY: usize = 32;
+
+/// Cached KMS framebuffer for a PRIME import, keyed by the underlying
+/// DMA-BUF's kernel identity — see [`dmabuf_identity`] and
+/// [`KmsDisplay::prime_fb_cache`].
+struct PrimeFbCacheEntry {
+    fb: framebuffer::Handle,
+    width: u32,
+    height: u32,
+    fourcc: DrmFourcc,
+    modifier: Option<DrmModifier>,
+}
+
+/// Kernel-stable identity of the underlying DMA-BUF behind `fd`, used
+/// to recognise "this is the same physical decode buffer as a
+/// previous frame" even when the exporting decoder hands back a
+/// freshly `dup()`'d fd number each time. `(st_dev, st_ino)` is the
+/// standard way Linux identifies the same underlying file/object
+/// across different fds (the same technique `lsof` and friends use) —
+/// a DMA-BUF is backed by an anonymous inode that `fstat` reports
+/// consistently for the life of the buffer object.
+fn dmabuf_identity(fd: i32) -> Option<(u64, u64)> {
+    unsafe {
+        let mut st: libc::stat = std::mem::zeroed();
+        if libc::fstat(fd, &mut st) == 0 {
+            Some((st.st_dev as u64, st.st_ino as u64))
+        } else {
+            None
+        }
+    }
 }
 
 /// `DRM_FORMAT_MOD_INVALID` — sentinel returned by VAAPI drivers when
@@ -2852,62 +2904,117 @@ impl KmsDisplay {
             Some(DrmModifier::from(modifier_raw))
         };
 
-        // Import every distinct DMA-BUF fd into a per-card GEM handle.
-        // The VAAPI mapping packs every plane into one fd, but we
-        // dedup defensively in case a future driver returns a multi-fd
-        // descriptor (Intel iHD has been known to do this for P010
-        // when the chroma plane lives on a separate object).
-        let mut handles: [Option<drm::buffer::Handle>; 4] = [None; 4];
-        let mut pitches: [u32; 4] = [0; 4];
-        let mut offsets: [u32; 4] = [0; 4];
+        // Check the import cache first — a decoder buffer pool recycles
+        // a small fixed set of underlying DMA-BUFs (RKMPP: ≤16), and
+        // re-running `prime_fd_to_buffer` + `add_planar_framebuffer`
+        // for the SAME underlying buffer on every recurrence is real,
+        // measurable overhead on some drivers: confirmed on RK3588,
+        // where skipping it here dropped average `present_prime` cost
+        // from double-digit milliseconds (swamping the 41.6ms/frame
+        // budget at 24fps) to sub-millisecond. GStreamer's kmssink uses
+        // the identical pattern for the identical reason. VAAPI's
+        // zero-copy path on Intel/AMD already presents fast without
+        // this (a cache hit there is just a cheap lookup instead of a
+        // cheap import — no measurable difference), so this applies
+        // universally rather than being gated to any one backend.
+        let cache_key = descriptor.planes.first().and_then(|p| dmabuf_identity(p.fd));
+        let cached_fb = cache_key.and_then(|key| self.prime_fb_cache.get(&key)).and_then(|e| {
+            (e.width == descriptor.width
+                && e.height == descriptor.height
+                && e.fourcc == fourcc
+                && e.modifier == modifier)
+                .then_some(e.fb)
+        });
+        let new_fb = if let Some(fb) = cached_fb {
+            fb
+        } else {
+            // Import every distinct DMA-BUF fd into a per-card GEM handle.
+            // The VAAPI mapping packs every plane into one fd, but we
+            // dedup defensively in case a future driver returns a multi-fd
+            // descriptor (Intel iHD has been known to do this for P010
+            // when the chroma plane lives on a separate object).
+            let mut handles: [Option<drm::buffer::Handle>; 4] = [None; 4];
+            let mut pitches: [u32; 4] = [0; 4];
+            let mut offsets: [u32; 4] = [0; 4];
 
-        for (i, plane) in descriptor.planes.iter().enumerate() {
-            if i >= 4 {
-                anyhow::bail!(
-                    "display_prime_invalid: too many planes ({})",
-                    descriptor.planes.len()
+            for (i, plane) in descriptor.planes.iter().enumerate() {
+                if i >= 4 {
+                    anyhow::bail!(
+                        "display_prime_invalid: too many planes ({})",
+                        descriptor.planes.len()
+                    );
+                }
+                // SAFETY: descriptor.planes[i].fd is owned by the
+                // `keepalive` Arc; the borrowed FD here lives only across
+                // this call to `prime_fd_to_buffer`, which dups the fd
+                // internally on the kernel side via the PRIME ioctl.
+                let borrowed = unsafe {
+                    std::os::fd::BorrowedFd::borrow_raw(plane.fd)
+                };
+                let handle = self
+                    .card
+                    .prime_fd_to_buffer(borrowed)
+                    .with_context(|| {
+                        format!(
+                            "display_prime_addfb_failed: prime_fd_to_buffer for plane {} (fd={})",
+                            i, plane.fd
+                        )
+                    })?;
+                handles[i] = Some(handle);
+                pitches[i] = plane.pitch;
+                offsets[i] = plane.offset;
+            }
+
+            let buf = PrimePlanarBuffer {
+                width: descriptor.width,
+                height: descriptor.height,
+                fourcc,
+                modifier,
+                handles,
+                pitches,
+                offsets,
+            };
+
+            let flags = if modifier.is_some() {
+                FbCmd2Flags::MODIFIERS
+            } else {
+                FbCmd2Flags::empty()
+            };
+            let fb = self
+                .card
+                .add_planar_framebuffer(&buf, flags)
+                .context("display_prime_addfb_failed: add_planar_framebuffer")?;
+            if let Some(key) = cache_key {
+                if let Some(old) = self.prime_fb_cache.remove(&key) {
+                    // Format changed for a recurring buffer object
+                    // (rare — e.g. a decoder resolution change reusing
+                    // the same underlying DMA-BUF). Destroy the stale
+                    // entry and drop its order-queue slot so eviction
+                    // bookkeeping stays consistent.
+                    let _ = self.card.destroy_framebuffer(old.fb);
+                    self.prime_fb_cache_order.retain(|k| *k != key);
+                }
+                if self.prime_fb_cache.len() >= PRIME_FB_CACHE_CAPACITY {
+                    if let Some(oldest_key) = self.prime_fb_cache_order.pop_front() {
+                        if let Some(evicted) = self.prime_fb_cache.remove(&oldest_key) {
+                            let _ = self.card.destroy_framebuffer(evicted.fb);
+                        }
+                    }
+                }
+                self.prime_fb_cache_order.push_back(key);
+                self.prime_fb_cache.insert(
+                    key,
+                    PrimeFbCacheEntry {
+                        fb,
+                        width: descriptor.width,
+                        height: descriptor.height,
+                        fourcc,
+                        modifier,
+                    },
                 );
             }
-            // SAFETY: descriptor.planes[i].fd is owned by the
-            // `keepalive` Arc; the borrowed FD here lives only across
-            // this call to `prime_fd_to_buffer`, which dups the fd
-            // internally on the kernel side via the PRIME ioctl.
-            let borrowed = unsafe {
-                std::os::fd::BorrowedFd::borrow_raw(plane.fd)
-            };
-            let handle = self
-                .card
-                .prime_fd_to_buffer(borrowed)
-                .with_context(|| {
-                    format!(
-                        "display_prime_addfb_failed: prime_fd_to_buffer for plane {} (fd={})",
-                        i, plane.fd
-                    )
-                })?;
-            handles[i] = Some(handle);
-            pitches[i] = plane.pitch;
-            offsets[i] = plane.offset;
-        }
-
-        let buf = PrimePlanarBuffer {
-            width: descriptor.width,
-            height: descriptor.height,
-            fourcc,
-            modifier,
-            handles,
-            pitches,
-            offsets,
+            fb
         };
-
-        let flags = if modifier.is_some() {
-            FbCmd2Flags::MODIFIERS
-        } else {
-            FbCmd2Flags::empty()
-        };
-        let new_fb = self
-            .card
-            .add_planar_framebuffer(&buf, flags)
-            .context("display_prime_addfb_failed: add_planar_framebuffer")?;
 
         // Promote the new prime FB onto the CRTC.
         //
@@ -3104,12 +3211,13 @@ impl KmsDisplay {
         // drops it on a side task to keep the per-frame budget tight
         // (`av_frame_free` can take ~1 ms on the first call after a
         // session warmup).
+        // `new_fb`'s object lifetime is cache-managed (see
+        // `prime_fb_cache` above) rather than destroyed on every frame
+        // transition — only `in_flight_keepalive` (the underlying
+        // decoded-frame memory, which really does need the one-frame-
+        // delayed release) still needs per-transition bookkeeping here.
         let mut state = self.prime_state.take().unwrap_or_default();
         let prev_keepalive = state.in_flight_keepalive.take();
-        if let Some(prev_fb) = state.in_flight_fb.take() {
-            let _ = self.card.destroy_framebuffer(prev_fb);
-        }
-        state.in_flight_fb = Some(new_fb);
         state.in_flight_keepalive = Some(keepalive);
         self.prime_state = Some(state);
 
@@ -3714,26 +3822,33 @@ impl KmsDisplay {
         }
     }
 
-    /// Flush any retained PRIME state — destroy the in-flight FB and
-    /// drop the keepalive. Idempotent: returns immediately when no
-    /// PRIME state is held, so the CPU-blit path can call this once
-    /// per frame without paying for a re-modeset every vblank.
+    /// Flush any retained PRIME state — destroy every cached imported
+    /// framebuffer and drop the in-flight keepalive. Idempotent: safe
+    /// to call every frame on the CPU-blit path without paying for a
+    /// re-modeset every vblank when there's nothing to release.
     ///
     /// Used on the runtime-demotion path: when sustained PRIME export
     /// failures push `output_display` from `vaapi-zerocopy` back to
     /// the CPU blit, the next blit calls this before writing the
     /// dumb-buffer fb so the scanout source is well-defined when
-    /// `present()` flips onto the dumb-buffer.
+    /// `present()` flips onto the dumb-buffer. We're leaving the PRIME
+    /// path for good on this decoder session at that point — a fresh
+    /// decoder open (input switch, resolution change) allocates its
+    /// own new buffer objects under fresh DMA-BUF identities anyway —
+    /// so every cached framebuffer is flushed here rather than left to
+    /// age out via `prime_fb_cache`'s normal FIFO eviction.
     pub fn release_prime_state(&mut self) {
+        for (_, entry) in self.prime_fb_cache.drain() {
+            let _ = self.card.destroy_framebuffer(entry.fb);
+        }
+        self.prime_fb_cache_order.clear();
+
         let Some(mut state) = self.prime_state.take() else {
             return;
         };
-        if state.in_flight_fb.is_none() && state.in_flight_keepalive.is_none() {
-            // Nothing to do — the slot was empty.
+        if state.in_flight_keepalive.is_none() {
+            // Nothing else to do — the slot was empty.
             return;
-        }
-        if let Some(fb) = state.in_flight_fb.take() {
-            let _ = self.card.destroy_framebuffer(fb);
         }
         state.in_flight_keepalive = None;
         // Re-arm the CRTC against the current dumb-buffer fb so the
