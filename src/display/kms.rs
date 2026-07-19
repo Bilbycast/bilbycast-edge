@@ -506,6 +506,35 @@ struct BarsOverlay {
     pixel_blend_coverage_value: u64,
 }
 
+/// Secondary content plane for zero-copy YUV PRIME scanout, adopted
+/// reactively when the primary plane permanently rejects a linear YUV
+/// framebuffer commit — confirmed on real RK3588 hardware: the VOP2
+/// "Cluster" window class (frequently the plane the kernel reports as
+/// `type=Primary`) accepts YUV **only** in AFBC-compressed form per the
+/// upstream kernel driver's own capability description ("Cluster
+/// windows: AFBC/line RGB and AFBC-only YUV support"), while "Esmart"
+/// windows support linear YUV directly. See
+/// [`KmsDisplay::try_promote_yuv_overlay`].
+///
+/// Unlike [`BarsOverlay`], this plane carries the actual video content
+/// (not a translucent overlay), so it needs `COLOR_ENCODING`/
+/// `COLOR_RANGE` resolved exactly like the primary plane's YUV path —
+/// and it has no ping-pong buffer state of its own, since every PRIME
+/// framebuffer is freshly imported per frame via `add_planar_framebuffer`
+/// (same as the primary-plane PRIME path).
+struct YuvOverlay {
+    plane: plane::Handle,
+    plane_props: PlanePropIds,
+    /// `Some` only when `zpos` exists and is mutable — writes
+    /// `zpos_value` so this plane composes ABOVE the primary plane's
+    /// stale dumb-buffer content underneath it. `None` when the driver
+    /// pins zpos (the pinned value already being above primary is
+    /// assumed rather than re-verified, mirroring
+    /// [`BarsOverlay::zpos`]'s immutable-and-compatible case).
+    zpos: Option<property::Handle>,
+    zpos_value: u64,
+}
+
 /// Holder for the active KMS master + double-buffered framebuffers.
 /// One per display output. Created by `output_display` after mode-set;
 /// owns the lifetime of the dumb buffers and the CRTC lease.
@@ -579,6 +608,22 @@ pub struct KmsDisplay {
     /// bars plane retries once per `BARS_REHEAL_COOLDOWN`, not per
     /// frame.
     bars_overlay_lost_at: Option<std::time::Instant>,
+    /// Secondary NV12-capable plane, adopted reactively after the
+    /// primary plane permanently rejects a linear YUV PRIME commit.
+    /// `None` until (if ever) [`Self::try_promote_yuv_overlay`]
+    /// succeeds; once `Some`, every subsequent YUV `atomic_present`
+    /// call targets this plane instead of the primary. See
+    /// [`YuvOverlay`]'s doc comment for the RK3588 Cluster/Esmart
+    /// background.
+    yuv_overlay: Option<YuvOverlay>,
+    /// Whether [`Self::try_promote_yuv_overlay`] has already been
+    /// attempted this session — attempted at most once, on the first
+    /// permanent primary-plane YUV rejection, regardless of outcome.
+    /// Prevents re-running plane discovery on every subsequent frame
+    /// when no suitable secondary plane exists (the VAAPI/Intel/AMD
+    /// case, where the primary plane's rejection means something else
+    /// entirely and promotion would never succeed).
+    yuv_overlay_promotion_attempted: bool,
     /// Currently-programmed HDR output metadata. The next atomic
     /// commit writes this onto the connector's `HDR_OUTPUT_METADATA`
     /// property. `None` when SDR (the connector is unset by writing
@@ -787,6 +832,8 @@ impl KmsDisplay {
             bars_overlay: None,
             bars_overlay_wanted: false,
             bars_overlay_lost_at: None,
+            yuv_overlay: None,
+            yuv_overlay_promotion_attempted: false,
             hdr_state: None,
             hdr_dirty: false,
         })
@@ -1005,6 +1052,65 @@ impl KmsDisplay {
             zpos_value,
             pixel_blend_mode,
             pixel_blend_coverage_value,
+        });
+        Ok(())
+    }
+
+    /// Attempt to adopt a secondary Overlay-class plane advertising
+    /// native NV12 support for the zero-copy YUV PRIME content path,
+    /// in place of the primary plane. Called reactively, at most once
+    /// per session, by `present_prime` the first time the primary
+    /// plane's atomic commit permanently rejects a linear YUV
+    /// framebuffer — see [`YuvOverlay`]'s doc comment for why this is
+    /// needed on RK3588 (Cluster windows: AFBC-only YUV) and why it's
+    /// safe to leave unused on hosts where the primary plane already
+    /// accepts YUV directly (VAAPI on Intel/AMD, proven over many
+    /// prior releases — this path is never even attempted there,
+    /// since it only runs after a primary-plane failure that those
+    /// hosts don't produce).
+    ///
+    /// On success, every subsequent `atomic_present(..., is_yuv=true)`
+    /// call targets the adopted plane automatically (see its
+    /// content-plane selection logic) — no further calls to this
+    /// method are needed. On failure (no suitable plane — e.g. VAAPI/
+    /// Intel/AMD hosts, where the primary plane's rejection means
+    /// something else entirely), the caller falls through to the
+    /// existing sysmem CPU-blit demotion exactly as before this
+    /// method existed.
+    fn try_promote_yuv_overlay(&mut self) -> Result<()> {
+        if self.yuv_overlay.is_some() {
+            return Ok(());
+        }
+        if !self.use_atomic {
+            anyhow::bail!("yuv-overlay promotion needs atomic_commit");
+        }
+        let primary_plane = self
+            .atomic
+            .as_ref()
+            .map(|a| a.plane)
+            .context("yuv-overlay promotion requires atomic setup to already exist")?;
+        let mut exclude = vec![primary_plane];
+        if let Some(bars) = &self.bars_overlay {
+            exclude.push(bars.plane);
+        }
+        let (plane_h, plane_props) = discover_yuv_overlay_plane(&self.card, self.crtc, &exclude)
+            .context("yuv-overlay plane discovery")?;
+        let (zpos, zpos_value) = discover_yuv_overlay_zpos(&self.card, plane_h, primary_plane)
+            .context("yuv-overlay zpos discovery")?;
+        tracing::info!(
+            plane = format!("{:?}", plane_h),
+            primary_plane = format!("{:?}", primary_plane),
+            zpos_write_armed = zpos.is_some(),
+            zpos_value,
+            "display: promoted zero-copy YUV scanout to a secondary NV12-capable plane — \
+             the primary plane rejected linear YUV (expected on Rockchip VOP2 boards whose \
+             Cluster-class primary window is AFBC-only for YUV)"
+        );
+        self.yuv_overlay = Some(YuvOverlay {
+            plane: plane_h,
+            plane_props,
+            zpos,
+            zpos_value,
         });
         Ok(())
     }
@@ -2296,6 +2402,113 @@ fn discover_bars_overlay_blend_props(
     Ok((zpos, zpos_value, pixel_blend_mode, coverage_value))
 }
 
+/// Search for an additional plane (beyond `exclude`) drivable from
+/// `crtc` that natively advertises `NV12` — the secondary content
+/// plane [`KmsDisplay::try_promote_yuv_overlay`] adopts when the
+/// primary plane permanently rejects linear YUV (confirmed: RK3588
+/// VOP2 Cluster windows, AFBC-only for YUV; Esmart windows support
+/// linear YUV directly and report `type=Overlay`, indistinguishable
+/// by type alone from a bars-overlay ARGB8888 candidate — hence the
+/// explicit NV12 format-list filter here rather than reusing
+/// [`discover_bars_overlay_plane`]'s type-based search).
+///
+/// Unlike the bars-overlay search, this resolves `COLOR_ENCODING`/
+/// `COLOR_RANGE` too — this plane carries real YUV pixel data, not a
+/// translucent ARGB8888 strip, so it needs the same colorimetry
+/// properties the primary plane's YUV path already sets.
+fn discover_yuv_overlay_plane(
+    card: &CardFile,
+    crtc: drm::control::crtc::Handle,
+    exclude: &[plane::Handle],
+) -> Result<(plane::Handle, PlanePropIds)> {
+    let res = card
+        .resource_handles()
+        .context("resource_handles for yuv-overlay discovery")?;
+    let planes = card
+        .plane_handles()
+        .context("plane_handles for yuv-overlay discovery")?;
+    let nv12 = DrmFourcc::Nv12 as u32;
+    let mut found: Option<plane::Handle> = None;
+    for p in planes {
+        if exclude.contains(&p) {
+            continue;
+        }
+        let info = card.get_plane(p).context("get_plane (yuv-overlay search)")?;
+        if !res.filter_crtcs(info.possible_crtcs()).iter().any(|c| *c == crtc) {
+            continue;
+        }
+        if !info.formats().iter().any(|f| *f == nv12) {
+            continue;
+        }
+        if read_plane_type(card, p)? == PlaneType::Overlay as u64 {
+            found = Some(p);
+            break;
+        }
+    }
+    let plane_h = found.context(
+        "no additional Overlay-type plane drivable from this CRTC advertises NV12 — \
+         no zero-copy fallback plane available on this host",
+    )?;
+    let names = [
+        "FB_ID", "CRTC_ID", "SRC_X", "SRC_Y", "SRC_W", "SRC_H", "CRTC_X", "CRTC_Y", "CRTC_W",
+        "CRTC_H",
+    ];
+    let p = collect_props(card, plane_h, &names)?;
+    let color_encoding = optional_prop(card, plane_h, "COLOR_ENCODING")?;
+    let color_encoding_value =
+        read_enum_value(card, plane_h, "COLOR_ENCODING", "ITU-R BT.709 YCbCr").unwrap_or(0);
+    let color_range = optional_prop(card, plane_h, "COLOR_RANGE")?;
+    let color_range_value =
+        read_enum_value(card, plane_h, "COLOR_RANGE", "YCbCr limited range").unwrap_or(0);
+    let plane_props = PlanePropIds {
+        fb_id: p[0],
+        crtc_id: p[1],
+        src_x: p[2],
+        src_y: p[3],
+        src_w: p[4],
+        src_h: p[5],
+        crtc_x: p[6],
+        crtc_y: p[7],
+        crtc_w: p[8],
+        crtc_h: p[9],
+        color_encoding,
+        color_encoding_value,
+        color_range,
+        color_range_value,
+    };
+    Ok((plane_h, plane_props))
+}
+
+/// Resolve the optional `zpos` property on a just-discovered
+/// yuv-overlay plane, so it composes ABOVE the primary plane's stale
+/// dumb-buffer content underneath it. Simplified sibling of
+/// [`discover_bars_overlay_blend_props`] — no `pixel blend mode`
+/// needed since YUV content is always fully opaque (no alpha plane),
+/// unlike the bars overlay's ARGB8888 strip.
+fn discover_yuv_overlay_zpos(
+    card: &CardFile,
+    yuv_plane: plane::Handle,
+    primary_plane: plane::Handle,
+) -> Result<(Option<property::Handle>, u64)> {
+    let primary_zpos = read_property_u64(card, primary_plane, "zpos").unwrap_or(0);
+    let zpos_value = primary_zpos.saturating_add(1);
+    let zpos = match optional_prop_state(card, yuv_plane, "zpos")? {
+        None => None,
+        Some((handle, true, _current)) => Some(handle),
+        Some((_handle, false, current)) => {
+            if current > primary_zpos {
+                None
+            } else {
+                anyhow::bail!(
+                    "yuv-overlay plane zpos is immutable at {current} (primary zpos \
+                     {primary_zpos}) — plane would composite under the primary"
+                );
+            }
+        }
+    };
+    Ok((zpos, zpos_value))
+}
+
 /// Read a u64-valued property by name, returning `None` when the
 /// property is absent on the object. Used to snapshot the primary
 /// plane's `zpos` so the bars plane can be ordered above it.
@@ -2815,6 +3028,60 @@ impl KmsDisplay {
                                 ));
                             }
                         }
+                    } else if fourcc_is_yuv(fourcc)
+                        && self.yuv_overlay.is_none()
+                        && !self.yuv_overlay_promotion_attempted
+                    {
+                        // Primary plane permanently rejected linear YUV.
+                        // Try adopting a secondary NV12-capable plane
+                        // ONCE (see `try_promote_yuv_overlay`'s doc
+                        // comment) before giving up on zero-copy
+                        // entirely for this session. On VAAPI/Intel/AMD
+                        // hosts (where the primary plane's rejection
+                        // means something unrelated) promotion finds no
+                        // suitable plane and this falls through to the
+                        // exact same error path as before this existed.
+                        self.yuv_overlay_promotion_attempted = true;
+                        match self.try_promote_yuv_overlay() {
+                            Ok(()) => {
+                                self.invalidate_atomic_modeset();
+                                match self.atomic_present(
+                                    new_fb,
+                                    descriptor.width,
+                                    descriptor.height,
+                                    true,
+                                ) {
+                                    Ok(()) => {
+                                        if let Err(e2) = self.wait_page_flip() {
+                                            let _ = self.card.destroy_framebuffer(new_fb);
+                                            return Err(e2.context(
+                                                "display_prime_page_flip_failed: receive_events (yuv-overlay-retry)",
+                                            ));
+                                        }
+                                    }
+                                    Err(retry_err) => {
+                                        // Secondary plane ALSO rejected it — don't
+                                        // keep retrying a broken plane every frame.
+                                        self.yuv_overlay = None;
+                                        let _ = self.card.destroy_framebuffer(new_fb);
+                                        return Err(anyhow::anyhow!(
+                                            "display_prime_page_flip_failed: atomic_commit \
+                                             (also failed on secondary NV12 plane): {retry_err:?}"
+                                        ));
+                                    }
+                                }
+                            }
+                            Err(promote_err) => {
+                                tracing::debug!(
+                                    "display: no secondary NV12-capable plane available \
+                                     ({promote_err:#}) — falling back to sysmem"
+                                );
+                                let _ = self.card.destroy_framebuffer(new_fb);
+                                return Err(anyhow::anyhow!(
+                                    "display_prime_page_flip_failed: atomic_commit: {msg}"
+                                ));
+                            }
+                        }
                     } else {
                         let _ = self.card.destroy_framebuffer(new_fb);
                         return Err(anyhow::anyhow!(
@@ -2910,33 +3177,76 @@ impl KmsDisplay {
             self.commit_modeset_only(plane, &plane_props, &crtc_props, &connector_props)?;
         }
 
-        let pp = &plane_props;
+        // Choose which plane actually carries the FB_ID/CRTC_ID/SRC/CRTC
+        // content properties this commit. Normally that's the primary
+        // plane (`plane`/`plane_props`, unchanged from before) — for
+        // RGB dumb-buffer presents always, and for YUV PRIME presents
+        // on every host where the primary plane accepts YUV directly
+        // (VAAPI on Intel/AMD, proven over many prior releases). Once
+        // `try_promote_yuv_overlay` has adopted a secondary plane
+        // (RK3588 Cluster-window case), every YUV present targets it
+        // instead — the primary plane is left untouched by this commit,
+        // keeping whatever dumb-buffer FB it last had (occluded once
+        // the yuv-overlay plane's zpos places it on top).
+        let yuv_target = if is_yuv {
+            self.yuv_overlay.as_ref().map(|y| {
+                (
+                    y.plane,
+                    PlanePropIds {
+                        fb_id: y.plane_props.fb_id,
+                        crtc_id: y.plane_props.crtc_id,
+                        src_x: y.plane_props.src_x,
+                        src_y: y.plane_props.src_y,
+                        src_w: y.plane_props.src_w,
+                        src_h: y.plane_props.src_h,
+                        crtc_x: y.plane_props.crtc_x,
+                        crtc_y: y.plane_props.crtc_y,
+                        crtc_w: y.plane_props.crtc_w,
+                        crtc_h: y.plane_props.crtc_h,
+                        color_encoding: y.plane_props.color_encoding,
+                        color_encoding_value: y.plane_props.color_encoding_value,
+                        color_range: y.plane_props.color_range,
+                        color_range_value: y.plane_props.color_range_value,
+                    },
+                    y.zpos,
+                    y.zpos_value,
+                )
+            })
+        } else {
+            None
+        };
+        let (content_plane, cp, yuv_zpos, yuv_zpos_value) = match yuv_target {
+            Some((p, props, zpos, zpos_value)) => (p, props, zpos, zpos_value),
+            None => (plane, plane_props, None, 0),
+        };
+
+        let pp = &cp;
         let mut req = AtomicModeReq::new();
-        req.add_property(plane, pp.fb_id, property::Value::Framebuffer(Some(new_fb)));
-        req.add_property(plane, pp.crtc_id, property::Value::CRTC(Some(self.crtc)));
+        req.add_property(content_plane, pp.fb_id, property::Value::Framebuffer(Some(new_fb)));
+        req.add_property(content_plane, pp.crtc_id, property::Value::CRTC(Some(self.crtc)));
         // SRC rectangle: full source surface in 16.16 fixed-point.
-        req.add_property(plane, pp.src_x, property::Value::UnsignedRange(0));
-        req.add_property(plane, pp.src_y, property::Value::UnsignedRange(0));
+        req.add_property(content_plane, pp.src_x, property::Value::UnsignedRange(0));
+        req.add_property(content_plane, pp.src_y, property::Value::UnsignedRange(0));
         req.add_property(
-            plane,
+            content_plane,
             pp.src_w,
             property::Value::UnsignedRange((src_w as u64) << 16),
         );
         req.add_property(
-            plane,
+            content_plane,
             pp.src_h,
             property::Value::UnsignedRange((src_h as u64) << 16),
         );
         // CRTC rectangle: full destination panel.
-        req.add_property(plane, pp.crtc_x, property::Value::SignedRange(0));
-        req.add_property(plane, pp.crtc_y, property::Value::SignedRange(0));
+        req.add_property(content_plane, pp.crtc_x, property::Value::SignedRange(0));
+        req.add_property(content_plane, pp.crtc_y, property::Value::SignedRange(0));
         req.add_property(
-            plane,
+            content_plane,
             pp.crtc_w,
             property::Value::UnsignedRange(self.width as u64),
         );
         req.add_property(
-            plane,
+            content_plane,
             pp.crtc_h,
             property::Value::UnsignedRange(self.height as u64),
         );
@@ -2949,18 +3259,28 @@ impl KmsDisplay {
         if is_yuv {
             if let Some(enc_prop) = pp.color_encoding {
                 req.add_property(
-                    plane,
+                    content_plane,
                     enc_prop,
                     property::Value::UnsignedRange(pp.color_encoding_value),
                 );
             }
             if let Some(range_prop) = pp.color_range {
                 req.add_property(
-                    plane,
+                    content_plane,
                     range_prop,
                     property::Value::UnsignedRange(pp.color_range_value),
                 );
             }
+        }
+        // zpos for the secondary yuv-overlay plane, so it composes
+        // above the primary's stale dumb-buffer content underneath it.
+        // Not applicable when `content_plane == plane` (primary itself).
+        if let Some(zpos_prop) = yuv_zpos {
+            req.add_property(
+                content_plane,
+                zpos_prop,
+                property::Value::UnsignedRange(yuv_zpos_value),
+            );
         }
         let _ = connector_props; // suppress unused warning; kept for symmetry with the other prop tables
         let _ = mode_blob_loaded;
