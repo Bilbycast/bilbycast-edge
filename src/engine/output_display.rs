@@ -574,6 +574,24 @@ async fn run_display_output(
     // the working CPU-blit path instead of black-screening on a doomed prime
     // present. Mirrors the `force_cpu_blit_for_bars` sharing pattern.
     let prime_scanout_failed = Arc::new(AtomicBool::new(false));
+    // Set by the decode task the first time `rga_transfer::nv12_dmabuf_to_sysmem`
+    // successfully engages. Read by the display task's pacer to gate a
+    // one-time A/V latency calibration — the RGA-accelerated transfer
+    // path was measured (2026-07-19, bilby-pir6s) to carry a large,
+    // *fixed* extra pipeline latency (roughly 340-400 ms, stable per session,
+    // not drifting) that the raw audio-vs-video drift calculation has
+    // no way to tell apart from a real backlog: left uncorrected, the
+    // catch-up drain fires continuously and the drop rate lands worse
+    // than the plain CPU transfer path it was meant to improve on
+    // (~31 % vs ~11 %) despite RGA's per-frame cost genuinely being
+    // lower. Same class of fix already proven correct for the (KMS-
+    // side, since-disabled) Esmart-plane zero-copy attempt earlier
+    // this session — mirrors `KmsDisplay::yuv_overlay_active()`'s role
+    // there, just for a transfer-path optimization instead of a
+    // scanout-plane one, so it carries none of that attempt's
+    // plane-compositing risk.
+    #[cfg(feature = "rga-transfer")]
+    let rga_transfer_active = Arc::new(AtomicBool::new(false));
 
     // Display is a terminal consumer — it decodes the flow's broadcast
     // channel and renders to KMS + ALSA. No encoder runs, so register a
@@ -642,6 +660,8 @@ async fn run_display_output(
     let demux_panel_hdr_capable = kms.panel_hdr_capable();
     let demux_force_cpu_blit_for_bars = Arc::clone(&force_cpu_blit_for_bars);
     let demux_prime_scanout_failed = Arc::clone(&prime_scanout_failed);
+    #[cfg(feature = "rga-transfer")]
+    let demux_rga_transfer_active = Arc::clone(&rga_transfer_active);
     let demux_output_stats = Arc::clone(&output_stats);
     let demux_audio_decode_counters = Arc::clone(&audio_decode_counters);
     let demux_video_decode_counters = Arc::clone(&video_decode_counters);
@@ -664,6 +684,8 @@ async fn run_display_output(
             demux_panel_hdr_capable,
             demux_force_cpu_blit_for_bars,
             demux_prime_scanout_failed,
+            #[cfg(feature = "rga-transfer")]
+            demux_rga_transfer_active,
             demux_output_stats,
             demux_audio_decode_counters,
             demux_video_decode_counters,
@@ -728,6 +750,8 @@ async fn run_display_output(
     let display_frame_gen = Arc::clone(&frame_gen);
     let display_force_cpu_blit = Arc::clone(&force_cpu_blit_for_bars);
     let display_prime_scanout_failed = Arc::clone(&prime_scanout_failed);
+    #[cfg(feature = "rga-transfer")]
+    let display_rga_transfer_active = Arc::clone(&rga_transfer_active);
     // Independent DRM-master release handle (a dup of the card fd) captured
     // before the live `kms` moves into the render thread below. Lets the
     // orchestrator free the connector on teardown even if that thread later
@@ -750,6 +774,8 @@ async fn run_display_output(
             display_frame_gen,
             display_force_cpu_blit,
             display_prime_scanout_failed,
+            #[cfg(feature = "rga-transfer")]
+            display_rga_transfer_active,
         );
     });
 
@@ -1002,6 +1028,7 @@ fn demux_decode_loop(
     panel_hdr_capable: bool,
     force_cpu_blit_for_bars: Arc<AtomicBool>,
     prime_scanout_failed: Arc<AtomicBool>,
+    #[cfg(feature = "rga-transfer")] rga_transfer_active: Arc<AtomicBool>,
     output_stats: Arc<OutputStatsAccumulator>,
     audio_decode_counters: Arc<DecodeStats>,
     video_decode_counters: Arc<VideoDecodeStats>,
@@ -1170,6 +1197,8 @@ fn demux_decode_loop(
                         panel_hdr_capable,
                         &force_cpu_blit_for_bars,
                         &prime_scanout_failed,
+                        #[cfg(feature = "rga-transfer")]
+                        &rga_transfer_active,
                         stream_ids,
                         &video_decode_counters,
                         &output_stats,
@@ -1204,6 +1233,8 @@ fn demux_decode_loop(
                         panel_hdr_capable,
                         &force_cpu_blit_for_bars,
                         &prime_scanout_failed,
+                        #[cfg(feature = "rga-transfer")]
+                        &rga_transfer_active,
                         stream_ids,
                         &video_decode_counters,
                         &output_stats,
@@ -1247,6 +1278,8 @@ fn demux_decode_loop(
                         panel_hdr_capable,
                         &force_cpu_blit_for_bars,
                         &prime_scanout_failed,
+                        #[cfg(feature = "rga-transfer")]
+                        &rga_transfer_active,
                         stream_ids,
                         &video_decode_counters,
                         &output_stats,
@@ -2091,6 +2124,7 @@ fn handle_video_au(
     panel_hdr_capable: bool,
     force_cpu_blit_for_bars: &AtomicBool,
     prime_scanout_failed: &AtomicBool,
+    #[cfg(feature = "rga-transfer")] rga_transfer_active: &AtomicBool,
     stream_ids: StreamIds,
     video_decode_counters: &VideoDecodeStats,
     output_stats: &OutputStatsAccumulator,
@@ -2209,6 +2243,8 @@ fn handle_video_au(
         panel_hdr_capable,
         force_cpu_blit_for_bars,
         prime_scanout_failed,
+        #[cfg(feature = "rga-transfer")]
+        rga_transfer_active,
         stream_ids,
         video_decode_counters,
         output_stats,
@@ -2528,6 +2564,7 @@ fn drain_video_frames(
     panel_hdr_capable: bool,
     force_cpu_blit_for_bars: &AtomicBool,
     prime_scanout_failed: &AtomicBool,
+    #[cfg(feature = "rga-transfer")] rga_transfer_active: &AtomicBool,
     stream_ids: StreamIds,
     video_decode_counters: &VideoDecodeStats,
     output_stats: &OutputStatsAccumulator,
@@ -2747,8 +2784,89 @@ fn drain_video_frames(
                     && ((source_is_hdr && !panel_hdr_capable)
                         || interlaced
                         || force_cpu_blit_for_bars.load(Ordering::Relaxed))));
+        // RGA-accelerated fast path (`rga-transfer` feature, ARM
+        // Rockchip only): FFmpeg's generic `download_to_sysmem()`
+        // (`av_hwframe_transfer_data`) does an unaccelerated CPU
+        // mmap+DMA_BUF_SYNC+memcpy — measured as the dominant per-frame
+        // cost behind HDMI display-output stutter on bilby-pir6s
+        // (RK3588), spikes up to ~106 ms. Try the Rockchip 2D
+        // accelerator first (benchmarked on the same hardware at
+        // ~3 ms/frame, 1080p) — restricted to the plain RKMPP-native
+        // NV12 case (not HDR/P010LE, which needs the CPU path's
+        // tonemap-aware handling downstream) so it never touches the
+        // HDR or bars-without-overlay reasons `need_sysmem` can also
+        // fire for. On any failure (feature not compiled in, frame not
+        // RKMPP-native, RGA call failed), `rga_prepared` stays `None`
+        // and every existing code path below runs completely
+        // unchanged.
+        #[cfg(feature = "rga-transfer")]
+        let rga_prepared: Option<(Vec<u8>, usize, VideoFrameChroma, i32)> = 'rga: {
+            // `DRM_FORMAT_NV12` fourcc ("NV12" little-endian, matching
+            // the value already seen on this exact path's atomic_commit
+            // error logs: `fourcc="0x3231564e"`). NOT the same check as
+            // `pixel_format == NV12` — `frame.pixel_format()` on a
+            // DRM_PRIME frame always reports `AV_PIX_FMT_DRM_PRIME`
+            // itself (that's what `is_drm_prime()` tests), never the
+            // underlying sw format, so gating on it here would silently
+            // reject every frame. The DRM_PRIME descriptor's own fourcc
+            // is the correct source for "is this actually 8-bit NV12".
+            const DRM_FOURCC_NV12: u32 = 0x3231564e;
+            if !need_sysmem || !frame.is_drm_prime() {
+                break 'rga None;
+            }
+            let Ok(prime_frame) = frame.map_drm_prime() else {
+                break 'rga None;
+            };
+            if prime_frame.fourcc != DRM_FOURCC_NV12 {
+                break 'rga None;
+            }
+            let Some(p0) = prime_frame.planes.first() else {
+                break 'rga None;
+            };
+            let uv_offset_rows = prime_frame
+                .planes
+                .get(1)
+                .map(|p1| p1.offset / p0.pitch.max(1))
+                .unwrap_or(height);
+            match crate::display::rga_transfer::nv12_dmabuf_to_sysmem(
+                p0.fd,
+                width,
+                height,
+                p0.pitch,
+                uv_offset_rows,
+            ) {
+                Ok((y, y_stride, uv, uv_stride)) => {
+                    // First engagement: log once and flip the shared
+                    // flag the display task's pacer reads to gate its
+                    // one-time A/V latency calibration (see
+                    // `rga_transfer_active`'s doc comment at its
+                    // declaration for why that's needed).
+                    if !rga_transfer_active.swap(true, Ordering::Relaxed) {
+                        tracing::info!(
+                            output_id = %output_id,
+                            "rga_transfer: hardware transfer engaged (one-shot confirmation)"
+                        );
+                    }
+                    Some((
+                        y,
+                        y_stride,
+                        VideoFrameChroma::SemiPlanar { uv, uv_stride },
+                        AVPixelFormat_AV_PIX_FMT_NV12_VAL,
+                    ))
+                }
+                Err(e) => {
+                    tracing::debug!(
+                        output_id = %output_id,
+                        "rga_transfer failed, falling back to CPU download: {e:#}"
+                    );
+                    None
+                }
+            }
+        };
+        #[cfg(not(feature = "rga-transfer"))]
+        let rga_prepared: Option<(Vec<u8>, usize, VideoFrameChroma, i32)> = None;
         let frame =
-            if need_sysmem {
+            if need_sysmem && rga_prepared.is_none() {
                 match frame.download_to_sysmem() {
                     Ok(sysmem) => sysmem,
                     Err(e) => {
@@ -2817,7 +2935,7 @@ fn drain_video_frames(
         // (2026-07-19): the sticky `prime_scanout_failed` demotion
         // correctly engaged after the first present failure, but this
         // stale check then dropped every subsequent frame anyway.
-        let frame = if frame.is_vaapi() || frame.is_drm_prime() {
+        let frame = if rga_prepared.is_none() && (frame.is_vaapi() || frame.is_drm_prime()) {
             let rkmpp_native = frame.is_drm_prime();
             let zerocopy_kind = if rkmpp_native { "rkmpp-zerocopy" } else { "vaapi-zerocopy" };
             match frame.map_drm_prime() {
@@ -2964,7 +3082,9 @@ fn drain_video_frames(
         //      semi-planar accessors are tried in order; the first
         //      `Some` decides the pixel format we stamp.
         let prepared: Option<(Vec<u8>, usize, VideoFrameChroma, i32)> =
-            if let Some((y, ys, u, us, v, vs)) = frame.yuv_planes() {
+            if let Some(rga) = rga_prepared {
+                Some(rga)
+            } else if let Some((y, ys, u, us, v, vs)) = frame.yuv_planes() {
                 Some((
                     y.to_vec(),
                     ys,
@@ -3205,6 +3325,7 @@ fn display_loop(
     frame_gen: Arc<AtomicU64>,
     force_cpu_blit_signal: Arc<AtomicBool>,
     prime_scanout_failed: Arc<AtomicBool>,
+    #[cfg(feature = "rga-transfer")] rga_transfer_active: Arc<AtomicBool>,
 ) {
     // Frame period derived from the observed PTS deltas — used to size
     // the late-drop threshold. 33 ms (30 fps) until we've seen enough
@@ -3293,6 +3414,36 @@ fn display_loop(
     // resolution change or large PTS jump so a stream switch starts
     // fresh.
     let mut wall_anchor: Option<(u64, Instant)> = None;
+
+    // One-time A/V latency calibration for the RGA-accelerated
+    // DRM_PRIME→sysmem transfer path (`rga-transfer` feature). That
+    // path was measured on bilby-pir6s (2026-07-19) to carry a large,
+    // *fixed* extra pipeline latency (roughly 340-400 ms, stable per session,
+    // not drifting) that the raw audio-vs-video drift below has no
+    // way to tell apart from a real backlog — left uncorrected, the
+    // catch-up drain (further below) fires continuously and the
+    // measured drop rate lands *worse* than the plain CPU transfer
+    // path RGA was meant to improve on (~31% vs ~11%), despite RGA's
+    // own per-frame cost genuinely being lower. Sample the raw drift
+    // for the first `RGA_CALIBRATION_MS` after engagement, lock in the
+    // median as a standing correction, and never touch it again — a
+    // fixed pipeline property, not something that drifts over a
+    // session. Same technique already proven correct for the (KMS-
+    // side, since-disabled) Esmart-plane zero-copy attempt earlier
+    // this session; this is a pacing-only correction with none of
+    // that attempt's plane-compositing risk.
+    #[cfg(feature = "rga-transfer")]
+    const RGA_CALIBRATION_MS: u128 = 1500;
+    #[cfg(feature = "rga-transfer")]
+    const RGA_CALIBRATION_MIN_SAMPLES: usize = 20;
+    #[cfg(feature = "rga-transfer")]
+    let mut rga_calibration_samples: Vec<i64> = Vec::new();
+    #[cfg(feature = "rga-transfer")]
+    let mut rga_calibration_started_at: Option<Instant> = None;
+    #[cfg(feature = "rga-transfer")]
+    let mut rga_latency_comp_ms: i64 = 0;
+    #[cfg(feature = "rga-transfer")]
+    let mut rga_calibration_done = false;
 
     // One-frame stash for the catch-up drain below: when the drain
     // pulls a frame that crossed a generation bump or a resolution
@@ -3685,7 +3836,42 @@ fn display_loop(
             clock.current_pts_90k_smoothed()
         {
             wall_anchor = None;
-            Some((next.pts_90k as i64 - audio_pts as i64) / 90)
+            let raw = (next.pts_90k as i64 - audio_pts as i64) / 90;
+            #[cfg(feature = "rga-transfer")]
+            {
+                if rga_transfer_active.load(Ordering::Relaxed) {
+                    if rga_calibration_done {
+                        Some(raw + rga_latency_comp_ms)
+                    } else {
+                        let started = *rga_calibration_started_at.get_or_insert_with(Instant::now);
+                        rga_calibration_samples.push(raw);
+                        if started.elapsed().as_millis() >= RGA_CALIBRATION_MS
+                            && rga_calibration_samples.len() >= RGA_CALIBRATION_MIN_SAMPLES
+                        {
+                            rga_calibration_samples.sort_unstable();
+                            let median = rga_calibration_samples[rga_calibration_samples.len() / 2];
+                            rga_latency_comp_ms = -median;
+                            rga_calibration_done = true;
+                            tracing::info!(
+                                output_id = %output_id,
+                                measured_offset_ms = median,
+                                comp_ms = rga_latency_comp_ms,
+                                "display: calibrated fixed A/V latency on the RGA transfer \
+                                 path — applying standing correction"
+                            );
+                        }
+                        // Still calibrating — let this frame's raw
+                        // drift through uncorrected rather than guess.
+                        Some(raw)
+                    }
+                } else {
+                    Some(raw)
+                }
+            }
+            #[cfg(not(feature = "rga-transfer"))]
+            {
+                Some(raw)
+            }
         } else {
             // Audio muted — pace on wall-clock seeded by the first frame.
             let now = Instant::now();
@@ -3787,7 +3973,14 @@ fn display_loop(
                 raw_drift_ms = if let Some(audio_pts) =
                     clock.current_pts_90k_smoothed()
                 {
-                    (next.pts_90k as i64 - audio_pts as i64) / 90
+                    let raw = (next.pts_90k as i64 - audio_pts as i64) / 90;
+                    #[cfg(feature = "rga-transfer")]
+                    let raw = if rga_transfer_active.load(Ordering::Relaxed) && rga_calibration_done {
+                        raw + rga_latency_comp_ms
+                    } else {
+                        raw
+                    };
+                    raw
                 } else if let Some((anchor_pts, anchor_at)) = wall_anchor.as_ref() {
                     ((next.pts_90k.wrapping_sub(*anchor_pts) as i64) / 90)
                         - anchor_at.elapsed().as_millis() as i64
