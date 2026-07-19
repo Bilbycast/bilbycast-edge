@@ -1092,6 +1092,31 @@ impl KmsDisplay {
     /// existing sysmem CPU-blit demotion exactly as before this
     /// method existed.
     fn try_promote_yuv_overlay(&mut self) -> Result<()> {
+        // SAFETY GATE (2026-07-19): disabled by default pending further
+        // investigation. On the RK3588 NanoPi R6S hardware this method
+        // was built for, promoting to the Esmart plane was confirmed via
+        // kernel/user tracing to add ~100-120 ms of fixed extra glass-
+        // to-glass latency versus the primary/Cluster plane (root cause
+        // of a ~66% dropped-frame rate — see the display-output-stutter
+        // investigation notes). A one-time auto-calibration was built to
+        // correct that latency and verified mathematically correct
+        // (av_sync_offset settled to single-digit ms), but on hardware
+        // testing WITH a human watching the physical screen — the first
+        // time anyone had, every earlier check relied on stats alone —
+        // the display went solid black (HDMI signal held, zero errors
+        // logged, `frames_displayed` climbing normally, and the DRM
+        // debugfs plane state looked entirely correct: right
+        // framebuffer, right format, right z-order, active CRTC).
+        // Stats cannot detect this failure mode, so its true root cause
+        // — and whether it also affects the plain (uncalibrated)
+        // promotion path — is unconfirmed. Left in place for a future
+        // session with HDMI capture-device tooling; not safe to enable
+        // without it. Flip this to `true` (or thread a real opt-in
+        // config flag) only after that hardware verification.
+        const YUV_OVERLAY_PROMOTION_ENABLED: bool = false;
+        if !YUV_OVERLAY_PROMOTION_ENABLED {
+            anyhow::bail!("yuv-overlay promotion disabled pending hardware verification (see comment)");
+        }
         if self.yuv_overlay.is_some() {
             return Ok(());
         }
