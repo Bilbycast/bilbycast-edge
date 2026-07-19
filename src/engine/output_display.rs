@@ -670,7 +670,6 @@ async fn run_display_output(
         crate::config::models::HwDecodePreference::Nvdec => DecoderBackend::Nvdec,
         crate::config::models::HwDecodePreference::Qsv => DecoderBackend::Qsv,
         crate::config::models::HwDecodePreference::Vaapi => DecoderBackend::Vaapi,
-        crate::config::models::HwDecodePreference::Rkmpp => DecoderBackend::Rkmpp,
     };
     let demux_frame_gen = Arc::clone(&frame_gen);
     // Snapshot the panel's HDR signalling capability now (kms is moved
@@ -753,7 +752,6 @@ async fn run_display_output(
         (crate::engine::hardware_probe::ResolvedDisplayDecoder::Vaapi, _) => {
             "vaapi-zerocopy"
         }
-        (crate::engine::hardware_probe::ResolvedDisplayDecoder::Rkmpp, _) => "rkmpp",
     };
     let display_frame_gen = Arc::clone(&frame_gen);
     let display_force_cpu_blit = Arc::clone(&force_cpu_blit_for_bars);
@@ -1815,7 +1813,6 @@ fn backend_name(backend: DecoderBackend) -> &'static str {
         DecoderBackend::Nvdec => "nvdec",
         DecoderBackend::Qsv => "qsv",
         DecoderBackend::Vaapi => "vaapi",
-        DecoderBackend::Rkmpp => "rkmpp",
     }
 }
 
