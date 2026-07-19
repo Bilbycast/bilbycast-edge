@@ -688,7 +688,6 @@ async fn run_display_output(
         crate::config::models::HwDecodePreference::Nvdec => DecoderBackend::Nvdec,
         crate::config::models::HwDecodePreference::Qsv => DecoderBackend::Qsv,
         crate::config::models::HwDecodePreference::Vaapi => DecoderBackend::Vaapi,
-        crate::config::models::HwDecodePreference::Rkmpp => DecoderBackend::Rkmpp,
     };
     let demux_frame_gen = Arc::clone(&frame_gen);
     // Snapshot the panel's HDR signalling capability now (kms is moved
@@ -1866,7 +1865,6 @@ fn backend_name(backend: DecoderBackend) -> &'static str {
         DecoderBackend::Nvdec => "nvdec",
         DecoderBackend::Qsv => "qsv",
         DecoderBackend::Vaapi => "vaapi",
-        DecoderBackend::Rkmpp => "rkmpp",
     }
 }
 
