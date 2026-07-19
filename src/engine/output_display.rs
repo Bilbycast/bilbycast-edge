@@ -2803,7 +2803,21 @@ fn drain_video_frames(
         // mapping failure falls back to a sysmem download and rides
         // the existing CPU-blit path below instead of being dropped —
         // worst case this is exactly the pre-zero-copy behaviour.
-        let frame = if is_hw_prime_frame {
+        //
+        // Re-check the frame's format fresh here rather than reuse
+        // `is_hw_prime_frame` (computed before the `need_sysmem` block
+        // above) — a successful `download_to_sysmem()` there already
+        // flipped `is_vaapi()`/`is_drm_prime()` to false, and entering
+        // this block on the stale flag would call `map_drm_prime()` on
+        // an already-sysmem frame, which always fails
+        // (`HwFrameNotOnDevice`, not the RKMPP-specific arm since
+        // `is_drm_prime()` is also false by then) and silently drops
+        // every frame forever — `frames_displayed` stuck at 0 with no
+        // error loop to notice by. Confirmed on real hardware
+        // (2026-07-19): the sticky `prime_scanout_failed` demotion
+        // correctly engaged after the first present failure, but this
+        // stale check then dropped every subsequent frame anyway.
+        let frame = if frame.is_vaapi() || frame.is_drm_prime() {
             let rkmpp_native = frame.is_drm_prime();
             let zerocopy_kind = if rkmpp_native { "rkmpp-zerocopy" } else { "vaapi-zerocopy" };
             match frame.map_drm_prime() {
