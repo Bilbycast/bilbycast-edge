@@ -614,7 +614,7 @@ async fn run_display_output(
     // the working CPU-blit path instead of black-screening on a doomed prime
     // present. Mirrors the `force_cpu_blit_for_bars` sharing pattern.
     let prime_scanout_failed = Arc::new(AtomicBool::new(false));
-    // Set by the decode task the first time `rga_transfer::nv12_dmabuf_to_sysmem`
+    // Set by the decode task the first time `rga_rs::nv12_dmabuf_to_sysmem`
     // successfully engages. Read by the display task's pacer to gate a
     // one-time A/V latency calibration — the RGA-accelerated transfer
     // path was measured (2026-07-19, bilby-pir6s) to carry a large,
@@ -2866,7 +2866,7 @@ fn drain_video_frames(
                 .get(1)
                 .map(|p1| p1.offset / p0.pitch.max(1))
                 .unwrap_or(height);
-            match crate::display::rga_transfer::nv12_dmabuf_to_sysmem(
+            match rga_rs::nv12_dmabuf_to_sysmem(
                 p0.fd,
                 width,
                 height,
