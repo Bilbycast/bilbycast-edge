@@ -127,7 +127,7 @@ jobs:
             artifact_suffix: aarch64-linux-rockchip
             variant: full
             rkmpp: "true"
-            cargo_features: "video-encoder-x264 video-encoder-x265 video-encoder-rkmpp video-decoder-rkmpp display mxl mxl-not-built sdi-decklink"
+            cargo_features: "video-encoder-x264 video-encoder-x265 video-encoder-rkmpp video-decoder-rkmpp rga-transfer display mxl mxl-not-built sdi-decklink"
     runs-on: ${{ matrix.runner }}
     steps:
       # Runs before any checkout / apt / x264-from-source / cargo, so a missing
@@ -417,6 +417,26 @@ jobs:
           echo "MPP_SOURCES_FILE=$HOME/rockchip-mpp-SOURCES.txt" >> "$GITHUB_ENV"
           echo "rockchip_mpp version: ${MPP_VER}"
 
+          # `rga-transfer` (bilbycast-rga-rs/librga-sys) hard-probes pkg-config
+          # `librga` at BUILD time to generate its bindgen types. Same PPA, same
+          # polarity as rockchip_mpp above: a userspace header+symbol/link check
+          # that touches no hardware, so it builds on this non-Rockchip runner
+          # and only opens /dev/rga at RUNTIME on a real RK3568/RK3588.
+          #
+          # NOTE (needs a real release run to confirm, same caveat as the MPP
+          # PPA note above): the PPA publishes source package `librga` at
+          # 2.2.0 — the exact version librga-sys's hand-declared signatures were
+          # confirmed against. The binary package split is assumed to follow the
+          # usual Debian convention (`librga-dev` headers + `librga2` runtime).
+          # If the -dev name differs, this step is where it surfaces, loudly,
+          # before the cargo build.
+          sudo apt-get install -y librga-dev
+          RGA_VER="$(pkg-config --modversion librga 2>/dev/null || echo unknown)"
+          printf 'librga corresponding source (Apache-2.0, dynamically linked)\nsource: https://github.com/airockchip/librga\npackaged-by: ppa:jjriek/rockchip-multimedia (librga-dev)\nversion: %s\n' \
+            "${RGA_VER}" > "$HOME/rockchip-rga-SOURCES.txt"
+          echo "RGA_SOURCES_FILE=$HOME/rockchip-rga-SOURCES.txt" >> "$GITHUB_ENV"
+          echo "librga version: ${RGA_VER}"
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -605,6 +625,18 @@ jobs:
               exit 1
             fi
             echo "OK: RKMPP compiled in (h264_rkmpp/hevc_rkmpp), librockchip_mpp dynamically linked (expected)"
+            # `rga-transfer` links librga.so the same way (via the sibling
+            # librga-sys crate's `#[link(name = "rga")]` + pkg-config
+            # directives). Its presence proves the feature actually compiled
+            # in rather than silently dropping out of the feature list — the
+            # failure mode that let 397 lines of FFI ship uncompiled by any
+            # CI job before this variant carried the feature.
+            if ! ldd "${BINARY}" | grep -qE 'librga'; then
+              echo "ERROR: rockchip binary is missing librga linkage — rga-transfer did not compile in."
+              echo "  Check the 'Install RKMPP build dependency' step and the cargo_features list."
+              exit 1
+            fi
+            echo "OK: rga-transfer compiled in, librga dynamically linked (expected)"
           else
             # librockchip_mpp must never leak into the x86_64 or generic
             # aarch64-full artefacts — those run on hosts without the Rockchip
@@ -613,7 +645,14 @@ jobs:
               echo "ERROR: non-rockchip binary unexpectedly links librockchip_mpp"
               exit 1
             fi
-            echo "OK: no RKMPP linkage (expected on non-rockchip variants)"
+            # Same polarity for librga — it must never leak into the x86_64 or
+            # generic aarch64-full artefacts, whose hosts have no /dev/rga and
+            # would refuse to start on the NEEDED entry alone.
+            if ldd "${BINARY}" | grep -qE 'librga'; then
+              echo "ERROR: non-rockchip binary unexpectedly links librga"
+              exit 1
+            fi
+            echo "OK: no RKMPP/RGA linkage (expected on non-rockchip variants)"
           fi
 
       - name: Package tarball

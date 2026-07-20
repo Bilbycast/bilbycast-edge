@@ -39,8 +39,6 @@ pub mod claim_registry;
 pub mod clock;
 pub mod hdr_tonemap;
 pub mod kms;
-#[cfg(feature = "rga-transfer")]
-pub mod rga_transfer;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]

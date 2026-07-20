@@ -113,6 +113,17 @@ mxl-rs = { path = "../bilbycast-mxl-rs/mxl-rs", optional = true }
 # dependency, mirroring `mxl-rs` (both are Bilbycast-org workspace crates).
 decklink-rs = { path = "../bilbycast-decklink-rs/decklink-rs", optional = true }
 
+# ── Rockchip RGA 2D-accelerator transfers (the `rga-transfer` feature) ───────
+# Hardware DRM_PRIME dma-buf → sysmem NV12 copy on RK3568 / RK3588, replacing
+# FFmpeg's generic CPU mmap + DMA_BUF_SYNC + memcpy in the local-display path.
+# The `librga` FFI + its bindgen build script live in the sibling workspace,
+# NOT here: bilbycast-edge is pure-Rust source and carries no build.rs, no
+# `.h`/`.c` files and no bindgen dependency — every native library it uses is
+# reached through a sibling `bilbycast-*-rs` crate behind an optional,
+# off-by-default feature. Default OFF, Rockchip-only. Sibling-path dependency,
+# mirroring `mxl-rs` / `decklink-rs`.
+rga-rs = { path = "../bilbycast-rga-rs/rga-rs", optional = true }
+
 # System resource monitoring (CPU, RAM)
 sysinfo = "0.39.1"
 
@@ -227,12 +238,6 @@ semver = { version = "1.0", features = ["serde"] }
 fs2 = "0.4"
 sigstore = { version = "0.14", default-features = false, features = ["sigstore-trust-root", "cached-client"] }
 x509-cert = { version = "0.2", default-features = false, features = ["std"] }
-
-[build-dependencies]
-# Only invoked when the `rga-transfer` feature is enabled (see build.rs);
-# harmless to compile in otherwise since bindgen/pkg-config are not run.
-bindgen = "0.72.1"
-pkg-config = "0.3"
 
 [features]
 # `display` is in the default feature set: every Linux release variant
@@ -450,10 +455,14 @@ video-decoder-rkmpp = ["video-engine/video-decoder-rkmpp"]
 # dropped frames vs. ~11% on the plain CPU path it replaces) despite
 # genuinely lower per-frame cost — don't disable/bypass the
 # calibration logic without re-verifying the drop rate on hardware.
-# Off by default; needs `librga-dev` + `/dev/rga` at build/run time,
-# plus systemd `DeviceAllow=/dev/rga rwm` under a hardened unit (see
-# `packaging/bilbycast-edge.service`).
-rga-transfer = ["video-decoder-rkmpp"]
+# Off by default; needs the `librga` headers at build time and `/dev/rga`
+# at run time, plus systemd `DeviceAllow=/dev/rga rwm` under a hardened
+# unit (see `packaging/bilbycast-edge.service`).
+#
+# The `librga` FFI itself lives in the sibling `bilbycast-rga-rs`
+# workspace, reached via the optional `rga-rs` dependency — the edge
+# carries no build.rs and no bindgen, exactly as with `mxl` / `sdi-decklink`.
+rga-transfer = ["video-decoder-rkmpp", "dep:rga-rs"]
 # Enable TLS (HTTPS on API + RTMPS) support via rustls/tokio-rustls/axum-server.
 tls = ["dep:tokio-rustls", "dep:axum-server"]
 # Enable WebRTC WHIP/WHEP input and output via str0m (pure Rust, sans-I/O).
