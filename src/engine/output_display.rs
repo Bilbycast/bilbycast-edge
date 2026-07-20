@@ -2381,9 +2381,44 @@ fn pts_jump(prev: Option<u64>, pts: u64) -> bool {
 /// and is excluded explicitly so a one-off pipeline collision doesn't
 /// falsely tear down zero-copy for the rest of the session.
 fn prime_scanout_permanently_rejected(err_msg: &str) -> bool {
-    err_msg.contains("display_prime_addfb_failed")
-        || err_msg.contains("display_prime_invalid")
-        || (err_msg.contains("display_prime_page_flip_failed") && !err_msg.contains("busy"))
+    // Unambiguously permanent: the kernel refused the framebuffer
+    // itself (modifier / descriptor the scanout plane will never
+    // accept), or the descriptor was malformed. Neither improves on a
+    // later frame.
+    if err_msg.contains("display_prime_addfb_failed") || err_msg.contains("display_prime_invalid") {
+        return true;
+    }
+
+    // `display_prime_page_flip_failed` is NOT permanent on its own — it
+    // covers three very different conditions, and only one is terminal:
+    //
+    //   * `atomic_commit busy`  — EBUSY, a previous nonblocking commit
+    //     is still in flight. The next frame retries and succeeds.
+    //   * `receive_events`      — `wait_page_flip` gave up after
+    //     FLIP_EVENT_TIMEOUT_MS with no DRM_EVENT_FLIP_COMPLETE. This is
+    //     the documented older-NVIDIA-on-new-kernel hiccup ("Flip event
+    //     timeout on head 0") and recovers on its own; the display loop
+    //     already drops the frame and retries.
+    //   * `atomic_commit: <EINVAL>` — the driver/plane combination
+    //     rejects our property set. This one really is permanent.
+    //
+    // The earlier form of this function excluded only "busy", so a
+    // transient flip TIMEOUT demoted the output to CPU blit for the
+    // rest of the session. Worse, it paired with the (now fixed)
+    // prime_fb_cache lifetime bug in `KmsDisplay::present_prime`: one
+    // transient failure destroyed a cache-owned FB, the next frame hit
+    // the dead handle and failed EINVAL, and that EINVAL was read here
+    // as a genuine permanent rejection — so a single hiccup latched a
+    // permanent demotion on hosts (including x86 VAAPI) whose zero-copy
+    // path was working perfectly.
+    //
+    // Match the terminal case positively rather than excluding known
+    // transients, so a newly-added transient string cannot silently
+    // become "permanent" by omission.
+    err_msg.contains("display_prime_page_flip_failed")
+        && err_msg.contains("atomic_commit")
+        && !err_msg.contains("busy")
+        && !err_msg.contains("receive_events")
 }
 
 fn feed_video_decoder(
@@ -4882,6 +4917,31 @@ mod tests {
         // Unrelated CPU-blit-path errors are not a zero-copy signal either.
         assert!(!prime_scanout_permanently_rejected(
             "display back-buffer unavailable"
+        ));
+
+        // Transient — `wait_page_flip` timed out waiting for
+        // DRM_EVENT_FLIP_COMPLETE (the older-NVIDIA-on-new-kernel "Flip
+        // event timeout on head 0" hiccup). Recovers on its own, so it
+        // must NOT latch a permanent demotion. These are the exact
+        // strings composed by `KmsDisplay::present_prime`.
+        assert!(!prime_scanout_permanently_rejected(
+            "display_prime_page_flip_failed: receive_events: display_flip_timeout: \
+             no page-flip completion within 500 ms"
+        ));
+        assert!(!prime_scanout_permanently_rejected(
+            "display_prime_page_flip_failed: receive_events (bars-retry): \
+             display_flip_timeout: no page-flip completion within 500 ms"
+        ));
+        assert!(!prime_scanout_permanently_rejected(
+            "display_prime_page_flip_failed: receive_events (yuv-overlay-retry): \
+             display_flip_timeout: no page-flip completion within 500 ms"
+        ));
+
+        // Permanent — the driver/plane combination refuses our property
+        // set outright. This is the one page-flip case that never
+        // recovers, so it MUST still demote.
+        assert!(prime_scanout_permanently_rejected(
+            "display_prime_page_flip_failed: atomic_commit: Invalid argument (os error 22)"
         ));
     }
 
