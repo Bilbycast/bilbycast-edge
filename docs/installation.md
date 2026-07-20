@@ -402,11 +402,15 @@ membership. Rockchip's MPP device registers under its own char-major class —
 unit that doesn't explicitly allow it blocks RKMPP even with `/dev/mpp_service`
 world-writable and the user correctly in `video`: `avcodec_open2` fails with
 `Failed to initialize MPP context (-1)`. The unit installed by `install-edge.sh`
-already includes `DeviceAllow=char-mpp_service rwm`. If you're running a custom
-unit or one built before this was added, add:
+already includes `DeviceAllow=/dev/mpp_service rwm` (the path form — `mpp_service`
+has its own dedicated major so the `char-mpp_service` class form also resolves,
+but the path form is used for consistency with the RGA line below it, which
+*requires* the path form since RGA is a `misc`-class device shared with many
+unrelated drivers). If you're running a custom unit or one built before this
+was added, add:
 
 ```ini
-DeviceAllow=char-mpp_service rwm
+DeviceAllow=/dev/mpp_service rwm
 ```
 
 then `sudo systemctl daemon-reload && sudo systemctl restart bilbycast-edge`.
