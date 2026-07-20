@@ -589,6 +589,24 @@ pub struct DisplayStatsCounters {
     /// `decode_us_total`.
     pub decode_count: AtomicU64,
 
+    /// Largest single `avcodec_receive_frame` call duration since
+    /// startup, in µs — the raw decoder-library frame fetch, diagnostic
+    /// companion to `decode_us_max` that excludes our own
+    /// post-processing (RKMPP's DRM_PRIME→sysmem transfer below, plane
+    /// copies, etc.). Temporary instrumentation added while
+    /// investigating RKMPP display-output stutter — isolates "MPP
+    /// itself stalled" from "our transfer stalled".
+    pub receive_frame_us_max: AtomicU64,
+    pub receive_frame_us_total: AtomicU64,
+    pub receive_frame_count: AtomicU64,
+    /// Largest single RKMPP DRM_PRIME→sysmem `av_hwframe_transfer_data`
+    /// call duration since startup, in µs. Only incremented on frames
+    /// that actually took the RKMPP transfer path — `receive_frame_*`
+    /// above covers every backend, this is RKMPP-only.
+    pub rkmpp_transfer_us_max: AtomicU64,
+    pub rkmpp_transfer_us_total: AtomicU64,
+    pub rkmpp_transfer_count: AtomicU64,
+
     /// Latest video codec the demuxer surfaced on this output, encoded
     /// as a `DisplayCodecLabel` discriminant. Updated on every received
     /// video frame so a mid-stream input switch (H.264 → HEVC) refreshes
@@ -1267,6 +1285,18 @@ impl OutputStatsAccumulator {
                 decode_us_avg: {
                     let total = h.counters.decode_us_total.load(Ordering::Relaxed);
                     let count = h.counters.decode_count.load(Ordering::Relaxed);
+                    if count == 0 { 0 } else { total / count }
+                },
+                receive_frame_us_max: h.counters.receive_frame_us_max.load(Ordering::Relaxed),
+                receive_frame_us_avg: {
+                    let total = h.counters.receive_frame_us_total.load(Ordering::Relaxed);
+                    let count = h.counters.receive_frame_count.load(Ordering::Relaxed);
+                    if count == 0 { 0 } else { total / count }
+                },
+                rkmpp_transfer_us_max: h.counters.rkmpp_transfer_us_max.load(Ordering::Relaxed),
+                rkmpp_transfer_us_avg: {
+                    let total = h.counters.rkmpp_transfer_us_total.load(Ordering::Relaxed);
+                    let count = h.counters.rkmpp_transfer_count.load(Ordering::Relaxed);
                     if count == 0 { 0 } else { total / count }
                 },
             });

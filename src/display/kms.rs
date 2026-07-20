@@ -391,6 +391,21 @@ struct PlanePropIds {
     crtc_y: property::Handle,
     crtc_w: property::Handle,
     crtc_h: property::Handle,
+    /// `COLOR_ENCODING` / `COLOR_RANGE` — optional on most Intel/AMD
+    /// scanout planes (VAAPI's zero-copy path has shipped without ever
+    /// setting them), but some embedded VOP/VOP2-class drivers
+    /// (confirmed: RK3588 Rockchip VOP2 Cluster window) reject a YUV
+    /// PRIME framebuffer commit with EINVAL unless these are set
+    /// explicitly — RGB commits work fine without them, which is why
+    /// this was never needed before RKMPP's native NV12 zero-copy path.
+    /// `None` when the property doesn't exist on this plane (older
+    /// kernels / drivers that never require it); the resolved `*_value`
+    /// is the numeric enum ID for "ITU-R BT.709 YCbCr" /
+    /// "YCbCr limited range" looked up once at discovery time.
+    color_encoding: Option<property::Handle>,
+    color_encoding_value: u64,
+    color_range: Option<property::Handle>,
+    color_range_value: u64,
 }
 
 struct CrtcPropIds {
@@ -491,6 +506,35 @@ struct BarsOverlay {
     pixel_blend_coverage_value: u64,
 }
 
+/// Secondary content plane for zero-copy YUV PRIME scanout, adopted
+/// reactively when the primary plane permanently rejects a linear YUV
+/// framebuffer commit — confirmed on real RK3588 hardware: the VOP2
+/// "Cluster" window class (frequently the plane the kernel reports as
+/// `type=Primary`) accepts YUV **only** in AFBC-compressed form per the
+/// upstream kernel driver's own capability description ("Cluster
+/// windows: AFBC/line RGB and AFBC-only YUV support"), while "Esmart"
+/// windows support linear YUV directly. See
+/// [`KmsDisplay::try_promote_yuv_overlay`].
+///
+/// Unlike [`BarsOverlay`], this plane carries the actual video content
+/// (not a translucent overlay), so it needs `COLOR_ENCODING`/
+/// `COLOR_RANGE` resolved exactly like the primary plane's YUV path —
+/// and it has no ping-pong buffer state of its own, since every PRIME
+/// framebuffer is freshly imported per frame via `add_planar_framebuffer`
+/// (same as the primary-plane PRIME path).
+struct YuvOverlay {
+    plane: plane::Handle,
+    plane_props: PlanePropIds,
+    /// `Some` only when `zpos` exists and is mutable — writes
+    /// `zpos_value` so this plane composes ABOVE the primary plane's
+    /// stale dumb-buffer content underneath it. `None` when the driver
+    /// pins zpos (the pinned value already being above primary is
+    /// assumed rather than re-verified, mirroring
+    /// [`BarsOverlay::zpos`]'s immutable-and-compatible case).
+    zpos: Option<property::Handle>,
+    zpos_value: u64,
+}
+
 /// Holder for the active KMS master + double-buffered framebuffers.
 /// One per display output. Created by `output_display` after mode-set;
 /// owns the lifetime of the dumb buffers and the CRTC lease.
@@ -511,6 +555,18 @@ pub struct KmsDisplay {
     /// completes, eliminating the green-flash / stuck-frame artefacts
     /// the VA pool causes when surfaces recycle mid-scanout.
     prime_state: Option<PrimeState>,
+    /// Imported-framebuffer cache keyed by [`dmabuf_identity`] — see
+    /// [`PrimeFbCacheEntry`]. Avoids re-running `prime_fd_to_buffer` +
+    /// `add_planar_framebuffer` for a decode buffer this session has
+    /// already imported (RKMPP recycles a fixed ≤16-buffer pool;
+    /// confirmed on RK3588 that skipping the redundant re-import here
+    /// eliminates the dominant per-frame cost on the zero-copy PRIME
+    /// path — average `present_prime` time dropped from double-digit
+    /// milliseconds to sub-millisecond).
+    prime_fb_cache: std::collections::HashMap<(u64, u64), PrimeFbCacheEntry>,
+    /// Insertion order for [`Self::prime_fb_cache`]'s FIFO eviction —
+    /// see [`PRIME_FB_CACHE_CAPACITY`].
+    prime_fb_cache_order: std::collections::VecDeque<(u64, u64)>,
     /// Atomic-commit page-flip state. `None` until the first PRIME
     /// present, which discovers the primary plane + caches property
     /// IDs. `use_atomic` flips to `false` (and stays there) on
@@ -564,6 +620,22 @@ pub struct KmsDisplay {
     /// bars plane retries once per `BARS_REHEAL_COOLDOWN`, not per
     /// frame.
     bars_overlay_lost_at: Option<std::time::Instant>,
+    /// Secondary NV12-capable plane, adopted reactively after the
+    /// primary plane permanently rejects a linear YUV PRIME commit.
+    /// `None` until (if ever) [`Self::try_promote_yuv_overlay`]
+    /// succeeds; once `Some`, every subsequent YUV `atomic_present`
+    /// call targets this plane instead of the primary. See
+    /// [`YuvOverlay`]'s doc comment for the RK3588 Cluster/Esmart
+    /// background.
+    yuv_overlay: Option<YuvOverlay>,
+    /// Whether [`Self::try_promote_yuv_overlay`] has already been
+    /// attempted this session — attempted at most once, on the first
+    /// permanent primary-plane YUV rejection, regardless of outcome.
+    /// Prevents re-running plane discovery on every subsequent frame
+    /// when no suitable secondary plane exists (the VAAPI/Intel/AMD
+    /// case, where the primary plane's rejection means something else
+    /// entirely and promotion would never succeed).
+    yuv_overlay_promotion_attempted: bool,
     /// Currently-programmed HDR output metadata. The next atomic
     /// commit writes this onto the connector's `HDR_OUTPUT_METADATA`
     /// property. `None` when SDR (the connector is unset by writing
@@ -763,6 +835,8 @@ impl KmsDisplay {
             bufs: [a, b],
             front_idx: 0,
             prime_state: None,
+            prime_fb_cache: std::collections::HashMap::new(),
+            prime_fb_cache_order: std::collections::VecDeque::new(),
             use_atomic,
             atomic: atomic_setup,
             atomic_ever_succeeded: false,
@@ -772,6 +846,8 @@ impl KmsDisplay {
             bars_overlay: None,
             bars_overlay_wanted: false,
             bars_overlay_lost_at: None,
+            yuv_overlay: None,
+            yuv_overlay_promotion_attempted: false,
             hdr_state: None,
             hdr_dirty: false,
         })
@@ -990,6 +1066,90 @@ impl KmsDisplay {
             zpos_value,
             pixel_blend_mode,
             pixel_blend_coverage_value,
+        });
+        Ok(())
+    }
+
+    /// Attempt to adopt a secondary Overlay-class plane advertising
+    /// native NV12 support for the zero-copy YUV PRIME content path,
+    /// in place of the primary plane. Called reactively, at most once
+    /// per session, by `present_prime` the first time the primary
+    /// plane's atomic commit permanently rejects a linear YUV
+    /// framebuffer — see [`YuvOverlay`]'s doc comment for why this is
+    /// needed on RK3588 (Cluster windows: AFBC-only YUV) and why it's
+    /// safe to leave unused on hosts where the primary plane already
+    /// accepts YUV directly (VAAPI on Intel/AMD, proven over many
+    /// prior releases — this path is never even attempted there,
+    /// since it only runs after a primary-plane failure that those
+    /// hosts don't produce).
+    ///
+    /// On success, every subsequent `atomic_present(..., is_yuv=true)`
+    /// call targets the adopted plane automatically (see its
+    /// content-plane selection logic) — no further calls to this
+    /// method are needed. On failure (no suitable plane — e.g. VAAPI/
+    /// Intel/AMD hosts, where the primary plane's rejection means
+    /// something else entirely), the caller falls through to the
+    /// existing sysmem CPU-blit demotion exactly as before this
+    /// method existed.
+    fn try_promote_yuv_overlay(&mut self) -> Result<()> {
+        // SAFETY GATE (2026-07-19): disabled by default pending further
+        // investigation. On the RK3588 NanoPi R6S hardware this method
+        // was built for, promoting to the Esmart plane was confirmed via
+        // kernel/user tracing to add ~100-120 ms of fixed extra glass-
+        // to-glass latency versus the primary/Cluster plane (root cause
+        // of a ~66% dropped-frame rate — see the display-output-stutter
+        // investigation notes). A one-time auto-calibration was built to
+        // correct that latency and verified mathematically correct
+        // (av_sync_offset settled to single-digit ms), but on hardware
+        // testing WITH a human watching the physical screen — the first
+        // time anyone had, every earlier check relied on stats alone —
+        // the display went solid black (HDMI signal held, zero errors
+        // logged, `frames_displayed` climbing normally, and the DRM
+        // debugfs plane state looked entirely correct: right
+        // framebuffer, right format, right z-order, active CRTC).
+        // Stats cannot detect this failure mode, so its true root cause
+        // — and whether it also affects the plain (uncalibrated)
+        // promotion path — is unconfirmed. Left in place for a future
+        // session with HDMI capture-device tooling; not safe to enable
+        // without it. Flip this to `true` (or thread a real opt-in
+        // config flag) only after that hardware verification.
+        const YUV_OVERLAY_PROMOTION_ENABLED: bool = false;
+        if !YUV_OVERLAY_PROMOTION_ENABLED {
+            anyhow::bail!("yuv-overlay promotion disabled pending hardware verification (see comment)");
+        }
+        if self.yuv_overlay.is_some() {
+            return Ok(());
+        }
+        if !self.use_atomic {
+            anyhow::bail!("yuv-overlay promotion needs atomic_commit");
+        }
+        let primary_plane = self
+            .atomic
+            .as_ref()
+            .map(|a| a.plane)
+            .context("yuv-overlay promotion requires atomic setup to already exist")?;
+        let mut exclude = vec![primary_plane];
+        if let Some(bars) = &self.bars_overlay {
+            exclude.push(bars.plane);
+        }
+        let (plane_h, plane_props) = discover_yuv_overlay_plane(&self.card, self.crtc, &exclude)
+            .context("yuv-overlay plane discovery")?;
+        let (zpos, zpos_value) = discover_yuv_overlay_zpos(&self.card, plane_h, primary_plane)
+            .context("yuv-overlay zpos discovery")?;
+        tracing::info!(
+            plane = format!("{:?}", plane_h),
+            primary_plane = format!("{:?}", primary_plane),
+            zpos_write_armed = zpos.is_some(),
+            zpos_value,
+            "display: promoted zero-copy YUV scanout to a secondary NV12-capable plane — \
+             the primary plane rejected linear YUV (expected on Rockchip VOP2 boards whose \
+             Cluster-class primary window is AFBC-only for YUV)"
+        );
+        self.yuv_overlay = Some(YuvOverlay {
+            plane: plane_h,
+            plane_props,
+            zpos,
+            zpos_value,
         });
         Ok(())
     }
@@ -1477,7 +1637,7 @@ impl KmsDisplay {
         let new_fb = self.bufs[back_idx].fb;
         let width = self.width;
         let height = self.height;
-        match self.atomic_present(new_fb, width, height) {
+        match self.atomic_present(new_fb, width, height, false) {
             Ok(()) => {
                 self.wait_page_flip()
                     .context("display_page_flip_failed: receive_events")?;
@@ -1539,7 +1699,7 @@ impl KmsDisplay {
                     );
                     self.disable_bars_overlay();
                     self.invalidate_atomic_modeset();
-                    match self.atomic_present(new_fb, width, height) {
+                    match self.atomic_present(new_fb, width, height, false) {
                         Ok(()) => {
                             self.wait_page_flip()
                                 .context("display_page_flip_failed: receive_events (bars-retry)")?;
@@ -2075,6 +2235,12 @@ fn discover_atomic_setup(
         "CRTC_H",
     ];
     let p = collect_props(card, plane_h, &plane_names)?;
+    let color_encoding = optional_prop(card, plane_h, "COLOR_ENCODING")?;
+    let color_encoding_value =
+        read_enum_value(card, plane_h, "COLOR_ENCODING", "ITU-R BT.709 YCbCr").unwrap_or(0);
+    let color_range = optional_prop(card, plane_h, "COLOR_RANGE")?;
+    let color_range_value =
+        read_enum_value(card, plane_h, "COLOR_RANGE", "YCbCr limited range").unwrap_or(0);
     let plane_props = PlanePropIds {
         fb_id: p[0],
         crtc_id: p[1],
@@ -2086,6 +2252,10 @@ fn discover_atomic_setup(
         crtc_y: p[7],
         crtc_w: p[8],
         crtc_h: p[9],
+        color_encoding,
+        color_encoding_value,
+        color_range,
+        color_range_value,
     };
 
     let c = collect_props(card, crtc, &["MODE_ID", "ACTIVE"])?;
@@ -2179,6 +2349,12 @@ fn discover_bars_overlay_plane(
         crtc_y: p[7],
         crtc_w: p[8],
         crtc_h: p[9],
+        // The bars overlay is always ARGB8888 — never YUV — so these
+        // are never read (see the `is_yuv` gate in `atomic_present`).
+        color_encoding: None,
+        color_encoding_value: 0,
+        color_range: None,
+        color_range_value: 0,
     };
     Ok((plane_h, plane_props, plane_type_name))
 }
@@ -2265,6 +2441,113 @@ fn discover_bars_overlay_blend_props(
     Ok((zpos, zpos_value, pixel_blend_mode, coverage_value))
 }
 
+/// Search for an additional plane (beyond `exclude`) drivable from
+/// `crtc` that natively advertises `NV12` — the secondary content
+/// plane [`KmsDisplay::try_promote_yuv_overlay`] adopts when the
+/// primary plane permanently rejects linear YUV (confirmed: RK3588
+/// VOP2 Cluster windows, AFBC-only for YUV; Esmart windows support
+/// linear YUV directly and report `type=Overlay`, indistinguishable
+/// by type alone from a bars-overlay ARGB8888 candidate — hence the
+/// explicit NV12 format-list filter here rather than reusing
+/// [`discover_bars_overlay_plane`]'s type-based search).
+///
+/// Unlike the bars-overlay search, this resolves `COLOR_ENCODING`/
+/// `COLOR_RANGE` too — this plane carries real YUV pixel data, not a
+/// translucent ARGB8888 strip, so it needs the same colorimetry
+/// properties the primary plane's YUV path already sets.
+fn discover_yuv_overlay_plane(
+    card: &CardFile,
+    crtc: drm::control::crtc::Handle,
+    exclude: &[plane::Handle],
+) -> Result<(plane::Handle, PlanePropIds)> {
+    let res = card
+        .resource_handles()
+        .context("resource_handles for yuv-overlay discovery")?;
+    let planes = card
+        .plane_handles()
+        .context("plane_handles for yuv-overlay discovery")?;
+    let nv12 = DrmFourcc::Nv12 as u32;
+    let mut found: Option<plane::Handle> = None;
+    for p in planes {
+        if exclude.contains(&p) {
+            continue;
+        }
+        let info = card.get_plane(p).context("get_plane (yuv-overlay search)")?;
+        if !res.filter_crtcs(info.possible_crtcs()).iter().any(|c| *c == crtc) {
+            continue;
+        }
+        if !info.formats().iter().any(|f| *f == nv12) {
+            continue;
+        }
+        if read_plane_type(card, p)? == PlaneType::Overlay as u64 {
+            found = Some(p);
+            break;
+        }
+    }
+    let plane_h = found.context(
+        "no additional Overlay-type plane drivable from this CRTC advertises NV12 — \
+         no zero-copy fallback plane available on this host",
+    )?;
+    let names = [
+        "FB_ID", "CRTC_ID", "SRC_X", "SRC_Y", "SRC_W", "SRC_H", "CRTC_X", "CRTC_Y", "CRTC_W",
+        "CRTC_H",
+    ];
+    let p = collect_props(card, plane_h, &names)?;
+    let color_encoding = optional_prop(card, plane_h, "COLOR_ENCODING")?;
+    let color_encoding_value =
+        read_enum_value(card, plane_h, "COLOR_ENCODING", "ITU-R BT.709 YCbCr").unwrap_or(0);
+    let color_range = optional_prop(card, plane_h, "COLOR_RANGE")?;
+    let color_range_value =
+        read_enum_value(card, plane_h, "COLOR_RANGE", "YCbCr limited range").unwrap_or(0);
+    let plane_props = PlanePropIds {
+        fb_id: p[0],
+        crtc_id: p[1],
+        src_x: p[2],
+        src_y: p[3],
+        src_w: p[4],
+        src_h: p[5],
+        crtc_x: p[6],
+        crtc_y: p[7],
+        crtc_w: p[8],
+        crtc_h: p[9],
+        color_encoding,
+        color_encoding_value,
+        color_range,
+        color_range_value,
+    };
+    Ok((plane_h, plane_props))
+}
+
+/// Resolve the optional `zpos` property on a just-discovered
+/// yuv-overlay plane, so it composes ABOVE the primary plane's stale
+/// dumb-buffer content underneath it. Simplified sibling of
+/// [`discover_bars_overlay_blend_props`] — no `pixel blend mode`
+/// needed since YUV content is always fully opaque (no alpha plane),
+/// unlike the bars overlay's ARGB8888 strip.
+fn discover_yuv_overlay_zpos(
+    card: &CardFile,
+    yuv_plane: plane::Handle,
+    primary_plane: plane::Handle,
+) -> Result<(Option<property::Handle>, u64)> {
+    let primary_zpos = read_property_u64(card, primary_plane, "zpos").unwrap_or(0);
+    let zpos_value = primary_zpos.saturating_add(1);
+    let zpos = match optional_prop_state(card, yuv_plane, "zpos")? {
+        None => None,
+        Some((handle, true, _current)) => Some(handle),
+        Some((_handle, false, current)) => {
+            if current > primary_zpos {
+                None
+            } else {
+                anyhow::bail!(
+                    "yuv-overlay plane zpos is immutable at {current} (primary zpos \
+                     {primary_zpos}) — plane would composite under the primary"
+                );
+            }
+        }
+    };
+    Ok((zpos, zpos_value))
+}
+
 /// Read a u64-valued property by name, returning `None` when the
 /// property is absent on the object. Used to snapshot the primary
 /// plane's `zpos` so the bars plane can be ordered above it.
@@ -2282,6 +2565,27 @@ fn read_property_u64(
         }
     }
     None
+}
+
+/// `true` for the YUV/semi-planar fourccs bilbycast-edge's zero-copy
+/// PRIME paths (VAAPI, RKMPP) actually produce. Drives whether
+/// `COLOR_ENCODING` / `COLOR_RANGE` plane properties get set on an
+/// atomic commit — see [`PlanePropIds::color_encoding`].
+fn fourcc_is_yuv(fourcc: DrmFourcc) -> bool {
+    matches!(
+        fourcc,
+        DrmFourcc::Nv12
+            | DrmFourcc::Nv21
+            | DrmFourcc::Nv16
+            | DrmFourcc::Nv61
+            | DrmFourcc::Nv24
+            | DrmFourcc::Nv42
+            | DrmFourcc::P010
+            | DrmFourcc::P016
+            | DrmFourcc::P210
+            | DrmFourcc::Yuyv
+            | DrmFourcc::Uyvy
+    )
 }
 
 /// Resolve an enum value by name on a property. KMS enum values are
@@ -2475,19 +2779,57 @@ impl PlanarBuffer for PrimePlanarBuffer {
     }
 }
 
-/// State retained across `present_prime` calls — the previous frame's
-/// KMS framebuffer + its source-frame keepalive. Released only when the
-/// *next* page-flip completes (the kernel keeps the previous FB live
-/// until the new one has been fully scanned out at least once, and
-/// VAAPI surfaces stay valid across exactly that boundary).
+/// State retained across `present_prime` calls — the in-flight frame's
+/// source-frame keepalive. Released only when the *next* page-flip
+/// completes (the kernel keeps the previous scanout source live until
+/// the new one has been fully scanned out at least once, and VAAPI /
+/// RKMPP frames stay valid across exactly that boundary). The KMS
+/// framebuffer *object* itself is no longer tracked here — see
+/// [`PrimeFbCacheEntry`]; its lifetime is cache-managed instead of
+/// per-frame-transition-managed.
 #[derive(Default)]
 struct PrimeState {
-    /// FB-id of the framebuffer the kernel is currently scanning out.
-    /// We never destroy the in-flight FB; instead we destroy the
-    /// **previous** FB after the new flip completes.
-    in_flight_fb: Option<framebuffer::Handle>,
-    /// Keepalive on the in-flight VAAPI surface.
+    /// Keepalive on the in-flight decoded frame (VAAPI surface or
+    /// RKMPP DRM_PRIME frame).
     in_flight_keepalive: Option<Arc<dyn PrimeKeepalive>>,
+}
+
+/// Generous headroom above RKMPP's fixed 16-buffer decode pool
+/// (`FRAMEGROUP_MAX_FRAMES` in FFmpeg's `rkmppdec.c`) — in steady-state
+/// playback every recurring buffer fits without ever evicting;
+/// eviction only engages across a decoder restart that introduces new
+/// underlying buffer objects (a resolution change, or a fresh decoder
+/// open after a source switch).
+const PRIME_FB_CACHE_CAPACITY: usize = 32;
+
+/// Cached KMS framebuffer for a PRIME import, keyed by the underlying
+/// DMA-BUF's kernel identity — see [`dmabuf_identity`] and
+/// [`KmsDisplay::prime_fb_cache`].
+struct PrimeFbCacheEntry {
+    fb: framebuffer::Handle,
+    width: u32,
+    height: u32,
+    fourcc: DrmFourcc,
+    modifier: Option<DrmModifier>,
+}
+
+/// Kernel-stable identity of the underlying DMA-BUF behind `fd`, used
+/// to recognise "this is the same physical decode buffer as a
+/// previous frame" even when the exporting decoder hands back a
+/// freshly `dup()`'d fd number each time. `(st_dev, st_ino)` is the
+/// standard way Linux identifies the same underlying file/object
+/// across different fds (the same technique `lsof` and friends use) —
+/// a DMA-BUF is backed by an anonymous inode that `fstat` reports
+/// consistently for the life of the buffer object.
+fn dmabuf_identity(fd: i32) -> Option<(u64, u64)> {
+    unsafe {
+        let mut st: libc::stat = std::mem::zeroed();
+        if libc::fstat(fd, &mut st) == 0 {
+            Some((st.st_dev as u64, st.st_ino as u64))
+        } else {
+            None
+        }
+    }
 }
 
 /// `DRM_FORMAT_MOD_INVALID` — sentinel returned by VAAPI drivers when
@@ -2587,62 +2929,117 @@ impl KmsDisplay {
             Some(DrmModifier::from(modifier_raw))
         };
 
-        // Import every distinct DMA-BUF fd into a per-card GEM handle.
-        // The VAAPI mapping packs every plane into one fd, but we
-        // dedup defensively in case a future driver returns a multi-fd
-        // descriptor (Intel iHD has been known to do this for P010
-        // when the chroma plane lives on a separate object).
-        let mut handles: [Option<drm::buffer::Handle>; 4] = [None; 4];
-        let mut pitches: [u32; 4] = [0; 4];
-        let mut offsets: [u32; 4] = [0; 4];
+        // Check the import cache first — a decoder buffer pool recycles
+        // a small fixed set of underlying DMA-BUFs (RKMPP: ≤16), and
+        // re-running `prime_fd_to_buffer` + `add_planar_framebuffer`
+        // for the SAME underlying buffer on every recurrence is real,
+        // measurable overhead on some drivers: confirmed on RK3588,
+        // where skipping it here dropped average `present_prime` cost
+        // from double-digit milliseconds (swamping the 41.6ms/frame
+        // budget at 24fps) to sub-millisecond. GStreamer's kmssink uses
+        // the identical pattern for the identical reason. VAAPI's
+        // zero-copy path on Intel/AMD already presents fast without
+        // this (a cache hit there is just a cheap lookup instead of a
+        // cheap import — no measurable difference), so this applies
+        // universally rather than being gated to any one backend.
+        let cache_key = descriptor.planes.first().and_then(|p| dmabuf_identity(p.fd));
+        let cached_fb = cache_key.and_then(|key| self.prime_fb_cache.get(&key)).and_then(|e| {
+            (e.width == descriptor.width
+                && e.height == descriptor.height
+                && e.fourcc == fourcc
+                && e.modifier == modifier)
+                .then_some(e.fb)
+        });
+        let new_fb = if let Some(fb) = cached_fb {
+            fb
+        } else {
+            // Import every distinct DMA-BUF fd into a per-card GEM handle.
+            // The VAAPI mapping packs every plane into one fd, but we
+            // dedup defensively in case a future driver returns a multi-fd
+            // descriptor (Intel iHD has been known to do this for P010
+            // when the chroma plane lives on a separate object).
+            let mut handles: [Option<drm::buffer::Handle>; 4] = [None; 4];
+            let mut pitches: [u32; 4] = [0; 4];
+            let mut offsets: [u32; 4] = [0; 4];
 
-        for (i, plane) in descriptor.planes.iter().enumerate() {
-            if i >= 4 {
-                anyhow::bail!(
-                    "display_prime_invalid: too many planes ({})",
-                    descriptor.planes.len()
+            for (i, plane) in descriptor.planes.iter().enumerate() {
+                if i >= 4 {
+                    anyhow::bail!(
+                        "display_prime_invalid: too many planes ({})",
+                        descriptor.planes.len()
+                    );
+                }
+                // SAFETY: descriptor.planes[i].fd is owned by the
+                // `keepalive` Arc; the borrowed FD here lives only across
+                // this call to `prime_fd_to_buffer`, which dups the fd
+                // internally on the kernel side via the PRIME ioctl.
+                let borrowed = unsafe {
+                    std::os::fd::BorrowedFd::borrow_raw(plane.fd)
+                };
+                let handle = self
+                    .card
+                    .prime_fd_to_buffer(borrowed)
+                    .with_context(|| {
+                        format!(
+                            "display_prime_addfb_failed: prime_fd_to_buffer for plane {} (fd={})",
+                            i, plane.fd
+                        )
+                    })?;
+                handles[i] = Some(handle);
+                pitches[i] = plane.pitch;
+                offsets[i] = plane.offset;
+            }
+
+            let buf = PrimePlanarBuffer {
+                width: descriptor.width,
+                height: descriptor.height,
+                fourcc,
+                modifier,
+                handles,
+                pitches,
+                offsets,
+            };
+
+            let flags = if modifier.is_some() {
+                FbCmd2Flags::MODIFIERS
+            } else {
+                FbCmd2Flags::empty()
+            };
+            let fb = self
+                .card
+                .add_planar_framebuffer(&buf, flags)
+                .context("display_prime_addfb_failed: add_planar_framebuffer")?;
+            if let Some(key) = cache_key {
+                if let Some(old) = self.prime_fb_cache.remove(&key) {
+                    // Format changed for a recurring buffer object
+                    // (rare — e.g. a decoder resolution change reusing
+                    // the same underlying DMA-BUF). Destroy the stale
+                    // entry and drop its order-queue slot so eviction
+                    // bookkeeping stays consistent.
+                    let _ = self.card.destroy_framebuffer(old.fb);
+                    self.prime_fb_cache_order.retain(|k| *k != key);
+                }
+                if self.prime_fb_cache.len() >= PRIME_FB_CACHE_CAPACITY {
+                    if let Some(oldest_key) = self.prime_fb_cache_order.pop_front() {
+                        if let Some(evicted) = self.prime_fb_cache.remove(&oldest_key) {
+                            let _ = self.card.destroy_framebuffer(evicted.fb);
+                        }
+                    }
+                }
+                self.prime_fb_cache_order.push_back(key);
+                self.prime_fb_cache.insert(
+                    key,
+                    PrimeFbCacheEntry {
+                        fb,
+                        width: descriptor.width,
+                        height: descriptor.height,
+                        fourcc,
+                        modifier,
+                    },
                 );
             }
-            // SAFETY: descriptor.planes[i].fd is owned by the
-            // `keepalive` Arc; the borrowed FD here lives only across
-            // this call to `prime_fd_to_buffer`, which dups the fd
-            // internally on the kernel side via the PRIME ioctl.
-            let borrowed = unsafe {
-                std::os::fd::BorrowedFd::borrow_raw(plane.fd)
-            };
-            let handle = self
-                .card
-                .prime_fd_to_buffer(borrowed)
-                .with_context(|| {
-                    format!(
-                        "display_prime_addfb_failed: prime_fd_to_buffer for plane {} (fd={})",
-                        i, plane.fd
-                    )
-                })?;
-            handles[i] = Some(handle);
-            pitches[i] = plane.pitch;
-            offsets[i] = plane.offset;
-        }
-
-        let buf = PrimePlanarBuffer {
-            width: descriptor.width,
-            height: descriptor.height,
-            fourcc,
-            modifier,
-            handles,
-            pitches,
-            offsets,
+            fb
         };
-
-        let flags = if modifier.is_some() {
-            FbCmd2Flags::MODIFIERS
-        } else {
-            FbCmd2Flags::empty()
-        };
-        let new_fb = self
-            .card
-            .add_planar_framebuffer(&buf, flags)
-            .context("display_prime_addfb_failed: add_planar_framebuffer")?;
 
         // Promote the new prime FB onto the CRTC.
         //
@@ -2688,7 +3085,7 @@ impl KmsDisplay {
         }
 
         if self.use_atomic && self.atomic.is_some() {
-            match self.atomic_present(new_fb, descriptor.width, descriptor.height) {
+            match self.atomic_present(new_fb, descriptor.width, descriptor.height, fourcc_is_yuv(fourcc)) {
                 Ok(()) => {
                     // Wait for the kernel-posted `DRM_EVENT_FLIP_COMPLETE`
                     // for our CRTC so the next iteration can safely
@@ -2746,7 +3143,7 @@ impl KmsDisplay {
                         );
                         self.disable_bars_overlay();
                         self.invalidate_atomic_modeset();
-                        match self.atomic_present(new_fb, descriptor.width, descriptor.height) {
+                        match self.atomic_present(new_fb, descriptor.width, descriptor.height, fourcc_is_yuv(fourcc)) {
                             Ok(()) => {
                                 if let Err(e2) = self.wait_page_flip() {
                                     let _ = self.card.destroy_framebuffer(new_fb);
@@ -2760,6 +3157,60 @@ impl KmsDisplay {
                                 return Err(anyhow::anyhow!(
                                     "display_prime_page_flip_failed: atomic_commit \
                                      (also failed without bars): {retry_err:?}"
+                                ));
+                            }
+                        }
+                    } else if fourcc_is_yuv(fourcc)
+                        && self.yuv_overlay.is_none()
+                        && !self.yuv_overlay_promotion_attempted
+                    {
+                        // Primary plane permanently rejected linear YUV.
+                        // Try adopting a secondary NV12-capable plane
+                        // ONCE (see `try_promote_yuv_overlay`'s doc
+                        // comment) before giving up on zero-copy
+                        // entirely for this session. On VAAPI/Intel/AMD
+                        // hosts (where the primary plane's rejection
+                        // means something unrelated) promotion finds no
+                        // suitable plane and this falls through to the
+                        // exact same error path as before this existed.
+                        self.yuv_overlay_promotion_attempted = true;
+                        match self.try_promote_yuv_overlay() {
+                            Ok(()) => {
+                                self.invalidate_atomic_modeset();
+                                match self.atomic_present(
+                                    new_fb,
+                                    descriptor.width,
+                                    descriptor.height,
+                                    true,
+                                ) {
+                                    Ok(()) => {
+                                        if let Err(e2) = self.wait_page_flip() {
+                                            let _ = self.card.destroy_framebuffer(new_fb);
+                                            return Err(e2.context(
+                                                "display_prime_page_flip_failed: receive_events (yuv-overlay-retry)",
+                                            ));
+                                        }
+                                    }
+                                    Err(retry_err) => {
+                                        // Secondary plane ALSO rejected it — don't
+                                        // keep retrying a broken plane every frame.
+                                        self.yuv_overlay = None;
+                                        let _ = self.card.destroy_framebuffer(new_fb);
+                                        return Err(anyhow::anyhow!(
+                                            "display_prime_page_flip_failed: atomic_commit \
+                                             (also failed on secondary NV12 plane): {retry_err:?}"
+                                        ));
+                                    }
+                                }
+                            }
+                            Err(promote_err) => {
+                                tracing::debug!(
+                                    "display: no secondary NV12-capable plane available \
+                                     ({promote_err:#}) — falling back to sysmem"
+                                );
+                                let _ = self.card.destroy_framebuffer(new_fb);
+                                return Err(anyhow::anyhow!(
+                                    "display_prime_page_flip_failed: atomic_commit: {msg}"
                                 ));
                             }
                         }
@@ -2785,12 +3236,13 @@ impl KmsDisplay {
         // drops it on a side task to keep the per-frame budget tight
         // (`av_frame_free` can take ~1 ms on the first call after a
         // session warmup).
+        // `new_fb`'s object lifetime is cache-managed (see
+        // `prime_fb_cache` above) rather than destroyed on every frame
+        // transition — only `in_flight_keepalive` (the underlying
+        // decoded-frame memory, which really does need the one-frame-
+        // delayed release) still needs per-transition bookkeeping here.
         let mut state = self.prime_state.take().unwrap_or_default();
         let prev_keepalive = state.in_flight_keepalive.take();
-        if let Some(prev_fb) = state.in_flight_fb.take() {
-            let _ = self.card.destroy_framebuffer(prev_fb);
-        }
-        state.in_flight_fb = Some(new_fb);
         state.in_flight_keepalive = Some(keepalive);
         self.prime_state = Some(state);
 
@@ -2809,6 +3261,7 @@ impl KmsDisplay {
         new_fb: framebuffer::Handle,
         src_w: u32,
         src_h: u32,
+        is_yuv: bool,
     ) -> std::result::Result<(), AtomicCommitError> {
         // Copy out every Copy field we need from `self.atomic` up-
         // front. This keeps the rest of the function free to take
@@ -2832,6 +3285,10 @@ impl KmsDisplay {
                     crtc_y: setup.plane_props.crtc_y,
                     crtc_w: setup.plane_props.crtc_w,
                     crtc_h: setup.plane_props.crtc_h,
+                    color_encoding: setup.plane_props.color_encoding,
+                    color_encoding_value: setup.plane_props.color_encoding_value,
+                    color_range: setup.plane_props.color_range,
+                    color_range_value: setup.plane_props.color_range_value,
                 },
                 CrtcPropIds {
                     mode_id: setup.crtc_props.mode_id,
@@ -2853,36 +3310,111 @@ impl KmsDisplay {
             self.commit_modeset_only(plane, &plane_props, &crtc_props, &connector_props)?;
         }
 
-        let pp = &plane_props;
+        // Choose which plane actually carries the FB_ID/CRTC_ID/SRC/CRTC
+        // content properties this commit. Normally that's the primary
+        // plane (`plane`/`plane_props`, unchanged from before) — for
+        // RGB dumb-buffer presents always, and for YUV PRIME presents
+        // on every host where the primary plane accepts YUV directly
+        // (VAAPI on Intel/AMD, proven over many prior releases). Once
+        // `try_promote_yuv_overlay` has adopted a secondary plane
+        // (RK3588 Cluster-window case), every YUV present targets it
+        // instead — the primary plane is left untouched by this commit,
+        // keeping whatever dumb-buffer FB it last had (occluded once
+        // the yuv-overlay plane's zpos places it on top).
+        let yuv_target = if is_yuv {
+            self.yuv_overlay.as_ref().map(|y| {
+                (
+                    y.plane,
+                    PlanePropIds {
+                        fb_id: y.plane_props.fb_id,
+                        crtc_id: y.plane_props.crtc_id,
+                        src_x: y.plane_props.src_x,
+                        src_y: y.plane_props.src_y,
+                        src_w: y.plane_props.src_w,
+                        src_h: y.plane_props.src_h,
+                        crtc_x: y.plane_props.crtc_x,
+                        crtc_y: y.plane_props.crtc_y,
+                        crtc_w: y.plane_props.crtc_w,
+                        crtc_h: y.plane_props.crtc_h,
+                        color_encoding: y.plane_props.color_encoding,
+                        color_encoding_value: y.plane_props.color_encoding_value,
+                        color_range: y.plane_props.color_range,
+                        color_range_value: y.plane_props.color_range_value,
+                    },
+                    y.zpos,
+                    y.zpos_value,
+                )
+            })
+        } else {
+            None
+        };
+        let (content_plane, cp, yuv_zpos, yuv_zpos_value) = match yuv_target {
+            Some((p, props, zpos, zpos_value)) => (p, props, zpos, zpos_value),
+            None => (plane, plane_props, None, 0),
+        };
+
+        let pp = &cp;
         let mut req = AtomicModeReq::new();
-        req.add_property(plane, pp.fb_id, property::Value::Framebuffer(Some(new_fb)));
-        req.add_property(plane, pp.crtc_id, property::Value::CRTC(Some(self.crtc)));
+        req.add_property(content_plane, pp.fb_id, property::Value::Framebuffer(Some(new_fb)));
+        req.add_property(content_plane, pp.crtc_id, property::Value::CRTC(Some(self.crtc)));
         // SRC rectangle: full source surface in 16.16 fixed-point.
-        req.add_property(plane, pp.src_x, property::Value::UnsignedRange(0));
-        req.add_property(plane, pp.src_y, property::Value::UnsignedRange(0));
+        req.add_property(content_plane, pp.src_x, property::Value::UnsignedRange(0));
+        req.add_property(content_plane, pp.src_y, property::Value::UnsignedRange(0));
         req.add_property(
-            plane,
+            content_plane,
             pp.src_w,
             property::Value::UnsignedRange((src_w as u64) << 16),
         );
         req.add_property(
-            plane,
+            content_plane,
             pp.src_h,
             property::Value::UnsignedRange((src_h as u64) << 16),
         );
         // CRTC rectangle: full destination panel.
-        req.add_property(plane, pp.crtc_x, property::Value::SignedRange(0));
-        req.add_property(plane, pp.crtc_y, property::Value::SignedRange(0));
+        req.add_property(content_plane, pp.crtc_x, property::Value::SignedRange(0));
+        req.add_property(content_plane, pp.crtc_y, property::Value::SignedRange(0));
         req.add_property(
-            plane,
+            content_plane,
             pp.crtc_w,
             property::Value::UnsignedRange(self.width as u64),
         );
         req.add_property(
-            plane,
+            content_plane,
             pp.crtc_h,
             property::Value::UnsignedRange(self.height as u64),
         );
+        // COLOR_ENCODING / COLOR_RANGE: required by some embedded
+        // VOP/VOP2-class drivers (confirmed: RK3588 Cluster window) to
+        // accept a YUV PRIME framebuffer commit — omitted for RGB since
+        // it's meaningless there and some drivers reject a COLOR_*
+        // property set on a non-YUV plane update. See the field doc on
+        // `PlanePropIds::color_encoding`.
+        if is_yuv {
+            if let Some(enc_prop) = pp.color_encoding {
+                req.add_property(
+                    content_plane,
+                    enc_prop,
+                    property::Value::UnsignedRange(pp.color_encoding_value),
+                );
+            }
+            if let Some(range_prop) = pp.color_range {
+                req.add_property(
+                    content_plane,
+                    range_prop,
+                    property::Value::UnsignedRange(pp.color_range_value),
+                );
+            }
+        }
+        // zpos for the secondary yuv-overlay plane, so it composes
+        // above the primary's stale dumb-buffer content underneath it.
+        // Not applicable when `content_plane == plane` (primary itself).
+        if let Some(zpos_prop) = yuv_zpos {
+            req.add_property(
+                content_plane,
+                zpos_prop,
+                property::Value::UnsignedRange(yuv_zpos_value),
+            );
+        }
         let _ = connector_props; // suppress unused warning; kept for symmetry with the other prop tables
         let _ = mode_blob_loaded;
 
@@ -3315,26 +3847,33 @@ impl KmsDisplay {
         }
     }
 
-    /// Flush any retained PRIME state — destroy the in-flight FB and
-    /// drop the keepalive. Idempotent: returns immediately when no
-    /// PRIME state is held, so the CPU-blit path can call this once
-    /// per frame without paying for a re-modeset every vblank.
+    /// Flush any retained PRIME state — destroy every cached imported
+    /// framebuffer and drop the in-flight keepalive. Idempotent: safe
+    /// to call every frame on the CPU-blit path without paying for a
+    /// re-modeset every vblank when there's nothing to release.
     ///
     /// Used on the runtime-demotion path: when sustained PRIME export
     /// failures push `output_display` from `vaapi-zerocopy` back to
     /// the CPU blit, the next blit calls this before writing the
     /// dumb-buffer fb so the scanout source is well-defined when
-    /// `present()` flips onto the dumb-buffer.
+    /// `present()` flips onto the dumb-buffer. We're leaving the PRIME
+    /// path for good on this decoder session at that point — a fresh
+    /// decoder open (input switch, resolution change) allocates its
+    /// own new buffer objects under fresh DMA-BUF identities anyway —
+    /// so every cached framebuffer is flushed here rather than left to
+    /// age out via `prime_fb_cache`'s normal FIFO eviction.
     pub fn release_prime_state(&mut self) {
+        for (_, entry) in self.prime_fb_cache.drain() {
+            let _ = self.card.destroy_framebuffer(entry.fb);
+        }
+        self.prime_fb_cache_order.clear();
+
         let Some(mut state) = self.prime_state.take() else {
             return;
         };
-        if state.in_flight_fb.is_none() && state.in_flight_keepalive.is_none() {
-            // Nothing to do — the slot was empty.
+        if state.in_flight_keepalive.is_none() {
+            // Nothing else to do — the slot was empty.
             return;
-        }
-        if let Some(fb) = state.in_flight_fb.take() {
-            let _ = self.card.destroy_framebuffer(fb);
         }
         state.in_flight_keepalive = None;
         // Re-arm the CRTC against the current dumb-buffer fb so the

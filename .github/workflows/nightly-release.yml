@@ -127,7 +127,7 @@ jobs:
             artifact_suffix: aarch64-linux-rockchip
             variant: full
             rkmpp: "true"
-            cargo_features: "video-encoder-x264 video-encoder-x265 video-encoder-rkmpp display mxl mxl-not-built sdi-decklink"
+            cargo_features: "video-encoder-x264 video-encoder-x265 video-encoder-rkmpp video-decoder-rkmpp display mxl mxl-not-built sdi-decklink"
     runs-on: ${{ matrix.runner }}
     steps:
       # Runs before any checkout / apt / x264-from-source / cargo, so a missing

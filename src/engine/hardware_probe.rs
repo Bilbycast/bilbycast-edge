@@ -240,6 +240,16 @@ pub struct HwDecoderSessionLimits {
     pub qsv_max_sessions_4k: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub vaapi_max_sessions_4k: Option<u32>,
+    /// RKMPP (Rockchip VPU) decoder session ceiling. Same vendor name
+    /// covers both directions (like QSV/VAAPI), but decode sessions live
+    /// on the same physical VPU as encode — this is a distinct probe
+    /// from [`HwSessionLimits::rkmpp_max_sessions`] (that one's the
+    /// encoder ceiling), not a shared counter. Older managers omit
+    /// these fields (serde skips `None`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rkmpp_max_sessions: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rkmpp_max_sessions_4k: Option<u32>,
 }
 
 impl HwDecoderSessionLimits {
@@ -250,6 +260,8 @@ impl HwDecoderSessionLimits {
             && self.nvdec_max_sessions_4k.is_none()
             && self.qsv_max_sessions_4k.is_none()
             && self.vaapi_max_sessions_4k.is_none()
+            && self.rkmpp_max_sessions.is_none()
+            && self.rkmpp_max_sessions_4k.is_none()
     }
 }
 
@@ -971,6 +983,31 @@ fn probe_decoder_session_limits(hw: &HwCodecCapability) -> HwDecoderSessionLimit
             }
         }
     }
+    if hw.h264_rkmpp || hw.hevc_rkmpp {
+        let probe_codec = if hw.h264_rkmpp { "h264_rkmpp" } else { "hevc_rkmpp" };
+        let n_1080p = video_engine::count_max_decoder_sessions(
+            probe_codec,
+            SESSION_PROBE_UPPER_BOUND,
+            video_engine::PROBE_WIDTH_1080P,
+            video_engine::PROBE_HEIGHT_1080P,
+        );
+        if n_1080p > 0 {
+            tracing::info!("rkmpp decoder 1080p session capacity probed: {n_1080p}");
+            out.rkmpp_max_sessions = Some(n_1080p);
+            if probe_4k {
+                let n_4k = video_engine::count_max_decoder_sessions(
+                    probe_codec,
+                    FOUR_K_UPPER_BOUND,
+                    video_engine::PROBE_WIDTH_4K,
+                    video_engine::PROBE_HEIGHT_4K,
+                );
+                if n_4k > 0 {
+                    tracing::info!("rkmpp decoder 4K session capacity probed: {n_4k}");
+                    out.rkmpp_max_sessions_4k = Some(n_4k);
+                }
+            }
+        }
+    }
     out
 }
 
@@ -1230,12 +1267,15 @@ fn probe_hw_decoders() -> HwCodecCapability {
         // VAAPI device twice in the probe.
         h264_vaapi: probe_runtime_vaapi_device(),
         hevc_vaapi: probe_runtime_vaapi_device(),
-        // RKMPP decode is not wired into a codec-selection path in this
-        // pass (the Rockchip VPU has capable h264/hevc/av1 decoders, but
-        // neither the transcode input-decode nor the display output selects
-        // rkmpp decode yet). Stubbed `false` like AMF on the decoder side.
-        h264_rkmpp: false,
-        hevc_rkmpp: false,
+        // RKMPP decode uses the same generic no-hwdevice probe path as
+        // NVDEC/QSV: `h264_rkmpp` / `hevc_rkmpp` are standalone named
+        // FFmpeg decoders (like the encoder side), producing sysmem NV12
+        // with no `AVHWDeviceContext`/`get_format` setup needed. Both the
+        // transcode input-decode path and the display output now select
+        // this backend via the Auto priority chain in
+        // `resolve_display_decoder` / `resolve_transcode_decoder`.
+        h264_rkmpp: probe_runtime_decoder("h264_rkmpp"),
+        hevc_rkmpp: probe_runtime_decoder("hevc_rkmpp"),
     }
 }
 
@@ -1863,6 +1903,10 @@ pub struct FlowCostPlan {
     /// VAAPI decoder sessions charged by HW-decoded `display` outputs
     /// resolved to VAAPI (Linux; AMD or Intel via libva).
     pub vaapi_decode_sessions: u32,
+    /// RKMPP (Rockchip VPU) decoder sessions charged by HW-decoded
+    /// `display` outputs resolved to RKMPP. Distinct from the encoder's
+    /// `rkmpp_sessions` — same physical VPU, independent accounting.
+    pub rkmpp_decode_sessions: u32,
     /// 4K-tier subset of decoder sessions. Display outputs don't
     /// carry an explicit source resolution at plan time, so today
     /// every HW-decoded display contributes to the 1080p tier and
@@ -1872,6 +1916,7 @@ pub struct FlowCostPlan {
     pub nvdec_sessions_4k: u32,
     pub qsv_decode_sessions_4k: u32,
     pub vaapi_decode_sessions_4k: u32,
+    pub rkmpp_decode_sessions_4k: u32,
 }
 
 /// Per-family hardware encoder session counts in active use across
@@ -1928,6 +1973,14 @@ pub struct HwSessionUsage {
     pub qsv_decode_in_use_4k: u32,
     #[serde(default, skip_serializing_if = "is_zero_u32")]
     pub vaapi_decode_in_use_4k: u32,
+    /// RKMPP (Rockchip VPU) decoder sessions in use across every flow.
+    /// QSV/VAAPI-style naming (one vendor name covers both directions),
+    /// not the NVENC/NVDEC split — `rkmpp_in_use` above is the encoder
+    /// counter, this is the independent decoder counter.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub rkmpp_decode_in_use: u32,
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub rkmpp_decode_in_use_4k: u32,
 }
 
 fn is_zero_u32(v: &u32) -> bool {
@@ -1984,6 +2037,11 @@ pub enum HwDecoderFamily {
     Nvdec,
     Qsv,
     Vaapi,
+    /// Rockchip MPP (RK3568 / RK3588 VPU). Same single family covers
+    /// both H.264 and HEVC, and both directions share the physical VPU
+    /// with the encoder side — but session accounting stays separate,
+    /// same as the encoder/decoder split for every other family here.
+    Rkmpp,
 }
 
 impl HwDecoderFamily {
@@ -2009,6 +2067,7 @@ impl HwDecoderFamily {
             HwDecodePreference::Nvdec => Some(HwDecoderFamily::Nvdec),
             HwDecodePreference::Qsv => Some(HwDecoderFamily::Qsv),
             HwDecodePreference::Vaapi => Some(HwDecoderFamily::Vaapi),
+            HwDecodePreference::Rkmpp => Some(HwDecoderFamily::Rkmpp),
         }
     }
 }
@@ -2123,6 +2182,7 @@ pub enum ResolvedDisplayDecoder {
     Nvdec,
     Qsv,
     Vaapi,
+    Rkmpp,
 }
 
 impl ResolvedDisplayDecoder {
@@ -2140,6 +2200,7 @@ impl ResolvedDisplayDecoder {
             ResolvedDisplayDecoder::Nvdec => Some(HwDecoderFamily::Nvdec),
             ResolvedDisplayDecoder::Qsv => Some(HwDecoderFamily::Qsv),
             ResolvedDisplayDecoder::Vaapi => Some(HwDecoderFamily::Vaapi),
+            ResolvedDisplayDecoder::Rkmpp => Some(HwDecoderFamily::Rkmpp),
         }
     }
 
@@ -2152,6 +2213,7 @@ impl ResolvedDisplayDecoder {
             ResolvedDisplayDecoder::Nvdec => video_engine::DecoderBackend::Nvdec,
             ResolvedDisplayDecoder::Qsv => video_engine::DecoderBackend::Qsv,
             ResolvedDisplayDecoder::Vaapi => video_engine::DecoderBackend::Vaapi,
+            ResolvedDisplayDecoder::Rkmpp => video_engine::DecoderBackend::Rkmpp,
         }
     }
 }
@@ -2173,17 +2235,20 @@ pub fn resolve_display_decoder(
     let nvdec_compiled = cfg!(feature = "video-decoder-nvdec");
     let qsv_compiled = cfg!(feature = "video-decoder-qsv");
     let vaapi_compiled = cfg!(feature = "video-decoder-vaapi");
+    let rkmpp_compiled = cfg!(feature = "video-decoder-rkmpp");
     let nvdec_ok = nvdec_compiled
         && caps.is_some_and(|c| c.hw_decoders.h264_nvenc || c.hw_decoders.hevc_nvenc);
     let qsv_ok = qsv_compiled
         && caps.is_some_and(|c| c.hw_decoders.h264_qsv || c.hw_decoders.hevc_qsv);
     let vaapi_ok = vaapi_compiled
         && caps.is_some_and(|c| c.hw_decoders.h264_vaapi || c.hw_decoders.hevc_vaapi);
+    let rkmpp_ok = rkmpp_compiled
+        && caps.is_some_and(|c| c.hw_decoders.h264_rkmpp || c.hw_decoders.hevc_rkmpp);
 
     match pref {
         HwDecodePreference::Cpu => Ok(ResolvedDisplayDecoder::Cpu),
         HwDecodePreference::Auto => {
-            // Auto priority: VAAPI ≻ NVDEC ≻ QSV ≻ CPU. With
+            // Auto priority: VAAPI ≻ NVDEC ≻ QSV ≻ RKMPP ≻ CPU. With
             // `drmModeAtomicCommit` driving the local-display
             // page-flip (see `display::kms::KmsDisplay::present_prime`),
             // cross-modifier flips between tiled NV12 / P010 surfaces
@@ -2198,14 +2263,18 @@ pub fn resolve_display_decoder(
             // convert, no dumb-buffer write. NVDEC and QSV remain Auto
             // fallbacks for hosts where atomic-commit is rejected (the
             // edge logs `display_atomic_unavailable` once and the
-            // present path stays on legacy `set_crtc`); CPU is the
-            // last-resort fallback.
+            // present path stays on legacy `set_crtc`); RKMPP only ever
+            // compiles on ARM Rockchip, where VAAPI/NVDEC/QSV are never
+            // available, so it slots in as that platform's only
+            // hardware option ahead of the CPU last resort.
             if vaapi_ok {
                 Ok(ResolvedDisplayDecoder::Vaapi)
             } else if nvdec_ok {
                 Ok(ResolvedDisplayDecoder::Nvdec)
             } else if qsv_ok {
                 Ok(ResolvedDisplayDecoder::Qsv)
+            } else if rkmpp_ok {
+                Ok(ResolvedDisplayDecoder::Rkmpp)
             } else {
                 Ok(ResolvedDisplayDecoder::Cpu)
             }
@@ -2241,6 +2310,17 @@ pub fn resolve_display_decoder(
                 Err(DecoderResolutionError::DriverMissing)
             } else {
                 Ok(ResolvedDisplayDecoder::Vaapi)
+            }
+        }
+        HwDecodePreference::Rkmpp => {
+            if !rkmpp_compiled {
+                Err(DecoderResolutionError::FeatureDisabled)
+            } else if caps.is_none() {
+                Err(DecoderResolutionError::ProbeUnavailable)
+            } else if !rkmpp_ok {
+                Err(DecoderResolutionError::DriverMissing)
+            } else {
+                Ok(ResolvedDisplayDecoder::Rkmpp)
             }
         }
     }
@@ -2280,12 +2360,15 @@ pub fn resolve_transcode_decoder(
     let nvdec_compiled = cfg!(feature = "video-decoder-nvdec");
     let qsv_compiled = cfg!(feature = "video-decoder-qsv");
     let vaapi_compiled = cfg!(feature = "video-decoder-vaapi");
+    let rkmpp_compiled = cfg!(feature = "video-decoder-rkmpp");
     let nvdec_ok = nvdec_compiled
         && caps.is_some_and(|c| c.hw_decoders.h264_nvenc || c.hw_decoders.hevc_nvenc);
     let qsv_ok = qsv_compiled
         && caps.is_some_and(|c| c.hw_decoders.h264_qsv || c.hw_decoders.hevc_qsv);
     let vaapi_ok = vaapi_compiled
         && caps.is_some_and(|c| c.hw_decoders.h264_vaapi || c.hw_decoders.hevc_vaapi);
+    let rkmpp_ok = rkmpp_compiled
+        && caps.is_some_and(|c| c.hw_decoders.h264_rkmpp || c.hw_decoders.hevc_rkmpp);
 
     match pref {
         HwDecodePreference::Cpu => Ok(ResolvedDisplayDecoder::Cpu),
@@ -2296,6 +2379,8 @@ pub fn resolve_transcode_decoder(
                 Ok(ResolvedDisplayDecoder::Nvdec)
             } else if qsv_ok {
                 Ok(ResolvedDisplayDecoder::Qsv)
+            } else if rkmpp_ok {
+                Ok(ResolvedDisplayDecoder::Rkmpp)
             } else {
                 Ok(ResolvedDisplayDecoder::Cpu)
             }
@@ -2331,6 +2416,17 @@ pub fn resolve_transcode_decoder(
                 Err(DecoderResolutionError::DriverMissing)
             } else {
                 Ok(ResolvedDisplayDecoder::Vaapi)
+            }
+        }
+        HwDecodePreference::Rkmpp => {
+            if !rkmpp_compiled {
+                Err(DecoderResolutionError::FeatureDisabled)
+            } else if caps.is_none() {
+                Err(DecoderResolutionError::ProbeUnavailable)
+            } else if !rkmpp_ok {
+                Err(DecoderResolutionError::DriverMissing)
+            } else {
+                Ok(ResolvedDisplayDecoder::Rkmpp)
             }
         }
     }

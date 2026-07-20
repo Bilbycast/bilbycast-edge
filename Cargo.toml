@@ -228,6 +228,12 @@ fs2 = "0.4"
 sigstore = { version = "0.14", default-features = false, features = ["sigstore-trust-root", "cached-client"] }
 x509-cert = { version = "0.2", default-features = false, features = ["std"] }
 
+[build-dependencies]
+# Only invoked when the `rga-transfer` feature is enabled (see build.rs);
+# harmless to compile in otherwise since bindgen/pkg-config are not run.
+bindgen = "0.72.1"
+pkg-config = "0.3"
+
 [features]
 # `display` is in the default feature set: every Linux release variant
 # (default + full) ships the local-display output. The optional `drm` /
@@ -418,6 +424,36 @@ video-decoder-qsv = ["video-engine/video-decoder-qsv"]
 # frames either as zero-copy DRM PRIME DMA-BUFs (KMS scanout via the
 # `display` feature) or system-memory NV12/P010 (HDR tonemap path).
 video-decoder-vaapi = ["video-engine/video-decoder-vaapi"]
+# RKMPP HW decode (ARM Rockchip only). Plain named decoder like NVDEC/QSV —
+# system-memory NV12 output, no hwframe-context plumbing needed. Off by
+# default; only buildable on a native aarch64 Rockchip host. Same
+# per-arch listing convention as `video-encoder-rkmpp` (not folded into
+# `video-encoders-full`, which is x86_64-only).
+video-decoder-rkmpp = ["video-engine/video-decoder-rkmpp"]
+# RGA-accelerated DRM_PRIME→sysmem transfer (ARM Rockchip only, requires
+# `video-decoder-rkmpp`). The generic FFmpeg `av_hwframe_transfer_data`
+# path (`hwcontext_drm.c`) does an unaccelerated CPU mmap + DMA_BUF_SYNC +
+# memcpy on every frame — measured as the dominant per-frame cost behind
+# the HDMI display-output stutter on bilby-pir6s (RK3588), with spikes up
+# to ~106ms. This feature instead uses the Rockchip 2D accelerator (RGA,
+# `librga`) to do the same DRM_PRIME dma-buf → sysmem NV12 copy in
+# hardware — benchmarked on bilby-pir6s at ~3ms/frame (1080p), a ~30x
+# improvement, with none of the VOP2 plane-class risk of the (currently
+# disabled) zero-copy KMS scanout attempt: presentation stays on the
+# proven CPU-blit primary-plane path, only the transfer step changes.
+# The RGA path also carries a large (~340-400ms), fixed pipeline
+# latency the audio-vs-video pacer can't tell apart from a real
+# backlog on its own — `output_display.rs`'s one-time A/V calibration
+# (gated on the shared `rga_transfer_active` flag) measures and
+# corrects for it in the first ~1.5s after engagement. Without that
+# calibration this feature is a net *regression* (measured: ~31%
+# dropped frames vs. ~11% on the plain CPU path it replaces) despite
+# genuinely lower per-frame cost — don't disable/bypass the
+# calibration logic without re-verifying the drop rate on hardware.
+# Off by default; needs `librga-dev` + `/dev/rga` at build/run time,
+# plus systemd `DeviceAllow=/dev/rga rwm` under a hardened unit (see
+# `packaging/bilbycast-edge.service`).
+rga-transfer = ["video-decoder-rkmpp"]
 # Enable TLS (HTTPS on API + RTMPS) support via rustls/tokio-rustls/axum-server.
 tls = ["dep:tokio-rustls", "dep:axum-server"]
 # Enable WebRTC WHIP/WHEP input and output via str0m (pure Rust, sans-I/O).
