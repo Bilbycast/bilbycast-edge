@@ -127,6 +127,34 @@ impl DemuxCache {
             .map_err(|e| anyhow!("mp4 spawn_blocking join failed: {e}"))??;
         let bytes = demux.approx_sample_bytes();
         let arc = std::sync::Arc::new(demux);
+
+        // Refuse to cache a file that alone blows the byte budget, rather
+        // than admitting it and exempting it from eviction.
+        //
+        // `demux_file` loads every sample payload into RAM, so footprint
+        // scales with file size and the media library permits uploads up
+        // to 4 GiB. Retaining one such entry for the whole life of the
+        // input task is exactly the case the budget exists to prevent —
+        // and it is the DOMINANT case, since a single looping slate is
+        // the workload this cache was added for. On a 2–4 GB SBC that
+        // turns a previously-transient demux into a permanent resident,
+        // pinned unreclaimable by `mlockall(MCL_FUTURE)` when
+        // BILBYCAST_MLOCKALL=1 (the packaged default).
+        //
+        // Skipping the cache costs a re-demux per loop for that one
+        // oversized file — the pre-existing behaviour — instead of an
+        // OOM kill. Every normally-sized file still gets the cache.
+        if bytes > Self::MAX_BYTES {
+            tracing::info!(
+                path = %path.display(),
+                approx_mb = bytes / (1 << 20),
+                budget_mb = Self::MAX_BYTES / (1 << 20),
+                "media-player: demuxed file exceeds the cache byte budget — \
+                 not caching (it will be re-demuxed on each loop)"
+            );
+            return Ok(arc);
+        }
+
         self.entries.insert(
             0,
             DemuxCacheEntry { path: path.to_path_buf(), mtime, len, demux: arc.clone(), bytes },
@@ -136,13 +164,19 @@ impl DemuxCache {
     }
 
     /// Evict LRU tail entries until within both the entry-count and byte
-    /// budgets. Never evicts the single front (just-inserted) entry.
+    /// budgets.
+    ///
+    /// The byte loop has no "keep at least one" exemption: `get_or_demux`
+    /// refuses to admit an entry larger than `MAX_BYTES` in the first
+    /// place, so anything in `entries` individually fits and the loop
+    /// always terminates within budget rather than parking an oversized
+    /// resident that eviction can never reclaim.
     fn enforce_budget(&mut self) {
         while self.entries.len() > Self::MAX_ENTRIES {
             self.entries.pop();
         }
         let mut total: u64 = self.entries.iter().map(|e| e.bytes).sum();
-        while total > Self::MAX_BYTES && self.entries.len() > 1 {
+        while total > Self::MAX_BYTES && !self.entries.is_empty() {
             if let Some(e) = self.entries.pop() {
                 total = total.saturating_sub(e.bytes);
             }
@@ -159,6 +193,13 @@ impl DemuxCache {
 /// Derived from consecutive `start_time` deltas (in track timescale units).
 /// The final sample has no successor, so it reuses the previous sample's
 /// duration (or a 33 ms ≈ 30 fps default for a single-sample track).
+/// Upper bound on a single sample's bundle-spread window.
+///
+/// 100 ms ≈ 2.5 frame periods at 25 fps, so CFR content is never
+/// clamped (its deltas are 33–40 ms) and only genuinely sparse VFR gaps
+/// hit it. See the rationale in [`sample_durations_us`].
+const MAX_SAMPLE_SPREAD_US: u64 = 100_000;
+
 fn sample_durations_us(samples: &[DemuxedSample], timescale: u32) -> Vec<u64> {
     let n = samples.len();
     let mut out = Vec::with_capacity(n);
@@ -176,7 +217,28 @@ fn sample_durations_us(samples: &[DemuxedSample], timescale: u32) -> Vec<u64> {
         // Guard against a zero/degenerate duration (identical timestamps, or
         // a single-sample track) so the pacer always has a non-zero spread
         // window — otherwise a whole sample would collapse back to a burst.
-        out.push(if dur == 0 { 33_000 } else { dur });
+        //
+        // Also cap it. `dur` is a raw inter-sample delta, and on VFR
+        // content (screen recordings, slate/timelapse MP4s) a static
+        // section can leave multi-second gaps between video samples.
+        // Two things break at that size:
+        //
+        //   * this sample's bundles get deadlines spread across the
+        //     whole gap, so its access-unit tail lands seconds after its
+        //     own DTS;
+        //   * the producer pushes a sample's bundles as a group, so
+        //     every AUDIO frame falling inside that window queues behind
+        //     them and is released in a late burst — audible dropout for
+        //     the duration of the static section, since those PES arrive
+        //     with PTS far behind the concurrent PCR and the receiver
+        //     discards them.
+        //
+        // Capping the spread bounds both. Anything beyond the cap simply
+        // emits early and idles until the next sample's anchor, which is
+        // correct — the anchor is absolute, so capping the spread never
+        // shifts a sample's presentation time.
+        let dur = if dur == 0 { 33_000 } else { dur };
+        out.push(dur.min(MAX_SAMPLE_SPREAD_US));
     }
     out
 }
@@ -935,15 +997,33 @@ mod tests {
     }
 
     #[test]
-    fn enforce_budget_evicts_over_byte_budget_but_keeps_front() {
+    fn enforce_budget_evicts_over_byte_budget() {
         let mut cache = DemuxCache::default();
-        // Front entry alone exceeds the byte budget; it must be kept (never
-        // evict the single just-inserted entry), tail evicted.
-        cache.entries.push(cache_entry("old.mp4", 10_000));
-        cache.entries.insert(0, cache_entry("huge.mp4", DemuxCache::MAX_BYTES + 1));
+        // Two entries that together exceed the budget: the LRU tail is
+        // evicted until the total fits.
+        let half = DemuxCache::MAX_BYTES / 2 + 1;
+        cache.entries.push(cache_entry("old.mp4", half));
+        cache.entries.insert(0, cache_entry("new.mp4", half));
         cache.enforce_budget();
         assert_eq!(cache.entries.len(), 1, "tail evicted to fit byte budget");
-        assert_eq!(cache.entries[0].path, std::path::PathBuf::from("huge.mp4"), "front kept");
+        assert_eq!(cache.entries[0].path, std::path::PathBuf::from("new.mp4"), "MRU kept");
+    }
+
+    #[test]
+    fn enforce_budget_does_not_park_an_oversized_resident() {
+        // An entry larger than the whole budget must NOT be exempted from
+        // eviction. `get_or_demux` refuses to admit one, but if a future
+        // change lets one in, eviction must still reclaim it rather than
+        // pinning it for the life of the input task — the OOM path on a
+        // small SBC looping a large slate, made unreclaimable by
+        // `mlockall`.
+        let mut cache = DemuxCache::default();
+        cache.entries.push(cache_entry("huge.mp4", DemuxCache::MAX_BYTES + 1));
+        cache.enforce_budget();
+        assert!(
+            cache.entries.is_empty(),
+            "an entry exceeding the entire byte budget must be evictable, not parked"
+        );
     }
 
     #[test]

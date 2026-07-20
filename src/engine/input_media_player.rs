@@ -2002,9 +2002,9 @@ async fn emit_to_pacer(
     let content_src_bytes = pending_src_bytes.saturating_add(total_len as u64);
     *pending_src_bytes = 0;
 
-    // Hand off to the OS-thread pacer. On `Full`, yield and retry — the
-    // pacer drains at file-bitrate (~2.1 ms per bundle at 5 Mbps), so
-    // the producer typically blocks for at most one bundle period.
+    // Hand off to the OS-thread pacer. On `Full`, park briefly and retry
+    // — the pacer drains at file-bitrate (~2.1 ms per bundle at 5 Mbps),
+    // so the producer typically waits at most one bundle period.
     let mut to_send = PacerMsg {
         pkt: processed,
         target_ns,
@@ -2018,17 +2018,75 @@ async fn emit_to_pacer(
         match pacer_tx.try_send(to_send) {
             Ok(()) => {
                 session.media_stats.pacer_queue_depth.fetch_add(1, Ordering::Relaxed);
+                // First successful hand-off means playout is genuinely
+                // under way. Without this the state only ever reached
+                // PLAYING via the lateness-latch RECOVERY branch, so a
+                // healthy input that never lagged reported "starting"
+                // for its entire life — making the documented state
+                // machine wrong and any manager UI keyed on "playing"
+                // permanently dark. Compare-exchange keeps this a
+                // one-shot: it must not stomp a later STALLED.
+                let _ = session.media_stats.state.compare_exchange(
+                    media_player_state::STARTING,
+                    media_player_state::PLAYING,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                );
                 poll_pacer_lateness_latch(session);
                 return true;
             }
             Err(std::sync::mpsc::TrySendError::Full(msg)) => {
                 to_send = msg;
-                tokio::task::yield_now().await;
+                // Park, don't spin. `tokio::task::yield_now()` here
+                // reschedules immediately rather than sleeping, so the
+                // producer burned a full tokio worker at ~100 % of a
+                // core for the ENTIRE duration of every MP4 played —
+                // the queue sits at capacity in steady state (the
+                // producer demuxes far faster than realtime), so this
+                // branch is the common path, not an edge case. On a
+                // 4-core SBC that is a quarter of the box spent
+                // spinning, stealing cycles from codec and wire-emit
+                // work. Constraint 1: never block the data path — and
+                // never starve it either.
+                //
+                // A short sleep is correct here rather than a precise
+                // one: the pacer thread owns emission timing, this is
+                // only backpressure. Selecting on the cancel token at
+                // the same time also restores prompt shutdown — the
+                // spin previously only noticed cancellation between
+                // retries.
+                tokio::select! {
+                    biased;
+                    _ = session.cancel.cancelled() => return false,
+                    _ = tokio::time::sleep(PACER_FULL_BACKOFF) => {}
+                }
             }
             Err(std::sync::mpsc::TrySendError::Disconnected(_)) => return false,
         }
     }
 }
+
+/// How long the producer parks when the pacer queue is full before
+/// retrying the hand-off.
+///
+/// Sized at roughly one bundle period for a high-bitrate file (1316 B at
+/// 50 Mbps ≈ 210 µs) so the retry lands about when a slot frees. The
+/// queue is 16 deep, so even a several-fold overshoot only drains slack
+/// rather than starving the pacer — and the pacer, not this producer,
+/// owns emission timing, so this value has no bearing on output pacing
+/// accuracy. It exists purely to stop the producer spinning.
+const PACER_FULL_BACKOFF: std::time::Duration = std::time::Duration::from_micros(200);
+
+/// Minimum wall-clock spacing the MP4 deadline pacer will place between
+/// two consecutive bundles when it has fallen behind schedule.
+///
+/// Only ever applies to a backlog — when the pacer is meeting its
+/// deadlines the computed target is already beyond this floor and the
+/// clamp is a no-op. It bounds the drain rate of a backlog to roughly
+/// 1316 B / 25 µs ≈ 420 Mbps, far above any real file bitrate but far
+/// below the memcpy-rate flood an unclamped past-deadline run produces.
+/// The point is to keep a recovery bounded, not to pace normally.
+const MIN_BUNDLE_SPACING_NS: u64 = 25_000;
 
 /// Pacer falls behind its own computed wall-clock schedule by at least this
 /// much before we latch `media_player_pacer_lagging`. `run_paced_emitter`
@@ -2137,6 +2195,12 @@ fn run_paced_emitter(
     // a media-player flow but keeps the first-bundle wallclock in the
     // future at startup so `clock_nanosleep` waits properly.
     let mut next_target_wall: u64 = initial_now.saturating_add(50_000_000);
+    // Last deadline actually emitted at, in MP4 sample-anchored mode.
+    // Floors each subsequent deadline so a clock step or a producer
+    // stall cannot collapse a backlog into a zero-spacing burst — see
+    // the clamp in the deadline branch below. Seeded so the very first
+    // bundle is never held back.
+    let mut last_emitted_ns: u64 = initial_now;
     tracing::info!(
         "media-pacer '{}': starting (bitrate_initial={} bps, sched_fifo={})",
         thread_name,
@@ -2163,10 +2227,38 @@ fn run_paced_emitter(
         // sharing one emitter body):
         let target_ns = if let Some(explicit) = msg.target_ns {
             // ── MP4 sample-anchored mode ──────────────────────────────────
-            // The producer already computed the exact deadline from the
-            // sample presentation timeline. Emit at it verbatim; the
-            // byte-rate state (`next_target_wall`) is unused in this mode.
-            explicit
+            // The producer computed this deadline from the sample
+            // presentation timeline against a fixed `epoch_ns`.
+            //
+            // Clamp it forward against the last emission, for the same
+            // reason the byte-rate branch below clamps against `now`:
+            // without this, ANY event that puts a run of deadlines in
+            // the past makes the pacer emit them back-to-back with zero
+            // sleep — dumping content at memcpy rate. Two realistic
+            // triggers:
+            //
+            //   * `monotonic_now_ns()` reads CLOCK_TAI, which despite
+            //     the name is steppable (chrony `makestep` after a DHCP
+            //     settle, or phc2sys stepping the system clock — both
+            //     documented on these edges). A forward step of X
+            //     instantly retires every deadline up to `epoch + X`.
+            //   * producer stalls — a slow transcode or post-process in
+            //     `emit_to_pacer`, or a preroll too short for the first
+            //     IDR's mux — leave a backlog of past deadlines that all
+            //     fire at once when the producer catches up.
+            //
+            // Bursting the remainder of a file at memcpy rate is exactly
+            // the overflow this pacer exists to prevent (issue #67), so
+            // an unguarded deadline branch reintroduces the bug it fixes.
+            //
+            // The clamp preserves the schedule whenever it is being met
+            // (the common case: `explicit` is already >= the floor, so
+            // this is a no-op) and degrades to nominal spacing when it
+            // is not, instead of collapsing to zero spacing.
+            let floor = last_emitted_ns.saturating_add(MIN_BUNDLE_SPACING_NS);
+            let clamped = explicit.max(floor);
+            last_emitted_ns = clamped;
+            clamped
         } else {
             // ── Byte-rate mode (TS passthrough) ───────────────────────────
             // Bitrate refinement piggybacks on every bundle so the OS thread
@@ -2227,6 +2319,15 @@ fn run_paced_emitter(
         out_pkt.recv_time_us = crate::util::time::now_us();
         let _ = broadcast_tx.send(out_pkt);
     }
+    // Zero the hand-off gauge on the way out. The loop can break on
+    // cancellation with messages still queued, and each of those was
+    // counted by the producer's `fetch_add` but never reaches the
+    // matching `fetch_sub` above. `MediaPlayerStats` outlives any single
+    // pacer thread (it spans the whole input, while a thread is spawned
+    // per source), so a playlist cycling sources under repeated
+    // cancellation would otherwise accumulate phantom depth until the
+    // reported value stopped meaning anything.
+    stats.pacer_queue_depth.store(0, Ordering::Relaxed);
     tracing::info!("media-pacer '{}': exited", thread_name);
 }
 
