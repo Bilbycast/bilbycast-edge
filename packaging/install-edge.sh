@@ -255,9 +255,17 @@ fi
 #                                 dynamic numa link would NEED libnuma.so.1
 # All have STABLE major SONAMEs (.1/.2) that do not churn across distro
 # releases, so the plain package name resolves on Ubuntu 22.04 → 26.04+.
-# Installed best-effort; the actual HW *drivers* (mesa-va-drivers /
-# intel-media-va-driver / libmfx-gen1.2 / NVIDIA driver) are an operator
-# concern — without them the runtime probe simply skips that backend.
+#
+# libva2 is only the *loader*: VAAPI does nothing until a backend DRIVER is
+# behind it. Without one, `av_hwdevice_ctx_create(VAAPI)` fails, the startup
+# probe reports no VAAPI capability, and the `display` output + transcode
+# decode path silently fall back to CPU — observed in the field as HDMI
+# frame-grabbing on an Intel node whose iHD driver was simply never installed
+# (issue #70): libva2 was present, the driver was not, and nothing said so.
+# The free VAAPI drivers are therefore installed best-effort alongside the
+# loader (all royalty-free — MIT / Mesa — so safe to pull automatically; the
+# runtime loads whichever matches the GPU and ignores the rest). Only the
+# proprietary NVIDIA driver + libmfx-gen1.2 (QSV) remain an operator concern.
 if command -v apt-get > /dev/null 2>&1; then
     echo "Installing runtime media libraries for variant '${VARIANT}'…"
     DEBIAN_FRONTEND=noninteractive apt-get update -qq || true
@@ -268,15 +276,27 @@ if command -v apt-get > /dev/null 2>&1; then
     if [[ "${VARIANT}" == "full" ]]; then
         DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
             libva2 libva-drm2 libdrm2 libnuma1 || true
+        # VAAPI backend drivers (see note above). `va-driver-all` is the VA-API
+        # driver metapackage — it pulls the Mesa gallium radeonsi driver (AMD)
+        # and the legacy i965 driver (Intel Gen9-) on every arch, and survives
+        # the Ubuntu 26.04 rename where the standalone `mesa-va-drivers` package
+        # was folded into `mesa-libgallium`. Modern Intel (Gen8+/Broadwell+
+        # through Alder Lake and newer) needs the iHD driver, which va-driver-all
+        # does NOT guarantee — its Intel alternative is satisfied by the older
+        # i965, which has no Gen12 support — so `intel-media-va-driver` is pulled
+        # explicitly on x86_64.
+        DEBIAN_FRONTEND=noninteractive apt-get install -y -qq va-driver-all || true
         if [[ "${ARCH}" == "x86_64-linux" ]]; then
             DEBIAN_FRONTEND=noninteractive apt-get install -y -qq libvpl2 || true
+            DEBIAN_FRONTEND=noninteractive apt-get install -y -qq intel-media-va-driver || true
         fi
     fi
 else
     echo "WARNING: apt-get unavailable — ensure libasound2 (all variants) and,"
     echo "         for the full variant, libva2 / libva-drm2 / libdrm2 / libnuma1"
-    echo "         / libvpl2 (x86_64) are installed, or the binary may fail to"
-    echo "         start. See docs.bilbycast.com/edge/installation/."
+    echo "         / libvpl2 (x86_64) plus a VAAPI driver (va-driver-all, and"
+    echo "         intel-media-va-driver on modern Intel) are installed, or HW decode"
+    echo "         silently falls back to CPU. See docs.bilbycast.com/edge/installation/."
 fi
 
 ensure_cosign() {
