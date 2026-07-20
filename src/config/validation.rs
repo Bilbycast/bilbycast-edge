@@ -12323,21 +12323,26 @@ mod tests {
             .to_string();
         assert!(e.contains("v210"), "v210 rejected with a useful message: {e}");
 
-        let e = super::validate_sdi_input(&sdi_config(
-            "uyvy422",
-            "hevc_nvenc",
-            Some("yuv420p"),
-            Some(10),
-        ))
-        .unwrap_err()
-        .to_string();
-        assert!(e.contains("bit_depth"), "10-bit rejected: {e}");
+        // 10-bit is refused whatever the build. Which encoder backends are
+        // compiled in is not this test's business, so pin the *reason* only
+        // when the identical config at 8-bit is accepted — then bit_depth is
+        // the only thing that changed. On a build without the NVENC backend
+        // the config is still refused, just for the earlier reason.
+        let eight = sdi_config("uyvy422", "hevc_nvenc", Some("yuv420p"), None);
+        let ten = sdi_config("uyvy422", "hevc_nvenc", Some("yuv420p"), Some(10));
+        let e = super::validate_sdi_input(&ten).unwrap_err().to_string();
+        if super::validate_sdi_input(&eight).is_ok() {
+            assert!(e.contains("bit_depth"), "10-bit rejected for the right reason: {e}");
+        }
 
-        // 4:4:4 has no path out of an 8-bit 4:2:2 capture either.
-        let e = super::validate_sdi_input(&sdi_config("uyvy422", "x264", Some("yuv444p"), None))
-            .unwrap_err()
-            .to_string();
-        assert!(e.contains("chroma"), "yuv444p rejected: {e}");
+        // 4:4:4 has no path out of an 8-bit 4:2:2 capture either — same guard,
+        // pinning the reason only where the codec's backend is compiled in.
+        let base = sdi_config("uyvy422", "x264", None, None);
+        let cfg444 = sdi_config("uyvy422", "x264", Some("yuv444p"), None);
+        let e = super::validate_sdi_input(&cfg444).unwrap_err().to_string();
+        if super::validate_sdi_input(&base).is_ok() {
+            assert!(e.contains("chroma"), "yuv444p rejected for the right reason: {e}");
+        }
     }
 
     /// SDI must stay **encoder-agnostic**: it reuses the shared host-capability
@@ -12383,9 +12388,15 @@ mod tests {
     fn sdi_accepts_auto_encoder_selection() {
         for codec in ["h264_auto", "hevc_auto"] {
             let cfg = sdi_config("uyvy422", codec, Some("yuv420p"), None);
-            assert!(
+            // Assert *agreement with the generic validator*, not `is_ok()`:
+            // whether `*_auto` resolves on this build is that validator's
+            // call, and a build with no encoder backend compiled in refuses
+            // it honestly. What SDI must never do is add a restriction of
+            // its own on top.
+            assert_eq!(
                 super::validate_sdi_input(&cfg).is_ok(),
-                "SDI must accept {codec} so host-agnostic configs work",
+                super::validate_video_encode(&cfg.video_encode, "t").is_ok(),
+                "SDI must neither add nor drop a restriction on {codec}",
             );
         }
     }
