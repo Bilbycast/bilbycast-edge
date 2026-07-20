@@ -1095,6 +1095,7 @@ fn demux_decode_loop(
         requested_backend,
         fell_back_to_cpu: hw_already_unavailable,
         fallback_event_emitted: hw_already_unavailable,
+        demote_requested: None,
         hdr_on_sdr_event_emitted: false,
         consecutive_send_errors: 0,
         last_send_error_log_at: None,
@@ -1691,6 +1692,14 @@ struct HwOpenState {
     /// One-shot gate so the warning event fires exactly once per
     /// fallback, never per access unit.
     fallback_event_emitted: bool,
+    /// Set by `drain_video_frames` when it hits a PERMANENT
+    /// HW-frame condition it cannot serve (currently: a HW frames
+    /// context with no downloadable `sw_format`, i.e. RKMPP with
+    /// 10-bit input). `drain_video_frames` only holds `&mut VideoDecoder`,
+    /// not the `Option` slot `force_cpu_fallback` needs to clear, so it
+    /// records the demotion here and the caller performs it. Carries the
+    /// trigger string for the operator event.
+    demote_requested: Option<&'static str>,
     /// One-shot gate so the HDR-on-SDR-panel tonemap warning fires
     /// exactly once per output on the first HDR frame that lands on an
     /// SDR-only connector. Reset whenever the decoder is re-opened
@@ -2289,6 +2298,27 @@ fn handle_video_au(
         video_decode_counters,
         output_stats,
     );
+    // `drain_video_frames` hit a permanent HW-frame condition it cannot
+    // serve and asked for a demotion. It only holds `&mut VideoDecoder`,
+    // so it could not clear the decoder slot itself — do it here, where
+    // the `Option` slots `force_cpu_fallback` needs are in scope.
+    if let Some(trigger) = hw_open_state.demote_requested.take() {
+        force_cpu_fallback(
+            video_decoder,
+            current_video_codec,
+            hw_open_state,
+            counters,
+            event_sender,
+            flow_id,
+            output_id,
+            trigger,
+            Some(
+                "HW frames context has no downloadable sw_format \
+                 (e.g. RKMPP with 10-bit input — NV12-only)"
+                    .to_string(),
+            ),
+        );
+    }
     let decode_us = decode_start.elapsed().as_micros() as u64;
     counters.decode_count.fetch_add(1, Ordering::Relaxed);
     counters
@@ -2944,6 +2974,16 @@ fn drain_video_frames(
             if need_sysmem && rga_prepared.is_none() {
                 match frame.download_to_sysmem() {
                     Ok(sysmem) => sysmem,
+                    // PERMANENT (see the companion arm further down):
+                    // no downloadable `sw_format`, so every future
+                    // frame fails identically. Demote to CPU so the
+                    // decoder starts producing sysmem frames and the
+                    // HDR-tonemap / bars paths that need them work
+                    // again, rather than silently degrading forever.
+                    Err(video_codec::VideoError::UnsupportedHwFormat) => {
+                        state.demote_requested = Some("sysmem_download_unsupported");
+                        continue;
+                    }
                     Err(e) => {
                         // Download failed (rare — driver / format
                         // mismatch). Pass the HW frame through and
@@ -3100,6 +3140,39 @@ fn drain_video_frames(
                     // NOT a `continue`, unlike every other arm here.
                     match frame.download_to_sysmem() {
                         Ok(sysmem) => sysmem,
+                        Err(video_codec::VideoError::UnsupportedHwFormat) => {
+                            // PERMANENT: the HW frames context has no
+                            // downloadable `sw_format`, so this will
+                            // fail identically on every future frame.
+                            // Seen on RKMPP with 10-bit input, where
+                            // `rkmppdec.c` only sets sw_format for
+                            // 8-bit NV12 (mainline libdrm has no
+                            // DRM_FORMAT_NV12_10).
+                            //
+                            // Bare `continue` here dropped EVERY frame
+                            // for the rest of the run — a silently
+                            // black display output with no event and
+                            // no metric distinguishing it from "no
+                            // source". Demote to CPU instead: the CPU
+                            // decoder produces sysmem frames directly,
+                            // so playout recovers on the next access
+                            // unit, and the operator gets a
+                            // `display_hw_decode_runtime_failed`
+                            // Warning naming the trigger.
+                            //
+                            // This is also the practical answer to
+                            // "don't advertise a backend the host
+                            // can't service": a decoder's usable bit
+                            // depth is a property of the STREAM, not
+                            // the host, so `avcodec_open2` at probe
+                            // time cannot know it (unlike the encoder
+                            // side, where pix_fmt is specified up
+                            // front). Detecting it on the first frame
+                            // and demoting once is the only place the
+                            // information actually exists.
+                            state.demote_requested = Some("sysmem_download_unsupported");
+                            continue;
+                        }
                         Err(_) => continue,
                     }
                 }
