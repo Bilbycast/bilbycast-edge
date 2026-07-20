@@ -193,6 +193,26 @@ impl DemuxCache {
 /// Derived from consecutive `start_time` deltas (in track timescale units).
 /// The final sample has no successor, so it reuses the previous sample's
 /// duration (or a 33 ms ≈ 30 fps default for a single-sample track).
+/// Is `a` after `b` on the 33-bit MPEG-TS PTS timeline?
+///
+/// Both values are masked to 33 bits, so a plain `>` breaks across the
+/// wrap: after ~26.5 h of continuous 90 kHz playout (reachable by any
+/// 24/7 looping media_player) every post-wrap PTS compares `false`
+/// against a pre-wrap high-water mark, freezing it just below 2^33. The
+/// next loop's `pts_offset_90k` is then derived from that stale value,
+/// producing a ~26.5 h forward PTS jump at one loop boundary.
+///
+/// Compares via signed distance on the 33-bit ring instead: values
+/// within half the range ahead are "after", which is the standard
+/// MPEG-TS interpretation and wrap-correct in both directions.
+fn pts_90_is_after(a: u64, b: u64) -> bool {
+    const RANGE: u64 = 1 << 33;
+    const HALF: u64 = 1 << 32;
+    // Distance from b forward to a, on the ring.
+    let forward = a.wrapping_sub(b) & (RANGE - 1);
+    forward != 0 && forward < HALF
+}
+
 /// Upper bound on a single sample's bundle-spread window.
 ///
 /// 100 ms ≈ 2.5 frame periods at 25 fps, so CFR content is never
@@ -650,6 +670,9 @@ async fn play_demuxed(
         })
         .with_context(|| "spawn media-player mp4 pacer thread")?;
     let mut pending_src_bytes: u64 = 0;
+    // Highest bundle deadline scheduled — carried into SpliceContinuity so
+    // the next file continues this wall timeline instead of re-anchoring.
+    let mut last_scheduled_ns: u64 = 0;
 
     // Wall-clock anchor: presentation time 0 maps to `epoch_ns`. Every
     // bundle's deadline is `epoch_ns + presentation_offset_ns`. The preroll
@@ -657,8 +680,32 @@ async fn play_demuxed(
     // thread has received the bundle before its deadline. Both this producer
     // and the pacer read the same monotonic clock, so the deadlines are
     // directly comparable across the thread boundary.
-    const PREROLL_NS: u64 = 50_000_000; // 50 ms, matches run_paced_emitter
-    let epoch_ns = crate::engine::wire_emit::monotonic_now_ns().saturating_add(PREROLL_NS);
+    // Preroll must cover BOTH the pacer warm-up (50 ms, matching
+    // run_paced_emitter) AND one full sample-spread window, because the
+    // spread now runs `[anchor - dur, anchor)` so the first sample
+    // schedules up to MAX_SAMPLE_SPREAD_US before its own anchor.
+    const PREROLL_NS: u64 = 50_000_000 + MAX_SAMPLE_SPREAD_US * 1_000;
+
+    // Continue the previous file's wall timeline rather than re-anchoring
+    // to `now`, so the wall gap across a loop equals the PTS gap
+    // (SPLICE_GUARD_TICKS_90K). Re-anchoring added the preroll plus
+    // teardown on every iteration while PTS advanced by only the 30 ms
+    // guard, so the emitted timeline ran short of real time each loop and
+    // drained the receiver buffer monotonically on a 24/7 slate.
+    //
+    // Fall back to `now + PREROLL` on a cold start, or whenever the
+    // carried deadline is already in the past (a long gap between files,
+    // or the first MP4 after a byte-rate-paced .ts entry, which records
+    // no deadline) — otherwise a stale anchor would dump a backlog.
+    let now_ns = crate::engine::wire_emit::monotonic_now_ns();
+    let cold_epoch = now_ns.saturating_add(PREROLL_NS);
+    let carried = session.cont.last_scheduled_deadline_ns();
+    let splice_guard_ns = crate::engine::input_media_player::splice_guard_ns();
+    let epoch_ns = if carried == 0 {
+        cold_epoch
+    } else {
+        carried.saturating_add(splice_guard_ns).max(now_ns)
+    };
     let mut bundle = BytesMut::with_capacity(session.bundle_size);
 
     'sample: while let Some(it) = heap.pop() {
@@ -681,7 +728,7 @@ async fn play_demuxed(
                         .wrapping_add(pts_offset_90k))
                         & 0x1_FFFF_FFFF;
                 let annex_b = avcc_to_annex_b(&s.bytes, &sps_nal, &pps_nal, s.is_sync);
-                if pts_90 > max_emitted_pts_90k {
+                if pts_90_is_after(pts_90, max_emitted_pts_90k) {
                     max_emitted_pts_90k = pts_90;
                 }
                 session.media_stats.video_samples_read.fetch_add(1, Ordering::Relaxed);
@@ -701,7 +748,7 @@ async fn play_demuxed(
                 let mut adts =
                     build_adts_header(profile, sr_idx, ch_cfg, s.bytes.len());
                 adts.extend_from_slice(&s.bytes);
-                if pts_90 > max_emitted_pts_90k {
+                if pts_90_is_after(pts_90, max_emitted_pts_90k) {
                     max_emitted_pts_90k = pts_90;
                 }
                 session.media_stats.audio_samples_read.fetch_add(1, Ordering::Relaxed);
@@ -735,14 +782,34 @@ async fn play_demuxed(
             sample_bundles.push(data);
         }
 
-        // Emit each bundle at `anchor + (i/N) * dur`, so bundle 0 (with the
-        // PCR) lands at the sample's true presentation time and the rest are
-        // spread across the sample's airtime.
+        // Spread this sample's bundles so the access unit is COMPLETE by
+        // its own DTS, not starting at it.
+        //
+        // The spread window runs `[anchor - dur, anchor)` rather than
+        // `[anchor, anchor + dur)`. MPEG-2 T-STD requires an access unit
+        // to be fully in the decoder buffer by its DTS; anchoring the
+        // spread at the DTS put the AU's tail a full sample duration
+        // LATE, so a strict analyser (Appear X10, Tektronix) doing T-STD
+        // buffer analysis would flag underflow even though PCR accuracy
+        // and repetition were clean. Most decoders have enough VBV
+        // headroom to absorb it, which is why it never showed up in the
+        // PCR_AC measurements — it is a conformance defect, not a
+        // visible one.
+        //
+        // `epoch_ns` carries a preroll of at least MAX_SAMPLE_SPREAD_US
+        // (see `PREROLL_NS`) so `anchor - dur` never underflows the
+        // epoch for the first sample. Shifting the window earlier does
+        // not move the sample's presentation time: the PTS/DTS written
+        // into the PES are unchanged, only the wire arrival is brought
+        // forward to where T-STD wants it.
         let n = sample_bundles.len() as u64;
         let anchor_ns = epoch_ns.saturating_add(it.wall_us.saturating_mul(1_000));
         let dur_ns = it.dur_us.saturating_mul(1_000);
+        let spread_start_ns = anchor_ns.saturating_sub(dur_ns);
         for (i, data) in sample_bundles.into_iter().enumerate() {
-            let target_ns = anchor_ns.saturating_add(dur_ns.saturating_mul(i as u64) / n.max(1));
+            let target_ns =
+                spread_start_ns.saturating_add(dur_ns.saturating_mul(i as u64) / n.max(1));
+            last_scheduled_ns = last_scheduled_ns.max(target_ns);
             if !emit_to_pacer(
                 data,
                 session,
@@ -786,7 +853,7 @@ async fn play_demuxed(
     if has_audio {
         session.cont.last_cc.insert(AUDIO_PID, cc_audio);
     }
-    session.cont.close_file(max_emitted_pts_90k);
+    session.cont.close_file_with_deadline(max_emitted_pts_90k, last_scheduled_ns);
     Ok(())
 }
 
@@ -994,6 +1061,26 @@ mod tests {
         // The oldest (LRU tail, "f0") must have been evicted; newest kept.
         assert_eq!(cache.entries.first().unwrap().path, std::path::PathBuf::from("f4.mp4"));
         assert!(cache.entries.iter().all(|e| e.path != std::path::PathBuf::from("f0.mp4")));
+    }
+
+    #[test]
+    fn pts_90_is_after_handles_the_33_bit_wrap() {
+        const MAX: u64 = (1 << 33) - 1;
+        // Ordinary forward progress.
+        assert!(pts_90_is_after(1_000, 900));
+        assert!(!pts_90_is_after(900, 1_000));
+        // Equal is not "after" — the high-water mark must not churn.
+        assert!(!pts_90_is_after(1_000, 1_000));
+        // ACROSS THE WRAP: a PTS just past 2^33 is AFTER one just below it.
+        // A plain `>` returns false here, which froze the high-water mark
+        // just under 2^33 after ~26.5 h of continuous playout and produced
+        // a ~26.5 h forward jump at the next loop boundary.
+        assert!(
+            pts_90_is_after(10, MAX - 10),
+            "post-wrap PTS must compare as after a pre-wrap high-water mark"
+        );
+        // And the reverse must NOT be after (no going backwards).
+        assert!(!pts_90_is_after(MAX - 10, 10));
     }
 
     #[test]

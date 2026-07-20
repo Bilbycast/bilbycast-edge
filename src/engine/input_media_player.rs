@@ -486,6 +486,14 @@ pub(super) type DemuxCacheField = ();
 /// from treating a same-tick splice as a stuck timestamp.
 const SPLICE_GUARD_TICKS_90K: u64 = 2_700;
 
+/// The inter-file splice guard expressed in nanoseconds of wall time.
+/// Keeps the wall gap between looped files equal to the PTS gap.
+pub(super) fn splice_guard_ns() -> u64 {
+    // 90 kHz ticks -> ns
+    SPLICE_GUARD_TICKS_90K * (1_000_000_000 / 90_000)
+}
+
+
 /// Continuity state threaded through every `play_*_file` call so the wire
 /// stream stays smooth across loop and playlist boundaries.
 ///
@@ -515,6 +523,19 @@ pub(super) struct SpliceContinuity {
     /// Last 90 kHz PTS emitted on the wire by the most recent file.
     /// Drives the next file's [`Self::next_target_output_pts_90k`].
     last_emitted_output_pts_90k: u64,
+
+    /// Monotonic wall-clock deadline (ns) of the last bundle the previous
+    /// file scheduled, or 0 on a cold start.
+    ///
+    /// Lets the next file place its epoch so the WALL gap between loops
+    /// equals the PTS gap. Without it each loop re-anchored to
+    /// `now + PREROLL`, so wall advanced by `file_span + preroll +
+    /// teardown` while PTS advanced by only `file_span +
+    /// SPLICE_GUARD_TICKS_90K` (30 ms) — the emitted timeline ran
+    /// systematically SHORT of real time every loop, draining the
+    /// receiver's buffer monotonically. On a 24/7 slate that is tens of
+    /// seconds a day on a stream that looks clean over any short window.
+    last_scheduled_deadline_ns: u64,
 
     /// Identity of the previous file. Distinguishes a same-file loop
     /// (no real boundary, no need to flag) from a playlist transition
@@ -613,7 +634,27 @@ impl SpliceContinuity {
     /// Synthesised paths (`play_mp4`, `play_image_file`) where audio and
     /// video are muxed in lockstep have a single max-PTS and pass it
     /// directly.
+    /// Wall-clock deadline (ns) of the last bundle the previous file
+    /// scheduled, or 0 if none (cold start, or a byte-rate-paced entry).
+    pub(super) fn last_scheduled_deadline_ns(&self) -> u64 {
+        self.last_scheduled_deadline_ns
+    }
+
     pub(super) fn close_file(&mut self, last_pts_90k: u64) {
+        self.close_file_with_deadline(last_pts_90k, 0);
+    }
+
+    /// As [`Self::close_file`], but also records the wall-clock deadline
+    /// of the last bundle scheduled, so the next file can continue the
+    /// wall timeline instead of re-anchoring to `now`. Pass 0 when the
+    /// caller does not pace against absolute deadlines (the byte-rate
+    /// TS path), which leaves the next file to cold-start its epoch.
+    pub(super) fn close_file_with_deadline(
+        &mut self,
+        last_pts_90k: u64,
+        last_deadline_ns: u64,
+    ) {
+        self.last_scheduled_deadline_ns = last_deadline_ns;
         self.last_emitted_output_pts_90k = last_pts_90k;
         // 33-bit wrap: PTS is 33 bits, target rolls over with it.
         self.next_target_output_pts_90k = last_pts_90k
