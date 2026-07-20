@@ -1415,6 +1415,8 @@ impl FlowRuntime {
                 nvdec_in_use_4k: cost_plan.nvdec_sessions_4k,
                 qsv_decode_in_use_4k: cost_plan.qsv_decode_sessions_4k,
                 vaapi_decode_in_use_4k: cost_plan.vaapi_decode_sessions_4k,
+                rkmpp_decode_in_use: cost_plan.rkmpp_decode_sessions,
+                rkmpp_decode_in_use_4k: cost_plan.rkmpp_decode_sessions_4k,
             },
         );
         let cost_units = std::sync::atomic::AtomicU32::new(cost_units);
@@ -5779,6 +5781,12 @@ fn pair_resolved_decoder_sessions(
                 plan.vaapi_decode_sessions_4k = plan.vaapi_decode_sessions_4k.saturating_add(1);
             }
         }
+        Some(HwDecoderFamily::Rkmpp) => {
+            plan.rkmpp_decode_sessions = plan.rkmpp_decode_sessions.saturating_add(1);
+            if is_4k {
+                plan.rkmpp_decode_sessions_4k = plan.rkmpp_decode_sessions_4k.saturating_add(1);
+            }
+        }
         None => {}
     }
 }
@@ -5810,6 +5818,12 @@ fn pair_resolved_decoder_usage(
             usage.vaapi_decode_in_use = usage.vaapi_decode_in_use.saturating_add(1);
             if is_4k {
                 usage.vaapi_decode_in_use_4k = usage.vaapi_decode_in_use_4k.saturating_add(1);
+            }
+        }
+        Some(HwDecoderFamily::Rkmpp) => {
+            usage.rkmpp_decode_in_use = usage.rkmpp_decode_in_use.saturating_add(1);
+            if is_4k {
+                usage.rkmpp_decode_in_use_4k = usage.rkmpp_decode_in_use_4k.saturating_add(1);
             }
         }
         None => {}
@@ -6058,6 +6072,10 @@ fn derive_cost_plan(flow: &ResolvedFlow) -> crate::engine::hardware_probe::FlowC
                     Some(crate::engine::hardware_probe::HwDecoderFamily::Vaapi) => {
                         plan.vaapi_decode_sessions =
                             plan.vaapi_decode_sessions.saturating_add(1);
+                    }
+                    Some(crate::engine::hardware_probe::HwDecoderFamily::Rkmpp) => {
+                        plan.rkmpp_decode_sessions =
+                            plan.rkmpp_decode_sessions.saturating_add(1);
                     }
                     None => {}
                 }
@@ -6319,6 +6337,9 @@ fn output_resource_contribution(
                 }
                 Some(crate::engine::hardware_probe::HwDecoderFamily::Vaapi) => {
                     usage.vaapi_decode_in_use = usage.vaapi_decode_in_use.saturating_add(1);
+                }
+                Some(crate::engine::hardware_probe::HwDecoderFamily::Rkmpp) => {
+                    usage.rkmpp_decode_in_use = usage.rkmpp_decode_in_use.saturating_add(1);
                 }
                 None => {}
             }

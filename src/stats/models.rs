@@ -1317,6 +1317,23 @@ pub struct DisplayStats {
     /// Average decode-AU duration since startup, in µs.
     #[serde(default)]
     pub decode_us_avg: u64,
+    /// Largest single `avcodec_receive_frame` call duration since
+    /// startup, in µs — the raw decoder-library frame fetch, excluding
+    /// `rkmpp_transfer_us_max` below. Temporary diagnostic
+    /// instrumentation added while investigating RKMPP display-output
+    /// stutter; isolates "MPP itself stalled" from "our transfer
+    /// stalled" within the combined `decode_us_max` figure above.
+    #[serde(default)]
+    pub receive_frame_us_max: u64,
+    #[serde(default)]
+    pub receive_frame_us_avg: u64,
+    /// Largest single RKMPP DRM_PRIME→sysmem transfer duration since
+    /// startup, in µs. Only populated on outputs using the RKMPP
+    /// decoder backend; `0` for every other backend.
+    #[serde(default)]
+    pub rkmpp_transfer_us_max: u64,
+    #[serde(default)]
+    pub rkmpp_transfer_us_avg: u64,
 }
 
 /// PCR accuracy trust metric — percentiles of `|observed_Δ − expected_Δ|`

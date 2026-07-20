@@ -428,6 +428,12 @@ impl FlowManager {
             acc.vaapi_decode_in_use_4k = acc
                 .vaapi_decode_in_use_4k
                 .saturating_add(f.vaapi_decode_in_use_4k);
+            acc.rkmpp_decode_in_use = acc
+                .rkmpp_decode_in_use
+                .saturating_add(f.rkmpp_decode_in_use);
+            acc.rkmpp_decode_in_use_4k = acc
+                .rkmpp_decode_in_use_4k
+                .saturating_add(f.rkmpp_decode_in_use_4k);
         }
         acc
     }

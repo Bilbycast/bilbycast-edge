@@ -50,6 +50,19 @@ DeviceAllow=char-alsa rwm
 DeviceAllow=char-nvidia rwm
 DeviceAllow=char-nvidia-frontend rwm
 DeviceAllow=char-nvidia-uvm rwm
+# Rockchip RGA (2D accelerator, `rga-transfer` feature) and MPP VPU
+# (`video-decoder-rkmpp`/`video-encoder-rkmpp`) — both are `misc`-class
+# character devices (major 10, shared with many unrelated kernel misc
+# drivers), so `char-rga`/`char-mpp_service` name-based matching does
+# NOT resolve them reliably: confirmed on bilby-pir6s (RK3588) that
+# `DeviceAllow=char-rga rwm` left `/dev/rga` open()s failing EPERM
+# despite systemd accepting the directive and 666 file permissions on
+# the node; the actual-path form below is what worked. `mpp_service`
+# happens to have its own dedicated major (241, not `misc`) so
+# `char-mpp_service` DOES resolve there, but the path form is used for
+# both here for one consistent, verified-working pattern.
+DeviceAllow=/dev/rga rwm
+DeviceAllow=/dev/mpp_service rwm
 SupplementaryGroups=video render audio
 # CAP_NET_ADMIN — required by kernel ≥ 6.x for setsockopt(SO_TXTIME)
 # with CLOCK_TAI. Without it, wire-emit falls back to clock_nanosleep.
