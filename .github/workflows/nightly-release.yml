@@ -429,14 +429,39 @@ jobs:
           # that touches no hardware, so it builds on this non-Rockchip runner
           # and only opens /dev/rga at RUNTIME on a real RK3568/RK3588.
           #
-          # NOTE (needs a real release run to confirm, same caveat as the MPP
-          # PPA note above): the PPA publishes source package `librga` at
-          # 2.2.0 — the exact version librga-sys's hand-declared signatures were
-          # confirmed against. The binary package split is assumed to follow the
-          # usual Debian convention (`librga-dev` headers + `librga2` runtime).
-          # If the -dev name differs, this step is where it surfaces, loudly,
-          # before the cargo build.
-          sudo apt-get install -y librga-dev
+          # CONFIRMED by the v0.99.0 release run: the PPA publishes source
+          # package `librga` at 2.2.0 — the exact version librga-sys's
+          # hand-declared signatures were confirmed against — split into
+          # `librga-dev` (headers + .pc + the `librga.so` link symlink) and
+          # `librga2` (the runtime `librga.so.2 -> librga.so.2.1.0`).
+          #
+          # BOTH are required, and `librga-dev` alone is NOT enough:
+          # this PPA's librga-dev carries **no `Depends:` field at all**, so
+          # apt will not pull the runtime for it. Installing only -dev leaves
+          # `/usr/lib/aarch64-linux-gnu/librga.so` dangling at its missing
+          # `librga.so.2` target, which does NOT fail here — it fails much
+          # later, at the final link of the edge binary, as
+          # `cannot find -lrga`. Do not "tidy" librga2 out of this line.
+          sudo apt-get install -y librga-dev librga2
+          # Fail fast, here, on exactly the two things that can be wrong and
+          # would otherwise only surface much later in the job:
+          #   1. bindgen needs <im2d_type.h> to RESOLVE. This PPA's .pc says
+          #      `Cflags: -I${includedir}` (= /usr/include) while the headers
+          #      are in /usr/include/rga/, and pkg-config strips the system
+          #      path from --cflags entirely — so `pkg-config --cflags librga`
+          #      is empty and proves nothing. Compile the real include.
+          #   2. `-lrga` must LINK (see the librga2 note above).
+          # Both are ~1 s here vs ~12 min into the cargo build.
+          printf '#include <im2d_type.h>\n#include <rga.h>\nint main(void){return 0;}\n' > /tmp/rga_probe.c
+          if ! cc /tmp/rga_probe.c $(pkg-config --cflags librga) -I/usr/include/rga \
+                  $(pkg-config --libs librga) -o /tmp/rga_probe; then
+            echo "ERROR: librga headers did not resolve or -lrga did not link."
+            echo "       Installed packages:"; dpkg -l | grep -i rga || true
+            echo "       Header locations:";   find /usr/include -name 'im2d_type.h' 2>/dev/null || true
+            echo "       Library locations:";  find /usr/lib -name 'librga.so*' 2>/dev/null || true
+            exit 1
+          fi
+          echo "OK: librga headers resolve and -lrga links"
           RGA_VER="$(pkg-config --modversion librga 2>/dev/null || echo unknown)"
           printf 'librga corresponding source (Apache-2.0, dynamically linked)\nsource: https://github.com/airockchip/librga\npackaged-by: ppa:jjriek/rockchip-multimedia (librga-dev)\nversion: %s\n' \
             "${RGA_VER}" > "$HOME/rockchip-rga-SOURCES.txt"
