@@ -946,7 +946,7 @@ Pulls media from an external WHEP server. The edge acts as a WHEP client. The `w
 
 ### Media Player Input
 
-Replays one or more local files (MPEG-TS, MP4 / MOV / MKV, or still images)
+Replays one or more local files (MPEG-TS, MP4 / MOV, or still images)
 as a paced fresh MPEG-TS feed. The synthesized TS publishes onto the flow's
 broadcast channel exactly like any other TS-bearing input, so every output
 type works unchanged. The marquee use case is a **slate / standby

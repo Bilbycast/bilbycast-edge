@@ -3,7 +3,7 @@
 
 //! File-backed media-player input.
 //!
-//! Plays one or more local assets — pre-encoded MPEG-TS, MP4 / MOV / MKV
+//! Plays one or more local assets — pre-encoded MPEG-TS, MP4 / MOV
 //! containers, or still images — as a paced fresh MPEG-TS feed onto the
 //! per-input broadcast channel. Designed for the "fallback while live is
 //! gone" use case: combine a media-player input with a live primary on a

@@ -213,7 +213,7 @@ rcgen = "0.14.7"
 # no external C dependency.
 ebur128 = "0.1"
 
-# MP4 / MOV / MKV demuxer for the file-backed media-player input. Pure
+# MP4 / MOV demuxer for the file-backed media-player input. Pure
 # Rust, ISO-BMFF parser only (no encode / no decode); we feed the
 # extracted ES through the existing TsMuxer. Used only when a flow has a
 # `MediaPlayerSource::Mp4` source attached.
