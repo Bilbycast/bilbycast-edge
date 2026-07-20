@@ -2950,6 +2950,15 @@ impl KmsDisplay {
                 && e.modifier == modifier)
                 .then_some(e.fb)
         });
+        // `fb_is_cached` tracks whether `new_fb` is owned by
+        // `prime_fb_cache`. It governs every error path below: a
+        // cache-owned FB must NEVER be destroyed on a failed present,
+        // because the cache still holds its handle and would hand the
+        // dead handle back on the next frame that reuses the same
+        // DMA-BUF. RKMPP recycles a small fixed pool (<=16 buffers), so
+        // "the next frame reuses the same DMA-BUF" is the common case,
+        // not a corner case.
+        let mut fb_is_cached = cached_fb.is_some();
         let new_fb = if let Some(fb) = cached_fb {
             fb
         } else {
@@ -3009,35 +3018,20 @@ impl KmsDisplay {
                 .card
                 .add_planar_framebuffer(&buf, flags)
                 .context("display_prime_addfb_failed: add_planar_framebuffer")?;
-            if let Some(key) = cache_key {
-                if let Some(old) = self.prime_fb_cache.remove(&key) {
-                    // Format changed for a recurring buffer object
-                    // (rare — e.g. a decoder resolution change reusing
-                    // the same underlying DMA-BUF). Destroy the stale
-                    // entry and drop its order-queue slot so eviction
-                    // bookkeeping stays consistent.
-                    let _ = self.card.destroy_framebuffer(old.fb);
-                    self.prime_fb_cache_order.retain(|k| *k != key);
-                }
-                if self.prime_fb_cache.len() >= PRIME_FB_CACHE_CAPACITY {
-                    if let Some(oldest_key) = self.prime_fb_cache_order.pop_front() {
-                        if let Some(evicted) = self.prime_fb_cache.remove(&oldest_key) {
-                            let _ = self.card.destroy_framebuffer(evicted.fb);
-                        }
-                    }
-                }
-                self.prime_fb_cache_order.push_back(key);
-                self.prime_fb_cache.insert(
-                    key,
-                    PrimeFbCacheEntry {
-                        fb,
-                        width: descriptor.width,
-                        height: descriptor.height,
-                        fourcc,
-                        modifier,
-                    },
-                );
-            }
+            // NOTE: the freshly-imported `fb` is deliberately NOT
+            // inserted into `prime_fb_cache` here. Insertion happens
+            // only after the present below actually succeeds (see
+            // "commit the new FB to the cache" at the tail of this
+            // function).
+            //
+            // Inserting up-front left the cache holding a handle that
+            // every error path immediately destroyed, so one transient
+            // EBUSY / flip timeout poisoned the cache: the next frame
+            // reusing that DMA-BUF got a cache hit on a destroyed
+            // handle, the commit failed EINVAL, and
+            // `prime_scanout_permanently_rejected` read that EINVAL as
+            // a permanent modifier rejection and demoted the output to
+            // CPU blit for the rest of the session.
             fb
         };
 
@@ -3093,7 +3087,11 @@ impl KmsDisplay {
                     // blocks until events arrive — same loop the legacy
                     // `present()` path uses.
                     if let Err(e) = self.wait_page_flip() {
-                        let _ = self.card.destroy_framebuffer(new_fb);
+                        // Only destroy an FB this call created. A cache-owned FB
+                        // stays alive — the cache still references it.
+                        if !fb_is_cached {
+                            let _ = self.card.destroy_framebuffer(new_fb);
+                        }
                         return Err(e.context("display_prime_page_flip_failed: receive_events"));
                     }
                     // The bars-overlay back buffer just submitted has
@@ -3113,7 +3111,11 @@ impl KmsDisplay {
                     // live while nothing composes them.
                     self.disable_bars_overlay();
                     if let Err(e2) = self.set_crtc_prime(new_fb) {
-                        let _ = self.card.destroy_framebuffer(new_fb);
+                        // Only destroy an FB this call created. A cache-owned FB
+                        // stays alive — the cache still references it.
+                        if !fb_is_cached {
+                            let _ = self.card.destroy_framebuffer(new_fb);
+                        }
                         return Err(e2);
                     }
                 }
@@ -3126,7 +3128,11 @@ impl KmsDisplay {
                     // cause a busy pipeline, and doing so on a one-frame
                     // collision permanently downgraded the composition
                     // path mid-session (observed 2026-06-11).
-                    let _ = self.card.destroy_framebuffer(new_fb);
+                    // Only destroy an FB this call created. A cache-owned FB
+                    // stays alive — the cache still references it.
+                    if !fb_is_cached {
+                        let _ = self.card.destroy_framebuffer(new_fb);
+                    }
                     return Err(anyhow::anyhow!(
                         "display_prime_page_flip_failed: atomic_commit busy (frame dropped): {e}"
                     ));
@@ -3146,14 +3152,22 @@ impl KmsDisplay {
                         match self.atomic_present(new_fb, descriptor.width, descriptor.height, fourcc_is_yuv(fourcc)) {
                             Ok(()) => {
                                 if let Err(e2) = self.wait_page_flip() {
-                                    let _ = self.card.destroy_framebuffer(new_fb);
+                                    // Only destroy an FB this call created. A cache-owned FB
+                                    // stays alive — the cache still references it.
+                                    if !fb_is_cached {
+                                        let _ = self.card.destroy_framebuffer(new_fb);
+                                    }
                                     return Err(e2.context(
                                         "display_prime_page_flip_failed: receive_events (bars-retry)",
                                     ));
                                 }
                             }
                             Err(retry_err) => {
-                                let _ = self.card.destroy_framebuffer(new_fb);
+                                // Only destroy an FB this call created. A cache-owned FB
+                                // stays alive — the cache still references it.
+                                if !fb_is_cached {
+                                    let _ = self.card.destroy_framebuffer(new_fb);
+                                }
                                 return Err(anyhow::anyhow!(
                                     "display_prime_page_flip_failed: atomic_commit \
                                      (also failed without bars): {retry_err:?}"
@@ -3185,7 +3199,11 @@ impl KmsDisplay {
                                 ) {
                                     Ok(()) => {
                                         if let Err(e2) = self.wait_page_flip() {
-                                            let _ = self.card.destroy_framebuffer(new_fb);
+                                            // Only destroy an FB this call created. A cache-owned FB
+                                            // stays alive — the cache still references it.
+                                            if !fb_is_cached {
+                                                let _ = self.card.destroy_framebuffer(new_fb);
+                                            }
                                             return Err(e2.context(
                                                 "display_prime_page_flip_failed: receive_events (yuv-overlay-retry)",
                                             ));
@@ -3195,7 +3213,11 @@ impl KmsDisplay {
                                         // Secondary plane ALSO rejected it — don't
                                         // keep retrying a broken plane every frame.
                                         self.yuv_overlay = None;
-                                        let _ = self.card.destroy_framebuffer(new_fb);
+                                        // Only destroy an FB this call created. A cache-owned FB
+                                        // stays alive — the cache still references it.
+                                        if !fb_is_cached {
+                                            let _ = self.card.destroy_framebuffer(new_fb);
+                                        }
                                         return Err(anyhow::anyhow!(
                                             "display_prime_page_flip_failed: atomic_commit \
                                              (also failed on secondary NV12 plane): {retry_err:?}"
@@ -3208,14 +3230,22 @@ impl KmsDisplay {
                                     "display: no secondary NV12-capable plane available \
                                      ({promote_err:#}) — falling back to sysmem"
                                 );
-                                let _ = self.card.destroy_framebuffer(new_fb);
+                                // Only destroy an FB this call created. A cache-owned FB
+                                // stays alive — the cache still references it.
+                                if !fb_is_cached {
+                                    let _ = self.card.destroy_framebuffer(new_fb);
+                                }
                                 return Err(anyhow::anyhow!(
                                     "display_prime_page_flip_failed: atomic_commit: {msg}"
                                 ));
                             }
                         }
                     } else {
-                        let _ = self.card.destroy_framebuffer(new_fb);
+                        // Only destroy an FB this call created. A cache-owned FB
+                        // stays alive — the cache still references it.
+                        if !fb_is_cached {
+                            let _ = self.card.destroy_framebuffer(new_fb);
+                        }
                         return Err(anyhow::anyhow!(
                             "display_prime_page_flip_failed: atomic_commit: {msg}"
                         ));
@@ -3224,10 +3254,57 @@ impl KmsDisplay {
             }
         } else {
             if let Err(e) = self.set_crtc_prime(new_fb) {
-                let _ = self.card.destroy_framebuffer(new_fb);
+                // Only destroy an FB this call created. A cache-owned FB
+                // stays alive — the cache still references it.
+                if !fb_is_cached {
+                    let _ = self.card.destroy_framebuffer(new_fb);
+                }
                 return Err(e);
             }
         }
+
+        // The present succeeded — commit the new FB to the cache.
+        //
+        // Deferred to here (rather than at import time) so a failed
+        // present never leaves a destroyed handle in the cache. Every
+        // error path above returns before this point, having destroyed
+        // the FB only if this call created it.
+        if !fb_is_cached {
+            if let Some(key) = cache_key {
+                if let Some(old) = self.prime_fb_cache.remove(&key) {
+                    // Format changed for a recurring buffer object
+                    // (rare — e.g. a decoder resolution change reusing
+                    // the same underlying DMA-BUF). Destroy the stale
+                    // entry and drop its order-queue slot so eviction
+                    // bookkeeping stays consistent.
+                    let _ = self.card.destroy_framebuffer(old.fb);
+                    self.prime_fb_cache_order.retain(|k| *k != key);
+                }
+                if self.prime_fb_cache.len() >= PRIME_FB_CACHE_CAPACITY {
+                    if let Some(oldest_key) = self.prime_fb_cache_order.pop_front() {
+                        if let Some(evicted) = self.prime_fb_cache.remove(&oldest_key) {
+                            let _ = self.card.destroy_framebuffer(evicted.fb);
+                        }
+                    }
+                }
+                self.prime_fb_cache_order.push_back(key);
+                self.prime_fb_cache.insert(
+                    key,
+                    PrimeFbCacheEntry {
+                        fb: new_fb,
+                        width: descriptor.width,
+                        height: descriptor.height,
+                        fourcc,
+                        modifier,
+                    },
+                );
+                fb_is_cached = true;
+            }
+        }
+        // Silence the unused-assignment lint: `fb_is_cached` is written
+        // above purely to document that ownership has transferred to
+        // the cache, and is not read again in this function.
+        let _ = fb_is_cached;
 
         // The kernel has promoted `new_fb` to the active scanout
         // source. The *previous* FB (whatever was active before this
