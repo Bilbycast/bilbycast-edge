@@ -114,6 +114,12 @@ jobs:
           repository: Bilbycast/bilbycast-decklink-rs
           path: bilbycast-decklink-rs
 
+      - name: Checkout bilbycast-rga-rs (path dependency)
+        uses: actions/checkout@v7
+        with:
+          repository: Bilbycast/bilbycast-rga-rs
+          path: bilbycast-rga-rs
+
       - name: Checkout bilbycast-edge
         uses: actions/checkout@v7
         with:
