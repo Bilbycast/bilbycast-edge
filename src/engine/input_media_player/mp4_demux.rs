@@ -701,10 +701,23 @@ async fn play_demuxed(
     let cold_epoch = now_ns.saturating_add(PREROLL_NS);
     let carried = session.cont.last_scheduled_deadline_ns();
     let splice_guard_ns = crate::engine::input_media_player::splice_guard_ns();
+    // Floor at `cold_epoch` (now + PREROLL_NS), not bare `now_ns`: a stale
+    // carried deadline (file-open/probe on the new source took longer than
+    // the splice guard covers — routine on slow ARM hosts opening a large,
+    // heavily-indexed MP4) must still leave the pacer its warm-up margin.
+    // Flooring at `now_ns` alone schedules the first bundle with zero
+    // preroll — `[anchor - dur, anchor)` then starts before `now_ns`, so
+    // the pacer emits it as already-late, bursting the file's opening
+    // bundles out back-to-back instead of pacing them. Audio's hardware
+    // buffer absorbs that burst; video, bound by vsync/page-flip, cannot
+    // drain it instantly and falls behind by roughly the burst duration
+    // (observed: several seconds on `bilby-pi`, a slow RK3568 host, on the
+    // transition into a large MP4 whose demuxed-cache miss meant a real
+    // parse rather than a cache hit).
     let epoch_ns = if carried == 0 {
         cold_epoch
     } else {
-        carried.saturating_add(splice_guard_ns).max(now_ns)
+        carried.saturating_add(splice_guard_ns).max(cold_epoch)
     };
     let mut bundle = BytesMut::with_capacity(session.bundle_size);
 
