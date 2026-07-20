@@ -2039,6 +2039,64 @@ mod tests {
         assert_eq!(new_delta, src_delta, "PTS-DTS delta preserved");
     }
 
+    /// A PES header carrying **both** PTS and DTS must come out of the
+    /// byte-level rewrite with both fields updated *and* the right marker
+    /// nibbles — `0b0011` on the PTS field, `0b0001` on the DTS field
+    /// (ISO/IEC 13818-1 §2.4.3.7). Leaving the PTS-only marker (`0b0010`) on a
+    /// PTS+DTS header makes a conforming demuxer misparse the pair, so the
+    /// marker is as load-bearing as the value — and `extract_pes_*` read the
+    /// values without checking it. `dts_pts_delta_preserved` covers the
+    /// arithmetic in `rewrite_pes_values`; this covers the packet rewrite that
+    /// carries it onto the wire.
+    #[test]
+    fn pes_dts_rewritten_in_place_with_correct_markers() {
+        let mut r = TsPtsRewriter::new(make_wallclock_pacer());
+        let mut buf = Vec::new();
+        r.process(&build_psi(0x100, 0x101), &mut buf);
+        let _ = r.rewrite_pcr_value(5_000_000); // anchor
+
+        let src_pts: u64 = 5_000_000 / 300 + 9000; // 100 ms after PCR
+        let src_dts: u64 = src_pts - 3600; // DTS leads PTS by 40 ms
+
+        let mut out = Vec::new();
+        r.process(&build_pes_packet_pts_and_dts(0x100, src_pts, src_dts), &mut out);
+
+        // `process` may emit injected PSI / padding ahead of the PES, so find
+        // the video PES rather than assuming it is the first packet out.
+        let pes = out
+            .chunks_exact(TS_PACKET_SIZE)
+            .find(|p| {
+                let pid = (((p[1] & 0x1F) as u16) << 8) | p[2] as u16;
+                pid == 0x100 && p[1] & 0x40 != 0
+            })
+            .expect("video PES packet present in output");
+
+        let new_pts = extract_pes_pts(pes).expect("PES PTS present");
+        let new_dts = extract_pes_dts(pes).expect("PES DTS present");
+
+        // Guard against a vacuous pass: the source packet already carries the
+        // right delta and markers, so assert the rewrite actually moved both
+        // fields off their source values before checking what it preserved.
+        assert_ne!(new_pts, src_pts, "PTS must be re-anchored after the PCR anchor");
+        assert_ne!(new_dts, src_dts, "DTS must be re-anchored after the PCR anchor");
+
+        // Decode order and the B-frame reorder gap survive the rewrite.
+        assert_eq!(
+            new_pts.wrapping_sub(new_dts) & 0x1_FFFF_FFFF,
+            src_pts - src_dts,
+            "PTS-DTS delta must survive the byte-level rewrite",
+        );
+
+        // AFC is 0b01 on this packet, so the payload starts at offset 4: the
+        // PTS field is at 4+9 and the DTS field at 4+14.
+        assert_eq!(
+            pes[13] >> 4,
+            0b0011,
+            "PTS marker nibble must stay 0b0011 while DTS is present",
+        );
+        assert_eq!(pes[18] >> 4, 0b0001, "DTS marker nibble must be 0b0001");
+    }
+
     /// Audio lipsync offset is applied; video unaffected.
     #[test]
     fn lipsync_audio_only() {

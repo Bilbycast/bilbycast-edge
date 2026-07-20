@@ -1033,7 +1033,7 @@ mod tune_tests {
 #[cfg(test)]
 mod preset_tests {
     use super::sanitise_preset;
-    use video_codec::VideoEncoderCodec::{self, *};
+    use video_codec::VideoEncoderCodec::*;
     use video_codec::VideoPreset::{self, *};
 
     const ALL_PRESETS: &[VideoPreset] = &[
