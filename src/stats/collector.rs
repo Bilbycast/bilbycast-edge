@@ -2768,6 +2768,169 @@ impl SdiPlayoutStats {
     }
 }
 
+/// Playback-progress code for [`MediaPlayerStats::state`]. `u8` (not an enum)
+/// so the hot path can `store`/`load` it with a plain `AtomicU8` — converted
+/// to a string only at snapshot time.
+pub mod media_player_state {
+    pub const STARTING: u8 = 0;
+    pub const PLAYING: u8 = 1;
+    pub const STALLED: u8 = 2;
+    pub const FAILED: u8 = 3;
+    pub const EXHAUSTED: u8 = 4;
+
+    pub fn as_str(code: u8) -> &'static str {
+        match code {
+            PLAYING => "playing",
+            STALLED => "stalled",
+            FAILED => "failed",
+            EXHAUSTED => "exhausted",
+            _ => "starting",
+        }
+    }
+}
+
+/// Lock-free media-player playout telemetry for one input, written by the
+/// `ts` / `mp4` / `image` per-format players and read by the snapshot path.
+///
+/// Exists because the media player synthesises its own MPEG-TS from a local
+/// file — `play_source()` returning `Ok(())` only means the demuxer/muxer
+/// didn't error, not that usable video ever reached the wire (see
+/// `docs/events-and-alarms.md` "Media Player Input"). `pacer_lateness_*`
+/// is the closest signal the player itself can observe for "am I keeping up
+/// with the file's own timeline": the input side is architecturally never
+/// blocked by a slow downstream broadcast subscriber (see root `CLAUDE.md`
+/// "Backpressure rule"), so this cannot see receiver-side decode stalls —
+/// only whether the player's own OS-thread pacer (`run_paced_emitter`) is
+/// falling behind the byte-rate schedule it computed for the file, which is
+/// exactly what a bursty large-sample source (oversized IDR, VBR spike)
+/// produces.
+#[derive(Debug, Default)]
+pub struct MediaPlayerStats {
+    /// One of the [`media_player_state`] codes.
+    pub state: AtomicU8,
+    /// Index of the source currently (or most recently) playing within the
+    /// input's playlist.
+    pub current_source_index: AtomicU64,
+    /// Video access units read from the container / muxed onto the wire.
+    pub video_samples_read: AtomicU64,
+    pub video_samples_emitted: AtomicU64,
+    /// Audio access units read from the container / muxed onto the wire.
+    pub audio_samples_read: AtomicU64,
+    pub audio_samples_emitted: AtomicU64,
+    /// Largest single compressed video access unit observed (bytes, pre-Annex-B
+    /// expansion). The `MEDIA_PLAYER_BURSTY_MP4_ISSUE` failure mode correlates
+    /// directly with this — a healthy 24 fps H.264 file's IDR is ~1 KB; the
+    /// file that silently failed playout had a ~512 KB IDR.
+    pub largest_video_sample_bytes: AtomicU64,
+    /// Wall-clock millisecond timestamp ([`crate::util::time::now_us`] / 1000)
+    /// of the last video / audio sample muxed onto the wire. `0` = none yet.
+    pub last_video_emit_ms: AtomicU64,
+    pub last_audio_emit_ms: AtomicU64,
+    /// Current occupancy of the OS-thread pacer's bounded hand-off queue
+    /// (`PACER_QUEUE_CAP`). Sustained values at capacity mean the producer
+    /// is generating bundles faster than the pacer can drain them at the
+    /// paced bitrate — the signature of a burst.
+    pub pacer_queue_depth: AtomicU64,
+    /// How far behind its computed wall-clock deadline the pacer's most
+    /// recently emitted bundle was, in milliseconds. `0` when on schedule or
+    /// running ahead.
+    pub pacer_lateness_current_ms: AtomicU64,
+    /// High-water-mark of [`Self::pacer_lateness_current_ms`] since the
+    /// input started (or since the last `reset_peak`).
+    pub pacer_lateness_max_ms: AtomicU64,
+    /// Latch: is the pacer currently considered lagging (crossed the warn
+    /// threshold and hasn't yet recovered below the clear threshold)? Mirrors
+    /// the `signal_present` transition-latch shape used by `sdi_io`'s
+    /// `sdi_signal_lost` / `sdi_signal_restored` pair.
+    pub pacer_lagging: AtomicBool,
+}
+
+impl MediaPlayerStats {
+    /// Record a fresh pacer-lateness observation, updating the running
+    /// high-water-mark. Called from the OS-thread pacer (`run_paced_emitter`)
+    /// after every emitted bundle.
+    pub fn record_pacer_lateness_ms(&self, late_ms: u64) {
+        self.pacer_lateness_current_ms.store(late_ms, Ordering::Relaxed);
+        self.pacer_lateness_max_ms.fetch_max(late_ms, Ordering::Relaxed);
+    }
+
+    /// Snapshot into the serialisable form the manager sees.
+    pub fn snapshot(&self) -> crate::stats::models::MediaPlayerInputStats {
+        let last_video_emit_ms = self.last_video_emit_ms.load(Ordering::Relaxed);
+        let seconds_since_video = if last_video_emit_ms == 0 {
+            None
+        } else {
+            let now_ms = crate::util::time::now_us() / 1000;
+            Some(now_ms.saturating_sub(last_video_emit_ms) as f64 / 1000.0)
+        };
+        crate::stats::models::MediaPlayerInputStats {
+            state: media_player_state::as_str(self.state.load(Ordering::Relaxed)).to_string(),
+            current_source_index: self.current_source_index.load(Ordering::Relaxed),
+            video_samples_read: self.video_samples_read.load(Ordering::Relaxed),
+            video_samples_emitted: self.video_samples_emitted.load(Ordering::Relaxed),
+            audio_samples_read: self.audio_samples_read.load(Ordering::Relaxed),
+            audio_samples_emitted: self.audio_samples_emitted.load(Ordering::Relaxed),
+            largest_video_sample_bytes: self.largest_video_sample_bytes.load(Ordering::Relaxed),
+            seconds_since_video,
+            pacer_queue_depth: self.pacer_queue_depth.load(Ordering::Relaxed),
+            pacer_lateness_current_ms: self.pacer_lateness_current_ms.load(Ordering::Relaxed),
+            pacer_lateness_max_ms: self.pacer_lateness_max_ms.load(Ordering::Relaxed),
+            pacer_lagging: self.pacer_lagging.load(Ordering::Relaxed),
+        }
+    }
+}
+
+#[cfg(test)]
+mod media_player_stats_tests {
+    use super::*;
+
+    #[test]
+    fn record_pacer_lateness_tracks_high_water_mark() {
+        let stats = MediaPlayerStats::default();
+        stats.record_pacer_lateness_ms(10);
+        stats.record_pacer_lateness_ms(300);
+        stats.record_pacer_lateness_ms(50);
+        let snap = stats.snapshot();
+        assert_eq!(snap.pacer_lateness_current_ms, 50, "current tracks the latest observation");
+        assert_eq!(snap.pacer_lateness_max_ms, 300, "max is the high-water-mark, not the latest");
+    }
+
+    #[test]
+    fn seconds_since_video_is_none_before_first_emit() {
+        let stats = MediaPlayerStats::default();
+        assert_eq!(stats.snapshot().seconds_since_video, None);
+    }
+
+    #[test]
+    fn seconds_since_video_is_some_after_first_emit() {
+        // `now_us()` reads a `OnceLock` epoch that only `main()` initializes;
+        // the test binary never calls it, so `now_us()` is otherwise always
+        // 0 here (harmless in production — `main()` sets it before anything
+        // else runs). Idempotent, so safe alongside other tests. A short
+        // real sleep after init guarantees a non-zero elapsed reading —
+        // otherwise `now_us()` could legitimately still be 0 microseconds
+        // after `init_epoch()`, colliding with the "unset" sentinel below.
+        crate::util::time::init_epoch();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let stats = MediaPlayerStats::default();
+        let now_ms = crate::util::time::now_us() / 1000;
+        stats.last_video_emit_ms.store(now_ms, Ordering::Relaxed);
+        let snap = stats.snapshot();
+        assert!(snap.seconds_since_video.is_some());
+        assert!(snap.seconds_since_video.unwrap() < 1.0, "should be near-zero right after emit");
+    }
+
+    #[test]
+    fn state_round_trips_through_snapshot() {
+        let stats = MediaPlayerStats::default();
+        assert_eq!(stats.snapshot().state, "starting");
+        stats.state.store(media_player_state::PLAYING, Ordering::Relaxed);
+        assert_eq!(stats.snapshot().state, "playing");
+        stats.state.store(media_player_state::STALLED, Ordering::Relaxed);
+        assert_eq!(stats.snapshot().state, "stalled");
+    }
+}
+
 /// Per-flow atomic counters for a single media flow (one input, N outputs).
 ///
 /// Holds input-side counters (`input_packets`, `input_bytes`, `input_loss`,
@@ -2823,6 +2986,10 @@ pub struct FlowStatsAccumulator {
     /// is plain atomics with no DeckLink dependency, so builds without
     /// `sdi-decklink` simply leave the map empty.
     pub sdi_capture_stats: DashMap<String, Arc<SdiCaptureStats>>,
+    /// Media-player playout telemetry, keyed by `input_id`. Same per-input
+    /// model as `sdi_capture_stats`. Registered by
+    /// `crate::engine::input_media_player::spawn_media_player_input`.
+    pub media_player_stats: DashMap<String, Arc<MediaPlayerStats>>,
     // Per-output stats
     pub output_stats: DashMap<String, Arc<OutputStatsAccumulator>>,
     pub input_throughput: ThroughputEstimator,
@@ -3067,6 +3234,7 @@ impl FlowStatsAccumulator {
             buffered_hitless_snapshot: std::sync::RwLock::new(None),
             ingress_dejitter_stats: DashMap::new(),
             sdi_capture_stats: DashMap::new(),
+            media_player_stats: DashMap::new(),
             output_stats: DashMap::new(),
             input_throughput: ThroughputEstimator::new(),
             tr101290: OnceLock::new(),
@@ -3446,6 +3614,15 @@ impl FlowStatsAccumulator {
     )]
     pub fn set_sdi_capture_stats(&self, input_id: &str, stats: Arc<SdiCaptureStats>) {
         self.sdi_capture_stats.insert(input_id.to_string(), stats);
+    }
+
+    /// Register a per-input media-player telemetry handle (keyed by
+    /// `input_id`) so the snapshot can surface playout state, sample
+    /// progress, and pacer health. Called once per media-player input at
+    /// startup by `crate::engine::input_media_player::run`. Idempotent on
+    /// re-register — the latest handle wins.
+    pub fn set_media_player_stats(&self, input_id: &str, stats: Arc<MediaPlayerStats>) {
+        self.media_player_stats.insert(input_id.to_string(), stats);
     }
 
     /// Replace the header fields (`input_type` + `InputConfigMeta`) that the
@@ -3977,6 +4154,10 @@ impl FlowStatsAccumulator {
                         .get(active_key)
                         .map(|h| h.depth.load(Ordering::Relaxed) as u64),
                     sdi_stats: self.sdi_capture_stats.get(active_key).map(|h| h.snapshot()),
+                    media_player_stats: self
+                        .media_player_stats
+                        .get(active_key)
+                        .map(|h| h.snapshot()),
                     transcode_stats: in_transcode,
                     audio_decode_stats: in_audio_decode,
                     audio_encode_stats: in_audio_encode,

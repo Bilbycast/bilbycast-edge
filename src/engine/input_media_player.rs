@@ -43,7 +43,7 @@ use tokio_util::sync::CancellationToken;
 use crate::config::models::{MediaPlayerInputConfig, MediaPlayerSource};
 use crate::engine::packet::RtpPacket;
 use crate::manager::events::{EventSender, EventSeverity, category};
-use crate::stats::collector::FlowStatsAccumulator;
+use crate::stats::collector::{FlowStatsAccumulator, MediaPlayerStats, media_player_state};
 
 #[cfg(all(feature = "media-codecs", feature = "fdk-aac"))]
 mod image_slate;
@@ -89,9 +89,32 @@ const PACER_QUEUE_CAP: usize = 16;
 /// one bundle period of any change.
 struct PacerMsg {
     pkt: crate::engine::packet::RtpPacket,
+    /// **Explicit absolute emission deadline** in the pacer's monotonic
+    /// clock domain (`crate::engine::wire_emit::monotonic_now_ns`).
+    ///
+    /// - `Some(t)` — the producer has computed the exact wall time this
+    ///   bundle must hit the wire. The OS thread sleeps to `t` and emits,
+    ///   ignoring `bitrate_bps`/`content_src_bytes`. Used by the **MP4
+    ///   path** (`mp4_demux::play_demuxed`), which anchors each video
+    ///   sample's first (PCR-bearing) bundle to the sample's true
+    ///   presentation time and spreads the sample's remaining bundles
+    ///   across the sample's own duration. This keeps PCR-packet arrival
+    ///   exactly linear in PCR value (TR-101290 PCR_AC / PCR_repetition
+    ///   pass) while still smoothing a large sample's packet burst — the
+    ///   byte-rate mode below can't do both, because byte-rate pacing
+    ///   decouples packet arrival from the sample-timestamp PCR clock and
+    ///   drifts on VBR content (verified on hardware: byte-rate pacing an
+    ///   MP4 grew `pcr_accuracy_errors` continuously, this deadline mode
+    ///   holds them at zero).
+    /// - `None` — byte-rate mode: the OS thread computes the deadline from
+    ///   `bitrate_bps` + `content_src_bytes`. Used by the **TS-passthrough
+    ///   path** (`play_ts_file`), which has no per-sample presentation
+    ///   timeline to anchor to (its PCR is already in the source bytes and
+    ///   real TS files are well-behaved / near-CBR).
+    target_ns: Option<u64>,
     /// Producer's current bitrate estimate (bps) for the file. The OS
     /// thread re-anchors `iter_start_wall` whenever this differs from
-    /// its last-seen value.
+    /// its last-seen value. Ignored when `target_ns` is `Some`.
     bitrate_bps: u64,
     /// Number of **source** TS bytes this message represents — i.e. how
     /// much file-content was consumed to produce `pkt`, *including* bytes
@@ -294,6 +317,18 @@ async fn run(
     // sequence is continuous regardless of how many times we wrap around
     // or move between sources.
     let mut cont = SpliceContinuity::default();
+    // Per-input demux cache — persists across the playlist loop so a looping
+    // MP4 is demuxed once, not re-read into RAM every loop. See
+    // `mp4_demux::DemuxCache` / `DemuxCacheField`.
+    let mut demux_cache = DemuxCacheField::default();
+
+    // Playout telemetry for the whole input's lifetime — see
+    // `MediaPlayerStats` doc comment for why this exists independently of
+    // `play_source()`'s `Result`. Registered once so the manager can read
+    // it via `InputStats.media_player_stats` immediately, even before the
+    // first source starts.
+    let media_stats = Arc::new(MediaPlayerStats::default());
+    stats.set_media_player_stats(&input_id, media_stats.clone());
 
     loop {
         let mut order: Vec<usize> = (0..config.sources.len()).collect();
@@ -316,6 +351,8 @@ async fn run(
             } else {
                 None
             };
+            media_stats.current_source_index.store(idx as u64, Ordering::Relaxed);
+            media_stats.state.store(media_player_state::STARTING, Ordering::Relaxed);
             let mut session = PlayerSession {
                 seq_num: &mut seq_num,
                 per_input_tx: &per_input_tx,
@@ -327,9 +364,15 @@ async fn run(
                 post: &mut post,
                 splice_gap_signal: gap_signal,
                 bundle_size,
+                media_stats: &media_stats,
+                events: &events,
+                flow_id: &flow_id,
+                input_id: &input_id,
+                demux_cache: &mut demux_cache,
             };
             let result = play_source(source, &config, &mut session).await;
             if let Err(e) = result {
+                media_stats.state.store(media_player_state::FAILED, Ordering::Relaxed);
                 let error_code = classify_playback_error(&e);
                 events.emit_flow_with_details(
                     EventSeverity::Critical,
@@ -357,6 +400,7 @@ async fn run(
         }
 
         if !config.loop_playback {
+            media_stats.state.store(media_player_state::EXHAUSTED, Ordering::Relaxed);
             events.emit_flow(
                 EventSeverity::Info,
                 category::FLOW,
@@ -408,7 +452,33 @@ pub(super) struct PlayerSession<'a> {
     /// more, smaller datagrams for a low-MTU / tunnel path; larger → jumbo
     /// datagrams for a LAN. Tests construct with the module [`BUNDLE_SIZE`].
     pub(super) bundle_size: usize,
+    /// Playout telemetry for the whole input's lifetime — see
+    /// [`MediaPlayerStats`] doc comment. Shared (not per-source) so progress
+    /// counters and pacer-lateness history survive across playlist entries.
+    pub(super) media_stats: &'a Arc<MediaPlayerStats>,
+    /// Event sender + scope, used for the pacer-lateness latch alarm
+    /// (`media_player_pacer_lagging` / `_recovered`) alongside the existing
+    /// `media_player_source_*` failure events emitted in `run()`.
+    pub(super) events: &'a EventSender,
+    pub(super) flow_id: &'a str,
+    pub(super) input_id: &'a str,
+    /// Per-input demux cache — lets a looping MP4 be demuxed once instead of
+    /// re-read into RAM every loop (see `mp4_demux::DemuxCache`). Borrowed
+    /// from the task-level state so it persists across the playlist. `()` on
+    /// builds without MP4 support (the `mp4` source kind errors there anyway).
+    pub(super) demux_cache: &'a mut DemuxCacheField,
 }
+
+/// The demux-cache type threaded through [`PlayerSession`]. Real cache with
+/// MP4 support compiled in; a zero-sized `()` placeholder otherwise (the
+/// `mp4` source kind returns an error without the codecs, so it's never used).
+/// A cfg-selected alias keeps `PlayerSession` and its construction sites free
+/// of `#[cfg]` noise — both variants implement `Default`, so callers just
+/// write `DemuxCacheField::default()`.
+#[cfg(all(feature = "media-codecs", feature = "fdk-aac"))]
+pub(super) type DemuxCacheField = mp4_demux::DemuxCache;
+#[cfg(not(all(feature = "media-codecs", feature = "fdk-aac")))]
+pub(super) type DemuxCacheField = ();
 
 /// 30 ms gap inserted between the previous file's last emitted PTS and the
 /// next file's first emitted PTS. ≥ 1 video frame at every common rate
@@ -471,12 +541,28 @@ pub(super) struct SpliceContinuity {
     /// preceding stream to be discontinuous from.
     has_played_at_least_one_file: bool,
 
-    /// Converged cumulative bitrate from the previous `play_ts_file` call.
-    /// Carried across loops so the OS-thread pacer starts at the known-good
-    /// rate instead of the head-scan estimate (which overshoots by 10-20%
-    /// on the first second of every loop, accumulating wire_tx excess that
-    /// never drains).
+    /// Converged cumulative bitrate from the previous `play_ts_file` /
+    /// `play_demuxed` call. Carried across loops so the OS-thread pacer
+    /// starts at the known-good rate instead of the head-scan estimate
+    /// (which overshoots by 10-20% on the first second of every loop,
+    /// accumulating wire_tx excess that never drains).
+    ///
+    /// **Only valid for a loop of the same source** — see
+    /// [`Self::last_converged_bitrate_source`]. Read this field directly
+    /// only through a check against that source id; a bare read here would
+    /// reintroduce issue #68 (a playlist transition to a different file
+    /// with a different bitrate starting its pacer at the previous file's
+    /// rate).
     pub(super) last_converged_bitrate_bps: Option<u64>,
+    /// Source identity (matches [`source_name_str`]) that produced
+    /// [`Self::last_converged_bitrate_bps`]. `SpliceContinuity` persists
+    /// for the whole playlist's lifetime, so without this scope check the
+    /// carried rate leaks across a transition to a genuinely different
+    /// file — a materially different bitrate, frame rate, or GOP structure
+    /// then starts the new file's pacer at the wrong rate, producing pacer
+    /// queue growth / excess lateness / bursty delivery right at the
+    /// playlist boundary (issue #68). `None` until the first file closes.
+    pub(super) last_converged_bitrate_source: Option<String>,
 }
 
 impl SpliceContinuity {
@@ -546,6 +632,28 @@ impl SpliceContinuity {
             self.last_layout = Some(new_layout);
         }
         changed
+    }
+
+    /// The carried pacer bitrate, scoped to a loop of `source_id` — `None`
+    /// on a genuine transition to a different source, even though
+    /// [`Self::last_converged_bitrate_bps`] itself is still populated from
+    /// whatever source played last. See the field doc comment and issue
+    /// #68 for why this scope check exists.
+    pub(super) fn carried_bitrate_for(&self, source_id: &str) -> Option<u64> {
+        if self.last_converged_bitrate_source.as_deref() == Some(source_id) {
+            self.last_converged_bitrate_bps
+        } else {
+            None
+        }
+    }
+
+    /// Record the converged pacer bitrate for `source_id`, called at the
+    /// end of each per-format player. Pairs with
+    /// [`Self::carried_bitrate_for`] — always write both fields together so
+    /// they can never disagree about which source the rate belongs to.
+    pub(super) fn set_converged_bitrate(&mut self, source_id: &str, bps: u64) {
+        self.last_converged_bitrate_bps = Some(bps);
+        self.last_converged_bitrate_source = Some(source_id.to_string());
     }
 }
 
@@ -628,7 +736,7 @@ async fn play_source(
         }
         MediaPlayerSource::Mp4 { name } => {
             let path = resolve_media_path(name)?;
-            play_mp4(&path, session).await
+            play_mp4(&path, cfg.paced_bitrate_bps, session).await
         }
         MediaPlayerSource::Image {
             name,
@@ -771,7 +879,15 @@ async fn play_ts_file(
     // head scan > default fallback. The carried rate eliminates the
     // 50-second convergence transient that otherwise overshoots on every
     // loop restart and accumulates wire_tx excess.
-    let carried = session.cont.last_converged_bitrate_bps;
+    //
+    // The carried rate is scoped to a loop of *this exact source* — see
+    // `SpliceContinuity::carried_bitrate_for`. `SpliceContinuity` persists
+    // for the whole playlist, so a bare read of `last_converged_bitrate_bps`
+    // would leak the previous (possibly very different) file's rate across
+    // a playlist transition, starting the new file's pacer at the wrong
+    // rate right at the boundary (issue #68).
+    let source_id = path.file_name().and_then(|n| n.to_str()).unwrap_or("?");
+    let carried = session.cont.carried_bitrate_for(source_id);
     let pacer_initial_bitrate = paced_bitrate_bps
         .or(carried)
         .or(head_bitrate)
@@ -784,12 +900,8 @@ async fn play_ts_file(
         std::sync::mpsc::sync_channel::<PacerMsg>(PACER_QUEUE_CAP);
     let broadcast_for_pacer = session.per_input_tx.clone();
     let cancel_for_pacer = session.cancel.clone();
-    let pacer_thread_name = format!(
-        "media-pacer-{}",
-        path.file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("?")
-    );
+    let media_stats_for_pacer = session.media_stats.clone();
+    let pacer_thread_name = format!("media-pacer-{source_id}");
     let pacer_thread = std::thread::Builder::new()
         .name(pacer_thread_name.clone())
         .spawn(move || {
@@ -799,6 +911,7 @@ async fn play_ts_file(
                 broadcast_for_pacer,
                 pacer_initial_bitrate,
                 cancel_for_pacer,
+                media_stats_for_pacer,
             );
         })
         .with_context(|| "spawn media-player pacer thread")?;
@@ -1091,12 +1204,18 @@ async fn play_ts_file(
             // this threshold, since appends are whole 188-byte packets) so the
             // windowed bitrate estimator stays correct for any datagram size.
             bytes_emitted = bytes_emitted.saturating_add(bundle.len() as u64);
-            if !emit_to_pacer(
+            let data = std::mem::replace(
                 &mut bundle,
+                BytesMut::with_capacity(session.bundle_size),
+            )
+            .freeze();
+            if !emit_to_pacer(
+                data,
                 session,
                 &pacer_tx,
                 current_bitrate_bps,
                 &mut pending_src_bytes,
+                None, // TS passthrough: byte-rate mode
             )
             .await
             {
@@ -1107,19 +1226,26 @@ async fn play_ts_file(
 
     // Flush the trailing partial bundle so we don't lose the file's tail.
     if !bundle.is_empty() {
-        let _ = emit_to_pacer(
+        let data = std::mem::replace(
             &mut bundle,
+            BytesMut::with_capacity(session.bundle_size),
+        )
+        .freeze();
+        let _ = emit_to_pacer(
+            data,
             session,
             &pacer_tx,
             current_bitrate_bps,
             &mut pending_src_bytes,
+            None, // TS passthrough: byte-rate mode
         )
         .await;
     }
 
-    // Carry the converged cumulative rate to the next loop so the pacer
-    // starts at the known-good rate instead of the head-scan estimate.
-    session.cont.last_converged_bitrate_bps = Some(current_bitrate_bps);
+    // Carry the converged cumulative rate to the next loop of *this same
+    // source* so the pacer starts at the known-good rate instead of the
+    // head-scan estimate (see `carried_bitrate_for`/issue #68 above).
+    session.cont.set_converged_bitrate(source_id, current_bitrate_bps);
 
     // Tear down the OS-thread pacer: dropping the sender lets the thread's
     // `recv_timeout` poll see `Disconnected` on its next iteration (within
@@ -1708,12 +1834,20 @@ pub(super) fn try_set_discontinuity_indicator(pkt: &mut [u8; TS_PACKET]) -> bool
 // ── MP4 + Image dispatch (Phase 3 / 4) ──────────────────────────────────
 
 #[cfg(all(feature = "media-codecs", feature = "fdk-aac"))]
-async fn play_mp4(path: &Path, session: &mut PlayerSession<'_>) -> Result<()> {
-    mp4_demux::play_mp4_file(path, session).await
+async fn play_mp4(
+    path: &Path,
+    paced_bitrate_bps: Option<u64>,
+    session: &mut PlayerSession<'_>,
+) -> Result<()> {
+    mp4_demux::play_mp4_file(path, paced_bitrate_bps, session).await
 }
 
 #[cfg(not(all(feature = "media-codecs", feature = "fdk-aac")))]
-async fn play_mp4(_path: &Path, _session: &mut PlayerSession<'_>) -> Result<()> {
+async fn play_mp4(
+    _path: &Path,
+    _paced_bitrate_bps: Option<u64>,
+    _session: &mut PlayerSession<'_>,
+) -> Result<()> {
     Err(anyhow!(
         "media-player MP4 source requires the 'media-codecs' and 'fdk-aac' features — rebuild the edge with those enabled, or use a pre-encoded .ts file instead"
     ))
@@ -1797,9 +1931,9 @@ fn fake_rtp_ts(_session: &PlayerSession<'_>) -> u32 {
     ((now_us / 1_000) * 90).rem_euclid(0x1_0000_0000) as u32
 }
 
-/// Drain `bundle` into an `RtpPacket`, run the optional input transcoder
-/// + post-processor under `block_in_place`, and push the result to the
-/// OS-thread pacer for absolute-deadline emission. Returns `true` on
+/// Wrap a ready TS `data` bundle into an `RtpPacket`, run the optional input
+/// transcoder + post-processor under `block_in_place`, and push the result to
+/// the OS-thread pacer for absolute-deadline emission. Returns `true` on
 /// success and `false` if the OS thread has shut down (channel
 /// disconnected) — the async loop should bail when that happens.
 ///
@@ -1810,7 +1944,7 @@ fn fake_rtp_ts(_session: &PlayerSession<'_>) -> u32 {
 /// `send()` that could stall a worker for tens of ms when a slow
 /// downstream broadcast subscriber back-pressures the OS thread.
 async fn emit_to_pacer(
-    bundle: &mut BytesMut,
+    data: Bytes,
     session: &mut PlayerSession<'_>,
     pacer_tx: &std::sync::mpsc::SyncSender<PacerMsg>,
     bitrate_bps: u64,
@@ -1818,12 +1952,14 @@ async fn emit_to_pacer(
     // nothing). Carried across calls so the next message that DOES emit is
     // credited with the full source-content it represents — see `PacerMsg`.
     pending_src_bytes: &mut u64,
+    // Explicit absolute emission deadline (MP4 sample-anchored path). `None`
+    // ⇒ byte-rate mode (TS passthrough). See [`PacerMsg::target_ns`].
+    target_ns: Option<u64>,
 ) -> bool {
-    if bundle.is_empty() {
+    if data.is_empty() {
         return true;
     }
-    let total_len = bundle.len();
-    let data: Bytes = std::mem::replace(bundle, BytesMut::with_capacity(session.bundle_size)).freeze();
+    let total_len = data.len();
     // `recv_time_us` is filled in by the OS-thread pacer right before
     // the broadcast send so the downstream `output_latency` metric
     // measures only wire_emit's queue + pacer time, not the extra
@@ -1871,6 +2007,7 @@ async fn emit_to_pacer(
     // the producer typically blocks for at most one bundle period.
     let mut to_send = PacerMsg {
         pkt: processed,
+        target_ns,
         bitrate_bps,
         content_src_bytes,
     };
@@ -1879,13 +2016,86 @@ async fn emit_to_pacer(
             return false;
         }
         match pacer_tx.try_send(to_send) {
-            Ok(()) => return true,
+            Ok(()) => {
+                session.media_stats.pacer_queue_depth.fetch_add(1, Ordering::Relaxed);
+                poll_pacer_lateness_latch(session);
+                return true;
+            }
             Err(std::sync::mpsc::TrySendError::Full(msg)) => {
                 to_send = msg;
                 tokio::task::yield_now().await;
             }
             Err(std::sync::mpsc::TrySendError::Disconnected(_)) => return false,
         }
+    }
+}
+
+/// Pacer falls behind its own computed wall-clock schedule by at least this
+/// much before we latch `media_player_pacer_lagging`. `run_paced_emitter`
+/// (SCHED_FIFO / CLOCK_TAI) normally tracks its target within microseconds —
+/// hundreds of ms of accumulated lateness means the producer is handing the
+/// pacer content faster than the paced bitrate can drain it, i.e. a burst.
+const PACER_LATE_WARN_MS: u64 = 250;
+/// Hysteresis: lateness must fall back to at most this before the latch
+/// clears and `media_player_pacer_recovered` fires. Prevents flapping while
+/// lateness oscillates around the warn threshold.
+const PACER_LATE_CLEAR_MS: u64 = 100;
+
+/// Check the pacer-lateness latch and fire `media_player_pacer_lagging` /
+/// `media_player_pacer_recovered` on a transition. Cheap (a few atomic
+/// loads) — safe to call from the hot emit path; the event send itself is
+/// edge-triggered so it only does real work on a state change.
+fn poll_pacer_lateness_latch(session: &PlayerSession<'_>) {
+    let late_ms = session.media_stats.pacer_lateness_current_ms.load(Ordering::Relaxed);
+    let was_lagging = session.media_stats.pacer_lagging.load(Ordering::Relaxed);
+    if !was_lagging && late_ms >= PACER_LATE_WARN_MS {
+        session.media_stats.pacer_lagging.store(true, Ordering::Relaxed);
+        session
+            .media_stats
+            .state
+            .store(media_player_state::STALLED, Ordering::Relaxed);
+        session.events.emit_flow_with_details(
+            EventSeverity::Warning,
+            category::FLOW,
+            format!(
+                "Media-player input '{}': output pacer falling behind schedule ({late_ms} ms late) — \
+                 likely a large/bursty compressed sample outpacing the paced bitrate",
+                session.input_id
+            ),
+            session.flow_id,
+            serde_json::json!({
+                "error_code": "media_player_pacer_lagging",
+                "flow_id": session.flow_id,
+                "input_id": session.input_id,
+                "pacer_lateness_ms": late_ms,
+                "pacer_queue_depth": session.media_stats.pacer_queue_depth.load(Ordering::Relaxed),
+                "largest_video_sample_bytes": session
+                    .media_stats
+                    .largest_video_sample_bytes
+                    .load(Ordering::Relaxed),
+            }),
+        );
+    } else if was_lagging && late_ms <= PACER_LATE_CLEAR_MS {
+        session.media_stats.pacer_lagging.store(false, Ordering::Relaxed);
+        session
+            .media_stats
+            .state
+            .store(media_player_state::PLAYING, Ordering::Relaxed);
+        session.events.emit_flow_with_details(
+            EventSeverity::Info,
+            category::FLOW,
+            format!(
+                "Media-player input '{}': output pacer caught back up to schedule",
+                session.input_id
+            ),
+            session.flow_id,
+            serde_json::json!({
+                "error_code": "media_player_pacer_recovered",
+                "flow_id": session.flow_id,
+                "input_id": session.input_id,
+                "pacer_lateness_ms": late_ms,
+            }),
+        );
     }
 }
 
@@ -1904,6 +2114,7 @@ fn run_paced_emitter(
     broadcast_tx: tokio::sync::broadcast::Sender<RtpPacket>,
     initial_bitrate_bps: u64,
     cancel: tokio_util::sync::CancellationToken,
+    stats: Arc<MediaPlayerStats>,
 ) {
     let sched_fifo = crate::util::runtime_diag::apply_sched_fifo(&thread_name, 50);
     let mut bitrate_bps: u64 = initial_bitrate_bps.max(1);
@@ -1942,39 +2153,63 @@ fn run_paced_emitter(
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
         };
-        // Bitrate refinement piggybacks on every bundle so the OS thread
-        // tracks the producer's view of the file rate even when the
-        // bundle channel is steady-state full. Updates affect FUTURE
-        // inter-bundle spacing only; the next target is the previous
-        // target plus the new bundle period. No retroactive shift of
-        // queued targets, so a rate refinement never produces a burst.
-        if msg.bitrate_bps != 0 {
-            bitrate_bps = msg.bitrate_bps;
-        }
-        // Pace by the SOURCE content this message represents, not a fixed
-        // `BUNDLE_SIZE`. In passthrough `content_src_bytes == BUNDLE_SIZE`
-        // (1 message per source bundle) so behaviour is unchanged; with an
-        // input transcoder the count carries any buffered-then-merged source
-        // bundles, so the file plays at true 1.0x instead of ~2 % fast.
-        // Fall back to BUNDLE_SIZE if a producer ever sends 0 (defensive).
-        let content_bytes = if msg.content_src_bytes != 0 {
-            msg.content_src_bytes
+        // Mirror the producer-side increment in `emit_to_pacer` — this
+        // message just left the hand-off queue.
+        stats.pacer_queue_depth.fetch_sub(1, Ordering::Relaxed);
+
+        // Two timing modes, selected per-message (a given pacer thread only
+        // ever sees one mode, since play_ts_file and play_demuxed each spawn
+        // their own thread — but branching per message keeps the two paths
+        // sharing one emitter body):
+        let target_ns = if let Some(explicit) = msg.target_ns {
+            // ── MP4 sample-anchored mode ──────────────────────────────────
+            // The producer already computed the exact deadline from the
+            // sample presentation timeline. Emit at it verbatim; the
+            // byte-rate state (`next_target_wall`) is unused in this mode.
+            explicit
         } else {
-            BUNDLE_SIZE as u64
+            // ── Byte-rate mode (TS passthrough) ───────────────────────────
+            // Bitrate refinement piggybacks on every bundle so the OS thread
+            // tracks the producer's view of the file rate even when the
+            // bundle channel is steady-state full. Updates affect FUTURE
+            // inter-bundle spacing only; the next target is the previous
+            // target plus the new bundle period. No retroactive shift of
+            // queued targets, so a rate refinement never produces a burst.
+            if msg.bitrate_bps != 0 {
+                bitrate_bps = msg.bitrate_bps;
+            }
+            // Pace by the SOURCE content this message represents, not a fixed
+            // `BUNDLE_SIZE`. In passthrough `content_src_bytes == BUNDLE_SIZE`
+            // (1 message per source bundle) so behaviour is unchanged; with an
+            // input transcoder the count carries any buffered-then-merged
+            // source bundles, so the file plays at true 1.0x instead of ~2 %
+            // fast. Fall back to BUNDLE_SIZE if a producer ever sends 0.
+            let content_bytes = if msg.content_src_bytes != 0 {
+                msg.content_src_bytes
+            } else {
+                BUNDLE_SIZE as u64
+            };
+            bytes_emitted = bytes_emitted.saturating_add(content_bytes);
+            let bundle_period_ns =
+                content_bytes.saturating_mul(8_000_000_000) / bitrate_bps.max(1);
+            let t = next_target_wall;
+            // Advance the running target for the next bundle. If the actual
+            // fire wallclock catches up to (or passes) `next_target_wall`
+            // — e.g. the channel has been silent for a while and the OS
+            // thread had nothing to send — anchor forward from "now" so the
+            // pacer doesn't burst through a backlog of past targets when a
+            // bundle eventually lands.
+            let now = crate::engine::wire_emit::monotonic_now_ns();
+            next_target_wall = t.max(now).saturating_add(bundle_period_ns);
+            t
         };
-        bytes_emitted = bytes_emitted.saturating_add(content_bytes);
-        let bundle_period_ns =
-            content_bytes.saturating_mul(8_000_000_000) / bitrate_bps.max(1);
-        let target_ns = next_target_wall;
-        // Advance the running target for the next bundle. If the actual
-        // fire wallclock catches up to (or passes) `next_target_wall`
-        // — e.g. the channel has been silent for a while and the OS
-        // thread had nothing to send — anchor forward from "now" so the
-        // pacer doesn't burst through a backlog of past targets when a
-        // bundle eventually lands.
+        // How far the pacer has already fallen behind this bundle's own
+        // deadline, in ms. `0` when on schedule or running ahead. The
+        // closest signal the media player has to "am I keeping up with the
+        // file's own timeline" — see `MediaPlayerStats` doc comment.
         let now_check = crate::engine::wire_emit::monotonic_now_ns();
-        let advance_from = target_ns.max(now_check);
-        next_target_wall = advance_from.saturating_add(bundle_period_ns);
+        let late_ms = now_check.saturating_sub(target_ns) / 1_000_000;
+        stats.record_pacer_lateness_ms(late_ms);
         crate::engine::wire_emit::sleep_until_monotonic_ns(target_ns);
         // `broadcast.send` is non-blocking — slow subscribers count
         // against their own `packets_dropped`, never the producer.
@@ -2006,6 +2241,106 @@ fn shuffle_indices(order: &mut [usize]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Minimal `PlayerSession` for exercising free functions that only
+    /// touch `media_stats` / `events` / `flow_id` / `input_id` — doesn't
+    /// need a real file, transcoder, or broadcast receiver.
+    type SessionHarnessParts = (
+        broadcast::Sender<RtpPacket>,
+        Arc<FlowStatsAccumulator>,
+        CancellationToken,
+        SpliceContinuity,
+        Option<crate::engine::input_transcode::InputTranscoder>,
+        EventSender,
+        tokio::sync::mpsc::Receiver<crate::manager::events::Event>,
+        Arc<MediaPlayerStats>,
+    );
+
+    fn test_session_harness() -> SessionHarnessParts {
+        let (tx, _rx) = broadcast::channel::<RtpPacket>(16);
+        let stats = Arc::new(FlowStatsAccumulator::new(
+            "test-flow".into(),
+            "test-flow-name".into(),
+            "media_player".into(),
+        ));
+        let cancel = CancellationToken::new();
+        let cont = SpliceContinuity::default();
+        let transcoder = None;
+        let (events, events_rx) = crate::manager::events::event_channel();
+        let media_stats = Arc::new(MediaPlayerStats::default());
+        (tx, stats, cancel, cont, transcoder, events, events_rx, media_stats)
+    }
+
+    #[test]
+    fn pacer_lateness_latch_fires_lagging_then_recovered() {
+        let (tx, stats, cancel, mut cont, mut transcoder, events, mut events_rx, media_stats) =
+            test_session_harness();
+        let mut seq_num: u16 = 0;
+        let mut post = None;
+        let mut demux_cache = DemuxCacheField::default();
+        let session = PlayerSession {
+            seq_num: &mut seq_num,
+            per_input_tx: &tx,
+            stats: &stats,
+            cancel: &cancel,
+            cont: &mut cont,
+            transcoder: &mut transcoder,
+            pid_overrides: None,
+            post: &mut post,
+            splice_gap_signal: None,
+            bundle_size: BUNDLE_SIZE,
+            media_stats: &media_stats,
+            events: &events,
+            flow_id: "test-flow",
+            input_id: "test-input",
+            demux_cache: &mut demux_cache,
+        };
+
+        // Below the warn threshold: no transition, no event.
+        media_stats.pacer_lateness_current_ms.store(50, Ordering::Relaxed);
+        poll_pacer_lateness_latch(&session);
+        assert!(!media_stats.pacer_lagging.load(Ordering::Relaxed));
+        assert!(events_rx.try_recv().is_err(), "must not fire below the warn threshold");
+
+        // Crosses the warn threshold: latches lagging, fires Warning with
+        // the stable error_code.
+        media_stats.pacer_lateness_current_ms.store(300, Ordering::Relaxed);
+        poll_pacer_lateness_latch(&session);
+        assert!(media_stats.pacer_lagging.load(Ordering::Relaxed));
+        assert_eq!(
+            media_stats.state.load(Ordering::Relaxed),
+            media_player_state::STALLED
+        );
+        let ev = events_rx.try_recv().expect("must fire on warn-threshold crossing");
+        assert_eq!(ev.severity, EventSeverity::Warning);
+        assert_eq!(
+            ev.details.as_ref().and_then(|d| d["error_code"].as_str()),
+            Some("media_player_pacer_lagging")
+        );
+
+        // Still lagging (between clear and warn thresholds): latch holds,
+        // no duplicate event.
+        media_stats.pacer_lateness_current_ms.store(150, Ordering::Relaxed);
+        poll_pacer_lateness_latch(&session);
+        assert!(media_stats.pacer_lagging.load(Ordering::Relaxed));
+        assert!(events_rx.try_recv().is_err(), "latch must not re-fire while still lagging");
+
+        // Drops at/below the clear threshold: latch clears, fires Info
+        // recovered event.
+        media_stats.pacer_lateness_current_ms.store(0, Ordering::Relaxed);
+        poll_pacer_lateness_latch(&session);
+        assert!(!media_stats.pacer_lagging.load(Ordering::Relaxed));
+        assert_eq!(
+            media_stats.state.load(Ordering::Relaxed),
+            media_player_state::PLAYING
+        );
+        let ev = events_rx.try_recv().expect("must fire on recovery");
+        assert_eq!(ev.severity, EventSeverity::Info);
+        assert_eq!(
+            ev.details.as_ref().and_then(|d| d["error_code"].as_str()),
+            Some("media_player_pacer_recovered")
+        );
+    }
 
     #[test]
     fn pcr_parser_decodes_known_packet() {
@@ -2419,9 +2754,12 @@ mod tests {
         let cancel = CancellationToken::new();
         let mut seq_num: u16 = 0;
         let mut cont = SpliceContinuity::default();
+        let (events, _events_rx) = crate::manager::events::event_channel();
+        let media_stats = std::sync::Arc::new(MediaPlayerStats::default());
 
         cont.open_file("dvb-fixture.ts");
         let mut transcoder: Option<crate::engine::input_transcode::InputTranscoder> = None;
+        let mut demux_cache = DemuxCacheField::default();
         {
             let mut session = PlayerSession {
                 seq_num: &mut seq_num,
@@ -2434,6 +2772,11 @@ mod tests {
                 post: &mut None,
                 splice_gap_signal: None,
                 bundle_size: BUNDLE_SIZE,
+                media_stats: &media_stats,
+                events: &events,
+                flow_id: "test-flow",
+                input_id: "test-input",
+                demux_cache: &mut demux_cache,
             };
             play_ts_file(&path, None, None, &mut session).await.unwrap();
         }
@@ -2511,6 +2854,34 @@ mod tests {
         // Real transition: flag must arm.
         cont.open_file("b.mp4");
         assert!(cont.pending_discontinuity);
+    }
+
+    /// Regression for issue #68: a playlist transition to a different
+    /// source must not inherit the previous source's converged pacer
+    /// bitrate. `SpliceContinuity` persists for the whole playlist, so a
+    /// bare (unscoped) read of `last_converged_bitrate_bps` would leak
+    /// `a.mp4`'s rate into `b.mp4`'s pacer startup, starting the new file
+    /// at the wrong rate right at the boundary.
+    #[test]
+    fn carried_bitrate_is_scoped_to_the_source_that_produced_it() {
+        let mut cont = SpliceContinuity::default();
+
+        // No source has ever converged — nothing carries.
+        assert_eq!(cont.carried_bitrate_for("a.mp4"), None);
+
+        cont.set_converged_bitrate("a.mp4", 4_800_000);
+        // Same source, e.g. a loop: carries.
+        assert_eq!(cont.carried_bitrate_for("a.mp4"), Some(4_800_000));
+        // Different source, e.g. a playlist transition: must NOT carry,
+        // even though `last_converged_bitrate_bps` is still populated.
+        assert_eq!(cont.carried_bitrate_for("b.mp4"), None);
+        assert_eq!(cont.last_converged_bitrate_bps, Some(4_800_000));
+
+        // After b.mp4 converges, a.mp4 no longer carries either — the
+        // scope always tracks the single most recent source, not a set.
+        cont.set_converged_bitrate("b.mp4", 7_200_000);
+        assert_eq!(cont.carried_bitrate_for("b.mp4"), Some(7_200_000));
+        assert_eq!(cont.carried_bitrate_for("a.mp4"), None);
     }
 
     #[test]
@@ -2609,6 +2980,9 @@ mod tests {
         let mut seq_num: u16 = 0;
         let mut cont = SpliceContinuity::default();
         let mut transcoder: Option<crate::engine::input_transcode::InputTranscoder> = None;
+        let (events, _events_rx) = crate::manager::events::event_channel();
+        let media_stats = std::sync::Arc::new(MediaPlayerStats::default());
+        let mut demux_cache = DemuxCacheField::default();
 
         // Iteration 1 — cold start.
         cont.open_file("loop-fixture.ts");
@@ -2624,6 +2998,11 @@ mod tests {
                 post: &mut None,
                 splice_gap_signal: None,
                 bundle_size: BUNDLE_SIZE,
+                media_stats: &media_stats,
+                events: &events,
+                flow_id: "test-flow",
+                input_id: "test-input",
+                demux_cache: &mut demux_cache,
             };
             play_ts_file(&path, None, None, &mut session).await.unwrap();
         }
@@ -2642,6 +3021,11 @@ mod tests {
                 post: &mut None,
                 splice_gap_signal: None,
                 bundle_size: BUNDLE_SIZE,
+                media_stats: &media_stats,
+                events: &events,
+                flow_id: "test-flow",
+                input_id: "test-input",
+                demux_cache: &mut demux_cache,
             };
             play_ts_file(&path, None, None, &mut session).await.unwrap();
         }

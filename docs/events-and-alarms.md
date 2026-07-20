@@ -531,6 +531,10 @@ flow-level event stream as start/stop/fail. Each event carries
 | info | Media player input started | Input task came up; reports source count and `loop_playback` / `shuffle` flags | `{ flow_id, input_id, source_count, loop_playback, shuffle }` |
 | critical | Media player source failed: {error} | A source failed to open, parse, or render (missing file, corrupt container, unsupported codec). Engine sleeps 2 s and advances to the next source. | `{ error_code, flow_id, input_id, source_index, source_kind, source_name, error }` |
 | info | Media player playlist exhausted | Final source finished and `loop_playback = false`. The input task exits cleanly — restart the flow to replay. | `{ flow_id, input_id }` |
+| warning | Media player output pacer falling behind schedule ({N} ms late) | The `ts` / `mp4` OS-thread pacer (`run_paced_emitter`) fell ≥ 250 ms behind its own schedule (byte-rate deadlines for `ts`, sample-presentation deadlines for `mp4`) — the signature of a source whose instantaneous packet rate (e.g. an oversized IDR or another bursty sample) exceeds what the bounded hand-off queue can absorb in time. Latched — fires once per lagging episode. See issue #67 for the failure this exists to surface (an MP4 with a ~512 KB IDR silently produced no usable video with no alarm). | `{ error_code: "media_player_pacer_lagging", flow_id, input_id, pacer_lateness_ms, pacer_queue_depth, largest_video_sample_bytes }` |
+| info | Media player output pacer caught back up to schedule | Lateness dropped back to ≤ 100 ms after a `media_player_pacer_lagging` latch. Clears the latch. | `{ error_code: "media_player_pacer_recovered", flow_id, input_id, pacer_lateness_ms }` |
+
+**Playout telemetry** (`InputStats.media_player_stats`, present on `media_player` inputs): `state` (`starting` / `playing` / `stalled` / `failed` / `exhausted`), `current_source_index`, `video_samples_read` / `video_samples_emitted`, `audio_samples_read` / `audio_samples_emitted`, `largest_video_sample_bytes`, `seconds_since_video`, `pacer_queue_depth`, `pacer_lateness_current_ms` / `pacer_lateness_max_ms`, `pacer_lagging`. Written by `stats::collector::MediaPlayerStats` (lock-free atomics, mirrors `SdiCaptureStats`), registered per-input by `input_media_player::run`. This exists because `play_source()` returning `Ok(())` only means the demuxer/muxer didn't error — not that usable video reached the wire; see the linked issue for the concrete failure mode.
 
 The Critical "source failed" event carries a stable `error_code` in
 `details` so the manager UI can attribute and highlight the offending file
@@ -739,7 +743,7 @@ These are generated server-side in `bilbycast-manager/crates/manager-server/src/
 
 | Category | Count | Description |
 |----------|-------|-------------|
-| `flow` | 16 | Flow lifecycle (start/stop/fail, output add/remove, input/output CRUD including update, media-player start/source-failed/playlist-exhausted) |
+| `flow` | 18 | Flow lifecycle (start/stop/fail, output add/remove, input/output CRUD including update, media-player start/source-failed/playlist-exhausted/pacer-lagging/pacer-recovered) |
 | `bandwidth` | 4 | Per-flow bandwidth monitoring (alarm, block, recovery) |
 | `srt` | 9 | SRT input and output connection state (now with structured details) |
 | `redundancy` | 3 | SMPTE 2022-7 dual-leg status |
@@ -764,7 +768,7 @@ These are generated server-side in `bilbycast-manager/crates/manager-server/src/
 | `nmos_registry` | 4 | IS-04 registration client lifecycle (registered, heartbeat lost, registration failed, registry unreachable) |
 | `scte104` | — | SCTE-104 splice events parsed from ST 2110-40 ANC (Phase 1) |
 | `sdi` | 28 | Native SDI (DeckLink) capture **and** playout lifecycle — signal lost/restored, raster or chroma the mode cannot carry, device open refused / lost, a card that stops draining scheduled frames, audio that stops scheduling. `sdi-decklink` feature. See the [SDI section](#sdi-sdi-sdi-decklink-feature) |
-| **Total** | **100** | |
+| **Total** | **102** | |
 
 ### Phase 1 ST 2110 categories
 
@@ -787,8 +791,8 @@ mapping:
 | Severity | Count | Description |
 |----------|-------|-------------|
 | critical | 23 | Service-impacting: flow/tunnel failures, auth rejection, both legs lost, bandwidth block, audio/video encoder failures, bind failures (RTP/UDP/RIST), media-player source failed |
-| warning | 23 | Degradation: disconnects, stale connections, upload failures, reconnects, bandwidth exceeded, audio_encode restart, resource gating, tunnel retry, master-clock PLL fallback |
-| info | 43 | State changes: connections established, flows started, config updated, bandwidth recovery, encoder started, input/output CRUD, bind success (RTP/UDP), media-player started/playlist-exhausted, master-clock PLL recovery |
+| warning | 24 | Degradation: disconnects, stale connections, upload failures, reconnects, bandwidth exceeded, audio_encode restart, resource gating, tunnel retry, master-clock PLL fallback, media-player pacer lagging |
+| info | 44 | State changes: connections established, flows started, config updated, bandwidth recovery, encoder started, input/output CRUD, bind success (RTP/UDP), media-player started/playlist-exhausted/pacer-recovered, master-clock PLL recovery |
 
 ## Unified bind-failure events (`port_conflict` / `bind_failed`)
 

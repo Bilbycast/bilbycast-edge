@@ -647,6 +647,40 @@ Config schema: [`configuration-guide.md`](configuration-guide.md#sdi-input-black
 Events: [`events-and-alarms.md`](events-and-alarms.md#sdi-input-flow-sdi-decklink-feature).
 Subsystem reference: [`sdi.md`](sdi.md).
 
+## Media-player playout telemetry (`InputStats.media_player_stats`)
+
+Lock-free atomics (`stats::collector::MediaPlayerStats`), same
+per-input-registered / snapshot-on-cadence shape as `SdiCaptureStats`
+above. Present only on `media_player` inputs.
+
+The governing property here mirrors SDI's: `play_source()` returning
+`Ok(())` only means the demuxer/muxer didn't error — it says nothing
+about whether usable video ever reached the wire. A source with a large
+or bursty compressed video sample (e.g. an oversized IDR) can be accepted
+and "play" with no error while producing no usable output; see the
+writeup filed as issue #67. These fields exist to make that observable
+instead of silent.
+
+| Field | Meaning |
+|---|---|
+| `state` | `starting` / `playing` / `stalled` / `failed` / `exhausted` |
+| `current_source_index` | Index of the source currently (or most recently) playing within the input's playlist |
+| `video_samples_read` / `video_samples_emitted` | Video access units read from the container / muxed onto the wire |
+| `audio_samples_read` / `audio_samples_emitted` | Audio access units read from the container / muxed onto the wire |
+| `largest_video_sample_bytes` | Largest single compressed video access unit observed (bytes, pre-Annex-B expansion). A healthy low-bitrate H.264 file's IDR is typically ~1-4 KB; hundreds of KB is the signature of a source likely to trigger bursty delivery |
+| `seconds_since_video` | Seconds since the last video sample was muxed onto the wire. `None` before the first video sample of the current/most recent source |
+| `pacer_queue_depth` | Current occupancy of the OS-thread pacer's bounded hand-off queue (16 slots). Steady-state near capacity is normal (the producer runs a small lookahead ahead of the real-time pacer); it only signals trouble alongside rising `pacer_lateness_*` |
+| `pacer_lateness_current_ms` / `pacer_lateness_max_ms` | How far behind its own computed wall-clock deadline the pacer's most recently emitted bundle was, and the high-water-mark since the input started |
+| `pacer_lagging` | Latched — true while `pacer_lateness_current_ms` has crossed 250 ms and hasn't yet recovered below 100 ms. Mirrors `media_player_pacer_lagging` / `media_player_pacer_recovered` events (see `docs/events-and-alarms.md`) |
+
+**Scope note**: the media player's async loop hands bundles to the OS-thread
+pacer and never blocks on a slow downstream broadcast subscriber (see root
+`CLAUDE.md` "Backpressure rule" — input is never blocked). `pacer_lateness_*`
+is therefore the closest signal the player itself can observe for "am I
+keeping up with the file's own timeline" — it cannot see receiver-side
+decode stalls, only whether its own paced delivery is falling behind the
+schedule it computed for the file.
+
 ## Display-output metrics (`OutputStats.display_stats`)
 
 Local-display outputs (Linux-only, `display` Cargo feature) populate
