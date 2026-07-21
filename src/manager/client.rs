@@ -1331,6 +1331,14 @@ fn edge_capabilities() -> Vec<&'static str> {
     // engine::bond_leg_probe + docs/leg-bandwidth-test.md.
     caps.push("bond-leg-capacity");
     caps.push("bond-probe-responder");
+    // Media-player operator control (Phase 3b). Advertised only when the
+    // controller is enabled on this edge, so the manager only shows the Next
+    // button where it will actually work; an input still has to be running
+    // the controller for a given flow, else the edge answers
+    // `media_player_control_unavailable`.
+    if crate::engine::input_media_player::controller::controller_enabled() {
+        caps.push("media-player-control-v1");
+    }
     if cfg!(feature = "replay") {
         // Replay-server: continuous flow recording + clip-based playback.
         // The manager UI gates the Replay tab on the presence of this string.

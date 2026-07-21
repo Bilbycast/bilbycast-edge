@@ -287,11 +287,20 @@ fn store_sidecar_inner(m: &AssetManifest) -> Result<()> {
     let dir = manifest_dir();
     std::fs::create_dir_all(&dir).map_err(|e| anyhow!("create {}: {e}", dir.display()))?;
     let final_path = sidecar_path(&m.name);
-    let tmp = dir.join(format!(".{}.tmp", m.name));
+    // Unique temp name: two probes of the SAME file can run concurrently (a
+    // post-upload probe racing a manifest() read), and a shared `.<name>.tmp`
+    // let one rename out from under the other's write — an `os error 2` on
+    // rename. Qualify the temp with pid + a monotonic counter so each write
+    // has its own scratch file.
+    static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = dir.join(format!(".{}.{}.{seq}.tmp", m.name, std::process::id()));
     let json = serde_json::to_vec_pretty(m)?;
     std::fs::write(&tmp, &json).map_err(|e| anyhow!("write {}: {e}", tmp.display()))?;
-    std::fs::rename(&tmp, &final_path)
-        .map_err(|e| anyhow!("rename {}: {e}", final_path.display()))?;
+    if let Err(e) = std::fs::rename(&tmp, &final_path) {
+        let _ = std::fs::remove_file(&tmp); // don't leak scratch on failure
+        return Err(anyhow!("rename {}: {e}", final_path.display()));
+    }
     Ok(())
 }
 
