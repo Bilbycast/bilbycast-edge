@@ -32,7 +32,12 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 
+pub mod manifest;
 pub mod probe;
+// `AssetManifest` is the one manifest type referenced from `MediaLibrary`
+// method signatures below; the rest of the manifest API (kinds, probe state,
+// error codes) is reached through the `manifest::` path.
+pub use manifest::AssetManifest;
 pub use probe::{MediaAudioStreamInfo, MediaVideoStreamInfo};
 
 /// Hard ceiling per individual asset (4 GiB).
@@ -622,13 +627,96 @@ impl MediaLibrary {
         Ok(result)
     }
 
+    /// Return the asset manifest for `name`, using the cached sidecar when it
+    /// is still fresh and re-probing otherwise (plan §6.3). This is the
+    /// read-path the manager's detected-kind badge is driven from; it is
+    /// cheap on the common cache-hit path (one `stat` + one small JSON read)
+    /// and only pays the full probe cost when the file is new or changed.
+    ///
+    /// Returns `Ok(None)` only when the file does not exist in the library —
+    /// an unsupported or unreadable file still yields a manifest (with
+    /// `probe_state` set accordingly) so the caller can render an actionable
+    /// state rather than nothing.
+    pub async fn manifest(name: &str) -> Result<Option<AssetManifest>> {
+        crate::config::validation::validate_media_filename(name, "manifest")?;
+        let path = media_dir().join(name);
+        let meta = match tokio::fs::metadata(&path).await {
+            Ok(m) => m,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(anyhow!("metadata {}: {e}", path.display())),
+        };
+        if !meta.is_file() {
+            return Ok(None);
+        }
+        let size = meta.len();
+        let mtime_ms = manifest::mtime_unix_ms(&meta);
+
+        // Cache hit: a fresh sidecar for this exact size+mtime.
+        let name_owned = name.to_string();
+        if let Some(cached) = tokio::task::spawn_blocking({
+            let n = name_owned.clone();
+            move || manifest::load_sidecar(&n)
+        })
+        .await
+        .map_err(|e| anyhow!("manifest cache load join: {e}"))?
+        {
+            if cached.is_fresh_for(size, mtime_ms) {
+                return Ok(Some(cached));
+            }
+        }
+
+        // Miss / stale: probe and persist. Probing is blocking (parses the
+        // MP4 moov / image header), so it runs off the async runtime.
+        let m = tokio::task::spawn_blocking(move || {
+            let m = manifest::probe_asset(&name_owned, &path, size, mtime_ms);
+            manifest::store_sidecar(&m);
+            m
+        })
+        .await
+        .map_err(|e| anyhow!("manifest probe join: {e}"))?;
+        Ok(Some(m))
+    }
+
+    /// Force a fresh probe of `name`, replacing any cached sidecar. Used by
+    /// the post-upload hook and by an operator `reprobe_media` command. A
+    /// missing file is a no-op (`Ok(None)`).
+    pub async fn refresh_manifest(name: &str) -> Result<Option<AssetManifest>> {
+        crate::config::validation::validate_media_filename(name, "reprobe_media")?;
+        let path = media_dir().join(name);
+        let meta = match tokio::fs::metadata(&path).await {
+            Ok(m) => m,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(anyhow!("metadata {}: {e}", path.display())),
+        };
+        if !meta.is_file() {
+            return Ok(None);
+        }
+        let size = meta.len();
+        let mtime_ms = manifest::mtime_unix_ms(&meta);
+        let name_owned = name.to_string();
+        let m = tokio::task::spawn_blocking(move || {
+            let m = manifest::probe_asset(&name_owned, &path, size, mtime_ms);
+            manifest::store_sidecar(&m);
+            m
+        })
+        .await
+        .map_err(|e| anyhow!("manifest reprobe join: {e}"))?;
+        Ok(Some(m))
+    }
+
     /// Hard-delete a file. Filename validation is the caller's responsibility
     /// (we re-check defence-in-depth here too).
     pub async fn delete(name: &str) -> Result<bool> {
         crate::config::validation::validate_media_filename(name, "delete_media")?;
         let path = media_dir().join(name);
         match tokio::fs::remove_file(&path).await {
-            Ok(()) => Ok(true),
+            Ok(()) => {
+                // Drop the manifest sidecar too so a later same-name upload
+                // can't be shadowed by a stale one. Best-effort.
+                let n = name.to_string();
+                let _ = tokio::task::spawn_blocking(move || manifest::remove_sidecar(&n)).await;
+                Ok(true)
+            }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
             Err(e) => Err(anyhow!("delete {}: {e}", path.display())),
         }
@@ -818,6 +906,17 @@ impl MediaLibrary {
             })
             .await
             .map_err(|e| anyhow!("upload finalise join: {e}"))??;
+            // Kick off a manifest probe for the freshly-landed file. Detached
+            // and fire-and-forget: probing parses the MP4 `moov` / image
+            // header and must never sit on the upload's final-chunk ACK
+            // (plan §6.3 — "return upload success independently from probe
+            // success"). A stale sidecar from a prior upload of the same
+            // name is superseded because probing keys the manifest on the new
+            // size/mtime. Errors are logged inside `refresh_manifest`.
+            let probe_name = name.to_string();
+            tokio::spawn(async move {
+                let _ = Self::refresh_manifest(&probe_name).await;
+            });
             return Ok(UploadProgress::Complete {
                 bytes_received: total_bytes,
             });

@@ -1013,6 +1013,33 @@ Library cap: **16 GiB** total (`MAX_TOTAL_BYTES`). Partial uploads stage
 under `<media_dir>/.tmp/<name>.<session_id>` and are reaped after 1 hour
 of inactivity.
 
+**Asset manifests (content-based kind detection).** After each upload the
+edge probes the new file and writes a small JSON *manifest* describing what
+it actually is — the source **kind is detected from the bytes, not the
+filename extension**. A `.mov` that is really an MP4 resolves to kind `mp4`;
+a file that matches none of the three supported kinds (MP4/MOV, TS File,
+Still Image) is reported as `unsupported` rather than mis-played. The manifest
+also carries container facts (format, duration, TS packet stride), per-stream
+codec / resolution / frame-rate / audio layout, and a `compatibility` block
+the manager renders as a kind badge and (from Phase 2) the playlist planner
+consumes.
+
+Manifests are cached as sidecar files under `<media_dir>/.manifests/<name>.json`.
+That directory is a dotfile, so it never appears in the operator library
+listing and never counts against the 16 GiB quota. A sidecar is invalidated
+and the file re-probed automatically whenever the file's size or mtime
+changes (the edge's atomic-rename upload always changes at least one), or when
+the manifest schema version moves. Probing is bounded, runs off the real-time
+path, and parses the MP4 `moov` header or image header only — it never decodes
+video and never blocks the upload's completion ACK.
+
+WS commands (manager → edge): `inspect_media { name }` returns the cached-or-
+freshly-probed manifest (`{ "manifest": … }`, or `manifest: null` when the file
+is absent); `reprobe_media { name }` forces a fresh probe, replacing the
+sidecar. Probe outcomes carry stable `error_code`s: `media_asset_kind_unsupported`
+(matched no supported kind), `media_asset_mp4_unusable` (recognised MP4 but
+fragmented or no H.264/AAC track), `media_asset_probe_io` (unreadable).
+
 **Uploading files** — the manager UI's input modal exposes a *Manage Files
 (this node)* panel that hosts the chosen file, splits it into 1 MiB
 chunks, and POSTs each chunk to

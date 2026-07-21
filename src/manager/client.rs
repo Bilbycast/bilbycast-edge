@@ -3493,6 +3493,32 @@ async fn execute_command(
                 .map_err(|e| format!("scan_media failed: {e}"))?;
             Ok(Some(serde_json::to_value(&result).unwrap_or_default()))
         }
+        "inspect_media" => {
+            // Return the content-derived asset manifest for one library file
+            // (plan Phase 1). Cache-backed: cheap on a fresh sidecar, probes
+            // only when the file is new or changed. `manifest: null` means the
+            // file is not in the library; an unsupported/unreadable file still
+            // returns a manifest whose `probe_state` carries the reason, so
+            // the manager can render an actionable badge either way.
+            let name = action["name"]
+                .as_str()
+                .ok_or("inspect_media: missing 'name'")?;
+            let m = crate::media::MediaLibrary::manifest(name)
+                .await
+                .map_err(|e| format!("inspect_media failed: {e}"))?;
+            Ok(Some(serde_json::json!({ "manifest": m })))
+        }
+        "reprobe_media" => {
+            // Force a fresh probe, replacing any cached manifest sidecar
+            // (operator/admin "Re-probe" affordance, plan §6.3).
+            let name = action["name"]
+                .as_str()
+                .ok_or("reprobe_media: missing 'name'")?;
+            let m = crate::media::MediaLibrary::refresh_manifest(name)
+                .await
+                .map_err(|e| format!("reprobe_media failed: {e}"))?;
+            Ok(Some(serde_json::json!({ "manifest": m })))
+        }
         "upload_media_chunk" => {
             let name = action["name"]
                 .as_str()
