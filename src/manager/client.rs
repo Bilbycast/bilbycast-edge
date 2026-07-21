@@ -3519,6 +3519,41 @@ async fn execute_command(
                 .map_err(|e| format!("reprobe_media failed: {e}"))?;
             Ok(Some(serde_json::json!({ "manifest": m })))
         }
+        "plan_media_playlist" => {
+            // Classify every adjacent boundary of a proposed playlist (plan
+            // Phase 2) so the manager can show per-boundary compatibility and
+            // block save/start on an unsupported splice before playout. The
+            // edge remains the authority. Input: an ordered `sources` array
+            // (`[{name}, …]`), `loop_playback`, and an optional `policy`.
+            use crate::engine::input_media_player::planner;
+
+            let sources = action["sources"]
+                .as_array()
+                .ok_or("plan_media_playlist: missing 'sources' array")?;
+            let loop_playback = action["loop_playback"].as_bool().unwrap_or(true);
+            let policy: planner::PlaybackPolicy = action
+                .get("policy")
+                .and_then(|p| serde_json::from_value(p.clone()).ok())
+                .unwrap_or_default();
+
+            // Resolve each entry's manifest (cache-or-probe). A missing /
+            // unreadable file yields `None`, which the planner classifies as
+            // a Missing entry + Unsupported boundary rather than erroring the
+            // whole command.
+            let mut manifests = Vec::with_capacity(sources.len());
+            for s in sources {
+                let name = s["name"].as_str().unwrap_or("");
+                if name.is_empty() {
+                    manifests.push(None);
+                    continue;
+                }
+                let m = crate::media::MediaLibrary::manifest(name).await.unwrap_or(None);
+                manifests.push(m);
+            }
+
+            let planned = planner::plan_playlist(&manifests, loop_playback, &policy);
+            Ok(Some(serde_json::to_value(&planned).unwrap_or_default()))
+        }
         "upload_media_chunk" => {
             let name = action["name"]
                 .as_str()

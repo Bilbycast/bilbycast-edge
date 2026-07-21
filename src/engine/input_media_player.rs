@@ -50,6 +50,12 @@ mod image_slate;
 #[cfg(all(feature = "media-codecs", feature = "fdk-aac"))]
 mod mp4_demux;
 
+// The playlist compatibility planner is pure logic over asset manifests with
+// no codec/demuxer dependency, so it is always available (the manager needs
+// it to validate a playlist regardless of which media features this edge was
+// built with).
+pub mod planner;
+
 /// 188-byte MPEG-TS packet size.
 const TS_PACKET: usize = 188;
 /// MPEG-TS sync byte (every TS packet starts with this).
