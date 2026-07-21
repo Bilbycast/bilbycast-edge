@@ -12,12 +12,15 @@
 //! in the programme (the playlist planner, prepared-source caching, the
 //! manager's detected-kind badge) reads these facts rather than re-probing.
 //!
-//! ## Detection order (plan §6.2)
+//! ## Detection order
 //!
-//! 1. MPEG-TS — a confirmed sync-byte stride with a plausible PAT.
-//! 2. MP4 / MOV — a parseable ISO Base Media / QuickTime header with at
+//! Definitive-magic containers first, the heuristic one last (see the note
+//! in [`probe_asset`] — leading with the TS sync heuristic mis-detects MP4):
+//!
+//! 1. MP4 / MOV — a parseable ISO Base Media / QuickTime header with at
 //!    least one track the player supports.
-//! 3. Still image — a raster format the `image` crate recognises.
+//! 2. Still image — a raster format the `image` crate recognises by magic.
+//! 3. MPEG-TS — a confirmed sync-byte stride with a plausible PAT.
 //! 4. Otherwise `Unsupported` — we refuse to guess.
 //!
 //! ## Cost
@@ -322,11 +325,21 @@ pub fn probe_asset(name: &str, path: &Path, size: u64, modified_unix_ms: u64) ->
     let fingerprint = Some(fingerprint(size, &head, &tail));
     let id = FileIdentity { size_bytes: size, modified_unix_ms, content_fingerprint: fingerprint };
 
-    // 1. MPEG-TS — confirmed stride + a PAT in the head window.
-    if let Some(m) = probe_ts(name, &head, id.clone()) {
-        return m;
-    }
-    // 2. MP4 / MOV — parseable ISO-BMFF header. This opens the file.
+    // Detection order: the two *definitive-magic* containers first, the
+    // *heuristic* one last.
+    //
+    // The plan (§6.2) lists TS first, but that assumed TS sync detection is
+    // reliable. It is not reliable enough to lead with: TS detection is a
+    // heuristic (a run of 0x47 bytes at a 188/192/204 stride plus a
+    // plausible PAT), and a modest MP4 carries enough incidental 0x47 bytes
+    // at 188 spacing to satisfy it — a live probe of an H.264/AAC MP4 was
+    // mis-detected as `ts`. MP4 (`ftyp`/`moov`) and the image formats have
+    // unambiguous magic, so we try those first and fall the heuristic TS
+    // scan through only for files that are provably neither. A genuine TS has
+    // no `ftyp` and no image magic, so it still resolves correctly; the
+    // reorder only removes false positives.
+    //
+    // 1. MP4 / MOV — parseable ISO-BMFF header (opens the file, moov only).
     match probe_mp4(name, path, id.clone()) {
         Mp4Probe::Manifest(m) => return m,
         Mp4Probe::NotMp4 => {}
@@ -334,8 +347,12 @@ pub fn probe_asset(name: &str, path: &Path, size: u64, modified_unix_ms: u64) ->
             return AssetManifest::unsupported(name.to_string(), id, code);
         }
     }
-    // 3. Still image — a raster format the decoder recognises.
+    // 2. Still image — a raster format the decoder recognises by magic.
     if let Some(m) = probe_image(name, path, &head, id.clone()) {
+        return m;
+    }
+    // 3. MPEG-TS — confirmed stride + a PAT in the head window (heuristic).
+    if let Some(m) = probe_ts(name, &head, id.clone()) {
         return m;
     }
     // 4. None matched.
@@ -947,5 +964,83 @@ mod tests {
             Some(DetectedKind::Image),
             "content wins over the .ts extension"
         );
+    }
+
+    fn ffmpeg_available() -> bool {
+        std::process::Command::new("ffmpeg")
+            .arg("-version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+
+    /// Regression for the detection-order bug a live probe caught: a real
+    /// H.264/AAC MP4 carries enough incidental 0x47 bytes at a 188-byte
+    /// stride to satisfy the heuristic TS sync scan, so leading with TS
+    /// mis-detected it as `ts`. Detection must try the definitive MP4 magic
+    /// first. Gated on a host `ffmpeg` (skips cleanly in a bare CI), matching
+    /// the idiom in `engine::thumbnail`.
+    #[test]
+    fn real_mp4_detects_as_mp4_not_ts() {
+        if !ffmpeg_available() {
+            eprintln!("skipping real_mp4_detects_as_mp4_not_ts: ffmpeg not on PATH");
+            return;
+        }
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("bilby_mp4_probe_{}.mp4", std::process::id()));
+        let ok = std::process::Command::new("ffmpeg")
+            .args([
+                "-y",
+                "-f", "lavfi", "-i", "testsrc=size=320x240:rate=30000/1001:duration=1",
+                "-f", "lavfi", "-i", "sine=frequency=1000:sample_rate=48000:duration=1",
+                "-c:v", "libx264", "-profile:v", "high", "-pix_fmt", "yuv420p",
+                "-c:a", "aac", "-ac", "2",
+                "-movflags", "+faststart",
+            ])
+            .arg(&path)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !ok {
+            let _ = std::fs::remove_file(&path);
+            eprintln!("skipping real_mp4_detects_as_mp4_not_ts: ffmpeg could not encode (no libx264?)");
+            return;
+        }
+
+        let size = std::fs::metadata(&path).unwrap().len();
+        let m = probe_asset("clip.mp4", &path, size, 1);
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(
+            m.detected_kind,
+            Some(DetectedKind::Mp4),
+            "H.264/AAC MP4 must detect as mp4, not ts (detection-order regression)"
+        );
+        assert_eq!(m.probe_state, ProbeState::Ready);
+
+        let video = m
+            .streams
+            .iter()
+            .find(|s| s.media_type == ManifestMediaType::Video)
+            .expect("video stream");
+        assert_eq!(video.codec.as_deref(), Some("h264"));
+        assert_eq!(video.width, Some(320));
+        assert_eq!(video.height, Some(240));
+        // The 30000/1001 rate must round-trip exactly, not as a lossy float.
+        assert_eq!(video.frame_rate_num, Some(30000));
+        assert_eq!(video.frame_rate_den, Some(1001));
+        assert!(video.extradata_fingerprint.is_some());
+
+        let audio = m
+            .streams
+            .iter()
+            .find(|s| s.media_type == ManifestMediaType::Audio)
+            .expect("audio stream");
+        assert_eq!(audio.sample_rate, Some(48000));
+        assert_eq!(audio.channels, Some(2));
     }
 }
