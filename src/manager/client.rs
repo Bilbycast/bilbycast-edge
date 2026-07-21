@@ -1339,6 +1339,12 @@ fn edge_capabilities() -> Vec<&'static str> {
     if crate::engine::input_media_player::controller::controller_enabled() {
         caps.push("media-player-control-v1");
     }
+    // Audio-only playout (Phase 7, §12): a no-video MP4/MOV or TS plays as an
+    // audio-only TS (PCR carried on the audio PID). This is a media *layout*
+    // the edge's existing MP4/TS paths now handle, not a new source kind, so
+    // it is advertised unconditionally. The `generate_black` layout policy
+    // (synthesised video for receivers that require it) is a later addition.
+    caps.push("media-player-audio-only-v1");
     if cfg!(feature = "replay") {
         // Replay-server: continuous flow recording + clip-based playback.
         // The manager UI gates the Replay tab on the presence of this string.
