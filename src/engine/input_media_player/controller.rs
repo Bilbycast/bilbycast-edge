@@ -51,6 +51,16 @@ pub fn controller_enabled() -> bool {
     )
 }
 
+/// Whether the Phase-4 bounded incremental MP4/MOV reader is used instead of
+/// the whole-file demux. Off by default → the deployed whole-file path runs
+/// unchanged. Set `BILBYCAST_MEDIA_PLAYER_INCREMENTAL_MP4=1` to opt in.
+pub fn incremental_mp4_enabled() -> bool {
+    matches!(
+        std::env::var("BILBYCAST_MEDIA_PLAYER_INCREMENTAL_MP4").ok().as_deref(),
+        Some("1") | Some("true") | Some("on")
+    )
+}
+
 /// Cheap readiness check for a transition target: can this source be opened
 /// right now? For TS and Still Image this is the whole story (open is fast),
 /// so it is sufficient for the Phase-3b "never cut to a source that isn't
