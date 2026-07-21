@@ -56,6 +56,12 @@ mod mp4_demux;
 // built with).
 pub mod planner;
 
+// The transition state machine is the pure-logic core of the Phase 3
+// controller (state graph, generation counter, operator-Next idempotency).
+// No I/O; not yet wired into the live run() loop — Phase 3b drives it behind
+// a default-off flag with the legacy sequential loop retained.
+pub mod transition;
+
 /// 188-byte MPEG-TS packet size.
 const TS_PACKET: usize = 188;
 /// MPEG-TS sync byte (every TS packet starts with this).
