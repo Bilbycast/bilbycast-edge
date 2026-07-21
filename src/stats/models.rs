@@ -892,6 +892,21 @@ pub struct MediaPlayerInputStats {
     /// `Next` command for double-click safety. `0` under the legacy loop.
     #[serde(default)]
     pub generation: u64,
+    /// Phase 5 transport: milliseconds elapsed within the current source
+    /// (wall-based, so meaningful for every source kind). `None` before the
+    /// first source starts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_source_elapsed_ms: Option<u64>,
+    /// Phase 5 transport: total duration of the current source in milliseconds
+    /// when known (MP4/MOV). `None` for live TS / still image → the UI shows an
+    /// indeterminate progress head.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_source_duration_ms: Option<u64>,
+    /// Phase 5 transport: whether the NEXT playlist item can be opened right
+    /// now. `Some(true)` ready, `Some(false)` missing/unresolvable (a `Next`
+    /// would cut to dead air), `None` when unknown or there is no next item.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_source_ready: Option<bool>,
 }
 
 /// SDI (DeckLink) capture statistics for one input.

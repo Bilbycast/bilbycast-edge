@@ -2849,6 +2849,22 @@ pub struct MediaPlayerStats {
     /// stale double-click is rejected rather than skipping twice. Stays 0
     /// under the legacy loop (which doesn't run the controller).
     pub generation: AtomicU64,
+    /// Phase 5 transport: wall-clock millisecond timestamp
+    /// ([`crate::util::time::now_us`] / 1000) at which the current source began
+    /// playing. `0` before the first source starts. The snapshot derives
+    /// elapsed-in-source from `now - this`, giving the UI a progress head that
+    /// works for every source kind (elapsed is wall-based, not PTS-based).
+    pub current_source_started_ms: AtomicU64,
+    /// Phase 5 transport: total duration of the current source in milliseconds
+    /// when known (MP4/MOV — read from the movie header at open). `0` = unknown
+    /// (live TS, still image), which the UI renders as an indeterminate bar.
+    pub current_source_duration_ms: AtomicU64,
+    /// Phase 5 transport: readiness of the NEXT playlist item, evaluated when
+    /// the current source starts. `0` = unknown / no next (tail of a
+    /// non-looping playlist), `1` = ready (resolves + on disk), `2` = not ready
+    /// (missing / unresolvable → a cut would hit dead air). Lets the UI warn
+    /// before an operator `Next`.
+    pub next_source_ready: AtomicU8,
 }
 
 impl MediaPlayerStats {
@@ -2869,6 +2885,23 @@ impl MediaPlayerStats {
             let now_ms = crate::util::time::now_us() / 1000;
             Some(now_ms.saturating_sub(last_video_emit_ms) as f64 / 1000.0)
         };
+        // Phase 5 transport: wall-based elapsed-in-source, known duration, and
+        // next-source readiness. Elapsed is `now - started` so it advances for
+        // every source kind; duration is `Some` only when the source told us.
+        let started_ms = self.current_source_started_ms.load(Ordering::Relaxed);
+        let current_source_elapsed_ms = if started_ms == 0 {
+            None
+        } else {
+            let now_ms = crate::util::time::now_us() / 1000;
+            Some(now_ms.saturating_sub(started_ms))
+        };
+        let dur_ms = self.current_source_duration_ms.load(Ordering::Relaxed);
+        let current_source_duration_ms = (dur_ms != 0).then_some(dur_ms);
+        let next_source_ready = match self.next_source_ready.load(Ordering::Relaxed) {
+            1 => Some(true),
+            2 => Some(false),
+            _ => None,
+        };
         crate::stats::models::MediaPlayerInputStats {
             state: media_player_state::as_str(self.state.load(Ordering::Relaxed)).to_string(),
             current_source_index: self.current_source_index.load(Ordering::Relaxed),
@@ -2883,6 +2916,9 @@ impl MediaPlayerStats {
             pacer_lateness_max_ms: self.pacer_lateness_max_ms.load(Ordering::Relaxed),
             pacer_lagging: self.pacer_lagging.load(Ordering::Relaxed),
             generation: self.generation.load(Ordering::Relaxed),
+            current_source_elapsed_ms,
+            current_source_duration_ms,
+            next_source_ready,
         }
     }
 }

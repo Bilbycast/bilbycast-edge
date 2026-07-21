@@ -382,7 +382,7 @@ async fn run(
         // 1316 B (SRT payload size / internet-safe MTU). See
         // `MediaPlayerInputConfig::ts_packets_per_datagram`.
         let bundle_size = (config.ts_packets_per_datagram.max(1) as usize) * TS_PACKET;
-        for idx in order {
+        for (pos, &idx) in order.iter().enumerate() {
             if cancel.is_cancelled() {
                 return;
             }
@@ -394,6 +394,17 @@ async fn run(
             };
             media_stats.current_source_index.store(idx as u64, Ordering::Relaxed);
             media_stats.state.store(media_player_state::STARTING, Ordering::Relaxed);
+            // Phase 5 transport: the next item is the following playlist entry,
+            // or (when looping) the head of the next pass — best-effort under
+            // shuffle, which re-orders on wrap.
+            let next_source = if pos + 1 < order.len() {
+                Some(&config.sources[order[pos + 1]])
+            } else if config.loop_playback {
+                Some(&config.sources[order[0]])
+            } else {
+                None
+            };
+            begin_source_telemetry(media_stats.as_ref(), next_source);
             let mut session = PlayerSession {
                 seq_num: &mut seq_num,
                 per_input_tx: &per_input_tx,
@@ -940,6 +951,19 @@ async fn run_controlled(
         media_stats.current_source_index.store(cfg_idx as u64, Ordering::Relaxed);
         media_stats.generation.store(sm.generation(), Ordering::Relaxed);
         media_stats.state.store(media_player_state::STARTING, Ordering::Relaxed);
+        // Phase 5 transport: the next item the state machine would advance to
+        // (next in order, or the head when looping).
+        let next_source = {
+            let next_active = if active + 1 < order.len() {
+                Some(active + 1)
+            } else if config.loop_playback {
+                Some(0)
+            } else {
+                None
+            };
+            next_active.map(|na| &config.sources[order[na]])
+        };
+        begin_source_telemetry(media_stats.as_ref(), next_source);
 
         // Per-source child token: cancelling it cuts only this source (for an
         // operator Next); the input-wide `cancel` still stops everything.
@@ -1086,6 +1110,24 @@ async fn run_controlled(
             }
         }
     }
+}
+
+/// Phase 5 transport telemetry, called as each source begins. Records the
+/// wall-clock start (the snapshot derives elapsed-in-source from it), clears the
+/// per-source known duration (an MP4 sets it once opened; TS/image leave it
+/// unknown), and evaluates whether the next playlist item can be opened right
+/// now so the UI can flag a `Next` that would cut to dead air. Cheap: one clock
+/// read plus one stat of the next file, once per source transition.
+fn begin_source_telemetry(media_stats: &MediaPlayerStats, next_source: Option<&MediaPlayerSource>) {
+    let now_ms = crate::util::time::now_us() / 1000;
+    media_stats.current_source_started_ms.store(now_ms, Ordering::Relaxed);
+    media_stats.current_source_duration_ms.store(0, Ordering::Relaxed);
+    let ready = match next_source {
+        Some(s) if controller::source_openable(s) => 1,
+        Some(_) => 2,
+        None => 0,
+    };
+    media_stats.next_source_ready.store(ready, Ordering::Relaxed);
 }
 
 async fn play_source(

@@ -72,10 +72,20 @@ pub async fn play_mp4_file(
             tokio::task::spawn_blocking(move || IncrementalMp4Reader::open(&path_owned))
                 .await
                 .map_err(|e| anyhow!("incremental mp4 open join failed: {e}"))??;
+        // Phase 5 transport: publish the known movie duration for the progress head.
+        session
+            .media_stats
+            .current_source_duration_ms
+            .store(reader.duration_ms(), Ordering::Relaxed);
         return play_incremental(path, &mut reader, paced_bitrate_bps, session).await;
     }
 
     let demux = session.demux_cache.get_or_demux(path).await?;
+    // Phase 5 transport: publish the known movie duration for the progress head.
+    session
+        .media_stats
+        .current_source_duration_ms
+        .store(demux.duration_ms, Ordering::Relaxed);
     play_demuxed(path, &demux, paced_bitrate_bps, session).await
 }
 
@@ -281,6 +291,8 @@ fn sample_durations_us(samples: &[DemuxedSample], timescale: u32) -> Vec<u64> {
 struct DemuxResult {
     video: Option<TrackData>,
     audio: Option<TrackData>,
+    /// Movie duration in milliseconds (from `mvhd`). Phase 5 transport head.
+    duration_ms: u64,
 }
 
 impl DemuxResult {
@@ -334,6 +346,9 @@ fn demux_file(path: &Path) -> Result<DemuxResult> {
     let reader = std::io::BufReader::new(f);
     let mut mp4 = mp4::Mp4Reader::read_header(reader, size)
         .map_err(|e| anyhow!("mp4 header parse {}: {e}", path.display()))?;
+    // Movie duration from `mvhd`, captured before the sample reads consume the
+    // reader. Phase 5 transport head (see `MediaPlayerInputStats`).
+    let duration_ms = mp4.duration().as_millis() as u64;
 
     // Reject fragmented MP4 (fMP4) BEFORE reading any samples. Movie
     // fragments (`moof`/`traf`/`trun`) are parsed into `Mp4Track::trafs` by
@@ -409,7 +424,7 @@ fn demux_file(path: &Path) -> Result<DemuxResult> {
         ));
     }
 
-    Ok(DemuxResult { video, audio })
+    Ok(DemuxResult { video, audio, duration_ms })
 }
 
 fn read_avc_track<R: std::io::Read + std::io::Seek>(
@@ -1347,6 +1362,8 @@ pub(in crate::engine) struct IncrementalMp4Reader {
     mp4: mp4::Mp4Reader<std::io::BufReader<std::fs::File>>,
     video: Option<TrackMeta>,
     audio: Option<TrackMeta>,
+    /// Movie duration in milliseconds (from `mvhd`). Phase 5 transport head.
+    duration_ms: u64,
 }
 
 impl IncrementalMp4Reader {
@@ -1357,6 +1374,7 @@ impl IncrementalMp4Reader {
         let reader = std::io::BufReader::new(f);
         let mp4 = mp4::Mp4Reader::read_header(reader, size)
             .map_err(|e| anyhow!("mp4 header parse {}: {e}", path.display()))?;
+        let duration_ms = mp4.duration().as_millis() as u64;
 
         // Same fragmented-MP4 rejection as `demux_file`: moof sample addressing
         // in the `mp4` crate is broken and would emit an undecodable stream.
@@ -1438,7 +1456,13 @@ impl IncrementalMp4Reader {
             ));
         }
 
-        Ok(IncrementalMp4Reader { mp4, video, audio })
+        Ok(IncrementalMp4Reader { mp4, video, audio, duration_ms })
+    }
+
+    /// Movie duration in milliseconds (from `mvhd`), or 0 if the header
+    /// declared none. Phase 5 transport head.
+    pub(in crate::engine) fn duration_ms(&self) -> u64 {
+        self.duration_ms
     }
 
     pub(in crate::engine) fn video_meta(&self) -> Option<&TrackMeta> {
@@ -1549,10 +1573,10 @@ mod tests {
             samples: vec![avc_sample(20, 0, true)],
             extra: TrackExtra::Aac { adts_profile: 1, sr_index: 3, ch_config: 2 },
         };
-        let d = DemuxResult { video: Some(v), audio: Some(a) };
+        let d = DemuxResult { video: Some(v), audio: Some(a), duration_ms: 0 };
         // (4+100)+(4+50) video + (4+20) audio = 158 + 24 = 182.
         assert_eq!(d.approx_sample_bytes(), 182);
-        assert_eq!(DemuxResult { video: None, audio: None }.approx_sample_bytes(), 0);
+        assert_eq!(DemuxResult { video: None, audio: None, duration_ms: 0 }.approx_sample_bytes(), 0);
     }
 
     /// A tiny `DemuxResult` whose `approx_sample_bytes` equals `n` (one video
@@ -1566,6 +1590,7 @@ mod tests {
                 extra: TrackExtra::Avc { sps: vec![], pps: vec![] },
             }),
             audio: None,
+            duration_ms: 0,
         })
     }
 
@@ -1716,7 +1741,7 @@ mod tests {
             ],
             extra: TrackExtra::Avc { sps, pps },
         };
-        let demux = DemuxResult { video: Some(video), audio: None };
+        let demux = DemuxResult { video: Some(video), audio: None, duration_ms: 0 };
 
         let (tx, mut rx) = broadcast::channel::<RtpPacket>(4096);
         let reader = tokio::spawn(async move {
@@ -1817,7 +1842,7 @@ mod tests {
             ],
             extra: TrackExtra::Avc { sps: vec![0x67, 0x42], pps: vec![0x68, 0xCE] },
         };
-        let demux = DemuxResult { video: Some(video), audio: None };
+        let demux = DemuxResult { video: Some(video), audio: None, duration_ms: 0 };
 
         let (tx, mut rx) = broadcast::channel::<RtpPacket>(1024);
         let reader = tokio::spawn(async move {
