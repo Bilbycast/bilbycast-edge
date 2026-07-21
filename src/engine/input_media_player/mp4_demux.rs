@@ -289,7 +289,8 @@ struct TrackData {
     extra: TrackExtra,
 }
 
-enum TrackExtra {
+#[derive(Debug, Clone)]
+pub(in crate::engine) enum TrackExtra {
     Avc {
         sps: Vec<u8>,
         pps: Vec<u8>,
@@ -301,7 +302,7 @@ enum TrackExtra {
     },
 }
 
-struct DemuxedSample {
+pub(in crate::engine) struct DemuxedSample {
     /// Start time in track timescale units (DTS for video, PTS for audio).
     start_time: u64,
     /// Composition offset (PTS - DTS) in track timescale units. Video only.
@@ -968,6 +969,179 @@ fn build_adts_header(profile: u8, sr_index: u8, ch_config: u8, payload_len: usiz
     h
 }
 
+// ── Incremental reader (Phase 4) ─────────────────────────────────────────
+
+/// Per-track metadata parsed once from the `moov` header — everything the
+/// playout path needs about a track EXCEPT the sample payloads, which the
+/// incremental reader streams on demand.
+#[derive(Debug, Clone)]
+#[allow(dead_code)] // adopted by play_mp4 in the next Phase-4 step
+pub(in crate::engine) struct TrackMeta {
+    pub id: u32,
+    pub timescale: u32,
+    pub sample_count: u32,
+    pub extra: TrackExtra,
+}
+
+/// Bounded, on-demand MP4/MOV reader (Phase 4). Parses the sample index (the
+/// `moov` header) exactly once and then reads each sample's payload lazily via
+/// `mp4::Mp4Reader::read_sample`, so a large file is never fully resident: the
+/// caller pulls samples as the pacer consumes them, keeping only a bounded
+/// read-ahead window. This is the pure-Rust replacement for the whole-file
+/// `DemuxResult` (see the plan's §4.1 decision — no libavformat); it reuses the
+/// same `mp4` crate, only the usage pattern changes.
+///
+/// Supports the same envelope as the whole-file path: unfragmented MP4/MOV,
+/// H.264 video and/or AAC audio. Fragmented (`moof`) and unsupported-codec
+/// files are rejected at [`open`](Self::open), matching `demux_file`.
+///
+/// Currently exercised only by the equivalence test; the `play_mp4` emit loop
+/// adopts it (behind a fallback flag) in the next Phase-4 step, at which point
+/// this allow comes off.
+#[allow(dead_code)]
+pub(in crate::engine) struct IncrementalMp4Reader {
+    mp4: mp4::Mp4Reader<std::io::BufReader<std::fs::File>>,
+    video: Option<TrackMeta>,
+    audio: Option<TrackMeta>,
+}
+
+#[allow(dead_code)] // methods adopted by play_mp4 in the next Phase-4 step
+impl IncrementalMp4Reader {
+    /// Open a file and parse its header. Reads no sample payloads.
+    pub(in crate::engine) fn open(path: &Path) -> Result<Self> {
+        let f = std::fs::File::open(path).map_err(|e| anyhow!("open {}: {e}", path.display()))?;
+        let size = f.metadata()?.len();
+        let reader = std::io::BufReader::new(f);
+        let mp4 = mp4::Mp4Reader::read_header(reader, size)
+            .map_err(|e| anyhow!("mp4 header parse {}: {e}", path.display()))?;
+
+        // Same fragmented-MP4 rejection as `demux_file`: moof sample addressing
+        // in the `mp4` crate is broken and would emit an undecodable stream.
+        if mp4.tracks().values().any(|t| !t.trafs.is_empty()) {
+            return Err(anyhow!(
+                "fragmented MP4 (fMP4 / moof) is not supported by the media player: {}. \
+                 Re-mux to a plain MP4 with `ffmpeg -i in.mp4 -c copy -movflags +faststart out.mp4`.",
+                path.display()
+            ));
+        }
+
+        // Select the first H.264 video and first AAC audio track, extracting
+        // the same metadata the whole-file readers do.
+        let mut video: Option<TrackMeta> = None;
+        let mut audio: Option<TrackMeta> = None;
+        let mut order: Vec<(u32, TrackType, MediaType)> = Vec::new();
+        for (id, track) in mp4.tracks().iter() {
+            match (track.track_type(), track.media_type()) {
+                (Ok(tt), Ok(mt)) => order.push((*id, tt, mt)),
+                _ => continue,
+            }
+        }
+        for (id, tt, mt) in order {
+            match (tt, mt) {
+                (TrackType::Video, MediaType::H264) if video.is_none() => {
+                    let track = mp4.tracks().get(&id).unwrap();
+                    let timescale = track.timescale();
+                    let sps = track
+                        .sequence_parameter_set()
+                        .map_err(|e| anyhow!("avc track {id} SPS: {e}"))?
+                        .to_vec();
+                    let pps = track
+                        .picture_parameter_set()
+                        .map_err(|e| anyhow!("avc track {id} PPS: {e}"))?
+                        .to_vec();
+                    let sample_count = mp4
+                        .sample_count(id)
+                        .map_err(|e| anyhow!("avc track {id} sample count: {e}"))?;
+                    video = Some(TrackMeta {
+                        id,
+                        timescale,
+                        sample_count,
+                        extra: TrackExtra::Avc { sps, pps },
+                    });
+                }
+                (TrackType::Audio, MediaType::AAC) if audio.is_none() => {
+                    let track = mp4.tracks().get(&id).unwrap();
+                    let timescale = track.timescale();
+                    let profile = track
+                        .audio_profile()
+                        .map_err(|e| anyhow!("aac track {id} profile: {e}"))?;
+                    let sr = track
+                        .sample_freq_index()
+                        .map_err(|e| anyhow!("aac track {id} freq index: {e}"))?;
+                    let ch = track
+                        .channel_config()
+                        .map_err(|e| anyhow!("aac track {id} channel config: {e}"))?;
+                    let sample_count = mp4
+                        .sample_count(id)
+                        .map_err(|e| anyhow!("aac track {id} sample count: {e}"))?;
+                    audio = Some(TrackMeta {
+                        id,
+                        timescale,
+                        sample_count,
+                        extra: TrackExtra::Aac {
+                            adts_profile: aot_to_adts_profile(profile),
+                            sr_index: sr_index_to_u8(sr),
+                            ch_config: ch as u8,
+                        },
+                    });
+                }
+                _ => {}
+            }
+        }
+
+        if video.is_none() && audio.is_none() {
+            return Err(anyhow!(
+                "MP4 has no H.264 or AAC tracks — re-encode the file or use a .ts source instead"
+            ));
+        }
+
+        Ok(IncrementalMp4Reader { mp4, video, audio })
+    }
+
+    pub(in crate::engine) fn video_meta(&self) -> Option<&TrackMeta> {
+        self.video.as_ref()
+    }
+    pub(in crate::engine) fn audio_meta(&self) -> Option<&TrackMeta> {
+        self.audio.as_ref()
+    }
+
+    /// Read one video sample by 1-based sample id. `Ok(None)` past the end.
+    pub(in crate::engine) fn read_video_sample(&mut self, sid: u32) -> Result<Option<DemuxedSample>> {
+        let id = match &self.video {
+            Some(m) => m.id,
+            None => return Ok(None),
+        };
+        self.read_one(id, sid, false)
+    }
+
+    /// Read one audio sample by 1-based sample id. `Ok(None)` past the end.
+    pub(in crate::engine) fn read_audio_sample(&mut self, sid: u32) -> Result<Option<DemuxedSample>> {
+        let id = match &self.audio {
+            Some(m) => m.id,
+            None => return Ok(None),
+        };
+        self.read_one(id, sid, true)
+    }
+
+    fn read_one(&mut self, track_id: u32, sid: u32, is_audio: bool) -> Result<Option<DemuxedSample>> {
+        match self
+            .mp4
+            .read_sample(track_id, sid)
+            .map_err(|e| anyhow!("mp4 sample {sid} (track {track_id}): {e}"))?
+        {
+            Some(s) => Ok(Some(DemuxedSample {
+                start_time: s.start_time,
+                // Audio AUs carry no composition offset and are all sync
+                // samples — mirror the whole-file readers exactly.
+                rendering_offset: if is_audio { 0 } else { s.rendering_offset },
+                is_sync: if is_audio { true } else { s.is_sync },
+                bytes: s.bytes.to_vec(),
+            })),
+            None => Ok(None),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1335,5 +1509,93 @@ mod tests {
             "frame-to-frame arrival gap {gap_1} ms should track the {FRAME_MS} ms presentation \
              interval (anchoring keeps PCR arrival linear)"
         );
+    }
+
+    fn ffmpeg_available() -> bool {
+        std::process::Command::new("ffmpeg")
+            .arg("-version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+
+    /// The incremental reader must yield byte-for-byte the same sample stream
+    /// as the whole-file `demux_file`, so it can replace it behind
+    /// `PreparedSource` without any change to downstream muxing/pacing. Encodes
+    /// a real MP4 with ffmpeg (skips cleanly when absent) and compares every
+    /// video and audio sample plus the per-track metadata.
+    #[test]
+    fn incremental_reader_matches_whole_file_demux() {
+        if !ffmpeg_available() {
+            eprintln!("skipping incremental_reader_matches_whole_file_demux: ffmpeg not on PATH");
+            return;
+        }
+        let path = std::env::temp_dir().join(format!("bilby_incr_{}.mp4", std::process::id()));
+        let ok = std::process::Command::new("ffmpeg")
+            .args([
+                "-y",
+                "-f", "lavfi", "-i", "testsrc=size=320x240:rate=25:duration=2",
+                "-f", "lavfi", "-i", "sine=frequency=1000:sample_rate=48000:duration=2",
+                "-c:v", "libx264", "-profile:v", "high", "-pix_fmt", "yuv420p", "-g", "25",
+                "-c:a", "aac", "-ac", "2", "-movflags", "+faststart",
+            ])
+            .arg(&path)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !ok {
+            let _ = std::fs::remove_file(&path);
+            eprintln!("skipping: ffmpeg could not encode (no libx264?)");
+            return;
+        }
+
+        let whole = demux_file(&path).expect("whole-file demux");
+        let mut incr = IncrementalMp4Reader::open(&path).expect("incremental open");
+
+        let cmp_samples = |whole_track: &Option<TrackData>,
+                           read: &mut dyn FnMut(&mut IncrementalMp4Reader, u32) -> Result<Option<DemuxedSample>>,
+                           incr: &mut IncrementalMp4Reader,
+                           meta: Option<&TrackMeta>| {
+            match (whole_track, meta) {
+                (Some(t), Some(m)) => {
+                    assert_eq!(t.timescale, m.timescale, "timescale mismatch");
+                    assert_eq!(t.samples.len() as u32, m.sample_count, "sample count mismatch");
+                    for (i, expected) in t.samples.iter().enumerate() {
+                        let sid = (i as u32) + 1;
+                        let got = read(incr, sid).expect("read").expect("some sample");
+                        assert_eq!(got.start_time, expected.start_time, "sample {sid} start_time");
+                        assert_eq!(got.rendering_offset, expected.rendering_offset, "sample {sid} rendering_offset");
+                        assert_eq!(got.is_sync, expected.is_sync, "sample {sid} is_sync");
+                        assert_eq!(got.bytes, expected.bytes, "sample {sid} bytes");
+                    }
+                    // One past the end is None.
+                    assert!(read(incr, m.sample_count + 1).expect("past-end").is_none());
+                }
+                (None, None) => {}
+                _ => panic!("track presence mismatch between whole-file and incremental"),
+            }
+        };
+
+        // Compare video, then audio. (Video meta borrow is dropped between calls.)
+        let v_meta = incr.video_meta().cloned();
+        cmp_samples(
+            &whole.video,
+            &mut |r, sid| r.read_video_sample(sid),
+            &mut incr,
+            v_meta.as_ref(),
+        );
+        let a_meta = incr.audio_meta().cloned();
+        cmp_samples(
+            &whole.audio,
+            &mut |r, sid| r.read_audio_sample(sid),
+            &mut incr,
+            a_meta.as_ref(),
+        );
+
+        let _ = std::fs::remove_file(&path);
     }
 }
