@@ -4717,6 +4717,52 @@ async fn execute_command(
                 ))?;
             dispatch_replay_input_command(action_type, action, cmd_tx).await
         }
+        "media_player_next" => {
+            // Operator "Next" for a media-player input running the Phase 3b
+            // controller. Routes through the per-input command channel; the
+            // controller's state machine validates the generation (idempotent
+            // double-click safety) and answers with the outcome, which we
+            // forward verbatim to the manager.
+            use crate::engine::input_media_player::controller::MediaPlayerCommand;
+            let flow_id = action["flow_id"].as_str().ok_or_else(|| {
+                CommandError::new("media_player_next: missing 'flow_id'")
+            })?;
+            let input_id = action["input_id"].as_str().ok_or_else(|| {
+                CommandError::new("media_player_next: missing 'input_id'")
+            })?;
+            let runtime = flow_manager
+                .get_runtime(flow_id)
+                .ok_or_else(|| CommandError::new(format!("Unknown flow '{flow_id}'")))?;
+            let cmd_tx = runtime
+                .media_player_command_txs
+                .get(input_id)
+                .map(|r| r.clone())
+                .ok_or_else(|| {
+                    CommandError::with_code(
+                        format!(
+                            "Media-player input '{input_id}' is not running the controller (Next unavailable)"
+                        ),
+                        "media_player_control_unavailable",
+                    )
+                })?;
+            let expected_generation = action["expected_generation"].as_u64().unwrap_or(0);
+            let request_id = action["request_id"].as_str().unwrap_or_default().to_string();
+            let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+            cmd_tx
+                .send(MediaPlayerCommand::Next {
+                    expected_generation,
+                    request_id,
+                    reply: reply_tx,
+                })
+                .await
+                .map_err(|_| {
+                    CommandError::new("media-player input command channel closed")
+                })?;
+            let outcome = reply_rx.await.map_err(|_| {
+                CommandError::new("media-player input dropped the Next reply")
+            })?;
+            Ok(Some(serde_json::to_value(&outcome).unwrap_or_default()))
+        }
         "upgrade_binary" => {
             let coord = crate::upgrade::global_coordinator().ok_or_else(|| {
                 CommandError::with_code(

@@ -2843,6 +2843,12 @@ pub struct MediaPlayerStats {
     /// the `signal_present` transition-latch shape used by `sdi_io`'s
     /// `sdi_signal_lost` / `sdi_signal_restored` pair.
     pub pacer_lagging: AtomicBool,
+    /// Playback generation (Phase 3b). Increments once per committed
+    /// transition (natural EOS, loop, or operator Next). The manager reads
+    /// this to send a correct `expected_generation` on a `Next` command so a
+    /// stale double-click is rejected rather than skipping twice. Stays 0
+    /// under the legacy loop (which doesn't run the controller).
+    pub generation: AtomicU64,
 }
 
 impl MediaPlayerStats {
@@ -2876,6 +2882,7 @@ impl MediaPlayerStats {
             pacer_lateness_current_ms: self.pacer_lateness_current_ms.load(Ordering::Relaxed),
             pacer_lateness_max_ms: self.pacer_lateness_max_ms.load(Ordering::Relaxed),
             pacer_lagging: self.pacer_lagging.load(Ordering::Relaxed),
+            generation: self.generation.load(Ordering::Relaxed),
         }
     }
 }

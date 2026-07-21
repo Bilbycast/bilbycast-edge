@@ -887,6 +887,11 @@ pub struct MediaPlayerInputStats {
     /// True while the pacer is latched as lagging (see
     /// `media_player_pacer_lagging` / `media_player_pacer_recovered` events).
     pub pacer_lagging: bool,
+    /// Playback generation (Phase 3b): increments once per committed
+    /// transition. The manager sends it back as `expected_generation` on a
+    /// `Next` command for double-click safety. `0` under the legacy loop.
+    #[serde(default)]
+    pub generation: u64,
 }
 
 /// SDI (DeckLink) capture statistics for one input.

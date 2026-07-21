@@ -334,6 +334,18 @@ impl TransitionMachine {
         self.state = PlayerState::Playing;
     }
 
+    /// Abandon a just-armed transition and return to plain playing without a
+    /// commit — used when an operator `Next` was accepted but the target then
+    /// proved not ready and the policy is to keep the current source playing
+    /// rather than hold (the v1 controller's not-ready handling). No
+    /// generation change; the current source stays on air.
+    pub fn cancel_armed(&mut self) {
+        if self.armed.take().is_some() {
+            self.next_ready = false;
+            self.state = PlayerState::Playing;
+        }
+    }
+
     /// The single mutation point for active source + generation (plan §9.1:
     /// "Only `CommitBoundary` may change the active generation/source").
     /// Consumes the armed transition; increments the generation exactly once;
