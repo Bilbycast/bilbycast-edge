@@ -41,6 +41,7 @@ use super::{
     run_paced_emitter,
 };
 use crate::engine::rtmp::ts_mux::TsMuxer;
+use crate::stats::collector::media_player_reader_mode;
 
 /// Stream type byte stamped on the synthesised PMT for AAC ADTS audio.
 const STREAM_TYPE_AAC: u8 = 0x0F;
@@ -64,20 +65,21 @@ pub async fn play_mp4_file(
     // residency) via `BILBYCAST_MEDIA_PLAYER_INCREMENTAL_MP4`. Default off →
     // the whole-file demux + cache path below runs unchanged.
     if super::controller::incremental_mp4_enabled() {
-        // Parse the moov header off the async runtime (the `mp4` crate is
-        // sync-only), then stream samples on demand. The reader is `Send`, so
-        // it moves back out of the blocking task cleanly.
-        let path_owned = path.to_path_buf();
-        let mut reader =
-            tokio::task::spawn_blocking(move || IncrementalMp4Reader::open(&path_owned))
-                .await
-                .map_err(|e| anyhow!("incremental mp4 open join failed: {e}"))??;
+        // Take a warm reader (or open one) — the `moov` header is parsed once
+        // and kept across loops (the loop-head prewarm), so a looping file
+        // skips the re-parse. The reader is owned locally during playout, then
+        // returned to the cache for the next loop.
+        let (mut reader, mtime, len) = session.demux_cache.take_reader_or_open(path).await?;
         // Phase 5 transport: publish the known movie duration for the progress head.
         session
             .media_stats
             .current_source_duration_ms
             .store(reader.duration_ms(), Ordering::Relaxed);
-        return play_incremental(path, &mut reader, paced_bitrate_bps, session).await;
+        publish_cache_telemetry(session, media_player_reader_mode::MP4_INCREMENTAL);
+        let result = play_incremental(path, &mut reader, paced_bitrate_bps, session).await;
+        session.demux_cache.put_reader(path, mtime, len, reader);
+        publish_cache_telemetry(session, media_player_reader_mode::MP4_INCREMENTAL);
+        return result;
     }
 
     let demux = session.demux_cache.get_or_demux(path).await?;
@@ -86,7 +88,23 @@ pub async fn play_mp4_file(
         .media_stats
         .current_source_duration_ms
         .store(demux.duration_ms, Ordering::Relaxed);
+    publish_cache_telemetry(session, media_player_reader_mode::MP4_WHOLE_FILE);
     play_demuxed(path, &demux, paced_bitrate_bps, session).await
+}
+
+/// Copy the demux cache's effectiveness into the media-player telemetry and
+/// stamp the active reader mode (Phase 4 follow-up). Called at each MP4 source
+/// start (and again after a reader is returned to the cache) so the manager UI
+/// can show reader mode, cache pressure, and hit/miss without a new channel.
+fn publish_cache_telemetry(session: &mut PlayerSession<'_>, reader_mode: u8) {
+    let t = session.demux_cache.telemetry();
+    let ms = session.media_stats;
+    ms.reader_mode.store(reader_mode, Ordering::Relaxed);
+    ms.cache_entries.store(t.entries, Ordering::Relaxed);
+    ms.cache_resident_bytes.store(t.resident_bytes, Ordering::Relaxed);
+    ms.cache_max_bytes.store(t.max_bytes, Ordering::Relaxed);
+    ms.cache_hits.store(t.hits, Ordering::Relaxed);
+    ms.cache_misses.store(t.misses, Ordering::Relaxed);
 }
 
 /// Bounded LRU cache of demuxed MP4 sample sets, keyed by path (with file
@@ -101,8 +119,19 @@ pub async fn play_mp4_file(
 /// unbounded regardless of playlist size.
 #[derive(Default)]
 pub(in crate::engine) struct DemuxCache {
-    /// Front = most-recently-used.
+    /// Whole-file demuxed sample sets (front = most-recently-used).
     entries: Vec<DemuxCacheEntry>,
+    /// Open incremental readers, kept warm across loops so a looping file never
+    /// re-parses its `moov` header at the loop boundary — the loop-head prewarm
+    /// for the incremental path, symmetric with `entries` for the whole-file
+    /// path. Cheap: an open reader holds the file handle + parsed sample tables
+    /// (~KBs), not the sample payloads. Front = most-recently-used.
+    readers: Vec<ReaderCacheEntry>,
+    /// Cumulative cache effectiveness counters (telemetry only).
+    demux_hits: u64,
+    demux_misses: u64,
+    reader_hits: u64,
+    reader_misses: u64,
 }
 
 struct DemuxCacheEntry {
@@ -112,6 +141,28 @@ struct DemuxCacheEntry {
     demux: std::sync::Arc<DemuxResult>,
     /// Approximate in-RAM footprint (sum of sample bytes), for the byte budget.
     bytes: u64,
+}
+
+struct ReaderCacheEntry {
+    path: std::path::PathBuf,
+    mtime: Option<std::time::SystemTime>,
+    len: u64,
+    reader: IncrementalMp4Reader,
+}
+
+/// Snapshot of [`DemuxCache`] effectiveness for the media-player telemetry.
+pub(in crate::engine) struct CacheTelemetry {
+    /// Total cached items (whole-file demuxes + open incremental readers).
+    pub entries: u64,
+    /// Resident whole-file sample bytes (the memory the byte budget bounds).
+    pub resident_bytes: u64,
+    /// The byte budget, so the UI can render a cache-pressure percentage.
+    pub max_bytes: u64,
+    /// Cumulative cache hits / misses across both the demux and reader caches.
+    /// On a looping file the hit count climbing each loop is the visible proof
+    /// the loop-head prewarm is working (no re-demux / no re-parse).
+    pub hits: u64,
+    pub misses: u64,
 }
 
 impl DemuxCache {
@@ -139,11 +190,13 @@ impl DemuxCache {
             .position(|e| e.path == path && e.mtime == mtime && e.len == len)
         {
             // Hit — promote to front (MRU) and hand back a cheap Arc clone.
+            self.demux_hits += 1;
             let entry = self.entries.remove(pos);
             let demux = entry.demux.clone();
             self.entries.insert(0, entry);
             return Ok(demux);
         }
+        self.demux_misses += 1;
 
         // Miss — demux off the async runtime (the `mp4` crate is sync-only).
         let path_owned = path.to_path_buf();
@@ -205,6 +258,74 @@ impl DemuxCache {
             if let Some(e) = self.entries.pop() {
                 total = total.saturating_sub(e.bytes);
             }
+        }
+    }
+
+    /// At most this many open incremental readers kept warm across loops.
+    /// Small — one covers the dominant single-file loop; a handful covers a
+    /// short playlist. Each is cheap (file handle + parsed sample tables).
+    const MAX_READERS: usize = 4;
+
+    /// Take a warm open reader for `path` (removed from the cache so the caller
+    /// can borrow it mutably for playout — [`put_reader`](Self::put_reader)
+    /// returns it), or open a fresh one off the async runtime. Reusing a cached
+    /// reader is the loop-head prewarm: its `moov` header is already parsed, so
+    /// a looping file skips the re-parse at the loop boundary. Returns the
+    /// reader with the `(mtime, len)` it was keyed on so `put_reader` need not
+    /// re-stat.
+    async fn take_reader_or_open(
+        &mut self,
+        path: &Path,
+    ) -> Result<(IncrementalMp4Reader, Option<std::time::SystemTime>, u64)> {
+        let (mtime, len) = match tokio::fs::metadata(path).await {
+            Ok(m) => (m.modified().ok(), m.len()),
+            Err(_) => (None, 0),
+        };
+        if let Some(pos) = self
+            .readers
+            .iter()
+            .position(|e| e.path == path && e.mtime == mtime && e.len == len)
+        {
+            self.reader_hits += 1;
+            let entry = self.readers.remove(pos);
+            return Ok((entry.reader, mtime, len));
+        }
+        self.reader_misses += 1;
+        let path_owned = path.to_path_buf();
+        let reader = tokio::task::spawn_blocking(move || IncrementalMp4Reader::open(&path_owned))
+            .await
+            .map_err(|e| anyhow!("incremental mp4 open join failed: {e}"))??;
+        Ok((reader, mtime, len))
+    }
+
+    /// Return a used reader to the cache (MRU front) for the next loop, bounding
+    /// the count. The reader is re-seekable by absolute sample id, so its
+    /// internal position after the previous play is irrelevant to reuse.
+    fn put_reader(
+        &mut self,
+        path: &Path,
+        mtime: Option<std::time::SystemTime>,
+        len: u64,
+        reader: IncrementalMp4Reader,
+    ) {
+        self.readers.retain(|e| e.path != path);
+        self.readers.insert(
+            0,
+            ReaderCacheEntry { path: path.to_path_buf(), mtime, len, reader },
+        );
+        while self.readers.len() > Self::MAX_READERS {
+            self.readers.pop();
+        }
+    }
+
+    /// Snapshot cache effectiveness for the media-player telemetry.
+    pub(in crate::engine) fn telemetry(&self) -> CacheTelemetry {
+        CacheTelemetry {
+            entries: (self.entries.len() + self.readers.len()) as u64,
+            resident_bytes: self.entries.iter().map(|e| e.bytes).sum(),
+            max_bytes: Self::MAX_BYTES,
+            hits: self.demux_hits + self.reader_hits,
+            misses: self.demux_misses + self.reader_misses,
         }
     }
 }

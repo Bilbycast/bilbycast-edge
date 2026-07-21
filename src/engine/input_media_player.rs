@@ -1181,6 +1181,10 @@ async fn play_ts_file(
     program_number: Option<u16>,
     session: &mut PlayerSession<'_>,
 ) -> Result<()> {
+    session.media_stats.reader_mode.store(
+        crate::stats::collector::media_player_reader_mode::TS,
+        Ordering::Relaxed,
+    );
     let mut file = tokio::fs::File::open(path)
         .await
         .with_context(|| format!("open {}", path.display()))?;
@@ -2272,6 +2276,10 @@ async fn play_image(
     audio_silence: bool,
     session: &mut PlayerSession<'_>,
 ) -> Result<()> {
+    session.media_stats.reader_mode.store(
+        crate::stats::collector::media_player_reader_mode::IMAGE,
+        Ordering::Relaxed,
+    );
     image_slate::play_image_file(path, fps, bitrate_kbps, audio_silence, session).await
 }
 

@@ -907,6 +907,23 @@ pub struct MediaPlayerInputStats {
     /// would cut to dead air), `None` when unknown or there is no next item.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next_source_ready: Option<bool>,
+    /// Phase 4 follow-up: reader path driving the current source — `"ts"`,
+    /// `"mp4_whole_file"`, `"mp4_incremental"`, `"image"`, or `"unknown"`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub reader_mode: String,
+    /// Phase 4 follow-up MP4 cache telemetry: cached items, resident whole-file
+    /// bytes, byte budget (pressure %), and cumulative hits / misses across the
+    /// demux + warm-reader caches. All default 0 for non-MP4 sources.
+    #[serde(default)]
+    pub cache_entries: u64,
+    #[serde(default)]
+    pub cache_resident_bytes: u64,
+    #[serde(default)]
+    pub cache_max_bytes: u64,
+    #[serde(default)]
+    pub cache_hits: u64,
+    #[serde(default)]
+    pub cache_misses: u64,
 }
 
 /// SDI (DeckLink) capture statistics for one input.

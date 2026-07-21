@@ -2789,6 +2789,27 @@ pub mod media_player_state {
     }
 }
 
+/// Which reader path is driving the currently-playing source (Phase 4 follow-up
+/// telemetry). Lets the manager UI show whole-file vs bounded-incremental MP4 at
+/// a glance, and which source kind is on air.
+pub mod media_player_reader_mode {
+    pub const UNKNOWN: u8 = 0;
+    pub const TS: u8 = 1;
+    pub const MP4_WHOLE_FILE: u8 = 2;
+    pub const MP4_INCREMENTAL: u8 = 3;
+    pub const IMAGE: u8 = 4;
+
+    pub fn as_str(code: u8) -> &'static str {
+        match code {
+            TS => "ts",
+            MP4_WHOLE_FILE => "mp4_whole_file",
+            MP4_INCREMENTAL => "mp4_incremental",
+            IMAGE => "image",
+            _ => "unknown",
+        }
+    }
+}
+
 /// Lock-free media-player playout telemetry for one input, written by the
 /// `ts` / `mp4` / `image` per-format players and read by the snapshot path.
 ///
@@ -2865,6 +2886,20 @@ pub struct MediaPlayerStats {
     /// (missing / unresolvable → a cut would hit dead air). Lets the UI warn
     /// before an operator `Next`.
     pub next_source_ready: AtomicU8,
+    /// Phase 4 follow-up: which reader path drives the current source — see
+    /// [`media_player_reader_mode`]. Stamped at each MP4 source start (whole-file
+    /// vs incremental) and by the TS / image players.
+    pub reader_mode: AtomicU8,
+    /// Phase 4 follow-up cache telemetry (MP4 only). Total cached items
+    /// (whole-file demuxes + warm incremental readers), resident whole-file
+    /// sample bytes, the byte budget (for a pressure %), and cumulative
+    /// hits / misses across both caches. A looping file drives `cache_hits`
+    /// upward each loop — the visible proof the loop-head prewarm is working.
+    pub cache_entries: AtomicU64,
+    pub cache_resident_bytes: AtomicU64,
+    pub cache_max_bytes: AtomicU64,
+    pub cache_hits: AtomicU64,
+    pub cache_misses: AtomicU64,
 }
 
 impl MediaPlayerStats {
@@ -2902,6 +2937,8 @@ impl MediaPlayerStats {
             2 => Some(false),
             _ => None,
         };
+        let reader_mode =
+            media_player_reader_mode::as_str(self.reader_mode.load(Ordering::Relaxed)).to_string();
         crate::stats::models::MediaPlayerInputStats {
             state: media_player_state::as_str(self.state.load(Ordering::Relaxed)).to_string(),
             current_source_index: self.current_source_index.load(Ordering::Relaxed),
@@ -2919,6 +2956,12 @@ impl MediaPlayerStats {
             current_source_elapsed_ms,
             current_source_duration_ms,
             next_source_ready,
+            reader_mode,
+            cache_entries: self.cache_entries.load(Ordering::Relaxed),
+            cache_resident_bytes: self.cache_resident_bytes.load(Ordering::Relaxed),
+            cache_max_bytes: self.cache_max_bytes.load(Ordering::Relaxed),
+            cache_hits: self.cache_hits.load(Ordering::Relaxed),
+            cache_misses: self.cache_misses.load(Ordering::Relaxed),
         }
     }
 }
