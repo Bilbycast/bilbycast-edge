@@ -1783,6 +1783,23 @@ fn open_video_decoder_with_retry(
         return VideoDecoder::open_with_backend(codec, DecoderBackend::Cpu).ok();
     }
 
+    // MPEG-2 → always CPU decode. The Intel VAAPI (and QSV) mpeg2 decoder
+    // rejects the media-player TS-passthrough elementary stream with a
+    // per-AU AVERROR_INVALIDDATA (fed raw, no NALU wrapper — verified on
+    // bilby-bite: a 1080p MPEG-2 slate froze the panel while the software
+    // decoder handled the identical bytes fine). MPEG-2 is cheap in software,
+    // so pin it to CPU here WITHOUT touching `state.backend`: a later
+    // H.264/HEVC source in the same playlist still opens on the HW backend,
+    // and the CPU decoder's sysmem frames route through the present path's
+    // per-frame `is_vaapi()`/`is_drm_prime()` check (CPU-blit), so no other
+    // display state needs to know. Falls through to the HW path only if the
+    // CPU open itself fails (then the normal retry+demote handles it).
+    if matches!(codec, VideoCodec::Mpeg2) {
+        if let Some(d) = VideoDecoder::open_with_backend(codec, DecoderBackend::Cpu).ok() {
+            return Some(d);
+        }
+    }
+
     const ATTEMPT_DELAYS_MS: [u64; 3] = [50, 100, 200];
     let mut last_err: Option<String> = None;
     for (attempt_idx, delay_ms) in
