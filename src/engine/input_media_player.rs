@@ -66,6 +66,12 @@ pub mod transition;
 // this module holds the independent, testable pieces.
 pub mod controller;
 
+// Phase 6: explicit rational frame-rate conversion cadence for normalised
+// playback. Pure integer arithmetic with no codec/hardware dependency (the
+// vendored FFmpeg has `--disable-avfilter`, so there is no fps filter to
+// delegate to). Driven by the normalisation pipeline once that lands.
+pub mod frame_rate;
+
 /// 188-byte MPEG-TS packet size.
 const TS_PACKET: usize = 188;
 /// MPEG-TS sync byte (every TS packet starts with this).
