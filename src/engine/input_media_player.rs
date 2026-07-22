@@ -1270,6 +1270,21 @@ async fn play_ts_file(
     } else {
         head_bitrate_raw
     };
+    // Phase 5 transport: estimate the TS file's playback duration for the
+    // progress head from its total size and the head-probed *whole-mux* rate
+    // (not the per-program filtered one — the file plays for its full wall
+    // duration regardless of program down-selection). VBR makes this
+    // approximate; it's a progress hint, not a seek index. `None`/0 leaves the
+    // duration unknown → the UI shows an indeterminate "live" head.
+    if let (Some(total_bps), Ok(meta)) = (head_bitrate_raw, tokio::fs::metadata(path).await) {
+        if total_bps > 0 && meta.len() > 0 {
+            let dur_ms = (meta.len() as u128 * 8 * 1000 / total_bps as u128) as u64;
+            session
+                .media_stats
+                .current_source_duration_ms
+                .store(dur_ms, Ordering::Relaxed);
+        }
+    }
     drop(head);
     file.seek(std::io::SeekFrom::Start(0))
         .await
