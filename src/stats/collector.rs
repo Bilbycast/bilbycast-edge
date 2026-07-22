@@ -2890,6 +2890,11 @@ pub struct MediaPlayerStats {
     /// [`media_player_reader_mode`]. Stamped at each MP4 source start (whole-file
     /// vs incremental) and by the TS / image players.
     pub reader_mode: AtomicU8,
+    /// Phase 7 audio-only: video presence of the current source. `0` = unknown
+    /// (reset at each source start; the TS path leaves it here since it doesn't
+    /// pre-parse), `1` = has video, `2` = audio-only (no video PID). Lets the
+    /// UI badge an audio-only source and suppress video-progress expectations.
+    pub current_source_has_video: AtomicU8,
     /// Phase 4 follow-up cache telemetry (MP4 only). Total cached items
     /// (whole-file demuxes + warm incremental readers), resident whole-file
     /// sample bytes, the byte budget (for a pressure %), and cumulative
@@ -2939,6 +2944,11 @@ impl MediaPlayerStats {
         };
         let reader_mode =
             media_player_reader_mode::as_str(self.reader_mode.load(Ordering::Relaxed)).to_string();
+        let current_source_has_video = match self.current_source_has_video.load(Ordering::Relaxed) {
+            1 => Some(true),
+            2 => Some(false),
+            _ => None,
+        };
         crate::stats::models::MediaPlayerInputStats {
             state: media_player_state::as_str(self.state.load(Ordering::Relaxed)).to_string(),
             current_source_index: self.current_source_index.load(Ordering::Relaxed),
@@ -2957,6 +2967,7 @@ impl MediaPlayerStats {
             current_source_duration_ms,
             next_source_ready,
             reader_mode,
+            current_source_has_video,
             cache_entries: self.cache_entries.load(Ordering::Relaxed),
             cache_resident_bytes: self.cache_resident_bytes.load(Ordering::Relaxed),
             cache_max_bytes: self.cache_max_bytes.load(Ordering::Relaxed),

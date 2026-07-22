@@ -1128,6 +1128,10 @@ fn begin_source_telemetry(media_stats: &MediaPlayerStats, next_source: Option<&M
     let now_ms = crate::util::time::now_us() / 1000;
     media_stats.current_source_started_ms.store(now_ms, Ordering::Relaxed);
     media_stats.current_source_duration_ms.store(0, Ordering::Relaxed);
+    // Reset video-presence to "unknown" so a previous source's value never
+    // lingers; the per-format player stamps it once it knows (MP4 sets it
+    // accurately from the demux, the TS path leaves it unknown).
+    media_stats.current_source_has_video.store(0, Ordering::Relaxed);
     let ready = match next_source {
         Some(s) if controller::source_openable(s) => 1,
         Some(_) => 2,

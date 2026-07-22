@@ -75,6 +75,11 @@ pub async fn play_mp4_file(
             .media_stats
             .current_source_duration_ms
             .store(reader.duration_ms(), Ordering::Relaxed);
+        // Phase 7 audio-only: stamp video presence (1 = has video, 2 = audio-only).
+        session.media_stats.current_source_has_video.store(
+            if reader.video_meta().is_some() { 1 } else { 2 },
+            Ordering::Relaxed,
+        );
         publish_cache_telemetry(session, media_player_reader_mode::MP4_INCREMENTAL);
         let result = play_incremental(path, &mut reader, paced_bitrate_bps, session).await;
         session.demux_cache.put_reader(path, mtime, len, reader);
@@ -88,6 +93,11 @@ pub async fn play_mp4_file(
         .media_stats
         .current_source_duration_ms
         .store(demux.duration_ms, Ordering::Relaxed);
+    // Phase 7 audio-only: stamp video presence (1 = has video, 2 = audio-only).
+    session.media_stats.current_source_has_video.store(
+        if demux.video.is_some() { 1 } else { 2 },
+        Ordering::Relaxed,
+    );
     publish_cache_telemetry(session, media_player_reader_mode::MP4_WHOLE_FILE);
     play_demuxed(path, &demux, paced_bitrate_bps, session).await
 }

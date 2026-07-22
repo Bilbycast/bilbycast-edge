@@ -911,6 +911,11 @@ pub struct MediaPlayerInputStats {
     /// `"mp4_whole_file"`, `"mp4_incremental"`, `"image"`, or `"unknown"`.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub reader_mode: String,
+    /// Phase 7 audio-only: `Some(false)` when the current source has no video
+    /// (audio-only playout), `Some(true)` when it has video, `None` when the
+    /// player hasn't determined it (e.g. a TS source it doesn't pre-parse).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_source_has_video: Option<bool>,
     /// Phase 4 follow-up MP4 cache telemetry: cached items, resident whole-file
     /// bytes, byte budget (pressure %), and cumulative hits / misses across the
     /// demux + warm-reader caches. All default 0 for non-MP4 sources.
