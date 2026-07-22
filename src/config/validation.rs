@@ -1630,7 +1630,7 @@ fn validate_media_player_input(c: &crate::config::models::MediaPlayerInputConfig
                 );
             }
         }
-        if let MediaPlayerSource::Image { fps, bitrate_kbps, .. } = src {
+        if let MediaPlayerSource::Image { fps, bitrate_kbps, duration_secs, .. } = src {
             if *fps == 0 || *fps > 60 {
                 bail!(
                     "media-player input sources[{i}]: image fps must be in 1..=60 (got {})",
@@ -1642,6 +1642,14 @@ fn validate_media_player_input(c: &crate::config::models::MediaPlayerInputConfig
                     "media-player input sources[{i}]: image bitrate_kbps must be in 50..=50000 (got {})",
                     bitrate_kbps
                 );
+            }
+            if let Some(d) = duration_secs {
+                if *d == 0 || *d > 86_400 {
+                    bail!(
+                        "media-player input sources[{i}]: image duration_secs must be in 1..=86400 (got {})",
+                        d
+                    );
+                }
             }
         }
     }

@@ -1986,6 +1986,12 @@ pub enum MediaPlayerSource {
         /// MediaPlayer source which carries audio). Default true.
         #[serde(default = "default_true")]
         audio_silence: bool,
+        /// How long the still is shown before the playlist advances, in
+        /// seconds. `None` = play indefinitely (the slate / Hitless-fallback
+        /// use case, unchanged). Set it to make the image a *timed* playlist
+        /// item so a rotating playlist doesn't stall on it forever.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        duration_secs: Option<u32>,
     },
 }
 

@@ -1164,9 +1164,10 @@ async fn play_source(
             fps,
             bitrate_kbps,
             audio_silence,
+            duration_secs,
         } => {
             let path = resolve_media_path(name)?;
-            play_image(&path, *fps, *bitrate_kbps, *audio_silence, session).await
+            play_image(&path, *fps, *bitrate_kbps, *audio_silence, *duration_secs, session).await
         }
     }
 }
@@ -2299,13 +2300,23 @@ async fn play_image(
     fps: u8,
     bitrate_kbps: u32,
     audio_silence: bool,
+    duration_secs: Option<u32>,
     session: &mut PlayerSession<'_>,
 ) -> Result<()> {
     session.media_stats.reader_mode.store(
         crate::stats::collector::media_player_reader_mode::IMAGE,
         Ordering::Relaxed,
     );
-    image_slate::play_image_file(path, fps, bitrate_kbps, audio_silence, session).await
+    // A still has a fixed duration only when the operator sets one; otherwise
+    // it renders indefinitely (slate/fallback), so the progress head has no
+    // total — leave it unknown (indeterminate bar).
+    if let Some(d) = duration_secs {
+        session
+            .media_stats
+            .current_source_duration_ms
+            .store((d as u64).saturating_mul(1000), Ordering::Relaxed);
+    }
+    image_slate::play_image_file(path, fps, bitrate_kbps, audio_silence, duration_secs, session).await
 }
 
 #[cfg(not(all(feature = "media-codecs", feature = "fdk-aac")))]
@@ -2314,6 +2325,7 @@ async fn play_image(
     _fps: u8,
     _bitrate_kbps: u32,
     _audio_silence: bool,
+    _duration_secs: Option<u32>,
     _session: &mut PlayerSession<'_>,
 ) -> Result<()> {
     Err(anyhow!(

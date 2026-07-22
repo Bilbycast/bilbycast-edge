@@ -36,6 +36,7 @@ pub async fn play_image_file(
     fps: u8,
     bitrate_kbps: u32,
     audio_silence: bool,
+    duration_secs: Option<u32>,
     session: &mut PlayerSession<'_>,
 ) -> Result<()> {
     let path_owned = path.to_path_buf();
@@ -43,7 +44,7 @@ pub async fn play_image_file(
         .await
         .map_err(|e| anyhow!("image decode join failed: {e}"))??;
 
-    encode_loop(decoded, fps, bitrate_kbps, audio_silence, session).await
+    encode_loop(decoded, fps, bitrate_kbps, audio_silence, duration_secs, session).await
 }
 
 struct DecodedImage {
@@ -131,6 +132,7 @@ async fn encode_loop(
     fps: u8,
     bitrate_kbps: u32,
     audio_silence: bool,
+    duration_secs: Option<u32>,
     session: &mut PlayerSession<'_>,
 ) -> Result<()> {
     let backend = select_video_backend()
@@ -229,7 +231,26 @@ async fn encode_loop(
     let mut frame_idx: u64 = 0;
     let mut out_rtp_ts: u32 = 0;
 
+    // The still is producing a valid TS from the first frame — the pacer-based
+    // formats flip PLAYING via `emit_to_pacer`, but this path uses `emit_bundle`
+    // directly, so stamp it here or the source is stuck reporting "starting".
+    use std::sync::atomic::Ordering;
+    session.media_stats.state.store(
+        crate::stats::collector::media_player_state::PLAYING,
+        Ordering::Relaxed,
+    );
+
+    // Optional fixed duration: a timed playlist item returns after it elapses so
+    // the playlist advances. `None` = the slate/fallback case — loop forever
+    // until cancelled (operator Next, transition, or flow stop).
+    let play_until = duration_secs.map(|d| start + Duration::from_secs(d as u64));
+
     loop {
+        if let Some(deadline) = play_until {
+            if Instant::now() >= deadline {
+                break;
+            }
+        }
         tokio::select! {
             _ = session.cancel.cancelled() => break,
             _ = ticker.tick() => {}
