@@ -1158,6 +1158,65 @@ Build prereqs, the per-port health payload, event catalogue, hardware
 gotchas (connector↔device interleaving on Quad cards) and verification
 recipes: [`docs/sdi.md`](sdi.md).
 
+### MXL Inputs (`mxl_video` / `mxl_audio` / `mxl_anc`)
+
+Consume an EBU / Linux Foundation **Media eXchange Layer** (MXL) flow
+off the same-host shared-memory bus and republish it onto the flow's
+broadcast channel. Three variants mirror the ST 2110-20/-30/-40 pattern.
+Gated on the `mxl` Cargo feature (default **off**, heavy build prereqs —
+see [`../../bilbycast-mxl-rs/CLAUDE.md`](../../bilbycast-mxl-rs/CLAUDE.md)); the
+schema is always present so configs round-trip on builds without it.
+**PTP is mandatory** — validation rejects `master_clock: "wallclock"` on
+any MXL flow, and the flow resolves to the `ptp` master-clock kind. The
+boot probe `dlopen`s `libmxl.so` and only advertises the `mxl-video` /
+`mxl-audio` / `mxl-anc` capability bits on success.
+
+> **Implementation status.** The **video** bridge (V210 ↔ H.264/HEVC) is
+> implemented in both directions. The **audio** codec bridge is a known
+> TODO (see [`mxl-integration-plan.md`](mxl-integration-plan.md)) — the
+> config and schema exist, but the essence path is not complete.
+
+```json
+{
+  "type": "mxl_video",
+  "id": "mxl-in1",
+  "name": "MXL camera 1",
+  "domain_path": "/dev/shm/mxl-domain",
+  "flow_name": "cam1-video",
+  "width": 1920,
+  "height": 1080,
+  "frame_rate_num": 30000,
+  "frame_rate_den": 1001,
+  "clock_domain": 0,
+  "video_encode": {
+    "codec": "h264_nvenc", "chroma": "yuv422p", "bit_depth": 10,
+    "preset": "fast", "rate_control": "cbr", "bitrate_kbps": 20000, "gop_size": 30
+  }
+}
+```
+
+All three variants share the MXL domain reference:
+
+| Field | Type | Default | Notes |
+|-------|------|---------|-------|
+| `type` | string | — | `"mxl_video"`, `"mxl_audio"` or `"mxl_anc"`. |
+| `domain_path` | string | — | **Required.** MXL domain directory, typically `/dev/shm/<name>`. Must live on tmpfs/ramfs — otherwise a `mxl_domain_not_tmpfs` Warning fires. |
+| `flow_name` | string | — | **Required.** libmxl flow name to consume. |
+| `clock_domain` | u8 | *(inherits flow)* | PTP clock domain `0..=127`. |
+
+`mxl_video` adds `width`, `height`, `frame_rate_num`, `frame_rate_den`,
+and a **mandatory** [`video_encode`](transcoding.md) block (a
+feature-gated backend must be compiled in) — it decodes V210 grains to
+planar 4:2:2 10-bit and encodes to MPEG-TS, exactly like ST 2110-20.
+`mxl_audio` adds `channels` (1/2/4/8/16, default 2), `packet_time_us`
+(default 1000, ST 2110-30 PM-compatible), and optional
+`transcode` / `audio_encode` blocks (same shape as ST 2110-30).
+`mxl_anc` carries only the domain reference + `clock_domain`.
+
+Architecture rationale + integration plan:
+[`mxl-integration-plan.md`](mxl-integration-plan.md); handoff notes:
+[`mxl-handoff.md`](mxl-handoff.md).
+
 ---
 
 ## Output Types
@@ -1777,6 +1836,45 @@ re-opens with backoff.
 Cost model: **275 units** (CPU decode, 1080p-class) — the same weight
 as a display output. Full pipeline, telemetry, loopback-verification
 notes and the genlock caveat: [`docs/sdi.md`](sdi.md#sdi-output-playout).
+
+### MXL Outputs (`mxl_video` / `mxl_audio` / `mxl_anc`)
+
+Publish the flow onto the same-host MXL shared-memory bus — the egress
+mirror of the [MXL inputs](#mxl-inputs-mxl_video--mxl_audio--mxl_anc).
+Same `mxl` Cargo feature gate (default off) and the same **PTP-mandatory**
+constraint. As with the inputs, the **video** bridge is implemented and
+the **audio** bridge is a known TODO.
+
+```json
+{
+  "type": "mxl_video",
+  "id": "mxl-out1",
+  "name": "MXL program out",
+  "domain_path": "/dev/shm/mxl-domain",
+  "flow_name": "program-video",
+  "width": 1920,
+  "height": 1080,
+  "frame_rate_num": 30000,
+  "frame_rate_den": 1001,
+  "clock_domain": 0
+}
+```
+
+| Field | Type | Default | Notes |
+|-------|------|---------|-------|
+| `type` | string | — | `"mxl_video"`, `"mxl_audio"` or `"mxl_anc"`. |
+| `id` / `name` | string | — | Standard output identity. |
+| `active` | bool | `true` | Whether the engine spawns it. |
+| `domain_path` | string | — | **Required.** MXL domain directory on tmpfs/ramfs. |
+| `flow_name` | string | — | **Required.** libmxl flow name to publish onto. |
+| `clock_domain` | u8 | *(inherits flow)* | PTP clock domain `0..=127`. |
+
+`mxl_video` adds `width` / `height` / `frame_rate_num` /
+`frame_rate_den` (it decodes the flow's TS and produces V210 grains);
+`mxl_audio` adds `channels` + `packet_time_us`; `mxl_anc` carries only
+the domain reference + `clock_domain`. See
+[`mxl-integration-plan.md`](mxl-integration-plan.md) for the essence path
+detail.
 
 ### Bonded Output
 

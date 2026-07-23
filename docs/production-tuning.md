@@ -187,7 +187,12 @@ worst-case latency well under 50 µs on an otherwise-idle box.
 |---|---|---|
 | `BILBYCAST_MLOCKALL` | `0` (unset) — seeded `1` by installer | Lock all current + future pages with `mlockall` at startup |
 | `BILBYCAST_WIRE_EMIT_CPUS` | unset | Comma-separated CPU set for round-robin wire-emit thread pinning |
+| `BILBYCAST_CODEC_CPUS` | unset | Same parser as `WIRE_EMIT_CPUS`; CPU-affinity set for codec (encode/decode) threads |
+| `BILBYCAST_PID_BUS_CPUS` | unset | Same parser; CPU-affinity set for the PID-bus / TS-assembler runtime |
+| `BILBYCAST_PLL_CPUS` | unset | Same parser; CPU-affinity set for the PCR-ingress / PLL sampler threads |
 | `BILBYCAST_ENABLE_TXTIME` | `0` | Opt in to the SO_TXTIME wire-pacing tier (tier 1 / 2). Requires ETF qdisc + `CAP_NET_ADMIN` (and PTP + HW-PTP NIC for tier 1). Without this the edge stays on the `clock_nanosleep` default. Alias: `BILBYCAST_ENABLE_SO_TXTIME=1` |
+| `BILBYCAST_ETF_SO_PRIORITY` | TC-map default | Override the `SO_PRIORITY` mapped onto the ETF qdisc class for SO_TXTIME outputs (layer 3 / only meaningful when SO_TXTIME is enabled) |
+| `BILBYCAST_LOSSLESS_SO_PRIORITY` | `4` | `SO_PRIORITY` pinning compressed (lossless-carrier) outputs **off** the etf class, so they aren't held to the wire-pacing schedule |
 | `BILBYCAST_FORCE_NANOSLEEP` | `0` | No-op alias kept for back-compat. Since `clock_nanosleep` is the wire-pacing default, the flag has no effect; old configs that set it still work |
 | `BILBYCAST_PROBE_SESSION_LIMITS` | `1` | HW encoder session-capacity probe at startup |
 | `BILBYCAST_ALLOW_INSECURE` | `0` | Allow `accept_self_signed_cert: true` |

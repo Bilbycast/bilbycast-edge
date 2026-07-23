@@ -346,7 +346,8 @@ leave the PMT untouched.
 ```jsonc
 "video_encode": {
   "codec":       "x264" | "x265" | "h264_nvenc" | "hevc_nvenc" | "h264_qsv" | "hevc_qsv"
-  //             | "h264_vaapi" | "hevc_vaapi" | "h264_auto" | "hevc_auto" | "auto",
+  //             | "h264_vaapi" | "hevc_vaapi" | "h264_rkmpp" | "hevc_rkmpp"
+  //             | "h264_auto" | "hevc_auto" | "auto",
   "width":       1920,       // optional — see "Limitations"
   "height":      1080,       // optional — see "Limitations"
   "fps_num":     30,         // recommended — operator-supplied, no auto-detect yet
@@ -373,6 +374,8 @@ See the licensing notes in the main `bilbycast-edge/CLAUDE.md`:
 | `hevc_qsv`    | `video-encoder-qsv`       | same; HEVC requires Kaby Lake (7th gen) or newer | same |
 | `h264_vaapi`  | `video-encoder-vaapi`     | Build: `apt install libva-dev`. Runtime: working VAAPI driver — Mesa **`radeonsi`** for AMD, **`iHD`** for Intel. **4:2:0 8-bit only** on every implementation (no Main10 / 4:2:2 profiles in H.264 VAAPI on any host). | Royalty-free; libva is MIT, FFmpeg's VAAPI wrapper LGPL. No GPL bundle. |
 | `hevc_vaapi`  | `video-encoder-vaapi`     | Same build deps. Supports broadcast contribution matrix end-to-end: 4:2:0 8-bit (NV12), 4:2:0 10-bit (P010LE), 4:2:2 8-bit (NV16), 4:2:2 10-bit (P210LE) — see per-vendor notes below. | same |
+| `h264_rkmpp` | `video-encoder-rkmpp`     | Rockchip MPP HW encode (`h264_rkmpp`) on RK3568 / RK3588 SoCs. Build: `librga` + `rockchip_mpp` headers (pkg-config). **4:2:0 8-bit only.** aarch64 only; ships in the `*-aarch64-linux-rockchip` release artefact (not in `*-linux-full`). | Royalty-free; LGPL API layer. No GPL bundle. |
+| `hevc_rkmpp` | `video-encoder-rkmpp`     | HEVC on the same MPP backend; same build deps + 4:2:0 8-bit limit. | same |
 
 #### VAAPI HEVC chroma × bit-depth support per vendor
 
@@ -439,18 +442,22 @@ and newer); `h264_vaapi` is locked to 4:2:0 8-bit on every VAAPI
 implementation. AMD VCN encoders generally reject 4:2:2 — broadcast
 contribution shops on AMD-on-Linux land on libx265.
 
-Default release build has no software video encoders (AGPL-only
-binary). The composite `video-encoders-full` feature bundles every
-video codec backend the edge knows about — encoders (x264 + x265 +
-NVENC + QSV + VAAPI) **and** HW decoders for the local-display +
-transcode-input paths (NVDEC + QSV-decode + VAAPI-decode) — and is
-used by the GitHub Actions release workflow to produce the
-`*-linux-full` variant. See
-[`docs/installation.md`](installation.md) for the two-channel
-release model. The `*-aarch64-linux-full` artefact intentionally
+A plain `cargo build --release` (the default feature set — no software
+video encoders, AGPL-only binary) is a valid local build but is **not**
+a published release artefact. The GitHub Actions release workflow ships
+only **full** variants: `*-x86_64-linux-full`, `*-aarch64-linux-full`,
+and `*-aarch64-linux-rockchip`. The composite `video-encoders-full`
+feature bundles every video codec backend the edge knows about —
+encoders (x264 + x265 + NVENC + QSV + VAAPI) **and** HW decoders for the
+local-display + transcode-input paths (NVDEC + QSV-decode + VAAPI-decode)
+— and drives the `*-x86_64-linux-full` variant. See
+[`docs/installation.md`](installation.md) for the release-channel
+reference. The `*-aarch64-linux-full` artefact intentionally
 drops QSV (encode + decode; Intel iGPU is x86_64-only) and lists
 the remaining features explicitly: x264 + x265 + NVENC + NVDEC +
-VAAPI encode/decode.
+VAAPI encode/decode. The `*-aarch64-linux-rockchip` artefact carries
+the Rockchip MPP encoders/decoders (`h264_rkmpp` / `hevc_rkmpp`) plus
+the RGA transfer path instead.
 Runtime error `video encoder disabled: rebuild with …` surfaces
 when a config targets a codec whose feature flag was not enabled at
 build; the display output's `hw_decode: "nvdec" / "qsv"` choice
@@ -470,7 +477,8 @@ layer). See [`LICENSE.commercial`](../LICENSE.commercial) and the
 bundled `NOTICE.full` for the full scope statement.
 
 ```bash
-# Linux — default build (no video encoders, matches *-linux release):
+# Linux — default build (no software video encoders; valid local build,
+# but not a published release artefact — the workflow ships full variants only):
 cargo build --release
 
 # libx264 + libx265 are STATICALLY linked (the binary then has no
@@ -824,12 +832,13 @@ options the current binary cannot satisfy.
 | Flag                        | Emitted when                                                   |
 |-----------------------------|----------------------------------------------------------------|
 | `audio-encode`              | Always (the AAC/Opus/MP2/AC-3 encoders are unconditional).     |
-| `video-encode`              | Any `video-encoder-*` feature (x264 / x265 / nvenc / qsv / vaapi) is enabled. |
+| `video-encode`              | Any of `video-encoder-x264` / `-x265` / `-nvenc` / `-qsv` / `-rkmpp` is enabled. (`video-encoder-vaapi` alone does **not** raise this bit — it emits only its own `video-encoder-vaapi` string below.) |
 | `video-encoder-x264`        | Built with `--features video-encoder-x264`.                    |
 | `video-encoder-x265`        | Built with `--features video-encoder-x265`.                    |
 | `video-encoder-nvenc`       | Built with `--features video-encoder-nvenc`.                   |
 | `video-encoder-qsv`         | Built with `--features video-encoder-qsv` (x86_64 only).       |
 | `video-encoder-vaapi`       | Built with `--features video-encoder-vaapi` (Linux).          |
+| `video-encoder-rkmpp`       | Built with `--features video-encoder-rkmpp` (aarch64 Rockchip only). |
 
 A follow-up will add an `st2110-video` capability flag so the manager
 UI can offer the ST 2110-20 / -23 pixel-format / partition-mode
@@ -842,7 +851,8 @@ and then enable only the codec options whose backend flag is also
 present. `h264_nvenc` and `hevc_nvenc` both gate on
 `video-encoder-nvenc`; `h264_qsv` and `hevc_qsv` both gate on
 `video-encoder-qsv`; `h264_vaapi` and `hevc_vaapi` both gate on
-`video-encoder-vaapi`. The `h264_auto` / `hevc_auto` / `auto` strings
+`video-encoder-vaapi`; `h264_rkmpp` and `hevc_rkmpp` both gate on
+`video-encoder-rkmpp`. The `h264_auto` / `hevc_auto` / `auto` strings
 are accepted whenever at least one encoder backend is compiled in and
 resolve to a concrete backend per-host at flow start (see
 [`docs/codec-matrix.md`](codec-matrix.md)).

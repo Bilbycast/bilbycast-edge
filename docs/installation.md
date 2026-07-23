@@ -15,7 +15,7 @@ curl -fsSL https://github.com/Bilbycast/bilbycast-edge/releases/latest/download/
         --registration-token <token-from-manager-ui>
 ```
 
-Optional flags: `--channel stable|nightly|beta`, `--variant default|full`,
+Optional flags: `--channel stable|nightly|beta`,
 `--output-nics <nic1,nic2>` (enable SO_TXTIME wire pacing), `--upgrade-installer`
 (refresh the script + service unit without touching config or installed
 binaries).
@@ -129,18 +129,22 @@ operators who want to inspect every step before running it).
 
 ## Manual install
 
-Two release variants are published on each tag. Pick the one that
-matches your transcoding needs:
+The release workflow publishes only the **full** variant as a prebuilt
+artefact — three tarballs per tag: `*-x86_64-linux-full`,
+`*-aarch64-linux-full`, and the Rockchip `*-aarch64-linux-rockchip`. The
+full binary is an AGPL + GPL combined work bundling every software /
+hardware video codec backend:
 
-| Variant         | H.264 / H.265 transcoding | Licence of binary            |
-|-----------------|---------------------------|------------------------------|
-| **`*-linux`**   | No (pass-through only)    | AGPL-3.0-or-later            |
-| **`*-linux-full`** | Yes (libx264 + libx265 + NVENC + VAAPI; QSV on x86_64 only — Intel iGPU is x86_64-only) | AGPL-3.0-or-later combined work (bundles GPL-2.0+ libx264 / libx265) |
+| Artefact | H.264 / H.265 transcoding | Licence of binary |
+|---|---|---|
+| **`*-linux-full`** (x86_64 + aarch64) | Yes (libx264 + libx265 + NVENC + VAAPI; QSV on x86_64 only — Intel iGPU is x86_64-only) | AGPL-3.0-or-later combined work (bundles GPL-2.0+ libx264 / libx265) |
+| **`*-aarch64-linux-rockchip`** | Yes, via the Rockchip VPU (`h264_rkmpp` / `hevc_rkmpp`, 8-bit 4:2:0) + x264 / x265 CPU fallback | AGPL-3.0-or-later combined work |
 
-Both ship for Linux x86_64 (amd64) and Linux ARM64 (aarch64). The
-`install-edge.sh` script defaults to `--variant full` on Linux (full is
-what most operators want); pass `--variant default` explicitly for the
-AGPL-only pass-through binary. See
+There is **no prebuilt `*-linux` (AGPL-only, no-encoder) artefact**. That
+default feature set is still fully buildable, but only
+[from source](#building-from-source) (`cargo build --release`) — it is
+never published for download. `install-edge.sh` fetches the full variant
+for your architecture automatically. See
 [README.md](../README.md#choosing-a-release-binary) for the full
 picture.
 
@@ -161,9 +165,11 @@ broken down by release variant and architecture. Tested on Ubuntu 24.04 LTS
 > installs should apply the same file; see
 > [st2110.md → Host kernel tuning](st2110.md#host-kernel-tuning-receive-side).
 
-### Default variant (`*-linux`) — runtime
+### Default (from-source) build — runtime
 
-The default binary statically bundles SRT, AAC (fdk-aac), and the FFmpeg
+This applies only to a default-feature binary you build yourself
+(`cargo build --release`) — there is no published `*-linux` artefact. The
+default binary statically bundles SRT, AAC (fdk-aac), and the FFmpeg
 video decoder used for thumbnails. It also includes the **local-display
 output** (`display` Cargo feature, HDMI / DisplayPort + ALSA confidence
 monitor playout), which dynamically links libasound2 at runtime
@@ -248,14 +254,20 @@ Ubuntu) and reboot once.
 
 **Both architectures — SDI (Blackmagic DeckLink):**
 
-SDI capture + playout is compiled into every full artefact and behaves
-exactly like NVENC: no apt packages, no link-time dependency, autodetected
-at runtime. The edge `dlopen`s `libDeckLinkAPI.so` at boot and enumerates
-cards. On a host with no DeckLink card — or no Desktop Video installed —
-the probe finds nothing, the `sdi-decklink` capability never reaches the
-manager, and the manager UI hides the SDI input / output types for that
-node. The binary starts and runs normally either way; you do not need a
-different build for SDI and non-SDI hosts.
+SDI capture + playout is included in a full artefact **only when that
+release was built with the `DECKLINK_SDK_TOKEN` secret present** — the SDK
+headers are EULA-gated and checked out at build time. If the token is
+absent the workflow prints a warning, strips the `sdi-decklink` feature,
+and the build **continues**, producing a full artefact with no SDI (the
+most recent release shipped this way for exactly this reason). When SDI
+*is* compiled in it behaves exactly like NVENC: no apt packages, no
+link-time dependency, autodetected at runtime. The edge `dlopen`s
+`libDeckLinkAPI.so` at boot and enumerates cards. On a host with no
+DeckLink card — or no Desktop Video installed, or a build without the SDI
+feature — the probe finds nothing, the `sdi-decklink` capability never
+reaches the manager, and the manager UI hides the SDI input / output types
+for that node. The binary starts and runs normally either way. To
+guarantee SDI, build from source with the `sdi-decklink` feature (below).
 
 To *use* SDI, install Blackmagic **Desktop Video** (the kernel driver plus
 `libDeckLinkAPI.so`) from
@@ -350,9 +362,12 @@ variable — `libdecklink-sys/build.rs` refuses rather than silently
 dropping the feature.
 
 This matches the package set the GitHub Actions release workflow uses to
-build the `*-linux-full` artefacts, which additionally check the SDK
-headers out of a private repository via the `DECKLINK_SDK_TOKEN` secret so
-every full release ships SDI.
+build the `*-linux-full` artefacts. The workflow checks the SDK headers out
+of a private repository via the `DECKLINK_SDK_TOKEN` secret **when it is
+configured** — but if that secret is absent the workflow drops the
+`sdi-decklink` feature and the build continues, so a published full release
+does **not** necessarily contain SDI. Build from source with the feature
+(above) when you need that guarantee.
 
 ### ARM Rockchip SBCs (RK3568 / RK3588) — RKMPP hardware encode
 
@@ -435,20 +450,9 @@ sudo systemctl mask sleep.target suspend.target hibernate.target hybrid-sleep.ta
 Replace `vX.Y.Z`, `<org>` and the architecture suffix below to match
 the GitHub Release you want (`x86_64` or `aarch64`).
 
-**Default variant** — no runtime codec libraries needed beyond
-glibc:
-
-```bash
-VER=vX.Y.Z
-ARCH=x86_64   # or aarch64
-
-curl -LO https://github.com/<org>/bilbycast-edge/releases/download/${VER}/bilbycast-edge-${VER#v}-${ARCH}-linux.tar.gz
-tar xzf bilbycast-edge-${VER#v}-${ARCH}-linux.tar.gz
-cd bilbycast-edge-${VER#v}-${ARCH}-linux
-./bilbycast-edge --config /path/to/config.json
-```
-
-**Full variant** — libx264 / libx265 are statically linked, so **no
+Only the **full** variant is published as a tarball — there is no
+`*-linux` download, so the URL below always ends in `-full.tar.gz`.
+libx264 / libx265 are statically linked into it, so **no
 codec runtime packages are required**. Install the remaining
 stable-SONAME runtime libraries (HW-accel + display); NVENC works
 automatically on NVIDIA hosts with just the driver:
@@ -928,14 +932,17 @@ git clone https://github.com/<org>/bilbycast-ffmpeg-video-rs.git --recurse-submo
 git clone https://github.com/<org>/bilbycast-rist.git
 
 cd bilbycast-edge
-# Default build (no software video encoders) — matches the `*-linux` release:
+# Default build (no software video encoders) — the AGPL-only feature set.
+# This is NOT published as a prebuilt artefact; building it yourself is the
+# only way to get it:
 cargo build --release
 
-# Full build — matches the `*-linux-full` release. Bundles every
-# video codec backend the edge knows about: encoders (x264 + x265 +
-# NVENC + QSV) and HW decoders for the display output (NVDEC +
-# QSV-decode). The runtime probe activates only the backends the host
-# can actually open.
+# Full build — matches the published `*-x86_64-linux-full` release. Bundles
+# every video codec backend the edge knows about: encoders (x264 + x265 +
+# NVENC + QSV + VAAPI) and HW decoders for the display output (NVDEC +
+# QSV-decode + VAAPI-decode). The runtime probe activates only the backends
+# the host can actually open. (The aarch64 full build omits QSV — Intel iGPU
+# is x86_64-only.)
 cargo build --release --features video-encoders-full
 ```
 
@@ -974,8 +981,8 @@ a physical Linux KMS connector (HDMI / DisplayPort) plus an ALSA
 audio device — a confidence monitor at the stadium / OB truck / MCR
 without an external decoder appliance.
 
-**Included by default in every Linux release variant** (`*-linux` and
-`*-linux-full`, both x86_64 and aarch64). The runtime library
+**On by default in every Linux build** — the published `*-linux-full`
+artefact (x86_64 + aarch64) and any from-source build alike. The runtime library
 (`libasound2`) ships with every modern Linux base install (`drm-rs`
 is pure-Rust ioctls and connector enumeration uses `/sys/class/drm`
 directly, so neither libdrm nor libudev are in the link graph). On
@@ -1166,9 +1173,9 @@ nm bilbycast-edge 2>/dev/null | grep -qE ' [Tt] x26[45]_encoder_open' \
 # (On a stripped binary `nm` shows nothing — fall back to the bundled NOTICE.)
 ```
 
-The `NOTICE` file inside each tarball is the authoritative bundled-library
+The `NOTICE` file inside the tarball is the authoritative bundled-library
 manifest: the full variant ships `NOTICE.full` (lists libx264 / libx265 +
-the GPL terms), the default variant ships the AGPL-only `NOTICE`.
+the GPL terms); a default (from-source) build ships the AGPL-only `NOTICE`.
 
 ---
 
@@ -1183,8 +1190,8 @@ the GPL terms), the default variant ships the AGPL-only `NOTICE`.
   libx264 / libx265, which remain GPL-2.0-or-later inside the
   `*-full` variant regardless of what commercial licence you hold
   for bilbycast. Commercial deployments that need to avoid GPL
-  copyleft entirely should use the default (`*-linux`) variant or
-  build with `--features video-encoder-nvenc` and/or `--features
+  copyleft entirely should build the default (AGPL-only) variant from
+  source, or build with `--features video-encoder-nvenc` and/or `--features
   video-encoder-qsv` only (NVENC's and QSV's API layers are both
   LGPL-compatible; NVIDIA / Intel cover the H.264 / H.265 patent
   pools at the hardware / driver layer).

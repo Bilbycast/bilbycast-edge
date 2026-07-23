@@ -431,6 +431,14 @@ Optional per-flow bandwidth monitoring for SMPTE RP 2129 trust boundary enforcem
 
 The input is discriminated by the `"type"` field.
 
+> **Incomplete list (legacy doc).** The types below are only the subset this
+> version-1 document covered. The current schema also ships `rist`,
+> `st2110_20` / `st2110_23` (uncompressed video), `st2110_30` / `st2110_31` /
+> `st2110_40`, `sdi` (Blackmagic DeckLink), `media_player`, `replay`, `bonded`,
+> and `mxl_video` / `mxl_audio` / `mxl_anc` (with the `mxl` feature). See
+> [docs/configuration-guide.md](configuration-guide.md) for the full,
+> up-to-date type reference and field schemas.
+
 ### SRT Input (`"type": "srt"`)
 
 | Field         | Type                    | Default | Description                                     |
@@ -564,6 +572,15 @@ Pulls media from an external WHEP server. The edge acts as a WHEP client. The `w
 ## Output Types
 
 Outputs are discriminated by the `"type"` field. All output types share `id` and `name` fields.
+
+> **Incomplete list (legacy doc).** The types below are only the subset this
+> version-1 document covered. The current schema also ships `rist`,
+> `st2110_20` / `st2110_23` (uncompressed video), `st2110_30` / `st2110_31` /
+> `st2110_40`, `sdi` (Blackmagic DeckLink), `cmaf`, `display` (local
+> HDMI/DisplayPort + ALSA), `bonded`, and `mxl_video` / `mxl_audio` /
+> `mxl_anc` (with the `mxl` feature). See
+> [docs/configuration-guide.md](configuration-guide.md) for the full,
+> up-to-date type reference and field schemas.
 
 ### SRT Output (`"type": "srt"`)
 

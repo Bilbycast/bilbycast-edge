@@ -259,16 +259,24 @@ End-to-end sanity check on each host class:
 
 ## Build channels
 
-The release workflow ships two binary variants per architecture per tag:
+The release workflow ships three artefacts per tag, all of them **full**
+builds (every video codec backend the edge knows about, bundled — with HW
+decoders for both display and transcode use). Combined work is AGPL with
+GPL terms on the GPL portions (see shipped `NOTICE.full`):
 
-* **`*-linux`** (`cargo build --release`) — AGPL-3.0-or-later, no
-  software video encoders. For deployments that don't transcode video.
-* **`*-linux-full`** (`cargo build --release --features
-  video-encoders-full` on x86_64; the explicit feature list on
-  aarch64) — bundles every video codec backend the edge knows about,
-  including HW decoders for both display and transcode use. Combined
-  work is AGPL with GPL terms on the GPL portions (see shipped
-  `NOTICE.full`).
+* **`*-x86_64-linux-full`** (`cargo build --release --features
+  video-encoders-full`) — x264 + x265 + NVENC + QSV + VAAPI encoders and
+  NVDEC + QSV + VAAPI decoders.
+* **`*-aarch64-linux-full`** (explicit feature list) — same set **minus
+  QSV** (Intel iGPU is x86_64-only).
+* **`*-aarch64-linux-rockchip`** — the aarch64 full set plus RKMPP
+  (`h264_rkmpp` / `hevc_rkmpp`, 8-bit 4:2:0) encode + decode and the RGA
+  DMA-buf transfer path (`rga-transfer`), for RK3568 / RK3588.
 
-The `aarch64-linux-full` build omits QSV (Intel iGPU is x86_64-only).
-Apple Silicon (`aarch64-apple-darwin`) is a planned artefact channel.
+There is no default-only (`*-linux`, AGPL-without-encoders) artefact in the
+matrix — the plain `cargo build --release` default feature set (no software
+video encoders) is still buildable from source, it is just not published as
+a download. SDI (`sdi-decklink`) is compiled into the `-full` / `-rockchip`
+artefacts when the `DECKLINK_SDK_TOKEN` secret is present; if it is absent
+the workflow strips the feature and the build continues, so a full artefact
+may ship without SDI.
