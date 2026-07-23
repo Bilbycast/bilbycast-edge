@@ -174,6 +174,17 @@ async fn encode_loop(
         false,
         format!("media-player-image-{}x{}", img.width, img.height),
     );
+    // This path stamps each frame with a **90 kHz** PTS (`pts_90khz` below),
+    // not a frame counter — declare it before the first encode so lazy-open
+    // gives libavcodec a 1/90000 timebase. Without this the encoder keeps the
+    // 1/fps timebase implied by `fps_num`/`fps_den` and reads the 90 kHz step
+    // (3600 ticks at 25 fps) as 3600 *frame periods* — i.e. 144 s per frame.
+    // Rate control then budgets `bitrate × 144 s` per picture, which turned a
+    // 500 kbps still into ~9 MB per frame ≈ 1.8 Gbps on the wire (measured on
+    // bilby-bite: ~3.2 GB emitted during a 15 s slate, which is also what
+    // drove the media-player edge's RSS spike and OOM). `sdi_io` and
+    // `st2110_video_io` already declare this for the same reason.
+    encoder.set_pts_90k();
 
     let mut audio_state = if audio_silence {
         Some(build_silence_encoder()?)
