@@ -166,25 +166,12 @@ async fn encode_loop(
         hw_decode: None,
     };
 
-    let mut encoder = ScaledVideoEncoder::new(
+    let mut encoder = build_image_encoder(
         video_cfg,
         backend,
-        fps as u32,
-        1,
-        false,
+        fps,
         format!("media-player-image-{}x{}", img.width, img.height),
     );
-    // This path stamps each frame with a **90 kHz** PTS (`pts_90khz` below),
-    // not a frame counter — declare it before the first encode so lazy-open
-    // gives libavcodec a 1/90000 timebase. Without this the encoder keeps the
-    // 1/fps timebase implied by `fps_num`/`fps_den` and reads the 90 kHz step
-    // (3600 ticks at 25 fps) as 3600 *frame periods* — i.e. 144 s per frame.
-    // Rate control then budgets `bitrate × 144 s` per picture, which turned a
-    // 500 kbps still into ~9 MB per frame ≈ 1.8 Gbps on the wire (measured on
-    // bilby-bite: ~3.2 GB emitted during a 15 s slate, which is also what
-    // drove the media-player edge's RSS spike and OOM). `sdi_io` and
-    // `st2110_video_io` already declare this for the same reason.
-    encoder.set_pts_90k();
 
     let mut audio_state = if audio_silence {
         Some(build_silence_encoder()?)
@@ -340,6 +327,29 @@ async fn encode_loop(
     Ok(())
 }
 
+/// Build the still-image encoder **and declare its 90 kHz PTS timebase**.
+///
+/// Kept as its own function purely so the declaration has a regression guard:
+/// this path stamps every frame with a 90 kHz PTS, and omitting
+/// `set_pts_90k()` does not fail loudly. Without it lazy-open keeps the 1/fps
+/// timebase implied by `fps_num`/`fps_den`, so libavcodec reads the 90 kHz
+/// step (3600 ticks at 25 fps) as 3600 *frame periods* — 144 s per picture —
+/// and rate control budgets `bitrate × 144 s` per frame. Hardware-measured on
+/// bilby-bite: a 500 kbps still emitted ~9 MB/frame ≈ 1.8 Gbps and ~3.2 GB per
+/// 15 s slate (~3600x configured), which also drove the edge's RSS into the
+/// OOM killer. `sdi_io` and `st2110_video_io` owe the same declaration —
+/// see `docs/sdi.md` "The 90 kHz PTS contract".
+fn build_image_encoder(
+    video_cfg: VideoEncodeConfig,
+    backend: video_codec::VideoEncoderCodec,
+    fps: u8,
+    log_tag: String,
+) -> ScaledVideoEncoder {
+    let mut encoder = ScaledVideoEncoder::new(video_cfg, backend, fps as u32, 1, false, log_tag);
+    encoder.set_pts_90k();
+    encoder
+}
+
 #[allow(unused_imports, unreachable_code)]
 fn select_video_backend() -> Option<video_codec::VideoEncoderCodec> {
     use video_codec::VideoEncoderCodec;
@@ -450,5 +460,76 @@ impl SilenceEncoder {
             out.push((encoded.bytes, pts));
         }
         Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn probe_cfg() -> VideoEncodeConfig {
+        VideoEncodeConfig {
+            codec: "libx264".to_string(),
+            width: Some(1920),
+            height: Some(1080),
+            fps_num: Some(25),
+            fps_den: Some(1),
+            bitrate_kbps: Some(500),
+            gop_size: Some(25),
+            preset: Some("ultrafast".to_string()),
+            profile: None,
+            chroma: None,
+            bit_depth: None,
+            rate_control: None,
+            crf: None,
+            max_bitrate_kbps: None,
+            bframes: Some(0),
+            refs: None,
+            level: None,
+            tune: Some("stillimage".to_string()),
+            color_primaries: None,
+            color_transfer: None,
+            color_matrix: None,
+            color_range: None,
+            source_video_pid: None,
+            hw_decode: None,
+        }
+    }
+
+    /// Regression guard for the 90 kHz PTS contract.
+    ///
+    /// The still-image path stamps 90 kHz PTS. If `set_pts_90k()` is dropped,
+    /// nothing crashes — rate control silently budgets `bitrate × 144 s` per
+    /// frame (3600 ticks at 25 fps read as 3600 frame periods), which measured
+    /// ~1.8 Gbps for a 500 kbps still on bilby-bite. There is no runtime signal
+    /// to catch that, so the declaration is asserted here instead.
+    #[test]
+    fn image_encoder_declares_90khz_pts() {
+        let enc = build_image_encoder(
+            probe_cfg(),
+            video_codec::VideoEncoderCodec::X264,
+            25,
+            "test".to_string(),
+        );
+        assert!(
+            enc.is_pts_90k(),
+            "still-image encoder must declare 90 kHz PTS; without it rate \
+             control over-allocates by ~3600x (see docs/sdi.md 90 kHz PTS contract)"
+        );
+    }
+
+    /// The declaration must not depend on `fps` — the mis-scaling factor is
+    /// `90000/fps`, so a low fps makes it *worse*, not better.
+    #[test]
+    fn image_encoder_declares_90khz_pts_at_any_fps() {
+        for fps in [1u8, 5, 25, 60] {
+            let enc = build_image_encoder(
+                probe_cfg(),
+                video_codec::VideoEncoderCodec::X264,
+                fps,
+                "test".to_string(),
+            );
+            assert!(enc.is_pts_90k(), "must declare 90 kHz PTS at fps={fps}");
+        }
     }
 }

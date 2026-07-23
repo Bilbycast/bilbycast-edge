@@ -1771,6 +1771,22 @@ const UNSUPPORTED_PIXFMT_RE_EMIT_S: u64 = 60;
 ///
 /// On the CPU branch (operator-chosen or post-fallback) we open once
 /// with no sleep; CPU decoder open is cheap and never contends.
+/// Whether MPEG-2 must be decoded in software on `backend`.
+///
+/// Intel's VAAPI and QSV mpeg2 decoders reject a media-player TS-passthrough
+/// elementary stream with a per-AU `AVERROR_INVALIDDATA` despite advertising
+/// `VAProfileMPEG2Main`. `avcodec_open2` succeeds, so the open-retry/demote
+/// path never fires — only `send_packet` fails — hence a pre-emptive pin.
+///
+/// Scoped to those two backends **only**. NVDEC and RKMPP have working MPEG-2
+/// decoders; pinning them would convert a working hardware path into a
+/// software one (worst on Rockchip, the weakest CPUs in the fleet). Widen only
+/// with per-backend evidence.
+fn mpeg2_requires_cpu_decode(codec: VideoCodec, backend: DecoderBackend) -> bool {
+    matches!(codec, VideoCodec::Mpeg2)
+        && matches!(backend, DecoderBackend::Vaapi | DecoderBackend::Qsv)
+}
+
 fn open_video_decoder_with_retry(
     codec: VideoCodec,
     state: &mut HwOpenState,
@@ -1806,9 +1822,7 @@ fn open_video_decoder_with_retry(
     // know. Caveat: that also means `DisplayStats.decoder_kind` still reports
     // the HW backend while MPEG-2 decodes on CPU. Falls through to the HW path
     // if the CPU open itself fails (then the normal retry+demote handles it).
-    if matches!(codec, VideoCodec::Mpeg2)
-        && matches!(state.backend, DecoderBackend::Vaapi | DecoderBackend::Qsv)
-    {
+    if mpeg2_requires_cpu_decode(codec, state.backend) {
         if let Some(d) = VideoDecoder::open_with_backend(codec, DecoderBackend::Cpu).ok() {
             return Some(d);
         }
@@ -5002,6 +5016,67 @@ fn emit_event(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// MPEG-2 must be pinned to software decode on the two Intel backends
+    /// proven to reject a media-player TS-passthrough elementary stream
+    /// (per-AU AVERROR_INVALIDDATA despite advertising VAProfileMPEG2Main).
+    #[test]
+    fn mpeg2_pinned_to_cpu_on_intel_backends() {
+        assert!(mpeg2_requires_cpu_decode(
+            VideoCodec::Mpeg2,
+            DecoderBackend::Vaapi
+        ));
+        assert!(mpeg2_requires_cpu_decode(
+            VideoCodec::Mpeg2,
+            DecoderBackend::Qsv
+        ));
+    }
+
+    /// The pin must NOT widen to backends with working MPEG-2 decoders.
+    ///
+    /// This is the regression guard that matters: an earlier revision pinned
+    /// MPEG-2 to CPU on *every* backend on Intel-only evidence, which would
+    /// have converted a working hardware path into a software one on NVDEC and
+    /// RKMPP — worst on the Rockchip boxes, the weakest CPUs in the fleet,
+    /// where 1080p software MPEG-2 is expensive. Widen only with per-backend
+    /// evidence, and update this test deliberately when doing so.
+    #[test]
+    fn mpeg2_not_pinned_on_nvdec_or_rkmpp() {
+        assert!(!mpeg2_requires_cpu_decode(
+            VideoCodec::Mpeg2,
+            DecoderBackend::Nvdec
+        ));
+        assert!(!mpeg2_requires_cpu_decode(
+            VideoCodec::Mpeg2,
+            DecoderBackend::Rkmpp
+        ));
+    }
+
+    /// The pin is codec-specific — H.264/HEVC keep the zero-copy HW path on
+    /// the very backends MPEG-2 is pinned away from, including when both
+    /// appear in one playlist.
+    #[test]
+    fn non_mpeg2_codecs_keep_hardware_decode() {
+        for backend in [
+            DecoderBackend::Vaapi,
+            DecoderBackend::Qsv,
+            DecoderBackend::Nvdec,
+            DecoderBackend::Rkmpp,
+        ] {
+            assert!(!mpeg2_requires_cpu_decode(VideoCodec::H264, backend));
+            assert!(!mpeg2_requires_cpu_decode(VideoCodec::Hevc, backend));
+        }
+    }
+
+    /// An already-CPU backend needs no pin — the caller returns before
+    /// reaching this predicate, and it must not claim otherwise.
+    #[test]
+    fn cpu_backend_needs_no_pin() {
+        assert!(!mpeg2_requires_cpu_decode(
+            VideoCodec::Mpeg2,
+            DecoderBackend::Cpu
+        ));
+    }
 
     /// The KMS-open error classifier must map a compositor-held DRM master
     /// (the `display_master_busy` context string emitted by `KmsDisplay::open`

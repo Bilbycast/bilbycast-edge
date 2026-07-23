@@ -712,6 +712,28 @@ RUST_LOG=info
 BILBYCAST_MEDIA_DIR=${DATA_ROOT}/media
 BILBYCAST_REPLAY_DIR=${DATA_ROOT}/replay
 
+# ── Opt-in media-player behaviours (both default OFF) ──────────────────
+# Listed here because they are read ONCE at process start and are easy to
+# lose: a hand-rolled relaunch that forgets them silently reverts to the
+# default, which reads as a regression rather than a missing setting.
+#
+# BILBYCAST_MEDIA_PLAYER_CONTROLLER=1
+#   Enables the playout controller and advertises the
+#   'media-player-control-v1' capability. The manager gates its playlist
+#   "Next" button on that capability, so with this unset the button simply
+#   does not render while the edge looks otherwise healthy — the most
+#   confusing symptom of a dropped env var.
+#
+# BILBYCAST_MEDIA_PLAYER_INCREMENTAL_MP4=1
+#   Uses the bounded incremental MP4/MOV reader instead of the default
+#   whole-file demux. The default holds an entire MP4 in memory, so a
+#   playlist of large assets grows RSS materially. Recommended on
+#   memory-constrained edges.
+#
+# Left commented so an install's behaviour never changes implicitly;
+# uncomment deliberately. See docs/configuration-guide.md (Media Player
+# Input).
+
 # Self-signed / untrusted manager TLS cert. The edge refuses to connect to a
 # manager whose cert isn't publicly trusted UNLESS both this env var is set to
 # 1 AND manager.accept_self_signed_cert=true in config.json (a two-part safety

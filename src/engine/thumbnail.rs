@@ -501,17 +501,25 @@ async fn thumbnail_loop(
                 let stream_silent = last_useful_packet_at
                     .map(|t| t.elapsed() >= NO_SIGNAL_TIMEOUT)
                     .unwrap_or(true);
-                if stream_silent || !state.has_data() {
+                #[cfg(feature = "media-codecs")]
+                let warm_frame = warm.as_ref().and_then(|w| w.latest());
+                #[cfg(not(feature = "media-codecs"))]
+                let warm_frame: Option<InternalThumbnailResult> = None;
+
+                let gate = capture_gate(stream_silent, state.has_data(), warm_frame.is_some());
+                if gate != CaptureGate::Capture {
                     tracing::debug!(
-                        "Thumbnail gate: stream_silent={} has_data={} since_useful_ms={}",
+                        "Thumbnail gate={:?}: stream_silent={} has_data={} warm={} since_useful_ms={}",
+                        gate,
                         stream_silent,
                         state.has_data(),
+                        warm_frame.is_some(),
                         last_useful_packet_at
                             .map(|t| t.elapsed().as_millis() as i64)
                             .unwrap_or(-1),
                     );
                 }
-                if stream_silent {
+                if gate == CaptureGate::NoSignal {
                     reset_thumbnail_state(&stats, &mut last_freeze_sample_at, &mut last_frozen);
                     stats.set_alarm(Some("no_signal".to_string()));
                     // Source gone — tear down any warm decoder so a dead feed
@@ -526,27 +534,10 @@ async fn thumbnail_loop(
                     }
                     continue;
                 }
-                // Packets ARE still arriving here (not `stream_silent`); the
-                // demuxed-AU ring may nonetheless be momentarily empty. A very
-                // low-rate source drains it between ticks — a still-image slate
-                // at 5 fps whose static frames compress to a few bytes each
-                // emits well under one AU per tick. That is NOT a lost signal,
-                // so it must not raise `no_signal` nor tear down the warm
-                // decoder (above): doing so is what made a short still-image
-                // item never produce a thumbnail at all, because every tick
-                // killed the only decoder able to preview it and re-armed
-                // escalation from zero, so the 3-failure escalation never
-                // completed inside the item's airtime.
-                #[cfg(feature = "media-codecs")]
-                let warm_frame = warm.as_ref().and_then(|w| w.latest());
-                #[cfg(not(feature = "media-codecs"))]
-                let warm_frame: Option<InternalThumbnailResult> = None;
-
-                // A warm frame is publishable even with an empty cold ring —
-                // it was decoded from the live edge, not from the ring. Only
-                // skip the tick when there is neither a warm frame nor any
-                // buffered AU to cold-decode.
-                if warm_frame.is_none() && !state.has_data() {
+                // `Skip`: packets are still arriving but there is neither a warm
+                // frame nor a buffered AU this tick. Deliberately NOT an alarm
+                // and NOT a warm-decoder teardown — see `capture_gate`.
+                if gate == CaptureGate::Skip {
                     continue;
                 }
 
@@ -647,6 +638,66 @@ async fn thumbnail_loop(
     if let Some(w) = warm.take() {
         w.shutdown();
     }
+}
+
+/// What the periodic tick should do, given the feed + buffer state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CaptureGate {
+    /// The feed itself has stopped: raise `no_signal`, drop the warm decoder.
+    NoSignal,
+    /// Data is still arriving but there is nothing to publish this tick.
+    /// Not an alarm, and the warm decoder must survive.
+    Skip,
+    /// Publish (warm frame if present, else a cold snapshot).
+    Capture,
+}
+
+/// Decide a tick's action.
+///
+/// The distinction that matters: a genuinely silent feed (`stream_silent`, a
+/// flat data-arrival timeout) is NOT the same as a momentarily-empty demuxed-AU
+/// ring. Conflating them broke previews for very low-rate sources — a
+/// still-image slate at a few fps emits well under one AU per tick, so the ring
+/// legitimately drains — because every tick then raised `no_signal`, tore down
+/// the warm decoder and reset the escalation counter, leaving a short item no
+/// way to ever complete the 3-failure escalation inside its airtime.
+///
+/// A warm frame is publishable even with an empty ring: it was decoded from the
+/// live edge, not from the ring.
+fn capture_gate(stream_silent: bool, has_data: bool, has_warm_frame: bool) -> CaptureGate {
+    if stream_silent {
+        return CaptureGate::NoSignal;
+    }
+    if has_warm_frame || has_data {
+        return CaptureGate::Capture;
+    }
+    CaptureGate::Skip
+}
+
+/// Whether a media-player source boundary just occurred in the warm decoder's
+/// input, meaning its persistent decoder must be re-opened.
+///
+/// A playlist switches sources underneath a decoder that lives for the whole
+/// flow. It can neither switch codec (H.264 ↔ MPEG-2) nor re-anchor its
+/// reference frames across the cut, so without this it wedges on the previous
+/// source's last frame — which the main loop then serves indefinitely.
+///
+/// `PTS_BOUNDARY_TICKS` is 1 s in 90 kHz. Adjacent AUs within one source sit
+/// tens of ms apart, so only a real cut trips it; B-frame reorder (well under
+/// a second) does not.
+fn is_source_boundary(
+    frame_codec: video_codec::VideoCodec,
+    current_codec: video_codec::VideoCodec,
+    pts: u64,
+    last_pts: Option<u64>,
+) -> bool {
+    const PTS_BOUNDARY_TICKS: i64 = 90_000;
+    if frame_codec != current_codec {
+        return true;
+    }
+    last_pts
+        .map(|lp| (pts as i64 - lp as i64).abs() > PTS_BOUNDARY_TICKS)
+        .unwrap_or(false)
 }
 
 /// Return true if any 188-byte TS packet in this chunk carries a non-NULL
@@ -821,17 +872,12 @@ fn warm_decode_loop(
             if au.is_empty() {
                 continue;
             }
-            // Source-boundary detection: a codec change, or a PTS step larger
-            // than any intra-source frame gap (adjacent AUs sit tens of ms
-            // apart; a >1 s jump in 90 kHz ticks only happens at a playlist
-            // cut). Re-open a fresh decoder so the persistent one can't wedge
-            // on the previous source, and clear `latest` so the main loop
-            // stops serving the stale frame until the new one decodes.
-            let pts_discontinuity = last_pts
-                .map(|lp| (pts as i64 - lp as i64).abs() > 90_000)
-                .unwrap_or(false);
+            // Re-open a fresh decoder at a source boundary so the persistent
+            // one can't wedge on the previous source, and clear `latest` so the
+            // main loop stops serving the stale frame until the new one decodes.
+            let boundary = is_source_boundary(frame_codec, current_codec, pts, last_pts);
             last_pts = Some(pts);
-            if frame_codec != current_codec || pts_discontinuity {
+            if boundary {
                 match video_engine::VideoDecoder::open(frame_codec) {
                     Ok(d) => {
                         decoder = d;
@@ -1529,6 +1575,86 @@ fn hash_jpeg(data: &[u8]) -> u64 {
 #[cfg(all(test, feature = "media-codecs"))]
 mod tests {
     use super::*;
+
+    // ── Capture gate ────────────────────────────────────────────────────
+    //
+    // Regression guards for the bug where a momentarily-empty AU ring was
+    // treated as loss of signal: that raised `no_signal`, tore down the warm
+    // decoder and reset the escalation counter every tick, so a short
+    // low-rate item (a still-image slate) could never complete the 3-failure
+    // warm escalation inside its airtime and produced no thumbnail at all.
+
+    #[test]
+    fn gate_silent_feed_is_no_signal_regardless_of_buffer() {
+        // A real data timeout wins even if stale AUs or a warm frame linger —
+        // those would just re-publish a picture of a feed that has stopped.
+        assert_eq!(capture_gate(true, false, false), CaptureGate::NoSignal);
+        assert_eq!(capture_gate(true, true, false), CaptureGate::NoSignal);
+        assert_eq!(capture_gate(true, true, true), CaptureGate::NoSignal);
+    }
+
+    #[test]
+    fn gate_empty_ring_on_live_feed_skips_without_alarming() {
+        // THE regression: data still arriving, ring momentarily drained.
+        // Must NOT be NoSignal — that is what tore down the warm decoder.
+        assert_eq!(capture_gate(false, false, false), CaptureGate::Skip);
+    }
+
+    #[test]
+    fn gate_warm_frame_publishes_even_with_empty_ring() {
+        // A warm frame is decoded from the live edge, not from the ring, so an
+        // empty ring must not suppress it — this is what actually restores the
+        // preview for a low-rate still-image source.
+        assert_eq!(capture_gate(false, false, true), CaptureGate::Capture);
+    }
+
+    #[test]
+    fn gate_buffered_aus_capture() {
+        assert_eq!(capture_gate(false, true, false), CaptureGate::Capture);
+        assert_eq!(capture_gate(false, true, true), CaptureGate::Capture);
+    }
+
+    // ── Warm-decoder source boundary ────────────────────────────────────
+    //
+    // The warm decoder is one persistent decoder for the whole flow, but a
+    // playlist switches sources underneath it. Missing a boundary means it
+    // wedges on the previous source's last frame — which the main loop then
+    // serves indefinitely (the "frozen thumbnail" failure).
+
+    #[test]
+    fn boundary_on_codec_change() {
+        use video_codec::VideoCodec::{H264, Mpeg2};
+        // H.264 -> MPEG-2 is the case that provably wedged the decoder.
+        assert!(is_source_boundary(Mpeg2, H264, 1_000, Some(900)));
+        assert!(is_source_boundary(H264, Mpeg2, 1_000, Some(900)));
+    }
+
+    #[test]
+    fn boundary_on_pts_discontinuity_same_codec() {
+        use video_codec::VideoCodec::H264;
+        // Same codec, new source timeline (the car -> slate case).
+        assert!(is_source_boundary(H264, H264, 5_000_000, Some(1_000)));
+        // Backwards jump counts too — a new source can start lower.
+        assert!(is_source_boundary(H264, H264, 1_000, Some(5_000_000)));
+    }
+
+    #[test]
+    fn no_boundary_within_a_source() {
+        use video_codec::VideoCodec::H264;
+        // Adjacent AUs sit tens of ms apart (3600 ticks = 40 ms at 25 fps);
+        // normal progression must not force a decoder re-open.
+        assert!(!is_source_boundary(H264, H264, 3_600, Some(0)));
+        assert!(!is_source_boundary(H264, H264, 90_000, Some(3_600)));
+        // B-frame reorder is well under the 1 s threshold.
+        assert!(!is_source_boundary(H264, H264, 10_000, Some(13_600)));
+    }
+
+    #[test]
+    fn no_boundary_on_first_frame() {
+        use video_codec::VideoCodec::H264;
+        // Nothing to compare against yet — must not thrash the decoder open.
+        assert!(!is_source_boundary(H264, H264, 12_345, None));
+    }
 
     #[test]
     fn build_annex_b_prepends_start_codes() {
