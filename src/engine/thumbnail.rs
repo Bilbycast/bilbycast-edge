@@ -502,6 +502,16 @@ async fn thumbnail_loop(
                     .map(|t| t.elapsed() >= NO_SIGNAL_TIMEOUT)
                     .unwrap_or(true);
                 if stream_silent || !state.has_data() {
+                    tracing::debug!(
+                        "Thumbnail gate: stream_silent={} has_data={} since_useful_ms={}",
+                        stream_silent,
+                        state.has_data(),
+                        last_useful_packet_at
+                            .map(|t| t.elapsed().as_millis() as i64)
+                            .unwrap_or(-1),
+                    );
+                }
+                if stream_silent {
                     reset_thumbnail_state(&stats, &mut last_freeze_sample_at, &mut last_frozen);
                     stats.set_alarm(Some("no_signal".to_string()));
                     // Source gone — tear down any warm decoder so a dead feed
@@ -516,14 +526,34 @@ async fn thumbnail_loop(
                     }
                     continue;
                 }
-
+                // Packets ARE still arriving here (not `stream_silent`); the
+                // demuxed-AU ring may nonetheless be momentarily empty. A very
+                // low-rate source drains it between ticks — a still-image slate
+                // at 5 fps whose static frames compress to a few bytes each
+                // emits well under one AU per tick. That is NOT a lost signal,
+                // so it must not raise `no_signal` nor tear down the warm
+                // decoder (above): doing so is what made a short still-image
+                // item never produce a thumbnail at all, because every tick
+                // killed the only decoder able to preview it and re-armed
+                // escalation from zero, so the 3-failure escalation never
+                // completed inside the item's airtime.
                 #[cfg(feature = "media-codecs")]
-                let result = match warm.as_ref().and_then(|w| w.latest()) {
+                let warm_frame = warm.as_ref().and_then(|w| w.latest());
+                #[cfg(not(feature = "media-codecs"))]
+                let warm_frame: Option<InternalThumbnailResult> = None;
+
+                // A warm frame is publishable even with an empty cold ring —
+                // it was decoded from the live edge, not from the ring. Only
+                // skip the tick when there is neither a warm frame nor any
+                // buffered AU to cold-decode.
+                if warm_frame.is_none() && !state.has_data() {
+                    continue;
+                }
+
+                let result = match warm_frame {
                     Some(r) => Ok(r),
                     None => state.capture(timing.decode_frames_cap).await,
                 };
-                #[cfg(not(feature = "media-codecs"))]
-                let result = state.capture(timing.decode_frames_cap).await;
                 match result {
                     Ok(result) => {
                         tracing::debug!("Thumbnail captured: {} bytes JPEG", result.jpeg.len());
