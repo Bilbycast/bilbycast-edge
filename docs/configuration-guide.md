@@ -987,9 +987,19 @@ of the local file kicks in transparently.
 | `name` | string | Yes | - | all | Filename within the media library. ASCII alphanumeric plus `._- ` only, 1–255 chars, no leading dot, no path separators. |
 
 > **`mp4` sources must be plain (unfragmented) H.264 + AAC.** Fragmented MP4 (fMP4 — `moof`/`traf` boxes, as produced by `ffmpeg -movflags frag_keyframe+empty_moov`, browser MediaRecorder / MSE, and DASH/HLS/CMAF packagers) is **rejected** with a Critical `media_player_source_unsupported` event, because the pure-Rust demuxer cannot address samples inside movie-fragment boxes and would otherwise emit an undecodable stream. Re-mux to a plain MP4 first — `ffmpeg -i in.mp4 -c copy -movflags +faststart out.mp4` — or transcode to MPEG-TS and use a `"ts"` source (the lowest-CPU path). HEVC-in-MP4 is likewise out of scope; transcode to `.ts`.
-| `fps` | integer | No | `5` | `image` | Frames per second to render. Range 1–60. |
-| `bitrate_kbps` | integer | No | `250` | `image` | Encoded video bitrate. Range 50–50 000 (50 kbps – 50 Mbps). |
+| `fps` | integer | No | `5` | `image` | Frames per second to render. Range 1–60. A still needs no more than a few fps — the picture never changes, so `fps` only sets how often an identical frame is re-encoded (and, with `gop_size = fps`, how often an IDR lands for fast receiver join). Raising it costs CPU and bitrate for no visible benefit. |
+| `bitrate_kbps` | integer | No | `250` | `image` | Encoded video bitrate. Range 50–50 000 (50 kbps – 50 Mbps). A static picture compresses to far less than this in practice; the value is an upper bound, not a target the encoder pads to. |
+| `duration_secs` | integer | No | `null` | `image` | How long the still stays on air before the playlist advances. Range 1–86 400 (1 s – 24 h). **Omit it (`null`) and the still plays forever** until an operator Next, a transition, or a flow stop — the intended behaviour for a fallback/emergency slate. Set it for a timed playlist item. |
 | `audio_silence` | boolean | No | `true` | `image` | Pair the rendered video with silent stereo AAC so downstream demuxers don't complain about a missing audio PID. |
+
+> **Still images are encoded, not looped bytes.** The `image` kind decodes
+> the file once to YUV420p and runs a real H.264 encoder at `fps`, so it
+> needs one of the `video-encoder-*` Cargo features (a default AGPL-only
+> build has no software encoder and the source fails to start). The encoder
+> is fed **90 kHz PTS** and declares that timebase via `set_pts_90k()` — see
+> [the 90 kHz PTS contract](sdi.md#the-90-khz-pts-contract-load-bearing);
+> omitting the declaration makes rate control over-allocate by orders of
+> magnitude rather than fail loudly.
 
 **Media library directory** — the on-disk location where uploaded files
 are stored on the edge. Resolution order:
@@ -1007,6 +1017,17 @@ are stored on the edge. Resolution order:
 > a path the service can't create — every upload then fails with
 > `Permission denied (os error 13)`. If you create the service user by hand
 > (outside `install-edge.sh`), set `BILBYCAST_MEDIA_DIR` yourself.
+
+**Opt-in media-player env flags.** Two behaviours are still gated behind
+environment variables rather than config fields. Both are read once at
+startup, so they must be set on the *process* — a hand-rolled `systemd-run`
+/ `nohup` relaunch that forgets them silently reverts to the default, which
+is easy to misread as a regression:
+
+| Env var | Default | Effect when set to `1` / `true` / `on` |
+|---------|---------|----------------------------------------|
+| `BILBYCAST_MEDIA_PLAYER_CONTROLLER` | off | Enables the Phase-3b playout controller and advertises the **`media-player-control-v1`** capability. The manager gates its playlist **Next** button on that capability, so with the flag unset the button simply does not render — the edge is otherwise healthy, which makes this the most confusing symptom of a dropped env var. |
+| `BILBYCAST_MEDIA_PLAYER_INCREMENTAL_MP4` | off | Uses the bounded incremental MP4/MOV reader instead of the default **whole-file demux**. The default path holds an entire MP4 in memory, so a playlist of large assets grows RSS materially; the incremental reader bounds it. Recommended on memory-constrained edges. |
 
 Files are written `0644`. Per-asset cap: **4 GiB** (`MAX_FILE_BYTES`).
 Library cap: **16 GiB** total (`MAX_TOTAL_BYTES`). Partial uploads stage
