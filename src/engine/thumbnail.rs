@@ -759,6 +759,18 @@ fn warm_decode_loop(
     let mut scaler: Option<(video_engine::VideoScaler, u32, u32)> = None;
     let encoder = video_engine::JpegEncoder::new(cfg.quality);
     let mut last_encode: Option<std::time::Instant> = None;
+    // The warm decoder is persistent for the whole flow, but a media-player
+    // playlist switches sources underneath it — a new codec (H.264 ↔ MPEG-2),
+    // or the same codec on a fresh PTS timeline. A single long-lived decoder
+    // fed across that boundary can neither switch codecs nor re-anchor its
+    // reference frames: it wedges on the last frame of the *previous* source
+    // and `latest` then serves that stale JPEG forever (the freeze an operator
+    // sees once the loop passes the first clip — the thumbnail sticks on the
+    // last frame of whichever source last decoded cleanly). Re-open a fresh
+    // decoder on any source boundary and drop `latest`, so the warm path
+    // re-locks on the new source's first keyframe instead of staying frozen.
+    let mut current_codec = codec;
+    let mut last_pts: Option<u64> = None;
 
     while let Ok(msg) = rx.recv() {
         let ts = match msg {
@@ -766,14 +778,42 @@ fn warm_decode_loop(
             WarmMsg::Shutdown => break,
         };
         for frame in demuxer.demux(&ts) {
-            let (au, pts): (Vec<u8>, u64) = match frame {
-                DemuxedFrame::H264 { nalus, pts, .. } => (build_annex_b(&nalus), pts),
-                DemuxedFrame::H265 { nalus, pts, .. } => (build_annex_b(&nalus), pts),
-                DemuxedFrame::Mpeg2 { es, pts, .. } => (es, pts),
+            let (frame_codec, au, pts): (video_codec::VideoCodec, Vec<u8>, u64) = match frame {
+                DemuxedFrame::H264 { nalus, pts, .. } => {
+                    (video_codec::VideoCodec::H264, build_annex_b(&nalus), pts)
+                }
+                DemuxedFrame::H265 { nalus, pts, .. } => {
+                    (video_codec::VideoCodec::Hevc, build_annex_b(&nalus), pts)
+                }
+                DemuxedFrame::Mpeg2 { es, pts, .. } => (video_codec::VideoCodec::Mpeg2, es, pts),
                 _ => continue,
             };
             if au.is_empty() {
                 continue;
+            }
+            // Source-boundary detection: a codec change, or a PTS step larger
+            // than any intra-source frame gap (adjacent AUs sit tens of ms
+            // apart; a >1 s jump in 90 kHz ticks only happens at a playlist
+            // cut). Re-open a fresh decoder so the persistent one can't wedge
+            // on the previous source, and clear `latest` so the main loop
+            // stops serving the stale frame until the new one decodes.
+            let pts_discontinuity = last_pts
+                .map(|lp| (pts as i64 - lp as i64).abs() > 90_000)
+                .unwrap_or(false);
+            last_pts = Some(pts);
+            if frame_codec != current_codec || pts_discontinuity {
+                match video_engine::VideoDecoder::open(frame_codec) {
+                    Ok(d) => {
+                        decoder = d;
+                        current_codec = frame_codec;
+                        scaler = None;
+                        last_encode = None;
+                        *latest.lock().unwrap() = None;
+                    }
+                    Err(e) => {
+                        tracing::debug!("Warm thumbnail decoder: reopen failed: {e}");
+                    }
+                }
             }
             if decoder.send_packet_with_pts(&au, pts as i64).is_err() {
                 continue;
