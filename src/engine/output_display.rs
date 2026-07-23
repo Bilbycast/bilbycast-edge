@@ -1783,18 +1783,32 @@ fn open_video_decoder_with_retry(
         return VideoDecoder::open_with_backend(codec, DecoderBackend::Cpu).ok();
     }
 
-    // MPEG-2 → always CPU decode. The Intel VAAPI (and QSV) mpeg2 decoder
-    // rejects the media-player TS-passthrough elementary stream with a
-    // per-AU AVERROR_INVALIDDATA (fed raw, no NALU wrapper — verified on
-    // bilby-bite: a 1080p MPEG-2 slate froze the panel while the software
-    // decoder handled the identical bytes fine). MPEG-2 is cheap in software,
-    // so pin it to CPU here WITHOUT touching `state.backend`: a later
-    // H.264/HEVC source in the same playlist still opens on the HW backend,
-    // and the CPU decoder's sysmem frames route through the present path's
-    // per-frame `is_vaapi()`/`is_drm_prime()` check (CPU-blit), so no other
-    // display state needs to know. Falls through to the HW path only if the
-    // CPU open itself fails (then the normal retry+demote handles it).
-    if matches!(codec, VideoCodec::Mpeg2) {
+    // MPEG-2 on **Intel** (VAAPI / QSV) → CPU decode. Those drivers reject a
+    // media-player TS-passthrough elementary stream with a per-AU
+    // AVERROR_INVALIDDATA (fed raw, no NALU wrapper) even though `vainfo`
+    // advertises `VAProfileMPEG2Main` — hardware-verified on bilby-bite, where
+    // a 1080p MPEG-2 source froze the panel while the software decoder handled
+    // the identical bytes fine. `avcodec_open2` *succeeds*, so the open-retry +
+    // demote path below never fires; the failure only shows up on send_packet.
+    // Hence a pre-emptive pin rather than a fallback.
+    //
+    // Deliberately scoped to the two backends actually proven broken. NVDEC and
+    // RKMPP have working MPEG-2 decoders and are NOT covered by the evidence
+    // above — pinning them to CPU would turn a working hardware path into a
+    // software one, which matters most on the Rockchip boxes (weakest CPU in
+    // the fleet, where 1080p software MPEG-2 is expensive). Widen this only
+    // with per-backend evidence.
+    //
+    // The pin does NOT touch `state.backend`: a later H.264/HEVC source in the
+    // same playlist still opens on the HW backend, and the CPU decoder's
+    // sysmem frames route through the present path's per-frame `is_vaapi()` /
+    // `is_drm_prime()` check (CPU-blit), so no other display state needs to
+    // know. Caveat: that also means `DisplayStats.decoder_kind` still reports
+    // the HW backend while MPEG-2 decodes on CPU. Falls through to the HW path
+    // if the CPU open itself fails (then the normal retry+demote handles it).
+    if matches!(codec, VideoCodec::Mpeg2)
+        && matches!(state.backend, DecoderBackend::Vaapi | DecoderBackend::Qsv)
+    {
         if let Some(d) = VideoDecoder::open_with_backend(codec, DecoderBackend::Cpu).ok() {
             return Some(d);
         }
