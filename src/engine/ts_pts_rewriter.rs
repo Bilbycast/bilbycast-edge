@@ -56,9 +56,13 @@
 //!     # i.e. the content genuinely was absent (live gap, splice).
 //!     if delta_src < −500 ms  or  (delta_src > 500 ms and
 //!                                  delta_src − delta_master > 500 ms):
+//!         # The bridge advance is clamped to one packet interval: the
+//!         # content either side of a bridged discontinuity is
+//!         # contiguous, so charging the real (file-reopen) latency
+//!         # would insert a hole that output PTS carries forever.
 //!         out_pcr_at_last = anchor.out_27mhz + (last_src_pcr − anchor.src_27mhz)
 //!         anchor.src_27mhz = src_pcr
-//!         anchor.out_27mhz = out_pcr_at_last + delta_master
+//!         anchor.out_27mhz = out_pcr_at_last + min(delta_master, 40 ms)
 //!     out_pcr = anchor.out_27mhz + (src_pcr − anchor.src_27mhz)
 //!     last_src_pcr = src_pcr
 //!     last_master  = master.now_27mhz()
@@ -143,6 +147,29 @@ const PCR_RR_MAX_27MHZ: u64 = 40 * 27_000;
 /// Protects against pathological cases (very large source gaps).
 /// 50 × 40 ms = 2 s of padding maximum.
 const PCR_RR_MAX_INJECTIONS: usize = 50;
+
+/// Ceiling on how far a discontinuity bridge may advance the output
+/// timeline, in 27 MHz ticks (one `PCR_RR_MAX_27MHZ` packet interval).
+///
+/// A bridge exists to keep output monotonic across a source
+/// discontinuity whose content is *contiguous* — a file loop wrap
+/// serves frame N of one pass immediately followed by frame 1 of the
+/// next. The correct output advance is therefore one packet interval:
+/// "the output PCR pauses for one packet then resumes".
+///
+/// Bridging by raw `delta_master` silently assumed that real elapsed
+/// time between the two PCR observations *is* that packet interval,
+/// which holds only when the wrap is instantaneous. It is not: the
+/// media player has to reopen and re-index the file, measured on
+/// bilby-bite at ~38 ms for the H.264 clip but ~163 ms for the MPEG-2
+/// one. Every loop then injected that reopen latency into the
+/// presentation timeline as a hole, so output PTS crept ahead of the
+/// content it described, the display waited longer and longer, and the
+/// frame queue shed the surplus — 30 fps decoded but only 18 fps
+/// presented after two minutes, drop rate accelerating. Clamping keeps
+/// the bridge's monotonicity guarantee while charging the timeline only
+/// what the content actually consumed.
+const MAX_BRIDGE_ADVANCE_27MHZ: u64 = PCR_RR_MAX_27MHZ;
 
 /// TR 101 290 §PAT_error / §PMT_error: PSI tables must repeat at
 /// least every 500 ms (else the receiver alarms). We inject cached
@@ -820,13 +847,15 @@ impl TsPtsRewriter {
                 self.anchor.last_src_pcr_27mhz.wrapping_sub(self.anchor.src_27mhz),
             );
             let delta_master = master_now.wrapping_sub(self.anchor.last_master_27mhz);
+            let bridge = delta_master.min(MAX_BRIDGE_ADVANCE_27MHZ);
             self.anchor.src_27mhz = src_pcr_27mhz;
-            self.anchor.out_27mhz = out_at_last.wrapping_add(delta_master);
+            self.anchor.out_27mhz = out_at_last.wrapping_add(bridge);
             set_di = true;
             tracing::info!(
                 src_pcr_27mhz,
                 delta_src_27mhz = delta_src,
                 delta_master_27mhz = delta_master,
+                bridge_27mhz = bridge,
                 "ts_pts_rewriter: backward PCR discontinuity bridged (DI=1)"
             );
         } else if delta_src > DISCONTINUITY_THRESHOLD_27MHZ as i64 {
@@ -871,12 +900,14 @@ impl TsPtsRewriter {
                 let out_at_last = self.anchor.out_27mhz.wrapping_add(
                     self.anchor.last_src_pcr_27mhz.wrapping_sub(self.anchor.src_27mhz),
                 );
+                let bridge = delta_master.min(MAX_BRIDGE_ADVANCE_27MHZ);
                 self.anchor.src_27mhz = src_pcr_27mhz;
-                self.anchor.out_27mhz = out_at_last.wrapping_add(delta_master);
+                self.anchor.out_27mhz = out_at_last.wrapping_add(bridge);
                 tracing::info!(
                     src_pcr_27mhz,
                     delta_src_27mhz = delta_src,
                     delta_master_27mhz = delta_master,
+                    bridge_27mhz = bridge,
                     "ts_pts_rewriter: unwitnessed forward PCR jump bridged (DI=1)"
                 );
             } else {
@@ -1668,6 +1699,51 @@ mod tests {
         assert!(
             ts_discontinuity_indicator(source_pkt),
             "bridged forward jump MUST still set DI=1 so receivers re-anchor"
+        );
+    }
+
+    /// A bridge must never advance the output timeline by more than one
+    /// packet interval, however long the source-side stall actually was.
+    /// The content either side of a bridged discontinuity is contiguous
+    /// (a loop wrap serves frame N then frame 1 back to back), so any
+    /// larger advance inserts a hole that output PTS carries forward
+    /// forever. Charging the real reopen latency — ~163 ms per loop on
+    /// the MPEG-2 clip, ~38 ms on the H.264 one — made output PTS creep
+    /// ahead of its own content until the display was presenting 18 fps
+    /// of a 30 fps decode with the queue shedding the rest.
+    #[test]
+    fn bridge_advance_is_clamped_to_one_packet_interval() {
+        let mut r = TsPtsRewriter::new(make_wallclock_pacer());
+        let mut buf = Vec::new();
+        r.process(&build_psi(0x100, 0x101), &mut buf);
+
+        let src_pcr_1: u64 = 1_000_000_000;
+        let mut out1 = Vec::new();
+        r.process(&build_pcr_packet(0x100, src_pcr_1), &mut out1);
+        let new_pcr_1 = extract_pcr(&out1[..TS_PACKET_SIZE]).unwrap();
+
+        // A slow file reopen: 250 ms of real time passes, well past the
+        // 40 ms packet interval, while the source wraps backward to the
+        // top of the file.
+        std::thread::sleep(std::time::Duration::from_millis(250));
+
+        let src_pcr_2: u64 = src_pcr_1 - 5_000 * 27_000;
+        let mut out2 = Vec::new();
+        r.process(&build_pcr_packet(0x100, src_pcr_2), &mut out2);
+        let new_pcr_2 = extract_pcr(&out2[..TS_PACKET_SIZE]).unwrap();
+
+        let forward = (new_pcr_2 as i64).wrapping_sub(new_pcr_1 as i64);
+        assert!(
+            forward > 0,
+            "bridge must keep output PCR monotonic across a backward source jump"
+        );
+        assert!(
+            forward <= MAX_BRIDGE_ADVANCE_27MHZ as i64,
+            "bridge advanced {forward} ticks (~{} ms) — must be clamped to one \
+             {}ms packet interval so the reopen latency is not charged to the \
+             presentation timeline",
+            forward / 27_000,
+            MAX_BRIDGE_ADVANCE_27MHZ / 27_000,
         );
     }
 
