@@ -46,17 +46,17 @@
 //!     last_master  = master.now_27mhz()
 //!
 //! On every subsequent PCR:
-//!     delta_src = src_pcr − last_src_pcr      (33-bit wrap-safe)
-//!     if |delta_src| > 500 ms in 27 MHz:
-//!         # Source discontinuity (loop wrap, splice, encoder restart)
-//!         # Bridge using master-clock elapsed time so the receiver
-//!         # sees a continuous monotonic PCR instead of a backward
-//!         # jump. The bridge value is what real wallclock elapsed
-//!         # between observations, which for an instantaneous loop
-//!         # wrap is ~ms — so the output PCR effectively pauses for
-//!         # one packet then resumes, no visible glitch.
+//!     delta_src    = src_pcr − last_src_pcr      (33-bit wrap-safe)
+//!     delta_master = master.now_27mhz() − last_master
+//!     # A discontinuity is *bridged* when the wall clock did not
+//!     # witness it — the source timeline moved but real time did not,
+//!     # so the gap is an artefact (loop wrap, encoder restart) and
+//!     # propagating it would push output off real time permanently.
+//!     # It is *passed through* when master elapsed by about as much,
+//!     # i.e. the content genuinely was absent (live gap, splice).
+//!     if delta_src < −500 ms  or  (delta_src > 500 ms and
+//!                                  delta_src − delta_master > 500 ms):
 //!         out_pcr_at_last = anchor.out_27mhz + (last_src_pcr − anchor.src_27mhz)
-//!         delta_master    = master.now_27mhz() − last_master
 //!         anchor.src_27mhz = src_pcr
 //!         anchor.out_27mhz = out_pcr_at_last + delta_master
 //!     out_pcr = anchor.out_27mhz + (src_pcr − anchor.src_27mhz)
@@ -81,7 +81,15 @@
 //!   the same way they did against source.
 //! - **DTS reorder preserved** — H.264 / HEVC B-frames decode correctly.
 //! - **Loop-wrap absorbed** — discontinuity bridged with real elapsed
-//!   wallclock; receiver sees no jump.
+//!   wallclock; receiver sees no jump. This holds for forward wraps as
+//!   well as backward ones: a looping file advances source PCR without
+//!   real time advancing, and passing that through made the output
+//!   timeline gain the wrap delta over the wall clock on every loop.
+//!   Hardware-measured on bilby-bite as a video-only 20 s clip decaying
+//!   from 30 fps presented to 10-17 fps over a few minutes.
+//! - **Genuine gaps still pass through** — a live feed that really was
+//!   off-air advances master alongside source, so PCR_FO rate accuracy
+//!   is preserved exactly as before (no master-bridge rate drift).
 //! - **No safety-check fallback** — the algorithm uses master clock
 //!   only for *deltas* (not absolute values), so it works regardless
 //!   of how master and source absolute values compare.
@@ -823,36 +831,81 @@ impl TsPtsRewriter {
             );
         } else if delta_src > DISCONTINUITY_THRESHOLD_27MHZ as i64 {
             set_di = true;
-            // Signal the audio replacer on this SAME input's pipeline
-            // to silence-pad the gap. Forward PCR jumps pass through
-            // (PCR_FO preservation), but on sources where audio PES
-            // PTS does NOT follow the PCR jump (notably
-            // `ffmpeg -stream_loop` — its mpegts muxer offsets audio
-            // by `audio_duration` and video by `video_duration`
-            // independently at each loop wrap), the output audio
-            // drifts ~1.3 s behind PCR per loop without padding.
+            // Forward jumps split into two physically different cases,
+            // told apart by whether the wall clock witnessed the gap.
             //
-            // **Per-input signal**: this Arc is shared with ONE audio
-            // replacer (the one in this input's pipeline). Passive
-            // inputs have their own separate Arc — no cross-input
-            // pollution. See the field's doc-comment for rationale.
-            // `None` = no replacer paired (audio passthrough or test
-            // setup); the signal is silently dropped.
-            let signalled = if let Some(s) = self.pcr_jump_signal.as_ref() {
-                s.fetch_add(
-                    delta_src,
-                    std::sync::atomic::Ordering::Release,
+            // A **real** gap — live feed off-air, splice, edit point —
+            // advances master by roughly as much as the source: the
+            // content really was absent for that long. Passing it
+            // through preserves PCR_FO rate accuracy (TR 101 290
+            // ±30 ppm); bridging would accumulate negative rate drift
+            // across every jump.
+            //
+            // An **artificial** jump — a file looping in the media
+            // player — advances source PCR by the wrap delta while real
+            // elapsed time is ~one packet interval. Passing that through
+            // makes the output timeline gain that delta over the wall
+            // clock on *every* loop, cumulatively. Hardware-measured on
+            // bilby-bite: a 20.4 s video-only clip wraps +0.797 s per
+            // loop (3.9 % ahead per iteration), and the display — pacing
+            // to a PTS timeline running ever further ahead of real time —
+            // decays from 30 fps presented to 10-17 fps with
+            // `frames_dropped_mpsc_full` climbing without bound. The same
+            // content at a 180 s loop period (0.44 % per iteration) is
+            // fine, and the same content muxed to MP4 is fine, because
+            // neither accumulates. Bridging with master elapsed keeps the
+            // output wall-clock-true, exactly as the backward-jump arm
+            // above already does.
+            //
+            // Why this never showed on audio-bearing sources: the
+            // `pcr_jump_signal` below makes the audio replacer
+            // silence-pad the gap, so the audio clock advances in step
+            // and the audio-mastered display stays consistent. Video-only
+            // sources emit the signal but nothing consumes it, leaving
+            // the drift uncorrected. The jump is also smaller than the
+            // display's 5 s `pts_jump` re-anchor threshold, so it never
+            // trips a discontinuity reset — it just accumulates silently.
+            let delta_master = master_now.wrapping_sub(self.anchor.last_master_27mhz);
+            let unwitnessed = (delta_src as u64).saturating_sub(delta_master);
+            if unwitnessed > DISCONTINUITY_THRESHOLD_27MHZ {
+                let out_at_last = self.anchor.out_27mhz.wrapping_add(
+                    self.anchor.last_src_pcr_27mhz.wrapping_sub(self.anchor.src_27mhz),
                 );
-                true
+                self.anchor.src_27mhz = src_pcr_27mhz;
+                self.anchor.out_27mhz = out_at_last.wrapping_add(delta_master);
+                tracing::info!(
+                    src_pcr_27mhz,
+                    delta_src_27mhz = delta_src,
+                    delta_master_27mhz = delta_master,
+                    "ts_pts_rewriter: unwitnessed forward PCR jump bridged (DI=1)"
+                );
             } else {
-                false
-            };
-            tracing::info!(
-                src_pcr_27mhz,
-                delta_src_27mhz = delta_src,
-                signalled,
-                "ts_pts_rewriter: forward PCR discontinuity passed through (DI=1)"
-            );
+                // Signal the audio replacer on this SAME input's pipeline
+                // to silence-pad the gap. Only meaningful on the
+                // pass-through arm: the bridge above removes the gap from
+                // the output timeline entirely, so padding it would
+                // re-introduce the very drift the bridge just cancelled.
+                //
+                // **Per-input signal**: this Arc is shared with ONE audio
+                // replacer (the one in this input's pipeline). Passive
+                // inputs have their own separate Arc — no cross-input
+                // pollution. See the field's doc-comment for rationale.
+                // `None` = no replacer paired (audio passthrough or test
+                // setup); the signal is silently dropped.
+                let signalled = if let Some(s) = self.pcr_jump_signal.as_ref() {
+                    s.fetch_add(delta_src, std::sync::atomic::Ordering::Release);
+                    true
+                } else {
+                    false
+                };
+                tracing::info!(
+                    src_pcr_27mhz,
+                    delta_src_27mhz = delta_src,
+                    delta_master_27mhz = delta_master,
+                    signalled,
+                    "ts_pts_rewriter: forward PCR discontinuity passed through (DI=1)"
+                );
+            }
         }
 
         self.anchor.last_src_pcr_27mhz = src_pcr_27mhz;
@@ -1567,13 +1620,18 @@ mod tests {
         );
     }
 
-    /// Forward PCR jump > 500 ms passes through with DI=1 and NO
-    /// synthetic padding. PCR_RR injection is intentionally skipped on
-    /// discontinuities — injecting dozens of phantom PCRs at a loop
-    /// boundary would confuse receivers and corrupt CC. The DI=1 flag
-    /// + native source PCR value is the correct discontinuity signal.
+    /// A forward PCR jump the wall clock never witnessed is an artefact
+    /// of the *source* timeline (a file looping in the media player),
+    /// not a real gap in content, so it must be bridged rather than
+    /// propagated. Passing it through made the output timeline gain the
+    /// wrap delta over real time on every single loop: hardware-measured
+    /// on bilby-bite as a 20.4 s video-only clip wrapping +0.797 s per
+    /// loop and decaying from 30 fps presented to 10-17 fps, with
+    /// `frames_dropped_mpsc_full` climbing without bound. The same clip
+    /// at a 180 s loop period, and the same video muxed to MP4, were both
+    /// unaffected — neither accumulates.
     #[test]
-    fn forward_pcr_jump_passes_through_with_di() {
+    fn unwitnessed_forward_pcr_jump_is_bridged_not_propagated() {
         use crate::engine::ts_parse::ts_discontinuity_indicator;
         let mut r = TsPtsRewriter::new(make_wallclock_pacer());
         let mut buf = Vec::new();
@@ -1584,15 +1642,63 @@ mod tests {
         r.process(&build_pcr_packet(0x100, src_pcr_1), &mut out1);
         let new_pcr_1 = extract_pcr(&out1[..TS_PACKET_SIZE]).unwrap();
 
-        // Source jumps forward 800 ms (typical ffmpeg file-loop boundary)
+        // File-loop boundary: source PCR leaps 800 ms with no real time
+        // elapsing between the two observations.
         let src_pcr_2: u64 = src_pcr_1 + 800 * 27_000;
         let mut out2 = Vec::new();
         r.process(&build_pcr_packet(0x100, src_pcr_2), &mut out2);
 
-        // Output: exactly 1 packet (source, with DI=1). No PCR_RR
-        // synthetics on a discontinuity.
+        // Still exactly one packet — PCR_RR synthetics stay suppressed on
+        // a discontinuity (phantom PCRs at a loop boundary would confuse
+        // receivers and corrupt CC).
         let n_pkts = out2.len() / TS_PACKET_SIZE;
         assert_eq!(n_pkts, 1, "forward discontinuity: source only, no synthetic padding");
+        let source_pkt = &out2[0..TS_PACKET_SIZE];
+        let new_pcr_2 = extract_pcr(source_pkt).unwrap();
+
+        let forward = (new_pcr_2 as i64).wrapping_sub(new_pcr_1 as i64);
+        assert!(
+            forward < 100 * 27_000,
+            "unwitnessed forward jump must be bridged to real elapsed time, \
+             not propagated; output advanced {forward} 27 MHz ticks \
+             (~{} ms) across a wrap that took no wall-clock time",
+            forward / 27_000,
+        );
+
+        assert!(
+            ts_discontinuity_indicator(source_pkt),
+            "bridged forward jump MUST still set DI=1 so receivers re-anchor"
+        );
+    }
+
+    /// The complement: a forward jump the wall clock *did* witness is a
+    /// genuine gap in the content — a live feed off-air, a splice, an
+    /// edit point — and must still pass through untouched. Bridging a
+    /// real gap would truncate it and accumulate negative rate drift
+    /// against TR 101 290 PCR_FO (±30 ppm) on every occurrence. Sleeping
+    /// is unavoidable here: the discriminator is literally whether the
+    /// master clock advanced alongside the source.
+    #[test]
+    fn witnessed_forward_pcr_jump_still_passes_through() {
+        use crate::engine::ts_parse::ts_discontinuity_indicator;
+        let mut r = TsPtsRewriter::new(make_wallclock_pacer());
+        let mut buf = Vec::new();
+        r.process(&build_psi(0x100, 0x101), &mut buf);
+
+        let src_pcr_1: u64 = 1_000_000_000;
+        let mut out1 = Vec::new();
+        r.process(&build_pcr_packet(0x100, src_pcr_1), &mut out1);
+        let new_pcr_1 = extract_pcr(&out1[..TS_PACKET_SIZE]).unwrap();
+
+        // Real time passes: the source really was absent. 350 ms against
+        // an 800 ms source jump leaves 450 ms unwitnessed, inside the
+        // 500 ms tolerance, so this is classified as a genuine gap.
+        std::thread::sleep(std::time::Duration::from_millis(350));
+
+        let src_pcr_2: u64 = src_pcr_1 + 800 * 27_000;
+        let mut out2 = Vec::new();
+        r.process(&build_pcr_packet(0x100, src_pcr_2), &mut out2);
+
         let source_pkt = &out2[0..TS_PACKET_SIZE];
         let new_pcr_2 = extract_pcr(source_pkt).unwrap();
 
@@ -1600,7 +1706,7 @@ mod tests {
         assert_eq!(
             forward,
             800 * 27_000,
-            "source PCR must preserve forward 800ms jump"
+            "a wall-clock-witnessed gap must preserve the source's forward jump"
         );
 
         assert!(

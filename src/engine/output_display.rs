@@ -1799,23 +1799,31 @@ const UNSUPPORTED_PIXFMT_RE_EMIT_S: u64 = 60;
 ///   139 MB, where the pinned build collapses to 8 obj / 30 MB) and
 ///   process CPU drops ~64 % → ~49 %.
 ///
-///   It is pinned anyway because hardware decode makes the *picture*
-///   worse on this host. Same file, same 1920x1080@60 panel, same
-///   `match_source` scaling, back-to-back builds: CPU decode presents
-///   the full 24 fps with `frames_dropped_mpsc_full` static, while
-///   VAAPI decode presents ~17 fps and sheds ~7 fps continuously at the
-///   display queue for the whole window. The decoder keeps up either
-///   way (~24 fps produced); it is the frames themselves that cost more
-///   downstream — VAAPI MPEG-2 surfaces evidently do not reach the
-///   zero-copy scanout the H.264 path enjoys (H.264 windows on the same
-///   run drop nothing). Cheaper decode, worse output, so the pin stays
-///   until the present-path cost is understood. Do not unpin on decode
-///   evidence alone: measure `frames_displayed` and
-///   `frames_dropped_mpsc_full` across a full source window.
-/// * **QSV — still pinned.** Same silicon as VAAPI, and now the same
-///   caution applies twice over: even a QSV decode that works may
-///   present worse than CPU. Needs the full decode + presentation
-///   measurement before any change.
+///   It stays pinned as a conservative default, **not** because
+///   hardware decode was shown to be worse. An earlier revision of this
+///   comment claimed VAAPI presented ~17 fps against CPU's 24 fps; that
+///   comparison was invalid. It used a video-only 23.976 fps TS on a
+///   short loop, which is subject to the loop-restart degradation
+///   documented on `ts_loop_restart` — so the two builds were sampled at
+///   different points on the same decay curve, and the difference was
+///   attributed to the decoder. Re-run properly on bilby-bite with
+///   matched 1080p30 clips (audio present, so the decay is absent),
+///   MPEG-2 decode measured 27-29 fps / 2.3 drops-per-second on CPU
+///   versus 27-30 fps / 2.0 on VAAPI: parity, within noise. Unpinning is
+///   therefore defensible on the evidence but buys nothing measurable at
+///   the panel, so the fleet-wide default stays CPU until someone wants
+///   the CPU headroom badly enough to validate it per host.
+/// * **QSV — still pinned.** Same silicon as VAAPI; never re-validated
+///   at all.
+///
+/// Two rules this predicate has cost us twice over, both worth obeying:
+/// `DisplayStats.decoder_kind` and the `backend=` field on the
+/// send_packet warning report `state.backend` whether or not the pin
+/// fired, so **neither is evidence of which decoder ran** — prove it
+/// out-of-band (i915 GEM totals, NVML, process CPU). And decode-side
+/// evidence alone must never move this predicate: measure
+/// `frames_displayed` + `frames_dropped_mpsc_full` across a full source
+/// window, on content that is not itself degrading.
 /// * **RKMPP — still pinned.** Not a runtime rejection at all: the
 ///   vendored rkmpp FFmpeg fork registers no MPEG-2 decoder
 ///   (`rkmppdec.c` handles h264/hevc/vp8/vp9 only), so
