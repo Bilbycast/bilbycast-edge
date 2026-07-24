@@ -1100,6 +1100,7 @@ fn demux_decode_loop(
         consecutive_send_errors: 0,
         last_send_error_log_at: None,
         first_send_after_open: None,
+        mpeg2_cpu_pinned: false,
     };
     let mut aac_decoder: Option<AacDecoder> = None;
     let mut ff_audio_decoder: Option<FfAudioDecoder> = None;
@@ -1728,6 +1729,19 @@ struct HwOpenState {
     /// `frames_received_since_open == 0` while still on a HW backend,
     /// we emit `display_hw_decode_no_frames` and demote to CPU.
     first_send_after_open: Option<Instant>,
+    /// Runtime-learned companion to the static `mpeg2_requires_cpu_decode`
+    /// table: set when a *hardware* MPEG-2 decode fails at runtime on a
+    /// backend the table does not pin. The table can only encode what the
+    /// fleet has been measured on — VAAPI is carved out because Intel iHD
+    /// decodes MPEG-2, but VAAPI is not one implementation (AMD VCN4
+    /// dropped MPEG-2 decode entirely, and `avcodec_open2` succeeds there
+    /// anyway), so an unmeasured host must be able to discover the same
+    /// answer for itself. Scoping that discovery to MPEG-2 rather than
+    /// demoting `backend` wholesale is the whole point: a backend-wide
+    /// demote is permanent and would strip HW decode from every later
+    /// H.264/HEVC source in the playlist, which is exactly the failure the
+    /// static pin exists to prevent.
+    mpeg2_cpu_pinned: bool,
 }
 
 /// Sustained run of `send_packet_with_pts` errors after which the
@@ -1810,6 +1824,15 @@ fn mpeg2_requires_cpu_decode(codec: VideoCodec, backend: DecoderBackend) -> bool
         && matches!(backend, DecoderBackend::Qsv | DecoderBackend::Rkmpp)
 }
 
+/// Whether this decoder open must use CPU for MPEG-2 — the static table
+/// above OR the runtime-learned pin (`HwOpenState::mpeg2_cpu_pinned`),
+/// which lets a host the fleet has never measured reach the same answer
+/// on its own after one failed hardware attempt.
+fn mpeg2_pin_active(codec: VideoCodec, backend: DecoderBackend, runtime_pinned: bool) -> bool {
+    mpeg2_requires_cpu_decode(codec, backend)
+        || (matches!(codec, VideoCodec::Mpeg2) && runtime_pinned)
+}
+
 /// Open a `VideoDecoder` with bounded HW retry + CPU fallback.
 ///
 /// On a flow restart that overlaps the previous flow's HW context
@@ -1852,7 +1875,7 @@ fn open_video_decoder_with_retry(
     // evidence of which decoder actually produced (or rejected) a frame.
     // Falls through to the HW path if the CPU open itself fails (then the
     // normal retry+demote handles it).
-    if mpeg2_requires_cpu_decode(codec, state.backend) {
+    if mpeg2_pin_active(codec, state.backend, state.mpeg2_cpu_pinned) {
         if let Some(d) = VideoDecoder::open_with_backend(codec, DecoderBackend::Cpu).ok() {
             return Some(d);
         }
@@ -2189,6 +2212,41 @@ fn force_cpu_fallback(
         // HW, plus by the send-error threshold path on a re-entry.
         return;
     }
+
+    // MPEG-2 demotes are scoped to MPEG-2, not to the backend. See
+    // `HwOpenState::mpeg2_cpu_pinned`: the backends that can't decode
+    // MPEG-2 decode H.264/HEVC perfectly well, so taking the whole
+    // backend down would trade one bad source for a whole bad playlist.
+    // The next `open_video_decoder_with_retry` for MPEG-2 picks up the
+    // pin; H.264/HEVC keep opening on `state.backend` untouched.
+    if matches!(*current, Some(VideoCodec::Mpeg2)) {
+        if !state.mpeg2_cpu_pinned {
+            state.mpeg2_cpu_pinned = true;
+            let backend = backend_name(state.backend);
+            event_sender.emit_flow_with_details(
+                EventSeverity::Warning,
+                crate::manager::events::category::SYSTEM_RESOURCES,
+                format!(
+                    "display output '{output_id}': MPEG-2 hardware decode failed on \
+                     {backend} ({trigger}); MPEG-2 pinned to CPU for this run — \
+                     H.264/HEVC keep hardware decode"
+                ),
+                flow_id,
+                serde_json::json!({
+                    "error_code": "display_hw_decode_mpeg2_pinned",
+                    "output_id": output_id,
+                    "backend": backend,
+                    "trigger": trigger,
+                    "last_error": last_error.unwrap_or_else(|| "unknown".to_string()),
+                }),
+            );
+        }
+        *slot = None;
+        *current = None;
+        reset_decoder_open_window(state, counters);
+        return;
+    }
+
     state.backend = DecoderBackend::Cpu;
     state.fell_back_to_cpu = true;
     *slot = None;
@@ -5075,6 +5133,31 @@ mod tests {
                 "MPEG-2 must stay on hardware decode on {backend:?}"
             );
         }
+    }
+
+    /// The runtime-learned pin covers what the static table cannot: a host
+    /// whose VAAPI has no MPEG-2 entrypoint (AMD VCN4 dropped it) discovers
+    /// that for itself after one failed attempt, and thereafter opens MPEG-2
+    /// on CPU — while H.264/HEVC keep opening on the hardware backend, which
+    /// is the whole reason the demote is codec-scoped rather than
+    /// backend-wide.
+    #[test]
+    fn runtime_pin_scopes_to_mpeg2_and_spares_other_codecs() {
+        let carved_out = DecoderBackend::Vaapi;
+        // Before the runtime pin: MPEG-2 goes to hardware on a carved-out
+        // backend, exactly as the static table says.
+        assert!(!mpeg2_pin_active(VideoCodec::Mpeg2, carved_out, false));
+        // After one runtime failure: MPEG-2 is on CPU...
+        assert!(mpeg2_pin_active(VideoCodec::Mpeg2, carved_out, true));
+        // ...and nothing else is.
+        assert!(!mpeg2_pin_active(VideoCodec::H264, carved_out, true));
+        assert!(!mpeg2_pin_active(VideoCodec::Hevc, carved_out, true));
+        // A statically pinned backend does not need the runtime flag.
+        assert!(mpeg2_pin_active(
+            VideoCodec::Mpeg2,
+            DecoderBackend::Rkmpp,
+            false
+        ));
     }
 
     /// The pin is codec-specific — H.264/HEVC keep the zero-copy HW path on
