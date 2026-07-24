@@ -1787,26 +1787,35 @@ const UNSUPPORTED_PIXFMT_RE_EMIT_S: u64 = 60;
 ///   in, MPEG-2 was re-validated on bilby-z440 against both the
 ///   broadcast sample and a freshly generated file (mpeg2/nvdec, zero
 ///   demotions/errors, full rate).
-/// * **VAAPI — carved out.** The "per-AU rejection" was the same
-///   *transient* start-of-source burst the CPU decoder logs on the very
-///   same file — an A/B on bilby-bite (i3-1215U, iHD,
-///   `VAProfileMPEG2Main`) measured an identical +11 `send_packet`
-///   errors at each MPEG-2 window start on both the pinned (CPU) and
-///   unpinned (VAAPI) builds, flat thereafter, so the burst is
-///   file-determined (mid-GOP AUs ahead of the first sequence header),
-///   not backend-determined. Pre-gate builds demoted permanently on it;
-///   the speculative keyframe-gate grace plus the 30-error threshold
-///   now absorb it. That VAAPI really decodes the stream — rather than
-///   libavcodec silently falling back to software inside the same
-///   context — was confirmed two ways: i915 GEM totals *rise* into a
-///   decode surface pool for the MPEG-2 window (60 obj / 50 MB → 84-87
-///   obj / 139 MB) where the pinned build collapses to 8 obj / 30 MB,
-///   and process CPU over the same window drops from ~64 % to ~49 %
-///   (non-overlapping ranges) while H.264 windows are unchanged.
-/// * **QSV — still pinned.** Same silicon as VAAPI, so the same story
-///   is *plausible*, but the only failure evidence predates the
-///   gate-grace work and no re-validation has been run on a QSV
-///   session. Unpin only with journal/soak evidence like VAAPI's.
+/// * **VAAPI — still pinned, but not for the original reason.** The
+///   per-AU `AVERROR_INVALIDDATA` story was wrong: an A/B on bilby-bite
+///   (i3-1215U, iHD, `VAProfileMPEG2Main`) measured an identical +11
+///   `send_packet` errors at each MPEG-2 window start on *both* the
+///   pinned (CPU) and unpinned (VAAPI) builds, flat thereafter, so that
+///   burst is file-determined (mid-GOP AUs ahead of the first sequence
+///   header) and not a backend rejection at all. VAAPI genuinely
+///   decodes the stream in hardware — i915 GEM totals rise into a real
+///   decode surface pool for the window (60 obj / 50 MB → 84-87 obj /
+///   139 MB, where the pinned build collapses to 8 obj / 30 MB) and
+///   process CPU drops ~64 % → ~49 %.
+///
+///   It is pinned anyway because hardware decode makes the *picture*
+///   worse on this host. Same file, same 1920x1080@60 panel, same
+///   `match_source` scaling, back-to-back builds: CPU decode presents
+///   the full 24 fps with `frames_dropped_mpsc_full` static, while
+///   VAAPI decode presents ~17 fps and sheds ~7 fps continuously at the
+///   display queue for the whole window. The decoder keeps up either
+///   way (~24 fps produced); it is the frames themselves that cost more
+///   downstream — VAAPI MPEG-2 surfaces evidently do not reach the
+///   zero-copy scanout the H.264 path enjoys (H.264 windows on the same
+///   run drop nothing). Cheaper decode, worse output, so the pin stays
+///   until the present-path cost is understood. Do not unpin on decode
+///   evidence alone: measure `frames_displayed` and
+///   `frames_dropped_mpsc_full` across a full source window.
+/// * **QSV — still pinned.** Same silicon as VAAPI, and now the same
+///   caution applies twice over: even a QSV decode that works may
+///   present worse than CPU. Needs the full decode + presentation
+///   measurement before any change.
 /// * **RKMPP — still pinned.** Not a runtime rejection at all: the
 ///   vendored rkmpp FFmpeg fork registers no MPEG-2 decoder
 ///   (`rkmppdec.c` handles h264/hevc/vp8/vp9 only), so
@@ -1821,7 +1830,10 @@ const UNSUPPORTED_PIXFMT_RE_EMIT_S: u64 = 60;
 /// for those sources.
 fn mpeg2_requires_cpu_decode(codec: VideoCodec, backend: DecoderBackend) -> bool {
     matches!(codec, VideoCodec::Mpeg2)
-        && matches!(backend, DecoderBackend::Qsv | DecoderBackend::Rkmpp)
+        && matches!(
+            backend,
+            DecoderBackend::Vaapi | DecoderBackend::Qsv | DecoderBackend::Rkmpp
+        )
 }
 
 /// Whether this decoder open must use CPU for MPEG-2 — the static table
@@ -5105,34 +5117,29 @@ fn emit_event(
 mod tests {
     use super::*;
 
-    /// MPEG-2 stays pinned to software decode only where the pin is still
-    /// justified: QSV (failure evidence predates the keyframe-gate grace
-    /// work; not re-validated) and RKMPP (the vendored FFmpeg fork has no
-    /// MPEG-2 decoder to open). NVDEC and VAAPI are carved out with
-    /// hardware evidence — see `mpeg2_requires_cpu_decode`'s doc for the
-    /// per-backend history.
+    /// MPEG-2 stays pinned to software decode on VAAPI (hardware decode
+    /// works but presents ~7 fps worse — see the predicate's doc), QSV
+    /// (untested, same silicon) and RKMPP (the vendored FFmpeg fork has
+    /// no MPEG-2 decoder to open). Only NVDEC is carved out, and only
+    /// because it was measured end-to-end on bilby-z440 once
+    /// `mpeg2_cuvid` was compiled into the vendored FFmpeg — its
+    /// original "failure" was that build gap, not the silicon.
     #[test]
-    fn mpeg2_pinned_to_cpu_on_broken_backends_not_nvdec_or_vaapi() {
-        for backend in [DecoderBackend::Qsv, DecoderBackend::Rkmpp] {
+    fn mpeg2_pinned_to_cpu_on_every_backend_except_nvdec() {
+        for backend in [
+            DecoderBackend::Vaapi,
+            DecoderBackend::Qsv,
+            DecoderBackend::Rkmpp,
+        ] {
             assert!(
                 mpeg2_requires_cpu_decode(VideoCodec::Mpeg2, backend),
                 "MPEG-2 must be pinned to CPU on {backend:?}"
             );
         }
-        // NVDEC: mpeg2_cuvid compiled into the vendored FFmpeg (its
-        // earlier failure was that build gap, not the silicon) —
-        // hardware-validated on bilby-z440.
-        // VAAPI: the historical rejection was the transient
-        // start-of-source burst absorbed by the speculative-feed grace;
-        // hardware decode confirmed on bilby-bite via the GEM
-        // surface-pool + CPU-delta A/B, not via `decoder_kind` (which
-        // reports `state.backend` whether or not the pin is active).
-        for backend in [DecoderBackend::Nvdec, DecoderBackend::Vaapi] {
-            assert!(
-                !mpeg2_requires_cpu_decode(VideoCodec::Mpeg2, backend),
-                "MPEG-2 must stay on hardware decode on {backend:?}"
-            );
-        }
+        assert!(!mpeg2_requires_cpu_decode(
+            VideoCodec::Mpeg2,
+            DecoderBackend::Nvdec
+        ));
     }
 
     /// The runtime-learned pin covers what the static table cannot: a host
@@ -5143,7 +5150,7 @@ mod tests {
     /// backend-wide.
     #[test]
     fn runtime_pin_scopes_to_mpeg2_and_spares_other_codecs() {
-        let carved_out = DecoderBackend::Vaapi;
+        let carved_out = DecoderBackend::Nvdec;
         // Before the runtime pin: MPEG-2 goes to hardware on a carved-out
         // backend, exactly as the static table says.
         assert!(!mpeg2_pin_active(VideoCodec::Mpeg2, carved_out, false));
