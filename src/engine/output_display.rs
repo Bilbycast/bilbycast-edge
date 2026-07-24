@@ -1759,6 +1759,49 @@ const WATCHDOG_NO_FRAMES_MS: u64 = 2_500;
 /// rate independently.
 const UNSUPPORTED_PIXFMT_RE_EMIT_S: u64 = 60;
 
+/// Whether MPEG-2 must be decoded in software on `backend`.
+///
+/// The original blanket pin ("every HW backend rejects a media-player
+/// TS-passthrough MPEG-2 stream with per-AU `AVERROR_INVALIDDATA`")
+/// turned out to bundle three unrelated failure modes, and two of the
+/// four backends have since been carved out with per-backend evidence:
+///
+/// * **NVDEC — carved out.** The "failure" was a build gap:
+///   `mpeg2_cuvid` was missing from the vendored FFmpeg's decoder list,
+///   so decoder-by-name returned NULL, open failed and the demote fired
+///   without the GPU ever being consulted. With the decoder compiled
+///   in, MPEG-2 was re-validated on bilby-z440 against both the
+///   broadcast sample and a freshly generated file (mpeg2/nvdec, zero
+///   demotions/errors, full rate).
+/// * **VAAPI — carved out.** The "per-AU rejection" was the same
+///   *transient* start-of-source burst the CPU decoder logs on the very
+///   same file (~5 INVALIDDATA sends for the mid-GOP AUs ahead of the
+///   first sequence header, then clean decode). Pre-gate builds demoted
+///   permanently on that burst; with the speculative keyframe-gate
+///   grace and the 30-error threshold, bilby-bite (i3-1215U, iHD,
+///   `VAProfileMPEG2Main`) hardware-decoded every MPEG-2 window of an
+///   hour-long playlist loop with zero fallbacks.
+/// * **QSV — still pinned.** Same silicon as VAAPI, so the same story
+///   is *plausible*, but the only failure evidence predates the
+///   gate-grace work and no re-validation has been run on a QSV
+///   session. Unpin only with journal/soak evidence like VAAPI's.
+/// * **RKMPP — still pinned.** Not a runtime rejection at all: the
+///   vendored rkmpp FFmpeg fork registers no MPEG-2 decoder
+///   (`rkmppdec.c` handles h264/hevc/vp8/vp9 only), so
+///   `ffmpeg_decoder_name` maps to None and nothing can be opened —
+///   even though the RK3588's MPP library itself advertises
+///   `MPP_VIDEO_CodingMPEG2`. Wiring it up means adding a decoder to
+///   the vendored C tree, not flipping this predicate.
+///
+/// The pin opens a CPU decoder for MPEG-2 *without touching
+/// `state.backend`*, so the codec is software-decoded locally while
+/// H.264/HEVC keep the HW path — and the resource card stays accurate
+/// for those sources.
+fn mpeg2_requires_cpu_decode(codec: VideoCodec, backend: DecoderBackend) -> bool {
+    matches!(codec, VideoCodec::Mpeg2)
+        && matches!(backend, DecoderBackend::Qsv | DecoderBackend::Rkmpp)
+}
+
 /// Open a `VideoDecoder` with bounded HW retry + CPU fallback.
 ///
 /// On a flow restart that overlaps the previous flow's HW context
@@ -1771,50 +1814,6 @@ const UNSUPPORTED_PIXFMT_RE_EMIT_S: u64 = 60;
 ///
 /// On the CPU branch (operator-chosen or post-fallback) we open once
 /// with no sleep; CPU decoder open is cheap and never contends.
-/// Whether MPEG-2 must be decoded in software on `backend`.
-///
-/// **Every hardware backend in the fleet rejects a media-player TS-passthrough
-/// MPEG-2 elementary stream** with a per-AU `AVERROR_INVALIDDATA`, despite each
-/// driver advertising an MPEG-2 profile — verified per backend, on hardware:
-///
-/// * VAAPI + QSV — bilby-bite (Intel i3-1215U, iHD)
-/// * RKMPP — bilby-pir6s (RK3588); a 15 h soak disproved the initial
-///   assumption that Rockchip's decoder handled it
-/// * NVDEC — bilby-z440 (GTX 1080 Ti, driver 580): `send_packet` failed 11×
-///   within a second of the MPEG-2 source starting and the runtime path
-///   demoted the whole display; H.264 throughput measurably dropped from
-///   ~22 fps (NVDEC) to ~9 fps (CPU blit) for the rest of the flow
-///
-/// `avcodec_open2` succeeds on all of them, so nothing fails at open time —
-/// only `send_packet`, per access unit — which is why this is a **pre-emptive
-/// pin** rather than relying on the runtime retry/demote path. The demote path
-/// is `state.backend`-wide and *permanent*, so an unpinned MPEG-2 source
-/// poisons every **subsequent** H.264/HEVC source in the playlist too. The pin
-/// opens a CPU decoder for MPEG-2 *without touching `state.backend`*, so the
-/// codec is software-decoded locally while H.264/HEVC keep the HW path — and
-/// the resource card stays accurate for those sources.
-///
-/// With all four fleet backends proven broken the predicate is simply "any
-/// hardware backend". A future backend that genuinely decodes this stream can
-/// carve itself out — with evidence and a test, the way NVDEC's former
-/// exclusion was removed.
-fn mpeg2_requires_cpu_decode(codec: VideoCodec, backend: DecoderBackend) -> bool {
-    // NVDEC is carved back out: its earlier "failure" was a build gap
-    // (`mpeg2_cuvid` missing from the vendored FFmpeg's decoder list —
-    // decoder-by-name returned NULL, open failed, demote fired; the GPU
-    // was never consulted). With the decoder compiled in, NVDEC MPEG-2
-    // decode was re-validated on bilby-z440 against both the broadcast
-    // sample and a freshly generated file. RKMPP has no MPEG-2 decoder
-    // mapping at all (`ffmpeg_decoder_name` → None) and VAAPI/QSV remain
-    // genuine runtime rejections (hwaccel enabled, opens, per-AU
-    // send_packet INVALIDDATA — feed-contract investigation open).
-    matches!(codec, VideoCodec::Mpeg2)
-        && matches!(
-            backend,
-            DecoderBackend::Vaapi | DecoderBackend::Qsv | DecoderBackend::Rkmpp
-        )
-}
-
 fn open_video_decoder_with_retry(
     codec: VideoCodec,
     state: &mut HwOpenState,
@@ -5045,36 +5044,32 @@ fn emit_event(
 mod tests {
     use super::*;
 
-    /// MPEG-2 must be pinned to software decode on every HW backend — each one
-    /// was individually proven to reject a media-player TS-passthrough
-    /// elementary stream with a per-AU AVERROR_INVALIDDATA: VAAPI + QSV
-    /// (bilby-bite/Intel), RKMPP (bilby-pir6s/RK3588, 15 h soak), and NVDEC
-    /// (bilby-z440/GTX 1080 Ti via dummy-HDMI validation — send_packet failed
-    /// within a second and the runtime demote halved H.264 throughput for the
-    /// rest of the flow). A future backend that genuinely decodes this stream
-    /// should carve itself out with evidence, the way NVDEC's former
-    /// exclusion was removed when evidence arrived.
+    /// MPEG-2 stays pinned to software decode only where the pin is still
+    /// justified: QSV (failure evidence predates the keyframe-gate grace
+    /// work; not re-validated) and RKMPP (the vendored FFmpeg fork has no
+    /// MPEG-2 decoder to open). NVDEC and VAAPI are carved out with
+    /// hardware evidence — see `mpeg2_requires_cpu_decode`'s doc for the
+    /// per-backend history.
     #[test]
-    fn mpeg2_pinned_to_cpu_on_broken_backends_not_nvdec() {
-        // VAAPI/QSV: genuine runtime send_packet rejection (open).
-        // RKMPP: no MPEG-2 decoder mapping exists.
-        for backend in [
-            DecoderBackend::Vaapi,
-            DecoderBackend::Qsv,
-            DecoderBackend::Rkmpp,
-        ] {
+    fn mpeg2_pinned_to_cpu_on_broken_backends_not_nvdec_or_vaapi() {
+        for backend in [DecoderBackend::Qsv, DecoderBackend::Rkmpp] {
             assert!(
                 mpeg2_requires_cpu_decode(VideoCodec::Mpeg2, backend),
                 "MPEG-2 must be pinned to CPU on {backend:?}"
             );
         }
-        // NVDEC decodes MPEG-2 in hardware once mpeg2_cuvid is compiled
-        // into the vendored FFmpeg (its earlier failure was that build
-        // gap, not the silicon) — hardware-validated on bilby-z440.
-        assert!(!mpeg2_requires_cpu_decode(
-            VideoCodec::Mpeg2,
-            DecoderBackend::Nvdec
-        ));
+        // NVDEC: mpeg2_cuvid compiled into the vendored FFmpeg (its
+        // earlier failure was that build gap, not the silicon) —
+        // hardware-validated on bilby-z440.
+        // VAAPI: the historical rejection was the transient
+        // start-of-source burst absorbed by the speculative-feed grace —
+        // hardware-validated on bilby-bite.
+        for backend in [DecoderBackend::Nvdec, DecoderBackend::Vaapi] {
+            assert!(
+                !mpeg2_requires_cpu_decode(VideoCodec::Mpeg2, backend),
+                "MPEG-2 must stay on hardware decode on {backend:?}"
+            );
+        }
     }
 
     /// The pin is codec-specific — H.264/HEVC keep the zero-copy HW path on
