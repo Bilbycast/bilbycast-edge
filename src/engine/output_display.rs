@@ -1775,12 +1775,20 @@ const UNSUPPORTED_PIXFMT_RE_EMIT_S: u64 = 60;
 ///   demotions/errors, full rate).
 /// * **VAAPI — carved out.** The "per-AU rejection" was the same
 ///   *transient* start-of-source burst the CPU decoder logs on the very
-///   same file (~5 INVALIDDATA sends for the mid-GOP AUs ahead of the
-///   first sequence header, then clean decode). Pre-gate builds demoted
-///   permanently on that burst; with the speculative keyframe-gate
-///   grace and the 30-error threshold, bilby-bite (i3-1215U, iHD,
-///   `VAProfileMPEG2Main`) hardware-decoded every MPEG-2 window of an
-///   hour-long playlist loop with zero fallbacks.
+///   same file — an A/B on bilby-bite (i3-1215U, iHD,
+///   `VAProfileMPEG2Main`) measured an identical +11 `send_packet`
+///   errors at each MPEG-2 window start on both the pinned (CPU) and
+///   unpinned (VAAPI) builds, flat thereafter, so the burst is
+///   file-determined (mid-GOP AUs ahead of the first sequence header),
+///   not backend-determined. Pre-gate builds demoted permanently on it;
+///   the speculative keyframe-gate grace plus the 30-error threshold
+///   now absorb it. That VAAPI really decodes the stream — rather than
+///   libavcodec silently falling back to software inside the same
+///   context — was confirmed two ways: i915 GEM totals *rise* into a
+///   decode surface pool for the MPEG-2 window (60 obj / 50 MB → 84-87
+///   obj / 139 MB) where the pinned build collapses to 8 obj / 30 MB,
+///   and process CPU over the same window drops from ~64 % to ~49 %
+///   (non-overlapping ranges) while H.264 windows are unchanged.
 /// * **QSV — still pinned.** Same silicon as VAAPI, so the same story
 ///   is *plausible*, but the only failure evidence predates the
 ///   gate-grace work and no re-validation has been run on a QSV
@@ -1826,29 +1834,24 @@ fn open_video_decoder_with_retry(
         return VideoDecoder::open_with_backend(codec, DecoderBackend::Cpu).ok();
     }
 
-    // MPEG-2 on **Intel** (VAAPI / QSV) → CPU decode. Those drivers reject a
-    // media-player TS-passthrough elementary stream with a per-AU
-    // AVERROR_INVALIDDATA (fed raw, no NALU wrapper) even though `vainfo`
-    // advertises `VAProfileMPEG2Main` — hardware-verified on bilby-bite, where
-    // a 1080p MPEG-2 source froze the panel while the software decoder handled
-    // the identical bytes fine. `avcodec_open2` *succeeds*, so the open-retry +
-    // demote path below never fires; the failure only shows up on send_packet.
-    // Hence a pre-emptive pin rather than a fallback.
+    // MPEG-2 → CPU decode on the backends that still need it. Which ones, and
+    // the per-backend evidence for each, live on `mpeg2_requires_cpu_decode`;
+    // don't restate it here, it has already drifted once.
     //
-    // Deliberately scoped to the two backends actually proven broken. NVDEC and
-    // RKMPP have working MPEG-2 decoders and are NOT covered by the evidence
-    // above — pinning them to CPU would turn a working hardware path into a
-    // software one, which matters most on the Rockchip boxes (weakest CPU in
-    // the fleet, where 1080p software MPEG-2 is expensive). Widen this only
-    // with per-backend evidence.
+    // `avcodec_open2` succeeds even where the backend can't handle the stream,
+    // so the open-retry + demote path below never fires for this failure class
+    // — hence a pre-emptive pin rather than a fallback.
     //
     // The pin does NOT touch `state.backend`: a later H.264/HEVC source in the
     // same playlist still opens on the HW backend, and the CPU decoder's
     // sysmem frames route through the present path's per-frame `is_vaapi()` /
     // `is_drm_prime()` check (CPU-blit), so no other display state needs to
-    // know. Caveat: that also means `DisplayStats.decoder_kind` still reports
-    // the HW backend while MPEG-2 decodes on CPU. Falls through to the HW path
-    // if the CPU open itself fails (then the normal retry+demote handles it).
+    // know. Two caveats that follow from that: `DisplayStats.decoder_kind`
+    // still reports the HW backend while MPEG-2 decodes on CPU, and so does
+    // the `backend=` field on the `send_packet failed` warning — neither is
+    // evidence of which decoder actually produced (or rejected) a frame.
+    // Falls through to the HW path if the CPU open itself fails (then the
+    // normal retry+demote handles it).
     if mpeg2_requires_cpu_decode(codec, state.backend) {
         if let Some(d) = VideoDecoder::open_with_backend(codec, DecoderBackend::Cpu).ok() {
             return Some(d);
@@ -5062,8 +5065,10 @@ mod tests {
         // earlier failure was that build gap, not the silicon) —
         // hardware-validated on bilby-z440.
         // VAAPI: the historical rejection was the transient
-        // start-of-source burst absorbed by the speculative-feed grace —
-        // hardware-validated on bilby-bite.
+        // start-of-source burst absorbed by the speculative-feed grace;
+        // hardware decode confirmed on bilby-bite via the GEM
+        // surface-pool + CPU-delta A/B, not via `decoder_kind` (which
+        // reports `state.backend` whether or not the pin is active).
         for backend in [DecoderBackend::Nvdec, DecoderBackend::Vaapi] {
             assert!(
                 !mpeg2_requires_cpu_decode(VideoCodec::Mpeg2, backend),
