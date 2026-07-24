@@ -1799,7 +1799,20 @@ const UNSUPPORTED_PIXFMT_RE_EMIT_S: u64 = 60;
 /// carve itself out — with evidence and a test, the way NVDEC's former
 /// exclusion was removed.
 fn mpeg2_requires_cpu_decode(codec: VideoCodec, backend: DecoderBackend) -> bool {
-    matches!(codec, VideoCodec::Mpeg2) && !matches!(backend, DecoderBackend::Cpu)
+    // NVDEC is carved back out: its earlier "failure" was a build gap
+    // (`mpeg2_cuvid` missing from the vendored FFmpeg's decoder list —
+    // decoder-by-name returned NULL, open failed, demote fired; the GPU
+    // was never consulted). With the decoder compiled in, NVDEC MPEG-2
+    // decode was re-validated on bilby-z440 against both the broadcast
+    // sample and a freshly generated file. RKMPP has no MPEG-2 decoder
+    // mapping at all (`ffmpeg_decoder_name` → None) and VAAPI/QSV remain
+    // genuine runtime rejections (hwaccel enabled, opens, per-AU
+    // send_packet INVALIDDATA — feed-contract investigation open).
+    matches!(codec, VideoCodec::Mpeg2)
+        && matches!(
+            backend,
+            DecoderBackend::Vaapi | DecoderBackend::Qsv | DecoderBackend::Rkmpp
+        )
 }
 
 fn open_video_decoder_with_retry(
@@ -5042,18 +5055,26 @@ mod tests {
     /// should carve itself out with evidence, the way NVDEC's former
     /// exclusion was removed when evidence arrived.
     #[test]
-    fn mpeg2_pinned_to_cpu_on_all_hw_backends() {
+    fn mpeg2_pinned_to_cpu_on_broken_backends_not_nvdec() {
+        // VAAPI/QSV: genuine runtime send_packet rejection (open).
+        // RKMPP: no MPEG-2 decoder mapping exists.
         for backend in [
             DecoderBackend::Vaapi,
             DecoderBackend::Qsv,
             DecoderBackend::Rkmpp,
-            DecoderBackend::Nvdec,
         ] {
             assert!(
                 mpeg2_requires_cpu_decode(VideoCodec::Mpeg2, backend),
                 "MPEG-2 must be pinned to CPU on {backend:?}"
             );
         }
+        // NVDEC decodes MPEG-2 in hardware once mpeg2_cuvid is compiled
+        // into the vendored FFmpeg (its earlier failure was that build
+        // gap, not the silicon) — hardware-validated on bilby-z440.
+        assert!(!mpeg2_requires_cpu_decode(
+            VideoCodec::Mpeg2,
+            DecoderBackend::Nvdec
+        ));
     }
 
     /// The pin is codec-specific — H.264/HEVC keep the zero-copy HW path on
