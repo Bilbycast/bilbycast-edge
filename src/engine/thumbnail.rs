@@ -398,6 +398,13 @@ async fn thumbnail_loop(
     let mut stale_count: u32 = 0;
     #[cfg(feature = "media-codecs")]
     let mut last_capture_hash: Option<u64> = None;
+    // Whether this generator has ever published a thumbnail this session. Drives
+    // cold-start warm escalation: a low-bitrate first source (a still-image
+    // slate at a few fps) drains the AU ring between ticks, so ticks land on
+    // `Skip` and the normal stale-based escalation never accumulates — a short
+    // first slate right after a restart then ends before any preview exists.
+    #[cfg(feature = "media-codecs")]
+    let mut has_captured_any = false;
 
     loop {
         // Hot-apply a live cadence change. Checked every iteration — the loop
@@ -467,6 +474,10 @@ async fn thumbnail_loop(
                             &mut last_frozen,
                         );
                         last_capture = Some(now);
+                        #[cfg(feature = "media-codecs")]
+                        {
+                            has_captured_any = true;
+                        }
                         // Re-align the periodic interval so the next scheduled
                         // tick is one interval from now, not from whenever it
                         // last fired.
@@ -538,6 +549,27 @@ async fn thumbnail_loop(
                 // frame nor a buffered AU this tick. Deliberately NOT an alarm
                 // and NOT a warm-decoder teardown — see `capture_gate`.
                 if gate == CaptureGate::Skip {
+                    // Cold-start warm escalation: if we have never published a
+                    // thumbnail this session and the ring is empty while packets
+                    // ARE flowing (Skip implies not silent), the source is a
+                    // low-bitrate one whose AUs drain between ticks — a slate at
+                    // a few fps. The stale-based escalation can't accumulate
+                    // here (Skip advances no counter), so a short first slate
+                    // would end before any preview. Bring the warm decoder up
+                    // now: it tracks the live edge off the incoming packets and
+                    // publishes even with an empty ring. Steady state (already
+                    // captured once) keeps the cheap cold path as the default.
+                    #[cfg(feature = "media-codecs")]
+                    if !has_captured_any && warm.is_none() {
+                        // `escalate_warm` no-ops until the codec is classified,
+                        // so this retries harmlessly across ticks until it takes.
+                        escalate_warm(
+                            &mut warm,
+                            state.codec(),
+                            program_number,
+                            "cold-start low-rate source (empty AU ring, no preview yet)",
+                        );
+                    }
                     continue;
                 }
 
@@ -567,6 +599,10 @@ async fn thumbnail_loop(
                             &mut last_frozen,
                         );
                         last_capture = Some(now);
+                        #[cfg(feature = "media-codecs")]
+                        {
+                            has_captured_any = true;
+                        }
                     }
                     Err(e) => {
                         #[cfg(feature = "media-codecs")]
