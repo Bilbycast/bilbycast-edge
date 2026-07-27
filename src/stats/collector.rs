@@ -5602,3 +5602,62 @@ mod bond_throughput_tests {
         assert!(json.get("hold_ms").is_none());
     }
 }
+
+/// Exercises the real accessor `FlowRuntime::hw_session_usage_live`
+/// reads from — `FlowStatsAccumulator::active_display_decoder_label` —
+/// against a genuinely registered display output whose live decoder
+/// atomic transitions. This is the runtime signal the hw_session_usage
+/// reconciliation subtracts on; the arithmetic itself is covered by
+/// `reconcile_display_decode_sessions` in the flow module.
+#[cfg(all(test, feature = "display", target_os = "linux"))]
+mod display_decoder_label_accessor_tests {
+    use super::*;
+
+    #[test]
+    fn active_display_decoder_label_tracks_registration_and_demote() {
+        let flow = FlowStatsAccumulator::new(
+            "f1".to_string(),
+            "flow-1".to_string(),
+            "media_player".to_string(),
+        );
+
+        // An id that was never registered yields None — the rollup leaves
+        // such a (non-existent) output's reservation untouched.
+        assert_eq!(flow.active_display_decoder_label("nope"), None);
+
+        // Register a display output and attach its live counters, as the
+        // display task does at startup. `decoder_kind` here is the frozen
+        // registration string; the live atomic starts `Unset`.
+        let out =
+            flow.register_output("d1".to_string(), "hdmi".to_string(), "display".to_string());
+        let counters = Arc::new(DisplayStatsCounters::default());
+        out.set_display_stats(counters.clone(), "1920x1080", 60, "nv12", "qsv");
+
+        // Unset before any decode decision → the reservation is kept
+        // (`hw_session_usage_live` only subtracts on an explicit CPU state).
+        assert_eq!(
+            flow.active_display_decoder_label("d1"),
+            Some(DisplayDecoderLabel::Unset),
+        );
+
+        // HW open succeeds → zero-copy label; nothing to reconcile.
+        counters.set_active_decoder_label(DisplayDecoderLabel::VaapiZeroCopy);
+        assert_eq!(
+            flow.active_display_decoder_label("d1"),
+            Some(DisplayDecoderLabel::VaapiZeroCopy),
+        );
+
+        // Runtime HW→CPU demote publishes CpuHwUnavailable — the exact
+        // signal the reconciliation drops a decode session on.
+        counters.set_active_decoder_label(DisplayDecoderLabel::CpuHwUnavailable);
+        assert_eq!(
+            flow.active_display_decoder_label("d1"),
+            Some(DisplayDecoderLabel::CpuHwUnavailable),
+        );
+
+        // A non-display output has no display handle → None, so the rollup
+        // never mistakes it for a demoted display decoder.
+        flow.register_output("u1".to_string(), "udp".to_string(), "udp".to_string());
+        assert_eq!(flow.active_display_decoder_label("u1"), None);
+    }
+}
