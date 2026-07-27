@@ -61,9 +61,9 @@ pub async fn play_mp4_file(
     // the OS — worse under `mlockall`, which pins them). Caching the
     // `Arc<DemuxResult>` turns that per-loop churn into a single bounded
     // allocation. See `DemuxCache`.
-    // Phase 4: opt into the bounded incremental reader (no whole-file
-    // residency) via `BILBYCAST_MEDIA_PLAYER_INCREMENTAL_MP4`. Default off →
-    // the whole-file demux + cache path below runs unchanged.
+    // Phase 4: the bounded incremental reader (no whole-file residency) is the
+    // default; `BILBYCAST_MEDIA_PLAYER_INCREMENTAL_MP4=0` opts back into the
+    // whole-file demux + cache path below (rollback escape hatch).
     if super::controller::incremental_mp4_enabled() {
         // Take a warm reader (or open one) — the `moov` header is parsed once
         // and kept across loops (the loop-head prewarm), so a looping file
@@ -1114,8 +1114,9 @@ async fn emit_sample(
 /// reads the next video and audio sample, emits whichever presents earlier, and
 /// advances — so at most ~2 samples are ever resident regardless of file size.
 ///
-/// Gated behind `BILBYCAST_MEDIA_PLAYER_INCREMENTAL_MP4` (see
-/// [`super::controller::incremental_mp4_enabled`]); the default path is
+/// The default path as of the 2026-07 hardening (see
+/// [`super::controller::incremental_mp4_enabled`]);
+/// `BILBYCAST_MEDIA_PLAYER_INCREMENTAL_MP4=0` falls back to whole-file
 /// `play_demuxed`. The setup (continuity, PMT, pacer, epoch anchoring) is
 /// identical to `play_demuxed` — only the sample source differs — and both drive
 /// the shared [`emit_sample`].

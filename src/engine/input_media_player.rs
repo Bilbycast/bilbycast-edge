@@ -359,13 +359,13 @@ async fn run(
     let media_stats = Arc::new(MediaPlayerStats::default());
     stats.set_media_player_stats(&input_id, media_stats.clone());
 
-    // ── Phase 3b controller path (opt-in, default OFF) ───────────────────
+    // ── Phase 3b controller path (default ON, per-input opt-out) ─────────
     // When the controller is enabled AND the flow runtime wired a command
     // channel, drive playout through the transition state machine so operator
     // `Next` works and natural EOS / loop / Next all commit through one path.
     // Otherwise fall straight through to the legacy sequential loop below,
     // which is left byte-for-byte unchanged (the rollback guarantee).
-    if controller::controller_enabled() {
+    if controller::controller_enabled(config.operator_control) {
         if let Some(cmd_rx) = cmd_rx {
             run_controlled(
                 &config, &per_input_tx, &stats, &cancel, &events, &flow_id, &input_id,

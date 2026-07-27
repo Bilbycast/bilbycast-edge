@@ -1331,12 +1331,13 @@ fn edge_capabilities() -> Vec<&'static str> {
     // engine::bond_leg_probe + docs/leg-bandwidth-test.md.
     caps.push("bond-leg-capacity");
     caps.push("bond-probe-responder");
-    // Media-player operator control (Phase 3b). Advertised only when the
-    // controller is enabled on this edge, so the manager only shows the Next
-    // button where it will actually work; an input still has to be running
-    // the controller for a given flow, else the edge answers
-    // `media_player_control_unavailable`.
-    if crate::engine::input_media_player::controller::controller_enabled() {
+    // Media-player operator control (Phase 3b). Now default-on, so advertise
+    // unless the node-wide `BILBYCAST_MEDIA_PLAYER_CONTROLLER=0` escape hatch
+    // disables it (passing `None` = "no per-input override" resolves to the
+    // node default). A specific input can still be pinned to the legacy loop
+    // via `operator_control: false`, in which case the edge answers
+    // `media_player_control_unavailable` for that flow.
+    if crate::engine::input_media_player::controller::controller_enabled(None) {
         caps.push("media-player-control-v1");
     }
     // Audio-only playout (Phase 7, §12): a no-video MP4/MOV or TS plays as an

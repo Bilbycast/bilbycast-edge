@@ -2087,6 +2087,16 @@ pub struct MediaPlayerInputConfig {
     /// each datagram unchanged.
     #[serde(default = "default_mp_ts_packets_per_datagram")]
     pub ts_packets_per_datagram: u16,
+    /// Operator transport control (Phase 3b) — the manager's **Next** button
+    /// and the underlying transition state machine. When enabled, playout runs
+    /// through the controller path (operator `Next`, natural EOS, loop, and
+    /// transitions all commit through one state machine); when disabled the
+    /// legacy sequential loop runs. **Default on** (`None`). Set `false` to pin
+    /// a specific player to the legacy loop. A node-wide
+    /// `BILBYCAST_MEDIA_PLAYER_CONTROLLER=0` escape hatch forces it off only
+    /// where this field is unset (explicit config wins over the env var).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operator_control: Option<bool>,
 }
 
 fn default_image_fps() -> u8 {

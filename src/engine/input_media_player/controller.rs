@@ -12,10 +12,12 @@
 //! tightly coupled to that module's private `play_source` / `PlayerSession`.
 //! Everything here is independent, small, and testable.
 //!
-//! **Default off.** The controller only runs when explicitly enabled
-//! ([`controller_enabled`]); otherwise the legacy sequential `run()` loop is
-//! used unchanged. This is the plan's Phase-3 rollback guarantee — the
-//! real-time path does not change until an operator opts in.
+//! **Default on** (as of the 2026-07 hardening). The controller runs unless a
+//! player is explicitly opted out ([`controller_enabled`] — per-input
+//! `operator_control: false`, or the node-wide
+//! `BILBYCAST_MEDIA_PLAYER_CONTROLLER=0` escape hatch), in which case the
+//! legacy sequential `run()` loop is used unchanged — the Phase-3 rollback
+//! path is preserved as an opt-out rather than the default.
 
 use tokio::sync::oneshot;
 
@@ -37,27 +39,44 @@ pub enum MediaPlayerCommand {
     },
 }
 
-/// Whether the new controller path is enabled. Gated on an environment
-/// variable so it is a genuine runtime switch with no config-schema or
-/// protocol change: set `BILBYCAST_MEDIA_PLAYER_CONTROLLER=1` on the edge to
-/// opt an install in. Absent / any other value → the legacy loop runs.
+/// Whether the operator-control (transition) path is enabled for a player.
 ///
-/// Read once per input spawn (not cached process-wide) so flipping the env
-/// and restarting a flow is enough to change behaviour.
-pub fn controller_enabled() -> bool {
-    matches!(
+/// **On by default** as of the 2026-07 media-player hardening. Resolution
+/// order:
+///  1. The per-input config field [`MediaPlayerInputConfig::operator_control`]
+///     (`cfg`) wins when set — an explicit `Some(true)`/`Some(false)`.
+///  2. Otherwise the node-wide `BILBYCAST_MEDIA_PLAYER_CONTROLLER` env var acts
+///     as an escape hatch: `0` / `false` / `off` forces the legacy loop.
+///  3. Otherwise → enabled (the new default).
+///
+/// Read once per input spawn (not cached process-wide) so editing the config
+/// (or flipping the env) and restarting a flow is enough to change behaviour.
+///
+/// [`MediaPlayerInputConfig::operator_control`]: crate::config::models::MediaPlayerInputConfig::operator_control
+pub fn controller_enabled(cfg: Option<bool>) -> bool {
+    if let Some(explicit) = cfg {
+        return explicit;
+    }
+    !matches!(
         std::env::var("BILBYCAST_MEDIA_PLAYER_CONTROLLER").ok().as_deref(),
-        Some("1") | Some("true") | Some("on")
+        Some("0") | Some("false") | Some("off")
     )
 }
 
 /// Whether the Phase-4 bounded incremental MP4/MOV reader is used instead of
-/// the whole-file demux. Off by default → the deployed whole-file path runs
-/// unchanged. Set `BILBYCAST_MEDIA_PLAYER_INCREMENTAL_MP4=1` to opt in.
+/// the whole-file demux.
+///
+/// **On by default** as of the 2026-07 media-player hardening: the whole-file
+/// demux loads an entire MP4 into RAM and was the prime contributor to the
+/// media-player OOM (a 4 GiB asset is a 4 GiB resident spike); the bounded
+/// reader keeps residency flat and was soak-validated on bilby-bite. The env
+/// var is now an **opt-out** escape hatch for rollback:
+/// `BILBYCAST_MEDIA_PLAYER_INCREMENTAL_MP4=0` (also `false` / `off`) forces the
+/// legacy whole-file path. Absent or any other value → incremental.
 pub fn incremental_mp4_enabled() -> bool {
-    matches!(
+    !matches!(
         std::env::var("BILBYCAST_MEDIA_PLAYER_INCREMENTAL_MP4").ok().as_deref(),
-        Some("1") | Some("true") | Some("on")
+        Some("0") | Some("false") | Some("off")
     )
 }
 
@@ -92,19 +111,50 @@ mod tests {
     // both fully set-then-clear it; grouped into one test so they can't race
     // each other across cargo's parallel threads.
     #[test]
-    fn controller_flag_reads_env() {
+    fn controller_defaults_on_config_wins_env_opts_out() {
         // SAFETY: single-threaded within this test; the var is exclusive to
         // the controller tests and cleared before returning.
         unsafe {
             std::env::remove_var("BILBYCAST_MEDIA_PLAYER_CONTROLLER");
-            assert!(!controller_enabled(), "absent → disabled");
+            // Default (no config override, no env) → enabled.
+            assert!(controller_enabled(None), "absent → enabled (new default)");
+            // Explicit per-input config wins regardless of env.
+            assert!(controller_enabled(Some(true)), "config true → enabled");
+            assert!(!controller_enabled(Some(false)), "config false → disabled");
+            // Env escape hatch forces off only when config is unset.
+            for v in ["0", "false", "off"] {
+                std::env::set_var("BILBYCAST_MEDIA_PLAYER_CONTROLLER", v);
+                assert!(!controller_enabled(None), "env {v} → disabled");
+                assert!(
+                    controller_enabled(Some(true)),
+                    "config true overrides env {v}"
+                );
+            }
+            // Any non-opt-out env value keeps the default.
             for v in ["1", "true", "on"] {
                 std::env::set_var("BILBYCAST_MEDIA_PLAYER_CONTROLLER", v);
-                assert!(controller_enabled(), "{v} should enable");
+                assert!(controller_enabled(None), "env {v} → enabled");
             }
-            std::env::set_var("BILBYCAST_MEDIA_PLAYER_CONTROLLER", "0");
-            assert!(!controller_enabled(), "0 → disabled");
             std::env::remove_var("BILBYCAST_MEDIA_PLAYER_CONTROLLER");
+        }
+    }
+
+    #[test]
+    fn incremental_mp4_defaults_on_and_opts_out() {
+        // SAFETY: single-threaded within this test; the var is exclusive to
+        // this test and cleared before returning.
+        unsafe {
+            std::env::remove_var("BILBYCAST_MEDIA_PLAYER_INCREMENTAL_MP4");
+            assert!(incremental_mp4_enabled(), "absent → incremental (new default)");
+            for v in ["0", "false", "off"] {
+                std::env::set_var("BILBYCAST_MEDIA_PLAYER_INCREMENTAL_MP4", v);
+                assert!(!incremental_mp4_enabled(), "{v} should force whole-file");
+            }
+            for v in ["1", "true", "on", "anything"] {
+                std::env::set_var("BILBYCAST_MEDIA_PLAYER_INCREMENTAL_MP4", v);
+                assert!(incremental_mp4_enabled(), "{v} → incremental");
+            }
+            std::env::remove_var("BILBYCAST_MEDIA_PLAYER_INCREMENTAL_MP4");
         }
     }
 

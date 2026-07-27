@@ -3715,10 +3715,13 @@ fn spawn_single_input(
         ),
         InputConfig::MediaPlayer(c) => {
             // Phase 3b: wire an operator-command channel only when the
-            // controller is enabled (env flag). When off, pass `None` and the
-            // legacy loop runs — nothing is registered, so a stray
-            // `media_player_next` command finds no input and is refused.
-            let cmd_rx = if super::input_media_player::controller::controller_enabled() {
+            // controller is enabled (per-input `operator_control`, default on;
+            // env escape hatch). When off, pass `None` and the legacy loop
+            // runs — nothing is registered, so a stray `media_player_next`
+            // command finds no input and is refused.
+            let cmd_rx = if super::input_media_player::controller::controller_enabled(
+                c.operator_control,
+            ) {
                 let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel::<
                     super::input_media_player::controller::MediaPlayerCommand,
                 >(16);
