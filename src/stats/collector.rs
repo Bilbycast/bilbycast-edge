@@ -3873,6 +3873,23 @@ impl FlowStatsAccumulator {
         self.output_config_meta.remove(output_id);
     }
 
+    /// Live active-decoder label for a registered display output, if that
+    /// output exists and has published one. `None` means the output isn't
+    /// registered, isn't a display output, or hasn't opened a decoder yet
+    /// (label still `Unset`). Used by the resource-budget rollup
+    /// (`FlowRuntime::hw_session_usage_live`) to tell whether a display
+    /// output's *configured* HW decode session is actually open right now,
+    /// or has demoted / MPEG-2-pinned to CPU since flow creation.
+    #[allow(dead_code)]
+    pub fn active_display_decoder_label(
+        &self,
+        output_id: &str,
+    ) -> Option<DisplayDecoderLabel> {
+        let acc = self.output_stats.get(output_id)?;
+        let handle = acc.display_stats_handle()?;
+        Some(handle.counters.load_active_decoder_label())
+    }
+
     /// Take a point-in-time snapshot of all input counters and every registered
     /// output's counters, assembling them into a [`FlowStats`] value.
     pub fn snapshot(&self) -> FlowStats {

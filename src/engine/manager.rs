@@ -399,10 +399,17 @@ impl FlowManager {
     /// Pairs with the static `hw_session_limits` probe so the manager
     /// UI can render `nvenc_in_use / nvenc_max_sessions` chips and
     /// alarm when usage exceeds capacity.
+    ///
+    /// Rolls up each flow's `hw_session_usage_live()` — the frozen
+    /// creation-time block reconciled against the live decoder label of
+    /// its display outputs — so a display output that has demoted (or
+    /// MPEG-2-pinned) HW→CPU at runtime stops counting against its decode
+    /// family here, keeping both the Resources card and the manager's
+    /// oversubscription watchdog honest.
     pub fn total_hw_sessions(&self) -> crate::engine::hardware_probe::HwSessionUsage {
         let mut acc = crate::engine::hardware_probe::HwSessionUsage::default();
         for entry in self.flows.iter() {
-            let f = entry.value().hw_session_usage();
+            let f = entry.value().hw_session_usage_live();
             acc.nvenc_in_use = acc.nvenc_in_use.saturating_add(f.nvenc_in_use);
             acc.qsv_in_use = acc.qsv_in_use.saturating_add(f.qsv_in_use);
             acc.videotoolbox_in_use = acc
