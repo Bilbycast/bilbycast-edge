@@ -404,6 +404,69 @@ impl DisplayCodecLabel {
     }
 }
 
+/// Discriminant table for the lock-free `active_decoder_label` atomic on
+/// [`DisplayStatsCounters`] — the decoder backend **actually** decoding
+/// right now, as opposed to the one the resolver picked at startup.
+///
+/// The `decoder_kind` string on the [`DisplayStatsHandle`] is set once at
+/// output registration and freezes, so it silently lies whenever the live
+/// path diverges from the resolved one: the MPEG-2 CPU pin decodes on CPU
+/// while the handle still reads `vaapi-zerocopy`, and a runtime HW→CPU
+/// demote likewise leaves the HW label frozen. Both misled diagnostics
+/// this session and, worse, kept the manager's Resources card showing a
+/// HW decoder session that was no longer in use. `engine::output_display`
+/// updates this atomic every time it actually opens or demotes a decoder
+/// (`open_video_decoder_with_retry`, `force_cpu_fallback`), and the
+/// snapshot path prefers it over the frozen handle label whenever it is
+/// set — exactly the fix already applied to the panel-mode fields above.
+#[allow(dead_code)]
+#[repr(u8)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum DisplayDecoderLabel {
+    /// No decoder opened yet — snapshot falls back to the handle label.
+    Unset = 0,
+    /// Software libavcodec: operator-chosen, or the per-source MPEG-2 pin
+    /// decoding on CPU while HW stays available for other codecs. Not a
+    /// failure — just "CPU is what's running".
+    Cpu = 1,
+    /// Software libavcodec because HW was wanted but is unavailable: the
+    /// startup soft-fallback (host can't do the chosen backend) or a
+    /// runtime demotion after HW decode failed mid-flight. Distinct from
+    /// `Cpu` so the UI can still explain *why* it isn't on hardware.
+    CpuHwUnavailable = 2,
+    Nvdec = 3,
+    Qsv = 4,
+    VaapiZeroCopy = 5,
+    RkmppZeroCopy = 6,
+}
+
+#[allow(dead_code)]
+impl DisplayDecoderLabel {
+    pub fn from_u8(v: u8) -> Self {
+        match v {
+            1 => Self::Cpu,
+            2 => Self::CpuHwUnavailable,
+            3 => Self::Nvdec,
+            4 => Self::Qsv,
+            5 => Self::VaapiZeroCopy,
+            6 => Self::RkmppZeroCopy,
+            _ => Self::Unset,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Unset => "unset",
+            Self::Cpu => "cpu",
+            Self::CpuHwUnavailable => "cpu (hw unavailable)",
+            Self::Nvdec => "nvdec",
+            Self::Qsv => "qsv",
+            Self::VaapiZeroCopy => "vaapi-zerocopy",
+            Self::RkmppZeroCopy => "rkmpp-zerocopy",
+        }
+    }
+}
+
 /// Lock-free counters that back [`crate::stats::models::DisplayStats`].
 /// Owned by `engine::output_display`; the accumulator stores an `Arc`
 /// to it so the snapshot path can sample without locking.
@@ -617,6 +680,13 @@ pub struct DisplayStatsCounters {
     /// `None` when the output has no audio device configured). Same
     /// shape as `video_codec_label`.
     pub audio_codec_label: AtomicU8,
+    /// Decoder backend **actually** decoding right now, as a
+    /// [`DisplayDecoderLabel`] discriminant. `0` (Unset) until the first
+    /// decoder opens, after which `open_video_decoder_with_retry` and
+    /// `force_cpu_fallback` keep it current across the MPEG-2 CPU pin and
+    /// runtime HW→CPU demotions. The snapshot path prefers it over the
+    /// frozen `DisplayStatsHandle::decoder_kind` string whenever it is set.
+    pub active_decoder_label: AtomicU8,
 }
 
 #[allow(dead_code)]
@@ -639,6 +709,12 @@ impl DisplayStatsCounters {
     }
     pub fn load_audio_codec_label(&self) -> DisplayCodecLabel {
         DisplayCodecLabel::from_u8(self.audio_codec_label.load(Ordering::Relaxed))
+    }
+    pub fn set_active_decoder_label(&self, label: DisplayDecoderLabel) {
+        self.active_decoder_label.store(label as u8, Ordering::Relaxed);
+    }
+    pub fn load_active_decoder_label(&self) -> DisplayDecoderLabel {
+        DisplayDecoderLabel::from_u8(self.active_decoder_label.load(Ordering::Relaxed))
     }
 }
 
@@ -1244,7 +1320,17 @@ impl OutputStatsAccumulator {
                     }
                 },
                 pixel_format: h.pixel_format.clone(),
-                decoder_kind: h.decoder_kind.clone(),
+                // Prefer the live `active_decoder_label` atomic — kept
+                // current across the MPEG-2 CPU pin and runtime demotes —
+                // over the frozen handle string, which only reflects the
+                // decoder the resolver picked at startup. Falls back to
+                // the handle label before the first decoder opens (Unset).
+                decoder_kind: match h.counters.load_active_decoder_label() {
+                    crate::stats::collector::DisplayDecoderLabel::Unset => {
+                        h.decoder_kind.clone()
+                    }
+                    live => live.as_str().to_string(),
+                },
                 video_codec: h.counters.load_video_codec_label().as_str().to_string(),
                 audio_codec: h.counters.load_audio_codec_label().as_str().to_string(),
                 send_packet_errors: h.counters.send_packet_errors.load(Ordering::Relaxed),

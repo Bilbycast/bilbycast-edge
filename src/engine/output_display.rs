@@ -60,7 +60,7 @@ use crate::engine::packet::RtpPacket;
 use crate::engine::ts_demux::{DemuxedFrame, TsDemuxer};
 use crate::engine::video_decode_stats::VideoDecodeStats;
 use crate::manager::events::{EventSender, EventSeverity};
-use crate::stats::collector::{DisplayStatsCounters, OutputStatsAccumulator};
+use crate::stats::collector::{DisplayDecoderLabel, DisplayStatsCounters, OutputStatsAccumulator};
 
 // Display feeder depth. 8 was too tight on 1080p H.264 CPU decode —
 // a single heavy frame whose blit+present overran the source frame
@@ -1853,6 +1853,22 @@ fn mpeg2_pin_active(codec: VideoCodec, backend: DecoderBackend, runtime_pinned: 
         || (matches!(codec, VideoCodec::Mpeg2) && runtime_pinned)
 }
 
+/// Map a hardware `DecoderBackend` to the manager-visible
+/// [`DisplayDecoderLabel`] the snapshot renders on `decoder_kind`. HW
+/// backends carry their `-zerocopy` scanout suffix (the display path
+/// requests DRM_PRIME on every one); `Cpu` maps to the plain `Cpu`
+/// variant here — callers that mean "HW was wanted but failed" store
+/// `CpuHwUnavailable` explicitly instead.
+fn decoder_label_for_backend(backend: DecoderBackend) -> DisplayDecoderLabel {
+    match backend {
+        DecoderBackend::Cpu => DisplayDecoderLabel::Cpu,
+        DecoderBackend::Nvdec => DisplayDecoderLabel::Nvdec,
+        DecoderBackend::Qsv => DisplayDecoderLabel::Qsv,
+        DecoderBackend::Vaapi => DisplayDecoderLabel::VaapiZeroCopy,
+        DecoderBackend::Rkmpp => DisplayDecoderLabel::RkmppZeroCopy,
+    }
+}
+
 /// Open a `VideoDecoder` with bounded HW retry + CPU fallback.
 ///
 /// On a flow restart that overlaps the previous flow's HW context
@@ -1874,6 +1890,15 @@ fn open_video_decoder_with_retry(
     output_id: &str,
 ) -> Option<VideoDecoder> {
     if matches!(state.backend, DecoderBackend::Cpu) {
+        // `fell_back_to_cpu` distinguishes "operator chose CPU" (plain
+        // `Cpu`) from "HW was wanted but is unavailable / demoted"
+        // (`CpuHwUnavailable`) — both land here once `state.backend` is
+        // `Cpu`, but the manager UI should explain the latter.
+        counters.set_active_decoder_label(if state.fell_back_to_cpu {
+            DisplayDecoderLabel::CpuHwUnavailable
+        } else {
+            DisplayDecoderLabel::Cpu
+        });
         return VideoDecoder::open_with_backend(codec, DecoderBackend::Cpu).ok();
     }
 
@@ -1897,6 +1922,10 @@ fn open_video_decoder_with_retry(
     // normal retry+demote handles it).
     if mpeg2_pin_active(codec, state.backend, state.mpeg2_cpu_pinned) {
         if let Some(d) = VideoDecoder::open_with_backend(codec, DecoderBackend::Cpu).ok() {
+            // MPEG-2 on CPU while `state.backend` stays HW for other
+            // codecs — plain `Cpu`, not a failure. This is the report
+            // that used to lie as `vaapi-zerocopy`/`rkmpp-zerocopy`.
+            counters.set_active_decoder_label(DisplayDecoderLabel::Cpu);
             return Some(d);
         }
     }
@@ -1925,6 +1954,7 @@ fn open_video_decoder_with_retry(
                     // paying a sysmem download on every frame.
                     d.set_rkmpp_zero_copy(true);
                 }
+                counters.set_active_decoder_label(decoder_label_for_backend(state.backend));
                 return Some(d);
             }
             Err(e) => {
@@ -1936,6 +1966,7 @@ fn open_video_decoder_with_retry(
     // Retry budget exhausted. Demote to CPU for the rest of this run.
     state.backend = DecoderBackend::Cpu;
     state.fell_back_to_cpu = true;
+    counters.set_active_decoder_label(DisplayDecoderLabel::CpuHwUnavailable);
     counters.decoder_demotions.fetch_add(1, Ordering::Relaxed);
     if !state.fallback_event_emitted {
         state.fallback_event_emitted = true;
@@ -2263,6 +2294,10 @@ fn force_cpu_fallback(
         }
         *slot = None;
         *current = None;
+        // MPEG-2 is now CPU-decoded; the next open confirms it via the
+        // pin path, but report the truth immediately rather than leaving
+        // the HW label standing until re-open.
+        counters.set_active_decoder_label(DisplayDecoderLabel::Cpu);
         reset_decoder_open_window(state, counters);
         return;
     }
@@ -2271,6 +2306,7 @@ fn force_cpu_fallback(
     state.fell_back_to_cpu = true;
     *slot = None;
     *current = None;
+    counters.set_active_decoder_label(DisplayDecoderLabel::CpuHwUnavailable);
     reset_decoder_open_window(state, counters);
     counters.decoder_demotions.fetch_add(1, Ordering::Relaxed);
     if !state.fallback_event_emitted {
@@ -5199,6 +5235,55 @@ mod tests {
             VideoCodec::Mpeg2,
             DecoderBackend::Cpu
         ));
+    }
+
+    /// `decoder_kind` must report what is ACTUALLY decoding — the report
+    /// that misled diagnostics twice and kept the manager Resources card
+    /// showing a HW session a demote/pin had already moved to CPU. This
+    /// covers the backend→label mapping the live-update sites feed into
+    /// `active_decoder_label`, its u8 round-trip, and the strings.
+    #[test]
+    fn decoder_label_reflects_active_backend() {
+        assert_eq!(
+            decoder_label_for_backend(DecoderBackend::Cpu),
+            DisplayDecoderLabel::Cpu
+        );
+        assert_eq!(
+            decoder_label_for_backend(DecoderBackend::Nvdec),
+            DisplayDecoderLabel::Nvdec
+        );
+        assert_eq!(
+            decoder_label_for_backend(DecoderBackend::Qsv),
+            DisplayDecoderLabel::Qsv
+        );
+        assert_eq!(
+            decoder_label_for_backend(DecoderBackend::Vaapi),
+            DisplayDecoderLabel::VaapiZeroCopy
+        );
+        assert_eq!(
+            decoder_label_for_backend(DecoderBackend::Rkmpp),
+            DisplayDecoderLabel::RkmppZeroCopy
+        );
+        // Round-trip through the atomic u8 encoding on the counters.
+        for l in [
+            DisplayDecoderLabel::Unset,
+            DisplayDecoderLabel::Cpu,
+            DisplayDecoderLabel::CpuHwUnavailable,
+            DisplayDecoderLabel::Nvdec,
+            DisplayDecoderLabel::Qsv,
+            DisplayDecoderLabel::VaapiZeroCopy,
+            DisplayDecoderLabel::RkmppZeroCopy,
+        ] {
+            assert_eq!(DisplayDecoderLabel::from_u8(l as u8), l);
+        }
+        // The MPEG-2 pin reports plain "cpu" (HW still serves other
+        // codecs) — distinct from the demote's "hw unavailable" reason.
+        assert_eq!(DisplayDecoderLabel::Cpu.as_str(), "cpu");
+        assert_eq!(
+            DisplayDecoderLabel::CpuHwUnavailable.as_str(),
+            "cpu (hw unavailable)"
+        );
+        assert_eq!(DisplayDecoderLabel::VaapiZeroCopy.as_str(), "vaapi-zerocopy");
     }
 
     /// The KMS-open error classifier must map a compositor-held DRM master

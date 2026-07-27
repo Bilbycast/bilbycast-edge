@@ -1241,7 +1241,13 @@ pub struct DisplayStats {
     /// Current pixel format on the wire to the connector
     /// (v1 always `"XRGB8888"`).
     pub pixel_format: String,
-    /// Decoder backend, `"sw"` in v1; `"vaapi"` / `"nvdec"` in v2.
+    /// Backend **actually** decoding right now — `"cpu"`,
+    /// `"cpu (hw unavailable)"`, `"nvdec"`, `"qsv"`, `"vaapi-zerocopy"`,
+    /// `"rkmpp-zerocopy"`. Tracks the live decode path, not the one the
+    /// resolver picked at startup: the per-source MPEG-2 CPU pin reports
+    /// `"cpu"` while H.264/HEVC on the same output stay on hardware, and
+    /// a runtime HW→CPU demotion flips this to `"cpu (hw unavailable)"`.
+    /// Sourced from `DisplayStatsCounters::active_decoder_label`.
     pub decoder_kind: String,
     /// Source video codec (`"h264"` / `"hevc"`).
     pub video_codec: String,
