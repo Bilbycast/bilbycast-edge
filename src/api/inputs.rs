@@ -6,7 +6,7 @@ use axum::extract::{Path, State};
 
 use crate::config::models::InputDefinition;
 use crate::config::persistence::save_config_split_async;
-use crate::config::validation::validate_input_definition;
+use crate::config::validation::{validate_input_definition, validate_port_conflicts_with_input};
 
 use super::auth::RequireAdmin;
 use super::errors::ApiError;
@@ -60,6 +60,8 @@ pub async fn create_input(
         .map_err(|e| ApiError::BadRequest(format!("Validation failed: {e}")))?;
 
     let mut config = state.config.write().await;
+    validate_port_conflicts_with_input(&config, &input)
+        .map_err(|e| ApiError::BadRequest(format!("Port conflict: {e}")))?;
 
     // Check for duplicate ID
     if config.inputs.iter().any(|i| i.id == input.id) {
@@ -101,6 +103,8 @@ pub async fn update_input(
         .map_err(|e| ApiError::BadRequest(format!("Validation failed: {e}")))?;
 
     let mut config = state.config.write().await;
+    validate_port_conflicts_with_input(&config, &input)
+        .map_err(|e| ApiError::BadRequest(format!("Port conflict: {e}")))?;
 
     let idx = config
         .inputs

@@ -44,6 +44,18 @@ pub async fn create_tunnel(
     if let Err(e) = crate::config::validation::validate_tunnel(&config) {
         return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": e.to_string() }))).into_response();
     }
+    // Cross-entity check against the prospective config, before the runtime
+    // is touched (see validate_port_conflicts_with_tunnel).
+    if let Err(e) = crate::config::validation::validate_port_conflicts_with_tunnel(
+        &*state.config.read().await,
+        &config,
+    ) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": format!("Port conflict: {e}") })),
+        )
+            .into_response();
+    }
     let persisted = config.clone();
     match state.tunnel_manager.create_tunnel(config).await {
         Ok(()) => {

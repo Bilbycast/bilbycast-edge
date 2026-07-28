@@ -6,7 +6,7 @@ use axum::extract::{Path, State};
 
 use crate::config::models::OutputConfig;
 use crate::config::persistence::save_config_split_async;
-use crate::config::validation::validate_output;
+use crate::config::validation::{validate_output, validate_port_conflicts_with_output};
 
 use super::auth::RequireAdmin;
 use super::errors::ApiError;
@@ -60,6 +60,8 @@ pub async fn create_output(
         .map_err(|e| ApiError::BadRequest(format!("Validation failed: {e}")))?;
 
     let mut config = state.config.write().await;
+    validate_port_conflicts_with_output(&config, &output)
+        .map_err(|e| ApiError::BadRequest(format!("Port conflict: {e}")))?;
 
     // Check for duplicate ID
     if config.outputs.iter().any(|o| o.id() == output.id()) {
@@ -106,6 +108,8 @@ pub async fn update_output(
         .map_err(|e| ApiError::BadRequest(format!("Validation failed: {e}")))?;
 
     let mut config = state.config.write().await;
+    validate_port_conflicts_with_output(&config, &output)
+        .map_err(|e| ApiError::BadRequest(format!("Port conflict: {e}")))?;
 
     let idx = config
         .outputs

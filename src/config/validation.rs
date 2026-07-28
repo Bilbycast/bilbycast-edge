@@ -7601,6 +7601,53 @@ fn reject_srt_caller_self_connect(
     Ok(())
 }
 
+/// Cross-entity port-conflict check for a **prospective** config: `config`
+/// with `input` substituted (replacing any entry of the same id, otherwise
+/// appended).
+///
+/// [`validate_config`] runs the same check at load, but the hot-add paths
+/// (`create_input` / `update_input` / `add_input` over the manager WS, and
+/// the local REST mirrors) validate only the entity in isolation. A live
+/// edit could therefore introduce a clash the *running* process tolerates —
+/// the new listener simply fails to bind, or the entity is inert — which
+/// then becomes a hard startup failure on the next restart. The node runs
+/// happily for days and refuses to boot at the worst possible moment.
+/// Hardware-confirmed on bilby-z440: a manager-side edit put an SRT output
+/// on the same UDP port as an egress tunnel, and the box crash-looped ten
+/// times into the systemd restart limit after an unrelated reboot.
+pub fn validate_port_conflicts_with_input(
+    config: &AppConfig,
+    input: &InputDefinition,
+) -> Result<()> {
+    let mut probe = config.clone();
+    probe.inputs.retain(|i| i.id != input.id);
+    probe.inputs.push(input.clone());
+    validate_port_conflicts(&probe)
+}
+
+/// Output twin of [`validate_port_conflicts_with_input`].
+pub fn validate_port_conflicts_with_output(
+    config: &AppConfig,
+    output: &OutputConfig,
+) -> Result<()> {
+    let mut probe = config.clone();
+    let id = output.id().to_string();
+    probe.outputs.retain(|o| o.id() != id);
+    probe.outputs.push(output.clone());
+    validate_port_conflicts(&probe)
+}
+
+/// Tunnel twin of [`validate_port_conflicts_with_input`].
+pub fn validate_port_conflicts_with_tunnel(
+    config: &AppConfig,
+    tunnel: &crate::tunnel::TunnelConfig,
+) -> Result<()> {
+    let mut probe = config.clone();
+    probe.tunnels.retain(|t| t.id != tunnel.id);
+    probe.tunnels.push(tunnel.clone());
+    validate_port_conflicts(&probe)
+}
+
 /// Validates that no two components in the config try to bind the same local
 /// port.  Called at the end of [`validate_config`] after individual component
 /// validation has already passed.
@@ -11450,6 +11497,123 @@ mod tests {
         let err = validate_config(&config).unwrap_err().to_string();
         assert!(err.contains("[in-1]"), "should include input id: {err}");
         assert!(err.contains("[out-1]"), "should include output id: {err}");
+    }
+
+    // ── Hot-add cross-entity port-conflict tests ──
+    //
+    // `validate_config` catches these at load, but the hot-add paths only
+    // validated the entity in isolation, so a live edit could seed a config
+    // that the running process tolerated and the next restart rejected.
+
+    /// Reproduces the bilby-z440 incident: a manager-side edit put an SRT
+    /// output on the same UDP port as a live egress tunnel. Entity-level
+    /// validation passes — that is exactly why the clash got in.
+    #[test]
+    fn hot_add_output_rejects_port_clash_with_tunnel() {
+        use crate::tunnel::config::{TunnelDirection, TunnelProtocol};
+        let config = make_tunnel_config(vec![make_test_tunnel(
+            "Z440 to BITE",
+            "0.0.0.0:9001",
+            TunnelProtocol::Udp,
+            TunnelDirection::Egress,
+        )]);
+        let output = srt_caller_output("SRT-OUT", Some("127.0.0.1:9001"), "10.0.0.5:7000");
+
+        // The gap: the entity on its own is perfectly valid.
+        assert!(validate_output(&output).is_ok());
+
+        let err = validate_port_conflicts_with_output(&config, &output)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("Port conflict"), "got: {err}");
+        assert!(err.contains("9001"), "got: {err}");
+    }
+
+    #[test]
+    fn hot_add_output_accepts_free_port() {
+        use crate::tunnel::config::{TunnelDirection, TunnelProtocol};
+        let config = make_tunnel_config(vec![make_test_tunnel(
+            "Z440 to BITE",
+            "0.0.0.0:9001",
+            TunnelProtocol::Udp,
+            TunnelDirection::Egress,
+        )]);
+        let output = srt_caller_output("SRT-OUT", Some("127.0.0.1:9002"), "10.0.0.5:7000");
+        assert!(validate_port_conflicts_with_output(&config, &output).is_ok());
+    }
+
+    /// An in-place edit must not conflict with the entity's own previous
+    /// definition — substitution replaces by id rather than appending.
+    /// Without this, every `update_output` on a bound port would be refused.
+    #[test]
+    fn hot_update_output_does_not_conflict_with_itself() {
+        let mut config = make_tunnel_config(vec![]);
+        let output = srt_caller_output("SRT-OUT", Some("127.0.0.1:9001"), "10.0.0.5:7000");
+        config.outputs.push(output.clone());
+        assert!(validate_port_conflicts_with_output(&config, &output).is_ok());
+    }
+
+    #[test]
+    fn hot_add_input_rejects_port_clash_with_tunnel() {
+        use crate::tunnel::config::{TunnelDirection, TunnelProtocol};
+        let config = make_tunnel_config(vec![make_test_tunnel(
+            "egress",
+            "0.0.0.0:9001",
+            TunnelProtocol::Udp,
+            TunnelDirection::Egress,
+        )]);
+        let input = srt_caller_input("SRT-IN", Some("127.0.0.1:9001"), "10.0.0.5:7000");
+        assert!(validate_input_definition(&input).is_ok());
+        let err = validate_port_conflicts_with_input(&config, &input)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("Port conflict"), "got: {err}");
+    }
+
+    /// The mirror image of the z440 incident — the tunnel arriving second.
+    #[test]
+    fn hot_add_tunnel_rejects_port_clash_with_output() {
+        use crate::tunnel::config::{TunnelDirection, TunnelProtocol};
+        let mut config = make_tunnel_config(vec![]);
+        config
+            .outputs
+            .push(srt_caller_output("SRT-OUT", Some("127.0.0.1:9001"), "10.0.0.5:7000"));
+        let tunnel = make_test_tunnel(
+            "Z440 to BITE",
+            "0.0.0.0:9001",
+            TunnelProtocol::Udp,
+            TunnelDirection::Egress,
+        );
+        // NB: no `validate_tunnel` assertion here — `make_test_tunnel` is a
+        // relay-mode fixture with no encryption key, which entity validation
+        // rejects on its own grounds. The input/output twins above make the
+        // "entity-level validation passes" point on fixtures that do.
+        let err = validate_port_conflicts_with_tunnel(&config, &tunnel)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("Port conflict"), "got: {err}");
+        assert!(err.contains("9001"), "got: {err}");
+    }
+
+    #[test]
+    fn hot_update_tunnel_does_not_conflict_with_itself() {
+        use crate::tunnel::config::{TunnelDirection, TunnelProtocol};
+        let tunnel = make_test_tunnel(
+            "egress",
+            "0.0.0.0:9001",
+            TunnelProtocol::Udp,
+            TunnelDirection::Egress,
+        );
+        let config = make_tunnel_config(vec![tunnel.clone()]);
+        assert!(validate_port_conflicts_with_tunnel(&config, &tunnel).is_ok());
+    }
+
+    #[test]
+    fn hot_update_input_does_not_conflict_with_itself() {
+        let mut config = make_tunnel_config(vec![]);
+        let input = srt_caller_input("SRT-IN", Some("127.0.0.1:9001"), "10.0.0.5:7000");
+        config.inputs.push(input.clone());
+        assert!(validate_port_conflicts_with_input(&config, &input).is_ok());
     }
 
     // ── SRT caller `local_addr` (source-bind) tests — Issue 12 ──

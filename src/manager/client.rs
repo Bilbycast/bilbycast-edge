@@ -23,7 +23,11 @@ use super::events::{Event, EventSeverity, build_event_envelope, category};
 use crate::config::models::{AppConfig, FlowAssembly, FlowConfig, FlowGroupConfig, InputDefinition, OutputConfig, ResolvedFlow};
 use crate::config::persistence::save_config_split_async;
 use crate::config::secrets::SecretsConfig;
-use crate::config::validation::{validate_config, validate_flow, validate_input_definition, validate_output, validate_tunnel};
+use crate::config::validation::{
+    validate_config, validate_flow, validate_input_definition, validate_output,
+    validate_port_conflicts_with_input, validate_port_conflicts_with_output,
+    validate_port_conflicts_with_tunnel, validate_tunnel,
+};
 use crate::engine::manager::FlowManager;
 use crate::engine::resource_monitor::SystemResourceState;
 use crate::tunnel::TunnelConfig;
@@ -2378,6 +2382,11 @@ async fn execute_command(
                 serde_json::from_value(action["output"].clone())
                     .map_err(|e| format!("Invalid output config: {e}"))?;
             validate_output(&output).map_err(|e| CommandError::from_validation("Invalid output config", e))?;
+            // Cross-entity check against the prospective config, before the
+            // runtime is touched — otherwise the clash only surfaces on the
+            // next cold start (see validate_port_conflicts_with_output).
+            validate_port_conflicts_with_output(&*app_config.read().await, &output)
+                .map_err(|e| CommandError::from_validation("Port conflict", e))?;
             tracing::info!("Manager command: add output to flow '{flow_id}'");
             flow_manager
                 .add_output(flow_id, output.clone())
@@ -2427,6 +2436,10 @@ async fn execute_command(
                     .map_err(|e| format!("Invalid input config: {e}"))?;
             validate_input_definition(&input)
                 .map_err(|e| CommandError::from_validation("Invalid input config", e))?;
+            // Cross-entity check against the prospective config, before the
+            // runtime is touched (see validate_port_conflicts_with_input).
+            validate_port_conflicts_with_input(&*app_config.read().await, &input)
+                .map_err(|e| CommandError::from_validation("Port conflict", e))?;
             let input_id = input.id.clone();
             tracing::info!(
                 "Manager command: add input '{input_id}' to flow '{flow_id}' (hot-add)"
@@ -2541,6 +2554,8 @@ async fn execute_command(
             validate_input_definition(&input).map_err(|e| CommandError::from_validation("Invalid input", e))?;
             tracing::info!("Manager command: create input '{}' ({})", input.id, input.config.type_name());
             let mut cfg = app_config.write().await;
+            validate_port_conflicts_with_input(&cfg, &input)
+                .map_err(|e| CommandError::from_validation("Port conflict", e))?;
             if cfg.inputs.iter().any(|i| i.id == input.id) {
                 return Err(CommandError::new(format!("Input '{}' already exists", input.id)));
             }
@@ -2560,6 +2575,8 @@ async fn execute_command(
             validate_input_definition(&input).map_err(|e| CommandError::from_validation("Invalid input", e))?;
             tracing::info!("Manager command: update input '{input_id}'");
             let mut cfg = app_config.write().await;
+            validate_port_conflicts_with_input(&cfg, &input)
+                .map_err(|e| CommandError::from_validation("Port conflict", e))?;
             let idx = cfg.inputs.iter().position(|i| i.id == input_id)
                 .ok_or_else(|| format!("Input '{input_id}' not found"))?;
             let old = cfg.inputs[idx].clone();
@@ -2724,6 +2741,8 @@ async fn execute_command(
             validate_output(&output).map_err(|e| CommandError::from_validation("Invalid output", e))?;
             tracing::info!("Manager command: create output '{}' ({})", output.id(), output.type_name());
             let mut cfg = app_config.write().await;
+            validate_port_conflicts_with_output(&cfg, &output)
+                .map_err(|e| CommandError::from_validation("Port conflict", e))?;
             if cfg.outputs.iter().any(|o| o.id() == output.id()) {
                 return Err(CommandError::new(format!("Output '{}' already exists", output.id())));
             }
@@ -2743,6 +2762,8 @@ async fn execute_command(
             validate_output(&output).map_err(|e| CommandError::from_validation("Invalid output", e))?;
             tracing::info!("Manager command: update output '{output_id}'");
             let mut cfg = app_config.write().await;
+            validate_port_conflicts_with_output(&cfg, &output)
+                .map_err(|e| CommandError::from_validation("Port conflict", e))?;
             let idx = cfg.outputs.iter().position(|o| o.id() == output_id)
                 .ok_or_else(|| format!("Output '{output_id}' not found"))?;
             let old_output = cfg.outputs[idx].clone();
@@ -2820,6 +2841,10 @@ async fn execute_command(
                 .map_err(|e| format!("Invalid tunnel config: {e}"))?;
             tunnel.normalize_relay_addrs();
             validate_tunnel(&tunnel).map_err(|e| CommandError::from_validation("Invalid tunnel config", e))?;
+            // Cross-entity check against the prospective config, before the
+            // runtime is touched (see validate_port_conflicts_with_tunnel).
+            validate_port_conflicts_with_tunnel(&*app_config.read().await, &tunnel)
+                .map_err(|e| CommandError::from_validation("Port conflict", e))?;
             tracing::info!("Manager command: create tunnel '{}'", tunnel.id);
             tunnel_manager
                 .create_tunnel(tunnel.clone())
