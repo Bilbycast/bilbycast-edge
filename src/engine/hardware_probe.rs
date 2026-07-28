@@ -1104,18 +1104,73 @@ fn encoder_failure_from(err: &video_engine::ProbeError) -> EncoderFailure {
     }
 }
 
-/// `true` when at least one `/dev/dri/renderD*` node exists — a DRM
-/// render node the QSV / VAAPI stack would open. One `read_dir`, only on
-/// a host where the family is already known broken.
-#[cfg(feature = "media-codecs")]
-fn dri_render_node_present() -> bool {
-    std::fs::read_dir("/dev/dri")
-        .map(|entries| {
-            entries
-                .flatten()
-                .any(|e| e.file_name().to_string_lossy().starts_with("renderD"))
+/// DRM drivers that can back an Intel QSV (oneVPL / iHD) stack.
+const QSV_DRM_DRIVERS: &[&str] = &["i915", "xe"];
+
+/// DRM drivers that can back a VAAPI stack — Intel (iHD / i965) and AMD
+/// (Mesa radeonsi / r600). Deliberately excludes `nvidia`: the proprietary
+/// driver exposes a render node but no VAAPI encode entry point.
+const VAAPI_DRM_DRIVERS: &[&str] = &["i915", "xe", "amdgpu", "radeon"];
+
+/// The DRM driver backing each `/dev/dri/renderD*` node, read from
+/// `/sys/class/drm/<node>/device/driver`. `None` for a node whose driver
+/// can't be resolved (no sysfs, container, unexpected layout).
+///
+/// One `read_dir` plus a `read_link` per node — cheap enough for the
+/// startup probe path, and otherwise only reached on a host where the
+/// family is already known broken.
+fn dri_render_node_drivers() -> Vec<Option<String>> {
+    let Ok(entries) = std::fs::read_dir("/dev/dri") else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().into_owned();
+            name.starts_with("renderD").then(|| {
+                std::fs::canonicalize(format!("/sys/class/drm/{name}/device/driver"))
+                    .ok()
+                    .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+            })
         })
-        .unwrap_or(false)
+        .collect()
+}
+
+/// `true` when at least one render node is — or might be — backed by one
+/// of `wanted`.
+///
+/// A node whose driver we could not resolve counts as a match: the verdict
+/// is only ever narrowed on *positive* evidence, so a host whose sysfs we
+/// can't read keeps the old "node present" behaviour rather than being
+/// mislabelled `no_driver`.
+///
+/// This is what stops a discrete-NVIDIA box from reporting QSV/VAAPI as
+/// `blocked` ("check the iHD media driver") when the only `renderD*` on
+/// the host belongs to `nvidia` and there is no Intel/AMD GPU at all —
+/// hardware-confirmed on a Xeon E5-1650 v3 + GTX 1080 Ti, which has no
+/// iGPU yet still publishes `/dev/dri/renderD128`.
+fn render_node_matches(nodes: &[Option<String>], wanted: &[&str]) -> bool {
+    nodes.iter().any(|driver| match driver {
+        Some(name) => wanted.contains(&name.as_str()),
+        None => true,
+    })
+}
+
+/// `true` when at least one render node is backed by an Intel DRM driver —
+/// the precondition for *hardware* QSV.
+///
+/// Opening `h264_qsv` is **not** evidence of hardware. The oneVPL dispatcher
+/// (`libvpl`) resolves and opens the decoder on hosts with no Intel GPU at
+/// all, so `avcodec_open2` returns `Ok` and the capability gets advertised
+/// with nothing behind it. Hardware-confirmed on a Xeon E5-1650 v3 + GTX
+/// 1080 Ti carrying `libvpl` but no iHD driver and no iGPU: `h264_qsv`
+/// opened, QSV was published as a decoder, the display output's Auto chain
+/// then *selected* it, and every `send_packet` failed until the flow was
+/// torn down. Gating on the render node's owning driver keeps a phantom
+/// backend out of the Auto priority chain instead of letting it be picked
+/// and fail at the first frame.
+fn intel_render_node_present() -> bool {
+    render_node_matches(&dri_render_node_drivers(), QSV_DRM_DRIVERS)
 }
 
 /// NVENC diagnostic. `None` unless NVENC is compiled in yet unavailable.
@@ -1175,7 +1230,7 @@ fn qsv_unavailable_diagnostic(hw: &HwCodecCapability) -> Option<HwEncoderDiagnos
         Ok(()) => return None,
         Err(e) => encoder_failure_from(&e),
     };
-    let node_present = dri_render_node_present();
+    let node_present = render_node_matches(&dri_render_node_drivers(), QSV_DRM_DRIVERS);
     let status = classify_encoder_status(failure, node_present);
     let detail = match failure {
         EncoderFailure::PermissionDenied => {
@@ -1189,7 +1244,8 @@ fn qsv_unavailable_diagnostic(hw: &HwCodecCapability) -> Option<HwEncoderDiagnos
              and the service DeviceAllow / cgroup sandbox"
         }
         EncoderFailure::Other => {
-            "no /dev/dri/renderD* node — no Intel GPU or the i915 driver is not loaded"
+            "no Intel /dev/dri/renderD* node — no Intel GPU, or the i915 / xe driver \
+             is not loaded (a discrete NVIDIA/AMD render node does not provide QSV)"
         }
     };
     Some(HwEncoderDiagnostic {
@@ -1217,7 +1273,7 @@ fn vaapi_unavailable_diagnostic(hw: &HwCodecCapability) -> Option<HwEncoderDiagn
         Ok(()) => return None,
         Err(e) => encoder_failure_from(&e),
     };
-    let node_present = dri_render_node_present();
+    let node_present = render_node_matches(&dri_render_node_drivers(), VAAPI_DRM_DRIVERS);
     let status = classify_encoder_status(failure, node_present);
     let detail = match failure {
         EncoderFailure::PermissionDenied => {
@@ -1231,7 +1287,9 @@ fn vaapi_unavailable_diagnostic(hw: &HwCodecCapability) -> Option<HwEncoderDiagn
              (Mesa radeonsi / iHD) and the service DeviceAllow / cgroup sandbox"
         }
         EncoderFailure::Other => {
-            "no /dev/dri/renderD* node — no GPU render node or the DRM driver is not loaded"
+            "no VAAPI-capable /dev/dri/renderD* node — no Intel/AMD GPU, or the \
+             i915 / xe / amdgpu / radeon driver is not loaded (the proprietary \
+             NVIDIA driver publishes a render node but provides no VAAPI encode)"
         }
     };
     Some(HwEncoderDiagnostic {
@@ -1242,11 +1300,23 @@ fn vaapi_unavailable_diagnostic(hw: &HwCodecCapability) -> Option<HwEncoderDiagn
 }
 
 fn probe_hw_decoders() -> HwCodecCapability {
+    // QSV decode needs a real Intel GPU behind it. The oneVPL dispatcher
+    // opens `h264_qsv` even where none exists, so the decoder probe alone
+    // is not evidence of hardware — see `intel_render_node_present`. Short-
+    // circuiting on the node check also skips a pointless open on hosts
+    // that could never use it.
+    let intel_gpu = intel_render_node_present();
+    if !intel_gpu {
+        tracing::debug!(
+            "QSV decode not probed: no Intel /dev/dri/renderD* node — oneVPL would \
+             open the decoder anyway, which is not evidence of hardware"
+        );
+    }
     HwCodecCapability {
         h264_nvenc: probe_runtime_decoder("h264_cuvid"),
         hevc_nvenc: probe_runtime_decoder("hevc_cuvid"),
-        h264_qsv: probe_runtime_decoder("h264_qsv"),
-        hevc_qsv: probe_runtime_decoder("hevc_qsv"),
+        h264_qsv: intel_gpu && probe_runtime_decoder("h264_qsv"),
+        hevc_qsv: intel_gpu && probe_runtime_decoder("hevc_qsv"),
         h264_videotoolbox: probe_videotoolbox_decoder("h264_videotoolbox"),
         hevc_videotoolbox: probe_videotoolbox_decoder("hevc_videotoolbox"),
         // AMD has no first-party FFmpeg HW decoder name *outside* VAAPI;
@@ -3457,6 +3527,98 @@ mod tests {
             classify_encoder_status(EncoderFailure::Other, false),
             "no_driver"
         );
+    }
+
+    /// A render node owned by a driver that cannot back the stack must not
+    /// count as "the GPU is here but blocked". Regression test for
+    /// bilby-z440 (Xeon E5-1650 v3, no iGPU, GTX 1080 Ti): its only
+    /// `renderD128` is owned by `nvidia`, and QSV/VAAPI were reporting
+    /// `blocked` with "check the iHD media driver" — advice that names
+    /// hardware the host does not physically have.
+    #[test]
+    fn nvidia_render_node_does_not_imply_qsv_or_vaapi() {
+        let nvidia_only = [Some("nvidia".to_string())];
+        assert!(!render_node_matches(&nvidia_only, QSV_DRM_DRIVERS));
+        assert!(!render_node_matches(&nvidia_only, VAAPI_DRM_DRIVERS));
+        // ...which flips the wire status from the misleading `blocked` to
+        // the truthful `no_driver`.
+        assert_eq!(
+            classify_encoder_status(
+                EncoderFailure::Other,
+                render_node_matches(&nvidia_only, QSV_DRM_DRIVERS)
+            ),
+            "no_driver"
+        );
+    }
+
+    /// The other half of the fix: a host with a real Intel iGPU whose QSV
+    /// genuinely fails must keep reporting `blocked`. Mirrors bilby-bite
+    /// (i3-1215U, `renderD128` owned by `i915`).
+    #[test]
+    fn intel_render_node_still_reports_blocked() {
+        let i915 = [Some("i915".to_string())];
+        assert!(render_node_matches(&i915, QSV_DRM_DRIVERS));
+        assert!(render_node_matches(&i915, VAAPI_DRM_DRIVERS));
+        assert_eq!(
+            classify_encoder_status(
+                EncoderFailure::Other,
+                render_node_matches(&i915, QSV_DRM_DRIVERS)
+            ),
+            "blocked"
+        );
+    }
+
+    #[test]
+    fn amd_render_node_backs_vaapi_but_not_qsv() {
+        let amdgpu = [Some("amdgpu".to_string())];
+        assert!(!render_node_matches(&amdgpu, QSV_DRM_DRIVERS));
+        assert!(render_node_matches(&amdgpu, VAAPI_DRM_DRIVERS));
+    }
+
+    /// A mixed box (Intel iGPU + discrete NVIDIA) must still find the
+    /// Intel node behind the NVIDIA one.
+    #[test]
+    fn mixed_gpu_host_finds_the_intel_node() {
+        let mixed = [Some("nvidia".to_string()), Some("i915".to_string())];
+        assert!(render_node_matches(&mixed, QSV_DRM_DRIVERS));
+        assert!(render_node_matches(&mixed, VAAPI_DRM_DRIVERS));
+    }
+
+    /// Unresolvable driver → assume it could match, preserving the old
+    /// behaviour. We only ever narrow the verdict on positive evidence, so
+    /// a sysfs-less container is never wrongly told it has no GPU.
+    #[test]
+    fn unresolvable_driver_is_treated_as_a_possible_match() {
+        assert!(render_node_matches(&[None], QSV_DRM_DRIVERS));
+        assert!(render_node_matches(&[None], VAAPI_DRM_DRIVERS));
+    }
+
+    /// QSV *decode* capability is `decoder_opened && intel_node_present`.
+    /// The second term is load-bearing: oneVPL opens `h264_qsv` on hosts
+    /// with no Intel GPU, so the first term alone published a phantom
+    /// backend that the display output's Auto chain then selected and
+    /// failed on every frame (bilby-z440, GTX 1080 Ti + libvpl, no iGPU).
+    #[test]
+    fn qsv_decode_requires_both_open_and_intel_node() {
+        let nvidia = [Some("nvidia".to_string())];
+        let i915 = [Some("i915".to_string())];
+
+        for (nodes, opened, expected, case) in [
+            (&nvidia, true, false, "oneVPL opens on a non-Intel host"),
+            (&nvidia, false, false, "no open, no node"),
+            (&i915, true, true, "real Intel GPU, decoder opens"),
+            (&i915, false, false, "Intel GPU but decoder won't open"),
+        ] {
+            let advertised = render_node_matches(nodes, QSV_DRM_DRIVERS) && opened;
+            assert_eq!(advertised, expected, "{case}");
+        }
+    }
+
+    /// No render nodes at all is still unambiguously `no_driver`.
+    #[test]
+    fn no_render_nodes_matches_nothing() {
+        assert!(!render_node_matches(&[], QSV_DRM_DRIVERS));
+        assert!(!render_node_matches(&[], VAAPI_DRM_DRIVERS));
     }
 
     #[test]
