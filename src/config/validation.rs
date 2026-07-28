@@ -11608,6 +11608,53 @@ mod tests {
         assert!(validate_port_conflicts_with_tunnel(&config, &tunnel).is_ok());
     }
 
+    /// The hot-add sites must run their *authoritative* port check under the
+    /// SAME write guard as the mutation it guards. This pins that invariant.
+    ///
+    /// Two commands race to add outputs on the same port. Commands are spawned
+    /// per inbound WS message, so this is the real shape, not a contrived one.
+    /// With check-and-mutate under one guard exactly one wins and the resulting
+    /// config still validates. If the check is ever moved back outside the
+    /// guard — as it was when this machinery first landed — both racers pass
+    /// and the committed config fails `validate_port_conflicts`: precisely the
+    /// config.json that refuses to boot, which is the whole point of the check.
+    #[tokio::test]
+    async fn concurrent_hot_adds_cannot_both_commit_a_conflicting_port() {
+        let config = std::sync::Arc::new(tokio::sync::RwLock::new(make_tunnel_config(vec![])));
+
+        let mut handles = Vec::new();
+        for id in ["out-a", "out-b"] {
+            let config = config.clone();
+            handles.push(tokio::spawn(async move {
+                let output = srt_caller_output(id, Some("127.0.0.1:9001"), "10.0.0.5:7000");
+                // Interleave the tasks so both have entered the arm before
+                // either takes the guard — the window the race lives in.
+                tokio::task::yield_now().await;
+                let mut cfg = config.write().await;
+                if validate_port_conflicts_with_output(&cfg, &output).is_err() {
+                    return false;
+                }
+                cfg.outputs.push(output);
+                true
+            }));
+        }
+
+        let mut winners = 0;
+        for h in handles {
+            if h.await.expect("task panicked") {
+                winners += 1;
+            }
+        }
+
+        assert_eq!(winners, 1, "exactly one racer may commit the contended port");
+        let cfg = config.read().await;
+        assert_eq!(cfg.outputs.len(), 1);
+        assert!(
+            validate_port_conflicts(&cfg).is_ok(),
+            "committed config must still boot"
+        );
+    }
+
     #[test]
     fn hot_update_input_does_not_conflict_with_itself() {
         let mut config = make_tunnel_config(vec![]);

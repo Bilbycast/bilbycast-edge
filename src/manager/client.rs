@@ -2382,9 +2382,8 @@ async fn execute_command(
                 serde_json::from_value(action["output"].clone())
                     .map_err(|e| format!("Invalid output config: {e}"))?;
             validate_output(&output).map_err(|e| CommandError::from_validation("Invalid output config", e))?;
-            // Cross-entity check against the prospective config, before the
-            // runtime is touched — otherwise the clash only surfaces on the
-            // next cold start (see validate_port_conflicts_with_output).
+            // Cheap pre-check so an obviously-clashing output never reaches the
+            // runtime at all. NOT authoritative — see the re-check below.
             validate_port_conflicts_with_output(&*app_config.read().await, &output)
                 .map_err(|e| CommandError::with_code(e.to_string(), "port_conflict"))?;
             tracing::info!("Manager command: add output to flow '{flow_id}'");
@@ -2395,6 +2394,23 @@ async fn execute_command(
             // Add to config: store output in top-level outputs and reference from flow
             let mut cfg = app_config.write().await;
             let output_id = output.id().to_string();
+            // Authoritative check, atomic with the mutation below because it
+            // runs under the same write guard. The pre-check above released
+            // its read guard before `add_output().await`, and commands are
+            // spawned per inbound WS message, so two concurrent hot-adds could
+            // both pass it and both persist — writing exactly the config.json
+            // that refuses to boot on the next restart. Losing the race here
+            // costs a runtime rollback; losing it there costs a crash-loop.
+            if let Err(e) = validate_port_conflicts_with_output(&cfg, &output) {
+                drop(cfg);
+                if let Err(rollback) = flow_manager.remove_output(flow_id, &output_id).await {
+                    tracing::warn!(
+                        "Failed to roll back output '{output_id}' after a losing \
+                         port-conflict race on flow '{flow_id}': {rollback}"
+                    );
+                }
+                return Err(CommandError::with_code(e.to_string(), "port_conflict"));
+            }
             // Add to top-level outputs if not already present
             if !cfg.outputs.iter().any(|o| o.id() == output_id) {
                 cfg.outputs.push(output);
@@ -2436,8 +2452,8 @@ async fn execute_command(
                     .map_err(|e| format!("Invalid input config: {e}"))?;
             validate_input_definition(&input)
                 .map_err(|e| CommandError::from_validation("Invalid input config", e))?;
-            // Cross-entity check against the prospective config, before the
-            // runtime is touched (see validate_port_conflicts_with_input).
+            // Cheap pre-check so an obviously-clashing input never reaches the
+            // runtime at all. NOT authoritative — see the re-check below.
             validate_port_conflicts_with_input(&*app_config.read().await, &input)
                 .map_err(|e| CommandError::with_code(e.to_string(), "port_conflict"))?;
             let input_id = input.id.clone();
@@ -2500,6 +2516,21 @@ async fn execute_command(
             // Persist: ensure the input definition exists in cfg.inputs and
             // the flow's input_ids carries the id.
             let mut cfg = app_config.write().await;
+            // Authoritative check, atomic with the mutation below because it
+            // runs under the same write guard — see the equivalent comment in
+            // `add_output`. The pre-check released its read guard before
+            // `add_input().await`, so on its own it cannot stop two concurrent
+            // hot-adds from both persisting a conflicting config.
+            if let Err(e) = validate_port_conflicts_with_input(&cfg, &input) {
+                drop(cfg);
+                if let Err(rollback) = flow_manager.remove_input(&flow_id, &input_id).await {
+                    tracing::warn!(
+                        "Failed to roll back input '{input_id}' after a losing \
+                         port-conflict race on flow '{flow_id}': {rollback}"
+                    );
+                }
+                return Err(CommandError::with_code(e.to_string(), "port_conflict"));
+            }
             if !cfg.inputs.iter().any(|i| i.id == input_id) {
                 cfg.inputs.push(input);
             }
@@ -2856,10 +2887,16 @@ async fn execute_command(
                 .map_err(|e| format!("Invalid tunnel config: {e}"))?;
             tunnel.normalize_relay_addrs();
             validate_tunnel(&tunnel).map_err(|e| CommandError::from_validation("Invalid tunnel config", e))?;
-            // Cross-entity check against the prospective config, before the
-            // runtime is touched (see validate_port_conflicts_with_tunnel).
-            validate_port_conflicts_with_tunnel(&*app_config.read().await, &tunnel)
-                .map_err(|e| CommandError::with_code(e.to_string(), "port_conflict"))?;
+            // Cheap pre-check so an obviously-clashing tunnel never reaches the
+            // runtime at all (NOT authoritative — see the re-check below), plus
+            // a snapshot of the definition this upsert may be replacing, so a
+            // losing race can put the previous tunnel back.
+            let replaced_tunnel = {
+                let cfg = app_config.read().await;
+                validate_port_conflicts_with_tunnel(&cfg, &tunnel)
+                    .map_err(|e| CommandError::with_code(e.to_string(), "port_conflict"))?;
+                cfg.tunnels.iter().find(|t| t.id == tunnel.id).cloned()
+            };
             tracing::info!("Manager command: create tunnel '{}'", tunnel.id);
             tunnel_manager
                 .create_tunnel(tunnel.clone())
@@ -2867,6 +2904,32 @@ async fn execute_command(
                 .map_err(|e| e.to_string())?;
             // Upsert in config: replace existing entry or append new
             let mut cfg = app_config.write().await;
+            // Authoritative check, atomic with the upsert below — see the
+            // equivalent comment in `add_output`.
+            if let Err(e) = validate_port_conflicts_with_tunnel(&cfg, &tunnel) {
+                drop(cfg);
+                if let Err(rollback) = tunnel_manager.destroy_tunnel(&tunnel.id).await {
+                    tracing::warn!(
+                        "Failed to tear down tunnel '{}' after a losing port-conflict \
+                         race: {rollback}",
+                        tunnel.id
+                    );
+                }
+                // This was an edit, not a create: config still names the old
+                // definition, so leave the runtime matching it rather than
+                // silently empty until the next restart.
+                if let Some(prev) = replaced_tunnel
+                    && let Err(restore) = tunnel_manager.create_tunnel(prev).await
+                {
+                    tracing::error!(
+                        "Rolled back tunnel '{}' but could not restore its previous \
+                         definition — runtime and config.json now disagree until \
+                         restart: {restore}",
+                        tunnel.id
+                    );
+                }
+                return Err(CommandError::with_code(e.to_string(), "port_conflict"));
+            }
             if let Some(existing) = cfg.tunnels.iter_mut().find(|t| t.id == tunnel.id) {
                 *existing = tunnel;
             } else {
