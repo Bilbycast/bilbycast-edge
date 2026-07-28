@@ -64,7 +64,26 @@ pub const PCR_MODULUS_27MHZ: u64 = (1u64 << 33) * 300;
 /// orders of magnitude larger than any plausible clock disagreement or
 /// egress offset, so "pick the candidate nearest to now" can never choose
 /// the wrong wrap.
+///
+/// **Do not use this for modular arithmetic.** The true period is
+/// `95_443_717_688_888.89 ns` and this constant truncates it. Reducing a
+/// 2026-era timestamp modulo the truncated value accumulates the missing
+/// 0.89 ns once per elapsed period — ~18_700 periods since the UNIX
+/// epoch, i.e. a ~16 µs error, growing by ~0.9 ns/day. [`unix_ns_from_pcr_27mhz`]
+/// therefore does its reduction in exact 27 MHz tick space and converts
+/// to nanoseconds only at the end. This constant is for human-facing
+/// reasoning and for locating test points, nothing more.
 pub const PCR_MODULUS_NS: u128 = (PCR_MODULUS_27MHZ as u128) * 1000 / 27;
+
+/// Worst-case round-trip error of [`pcr_27mhz_from_unix_ns`] followed by
+/// [`unix_ns_from_pcr_27mhz`], in nanoseconds.
+///
+/// Both directions truncate, and each truncation loses at most one 27 MHz
+/// tick (`1000/27` ≈ 37.04 ns), so the round trip lands at most ~75 ns
+/// *below* the original instant and never above it. That is five orders
+/// of magnitude inside the ±100 ms this feature targets, and — because
+/// every node runs the identical arithmetic — it is common-mode anyway.
+pub const ROUND_TRIP_TOLERANCE_NS: u128 = 75;
 
 /// Forward direction: the 27 MHz PCR value an epoch-locked master clock
 /// generates for a given UNIX-epoch instant.
@@ -88,23 +107,31 @@ pub fn pcr_27mhz_from_unix_ns(unix_ns: u128) -> u64 {
 /// never marginal.
 ///
 /// Resolution is one 27 MHz tick (~37 ns) — five orders of magnitude finer
-/// than the ±100 ms this feature targets.
+/// than the ±100 ms this feature targets. See [`ROUND_TRIP_TOLERANCE_NS`].
+///
+/// # Why the reduction happens in tick space
+///
+/// The obvious implementation reduces `near_unix_ns` modulo
+/// [`PCR_MODULUS_NS`] and adds the PCR's nanosecond phase. That is subtly
+/// wrong: `PCR_MODULUS_NS` truncates a repeating fraction, so each elapsed
+/// period contributes ~0.89 ns of error and a 2026 timestamp lands ~16 µs
+/// off. Ticks are the domain where the modulus is exact, so the reduction
+/// is done there and the conversion to nanoseconds happens once, at the
+/// end.
 pub fn unix_ns_from_pcr_27mhz(pcr_27mhz: u64, near_unix_ns: u128) -> u128 {
-    let modulus = PCR_MODULUS_NS;
-    // The instant this PCR maps to within the wrap period containing the
-    // UNIX epoch. Tick→ns before the modular fix-up so the rounding is
-    // applied once, consistently, on every node.
-    let phase_ns = (pcr_27mhz as u128) * 1000 / 27;
-    // Start of the wrap period `near_unix_ns` currently sits in.
-    let period_start = near_unix_ns - (near_unix_ns % modulus);
-    let candidate = period_start + phase_ns;
+    let modulus = PCR_MODULUS_27MHZ as u128;
+    // Reduce in exact 27 MHz tick space — see the note above.
+    let near_ticks = near_unix_ns * 27 / 1000;
+    // Start of the wrap period `near_ticks` currently sits in.
+    let period_start = near_ticks - (near_ticks % modulus);
+    let candidate = period_start + (pcr_27mhz as u128 % modulus);
 
     // Three candidates cover every case: the current period, and one
     // period either side (the PCR may have wrapped just before or just
-    // after `near_unix_ns` did). Pick the nearest.
+    // after `near_ticks` did). Pick the nearest.
     let prev = candidate.saturating_sub(modulus);
     let next = candidate + modulus;
-    let dist = |a: u128| if a > near_unix_ns { a - near_unix_ns } else { near_unix_ns - a };
+    let dist = |a: u128| if a > near_ticks { a - near_ticks } else { near_ticks - a };
 
     let mut best = candidate;
     let mut best_dist = dist(candidate);
@@ -115,7 +142,8 @@ pub fn unix_ns_from_pcr_27mhz(pcr_27mhz: u64, near_unix_ns: u128) -> u128 {
             best_dist = d;
         }
     }
-    best
+    // Single tick→ns conversion, applied identically on every node.
+    best * 1000 / 27
 }
 
 /// Measured TAI − CLOCK_REALTIME offset in nanoseconds.
@@ -170,9 +198,8 @@ mod tests {
     fn round_trips_at_a_representative_instant() {
         let pcr = pcr_27mhz_from_unix_ns(T2026_NS);
         let back = unix_ns_from_pcr_27mhz(pcr, T2026_NS);
-        // Exact to one 27 MHz tick (~37 ns).
         assert!(
-            T2026_NS.abs_diff(back) < 40,
+            T2026_NS.abs_diff(back) <= ROUND_TRIP_TOLERANCE_NS,
             "round-trip drifted: {T2026_NS} -> {pcr} -> {back}"
         );
     }
@@ -186,7 +213,10 @@ mod tests {
             let t = T2026_NS + i * step;
             let pcr = pcr_27mhz_from_unix_ns(t);
             let back = unix_ns_from_pcr_27mhz(pcr, t);
-            assert!(t.abs_diff(back) < 40, "failed at i={i}: {t} -> {pcr} -> {back}");
+            assert!(
+                t.abs_diff(back) <= ROUND_TRIP_TOLERANCE_NS,
+                "failed at i={i}: {t} -> {pcr} -> {back}"
+            );
         }
     }
 
@@ -202,7 +232,7 @@ mod tests {
         let pcr_after = pcr_27mhz_from_unix_ns(after);
         let got = unix_ns_from_pcr_27mhz(pcr_after, boundary - 5_000_000);
         assert!(
-            after.abs_diff(got) < 40,
+            after.abs_diff(got) <= ROUND_TRIP_TOLERANCE_NS,
             "forward wrap mis-resolved: expected ~{after}, got {got}"
         );
 
@@ -211,7 +241,7 @@ mod tests {
         let pcr_before = pcr_27mhz_from_unix_ns(before);
         let got = unix_ns_from_pcr_27mhz(pcr_before, boundary + 5_000_000);
         assert!(
-            before.abs_diff(got) < 40,
+            before.abs_diff(got) <= ROUND_TRIP_TOLERANCE_NS,
             "backward wrap mis-resolved: expected ~{before}, got {got}"
         );
     }
@@ -241,7 +271,7 @@ mod tests {
         // The PCR was generated *now*, so with a zero offset the target
         // should land on the current TAI reading.
         assert!(
-            (target - tai as i128).abs() < 40,
+            (target - tai as i128).unsigned_abs() <= ROUND_TRIP_TOLERANCE_NS,
             "target ignored the TAI offset: target={target} now_tai={tai}"
         );
     }
