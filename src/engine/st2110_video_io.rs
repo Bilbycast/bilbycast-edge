@@ -1112,6 +1112,7 @@ pub async fn run_st2110_20_output(
         WirePacingClass::EtfEligible,
         EgressPacingMode::Forward,
         None,
+        None, // epoch_lock: raster-anchored, N/A
         stats.clone(),
         cancel.clone(),
     );
@@ -1136,6 +1137,7 @@ pub async fn run_st2110_20_output(
                 WirePacingClass::EtfEligible,
                 EgressPacingMode::Forward,
                 None,
+                None, // epoch_lock: raster-anchored, N/A
                 leg2_stats,
                 cancel.clone(),
             ))
@@ -1949,6 +1951,7 @@ pub async fn run_st2110_23_output(
             WirePacingClass::EtfEligible,
             EgressPacingMode::Forward,
             None,
+            None, // epoch_lock: raster-anchored, N/A
             stats.clone(),
             cancel.clone(),
         );
@@ -1980,6 +1983,7 @@ pub async fn run_st2110_23_output(
                     WirePacingClass::EtfEligible,
                     EgressPacingMode::Forward,
                     None,
+                    None, // epoch_lock: raster-anchored, N/A
                     leg2_stats,
                     cancel.clone(),
                 ))

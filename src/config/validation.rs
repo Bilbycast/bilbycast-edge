@@ -426,6 +426,23 @@ pub fn validate_config(config: &AppConfig) -> Result<()> {
         }
     }
 
+    // Epoch-locked outputs need an epoch-locked flow master clock. Checked
+    // here rather than in `validate_flow` / `validate_output` because it is
+    // the only place both halves are visible at once — outputs are
+    // top-level and validated independently of any flow.
+    for flow in &config.flows {
+        let has_epoch_lock = flow.output_ids.iter().any(|oid| {
+            config
+                .outputs
+                .iter()
+                .find(|o| o.id() == oid)
+                .is_some_and(output_has_epoch_lock)
+        });
+        if has_epoch_lock {
+            validate_flow_epoch_lock(flow)?;
+        }
+    }
+
     // Validate ST 2110 flow groups (essence bundles).
     // Each group must have a unique ID and only reference defined flows; each
     // member flow's `flow_group_id` (if set) must point at this group.
@@ -4632,6 +4649,7 @@ pub fn validate_output(output: &OutputConfig) -> Result<()> {
     validate_output_with_input(output, None)?;
     validate_output_interface_bindings(output)?;
     validate_output_egress_buffer(output)?;
+    validate_output_epoch_lock(output)?;
     validate_pid_overrides(
         output_pid_overrides(output),
         "output pid_overrides",
@@ -4760,6 +4778,153 @@ fn validate_output_egress_buffer(output: &OutputConfig) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Validate the `epoch_lock` block on the compressed UDP/RTP outputs.
+///
+/// Two rules, both guarding against a silent no-op rather than a crash —
+/// epoch lock that isn't actually working looks exactly like epoch lock
+/// that is, until someone measures two nodes against each other.
+///
+/// 1. **`egress_pacing` must be an explicit `"pcr"`.** That is the only
+///    mode where `wire_emit` owns release timing and consults the anchor.
+///    Under `forward` nothing re-paces; under `servo` the leaky bucket is
+///    a rate regulator with ±5 % authority, not a phase actuator. Unset
+///    (`auto`) is rejected too, even though it *can* resolve to `pcr`:
+///    it only does so for flows with a bonded input, so accepting it here
+///    would make the feature silently depend on unrelated flow shape.
+///
+/// 2. **The offset must be in range.** Below
+///    [`MIN_EPOCH_LOCK_OFFSET_MS`] there is no room for even a LAN
+///    receive path and every node sits at a permanent deficit; above
+///    [`MAX_EPOCH_LOCK_OFFSET_MS`] the wire-emit queue is not sized to
+///    hold the backlog.
+///
+/// The remaining requirement — that the flow's master clock is
+/// epoch-locked — cannot be checked here, because outputs are validated
+/// independently of any flow. It is enforced in [`validate_flow`] via
+/// [`validate_flow_epoch_lock`].
+fn validate_output_epoch_lock(output: &OutputConfig) -> Result<()> {
+    let (pacing, epoch, label) = match output {
+        OutputConfig::Rtp(c) => (
+            c.egress_pacing,
+            c.epoch_lock.as_ref(),
+            format!("output '{}' (RTP)", c.id),
+        ),
+        OutputConfig::Udp(c) => (
+            c.egress_pacing,
+            c.epoch_lock.as_ref(),
+            format!("output '{}' (UDP)", c.id),
+        ),
+        _ => return Ok(()),
+    };
+    let Some(epoch) = epoch else { return Ok(()) };
+
+    if pacing != Some(EgressPacingMode::Pcr) {
+        bail!(
+            "{label}: epoch_lock requires an explicit egress_pacing = \"pcr\" \
+             (got {}). Only PCR pacing lets the wire emitter own release \
+             timing; under forward pacing nothing re-paces and the epoch \
+             anchor would be a silent no-op, and servo pacing regulates rate, \
+             not phase. \"auto\" is rejected because it resolves to pcr only \
+             for bonded-input flows",
+            match pacing {
+                Some(m) => format!("\"{}\"", m.as_str()),
+                None => "unset (auto)".to_string(),
+            }
+        );
+    }
+
+    let ms = epoch.egress_offset_ms;
+    if !(MIN_EPOCH_LOCK_OFFSET_MS..=MAX_EPOCH_LOCK_OFFSET_MS).contains(&ms) {
+        bail!(
+            "{label}: epoch_lock.egress_offset_ms must be \
+             {MIN_EPOCH_LOCK_OFFSET_MS}-{MAX_EPOCH_LOCK_OFFSET_MS} ms, got {ms}"
+        );
+    }
+
+    if let Some(g) = epoch.group_label.as_deref() {
+        if g.len() > 64 {
+            bail!("{label}: epoch_lock.group_label must be at most 64 characters");
+        }
+    }
+    Ok(())
+}
+
+/// Does this output carry an `epoch_lock` block? Only the two
+/// wire-emit-paced output types can.
+fn output_has_epoch_lock(output: &OutputConfig) -> bool {
+    match output {
+        OutputConfig::Rtp(c) => c.epoch_lock.is_some(),
+        OutputConfig::Udp(c) => c.epoch_lock.is_some(),
+        _ => false,
+    }
+}
+
+/// A flow feeding an epoch-locked output must run an epoch-locked master
+/// clock, because the whole mechanism is the invertibility of PCR back to
+/// wall time.
+///
+/// Only `ptp` qualifies. Despite the name it does not require a PTP
+/// grandmaster — `PtpMasterClock::now_27mhz` reads `SystemTime::now()`,
+/// so an NTP-disciplined host is enough, and PTP lock state only affects
+/// telemetry. What matters is that PCR is a deterministic function of the
+/// UNIX epoch.
+///
+/// Everything else is rejected, and the two dangerous cases are worth
+/// naming explicitly:
+///
+/// * **`wallclock`** folds a *random* per-process offset into its epoch,
+///   added deliberately so that two parallel edges never accidentally
+///   appear coherent. It is the exact inverse of what epoch lock needs,
+///   and it would fail silently — the output looks fine in isolation.
+/// * **`auto`** (the default) resolves by flow role. It only picks `ptp`
+///   for ST 2110 / MXL essence; a UDP or SRT contribution flow gets the
+///   PLL cascade, whose fallback floor is that same randomised wallclock.
+///   Accepting `auto` would make alignment depend on flow shape in a way
+///   no operator would predict.
+fn validate_flow_epoch_lock(flow: &FlowConfig) -> Result<()> {
+    let kind = flow.master_clock.as_ref().map(|mc| mc.kind);
+    if kind == Some(MasterClockKindConfig::Ptp) {
+        return Ok(());
+    }
+    let (label, why) = match kind {
+        None | Some(MasterClockKindConfig::Auto) => (
+            "unset (auto)",
+            "auto only resolves to ptp for ST 2110 / MXL essence — a \
+             contribution flow gets the PCR-PLL cascade, whose fallback \
+             floor is the randomised wallclock master",
+        ),
+        Some(MasterClockKindConfig::Wallclock) => (
+            "wallclock",
+            "the wallclock master folds a random per-process offset into \
+             its epoch, specifically so independent edges never appear \
+             coherent",
+        ),
+        Some(MasterClockKindConfig::Passthrough) => (
+            "passthrough",
+            "passthrough carries the source's own arbitrary PCR through \
+             unchanged, so there is no epoch to invert",
+        ),
+        Some(other) => (
+            match other {
+                MasterClockKindConfig::SourcePcrPll => "source_pcr_pll",
+                MasterClockKindConfig::Contribution => "contribution",
+                MasterClockKindConfig::AudioMaster => "audio_master",
+                MasterClockKindConfig::SenderTimestamp => "sender_timestamp",
+                _ => "unsupported",
+            },
+            "output PCR is recovered from the source clock, which has no \
+             defined relationship to the UNIX epoch",
+        ),
+    };
+    bail!(
+        "Flow '{}': an output has epoch_lock set, which requires \
+         master_clock.kind = \"ptp\" (got {label}) — {why}. Note that \"ptp\" \
+         does not require a PTP grandmaster here: it generates PCR from the \
+         host wall clock, so an NTP-disciplined host is sufficient",
+        flow.id
+    );
 }
 
 /// Validates the optional `group` tag on an output. Returns an error if the
@@ -8319,6 +8484,7 @@ mod tests {
                 interface_binding: None,
                 egress_pacing: pacing,
                 egress_buffer_ms: buf,
+                epoch_lock: None,
             })
         }
         // No knobs / pacing alone (any mode, no buffer) → ok.
@@ -8345,6 +8511,119 @@ mod tests {
             validate_output_egress_buffer(&rtp(Some(EgressPacingMode::Servo), Some(3000)))
                 .is_err()
         );
+    }
+
+    #[test]
+    fn epoch_lock_requires_explicit_pcr_pacing_and_sane_bounds() {
+        // Epoch lock only actuates under PCR pacing. Accepting it in any
+        // other mode would be a silent no-op that is indistinguishable
+        // from success until someone measures two nodes against each
+        // other — the whole reason this rule exists.
+        fn rtp(pacing: Option<EgressPacingMode>, offset_ms: Option<u32>) -> OutputConfig {
+            OutputConfig::Rtp(RtpOutputConfig {
+                active: true,
+                group: None,
+                id: "out-el".to_string(),
+                name: "Out EL".to_string(),
+                dest_addr: "127.0.0.1:6000".to_string(),
+                bind_addr: None,
+                interface_addr: None,
+                fec_encode: None,
+                dscp: 46,
+                redundancy: None,
+                program_number: None,
+                pid_map: None,
+                delay: None,
+                audio_encode: None,
+                transcode: None,
+                video_encode: None,
+                cbr_pad_to_kbps: None,
+                pid_overrides: None,
+                interface_binding: None,
+                egress_pacing: pacing,
+                egress_buffer_ms: None,
+                epoch_lock: offset_ms.map(|ms| EpochLockConfig {
+                    egress_offset_ms: ms,
+                    group_label: None,
+                }),
+            })
+        }
+
+        // No epoch_lock block → every pacing mode is fine.
+        for mode in [None, Some(EgressPacingMode::Forward), Some(EgressPacingMode::Pcr)] {
+            assert!(validate_output_epoch_lock(&rtp(mode, None)).is_ok());
+        }
+
+        // With epoch_lock, anything but an explicit `pcr` is rejected —
+        // including unset, which resolves to `pcr` only for bonded-input
+        // flows and would otherwise make alignment depend on flow shape.
+        assert!(validate_output_epoch_lock(&rtp(None, Some(200))).is_err());
+        assert!(
+            validate_output_epoch_lock(&rtp(Some(EgressPacingMode::Forward), Some(200))).is_err()
+        );
+        assert!(
+            validate_output_epoch_lock(&rtp(Some(EgressPacingMode::Servo), Some(200))).is_err()
+        );
+        assert!(validate_output_epoch_lock(&rtp(Some(EgressPacingMode::Pcr), Some(200))).is_ok());
+
+        // Offset bounds.
+        let pcr = Some(EgressPacingMode::Pcr);
+        assert!(validate_output_epoch_lock(&rtp(pcr, Some(MIN_EPOCH_LOCK_OFFSET_MS))).is_ok());
+        assert!(validate_output_epoch_lock(&rtp(pcr, Some(MAX_EPOCH_LOCK_OFFSET_MS))).is_ok());
+        assert!(
+            validate_output_epoch_lock(&rtp(pcr, Some(MIN_EPOCH_LOCK_OFFSET_MS - 1))).is_err()
+        );
+        assert!(
+            validate_output_epoch_lock(&rtp(pcr, Some(MAX_EPOCH_LOCK_OFFSET_MS + 1))).is_err()
+        );
+    }
+
+    #[test]
+    fn epoch_lock_requires_an_epoch_locked_master_clock() {
+        // Only `ptp` generates PCR as a function of the UNIX epoch, which
+        // is the property the whole mechanism inverts.
+        let flow = |kind: Option<MasterClockKindConfig>| FlowConfig {
+            id: "f-el".to_string(),
+            name: "Flow EL".to_string(),
+            enabled: true,
+            media_analysis: false,
+            thumbnail: false,
+            thumbnail_program_number: None,
+            thumbnail_interval_secs: None,
+            bandwidth_limit: None,
+            flow_group_id: None,
+            clock_domain: None,
+            input_ids: vec!["in-1".to_string()],
+            output_ids: vec!["out-el".to_string()],
+            assembly: None,
+            content_analysis: None,
+            recording: None,
+            master_clock: kind.map(|k| MasterClockConfig {
+                kind: k,
+                lipsync_offset_90k: 0,
+                pll_lock_timeout_s: None,
+                pll_lock_jitter_us: None,
+            }),
+            bandwidth_profile: None,
+        };
+        assert!(validate_flow_epoch_lock(&flow(Some(MasterClockKindConfig::Ptp))).is_ok());
+
+        // `auto` / unset is rejected even though it *can* land on ptp: it
+        // only does so for ST 2110 / MXL essence, and a contribution flow
+        // gets the PLL cascade whose floor is the randomised wallclock.
+        assert!(validate_flow_epoch_lock(&flow(None)).is_err());
+        assert!(validate_flow_epoch_lock(&flow(Some(MasterClockKindConfig::Auto))).is_err());
+        // Wallclock is the actively dangerous one — it randomises its
+        // epoch precisely so independent edges never look coherent.
+        assert!(validate_flow_epoch_lock(&flow(Some(MasterClockKindConfig::Wallclock))).is_err());
+        for k in [
+            MasterClockKindConfig::Passthrough,
+            MasterClockKindConfig::SourcePcrPll,
+            MasterClockKindConfig::Contribution,
+            MasterClockKindConfig::SenderTimestamp,
+        ] {
+            assert!(validate_flow_epoch_lock(&flow(Some(k))).is_err(), "{k:?} must be rejected");
+        }
     }
 
     #[test]
@@ -9069,6 +9348,7 @@ mod tests {
                 interface_binding: None,
             egress_pacing: None,
             egress_buffer_ms: None,
+            epoch_lock: None,
         }));
         config.flows.push(FlowConfig {
             id: "f1".to_string(),
@@ -9493,6 +9773,7 @@ mod tests {
                 interface_binding: None,
             egress_pacing: None,
             egress_buffer_ms: None,
+            epoch_lock: None,
         }));
         config.flows.push(FlowConfig {
             id: "f1".to_string(),
@@ -9569,6 +9850,7 @@ mod tests {
                 interface_binding: None,
             egress_pacing: None,
             egress_buffer_ms: None,
+            epoch_lock: None,
         }));
         config.flows.push(FlowConfig {
             id: "f1".to_string(),
@@ -9674,6 +9956,7 @@ mod tests {
                 interface_binding: None,
             egress_pacing: None,
             egress_buffer_ms: None,
+            epoch_lock: None,
         }));
         config.flows.push(FlowConfig {
             id: "f1".to_string(),
@@ -9750,6 +10033,7 @@ mod tests {
                 interface_binding: None,
             egress_pacing: None,
             egress_buffer_ms: None,
+            epoch_lock: None,
         }));
         config.flows.push(FlowConfig {
             id: "f1".to_string(),
@@ -9826,6 +10110,7 @@ mod tests {
                 interface_binding: None,
             egress_pacing: None,
             egress_buffer_ms: None,
+            epoch_lock: None,
         }));
         config.flows.push(FlowConfig {
             id: "f1".to_string(),
@@ -11400,6 +11685,7 @@ mod tests {
                 interface_binding: None,
             egress_pacing: None,
             egress_buffer_ms: None,
+            epoch_lock: None,
         }));
         config.outputs.push(OutputConfig::Udp(UdpOutputConfig {
             id: "out-udp-b".into(),
@@ -11422,6 +11708,7 @@ mod tests {
                 interface_binding: None,
             egress_pacing: None,
             egress_buffer_ms: None,
+            epoch_lock: None,
         }));
         let err = validate_config(&config).unwrap_err().to_string();
         assert!(err.contains("Port conflict"), "got: {err}");

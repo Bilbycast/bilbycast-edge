@@ -3343,6 +3343,10 @@ pub struct RtpOutputConfig {
     /// `None` → no cushion. Bounded 20–2000 ms.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub egress_buffer_ms: Option<u32>,
+    /// Optional epoch-locked egress. See [`EpochLockConfig`]. Requires
+    /// `egress_pacing: "pcr"` and an epoch-locked flow master clock.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub epoch_lock: Option<EpochLockConfig>,
 }
 
 /// Egress pacing model for compressed (MPEG-TS) UDP/RTP outputs — how
@@ -3413,6 +3417,73 @@ impl EgressPacingMode {
         }
     }
 }
+
+/// Epoch-locked egress — align this output's wire timing with other nodes
+/// carrying the same stream, without any coordination between them.
+///
+/// # What it does
+///
+/// Normally `wire_emit` anchors its pacing on the first datagram it sees
+/// (`now + PREROLL_NS`), so a node's egress phase is set by whenever it
+/// happened to start. Two nodes fed the same stream therefore emit the
+/// same frame at unrelated wall-clock instants.
+///
+/// With epoch lock enabled, the release instant is instead derived
+/// *analytically* from the datagram's PCR via
+/// [`crate::engine::epoch_lock`]: because an epoch-locked master clock
+/// generates PCR as a pure function of the UNIX-epoch wall clock, that
+/// function can be inverted. Every node computes the identical target, so
+/// egress aligns by arithmetic — no group membership, no manager in the
+/// loop, no control loop to converge or oscillate.
+///
+/// Accuracy is bounded by how well the hosts' clocks agree. NTP on a LAN
+/// is typically tens of microseconds and a few milliseconds over the
+/// internet, well inside the ±100 ms this targets.
+///
+/// # Requirements (enforced at validation)
+///
+/// - `egress_pacing` must resolve to `pcr`. In `forward` mode nothing
+///   re-paces and the anchor is never consulted; the `servo` leaky bucket
+///   is a rate regulator, not a phase actuator.
+/// - The flow's `master_clock.kind` must be epoch-locked (`ptp`). The
+///   default `auto` policy resolves file / switcher / replay flows to
+///   `wallclock`, which **deliberately randomises its epoch** so that
+///   independent edges never accidentally appear coherent — the exact
+///   opposite of what this needs.
+///
+/// A flow that falls back to wallclock mid-run silently loses alignment,
+/// so that transition raises a critical alarm rather than a warning.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EpochLockConfig {
+    /// Headroom, in milliseconds, between the instant a PCR represents and
+    /// the instant its datagram is released onto the wire.
+    ///
+    /// This is the budget every member spends absorbing its own receive
+    /// and processing path — network transit, jitter buffer, any
+    /// transcode. It **must be identical on every node in the group**;
+    /// that is what makes their targets agree. Set it comfortably above
+    /// the slowest member's path, or that member will run at a permanent
+    /// deficit and lag the others.
+    ///
+    /// Bounded 50..=5000 ms. Absolute accuracy is not required: a constant
+    /// error here is common-mode and cancels out of the inter-node
+    /// difference, which is the only thing this feature promises.
+    pub egress_offset_ms: u32,
+    /// Optional operator label, surfaced on telemetry so the manager UI
+    /// can group members visually. Carries **no behaviour** — nodes are
+    /// aligned by the arithmetic above, not by sharing this string. Max
+    /// 64 chars.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group_label: Option<String>,
+}
+
+/// Minimum `egress_offset_ms`. Below ~50 ms there is no room for even a
+/// LAN receive path, so every node would sit at a permanent deficit.
+pub const MIN_EPOCH_LOCK_OFFSET_MS: u32 = 50;
+/// Maximum `egress_offset_ms`. 5 s is already far beyond any contribution
+/// path this is meant for, and the wire-emit queue is not sized to hold
+/// more.
+pub const MAX_EPOCH_LOCK_OFFSET_MS: u32 = 5_000;
 
 /// Configurable output delay for stream synchronization.
 ///
@@ -3578,6 +3649,10 @@ pub struct UdpOutputConfig {
     /// UDP/RTP). See `docs/egress-dejitter-design.md`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub egress_buffer_ms: Option<u32>,
+    /// Optional epoch-locked egress. See [`EpochLockConfig`]. Requires
+    /// `egress_pacing: "pcr"` and an epoch-locked flow master clock.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub epoch_lock: Option<EpochLockConfig>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -7321,6 +7396,7 @@ mod tests {
                 interface_binding: None,
                 egress_pacing: None,
                 egress_buffer_ms: None,
+                epoch_lock: None,
             })],
             flows: vec![FlowConfig {
                 id: "test-flow".to_string(),
@@ -7399,6 +7475,7 @@ mod tests {
                 interface_binding: None,
                 egress_pacing: None,
                 egress_buffer_ms: None,
+                epoch_lock: None,
             })],
             flows: vec![FlowConfig {
                 id: "flow-1".to_string(),

@@ -150,6 +150,27 @@ pub struct OutputStatsAccumulator {
     /// SO_TXTIME-path signal and stays 0 on the default `clock_nanosleep`
     /// release path.
     pub wire_pacing_late: AtomicU64,
+    /// Epoch-locked egress: the configured offset in µs, registered once
+    /// at output spawn. The presence of this value is what tells the
+    /// manager the output is running epoch-locked at all.
+    pub epoch_lock_offset_us: OnceLock<u64>,
+    /// Operator group label for this epoch-locked output, if set. Purely
+    /// a UI grouping aid — nodes align by arithmetic, not by sharing
+    /// this string.
+    pub epoch_lock_group: OnceLock<String>,
+    /// Whether the analytic epoch anchor has been applied at least once.
+    /// False while epoch lock is configured but no PCR has arrived yet —
+    /// the difference between "warming up" and "silently doing nothing".
+    pub epoch_lock_engaged: AtomicBool,
+    /// Most recent epoch-lock shortfall in µs: how far the analytic
+    /// target had already slipped into the past when it was computed.
+    /// Non-zero means this node cannot honour the configured offset, so
+    /// it is emitting as fast as it can and running behind its peers.
+    pub epoch_lock_deficit_us: AtomicU64,
+    /// High-water mark of the above since output start. A deficit that
+    /// only spiked at startup reads very differently from one still
+    /// happening, and a 1 Hz gauge alone cannot tell those apart.
+    pub epoch_lock_deficit_max_us: AtomicU64,
     /// Datagrams dropped by a **partial `sendmmsg` short-write** (kernel
     /// accepted fewer messages than submitted, e.g. transient ENOBUFS / socket
     /// buffer pressure on the batch send path). Distinct from `wire_pacing_late`
@@ -781,12 +802,44 @@ impl OutputStatsAccumulator {
             wire_pacing_tier: OnceLock::new(),
             egress_pacing_effective: OnceLock::new(),
             wire_pacing_late: AtomicU64::new(0),
+            epoch_lock_offset_us: OnceLock::new(),
+            epoch_lock_group: OnceLock::new(),
+            epoch_lock_engaged: AtomicBool::new(false),
+            epoch_lock_deficit_us: AtomicU64::new(0),
+            epoch_lock_deficit_max_us: AtomicU64::new(0),
             wire_short_write: AtomicU64::new(0),
             wire_pacing_pinned_cpu: AtomicI32::new(-1),
             egress_shed: AtomicU64::new(0),
             wire_emit_depth: OnceLock::new(),
             display_frames_fresh: crate::stats::throughput::CounterFreshness::new(),
             display_audio_fresh: crate::stats::throughput::CounterFreshness::new(),
+        }
+    }
+
+    /// Register epoch-locked egress for this output. Called once at
+    /// spawn by `engine::wire_emit`; the registered offset is what makes
+    /// epoch lock visible in telemetry at all.
+    pub fn set_epoch_lock(&self, offset_us: u64, group: Option<&str>) {
+        let _ = self.epoch_lock_offset_us.set(offset_us);
+        if let Some(g) = group {
+            let _ = self.epoch_lock_group.set(g.to_string());
+        }
+    }
+
+    /// Record the outcome of one analytic epoch anchor. `deficit_us` is
+    /// 0 when the target was still in the future — the healthy case.
+    ///
+    /// Called from the wire thread on every PCR-bearing datagram, so it
+    /// stays at two relaxed stores plus a conditional max update: no
+    /// allocation, no lock, no syscall.
+    #[inline]
+    pub fn record_epoch_lock_anchor(&self, deficit_us: u64) {
+        self.epoch_lock_engaged.store(true, Ordering::Relaxed);
+        self.epoch_lock_deficit_us
+            .store(deficit_us, Ordering::Relaxed);
+        if deficit_us > 0 {
+            self.epoch_lock_deficit_max_us
+                .fetch_max(deficit_us, Ordering::Relaxed);
         }
     }
 
@@ -1388,6 +1441,13 @@ impl OutputStatsAccumulator {
             wire_pacing_tier: self.wire_pacing_tier.get().cloned(),
             egress_pacing_effective: self.egress_pacing_effective.get().cloned(),
             wire_pacing_late: self.wire_pacing_late.load(Ordering::Relaxed),
+            epoch_lock: self.epoch_lock_offset_us.get().map(|off| EpochLockStats {
+                group_label: self.epoch_lock_group.get().cloned(),
+                egress_offset_us: *off,
+                engaged: self.epoch_lock_engaged.load(Ordering::Relaxed),
+                deficit_us: self.epoch_lock_deficit_us.load(Ordering::Relaxed),
+                deficit_max_us: self.epoch_lock_deficit_max_us.load(Ordering::Relaxed),
+            }),
             wire_short_write: self.wire_short_write.load(Ordering::Relaxed),
             wire_pacing_pinned_cpu: {
                 let v = self.wire_pacing_pinned_cpu.load(Ordering::Relaxed);

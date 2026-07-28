@@ -187,6 +187,14 @@ async fn rtp_output_loop(
         .into_std()
         .map_err(|e| anyhow::anyhow!("convert tokio UdpSocket -> std: {e}"))?;
     std_socket.set_nonblocking(false)?;
+    // Epoch-locked egress: ms -> ns once, here, so the hot path never
+    // divides. `None` leaves wire_emit on its classic relative anchor.
+    let epoch_lock_params = config.epoch_lock.as_ref().map(|e| {
+        crate::engine::wire_emit::EpochLockParams {
+            offset_ns: e.egress_offset_ms as u64 * 1_000_000,
+            group_label: e.group_label.clone(),
+        }
+    });
     let wire_tx = spawn_wire_emitter(
         config.id.clone(),
         std_socket,
@@ -195,6 +203,7 @@ async fn rtp_output_loop(
         WirePacingClass::Lossless,
         config.egress_pacing.unwrap_or_default(),
         config.egress_buffer_ms,
+        epoch_lock_params.clone(),
         stats.clone(),
         cancel.clone(),
     );
@@ -790,6 +799,14 @@ async fn rtp_output_redundant_loop(
         format!("{}-leg2", config.id),
         "rtp_2022_7_leg2".to_string(),
     ));
+    // Epoch-locked egress: ms -> ns once, here, so the hot path never
+    // divides. `None` leaves wire_emit on its classic relative anchor.
+    let epoch_lock_params = config.epoch_lock.as_ref().map(|e| {
+        crate::engine::wire_emit::EpochLockParams {
+            offset_ns: e.egress_offset_ms as u64 * 1_000_000,
+            group_label: e.group_label.clone(),
+        }
+    });
     let wire_tx_leg1 = spawn_wire_emitter(
         format!("{}-leg1", config.id),
         std_socket1,
@@ -798,6 +815,7 @@ async fn rtp_output_redundant_loop(
         WirePacingClass::Lossless,
         config.egress_pacing.unwrap_or_default(),
         config.egress_buffer_ms,
+        epoch_lock_params.clone(),
         stats.clone(),
         cancel.clone(),
     );
@@ -809,6 +827,7 @@ async fn rtp_output_redundant_loop(
         WirePacingClass::Lossless,
         config.egress_pacing.unwrap_or_default(),
         config.egress_buffer_ms,
+        epoch_lock_params.clone(),
         leg2_stats,
         cancel.clone(),
     );

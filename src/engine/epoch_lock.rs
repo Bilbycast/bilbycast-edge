@@ -73,6 +73,10 @@ pub const PCR_MODULUS_27MHZ: u64 = (1u64 << 33) * 300;
 /// therefore does its reduction in exact 27 MHz tick space and converts
 /// to nanoseconds only at the end. This constant is for human-facing
 /// reasoning and for locating test points, nothing more.
+///
+/// Test-only, and gated rather than merely allowed: the warning above is
+/// only enforceable if the production path cannot reach it at all.
+#[cfg(test)]
 pub const PCR_MODULUS_NS: u128 = (PCR_MODULUS_27MHZ as u128) * 1000 / 27;
 
 /// Worst-case round-trip error of [`pcr_27mhz_from_unix_ns`] followed by
@@ -83,6 +87,10 @@ pub const PCR_MODULUS_NS: u128 = (PCR_MODULUS_27MHZ as u128) * 1000 / 27;
 /// *below* the original instant and never above it. That is five orders
 /// of magnitude inside the ±100 ms this feature targets, and — because
 /// every node runs the identical arithmetic — it is common-mode anyway.
+///
+/// Test-only: it exists to give the round-trip tests a single named bound
+/// to assert against, not to be consulted at runtime.
+#[cfg(test)]
 pub const ROUND_TRIP_TOLERANCE_NS: u128 = 75;
 
 /// Forward direction: the 27 MHz PCR value an epoch-locked master clock
@@ -92,6 +100,12 @@ pub const ROUND_TRIP_TOLERANCE_NS: u128 = 75;
 /// `u128` — absolute epoch nanoseconds are ~1.8e18 in 2026, and
 /// `1.8e18 × 27 ≈ 4.9e19` overflows `u64::MAX` (1.8e19). A `u64` multiply
 /// here would pin the result to a constant and freeze the derived anchor.
+///
+/// Test-only. Edges never run this direction — a PCR arrives on the wire
+/// already stamped, and the only thing the emitter needs is the inverse.
+/// It exists so the tests can generate a PCR for a chosen instant and
+/// assert the round trip.
+#[cfg(test)]
 #[inline]
 pub fn pcr_27mhz_from_unix_ns(unix_ns: u128) -> u64 {
     ((unix_ns * 27 / 1000) % (PCR_MODULUS_27MHZ as u128)) as u64
@@ -101,18 +115,18 @@ pub fn pcr_27mhz_from_unix_ns(unix_ns: u128) -> u64 {
 /// master clock would have stamped with `pcr_27mhz`.
 ///
 /// `pcr_27mhz` is modular, so the true instant is only determined up to a
-/// multiple of [`PCR_MODULUS_NS`]. `near_unix_ns` resolves that: we return
+/// multiple of `PCR_MODULUS_NS`. `near_unix_ns` resolves that: we return
 /// whichever candidate lies closest to it. Because the ambiguity period is
 /// ~26.5 h and the inputs disagree by milliseconds at worst, the choice is
 /// never marginal.
 ///
 /// Resolution is one 27 MHz tick (~37 ns) — five orders of magnitude finer
-/// than the ±100 ms this feature targets. See [`ROUND_TRIP_TOLERANCE_NS`].
+/// than the ±100 ms this feature targets. See `ROUND_TRIP_TOLERANCE_NS`.
 ///
 /// # Why the reduction happens in tick space
 ///
 /// The obvious implementation reduces `near_unix_ns` modulo
-/// [`PCR_MODULUS_NS`] and adds the PCR's nanosecond phase. That is subtly
+/// `PCR_MODULUS_NS` and adds the PCR's nanosecond phase. That is subtly
 /// wrong: `PCR_MODULUS_NS` truncates a repeating fraction, so each elapsed
 /// period contributes ~0.89 ns of error and a 2026 timestamp lands ~16 µs
 /// off. Ticks are the domain where the modulus is exact, so the reduction
@@ -161,8 +175,9 @@ pub fn tai_minus_realtime_ns(tai_ns: u64, realtime_unix_ns: u128) -> i64 {
     (tai_ns as i128 - realtime_unix_ns as i128) as i64
 }
 
-/// The full derivation `wire_emit` needs: given a PCR value, produce the
-/// CLOCK_TAI instant at which the carrying datagram should hit the wire.
+/// Single-shot convenience form: given a PCR value, produce the CLOCK_TAI
+/// instant at which the carrying datagram should hit the wire, measuring
+/// the TAI−realtime skew from the two clock readings passed in.
 ///
 /// - `pcr_27mhz` — PCR parsed from the datagram.
 /// - `now_tai_ns` — the emitter's current CLOCK_TAI reading.
@@ -173,17 +188,62 @@ pub fn tai_minus_realtime_ns(tai_ns: u64, realtime_unix_ns: u128) -> i64 {
 /// caller can compare and sleep against it directly. It may legitimately
 /// be in the past when the node cannot meet the configured offset — the
 /// caller treats that as the deficit signal rather than clamping silently.
+///
+/// **Test-only, deliberately.** It is correct only when the two clock
+/// readings are simultaneous, which is exactly what the emitter cannot
+/// promise: `wire_emit` reads the clock once and reuses it across a whole
+/// batch, so the skew derived here would absorb the batch latency and
+/// shift every target by a load-dependent amount. Production therefore
+/// calls [`target_tai_ns`] with a skew sampled separately on a slow timer
+/// (see `wire_emit::refresh_epoch_skew`). Gating this to tests keeps that
+/// distinction structural instead of advisory.
+#[cfg(test)]
 pub fn target_tai_ns_for_pcr(
     pcr_27mhz: u64,
     now_tai_ns: u64,
     realtime_unix_ns: u128,
     egress_offset_ns: u64,
 ) -> i128 {
-    let offset = tai_minus_realtime_ns(now_tai_ns, realtime_unix_ns) as i128;
+    target_tai_ns(
+        pcr_27mhz,
+        now_tai_ns,
+        tai_minus_realtime_ns(now_tai_ns, realtime_unix_ns),
+        egress_offset_ns,
+    )
+}
+
+/// The core derivation, taking the TAI−realtime skew as an explicit
+/// parameter rather than re-measuring it.
+///
+/// # Why the skew is a parameter
+///
+/// Measuring it from the caller's `now_tai_ns` against a freshly-sampled
+/// `SystemTime::now()` only works if the two readings are simultaneous.
+/// They are not: `wire_emit` reads the clock once and then processes a
+/// whole batch of datagrams against that reading, so `now_tai_ns` is
+/// routinely stale by however long the batch takes. A stale reading would
+/// be mistaken for clock skew and shifted straight into the target —
+/// silently, and by an amount that varies with load. Callers therefore
+/// sample both clocks together, once, and pass the resulting skew in.
+///
+/// Given a fixed skew the result is **independent of `now_tai_ns`**, which
+/// is the whole point: the target must be a function of the PCR alone.
+/// `now_tai_ns` is used only to pick the right wrap period, where being
+/// milliseconds stale is irrelevant against a ~26.5 h ambiguity window.
+pub fn target_tai_ns(
+    pcr_27mhz: u64,
+    now_tai_ns: u64,
+    tai_minus_realtime_ns: i64,
+    egress_offset_ns: u64,
+) -> i128 {
+    let skew = tai_minus_realtime_ns as i128;
     // Disambiguate against *realtime* — that is the clock the PCR was
-    // generated from, so it is the one whose wrap phase matches.
-    let generated_at = unix_ns_from_pcr_27mhz(pcr_27mhz, realtime_unix_ns) as i128;
-    generated_at + offset + egress_offset_ns as i128
+    // generated from, so it is the one whose wrap phase matches. Derived
+    // from the caller's TAI reading rather than sampled separately, so
+    // the two can never disagree.
+    let realtime_near = (now_tai_ns as i128 - skew).max(0) as u128;
+    let generated_at = unix_ns_from_pcr_27mhz(pcr_27mhz, realtime_near) as i128;
+    generated_at + skew + egress_offset_ns as i128
 }
 
 #[cfg(test)]
