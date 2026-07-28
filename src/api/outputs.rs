@@ -60,8 +60,6 @@ pub async fn create_output(
         .map_err(|e| ApiError::BadRequest(format!("Validation failed: {e}")))?;
 
     let mut config = state.config.write().await;
-    validate_port_conflicts_with_output(&config, &output)
-        .map_err(|e| ApiError::BadRequest(format!("Port conflict: {e}")))?;
 
     // Check for duplicate ID
     if config.outputs.iter().any(|o| o.id() == output.id()) {
@@ -77,6 +75,12 @@ pub async fn create_output(
             output.id()
         )));
     }
+
+    // Cross-entity port check runs *after* the identity checks so a duplicate
+    // id still reports 409, not 400 — the probe substitutes by id and would
+    // otherwise drop the colliding entity and mask the real error.
+    validate_port_conflicts_with_output(&config, &output)
+        .map_err(|e| ApiError::BadRequest(e.to_string()))?;
 
     config.outputs.push(output.clone());
     save_config_split_async(state.config_path.clone(), state.secrets_path.clone(), config.clone())
@@ -108,14 +112,17 @@ pub async fn update_output(
         .map_err(|e| ApiError::BadRequest(format!("Validation failed: {e}")))?;
 
     let mut config = state.config.write().await;
-    validate_port_conflicts_with_output(&config, &output)
-        .map_err(|e| ApiError::BadRequest(format!("Port conflict: {e}")))?;
 
     let idx = config
         .outputs
         .iter()
         .position(|o| o.id() == output_id)
         .ok_or_else(|| ApiError::NotFound(format!("Output '{output_id}' not found")))?;
+
+    // After the existence check, so editing a non-existent output still reports
+    // 404 rather than a port conflict against a phantom entity.
+    validate_port_conflicts_with_output(&config, &output)
+        .map_err(|e| ApiError::BadRequest(e.to_string()))?;
 
     let old_output = config.outputs[idx].clone();
     config.outputs[idx] = output.clone();

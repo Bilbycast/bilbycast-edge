@@ -52,7 +52,7 @@ pub async fn create_tunnel(
     ) {
         return (
             StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({ "error": format!("Port conflict: {e}") })),
+            Json(serde_json::json!({ "error": e.to_string() })),
         )
             .into_response();
     }

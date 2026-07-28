@@ -1116,7 +1116,10 @@ const VAAPI_DRM_DRIVERS: &[&str] = &["i915", "xe", "amdgpu", "radeon"];
 /// `/sys/class/drm/<node>/device/driver`. `None` for a node whose driver
 /// can't be resolved (no sysfs, container, unexpected layout).
 ///
-/// One `read_dir` plus a `read_link` per node — cheap enough for the
+/// One `read_dir` plus a `canonicalize` per node — `read_link` is not
+/// enough, since `/sys/class/drm/<node>` is itself a symlink into
+/// `/sys/devices/...` and only full resolution reaches the driver
+/// directory whose basename is the driver name. Cheap enough for the
 /// startup probe path, and otherwise only reached on a host where the
 /// family is already known broken.
 fn dri_render_node_drivers() -> Vec<Option<String>> {
@@ -1200,6 +1203,16 @@ fn nvenc_unavailable_diagnostic(hw: &HwCodecCapability) -> Option<HwEncoderDiagn
             "NVENC session slots exhausted — another process is holding all encode sessions"
                 .to_string()
         }
+        // EACCES has one correct remedy and it is not "reboot" — keep it on
+        // the sandbox runbook, matching the explicit shape the QSV and VAAPI
+        // twins already use. Without this arm the version-mismatch branch
+        // below swallows a permission failure whenever any version skew also
+        // happens to be present.
+        EncoderFailure::PermissionDenied if node_present => {
+            "/dev/nvidia* present but not accessible — check the service \
+             DeviceAllow / cgroup sandbox (see installation.md)"
+                .to_string()
+        }
         // A stale kernel module is by far the most common cause of a
         // present-but-unopenable NVIDIA stack, and it is silent: the box
         // keeps running, the encode just degrades to CPU. Name it exactly
@@ -1265,26 +1278,64 @@ const NVIDIA_LIB_DIRS: &[&str] = &[
     "/usr/lib",
 ];
 
-/// Library stems whose soname carries the userspace driver version.
-/// `libcuda` is the fallback: NVENC hosts always have it, whereas
-/// `libnvidia-encode` is absent on decode-only installs.
+/// Library stems whose soname carries the userspace driver version, in
+/// preference order. `libcuda` is the fallback: NVENC hosts always have it,
+/// whereas `libnvidia-encode` is absent on decode-only installs.
 const NVIDIA_VERSIONED_LIBS: &[&str] = &["libnvidia-encode", "libcuda"];
+
+/// Numeric component vector for ordering dotted versions. `is_dotted_version`
+/// has already guaranteed every component is ASCII digits, so the parse cannot
+/// realistically fail; a lexical compare would misorder `580.9` vs `580.10`.
+fn version_key(v: &str) -> Vec<u64> {
+    v.split('.').map(|c| c.parse::<u64>().unwrap_or(0)).collect()
+}
 
 /// Userspace NVIDIA driver version, read from the versioned library soname.
 /// Deliberately avoids NVML — that is behind an optional Cargo feature, and
 /// on a mismatched host `nvmlInit` is exactly what fails.
+///
+/// Resolution order matters, because the host this exists to diagnose is
+/// precisely the one that can carry libraries from two driver generations at
+/// once. `<stem>.so.1` is what the dynamic loader actually binds, so resolving
+/// that symlink names the version in use; a bare `read_dir` scan would pick
+/// between co-resident versions in filesystem order and could just as easily
+/// fabricate a mismatch as mask one.
 fn nvidia_userspace_version() -> Option<String> {
-    for dir in NVIDIA_LIB_DIRS {
-        let Ok(entries) = std::fs::read_dir(dir) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let name = entry.file_name().to_string_lossy().into_owned();
-            for stem in NVIDIA_VERSIONED_LIBS {
-                if let Some(v) = parse_nvidia_lib_version(&name, stem) {
-                    return Some(v);
+    // Stems outermost — this is the documented preference order.
+    for stem in NVIDIA_VERSIONED_LIBS {
+        for dir in NVIDIA_LIB_DIRS {
+            if let Some(v) = std::fs::read_link(format!("{dir}/{stem}.so.1"))
+                .ok()
+                .and_then(|target| {
+                    target.file_name().map(|n| n.to_string_lossy().into_owned())
+                })
+                .and_then(|name| parse_nvidia_lib_version(&name, stem))
+            {
+                return Some(v);
+            }
+        }
+    }
+
+    // Fallback for layouts with no `.so.1` symlink: scan, but take the highest
+    // version rather than whichever entry read_dir happened to yield first, so
+    // a leftover older library can never win.
+    for stem in NVIDIA_VERSIONED_LIBS {
+        let mut best: Option<String> = None;
+        for dir in NVIDIA_LIB_DIRS {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if let Some(v) = parse_nvidia_lib_version(&name, stem)
+                    && best.as_deref().is_none_or(|b| version_key(b) < version_key(&v))
+                {
+                    best = Some(v);
                 }
             }
+        }
+        if best.is_some() {
+            return best;
         }
     }
     None
@@ -1299,9 +1350,12 @@ fn nvidia_kernel_module_version() -> Option<String> {
 ///
 /// Upgrading the NVIDIA packages without rebooting leaves the running
 /// `nvidia.ko` older than the userspace libraries; `cuInit` then fails with
-/// `CUDA_ERROR_COMPAT_NOT_SUPPORTED_ON_DEVICE` and every HW encode silently
-/// falls back to CPU. Hardware-confirmed on bilby-z440, where it went
-/// unnoticed for three days because the only symptom was elevated CPU.
+/// `CUDA_ERROR_SYSTEM_DRIVER_MISMATCH` (803) — the same condition `nvidia-smi`
+/// reports as "Driver/library version mismatch" — and every HW encode silently
+/// falls back to CPU. (804, `CUDA_ERROR_COMPAT_NOT_SUPPORTED_ON_DEVICE`, is the
+/// distinct `cuda-compat` forward-compatibility failure, not this.)
+/// Hardware-confirmed on bilby-z440, where it went unnoticed for three days
+/// because the only symptom was elevated CPU.
 fn nvidia_driver_version_mismatch() -> Option<(String, String)> {
     let kernel = nvidia_kernel_module_version()?;
     let userspace = nvidia_userspace_version()?;
@@ -3767,6 +3821,17 @@ mod tests {
         assert!(!is_dotted_version("Module")); // no digits
         assert!(!is_dotted_version("x86_64")); // not dotted-numeric
         assert!(!is_dotted_version("")); // empty
+    }
+
+    /// Driver versions must order numerically, not lexically. The scan
+    /// fallback in `nvidia_userspace_version` picks the highest co-resident
+    /// version, so `580.9` must not outrank `580.10`.
+    #[test]
+    fn version_key_orders_numerically_not_lexically() {
+        assert!(version_key("580.159.03") < version_key("580.173.02"));
+        assert!(version_key("580.9") < version_key("580.10")); // lexical would invert
+        assert_eq!(version_key("580.173.02"), version_key("580.173.02"));
+        assert!(version_key("535.104.05") < version_key("580.159.03"));
     }
 
     /// No render nodes at all is still unambiguously `no_driver`.
