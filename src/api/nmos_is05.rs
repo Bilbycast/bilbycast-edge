@@ -21,6 +21,52 @@ use super::server::AppState;
 use crate::config::models::{InputConfig, OutputConfig};
 use crate::manager::events::{EventSeverity, category};
 
+/// Refuse an IS-05 activation that would produce an invalid or unbootable
+/// config, and tell the operator why.
+///
+/// IS-05 activation is the one write surface on this node that mutates *and
+/// persists* input/output configs. Its transport params are supplied by an
+/// external NMOS controller, and this route is **public by default** (see
+/// `api::server` — `nmos_require_auth` is opt-in), so the values reaching
+/// `apply_*_params_to_*` are untrusted. Persisting an unvalidated one produces
+/// exactly the failure mode `validate_port_conflicts_with_*` exists to prevent:
+/// the running node tolerates it (the listener just fails to bind), and the
+/// *next restart* hard-fails in `validate_config` — a box that runs for days
+/// and then refuses to boot, with no obvious link to the activation that did it.
+///
+/// The handler's error type is a bare `StatusCode`, so there is nowhere to put
+/// a reason for the controller. Emit a Warning event instead: without it a
+/// refused activation is invisible on the node that refused it.
+fn reject_activation(
+    state: &AppState,
+    flow_id: &str,
+    kind: &str,
+    resource_id: &Uuid,
+    entity_id: &str,
+    reason: &str,
+) -> StatusCode {
+    tracing::warn!(
+        "IS-05 {kind} activation refused for {resource_id} (entity '{entity_id}'): {reason}"
+    );
+    if let Some(ref tx) = state.event_sender {
+        tx.emit_flow_with_details(
+            EventSeverity::Warning,
+            category::NMOS,
+            format!("IS-05 {kind} activation refused: {reason}"),
+            flow_id,
+            serde_json::json!({
+                "subsystem": "is-05",
+                "action": format!("{kind}_activation_refused"),
+                "error_code": "invalid_transport_params",
+                "resource_id": resource_id.to_string(),
+                "entity_id": entity_id,
+                "error": reason,
+            }),
+        );
+    }
+    StatusCode::BAD_REQUEST
+}
+
 /// Apply a staged `TransportParamSet` to an `OutputConfig` in-place.
 ///
 /// Operates through `serde_json::Value` rather than per-variant match: for
@@ -338,6 +384,30 @@ async fn patch_sender_staged(
             })?;
 
         if let Some(new_output) = apply_result {
+            // Validate the patched entity BEFORE the runtime is touched — the
+            // controller's `destination_ip` / `source_port` reach this point
+            // unchecked, and `apply_sender_params_to_output` only round-trips
+            // through serde, which type-checks the shape but happily accepts
+            // "not-an-ip:5004" as a String. See `reject_activation`.
+            if let Err(e) = crate::config::validation::validate_output(&new_output) {
+                return Err(reject_activation(
+                    &state, &sender_flow_id, "sender", &uuid, &output_id, &e.to_string(),
+                ));
+            }
+            // Cross-entity check against the prospective config: a rewritten
+            // `bind_addr` / `local_addr` moves a *local* port, so it can newly
+            // collide with another input, output or tunnel on this node.
+            let conflict = {
+                let cfg = state.config.read().await;
+                crate::config::validation::validate_port_conflicts_with_output(&cfg, &new_output)
+                    .err()
+            };
+            if let Some(e) = conflict {
+                return Err(reject_activation(
+                    &state, &sender_flow_id, "sender", &uuid, &output_id, &e.to_string(),
+                ));
+            }
+
             // Hot-swap: remove then add the patched output. If the remove
             // succeeds but add fails the flow ends up with one fewer
             // output; we surface that to the NMOS client as a 500 so it
@@ -573,6 +643,42 @@ async fn patch_receiver_staged(
                     f.input_ids.first().cloned()
                 })
             };
+
+            // Validate the prospective input BEFORE destroying the flow. The
+            // receiver path is the more destructive of the two: it tears the
+            // flow down and recreates it from the patched input, then persists.
+            // An unchecked `source_port` therefore takes the flow off air AND
+            // seeds a config that refuses to boot. See `reject_activation`.
+            //
+            // `None` here means the patch is a no-op below (the write is
+            // guarded by the same lookup), so there is nothing to validate.
+            let prospective = {
+                let cfg = state.config.read().await;
+                active_input_id
+                    .as_ref()
+                    .and_then(|id| cfg.inputs.iter().find(|i| &i.id == id))
+                    .map(|def| {
+                        let mut d = def.clone();
+                        d.config = new_input.clone();
+                        d
+                    })
+            };
+            if let Some(def) = prospective {
+                if let Err(e) = crate::config::validation::validate_input_definition(&def) {
+                    return Err(reject_activation(
+                        &state, &receiver_flow_id, "receiver", &uuid, &def.id, &e.to_string(),
+                    ));
+                }
+                let conflict = {
+                    let cfg = state.config.read().await;
+                    crate::config::validation::validate_port_conflicts_with_input(&cfg, &def).err()
+                };
+                if let Some(e) = conflict {
+                    return Err(reject_activation(
+                        &state, &receiver_flow_id, "receiver", &uuid, &def.id, &e.to_string(),
+                    ));
+                }
+            }
 
             // Update config.inputs[...], destroy+recreate the flow with the
             // resolved new input set, persist.
@@ -879,4 +985,124 @@ fn active_receiver_params(
         activation: None,
         master_enable: true,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A minimal UDP output. `dest_addr` is the sender-side address IS-05
+    /// rewrites from `destination_ip` / `destination_port`.
+    fn udp_output(dest: &str) -> OutputConfig {
+        serde_json::from_value(serde_json::json!({
+            "type": "udp",
+            "id": "out-1",
+            "name": "OUT",
+            "active": true,
+            "dest_addr": dest,
+        }))
+        .expect("fixture must deserialise")
+    }
+
+    /// A minimal UDP input. `bind_addr` is the receiver-side address IS-05
+    /// rewrites from `interface_ip` / `source_port`.
+    fn udp_input(bind: &str) -> InputConfig {
+        serde_json::from_value(serde_json::json!({
+            "type": "udp",
+            "bind_addr": bind,
+        }))
+        .expect("fixture must deserialise")
+    }
+
+    /// Wrap a patched `InputConfig` back into the definition the validator
+    /// actually takes. `InputConfig` is `#[serde(flatten)]`-ed into
+    /// `InputDefinition`, so the id/name/active fields sit alongside it.
+    fn input_def(config: InputConfig) -> crate::config::models::InputDefinition {
+        crate::config::models::InputDefinition {
+            id: "in-1".to_string(),
+            name: "IN".to_string(),
+            active: true,
+            group: None,
+            config,
+        }
+    }
+
+    /// The gap this validation closes: `apply_sender_params_to_output` only
+    /// round-trips through serde, which type-checks the *shape* and happily
+    /// accepts a non-address as a String. Before the check was added, this
+    /// value was hot-swapped into the runtime and persisted — and only
+    /// `validate_config` on the NEXT BOOT rejected it, turning an NMOS
+    /// activation into a delayed crash-loop.
+    #[test]
+    fn patched_output_with_a_bogus_ip_is_rejected_by_validation() {
+        let params = TransportParamSet {
+            destination_ip: Some("not-an-ip".to_string()),
+            ..Default::default()
+        };
+        let patched = apply_sender_params_to_output(&udp_output("239.0.0.1:5004"), &params)
+            .expect("patch must not error")
+            .expect("patch must report a change");
+
+        // The patch itself succeeds — that is precisely why the gap existed.
+        // Validation is what catches it.
+        assert!(
+            crate::config::validation::validate_output(&patched).is_err(),
+            "validate_output must reject a non-address destination"
+        );
+    }
+
+    #[test]
+    fn patched_output_with_a_valid_address_still_passes() {
+        let params = TransportParamSet {
+            destination_ip: Some("239.0.0.9".to_string()),
+            destination_port: Some(5006),
+            ..Default::default()
+        };
+        let patched = apply_sender_params_to_output(&udp_output("239.0.0.1:5004"), &params)
+            .expect("patch must not error")
+            .expect("patch must report a change");
+        assert!(
+            crate::config::validation::validate_output(&patched).is_ok(),
+            "a legitimate IS-05 activation must not be refused"
+        );
+    }
+
+    /// Receiver twin. The receiver path is the more destructive one — it tears
+    /// the flow down and rebuilds it from the patched input — so an invalid
+    /// `interface_ip` took the flow off air *and* seeded an unbootable config.
+    #[test]
+    fn patched_input_with_a_bogus_interface_ip_is_rejected_by_validation() {
+        let params = TransportParamSet {
+            interface_ip: Some("999.999.999.999".to_string()),
+            ..Default::default()
+        };
+        let patched = apply_receiver_params_to_input(&udp_input("0.0.0.0:5004"), &params)
+            .expect("patch must not error")
+            .expect("patch must report a change");
+
+        let def = input_def(patched);
+        assert!(
+            crate::config::validation::validate_input_definition(&def).is_err(),
+            "validate_input_definition must reject a non-address interface_ip"
+        );
+    }
+
+    /// A port-only move is well-formed, so entity validation passes — this is
+    /// the case that needs the *cross-entity* port-conflict check, not
+    /// `validate_input_definition`. Pins that distinction.
+    #[test]
+    fn port_only_move_is_well_formed_and_needs_the_cross_entity_check() {
+        let params = TransportParamSet {
+            source_port: Some(9001),
+            ..Default::default()
+        };
+        let patched = apply_receiver_params_to_input(&udp_input("0.0.0.0:5004"), &params)
+            .expect("patch must not error")
+            .expect("patch must report a change");
+        let def = input_def(patched);
+        assert!(
+            crate::config::validation::validate_input_definition(&def).is_ok(),
+            "a port move is entity-valid; only validate_port_conflicts_with_input catches a clash"
+        );
+    }
 }
