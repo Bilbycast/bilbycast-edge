@@ -1198,19 +1198,114 @@ fn nvenc_unavailable_diagnostic(hw: &HwCodecCapability) -> Option<HwEncoderDiagn
     let detail = match failure {
         EncoderFailure::Busy => {
             "NVENC session slots exhausted — another process is holding all encode sessions"
+                .to_string()
         }
-        _ if node_present => {
-            "NVIDIA driver present but device unopenable — check the service \
-             DeviceAllow / cgroup sandbox (see installation.md)"
-        }
+        // A stale kernel module is by far the most common cause of a
+        // present-but-unopenable NVIDIA stack, and it is silent: the box
+        // keeps running, the encode just degrades to CPU. Name it exactly
+        // rather than sending the operator to the DeviceAllow runbook.
+        _ if node_present => match nvidia_driver_version_mismatch() {
+            Some((kernel, userspace)) => format!(
+                "NVIDIA kernel module {kernel} does not match userspace libraries \
+                 {userspace} — the driver packages were upgraded without reloading the \
+                 module (typically unattended-upgrades). Reboot, or reload nvidia.ko, to \
+                 restore NVENC. Consider holding the nvidia-*/libnvidia-* packages on \
+                 GPU nodes so an unattended upgrade cannot silently drop encoding to CPU."
+            ),
+            None => "NVIDIA driver present but device unopenable — check the service \
+                     DeviceAllow / cgroup sandbox (see installation.md)"
+                .to_string(),
+        },
         _ => "no /dev/nvidia* device nodes — the NVIDIA driver is not installed or nvidia.ko \
-              is not loaded",
+              is not loaded"
+            .to_string(),
     };
     Some(HwEncoderDiagnostic {
         family: "nvenc".into(),
         status: status.into(),
-        detail: detail.into(),
+        detail,
     })
+}
+
+/// `true` for a dotted numeric version token such as `580.159.03`.
+fn is_dotted_version(token: &str) -> bool {
+    token.contains('.')
+        && token.chars().all(|c| c.is_ascii_digit() || c == '.')
+        && token.starts_with(|c: char| c.is_ascii_digit())
+}
+
+/// Pull the driver version out of `/proc/driver/nvidia/version` contents.
+///
+/// The line reads like
+/// `NVRM version: NVIDIA UNIX x86_64 Kernel Module  580.159.03  Fri Apr 24 …`.
+/// The surrounding prose varies by driver branch and architecture, so this
+/// takes the first dotted-numeric token rather than anchoring on position.
+fn parse_nvrm_version(contents: &str) -> Option<String> {
+    contents
+        .lines()
+        .find(|l| l.starts_with("NVRM version:"))?
+        .split_whitespace()
+        .find(|tok| is_dotted_version(tok))
+        .map(str::to_string)
+}
+
+/// Pull the driver version out of a versioned NVIDIA library filename —
+/// `libnvidia-encode.so.580.173.02` → `580.173.02`.
+fn parse_nvidia_lib_version(file_name: &str, stem: &str) -> Option<String> {
+    let suffix = file_name.strip_prefix(stem)?.strip_prefix(".so.")?;
+    is_dotted_version(suffix).then(|| suffix.to_string())
+}
+
+/// Directories searched for the versioned NVIDIA userspace libraries.
+/// Covers Debian/Ubuntu multiarch and the RHEL/Fedora `lib64` layout.
+const NVIDIA_LIB_DIRS: &[&str] = &[
+    "/usr/lib/x86_64-linux-gnu",
+    "/usr/lib/aarch64-linux-gnu",
+    "/usr/lib64",
+    "/usr/lib",
+];
+
+/// Library stems whose soname carries the userspace driver version.
+/// `libcuda` is the fallback: NVENC hosts always have it, whereas
+/// `libnvidia-encode` is absent on decode-only installs.
+const NVIDIA_VERSIONED_LIBS: &[&str] = &["libnvidia-encode", "libcuda"];
+
+/// Userspace NVIDIA driver version, read from the versioned library soname.
+/// Deliberately avoids NVML — that is behind an optional Cargo feature, and
+/// on a mismatched host `nvmlInit` is exactly what fails.
+fn nvidia_userspace_version() -> Option<String> {
+    for dir in NVIDIA_LIB_DIRS {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            for stem in NVIDIA_VERSIONED_LIBS {
+                if let Some(v) = parse_nvidia_lib_version(&name, stem) {
+                    return Some(v);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Loaded kernel-module version, or `None` when `nvidia.ko` is not loaded.
+fn nvidia_kernel_module_version() -> Option<String> {
+    parse_nvrm_version(&std::fs::read_to_string("/proc/driver/nvidia/version").ok()?)
+}
+
+/// `Some((kernel, userspace))` when both versions resolve **and** disagree.
+///
+/// Upgrading the NVIDIA packages without rebooting leaves the running
+/// `nvidia.ko` older than the userspace libraries; `cuInit` then fails with
+/// `CUDA_ERROR_COMPAT_NOT_SUPPORTED_ON_DEVICE` and every HW encode silently
+/// falls back to CPU. Hardware-confirmed on bilby-z440, where it went
+/// unnoticed for three days because the only symptom was elevated CPU.
+fn nvidia_driver_version_mismatch() -> Option<(String, String)> {
+    let kernel = nvidia_kernel_module_version()?;
+    let userspace = nvidia_userspace_version()?;
+    (kernel != userspace).then_some((kernel, userspace))
 }
 
 /// QSV diagnostic. `None` unless QSV is compiled in yet unavailable. The
@@ -3612,6 +3707,66 @@ mod tests {
             let advertised = render_node_matches(nodes, QSV_DRM_DRIVERS) && opened;
             assert_eq!(advertised, expected, "{case}");
         }
+    }
+
+    /// Real `/proc/driver/nvidia/version` contents from bilby-z440 during
+    /// the 2026-07-25 mismatch incident.
+    #[test]
+    fn parses_nvrm_version_from_real_proc_contents() {
+        let contents = "NVRM version: NVIDIA UNIX x86_64 Kernel Module  580.159.03  \
+                        Fri Apr 24 06:16:47 UTC 2026\nGCC version:\n";
+        assert_eq!(parse_nvrm_version(contents).as_deref(), Some("580.159.03"));
+    }
+
+    #[test]
+    fn parses_nvrm_version_on_other_architectures() {
+        // aarch64 line carries a different arch token in the same position.
+        let contents = "NVRM version: NVIDIA UNIX aarch64 Kernel Module  535.104.05  \
+                        Sat Aug 19 01:15:15 UTC 2023\n";
+        assert_eq!(parse_nvrm_version(contents).as_deref(), Some("535.104.05"));
+    }
+
+    #[test]
+    fn nvrm_version_absent_when_module_not_loaded() {
+        assert_eq!(parse_nvrm_version(""), None);
+        assert_eq!(parse_nvrm_version("something else entirely\n"), None);
+    }
+
+    #[test]
+    fn parses_versioned_library_soname() {
+        assert_eq!(
+            parse_nvidia_lib_version("libnvidia-encode.so.580.173.02", "libnvidia-encode")
+                .as_deref(),
+            Some("580.173.02")
+        );
+        assert_eq!(
+            parse_nvidia_lib_version("libcuda.so.580.173.02", "libcuda").as_deref(),
+            Some("580.173.02")
+        );
+        // The unversioned symlinks must not be mistaken for a version.
+        assert_eq!(
+            parse_nvidia_lib_version("libnvidia-encode.so", "libnvidia-encode"),
+            None
+        );
+        assert_eq!(
+            parse_nvidia_lib_version("libnvidia-encode.so.1", "libnvidia-encode"),
+            None
+        );
+        // Wrong stem must not match a same-prefixed library.
+        assert_eq!(
+            parse_nvidia_lib_version("libcudart.so.12.4.99", "libcuda"),
+            None
+        );
+    }
+
+    #[test]
+    fn dotted_version_rejects_non_versions() {
+        assert!(is_dotted_version("580.159.03"));
+        assert!(is_dotted_version("12.4"));
+        assert!(!is_dotted_version("580")); // no dot
+        assert!(!is_dotted_version("Module")); // no digits
+        assert!(!is_dotted_version("x86_64")); // not dotted-numeric
+        assert!(!is_dotted_version("")); // empty
     }
 
     /// No render nodes at all is still unambiguously `no_driver`.
