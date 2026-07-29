@@ -93,8 +93,12 @@ for entry in "${LIBS[@]}"; do
     [[ "${TAGSHA[$t]}" == "$pinned_sha" ]] && { pinned_tag="$t"; break; }
   done
 
+  # Guard every negative index explicitly: under `set -u`, ${arr[-1]} on an
+  # empty array writes "bad array subscript" to stderr even when a :- default
+  # rescues the value. In a security job that stray line reads like a defect.
   mapfile -t stable < <(printf '%s\n' "${!TAGSHA[@]}" | grep -E "$stable_re" | sort -V)
-  latest="${stable[-1]:-}"
+  latest=""
+  (( ${#stable[@]} > 0 )) && latest="${stable[-1]}"
 
   if [[ -z "$pinned_tag" ]]; then
     printf '%-10s %-12s %-12s %s\n' "$name" "${pinned_sha:0:9}" "${latest:-?}" \
@@ -109,7 +113,8 @@ for entry in "${LIBS[@]}"; do
   for t in "${stable[@]}"; do
     [[ "$(series_of "$t")" == "$want" ]] && in_series+=("$t")
   done
-  latest_in_series="${in_series[-1]:-$pinned_tag}"
+  latest_in_series="$pinned_tag"
+  (( ${#in_series[@]} > 0 )) && latest_in_series="${in_series[-1]}"
 
   if [[ "$pinned_tag" != "$latest_in_series" ]]; then
     printf '%-10s %-12s %-12s %s\n' "$name" "$pinned_tag" "$latest_in_series" \
