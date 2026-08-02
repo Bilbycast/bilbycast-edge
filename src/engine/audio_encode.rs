@@ -678,7 +678,8 @@ impl AudioEncoder {
             let ratio = params.target_sample_rate as f64 / params.sample_rate as f64;
             let sinc_params = rubato::SincInterpolationParameters {
                 sinc_len: 64,
-                f_cutoff: 0.92,
+                // Explicit cutoff — rubato 4's `None` would derive its own.
+                f_cutoff: Some(0.92),
                 interpolation: rubato::SincInterpolationType::Linear,
                 oversampling_factor: 128,
                 window: rubato::WindowFunction::Hann,

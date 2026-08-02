@@ -79,13 +79,16 @@ bilbycast-edge is a media gateway supporting multiple transport protocols for pr
 
 ### Bonded (multi-path aggregation)
 - **Direction:** Input and Output
-- **Transport:** N heterogeneous paths over UDP, QUIC (RFC 9221 DATAGRAM),
-  or RIST Simple Profile, chosen per-path
+- **Transport:** N heterogeneous aggregation legs over UDP or QUIC
+  (RFC 9221 DATAGRAM), chosen per-leg. (RIST is unidirectional at the
+  bond layer, so it is not selectable as an aggregation leg.)
 - **Payload:** Any bytes — MPEG-TS, RTP, or raw — framed inside a 12-byte
   bond header with 32-bit sequence across all paths
-- **Scheduler:** `media_aware` (default, walks H.264/HEVC NAL units and
-  duplicates IDR frames across the two lowest-RTT paths), `weighted_rtt`,
-  or `round_robin`
+- **Scheduler:** `adaptive` (default — capacity-aware, congestion-controlled:
+  discovers each leg's usable bandwidth and splits the stream to track
+  measured capacity while duplicating H.264/HEVC IDR frames across the two
+  best paths), `media_aware` (legacy RTT-only split, superseded by
+  `adaptive`), `weighted_rtt`, or `round_robin`
 - **Why it exists:** Peplink-class path aggregation for broadcast —
   outperforms per-protocol bonding (SRT groups, RIST 2022-7) on mixed-link
   heterogeneous scenarios (5G + Starlink + fibre), with frame-accurate
@@ -107,6 +110,20 @@ bilbycast-edge is a media gateway supporting multiple transport protocols for pr
   universal option for N ≥ 2 heterogeneous links carrying any inner
   protocol — see [bonding.md](bonding.md) for the full config schema,
   worked examples, and tuning guidance.
+
+### Synthetic / local inputs (`test_pattern`, `media_player`, `replay`)
+- **Direction:** Input
+- **`test_pattern`** — generates a synthetic colour-bar / test raster with
+  optional screen-ID text, tone/beep ident, and an A/V-sync sweep, muxed as
+  a paced MPEG-TS on the flow's broadcast channel. No source required.
+- **`media_player`** (default-on `replay`/`media-codecs` build) — replays a
+  playlist of local assets (TS / MP4 / MOV / MKV / still image) from the
+  edge's media library (`BILBYCAST_MEDIA_DIR`) as a paced fresh MPEG-TS.
+  Supports `loop_playback`, `shuffle`, optional `paced_bitrate_bps`
+  (TS-only), and optional MPTS→SPTS `program_number` down-selection.
+- **`replay`** (default-on `replay` feature) — plays a recorded clip or
+  recording back into the flow as a fresh input, driven by the replay
+  command channel (cue / play / scrub). See [replay.md](replay.md).
 
 ## Output Protocols
 
@@ -180,15 +197,16 @@ bilbycast-edge is a media gateway supporting multiple transport protocols for pr
 - **Use case:** Delivering to Twitch, YouTube Live, Facebook Live; ingesting from OBS, Wirecast, ffmpeg
 - **Features:**
   - Pure Rust RTMP protocol implementation (handshake, chunking, AMF0)
-  - Demuxes H.264 and AAC from MPEG-2 TS, muxes into FLV
+  - Demuxes H.264 or HEVC and AAC from MPEG-2 TS, muxes into FLV
   - Automatic AVC sequence header (SPS/PPS) and AAC config generation
+  - **H.264 rides classic FLV; HEVC rides Enhanced RTMP v2** (extended VideoTagHeader, `hvc1` FourCC, hvcC assembled from cached VPS/SPS/PPS). Both passthrough and re-encode (`video_encode`) HEVC take the E-RTMP path
   - Reconnection with configurable delay and max attempts
   - Non-blocking: uses mpsc bridge pattern, never blocks other outputs
   - **MPTS-aware:** on an MPTS input, selects program by `program_number` or (default) locks onto the lowest-numbered program in the PAT
   - **Optional `audio_encode` block (Phase B):** re-encodes the input AAC so the operator can normalise bitrate / sample rate / channel count or upgrade to HE-AAC v1/v2 (`aac_lc`, `he_aac_v1`, `he_aac_v2`). With the default `fdk-aac` feature these AAC profiles encode **in-process** via Fraunhofer FDK AAC — no ffmpeg dependency. (ffmpeg is only needed as a subprocess fallback when `fdk-aac` is off.) Same-codec passthrough fast path skips both decoder and encoder when the source is already AAC-LC and no overrides are set (disabled when `transcode` is set). Outputs without `audio_encode` need no codec libraries at all. See [audio-gateway.md](audio-gateway.md#the-audio_encode-block--compressed-audio-egress-rtmp--hls--webrtc).
   - **Optional companion `transcode` block:** channel shuffle / sample-rate conversion applied to the decoded PCM before re-encoding. See [transcoding.md](transcoding.md#transcode--channel-shuffle--sample-rate-conversion).
 - **Limitations:**
-  - Only H.264 video and AAC audio. HEVC/VP9 not supported via RTMP.
+  - VP9 / AV1 not supported via RTMP (H.264 + HEVC video, AAC audio only).
   - RTMPS (TLS) uses the `tls` feature (enabled by default).
   - Single-program by spec — only one program can be published per output.
 
@@ -302,11 +320,11 @@ bilbycast-edge is a media gateway supporting multiple transport protocols for pr
 - **2022-7 Red/Blue:** per-input and per-output via the existing
   `redundancy` field.
 - **Feature gating:** ST 2110-20 **inputs** require a compile-time
-  `video-encoder-*` feature (x264 / x265 / NVENC) or the
+  `video-encoder-*` feature (x264 / x265 / NVENC / QSV / VAAPI) or the
   `video-encoders-full` composite. The default `cargo build` has no
   software video encoders, so it will deserialize the config but the
-  encode worker logs an error and drops frames. The `*-linux-full`
-  release binary includes all three encoders. ST 2110-20 **outputs**
+  encode worker logs an error and drops frames. The `*-full`
+  release binary bundles every encoder. ST 2110-20 **outputs**
   only need the `media-codecs` feature (default on).
 - **NMOS:** advertised as `urn:x-nmos:format:video` in IS-04 with
   BCP-004 receiver caps declaring `video/raw`,
@@ -352,6 +370,52 @@ bilbycast-edge is a media gateway supporting multiple transport protocols for pr
 - **Status:** Gated by the `mxl` Cargo feature, which is **OFF by default** (heavy build prerequisites — see [`mxl-integration-plan.md`](mxl-integration-plan.md) and `bilbycast-mxl-rs/CLAUDE.md`).
 - **Variants:** three input variants and three output variants — `mxl_video` (V210 4:2:2 10-bit), `mxl_audio` (Float32 PCM @ 48 kHz), `mxl_anc` (RFC 8331 ANC) — mirroring the ST 2110-20/-30/-40 pattern over the EBU / Linux Foundation same-host shared-memory bus.
 - **PTP:** mandatory at validation time (`master_clock = wallclock` is rejected on MXL flows). The boot probe dlopens `libmxl.so` and only advertises the `mxl-video` / `mxl-audio` / `mxl-anc` capability bits when it loads successfully.
+
+### SDI (Blackmagic DeckLink) — behind the `sdi-decklink` feature
+
+- **Direction:** Input and Output (config `type: "sdi"`)
+- **Status:** Gated by the `sdi-decklink` Cargo feature — **off** in a plain
+  `cargo build`, but compiled into every `*-full` release artefact (on both
+  arches, when `DECKLINK_SDK_TOKEN` is present at build time). Also requires
+  `media-codecs` (default on). Talks to the Blackmagic DeckLink SDK directly
+  via a C++ shim through the sibling `bilbycast-decklink-rs` crate — **not**
+  FFmpeg's `decklink` avdevice, which hides `bmdFrameHasNoInputSource` and
+  makes a pulled cable indistinguishable from a live feed.
+- **Input (capture):** UYVY422 8-bit capture → encoder (any backend:
+  x264 / x265 / NVENC / QSV / VAAPI / `*_auto`) + embedded-PCM → AAC →
+  shared `TsMuxer` → the flow's broadcast channel. VANC trigger/metadata
+  extraction: SCTE-104/35 (→ SCTE-35 PID), SMPTE 12M ATC timecode, and
+  CEA-608/708 caption presence. Signal-loss is surfaced as
+  `sdi_signal_lost` / `sdi_signal_restored` events (the card's bars keep
+  encoding so the TS stays up).
+- **Output (playout):** broadcast → `TsDemuxer` → `VideoDecoder` →
+  `pack_uyvy422` → DeckLink playout on the card's clock, with hardware A/V
+  sync (video + audio placed from their own source PTS on a shared 90 kHz
+  timeline) and optional SCTE-35→SCTE-104 VANC injection.
+- **Clocking:** self-clocked, no PTP requirement; SDI flows take the
+  Wallclock master-clock kind, with a per-input `SourcePcr` `ClockIdentity`
+  (two un-genlocked ports are not co-clocked).
+- **Runtime:** `libDeckLinkAPI.so` is `dlopen`ed by Blackmagic Desktop
+  Video; the boot probe enumerates cards and advertises the `sdi-decklink`
+  capability bit only on success. Per-port hardware health rides
+  `HealthPayload.sdi_devices[]`. Full reference: [`docs/sdi.md`](sdi.md).
+
+### Local-display output (HDMI / DisplayPort + ALSA) — the `display` feature
+
+- **Direction:** Output only (config `type: "display"`)
+- **Status:** Gated by the `display` Cargo feature (**on by default**,
+  Linux-only effect). Decodes the flow's video + audio and renders to a KMS
+  connector (HDMI / DisplayPort) plus an ALSA audio device — a confidence /
+  playout monitor with no network egress.
+- **Pipeline:** demux + decode (`VideoDecoder` + AAC/MP2/AC-3/E-AC-3/Opus
+  audio) → KMS/DRM atomic-commit page flip (zero-copy VAAPI DMA-BUF scanout
+  where available, CPU-blit fallback otherwise) + blocking ALSA playback.
+  A/V sync is audio-master (the ALSA write clock drives the display task's
+  dup/drop). Optional audio-bars overlay, HDR-on-HDR passthrough with
+  HDR-on-SDR tonemap fallback, and bob deinterlacing.
+- **Runtime:** capability `"display"` advertised only when the feature is on
+  **and** ≥ 1 KMS connector enumerates; `HealthPayload.display_devices`
+  carries the connector list for the manager UI's dropdown.
 
 ## MPEG-TS Program Handling
 

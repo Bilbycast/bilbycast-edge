@@ -254,9 +254,13 @@ The handle exposes a per-flow lipsync offset in 90 kHz ticks, bounded
 operators nudge it via the WS command `set_master_clock_lipsync` — see
 `bilbycast-manager/docs/...` for the REST mirror.
 
-The trim is currently surfaced in telemetry but not yet applied to
-output PTS values (the field is plumbed through to make the future
-audio-delay path mechanical).
+The trim is applied to output PTS: `engine::ts_pts_rewriter` folds
+`lipsync_offset_90k` into the anchored PES PTS/DTS **on audio PIDs only**
+(`anchor_out_90k = master.now_27mhz()/300 + PCR_PREROLL_90K +
+lipsync_offset_90k`), and it is surfaced on `FlowStats.master_clock`. It
+shifts audio relative to video; a positive value moves audio later. It
+does not retime video PIDs (see the "Encoder-style PES PTS regeneration"
+and "Known limitations" sections).
 
 ## Telemetry
 

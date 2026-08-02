@@ -185,6 +185,25 @@ cascade's PLL rung). Emitted by the per-flow fallback watcher in
 
 ---
 
+### Source clock discontinuities (`flow`)
+
+The PCR-ingress sampler that feeds the master-clock PLL also watches the
+**source** timing for discontinuities and raises a Warning `flow` event on
+each. These describe the incoming stream (a stream-source change, a looping
+file wrapping, a splicer stepping the clock), not a fault in the edge — a
+single discontinuity is expected on input switches and loop points. Each is
+debounced so a churning source doesn't flood the feed.
+
+| Severity | Message | Trigger | Details |
+|----------|---------|---------|---------|
+| warning | source PCR discontinuity on flow '{id}' (input '{id}'): {n} ms jump | The source PCR jumped by > 500 ms in either direction. | `{ error_code: "source_pcr_discontinuity", input_id, prev_pcr_27mhz, new_pcr_27mhz, gap_ms }` |
+| warning | source PTS discontinuity on flow '{id}' (input '{id}', PID 0x{pid}): {n} ms jump | A per-PID PES PTS made a backward jump. | `{ error_code: "source_pts_discontinuity", input_id, pid, prev_pts_90khz, new_pts_90khz, gap_ms }` |
+| warning | source DTS discontinuity on flow '{id}' (input '{id}', PID 0x{pid}): {n} ms jump | A per-PID PES DTS made a backward jump (video reorder streams). | `{ error_code: "source_dts_discontinuity", input_id, pid, prev_dts_90khz, new_dts_90khz, gap_ms }` |
+
+**Source**: `src/engine/pcr_ingress_sampler.rs`.
+
+---
+
 ### Bandwidth (`bandwidth`)
 
 | Severity | Message | Trigger | Details |
@@ -245,6 +264,26 @@ meant to complement the live stats pane.
 | warning | bonded {input\|output} path '{name}' (#{id}) interface lost — pinned NIC or source address disappeared | The pinned interface (or bound source address) vanished under a UDP leg. Emitted once per disappearance; a later `PathDead` (keepalive timeout) and an eventual `socket rebuilt: interface_restored` follow independently | `{ error_code: "bond_interface_lost", path_id, path_name, scope }` |
 | warning | bonded output '{id}': payload N B exceeds the per-datagram budget M B and is not 188-byte-aligned TS | Oversized **TS** payloads are re-chunked at 188-byte packet boundaries to fit the configured `path_mtu` (default 1500) and never trigger this. The warning fires only for a payload that is **not 188-aligned** (non-TS essence) and therefore cannot be re-chunked — it is sent whole (never dropped) and will IP-fragment on a leg whose MTU it exceeds. Budget = `path_mtu` − IP/UDP (28 IPv4 / 48 for IPv6 literals or hostnames) − relay tunnel framing (16/44 B on relay legs) − RIST/RTP framing (12 B on RIST legs) − bond header (12 v1 / 16 v2) − AEAD envelope (29 B when `encryption_key` is set) − FEC repair headroom (when FEC is configured). Emitted **once per output**, with the running count on `BondLegStats.oversize_payloads` | `{ error_code: "bond_payload_exceeds_mtu", output_id, payload_bytes, budget_bytes }` |
 | critical | bonded output '{id}': gateway route for path '{name}' (via {gw}) is gone and re-programming failed | The 5 s route-integrity re-assert (`BondRouteManager::is_intact`) found the leg's policy route missing (kernel flushes the private table on link-down / device-destroy without any watcher-visible signal) and `program()` failed — usually because the device is still absent (USB re-enumeration). Emitted once per failing streak; the re-assert keeps retrying every 5 s and logs a warn on the eventual repair. Until repaired the leg rides the main default route (cosmetic bond) | `{ error_code: "bond_gateway_route_lost", output_id, path_id, path_name, gateway }` |
+| warning | bonded {input\|output} path '{name}' reconnecting: {reason} | The leg's link dropped or is failing to (re)establish and the transport is re-dialing in the background (QUIC self-redial). Carries the **specific** cause so the operator sees *why* a leg won't come up — beyond the generic keepalive-timeout `PathDead`. Emitted once per down-episode by the transport (not flap-deduped here) | `{ error_code: "bond_leg_reconnecting", reason }` |
+| info / warning | bonded output '{id}' leg '{name}' (#{id}) diagnosis: {headline} | Per-leg self-diagnosis of a degraded / dead leg. **Info** when the leg is healthy again, **Warning** otherwise. Carries a plain-English headline, a suggested fix, and the per-check detail (RTT / loss / egress-interface findings) | `{ error_code: "bond_leg_diagnosis", path_id, path_name, headline, suggested_fix, checks, chosen_egress_interface, flow_id }` |
+| warning | bonded output '{id}' leg '{name}': bond protocol version mismatch — peer reports v{v}, this end equalization-stamps v2 | The peer bonded input reports bond-protocol v1 but this output equalization-stamps v2 — the peer can't parse the v2 header, so the leg stays on v1 (no equalization). Enable equalization (auto/on) on **both** ends to clear it | `{ error_code: "bond_protocol_version_mismatch", component, output_id, path_id, path_name, peer_version, local_version, flow_id }` |
+| warning | ingress_dejitter_ms ignored on bonded input '{id}' (would shed bond bursts) | A per-input `ingress_dejitter_ms` was set on a **bonded** input — silently ignored because the rate-paced de-jitter servo would shed the bond's bursty delivery (15–30 % loss). Use `hold_ms` / `max_bonding_latency_ms` to control bond latency instead | `{ error_code: "bond_ingress_dejitter_ignored", input_id }` |
+
+Three further bond-related alarms are emitted **under a different category**
+than `bond`, so a `category:bond` filter alone will not surface them — the
+shared-leg capacity broker's two events ride category **`bonding`**, and the
+unencrypted-legs warning rides category **`media`**:
+
+| Severity | Message | Trigger | Details |
+|----------|---------|---------|---------|
+| warning | shared uplink '{key}' can't honour its priority flows: {n} Mbps short of the reserved demand of its Critical/Normal flow(s) | **Category `bonding`.** The shared-leg capacity broker found a shared uplink carrying ≥ 2 bonded flows that can't meet the reserved demand of its Critical/Normal-tier flows (bonded-output priority tiers are critical / normal / best_effort, default best_effort) | `{ error_code: "bond_leg_oversubscribed", leg, capacity_bps, member_count, unmet_bps, guaranteed_unmet_bps, min_viable_bps }` |
+| info | shared uplink '{key}' no longer over-subscribed | **Category `bonding`.** Recovery counterpart to `bond_leg_oversubscribed` | `{ error_code: "bond_leg_oversubscribed_cleared", leg }` |
+| warning | bonded flow admitted onto over-subscribed shared uplink '{leg}' — combined min-viable rates exceed its capacity | **Category `bonding`.** Advisory-by-default P4 admission check: a flow landed on a shared uplink whose co-resident flows' combined min-viable rates exceed its capacity (refuses only under strict mode) | `{ error_code: "bond_leg_admission_pressure", leg }` |
+| warning | bonded output '{id}': {n} UDP leg(s) unencrypted — set encryption_key for confidentiality | **Category `media`.** One or more UDP bond legs carry media in the clear (no `encryption_key`). Set a 64-hex-char key (same value on the bonded input) to ChaCha20-encrypt UDP legs; QUIC legs are always TLS | `{ error_code: "bond_legs_unencrypted", component, output_id, udp_legs }` |
+
+(`bond_leg_oversubscribed`, `bond_ingress_dejitter_ignored`, and
+`bond_legs_unencrypted` are also described in prose in
+[`docs/bonding.md`](bonding.md).)
 
 **`reason`** (on path-dead events) is one of `keepalive_timeout`,
 `receive_timeout`, `transport_error`. Per-path alive/dead events are
@@ -278,8 +317,11 @@ and event generation live inside `bilbycast-bonding` at
 | warning | Redundant leg 1 lost | SRT redundant leg 1 stopped receiving |
 | warning | Redundant leg 2 lost | SRT redundant leg 2 stopped receiving |
 | critical | Both redundant legs lost | No data from either leg, will reconnect |
+| warning | SRT redundancy on raw TS: running active-leg failover, not hitless dedup | An SRT redundant input carries **raw TS** (no shared cross-leg RTP sequence), so the merger can't do 2022-7 seq-aware dedup and falls back to active-leg failover. Configure the publisher to send RTP/TS (SMPTE ST 2022-2) for true hitless behaviour. Details: `{ error_code: "redundancy_failover_mode", format: "raw_ts", fix_hint }` |
+| warning | SMPTE 2022-7: leg SSRC mismatch — both legs must carry byte-identical RTP including SSRC | A 2022-7 dual-leg merge saw the two RTP legs carry different SSRCs; hitless dedup needs byte-identical RTP (including SSRC) on both legs. Details: `{ error_code: "redundancy_ssrc_mismatch", mismatch_count }` |
 
-**Source**: `src/engine/input_srt.rs`
+**Source**: `src/engine/input_srt.rs` (`redundancy_failover_mode`),
+`src/engine/input_rtp.rs` (`redundancy_ssrc_mismatch`)
 
 ---
 
@@ -422,6 +464,7 @@ Critical events emitted by `build_assembly_plan()` at flow bring-up and by `Flow
 | `pes_splice_completed` | Info, **PES Switch Phase 4**. PES-aligned splice committed. Audio (`kind: "audio"`, default since edge 0.64.0) commits on B's first PUSI=1 PES with `pts ≥ last_a_pts + audio_frame_duration`; video (`kind: "video"`, edge 0.66.0) additionally requires an IDR NAL in the same PES (H.264 type 5, HEVC IRAP 16..=21). Active leg has been flipped, PMT bumped (v+1 mod 32), DI=1 armed on next PCR, fresh PSI pushed. Receiver should see a glitchless cut. | `{ kind?, program_number, out_pid, to_input_id, first_b_pts }` (the `kind` field is only present on video splices for backwards compatibility with manager UIs that pre-date the video MVP) | Operator-visible confirmation that the PES-aligned path actually fired. Without this event the operator can't tell whether the splice mode is having any effect. |
 | `pes_splice_timeout` | Warning, **PES Switch Phase 4**. PES-aligned splice budget expired without B producing an aligned PES — runtime fell back to today's `pmt_bump` path (immediate flip + PMT v+1 + DI=1). Audio (`kind: "audio"`) and video (`kind: "video"`) both surface here; video timeouts usually indicate B's GoP exceeds the configured `splice_budget_ms` (default 2000 ms — longer than the audio default because the next IDR may be 1–2 s away). | `{ kind, program_number, out_pid, to_input_id }` | Usually means B's stream rate is much slower than expected, B isn't producing PUSI=1 in time, or (video only) B's next IDR didn't land inside the budget. Bump `splice_budget_ms` if expected; otherwise inspect B's ingress for buffer/jitter / GoP-length issues. |
 | `pes_splice_codec_param_mismatch` | Warning, **PES Switch Phase 4**. PES-aligned splice arrived at the right boundary but B's codec parameters differ from A's; the runtime refused the PES-aligned commit and fell back to today's `pmt_bump` path (flip + PMT v+1 + DI=1) so receivers re-initialise the decoder cleanly on the new params. The `kind` field tells the two families apart — `"audio"` for AAC `AudioSpecificConfig` differences (profile / sample_rate / channel_config; coverage extended to LATM in edge 0.67.0); `"video"` for SPS-derived differences on H.264 / HEVC slots (profile_idc / level_idc / chroma_format / bit-depth / width / height). | Audio: `{ kind: "audio", program_number, out_pid, to_input_id, a_aac_params: {profile, sample_rate_idx, sample_rate_hz, channel_config}, b_aac_params: {...} }` (kind field is the audio-MVP shape and is omitted in pre-0.67.0 events for backwards compat). Video: `{ kind: "video", program_number, out_pid, to_input_id, a_video_params: {profile_idc, level_idc, chroma_format_idc, bit_depth_luma, bit_depth_chroma, width, height}, b_video_params: {...} }`. | Operator-actionable: receivers will still recover via the PMT bump, but the cut isn't glitch-free. Re-encode the legs to a common config (same SPS for video, same AudioSpecificConfig for audio) or set the slot's `splice_mode` to `pmt_bump` deliberately to silence the event. |
+| `pes_splice_degraded` | Warning, **PES Switch**. The assembler flipped an active leg on a Switch slot but the PES-aligned commit couldn't be honoured and it degraded to today's `pmt_bump` path (flip + PMT v+1 + DI=1). This is the assembler-side generic form of the outcome — `reason` names the specific cause; `forced` is `true` when a per-switch `splice_mode_override` requested `pes_aligned`. | `{ error_code: "pes_splice_degraded", reason, forced, stream_type, program_number, out_pid, to_input_id }` | Receivers still recover via the PMT bump but the cut isn't glitch-free. Check the named leg's ingress (buffer / jitter / GoP length) and codec params against the outgoing leg. |
 | `pid_bus_slot_source_closed` | Warning, **defensive only — currently unreachable in production**: `NodeEsBus` retains a `broadcast::Sender` per `(input_id, source_pid)` key for the life of the node (no removal path), so the channel-closed condition this event guards cannot fire; the emit is kept as a tripwire in case the bus lifecycle ever changes. The operational signal for "an input-host flow stopped while sibling assemblies still reference its inputs" is **`pid_bus_slot_stalled`** (below), which latches within ~5 s of the slot going silent and names the dead source. Deliberately NOT "fixed" by dropping bus senders on host-flow stop: the fan-in task exits on channel close, so dropped senders would kill the slot permanently instead of recovering on host restart — a data-path redesign whose only payoff over the stall event is ~5 s of latency. | `{ error_code: "pid_bus_slot_source_closed", program_number, out_pid, source_input_id, source_pid }` | Should not occur. If seen, treat as `pid_bus_slot_stalled` (restart the owning flow / fix the cross-flow reference) and report the occurrence — it means the bus lifecycle changed. |
 | `pid_bus_slot_stalled` | Warning. Runtime: an assembly slot has forwarded **no ES packet for ≥ 5 s** (10 s grace after flow start; hot-swapped-in slots get their own grace from the swap). Catches the failure `pid_bus_slot_source_closed` structurally cannot: a source that is *configured but never delivers* — a never-connected SRT caller, a `pid_overrides` program-number key that matches nothing in the live PAT, a wrong `source_pid`, or a Switch slot whose **active leg** went dead while passive legs still carry bus traffic. Without it, the assembler keeps emitting PSI-only (~3 dgm/s) indefinitely and every byte-level liveness check stays green. Latched per slot — fires once per stall episode, re-arms on recovery. **Only continuous-media stream types are scanned** (MPEG-1/2/H.264/HEVC/JPEG-2000/AVS/VC-1 video; MPEG audio/AAC/LATM/AC-3/E-AC-3): sparse essences (SCTE-35 0x86, private sections 0x05, all of 0x06 — subtitles/teletext/DVB audio are indistinguishable without descriptors at plan level) are exempt so legitimately bursty PIDs never latch false alarms. Exempt slots still count in `total_slots`. The same per-slot state feeds `FlowStats.assembly_health` at 1 Hz (`total_slots`, `stalled_slot_count`, `stalled_slots[]`). | `{ error_code: "pid_bus_slot_stalled", flow_id, program_number, out_pid, input_id, source_pid, seconds_since_data }` | Check the named input's connection state and its `pid_overrides` / `source_pid` against the live PSI catalogue. For Switch slots, `input_id` is the currently-active leg. |
 | `pid_bus_slot_recovered` | Info. Runtime: first ES packet forwarded on a slot after a `pid_bus_slot_stalled` latch — the pair brackets each outage so the manager event log shows outage duration without polling. Re-arms stall detection for the slot. | `{ error_code: "pid_bus_slot_recovered", flow_id, program_number, out_pid, input_id, source_pid }` | None — confirmation the slot's source resumed. |
@@ -568,6 +611,7 @@ apply — the media player is file-backed and binds no sockets.
 | warning | Tunnel '{name}' attempt {N} failed: {error} | Direct-mode retry failed | `{ tunnel_name, attempt }` |
 | critical | Tunnel '{name}' failed: {error} | Tunnel task exited with fatal error | `{ tunnel_name }` |
 | critical | Tunnel bind rejected by relay: {reason} | HMAC bind token verification failed | `{ relay_addr }` |
+| critical | Tunnel '{name}': {N} decrypt failures and zero packets delivered in {W}s — likely tunnel_encryption_key mismatch between edges | AEAD (ChaCha20-Poly1305) decrypt kept failing on inbound tunnel traffic while nothing was delivered across a full window — almost always the two edges hold different `tunnel_encryption_key` values. Emitted once per window | `{ error_code: "tunnel_decrypt_failure", tunnel_name, decrypt_errors_window, packets_delivered_window, window_secs }` |
 
 **Source**: `src/tunnel/manager.rs`, `src/tunnel/relay_client.rs`
 
@@ -664,15 +708,18 @@ Debounced so a flapping link doesn't spam the feed. See
 
 Requires `resource_limits` config block. When `critical_action` is `"gate_flows"`, new flow creation is rejected while any metric is in the critical state. Events fire on state transitions with a configurable grace period (default 10 seconds) to avoid flapping.
 
-#### HW encoder oversubscription
+#### HW encoder / decoder oversubscription
 
 | Severity | Message | Trigger |
 |----------|---------|---------|
 | warning | Flow '{id}' caused {family} encoder oversubscription: {in_use} sessions in use, {max} probed at startup. Reduce HW transcodes or restart on a host with more capacity. | A new flow's HW `video_encode` outputs push the per-family in-use count above the startup-probed `max_sessions`. Soft warning only — the flow still starts. |
+| warning | Flow '{id}' caused {family} decoder oversubscription: {in_use} sessions in use, {max} probed at startup. Drop a HW-decoded display output or restart on a host with more capacity. | A new flow's HW **decode** sessions (NVDEC / QSV — transcode-input decode or a HW-decoded display output) push the per-family in-use count above the startup-probed `max_sessions`. Soft warning only — the flow still starts. |
 
-**Details**: `{ error_code: "hw_encoder_oversubscribed", family: "nvenc"|"qsv"|"amf", role: "encoder", in_use: u32, max_sessions: u32, flow_id }`
+**Details** (encoder): `{ error_code: "hw_encoder_oversubscribed", family: "nvenc"|"qsv"|"amf", role: "encoder", in_use: u32, max_sessions: u32, flow_id }`
 
-**Source**: `src/engine/manager.rs::create_flow` → `emit_hw_oversubscribe_warnings`. The probed-max-sessions number comes from `engine::hardware_probe::probe_encoder_session_limits` at startup (capped at 8; see [`docs/configuration-guide.md`](configuration-guide.md#capacity--resource-budget) and the `BILBYCAST_PROBE_SESSION_LIMITS=0` opt-out). Soft warning matches the existing modal `updateResourceImpact` 80/100 % units pattern — the alarm tells the operator to fix it without blocking flow creation.
+**Details** (decoder): `{ error_code: "hw_decoder_oversubscribed", family: "nvdec"|"qsv", role: "decoder", in_use: u32, max_sessions: u32, flow_id }`
+
+**Source**: `src/engine/manager.rs::create_flow` → `emit_hw_oversubscribe_warnings`. The probed-max-sessions number comes from `engine::hardware_probe::probe_encoder_session_limits` / `probe_decoder_session_limits` at startup (capped at 8; see [`docs/configuration-guide.md`](configuration-guide.md#capacity--resource-budget) and the `BILBYCAST_PROBE_SESSION_LIMITS=0` opt-out). Soft warning matches the existing modal `updateResourceImpact` 80/100 % units pattern — the alarm tells the operator to fix it without blocking flow creation.
 
 ### Remote upgrade (`upgrade`)
 
@@ -700,6 +747,8 @@ Surface for the `upgrade_binary` lifecycle. Manager UI gates the per-node "Upgra
 | warning | `upgrade_disk_full` | `ENOSPC` while extracting. |
 | warning | `upgrade_network_error` | Manifest, bundle, or tarball fetch failed after retries. |
 | warning | `upgrade_arch_mismatch` | Manifest carries no artefact for the host's `(arch, variant)` tuple. |
+| warning | `upgrade_version_invalid` | The requested version — or the edge's own current version — did not parse as valid semver. Rides on `command_ack.error_code`. |
+| warning | `upgrade_manifest_invalid` | The fetched `manifest.json` was not valid JSON, or failed the `(version, channel, "edge")` cross-check. Rides on `command_ack.error_code`. |
 
 **Details**: `{ error_code, from_version, to_version, channel, arch, variant, … }` (fields populated according to the lifecycle stage).
 
@@ -743,32 +792,32 @@ These are generated server-side in `bilbycast-manager/crates/manager-server/src/
 
 | Category | Count | Description |
 |----------|-------|-------------|
-| `flow` | 18 | Flow lifecycle (start/stop/fail, output add/remove, input/output CRUD including update, media-player start/source-failed/playlist-exhausted/pacer-lagging/pacer-recovered) |
+| `flow` | 21 | Flow lifecycle (start/stop/fail, output add/remove, input/output CRUD including update, media-player start/source-failed/playlist-exhausted/pacer-lagging/pacer-recovered) + source PCR/PTS/DTS discontinuity |
 | `bandwidth` | 4 | Per-flow bandwidth monitoring (alarm, block, recovery) |
 | `srt` | 9 | SRT input and output connection state (now with structured details) |
-| `redundancy` | 3 | SMPTE 2022-7 dual-leg status |
+| `redundancy` | 5 | SMPTE 2022-7 dual-leg status + raw-TS active-leg failover (`redundancy_failover_mode`) + leg SSRC mismatch (`redundancy_ssrc_mismatch`) |
 | `rtmp` | 3 | RTMP publisher connections |
 | `rtsp` | 2 | RTSP input state (now with structured details) |
 | `hls` | 2 | HLS output failures |
 | `webrtc` | 8 | WHIP/WHEP session lifecycle |
 | `audio_encode` | 9 | Audio encoder lifecycle — ffmpeg sidecar (RTMP/HLS/WebRTC) + in-process TsAudioReplacer (SRT/RIST/RTP/UDP) |
 | `video_encode` | 2 | Video transcoder lifecycle — in-process TsVideoReplacer (SRT/RIST/RTP/UDP) |
-| `tunnel` | 9 | Tunnel connection state (now with structured details) |
+| `tunnel` | 10 | Tunnel connection state (now with structured details) + AEAD decrypt failure (`tunnel_decrypt_failure`) |
 | `manager` | 3 | Manager WebSocket connection |
 | `config` | 2 | Configuration changes |
 | `master_clock` | 2 | Source-PCR PLL lock-state transitions (fallback to wallclock, recovery) |
-| `system_resources` | 7 | CPU/RAM threshold monitoring + flow creation gating |
+| `system_resources` | 8 | CPU/RAM threshold monitoring + flow creation gating + HW encoder/decoder oversubscription (`hw_encoder_oversubscribed` / `hw_decoder_oversubscribed`) |
 | `rtp` | 2 | RTP input bind and lifecycle |
 | `udp` | 2 | UDP input bind and lifecycle |
 | `rist` | 4 | RIST Simple Profile connection lifecycle |
-| `bond` | 9 | Bonded input/output — per-path alive/dead, bond-aggregate degraded/down/recovered, session reset (`bond_session_reset`), socket rebuild (`bond_path_rebuilt`), interface lost (`bond_interface_lost`), MTU-budget exceedance (`bond_payload_exceeds_mtu`) |
+| `bond` | 14 | Bonded input/output — per-path alive/dead, bond-aggregate degraded/down/recovered, session reset (`bond_session_reset`), socket rebuild (`bond_path_rebuilt`), interface lost (`bond_interface_lost`), MTU-budget exceedance (`bond_payload_exceeds_mtu`), gateway route lost (`bond_gateway_route_lost`), leg reconnecting (`bond_leg_reconnecting`), per-leg diagnosis (`bond_leg_diagnosis`), protocol-version mismatch (`bond_protocol_version_mismatch`), ingress-dejitter ignored (`bond_ingress_dejitter_ignored`). **Note:** the shared-leg broker's `bond_leg_oversubscribed` / `_cleared` + `bond_leg_admission_pressure` ride category `bonding`, and `bond_legs_unencrypted` rides category `media` — see the Bonding section |
 | `ptp` | — | SMPTE ST 2110 PTP slave clock state changes (Phase 1) |
 | `network_leg` | — | SMPTE 2022-7 Red/Blue per-leg loss / recovery (Phase 1) |
 | `nmos` | — | NMOS IS-04 / IS-05 / IS-08 controller activity (Phase 1) |
 | `nmos_registry` | 4 | IS-04 registration client lifecycle (registered, heartbeat lost, registration failed, registry unreachable) |
 | `scte104` | — | SCTE-104 splice events parsed from ST 2110-40 ANC (Phase 1) |
 | `sdi` | 28 | Native SDI (DeckLink) capture **and** playout lifecycle — signal lost/restored, raster or chroma the mode cannot carry, device open refused / lost, a card that stops draining scheduled frames, audio that stops scheduling. `sdi-decklink` feature. See the [SDI section](#sdi-sdi-sdi-decklink-feature) |
-| **Total** | **102** | |
+| **Total** | **113** | |
 
 ### Phase 1 ST 2110 categories
 

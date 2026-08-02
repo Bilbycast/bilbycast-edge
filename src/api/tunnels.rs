@@ -44,10 +44,59 @@ pub async fn create_tunnel(
     if let Err(e) = crate::config::validation::validate_tunnel(&config) {
         return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": e.to_string() }))).into_response();
     }
+    // Cheap pre-check so an obviously-clashing tunnel never reaches the runtime
+    // at all (NOT authoritative — see the re-check below), plus a snapshot of
+    // the definition this upsert may be replacing, so a losing race can put the
+    // previous tunnel back.
+    let replaced_tunnel = {
+        let cfg = state.config.read().await;
+        if let Err(e) =
+            crate::config::validation::validate_port_conflicts_with_tunnel(&cfg, &config)
+        {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": e.to_string() })),
+            )
+                .into_response();
+        }
+        cfg.tunnels.iter().find(|t| t.id == config.id).cloned()
+    };
     let persisted = config.clone();
     match state.tunnel_manager.create_tunnel(config).await {
         Ok(()) => {
             let mut cfg = state.config.write().await;
+            // Authoritative check, atomic with the upsert below because it runs
+            // under the same write guard. The pre-check released its read guard
+            // before `create_tunnel().await`, so on its own it cannot stop this
+            // request and a concurrent one from both passing and both persisting
+            // the config.json that refuses to boot.
+            if let Err(e) = crate::config::validation::validate_port_conflicts_with_tunnel(
+                &cfg, &persisted,
+            ) {
+                drop(cfg);
+                if let Err(rollback) = state.tunnel_manager.destroy_tunnel(&persisted.id).await {
+                    tracing::warn!(
+                        "Failed to tear down tunnel '{}' after a losing port-conflict \
+                         race: {rollback}",
+                        persisted.id
+                    );
+                }
+                if let Some(prev) = replaced_tunnel
+                    && let Err(restore) = state.tunnel_manager.create_tunnel(prev).await
+                {
+                    tracing::error!(
+                        "Rolled back tunnel '{}' but could not restore its previous \
+                         definition — runtime and config.json now disagree until \
+                         restart: {restore}",
+                        persisted.id
+                    );
+                }
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({ "error": e.to_string() })),
+                )
+                    .into_response();
+            }
             // Upsert by id (replace an existing entry, else append).
             cfg.tunnels.retain(|t| t.id != persisted.id);
             cfg.tunnels.push(persisted);

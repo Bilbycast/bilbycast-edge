@@ -46,7 +46,7 @@ Bundled third-party components
 | bilbycast-rist             | same tag | MPL-2.0 (Softside Tech)         |
 | bilbycast-fdk-aac-rs       | same tag | MPL-2.0 (Softside Tech)         |
 | bilbycast-ffmpeg-video-rs  | same tag | MPL-2.0 (Softside Tech)         |
-| FFmpeg (libavcodec,        | n7.1.3   | LGPL-2.1-or-later, elevated to  |
+| FFmpeg (libavcodec,        | n8.1.2   | LGPL-2.1-or-later, elevated to  |
 |  libavutil, libswscale)    |          | GPL-2.0-or-later via            |
 |                            |          | --enable-gpl at configure time  |
 | libx264                    | {VER}    | GPL-2.0-or-later                |
@@ -55,7 +55,7 @@ Bundled third-party components
 |                            |          | only; runtime libnvidia-encode  |
 |                            |          | ships with NVIDIA's proprietary |
 |                            |          | driver)                         |
-| libopus                    | 1.5.2    | BSD-3-Clause                    |
+| libopus                    | 1.6.1    | BSD-3-Clause                    |
 | Fraunhofer FDK AAC         | 2.0.3    | FDK AAC Codec Library License   |
 |                            |          | (permissive, with patent notice)|
 | Rust crates                | —        | MIT / Apache-2.0 / BSD-3-Clause |

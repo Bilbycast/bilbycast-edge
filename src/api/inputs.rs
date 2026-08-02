@@ -6,7 +6,7 @@ use axum::extract::{Path, State};
 
 use crate::config::models::InputDefinition;
 use crate::config::persistence::save_config_split_async;
-use crate::config::validation::validate_input_definition;
+use crate::config::validation::{validate_input_definition, validate_port_conflicts_with_input};
 
 use super::auth::RequireAdmin;
 use super::errors::ApiError;
@@ -76,6 +76,12 @@ pub async fn create_input(
         )));
     }
 
+    // Cross-entity port check runs *after* the identity checks so a duplicate
+    // id still reports 409, not 400: the probe substitutes by id, so it would
+    // otherwise silently drop the colliding entity and mask the real error.
+    validate_port_conflicts_with_input(&config, &input)
+        .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+
     config.inputs.push(input.clone());
     save_config_split_async(state.config_path.clone(), state.secrets_path.clone(), config.clone())
         .await
@@ -107,6 +113,11 @@ pub async fn update_input(
         .iter()
         .position(|i| i.id == input_id)
         .ok_or_else(|| ApiError::NotFound(format!("Input '{input_id}' not found")))?;
+
+    // After the existence check, so editing a non-existent input still reports
+    // 404 rather than a port conflict against a phantom entity.
+    validate_port_conflicts_with_input(&config, &input)
+        .map_err(|e| ApiError::BadRequest(e.to_string()))?;
 
     let old = config.inputs[idx].clone();
     // Activation is owned by POST /api/v1/flows/{id}/activate-input (and the

@@ -1,6 +1,6 @@
 [package]
 name = "bilbycast-edge"
-version = "0.99.1"
+version = "0.99.2"
 edition = "2024"
 description = "Pure-Rust media gateway: RTP, SRT, RTMP, HLS, WebRTC with SMPTE 2022-1/7, TR-101290, and RP 2129"
 license = "AGPL-3.0-or-later"
@@ -20,7 +20,7 @@ tokio-stream = "0.1.18"
 
 # HTTP framework
 axum = { version = "0.8.9", features = ["ws"] }
-tower-http = { version = "0.6.8", features = ["cors", "trace"] }
+tower-http = { version = "0.7.0", features = ["cors", "trace"] }
 
 # Serialization
 serde = { version = "1.0.228", features = ["derive"] }
@@ -64,7 +64,7 @@ rand = "0.10.1"
 # transcode stage in `engine::audio_transcode` to bridge mismatched
 # ST 2110-30 / -31 / rtp_audio formats and feed the SMPTE 302M-over-SRT
 # pipeline). No C deps.
-rubato = "2.0.0"
+rubato = "4.0.0"
 
 # Pure-Rust audio codec decoder (used by `engine::audio_decode` to convert
 # ── AAC backend ─────────────────────────────────────────────────────────
@@ -76,6 +76,18 @@ rubato = "2.0.0"
 # ────────────────────────────────────────────────────────────────────────
 aac-audio = { path = "../bilbycast-fdk-aac-rs/aac-audio", optional = true }
 aac-codec = { path = "../bilbycast-fdk-aac-rs/aac-codec", optional = true }
+# HELD at 0.5.5 deliberately — symphonia 0.6.0 is out but reworked the audio
+# API wholesale (`AudioBufferRef` / `Signal` / `SignalSpec` / `DecoderOptions` /
+# `CODEC_TYPE_AAC` all moved or renamed), so it needs a real port of the
+# `#[cfg(not(feature = "fdk-aac"))]` decoder in `engine::audio_decode`. That
+# fallback only exists in the `--no-default-features` build, which does NOT
+# compile at present for an unrelated reason (`engine::ts_video_replace` and
+# `engine::flow` reference the `media-codecs`-gated `video_encode_util` /
+# `resolve_for_video_encode_config` unconditionally). Porting a broadcast
+# audio-decode path that cannot be built — let alone run against the quality
+# gates — would be unverifiable. Fix the feature gating first, then bump.
+# No shipped release artefact is affected: all three publish with default
+# features, so fdk-aac is the active decoder everywhere.
 symphonia = { version = "0.5.5", features = ["aac"], default-features = false }
 
 # ── FFmpeg / libav base codec layer (the `media-codecs` feature) ──────
@@ -133,12 +145,12 @@ anyhow = "1.0.102"
 # Auth (JWT / HMAC-SHA256)
 hmac = "0.13.0"
 sha2 = "0.11.0"
-base64 = "0.22.1"
+base64 = "0.23.0"
 serde_urlencoded = "0.7.1"
 subtle = "2.6"
 
 # Secrets encryption at rest (AES-256-GCM for secrets.json)
-aes-gcm = "0.11.0-rc.3"
+aes-gcm = "0.11.0"
 # Pure-Rust CENC ciphers for CMAF output (Common Encryption ISO/IEC 23001-7):
 #   cenc scheme → AES-128-CTR, cbcs scheme → AES-128-CBC with 1:9 block
 #   pattern. RustCrypto audited crates, MIT/Apache-2.0. Tiny binary cost.
@@ -150,7 +162,7 @@ cbc = "0.2"
 uuid = { version = "1.23.1", features = ["v4", "v5", "serde"] }
 
 # WebSocket client for manager connection
-tokio-tungstenite = { version = "0.29.0", features = ["rustls-tls-webpki-roots"] }
+tokio-tungstenite = { version = "0.30.0", features = ["rustls-tls-webpki-roots"] }
 webpki-roots = "1.0.7"
 futures-util = "0.3.32"
 url = "2.5.8"
@@ -158,6 +170,12 @@ url = "2.5.8"
 # Netlink (gateway-mode bonded-path policy routing — engine::bond_routing).
 # Pure Rust; uses the edge process's CAP_NET_ADMIN at runtime.
 rtnetlink = "0.21"
+# HELD at 0.30 deliberately — netlink-packet-route 0.31.0 is out, but
+# rtnetlink 0.21 (the latest) requires ^0.30, and `engine::bond_routing`
+# passes RouteMessage / RuleAction straight between the two crates. Bumping
+# ours alone resolves BOTH into the graph and those types stop unifying
+# (E0308: "multiple different versions of crate netlink_packet_route").
+# Move this in lockstep with rtnetlink, not ahead of it.
 netlink-packet-route = "0.30"
 
 # ── SRT backend ──────────────────────────────────────────────────────────
@@ -237,6 +255,12 @@ flate2 = { version = "1.1", default-features = false, features = ["rust_backend"
 semver = { version = "1.0", features = ["serde"] }
 fs2 = "0.4"
 sigstore = { version = "0.14", default-features = false, features = ["sigstore-trust-root", "cached-client"] }
+# HELD at 0.2 deliberately — x509-cert 0.3.0 is out, but sigstore 0.14 (the
+# latest) still requires ^0.2. Bumping ours alone resolves BOTH into the graph,
+# putting a second X.509 parser in the upgrade-signature verification path for
+# no functional gain (we only need `Certificate::from_der` + extension access,
+# and we hand sigstore raw SPKI/signature bytes, never a shared type). Move
+# this in lockstep with sigstore, not ahead of it.
 x509-cert = { version = "0.2", default-features = false, features = ["std"] }
 
 [features]
@@ -492,6 +516,18 @@ features = ["tls-rustls"]
 optional = true
 
 [dependencies.str0m]
+# HELD at 0.19.0 deliberately — 0.21.0 is out. This is NOT drift; the bump is
+# a scoped media-path project, not a version-number edit. What it needs:
+#   * re-vendor `is` 0.10.0 under vendor/ with the PRIORITY patch below
+#     (str0m 0.21 wants `is ^0.10`; upstream 0.10.0 STILL hard-rejects
+#     PRIORITY-less Binding Requests, so scenario (b) below is not yet live —
+#     verified against the published 0.10.0 source).
+#   * port five breaking changes: `write_rtp()` now takes an `RtpWrite`
+#     builder, media data moved to `Arc<[u8]>`, `abs-capture-time` writer /
+#     receiver rework, permissive-vp8 depacketizer fix (all 0.20), and
+#     dimpl 0.7.0 (0.21).
+#   * re-run WHIP/WHEP interop against ffmpeg, OBS and a browser, plus
+#     quality gates 3 / 7 / 9 — this is live A/V, not a leaf dependency.
 version = "0.19.0"
 optional = true
 # Use OpenSSL DTLS backend instead of the default aws-lc-rs + dimpl. The
@@ -523,7 +559,7 @@ version = "0.4.19"
 # (`_nmos-node._tcp`). Best-effort: registration is gated at runtime so
 # environments without multicast on the chosen interface degrade cleanly.
 [dependencies.mdns-sd]
-version = "0.19.1"
+version = "0.20.3"
 
 [dev-dependencies]
 tempfile = "3.27.0"
@@ -547,7 +583,7 @@ nvml-wrapper = { version = "0.12", optional = true }
 # so libudev is not in the link graph.
 [target.'cfg(target_os = "linux")'.dependencies]
 drm = { version = "0.15", optional = true }
-alsa = { version = "0.11", optional = true }
+alsa = { version = "0.12", optional = true }
 
 # Pure-Rust D-Bus client for reading cellular modem state from ModemManager
 # (org.freedesktop.ModemManager1) — powers util::cellular's zero-config USB /

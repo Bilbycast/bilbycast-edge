@@ -1,7 +1,13 @@
-# Bonded relay legs — loopback-free in-process bridge (implementation spec)
+# Bonded relay legs — loopback-free in-process bridge
 
-**Status: SPEC — NOT yet implemented. Requires a dedicated testbed-verified pass
-(broadcast quality gates) because it changes the Tier-1 bonded media data path.**
+**Status: IMPLEMENTED.** The loopback-free in-process bonded-relay leg bridge is
+shipped in both the bonding library and the edge. The bond exposes a
+`BondPathTransportConfig::Relay` path variant; `bonding-transport` carries the
+`PathTransport::Attached` config, the `AttachedPath`, and
+`BondSocket::sender_attached` / `receiver_attached`; and the edge builds the leg
+in-process via `run_native_relay_leg_inproc` / `AttachedChannels` in
+`input_bonded.rs` / `output_bonded.rs` — no loopback UDP round-trip and no
+second AEAD pass. The sections below describe the design that motivated it.
 
 ## Why
 

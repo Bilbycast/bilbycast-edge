@@ -37,7 +37,10 @@ use alsa::pcm::{Access, Format, HwParams, PCM};
 use alsa::{Direction, ValueOr};
 use anyhow::{Context, Result};
 use rubato::audioadapter_buffers::direct::SequentialSliceOfVecs;
-use rubato::{Async, FixedAsync, PolynomialDegree, Resampler};
+// rubato 4 split the ratio-adjustment methods (`set_resample_ratio*`) out of
+// `Resampler` into the separate `Adjustable` trait — the genlock servo below
+// drives `set_resample_ratio_relative`, so both traits must be in scope.
+use rubato::{Adjustable, Async, FixedAsync, PolynomialDegree, Resampler};
 
 use super::clock::AudioClock;
 use crate::engine::master_clock::MasterClockHandle;

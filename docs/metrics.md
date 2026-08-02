@@ -698,8 +698,8 @@ field. All counters are lock-free atomic loads sampled at the regular
 | `av_sync_offset_ms` | Signed EMA of the video-vs-audio offset in milliseconds (positive = video late). Read every 1-second snapshot |
 | `current_resolution` | Negotiated KMS mode resolution (e.g. `"1920x1080"`) — fixed at modeset, surfaced for the manager UI's flow-card subtitle |
 | `current_refresh_hz` | Negotiated refresh rate in Hz |
-| `pixel_format` | Pixel format on the wire to the connector. v1 always `"XRGB8888"`; v2 introduces DMA-BUF zero-copy variants |
-| `decoder_kind` | Decoder backend: `"sw"` (v1) / `"vaapi"` / `"nvdec"` (v2) |
+| `pixel_format` | Pixel format on the wire to the connector. v1 always `"XRGB8888"` (CPU / dumb-buffer path); v2 adds the DMA-BUF zero-copy variants `"NV12"` / `"P010"` on the VAAPI / NVDEC / RKMPP scanout path |
+| `decoder_kind` | What the runtime decoder resolver actually opened on this host: `"cpu"`, `"cpu (hw unavailable)"` (operator requested a HW backend the host can't open), `"nvdec"`, `"qsv"`, `"vaapi-zerocopy"`, or `"rkmpp-zerocopy"` (the aarch64 Rockchip HW decode path) |
 | `video_codec` | Source video codec (`"h264"` / `"hevc"`) |
 | `audio_codec` | Source audio codec (`"aac"` / `"mp2"` / `"ac3"` / `"eac3"` / `"opus"` / `"none"` when audio is muted) |
 

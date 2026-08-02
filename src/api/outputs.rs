@@ -6,7 +6,7 @@ use axum::extract::{Path, State};
 
 use crate::config::models::OutputConfig;
 use crate::config::persistence::save_config_split_async;
-use crate::config::validation::validate_output;
+use crate::config::validation::{validate_output, validate_port_conflicts_with_output};
 
 use super::auth::RequireAdmin;
 use super::errors::ApiError;
@@ -76,6 +76,12 @@ pub async fn create_output(
         )));
     }
 
+    // Cross-entity port check runs *after* the identity checks so a duplicate
+    // id still reports 409, not 400 — the probe substitutes by id and would
+    // otherwise drop the colliding entity and mask the real error.
+    validate_port_conflicts_with_output(&config, &output)
+        .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+
     config.outputs.push(output.clone());
     save_config_split_async(state.config_path.clone(), state.secrets_path.clone(), config.clone())
         .await
@@ -112,6 +118,11 @@ pub async fn update_output(
         .iter()
         .position(|o| o.id() == output_id)
         .ok_or_else(|| ApiError::NotFound(format!("Output '{output_id}' not found")))?;
+
+    // After the existence check, so editing a non-existent output still reports
+    // 404 rather than a port conflict against a phantom entity.
+    validate_port_conflicts_with_output(&config, &output)
+        .map_err(|e| ApiError::BadRequest(e.to_string()))?;
 
     let old_output = config.outputs[idx].clone();
     config.outputs[idx] = output.clone();

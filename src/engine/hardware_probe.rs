@@ -1104,18 +1104,76 @@ fn encoder_failure_from(err: &video_engine::ProbeError) -> EncoderFailure {
     }
 }
 
-/// `true` when at least one `/dev/dri/renderD*` node exists — a DRM
-/// render node the QSV / VAAPI stack would open. One `read_dir`, only on
-/// a host where the family is already known broken.
-#[cfg(feature = "media-codecs")]
-fn dri_render_node_present() -> bool {
-    std::fs::read_dir("/dev/dri")
-        .map(|entries| {
-            entries
-                .flatten()
-                .any(|e| e.file_name().to_string_lossy().starts_with("renderD"))
+/// DRM drivers that can back an Intel QSV (oneVPL / iHD) stack.
+const QSV_DRM_DRIVERS: &[&str] = &["i915", "xe"];
+
+/// DRM drivers that can back a VAAPI stack — Intel (iHD / i965) and AMD
+/// (Mesa radeonsi / r600). Deliberately excludes `nvidia`: the proprietary
+/// driver exposes a render node but no VAAPI encode entry point.
+const VAAPI_DRM_DRIVERS: &[&str] = &["i915", "xe", "amdgpu", "radeon"];
+
+/// The DRM driver backing each `/dev/dri/renderD*` node, read from
+/// `/sys/class/drm/<node>/device/driver`. `None` for a node whose driver
+/// can't be resolved (no sysfs, container, unexpected layout).
+///
+/// One `read_dir` plus a `canonicalize` per node — `read_link` is not
+/// enough, since `/sys/class/drm/<node>` is itself a symlink into
+/// `/sys/devices/...` and only full resolution reaches the driver
+/// directory whose basename is the driver name. Cheap enough for the
+/// startup probe path, and otherwise only reached on a host where the
+/// family is already known broken.
+fn dri_render_node_drivers() -> Vec<Option<String>> {
+    let Ok(entries) = std::fs::read_dir("/dev/dri") else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().into_owned();
+            name.starts_with("renderD").then(|| {
+                std::fs::canonicalize(format!("/sys/class/drm/{name}/device/driver"))
+                    .ok()
+                    .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+            })
         })
-        .unwrap_or(false)
+        .collect()
+}
+
+/// `true` when at least one render node is — or might be — backed by one
+/// of `wanted`.
+///
+/// A node whose driver we could not resolve counts as a match: the verdict
+/// is only ever narrowed on *positive* evidence, so a host whose sysfs we
+/// can't read keeps the old "node present" behaviour rather than being
+/// mislabelled `no_driver`.
+///
+/// This is what stops a discrete-NVIDIA box from reporting QSV/VAAPI as
+/// `blocked` ("check the iHD media driver") when the only `renderD*` on
+/// the host belongs to `nvidia` and there is no Intel/AMD GPU at all —
+/// hardware-confirmed on a Xeon E5-1650 v3 + GTX 1080 Ti, which has no
+/// iGPU yet still publishes `/dev/dri/renderD128`.
+fn render_node_matches(nodes: &[Option<String>], wanted: &[&str]) -> bool {
+    nodes.iter().any(|driver| match driver {
+        Some(name) => wanted.contains(&name.as_str()),
+        None => true,
+    })
+}
+
+/// `true` when at least one render node is backed by an Intel DRM driver —
+/// the precondition for *hardware* QSV.
+///
+/// Opening `h264_qsv` is **not** evidence of hardware. The oneVPL dispatcher
+/// (`libvpl`) resolves and opens the decoder on hosts with no Intel GPU at
+/// all, so `avcodec_open2` returns `Ok` and the capability gets advertised
+/// with nothing behind it. Hardware-confirmed on a Xeon E5-1650 v3 + GTX
+/// 1080 Ti carrying `libvpl` but no iHD driver and no iGPU: `h264_qsv`
+/// opened, QSV was published as a decoder, the display output's Auto chain
+/// then *selected* it, and every `send_packet` failed until the flow was
+/// torn down. Gating on the render node's owning driver keeps a phantom
+/// backend out of the Auto priority chain instead of letting it be picked
+/// and fail at the first frame.
+fn intel_render_node_present() -> bool {
+    render_node_matches(&dri_render_node_drivers(), QSV_DRM_DRIVERS)
 }
 
 /// NVENC diagnostic. `None` unless NVENC is compiled in yet unavailable.
@@ -1143,19 +1201,165 @@ fn nvenc_unavailable_diagnostic(hw: &HwCodecCapability) -> Option<HwEncoderDiagn
     let detail = match failure {
         EncoderFailure::Busy => {
             "NVENC session slots exhausted — another process is holding all encode sessions"
+                .to_string()
         }
-        _ if node_present => {
-            "NVIDIA driver present but device unopenable — check the service \
+        // EACCES has one correct remedy and it is not "reboot" — keep it on
+        // the sandbox runbook, matching the explicit shape the QSV and VAAPI
+        // twins already use. Without this arm the version-mismatch branch
+        // below swallows a permission failure whenever any version skew also
+        // happens to be present.
+        EncoderFailure::PermissionDenied if node_present => {
+            "/dev/nvidia* present but not accessible — check the service \
              DeviceAllow / cgroup sandbox (see installation.md)"
+                .to_string()
         }
+        // A stale kernel module is by far the most common cause of a
+        // present-but-unopenable NVIDIA stack, and it is silent: the box
+        // keeps running, the encode just degrades to CPU. Name it exactly
+        // rather than sending the operator to the DeviceAllow runbook.
+        _ if node_present => match nvidia_driver_version_mismatch() {
+            Some((kernel, userspace)) => format!(
+                "NVIDIA kernel module {kernel} does not match userspace libraries \
+                 {userspace} — the driver packages were upgraded without reloading the \
+                 module (typically unattended-upgrades). Reboot, or reload nvidia.ko, to \
+                 restore NVENC. Consider holding the nvidia-*/libnvidia-* packages on \
+                 GPU nodes so an unattended upgrade cannot silently drop encoding to CPU."
+            ),
+            None => "NVIDIA driver present but device unopenable — check the service \
+                     DeviceAllow / cgroup sandbox (see installation.md)"
+                .to_string(),
+        },
         _ => "no /dev/nvidia* device nodes — the NVIDIA driver is not installed or nvidia.ko \
-              is not loaded",
+              is not loaded"
+            .to_string(),
     };
     Some(HwEncoderDiagnostic {
         family: "nvenc".into(),
         status: status.into(),
-        detail: detail.into(),
+        detail,
     })
+}
+
+/// `true` for a dotted numeric version token such as `580.159.03`.
+fn is_dotted_version(token: &str) -> bool {
+    token.contains('.')
+        && token.chars().all(|c| c.is_ascii_digit() || c == '.')
+        && token.starts_with(|c: char| c.is_ascii_digit())
+}
+
+/// Pull the driver version out of `/proc/driver/nvidia/version` contents.
+///
+/// The line reads like
+/// `NVRM version: NVIDIA UNIX x86_64 Kernel Module  580.159.03  Fri Apr 24 …`.
+/// The surrounding prose varies by driver branch and architecture, so this
+/// takes the first dotted-numeric token rather than anchoring on position.
+fn parse_nvrm_version(contents: &str) -> Option<String> {
+    contents
+        .lines()
+        .find(|l| l.starts_with("NVRM version:"))?
+        .split_whitespace()
+        .find(|tok| is_dotted_version(tok))
+        .map(str::to_string)
+}
+
+/// Pull the driver version out of a versioned NVIDIA library filename —
+/// `libnvidia-encode.so.580.173.02` → `580.173.02`.
+fn parse_nvidia_lib_version(file_name: &str, stem: &str) -> Option<String> {
+    let suffix = file_name.strip_prefix(stem)?.strip_prefix(".so.")?;
+    is_dotted_version(suffix).then(|| suffix.to_string())
+}
+
+/// Directories searched for the versioned NVIDIA userspace libraries.
+/// Covers Debian/Ubuntu multiarch and the RHEL/Fedora `lib64` layout.
+const NVIDIA_LIB_DIRS: &[&str] = &[
+    "/usr/lib/x86_64-linux-gnu",
+    "/usr/lib/aarch64-linux-gnu",
+    "/usr/lib64",
+    "/usr/lib",
+];
+
+/// Library stems whose soname carries the userspace driver version, in
+/// preference order. `libcuda` is the fallback: NVENC hosts always have it,
+/// whereas `libnvidia-encode` is absent on decode-only installs.
+const NVIDIA_VERSIONED_LIBS: &[&str] = &["libnvidia-encode", "libcuda"];
+
+/// Numeric component vector for ordering dotted versions. `is_dotted_version`
+/// has already guaranteed every component is ASCII digits, so the parse cannot
+/// realistically fail; a lexical compare would misorder `580.9` vs `580.10`.
+fn version_key(v: &str) -> Vec<u64> {
+    v.split('.').map(|c| c.parse::<u64>().unwrap_or(0)).collect()
+}
+
+/// Userspace NVIDIA driver version, read from the versioned library soname.
+/// Deliberately avoids NVML — that is behind an optional Cargo feature, and
+/// on a mismatched host `nvmlInit` is exactly what fails.
+///
+/// Resolution order matters, because the host this exists to diagnose is
+/// precisely the one that can carry libraries from two driver generations at
+/// once. `<stem>.so.1` is what the dynamic loader actually binds, so resolving
+/// that symlink names the version in use; a bare `read_dir` scan would pick
+/// between co-resident versions in filesystem order and could just as easily
+/// fabricate a mismatch as mask one.
+fn nvidia_userspace_version() -> Option<String> {
+    // Stems outermost — this is the documented preference order.
+    for stem in NVIDIA_VERSIONED_LIBS {
+        for dir in NVIDIA_LIB_DIRS {
+            if let Some(v) = std::fs::read_link(format!("{dir}/{stem}.so.1"))
+                .ok()
+                .and_then(|target| {
+                    target.file_name().map(|n| n.to_string_lossy().into_owned())
+                })
+                .and_then(|name| parse_nvidia_lib_version(&name, stem))
+            {
+                return Some(v);
+            }
+        }
+    }
+
+    // Fallback for layouts with no `.so.1` symlink: scan, but take the highest
+    // version rather than whichever entry read_dir happened to yield first, so
+    // a leftover older library can never win.
+    for stem in NVIDIA_VERSIONED_LIBS {
+        let mut best: Option<String> = None;
+        for dir in NVIDIA_LIB_DIRS {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if let Some(v) = parse_nvidia_lib_version(&name, stem)
+                    && best.as_deref().is_none_or(|b| version_key(b) < version_key(&v))
+                {
+                    best = Some(v);
+                }
+            }
+        }
+        if best.is_some() {
+            return best;
+        }
+    }
+    None
+}
+
+/// Loaded kernel-module version, or `None` when `nvidia.ko` is not loaded.
+fn nvidia_kernel_module_version() -> Option<String> {
+    parse_nvrm_version(&std::fs::read_to_string("/proc/driver/nvidia/version").ok()?)
+}
+
+/// `Some((kernel, userspace))` when both versions resolve **and** disagree.
+///
+/// Upgrading the NVIDIA packages without rebooting leaves the running
+/// `nvidia.ko` older than the userspace libraries; `cuInit` then fails with
+/// `CUDA_ERROR_SYSTEM_DRIVER_MISMATCH` (803) — the same condition `nvidia-smi`
+/// reports as "Driver/library version mismatch" — and every HW encode silently
+/// falls back to CPU. (804, `CUDA_ERROR_COMPAT_NOT_SUPPORTED_ON_DEVICE`, is the
+/// distinct `cuda-compat` forward-compatibility failure, not this.)
+/// Hardware-confirmed on bilby-z440, where it went unnoticed for three days
+/// because the only symptom was elevated CPU.
+fn nvidia_driver_version_mismatch() -> Option<(String, String)> {
+    let kernel = nvidia_kernel_module_version()?;
+    let userspace = nvidia_userspace_version()?;
+    (kernel != userspace).then_some((kernel, userspace))
 }
 
 /// QSV diagnostic. `None` unless QSV is compiled in yet unavailable. The
@@ -1175,7 +1379,7 @@ fn qsv_unavailable_diagnostic(hw: &HwCodecCapability) -> Option<HwEncoderDiagnos
         Ok(()) => return None,
         Err(e) => encoder_failure_from(&e),
     };
-    let node_present = dri_render_node_present();
+    let node_present = render_node_matches(&dri_render_node_drivers(), QSV_DRM_DRIVERS);
     let status = classify_encoder_status(failure, node_present);
     let detail = match failure {
         EncoderFailure::PermissionDenied => {
@@ -1189,7 +1393,8 @@ fn qsv_unavailable_diagnostic(hw: &HwCodecCapability) -> Option<HwEncoderDiagnos
              and the service DeviceAllow / cgroup sandbox"
         }
         EncoderFailure::Other => {
-            "no /dev/dri/renderD* node — no Intel GPU or the i915 driver is not loaded"
+            "no Intel /dev/dri/renderD* node — no Intel GPU, or the i915 / xe driver \
+             is not loaded (a discrete NVIDIA/AMD render node does not provide QSV)"
         }
     };
     Some(HwEncoderDiagnostic {
@@ -1217,7 +1422,7 @@ fn vaapi_unavailable_diagnostic(hw: &HwCodecCapability) -> Option<HwEncoderDiagn
         Ok(()) => return None,
         Err(e) => encoder_failure_from(&e),
     };
-    let node_present = dri_render_node_present();
+    let node_present = render_node_matches(&dri_render_node_drivers(), VAAPI_DRM_DRIVERS);
     let status = classify_encoder_status(failure, node_present);
     let detail = match failure {
         EncoderFailure::PermissionDenied => {
@@ -1231,7 +1436,9 @@ fn vaapi_unavailable_diagnostic(hw: &HwCodecCapability) -> Option<HwEncoderDiagn
              (Mesa radeonsi / iHD) and the service DeviceAllow / cgroup sandbox"
         }
         EncoderFailure::Other => {
-            "no /dev/dri/renderD* node — no GPU render node or the DRM driver is not loaded"
+            "no VAAPI-capable /dev/dri/renderD* node — no Intel/AMD GPU, or the \
+             i915 / xe / amdgpu / radeon driver is not loaded (the proprietary \
+             NVIDIA driver publishes a render node but provides no VAAPI encode)"
         }
     };
     Some(HwEncoderDiagnostic {
@@ -1242,11 +1449,23 @@ fn vaapi_unavailable_diagnostic(hw: &HwCodecCapability) -> Option<HwEncoderDiagn
 }
 
 fn probe_hw_decoders() -> HwCodecCapability {
+    // QSV decode needs a real Intel GPU behind it. The oneVPL dispatcher
+    // opens `h264_qsv` even where none exists, so the decoder probe alone
+    // is not evidence of hardware — see `intel_render_node_present`. Short-
+    // circuiting on the node check also skips a pointless open on hosts
+    // that could never use it.
+    let intel_gpu = intel_render_node_present();
+    if !intel_gpu {
+        tracing::debug!(
+            "QSV decode not probed: no Intel /dev/dri/renderD* node — oneVPL would \
+             open the decoder anyway, which is not evidence of hardware"
+        );
+    }
     HwCodecCapability {
         h264_nvenc: probe_runtime_decoder("h264_cuvid"),
         hevc_nvenc: probe_runtime_decoder("hevc_cuvid"),
-        h264_qsv: probe_runtime_decoder("h264_qsv"),
-        hevc_qsv: probe_runtime_decoder("hevc_qsv"),
+        h264_qsv: intel_gpu && probe_runtime_decoder("h264_qsv"),
+        hevc_qsv: intel_gpu && probe_runtime_decoder("hevc_qsv"),
         h264_videotoolbox: probe_videotoolbox_decoder("h264_videotoolbox"),
         hevc_videotoolbox: probe_videotoolbox_decoder("hevc_videotoolbox"),
         // AMD has no first-party FFmpeg HW decoder name *outside* VAAPI;
@@ -3457,6 +3676,169 @@ mod tests {
             classify_encoder_status(EncoderFailure::Other, false),
             "no_driver"
         );
+    }
+
+    /// A render node owned by a driver that cannot back the stack must not
+    /// count as "the GPU is here but blocked". Regression test for
+    /// bilby-z440 (Xeon E5-1650 v3, no iGPU, GTX 1080 Ti): its only
+    /// `renderD128` is owned by `nvidia`, and QSV/VAAPI were reporting
+    /// `blocked` with "check the iHD media driver" — advice that names
+    /// hardware the host does not physically have.
+    #[test]
+    fn nvidia_render_node_does_not_imply_qsv_or_vaapi() {
+        let nvidia_only = [Some("nvidia".to_string())];
+        assert!(!render_node_matches(&nvidia_only, QSV_DRM_DRIVERS));
+        assert!(!render_node_matches(&nvidia_only, VAAPI_DRM_DRIVERS));
+        // ...which flips the wire status from the misleading `blocked` to
+        // the truthful `no_driver`.
+        assert_eq!(
+            classify_encoder_status(
+                EncoderFailure::Other,
+                render_node_matches(&nvidia_only, QSV_DRM_DRIVERS)
+            ),
+            "no_driver"
+        );
+    }
+
+    /// The other half of the fix: a host with a real Intel iGPU whose QSV
+    /// genuinely fails must keep reporting `blocked`. Mirrors bilby-bite
+    /// (i3-1215U, `renderD128` owned by `i915`).
+    #[test]
+    fn intel_render_node_still_reports_blocked() {
+        let i915 = [Some("i915".to_string())];
+        assert!(render_node_matches(&i915, QSV_DRM_DRIVERS));
+        assert!(render_node_matches(&i915, VAAPI_DRM_DRIVERS));
+        assert_eq!(
+            classify_encoder_status(
+                EncoderFailure::Other,
+                render_node_matches(&i915, QSV_DRM_DRIVERS)
+            ),
+            "blocked"
+        );
+    }
+
+    #[test]
+    fn amd_render_node_backs_vaapi_but_not_qsv() {
+        let amdgpu = [Some("amdgpu".to_string())];
+        assert!(!render_node_matches(&amdgpu, QSV_DRM_DRIVERS));
+        assert!(render_node_matches(&amdgpu, VAAPI_DRM_DRIVERS));
+    }
+
+    /// A mixed box (Intel iGPU + discrete NVIDIA) must still find the
+    /// Intel node behind the NVIDIA one.
+    #[test]
+    fn mixed_gpu_host_finds_the_intel_node() {
+        let mixed = [Some("nvidia".to_string()), Some("i915".to_string())];
+        assert!(render_node_matches(&mixed, QSV_DRM_DRIVERS));
+        assert!(render_node_matches(&mixed, VAAPI_DRM_DRIVERS));
+    }
+
+    /// Unresolvable driver → assume it could match, preserving the old
+    /// behaviour. We only ever narrow the verdict on positive evidence, so
+    /// a sysfs-less container is never wrongly told it has no GPU.
+    #[test]
+    fn unresolvable_driver_is_treated_as_a_possible_match() {
+        assert!(render_node_matches(&[None], QSV_DRM_DRIVERS));
+        assert!(render_node_matches(&[None], VAAPI_DRM_DRIVERS));
+    }
+
+    /// QSV *decode* capability is `decoder_opened && intel_node_present`.
+    /// The second term is load-bearing: oneVPL opens `h264_qsv` on hosts
+    /// with no Intel GPU, so the first term alone published a phantom
+    /// backend that the display output's Auto chain then selected and
+    /// failed on every frame (bilby-z440, GTX 1080 Ti + libvpl, no iGPU).
+    #[test]
+    fn qsv_decode_requires_both_open_and_intel_node() {
+        let nvidia = [Some("nvidia".to_string())];
+        let i915 = [Some("i915".to_string())];
+
+        for (nodes, opened, expected, case) in [
+            (&nvidia, true, false, "oneVPL opens on a non-Intel host"),
+            (&nvidia, false, false, "no open, no node"),
+            (&i915, true, true, "real Intel GPU, decoder opens"),
+            (&i915, false, false, "Intel GPU but decoder won't open"),
+        ] {
+            let advertised = render_node_matches(nodes, QSV_DRM_DRIVERS) && opened;
+            assert_eq!(advertised, expected, "{case}");
+        }
+    }
+
+    /// Real `/proc/driver/nvidia/version` contents from bilby-z440 during
+    /// the 2026-07-25 mismatch incident.
+    #[test]
+    fn parses_nvrm_version_from_real_proc_contents() {
+        let contents = "NVRM version: NVIDIA UNIX x86_64 Kernel Module  580.159.03  \
+                        Fri Apr 24 06:16:47 UTC 2026\nGCC version:\n";
+        assert_eq!(parse_nvrm_version(contents).as_deref(), Some("580.159.03"));
+    }
+
+    #[test]
+    fn parses_nvrm_version_on_other_architectures() {
+        // aarch64 line carries a different arch token in the same position.
+        let contents = "NVRM version: NVIDIA UNIX aarch64 Kernel Module  535.104.05  \
+                        Sat Aug 19 01:15:15 UTC 2023\n";
+        assert_eq!(parse_nvrm_version(contents).as_deref(), Some("535.104.05"));
+    }
+
+    #[test]
+    fn nvrm_version_absent_when_module_not_loaded() {
+        assert_eq!(parse_nvrm_version(""), None);
+        assert_eq!(parse_nvrm_version("something else entirely\n"), None);
+    }
+
+    #[test]
+    fn parses_versioned_library_soname() {
+        assert_eq!(
+            parse_nvidia_lib_version("libnvidia-encode.so.580.173.02", "libnvidia-encode")
+                .as_deref(),
+            Some("580.173.02")
+        );
+        assert_eq!(
+            parse_nvidia_lib_version("libcuda.so.580.173.02", "libcuda").as_deref(),
+            Some("580.173.02")
+        );
+        // The unversioned symlinks must not be mistaken for a version.
+        assert_eq!(
+            parse_nvidia_lib_version("libnvidia-encode.so", "libnvidia-encode"),
+            None
+        );
+        assert_eq!(
+            parse_nvidia_lib_version("libnvidia-encode.so.1", "libnvidia-encode"),
+            None
+        );
+        // Wrong stem must not match a same-prefixed library.
+        assert_eq!(
+            parse_nvidia_lib_version("libcudart.so.12.4.99", "libcuda"),
+            None
+        );
+    }
+
+    #[test]
+    fn dotted_version_rejects_non_versions() {
+        assert!(is_dotted_version("580.159.03"));
+        assert!(is_dotted_version("12.4"));
+        assert!(!is_dotted_version("580")); // no dot
+        assert!(!is_dotted_version("Module")); // no digits
+        assert!(!is_dotted_version("x86_64")); // not dotted-numeric
+        assert!(!is_dotted_version("")); // empty
+    }
+
+    /// Driver versions must order numerically, not lexically. The scan
+    /// fallback in `nvidia_userspace_version` picks the highest co-resident
+    /// version, so `580.9` must not outrank `580.10`.
+    #[test]
+    fn version_key_orders_numerically_not_lexically() {
+        assert!(version_key("580.159.03") < version_key("580.173.02"));
+        assert!(version_key("580.9") < version_key("580.10")); // lexical would invert
+        assert_eq!(version_key("580.173.02"), version_key("580.173.02"));
+        assert!(version_key("535.104.05") < version_key("580.159.03"));
+    }
+
+    /// No render nodes at all is still unambiguously `no_driver`.
+    #[test]
+    fn no_render_nodes_matches_nothing() {
+        assert!(!render_node_matches(&[], QSV_DRM_DRIVERS));
+        assert!(!render_node_matches(&[], VAAPI_DRM_DRIVERS));
     }
 
     #[test]

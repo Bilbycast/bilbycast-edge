@@ -1758,16 +1758,20 @@ impl PlanarAudioTranscoder {
 
 fn sinc_params_for(quality: SrcQuality) -> SincInterpolationParameters {
     match quality {
+        // rubato 4 made `f_cutoff` an `Option<f32>` where `None` asks the
+        // crate to derive a cutoff from `sinc_len`. Keep the explicit values
+        // so the filter response — and therefore the audio — is bit-for-bit
+        // what it was on rubato 2.
         SrcQuality::High => SincInterpolationParameters {
             sinc_len: 256,
-            f_cutoff: 0.95,
+            f_cutoff: Some(0.95),
             interpolation: SincInterpolationType::Linear,
             oversampling_factor: 256,
             window: WindowFunction::BlackmanHarris2,
         },
         SrcQuality::Fast => SincInterpolationParameters {
             sinc_len: 64,
-            f_cutoff: 0.92,
+            f_cutoff: Some(0.92),
             interpolation: SincInterpolationType::Linear,
             oversampling_factor: 128,
             window: WindowFunction::Hann,
