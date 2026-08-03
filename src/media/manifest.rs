@@ -42,6 +42,7 @@
 //! schema version moves.
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 use std::time::UNIX_EPOCH;
 
 use anyhow::{anyhow, Result};
@@ -557,7 +558,7 @@ fn probe_mp4(name: &str, path: &Path, id: FileIdentity) -> Mp4Probe {
                 have_supported_track = true;
                 let profile = track.video_profile().ok().map(|p| format!("{p:?}"));
                 let extra = mp4_extradata_fingerprint(track);
-                let (num, den) = frame_rate_rational(track.frame_rate());
+                let (num, den) = frame_rate_from_track(track.sample_count(), track.duration());
                 streams.push(ManifestStream {
                     index: idx,
                     media_type: ManifestMediaType::Video,
@@ -674,29 +675,55 @@ fn mp4_extradata_fingerprint(track: &mp4::Mp4Track) -> Option<String> {
     Some(full[..16].to_string())
 }
 
-/// The `mp4` crate reports `frame_rate()` as an already-divided `f64`. Turn
-/// common broadcast rates back into exact rationals so 29.97 round-trips as
+/// Exact frame rate for a video track, as a rational.
+///
+/// **Do not use `mp4::Mp4Track::frame_rate()` for this.** It computes
+/// `(sample_count * 1000) / duration_ms` in *integer* arithmetic and only then
+/// casts to `f64`, so every 1001-based broadcast rate is truncated before it
+/// can ever be recognised: 29.97 arrives as exactly `29.0`, 23.976 as `23.0`,
+/// 59.94 as `59.0`. Dividing the sample count by the track's own media
+/// duration (which the crate exposes at microsecond precision) keeps the
+/// fractional part, so `30 samples / 1.001 s` is `29.97002997` and snaps to
+/// 30000/1001 as intended.
+fn frame_rate_from_track(sample_count: u32, duration: Duration) -> (Option<u32>, Option<u32>) {
+    let secs = duration.as_secs_f64();
+    if sample_count == 0 || !secs.is_finite() || secs <= 0.0 {
+        return (None, None);
+    }
+    frame_rate_rational(sample_count as f64 / secs)
+}
+
+/// Turn a measured frame rate into an exact rational so 29.97 round-trips as
 /// 30000/1001 rather than a lossy float. Unknown rates fall back to
 /// `(round(fps), 1)`.
 fn frame_rate_rational(fps: f64) -> (Option<u32>, Option<u32>) {
     if !fps.is_finite() || fps <= 0.0 {
         return (None, None);
     }
-    // Snap to the nearest well-known rate within a small tolerance.
     const KNOWN: &[(f64, u32, u32)] = &[
-        (23.976, 24000, 1001),
+        (24000.0 / 1001.0, 24000, 1001),
         (24.0, 24, 1),
         (25.0, 25, 1),
-        (29.97, 30000, 1001),
+        (30000.0 / 1001.0, 30000, 1001),
         (30.0, 30, 1),
         (50.0, 50, 1),
-        (59.94, 60000, 1001),
+        (60000.0 / 1001.0, 60000, 1001),
         (60.0, 60, 1),
     ];
+    // Snap to the *nearest* well-known rate, not the first one inside the
+    // tolerance window. The 1001-based rates sit only 0.03 (29.97 vs 30) and
+    // 0.024 (23.976 vs 24) away from their integer neighbours — narrower than
+    // the window — so a first-match scan snapped genuine 24 fps and 30 fps
+    // assets onto 24000/1001 and 30000/1001 respectively.
+    let mut best: Option<(f64, u32, u32)> = None;
     for &(rate, num, den) in KNOWN {
-        if (fps - rate).abs() < 0.05 {
-            return (Some(num), Some(den));
+        let delta = (fps - rate).abs();
+        if delta < 0.05 && best.is_none_or(|(best_delta, _, _)| delta < best_delta) {
+            best = Some((delta, num, den));
         }
+    }
+    if let Some((_, num, den)) = best {
+        return (Some(num), Some(den));
     }
     (Some(fps.round() as u32), Some(1))
 }
@@ -904,6 +931,72 @@ mod tests {
         // Nonsense yields nothing.
         assert_eq!(frame_rate_rational(0.0), (None, None));
         assert_eq!(frame_rate_rational(f64::NAN), (None, None));
+    }
+
+    /// The integer neighbours of the 1001-based rates must NOT be snapped onto
+    /// them. 24.0 sits 0.024 from 23.976 and 30.0 sits 0.03 from 29.97 — both
+    /// inside the tolerance window — so a first-match scan mislabelled every
+    /// genuine 24 fps and 30 fps asset as fractional.
+    #[test]
+    fn integer_rates_are_not_snapped_onto_their_1001_neighbours() {
+        assert_eq!(frame_rate_rational(24.0), (Some(24), Some(1)));
+        assert_eq!(frame_rate_rational(30.0), (Some(30), Some(1)));
+        assert_eq!(frame_rate_rational(60.0), (Some(60), Some(1)));
+        assert_eq!(frame_rate_rational(50.0), (Some(50), Some(1)));
+    }
+
+    /// Exact rates as they actually arrive from a real track — the full
+    /// fractional expansion, not the 4-digit label.
+    #[test]
+    fn exact_1001_rates_snap() {
+        assert_eq!(
+            frame_rate_rational(30000.0 / 1001.0),
+            (Some(30000), Some(1001))
+        );
+        assert_eq!(
+            frame_rate_rational(24000.0 / 1001.0),
+            (Some(24000), Some(1001))
+        );
+        assert_eq!(
+            frame_rate_rational(60000.0 / 1001.0),
+            (Some(60000), Some(1001))
+        );
+    }
+
+    /// Guards the `mp4` crate's integer-division trap without needing ffmpeg
+    /// on the runner. These are the exact `(sample_count, duration)` pairs a
+    /// one-second clip at each rate produces; `Mp4Track::frame_rate()` would
+    /// return 23 / 29 / 59 for the fractional three, which then fall outside
+    /// every snap window and land as `(23,1)` / `(29,1)` / `(59,1)`.
+    #[test]
+    fn frame_rate_from_track_survives_the_integer_division_trap() {
+        // 29.97: 30 samples across 1.001 s.
+        assert_eq!(
+            frame_rate_from_track(30, Duration::from_micros(1_001_000)),
+            (Some(30000), Some(1001))
+        );
+        // 23.976: 24 samples across 1.001 s.
+        assert_eq!(
+            frame_rate_from_track(24, Duration::from_micros(1_001_000)),
+            (Some(24000), Some(1001))
+        );
+        // 59.94: 60 samples across 1.001 s.
+        assert_eq!(
+            frame_rate_from_track(60, Duration::from_micros(1_001_000)),
+            (Some(60000), Some(1001))
+        );
+        // Integer rates stay integer.
+        assert_eq!(
+            frame_rate_from_track(25, Duration::from_secs(1)),
+            (Some(25), Some(1))
+        );
+        assert_eq!(
+            frame_rate_from_track(30, Duration::from_secs(1)),
+            (Some(30), Some(1))
+        );
+        // Degenerate tracks yield nothing rather than dividing by zero.
+        assert_eq!(frame_rate_from_track(0, Duration::from_secs(1)), (None, None));
+        assert_eq!(frame_rate_from_track(30, Duration::ZERO), (None, None));
     }
 
     #[test]
