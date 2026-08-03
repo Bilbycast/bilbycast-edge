@@ -946,7 +946,7 @@ Pulls media from an external WHEP server. The edge acts as a WHEP client. The `w
 
 ### Media Player Input
 
-Replays one or more local files (MPEG-TS, MP4 / MOV / MKV, or still images)
+Replays one or more local files (MPEG-TS, MP4 / MOV, or still images)
 as a paced fresh MPEG-TS feed. The synthesized TS publishes onto the flow's
 broadcast channel exactly like any other TS-bearing input, so every output
 type works unchanged. The marquee use case is a **slate / standby
@@ -975,7 +975,8 @@ of the local file kicks in transparently.
 | `type` | string | Yes | - | Must be `"media_player"`. |
 | `sources` | array | Yes | - | 1–256 entries. Each entry is a `MediaPlayerSource` (see below). Files are referenced by name within the edge's media library; upload them via the manager UI before starting the flow. |
 | `loop_playback` | boolean | No | `true` | Restart at the head of the playlist when the last source ends. Leave on for fallback duty. |
-| `shuffle` | boolean | No | `false` | Randomise source order each time the playlist starts. |
+| `shuffle` | boolean | No | `false` | Randomise source order each time the playlist starts — a fresh permutation is drawn at flow start and again on every loop wrap. |
+| `operator_control` | boolean | No | unset | Transport control (the manager's **Next** button) and the transition state machine. Unset resolves to the node default, which is **on**; `false` pins this input to the legacy sequential loop and makes the edge answer `media_player_control_unavailable` for a `Next`. Resolution order: explicit config → `BILBYCAST_MEDIA_PLAYER_CONTROLLER` → on. |
 | `paced_bitrate_bps` | integer | No | `null` | TS-only override for the egress pacer when the source has no usable PCR. Range 100 000 – 200 000 000 (100 kbps – 200 Mbps). Leave `null` to pace from PCR (default for any healthy TS asset). |
 | `ts_packets_per_datagram` | integer | No | `7` | How many 188-byte MPEG-TS packets the player bundles into each UDP datagram on the flow broadcast channel and the QUIC/UDP tunnel path (both forward each datagram unchanged). Applies to every source kind (`ts` / `mp4` / `image`). `7 × 188 = 1316 B` is the standard / SRT datagram size. Range `[1, 348]` (`348 × 188 = 65 424 B`, the largest that fits one UDP datagram; `0` is rejected). **Lower** it (e.g. `4`–`5`) for constrained / low-MTU internet or cellular paths where a big datagram IP-fragments and drops; **raise** it (`8`+) for jumbo datagrams on a LAN. Independent of any downstream UDP/RTP/SRT output, which re-chunks to its own fixed 1316 B wire size. |
 
@@ -987,9 +988,19 @@ of the local file kicks in transparently.
 | `name` | string | Yes | - | all | Filename within the media library. ASCII alphanumeric plus `._- ` only, 1–255 chars, no leading dot, no path separators. |
 
 > **`mp4` sources must be plain (unfragmented) H.264 + AAC.** Fragmented MP4 (fMP4 — `moof`/`traf` boxes, as produced by `ffmpeg -movflags frag_keyframe+empty_moov`, browser MediaRecorder / MSE, and DASH/HLS/CMAF packagers) is **rejected** with a Critical `media_player_source_unsupported` event, because the pure-Rust demuxer cannot address samples inside movie-fragment boxes and would otherwise emit an undecodable stream. Re-mux to a plain MP4 first — `ffmpeg -i in.mp4 -c copy -movflags +faststart out.mp4` — or transcode to MPEG-TS and use a `"ts"` source (the lowest-CPU path). HEVC-in-MP4 is likewise out of scope; transcode to `.ts`.
-| `fps` | integer | No | `5` | `image` | Frames per second to render. Range 1–60. |
-| `bitrate_kbps` | integer | No | `250` | `image` | Encoded video bitrate. Range 50–50 000 (50 kbps – 50 Mbps). |
+| `fps` | integer | No | `5` | `image` | Frames per second to render. Range 1–60. A still needs no more than a few fps — the picture never changes, so `fps` only sets how often an identical frame is re-encoded (and, with `gop_size = fps`, how often an IDR lands for fast receiver join). Raising it costs CPU and bitrate for no visible benefit. |
+| `bitrate_kbps` | integer | No | `250` | `image` | Encoded video bitrate. Range 50–50 000 (50 kbps – 50 Mbps). A static picture compresses to far less than this in practice; the value is an upper bound, not a target the encoder pads to. |
+| `duration_secs` | integer | No | `null` | `image` | How long the still stays on air before the playlist advances. Range 1–86 400 (1 s – 24 h). **Omit it (`null`) and the still plays forever** until an operator Next, a transition, or a flow stop — the intended behaviour for a fallback/emergency slate. Set it for a timed playlist item. |
 | `audio_silence` | boolean | No | `true` | `image` | Pair the rendered video with silent stereo AAC so downstream demuxers don't complain about a missing audio PID. |
+
+> **Still images are encoded, not looped bytes.** The `image` kind decodes
+> the file once to YUV420p and runs a real H.264 encoder at `fps`, so it
+> needs one of the `video-encoder-*` Cargo features (a default AGPL-only
+> build has no software encoder and the source fails to start). The encoder
+> is fed **90 kHz PTS** and declares that timebase via `set_pts_90k()` — see
+> [the 90 kHz PTS contract](sdi.md#the-90-khz-pts-contract-load-bearing);
+> omitting the declaration makes rate control over-allocate by orders of
+> magnitude rather than fail loudly.
 
 **Media library directory** — the on-disk location where uploaded files
 are stored on the edge. Resolution order:
@@ -1008,10 +1019,58 @@ are stored on the edge. Resolution order:
 > `Permission denied (os error 13)`. If you create the service user by hand
 > (outside `install-edge.sh`), set `BILBYCAST_MEDIA_DIR` yourself.
 
+**Media-player rollback escape hatches.** Two behaviours are **on by
+default** and can be turned off with an environment variable. These are
+rollback levers, not feature switches — setting them to `1` does nothing,
+because `1` is already the default. Both are read once at startup, so they
+must be set on the *process*: a hand-rolled `systemd-run` / `nohup` relaunch
+that forgets them silently restores the default behaviour.
+
+| Env var | Default | Effect when set to `0` / `false` / `off` |
+|---------|---------|------------------------------------------|
+| `BILBYCAST_MEDIA_PLAYER_CONTROLLER` | **on** | Falls back to the legacy sequential playout loop. The edge then stops advertising the **`media-player-control-v1`** capability, and because the manager gates its playlist **Next** button on that capability, the button disappears while the edge looks otherwise healthy — the most confusing symptom of a dropped env var. Prefer the per-input `operator_control: false` (below) to pin one player to the legacy loop without changing the node default. |
+| `BILBYCAST_MEDIA_PLAYER_INCREMENTAL_MP4` | **on** | Falls back to the whole-file MP4/MOV demux, which holds an entire MP4 in memory — a 4 GiB asset is a 4 GiB resident spike, and that was the principal driver of the media-player OOM the bounded reader was written to fix. Only useful for diagnosing a suspected incremental-reader defect. |
+
+`operator_control` (per media-player input, `Option<bool>`, default unset)
+takes precedence over `BILBYCAST_MEDIA_PLAYER_CONTROLLER` — the resolution
+order is **explicit config → env var → on**. Set it to `false` to pin one
+input to the legacy loop; the edge then answers
+`media_player_control_unavailable` for a `Next` issued against that input.
+Note the capability bit reflects only the node-wide default, so the manager
+must gate its Next button on
+`capabilities.includes('media-player-control-v1') && operator_control !== false`.
+
 Files are written `0644`. Per-asset cap: **4 GiB** (`MAX_FILE_BYTES`).
 Library cap: **16 GiB** total (`MAX_TOTAL_BYTES`). Partial uploads stage
 under `<media_dir>/.tmp/<name>.<session_id>` and are reaped after 1 hour
 of inactivity.
+
+**Asset manifests (content-based kind detection).** After each upload the
+edge probes the new file and writes a small JSON *manifest* describing what
+it actually is — the source **kind is detected from the bytes, not the
+filename extension**. A `.mov` that is really an MP4 resolves to kind `mp4`;
+a file that matches none of the three supported kinds (MP4/MOV, TS File,
+Still Image) is reported as `unsupported` rather than mis-played. The manifest
+also carries container facts (format, duration, TS packet stride), per-stream
+codec / resolution / frame-rate / audio layout, and a `compatibility` block
+the manager renders as a kind badge and (from Phase 2) the playlist planner
+consumes.
+
+Manifests are cached as sidecar files under `<media_dir>/.manifests/<name>.json`.
+That directory is a dotfile, so it never appears in the operator library
+listing and never counts against the 16 GiB quota. A sidecar is invalidated
+and the file re-probed automatically whenever the file's size or mtime
+changes (the edge's atomic-rename upload always changes at least one), or when
+the manifest schema version moves. Probing is bounded, runs off the real-time
+path, and parses the MP4 `moov` header or image header only — it never decodes
+video and never blocks the upload's completion ACK.
+
+WS commands (manager → edge): `inspect_media { name }` returns the cached-or-
+freshly-probed manifest (`{ "manifest": … }`, or `manifest: null` when the file
+is absent); `reprobe_media { name }` forces a fresh probe, replacing the
+sidecar. Probe outcomes carry stable `error_code`s: `media_asset_kind_unsupported`
+(matched no supported kind), `media_asset_mp4_unusable` (recognised MP4 but
+fragmented or no H.264/AAC track), `media_asset_probe_io` (unreadable).
 
 **Uploading files** — the manager UI's input modal exposes a *Manage Files
 (this node)* panel that hosts the chosen file, splits it into 1 MiB

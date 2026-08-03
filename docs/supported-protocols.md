@@ -117,7 +117,8 @@ bilbycast-edge is a media gateway supporting multiple transport protocols for pr
   optional screen-ID text, tone/beep ident, and an A/V-sync sweep, muxed as
   a paced MPEG-TS on the flow's broadcast channel. No source required.
 - **`media_player`** (default-on `replay`/`media-codecs` build) — replays a
-  playlist of local assets (TS / MP4 / MOV / MKV / still image) from the
+  playlist of local assets (TS / MP4 / MOV / still image — the `mp4` kind is
+  ISO Base Media / QuickTime only; Matroska `.mkv` is **not** supported) from the
   edge's media library (`BILBYCAST_MEDIA_DIR`) as a paced fresh MPEG-TS.
   Supports `loop_playback`, `shuffle`, optional `paced_bitrate_bps`
   (TS-only), and optional MPTS→SPTS `program_number` down-selection.

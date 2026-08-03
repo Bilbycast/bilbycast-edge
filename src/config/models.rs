@@ -1596,7 +1596,7 @@ pub enum InputConfig {
     #[serde(rename = "test_pattern")]
     TestPattern(TestPatternInputConfig),
     /// File-based media player: replays a local `.ts` / `.mp4` / `.mov` /
-    /// `.mkv` / image asset (single file or sequential playlist) as a
+    /// image asset (single file or sequential playlist) as a
     /// fresh MPEG-TS feed onto the flow broadcast channel. Used as a
     /// fallback source under PID-bus Hitless when the live primary stalls,
     /// or as a manual idle fill. Files live under the edge's media
@@ -1937,7 +1937,9 @@ fn default_tp_ts_packets_per_datagram() -> u16 {
 ///
 /// * `ts`  — pre-encoded MPEG-TS file. Read raw, paced from PCR (or the
 ///   optional `paced_bitrate_bps` override), no decoder. Lowest CPU.
-/// * `mp4` — MP4 / MOV / MKV container. Demuxed with the `mp4` crate,
+/// * `mp4` — MP4 / MOV container (ISO Base Media / QuickTime). Demuxed
+///   with the `mp4` crate, which is ISO-BMFF only — Matroska (`.mkv`) is
+///   **not** supported and never has been.
 ///   H.264 NAL units converted from AVCC to Annex-B, AAC samples wrapped
 ///   in ADTS, all re-muxed via the shared [`crate::engine::rtmp::ts_mux::TsMuxer`].
 /// * `image` — single still image (JPEG / PNG). Decoded once, fed to the
@@ -1963,7 +1965,7 @@ pub enum MediaPlayerSource {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         program_number: Option<u16>,
     },
-    /// MP4 / MOV / MKV container in the edge's media library.
+    /// MP4 / MOV container in the edge's media library.
     Mp4 {
         /// Filename inside the media library directory (no path components).
         name: String,
@@ -1984,6 +1986,12 @@ pub enum MediaPlayerSource {
         /// MediaPlayer source which carries audio). Default true.
         #[serde(default = "default_true")]
         audio_silence: bool,
+        /// How long the still is shown before the playlist advances, in
+        /// seconds. `None` = play indefinitely (the slate / Hitless-fallback
+        /// use case, unchanged). Set it to make the image a *timed* playlist
+        /// item so a rotating playlist doesn't stall on it forever.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        duration_secs: Option<u32>,
     },
 }
 
@@ -2079,6 +2087,16 @@ pub struct MediaPlayerInputConfig {
     /// each datagram unchanged.
     #[serde(default = "default_mp_ts_packets_per_datagram")]
     pub ts_packets_per_datagram: u16,
+    /// Operator transport control (Phase 3b) — the manager's **Next** button
+    /// and the underlying transition state machine. When enabled, playout runs
+    /// through the controller path (operator `Next`, natural EOS, loop, and
+    /// transitions all commit through one state machine); when disabled the
+    /// legacy sequential loop runs. **Default on** (`None`). Set `false` to pin
+    /// a specific player to the legacy loop. A node-wide
+    /// `BILBYCAST_MEDIA_PLAYER_CONTROLLER=0` escape hatch forces it off only
+    /// where this field is unset (explicit config wins over the env var).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operator_control: Option<bool>,
 }
 
 fn default_image_fps() -> u8 {

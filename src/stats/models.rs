@@ -887,6 +887,48 @@ pub struct MediaPlayerInputStats {
     /// True while the pacer is latched as lagging (see
     /// `media_player_pacer_lagging` / `media_player_pacer_recovered` events).
     pub pacer_lagging: bool,
+    /// Playback generation (Phase 3b): increments once per committed
+    /// transition. The manager sends it back as `expected_generation` on a
+    /// `Next` command for double-click safety. `0` under the legacy loop.
+    #[serde(default)]
+    pub generation: u64,
+    /// Phase 5 transport: milliseconds elapsed within the current source
+    /// (wall-based, so meaningful for every source kind). `None` before the
+    /// first source starts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_source_elapsed_ms: Option<u64>,
+    /// Phase 5 transport: total duration of the current source in milliseconds
+    /// when known (MP4/MOV). `None` for live TS / still image → the UI shows an
+    /// indeterminate progress head.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_source_duration_ms: Option<u64>,
+    /// Phase 5 transport: whether the NEXT playlist item can be opened right
+    /// now. `Some(true)` ready, `Some(false)` missing/unresolvable (a `Next`
+    /// would cut to dead air), `None` when unknown or there is no next item.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_source_ready: Option<bool>,
+    /// Phase 4 follow-up: reader path driving the current source — `"ts"`,
+    /// `"mp4_whole_file"`, `"mp4_incremental"`, `"image"`, or `"unknown"`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub reader_mode: String,
+    /// Phase 7 audio-only: `Some(false)` when the current source has no video
+    /// (audio-only playout), `Some(true)` when it has video, `None` when the
+    /// player hasn't determined it (e.g. a TS source it doesn't pre-parse).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_source_has_video: Option<bool>,
+    /// Phase 4 follow-up MP4 cache telemetry: cached items, resident whole-file
+    /// bytes, byte budget (pressure %), and cumulative hits / misses across the
+    /// demux + warm-reader caches. All default 0 for non-MP4 sources.
+    #[serde(default)]
+    pub cache_entries: u64,
+    #[serde(default)]
+    pub cache_resident_bytes: u64,
+    #[serde(default)]
+    pub cache_max_bytes: u64,
+    #[serde(default)]
+    pub cache_hits: u64,
+    #[serde(default)]
+    pub cache_misses: u64,
 }
 
 /// SDI (DeckLink) capture statistics for one input.
@@ -1199,7 +1241,13 @@ pub struct DisplayStats {
     /// Current pixel format on the wire to the connector
     /// (v1 always `"XRGB8888"`).
     pub pixel_format: String,
-    /// Decoder backend, `"sw"` in v1; `"vaapi"` / `"nvdec"` in v2.
+    /// Backend **actually** decoding right now — `"cpu"`,
+    /// `"cpu (hw unavailable)"`, `"nvdec"`, `"qsv"`, `"vaapi-zerocopy"`,
+    /// `"rkmpp-zerocopy"`. Tracks the live decode path, not the one the
+    /// resolver picked at startup: the per-source MPEG-2 CPU pin reports
+    /// `"cpu"` while H.264/HEVC on the same output stay on hardware, and
+    /// a runtime HW→CPU demotion flips this to `"cpu (hw unavailable)"`.
+    /// Sourced from `DisplayStatsCounters::active_decoder_label`.
     pub decoder_kind: String,
     /// Source video codec (`"h264"` / `"hevc"`).
     pub video_codec: String,

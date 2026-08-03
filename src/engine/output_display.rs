@@ -60,7 +60,7 @@ use crate::engine::packet::RtpPacket;
 use crate::engine::ts_demux::{DemuxedFrame, TsDemuxer};
 use crate::engine::video_decode_stats::VideoDecodeStats;
 use crate::manager::events::{EventSender, EventSeverity};
-use crate::stats::collector::{DisplayStatsCounters, OutputStatsAccumulator};
+use crate::stats::collector::{DisplayDecoderLabel, DisplayStatsCounters, OutputStatsAccumulator};
 
 // Display feeder depth. 8 was too tight on 1080p H.264 CPU decode —
 // a single heavy frame whose blit+present overran the source frame
@@ -1100,6 +1100,7 @@ fn demux_decode_loop(
         consecutive_send_errors: 0,
         last_send_error_log_at: None,
         first_send_after_open: None,
+        mpeg2_cpu_pinned: false,
     };
     let mut aac_decoder: Option<AacDecoder> = None;
     let mut ff_audio_decoder: Option<FfAudioDecoder> = None;
@@ -1728,6 +1729,19 @@ struct HwOpenState {
     /// `frames_received_since_open == 0` while still on a HW backend,
     /// we emit `display_hw_decode_no_frames` and demote to CPU.
     first_send_after_open: Option<Instant>,
+    /// Runtime-learned companion to the static `mpeg2_requires_cpu_decode`
+    /// table: set when a *hardware* MPEG-2 decode fails at runtime on a
+    /// backend the table does not pin. The table can only encode what the
+    /// fleet has been measured on — VAAPI is carved out because Intel iHD
+    /// decodes MPEG-2, but VAAPI is not one implementation (AMD VCN4
+    /// dropped MPEG-2 decode entirely, and `avcodec_open2` succeeds there
+    /// anyway), so an unmeasured host must be able to discover the same
+    /// answer for itself. Scoping that discovery to MPEG-2 rather than
+    /// demoting `backend` wholesale is the whole point: a backend-wide
+    /// demote is permanent and would strip HW decode from every later
+    /// H.264/HEVC source in the playlist, which is exactly the failure the
+    /// static pin exists to prevent.
+    mpeg2_cpu_pinned: bool,
 }
 
 /// Sustained run of `send_packet_with_pts` errors after which the
@@ -1759,6 +1773,115 @@ const WATCHDOG_NO_FRAMES_MS: u64 = 2_500;
 /// rate independently.
 const UNSUPPORTED_PIXFMT_RE_EMIT_S: u64 = 60;
 
+/// Whether MPEG-2 must be decoded in software on `backend`.
+///
+/// The original blanket pin ("every HW backend rejects a media-player
+/// TS-passthrough MPEG-2 stream with per-AU `AVERROR_INVALIDDATA`")
+/// turned out to bundle three unrelated failure modes, and two of the
+/// four backends have since been carved out with per-backend evidence:
+///
+/// * **NVDEC — carved out.** The "failure" was a build gap:
+///   `mpeg2_cuvid` was missing from the vendored FFmpeg's decoder list,
+///   so decoder-by-name returned NULL, open failed and the demote fired
+///   without the GPU ever being consulted. With the decoder compiled
+///   in, MPEG-2 was re-validated on bilby-z440 against both the
+///   broadcast sample and a freshly generated file (mpeg2/nvdec, zero
+///   demotions/errors, full rate).
+/// * **VAAPI — still pinned, but not for the original reason.** The
+///   per-AU `AVERROR_INVALIDDATA` story was wrong: an A/B on bilby-bite
+///   (i3-1215U, iHD, `VAProfileMPEG2Main`) measured an identical +11
+///   `send_packet` errors at each MPEG-2 window start on *both* the
+///   pinned (CPU) and unpinned (VAAPI) builds, flat thereafter, so that
+///   burst is file-determined (mid-GOP AUs ahead of the first sequence
+///   header) and not a backend rejection at all. VAAPI genuinely
+///   decodes the stream in hardware — i915 GEM totals rise into a real
+///   decode surface pool for the window (60 obj / 50 MB → 84-87 obj /
+///   139 MB, where the pinned build collapses to 8 obj / 30 MB) and
+///   process CPU drops ~64 % → ~49 %.
+///
+///   It stays pinned as a conservative default, **not** because
+///   hardware decode was shown to be worse. An earlier revision of this
+///   comment claimed VAAPI presented ~17 fps against CPU's 24 fps; that
+///   comparison was invalid. It used a video-only 23.976 fps TS on a
+///   short loop, which is subject to the loop-restart degradation
+///   documented on `ts_loop_restart` — so the two builds were sampled at
+///   different points on the same decay curve, and the difference was
+///   attributed to the decoder. Re-run properly on bilby-bite with
+///   matched 1080p30 clips (audio present, so the decay is absent),
+///   MPEG-2 decode measured 27-29 fps / 2.3 drops-per-second on CPU
+///   versus 27-30 fps / 2.0 on VAAPI: parity, within noise. Unpinning is
+///   therefore defensible on the evidence but buys nothing measurable at
+///   the panel, so the fleet-wide default stays CPU until someone wants
+///   the CPU headroom badly enough to validate it per host.
+/// * **QSV — still pinned.** Same silicon as VAAPI; never re-validated
+///   at all.
+///
+/// Two rules this predicate has cost us twice over, both worth obeying:
+/// `DisplayStats.decoder_kind` and the `backend=` field on the
+/// send_packet warning report `state.backend` whether or not the pin
+/// fired, so **neither is evidence of which decoder ran** — prove it
+/// out-of-band (i915 GEM totals, NVML, process CPU). And decode-side
+/// evidence alone must never move this predicate: measure
+/// `frames_displayed` + `frames_dropped_mpsc_full` across a full source
+/// window, on content that is not itself degrading.
+/// * **RKMPP — still pinned.** Not a runtime rejection at all: the
+///   vendored rkmpp FFmpeg fork registers no MPEG-2 decoder
+///   (`rkmppdec.c` handles h264/hevc/vp8/vp9 only), so
+///   `ffmpeg_decoder_name` maps to None and nothing can be opened —
+///   even though the RK3588's MPP library itself advertises
+///   `MPP_VIDEO_CodingMPEG2`. Wiring it up means adding a decoder to
+///   the vendored C tree, not flipping this predicate.
+///
+/// The pin opens a CPU decoder for MPEG-2 *without touching
+/// `state.backend`*, so the codec is software-decoded locally while
+/// H.264/HEVC keep the HW path — and the resource card stays accurate
+/// for those sources.
+fn mpeg2_requires_cpu_decode(codec: VideoCodec, backend: DecoderBackend) -> bool {
+    matches!(codec, VideoCodec::Mpeg2)
+        && matches!(
+            backend,
+            DecoderBackend::Vaapi | DecoderBackend::Qsv | DecoderBackend::Rkmpp
+        )
+}
+
+/// Whether this decoder open must use CPU for MPEG-2 — the static table
+/// above OR the runtime-learned pin (`HwOpenState::mpeg2_cpu_pinned`),
+/// which lets a host the fleet has never measured reach the same answer
+/// on its own after one failed hardware attempt.
+/// Whether hardware is *actually* decoding the codec currently on air.
+///
+/// `state.backend` alone is not that answer. The MPEG-2 pin deliberately opens
+/// a CPU decoder while leaving `state.backend` on the hardware backend, so that
+/// H.264/HEVC sources later in the same playlist keep the hardware path. Every
+/// runtime gate that means "hardware is decoding, so a failure is a hardware
+/// failure" must therefore subtract the pin, or it treats a CPU decoder's
+/// behaviour as evidence against a hardware backend that was never opened.
+fn hw_decode_active(state: &HwOpenState, codec: Option<VideoCodec>) -> bool {
+    !matches!(state.backend, DecoderBackend::Cpu)
+        && !codec.is_some_and(|c| mpeg2_pin_active(c, state.backend, state.mpeg2_cpu_pinned))
+}
+
+fn mpeg2_pin_active(codec: VideoCodec, backend: DecoderBackend, runtime_pinned: bool) -> bool {
+    mpeg2_requires_cpu_decode(codec, backend)
+        || (matches!(codec, VideoCodec::Mpeg2) && runtime_pinned)
+}
+
+/// Map a hardware `DecoderBackend` to the manager-visible
+/// [`DisplayDecoderLabel`] the snapshot renders on `decoder_kind`. HW
+/// backends carry their `-zerocopy` scanout suffix (the display path
+/// requests DRM_PRIME on every one); `Cpu` maps to the plain `Cpu`
+/// variant here — callers that mean "HW was wanted but failed" store
+/// `CpuHwUnavailable` explicitly instead.
+fn decoder_label_for_backend(backend: DecoderBackend) -> DisplayDecoderLabel {
+    match backend {
+        DecoderBackend::Cpu => DisplayDecoderLabel::Cpu,
+        DecoderBackend::Nvdec => DisplayDecoderLabel::Nvdec,
+        DecoderBackend::Qsv => DisplayDecoderLabel::Qsv,
+        DecoderBackend::Vaapi => DisplayDecoderLabel::VaapiZeroCopy,
+        DecoderBackend::Rkmpp => DisplayDecoderLabel::RkmppZeroCopy,
+    }
+}
+
 /// Open a `VideoDecoder` with bounded HW retry + CPU fallback.
 ///
 /// On a flow restart that overlaps the previous flow's HW context
@@ -1780,7 +1903,44 @@ fn open_video_decoder_with_retry(
     output_id: &str,
 ) -> Option<VideoDecoder> {
     if matches!(state.backend, DecoderBackend::Cpu) {
+        // `fell_back_to_cpu` distinguishes "operator chose CPU" (plain
+        // `Cpu`) from "HW was wanted but is unavailable / demoted"
+        // (`CpuHwUnavailable`) — both land here once `state.backend` is
+        // `Cpu`, but the manager UI should explain the latter.
+        counters.set_active_decoder_label(if state.fell_back_to_cpu {
+            DisplayDecoderLabel::CpuHwUnavailable
+        } else {
+            DisplayDecoderLabel::Cpu
+        });
         return VideoDecoder::open_with_backend(codec, DecoderBackend::Cpu).ok();
+    }
+
+    // MPEG-2 → CPU decode on the backends that still need it. Which ones, and
+    // the per-backend evidence for each, live on `mpeg2_requires_cpu_decode`;
+    // don't restate it here, it has already drifted once.
+    //
+    // `avcodec_open2` succeeds even where the backend can't handle the stream,
+    // so the open-retry + demote path below never fires for this failure class
+    // — hence a pre-emptive pin rather than a fallback.
+    //
+    // The pin does NOT touch `state.backend`: a later H.264/HEVC source in the
+    // same playlist still opens on the HW backend, and the CPU decoder's
+    // sysmem frames route through the present path's per-frame `is_vaapi()` /
+    // `is_drm_prime()` check (CPU-blit), so no other display state needs to
+    // know. Two caveats that follow from that: `DisplayStats.decoder_kind`
+    // still reports the HW backend while MPEG-2 decodes on CPU, and so does
+    // the `backend=` field on the `send_packet failed` warning — neither is
+    // evidence of which decoder actually produced (or rejected) a frame.
+    // Falls through to the HW path if the CPU open itself fails (then the
+    // normal retry+demote handles it).
+    if mpeg2_pin_active(codec, state.backend, state.mpeg2_cpu_pinned) {
+        if let Some(d) = VideoDecoder::open_with_backend(codec, DecoderBackend::Cpu).ok() {
+            // MPEG-2 on CPU while `state.backend` stays HW for other
+            // codecs — plain `Cpu`, not a failure. This is the report
+            // that used to lie as `vaapi-zerocopy`/`rkmpp-zerocopy`.
+            counters.set_active_decoder_label(DisplayDecoderLabel::Cpu);
+            return Some(d);
+        }
     }
 
     const ATTEMPT_DELAYS_MS: [u64; 3] = [50, 100, 200];
@@ -1807,6 +1967,7 @@ fn open_video_decoder_with_retry(
                     // paying a sysmem download on every frame.
                     d.set_rkmpp_zero_copy(true);
                 }
+                counters.set_active_decoder_label(decoder_label_for_backend(state.backend));
                 return Some(d);
             }
             Err(e) => {
@@ -1818,6 +1979,7 @@ fn open_video_decoder_with_retry(
     // Retry budget exhausted. Demote to CPU for the rest of this run.
     state.backend = DecoderBackend::Cpu;
     state.fell_back_to_cpu = true;
+    counters.set_active_decoder_label(DisplayDecoderLabel::CpuHwUnavailable);
     counters.decoder_demotions.fetch_add(1, Ordering::Relaxed);
     if !state.fallback_event_emitted {
         state.fallback_event_emitted = true;
@@ -2090,8 +2252,12 @@ fn flush_decoders_for_switch(
 
 /// Switch the active decoder from a HW backend to CPU mid-flight.
 /// Called by both the runtime send-error threshold (Section 1) and the
-/// watchdog (Section 3). Idempotent on repeat calls — subsequent calls
-/// are no-ops because `state.backend` is already `Cpu`. Emits one
+/// watchdog (Section 3). Idempotent on repeat calls: a backend-wide demote
+/// short-circuits because `state.backend` is already `Cpu`, and an MPEG-2
+/// demote short-circuits on `state.mpeg2_cpu_pinned` — that second guard is
+/// load-bearing, because the MPEG-2 branch deliberately leaves
+/// `state.backend` on the hardware backend, so it has no `Cpu` state to
+/// return early on. Emits one
 /// Warning event with the supplied `trigger` so the manager UI can
 /// distinguish "send_packet kept failing" from "decoder accepted
 /// packets but never produced a frame". Single-shot via
@@ -2114,10 +2280,56 @@ fn force_cpu_fallback(
         // HW, plus by the send-error threshold path on a re-entry.
         return;
     }
+
+    // MPEG-2 demotes are scoped to MPEG-2, not to the backend. See
+    // `HwOpenState::mpeg2_cpu_pinned`: the backends that can't decode
+    // MPEG-2 decode H.264/HEVC perfectly well, so taking the whole
+    // backend down would trade one bad source for a whole bad playlist.
+    // The next `open_video_decoder_with_retry` for MPEG-2 picks up the
+    // pin; H.264/HEVC keep opening on `state.backend` untouched.
+    if matches!(*current, Some(VideoCodec::Mpeg2)) {
+        // Already pinned — statically for this backend, or from an earlier
+        // demote this run. Re-entering would tear the decoder down and reset
+        // the very counters the two callers test, so on a statically-pinned
+        // host the cycle re-armed every WATCHDOG_NO_FRAMES_MS forever, each
+        // pass emitting a Warning naming a backend that was never opened.
+        if mpeg2_pin_active(VideoCodec::Mpeg2, state.backend, state.mpeg2_cpu_pinned) {
+            return;
+        }
+        state.mpeg2_cpu_pinned = true;
+        let backend = backend_name(state.backend);
+        event_sender.emit_flow_with_details(
+            EventSeverity::Warning,
+            crate::manager::events::category::SYSTEM_RESOURCES,
+            format!(
+                "display output '{output_id}': MPEG-2 hardware decode failed on \
+                 {backend} ({trigger}); MPEG-2 pinned to CPU for this run — \
+                 H.264/HEVC keep hardware decode"
+            ),
+            flow_id,
+            serde_json::json!({
+                "error_code": "display_hw_decode_mpeg2_pinned",
+                "output_id": output_id,
+                "backend": backend,
+                "trigger": trigger,
+                "last_error": last_error.unwrap_or_else(|| "unknown".to_string()),
+            }),
+        );
+        *slot = None;
+        *current = None;
+        // MPEG-2 is now CPU-decoded; the next open confirms it via the
+        // pin path, but report the truth immediately rather than leaving
+        // the HW label standing until re-open.
+        counters.set_active_decoder_label(DisplayDecoderLabel::Cpu);
+        reset_decoder_open_window(state, counters);
+        return;
+    }
+
     state.backend = DecoderBackend::Cpu;
     state.fell_back_to_cpu = true;
     *slot = None;
     *current = None;
+    counters.set_active_decoder_label(DisplayDecoderLabel::CpuHwUnavailable);
     reset_decoder_open_window(state, counters);
     counters.decoder_demotions.fetch_add(1, Ordering::Relaxed);
     if !state.fallback_event_emitted {
@@ -2340,7 +2552,7 @@ fn handle_video_au(
     let speculative_grace = keyframe_gate.speculative_feed()
         && keyframe_gate.armed_elapsed() < SPECULATIVE_DEMOTE_GRACE;
     if hw_open_state.consecutive_send_errors >= RUNTIME_FAIL_DEMOTE_THRESHOLD
-        && !matches!(hw_open_state.backend, DecoderBackend::Cpu)
+        && hw_decode_active(hw_open_state, *current_video_codec)
         && !speculative_grace
     {
         force_cpu_fallback(
@@ -2364,7 +2576,7 @@ fn handle_video_au(
     // yet) — pre-gate builds demoted healthy VAAPI through exactly
     // this path on every mid-GOP join ("accepted packets but produced
     // no frame in ~2.5 s").
-    if !matches!(hw_open_state.backend, DecoderBackend::Cpu)
+    if hw_decode_active(hw_open_state, *current_video_codec)
         && !hw_open_state.fell_back_to_cpu
         && !speculative_grace
         && counters.frames_received_since_open.load(Ordering::Relaxed) == 0
@@ -4971,6 +5183,131 @@ fn emit_event(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// MPEG-2 stays pinned to software decode on VAAPI (hardware decode
+    /// works but presents ~7 fps worse — see the predicate's doc), QSV
+    /// (untested, same silicon) and RKMPP (the vendored FFmpeg fork has
+    /// no MPEG-2 decoder to open). Only NVDEC is carved out, and only
+    /// because it was measured end-to-end on bilby-z440 once
+    /// `mpeg2_cuvid` was compiled into the vendored FFmpeg — its
+    /// original "failure" was that build gap, not the silicon.
+    #[test]
+    fn mpeg2_pinned_to_cpu_on_every_backend_except_nvdec() {
+        for backend in [
+            DecoderBackend::Vaapi,
+            DecoderBackend::Qsv,
+            DecoderBackend::Rkmpp,
+        ] {
+            assert!(
+                mpeg2_requires_cpu_decode(VideoCodec::Mpeg2, backend),
+                "MPEG-2 must be pinned to CPU on {backend:?}"
+            );
+        }
+        assert!(!mpeg2_requires_cpu_decode(
+            VideoCodec::Mpeg2,
+            DecoderBackend::Nvdec
+        ));
+    }
+
+    /// The runtime-learned pin covers what the static table cannot: a host
+    /// whose VAAPI has no MPEG-2 entrypoint (AMD VCN4 dropped it) discovers
+    /// that for itself after one failed attempt, and thereafter opens MPEG-2
+    /// on CPU — while H.264/HEVC keep opening on the hardware backend, which
+    /// is the whole reason the demote is codec-scoped rather than
+    /// backend-wide.
+    #[test]
+    fn runtime_pin_scopes_to_mpeg2_and_spares_other_codecs() {
+        let carved_out = DecoderBackend::Nvdec;
+        // Before the runtime pin: MPEG-2 goes to hardware on a carved-out
+        // backend, exactly as the static table says.
+        assert!(!mpeg2_pin_active(VideoCodec::Mpeg2, carved_out, false));
+        // After one runtime failure: MPEG-2 is on CPU...
+        assert!(mpeg2_pin_active(VideoCodec::Mpeg2, carved_out, true));
+        // ...and nothing else is.
+        assert!(!mpeg2_pin_active(VideoCodec::H264, carved_out, true));
+        assert!(!mpeg2_pin_active(VideoCodec::Hevc, carved_out, true));
+        // A statically pinned backend does not need the runtime flag.
+        assert!(mpeg2_pin_active(
+            VideoCodec::Mpeg2,
+            DecoderBackend::Rkmpp,
+            false
+        ));
+    }
+
+    /// The pin is codec-specific — H.264/HEVC keep the zero-copy HW path on
+    /// the very backends MPEG-2 is pinned away from, including when both
+    /// appear in one playlist.
+    #[test]
+    fn non_mpeg2_codecs_keep_hardware_decode() {
+        for backend in [
+            DecoderBackend::Vaapi,
+            DecoderBackend::Qsv,
+            DecoderBackend::Nvdec,
+            DecoderBackend::Rkmpp,
+        ] {
+            assert!(!mpeg2_requires_cpu_decode(VideoCodec::H264, backend));
+            assert!(!mpeg2_requires_cpu_decode(VideoCodec::Hevc, backend));
+        }
+    }
+
+    /// An already-CPU backend needs no pin — the caller returns before
+    /// reaching this predicate, and it must not claim otherwise.
+    #[test]
+    fn cpu_backend_needs_no_pin() {
+        assert!(!mpeg2_requires_cpu_decode(
+            VideoCodec::Mpeg2,
+            DecoderBackend::Cpu
+        ));
+    }
+
+    /// `decoder_kind` must report what is ACTUALLY decoding — the report
+    /// that misled diagnostics twice and kept the manager Resources card
+    /// showing a HW session a demote/pin had already moved to CPU. This
+    /// covers the backend→label mapping the live-update sites feed into
+    /// `active_decoder_label`, its u8 round-trip, and the strings.
+    #[test]
+    fn decoder_label_reflects_active_backend() {
+        assert_eq!(
+            decoder_label_for_backend(DecoderBackend::Cpu),
+            DisplayDecoderLabel::Cpu
+        );
+        assert_eq!(
+            decoder_label_for_backend(DecoderBackend::Nvdec),
+            DisplayDecoderLabel::Nvdec
+        );
+        assert_eq!(
+            decoder_label_for_backend(DecoderBackend::Qsv),
+            DisplayDecoderLabel::Qsv
+        );
+        assert_eq!(
+            decoder_label_for_backend(DecoderBackend::Vaapi),
+            DisplayDecoderLabel::VaapiZeroCopy
+        );
+        assert_eq!(
+            decoder_label_for_backend(DecoderBackend::Rkmpp),
+            DisplayDecoderLabel::RkmppZeroCopy
+        );
+        // Round-trip through the atomic u8 encoding on the counters.
+        for l in [
+            DisplayDecoderLabel::Unset,
+            DisplayDecoderLabel::Cpu,
+            DisplayDecoderLabel::CpuHwUnavailable,
+            DisplayDecoderLabel::Nvdec,
+            DisplayDecoderLabel::Qsv,
+            DisplayDecoderLabel::VaapiZeroCopy,
+            DisplayDecoderLabel::RkmppZeroCopy,
+        ] {
+            assert_eq!(DisplayDecoderLabel::from_u8(l as u8), l);
+        }
+        // The MPEG-2 pin reports plain "cpu" (HW still serves other
+        // codecs) — distinct from the demote's "hw unavailable" reason.
+        assert_eq!(DisplayDecoderLabel::Cpu.as_str(), "cpu");
+        assert_eq!(
+            DisplayDecoderLabel::CpuHwUnavailable.as_str(),
+            "cpu (hw unavailable)"
+        );
+        assert_eq!(DisplayDecoderLabel::VaapiZeroCopy.as_str(), "vaapi-zerocopy");
+    }
 
     /// The KMS-open error classifier must map a compositor-held DRM master
     /// (the `display_master_busy` context string emitted by `KmsDisplay::open`

@@ -404,6 +404,69 @@ impl DisplayCodecLabel {
     }
 }
 
+/// Discriminant table for the lock-free `active_decoder_label` atomic on
+/// [`DisplayStatsCounters`] — the decoder backend **actually** decoding
+/// right now, as opposed to the one the resolver picked at startup.
+///
+/// The `decoder_kind` string on the [`DisplayStatsHandle`] is set once at
+/// output registration and freezes, so it silently lies whenever the live
+/// path diverges from the resolved one: the MPEG-2 CPU pin decodes on CPU
+/// while the handle still reads `vaapi-zerocopy`, and a runtime HW→CPU
+/// demote likewise leaves the HW label frozen. Both misled diagnostics
+/// this session and, worse, kept the manager's Resources card showing a
+/// HW decoder session that was no longer in use. `engine::output_display`
+/// updates this atomic every time it actually opens or demotes a decoder
+/// (`open_video_decoder_with_retry`, `force_cpu_fallback`), and the
+/// snapshot path prefers it over the frozen handle label whenever it is
+/// set — exactly the fix already applied to the panel-mode fields above.
+#[allow(dead_code)]
+#[repr(u8)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum DisplayDecoderLabel {
+    /// No decoder opened yet — snapshot falls back to the handle label.
+    Unset = 0,
+    /// Software libavcodec: operator-chosen, or the per-source MPEG-2 pin
+    /// decoding on CPU while HW stays available for other codecs. Not a
+    /// failure — just "CPU is what's running".
+    Cpu = 1,
+    /// Software libavcodec because HW was wanted but is unavailable: the
+    /// startup soft-fallback (host can't do the chosen backend) or a
+    /// runtime demotion after HW decode failed mid-flight. Distinct from
+    /// `Cpu` so the UI can still explain *why* it isn't on hardware.
+    CpuHwUnavailable = 2,
+    Nvdec = 3,
+    Qsv = 4,
+    VaapiZeroCopy = 5,
+    RkmppZeroCopy = 6,
+}
+
+#[allow(dead_code)]
+impl DisplayDecoderLabel {
+    pub fn from_u8(v: u8) -> Self {
+        match v {
+            1 => Self::Cpu,
+            2 => Self::CpuHwUnavailable,
+            3 => Self::Nvdec,
+            4 => Self::Qsv,
+            5 => Self::VaapiZeroCopy,
+            6 => Self::RkmppZeroCopy,
+            _ => Self::Unset,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Unset => "unset",
+            Self::Cpu => "cpu",
+            Self::CpuHwUnavailable => "cpu (hw unavailable)",
+            Self::Nvdec => "nvdec",
+            Self::Qsv => "qsv",
+            Self::VaapiZeroCopy => "vaapi-zerocopy",
+            Self::RkmppZeroCopy => "rkmpp-zerocopy",
+        }
+    }
+}
+
 /// Lock-free counters that back [`crate::stats::models::DisplayStats`].
 /// Owned by `engine::output_display`; the accumulator stores an `Arc`
 /// to it so the snapshot path can sample without locking.
@@ -617,6 +680,13 @@ pub struct DisplayStatsCounters {
     /// `None` when the output has no audio device configured). Same
     /// shape as `video_codec_label`.
     pub audio_codec_label: AtomicU8,
+    /// Decoder backend **actually** decoding right now, as a
+    /// [`DisplayDecoderLabel`] discriminant. `0` (Unset) until the first
+    /// decoder opens, after which `open_video_decoder_with_retry` and
+    /// `force_cpu_fallback` keep it current across the MPEG-2 CPU pin and
+    /// runtime HW→CPU demotions. The snapshot path prefers it over the
+    /// frozen `DisplayStatsHandle::decoder_kind` string whenever it is set.
+    pub active_decoder_label: AtomicU8,
 }
 
 #[allow(dead_code)]
@@ -639,6 +709,12 @@ impl DisplayStatsCounters {
     }
     pub fn load_audio_codec_label(&self) -> DisplayCodecLabel {
         DisplayCodecLabel::from_u8(self.audio_codec_label.load(Ordering::Relaxed))
+    }
+    pub fn set_active_decoder_label(&self, label: DisplayDecoderLabel) {
+        self.active_decoder_label.store(label as u8, Ordering::Relaxed);
+    }
+    pub fn load_active_decoder_label(&self) -> DisplayDecoderLabel {
+        DisplayDecoderLabel::from_u8(self.active_decoder_label.load(Ordering::Relaxed))
     }
 }
 
@@ -1244,7 +1320,17 @@ impl OutputStatsAccumulator {
                     }
                 },
                 pixel_format: h.pixel_format.clone(),
-                decoder_kind: h.decoder_kind.clone(),
+                // Prefer the live `active_decoder_label` atomic — kept
+                // current across the MPEG-2 CPU pin and runtime demotes —
+                // over the frozen handle string, which only reflects the
+                // decoder the resolver picked at startup. Falls back to
+                // the handle label before the first decoder opens (Unset).
+                decoder_kind: match h.counters.load_active_decoder_label() {
+                    crate::stats::collector::DisplayDecoderLabel::Unset => {
+                        h.decoder_kind.clone()
+                    }
+                    live => live.as_str().to_string(),
+                },
                 video_codec: h.counters.load_video_codec_label().as_str().to_string(),
                 audio_codec: h.counters.load_audio_codec_label().as_str().to_string(),
                 send_packet_errors: h.counters.send_packet_errors.load(Ordering::Relaxed),
@@ -2789,6 +2875,31 @@ pub mod media_player_state {
     }
 }
 
+/// Which reader path is driving the currently-playing source (Phase 4 follow-up
+/// telemetry). Lets the manager UI show whole-file vs bounded-incremental MP4 at
+/// a glance, and which source kind is on air.
+pub mod media_player_reader_mode {
+    pub const UNKNOWN: u8 = 0;
+    pub const TS: u8 = 1;
+    pub const MP4_WHOLE_FILE: u8 = 2;
+    pub const MP4_INCREMENTAL: u8 = 3;
+    pub const IMAGE: u8 = 4;
+
+    pub fn as_str(code: u8) -> &'static str {
+        match code {
+            TS => "ts",
+            MP4_WHOLE_FILE => "mp4_whole_file",
+            MP4_INCREMENTAL => "mp4_incremental",
+            IMAGE => "image",
+            // `UNKNOWN` is the zero-initialised value of `reader_mode`, so it
+            // is what a player reports before its first source starts — and
+            // what the legacy loop reports throughout, since it never stamps
+            // the field. Any other value is a code this build doesn't know.
+            UNKNOWN | _ => "unknown",
+        }
+    }
+}
+
 /// Lock-free media-player playout telemetry for one input, written by the
 /// `ts` / `mp4` / `image` per-format players and read by the snapshot path.
 ///
@@ -2843,6 +2954,47 @@ pub struct MediaPlayerStats {
     /// the `signal_present` transition-latch shape used by `sdi_io`'s
     /// `sdi_signal_lost` / `sdi_signal_restored` pair.
     pub pacer_lagging: AtomicBool,
+    /// Playback generation (Phase 3b). Increments once per committed
+    /// transition (natural EOS, loop, or operator Next). The manager reads
+    /// this to send a correct `expected_generation` on a `Next` command so a
+    /// stale double-click is rejected rather than skipping twice. Stays 0
+    /// under the legacy loop (which doesn't run the controller).
+    pub generation: AtomicU64,
+    /// Phase 5 transport: wall-clock millisecond timestamp
+    /// ([`crate::util::time::now_us`] / 1000) at which the current source began
+    /// playing. `0` before the first source starts. The snapshot derives
+    /// elapsed-in-source from `now - this`, giving the UI a progress head that
+    /// works for every source kind (elapsed is wall-based, not PTS-based).
+    pub current_source_started_ms: AtomicU64,
+    /// Phase 5 transport: total duration of the current source in milliseconds
+    /// when known (MP4/MOV — read from the movie header at open). `0` = unknown
+    /// (live TS, still image), which the UI renders as an indeterminate bar.
+    pub current_source_duration_ms: AtomicU64,
+    /// Phase 5 transport: readiness of the NEXT playlist item, evaluated when
+    /// the current source starts. `0` = unknown / no next (tail of a
+    /// non-looping playlist), `1` = ready (resolves + on disk), `2` = not ready
+    /// (missing / unresolvable → a cut would hit dead air). Lets the UI warn
+    /// before an operator `Next`.
+    pub next_source_ready: AtomicU8,
+    /// Phase 4 follow-up: which reader path drives the current source — see
+    /// [`media_player_reader_mode`]. Stamped at each MP4 source start (whole-file
+    /// vs incremental) and by the TS / image players.
+    pub reader_mode: AtomicU8,
+    /// Phase 7 audio-only: video presence of the current source. `0` = unknown
+    /// (reset at each source start; the TS path leaves it here since it doesn't
+    /// pre-parse), `1` = has video, `2` = audio-only (no video PID). Lets the
+    /// UI badge an audio-only source and suppress video-progress expectations.
+    pub current_source_has_video: AtomicU8,
+    /// Phase 4 follow-up cache telemetry (MP4 only). Total cached items
+    /// (whole-file demuxes + warm incremental readers), resident whole-file
+    /// sample bytes, the byte budget (for a pressure %), and cumulative
+    /// hits / misses across both caches. A looping file drives `cache_hits`
+    /// upward each loop — the visible proof the loop-head prewarm is working.
+    pub cache_entries: AtomicU64,
+    pub cache_resident_bytes: AtomicU64,
+    pub cache_max_bytes: AtomicU64,
+    pub cache_hits: AtomicU64,
+    pub cache_misses: AtomicU64,
 }
 
 impl MediaPlayerStats {
@@ -2863,6 +3015,30 @@ impl MediaPlayerStats {
             let now_ms = crate::util::time::now_us() / 1000;
             Some(now_ms.saturating_sub(last_video_emit_ms) as f64 / 1000.0)
         };
+        // Phase 5 transport: wall-based elapsed-in-source, known duration, and
+        // next-source readiness. Elapsed is `now - started` so it advances for
+        // every source kind; duration is `Some` only when the source told us.
+        let started_ms = self.current_source_started_ms.load(Ordering::Relaxed);
+        let current_source_elapsed_ms = if started_ms == 0 {
+            None
+        } else {
+            let now_ms = crate::util::time::now_us() / 1000;
+            Some(now_ms.saturating_sub(started_ms))
+        };
+        let dur_ms = self.current_source_duration_ms.load(Ordering::Relaxed);
+        let current_source_duration_ms = (dur_ms != 0).then_some(dur_ms);
+        let next_source_ready = match self.next_source_ready.load(Ordering::Relaxed) {
+            1 => Some(true),
+            2 => Some(false),
+            _ => None,
+        };
+        let reader_mode =
+            media_player_reader_mode::as_str(self.reader_mode.load(Ordering::Relaxed)).to_string();
+        let current_source_has_video = match self.current_source_has_video.load(Ordering::Relaxed) {
+            1 => Some(true),
+            2 => Some(false),
+            _ => None,
+        };
         crate::stats::models::MediaPlayerInputStats {
             state: media_player_state::as_str(self.state.load(Ordering::Relaxed)).to_string(),
             current_source_index: self.current_source_index.load(Ordering::Relaxed),
@@ -2876,6 +3052,17 @@ impl MediaPlayerStats {
             pacer_lateness_current_ms: self.pacer_lateness_current_ms.load(Ordering::Relaxed),
             pacer_lateness_max_ms: self.pacer_lateness_max_ms.load(Ordering::Relaxed),
             pacer_lagging: self.pacer_lagging.load(Ordering::Relaxed),
+            generation: self.generation.load(Ordering::Relaxed),
+            current_source_elapsed_ms,
+            current_source_duration_ms,
+            next_source_ready,
+            reader_mode,
+            current_source_has_video,
+            cache_entries: self.cache_entries.load(Ordering::Relaxed),
+            cache_resident_bytes: self.cache_resident_bytes.load(Ordering::Relaxed),
+            cache_max_bytes: self.cache_max_bytes.load(Ordering::Relaxed),
+            cache_hits: self.cache_hits.load(Ordering::Relaxed),
+            cache_misses: self.cache_misses.load(Ordering::Relaxed),
         }
     }
 }
@@ -3688,6 +3875,23 @@ impl FlowStatsAccumulator {
     pub fn unregister_output(&self, output_id: &str) {
         self.output_stats.remove(output_id);
         self.output_config_meta.remove(output_id);
+    }
+
+    /// Live active-decoder label for a registered display output, if that
+    /// output exists and has published one. `None` means the output isn't
+    /// registered, isn't a display output, or hasn't opened a decoder yet
+    /// (label still `Unset`). Used by the resource-budget rollup
+    /// (`FlowRuntime::hw_session_usage_live`) to tell whether a display
+    /// output's *configured* HW decode session is actually open right now,
+    /// or has demoted / MPEG-2-pinned to CPU since flow creation.
+    #[allow(dead_code)]
+    pub fn active_display_decoder_label(
+        &self,
+        output_id: &str,
+    ) -> Option<DisplayDecoderLabel> {
+        let acc = self.output_stats.get(output_id)?;
+        let handle = acc.display_stats_handle()?;
+        Some(handle.counters.load_active_decoder_label())
     }
 
     /// Take a point-in-time snapshot of all input counters and every registered
@@ -5400,5 +5604,64 @@ mod bond_throughput_tests {
         assert_eq!(legs.hold_ms, None);
         let json = serde_json::to_value(&legs).unwrap();
         assert!(json.get("hold_ms").is_none());
+    }
+}
+
+/// Exercises the real accessor `FlowRuntime::hw_session_usage_live`
+/// reads from — `FlowStatsAccumulator::active_display_decoder_label` —
+/// against a genuinely registered display output whose live decoder
+/// atomic transitions. This is the runtime signal the hw_session_usage
+/// reconciliation subtracts on; the arithmetic itself is covered by
+/// `reconcile_display_decode_sessions` in the flow module.
+#[cfg(all(test, feature = "display", target_os = "linux"))]
+mod display_decoder_label_accessor_tests {
+    use super::*;
+
+    #[test]
+    fn active_display_decoder_label_tracks_registration_and_demote() {
+        let flow = FlowStatsAccumulator::new(
+            "f1".to_string(),
+            "flow-1".to_string(),
+            "media_player".to_string(),
+        );
+
+        // An id that was never registered yields None — the rollup leaves
+        // such a (non-existent) output's reservation untouched.
+        assert_eq!(flow.active_display_decoder_label("nope"), None);
+
+        // Register a display output and attach its live counters, as the
+        // display task does at startup. `decoder_kind` here is the frozen
+        // registration string; the live atomic starts `Unset`.
+        let out =
+            flow.register_output("d1".to_string(), "hdmi".to_string(), "display".to_string());
+        let counters = Arc::new(DisplayStatsCounters::default());
+        out.set_display_stats(counters.clone(), "1920x1080", 60, "nv12", "qsv");
+
+        // Unset before any decode decision → the reservation is kept
+        // (`hw_session_usage_live` only subtracts on an explicit CPU state).
+        assert_eq!(
+            flow.active_display_decoder_label("d1"),
+            Some(DisplayDecoderLabel::Unset),
+        );
+
+        // HW open succeeds → zero-copy label; nothing to reconcile.
+        counters.set_active_decoder_label(DisplayDecoderLabel::VaapiZeroCopy);
+        assert_eq!(
+            flow.active_display_decoder_label("d1"),
+            Some(DisplayDecoderLabel::VaapiZeroCopy),
+        );
+
+        // Runtime HW→CPU demote publishes CpuHwUnavailable — the exact
+        // signal the reconciliation drops a decode session on.
+        counters.set_active_decoder_label(DisplayDecoderLabel::CpuHwUnavailable);
+        assert_eq!(
+            flow.active_display_decoder_label("d1"),
+            Some(DisplayDecoderLabel::CpuHwUnavailable),
+        );
+
+        // A non-display output has no display handle → None, so the rollup
+        // never mistakes it for a demoted display decoder.
+        flow.register_output("u1".to_string(), "udp".to_string(), "udp".to_string());
+        assert_eq!(flow.active_display_decoder_label("u1"), None);
     }
 }

@@ -32,7 +32,12 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 
+pub mod manifest;
 pub mod probe;
+// `AssetManifest` is the one manifest type referenced from `MediaLibrary`
+// method signatures below; the rest of the manifest API (kinds, probe state,
+// error codes) is reached through the `manifest::` path.
+pub use manifest::AssetManifest;
 pub use probe::{MediaAudioStreamInfo, MediaVideoStreamInfo};
 
 /// Hard ceiling per individual asset (4 GiB).
@@ -149,6 +154,39 @@ fn is_false(b: &bool) -> bool { !*b }
 /// Reed-Solomon parity-suffixed broadcast capture).
 pub(crate) fn detect_ts_stride(buf: &[u8]) -> Option<(usize, usize)> {
     use crate::engine::ts_parse::{TS_PACKET_SIZE, TS_SYNC_BYTE};
+    if let Some(confirmed) = detect_ts_stride_confirmed(buf) {
+        return Some(confirmed);
+    }
+
+    // Tail-of-buffer fallback: too few packets to confirm a run (tiny files).
+    // A single confirmed sync byte counts, canonical 188 only.
+    //
+    // This branch is deliberately permissive so the manager's program picker
+    // still walks a truncated or very short capture. It is NOT evidence that a
+    // file *is* a transport stream — one incidental 0x47 anywhere in the probe
+    // window satisfies it, which on a 512 KiB head is essentially every binary
+    // file. Anything that classifies a file (rather than merely walking one
+    // already known to be TS) must call [`detect_ts_stride_confirmed`].
+    if buf.len() >= TS_PACKET_SIZE {
+        for s in 0..=buf.len() - TS_PACKET_SIZE {
+            if buf[s] == TS_SYNC_BYTE {
+                return Some((TS_PACKET_SIZE, s));
+            }
+        }
+    }
+    None
+}
+
+/// Like [`detect_ts_stride`], but returns **only** a run-length-confirmed
+/// stride — never the single-sync-byte tail fallback.
+///
+/// Use this wherever the answer decides *what a file is*. The lenient
+/// fallback in `detect_ts_stride` exists so the program picker can still walk
+/// a truncated capture; as a classifier it says yes to any file containing one
+/// 0x47 byte, which is `G` in ASCII and appears in essentially every binary of
+/// non-trivial size.
+pub(crate) fn detect_ts_stride_confirmed(buf: &[u8]) -> Option<(usize, usize)> {
+    use crate::engine::ts_parse::{TS_PACKET_SIZE, TS_SYNC_BYTE};
     const STRIDE_CANDIDATES: [usize; 3] = [TS_PACKET_SIZE, 192, 204];
     // A two-byte "sync, then sync `stride` bytes later" match is NOT a
     // reliable stride confirmation: 0x47 occurs at ~1/256 density in
@@ -186,20 +224,7 @@ pub(crate) fn detect_ts_stride(buf: &[u8]) -> Option<(usize, usize)> {
             start += 1;
         }
     }
-    if let Some((_, stride, start)) = best {
-        return Some((stride, start));
-    }
-
-    // Tail-of-buffer fallback: too few packets to confirm a run (tiny files).
-    // A single confirmed sync byte counts, canonical 188 only.
-    if buf.len() >= TS_PACKET_SIZE {
-        for s in 0..=buf.len() - TS_PACKET_SIZE {
-            if buf[s] == TS_SYNC_BYTE {
-                return Some((TS_PACKET_SIZE, s));
-            }
-        }
-    }
-    None
+    best.map(|(_, stride, start)| (stride, start))
 }
 
 /// Length, in packets, of the unbroken run of TS sync bytes at
@@ -622,13 +647,96 @@ impl MediaLibrary {
         Ok(result)
     }
 
+    /// Return the asset manifest for `name`, using the cached sidecar when it
+    /// is still fresh and re-probing otherwise (plan §6.3). This is the
+    /// read-path the manager's detected-kind badge is driven from; it is
+    /// cheap on the common cache-hit path (one `stat` + one small JSON read)
+    /// and only pays the full probe cost when the file is new or changed.
+    ///
+    /// Returns `Ok(None)` only when the file does not exist in the library —
+    /// an unsupported or unreadable file still yields a manifest (with
+    /// `probe_state` set accordingly) so the caller can render an actionable
+    /// state rather than nothing.
+    pub async fn manifest(name: &str) -> Result<Option<AssetManifest>> {
+        crate::config::validation::validate_media_filename(name, "manifest")?;
+        let path = media_dir().join(name);
+        let meta = match tokio::fs::metadata(&path).await {
+            Ok(m) => m,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(anyhow!("metadata {}: {e}", path.display())),
+        };
+        if !meta.is_file() {
+            return Ok(None);
+        }
+        let size = meta.len();
+        let mtime_ms = manifest::mtime_unix_ms(&meta);
+
+        // Cache hit: a fresh sidecar for this exact size+mtime.
+        let name_owned = name.to_string();
+        if let Some(cached) = tokio::task::spawn_blocking({
+            let n = name_owned.clone();
+            move || manifest::load_sidecar(&n)
+        })
+        .await
+        .map_err(|e| anyhow!("manifest cache load join: {e}"))?
+        {
+            if cached.is_fresh_for(size, mtime_ms) {
+                return Ok(Some(cached));
+            }
+        }
+
+        // Miss / stale: probe and persist. Probing is blocking (parses the
+        // MP4 moov / image header), so it runs off the async runtime.
+        let m = tokio::task::spawn_blocking(move || {
+            let m = manifest::probe_asset(&name_owned, &path, size, mtime_ms);
+            manifest::store_sidecar(&m);
+            m
+        })
+        .await
+        .map_err(|e| anyhow!("manifest probe join: {e}"))?;
+        Ok(Some(m))
+    }
+
+    /// Force a fresh probe of `name`, replacing any cached sidecar. Used by
+    /// the post-upload hook and by an operator `reprobe_media` command. A
+    /// missing file is a no-op (`Ok(None)`).
+    pub async fn refresh_manifest(name: &str) -> Result<Option<AssetManifest>> {
+        crate::config::validation::validate_media_filename(name, "reprobe_media")?;
+        let path = media_dir().join(name);
+        let meta = match tokio::fs::metadata(&path).await {
+            Ok(m) => m,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(anyhow!("metadata {}: {e}", path.display())),
+        };
+        if !meta.is_file() {
+            return Ok(None);
+        }
+        let size = meta.len();
+        let mtime_ms = manifest::mtime_unix_ms(&meta);
+        let name_owned = name.to_string();
+        let m = tokio::task::spawn_blocking(move || {
+            let m = manifest::probe_asset(&name_owned, &path, size, mtime_ms);
+            manifest::store_sidecar(&m);
+            m
+        })
+        .await
+        .map_err(|e| anyhow!("manifest reprobe join: {e}"))?;
+        Ok(Some(m))
+    }
+
     /// Hard-delete a file. Filename validation is the caller's responsibility
     /// (we re-check defence-in-depth here too).
     pub async fn delete(name: &str) -> Result<bool> {
         crate::config::validation::validate_media_filename(name, "delete_media")?;
         let path = media_dir().join(name);
         match tokio::fs::remove_file(&path).await {
-            Ok(()) => Ok(true),
+            Ok(()) => {
+                // Drop the manifest sidecar too so a later same-name upload
+                // can't be shadowed by a stale one. Best-effort.
+                let n = name.to_string();
+                let _ = tokio::task::spawn_blocking(move || manifest::remove_sidecar(&n)).await;
+                Ok(true)
+            }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
             Err(e) => Err(anyhow!("delete {}: {e}", path.display())),
         }
@@ -818,6 +926,17 @@ impl MediaLibrary {
             })
             .await
             .map_err(|e| anyhow!("upload finalise join: {e}"))??;
+            // Kick off a manifest probe for the freshly-landed file. Detached
+            // and fire-and-forget: probing parses the MP4 `moov` / image
+            // header and must never sit on the upload's final-chunk ACK
+            // (plan §6.3 — "return upload success independently from probe
+            // success"). A stale sidecar from a prior upload of the same
+            // name is superseded because probing keys the manifest on the new
+            // size/mtime. Errors are logged inside `refresh_manifest`.
+            let probe_name = name.to_string();
+            tokio::spawn(async move {
+                let _ = Self::refresh_manifest(&probe_name).await;
+            });
             return Ok(UploadProgress::Complete {
                 bytes_received: total_bytes,
             });

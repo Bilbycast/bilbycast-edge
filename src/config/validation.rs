@@ -1630,7 +1630,7 @@ fn validate_media_player_input(c: &crate::config::models::MediaPlayerInputConfig
                 );
             }
         }
-        if let MediaPlayerSource::Image { fps, bitrate_kbps, .. } = src {
+        if let MediaPlayerSource::Image { fps, bitrate_kbps, duration_secs, .. } = src {
             if *fps == 0 || *fps > 60 {
                 bail!(
                     "media-player input sources[{i}]: image fps must be in 1..=60 (got {})",
@@ -1642,6 +1642,14 @@ fn validate_media_player_input(c: &crate::config::models::MediaPlayerInputConfig
                     "media-player input sources[{i}]: image bitrate_kbps must be in 50..=50000 (got {})",
                     bitrate_kbps
                 );
+            }
+            if let Some(d) = duration_secs {
+                if *d == 0 || *d > 86_400 {
+                    bail!(
+                        "media-player input sources[{i}]: image duration_secs must be in 1..=86400 (got {})",
+                        d
+                    );
+                }
             }
         }
     }
@@ -8146,8 +8154,16 @@ mod tests {
             "../testbed/configs/bonded-adaptive-contribution-sender.json",
             "../testbed/configs/bonded-adaptive-contribution-receiver.json",
         ] {
-            let s =
-                std::fs::read_to_string(path).unwrap_or_else(|e| panic!("read {path}: {e}"));
+            // The `testbed/` fixtures live outside the edge repo and are not
+            // checked out in CI (only bilbycast-edge + its dependency siblings
+            // are), so a missing file is "skip", not "fail" — matching
+            // `models::tests::pid_bus_testbed_configs_roundtrip_exactly`. When
+            // the fixtures ARE present (developer full-workspace checkout) the
+            // parse/validate assertions below still run and still catch drift.
+            let s = match std::fs::read_to_string(path) {
+                Ok(t) => t,
+                Err(_) => continue,
+            };
             let cfg: AppConfig =
                 serde_json::from_str(&s).unwrap_or_else(|e| panic!("parse {path}: {e}"));
             validate_config(&cfg).unwrap_or_else(|e| panic!("validate {path}: {e}"));

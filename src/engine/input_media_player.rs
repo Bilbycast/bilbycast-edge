@@ -3,7 +3,7 @@
 
 //! File-backed media-player input.
 //!
-//! Plays one or more local assets — pre-encoded MPEG-TS, MP4 / MOV / MKV
+//! Plays one or more local assets — pre-encoded MPEG-TS, MP4 / MOV
 //! containers, or still images — as a paced fresh MPEG-TS feed onto the
 //! per-input broadcast channel. Designed for the "fallback while live is
 //! gone" use case: combine a media-player input with a live primary on a
@@ -49,6 +49,28 @@ use crate::stats::collector::{FlowStatsAccumulator, MediaPlayerStats, media_play
 mod image_slate;
 #[cfg(all(feature = "media-codecs", feature = "fdk-aac"))]
 mod mp4_demux;
+
+// The playlist compatibility planner is pure logic over asset manifests with
+// no codec/demuxer dependency, so it is always available (the manager needs
+// it to validate a playlist regardless of which media features this edge was
+// built with).
+pub mod planner;
+
+// The transition state machine is the pure-logic core of the Phase 3
+// controller (state graph, generation counter, operator-Next idempotency).
+pub mod transition;
+
+// Phase 3b: the controller command surface (operator-Next channel, readiness
+// check, runtime flag). The controller LOOP lives in this file
+// (`run_controlled`) because it needs the private play_source/PlayerSession;
+// this module holds the independent, testable pieces.
+pub mod controller;
+
+// Phase 6: explicit rational frame-rate conversion cadence for normalised
+// playback. Pure integer arithmetic with no codec/hardware dependency (the
+// vendored FFmpeg has `--disable-avfilter`, so there is no fps filter to
+// delegate to). Driven by the normalisation pipeline once that lands.
+pub mod frame_rate;
 
 /// 188-byte MPEG-TS packet size.
 const TS_PACKET: usize = 188;
@@ -139,6 +161,7 @@ struct PacerMsg {
 /// Public entry point. Matches the signature shape of `input_test_pattern`
 /// and `input_bonded` so the flow runtime calls it through the same
 /// per-input forwarder pipeline.
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_media_player_input(
     config: MediaPlayerInputConfig,
     per_input_tx: broadcast::Sender<RtpPacket>,
@@ -148,6 +171,9 @@ pub fn spawn_media_player_input(
     flow_id: String,
     input_id: String,
     av_sync_pacer: Option<Arc<crate::engine::av_sync_mux::AvSyncPacer>>,
+    // Operator-command channel (Phase 3b). `None` when the flow runtime did
+    // not wire one (the controller is opt-in); the legacy loop ignores it.
+    cmd_rx: Option<tokio::sync::mpsc::Receiver<controller::MediaPlayerCommand>>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         run(
@@ -159,6 +185,7 @@ pub fn spawn_media_player_input(
             flow_id,
             input_id,
             av_sync_pacer,
+            cmd_rx,
         )
         .await;
     })
@@ -197,6 +224,7 @@ pub fn resolve_media_path(name: &str) -> Result<PathBuf> {
     Ok(media_dir().join(name))
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run(
     config: MediaPlayerInputConfig,
     per_input_tx: broadcast::Sender<RtpPacket>,
@@ -206,6 +234,7 @@ async fn run(
     flow_id: String,
     input_id: String,
     av_sync_pacer: Option<Arc<crate::engine::av_sync_mux::AvSyncPacer>>,
+    cmd_rx: Option<tokio::sync::mpsc::Receiver<controller::MediaPlayerCommand>>,
 ) {
     events.emit_flow(
         EventSeverity::Info,
@@ -330,6 +359,24 @@ async fn run(
     let media_stats = Arc::new(MediaPlayerStats::default());
     stats.set_media_player_stats(&input_id, media_stats.clone());
 
+    // ── Phase 3b controller path (default ON, per-input opt-out) ─────────
+    // When the controller is enabled AND the flow runtime wired a command
+    // channel, drive playout through the transition state machine so operator
+    // `Next` works and natural EOS / loop / Next all commit through one path.
+    // Otherwise fall straight through to the legacy sequential loop below,
+    // which is left byte-for-byte unchanged (the rollback guarantee).
+    if controller::controller_enabled(config.operator_control) {
+        if let Some(cmd_rx) = cmd_rx {
+            run_controlled(
+                &config, &per_input_tx, &stats, &cancel, &events, &flow_id, &input_id,
+                &mut seq_num, &mut cont, &mut transcoder, &mut post, &mut demux_cache,
+                &media_stats, &pcr_jump_signal, cmd_rx,
+            )
+            .await;
+            return;
+        }
+    }
+
     loop {
         let mut order: Vec<usize> = (0..config.sources.len()).collect();
         if config.shuffle && order.len() > 1 {
@@ -341,7 +388,7 @@ async fn run(
         // 1316 B (SRT payload size / internet-safe MTU). See
         // `MediaPlayerInputConfig::ts_packets_per_datagram`.
         let bundle_size = (config.ts_packets_per_datagram.max(1) as usize) * TS_PACKET;
-        for idx in order {
+        for (pos, &idx) in order.iter().enumerate() {
             if cancel.is_cancelled() {
                 return;
             }
@@ -353,6 +400,17 @@ async fn run(
             };
             media_stats.current_source_index.store(idx as u64, Ordering::Relaxed);
             media_stats.state.store(media_player_state::STARTING, Ordering::Relaxed);
+            // Phase 5 transport: the next item is the following playlist entry,
+            // or (when looping) the head of the next pass — best-effort under
+            // shuffle, which re-orders on wrap.
+            let next_source = if pos + 1 < order.len() {
+                Some(&config.sources[order[pos + 1]])
+            } else if config.loop_playback {
+                Some(&config.sources[order[0]])
+            } else {
+                None
+            };
+            begin_source_telemetry(media_stats.as_ref(), next_source);
             let mut session = PlayerSession {
                 seq_num: &mut seq_num,
                 per_input_tx: &per_input_tx,
@@ -714,6 +772,81 @@ pub(super) struct StreamLayout {
 /// keys off these codes (rather than the free-form message) to attribute
 /// failures and decide whether to highlight the file in the library picker.
 ///
+/// Emit `media_player_transition_started` (Phase 3b) — a boundary was armed
+/// and is about to commit.
+fn emit_transition_started(
+    events: &EventSender,
+    flow_id: &str,
+    input_id: &str,
+    transition_id: &str,
+    generation: u64,
+    from_index: usize,
+    to_index: usize,
+    trigger: &str,
+) {
+    events.emit_flow_with_details(
+        EventSeverity::Info,
+        category::FLOW,
+        format!("Media-player input '{input_id}': transition {from_index}→{to_index} ({trigger})"),
+        flow_id,
+        serde_json::json!({
+            "error_code": "media_player_transition_started",
+            "flow_id": flow_id,
+            "input_id": input_id,
+            "transition_id": transition_id,
+            "generation": generation,
+            "from_index": from_index,
+            "to_index": to_index,
+            "trigger": trigger,
+        }),
+    );
+}
+
+/// Emit `media_player_transition_completed` (Phase 3b) — the new source's
+/// generation is now on air.
+fn emit_transition_completed(
+    events: &EventSender,
+    flow_id: &str,
+    input_id: &str,
+    cr: &transition::CommitResult,
+) {
+    events.emit_flow_with_details(
+        EventSeverity::Info,
+        category::FLOW,
+        format!(
+            "Media-player input '{input_id}': transition complete {}→{} (gen {})",
+            cr.previous_index, cr.new_index, cr.new_generation
+        ),
+        flow_id,
+        serde_json::json!({
+            "error_code": "media_player_transition_completed",
+            "flow_id": flow_id,
+            "input_id": input_id,
+            "transition_id": cr.transition_id,
+            "generation": cr.new_generation,
+            "previous_index": cr.previous_index,
+            "current_index": cr.new_index,
+        }),
+    );
+}
+
+/// Emit `media_player_next_prepare_failed` (Phase 3b) — an operator `Next`
+/// target could not be prepared, so the current source stays on air.
+fn emit_next_prepare_failed(events: &EventSender, flow_id: &str, input_id: &str, target_index: usize) {
+    events.emit_flow_with_details(
+        EventSeverity::Warning,
+        category::FLOW,
+        format!("Media-player input '{input_id}': Next target[{target_index}] not ready — keeping current source"),
+        flow_id,
+        serde_json::json!({
+            "error_code": "media_player_next_prepare_failed",
+            "flow_id": flow_id,
+            "input_id": input_id,
+            "target_index": target_index,
+        }),
+    );
+}
+
 /// Walks `anyhow`'s error chain looking for an `io::Error` first (file
 /// open / read failures preserve `io::Error` via `.with_context`), then
 /// falls back to message-pattern matching for parse-level errors that
@@ -760,6 +893,280 @@ fn source_name_str(source: &MediaPlayerSource) -> &str {
     }
 }
 
+/// Phase 3b controller loop. Replaces the legacy sequential playlist loop
+/// when the controller is enabled, driving every boundary — natural EOS,
+/// loop wrap, and operator `Next` — through the transition state machine.
+///
+/// Structure: for the active source, run `play_source` on a per-source child
+/// cancel token while `select!`ing on the operator-command channel. A `Next`
+/// that the state machine accepts and whose target is openable cancels the
+/// child token (cutting the current source), then commits; natural completion
+/// arms and commits the next boundary. The transition machine owns the
+/// generation counter and the double-click / hold semantics; this loop only
+/// performs the I/O each decision implies.
+#[allow(clippy::too_many_arguments)]
+async fn run_controlled(
+    config: &MediaPlayerInputConfig,
+    per_input_tx: &broadcast::Sender<RtpPacket>,
+    stats: &Arc<FlowStatsAccumulator>,
+    cancel: &CancellationToken,
+    events: &EventSender,
+    flow_id: &str,
+    input_id: &str,
+    seq_num: &mut u16,
+    cont: &mut SpliceContinuity,
+    transcoder: &mut Option<crate::engine::input_transcode::InputTranscoder>,
+    post: &mut Option<crate::engine::input_post_process::InputPostProcess>,
+    demux_cache: &mut DemuxCacheField,
+    media_stats: &Arc<MediaPlayerStats>,
+    pcr_jump_signal: &Arc<std::sync::atomic::AtomicI64>,
+    mut cmd_rx: tokio::sync::mpsc::Receiver<controller::MediaPlayerCommand>,
+) {
+    use transition::{NextOutcome, NextRequest, TransitionMachine, TransitionTrigger};
+
+    let bundle_size = (config.ts_packets_per_datagram.max(1) as usize) * TS_PACKET;
+    // Draw the first permutation here; each loop wrap re-permutes at the commit
+    // that lands back on index 0 (see `reshuffle_on_wrap` below). `order` holds
+    // indices INTO `config.sources`, while the state machine's indices are into
+    // `order`, so permuting it never disturbs the machine's stable index space.
+    let mut order: Vec<usize> = (0..config.sources.len()).collect();
+    if config.shuffle && order.len() > 1 {
+        shuffle_indices(&mut order);
+    }
+    if order.is_empty() {
+        cancel.cancelled().await;
+        return;
+    }
+
+    let mut sm = TransitionMachine::new(order.len(), config.loop_playback);
+    let mut tid_counter: u64 = 0;
+    sm.begin_playing();
+    events.emit_flow(
+        EventSeverity::Info,
+        category::FLOW,
+        format!("Media-player input '{input_id}': controller path active (operator Next enabled)"),
+        flow_id,
+    );
+
+    loop {
+        if cancel.is_cancelled() {
+            return;
+        }
+        let active = sm.active_index();
+        let cfg_idx = order[active];
+        let source = &config.sources[cfg_idx];
+        let gap_signal = if transcoder.is_some() { Some(&*pcr_jump_signal) } else { None };
+        media_stats.current_source_index.store(cfg_idx as u64, Ordering::Relaxed);
+        media_stats.generation.store(sm.generation(), Ordering::Relaxed);
+        media_stats.state.store(media_player_state::STARTING, Ordering::Relaxed);
+        // Phase 5 transport: the next item the state machine would advance to
+        // (next in order, or the head when looping).
+        let next_source = {
+            let next_active = if active + 1 < order.len() {
+                Some(active + 1)
+            } else if config.loop_playback {
+                Some(0)
+            } else {
+                None
+            };
+            next_active.map(|na| &config.sources[order[na]])
+        };
+        begin_source_telemetry(media_stats.as_ref(), next_source);
+
+        // Per-source child token: cancelling it cuts only this source (for an
+        // operator Next); the input-wide `cancel` still stops everything.
+        let source_cancel = cancel.child_token();
+        let mut session = PlayerSession {
+            seq_num: &mut *seq_num,
+            per_input_tx,
+            stats,
+            cancel: &source_cancel,
+            cont: &mut *cont,
+            transcoder: &mut *transcoder,
+            pid_overrides: config.pid_overrides.as_ref(),
+            post: &mut *post,
+            splice_gap_signal: gap_signal,
+            bundle_size,
+            media_stats,
+            events,
+            flow_id,
+            input_id,
+            demux_cache: &mut *demux_cache,
+        };
+        let play_fut = play_source(source, config, &mut session);
+        tokio::pin!(play_fut);
+
+        let mut was_cut = false;
+        let mut play_result: Result<()> = Ok(());
+        let mut cmd_closed = false;
+        loop {
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => { return; }
+                res = &mut play_fut => { play_result = res; break; }
+                maybe_cmd = cmd_rx.recv(), if !cmd_closed => {
+                    let cmd = match maybe_cmd {
+                        Some(c) => c,
+                        None => { cmd_closed = true; continue; }
+                    };
+                    match cmd {
+                        controller::MediaPlayerCommand::Next { expected_generation, request_id, reply } => {
+                            tid_counter += 1;
+                            let tid_val = tid_counter;
+                            let outcome = sm.request_next(
+                                &NextRequest { expected_generation, request_id },
+                                || format!("mp-{tid_val}"),
+                            );
+                            // Pull out target + transition id without holding a
+                            // borrow across the `reply.send(outcome)` move.
+                            let accepted = match &outcome {
+                                NextOutcome::Accepted { target_index, transition_id, .. } => {
+                                    Some((*target_index, transition_id.clone()))
+                                }
+                                _ => None,
+                            };
+                            match accepted {
+                                Some((target, tid_str)) => {
+                                    if controller::source_openable(&config.sources[order[target]]) {
+                                        let cur_gen = sm.generation();
+                                        let _ = reply.send(outcome);
+                                        emit_transition_started(events, flow_id, input_id, &tid_str, cur_gen, active, target, "operator_next");
+                                        source_cancel.cancel();
+                                        was_cut = true;
+                                        break;
+                                    } else {
+                                        sm.cancel_armed();
+                                        let _ = reply.send(NextOutcome::Rejected { code: "media_player_next_not_ready" });
+                                        emit_next_prepare_failed(events, flow_id, input_id, target);
+                                    }
+                                }
+                                None => {
+                                    let _ = reply.send(outcome);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if was_cut {
+            // Let the cancelled source finish returning (releases file/codec
+            // state) before committing the boundary.
+            let _ = play_fut.as_mut().await;
+            let cr = sm.commit();
+            media_stats.generation.store(cr.new_generation, Ordering::Relaxed);
+            reshuffle_on_wrap(&config, &mut order, &cr);
+            emit_transition_completed(events, flow_id, input_id, &cr);
+            sm.settle_playing();
+            continue;
+        }
+
+        // Natural completion (or error).
+        if let Err(e) = &play_result {
+            media_stats.state.store(media_player_state::FAILED, Ordering::Relaxed);
+            let error_code = classify_playback_error(e);
+            events.emit_flow_with_details(
+                EventSeverity::Critical,
+                category::FLOW,
+                format!("Media-player input '{input_id}': source[{cfg_idx}] failed: {e}"),
+                flow_id,
+                serde_json::json!({
+                    "error_code": error_code,
+                    "flow_id": flow_id,
+                    "input_id": input_id,
+                    "source_index": cfg_idx,
+                    "source_kind": source_kind_str(source),
+                    "source_name": source_name_str(source),
+                    "error": e.to_string(),
+                }),
+            );
+            tokio::select! {
+                _ = cancel.cancelled() => return,
+                _ = tokio::time::sleep(Duration::from_secs(2)) => {}
+            }
+        }
+
+        let trigger = if active + 1 >= order.len() {
+            TransitionTrigger::Loop
+        } else {
+            TransitionTrigger::NaturalEos
+        };
+        tid_counter += 1;
+        let tid_val = tid_counter;
+        match sm.arm_natural(trigger, || format!("mp-{tid_val}")) {
+            Some(_target) => {
+                // Best-effort readiness: if the next file is missing, play_source
+                // will error and the loop's error handler sleeps 2 s, matching
+                // the legacy loop's behaviour.
+                sm.set_next_ready(true);
+                if sm.on_current_exhausted() {
+                    let cr = sm.commit();
+                    media_stats.generation.store(cr.new_generation, Ordering::Relaxed);
+                    reshuffle_on_wrap(&config, &mut order, &cr);
+                    sm.settle_playing();
+                }
+            }
+            None => {
+                media_stats.state.store(media_player_state::EXHAUSTED, Ordering::Relaxed);
+                events.emit_flow(
+                    EventSeverity::Info,
+                    category::FLOW,
+                    format!("Media-player input '{input_id}': playlist exhausted (loop=false), idle until cancelled"),
+                    flow_id,
+                );
+                // Keep answering `Next` while parked. `cmd_rx` is owned by this
+                // task and the only `recv()` lives in the per-source select!
+                // that has already exited, so simply awaiting cancellation here
+                // strands every subsequent Next: `cmd_tx.send()` still succeeds
+                // (nothing removes the entry from `media_player_command_txs`),
+                // the buffered message keeps its oneshot::Sender alive, and the
+                // dispatcher's unbounded `reply_rx.await` never resolves — no
+                // command_ack, and one parked handler task per press holding
+                // Arc clones until the flow stops.
+                loop {
+                    tokio::select! {
+                        _ = cancel.cancelled() => return,
+                        cmd = cmd_rx.recv() => match cmd {
+                            Some(controller::MediaPlayerCommand::Next { reply, .. }) => {
+                                let _ = reply.send(NextOutcome::Rejected {
+                                    code: transition::reject_code::PLAYLIST_EXHAUSTED,
+                                });
+                            }
+                            None => {
+                                cancel.cancelled().await;
+                                return;
+                            }
+                        },
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Phase 5 transport telemetry, called as each source begins. Records the
+/// wall-clock start (the snapshot derives elapsed-in-source from it), clears the
+/// per-source known duration (an MP4 sets it once opened; TS/image leave it
+/// unknown), and evaluates whether the next playlist item can be opened right
+/// now so the UI can flag a `Next` that would cut to dead air. Cheap: one clock
+/// read plus one stat of the next file, once per source transition.
+fn begin_source_telemetry(media_stats: &MediaPlayerStats, next_source: Option<&MediaPlayerSource>) {
+    let now_ms = crate::util::time::now_us() / 1000;
+    media_stats.current_source_started_ms.store(now_ms, Ordering::Relaxed);
+    media_stats.current_source_duration_ms.store(0, Ordering::Relaxed);
+    // Reset video-presence to "unknown" so a previous source's value never
+    // lingers; the per-format player stamps it once it knows (MP4 sets it
+    // accurately from the demux, the TS path leaves it unknown).
+    media_stats.current_source_has_video.store(0, Ordering::Relaxed);
+    let ready = match next_source {
+        Some(s) if controller::source_openable(s) => 1,
+        Some(_) => 2,
+        None => 0,
+    };
+    media_stats.next_source_ready.store(ready, Ordering::Relaxed);
+}
+
 async fn play_source(
     source: &MediaPlayerSource,
     cfg: &MediaPlayerInputConfig,
@@ -784,9 +1191,10 @@ async fn play_source(
             fps,
             bitrate_kbps,
             audio_silence,
+            duration_secs,
         } => {
             let path = resolve_media_path(name)?;
-            play_image(&path, *fps, *bitrate_kbps, *audio_silence, session).await
+            play_image(&path, *fps, *bitrate_kbps, *audio_silence, *duration_secs, session).await
         }
     }
 }
@@ -811,6 +1219,10 @@ async fn play_ts_file(
     program_number: Option<u16>,
     session: &mut PlayerSession<'_>,
 ) -> Result<()> {
+    session.media_stats.reader_mode.store(
+        crate::stats::collector::media_player_reader_mode::TS,
+        Ordering::Relaxed,
+    );
     let mut file = tokio::fs::File::open(path)
         .await
         .with_context(|| format!("open {}", path.display()))?;
@@ -886,6 +1298,21 @@ async fn play_ts_file(
     } else {
         head_bitrate_raw
     };
+    // Phase 5 transport: estimate the TS file's playback duration for the
+    // progress head from its total size and the head-probed *whole-mux* rate
+    // (not the per-program filtered one — the file plays for its full wall
+    // duration regardless of program down-selection). VBR makes this
+    // approximate; it's a progress hint, not a seek index. `None`/0 leaves the
+    // duration unknown → the UI shows an indeterminate "live" head.
+    if let (Some(total_bps), Ok(meta)) = (head_bitrate_raw, tokio::fs::metadata(path).await) {
+        if total_bps > 0 && meta.len() > 0 {
+            let dur_ms = (meta.len() as u128 * 8 * 1000 / total_bps as u128) as u64;
+            session
+                .media_stats
+                .current_source_duration_ms
+                .store(dur_ms, Ordering::Relaxed);
+        }
+    }
     drop(head);
     file.seek(std::io::SeekFrom::Start(0))
         .await
@@ -1900,9 +2327,23 @@ async fn play_image(
     fps: u8,
     bitrate_kbps: u32,
     audio_silence: bool,
+    duration_secs: Option<u32>,
     session: &mut PlayerSession<'_>,
 ) -> Result<()> {
-    image_slate::play_image_file(path, fps, bitrate_kbps, audio_silence, session).await
+    session.media_stats.reader_mode.store(
+        crate::stats::collector::media_player_reader_mode::IMAGE,
+        Ordering::Relaxed,
+    );
+    // A still has a fixed duration only when the operator sets one; otherwise
+    // it renders indefinitely (slate/fallback), so the progress head has no
+    // total — leave it unknown (indeterminate bar).
+    if let Some(d) = duration_secs {
+        session
+            .media_stats
+            .current_source_duration_ms
+            .store((d as u64).saturating_mul(1000), Ordering::Relaxed);
+    }
+    image_slate::play_image_file(path, fps, bitrate_kbps, audio_silence, duration_secs, session).await
 }
 
 #[cfg(not(all(feature = "media-codecs", feature = "fdk-aac")))]
@@ -1911,6 +2352,7 @@ async fn play_image(
     _fps: u8,
     _bitrate_kbps: u32,
     _audio_silence: bool,
+    _duration_secs: Option<u32>,
     _session: &mut PlayerSession<'_>,
 ) -> Result<()> {
     Err(anyhow!(
@@ -2370,6 +2812,31 @@ fn run_paced_emitter(
     // reported value stopped meaning anything.
     stats.pacer_queue_depth.store(0, Ordering::Relaxed);
     tracing::info!("media-pacer '{}': exited", thread_name);
+}
+
+/// Re-permute the play order when a commit wraps the playlist back to its
+/// first slot.
+///
+/// The legacy sequential loop rebuilds and re-shuffles `order` on every pass,
+/// which is what `MediaPlayerInputConfig::shuffle` documents ("randomise the
+/// playback order each time the playlist starts") and what the manager's own
+/// help text and AI knowledge base promise. The controller path drew its
+/// permutation once before its loop, so a shuffled playlist repeated one fixed
+/// rotation for the life of the flow — and because `operator_control` defaults
+/// on, every existing `shuffle: true` config inherited that on upgrade with no
+/// config change and no event.
+///
+/// `new_index == 0` identifies the wrap unambiguously: from any other slot the
+/// natural successor and an operator `Next` both move forward, so index 0 is
+/// only ever reached by wrapping off the end.
+fn reshuffle_on_wrap(
+    config: &MediaPlayerInputConfig,
+    order: &mut [usize],
+    cr: &transition::CommitResult,
+) {
+    if config.shuffle && order.len() > 1 && cr.new_index == 0 {
+        shuffle_indices(order);
+    }
 }
 
 // ── Order-shuffle helper ────────────────────────────────────────────────

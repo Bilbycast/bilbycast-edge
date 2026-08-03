@@ -275,6 +275,11 @@ pub struct FlowRuntime {
     /// by input_id.
     #[cfg(feature = "replay")]
     pub replay_command_txs: dashmap::DashMap<String, tokio::sync::mpsc::Sender<crate::replay::ReplayCommand>>,
+    /// Per-input operator-command channels for media-player inputs running the
+    /// Phase 3b controller. Populated only when the controller is enabled for
+    /// an input; the manager-WS `media_player_next` dispatcher routes by
+    /// input_id. Empty otherwise.
+    pub media_player_command_txs: dashmap::DashMap<String, tokio::sync::mpsc::Sender<crate::engine::input_media_player::controller::MediaPlayerCommand>>,
     /// Per-output resource contributions, keyed by output_id. Stored
     /// at spawn time (start_output / add_output) and subtracted on
     /// remove_output so a runtime change to a display output's
@@ -745,6 +750,10 @@ impl FlowRuntime {
         // dispatcher reads it to route mark/cue/play/scrub commands.
         #[cfg(feature = "replay")]
         let replay_command_txs: dashmap::DashMap<String, tokio::sync::mpsc::Sender<crate::replay::ReplayCommand>> = dashmap::DashMap::new();
+        // Media-player operator-command registry (Phase 3b), same lifetime
+        // pattern as the replay one: built here, referenced by the input spawn
+        // loop below, then moved into the FlowRuntime.
+        let media_player_command_txs: dashmap::DashMap<String, tokio::sync::mpsc::Sender<crate::engine::input_media_player::controller::MediaPlayerCommand>> = dashmap::DashMap::new();
         // PES Switch Phase 2.1c Stage 2: track which `input_id`s we
         // register with the node-wide `FlowManager` so `stop()` can
         // symmetrically unregister. Built incrementally as the input
@@ -773,6 +782,7 @@ impl FlowRuntime {
             broadcast_capacity,
             #[cfg(feature = "replay")]
             replay_command_txs: &replay_command_txs,
+            media_player_command_txs: &media_player_command_txs,
         };
         for input_def in &config.inputs {
             let spawned = spawn_input_runtime(input_def, &spawn_ctx);
@@ -1472,6 +1482,7 @@ impl FlowRuntime {
             recording_handle,
             #[cfg(feature = "replay")]
             replay_command_txs,
+            media_player_command_txs,
             cost_units,
             thumbnail_cost_units,
             hw_session_usage,
@@ -1509,6 +1520,56 @@ impl FlowRuntime {
             .read()
             .map(|g| g.clone())
             .unwrap_or_default()
+    }
+
+    /// Like [`hw_session_usage`](Self::hw_session_usage), but reconciled
+    /// against the *live* decoder state of each local-display output.
+    ///
+    /// The frozen block records the decode session a display output was
+    /// *configured* to open at flow creation. A runtime HW→CPU demote (or
+    /// an MPEG-2-on-CPU pin window) means that HW session is not actually
+    /// open right now, yet the frozen count still charges it — which is
+    /// what made the Resources card and the oversubscription watchdog
+    /// over-report HW decoders after a demote. This corrected view is what
+    /// [`FlowManager::total_hw_sessions`] rolls up, so both the card and
+    /// the watchdog count the sessions that are really live.
+    ///
+    /// Scope: **display outputs only**. That's where the runtime demote
+    /// path publishes a live decoder label (the `active_decoder_label`
+    /// atomic). Encode sessions and SDI / transcode decode sessions have
+    /// no runtime-truthful signal today, so they keep their frozen
+    /// contribution. The correction is one-directional — it only ever
+    /// *subtracts* a HW session the config reserved but the runtime isn't
+    /// using, never adds one, so it can never manufacture a spurious
+    /// oversubscription alarm. A display output whose decoder hasn't been
+    /// opened yet (label still `Unset`) keeps its configured reservation.
+    pub fn hw_session_usage_live(&self) -> crate::engine::hardware_probe::HwSessionUsage {
+        #[allow(unused_mut)]
+        let mut usage = self.hw_session_usage();
+        #[cfg(all(feature = "display", target_os = "linux"))]
+        {
+            use crate::config::models::OutputConfig;
+            let pairs: Vec<_> = self
+                .config
+                .outputs
+                .iter()
+                .filter_map(|out| {
+                    let OutputConfig::Display(d) = out else {
+                        return None;
+                    };
+                    let pref = d.hw_decode.unwrap_or_default();
+                    let configured = crate::engine::hardware_probe::resolve_display_decoder(
+                        &pref,
+                        crate::engine::hardware_probe::static_capabilities().as_deref(),
+                    )
+                    .unwrap_or(crate::engine::hardware_probe::ResolvedDisplayDecoder::Cpu);
+                    let live = self.stats.active_display_decoder_label(out.id());
+                    Some((configured.family(), live))
+                })
+                .collect();
+            usage = reconcile_display_decode_sessions(usage, pairs);
+        }
+        usage
     }
 
     /// Phase 7: replace this flow's PID-bus assembly plan in place.
@@ -3027,6 +3088,7 @@ impl FlowRuntime {
             broadcast_capacity: self.broadcast_capacity,
             #[cfg(feature = "replay")]
             replay_command_txs: &self.replay_command_txs,
+            media_player_command_txs: &self.media_player_command_txs,
         };
 
         let spawned = spawn_input_runtime(&input_def, &spawn_ctx);
@@ -3521,6 +3583,7 @@ fn spawn_single_input(
     st2110_timeline: &Arc<crate::engine::st2110::timeline::SharedMediaTimeline>,
     #[cfg(feature = "replay")]
     replay_command_txs: &dashmap::DashMap<String, tokio::sync::mpsc::Sender<crate::replay::ReplayCommand>>,
+    media_player_command_txs: &dashmap::DashMap<String, tokio::sync::mpsc::Sender<crate::engine::input_media_player::controller::MediaPlayerCommand>>,
 ) -> (JoinHandle<()>, Option<WhipSessionInfo>) {
     let input_id = input_def.id.clone();
     let mut whip_info: Option<WhipSessionInfo> = None;
@@ -3650,12 +3713,30 @@ fn spawn_single_input(
             input_cancel.clone(), event_sender.clone(),
             flow_id.to_string(), input_id.clone(),
         ),
-        InputConfig::MediaPlayer(c) => super::input_media_player::spawn_media_player_input(
-            c.clone(), per_input_tx.clone(), flow_stats.clone(),
-            input_cancel.clone(), event_sender.clone(),
-            flow_id.to_string(), input_id.clone(),
-            av_sync_pacer.clone(),
-        ),
+        InputConfig::MediaPlayer(c) => {
+            // Phase 3b: wire an operator-command channel only when the
+            // controller is enabled (per-input `operator_control`, default on;
+            // env escape hatch). When off, pass `None` and the legacy loop
+            // runs — nothing is registered, so a stray `media_player_next`
+            // command finds no input and is refused.
+            let cmd_rx = if super::input_media_player::controller::controller_enabled(
+                c.operator_control,
+            ) {
+                let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel::<
+                    super::input_media_player::controller::MediaPlayerCommand,
+                >(16);
+                media_player_command_txs.insert(input_id.clone(), cmd_tx);
+                Some(cmd_rx)
+            } else {
+                None
+            };
+            super::input_media_player::spawn_media_player_input(
+                c.clone(), per_input_tx.clone(), flow_stats.clone(),
+                input_cancel.clone(), event_sender.clone(),
+                flow_id.to_string(), input_id.clone(),
+                av_sync_pacer.clone(), cmd_rx,
+            )
+        }
         #[cfg(feature = "replay")]
         InputConfig::Replay(c) => {
             let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel::<crate::replay::ReplayCommand>(32);
@@ -3808,6 +3889,10 @@ pub(crate) struct InputSpawnContext<'a> {
     #[cfg(feature = "replay")]
     pub replay_command_txs:
         &'a dashmap::DashMap<String, tokio::sync::mpsc::Sender<crate::replay::ReplayCommand>>,
+    /// Media-player operator-command registry (Phase 3b). Same threading as
+    /// `replay_command_txs`.
+    pub media_player_command_txs:
+        &'a dashmap::DashMap<String, tokio::sync::mpsc::Sender<crate::engine::input_media_player::controller::MediaPlayerCommand>>,
 }
 
 /// Output of [`spawn_input_runtime`]. Carries the assembled [`InputRuntime`]
@@ -3874,6 +3959,7 @@ pub(crate) fn spawn_input_runtime(
         ctx.st2110_timeline,
         #[cfg(feature = "replay")]
         ctx.replay_command_txs,
+        ctx.media_player_command_txs,
     );
 
     if input_def.config.is_ts_carrier() {
@@ -6353,6 +6439,57 @@ fn output_resource_contribution(
     (units, usage)
 }
 
+/// Reconcile a flow's frozen HW-session block against the live decoder
+/// state of its display outputs. For each `(configured_family,
+/// live_label)` pair, subtract one from the matching decode-session
+/// counter iff the output was costed against a HW decode family but its
+/// live label now reports an *explicit* CPU state (a runtime demote or an
+/// MPEG-2-on-CPU pin window). A `None` family (CPU-configured output) or a
+/// `None` / `Unset` label (output not started, or decoder not opened yet)
+/// leaves the reservation untouched.
+///
+/// Pure over its inputs so it can be unit-tested without a live
+/// `FlowRuntime`. See [`FlowRuntime::hw_session_usage_live`] for scope and
+/// the one-directional (subtract-only) rationale.
+#[cfg(all(feature = "display", target_os = "linux"))]
+fn reconcile_display_decode_sessions(
+    mut usage: crate::engine::hardware_probe::HwSessionUsage,
+    display_outputs: impl IntoIterator<
+        Item = (
+            Option<crate::engine::hardware_probe::HwDecoderFamily>,
+            Option<crate::stats::collector::DisplayDecoderLabel>,
+        ),
+    >,
+) -> crate::engine::hardware_probe::HwSessionUsage {
+    use crate::engine::hardware_probe::HwDecoderFamily;
+    use crate::stats::collector::DisplayDecoderLabel;
+    for (family, label) in display_outputs {
+        let Some(family) = family else { continue };
+        let on_cpu = matches!(
+            label,
+            Some(DisplayDecoderLabel::Cpu) | Some(DisplayDecoderLabel::CpuHwUnavailable)
+        );
+        if !on_cpu {
+            continue;
+        }
+        match family {
+            HwDecoderFamily::Nvdec => {
+                usage.nvdec_in_use = usage.nvdec_in_use.saturating_sub(1);
+            }
+            HwDecoderFamily::Qsv => {
+                usage.qsv_decode_in_use = usage.qsv_decode_in_use.saturating_sub(1);
+            }
+            HwDecoderFamily::Vaapi => {
+                usage.vaapi_decode_in_use = usage.vaapi_decode_in_use.saturating_sub(1);
+            }
+            HwDecoderFamily::Rkmpp => {
+                usage.rkmpp_decode_in_use = usage.rkmpp_decode_in_use.saturating_sub(1);
+            }
+        }
+    }
+    usage
+}
+
 /// Pull the `(audio_encode, video_encode_codec)` pair out of an
 /// [`OutputConfig`] variant, returning `(None, None)` for outputs
 /// that don't carry encode blocks (ST 2110 audio, bonded, etc.).
@@ -7222,6 +7359,88 @@ mod cost_plan_tests {
         // input, and there are no per-input generators).
         let no_inputs = derive_cost_plan(&flow_with_thumbnail(vec![], true, None));
         assert_eq!(no_inputs.thumbnail_units, 0);
+    }
+
+    // ── hw_session_usage_live reconciliation (part 2 of the monitoring
+    //    accuracy fix): a display output that demotes / MPEG-2-pins to CPU
+    //    at runtime must stop counting against its configured decode
+    //    family in the rollup the manager sees. Exercises the pure
+    //    `reconcile_display_decode_sessions` helper directly so no live
+    //    FlowRuntime is needed.
+
+    #[cfg(all(feature = "display", target_os = "linux"))]
+    #[test]
+    fn live_reconcile_subtracts_only_demoted_display_decoders() {
+        use crate::engine::hardware_probe::{HwDecoderFamily, HwSessionUsage};
+        use crate::stats::collector::DisplayDecoderLabel;
+
+        // Frozen creation-time block: two VAAPI display decoders reserved,
+        // one NVDEC, one RKMPP — plus a VAAPI *encode* session that this
+        // decode-side reconciliation must never touch.
+        let frozen = HwSessionUsage {
+            vaapi_decode_in_use: 2,
+            nvdec_in_use: 1,
+            rkmpp_decode_in_use: 1,
+            vaapi_in_use: 1,
+            ..Default::default()
+        };
+
+        // One VAAPI output demoted (hw unavailable), one still zero-copy,
+        // NVDEC pinned to CPU (an MPEG-2 window), RKMPP decoder not opened
+        // yet (Unset), and a CPU-configured output (no family) that also
+        // reports CPU — nothing to subtract for the latter two.
+        let pairs = vec![
+            (
+                Some(HwDecoderFamily::Vaapi),
+                Some(DisplayDecoderLabel::CpuHwUnavailable),
+            ),
+            (
+                Some(HwDecoderFamily::Vaapi),
+                Some(DisplayDecoderLabel::VaapiZeroCopy),
+            ),
+            (Some(HwDecoderFamily::Nvdec), Some(DisplayDecoderLabel::Cpu)),
+            (Some(HwDecoderFamily::Rkmpp), Some(DisplayDecoderLabel::Unset)),
+            (None, Some(DisplayDecoderLabel::Cpu)),
+        ];
+
+        let live = reconcile_display_decode_sessions(frozen, pairs);
+
+        assert_eq!(
+            live.vaapi_decode_in_use, 1,
+            "one VAAPI demote subtracts exactly one; the zero-copy one stays"
+        );
+        assert_eq!(
+            live.nvdec_in_use, 0,
+            "an MPEG-2 CPU-pin drops the reserved NVDEC session"
+        );
+        assert_eq!(
+            live.rkmpp_decode_in_use, 1,
+            "an Unset (not-yet-opened) label keeps the reservation"
+        );
+        assert_eq!(
+            live.vaapi_in_use, 1,
+            "encode sessions are never adjusted by decode-side reconciliation"
+        );
+    }
+
+    #[cfg(all(feature = "display", target_os = "linux"))]
+    #[test]
+    fn live_reconcile_saturates_and_ignores_missing_labels() {
+        use crate::engine::hardware_probe::{HwDecoderFamily, HwSessionUsage};
+        use crate::stats::collector::DisplayDecoderLabel;
+
+        // Frozen says zero VAAPI decoders but a demote is reported anyway
+        // (shouldn't happen, but the subtract must saturate, not underflow),
+        // and a None label (output not registered / no display handle) is
+        // ignored — the reservation is neither added nor removed.
+        let frozen = HwSessionUsage::default();
+        let pairs = vec![
+            (Some(HwDecoderFamily::Vaapi), Some(DisplayDecoderLabel::Cpu)),
+            (Some(HwDecoderFamily::Qsv), None),
+        ];
+        let live = reconcile_display_decode_sessions(frozen, pairs);
+        assert_eq!(live.vaapi_decode_in_use, 0, "saturating_sub floors at zero");
+        assert_eq!(live.qsv_decode_in_use, 0, "None label is a no-op");
     }
 }
 

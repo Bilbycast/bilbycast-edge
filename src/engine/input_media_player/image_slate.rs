@@ -36,6 +36,7 @@ pub async fn play_image_file(
     fps: u8,
     bitrate_kbps: u32,
     audio_silence: bool,
+    duration_secs: Option<u32>,
     session: &mut PlayerSession<'_>,
 ) -> Result<()> {
     let path_owned = path.to_path_buf();
@@ -43,7 +44,7 @@ pub async fn play_image_file(
         .await
         .map_err(|e| anyhow!("image decode join failed: {e}"))??;
 
-    encode_loop(decoded, fps, bitrate_kbps, audio_silence, session).await
+    encode_loop(decoded, fps, bitrate_kbps, audio_silence, duration_secs, session).await
 }
 
 struct DecodedImage {
@@ -131,6 +132,7 @@ async fn encode_loop(
     fps: u8,
     bitrate_kbps: u32,
     audio_silence: bool,
+    duration_secs: Option<u32>,
     session: &mut PlayerSession<'_>,
 ) -> Result<()> {
     let backend = select_video_backend()
@@ -164,12 +166,10 @@ async fn encode_loop(
         hw_decode: None,
     };
 
-    let mut encoder = ScaledVideoEncoder::new(
+    let mut encoder = build_image_encoder(
         video_cfg,
         backend,
-        fps as u32,
-        1,
-        false,
+        fps,
         format!("media-player-image-{}x{}", img.width, img.height),
     );
 
@@ -229,7 +229,26 @@ async fn encode_loop(
     let mut frame_idx: u64 = 0;
     let mut out_rtp_ts: u32 = 0;
 
+    // The still is producing a valid TS from the first frame — the pacer-based
+    // formats flip PLAYING via `emit_to_pacer`, but this path uses `emit_bundle`
+    // directly, so stamp it here or the source is stuck reporting "starting".
+    use std::sync::atomic::Ordering;
+    session.media_stats.state.store(
+        crate::stats::collector::media_player_state::PLAYING,
+        Ordering::Relaxed,
+    );
+
+    // Optional fixed duration: a timed playlist item returns after it elapses so
+    // the playlist advances. `None` = the slate/fallback case — loop forever
+    // until cancelled (operator Next, transition, or flow stop).
+    let play_until = duration_secs.map(|d| start + Duration::from_secs(d as u64));
+
     loop {
+        if let Some(deadline) = play_until {
+            if Instant::now() >= deadline {
+                break;
+            }
+        }
         tokio::select! {
             _ = session.cancel.cancelled() => break,
             _ = ticker.tick() => {}
@@ -306,6 +325,29 @@ async fn encode_loop(
     }
     session.cont.close_file(max_emitted_pts_90k);
     Ok(())
+}
+
+/// Build the still-image encoder **and declare its 90 kHz PTS timebase**.
+///
+/// Kept as its own function purely so the declaration has a regression guard:
+/// this path stamps every frame with a 90 kHz PTS, and omitting
+/// `set_pts_90k()` does not fail loudly. Without it lazy-open keeps the 1/fps
+/// timebase implied by `fps_num`/`fps_den`, so libavcodec reads the 90 kHz
+/// step (3600 ticks at 25 fps) as 3600 *frame periods* — 144 s per picture —
+/// and rate control budgets `bitrate × 144 s` per frame. Hardware-measured on
+/// bilby-bite: a 500 kbps still emitted ~9 MB/frame ≈ 1.8 Gbps and ~3.2 GB per
+/// 15 s slate (~3600x configured), which also drove the edge's RSS into the
+/// OOM killer. `sdi_io` and `st2110_video_io` owe the same declaration —
+/// see `docs/sdi.md` "The 90 kHz PTS contract".
+fn build_image_encoder(
+    video_cfg: VideoEncodeConfig,
+    backend: video_codec::VideoEncoderCodec,
+    fps: u8,
+    log_tag: String,
+) -> ScaledVideoEncoder {
+    let mut encoder = ScaledVideoEncoder::new(video_cfg, backend, fps as u32, 1, false, log_tag);
+    encoder.set_pts_90k();
+    encoder
 }
 
 #[allow(unused_imports, unreachable_code)]
@@ -418,5 +460,76 @@ impl SilenceEncoder {
             out.push((encoded.bytes, pts));
         }
         Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn probe_cfg() -> VideoEncodeConfig {
+        VideoEncodeConfig {
+            codec: "libx264".to_string(),
+            width: Some(1920),
+            height: Some(1080),
+            fps_num: Some(25),
+            fps_den: Some(1),
+            bitrate_kbps: Some(500),
+            gop_size: Some(25),
+            preset: Some("ultrafast".to_string()),
+            profile: None,
+            chroma: None,
+            bit_depth: None,
+            rate_control: None,
+            crf: None,
+            max_bitrate_kbps: None,
+            bframes: Some(0),
+            refs: None,
+            level: None,
+            tune: Some("stillimage".to_string()),
+            color_primaries: None,
+            color_transfer: None,
+            color_matrix: None,
+            color_range: None,
+            source_video_pid: None,
+            hw_decode: None,
+        }
+    }
+
+    /// Regression guard for the 90 kHz PTS contract.
+    ///
+    /// The still-image path stamps 90 kHz PTS. If `set_pts_90k()` is dropped,
+    /// nothing crashes — rate control silently budgets `bitrate × 144 s` per
+    /// frame (3600 ticks at 25 fps read as 3600 frame periods), which measured
+    /// ~1.8 Gbps for a 500 kbps still on bilby-bite. There is no runtime signal
+    /// to catch that, so the declaration is asserted here instead.
+    #[test]
+    fn image_encoder_declares_90khz_pts() {
+        let enc = build_image_encoder(
+            probe_cfg(),
+            video_codec::VideoEncoderCodec::X264,
+            25,
+            "test".to_string(),
+        );
+        assert!(
+            enc.is_pts_90k(),
+            "still-image encoder must declare 90 kHz PTS; without it rate \
+             control over-allocates by ~3600x (see docs/sdi.md 90 kHz PTS contract)"
+        );
+    }
+
+    /// The declaration must not depend on `fps` — the mis-scaling factor is
+    /// `90000/fps`, so a low fps makes it *worse*, not better.
+    #[test]
+    fn image_encoder_declares_90khz_pts_at_any_fps() {
+        for fps in [1u8, 5, 25, 60] {
+            let enc = build_image_encoder(
+                probe_cfg(),
+                video_codec::VideoEncoderCodec::X264,
+                fps,
+                "test".to_string(),
+            );
+            assert!(enc.is_pts_90k(), "must declare 90 kHz PTS at fps={fps}");
+        }
     }
 }

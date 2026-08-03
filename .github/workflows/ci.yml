@@ -153,3 +153,15 @@ jobs:
       - name: cargo check
         working-directory: bilbycast-edge
         run: cargo check --all-targets --locked
+
+      # Run the unit/integration test suite. Added as a step in this job
+      # rather than a separate job on purpose: a parallel job would re-clone
+      # all eight sibling repos and rebuild the vendored FFmpeg from cold
+      # (the dominant cost), for no extra coverage. `cargo test` here reuses
+      # the target dir `cargo check` just populated — only the test-mode
+      # codegen is new. Before this step existed nothing ran the suite on a
+      # PR: CI was compile-only, so a green tree could still ship a failing
+      # test. See MEDIA_PLAYER_HOLISTIC_REDESIGN_PLAN.md Phase 0.
+      - name: cargo test
+        working-directory: bilbycast-edge
+        run: cargo test --all-targets --locked

@@ -108,6 +108,21 @@ shares this contract (and previously shared the bug). Details:
 `docs/clocking.md` does not cover this; see the module doc in
 `engine/video_encode_util.rs` and `VideoEncoderConfig::time_base_num`.
 
+**Every `ScaledVideoEncoder` call site that stamps 90 kHz PTS must call
+`set_pts_90k()` before the first `encode*`** (lazy-open reads it). Current
+call sites: `engine::sdi_io`, `engine::st2110_video_io`, and
+`engine::input_media_player::image_slate`. The third one is a cautionary
+case, because a missing declaration does **not** always announce itself as
+a crash: the media-player still-image path shipped without it and instead
+*silently over-allocated bitrate*. At 25 fps the 90 kHz step is 3600 ticks,
+which rate control read as 3600 frame periods (144 s per picture) and
+budgeted `bitrate × 144 s` for every frame — a 500 kbps slate emitted ~9 MB
+per frame, **~1.84 Gbps on the wire (~3600× configured)** and ~3.2 GB per
+15 s slate. Hardware-measured on bilby-bite; the resulting firehose was also
+what drove the edge's RSS growth into the OOM killer. So the symptom to
+watch for is not only a segfault but *any* encoder output wildly above its
+configured bitrate — check `set_pts_90k()` first.
+
 ## Build
 
 ```bash

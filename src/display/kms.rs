@@ -2970,13 +2970,15 @@ impl KmsDisplay {
             let mut handles: [Option<drm::buffer::Handle>; 4] = [None; 4];
             let mut pitches: [u32; 4] = [0; 4];
             let mut offsets: [u32; 4] = [0; 4];
+            let mut import_err: Option<anyhow::Error> = None;
 
             for (i, plane) in descriptor.planes.iter().enumerate() {
                 if i >= 4 {
-                    anyhow::bail!(
+                    import_err = Some(anyhow::anyhow!(
                         "display_prime_invalid: too many planes ({})",
                         descriptor.planes.len()
-                    );
+                    ));
+                    break;
                 }
                 // SAFETY: descriptor.planes[i].fd is owned by the
                 // `keepalive` Arc; the borrowed FD here lives only across
@@ -2985,40 +2987,76 @@ impl KmsDisplay {
                 let borrowed = unsafe {
                     std::os::fd::BorrowedFd::borrow_raw(plane.fd)
                 };
-                let handle = self
-                    .card
-                    .prime_fd_to_buffer(borrowed)
-                    .with_context(|| {
-                        format!(
+                match self.card.prime_fd_to_buffer(borrowed) {
+                    Ok(handle) => {
+                        handles[i] = Some(handle);
+                        pitches[i] = plane.pitch;
+                        offsets[i] = plane.offset;
+                    }
+                    Err(e) => {
+                        import_err = Some(anyhow::Error::new(e).context(format!(
                             "display_prime_addfb_failed: prime_fd_to_buffer for plane {} (fd={})",
                             i, plane.fd
-                        )
-                    })?;
-                handles[i] = Some(handle);
-                pitches[i] = plane.pitch;
-                offsets[i] = plane.offset;
+                        )));
+                        break;
+                    }
+                }
             }
 
-            let buf = PrimePlanarBuffer {
-                width: descriptor.width,
-                height: descriptor.height,
-                fourcc,
-                modifier,
-                handles,
-                pitches,
-                offsets,
+            let fb_result: Result<framebuffer::Handle> = match import_err {
+                Some(e) => Err(e),
+                None => {
+                    let buf = PrimePlanarBuffer {
+                        width: descriptor.width,
+                        height: descriptor.height,
+                        fourcc,
+                        modifier,
+                        handles,
+                        pitches,
+                        offsets,
+                    };
+                    let flags = if modifier.is_some() {
+                        FbCmd2Flags::MODIFIERS
+                    } else {
+                        FbCmd2Flags::empty()
+                    };
+                    self.card
+                        .add_planar_framebuffer(&buf, flags)
+                        .context("display_prime_addfb_failed: add_planar_framebuffer")
+                }
             };
 
-            let flags = if modifier.is_some() {
-                FbCmd2Flags::MODIFIERS
-            } else {
-                FbCmd2Flags::empty()
-            };
-            let fb = self
-                .card
-                .add_planar_framebuffer(&buf, flags)
-                .context("display_prime_addfb_failed: add_planar_framebuffer")?;
-            // NOTE: the freshly-imported `fb` is deliberately NOT
+            // Close the per-fd GEM handles now — success *and* failure.
+            //
+            // `prime_fd_to_buffer` creates a handle-table entry that holds its
+            // own reference on the underlying buffer object; the framebuffer
+            // created above takes a *separate* kernel reference at addfb time,
+            // so scanout does not need the handle (the classic addfb-then-
+            // GEM_CLOSE pattern GStreamer's kmssink uses). Nothing else reads
+            // these handles: the cache stores only the fb, and eviction calls
+            // `destroy_framebuffer` alone. Leaving the handles open therefore
+            // leaked one buffer-object reference per import, pinning the
+            // object *after* its fb was evicted — measured on bilby-bite
+            // (i915) as ~70 MB/min of `i915_gem_objects` growth under a
+            // media-player source-switch loop (every switch brings a fresh
+            // VAAPI surface pool with new DMA-BUF identities; `fb_count`
+            // stayed bounded while GEM bytes climbed), which is what drove
+            // the box into the OOM killer overnight. Dedup before closing:
+            // planes sharing one underlying object get the *same* handle
+            // back from the kernel, and GEM_CLOSE on an already-closed
+            // handle would just EINVAL (harmless, but noisy).
+            let mut closed: [u32; 4] = [0; 4];
+            let mut n_closed = 0usize;
+            for h in handles.iter().flatten() {
+                let raw: u32 = (*h).into();
+                if !closed[..n_closed].contains(&raw) {
+                    closed[n_closed] = raw;
+                    n_closed += 1;
+                    let _ = self.card.close_buffer(*h);
+                }
+            }
+
+            // NOTE: the freshly-imported fb is deliberately NOT
             // inserted into `prime_fb_cache` here. Insertion happens
             // only after the present below actually succeeds (see
             // "commit the new FB to the cache" at the tail of this
@@ -3032,7 +3070,7 @@ impl KmsDisplay {
             // `prime_scanout_permanently_rejected` read that EINVAL as
             // a permanent modifier rejection and demoted the output to
             // CPU blit for the rest of the session.
-            fb
+            fb_result?
         };
 
         // Promote the new prime FB onto the CRTC.

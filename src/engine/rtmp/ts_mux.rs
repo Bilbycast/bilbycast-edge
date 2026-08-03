@@ -423,7 +423,21 @@ impl TsMuxer {
         let mut packets = self.maybe_emit_pat_pmt(false);
         let pes = build_pes_packet(0xC0, adts_frame, pts_90khz, None);
         let audio_pid = self.audio_pid;
-        packets.extend(self.packetize(audio_pid, &pes, true, false, None, false));
+        // Audio-only playout (no video PID): the PMT points the PCR PID at the
+        // audio PID, so PCR must actually ride the audio packets — otherwise the
+        // stream carries no PCR at all and receivers can't establish a clock
+        // (TR-101290 PCR_error, no playout). Mirrors `mux_private_audio`. When
+        // video IS present it carries the PCR, so this stays `false` there and
+        // the existing video+audio path is byte-identical.
+        //
+        // Gate on the *effective* PCR PID, not on `audio_pid` directly: a
+        // caller that set `pcr_pid_override` has declared PCR on some other
+        // PID in the PMT, and writing it here as well would put PCR on a PID
+        // the PMT does not name — the same PCR_error in the other direction.
+        let pcr_pid = self.pcr_pid_override.unwrap_or(audio_pid);
+        let write_pcr = !self.has_video && pcr_pid == audio_pid;
+        let pcr = if write_pcr { Some(pts_90khz) } else { None };
+        packets.extend(self.packetize(audio_pid, &pes, true, write_pcr, pcr, false));
         packets
     }
 
@@ -1303,5 +1317,83 @@ mod tests {
         let pos = payload(&a[0]);
         assert_eq!(a[0][pos], 0); // pointer_field
         assert_eq!(a[0][pos + 1], 0xfc);
+    }
+
+    /// True if a 188-byte TS packet carries a PCR in its adaptation field.
+    fn ts_packet_has_pcr(pkt: &[u8]) -> bool {
+        // adaptation_field_control: byte 3, bits 5-4. 0b10 or 0b11 ⇒ AF present.
+        let afc = (pkt[3] >> 4) & 0x03;
+        if afc != 0b10 && afc != 0b11 {
+            return false;
+        }
+        let af_len = pkt[4] as usize;
+        if af_len == 0 {
+            return false;
+        }
+        // AF flags byte (pkt[5]), PCR_flag = 0x10.
+        (pkt[5] & 0x10) != 0
+    }
+
+    fn ts_pid(pkt: &[u8]) -> u16 {
+        (((pkt[1] & 0x1F) as u16) << 8) | pkt[2] as u16
+    }
+
+    /// Audio-only playout (no video PID): the PMT points PCR at the audio PID,
+    /// so the audio packets themselves must carry PCR — otherwise the stream has
+    /// no clock and receivers can't play it. Regression for Phase 7 audio-only.
+    #[test]
+    fn audio_only_pre_adts_emits_pcr_on_the_audio_pid() {
+        let mut muxer = TsMuxer::new();
+        muxer.set_has_video(false);
+        muxer.set_has_audio(true);
+        muxer.set_audio_stream(0x0F, None); // AAC
+        muxer.set_pids(Some(0x1000), None, Some(0x0101), None);
+        // Minimal ADTS frame: 7-byte header + a couple payload bytes.
+        let adts = vec![0xFF, 0xF1, 0x50, 0x80, 0x00, 0x1F, 0xFC, 0xDE, 0xAD];
+        let ts = muxer.mux_audio_pre_adts(&adts, 90_000);
+        let has_pcr = ts
+            .iter()
+            .any(|p| ts_pid(p) == 0x0101 && ts_packet_has_pcr(p));
+        assert!(has_pcr, "audio-only stream must carry PCR on the audio PID");
+    }
+
+    /// With video present, PCR rides the video PID — the audio path must NOT
+    /// also emit PCR (that would be a second, conflicting clock). Guards the
+    /// audio-only fix against regressing the normal video+audio path.
+    #[test]
+    fn video_audio_pre_adts_keeps_pcr_off_the_audio_pid() {
+        let mut muxer = TsMuxer::new();
+        muxer.set_has_video(true);
+        muxer.set_has_audio(true);
+        muxer.set_pids(Some(0x1000), Some(0x0100), Some(0x0101), None);
+        let adts = vec![0xFF, 0xF1, 0x50, 0x80, 0x00, 0x1F, 0xFC, 0xDE, 0xAD];
+        let ts = muxer.mux_audio_pre_adts(&adts, 90_000);
+        let audio_has_pcr = ts
+            .iter()
+            .any(|p| ts_pid(p) == 0x0101 && ts_packet_has_pcr(p));
+        assert!(!audio_has_pcr, "video+audio: PCR rides video, never the audio PID");
+    }
+
+    /// Audio-only, but the caller declared PCR on a different PID via
+    /// `set_pcr_pid`. The PMT names that PID, so the audio packets must NOT
+    /// carry PCR — writing it here too would put PCR on a PID the PMT does not
+    /// name, which is the same TR-101290 PCR_error the audio-only fix exists to
+    /// avoid, just in the other direction.
+    #[test]
+    fn audio_only_with_pcr_pid_override_keeps_pcr_off_the_audio_pid() {
+        let mut muxer = TsMuxer::new();
+        muxer.set_has_video(false);
+        muxer.set_has_audio(true);
+        muxer.set_audio_stream(0x0F, None); // AAC
+        muxer.set_pids(Some(0x1000), None, Some(0x0101), Some(0x0200));
+        let adts = vec![0xFF, 0xF1, 0x50, 0x80, 0x00, 0x1F, 0xFC, 0xDE, 0xAD];
+        let ts = muxer.mux_audio_pre_adts(&adts, 90_000);
+        let audio_has_pcr = ts
+            .iter()
+            .any(|p| ts_pid(p) == 0x0101 && ts_packet_has_pcr(p));
+        assert!(
+            !audio_has_pcr,
+            "pcr_pid_override declared another PCR PID — audio must not carry PCR"
+        );
     }
 }

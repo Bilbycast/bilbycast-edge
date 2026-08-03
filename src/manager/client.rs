@@ -1335,6 +1335,21 @@ fn edge_capabilities() -> Vec<&'static str> {
     // engine::bond_leg_probe + docs/leg-bandwidth-test.md.
     caps.push("bond-leg-capacity");
     caps.push("bond-probe-responder");
+    // Media-player operator control (Phase 3b). Now default-on, so advertise
+    // unless the node-wide `BILBYCAST_MEDIA_PLAYER_CONTROLLER=0` escape hatch
+    // disables it (passing `None` = "no per-input override" resolves to the
+    // node default). A specific input can still be pinned to the legacy loop
+    // via `operator_control: false`, in which case the edge answers
+    // `media_player_control_unavailable` for that flow.
+    if crate::engine::input_media_player::controller::controller_enabled(None) {
+        caps.push("media-player-control-v1");
+    }
+    // Audio-only playout (Phase 7, §12): a no-video MP4/MOV or TS plays as an
+    // audio-only TS (PCR carried on the audio PID). This is a media *layout*
+    // the edge's existing MP4/TS paths now handle, not a new source kind, so
+    // it is advertised unconditionally. The `generate_black` layout policy
+    // (synthesised video for receivers that require it) is a later addition.
+    caps.push("media-player-audio-only-v1");
     if cfg!(feature = "replay") {
         // Replay-server: continuous flow recording + clip-based playback.
         // The manager UI gates the Replay tab on the presence of this string.
@@ -3596,6 +3611,85 @@ async fn execute_command(
                 .map_err(|e| format!("scan_media failed: {e}"))?;
             Ok(Some(serde_json::to_value(&result).unwrap_or_default()))
         }
+        "inspect_media" => {
+            // Return the content-derived asset manifest for one library file
+            // (plan Phase 1). Cache-backed: cheap on a fresh sidecar, probes
+            // only when the file is new or changed. `manifest: null` means the
+            // file is not in the library; an unsupported/unreadable file still
+            // returns a manifest whose `probe_state` carries the reason, so
+            // the manager can render an actionable badge either way.
+            let name = action["name"]
+                .as_str()
+                .ok_or("inspect_media: missing 'name'")?;
+            let m = crate::media::MediaLibrary::manifest(name)
+                .await
+                .map_err(|e| format!("inspect_media failed: {e}"))?;
+            Ok(Some(serde_json::json!({ "manifest": m })))
+        }
+        "reprobe_media" => {
+            // Force a fresh probe, replacing any cached manifest sidecar
+            // (operator/admin "Re-probe" affordance, plan §6.3).
+            let name = action["name"]
+                .as_str()
+                .ok_or("reprobe_media: missing 'name'")?;
+            let m = crate::media::MediaLibrary::refresh_manifest(name)
+                .await
+                .map_err(|e| format!("reprobe_media failed: {e}"))?;
+            Ok(Some(serde_json::json!({ "manifest": m })))
+        }
+        "plan_media_playlist" => {
+            // Classify every adjacent boundary of a proposed playlist (plan
+            // Phase 2) so the manager can show per-boundary compatibility and
+            // block save/start on an unsupported splice before playout. The
+            // edge remains the authority. Input: an ordered `sources` array
+            // (`[{name}, …]`), `loop_playback`, and an optional `policy`.
+            use crate::engine::input_media_player::planner;
+
+            let sources = action["sources"]
+                .as_array()
+                .ok_or("plan_media_playlist: missing 'sources' array")?;
+            // Same bound the config validator enforces on a real playlist —
+            // without it an oversized array drives that many manifest probes.
+            if sources.len() > 256 {
+                return Err(CommandError::new(format!(
+                    "plan_media_playlist: 'sources' must contain 1-256 entries (got {})",
+                    sources.len()
+                )));
+            }
+            let loop_playback = action["loop_playback"].as_bool().unwrap_or(true);
+            // Reject a malformed policy rather than silently defaulting. Every
+            // other structured parameter in this dispatcher uses `map_err(..)?`;
+            // swallowing the error here would degrade to the permissive Native
+            // mode and flip the authoritative `valid` / `requires_transcode`
+            // answer in the lenient direction — on the one command whose own
+            // contract is "the edge remains the authority". A US-spelled
+            // "normalized" against this edge's "normalised" is exactly that
+            // case: a hard parse failure, not a near miss.
+            let policy: planner::PlaybackPolicy = match action.get("policy") {
+                None | Some(serde_json::Value::Null) => planner::PlaybackPolicy::default(),
+                Some(p) => serde_json::from_value(p.clone()).map_err(|e| {
+                    CommandError::new(format!("plan_media_playlist: invalid 'policy': {e}"))
+                })?,
+            };
+
+            // Resolve each entry's manifest (cache-or-probe). A missing /
+            // unreadable file yields `None`, which the planner classifies as
+            // a Missing entry + Unsupported boundary rather than erroring the
+            // whole command.
+            let mut manifests = Vec::with_capacity(sources.len());
+            for s in sources {
+                let name = s["name"].as_str().unwrap_or("");
+                if name.is_empty() {
+                    manifests.push(None);
+                    continue;
+                }
+                let m = crate::media::MediaLibrary::manifest(name).await.unwrap_or(None);
+                manifests.push(m);
+            }
+
+            let planned = planner::plan_playlist(&manifests, loop_playback, &policy);
+            Ok(Some(serde_json::to_value(&planned).unwrap_or_default()))
+        }
         "upload_media_chunk" => {
             let name = action["name"]
                 .as_str()
@@ -4758,6 +4852,64 @@ async fn execute_command(
                     "replay_no_playback_input",
                 ))?;
             dispatch_replay_input_command(action_type, action, cmd_tx).await
+        }
+        "media_player_next" => {
+            // Operator "Next" for a media-player input running the Phase 3b
+            // controller. Routes through the per-input command channel; the
+            // controller's state machine validates the generation (idempotent
+            // double-click safety) and answers with the outcome, which we
+            // forward verbatim to the manager.
+            use crate::engine::input_media_player::controller::MediaPlayerCommand;
+            let flow_id = action["flow_id"].as_str().ok_or_else(|| {
+                CommandError::new("media_player_next: missing 'flow_id'")
+            })?;
+            let input_id = action["input_id"].as_str().ok_or_else(|| {
+                CommandError::new("media_player_next: missing 'input_id'")
+            })?;
+            let runtime = flow_manager
+                .get_runtime(flow_id)
+                .ok_or_else(|| CommandError::new(format!("Unknown flow '{flow_id}'")))?;
+            let cmd_tx = runtime
+                .media_player_command_txs
+                .get(input_id)
+                .map(|r| r.clone())
+                .ok_or_else(|| {
+                    CommandError::with_code(
+                        format!(
+                            "Media-player input '{input_id}' is not running the controller (Next unavailable)"
+                        ),
+                        "media_player_control_unavailable",
+                    )
+                })?;
+            // `0` is a real generation — the first source to play is
+            // generation 0 — so it cannot double as "caller didn't say".
+            // Defaulting a missing field to 0 would let a manager that omits
+            // the token skip an item on a player that has never transitioned,
+            // while being rejected as stale on every player that has. Require
+            // it, and let the manager use the `generation` field the stats
+            // already carry.
+            let expected_generation = action["expected_generation"].as_u64().ok_or_else(|| {
+                CommandError::new(
+                    "media_player_next: missing 'expected_generation' (send the \
+                     `generation` value from media_player_stats)",
+                )
+            })?;
+            let request_id = action["request_id"].as_str().unwrap_or_default().to_string();
+            let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+            cmd_tx
+                .send(MediaPlayerCommand::Next {
+                    expected_generation,
+                    request_id,
+                    reply: reply_tx,
+                })
+                .await
+                .map_err(|_| {
+                    CommandError::new("media-player input command channel closed")
+                })?;
+            let outcome = reply_rx.await.map_err(|_| {
+                CommandError::new("media-player input dropped the Next reply")
+            })?;
+            Ok(Some(serde_json::to_value(&outcome).unwrap_or_default()))
         }
         "upgrade_binary" => {
             let coord = crate::upgrade::global_coordinator().ok_or_else(|| {
