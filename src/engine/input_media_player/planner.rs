@@ -292,12 +292,31 @@ fn first_stream<'a>(m: &'a AssetManifest, t: ManifestMediaType) -> Option<&'a cr
     m.streams.iter().find(|s| s.media_type == t)
 }
 
+/// Whether the asset's PAT advertised more than one program.
+fn is_mpts(m: &AssetManifest) -> bool {
+    m.container.as_ref().and_then(|c| c.programs).unwrap_or(0) > 1
+}
+
 fn compare(a: &AssetManifest, b: &AssetManifest) -> Diff {
     let mut reasons = Vec::new();
     let mut layout_changed = false;
 
     if a.detected_kind != b.detected_kind {
         reasons.push("source_kind_changed".to_string());
+    }
+
+    // An MPTS endpoint cannot be compared track-for-track. `streams` is a flat
+    // list with no program association, so `first_stream` can pick a video from
+    // one program and an audio from another, and the plan request carries only
+    // each entry's `name` — never the `MediaPlayerSource::Ts { program_number }`
+    // the runtime actually plays. A playlist of the same mux at two different
+    // program numbers therefore resolves one manifest twice and compares it to
+    // itself, reporting continuity across a splice that changes video codec,
+    // resolution and audio codec. Say we don't know rather than claim it is
+    // clean; per-stream program association is the full fix.
+    if is_mpts(a) || is_mpts(b) {
+        reasons.push("mpts_program_selection_unknown".to_string());
+        layout_changed = true;
     }
 
     let av = first_stream(a, ManifestMediaType::Video);
@@ -451,6 +470,7 @@ mod tests {
                 bitrate_bps: None,
                 fragmented: false,
                 ts_packet_bytes: None,
+                programs: None,
             }),
             streams,
             compatibility: Compatibility::default(),
@@ -494,6 +514,42 @@ mod tests {
         assert!(!bnd.native_actions.contains(&"pmt_version_bump".to_string()));
         // A signalled native boundary is still a valid playlist.
         assert!(plan.valid);
+    }
+
+    /// Two identical-looking MPTS endpoints must NOT be reported as
+    /// continuous. `streams` is flat with no program association and the plan
+    /// request carries no `program_number`, so the planner cannot know which
+    /// program each entry will actually play — a playlist of the same mux at
+    /// two different program numbers compares one manifest against itself.
+    #[test]
+    fn mpts_endpoints_are_never_claimed_continuous() {
+        let mut a = manifest(DetectedKind::Ts, vec![video("h264", 1920, 1080, (25, 1), "aaa")]);
+        let mut b = a.clone();
+        for m in [&mut a, &mut b] {
+            m.container.as_mut().unwrap().programs = Some(4);
+        }
+        let plan = plan_playlist(&[Some(a), Some(b)], false, &native());
+        let bnd = &plan.boundaries[0];
+        assert_eq!(bnd.classification, TransitionClass::NativeDiscontinuity);
+        assert!(bnd
+            .reasons
+            .contains(&"mpts_program_selection_unknown".to_string()));
+        // Still playable — it is an honest discontinuity, not a rejection.
+        assert!(plan.valid);
+    }
+
+    /// An SPTS pair with identical streams stays continuous — the MPTS guard
+    /// must not fire on single-program files.
+    #[test]
+    fn spts_endpoints_stay_continuous() {
+        let mut a = manifest(DetectedKind::Ts, vec![video("h264", 1920, 1080, (25, 1), "aaa")]);
+        a.container.as_mut().unwrap().programs = Some(1);
+        let b = a.clone();
+        let plan = plan_playlist(&[Some(a), Some(b)], false, &native());
+        assert_eq!(
+            plan.boundaries[0].classification,
+            TransitionClass::NativeContinuous
+        );
     }
 
     #[test]

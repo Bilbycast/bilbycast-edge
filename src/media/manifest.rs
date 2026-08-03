@@ -178,6 +178,19 @@ pub struct ContainerInfo {
     /// On-wire TS packet stride (188 / 192 / 204) when `detected_kind == Ts`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ts_packet_bytes: Option<u16>,
+    /// Number of programs the PAT advertises, when `detected_kind == Ts`.
+    /// `> 1` means MPTS.
+    ///
+    /// `streams` is a flat list with no program association, so on an MPTS it
+    /// mixes tracks from every program and `first_stream()`-style selection
+    /// can pick a video and an audio belonging to *different* programs. The
+    /// planner therefore cannot compare MPTS endpoints track-for-track and
+    /// uses this count to say so honestly rather than claiming continuity it
+    /// has not established. Per-stream program association (and forwarding
+    /// each playlist entry's `program_number` into the plan request) is the
+    /// full fix and will need a schema bump.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub programs: Option<u16>,
 }
 
 /// Playability summary the manager renders and the planner consumes.
@@ -480,6 +493,7 @@ fn probe_ts(name: &str, head: &[u8], id: FileIdentity) -> Option<AssetManifest> 
         bitrate_bps: None,
         fragmented: false,
         ts_packet_bytes: Some(stride as u16),
+        programs: Some(scan.programs.len().min(u16::MAX as usize) as u16),
     };
 
     let has_video = streams.iter().any(|s| s.media_type == ManifestMediaType::Video);
@@ -637,6 +651,7 @@ fn probe_mp4(name: &str, path: &Path, id: FileIdentity) -> Mp4Probe {
         bitrate_bps: None,
         fragmented: false,
         ts_packet_bytes: None,
+        programs: None,
     };
 
     let has_video = streams.iter().any(|s| s.media_type == ManifestMediaType::Video);
@@ -849,6 +864,7 @@ fn probe_image(name: &str, path: &Path, head: &[u8], id: FileIdentity) -> Option
             bitrate_bps: None,
             fragmented: false,
             ts_packet_bytes: None,
+            programs: None,
         }),
         streams: vec![ManifestStream {
             index: 0,
@@ -924,6 +940,7 @@ mod tests {
                 bitrate_bps: Some(7800000),
                 fragmented: false,
                 ts_packet_bytes: None,
+                programs: None,
             }),
             streams: vec![ManifestStream {
                 index: 0,
