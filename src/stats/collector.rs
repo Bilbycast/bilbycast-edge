@@ -2891,7 +2891,11 @@ pub mod media_player_reader_mode {
             MP4_WHOLE_FILE => "mp4_whole_file",
             MP4_INCREMENTAL => "mp4_incremental",
             IMAGE => "image",
-            _ => "unknown",
+            // `UNKNOWN` is the zero-initialised value of `reader_mode`, so it
+            // is what a player reports before its first source starts — and
+            // what the legacy loop reports throughout, since it never stamps
+            // the field. Any other value is a code this build doesn't know.
+            UNKNOWN | _ => "unknown",
         }
     }
 }

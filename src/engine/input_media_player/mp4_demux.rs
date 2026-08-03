@@ -1232,8 +1232,22 @@ async fn play_incremental(
     // its presentation DURATION, i.e. the delta to the NEXT same-track sample;
     // we therefore keep a one-sample read-ahead (`*_pending`) and compute the
     // duration from the sample after it, exactly matching `sample_durations_us`.
-    let mut v_pending = if has_video { read_next(reader, true)? } else { None };
-    let mut a_pending = if has_audio { read_next(reader, false)? } else { None };
+    // Every sample pull is a `seek` + `read_exact` on the underlying file and
+    // an `stts`/`stsc` walk in the sync-only `mp4` crate — the same work the
+    // whole-file path does under `spawn_blocking`. Keep it off the reactor for
+    // the same reason, via `block_in_place` (this runs on the multi-threaded
+    // runtime, and the surrounding loop owns `reader` by &mut so it cannot be
+    // moved into a task).
+    let mut v_pending = if has_video {
+        tokio::task::block_in_place(|| read_next(reader, true))?
+    } else {
+        None
+    };
+    let mut a_pending = if has_audio {
+        tokio::task::block_in_place(|| read_next(reader, false))?
+    } else {
+        None
+    };
     let mut v_next_id: u32 = 2;
     let mut a_next_id: u32 = 2;
     let mut v_prev_start: Option<u64> = None;
@@ -1261,7 +1275,7 @@ async fn play_incremental(
         // reuse the previous inter-sample delta, mirroring `sample_durations_us`.
         let (cur, wall_us, dur_us) = if take_video {
             let cur = v_pending.take().expect("take_video ⇒ v_pending is Some");
-            let following = read_next_at(reader, true, v_next_id)?;
+            let following = tokio::task::block_in_place(|| read_next_at(reader, true, v_next_id))?;
             v_next_id += 1;
             let dur = duration_us(&cur, following.as_ref(), v_prev_start, video_timescale);
             v_prev_start = Some(cur.start_time);
@@ -1270,7 +1284,8 @@ async fn play_incremental(
             (cur, wall, dur)
         } else {
             let cur = a_pending.take().expect("take_audio ⇒ a_pending is Some");
-            let following = read_next_at(reader, false, a_next_id)?;
+            let following =
+                tokio::task::block_in_place(|| read_next_at(reader, false, a_next_id))?;
             a_next_id += 1;
             let dur = duration_us(&cur, following.as_ref(), a_prev_start, audio_timescale);
             a_prev_start = Some(cur.start_time);
@@ -1623,11 +1638,35 @@ impl IncrementalMp4Reader {
     }
 
     fn read_one(&mut self, track_id: u32, sid: u32, is_audio: bool) -> Result<Option<DemuxedSample>> {
-        match self
-            .mp4
-            .read_sample(track_id, sid)
-            .map_err(|e| anyhow!("mp4 sample {sid} (track {track_id}): {e}"))?
-        {
+        // `mp4::Mp4Reader::read_sample` is not panic-free on malformed input.
+        // In mp4-0.14.0 `track.rs:553` is a bare `self.sample_time(sample_id)
+        // .unwrap()` — marked `// XXX` upstream — which panics whenever `stts`
+        // fails to cover a sample id, and `stsc_index` divides and modulos by
+        // `samples_per_chunk` without ever checking it for zero.
+        //
+        // The whole-file path this reader replaces was immune by construction:
+        // `demux_file` runs entirely inside `spawn_blocking`, so an unwind
+        // surfaces as a `JoinError`, becomes an `anyhow` error, and the caller
+        // turns it into a Critical `media_player_source_failed` event, a 2 s
+        // sleep and an advance to the next playlist item. Here the reads happen
+        // on the async task, `spawn_media_player_input` is a bare `tokio::spawn`
+        // with no supervisor, and the crate has neither `catch_unwind` nor
+        // `panic = "abort"` — so an unwind would end `run()` and leave the input
+        // permanently silent with no event and no restart. This input is the
+        // automatic fallback slate for a PID-bus Hitless leg, so that failure
+        // mode kills the fallback exactly when the primary needs it.
+        //
+        // Convert the unwind back into the graceful path. The reader is
+        // abandoned by the caller's `?` immediately afterwards, so a torn
+        // parser is never reused.
+        let read = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.mp4.read_sample(track_id, sid)
+        }))
+        .map_err(|_| {
+            anyhow!("malformed MP4 sample table at sample {sid} (track {track_id})")
+        })?;
+
+        match read.map_err(|e| anyhow!("mp4 sample {sid} (track {track_id}): {e}"))? {
             Some(s) => Ok(Some(DemuxedSample {
                 start_time: s.start_time,
                 // Audio AUs carry no composition offset and are all sync

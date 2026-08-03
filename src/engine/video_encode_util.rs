@@ -499,6 +499,10 @@ impl ScaledVideoEncoder {
     /// that owe the declaration can assert it in a unit test — a missing
     /// `set_pts_90k()` does not fail loudly (it silently mis-scales rate
     /// control), so it needs a regression guard rather than runtime detection.
+    ///
+    /// Test-only: nothing in the shipping binary reads it, and leaving it
+    /// unconditional trips the crate's dead-code warning.
+    #[cfg(test)]
     pub fn is_pts_90k(&self) -> bool {
         self.pts_90k
     }

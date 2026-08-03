@@ -925,8 +925,10 @@ async fn run_controlled(
     use transition::{NextOutcome, NextRequest, TransitionMachine, TransitionTrigger};
 
     let bundle_size = (config.ts_packets_per_datagram.max(1) as usize) * TS_PACKET;
-    // Shuffle once for the controller path (a genuine reorder each loop would
-    // fight the state machine's stable index space). Shuffle is off by default.
+    // Draw the first permutation here; each loop wrap re-permutes at the commit
+    // that lands back on index 0 (see `reshuffle_on_wrap` below). `order` holds
+    // indices INTO `config.sources`, while the state machine's indices are into
+    // `order`, so permuting it never disturbs the machine's stable index space.
     let mut order: Vec<usize> = (0..config.sources.len()).collect();
     if config.shuffle && order.len() > 1 {
         shuffle_indices(&mut order);
@@ -1054,6 +1056,7 @@ async fn run_controlled(
             let _ = play_fut.as_mut().await;
             let cr = sm.commit();
             media_stats.generation.store(cr.new_generation, Ordering::Relaxed);
+            reshuffle_on_wrap(&config, &mut order, &cr);
             emit_transition_completed(events, flow_id, input_id, &cr);
             sm.settle_playing();
             continue;
@@ -1100,6 +1103,7 @@ async fn run_controlled(
                 if sm.on_current_exhausted() {
                     let cr = sm.commit();
                     media_stats.generation.store(cr.new_generation, Ordering::Relaxed);
+                    reshuffle_on_wrap(&config, &mut order, &cr);
                     sm.settle_playing();
                 }
             }
@@ -1111,8 +1115,31 @@ async fn run_controlled(
                     format!("Media-player input '{input_id}': playlist exhausted (loop=false), idle until cancelled"),
                     flow_id,
                 );
-                cancel.cancelled().await;
-                return;
+                // Keep answering `Next` while parked. `cmd_rx` is owned by this
+                // task and the only `recv()` lives in the per-source select!
+                // that has already exited, so simply awaiting cancellation here
+                // strands every subsequent Next: `cmd_tx.send()` still succeeds
+                // (nothing removes the entry from `media_player_command_txs`),
+                // the buffered message keeps its oneshot::Sender alive, and the
+                // dispatcher's unbounded `reply_rx.await` never resolves — no
+                // command_ack, and one parked handler task per press holding
+                // Arc clones until the flow stops.
+                loop {
+                    tokio::select! {
+                        _ = cancel.cancelled() => return,
+                        cmd = cmd_rx.recv() => match cmd {
+                            Some(controller::MediaPlayerCommand::Next { reply, .. }) => {
+                                let _ = reply.send(NextOutcome::Rejected {
+                                    code: transition::reject_code::PLAYLIST_EXHAUSTED,
+                                });
+                            }
+                            None => {
+                                cancel.cancelled().await;
+                                return;
+                            }
+                        },
+                    }
+                }
             }
         }
     }
@@ -2785,6 +2812,31 @@ fn run_paced_emitter(
     // reported value stopped meaning anything.
     stats.pacer_queue_depth.store(0, Ordering::Relaxed);
     tracing::info!("media-pacer '{}': exited", thread_name);
+}
+
+/// Re-permute the play order when a commit wraps the playlist back to its
+/// first slot.
+///
+/// The legacy sequential loop rebuilds and re-shuffles `order` on every pass,
+/// which is what `MediaPlayerInputConfig::shuffle` documents ("randomise the
+/// playback order each time the playlist starts") and what the manager's own
+/// help text and AI knowledge base promise. The controller path drew its
+/// permutation once before its loop, so a shuffled playlist repeated one fixed
+/// rotation for the life of the flow — and because `operator_control` defaults
+/// on, every existing `shuffle: true` config inherited that on upgrade with no
+/// config change and no event.
+///
+/// `new_index == 0` identifies the wrap unambiguously: from any other slot the
+/// natural successor and an operator `Next` both move forward, so index 0 is
+/// only ever reached by wrapping off the end.
+fn reshuffle_on_wrap(
+    config: &MediaPlayerInputConfig,
+    order: &mut [usize],
+    cr: &transition::CommitResult,
+) {
+    if config.shuffle && order.len() > 1 && cr.new_index == 0 {
+        shuffle_indices(order);
+    }
 }
 
 // ── Order-shuffle helper ────────────────────────────────────────────────

@@ -975,7 +975,8 @@ of the local file kicks in transparently.
 | `type` | string | Yes | - | Must be `"media_player"`. |
 | `sources` | array | Yes | - | 1–256 entries. Each entry is a `MediaPlayerSource` (see below). Files are referenced by name within the edge's media library; upload them via the manager UI before starting the flow. |
 | `loop_playback` | boolean | No | `true` | Restart at the head of the playlist when the last source ends. Leave on for fallback duty. |
-| `shuffle` | boolean | No | `false` | Randomise source order each time the playlist starts. |
+| `shuffle` | boolean | No | `false` | Randomise source order each time the playlist starts — a fresh permutation is drawn at flow start and again on every loop wrap. |
+| `operator_control` | boolean | No | unset | Transport control (the manager's **Next** button) and the transition state machine. Unset resolves to the node default, which is **on**; `false` pins this input to the legacy sequential loop and makes the edge answer `media_player_control_unavailable` for a `Next`. Resolution order: explicit config → `BILBYCAST_MEDIA_PLAYER_CONTROLLER` → on. |
 | `paced_bitrate_bps` | integer | No | `null` | TS-only override for the egress pacer when the source has no usable PCR. Range 100 000 – 200 000 000 (100 kbps – 200 Mbps). Leave `null` to pace from PCR (default for any healthy TS asset). |
 | `ts_packets_per_datagram` | integer | No | `7` | How many 188-byte MPEG-TS packets the player bundles into each UDP datagram on the flow broadcast channel and the QUIC/UDP tunnel path (both forward each datagram unchanged). Applies to every source kind (`ts` / `mp4` / `image`). `7 × 188 = 1316 B` is the standard / SRT datagram size. Range `[1, 348]` (`348 × 188 = 65 424 B`, the largest that fits one UDP datagram; `0` is rejected). **Lower** it (e.g. `4`–`5`) for constrained / low-MTU internet or cellular paths where a big datagram IP-fragments and drops; **raise** it (`8`+) for jumbo datagrams on a LAN. Independent of any downstream UDP/RTP/SRT output, which re-chunks to its own fixed 1316 B wire size. |
 
@@ -1018,16 +1019,26 @@ are stored on the edge. Resolution order:
 > `Permission denied (os error 13)`. If you create the service user by hand
 > (outside `install-edge.sh`), set `BILBYCAST_MEDIA_DIR` yourself.
 
-**Opt-in media-player env flags.** Two behaviours are still gated behind
-environment variables rather than config fields. Both are read once at
-startup, so they must be set on the *process* — a hand-rolled `systemd-run`
-/ `nohup` relaunch that forgets them silently reverts to the default, which
-is easy to misread as a regression:
+**Media-player rollback escape hatches.** Two behaviours are **on by
+default** and can be turned off with an environment variable. These are
+rollback levers, not feature switches — setting them to `1` does nothing,
+because `1` is already the default. Both are read once at startup, so they
+must be set on the *process*: a hand-rolled `systemd-run` / `nohup` relaunch
+that forgets them silently restores the default behaviour.
 
-| Env var | Default | Effect when set to `1` / `true` / `on` |
-|---------|---------|----------------------------------------|
-| `BILBYCAST_MEDIA_PLAYER_CONTROLLER` | off | Enables the Phase-3b playout controller and advertises the **`media-player-control-v1`** capability. The manager gates its playlist **Next** button on that capability, so with the flag unset the button simply does not render — the edge is otherwise healthy, which makes this the most confusing symptom of a dropped env var. |
-| `BILBYCAST_MEDIA_PLAYER_INCREMENTAL_MP4` | off | Uses the bounded incremental MP4/MOV reader instead of the default **whole-file demux**. The default path holds an entire MP4 in memory, so a playlist of large assets grows RSS materially; the incremental reader bounds it. Recommended on memory-constrained edges. |
+| Env var | Default | Effect when set to `0` / `false` / `off` |
+|---------|---------|------------------------------------------|
+| `BILBYCAST_MEDIA_PLAYER_CONTROLLER` | **on** | Falls back to the legacy sequential playout loop. The edge then stops advertising the **`media-player-control-v1`** capability, and because the manager gates its playlist **Next** button on that capability, the button disappears while the edge looks otherwise healthy — the most confusing symptom of a dropped env var. Prefer the per-input `operator_control: false` (below) to pin one player to the legacy loop without changing the node default. |
+| `BILBYCAST_MEDIA_PLAYER_INCREMENTAL_MP4` | **on** | Falls back to the whole-file MP4/MOV demux, which holds an entire MP4 in memory — a 4 GiB asset is a 4 GiB resident spike, and that was the principal driver of the media-player OOM the bounded reader was written to fix. Only useful for diagnosing a suspected incremental-reader defect. |
+
+`operator_control` (per media-player input, `Option<bool>`, default unset)
+takes precedence over `BILBYCAST_MEDIA_PLAYER_CONTROLLER` — the resolution
+order is **explicit config → env var → on**. Set it to `false` to pin one
+input to the legacy loop; the edge then answers
+`media_player_control_unavailable` for a `Next` issued against that input.
+Note the capability bit reflects only the node-wide default, so the manager
+must gate its Next button on
+`capabilities.includes('media-player-control-v1') && operator_control !== false`.
 
 Files are written `0644`. Per-asset cap: **4 GiB** (`MAX_FILE_BYTES`).
 Library cap: **16 GiB** total (`MAX_TOTAL_BYTES`). Partial uploads stage

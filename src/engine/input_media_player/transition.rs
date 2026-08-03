@@ -121,6 +121,10 @@ pub enum NextOutcome {
 pub mod reject_code {
     pub const NOT_PLAYING: &str = "media_player_not_playing";
     pub const GENERATION_CONFLICT: &str = "media_player_generation_conflict";
+    /// A non-looping playlist has played its last item. The controller parks
+    /// in this state until cancelled, but it still answers `Next` — leaving
+    /// the command unanswered strands the manager's request forever.
+    pub const PLAYLIST_EXHAUSTED: &str = "media_player_playlist_exhausted";
 }
 
 /// The transition machine. Holds only the small amount of state needed to
