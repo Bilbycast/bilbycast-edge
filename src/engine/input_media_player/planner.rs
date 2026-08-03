@@ -378,8 +378,13 @@ fn frame_rate_equal(
     bd: Option<u32>,
 ) -> bool {
     match (an, ad, bn, bd) {
-        (Some(an), Some(ad), Some(bn), Some(bd)) if ad != 0 && bd != 0 => {
-            (an as u64) * (bd as u64) == (bn as u64) * (ad as u64)
+        // Delegate the cross-multiply to the conversion primitive rather than
+        // repeating it: "the boundary needs no rate conversion" and "the
+        // converter is the identity" must never be able to disagree, and
+        // `FrameRateConverter` is the module that owns that arithmetic.
+        (Some(an), Some(ad), Some(bn), Some(bd)) => {
+            super::frame_rate::FrameRateConverter::new(an as u64, ad as u64, bn as u64, bd as u64)
+                .is_some_and(|c| c.is_identity())
         }
         // If either side lacks a rate, don't claim a difference.
         _ => true,

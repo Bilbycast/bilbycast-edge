@@ -7,9 +7,15 @@
 //! transitions, the playback generation counter, and the operator-`Next`
 //! idempotency contract, with **no I/O, no demuxer, no scheduler**. The
 //! Phase 3 controller drives it; every rule here is unit-testable in
-//! isolation. It is deliberately not yet wired into the live `run()` loop —
-//! Phase 3b does that behind a default-off flag, with the legacy sequential
-//! loop retained (plan §16, Phase 3 "Rollback").
+//! isolation. The controller path is **on by default**; the legacy sequential
+//! loop is retained as the rollback (per-input `operator_control: false`, or
+//! node-wide `BILBYCAST_MEDIA_PLAYER_CONTROLLER=0`).
+//!
+//! **Not yet driven:** the `HoldingForNext` half of the state graph (§9.3) is
+//! implemented and tested here but no controller edge reaches it — the
+//! controller commits or fails rather than emitting hold filler, so the
+//! "never dead air near EOS" guarantee below describes the machine, not yet
+//! the shipped playout.
 //!
 //! It encodes three things the plan is exact about:
 //!
@@ -22,13 +28,6 @@
 //!   conflict rather than skipping a second item.
 //! * **Commit is the only mutation of active source/generation** — nothing
 //!   else may change which source is on air.
-
-// This module is the tested pure-logic core; the Phase 3b controller (which
-// wires it into the live run() loop behind a default-off flag) is the
-// consumer. Until that lands, the public surface is exercised only by the
-// unit tests, so silence dead-code warnings for the module rather than the
-// whole crate. Remove this attribute once the controller uses it.
-#![allow(dead_code)]
 
 use serde::{Deserialize, Serialize};
 
@@ -120,7 +119,11 @@ pub enum NextOutcome {
 /// Rejection codes surfaced to the manager. Stable strings.
 pub mod reject_code {
     pub const NOT_PLAYING: &str = "media_player_not_playing";
-    pub const GENERATION_CONFLICT: &str = "media_player_generation_conflict";
+    // NOTE: there is deliberately no `GENERATION_CONFLICT` here. A stale
+    // generation is reported as the tagged `NextOutcome::GenerationConflict`
+    // variant, which also carries `current_generation` so the manager can
+    // retry in one round trip; a parallel `Rejected { code }` string would be
+    // a second, lossier way to say the same thing.
     /// A non-looping playlist has played its last item. The controller parks
     /// in this state until cancelled, but it still answers `Next` — leaving
     /// the command unanswered strands the manager's request forever.
@@ -167,18 +170,25 @@ impl TransitionMachine {
         }
     }
 
-    pub fn state(&self) -> PlayerState {
-        self.state
-    }
     pub fn generation(&self) -> u64 {
         self.generation
     }
     pub fn active_index(&self) -> usize {
         self.active_index
     }
+
+    // Introspection accessors. The controller drives the machine through its
+    // command methods and never needs to read raw state, so these exist for
+    // the unit tests that assert the state graph.
+    #[cfg(test)]
+    pub fn state(&self) -> PlayerState {
+        self.state
+    }
+    #[cfg(test)]
     pub fn armed_target(&self) -> Option<usize> {
         self.armed.as_ref().map(|a| a.target_index)
     }
+    #[cfg(test)]
     pub fn is_transition_armed(&self) -> bool {
         self.armed.is_some()
     }
@@ -315,6 +325,14 @@ impl TransitionMachine {
     /// The next source became ready (e.g. while holding). Returns `true` when
     /// a commit should now happen (a transition is armed) — the controller
     /// calls [`Self::commit`] next.
+    ///
+    /// **Unreached today.** The controller calls `set_next_ready(true)`
+    /// unconditionally before `on_current_exhausted`, so the machine never
+    /// enters `HoldingForNext` and never needs to be told readiness arrived
+    /// late. Kept because it is the other half of the §9.3 hold contract that
+    /// `on_current_exhausted` already implements; wiring the hold path needs
+    /// controller-side filler emission, which is a feature, not a fix.
+    #[allow(dead_code)]
     pub fn on_next_ready(&mut self) -> bool {
         self.next_ready = true;
         self.armed.is_some()
@@ -330,6 +348,9 @@ impl TransitionMachine {
     /// The hold deadline expired without next becoming ready (plan §9.3, step
     /// 4). Abandon the armed transition and fall back to normal progression:
     /// the controller emits `media_player_next_prepare_failed` and resumes.
+    ///
+    /// **Unreached today** — see [`Self::on_next_ready`].
+    #[allow(dead_code)]
     pub fn on_hold_deadline_expired(&mut self) {
         self.armed = None;
         self.next_ready = false;

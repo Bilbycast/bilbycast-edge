@@ -14,11 +14,19 @@
 //!
 //! It is deliberately decoupled from any codec, decoder, encoder, or hardware
 //! session so it is exhaustively unit-testable on its own (plan §17.1
-//! "rational frame-rate comparison"). The normalisation playout pipeline (the
-//! decode → scale/convert → encode stage, Phase 6, feature-gated on a video
-//! encoder) drives its emitted-frame loop from [`FrameRateConverter`]; until
-//! that pipeline lands this is `#[allow(dead_code)]`, mirroring how
-//! `IncrementalMp4Reader` was staged before Phase 4 wired it in.
+//! "rational frame-rate comparison").
+//!
+//! Two halves with different maturity. The **rate comparison** half
+//! ([`FrameRateConverter::new`] + [`FrameRateConverter::is_identity`]) is
+//! live: the Phase 2 playlist planner classifies every boundary's
+//! frame-rate change through it, so the planner's notion of "no conversion
+//! needed" and this module's notion of "the converter is the identity" cannot
+//! drift apart. The **cadence** half (`source_index_for_output`,
+//! `output_repeat_for_source`, `output_len_for_source_len`) has no consumer
+//! yet — it is driven by the normalisation playout pipeline (decode →
+//! scale/convert → encode, Phase 6, feature-gated on a video encoder) when
+//! that lands, and is marked `#[allow(dead_code)]` individually rather than
+//! module-wide so genuinely new dead code here still warns.
 //!
 //! **Nearest-preceding model.** Output frame `k` presents at wall time
 //! `k · dst_den / dst_num`. The source frame showing at that instant is the one
@@ -29,8 +37,6 @@
 //! cadence for the broadcast rates (23.976/24/25/29.97/30/50/59.94). All
 //! arithmetic is done in `u128` so the rate products never overflow and the
 //! mapping is exact — no floating-point drift accumulates across a long loop.
-
-#![allow(dead_code)] // driven by the Phase 6 normalisation pipeline once it lands
 
 /// A constant-rate frame-rate converter between two rational rates.
 ///
@@ -66,6 +72,7 @@ impl FrameRateConverter {
     /// `output_index`. Monotonic non-decreasing in `output_index`.
     ///
     /// `floor(output_index · dst_den · src_num / (dst_num · src_den))`.
+    #[allow(dead_code)] // Phase 6 normalisation pipeline (see module doc)
     pub fn source_index_for_output(&self, output_index: u64) -> u64 {
         let numer = (output_index as u128) * (self.dst_den as u128) * (self.src_num as u128);
         let denom = (self.dst_num as u128) * (self.src_den as u128);
@@ -76,6 +83,7 @@ impl FrameRateConverter {
     /// output run of `output_len` slots. `0` means the frame is dropped (its
     /// time falls between two output slots). Useful for a producer that walks
     /// source frames and asks "emit this decoded frame N times, or skip it".
+    #[allow(dead_code)] // Phase 6 normalisation pipeline (see module doc)
     pub fn output_repeat_for_source(&self, source_index: u64, output_len: u64) -> u64 {
         // Count outputs k in [0, output_len) with source_index_for_output(k) == source_index.
         // The mapping is monotonic, so the matching k form a contiguous run; find its bounds.
@@ -114,6 +122,7 @@ impl FrameRateConverter {
     /// Number of output frames spanning `source_len` source frames — i.e. how
     /// many target-rate slots the source's own duration covers. Used to size a
     /// normalised segment's output timeline.
+    #[allow(dead_code)] // Phase 6 normalisation pipeline (see module doc)
     pub fn output_len_for_source_len(&self, source_len: u64) -> u64 {
         // source duration = source_len · src_den / src_num seconds
         // output frames   = ceil(duration · dst_num / dst_den)
