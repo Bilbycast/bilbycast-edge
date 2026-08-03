@@ -154,6 +154,39 @@ fn is_false(b: &bool) -> bool { !*b }
 /// Reed-Solomon parity-suffixed broadcast capture).
 pub(crate) fn detect_ts_stride(buf: &[u8]) -> Option<(usize, usize)> {
     use crate::engine::ts_parse::{TS_PACKET_SIZE, TS_SYNC_BYTE};
+    if let Some(confirmed) = detect_ts_stride_confirmed(buf) {
+        return Some(confirmed);
+    }
+
+    // Tail-of-buffer fallback: too few packets to confirm a run (tiny files).
+    // A single confirmed sync byte counts, canonical 188 only.
+    //
+    // This branch is deliberately permissive so the manager's program picker
+    // still walks a truncated or very short capture. It is NOT evidence that a
+    // file *is* a transport stream — one incidental 0x47 anywhere in the probe
+    // window satisfies it, which on a 512 KiB head is essentially every binary
+    // file. Anything that classifies a file (rather than merely walking one
+    // already known to be TS) must call [`detect_ts_stride_confirmed`].
+    if buf.len() >= TS_PACKET_SIZE {
+        for s in 0..=buf.len() - TS_PACKET_SIZE {
+            if buf[s] == TS_SYNC_BYTE {
+                return Some((TS_PACKET_SIZE, s));
+            }
+        }
+    }
+    None
+}
+
+/// Like [`detect_ts_stride`], but returns **only** a run-length-confirmed
+/// stride — never the single-sync-byte tail fallback.
+///
+/// Use this wherever the answer decides *what a file is*. The lenient
+/// fallback in `detect_ts_stride` exists so the program picker can still walk
+/// a truncated capture; as a classifier it says yes to any file containing one
+/// 0x47 byte, which is `G` in ASCII and appears in essentially every binary of
+/// non-trivial size.
+pub(crate) fn detect_ts_stride_confirmed(buf: &[u8]) -> Option<(usize, usize)> {
+    use crate::engine::ts_parse::{TS_PACKET_SIZE, TS_SYNC_BYTE};
     const STRIDE_CANDIDATES: [usize; 3] = [TS_PACKET_SIZE, 192, 204];
     // A two-byte "sync, then sync `stride` bytes later" match is NOT a
     // reliable stride confirmation: 0x47 occurs at ~1/256 density in
@@ -191,20 +224,7 @@ pub(crate) fn detect_ts_stride(buf: &[u8]) -> Option<(usize, usize)> {
             start += 1;
         }
     }
-    if let Some((_, stride, start)) = best {
-        return Some((stride, start));
-    }
-
-    // Tail-of-buffer fallback: too few packets to confirm a run (tiny files).
-    // A single confirmed sync byte counts, canonical 188 only.
-    if buf.len() >= TS_PACKET_SIZE {
-        for s in 0..=buf.len() - TS_PACKET_SIZE {
-            if buf[s] == TS_SYNC_BYTE {
-                return Some((TS_PACKET_SIZE, s));
-            }
-        }
-    }
-    None
+    best.map(|(_, stride, start)| (stride, start))
 }
 
 /// Length, in packets, of the unbroken run of TS sync bytes at

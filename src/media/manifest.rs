@@ -416,13 +416,22 @@ fn hex_lower(bytes: &[u8]) -> String {
     s
 }
 
-/// TS detection: a confirmed sync stride AND a PAT in the head window. Uses
-/// the same `scan_programs_in_buf` the picker already trusts, so detection
-/// and the picker never disagree.
+/// TS detection: a **run-confirmed** sync stride AND a PAT carrying at least
+/// one real program in the head window. Both halves are load-bearing.
+///
+/// `detect_ts_stride` is not usable here — its tail fallback accepts a single
+/// 0x47 anywhere in the 512 KiB probe window, which every binary file of any
+/// size satisfies. Neither is `MediaScanResult::is_ts`: `scan_programs_in_buf`
+/// reports `is_ts: true` on its empty-PAT early return, so it echoes the
+/// stride finder's verdict rather than adding independent evidence. Gating on
+/// either alone made this function accept an MKV, a WAV or a PDF as a `Ready`,
+/// `native_playable` TS asset with no warnings — which in turn made step 4 of
+/// [`probe_asset`] (the `Unsupported` verdict) unreachable for any file over
+/// 188 bytes that is not an image or ISO-BMFF.
 fn probe_ts(name: &str, head: &[u8], id: FileIdentity) -> Option<AssetManifest> {
-    let stride = super::detect_ts_stride(head)?;
+    let (stride, _) = super::detect_ts_stride_confirmed(head)?;
     let scan = super::scan_programs_in_buf(head);
-    if !scan.is_ts {
+    if !scan.is_ts || scan.programs.is_empty() {
         return None;
     }
 
@@ -470,7 +479,7 @@ fn probe_ts(name: &str, head: &[u8], id: FileIdentity) -> Option<AssetManifest> 
         duration_90khz: None,
         bitrate_bps: None,
         fragmented: false,
-        ts_packet_bytes: Some(stride.0 as u16),
+        ts_packet_bytes: Some(stride as u16),
     };
 
     let has_video = streams.iter().any(|s| s.media_type == ManifestMediaType::Video);
@@ -899,10 +908,49 @@ mod tests {
 
     #[test]
     fn unsupported_bytes_probe_unsupported() {
-        // Random non-TS, non-MP4, non-image bytes in the head window.
-        let head = vec![0x11u8; 4096];
-        assert!(super::probe_ts("f", &head, ident()).is_none());
+        // Deliberately NOT a 0x47-free buffer. The old fixture was
+        // `vec![0x11u8; 4096]`, which passed vacuously: it contained no sync
+        // byte at all, so it could not exercise the single-sync-byte tail
+        // fallback that made probe_ts accept essentially every binary file.
+        let head = pseudo_fill(64 * 1024);
+        assert!(
+            head.contains(&0x47),
+            "fixture must contain a stray sync byte or it tests nothing"
+        );
+        assert!(
+            super::probe_ts("f", &head, ident()).is_none(),
+            "a stray 0x47 must not classify a file as a transport stream"
+        );
         assert!(image::guess_format(&head).is_err());
+    }
+
+    /// An EBML/Matroska header must probe Unsupported, not TS. This is the
+    /// concrete file class Phase 0 exists to reject: the `mp4` crate is
+    /// ISO-BMFF only and never parsed Matroska, so an .mkv that classified as
+    /// a playable "TS File" would be exactly the air-time failure Phase 0's
+    /// contract change was written to prevent.
+    #[test]
+    fn matroska_probes_unsupported_not_ts() {
+        let mut head = vec![0x1A, 0x45, 0xDF, 0xA3]; // EBML magic
+        head.extend_from_slice(&pseudo_fill(64 * 1024));
+        assert!(super::probe_ts("clip.mkv", &head, ident()).is_none());
+        let m = probe_asset("clip.mkv", Path::new("/nonexistent"), head.len() as u64, 1);
+        // The path does not exist, so this asserts the classification arm we
+        // can reach without a fixture on disk: it must not come back Ready/Ts.
+        assert_ne!(m.detected_kind, Some(DetectedKind::Ts));
+    }
+
+    /// Deterministic pseudo-random bytes — a cheap LCG, no dev-dependency.
+    /// Statistically certain to contain 0x47 at this length, which is the
+    /// whole point: real-world binaries do too.
+    fn pseudo_fill(len: usize) -> Vec<u8> {
+        let mut out = Vec::with_capacity(len);
+        let mut x: u32 = 0x1234_5678;
+        for _ in 0..len {
+            x = x.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            out.push((x >> 24) as u8);
+        }
+        out
     }
 
     #[test]
