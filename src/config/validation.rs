@@ -3973,6 +3973,35 @@ fn validate_pid_overrides_entry(
         if Some(pcr) == pmt {
             bail!("{context}: pcr_pid (0x{pcr:04X}) collides with pmt_pid; PCR must ride an ES PID, not the PMT PID");
         }
+        // PCR must name a PID the muxer will actually emit PCR on. The muxer
+        // writes PCR into the adaptation field of the video PES (or, for an
+        // audio-only program, the audio PES) — it never synthesises PCR-only
+        // packets on a standalone PID. A `pcr_pid` naming neither ES therefore
+        // produces a PMT that declares a PCR PID carrying no PCR at all: a
+        // TR 101 290 PCR_error, and a stream no receiver can clock.
+        //
+        // Caught by broadcast gate 10 on an audio-only ST 2110-30 → AAC flow
+        // configured with `pcr_pid` pointing at an unused PID: the capture had
+        // zero PCR packets anywhere. `ts_mux::write_pmt` documents the
+        // requirement in a comment; nothing enforced it, so an operator could
+        // only discover it from a receiver refusing to lock.
+        let eff_video = video.unwrap_or(crate::engine::rtmp::ts_mux::DEFAULT_VIDEO_PID);
+        let eff_audio = audio.unwrap_or(crate::engine::rtmp::ts_mux::DEFAULT_AUDIO_PID);
+        let rides_an_es = pcr == eff_video
+            || pcr == eff_audio
+            || entry
+                .audio_pids
+                .as_ref()
+                .is_some_and(|m| m.values().any(|&dst| dst == pcr));
+        if !rides_an_es {
+            bail!(
+                "{context}: pcr_pid (0x{pcr:04X}) names neither the video PID (0x{eff_video:04X}) \
+                 nor an audio PID (0x{eff_audio:04X}); the muxer only writes PCR into a video or \
+                 audio PES adaptation field, never onto a standalone PID, so this would emit a PMT \
+                 declaring a PCR PID that carries no PCR (TR 101 290 PCR_error). Point pcr_pid at \
+                 the video or audio PID, or leave it unset to default correctly."
+            );
+        }
     }
 
     // Multi-audio collision checks. Targets in `audio_pids` must be
@@ -8333,6 +8362,56 @@ mod tests {
             ..Default::default()
         });
         assert!(validate_pid_overrides(Some(&m), "test", false).is_ok());
+    }
+
+    /// `pcr_pid` must name a PID the muxer actually writes PCR onto.
+    ///
+    /// Found by broadcast gate 10: an audio-only ST 2110-30 → AAC flow with
+    /// `pcr_pid` pointing at an unused PID produced a capture whose PMT
+    /// declared PCR PID 0x0200 and which carried **zero** PCR packets — no
+    /// receiver can clock that. The muxer only ever writes PCR into a video or
+    /// audio PES adaptation field; it never synthesises PCR-only packets.
+    #[test]
+    fn pid_overrides_rejects_pcr_pid_that_rides_no_elementary_stream() {
+        // Names neither the video nor the audio PID → rejected.
+        let m = one_prog(TsPidOverridesEntry {
+            video_pid: Some(0x0100),
+            audio_pid: Some(0x0101),
+            pcr_pid: Some(0x0200),
+            ..Default::default()
+        });
+        let err = validate_pid_overrides(Some(&m), "ctx", false).unwrap_err().to_string();
+        assert!(err.contains("pcr_pid"), "{err}");
+        assert!(err.contains("PCR_error"), "error must name the consequence: {err}");
+
+        // Aliasing video or audio is the legitimate pattern — still accepted.
+        for pcr in [0x0100u16, 0x0101u16] {
+            let m = one_prog(TsPidOverridesEntry {
+                video_pid: Some(0x0100),
+                audio_pid: Some(0x0101),
+                pcr_pid: Some(pcr),
+                ..Default::default()
+            });
+            assert!(validate_pid_overrides(Some(&m), "ctx", false).is_ok());
+        }
+
+        // Unspecified ES slots fall back to the muxer defaults, so a pcr_pid
+        // naming a default PID is fine even with no explicit video/audio.
+        let m = one_prog(TsPidOverridesEntry {
+            pcr_pid: Some(crate::engine::rtmp::ts_mux::DEFAULT_AUDIO_PID),
+            ..Default::default()
+        });
+        assert!(validate_pid_overrides(Some(&m), "ctx", false).is_ok());
+
+        // A multi-audio target is a real ES and may carry PCR.
+        let mut audio_pids = std::collections::BTreeMap::new();
+        audio_pids.insert(0x0101u16, 0x0300u16);
+        let m = one_prog(TsPidOverridesEntry {
+            audio_pids: Some(audio_pids),
+            pcr_pid: Some(0x0300),
+            ..Default::default()
+        });
+        assert!(validate_pid_overrides(Some(&m), "ctx", false).is_ok());
     }
 
     #[test]
