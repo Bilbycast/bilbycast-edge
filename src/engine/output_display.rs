@@ -679,6 +679,7 @@ async fn run_display_output(
     // from double-warning since `state.backend` is already `Cpu` and
     // the operator's preference can't be honoured anyway.
     let demux_hw_already_unavailable = hw_unavailable_reason.is_some();
+    let demux_mpeg2_cpu_decode = config.mpeg2_cpu_decode;
     // Snapshot the operator's original preference (before soft-fallback
     // forced it to Cpu) so the runtime fallback events name the right
     // backend in the manager UI.
@@ -720,6 +721,7 @@ async fn run_display_output(
             demux_backend,
             demux_requested_backend,
             demux_hw_already_unavailable,
+            demux_mpeg2_cpu_decode,
             demux_frame_gen,
             demux_panel_hdr_capable,
             demux_force_cpu_blit_for_bars,
@@ -1064,6 +1066,9 @@ fn demux_decode_loop(
     backend: DecoderBackend,
     requested_backend: DecoderBackend,
     hw_already_unavailable: bool,
+    // Per-output override of the static MPEG-2 CPU pin
+    // (`DisplayOutputConfig::mpeg2_cpu_decode`).
+    mpeg2_cpu_decode: Option<bool>,
     frame_gen: Arc<AtomicU64>,
     panel_hdr_capable: bool,
     force_cpu_blit_for_bars: Arc<AtomicBool>,
@@ -1101,6 +1106,7 @@ fn demux_decode_loop(
         last_send_error_log_at: None,
         first_send_after_open: None,
         mpeg2_cpu_pinned: false,
+        mpeg2_cpu_override: mpeg2_cpu_decode,
     };
     let mut aac_decoder: Option<AacDecoder> = None;
     let mut ff_audio_decoder: Option<FfAudioDecoder> = None;
@@ -1742,6 +1748,14 @@ struct HwOpenState {
     /// H.264/HEVC source in the playlist, which is exactly the failure the
     /// static pin exists to prevent.
     mpeg2_cpu_pinned: bool,
+
+    /// Per-output override of the *static* MPEG-2 CPU pin, from
+    /// `DisplayOutputConfig::mpeg2_cpu_decode`. `None` keeps the fleet-wide
+    /// policy. Deliberately does not gate `mpeg2_cpu_pinned`: a backend that
+    /// actually failed to decode MPEG-2 at run time stays pinned whatever the
+    /// operator asked for, so opting out can cost frames but cannot wedge the
+    /// output.
+    mpeg2_cpu_override: Option<bool>,
 }
 
 /// Sustained run of `send_packet_with_pts` errors after which the
@@ -1816,11 +1830,14 @@ const UNSUPPORTED_PIXFMT_RE_EMIT_S: u64 = 60;
 /// * **QSV — still pinned.** Same silicon as VAAPI; never re-validated
 ///   at all.
 ///
-/// Two rules this predicate has cost us twice over, both worth obeying:
-/// `DisplayStats.decoder_kind` and the `backend=` field on the
-/// send_packet warning report `state.backend` whether or not the pin
-/// fired, so **neither is evidence of which decoder ran** — prove it
-/// out-of-band (i915 GEM totals, NVML, process CPU). And decode-side
+/// Two rules this predicate has cost us twice over, both worth obeying.
+/// First, the `backend=` field on the `send_packet failed` warning
+/// still reports `state.backend` whether or not the pin fired, so **it
+/// is not evidence of which decoder ran** — prove that out-of-band
+/// (i915 GEM totals, NVML, process CPU). `DisplayStats.decoder_kind`
+/// *used* to share that flaw and no longer does: it is sourced from
+/// `DisplayStatsCounters::active_decoder_label`, which the pin sets to
+/// `cpu`, so it now tracks the live decode path. Second, decode-side
 /// evidence alone must never move this predicate: measure
 /// `frames_displayed` + `frames_dropped_mpsc_full` across a full source
 /// window, on content that is not itself degrading.
@@ -1858,12 +1875,28 @@ fn mpeg2_requires_cpu_decode(codec: VideoCodec, backend: DecoderBackend) -> bool
 /// behaviour as evidence against a hardware backend that was never opened.
 fn hw_decode_active(state: &HwOpenState, codec: Option<VideoCodec>) -> bool {
     !matches!(state.backend, DecoderBackend::Cpu)
-        && !codec.is_some_and(|c| mpeg2_pin_active(c, state.backend, state.mpeg2_cpu_pinned))
+        && !codec.is_some_and(|c| mpeg2_pin_active(c, state.backend, state.mpeg2_cpu_pinned, state.mpeg2_cpu_override))
 }
 
-fn mpeg2_pin_active(codec: VideoCodec, backend: DecoderBackend, runtime_pinned: bool) -> bool {
-    mpeg2_requires_cpu_decode(codec, backend)
-        || (matches!(codec, VideoCodec::Mpeg2) && runtime_pinned)
+fn mpeg2_pin_active(
+    codec: VideoCodec,
+    backend: DecoderBackend,
+    runtime_pinned: bool,
+    cfg_override: Option<bool>,
+) -> bool {
+    if !matches!(codec, VideoCodec::Mpeg2) {
+        return false;
+    }
+    // A runtime-learned pin outranks the operator: this backend has already
+    // been observed failing to decode MPEG-2 on this host, so honouring an
+    // opt-out here would re-enter the failure every source boundary.
+    if runtime_pinned {
+        return true;
+    }
+    match cfg_override {
+        Some(v) => v,
+        None => mpeg2_requires_cpu_decode(codec, backend),
+    }
 }
 
 /// Map a hardware `DecoderBackend` to the manager-visible
@@ -1927,13 +1960,15 @@ fn open_video_decoder_with_retry(
     // same playlist still opens on the HW backend, and the CPU decoder's
     // sysmem frames route through the present path's per-frame `is_vaapi()` /
     // `is_drm_prime()` check (CPU-blit), so no other display state needs to
-    // know. Two caveats that follow from that: `DisplayStats.decoder_kind`
-    // still reports the HW backend while MPEG-2 decodes on CPU, and so does
-    // the `backend=` field on the `send_packet failed` warning — neither is
-    // evidence of which decoder actually produced (or rejected) a frame.
+    // know. One caveat follows from that: the `backend=` field on the
+    // `send_packet failed` warning still reports `state.backend` while MPEG-2
+    // decodes on CPU, so it is not evidence of which decoder produced (or
+    // rejected) a frame. `DisplayStats.decoder_kind` is no longer in that
+    // category — the `set_active_decoder_label` call below makes it report
+    // `cpu` for exactly this case.
     // Falls through to the HW path if the CPU open itself fails (then the
     // normal retry+demote handles it).
-    if mpeg2_pin_active(codec, state.backend, state.mpeg2_cpu_pinned) {
+    if mpeg2_pin_active(codec, state.backend, state.mpeg2_cpu_pinned, state.mpeg2_cpu_override) {
         if let Some(d) = VideoDecoder::open_with_backend(codec, DecoderBackend::Cpu).ok() {
             // MPEG-2 on CPU while `state.backend` stays HW for other
             // codecs — plain `Cpu`, not a failure. This is the report
@@ -2293,7 +2328,7 @@ fn force_cpu_fallback(
         // the very counters the two callers test, so on a statically-pinned
         // host the cycle re-armed every WATCHDOG_NO_FRAMES_MS forever, each
         // pass emitting a Warning naming a backend that was never opened.
-        if mpeg2_pin_active(VideoCodec::Mpeg2, state.backend, state.mpeg2_cpu_pinned) {
+        if mpeg2_pin_active(VideoCodec::Mpeg2, state.backend, state.mpeg2_cpu_pinned, state.mpeg2_cpu_override) {
             return;
         }
         state.mpeg2_cpu_pinned = true;
@@ -5220,18 +5255,63 @@ mod tests {
         let carved_out = DecoderBackend::Nvdec;
         // Before the runtime pin: MPEG-2 goes to hardware on a carved-out
         // backend, exactly as the static table says.
-        assert!(!mpeg2_pin_active(VideoCodec::Mpeg2, carved_out, false));
+        assert!(!mpeg2_pin_active(VideoCodec::Mpeg2, carved_out, false, None));
         // After one runtime failure: MPEG-2 is on CPU...
-        assert!(mpeg2_pin_active(VideoCodec::Mpeg2, carved_out, true));
+        assert!(mpeg2_pin_active(VideoCodec::Mpeg2, carved_out, true, None));
         // ...and nothing else is.
-        assert!(!mpeg2_pin_active(VideoCodec::H264, carved_out, true));
-        assert!(!mpeg2_pin_active(VideoCodec::Hevc, carved_out, true));
+        assert!(!mpeg2_pin_active(VideoCodec::H264, carved_out, true, None));
+        assert!(!mpeg2_pin_active(VideoCodec::Hevc, carved_out, true, None));
         // A statically pinned backend does not need the runtime flag.
         assert!(mpeg2_pin_active(
             VideoCodec::Mpeg2,
             DecoderBackend::Rkmpp,
-            false
+            false,
+            None
         ));
+    }
+
+    /// `mpeg2_cpu_decode` moves the *static* policy only. An operator who has
+    /// measured their own Intel host can reclaim the CPU headroom the pin
+    /// costs; an operator who wants the pin on a carved-out backend can have
+    /// it. Neither can override a backend that has already been observed
+    /// failing at run time.
+    #[test]
+    fn mpeg2_cpu_decode_override_moves_static_policy_only() {
+        let pinned = DecoderBackend::Vaapi; // statically pinned
+        let carved_out = DecoderBackend::Nvdec; // statically exempt
+
+        // Opt out of a static pin → hardware decode.
+        assert!(!mpeg2_pin_active(
+            VideoCodec::Mpeg2,
+            pinned,
+            false,
+            Some(false)
+        ));
+        // Opt in on a carved-out backend → CPU.
+        assert!(mpeg2_pin_active(
+            VideoCodec::Mpeg2,
+            carved_out,
+            false,
+            Some(true)
+        ));
+        // A runtime-learned pin outranks an opt-out: this backend has already
+        // been seen failing on this host, so honouring the operator here would
+        // re-enter the failure at every source boundary.
+        assert!(mpeg2_pin_active(
+            VideoCodec::Mpeg2,
+            pinned,
+            true,
+            Some(false)
+        ));
+        assert!(mpeg2_pin_active(
+            VideoCodec::Mpeg2,
+            carved_out,
+            true,
+            Some(false)
+        ));
+        // Still codec-scoped in every combination.
+        assert!(!mpeg2_pin_active(VideoCodec::H264, pinned, true, Some(true)));
+        assert!(!mpeg2_pin_active(VideoCodec::Hevc, pinned, true, Some(true)));
     }
 
     /// The pin is codec-specific — H.264/HEVC keep the zero-copy HW path on

@@ -1751,6 +1751,25 @@ output.
   decoder pool (~15 resource-budget units per output, ~1-2 % CPU per
   PID at typical broadcast bitrates). Defaults `false`.
 
+- **`mpeg2_cpu_decode`** — override the fleet-wide "MPEG-2 decodes on
+  CPU" policy for this output. Unset (default) keeps it; `false` opts
+  out so MPEG-2 uses the hardware backend; `true` forces CPU even on a
+  backend that is otherwise exempt (NVDEC).
+
+  MPEG-2 is pinned to CPU on every hardware backend except NVDEC. On
+  **RKMPP** that is a capability fact — the vendored fork registers no
+  MPEG-2 decoder at all. On **VAAPI** it is a conservative default
+  rather than a measurement: a matched A/B on Intel iHD put CPU at
+  27–29 fps / 2.3 drops-per-second against VAAPI's 27–30 / 2.0 —
+  parity within noise — at a cost of roughly 15 points of process CPU.
+  The pin is source-agnostic, so it also applies to an MPEG-2
+  *contribution* feed on a monitoring wall, not just a media player.
+
+  Set `false` only if you have measured this host. A backend that then
+  fails MPEG-2 at run time is pinned back to CPU automatically and this
+  field does **not** override that runtime-learned pin — so opting out
+  can cost frames but cannot wedge the output.
+
 **Build prerequisites.** `display` is Linux-only and gated on the
 `display` Cargo feature (off by default). Schema is unconditional —
 configs round-trip on every platform. On non-Linux / non-feature

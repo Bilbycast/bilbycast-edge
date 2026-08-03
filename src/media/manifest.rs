@@ -103,6 +103,11 @@ pub mod error_code {
     /// Recognised as MP4 but structurally unusable (fragmented, no
     /// supported track, corrupt `moov`).
     pub const MP4_UNUSABLE: &str = "media_asset_mp4_unusable";
+    /// A raster format whose magic bytes are recognised but whose decoder is
+    /// not compiled into this build (TIFF / ICO / PNM / QOI / HDR / EXR / DDS
+    /// / farbfeld). Distinct from [`UNSUPPORTED`] so the manager can say
+    /// *which* format, and that the file is a real image rather than junk.
+    pub const IMAGE_FORMAT_NOT_BUILT: &str = "media_asset_image_format_not_built";
 }
 
 /// A bounded, stable identity for the file the manifest describes. Size plus
@@ -151,6 +156,15 @@ pub struct ManifestStream {
     /// without a reinit — the planner uses this in Phase 2.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub extradata_fingerprint: Option<String>,
+    /// Which PAT program this stream belongs to, for TS assets. `None` for
+    /// MP4/MOV and stills, which have no program concept.
+    ///
+    /// Without this the flat `streams` list mixes every program of an MPTS,
+    /// so picking "the first video" and "the first audio" can select tracks
+    /// from two different programs — and the planner would then compare a
+    /// chimera against another chimera. The planner filters on it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub program_number: Option<u16>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -246,7 +260,13 @@ impl AssetManifest {
             schema_version: MANIFEST_SCHEMA_VERSION,
             name,
             file_identity: id,
-            probe_state: if code == error_code::UNSUPPORTED {
+            // `Unsupported` means "this build cannot play it"; `Error` means
+            // "the probe itself failed". A recognised raster whose decoder
+            // was not compiled in is the former — the file is fine, this
+            // binary just cannot read it.
+            probe_state: if code == error_code::UNSUPPORTED
+                || code == error_code::IMAGE_FORMAT_NOT_BUILT
+            {
                 ProbeState::Unsupported
             } else {
                 ProbeState::Error
@@ -465,6 +485,7 @@ fn probe_ts(name: &str, head: &[u8], id: FileIdentity) -> Option<AssetManifest> 
                 channels: None,
                 language: None,
                 extradata_fingerprint: None,
+                program_number: Some(prog.program_number),
             });
             idx += 1;
         }
@@ -482,6 +503,7 @@ fn probe_ts(name: &str, head: &[u8], id: FileIdentity) -> Option<AssetManifest> 
                 channels: None,
                 language: a.language.clone(),
                 extradata_fingerprint: None,
+                program_number: Some(prog.program_number),
             });
             idx += 1;
         }
@@ -599,6 +621,7 @@ fn probe_mp4(name: &str, path: &Path, id: FileIdentity) -> Mp4Probe {
                     channels: None,
                     language: non_empty(track.language()),
                     extradata_fingerprint: extra,
+                    program_number: None,
                 });
                 idx += 1;
             }
@@ -619,6 +642,7 @@ fn probe_mp4(name: &str, path: &Path, id: FileIdentity) -> Mp4Probe {
                     channels: ch,
                     language: non_empty(track.language()),
                     extradata_fingerprint: None,
+                    program_number: None,
                 });
                 idx += 1;
             }
@@ -835,7 +859,21 @@ fn non_empty(s: &str) -> Option<String> {
 fn probe_image(name: &str, path: &Path, head: &[u8], id: FileIdentity) -> Option<AssetManifest> {
     let format = image::guess_format(head).ok()?;
     if !image_format_is_decodable(format) {
-        return None;
+        // Short-circuit rather than returning `None`: falling through would
+        // hand a genuine raster file to the TS sync heuristic, and the
+        // operator would end up with the generic "not a supported media file"
+        // instead of the actionable reason. Name the format — "tiff is not
+        // built into this edge" tells them to convert; "unsupported" does not.
+        let mut m = AssetManifest::unsupported(
+            name.to_string(),
+            id,
+            error_code::IMAGE_FORMAT_NOT_BUILT,
+        );
+        m.compatibility.warnings = vec![format!(
+            "{} images are not built into this edge — convert to JPEG or PNG",
+            format!("{format:?}").to_lowercase()
+        )];
+        return Some(m);
     }
 
     // Dimensions: prefer a cheap header-only read straight from disk.
@@ -879,6 +917,7 @@ fn probe_image(name: &str, path: &Path, head: &[u8], id: FileIdentity) -> Option
             channels: None,
             language: None,
             extradata_fingerprint: None,
+            program_number: None,
         }],
         compatibility: Compatibility {
             native_playable: true,
@@ -955,6 +994,7 @@ mod tests {
                 channels: None,
                 language: None,
                 extradata_fingerprint: Some("0123456789abcdef".to_string()),
+                program_number: None,
             }],
             compatibility: Compatibility {
                 native_playable: true,

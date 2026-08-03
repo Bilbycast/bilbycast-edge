@@ -154,6 +154,38 @@ master clock can't help, kicks in only when the two agree to within
 
 The transcoded path landed the same model in
 [`engine::ts_audio_replace::TsAudioReplacer::set_av_sync_pacer`](../src/engine/ts_audio_replace.rs).
+### PCR discontinuity bridging (and what the clamp costs)
+
+`engine::ts_pts_rewriter::rewrite_pcr_value` handles a source PCR
+discontinuity in three ways, and the third is the one worth knowing about.
+
+* **Backward jump** (source PCR goes back > 500 ms) — re-anchor and bridge
+  with master elapsed so output PCR never moves backwards. PCR going
+  backwards is a clock fault to every receiver.
+* **Forward jump the wall clock witnessed** — pass through, DI=1. A live
+  edit point or SCTE-35 splice is a real gap in the content, and passing it
+  through preserves PCR_FO rate accuracy (TR 101 290, ±30 ppm). The
+  `pcr_jump_signal` tells that input's audio replacer to silence-pad it.
+* **Forward jump the wall clock did *not* witness** — bridge it. A file loop
+  wrap leaps a whole programme duration in milliseconds of real time; passed
+  through, that leap lands in the presentation timeline and the display sheds
+  frames indefinitely trying to absorb it (measured decaying from 30 fps
+  presented to 10–17 fps on a video-only loop).
+
+Both bridges are clamped to `MAX_BRIDGE_ADVANCE_27MHZ` — 40 ms, the TR 101 290
+PCR repetition-rate ceiling. **The clamp does not distinguish an instantaneous
+seam from a long genuine outage.** An input that reconnects after 30 s is
+charged 40 ms, and the resulting offset between the output timeline and wall
+clock persists for the life of that anchor.
+
+That is a deliberate trade. Output stays monotonic and PCR-conformant, which
+is what receivers require; the alternative — trusting raw elapsed master time
+— was measured injecting each reopen's latency (~38 ms H.264, ~163 ms MPEG-2)
+into the timeline every loop, so output PTS crept ahead of its own content
+until the frame queue was shedding continuously. What is given up is absolute
+wall-clock alignment across a long gap, not stream validity. Pinned by
+`bridge_clamp_charges_a_long_outage_only_one_pcr_rr_interval`.
+
 On first PES + every >500 ms source-PTS discontinuity, the audio
 replacer anchors via the same `anchor_target` helper with the same
 10 s safety. Wired through

@@ -3677,8 +3677,20 @@ async fn execute_command(
             // a Missing entry + Unsupported boundary rather than erroring the
             // whole command.
             let mut manifests = Vec::with_capacity(sources.len());
+            // Each entry's `MediaPlayerSource::Ts { program_number }`. The
+            // runtime down-selects an MPTS to this program before publishing,
+            // so the planner has to classify against the same one — without
+            // it, two entries pointing at the same mux with different program
+            // numbers resolve one manifest twice and compare it to itself.
+            let mut programs: Vec<Option<u16>> = Vec::with_capacity(sources.len());
             for s in sources {
                 let name = s["name"].as_str().unwrap_or("");
+                programs.push(
+                    s["program_number"]
+                        .as_u64()
+                        .and_then(|p| u16::try_from(p).ok())
+                        .filter(|p| *p > 0),
+                );
                 if name.is_empty() {
                     manifests.push(None);
                     continue;
@@ -3687,7 +3699,7 @@ async fn execute_command(
                 manifests.push(m);
             }
 
-            let planned = planner::plan_playlist(&manifests, loop_playback, &policy);
+            let planned = planner::plan_playlist(&manifests, &programs, loop_playback, &policy);
             Ok(Some(serde_json::to_value(&planned).unwrap_or_default()))
         }
         "upload_media_chunk" => {

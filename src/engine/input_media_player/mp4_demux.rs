@@ -1238,88 +1238,99 @@ async fn play_incremental(
     // the same reason, via `block_in_place` (this runs on the multi-threaded
     // runtime, and the surrounding loop owns `reader` by &mut so it cannot be
     // moved into a task).
-    let mut v_pending = if has_video {
-        tokio::task::block_in_place(|| read_next(reader, true))?
-    } else {
-        None
-    };
-    let mut a_pending = if has_audio {
-        tokio::task::block_in_place(|| read_next(reader, false))?
-    } else {
-        None
-    };
-    let mut v_next_id: u32 = 2;
-    let mut a_next_id: u32 = 2;
-    let mut v_prev_start: Option<u64> = None;
-    let mut a_prev_start: Option<u64> = None;
-
-    loop {
-        if session.cancel.is_cancelled() {
-            break;
-        }
-        // Pick the earlier-presenting head; video wins ties (deterministic, and
-        // harmless — PTS/DTS in the PES fix true ordering). `None` on a track
-        // means it is exhausted.
-        let take_video = match (&v_pending, &a_pending) {
-            (Some(v), Some(a)) => {
-                ts_to_us(v.start_time, video_timescale) <= ts_to_us(a.start_time, audio_timescale)
-            }
-            (Some(_), None) => true,
-            (None, Some(_)) => false,
-            (None, None) => break,
-        };
-
-        // Advance the chosen track: take its pending sample, read its successor
-        // (which becomes the new pending), and derive the emitted sample's
-        // duration from that successor's start time — or, on the last sample,
-        // reuse the previous inter-sample delta, mirroring `sample_durations_us`.
-        let (cur, wall_us, dur_us) = if take_video {
-            let cur = v_pending.take().expect("take_video ⇒ v_pending is Some");
-            let following = tokio::task::block_in_place(|| read_next_at(reader, true, v_next_id))?;
-            v_next_id += 1;
-            let dur = duration_us(&cur, following.as_ref(), v_prev_start, video_timescale);
-            v_prev_start = Some(cur.start_time);
-            v_pending = following;
-            let wall = ts_to_us(cur.start_time, video_timescale);
-            (cur, wall, dur)
+    // Run the merge inside a block whose result is captured rather than
+    // propagated, so the teardown below runs on the error path too. A bare
+    // `?` here returned straight out of the function, skipping the CC spill
+    // into `session.cont.last_cc` and `close_file_with_deadline` — which
+    // costs one continuity-counter step per PID at the next splice. (The
+    // pre-existing `play_ts_file` has the same shape on `main`; this is the
+    // convention being corrected, not one this path invented.)
+    let merge_result: Result<()> = async {
+        let mut v_pending = if has_video {
+            tokio::task::block_in_place(|| read_next(reader, true))?
         } else {
-            let cur = a_pending.take().expect("take_audio ⇒ a_pending is Some");
-            let following =
-                tokio::task::block_in_place(|| read_next_at(reader, false, a_next_id))?;
-            a_next_id += 1;
-            let dur = duration_us(&cur, following.as_ref(), a_prev_start, audio_timescale);
-            a_prev_start = Some(cur.start_time);
-            a_pending = following;
-            let wall = ts_to_us(cur.start_time, audio_timescale);
-            (cur, wall, dur)
+            None
         };
+        let mut a_pending = if has_audio {
+            tokio::task::block_in_place(|| read_next(reader, false))?
+        } else {
+            None
+        };
+        let mut v_next_id: u32 = 2;
+        let mut a_next_id: u32 = 2;
+        let mut v_prev_start: Option<u64> = None;
+        let mut a_prev_start: Option<u64> = None;
 
-        if !emit_sample(
-            EmitSample {
-                is_video: take_video,
-                start_time: cur.start_time,
-                rendering_offset: cur.rendering_offset,
-                is_sync: cur.is_sync,
-                bytes: &cur.bytes,
-                wall_us,
-                dur_us,
-            },
-            &mux,
-            &mut MuxRunState {
-                ts_mux: &mut ts_mux,
-                bundle: &mut bundle,
-                max_emitted_pts_90k: &mut max_emitted_pts_90k,
-                last_scheduled_ns: &mut last_scheduled_ns,
-                pending_src_bytes: &mut pending_src_bytes,
-            },
-            &pacer_tx,
-            session,
-        )
-        .await
-        {
-            break;
+        loop {
+            if session.cancel.is_cancelled() {
+                break;
+            }
+            // Pick the earlier-presenting head; video wins ties (deterministic, and
+            // harmless — PTS/DTS in the PES fix true ordering). `None` on a track
+            // means it is exhausted.
+            let take_video = match (&v_pending, &a_pending) {
+                (Some(v), Some(a)) => {
+                    ts_to_us(v.start_time, video_timescale) <= ts_to_us(a.start_time, audio_timescale)
+                }
+                (Some(_), None) => true,
+                (None, Some(_)) => false,
+                (None, None) => break,
+            };
+
+            // Advance the chosen track: take its pending sample, read its successor
+            // (which becomes the new pending), and derive the emitted sample's
+            // duration from that successor's start time — or, on the last sample,
+            // reuse the previous inter-sample delta, mirroring `sample_durations_us`.
+            let (cur, wall_us, dur_us) = if take_video {
+                let cur = v_pending.take().expect("take_video ⇒ v_pending is Some");
+                let following = tokio::task::block_in_place(|| read_next_at(reader, true, v_next_id))?;
+                v_next_id += 1;
+                let dur = duration_us(&cur, following.as_ref(), v_prev_start, video_timescale);
+                v_prev_start = Some(cur.start_time);
+                v_pending = following;
+                let wall = ts_to_us(cur.start_time, video_timescale);
+                (cur, wall, dur)
+            } else {
+                let cur = a_pending.take().expect("take_audio ⇒ a_pending is Some");
+                let following =
+                    tokio::task::block_in_place(|| read_next_at(reader, false, a_next_id))?;
+                a_next_id += 1;
+                let dur = duration_us(&cur, following.as_ref(), a_prev_start, audio_timescale);
+                a_prev_start = Some(cur.start_time);
+                a_pending = following;
+                let wall = ts_to_us(cur.start_time, audio_timescale);
+                (cur, wall, dur)
+            };
+
+            if !emit_sample(
+                EmitSample {
+                    is_video: take_video,
+                    start_time: cur.start_time,
+                    rendering_offset: cur.rendering_offset,
+                    is_sync: cur.is_sync,
+                    bytes: &cur.bytes,
+                    wall_us,
+                    dur_us,
+                },
+                &mux,
+                &mut MuxRunState {
+                    ts_mux: &mut ts_mux,
+                    bundle: &mut bundle,
+                    max_emitted_pts_90k: &mut max_emitted_pts_90k,
+                    last_scheduled_ns: &mut last_scheduled_ns,
+                    pending_src_bytes: &mut pending_src_bytes,
+                },
+                &pacer_tx,
+                session,
+            )
+            .await
+            {
+                break;
+            }
         }
+        Ok(())
     }
+    .await;
 
     drop(pacer_tx);
     let _ = tokio::task::spawn_blocking(move || pacer_thread.join()).await;
@@ -1334,7 +1345,7 @@ async fn play_incremental(
         session.cont.last_cc.insert(AUDIO_PID, cc_audio);
     }
     session.cont.close_file_with_deadline(max_emitted_pts_90k, last_scheduled_ns);
-    Ok(())
+    merge_result
 }
 
 /// Read sample id 1 of a track (video/audio), for priming the 2-cursor merge.

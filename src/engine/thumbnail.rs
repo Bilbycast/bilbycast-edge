@@ -442,17 +442,31 @@ async fn thumbnail_loop(
                 let cooldown_ok = last_capture
                     .map(|t| t.elapsed() >= TRIGGER_MIN_GAP)
                     .unwrap_or(true);
-                if !cooldown_ok || !state.has_data() {
+                if !cooldown_ok {
                     continue;
                 }
                 // Prefer a warm frame if the warm decoder has locked; else cold.
                 #[cfg(feature = "media-codecs")]
-                let result = match warm.as_ref().and_then(|w| w.latest()) {
+                let warm_frame = warm.as_ref().and_then(|w| w.latest());
+                #[cfg(not(feature = "media-codecs"))]
+                let warm_frame: Option<CaptureResult> = None;
+                // Gate on the same rule as the periodic tick rather than raw
+                // `has_data()`. The invariant the tick declares — a warm frame
+                // publishes even with an empty ring, because it was decoded
+                // from the live edge and not from the ring — was not honoured
+                // here, so an external refresh on a source whose ring happens
+                // to be empty silently did nothing while a perfectly good warm
+                // frame sat available. `stream_silent = false`: a trigger only
+                // arrives on activity.
+                if capture_gate(false, state.has_data(), warm_frame.is_some())
+                    != CaptureGate::Capture
+                {
+                    continue;
+                }
+                let result = match warm_frame {
                     Some(r) => Ok(r),
                     None => state.capture(timing.decode_frames_cap).await,
                 };
-                #[cfg(not(feature = "media-codecs"))]
-                let result = state.capture(timing.decode_frames_cap).await;
                 match result {
                     Ok(result) => {
                         let now = std::time::Instant::now();
@@ -549,14 +563,14 @@ async fn thumbnail_loop(
                 // frame nor a buffered AU this tick. Deliberately NOT an alarm
                 // and NOT a warm-decoder teardown — see `capture_gate`.
                 if gate == CaptureGate::Skip {
-                    // Cold-start warm escalation: if we have never published a
+                    // Cold-start warm escalation: we have never published a
                     // thumbnail this session and the ring is empty while packets
-                    // ARE flowing (Skip implies not silent), the source is a
-                    // low-bitrate one whose AUs drain between ticks — a slate at
-                    // a few fps. The stale-based escalation can't accumulate
-                    // here (Skip advances no counter), so a short first slate
-                    // would end before any preview. Bring the warm decoder up
-                    // now: it tracks the live edge off the incoming packets and
+                    // ARE flowing (Skip implies not silent) — so no decodable AU
+                    // has reached the ring yet, or one oversized AU evicted the
+                    // rest. The stale-based escalation cannot accumulate here
+                    // (Skip advances no counter), so a short first item would
+                    // end before any preview. Bring the warm decoder up now: it
+                    // tracks the live edge off the incoming packets and
                     // publishes even with an empty ring. Steady state (already
                     // captured once) keeps the cheap cold path as the default.
                     #[cfg(feature = "media-codecs")]
@@ -691,12 +705,29 @@ enum CaptureGate {
 /// Decide a tick's action.
 ///
 /// The distinction that matters: a genuinely silent feed (`stream_silent`, a
-/// flat data-arrival timeout) is NOT the same as a momentarily-empty demuxed-AU
-/// ring. Conflating them broke previews for very low-rate sources — a
-/// still-image slate at a few fps emits well under one AU per tick, so the ring
-/// legitimately drains — because every tick then raised `no_signal`, tore down
-/// the warm decoder and reset the escalation counter, leaving a short item no
-/// way to ever complete the 3-failure escalation inside its airtime.
+/// flat data-arrival timeout) is NOT the same as an empty demuxed-AU ring.
+/// Conflating them meant every empty-ring tick raised `no_signal`, tore down
+/// the warm decoder and reset the escalation counter, so a short item had no
+/// way to complete the 3-failure escalation inside its airtime and produced no
+/// preview at all.
+///
+/// **The ring does not drain.** `LiveState::frames` is append-only —
+/// `capture()` takes `&self` and clones, and the only eviction is the
+/// byte-budget `pop_front` in `push_frame`. Earlier comments here (and the
+/// `CLAUDE.md` row copied from them) blamed a low-frame-rate source whose AUs
+/// "drain between ticks"; that cannot happen. An empty ring means exactly one
+/// of three things:
+///
+///  * no AU has arrived yet (cold start, or a source that has not begun);
+///  * a single AU exceeded `MAX_AU_BUFFER_BYTES` (8 MB) and evicted every
+///    predecessor on push — which is precisely what the 1.84 Gbps still-image
+///    encoder bug produced, and what declaring 90 kHz PTS on that encoder
+///    fixed;
+///  * the flow carries no decodable video PID at all.
+///
+/// None of those is a lost signal, and none of them should cost the warm
+/// decoder — which is why `Skip` exists and why it is neither an alarm nor a
+/// teardown.
 ///
 /// A warm frame is publishable even with an empty ring: it was decoded from the
 /// live edge, not from the ring.
@@ -914,13 +945,21 @@ fn warm_decode_loop(
             let boundary = is_source_boundary(frame_codec, current_codec, pts, last_pts);
             last_pts = Some(pts);
             if boundary {
+                // Drop the cached frame BEFORE attempting the re-open, not
+                // inside its success arm. The frame belongs to the source we
+                // have just left, so it is stale the moment the boundary is
+                // detected — and if the open fails (a codec this build cannot
+                // decode, or transient encoder pressure) the old placement left
+                // it published, serving the previous source's last picture
+                // indefinitely. That is exactly the frozen-thumbnail failure
+                // this re-open exists to prevent, surviving on the error path.
+                *latest.lock().unwrap() = None;
                 match video_engine::VideoDecoder::open(frame_codec) {
                     Ok(d) => {
                         decoder = d;
                         current_codec = frame_codec;
                         scaler = None;
                         last_encode = None;
-                        *latest.lock().unwrap() = None;
                     }
                     Err(e) => {
                         tracing::debug!("Warm thumbnail decoder: reopen failed: {e}");

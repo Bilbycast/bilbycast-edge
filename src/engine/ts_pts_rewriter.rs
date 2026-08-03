@@ -149,8 +149,16 @@ const PCR_RR_MAX_27MHZ: u64 = 40 * 27_000;
 const PCR_RR_MAX_INJECTIONS: usize = 50;
 
 /// Ceiling on how far a discontinuity bridge may advance the output
-/// timeline, in 27 MHz ticks (one `PCR_RR_MAX_27MHZ` packet interval).
+/// timeline, in 27 MHz ticks.
 ///
+/// The value is [`PCR_RR_MAX_27MHZ`] — the TR 101 290 **PCR repetition-rate**
+/// ceiling of 40 ms, i.e. the longest gap a conforming stream may leave
+/// between PCRs. It is *not* "one packet interval"; an earlier revision of
+/// this comment called it that, which reads as a property of the wire rate
+/// and is wrong at every bitrate. 40 ms is simply the largest advance that
+/// cannot itself create a PCR_RR violation.
+///
+
 /// A bridge exists to keep output monotonic across a source
 /// discontinuity whose content is *contiguous* — a file loop wrap
 /// serves frame N of one pass immediately followed by frame 1 of the
@@ -169,6 +177,21 @@ const PCR_RR_MAX_INJECTIONS: usize = 50;
 /// presented after two minutes, drop rate accelerating. Clamping keeps
 /// the bridge's monotonicity guarantee while charging the timeline only
 /// what the content actually consumed.
+///
+/// **The trade-off, stated plainly.** The clamp assumes a bridged
+/// discontinuity is an instantaneous *seam* — content either side is
+/// contiguous, and the wall-clock gap between the two PCR observations is
+/// reopen latency rather than elapsed programme time. That is true for the
+/// loop wrap this was measured on. It is *not* true for a long genuine gap:
+/// an input that reconnects after 30 s of silence, or an encoder that
+/// restarts, is charged 40 ms, and the resulting offset between output
+/// timeline and wall clock persists for the life of that input's anchor.
+/// Output stays internally monotonic and PCR-conformant throughout — this
+/// costs absolute wall-clock alignment, not stream validity — and the
+/// alternative (trusting raw `delta_master`) was measured causing continuous
+/// frame shedding, which is worse. Both bridge arms share this behaviour, so
+/// a reconnect on a live contribution feed is subject to it as much as a
+/// media-player loop wrap.
 const MAX_BRIDGE_ADVANCE_27MHZ: u64 = PCR_RR_MAX_27MHZ;
 
 /// TR 101 290 §PAT_error / §PMT_error: PSI tables must repeat at
@@ -802,10 +825,22 @@ impl TsPtsRewriter {
     /// §PCR_DR requirement on every PCR discontinuity).
     ///
     /// First PCR establishes the anchor; subsequent PCRs use anchor +
-    /// source-delta. >500 ms backward source jump → re-anchor with
-    /// master delta bridge (output stays monotonic). >500 ms forward
-    /// jump → pass through (preserves PCR_FO rate accuracy) and flag
-    /// DI=1 so receivers re-anchor cleanly.
+    /// source-delta.
+    ///
+    /// A >500 ms **backward** source jump re-anchors with a master-delta
+    /// bridge so output stays monotonic, DI=1.
+    ///
+    /// A >500 ms **forward** jump splits two ways on whether the wall clock
+    /// witnessed it. If real elapsed time accounts for the jump (a live edit
+    /// point, a splice), it passes through — that preserves PCR_FO rate
+    /// accuracy — and the `pcr_jump_signal` tells this input's audio replacer
+    /// to silence-pad the gap. If the jump is *unwitnessed* by more than
+    /// 500 ms (a file loop wrap: source PCR leaps a whole programme duration
+    /// while only milliseconds of wall clock passed), it is bridged like the
+    /// backward case, because passing it through injects that leap into the
+    /// presentation timeline and the display sheds frames to absorb it. Both
+    /// bridges are clamped — see [`MAX_BRIDGE_ADVANCE_27MHZ`] for the
+    /// trade-off that clamp makes. DI=1 on every discontinuity either way.
     fn rewrite_pcr_value(&mut self, src_pcr_27mhz: u64) -> (u64, bool) {
         let master_now = self.pacer.now_27mhz();
 
@@ -830,12 +865,16 @@ impl TsPtsRewriter {
         //   insertion, loop wrap on a source that resets PCR to file
         //   start) hit this path. DI=1 flagged.
         //
-        // - **Forward jumps** (delta_src > +500 ms): pass through.
-        //   Forward PCR jumps are tolerated by receivers (with DI=1
-        //   they re-anchor cleanly). Most forward jumps we see are
-        //   file-loop boundaries (`ffmpeg -stream_loop`), SCTE-35
-        //   splice points, or live content edit points — passing them
-        //   through preserves PCR_FO accuracy (TR 101 290 ±30 ppm).
+        // - **Forward jumps** (delta_src > +500 ms): pass through *if the
+        //   wall clock witnessed them*, else bridge. Receivers tolerate a
+        //   forward PCR jump (with DI=1 they re-anchor cleanly), and passing
+        //   an edit point or SCTE-35 splice through preserves PCR_FO accuracy
+        //   (TR 101 290 ±30 ppm). But a file-loop boundary
+        //   (`ffmpeg -stream_loop`) leaps a whole programme duration in
+        //   milliseconds of real time; passing that through puts the leap in
+        //   the presentation timeline, and the display sheds frames forever
+        //   trying to absorb it. The `unwitnessed` test below separates the
+        //   two — see the block comment there for the hardware evidence.
         //   Truncating with a master-clock bridge would accumulate
         //   negative rate drift across each jump. DI=1 flagged so
         //   strict receivers don't alarm.
@@ -1743,6 +1782,52 @@ mod tests {
              {}ms packet interval so the reopen latency is not charged to the \
              presentation timeline",
             forward / 27_000,
+            MAX_BRIDGE_ADVANCE_27MHZ / 27_000,
+        );
+    }
+
+    /// Pins the clamp's *cost*, so the trade-off is a decision rather than an
+    /// accident. A long genuine outage — an input that reconnects after
+    /// 30 s — is charged the same 40 ms as an instantaneous loop seam, so the
+    /// output timeline ends up ~30 s behind wall clock and stays there for
+    /// the life of this anchor.
+    ///
+    /// That is deliberate. Output remains monotonic and PCR-conformant, which
+    /// is what receivers require; the alternative (trusting raw
+    /// `delta_master`) was measured shedding frames continuously. But it does
+    /// mean absolute wall-clock alignment is not preserved across a long gap,
+    /// and this test exists so that fact cannot be rediscovered by surprise.
+    ///
+    /// Uses a simulated 30 s source-side gap with only a short real sleep —
+    /// the clamp reads `delta_master`, so a large *source* jump plus a small
+    /// real elapsed time is exactly the shape under test.
+    #[test]
+    fn bridge_clamp_charges_a_long_outage_only_one_pcr_rr_interval() {
+        let mut r = TsPtsRewriter::new(make_wallclock_pacer());
+        let mut buf = Vec::new();
+        r.process(&build_psi(0x100, 0x101), &mut buf);
+
+        let src_pcr_1: u64 = 1_000_000_000;
+        let mut out1 = Vec::new();
+        r.process(&build_pcr_packet(0x100, src_pcr_1), &mut out1);
+        let new_pcr_1 = extract_pcr(&out1[..TS_PACKET_SIZE]).unwrap();
+
+        // 120 ms of real time — a reconnect, not an instantaneous seam.
+        std::thread::sleep(std::time::Duration::from_millis(120));
+
+        // Source resumes 30 s *earlier* (encoder restarted, PCR reset).
+        let src_pcr_2: u64 = src_pcr_1 - 30_000 * 27_000;
+        let mut out2 = Vec::new();
+        r.process(&build_pcr_packet(0x100, src_pcr_2), &mut out2);
+        let new_pcr_2 = extract_pcr(&out2[..TS_PACKET_SIZE]).unwrap();
+
+        let forward = (new_pcr_2 as i64).wrapping_sub(new_pcr_1 as i64);
+        assert!(forward > 0, "output must stay monotonic across the outage");
+        assert!(
+            forward <= MAX_BRIDGE_ADVANCE_27MHZ as i64,
+            "a 120 ms real gap is still charged at most {} ms — the clamp does \
+             not distinguish a long outage from a loop seam, and that is the \
+             documented trade-off",
             MAX_BRIDGE_ADVANCE_27MHZ / 27_000,
         );
     }

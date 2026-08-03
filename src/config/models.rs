@@ -6592,6 +6592,30 @@ pub struct DisplayOutputConfig {
     /// missing, or session capacity exhausted at probe time).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hw_decode: Option<HwDecodePreference>,
+
+    /// Override the fleet-wide "MPEG-2 decodes on CPU" pin for this output.
+    ///
+    /// MPEG-2 is pinned to CPU decode on every hardware backend except NVDEC
+    /// (see `engine::output_display::mpeg2_requires_cpu_decode`). On RKMPP
+    /// that is a capability fact — the vendored fork registers no MPEG-2
+    /// decoder — but on **VAAPI** it is a conservative default rather than a
+    /// measurement: a matched A/B on Intel iHD put CPU at 27-29 fps and VAAPI
+    /// at 27-30 fps, parity within noise, at a cost of roughly 15 points of
+    /// process CPU. The pin is also source-agnostic, so it fires for an
+    /// MPEG-2 *contribution* feed on a monitoring wall, not only for a media
+    /// player.
+    ///
+    /// `None` (default) keeps the pin. `Some(false)` opts this output out, so
+    /// an operator who has measured their own host can reclaim that headroom
+    /// without a rebuild. `Some(true)` forces the pin even on a carved-out
+    /// backend (NVDEC).
+    ///
+    /// The runtime-learned pin is deliberately **not** overridable: if a
+    /// backend actually fails to decode MPEG-2 at run time, the demote still
+    /// latches regardless of this field. This knob only moves the *static*
+    /// policy, so opting out can cost frames but can never wedge the output.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mpeg2_cpu_decode: Option<bool>,
 }
 
 fn default_audio_channel_pair() -> [u8; 2] {

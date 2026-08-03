@@ -141,9 +141,16 @@ pub struct PlannedPlaylist {
 /// `loop_playback` and there are ≥ 2 entries.
 pub fn plan_playlist(
     manifests: &[Option<AssetManifest>],
+    selected_programs: &[Option<u16>],
     loop_playback: bool,
     policy: &PlaybackPolicy,
 ) -> PlannedPlaylist {
+    // Per-entry `MediaPlayerSource::Ts { program_number }`, aligned by index.
+    // The runtime honours it at playout, so the planner must classify against
+    // the same program the operator will actually hear and see — comparing an
+    // MPTS's flat stream list would otherwise pit one program's video against
+    // another program's audio. A short slice reads as "no selection".
+    let prog_at = |i: usize| selected_programs.get(i).copied().flatten();
     let entries: Vec<EntryPlan> = manifests
         .iter()
         .enumerate()
@@ -163,14 +170,24 @@ pub fn plan_playlist(
     let n = manifests.len();
     if n >= 2 {
         for i in 0..(n - 1) {
-            boundaries.push(classify_boundary(i, i + 1, &manifests[i], &manifests[i + 1], policy));
+            boundaries.push(classify_boundary(
+                i,
+                i + 1,
+                &manifests[i],
+                prog_at(i),
+                &manifests[i + 1],
+                prog_at(i + 1),
+                policy,
+            ));
         }
         if loop_playback {
             boundaries.push(classify_boundary(
                 n - 1,
                 0,
                 &manifests[n - 1],
+                prog_at(n - 1),
                 &manifests[0],
+                prog_at(0),
                 policy,
             ));
         }
@@ -195,11 +212,14 @@ pub fn plan_playlist(
 }
 
 /// Classify one boundary from `a` → `b`.
+#[allow(clippy::too_many_arguments)]
 fn classify_boundary(
     from_index: usize,
     to_index: usize,
     a: &Option<AssetManifest>,
+    a_program: Option<u16>,
     b: &Option<AssetManifest>,
+    b_program: Option<u16>,
     policy: &PlaybackPolicy,
 ) -> Boundary {
     // An unusable endpoint makes the whole boundary unsupported — you cannot
@@ -226,7 +246,7 @@ fn classify_boundary(
     };
 
     // Gather the differences that matter for a splice.
-    let diff = compare(a, b);
+    let diff = compare(a, a_program, b, b_program);
 
     // Under normalised policy, any difference at all is normalise_required —
     // every item is forced to the output profile, so differing inputs are
@@ -288,8 +308,30 @@ struct Diff {
     layout_changed: bool,
 }
 
-fn first_stream<'a>(m: &'a AssetManifest, t: ManifestMediaType) -> Option<&'a crate::media::manifest::ManifestStream> {
-    m.streams.iter().find(|s| s.media_type == t)
+/// The stream of type `t` this entry will actually play.
+///
+/// With a program selected, restrict to that program's tracks. `streams` is a
+/// flat list across every program of an MPTS, so an unrestricted "first video"
+/// / "first audio" can return tracks belonging to two different programs — and
+/// comparing that chimera against another file's chimera is how a splice that
+/// changes codec, resolution and audio layout came back `native_continuous`.
+///
+/// A selected program that the manifest does not carry yields `None` rather
+/// than falling back to another program's tracks: a stale sidecar or a
+/// mistyped program number should read as "absent", never as "here is some
+/// other program's video".
+fn first_stream<'a>(
+    m: &'a AssetManifest,
+    t: ManifestMediaType,
+    program: Option<u16>,
+) -> Option<&'a crate::media::manifest::ManifestStream> {
+    match program {
+        Some(p) => m
+            .streams
+            .iter()
+            .find(|s| s.media_type == t && s.program_number == Some(p)),
+        None => m.streams.iter().find(|s| s.media_type == t),
+    }
 }
 
 /// Whether the asset's PAT advertised more than one program.
@@ -297,7 +339,12 @@ fn is_mpts(m: &AssetManifest) -> bool {
     m.container.as_ref().and_then(|c| c.programs).unwrap_or(0) > 1
 }
 
-fn compare(a: &AssetManifest, b: &AssetManifest) -> Diff {
+fn compare(
+    a: &AssetManifest,
+    a_program: Option<u16>,
+    b: &AssetManifest,
+    b_program: Option<u16>,
+) -> Diff {
     let mut reasons = Vec::new();
     let mut layout_changed = false;
 
@@ -314,13 +361,15 @@ fn compare(a: &AssetManifest, b: &AssetManifest) -> Diff {
     // itself, reporting continuity across a splice that changes video codec,
     // resolution and audio codec. Say we don't know rather than claim it is
     // clean; per-stream program association is the full fix.
-    if is_mpts(a) || is_mpts(b) {
+    // Only when the entry has NO program selected. With a selection the
+    // comparison below is exact, so flagging it would be noise.
+    if (is_mpts(a) && a_program.is_none()) || (is_mpts(b) && b_program.is_none()) {
         reasons.push("mpts_program_selection_unknown".to_string());
         layout_changed = true;
     }
 
-    let av = first_stream(a, ManifestMediaType::Video);
-    let bv = first_stream(b, ManifestMediaType::Video);
+    let av = first_stream(a, ManifestMediaType::Video, a_program);
+    let bv = first_stream(b, ManifestMediaType::Video, b_program);
     match (av, bv) {
         (Some(_), None) => {
             reasons.push("video_removed".to_string());
@@ -359,8 +408,8 @@ fn compare(a: &AssetManifest, b: &AssetManifest) -> Diff {
         (None, None) => {}
     }
 
-    let aa = first_stream(a, ManifestMediaType::Audio);
-    let ba = first_stream(b, ManifestMediaType::Audio);
+    let aa = first_stream(a, ManifestMediaType::Audio, a_program);
+    let ba = first_stream(b, ManifestMediaType::Audio, b_program);
     match (aa, ba) {
         (Some(_), None) => {
             reasons.push("audio_removed".to_string());
@@ -435,6 +484,7 @@ mod tests {
             channels: None,
             language: None,
             extradata_fingerprint: Some(extradata.to_string()),
+            program_number: None,
         }
     }
 
@@ -452,6 +502,7 @@ mod tests {
             channels: Some(ch),
             language: None,
             extradata_fingerprint: None,
+            program_number: None,
         }
     }
 
@@ -494,7 +545,7 @@ mod tests {
             DetectedKind::Mp4,
             vec![video("h264", 1920, 1080, (30000, 1001), "aaa"), audio("aac_lc", 48000, 2)],
         );
-        let plan = plan_playlist(&[Some(a.clone()), Some(a)], false, &native());
+        let plan = plan_playlist(&[Some(a.clone()), Some(a)], &[], false, &native());
         assert!(plan.valid);
         assert_eq!(plan.boundaries.len(), 1);
         assert_eq!(plan.boundaries[0].classification, TransitionClass::NativeContinuous);
@@ -505,7 +556,7 @@ mod tests {
     fn frame_rate_change_is_native_discontinuity_not_unsupported() {
         let a = manifest(DetectedKind::Mp4, vec![video("h264", 1920, 1080, (24, 1), "aaa")]);
         let b = manifest(DetectedKind::Mp4, vec![video("h264", 1920, 1080, (30000, 1001), "aaa")]);
-        let plan = plan_playlist(&[Some(a), Some(b)], false, &native());
+        let plan = plan_playlist(&[Some(a), Some(b)], &[], false, &native());
         let bnd = &plan.boundaries[0];
         assert_eq!(bnd.classification, TransitionClass::NativeDiscontinuity);
         assert!(bnd.reasons.contains(&"video_frame_rate_changed".to_string()));
@@ -528,7 +579,7 @@ mod tests {
         for m in [&mut a, &mut b] {
             m.container.as_mut().unwrap().programs = Some(4);
         }
-        let plan = plan_playlist(&[Some(a), Some(b)], false, &native());
+        let plan = plan_playlist(&[Some(a), Some(b)], &[], false, &native());
         let bnd = &plan.boundaries[0];
         assert_eq!(bnd.classification, TransitionClass::NativeDiscontinuity);
         assert!(bnd
@@ -538,6 +589,91 @@ mod tests {
         assert!(plan.valid);
     }
 
+    /// The case the flat stream list got exactly backwards: one MPTS, two
+    /// entries selecting different programs. Before per-stream program
+    /// association this resolved the same manifest twice, compared it against
+    /// itself and reported `native_continuous` across a splice that changes
+    /// video codec, resolution and audio codec.
+    #[test]
+    fn same_mux_different_programs_is_a_discontinuity() {
+        let mut v1 = video("h264", 1920, 1080, (25, 1), "aaa");
+        v1.program_number = Some(1);
+        let mut a1 = audio("aac_lc", 48000, 2);
+        a1.program_number = Some(1);
+        let mut v2 = video("mpeg2video", 720, 576, (25, 1), "bbb");
+        v2.program_number = Some(2);
+        let mut a2 = audio("mp2", 48000, 2);
+        a2.program_number = Some(2);
+
+        let mux = manifest(DetectedKind::Ts, vec![v1, a1, v2, a2]);
+        let mut mux2 = mux.clone();
+        for m in [&mut mux2] {
+            m.container.as_mut().unwrap().programs = Some(2);
+        }
+        let mut mux1 = mux;
+        mux1.container.as_mut().unwrap().programs = Some(2);
+
+        let plan = plan_playlist(
+            &[Some(mux1), Some(mux2)],
+            &[Some(1), Some(2)],
+            false,
+            &native(),
+        );
+        let bnd = &plan.boundaries[0];
+        assert_eq!(bnd.classification, TransitionClass::NativeDiscontinuity);
+        assert!(bnd.reasons.contains(&"video_codec_changed".to_string()));
+        assert!(bnd.reasons.contains(&"video_resolution_changed".to_string()));
+        assert!(bnd.reasons.contains(&"audio_codec_changed".to_string()));
+        // With an explicit selection the "we don't know which program" flag
+        // must NOT fire — the comparison above is exact.
+        assert!(!bnd
+            .reasons
+            .contains(&"mpts_program_selection_unknown".to_string()));
+    }
+
+    /// Selecting the same program on both sides of a boundary is continuous,
+    /// even though the flat list carries another program's differing tracks.
+    #[test]
+    fn same_mux_same_program_is_continuous() {
+        let mut v1 = video("h264", 1920, 1080, (25, 1), "aaa");
+        v1.program_number = Some(1);
+        let mut v2 = video("mpeg2video", 720, 576, (25, 1), "bbb");
+        v2.program_number = Some(2);
+        let mut m = manifest(DetectedKind::Ts, vec![v1, v2]);
+        m.container.as_mut().unwrap().programs = Some(2);
+        let plan = plan_playlist(
+            &[Some(m.clone()), Some(m)],
+            &[Some(1), Some(1)],
+            false,
+            &native(),
+        );
+        assert_eq!(
+            plan.boundaries[0].classification,
+            TransitionClass::NativeContinuous
+        );
+    }
+
+    /// A selected program the manifest does not carry reads as "absent",
+    /// never as "here is some other program's video".
+    #[test]
+    fn missing_selected_program_does_not_fall_back_to_another() {
+        let mut v1 = video("h264", 1920, 1080, (25, 1), "aaa");
+        v1.program_number = Some(1);
+        let mut m = manifest(DetectedKind::Ts, vec![v1]);
+        m.container.as_mut().unwrap().programs = Some(1);
+        let plan = plan_playlist(
+            &[Some(m.clone()), Some(m)],
+            &[Some(1), Some(9)],
+            false,
+            &native(),
+        );
+        // Program 9 has no video → the boundary reports video removed rather
+        // than silently comparing program 1's video on both sides.
+        assert!(plan.boundaries[0]
+            .reasons
+            .contains(&"video_removed".to_string()));
+    }
+
     /// An SPTS pair with identical streams stays continuous — the MPTS guard
     /// must not fire on single-program files.
     #[test]
@@ -545,7 +681,7 @@ mod tests {
         let mut a = manifest(DetectedKind::Ts, vec![video("h264", 1920, 1080, (25, 1), "aaa")]);
         a.container.as_mut().unwrap().programs = Some(1);
         let b = a.clone();
-        let plan = plan_playlist(&[Some(a), Some(b)], false, &native());
+        let plan = plan_playlist(&[Some(a), Some(b)], &[], false, &native());
         assert_eq!(
             plan.boundaries[0].classification,
             TransitionClass::NativeContinuous
@@ -557,7 +693,7 @@ mod tests {
         // 30000/1001 vs 60000/2002 are the same rate.
         let a = manifest(DetectedKind::Mp4, vec![video("h264", 1280, 720, (30000, 1001), "aaa")]);
         let b = manifest(DetectedKind::Mp4, vec![video("h264", 1280, 720, (60000, 2002), "aaa")]);
-        let plan = plan_playlist(&[Some(a), Some(b)], false, &native());
+        let plan = plan_playlist(&[Some(a), Some(b)], &[], false, &native());
         assert_eq!(plan.boundaries[0].classification, TransitionClass::NativeContinuous);
     }
 
@@ -568,7 +704,7 @@ mod tests {
             vec![video("h264", 1920, 1080, (25, 1), "aaa"), audio("aac_lc", 48000, 2)],
         );
         let b = manifest(DetectedKind::Mp4, vec![video("h264", 1920, 1080, (25, 1), "aaa")]);
-        let plan = plan_playlist(&[Some(a), Some(b)], false, &native());
+        let plan = plan_playlist(&[Some(a), Some(b)], &[], false, &native());
         let bnd = &plan.boundaries[0];
         assert_eq!(bnd.classification, TransitionClass::NativeDiscontinuity);
         assert!(bnd.reasons.contains(&"audio_removed".to_string()));
@@ -579,7 +715,7 @@ mod tests {
     fn codec_config_change_forces_reinit_at_same_resolution() {
         let a = manifest(DetectedKind::Mp4, vec![video("h264", 1920, 1080, (25, 1), "aaa")]);
         let b = manifest(DetectedKind::Mp4, vec![video("h264", 1920, 1080, (25, 1), "bbb")]);
-        let plan = plan_playlist(&[Some(a), Some(b)], false, &native());
+        let plan = plan_playlist(&[Some(a), Some(b)], &[], false, &native());
         let bnd = &plan.boundaries[0];
         assert_eq!(bnd.classification, TransitionClass::NativeDiscontinuity);
         assert!(bnd.reasons.contains(&"video_codec_config_changed".to_string()));
@@ -589,7 +725,7 @@ mod tests {
     #[test]
     fn unsupported_endpoint_makes_boundary_unsupported_and_playlist_invalid() {
         let a = manifest(DetectedKind::Mp4, vec![video("h264", 1920, 1080, (25, 1), "aaa")]);
-        let plan = plan_playlist(&[Some(a), Some(unsupported())], false, &native());
+        let plan = plan_playlist(&[Some(a), Some(unsupported())], &[], false, &native());
         assert_eq!(plan.boundaries[0].classification, TransitionClass::Unsupported);
         assert!(!plan.valid);
         assert_eq!(plan.entries[1].asset_state, AssetState::Unsupported);
@@ -599,7 +735,7 @@ mod tests {
     #[test]
     fn missing_manifest_is_missing_entry_and_unsupported_boundary() {
         let a = manifest(DetectedKind::Mp4, vec![video("h264", 1920, 1080, (25, 1), "aaa")]);
-        let plan = plan_playlist(&[Some(a), None], false, &native());
+        let plan = plan_playlist(&[Some(a), None], &[], false, &native());
         assert_eq!(plan.entries[1].asset_state, AssetState::Missing);
         assert_eq!(plan.boundaries[0].classification, TransitionClass::Unsupported);
         assert!(!plan.valid);
@@ -610,9 +746,9 @@ mod tests {
         let a = manifest(DetectedKind::Mp4, vec![video("h264", 1920, 1080, (25, 1), "aaa")]);
         let b = manifest(DetectedKind::Ts, vec![video("h264", 1280, 720, (25, 1), "bbb")]);
         // No loop: one boundary (a→b). Loop: two (a→b, b→a).
-        let no_loop = plan_playlist(&[Some(a.clone()), Some(b.clone())], false, &native());
+        let no_loop = plan_playlist(&[Some(a.clone()), Some(b.clone())], &[], false, &native());
         assert_eq!(no_loop.boundaries.len(), 1);
-        let looped = plan_playlist(&[Some(a), Some(b)], true, &native());
+        let looped = plan_playlist(&[Some(a), Some(b)], &[], true, &native());
         assert_eq!(looped.boundaries.len(), 2);
         assert_eq!(looped.boundaries[1].from_index, 1);
         assert_eq!(looped.boundaries[1].to_index, 0);
@@ -621,7 +757,7 @@ mod tests {
     #[test]
     fn single_entry_has_no_boundaries() {
         let a = manifest(DetectedKind::Image, vec![video("raster", 1920, 1080, (0, 0), "")]);
-        let plan = plan_playlist(&[Some(a)], true, &native());
+        let plan = plan_playlist(&[Some(a)], &[], true, &native());
         assert!(plan.boundaries.is_empty());
         assert!(plan.valid);
     }
@@ -631,7 +767,7 @@ mod tests {
         let a = manifest(DetectedKind::Mp4, vec![video("h264", 1920, 1080, (24, 1), "aaa")]);
         let b = manifest(DetectedKind::Mp4, vec![video("h264", 1280, 720, (30, 1), "bbb")]);
         let policy = PlaybackPolicy { mode: PolicyMode::Normalised, on_incompatible: OnIncompatible::Reject };
-        let plan = plan_playlist(&[Some(a), Some(b)], false, &policy);
+        let plan = plan_playlist(&[Some(a), Some(b)], &[], false, &policy);
         assert_eq!(plan.boundaries[0].classification, TransitionClass::NormaliseRequired);
         assert!(plan.resource_plan.requires_transcode);
         // Under native policy the plan is "valid" (signalled); under
