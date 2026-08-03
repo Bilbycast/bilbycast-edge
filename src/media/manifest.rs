@@ -544,6 +544,10 @@ fn probe_mp4(name: &str, path: &Path, id: FileIdentity) -> Mp4Probe {
     let mut streams = Vec::new();
     let mut idx = 0u32;
     let mut have_supported_track = false;
+    // Tracks the container carries that this build cannot mux natively, so the
+    // warnings can distinguish "no video at all" from "video we had to drop".
+    let mut skipped_video: Vec<String> = Vec::new();
+    let mut skipped_audio: Vec<String> = Vec::new();
     let mut duration_90khz = None;
 
     // Whole-movie duration in 90 kHz ticks from the first track that has a
@@ -606,8 +610,18 @@ fn probe_mp4(name: &str, path: &Path, id: FileIdentity) -> Mp4Probe {
             }
             // Non-H.264 video / non-AAC audio: recognised container, but a
             // track the player can't use. Not fatal on its own — the file is
-            // usable if *another* track is supported.
-            _ => {}
+            // usable if *another* track is supported. Remember what was
+            // skipped: without this, an HEVC+AAC file produces a `streams`
+            // list with no Video entry and is reported as "audio-only, no
+            // video track", which tells the operator the file is audio when
+            // the truth is that its video will be silently dropped.
+            (tt, mt) => {
+                if matches!(tt, TrackType::Video) {
+                    skipped_video.push(format!("{mt:?}").to_lowercase());
+                } else if matches!(tt, TrackType::Audio) {
+                    skipped_audio.push(format!("{mt:?}").to_lowercase());
+                }
+            }
         }
     }
 
@@ -626,11 +640,30 @@ fn probe_mp4(name: &str, path: &Path, id: FileIdentity) -> Mp4Probe {
     };
 
     let has_video = streams.iter().any(|s| s.media_type == ManifestMediaType::Video);
-    let warnings = if !has_video {
-        vec!["audio-only MP4/MOV: no video track".to_string()]
-    } else {
-        Vec::new()
-    };
+    let mut warnings = Vec::new();
+    if !has_video {
+        if skipped_video.is_empty() {
+            warnings.push("audio-only MP4/MOV: no video track".to_string());
+        } else {
+            // There IS video, the player just can't carry it natively. Say so
+            // — "audio-only" would be a factual misreport, and the manager
+            // renders this string verbatim.
+            warnings.push(format!(
+                "video track present but not natively playable ({}) — it will be \
+                 dropped; remux the video to H.264 to keep it",
+                skipped_video.join(", ")
+            ));
+        }
+    }
+    if !skipped_audio.is_empty()
+        && !streams.iter().any(|s| s.media_type == ManifestMediaType::Audio)
+    {
+        warnings.push(format!(
+            "audio track present but not natively playable ({}) — it will be \
+             dropped; remux the audio to AAC-LC to keep it",
+            skipped_audio.join(", ")
+        ));
+    }
 
     Mp4Probe::Manifest(AssetManifest {
         schema_version: MANIFEST_SCHEMA_VERSION,
@@ -737,6 +770,32 @@ fn frame_rate_rational(fps: f64) -> (Option<u32>, Option<u32>) {
     (Some(fps.round() as u32), Some(1))
 }
 
+/// Whether this build can actually decode `format`.
+///
+/// Must track the `image` crate's feature list in Cargo.toml
+/// (`["jpeg", "png", "webp", "bmp", "gif"]`). Written as an exhaustive match
+/// rather than a slice so adding a format to Cargo.toml without revisiting
+/// this is a compile error, not a silently-wrong manifest.
+fn image_format_is_decodable(format: image::ImageFormat) -> bool {
+    use image::ImageFormat as F;
+    match format {
+        F::Jpeg | F::Png | F::WebP | F::Bmp | F::Gif => true,
+        F::Tiff
+        | F::Tga
+        | F::Dds
+        | F::Ico
+        | F::Hdr
+        | F::OpenExr
+        | F::Pnm
+        | F::Farbfeld
+        | F::Avif
+        | F::Qoi => false,
+        // `ImageFormat` is `#[non_exhaustive]`; a format this build has never
+        // heard of is by definition one it cannot decode.
+        _ => false,
+    }
+}
+
 fn non_empty(s: &str) -> Option<String> {
     let t = s.trim();
     if t.is_empty() || t == "und" {
@@ -749,8 +808,20 @@ fn non_empty(s: &str) -> Option<String> {
 /// Still-image detection. The magic bytes in the head window pick the format
 /// cheaply; dimensions come from a header-only decode (`image` reads just the
 /// header for `into_dimensions` on the formats we enable).
+///
+/// `image::guess_format` recognises formats by magic byte regardless of which
+/// decoders were compiled in, and this build enables only five (see the
+/// `image` dependency in Cargo.toml). Reporting a TIFF or an ICO as a `Ready`,
+/// `native_playable` still image would hand the manager a green badge for a
+/// file whose first playout attempt fails at `image::open` — so check the
+/// format against what this build can actually decode, and let an unrecognised
+/// one fall through to the `Unsupported` verdict where the manager can render
+/// an actionable reason.
 fn probe_image(name: &str, path: &Path, head: &[u8], id: FileIdentity) -> Option<AssetManifest> {
     let format = image::guess_format(head).ok()?;
+    if !image_format_is_decodable(format) {
+        return None;
+    }
 
     // Dimensions: prefer a cheap header-only read straight from disk.
     let (width, height) = match image::ImageReader::open(path)

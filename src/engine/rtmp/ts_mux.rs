@@ -429,7 +429,13 @@ impl TsMuxer {
         // (TR-101290 PCR_error, no playout). Mirrors `mux_private_audio`. When
         // video IS present it carries the PCR, so this stays `false` there and
         // the existing video+audio path is byte-identical.
-        let write_pcr = !self.has_video;
+        //
+        // Gate on the *effective* PCR PID, not on `audio_pid` directly: a
+        // caller that set `pcr_pid_override` has declared PCR on some other
+        // PID in the PMT, and writing it here as well would put PCR on a PID
+        // the PMT does not name — the same PCR_error in the other direction.
+        let pcr_pid = self.pcr_pid_override.unwrap_or(audio_pid);
+        let write_pcr = !self.has_video && pcr_pid == audio_pid;
         let pcr = if write_pcr { Some(pts_90khz) } else { None };
         packets.extend(self.packetize(audio_pid, &pes, true, write_pcr, pcr, false));
         packets
@@ -1366,5 +1372,28 @@ mod tests {
             .iter()
             .any(|p| ts_pid(p) == 0x0101 && ts_packet_has_pcr(p));
         assert!(!audio_has_pcr, "video+audio: PCR rides video, never the audio PID");
+    }
+
+    /// Audio-only, but the caller declared PCR on a different PID via
+    /// `set_pcr_pid`. The PMT names that PID, so the audio packets must NOT
+    /// carry PCR — writing it here too would put PCR on a PID the PMT does not
+    /// name, which is the same TR-101290 PCR_error the audio-only fix exists to
+    /// avoid, just in the other direction.
+    #[test]
+    fn audio_only_with_pcr_pid_override_keeps_pcr_off_the_audio_pid() {
+        let mut muxer = TsMuxer::new();
+        muxer.set_has_video(false);
+        muxer.set_has_audio(true);
+        muxer.set_audio_stream(0x0F, None); // AAC
+        muxer.set_pids(Some(0x1000), None, Some(0x0101), Some(0x0200));
+        let adts = vec![0xFF, 0xF1, 0x50, 0x80, 0x00, 0x1F, 0xFC, 0xDE, 0xAD];
+        let ts = muxer.mux_audio_pre_adts(&adts, 90_000);
+        let audio_has_pcr = ts
+            .iter()
+            .any(|p| ts_pid(p) == 0x0101 && ts_packet_has_pcr(p));
+        assert!(
+            !audio_has_pcr,
+            "pcr_pid_override declared another PCR PID — audio must not carry PCR"
+        );
     }
 }

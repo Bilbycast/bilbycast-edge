@@ -3648,11 +3648,29 @@ async fn execute_command(
             let sources = action["sources"]
                 .as_array()
                 .ok_or("plan_media_playlist: missing 'sources' array")?;
+            // Same bound the config validator enforces on a real playlist —
+            // without it an oversized array drives that many manifest probes.
+            if sources.len() > 256 {
+                return Err(CommandError::new(format!(
+                    "plan_media_playlist: 'sources' must contain 1-256 entries (got {})",
+                    sources.len()
+                )));
+            }
             let loop_playback = action["loop_playback"].as_bool().unwrap_or(true);
-            let policy: planner::PlaybackPolicy = action
-                .get("policy")
-                .and_then(|p| serde_json::from_value(p.clone()).ok())
-                .unwrap_or_default();
+            // Reject a malformed policy rather than silently defaulting. Every
+            // other structured parameter in this dispatcher uses `map_err(..)?`;
+            // swallowing the error here would degrade to the permissive Native
+            // mode and flip the authoritative `valid` / `requires_transcode`
+            // answer in the lenient direction — on the one command whose own
+            // contract is "the edge remains the authority". A US-spelled
+            // "normalized" against this edge's "normalised" is exactly that
+            // case: a hard parse failure, not a near miss.
+            let policy: planner::PlaybackPolicy = match action.get("policy") {
+                None | Some(serde_json::Value::Null) => planner::PlaybackPolicy::default(),
+                Some(p) => serde_json::from_value(p.clone()).map_err(|e| {
+                    CommandError::new(format!("plan_media_playlist: invalid 'policy': {e}"))
+                })?,
+            };
 
             // Resolve each entry's manifest (cache-or-probe). A missing /
             // unreadable file yields `None`, which the planner classifies as
@@ -4863,7 +4881,19 @@ async fn execute_command(
                         "media_player_control_unavailable",
                     )
                 })?;
-            let expected_generation = action["expected_generation"].as_u64().unwrap_or(0);
+            // `0` is a real generation — the first source to play is
+            // generation 0 — so it cannot double as "caller didn't say".
+            // Defaulting a missing field to 0 would let a manager that omits
+            // the token skip an item on a player that has never transitioned,
+            // while being rejected as stale on every player that has. Require
+            // it, and let the manager use the `generation` field the stats
+            // already carry.
+            let expected_generation = action["expected_generation"].as_u64().ok_or_else(|| {
+                CommandError::new(
+                    "media_player_next: missing 'expected_generation' (send the \
+                     `generation` value from media_player_stats)",
+                )
+            })?;
             let request_id = action["request_id"].as_str().unwrap_or_default().to_string();
             let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
             cmd_tx
