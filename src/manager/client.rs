@@ -3139,7 +3139,28 @@ async fn execute_command(
                             // start-up, since mid-flight subscriber toggle
                             // is not yet wired through FlowManager).
                             let input_changed = input_set_changed(&old_flow.input_ids, &new_flow.input_ids);
-                            let restart_required = old_flow.bandwidth_limit != new_flow.bandwidth_limit;
+                            // An input that stays a member but whose definition
+                            // changed cannot be reconciled surgically: the
+                            // common case is a flow's only input, which is also
+                            // its active one, and `remove_input` refuses to
+                            // take that away (`active_input_in_use`). So it is
+                            // a restart, exactly as the `update_input` command
+                            // already does for the same edit arriving by the
+                            // other route — this path was the only one that
+                            // silently did nothing.
+                            let edited_inputs = changed_input_definitions(
+                                &new_flow.input_ids,
+                                &old_config.inputs,
+                                &new_config.inputs,
+                            );
+                            let restart_required = old_flow.bandwidth_limit != new_flow.bandwidth_limit
+                                || !edited_inputs.is_empty();
+                            if !edited_inputs.is_empty() {
+                                tracing::info!(
+                                    "Config diff: flow '{id}' restarting because input definition(s) changed: {}",
+                                    edited_inputs.join(", ")
+                                );
+                            }
                             let persist_only_meta_changed = old_flow.name != new_flow.name
                                 || old_flow.media_analysis != new_flow.media_analysis
                                 || old_flow.thumbnail != new_flow.thumbnail
@@ -5299,6 +5320,53 @@ fn input_set_changed(old: &[String], new: &[String]) -> bool {
     a != b
 }
 
+/// Which of a flow's inputs have had their **definition** edited.
+///
+/// `input_set_changed` answers "did the roster change"; this answers "did any
+/// of the members change". They are different questions and only the first was
+/// being asked, so an edit to an input that was already a member of a running
+/// flow was persisted and never applied — the capture session kept the
+/// definition it was created with while every UI, the unit's own `/config` and
+/// the config-history snapshot showed the new one.
+///
+/// Measured on 2026-08-05: an SDI input created with `video_encode.bitrate_kbps
+/// = 2000` produced 2 062 kbps; changing it to 16 000 on the running flow left
+/// it at 2 084 kbps; deleting the input and re-creating it at 16 000 produced
+/// 16 287 kbps. The value reached the unit each time.
+///
+/// **`active` is excluded deliberately.** Activation is owned by the
+/// `activate_input` command — the same rule the `update_input` handler states
+/// and follows — and treating an activation as an edit would tear down and
+/// rebuild the input the operator just switched to, which is the one thing a
+/// switcher must never do.
+///
+/// Only inputs present in `ids` are compared: one being added or removed is
+/// already the roster's business, and `diff_inputs` handles it surgically.
+fn changed_input_definitions(
+    ids: &[String],
+    old: &[InputDefinition],
+    new: &[InputDefinition],
+) -> Vec<String> {
+    let find = |list: &[InputDefinition], id: &str| {
+        list.iter().find(|item| item.id == id).cloned()
+    };
+    let mut changed = Vec::new();
+    for id in ids {
+        let (Some(before), Some(after)) = (find(old, id), find(new, id)) else {
+            continue;
+        };
+        // Same comparison the `update_input` command makes, for the same
+        // reason: these are the fields bound into the running task graph.
+        if before.config != after.config
+            || before.name != after.name
+            || before.group != after.group
+        {
+            changed.push(id.clone());
+        }
+    }
+    changed
+}
+
 #[cfg(test)]
 mod input_diff_tests {
     use super::input_set_changed;
@@ -5325,6 +5393,98 @@ mod input_diff_tests {
         assert!(input_set_changed(&v(&["a"]), &v(&["b"]))); // swapped
         assert!(input_set_changed(&v(&[]), &v(&["a"]))); // empty → one
         assert!(input_set_changed(&v(&["a"]), &v(&[]))); // one → empty (drops all)
+    }
+}
+
+#[cfg(test)]
+mod input_definition_diff_tests {
+    use super::changed_input_definitions;
+    use crate::config::models::InputDefinition;
+
+    /// Built from JSON rather than by hand, which is both shorter and the
+    /// shape these actually arrive in.
+    fn input(id: &str, bind: &str) -> InputDefinition {
+        serde_json::from_value(serde_json::json!({
+            "id": id, "name": id, "active": true,
+            "type": "udp", "bind_addr": bind
+        }))
+        .expect("fixture")
+    }
+    fn ids(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn an_unchanged_input_is_not_a_change() {
+        let before = vec![input("a", "0.0.0.0:5000")];
+        let after = vec![input("a", "0.0.0.0:5000")];
+        assert!(changed_input_definitions(&ids(&["a"]), &before, &after).is_empty());
+    }
+
+    /// The bug this exists for: the definition changed, the roster did not.
+    #[test]
+    fn an_edited_input_is_a_change() {
+        let before = vec![input("a", "0.0.0.0:5000")];
+        let after = vec![input("a", "0.0.0.0:6000")];
+        assert_eq!(changed_input_definitions(&ids(&["a"]), &before, &after), vec!["a"]);
+    }
+
+    /// **Activation must never look like an edit.** Tearing down and
+    /// rebuilding the input somebody just switched to is the one thing a
+    /// switcher must not do, which is why the `update_input` command
+    /// deliberately preserves `active` and this comparison ignores it.
+    #[test]
+    fn activation_is_not_an_edit() {
+        let before = vec![input("a", "0.0.0.0:5000")];
+        let mut after = vec![input("a", "0.0.0.0:5000")];
+        after[0].active = false;
+        assert!(changed_input_definitions(&ids(&["a"]), &before, &after).is_empty());
+    }
+
+    /// A rename reaches the flow's own descriptors, so it counts — same rule
+    /// the `update_input` command applies.
+    #[test]
+    fn a_rename_or_regroup_is_a_change() {
+        let before = vec![input("a", "0.0.0.0:5000")];
+        let mut renamed = vec![input("a", "0.0.0.0:5000")];
+        renamed[0].name = "Camera 2".into();
+        assert_eq!(changed_input_definitions(&ids(&["a"]), &before, &renamed), vec!["a"]);
+
+        let mut regrouped = vec![input("a", "0.0.0.0:5000")];
+        regrouped[0].group = Some("studio".into());
+        assert_eq!(changed_input_definitions(&ids(&["a"]), &before, &regrouped), vec!["a"]);
+    }
+
+    /// Only what the flow actually uses. An edit to an input this flow does
+    /// not carry must not restart it.
+    #[test]
+    fn an_input_this_flow_does_not_use_is_ignored() {
+        let before = vec![input("a", "0.0.0.0:5000"), input("b", "0.0.0.0:5001")];
+        let after = vec![input("a", "0.0.0.0:5000"), input("b", "0.0.0.0:9999")];
+        assert!(changed_input_definitions(&ids(&["a"]), &before, &after).is_empty());
+        assert_eq!(changed_input_definitions(&ids(&["a", "b"]), &before, &after), vec!["b"]);
+    }
+
+    /// Added and removed members belong to the roster diff, which reconciles
+    /// them surgically. Reporting them here would force a restart for
+    /// something `diff_inputs` handles without one.
+    #[test]
+    fn added_and_removed_members_are_left_to_the_roster_diff() {
+        let before = vec![input("a", "0.0.0.0:5000")];
+        let after = vec![input("a", "0.0.0.0:5000"), input("b", "0.0.0.0:5001")];
+        assert!(changed_input_definitions(&ids(&["a", "b"]), &before, &after).is_empty());
+        assert!(changed_input_definitions(&ids(&["a"]), &after, &before).is_empty());
+    }
+
+    /// Every edited member is named, so the log says which.
+    #[test]
+    fn every_edited_member_is_reported() {
+        let before = vec![input("a", "0.0.0.0:5000"), input("b", "0.0.0.0:5001")];
+        let after = vec![input("a", "0.0.0.0:6000"), input("b", "0.0.0.0:6001")];
+        assert_eq!(
+            changed_input_definitions(&ids(&["a", "b"]), &before, &after),
+            vec!["a", "b"]
+        );
     }
 }
 
