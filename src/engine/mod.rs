@@ -45,6 +45,11 @@ pub mod cmaf;
 pub mod content_analysis;
 pub mod degradation_monitor;
 pub mod delay_buffer;
+/// Epoch-locked egress — deriving a wall-clock release instant from a PCR
+/// value alone, so independent nodes carrying the same stream emit in
+/// alignment without any peer coordination. Pure integer maths; see
+/// [`epoch_lock`] for the clock-domain reasoning.
+pub mod epoch_lock;
 pub mod flow;
 /// Hardware probe + CPU class + software-encode capacity estimate. Powers
 /// the `resource_budget` block on the manager `HealthPayload`. One-shot

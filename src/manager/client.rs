@@ -1270,6 +1270,19 @@ fn edge_capabilities() -> Vec<&'static str> {
         // tolerance), so the manager UI MUST gate the pacing dropdown on
         // this capability to avoid the silent-no-op trap.
         "egress_pacing",
+        // Epoch-locked egress: compressed UDP/RTP outputs accept an
+        // `epoch_lock` block, which anchors wire release on the PCR
+        // value itself rather than on a local first-datagram preroll.
+        // Independent nodes carrying the same stream then emit in
+        // alignment with no coordination between them (issue #79).
+        // Requires an explicit `egress_pacing: "pcr"` and a flow
+        // `master_clock.kind = "ptp"` — both enforced by validation, so
+        // a manager that offers this control MUST offer those two
+        // alongside it or the config push will be rejected. Edges
+        // WITHOUT this bit silently ignore the field (serde unknown-
+        // field tolerance), so gate the UI on it to avoid a silent
+        // no-op that looks exactly like success.
+        "epoch-lock",
         // Ingress de-jitter: raw UDP / RTP inputs run the ingress
         // counterpart to the egress servo — recover the source rate from
         // inter-PCR observations and release packets paced at that rate

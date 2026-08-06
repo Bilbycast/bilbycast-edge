@@ -165,6 +165,14 @@ async fn udp_output_loop_302m(
         .into_std()
         .map_err(|e| anyhow::anyhow!("convert tokio UdpSocket -> std: {e}"))?;
     std_socket.set_nonblocking(false)?;
+    // Epoch-locked egress: ms -> ns once, here, so the hot path never
+    // divides. `None` leaves wire_emit on its classic relative anchor.
+    let epoch_lock_params = config.epoch_lock.as_ref().map(|e| {
+        crate::engine::wire_emit::EpochLockParams {
+            offset_ns: e.egress_offset_ms as u64 * 1_000_000,
+            group_label: e.group_label.clone(),
+        }
+    });
     let wire_tx = spawn_wire_emitter(
         format!("{}-302m", config.id),
         std_socket,
@@ -173,6 +181,7 @@ async fn udp_output_loop_302m(
         WirePacingClass::Lossless,
         config.egress_pacing.unwrap_or_default(),
         config.egress_buffer_ms,
+        epoch_lock_params.clone(),
         stats.clone(),
         cancel.clone(),
     );
@@ -245,6 +254,14 @@ async fn udp_output_loop(
         .into_std()
         .map_err(|e| anyhow::anyhow!("convert tokio UdpSocket -> std: {e}"))?;
     std_socket.set_nonblocking(false)?;
+    // Epoch-locked egress: ms -> ns once, here, so the hot path never
+    // divides. `None` leaves wire_emit on its classic relative anchor.
+    let epoch_lock_params = config.epoch_lock.as_ref().map(|e| {
+        crate::engine::wire_emit::EpochLockParams {
+            offset_ns: e.egress_offset_ms as u64 * 1_000_000,
+            group_label: e.group_label.clone(),
+        }
+    });
     let wire_tx = spawn_wire_emitter(
         config.id.clone(),
         std_socket,
@@ -253,6 +270,7 @@ async fn udp_output_loop(
         WirePacingClass::Lossless,
         config.egress_pacing.unwrap_or_default(),
         config.egress_buffer_ms,
+        epoch_lock_params.clone(),
         stats.clone(),
         cancel.clone(),
     );

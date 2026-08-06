@@ -570,6 +570,14 @@ pub fn spawn_wire_emitter(
     pacing: WirePacingClass,
     egress_pacing: EgressPacingMode,
     egress_buffer_ms: Option<u32>,
+    // Epoch-locked egress. `Some` switches PCR anchoring from "first
+    // datagram + preroll" to the analytic derivation in
+    // `engine::epoch_lock`, aligning this output with other nodes
+    // carrying the same stream. `None` (every ST 2110 caller, and any
+    // output without `epoch_lock` configured) keeps the existing relative
+    // anchoring unchanged. Only meaningful with `AnchorSource::Pcr` — the
+    // raster anchor bypasses `derive_target` entirely.
+    epoch_lock: Option<EpochLockParams>,
     stats: Arc<OutputStatsAccumulator>,
     cancel: CancellationToken,
 ) -> WireTxHandle {
@@ -586,6 +594,11 @@ pub fn spawn_wire_emitter(
     // Linux ≥ 4.6. ST 2110 raster targets that arrive in TAI from
     // upstream `St2110_21Pacer` work unchanged.
     let clockid = crate::engine::wire_emit_txtime::CLOCK_TAI;
+
+    // Split once here: the offset travels to `TargetState` on the hot
+    // path, the label only to telemetry at startup.
+    let epoch_offset_ns = epoch_lock.as_ref().map(|e| e.offset_ns);
+    let epoch_group_label = epoch_lock.as_ref().and_then(|e| e.group_label.clone());
 
     // Releaser selection policy. **Default = clock_nanosleep**, *not* SO_TXTIME.
     //
@@ -758,6 +771,14 @@ pub fn spawn_wire_emitter(
             let pinned_to = crate::util::runtime_diag::apply_cpu_pinning(&who, cpu_index);
             stats_for_thread.set_wire_pacing_tier(tier_label(releaser, sched_fifo));
             stats_for_thread.set_wire_pacing_pinned_cpu(pinned_to);
+            if let Some(off_ns) = epoch_offset_ns {
+                // Registering the offset is what makes `epoch_lock`
+                // appear in telemetry at all, so do it before the first
+                // datagram rather than lazily on first anchor — an
+                // output that never receives a PCR should still be
+                // visibly *configured* for epoch lock.
+                stats_for_thread.set_epoch_lock(off_ns / 1_000, epoch_group_label.as_deref());
+            }
             tracing::info!(
                 "wire-emit '{}': starting (anchor={:?}, tier={}, sched_fifo={}, pinned_cpu={:?})",
                 thread_id,
@@ -766,7 +787,10 @@ pub fn spawn_wire_emitter(
                 sched_fifo,
                 pinned_to,
             );
-            run_emitter(thread_id, socket, dest, anchor, releaser, dejitter, stats_for_thread, cancel, rx);
+            run_emitter(
+                thread_id, socket, dest, anchor, releaser, dejitter, epoch_offset_ns,
+                stats_for_thread, cancel, rx,
+            );
         })
         .expect("wire-emit thread spawn");
     tx
@@ -911,6 +935,60 @@ struct TargetState {
     /// trading at most one wire-queue's worth of latency on the
     /// discontinuity packet for spec-compliant ordering.
     last_returned_ns: u64,
+    /// Epoch-locked egress offset in ns, when the operator enabled it on
+    /// this output. `None` = classic relative anchoring, byte-for-byte
+    /// unchanged.
+    ///
+    /// When set, PCR-bearing datagrams anchor *analytically*: the target
+    /// is derived from the PCR value itself rather than from a local
+    /// first-datagram preroll, so nodes carrying the same stream align
+    /// without talking to each other. See [`crate::engine::epoch_lock`].
+    epoch_offset_ns: Option<u64>,
+    /// Most recent shortfall (ns) between the analytic epoch target and
+    /// `now` — how far this node is from being able to honour the
+    /// configured offset. Zero while the target is still in the future.
+    ///
+    /// Only meaningful under `epoch_offset_ns`. Surfaced as telemetry so
+    /// an operator can tell "my offset budget is too tight for this
+    /// node's path" apart from "the group is misaligned".
+    epoch_deficit_ns: u64,
+    /// Whether the analytic anchor has been applied at least once.
+    /// Distinguishes "epoch lock configured but no PCR seen yet" (still
+    /// pacing off the cold-start preroll) from "epoch lock live".
+    epoch_engaged: bool,
+    /// Cached CLOCK_TAI − CLOCK_REALTIME skew in ns.
+    ///
+    /// Sampled by reading both clocks back-to-back, never by differencing
+    /// the caller's `now_ns` against a fresh realtime read — `now_ns` is
+    /// reused across a whole batch, and its staleness would otherwise be
+    /// mistaken for skew and shifted into every target.
+    ///
+    /// Only changes at a leap second, so it is refreshed on a slow timer
+    /// rather than per datagram.
+    epoch_tai_skew_ns: i64,
+    /// `now_ns` after which [`Self::epoch_tai_skew_ns`] is re-sampled.
+    /// Zero forces a sample on first use.
+    epoch_skew_refresh_at_ns: u64,
+}
+
+/// How often to re-sample the TAI−realtime skew. The value only moves at
+/// a leap second, so this is about eventually noticing one, not about
+/// tracking anything. Cheap either way — two vDSO reads.
+const EPOCH_SKEW_REFRESH_NS: u64 = 10_000_000_000;
+
+/// Epoch-locked egress parameters for one output.
+///
+/// Resolved from `EpochLockConfig` at output spawn and handed to the wire
+/// thread. Kept separate from `DejitterConfig` because the two answer
+/// different questions: the dejitter config decides *how smoothly* to
+/// release, this decides *at what absolute instant*.
+#[derive(Debug, Clone)]
+pub struct EpochLockParams {
+    /// Operator's egress offset, pre-converted to ns so the hot path
+    /// never divides.
+    pub offset_ns: u64,
+    /// Operator's group label, telemetry only.
+    pub group_label: Option<String>,
 }
 
 /// Minimum gap (ns) between consecutive `derive_target` returns when
@@ -922,6 +1000,40 @@ struct TargetState {
 const MONOTONIC_TARGET_EPSILON_NS: u64 = 1_000;
 
 impl TargetState {
+    /// Analytic epoch-locked anchor for a PCR-bearing datagram, or `None`
+    /// when epoch lock is not enabled on this output.
+    ///
+    /// This is the whole of the cross-node alignment mechanism: rather
+    /// than advancing a locally-seeded anchor by the observed PCR delta,
+    /// we invert the PCR straight back to the wall instant that generated
+    /// it and add the operator's offset. Two nodes handed the same PCR
+    /// compute the same answer, so their egress lines up without either
+    /// knowing the other exists.
+    ///
+    /// Returns the target on the emitter's CLOCK_TAI timeline, already
+    /// floored at `now_ns`. A target that *wanted* to be in the past means
+    /// this node cannot meet the configured offset; the shortfall is
+    /// recorded in `epoch_deficit_ns` rather than silently absorbed, since
+    /// it is the difference between "the group is misaligned" and "this
+    /// node's budget is too tight" — two problems with different fixes.
+    fn epoch_anchor_ns(&mut self, pcr: u64, now_ns: u64) -> Option<u64> {
+        let offset_ns = self.epoch_offset_ns?;
+        let target = crate::engine::epoch_lock::target_tai_ns(
+            pcr,
+            now_ns,
+            self.epoch_tai_skew_ns,
+            offset_ns,
+        );
+        self.epoch_engaged = true;
+        if target <= now_ns as i128 {
+            self.epoch_deficit_ns = (now_ns as i128 - target).unsigned_abs() as u64;
+            Some(now_ns)
+        } else {
+            self.epoch_deficit_ns = 0;
+            Some(target as u64)
+        }
+    }
+
     /// Compute the target wall instant (CLOCK_MONOTONIC ns) at which
     /// the just-handed datagram should hit the wire. Mutates internal
     /// anchors so the next call sees consistent state.
@@ -985,7 +1097,14 @@ impl TargetState {
     /// caller.
     fn derive_target_raw(&mut self, now_ns: u64, datagram_pcr: Option<u64>, datagram_bytes: usize) -> u64 {
         if !self.initialised {
-            self.wall_anchor_ns = now_ns.saturating_add(PREROLL_NS);
+            // Epoch lock anchors on the PCR itself, so a cold start needs
+            // no preroll guess — the very first PCR-bearing datagram
+            // lands on the group's shared timeline immediately. Without a
+            // PCR we still have nothing to invert, so fall through to the
+            // classic preroll and pick up the anchor on the first PCR.
+            self.wall_anchor_ns = datagram_pcr
+                .and_then(|pcr| self.epoch_anchor_ns(pcr, now_ns))
+                .unwrap_or_else(|| now_ns.saturating_add(PREROLL_NS));
             self.bytes_since_anchor = 0;
             self.initialised = true;
             if let Some(pcr) = datagram_pcr {
@@ -997,6 +1116,60 @@ impl TargetState {
         }
 
         if let Some(pcr) = datagram_pcr {
+            // ── Epoch-locked anchoring ──────────────────────────────
+            //
+            // Placed ahead of every relative-anchoring case on purpose,
+            // including the discontinuity reset below. Under epoch lock a
+            // PCR discontinuity is not a special case: the target depends
+            // only on the PCR value in hand, never on where the previous
+            // anchor sat, so an input switch or source restart re-anchors
+            // correctly on its own. Routing a discontinuity through the
+            // "reset to now" branch would be actively wrong — it would
+            // silently drop this node off the group's timeline exactly
+            // when the stream changed, which is the moment an operator is
+            // least likely to be watching for it.
+            //
+            // The classic relative path below is untouched when epoch
+            // lock is off.
+            if self.epoch_offset_ns.is_some() {
+                // Keep the inter-PCR interval bookkeeping fed so non-PCR
+                // datagrams still interpolate across the interval instead
+                // of clumping on the anchor and bursting once per PCR.
+                if let Some(prev) = self.pcr_anchor {
+                    let delta_27 = pcr.wrapping_sub(prev) as i64;
+                    if (0..=PCR_DISCONTINUITY_27MHZ).contains(&delta_27) {
+                        let delta_ns = (delta_27 as u64) * 1000 / 27;
+                        if delta_ns >= 1_000_000 && self.bytes_since_anchor > 0 {
+                            self.prev_interval_bytes = self.bytes_since_anchor;
+                            self.prev_interval_ns = delta_ns;
+                            let observed_bps = self
+                                .bytes_since_anchor
+                                .saturating_mul(8 * 1_000_000_000)
+                                / delta_ns;
+                            self.observed_rate_bps = if self.observed_rate_bps == 0 {
+                                observed_bps
+                            } else {
+                                (3 * self.observed_rate_bps + observed_bps) / 4
+                            };
+                        }
+                    } else {
+                        // Genuine discontinuity: the old interval no
+                        // longer describes the new stream, so drop it
+                        // rather than interpolate the next datagrams
+                        // against a stale rate.
+                        self.prev_interval_bytes = 0;
+                        self.prev_interval_ns = 0;
+                        self.observed_rate_bps = 0;
+                    }
+                }
+                if let Some(epoch_target) = self.epoch_anchor_ns(pcr, now_ns) {
+                    self.pcr_anchor = Some(pcr);
+                    self.wall_anchor_ns = epoch_target;
+                    self.bytes_since_anchor = 0;
+                    return epoch_target;
+                }
+            }
+
             if let Some(prev) = self.pcr_anchor {
                 let delta_27 = pcr.wrapping_sub(prev) as i64;
                 // Discontinuity: backwards by any meaningful amount, or
@@ -1369,6 +1542,52 @@ fn shed_stale_backlog(
     shed
 }
 
+/// Sample the CLOCK_TAI − CLOCK_REALTIME skew by reading both clocks
+/// back-to-back.
+///
+/// Deliberately *not* derived from a `now_ns` the caller is already
+/// holding: that value is reused across a whole batch, and its staleness
+/// would be indistinguishable from real skew.
+fn sample_tai_skew_ns() -> i64 {
+    let tai = monotonic_now_ns();
+    let realtime = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    crate::engine::epoch_lock::tai_minus_realtime_ns(tai, realtime)
+}
+
+/// Keep `TargetState`'s cached TAI skew fresh on a slow timer.
+///
+/// Lives here rather than inside `TargetState` so that type stays a pure
+/// function of its inputs — it is covered by a large unit-test suite that
+/// would otherwise be at the mercy of the host's leap-second data.
+#[inline]
+fn refresh_epoch_skew(state: &mut TargetState, now_ns: u64) {
+    if state.epoch_offset_ns.is_none() {
+        return;
+    }
+    if state.epoch_skew_refresh_at_ns == 0 || now_ns >= state.epoch_skew_refresh_at_ns {
+        state.epoch_tai_skew_ns = sample_tai_skew_ns();
+        state.epoch_skew_refresh_at_ns = now_ns.saturating_add(EPOCH_SKEW_REFRESH_NS);
+    }
+}
+
+/// Push the latest epoch-lock anchor outcome to telemetry.
+///
+/// Kept outside `TargetState` so that type stays a pure, allocation-free
+/// function of its inputs — it carries a large unit-test suite that would
+/// otherwise need a stats handle threaded through every case.
+///
+/// A no-op unless epoch lock is both configured and engaged, so the
+/// classic pacing path pays one predictable branch.
+#[inline]
+fn report_epoch_deficit(state: &TargetState, stats: &OutputStatsAccumulator) {
+    if state.epoch_offset_ns.is_some() && state.epoch_engaged {
+        stats.record_epoch_lock_anchor(state.epoch_deficit_ns / 1_000);
+    }
+}
+
 fn run_emitter(
     id: String,
     socket: UdpSocket,
@@ -1376,11 +1595,15 @@ fn run_emitter(
     anchor: AnchorSource,
     releaser: Releaser,
     dejitter: DejitterConfig,
+    epoch_offset_ns: Option<u64>,
     stats: Arc<OutputStatsAccumulator>,
     cancel: CancellationToken,
     rx: WireTxReceiver,
 ) {
-    let mut state = TargetState::default();
+    let mut state = TargetState {
+        epoch_offset_ns,
+        ..TargetState::default()
+    };
     let mut packets_since_drain: u64 = 0;
     let mut pending: Option<PendingDatagram> = None;
     // Initial capacity covers a typical TS inter-PCR window (~20 dgms)
@@ -1467,6 +1690,7 @@ fn run_emitter(
                 }
                 let pcr_27mhz = pcr_with_pid.map(|(pcr, _)| pcr);
 
+                refresh_epoch_skew(&mut state, now_ns);
                 let target_ns = match anchor {
                     AnchorSource::Pcr => state.derive_target_paced(
                         now_ns,
@@ -1477,6 +1701,7 @@ fn run_emitter(
                     ),
                     AnchorSource::St2110Raster => dg.target_tx_time_ns.unwrap_or(now_ns),
                 };
+                report_epoch_deficit(&state, &stats);
                 (dg, target_ns, pcr_27mhz)
             }
         };
@@ -1598,6 +1823,7 @@ fn run_emitter(
                             }
                         }
                         let next_pcr_27mhz = next_pcr_with_pid.map(|(pcr, _)| pcr);
+                        refresh_epoch_skew(&mut state, now_ns);
                         let next_target = state.derive_target_paced(
                             now_ns,
                             next_pcr_27mhz,
@@ -1605,6 +1831,7 @@ fn run_emitter(
                             rx.depth.load(Ordering::Relaxed),
                             &dejitter,
                         );
+                        report_epoch_deficit(&state, &stats);
                         if next_target <= now_ns {
                             batch.push(BatchEntry {
                                 dg: next_dg,
@@ -2097,6 +2324,7 @@ mod tests {
             WirePacingClass::Lossless,
             EgressPacingMode::Forward,
             None,
+            None, // epoch_lock: raster-anchored, N/A
             stats.clone(),
             cancel.clone(),
         );
@@ -2152,6 +2380,7 @@ mod tests {
             WirePacingClass::EtfEligible,
             EgressPacingMode::Forward,
             None,
+            None, // epoch_lock: raster-anchored, N/A
             stats.clone(),
             cancel.clone(),
         );
@@ -2249,6 +2478,140 @@ mod tests {
              miss the PCR (this is what justified the ts_offset field); \
              if this assertion ever fails the fixture has changed"
         );
+    }
+
+    // ── Epoch-locked egress ─────────────────────────────────────────────
+
+    /// Build a `TargetState` with epoch lock armed at `offset_ms`.
+    ///
+    /// Skew is pinned to zero and the refresh timer parked far in the
+    /// future, so the harness can treat "TAI" and "realtime" as one
+    /// domain. Without that these tests would silently depend on whether
+    /// the build host has leap-second data loaded (a 37 s difference).
+    fn epoch_state(offset_ms: u64) -> TargetState {
+        TargetState {
+            epoch_offset_ns: Some(offset_ms * 1_000_000),
+            epoch_tai_skew_ns: 0,
+            epoch_skew_refresh_at_ns: u64::MAX,
+            ..TargetState::default()
+        }
+    }
+
+    /// A PCR value an epoch-locked master would emit `ago_ms` ago, plus the
+    /// matching CLOCK_TAI reading for "now" (TAI == realtime on this host's
+    /// test harness, which is the conservative case).
+    fn pcr_generated_ms_ago(ago_ms: u64) -> (u64, u64) {
+        let now_realtime = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock is after the UNIX epoch")
+            .as_nanos();
+        let generated = now_realtime - (ago_ms as u128 * 1_000_000);
+        let pcr = crate::engine::epoch_lock::pcr_27mhz_from_unix_ns(generated);
+        (pcr, now_realtime as u64)
+    }
+
+    /// The core claim: the target is a function of the PCR, not of when
+    /// this emitter happened to start. Two states created at different
+    /// moments, fed the same PCR, must agree.
+    ///
+    /// This is the property that makes nodes align without coordinating,
+    /// so it is worth asserting directly rather than inferring from
+    /// pacing behaviour.
+    #[test]
+    fn epoch_targets_depend_only_on_the_pcr_not_on_start_time() {
+        let (pcr, now_tai) = pcr_generated_ms_ago(0);
+        // Offset comfortably exceeds the start-time difference below, so
+        // both states can actually meet the target. (When one cannot, it
+        // clamps to `now` and emits immediately — that is the deficit
+        // path, covered separately; it is a difference in *ability to
+        // meet* the target, not in the target itself.)
+        let mut early = epoch_state(500);
+        let mut late = epoch_state(500);
+        // `late` starts a quarter second after `early` — under classic
+        // anchoring that difference lands directly in the target.
+        let t_early = early.derive_target_raw(now_tai, Some(pcr), 1316);
+        let t_late = late.derive_target_raw(now_tai + 250_000_000, Some(pcr), 1316);
+        assert_eq!(t_early, 0u64.max(t_late).max(t_early), "sanity");
+        let divergence = t_early.abs_diff(t_late);
+        assert!(
+            divergence <= 1_000,
+            "epoch targets diverged by {divergence} ns for the same PCR —              they must not depend on emitter start time"
+        );
+        assert_eq!(early.epoch_deficit_ns, 0);
+        assert_eq!(late.epoch_deficit_ns, 0);
+    }
+
+    /// A PCR older than the configured offset cannot be honoured. The
+    /// emitter must say so via `epoch_deficit_ns` rather than quietly
+    /// emitting late and looking healthy.
+    #[test]
+    fn epoch_reports_a_deficit_when_the_offset_cannot_be_met() {
+        // Offset budget 100 ms, but the PCR is already 400 ms old.
+        let (pcr, now_tai) = pcr_generated_ms_ago(400);
+        let mut s = epoch_state(100);
+        let target = s.derive_target_raw(now_tai, Some(pcr), 1316);
+        assert_eq!(target, now_tai, "a missed target must emit immediately");
+        assert!(s.epoch_engaged);
+        let deficit_ms = s.epoch_deficit_ns / 1_000_000;
+        assert!(
+            (250..=350).contains(&deficit_ms),
+            "expected a ~300 ms deficit, got {deficit_ms} ms"
+        );
+    }
+
+    /// Healthy case: a fresh PCR with a generous offset targets the
+    /// future and reports no deficit.
+    #[test]
+    fn epoch_reports_no_deficit_when_the_offset_is_comfortable() {
+        let (pcr, now_tai) = pcr_generated_ms_ago(10);
+        let mut s = epoch_state(500);
+        let target = s.derive_target_raw(now_tai, Some(pcr), 1316);
+        assert!(target > now_tai, "a met target must sit in the future");
+        assert_eq!(s.epoch_deficit_ns, 0);
+        assert!(s.epoch_engaged);
+    }
+
+    /// A PCR discontinuity — an input switch, a source restart — must not
+    /// knock the output off the group timeline. Under classic anchoring
+    /// this resets pacing to "now"; under epoch lock the new PCR is just
+    /// as invertible as the old one, so alignment survives.
+    #[test]
+    fn epoch_survives_a_pcr_discontinuity() {
+        let (pcr_a, now_tai) = pcr_generated_ms_ago(10);
+        let mut s = epoch_state(500);
+        let _ = s.derive_target_raw(now_tai, Some(pcr_a), 1316);
+        // New source: PCR jumps by hours, far beyond the discontinuity
+        // threshold the relative path would trip on.
+        let jumped = pcr_a.wrapping_add(90_000 * 27_000);
+        let target = s.derive_target_raw(now_tai + 40_000_000, Some(jumped), 1316);
+        assert_ne!(
+            target,
+            now_tai + 40_000_000,
+            "discontinuity fell through to the relative 'reset to now' path"
+        );
+        assert!(s.epoch_engaged);
+    }
+
+    /// Epoch lock off must leave the existing pacing byte-for-byte
+    /// unchanged — the classic path is load-bearing for every output that
+    /// does not opt in.
+    #[test]
+    fn epoch_disabled_leaves_classic_anchoring_untouched() {
+        let mut classic = TargetState::default();
+        let mut also_classic = TargetState {
+            epoch_offset_ns: None,
+            ..TargetState::default()
+        };
+        let now = 1_000_000_000u64;
+        for (i, pcr) in [900_000u64, 1_800_000, 2_700_000].iter().enumerate() {
+            let step = now + i as u64 * 33_000_000;
+            assert_eq!(
+                classic.derive_target(step, Some(*pcr), 1316),
+                also_classic.derive_target(step, Some(*pcr), 1316),
+            );
+        }
+        assert!(!classic.epoch_engaged);
+        assert_eq!(classic.epoch_deficit_ns, 0);
     }
 
     // ── Egress de-jitter: residence-cap shed (Phase 1) ──────────────────
