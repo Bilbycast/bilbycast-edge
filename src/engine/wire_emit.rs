@@ -1804,6 +1804,17 @@ fn refresh_epoch_skew(state: &mut TargetState, now_ns: u64) {
 #[inline]
 fn report_epoch_deficit(state: &TargetState, stats: &OutputStatsAccumulator, had_pcr: bool) {
     if state.epoch_offset_ns.is_some() && had_pcr {
+        // Mint observation, only while unarmed: once the emitter is
+        // dwelling, its dequeue instant no longer answers "when did this
+        // node have this content".
+        if state.epoch_anchor.is_none() {
+            if let Some(pcr) = state.pcr_anchor {
+                // CLOCK_TAI -> CLOCK_REALTIME with the skew already cached
+                // for the derivation, so this costs no extra clock read.
+                let unix_ns = state.last_returned_ns as i128 - state.epoch_tai_skew_ns as i128;
+                stats.record_epoch_mint_observation(pcr, unix_ns as i64);
+            }
+        }
         stats.record_epoch_lock_anchor(
             state.epoch_engaged,
             state.epoch_deficit_ns / 1_000,

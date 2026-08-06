@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
@@ -186,6 +186,17 @@ pub struct OutputStatsAccumulator {
     /// important bit in this struct: it is the difference between
     /// "aligned" and "quietly pacing itself".
     pub epoch_lock_disengaged: AtomicBool,
+    /// Mint observation: the most recent `(source PCR, wall instant at
+    /// which this node had that content ready to release)`, published only
+    /// while the output is **not yet armed** with a group anchor.
+    ///
+    /// This is what the manager mints from. It is sampled before the egress
+    /// dwell begins — sampling after it (which is where `PcrTrust` samples)
+    /// would fold the offset back into the anchor and double-count it.
+    /// Once armed the pair stops updating, because a dwelling emitter's
+    /// dequeue instant no longer answers "when did this node have it".
+    pub epoch_mint_pcr_27mhz: AtomicU64,
+    pub epoch_mint_unix_ns: AtomicI64,
     /// Hot-swappable home for this output's epoch-lock group anchor.
     ///
     /// Lives on the stats accumulator because that is already the one
@@ -917,6 +928,8 @@ impl OutputStatsAccumulator {
             epoch_lock_disengaged: AtomicBool::new(false),
             epoch_lock_anchor_generation: AtomicU64::new(0),
             epoch_anchor_cell: Arc::new(crate::engine::epoch_lock::EpochAnchorCell::new()),
+            epoch_mint_pcr_27mhz: AtomicU64::new(0),
+            epoch_mint_unix_ns: AtomicI64::new(0),
             wire_short_write: AtomicU64::new(0),
             wire_pacing_pinned_cpu: AtomicI32::new(-1),
             egress_shed: AtomicU64::new(0),
@@ -948,6 +961,14 @@ impl OutputStatsAccumulator {
     /// output that disengages stops claiming to be aligned. Latching it
     /// would leave a node that lost its source hours ago still reporting
     /// `engaged: true, deficit: 0`.
+    /// Publish a mint observation. See the field docs for why this is only
+    /// meaningful before the group anchor arrives.
+    #[inline]
+    pub fn record_epoch_mint_observation(&self, pcr_27mhz: u64, unix_ns: i64) {
+        self.epoch_mint_pcr_27mhz.store(pcr_27mhz, Ordering::Relaxed);
+        self.epoch_mint_unix_ns.store(unix_ns, Ordering::Relaxed);
+    }
+
     #[inline]
     pub fn record_epoch_lock_anchor(
         &self,
@@ -1594,6 +1615,8 @@ impl OutputStatsAccumulator {
                 anchor_generation: self
                     .epoch_lock_anchor_generation
                     .load(Ordering::Relaxed) as u32,
+                mint_pcr_27mhz: self.epoch_mint_pcr_27mhz.load(Ordering::Relaxed),
+                mint_unix_ns: self.epoch_mint_unix_ns.load(Ordering::Relaxed),
             }),
             wire_short_write: self.wire_short_write.load(Ordering::Relaxed),
             wire_pacing_pinned_cpu: {

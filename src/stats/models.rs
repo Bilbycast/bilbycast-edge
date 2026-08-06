@@ -2534,4 +2534,16 @@ pub struct EpochLockStats {
     /// their anchors — a fault no other field would reveal.
     #[serde(default)]
     pub anchor_generation: u32,
+    /// Mint observation: a source PCR this node saw, and the wall instant
+    /// it had that content ready to release. Zero once the group anchor is
+    /// armed — see `OutputStatsAccumulator::epoch_mint_pcr_27mhz`.
+    ///
+    /// The manager normalises every member's pair onto one reference PCR
+    /// and anchors on the **slowest**, which is what makes the required
+    /// egress dwell the inter-node latency *spread* rather than the
+    /// absolute end-to-end latency.
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub mint_pcr_27mhz: u64,
+    #[serde(default)]
+    pub mint_unix_ns: i64,
 }
