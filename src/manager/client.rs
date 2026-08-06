@@ -3153,14 +3153,10 @@ async fn execute_command(
                                 &old_config.inputs,
                                 &new_config.inputs,
                             );
-                            let restart_required = old_flow.bandwidth_limit != new_flow.bandwidth_limit
-                                || !edited_inputs.is_empty();
-                            if !edited_inputs.is_empty() {
-                                tracing::info!(
-                                    "Config diff: flow '{id}' restarting because input definition(s) changed: {}",
-                                    edited_inputs.join(", ")
-                                );
-                            }
+                            let bandwidth_limit_changed =
+                                old_flow.bandwidth_limit != new_flow.bandwidth_limit;
+                            let restart_required =
+                                bandwidth_limit_changed || !edited_inputs.is_empty();
                             let persist_only_meta_changed = old_flow.name != new_flow.name
                                 || old_flow.media_analysis != new_flow.media_analysis
                                 || old_flow.thumbnail != new_flow.thumbnail
@@ -3191,7 +3187,8 @@ async fn execute_command(
 
                             if force_restart {
                                 tracing::info!(
-                                    "Config diff: restarting flow '{id}' (input_touches_hitless={input_touches_hitless}, bandwidth_limit changed={restart_required})"
+                                    "Config diff: restarting flow '{id}' (input_touches_hitless={input_touches_hitless}, bandwidth_limit changed={bandwidth_limit_changed}, input definitions changed=[{}])",
+                                    edited_inputs.join(", ")
                                 );
                                 let _ = flow_manager.destroy_flow(id).await;
                                 match new_config.resolve_flow(new_flow) {
@@ -5347,9 +5344,9 @@ fn changed_input_definitions(
     old: &[InputDefinition],
     new: &[InputDefinition],
 ) -> Vec<String> {
-    let find = |list: &[InputDefinition], id: &str| {
-        list.iter().find(|item| item.id == id).cloned()
-    };
+    fn find<'a>(list: &'a [InputDefinition], id: &str) -> Option<&'a InputDefinition> {
+        list.iter().find(|item| item.id == id)
+    }
     let mut changed = Vec::new();
     for id in ids {
         let (Some(before), Some(after)) = (find(old, id), find(new, id)) else {
@@ -5485,6 +5482,77 @@ mod input_definition_diff_tests {
             changed_input_definitions(&ids(&["a", "b"]), &before, &after),
             vec!["a", "b"]
         );
+    }
+
+    /// **A manager echo must not restart anything.** This is the load-bearing
+    /// precondition of the whole comparison, and it is invisible: the manager
+    /// does not rebuild an input from its own model, it caches the JSON
+    /// `GetConfig` handed it and pushes that blob back with one key patched
+    /// (`push_device_name_to_edge` does exactly this for a rename). So the
+    /// `old` side of the diff is an edge-native struct and the `new` side is
+    /// that same struct after a serialize → deserialize trip. Any asymmetry —
+    /// a lossy custom deserializer, a `default` that disagrees with what was
+    /// serialized — turns a node rename into a restart of every flow on it.
+    ///
+    /// Verified across all 97 input definitions in `testbed/configs/` (16
+    /// types) at the time of writing; pinned here on the variants that carry
+    /// the asymmetry risk, since the testbed is a sibling repo and not
+    /// checked out in CI.
+    #[test]
+    fn a_manager_round_trip_is_not_an_edit() {
+        // `equalization: true` is the legacy boolean form, normalised by
+        // `de_bond_equalization_mode` and re-emitted as `"auto"`; the explicit
+        // `interface_addr: null` is dropped entirely by
+        // `skip_serializing_if`. Both differ as JSON across the trip and must
+        // still compare equal as structs.
+        let fixtures = [
+            serde_json::json!({
+                "id": "srt-in", "name": "SRT ingest", "type": "srt",
+                "mode": "listener", "local_addr": "0.0.0.0:9300", "latency_ms": 500,
+                "audio_encode": {"codec": "mp2", "bitrate_kbps": 192},
+                "video_encode": {"codec": "x264", "bitrate_kbps": 2000,
+                                 "preset": "veryfast", "profile": "high"}
+            }),
+            serde_json::json!({
+                "id": "udp-in", "name": "UDP", "type": "udp",
+                "bind_addr": "0.0.0.0:5020", "interface_addr": null, "active": true
+            }),
+            serde_json::json!({
+                "id": "bond-in", "name": "Bond RX", "type": "bonded",
+                "bond_flow_id": 303, "hold_ms": 800, "equalization": true,
+                "paths": [{"id": 0, "name": "lte-0",
+                           "transport": {"type": "udp", "bind": "0.0.0.0:7300"}}]
+            }),
+            serde_json::json!({
+                "id": "mp-in", "name": "Player", "type": "media_player",
+                "active": false, "loop_playback": true,
+                "sources": [{"kind": "ts", "name": "clip.ts"}]
+            }),
+            serde_json::json!({
+                "id": "aud-in", "name": "2110-30 RX", "type": "st2110_30",
+                "bind_addr": "239.83.10.31:20002", "interface_addr": "10.1.1.100",
+                "sample_rate": 48000, "bit_depth": 24, "channels": 2,
+                "packet_time_us": 1000, "payload_type": 97
+            }),
+        ];
+
+        for fixture in fixtures {
+            let on_edge: InputDefinition =
+                serde_json::from_value(fixture.clone()).expect("fixture parses");
+            // What GetConfig ships, cached verbatim by the manager.
+            let shipped = serde_json::to_value(&on_edge).expect("serialize");
+            // What update_config hands back.
+            let echoed: InputDefinition =
+                serde_json::from_value(shipped.clone()).expect("echo parses");
+
+            let id = on_edge.id.clone();
+            let reshipped = serde_json::to_value(&echoed).expect("serialize twice");
+            assert!(
+                changed_input_definitions(&ids(&[&id]), &[on_edge], &[echoed]).is_empty(),
+                "'{id}' would restart its flow on an unmodified manager echo",
+            );
+            assert_eq!(shipped, reshipped, "'{id}' does not serialize idempotently");
+        }
     }
 }
 
