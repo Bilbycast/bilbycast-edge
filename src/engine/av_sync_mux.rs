@@ -186,9 +186,19 @@ pub fn wallclock_pacer() -> AvSyncPacer {
 /// jitter (T-STD spec is ≤ 500 ns; we measured stdev 176 ms, max 423
 /// ms on a transcoded UDP loopback feed). The legacy path is
 /// deterministic — every output of a flow that emits the same source
-/// PTS produces the same PCR, so cross-edge coherence (the original
-/// motivation for the master-clock PCR) is preserved without sampling
-/// jitter.
+/// PTS produces the same PCR, without sampling jitter.
+///
+/// **This function is content-invariant; the pipeline it sits in is not.**
+/// An earlier version of this comment claimed the legacy path "preserves
+/// cross-edge coherence". That is false as wired, and the claim helped
+/// send PR #83 in the wrong direction. `ts_pts_rewriter` runs at *ingress*
+/// (`input_post_process`, stage 4) while the transcoder runs *per output*,
+/// so the "source PTS" handed in here has already been re-stamped against
+/// this node's own wall clock. Measured: two nodes fed identical bytes
+/// with a 120 ms ingest-latency difference emit PCRs 120 ms apart through
+/// this path with a muxer-mode upstream, and 0 ms apart with
+/// `passthrough_clock: true`. This function launders whatever it is
+/// handed; coherence is a property of what feeds it.
 ///
 /// The pacer parameter is retained for API stability and for non-PCR
 /// uses of the master clock (telemetry, lipsync trim, future

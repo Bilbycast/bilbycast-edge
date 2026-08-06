@@ -456,6 +456,28 @@ impl FlowManager {
     /// an `Arc<FlowRuntime>` clone so they can read runtime handles
     /// (e.g. the PID-bus assembler's `plan_tx` for `update_flow_assembly`)
     /// without holding the DashMap shard lock.
+    /// Find a running output's stats accumulator by output id, across
+    /// every flow.
+    ///
+    /// Outputs are unique across flows (assignment uniqueness is enforced
+    /// at validation), so the first match is the only match. Used by the
+    /// control plane to reach per-output shared state — currently the
+    /// epoch-lock anchor cell — without threading a second registry
+    /// alongside the stats one.
+    pub fn output_stats(
+        &self,
+        output_id: &str,
+    ) -> Option<Arc<crate::stats::collector::OutputStatsAccumulator>> {
+        self.flows.iter().find_map(|entry| {
+            entry
+                .value()
+                .stats
+                .output_stats
+                .get(output_id)
+                .map(|o| o.value().clone())
+        })
+    }
+
     pub fn get_runtime(&self, flow_id: &str) -> Option<Arc<FlowRuntime>> {
         self.flows.get(flow_id).map(|r| r.value().clone())
     }

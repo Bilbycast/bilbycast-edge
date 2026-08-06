@@ -1173,11 +1173,13 @@ mod inner {
                         }
                         let pts_for_pes = queued.unwrap_or(self.pts_90k);
                         let pes = build_video_pes(&ef.data, pts_for_pes);
-                        // PCR comes from the master clock when a flow-
-                        // wide pacer is attached (broadcast-grade emit);
-                        // otherwise fall back to the legacy pts*300 −
-                        // preroll derivation so unit tests + non-mastered
-                        // call sites keep their existing behaviour.
+                        // PCR is derived from the source PES PTS —
+                        // `pcr_for_emit` takes the pacer for API
+                        // stability and ignores it (sampling the master
+                        // clock at the encoder boundary measured stdev
+                        // 176 ms of PCR jitter; see its doc comment).
+                        // The argument is retained rather than dropped
+                        // because non-PCR uses of the pacer are planned.
                         let pcr_27mhz = crate::engine::av_sync_mux::pcr_for_emit(
                             self.av_sync_pacer.as_ref(),
                             pts_for_pes,

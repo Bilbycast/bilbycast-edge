@@ -425,3 +425,139 @@ grandmaster (Meinberg, ESI, FsPro, or similar).
   egress-side ETF qdisc setup for SO_TXTIME wire pacing. Independent of
   the GM helper; production-only, and the userspace
   `clock_nanosleep(CLOCK_TAI)` tier is the default elsewhere.
+
+---
+
+## Cross-node egress alignment (`epoch_lock`)
+
+Two edges receiving the same contribution feed over independent paths do
+not, by default, emit the same content at the same wall-clock instant.
+Each node's egress phase is set by its own ingest latency, so the two
+streams sit apart by the difference between those paths — routinely
+hundreds of milliseconds. Cutting between them downstream produces a
+visible jump in content and in receiver buffer occupancy.
+
+`epoch_lock` removes that difference. It is configured per compressed
+UDP/RTP output and requires a manager-minted group anchor.
+
+### How it works
+
+The wire emitter normally anchors on the first datagram it sees
+(`now + PREROLL_NS`). Under epoch lock it instead derives each
+PCR-bearing datagram's release instant analytically:
+
+```
+release_instant = anchor.unix_ns
+                + (pcr − anchor.pcr_27mhz) × 1000/27      # source ticks → ns
+                + egress_offset_ms
+```
+
+Every member runs identical arithmetic on an identical PCR and an
+identical anchor, so alignment falls out of the maths rather than from a
+control loop. The derivation reads **no local clock at all** — that is the
+property that makes it work, and it is checkable by inspection in
+`engine::epoch_lock::unix_ns_from_pcr_anchored`.
+
+### The precondition that actually matters
+
+**The PCR reaching the emitter must be a function of the content, not of
+the node.** That is only true where `engine::ts_pts_rewriter` is out of
+the path:
+
+| Path | Output PCR | Usable? |
+|---|---|---|
+| `passthrough_clock: true` on every input | `= src_pcr`, byte-for-byte | **yes** |
+| `bonded` input (never builds an `InputPostProcess`) | `= src_pcr` | **yes** |
+| Default muxer mode | `T_first_ingest(this node) + Δsrc − 80 ms` | no |
+| Transcoded output | inherits the above, plus a per-node audio-lag servo | no |
+| PID-bus assembled flow | assembler's own anchor, seeded by this node's slot fan-in order | no |
+
+In muxer mode `rewrite_pcr_value` samples the master clock **once**, at
+the first PCR it sees, and free-runs on source deltas after that. The
+emitted PCR therefore carries this node's ingest instant as a fixed
+additive term — exactly the quantity alignment has to cancel.
+
+**Trade-off:** `passthrough_clock: true` also disables PES PTS
+regeneration and the discontinuity bridge on that input. Alignment and
+PCR/PTS regeneration are mutually exclusive.
+
+### The group anchor
+
+A free-running source PCR has no relationship to wall time, so the
+mapping must come from outside the node. The manager mints one
+`(pcr_27mhz, unix_ns)` pair and pushes it byte-identically to every
+member via the `set_epoch_anchor` command.
+
+`unix_ns` is a **label**, not the true origination instant. The manager
+mints it from the **slowest member's** observed arrival plus a margin, so
+each member's required egress dwell is its lead over the slowest — not its
+absolute end-to-end latency. That distinction is what keeps a WAN
+contribution path clear of the wire-emit residence cap: anchoring on true
+origination would demand a dwell equal to the full SRT latency buffer.
+
+Re-mints carry `effective_from_pcr` so every member switches on the same
+*packet* rather than at the same moment on its own clock. Without that,
+the switch opens a divergence window equal to the whole anchor step.
+
+### Sizing `egress_offset_ms`
+
+Bounded 150–800 ms, and both ends are derived rather than chosen:
+
+- **Floor** — output PCR trails the master by `PCR_PREROLL_27MHZ` (80 ms)
+  plus local mux/fan-out depth. Below that no future target exists and the
+  node sits at a permanent deficit.
+- **Ceiling** — epoch lock forces `egress_pacing: "pcr"`, under which
+  `egress_buffer_ms` is rejected, so `DejitterConfig::lossless` pins the
+  residence cap at 1000 ms with no operator override. Dwell is measured
+  from enqueue, so an offset at or above the cap makes
+  `shed_stale_backlog` fire on essentially every datagram — measured at
+  84–96 % sustained loss, and bitrate-independent.
+
+The offset must be **identical on every member**. A mismatch misaligns the
+group by exactly the difference, with every node reporting healthy.
+
+There is also a bitrate ceiling, because the dwell is held in the
+fixed 8192-slot wire channel (`86.2 Mbit` at 1316-byte datagrams):
+sustainable rate ≈ `86.2 Mbit / (offset − 80 ms)`. At 250 ms that is
+~520 Mbps; at 500 ms ~208 Mbps. Multi-gigabit and a large offset are
+mutually exclusive.
+
+### Telemetry
+
+`OutputStats.epoch_lock` carries `engaged`, `disengaged`, `deficit_us`,
+`deficit_max_us`, `clamped`, `implausible`, and `anchor_generation`.
+
+- `deficit_us` — this node released **late**: it cannot meet the offset.
+  Remedy: raise the offset, or fix the slow path.
+- `clamped` — this node released **early**: the target exceeded what the
+  emitter will hold. Opposite remedy. Reported separately for that reason.
+- `disengaged` — the plausibility gate took this output off the analytic
+  anchor because the PCR is not on the group timeline. The output is
+  running, but it is *not aligned*.
+- `anchor_generation` — members on different generations are misaligned by
+  the difference between their anchors, which no other field reveals.
+
+**This is not an alignment measurement.** A node cannot verify its own
+alignment; that needs an external observer timestamping every member
+against one clock.
+
+### Scope
+
+Single-input, single-program, non-transcoded, non-assembled UDP/RTP
+forwarding. Two independent encoders do not produce the same bitstream, so
+transcoded outputs can never be aligned this way. Locally originated
+sources (`test_pattern`, `media_player`, `replay`, `sdi`, `webrtc`) are not
+carrying the same content as a peer in the first place.
+
+Gives a clean downstream **cut**, not a seamless 2022-7 merge — RTP
+sequence numbers remain per-node counters.
+
+### Verification
+
+A single node cannot prove alignment. Before trusting this on air, capture
+both members on one host against a PTP-disciplined PHC with hardware
+`SO_TIMESTAMPING`, cross-correlate identical TS payload bytes, and report
+Δ emission p50/p99/max over ≥ 1 h. Gates 3, 4, 5, 6, 7 and 8 from
+`testbed/BROADCAST_QUALITY_GATES.md` all apply — in particular Gate 4
+(PCR_AC) with epoch lock on versus off on the identical output, since
+`egress_pacing: "pcr"` re-times every datagram.

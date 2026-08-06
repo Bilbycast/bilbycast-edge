@@ -1166,6 +1166,11 @@ pub struct OutputStats {
     /// field — old managers ignore it.
     #[serde(default, skip_serializing_if = "is_zero_u64")]
     pub wire_pacing_late: u64,
+    /// Epoch-locked egress state, when this output has `epoch_lock`
+    /// configured. Absent on every other output. Backward-compatible
+    /// additive field — old managers ignore it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub epoch_lock: Option<EpochLockStats>,
     /// Datagrams dropped by a partial `sendmmsg` short-write (transient
     /// socket-buffer pressure / ENOBUFS on the batch send path). Separate from
     /// `wire_pacing_late` so socket backpressure on the default release path is
@@ -2470,4 +2475,75 @@ pub struct ThumbnailStats {
     /// AU" from "no buffered AUs to decode" without enabling debug logs.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
+}
+
+
+/// Per-output epoch-locked egress telemetry.
+///
+/// Present only on UDP/RTP outputs with `epoch_lock` configured. The
+/// operator question this answers is "is this node holding the group
+/// timeline, and if not, is that because its budget is too tight?"
+///
+/// Deliberately **not** an alignment measurement. A node cannot verify
+/// its own alignment — that needs an external observer timestamping all
+/// members against one clock (see the verification rig in issue #79).
+/// What is reported here is what the node can honestly know: the offset
+/// it was asked to hold, whether it has engaged, and by how much it is
+/// failing to meet it.
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct EpochLockStats {
+    /// Operator group label, if one was set. UI grouping only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub group_label: Option<String>,
+    /// The configured egress offset this output is holding, in µs.
+    pub egress_offset_us: u64,
+    /// True once the analytic anchor has been applied at least once.
+    /// False means epoch lock is configured but no PCR has arrived, so
+    /// the output is still on its cold-start preroll.
+    pub engaged: bool,
+    /// Current shortfall in µs — how far into the past the analytic
+    /// target had already slipped. 0 is healthy. Sustained non-zero
+    /// means `egress_offset_ms` is too tight for this node's path, and
+    /// this node is lagging the rest of the group.
+    pub deficit_us: u64,
+    /// High-water mark of `deficit_us` since output start.
+    pub deficit_max_us: u64,
+    /// Times the analytic target was truncated by the future-lookahead
+    /// ceiling — this node released **early** relative to the group.
+    ///
+    /// The mirror image of `deficit_us`, and it needs the opposite remedy:
+    /// a deficit means "this node cannot keep up, raise the offset", a
+    /// clamp means "the offset exceeds what the emitter will hold, lower
+    /// it". Reporting them as one "unhealthy" bit would send the operator
+    /// the wrong way half the time.
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub clamped: u64,
+    /// Times a derivation was rejected as implausible — the PCR being
+    /// inverted is not on the group's timeline at all.
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub implausible: u64,
+    /// True while the plausibility gate has taken this output **off** the
+    /// analytic anchor and back onto classic relative pacing.
+    ///
+    /// The single most important field here: without it a misconfigured
+    /// output is indistinguishable from an aligned one.
+    #[serde(default)]
+    pub disengaged: bool,
+    /// Generation of the group anchor in force. Members reporting
+    /// different generations are misaligned by the difference between
+    /// their anchors — a fault no other field would reveal.
+    #[serde(default)]
+    pub anchor_generation: u32,
+    /// Mint observation: a source PCR this node saw, and the wall instant
+    /// it had that content ready to release. Zero once the group anchor is
+    /// armed — see `OutputStatsAccumulator::epoch_mint_pcr_27mhz`.
+    ///
+    /// The manager normalises every member's pair onto one reference PCR
+    /// and anchors on the **slowest**, which is what makes the required
+    /// egress dwell the inter-node latency *spread* rather than the
+    /// absolute end-to-end latency.
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub mint_pcr_27mhz: u64,
+    #[serde(default)]
+    pub mint_unix_ns: i64,
 }

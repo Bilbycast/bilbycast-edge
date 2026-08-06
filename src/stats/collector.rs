@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
@@ -150,6 +150,67 @@ pub struct OutputStatsAccumulator {
     /// SO_TXTIME-path signal and stays 0 on the default `clock_nanosleep`
     /// release path.
     pub wire_pacing_late: AtomicU64,
+    /// Epoch-locked egress: the configured offset in µs, registered once
+    /// at output spawn. The presence of this value is what tells the
+    /// manager the output is running epoch-locked at all.
+    pub epoch_lock_offset_us: OnceLock<u64>,
+    /// Operator group label for this epoch-locked output, if set. Purely
+    /// a UI grouping aid — nodes align by arithmetic, not by sharing
+    /// this string.
+    pub epoch_lock_group: OnceLock<String>,
+    /// Whether the analytic epoch anchor has been applied at least once.
+    /// False while epoch lock is configured but no PCR has arrived yet —
+    /// the difference between "warming up" and "silently doing nothing".
+    pub epoch_lock_engaged: AtomicBool,
+    /// Most recent epoch-lock shortfall in µs: how far the analytic
+    /// target had already slipped into the past when it was computed.
+    /// Non-zero means this node cannot honour the configured offset, so
+    /// it is emitting as fast as it can and running behind its peers.
+    pub epoch_lock_deficit_us: AtomicU64,
+    /// High-water mark of the above since output start. A deficit that
+    /// only spiked at startup reads very differently from one still
+    /// happening, and a 1 Hz gauge alone cannot tell those apart.
+    pub epoch_lock_deficit_max_us: AtomicU64,
+    /// Times the analytic target was truncated by the future-lookahead
+    /// ceiling — this node released EARLY relative to the group. The
+    /// mirror image of a deficit, and it needs the opposite remedy
+    /// (lower the offset / raise the ceiling, not speed the node up), so
+    /// it is counted separately rather than folded into one "unhealthy".
+    pub epoch_lock_clamped: AtomicU64,
+    /// Times a derivation was rejected as implausible — the PCR being
+    /// inverted is not on the group's timeline (foreign or free-running
+    /// source, mis-latched MPTS program, stale anchor generation).
+    pub epoch_lock_implausible: AtomicU64,
+    /// True while the plausibility gate has this output OFF the analytic
+    /// anchor and back on classic relative pacing. The single most
+    /// important bit in this struct: it is the difference between
+    /// "aligned" and "quietly pacing itself".
+    pub epoch_lock_disengaged: AtomicBool,
+    /// Mint observation: the most recent `(source PCR, wall instant at
+    /// which this node had that content ready to release)`, published only
+    /// while the output is **not yet armed** with a group anchor.
+    ///
+    /// This is what the manager mints from. It is sampled before the egress
+    /// dwell begins — sampling after it (which is where `PcrTrust` samples)
+    /// would fold the offset back into the anchor and double-count it.
+    /// Once armed the pair stops updating, because a dwelling emitter's
+    /// dequeue instant no longer answers "when did this node have it".
+    pub epoch_mint_pcr_27mhz: AtomicU64,
+    pub epoch_mint_unix_ns: AtomicI64,
+    /// Hot-swappable home for this output's epoch-lock group anchor.
+    ///
+    /// Lives on the stats accumulator because that is already the one
+    /// per-output object shared between the control plane (which can find
+    /// it by output id through `StatsCollector`) and the wire thread
+    /// (which is handed an `Arc` of it at spawn). Adding a second parallel
+    /// registry keyed the same way would be pure duplication. The cell is
+    /// a seqlock, so the SCHED_FIFO wire thread never blocks on a
+    /// manager-side re-mint.
+    pub epoch_anchor_cell: Arc<crate::engine::epoch_lock::EpochAnchorCell>,
+    /// Generation of the group anchor currently in force. Two members
+    /// reporting different generations are misaligned by the difference
+    /// between their anchors, which no other field would reveal.
+    pub epoch_lock_anchor_generation: AtomicU64,
     /// Datagrams dropped by a **partial `sendmmsg` short-write** (kernel
     /// accepted fewer messages than submitted, e.g. transient ENOBUFS / socket
     /// buffer pressure on the batch send path). Distinct from `wire_pacing_late`
@@ -857,6 +918,18 @@ impl OutputStatsAccumulator {
             wire_pacing_tier: OnceLock::new(),
             egress_pacing_effective: OnceLock::new(),
             wire_pacing_late: AtomicU64::new(0),
+            epoch_lock_offset_us: OnceLock::new(),
+            epoch_lock_group: OnceLock::new(),
+            epoch_lock_engaged: AtomicBool::new(false),
+            epoch_lock_deficit_us: AtomicU64::new(0),
+            epoch_lock_deficit_max_us: AtomicU64::new(0),
+            epoch_lock_clamped: AtomicU64::new(0),
+            epoch_lock_implausible: AtomicU64::new(0),
+            epoch_lock_disengaged: AtomicBool::new(false),
+            epoch_lock_anchor_generation: AtomicU64::new(0),
+            epoch_anchor_cell: Arc::new(crate::engine::epoch_lock::EpochAnchorCell::new()),
+            epoch_mint_pcr_27mhz: AtomicU64::new(0),
+            epoch_mint_unix_ns: AtomicI64::new(0),
             wire_short_write: AtomicU64::new(0),
             wire_pacing_pinned_cpu: AtomicI32::new(-1),
             egress_shed: AtomicU64::new(0),
@@ -864,6 +937,62 @@ impl OutputStatsAccumulator {
             display_frames_fresh: crate::stats::throughput::CounterFreshness::new(),
             display_audio_fresh: crate::stats::throughput::CounterFreshness::new(),
         }
+    }
+
+    /// Register epoch-locked egress for this output. Called once at
+    /// spawn by `engine::wire_emit`; the registered offset is what makes
+    /// epoch lock visible in telemetry at all.
+    pub fn set_epoch_lock(&self, offset_us: u64, group: Option<&str>) {
+        let _ = self.epoch_lock_offset_us.set(offset_us);
+        if let Some(g) = group {
+            let _ = self.epoch_lock_group.set(g.to_string());
+        }
+    }
+
+    /// Record the outcome of one analytic epoch anchor.
+    ///
+    /// Called from the wire thread once per **PCR-bearing** datagram (not
+    /// per datagram — the values only change when an anchor is derived,
+    /// and at multi-gigabit the difference is ~950k lock-prefixed RMWs per
+    /// second versus ~25-50). Relaxed stores plus conditional max updates:
+    /// no allocation, no lock, no syscall.
+    ///
+    /// `engaged` is driven from the caller rather than latched, so an
+    /// output that disengages stops claiming to be aligned. Latching it
+    /// would leave a node that lost its source hours ago still reporting
+    /// `engaged: true, deficit: 0`.
+    /// Publish a mint observation. See the field docs for why this is only
+    /// meaningful before the group anchor arrives.
+    #[inline]
+    pub fn record_epoch_mint_observation(&self, pcr_27mhz: u64, unix_ns: i64) {
+        self.epoch_mint_pcr_27mhz.store(pcr_27mhz, Ordering::Relaxed);
+        self.epoch_mint_unix_ns.store(unix_ns, Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub fn record_epoch_lock_anchor(
+        &self,
+        engaged: bool,
+        deficit_us: u64,
+        clamped: u64,
+        implausible: u64,
+        disengaged: bool,
+        anchor_generation: u32,
+    ) {
+        self.epoch_lock_engaged.store(engaged, Ordering::Relaxed);
+        self.epoch_lock_disengaged
+            .store(disengaged, Ordering::Relaxed);
+        self.epoch_lock_deficit_us
+            .store(deficit_us, Ordering::Relaxed);
+        if deficit_us > 0 {
+            self.epoch_lock_deficit_max_us
+                .fetch_max(deficit_us, Ordering::Relaxed);
+        }
+        self.epoch_lock_clamped.store(clamped, Ordering::Relaxed);
+        self.epoch_lock_implausible
+            .store(implausible, Ordering::Relaxed);
+        self.epoch_lock_anchor_generation
+            .store(anchor_generation as u64, Ordering::Relaxed);
     }
 
     /// Register the active wire-pacing tier for this output. Called
@@ -1474,6 +1603,21 @@ impl OutputStatsAccumulator {
             wire_pacing_tier: self.wire_pacing_tier.get().cloned(),
             egress_pacing_effective: self.egress_pacing_effective.get().cloned(),
             wire_pacing_late: self.wire_pacing_late.load(Ordering::Relaxed),
+            epoch_lock: self.epoch_lock_offset_us.get().map(|off| EpochLockStats {
+                group_label: self.epoch_lock_group.get().cloned(),
+                egress_offset_us: *off,
+                engaged: self.epoch_lock_engaged.load(Ordering::Relaxed),
+                deficit_us: self.epoch_lock_deficit_us.load(Ordering::Relaxed),
+                deficit_max_us: self.epoch_lock_deficit_max_us.load(Ordering::Relaxed),
+                clamped: self.epoch_lock_clamped.load(Ordering::Relaxed),
+                implausible: self.epoch_lock_implausible.load(Ordering::Relaxed),
+                disengaged: self.epoch_lock_disengaged.load(Ordering::Relaxed),
+                anchor_generation: self
+                    .epoch_lock_anchor_generation
+                    .load(Ordering::Relaxed) as u32,
+                mint_pcr_27mhz: self.epoch_mint_pcr_27mhz.load(Ordering::Relaxed),
+                mint_unix_ns: self.epoch_mint_unix_ns.load(Ordering::Relaxed),
+            }),
             wire_short_write: self.wire_short_write.load(Ordering::Relaxed),
             wire_pacing_pinned_cpu: {
                 let v = self.wire_pacing_pinned_cpu.load(Ordering::Relaxed);
