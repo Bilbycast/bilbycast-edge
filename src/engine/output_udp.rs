@@ -171,6 +171,8 @@ async fn udp_output_loop_302m(
         crate::engine::wire_emit::EpochLockParams {
             offset_ns: e.egress_offset_ms as u64 * 1_000_000,
             group_label: e.group_label.clone(),
+            anchor: e.source_anchor.map(Into::into),
+            anchor_cell: Some(stats.epoch_anchor_cell.clone()),
         }
     });
     let wire_tx = spawn_wire_emitter(
@@ -260,6 +262,8 @@ async fn udp_output_loop(
         crate::engine::wire_emit::EpochLockParams {
             offset_ns: e.egress_offset_ms as u64 * 1_000_000,
             group_label: e.group_label.clone(),
+            anchor: e.source_anchor.map(Into::into),
+            anchor_cell: Some(stats.epoch_anchor_cell.clone()),
         }
     });
     let wire_tx = spawn_wire_emitter(

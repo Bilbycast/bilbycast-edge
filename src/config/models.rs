@@ -450,6 +450,42 @@ impl AppConfig {
             outputs.push(out.clone());
         }
 
+        // Epoch-lock coherence gate.
+        //
+        // The precondition spans two objects (the flow's inputs decide
+        // whether the PCR is content-invariant; the output carries the
+        // `epoch_lock` block), so no per-entity validator can see both
+        // halves — and the WS/REST mutation handlers validate one entity at
+        // a time. `resolve_flow` is the single boundary every engine path
+        // crosses, which makes it the one place the check cannot be routed
+        // around: config load, flow start, flow restart, and every hot edit
+        // land here.
+        //
+        // Strip rather than fail. A flow that would otherwise run fine must
+        // not be taken off air by a mis-specified alignment knob — the
+        // output keeps running on classic relative pacing, and the loud
+        // error plus the absent `epoch_lock` telemetry block is what tells
+        // the operator it is not aligned. Silently *keeping* it would be
+        // the dangerous outcome, because a misconfigured epoch lock looks
+        // exactly like a working one from a single node.
+        let in_refs: Vec<&InputDefinition> = inputs.iter().collect();
+        let out_refs: Vec<&OutputConfig> = outputs.iter().collect();
+        if let Err(e) =
+            crate::config::validation::validate_flow_epoch_lock(flow, &in_refs, &out_refs)
+        {
+            tracing::error!(
+                flow_id = %flow.id,
+                "epoch_lock disabled on this flow's outputs — {e}"
+            );
+            for out in &mut outputs {
+                match out {
+                    OutputConfig::Rtp(c) => c.epoch_lock = None,
+                    OutputConfig::Udp(c) => c.epoch_lock = None,
+                    _ => {}
+                }
+            }
+        }
+
         Ok(ResolvedFlow {
             config: flow.clone(),
             inputs,
@@ -3436,72 +3472,139 @@ impl EgressPacingMode {
     }
 }
 
-/// Epoch-locked egress — align this output's wire timing with other nodes
-/// carrying the same stream, without any coordination between them.
+/// Epoch-locked egress — align this output's wire timing with other edges
+/// carrying the same source stream, so a downstream switcher can cut
+/// between them without a timing discontinuity.
 ///
 /// # What it does
 ///
-/// Normally `wire_emit` anchors its pacing on the first datagram it sees
-/// (`now + PREROLL_NS`), so a node's egress phase is set by whenever it
-/// happened to start. Two nodes fed the same stream therefore emit the
-/// same frame at unrelated wall-clock instants.
+/// Normally `wire_emit` anchors pacing on the first datagram it sees
+/// (`now + PREROLL_NS`), so a node's egress phase is an accident of when
+/// it started and of how long its own ingest path is. Two edges fed the
+/// same feed over different paths therefore emit the same frame at wall
+/// instants separated by their ingest-latency difference — routinely
+/// hundreds of milliseconds on redundant contribution paths.
 ///
-/// With epoch lock enabled, the release instant is instead derived
-/// *analytically* from the datagram's PCR via
-/// [`crate::engine::epoch_lock`]: because an epoch-locked master clock
-/// generates PCR as a pure function of the UNIX-epoch wall clock, that
-/// function can be inverted. Every node computes the identical target, so
-/// egress aligns by arithmetic — no group membership, no manager in the
-/// loop, no control loop to converge or oscillate.
+/// Under epoch lock the release instant is derived from the datagram's PCR
+/// via [`crate::engine::epoch_lock`], against a **group-shared anchor**.
+/// Every member runs identical arithmetic on an identical PCR and an
+/// identical anchor, so alignment falls out analytically.
 ///
-/// Accuracy is bounded by how well the hosts' clocks agree. NTP on a LAN
-/// is typically tens of microseconds and a few milliseconds over the
-/// internet, well inside the ±100 ms this targets.
+/// # The load-bearing requirement: a content-invariant PCR
 ///
-/// # Requirements (enforced at validation)
+/// The PCR reaching the wire emitter must be a function of the **content**,
+/// not of this node. That is only true where `engine::ts_pts_rewriter` is
+/// out of the path — i.e. every input on the flow sets
+/// `passthrough_clock: true`, or the input is `bonded`. In default muxer
+/// mode the rewriter anchors output PCR to *this node's* wall clock at the
+/// first PCR it saw (`ts_pts_rewriter.rs`), so the value carries the
+/// node's own ingest instant and inverting it recovers nothing shared.
+/// Validation enforces this; see `validate_flow_epoch_lock`.
 ///
-/// - `egress_pacing` must resolve to `pcr`. In `forward` mode nothing
-///   re-paces and the anchor is never consulted; the `servo` leaky bucket
-///   is a rate regulator, not a phase actuator.
-/// - The flow's `master_clock.kind` must be epoch-locked (`ptp`). The
-///   default `auto` policy resolves file / switcher / replay flows to
-///   `wallclock`, which **deliberately randomises its epoch** so that
-///   independent edges never accidentally appear coherent — the exact
-///   opposite of what this needs.
+/// **Consequence the operator feels:** alignment and PCR/PTS regeneration
+/// are mutually exclusive. Turning this on gives up muxer-mode rewriting
+/// on those inputs.
 ///
-/// A flow that falls back to wallclock mid-run silently loses alignment,
-/// so that transition raises a critical alarm rather than a warning.
+/// # Scope
+///
+/// Single-input, single-program, non-transcoded, non-assembled UDP/RTP
+/// forwarding. Two independent encoders do not produce the same bitstream,
+/// so transcoded outputs can never be aligned this way. Gives a clean
+/// downstream **cut**, not a seamless 2022-7 merge (RTP sequence numbers
+/// remain per-node counters).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct EpochLockConfig {
-    /// Headroom, in milliseconds, between the instant a PCR represents and
-    /// the instant its datagram is released onto the wire.
+    /// Headroom, in milliseconds, between the instant the group's shared
+    /// timeline assigns to a PCR and the instant its datagram is released.
     ///
-    /// This is the budget every member spends absorbing its own receive
-    /// and processing path — network transit, jitter buffer, any
-    /// transcode. It **must be identical on every node in the group**;
-    /// that is what makes their targets agree. Set it comfortably above
-    /// the slowest member's path, or that member will run at a permanent
-    /// deficit and lag the others.
+    /// **This is a budget for the inter-node latency _spread_, not for
+    /// absolute end-to-end latency.** The manager mints the anchor from
+    /// the slowest member's arrival, so a member's required dwell is its
+    /// lead over the slowest, plus this margin — absolute path latency
+    /// cancels out. Sizing it against absolute latency instead would put a
+    /// WAN contribution feed straight through the wire-emit residence cap.
     ///
-    /// Bounded 50..=5000 ms. Absolute accuracy is not required: a constant
-    /// error here is common-mode and cancels out of the inter-node
-    /// difference, which is the only thing this feature promises.
+    /// It **must be identical on every member**; a mismatch misaligns the
+    /// group by exactly the difference, with both nodes reporting healthy.
+    ///
+    /// Bounded [`MIN_EPOCH_LOCK_OFFSET_MS`]..=[`MAX_EPOCH_LOCK_OFFSET_MS`].
     pub egress_offset_ms: u32,
-    /// Optional operator label, surfaced on telemetry so the manager UI
-    /// can group members visually. Carries **no behaviour** — nodes are
-    /// aligned by the arithmetic above, not by sharing this string. Max
-    /// 64 chars.
+    /// Optional operator label, surfaced on telemetry so the manager UI can
+    /// group members visually. Carries **no behaviour**. Max 64 chars.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub group_label: Option<String>,
+    /// Group-shared source-PCR -> wall-instant anchor, minted by the
+    /// manager and pushed byte-identically to every member.
+    ///
+    /// Absent until the manager arms the group. While absent the emitter
+    /// falls back to the closed-form UNIX-epoch inversion, which aligns
+    /// nodes only when the source itself is epoch-locked (an upstream
+    /// bilbycast edge, or an SMPTE 2059 / RFC 7273 encoder); the runtime
+    /// plausibility gate disengages rather than pacing off a garbage
+    /// instant when it is not.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_anchor: Option<SourceAnchorConfig>,
+    /// PCR PID to anchor on, for a source carrying more than one program.
+    ///
+    /// `wire_emit` otherwise latches "the first PCR-bearing PID this
+    /// emitter ever saw", and two members joining an MPTS at different
+    /// byte offsets can latch *different programs* — misaligning by
+    /// seconds while every plausibility check passes. Validation requires
+    /// either a single-program source or an explicit value here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pcr_pid: Option<u16>,
 }
 
-/// Minimum `egress_offset_ms`. Below ~50 ms there is no room for even a
-/// LAN receive path, so every node would sit at a permanent deficit.
-pub const MIN_EPOCH_LOCK_OFFSET_MS: u32 = 50;
-/// Maximum `egress_offset_ms`. 5 s is already far beyond any contribution
-/// path this is meant for, and the wire-emit queue is not sized to hold
-/// more.
-pub const MAX_EPOCH_LOCK_OFFSET_MS: u32 = 5_000;
+/// Wire form of [`crate::engine::epoch_lock::SourceAnchor`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SourceAnchorConfig {
+    /// Reference point on the source's 27 MHz PCR timeline.
+    pub pcr_27mhz: u64,
+    /// Wall instant (UNIX epoch nanoseconds) the group agrees that PCR
+    /// denotes. Not necessarily the true origination instant — it is a
+    /// shared label, minted from the slowest member's arrival plus margin.
+    pub unix_ns: i64,
+    /// Mint counter. Members on different generations are misaligned by
+    /// the difference between their anchors.
+    pub generation: u32,
+    /// Source-PCR value at which this anchor takes effect, so every member
+    /// switches on the same *packet* rather than at the same moment on its
+    /// own clock. `None` = effective immediately.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effective_from_pcr: Option<u64>,
+}
+
+impl From<SourceAnchorConfig> for crate::engine::epoch_lock::SourceAnchor {
+    fn from(c: SourceAnchorConfig) -> Self {
+        Self {
+            pcr_27mhz: c.pcr_27mhz,
+            unix_ns: c.unix_ns as i128,
+            generation: c.generation,
+            effective_from_pcr: c.effective_from_pcr,
+        }
+    }
+}
+
+/// Minimum `egress_offset_ms`.
+///
+/// Output PCR is stamped `PCR_PREROLL_27MHZ` (80 ms) behind the master
+/// clock, and the datagram spends further time in the mux and the flow
+/// fan-out before it reaches the emitter. An offset below that floor can
+/// never produce a future target, so the node sits at a permanent deficit
+/// and releases every PCR-bearing datagram on arrival. 150 ms clears the
+/// pre-roll with room for a local pipeline.
+pub const MIN_EPOCH_LOCK_OFFSET_MS: u32 = 150;
+/// Maximum `egress_offset_ms`.
+///
+/// **Derived from the wire-emit residence cap, not chosen.** Epoch lock
+/// forces `egress_pacing: "pcr"`, under which `egress_buffer_ms` is
+/// rejected, so `DejitterConfig::lossless` pins `cap_ms` at 1000 ms and
+/// the operator has no way to raise it. Dwell is measured from
+/// `enqueue_us`, so an offset at or above that cap makes
+/// `shed_stale_backlog` fire on essentially every datagram — measured at
+/// 84-96 % sustained loss, and bitrate-independent. 800 ms leaves 200 ms
+/// of headroom against the cap.
+pub const MAX_EPOCH_LOCK_OFFSET_MS: u32 = 800;
 
 /// Configurable output delay for stream synchronization.
 ///

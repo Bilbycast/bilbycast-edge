@@ -1270,19 +1270,25 @@ fn edge_capabilities() -> Vec<&'static str> {
         // tolerance), so the manager UI MUST gate the pacing dropdown on
         // this capability to avoid the silent-no-op trap.
         "egress_pacing",
-        // Epoch-locked egress: compressed UDP/RTP outputs accept an
-        // `epoch_lock` block, which anchors wire release on the PCR
-        // value itself rather than on a local first-datagram preroll.
-        // Independent nodes carrying the same stream then emit in
-        // alignment with no coordination between them (issue #79).
-        // Requires an explicit `egress_pacing: "pcr"` and a flow
-        // `master_clock.kind = "ptp"` — both enforced by validation, so
-        // a manager that offers this control MUST offer those two
-        // alongside it or the config push will be rejected. Edges
-        // WITHOUT this bit silently ignore the field (serde unknown-
-        // field tolerance), so gate the UI on it to avoid a silent
-        // no-op that looks exactly like success.
-        "epoch-lock",
+        // Epoch-locked egress: cross-node release alignment for
+        // compressed UDP/RTP outputs (issue #79). Independent edges
+        // forwarding the same contribution feed emit the same content at
+        // the same wall instant, so a downstream switcher can cut between
+        // them without a timing discontinuity.
+        //
+        // Requires, and validation enforces: an explicit
+        // `egress_pacing: "pcr"`; a single, non-assembled flow; a
+        // non-transcoded output with an unambiguous PCR PID; and every
+        // input either `bonded` or carrying `passthrough_clock: true` —
+        // that last one is what makes the PCR content-invariant rather
+        // than carrying this node's own ingest latency.
+        //
+        // Alignment additionally needs a group anchor, minted by the
+        // manager and pushed to every member via `set_epoch_anchor`. An
+        // edge WITHOUT this bit ignores the config field silently (serde
+        // unknown-field tolerance), which looks exactly like success — so
+        // the manager UI must gate on it.
+        "epoch_lock",
         // Ingress de-jitter: raw UDP / RTP inputs run the ingress
         // counterpart to the egress servo — recover the source rate from
         // inter-PCR observations and release packets paced at that rate
@@ -5141,6 +5147,78 @@ async fn execute_command(
             runtime.stats.set_master_clock_lipsync(clamped);
             Ok(Some(serde_json::json!({
                 "lipsync_offset_90k": clamped,
+            })))
+        }
+        // Publish (or refresh) the group anchor for an epoch-locked output.
+        //
+        // A dedicated command rather than an `update_output` config edit,
+        // because the config route replaces the running output
+        // (`remove_output` + `add_output`) and that drops the accumulated
+        // egress dwell — a visible glitch every time the manager refreshes
+        // a scalar to correct for source-oscillator drift. This writes into
+        // the live seqlock cell instead, so the running emitter picks it up
+        // on its next PCR-bearing datagram.
+        "set_epoch_anchor" => {
+            let output_id = action["output_id"].as_str().ok_or_else(|| {
+                CommandError::with_code("set_epoch_anchor: missing 'output_id'", "missing_field")
+            })?;
+            let pcr_27mhz = action["pcr_27mhz"].as_u64().ok_or_else(|| {
+                CommandError::with_code("set_epoch_anchor: missing 'pcr_27mhz'", "missing_field")
+            })?;
+            let unix_ns = action["unix_ns"].as_i64().ok_or_else(|| {
+                CommandError::with_code("set_epoch_anchor: missing 'unix_ns'", "missing_field")
+            })?;
+            let generation = action["generation"].as_u64().ok_or_else(|| {
+                CommandError::with_code("set_epoch_anchor: missing 'generation'", "missing_field")
+            })? as u32;
+            let effective_from_pcr = action["effective_from_pcr"].as_u64();
+
+            if pcr_27mhz >= crate::engine::epoch_lock::PCR_MODULUS_27MHZ {
+                return Err(CommandError::with_code(
+                    format!(
+                        "set_epoch_anchor: pcr_27mhz {pcr_27mhz} exceeds the PCR modulus {}",
+                        crate::engine::epoch_lock::PCR_MODULUS_27MHZ
+                    ),
+                    "invalid_field",
+                ));
+            }
+            if unix_ns <= 0 {
+                return Err(CommandError::with_code(
+                    "set_epoch_anchor: unix_ns must be a positive UNIX-epoch nanosecond instant",
+                    "invalid_field",
+                ));
+            }
+
+            // Reach the running output's accumulator, which owns the live
+            // anchor cell. Absent means the output is not running, and a
+            // silent success there would leave the manager believing the
+            // group is armed when one member never got the anchor.
+            let acc = flow_manager
+                .output_stats(output_id)
+                .ok_or_else(|| {
+                    CommandError::with_code(
+                        format!("set_epoch_anchor: unknown or not-running output '{output_id}'"),
+                        "unknown_output",
+                    )
+                })?;
+            acc.epoch_anchor_cell
+                .store(crate::engine::epoch_lock::SourceAnchor {
+                    pcr_27mhz,
+                    unix_ns: unix_ns as i128,
+                    generation,
+                    effective_from_pcr,
+                });
+            tracing::info!(
+                output_id,
+                generation,
+                pcr_27mhz,
+                unix_ns,
+                ?effective_from_pcr,
+                "epoch-lock group anchor published"
+            );
+            Ok(Some(serde_json::json!({
+                "output_id": output_id,
+                "generation": generation,
             })))
         }
         "reset_counters" => {

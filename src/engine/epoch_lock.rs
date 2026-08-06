@@ -246,6 +246,202 @@ pub fn target_tai_ns(
     generated_at + skew + egress_offset_ns as i128
 }
 
+/// A shared label for the source's PCR timeline: "source PCR value
+/// `pcr_27mhz` denotes wall instant `unix_ns`".
+///
+/// # Why this exists
+///
+/// The closed form above ([`unix_ns_from_pcr_27mhz`]) assumes the PCR it
+/// is handed was generated *from* the UNIX epoch. That is true only when
+/// the stream's originator is itself epoch-locked. For an ordinary
+/// contribution feed the source PCR is free-running with an arbitrary
+/// phase, so there is no self-derivable mapping onto wall time — and
+/// critically, **any mapping a node derives from its own observations is
+/// node-variant**, because every observation is timestamped on arrival
+/// and therefore carries that node's ingest latency.
+///
+/// The phase must therefore come from outside the node: one scalar pair,
+/// minted once and distributed byte-identically to every member of an
+/// alignment group. Nothing requires `unix_ns` to be the instant the
+/// encoder actually originated that content — it is only a *label*. The
+/// manager mints it from the **slowest** member's observed arrival plus a
+/// margin, which makes the required egress dwell equal to the inter-node
+/// latency *spread* rather than the absolute end-to-end latency. That
+/// distinction is what keeps the dwell clear of the wire-emit residence
+/// cap on a WAN contribution path; see `docs/clocking.md`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SourceAnchor {
+    /// Reference point on the source's 27 MHz PCR timeline.
+    pub pcr_27mhz: u64,
+    /// Wall instant (UNIX epoch nanoseconds, CLOCK_REALTIME domain) that
+    /// the group agrees `pcr_27mhz` denotes.
+    pub unix_ns: i128,
+    /// Monotonically increasing mint counter. Carried on telemetry so an
+    /// operator can confirm every member is on the same generation — two
+    /// members on different generations are misaligned by the difference
+    /// between the two anchors.
+    pub generation: u32,
+    /// Source-PCR value at (or after) which this anchor takes effect.
+    ///
+    /// Gating the swap on a **content** coordinate rather than a wall
+    /// instant is what makes a re-mint hitless: both nodes switch on the
+    /// same *packet*, not at the same moment on their own clocks. Without
+    /// it a re-mint opens a divergence window equal to the full anchor
+    /// step. `None` = effective immediately (first arm).
+    pub effective_from_pcr: Option<u64>,
+}
+
+impl SourceAnchor {
+    /// Is this anchor in force for a datagram carrying `pcr_27mhz`?
+    ///
+    /// Compared with [`signed_pcr_delta`] rather than `>=` so a PCR that
+    /// has wrapped past the trigger still counts as "at or after" it.
+    #[inline]
+    pub fn is_effective_for(&self, pcr_27mhz: u64) -> bool {
+        match self.effective_from_pcr {
+            None => true,
+            Some(from) => signed_pcr_delta(pcr_27mhz, from) >= 0,
+        }
+    }
+}
+
+/// Shortest signed distance from `b` to `a` on the modular PCR timeline,
+/// in 27 MHz ticks — i.e. the representative of `a - b` nearest zero.
+///
+/// # Why not `a.wrapping_sub(b) as i64`
+///
+/// The PCR modulus is `(1<<33) × 300 ≈ 2.58e12`, which is **not** a power
+/// of two, so the natural `u64` wrap is not congruent to it. Reducing
+/// with `wrapping_sub` and casting silently returns a value that is wrong
+/// by `2^64 mod MODULUS` once the arithmetic crosses a `u64` boundary,
+/// and near the PCR wrap it produces a ~4 h 35 m error — large enough to
+/// look like a plausible timeline and small enough to be missed.
+/// `rem_euclid` against the real modulus is correct at every input.
+#[inline]
+pub fn signed_pcr_delta(a: u64, b: u64) -> i64 {
+    let m = PCR_MODULUS_27MHZ as i128;
+    let d = (a as i128 - b as i128).rem_euclid(m);
+    if d > m / 2 { (d - m) as i64 } else { d as i64 }
+}
+
+/// Anchored inversion: the wall instant a source PCR denotes, under a
+/// group-shared [`SourceAnchor`].
+///
+/// Unlike [`unix_ns_from_pcr_27mhz`] this reads **no local clock at all** —
+/// not even to disambiguate the wrap, because the anchor already pins the
+/// phase. The result is a pure function of `(pcr_27mhz, anchor)`, both of
+/// which are identical on every member. That is the whole alignment
+/// property, and stating it this way makes it checkable by inspection.
+#[inline]
+pub fn unix_ns_from_pcr_anchored(pcr_27mhz: u64, anchor: &SourceAnchor) -> i128 {
+    let delta_ticks = signed_pcr_delta(pcr_27mhz, anchor.pcr_27mhz) as i128;
+    // Truncating division, applied identically on every node — so the
+    // sub-tick residue is common-mode and cancels between members.
+    anchor.unix_ns + delta_ticks * 1000 / 27
+}
+
+/// Release instant on the emitter's CLOCK_TAI timeline for a datagram
+/// carrying `pcr_27mhz`, under a group-shared anchor.
+///
+/// # Heterogeneous leap-second data is safe
+///
+/// `tai_minus_realtime_ns` is a *local* quantity: 37 s on a host with
+/// leap-second data loaded, 0 on one without. It cancels rather than
+/// diverging — each node converts the same shared CLOCK_REALTIME instant
+/// into its own CLOCK_TAI domain, so both fire at the same real moment.
+/// A group may therefore mix hosts with and without leap data.
+#[inline]
+pub fn target_tai_ns_anchored(
+    pcr_27mhz: u64,
+    tai_minus_realtime_ns: i64,
+    egress_offset_ns: u64,
+    anchor: &SourceAnchor,
+) -> i128 {
+    unix_ns_from_pcr_anchored(pcr_27mhz, anchor)
+        + tai_minus_realtime_ns as i128
+        + egress_offset_ns as i128
+}
+
+/// Lock-free, hot-swappable home for the group anchor.
+///
+/// A re-mint must reach a running wire thread without restarting the
+/// output — restarting drops the dwell and glitches the feed, which is a
+/// poor answer to "the manager refreshed a scalar". The wire thread runs
+/// SCHED_FIFO, so a `Mutex` is the wrong tool even at 25-50 reads/s: if the
+/// writer is preempted while holding it, the real-time thread blocks on a
+/// lower-priority task.
+///
+/// A seqlock fits exactly: writes are rare and single-writer, reads are
+/// frequent and wait-free. The writer bumps `seq` to odd, publishes, bumps
+/// to even; a reader that sees an odd or changed `seq` retries.
+#[derive(Debug, Default)]
+pub struct EpochAnchorCell {
+    seq: std::sync::atomic::AtomicU64,
+    pcr_27mhz: std::sync::atomic::AtomicU64,
+    unix_ns: std::sync::atomic::AtomicI64,
+    generation: std::sync::atomic::AtomicU32,
+    /// `u64::MAX` encodes `None` — a real trigger can never be that value,
+    /// since PCR is bounded by [`PCR_MODULUS_27MHZ`].
+    effective_from_pcr: std::sync::atomic::AtomicU64,
+    /// False until the first anchor is published.
+    armed: std::sync::atomic::AtomicBool,
+}
+
+const NO_TRIGGER: u64 = u64::MAX;
+
+impl EpochAnchorCell {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Publish a new anchor. Single-writer (the manager command handler).
+    pub fn store(&self, a: SourceAnchor) {
+        use std::sync::atomic::Ordering::{Relaxed, Release};
+        let s = self.seq.load(Relaxed);
+        self.seq.store(s.wrapping_add(1), Release); // odd: write in progress
+        self.pcr_27mhz.store(a.pcr_27mhz, Relaxed);
+        self.unix_ns.store(a.unix_ns as i64, Relaxed);
+        self.generation.store(a.generation, Relaxed);
+        self.effective_from_pcr
+            .store(a.effective_from_pcr.unwrap_or(NO_TRIGGER), Relaxed);
+        self.armed.store(true, Relaxed);
+        self.seq.store(s.wrapping_add(2), Release); // even: consistent
+    }
+
+    /// Wait-free read. `None` until an anchor has been published.
+    ///
+    /// Bounded retry rather than an unbounded spin: the wire thread must
+    /// never be parked by a writer that was preempted mid-update. Falling
+    /// back to "no anchor for this datagram" is safe — the caller then uses
+    /// the closed form for one packet and the plausibility gate still
+    /// covers it.
+    pub fn load(&self) -> Option<SourceAnchor> {
+        use std::sync::atomic::Ordering::{Acquire, Relaxed};
+        if !self.armed.load(Relaxed) {
+            return None;
+        }
+        for _ in 0..4 {
+            let before = self.seq.load(Acquire);
+            if before % 2 != 0 {
+                continue;
+            }
+            let a = SourceAnchor {
+                pcr_27mhz: self.pcr_27mhz.load(Relaxed),
+                unix_ns: self.unix_ns.load(Relaxed) as i128,
+                generation: self.generation.load(Relaxed),
+                effective_from_pcr: match self.effective_from_pcr.load(Relaxed) {
+                    NO_TRIGGER => None,
+                    v => Some(v),
+                },
+            };
+            if self.seq.load(Acquire) == before {
+                return Some(a);
+            }
+        }
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -377,5 +573,81 @@ mod tests {
         // other. ~95_443 s.
         assert_eq!(PCR_MODULUS_NS, (PCR_MODULUS_27MHZ as u128) * 1000 / 27);
         assert!((95_442_000_000_000..95_444_000_000_000).contains(&(PCR_MODULUS_NS as u64)));
+    }
+
+    // ── Anchored (group-shared) inversion ───────────────────────────────
+
+    fn anchor_at(pcr: u64, unix_ns: i128) -> SourceAnchor {
+        SourceAnchor { pcr_27mhz: pcr, unix_ns, generation: 1, effective_from_pcr: None }
+    }
+
+    #[test]
+    fn signed_delta_is_zero_centred_and_wraps_both_ways() {
+        assert_eq!(signed_pcr_delta(100, 100), 0);
+        assert_eq!(signed_pcr_delta(127, 100), 27);
+        assert_eq!(signed_pcr_delta(100, 127), -27);
+        // Across the wrap: 10 ticks past the modulus is +20 from 27 below it.
+        let m = PCR_MODULUS_27MHZ;
+        assert_eq!(signed_pcr_delta(10, m - 10), 20);
+        assert_eq!(signed_pcr_delta(m - 10, 10), -20);
+    }
+
+    /// The defect this function exists to avoid: `wrapping_sub` is not
+    /// congruent to the PCR modulus (which is not a power of two), so the
+    /// naive form is wrong by ~4 h 35 m at the wrap antipode.
+    #[test]
+    fn signed_delta_beats_the_naive_wrapping_sub_at_the_antipode() {
+        let m = PCR_MODULUS_27MHZ;
+        let a = 5u64;
+        let b = m - 5;
+        assert_eq!(signed_pcr_delta(a, b), 10, "true distance is 10 ticks");
+        let naive = a.wrapping_sub(b) as i64;
+        assert_ne!(naive, 10, "the naive form must differ — that is the bug");
+    }
+
+    /// The alignment property, stated directly: two nodes holding the same
+    /// anchor derive the *same* instant for the same PCR, and nothing
+    /// about either node enters the calculation.
+    #[test]
+    fn anchored_targets_are_identical_across_nodes_and_read_no_local_clock() {
+        let a = anchor_at(1_000_000, T2026_NS as i128);
+        let pcr = 1_000_000 + 27_000_000; // one second later on the source
+        // Node A has leap-second data (TAI-UTC = 37 s), node B does not.
+        let t_a = target_tai_ns_anchored(pcr, 37_000_000_000, 200_000_000, &a);
+        let t_b = target_tai_ns_anchored(pcr, 0, 200_000_000, &a);
+        // Each lands on its own TAI timeline, but both denote the same
+        // CLOCK_REALTIME instant — the skew cancels.
+        assert_eq!(t_a - 37_000_000_000, t_b);
+        // And that instant is anchor + 1 s of source time + the offset.
+        assert_eq!(t_b, T2026_NS as i128 + 1_000_000_000 + 200_000_000);
+    }
+
+    #[test]
+    fn anchored_inversion_round_trips_forwards_and_backwards() {
+        let a = anchor_at(500_000_000, T2026_NS as i128);
+        for secs in [-3600i64, -60, -1, 0, 1, 60, 3600] {
+            let pcr = (500_000_000i64 + secs * 27_000_000)
+                .rem_euclid(PCR_MODULUS_27MHZ as i64) as u64;
+            let got = unix_ns_from_pcr_anchored(pcr, &a);
+            let want = T2026_NS as i128 + secs as i128 * 1_000_000_000;
+            assert!(
+                (got - want).abs() <= 40,
+                "secs={secs}: got {got} want {want}"
+            );
+        }
+    }
+
+    /// A re-mint must switch both nodes on the same *packet*. Gating on a
+    /// content coordinate is what makes that true regardless of when each
+    /// node received the new anchor.
+    #[test]
+    fn effective_from_pcr_gates_on_content_not_wall_time() {
+        let mut next = anchor_at(2_000_000, T2026_NS as i128);
+        next.effective_from_pcr = Some(2_000_000);
+        assert!(!next.is_effective_for(1_999_999), "before the trigger");
+        assert!(next.is_effective_for(2_000_000), "exactly at the trigger");
+        assert!(next.is_effective_for(2_000_001), "after the trigger");
+        // Still correct once the PCR has wrapped past the trigger.
+        assert!(next.is_effective_for(2_000_000 + 27_000_000));
     }
 }

@@ -2508,4 +2508,30 @@ pub struct EpochLockStats {
     pub deficit_us: u64,
     /// High-water mark of `deficit_us` since output start.
     pub deficit_max_us: u64,
+    /// Times the analytic target was truncated by the future-lookahead
+    /// ceiling — this node released **early** relative to the group.
+    ///
+    /// The mirror image of `deficit_us`, and it needs the opposite remedy:
+    /// a deficit means "this node cannot keep up, raise the offset", a
+    /// clamp means "the offset exceeds what the emitter will hold, lower
+    /// it". Reporting them as one "unhealthy" bit would send the operator
+    /// the wrong way half the time.
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub clamped: u64,
+    /// Times a derivation was rejected as implausible — the PCR being
+    /// inverted is not on the group's timeline at all.
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub implausible: u64,
+    /// True while the plausibility gate has taken this output **off** the
+    /// analytic anchor and back onto classic relative pacing.
+    ///
+    /// The single most important field here: without it a misconfigured
+    /// output is indistinguishable from an aligned one.
+    #[serde(default)]
+    pub disengaged: bool,
+    /// Generation of the group anchor in force. Members reporting
+    /// different generations are misaligned by the difference between
+    /// their anchors — a fault no other field would reveal.
+    #[serde(default)]
+    pub anchor_generation: u32,
 }

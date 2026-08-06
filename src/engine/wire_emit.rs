@@ -599,6 +599,13 @@ pub fn spawn_wire_emitter(
     // path, the label only to telemetry at startup.
     let epoch_offset_ns = epoch_lock.as_ref().map(|e| e.offset_ns);
     let epoch_group_label = epoch_lock.as_ref().and_then(|e| e.group_label.clone());
+    let epoch_anchor = epoch_lock.as_ref().and_then(|e| e.anchor);
+    let epoch_anchor_cell = epoch_lock.as_ref().and_then(|e| e.anchor_cell.clone());
+    // Seed the live cell so a manager re-mint and a config-borne anchor
+    // are the same mechanism rather than two competing ones.
+    if let (Some(cell), Some(a)) = (epoch_anchor_cell.as_ref(), epoch_anchor) {
+        cell.store(a);
+    }
 
     // Releaser selection policy. **Default = clock_nanosleep**, *not* SO_TXTIME.
     //
@@ -789,6 +796,7 @@ pub fn spawn_wire_emitter(
             );
             run_emitter(
                 thread_id, socket, dest, anchor, releaser, dejitter, epoch_offset_ns,
+                epoch_anchor, epoch_anchor_cell,
                 stats_for_thread, cancel, rx,
             );
         })
@@ -969,6 +977,44 @@ struct TargetState {
     /// `now_ns` after which [`Self::epoch_tai_skew_ns`] is re-sampled.
     /// Zero forces a sample on first use.
     epoch_skew_refresh_at_ns: u64,
+    /// Group-shared source-PCR → wall-instant anchor, when the manager has
+    /// minted one for this output's alignment group.
+    ///
+    /// `Some` selects the **anchored** derivation, which is a pure
+    /// function of `(pcr, anchor)` and reads no local clock — that is what
+    /// makes independent nodes agree. `None` falls back to the closed-form
+    /// UNIX-epoch inversion, which is correct only when the stream's
+    /// originator is itself epoch-locked.
+    epoch_anchor: Option<crate::engine::epoch_lock::SourceAnchor>,
+    /// Live cell the manager re-mints into. Polled once per PCR-bearing
+    /// datagram (~25-50/s), never per datagram.
+    epoch_anchor_cell: Option<std::sync::Arc<crate::engine::epoch_lock::EpochAnchorCell>>,
+    /// Anchor to adopt once the source PCR reaches its `effective_from_pcr`
+    /// trigger. Staged rather than applied on arrival so every member
+    /// switches on the same *packet*.
+    epoch_pending_anchor: Option<crate::engine::epoch_lock::SourceAnchor>,
+    /// Consecutive implausible / plausible anchor derivations, for the
+    /// disengage hysteresis. See [`TargetState::epoch_plausible`].
+    epoch_implausible_run: u32,
+    epoch_plausible_run: u32,
+    /// True while the plausibility gate has taken this output *off* the
+    /// analytic anchor and back onto classic relative pacing.
+    ///
+    /// Deliberately re-enterable rather than a latch: a one-off clock step
+    /// or a burst of foreign PCR must not take the output off the group
+    /// timeline for the life of the flow.
+    epoch_disengaged: bool,
+    /// Times the analytic target was truncated by the future-lookahead
+    /// ceiling. Non-zero means the emitter could not hold the datagram as
+    /// long as the group timeline asked, so this node ran early.
+    epoch_clamped: u64,
+    /// Times the gate rejected a derivation as implausible.
+    epoch_implausible: u64,
+    /// Set for the duration of one `derive_target` call when the analytic
+    /// anchor produced this datagram's target, so the outer monotonic
+    /// guard knows to accept it verbatim instead of flooring it against a
+    /// stale local value. Reset at the top of every call.
+    epoch_anchor_applied: bool,
 }
 
 /// How often to re-sample the TAI−realtime skew. The value only moves at
@@ -989,7 +1035,38 @@ pub struct EpochLockParams {
     pub offset_ns: u64,
     /// Operator's group label, telemetry only.
     pub group_label: Option<String>,
+    /// Group-shared source-PCR → wall anchor, when one has been minted.
+    /// `None` leaves the emitter on the closed-form UNIX-epoch inversion,
+    /// which only aligns nodes when the source itself is epoch-locked.
+    pub anchor: Option<crate::engine::epoch_lock::SourceAnchor>,
+    /// Live cell the manager re-mints into, so a refreshed anchor reaches
+    /// a running emitter without restarting the output — a restart would
+    /// drop the accumulated dwell and glitch the feed.
+    pub anchor_cell: Option<std::sync::Arc<crate::engine::epoch_lock::EpochAnchorCell>>,
 }
+
+/// Slack either side of the expected target before a derivation is judged
+/// implausible, on top of the configured offset.
+///
+/// Sized off the offset rather than fixed: the whole point is to catch a
+/// PCR that has no relationship to the group's timeline (a foreign or
+/// free-running source, a mis-latched MPTS program, a stale anchor), and
+/// those miss by seconds to hours, not by milliseconds. A fixed 30 s
+/// window — as the first cut used — is 30-60x the dwell budget, so every
+/// discontinuity between half a second and half a minute sails through and
+/// silently un-aligns the node.
+const EPOCH_PLAUSIBILITY_SLACK_NS: u64 = 2_000_000_000;
+
+/// Consecutive implausible derivations before the gate disengages.
+/// More than one so a single corrupt PCR cannot drop the output off the
+/// group timeline.
+const EPOCH_DISENGAGE_AFTER: u32 = 3;
+
+/// Consecutive plausible derivations before the gate re-engages. Wider
+/// than the disengage threshold so the output cannot flap between the two
+/// pacing models at the boundary — flapping would move the two nodes apart
+/// at exactly the moment an operator is trying to diagnose them.
+const EPOCH_REENGAGE_AFTER: u32 = 16;
 
 /// Minimum gap (ns) between consecutive `derive_target` returns when
 /// the natural computation would have produced a non-monotonic step.
@@ -1016,14 +1093,102 @@ impl TargetState {
     /// recorded in `epoch_deficit_ns` rather than silently absorbed, since
     /// it is the difference between "the group is misaligned" and "this
     /// node's budget is too tight" — two problems with different fixes.
+    /// Is a derived target close enough to `now` to be believable?
+    ///
+    /// A target should land within roughly `[now, now + offset]`. Anything
+    /// far outside that means the PCR being inverted is not on the group's
+    /// timeline at all — a `passthrough_clock` stream behind a
+    /// non-epoch-locked encoder, a mis-latched MPTS program, a stale
+    /// anchor generation, or plain corruption. Those miss by seconds or
+    /// hours, so a generous slack still catches them while never firing on
+    /// ordinary jitter.
+    #[inline]
+    fn epoch_plausible(&self, target: i128, now_ns: u64, offset_ns: u64) -> bool {
+        let window = offset_ns.saturating_add(EPOCH_PLAUSIBILITY_SLACK_NS) as i128;
+        (target - now_ns as i128).abs() <= window
+    }
+
+    /// Analytic epoch anchor for a PCR-bearing datagram.
+    ///
+    /// `#[inline(never)]`: this is ~120 instructions and `derive_target_raw`
+    /// is called from two sites, so letting it inline doubled the hottest
+    /// per-datagram function's code footprint (measured 1440 -> 2695 bytes)
+    /// — paid in I-cache by every output on the host, including the ST 2110
+    /// ones that can never reach this code. It runs once per PCR-bearing
+    /// datagram (~25-50/s), so the call is free at this rate.
+    #[inline(never)]
     fn epoch_anchor_ns(&mut self, pcr: u64, now_ns: u64) -> Option<u64> {
         let offset_ns = self.epoch_offset_ns?;
-        let target = crate::engine::epoch_lock::target_tai_ns(
-            pcr,
-            now_ns,
-            self.epoch_tai_skew_ns,
-            offset_ns,
-        );
+
+        // Pick up a re-mint. Staged rather than applied on sight so the
+        // switch happens on a content coordinate; see below.
+        if let Some(published) = self.epoch_anchor_cell.as_ref().and_then(|c| c.load()) {
+            let live_gen = self.epoch_anchor.map(|a| a.generation).unwrap_or(0);
+            let staged_gen = self.epoch_pending_anchor.map(|a| a.generation);
+            if published.generation != live_gen && staged_gen != Some(published.generation) {
+                if published.effective_from_pcr.is_some() {
+                    self.epoch_pending_anchor = Some(published);
+                } else {
+                    self.epoch_anchor = Some(published);
+                }
+            }
+        }
+
+        // Adopt a staged anchor once the source timeline reaches its
+        // trigger, so every member switches on the same packet.
+        if let Some(pending) = self.epoch_pending_anchor {
+            if pending.is_effective_for(pcr) {
+                self.epoch_anchor = Some(pending);
+                self.epoch_pending_anchor = None;
+            }
+        }
+
+        let target = match self.epoch_anchor.as_ref() {
+            // Group-shared anchor: a pure function of (pcr, anchor). No
+            // local clock reading enters the result, which is precisely
+            // why two nodes agree.
+            Some(anchor) => crate::engine::epoch_lock::target_tai_ns_anchored(
+                pcr,
+                self.epoch_tai_skew_ns,
+                offset_ns,
+                anchor,
+            ),
+            // No anchor: fall back to the closed-form UNIX-epoch
+            // inversion. Correct only for a source that is itself
+            // epoch-locked; the plausibility gate below is what stops a
+            // free-running source from being paced off a garbage instant.
+            None => crate::engine::epoch_lock::target_tai_ns(
+                pcr,
+                now_ns,
+                self.epoch_tai_skew_ns,
+                offset_ns,
+            ),
+        };
+
+        if self.epoch_plausible(target, now_ns, offset_ns) {
+            self.epoch_implausible_run = 0;
+            self.epoch_plausible_run = self.epoch_plausible_run.saturating_add(1);
+            if self.epoch_disengaged && self.epoch_plausible_run >= EPOCH_REENGAGE_AFTER {
+                self.epoch_disengaged = false;
+            }
+        } else {
+            self.epoch_plausible_run = 0;
+            self.epoch_implausible_run = self.epoch_implausible_run.saturating_add(1);
+            self.epoch_implausible = self.epoch_implausible.saturating_add(1);
+            if self.epoch_implausible_run >= EPOCH_DISENGAGE_AFTER {
+                self.epoch_disengaged = true;
+            }
+        }
+
+        // Disengaged: hand the datagram back to classic relative pacing
+        // rather than to a target we do not believe. Reported, never
+        // silent — an operator must be able to tell "aligned" from
+        // "quietly pacing itself".
+        if self.epoch_disengaged {
+            self.epoch_engaged = false;
+            return None;
+        }
+
         self.epoch_engaged = true;
         if target <= now_ns as i128 {
             self.epoch_deficit_ns = (now_ns as i128 - target).unsigned_abs() as u64;
@@ -1049,8 +1214,22 @@ impl TargetState {
     /// `last_returned`. With the follow-through, natural pacing
     /// resumes seamlessly from the guarded anchor.
     fn derive_target(&mut self, now_ns: u64, datagram_pcr: Option<u64>, datagram_bytes: usize) -> u64 {
+        self.epoch_anchor_applied = false;
         let raw = self.derive_target_raw(now_ns, datagram_pcr, datagram_bytes);
-        let guarded = if raw < self.last_returned_ns {
+        // An analytic epoch target is authoritative: it is the same value
+        // on every member, and `epoch_anchor_ns` has already floored it at
+        // `now_ns`, so it can never ask the emitter to send in the past.
+        // Running it through the backwards guard would replace it with
+        // `last_returned + 1 us` — a stale *local* value — and pin
+        // `wall_anchor` there, which is the one thing that must not happen
+        // to a target whose whole purpose is to be node-independent. The
+        // classic branches below reset `last_returned_ns` for exactly this
+        // reason (see the discontinuity and late-rebase resets); the epoch
+        // branch returns early and cannot, so it is handled here instead.
+        let guarded = if self.epoch_anchor_applied {
+            self.last_returned_ns = raw;
+            raw
+        } else if raw < self.last_returned_ns {
             // Strict backwards step — kernel ETF would reorder. Push
             // forward to last_returned + epsilon and fast-forward the
             // pacing anchor so subsequent natural-paced calls compute
@@ -1080,8 +1259,33 @@ impl TargetState {
         // `wall_anchor` and `last_returned_ns` to the cap so subsequent
         // natural-paced calls compute from the bounded baseline rather
         // than re-clamping each packet.
-        let max_future = now_ns.saturating_add(MAX_FUTURE_LOOKAHEAD_NS);
+        //
+        // **Epoch lock widens this ceiling, and only for itself.** The
+        // spiral above is a property of the *closed-loop* pacer: each
+        // target is built from the previous anchor, so an over-estimate
+        // compounds. The analytic anchor is recomputed from the PCR on
+        // every PCR-bearing datagram and never reads the previous anchor,
+        // so it cannot integrate and cannot spiral. Leaving the ceiling at
+        // a flat 200 ms instead silently truncates every offset above it —
+        // reintroducing a dependence on local `now`, which is exactly what
+        // epoch lock exists to remove (measured: 80 ms of inter-node
+        // divergence, i.e. the full ingest skew, at every offset >= 300
+        // ms). The ceiling is retained as a bounded backstop at
+        // `offset + MAX_FUTURE_LOOKAHEAD_NS`, and truncations are now
+        // counted rather than absorbed in silence.
+        let lookahead = match self.epoch_offset_ns {
+            Some(off) if self.epoch_engaged => {
+                MAX_FUTURE_LOOKAHEAD_NS.saturating_add(off)
+            }
+            // Byte-for-byte the previous behaviour for every output that
+            // does not run epoch lock — which is all of them by default.
+            _ => MAX_FUTURE_LOOKAHEAD_NS,
+        };
+        let max_future = now_ns.saturating_add(lookahead);
         let final_target = if guarded > max_future {
+            if self.epoch_engaged {
+                self.epoch_clamped = self.epoch_clamped.saturating_add(1);
+            }
             self.wall_anchor_ns = max_future;
             max_future
         } else {
@@ -1102,9 +1306,15 @@ impl TargetState {
             // lands on the group's shared timeline immediately. Without a
             // PCR we still have nothing to invert, so fall through to the
             // classic preroll and pick up the anchor on the first PCR.
-            self.wall_anchor_ns = datagram_pcr
+            self.wall_anchor_ns = match datagram_pcr
                 .and_then(|pcr| self.epoch_anchor_ns(pcr, now_ns))
-                .unwrap_or_else(|| now_ns.saturating_add(PREROLL_NS));
+            {
+                Some(epoch_target) => {
+                    self.epoch_anchor_applied = true;
+                    epoch_target
+                }
+                None => now_ns.saturating_add(PREROLL_NS),
+            };
             self.bytes_since_anchor = 0;
             self.initialised = true;
             if let Some(pcr) = datagram_pcr {
@@ -1166,8 +1376,12 @@ impl TargetState {
                     self.pcr_anchor = Some(pcr);
                     self.wall_anchor_ns = epoch_target;
                     self.bytes_since_anchor = 0;
+                    self.epoch_anchor_applied = true;
                     return epoch_target;
                 }
+                // Gate disengaged: fall through to classic relative
+                // anchoring for this datagram rather than pacing off a
+                // target we do not believe.
             }
 
             if let Some(prev) = self.pcr_anchor {
@@ -1579,12 +1793,25 @@ fn refresh_epoch_skew(state: &mut TargetState, now_ns: u64) {
 /// function of its inputs — it carries a large unit-test suite that would
 /// otherwise need a stats handle threaded through every case.
 ///
-/// A no-op unless epoch lock is both configured and engaged, so the
-/// classic pacing path pays one predictable branch.
+/// A no-op unless epoch lock is configured, so the classic pacing path
+/// pays one predictable branch.
+///
+/// `had_pcr` gates the write to PCR-bearing datagrams only. The values it
+/// publishes change exactly when an anchor is derived (~25-50/s), so
+/// firing per datagram instead would issue ~950k lock-prefixed `fetch_max`
+/// per second at 10 Gbps on the SCHED_FIFO wire thread for no new
+/// information.
 #[inline]
-fn report_epoch_deficit(state: &TargetState, stats: &OutputStatsAccumulator) {
-    if state.epoch_offset_ns.is_some() && state.epoch_engaged {
-        stats.record_epoch_lock_anchor(state.epoch_deficit_ns / 1_000);
+fn report_epoch_deficit(state: &TargetState, stats: &OutputStatsAccumulator, had_pcr: bool) {
+    if state.epoch_offset_ns.is_some() && had_pcr {
+        stats.record_epoch_lock_anchor(
+            state.epoch_engaged,
+            state.epoch_deficit_ns / 1_000,
+            state.epoch_clamped,
+            state.epoch_implausible,
+            state.epoch_disengaged,
+            state.epoch_anchor.map(|a| a.generation).unwrap_or(0),
+        );
     }
 }
 
@@ -1596,12 +1823,16 @@ fn run_emitter(
     releaser: Releaser,
     dejitter: DejitterConfig,
     epoch_offset_ns: Option<u64>,
+    epoch_anchor: Option<crate::engine::epoch_lock::SourceAnchor>,
+    epoch_anchor_cell: Option<Arc<crate::engine::epoch_lock::EpochAnchorCell>>,
     stats: Arc<OutputStatsAccumulator>,
     cancel: CancellationToken,
     rx: WireTxReceiver,
 ) {
     let mut state = TargetState {
         epoch_offset_ns,
+        epoch_anchor,
+        epoch_anchor_cell,
         ..TargetState::default()
     };
     let mut packets_since_drain: u64 = 0;
@@ -1701,7 +1932,7 @@ fn run_emitter(
                     ),
                     AnchorSource::St2110Raster => dg.target_tx_time_ns.unwrap_or(now_ns),
                 };
-                report_epoch_deficit(&state, &stats);
+                report_epoch_deficit(&state, &stats, pcr_27mhz.is_some());
                 (dg, target_ns, pcr_27mhz)
             }
         };
@@ -1831,7 +2062,7 @@ fn run_emitter(
                             rx.depth.load(Ordering::Relaxed),
                             &dejitter,
                         );
-                        report_epoch_deficit(&state, &stats);
+                        report_epoch_deficit(&state, &stats, next_pcr_27mhz.is_some());
                         if next_target <= now_ns {
                             batch.push(BatchEntry {
                                 dg: next_dg,
@@ -2482,114 +2713,232 @@ mod tests {
 
     // ── Epoch-locked egress ─────────────────────────────────────────────
 
-    /// Build a `TargetState` with epoch lock armed at `offset_ms`.
+    /// A `TargetState` with epoch lock armed at `offset_ms`, under a
+    /// group-shared anchor.
     ///
-    /// Skew is pinned to zero and the refresh timer parked far in the
-    /// future, so the harness can treat "TAI" and "realtime" as one
-    /// domain. Without that these tests would silently depend on whether
-    /// the build host has leap-second data loaded (a 37 s difference).
-    fn epoch_state(offset_ms: u64) -> TargetState {
+    /// Skew is pinned to zero and the refresh timer parked, so the harness
+    /// can treat TAI and realtime as one domain — without that these tests
+    /// would depend on whether the build host has leap-second data loaded
+    /// (a 37 s difference).
+    fn epoch_state(offset_ms: u64, anchor: crate::engine::epoch_lock::SourceAnchor) -> TargetState {
         TargetState {
             epoch_offset_ns: Some(offset_ms * 1_000_000),
+            epoch_anchor: Some(anchor),
             epoch_tai_skew_ns: 0,
             epoch_skew_refresh_at_ns: u64::MAX,
             ..TargetState::default()
         }
     }
 
-    /// A PCR value an epoch-locked master would emit `ago_ms` ago, plus the
-    /// matching CLOCK_TAI reading for "now" (TAI == realtime on this host's
-    /// test harness, which is the conservative case).
-    fn pcr_generated_ms_ago(ago_ms: u64) -> (u64, u64) {
-        let now_realtime = std::time::SystemTime::now()
+    /// A source timeline: an arbitrary free-running PCR (the realistic
+    /// case — a contribution encoder's PCR has no relationship to the UNIX
+    /// epoch), plus the group anchor that labels it, plus "now".
+    fn source_timeline() -> (u64, crate::engine::epoch_lock::SourceAnchor, u64) {
+        let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .expect("system clock is after the UNIX epoch")
             .as_nanos();
-        let generated = now_realtime - (ago_ms as u128 * 1_000_000);
-        let pcr = crate::engine::epoch_lock::pcr_27mhz_from_unix_ns(generated);
-        (pcr, now_realtime as u64)
+        // Deliberately unrelated to wall time — inverting this with the
+        // closed form would land ~hours away.
+        let pcr_now = 4_242_424_242u64;
+        let anchor = crate::engine::epoch_lock::SourceAnchor {
+            pcr_27mhz: pcr_now,
+            unix_ns: now as i128,
+            generation: 1,
+            effective_from_pcr: None,
+        };
+        (pcr_now, anchor, now as u64)
     }
 
-    /// The core claim: the target is a function of the PCR, not of when
-    /// this emitter happened to start. Two states created at different
-    /// moments, fed the same PCR, must agree.
+    fn pcr_plus_ms(pcr: u64, ms: i64) -> u64 {
+        let d = ms * 27_000;
+        ((pcr as i128 + d as i128)
+            .rem_euclid(crate::engine::epoch_lock::PCR_MODULUS_27MHZ as i128)) as u64
+    }
+
+    /// **The property the whole feature exists for**, asserted through the
+    /// production entry point.
     ///
-    /// This is the property that makes nodes align without coordinating,
-    /// so it is worth asserting directly rather than inferring from
-    /// pacing behaviour.
+    /// Two nodes whose emitters are at completely different phases — they
+    /// started at different times and their ingest paths differ by 300 ms —
+    /// must derive the *same* release instant for the same content.
+    ///
+    /// Deliberately `derive_target`, not `derive_target_raw`. Every epoch
+    /// test in PR #83 called the raw inner function, which is the one entry
+    /// point production never uses: `derive_target_paced` -> `derive_target`
+    /// is the only path for `egress_pacing: "pcr"`. That single omission is
+    /// why a 200 ms ceiling that truncated every target above it shipped
+    /// unexamined.
     #[test]
-    fn epoch_targets_depend_only_on_the_pcr_not_on_start_time() {
-        let (pcr, now_tai) = pcr_generated_ms_ago(0);
-        // Offset comfortably exceeds the start-time difference below, so
-        // both states can actually meet the target. (When one cannot, it
-        // clamps to `now` and emits immediately — that is the deficit
-        // path, covered separately; it is a difference in *ability to
-        // meet* the target, not in the target itself.)
-        let mut early = epoch_state(500);
-        let mut late = epoch_state(500);
-        // `late` starts a quarter second after `early` — under classic
-        // anchoring that difference lands directly in the target.
-        let t_early = early.derive_target_raw(now_tai, Some(pcr), 1316);
-        let t_late = late.derive_target_raw(now_tai + 250_000_000, Some(pcr), 1316);
-        assert_eq!(t_early, 0u64.max(t_late).max(t_early), "sanity");
-        let divergence = t_early.abs_diff(t_late);
-        assert!(
-            divergence <= 1_000,
-            "epoch targets diverged by {divergence} ns for the same PCR —              they must not depend on emitter start time"
+    fn two_nodes_derive_the_same_release_instant_through_the_production_path() {
+        let (pcr_now, anchor, now) = source_timeline();
+        // 400 ms of offset: comfortably above the 80 ms PCR pre-roll and
+        // well inside the residence cap.
+        let mut node_a = epoch_state(400, anchor);
+        let mut node_b = epoch_state(400, anchor);
+
+        // Node A's emitter dequeues this content 20 ms after the anchor
+        // instant; node B's is 300 ms behind it on a slower path.
+        let pcr = pcr_plus_ms(pcr_now, 0);
+        let t_a = node_a.derive_target(now + 20_000_000, Some(pcr), 1316);
+        let t_b = node_b.derive_target(now + 320_000_000, Some(pcr), 1316);
+
+        assert_eq!(
+            t_a, t_b,
+            "same content + same anchor must give the same instant, whatever \
+             each node's own phase is"
         );
-        assert_eq!(early.epoch_deficit_ns, 0);
-        assert_eq!(late.epoch_deficit_ns, 0);
+        // And that instant is the anchor plus the operator's offset.
+        assert_eq!(t_a, now + 400_000_000);
+        assert_eq!(node_a.epoch_deficit_ns, 0);
+        assert_eq!(node_b.epoch_deficit_ns, 0);
+        assert_eq!(node_a.epoch_clamped, 0, "target must survive the ceiling");
+        assert_eq!(node_b.epoch_clamped, 0);
     }
 
-    /// A PCR older than the configured offset cannot be honoured. The
-    /// emitter must say so via `epoch_deficit_ns` rather than quietly
-    /// emitting late and looking healthy.
+    /// The ceiling must not truncate a legitimate epoch target. This is the
+    /// regression test for the defect that made PR #83 a no-op above
+    /// ~200 ms of offset while reporting `deficit = 0`.
+    #[test]
+    fn the_future_ceiling_does_not_truncate_an_epoch_target() {
+        for offset_ms in [150u64, 250, 400, 600, 800] {
+            let (pcr_now, anchor, now) = source_timeline();
+            let mut s = epoch_state(offset_ms, anchor);
+            let t = s.derive_target(now, Some(pcr_now), 1316);
+            assert_eq!(
+                t,
+                now + offset_ms * 1_000_000,
+                "offset {offset_ms} ms was truncated by the lookahead ceiling"
+            );
+            assert_eq!(s.epoch_clamped, 0, "offset {offset_ms} ms hit the ceiling");
+        }
+    }
+
+    /// A node that cannot meet the offset emits immediately and *says so*.
+    /// Both nodes still name the same instant; they differ only in ability
+    /// to meet it.
     #[test]
     fn epoch_reports_a_deficit_when_the_offset_cannot_be_met() {
-        // Offset budget 100 ms, but the PCR is already 400 ms old.
-        let (pcr, now_tai) = pcr_generated_ms_ago(400);
-        let mut s = epoch_state(100);
-        let target = s.derive_target_raw(now_tai, Some(pcr), 1316);
-        assert_eq!(target, now_tai, "a missed target must emit immediately");
+        let (pcr_now, anchor, now) = source_timeline();
+        let mut s = epoch_state(200, anchor);
+        // Content arrives at the emitter 500 ms after its anchor instant,
+        // against a 200 ms budget.
+        let t = s.derive_target(now + 500_000_000, Some(pcr_now), 1316);
+        assert_eq!(t, now + 500_000_000, "a missed target must emit immediately");
         assert!(s.epoch_engaged);
         let deficit_ms = s.epoch_deficit_ns / 1_000_000;
         assert!(
-            (250..=350).contains(&deficit_ms),
+            (290..=310).contains(&deficit_ms),
             "expected a ~300 ms deficit, got {deficit_ms} ms"
         );
     }
 
-    /// Healthy case: a fresh PCR with a generous offset targets the
-    /// future and reports no deficit.
+    /// A PCR with no relationship to the group timeline must take the
+    /// output OFF the analytic anchor rather than pace it off a garbage
+    /// instant — and must be re-enterable, so a transient does not disable
+    /// alignment for the life of the flow.
     #[test]
-    fn epoch_reports_no_deficit_when_the_offset_is_comfortable() {
-        let (pcr, now_tai) = pcr_generated_ms_ago(10);
-        let mut s = epoch_state(500);
-        let target = s.derive_target_raw(now_tai, Some(pcr), 1316);
-        assert!(target > now_tai, "a met target must sit in the future");
-        assert_eq!(s.epoch_deficit_ns, 0);
-        assert!(s.epoch_engaged);
+    fn implausible_pcr_disengages_and_then_recovers() {
+        let (pcr_now, anchor, now) = source_timeline();
+        let mut s = epoch_state(400, anchor);
+        let good = s.derive_target(now, Some(pcr_now), 1316);
+        assert_eq!(good, now + 400_000_000);
+        assert!(!s.epoch_disengaged);
+
+        // A foreign PCR — an hour off the group timeline.
+        let foreign = pcr_plus_ms(pcr_now, 3_600_000);
+        for _ in 0..EPOCH_DISENGAGE_AFTER {
+            let _ = s.derive_target(now, Some(foreign), 1316);
+        }
+        assert!(s.epoch_disengaged, "must disengage on sustained implausibility");
+        assert!(!s.epoch_engaged, "telemetry must stop claiming alignment");
+        assert!(s.epoch_implausible >= EPOCH_DISENGAGE_AFTER as u64);
+
+        // Recovery: enough consecutive good derivations re-engages it.
+        let mut t = now;
+        for i in 0..EPOCH_REENGAGE_AFTER {
+            t = now + (i as u64 + 1) * 40_000_000;
+            let _ = s.derive_target(t, Some(pcr_plus_ms(pcr_now, 40 * (i as i64 + 1))), 1316);
+        }
+        assert!(!s.epoch_disengaged, "must re-engage once the source is sane again");
+        let _ = t;
     }
 
-    /// A PCR discontinuity — an input switch, a source restart — must not
-    /// knock the output off the group timeline. Under classic anchoring
-    /// this resets pacing to "now"; under epoch lock the new PCR is just
-    /// as invertible as the old one, so alignment survives.
+    /// A re-mint must land on the same *packet* on every member, not at the
+    /// same moment on each member's own clock — otherwise the switch opens
+    /// a divergence window equal to the whole anchor step.
     #[test]
-    fn epoch_survives_a_pcr_discontinuity() {
-        let (pcr_a, now_tai) = pcr_generated_ms_ago(10);
-        let mut s = epoch_state(500);
-        let _ = s.derive_target_raw(now_tai, Some(pcr_a), 1316);
-        // New source: PCR jumps by hours, far beyond the discontinuity
-        // threshold the relative path would trip on.
-        let jumped = pcr_a.wrapping_add(90_000 * 27_000);
-        let target = s.derive_target_raw(now_tai + 40_000_000, Some(jumped), 1316);
-        assert_ne!(
-            target,
-            now_tai + 40_000_000,
-            "discontinuity fell through to the relative 'reset to now' path"
+    fn a_remint_takes_effect_on_a_content_coordinate() {
+        let (pcr_now, anchor, now) = source_timeline();
+        let mut s = epoch_state(400, anchor);
+        let _ = s.derive_target(now, Some(pcr_now), 1316);
+
+        // New anchor, shifted 50 ms later, effective from 1 s of source time.
+        let trigger = pcr_plus_ms(pcr_now, 1_000);
+        s.epoch_pending_anchor = Some(crate::engine::epoch_lock::SourceAnchor {
+            pcr_27mhz: anchor.pcr_27mhz,
+            unix_ns: anchor.unix_ns + 50_000_000,
+            generation: 2,
+            effective_from_pcr: Some(trigger),
+        });
+
+        // Before the trigger: still on generation 1.
+        let before = s.derive_target(now + 500_000_000, Some(pcr_plus_ms(pcr_now, 500)), 1316);
+        assert_eq!(before, now + 900_000_000, "old anchor still in force");
+        assert_eq!(s.epoch_anchor.unwrap().generation, 1);
+
+        // At the trigger: generation 2, and the 50 ms step is applied.
+        let after = s.derive_target(now + 1_000_000_000, Some(trigger), 1316);
+        assert_eq!(s.epoch_anchor.unwrap().generation, 2);
+        assert_eq!(after, now + 1_000_000_000 + 400_000_000 + 50_000_000);
+    }
+
+    /// Under epoch lock a PCR discontinuity is not a special case — the
+    /// target depends only on the PCR in hand — so both members compute the
+    /// *same* new instant. Note this asserts the opposite of PR #83's test
+    /// of the same name, which only checked that the relative "reset to
+    /// now" branch was avoided, and did so through the raw path.
+    ///
+    /// Also pins the operational consequence, which is easy to miss: after
+    /// a **backward** source discontinuity the group anchor still labels
+    /// the old timeline, so the content is "late" by the size of the step
+    /// and every member falls into deficit and emits on arrival. Members
+    /// still agree on the target; they are all simply unable to meet it.
+    /// Recovering alignment needs a manager re-mint, not a longer offset.
+    #[test]
+    fn a_source_discontinuity_is_followed_identically_by_both_nodes() {
+        let (pcr_now, anchor, now) = source_timeline();
+        let mut a = epoch_state(400, anchor);
+        let mut b = epoch_state(400, anchor);
+        let _ = a.derive_target(now, Some(pcr_now), 1316);
+        let _ = b.derive_target(now + 250_000_000, Some(pcr_now), 1316);
+
+        // A forward step inside the offset budget is followed exactly.
+        let stepped = pcr_plus_ms(pcr_now, 120);
+        let now_a = now + 40_000_000;
+        let now_b = now + 290_000_000;
+        let t_a = a.derive_target(now_a, Some(stepped), 1316);
+        let t_b = b.derive_target(now_b, Some(stepped), 1316);
+        assert_eq!(t_a, t_b, "both members must land on the same new instant");
+        assert_eq!(t_a, now + 120_000_000 + 400_000_000);
+
+        // A large backward step: the anchor now labels a stale timeline, so
+        // both members are in deficit and release on arrival — at their own
+        // phase, because that is what "cannot meet the target" means.
+        let restarted = pcr_plus_ms(pcr_now, -10_000);
+        let e_a = a.derive_target(now_a, Some(restarted), 1316);
+        let e_b = b.derive_target(now_b, Some(restarted), 1316);
+        assert_eq!(e_a, now_a, "deficit releases on arrival");
+        assert_eq!(e_b, now_b);
+        // The agreed target is still identical — recover it from each
+        // node's own reported shortfall.
+        let target_a = now_a as i128 - a.epoch_deficit_ns as i128;
+        let target_b = now_b as i128 - b.epoch_deficit_ns as i128;
+        assert_eq!(
+            target_a, target_b,
+            "members must still agree on the instant, even when neither can meet it"
         );
-        assert!(s.epoch_engaged);
+        assert!(a.epoch_deficit_ns > 9_000_000_000, "deficit reflects the 10 s step");
     }
 
     /// Epoch lock off must leave the existing pacing byte-for-byte
