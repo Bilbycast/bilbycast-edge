@@ -2035,44 +2035,8 @@ async fn execute_command(
                     // toggling mid-flight is not yet wired through the
                     // FlowManager, so we avoid the disruptive restart here.
                     let input_changed = input_set_changed(&old_flow.input_ids, &new_flow.input_ids);
-                    // `content_analysis` tier toggles are baked in at
-                    // `FlowRuntime::start` (the analyser tasks are spawned
-                    // there). Toggling them mid-flight requires a flow
-                    // restart so the new tier tasks actually start running
-                    // — without this, the operator flips the switch in the
-                    // manager UI and nothing visible happens.
-                    let content_analysis_changed = old_flow.content_analysis != new_flow.content_analysis;
-                    // Recording-config changes (enabled flip, segment_seconds,
-                    // retention, max_bytes, pre_buffer_seconds) are baked in
-                    // at `FlowRuntime::start` — `spawn_writer` runs there and
-                    // owns the recording_handle for the flow's lifetime.
-                    // Mid-flight diff doesn't tear that handle down, so
-                    // unchecking `recording.enabled` in the flow form would
-                    // silently leave the writer rolling pre-roll TS to disk.
-                    // Restart the flow on any recording-config change so the
-                    // edit takes effect immediately.
-                    let recording_changed = old_flow.recording != new_flow.recording;
-                    let master_clock_changed = old_flow.master_clock != new_flow.master_clock;
-                    // Crossing the passthrough↔assembled boundary — or any
-                    // assembly-plan change that arrives via `update_flow`
-                    // rather than the `update_flow_assembly` hot-swap — must
-                    // rebuild the task graph. `FlowRuntime::start` keys
-                    // passthrough vs assembled off `assembly`, and the live
-                    // SPTS/MPTS assembler task is owned for the flow's
-                    // lifetime; the surgical output-only diff below never
-                    // tears it down. Without this the assembly-less config
-                    // would persist while the assembler keeps emitting, so
-                    // config and runtime silently diverge until the next
-                    // manual restart. (Same-boundary assembly edits still
-                    // hot-swap via `update_flow_assembly`, so this only forces
-                    // a restart on genuine plan changes routed through here —
-                    // notably the manager's "Convert to passthrough" button.)
-                    let assembly_changed = old_flow.assembly != new_flow.assembly;
-                    let restart_required = old_flow.bandwidth_limit != new_flow.bandwidth_limit
-                        || content_analysis_changed
-                        || recording_changed
-                        || master_clock_changed
-                        || assembly_changed;
+                    let restart_fields = flow_fields_requiring_restart(&old_flow, &new_flow);
+                    let restart_required = !restart_fields.is_empty();
                     let persist_only_meta_changed = old_flow.name != new_flow.name
                         || old_flow.media_analysis != new_flow.media_analysis
                         || old_flow.thumbnail != new_flow.thumbnail
@@ -2103,11 +2067,12 @@ async fn execute_command(
                     let force_restart = input_touches_hitless || restart_required;
 
                     if force_restart {
-                        // Input change that touches a hitless leg, rate-limit
-                        // change, or content-analysis / recording tier toggle
-                        // — must restart entire flow.
+                        // Input change that touches a hitless leg, or any of
+                        // the flow-level fields baked in at start — must
+                        // restart the entire flow.
                         tracing::info!(
-                            "Update flow '{flow_id}': restarting (input_touches_hitless={input_touches_hitless}, bandwidth_limit/content_analysis/recording/master_clock/assembly changed={restart_required}, content_analysis_changed={content_analysis_changed}, recording_changed={recording_changed}, master_clock_changed={master_clock_changed}, assembly_changed={assembly_changed})"
+                            "Update flow '{flow_id}': restarting (input_touches_hitless={input_touches_hitless}, fields changed=[{}])",
+                            restart_fields.join(", ")
                         );
                         let _ = flow_manager.destroy_flow(flow_id).await;
                         let resolved = {
@@ -3139,29 +3104,30 @@ async fn execute_command(
                             // start-up, since mid-flight subscriber toggle
                             // is not yet wired through FlowManager).
                             let input_changed = input_set_changed(&old_flow.input_ids, &new_flow.input_ids);
-                            // An input that stays a member but whose definition
-                            // changed cannot be reconciled surgically: the
-                            // common case is a flow's only input, which is also
-                            // its active one, and `remove_input` refuses to
-                            // take that away (`active_input_in_use`). So it is
-                            // a restart, exactly as the `update_input` command
-                            // already does for the same edit arriving by the
-                            // other route — this path was the only one that
-                            // silently did nothing.
+                            // Members whose *definition* changed. The roster
+                            // diff below only reconciles which ids belong, so
+                            // without this an edit to an input that stayed a
+                            // member was persisted and never applied.
                             let edited_inputs = changed_input_definitions(
                                 &new_flow.input_ids,
                                 &old_config.inputs,
                                 &new_config.inputs,
                             );
-                            let bandwidth_limit_changed =
-                                old_flow.bandwidth_limit != new_flow.bandwidth_limit;
-                            let restart_required =
-                                bandwidth_limit_changed || !edited_inputs.is_empty();
+                            // Same predicate the `update_flow` command uses, so
+                            // the two routes cannot disagree about what a
+                            // running flow has to be rebuilt for.
+                            let restart_fields =
+                                flow_fields_requiring_restart(old_flow, new_flow);
+                            let flow_restart_required = !restart_fields.is_empty();
                             let persist_only_meta_changed = old_flow.name != new_flow.name
                                 || old_flow.media_analysis != new_flow.media_analysis
                                 || old_flow.thumbnail != new_flow.thumbnail
                                 || old_flow.thumbnail_interval_secs != new_flow.thumbnail_interval_secs;
-                            if persist_only_meta_changed && !(input_changed || restart_required) {
+                            if persist_only_meta_changed
+                                && !(input_changed
+                                    || flow_restart_required
+                                    || !edited_inputs.is_empty())
+                            {
                                 tracing::info!(
                                     "Config diff: flow '{id}' metadata-only change — persisting without restart; thumbnail/media_analysis settings apply at next flow restart"
                                 );
@@ -3183,12 +3149,38 @@ async fn execute_command(
                             } else {
                                 false
                             };
-                            let force_restart = input_touches_hitless || restart_required;
+
+                            // An edited member is swapped in place where the
+                            // engine allows it, so re-pointing a standby input
+                            // no longer takes the on-air one off air with it.
+                            let restart_covers_edits = flow_restart_required
+                                || input_touches_hitless
+                                || edited_includes_active_input(
+                                    &edited_inputs,
+                                    &old_config.inputs,
+                                );
+                            let unswappable_inputs =
+                                if edited_inputs.is_empty() || restart_covers_edits {
+                                    edited_inputs.clone()
+                                } else {
+                                    replace_edited_inputs(
+                                        flow_manager,
+                                        id,
+                                        &edited_inputs,
+                                        &new_config.inputs,
+                                        _webrtc_sessions,
+                                    )
+                                    .await
+                                };
+                            let force_restart = input_touches_hitless
+                                || flow_restart_required
+                                || !unswappable_inputs.is_empty();
 
                             if force_restart {
                                 tracing::info!(
-                                    "Config diff: restarting flow '{id}' (input_touches_hitless={input_touches_hitless}, bandwidth_limit changed={bandwidth_limit_changed}, input definitions changed=[{}])",
-                                    edited_inputs.join(", ")
+                                    "Config diff: restarting flow '{id}' (input_touches_hitless={input_touches_hitless}, fields changed=[{}], inputs needing restart=[{}])",
+                                    restart_fields.join(", "),
+                                    unswappable_inputs.join(", ")
                                 );
                                 let _ = flow_manager.destroy_flow(id).await;
                                 match new_config.resolve_flow(new_flow) {
@@ -3228,9 +3220,12 @@ async fn execute_command(
                                 )
                                 .await;
                             } else {
-                                // Input unchanged — reconcile outputs against the runtime
+                                // Roster unchanged — any definition edit was
+                                // already swapped in place above; reconcile
+                                // outputs against the runtime.
                                 tracing::info!(
-                                    "Config diff: flow '{id}' unchanged, reconciling outputs (config old→new: {} → {})",
+                                    "Config diff: flow '{id}' roster unchanged ({} input definition edit(s) applied in place), reconciling outputs (config old→new: {} → {})",
+                                    edited_inputs.len(),
                                     old_flow.output_ids.len(),
                                     new_flow.output_ids.len(),
                                 );
@@ -5317,6 +5312,83 @@ fn input_set_changed(old: &[String], new: &[String]) -> bool {
     a != b
 }
 
+/// The flow-level fields whose change forces a full restart of a running
+/// flow, named. Empty means nothing restart-worthy changed.
+///
+/// **Shared by both routes on purpose.** `update_flow` (per-flow edit) and
+/// `update_config` (whole-config push) each have to make this decision, and
+/// for a long time only the first made it properly: the config diff compared
+/// `bandwidth_limit` alone, so a `recording` or `content_analysis` change
+/// arriving on a whole-config push was validated, persisted, echoed back by
+/// `/config` — and never applied. A field is easy to add to one list and
+/// forget in the other, so there is one list.
+///
+/// Why each field is here:
+///
+/// - `bandwidth_limit` sizes the flow's broadcast channel at construction.
+/// - `content_analysis` tier toggles are baked in at `FlowRuntime::start`,
+///   where the analyser tasks are spawned. Without a restart the operator
+///   flips the switch in the manager UI and nothing visible happens.
+/// - `recording` is owned by `spawn_writer`, which also runs at start and
+///   holds the recording handle for the flow's lifetime. A mid-flight diff
+///   never tears that handle down, so unchecking `recording.enabled` would
+///   silently leave the writer rolling pre-roll TS to disk.
+/// - `master_clock` selects the clock the whole flow is paced against.
+/// - `assembly` keys passthrough vs assembled in `FlowRuntime::start`, and
+///   the live SPTS/MPTS assembler task is owned for the flow's lifetime —
+///   the surgical output-only diff never tears it down, so an assembly-less
+///   config would persist while the assembler kept emitting. (Same-boundary
+///   assembly edits still hot-swap via `update_flow_assembly`; this catches
+///   plan changes routed through the two generic handlers — notably the
+///   manager's "Convert to passthrough" button.)
+///
+/// Deliberately absent: `name`, `media_analysis`, `thumbnail` and
+/// `thumbnail_interval_secs`. Their runtime binding is baked in at spawn too,
+/// but they are not worth a disruptive restart — they persist and take effect
+/// at the next start. `input_ids` / `output_ids` are the roster diffs'
+/// business, and an edit to a member's definition is
+/// [`changed_input_definitions`].
+fn flow_fields_requiring_restart(old: &FlowConfig, new: &FlowConfig) -> Vec<&'static str> {
+    let mut changed = Vec::new();
+    if old.bandwidth_limit != new.bandwidth_limit {
+        changed.push("bandwidth_limit");
+    }
+    if old.content_analysis != new.content_analysis {
+        changed.push("content_analysis");
+    }
+    if old.recording != new.recording {
+        changed.push("recording");
+    }
+    if old.master_clock != new.master_clock {
+        changed.push("master_clock");
+    }
+    if old.assembly != new.assembly {
+        changed.push("assembly");
+    }
+    changed
+}
+
+/// Whether any edited member is the flow's currently-active input.
+///
+/// The active input cannot be swapped in place — `FlowRuntime::remove_input`
+/// refuses it (`active_input_in_use`) to keep the data path's "always have an
+/// active source" invariant — so its edit needs the full restart. Asking up
+/// front rather than discovering it mid-swap matters: a flow whose only input
+/// is the active one is the common case, and a flow with several edited
+/// members should not churn the standby ones only for the restart to tear
+/// them down a moment later.
+///
+/// Activation is read from the config because `activate_input` writes it back
+/// there (`def.active = def.id == input_id`), so the config's view and the
+/// runtime's `active_input_tx` agree.
+fn edited_includes_active_input(edited: &[String], inputs: &[InputDefinition]) -> bool {
+    edited.iter().any(|id| {
+        inputs
+            .iter()
+            .any(|def| def.id == *id && def.active)
+    })
+}
+
 /// Which of a flow's inputs have had their **definition** edited.
 ///
 /// `input_set_changed` answers "did the roster change"; this answers "did any
@@ -5394,8 +5466,87 @@ mod input_diff_tests {
 }
 
 #[cfg(test)]
+mod flow_restart_field_tests {
+    use super::flow_fields_requiring_restart;
+    use crate::config::models::FlowConfig;
+
+    fn flow(extra: serde_json::Value) -> FlowConfig {
+        let mut obj = serde_json::json!({"id": "f", "name": "Flow"});
+        for (k, v) in extra.as_object().expect("object") {
+            obj[k] = v.clone();
+        }
+        serde_json::from_value(obj).expect("fixture")
+    }
+
+    #[test]
+    fn an_unchanged_flow_needs_no_restart() {
+        let a = flow(serde_json::json!({}));
+        let b = flow(serde_json::json!({}));
+        assert!(flow_fields_requiring_restart(&a, &b).is_empty());
+    }
+
+    /// Each of these is baked into the task graph at `FlowRuntime::start`, so
+    /// a change that does not restart is a change that never happens. Four of
+    /// the five were missing from the `update_config` route entirely.
+    #[test]
+    fn every_start_time_field_forces_a_restart() {
+        let base = flow(serde_json::json!({}));
+        let cases = [
+            (
+                "bandwidth_limit",
+                serde_json::json!({"bandwidth_limit": {"max_bitrate_mbps": 50.0, "action": "alarm"}}),
+            ),
+            ("content_analysis", serde_json::json!({"content_analysis": {}})),
+            ("recording", serde_json::json!({"recording": {}})),
+            ("master_clock", serde_json::json!({"master_clock": {"kind": "ptp"}})),
+            ("assembly", serde_json::json!({"assembly": {"kind": "spts"}})),
+        ];
+        for (field, extra) in cases {
+            let changed = flow(extra);
+            assert_eq!(
+                flow_fields_requiring_restart(&base, &changed),
+                vec![field],
+                "{field} must force a restart",
+            );
+            // Symmetric: clearing it back is equally a change.
+            assert_eq!(flow_fields_requiring_restart(&changed, &base), vec![field]);
+        }
+    }
+
+    /// The counterweight — these persist and apply at the next start rather
+    /// than interrupting a live flow, so they must stay out of the list.
+    #[test]
+    fn cosmetic_and_subscriber_toggles_do_not_restart() {
+        let base = flow(serde_json::json!({}));
+        for extra in [
+            serde_json::json!({"name": "Renamed"}),
+            serde_json::json!({"media_analysis": false}),
+            serde_json::json!({"thumbnail": false}),
+            serde_json::json!({"thumbnail_interval_secs": 30}),
+        ] {
+            assert!(
+                flow_fields_requiring_restart(&base, &flow(extra.clone())).is_empty(),
+                "{extra} must not restart a running flow",
+            );
+        }
+    }
+
+    #[test]
+    fn every_changed_field_is_named() {
+        let a = flow(serde_json::json!({}));
+        let b = flow(serde_json::json!({
+            "recording": {}, "master_clock": {"kind": "ptp"}
+        }));
+        assert_eq!(
+            flow_fields_requiring_restart(&a, &b),
+            vec!["recording", "master_clock"]
+        );
+    }
+}
+
+#[cfg(test)]
 mod input_definition_diff_tests {
-    use super::changed_input_definitions;
+    use super::{changed_input_definitions, edited_includes_active_input};
     use crate::config::models::InputDefinition;
 
     /// Built from JSON rather than by hand, which is both shorter and the
@@ -5482,6 +5633,42 @@ mod input_definition_diff_tests {
             changed_input_definitions(&ids(&["a", "b"]), &before, &after),
             vec!["a", "b"]
         );
+    }
+
+    /// **Editing a standby input must not take the on-air one off air.** The
+    /// active member is the one the engine refuses to swap in flight, so it
+    /// alone escalates to a full flow restart; every other member is applied
+    /// in place while the active input keeps feeding the outputs.
+    #[test]
+    fn only_an_edit_to_the_active_input_escalates_to_a_restart() {
+        let mut on_air = input("a", "0.0.0.0:5000");
+        on_air.active = true;
+        let mut standby = input("b", "0.0.0.0:5001");
+        standby.active = false;
+        let inputs = vec![on_air, standby];
+
+        assert!(
+            !edited_includes_active_input(&ids(&["b"]), &inputs),
+            "a standby edit must be swapped in place",
+        );
+        assert!(
+            edited_includes_active_input(&ids(&["a"]), &inputs),
+            "an edit to the on-air input needs the restart",
+        );
+        assert!(
+            edited_includes_active_input(&ids(&["a", "b"]), &inputs),
+            "one unswappable member is enough to restart",
+        );
+        assert!(!edited_includes_active_input(&[], &inputs));
+        assert!(!edited_includes_active_input(&ids(&["missing"]), &inputs));
+    }
+
+    /// Issue #81's own shape: a single-input flow, so the edited input is
+    /// also the active one and the restart is unavoidable.
+    #[test]
+    fn a_single_input_flow_always_restarts_for_its_own_edit() {
+        let only = vec![input("a", "0.0.0.0:5000")]; // fixture is active: true
+        assert!(edited_includes_active_input(&ids(&["a"]), &only));
     }
 
     /// **A manager echo must not restart anything.** This is the load-bearing
@@ -5640,6 +5827,117 @@ async fn diff_inputs(
     }
     #[cfg(not(feature = "webrtc"))]
     let _ = webrtc_sessions;
+}
+
+/// Apply edited input **definitions** to a running flow in place, and report
+/// the ids that could not be applied that way.
+///
+/// The roster diff ([`diff_inputs`]) reconciles membership and skips anything
+/// already running; this is its sibling for a member that stayed a member but
+/// changed. Swapping in place matters because the alternative is a full flow
+/// restart, and in a switcher flow that takes the *on-air* input down to land
+/// an edit to a standby one.
+///
+/// **The engine is the authority on what can be swapped.**
+/// [`FlowRuntime::remove_input`] runs all four of its refusal checks —
+/// `input_not_member`, `active_input_in_use`, `pid_bus_input_in_use`,
+/// `hitless_leg_change_requires_restart` — before it mutates a single thing,
+/// so a refusal here costs nothing and the caller falls back to the restart
+/// that those cases genuinely need. Duplicating the conditions in this layer
+/// would just give them somewhere to drift apart.
+///
+/// Returns the ids that need the full restart, and stops at the first one:
+/// the caller's restart rebuilds every input from the new config, so carrying
+/// on would only swap inputs that are about to be torn down anyway.
+///
+/// A new definition that fails to *bind* (the operator re-pointed a listener
+/// onto a busy port) is rolled back and reported as an event rather than
+/// escalated to a restart — a restart would hit the identical bind failure,
+/// having interrupted the on-air input to get there.
+async fn replace_edited_inputs(
+    flow_manager: &Arc<FlowManager>,
+    flow_id: &str,
+    edited: &[String],
+    input_defs: &[InputDefinition],
+    webrtc_sessions: &WebrtcRegistry,
+) -> Vec<String> {
+    let mut needs_restart = Vec::new();
+
+    for id in edited {
+        let Some(new_def) = input_defs.iter().find(|d| d.id == *id) else {
+            tracing::warn!(
+                "Config diff: edited input '{id}' referenced by flow '{flow_id}' but not found in top-level inputs"
+            );
+            continue;
+        };
+
+        if let Err(e) = flow_manager.remove_input(flow_id, id).await {
+            tracing::info!(
+                "Config diff: input '{id}' on flow '{flow_id}' cannot be swapped in place ({e}) — falling back to a flow restart"
+            );
+            needs_restart.push(id.clone());
+            break;
+        }
+
+        tracing::info!(
+            "Config diff: applying edited definition of input '{id}' to running flow '{flow_id}' in place"
+        );
+        let spawn_started_at = std::time::Instant::now();
+        let hot_added = match flow_manager.add_input(flow_id, new_def.clone()).await {
+            Ok(info) => info,
+            Err(e) => {
+                tracing::warn!(
+                    "Failed to re-add input '{id}' to flow '{flow_id}' after an edit: {e} — falling back to a flow restart"
+                );
+                needs_restart.push(id.clone());
+                break;
+            }
+        };
+
+        if let Some(err) =
+            wait_for_first_bind_failure(flow_manager.event_sender(), flow_id, spawn_started_at)
+                .await
+        {
+            tracing::warn!(
+                "Edited input '{id}' failed to bind on flow '{flow_id}': {} — rolling back",
+                err.message,
+            );
+            let _ = flow_manager.remove_input(flow_id, id).await;
+            // Loud: the flow keeps running without this input, and the config
+            // on disk still says it is a member. Silence here would leave the
+            // operator's own edit looking like it had applied.
+            flow_manager.event_sender().emit_input(
+                EventSeverity::Warning,
+                category::FLOW,
+                format!(
+                    "Input '{id}' could not restart with its new settings and has been \
+                     dropped from the running flow: {}",
+                    err.message
+                ),
+                id,
+            );
+            continue;
+        }
+
+        // Same registration the hot-add path does — a WHIP-server input that
+        // was re-spawned under a new definition needs a fresh session channel
+        // or browsers can no longer pair with it.
+        #[cfg(feature = "webrtc")]
+        if let Some((tx, bearer_token)) = hot_added.whip_info
+            && let Some(registry) = webrtc_sessions
+        {
+            registry.register_whip_input(flow_id, tx, bearer_token);
+            tracing::info!(
+                "Re-registered WHIP input '{id}' for flow '{flow_id}' after an in-place swap"
+            );
+        }
+        #[cfg(not(feature = "webrtc"))]
+        let _ = hot_added;
+    }
+
+    #[cfg(not(feature = "webrtc"))]
+    let _ = webrtc_sessions;
+    needs_restart
 }
 
 /// Detect whether the delta between `old_ids` and `new_ids` would touch the
