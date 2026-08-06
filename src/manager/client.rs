@@ -3022,6 +3022,12 @@ async fn execute_command(
                 new_config.device_name = old_config.device_name.clone();
             }
 
+            // Activation is owned by the `activate_input` command, so a
+            // whole-config push must not move what is on air. Runs before
+            // validation and before the flow diff, so every later stage —
+            // including `resolve_flow` on a restart — sees the held value.
+            hold_active_inputs(&old_config, &mut new_config);
+
             validate_config(&new_config).map_err(|e| CommandError::from_validation("Invalid config", e))?;
             tracing::info!("Manager command: update_config (diff-based)");
 
@@ -5312,6 +5318,75 @@ fn input_set_changed(old: &[String], new: &[String]) -> bool {
     a != b
 }
 
+/// Hold every flow's on-air input where it is across a whole-config push.
+///
+/// Activation belongs to the `activate_input` command — the same rule the
+/// `update_input` handler states and follows with its one-line
+/// `input.active = old.active`. This is that rule for the other route.
+///
+/// It matters because the manager pushes a **cached copy** of the node's own
+/// config, not a freshly-composed one: `push_device_name_to_edge` patches a
+/// single key on the blob it already had and sends the rest back verbatim. If
+/// that cache is stale — an operator hit Take after it was taken — honouring
+/// the `active` flags in it would cut the flow back to the previously-live
+/// input as a side effect of renaming the node. Nothing about that push says
+/// "change what is on air", so nothing about it should.
+///
+/// Holding it also keeps `config.json` tracking the runtime instead of
+/// drifting from it, which matters beyond this push: `resolve_flow` reads
+/// `active` at flow start, so a restart now comes back up on whatever was
+/// genuinely on air rather than on whatever the last config push happened to
+/// say.
+///
+/// Two deliberate exemptions:
+///
+/// - **A flow with no incumbent** (brand new, or nothing activated yet) takes
+///   the pushed activation as-is. There is nothing on air to protect, and
+///   refusing would leave the flow unable to start on a chosen input.
+/// - **Assembled (PID-bus) flows** are left alone entirely. Every member runs
+///   concurrently there and the `active` flag is unused on that path, so
+///   rewriting it would be churn with no meaning — the same carve-out
+///   `validate_config` makes when it counts active inputs.
+fn hold_active_inputs(old: &AppConfig, new: &mut AppConfig) {
+    // Collected first: the members and the incumbent are read off
+    // `new.flows` while the flags are written to `new.inputs`.
+    let held: Vec<(String, Vec<String>, String)> = new
+        .flows
+        .iter()
+        .filter(|flow| {
+            !flow.assembly.as_ref().is_some_and(|a| {
+                !matches!(a.kind, crate::config::models::AssemblyKind::Passthrough)
+            })
+        })
+        .filter_map(|flow| {
+            let incumbent = flow
+                .input_ids
+                .iter()
+                .find(|id| old.inputs.iter().any(|i| i.id == **id && i.active))?;
+            Some((flow.id.clone(), flow.input_ids.clone(), incumbent.clone()))
+        })
+        .collect();
+
+    for (flow_id, members, incumbent) in held {
+        for id in members {
+            let Some(def) = new.inputs.iter_mut().find(|i| i.id == id) else {
+                continue;
+            };
+            let on_air = def.id == incumbent;
+            if def.active != on_air {
+                tracing::info!(
+                    "Config diff: holding input '{}' at active={on_air} on flow '{flow_id}' \
+                     (push said {}) — activation is owned by the activate_input command, \
+                     not a config push",
+                    def.id,
+                    def.active,
+                );
+            }
+            def.active = on_air;
+        }
+    }
+}
+
 /// The flow-level fields whose change forces a full restart of a running
 /// flow, named. Empty means nothing restart-worthy changed.
 ///
@@ -5462,6 +5537,106 @@ mod input_diff_tests {
         assert!(input_set_changed(&v(&["a"]), &v(&["b"]))); // swapped
         assert!(input_set_changed(&v(&[]), &v(&["a"]))); // empty → one
         assert!(input_set_changed(&v(&["a"]), &v(&[]))); // one → empty (drops all)
+    }
+}
+
+#[cfg(test)]
+mod hold_active_inputs_tests {
+    use super::hold_active_inputs;
+    use crate::config::models::AppConfig;
+
+    /// `id`, and which member (if any) is on air.
+    fn config(inputs: &[(&str, bool)], flow: serde_json::Value) -> AppConfig {
+        let inputs: Vec<serde_json::Value> = inputs
+            .iter()
+            .map(|(id, active)| {
+                serde_json::json!({
+                    "id": id, "name": id, "active": active,
+                    "type": "udp", "bind_addr": "0.0.0.0:5000"
+                })
+            })
+            .collect();
+        serde_json::from_value(serde_json::json!({
+            "version": 2,
+            "server": {"listen_addr": "127.0.0.1", "listen_port": 8080},
+            "inputs": inputs, "outputs": [], "flows": [flow]
+        }))
+        .expect("fixture")
+    }
+
+    fn passthrough(members: &[&str]) -> serde_json::Value {
+        serde_json::json!({"id": "f", "name": "F", "input_ids": members})
+    }
+
+    fn active_of(cfg: &AppConfig) -> Vec<&str> {
+        cfg.inputs
+            .iter()
+            .filter(|i| i.active)
+            .map(|i| i.id.as_str())
+            .collect()
+    }
+
+    /// The failure this exists for: the manager pushes a cached copy of the
+    /// node's config, so a rename replaying a blob taken before the last Take
+    /// would otherwise cut the flow back to the previously-live input.
+    #[test]
+    fn a_stale_push_cannot_move_what_is_on_air() {
+        let on_node = config(&[("a", false), ("b", true)], passthrough(&["a", "b"]));
+        let mut stale = config(&[("a", true), ("b", false)], passthrough(&["a", "b"]));
+        hold_active_inputs(&on_node, &mut stale);
+        assert_eq!(active_of(&stale), vec!["b"], "the live input must stay live");
+    }
+
+    /// Adding a member must not put it on air, whatever the push says.
+    #[test]
+    fn a_newly_pushed_member_does_not_take_over() {
+        let on_node = config(&[("a", true)], passthrough(&["a"]));
+        let mut adds_b = config(&[("a", false), ("b", true)], passthrough(&["a", "b"]));
+        hold_active_inputs(&on_node, &mut adds_b);
+        assert_eq!(active_of(&adds_b), vec!["a"]);
+    }
+
+    /// Nothing on air yet — the push decides, or the flow could never start
+    /// on a chosen input.
+    #[test]
+    fn a_flow_with_no_incumbent_takes_the_pushed_activation() {
+        let on_node = config(&[("a", false), ("b", false)], passthrough(&["a", "b"]));
+        let mut pushed = config(&[("a", false), ("b", true)], passthrough(&["a", "b"]));
+        hold_active_inputs(&on_node, &mut pushed);
+        assert_eq!(active_of(&pushed), vec!["b"]);
+    }
+
+    /// A push that agrees with the runtime is left exactly as it arrived.
+    #[test]
+    fn an_agreeing_push_is_untouched() {
+        let on_node = config(&[("a", true), ("b", false)], passthrough(&["a", "b"]));
+        let mut same = config(&[("a", true), ("b", false)], passthrough(&["a", "b"]));
+        hold_active_inputs(&on_node, &mut same);
+        assert_eq!(active_of(&same), vec!["a"]);
+    }
+
+    /// Assembled flows run every member concurrently and never read `active`,
+    /// so rewriting the flags there would be meaningless churn — the same
+    /// carve-out `validate_config` makes.
+    #[test]
+    fn an_assembled_flow_is_left_alone() {
+        let assembled = serde_json::json!({
+            "id": "f", "name": "F", "input_ids": ["a", "b"],
+            "assembly": {"kind": "spts"}
+        });
+        let on_node = config(&[("a", true), ("b", false)], assembled.clone());
+        let mut pushed = config(&[("a", true), ("b", true)], assembled);
+        hold_active_inputs(&on_node, &mut pushed);
+        assert_eq!(active_of(&pushed), vec!["a", "b"]);
+    }
+
+    /// An input belonging to no flow has no on-air semantics to protect.
+    #[test]
+    fn an_unassigned_input_is_not_touched() {
+        let on_node = config(&[("a", true), ("spare", false)], passthrough(&["a"]));
+        let mut pushed = config(&[("a", true), ("spare", true)], passthrough(&["a"]));
+        hold_active_inputs(&on_node, &mut pushed);
+        assert_eq!(active_of(&pushed), vec!["a", "spare"]);
     }
 }
 
