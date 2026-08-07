@@ -2125,7 +2125,7 @@ async fn execute_command(
                             new_flow.output_ids.len(),
                         );
                         let cfg = app_config.read().await;
-                        diff_inputs(
+                        let unreconciled = diff_inputs(
                             flow_manager,
                             flow_id,
                             &new_flow.input_ids,
@@ -2134,6 +2134,31 @@ async fn execute_command(
                         )
                         .await;
                         diff_outputs(flow_manager, flow_id, &new_flow.output_ids, &cfg).await;
+                        drop(cfg);
+                        // An input the engine would not surrender means the
+                        // runtime is now carrying something the new config
+                        // does not contain. Escalating to a restart is the
+                        // only honest outcome: the alternative is to ack
+                        // success on a flow that is still forwarding it.
+                        if !unreconciled.is_empty() {
+                            tracing::warn!(
+                                "Update flow '{flow_id}': restarting — inputs [{}] could not be reconciled in place",
+                                unreconciled.join(", ")
+                            );
+                            let _ = flow_manager.destroy_flow(flow_id).await;
+                            let resolved = {
+                                let cfg = app_config.read().await;
+                                cfg.resolve_flow(&new_flow).map_err(|e| e.to_string())?
+                            };
+                            let _runtime = flow_manager
+                                .create_flow(resolved)
+                                .await
+                                .map_err(|e| e.to_string())?;
+                            #[cfg(feature = "webrtc")]
+                            register_whip_if_needed(_webrtc_sessions, &_runtime);
+                            #[cfg(feature = "webrtc")]
+                            register_whep_if_needed(_webrtc_sessions, &_runtime);
+                        }
                     } else {
                         // Only outputs changed — diff surgically against the runtime.
                         // `old_flow.output_ids` is intentionally unused here; see
@@ -3228,7 +3253,7 @@ async fn execute_command(
                                     old_flow.output_ids.len(),
                                     new_flow.output_ids.len(),
                                 );
-                                diff_inputs(
+                                let unreconciled = diff_inputs(
                                     flow_manager,
                                     id,
                                     &new_flow.input_ids,
@@ -3244,6 +3269,42 @@ async fn execute_command(
                                     &new_config,
                                 )
                                 .await;
+                                // Same escalation as the per-flow update path:
+                                // an input the engine kept is an input this
+                                // config push did not actually apply, so
+                                // rebuild the flow from the config rather than
+                                // leave the two disagreeing.
+                                if !unreconciled.is_empty() {
+                                    tracing::warn!(
+                                        "Config diff: flow '{id}' restarting — inputs [{}] could not be reconciled in place",
+                                        unreconciled.join(", ")
+                                    );
+                                    let _ = flow_manager.destroy_flow(id).await;
+                                    match new_config.resolve_flow(new_flow) {
+                                        Ok(resolved) => {
+                                            match flow_manager.create_flow(resolved).await {
+                                                Ok(_runtime) => {
+                                                    #[cfg(feature = "webrtc")]
+                                                    register_whip_if_needed(
+                                                        _webrtc_sessions,
+                                                        &_runtime,
+                                                    );
+                                                    #[cfg(feature = "webrtc")]
+                                                    register_whep_if_needed(
+                                                        _webrtc_sessions,
+                                                        &_runtime,
+                                                    );
+                                                }
+                                                Err(e) => tracing::error!(
+                                                    "Config diff: flow '{id}' failed to restart after unreconciled inputs: {e}"
+                                                ),
+                                            }
+                                        }
+                                        Err(e) => tracing::error!(
+                                            "Config diff: flow '{id}' could not be resolved for restart: {e}"
+                                        ),
+                                    }
+                                }
                             } else {
                                 // Roster unchanged — any definition edit was
                                 // already swapped in place above; reconcile
@@ -6009,13 +6070,29 @@ mod input_definition_diff_tests {
     }
 }
 
+/// Reconcile a running flow's input roster against the new config, and report
+/// the ids that could not be reconciled.
+///
+/// **Additions run before removals.** They used to run after, which made a
+/// 1→1 replacement impossible to satisfy: the outgoing input was still the
+/// flow's only member and therefore still the active one, and
+/// [`FlowRuntime::remove_input`] refuses to pull the input that is on air.
+/// The removal was attempted, refused, and the refusal discarded — so the
+/// deleted input kept feeding every output while the persisted config, the
+/// deployment record and the manager UI all showed the replacement. Adding
+/// first means a replacement always has a survivor to hand the slot to.
+///
+/// Returns the ids still running that the new config does not contain. A
+/// non-empty result means **the runtime no longer matches its configuration**
+/// and the caller should escalate to a flow restart rather than persist a
+/// config the engine did not adopt.
 async fn diff_inputs(
     flow_manager: &Arc<FlowManager>,
     flow_id: &str,
     new_input_ids: &[String],
     input_defs: &[InputDefinition],
     webrtc_sessions: &WebrtcRegistry,
-) {
+) -> Vec<String> {
     use std::collections::HashSet;
 
     let running: Vec<String> = flow_manager
@@ -6031,19 +6108,7 @@ async fn diff_inputs(
         new_input_ids,
     );
 
-    // Remove inputs no longer referenced.
-    for id in running_set.iter().copied() {
-        if !new_set.contains(id) {
-            tracing::info!(
-                "Config diff: removing input '{id}' from flow '{flow_id}' (running, not in new config)"
-            );
-            if let Err(e) = flow_manager.remove_input(flow_id, id).await {
-                tracing::warn!("Failed to remove input '{id}' from flow '{flow_id}': {e}");
-            }
-        }
-    }
-
-    // Add newly referenced inputs.
+    // Add newly referenced inputs FIRST — see the note on this function.
     for &id in &new_set {
         if running_set.contains(id) {
             continue;
@@ -6091,8 +6156,63 @@ async fn diff_inputs(
         #[cfg(not(feature = "webrtc"))]
         let _ = hot_added;
     }
+
+    // Now remove what the new config dropped.
+    let mut unreconciled: Vec<String> = Vec::new();
+    for id in running_set.iter().copied() {
+        if new_set.contains(id) {
+            continue;
+        }
+        tracing::info!(
+            "Config diff: removing input '{id}' from flow '{flow_id}' (running, not in new config)"
+        );
+        let mut err = match flow_manager.remove_input(flow_id, id).await {
+            Ok(()) => continue,
+            Err(e) => e,
+        };
+
+        // The engine refuses to pull the input that is on air. That refusal is
+        // right, and for a replacement it is also precisely what the operator
+        // asked for — so move the slot onto a member the new config keeps and
+        // ask again. Only this one code is retried: an assembly reference or a
+        // hitless leg genuinely needs a restart, and a retry would just be
+        // refused twice for the same reason.
+        let active_conflict = err
+            .downcast_ref::<crate::engine::flow::InputMembershipError>()
+            .is_some_and(|m| m.code == "active_input_in_use");
+        if active_conflict {
+            if let Some(survivor) = new_input_ids.iter().find(|c| c.as_str() != id) {
+                tracing::info!(
+                    "Config diff: '{id}' is on air and is being removed — activating '{survivor}' first"
+                );
+                match flow_manager
+                    .switch_active_input(flow_id, survivor, None)
+                    .await
+                {
+                    Ok(()) => match flow_manager.remove_input(flow_id, id).await {
+                        Ok(()) => continue,
+                        Err(e) => err = e,
+                    },
+                    Err(e) => tracing::warn!(
+                        "Failed to activate '{survivor}' on flow '{flow_id}' before removing '{id}': {e}"
+                    ),
+                }
+            }
+        }
+
+        // Loud, because the alternative is what this function used to do:
+        // persist a configuration the engine never adopted and let the flow
+        // keep forwarding a deleted input with everything reporting success.
+        tracing::error!(
+            "Config diff: could not remove input '{id}' from flow '{flow_id}': {err} — \
+             the running flow no longer matches its configuration"
+        );
+        unreconciled.push(id.to_string());
+    }
+
     #[cfg(not(feature = "webrtc"))]
     let _ = webrtc_sessions;
+    unreconciled
 }
 
 /// Apply edited input **definitions** to a running flow in place, and report
