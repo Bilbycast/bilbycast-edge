@@ -1393,6 +1393,32 @@ async fn play_ts_file(
     let mut window_pcr_27mhz: Option<u64> = None;
     let mut window_byte_pos: u64 = 0;
     let mut current_bitrate_bps: u64 = pacer_initial_bitrate;
+    // ── PCR-anchored emission deadlines (TS) ───────────────────────────
+    // The byte-rate mode alone paces from an *estimated* rate. On VBR
+    // content that estimate is wrong by construction, and an overestimate
+    // makes the pacer emit faster than real time. Worse, the converged
+    // rate is carried into the next loop (`carried_bitrate_for`), so on a
+    // looping file the overshoot compounds every iteration.
+    //
+    // Hardware-diagnosed on bilby-pi (rk3568) with a VBR 6.6-10 Mbps
+    // source: frame loss ran away (4 -> 1413 over 2 min) with 62
+    // `send_packet` failures as the flood overran the RKMPP task queue
+    // (kernel `force_dequeue`), which then tripped a permanent HW->CPU
+    // demote. Pinning `paced_bitrate_bps` fixed it (62 -> 4 failures,
+    // loss flat) — which is what identified the rate as the variable.
+    //
+    // Fix: anchor each bundle's absolute deadline on the PCR timeline the
+    // source already carries, re-anchoring on every PCR. The estimated
+    // rate is then only used to interpolate *within* one PCR interval, so
+    // an overestimate can run ahead by at most that interval instead of
+    // compounding without bound. This is the same deadline mode the MP4
+    // path uses (`PacerMsg::target_ns`), including its
+    // `MIN_BUNDLE_SPACING_NS` clamp, and that path has never exhibited
+    // this failure.
+    let mut pcr_epoch_27mhz: Option<u64> = None;
+    let mut pacer_epoch_ns: Option<u64> = None;
+    let mut last_pcr_target_ns: Option<u64> = None;
+    let mut bytes_since_pcr: u64 = 0;
     let mut bytes_emitted: u64 = 0;
     // Source bytes the transcoder buffered without emitting yet. Credited to
     // the next emitted message so the pacer's content clock stays conserved
@@ -1596,6 +1622,31 @@ async fn play_ts_file(
                     }
                 }
             }
+
+            // Re-anchor the emission deadline on this PCR. Only the anchor
+            // PID participates: an MPTS carries one independent 27 MHz
+            // clock per program, and mixing them would step the deadline
+            // by the inter-program skew (often seconds) at every PID
+            // switch — the same trap the bitrate estimator guards against.
+            if anchor_pcr_pid.is_none() || anchor_pcr_pid == Some(pcr_pid_early) {
+                let epoch = *pcr_epoch_27mhz.get_or_insert(pcr);
+                let e_ns = *pacer_epoch_ns.get_or_insert_with(
+                    crate::engine::wire_emit::monotonic_now_ns,
+                );
+                let d = pcr.wrapping_sub(epoch);
+                // Guard against a PCR discontinuity (loop wrap, source
+                // splice) re-anchoring the timeline into the far future or
+                // the past. Outside the sane span we re-epoch on this PCR
+                // rather than emit a deadline we would then have to clamp.
+                if (d as i64) >= 0 && d < 27_000_000 * 3600 {
+                    last_pcr_target_ns = Some(e_ns.saturating_add((d / 27) * 1_000));
+                } else {
+                    pcr_epoch_27mhz = Some(pcr);
+                    pacer_epoch_ns = Some(crate::engine::wire_emit::monotonic_now_ns());
+                    last_pcr_target_ns = pacer_epoch_ns;
+                }
+                bytes_since_pcr = 0;
+            }
         }
 
         // ── PAT/PMT inspection (audio-PID discovery for splice anchor) ─
@@ -1671,7 +1722,14 @@ async fn play_ts_file(
             // Credit the exact bytes about to leave (== session.bundle_size at
             // this threshold, since appends are whole 188-byte packets) so the
             // windowed bitrate estimator stays correct for any datagram size.
-            bytes_emitted = bytes_emitted.saturating_add(bundle.len() as u64);
+            let blen = bundle.len() as u64;
+            let target_ns = ts_bundle_deadline(
+                last_pcr_target_ns,
+                bytes_since_pcr,
+                current_bitrate_bps,
+            );
+            bytes_since_pcr = bytes_since_pcr.saturating_add(blen);
+            bytes_emitted = bytes_emitted.saturating_add(blen);
             let data = std::mem::replace(
                 &mut bundle,
                 BytesMut::with_capacity(session.bundle_size),
@@ -1683,7 +1741,7 @@ async fn play_ts_file(
                 &pacer_tx,
                 current_bitrate_bps,
                 &mut pending_src_bytes,
-                None, // TS passthrough: byte-rate mode
+                target_ns,
             )
             .await
             {
@@ -1705,7 +1763,7 @@ async fn play_ts_file(
             &pacer_tx,
             current_bitrate_bps,
             &mut pending_src_bytes,
-            None, // TS passthrough: byte-rate mode
+            ts_bundle_deadline(last_pcr_target_ns, bytes_since_pcr, current_bitrate_bps),
         )
         .await;
     }
@@ -2426,6 +2484,32 @@ fn fake_rtp_ts(_session: &PlayerSession<'_>) -> u32 {
 /// the data-path performance rules — no `block_in_place` around a
 /// `send()` that could stall a worker for tens of ms when a slow
 /// downstream broadcast subscriber back-pressures the OS thread.
+/// Absolute emission deadline for one TS bundle, anchored on the source's
+/// own PCR timeline.
+///
+/// `base` is the wall-clock instant the most recent PCR maps to (computed
+/// in [`play_ts_file`] from the `pcr_epoch_27mhz` / `pacer_epoch_ns` pair);
+/// `bytes_since_pcr` is the content emitted since that PCR. The estimated
+/// rate therefore only interpolates *within* one PCR interval, so a rate
+/// overestimate can run ahead by at most one interval instead of
+/// compounding across the file and across loops.
+///
+/// Returns `None` before the first PCR — and for TS that carries no PCR at
+/// all — which leaves the pacer in its legacy byte-rate mode.
+fn ts_bundle_deadline(
+    base: Option<u64>,
+    bytes_since_pcr: u64,
+    bitrate_bps: u64,
+) -> Option<u64> {
+    let base = base?;
+    // Clamp the divisor to the estimator's own lower sanity bound so a
+    // zero/absurd rate can never produce a division trap or a deadline
+    // decades away.
+    let rate = bitrate_bps.max(100_000) as u128;
+    let ns = (bytes_since_pcr as u128).saturating_mul(8 * 1_000_000_000u128) / rate;
+    Some(base.saturating_add(ns.min(u64::MAX as u128) as u64))
+}
+
 async fn emit_to_pacer(
     data: Bytes,
     session: &mut PlayerSession<'_>,
