@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -122,6 +122,187 @@ async fn srt_send_chunked(socket: &Arc<SrtSocket>, data: &[u8]) -> Result<usize,
 /// that layer awaits, so it backpressures, whereas this one drops — which is
 /// why it needed the headroom more, not less.
 const SRT_SEND_QUEUE_CAPACITY: usize = 4096;
+
+/// Byte ceiling for the same queue, applied alongside the slot count.
+///
+/// The slot cap alone is not a memory bound, because **an item is a whole
+/// upstream `RtpPacket` and its size is set by the publisher**, varying by
+/// ~800× across source classes (#98):
+///
+/// | publisher | bytes per item |
+/// |---|---|
+/// | SDI, WebRTC | one 188 B TS packet |
+/// | UDP / RTP / SRT passthrough | ~1316 B (7 × 188) |
+/// | RTMP, RTSP | a **whole access unit** — measured IDRs 123–144 KB |
+///
+/// So 4096 slots is ~5.4 MB of TS-class traffic but up to ~164 MB of
+/// RTMP/RTSP access units. Those sources never overflowed at the old 256
+/// slots either, so they gain nothing from the depth and pay for all of it.
+///
+/// 8 MiB is chosen so the slot cap still binds first for the two item shapes
+/// #95 actually measured: 4096 × 1316 B ≈ 5.4 MB and 4096 × 188 B ≈ 0.8 MB
+/// are both under it, so the TS-class behaviour measured there (0 drops
+/// across 10.6 M packets) is preserved exactly. For whole-AU items the byte
+/// cap binds first — at the 123–144 KB IDRs actually measured that is 56–66
+/// access units (pinned by `the_byte_ceiling_is_reached_at_the_measured_idr_sizes`),
+/// still an order of magnitude more burst absorption than the ~2 an IDR
+/// needs, at 5 % of the memory.
+///
+/// **The crossover is 2048 B/item** (`8 MiB / 4096`), not "every class the
+/// depth was raised for" — above that the byte cap binds first. That is
+/// reachable from config, not just from RTMP/RTSP: `ts_packets_per_datagram`
+/// on test-pattern and media-player inputs validates up to 348 (65 424 B),
+/// where the effective depth is 128 items rather than 4096. Still ~8 MiB of
+/// burst either way, which is the quantity that matters — but the *slot*
+/// figure no longer describes those flows, so read the byte bound, not the
+/// slot count, when reasoning about them.
+///
+/// Deliberately a fixed budget rather than one derived from
+/// `BandwidthProfile`: the profile describes the *flow's* bitrate class,
+/// while this queue's exposure is set by the publisher's item shape, and
+/// the two are independent — an `Uncompressed` flow publishing 188 B items
+/// needs less headroom here than a `Standard` flow publishing whole AUs.
+const SRT_SEND_QUEUE_MAX_BYTES: usize = 8 * 1024 * 1024;
+
+/// Release `n` reserved bytes without ever underflowing.
+///
+/// A plain `fetch_sub` would wrap on any double-release race (a producer
+/// unwinding its reservation while [`SendQueueRx::drop`] drains the same
+/// item), and a wrapped counter reads as permanently over the ceiling —
+/// which is exactly the wedge this queue must not create.
+fn release_queued_bytes(counter: &AtomicUsize, n: usize) {
+    let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+        Some(v.saturating_sub(n))
+    });
+}
+
+/// Sender half of the SRT egress queue, bounded in **both** slots and bytes.
+///
+/// Wraps `mpsc::Sender` rather than replacing it so the item shape and the
+/// redundant loop's both-legs-`Full` reconnect semantics are untouched —
+/// `try_send` keeps returning `TrySendError` with the item handed back, and
+/// every existing call site reads the same.
+///
+/// Deliberately **not** `Clone`: every queue in this file has exactly one
+/// producer (the forward loop, or one redundancy leg). The single-producer
+/// property is what makes the empty-queue admission rule in [`Self::try_send`]
+/// a bound of `max(ceiling, one item)` rather than `slots × one item`.
+struct SendQueueTx {
+    tx: tokio::sync::mpsc::Sender<(Bytes, u64)>,
+    queued_bytes: Arc<AtomicUsize>,
+    /// Rejections attributable to the **byte** ceiling. Everything else in
+    /// `packets_dropped` for this queue is the slot cap, and the two want
+    /// opposite remedies — see the throttled warn in the forward loop.
+    byte_bound_rejections: Arc<AtomicU64>,
+}
+
+impl SendQueueTx {
+    /// Non-blocking enqueue. `Full` when either bound would be exceeded.
+    ///
+    /// Reserves the bytes before offering the item and releases them on any
+    /// rejection, so the counter can transiently over-read but never
+    /// under-read — an under-read would let the queue past its ceiling,
+    /// which is the failure this bound exists to prevent.
+    ///
+    /// **An empty queue always admits one item, whatever its size.** Without
+    /// that a publisher whose item exceeds the whole ceiling could never send
+    /// anything at all: the reservation fails against an empty queue, so it is
+    /// not transient fullness but permanent, total egress loss. That is not
+    /// hypothetical — the media-player still-image path has produced ~9 MB
+    /// frames (see `docs/sdi.md`, the 90 kHz PTS contract). Worse, in 2022-7
+    /// mode both legs reject the same oversized item in lockstep, and the
+    /// redundant loop reads "both legs `Full`" as *all legs lost*: it would
+    /// close both healthy SRT sockets and reconnect, forever. The real bound
+    /// is therefore `max(SRT_SEND_QUEUE_MAX_BYTES, largest single item)`.
+    fn try_send(
+        &self,
+        item: (Bytes, u64),
+    ) -> Result<(), tokio::sync::mpsc::error::TrySendError<(Bytes, u64)>> {
+        let n = item.0.len();
+        let prev = self.queued_bytes.fetch_add(n, Ordering::Relaxed);
+        if prev > 0 && prev.saturating_add(n) > SRT_SEND_QUEUE_MAX_BYTES {
+            release_queued_bytes(&self.queued_bytes, n);
+            // Never let the byte ceiling mask a dead consumer. This check
+            // runs *ahead* of `tx.try_send`, so on a closed channel it would
+            // otherwise report `Full` where tokio would have said `Closed` —
+            // and `Closed` is the only thing that triggers a reconnect on a
+            // bonded output, whose `peer_is_gone()` is hardwired `false` for
+            // an `SrtGroup`. Reporting fullness there wedges the output into
+            // dropping every packet forever with no reconnect.
+            return Err(if self.tx.is_closed() {
+                tokio::sync::mpsc::error::TrySendError::Closed(item)
+            } else {
+                self.byte_bound_rejections.fetch_add(1, Ordering::Relaxed);
+                tokio::sync::mpsc::error::TrySendError::Full(item)
+            });
+        }
+        match self.tx.try_send(item) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                release_queued_bytes(&self.queued_bytes, n);
+                Err(e)
+            }
+        }
+    }
+
+    /// Live depth in bytes, for logging. Advisory — it can be read between a
+    /// producer's reservation and its release.
+    fn queued_bytes(&self) -> usize {
+        self.queued_bytes.load(Ordering::Relaxed)
+    }
+
+    /// How many rejections so far were the byte ceiling rather than the slots.
+    fn byte_bound_rejections(&self) -> u64 {
+        self.byte_bound_rejections.load(Ordering::Relaxed)
+    }
+}
+
+/// Receiver half. Releases each item's bytes as it is dequeued.
+struct SendQueueRx {
+    rx: tokio::sync::mpsc::Receiver<(Bytes, u64)>,
+    queued_bytes: Arc<AtomicUsize>,
+}
+
+impl SendQueueRx {
+    async fn recv(&mut self) -> Option<(Bytes, u64)> {
+        let item = self.rx.recv().await?;
+        release_queued_bytes(&self.queued_bytes, item.0.len());
+        Some(item)
+    }
+}
+
+/// Releasing the reservation of everything still queued is **load-bearing**,
+/// not tidiness: the send task `break`s out of its `while let` on a
+/// non-transient send error, which drops this half with items still in the
+/// channel. Their bytes would otherwise stay reserved for the life of the
+/// connection, and once that residue reaches the ceiling every later
+/// `try_send` short-circuits to `Full` — see [`SendQueueTx::try_send`] for
+/// why a masked `Closed` is unrecoverable on a bonded output.
+impl Drop for SendQueueRx {
+    fn drop(&mut self) {
+        // Close first so any concurrent producer sees `Closed` immediately
+        // and unwinds its own reservation through the normal error path.
+        self.rx.close();
+        while let Ok(item) = self.rx.try_recv() {
+            release_queued_bytes(&self.queued_bytes, item.0.len());
+        }
+    }
+}
+
+/// Build a queue bounded by [`SRT_SEND_QUEUE_CAPACITY`] slots **and**
+/// [`SRT_SEND_QUEUE_MAX_BYTES`] bytes, whichever binds first.
+fn send_queue() -> (SendQueueTx, SendQueueRx) {
+    let (tx, rx) = tokio::sync::mpsc::channel::<(Bytes, u64)>(SRT_SEND_QUEUE_CAPACITY);
+    let queued_bytes = Arc::new(AtomicUsize::new(0));
+    (
+        SendQueueTx {
+            tx,
+            queued_bytes: Arc::clone(&queued_bytes),
+            byte_bound_rejections: Arc::new(AtomicU64::new(0)),
+        },
+        SendQueueRx { rx, queued_bytes },
+    )
+}
 
 /// How often a saturated send queue may log. Discards arrive in bursts of
 /// hundreds, so an unthrottled warning would itself become a load source.
@@ -847,8 +1028,7 @@ async fn srt_output_forward_loop(
     compressed_audio_input: bool,
     frame_rate_rx: Option<tokio::sync::watch::Receiver<Option<f64>>>,
 ) -> anyhow::Result<bool> {
-    let (send_tx, mut send_rx) =
-        tokio::sync::mpsc::channel::<(Bytes, u64)>(SRT_SEND_QUEUE_CAPACITY);
+    let (send_tx, mut send_rx) = send_queue();
     let send_sink = sink.clone();
     let send_stats = stats.clone();
     let output_id = config.id.clone();
@@ -1245,13 +1425,32 @@ async fn srt_output_forward_loop(
                         .is_none_or(|t| now.duration_since(t) >= SEND_QUEUE_WARN_INTERVAL);
                     if due {
                         send_queue_warned_at = Some(now);
+                        // Attribute the drop to the bound that actually
+                        // rejected it. The two have opposite remedies —
+                        // slots means the srt-io task is not draining fast
+                        // enough, bytes means this publisher's items are
+                        // large enough that 8 MiB is the binding constraint
+                        // (crossover is 2048 B/item) — and the old wording
+                        // asserted the first unconditionally, which a
+                        // byte-bound rejection can contradict outright:
+                        // that one fires with a nearly empty queue and a
+                        // perfectly healthy io task.
+                        let by_bytes = send_tx.byte_bound_rejections();
                         tracing::warn!(
                             output_id = %config.id,
                             dropped_total = send_queue_dropped,
+                            dropped_by_byte_bound = by_bytes,
+                            dropped_by_slot_bound =
+                                send_queue_dropped.saturating_sub(by_bytes),
+                            queued_bytes = send_tx.queued_bytes(),
                             capacity = SRT_SEND_QUEUE_CAPACITY,
+                            max_bytes = SRT_SEND_QUEUE_MAX_BYTES,
                             "SRT output send queue full — discarding egress packets; \
-                             the srt-io task is not draining fast enough to absorb the \
-                             source's burst (a large IDR access unit is the usual cause)"
+                             compare dropped_by_slot_bound (the srt-io task is not \
+                             draining fast enough to absorb the source's burst, a large \
+                             IDR access unit being the usual cause) against \
+                             dropped_by_byte_bound (this publisher's items are large \
+                             enough that the 8 MiB ceiling binds before the slot count)"
                         );
                     }
                 }
@@ -1402,8 +1601,7 @@ async fn srt_output_redundant_loop(
         // on an idle socket.
         let mut rx = broadcast_tx.subscribe();
 
-        let (send_tx_leg1, mut send_rx_leg1) =
-            tokio::sync::mpsc::channel::<(Bytes, u64)>(SRT_SEND_QUEUE_CAPACITY);
+        let (send_tx_leg1, mut send_rx_leg1) = send_queue();
         let send_socket1 = socket_leg1.clone();
         let send_stats1 = stats.clone();
         let output_id1 = config.id.clone();
@@ -1513,7 +1711,7 @@ async fn srt_output_redundant_loop(
 
         // leg 2 send task is spawned lazily once the leg-2 future resolves.
         let mut socket_leg2: Option<Arc<SrtSocket>> = None;
-        let mut send_tx_leg2_opt: Option<tokio::sync::mpsc::Sender<(Bytes, u64)>> = None;
+        let mut send_tx_leg2_opt: Option<SendQueueTx> = None;
 
         // Optional output delay buffer for stream synchronization.
         let resolved = if let Some(ref delay) = config.delay {
@@ -1563,7 +1761,7 @@ async fn srt_output_redundant_loop(
                         listener_leg2 = returned_listener;
                     }
                     if let Some(sock2) = sock {
-                        let (tx2, mut rx2) = tokio::sync::mpsc::channel::<(Bytes, u64)>(SRT_SEND_QUEUE_CAPACITY);
+                        let (tx2, mut rx2) = send_queue();
                         let send_socket2 = sock2.clone();
                         let output_id2 = config.id.clone();
                         tokio::spawn(async move {
@@ -1686,35 +1884,66 @@ async fn srt_output_redundant_loop(
                 }
             }
 
-            // Send to both legs
+            // Send to both legs.
+            //
+            // `Full` and `Closed` are **different verdicts** and must not both
+            // mean "this leg is lost". `Full` is backpressure — the queue doing
+            // exactly its job, shedding a packet while the leg stays up — and
+            // treating it as a lost leg violates the node-wide rule that slow
+            // consumers see dropped packets, never cascading teardown. Only
+            // `Closed` (the leg's send task has died) is a liveness verdict.
+            //
+            // This mattered little while `Full` needed 4096 queued whole access
+            // units (~164 MB, effectively unreachable). The 8 MiB ceiling makes
+            // it ~56-66 IDRs, which an ordinary burst against a briefly-stalled
+            // srt-io task reaches — so a transient drain stall would otherwise
+            // become a real dual-socket teardown plus an operator alarm, on
+            // precisely the source class this change was written for.
             let mut all_legs_lost = false;
             for (payload, recv_time_us) in payloads_to_send {
-                let leg1_ok = match send_tx_leg1.try_send((payload.clone(), recv_time_us)) {
+                let leg1_alive = match send_tx_leg1.try_send((payload.clone(), recv_time_us)) {
                     Ok(()) => true,
                     Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
                         stats.packets_dropped.fetch_add(1, Ordering::Relaxed);
-                        false
+                        true
                     }
                     Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => false,
                 };
 
-                let leg2_ok = if let Some(ref tx2) = send_tx_leg2_opt {
-                    match tx2.try_send((payload, recv_time_us)) {
+                // An absent leg 2 is "not connected yet", not "lost". Leg 2
+                // attaches lazily once its connect future resolves, and while
+                // it was counted as a dead leg a single rejection on leg 1 was
+                // enough to satisfy the teardown condition for the whole
+                // pre-connection window.
+                let leg2_alive = match send_tx_leg2_opt {
+                    Some(ref tx2) => match tx2.try_send((payload, recv_time_us)) {
                         Ok(()) => true,
                         Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
                             stats.packets_dropped.fetch_add(1, Ordering::Relaxed);
-                            false
+                            true
                         }
                         Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => false,
-                    }
-                } else {
-                    false
+                    },
+                    None => true,
                 };
 
-                if !leg1_ok && !leg2_ok {
+                if !leg1_alive && !leg2_alive {
+                    // Reaching here now means both legs' send tasks are
+                    // genuinely gone (`Closed`), not merely congested. Log the
+                    // queue state anyway so a teardown is always traceable to
+                    // the state that produced it.
                     tracing::warn!(
-                        "SRT output '{}' all legs lost, will reconnect",
-                        config.id
+                        output_id = %config.id,
+                        leg1_queued_bytes = send_tx_leg1.queued_bytes(),
+                        leg1_byte_bound_rejections = send_tx_leg1.byte_bound_rejections(),
+                        leg2_queued_bytes = send_tx_leg2_opt
+                            .as_ref()
+                            .map(|t| t.queued_bytes()),
+                        leg2_byte_bound_rejections = send_tx_leg2_opt
+                            .as_ref()
+                            .map(|t| t.byte_bound_rejections()),
+                        max_bytes = SRT_SEND_QUEUE_MAX_BYTES,
+                        "SRT output all legs lost, will reconnect"
                     );
                     all_legs_lost = true;
                     break;
@@ -2095,3 +2324,201 @@ async fn srt_output_bonded_loop(
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::sync::mpsc::error::TrySendError;
+
+    fn item(bytes: usize) -> (Bytes, u64) {
+        (Bytes::from(vec![0u8; bytes]), 0)
+    }
+
+    // ── Egress queue byte bound (issue #98) ──────────────────────────
+    //
+    // An item is a whole upstream `RtpPacket`, and its size is set by the
+    // publisher: 188 B from SDI, ~1316 B from TS passthrough, a whole
+    // access unit (123-144 KB measured) from RTMP/RTSP. A slot count is
+    // therefore not a memory bound.
+
+    #[test]
+    fn ts_class_items_are_still_bounded_by_slots_not_bytes() {
+        // The property that preserves #95: for the two item shapes that
+        // change actually measured, the slot cap must bind first, or this
+        // change would silently undo the fix it sits on top of.
+        assert!(SRT_SEND_QUEUE_CAPACITY * 1316 < SRT_SEND_QUEUE_MAX_BYTES);
+        assert!(SRT_SEND_QUEUE_CAPACITY * 188 < SRT_SEND_QUEUE_MAX_BYTES);
+    }
+
+    #[test]
+    fn the_bound_crossover_is_two_kilobytes_per_item() {
+        // Pin the honest statement of when each bound binds. The rationale
+        // comment claimed the slot cap binds first for "every class the
+        // depth was raised for"; it does not. Above 2 KiB/item the byte
+        // ceiling binds, and that is reachable from config — a
+        // media-player or test-pattern input may set
+        // `ts_packets_per_datagram` up to 348 (65 424 B), validated in
+        // `config::validation`, which is 128 items rather than 4096.
+        let crossover = SRT_SEND_QUEUE_MAX_BYTES / SRT_SEND_QUEUE_CAPACITY;
+        assert_eq!(crossover, 2048);
+        assert!(SRT_SEND_QUEUE_MAX_BYTES / 65_424 < SRT_SEND_QUEUE_CAPACITY);
+    }
+
+    #[test]
+    fn whole_access_unit_items_are_bounded_by_bytes() {
+        // Use the IDR sizes actually measured on this path (123-144 KB),
+        // not a flattering round number: 4096 slots would be 492-576 MB.
+        for au in [123 * 1024, 144 * 1024] {
+            assert!(SRT_SEND_QUEUE_MAX_BYTES / au < SRT_SEND_QUEUE_CAPACITY);
+            // Still far more absorption than the ~2 items an IDR burst needs.
+            assert!(SRT_SEND_QUEUE_MAX_BYTES / au >= 50);
+        }
+    }
+
+    #[test]
+    fn byte_cap_rejects_before_the_slot_cap_for_large_items() {
+        let (tx, _rx) = send_queue();
+        let big = 1024 * 1024; // 1 MiB items
+        let mut accepted = 0;
+        for _ in 0..SRT_SEND_QUEUE_CAPACITY {
+            if tx.try_send(item(big)).is_err() {
+                break;
+            }
+            accepted += 1;
+        }
+        // 8 MiB ceiling / 1 MiB items
+        assert_eq!(accepted, SRT_SEND_QUEUE_MAX_BYTES / big);
+        assert!(accepted < SRT_SEND_QUEUE_CAPACITY, "slot cap must not be what bound it");
+        assert_eq!(tx.byte_bound_rejections(), 1, "the rejection must be attributed to bytes");
+    }
+
+    #[tokio::test]
+    async fn dequeue_releases_the_reserved_bytes() {
+        // Without the release the queue would wedge shut after one fill,
+        // which is worse than the unbounded-memory bug being fixed.
+        let (tx, mut rx) = send_queue();
+        let big = 1024 * 1024;
+        while tx.try_send(item(big)).is_ok() {}
+        assert!(tx.try_send(item(big)).is_err(), "should be full");
+        let got = rx.recv().await;
+        assert!(got.is_some());
+        tx.try_send(item(big))
+            .expect("a dequeue must free room for another item");
+    }
+
+    #[test]
+    fn rejection_does_not_leak_reserved_bytes() {
+        // The reserve-then-offer order must unwind on rejection, or every
+        // rejected item would permanently shrink the queue.
+        let (tx, _rx) = send_queue();
+        let big = 1024 * 1024;
+        while tx.try_send(item(big)).is_ok() {}
+        let settled = tx.queued_bytes();
+        for _ in 0..10 {
+            assert!(tx.try_send(item(big)).is_err());
+        }
+        assert_eq!(
+            tx.queued_bytes(),
+            settled,
+            "a rejected item must not consume budget"
+        );
+    }
+
+    #[test]
+    fn an_item_larger_than_the_whole_ceiling_is_admitted_to_an_empty_queue() {
+        // Liveness. Without the empty-queue exemption such an item is not
+        // "transiently full" but permanently un-sendable, and in 2022-7
+        // mode both legs reject it in lockstep, which the redundant loop
+        // reads as `all_legs_lost` and answers by closing two healthy SRT
+        // sockets — forever. ~9 MB frames are on record from the
+        // media-player still-image path.
+        let (tx, _rx) = send_queue();
+        let oversized = SRT_SEND_QUEUE_MAX_BYTES + 1;
+        tx.try_send(item(oversized))
+            .expect("an empty queue must always admit one item, whatever its size");
+        // ...and it is the *only* one admitted, so the bound really is
+        // `max(ceiling, one item)` rather than unbounded.
+        assert!(tx.try_send(item(1316)).is_err());
+    }
+
+    #[tokio::test]
+    async fn an_oversized_item_does_not_wedge_the_queue_after_it_drains() {
+        let (tx, mut rx) = send_queue();
+        tx.try_send(item(SRT_SEND_QUEUE_MAX_BYTES + 1)).unwrap();
+        assert!(rx.recv().await.is_some());
+        assert_eq!(tx.queued_bytes(), 0, "draining must release the whole reservation");
+        tx.try_send(item(1316))
+            .expect("normal traffic must resume once the oversized item is gone");
+    }
+
+    #[test]
+    fn dropping_the_receiver_releases_every_queued_reservation() {
+        // The send task `break`s out of its recv loop on a non-transient
+        // send error, dropping the receiver with items still queued. Those
+        // reservations must not survive it.
+        let (tx, rx) = send_queue();
+        let big = 1024 * 1024;
+        while tx.try_send(item(big)).is_ok() {}
+        assert!(tx.queued_bytes() > 0);
+        drop(rx);
+        assert_eq!(tx.queued_bytes(), 0, "a dropped receiver must release what it held");
+    }
+
+    #[test]
+    fn the_byte_ceiling_is_reached_at_the_measured_idr_sizes() {
+        // Pins the depth at which `Full` starts appearing for whole-AU
+        // publishers, because in the redundant loop that depth is the
+        // trigger point for leg-liveness control flow — it should be
+        // fixed by a test, not left implicit in a doc comment's arithmetic.
+        for (au, want) in [(123 * 1024usize, 66usize), (144 * 1024, 56)] {
+            let (tx, _rx) = send_queue();
+            let mut accepted = 0;
+            while tx.try_send(item(au)).is_ok() {
+                accepted += 1;
+            }
+            assert_eq!(accepted, want, "au={au}");
+        }
+    }
+
+    #[test]
+    fn both_2022_7_legs_shed_the_same_oversized_item_without_either_dying() {
+        // 2022-7 legs carry identical items, so they cross any size-derived
+        // bound in lockstep. The redundant loop must not read that as "all
+        // legs lost" — `Full` is backpressure, only `Closed` is a liveness
+        // verdict. Both halves of that contract are asserted here: the
+        // oversized item is admitted (not rejected in lockstep), and a
+        // genuinely full queue still reports `Full` rather than `Closed`.
+        let (leg1, _rx1) = send_queue();
+        let (leg2, _rx2) = send_queue();
+        let oversized = SRT_SEND_QUEUE_MAX_BYTES + 1;
+        assert!(leg1.try_send(item(oversized)).is_ok());
+        assert!(leg2.try_send(item(oversized)).is_ok());
+        for (leg, label) in [(&leg1, "leg1"), (&leg2, "leg2")] {
+            match leg.try_send(item(1316)) {
+                Err(TrySendError::Full(_)) => {}
+                other => panic!("{label}: a congested live leg must report Full, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn a_dead_consumer_reports_closed_not_full_even_at_the_byte_ceiling() {
+        // The wedge this guard exists to prevent: the byte check runs ahead
+        // of `tx.try_send`, so a counter sitting at the ceiling would
+        // report `Full` where tokio would say `Closed`. `Closed` is the
+        // only reconnect trigger on a bonded output — `peer_is_gone()` is
+        // hardwired `false` for an `SrtGroup` — so masking it drops every
+        // packet forever with no reconnect. Simulate the wedged counter
+        // directly rather than relying on a leak the Drop impl now fixes.
+        let (tx, rx) = send_queue();
+        drop(rx);
+        tx.queued_bytes
+            .store(SRT_SEND_QUEUE_MAX_BYTES, Ordering::Relaxed);
+        match tx.try_send(item(1316)) {
+            Err(TrySendError::Closed(_)) => {}
+            Err(TrySendError::Full(_)) => {
+                panic!("a dead consumer must never be reported as transient fullness")
+            }
+            Ok(()) => panic!("a closed channel must not accept"),
+        }
+    }
+}

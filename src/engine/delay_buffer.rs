@@ -35,22 +35,48 @@ pub struct DelayBuffer {
     delay_us: u64,
     buffer: VecDeque<RtpPacket>,
     max_capacity: usize,
+    max_bytes: usize,
+    queued_bytes: usize,
     overflow_dropped: u64,
+    overflow_dropped_bytes: u64,
 }
+
+/// Byte ceiling for a delay buffer, mirroring the SRT egress queue's
+/// `SRT_SEND_QUEUE_MAX_BYTES`.
+///
+/// [`DelayBuffer::auto_capacity`] is a **packet count**, and its own
+/// rationale reasons in "~2 000 pkt/s" — i.e. it assumes a ~1316 B TS
+/// datagram per slot. That assumption does not hold: an `RtpPacket` is
+/// whatever the publisher produced, and RTMP/RTSP publish a whole access
+/// unit per packet (measured IDRs 123-144 KB). At the 16 384-slot floor
+/// that is ~2.1 GB resident, on the same output whose egress queue is
+/// capped at 8 MiB and five lines below it.
+///
+/// 64 MiB rather than the queue's 8 MiB because this buffer's whole job is
+/// to hold seconds of stream: 2 s of a 200 Mbps contribution feed is 50 MB,
+/// and clipping that would break the feature. It is a backstop against the
+/// item-shape blowup, not a working-set limit — a delay that genuinely needs
+/// more than 64 MiB is misconfigured, and shedding beats an OOM.
+const DELAY_BUFFER_MAX_BYTES: usize = 64 * 1024 * 1024;
 
 #[allow(dead_code)]
 impl DelayBuffer {
     /// Create a new delay buffer.
     ///
     /// `delay_ms` is the output delay in milliseconds. `max_capacity`
-    /// limits the buffer size; excess packets are dropped from the
-    /// front (oldest first).
+    /// limits the buffer size in packets; excess packets are dropped from
+    /// the front (oldest first). A byte ceiling of
+    /// [`DELAY_BUFFER_MAX_BYTES`] applies alongside it — see that constant
+    /// for why a packet count alone is not a memory bound.
     pub fn new(delay_ms: u64, max_capacity: usize) -> Self {
         Self {
             delay_us: delay_ms * 1000,
             buffer: VecDeque::with_capacity(max_capacity.min(16384)),
             max_capacity,
+            max_bytes: DELAY_BUFFER_MAX_BYTES,
+            queued_bytes: 0,
             overflow_dropped: 0,
+            overflow_dropped_bytes: 0,
         }
     }
 
@@ -59,19 +85,49 @@ impl DelayBuffer {
     /// A 1080p50 MPEG-TS stream at ~20 Mbps produces ~1,700 pkt/s;
     /// at 100 Mbps it's ~9,500 pkt/s. We budget 2,000 pkt/s per
     /// second of delay plus 2 seconds of headroom.
+    ///
+    /// This is a **packet count and therefore not a memory bound** — the
+    /// per-packet size assumption behind it holds only for TS-datagram
+    /// publishers. [`DELAY_BUFFER_MAX_BYTES`] is the companion bound.
     pub fn auto_capacity(delay_ms: u64) -> usize {
         let secs = delay_ms / 1000 + 2;
         (secs as usize * 2000).max(16384)
     }
 
-    /// Enqueue a packet. If the buffer exceeds `max_capacity`, the
-    /// oldest packet is dropped and counted.
+    /// Enqueue a packet, evicting oldest-first until **both** the packet
+    /// count and the byte ceiling are satisfied.
+    ///
+    /// Eviction is from the front so the buffer keeps the newest content,
+    /// matching the pre-existing overflow behaviour. A single packet larger
+    /// than the whole ceiling is still admitted to an empty buffer — the
+    /// alternative is dropping it forever, and a delay buffer that can
+    /// never pass an oversized frame silently blanks the output.
     pub fn push(&mut self, packet: RtpPacket) {
-        if self.buffer.len() >= self.max_capacity {
-            self.buffer.pop_front();
-            self.overflow_dropped += 1;
+        let n = packet.data.len();
+        while self.buffer.len() >= self.max_capacity
+            || (!self.buffer.is_empty() && self.queued_bytes + n > self.max_bytes)
+        {
+            match self.buffer.pop_front() {
+                Some(dropped) => {
+                    self.queued_bytes = self.queued_bytes.saturating_sub(dropped.data.len());
+                    self.overflow_dropped += 1;
+                    self.overflow_dropped_bytes += dropped.data.len() as u64;
+                }
+                None => break,
+            }
         }
+        self.queued_bytes += n;
         self.buffer.push_back(packet);
+    }
+
+    /// Bytes currently held.
+    pub fn queued_bytes(&self) -> usize {
+        self.queued_bytes
+    }
+
+    /// Total bytes shed by either overflow bound.
+    pub fn overflow_dropped_bytes(&self) -> u64 {
+        self.overflow_dropped_bytes
     }
 
     /// Drain all packets whose release time has passed.
@@ -81,6 +137,7 @@ impl DelayBuffer {
     pub fn drain_ready(&mut self, now_us: u64) -> DrainReady<'_> {
         DrainReady {
             buffer: &mut self.buffer,
+            queued_bytes: &mut self.queued_bytes,
             deadline_us: now_us,
             delay_us: self.delay_us,
         }
@@ -121,6 +178,7 @@ impl DelayBuffer {
     /// Flush all buffered packets (e.g., on SRT reconnect).
     pub fn clear(&mut self) {
         self.buffer.clear();
+        self.queued_bytes = 0;
     }
 }
 
@@ -131,6 +189,10 @@ impl DelayBuffer {
 /// (the queue is sorted by `recv_time_us`).
 pub struct DrainReady<'a> {
     buffer: &'a mut VecDeque<RtpPacket>,
+    /// Released as each packet leaves, so the byte ceiling tracks the
+    /// buffer's real occupancy rather than ratcheting up to it and staying
+    /// there.
+    queued_bytes: &'a mut usize,
     deadline_us: u64,
     delay_us: u64,
 }
@@ -141,7 +203,9 @@ impl<'a> Iterator for DrainReady<'a> {
     fn next(&mut self) -> Option<RtpPacket> {
         let front = self.buffer.front()?;
         if front.recv_time_us + self.delay_us <= self.deadline_us {
-            self.buffer.pop_front()
+            let packet = self.buffer.pop_front()?;
+            *self.queued_bytes = self.queued_bytes.saturating_sub(packet.data.len());
+            Some(packet)
         } else {
             None
         }
@@ -390,5 +454,97 @@ mod tests {
         assert_eq!(DelayBuffer::auto_capacity(10000), 24000);
         // 0ms delay → (0+2)*2000 = 4000, but min is 16384
         assert_eq!(DelayBuffer::auto_capacity(0), 16384);
+    }
+
+    // ── Byte ceiling (issue #98) ──────────────────────────────────────
+    //
+    // `auto_capacity` is a packet count whose rationale assumes a ~1316 B
+    // TS datagram per slot. RTMP/RTSP publish a whole access unit per
+    // packet, so the slot floor of 16 384 is ~2.1 GB at a measured 130 KB
+    // IDR — on the same output whose egress queue is capped at 8 MiB.
+
+    fn make_sized_packet(recv_time_us: u64, seq: u16, bytes: usize) -> RtpPacket {
+        RtpPacket {
+            data: Bytes::from(vec![0u8; bytes]),
+            sequence_number: seq,
+            rtp_timestamp: 0,
+            recv_time_us,
+            is_raw_ts: true,
+            upstream_seq: None,
+            upstream_leg_id: None,
+            sender_timestamp_us: None,
+        }
+    }
+
+    #[test]
+    fn whole_access_unit_packets_are_bounded_by_bytes_not_slots() {
+        // 16 384 slots x 130 KB would be ~2.1 GB. The byte ceiling must
+        // bind long before the slot count for this publisher class.
+        let cap = DelayBuffer::auto_capacity(2000);
+        let mut buf = DelayBuffer::new(2000, cap);
+        let au = 130 * 1024;
+        for i in 0..1000 {
+            buf.push(make_sized_packet(i as u64 * 1000, i as u16, au));
+        }
+        assert!(buf.queued_bytes() <= DELAY_BUFFER_MAX_BYTES);
+        assert!(
+            buf.len() < cap,
+            "the byte ceiling, not the slot count, must be what bound it"
+        );
+        assert!(buf.overflow_dropped() > 0);
+        assert!(buf.overflow_dropped_bytes() > 0);
+    }
+
+    #[test]
+    fn ts_datagram_packets_are_still_bounded_by_slots() {
+        // The pre-existing behaviour for the publisher class the capacity
+        // heuristic was written for must be untouched: 16 384 x 1316 B is
+        // ~21 MB, well under the ceiling, so slots still bind.
+        let mut buf = DelayBuffer::new(0, DelayBuffer::auto_capacity(0));
+        for i in 0..20_000u32 {
+            buf.push(make_sized_packet(i as u64 * 100, i as u16, 1316));
+        }
+        assert_eq!(buf.len(), 16384, "slot cap must be what bound it");
+        assert!(buf.queued_bytes() < DELAY_BUFFER_MAX_BYTES);
+    }
+
+    #[test]
+    fn draining_releases_the_byte_count() {
+        let mut buf = DelayBuffer::new(0, 1024);
+        for i in 0..10u32 {
+            buf.push(make_sized_packet(i as u64, i as u16, 4096));
+        }
+        assert_eq!(buf.queued_bytes(), 10 * 4096);
+        let drained: Vec<_> = buf.drain_ready(u64::MAX).collect();
+        assert_eq!(drained.len(), 10);
+        assert_eq!(buf.queued_bytes(), 0, "a full drain must zero the byte count");
+        // ...and the buffer is reusable rather than wedged at its ceiling.
+        buf.push(make_sized_packet(0, 0, 4096));
+        assert_eq!(buf.queued_bytes(), 4096);
+    }
+
+    #[test]
+    fn clear_zeroes_the_byte_count() {
+        let mut buf = DelayBuffer::new(1000, 1024);
+        for i in 0..10u32 {
+            buf.push(make_sized_packet(i as u64, i as u16, 4096));
+        }
+        buf.clear();
+        assert_eq!(buf.queued_bytes(), 0);
+        assert_eq!(buf.len(), 0);
+    }
+
+    #[test]
+    fn a_packet_larger_than_the_whole_ceiling_is_admitted_to_an_empty_buffer() {
+        // Same liveness rule as the SRT egress queue: rejecting it outright
+        // would blank the output for that frame forever rather than shed it.
+        let mut buf = DelayBuffer::new(1000, 1024);
+        buf.push(make_sized_packet(0, 0, DELAY_BUFFER_MAX_BYTES + 1));
+        assert_eq!(buf.len(), 1);
+        assert!(buf.queued_bytes() > DELAY_BUFFER_MAX_BYTES);
+        // The next push evicts it rather than growing without bound.
+        buf.push(make_sized_packet(1, 1, 1316));
+        assert_eq!(buf.len(), 1);
+        assert_eq!(buf.queued_bytes(), 1316);
     }
 }
