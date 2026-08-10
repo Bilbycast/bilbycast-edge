@@ -1106,6 +1106,7 @@ fn demux_decode_loop(
         hw_reset_attempts: 0,
         demoted_at: None,
         hw_repromote_attempts: 0,
+        last_send_error_at: None,
         last_send_error_log_at: None,
         first_send_after_open: None,
         mpeg2_cpu_pinned: false,
@@ -1760,6 +1761,20 @@ struct HwOpenState {
     /// that has been on CPU for an hour should still be trying to get
     /// its hardware path back.
     hw_repromote_attempts: u32,
+    /// Wall-clock of the most recent `send_packet_with_pts` failure, on
+    /// **any** backend including CPU. Unlike `consecutive_send_errors`
+    /// this is not reset by a successful drain, so it answers a
+    /// different question: "when did this stream last misbehave?".
+    ///
+    /// [`maybe_repromote_hw_decode`] requires a quiet interval here
+    /// before retrying hardware. Without it, re-promotion runs on a bare
+    /// timer and a *persistent* fault produces a demote/re-promote
+    /// oscillation — each cycle tearing the decoder down, which on
+    /// hardware showed up as a frozen picture. Verified on bilby-pi
+    /// under 45 % induced packet loss: `decoder_demotions` climbed
+    /// 1 → 2 → 3 as the retry fired straight back into the same broken
+    /// stream.
+    last_send_error_at: Option<Instant>,
     /// Last wall-clock at which `feed_video_decoder` emitted a
     /// `tracing::warn!` for a send_packet error. One-per-second
     /// throttle so a hard-broken HW backend doesn't flood the log
@@ -1848,6 +1863,31 @@ const HW_REPROMOTE_BACKOFF_BASE: Duration = Duration::from_secs(30);
 /// instead of needing a restart nobody knows to perform.
 const HW_REPROMOTE_BACKOFF_MAX: Duration = Duration::from_secs(600);
 
+/// Quiet interval with **no** `send_packet` failures required before a
+/// hardware re-promotion is allowed, on top of the backoff.
+///
+/// A weak filter, deliberately documented as such. It suppresses a retry
+/// while the decoder is *visibly* struggling, but it is NOT proof the
+/// stream recovered: measured on bilby-pi under 45 % induced packet loss,
+/// CPU decode of a badly corrupted stream produces **no** `send_packet`
+/// errors at all — libavcodec conceals and carries on. So silence here
+/// means "CPU is coping", not "the input is clean", and the gate cannot
+/// prevent a re-probe into a still-broken stream.
+///
+/// Oscillation under a *persistent* fault is therefore bounded by the
+/// exponential backoff, not by this: the same test measured 3 demotes in
+/// ~180 s without the gate and 2 with it — a real but modest improvement.
+/// Each probe costs one decoder re-open (~1-2 s of disturbed picture),
+/// and the backoff decays the rate to one per 10 minutes after four
+/// attempts.
+///
+/// This is the right trade on hardware where CPU decode is not viable
+/// (rk3568 needs 39 ms/frame against a 20 ms budget, so the demoted state
+/// is permanently broken anyway). On a host where CPU decode keeps up, a
+/// periodic probe is pure cost — a follow-up should gate re-promotion on
+/// a genuine input-health signal (TR-101-290 CC-error rate, or SRT
+/// `packets_lost`) rather than on decoder silence.
+const HW_REPROMOTE_CLEAN_PERIOD: Duration = Duration::from_secs(20);
 /// Backoff before the next hardware re-promotion attempt, doubling per
 /// prior attempt and saturating at [`HW_REPROMOTE_BACKOFF_MAX`].
 fn hw_repromote_backoff(attempts: u32) -> Duration {
@@ -2425,6 +2465,17 @@ fn maybe_repromote_hw_decode(
     }
     let backoff = hw_repromote_backoff(state.hw_repromote_attempts);
     if demoted_at.elapsed() < backoff {
+        return false;
+    }
+    // Suppress a retry while the decoder is still visibly failing. This
+    // is a damping term, not a correctness gate — see the constant: CPU
+    // decode stays silent on a corrupt stream, so this cannot detect that
+    // the input is still bad. The backoff is what actually bounds the
+    // re-probe rate under a persistent fault.
+    if state
+        .last_send_error_at
+        .is_some_and(|t| t.elapsed() < HW_REPROMOTE_CLEAN_PERIOD)
+    {
         return false;
     }
 
@@ -3058,6 +3109,10 @@ fn feed_video_decoder(
         Err(e) => {
             counters.send_packet_errors.fetch_add(1, Ordering::Relaxed);
             state.consecutive_send_errors = state.consecutive_send_errors.saturating_add(1);
+            // Evidence that the stream is still unhealthy. Recorded even
+            // while on CPU, where it gates hardware re-promotion — see
+            // `maybe_repromote_hw_decode`.
+            state.last_send_error_at = Some(Instant::now());
             // Throttle log lines to once per second so a hard-broken
             // backend doesn't flood the log before the demotion
             // threshold trips. Counter still increments per call.
