@@ -30,7 +30,7 @@
 //! the catalogue of categories and error codes that flow through here.
 
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -194,7 +194,7 @@ fn build_envelope(static_fields: &StaticFields, event: &Event, format: LogFormat
         message: &event.message,
         details: event.details.clone(),
     };
-    let raw = serde_json::to_value(&envelope).unwrap_or_else(|_| Value::Null);
+    let raw = serde_json::to_value(&envelope).unwrap_or(Value::Null);
     apply_format(raw, format, error_code)
 }
 
@@ -384,7 +384,7 @@ fn rotate_file(path: &PathBuf, max_backups: u32) -> std::io::Result<()> {
     Ok(())
 }
 
-fn backup_path(path: &PathBuf, n: u32) -> PathBuf {
+fn backup_path(path: &Path, n: u32) -> PathBuf {
     let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("log");
     path.with_extension(format!("{ext}.{n}"))
 }

@@ -153,7 +153,7 @@ pub fn validate_url_host(url: &str) -> Result<()> {
     let host = parsed
         .host_str()
         .ok_or_else(|| anyhow!("URL {url:?} has no host"))?;
-    if !ALLOWED_URL_HOSTS.iter().any(|h| host == *h) {
+    if !ALLOWED_URL_HOSTS.contains(&host) {
         bail!(
             "URL {url:?} host {host:?} is not in the upgrade host whitelist {:?}",
             ALLOWED_URL_HOSTS

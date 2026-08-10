@@ -372,8 +372,7 @@ async fn patch_sender_staged(
         // patch didn't change any address fields (master_enable-only, etc.)
         // we skip the restart and just emit an info event.
         let primary = patch
-            .transport_params
-            .get(0)
+            .transport_params.first()
             .cloned()
             .unwrap_or_default();
         let output_id = existing_output.id().to_string();
@@ -610,7 +609,7 @@ async fn patch_receiver_staged(
         // Apply transport params onto the running receiver by mutating the
         // matching input in the config, destroying and recreating the flow
         // with the new input config. Only the primary leg is handled.
-        let primary = patch.transport_params.get(0).cloned().unwrap_or_default();
+        let primary = patch.transport_params.first().cloned().unwrap_or_default();
 
         // If the receiver has no resolved active input (multi-input flow
         // with no active set) or the patch is a no-op, fall back to the

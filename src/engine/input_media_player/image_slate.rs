@@ -426,7 +426,7 @@ fn build_silence_encoder() -> Result<SilenceEncoder> {
         sample_rate,
         channels,
         frame_size,
-        accumulator: vec![Vec::with_capacity(frame_size); channels],
+        accumulator: (0..channels).map(|_| Vec::with_capacity(frame_size)).collect(),
         accumulated: 0,
         pts_90k: 0,
     })
@@ -436,7 +436,7 @@ impl SilenceEncoder {
     fn tick(&mut self, fps: usize) -> Result<Vec<(Vec<u8>, u64)>> {
         let samples_needed = self.sample_rate / fps.max(1);
         for ch in self.accumulator.iter_mut() {
-            ch.extend(std::iter::repeat(0.0f32).take(samples_needed));
+            ch.extend(std::iter::repeat_n(0.0f32, samples_needed));
         }
         self.accumulated += samples_needed;
 

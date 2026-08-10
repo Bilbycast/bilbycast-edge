@@ -971,6 +971,32 @@ pub fn event_channel() -> (EventSender, mpsc::Receiver<Event>) {
     )
 }
 
+/// Build a WebSocket event envelope from an `Event`.
+pub fn build_event_envelope(event: &Event) -> serde_json::Value {
+    let mut payload = serde_json::json!({
+        "severity": event.severity.as_str(),
+        "category": event.category,
+        "message": event.message,
+    });
+    if let Some(ref details) = event.details {
+        payload["details"] = details.clone();
+    }
+    if let Some(ref flow_id) = event.flow_id {
+        payload["flow_id"] = serde_json::Value::String(flow_id.clone());
+    }
+    if let Some(ref input_id) = event.input_id {
+        payload["input_id"] = serde_json::Value::String(input_id.clone());
+    }
+    if let Some(ref output_id) = event.output_id {
+        payload["output_id"] = serde_json::Value::String(output_id.clone());
+    }
+    serde_json::json!({
+        "type": "event",
+        "timestamp": chrono::Utc::now().to_rfc3339(),
+        "payload": payload
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1328,30 +1354,4 @@ mod tests {
         assert_eq!(details["error_code"], "bond_interface_lost");
         assert_eq!(details["path_id"], 3);
     }
-}
-
-/// Build a WebSocket event envelope from an `Event`.
-pub fn build_event_envelope(event: &Event) -> serde_json::Value {
-    let mut payload = serde_json::json!({
-        "severity": event.severity.as_str(),
-        "category": event.category,
-        "message": event.message,
-    });
-    if let Some(ref details) = event.details {
-        payload["details"] = details.clone();
-    }
-    if let Some(ref flow_id) = event.flow_id {
-        payload["flow_id"] = serde_json::Value::String(flow_id.clone());
-    }
-    if let Some(ref input_id) = event.input_id {
-        payload["input_id"] = serde_json::Value::String(input_id.clone());
-    }
-    if let Some(ref output_id) = event.output_id {
-        payload["output_id"] = serde_json::Value::String(output_id.clone());
-    }
-    serde_json::json!({
-        "type": "event",
-        "timestamp": chrono::Utc::now().to_rfc3339(),
-        "payload": payload
-    })
 }

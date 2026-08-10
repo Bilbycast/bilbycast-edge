@@ -379,17 +379,14 @@ async fn publish_loop(
         let packet = tokio::select! {
             _ = cancel.cancelled() => return Ok(()),
             _ = silence_tick => {
-                if let Err(e) = emit_silence_if_needed(
+                emit_silence_if_needed(
                     config,
                     client,
                     &mut encoder_state,
                     &mut sent_audio_header,
                     stats,
                 )
-                .await
-                {
-                    return Err(e);
-                }
+                .await?;
                 client.flush().await?;
                 continue;
             }
@@ -826,7 +823,7 @@ fn build_hevc_sequence_header_from_hvcc(extradata: &[u8]) -> Vec<u8> {
         }
     };
     let mut buf = BytesMut::with_capacity(5 + hvcc.len());
-    buf.put_u8(0x80 | (1 << 4) | 0); // Ex | keyframe | PacketType=SequenceStart
+    buf.put_u8(0x80 | (1 << 4)); // Ex | keyframe | PacketType=SequenceStart
     buf.put_slice(&FOURCC_HVC1);
     buf.put_slice(&hvcc);
     buf.to_vec()
@@ -1380,7 +1377,7 @@ fn annex_b_to_avcc_filtered_h265(nalus: &[Vec<u8>]) -> Vec<u8> {
             continue;
         }
         let nal_type = (n[0] >> 1) & 0x3F;
-        if matches!(nal_type, 32 | 33 | 34) {
+        if matches!(nal_type, 32..=34) {
             continue;
         }
         out.extend_from_slice(&(n.len() as u32).to_be_bytes());

@@ -943,7 +943,7 @@ fn try_parse_video_pes(pkt: &[u8], pid: u16, state: &mut MediaAnalysisState) {
                     // frame rates. Min 1200 ticks (~75 fps ceiling) filters out non-frame
                     // PES packets (parameter sets with near-duplicate timestamps).
                     // Max 90000 ticks (1 fps floor) filters out stale/wrapped values.
-                    if delta >= 1200 && delta <= 90_000 {
+                    if (1200..=90_000).contains(&delta) {
                         v.pts_interval_sum += delta;
                         v.pts_frame_count += 1;
 
@@ -1459,7 +1459,7 @@ fn parse_h265_sps(data: &[u8]) -> Option<SpsInfo> {
     // We already consumed 5 bits (wrongly). Let's just consume remaining bits for profile_tier_level.
     // Restart with a cleaner approach:
     let reader2 = BitReader::new(&data[2..]);
-    return parse_h265_sps_clean(reader2, sps_max_sub_layers_minus1 as u8);
+    parse_h265_sps_clean(reader2, sps_max_sub_layers_minus1 as u8)
 }
 
 fn parse_h265_sps_clean(mut reader: BitReader, sps_max_sub_layers_minus1: u8) -> Option<SpsInfo> {
@@ -2213,7 +2213,7 @@ impl<'a> BitReader<'a> {
     /// Read a signed Exp-Golomb coded value (se(v)).
     fn read_signed_exp_golomb(&mut self) -> Option<i32> {
         let code = self.read_exp_golomb()?;
-        let value = ((code + 1) / 2) as i32;
+        let value = code.div_ceil(2) as i32;
         if code % 2 == 0 {
             Some(-value)
         } else {

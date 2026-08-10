@@ -148,8 +148,10 @@ fn socket_config_for_sender(
     retransmit_buffer_capacity: Option<usize>,
     local_addr: SocketAddr,
 ) -> RistSocketConfig {
-    let mut sc = RistSocketConfig::default();
-    sc.local_addr = local_addr;
+    let mut sc = RistSocketConfig {
+        local_addr,
+        ..Default::default()
+    };
     if let Some(ms) = buffer_ms {
         sc.buffer_size = Duration::from_millis(ms as u64);
     }
@@ -440,7 +442,7 @@ async fn rist_output_loop(
                     break;
                 }
             },
-            _ = &mut delay_sleep, if delay_buf.as_ref().map_or(false, |db| db.len() > 0) => {
+            _ = &mut delay_sleep, if delay_buf.as_ref().is_some_and(|db| db.len() > 0) => {
                 let db = delay_buf.as_mut().unwrap();
                 let now = now_us();
                 for packet in db.drain_ready(now) {

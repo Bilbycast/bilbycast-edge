@@ -225,7 +225,7 @@ impl VideoFullState {
         // Freeze alarm
         if let Some(ref m) = metrics {
             let now = Instant::now();
-            if m.sad_score.map_or(false, |s| s < FREEZE_SAD_THRESHOLD) {
+            if m.sad_score.is_some_and(|s| s < FREEZE_SAD_THRESHOLD) {
                 if self.freeze_since.is_none() {
                     self.freeze_since = Some(now);
                 }
@@ -233,7 +233,7 @@ impl VideoFullState {
                     if now.duration_since(since) >= FREEZE_DEBOUNCE && !self.freeze_active {
                         self.freeze_active = true;
                         let fire = self.last_freeze_event_at
-                            .map_or(true, |t| t.elapsed() >= EVENT_RATELIMIT);
+                            .is_none_or(|t| t.elapsed() >= EVENT_RATELIMIT);
                         if fire {
                             events.send(Event {
                                 severity: EventSeverity::Warning,
@@ -326,11 +326,8 @@ fn decode_and_metrics(
     // Iterate through all frames returned — decode until we have the
     // most recent one or the decoder signals need-more-input / EOF.
     let mut latest: Option<video_engine::DecodedFrame> = None;
-    loop {
-        match decoder.receive_frame() {
-            Ok(f) => latest = Some(f),
-            Err(_) => break,
-        }
+    while let Ok(f) = decoder.receive_frame() {
+        latest = Some(f);
     }
     let frame = match latest {
         Some(f) => f,
@@ -532,7 +529,7 @@ fn compute_metrics(y: &[u8], width: u32, height: u32, prev: Option<&YPlane>) -> 
     let (letterbox_rows, pillarbox_cols) = letterbox_detect(y, w, h);
     let cbar = detect_colour_bars(y, w, h);
     // Slate: high freeze + low motion + high mean (static brightness) for N samples.
-    let slate = sad.map_or(false, |s| s < FREEZE_SAD_THRESHOLD) && mean_y > 40.0 && mean_y < 220.0;
+    let slate = sad.is_some_and(|s| s < FREEZE_SAD_THRESHOLD) && mean_y > 40.0 && mean_y < 220.0;
 
     FrameMetrics {
         width,

@@ -328,7 +328,7 @@ pub async fn connect_and_bind(
             tokio::select! {
                 _ = interval.tick() => {
                     let mut s = ka_send.lock().await;
-                    if protocol::write_message(&mut *s, &EdgeMessage::Ping).await.is_err() {
+                    if protocol::write_message(&mut s, &EdgeMessage::Ping).await.is_err() {
                         break;
                     }
                 }

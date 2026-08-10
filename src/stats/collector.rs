@@ -3047,7 +3047,6 @@ pub mod media_player_state {
 /// telemetry). Lets the manager UI show whole-file vs bounded-incremental MP4 at
 /// a glance, and which source kind is on air.
 pub mod media_player_reader_mode {
-    pub const UNKNOWN: u8 = 0;
     pub const TS: u8 = 1;
     pub const MP4_WHOLE_FILE: u8 = 2;
     pub const MP4_INCREMENTAL: u8 = 3;
@@ -3059,11 +3058,11 @@ pub mod media_player_reader_mode {
             MP4_WHOLE_FILE => "mp4_whole_file",
             MP4_INCREMENTAL => "mp4_incremental",
             IMAGE => "image",
-            // `UNKNOWN` is the zero-initialised value of `reader_mode`, so it
+            // Code 0 is the zero-initialised value of `reader_mode`, so it
             // is what a player reports before its first source starts — and
             // what the legacy loop reports throughout, since it never stamps
             // the field. Any other value is a code this build doesn't know.
-            UNKNOWN | _ => "unknown",
+            _ => "unknown",
         }
     }
 }
@@ -4322,7 +4321,7 @@ impl FlowStatsAccumulator {
                 if let Some(snap) = out_entry.value().pcr_trust_sampler().snapshot() {
                     let agg = acc.get_or_insert_with(Default::default);
                     agg.samples = agg.samples.max(snap.samples);
-                    agg.cumulative_samples = agg.cumulative_samples + snap.cumulative_samples;
+                    agg.cumulative_samples += snap.cumulative_samples;
                     agg.avg_us = agg.avg_us.max(snap.avg_us);
                     agg.p50_us = agg.p50_us.max(snap.p50_us);
                     agg.p95_us = agg.p95_us.max(snap.p95_us);

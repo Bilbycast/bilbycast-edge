@@ -260,7 +260,7 @@ async fn process_media(
                             1 => {
                                 // AVC NALU data
                                 let is_keyframe = frame_type == 1;
-                                let composition_time = ((data[2] as i32) << 16 | (data[3] as i32) << 8 | data[4] as i32) as i32;
+                                let composition_time = (data[2] as i32) << 16 | (data[3] as i32) << 8 | data[4] as i32;
                                 // Sign extend 24-bit
                                 let composition_time = if composition_time & 0x800000 != 0 {
                                     composition_time | !0xFFFFFF

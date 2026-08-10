@@ -87,7 +87,7 @@ pub fn spawn_udp_input(
             pcr_jump_signal: Some(&pcr_jump_signal),
             av_skew: Some(&av_skew_for_post),
         });
-        if let Some(_) = post.as_ref() {
+        if post.as_ref().is_some() {
             tracing::info!(
                 "UDP input '{input_id}': ingress post-process active (program_filter={} pid_overrides={} pid_map={} passthrough_clock={})",
                 config.program_number.is_some(),

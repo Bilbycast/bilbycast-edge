@@ -879,10 +879,12 @@ pub struct FlowConfig {
 /// the number of inputs).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum BandwidthProfile {
     /// 16 384 slots. The default for TS-carrying flows up to ~500 Mbps
     /// compressed video. Generous jitter budget on every typical
     /// contribution / distribution flow.
+    #[default]
     Standard,
     /// 32 768 slots. For compressed video flows in the 500 Mbps –
     /// 3 Gbps range — UHD HEVC contribution, JPEG XS (ST 2110-22 when
@@ -906,11 +908,6 @@ impl BandwidthProfile {
     }
 }
 
-impl Default for BandwidthProfile {
-    fn default() -> Self {
-        Self::Standard
-    }
-}
 
 /// Per-flow master-clock override. Mirrors the
 /// `engine::master_clock::MasterClockKind` enum on the wire so the same
@@ -6578,17 +6575,14 @@ fn default_st2110_video_payload_budget() -> usize {
 /// pacing across frame period). Reserved for the gapped-narrow follow-up.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum St2110_21ProfileConfig {
+    #[default]
     Narrow,
     NarrowLinear,
     Wide,
 }
 
-impl Default for St2110_21ProfileConfig {
-    fn default() -> Self {
-        St2110_21ProfileConfig::Narrow
-    }
-}
 
 /// Wire-pacing mode for an output. Today only ST 2110-20 / -23 outputs
 /// honour this; compressed-TS outputs (UDP, RTP, SRT) are paced by

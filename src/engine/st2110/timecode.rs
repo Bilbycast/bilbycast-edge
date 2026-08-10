@@ -45,16 +45,20 @@ pub struct Timecode {
     pub color_frame: bool,
 }
 
-impl Timecode {
-    /// Format as `HH:MM:SS:FF` (drop-frame uses `;` between SS and FF, per
-    /// SMPTE convention).
-    pub fn to_string(&self) -> String {
+/// Format as `HH:MM:SS:FF` (drop-frame uses `;` between SS and FF, per
+/// SMPTE convention). `to_string()` comes free via `ToString`.
+impl std::fmt::Display for Timecode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let sep = if self.drop_frame { ';' } else { ':' };
-        format!(
+        write!(
+            f,
             "{:02}:{:02}:{:02}{}{:02}",
             self.hours, self.minutes, self.seconds, sep, self.frames
         )
     }
+}
+
+impl Timecode {
 }
 
 /// Errors returned by [`parse_timecode`].

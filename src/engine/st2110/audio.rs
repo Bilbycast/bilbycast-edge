@@ -306,7 +306,7 @@ impl PcmDepacketizer {
         let payload_bytes = &packet[header_len..];
 
         let frame_size = self.frame_size();
-        if payload_bytes.len() % frame_size != 0 {
+        if !payload_bytes.len().is_multiple_of(frame_size) {
             return Err(PcmDepacketizeError::NotFrameAligned {
                 payload_len: payload_bytes.len(),
                 frame_size,

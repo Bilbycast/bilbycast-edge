@@ -81,8 +81,9 @@ async fn run(
     av_sync_pacer: Option<Arc<crate::engine::av_sync_mux::AvSyncPacer>>,
 ) -> Result<()> {
     let mut reader = open_reader(&config).await?;
-    let mut playing = !config.start_paused && config.clip_id.is_some()
-        || (!config.start_paused && config.clip_id.is_none());
+    // Both arms of the old expression reduced to this: the clip_id
+    // is_some/is_none pair covers every case, so only start_paused matters.
+    let mut playing = !config.start_paused;
     let mut pacing = PacingState::new();
     // Build the ingress transcoder once for the input task lifetime so
     // PMT discovery and codec buffers persist across cue / scrub /
@@ -540,11 +541,9 @@ async fn pump_one_bundle(
         Some(b) => b,
         None => return Ok(false),
     };
-    let mut bytes_to_emit = if (pacing.speed - 1.0).abs() > 1e-6 {
-        bundle.clone()
-    } else {
-        bundle.clone()
-    };
+    // Both speed branches wanted the same bytes, so this was a full bundle
+    // memcpy per iteration for nothing. `bundle` is not read again below.
+    let mut bytes_to_emit = bundle;
     // Walk packets to extract PCR + (if not 1.0×) rewrite PCR / PES PTS / DTS.
     let mut last_observed_in_pcr: Option<u64> = None;
     for chunk in bytes_to_emit.chunks_exact_mut(TS_PACKET) {
@@ -689,7 +688,7 @@ fn rewrite_packet_in_place(ts: &mut [u8], pacing: &mut PacingState) -> RewriteOu
             // Adaptation field bytes: ts[5 .. 5+af_len].
             let af_flags = ts[5];
             let pcr_flag = (af_flags & 0x10) != 0;
-            if pcr_flag && af_len >= 1 + 6 {
+            if pcr_flag && af_len > 6 {
                 let base: u64 = ((ts[6] as u64) << 25)
                     | ((ts[7] as u64) << 17)
                     | ((ts[8] as u64) << 9)

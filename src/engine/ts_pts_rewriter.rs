@@ -158,7 +158,6 @@ const PCR_RR_MAX_INJECTIONS: usize = 50;
 /// and is wrong at every bitrate. 40 ms is simply the largest advance that
 /// cannot itself create a PCR_RR violation.
 ///
-
 /// A bridge exists to keep output monotonic across a source
 /// discontinuity whose content is *contiguous* — a file loop wrap
 /// serves frame N of one pass immediately followed by frame 1 of the
@@ -746,7 +745,7 @@ impl TsPtsRewriter {
         let gap = master_now.wrapping_sub(last);
         // Protect against backwards/huge gaps (Wallclock master can
         // produce wrap-near values briefly; ignore those).
-        if gap < PSI_RR_MAX_27MHZ || gap >= PCR_MODULUS_27MHZ / 2 {
+        if !(PSI_RR_MAX_27MHZ..PCR_MODULUS_27MHZ / 2).contains(&gap) {
             return;
         }
         // Rewrite CC on every cached PSI packet before emitting so the
@@ -1677,7 +1676,7 @@ mod tests {
         // acceptable; backward is a fail.
         let forward = (new_pcr_2 as i64).wrapping_sub(new_pcr_1 as i64);
         assert!(
-            forward >= 0 && forward < 100_000_000,
+            (0..100_000_000).contains(&forward),
             "output PCR should advance forward by at most ~ms after bridge; \
              got forward delta = {forward} 27 MHz ticks"
         );
@@ -2415,7 +2414,7 @@ mod tests {
     /// regression below.
     fn build_mpts_pat(program_count: usize) -> [u8; TS_PACKET_SIZE] {
         use crate::engine::ts_parse::mpeg2_crc32;
-        assert!(program_count >= 1 && program_count <= 16);
+        assert!((1..=16).contains(&program_count));
         let mut pat = [0xFFu8; TS_PACKET_SIZE];
         pat[0] = TS_SYNC_BYTE;
         pat[1] = 0x40;

@@ -498,7 +498,7 @@ impl MasterClock for PtpMasterClock {
             rate_offset_ppm: 0.0,
             jitter_us: snap
                 .offset_ns
-                .map(|o| (o.unsigned_abs() / 1000) as u64)
+                .map(|o| o.unsigned_abs() / 1000)
                 .unwrap_or(0),
             configured_kind: None,
             fallback_active: false,
@@ -711,7 +711,7 @@ impl PcrPllWithFallback {
         let use_ptp = self
             .ptp_fallback
             .as_ref()
-            .map_or(false, |p| p.is_locked());
+            .is_some_and(|p| p.is_locked());
         self.fallback_uses_ptp.store(use_ptp, Ordering::Release);
         // Record reason first so any reader observing `fallback_active`
         // sees a populated reason. `expect` is safe — write lock
@@ -781,7 +781,7 @@ impl PcrPllWithFallback {
                 && self
                     .ptp_fallback
                     .as_ref()
-                    .map_or(false, |p| p.is_locked());
+                    .is_some_and(|p| p.is_locked());
             if on_ptp {
                 let mut t = self.ptp_fallback.as_ref().unwrap().telemetry();
                 t.configured_kind =

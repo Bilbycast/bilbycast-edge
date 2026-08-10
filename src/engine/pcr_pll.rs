@@ -587,7 +587,7 @@ mod tests {
     fn feed_perfect(pll: &PcrPll, n: u64, start_pcr: u64, period_ns: u128) {
         for i in 0..n {
             let pcr =
-                start_pcr.wrapping_add((i as u64) * (period_ns as u64) * 27 / 1000);
+                start_pcr.wrapping_add(i * (period_ns as u64) * 27 / 1000);
             let wall = i as u128 * period_ns;
             pll.record_sample(pcr, wall);
         }
@@ -638,7 +638,7 @@ mod tests {
         // 10 ms × 27 000 ticks/ms = 270 000 ticks.
         let delta = now2.wrapping_sub(now1);
         assert!(
-            delta >= 268_000 && delta <= 272_000,
+            (268_000..=272_000).contains(&delta),
             "unexpected projected delta: {}",
             delta
         );
@@ -656,7 +656,7 @@ mod tests {
         // Then resume normal cadence.
         for i in 0..50u64 {
             let wall = last_wall + 1_000_000_000 + (i as u128) * 40_000_000;
-            let pcr = (i * 40_000 * 27) as u64;
+            let pcr = i * 40_000 * 27;
             pll.record_sample(pcr, wall);
         }
         let rate_after = pll.telemetry().rate_offset_ppm;

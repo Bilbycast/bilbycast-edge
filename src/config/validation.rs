@@ -624,7 +624,7 @@ pub fn validate_flow(flow: &FlowConfig) -> Result<()> {
     // fallback timeout.
     if let Some(ref mc) = flow.master_clock {
         if let Some(t) = mc.pll_lock_timeout_s {
-            if t != 0 && (t < 5 || t > 300) {
+            if t != 0 && !(5..=300).contains(&t) {
                 bail!(
                     "Flow '{}': master_clock.pll_lock_timeout_s = {} out of range \
                      (allowed: 0 to opt out, or 5..=300)",
@@ -1546,12 +1546,12 @@ fn validate_recording_config(
 /// Validate a synthetic test-pattern input. All fields have sensible
 /// defaults; this is the sanity-bound check.
 fn validate_test_pattern_input(c: &crate::config::models::TestPatternInputConfig) -> Result<()> {
-    if c.width < 64 || c.width > 7680 || c.width % 2 != 0 {
+    if c.width < 64 || c.width > 7680 || !c.width.is_multiple_of(2) {
         return Err(anyhow::anyhow!(
             "test-pattern: width must be an even number in 64..=7680 (got {})", c.width
         ));
     }
-    if c.height < 64 || c.height > 4320 || c.height % 2 != 0 {
+    if c.height < 64 || c.height > 4320 || !c.height.is_multiple_of(2) {
         return Err(anyhow::anyhow!(
             "test-pattern: height must be an even number in 64..=4320 (got {})", c.height
         ));
@@ -2669,10 +2669,10 @@ fn validate_cbr_pad_to_kbps(
 }
 
 fn validate_video_dims(width: u32, height: u32, fps_num: u32, fps_den: u32, ctx: &str) -> Result<()> {
-    if !(64..=8192).contains(&width) || width % 2 != 0 {
+    if !(64..=8192).contains(&width) || !width.is_multiple_of(2) {
         bail!("{ctx}: width must be 64..=8192 and even, got {width}");
     }
-    if !(64..=8192).contains(&height) || height % 2 != 0 {
+    if !(64..=8192).contains(&height) || !height.is_multiple_of(2) {
         bail!("{ctx}: height must be 64..=8192 and even, got {height}");
     }
     if fps_den == 0 {
@@ -5600,7 +5600,7 @@ pub fn validate_output_with_input(
                         anyhow::bail!("{ctx}: encryption.pssh_boxes[{i}] must be even-length hex");
                     }
                     let bytes_len = pssh_hex.len() / 2;
-                    if bytes_len < 32 || bytes_len > 4096 {
+                    if !(32..=4096).contains(&bytes_len) {
                         anyhow::bail!(
                             "{ctx}: encryption.pssh_boxes[{i}] must decode to 32..=4096 bytes"
                         );
@@ -6874,7 +6874,7 @@ fn validate_srt_common(
     }
 
     if let Some(pct) = overhead_bw {
-        if pct < 5 || pct > 100 {
+        if !(5..=100).contains(&pct) {
             bail!("{context}: overhead_bw must be 5-100 (percentage), got {pct}");
         }
     }
@@ -6934,13 +6934,13 @@ fn validate_srt_common(
     }
 
     if let Some(s) = payload_size {
-        if s < 188 || s > 1456 {
+        if !(188..=1456).contains(&s) {
             bail!("{context}: payload_size must be 188-1456, got {s}");
         }
     }
 
     if let Some(s) = mss {
-        if s < 76 || s > 9000 {
+        if !(76..=9000).contains(&s) {
             bail!("{context}: mss must be 76-9000, got {s}");
         }
     }
@@ -7027,7 +7027,7 @@ fn validate_srt_redundancy(red: &SrtRedundancyConfig, context: &str) -> Result<(
 fn validate_rist_addr(addr: &str, context: &str) -> Result<()> {
     validate_socket_addr(addr, context)?;
     let sa: SocketAddr = addr.parse().unwrap();
-    if sa.port() != 0 && sa.port() % 2 != 0 {
+    if sa.port() != 0 && !sa.port().is_multiple_of(2) {
         bail!(
             "{context}: RIST port must be even (RTCP binds on port+1), got {}",
             sa.port()
@@ -7113,7 +7113,7 @@ fn validate_rist_output(rist: &RistOutputConfig) -> Result<()> {
         &format!("RIST output '{}'", rist.id),
     )?;
     if let Some(cap) = rist.retransmit_buffer_capacity {
-        if cap < 64 || cap > 65_536 {
+        if !(64..=65_536).contains(&cap) {
             bail!(
                 "RIST output '{}': retransmit_buffer_capacity must be 64-65536, got {cap}",
                 rist.id
@@ -8987,16 +8987,20 @@ mod tests {
     /// constants cannot drift apart unnoticed.
     #[test]
     fn epoch_lock_offset_bounds_stay_inside_the_residence_cap() {
-        assert!(
-            MAX_EPOCH_LOCK_OFFSET_MS < 1_000,
-            "max offset {MAX_EPOCH_LOCK_OFFSET_MS} must stay below the 1000 ms residence cap \
-             that `DejitterConfig::lossless` pins under pcr pacing"
-        );
-        assert!(
-            MIN_EPOCH_LOCK_OFFSET_MS > 80,
-            "min offset {MIN_EPOCH_LOCK_OFFSET_MS} must clear the 80 ms PCR pre-roll"
-        );
-        assert!(MIN_EPOCH_LOCK_OFFSET_MS < MAX_EPOCH_LOCK_OFFSET_MS);
+        const {
+            assert!(
+                MAX_EPOCH_LOCK_OFFSET_MS < 1_000,
+                "max offset must stay below the 1000 ms residence cap that \
+                 `DejitterConfig::lossless` pins under pcr pacing"
+            )
+        };
+        const {
+            assert!(
+                MIN_EPOCH_LOCK_OFFSET_MS > 80,
+                "min offset must clear the 80 ms PCR pre-roll"
+            )
+        };
+        const { assert!(MIN_EPOCH_LOCK_OFFSET_MS < MAX_EPOCH_LOCK_OFFSET_MS) };
     }
 
     #[test]

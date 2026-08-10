@@ -473,7 +473,7 @@ impl LegBroker {
                     guaranteed_unmet_bps: 0,
                 })
             });
-            if let Ok(mut st) = entry.value_mut().lock() {
+            if let Ok(st) = entry.value_mut().get_mut() {
                 // Replace any stale registration for the same (flow, path).
                 st.members
                     .retain(|x| !(x.flow_id == m.flow_id && x.path_id == m.path_id));
@@ -516,7 +516,7 @@ impl LegBroker {
         }
         // Drop now-empty legs so the map doesn't grow unbounded.
         self.legs
-            .retain(|_, v| v.lock().map(|s| !s.members.is_empty()).unwrap_or(false));
+            .retain(|_, v| v.get_mut().map(|s| !s.members.is_empty()).unwrap_or(false));
     }
 
     /// Spawn the single re-evaluation timer once, lazily, on first register

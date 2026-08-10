@@ -161,8 +161,8 @@ mod tests {
     fn h264_has_idr_detects_type_5() {
         let idr = vec![0x65, 0xB8];
         let p = vec![0x41, 0x00];
-        assert!(h264_has_idr(&[idr.clone()]));
-        assert!(!h264_has_idr(&[p.clone()]));
+        assert!(h264_has_idr(std::slice::from_ref(&idr)));
+        assert!(!h264_has_idr(std::slice::from_ref(&p)));
         assert!(h264_has_idr(&[p, idr]));
     }
 

@@ -51,6 +51,23 @@ new_without_default = "allow"
 # Wants type aliases for signatures that are already local and self-describing.
 # Cosmetic, and the alias indirection reads worse at the use site.
 type_complexity = "allow"
+# Fires on codec bit-field construction, where the "redundant" term IS the
+# documentation of the wire layout:
+#     hdr[5] = (8 << 3) | 0;                       // bsid=8, bsmod=0
+#     p[21]  = ((channel_config & 0x03) << 6) | 0x00;
+# Folding those to `8 << 3` deletes the statement that the low field is zero,
+# which is exactly what a reader checking against the spec needs to see.
+identity_op = "allow"
+# New in clippy 1.95. Wants `if sr > 0 { pts += n * 90_000 / sr }` rewritten as
+# `checked_div` + `if let`, which is longer and states less: the guard means
+# "the sample rate is not known yet", which is the condition the reader cares
+# about, not "this division might trap".
+manual_checked_ops = "allow"
+# Index arithmetic over byte, sample and pixel buffers is the domain language
+# here — `for b in dpos + 2..dpos + 2 + dlen` walks a descriptor body, and the
+# iterator rewrite is longer and easier to get wrong. Rewriting 27 such loops
+# in TS-parsing and DSP code risks real defects for no functional gain.
+needless_range_loop = "allow"
 
 [dependencies]
 # Async runtime

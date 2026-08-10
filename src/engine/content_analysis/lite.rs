@@ -317,7 +317,6 @@ impl LiteState {
             self.signalling.observe_ts(pusi, payload);
             self.timecode.observe_ts(pusi, payload);
             self.captions.observe_ts(pusi, payload);
-            return;
         }
     }
 
@@ -458,7 +457,7 @@ impl LiteState {
         if ndf > MDI_NDF_ALARM_MS {
             let fire = self
                 .last_mdi_event_at
-                .map_or(true, |t| t.elapsed() >= MDI_EVENT_RATELIMIT);
+                .is_none_or(|t| t.elapsed() >= MDI_EVENT_RATELIMIT);
             if fire {
                 events.send(crate::manager::events::Event {
                     severity: EventSeverity::Warning,
@@ -489,7 +488,7 @@ impl LiteState {
         if self.captions_was_present && !captions_now_present {
             let fire = self
                 .last_caption_event_at
-                .map_or(true, |t| t.elapsed() >= EVENT_RATELIMIT);
+                .is_none_or(|t| t.elapsed() >= EVENT_RATELIMIT);
             if fire {
                 events.send(crate::manager::events::Event {
                     severity: EventSeverity::Warning,

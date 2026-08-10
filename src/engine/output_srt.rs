@@ -612,7 +612,7 @@ async fn srt_output_listener_loop(
             let mut test_rx = broadcast_tx.subscribe();
             let mut sent = 0u32;
             let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
-            let alive = loop {
+            loop {
                 tokio::select! {
                     _ = cancel.cancelled() => break false,
                     _ = tokio::time::sleep_until(deadline) => {
@@ -633,7 +633,7 @@ async fn srt_output_listener_loop(
                                 Ok(_) => {
                                     sent += 1;
                                     // After sending some packets, check for ACKs periodically
-                                    if sent % 100 == 0 {
+                                    if sent.is_multiple_of(100) {
                                         let srt_stats = socket.stats().await;
                                         if srt_stats.pkt_recv_ack_total > 0 {
                                             break true;
@@ -651,8 +651,7 @@ async fn srt_output_listener_loop(
                         }
                     }
                 }
-            };
-            alive
+            }
         };
 
         if !is_alive {
@@ -758,7 +757,7 @@ async fn srt_output_caller_loop(
             // 20th attempt (~10 min at the 30 s cap) so a long outage leaves
             // a trail without flooding the events feed.
             let threshold = crate::srt::connection::CONNECT_FAILED_THRESHOLD;
-            if attempt == threshold || (attempt > threshold && attempt % 20 == 0) {
+            if attempt == threshold || (attempt > threshold && attempt.is_multiple_of(20)) {
                 attempt_events.emit_output_with_details(
                     EventSeverity::Critical,
                     category::SRT,
@@ -1404,7 +1403,7 @@ async fn srt_output_forward_loop(
                     }
                 }
             }
-            _ = &mut delay_sleep, if delay_buf.as_ref().map_or(false, |db| db.len() > 0) => {
+            _ = &mut delay_sleep, if delay_buf.as_ref().is_some_and(|db| db.len() > 0) => {
                 let db = delay_buf.as_mut().unwrap();
                 let now = now_us();
                 for packet in db.drain_ready(now) {
@@ -1875,7 +1874,7 @@ async fn srt_output_redundant_loop(
                         }
                     }
                 }
-                _ = &mut delay_sleep, if delay_buf.as_ref().map_or(false, |db| db.len() > 0) => {
+                _ = &mut delay_sleep, if delay_buf.as_ref().is_some_and(|db| db.len() > 0) => {
                     let db = delay_buf.as_mut().unwrap();
                     let now = now_us();
                     for packet in db.drain_ready(now) {
@@ -2345,8 +2344,8 @@ mod tests {
         // The property that preserves #95: for the two item shapes that
         // change actually measured, the slot cap must bind first, or this
         // change would silently undo the fix it sits on top of.
-        assert!(SRT_SEND_QUEUE_CAPACITY * 1316 < SRT_SEND_QUEUE_MAX_BYTES);
-        assert!(SRT_SEND_QUEUE_CAPACITY * 188 < SRT_SEND_QUEUE_MAX_BYTES);
+        const { assert!(SRT_SEND_QUEUE_CAPACITY * 1316 < SRT_SEND_QUEUE_MAX_BYTES) };
+        const { assert!(SRT_SEND_QUEUE_CAPACITY * 188 < SRT_SEND_QUEUE_MAX_BYTES) };
     }
 
     #[test]
@@ -2360,7 +2359,7 @@ mod tests {
         // `config::validation`, which is 128 items rather than 4096.
         let crossover = SRT_SEND_QUEUE_MAX_BYTES / SRT_SEND_QUEUE_CAPACITY;
         assert_eq!(crossover, 2048);
-        assert!(SRT_SEND_QUEUE_MAX_BYTES / 65_424 < SRT_SEND_QUEUE_CAPACITY);
+        const { assert!(SRT_SEND_QUEUE_MAX_BYTES / 65_424 < SRT_SEND_QUEUE_CAPACITY) };
     }
 
     #[test]

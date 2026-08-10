@@ -440,7 +440,7 @@ async fn http_put_inner(
 
     let has_crlf = |s: &str| s.bytes().any(|b| b == b'\r' || b == b'\n');
     if has_crlf(&target.host) || has_crlf(&target.path_and_query) || has_crlf(content_type)
-        || auth_token.map_or(false, has_crlf)
+        || auth_token.is_some_and(has_crlf)
     {
         anyhow::bail!("HTTP PUT refused: header injection attempt in URL or headers");
     }
@@ -1139,7 +1139,7 @@ fn encode_audio_pcm(
             } else if !planar_for_encoder.is_empty() {
                 // Pad missing channels with silence
                 accumulator[ch].extend(
-                    std::iter::repeat(0.0f32).take(planar_for_encoder[0].len()),
+                    std::iter::repeat_n(0.0f32, planar_for_encoder[0].len()),
                 );
             }
         }
@@ -1241,7 +1241,7 @@ fn encode_audio_pcm_aac(
                 accumulator[ch].extend_from_slice(&planar_for_encoder[ch]);
             } else if !planar_for_encoder.is_empty() {
                 accumulator[ch].extend(
-                    std::iter::repeat(0.0f32).take(planar_for_encoder[0].len()),
+                    std::iter::repeat_n(0.0f32, planar_for_encoder[0].len()),
                 );
             }
         }

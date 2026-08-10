@@ -28,7 +28,7 @@ use super::manifest::validate_url_host;
 /// Hard cap for `manifest.json` + bundle. The real files are <2 KiB; the
 /// 1 MiB ceiling is paranoid headroom against a compromised origin
 /// returning a multi-GB body to exhaust RAM.
-pub const MAX_MANIFEST_BYTES: usize = 1 * 1024 * 1024;
+pub const MAX_MANIFEST_BYTES: usize = 1024 * 1024;
 /// Hard cap for the release tarball. Today's largest variant
 /// (`-x86_64-linux-full`) is ~120 MB; cap at 512 MiB so future
 /// growth (more codec backends, debuginfo) is fine but a runaway
@@ -64,8 +64,8 @@ pub async fn fetch_text(url: &str, timeout: Duration) -> Result<String> {
                             bytes.len()
                         );
                     }
-                    return Ok(String::from_utf8(bytes.to_vec())
-                        .with_context(|| format!("body from {url} is not valid UTF-8"))?);
+                    return String::from_utf8(bytes.to_vec())
+                        .with_context(|| format!("body from {url} is not valid UTF-8"));
                 }
             }
             Err(e) => {

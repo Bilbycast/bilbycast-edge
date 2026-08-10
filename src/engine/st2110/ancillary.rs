@@ -500,7 +500,7 @@ mod tests {
             sdid: 0x01,
             user_data: vec![0xCA, 0xFE, 0xBA, 0xBE],
         };
-        let payload = pack_ancillary(&[packet.clone()], 0, AncField::Progressive);
+        let payload = pack_ancillary(std::slice::from_ref(&packet), 0, AncField::Progressive);
         let parsed = unpack_ancillary(&payload).unwrap();
         assert_eq!(parsed.len(), 1);
         assert_eq!(parsed[0], packet);

@@ -333,7 +333,7 @@ impl SecretsConfig {
                 "Migrating {} flow secret(s) from secrets.json back to config.json",
                 self.flows.len()
             );
-            for (_flow_id, fs) in &self.flows {
+            for fs in self.flows.values() {
                 // Merge input secrets into top-level inputs
                 if let Some(is) = &fs.input {
                     for input_def in &mut config.inputs {
@@ -852,16 +852,18 @@ mod tests {
 
     #[test]
     fn test_has_secrets_with_manager_secret() {
-        let mut config = AppConfig::default();
-        config.manager = Some(ManagerConfig {
-            enabled: true,
-            urls: vec!["wss://manager:8443/ws/node".to_string()],
-            accept_self_signed_cert: false,
-            cert_fingerprint: None,
-            registration_token: None,
-            node_id: None,
-            node_secret: Some("secret".to_string()),
-        });
+        let config = AppConfig {
+            manager: Some(ManagerConfig {
+                enabled: true,
+                urls: vec!["wss://manager:8443/ws/node".to_string()],
+                accept_self_signed_cert: false,
+                cert_fingerprint: None,
+                registration_token: None,
+                node_id: None,
+                node_secret: Some("secret".to_string()),
+            }),
+            ..Default::default()
+        };
         assert!(has_secrets(&config));
     }
 

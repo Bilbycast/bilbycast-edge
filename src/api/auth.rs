@@ -203,7 +203,7 @@ pub fn jwt_encode(claims: &Claims, secret: &[u8]) -> Result<String, String> {
         .map_err(|e| format!("HMAC key error: {e}"))?;
     mac.update(signing_input.as_bytes());
     let signature = mac.finalize().into_bytes();
-    let sig_b64 = b64().encode(&signature);
+    let sig_b64 = b64().encode(signature);
 
     Ok(format!("{signing_input}.{sig_b64}"))
 }

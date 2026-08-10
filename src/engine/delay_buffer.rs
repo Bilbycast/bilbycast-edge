@@ -151,7 +151,9 @@ impl DelayBuffer {
         self.buffer.front().map(|p| p.recv_time_us + self.delay_us)
     }
 
-    /// Number of packets currently buffered.
+    /// Number of packets currently buffered. No `is_empty()` companion:
+    /// nothing would call it, and an unused method is dead code.
+    #[allow(clippy::len_without_is_empty)]
     pub fn len(&self) -> usize {
         self.buffer.len()
     }
@@ -267,7 +269,7 @@ pub async fn resolve_output_delay(
                                 "Output '{}': target latency {} frames at {:.2} fps = {} ms",
                                 output_id, frames, fps, ms
                             );
-                            resolved_ms = Some(ms.max(1).min(10000));
+                            resolved_ms = Some(ms.clamp(1, 10000));
                             break;
                         }
                     }

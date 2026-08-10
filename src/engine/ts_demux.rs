@@ -815,7 +815,7 @@ impl TsDemuxer {
             let audio_codec_changed = self
                 .audio_pid
                 .and_then(|pid| self.pes_assemblers.get(&pid))
-                .map_or(true, |a| a.stream_type != selected_type);
+                .is_none_or(|a| a.stream_type != selected_type);
             if audio_pid_changed || audio_codec_changed {
                 let codec_name = match selected_type {
                     STREAM_TYPE_AAC_ADTS => "AAC",
@@ -1256,12 +1256,11 @@ pub(crate) fn split_annex_b_nalus(data: &[u8]) -> Vec<Vec<u8>> {
 
 /// Parse a 5-byte PTS field from PES header.
 fn parse_pts(data: &[u8]) -> u64 {
-    let pts = ((data[0] as u64 & 0x0E) << 29)
+    ((data[0] as u64 & 0x0E) << 29)
         | ((data[1] as u64) << 22)
         | ((data[2] as u64 & 0xFE) << 14)
         | ((data[3] as u64) << 7)
-        | ((data[4] as u64) >> 1);
-    pts
+        | ((data[4] as u64) >> 1)
 }
 
 #[cfg(test)]

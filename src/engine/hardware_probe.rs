@@ -582,6 +582,9 @@ pub fn probe_static_capabilities() -> StaticCapabilities {
 /// return true — there's no point asking "can it do 4:2:2?" if it
 /// can't open at all.
 #[cfg(feature = "media-codecs")]
+// One probe call per field; a struct literal would be the same 30 lines with
+// the field names moved, and each probe is an `avcodec_open2` round trip.
+#[allow(clippy::field_reassign_with_default)]
 fn probe_encoder_chroma_capability(hw: &HwCodecCapability) -> HwEncoderChromaCapability {
     let mut out = HwEncoderChromaCapability::default();
 
@@ -3951,6 +3954,10 @@ mod tests {
 
     #[cfg(feature = "media-codecs")]
     #[test]
+    // Each cfg! assert below is reachable only from its own match arm, so it
+    // cannot become a `const` block — that would evaluate unconditionally and
+    // fail whichever way the feature is set.
+    #[allow(clippy::assertions_on_constants)]
     fn auto_falls_through_to_software_when_no_hw() {
         // Software-only host. Auto should land on libx264 / libx265.
         let caps = make_caps(HwCodecCapability::default());

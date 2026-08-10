@@ -161,9 +161,11 @@ impl BitDepth {
 /// Sample rate conversion quality.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
+#[derive(Default)]
 pub enum SrcQuality {
     /// High-quality windowed sinc resampler. Broadcast monitoring quality;
     /// CPU cost is several × `Fast`. Default.
+    #[default]
     High,
     /// Lower-quality polynomial-interpolation resampler. Lower CPU + latency,
     /// suitable for talkback / IFB paths where pristine fidelity is not
@@ -171,29 +173,21 @@ pub enum SrcQuality {
     Fast,
 }
 
-impl Default for SrcQuality {
-    fn default() -> Self {
-        SrcQuality::High
-    }
-}
 
 /// Dithering applied when down-converting bit depth.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
+#[derive(Default)]
 pub enum Dither {
     /// Triangular probability density function dither (recommended for
     /// PCM down-conversion to break quantization correlation).
+    #[default]
     Tpdf,
     /// No dither: truncate. Faster, slightly worse quality. Use only when
     /// downstream is going to dither anyway.
     None,
 }
 
-impl Default for Dither {
-    fn default() -> Self {
-        Dither::Tpdf
-    }
-}
 
 /// A channel routing matrix.
 ///
@@ -791,7 +785,7 @@ pub fn decode_pcm_be(
 ) -> Result<usize, String> {
     let bps = bit_depth.wire_bytes();
     let frame_size = channels as usize * bps;
-    if payload.len() % frame_size != 0 {
+    if !payload.len().is_multiple_of(frame_size) {
         return Err(format!(
             "decode_pcm_be: payload {} not aligned to frame size {}",
             payload.len(),
@@ -1178,15 +1172,15 @@ impl TranscodeStage {
         let matrix = self.current_matrix();
         if matrix.out_channels() != self.cfg.out_channels as usize {
             // Live matrix shape mismatch — fall back to the configured matrix.
-            if let Err(_) = apply_channel_matrix(
+            if apply_channel_matrix(
                 &self.in_scratch,
                 &self.cfg.channel_matrix,
                 &mut self.routed_scratch,
-            ) {
+            ).is_err() {
                 self.stats.inc_dropped();
                 return Vec::new();
             }
-        } else if let Err(_) = apply_channel_matrix(&self.in_scratch, &matrix, &mut self.routed_scratch)
+        } else if apply_channel_matrix(&self.in_scratch, &matrix, &mut self.routed_scratch).is_err()
         {
             self.stats.inc_dropped();
             return Vec::new();
@@ -1431,16 +1425,15 @@ impl TranscodeStage {
         // Apply the live channel matrix.
         let matrix = self.current_matrix();
         if matrix.out_channels() != self.cfg.out_channels as usize {
-            if let Err(_) = apply_channel_matrix(
+            if apply_channel_matrix(
                 &self.in_scratch,
                 &self.cfg.channel_matrix,
                 &mut self.routed_scratch,
-            ) {
+            ).is_err() {
                 self.stats.inc_dropped();
                 return Vec::new();
             }
-        } else if let Err(_) =
-            apply_channel_matrix(&self.in_scratch, &matrix, &mut self.routed_scratch)
+        } else if apply_channel_matrix(&self.in_scratch, &matrix, &mut self.routed_scratch).is_err()
         {
             self.stats.inc_dropped();
             return Vec::new();
@@ -1687,7 +1680,7 @@ impl PlanarAudioTranscoder {
 
         // Full passthrough fast-path.
         if self.matrix_is_identity && self.rate_unchanged {
-            return Ok(planar_in.iter().map(|c| c.clone()).collect());
+            return Ok(planar_in.to_vec());
         }
 
         // Channel matrix stage.
@@ -1702,7 +1695,7 @@ impl PlanarAudioTranscoder {
 
         // SRC fast-path: same rate, matrix already applied.
         if self.rate_unchanged {
-            return Ok(self.routed_scratch.iter().map(|c| c.clone()).collect());
+            return Ok(self.routed_scratch.to_vec());
         }
 
         // Rubato SRC: lazy construct (input chunk size comes from the first
@@ -2441,12 +2434,12 @@ mod tests {
         // and allow one L20 LSB of drift from the f32 round-trip.
         for frame in 0..(payload.len() / 3) {
             let off = frame * 3;
-            let a = (((payload[off] as i32) << 16)
+            let a = ((payload[off] as i32) << 16)
                 | ((payload[off + 1] as i32) << 8)
-                | payload[off + 2] as i32) as i32;
-            let b = (((out[off] as i32) << 16)
+                | payload[off + 2] as i32;
+            let b = ((out[off] as i32) << 16)
                 | ((out[off + 1] as i32) << 8)
-                | out[off + 2] as i32) as i32;
+                | out[off + 2] as i32;
             let a_s = if a & 0x0080_0000 != 0 { a | !0x00FF_FFFF } else { a };
             let b_s = if b & 0x0080_0000 != 0 { b | !0x00FF_FFFF } else { b };
             let diff = (a_s - b_s).abs();

@@ -269,14 +269,14 @@ pub async fn run_st2110_audio_input(
     // The recv loop in RedBluePair owns the sockets, so we cannot easily reach
     // out for source-IP filtering at this layer (it ignores src). Apply source
     // filtering inline by reading via a single-leg path when no Blue is set.
-    if pair.blue.is_none() && source_filter.is_some() {
+    if pair.blue.is_none() && let Some(filter) = source_filter {
         // Single-leg path with source IP filter — fall through to the manual loop
         // below so we can see `src` per packet.
         run_audio_input_single_with_filter(
             config,
             label,
             depacketizer,
-            source_filter.unwrap(),
+            filter,
             broadcast_tx,
             stats,
             cancel,
@@ -286,7 +286,6 @@ pub async fn run_st2110_audio_input(
     } else {
         // Standard path: dual-leg or single-leg without source filter.
         let stats_clone = stats.clone();
-        let depacketizer = depacketizer; // owned by closure
         let label_owned = label.to_string();
         let tx = broadcast_tx;
         pair.recv_loop(cancel, move |payload, _leg, _seq| {
@@ -709,10 +708,10 @@ pub async fn run_st2110_anc_input(
 
     let source_filter = build_source_filter(&config.allowed_sources);
 
-    if pair.blue.is_none() && source_filter.is_some() {
+    if pair.blue.is_none() && let Some(filter) = source_filter {
         run_anc_input_single_with_filter(
             config,
-            source_filter.unwrap(),
+            filter,
             broadcast_tx,
             stats,
             cancel,

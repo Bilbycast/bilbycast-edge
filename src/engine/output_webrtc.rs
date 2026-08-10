@@ -1118,12 +1118,9 @@ async fn whep_viewer_loop(
 
                         // Drive str0m: process incoming RTCP/STUN + send queued output.
                         if let Some(ev) = session.drive_udp_io().await {
-                            match ev {
-                                SessionEvent::Disconnected => {
-                                    tracing::info!("WHEP viewer '{}' disconnected during send", session_id);
-                                    break;
-                                }
-                                _ => {}
+                            if let SessionEvent::Disconnected = ev {
+                                tracing::info!("WHEP viewer '{}' disconnected during send", session_id);
+                                break;
                             }
                         }
                     }

@@ -1797,7 +1797,7 @@ mod tests {
         assert_eq!(cache.entries.len(), DemuxCache::MAX_ENTRIES, "capped at MAX_ENTRIES");
         // The oldest (LRU tail, "f0") must have been evicted; newest kept.
         assert_eq!(cache.entries.first().unwrap().path, std::path::PathBuf::from("f4.mp4"));
-        assert!(cache.entries.iter().all(|e| e.path != std::path::PathBuf::from("f0.mp4")));
+        assert!(cache.entries.iter().all(|e| e.path != Path::new("f0.mp4")));
     }
 
     #[test]

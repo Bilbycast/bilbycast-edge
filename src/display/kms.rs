@@ -163,7 +163,7 @@ fn enumerate_card(path: &PathBuf) -> Result<Vec<DisplayDevice>> {
                 DisplayMode {
                     width: w as u32,
                     height: h as u32,
-                    refresh_hz: m.vrefresh() as u32,
+                    refresh_hz: m.vrefresh(),
                     preferred: (m.mode_type() & drm::control::ModeTypeFlags::PREFERRED)
                         == drm::control::ModeTypeFlags::PREFERRED,
                 }
@@ -1355,7 +1355,7 @@ impl KmsDisplay {
         self.height
     }
     pub fn refresh_hz(&self) -> u32 {
-        self.mode.vrefresh() as u32
+        self.mode.vrefresh()
     }
 
     /// Re-program the connector to the best mode covering source dims
@@ -1397,7 +1397,7 @@ impl KmsDisplay {
         let new_w = new_w_i16 as u32;
         let new_h = new_h_i16 as u32;
         let same_size = new_w == self.width && new_h == self.height;
-        let same_rate = new_mode.vrefresh() as u32 == self.mode.vrefresh() as u32;
+        let same_rate = new_mode.vrefresh() as u32 == self.mode.vrefresh();
         if same_size && same_rate {
             return Ok(());
         }
@@ -1550,7 +1550,7 @@ impl KmsDisplay {
         let new_w = new_w_i16 as u32;
         let new_h = new_h_i16 as u32;
         let same_size = new_w == self.width && new_h == self.height;
-        let same_rate = new_mode.vrefresh() as u32 == self.mode.vrefresh() as u32;
+        let same_rate = new_mode.vrefresh() == self.mode.vrefresh();
         if same_size && same_rate {
             return Ok(());
         }
@@ -1768,7 +1768,10 @@ impl<'a> DumbBufferMap<'a> {
     pub fn height(&self) -> u32 {
         self.height
     }
-    pub fn as_mut(&mut self) -> &mut [u8] {
+}
+
+impl AsMut<[u8]> for DumbBufferMap<'_> {
+    fn as_mut(&mut self) -> &mut [u8] {
         self.slice
     }
 }
@@ -1806,7 +1809,7 @@ fn pick_mode(
     // 1. Exact (W,H,Hz) match if all three were specified.
     if let (Some(w), Some(h), Some(hz)) = (width, height, refresh_hz) {
         if let Some(m) = modes.iter().find(|m| {
-            m.size().0 as u32 == w && m.size().1 as u32 == h && m.vrefresh() as u32 == hz
+            m.size().0 as u32 == w && m.size().1 as u32 == h && m.vrefresh() == hz
         }) {
             return Ok(*m);
         }
@@ -1895,7 +1898,7 @@ fn pick_mode_for_source_dims_only(
         let mut em = exact;
         em.sort_by_key(|m| {
             (
-                cadence_rank(m.vrefresh() as u32),
+                cadence_rank(m.vrefresh()),
                 std::cmp::Reverse(m.vrefresh()),
             )
         });
@@ -1909,7 +1912,7 @@ fn pick_mode_for_source_dims_only(
         at_or_above.sort_by_key(|m| {
             (
                 (m.size().0 as u64) * (m.size().1 as u64),
-                cadence_rank(m.vrefresh() as u32) as u64,
+                cadence_rank(m.vrefresh()) as u64,
                 std::cmp::Reverse(m.vrefresh() as u64),
             )
         });
@@ -1919,7 +1922,7 @@ fn pick_mode_for_source_dims_only(
     all.sort_by_key(|m| {
         (
             std::cmp::Reverse((m.size().0 as u64) * (m.size().1 as u64)),
-            cadence_rank(m.vrefresh() as u32) as u64,
+            cadence_rank(m.vrefresh()) as u64,
             std::cmp::Reverse(m.vrefresh() as u64),
         )
     });
@@ -2205,7 +2208,7 @@ fn discover_atomic_setup(
     let res = card
         .resource_handles()
         .context("resource_handles for atomic discovery")?;
-    if !res.crtcs().iter().any(|c| *c == crtc) {
+    if !res.crtcs().contains(&crtc) {
         anyhow::bail!("CRTC handle not found in resource enumeration");
     }
 
@@ -2218,7 +2221,7 @@ fn discover_atomic_setup(
         // `filter_crtcs` decodes the plane's `pos_crtcs` bitmask
         // against the resource enumeration order — the only way to
         // read it without poking at private fields.
-        if !res.filter_crtcs(info.possible_crtcs()).iter().any(|c| *c == crtc) {
+        if !res.filter_crtcs(info.possible_crtcs()).contains(&crtc) {
             continue;
         }
         let ty = read_plane_type(card, p)?;
@@ -2310,10 +2313,10 @@ fn discover_bars_overlay_plane(
             continue;
         }
         let info = card.get_plane(p).context("get_plane (overlay search)")?;
-        if !res.filter_crtcs(info.possible_crtcs()).iter().any(|c| *c == crtc) {
+        if !res.filter_crtcs(info.possible_crtcs()).contains(&crtc) {
             continue;
         }
-        if !info.formats().iter().any(|f| *f == argb) {
+        if !info.formats().contains(&argb) {
             continue;
         }
         match read_plane_type(card, p)? {
@@ -2473,10 +2476,10 @@ fn discover_yuv_overlay_plane(
             continue;
         }
         let info = card.get_plane(p).context("get_plane (yuv-overlay search)")?;
-        if !res.filter_crtcs(info.possible_crtcs()).iter().any(|c| *c == crtc) {
+        if !res.filter_crtcs(info.possible_crtcs()).contains(&crtc) {
             continue;
         }
-        if !info.formats().iter().any(|f| *f == nv12) {
+        if !info.formats().contains(&nv12) {
             continue;
         }
         if read_plane_type(card, p)? == PlaneType::Overlay as u64 {
@@ -2612,7 +2615,7 @@ fn read_enum_value(
             let (_raw_values, defs) = enums.values();
             for e in defs.iter() {
                 if e.name().to_bytes() == enum_name.as_bytes() {
-                    return Some(e.value() as u64);
+                    return Some(e.value());
                 }
             }
         }

@@ -294,9 +294,10 @@ pub fn extract_aac_params_from_pes(pkt: &[u8], stream_type: u8) -> Option<AacAud
 ///   [`AudioSpliceState::check_timeout`]. On `Some(SpliceOutcome::Timeout)`
 ///   the assembler runs the legacy PmtBump path and emits
 ///   `pes_splice_timeout`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum AudioSpliceState {
     /// No splice in flight; the slot follows today's behaviour.
+    #[default]
     Idle,
     /// Splice armed — outbound is held until either:
     /// (a) the to-leg produces a PUSI=1 PES with `pts ≥ threshold_pts`
@@ -353,11 +354,6 @@ pub enum FromPacketAction {
 }
 
 impl AudioSpliceState {
-    /// Construct an Idle state.
-    pub fn new() -> Self {
-        AudioSpliceState::Idle
-    }
-
     /// Arm the splice. Returns `false` and stays `Idle` when the
     /// stream type isn't a supported audio codec (caller falls back
     /// to PmtBump silently — non-audio splice is a separate Phase 4
@@ -547,12 +543,6 @@ impl AudioSpliceState {
         } else {
             None
         }
-    }
-}
-
-impl Default for AudioSpliceState {
-    fn default() -> Self {
-        AudioSpliceState::Idle
     }
 }
 
@@ -1047,9 +1037,10 @@ pub fn extract_video_params_from_pes(pkt: &[u8], stream_type: u8) -> Option<Vide
 /// would receive bytes that depend on AUs it never decoded (the
 /// preceding GoP from A), and freeze on the next anchor frame
 /// regardless of PMT-version bumps.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum VideoSpliceState {
     /// No splice in flight; the slot follows today's behaviour.
+    #[default]
     Idle,
     /// Splice armed — outbound is held until one of:
     /// (a) the to-leg produces a PUSI=1 PES with `pts ≥ threshold_pts`
@@ -1093,11 +1084,6 @@ pub enum VideoSpliceState {
 }
 
 impl VideoSpliceState {
-    /// Construct an Idle state.
-    pub fn new() -> Self {
-        VideoSpliceState::Idle
-    }
-
     /// Arm the splice. Returns `false` and stays `Idle` when the slot's
     /// `stream_type` isn't one of the supported video codecs — caller
     /// falls back to PmtBump silently.
@@ -1283,11 +1269,6 @@ impl VideoSpliceState {
     }
 }
 
-impl Default for VideoSpliceState {
-    fn default() -> Self {
-        VideoSpliceState::Idle
-    }
-}
 
 #[cfg(test)]
 mod tests {
@@ -1349,7 +1330,7 @@ mod tests {
 
     #[test]
     fn arm_rejects_non_audio_stream_type() {
-        let mut s = AudioSpliceState::new();
+        let mut s = AudioSpliceState::default();
         let now = Instant::now();
         let armed = arm_no_sentinel(
             &mut s,
@@ -1365,7 +1346,7 @@ mod tests {
 
     #[test]
     fn commit_on_first_b_pes_at_threshold() {
-        let mut s = AudioSpliceState::new();
+        let mut s = AudioSpliceState::default();
         let now = Instant::now();
         // AAC-LC: frame = 1920 ticks. last_a = 90_000, threshold = 91_920.
         assert!(arm_no_sentinel(&mut s, "to", 0x0F, 90_000, now, Duration::from_millis(200)));
@@ -1382,7 +1363,7 @@ mod tests {
 
     #[test]
     fn commit_on_first_b_pes_past_threshold() {
-        let mut s = AudioSpliceState::new();
+        let mut s = AudioSpliceState::default();
         let now = Instant::now();
         assert!(arm_no_sentinel(&mut s, "to", 0x0F, 90_000, now, Duration::from_millis(200)));
         // 200 ticks past threshold.
@@ -1395,7 +1376,7 @@ mod tests {
 
     #[test]
     fn skip_pes_below_threshold() {
-        let mut s = AudioSpliceState::new();
+        let mut s = AudioSpliceState::default();
         let now = Instant::now();
         assert!(arm_no_sentinel(&mut s, "to", 0x0F, 90_000, now, Duration::from_millis(200)));
         // B's first PES is exactly the same as last A — alias, must wait.
@@ -1406,7 +1387,7 @@ mod tests {
 
     #[test]
     fn skip_non_pusi() {
-        let mut s = AudioSpliceState::new();
+        let mut s = AudioSpliceState::default();
         let now = Instant::now();
         assert!(arm_no_sentinel(&mut s, "to", 0x0F, 90_000, now, Duration::from_millis(200)));
         let pkt = pkt_with_pts(99_999, /* pusi */ false);
@@ -1416,7 +1397,7 @@ mod tests {
 
     #[test]
     fn timeout_emits_once() {
-        let mut s = AudioSpliceState::new();
+        let mut s = AudioSpliceState::default();
         let now = Instant::now();
         assert!(arm_no_sentinel(
             &mut s,
@@ -1439,7 +1420,7 @@ mod tests {
 
     #[test]
     fn no_timeout_before_deadline() {
-        let mut s = AudioSpliceState::new();
+        let mut s = AudioSpliceState::default();
         let now = Instant::now();
         assert!(arm_no_sentinel(&mut s, "to", 0x0F, 90_000, now, Duration::from_millis(200)));
         assert!(s.check_timeout(now + Duration::from_millis(50)).is_none());
@@ -1451,7 +1432,7 @@ mod tests {
         // last_a near the top of the 33-bit space; threshold wraps to
         // near zero. A B PES with PTS slightly past the wrap counts as
         // "ahead" and must commit.
-        let mut s = AudioSpliceState::new();
+        let mut s = AudioSpliceState::default();
         let now = Instant::now();
         let near_top: u64 = (1u64 << 33) - 1000;
         // AAC frame 1920 → threshold wraps past 2^33 to (1920 - 1000) = 920.
@@ -1465,7 +1446,7 @@ mod tests {
 
     #[test]
     fn observe_does_nothing_when_idle() {
-        let mut s = AudioSpliceState::new();
+        let mut s = AudioSpliceState::default();
         let pkt = pkt_with_pts(1_000_000, true);
         assert!(s.observe_b_packet(&pkt).is_none());
         assert!(s.check_timeout(Instant::now()).is_none());
@@ -1477,7 +1458,7 @@ mod tests {
 
     #[test]
     fn from_leg_forwarded_then_dropped_at_next_pusi() {
-        let mut s = AudioSpliceState::new();
+        let mut s = AudioSpliceState::default();
         let now = Instant::now();
         assert!(arm_no_sentinel(&mut s, "to", 0x0F, 90_000, now, Duration::from_millis(200)));
         // First, a non-PUSI continuation packet from A: forward.
@@ -1496,7 +1477,7 @@ mod tests {
 
     #[test]
     fn commit_resets_to_idle_so_subsequent_a_forwards() {
-        let mut s = AudioSpliceState::new();
+        let mut s = AudioSpliceState::default();
         let now = Instant::now();
         assert!(arm_no_sentinel(&mut s, "to", 0x0F, 90_000, now, Duration::from_millis(200)));
         let pusi_b = pkt_with_pts(91_920, true);
@@ -1577,7 +1558,7 @@ mod tests {
 
     #[test]
     fn record_a_audio_params_captures_aac() {
-        let mut s = AudioSpliceState::new();
+        let mut s = AudioSpliceState::default();
         let now = Instant::now();
         assert!(s.arm(
             "to".into(),
@@ -1599,7 +1580,7 @@ mod tests {
 
     #[test]
     fn record_a_audio_params_noop_for_non_aac_stream_type() {
-        let mut s = AudioSpliceState::new();
+        let mut s = AudioSpliceState::default();
         let now = Instant::now();
         // MP2 audio — frame duration table accepts it, but the codec
         // sentinel is ADTS-only today.
@@ -1623,7 +1604,7 @@ mod tests {
 
     #[test]
     fn record_a_audio_params_noop_after_au_completed() {
-        let mut s = AudioSpliceState::new();
+        let mut s = AudioSpliceState::default();
         let now = Instant::now();
         assert!(s.arm(
             "to".into(),
@@ -1651,7 +1632,7 @@ mod tests {
 
     #[test]
     fn sentinel_commits_when_aac_params_match() {
-        let mut s = AudioSpliceState::new();
+        let mut s = AudioSpliceState::default();
         let now = Instant::now();
         assert!(s.arm(
             "to".into(),
@@ -1672,7 +1653,7 @@ mod tests {
 
     #[test]
     fn sentinel_rejects_on_channel_count_change() {
-        let mut s = AudioSpliceState::new();
+        let mut s = AudioSpliceState::default();
         let now = Instant::now();
         assert!(s.arm(
             "to-leg".into(),
@@ -1702,7 +1683,7 @@ mod tests {
 
     #[test]
     fn sentinel_rejects_on_sample_rate_change() {
-        let mut s = AudioSpliceState::new();
+        let mut s = AudioSpliceState::default();
         let now = Instant::now();
         assert!(s.arm(
             "to".into(),
@@ -1722,7 +1703,7 @@ mod tests {
 
     #[test]
     fn sentinel_rejects_on_profile_change() {
-        let mut s = AudioSpliceState::new();
+        let mut s = AudioSpliceState::default();
         let now = Instant::now();
         assert!(s.arm(
             "to".into(),
@@ -1746,7 +1727,7 @@ mod tests {
         // we commit on PTS alignment alone. This is the audio-MVP
         // fallback path: AAC-LATM A leg, or arm happened before any
         // ADTS-parseable PUSI was seen.
-        let mut s = AudioSpliceState::new();
+        let mut s = AudioSpliceState::default();
         let now = Instant::now();
         assert!(s.arm(
             "to".into(),
@@ -1768,7 +1749,7 @@ mod tests {
         // A snapshot present, but B's PES isn't ADTS-parseable (e.g.
         // LATM source, or ADTS frame straddles two TS packets). We
         // can't refuse on missing data — commit on PTS alone.
-        let mut s = AudioSpliceState::new();
+        let mut s = AudioSpliceState::default();
         let now = Instant::now();
         assert!(s.arm(
             "to".into(),
@@ -1798,15 +1779,9 @@ mod tests {
         bits.push(0); // useSameStreamMux = 0
         bits.push(0); // audioMuxVersion = 0
         bits.push(1); // allStreamsSameTimeFraming = 1
-        for _ in 0..6 {
-            bits.push(0); // numSubFrames = 0
-        }
-        for _ in 0..4 {
-            bits.push(0); // numProgram = 0
-        }
-        for _ in 0..3 {
-            bits.push(0); // numLayer = 0
-        }
+        bits.extend(std::iter::repeat_n(0u8, 6)); // numSubFrames = 0
+        bits.extend(std::iter::repeat_n(0u8, 4)); // numProgram = 0
+        bits.extend(std::iter::repeat_n(0u8, 3)); // numLayer = 0
         // AudioSpecificConfig: AOT (5 bits — assume ≤30, no escape), SFI (4), channel_config (4)
         for i in (0..5).rev() {
             bits.push((aot >> i) & 1);
@@ -1853,17 +1828,17 @@ mod tests {
     fn parse_latm_rejects_use_same_stream_mux() {
         // useSameStreamMux=1 means "reuse prior StreamMuxConfig". The
         // parser doesn't have it; fail-safe to None.
-        let mut bits: Vec<u8> = vec![];
-        bits.push(1);
+        let bits: Vec<u8> = vec![1];
         let payload = pack_bits(&bits);
         assert!(parse_aac_latm_params(&payload).is_none());
     }
 
     #[test]
     fn parse_latm_rejects_audio_mux_version_1() {
-        let mut bits: Vec<u8> = vec![];
-        bits.push(0); // useSameStreamMux=0
-        bits.push(1); // audioMuxVersion=1 (extended; not supported)
+        let bits: Vec<u8> = vec![
+            0, // useSameStreamMux=0
+            1, // audioMuxVersion=1 (extended; not supported)
+        ];
         let payload = pack_bits(&bits);
         assert!(parse_aac_latm_params(&payload).is_none());
     }
@@ -1890,7 +1865,7 @@ mod tests {
     #[test]
     fn sentinel_rejects_latm_channel_count_change() {
         // A is LATM AAC-LC stereo 48 kHz; B is LATM AAC-LC 5.1 48 kHz.
-        let mut s = AudioSpliceState::new();
+        let mut s = AudioSpliceState::default();
         let now = Instant::now();
         let a_params = AacAudioParams {
             profile: 1,
@@ -1922,7 +1897,7 @@ mod tests {
 
     #[test]
     fn sentinel_commits_latm_match() {
-        let mut s = AudioSpliceState::new();
+        let mut s = AudioSpliceState::default();
         let now = Instant::now();
         let a = AacAudioParams { profile: 1, sample_rate_idx: 3, channel_config: 2 };
         assert!(s.arm(
@@ -1945,7 +1920,7 @@ mod tests {
         // MP2 audio: frame-duration table supports the splice, but the
         // codec sentinel is ADTS-only today. Even if expected_aac_params
         // is somehow populated, an MP2 slot must commit on PTS alone.
-        let mut s = AudioSpliceState::new();
+        let mut s = AudioSpliceState::default();
         let now = Instant::now();
         assert!(s.arm(
             "to".into(),
@@ -2125,7 +2100,7 @@ mod tests {
 
     #[test]
     fn video_arm_rejects_non_video_stream_type() {
-        let mut s = VideoSpliceState::new();
+        let mut s = VideoSpliceState::default();
         let now = Instant::now();
         // AAC stream type — not a video codec; arm must refuse.
         assert!(!video_arm_no_sentinel(
@@ -2141,7 +2116,7 @@ mod tests {
 
     #[test]
     fn video_commit_on_first_idr_pes_at_threshold() {
-        let mut s = VideoSpliceState::new();
+        let mut s = VideoSpliceState::default();
         let now = Instant::now();
         // last_a = 90_000, threshold = 93_600 (+ VIDEO_FRAME_DURATION_90K).
         assert!(video_arm_no_sentinel(
@@ -2170,7 +2145,7 @@ mod tests {
         // The state machine must keep waiting — committing on a
         // non-RAP would freeze the receiver's decoder on the next
         // anchor frame.
-        let mut s = VideoSpliceState::new();
+        let mut s = VideoSpliceState::default();
         let now = Instant::now();
         assert!(video_arm_no_sentinel(
             &mut s,
@@ -2196,7 +2171,7 @@ mod tests {
         // B's first IDR PES is below threshold (B's encoder is behind
         // A's wallclock) — wait, even though the PES would otherwise
         // qualify as a clean RAP.
-        let mut s = VideoSpliceState::new();
+        let mut s = VideoSpliceState::default();
         let now = Instant::now();
         assert!(video_arm_no_sentinel(
             &mut s,
@@ -2213,7 +2188,7 @@ mod tests {
 
     #[test]
     fn video_skips_non_pusi() {
-        let mut s = VideoSpliceState::new();
+        let mut s = VideoSpliceState::default();
         let now = Instant::now();
         assert!(video_arm_no_sentinel(
             &mut s,
@@ -2230,7 +2205,7 @@ mod tests {
 
     #[test]
     fn video_hevc_commits_on_idr_w_radl() {
-        let mut s = VideoSpliceState::new();
+        let mut s = VideoSpliceState::default();
         let now = Instant::now();
         assert!(video_arm_no_sentinel(
             &mut s,
@@ -2250,7 +2225,7 @@ mod tests {
 
     #[test]
     fn video_timeout_emits_once() {
-        let mut s = VideoSpliceState::new();
+        let mut s = VideoSpliceState::default();
         let now = Instant::now();
         assert!(video_arm_no_sentinel(
             &mut s,
@@ -2272,7 +2247,7 @@ mod tests {
 
     #[test]
     fn video_no_timeout_before_deadline() {
-        let mut s = VideoSpliceState::new();
+        let mut s = VideoSpliceState::default();
         let now = Instant::now();
         assert!(video_arm_no_sentinel(
             &mut s,
@@ -2290,7 +2265,7 @@ mod tests {
     fn video_pts_wrap_around_threshold_commits() {
         // last_a near the top of the 33-bit space; threshold wraps
         // past 2^33. A B PES with a small PTS counts as wrapped-ahead.
-        let mut s = VideoSpliceState::new();
+        let mut s = VideoSpliceState::default();
         let now = Instant::now();
         let near_top: u64 = (1u64 << 33) - 1000;
         assert!(video_arm_no_sentinel(
@@ -2311,7 +2286,7 @@ mod tests {
 
     #[test]
     fn video_observe_does_nothing_when_idle() {
-        let mut s = VideoSpliceState::new();
+        let mut s = VideoSpliceState::default();
         let pkt = pkt_with_video_pes(1_000_000, true, &[(4, avc_nal(5))]);
         assert!(s.observe_b_packet(&pkt).is_none());
         assert!(s.check_timeout(Instant::now()).is_none());
@@ -2320,7 +2295,7 @@ mod tests {
 
     #[test]
     fn video_from_leg_forwarded_then_dropped_at_next_pusi() {
-        let mut s = VideoSpliceState::new();
+        let mut s = VideoSpliceState::default();
         let now = Instant::now();
         assert!(video_arm_no_sentinel(
             &mut s,
@@ -2544,7 +2519,7 @@ mod tests {
 
     #[test]
     fn record_a_video_params_captures_sps() {
-        let mut s = VideoSpliceState::new();
+        let mut s = VideoSpliceState::default();
         let now = Instant::now();
         assert!(video_arm_no_sentinel(
             &mut s,
@@ -2567,7 +2542,7 @@ mod tests {
 
     #[test]
     fn record_a_video_params_noop_after_au_completed() {
-        let mut s = VideoSpliceState::new();
+        let mut s = VideoSpliceState::default();
         let now = Instant::now();
         assert!(video_arm_no_sentinel(
             &mut s,
@@ -2594,7 +2569,7 @@ mod tests {
 
     #[test]
     fn video_sentinel_commits_when_params_match() {
-        let mut s = VideoSpliceState::new();
+        let mut s = VideoSpliceState::default();
         let now = Instant::now();
         assert!(s.arm(
             "to".into(),
@@ -2615,7 +2590,7 @@ mod tests {
 
     #[test]
     fn video_sentinel_rejects_on_resolution_change() {
-        let mut s = VideoSpliceState::new();
+        let mut s = VideoSpliceState::default();
         let now = Instant::now();
         assert!(s.arm(
             "to-leg".into(),
@@ -2646,7 +2621,7 @@ mod tests {
 
     #[test]
     fn video_sentinel_rejects_on_profile_change() {
-        let mut s = VideoSpliceState::new();
+        let mut s = VideoSpliceState::default();
         let now = Instant::now();
         assert!(s.arm(
             "to".into(),
@@ -2669,7 +2644,7 @@ mod tests {
     fn video_sentinel_rejects_on_bit_depth_change() {
         // A is High10 10-bit; B is High10 8-bit. Bit-depth mismatch
         // forces a decoder re-init.
-        let mut s = VideoSpliceState::new();
+        let mut s = VideoSpliceState::default();
         let now = Instant::now();
         let a = VideoCodecParams {
             codec: VideoCodec::Avc,
@@ -2701,7 +2676,7 @@ mod tests {
     #[test]
     fn video_sentinel_falls_through_when_a_params_unknown() {
         // No A baseline → sentinel can't refuse → commit on IDR/PTS alone.
-        let mut s = VideoSpliceState::new();
+        let mut s = VideoSpliceState::default();
         let now = Instant::now();
         assert!(s.arm(
             "to".into(),
@@ -2726,7 +2701,7 @@ mod tests {
         // encoders don't emit SPS on every IDR). Sentinel must
         // fail-safe to commit on IDR+PTS alone — refusing on missing
         // data would refuse perfectly compatible splices.
-        let mut s = VideoSpliceState::new();
+        let mut s = VideoSpliceState::default();
         let now = Instant::now();
         assert!(s.arm(
             "to".into(),
@@ -2746,7 +2721,7 @@ mod tests {
 
     #[test]
     fn video_commit_resets_to_idle() {
-        let mut s = VideoSpliceState::new();
+        let mut s = VideoSpliceState::default();
         let now = Instant::now();
         assert!(video_arm_no_sentinel(
             &mut s,

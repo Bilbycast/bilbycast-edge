@@ -456,7 +456,7 @@ mod dbus {
     }
 
     fn dict_f32(d: &HashMap<String, OwnedValue>, key: &str) -> Option<f32> {
-        d.get(key).and_then(|v| value_to_f64(v)).map(|f| f as f32)
+        d.get(key).and_then(value_to_f64).map(|f| f as f32)
     }
 
     /// Numeric coercion across the variant types ModemManager uses (`d` mostly,

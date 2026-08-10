@@ -1912,7 +1912,7 @@ pub async fn run_st2110_23_output(
     let frame_bytes = frame_pixels.saturating_mul(pgroup_bytes) / pgroup_pixels.max(1);
     let payload = (config.payload_budget as u64).max(1);
     let packets_per_frame_total = (frame_bytes.saturating_add(payload - 1) / payload).max(1) as u32;
-    let packets_per_substream = ((packets_per_frame_total as u64 + n as u64 - 1) / n as u64) as u32;
+    let packets_per_substream = (packets_per_frame_total as u64).div_ceil(n as u64) as u32;
     let frame_period_ns = 1_000_000_000u64
         .saturating_mul(config.frame_rate_den as u64)
         / (config.frame_rate_num as u64).max(1);

@@ -314,13 +314,8 @@ impl WebrtcSession {
     /// negotiated" bug). Call this after Connected to flush any
     /// pending events.
     pub fn drain_pending_events(&mut self) {
-        loop {
-            match self.rtc.poll_output() {
-                Ok(Output::Event(event)) => {
-                    let _ = self.handle_event(event);
-                }
-                Ok(Output::Transmit(_)) | Ok(Output::Timeout(_)) | Err(_) => break,
-            }
+        while let Ok(Output::Event(event)) = self.rtc.poll_output() {
+            let _ = self.handle_event(event);
         }
     }
 

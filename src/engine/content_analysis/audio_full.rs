@@ -417,8 +417,7 @@ impl AudioPidState {
             // Initialise decoder lazily once we have a valid config.
             if self.aac_decoder.is_none() {
                 if let Some(sr) = sample_rate_from_index(sr_index) {
-                    if channel_config >= 1
-                        && channel_config <= 7
+                    if (1..=7).contains(&channel_config)
                         && let Ok(dec) =
                             AacDecoder::from_adts_config(profile, sr_index, channel_config)
                     {
@@ -545,7 +544,7 @@ impl AudioPidState {
                     self.likely_silent = true;
                     let fire = self
                         .last_silence_event_at
-                        .map_or(true, |t| t.elapsed() >= EVENT_RATELIMIT);
+                        .is_none_or(|t| t.elapsed() >= EVENT_RATELIMIT);
                     if fire {
                         events.send(Event {
                             severity: EventSeverity::Warning,
@@ -1033,7 +1032,7 @@ impl PcmAudioState {
                     self.likely_silent = true;
                     let fire = self
                         .last_silence_event_at
-                        .map_or(true, |t| t.elapsed() >= EVENT_RATELIMIT);
+                        .is_none_or(|t| t.elapsed() >= EVENT_RATELIMIT);
                     if fire {
                         events.send(Event {
                             severity: EventSeverity::Warning,

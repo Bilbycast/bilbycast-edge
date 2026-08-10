@@ -999,7 +999,7 @@ async fn run_assembler(
                                             .unwrap_or(DEFAULT_AUDIO_SPLICE_BUDGET_MS);
                                         let state = splice_state
                                             .entry(key)
-                                            .or_insert_with(AudioSpliceState::new);
+                                            .or_default();
                                         // Snapshot A's last AAC params for
                                         // the codec sentinel. `None` for
                                         // non-AAC or when ADTS hasn't
@@ -1040,7 +1040,7 @@ async fn run_assembler(
                                             .unwrap_or(DEFAULT_VIDEO_SPLICE_BUDGET_MS);
                                         let state = video_splice_state
                                             .entry(key)
-                                            .or_insert_with(VideoSpliceState::new);
+                                            .or_default();
                                         // Snapshot A's last SPS-derived
                                         // codec params for the sentinel.
                                         // `None` when A's encoder hasn't
@@ -2057,8 +2057,6 @@ fn install_plan(
 ///
 /// Monotonic mod 32 — same discipline as `TsContinuityFixer` so A→B→A
 /// never lands on a receiver-locked phantom version.
-#[allow(clippy::too_many_arguments)]
-#[allow(clippy::too_many_arguments)]
 fn apply_plan_replacement(
     plan: &mut AssemblyPlan,
     new_plan: AssemblyPlan,
@@ -2141,7 +2139,7 @@ fn apply_plan_replacement(
     let mut new_active_leg_input: std::collections::HashMap<(usize, u16), String> =
         std::collections::HashMap::new();
 
-    for new_prog in new_plan.programs.iter().enumerate().map(|(pidx, p)| (pidx, p)) {
+    for new_prog in new_plan.programs.iter().enumerate() {
         let (pidx, prog) = new_prog;
         for s in prog.slots.iter() {
             let leg_pairs: Vec<(String, u16)> = match &s.switch_legs {
@@ -2156,7 +2154,7 @@ fn apply_plan_replacement(
                 let match_idx = flat.iter().enumerate().find_map(|(i, f)| {
                     if !reused[i]
                         && f.source == *src
-                        && slot_cancels.get(i).map_or(true, |c| !c.is_cancelled())
+                        && slot_cancels.get(i).is_none_or(|c| !c.is_cancelled())
                     {
                         Some(i)
                     } else {

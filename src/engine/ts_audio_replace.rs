@@ -615,7 +615,7 @@ impl TsAudioReplacer {
         }
 
         // Bail out for non-aligned input: passthrough, do nothing clever.
-        if input_ts.len() % TS_PACKET_SIZE != 0 {
+        if !input_ts.len().is_multiple_of(TS_PACKET_SIZE) {
             output.extend_from_slice(input_ts);
             return;
         }
@@ -878,8 +878,7 @@ impl TsAudioReplacer {
             );
             for ch in self.accumulator.iter_mut() {
                 ch.extend(
-                    std::iter::repeat(0.0f32)
-                        .take(silence_samples as usize),
+                    std::iter::repeat_n(0.0f32, silence_samples as usize),
                 );
             }
         }
@@ -1588,8 +1587,7 @@ impl TsAudioReplacer {
                             .extend_from_slice(&shuffled_planar[ch]);
                     } else if !shuffled_planar.is_empty() {
                         self.accumulator[ch].extend(
-                            std::iter::repeat(0.0f32)
-                                .take(shuffled_planar[0].len()),
+                            std::iter::repeat_n(0.0f32, shuffled_planar[0].len()),
                         );
                     }
                 }
@@ -1713,7 +1711,7 @@ impl TsAudioReplacer {
                     self.aac_encoder = Some(
                         aac_audio::AacEncoder::open(&cfg).map_err(|_| ())?,
                     );
-                    return Ok(());
+                    Ok(())
                 }
                 #[cfg(not(all(feature = "media-codecs", feature = "fdk-aac")))]
                 {
@@ -1736,7 +1734,7 @@ impl TsAudioReplacer {
                     };
                     self.av_encoder =
                         Some(video_engine::AudioEncoder::open(&cfg).map_err(|_| ())?);
-                    return Ok(());
+                    Ok(())
                 }
                 #[cfg(not(feature = "media-codecs"))]
                 {
