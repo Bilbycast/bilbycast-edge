@@ -1120,6 +1120,7 @@ fn demux_decode_loop(
         demoted_at: None,
         hw_repromote_attempts: 0,
         last_send_error_at: None,
+        hw_repromoted_at: None,
         last_send_error_log_at: None,
         first_send_after_open: None,
         mpeg2_cpu_pinned: false,
@@ -1791,6 +1792,20 @@ struct HwOpenState {
     /// 1 → 2 → 3 as the retry fired straight back into the same broken
     /// stream.
     last_send_error_at: Option<Instant>,
+    /// Wall-clock at which a re-promotion's hardware decoder actually
+    /// opened. `None` while on CPU, or when hardware was never demoted.
+    ///
+    /// Exists only to decide whether `hw_repromote_attempts` should decay.
+    /// The attempt counter has no reset, so it counts probes *ever fired*
+    /// on this flow rather than consecutive failures — and a node with a
+    /// recurring transient fault (the #96 eth0 stall, roughly hourly)
+    /// recovers on the first probe every time yet still ratchets, until
+    /// every later gap waits the full [`HW_REPROMOTE_BACKOFF_MAX`] on a
+    /// backend that has never failed a probe. Decaying on a session that
+    /// *held* longer than the cap keeps the exponential growth where it
+    /// belongs — a backend failing probe after probe re-demotes far
+    /// inside that window and never earns the reset.
+    hw_repromoted_at: Option<Instant>,
     /// Last wall-clock at which `feed_video_decoder` emitted a
     /// `tracing::warn!` for a send_packet error. One-per-second
     /// throttle so a hard-broken HW backend doesn't flood the log
@@ -1910,6 +1925,17 @@ fn hw_repromote_backoff(attempts: u32) -> Duration {
     HW_REPROMOTE_BACKOFF_BASE
         .saturating_mul(1u32 << attempts.min(5))
         .min(HW_REPROMOTE_BACKOFF_MAX)
+}
+
+/// `true` when a re-promotion's hardware session lasted long enough to be a
+/// recovery rather than a failed probe, so the attempt counter may decay.
+///
+/// The threshold is the whole backoff ladder: a backend that is genuinely
+/// broken re-demotes far inside it and keeps its exponential damping, while a
+/// node whose fault is transient — and which therefore recovers on the first
+/// probe every time — stops ratcheting toward the ceiling.
+fn repromotion_held(held_for: Option<Duration>) -> bool {
+    held_for.is_some_and(|d| d >= HW_REPROMOTE_BACKOFF_MAX)
 }
 
 /// Watchdog deadline for "decoder accepted packets but never produced
@@ -2145,6 +2171,15 @@ fn open_video_decoder_with_retry(
                     d.set_rkmpp_zero_copy(true);
                 }
                 counters.set_active_decoder_label(decoder_label_for_backend(state.backend));
+                // Hardware is genuinely back in the decode path, so the
+                // re-promotion clock is spent. `maybe_repromote_hw_decode`
+                // leaves it armed across the probe precisely so that a
+                // *failed* open (the demote at the bottom of this function,
+                // which stamps nothing) still re-tests later.
+                if !matches!(state.backend, DecoderBackend::Cpu) {
+                    state.demoted_at = None;
+                    state.hw_repromoted_at = Some(Instant::now());
+                }
                 return Some(d);
             }
             Err(e) => {
@@ -2480,6 +2515,12 @@ fn maybe_repromote_hw_decode(
     if matches!(state.requested_backend, DecoderBackend::Cpu) {
         return false;
     }
+    // `demoted_at` stays armed across the probe itself (see below), so it can
+    // be `Some` while the backend is already back on hardware and merely
+    // waiting for its first open. Only retry when actually on CPU.
+    if !matches!(state.backend, DecoderBackend::Cpu) {
+        return false;
+    }
     let backoff = hw_repromote_backoff(state.hw_repromote_attempts);
     if demoted_at.elapsed() < backoff {
         return false;
@@ -2508,9 +2549,31 @@ fn maybe_repromote_hw_decode(
     state.fell_back_to_cpu = false;
     state.fallback_event_emitted = false;
     state.consecutive_send_errors = 0;
-    state.hw_reset_attempts = 0;
     state.demote_requested = None;
-    state.demoted_at = None;
+
+    // A probe is not evidence the backend works, so it does **not** get a
+    // fresh wedge-reset budget. With the budget refilled, a failed probe
+    // does not demote on its first error run — it re-spends both
+    // `MAX_HW_RESET_ATTEMPTS`, and every reset re-arms the keyframe gate,
+    // buying another `KEYFRAME_GATE_MAX_WAIT` and (on an IDR-less source)
+    // another `SPECULATIVE_DEMOTE_GRACE` during which nothing decodes. That
+    // turns the "~1-2 s of disturbed picture" this costs into three decoder
+    // cycles. A probe that genuinely recovers refills the budget on its
+    // first decoded frame in `drain_video_frames`, so this costs a real
+    // recovery nothing.
+    state.hw_reset_attempts = MAX_HW_RESET_ATTEMPTS;
+
+    // Deliberately **not** cleared here. The re-open below can fail: when it
+    // does, `open_video_decoder_with_retry` demotes at its own "retry budget
+    // exhausted" site, which sets `backend = Cpu` but does not stamp
+    // `demoted_at`. Clearing the clock optimistically therefore disarmed the
+    // retry for the life of the flow after a single failed probe — the exact
+    // "demote outlives its cause" failure this function exists to fix,
+    // reached through a different door and invisible to the hardware test,
+    // which only ever exercised the runtime (`send_packet`) demote path.
+    // Re-stamp instead, so a failed probe re-tests on the widened backoff;
+    // the successful-open arm clears it once hardware is genuinely back.
+    state.demoted_at = Some(Instant::now());
 
     tracing::info!(
         flow_id = %flow_id,
@@ -2613,6 +2676,17 @@ fn force_cpu_fallback(
 
     state.backend = DecoderBackend::Cpu;
     state.fell_back_to_cpu = true;
+    // A re-promotion whose hardware session then *held* for longer than the
+    // whole backoff ladder was a genuine recovery, not a failed probe, so it
+    // must not be charged against the schedule — otherwise a node with a
+    // recurring transient fault ratchets to the 10-minute ceiling despite
+    // recovering on the first probe every time. A backend that is really
+    // broken re-demotes far inside this window and keeps its exponential
+    // damping.
+    if repromotion_held(state.hw_repromoted_at.map(|t| t.elapsed())) {
+        state.hw_repromote_attempts = 0;
+    }
+    state.hw_repromoted_at = None;
     // Start the re-promotion clock. Without this the demote is terminal
     // for the life of the flow — see `HW_REPROMOTE_BACKOFF_BASE`.
     state.demoted_at = Some(Instant::now());
@@ -5605,6 +5679,111 @@ mod tests {
         assert_eq!(hw_repromote_backoff(1), HW_REPROMOTE_BACKOFF_BASE * 2);
         assert_eq!(hw_repromote_backoff(2), HW_REPROMOTE_BACKOFF_BASE * 4);
         assert_eq!(hw_repromote_backoff(3), HW_REPROMOTE_BACKOFF_BASE * 8);
+    }
+
+    /// A state that has been demoted long enough for the first probe to be due.
+    fn demoted_state() -> HwOpenState {
+        HwOpenState {
+            backend: DecoderBackend::Cpu,
+            requested_backend: DecoderBackend::Rkmpp,
+            fell_back_to_cpu: true,
+            fallback_event_emitted: true,
+            demote_requested: None,
+            hdr_on_sdr_event_emitted: false,
+            consecutive_send_errors: 31,
+            hw_reset_attempts: MAX_HW_RESET_ATTEMPTS,
+            demoted_at: Some(Instant::now() - (HW_REPROMOTE_BACKOFF_BASE + Duration::from_secs(1))),
+            hw_repromote_attempts: 0,
+            last_send_error_at: None,
+            hw_repromoted_at: None,
+            last_send_error_log_at: None,
+            first_send_after_open: None,
+            mpeg2_cpu_pinned: false,
+            mpeg2_cpu_override: None,
+        }
+    }
+
+    fn fire_repromote(state: &mut HwOpenState) -> bool {
+        let (events, _rx) = crate::manager::events::event_channel();
+        let counters = DisplayStatsCounters::default();
+        let mut gate = KeyframeGate::new();
+        let stale = AtomicBool::new(false);
+        let mut slot: Option<VideoDecoder> = None;
+        let mut current: Option<VideoCodec> = None;
+        maybe_repromote_hw_decode(
+            &mut slot,
+            &mut current,
+            state,
+            &counters,
+            &mut gate,
+            &stale,
+            &events,
+            "flow-test",
+            "out-test",
+        )
+    }
+
+    /// Regression: the probe must leave `demoted_at` armed.
+    ///
+    /// `open_video_decoder_with_retry`'s own "retry budget exhausted" demote
+    /// sets `backend = Cpu` **without** stamping `demoted_at`. So if the probe
+    /// cleared the clock optimistically, a single failed re-open disarmed the
+    /// retry for the life of the flow — reinstating the exact 50-minutes-stuck-
+    /// on-CPU bug this whole mechanism exists to fix, by a different route. The
+    /// hardware test could not see it: it only ever drove the runtime
+    /// (`send_packet`) demote, which does re-stamp.
+    #[test]
+    fn repromote_leaves_the_clock_armed_so_a_failed_open_retries() {
+        let mut state = demoted_state();
+        assert!(fire_repromote(&mut state), "probe should have fired");
+        assert!(
+            state.demoted_at.is_some(),
+            "a failed re-open stamps nothing, so clearing the clock here disarms the retry forever"
+        );
+        assert_eq!(state.backend, DecoderBackend::Rkmpp);
+        assert_eq!(state.hw_repromote_attempts, 1);
+    }
+
+    /// A probe is not evidence the backend works, so it must not hand itself a
+    /// fresh wedge-reset budget: that lets a failed probe re-spend both resets
+    /// and re-arm the keyframe gate twice more, turning one decoder cycle into
+    /// three. A genuine recovery refills the budget on its first decoded frame.
+    #[test]
+    fn repromote_does_not_refill_the_wedge_reset_budget() {
+        let mut state = demoted_state();
+        assert!(fire_repromote(&mut state));
+        assert_eq!(state.hw_reset_attempts, MAX_HW_RESET_ATTEMPTS);
+    }
+
+    /// Being back on hardware must suppress a second probe even while the
+    /// clock is still armed for the open that has not happened yet.
+    #[test]
+    fn repromote_does_not_fire_again_while_already_on_hardware() {
+        let mut state = demoted_state();
+        assert!(fire_repromote(&mut state));
+        state.demoted_at =
+            Some(Instant::now() - (HW_REPROMOTE_BACKOFF_MAX + Duration::from_secs(1)));
+        assert!(
+            !fire_repromote(&mut state),
+            "backend is already the requested one — nothing to promote"
+        );
+        assert_eq!(state.hw_repromote_attempts, 1, "attempts must not double-count");
+    }
+
+    /// The attempt counter decays only for a session that actually held, so a
+    /// node recovering on the first probe every time never ratchets to the
+    /// ceiling, while a backend failing probe after probe still does.
+    #[test]
+    fn repromotion_decays_only_after_a_session_that_held() {
+        assert!(!repromotion_held(None));
+        assert!(!repromotion_held(Some(Duration::ZERO)));
+        assert!(!repromotion_held(Some(
+            HW_REPROMOTE_BACKOFF_MAX - Duration::from_secs(1)
+        )));
+        assert!(repromotion_held(Some(HW_REPROMOTE_BACKOFF_MAX)));
+        assert!(repromotion_held(Some(
+            HW_REPROMOTE_BACKOFF_MAX + Duration::from_secs(1)
+        )));
     }
 
     #[test]
