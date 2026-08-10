@@ -3962,6 +3962,32 @@ impl KmsDisplay {
         }
     }
 
+    /// Destroy every cached imported framebuffer, **without** touching
+    /// `prime_state` or the CRTC. The narrow half of
+    /// [`Self::release_prime_state`], for callers that are staying on the
+    /// zero-copy path and only need the memo dropped.
+    ///
+    /// `prime_fb_cache` is keyed on the DMA-BUF's `(st_dev, st_ino)`, and
+    /// its capacity comment assumes entries only go stale "across a
+    /// decoder restart that introduces new underlying buffer objects".
+    /// A decoder teardown + re-open is exactly that: an RKMPP pool retires
+    /// its ≤16 DMA-BUF identities and allocates 16 fresh ones, so every
+    /// cached entry is dead. Left to age out through the FIFO the next 16
+    /// presents each pay a full re-import — measured on RK3588 as the
+    /// difference between sub-millisecond and double-digit milliseconds
+    /// against a 41.6 ms/frame budget, i.e. a burst of missed vblanks.
+    ///
+    /// Distinct from `release_prime_state` because a reset is not a
+    /// demotion: tearing down `prime_state` and re-arming the CRTC onto
+    /// the dumb buffer would put a visible flip in the middle of a
+    /// recovery that is otherwise invisible. See issue #94.
+    pub fn invalidate_prime_fb_cache(&mut self) {
+        for (_, entry) in self.prime_fb_cache.drain() {
+            let _ = self.card.destroy_framebuffer(entry.fb);
+        }
+        self.prime_fb_cache_order.clear();
+    }
+
     /// Flush any retained PRIME state — destroy every cached imported
     /// framebuffer and drop the in-flight keepalive. Idempotent: safe
     /// to call every frame on the CPU-blit path without paying for a
@@ -3978,10 +4004,7 @@ impl KmsDisplay {
     /// so every cached framebuffer is flushed here rather than left to
     /// age out via `prime_fb_cache`'s normal FIFO eviction.
     pub fn release_prime_state(&mut self) {
-        for (_, entry) in self.prime_fb_cache.drain() {
-            let _ = self.card.destroy_framebuffer(entry.fb);
-        }
-        self.prime_fb_cache_order.clear();
+        self.invalidate_prime_fb_cache();
 
         let Some(mut state) = self.prime_state.take() else {
             return;

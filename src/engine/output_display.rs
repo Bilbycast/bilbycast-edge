@@ -614,6 +614,14 @@ async fn run_display_output(
     // the working CPU-blit path instead of black-screening on a doomed prime
     // present. Mirrors the `force_cpu_blit_for_bars` sharing pattern.
     let prime_scanout_failed = Arc::new(AtomicBool::new(false));
+    // Set by the decode task whenever it tears a decoder down for a
+    // re-open on the SAME backend (the #91 wedge reset, and the #97
+    // hardware re-promotion). Consumed once by the display task, which
+    // drops `KmsDisplay`'s PRIME framebuffer memo before the next
+    // present. A re-opened decoder pool allocates fresh DMA-BUF
+    // identities, so every cached `(st_dev, st_ino)` key is dead and
+    // the next ~16 presents would each pay a full re-import. See #94.
+    let prime_cache_stale = Arc::new(AtomicBool::new(false));
     // Set by the decode task the first time `rga_rs::nv12_dmabuf_to_sysmem`
     // successfully engages. Read by the display task's pacer to gate a
     // one-time A/V latency calibration — the RGA-accelerated transfer
@@ -701,6 +709,7 @@ async fn run_display_output(
     let demux_panel_hdr_capable = kms.panel_hdr_capable();
     let demux_force_cpu_blit_for_bars = Arc::clone(&force_cpu_blit_for_bars);
     let demux_prime_scanout_failed = Arc::clone(&prime_scanout_failed);
+    let demux_prime_cache_stale = Arc::clone(&prime_cache_stale);
     #[cfg(feature = "rga-transfer")]
     let demux_rga_transfer_active = Arc::clone(&rga_transfer_active);
     let demux_output_stats = Arc::clone(&output_stats);
@@ -726,6 +735,7 @@ async fn run_display_output(
             demux_panel_hdr_capable,
             demux_force_cpu_blit_for_bars,
             demux_prime_scanout_failed,
+            demux_prime_cache_stale,
             #[cfg(feature = "rga-transfer")]
             demux_rga_transfer_active,
             demux_output_stats,
@@ -792,6 +802,7 @@ async fn run_display_output(
     let display_frame_gen = Arc::clone(&frame_gen);
     let display_force_cpu_blit = Arc::clone(&force_cpu_blit_for_bars);
     let display_prime_scanout_failed = Arc::clone(&prime_scanout_failed);
+    let display_prime_cache_stale = Arc::clone(&prime_cache_stale);
     #[cfg(feature = "rga-transfer")]
     let display_rga_transfer_active = Arc::clone(&rga_transfer_active);
     // Independent DRM-master release handle (a dup of the card fd) captured
@@ -816,6 +827,7 @@ async fn run_display_output(
             display_frame_gen,
             display_force_cpu_blit,
             display_prime_scanout_failed,
+            display_prime_cache_stale,
             #[cfg(feature = "rga-transfer")]
             display_rga_transfer_active,
         );
@@ -1073,6 +1085,7 @@ fn demux_decode_loop(
     panel_hdr_capable: bool,
     force_cpu_blit_for_bars: Arc<AtomicBool>,
     prime_scanout_failed: Arc<AtomicBool>,
+    prime_cache_stale: Arc<AtomicBool>,
     #[cfg(feature = "rga-transfer")] rga_transfer_active: Arc<AtomicBool>,
     output_stats: Arc<OutputStatsAccumulator>,
     audio_decode_counters: Arc<DecodeStats>,
@@ -1104,6 +1117,9 @@ fn demux_decode_loop(
         hdr_on_sdr_event_emitted: false,
         consecutive_send_errors: 0,
         hw_reset_attempts: 0,
+        demoted_at: None,
+        hw_repromote_attempts: 0,
+        last_send_error_at: None,
         last_send_error_log_at: None,
         first_send_after_open: None,
         mpeg2_cpu_pinned: false,
@@ -1246,6 +1262,7 @@ fn demux_decode_loop(
                         panel_hdr_capable,
                         &force_cpu_blit_for_bars,
                         &prime_scanout_failed,
+                        &prime_cache_stale,
                         #[cfg(feature = "rga-transfer")]
                         &rga_transfer_active,
                         stream_ids,
@@ -1282,6 +1299,7 @@ fn demux_decode_loop(
                         panel_hdr_capable,
                         &force_cpu_blit_for_bars,
                         &prime_scanout_failed,
+                        &prime_cache_stale,
                         #[cfg(feature = "rga-transfer")]
                         &rga_transfer_active,
                         stream_ids,
@@ -1327,6 +1345,7 @@ fn demux_decode_loop(
                         panel_hdr_capable,
                         &force_cpu_blit_for_bars,
                         &prime_scanout_failed,
+                        &prime_cache_stale,
                         #[cfg(feature = "rga-transfer")]
                         &rga_transfer_active,
                         stream_ids,
@@ -1741,6 +1760,37 @@ struct HwOpenState {
     /// failure run, so only a backend that cannot be recovered
     /// `MAX_HW_RESET_ATTEMPTS` times in a row is actually demoted.
     hw_reset_attempts: u32,
+    /// Wall-clock at which the **backend-wide** CPU demote took effect,
+    /// i.e. the point `force_cpu_fallback` set `backend = Cpu`. `None`
+    /// whenever hardware decode is live. Read by
+    /// [`maybe_repromote_hw_decode`] to time the retry backoff.
+    ///
+    /// The MPEG-2 pin deliberately does **not** set this: that demote is
+    /// codec-scoped, leaves `backend` on hardware for H.264/HEVC, and is
+    /// a statement about the vendored decoder's capabilities rather than
+    /// about a transient condition. Re-promoting it would re-open MPEG-2
+    /// on a backend that structurally cannot decode it.
+    demoted_at: Option<Instant>,
+    /// Count of backend-wide re-promotion attempts on this run. Only
+    /// grows the backoff — it is never a cap, because the condition that
+    /// forces a demote is usually transient (an input gap) and a node
+    /// that has been on CPU for an hour should still be trying to get
+    /// its hardware path back.
+    hw_repromote_attempts: u32,
+    /// Wall-clock of the most recent `send_packet_with_pts` failure, on
+    /// **any** backend including CPU. Unlike `consecutive_send_errors`
+    /// this is not reset by a successful drain, so it answers a
+    /// different question: "when did this stream last misbehave?".
+    ///
+    /// [`maybe_repromote_hw_decode`] requires a quiet interval here
+    /// before retrying hardware. Without it, re-promotion runs on a bare
+    /// timer and a *persistent* fault produces a demote/re-promote
+    /// oscillation — each cycle tearing the decoder down, which on
+    /// hardware showed up as a frozen picture. Verified on bilby-pi
+    /// under 45 % induced packet loss: `decoder_demotions` climbed
+    /// 1 → 2 → 3 as the retry fired straight back into the same broken
+    /// stream.
+    last_send_error_at: Option<Instant>,
     /// Last wall-clock at which `feed_video_decoder` emitted a
     /// `tracing::warn!` for a send_packet error. One-per-second
     /// throttle so a hard-broken HW backend doesn't flood the log
@@ -1805,6 +1855,62 @@ const RUNTIME_FAIL_DEMOTE_THRESHOLD: u32 = 30;
 /// filled the page-flip queue and blacked the panel. Two resets recover the
 /// session; the demote never does.
 const MAX_HW_RESET_ATTEMPTS: u32 = 2;
+
+/// First delay before retrying hardware decode after a backend-wide CPU
+/// demote, doubling per failed attempt up to [`HW_REPROMOTE_BACKOFF_MAX`].
+///
+/// A demote is a response to a condition that is usually **transient** —
+/// most often an input gap, where no frames arrive, nothing drains, the
+/// reset budget never refills, and the two [`MAX_HW_RESET_ATTEMPTS`] are
+/// consumed inside a single outage regardless of how healthy the decoder
+/// is. Before this retry existed the demote outlived its cause forever:
+/// hardware-measured on bilby-pi (RK3568), a ~4-minute NIC receive stall
+/// left the flow on CPU for **50 minutes**, through the network fully
+/// recovering, until an operator restarted the service. On that board CPU
+/// decode of 1080i50 H.264 costs 39 ms/frame against a 20 ms budget, so
+/// the demoted state drops frames continuously and is visible as
+/// macroblocking (`decode_us_avg` 39 215 -> 926 on re-promotion).
+const HW_REPROMOTE_BACKOFF_BASE: Duration = Duration::from_secs(30);
+
+/// Ceiling for the re-promotion backoff. A backend that genuinely cannot
+/// serve this stream re-tests every 10 minutes forever: one decoder open
+/// per interval is negligible, and it means a host whose GPU comes back
+/// (driver reload, contended device freed) heals without intervention
+/// instead of needing a restart nobody knows to perform.
+const HW_REPROMOTE_BACKOFF_MAX: Duration = Duration::from_secs(600);
+
+/// Quiet interval with **no** `send_packet` failures required before a
+/// hardware re-promotion is allowed, on top of the backoff.
+///
+/// A weak filter, deliberately documented as such. It suppresses a retry
+/// while the decoder is *visibly* struggling, but it is NOT proof the
+/// stream recovered: measured on bilby-pi under 45 % induced packet loss,
+/// CPU decode of a badly corrupted stream produces **no** `send_packet`
+/// errors at all — libavcodec conceals and carries on. So silence here
+/// means "CPU is coping", not "the input is clean", and the gate cannot
+/// prevent a re-probe into a still-broken stream.
+///
+/// Oscillation under a *persistent* fault is therefore bounded by the
+/// exponential backoff, not by this: the same test measured 3 demotes in
+/// ~180 s without the gate and 2 with it — a real but modest improvement.
+/// Each probe costs one decoder re-open (~1-2 s of disturbed picture),
+/// and the backoff decays the rate to one per 10 minutes after four
+/// attempts.
+///
+/// This is the right trade on hardware where CPU decode is not viable
+/// (rk3568 needs 39 ms/frame against a 20 ms budget, so the demoted state
+/// is permanently broken anyway). On a host where CPU decode keeps up, a
+/// periodic probe is pure cost — a follow-up should gate re-promotion on
+/// a genuine input-health signal (TR-101-290 CC-error rate, or SRT
+/// `packets_lost`) rather than on decoder silence.
+const HW_REPROMOTE_CLEAN_PERIOD: Duration = Duration::from_secs(20);
+/// Backoff before the next hardware re-promotion attempt, doubling per
+/// prior attempt and saturating at [`HW_REPROMOTE_BACKOFF_MAX`].
+fn hw_repromote_backoff(attempts: u32) -> Duration {
+    HW_REPROMOTE_BACKOFF_BASE
+        .saturating_mul(1u32 << attempts.min(5))
+        .min(HW_REPROMOTE_BACKOFF_MAX)
+}
 
 /// Watchdog deadline for "decoder accepted packets but never produced
 /// a frame". Picked so that legitimate first-frame latency on QSV /
@@ -2334,6 +2440,115 @@ fn flush_decoders_for_switch(
 /// packets but never produced a frame". Single-shot via
 /// `state.fallback_event_emitted`.
 #[allow(clippy::too_many_arguments)]
+/// Retry the operator's hardware backend after a backend-wide CPU demote,
+/// once the backoff has elapsed. Returns `true` when a re-promotion was
+/// performed, in which case the caller must not run its demote checks on
+/// this pass — the decoder slot has been cleared and the next AU re-opens
+/// on hardware.
+///
+/// **Why a demote must not be terminal.** `force_cpu_fallback` is
+/// backend-wide and, before this, permanent for the life of the flow. The
+/// conditions that trigger it are mostly self-clearing — an input gap, a
+/// wedged session, a momentarily contended device — so the response
+/// outlived its cause. Distinguishing "hardware rejected this stream"
+/// from "nothing arrived to decode" at the demote site is not reliably
+/// possible: both present as a run of `send_packet` errors. Retrying on a
+/// widening backoff sidesteps that entirely — a transient cause heals on
+/// the first retry, and a genuine one costs a single decoder open per
+/// interval and settles at [`HW_REPROMOTE_BACKOFF_MAX`].
+///
+/// The MPEG-2 pin is deliberately excluded (it never sets `demoted_at`):
+/// it is codec-scoped, and on backends whose vendored decoder registers
+/// no MPEG-2 support at all, retrying could only fail.
+fn maybe_repromote_hw_decode(
+    slot: &mut Option<VideoDecoder>,
+    current: &mut Option<VideoCodec>,
+    state: &mut HwOpenState,
+    counters: &DisplayStatsCounters,
+    keyframe_gate: &mut KeyframeGate,
+    prime_cache_stale: &AtomicBool,
+    event_sender: &EventSender,
+    flow_id: &str,
+    output_id: &str,
+) -> bool {
+    // Only a backend-wide demote arms this, and only when the operator
+    // actually asked for a HW backend — a configured `cpu` output has
+    // nothing to be promoted to.
+    let Some(demoted_at) = state.demoted_at else {
+        return false;
+    };
+    if matches!(state.requested_backend, DecoderBackend::Cpu) {
+        return false;
+    }
+    let backoff = hw_repromote_backoff(state.hw_repromote_attempts);
+    if demoted_at.elapsed() < backoff {
+        return false;
+    }
+    // Suppress a retry while the decoder is still visibly failing. This
+    // is a damping term, not a correctness gate — see the constant: CPU
+    // decode stays silent on a corrupt stream, so this cannot detect that
+    // the input is still bad. The backoff is what actually bounds the
+    // re-probe rate under a persistent fault.
+    if state
+        .last_send_error_at
+        .is_some_and(|t| t.elapsed() < HW_REPROMOTE_CLEAN_PERIOD)
+    {
+        return false;
+    }
+
+    state.hw_repromote_attempts = state.hw_repromote_attempts.saturating_add(1);
+    let attempt = state.hw_repromote_attempts;
+    let backend = backend_name(state.requested_backend);
+    let cpu_seconds = demoted_at.elapsed().as_secs();
+
+    // Restore the pre-demote state wholesale. Leaving `fell_back_to_cpu`
+    // or `fallback_event_emitted` set would let the retry silently skip
+    // the machinery that makes a *second* failure observable.
+    state.backend = state.requested_backend;
+    state.fell_back_to_cpu = false;
+    state.fallback_event_emitted = false;
+    state.consecutive_send_errors = 0;
+    state.hw_reset_attempts = 0;
+    state.demote_requested = None;
+    state.demoted_at = None;
+
+    tracing::info!(
+        flow_id = %flow_id,
+        output_id = %output_id,
+        "display decoder re-promoting to {backend} after {cpu_seconds}s on CPU \
+         (attempt {attempt}) — the condition that forced the demote may have cleared"
+    );
+    event_sender.emit_flow_with_details(
+        EventSeverity::Info,
+        crate::manager::events::category::SYSTEM_RESOURCES,
+        format!(
+            "display output '{output_id}': retrying hardware decode on {backend} \
+             after {cpu_seconds}s on CPU (attempt {attempt})"
+        ),
+        flow_id,
+        serde_json::json!({
+            "error_code": "display_hw_decode_repromote",
+            "output_id": output_id,
+            "backend": backend,
+            "attempt": attempt,
+            "cpu_seconds": cpu_seconds,
+        }),
+    );
+
+    // Same teardown the reset path uses: drop the decoder so the next AU
+    // re-opens on hardware, and arm the gate so the fresh session starts
+    // on an IDR. Without arming, the mid-GOP AUs that follow would be
+    // rejected by a session with no reference frames and drive the error
+    // run straight back to a demote — burning the attempt for nothing.
+    *slot = None;
+    *current = None;
+    keyframe_gate.arm();
+    // Same fresh-pool invalidation the wedge reset needs — see #94.
+    prime_cache_stale.store(true, Ordering::Relaxed);
+    reset_decoder_open_window(state, counters);
+    true
+}
+
 fn force_cpu_fallback(
     slot: &mut Option<VideoDecoder>,
     current: &mut Option<VideoCodec>,
@@ -2398,6 +2613,9 @@ fn force_cpu_fallback(
 
     state.backend = DecoderBackend::Cpu;
     state.fell_back_to_cpu = true;
+    // Start the re-promotion clock. Without this the demote is terminal
+    // for the life of the flow — see `HW_REPROMOTE_BACKOFF_BASE`.
+    state.demoted_at = Some(Instant::now());
     *slot = None;
     *current = None;
     counters.set_active_decoder_label(DisplayDecoderLabel::CpuHwUnavailable);
@@ -2456,6 +2674,7 @@ fn handle_video_au(
     panel_hdr_capable: bool,
     force_cpu_blit_for_bars: &AtomicBool,
     prime_scanout_failed: &AtomicBool,
+    prime_cache_stale: &AtomicBool,
     #[cfg(feature = "rga-transfer")] rga_transfer_active: &AtomicBool,
     stream_ids: StreamIds,
     video_decode_counters: &VideoDecodeStats,
@@ -2620,6 +2839,25 @@ fn handle_video_au(
     // SPECULATIVE_DEMOTE_GRACE so an IDR-less intra-refresh source on
     // a HW backend still falls back to CPU (which can error-conceal)
     // rather than staying black forever.
+    // Section 0: a previous demote is not a life sentence. Before testing
+    // whether to demote, test whether we are owed a retry of the operator's
+    // hardware backend. Runs first because it clears the decoder slot — the
+    // checks below would otherwise evaluate against a decoder that is about
+    // to be torn down.
+    if maybe_repromote_hw_decode(
+        video_decoder,
+        current_video_codec,
+        hw_open_state,
+        counters,
+        keyframe_gate,
+        prime_cache_stale,
+        event_sender,
+        flow_id,
+        output_id,
+    ) {
+        return;
+    }
+
     let speculative_grace = keyframe_gate.speculative_feed()
         && keyframe_gate.armed_elapsed() < SPECULATIVE_DEMOTE_GRACE;
     if hw_open_state.consecutive_send_errors >= RUNTIME_FAIL_DEMOTE_THRESHOLD
@@ -2687,6 +2925,13 @@ fn handle_video_au(
             // which is what stops the no-frames watchdog demoting a decoder
             // that was only ever waiting for an anchor.
             keyframe_gate.arm();
+            // The re-opened pool allocates fresh DMA-BUF identities, so
+            // every `prime_fb_cache` entry keyed on the old ones is dead.
+            // Left to age out through the FIFO the next ~16 presents each
+            // pay a full re-import — sub-millisecond becomes double-digit
+            // ms against a 41.6 ms budget, a burst of missed vblanks that
+            // no counter in this path can see (#94).
+            prime_cache_stale.store(true, Ordering::Relaxed);
             reset_decoder_open_window(hw_open_state, counters);
             return;
         }
@@ -2892,6 +3137,10 @@ fn feed_video_decoder(
         Err(e) => {
             counters.send_packet_errors.fetch_add(1, Ordering::Relaxed);
             state.consecutive_send_errors = state.consecutive_send_errors.saturating_add(1);
+            // Evidence that the stream is still unhealthy. Recorded even
+            // while on CPU, where it gates hardware re-promotion — see
+            // `maybe_repromote_hw_decode`.
+            state.last_send_error_at = Some(Instant::now());
             // Throttle log lines to once per second so a hard-broken
             // backend doesn't flood the log before the demotion
             // threshold trips. Counter still increments per call.
@@ -3825,6 +4074,7 @@ fn display_loop(
     frame_gen: Arc<AtomicU64>,
     force_cpu_blit_signal: Arc<AtomicBool>,
     prime_scanout_failed: Arc<AtomicBool>,
+    prime_cache_stale: Arc<AtomicBool>,
     #[cfg(feature = "rga-transfer")] rga_transfer_active: Arc<AtomicBool>,
 ) {
     // Frame period derived from the observed PTS deltas — used to size
@@ -4531,6 +4781,18 @@ fn display_loop(
         // slot and the next iteration's pacing has already slipped a
         // frame.
         compose_stream_header(&mut header_buf, &next, frame_period_ms);
+        // The decode task tore a decoder down and re-opened it on the same
+        // backend (#91's wedge reset, or #97's hardware re-promotion). That
+        // retires the pool's DMA-BUF identities, so every `prime_fb_cache`
+        // entry keyed on the old `(st_dev, st_ino)` is stale. Drop the memo
+        // here, on the thread that owns `KmsDisplay`, before the import it
+        // would otherwise serve. Deliberately the narrow invalidation and
+        // not `release_prime_state`: a reset is not a demotion, and tearing
+        // `prime_state` down would re-arm the CRTC onto the dumb buffer,
+        // putting a visible flip into an otherwise invisible recovery (#94).
+        if prime_cache_stale.swap(false, Ordering::Relaxed) {
+            kms.invalidate_prime_fb_cache();
+        }
         let blit_start = Instant::now();
         let blit_ok = match blit_and_present(
             &mut kms,
@@ -5331,6 +5593,55 @@ mod tests {
     /// because it was measured end-to-end on bilby-z440 once
     /// `mpeg2_cuvid` was compiled into the vendored FFmpeg — its
     /// original "failure" was that build gap, not the silicon.
+
+    // ── HW re-promotion backoff (issue #97) ───────────────────────────
+    //
+    // A CPU demote used to be terminal for the life of the flow. These
+    // pin the shape of the retry schedule that makes it recoverable.
+
+    #[test]
+    fn repromote_backoff_starts_at_base_and_doubles() {
+        assert_eq!(hw_repromote_backoff(0), HW_REPROMOTE_BACKOFF_BASE);
+        assert_eq!(hw_repromote_backoff(1), HW_REPROMOTE_BACKOFF_BASE * 2);
+        assert_eq!(hw_repromote_backoff(2), HW_REPROMOTE_BACKOFF_BASE * 4);
+        assert_eq!(hw_repromote_backoff(3), HW_REPROMOTE_BACKOFF_BASE * 8);
+    }
+
+    #[test]
+    fn repromote_backoff_saturates_at_max() {
+        // The doubling must stop, or a long-lived flow's retry interval
+        // overflows into "never" and the demote is terminal again by
+        // another route.
+        assert_eq!(hw_repromote_backoff(10), HW_REPROMOTE_BACKOFF_MAX);
+        assert_eq!(hw_repromote_backoff(100), HW_REPROMOTE_BACKOFF_MAX);
+        assert_eq!(hw_repromote_backoff(u32::MAX), HW_REPROMOTE_BACKOFF_MAX);
+    }
+
+    #[test]
+    fn repromote_backoff_is_monotonic_and_never_zero() {
+        // Zero would spin the decoder open path every AU; a decrease
+        // would let a persistently-failing backend retry faster the
+        // longer it keeps failing.
+        let mut prev = Duration::ZERO;
+        for a in 0..40u32 {
+            let d = hw_repromote_backoff(a);
+            assert!(d >= prev, "backoff decreased at attempt {a}");
+            assert!(d >= HW_REPROMOTE_BACKOFF_BASE, "below base at {a}");
+            assert!(d <= HW_REPROMOTE_BACKOFF_MAX, "above max at {a}");
+            prev = d;
+        }
+    }
+
+    #[test]
+    fn repromote_first_retry_is_prompt_enough_to_matter() {
+        // The measured failure was a ~4 min input stall leaving the flow
+        // on CPU for 50 min. The first retry must land far inside that
+        // window, or the fix does not address the reported symptom.
+        assert!(
+            hw_repromote_backoff(0) <= Duration::from_secs(60),
+            "first retry too slow to recover from a transient input gap"
+        );
+    }
     #[test]
     fn mpeg2_pinned_to_cpu_on_every_backend_except_nvdec() {
         for backend in [
