@@ -1103,6 +1103,7 @@ fn demux_decode_loop(
         demote_requested: None,
         hdr_on_sdr_event_emitted: false,
         consecutive_send_errors: 0,
+        hw_reset_attempts: 0,
         last_send_error_log_at: None,
         first_send_after_open: None,
         mpeg2_cpu_pinned: false,
@@ -1723,6 +1724,23 @@ struct HwOpenState {
     /// every send_packet returns EINVAL on Arrow Lake / fresh iHD"
     /// pattern that today's silent `let _ = ...` swallowing hides.
     consecutive_send_errors: u32,
+    /// Decoder reset+reopen attempts made on the **current** HW backend
+    /// before conceding a backend-wide demote.
+    ///
+    /// A sustained `send_packet` error run is not proof the backend is
+    /// unusable — a wedged MPP session produces exactly the same signature
+    /// as a genuinely broken driver, and a wedged session is recoverable by
+    /// tearing the decoder down and re-opening it on the next keyframe.
+    /// Demoting instead is **permanent for the life of the flow**, so the
+    /// old behaviour turned a transient stall into a total, irreversible
+    /// loss of HW decode (measured on rk3588: 1.4 ms/frame on hardware vs
+    /// 20.9 ms on the CPU fallback, and the CPU blit then could not hold
+    /// vblank, ending in a black panel).
+    ///
+    /// Reset to 0 by `drain_video_frames` on the first frame after a
+    /// failure run, so only a backend that cannot be recovered
+    /// `MAX_HW_RESET_ATTEMPTS` times in a row is actually demoted.
+    hw_reset_attempts: u32,
     /// Last wall-clock at which `feed_video_decoder` emitted a
     /// `tracing::warn!` for a send_packet error. One-per-second
     /// throttle so a hard-broken HW backend doesn't flood the log
@@ -1769,6 +1787,24 @@ struct HwOpenState {
 /// non-keyframe-anchored AUs) are exempt — see
 /// [`KeyframeGate::opened_by_timeout`] and [`SPECULATIVE_DEMOTE_GRACE`].
 const RUNTIME_FAIL_DEMOTE_THRESHOLD: u32 = 30;
+
+/// Decoder reset+reopen attempts on the current HW backend before a
+/// sustained `send_packet` error run is allowed to demote it.
+///
+/// A wedged hardware decode session is indistinguishable from a broken
+/// backend at the `send_packet` boundary — both return the same errors
+/// forever. The difference is that a wedged session recovers from a
+/// teardown + re-open on the next keyframe, whereas the demote is
+/// **backend-wide and permanent for the life of the flow**.
+///
+/// Hardware-diagnosed on bilby-pi (rk3568) and bilby-pir6s (rk3588): a
+/// media-player TS input whose pacer overshot the source rate overran the
+/// RKMPP task queue (kernel: `mpp_rkvdec2 ... force_dequeue 1`), producing
+/// a `send_packet` error run that demoted a *healthy* decoder to CPU. CPU
+/// decode then cost ~15x more per frame (20.9 ms vs 1.4 ms), missed vblank,
+/// filled the page-flip queue and blacked the panel. Two resets recover the
+/// session; the demote never does.
+const MAX_HW_RESET_ATTEMPTS: u32 = 2;
 
 /// Watchdog deadline for "decoder accepted packets but never produced
 /// a frame". Picked so that legitimate first-frame latency on QSV /
@@ -2590,6 +2626,32 @@ fn handle_video_au(
         && hw_decode_active(hw_open_state, *current_video_codec)
         && !speculative_grace
     {
+        // A sustained error run is not proof the backend is broken. A
+        // wedged HW session (RKMPP task starvation, VAAPI surface-pool
+        // stall) produces exactly this signature and recovers from a
+        // teardown + re-open on the next keyframe; the demote below does
+        // not, because it is backend-wide and permanent for the life of
+        // the flow. Try the cheap, reversible thing first.
+        if hw_open_state.hw_reset_attempts < MAX_HW_RESET_ATTEMPTS {
+            hw_open_state.hw_reset_attempts += 1;
+            let attempt = hw_open_state.hw_reset_attempts;
+            let errs = hw_open_state.consecutive_send_errors;
+            let backend = backend_name(hw_open_state.backend);
+            tracing::warn!(
+                flow_id = %flow_id,
+                output_id = %output_id,
+                "display decoder reset {attempt}/{MAX_HW_RESET_ATTEMPTS} after \
+                 {errs} consecutive send_packet errors — re-opening on {backend} \
+                 before considering a CPU demote"
+            );
+            // Drop the decoder; `open_video_decoder_with_retry` re-opens it
+            // on the *same* backend for the next AU, and the keyframe gate
+            // holds it until an IDR so the fresh session starts anchored.
+            *video_decoder = None;
+            *current_video_codec = None;
+            reset_decoder_open_window(hw_open_state, counters);
+            return;
+        }
         force_cpu_fallback(
             video_decoder,
             current_video_codec,
@@ -2967,6 +3029,11 @@ fn drain_video_frames(
         // on *sustained* failure, not the legit packet errors a
         // broadcast stream produces.
         state.consecutive_send_errors = 0;
+        // A frame also proves any reset we performed actually worked, so
+        // the reset budget refills. Without this a flow that hits one
+        // recoverable stall per hour would exhaust the budget over a long
+        // run and demote on a backend that recovered every single time.
+        state.hw_reset_attempts = 0;
         // Bump the watchdog counter (must happen before the decode
         // continues — the watchdog reads it on every AU iteration).
         counters
