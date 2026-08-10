@@ -490,8 +490,22 @@ pub async fn connect_srt_output(
     config: &SrtOutputConfig,
     cancel: &CancellationToken,
 ) -> Result<Arc<SrtSocket>> {
+    connect_srt_output_observed(config, cancel, &mut |_, _| {}).await
+}
+
+/// Like [`connect_srt_output`], with the per-attempt failure observer.
+///
+/// `connect_srt_with_retry` retries **forever** (30 s cap) and only logs, so
+/// without an observer a caller-mode output that cannot reach its peer is
+/// completely silent after its first event — for the whole outage. Mirrors
+/// [`connect_srt_redundancy_leg_observed`], which is the existing precedent.
+pub async fn connect_srt_output_observed(
+    config: &SrtOutputConfig,
+    cancel: &CancellationToken,
+    on_attempt_failed: &mut (dyn FnMut(u32, &anyhow::Error) + Send),
+) -> Result<Arc<SrtSocket>> {
     let p = SrtConnectionParams::from(config);
-    connect_srt_with_retry(&p, cancel).await
+    connect_srt_with_retry_observed(&p, cancel, on_attempt_failed).await
 }
 
 /// Convenience wrapper: connect the SMPTE 2022-7 redundancy leg (leg 2)

@@ -237,6 +237,7 @@ debounced so a churning source doesn't flood the feed.
 | warning | SRT output '{id}' disconnected | Peer disconnected or connection lost. `output_id` set on event | `{ mode, local_addr/remote_addr }` |
 | warning | SRT output '{id}' stale connection detected | No ACK received after timeout, re-accepting. `output_id` set on event | |
 | critical | SRT output '{id}' connection failed: {error} | Caller can't reach remote, or bind fails. `output_id` set on event | `{ mode, remote_addr, stream_id, error }` |
+| critical | SRT output '{id}' cannot reach its peer — {n} consecutive connection attempts failed, still retrying | Caller-mode output, `error_code: srt_output_peer_unreachable`. Fires once as the count crosses `CONNECT_FAILED_THRESHOLD` (5), then every 20th attempt (~10 min at the retry loop's 30 s cap). The output's stats `state` also flips to `connect_failed` (manager renders it red as "CONNECT FAILED"), re-arming on a successful connect — the output twin of the SRT-input row above. **Why:** the connect retry runs forever and was silent, so a peer that rebooted left the feed permanently dead reporting `idle`, which the manager also uses for a stopped flow (issue #100) | `{ error_code, output_id, remote_addr, attempts, error }` |
 
 **Source**: `src/engine/input_srt.rs`, `src/engine/output_srt.rs`
 

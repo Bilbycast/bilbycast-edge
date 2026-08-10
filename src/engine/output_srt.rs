@@ -8,6 +8,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use srt_protocol::error::SrtError;
 use srt_transport::SrtSocket;
+use srt_transport::SocketStatus;
 use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
@@ -18,7 +19,7 @@ use crate::manager::events::{EventSender, EventSeverity, category};
 use crate::srt::connection::{
     accept_srt_connection, bind_srt_listener_for_bonded_output, bind_srt_listener_for_output,
     bind_srt_listener_for_redundancy, connect_srt_group, connect_srt_output,
-    connect_srt_redundancy_leg, spawn_srt_group_stats_poller,
+    connect_srt_output_observed, connect_srt_redundancy_leg, spawn_srt_group_stats_poller,
     spawn_srt_socket_group_stats_poller, spawn_srt_stats_poller, SrtConnectionParams,
 };
 use crate::stats::collector::OutputStatsAccumulator;
@@ -187,6 +188,34 @@ impl SrtSendSink {
         }
     }
 
+    /// `true` when the peer is gone and this sink will never carry data again.
+    ///
+    /// **Independent of the send path on purpose.** Until #100 the forward
+    /// loop's only liveness signal was `try_send` returning `Closed`, which
+    /// requires the `srt-io` send task to have errored first — so the whole
+    /// output was staked on the contract "`send()` eventually errors when the
+    /// peer is gone". It does now, but a single missed state transition in the
+    /// backend was enough to park an output at `idle` indefinitely while its
+    /// peer's listener sat waiting, recoverable only by recreating the output.
+    /// A cheap poll of the socket's own status costs nothing per packet and
+    /// does not depend on that contract holding.
+    ///
+    /// Groups are exempt: a member breaking is ordinary bonding failover, and
+    /// the group survives it. Only libsrt's own group status could answer this
+    /// and it means something different, so the bonded path keeps relying on
+    /// the send error.
+    fn peer_is_gone(&self) -> bool {
+        match self {
+            SrtSendSink::Socket(s) => matches!(
+                s.status(),
+                SocketStatus::Broken
+                    | SocketStatus::Closing
+                    | SocketStatus::Closed
+                    | SocketStatus::NonExist
+            ),
+            SrtSendSink::Group(_) => false,
+        }
+    }
 }
 
 /// Resolve `interface_binding` → `local_addr` for the primary leg, the
@@ -531,7 +560,43 @@ async fn srt_output_caller_loop(
         cancel.clone(),
     );
     loop {
-        let socket = match connect_srt_output(config, &cancel).await {
+        // Feed the retry loop's per-attempt failures into the output's
+        // `connect_failures` counter and a throttled event. `connect_srt_*`
+        // retries forever, so without this a caller whose peer is gone goes
+        // silent after its first event and reports `idle` — the same state the
+        // manager shows for a stopped flow (#100).
+        let attempt_stats = Arc::clone(&stats);
+        let attempt_events = events.clone();
+        let attempt_output_id = config.id.clone();
+        let attempt_remote = config.remote_addr.clone().unwrap_or_default();
+        let mut on_attempt_failed = move |attempt: u32, err: &anyhow::Error| {
+            attempt_stats
+                .connect_failures
+                .store(attempt, std::sync::atomic::Ordering::Relaxed);
+            // One event as the state flips to `connect_failed`, then every
+            // 20th attempt (~10 min at the 30 s cap) so a long outage leaves
+            // a trail without flooding the events feed.
+            let threshold = crate::srt::connection::CONNECT_FAILED_THRESHOLD;
+            if attempt == threshold || (attempt > threshold && attempt % 20 == 0) {
+                attempt_events.emit_output_with_details(
+                    EventSeverity::Critical,
+                    category::SRT,
+                    format!(
+                        "SRT output '{attempt_output_id}' cannot reach its peer —                          {attempt} consecutive connection attempts failed, still retrying"
+                    ),
+                    &attempt_output_id,
+                    serde_json::json!({
+                        "error_code": "srt_output_peer_unreachable",
+                        "output_id": attempt_output_id,
+                        "remote_addr": attempt_remote,
+                        "attempts": attempt,
+                        "error": err.to_string(),
+                    }),
+                );
+            }
+        };
+        let socket = match connect_srt_output_observed(config, &cancel, &mut on_attempt_failed).await
+        {
             Ok(s) => s,
             Err(e) => {
                 if cancel.is_cancelled() {
@@ -556,6 +621,9 @@ async fn srt_output_caller_loop(
             }
         };
 
+        stats
+            .connect_failures
+            .store(0, std::sync::atomic::Ordering::Relaxed);
         tracing::info!(
             "SRT output '{}' connected: mode={:?} local={}",
             config.id,
@@ -1198,6 +1266,21 @@ async fn srt_output_forward_loop(
             }
         }
         if got_connection_lost {
+            break true;
+        }
+        // Second, independent liveness check. The `Closed` arm above only
+        // fires once the `srt-io` send task has itself errored; if the send
+        // path ever stops surfacing a dead peer, this notices anyway. It is a
+        // status read on a watch channel, so it costs nothing to do per batch.
+        if sink.peer_is_gone() {
+            tracing::warn!(
+                "SRT output '{}' peer gone (socket status {:?}), will reconnect",
+                config.id,
+                match &sink {
+                    SrtSendSink::Socket(s) => Some(s.status()),
+                    SrtSendSink::Group(_) => None,
+                }
+            );
             break true;
         }
     };

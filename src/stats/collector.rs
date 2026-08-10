@@ -30,6 +30,19 @@ pub struct OutputStatsAccumulator {
     pub bytes_sent: AtomicU64,
     pub packets_dropped: AtomicU64,
     pub fec_packets_sent: AtomicU64,
+    /// Consecutive failed connection attempts on a caller-mode output.
+    /// Reset to 0 on every successful connect.
+    ///
+    /// The output twin of [`PerInputCounters::connect_failures`]. Without it
+    /// an output whose peer is gone reports `idle` — the *same* state the
+    /// manager substitutes for an output whose flow is simply stopped, which
+    /// it renders as "STOPPED". So a dead feed and a deliberately stopped one
+    /// were indistinguishable in the UI (issue #100). Crossing
+    /// [`crate::srt::connection::CONNECT_FAILED_THRESHOLD`] promotes the state
+    /// to `connect_failed`, which the manager already renders red as
+    /// "CONNECT FAILED" — the vocabulary exists, the output side just never
+    /// spoke it.
+    pub connect_failures: AtomicU32,
     throughput: ThroughputEstimator,
     /// Cached SRT stats for primary leg, updated by the SRT output polling task
     /// via a lock-free watch channel. Read via `borrow()`, write via `send()`.
@@ -899,6 +912,7 @@ impl OutputStatsAccumulator {
             bytes_sent: AtomicU64::new(0),
             packets_dropped: AtomicU64::new(0),
             fec_packets_sent: AtomicU64::new(0),
+            connect_failures: AtomicU32::new(0),
             throughput: ThroughputEstimator::new(),
             srt_stats_cache: Arc::new(watch::channel(None).0),
             srt_leg2_stats_cache: Arc::new(watch::channel(None).0),
@@ -1566,6 +1580,8 @@ impl OutputStatsAccumulator {
                 packets_dropped,
                 display_frames_displayed,
                 display_frames_advancing,
+                self.connect_failures.load(Ordering::Relaxed)
+                    >= crate::srt::connection::CONNECT_FAILED_THRESHOLD,
             ),
             mode: None,
             remote_addr: None,
@@ -5181,9 +5197,15 @@ fn derive_output_state(
     packets_dropped: u64,
     display_frames_displayed: u64,
     display_frames_advancing: bool,
+    connect_failed: bool,
 ) -> String {
     if bitrate_bps > 0 || display_frames_advancing {
         "active"
+    } else if connect_failed {
+        // Ahead of `idle` deliberately: an output that is retrying a peer
+        // that will not answer is a fault, and `idle` is the string the
+        // manager also uses for "this flow is stopped".
+        "connect_failed"
     } else if packets_sent > 0 || display_frames_displayed > 0 {
         "idle"
     } else if packets_dropped > 0 {
@@ -5600,23 +5622,43 @@ mod input_state_tests {
     fn derive_output_state_wire_outputs_unchanged() {
         // Network outputs pass (0, false) for the display pair — the
         // pre-existing derivation must be bit-identical.
-        assert_eq!(derive_output_state(1_000, 10, 0, 0, false), "active");
-        assert_eq!(derive_output_state(0, 10, 0, 0, false), "idle");
-        assert_eq!(derive_output_state(0, 0, 5, 0, false), "dropping");
-        assert_eq!(derive_output_state(0, 0, 0, 0, false), "waiting");
+        assert_eq!(derive_output_state(1_000, 10, 0, 0, false, false), "active");
+        assert_eq!(derive_output_state(0, 10, 0, 0, false, false), "idle");
+        assert_eq!(derive_output_state(0, 0, 5, 0, false, false), "dropping");
+        assert_eq!(derive_output_state(0, 0, 0, 0, false, false), "waiting");
     }
 
     #[test]
     fn derive_output_state_display_freezes_to_idle() {
         // Frames still advancing → active, exactly as before.
-        assert_eq!(derive_output_state(0, 0, 0, 100, true), "active");
+        assert_eq!(derive_output_state(0, 0, 0, 100, true, false), "active");
         // Frozen mid-run (lifetime counter > 0, no advance within the
         // stall window) → idle, NOT the latched-active the cumulative
         // counter used to produce.
-        assert_eq!(derive_output_state(0, 0, 0, 100, false), "idle");
+        assert_eq!(derive_output_state(0, 0, 0, 100, false, false), "idle");
         // Never displayed a frame → waiting (registration alone isn't
         // activity).
-        assert_eq!(derive_output_state(0, 0, 0, 0, false), "waiting");
+        assert_eq!(derive_output_state(0, 0, 0, 0, false, false), "waiting");
+    }
+
+    /// #100: a caller whose peer is gone must not report the same string the
+    /// manager uses for a stopped flow. `connect_failed` outranks `idle`
+    /// because a lifetime `packets_sent > 0` would otherwise mask it forever
+    /// — the output HAS sent, just not since the peer vanished.
+    #[test]
+    fn derive_output_state_reports_connect_failed_over_idle() {
+        assert_eq!(
+            derive_output_state(0, 10, 0, 0, false, true),
+            "connect_failed"
+        );
+        assert_eq!(
+            derive_output_state(0, 0, 0, 0, false, true),
+            "connect_failed"
+        );
+        // A live output is never masked by a stale failure count.
+        assert_eq!(derive_output_state(1_000, 10, 0, 0, false, true), "active");
+        // Ordinary paths unchanged.
+        assert_eq!(derive_output_state(0, 10, 0, 0, false, false), "idle");
     }
 }
 
