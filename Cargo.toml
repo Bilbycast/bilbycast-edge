@@ -179,26 +179,25 @@ rtnetlink = "0.21"
 netlink-packet-route = "0.30"
 
 # ── SRT backend ──────────────────────────────────────────────────────────
-# Uncomment ONE pair below. Both expose identical public APIs (SrtSocket,
-# SrtListener, SrtStats, etc.). No other code changes needed to switch.
+# Haivision libsrt wrapper. Native SRT bonding, guaranteed FEC/encryption
+# interop with all SRT devices. Build needs CMake, OpenSSL headers, clang.
 #
-#   libsrt (default) — Haivision C library wrapper. Native SRT bonding,
-#                       guaranteed FEC/encryption interop with all SRT devices.
-#                       Requires: CMake, OpenSSL headers, clang (for build).
+# This block used to say the sibling pure-Rust `bilbycast-srt` could be
+# swapped in by commenting one pair and uncommenting another, with "no other
+# code changes needed". **That is not true and has not been for some time.**
+# When native SRT bonding landed, the edge began referencing socket-group
+# types unconditionally — `SrtGroup`, `SrtGroupBuilder`, `GroupMode`,
+# `GroupMemberStats`, `MemberStatus` — and only the libsrt wrapper provides
+# them. A swap fails with 9 compile errors, all of that shape (issue #102).
 #
-#   pure-rust        — bilbycast-srt. Zero C dependencies. FEC interop with
-#                       non-Rust SRT peers is broken (encryption ordering).
-#
-# To switch: comment out the active pair, uncomment the other, cargo build.
+# Nothing builds the alternative, so the claim rotted silently. It is removed
+# rather than repaired: libsrt is the backend. `bilbycast-srt` still exists as
+# a wire-compatible pure-Rust implementation and is maintained on its own
+# terms, but it is not currently a drop-in for this crate. Restoring that
+# would mean feature-gating the whole bonding surface here.
 # ─────────────────────────────────────────────────────────────────────────
-
-# Active: Haivision libsrt wrapper (default)
 srt-transport = { path = "../bilbycast-libsrt-rs/srt-transport" }
 srt-protocol = { path = "../bilbycast-libsrt-rs/srt-protocol" }
-
-# Alternative: Pure Rust (uncomment these, comment out the pair above)
-# srt-transport = { path = "../bilbycast-srt/srt-transport" }
-# srt-protocol = { path = "../bilbycast-srt/srt-protocol" }
 
 # ── RIST backend ─────────────────────────────────────────────────────────
 # Pure-Rust RIST Simple Profile (TR-06-1:2020). Zero C dependencies.

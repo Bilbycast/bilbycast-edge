@@ -32,7 +32,7 @@ Example configs in `config_examples/`. Interop testing uses `test-edge1.json` th
 
 See the root `CLAUDE.md` for the full backend comparison and switching instructions. Edge-specific notes:
 
-- **SRT**: two swappable sibling crate sets expose identical `srt-transport` + `srt-protocol` APIs (`../bilbycast-srt/` pure Rust, or `../bilbycast-libsrt-rs/` wrapper). Switch via the `── SRT backend ──` block in `Cargo.toml`.
+- **SRT**: `../bilbycast-libsrt-rs/` (Haivision libsrt wrapper) is **the** backend. The sibling pure-Rust `../bilbycast-srt/` mirrors its API deliberately but is **not** currently swappable into this crate — the edge uses socket-group/bonding types only the wrapper provides, so a swap fails to compile (issue #102). The `── SRT backend ──` block in `Cargo.toml` no longer offers a choice.
 - **RIST**: always compiled in, no feature flag, zero C deps. `rist-transport::RistSocket::receiver` / `::sender` is consumed directly by `engine::input_rist` / `engine::output_rist`. Wire-verified against librist 0.2.11.
 
 ## Feature Flags
