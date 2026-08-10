@@ -1031,6 +1031,51 @@ impl FlowManager {
         Ok(())
     }
 
+    /// Move a flow's active-input pointer **without** signalling the PID-bus
+    /// assembler.
+    ///
+    /// [`Self::switch_active_input`] is the operator's Take: it moves the
+    /// pointer *and* pushes `PlanCommand::SwitchActiveInput`, which walks every
+    /// Switch slot whose leg list carries the new id, flips that slot's
+    /// active-leg pointer, bumps the owning program's PMT version and arms DI=1
+    /// on the next PCR — a real splice, on air.
+    ///
+    /// The config-diff reconciler needs only the pointer. It calls this when
+    /// the input a config change is deleting happens to be the one on air:
+    /// `FlowRuntime::remove_input` refuses that removal by reading
+    /// `active_input_tx` alone, so handing the slot to a surviving member is
+    /// the whole of what unblocks it. Firing a splice as well would cut an
+    /// assembled flow's program over to a different leg when nothing in the
+    /// operator's edit asked for one — and on that path the `active` flag is
+    /// not even read, which is why `hold_active_inputs` exempts assembled
+    /// flows outright.
+    pub async fn reassign_active_input(&self, flow_id: &str, new_input_id: &str) -> Result<()> {
+        let runtime = self
+            .flows
+            .get(flow_id)
+            .ok_or_else(|| anyhow::anyhow!("Flow '{}' is not running", flow_id))?;
+        let previous_input_id = runtime.active_input_tx.borrow().clone();
+        runtime.switch_active_input(new_input_id).await?;
+        // Still an Info event: what is on air genuinely changed, and an
+        // operator watching the flow needs to see that as plainly as a Take.
+        self.event_sender.send(Event {
+            severity: EventSeverity::Info,
+            category: category::FLOW.to_string(),
+            message: format!(
+                "Flow '{flow_id}': active input moved to '{new_input_id}' — \
+                 '{previous_input_id}' was on air and is being removed by a config change"
+            ),
+            details: Some(serde_json::json!({
+                "previous_input_id": previous_input_id,
+                "reason": "config_diff_removed_active_input",
+            })),
+            flow_id: Some(flow_id.to_string()),
+            input_id: Some(new_input_id.to_string()),
+            output_id: None,
+        });
+        Ok(())
+    }
+
     /// Toggle an output active or passive on a running flow.
     ///
     /// Setting an output active spawns a fresh output task if one is not

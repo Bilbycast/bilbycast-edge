@@ -2145,11 +2145,17 @@ async fn execute_command(
                                 "Update flow '{flow_id}': restarting — inputs [{}] could not be reconciled in place",
                                 unreconciled.join(", ")
                             );
-                            let _ = flow_manager.destroy_flow(flow_id).await;
+                            // Resolve BEFORE destroying. This restart is a
+                            // recovery action on a flow nobody asked to
+                            // restart, so a rebuild that cannot even be
+                            // resolved must leave the flow alone rather than
+                            // take it off air to discover that.
                             let resolved = {
                                 let cfg = app_config.read().await;
                                 cfg.resolve_flow(&new_flow).map_err(|e| e.to_string())?
                             };
+                            let _ = flow_manager.destroy_flow(flow_id).await;
+                            let spawn_started_at = std::time::Instant::now();
                             let _runtime = flow_manager
                                 .create_flow(resolved)
                                 .await
@@ -2158,6 +2164,20 @@ async fn execute_command(
                             register_whip_if_needed(_webrtc_sessions, &_runtime);
                             #[cfg(feature = "webrtc")]
                             register_whep_if_needed(_webrtc_sessions, &_runtime);
+                            // Same bind-failure gate the `force_restart` arm
+                            // above runs, for the same reason: without it a
+                            // flow that came back up unable to bind reports
+                            // success and only says otherwise in the journal.
+                            if let Some(err) = wait_for_first_bind_failure(
+                                flow_manager.event_sender(),
+                                flow_id,
+                                spawn_started_at,
+                            )
+                            .await
+                            {
+                                let _ = flow_manager.destroy_flow(flow_id).await;
+                                return Err(err);
+                            }
                         }
                     } else {
                         // Only outputs changed — diff surgically against the runtime.
@@ -3279,9 +3299,15 @@ async fn execute_command(
                                         "Config diff: flow '{id}' restarting — inputs [{}] could not be reconciled in place",
                                         unreconciled.join(", ")
                                     );
-                                    let _ = flow_manager.destroy_flow(id).await;
+                                    // Resolve BEFORE destroying. A config push
+                                    // touches every flow and cannot abort on
+                                    // one of them, so a rebuild that was never
+                                    // going to resolve has to leave the flow
+                                    // running rather than take it off air on
+                                    // the way to finding that out.
                                     match new_config.resolve_flow(new_flow) {
                                         Ok(resolved) => {
+                                            let _ = flow_manager.destroy_flow(id).await;
                                             match flow_manager.create_flow(resolved).await {
                                                 Ok(_runtime) => {
                                                     #[cfg(feature = "webrtc")]
@@ -3295,14 +3321,41 @@ async fn execute_command(
                                                         &_runtime,
                                                     );
                                                 }
-                                                Err(e) => tracing::error!(
-                                                    "Config diff: flow '{id}' failed to restart after unreconciled inputs: {e}"
-                                                ),
+                                                // This push still persists and
+                                                // still acks success, so a line
+                                                // in the journal is not enough:
+                                                // the flow is off air and only
+                                                // an event says so.
+                                                Err(e) => {
+                                                    tracing::error!(
+                                                        "Config diff: flow '{id}' failed to restart after unreconciled inputs: {e}"
+                                                    );
+                                                    flow_manager.event_sender().emit_flow(
+                                                        EventSeverity::Critical,
+                                                        category::FLOW,
+                                                        format!(
+                                                            "Flow '{id}' was stopped to apply a configuration change and could not be \
+                                                             restarted: {e}"
+                                                        ),
+                                                        id,
+                                                    );
+                                                }
                                             }
                                         }
-                                        Err(e) => tracing::error!(
-                                            "Config diff: flow '{id}' could not be resolved for restart: {e}"
-                                        ),
+                                        Err(e) => {
+                                            tracing::error!(
+                                                "Config diff: flow '{id}' could not be resolved for restart: {e} — left running on its previous inputs"
+                                            );
+                                            flow_manager.event_sender().emit_flow(
+                                                EventSeverity::Critical,
+                                                category::FLOW,
+                                                format!(
+                                                    "Flow '{id}' is still carrying inputs the pushed configuration removed, and that \
+                                                     configuration could not be resolved to restart it: {e}"
+                                                ),
+                                                id,
+                                            );
+                                        }
                                     }
                                 }
                             } else {
@@ -6070,6 +6123,117 @@ mod input_definition_diff_tests {
     }
 }
 
+/// Order the members the new config keeps by how well each qualifies to take
+/// the on-air slot from an input that is being removed, best first.
+///
+/// The config's own `active` flag leads, because it is authoritative in exactly
+/// this branch. [`hold_active_inputs`] pins a flow's activation back to the
+/// incumbent only while the incumbent is still a member, and deliberately lets
+/// the pushed value stand for a flow that has none — which is precisely the
+/// flow whose on-air input this roster drops. Choosing by position instead
+/// would put a different source to air than the configuration being applied
+/// asks for, and [`input_set_changed`] records that roster order carries no
+/// runtime meaning at all, so position is not a tie-break anyone chose.
+///
+/// Ties keep roster order, and the list is complete rather than a single pick:
+/// a candidate can fail to activate (its own addition failed earlier in the
+/// same reconcile), and the next one should still get a turn.
+fn surviving_active_candidates<'a>(
+    new_input_ids: &'a [String],
+    input_defs: &[InputDefinition],
+    removing: &str,
+) -> Vec<&'a str> {
+    let mut candidates: Vec<&str> = new_input_ids
+        .iter()
+        .map(|s| s.as_str())
+        .filter(|c| *c != removing)
+        .collect();
+    // Stable, so equally-qualified candidates stay in roster order.
+    candidates.sort_by_key(|c| !input_defs.iter().any(|d| d.id == *c && d.active));
+    candidates
+}
+
+#[cfg(test)]
+mod surviving_active_candidates_tests {
+    //! The survivor choice is the one part of the removal retry that is pure,
+    //! and it is the part that decides what goes to air — so it is pinned here
+    //! rather than left to the live-`FlowManager` harness the rest of the
+    //! reconcile still needs.
+    use super::{surviving_active_candidates, InputDefinition};
+
+    fn defs(inputs: &[(&str, bool)]) -> Vec<InputDefinition> {
+        inputs
+            .iter()
+            .map(|(id, active)| {
+                serde_json::from_value(serde_json::json!({
+                    "id": id, "name": id, "active": active,
+                    "type": "udp", "bind_addr": "0.0.0.0:5000"
+                }))
+                .expect("fixture")
+            })
+            .collect()
+    }
+
+    fn roster(ids: &[&str]) -> Vec<String> {
+        ids.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// The failure this ordering exists to prevent: a restore names one input
+    /// as the one to be on air while the roster happens to list another first.
+    /// Choosing by position puts the wrong source to air, silently.
+    #[test]
+    fn the_configs_active_flag_outranks_roster_position() {
+        let members = roster(&["cam-b", "cam-c"]);
+        let cfg = defs(&[("cam-a", false), ("cam-b", false), ("cam-c", true)]);
+        assert_eq!(
+            surviving_active_candidates(&members, &cfg, "cam-a"),
+            vec!["cam-c", "cam-b"],
+        );
+    }
+
+    /// Nothing flagged — roster order is all that is left, and it must survive
+    /// the sort rather than be shuffled by it.
+    #[test]
+    fn with_nothing_flagged_active_roster_order_stands() {
+        let members = roster(&["a", "b", "c"]);
+        let cfg = defs(&[("a", false), ("b", false), ("c", false)]);
+        assert_eq!(
+            surviving_active_candidates(&members, &cfg, "gone"),
+            vec!["a", "b", "c"],
+        );
+    }
+
+    /// An input on its way out is never a candidate to replace itself, however
+    /// it is flagged — that would hand the slot straight back and refuse again.
+    #[test]
+    fn the_departing_input_is_excluded_even_when_flagged_active() {
+        let members = roster(&["a", "b"]);
+        let cfg = defs(&[("a", true), ("b", false)]);
+        assert_eq!(surviving_active_candidates(&members, &cfg, "a"), vec!["b"]);
+    }
+
+    /// A roster that keeps nobody offers no survivor, so the caller escalates
+    /// to a restart instead of activating something that is not there.
+    #[test]
+    fn emptying_a_flow_offers_no_survivor() {
+        let cfg = defs(&[("a", true)]);
+        assert!(surviving_active_candidates(&[], &cfg, "a").is_empty());
+    }
+
+    /// Every survivor is offered, not just the best one: the front-runner can
+    /// fail to activate because its own addition failed earlier in the same
+    /// reconcile, and the next one still has to get a turn.
+    #[test]
+    fn every_survivor_is_offered_not_just_the_front_runner() {
+        let members = roster(&["a", "b", "c"]);
+        let cfg = defs(&[("a", false), ("b", true), ("c", false)]);
+        assert_eq!(
+            surviving_active_candidates(&members, &cfg, "gone"),
+            vec!["b", "a", "c"],
+        );
+    }
+}
+
 /// Reconcile a running flow's input roster against the new config, and report
 /// the ids that could not be reconciled.
 ///
@@ -6082,10 +6246,19 @@ mod input_definition_diff_tests {
 /// deployment record and the manager UI all showed the replacement. Adding
 /// first means a replacement always has a survivor to hand the slot to.
 ///
-/// Returns the ids still running that the new config does not contain. A
-/// non-empty result means **the runtime no longer matches its configuration**
-/// and the caller should escalate to a flow restart rather than persist a
-/// config the engine did not adopt.
+/// Returns the ids still running that the new config does not contain, and
+/// stops at the first one — the same contract, and the same reason, as
+/// [`replace_edited_inputs`]. A non-empty result means **the runtime no longer
+/// matches its configuration** and the caller should escalate to a flow restart
+/// rather than persist a config the engine did not adopt.
+///
+/// An *addition* that fails is reported as an operator-visible event and left
+/// out of the return value, again matching [`replace_edited_inputs`]: a restart
+/// would hit the identical failure having interrupted the on-air input to get
+/// there. The one case where that costs something is a swap onto an address the
+/// outgoing input still holds — additions run first, so the incoming listener
+/// meets a bound port — which is why the event says so rather than the flow
+/// quietly running one input short.
 async fn diff_inputs(
     flow_manager: &Arc<FlowManager>,
     flow_id: &str,
@@ -6117,6 +6290,18 @@ async fn diff_inputs(
             tracing::warn!(
                 "Config diff: input '{id}' referenced by flow '{flow_id}' but not found in top-level inputs"
             );
+            // Same reasoning as the bind-failure arm below: the config on disk
+            // will claim this input is a member and the runtime will not have
+            // it, so the operator has to be told rather than left to notice.
+            flow_manager.event_sender().emit_input(
+                EventSeverity::Warning,
+                category::FLOW,
+                format!(
+                    "Input '{id}' is referenced by flow '{flow_id}' but is not defined on this \
+                     node — the flow is running without it"
+                ),
+                id,
+            );
             continue;
         };
         tracing::info!("Config diff: adding input '{id}' to flow '{flow_id}'");
@@ -6125,6 +6310,15 @@ async fn diff_inputs(
             Ok(info) => info,
             Err(e) => {
                 tracing::warn!("Failed to add input '{id}' to flow '{flow_id}': {e}");
+                flow_manager.event_sender().emit_input(
+                    EventSeverity::Warning,
+                    category::FLOW,
+                    format!(
+                        "Input '{id}' could not be added to flow '{flow_id}' and is not running \
+                         even though the saved configuration lists it: {e}"
+                    ),
+                    id,
+                );
                 continue;
             }
         };
@@ -6140,6 +6334,23 @@ async fn diff_inputs(
                 err.message,
             );
             let _ = flow_manager.remove_input(flow_id, id).await;
+            // Loud, for the same reason `replace_edited_inputs` is loud on the
+            // identical failure: the flow keeps running without this input
+            // while the config on disk lists it as a member, so silence would
+            // leave the operator's own edit looking like it had applied. A
+            // same-address swap lands here — additions run before removals, so
+            // an incoming listener meets the outgoing one still holding the
+            // port — and that case is invisible without this.
+            flow_manager.event_sender().emit_input(
+                EventSeverity::Warning,
+                category::FLOW,
+                format!(
+                    "Input '{id}' could not start and has been dropped from the running flow \
+                     '{flow_id}', which the saved configuration still lists it in: {}",
+                    err.message
+                ),
+                id,
+            );
             continue;
         }
         // Register WHIP session channel if this hot-added input is a
@@ -6181,22 +6392,37 @@ async fn diff_inputs(
             .downcast_ref::<crate::engine::flow::InputMembershipError>()
             .is_some_and(|m| m.code == "active_input_in_use");
         if active_conflict {
-            if let Some(survivor) = new_input_ids.iter().find(|c| c.as_str() != id) {
+            let mut removed = false;
+            for survivor in surviving_active_candidates(new_input_ids, input_defs, id) {
                 tracing::info!(
                     "Config diff: '{id}' is on air and is being removed — activating '{survivor}' first"
                 );
-                match flow_manager
-                    .switch_active_input(flow_id, survivor, None)
-                    .await
-                {
-                    Ok(()) => match flow_manager.remove_input(flow_id, id).await {
-                        Ok(()) => continue,
-                        Err(e) => err = e,
-                    },
-                    Err(e) => tracing::warn!(
+                // `reassign_active_input`, not `switch_active_input`: this only
+                // needs the pointer moved so the removal gate lets go. The Take
+                // wrapper would additionally splice every PID-bus slot carrying
+                // the survivor, cutting an assembled flow's program on air when
+                // nothing in the operator's edit asked for it.
+                if let Err(e) = flow_manager.reassign_active_input(flow_id, survivor).await {
+                    tracing::warn!(
                         "Failed to activate '{survivor}' on flow '{flow_id}' before removing '{id}': {e}"
-                    ),
+                    );
+                    continue;
                 }
+                match flow_manager.remove_input(flow_id, id).await {
+                    Ok(()) => {
+                        removed = true;
+                        break;
+                    }
+                    // A second refusal is a different reason than the one the
+                    // reassignment cleared; another survivor cannot help.
+                    Err(e) => {
+                        err = e;
+                        break;
+                    }
+                }
+            }
+            if removed {
+                continue;
             }
         }
 
@@ -6208,6 +6434,12 @@ async fn diff_inputs(
              the running flow no longer matches its configuration"
         );
         unreconciled.push(id.to_string());
+        // Stop here, exactly as `replace_edited_inputs` does: the caller's
+        // restart rebuilds every input from the new config, so carrying on
+        // would only churn inputs that are about to be torn down anyway — and
+        // each further removal of an on-air input would move the active slot
+        // again on a flow already condemned to a restart.
+        break;
     }
 
     #[cfg(not(feature = "webrtc"))]
