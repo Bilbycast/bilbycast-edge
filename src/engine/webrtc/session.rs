@@ -490,11 +490,7 @@ impl WebrtcSession {
                 }
             }
             Event::MediaAdded(added) => {
-                let kind = if let Some(media) = self.rtc.media(added.mid) {
-                    media.kind()
-                } else {
-                    return None;
-                };
+                let kind = self.rtc.media(added.mid)?.kind();
                 match kind {
                     MediaKind::Video => self.video_mid = Some(added.mid),
                     MediaKind::Audio => self.audio_mid = Some(added.mid),

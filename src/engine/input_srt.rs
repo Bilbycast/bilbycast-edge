@@ -124,10 +124,8 @@ pub(crate) fn scan_first_pcr_in_datagram(data: &[u8]) -> Option<u64> {
             i += TS_PACKET_SIZE;
         } else {
             // Resync — scan forward for the next sync byte.
-            match payload[i + 1..].iter().position(|&b| b == TS_SYNC_BYTE) {
-                Some(p) => i = i + 1 + p,
-                None => return None,
-            }
+            let p = payload[i + 1..].iter().position(|&b| b == TS_SYNC_BYTE)?;
+            i = i + 1 + p;
         }
     }
     None

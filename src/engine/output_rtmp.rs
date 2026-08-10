@@ -792,7 +792,7 @@ fn build_avc_nalu_tag(nalus: &[Vec<u8>], is_keyframe: bool) -> Vec<u8> {
 }
 
 /// FourCC identifier for HEVC in the Enhanced RTMP v2 extended VideoTagHeader.
-const FOURCC_HVC1: [u8; 4] = [b'h', b'v', b'c', b'1'];
+const FOURCC_HVC1: [u8; 4] = *b"hvc1";
 
 /// Build an Enhanced RTMP v2 SequenceStart tag payload for HEVC.
 ///
