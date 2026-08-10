@@ -649,8 +649,11 @@ FEC (2022-1) and hitless redundancy (2022-7) run **after** the filter, so the re
   └─ No cascading backpressure
 
   SRT output inner buffer:
-  ├─ mpsc::channel(256) between broadcast task and SRT send
+  ├─ mpsc::channel(SRT_SEND_QUEUE_CAPACITY = 4096) broadcast task → SRT send
   ├─ try_send() (non-blocking) — drops if full
+  ├─ Sized to absorb one IDR access unit: on the 188-B-per-item SDI/WebRTC
+  │  publish path a 123–144 KB IDR is 654–766 items, which overran the
+  │  previous 256 once per GOP (see SRT_SEND_QUEUE_CAPACITY in output_srt.rs)
   └─ Separate from broadcast backpressure
 
   RTP output:
@@ -668,7 +671,12 @@ the essence bitrate class via [`crate::config::models::BandwidthProfile`]:
 | `HighBitrate` | 32 768 | 43 MB | 6.9 s | 690 ms | 115 ms | 28 ms |
 | `Uncompressed` | 65 536 | 86 MB | 13.8 s | 1.38 s | 230 ms | 57 ms |
 
-Each slot holds one `RtpPacket` (≈1316 B for 7×188 TS in RTP).
+Each slot holds one `RtpPacket`. The memory column above assumes ≈1316 B
+per slot (7×188 TS in RTP), which holds for the UDP / RTP / SRT passthrough
+publishers **only** — the bound is on *items*, not bytes. SDI and WebRTC
+publish one 188-byte TS packet per slot (so the real figure is ~7× smaller),
+while RTMP and RTSP bundle a whole access unit per slot (tens of KB — the
+figure is then an order of magnitude *larger*). Tracked in #98.
 `engine::bandwidth_profile::resolve_for_flow` picks the tier:
 
 - **ST 2110-20**, **ST 2110-23**, **MXL video** → `Uncompressed`

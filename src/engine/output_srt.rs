@@ -88,25 +88,38 @@ async fn srt_send_chunked(socket: &Arc<SrtSocket>, data: &[u8]) -> Result<usize,
 /// **This is a burst buffer, not a latency budget.** Compressed video is not
 /// delivered at a constant rate: an H.264 IDR access unit routinely runs 3×
 /// the median AU size (measured 123–144 KB against a ~39 KB baseline on live
-/// 1080i50 SDI at 8 Mbps CBR), and the whole AU is pushed into this channel in
-/// one pass. Sizing the queue against the *mean* rate therefore guarantees
-/// periodic overflow on completely ordinary content.
+/// 1080i50 SDI at 8 Mbps CBR). Sizing the queue against the *mean* rate
+/// therefore guarantees periodic overflow on completely ordinary content.
 ///
-/// The previous value of 256 slots was ~337 ms at 8 Mbps with 1316-byte
-/// payloads — small enough that a brief drain stall dropped packets, silently,
+/// **The bound is in items, not bytes, and item size is set by the publisher**
+/// — so quoting one duration or one byte figure for this queue is wrong. The
+/// item is a whole upstream `RtpPacket`, and the three publishing shapes in
+/// the tree differ by ~800×:
+///
+/// - **SDI** (`sdi_io::publish_ts`) and **WebRTC** publish **one 188-byte TS
+///   packet per item**. 4096 slots is ~770 KB / ~0.77 s at 8 Mbps.
+/// - **UDP / RTP / SRT passthrough** publish ~1316 B (7 × 188). ~5.4 MB.
+/// - **RTMP** (`input_rtmp.rs`) and **RTSP** bundle a whole access unit into
+///   one item, "tens of KB" as the chunking note above warns. 4096 slots is
+///   then ~164 MB / ~164 s at the same bitrate. Those sources never overflowed
+///   at 256 either, so they gain nothing here and pay the depth — bounding
+///   this queue in bytes rather than slots is tracked in #98.
+///
+/// That granularity is what makes the measured failure inevitable rather than
+/// merely unlucky: on the SDI path a single 123–144 KB IDR is **654–766
+/// items**, so it overran the old 256-slot queue roughly 3× *on its own*,
 /// once per GOP. Hardware-measured on bilby-z440 feeding four SRT outputs:
 /// 2149 discards in 60 s with **zero** broadcast-`Lagged` warnings, i.e. every
 /// one came from `try_send` returning `Full` here. Halving the source's IDR
 /// count (`gop_size` 50 → 100) halved the discards and restoring it restored
 /// them, confirming the IDR burst as the driver rather than a coincidence.
 ///
-/// 4096 slots is ~5.4 s / ~5.4 MB per output at that rate — comfortably above
-/// any plausible single-AU burst while staying bounded. This mirrors the fix
-/// already applied one layer down in the libsrt wrapper, where the caller →
-/// `srt-io` channel was raised 256 → 8192 for this same class of stall (see
-/// `srt-transport::socket::SEND_CHANNEL_CAPACITY`); that layer awaits, so it
-/// backpressures, whereas this one drops — which is why it needed the headroom
-/// more, not less.
+/// 4096 leaves ~5 IDRs of headroom on that path while staying bounded. It
+/// mirrors the fix already applied one layer down in the libsrt wrapper, where
+/// the caller → `srt-io` channel was raised 256 → 8192 for this same class of
+/// stall (`srt-transport::socket::SEND_CHANNEL_CAPACITY`, commit `7cce767`);
+/// that layer awaits, so it backpressures, whereas this one drops — which is
+/// why it needed the headroom more, not less.
 const SRT_SEND_QUEUE_CAPACITY: usize = 4096;
 
 /// How often a saturated send queue may log. Discards arrive in bursts of
@@ -118,12 +131,19 @@ const SEND_QUEUE_WARN_INTERVAL: Duration = Duration::from_secs(10);
 /// failure. Callers should **not** tear the connection down on these — drop
 /// the current packet, bump `packets_dropped`, and keep serving.
 ///
-/// **Dead on the libsrt backend.** `SrtSocket::send` awaits its bounded channel
-/// and can only fail with `ConnectionLost`; it has not produced `AsyncSend`
-/// since the 2026-04-20 fix. Retained because the pure-Rust `bilbycast-srt`
-/// backend is swappable in via `Cargo.toml` and still surfaces it. Do not read
-/// a zero `packets_dropped` at these call sites as evidence the send path is
-/// healthy — on libsrt the real discard site is the `try_send` below.
+/// **Dead on both backends.** On libsrt, `SrtSocket::send` awaits its bounded
+/// channel and can only fail with `ConnectionLost`; `AsyncSend` is constructed
+/// but consumed entirely inside the wrapper's `epoll_bridge` (a would-block is
+/// pushed onto its send backlog), so it has not reached a caller since the
+/// 2026-04-20 fix. The pure-Rust `bilbycast-srt` backend — swappable in via
+/// `Cargo.toml` — never constructs the variant at all: its `SrtSocket::send`
+/// likewise awaits and maps every failure to `NoConnection`. Retained as
+/// forward-compatibility scaffolding should either backend reintroduce a
+/// non-awaiting send, which is the 2026-04-20 regression described below.
+///
+/// Do not read a zero `packets_dropped` at these call sites as evidence the
+/// send path is healthy — the real discard sites are the five `try_send`
+/// calls below (three in the forward loop, two in the redundant loop).
 ///
 /// Historically `SrtSocket::send` used `try_send` onto a 256-slot mpsc and
 /// surfaced this error under bursty input (especially SRT + FEC on the send
@@ -759,7 +779,8 @@ async fn srt_output_forward_loop(
     compressed_audio_input: bool,
     frame_rate_rx: Option<tokio::sync::watch::Receiver<Option<f64>>>,
 ) -> anyhow::Result<bool> {
-    let (send_tx, mut send_rx) = tokio::sync::mpsc::channel::<(Bytes, u64)>(SRT_SEND_QUEUE_CAPACITY);
+    let (send_tx, mut send_rx) =
+        tokio::sync::mpsc::channel::<(Bytes, u64)>(SRT_SEND_QUEUE_CAPACITY);
     let send_sink = sink.clone();
     let send_stats = stats.clone();
     let output_id = config.id.clone();
@@ -1298,7 +1319,8 @@ async fn srt_output_redundant_loop(
         // on an idle socket.
         let mut rx = broadcast_tx.subscribe();
 
-        let (send_tx_leg1, mut send_rx_leg1) = tokio::sync::mpsc::channel::<(Bytes, u64)>(SRT_SEND_QUEUE_CAPACITY);
+        let (send_tx_leg1, mut send_rx_leg1) =
+            tokio::sync::mpsc::channel::<(Bytes, u64)>(SRT_SEND_QUEUE_CAPACITY);
         let send_socket1 = socket_leg1.clone();
         let send_stats1 = stats.clone();
         let output_id1 = config.id.clone();
