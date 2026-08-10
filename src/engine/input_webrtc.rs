@@ -250,7 +250,7 @@ async fn whip_input_loop(
                     } else if is_video {
                         // H.264 data from str0m is already depayloaded (complete NALUs)
                         // Convert to Annex B and mux into TS
-                        let pts_90khz = rtp_time.numer() as u64;
+                        let pts_90khz = rtp_time.numer();
 
                         // Prepend Annex B start codes and feed to TS muxer
                         let mut annex_b = Vec::new();
@@ -508,7 +508,7 @@ async fn whep_input_loop(
             match event {
                 SessionEvent::MediaData { mid, data, rtp_time, .. } => {
                     if session.video_mid == Some(mid) {
-                        let pts_90khz = rtp_time.numer() as u64;
+                        let pts_90khz = rtp_time.numer();
                         let mut annex_b = Vec::new();
                         annex_b.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]);
                         annex_b.extend_from_slice(&data);

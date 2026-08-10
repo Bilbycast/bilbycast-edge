@@ -115,7 +115,7 @@ impl PgroupFormat {
     /// responsible for ensuring `pixels` is a multiple of `pgroup_pixels()`
     /// (always even for 4:2:2).
     pub fn bytes_for_pixels(self, pixels: usize) -> usize {
-        debug_assert!(pixels % self.pgroup_pixels() == 0);
+        debug_assert!(pixels.is_multiple_of(self.pgroup_pixels()));
         (pixels / self.pgroup_pixels()) * self.pgroup_bytes()
     }
 }
@@ -519,8 +519,8 @@ impl Rfc4175Packetizer {
             let mut pending: Vec<PendingTriplet> = Vec::with_capacity(4);
             let mut payload_budget_left = self.config.payload_budget;
 
-            // Reserve space for at least one triplet header (6 bytes) + 1 pgroup.
-            // Each additional triplet consumes 6 more bytes of budget.
+            // Every triplet header costs 6 bytes, charged at its own iteration
+            // below — there is deliberately no up-front reservation here.
 
             while row < frame.height {
                 let remaining_in_row = (frame.width - col_pixel) as usize;
@@ -530,10 +530,9 @@ impl Rfc4175Packetizer {
                     continue;
                 }
 
-                // Budget check: need 6 bytes per triplet header already
-                // accounted for by reserving 6 up-front; subsequent triplets
-                // reduce budget by another 6 before their pixels are counted.
-                let triplet_hdr_cost = if pending.is_empty() { 6 } else { 6 };
+                // Budget check: this triplet's own 6-byte header, plus at least
+                // one pgroup of pixels, has to fit in what is left.
+                let triplet_hdr_cost = 6;
                 if payload_budget_left < triplet_hdr_cost + pgroup_bytes {
                     break;
                 }

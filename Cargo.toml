@@ -10,6 +10,65 @@ license = "AGPL-3.0-or-later"
 # (../bilbycast-fdk-aac-rs/*, etc.) stop generating wildcard warnings.
 publish = false
 
+# Clippy policy. CI runs `cargo clippy --all-targets --locked -- -D warnings`,
+# so anything not allowed here is a build failure. Every entry below is a
+# deliberate exemption with a reason — do not add one to silence a lint you
+# simply have not looked at.
+#
+# The first group is toolchain churn, not code debt: clippy 1.95 expanded
+# these to fire on shapes that were idiomatic when written, and rewriting
+# ~650 call sites across the engine to satisfy them would be unreviewable
+# and would bury real findings.
+[lints.clippy]
+# Fires on every `if let … { if let … { } }` (500 sites), suggesting the
+# edition-2024 let-chain form. The nesting is correct code; a mass rewrite of
+# the engine's option-unwrapping is churn with no defect-catching value.
+collapsible_if = "allow"
+collapsible_match = "allow"
+# Engine constructors legitimately take many parameters (spawn_hitless_es_merger_full
+# takes 8: uid, primary, backup, bus, stall, seq_aware, path_differential, cancel).
+# The fix is a builder or a params struct per call site — a design change, not a lint fix.
+too_many_arguments = "allow"
+# Doc-comment list formatting only. No effect on rendered rustdoc for our style.
+doc_lazy_continuation = "allow"
+doc_overindented_list_items = "allow"
+
+# The second group is where clippy's suggested fix is actively wrong for this
+# codebase.
+#
+# The suggested fix is to Box the large variant. These enums carry media
+# payloads on the packet path, where an extra heap allocation per packet
+# violates the "never block the data path" constraint (root CLAUDE.md #1).
+# Trading a fixed stack cost for a per-packet malloc is the wrong direction.
+large_enum_variant = "allow"
+# Fires on `let _ = spawn_*(…)` where the helper is a plain `fn` returning a
+# JoinHandle, not an `async fn`. The body runs at the call; only the handle is
+# dropped, which is a deliberate detached task. Verified all 8 sites 2026-08-11.
+let_underscore_future = "allow"
+# Would add ~21 `Default` impls that nothing constructs, i.e. dead code — which
+# the project bar forbids outright. Revisit per-type if a caller ever wants one.
+new_without_default = "allow"
+# Wants type aliases for signatures that are already local and self-describing.
+# Cosmetic, and the alias indirection reads worse at the use site.
+type_complexity = "allow"
+# Fires on codec bit-field construction, where the "redundant" term IS the
+# documentation of the wire layout:
+#     hdr[5] = (8 << 3) | 0;                       // bsid=8, bsmod=0
+#     p[21]  = ((channel_config & 0x03) << 6) | 0x00;
+# Folding those to `8 << 3` deletes the statement that the low field is zero,
+# which is exactly what a reader checking against the spec needs to see.
+identity_op = "allow"
+# New in clippy 1.95. Wants `if sr > 0 { pts += n * 90_000 / sr }` rewritten as
+# `checked_div` + `if let`, which is longer and states less: the guard means
+# "the sample rate is not known yet", which is the condition the reader cares
+# about, not "this division might trap".
+manual_checked_ops = "allow"
+# Index arithmetic over byte, sample and pixel buffers is the domain language
+# here — `for b in dpos + 2..dpos + 2 + dlen` walks a descriptor body, and the
+# iterator rewrite is longer and easier to get wrong. Rewriting 27 such loops
+# in TS-parsing and DSP code risks real defects for no functional gain.
+needless_range_loop = "allow"
+
 [dependencies]
 # Async runtime
 tokio = { version = "1.52", features = ["full"] }

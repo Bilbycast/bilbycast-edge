@@ -442,7 +442,7 @@ mod tests {
         let mut m = playing(3, true);
         assert_eq!(m.generation(), 0);
         let mut idg = id_gen();
-        m.arm_natural(TransitionTrigger::NaturalEos, || idg());
+        m.arm_natural(TransitionTrigger::NaturalEos, &mut idg);
         // Arming does NOT change generation.
         assert_eq!(m.generation(), 0);
         m.set_next_ready(true);
@@ -459,34 +459,34 @@ mod tests {
         let mut idg = id_gen();
         assert_eq!(m.active_index(), 0);
         // 0 -> 1
-        assert_eq!(m.arm_natural(TransitionTrigger::NaturalEos, || idg()), Some(1));
+        assert_eq!(m.arm_natural(TransitionTrigger::NaturalEos, &mut idg), Some(1));
         m.set_next_ready(true);
         m.on_current_exhausted();
         m.commit();
         assert_eq!(m.active_index(), 1);
         m.settle_playing();
         // fast-forward to tail 2, then wrap to 0
-        assert_eq!(m.arm_natural(TransitionTrigger::NaturalEos, || idg()), Some(2));
+        assert_eq!(m.arm_natural(TransitionTrigger::NaturalEos, &mut idg), Some(2));
         m.set_next_ready(true);
         m.on_current_exhausted();
         m.commit();
         m.settle_playing();
         assert_eq!(m.active_index(), 2);
-        assert_eq!(m.arm_natural(TransitionTrigger::Loop, || idg()), Some(0), "wrap to head");
+        assert_eq!(m.arm_natural(TransitionTrigger::Loop, &mut idg), Some(0), "wrap to head");
     }
 
     #[test]
     fn non_looping_tail_exhausts() {
         let mut m = playing(2, false);
         let mut idg = id_gen();
-        m.arm_natural(TransitionTrigger::NaturalEos, || idg());
+        m.arm_natural(TransitionTrigger::NaturalEos, &mut idg);
         m.set_next_ready(true);
         m.on_current_exhausted();
         m.commit();
         m.settle_playing();
         assert_eq!(m.active_index(), 1);
         // At the tail, no more to advance to.
-        assert_eq!(m.arm_natural(TransitionTrigger::NaturalEos, || idg()), None);
+        assert_eq!(m.arm_natural(TransitionTrigger::NaturalEos, &mut idg), None);
         assert_eq!(m.state(), PlayerState::Exhausted);
     }
 
@@ -494,7 +494,7 @@ mod tests {
     fn next_is_accepted_and_reports_precommit_generation() {
         let mut m = playing(3, true);
         let mut idg = id_gen();
-        let out = m.request_next(&NextRequest { expected_generation: 0, request_id: "r1".into() }, || idg());
+        let out = m.request_next(&NextRequest { expected_generation: 0, request_id: "r1".into() }, &mut idg);
         match out {
             NextOutcome::Accepted { previous_index, target_index, accepted_generation, .. } => {
                 assert_eq!(previous_index, 0);
@@ -511,14 +511,14 @@ mod tests {
     fn duplicate_next_is_already_pending_not_double_skip() {
         let mut m = playing(4, true);
         let mut idg = id_gen();
-        let first = m.request_next(&NextRequest { expected_generation: 0, request_id: "r1".into() }, || idg());
+        let first = m.request_next(&NextRequest { expected_generation: 0, request_id: "r1".into() }, &mut idg);
         let tid = match first {
             NextOutcome::Accepted { transition_id, .. } => transition_id,
             o => panic!("{o:?}"),
         };
         // A retry / second click at the same generation must not arm a second
         // transition — it maps to the existing one.
-        let second = m.request_next(&NextRequest { expected_generation: 0, request_id: "r1".into() }, || idg());
+        let second = m.request_next(&NextRequest { expected_generation: 0, request_id: "r1".into() }, &mut idg);
         match second {
             NextOutcome::AlreadyPending { transition_id } => assert_eq!(transition_id, tid),
             o => panic!("expected AlreadyPending, got {o:?}"),
@@ -531,14 +531,14 @@ mod tests {
         let mut m = playing(4, true);
         let mut idg = id_gen();
         // Commit once so generation becomes 1.
-        m.request_next(&NextRequest { expected_generation: 0, request_id: "r1".into() }, || idg());
+        m.request_next(&NextRequest { expected_generation: 0, request_id: "r1".into() }, &mut idg);
         m.set_next_ready(true);
         assert!(m.on_current_exhausted());
         m.commit();
         m.settle_playing();
         assert_eq!(m.generation(), 1);
         // A delayed double-click carrying the old generation 0 is refused.
-        let out = m.request_next(&NextRequest { expected_generation: 0, request_id: "r1".into() }, || idg());
+        let out = m.request_next(&NextRequest { expected_generation: 0, request_id: "r1".into() }, &mut idg);
         match out {
             NextOutcome::GenerationConflict { current_generation } => assert_eq!(current_generation, 1),
             o => panic!("expected GenerationConflict, got {o:?}"),
@@ -549,7 +549,7 @@ mod tests {
     fn next_near_eos_with_unready_next_holds_not_dead_air() {
         let mut m = playing(3, true);
         let mut idg = id_gen();
-        m.request_next(&NextRequest { expected_generation: 0, request_id: "r1".into() }, || idg());
+        m.request_next(&NextRequest { expected_generation: 0, request_id: "r1".into() }, &mut idg);
         // next is NOT ready and the current source runs out.
         m.set_next_ready(false);
         let can_commit = m.on_current_exhausted();
@@ -566,7 +566,7 @@ mod tests {
     fn hold_deadline_abandons_transition_and_resumes() {
         let mut m = playing(3, true);
         let mut idg = id_gen();
-        m.request_next(&NextRequest { expected_generation: 0, request_id: "r1".into() }, || idg());
+        m.request_next(&NextRequest { expected_generation: 0, request_id: "r1".into() }, &mut idg);
         m.set_next_ready(false);
         m.on_current_exhausted();
         assert_eq!(m.state(), PlayerState::HoldingForNext);
@@ -581,7 +581,7 @@ mod tests {
     fn next_rejected_when_not_playing() {
         let mut m = TransitionMachine::new(3, true); // still Idle
         let mut idg = id_gen();
-        let out = m.request_next(&NextRequest { expected_generation: 0, request_id: "r1".into() }, || idg());
+        let out = m.request_next(&NextRequest { expected_generation: 0, request_id: "r1".into() }, &mut idg);
         assert!(matches!(out, NextOutcome::Rejected { code } if code == reject_code::NOT_PLAYING));
     }
 
@@ -589,10 +589,10 @@ mod tests {
     fn only_one_transition_arms_at_a_time() {
         let mut m = playing(5, true);
         let mut idg = id_gen();
-        m.arm_natural(TransitionTrigger::NaturalEos, || idg());
+        m.arm_natural(TransitionTrigger::NaturalEos, &mut idg);
         assert_eq!(m.armed_target(), Some(1));
         // A subsequent arm_natural keeps the first, does not stack.
-        m.arm_natural(TransitionTrigger::NaturalEos, || idg());
+        m.arm_natural(TransitionTrigger::NaturalEos, &mut idg);
         assert_eq!(m.armed_target(), Some(1));
     }
 }

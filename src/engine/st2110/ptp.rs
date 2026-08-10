@@ -54,10 +54,12 @@ use crate::manager::events::{EventSender, EventSeverity, category};
 /// alarm on `Unlocked` for ST 2110 flows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum PtpLockState {
     /// No PTP daemon is reachable. The Phase 1 reporter returns this when
     /// `/var/run/ptp4l` is missing, when the daemon does not respond within
     /// the poll timeout, or when the response cannot be decoded.
+    #[default]
     Unavailable,
     /// PTP is running but the slave is in `LISTENING`/`UNCALIBRATED` and has
     /// not yet acquired a lock with the grandmaster.
@@ -88,11 +90,6 @@ impl PtpLockState {
     }
 }
 
-impl Default for PtpLockState {
-    fn default() -> Self {
-        PtpLockState::Unavailable
-    }
-}
 
 /// IEEE 1588 grandmaster identifier as 8 hex bytes.
 ///
@@ -1568,8 +1565,8 @@ mod tests {
         buf.extend_from_slice(&tlv_value_len.to_be_bytes());
         buf.extend_from_slice(&MANAGEMENT_ID_CURRENT_DATA_SET.to_be_bytes());
         buf.extend_from_slice(&steps_removed.to_be_bytes());
-        buf.extend_from_slice(&((offset_ns << 16) as i64).to_be_bytes());
-        buf.extend_from_slice(&((mean_path_delay_ns << 16) as i64).to_be_bytes());
+        buf.extend_from_slice(&(offset_ns << 16).to_be_bytes());
+        buf.extend_from_slice(&(mean_path_delay_ns << 16).to_be_bytes());
         buf
     }
 

@@ -129,7 +129,7 @@ mod tests {
         // ue=0 -> se=0, ue=1 -> se=1, ue=2 -> se=-1, ue=3 -> se=2, ue=4 -> se=-2
         // Encode [0, 1, 2, 3, 4] then decode as se.
         // 1, 010, 011, 00100, 00101
-        let bytes = [0b1_010_011_0, 0b0100_0010, 0b1000_0000];
+        let bytes = [0b1010_0110, 0b0100_0010, 0b1000_0000];
         let mut r = BitReader::new(&bytes);
         assert_eq!(r.read_se(), Some(0));
         assert_eq!(r.read_se(), Some(1));

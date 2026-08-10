@@ -803,16 +803,13 @@ mod tests {
         async fn drain(sock: &UdpSocket) -> Vec<Vec<u8>> {
             let mut got = Vec::new();
             let mut buf = [0u8; 64];
-            loop {
-                match tokio::time::timeout(
-                    std::time::Duration::from_millis(200),
-                    sock.recv_from(&mut buf),
-                )
-                .await
-                {
-                    Ok(Ok((n, _))) => got.push(buf[..n].to_vec()),
-                    _ => break,
-                }
+            while let Ok(Ok((n, _))) = tokio::time::timeout(
+                std::time::Duration::from_millis(200),
+                sock.recv_from(&mut buf),
+            )
+            .await
+            {
+                got.push(buf[..n].to_vec());
             }
             got
         }

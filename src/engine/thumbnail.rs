@@ -1215,7 +1215,7 @@ impl LiveState {
                     // a parameter-set-bearing AU only when no IDR has
                     // been seen.
                     let has_param_set =
-                        nalus.iter().any(|n| matches!(h265_nal_type(n), 32 | 33 | 34));
+                        nalus.iter().any(|n| matches!(h265_nal_type(n), 32..=34));
                     let anchor = if is_keyframe {
                         AnchorKind::Idr
                     } else if has_param_set {
@@ -1985,7 +1985,7 @@ mod tests {
                 while let Ok(f) = decoder.receive_frame() {
                     frame_no += 1;
                     // Sample roughly the rate the async loop would at ~1 s.
-                    if frame_no % 25 == 0 {
+                    if frame_no.is_multiple_of(25) {
                         if let Some(r) = warm_scale_encode(&f, &mut scaler, &encoder, &cfg) {
                             warm_hashes.insert(hash_jpeg(&r.jpeg));
                         }

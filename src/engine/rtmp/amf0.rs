@@ -268,7 +268,7 @@ mod tests {
     #[test]
     fn round_trip_number() {
         let val = Amf0Value::Number(42.5);
-        let encoded = encode_values(&[val.clone()]);
+        let encoded = encode_values(std::slice::from_ref(&val));
         let decoded = decode_all(&encoded).unwrap();
         assert_eq!(decoded, vec![val]);
     }
@@ -276,7 +276,7 @@ mod tests {
     #[test]
     fn round_trip_string() {
         let val = Amf0Value::String("connect".into());
-        let encoded = encode_values(&[val.clone()]);
+        let encoded = encode_values(std::slice::from_ref(&val));
         let decoded = decode_all(&encoded).unwrap();
         assert_eq!(decoded, vec![val]);
     }
@@ -288,7 +288,7 @@ mod tests {
             ("type".into(), Amf0Value::String("nonprivate".into())),
             ("flashVer".into(), Amf0Value::String("FMLE/3.0".into())),
         ]);
-        let encoded = encode_values(&[val.clone()]);
+        let encoded = encode_values(std::slice::from_ref(&val));
         let decoded = decode_all(&encoded).unwrap();
         assert_eq!(decoded, vec![val]);
     }
@@ -296,7 +296,7 @@ mod tests {
     #[test]
     fn round_trip_null() {
         let val = Amf0Value::Null;
-        let encoded = encode_values(&[val.clone()]);
+        let encoded = encode_values(std::slice::from_ref(&val));
         let decoded = decode_all(&encoded).unwrap();
         assert_eq!(decoded, vec![val]);
     }

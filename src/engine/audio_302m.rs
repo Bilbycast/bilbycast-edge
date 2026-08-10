@@ -231,17 +231,17 @@ impl S302mPacketizer {
         let aps = audio_bytes as u16;
         out.extend_from_slice(&aps.to_be_bytes());
         // 2 bits number_channels: 0=2, 1=4, 2=6, 3=8
-        let nc_field = ((self.channels - 2) >> 1) as u8 & 0x03;
+        let nc_field = ((self.channels - 2) >> 1) & 0x03;
         // 8 bits channel_identification: 0
         // 2 bits bits_per_sample: 0=16, 1=20, 2=24
-        let bps_field = ((self.bit_depth - 16) / 4) as u8 & 0x03;
+        let bps_field = ((self.bit_depth - 16) / 4) & 0x03;
         // 4 bits alignment_bits: 0
         //
         // Layout across the next two header bytes (big-endian bitstream):
         //   byte2 = nc(2) | id(6 high)
         //   byte3 = id(2 low) | bps(2) | align(4)
-        let byte2 = (nc_field << 6) | 0x00;
-        let byte3 = (0x00 << 6) | (bps_field << 4) | 0x00;
+        let byte2 = nc_field << 6;
+        let byte3 = bps_field << 4;
         out.extend_from_slice(&[byte2, byte3]);
 
         // ── Audio body ──
@@ -340,7 +340,7 @@ impl S302mDepacketizer {
         }
         let nc_field = (payload[2] >> 6) & 0x03;
         let bps_field = (payload[3] >> 4) & 0x03;
-        let channels = ((nc_field as u8) + 1) * 2; // 0→2, 1→4, 2→6, 3→8
+        let channels = (nc_field + 1) * 2; // 0→2, 1→4, 2→6, 3→8
         let bit_depth = 16u8 + bps_field * 4; // 0→16, 1→20, 2→24
         if !matches!(channels, 2 | 4 | 6 | 8) {
             return Err(format!("S302m: bad channel field {nc_field}"));
@@ -356,7 +356,7 @@ impl S302mDepacketizer {
         };
         let pairs_per_frame = channels as usize / 2;
         let bytes_per_frame = pairs_per_frame * bytes_per_pair;
-        if aps % bytes_per_frame != 0 {
+        if !aps.is_multiple_of(bytes_per_frame) {
             return Err(format!(
                 "S302m: audio_packet_size {aps} not aligned to frame size {bytes_per_frame}"
             ));
@@ -431,8 +431,8 @@ impl S302mDepacketizer {
                         let s0 = (b0 << 12) | (b1 << 20) | (s0_top << 28);
                         let s1 = (b3 << 12) | (b4 << 20) | (s1_top << 28);
                         // Sign-extend the 20-bit sample placed in bits 12..31.
-                        let s0 = ((s0 as i32) >> 12) as i32;
-                        let s1 = ((s1 as i32) >> 12) as i32;
+                        let s0 = (s0 as i32) >> 12;
+                        let s1 = (s1 as i32) >> 12;
                         (s0, s1)
                     }
                     24 => {
@@ -461,8 +461,8 @@ impl S302mDepacketizer {
                             | (b5 << 20)
                             | (b6 << 28);
                         // Sign-extend the 24-bit sample placed in bits 8..31.
-                        let s0 = ((s0 as i32) >> 8) as i32;
-                        let s1 = ((s1 as i32) >> 8) as i32;
+                        let s0 = (s0 as i32) >> 8;
+                        let s1 = (s1 as i32) >> 8;
                         (s0, s1)
                     }
                     _ => unreachable!(),

@@ -178,8 +178,10 @@ pub fn spawn_rist_input(
 }
 
 fn socket_config_for(config: &RistInputConfig, local_addr: SocketAddr) -> RistSocketConfig {
-    let mut sc = RistSocketConfig::default();
-    sc.local_addr = local_addr;
+    let mut sc = RistSocketConfig {
+        local_addr,
+        ..Default::default()
+    };
     if let Some(ms) = config.buffer_ms {
         sc.buffer_size = Duration::from_millis(ms as u64);
     }

@@ -151,7 +151,7 @@ fn decode_hex16(hex_str: &str, label: &str) -> anyhow::Result<[u8; 16]> {
 
 fn hex_decode(s: &str) -> Result<Vec<u8>, String> {
     let s = s.trim();
-    if s.len() % 2 != 0 {
+    if !s.len().is_multiple_of(2) {
         return Err("odd hex length".into());
     }
     let mut out = Vec::with_capacity(s.len() / 2);
@@ -915,13 +915,9 @@ async fn handle_video(
         // Apply CENC by rebuilding the segment from the raw Sample
         // vector with per-sample encryption applied.
         let (segment_bytes, segment_kind, duration_90k) = if state.cenc.is_some()
-            && outcome.completed_video_samples.is_some()
+            && let Some(completed) = outcome.completed_video_samples.as_ref()
         {
-            encrypt_and_build_video_segment(
-                state,
-                &seg,
-                outcome.completed_video_samples.as_ref().unwrap(),
-            )
+            encrypt_and_build_video_segment(state, &seg, completed)
             .map(|b| (b, SegmentKind::Video, seg.duration_90k))
             .unwrap_or((seg.bytes, seg.kind, seg.duration_90k))
         } else if state.audio_seg.is_some() {

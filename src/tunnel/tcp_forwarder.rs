@@ -155,14 +155,9 @@ async fn handle_egress_tcp(
                 read_encrypted_to_tcp(&cipher, &mut quic_recv, &mut tcp_write, stats_rx).await
             } else {
                 let mut buf = vec![0u8; 8192];
-                loop {
-                    match quic_recv.read(&mut buf).await? {
-                        Some(n) => {
-                            tcp_write.write_all(&buf[..n]).await?;
-                            stats_rx.fetch_add(n as u64, Ordering::Relaxed);
-                        }
-                        None => break,
-                    }
+                while let Some(n) = quic_recv.read(&mut buf).await? {
+                    tcp_write.write_all(&buf[..n]).await?;
+                    stats_rx.fetch_add(n as u64, Ordering::Relaxed);
                 }
                 Ok(())
             }
@@ -200,7 +195,6 @@ pub async fn run_ingress(
                 stats.connections_total.fetch_add(1, Ordering::Relaxed);
                 stats.connections_active.fetch_add(1, Ordering::Relaxed);
 
-                let forward_addr = forward_addr;
                 let stats = stats.clone();
                 let cancel = cancel.clone();
                 let cipher = cipher.clone();
@@ -263,14 +257,9 @@ async fn handle_ingress_tcp(
                 read_encrypted_to_tcp(&cipher, quic_recv, &mut tcp_write, stats_rx).await
             } else {
                 let mut buf = vec![0u8; 8192];
-                loop {
-                    match quic_recv.read(&mut buf).await? {
-                        Some(n) => {
-                            tcp_write.write_all(&buf[..n]).await?;
-                            stats_rx.fetch_add(n as u64, Ordering::Relaxed);
-                        }
-                        None => break,
-                    }
+                while let Some(n) = quic_recv.read(&mut buf).await? {
+                    tcp_write.write_all(&buf[..n]).await?;
+                    stats_rx.fetch_add(n as u64, Ordering::Relaxed);
                 }
                 Ok(())
             }

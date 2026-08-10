@@ -68,7 +68,7 @@ impl IndexEntry {
         self.flags & flag::SMPTE_TC_VALID != 0
     }
     /// Pack the entry into a 24-byte buffer, little-endian.
-    pub fn to_bytes(&self) -> [u8; ENTRY_SIZE] {
+    pub fn to_bytes(self) -> [u8; ENTRY_SIZE] {
         let mut buf = [0u8; ENTRY_SIZE];
         buf[0..8].copy_from_slice(&self.pts_90khz.to_le_bytes());
         buf[8..12].copy_from_slice(&self.smpte_tc.to_le_bytes());

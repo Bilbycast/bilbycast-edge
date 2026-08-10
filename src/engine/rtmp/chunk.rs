@@ -192,9 +192,9 @@ impl ChunkWriter {
 /// - cs_id 320..65599: 3-byte form `[fmt:2 | 1:6] [low byte] [high byte]`
 fn write_basic_header(buf: &mut BytesMut, fmt: u8, cs_id: u32) {
     let fmt_bits = (fmt & 0x03) << 6;
-    if cs_id >= 2 && cs_id <= 63 {
+    if (2..=63).contains(&cs_id) {
         buf.put_u8(fmt_bits | cs_id as u8);
-    } else if cs_id >= 64 && cs_id <= 319 {
+    } else if (64..=319).contains(&cs_id) {
         buf.put_u8(fmt_bits); // lower 6 bits = 0
         buf.put_u8((cs_id - 64) as u8);
     } else {
@@ -210,7 +210,7 @@ fn write_basic_header(buf: &mut BytesMut, fmt: u8, cs_id: u32) {
 // ---------------------------------------------------------------------------
 
 /// Tracks per-chunk-stream state needed for reassembly.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 struct ChunkStreamState {
     msg_type: u8,
     msg_len: u32,
@@ -220,17 +220,6 @@ struct ChunkStreamState {
     payload: Vec<u8>,
 }
 
-impl Default for ChunkStreamState {
-    fn default() -> Self {
-        Self {
-            msg_type: 0,
-            msg_len: 0,
-            timestamp: 0,
-            stream_id: 0,
-            payload: Vec::new(),
-        }
-    }
-}
 
 /// A fully reassembled RTMP message.
 #[derive(Debug)]
@@ -281,7 +270,7 @@ impl ChunkReader {
                     // 3-byte form
                     let lo = read_u8(stream).await?;
                     let hi = read_u8(stream).await?;
-                    (hi as u32) << 8 | lo as u32 + 64
+                    ((hi as u32) << 8) | (lo as u32 + 64)
                 }
                 n => n as u32,
             };
@@ -289,7 +278,7 @@ impl ChunkReader {
             let state = self
                 .streams
                 .entry(cs_id)
-                .or_insert_with(ChunkStreamState::default);
+                .or_default();
 
             // -- Message header (depends on fmt) --
             match fmt {

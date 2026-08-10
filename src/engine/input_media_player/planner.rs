@@ -320,11 +320,11 @@ struct Diff {
 /// than falling back to another program's tracks: a stale sidecar or a
 /// mistyped program number should read as "absent", never as "here is some
 /// other program's video".
-fn first_stream<'a>(
-    m: &'a AssetManifest,
+fn first_stream(
+    m: &AssetManifest,
     t: ManifestMediaType,
     program: Option<u16>,
-) -> Option<&'a crate::media::manifest::ManifestStream> {
+) -> Option<&crate::media::manifest::ManifestStream> {
     match program {
         Some(p) => m
             .streams
@@ -607,7 +607,8 @@ mod tests {
 
         let mux = manifest(DetectedKind::Ts, vec![v1, a1, v2, a2]);
         let mut mux2 = mux.clone();
-        for m in [&mut mux2] {
+        {
+            let m = &mut mux2;
             m.container.as_mut().unwrap().programs = Some(2);
         }
         let mut mux1 = mux;

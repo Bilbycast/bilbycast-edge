@@ -220,7 +220,7 @@ pub async fn start_monitor_server(
         let listener = build_monitor_listener(*bind_addr).map_err(|e| {
             crate::util::port_error::annotate_bind_error(
                 e,
-                &bind_addr.to_string(),
+                bind_addr.to_string(),
                 "Monitor dashboard server",
             )
         })?;

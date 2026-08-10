@@ -217,7 +217,7 @@ pub(crate) fn detect_ts_stride_confirmed(buf: &[u8]) -> Option<(usize, usize)> {
         while start < start_limit && start + stride < buf.len() {
             if buf[start] == TS_SYNC_BYTE && buf[start + stride] == TS_SYNC_BYTE {
                 let run = sync_run_len(buf, stride, start);
-                if run >= MIN_RUN && best.map_or(true, |(best_run, _, _)| run > best_run) {
+                if run >= MIN_RUN && best.is_none_or(|(best_run, _, _)| run > best_run) {
                     best = Some((run, stride, start));
                 }
             }
@@ -379,7 +379,7 @@ fn assign_stream_bitrates(
             v.bitrate_bps = if claimed.insert(v.pid) {
                 let pkts = counts.get(&v.pid).copied();
                 prog_packets += pkts.unwrap_or(0);
-                pkts.map(|p| to_bps(p))
+                pkts.map(to_bps)
             } else {
                 None
             };
@@ -388,7 +388,7 @@ fn assign_stream_bitrates(
             a.bitrate_bps = if claimed.insert(a.pid) {
                 let pkts = counts.get(&a.pid).copied();
                 prog_packets += pkts.unwrap_or(0);
-                pkts.map(|p| to_bps(p))
+                pkts.map(to_bps)
             } else {
                 None
             };
@@ -881,7 +881,6 @@ impl MediaLibrary {
             let mut f = OpenOptions::new()
                 .create(is_first)
                 .append(true)
-                .write(true)
                 .truncate(false)
                 .open(&staging_path)
                 .map_err(|e| anyhow!("open staging {}: {e}", staging_path.display()))?;

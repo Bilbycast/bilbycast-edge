@@ -444,7 +444,7 @@ impl AudioBackend {
             pcm.hw_params(&hwp).context("alsa hw_params")?;
             let buf = hwp.get_buffer_size().unwrap_or((period * 4) as alsa::pcm::Frames);
             let per = hwp.get_period_size().unwrap_or(period);
-            (buf as i64, per as i64)
+            (buf, per)
         };
         pcm.prepare().context("alsa prepare")?;
         self.pcm = Some(pcm);

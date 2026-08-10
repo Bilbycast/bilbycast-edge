@@ -77,13 +77,11 @@ impl DatagramLink for QuicLink {
             .map_err(|e| anyhow::anyhow!("quic datagram send: {e}"))
     }
 
-    fn recv_datagram(&self) -> impl Future<Output = Result<Bytes>> + Send {
-        async move {
-            self.0
-                .read_datagram()
-                .await
-                .map_err(|e| anyhow::anyhow!("quic datagram recv: {e}"))
-        }
+    async fn recv_datagram(&self) -> Result<Bytes> {
+        self.0
+            .read_datagram()
+            .await
+            .map_err(|e| anyhow::anyhow!("quic datagram recv: {e}"))
     }
 }
 
@@ -132,8 +130,8 @@ impl DatagramLink for PlainUdpLink {
         }
     }
 
-    fn recv_datagram(&self) -> impl Future<Output = Result<Bytes>> + Send {
-        async move {
+    async fn recv_datagram(&self) -> Result<Bytes> {
+        {
             let mut buf = vec![0u8; 2048];
             loop {
                 let n = self.sock.recv(&mut buf).await?;

@@ -263,7 +263,7 @@ impl CipherState {
                 let mut cbc_iv = *iv;
                 while i + 16 <= bytes.len() {
                     // Every 10th position (0, 10, 20, ...) is encrypted.
-                    if (i / 16) % 10 == 0 {
+                    if (i / 16).is_multiple_of(10) {
                         // One AES-CBC block: XOR IV, encrypt, result becomes next IV.
                         let block: &mut [u8; 16] = (&mut bytes[i..i + 16])
                             .try_into()

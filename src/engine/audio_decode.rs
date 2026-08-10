@@ -1255,7 +1255,7 @@ mod tests {
                 r.push(s);
                 sample_idx += 1;
             }
-            let encoded = encoder.encode_frame(&vec![l, r]).expect("encode");
+            let encoded = encoder.encode_frame(&[l, r]).expect("encode");
             if encoded.bytes.is_empty() {
                 // Encoder still priming; skip.
                 continue;
@@ -1406,7 +1406,7 @@ mod tests {
     /// length. `frame_bytes` must be even and >= 6.
     #[cfg(feature = "media-codecs")]
     fn make_eac3_frame(frame_bytes: usize) -> Vec<u8> {
-        assert!(frame_bytes >= 6 && frame_bytes % 2 == 0);
+        assert!(frame_bytes >= 6 && frame_bytes.is_multiple_of(2));
         let frmsiz: u16 = (frame_bytes as u16 / 2) - 1;
         let mut buf = vec![0u8; frame_bytes];
         buf[0] = 0x0B;

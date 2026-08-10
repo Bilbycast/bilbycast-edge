@@ -154,6 +154,20 @@ jobs:
         working-directory: bilbycast-edge
         run: cargo check --all-targets --locked
 
+      # Lint gate. A step in this job rather than a job of its own for the same
+      # reason as `cargo test` below: a parallel job would re-clone all eight
+      # sibling repos and rebuild the vendored FFmpeg from cold, which dwarfs
+      # the lint itself. Clippy reuses the target dir `cargo check` just filled.
+      #
+      # The accepted-lint set lives in `[lints.clippy]` in bilbycast-edge's
+      # Cargo.toml, one documented reason per entry — so this is `-D warnings`
+      # with no inline `-A` flags to drift out of sync with the manifest.
+      # Nothing ran clippy before this: the tree had accumulated 1063 lints
+      # unnoticed, which is what motivated the gate.
+      - name: cargo clippy
+        working-directory: bilbycast-edge
+        run: cargo clippy --all-targets --locked -- -D warnings
+
       # Run the unit/integration test suite. Added as a step in this job
       # rather than a separate job on purpose: a parallel job would re-clone
       # all eight sibling repos and rebuild the vendored FFmpeg from cold

@@ -200,7 +200,7 @@ async fn udp_output_loop_302m(
                         pipeline.process(&packet);
                         for datagram in pipeline.take_ready_datagrams() {
                             let dg = WireDatagram {
-                                bytes: Bytes::from(datagram),
+                                bytes: datagram,
                                 recv_time_us: packet.recv_time_us,
                                 enqueue_us: 0,
                                 target_tx_time_ns: None,
@@ -508,7 +508,7 @@ async fn udp_output_loop(
                     }
                 }
             }
-            _ = &mut delay_sleep, if delay_buf.as_ref().map_or(false, |db| db.len() > 0) => {
+            _ = &mut delay_sleep, if delay_buf.as_ref().is_some_and(|db| db.len() > 0) => {
                 let db = delay_buf.as_mut().unwrap();
                 let now = now_us();
                 for packet in db.drain_ready(now) {
@@ -637,7 +637,7 @@ async fn udp_output_loop(
             // transcoded output arrives asynchronously on the
             // `chain.recv()` branch of the outer select! below.
             if let Some(ref chain) = transcode_chain {
-                if let Err(_) = chain.try_submit(Bytes::copy_from_slice(filtered_bytes)) {
+                if chain.try_submit(Bytes::copy_from_slice(filtered_bytes)).is_err() {
                     stats.packets_dropped.fetch_add(1, Ordering::Relaxed);
                 }
             } else {

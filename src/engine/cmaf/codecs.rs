@@ -270,7 +270,7 @@ impl<'a> BitReader<'a> {
     fn se(&mut self) -> Option<i32> {
         let v = self.ue()?;
         Some(if v & 1 == 1 {
-            ((v + 1) / 2) as i32
+            v.div_ceil(2) as i32
         } else {
             -((v / 2) as i32)
         })
@@ -489,7 +489,7 @@ pub fn aac_audio_specific_config(profile: u8, sr_idx: u8, ch_cfg: u8) -> [u8; 2]
 pub fn write_esds_mpeg_audio(parent: &mut BoxWriter<'_>, avg_bitrate: u32) {
     let mut esds = parent.child_full(*b"esds", 0, 0);
     // ES_Descriptor (tag 0x03)
-    let dcd_body_len = 13 + 2 + 0; // DCD core + empty DSI tag/len
+    let dcd_body_len = 13 + 2; // DCD core + empty DSI tag/len
     let dcd_len = 1 + 1 + dcd_body_len;
     let sl_len = 1 + 1 + 1;
     let es_body_len = 3 + dcd_len + sl_len;

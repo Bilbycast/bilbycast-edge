@@ -702,7 +702,7 @@ pub fn set_psi_version(pkt: &mut [u8], version: u8) {
 /// For raw TS packets (`is_raw_ts` = true), returns the entire data.
 /// For RTP-wrapped TS, parses the variable-length RTP header (CSRC + extension)
 /// and returns the payload after it.
-pub fn strip_rtp_header<'a>(packet: &'a RtpPacket) -> &'a [u8] {
+pub fn strip_rtp_header(packet: &RtpPacket) -> &[u8] {
     let data = &packet.data;
 
     if packet.is_raw_ts {

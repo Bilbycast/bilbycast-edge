@@ -218,6 +218,31 @@ impl GopTracker {
     }
 }
 
+/// Given a PES-payload-starting TS payload (right after PUSI), return the
+/// byte offset at which the elementary-stream starts. Returns 0 on anything
+/// we don't recognise so callers can safely scan from the beginning.
+fn pes_payload_offset(payload: &[u8]) -> usize {
+    if payload.len() < 9 {
+        return 0;
+    }
+    if payload[0] != 0 || payload[1] != 0 || payload[2] != 1 {
+        return 0;
+    }
+    let stream_id = payload[3];
+    // Video stream IDs are 0xE0..=0xEF; audio 0xC0..=0xDF. We accept any
+    // PES stream id here and let the NAL scan decide.
+    if !(0xC0..=0xEF).contains(&stream_id) {
+        return 0;
+    }
+    // PES_header_data_length is at offset 8
+    let hdr_len = payload[8] as usize;
+    let es_start = 9 + hdr_len;
+    if es_start > payload.len() {
+        return payload.len();
+    }
+    es_start
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -257,29 +282,4 @@ mod tests {
         assert_eq!(snap.codec, "h265");
         assert_eq!(snap.idr_count, 1);
     }
-}
-
-/// Given a PES-payload-starting TS payload (right after PUSI), return the
-/// byte offset at which the elementary-stream starts. Returns 0 on anything
-/// we don't recognise so callers can safely scan from the beginning.
-fn pes_payload_offset(payload: &[u8]) -> usize {
-    if payload.len() < 9 {
-        return 0;
-    }
-    if payload[0] != 0 || payload[1] != 0 || payload[2] != 1 {
-        return 0;
-    }
-    let stream_id = payload[3];
-    // Video stream IDs are 0xE0..=0xEF; audio 0xC0..=0xDF. We accept any
-    // PES stream id here and let the NAL scan decide.
-    if !(0xC0..=0xEF).contains(&stream_id) {
-        return 0;
-    }
-    // PES_header_data_length is at offset 8
-    let hdr_len = payload[8] as usize;
-    let es_start = 9 + hdr_len;
-    if es_start > payload.len() {
-        return payload.len();
-    }
-    es_start
 }

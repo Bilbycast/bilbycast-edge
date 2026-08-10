@@ -358,8 +358,8 @@ fn process_ts_packet(
     }
 
     // ── 5. PMT handling ──
-    if state.pmt_pids.contains_key(&pid) {
-        state.pmt_pids.insert(pid, Some(now));
+    if let std::collections::hash_map::Entry::Occupied(mut e) = state.pmt_pids.entry(pid) {
+        e.insert(Some(now));
         // PMT PID was just seen on the wire — clear any stale error latch.
         state.pmt_errored.remove(&pid);
         if ts_pusi(pkt) {
@@ -381,8 +381,8 @@ fn process_ts_packet(
     }
 
     // ── 5b. Track ES PID presence for PID error check (Priority 1) ──
-    if state.es_pids.contains_key(&pid) {
-        state.es_pids.insert(pid, Some(now));
+    if let std::collections::hash_map::Entry::Occupied(mut e) = state.es_pids.entry(pid) {
+        e.insert(Some(now));
         state.es_errored.remove(&pid);
     }
 
@@ -849,7 +849,7 @@ fn check_pat_pmt_timeouts(stats: &Tr101290Accumulator) {
 
     let startup_grace_elapsed = state
         .first_pat_time
-        .map_or(false, |t| now.duration_since(t) > PAT_PMT_TIMEOUT * 2);
+        .is_some_and(|t| now.duration_since(t) > PAT_PMT_TIMEOUT * 2);
 
     // PAT timeout — singleton, no per-PID latch needed; just only fire
     // once per stall window.

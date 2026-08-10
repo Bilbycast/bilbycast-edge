@@ -10,7 +10,7 @@
 //! after connecting (not via query parameters, to avoid leaking secrets in URLs/logs).
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -368,7 +368,11 @@ async fn try_connect(
     tunnel_manager: &Arc<TunnelManager>,
     ws_stats_tx: &broadcast::Sender<String>,
     app_config: &Arc<RwLock<AppConfig>>,
+    // Not `&Path`: both are cloned into spawned tasks that outlive this
+    // frame, so the owned type is what the body actually needs.
+    #[allow(clippy::ptr_arg)]
     config_path: &PathBuf,
+    #[allow(clippy::ptr_arg)]
     secrets_path: &PathBuf,
     api_addr: &str,
     monitor_addr: Option<&str>,
@@ -1535,8 +1539,8 @@ fn edge_capabilities() -> Vec<&'static str> {
 /// Persist manager credentials to config + secrets files.
 async fn persist_credentials(
     app_config: &Arc<RwLock<AppConfig>>,
-    config_path: &PathBuf,
-    secrets_path: &PathBuf,
+    config_path: &Path,
+    secrets_path: &Path,
     node_id: &str,
     node_secret: &str,
 ) {
@@ -1558,7 +1562,7 @@ async fn persist_credentials(
             "Setup wizard disabled and one-shot token cleared after successful manager registration"
         );
     }
-    if let Err(e) = save_config_split_async(config_path.clone(), secrets_path.clone(), cfg.clone()).await {
+    if let Err(e) = save_config_split_async(config_path.to_path_buf(), secrets_path.to_path_buf(), cfg.clone()).await {
         tracing::warn!("Failed to persist manager credentials: {e}");
     } else {
         tracing::info!("Manager credentials saved (node_secret → {})", secrets_path.display());
@@ -1801,8 +1805,8 @@ async fn handle_manager_message(
     flow_manager: &Arc<FlowManager>,
     tunnel_manager: &Arc<TunnelManager>,
     app_config: &Arc<RwLock<AppConfig>>,
-    config_path: &PathBuf,
-    secrets_path: &PathBuf,
+    config_path: &Path,
+    secrets_path: &Path,
     webrtc_sessions: &WebrtcRegistry,
     out_tx: &mpsc::Sender<String>,
 ) {
@@ -1980,8 +1984,8 @@ async fn execute_command(
     flow_manager: &Arc<FlowManager>,
     tunnel_manager: &Arc<TunnelManager>,
     app_config: &Arc<RwLock<AppConfig>>,
-    config_path: &PathBuf,
-    secrets_path: &PathBuf,
+    config_path: &Path,
+    secrets_path: &Path,
     _webrtc_sessions: &WebrtcRegistry,
 ) -> Result<Option<serde_json::Value>, CommandError> {
     match action_type {
@@ -3509,7 +3513,7 @@ async fn execute_command(
                 cfg.logging = new_config.logging.clone();
                 cfg.nmos_registration = new_config.nmos_registration.clone();
                 cfg.upgrades = new_config.upgrades.clone();
-                if let Err(e) = save_config_split_async(config_path.clone(), secrets_path.clone(), cfg.clone()).await {
+                if let Err(e) = save_config_split_async(config_path.to_path_buf(), secrets_path.to_path_buf(), cfg.clone()).await {
                     tracing::error!("Failed to persist config after manager command: {e}");
                     tunnel_manager.event_sender().emit(
                         EventSeverity::Warning,
@@ -4048,7 +4052,7 @@ async fn execute_command(
                 cfg.flow_groups.retain(|g| g.id != group.id);
                 return Err(format!("Invalid flow group: {e}").into());
             }
-            if let Err(e) = save_config_split_async(config_path.clone(), secrets_path.clone(), cfg.clone()).await {
+            if let Err(e) = save_config_split_async(config_path.to_path_buf(), secrets_path.to_path_buf(), cfg.clone()).await {
                 tracing::warn!("Failed to persist config after add_flow_group: {e}");
                 tunnel_manager.event_sender().emit(
                     EventSeverity::Warning,
@@ -4084,7 +4088,7 @@ async fn execute_command(
                 cfg.flow_groups[idx] = old;
                 return Err(format!("Invalid flow group update: {e}").into());
             }
-            if let Err(e) = save_config_split_async(config_path.clone(), secrets_path.clone(), cfg.clone()).await {
+            if let Err(e) = save_config_split_async(config_path.to_path_buf(), secrets_path.to_path_buf(), cfg.clone()).await {
                 tracing::warn!("Failed to persist config after update_flow_group: {e}");
                 tunnel_manager.event_sender().emit(
                     EventSeverity::Warning,
@@ -4127,7 +4131,7 @@ async fn execute_command(
             if cfg.flow_groups.len() == before {
                 return Err(format!("Flow group '{target_id}' not found").into());
             }
-            if let Err(e) = save_config_split_async(config_path.clone(), secrets_path.clone(), cfg.clone()).await {
+            if let Err(e) = save_config_split_async(config_path.to_path_buf(), secrets_path.to_path_buf(), cfg.clone()).await {
                 tracing::warn!("Failed to persist config after remove_flow_group: {e}");
                 tunnel_manager.event_sender().emit(
                     EventSeverity::Warning,
@@ -4172,7 +4176,7 @@ async fn execute_command(
                 }
                 return Err(format!("Invalid essence flow add: {e}").into());
             }
-            if let Err(e) = save_config_split_async(config_path.clone(), secrets_path.clone(), cfg.clone()).await {
+            if let Err(e) = save_config_split_async(config_path.to_path_buf(), secrets_path.to_path_buf(), cfg.clone()).await {
                 tracing::warn!("Failed to persist config after add_essence_flow: {e}");
                 tunnel_manager.event_sender().emit(
                     EventSeverity::Warning,
@@ -4225,7 +4229,7 @@ async fn execute_command(
                 }
                 return Err(format!("Invalid essence flow remove: {e}").into());
             }
-            if let Err(e) = save_config_split_async(config_path.clone(), secrets_path.clone(), cfg.clone()).await {
+            if let Err(e) = save_config_split_async(config_path.to_path_buf(), secrets_path.to_path_buf(), cfg.clone()).await {
                 tracing::warn!("Failed to persist config after remove_essence_flow: {e}");
                 tunnel_manager.event_sender().emit(
                     EventSeverity::Warning,
@@ -6238,10 +6242,11 @@ mod config_diff_live_flow_tests {
     }
 
     fn config(inputs: Vec<InputDefinition>, ids: &[&str]) -> AppConfig {
-        let mut cfg = AppConfig::default();
-        cfg.inputs = inputs;
-        cfg.flows = vec![flow_with(ids)];
-        cfg
+        AppConfig {
+            inputs,
+            flows: vec![flow_with(ids)],
+            ..Default::default()
+        }
     }
 
     async fn start(fm: &Arc<FlowManager>, cfg: &AppConfig) {
@@ -6375,8 +6380,7 @@ mod forced_active_writeback_tests {
     use super::{apply_forced_active, AppConfig};
 
     fn config(members: &[(&str, bool)]) -> AppConfig {
-        let mut cfg = AppConfig::default();
-        cfg.inputs = members
+        let inputs = members
             .iter()
             .map(|(id, active)| {
                 serde_json::from_value(serde_json::json!({
@@ -6386,15 +6390,18 @@ mod forced_active_writeback_tests {
                 .expect("input fixture")
             })
             .collect();
-        cfg.flows = vec![
-            serde_json::from_value(serde_json::json!({
-                "id": "f1", "name": "f1",
-                "input_ids": members.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
-                "output_ids": [],
-            }))
-            .expect("flow fixture"),
-        ];
-        cfg
+        AppConfig {
+            inputs,
+            flows: vec![
+                serde_json::from_value(serde_json::json!({
+                    "id": "f1", "name": "f1",
+                    "input_ids": members.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+                    "output_ids": [],
+                }))
+                .expect("flow fixture"),
+            ],
+            ..Default::default()
+        }
     }
 
     fn active_ids(cfg: &AppConfig) -> Vec<&str> {
@@ -7184,11 +7191,11 @@ async fn diff_outputs_inner(
 /// this way; this brings the manager-WS path to parity.
 async fn persist_config(
     config: &AppConfig,
-    config_path: &PathBuf,
-    secrets_path: &PathBuf,
+    config_path: &Path,
+    secrets_path: &Path,
 ) -> Result<(), CommandError> {
     if let Err(e) =
-        save_config_split_async(config_path.clone(), secrets_path.clone(), config.clone()).await
+        save_config_split_async(config_path.to_path_buf(), secrets_path.to_path_buf(), config.clone()).await
     {
         tracing::error!("Failed to persist config after manager command: {e}");
         return Err(CommandError::with_code(

@@ -217,7 +217,7 @@ impl TimecodeTracker {
                 .frame_rate
                 .map(|f| f.ceil() as u32)
                 .unwrap_or(MAX_FRAMES_FALLBACK);
-            if n_frames as u32 >= max_frames {
+            if n_frames >= max_frames {
                 return;
             }
             let (mut seconds_value, mut minutes_value, mut hours_value) = (0u32, 0u32, 0u32);

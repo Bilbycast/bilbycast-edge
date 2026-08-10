@@ -968,7 +968,7 @@ async fn run_controlled(
         let active = sm.active_index();
         let cfg_idx = order[active];
         let source = &config.sources[cfg_idx];
-        let gap_signal = if transcoder.is_some() { Some(&*pcr_jump_signal) } else { None };
+        let gap_signal = if transcoder.is_some() { Some(pcr_jump_signal) } else { None };
         media_stats.current_source_index.store(cfg_idx as u64, Ordering::Relaxed);
         media_stats.generation.store(sm.generation(), Ordering::Relaxed);
         media_stats.state.store(media_player_state::STARTING, Ordering::Relaxed);
@@ -1069,7 +1069,7 @@ async fn run_controlled(
             let _ = play_fut.as_mut().await;
             let cr = sm.commit();
             media_stats.generation.store(cr.new_generation, Ordering::Relaxed);
-            reshuffle_on_wrap(&config, &mut order, &cr);
+            reshuffle_on_wrap(config, &mut order, &cr);
             emit_transition_completed(events, flow_id, input_id, &cr);
             sm.settle_playing();
             continue;
@@ -1116,7 +1116,7 @@ async fn run_controlled(
                 if sm.on_current_exhausted() {
                     let cr = sm.commit();
                     media_stats.generation.store(cr.new_generation, Ordering::Relaxed);
-                    reshuffle_on_wrap(&config, &mut order, &cr);
+                    reshuffle_on_wrap(config, &mut order, &cr);
                     sm.settle_playing();
                 }
             }
@@ -3195,7 +3195,7 @@ mod ts_pacing_tests {
         let generous_lead_ns = 16 * 10_000_000u64; // 16 bundles @ 10 ms
         assert!(MAX_DEADLINE_LATENESS_NS > generous_lead_ns);
         assert!(MAX_DEADLINE_LOOKAHEAD_NS > generous_lead_ns);
-        assert!(MAX_DEADLINE_LOOKAHEAD_NS < 2_000_000_000);
+        const { assert!(MAX_DEADLINE_LOOKAHEAD_NS < 2_000_000_000) };
     }
 
     /// A PCR step is judged against the previous PCR, not the epoch. This
@@ -3737,7 +3737,7 @@ mod tests {
                 ts188.extend_from_slice(&pkt);
             }
         }
-        assert!(ts188.len() % TS_PACKET == 0);
+        assert!(ts188.len().is_multiple_of(TS_PACKET));
 
         // Wrap into 204-byte packets: TS188 + 16 bytes of synthetic parity.
         let mut ts204: Vec<u8> = Vec::with_capacity(ts188.len() / 188 * 204);
@@ -3917,8 +3917,10 @@ mod tests {
 
     #[test]
     fn update_layout_wraps_pmt_version_at_5_bits() {
-        let mut cont = SpliceContinuity::default();
-        cont.pmt_version = 31;
+        let mut cont = SpliceContinuity {
+            pmt_version: 31,
+            ..Default::default()
+        };
         let l1 = StreamLayout {
             video_pid: Some(0x100),
             video_stream_type: Some(0x1B),
@@ -3968,7 +3970,7 @@ mod tests {
                 bytes.extend_from_slice(&pkt);
             }
         }
-        assert!(bytes.len() % TS_PACKET == 0, "fixture must be 188-aligned");
+        assert!(bytes.len().is_multiple_of(TS_PACKET), "fixture must be 188-aligned");
 
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("loop-fixture.ts");
@@ -4038,11 +4040,8 @@ mod tests {
         // ── Drain bundles and validate on-wire structure ──────────────
         drop(tx); // close so try_recv eventually returns Closed
         let mut bundles: Vec<RtpPacket> = Vec::new();
-        loop {
-            match rx.try_recv() {
-                Ok(pkt) => bundles.push(pkt),
-                Err(_) => break,
-            }
+        while let Ok(pkt) = rx.try_recv() {
+            bundles.push(pkt);
         }
         assert!(
             !bundles.is_empty(),

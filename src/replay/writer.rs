@@ -567,7 +567,7 @@ impl WriterState {
             return Ok(());
         }
         let ts = strip_rtp_if_present(buf);
-        if ts.is_empty() || ts.len() % TS_PACKET != 0 {
+        if ts.is_empty() || !ts.len().is_multiple_of(TS_PACKET) {
             // Mis-sized or non-TS payload — don't poison the segment.
             // Audio-only PCM flows would land here; recording is a no-op
             // for them in Phase 1.
@@ -634,7 +634,7 @@ impl WriterState {
                     let flags = af[0];
                     random_access = (flags & 0x40) != 0;
                     let pcr_flag = (flags & 0x10) != 0;
-                    if pcr_flag && af.len() >= 1 + 6 {
+                    if pcr_flag && af.len() > 6 {
                         // PCR is 33-bit base * 300 + 9-bit extension.
                         let base: u64 = ((af[1] as u64) << 25)
                             | ((af[2] as u64) << 17)
@@ -1138,7 +1138,7 @@ fn unpack_smpte_tc(packed: u32) -> String {
 /// not flagged in Phase 1.
 fn smpte_tc_packed(snap: Option<&crate::stats::models::TimecodeStats>) -> Option<u32> {
     let s = snap?.last.as_ref()?;
-    let parts: Vec<&str> = s.split(|c: char| c == ':' || c == ';').collect();
+    let parts: Vec<&str> = s.split([':', ';']).collect();
     if parts.len() != 4 {
         return None;
     }

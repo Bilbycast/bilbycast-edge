@@ -463,8 +463,7 @@ impl MeterPidState {
             let channel_config = ((buf[2] & 0x01) << 2) | ((buf[3] >> 6) & 0x03);
 
             if self.aac_decoder.is_none()
-                && channel_config >= 1
-                && channel_config <= 7
+                && (1..=7).contains(&channel_config)
                 && let Ok(dec) = AacDecoder::from_adts_config(profile, sr_index, channel_config)
             {
                 self.aac_decoder = Some(dec);

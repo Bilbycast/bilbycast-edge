@@ -658,7 +658,7 @@ async fn bonded_output_run(
             for (i, p) in config.paths.iter().enumerate() {
                 let leg_key = match leg_keys
                     .get(i)
-                    .and_then(|k| super::bond_leg_broker::leg_key_from_probe(k))
+                    .and_then(super::bond_leg_broker::leg_key_from_probe)
                 {
                     Some(k) => k,
                     None => continue,
@@ -973,7 +973,7 @@ async fn bonded_output_run(
                     };
 
                     if remapped.len() > chunk_bytes
-                        && remapped.len() % TS_PACKET_SIZE == 0
+                        && remapped.len().is_multiple_of(TS_PACKET_SIZE)
                     {
                         // Re-chunk oversized TS payloads at TS-packet
                         // boundaries so every bond datagram — header, AEAD

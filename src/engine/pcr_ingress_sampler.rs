@@ -492,10 +492,7 @@ fn sample_packet(master: &SourcePcrPllMaster, pkt: &RtpPacket) -> Option<u64> {
     };
 
     // Find the first TS sync byte and walk in 188-byte strides.
-    let mut i = match payload.iter().position(|&b| b == TS_SYNC_BYTE) {
-        Some(p) => p,
-        None => return None,
-    };
+    let mut i = payload.iter().position(|&b| b == TS_SYNC_BYTE)?;
     let mut latest_pcr: Option<u64> = None;
     while i + TS_PACKET_SIZE <= payload.len() {
         let ts_pkt = &payload[i..i + TS_PACKET_SIZE];

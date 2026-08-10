@@ -81,7 +81,7 @@ pub async fn enumerate(replay_root: &Path) -> Vec<RecordingSummary> {
         let summary = summarize_recording(&name, &path).await;
         out.push(summary);
     }
-    out.sort_by(|a, b| b.last_modified_unix.cmp(&a.last_modified_unix));
+    out.sort_by_key(|r| std::cmp::Reverse(r.last_modified_unix));
     out
 }
 

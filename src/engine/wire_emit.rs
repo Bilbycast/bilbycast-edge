@@ -1604,7 +1604,7 @@ impl TargetState {
         self.bytes_since_anchor = self.bytes_since_anchor.saturating_add(datagram_bytes as u64);
 
         let nominal = self.observed_rate_bps;
-        let cushion_ns = (cfg.setpoint_ms.max(1) as u64).saturating_mul(1_000_000);
+        let cushion_ns = cfg.setpoint_ms.max(1).saturating_mul(1_000_000);
 
         if cfg.seed_cushion {
             // ── De-jitter mode (OPT-IN via egress_buffer_ms) ──────────────
@@ -3009,9 +3009,11 @@ mod tests {
         // anchor (counts as 1), then we drop 100 → 32 = 68 more = 69 total,
         // leaving exactly `floor` in the channel.
         let (tx, rx) = filled_wire_channel(100);
-        let mut state = TargetState::default();
         // Simulate a runaway: pacing anchored far in the future.
-        state.initialised = true;
+        let mut state = TargetState {
+            initialised: true,
+            ..Default::default()
+        };
         state.pcr_anchor = Some(123_456);
         state.bytes_since_anchor = 9_999;
         state.last_returned_ns = 50_000_000_000;
@@ -3093,12 +3095,13 @@ mod tests {
     /// A warmed servo state: rate already recovered, leaky-bucket cursor at
     /// `last_returned_ns`. Mirrors steady-state after a few inter-PCR pairs.
     fn warmed_servo_state(rate_bps: u64, last_returned_ns: u64) -> TargetState {
-        let mut s = TargetState::default();
-        s.observed_rate_bps = rate_bps;
-        s.initialised = true;
-        s.pcr_anchor = Some(1_000_000);
-        s.last_returned_ns = last_returned_ns;
-        s
+        TargetState {
+            observed_rate_bps: rate_bps,
+            initialised: true,
+            pcr_anchor: Some(1_000_000),
+            last_returned_ns,
+            ..Default::default()
+        }
     }
 
     #[test]

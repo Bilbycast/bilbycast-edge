@@ -145,7 +145,7 @@ pub fn unix_ns_from_pcr_27mhz(pcr_27mhz: u64, near_unix_ns: u128) -> u128 {
     // after `near_ticks` did). Pick the nearest.
     let prev = candidate.saturating_sub(modulus);
     let next = candidate + modulus;
-    let dist = |a: u128| if a > near_ticks { a - near_ticks } else { near_ticks - a };
+    let dist = |a: u128| a.abs_diff(near_ticks);
 
     let mut best = candidate;
     let mut best_dist = dist(candidate);
@@ -422,7 +422,7 @@ impl EpochAnchorCell {
         }
         for _ in 0..4 {
             let before = self.seq.load(Acquire);
-            if before % 2 != 0 {
+            if !before.is_multiple_of(2) {
                 continue;
             }
             let a = SourceAnchor {

@@ -135,7 +135,7 @@ async fn run_inner(
         transcoder.as_mut(),
         config.audio_encode.as_ref(),
         config.video_encode.as_ref(),
-        &events,
+        events,
     );
     // Synthetic-TS — TsMuxer handles pid_overrides. No `passthrough_clock`
     // on TestPatternInputConfig: the pattern generator already controls
@@ -539,7 +539,7 @@ fn build_smpte_bars_yuv420p(width: u32, height: u32) -> (Vec<u8>, Vec<u8>, Vec<u
     let h = height as usize;
     let cw = w / 2;
     let ch = h / 2;
-    let bar_w = (w + 7) / 8;
+    let bar_w = w.div_ceil(8);
 
     let mut y = vec![16u8; w * h];
     let mut u = vec![128u8; cw * ch];
@@ -1104,7 +1104,7 @@ fn render_counted_beeps(digit: usize, sample_rate: usize, amplitude: f32) -> Vec
             out.push(((2.0 * std::f64::consts::PI * freq * t).sin() * env) as f32 * amplitude);
         }
         if b + 1 < digit {
-            out.extend(std::iter::repeat(0.0f32).take(gap_n));
+            out.extend(std::iter::repeat_n(0.0f32, gap_n));
         }
     }
     out

@@ -195,8 +195,7 @@ pub fn send_with_txtime(
     unsafe {
         let cmsg = libc::CMSG_FIRSTHDR(&msg);
         if cmsg.is_null() {
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
+            return Err(io::Error::other(
                 "CMSG_FIRSTHDR returned null",
             ));
         }
@@ -463,9 +462,9 @@ fn sockaddr_for(addr: &SocketAddr) -> (*mut libc::c_void, libc::socklen_t) {
     // safe because syscalls are synchronous within a thread.
     thread_local! {
         static SA_V4: std::cell::UnsafeCell<libc::sockaddr_in> =
-            std::cell::UnsafeCell::new(unsafe { std::mem::zeroed() });
+            const { std::cell::UnsafeCell::new(unsafe { std::mem::zeroed() }) };
         static SA_V6: std::cell::UnsafeCell<libc::sockaddr_in6> =
-            std::cell::UnsafeCell::new(unsafe { std::mem::zeroed() });
+            const { std::cell::UnsafeCell::new(unsafe { std::mem::zeroed() }) };
     }
     match addr {
         SocketAddr::V4(v4) => SA_V4.with(|cell| {

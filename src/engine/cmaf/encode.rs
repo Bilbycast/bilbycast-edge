@@ -533,14 +533,13 @@ fn split_annex_b_to_nalus(data: &[u8], out: &mut Vec<Vec<u8>>) {
         let end = if k + 1 < starts.len() {
             // Back up over the start code preamble of the next NAL.
             let next_start = starts[k + 1];
-            let pre = if next_start >= 4 && &data[next_start - 4..next_start] == [0, 0, 0, 1] {
+            if next_start >= 4 && data[next_start - 4..next_start] == [0, 0, 0, 1] {
                 next_start - 4
-            } else if next_start >= 3 && &data[next_start - 3..next_start] == [0, 0, 1] {
+            } else if next_start >= 3 && data[next_start - 3..next_start] == [0, 0, 1] {
                 next_start - 3
             } else {
                 next_start
-            };
-            pre
+            }
         } else {
             data.len()
         };

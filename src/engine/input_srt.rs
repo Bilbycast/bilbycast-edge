@@ -1061,7 +1061,7 @@ async fn srt_input_redundant_loop(
                             let data = pkt.data;
                             if format == SrtPayloadFormat::Unknown {
                                 format = detect_format(&data);
-                                log_detected_format_redundant(format, &events, flow_id);
+                                log_detected_format_redundant(format, events, flow_id);
                             }
                             process_redundant_packet(
                                 data,
@@ -1098,7 +1098,7 @@ async fn srt_input_redundant_loop(
                             let data = pkt.data;
                             if format == SrtPayloadFormat::Unknown {
                                 format = detect_format(&data);
-                                log_detected_format_redundant(format, &events, flow_id);
+                                log_detected_format_redundant(format, events, flow_id);
                             }
                             process_redundant_packet(
                                 data,

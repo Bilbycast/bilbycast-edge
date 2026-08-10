@@ -374,7 +374,7 @@ fn build_synth(
         // Default to matching the input shape when the operator left
         // `audio_encode.channels` / `audio_encode.bit_depth` unset; the
         // pipeline promotes as needed.
-        let out_channels = ae.channels.unwrap_or_else(|| {
+        let out_channels = ae.channels.unwrap_or({
             // 302M requires 2/4/6/8 — round mono up to stereo; cap >8 at 8.
             match input_fmt.channels {
                 1 => 2,
@@ -534,7 +534,7 @@ impl AacSynth {
             }
         }
         let payload = &data[header_len..];
-        if payload.is_empty() || payload.len() % self.frame_size != 0 {
+        if payload.is_empty() || !payload.len().is_multiple_of(self.frame_size) {
             return Vec::new();
         }
 

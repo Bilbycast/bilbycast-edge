@@ -255,7 +255,7 @@ pub fn gc_versions(install_root: &Path, current_version: &str, keep: usize) -> R
 
     // Sort newest first, drop everything past `keep` entries.
     let mut sorted = entries;
-    sorted.sort_by(|a, b| b.1.cmp(&a.1));
+    sorted.sort_by_key(|e| std::cmp::Reverse(e.1));
     for (path, _) in sorted.into_iter().skip(keep) {
         let _ = fs::remove_dir_all(&path);
     }

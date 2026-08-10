@@ -969,7 +969,7 @@ impl FlowRuntime {
             event_sender.clone(),
             cancel_token.child_token(),
         );
-        let analyzer_handle = if active_input_cfg.map_or(false, |i| i.is_ts_carrier()) {
+        let analyzer_handle = if active_input_cfg.is_some_and(|i| i.is_ts_carrier()) {
             spawn_tr101290_analyzer(
                 &broadcast_tx,
                 tr101290_acc,
@@ -999,8 +999,10 @@ impl FlowRuntime {
         // Media analysis is always keyed on the currently active input —
         // passive inputs don't reach the broadcast channel, so the analyzer
         // would only see silence from them.
-        let media_analysis_handle = if config.config.media_analysis && active_input_cfg.is_some() {
-            let m = media_analysis_metadata(active_input_cfg.expect("checked by is_some() guard"));
+        let media_analysis_handle = if config.config.media_analysis
+            && let Some(active_cfg) = active_input_cfg
+        {
+            let m = media_analysis_metadata(active_cfg);
             let media_acc = Arc::new(MediaAnalysisAccumulator::new(
                 m.protocol,
                 m.payload_format,
@@ -1055,7 +1057,7 @@ impl FlowRuntime {
         // will happen so the wire shape carries the tier-drop counters +
         // UI can render "analysing…" even before the first sample lands.
         let content_cfg = config.config.effective_content_analysis();
-        let ts_carrier = active_input_cfg.map_or(false, |i| i.is_ts_carrier());
+        let ts_carrier = active_input_cfg.is_some_and(|i| i.is_ts_carrier());
         let audio_full_mode = active_input_cfg.and_then(|i| derive_audio_full_mode(i, ts_carrier));
         let lite_eligible = content_cfg.lite && ts_carrier;
         let audio_full_eligible = content_cfg.audio_full && audio_full_mode.is_some();
@@ -1267,7 +1269,7 @@ impl FlowRuntime {
         let input_audio_format = active_input_cfg
             .and_then(crate::engine::audio_transcode::InputFormat::from_input_config);
         let compressed_audio_input = active_input_cfg
-            .map_or(false, crate::engine::audio_decode::input_can_carry_ts_audio);
+            .is_some_and(crate::engine::audio_decode::input_can_carry_ts_audio);
         // Any bonded input in the flow's set (not just the active one)
         // flips UDP/RTP outputs with unset `egress_pacing` to `pcr`.
         let flow_has_bonded_input = config
@@ -2754,7 +2756,7 @@ impl FlowRuntime {
         let input_audio_format = active_input_cfg
             .and_then(crate::engine::audio_transcode::InputFormat::from_input_config);
         let compressed_audio_input = active_input_cfg
-            .map_or(false, crate::engine::audio_decode::input_can_carry_ts_audio);
+            .is_some_and(crate::engine::audio_decode::input_can_carry_ts_audio);
         // Honour hot-added inputs: any bonded member of the live input
         // set drives the unset-`egress_pacing` → `pcr` auto-resolution.
         let flow_has_bonded_input = {
@@ -3203,7 +3205,7 @@ impl FlowRuntime {
         // appears in telemetry.
         let clock_source =
             crate::engine::master_clock::resolve_pcr_source_input_id(&self.config.config);
-        if clock_source.as_deref() == Some(input_id) {
+        if clock_source == Some(input_id) {
             self.event_sender.emit_flow_with_details(
                 EventSeverity::Warning,
                 category::FLOW,
@@ -6061,7 +6063,7 @@ fn derive_cost_plan(flow: &ResolvedFlow) -> crate::engine::hardware_probe::FlowC
                 // explicit resolution default to 1080p (probe
                 // baseline). VideoToolbox is intentionally excluded
                 // — macOS doesn't expose a 4K probe today.
-                let is_4k = w.map_or(false, |w| w >= 3840) || h.map_or(false, |h| h >= 2160);
+                let is_4k = w.is_some_and(|w| w >= 3840) || h.is_some_and(|h| h >= 2160);
                 match hw_family {
                     Some(crate::engine::hardware_probe::HwEncoderFamily::Nvenc) => {
                         plan.nvenc_sessions = plan.nvenc_sessions.saturating_add(1);
@@ -6215,8 +6217,8 @@ fn derive_cost_plan(flow: &ResolvedFlow) -> crate::engine::hardware_probe::FlowC
             if is_hw {
                 plan.hw_video_encode_units =
                     plan.hw_video_encode_units.saturating_add(units);
-                let is_4k = w.map_or(false, |w| w >= 3840)
-                    || h.map_or(false, |h| h >= 2160);
+                let is_4k = w.is_some_and(|w| w >= 3840)
+                    || h.is_some_and(|h| h >= 2160);
                 match hw_family {
                     Some(crate::engine::hardware_probe::HwEncoderFamily::Nvenc) => {
                         plan.nvenc_sessions = plan.nvenc_sessions.saturating_add(1);
@@ -6329,7 +6331,7 @@ fn output_resource_contribution(
         // `video_engine::PROBE_WIDTH_4K` (3840) / `PROBE_HEIGHT_4K`
         // (2160). Outputs without an explicit resolution stay 1080p.
         let (w, h) = output_video_encode_dims(output);
-        let is_4k = w.map_or(false, |w| w >= 3840) || h.map_or(false, |h| h >= 2160);
+        let is_4k = w.is_some_and(|w| w >= 3840) || h.is_some_and(|h| h >= 2160);
         // Resolve the encoder backend the runtime will actually pick, the
         // same way `derive_cost_plan` does — string classify returns None
         // for `*_auto` codecs and would mis-cost them as software, so

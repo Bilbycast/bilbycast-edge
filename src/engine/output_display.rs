@@ -448,7 +448,7 @@ async fn run_display_output(
                                 }),
                             );
                             emitted_critical = true;
-                        } else if attempt % 60 == 0 {
+                        } else if attempt.is_multiple_of(60) {
                             // Throttled progress log every ~30 s so an
                             // operator who left the wait running sees that
                             // we're still trying, without spamming the event
@@ -1378,7 +1378,7 @@ fn demux_decode_loop(
                                     let sr = decoder.sample_rate().unwrap_or(48_000);
                                     let ch = decoder.channels().unwrap_or(2);
                                     if let Some(h) = output_stats.audio_decode_stats_handle() {
-                                        h.set_output_shape(sr, ch as u8);
+                                        h.set_output_shape(sr, ch);
                                     }
                                     if atx.try_send(AudioBlock {
                                         planar: decoded.planar,
@@ -1443,7 +1443,7 @@ fn demux_decode_loop(
                                     if let Some(h) = output_stats.audio_decode_stats_handle() {
                                         h.set_output_shape(
                                             decoded.sample_rate,
-                                            decoded.channels as u8,
+                                            decoded.channels,
                                         );
                                     }
                                     let frame_pts = if decoded.sample_rate > 0 {
@@ -1598,7 +1598,7 @@ fn demux_decode_loop(
                                     if let Some(h) = output_stats.audio_decode_stats_handle() {
                                         h.set_output_shape(
                                             decoded.sample_rate,
-                                            decoded.channels as u8,
+                                            decoded.channels,
                                         );
                                     }
                                     let frame_pts = if decoded.sample_rate > 0 {
@@ -2137,7 +2137,7 @@ fn open_video_decoder_with_retry(
     // Falls through to the HW path if the CPU open itself fails (then the
     // normal retry+demote handles it).
     if mpeg2_pin_active(codec, state.backend, state.mpeg2_cpu_pinned, state.mpeg2_cpu_override) {
-        if let Some(d) = VideoDecoder::open_with_backend(codec, DecoderBackend::Cpu).ok() {
+        if let Ok(d) = VideoDecoder::open_with_backend(codec, DecoderBackend::Cpu) {
             // MPEG-2 on CPU while `state.backend` stays HW for other
             // codecs — plain `Cpu`, not a failure. This is the report
             // that used to lie as `vaapi-zerocopy`/`rkmpp-zerocopy`.
@@ -2723,8 +2723,6 @@ fn force_cpu_fallback(
 /// H265 arms in `demux_decode_loop` stay one-line dispatches and every
 /// piece of book-keeping (pts_jump flush, decoder ensure, send,
 /// drain, watchdog) lives in lock-step in one place.
-#[allow(clippy::too_many_arguments)]
-#[allow(clippy::too_many_arguments)]
 fn handle_video_au(
     nalus: &[Vec<u8>],
     pts: u64,
@@ -3377,8 +3375,8 @@ fn drain_video_frames(
                 VideoCodec::Mpeg2 => "mpeg2",
             };
             h.set_input_codec(codec_label);
-            let w = frame.width() as u32;
-            let hght = frame.height() as u32;
+            let w = frame.width();
+            let hght = frame.height();
             if h.output_width.load(Ordering::Relaxed) != w
                 || h.output_height.load(Ordering::Relaxed) != hght
             {
@@ -4700,7 +4698,7 @@ fn display_loop(
             // Audio muted — pace on wall-clock seeded by the first frame.
             let now = Instant::now();
             let (anchor_pts, anchor_at) =
-                wall_anchor.get_or_insert_with(|| (next.pts_90k, now));
+                wall_anchor.get_or_insert((next.pts_90k, now));
             let pts_delta_ms = (next.pts_90k.wrapping_sub(*anchor_pts) as i64) / 90;
             let wall_delta_ms = now.duration_since(*anchor_at).as_millis() as i64;
             let drift_ms = pts_delta_ms - wall_delta_ms;
@@ -5367,6 +5365,9 @@ fn blit_and_present(
         );
     }
 
+    // Ends the mutable borrow early rather than running a destructor —
+    // DumbBufferMap has no Drop impl, which is what the lint objects to.
+    #[allow(clippy::drop_non_drop)]
     drop(map);
 
     // Refresh the overlay-plane bars buffer so the next atomic commit
@@ -5633,9 +5634,10 @@ fn classify_kms_error(msg: &str) -> &'static str {
         "display_master_busy"
     } else if msg.contains("display_mode_set_failed") {
         "display_mode_set_failed"
-    } else if msg.contains("display_device_invalid") {
-        "display_device_invalid"
     } else {
+        // Also the explicit display_device_invalid case — it and the
+        // unrecognised-error fallback deliberately report the same code, so
+        // matching on it separately gained nothing.
         "display_device_invalid"
     }
 }

@@ -945,7 +945,7 @@ async fn main() -> anyhow::Result<()> {
                 let std_listener = build_std_tcp_listener(*bind_addr).map_err(|e| {
                     crate::util::port_error::annotate_bind_error(
                         e,
-                        &bind_addr.to_string(),
+                        bind_addr.to_string(),
                         "Edge API server (HTTPS)",
                     )
                 })?;
@@ -1138,7 +1138,7 @@ async fn run_multi_listener_plain(
         let listener = build_tokio_tcp_listener(*bind_addr).map_err(|e| {
             crate::util::port_error::annotate_bind_error(
                 e,
-                &bind_addr.to_string(),
+                bind_addr.to_string(),
                 "Edge API server",
             )
         })?;

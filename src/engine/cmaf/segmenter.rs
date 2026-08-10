@@ -499,7 +499,7 @@ mod tests {
         let a = AudioTrack::aac([0x11, 0x90], 48000, 2, 128_000);
         let mut s = AudioSegmenter::new(a, 2.0);
         for i in 0..10 {
-            s.push(&vec![0xFF; 100], (i * 1920) as u64);
+            s.push(&[0xFF; 100], (i * 1920) as u64);
         }
         let result = s.take_pending_samples(20_000);
         assert!(result.is_some());

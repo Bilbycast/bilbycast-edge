@@ -63,7 +63,7 @@ impl DisplayKind {
         match t {
             11 | 12 => Self::Hdmi,
             10 | 14 => Self::DisplayPort,
-            2 | 3 | 4 => Self::Dvi,
+            2..=4 => Self::Dvi,
             1 => Self::Vga,
             5 => Self::Composite,
             _ => Self::Other,

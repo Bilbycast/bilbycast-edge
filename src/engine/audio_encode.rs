@@ -1312,7 +1312,7 @@ impl FramerState {
             let b4 = self.leftover[4] as usize;
             let b5 = self.leftover[5] as usize;
             let frame_len = ((b3 & 0x03) << 11) | (b4 << 3) | (b5 >> 5);
-            if frame_len < 7 || frame_len > 8191 {
+            if !(7..=8191).contains(&frame_len) {
                 // Bogus length — skip one byte and resync.
                 let _ = self.leftover.split_to(1);
                 continue;
@@ -1476,7 +1476,7 @@ impl FramerState {
                 continue;
             }
             // Layer II frame size (bytes) = (144 * bitrate / sample_rate) + padding.
-            let frame_len = (144 * bitrate_kbps * 1000 / sample_rate as u32) as usize + padding;
+            let frame_len = (144 * bitrate_kbps * 1000 / sample_rate) as usize + padding;
             if frame_len < 4 || self.leftover.len() < frame_len {
                 if frame_len < 4 {
                     let _ = self.leftover.split_to(1);
@@ -1576,7 +1576,7 @@ fn mp2_bitrate_kbps(version_id: u8, br_idx: u8) -> u32 {
 
 /// MP2 sample rate table (Hz). Returns 0 for invalid combinations.
 fn mp2_sample_rate_hz(version_id: u8, sr_idx: u8) -> u32 {
-    let base = match (version_id, sr_idx) {
+    match (version_id, sr_idx) {
         (0b11, 0) => 44_100,
         (0b11, 1) => 48_000,
         (0b11, 2) => 32_000,
@@ -1587,8 +1587,7 @@ fn mp2_sample_rate_hz(version_id: u8, sr_idx: u8) -> u32 {
         (0b00, 1) => 12_000,
         (0b00, 2) => 8_000,
         _ => 0,
-    };
-    base
+    }
 }
 
 /// AC-3 frame size lookup (16-bit words). `fscod`/`frmsizecod` come from
@@ -1962,7 +1961,7 @@ async fn stdin_writer_task(
                     Ok(Ok(())) => {
                         chunks_written += 1;
                         bytes_written += chunk_len as u64;
-                        if chunks_written == 1 || chunks_written % 50 == 0 {
+                        if chunks_written == 1 || chunks_written.is_multiple_of(50) {
                             tracing::debug!(
                                 "audio_encode stdin_writer_task: chunks={chunks_written} bytes={bytes_written}"
                             );
@@ -2038,7 +2037,7 @@ async fn stdout_reader_task(
                             }
                         }
                         total_frames_emitted += n_frames as u64;
-                        if total_frames_emitted == 1 || total_frames_emitted % 50 == 0 {
+                        if total_frames_emitted == 1 || total_frames_emitted.is_multiple_of(50) {
                             tracing::debug!(
                                 "audio_encode stdout_reader_task: bytes={total_bytes_read} frames={total_frames_emitted}"
                             );

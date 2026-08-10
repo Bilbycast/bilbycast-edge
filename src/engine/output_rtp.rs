@@ -521,7 +521,7 @@ async fn rtp_output_loop(
                     }
                 }
             }
-            _ = &mut delay_sleep, if delay_buf.as_ref().map_or(false, |db| db.len() > 0) => {
+            _ = &mut delay_sleep, if delay_buf.as_ref().is_some_and(|db| db.len() > 0) => {
                 let db = delay_buf.as_mut().unwrap();
                 let now = now_us();
                 for packet in db.drain_ready(now) {
@@ -696,7 +696,7 @@ async fn rtp_output_loop(
                 let fec_packets = encoder.process(packet.sequence_number, payload);
                 for fec_pkt in fec_packets {
                     let dg = WireDatagram {
-                        bytes: Bytes::from(fec_pkt),
+                        bytes: fec_pkt,
                         recv_time_us: packet.recv_time_us,
                         enqueue_us: 0,
                         target_tx_time_ns: None,
@@ -981,7 +981,7 @@ async fn rtp_output_redundant_loop(
                     }
                 }
             }
-            _ = &mut delay_sleep, if delay_buf.as_ref().map_or(false, |db| db.len() > 0) => {
+            _ = &mut delay_sleep, if delay_buf.as_ref().is_some_and(|db| db.len() > 0) => {
                 let db = delay_buf.as_mut().unwrap();
                 let now = now_us();
                 for packet in db.drain_ready(now) {
@@ -1094,7 +1094,7 @@ async fn rtp_output_redundant_loop(
 
                 let fec_packets = encoder.process(packet.sequence_number, payload);
                 for fec_pkt in fec_packets {
-                    let bytes = Bytes::from(fec_pkt);
+                    let bytes = fec_pkt;
                     let dg1 = WireDatagram {
                         bytes: bytes.clone(),
                         recv_time_us: packet.recv_time_us,

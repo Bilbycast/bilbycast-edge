@@ -195,7 +195,7 @@ impl HitlessMerger {
             // If the gap is larger than the reorder window, treat it as a
             // stream reset (e.g. publisher restarted with a new ISN). Reset
             // the bitmap and re-anchor.
-            if forward as u16 >= self.window {
+            if forward >= self.window {
                 for w in self.emitted.iter_mut() {
                     *w = 0;
                 }
@@ -822,10 +822,7 @@ impl<T: Clone> BufferedHitlessMerger<T> {
     fn drain_ready(&mut self, now: Instant) -> Vec<(ActiveLeg, T)> {
         let mut out = Vec::new();
         let mut last_emit_leg: Option<ActiveLeg> = None;
-        loop {
-            let Some((&virt, entry)) = self.buffer.iter().next() else {
-                break;
-            };
+        while let Some((&virt, entry)) = self.buffer.iter().next() {
             if now < entry.release_at {
                 break;
             }

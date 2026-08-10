@@ -224,14 +224,14 @@ mod tests {
         let f0_p1 = p.target_for_packet(0, 1);
         assert!(f0_p1 > f0, "packet 1 must be after packet 0");
         let delta = f0_p1 - f0;
-        assert!(delta >= 4_000 && delta <= 5_000, "delta={delta}");
+        assert!((4_000..=5_000).contains(&delta), "delta={delta}");
         // Packet 4319 (last in frame): nearly the next frame boundary.
         let f0_last = p.target_for_packet(0, 4319);
         let next_frame = p.target_for_packet(1, 0);
         assert!(f0_last < next_frame, "last packet of frame must precede frame 1");
         let gap = next_frame - f0_last;
         // Should be ~ (frame_period / packets) gap.
-        assert!(gap >= 4_000 && gap <= 5_000, "gap={gap}");
+        assert!((4_000..=5_000).contains(&gap), "gap={gap}");
     }
 
     /// 4K60 at ~17280 packets/frame: math doesn't overflow at large

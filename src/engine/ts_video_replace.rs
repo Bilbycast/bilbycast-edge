@@ -921,7 +921,7 @@ mod inner {
             if self.external_reset.swap(false, Ordering::Relaxed) {
                 self.reset_source_state("input switched");
             }
-            if input_ts.len() % TS_PACKET_SIZE != 0 {
+            if !input_ts.len().is_multiple_of(TS_PACKET_SIZE) {
                 output.extend_from_slice(input_ts);
                 return;
             }
@@ -1022,11 +1022,11 @@ mod inner {
                         // stream_type, and any source whose PMT pointed
                         // PCR_PID at a separate dedicated PCR PID needs
                         // PCR_PID re-pointed at the rebuilt video PID).
-                        if self.video_pid.is_some() {
+                        if let Some(video_pid) = self.video_pid {
                             let mut rewritten = pkt.to_vec();
                             rewrite_pmt_video_stream_type(
                                 &mut rewritten,
-                                self.video_pid.unwrap(),
+                                video_pid,
                                 self.target_stream_type,
                             );
                             // Stamp the per-replacer monotonic version so
@@ -1275,7 +1275,7 @@ mod inner {
             if let Some(dts) = pes_dts {
                 if let Some(prev_dts) = self.last_input_dts {
                     let delta = dts.wrapping_sub(prev_dts);
-                    if delta >= 90 && delta <= 90_000 {
+                    if (90..=90_000).contains(&delta) {
                         self.pts_step_90k = delta;
                         if !self.source_fps_locked {
                             let fps_num = 90_000u32;
@@ -1939,7 +1939,7 @@ fn packetize_ts(
         // PCR-carrying PUSI start: build adaptation field (8 bytes:
         // 1 length + 1 flags + 6 PCR), then payload fills the rest.
         // af_length = 7 (excludes the length byte itself).
-        if is_first && pcr_27mhz.is_some() {
+        if is_first && let Some(pcr_value) = pcr_27mhz {
             const AF_BYTES_AFTER_LEN: usize = 7; // flags(1) + PCR(6)
             const AF_TOTAL: usize = AF_BYTES_AFTER_LEN + 1; // + length byte
             let payload_capacity = TS_PACKET_SIZE - 4 - AF_TOTAL;
@@ -1954,7 +1954,7 @@ fn packetize_ts(
             // PCR jump as a fault and lock up.
             pkt[5] = if discontinuity { 0x90 } else { 0x10 };
             let mut pcr_buf = [0u8; 6];
-            write_pcr_field(&mut pcr_buf, pcr_27mhz.unwrap());
+            write_pcr_field(&mut pcr_buf, pcr_value);
             pkt[6..12].copy_from_slice(&pcr_buf);
             let take = remaining.min(payload_capacity);
             pkt[4 + AF_TOTAL..4 + AF_TOTAL + take]
