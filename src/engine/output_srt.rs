@@ -82,10 +82,48 @@ async fn srt_send_chunked(socket: &Arc<SrtSocket>, data: &[u8]) -> Result<usize,
     Ok(total)
 }
 
+/// Capacity of the bounded channel between an output's broadcast-subscriber
+/// loop and its `srt-io` send task.
+///
+/// **This is a burst buffer, not a latency budget.** Compressed video is not
+/// delivered at a constant rate: an H.264 IDR access unit routinely runs 3×
+/// the median AU size (measured 123–144 KB against a ~39 KB baseline on live
+/// 1080i50 SDI at 8 Mbps CBR), and the whole AU is pushed into this channel in
+/// one pass. Sizing the queue against the *mean* rate therefore guarantees
+/// periodic overflow on completely ordinary content.
+///
+/// The previous value of 256 slots was ~337 ms at 8 Mbps with 1316-byte
+/// payloads — small enough that a brief drain stall dropped packets, silently,
+/// once per GOP. Hardware-measured on bilby-z440 feeding four SRT outputs:
+/// 2149 discards in 60 s with **zero** broadcast-`Lagged` warnings, i.e. every
+/// one came from `try_send` returning `Full` here. Halving the source's IDR
+/// count (`gop_size` 50 → 100) halved the discards and restoring it restored
+/// them, confirming the IDR burst as the driver rather than a coincidence.
+///
+/// 4096 slots is ~5.4 s / ~5.4 MB per output at that rate — comfortably above
+/// any plausible single-AU burst while staying bounded. This mirrors the fix
+/// already applied one layer down in the libsrt wrapper, where the caller →
+/// `srt-io` channel was raised 256 → 8192 for this same class of stall (see
+/// `srt-transport::socket::SEND_CHANNEL_CAPACITY`); that layer awaits, so it
+/// backpressures, whereas this one drops — which is why it needed the headroom
+/// more, not less.
+const SRT_SEND_QUEUE_CAPACITY: usize = 4096;
+
+/// How often a saturated send queue may log. Discards arrive in bursts of
+/// hundreds, so an unthrottled warning would itself become a load source.
+const SEND_QUEUE_WARN_INTERVAL: Duration = Duration::from_secs(10);
+
 /// `true` when `err` represents a transient Rust-side backpressure condition
 /// on the Tokio → `srt-io` send channel rather than a genuine connection
 /// failure. Callers should **not** tear the connection down on these — drop
 /// the current packet, bump `packets_dropped`, and keep serving.
+///
+/// **Dead on the libsrt backend.** `SrtSocket::send` awaits its bounded channel
+/// and can only fail with `ConnectionLost`; it has not produced `AsyncSend`
+/// since the 2026-04-20 fix. Retained because the pure-Rust `bilbycast-srt`
+/// backend is swappable in via `Cargo.toml` and still surfaces it. Do not read
+/// a zero `packets_dropped` at these call sites as evidence the send path is
+/// healthy — on libsrt the real discard site is the `try_send` below.
 ///
 /// Historically `SrtSocket::send` used `try_send` onto a 256-slot mpsc and
 /// surfaced this error under bursty input (especially SRT + FEC on the send
@@ -721,7 +759,7 @@ async fn srt_output_forward_loop(
     compressed_audio_input: bool,
     frame_rate_rx: Option<tokio::sync::watch::Receiver<Option<f64>>>,
 ) -> anyhow::Result<bool> {
-    let (send_tx, mut send_rx) = tokio::sync::mpsc::channel::<(Bytes, u64)>(256);
+    let (send_tx, mut send_rx) = tokio::sync::mpsc::channel::<(Bytes, u64)>(SRT_SEND_QUEUE_CAPACITY);
     let send_sink = sink.clone();
     let send_stats = stats.clone();
     let output_id = config.id.clone();
@@ -861,6 +899,14 @@ async fn srt_output_forward_loop(
 
     let delay_sleep = tokio::time::sleep(Duration::from_secs(86400));
     tokio::pin!(delay_sleep);
+
+    // Saturation of the send queue below is a silent packet discard — it bumps
+    // a counter and nothing else. That cost real diagnostic time: an operator
+    // seeing macroblocking has no signal distinguishing "this node is dropping
+    // egress packets" from a network or receiver fault, and the broadcast
+    // `Lagged` path (which does log) stays quiet throughout. Warn, throttled.
+    let mut send_queue_dropped: u64 = 0;
+    let mut send_queue_warned_at: Option<Instant> = None;
 
     let connection_lost = loop {
         if let Some(ref db) = delay_buf {
@@ -1104,6 +1150,21 @@ async fn srt_output_forward_loop(
                 Ok(()) => {}
                 Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
                     stats.packets_dropped.fetch_add(1, Ordering::Relaxed);
+                    send_queue_dropped += 1;
+                    let now = Instant::now();
+                    let due = send_queue_warned_at
+                        .is_none_or(|t| now.duration_since(t) >= SEND_QUEUE_WARN_INTERVAL);
+                    if due {
+                        send_queue_warned_at = Some(now);
+                        tracing::warn!(
+                            output_id = %config.id,
+                            dropped_total = send_queue_dropped,
+                            capacity = SRT_SEND_QUEUE_CAPACITY,
+                            "SRT output send queue full — discarding egress packets; \
+                             the srt-io task is not draining fast enough to absorb the \
+                             source's burst (a large IDR access unit is the usual cause)"
+                        );
+                    }
                 }
                 Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
                     tracing::warn!(
@@ -1237,7 +1298,7 @@ async fn srt_output_redundant_loop(
         // on an idle socket.
         let mut rx = broadcast_tx.subscribe();
 
-        let (send_tx_leg1, mut send_rx_leg1) = tokio::sync::mpsc::channel::<(Bytes, u64)>(256);
+        let (send_tx_leg1, mut send_rx_leg1) = tokio::sync::mpsc::channel::<(Bytes, u64)>(SRT_SEND_QUEUE_CAPACITY);
         let send_socket1 = socket_leg1.clone();
         let send_stats1 = stats.clone();
         let output_id1 = config.id.clone();
@@ -1397,7 +1458,7 @@ async fn srt_output_redundant_loop(
                         listener_leg2 = returned_listener;
                     }
                     if let Some(sock2) = sock {
-                        let (tx2, mut rx2) = tokio::sync::mpsc::channel::<(Bytes, u64)>(256);
+                        let (tx2, mut rx2) = tokio::sync::mpsc::channel::<(Bytes, u64)>(SRT_SEND_QUEUE_CAPACITY);
                         let send_socket2 = sock2.clone();
                         let output_id2 = config.id.clone();
                         tokio::spawn(async move {
