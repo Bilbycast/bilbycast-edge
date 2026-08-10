@@ -2727,6 +2727,15 @@ const MIN_BUNDLE_SPACING_NS: u64 = 25_000;
 /// clock step or a producer stall, not of ordinary scheduling jitter.
 const MAX_DEADLINE_LATENESS_NS: u64 = 500_000_000;
 
+/// Ceiling on how fast a behind-schedule deadline stream may drain, as a
+/// multiple of the content's own rate.
+///
+/// The point of a floor here is not to stop the pacer catching up — it must
+/// be able to, or lateness is permanent — but to stop it catching up at
+/// memcpy rate. 2× clears a per-PCR-interval snap-back inside the next
+/// interval while keeping the peak within a receiver's jitter budget.
+const MAX_CATCHUP_FACTOR: u64 = 2;
+
 /// The mirror bound: how far into the future an explicit deadline may sit
 /// before it is treated as a source discontinuity rather than a schedule.
 ///
@@ -2884,10 +2893,28 @@ fn run_paced_emitter(
         // message just left the hand-off queue.
         stats.pacer_queue_depth.fetch_sub(1, Ordering::Relaxed);
 
-        // Two timing modes, selected per-message (a given pacer thread only
-        // ever sees one mode, since play_ts_file and play_demuxed each spawn
-        // their own thread — but branching per message keeps the two paths
-        // sharing one emitter body):
+        // Two timing modes, selected per-message. A TS thread sees BOTH in
+        // sequence — byte-rate until the first PCR, deadlines after — so
+        // nothing may assume one mode per thread.
+        //
+        // The rate is refreshed for both, because the deadline branch needs
+        // it too: its emission floor is derived from the content's own rate,
+        // not from a fixed spacing.
+        if msg.bitrate_bps != 0 {
+            bitrate_bps = msg.bitrate_bps;
+        }
+        let content_bytes = if msg.content_src_bytes != 0 {
+            msg.content_src_bytes
+        } else {
+            BUNDLE_SIZE as u64
+        };
+        // How long this message's content actually lasts on the wire. The
+        // floor below never lets the pacer emit faster than this, so a
+        // backlog drains at the source's own rate instead of at whatever
+        // `MIN_BUNDLE_SPACING_NS` happens to allow.
+        let content_period_ns = content_bytes
+            .saturating_mul(8_000_000_000)
+            / bitrate_bps.max(1);
         let target_ns = if let Some(explicit) = msg.target_ns {
             // ── MP4 sample-anchored mode ──────────────────────────────────
             // The producer computed this deadline from the sample
@@ -2957,7 +2984,31 @@ fn run_paced_emitter(
             } else {
                 shifted
             };
-            let floor = last_emitted_ns.saturating_add(MIN_BUNDLE_SPACING_NS);
+            // Floor at the content's own duration, not at a flat 25 µs.
+            // `MIN_BUNDLE_SPACING_NS` is ~421 Mbps for a 1316-byte bundle,
+            // three orders above any real rate, so it bounds nothing that
+            // matters: measured on a VBR asset it let 18 % of datagrams
+            // leave back-to-back in runs of up to 19, peaking at 40 Mbps in
+            // a 10 ms window against a 3.5 Mbps nominal. The cause is
+            // structural, not exceptional — the rate estimate is a 2 s
+            // window applied to a ~40 ms interpolation, so within every PCR
+            // interval the deadline drifts and then snaps back at the
+            // re-anchor, and each snap leaves a backlog. Draining at the
+            // content rate absorbs it smoothly; the re-base above is what
+            // stops a genuinely large debt from being carried forever.
+            // Halved, so the pacer may run at up to `MAX_CATCHUP_FACTOR` ×
+            // nominal while it is behind. Flooring at exactly nominal is the
+            // obvious thing and is wrong: lateness then becomes permanent —
+            // measured, the schedule accreted ~500 ms every ~10 s on a VBR
+            // asset (the rate estimate is a trailing window, so the floor
+            // spaces slightly wider than the source's true instantaneous
+            // rate) and could only ever shed it by re-basing, which means
+            // playout runs slow between re-bases. A bounded catch-up absorbs
+            // both that and the per-interval snap-back without ever
+            // approaching the memcpy rate the flat floor allowed.
+            let floor = last_emitted_ns.saturating_add(
+                (content_period_ns / MAX_CATCHUP_FACTOR).max(MIN_BUNDLE_SPACING_NS),
+            );
             let clamped = rebased.max(floor);
             last_emitted_ns = clamped;
             clamped
@@ -2965,27 +3016,21 @@ fn run_paced_emitter(
             // ── Byte-rate mode (TS passthrough) ───────────────────────────
             // Bitrate refinement piggybacks on every bundle so the OS thread
             // tracks the producer's view of the file rate even when the
-            // bundle channel is steady-state full. Updates affect FUTURE
-            // inter-bundle spacing only; the next target is the previous
-            // target plus the new bundle period. No retroactive shift of
-            // queued targets, so a rate refinement never produces a burst.
-            if msg.bitrate_bps != 0 {
-                bitrate_bps = msg.bitrate_bps;
-            }
-            // Pace by the SOURCE content this message represents, not a fixed
-            // `BUNDLE_SIZE`. In passthrough `content_src_bytes == BUNDLE_SIZE`
-            // (1 message per source bundle) so behaviour is unchanged; with an
-            // input transcoder the count carries any buffered-then-merged
-            // source bundles, so the file plays at true 1.0x instead of ~2 %
-            // fast. Fall back to BUNDLE_SIZE if a producer ever sends 0.
-            let content_bytes = if msg.content_src_bytes != 0 {
-                msg.content_src_bytes
-            } else {
-                BUNDLE_SIZE as u64
-            };
+            // bundle channel is steady-state full (hoisted above, since the
+            // deadline branch derives its floor from the same rate). Updates
+            // affect FUTURE inter-bundle spacing only; the next target is the
+            // previous target plus the new bundle period. No retroactive
+            // shift of queued targets, so a rate refinement never bursts.
+            //
+            // `content_period_ns` — also hoisted — is this message's own
+            // duration, paced by the SOURCE content it represents rather than
+            // a fixed `BUNDLE_SIZE`. In passthrough `content_src_bytes ==
+            // BUNDLE_SIZE` (1 message per source bundle) so behaviour is
+            // unchanged; with an input transcoder the count carries any
+            // buffered-then-merged source bundles, so the file plays at true
+            // 1.0x instead of ~2 % fast.
             bytes_emitted = bytes_emitted.saturating_add(content_bytes);
-            let bundle_period_ns =
-                content_bytes.saturating_mul(8_000_000_000) / bitrate_bps.max(1);
+            let bundle_period_ns = content_period_ns;
             let t = next_target_wall;
             // Advance the running target for the next bundle. If the actual
             // fire wallclock catches up to (or passes) `next_target_wall`
