@@ -2644,11 +2644,49 @@ fn handle_video_au(
                  {errs} consecutive send_packet errors — re-opening on {backend} \
                  before considering a CPU demote"
             );
+            // Operator-visible, because the alternative is what this branch
+            // replaces: the demote fired once, emitted
+            // `display_hw_decode_runtime_failed` and flipped the decoder
+            // pill to CPU. A recovery that logs only to the journal turns a
+            // loud terminal fault into a silent recurring one — and each
+            // cycle is >= RUNTIME_FAIL_DEMOTE_THRESHOLD frames of no
+            // picture, so a node resetting every 25 s is visibly broken
+            // while every manager surface reads healthy.
+            counters.decoder_resets.fetch_add(1, Ordering::Relaxed);
+            event_sender.emit_flow_with_details(
+                EventSeverity::Warning,
+                crate::manager::events::category::SYSTEM_RESOURCES,
+                format!(
+                    "display output '{output_id}': HW decoder wedged after {errs} \
+                     consecutive send_packet errors — resetting {attempt}/\
+                     {MAX_HW_RESET_ATTEMPTS} on {backend} instead of demoting to CPU"
+                ),
+                flow_id,
+                serde_json::json!({
+                    "error_code": "display_hw_decode_reset",
+                    "output_id": output_id,
+                    "backend": backend,
+                    "attempt": attempt,
+                    "max_attempts": MAX_HW_RESET_ATTEMPTS,
+                    "consecutive_send_errors": errs,
+                }),
+            );
             // Drop the decoder; `open_video_decoder_with_retry` re-opens it
             // on the *same* backend for the next AU, and the keyframe gate
             // holds it until an IDR so the fresh session starts anchored.
             *video_decoder = None;
             *current_video_codec = None;
+            // Arm the gate, which is what makes the sentence above true. A
+            // freshly-opened session has no reference frames, so feeding it
+            // the mid-GOP AUs that follow guarantees another rejection run:
+            // on a long-GOP source both reset attempts would be spent on
+            // pre-IDR slices and the demote would land anyway, ~2.4 s later
+            // and having torn the decoder down twice for nothing. Arming
+            // also grants `opened_by_timeout` -> `SPECULATIVE_DEMOTE_GRACE`
+            // immunity if no IDR arrives inside `KEYFRAME_GATE_MAX_WAIT`,
+            // which is what stops the no-frames watchdog demoting a decoder
+            // that was only ever waiting for an anchor.
+            keyframe_gate.arm();
             reset_decoder_open_window(hw_open_state, counters);
             return;
         }

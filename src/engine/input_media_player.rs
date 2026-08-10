@@ -129,10 +129,23 @@ struct PacerMsg {
     ///   MP4 grew `pcr_accuracy_errors` continuously, this deadline mode
     ///   holds them at zero).
     /// - `None` — byte-rate mode: the OS thread computes the deadline from
-    ///   `bitrate_bps` + `content_src_bytes`. Used by the **TS-passthrough
-    ///   path** (`play_ts_file`), which has no per-sample presentation
-    ///   timeline to anchor to (its PCR is already in the source bytes and
-    ///   real TS files are well-behaved / near-CBR).
+    ///   `bitrate_bps` + `content_src_bytes`.
+    ///
+    /// The TS-passthrough path (`play_ts_file`) used to be the `None` case,
+    /// on the reasoning that a TS has no per-sample presentation timeline
+    /// and "real TS files are well-behaved / near-CBR". The second half was
+    /// the load-bearing half and it is false: on VBR the estimated rate is
+    /// wrong by construction, and byte-rate mode integrates that error
+    /// forward without bound. It now anchors on the source's own PCR
+    /// instead — which *is* its presentation timeline, and was in the bytes
+    /// the whole time — so a TS message carries `Some` from its first PCR
+    /// onward. `BILBYCAST_MEDIA_PLAYER_PCR_DEADLINES=0` restores the old
+    /// behaviour.
+    ///
+    /// **A TS pacer thread therefore sees both modes in sequence**: byte-rate
+    /// until the first PCR, deadlines after. Anything hoisted out of the
+    /// receive loop must survive that transition — `next_target_wall` in
+    /// particular is frozen at its pre-PCR value for the rest of the file.
     target_ns: Option<u64>,
     /// Producer's current bitrate estimate (bps) for the file. The OS
     /// thread re-anchors `iter_start_wall` whenever this differs from
@@ -1418,7 +1431,16 @@ async fn play_ts_file(
     let mut pcr_epoch_27mhz: Option<u64> = None;
     let mut pacer_epoch_ns: Option<u64> = None;
     let mut last_pcr_target_ns: Option<u64> = None;
+    let mut last_anchor_pcr_27mhz: Option<u64> = None;
     let mut bytes_since_pcr: u64 = 0;
+    // Rollback lever for the whole PCR-anchored scheme, matching the two
+    // levers `input_media_player::controller` already carries. The failure
+    // modes this mode can have are asset- and host-dependent (a spliced
+    // asset, a stalling disk, a clock step), which is exactly the class
+    // that shows up on one customer node and nowhere in the lab — and the
+    // only other remedy is rolling the whole release back, which also
+    // takes away the black-panel fix this exists to deliver.
+    let pcr_deadlines_enabled = pcr_deadline_pacing_enabled();
     let mut bytes_emitted: u64 = 0;
     // Source bytes the transcoder buffered without emitting yet. Credited to
     // the next emitted message so the pacer's content clock stays conserved
@@ -1628,23 +1650,38 @@ async fn play_ts_file(
             // clock per program, and mixing them would step the deadline
             // by the inter-program skew (often seconds) at every PID
             // switch — the same trap the bitrate estimator guards against.
-            if anchor_pcr_pid.is_none() || anchor_pcr_pid == Some(pcr_pid_early) {
+            if pcr_deadlines_enabled && anchor_pcr_pid == Some(pcr_pid_early) {
                 let epoch = *pcr_epoch_27mhz.get_or_insert(pcr);
                 let e_ns = *pacer_epoch_ns.get_or_insert_with(
                     crate::engine::wire_emit::monotonic_now_ns,
                 );
+                // Discontinuity is a property of the *step* between
+                // consecutive PCRs, not of the distance from the epoch.
+                // Testing the epoch span instead conflates two unrelated
+                // things: it calls a perfectly continuous PCR a
+                // discontinuity once an asset has simply played for long
+                // enough, and — far worse — it accepts a genuine forward
+                // splice of up to the span bound as a real deadline, so
+                // the pacer sleeps out the whole jump and playout freezes
+                // for its duration. Byte-rate mode could not do that.
+                //
+                // MPEG-TS requires a PCR at least every 100 ms, so a step
+                // beyond `PCR_STEP_DISCONTINUITY_27MHZ` is never the
+                // source's own clock advancing. Sign covers the 42-bit
+                // wrap (~26.5 h) and a backward splice in one test.
+                let continuous = last_anchor_pcr_27mhz.is_none_or(|prev| {
+                    let step = pcr.wrapping_sub(prev) as i64;
+                    (0..=PCR_STEP_DISCONTINUITY_27MHZ).contains(&step)
+                });
                 let d = pcr.wrapping_sub(epoch);
-                // Guard against a PCR discontinuity (loop wrap, source
-                // splice) re-anchoring the timeline into the far future or
-                // the past. Outside the sane span we re-epoch on this PCR
-                // rather than emit a deadline we would then have to clamp.
-                if (d as i64) >= 0 && d < 27_000_000 * 3600 {
+                if continuous && (d as i64) >= 0 {
                     last_pcr_target_ns = Some(e_ns.saturating_add((d / 27) * 1_000));
                 } else {
                     pcr_epoch_27mhz = Some(pcr);
                     pacer_epoch_ns = Some(crate::engine::wire_emit::monotonic_now_ns());
                     last_pcr_target_ns = pacer_epoch_ns;
                 }
+                last_anchor_pcr_27mhz = Some(pcr);
                 bytes_since_pcr = 0;
             }
         }
@@ -2496,6 +2533,31 @@ fn fake_rtp_ts(_session: &PlayerSession<'_>) -> u32 {
 ///
 /// Returns `None` before the first PCR — and for TS that carries no PCR at
 /// all — which leaves the pacer in its legacy byte-rate mode.
+///
+/// Step between consecutive PCRs beyond which the source's clock is taken
+/// to have jumped rather than advanced. 500 ms, mirroring
+/// [`crate::engine::wire_emit`]'s `PCR_DISCONTINUITY_27MHZ`; MPEG-TS
+/// mandates a PCR at least every 100 ms, so a legitimate step is an order
+/// of magnitude below this.
+const PCR_STEP_DISCONTINUITY_27MHZ: i64 = 13_500_000;
+
+/// Whether TS playout paces on PCR-anchored deadlines (default) or on the
+/// legacy byte-rate estimate.
+///
+/// Rollback lever, same shape as `BILBYCAST_MEDIA_PLAYER_CONTROLLER` and
+/// `BILBYCAST_MEDIA_PLAYER_INCREMENTAL_MP4`. Set
+/// `BILBYCAST_MEDIA_PLAYER_PCR_DEADLINES` to `0`/`false`/`off` to fall back
+/// to byte-rate pacing on a single node without rolling back the release.
+fn pcr_deadline_pacing_enabled() -> bool {
+    match std::env::var("BILBYCAST_MEDIA_PLAYER_PCR_DEADLINES") {
+        Ok(v) => !matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "off" | "no"
+        ),
+        Err(_) => true,
+    }
+}
+
 fn ts_bundle_deadline(
     base: Option<u64>,
     bytes_since_pcr: u64,
@@ -2655,6 +2717,36 @@ const PACER_FULL_BACKOFF: std::time::Duration = std::time::Duration::from_micros
 /// The point is to keep a recovery bounded, not to pace normally.
 const MIN_BUNDLE_SPACING_NS: u64 = 25_000;
 
+/// How far behind this thread's clock an explicit deadline schedule may
+/// fall before it is re-based onto the present rather than drained at
+/// [`MIN_BUNDLE_SPACING_NS`].
+///
+/// Legitimate lateness is bounded by the producer's lead, itself bounded by
+/// [`PACER_QUEUE_CAP`] (16) messages of content — tens of milliseconds at
+/// any real rate. Half a second is therefore unambiguous evidence of a
+/// clock step or a producer stall, not of ordinary scheduling jitter.
+const MAX_DEADLINE_LATENESS_NS: u64 = 500_000_000;
+
+/// The mirror bound: how far into the future an explicit deadline may sit
+/// before it is treated as a source discontinuity rather than a schedule.
+///
+/// Without it the pacer sleeps out the whole jump and playout freezes for
+/// its duration, invisibly — `late_ms` is a saturating subtract, so running
+/// early reports 0 and `media_player_pacer_lagging` never latches.
+/// Generous relative to the ~16-message producer lead because
+/// `play_ts_file` now re-epochs on a PCR step of 500 ms, which is the
+/// precise guard; this is the backstop for everything that misses.
+const MAX_DEADLINE_LOOKAHEAD_NS: u64 = 1_000_000_000;
+
+/// Apply [`run_paced_emitter`]'s accumulated re-base offset to one deadline.
+///
+/// Saturating in both directions and floored at 0 — the offset is a signed
+/// nanosecond correction against a `CLOCK_TAI` absolute, and a large
+/// negative shift on an early deadline must not wrap.
+fn shift_deadline(deadline_ns: u64, shift_ns: i64) -> u64 {
+    (deadline_ns as i64).saturating_add(shift_ns).max(0) as u64
+}
+
 /// Pacer falls behind its own computed wall-clock schedule by at least this
 /// much before we latch `media_player_pacer_lagging`. `run_paced_emitter`
 /// (SCHED_FIFO / CLOCK_TAI) normally tracks its target within microseconds —
@@ -2768,6 +2860,10 @@ fn run_paced_emitter(
     // the clamp in the deadline branch below. Seeded so the very first
     // bundle is never held back.
     let mut last_emitted_ns: u64 = initial_now;
+    // Signed correction applied to every explicit deadline, so a schedule
+    // that has drifted grossly from this thread's clock is re-based **once**
+    // and keeps its relative spacing thereafter. Zero in the common case.
+    let mut explicit_shift_ns: i64 = 0;
     tracing::info!(
         "media-pacer '{}': starting (bitrate_initial={} bps, sched_fifo={})",
         thread_name,
@@ -2822,8 +2918,47 @@ fn run_paced_emitter(
             // (the common case: `explicit` is already >= the floor, so
             // this is a no-op) and degrades to nominal spacing when it
             // is not, instead of collapsing to zero spacing.
+            //
+            // ── The floor alone does NOT deliver what the paragraph above
+            // claims. `MIN_BUNDLE_SPACING_NS` bounds the spacing between
+            // consecutive bundles, not the schedule's lateness against the
+            // clock, and 25 µs per 1316-byte bundle is ~421 Mbps — two
+            // orders of magnitude above any content rate. So a backlog
+            // still drains as a burst, just a floor-rated one: a forward
+            // CLOCK_TAI step of X retires X worth of deadlines and dumps
+            // them in X/42 000 of the time. On a PTP edge that is not even
+            // a fault — the kernel's `tai_offset` starts at 0 and jumps
+            // ~37 s the moment chrony or ptp4l sets it, which would dump
+            // ~47 MB in under a second into the very decoder queue whose
+            // overrun this pacer exists to prevent.
+            //
+            // The byte-rate branch below never had this problem because it
+            // re-anchors on `now` every message (`t.max(now)`). The
+            // deadline branch has no `now` term at all, so add the missing
+            // one: when the schedule has drifted grossly in either
+            // direction, re-base it onto the present and carry that shift
+            // forward, so relative spacing is preserved and the drift is
+            // paid once rather than per bundle. Within tolerance the shift
+            // stays 0 and the schedule is exactly as the producer computed
+            // it.
+            let now = crate::engine::wire_emit::monotonic_now_ns();
+            let shifted = shift_deadline(explicit, explicit_shift_ns);
+            let rebased = if now.saturating_sub(shifted) > MAX_DEADLINE_LATENESS_NS
+                || shifted.saturating_sub(now) > MAX_DEADLINE_LOOKAHEAD_NS
+            {
+                explicit_shift_ns = (now as i64).saturating_sub(explicit as i64);
+                tracing::warn!(
+                    "media-player pacer: deadline schedule re-based onto now \
+                     (was {} ms {}) — clock step, producer stall or source discontinuity",
+                    now.abs_diff(shifted) / 1_000_000,
+                    if shifted < now { "late" } else { "ahead" },
+                );
+                now
+            } else {
+                shifted
+            };
             let floor = last_emitted_ns.saturating_add(MIN_BUNDLE_SPACING_NS);
-            let clamped = explicit.max(floor);
+            let clamped = rebased.max(floor);
             last_emitted_ns = clamped;
             clamped
         } else {
@@ -2929,6 +3064,138 @@ fn shuffle_indices(order: &mut [usize]) {
     use rand::seq::SliceRandom;
     let mut rng = rand::rng();
     order.shuffle(&mut rng);
+}
+
+#[cfg(test)]
+mod ts_pacing_tests {
+    //! The PCR-anchored TS pacing scheme reduces to three pure decisions —
+    //! what deadline a bundle gets, whether a PCR step is the source's own
+    //! clock or a discontinuity, and how a drifted schedule is re-based.
+    //! All three decide when bytes hit the wire, so they are pinned here
+    //! rather than left to a hardware soak to notice.
+    use super::{
+        shift_deadline, ts_bundle_deadline, MAX_DEADLINE_LATENESS_NS,
+        MAX_DEADLINE_LOOKAHEAD_NS, PCR_STEP_DISCONTINUITY_27MHZ,
+    };
+
+    /// No PCR seen yet, or a TS that carries none at all: the pacer must
+    /// stay in byte-rate mode rather than be handed a bogus absolute.
+    #[test]
+    fn no_anchor_means_no_deadline() {
+        assert_eq!(ts_bundle_deadline(None, 0, 4_000_000), None);
+        assert_eq!(ts_bundle_deadline(None, 999_999, 4_000_000), None);
+    }
+
+    /// Within one PCR interval the deadline is linear in bytes emitted.
+    /// 1316 B at 4 Mbps is 2.632 ms of content.
+    #[test]
+    fn deadline_interpolates_linearly_within_the_interval() {
+        let base = 1_000_000_000;
+        assert_eq!(ts_bundle_deadline(Some(base), 0, 4_000_000), Some(base));
+        assert_eq!(
+            ts_bundle_deadline(Some(base), 1316, 4_000_000),
+            Some(base + 2_632_000),
+        );
+        assert_eq!(
+            ts_bundle_deadline(Some(base), 2632, 4_000_000),
+            Some(base + 5_264_000),
+        );
+    }
+
+    /// A zero or absurd rate must not divide by zero or throw the deadline
+    /// decades out; the clamp is the estimator's own lower sanity bound.
+    #[test]
+    fn an_absurd_rate_is_clamped_not_trusted() {
+        let base = 1_000_000_000;
+        assert_eq!(
+            ts_bundle_deadline(Some(base), 1316, 0),
+            ts_bundle_deadline(Some(base), 1316, 100_000),
+            "a zero rate must clamp to the same floor as the minimum sane rate",
+        );
+        // 1316 B at the 100 kbps floor = 105.28 ms — large, but bounded.
+        assert_eq!(
+            ts_bundle_deadline(Some(base), 1316, 1),
+            Some(base + 105_280_000),
+        );
+    }
+
+    /// The re-base offset is applied saturating and floored at zero — it is
+    /// a signed correction against a CLOCK_TAI absolute and must never wrap
+    /// a small deadline into the far future.
+    #[test]
+    fn shifting_a_deadline_saturates_instead_of_wrapping() {
+        assert_eq!(shift_deadline(1_000, 500), 1_500);
+        assert_eq!(shift_deadline(1_000, -500), 500);
+        assert_eq!(shift_deadline(1_000, -5_000), 0, "must floor, not wrap");
+        // A real CLOCK_TAI absolute is ~1.78e18 ns, with ample i64 headroom.
+        // The largest realistic shift is the kernel's `tai_offset` settling
+        // from 0 to ~37 s, in either direction.
+        let tai_now = 1_780_000_000_000_000_000u64;
+        assert_eq!(
+            shift_deadline(tai_now, 37_000_000_000),
+            tai_now + 37_000_000_000,
+        );
+        assert_eq!(
+            shift_deadline(tai_now, -37_000_000_000),
+            tai_now - 37_000_000_000,
+        );
+    }
+
+    /// The bounds must sit above any legitimate producer lead
+    /// (`PACER_QUEUE_CAP` = 16 messages, tens of ms) and far below the
+    /// multi-second jumps they exist to catch — otherwise they either trip
+    /// constantly or never.
+    #[test]
+    fn rebase_bounds_bracket_the_legitimate_producer_lead() {
+        let generous_lead_ns = 16 * 10_000_000u64; // 16 bundles @ 10 ms
+        assert!(MAX_DEADLINE_LATENESS_NS > generous_lead_ns);
+        assert!(MAX_DEADLINE_LOOKAHEAD_NS > generous_lead_ns);
+        assert!(MAX_DEADLINE_LOOKAHEAD_NS < 2_000_000_000);
+    }
+
+    /// A PCR step is judged against the previous PCR, not the epoch. This
+    /// mirrors the predicate in `play_ts_file`; the boundary is what
+    /// separates "the source's clock advanced" from "the source spliced".
+    fn continuous(prev: u64, pcr: u64) -> bool {
+        let step = pcr.wrapping_sub(prev) as i64;
+        (0..=PCR_STEP_DISCONTINUITY_27MHZ).contains(&step)
+    }
+
+    #[test]
+    fn an_ordinary_pcr_advance_is_continuous() {
+        // MPEG-TS mandates a PCR at least every 100 ms; 40 ms is typical.
+        assert!(continuous(27_000_000, 27_000_000 + 27_000 * 40));
+        assert!(continuous(27_000_000, 27_000_000 + 27_000 * 100));
+        // Exactly at the bound is still accepted.
+        assert!(continuous(
+            27_000_000,
+            27_000_000 + PCR_STEP_DISCONTINUITY_27MHZ as u64
+        ));
+    }
+
+    /// The case that made a forward splice freeze playout for its whole
+    /// duration: a jump must re-epoch, never become a deadline.
+    #[test]
+    fn a_forward_splice_is_a_discontinuity() {
+        assert!(!continuous(27_000_000, 27_000_000 + 27_000_000 * 2));
+        assert!(!continuous(27_000_000, 27_000_000 + 27_000_000 * 1200));
+    }
+
+    #[test]
+    fn a_backward_step_and_a_wrap_are_discontinuities() {
+        assert!(!continuous(27_000_000 * 10, 27_000_000));
+        // 42-bit PCR wrap: tiny value after a near-maximal one.
+        assert!(!continuous((1u64 << 42) - 27_000_000, 1_000));
+    }
+
+    /// A long asset must NOT be called discontinuous merely for having
+    /// played a while — the defect in judging span-from-epoch instead of
+    /// step-from-previous.
+    #[test]
+    fn a_multi_hour_asset_stays_continuous() {
+        let two_hours = 27_000_000u64 * 3600 * 2;
+        assert!(continuous(two_hours, two_hours + 27_000 * 40));
+    }
 }
 
 #[cfg(test)]

@@ -575,6 +575,13 @@ pub struct DisplayStatsCounters {
     /// `display_loop`). Single per-flow open + immediate switch counts
     /// once. Manager UI flags `>0` as "HW degraded to CPU on this output".
     pub decoder_demotions: AtomicU64,
+    /// HW decoder reset+reopen cycles on the *same* backend, each one a
+    /// wedged session recovered instead of demoted. Distinct from
+    /// `decoder_demotions`, which counts only the terminal give-up — a
+    /// backend that wedges and recovers indefinitely leaves that at 0
+    /// forever, so without this counter a node stalling every 25 s is
+    /// indistinguishable from a healthy one on every manager surface.
+    pub decoder_resets: AtomicU64,
     /// Decoded frames pulled out of the active decoder since it was
     /// last opened. Reset to 0 by `force_cpu_fallback`. Watchdog reads
     /// this — `0` after `first_send_after_open` + 2.5 s while still on
@@ -1464,6 +1471,7 @@ impl OutputStatsAccumulator {
                 audio_codec: h.counters.load_audio_codec_label().as_str().to_string(),
                 send_packet_errors: h.counters.send_packet_errors.load(Ordering::Relaxed),
                 decoder_demotions: h.counters.decoder_demotions.load(Ordering::Relaxed),
+                decoder_resets: h.counters.decoder_resets.load(Ordering::Relaxed),
                 frames_received_since_open: h
                     .counters
                     .frames_received_since_open

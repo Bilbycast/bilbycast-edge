@@ -1274,6 +1274,13 @@ pub struct DisplayStats {
     /// the dropdown to `cpu` permanently or wait for a driver fix.
     #[serde(default)]
     pub decoder_demotions: u64,
+    /// HW decoder reset+reopen cycles on the same backend — wedged
+    /// sessions recovered rather than demoted. A rising count with
+    /// `decoder_demotions == 0` is the recoverable-but-recurring state:
+    /// hardware decode is being held, but each cycle costs at least
+    /// `RUNTIME_FAIL_DEMOTE_THRESHOLD` frames of picture.
+    #[serde(default)]
+    pub decoder_resets: u64,
     /// Decoded frames produced since the active decoder was last
     /// opened. Resets on every HW→CPU demotion and on every codec
     /// switch. Used by the manager UI to badge "warming up" until the
