@@ -614,6 +614,14 @@ async fn run_display_output(
     // the working CPU-blit path instead of black-screening on a doomed prime
     // present. Mirrors the `force_cpu_blit_for_bars` sharing pattern.
     let prime_scanout_failed = Arc::new(AtomicBool::new(false));
+    // Set by the decode task whenever it tears a decoder down for a
+    // re-open on the SAME backend (the #91 wedge reset, and the #97
+    // hardware re-promotion). Consumed once by the display task, which
+    // drops `KmsDisplay`'s PRIME framebuffer memo before the next
+    // present. A re-opened decoder pool allocates fresh DMA-BUF
+    // identities, so every cached `(st_dev, st_ino)` key is dead and
+    // the next ~16 presents would each pay a full re-import. See #94.
+    let prime_cache_stale = Arc::new(AtomicBool::new(false));
     // Set by the decode task the first time `rga_rs::nv12_dmabuf_to_sysmem`
     // successfully engages. Read by the display task's pacer to gate a
     // one-time A/V latency calibration — the RGA-accelerated transfer
@@ -701,6 +709,7 @@ async fn run_display_output(
     let demux_panel_hdr_capable = kms.panel_hdr_capable();
     let demux_force_cpu_blit_for_bars = Arc::clone(&force_cpu_blit_for_bars);
     let demux_prime_scanout_failed = Arc::clone(&prime_scanout_failed);
+    let demux_prime_cache_stale = Arc::clone(&prime_cache_stale);
     #[cfg(feature = "rga-transfer")]
     let demux_rga_transfer_active = Arc::clone(&rga_transfer_active);
     let demux_output_stats = Arc::clone(&output_stats);
@@ -726,6 +735,7 @@ async fn run_display_output(
             demux_panel_hdr_capable,
             demux_force_cpu_blit_for_bars,
             demux_prime_scanout_failed,
+            demux_prime_cache_stale,
             #[cfg(feature = "rga-transfer")]
             demux_rga_transfer_active,
             demux_output_stats,
@@ -792,6 +802,7 @@ async fn run_display_output(
     let display_frame_gen = Arc::clone(&frame_gen);
     let display_force_cpu_blit = Arc::clone(&force_cpu_blit_for_bars);
     let display_prime_scanout_failed = Arc::clone(&prime_scanout_failed);
+    let display_prime_cache_stale = Arc::clone(&prime_cache_stale);
     #[cfg(feature = "rga-transfer")]
     let display_rga_transfer_active = Arc::clone(&rga_transfer_active);
     // Independent DRM-master release handle (a dup of the card fd) captured
@@ -816,6 +827,7 @@ async fn run_display_output(
             display_frame_gen,
             display_force_cpu_blit,
             display_prime_scanout_failed,
+            display_prime_cache_stale,
             #[cfg(feature = "rga-transfer")]
             display_rga_transfer_active,
         );
@@ -1073,6 +1085,7 @@ fn demux_decode_loop(
     panel_hdr_capable: bool,
     force_cpu_blit_for_bars: Arc<AtomicBool>,
     prime_scanout_failed: Arc<AtomicBool>,
+    prime_cache_stale: Arc<AtomicBool>,
     #[cfg(feature = "rga-transfer")] rga_transfer_active: Arc<AtomicBool>,
     output_stats: Arc<OutputStatsAccumulator>,
     audio_decode_counters: Arc<DecodeStats>,
@@ -1249,6 +1262,7 @@ fn demux_decode_loop(
                         panel_hdr_capable,
                         &force_cpu_blit_for_bars,
                         &prime_scanout_failed,
+                        &prime_cache_stale,
                         #[cfg(feature = "rga-transfer")]
                         &rga_transfer_active,
                         stream_ids,
@@ -1285,6 +1299,7 @@ fn demux_decode_loop(
                         panel_hdr_capable,
                         &force_cpu_blit_for_bars,
                         &prime_scanout_failed,
+                        &prime_cache_stale,
                         #[cfg(feature = "rga-transfer")]
                         &rga_transfer_active,
                         stream_ids,
@@ -1330,6 +1345,7 @@ fn demux_decode_loop(
                         panel_hdr_capable,
                         &force_cpu_blit_for_bars,
                         &prime_scanout_failed,
+                        &prime_cache_stale,
                         #[cfg(feature = "rga-transfer")]
                         &rga_transfer_active,
                         stream_ids,
@@ -2450,6 +2466,7 @@ fn maybe_repromote_hw_decode(
     state: &mut HwOpenState,
     counters: &DisplayStatsCounters,
     keyframe_gate: &mut KeyframeGate,
+    prime_cache_stale: &AtomicBool,
     event_sender: &EventSender,
     flow_id: &str,
     output_id: &str,
@@ -2526,6 +2543,8 @@ fn maybe_repromote_hw_decode(
     *slot = None;
     *current = None;
     keyframe_gate.arm();
+    // Same fresh-pool invalidation the wedge reset needs — see #94.
+    prime_cache_stale.store(true, Ordering::Relaxed);
     reset_decoder_open_window(state, counters);
     true
 }
@@ -2655,6 +2674,7 @@ fn handle_video_au(
     panel_hdr_capable: bool,
     force_cpu_blit_for_bars: &AtomicBool,
     prime_scanout_failed: &AtomicBool,
+    prime_cache_stale: &AtomicBool,
     #[cfg(feature = "rga-transfer")] rga_transfer_active: &AtomicBool,
     stream_ids: StreamIds,
     video_decode_counters: &VideoDecodeStats,
@@ -2830,6 +2850,7 @@ fn handle_video_au(
         hw_open_state,
         counters,
         keyframe_gate,
+        prime_cache_stale,
         event_sender,
         flow_id,
         output_id,
@@ -2904,6 +2925,13 @@ fn handle_video_au(
             // which is what stops the no-frames watchdog demoting a decoder
             // that was only ever waiting for an anchor.
             keyframe_gate.arm();
+            // The re-opened pool allocates fresh DMA-BUF identities, so
+            // every `prime_fb_cache` entry keyed on the old ones is dead.
+            // Left to age out through the FIFO the next ~16 presents each
+            // pay a full re-import — sub-millisecond becomes double-digit
+            // ms against a 41.6 ms budget, a burst of missed vblanks that
+            // no counter in this path can see (#94).
+            prime_cache_stale.store(true, Ordering::Relaxed);
             reset_decoder_open_window(hw_open_state, counters);
             return;
         }
@@ -4046,6 +4074,7 @@ fn display_loop(
     frame_gen: Arc<AtomicU64>,
     force_cpu_blit_signal: Arc<AtomicBool>,
     prime_scanout_failed: Arc<AtomicBool>,
+    prime_cache_stale: Arc<AtomicBool>,
     #[cfg(feature = "rga-transfer")] rga_transfer_active: Arc<AtomicBool>,
 ) {
     // Frame period derived from the observed PTS deltas — used to size
@@ -4752,6 +4781,18 @@ fn display_loop(
         // slot and the next iteration's pacing has already slipped a
         // frame.
         compose_stream_header(&mut header_buf, &next, frame_period_ms);
+        // The decode task tore a decoder down and re-opened it on the same
+        // backend (#91's wedge reset, or #97's hardware re-promotion). That
+        // retires the pool's DMA-BUF identities, so every `prime_fb_cache`
+        // entry keyed on the old `(st_dev, st_ino)` is stale. Drop the memo
+        // here, on the thread that owns `KmsDisplay`, before the import it
+        // would otherwise serve. Deliberately the narrow invalidation and
+        // not `release_prime_state`: a reset is not a demotion, and tearing
+        // `prime_state` down would re-arm the CRTC onto the dumb buffer,
+        // putting a visible flip into an otherwise invisible recovery (#94).
+        if prime_cache_stale.swap(false, Ordering::Relaxed) {
+            kms.invalidate_prime_fb_cache();
+        }
         let blit_start = Instant::now();
         let blit_ok = match blit_and_present(
             &mut kms,
