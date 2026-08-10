@@ -649,11 +649,25 @@ FEC (2022-1) and hitless redundancy (2022-7) run **after** the filter, so the re
   └─ No cascading backpressure
 
   SRT output inner buffer:
-  ├─ mpsc::channel(SRT_SEND_QUEUE_CAPACITY = 4096) broadcast task → SRT send
-  ├─ try_send() (non-blocking) — drops if full
-  ├─ Sized to absorb one IDR access unit: on the 188-B-per-item SDI/WebRTC
-  │  publish path a 123–144 KB IDR is 654–766 items, which overran the
-  │  previous 256 once per GOP (see SRT_SEND_QUEUE_CAPACITY in output_srt.rs)
+  ├─ send_queue() — bounded in BOTH slots and bytes, whichever binds first:
+  │    SRT_SEND_QUEUE_CAPACITY = 4096 slots
+  │    SRT_SEND_QUEUE_MAX_BYTES = 8 MiB
+  ├─ try_send() (non-blocking) — drops if either bound would be exceeded
+  ├─ Slot count sized to absorb one IDR access unit: on the 188-B-per-item
+  │  SDI/WebRTC publish path a 123–144 KB IDR is 654–766 items, which overran
+  │  the previous 256 once per GOP (see SRT_SEND_QUEUE_CAPACITY)
+  ├─ Byte ceiling exists because a slot count is not a memory bound — an item
+  │  is a whole RtpPacket whose size the publisher sets, so 4096 slots is
+  │  ~5.4 MB of TS-class traffic but up to ~164 MB of RTMP/RTSP whole-AU
+  │  items. Crossover is 2048 B/item: below it the slots bind, above it the
+  │  bytes do (reachable from config — ts_packets_per_datagram goes to 348,
+  │  i.e. 65 424 B, which is 128 items rather than 4096)
+  ├─ An EMPTY queue always admits one item whatever its size, so the real
+  │  bound is max(8 MiB, largest single item). Without that exemption an
+  │  oversized item is permanently un-sendable rather than transiently
+  │  dropped, and in 2022-7 mode both legs reject it in lockstep — which the
+  │  redundant loop reads as "all legs lost" and answers by closing two
+  │  healthy sockets, forever
   └─ Separate from broadcast backpressure
 
   RTP output:
@@ -676,7 +690,13 @@ per slot (7×188 TS in RTP), which holds for the UDP / RTP / SRT passthrough
 publishers **only** — the bound is on *items*, not bytes. SDI and WebRTC
 publish one 188-byte TS packet per slot (so the real figure is ~7× smaller),
 while RTMP and RTSP bundle a whole access unit per slot (tens of KB — the
-figure is then an order of magnitude *larger*). Tracked in #98.
+figure is then an order of magnitude *larger*). Tracked in #98, which is
+**still open for these channels**: the SRT egress queue above now carries a
+companion byte ceiling, but this flow-level broadcast ring does not. It is
+the dominant term (~655 MB for an RTMP-sourced `Standard` flow against the
+21 MB above) and needs either a different channel type or a publisher-side
+item-size contract — `tokio::broadcast` fixes its capacity at construction,
+so the same wrapper trick does not apply.
 `engine::bandwidth_profile::resolve_for_flow` picks the tier:
 
 - **ST 2110-20**, **ST 2110-23**, **MXL video** → `Uncompressed`
