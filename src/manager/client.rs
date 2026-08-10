@@ -2125,7 +2125,10 @@ async fn execute_command(
                             new_flow.output_ids.len(),
                         );
                         let cfg = app_config.read().await;
-                        let unreconciled = diff_inputs(
+                        let InputDiffOutcome {
+                            unreconciled,
+                            forced_active,
+                        } = diff_inputs(
                             flow_manager,
                             flow_id,
                             &new_flow.input_ids,
@@ -2135,6 +2138,14 @@ async fn execute_command(
                         .await;
                         diff_outputs(flow_manager, flow_id, &new_flow.output_ids, &cfg).await;
                         drop(cfg);
+                        // The reconciler put a survivor on air because this push
+                        // deleted the input that was active. Record it, or
+                        // config.json stops tracking the runtime and the flow's
+                        // next restart comes up with no active member at all (#87).
+                        if let Some(survivor) = forced_active.as_deref() {
+                            let mut cfg = app_config.write().await;
+                            apply_forced_active(&mut cfg, flow_id, survivor);
+                        }
                         // An input the engine would not surrender means the
                         // runtime is now carrying something the new config
                         // does not contain. Escalating to a restart is the
@@ -2761,6 +2772,29 @@ async fn execute_command(
                     .map_err(|e| {
                         CommandError::new(format!("activate_input failed: {e}"))
                     })?;
+            } else if cfg.flows[flow_idx].enabled {
+                // Enabled but not in the registry: the flow is mid-restart —
+                // `destroy_flow` removes it before awaiting a stop that can run
+                // to tens of seconds, and WS commands are spawned per frame so
+                // they overlap freely. Skipping the switch here while still
+                // flipping `active` below and acking `Ok` meant an operator
+                // pressed Take, the UI said it worked, `config.json` said it
+                // worked, and the source never went to air — the rebuild then
+                // resolved from a config the Take had never reached. Fail
+                // loudly instead; the manager retries or the operator sees it.
+                //
+                // A flow that is *disabled* is a different case and still falls
+                // through: recording which member is active on a stopped flow is
+                // exactly what this command is for, and it comes up on it.
+                return Err(CommandError::with_code(
+                    format!(
+                        "Flow '{flow_id}' is enabled but not currently running — it is \
+                         most likely restarting. Refusing to record input '{input_id}' as \
+                         active without performing the switch, because that would report \
+                         success for a Take that never reached the media. Retry shortly."
+                    ),
+                    "flow_not_running",
+                ));
             }
             let member_ids: Vec<String> = cfg.flows[flow_idx].input_ids.clone();
             for def in cfg.inputs.iter_mut() {
@@ -3121,6 +3155,13 @@ async fn execute_command(
                 }
             }
 
+            // Takes the reconciler was forced to perform because a push deleted
+            // the input that was on air. Collected here rather than applied in
+            // place because `new_flow_map` holds an immutable borrow of
+            // `new_config` for the whole loop; applied below, before the config
+            // is persisted (#87).
+            let mut forced_actives: Vec<(String, String)> = Vec::new();
+
             // Added or changed flows
             for (&id, &new_flow) in &new_flow_map {
                 let was_running = flow_manager.is_running(id);
@@ -3273,7 +3314,10 @@ async fn execute_command(
                                     old_flow.output_ids.len(),
                                     new_flow.output_ids.len(),
                                 );
-                                let unreconciled = diff_inputs(
+                                let InputDiffOutcome {
+                                    unreconciled,
+                                    forced_active,
+                                } = diff_inputs(
                                     flow_manager,
                                     id,
                                     &new_flow.input_ids,
@@ -3281,6 +3325,13 @@ async fn execute_command(
                                     _webrtc_sessions,
                                 )
                                 .await;
+                                // Same write-back as the per-flow route. This
+                                // one matters more: `new_config` is what gets
+                                // persisted below, so without it the drift
+                                // ships (#87).
+                                if let Some(survivor) = forced_active {
+                                    forced_actives.push((id.to_string(), survivor));
+                                }
                                 diff_outputs_with_configs(
                                     flow_manager,
                                     id,
@@ -3374,6 +3425,16 @@ async fn execute_command(
                         // else: !was_running && !should_run → no-op
                     }
                 }
+            }
+
+            // Now that `new_flow_map`'s borrow is done, record every forced Take
+            // into the config that is about to be written. Without this the push
+            // persists a member set in which no input is active, and the flow's
+            // next restart comes up black while reporting healthy (#87).
+            drop(new_flow_map);
+            drop(old_flow_map);
+            for (flow_id, survivor) in &forced_actives {
+                apply_forced_active(&mut new_config, flow_id, survivor);
             }
 
             // --- Diff tunnels ---
@@ -6123,6 +6184,270 @@ mod input_definition_diff_tests {
     }
 }
 
+#[cfg(test)]
+mod config_diff_live_flow_tests {
+    //! #89: drive `diff_inputs` against a **running** `FlowManager`.
+    //!
+    //! Three shipped bugs lived in exactly this gap — #85's on-air replacement,
+    //! #87's missing write-back, #90's same-address swap — because every test
+    //! covering the reconcile was a pure-function test of one helper, and the
+    //! bugs were all in how the helpers compose against a real runtime.
+    //!
+    //! UDP inputs on loopback are used deliberately: they bind a real socket
+    //! (so an address collision is a real EADDRINUSE, which is the whole point
+    //! of the #90 case) but need no peer, so the tests are hermetic.
+    use super::*;
+    use crate::config::models::{AppConfig, FlowConfig, InputDefinition};
+    use crate::stats::collector::StatsCollector;
+
+    fn fm() -> Arc<FlowManager> {
+        let stats = Arc::new(StatsCollector::new());
+        let (event_sender, rx) = crate::manager::events::event_channel();
+        // Keep the receiver alive: the emitters are best-effort, but dropping it
+        // would make every event a send error and muddy the logs under -- --nocapture.
+        Box::leak(Box::new(rx));
+        let resource_state = Arc::new(crate::engine::resource_monitor::SystemResourceState::new());
+        Arc::new(FlowManager::new(
+            stats,
+            false,
+            event_sender,
+            resource_state,
+            None,
+            None,
+            #[cfg(all(feature = "display", target_os = "linux"))]
+            crate::display::claim_registry::DisplayClaimRegistry::new(),
+            #[cfg(feature = "webrtc")]
+            None,
+        ))
+    }
+
+    fn udp_input(id: &str, port: u16, active: bool) -> InputDefinition {
+        serde_json::from_value(serde_json::json!({
+            "id": id, "name": id, "active": active,
+            "type": "udp", "bind_addr": format!("127.0.0.1:{port}")
+        }))
+        .expect("input fixture")
+    }
+
+    fn flow_with(ids: &[&str]) -> FlowConfig {
+        serde_json::from_value(serde_json::json!({
+            "id": "f1", "name": "f1",
+            "input_ids": ids, "output_ids": [],
+        }))
+        .expect("flow fixture")
+    }
+
+    fn config(inputs: Vec<InputDefinition>, ids: &[&str]) -> AppConfig {
+        let mut cfg = AppConfig::default();
+        cfg.inputs = inputs;
+        cfg.flows = vec![flow_with(ids)];
+        cfg
+    }
+
+    async fn start(fm: &Arc<FlowManager>, cfg: &AppConfig) {
+        let resolved = cfg.resolve_flow(&cfg.flows[0]).expect("resolve");
+        fm.create_flow(resolved).await.expect("create_flow");
+    }
+
+    /// #87 + #85: dropping the on-air input moves air to a survivor AND reports
+    /// it, so the caller can keep `config.json` tracking the runtime.
+    #[tokio::test]
+    async fn dropping_the_on_air_input_reports_the_forced_take() {
+        let fm = fm();
+        let cfg = config(
+            vec![udp_input("a", 41801, true), udp_input("b", 41802, false)],
+            &["a", "b"],
+        );
+        start(&fm, &cfg).await;
+
+        let outcome = diff_inputs(&fm, "f1", &["b".to_string()], &cfg.inputs, &None).await;
+
+        assert!(
+            outcome.unreconciled.is_empty(),
+            "removal of the on-air input should succeed after the reassignment, got {:?}",
+            outcome.unreconciled
+        );
+        assert_eq!(
+            outcome.forced_active.as_deref(),
+            Some("b"),
+            "the Take the reconciler performed must be reported, or config.json drifts (#87)"
+        );
+        let running = fm.running_input_ids("f1").await.unwrap_or_default();
+        assert_eq!(running, vec!["b".to_string()], "runtime should hold only 'b'");
+        let _ = fm.destroy_flow("f1").await;
+    }
+
+    /// #90: replacing an input with a different entity on the SAME address.
+    /// Adds run before removals, so the incoming socket meets a port the
+    /// outgoing input still holds; the deferred retry is what saves it.
+    #[tokio::test]
+    async fn same_address_swap_succeeds_via_the_deferred_retry() {
+        let fm = fm();
+        let mut cfg = config(
+            vec![udp_input("keep", 41811, true), udp_input("old", 41812, false)],
+            &["keep", "old"],
+        );
+        start(&fm, &cfg).await;
+
+        // 'new' wants exactly the port 'old' is holding.
+        cfg.inputs.push(udp_input("new", 41812, false));
+
+        let outcome = diff_inputs(
+            &fm,
+            "f1",
+            &["keep".to_string(), "new".to_string()],
+            &cfg.inputs,
+            &None,
+        )
+        .await;
+
+        assert!(
+            outcome.unreconciled.is_empty(),
+            "a same-address swap must not condemn the flow to a restart, got {:?}",
+            outcome.unreconciled
+        );
+        let mut running = fm.running_input_ids("f1").await.unwrap_or_default();
+        running.sort();
+        assert_eq!(
+            running,
+            vec!["keep".to_string(), "new".to_string()],
+            "the incoming input must be running — before the retry it was silently dropped \
+             and only the config claimed it (#90)"
+        );
+        let _ = fm.destroy_flow("f1").await;
+    }
+
+    /// #88: a flow that is not in the registry at all must not be diffed as if
+    /// it were running with zero inputs — that adopted nothing and acked success.
+    #[tokio::test]
+    async fn absent_flow_is_reported_unreconciled_not_silently_empty() {
+        let fm = fm();
+        let cfg = config(vec![udp_input("a", 41821, true)], &["a"]);
+        // Deliberately never started.
+        let outcome = diff_inputs(&fm, "f1", &["a".to_string()], &cfg.inputs, &None).await;
+        assert!(
+            !outcome.unreconciled.is_empty(),
+            "diffing a flow that is not running must escalate, not report success"
+        );
+    }
+
+    /// The ordinary case still works: adding a second input to a live flow
+    /// leaves both running and takes nothing off air.
+    #[tokio::test]
+    async fn adding_an_input_keeps_the_incumbent_on_air() {
+        let fm = fm();
+        let mut cfg = config(vec![udp_input("a", 41831, true)], &["a"]);
+        start(&fm, &cfg).await;
+        cfg.inputs.push(udp_input("b", 41832, false));
+
+        let outcome = diff_inputs(
+            &fm,
+            "f1",
+            &["a".to_string(), "b".to_string()],
+            &cfg.inputs,
+            &None,
+        )
+        .await;
+
+        assert!(outcome.unreconciled.is_empty());
+        assert!(
+            outcome.forced_active.is_none(),
+            "nothing was removed, so no Take should have been forced"
+        );
+        let mut running = fm.running_input_ids("f1").await.unwrap_or_default();
+        running.sort();
+        assert_eq!(running, vec!["a".to_string(), "b".to_string()]);
+        let _ = fm.destroy_flow("f1").await;
+    }
+}
+
+#[cfg(test)]
+mod forced_active_writeback_tests {
+    //! #87: the reconciler's forced Take must reach `config.json`.
+    //!
+    //! When a push deletes the input that is on air, the reconciler moves the
+    //! slot to a survivor so the removal is permitted. Before this, nothing
+    //! wrote that back, so the persisted config had the *deleted* input flagged
+    //! active and every surviving member inactive — a member set with no active
+    //! input at all. The flow kept running until its next restart, then came up
+    //! with `active_input()` == None, no forwarder matched, and every output
+    //! emitted only NULL-PID padding while reporting healthy.
+    use super::{apply_forced_active, AppConfig};
+
+    fn config(members: &[(&str, bool)]) -> AppConfig {
+        let mut cfg = AppConfig::default();
+        cfg.inputs = members
+            .iter()
+            .map(|(id, active)| {
+                serde_json::from_value(serde_json::json!({
+                    "id": id, "name": id, "active": active,
+                    "type": "udp", "bind_addr": "0.0.0.0:5000"
+                }))
+                .expect("input fixture")
+            })
+            .collect();
+        cfg.flows = vec![
+            serde_json::from_value(serde_json::json!({
+                "id": "f1", "name": "f1",
+                "input_ids": members.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+                "output_ids": [],
+            }))
+            .expect("flow fixture"),
+        ];
+        cfg
+    }
+
+    fn active_ids(cfg: &AppConfig) -> Vec<&str> {
+        cfg.inputs
+            .iter()
+            .filter(|d| d.active)
+            .map(|d| d.id.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn survivor_becomes_the_only_active_member() {
+        // A was on air; the push drops it and the reconciler picks B.
+        let mut cfg = config(&[("a", true), ("b", false)]);
+        apply_forced_active(&mut cfg, "f1", "b");
+        assert_eq!(active_ids(&cfg), vec!["b"]);
+    }
+
+    #[test]
+    fn exactly_one_member_is_active_afterwards() {
+        // The pathological shape this fixes: nothing active at all.
+        let mut cfg = config(&[("a", false), ("b", false), ("c", false)]);
+        apply_forced_active(&mut cfg, "f1", "c");
+        assert_eq!(active_ids(&cfg), vec!["c"]);
+        // And it is idempotent — a second reconcile must not clear it.
+        apply_forced_active(&mut cfg, "f1", "c");
+        assert_eq!(active_ids(&cfg), vec!["c"]);
+    }
+
+    #[test]
+    fn inputs_outside_the_flow_are_untouched() {
+        // Inputs are shared entities; only this flow's roster may be rewritten.
+        let mut cfg = config(&[("a", true), ("b", false)]);
+        let outsider: super::InputDefinition = serde_json::from_value(serde_json::json!({
+            "id": "other", "name": "other", "active": true,
+            "type": "udp", "bind_addr": "0.0.0.0:5001"
+        }))
+        .expect("fixture");
+        cfg.inputs.push(outsider);
+        apply_forced_active(&mut cfg, "f1", "b");
+        let mut got = active_ids(&cfg);
+        got.sort_unstable();
+        assert_eq!(got, vec!["b", "other"]);
+    }
+
+    #[test]
+    fn unknown_flow_is_a_no_op() {
+        let mut cfg = config(&[("a", true), ("b", false)]);
+        apply_forced_active(&mut cfg, "nope", "b");
+        assert_eq!(active_ids(&cfg), vec!["a"]);
+    }
+}
+
 /// Order the members the new config keeps by how well each qualifies to take
 /// the on-air slot from an input that is being removed, best first.
 ///
@@ -6259,19 +6584,80 @@ mod surviving_active_candidates_tests {
 /// outgoing input still holds — additions run first, so the incoming listener
 /// meets a bound port — which is why the event says so rather than the flow
 /// quietly running one input short.
+/// Write a reconciler-forced Take into the config's `active` flags.
+///
+/// Mirrors what `activate_input` does: within the flow's member set, exactly
+/// one input is active. Scoped to `flow.input_ids` so a shared input entity
+/// referenced by another flow is not disturbed.
+fn apply_forced_active(cfg: &mut AppConfig, flow_id: &str, survivor: &str) {
+    let Some(flow) = cfg.flows.iter().find(|f| f.id == flow_id) else {
+        return;
+    };
+    let members = flow.input_ids.clone();
+    for def in cfg.inputs.iter_mut() {
+        if members.contains(&def.id) {
+            def.active = def.id == survivor;
+        }
+    }
+    tracing::info!(
+        "Config diff: recorded forced Take on flow '{flow_id}' — input '{survivor}' is now \
+         active in config, matching what the reconciler put on air"
+    );
+}
+
+/// What `diff_inputs` did that the caller must persist.
+///
+/// `unreconciled` is the pre-existing return: inputs the engine refused to
+/// surrender, which escalate to a full flow restart.
+///
+/// `forced_active` is the half that used to be dropped on the floor. When a
+/// push deletes the input that is on air, the reconciler hands the slot to a
+/// survivor so `remove_input` will let go. That Take is real and it is on air —
+/// but unlike `activate_input` nothing wrote it back into `cfg.inputs[].active`,
+/// so `config.json` stopped tracking the runtime. The next restart of that flow
+/// then resolved a member set in which **no member is active**,
+/// `ResolvedFlow::active_input()` returned `None`, no per-input forwarder
+/// matched, and every output emitted only the 250 ms NULL-PID keepalive while
+/// the flow reported running: latent black output on a flow that looked healthy
+/// when it was edited (issue #87).
+#[derive(Debug, Default)]
+struct InputDiffOutcome {
+    unreconciled: Vec<String>,
+    forced_active: Option<String>,
+}
+
 async fn diff_inputs(
     flow_manager: &Arc<FlowManager>,
     flow_id: &str,
     new_input_ids: &[String],
     input_defs: &[InputDefinition],
     webrtc_sessions: &WebrtcRegistry,
-) -> Vec<String> {
+) -> InputDiffOutcome {
     use std::collections::HashSet;
 
-    let running: Vec<String> = flow_manager
-        .running_input_ids(flow_id)
-        .await
-        .unwrap_or_default();
+    // A flow that is mid-teardown is neither running nor absent. Without this
+    // check `running_input_ids` returns None, `unwrap_or_default()` fabricates an
+    // empty running set, every add fails "Flow is not running" and is swallowed,
+    // the removal loop iterates nothing, `unreconciled` comes back empty so no
+    // escalation fires — and the push persists and acks success on a runtime that
+    // adopted none of it (#88). Report it as unreconciled instead: the caller's
+    // escalation destroys and rebuilds the flow from the new config, which is the
+    // correct outcome and the only one that actually applies the operator's edit.
+    let Some(running) = flow_manager.running_input_ids(flow_id).await else {
+        let why = if flow_manager.is_stopping(flow_id) {
+            "mid-teardown"
+        } else {
+            "not in the registry"
+        };
+        tracing::warn!(
+            "Config diff: flow '{flow_id}' is {why} — deferring its input reconcile to a full \
+             restart rather than diffing against a flow that is not there"
+        );
+        return InputDiffOutcome {
+            unreconciled: new_input_ids.to_vec(),
+            forced_active: None,
+        };
+    };
     let running_set: HashSet<&str> = running.iter().map(|s| s.as_str()).collect();
     let new_set: HashSet<&str> = new_input_ids.iter().map(|s| s.as_str()).collect();
 
@@ -6280,6 +6666,10 @@ async fn diff_inputs(
         running,
         new_input_ids,
     );
+
+    // Adds that failed to bind. Retried once after the removal loop has freed
+    // the addresses the outgoing inputs were holding — see the bind-failure arm.
+    let mut deferred_adds: Vec<&str> = Vec::new();
 
     // Add newly referenced inputs FIRST — see the note on this function.
     for &id in &new_set {
@@ -6334,23 +6724,20 @@ async fn diff_inputs(
                 err.message,
             );
             let _ = flow_manager.remove_input(flow_id, id).await;
-            // Loud, for the same reason `replace_edited_inputs` is loud on the
-            // identical failure: the flow keeps running without this input
-            // while the config on disk lists it as a member, so silence would
-            // leave the operator's own edit looking like it had applied. A
-            // same-address swap lands here — additions run before removals, so
-            // an incoming listener meets the outgoing one still holding the
-            // port — and that case is invisible without this.
-            flow_manager.event_sender().emit_input(
-                EventSeverity::Warning,
-                category::FLOW,
-                format!(
-                    "Input '{id}' could not start and has been dropped from the running flow \
-                     '{flow_id}', which the saved configuration still lists it in: {}",
-                    err.message
-                ),
-                id,
-            );
+            // Defer rather than give up. Additions run before removals (#84: a
+            // 1->1 replacement is unsatisfiable the other way round, because the
+            // outgoing input is still the flow's only member and therefore still
+            // the active one, so `remove_input` refuses). But add-first means a
+            // same-address swap has the incoming listener meeting a port the
+            // outgoing input still holds — a purely transient collision that
+            // exists only because of the ordering, which no validation can see
+            // because the two inputs live in different config snapshots (#90).
+            //
+            // The removals below free that address. Retrying afterwards fixes
+            // the swap without reordering the general case and without
+            // escalating to a restart. If it still fails then, it was not the
+            // ordering, and the retry reports it exactly as this arm used to.
+            deferred_adds.push(id);
             continue;
         }
         // Register WHIP session channel if this hot-added input is a
@@ -6370,6 +6757,9 @@ async fn diff_inputs(
 
     // Now remove what the new config dropped.
     let mut unreconciled: Vec<String> = Vec::new();
+    // The last survivor the reconciler put on air, if any — returned so the
+    // caller can write it into `cfg.inputs[].active` before persisting.
+    let mut forced_active: Option<String> = None;
     for id in running_set.iter().copied() {
         if new_set.contains(id) {
             continue;
@@ -6410,6 +6800,12 @@ async fn diff_inputs(
                 }
                 match flow_manager.remove_input(flow_id, id).await {
                     Ok(()) => {
+                        // Only once the removal actually succeeded is this the
+                        // slot's real occupant — a reassignment followed by a
+                        // refusal leaves the engine on the survivor but the
+                        // flow condemned to a restart, and that restart
+                        // resolves from config anyway.
+                        forced_active = Some(survivor.to_string());
                         removed = true;
                         break;
                     }
@@ -6442,9 +6838,85 @@ async fn diff_inputs(
         break;
     }
 
+    // Second chance for adds that lost a race with an outgoing input's address.
+    // Only reached once the removals above have actually run, which is the whole
+    // point (#90). Skipped when the flow is already condemned to a restart — that
+    // rebuild starts every input from the new config, so retrying here would just
+    // churn a port that is about to be torn down anyway.
+    if unreconciled.is_empty() {
+        for id in deferred_adds {
+            let Some(input_def) = input_defs.iter().find(|d| d.id == id) else {
+                continue;
+            };
+            tracing::info!(
+                "Config diff: retrying input '{id}' on flow '{flow_id}' now that the removals \
+                 have released their addresses"
+            );
+            // `remove_input` returns once the input task has been signalled, not
+            // once its socket is closed, so the freed address can still be held
+            // for a moment. A single retry therefore races the teardown it is
+            // waiting on — measured flaky in the #89 harness. A few attempts a
+            // short interval apart make it deterministic without inventing a
+            // synchronous close path through the whole input stack.
+            const RETRY_ATTEMPTS: usize = 4;
+            const RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_millis(150);
+            let mut retry_err = None;
+            for attempt in 0..RETRY_ATTEMPTS {
+                if attempt > 0 {
+                    tokio::time::sleep(RETRY_INTERVAL).await;
+                }
+                let spawn_started_at = std::time::Instant::now();
+                retry_err = match flow_manager.add_input(flow_id, input_def.clone()).await {
+                    Ok(_info) => wait_for_first_bind_failure(
+                        flow_manager.event_sender(),
+                        flow_id,
+                        spawn_started_at,
+                    )
+                    .await
+                    .map(|e| e.message),
+                    Err(e) => Some(e.to_string()),
+                };
+                if retry_err.is_none() {
+                    break;
+                }
+                // Roll the failed attempt back before trying again, or the next
+                // add is refused as an existing member rather than retried.
+                let _ = flow_manager.remove_input(flow_id, id).await;
+            }
+            match retry_err {
+                None => {
+                    tracing::info!(
+                        "Config diff: input '{id}' started on retry — the collision was the \
+                         add-before-remove ordering, not the configuration"
+                    );
+                }
+                Some(message) => {
+                    // Already rolled back inside the retry loop.
+                    // Same loudness as before the retry existed: the flow keeps
+                    // running without this input while the config on disk lists
+                    // it, so silence would leave the operator's own edit looking
+                    // like it had applied.
+                    flow_manager.event_sender().emit_input(
+                        EventSeverity::Warning,
+                        category::FLOW,
+                        format!(
+                            "Input '{id}' could not start and has been dropped from the running \
+                             flow '{flow_id}', which the saved configuration still lists it in: \
+                             {message}"
+                        ),
+                        id,
+                    );
+                }
+            }
+        }
+    }
+
     #[cfg(not(feature = "webrtc"))]
     let _ = webrtc_sessions;
-    unreconciled
+    InputDiffOutcome {
+        unreconciled,
+        forced_active,
+    }
 }
 
 /// Apply edited input **definitions** to a running flow in place, and report

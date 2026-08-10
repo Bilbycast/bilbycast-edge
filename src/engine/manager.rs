@@ -41,6 +41,22 @@ pub struct FlowManager {
     /// Active flow runtimes, keyed by flow_id.
     /// Uses `DashMap` for lock-free concurrent reads and fine-grained write locks.
     flows: DashMap<String, Arc<FlowRuntime>>,
+    /// Flows currently inside `destroy_flow`, i.e. removed from `flows` but
+    /// still stopping.
+    ///
+    /// `destroy_flow` removes the entry BEFORE awaiting `stop()`, which awaits
+    /// up to 5 s per output handle plus 5 s per input handle plus 5 s per
+    /// forwarder, sequentially — a 3-output/2-input flow can be absent from the
+    /// registry for tens of seconds. WS commands are `tokio::spawn`ed per frame
+    /// and so overlap freely, and inside that window a concurrent command could
+    /// not tell "this flow does not exist" from "this flow is mid-restart".
+    /// Both silently succeeded on a runtime that adopted nothing (issue #88).
+    ///
+    /// A separate set rather than a state enum on `flows` deliberately: the
+    /// registry stays exactly the lock-free `DashMap<String, Arc<FlowRuntime>>`
+    /// every hot path already reads, and this is consulted only by control-plane
+    /// commands that are about to refuse.
+    stopping: DashMap<String, ()>,
     /// Global stats collector shared across all flows; each flow registers
     /// itself here on creation and unregisters on destruction.
     stats: Arc<StatsCollector>,
@@ -182,6 +198,24 @@ impl Drop for DemuxerHandle {
 }
 
 
+/// Clears a flow's `stopping` mark when the teardown leaves scope.
+///
+/// A guard rather than a bare `remove` at the end of `destroy_flow` because
+/// `runtime.stop()` sits between the two, and a panic or an early return there
+/// would otherwise leave the flow permanently marked stopping — which every
+/// control-plane command would then refuse, turning a transient window into a
+/// permanent one.
+struct StoppingGuard<'a> {
+    flows: &'a DashMap<String, ()>,
+    flow_id: &'a str,
+}
+
+impl Drop for StoppingGuard<'_> {
+    fn drop(&mut self) {
+        self.flows.remove(self.flow_id);
+    }
+}
+
 impl FlowManager {
     /// Create a new `FlowManager` with no active flows.
     ///
@@ -204,6 +238,7 @@ impl FlowManager {
     ) -> Self {
         Self {
             flows: DashMap::new(),
+            stopping: DashMap::new(),
             stats,
             ffmpeg_available,
             event_sender,
@@ -679,6 +714,13 @@ impl FlowManager {
     /// Returns an error if no flow with the given ID is currently running.
     pub async fn destroy_flow(&self, flow_id: &str) -> Result<()> {
         if let Some((_, runtime)) = self.flows.remove(flow_id) {
+            // Published for the whole teardown so an overlapping command can see
+            // "stopping" rather than "absent" — see the `stopping` field.
+            self.stopping.insert(flow_id.to_string(), ());
+            let _guard = StoppingGuard {
+                flows: &self.stopping,
+                flow_id,
+            };
             runtime.stop().await;
             self.stats.unregister_flow(flow_id);
             // Clear the flow's WebRTC session entries (WHIP input channel,
@@ -773,6 +815,16 @@ impl FlowManager {
     /// attached" set so a hot-add / hot-remove dispatch correctly identifies
     /// the deltas against the running flow.
     #[allow(dead_code)] // Phase 1 wires callers via the update_flow / update_config diff.
+    /// `true` while `destroy_flow` is tearing this flow down.
+    ///
+    /// A flow that is stopping is neither running nor absent, and a control-plane
+    /// command that cannot tell the difference will act on a phantom: adds fail
+    /// "Flow is not running", the removal loop iterates nothing, and the push
+    /// persists and acks success having adopted none of itself (#88).
+    pub fn is_stopping(&self, flow_id: &str) -> bool {
+        self.stopping.contains_key(flow_id)
+    }
+
     pub async fn running_input_ids(&self, flow_id: &str) -> Option<Vec<String>> {
         let runtime = self.flows.get(flow_id)?;
         let handles = runtime.input_handles.read().await;
