@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -122,6 +122,104 @@ async fn srt_send_chunked(socket: &Arc<SrtSocket>, data: &[u8]) -> Result<usize,
 /// that layer awaits, so it backpressures, whereas this one drops — which is
 /// why it needed the headroom more, not less.
 const SRT_SEND_QUEUE_CAPACITY: usize = 4096;
+
+/// Byte ceiling for the same queue, applied alongside the slot count.
+///
+/// The slot cap alone is not a memory bound, because **an item is a whole
+/// upstream `RtpPacket` and its size is set by the publisher**, varying by
+/// ~800× across source classes (#98):
+///
+/// | publisher | bytes per item |
+/// |---|---|
+/// | SDI, WebRTC | one 188 B TS packet |
+/// | UDP / RTP / SRT passthrough | ~1316 B (7 × 188) |
+/// | RTMP, RTSP | a **whole access unit** — measured IDRs 123–144 KB |
+///
+/// So 4096 slots is ~5.4 MB of TS-class traffic but up to ~164 MB of
+/// RTMP/RTSP access units. Those sources never overflowed at the old 256
+/// slots either, so they gain nothing from the depth and pay for all of it.
+///
+/// 8 MiB is chosen so the **slot cap still binds first for every class the
+/// depth was raised for**: 4096 × 1316 B ≈ 5.4 MB and 4096 × 188 B ≈ 0.8 MB
+/// are both under it, so the TS-class behaviour measured in #95 (0 drops
+/// across 10.6 M packets) is preserved exactly. For whole-AU items the byte
+/// cap binds first at ~200 access units — still far more burst absorption
+/// than the ~2 an IDR needs, at 5 % of the memory.
+///
+/// Deliberately a fixed budget rather than one derived from
+/// `BandwidthProfile`: the profile describes the *flow's* bitrate class,
+/// while this queue's exposure is set by the publisher's item shape, and
+/// the two are independent — an `Uncompressed` flow publishing 188 B items
+/// needs less headroom here than a `Standard` flow publishing whole AUs.
+const SRT_SEND_QUEUE_MAX_BYTES: usize = 8 * 1024 * 1024;
+
+/// Sender half of the SRT egress queue, bounded in **both** slots and bytes.
+///
+/// Wraps `mpsc::Sender` rather than replacing it so the item shape and the
+/// redundant loop's both-legs-`Full` reconnect semantics are untouched —
+/// `try_send` keeps returning `TrySendError` with the item handed back, and
+/// every existing call site reads the same.
+#[derive(Clone)]
+struct SendQueueTx {
+    tx: tokio::sync::mpsc::Sender<(Bytes, u64)>,
+    queued_bytes: Arc<AtomicUsize>,
+}
+
+impl SendQueueTx {
+    /// Non-blocking enqueue. `Full` when either bound would be exceeded.
+    ///
+    /// Reserves the bytes before offering the item and releases them on any
+    /// rejection, so the counter can transiently over-read but never
+    /// under-read — an under-read would let the queue past its ceiling,
+    /// which is the failure this bound exists to prevent.
+    fn try_send(
+        &self,
+        item: (Bytes, u64),
+    ) -> Result<(), tokio::sync::mpsc::error::TrySendError<(Bytes, u64)>> {
+        let n = item.0.len();
+        let prev = self.queued_bytes.fetch_add(n, Ordering::Relaxed);
+        if prev.saturating_add(n) > SRT_SEND_QUEUE_MAX_BYTES {
+            self.queued_bytes.fetch_sub(n, Ordering::Relaxed);
+            return Err(tokio::sync::mpsc::error::TrySendError::Full(item));
+        }
+        match self.tx.try_send(item) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                self.queued_bytes.fetch_sub(n, Ordering::Relaxed);
+                Err(e)
+            }
+        }
+    }
+}
+
+/// Receiver half. Releases each item's bytes as it is dequeued.
+struct SendQueueRx {
+    rx: tokio::sync::mpsc::Receiver<(Bytes, u64)>,
+    queued_bytes: Arc<AtomicUsize>,
+}
+
+impl SendQueueRx {
+    async fn recv(&mut self) -> Option<(Bytes, u64)> {
+        let item = self.rx.recv().await?;
+        self.queued_bytes
+            .fetch_sub(item.0.len(), Ordering::Relaxed);
+        Some(item)
+    }
+}
+
+/// Build a queue bounded by [`SRT_SEND_QUEUE_CAPACITY`] slots **and**
+/// [`SRT_SEND_QUEUE_MAX_BYTES`] bytes, whichever binds first.
+fn send_queue() -> (SendQueueTx, SendQueueRx) {
+    let (tx, rx) = tokio::sync::mpsc::channel::<(Bytes, u64)>(SRT_SEND_QUEUE_CAPACITY);
+    let queued_bytes = Arc::new(AtomicUsize::new(0));
+    (
+        SendQueueTx {
+            tx,
+            queued_bytes: Arc::clone(&queued_bytes),
+        },
+        SendQueueRx { rx, queued_bytes },
+    )
+}
 
 /// How often a saturated send queue may log. Discards arrive in bursts of
 /// hundreds, so an unthrottled warning would itself become a load source.
@@ -847,8 +945,7 @@ async fn srt_output_forward_loop(
     compressed_audio_input: bool,
     frame_rate_rx: Option<tokio::sync::watch::Receiver<Option<f64>>>,
 ) -> anyhow::Result<bool> {
-    let (send_tx, mut send_rx) =
-        tokio::sync::mpsc::channel::<(Bytes, u64)>(SRT_SEND_QUEUE_CAPACITY);
+    let (send_tx, mut send_rx) = send_queue();
     let send_sink = sink.clone();
     let send_stats = stats.clone();
     let output_id = config.id.clone();
@@ -1249,6 +1346,7 @@ async fn srt_output_forward_loop(
                             output_id = %config.id,
                             dropped_total = send_queue_dropped,
                             capacity = SRT_SEND_QUEUE_CAPACITY,
+                            max_bytes = SRT_SEND_QUEUE_MAX_BYTES,
                             "SRT output send queue full — discarding egress packets; \
                              the srt-io task is not draining fast enough to absorb the \
                              source's burst (a large IDR access unit is the usual cause)"
@@ -1402,8 +1500,7 @@ async fn srt_output_redundant_loop(
         // on an idle socket.
         let mut rx = broadcast_tx.subscribe();
 
-        let (send_tx_leg1, mut send_rx_leg1) =
-            tokio::sync::mpsc::channel::<(Bytes, u64)>(SRT_SEND_QUEUE_CAPACITY);
+        let (send_tx_leg1, mut send_rx_leg1) = send_queue();
         let send_socket1 = socket_leg1.clone();
         let send_stats1 = stats.clone();
         let output_id1 = config.id.clone();
@@ -1513,7 +1610,7 @@ async fn srt_output_redundant_loop(
 
         // leg 2 send task is spawned lazily once the leg-2 future resolves.
         let mut socket_leg2: Option<Arc<SrtSocket>> = None;
-        let mut send_tx_leg2_opt: Option<tokio::sync::mpsc::Sender<(Bytes, u64)>> = None;
+        let mut send_tx_leg2_opt: Option<SendQueueTx> = None;
 
         // Optional output delay buffer for stream synchronization.
         let resolved = if let Some(ref delay) = config.delay {
@@ -1563,7 +1660,7 @@ async fn srt_output_redundant_loop(
                         listener_leg2 = returned_listener;
                     }
                     if let Some(sock2) = sock {
-                        let (tx2, mut rx2) = tokio::sync::mpsc::channel::<(Bytes, u64)>(SRT_SEND_QUEUE_CAPACITY);
+                        let (tx2, mut rx2) = send_queue();
                         let send_socket2 = sock2.clone();
                         let output_id2 = config.id.clone();
                         tokio::spawn(async move {
@@ -2095,3 +2192,80 @@ async fn srt_output_bonded_loop(
     }
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn item(bytes: usize) -> (Bytes, u64) {
+        (Bytes::from(vec![0u8; bytes]), 0)
+    }
+
+    // ── Egress queue byte bound (issue #98) ──────────────────────────
+    //
+    // An item is a whole upstream `RtpPacket`, and its size is set by the
+    // publisher: 188 B from SDI, ~1316 B from TS passthrough, a whole
+    // access unit (123-144 KB measured) from RTMP/RTSP. A slot count is
+    // therefore not a memory bound.
+
+    #[test]
+    fn ts_class_items_are_still_bounded_by_slots_not_bytes() {
+        // The property that preserves #95: for the classes whose depth was
+        // raised, the slot cap must bind first, or this change would
+        // silently undo the fix it sits on top of.
+        assert!(SRT_SEND_QUEUE_CAPACITY * 1316 < SRT_SEND_QUEUE_MAX_BYTES);
+        assert!(SRT_SEND_QUEUE_CAPACITY * 188 < SRT_SEND_QUEUE_MAX_BYTES);
+    }
+
+    #[test]
+    fn whole_access_unit_items_are_bounded_by_bytes() {
+        // 4096 slots x ~40 KB would be ~164 MB. The byte cap must bind
+        // well before the slot cap for this class.
+        let au = 40 * 1024;
+        assert!(SRT_SEND_QUEUE_MAX_BYTES / au < SRT_SEND_QUEUE_CAPACITY);
+    }
+
+    #[tokio::test]
+    async fn byte_cap_rejects_before_the_slot_cap_for_large_items() {
+        let (tx, _rx) = send_queue();
+        let big = 1024 * 1024; // 1 MiB items
+        let mut accepted = 0;
+        for _ in 0..SRT_SEND_QUEUE_CAPACITY {
+            if tx.try_send(item(big)).is_err() {
+                break;
+            }
+            accepted += 1;
+        }
+        // 8 MiB ceiling / 1 MiB items
+        assert_eq!(accepted, SRT_SEND_QUEUE_MAX_BYTES / big);
+        assert!(accepted < SRT_SEND_QUEUE_CAPACITY, "slot cap must not be what bound it");
+    }
+
+    #[tokio::test]
+    async fn dequeue_releases_the_reserved_bytes() {
+        // Without the release the queue would wedge shut after one fill,
+        // which is worse than the unbounded-memory bug being fixed.
+        let (tx, mut rx) = send_queue();
+        let big = 1024 * 1024;
+        while tx.try_send(item(big)).is_ok() {}
+        assert!(tx.try_send(item(big)).is_err(), "should be full");
+        let got = rx.recv().await;
+        assert!(got.is_some());
+        tx.try_send(item(big))
+            .expect("a dequeue must free room for another item");
+    }
+
+    #[tokio::test]
+    async fn rejection_does_not_leak_reserved_bytes() {
+        // The reserve-then-offer order must unwind on rejection, or every
+        // rejected item would permanently shrink the queue.
+        let (tx, _rx) = send_queue();
+        let oversized = SRT_SEND_QUEUE_MAX_BYTES + 1;
+        for _ in 0..10 {
+            assert!(tx.try_send(item(oversized)).is_err());
+        }
+        // The ceiling is intact: a normal item still fits.
+        tx.try_send(item(1316))
+            .expect("rejected oversized items must not consume budget");
+    }
+}
