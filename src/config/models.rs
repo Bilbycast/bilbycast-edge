@@ -6666,6 +6666,23 @@ fn default_st2110_anc_pt() -> u8 {
 /// output at `start_output()` with `display_device_invalid`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DisplayOutputConfig {
+    /// Presentation lead in milliseconds for the wall-clock (muted /
+    /// video-only) pacing path.
+    ///
+    /// The pacer cannot present a frame that has not arrived: a frame handed
+    /// over past its target is shown immediately on top of the previous one,
+    /// and the next frame then waits its full slot — a short/long pair the
+    /// operator sees as stutter. Lead time moves every target later so a
+    /// late-arriving frame still makes its slot, costing exactly that much
+    /// added display latency.
+    ///
+    /// Unset (the default) picks per decoder: the RKMPP path gets 200 ms,
+    /// where its dose-response saturates (elbow ~120 ms, one frame period
+    /// buys nothing); every other backend gets 0 and is unchanged. Set this
+    /// to override — `0` disables it outright, useful where the added
+    /// latency matters more than the stutter. Range 0..=1000.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub present_lead_ms: Option<u32>,
     /// Unique output ID within this flow.
     pub id: String,
     /// Human-readable name.

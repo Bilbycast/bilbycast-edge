@@ -803,6 +803,7 @@ async fn run_display_output(
     let display_force_cpu_blit = Arc::clone(&force_cpu_blit_for_bars);
     let display_prime_scanout_failed = Arc::clone(&prime_scanout_failed);
     let display_prime_cache_stale = Arc::clone(&prime_cache_stale);
+    let display_configured_lead_ms = config.present_lead_ms;
     #[cfg(feature = "rga-transfer")]
     let display_rga_transfer_active = Arc::clone(&rga_transfer_active);
     // Independent DRM-master release handle (a dup of the card fd) captured
@@ -816,6 +817,7 @@ async fn run_display_output(
             vrx,
             display_clock,
             display_counters,
+            display_configured_lead_ms,
             display_cancel,
             display_output_stats,
             decoder_kind_label,
@@ -4553,6 +4555,12 @@ impl DisplayPresentLatch {
 /// rebuild: this servo slides the presentation phase relative to vblank, and
 /// on a 25 fps source driving a 50 Hz panel a phase crossing costs a visible
 /// hitch. Default is the previous hard-coded 250 us.
+/// Lead applied on the RKMPP display path only. See [`display_lead_ms`].
+///
+/// 200 ms is where the dose-response saturates on this backend; the elbow
+/// is ~120 ms and one frame period (40 ms) buys nothing.
+const RKMPP_PRESENT_LEAD_MS: u64 = 200;
+
 /// Presentation lead time in milliseconds for the **wall-clock** pacing
 /// path, overridable via `BILBYCAST_DISPLAY_LEAD_MS`.
 ///
@@ -4592,14 +4600,31 @@ impl DisplayPresentLatch {
 /// video-only output. On the audio-master path `wall_anchor` is cleared and
 /// never consulted, so this cannot shift video against audio and carries no
 /// lip-sync risk. Setting it to 0 restores the previous behaviour.
-fn display_lead_ms() -> u64 {
-    static CACHED: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    *CACHED.get_or_init(|| {
-        std::env::var("BILBYCAST_DISPLAY_LEAD_MS")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(200)
-    })
+fn display_lead_ms(
+    counters: &DisplayStatsCounters,
+    configured: Option<u32>,
+) -> u64 {
+    // Operator intent wins: an explicit value (including 0) is honoured as
+    // written, so a deployment that would rather keep the latency than the
+    // smoothness can say so.
+    if let Some(v) = configured {
+        return v as u64;
+    }
+    if let Some(v) = std::env::var("BILBYCAST_DISPLAY_LEAD_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+    {
+        return v;
+    }
+    // Keyed off the decoder that is actually running, not off host or
+    // config guesswork. Only the backend measured to hand frames over
+    // late gets the lead; every other path keeps its existing timing and
+    // its existing latency, so this cannot regress deployments that do
+    // not have the fault.
+    match counters.load_active_decoder_label() {
+        DisplayDecoderLabel::RkmppZeroCopy => RKMPP_PRESENT_LEAD_MS,
+        _ => 0,
+    }
 }
 
 fn display_servo_step_us() -> u64 {
@@ -4617,6 +4642,7 @@ fn display_loop(
     mut vrx: mpsc::Receiver<VideoFrame>,
     clock: Arc<AudioClock>,
     counters: Arc<DisplayStatsCounters>,
+    configured_lead_ms: Option<u32>,
     cancel: CancellationToken,
     output_stats: Arc<OutputStatsAccumulator>,
     decoder_kind_label: &'static str,
@@ -5196,7 +5222,7 @@ fn display_loop(
             // immediately on top of the previous one (#104).
             let (anchor_pts, anchor_at) = wall_anchor.get_or_insert((
                 next.pts_90k,
-                now + std::time::Duration::from_millis(display_lead_ms()),
+                now + std::time::Duration::from_millis(display_lead_ms(&counters, configured_lead_ms)),
             ));
             let pts_delta_ms = (next.pts_90k.wrapping_sub(*anchor_pts) as i64) / 90;
             let wall_delta_ms = now.duration_since(*anchor_at).as_millis() as i64;

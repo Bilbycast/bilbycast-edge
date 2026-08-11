@@ -6095,6 +6095,18 @@ fn validate_display_output(c: &crate::config::models::DisplayOutputConfig) -> Re
     if c.name.len() > 256 {
         return Err(anyhow::anyhow!("display output '{}' name too long (>256 chars)", c.id));
     }
+    // Lead time buys smoothness with latency, one for one. Bounded at 1 s so a
+    // typo cannot park the picture a minute behind the source; 0 is explicitly
+    // allowed and means "no lead", which is the right answer wherever the
+    // decoder hands frames over on time.
+    if let Some(lead) = c.present_lead_ms
+        && lead > 1000
+    {
+        return Err(anyhow::anyhow!(
+            "display output '{}': present_lead_ms must be in [0, 1000], got {lead}",
+            c.id
+        ));
+    }
     validate_output_group(c.group.as_deref(), &c.id)?;
 
     // Connector regex — KMS canonical names: HDMI-A-1, DP-2, DVI-D-1, VGA-1.
