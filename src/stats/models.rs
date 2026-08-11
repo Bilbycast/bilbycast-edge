@@ -1362,6 +1362,18 @@ pub struct DisplayStats {
     /// work is missing vblank slots.
     #[serde(default)]
     pub blit_us_max: u64,
+    #[serde(default)]
+    pub present_interval_us_min: u64,
+    #[serde(default)]
+    pub present_interval_us_max: u64,
+    #[serde(default)]
+    pub present_interval_outliers: u64,
+    #[serde(default)]
+    pub present_bucket: [u64; 8],
+    #[serde(default)]
+    pub present_no_sleep: u64,
+    #[serde(default)]
+    pub present_interval_count: u64,
     /// Average `blit_and_present` duration since startup, in µs.
     /// Computed on the fly by the snapshot path from the running sum
     /// + count atomics on the counter struct.

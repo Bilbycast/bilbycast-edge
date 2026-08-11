@@ -1829,6 +1829,41 @@ output.
   field does **not** override that runtime-learned pin — so opting out
   can cost frames but cannot wedge the output.
 
+- **`present_lead_ms`** — how far ahead of the panel the wall-clock pacer
+  buffers, in milliseconds. Range `0..=1000`. Unset (default) resolves
+  per **live decoder**: `200` on RKMPP, `0` — bit-for-bit unchanged — on
+  every other backend.
+
+  The pacer sleeps until each frame's due time, which absorbs arrival
+  jitter perfectly right up until a frame arrives *after* its due time.
+  Past that there is nothing left to sleep: the frame is presented
+  immediately on top of the previous one and the next waits its full
+  slot. That short/long pair is what an operator sees as stutter, and
+  because every frame is still presented, no loss counter moves — which
+  is why it went undiagnosed until `present_bucket` was added (issue
+  #104). RKMPP's `receive_frame` blocks up to 17 ms and delivers in
+  bursts; VAAPI's returns in ~1 µs and never triggers it.
+
+  Lead time moves every target later, which in practice keeps
+  `lead / frame_period` frames buffered ahead of the panel so a burst is
+  served from that backlog. Measured on RK3568 at 25 fps, presents
+  landing on target: 70 % at `0`, 68 % at `40`, 81 % at `80`, 98 % at
+  `120`, 99.8 % at `200`. One frame period buys nothing — the elbow is
+  ~120 ms and 200 ms saturates.
+
+  The cost is exactly that much added display latency, and nothing else:
+  the setting lives on the muted / video-only pacing branch, so there is
+  no audio for the picture to fall out of sync with. Set `0` where a
+  confidence monitor's latency matters more than its smoothness.
+
+  Two limits worth knowing. It is **clamped at run time** to what the
+  decode queue can hold (`MPSC_VIDEO_DEPTH / 3` frames) — a lead deeper
+  than the queue does not buffer, it spills onto
+  `frames_dropped_mpsc_full`. And it **does not apply to an output with
+  an `audio_device`**: that path paces against the measured ALSA playout
+  position, which has no anchor to seed, so an audio-enabled display
+  output on RKMPP still has the fault.
+
 **Build prerequisites.** `display` is Linux-only and gated on the
 `display` Cargo feature (off by default). Schema is unconditional —
 configs round-trip on every platform. On non-Linux / non-feature

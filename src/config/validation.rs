@@ -6095,6 +6095,18 @@ fn validate_display_output(c: &crate::config::models::DisplayOutputConfig) -> Re
     if c.name.len() > 256 {
         return Err(anyhow::anyhow!("display output '{}' name too long (>256 chars)", c.id));
     }
+    // Lead time buys smoothness with latency, one for one. Bounded at 1 s so a
+    // typo cannot park the picture a minute behind the source; 0 is explicitly
+    // allowed and means "no lead", which is the right answer wherever the
+    // decoder hands frames over on time.
+    if let Some(lead) = c.present_lead_ms
+        && lead > 1000
+    {
+        return Err(anyhow::anyhow!(
+            "display output '{}': present_lead_ms must be in [0, 1000], got {lead}",
+            c.id
+        ));
+    }
     validate_output_group(c.group.as_deref(), &c.id)?;
 
     // Connector regex — KMS canonical names: HDMI-A-1, DP-2, DVI-D-1, VGA-1.
@@ -13302,6 +13314,63 @@ mod tests {
         assert!(
             super::sdi_duplicate_claims(&config).is_empty(),
             "only a byte-identical name is the same device"
+        );
+    }
+
+    // ── Display presentation lead (issue #104) ────────────────────────
+
+    fn display_output_with_lead(
+        lead: Option<u32>,
+    ) -> crate::config::models::DisplayOutputConfig {
+        let mut v = serde_json::json!({
+            "id": "disp-1",
+            "name": "Monitor wall 1",
+            "device": "HDMI-A-1",
+        });
+        if let Some(l) = lead {
+            v["present_lead_ms"] = serde_json::json!(l);
+        }
+        serde_json::from_value(v).expect("minimal display output parses")
+    }
+
+    /// The lead buys smoothness with display latency one for one, so it is
+    /// bounded. `0` is explicitly meaningful — it is the documented way to
+    /// opt a Rockchip node out of the per-decoder default — and must not be
+    /// rejected alongside the out-of-range values.
+    #[test]
+    fn display_present_lead_ms_is_bounded_and_allows_zero() {
+        for ok in [None, Some(0), Some(200), Some(1000)] {
+            assert!(
+                super::validate_display_output(&display_output_with_lead(ok)).is_ok(),
+                "present_lead_ms {ok:?} should validate"
+            );
+        }
+        let err = super::validate_display_output(&display_output_with_lead(Some(1001)))
+            .expect_err("1001 is out of range");
+        assert!(
+            err.to_string().contains("present_lead_ms"),
+            "error should name the offending field, got: {err}"
+        );
+    }
+
+    /// A config carrying the field must round-trip it. The manager replays a
+    /// cached copy of the node's config on push, so a field that serialises
+    /// away is a knob the operator sets once and silently loses.
+    #[test]
+    fn display_present_lead_ms_survives_a_config_round_trip() {
+        let cfg = display_output_with_lead(Some(120));
+        let json = serde_json::to_string(&cfg).expect("serialise");
+        let back: crate::config::models::DisplayOutputConfig =
+            serde_json::from_str(&json).expect("deserialise");
+        assert_eq!(back.present_lead_ms, Some(120));
+
+        // Unset stays absent rather than materialising as 0, which would
+        // pin every RKMPP output to "no lead" on the first round trip.
+        let unset = display_output_with_lead(None);
+        let json = serde_json::to_string(&unset).expect("serialise");
+        assert!(
+            !json.contains("present_lead_ms"),
+            "unset must not serialise, got: {json}"
         );
     }
 }

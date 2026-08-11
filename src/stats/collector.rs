@@ -709,6 +709,42 @@ pub struct DisplayStatsCounters {
     /// ~33 000 µs mean we've missed a vblank slot at least once and
     /// are deferring the next iteration's pacing.
     pub blit_us_max: AtomicU64,
+    /// Interval between successive page-flips, in microseconds — the only
+    /// direct measure of what the panel actually shows. Every other counter
+    /// here records a *loss*, and the stutter class in #104 loses nothing:
+    /// the frames are all presented, just at irregular times, so none of the
+    /// existing stats move. On a 25 fps source driving a 50 Hz panel each
+    /// frame must hold exactly two vblanks (40 ms); one holding one or three
+    /// is a visible hitch.
+    pub present_interval_us_min: AtomicU64,
+    pub present_interval_us_max: AtomicU64,
+    /// Intervals at least half a vblank (>=10 ms) off the running frame
+    /// period — frames that did not hold their expected vblank count.
+    ///
+    /// **Use this within one run, never to compare two.** Its reference is
+    /// `frame_period_ms`, an EMA fed by the same frame-to-frame deltas being
+    /// measured, so the threshold moves with the signal. That is not
+    /// hypothetical: it scored one identical configuration at 1.4 % and then
+    /// 34.6 %, and a fix claim was published off the low reading and
+    /// retracted (#104). `present_bucket` exists because of this and is what
+    /// any A/B must be read from.
+    pub present_interval_outliers: AtomicU64,
+    /// Present intervals in **fixed** microsecond buckets. Deliberately not
+    /// keyed off `frame_period_ms`: that is an EMA fed by the same
+    /// frame-to-frame deltas being measured, so a threshold derived from it
+    /// moves with the signal and cannot support comparing one arm against
+    /// another — which is how a lead-time experiment produced 1.4 % and 34.6 %
+    /// at the same setting. These boundaries are constants, so runs compare.
+    /// Bins (us): <10k, 10-20k, 20-30k, 30-38k, 38-42k (on target at 25 fps),
+    /// 42-60k, 60-100k, >=100k.
+    pub present_bucket: [AtomicU64; 8],
+    /// Frames presented immediately because they arrived at or past their
+    /// target, leaving no time to sleep. Separates "arrived late" from "slept
+    /// but missed vblank" — the outlier count conflates the two, and they
+    /// need different fixes.
+    pub present_no_sleep: AtomicU64,
+    /// Denominator for the above.
+    pub present_interval_count: AtomicU64,
     /// Sum of `blit_and_present` durations since startup (µs). Read
     /// against `blit_count` for an average; the manager UI doesn't
     /// reset these mid-run.
@@ -1545,6 +1581,26 @@ impl OutputStatsAccumulator {
                 bars_overlay_enabled: h.counters.bars_overlay_enabled.load(Ordering::Relaxed),
                 meter_publishes: h.counters.meter_publishes.load(Ordering::Relaxed),
                 blit_us_max: h.counters.blit_us_max.load(Ordering::Relaxed),
+                present_interval_us_min: h
+                    .counters
+                    .present_interval_us_min
+                    .load(Ordering::Relaxed),
+                present_interval_us_max: h
+                    .counters
+                    .present_interval_us_max
+                    .load(Ordering::Relaxed),
+                present_interval_outliers: h
+                    .counters
+                    .present_interval_outliers
+                    .load(Ordering::Relaxed),
+                present_bucket: std::array::from_fn(|i| {
+                    h.counters.present_bucket[i].load(Ordering::Relaxed)
+                }),
+                present_no_sleep: h.counters.present_no_sleep.load(Ordering::Relaxed),
+                present_interval_count: h
+                    .counters
+                    .present_interval_count
+                    .load(Ordering::Relaxed),
                 blit_us_avg: {
                     let total = h.counters.blit_us_total.load(Ordering::Relaxed);
                     let count = h.counters.blit_count.load(Ordering::Relaxed);
