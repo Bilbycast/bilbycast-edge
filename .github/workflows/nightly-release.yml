@@ -146,17 +146,31 @@ jobs:
         id: decklink
         if: matrix.variant == 'full'
         env:
+          DECKLINK_SDK_DEPLOY_KEY: ${{ secrets.DECKLINK_SDK_DEPLOY_KEY }}
           DECKLINK_SDK_TOKEN: ${{ secrets.DECKLINK_SDK_TOKEN }}
         run: |
+          # Either credential unlocks the headers. The deploy key is preferred:
+          # it is scoped to that one repo, is not tied to any person's account,
+          # and does not expire. A fine-grained PAT does expire, and because
+          # this step warns rather than blocks, an expired PAT silently drops
+          # SDI from every later release — the exact silent failure this area
+          # already suffered from v0.99.2 to v0.102.0.
+          if [ -n "${DECKLINK_SDK_DEPLOY_KEY}" ]; then
+            echo "OK: DECKLINK_SDK_DEPLOY_KEY is set - SDI (DeckLink) will be built into this artefact."
+            echo "sdi=on" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           if [ -n "${DECKLINK_SDK_TOKEN}" ]; then
             echo "OK: DECKLINK_SDK_TOKEN is set - SDI (DeckLink) will be built into this artefact."
+            echo "NOTE: prefer DECKLINK_SDK_DEPLOY_KEY - a PAT expires, and its"
+            echo "      expiry silently drops SDI from later releases."
             echo "sdi=on" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           echo "sdi=off" >> "$GITHUB_OUTPUT"
           cat >&2 <<'EOF'
           ======================================================================
-          WARNING - DECKLINK_SDK_TOKEN is not set.
+          WARNING - no DeckLink SDK credential is set.
           ======================================================================
 
           This `*-linux-full` artefact is being built WITHOUT SDI (Blackmagic
@@ -165,30 +179,34 @@ jobs:
           build CONTINUES (the `sdi-decklink` cargo feature is dropped for this
           run) rather than blocking the release.
 
-          To ship SDI in the full artefact, set up the token once (every later
-          release then picks it up automatically):
+          To ship SDI in the full artefact, do the one-time setup below. Every
+          later release then picks it up automatically.
 
-          WHY A TOKEN: the DeckLink SDK is EULA-gated and cannot live in this
-          public repository. Only the SDK *headers* are needed to build -
-          libDeckLinkAPI.so is dlopened at runtime by Desktop Video on the
-          operator's host - but there is no header-free build path: the C++ shim
-          #includes DeckLinkAPI.h and the SDK's own DeckLinkAPIDispatch.cpp is
-          compiled in.
+          WHY A CREDENTIAL: the DeckLink SDK is EULA-gated and is deliberately
+          NOT vendored into this public repository. Only the SDK *headers* are
+          needed to build - libDeckLinkAPI.so is dlopened at runtime by Desktop
+          Video on the operator's host - but there is no header-free build path:
+          the C++ shim #includes DeckLinkAPI.h and the SDK's own
+          DeckLinkAPIDispatch.cpp is compiled in.
 
-          ONE-TIME SETUP (do this once; every later release just works):
+          ONE-TIME SETUP (full walkthrough: docs/sdi.md "Building with SDI"):
 
-            1. Download the "Desktop Video SDK" from Blackmagic Design and
-               accept the EULA:  https://www.blackmagicdesign.com/support/
-            2. Create a PRIVATE repo Bilbycast/bilbycast-decklink-sdk and commit
-               the SDK's `Linux/include` directory to it - the one holding BOTH
-               DeckLinkAPI.h and DeckLinkAPIDispatch.cpp:
-                 git init && cp -r /path/to/SDK/Linux/include . && git add -A
-                 git commit -m "DeckLink SDK <version> headers" && git push
-               Private, so nothing is redistributed. Tag it with the SDK version.
-            3. Create a fine-grained PAT with Contents:Read on that repo only,
-               and add it here as the DECKLINK_SDK_TOKEN secret
-               (Settings -> Secrets and variables -> Actions).
+            1. Download the "Desktop Video SDK" (SDK 16 or newer - the shim
+               needs IDeckLinkVideoBuffer / StartAccess) from Blackmagic Design
+               and accept the EULA:  https://www.blackmagicdesign.com/support/
+            2. Create a PRIVATE repo Bilbycast/bilbycast-decklink-sdk holding
+               ONLY the SDK's `Linux/include` directory - the one with BOTH
+               DeckLinkAPI.h and DeckLinkAPIDispatch.cpp. Do not commit
+               Samples/, the .so, or the installer. Tag it with the SDK version.
+            3. Generate an SSH keypair, add the PUBLIC half to that repo as a
+               deploy key (read-only), and add the PRIVATE half here as the
+               DECKLINK_SDK_DEPLOY_KEY secret (Settings -> Secrets and
+               variables -> Actions).
             4. Re-run this workflow.
+
+          A fine-grained PAT with Contents:Read, set as DECKLINK_SDK_TOKEN, also
+          works and is checked as a fallback - but it EXPIRES, and its expiry
+          silently drops SDI from every later release. Prefer the deploy key.
 
           To bump the SDK later, commit new headers to that repo. Nothing here
           changes.
@@ -276,18 +294,22 @@ jobs:
           sudo apt-get install -y cmake make clang libclang-dev pkg-config libssl-dev g++ \
             libasound2-dev nasm
 
-      # Materialises the EULA-gated DeckLink SDK headers that
-      # The SDK headers live in a private org repo rather than a download URL:
-      # same auth as every other sibling checkout, no expiring pre-signed URLs,
-      # and an SDK bump is a commit there rather than a secret rotation here.
-      # Private, so nothing is redistributed - build.rs only needs the headers;
-      # libDeckLinkAPI.so is dlopened at runtime from Desktop Video.
+      # Materialises the EULA-gated DeckLink SDK headers. They live in a private
+      # org repo rather than behind a download URL: no expiring pre-signed URLs,
+      # no scripted assent to Blackmagic's registration form, and an SDK bump is
+      # a commit there rather than a change here. Private, so nothing is
+      # redistributed — build.rs needs only the headers; libDeckLinkAPI.so is
+      # dlopened at runtime from the operator's own Desktop Video install.
+      #
+      # ssh-key wins when set; actions/checkout falls back to `token` when the
+      # key input is empty, so both credential styles work through one step.
       - name: Checkout DeckLink SDK headers (private)
         if: matrix.variant == 'full' && steps.decklink.outputs.sdi == 'on'
         uses: actions/checkout@v7
         with:
           repository: Bilbycast/bilbycast-decklink-sdk
-          token: ${{ secrets.DECKLINK_SDK_TOKEN }}
+          ssh-key: ${{ secrets.DECKLINK_SDK_DEPLOY_KEY }}
+          token: ${{ secrets.DECKLINK_SDK_TOKEN || github.token }}
           path: decklink-sdk
 
       - name: Locate DeckLink SDK headers

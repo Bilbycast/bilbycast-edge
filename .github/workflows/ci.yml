@@ -14,12 +14,15 @@ name: CI
 # Scope is deliberately the DEFAULT feature set. That is where the sibling-crate
 # API drift bites, and it is what every operator gets from `cargo build`. The
 # GPL / vendor-specific encoder features are left to nightly-release: they add
-# heavy apt deps for little extra API coverage. `sdi-decklink` cannot be built
-# here at all — libdecklink-sys/build.rs hard-requires the Blackmagic SDK
-# headers (DECKLINK_SDK_DIR), which are EULA-gated and deliberately not
-# vendored, so there is no header-free compile path (unlike mxl, which vendors
-# its headers under Apache-2.0 and so can use `mxl-not-built`). The ~2.2k lines
-# behind that feature are therefore NOT covered by CI — see docs/sdi.md.
+# heavy apt deps for little extra API coverage.
+#
+# `sdi-decklink` is the exception, and it is covered — see the SDI compile gate
+# in the `check` job. libdecklink-sys/build.rs hard-requires the Blackmagic SDK
+# headers (DECKLINK_SDK_DIR), which are EULA-gated and deliberately not vendored
+# (unlike mxl, which vendors its headers under Apache-2.0 and so can use
+# `mxl-not-built`), so the gate pulls them from the private SDK repo and runs
+# only when a credential is available. It is compile-only — no card, no Desktop
+# Video. Fork PRs get no secrets, so it skips there rather than failing.
 
 on:
   pull_request:
@@ -37,6 +40,11 @@ jobs:
   check:
     name: cargo check (default features)
     runs-on: ubuntu-24.04
+    env:
+      # The `secrets` context is NOT available in a step-level `if:` — only in
+      # `with:`/`env:`. Collapse "do we have a DeckLink SDK credential?" to a
+      # plain env string here so the SDI steps below can branch on it.
+      HAS_DECKLINK_SDK: ${{ secrets.DECKLINK_SDK_DEPLOY_KEY != '' || secrets.DECKLINK_SDK_TOKEN != '' }}
     steps:
       # bilbycast-edge/Cargo.toml path-depends on seven sibling repos. cargo
       # reads every path dependency's manifest when building the dependency
@@ -153,6 +161,55 @@ jobs:
       - name: cargo check
         working-directory: bilbycast-edge
         run: cargo check --all-targets --locked
+
+      # ─── SDI (DeckLink) compile gate ─────────────────────────────────────
+      # The ~2.2k lines behind `sdi-decklink` were never compiled anywhere in
+      # CI, because the release workflow drops the feature whenever the SDK
+      # credential is absent. That gap is precisely how the edge's SDI code
+      # drifted ahead of decklink-rs — calling `api_available`,
+      # `read_frame_timeout` and a 3-arg `write_video_with_ancillary` that
+      # existed in no committed branch — and went unnoticed for months
+      # (issue #76, item B). This closes it.
+      #
+      # Compile-only, so no DeckLink card and no Desktop Video are needed:
+      # DeckLinkAPIDispatch.cpp dlopens libDeckLinkAPI.so at RUNTIME, and only
+      # the headers are a build-time input.
+      #
+      # SKIPPED, not failed, when no credential is available. Fork PRs never
+      # receive secrets, and hard-failing there would red-line every outside
+      # contribution for a feature they cannot build. On this repo's own
+      # branches the credential is present and the gate always runs.
+      - name: Checkout DeckLink SDK headers (private)
+        if: env.HAS_DECKLINK_SDK == 'true'
+        uses: actions/checkout@v7
+        with:
+          repository: Bilbycast/bilbycast-decklink-sdk
+          ssh-key: ${{ secrets.DECKLINK_SDK_DEPLOY_KEY }}
+          token: ${{ secrets.DECKLINK_SDK_TOKEN || github.token }}
+          path: decklink-sdk
+
+      - name: cargo check (sdi-decklink)
+        if: env.HAS_DECKLINK_SDK == 'true'
+        working-directory: bilbycast-edge
+        run: |
+          # Locate rather than assume a layout, so the SDK repo may keep the
+          # vendor's `Linux/include` nesting or flatten it — same tolerance the
+          # release workflow has.
+          API_H="$(find ../decklink-sdk -type f -name DeckLinkAPI.h -print -quit)"
+          if [ -z "${API_H}" ]; then
+            echo "ERROR: DeckLinkAPI.h not found in the decklink-sdk checkout." >&2
+            echo "       The repo must contain the SDK's Linux/include directory." >&2
+            exit 1
+          fi
+          DECKLINK_SDK_DIR="$(dirname "${API_H}")"
+          export DECKLINK_SDK_DIR
+          echo "DECKLINK_SDK_DIR=${DECKLINK_SDK_DIR}"
+          cargo check --all-targets --locked --features sdi-decklink
+
+      - name: SDI compile gate skipped (no SDK credential)
+        if: env.HAS_DECKLINK_SDK != 'true'
+        run: |
+          echo "::notice title=SDI compile gate skipped::No DeckLink SDK credential is available to this run (expected on fork PRs), so 'cargo check --features sdi-decklink' did not run. See docs/sdi.md."
 
       # Lint gate. A step in this job rather than a job of its own for the same
       # reason as `cargo test` below: a parallel job would re-clone all eight

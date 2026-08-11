@@ -123,18 +123,172 @@ what drove the edge's RSS growth into the OOM killer. So the symptom to
 watch for is not only a segfault but *any* encoder output wildly above its
 configured bitrate — check `set_pts_90k()` first.
 
-## Build
+## Building with SDI
 
-```bash
-# Blackmagic "Desktop Video SDK" (EULA-gated download) → Linux/include
-export DECKLINK_SDK_DIR=$HOME/decklink-sdk-include
-cargo build --release --features sdi-decklink,video-encoder-x264,video-encoder-nvenc
-```
+SDI is behind the **`sdi-decklink`** Cargo feature, which is **off** in a plain
+`cargo build`. Turning it on needs the Blackmagic DeckLink SDK **headers** at
+build time. That is the only extra input — and it is the reason the published
+release artefacts shipped *without* SDI from v0.99.2 through v0.102.0.
 
-Only the SDK **headers** are needed at build time. At runtime the host needs
-Blackmagic **Desktop Video** (kernel driver + `libDeckLinkAPI.so`); a host
-without it fails the boot probe gracefully and simply doesn't advertise the
-capability.
+### What you actually need, and why
+
+| | Needed at **build** time | Needed at **run** time |
+|---|---|---|
+| SDK headers (`DeckLinkAPI.h`, `DeckLinkAPIDispatch.cpp`) | ✅ yes | ❌ no |
+| `libDeckLinkAPI.so` (ships in Desktop Video) | ❌ no | ✅ yes |
+| A DeckLink card | ❌ no | ✅ yes (to carry signal) |
+
+`DeckLinkAPIDispatch.cpp` `dlopen`s `libDeckLinkAPI.so` at runtime, so you can
+compile an SDI-capable binary on a machine with no card and no driver. A host
+that later runs it without Desktop Video fails the boot probe gracefully, never
+advertises the `sdi-decklink` capability, and the manager UI hides the SDI I/O
+types for that node. There is no runtime cost to shipping SDI to a non-SDI host.
+
+**Version floor: SDK 16 or newer.** The shim uses `IDeckLinkVideoBuffer` with
+`StartAccess`/`EndAccess`, which SDK 16 introduced. Older SDKs will not compile.
+
+### Checklist A — build it yourself, locally
+
+For third parties and anyone building from source on their own machine. You do
+**not** need a GitHub account, a private repo, or any credential.
+
+- [ ] **1. Get the SDK.** Go to <https://www.blackmagicdesign.com/support/>,
+      search for **"Desktop Video SDK"**, pick version **16 or newer**, and
+      download it. You will have to fill in the registration form and accept
+      Blackmagic's EULA — that is Blackmagic's gate, not ours.
+- [ ] **2. Unzip it and find `Linux/include`.** That one directory holds both
+      `DeckLinkAPI.h` and `DeckLinkAPIDispatch.cpp`. Nothing else from the SDK
+      is used.
+- [ ] **3. Point `DECKLINK_SDK_DIR` at that directory** — at the directory
+      itself, not its parent:
+      ```bash
+      export DECKLINK_SDK_DIR=/path/to/Blackmagic_DeckLink_SDK_16.0/Linux/include
+      ls "$DECKLINK_SDK_DIR"/DeckLinkAPI.h "$DECKLINK_SDK_DIR"/DeckLinkAPIDispatch.cpp
+      ```
+      Both files must list. If they don't, you are pointing one level off.
+- [ ] **4. Build**, adding `sdi-decklink` to whatever features you already use:
+      ```bash
+      cargo build --release --features sdi-decklink,video-encoder-x264
+      ```
+      SDI also requires `media-codecs` (on by default) — without it both the
+      SDI input and output refuse to start with `sdi_no_media_codecs`, since
+      neither can encode or decode.
+- [ ] **5. Install Desktop Video on the machine that has the card** (kernel
+      driver + `libDeckLinkAPI.so`), from the same support page.
+- [ ] **6. Confirm the card is visible** to the OS before blaming the build:
+      ```bash
+      ls /dev/blackmagic/          # device nodes should be listed
+      ```
+- [ ] **7. Confirm the edge sees it** — start the edge and check that
+      `sdi-decklink` appears in `HealthPayload.capabilities`, and that
+      `HealthPayload.sdi_devices[]` lists your ports.
+
+**If you run the edge under the packaged systemd unit**, also do Checklist C
+below — the hardened unit blocks the DeckLink device nodes by default.
+
+### Checklist B — build it in GitHub Actions (maintainers)
+
+The release workflow already lists `sdi-decklink` in the feature set for all
+three artefacts. It strips the feature at build time whenever no SDK credential
+is configured, warns, and continues. So this checklist is entirely about
+**making the headers reachable from CI** — no workflow edit is required.
+
+The SDK is **not** vendored into this public repo. It lives in a separate
+**private** repo that CI checks out.
+
+- [ ] **1. Get the SDK** exactly as in Checklist A steps 1–2. You want the
+      `Linux/include` directory.
+- [ ] **2. Create a PRIVATE repo** named `Bilbycast/bilbycast-decklink-sdk`.
+      Private matters: nothing is redistributed.
+- [ ] **3. Commit ONLY `Linux/include`.** Not `Samples/`, not the `.so`, not
+      the installer, not the PDFs:
+      ```bash
+      mkdir bilbycast-decklink-sdk && cd bilbycast-decklink-sdk
+      git init
+      cp -r /path/to/SDK/Linux/include .
+      ls include/DeckLinkAPI.h include/DeckLinkAPIDispatch.cpp   # both must exist
+      git add -A && git commit -m "DeckLink SDK 16.0 headers"
+      git tag sdk-16.0
+      git remote add origin git@github.com:Bilbycast/bilbycast-decklink-sdk.git
+      git push -u origin main --tags
+      ```
+      CI *locates* `DeckLinkAPI.h` rather than assuming a path, so keeping the
+      vendor's nesting or flattening it both work.
+- [ ] **4. Generate a deploy key** (an SSH keypair used by one repo):
+      ```bash
+      ssh-keygen -t ed25519 -N "" -C "bilbycast-decklink-sdk deploy key" \
+        -f ~/.ssh/decklink_sdk_deploy
+      ```
+      This writes `decklink_sdk_deploy` (private) and `decklink_sdk_deploy.pub`
+      (public).
+- [ ] **5. Add the PUBLIC half as a deploy key** on the SDK repo:
+      `bilbycast-decklink-sdk` → Settings → Deploy keys → Add deploy key.
+      Paste the contents of `decklink_sdk_deploy.pub`. **Leave "Allow write
+      access" unchecked** — CI only reads.
+- [ ] **6. Add the PRIVATE half as a secret** on the **edge** repo:
+      `bilbycast-edge` → Settings → Secrets and variables → Actions → New
+      repository secret. Name it exactly **`DECKLINK_SDK_DEPLOY_KEY`** and
+      paste the entire contents of `decklink_sdk_deploy`, including the
+      `-----BEGIN OPENSSH PRIVATE KEY-----` and `-----END …-----` lines.
+- [ ] **7. Verify before releasing.** Push any commit to `main` and open the CI
+      run: the **`cargo check (sdi-decklink)`** step should run and pass. If it
+      says *"SDI compile gate skipped"*, the secret is not visible — recheck
+      the name in step 6.
+- [ ] **8. Cut a release** (`./release-all.sh --yes`). In the release run's
+      build logs, the preflight must print
+      `OK: DECKLINK_SDK_DEPLOY_KEY is set` and the *Verify binary* step must
+      print `OK: SDI compiled in (dl_read_frame present)`. The published
+      release notes flip automatically to the SDI-present wording.
+
+**Why a deploy key rather than a personal access token.** A fine-grained PAT
+with `Contents: Read` also works and is accepted as `DECKLINK_SDK_TOKEN`, but a
+PAT **expires** and is tied to one person's account. Because the preflight warns
+rather than blocks, an expired PAT silently drops SDI from every subsequent
+release — the exact failure this feature already suffered. A deploy key is
+scoped to one repo, belongs to no individual, and does not expire.
+
+**To bump the SDK later**, commit the new headers to the SDK repo. Nothing in
+`bilbycast-edge` changes.
+
+### Checklist C — grant the device nodes under systemd
+
+Only if you run the edge from the packaged unit
+([`packaging/bilbycast-edge.service`](../packaging/bilbycast-edge.service)).
+It runs `DevicePolicy=closed`, so device access is deny-by-default.
+
+Without this, a correctly built SDI binary **enumerates zero cards while still
+advertising the capability** — `api_available()` returns true (it only needs
+`libDeckLinkAPI.so`, which loads fine) but every device open is denied. Verified
+on hardware as the cause of exactly that confusing split.
+
+- [ ] **1. Check what your card actually exposes:**
+      ```bash
+      ls /dev/blackmagic/
+      ```
+- [ ] **2. Confirm the shipped unit covers them.** It grants
+      `char-blackmagic` plus `/dev/blackmagic/io0`…`io7`. If your host lists
+      names outside that set (e.g. `dvN`, or more than eight nodes), add the
+      matching `DeviceAllow=/dev/blackmagic/<node> rw` lines. Paths that do not
+      exist are ignored with a log warning, so extra entries are harmless.
+- [ ] **3. Reload and restart:**
+      ```bash
+      sudo systemctl daemon-reload && sudo systemctl restart bilbycast-edge
+      ```
+- [ ] **4. Confirm** `HealthPayload.sdi_devices[]` is now populated.
+
+### How CI protects this going forward
+
+`sdi-decklink` used to be compiled **nowhere** in CI, because the release
+workflow drops it whenever the credential is absent. That is how the edge's SDI
+code drifted ahead of `bilbycast-decklink-rs` — calling `api_available`,
+`read_frame_timeout` and a three-argument `write_video_with_ancillary` that
+existed in no committed branch — without anything going red (issue #76, item B).
+
+`ci.yml` now carries an **SDI compile gate**: it checks out the SDK headers and
+runs `cargo check --all-targets --locked --features sdi-decklink` on every push
+and PR from this repo. It is compile-only, so it needs no card and no Desktop
+Video. Fork PRs receive no secrets, so it **skips** there with a notice rather
+than failing — a contributor who cannot access the SDK is not blamed for it.
 
 ## Configuration
 

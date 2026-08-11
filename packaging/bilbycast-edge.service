@@ -63,6 +63,29 @@ DeviceAllow=char-nvidia-uvm rwm
 # both here for one consistent, verified-working pattern.
 DeviceAllow=/dev/rga rwm
 DeviceAllow=/dev/mpp_service rwm
+# Blackmagic DeckLink SDI capture/playout (`sdi-decklink` feature). Without
+# these the hardened unit enumerates ZERO cards while still advertising the
+# capability — api_available() returns true (CreateDeckLinkIteratorInstance
+# succeeds, it only needs libDeckLinkAPI.so) but every device open is denied,
+# so the node offers SDI and then finds nothing. Confirmed on hardware
+# (bilby-z440, DeckLink Quad 2) as the cause of that exact split.
+#
+# Both forms are listed on purpose. The class form covers any card count and
+# survives renumbering; the path forms are the pattern already proven to work
+# on this unit when a class name failed to resolve (see /dev/rga above).
+# NOTE: the path list is io0..io7 (Quad 2 = 8 devices) and is NOT verified
+# on hardware here. Check `ls /dev/blackmagic/` on your host — if your card
+# exposes `dvN` nodes, or more than 8, add those paths too. Paths that do
+# not exist are ignored with a log warning, so extras are harmless.
+DeviceAllow=char-blackmagic rwm
+DeviceAllow=/dev/blackmagic/io0 rw
+DeviceAllow=/dev/blackmagic/io1 rw
+DeviceAllow=/dev/blackmagic/io2 rw
+DeviceAllow=/dev/blackmagic/io3 rw
+DeviceAllow=/dev/blackmagic/io4 rw
+DeviceAllow=/dev/blackmagic/io5 rw
+DeviceAllow=/dev/blackmagic/io6 rw
+DeviceAllow=/dev/blackmagic/io7 rw
 SupplementaryGroups=video render audio
 # CAP_NET_ADMIN — required by kernel ≥ 6.x for setsockopt(SO_TXTIME)
 # with CLOCK_TAI. Without it, wire-emit falls back to clock_nanosleep.
