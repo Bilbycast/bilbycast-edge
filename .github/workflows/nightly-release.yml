@@ -909,13 +909,20 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           # Does this release's artefacts actually carry SDI? The build job
-          # drops `sdi-decklink` when DECKLINK_SDK_TOKEN is absent (the
+          # drops `sdi-decklink` when no SDK credential is present (the
           # warn-and-continue path), so the notes have to state which of the
           # two happened. They asserted SDI unconditionally from v0.99.2
           # through v0.102.0 while no shipped artefact contained it, telling
           # customers to fit a card and install Desktop Video for a feature
           # that was never in the binary.
-          SDI_BUILT: ${{ secrets.DECKLINK_SDK_TOKEN != '' }}
+          #
+          # This MUST list the same two credentials the preflight step accepts.
+          # It checked DECKLINK_SDK_TOKEN alone, and was not updated when the
+          # deploy-key route landed — so v0.103.0 built SDI into both `-full`
+          # artefacts (deploy key set, PAT unset) and then told readers SDI was
+          # absent. Same defect as the v0.99.2 one, inverted: the notes are
+          # wrong whenever this expression and the preflight disagree.
+          SDI_BUILT: ${{ secrets.DECKLINK_SDK_DEPLOY_KEY != '' || secrets.DECKLINK_SDK_TOKEN != '' }}
         run: |
           TAG="${{ needs.check-version.outputs.tag }}"
           VERSION="${{ needs.check-version.outputs.version }}"
