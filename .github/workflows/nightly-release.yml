@@ -83,22 +83,34 @@ jobs:
           # is included on top of the codec bundle so the local-display
           # output spawner is compiled in. MXL compiled in with
           # `mxl-not-built` — Rust code ships, libmxl.so discovered at
-          # runtime via dlopen. `sdi-decklink` ships on both arches — it is
-          # an I/O type, not a codec backend, so it is listed here rather
-          # than folded into the `video-encoders-full` composite. Its SDK
-          # headers come from a private org repo (EULA-gated, not vendorable
-          # here) and libDeckLinkAPI.so is dlopened at runtime, so a
-          # host with no card / no Desktop Video simply fails the boot probe
-          # and never advertises the capability.
+          # runtime via dlopen.
+          #
+          # `sdi-decklink` ships on the two `full` arches and is marked by
+          # `sdi: "true"` — that flag, not `variant`, gates every SDI step
+          # below. It is an I/O type, not a codec backend, so it is listed
+          # per-entry rather than folded into the `video-encoders-full`
+          # composite. Its SDK headers come from a private org repo (EULA-
+          # gated, not vendorable here) and libDeckLinkAPI.so is dlopened at
+          # runtime, so a host with no card / no Desktop Video simply fails
+          # the boot probe and never advertises the capability. aarch64 is
+          # included because the SDK supports it — the 16.0 release notes
+          # say "All Linux samples: added support for aarch64", and the
+          # headers carry no arch-specific code in any case.
+          #
+          # The Rockchip entry deliberately OMITS it: those boards are the
+          # embedded/SBC deployment, not a rack host with a PCIe DeckLink
+          # fitted, so the SDK dependency buys nothing there.
           - runner: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
             artifact_suffix: x86_64-linux-full
             variant: full
+            sdi: "true"
             cargo_features: "video-encoders-full display mxl mxl-not-built sdi-decklink"
           - runner: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
             artifact_suffix: aarch64-linux-full
             variant: full
+            sdi: "true"
             cargo_features: "video-encoder-x264 video-encoder-x265 video-encoder-nvenc video-encoder-vaapi video-decoder-nvdec video-decoder-vaapi display mxl mxl-not-built sdi-decklink"
           # ─── Rockchip variant: aarch64 full bundle PLUS the RK3568/RK3588
           # RKMPP hardware H.264/HEVC encoder (h264_rkmpp / hevc_rkmpp, 8-bit
@@ -127,7 +139,7 @@ jobs:
             artifact_suffix: aarch64-linux-rockchip
             variant: full
             rkmpp: "true"
-            cargo_features: "video-encoder-x264 video-encoder-x265 video-encoder-rkmpp video-decoder-rkmpp rga-transfer display mxl mxl-not-built sdi-decklink"
+            cargo_features: "video-encoder-x264 video-encoder-x265 video-encoder-rkmpp video-decoder-rkmpp rga-transfer display mxl mxl-not-built"
     runs-on: ${{ matrix.runner }}
     steps:
       # Runs before any checkout / apt / x264-from-source / cargo, so a missing
@@ -144,7 +156,7 @@ jobs:
       # best-effort and the release notes report which way it went.
       - name: Preflight - DeckLink SDK access
         id: decklink
-        if: matrix.variant == 'full'
+        if: matrix.sdi == 'true'
         env:
           DECKLINK_SDK_DEPLOY_KEY: ${{ secrets.DECKLINK_SDK_DEPLOY_KEY }}
           DECKLINK_SDK_TOKEN: ${{ secrets.DECKLINK_SDK_TOKEN }}
@@ -304,7 +316,7 @@ jobs:
       # ssh-key wins when set; actions/checkout falls back to `token` when the
       # key input is empty, so both credential styles work through one step.
       - name: Checkout DeckLink SDK headers (private)
-        if: matrix.variant == 'full' && steps.decklink.outputs.sdi == 'on'
+        if: matrix.sdi == 'true' && steps.decklink.outputs.sdi == 'on'
         uses: actions/checkout@v7
         with:
           repository: Bilbycast/bilbycast-decklink-sdk
@@ -313,7 +325,7 @@ jobs:
           path: decklink-sdk
 
       - name: Locate DeckLink SDK headers
-        if: matrix.variant == 'full' && steps.decklink.outputs.sdi == 'on'
+        if: matrix.sdi == 'true' && steps.decklink.outputs.sdi == 'on'
         run: |
           # build.rs wants the directory holding BOTH files. Locate it rather
           # than assume a layout, so the private repo can keep the SDK's own
@@ -529,15 +541,19 @@ jobs:
         working-directory: bilbycast-edge
         env:
           SDI: ${{ steps.decklink.outputs.sdi }}
+          WANT_SDI: ${{ matrix.sdi }}
         run: |
           FEATURES="${{ matrix.cargo_features }}"
-          # When no DECKLINK_SDK_TOKEN is configured the preflight sets sdi=off;
-          # strip the sdi-decklink feature so the full build still succeeds
-          # without the (EULA-gated) SDK headers. SDI returns automatically once
-          # the token is set up — no workflow change needed.
-          if [ "${SDI}" != "on" ] && [ -n "${FEATURES}" ]; then
+          # There are two distinct reasons a build can end up without SDI, and
+          # conflating them in the log is how "SDI is in every full artefact"
+          # survived three releases that had no SDI in them:
+          #
+          #   * this variant never asked for it (rockchip) — nothing to strip,
+          #     say nothing;
+          #   * it asked, but no SDK credential reached CI — strip and say so.
+          if [ "${WANT_SDI}" = "true" ] && [ "${SDI}" != "on" ] && [ -n "${FEATURES}" ]; then
             FEATURES="$(printf '%s' "${FEATURES}" | tr ' ' '\n' | grep -v '^sdi-decklink$' | tr '\n' ' ' | sed -E 's/  +/ /g; s/^ //; s/ $//')"
-            echo "NOTE: DECKLINK_SDK_TOKEN absent — building WITHOUT sdi-decklink."
+            echo "NOTE: no DeckLink SDK credential — building WITHOUT sdi-decklink."
             echo "      Effective features: ${FEATURES}"
           fi
           if [ -n "${FEATURES}" ]; then
@@ -549,6 +565,8 @@ jobs:
       - name: Verify binary
         env:
           SDI: ${{ steps.decklink.outputs.sdi }}
+          WANT_SDI: ${{ matrix.sdi }}
+          ARTIFACT_SUFFIX: ${{ matrix.artifact_suffix }}
         run: |
           BINARY="bilbycast-edge/target/${{ matrix.target }}/release/bilbycast-edge"
           echo "=== File type ==="
@@ -648,19 +666,22 @@ jobs:
           # x264/x265 symbol check — the inverted ldd gate above passes just as
           # happily on a binary built without the feature at all. The release
           # binary is not stripped, so the shim's C-ABI symbols are visible.
-          # Only assert this when SDI was actually requested for this build
-          # (sdi=on); when DECKLINK_SDK_TOKEN is absent the preflight drops the
-          # sdi-decklink feature and the symbol is legitimately absent.
-          if [ "${SDI}" = "on" ]; then
+          # Three outcomes, reported distinctly. Asserting the symbol only when
+          # SDI was actually requested AND the credential arrived; the other
+          # two cases legitimately have no symbol and must not fail the build.
+          if [ "${WANT_SDI}" != "true" ]; then
+            echo "SKIP: SDI not requested for this variant (${ARTIFACT_SUFFIX}) — dl_read_frame not expected."
+          elif [ "${SDI}" = "on" ]; then
             if ! nm "${BINARY}" 2>/dev/null | grep -qE ' [Tt] dl_read_frame'; then
               echo "ERROR: DeckLink shim symbol not found — sdi-decklink did not compile in."
-              echo "  Every full artefact must ship SDI; check the cargo_features list and"
-              echo "  the Materialise DeckLink SDK headers step."
+              echo "  This variant requested SDI and the SDK credential was present, so a"
+              echo "  missing symbol is a real failure. Check the cargo_features list and"
+              echo "  the DeckLink SDK checkout step."
               exit 1
             fi
             echo "OK: SDI compiled in (dl_read_frame present), libDeckLinkAPI dlopen-only"
           else
-            echo "SKIP: SDI omitted (no DECKLINK_SDK_TOKEN) — dl_read_frame not expected; libDeckLinkAPI dlopen-only check passed above."
+            echo "SKIP: SDI requested for this variant but no SDK credential reached CI — feature was stripped, dl_read_frame not expected."
           fi
 
           echo "=== MXL ==="
@@ -900,10 +921,10 @@ jobs:
           VERSION="${{ needs.check-version.outputs.version }}"
 
           if [ "${SDI_BUILT}" = "true" ]; then
-            SDI_NOTE="**SDI** (Blackmagic DeckLink capture + playout) is compiled in. Autodetected at runtime exactly like NVENC: the edge \`dlopen\`s \`libDeckLinkAPI.so\` at boot and enumerates cards, so a host without Blackmagic **Desktop Video** installed — or with no DeckLink card fitted — simply does not advertise the \`sdi-decklink\` capability, and the manager UI hides the SDI input / output types for that node. There is nothing to configure and no separate build to install: fit a card, install Desktop Video, restart the edge, and SDI appears."
+            SDI_NOTE="**SDI** (Blackmagic DeckLink capture + playout) is compiled into the two **\`-full\`** artefacts (x86_64 and aarch64). The **\`-rockchip\`** artefact does **not** include it — those boards are the embedded deployment, not a rack host with a PCIe DeckLink fitted. Autodetected at runtime exactly like NVENC: the edge \`dlopen\`s \`libDeckLinkAPI.so\` at boot and enumerates cards, so a host without Blackmagic **Desktop Video** installed — or with no DeckLink card fitted — simply does not advertise the \`sdi-decklink\` capability, and the manager UI hides the SDI input / output types for that node. There is nothing to configure and no separate build to install: fit a card, install Desktop Video, restart the edge, and SDI appears."
             SDI_RUNTIME=" **For SDI (DeckLink)**: install Blackmagic **Desktop Video** (kernel driver + \`libDeckLinkAPI.so\`) from https://www.blackmagicdesign.com/support/ — needed only on hosts with a DeckLink card. The binary carries no link-time dependency on it, so hosts without it run normally and just don't offer SDI."
           else
-            SDI_NOTE="**SDI** (Blackmagic DeckLink capture + playout) is **not** included in this build. The Blackmagic SDK headers are EULA-gated and cannot be vendored publicly, so the release workflow compiles SDI only when a \`DECKLINK_SDK_TOKEN\` is configured — it was not for this release. These artefacts carry no \`sdi\` input or output type, do not advertise the \`sdi-decklink\` capability, and the manager UI hides SDI for nodes running them. To get SDI, build from source with \`--features sdi-decklink\` and \`DECKLINK_SDK_DIR\` pointing at the SDK headers."
+            SDI_NOTE="**SDI** (Blackmagic DeckLink capture + playout) is **not** included in any artefact of this release. The Blackmagic SDK headers are EULA-gated and are not vendored into this repository, so the release workflow compiles SDI only when an SDK credential is configured — none was for this release. These binaries carry no \`sdi\` input or output type, do not advertise the \`sdi-decklink\` capability, and the manager UI hides SDI for nodes running them. To get SDI, build from source with \`--features sdi-decklink\` and \`DECKLINK_SDK_DIR\` pointing at the SDK's \`Linux/include\` — see the [SDI guide](https://docs.bilbycast.com/edge/sdi/). (The \`-rockchip\` artefact never includes SDI, by design.)"
             SDI_RUNTIME=""
           fi
 
