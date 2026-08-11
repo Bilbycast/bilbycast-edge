@@ -732,6 +732,22 @@ pub struct DisplayStatsCounters {
     /// Count of decode-AU invocations whose timing fed
     /// `decode_us_total`.
     pub decode_count: AtomicU64,
+    /// Source frame period the display thread is currently presenting at,
+    /// in µs — its own EMA-smoothed PTS-delta estimate, republished here
+    /// once per presented frame. `0` until the first frame lands.
+    ///
+    /// Written by the display thread, read by the demux+decode child: it
+    /// is the frame *budget* against which
+    /// `output_display::cpu_decode_has_headroom` judges whether CPU decode
+    /// is comfortably keeping up, which in turn decides whether a
+    /// hardware re-promotion probe is worth the ~1-2 s of disturbed
+    /// picture it costs. Not on the wire — internal to the display path.
+    ///
+    /// It is the *presented* period, so an interlaced source publishes the
+    /// field period (20 ms for 1080i50) rather than the coded-frame
+    /// period. That is the stricter of the two readings and only ever
+    /// makes the headroom gate probe more readily.
+    pub source_frame_period_us: AtomicU64,
 
     /// Largest single `avcodec_receive_frame` call duration since
     /// startup, in µs — the raw decoder-library frame fetch, diagnostic

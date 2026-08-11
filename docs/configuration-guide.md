@@ -1870,8 +1870,10 @@ under *Host prerequisites (NVIDIA GPUs + desktop systems)*.
 See [`docs/events-and-alarms.md`](events-and-alarms.md#display-output-events-display)
 for the full event catalogue, including `display_device_unavailable`,
 `display_mode_set_failed`, `display_master_busy`, `display_flip_timeout`,
-`display_audio_open_failed`, `display_decoder_overload`,
-`display_av_drift`, `display_subscriber_lagged`.
+`display_audio_open_failed`, `display_frame_loss_sustained` /
+`display_frame_loss_recovered`, `display_subscriber_lagged`.
+(`display_decoder_overload` and `display_av_drift` appear in older
+revisions of this list but were never implemented — see the catalogue.)
 
 ### SDI Output (Blackmagic DeckLink playout)
 

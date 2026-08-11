@@ -1123,6 +1123,8 @@ fn demux_decode_loop(
         hw_repromoted_at: None,
         last_send_error_log_at: None,
         first_send_after_open: None,
+        decode_us_ema: None,
+        last_frame_at: None,
         mpeg2_cpu_pinned: false,
         mpeg2_cpu_override: mpeg2_cpu_decode,
     };
@@ -1843,6 +1845,37 @@ struct HwOpenState {
     /// static pin exists to prevent.
     mpeg2_cpu_pinned: bool,
 
+    /// EMA of per-AU decode cost (µs) on the **current** decoder era —
+    /// `send_packet` + reorder drain + plane copies, i.e. the same span
+    /// that feeds `decode_us_total`. `None` until the first AU after an
+    /// open / flush (`reset_decoder_open_window` clears it).
+    ///
+    /// Deliberately *not* the `decode_us_avg` the manager sees. That one is
+    /// `decode_us_total / decode_count` from process start, so immediately
+    /// after a demote it is dominated by the hardware era whose slowness
+    /// caused the demote — it would report "CPU has no headroom" on a host
+    /// where CPU decode is in fact comfortable, which is the exact
+    /// judgement [`cpu_decode_has_headroom`] has to make.
+    decode_us_ema: Option<f64>,
+
+    /// When the decoder last actually *produced* a frame. Stamped in
+    /// `drain_video_frames` next to the `frames_received_since_open` bump,
+    /// cleared by [`reset_decoder_open_window`] so it is era-scoped like
+    /// [`Self::decode_us_ema`].
+    ///
+    /// This is the liveness half of [`cpu_decode_has_headroom`], and it
+    /// has to be a *recency*, not a count. A CPU decoder that decodes 500
+    /// frames and then returns `EAGAIN` forever emits no `send_packet`
+    /// error, so nothing resets the open window: the lifetime count stays
+    /// at 500 and `decode_us_ema` decays toward the near-zero cost of a
+    /// no-op decode. Judged on those two alone the gate reads "plenty of
+    /// headroom" and suppresses the re-promotion probe permanently — and
+    /// the probe is the only thing that re-opens the decoder, so the panel
+    /// stays frozen for the life of the flow. (The no-frames watchdog does
+    /// not cover it either: that one is gated on `hw_decode_active` and on
+    /// `frames_received_since_open == 0`.)
+    last_frame_at: Option<Instant>,
+
     /// Per-output override of the *static* MPEG-2 CPU pin, from
     /// `DisplayOutputConfig::mpeg2_cpu_decode`. `None` keeps the fleet-wide
     /// policy. Deliberately does not gate `mpeg2_cpu_pinned`: a backend that
@@ -1926,9 +1959,10 @@ const HW_REPROMOTE_BACKOFF_MAX: Duration = Duration::from_secs(600);
 /// This is the right trade on hardware where CPU decode is not viable
 /// (rk3568 needs 39 ms/frame against a 20 ms budget, so the demoted state
 /// is permanently broken anyway). On a host where CPU decode keeps up, a
-/// periodic probe is pure cost — a follow-up should gate re-promotion on
-/// a genuine input-health signal (TR-101-290 CC-error rate, or SRT
-/// `packets_lost`) rather than on decoder silence.
+/// periodic probe is pure cost — which is what [`cpu_decode_has_headroom`]
+/// now answers: the probe is suppressed entirely while measured CPU decode
+/// sits inside the frame budget, so this damping term only ever runs on
+/// hosts where re-promotion is actually worth attempting.
 const HW_REPROMOTE_CLEAN_PERIOD: Duration = Duration::from_secs(20);
 /// Backoff before the next hardware re-promotion attempt, doubling per
 /// prior attempt and saturating at [`HW_REPROMOTE_BACKOFF_MAX`].
@@ -1947,6 +1981,104 @@ fn hw_repromote_backoff(attempts: u32) -> Duration {
 /// probe every time — stops ratcheting toward the ceiling.
 fn repromotion_held(held_for: Option<Duration>) -> bool {
     held_for.is_some_and(|d| d >= HW_REPROMOTE_BACKOFF_MAX)
+}
+
+/// EMA weight for [`HwOpenState::decode_us_ema`].
+///
+/// Slower than the other EMAs in this file (the frame-period estimator
+/// uses 1/8) on purpose: per-AU decode cost is genuinely spiky — an
+/// I-frame costs a multiple of a P-frame — and this estimate is only ever
+/// sampled once per re-promotion backoff, i.e. at most every 30 s. 1/32 is
+/// a ~1.3 s window at 25 fps, long enough that the sample the gate reads
+/// is not whichever picture type happened to land last.
+const DECODE_US_EMA_ALPHA: f64 = 0.031_25;
+
+/// Share of the source frame period CPU decode may average before a
+/// hardware re-promotion probe is considered worth its cost.
+///
+/// The budget is the whole frame period, not a slice of it: decode runs on
+/// the demux child and hands frames to the display thread over a 24-slot
+/// mpsc, so the two stages are pipelined rather than serial. 60 % leaves
+/// room for the per-AU spread around the mean so a host sitting right on
+/// the edge still probes. The measured failure case is nowhere near the
+/// line in either direction — bilby-pi's CPU decode of 1080i50 H.264 cost
+/// 39 ms against a 20 ms field period (195 %), against 926 µs once
+/// hardware came back (4.6 %).
+const HW_REPROMOTE_DECODE_BUDGET_PCT: u64 = 60;
+
+/// Decoded frames the current decoder must have produced before its
+/// measured cost is allowed to suppress a probe.
+///
+/// Purely a warm-up bound on [`HwOpenState::decode_us_ema`] — 50 frames is
+/// ~2 s at 25 fps, comfortably past the EMA's ~32-sample time constant, so
+/// the gate never judges on a half-converged estimate. The counter is
+/// zeroed by every open / flush / demote via
+/// [`reset_decoder_open_window`], so it counts the decoder running right
+/// now rather than the process.
+///
+/// It is **not** the liveness half of the gate — a lifetime count cannot
+/// be, because it stops moving without falling, which is exactly what a
+/// decoder that wedges after producing frames does. That job belongs to
+/// [`HwOpenState::last_frame_at`] and [`HW_REPROMOTE_PRODUCING_WINDOW`].
+const HW_REPROMOTE_MIN_FRAMES_FOR_HEADROOM: u64 = 50;
+
+/// How stale the last produced frame may be before cheap decode stops
+/// counting as headroom.
+///
+/// The gate only runs while access units are being fed (its only caller is
+/// on the per-AU path), so "AUs going in, no frames coming out for this
+/// long" is a wedged decoder, not an input gap — an input that stops
+/// delivering stops calling this code entirely. 2 s sits just under the
+/// [`WATCHDOG_NO_FRAMES_MS`] deadline used for the same symptom on the
+/// hardware side, and covers source rates down to 0.5 fps.
+///
+/// Asymmetric costs set the direction of the error: judging a live decoder
+/// wedged costs one probe (~1-2 s of disturbed picture), judging a wedged
+/// decoder live costs the panel for the life of the flow.
+const HW_REPROMOTE_PRODUCING_WINDOW: Duration = Duration::from_secs(2);
+
+/// Is CPU decode comfortably inside the frame budget, i.e. is the demoted
+/// state costing the operator nothing?
+///
+/// Re-probing hardware is not free: the probe tears the decoder down,
+/// re-arms the keyframe gate and invalidates the PRIME framebuffer cache,
+/// costing ~1-2 s of disturbed picture. On a host where CPU decode meets
+/// the frame budget, that is a visible hitch bought for no benefit — the
+/// probe is pure cost (issue #101). Answering `true` here suppresses it.
+///
+/// **Cheap decode only counts while the decoder is still producing.** A
+/// wedged decoder is also a cheap one: a CPU decoder that returns `EAGAIN`
+/// forever raises no `send_packet` error, so its open window is never
+/// reset, its frame count sits at whatever it reached and its cost EMA
+/// decays toward the price of a no-op. Cost plus a lifetime count would
+/// therefore read "plenty of headroom" on a frozen panel and suppress the
+/// one mechanism that re-opens the decoder — hence `last_frame_at`, which
+/// falls stale where a count merely stops rising.
+///
+/// Every "don't know" answers `false`, so an unknown never suppresses a
+/// probe: no cost estimate yet, no frame period published by the display
+/// thread, no frame produced yet, or too few frames out of the current
+/// decoder to trust the estimate.
+fn cpu_decode_has_headroom(
+    decode_us_ema: Option<f64>,
+    frame_period_us: u64,
+    frames_since_open: u64,
+    last_frame_at: Option<Instant>,
+    now: Instant,
+) -> bool {
+    let Some(ema_us) = decode_us_ema else {
+        return false;
+    };
+    if frame_period_us == 0 || frames_since_open < HW_REPROMOTE_MIN_FRAMES_FOR_HEADROOM {
+        return false;
+    }
+    let producing = last_frame_at
+        .is_some_and(|t| now.saturating_duration_since(t) < HW_REPROMOTE_PRODUCING_WINDOW);
+    if !producing {
+        return false;
+    }
+    let budget_us = frame_period_us as f64 * HW_REPROMOTE_DECODE_BUDGET_PCT as f64 / 100.0;
+    ema_us < budget_us
 }
 
 /// Watchdog deadline for "decoder accepted packets but never produced
@@ -2271,6 +2403,13 @@ fn backend_name(backend: DecoderBackend) -> &'static str {
 fn reset_decoder_open_window(state: &mut HwOpenState, counters: &DisplayStatsCounters) {
     state.consecutive_send_errors = 0;
     state.first_send_after_open = None;
+    // The decode-cost estimate describes one decoder era. Carrying it
+    // across a demote would let the hardware era's timings answer a
+    // question that is only ever asked about CPU decode, and vice versa.
+    // Its liveness companion is era-scoped for the same reason: a frame
+    // the *previous* decoder produced is no evidence about this one.
+    state.decode_us_ema = None;
+    state.last_frame_at = None;
     counters
         .frames_received_since_open
         .store(0, Ordering::Relaxed);
@@ -2505,6 +2644,13 @@ fn flush_decoders_for_switch(
 /// The MPEG-2 pin is deliberately excluded (it never sets `demoted_at`):
 /// it is codec-scoped, and on backends whose vendored decoder registers
 /// no MPEG-2 support at all, retrying could only fail.
+///
+/// **What actually arms a probe.** The backoff bounds how *often* one may
+/// fire; [`cpu_decode_has_headroom`] decides whether one is worth firing at
+/// all. Before that gate existed this ran on a pure timer, so a host whose
+/// CPU decode comfortably met the frame budget paid a ~1-2 s picture
+/// disturbance every backoff interval to re-test hardware it did not need
+/// (issue #101).
 fn maybe_repromote_hw_decode(
     slot: &mut Option<VideoDecoder>,
     current: &mut Option<VideoCodec>,
@@ -2544,6 +2690,23 @@ fn maybe_repromote_hw_decode(
         .last_send_error_at
         .is_some_and(|t| t.elapsed() < HW_REPROMOTE_CLEAN_PERIOD)
     {
+        return false;
+    }
+    // Measured decode headroom — the condition, as opposed to the two
+    // damping terms above. While CPU decode is comfortably inside the
+    // frame budget *and still producing frames*, the demoted state is
+    // costing the operator nothing, so the probe can only put a visible
+    // hitch on a panel that was fine (issue #101). The skip consumes
+    // nothing: `demoted_at` and `hw_repromote_attempts` are untouched, so
+    // the first AU after headroom disappears is eligible, and the backoff
+    // above still bounds the attempt rate on hosts that do need the probe.
+    if cpu_decode_has_headroom(
+        state.decode_us_ema,
+        counters.source_frame_period_us.load(Ordering::Relaxed),
+        counters.frames_received_since_open.load(Ordering::Relaxed),
+        state.last_frame_at,
+        Instant::now(),
+    ) {
         return false;
     }
 
@@ -2955,6 +3118,13 @@ fn handle_video_au(
     counters
         .decode_us_max
         .fetch_max(decode_us, Ordering::Relaxed);
+    // Feed the re-promotion headroom gate below. Era-scoped, unlike the
+    // lifetime `decode_us_total / decode_count` the manager reports — see
+    // `HwOpenState::decode_us_ema`.
+    hw_open_state.decode_us_ema = Some(match hw_open_state.decode_us_ema {
+        Some(prev) => prev + (decode_us as f64 - prev) * DECODE_US_EMA_ALPHA,
+        None => decode_us as f64,
+    });
 
     // Section 1: sustained send_packet errors → demote. Suspended while
     // the keyframe gate is timeout-opened (speculative feed): a HW
@@ -3450,6 +3620,11 @@ fn drain_video_frames(
         counters
             .frames_received_since_open
             .fetch_add(1, Ordering::Relaxed);
+        // ...and stamp *when*, which is what the re-promotion headroom
+        // gate needs: the counter above stops rising when the decoder
+        // wedges, but it never falls, so only a timestamp distinguishes
+        // "still producing" from "produced 500 frames and then stopped".
+        state.last_frame_at = Some(Instant::now());
         // Prefer the decoder-propagated display-order PTS. With
         // B-frame H.264 / HEVC, the input-feed PTS we held in the
         // outer loop matches the *most recent fed* access unit, not
@@ -4181,6 +4356,195 @@ fn display_sleep_until_monotonic_ns(target_ns: u64) {
     }
 }
 
+/// Sustained shortfall between what a display output presents and what
+/// its panel could show, before the latched `display_frame_loss_sustained`
+/// Warning fires.
+///
+/// **The condition is a shortfall, not a drop count.** An earlier revision
+/// of this alarm compared `frames_dropped_mpsc_full` against
+/// `frames_dropped_mpsc_full + frames_displayed` and warned at 20 % of
+/// *that*. On any source whose frame rate legitimately exceeds the panel
+/// mode — 1080p60 into a 3840x2160@30 panel is the everyday case — the
+/// display thread decimates exactly as it should, the decode child's
+/// `try_send` fails for every second frame, and the ratio parks at 50 %
+/// forever: a Warning that can never clear (it can never reach the clear
+/// threshold either) on an output that is working as configured and looks
+/// correct. The question worth alarming on is "is this output presenting
+/// what the panel could show", so the denominator is the panel's own
+/// capacity over the window, not the decoder's output rate.
+///
+/// 20 %: one frame in five that the panel had a slot for and never got is
+/// ~5 fps of judder on a 25 fps source — unambiguously visible to an
+/// operator, and far above anything a healthy host produces (a clean
+/// display output sits at exactly 0).
+const DISPLAY_PRESENT_SHORTFALL_WARN_PCT: u64 = 20;
+
+/// Hysteresis: the shortfall must fall back to at most this for a whole
+/// window before the latch clears and `display_frame_loss_recovered`
+/// fires. Non-zero so an output hovering around the warn threshold cannot
+/// flap.
+const DISPLAY_PRESENT_SHORTFALL_CLEAR_PCT: u64 = 5;
+
+/// Evaluation window for the present-shortfall latch.
+///
+/// 30 s is ~750 frames at 25 fps, so no single burst can carry the verdict
+/// — the entire hand-off queue is 24 frames, 3 % of the window. It is also
+/// comfortably longer than the recovery paths that legitimately shed
+/// frames (a HW decoder reset costs ≥ 30 frames, a re-promotion probe
+/// ~1-2 s), and short enough that an operator sees the alarm inside a
+/// commercial break.
+const DISPLAY_PRESENT_WINDOW: Duration = Duration::from_secs(30);
+
+/// Frames a window must carry before its verdict is trusted. Below this
+/// the window is rolled with no verdict: an output that presented three
+/// frames in 30 s has a different problem, and "2 of 3 missing" is not a
+/// meaningful percentage.
+const DISPLAY_PRESENT_WINDOW_MIN_FRAMES: u64 = 60;
+
+/// What [`DisplayPresentLatch::poll`] decided, when it decided anything.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PresentLatchTransition {
+    Latched {
+        shortfall_pct: u64,
+        displayed: u64,
+        presentable: u64,
+        dropped: u64,
+        /// The window's real duration, which is
+        /// [`DISPLAY_PRESENT_WINDOW`] plus however long the frame that
+        /// closed it took to arrive. Reported rather than the nominal
+        /// constant so `presentable` (computed against this) and the
+        /// operator-facing message agree.
+        window_secs: u64,
+    },
+    Recovered {
+        shortfall_pct: u64,
+    },
+}
+
+/// Latch for the sustained present-shortfall alarm on a display output.
+///
+/// Exists because a display output can be failing to put most of its
+/// frames on the panel while every manager surface reads Healthy:
+/// `frames_dropped_mpsc_full` climbs and nothing looks at it (issue #68,
+/// hardening item (a)).
+///
+/// Edge-triggered, mirroring the `media_player_pacer_lagging` /
+/// `media_player_pacer_recovered` pair in
+/// `engine::input_media_player::poll_pacer_lateness_latch`: [`poll`] is
+/// cheap enough for the per-frame path and only does real work on a
+/// transition.
+///
+/// [`poll`]: DisplayPresentLatch::poll
+struct DisplayPresentLatch {
+    window_start: Instant,
+    displayed_at_start: u64,
+    dropped_at_start: u64,
+    refresh_at_start: u32,
+    latched: bool,
+}
+
+impl DisplayPresentLatch {
+    fn new(now: Instant, panel_refresh_hz: u32) -> Self {
+        Self {
+            window_start: now,
+            displayed_at_start: 0,
+            dropped_at_start: 0,
+            refresh_at_start: panel_refresh_hz,
+            latched: false,
+        }
+    }
+
+    /// Roll the window if it has elapsed and report a latch transition.
+    ///
+    /// `displayed` / `dropped` are the cumulative `frames_displayed` and
+    /// `frames_dropped_mpsc_full` counters; the verdict is computed from
+    /// their deltas over the window just closed. `panel_refresh_hz` is the
+    /// live KMS mode's vertical refresh — read per call rather than cached,
+    /// because the auto-match modeset can change it mid-flow, and a window
+    /// whose refresh changed under it is rolled without a verdict.
+    ///
+    /// The presentable count is `min(frames the decoder handed over,
+    /// vblanks the panel offered)`. Both caps matter and for different
+    /// reasons: the panel cannot show more than its refresh, and the
+    /// output cannot present frames that were never decoded, so a source
+    /// slower than the panel is not a shortfall either.
+    ///
+    /// `frames_dropped_late` and `frames_dropped_stale_gen` are
+    /// deliberately absent from both sides — the first is the catch-up
+    /// drain and the second is the queue being shed across an operator
+    /// switch, both the pipeline working correctly. That makes the
+    /// decoder-side estimate conservative (a frame dropped late is counted
+    /// as never produced), which can only under-report a shortfall, never
+    /// invent one.
+    fn poll(
+        &mut self,
+        now: Instant,
+        displayed: u64,
+        dropped: u64,
+        panel_refresh_hz: u32,
+    ) -> Option<PresentLatchTransition> {
+        let elapsed = now.saturating_duration_since(self.window_start);
+        if elapsed < DISPLAY_PRESENT_WINDOW {
+            return None;
+        }
+        let win_displayed = displayed.saturating_sub(self.displayed_at_start);
+        let win_dropped = dropped.saturating_sub(self.dropped_at_start);
+        let refresh_changed = self.refresh_at_start != panel_refresh_hz;
+        self.window_start = now;
+        self.displayed_at_start = displayed;
+        self.dropped_at_start = dropped;
+        self.refresh_at_start = panel_refresh_hz;
+
+        if refresh_changed {
+            // The auto-match modeset re-programmed the panel part-way
+            // through this window, so the capacity below describes only
+            // the tail of it. Roll without a verdict — a modeset costs the
+            // picture a beat anyway, and inventing a shortfall out of a
+            // denominator that changed mid-measurement is precisely the
+            // false-alarm class this latch was rewritten to avoid.
+            return None;
+        }
+
+        let produced = win_displayed.saturating_add(win_dropped);
+        if produced < DISPLAY_PRESENT_WINDOW_MIN_FRAMES {
+            // Too little traffic to judge. Note this deliberately does
+            // NOT clear an existing latch — an output that goes quiet has
+            // not recovered, it has stopped.
+            return None;
+        }
+        // Vblanks the panel offered over the window just closed. Zero
+        // means the mode carries no refresh figure, in which case there is
+        // no panel ceiling to measure against and the window is rolled
+        // without a verdict rather than falling back to the drop ratio
+        // this function exists to replace.
+        let panel_capacity = (panel_refresh_hz as u64)
+            .saturating_mul(elapsed.as_millis() as u64)
+            / 1000;
+        if panel_capacity == 0 {
+            return None;
+        }
+        let presentable = produced.min(panel_capacity);
+        let presented = win_displayed.min(presentable);
+        let shortfall_pct = (presentable - presented).saturating_mul(100) / presentable;
+
+        if !self.latched && shortfall_pct >= DISPLAY_PRESENT_SHORTFALL_WARN_PCT {
+            self.latched = true;
+            Some(PresentLatchTransition::Latched {
+                shortfall_pct,
+                displayed: win_displayed,
+                presentable,
+                dropped: win_dropped,
+                window_secs: elapsed.as_secs(),
+            })
+        } else if self.latched && shortfall_pct <= DISPLAY_PRESENT_SHORTFALL_CLEAR_PCT {
+            self.latched = false;
+            Some(PresentLatchTransition::Recovered { shortfall_pct })
+        } else {
+            None
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn display_loop(
     mut kms: KmsDisplay,
@@ -4288,6 +4652,10 @@ fn display_loop(
     // resolution change or large PTS jump so a stream switch starts
     // fresh.
     let mut wall_anchor: Option<(u64, Instant)> = None;
+
+    // Sustained present-shortfall latch (issue #68). Polled once per
+    // presented frame; see `DisplayPresentLatch`.
+    let mut present_latch = DisplayPresentLatch::new(Instant::now(), kms.refresh_hz());
 
     // One-time A/V latency calibration for the RGA-accelerated
     // DRM_PRIME→sysmem transfer path (`rga-transfer` feature). That
@@ -4643,6 +5011,13 @@ fn display_loop(
             }
         }
         last_pts = Some(next.pts_90k);
+        // Republish the period for the demux child's re-promotion headroom
+        // gate (`cpu_decode_has_headroom`). Published from here rather than
+        // re-derived there because this is the estimate that is already fed
+        // fractional deltas and reset on a stream change.
+        counters
+            .source_frame_period_us
+            .store((frame_period_ms * 1000.0) as u64, Ordering::Relaxed);
         let _ = stats_registered;
 
         // Pace this frame against the audio master clock (or against a
@@ -4867,10 +5242,15 @@ fn display_loop(
                     break;
                 };
             }
-            // Surface the raw V−A offset to the operator. We drive this
-            // toward zero by present-to-playout (below), so a sustained
-            // non-zero value is a real lip-sync problem — not an absorbed
-            // baseline as in the previous EMA design.
+            // Surface the raw V−A offset to the operator. Note this is
+            // sampled *before* the present sleep below, so it is not an
+            // error signal that rests at zero: the sleep lands the frame
+            // at `PRESENT_MARGIN_MS` and the loop then immediately reads
+            // the next queued frame, one source period further ahead. In
+            // the queue-backed steady state this therefore reads about one
+            // frame period (~40 ms at 25 fps) and that is healthy. What is
+            // diagnostic is a *departure* from that baseline — see the
+            // `av_sync_offset_ms` row in `docs/metrics.md`.
             if !drift_is_stale {
                 counters.store_av_offset_ms(
                     raw_drift_ms.clamp(i32::MIN as i64, i32::MAX as i64) as i32,
@@ -5069,6 +5449,78 @@ fn display_loop(
                     "display atomic commit unavailable — falling back to per-frame set_crtc: {reason}"
                 ),
             );
+        }
+
+        // Sustained present-shortfall alarm (issue #68, hardening item
+        // (a)). An output that is failing to put its frames on the panel
+        // reads Healthy on every manager surface today:
+        // `frames_dropped_mpsc_full` climbs and nothing looks at it.
+        // Polled here — one `Instant::now()`, two relaxed loads and a
+        // cached mode read per frame — and edge-triggered, so real work
+        // happens only on a transition.
+        //
+        // The poll rides the present path deliberately. The condition it
+        // describes (the display thread cannot keep the panel fed) keeps
+        // the loop iterating by definition, just slowly. A loop that stops
+        // iterating altogether is the separate "no picture at all"
+        // failure that `display_flip_timeout` and the decoder no-frames
+        // watchdog own.
+        match present_latch.poll(
+            Instant::now(),
+            counters.frames_displayed.load(Ordering::Relaxed),
+            counters.frames_dropped_mpsc_full.load(Ordering::Relaxed),
+            kms.refresh_hz(),
+        ) {
+            Some(PresentLatchTransition::Latched {
+                shortfall_pct,
+                displayed,
+                presentable,
+                dropped,
+                window_secs: window_s,
+            }) => {
+                let refresh_hz = kms.refresh_hz();
+                event_sender.emit_flow_with_details(
+                    EventSeverity::Warning,
+                    "display",
+                    format!(
+                        "display output '{output_id}': presented {displayed} of the \
+                         {presentable} frames the {refresh_hz} Hz panel could have shown \
+                         over {window_s}s ({shortfall_pct}% short, {dropped} frames \
+                         dropped at the decoder hand-off) — the panel is visibly \
+                         juddering"
+                    ),
+                    &flow_id,
+                    serde_json::json!({
+                        "error_code": "display_frame_loss_sustained",
+                        "output_id": output_id,
+                        "present_shortfall_pct": shortfall_pct,
+                        "frames_dropped_mpsc_full": dropped,
+                        "frames_displayed": displayed,
+                        "frames_presentable": presentable,
+                        "panel_refresh_hz": refresh_hz,
+                        "window_seconds": window_s,
+                        "threshold_pct": DISPLAY_PRESENT_SHORTFALL_WARN_PCT,
+                    }),
+                );
+            }
+            Some(PresentLatchTransition::Recovered { shortfall_pct }) => {
+                event_sender.emit_flow_with_details(
+                    EventSeverity::Info,
+                    "display",
+                    format!(
+                        "display output '{output_id}': presenting within \
+                         {shortfall_pct}% of what the panel can show again"
+                    ),
+                    &flow_id,
+                    serde_json::json!({
+                        "error_code": "display_frame_loss_recovered",
+                        "output_id": output_id,
+                        "present_shortfall_pct": shortfall_pct,
+                        "window_seconds": DISPLAY_PRESENT_WINDOW.as_secs(),
+                    }),
+                );
+            }
+            None => {}
         }
     }
 }
@@ -5749,14 +6201,19 @@ mod tests {
             hw_repromoted_at: None,
             last_send_error_log_at: None,
             first_send_after_open: None,
+            decode_us_ema: None,
+            last_frame_at: None,
             mpeg2_cpu_pinned: false,
             mpeg2_cpu_override: None,
         }
     }
 
     fn fire_repromote(state: &mut HwOpenState) -> bool {
+        fire_repromote_with(state, &DisplayStatsCounters::default())
+    }
+
+    fn fire_repromote_with(state: &mut HwOpenState, counters: &DisplayStatsCounters) -> bool {
         let (events, _rx) = crate::manager::events::event_channel();
-        let counters = DisplayStatsCounters::default();
         let mut gate = KeyframeGate::new();
         let stale = AtomicBool::new(false);
         let mut slot: Option<VideoDecoder> = None;
@@ -5765,13 +6222,27 @@ mod tests {
             &mut slot,
             &mut current,
             state,
-            &counters,
+            counters,
             &mut gate,
             &stale,
             &events,
             "flow-test",
             "out-test",
         )
+    }
+
+    /// Counters describing a display output that is presenting a 25 fps
+    /// source and has produced plenty of frames out of the current
+    /// decoder — i.e. the headroom gate has everything it needs to judge.
+    fn counters_presenting_25fps() -> DisplayStatsCounters {
+        let counters = DisplayStatsCounters::default();
+        counters
+            .source_frame_period_us
+            .store(40_000, Ordering::Relaxed);
+        counters
+            .frames_received_since_open
+            .store(500, Ordering::Relaxed);
+        counters
     }
 
     /// Regression: the probe must leave `demoted_at` armed.
@@ -5872,6 +6343,477 @@ mod tests {
             "first retry too slow to recover from a transient input gap"
         );
     }
+
+    // ── Re-promotion decode-headroom gate (issue #101) ────────────────
+    //
+    // Re-promotion used to run on a pure timer, so a host whose CPU
+    // decode comfortably met the frame budget paid a decoder teardown
+    // (~1-2 s of disturbed picture) every backoff interval to re-test
+    // hardware it did not need. These pin the condition that now has to
+    // hold before a probe is worth firing.
+
+    /// A decoder that produced a frame just now, so only the cost half of
+    /// the gate is under test.
+    fn producing_now() -> (Option<Instant>, Instant) {
+        let now = Instant::now();
+        (Some(now), now)
+    }
+
+    #[test]
+    fn headroom_suppresses_the_probe_when_cpu_decode_is_cheap() {
+        // 4 ms per AU against a 40 ms budget — the demoted state is
+        // costing the operator nothing, so a probe can only hurt.
+        let (last, now) = producing_now();
+        assert!(cpu_decode_has_headroom(Some(4_000.0), 40_000, 500, last, now));
+    }
+
+    #[test]
+    fn headroom_probes_when_cpu_decode_misses_the_budget() {
+        // The hardware-measured failure: rk3568 CPU decode of 1080i50
+        // H.264 at 39 ms against a 20 ms field period. That output is
+        // dropping frames continuously and must keep retrying hardware.
+        let (last, now) = producing_now();
+        assert!(!cpu_decode_has_headroom(
+            Some(39_000.0),
+            20_000,
+            500,
+            last,
+            now
+        ));
+    }
+
+    #[test]
+    fn headroom_probes_right_at_the_budget_boundary() {
+        // Exactly at the 60 % line still probes — the constant is the
+        // point past which CPU decode is no longer *comfortable*, and
+        // per-AU cost varies either side of its mean.
+        let budget_us = 40_000 * HW_REPROMOTE_DECODE_BUDGET_PCT / 100;
+        let (last, now) = producing_now();
+        assert!(!cpu_decode_has_headroom(
+            Some(budget_us as f64),
+            40_000,
+            500,
+            last,
+            now
+        ));
+        assert!(cpu_decode_has_headroom(
+            Some(budget_us as f64 - 1.0),
+            40_000,
+            500,
+            last,
+            now
+        ));
+    }
+
+    #[test]
+    fn headroom_never_suppresses_on_an_unknown() {
+        let (last, now) = producing_now();
+        // No cost estimate yet (fresh open / flush).
+        assert!(!cpu_decode_has_headroom(None, 40_000, 500, last, now));
+        // Display thread hasn't published a frame period yet.
+        assert!(!cpu_decode_has_headroom(Some(1_000.0), 0, 500, last, now));
+        // Decoder has never produced a frame at all.
+        assert!(!cpu_decode_has_headroom(Some(1_000.0), 40_000, 500, None, now));
+    }
+
+    /// The EMA warm-up bound: a cost estimate built from a handful of AUs
+    /// is not worth suppressing a probe on.
+    #[test]
+    fn headroom_waits_for_the_cost_estimate_to_warm_up() {
+        let (last, now) = producing_now();
+        assert!(!cpu_decode_has_headroom(Some(50.0), 40_000, 0, last, now));
+        assert!(!cpu_decode_has_headroom(
+            Some(50.0),
+            40_000,
+            HW_REPROMOTE_MIN_FRAMES_FOR_HEADROOM - 1,
+            last,
+            now
+        ));
+        assert!(cpu_decode_has_headroom(
+            Some(50.0),
+            40_000,
+            HW_REPROMOTE_MIN_FRAMES_FOR_HEADROOM,
+            last,
+            now
+        ));
+    }
+
+    /// The liveness half of the gate, and the reason it cannot be the
+    /// lifetime frame count.
+    ///
+    /// A CPU decoder that decodes 500 frames and then returns `EAGAIN`
+    /// forever raises no `send_packet` error, so nothing resets the open
+    /// window: the count stays at 500 (way past the warm-up bar) and the
+    /// cost EMA decays toward the price of a no-op decode. Judged on those
+    /// two the gate would read "loads of headroom" and suppress the probe
+    /// permanently — and the probe is the only thing that re-opens the
+    /// decoder, so the panel would stay frozen for the life of the flow.
+    #[test]
+    fn headroom_does_not_trust_a_decoder_that_stopped_producing() {
+        let now = Instant::now();
+        let wedged_at = now - (HW_REPROMOTE_PRODUCING_WINDOW + Duration::from_secs(1));
+        // Cheap (a no-op decode costs almost nothing) and 500 frames deep
+        // — every count-based signal says "healthy".
+        assert!(!cpu_decode_has_headroom(
+            Some(50.0),
+            40_000,
+            500,
+            Some(wedged_at),
+            now
+        ));
+        // The same decoder while it was still delivering pictures.
+        assert!(cpu_decode_has_headroom(
+            Some(50.0),
+            40_000,
+            500,
+            Some(now - HW_REPROMOTE_PRODUCING_WINDOW / 2),
+            now
+        ));
+    }
+
+    /// End-to-end through the real gate: a due backoff is no longer
+    /// sufficient on its own.
+    #[test]
+    fn repromote_skips_a_due_probe_while_cpu_decode_has_headroom() {
+        let mut state = demoted_state();
+        state.decode_us_ema = Some(3_000.0);
+        state.last_frame_at = Some(Instant::now());
+        let counters = counters_presenting_25fps();
+        assert!(
+            !fire_repromote_with(&mut state, &counters),
+            "backoff is due but CPU decode is comfortable — the probe is pure cost"
+        );
+        // Nothing consumed: the moment headroom disappears the very next
+        // AU must be eligible, on the same backoff step.
+        assert_eq!(state.hw_repromote_attempts, 0);
+        assert_eq!(state.backend, DecoderBackend::Cpu);
+        assert!(state.demoted_at.is_some());
+    }
+
+    #[test]
+    fn repromote_fires_once_cpu_decode_stops_keeping_up() {
+        let mut state = demoted_state();
+        state.decode_us_ema = Some(39_000.0);
+        state.last_frame_at = Some(Instant::now());
+        let counters = counters_presenting_25fps();
+        assert!(fire_repromote_with(&mut state, &counters));
+        assert_eq!(state.backend, DecoderBackend::Rkmpp);
+        assert_eq!(state.hw_repromote_attempts, 1);
+    }
+
+    /// End-to-end wedge case (issue #101 follow-up): cheap decode, 500
+    /// frames on the clock, backoff due — and no frame for seconds. The
+    /// probe is the only recovery path left, so it must still fire.
+    #[test]
+    fn repromote_still_fires_for_a_decoder_that_wedged_after_producing() {
+        let mut state = demoted_state();
+        // A no-op decode is cheap: the cost EMA alone says "headroom".
+        state.decode_us_ema = Some(50.0);
+        state.last_frame_at =
+            Some(Instant::now() - (HW_REPROMOTE_PRODUCING_WINDOW + Duration::from_secs(3)));
+        let counters = counters_presenting_25fps();
+        assert!(
+            fire_repromote_with(&mut state, &counters),
+            "a decoder that stopped producing must not suppress its own recovery"
+        );
+        assert_eq!(state.backend, DecoderBackend::Rkmpp);
+        assert_eq!(state.hw_repromote_attempts, 1);
+    }
+
+    /// The EMA must describe the decoder that is running *now*. Carrying
+    /// it across the demote would let the hardware era's timings answer a
+    /// question only ever asked about CPU decode. Its liveness stamp is
+    /// era-scoped for the same reason.
+    #[test]
+    fn decoder_open_window_reset_clears_the_decode_cost_estimate() {
+        let mut state = demoted_state();
+        state.decode_us_ema = Some(39_000.0);
+        state.last_frame_at = Some(Instant::now());
+        let counters = counters_presenting_25fps();
+        reset_decoder_open_window(&mut state, &counters);
+        assert_eq!(state.decode_us_ema, None);
+        assert_eq!(state.last_frame_at, None);
+        assert_eq!(
+            counters.frames_received_since_open.load(Ordering::Relaxed),
+            0
+        );
+    }
+
+    // ── Sustained present-shortfall latch (issue #68) ─────────────────
+    //
+    // A display output can be failing to put its frames on the panel
+    // while every manager surface reads Healthy: `frames_dropped_mpsc_full`
+    // climbs and nothing looks at it.
+
+    /// 25 fps of source for the whole window — comfortably past the
+    /// min-frames bar.
+    const WINDOW_FRAMES: u64 = 750;
+
+    /// A 50 Hz panel: twice the 25 fps source above, so the panel ceiling
+    /// is never the binding constraint in these cases and the verdict is
+    /// purely about frames that had a slot and never arrived.
+    const PANEL_HZ: u32 = 50;
+
+    #[test]
+    fn present_latch_stays_quiet_inside_a_window() {
+        let t0 = Instant::now();
+        let mut latch = DisplayPresentLatch::new(t0, PANEL_HZ);
+        assert_eq!(
+            latch.poll(
+                t0 + DISPLAY_PRESENT_WINDOW - Duration::from_secs(1),
+                0,
+                1_000,
+                PANEL_HZ
+            ),
+            None,
+            "a partial window must not be judged"
+        );
+    }
+
+    #[test]
+    fn present_latch_fires_on_a_sustained_shortfall() {
+        let t0 = Instant::now();
+        let mut latch = DisplayPresentLatch::new(t0, PANEL_HZ);
+        // 30 % of the window's frames never reached the panel, which had
+        // room for every one of them.
+        let dropped = WINDOW_FRAMES * 3 / 10;
+        let displayed = WINDOW_FRAMES - dropped;
+        assert_eq!(
+            latch.poll(t0 + DISPLAY_PRESENT_WINDOW, displayed, dropped, PANEL_HZ),
+            Some(PresentLatchTransition::Latched {
+                shortfall_pct: 30,
+                displayed,
+                presentable: WINDOW_FRAMES,
+                dropped,
+                window_secs: DISPLAY_PRESENT_WINDOW.as_secs(),
+            })
+        );
+    }
+
+    /// **The regression this alarm's second revision exists for.** A
+    /// 1080p60 source on a 3840x2160@30 panel is a correct, everyday
+    /// configuration: the display thread presents every other frame, the
+    /// decode child's `try_send` fails for the rest, and the *drop ratio*
+    /// sits at a permanent 50 %. Judged on that ratio the alarm latched a
+    /// Warning that could never clear (5 % was equally unreachable) on an
+    /// output that looks perfect on the panel.
+    #[test]
+    fn present_latch_never_fires_on_legitimate_source_to_panel_decimation() {
+        let t0 = Instant::now();
+        let panel_hz: u32 = 30;
+        let mut latch = DisplayPresentLatch::new(t0, panel_hz);
+        // Per window: decoder produces 60 fps, panel shows 30 fps, the
+        // 24-slot hand-off sheds the difference.
+        let produced = 60 * DISPLAY_PRESENT_WINDOW.as_secs();
+        let per_window_displayed = panel_hz as u64 * DISPLAY_PRESENT_WINDOW.as_secs();
+        let per_window_dropped = produced - per_window_displayed;
+        let (mut displayed, mut dropped) = (0u64, 0u64);
+        for w in 1..=20 {
+            displayed += per_window_displayed;
+            dropped += per_window_dropped;
+            assert_eq!(
+                latch.poll(t0 + DISPLAY_PRESENT_WINDOW * w, displayed, dropped, panel_hz),
+                None,
+                "a 50 % drop ratio that is just source-to-panel decimation \
+                 must never alarm (window {w})"
+            );
+        }
+        assert!(!latch.latched);
+    }
+
+    /// The same panel, genuinely failing: half the vblanks the panel
+    /// offered go unfilled. Decimation must not have desensitised the
+    /// alarm, only re-based it.
+    #[test]
+    fn present_latch_still_fires_under_the_panel_ceiling() {
+        let t0 = Instant::now();
+        let panel_hz: u32 = 30;
+        let mut latch = DisplayPresentLatch::new(t0, panel_hz);
+        let produced = 60 * DISPLAY_PRESENT_WINDOW.as_secs();
+        // Only 15 fps reaches the panel where 30 could.
+        let displayed = 15 * DISPLAY_PRESENT_WINDOW.as_secs();
+        let dropped = produced - displayed;
+        assert_eq!(
+            latch.poll(t0 + DISPLAY_PRESENT_WINDOW, displayed, dropped, panel_hz),
+            Some(PresentLatchTransition::Latched {
+                shortfall_pct: 50,
+                displayed,
+                presentable: panel_hz as u64 * DISPLAY_PRESENT_WINDOW.as_secs(),
+                dropped,
+                window_secs: DISPLAY_PRESENT_WINDOW.as_secs(),
+            })
+        );
+    }
+
+    /// A source slower than the panel is not a shortfall: 25 fps of
+    /// content on a 50 Hz panel presents 25 fps and that is all there is.
+    #[test]
+    fn present_latch_does_not_expect_more_frames_than_the_source_has() {
+        let t0 = Instant::now();
+        let mut latch = DisplayPresentLatch::new(t0, PANEL_HZ);
+        assert_eq!(
+            latch.poll(t0 + DISPLAY_PRESENT_WINDOW, WINDOW_FRAMES, 0, PANEL_HZ),
+            None
+        );
+    }
+
+    /// A mode with no refresh figure gives nothing to measure against, so
+    /// the window rolls without a verdict rather than falling back to the
+    /// drop ratio this latch replaced.
+    #[test]
+    fn present_latch_withholds_a_verdict_without_a_panel_refresh() {
+        let t0 = Instant::now();
+        let mut latch = DisplayPresentLatch::new(t0, 0);
+        let dropped = WINDOW_FRAMES * 3 / 10;
+        let displayed = WINDOW_FRAMES - dropped;
+        assert_eq!(
+            latch.poll(t0 + DISPLAY_PRESENT_WINDOW, displayed, dropped, 0),
+            None
+        );
+        assert!(!latch.latched);
+    }
+
+    /// The auto-match modeset can re-program the panel part-way through a
+    /// window, which changes the denominator under the measurement: the
+    /// frames were presented against the old mode and the capacity would
+    /// be computed against the new one. Roll without a verdict.
+    #[test]
+    fn present_latch_withholds_a_verdict_across_a_modeset() {
+        let t0 = Instant::now();
+        let mut latch = DisplayPresentLatch::new(t0, 30);
+        // The window's traffic would read as a 50 % shortfall against the
+        // 60 Hz mode it ended on, and as nothing at all against the 30 Hz
+        // mode it ran under.
+        let displayed = 30 * DISPLAY_PRESENT_WINDOW.as_secs();
+        let dropped = 30 * DISPLAY_PRESENT_WINDOW.as_secs();
+        assert_eq!(
+            latch.poll(t0 + DISPLAY_PRESENT_WINDOW, displayed, dropped, 60),
+            None
+        );
+        assert!(!latch.latched);
+        // The next window is measured cleanly against the new mode.
+        assert_eq!(
+            latch.poll(
+                t0 + DISPLAY_PRESENT_WINDOW * 2,
+                displayed * 2,
+                dropped * 2,
+                60
+            ),
+            Some(PresentLatchTransition::Latched {
+                shortfall_pct: 50,
+                displayed,
+                presentable: 60 * DISPLAY_PRESENT_WINDOW.as_secs(),
+                dropped,
+                window_secs: DISPLAY_PRESENT_WINDOW.as_secs(),
+            })
+        );
+    }
+
+    #[test]
+    fn present_latch_is_edge_triggered() {
+        let t0 = Instant::now();
+        let mut latch = DisplayPresentLatch::new(t0, PANEL_HZ);
+        let dropped = WINDOW_FRAMES * 3 / 10;
+        let displayed = WINDOW_FRAMES - dropped;
+        assert!(latch
+            .poll(t0 + DISPLAY_PRESENT_WINDOW, displayed, dropped, PANEL_HZ)
+            .is_some());
+        assert_eq!(
+            latch.poll(
+                t0 + DISPLAY_PRESENT_WINDOW * 2,
+                displayed * 2,
+                dropped * 2,
+                PANEL_HZ
+            ),
+            None,
+            "a still-latched output must not re-emit every window"
+        );
+    }
+
+    #[test]
+    fn present_latch_clears_with_hysteresis() {
+        let t0 = Instant::now();
+        let mut latch = DisplayPresentLatch::new(t0, PANEL_HZ);
+        let mut dropped = WINDOW_FRAMES * 3 / 10;
+        let mut displayed = WINDOW_FRAMES - dropped;
+        assert!(latch
+            .poll(t0 + DISPLAY_PRESENT_WINDOW, displayed, dropped, PANEL_HZ)
+            .is_some());
+
+        // Improved to 10 % — better, but inside the hysteresis band, so
+        // the latch must hold rather than flap.
+        dropped += WINDOW_FRAMES / 10;
+        displayed += WINDOW_FRAMES - WINDOW_FRAMES / 10;
+        assert_eq!(
+            latch.poll(t0 + DISPLAY_PRESENT_WINDOW * 2, displayed, dropped, PANEL_HZ),
+            None
+        );
+
+        // Down to 2 % — a real recovery.
+        dropped += WINDOW_FRAMES * 2 / 100;
+        displayed += WINDOW_FRAMES - WINDOW_FRAMES * 2 / 100;
+        assert_eq!(
+            latch.poll(t0 + DISPLAY_PRESENT_WINDOW * 3, displayed, dropped, PANEL_HZ),
+            Some(PresentLatchTransition::Recovered { shortfall_pct: 2 })
+        );
+    }
+
+    #[test]
+    fn present_latch_ignores_a_window_too_small_to_judge() {
+        let t0 = Instant::now();
+        let mut latch = DisplayPresentLatch::new(t0, PANEL_HZ);
+        // 2 of 3 frames missing is not "66 % short" in any useful sense.
+        assert_eq!(
+            latch.poll(t0 + DISPLAY_PRESENT_WINDOW, 1, 2, PANEL_HZ),
+            None
+        );
+        // ...and the window still rolled, so the next one is judged on
+        // its own traffic rather than inheriting the runt.
+        let dropped = WINDOW_FRAMES * 3 / 10;
+        assert!(latch
+            .poll(
+                t0 + DISPLAY_PRESENT_WINDOW * 2,
+                1 + WINDOW_FRAMES - dropped,
+                2 + dropped,
+                PANEL_HZ
+            )
+            .is_some());
+    }
+
+    /// An output that goes quiet has not recovered, it has stopped — so a
+    /// runt window must never clear a standing latch.
+    #[test]
+    fn present_latch_does_not_clear_on_silence() {
+        let t0 = Instant::now();
+        let mut latch = DisplayPresentLatch::new(t0, PANEL_HZ);
+        let dropped = WINDOW_FRAMES * 3 / 10;
+        let displayed = WINDOW_FRAMES - dropped;
+        assert!(latch
+            .poll(t0 + DISPLAY_PRESENT_WINDOW, displayed, dropped, PANEL_HZ)
+            .is_some());
+        assert_eq!(
+            latch.poll(t0 + DISPLAY_PRESENT_WINDOW * 2, displayed, dropped, PANEL_HZ),
+            None
+        );
+        assert!(latch.latched, "silence is not recovery");
+    }
+
+    /// A healthy output must never produce an event, whatever its frame
+    /// rate — this is the false-positive guard for a per-frame poll.
+    #[test]
+    fn present_latch_never_fires_on_a_clean_output() {
+        let t0 = Instant::now();
+        let mut latch = DisplayPresentLatch::new(t0, PANEL_HZ);
+        let mut displayed = 0;
+        for w in 1..=20 {
+            displayed += WINDOW_FRAMES;
+            assert_eq!(
+                latch.poll(t0 + DISPLAY_PRESENT_WINDOW * w, displayed, 0, PANEL_HZ),
+                None
+            );
+        }
+    }
+
     #[test]
     fn mpeg2_pinned_to_cpu_on_every_backend_except_nvdec() {
         for backend in [
