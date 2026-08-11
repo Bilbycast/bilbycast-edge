@@ -1318,6 +1318,7 @@ Sends RTP-wrapped MPEG-TS packets to a unicast or multicast destination. Support
 | `delay` | object | No | `null` | Output delay for stream synchronization. Modes: `{"mode":"fixed","ms":N}` adds constant delay; `{"mode":"target_ms","ms":N}` targets end-to-end latency (self-adjusting); `{"mode":"target_frames","frames":N,"fallback_ms":M}` targets latency in video frames (auto-detected fps). |
 | `egress_pacing` | string | No | auto | Egress pacing model for the wire emitter: `"forward"` (emit at input cadence, no re-pacing; lowest latency, recommended for clean upstreams), `"pcr"` (open-loop re-pacing at PCR-implied instants, for SMPTE 2022-7 dual-leg coherence / strict-T-STD receivers / bond-reassembled cadence), `"servo"` (closed-loop release-rate servo for a genuinely bursty unpaced ingress). **Unset = auto**: resolves to `"pcr"` when the flow has a `bonded` input, else `"forward"` (see [Egress pacing auto-resolution](#egress-pacing-auto-resolution)). A bounded residence cap guards against latency runaway in every mode. Manager-configurable; UI gated on the `egress_pacing` capability. |
 | `egress_buffer_ms` | integer | No | `null` | Servo de-jitter cushion (ms of content). **Only valid with `egress_pacing: "servo"`** — rejected otherwise. Seeds and holds ~this much content in the egress queue, absorbing arrival jitter at the cost of that latency. Range 20-2000. `null` = no cushion (servo rate-trims only). |
+| `epoch_lock` | object | No | `null` | Epoch-locked egress — release this output's datagrams on a **group-shared timeline** so independent nodes forwarding the same feed emit the same content at the same wall instant. See [Epoch-locked egress](#epoch-locked-egress-cross-node-alignment). |
 
 **Validation rules:**
 - `id` cannot be empty.
@@ -1326,6 +1327,7 @@ Sends RTP-wrapped MPEG-TS packets to a unicast or multicast destination. Support
 - `program_number` must be `> 0` if set (program_number 0 is reserved for the NIT).
 - `delay`: `fixed` ms 0-10000; `target_ms` ms 1-10000; `target_frames` frames 0.01-300, fallback_ms 0-10000.
 - `egress_buffer_ms` requires `egress_pacing: "servo"` and must be 20-2000 ms.
+- `epoch_lock` requires an explicit `egress_pacing: "pcr"` and a flow that satisfies every condition in [Epoch-locked egress](#epoch-locked-egress-cross-node-alignment).
 
 #### Egress pacing auto-resolution
 
@@ -1378,6 +1380,7 @@ Sends raw MPEG-TS over UDP without RTP headers. Datagrams are TS-aligned (7×188
 | `delay` | object | No | `null` | Output delay for stream synchronization (same modes as RTP output). Incompatible with `transport_mode: "audio_302m"`. |
 | `egress_pacing` | string | No | auto | Egress pacing model for the wire emitter: `"forward"` (emit at input cadence, no re-pacing; lowest latency, recommended for clean upstreams), `"pcr"` (open-loop re-pacing at PCR-implied instants, for SMPTE 2022-7 dual-leg coherence / strict-T-STD receivers / bond-reassembled cadence), `"servo"` (closed-loop release-rate servo for a genuinely bursty unpaced ingress). **Unset = auto**: resolves to `"pcr"` when the flow has a `bonded` input, else `"forward"` (see [Egress pacing auto-resolution](#egress-pacing-auto-resolution)). A bounded residence cap guards against latency runaway in every mode. Manager-configurable; UI gated on the `egress_pacing` capability. |
 | `egress_buffer_ms` | integer | No | `null` | Servo de-jitter cushion (ms of content). **Only valid with `egress_pacing: "servo"`** — rejected otherwise. Seeds and holds ~this much content in the egress queue, absorbing arrival jitter at the cost of that latency. Range 20-2000. `null` = no cushion (servo rate-trims only). |
+| `epoch_lock` | object | No | `null` | Epoch-locked egress — release this output's datagrams on a **group-shared timeline** so independent nodes forwarding the same feed emit the same content at the same wall instant. See [Epoch-locked egress](#epoch-locked-egress-cross-node-alignment). |
 
 **Validation rules:**
 - `id` cannot be empty.
@@ -1386,6 +1389,62 @@ Sends raw MPEG-TS over UDP without RTP headers. Datagrams are TS-aligned (7×188
 - `program_number` must be `> 0` if set.
 - `delay`: same validation as RTP output. Incompatible with `transport_mode: "audio_302m"`.
 - `egress_buffer_ms` requires `egress_pacing: "servo"` and must be 20-2000 ms.
+- `epoch_lock` requires an explicit `egress_pacing: "pcr"` and a flow that satisfies every condition in [Epoch-locked egress](#epoch-locked-egress-cross-node-alignment).
+
+#### Epoch-locked egress (cross-node alignment)
+
+Two edges fed the same contribution feed normally emit it at whatever instant
+each one's own ingest path delivers it — they differ by their path-latency
+difference. `epoch_lock` puts both on a **shared timeline** so a downstream
+switcher can cut between them without a timing discontinuity. It gives a clean
+**cut**, not a seamless SMPTE 2022-7 merge (RTP sequence numbers stay per-node
+counters).
+
+Available on **UDP and RTP outputs only**. Advertised as the `epoch_lock`
+capability — an edge without it ignores the block silently, which looks exactly
+like success, so the manager UI gates the field on the bit.
+
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| `egress_offset_ms` | integer | Yes | - | Headroom between the instant the group's shared timeline assigns to a PCR and the instant its datagram is released. Range 150-800. **Must be identical on every member** — a mismatch misaligns the group by exactly the difference while every node reports healthy. |
+| `group_label` | string | No | `null` | Operator label surfaced on telemetry so the manager UI can group members visually. Carries **no behaviour**. Max 64 chars. |
+| `source_anchor` | object | No | `null` | The group-shared source-PCR → wall-instant anchor: `{ "pcr_27mhz": N, "unix_ns": N, "generation": N, "effective_from_pcr": N|null }`. **Minted and pushed by the manager** (`set_epoch_anchor`) — not hand-authored. Absent until the group is armed. |
+| `pcr_pid` | integer | No | `null` | PCR PID to anchor on, for a source carrying more than one program. Must be `< 0x1FFF`. Required unless the source is single-program: the emitter otherwise latches "the first PCR-bearing PID I ever saw", and two members joining an MPTS at different byte offsets can latch *different programs* — misaligning by seconds while every plausibility check passes. |
+
+**`egress_offset_ms` is a budget for the inter-node latency _spread_, not for
+absolute end-to-end latency.** The manager mints the anchor from the slowest
+member's arrival, so a member's required dwell is its lead over the slowest plus
+this margin — absolute path latency cancels out. Sizing it against absolute
+latency instead puts a WAN contribution feed straight into the wire-emit
+residence cap.
+
+**Scope — validation rejects everything outside it:**
+
+- Explicit `egress_pacing: "pcr"` on the output (never `auto`, `forward` or `servo`).
+- Exactly **one input** on the flow, and the flow is **not** assembled (no PID bus).
+- The output is **not** transcoded (no `audio_encode` / `video_encode`) and has an unambiguous PCR PID.
+- Every input on the flow is `bonded` **or** sets `passthrough_clock: true`.
+
+That last one is load-bearing. The PCR reaching the wire emitter must be a
+function of the **content**, not of this node. In default muxer mode
+`ts_pts_rewriter` anchors output PCR to *this node's* wall clock at the first PCR
+it saw, so the value carries the node's own ingest instant and inverting it
+recovers nothing shared. **Consequence the operator feels: alignment and PCR/PTS
+regeneration are mutually exclusive** — turning this on gives up muxer-mode
+rewriting on those inputs.
+
+A flow-level violation does not fail the config. The edge **strips `epoch_lock`
+from the flow's outputs and keeps running**, logging why; the absent
+`epoch_lock` telemetry block is what tells the manager the group never armed.
+
+Per-output telemetry rides `OutputStats.epoch_lock`: `engaged`, `disengaged`,
+`egress_offset_us`, `deficit_us` / `deficit_max_us` (released **late** — raise
+the offset), `clamped` (released **early** — lower it; a **lifetime** counter
+that never resets), `implausible`, `anchor_generation`, `group_label`.
+
+Arming a group is a manager operation — a single node cannot mint its own
+anchor. See the manager's [Alignment Groups](../../bilbycast-manager/docs/alignment-groups.md)
+reference and the full design rationale in [`clocking.md`](clocking.md#cross-node-egress-alignment-epoch_lock).
 
 ### SRT Output
 
