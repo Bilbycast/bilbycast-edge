@@ -449,7 +449,7 @@ async fn thumbnail_loop(
                 #[cfg(feature = "media-codecs")]
                 let warm_frame = warm.as_ref().and_then(|w| w.latest());
                 #[cfg(not(feature = "media-codecs"))]
-                let warm_frame: Option<CaptureResult> = None;
+                let warm_frame: Option<InternalThumbnailResult> = None;
                 // Gate on the same rule as the periodic tick rather than raw
                 // `has_data()`. The invariant the tick declares — a warm frame
                 // publishes even with an empty ring, because it was decoded
@@ -752,6 +752,7 @@ fn capture_gate(stream_silent: bool, has_data: bool, has_warm_frame: bool) -> Ca
 /// `PTS_BOUNDARY_TICKS` is 1 s in 90 kHz. Adjacent AUs within one source sit
 /// tens of ms apart, so only a real cut trips it; B-frame reorder (well under
 /// a second) does not.
+#[cfg(feature = "media-codecs")]
 fn is_source_boundary(
     frame_codec: video_codec::VideoCodec,
     current_codec: video_codec::VideoCodec,

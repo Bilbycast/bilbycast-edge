@@ -8,6 +8,7 @@
 //! by driving the UDP socket and str0m poll loop in a select! loop.
 
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::Result;
@@ -28,7 +29,11 @@ pub enum SessionEvent {
     MediaData {
         mid: Mid,
         pt: Pt,
-        data: Vec<u8>,
+        /// str0m 0.20 changed `MediaData.data` from `Vec<u8>` to `Arc<[u8]>`.
+        /// Carried through as-is rather than `.to_vec()`'d: every consumer only
+        /// borrows it (`&data`, indexing, `is_empty`), so widening keeps the
+        /// WebRTC ingest path free of a per-frame allocation and copy.
+        data: Arc<[u8]>,
         rtp_time: MediaTime,
         network_time: Instant,
         contiguous: bool,

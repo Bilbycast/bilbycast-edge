@@ -45,13 +45,17 @@ use std::sync::atomic::{AtomicU64, Ordering};
 // ── Backend-specific imports ────────────────────────────────────────────────
 
 #[cfg(not(feature = "fdk-aac"))]
-use symphonia::core::audio::{AudioBufferRef, Channels, Signal, SignalSpec};
+use symphonia::core::audio::{Audio, AudioSpec, Channels, GenericAudioBufferRef, Position};
 #[cfg(not(feature = "fdk-aac"))]
-use symphonia::core::codecs::{CODEC_TYPE_AAC, CodecParameters, Decoder, DecoderOptions};
+use symphonia::core::codecs::audio::well_known::CODEC_ID_AAC;
+#[cfg(not(feature = "fdk-aac"))]
+use symphonia::core::codecs::audio::{AudioCodecParameters, AudioDecoder, AudioDecoderOptions};
 #[cfg(not(feature = "fdk-aac"))]
 use symphonia::core::errors::Error as SymphoniaError;
 #[cfg(not(feature = "fdk-aac"))]
-use symphonia::core::formats::Packet;
+use symphonia::core::packet::PacketRef;
+#[cfg(not(feature = "fdk-aac"))]
+use symphonia::core::units::{Duration as SymphoniaDuration, Timestamp};
 #[cfg(not(feature = "fdk-aac"))]
 use symphonia::default::codecs::AacDecoder as SymphoniaAacDecoder;
 
@@ -892,18 +896,18 @@ impl AacDecoder {
         };
 
         let channels_mask = match channels {
-            1 => Channels::FRONT_LEFT,
-            2 => Channels::FRONT_LEFT | Channels::FRONT_RIGHT,
+            1 => Channels::Positioned(Position::FRONT_LEFT),
+            2 => Channels::Positioned(Position::FRONT_LEFT | Position::FRONT_RIGHT),
             _ => return Err(AacDecodeError::UnsupportedChannelConfig(channels)),
         };
 
-        let mut params = CodecParameters::new();
+        let mut params = AudioCodecParameters::new();
         params
-            .for_codec(CODEC_TYPE_AAC)
+            .for_codec(CODEC_ID_AAC)
             .with_sample_rate(sample_rate)
             .with_channels(channels_mask);
 
-        let inner = SymphoniaAacDecoder::try_new(&params, &DecoderOptions::default())
+        let inner = SymphoniaAacDecoder::try_new(&params, &AudioDecoderOptions::default())
             .map_err(|e: SymphoniaError| AacDecodeError::Symphonia(e.to_string()))?;
 
         Ok(Self {
@@ -923,12 +927,19 @@ impl AacDecoder {
     }
 
     pub fn decode_frame(&mut self, frame_bytes: &[u8]) -> Result<Vec<Vec<f32>>, AacDecodeError> {
-        let packet = Packet::new_from_slice(0, self.next_ts, 1024, frame_bytes);
+        // `PacketRef` borrows `frame_bytes` — the owning `Packet` would copy every
+        // AAC frame into a fresh `Box<[u8]>`, which this decode path runs per frame.
+        let packet = PacketRef::new(
+            0,
+            Timestamp::new(self.next_ts as i64),
+            SymphoniaDuration::new(1024),
+            frame_bytes,
+        );
         self.next_ts = self.next_ts.saturating_add(1024);
 
         let buf_ref = self
             .inner
-            .decode(&packet)
+            .decode_ref(&packet)
             .map_err(|e: SymphoniaError| AacDecodeError::Symphonia(e.to_string()))?;
 
         Ok(audio_buffer_ref_to_planar_f32(&buf_ref))
@@ -946,37 +957,50 @@ impl AacDecoder {
 }
 
 #[cfg(not(feature = "fdk-aac"))]
-fn audio_buffer_ref_to_planar_f32(buf_ref: &AudioBufferRef<'_>) -> Vec<Vec<f32>> {
+fn audio_buffer_ref_to_planar_f32(buf_ref: &GenericAudioBufferRef<'_>) -> Vec<Vec<f32>> {
     match buf_ref {
-        AudioBufferRef::F32(buf) => extract_planar_f32(buf.spec(), buf.frames(), |ch| buf.chan(ch)),
-        AudioBufferRef::F64(buf) => extract_planar_with(buf.spec(), buf.frames(), |ch| buf.chan(ch), |s| *s as f32),
-        AudioBufferRef::S16(buf) => extract_planar_with(buf.spec(), buf.frames(), |ch| buf.chan(ch), |s| *s as f32 / 32_768.0),
-        AudioBufferRef::S24(buf) => extract_planar_with(buf.spec(), buf.frames(), |ch| buf.chan(ch), |s| s.inner() as f32 / 8_388_608.0),
-        AudioBufferRef::S32(buf) => extract_planar_with(buf.spec(), buf.frames(), |ch| buf.chan(ch), |s| *s as f32 / 2_147_483_648.0),
-        AudioBufferRef::U8(buf) => extract_planar_with(buf.spec(), buf.frames(), |ch| buf.chan(ch), |s| (*s as f32 - 128.0) / 128.0),
-        AudioBufferRef::U16(buf) => extract_planar_with(buf.spec(), buf.frames(), |ch| buf.chan(ch), |s| (*s as f32 - 32_768.0) / 32_768.0),
-        AudioBufferRef::U24(buf) => extract_planar_with(buf.spec(), buf.frames(), |ch| buf.chan(ch), |s| (s.inner() as f32 - 8_388_608.0) / 8_388_608.0),
-        AudioBufferRef::U32(buf) => extract_planar_with(buf.spec(), buf.frames(), |ch| buf.chan(ch), |s| (*s as f32 - 2_147_483_648.0) / 2_147_483_648.0),
-        AudioBufferRef::S8(buf) => extract_planar_with(buf.spec(), buf.frames(), |ch| buf.chan(ch), |s| *s as f32 / 128.0),
+        // `plane` replaces 0.5's `Signal::chan` and returns `Option` rather than
+        // panicking. A missing plane means the decoder produced fewer channels than
+        // the spec advertises; treat it as silence rather than killing the flow.
+        GenericAudioBufferRef::F32(buf) => extract_planar_f32(buf.spec(), buf.frames(), |ch| buf.plane(ch).unwrap_or(&[])),
+        GenericAudioBufferRef::F64(buf) => extract_planar_with(buf.spec(), buf.frames(), |ch| buf.plane(ch).unwrap_or(&[]), |s| *s as f32),
+        GenericAudioBufferRef::S16(buf) => extract_planar_with(buf.spec(), buf.frames(), |ch| buf.plane(ch).unwrap_or(&[]), |s| *s as f32 / 32_768.0),
+        GenericAudioBufferRef::S24(buf) => extract_planar_with(buf.spec(), buf.frames(), |ch| buf.plane(ch).unwrap_or(&[]), |s| s.inner() as f32 / 8_388_608.0),
+        GenericAudioBufferRef::S32(buf) => extract_planar_with(buf.spec(), buf.frames(), |ch| buf.plane(ch).unwrap_or(&[]), |s| *s as f32 / 2_147_483_648.0),
+        GenericAudioBufferRef::U8(buf) => extract_planar_with(buf.spec(), buf.frames(), |ch| buf.plane(ch).unwrap_or(&[]), |s| (*s as f32 - 128.0) / 128.0),
+        GenericAudioBufferRef::U16(buf) => extract_planar_with(buf.spec(), buf.frames(), |ch| buf.plane(ch).unwrap_or(&[]), |s| (*s as f32 - 32_768.0) / 32_768.0),
+        GenericAudioBufferRef::U24(buf) => extract_planar_with(buf.spec(), buf.frames(), |ch| buf.plane(ch).unwrap_or(&[]), |s| (s.inner() as f32 - 8_388_608.0) / 8_388_608.0),
+        GenericAudioBufferRef::U32(buf) => extract_planar_with(buf.spec(), buf.frames(), |ch| buf.plane(ch).unwrap_or(&[]), |s| (*s as f32 - 2_147_483_648.0) / 2_147_483_648.0),
+        GenericAudioBufferRef::S8(buf) => extract_planar_with(buf.spec(), buf.frames(), |ch| buf.plane(ch).unwrap_or(&[]), |s| *s as f32 / 128.0),
     }
 }
 
 #[cfg(not(feature = "fdk-aac"))]
 #[inline]
-fn extract_planar_f32<'a, F>(spec: &SignalSpec, frames: usize, get_chan: F) -> Vec<Vec<f32>>
+fn extract_planar_f32<'a, F>(spec: &AudioSpec, frames: usize, get_chan: F) -> Vec<Vec<f32>>
 where
     F: Fn(usize) -> &'a [f32],
 {
-    let n_ch = spec.channels.count();
+    let n_ch = spec.channels().count();
     (0..n_ch)
-        .map(|ch| get_chan(ch)[..frames].to_vec())
+        .map(|ch| {
+            // Honour the "missing plane is silence" contract in the caller:
+            // slicing `[..frames]` on a short/empty plane would panic instead.
+            // Every channel comes back exactly `frames` long, zero-padded.
+            let plane = get_chan(ch);
+            let n = plane.len().min(frames);
+            let mut out = Vec::with_capacity(frames);
+            out.extend_from_slice(&plane[..n]);
+            out.resize(frames, 0.0);
+            out
+        })
         .collect()
 }
 
 #[cfg(not(feature = "fdk-aac"))]
 #[inline]
 fn extract_planar_with<'a, S, F, M>(
-    spec: &SignalSpec,
+    spec: &AudioSpec,
     frames: usize,
     get_chan: F,
     map: M,
@@ -986,9 +1010,16 @@ where
     F: Fn(usize) -> &'a [S],
     M: Fn(&S) -> f32,
 {
-    let n_ch = spec.channels.count();
+    let n_ch = spec.channels().count();
     (0..n_ch)
-        .map(|ch| get_chan(ch)[..frames].iter().map(&map).collect())
+        .map(|ch| {
+            // Same silence contract as `extract_planar_f32` — see there.
+            let plane = get_chan(ch);
+            let n = plane.len().min(frames);
+            let mut out: Vec<f32> = plane[..n].iter().map(&map).collect();
+            out.resize(frames, 0.0);
+            out
+        })
         .collect()
 }
 
@@ -1079,6 +1110,96 @@ mod tests {
         assert!(matches!(err, AacDecodeError::UnsupportedChannelConfig(6)));
     }
 
+    /// A real AAC-LC bitstream, decoded and checked for content — deliberately
+    /// NOT gated on a backend, so it covers fdk-aac AND symphonia.
+    ///
+    /// Until this existed, the symphonia half of this module had no test that
+    /// decoded a single frame: the two round-trip tests are `#[cfg(feature =
+    /// "fdk-aac")]` because they need the fdk *encoder*, and the only
+    /// symphonia-specific test is a rejection test. So the pure-Rust fallback
+    /// could have emitted silence, noise, or half a stream and every test would
+    /// still have passed. That gap predated the 0.5.5 -> 0.6.0 bump and was the
+    /// real reason the bump looked unverifiable.
+    ///
+    /// The fixture is 0.5 s of a 1 kHz sine at amplitude 0.5, 48 kHz stereo,
+    /// AAC-LC 128 kbps in ADTS framing. Cross-checked against an independent
+    /// decoder (ffmpeg 8.0.1) which resolves it to RMS 0.3494 over the same
+    /// post-priming window — i.e. the tolerance below is calibrated against a
+    /// second implementation, not just against our own arithmetic.
+    ///
+    /// Beware regenerating it: ffmpeg's `sine` lavfi source defaults to
+    /// amplitude 0.125, not full scale. The first cut of this fixture was
+    /// built with `volume=0.5` on top of that and came out 18 dB down, which
+    /// read as a decoder fault until ffmpeg agreed with us to 4 decimal places.
+    /// The correct chain is `sine=...,volume=4.0` for a 0.5 peak.
+    #[test]
+    fn decodes_real_aac_lc_sine_to_expected_rms() {
+        const FIXTURE: &[u8] = include_bytes!("testdata/sine1k_aac_lc_48k_stereo.adts");
+        const AMP: f64 = 0.5;
+
+        let mut decoder = AacDecoder::from_adts_config(1, 3, 2).expect("decoder");
+        assert_eq!(decoder.sample_rate(), 48_000);
+        assert_eq!(decoder.channels(), 2);
+
+        // Walk the ADTS frames: 13-bit aac_frame_length spans bytes 3..5.
+        let mut left: Vec<f32> = Vec::new();
+        let mut right: Vec<f32> = Vec::new();
+        let mut off = 0usize;
+        let mut frames = 0usize;
+        while off + 7 <= FIXTURE.len() {
+            assert_eq!(FIXTURE[off], 0xFF, "lost ADTS sync at {off}");
+            let len = (((FIXTURE[off + 3] as usize) & 0x03) << 11)
+                | ((FIXTURE[off + 4] as usize) << 3)
+                | ((FIXTURE[off + 5] as usize) >> 5);
+            if len == 0 || off + len > FIXTURE.len() {
+                break;
+            }
+            let raw = strip_adts_header(&FIXTURE[off..off + len]);
+            // The encoder's first frame carries its metadata comment and may
+            // decode to nothing useful; a decode error there is not a failure.
+            if let Ok(planar) = decoder.decode_frame(raw) {
+                assert_eq!(planar.len(), 2, "expected stereo planar output");
+                left.extend_from_slice(&planar[0]);
+                right.extend_from_slice(&planar[1]);
+            }
+            off += len;
+            frames += 1;
+        }
+
+        assert!(frames >= 15, "only walked {frames} ADTS frames");
+        assert!(
+            left.len() > 8_000,
+            "decoded only {} samples — decoder produced no audio",
+            left.len()
+        );
+        assert_eq!(left.len(), right.len(), "channel planes differ in length");
+
+        // Skip encoder + decoder priming, then measure. A silence bug lands at
+        // rms ~0 and a full-scale/format bug at ~0.707; the true value is
+        // 0.5/sqrt(2) = 0.3536. AAC-LC at 128 kbps holds a single tone well
+        // inside +/-20 %.
+        let skip = 2_048.min(left.len() / 2);
+        let body = &left[skip..];
+        let sum_sq: f64 = body.iter().map(|s| (*s as f64).powi(2)).sum();
+        let rms = (sum_sq / body.len() as f64).sqrt();
+        let expected = AMP / std::f64::consts::SQRT_2;
+        assert!(
+            rms >= expected * 0.8 && rms <= expected * 1.2,
+            "decoded 1 kHz sine RMS {rms:.4} outside [{:.4}, {:.4}]",
+            expected * 0.8,
+            expected * 1.2
+        );
+
+        // The fixture is dual-mono, so a channel-ordering or plane-aliasing
+        // fault in the planar extraction shows up as a mismatch here.
+        let r_sum_sq: f64 = right[skip..].iter().map(|s| (*s as f64).powi(2)).sum();
+        let r_rms = (r_sum_sq / right[skip..].len() as f64).sqrt();
+        assert!(
+            (rms - r_rms).abs() < expected * 0.05,
+            "L/R RMS diverge ({rms:.4} vs {r_rms:.4}) on a dual-mono source"
+        );
+    }
+
     #[cfg(feature = "fdk-aac")]
     #[test]
     fn accepts_multichannel_fdk() {
@@ -1143,7 +1264,9 @@ mod tests {
 
     /// Strip the ADTS header from an encoded AAC frame so our decoder —
     /// which uses `open_raw` with an explicit ASC — can consume it.
-    #[cfg(feature = "fdk-aac")]
+    ///
+    /// Not backend-gated: `decodes_real_aac_lc_sine_to_expected_rms` uses it on
+    /// the symphonia build too.
     fn strip_adts_header(adts: &[u8]) -> &[u8] {
         assert!(adts.len() >= 7, "ADTS frame too short: {}", adts.len());
         assert_eq!(adts[0], 0xFF, "missing ADTS sync byte 0");
@@ -1523,6 +1646,10 @@ mod tests {
     /// verbatim from ATSC A/52 § 5.4.1.4 Table 5.18 and a typo there
     /// would silently drop audio frames; lock in the most common
     /// 48 kHz bitrates.
+    ///
+    /// Gated to match `AC3_FRMSIZ_WORDS` itself, which only exists with the
+    /// libavcodec audio layer — the same gate its eight sibling tests carry.
+    #[cfg(feature = "media-codecs")]
     #[test]
     fn ac3_frmsiz_table_known_48k_bitrates() {
         // [bitrate_kbps, frmsiz_words, frame_bytes]

@@ -2790,6 +2790,18 @@ pub fn resolve_for_video_encode_config(
     )
 }
 
+/// Without `media-codecs` there is no probe to resolve against, so this reports
+/// "probe didn't run" and the three callers in `engine::flow` fall through to
+/// the `HwEncoderFamily::classify` branch they already implement for that case.
+/// Present so those call sites need no `cfg` of their own — the resolver is the
+/// thing that is feature-dependent, not the flow logic.
+#[cfg(not(feature = "media-codecs"))]
+pub fn resolve_for_video_encode_config(
+    _cfg: &crate::config::models::VideoEncodeConfig,
+) -> Result<ResolvedVideoEncoder, EncoderResolutionError> {
+    Err(EncoderResolutionError::ProbeUnavailable)
+}
+
 /// Resolve a `video_encode` config into the **full Auto fall-through
 /// chain** of encoder backends to try in order on `avcodec_open2`
 /// failure.

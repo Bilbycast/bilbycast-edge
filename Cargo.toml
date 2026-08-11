@@ -126,19 +126,35 @@ rubato = "5.0.0"
 # ────────────────────────────────────────────────────────────────────────
 aac-audio = { path = "../bilbycast-fdk-aac-rs/aac-audio", optional = true }
 aac-codec = { path = "../bilbycast-fdk-aac-rs/aac-codec", optional = true }
-# HELD at 0.5.5 deliberately — symphonia 0.6.0 is out but reworked the audio
-# API wholesale (`AudioBufferRef` / `Signal` / `SignalSpec` / `DecoderOptions` /
-# `CODEC_TYPE_AAC` all moved or renamed), so it needs a real port of the
-# `#[cfg(not(feature = "fdk-aac"))]` decoder in `engine::audio_decode`. That
-# fallback only exists in the `--no-default-features` build, which does NOT
-# compile at present for an unrelated reason (`engine::ts_video_replace` and
-# `engine::flow` reference the `media-codecs`-gated `video_encode_util` /
-# `resolve_for_video_encode_config` unconditionally). Porting a broadcast
-# audio-decode path that cannot be built — let alone run against the quality
-# gates — would be unverifiable. Fix the feature gating first, then bump.
-# No shipped release artefact is affected: all three publish with default
-# features, so fdk-aac is the active decoder everywhere.
-symphonia = { version = "0.5.5", features = ["aac"], default-features = false }
+# 0.6.0 reworked the audio API wholesale — `AudioBufferRef` -> `GenericAudioBufferRef`,
+# `Signal` -> `Audio`, `SignalSpec` -> `AudioSpec`, `Channels` from a bitflags set to
+# an enum wrapping `Position`, and the codec types split into `codecs::audio::*`
+# (`CodecParameters` -> `AudioCodecParameters`, `DecoderOptions` -> `AudioDecoderOptions`,
+# `CODEC_TYPE_AAC` -> `well_known::CODEC_ID_AAC`). The port lives in the
+# `#[cfg(not(feature = "fdk-aac"))]` half of `engine::audio_decode`.
+#
+# This was previously held on the claim that the fallback "does NOT compile at
+# present" because a bare `--no-default-features` build fails on unrelated
+# `media-codecs` gating. That conflated two different configurations. The
+# symphonia decoder needs `fdk-aac` off, NOT `media-codecs` off, and
+# `--no-default-features --features tls,webrtc,media-codecs,replay` builds and
+# its tests pass. (Note `display` implies `fdk-aac`, so it must be dropped too —
+# leaving it on silently re-enables fdk-aac and hides the symphonia path.)
+# That config is not warning-clean — it carries ~12 pre-existing dead-code
+# warnings — and it is not CI-gated; CI checks default features only.
+#
+# The `media-codecs`-off gating defects that motivated the original hold are
+# fixed here (stub `ResolvedBackendCell` + `ProbeUnavailable`, two `#[cfg]`
+# corrections in `thumbnail.rs`), so `--no-default-features --features
+# tls,webrtc,replay` now compiles where it previously did not. A *bare*
+# `--no-default-features` build still fails, but the remaining ~29 errors are
+# `webrtc` gating in `engine::output_webrtc` plus one E0308 in
+# `manager::client` — no longer a media-codecs problem. Tracked separately.
+#
+# Still true, and the reason this stays a fallback: no shipped release artefact
+# exercises it. All three publish with `display` on, which forces `fdk-aac`, so
+# fdk-aac is the active AAC decoder everywhere in production.
+symphonia = { version = "0.6.0", features = ["aac"], default-features = false }
 
 # ── FFmpeg / libav base codec layer (the `media-codecs` feature) ──────
 # In-process video decode, JPEG thumbnail encode, audio decode/encode
@@ -565,19 +581,30 @@ features = ["tls-rustls"]
 optional = true
 
 [dependencies.str0m]
-# HELD at 0.19.0 deliberately — 0.21.0 is out. This is NOT drift; the bump is
-# a scoped media-path project, not a version-number edit. What it needs:
-#   * re-vendor `is` 0.10.0 under vendor/ with the PRIORITY patch below
-#     (str0m 0.21 wants `is ^0.10`; upstream 0.10.0 STILL hard-rejects
-#     PRIORITY-less Binding Requests, so scenario (b) below is not yet live —
-#     verified against the published 0.10.0 source).
-#   * port five breaking changes: `write_rtp()` now takes an `RtpWrite`
-#     builder, media data moved to `Arc<[u8]>`, `abs-capture-time` writer /
-#     receiver rework, permissive-vp8 depacketizer fix (all 0.20), and
-#     dimpl 0.7.0 (0.21).
-#   * re-run WHIP/WHEP interop against ffmpeg, OBS and a browser, plus
-#     quality gates 3 / 7 / 9 — this is live A/V, not a leaf dependency.
-version = "0.19.0"
+# 0.22.0 (2026-08-11), up from 0.19.0. The previous hold listed five breaking
+# changes; on audit only ONE reaches this crate:
+#   * `MediaData.data` moved `Vec<u8>` -> `Arc<[u8]>` (0.20). Handled in
+#     `engine::webrtc::session` by widening `SessionEvent::MediaData.data`
+#     to match, rather than copying per frame.
+# The other four do not apply: we never call `write_rtp` / `RtpWrite` (only the
+# sample-level `writer(mid).write(..)`, whose signature widened compatibly via
+# `Vec<u8>: Into<Arc<[u8]>>`), never touch abs-capture-time, and negotiate
+# H.264 + Opus only so the permissive-VP8 depacketizer fix is irrelevant. dimpl
+# 0.7 is transitive — we use the `openssl` DTLS backend, not dimpl.
+#
+# `is` moves 0.9.0 -> 0.11.0 with it (str0m 0.22 requires `is ^0.11.0`); the
+# vendored PRIORITY patch below has been re-applied. Upstream 0.11.0 still
+# hard-rejects PRIORITY-less Binding Requests, so the vendor tree stays.
+#
+# NOT yet re-verified on live A/V: WHIP/WHEP interop against ffmpeg, OBS and a
+# browser, plus quality gates 3 / 7 / 9. Do that before shipping a release.
+#
+# Opportunity left on the table deliberately: 0.22 (#1016) stopped rejecting an
+# offered H.264 level above the local config's, which is exactly what the four
+# extra level-5.1 PT registrations in `engine::webrtc::session` work around.
+# Removing them would change the answered SDP m-line PT set — interop-visible,
+# so it wants its own change with its own interop run.
+version = "0.22.0"
 optional = true
 # Use OpenSSL DTLS backend instead of the default aws-lc-rs + dimpl. The
 # pure-Rust dimpl DTLS implementation stalls when the active side (WHEP
@@ -642,10 +669,10 @@ alsa = { version = "0.12", optional = true }
 zbus = { version = "5", default-features = false, features = ["tokio"] }
 
 # ---------------------------------------------------------------------------
-# BILBYCAST PATCH: vendored `is` 0.9.0 with the strict-PRIORITY check on ICE
+# BILBYCAST PATCH: vendored `is` 0.11.0 with the strict-PRIORITY check on ICE
 # Binding Requests removed. Originally vendored against `is` 0.8.0 (2026-04-09);
-# re-vendored against 0.9.0 (2026-05-12) when str0m bumped to 0.19. Upstream
-# still hard-rejects PRIORITY-less Binding Requests in 0.9.0.
+# re-vendored against 0.9.0 (2026-05-12, str0m 0.19) and 0.11.0 (2026-08-11,
+# str0m 0.22). Upstream still hard-rejects PRIORITY-less Binding Requests in 0.11.0.
 #
 # Why: ffmpeg's WHIP muxer (and a few other production WHIP publishers)
 # sends ICE connectivity-check Binding Requests without the PRIORITY

@@ -210,6 +210,27 @@ pub mod ingress_dejitter;
 #[cfg(feature = "media-codecs")]
 pub mod video_encode_util;
 
+/// Stand-in for the real module when `media-codecs` is off.
+///
+/// `ts_video_replace::VideoEncodeStats` holds an
+/// `Arc<ResolvedBackendCell>` unconditionally and `stats::collector` reads
+/// `.label()` off it, but the real cell stores a `video_codec::VideoEncoderCodec`
+/// and so cannot compile without the codec layer. Only `label()` is reachable
+/// from ungated code — `store()` is called solely by the encoder pipeline,
+/// which does not exist in this configuration — so the stub answers "no encoder
+/// has opened", which is permanently true here.
+#[cfg(not(feature = "media-codecs"))]
+pub mod video_encode_util {
+    #[derive(Default, Debug)]
+    pub struct ResolvedBackendCell;
+
+    impl ResolvedBackendCell {
+        pub fn label(&self) -> Option<&'static str> {
+            None
+        }
+    }
+}
+
 pub mod input_post_process;
 /// Ingress-side audio + video transcoding composer for TS-carrying inputs.
 /// Wraps [`ts_audio_replace::TsAudioReplacer`] and [`ts_video_replace::TsVideoReplacer`]

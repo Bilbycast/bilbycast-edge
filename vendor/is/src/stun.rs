@@ -185,7 +185,8 @@ impl<'a> StunMessage<'a> {
             if attrs.split_username().is_none() {
                 return Err(StunError::Parse("STUN packet missing username".into()));
             }
-            // BILBYCAST PATCH (2026-04-09, re-applied for is 0.9.0 on 2026-05-12):
+            // BILBYCAST PATCH (2026-04-09; re-applied for is 0.9.0 on 2026-05-12,
+            // for is 0.11.0 on 2026-08-11 alongside the str0m 0.19 -> 0.22 bump):
             // upstream `is` hard-rejects every ICE Binding Request that lacks the
             // PRIORITY attribute. RFC 5245 §7.1.2.1 makes PRIORITY mandatory on
             // connectivity-check requests, but several production WHIP publishers —
@@ -197,7 +198,12 @@ impl<'a> StunMessage<'a> {
             // missing priority gracefully. Track upstream fix at
             // <bilbycast-edge/CLAUDE.md> "WHEN UPGRADING str0m". When the upstream
             // `is` crate ships a permissive parser this entire vendor/ tree can be
-            // deleted along with the [patch.crates-io] entry in Cargo.toml.
+            // deleted along with the [patch.crates-io] entry in Cargo.toml. Checked
+            // again at 0.11.0: the rejection is still there, byte-identical.
+            //
+            // Note the "missing priority" in `src/parse.rs` is NOT a second copy of
+            // this check — that one is the mandatory priority field of the SDP
+            // `a=candidate:` line grammar, unrelated to the STUN attribute. Leave it.
             //
             // Original (upstream) check, kept here for diff visibility:
             //
@@ -959,6 +965,12 @@ impl<'a> Attributes<'a> {
                         attributes.message_integrity = Some(&buf[4..24]);
                     }
                     Self::ERROR_CODE => {
+                        if len < 4 {
+                            return Err(StunError::Parse(
+                                "Error code length must be at least 4".into(),
+                            ));
+                        }
+
                         if buf[4] != 0 || buf[5] != 0 || buf[6] & 0b1111_1000 != 0 {
                             return Err(StunError::Parse("Expected 0 at top of error code".into()));
                         }
@@ -1047,6 +1059,9 @@ impl<'a> Attributes<'a> {
                         warn!("STUN got AlternateServer");
                     }
                     Self::FINGERPRINT => {
+                        if len != 4 {
+                            return Err(StunError::Parse("Fingerprint length must be 4".into()));
+                        }
                         let bytes = [buf[4], buf[5], buf[6], buf[7]];
                         attributes.fingerprint = Some(u32::from_be_bytes(bytes));
                     }

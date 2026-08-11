@@ -14,17 +14,6 @@ ignore = [
     # off rustls-pemfile onto rustls_pki_types::pem::PemObject, then drop
     # this ignore.
     "RUSTSEC-2025-0134",
-    # rsa 0.9.x — Marvin Attack timing sidechannel on private-key
-    # operations. Pulled in transitively by sigstore 0.12 (used by the
-    # remote-upgrade pipeline's cosign verify-blob path). The edge only
-    # *verifies* signatures, never decrypts or signs with RSA — the
-    # exploitable scenario is "attacker observes timing of repeated RSA
-    # decryptions over the network", which does not apply to one-shot
-    # signature verification with no private key on this side. The
-    # RustCrypto team is migrating to a constant-time implementation;
-    # drop this ignore once a patched rsa version ships.
-    # https://github.com/RustCrypto/RSA/issues/19
-    "RUSTSEC-2023-0071",
     # paste 1.0.15 — unmaintained (author archived the repo). A compile-time
     # proc-macro helper with no runtime surface, pulled in transitively by the
     # netlink stack (netlink-packet-core → netlink-packet-route / rtnetlink)
@@ -32,10 +21,6 @@ ignore = [
     # version exists, and the netlink crates have not migrated off it.
     # TODO: drop when the netlink stack moves to `pastey`/`with_builtin_macros`.
     "RUSTSEC-2024-0436",
-    # proc-macro-error2 2.0.1 — unmaintained. Another compile-time-only
-    # proc-macro helper, transitive via nvml-wrapper / zbus / mdns-sd. Not a
-    # vulnerability; no patched version. TODO: drop when those crates migrate.
-    "RUSTSEC-2026-0173",
 ]
 
 [licenses]
