@@ -4557,7 +4557,7 @@ impl DisplayPresentLatch {
 const RKMPP_PRESENT_LEAD_MS: u64 = 200;
 
 /// Presentation lead time in milliseconds for the **wall-clock** pacing
-/// path, overridable via `BILBYCAST_DISPLAY_LEAD_MS`.
+/// path, set per output by `DisplayOutputConfig::present_lead_ms`.
 ///
 /// The wall-clock pacer targets `anchor_at + pts_delta`, which is already an
 /// absolute anchored schedule — per-frame arrival jitter cannot move it. What
@@ -4614,6 +4614,13 @@ const RKMPP_PRESENT_LEAD_MS: u64 = 200;
 /// Corollary worth stating plainly: an **audio-enabled** display output
 /// still has the fault and this does not fix it. The audio branch paces
 /// against the measured ALSA playout position, which has no anchor to seed.
+///
+/// There is deliberately **no env-var override**. One existed while this
+/// was being measured, and it is strictly worse than the config field on
+/// every axis: node-wide where the fault is per-decoder, needing a process
+/// restart where a config edit restarts only the output, unvalidated, and
+/// silently shadowed by any output that sets the field. The per-decoder
+/// default already covers the case it was reaching for.
 fn display_lead_ms(
     counters: &DisplayStatsCounters,
     configured: Option<u32>,
@@ -4624,8 +4631,6 @@ fn display_lead_ms(
     // smoothness can say so.
     let requested = if let Some(v) = configured {
         v as u64
-    } else if let Some(v) = display_lead_env_ms() {
-        v
     } else {
         // Keyed off the decoder that is actually running, not off host or
         // config guesswork. Only the backend measured to hand frames over
@@ -4647,36 +4652,6 @@ fn display_lead_ms(
     // ceiling further inside the queue rather than outside it.
     let ceiling = (MPSC_VIDEO_DEPTH as u64 / 3) * frame_period_ms.max(1.0) as u64;
     requested.min(ceiling)
-}
-
-/// Cached parse of `BILBYCAST_DISPLAY_LEAD_MS`. Cached because the seed
-/// expression is evaluated on every frame of the muted path (`get_or_insert`
-/// is eager) — an uncached `env::var` would allocate a `String` per frame on
-/// the display hot path.
-fn display_lead_env_ms() -> Option<u64> {
-    static CACHED: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
-    *CACHED.get_or_init(|| {
-        std::env::var("BILBYCAST_DISPLAY_LEAD_MS")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-    })
-}
-
-/// Anchor-servo step in microseconds, overridable via
-/// `BILBYCAST_DISPLAY_SERVO_US` (0 disables the servo entirely).
-///
-/// Exists to test the #104 phase-slide hypothesis on hardware without a
-/// rebuild: the servo slides the presentation phase relative to vblank, and
-/// on a 25 fps source driving a 50 Hz panel a phase crossing costs a visible
-/// hitch. Default is the previous hard-coded 250 us.
-fn display_servo_step_us() -> u64 {
-    static CACHED: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    *CACHED.get_or_init(|| {
-        std::env::var("BILBYCAST_DISPLAY_SERVO_US")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(250)
-    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -5302,7 +5277,7 @@ fn display_loop(
             let deadband_ms = frame_period_ms as i64;
             if drift_ms.unsigned_abs() as i64 > deadband_ms {
                 let excess_ms = (drift_ms.unsigned_abs() as i64 - deadband_ms) as u64;
-                let step = std::time::Duration::from_micros(display_servo_step_us())
+                let step = std::time::Duration::from_micros(250)
                     .min(std::time::Duration::from_millis(excess_ms));
                 if drift_ms > 0 {
                     // Frame runs ahead of the wall timeline — pull the
@@ -6370,13 +6345,16 @@ fn emit_event(
 mod tests {
     use super::*;
 
-    /// MPEG-2 stays pinned to software decode on VAAPI (hardware decode
-    /// works but presents ~7 fps worse — see the predicate's doc), QSV
-    /// (untested, same silicon) and RKMPP (the vendored FFmpeg fork has
-    /// no MPEG-2 decoder to open). Only NVDEC is carved out, and only
-    /// because it was measured end-to-end on bilby-z440 once
-    /// `mpeg2_cuvid` was compiled into the vendored FFmpeg — its
-    /// original "failure" was that build gap, not the silicon.
+    // MPEG-2 stays pinned to software decode on VAAPI (hardware decode
+    // works but presents ~7 fps worse — see the predicate's doc), QSV
+    // (untested, same silicon) and RKMPP (the vendored FFmpeg fork has
+    // no MPEG-2 decoder to open). Only NVDEC is carved out, and only
+    // because it was measured end-to-end on bilby-z440 once
+    // `mpeg2_cuvid` was compiled into the vendored FFmpeg — its
+    // original "failure" was that build gap, not the silicon.
+    //
+    // (A `///` block, but it documented no item — the test it belonged to
+    // is gone. Left as prose because the reasoning is still worth having.)
 
     // ── Presentation lead resolution (issue #104) ─────────────────────
     //
