@@ -849,22 +849,7 @@ async fn run_assembler(
                         if !new_catalogs.is_empty() {
                             catalogs = new_catalogs;
                         }
-                        apply_plan_replacement(
-                            &mut plan,
-                            new_plan,
-                            &bus,
-                            &fanin_tx,
-                            &cancel,
-                            &mut flat,
-                            &mut slot_cancels,
-                            &mut slot_tasks,
-                            &mut pcr_out_pid_by_program,
-                            &mut pat_version,
-                            &mut pmt_versions,
-                            &mut active_leg_input,
-                            &event_sender,
-                            &flow_id,
-                        );
+                        apply_plan_replacement(&mut plan, new_plan, PlanSwapState { bus: &bus, fanin_tx: &fanin_tx, cancel: &cancel, flat: &mut flat, slot_cancels: &mut slot_cancels, slot_tasks: &mut slot_tasks, pcr_out_pid_by_program: &mut pcr_out_pid_by_program, pat_version: &mut pat_version, pmt_versions: &mut pmt_versions, active_leg_input: &mut active_leg_input, event_sender: &event_sender, flow_id: &flow_id });
                         // Drop vitals for removed slots; fresh grace
                         // anchor for hot-swapped-in ones.
                         sync_slot_vitals(&plan, &mut slot_vitals, Instant::now());
@@ -2044,22 +2029,44 @@ fn install_plan(
 ///
 /// Monotonic mod 32 — same discipline as `TsContinuityFixer` so A→B→A
 /// never lands on a receiver-locked phantom version.
+/// The assembler's live, mutable slot bookkeeping, handed to a plan swap as
+/// one unit because every field has to move in lock-step with the others.
+struct PlanSwapState<'a> {
+    bus: &'a Arc<NodeEsBus>,
+    fanin_tx: &'a mpsc::Sender<(usize, EsPacket)>,
+    cancel: &'a CancellationToken,
+    flat: &'a mut Vec<FlatSlot>,
+    slot_cancels: &'a mut Vec<CancellationToken>,
+    slot_tasks: &'a mut Vec<JoinHandle<()>>,
+    pcr_out_pid_by_program: &'a mut Vec<u16>,
+    pat_version: &'a mut u8,
+    pmt_versions: &'a mut Vec<u8>,
+    active_leg_input: &'a mut std::collections::HashMap<(usize, u16), String>,
+    event_sender: &'a Option<crate::manager::events::EventSender>,
+    flow_id: &'a str,
+}
+
 fn apply_plan_replacement(
     plan: &mut AssemblyPlan,
     new_plan: AssemblyPlan,
-    bus: &Arc<NodeEsBus>,
-    fanin_tx: &mpsc::Sender<(usize, EsPacket)>,
-    cancel: &CancellationToken,
-    flat: &mut Vec<FlatSlot>,
-    slot_cancels: &mut Vec<CancellationToken>,
-    slot_tasks: &mut Vec<JoinHandle<()>>,
-    pcr_out_pid_by_program: &mut Vec<u16>,
-    pat_version: &mut u8,
-    pmt_versions: &mut Vec<u8>,
-    active_leg_input: &mut std::collections::HashMap<(usize, u16), String>,
-    event_sender: &Option<crate::manager::events::EventSender>,
-    flow_id: &str,
+    params: PlanSwapState<'_>,
 ) {
+    // Destructured back into the original bindings so the body is unchanged.
+    let PlanSwapState {
+        bus,
+        fanin_tx,
+        cancel,
+        flat,
+        slot_cancels,
+        slot_tasks,
+        pcr_out_pid_by_program,
+        pat_version,
+        pmt_versions,
+        active_leg_input,
+        event_sender,
+        flow_id,
+    } = params;
+
     // Program set: (program_number, pmt_pid) pairs, order-preserving.
     let old_pat: Vec<(u16, u16)> = plan
         .programs

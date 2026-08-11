@@ -1061,21 +1061,7 @@ async fn srt_input_redundant_loop(
                                 format = detect_format(&data);
                                 log_detected_format_redundant(format, events, flow_id);
                             }
-                            process_redundant_packet(
-                                data,
-                                srctime_us,
-                                ActiveLeg::Leg1,
-                                format,
-                                &mut raw_ts_seq_leg1,
-                                &mut raw_ts_timestamp,
-                                &mut merger,
-                                &mut failover,
-                                &mut prev_active_leg,
-                                &stats,
-                                &publisher,
-                                transcoder,
-                                post,
-                            );
+                            process_redundant_packet(data, srctime_us, ActiveLeg::Leg1, format, RedundantPacketState { raw_ts_seq: &mut raw_ts_seq_leg1, raw_ts_timestamp: &mut raw_ts_timestamp, merger: &mut merger, failover: &mut failover, prev_active_leg: &mut prev_active_leg, stats: &stats, publisher: &publisher, transcoder, post });
                         }
                         Err(_) => {
                             tracing::warn!("SRT input leg1 connection lost");
@@ -1098,21 +1084,7 @@ async fn srt_input_redundant_loop(
                                 format = detect_format(&data);
                                 log_detected_format_redundant(format, events, flow_id);
                             }
-                            process_redundant_packet(
-                                data,
-                                srctime_us,
-                                ActiveLeg::Leg2,
-                                format,
-                                &mut raw_ts_seq_leg2,
-                                &mut raw_ts_timestamp,
-                                &mut merger,
-                                &mut failover,
-                                &mut prev_active_leg,
-                                &stats,
-                                &publisher,
-                                transcoder,
-                                post,
-                            );
+                            process_redundant_packet(data, srctime_us, ActiveLeg::Leg2, format, RedundantPacketState { raw_ts_seq: &mut raw_ts_seq_leg2, raw_ts_timestamp: &mut raw_ts_timestamp, merger: &mut merger, failover: &mut failover, prev_active_leg: &mut prev_active_leg, stats: &stats, publisher: &publisher, transcoder, post });
                         }
                         Err(_) => {
                             tracing::warn!("SRT input leg2 connection lost");
@@ -1276,21 +1248,40 @@ impl RawTsFailover {
 /// - **Raw TS / Unknown**: routes through [`RawTsFailover`] for
 ///   active-leg protection-switching. Real dedup is impossible without a
 ///   shared seq across legs.
+/// The dual-leg receive path's mutable state: sequence/timestamp counters,
+/// the hitless merger and failover, and the downstream publish chain.
+struct RedundantPacketState<'a> {
+    raw_ts_seq: &'a mut u16,
+    raw_ts_timestamp: &'a mut u32,
+    merger: &'a mut HitlessMerger,
+    failover: &'a mut RawTsFailover,
+    prev_active_leg: &'a mut ActiveLeg,
+    stats: &'a Arc<FlowStatsAccumulator>,
+    publisher: &'a crate::engine::ingress_publisher::IngressPublisher,
+    transcoder: &'a mut Option<InputTranscoder>,
+    post: &'a mut Option<InputPostProcess>,
+}
+
 fn process_redundant_packet(
     data: Bytes,
     srctime_us: Option<i64>,
     leg: ActiveLeg,
     format: SrtPayloadFormat,
-    raw_ts_seq: &mut u16,
-    raw_ts_timestamp: &mut u32,
-    merger: &mut HitlessMerger,
-    failover: &mut RawTsFailover,
-    prev_active_leg: &mut ActiveLeg,
-    stats: &Arc<FlowStatsAccumulator>,
-    publisher: &crate::engine::ingress_publisher::IngressPublisher,
-    transcoder: &mut Option<InputTranscoder>,
-    post: &mut Option<InputPostProcess>,
+    params: RedundantPacketState<'_>,
 ) {
+    // Destructured back into the original bindings so the body is unchanged.
+    let RedundantPacketState {
+        raw_ts_seq,
+        raw_ts_timestamp,
+        merger,
+        failover,
+        prev_active_leg,
+        stats,
+        publisher,
+        transcoder,
+        post,
+    } = params;
+
     let (seq, ts, is_raw, accepted_leg) = match format {
         SrtPayloadFormat::RtpTs => {
             if !is_likely_rtp(&data) {

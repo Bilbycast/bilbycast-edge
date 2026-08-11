@@ -432,19 +432,36 @@ fn apply_srt_output_interface_bindings(config: &mut SrtOutputConfig) -> anyhow::
 /// Spawn a task that subscribes to the broadcast channel and sends
 /// RTP packets over an SRT connection. If redundancy is configured,
 /// packets are duplicated to both SRT legs via SrtDuplicator.
+/// Per-flow context an SRT output needs beyond its own config: identity,
+/// event sink, and the negotiated audio/clock state shared with the flow.
+pub struct SrtOutputCtx {
+    pub event_sender: EventSender,
+    pub flow_id: String,
+    pub input_format: Option<InputFormat>,
+    pub compressed_audio_input: bool,
+    pub frame_rate_rx: Option<tokio::sync::watch::Receiver<Option<f64>>>,
+    pub av_sync_pacer: Option<Arc<crate::engine::av_sync_mux::AvSyncPacer>>,
+    pub active_input_rx: tokio::sync::watch::Receiver<String>,
+}
+
 pub fn spawn_srt_output(
     config: SrtOutputConfig,
     broadcast_tx: &broadcast::Sender<RtpPacket>,
     output_stats: Arc<OutputStatsAccumulator>,
     cancel: CancellationToken,
-    event_sender: EventSender,
-    flow_id: String,
-    input_format: Option<InputFormat>,
-    compressed_audio_input: bool,
-    frame_rate_rx: Option<tokio::sync::watch::Receiver<Option<f64>>>,
-    av_sync_pacer: Option<Arc<crate::engine::av_sync_mux::AvSyncPacer>>,
-    active_input_rx: tokio::sync::watch::Receiver<String>,
+    params: SrtOutputCtx,
 ) -> JoinHandle<()> {
+    // Destructured back into the original bindings so the body is unchanged.
+    let SrtOutputCtx {
+        event_sender,
+        flow_id,
+        input_format,
+        compressed_audio_input,
+        frame_rate_rx,
+        av_sync_pacer,
+        active_input_rx,
+    } = params;
+
     let broadcast_tx = broadcast_tx.clone();
     // Apply interface_binding (loose only on SRT in Phase 1) for the
     // primary leg, the 2022-7 redundancy leg, and every bonding endpoint.

@@ -195,58 +195,67 @@ impl rustls::client::danger::ServerCertVerifier for PinnedCertVerifier {
 }
 
 /// Start the manager client background task.
+/// Everything the manager client needs from the rest of the process, bundled
+/// because it is one thing — "the node this client speaks for" — and because
+/// all three of `start_manager_client`, `manager_client_loop` and
+/// `try_connect` need the identical set. Passing it as 17 positional
+/// parameters through three call layers was how they drifted apart.
+pub struct ManagerClientDeps {
+    pub flow_manager: Arc<FlowManager>,
+    pub tunnel_manager: Arc<TunnelManager>,
+    pub ws_stats_tx: broadcast::Sender<String>,
+    pub app_config: Arc<RwLock<AppConfig>>,
+    pub config_path: PathBuf,
+    pub secrets_path: PathBuf,
+    pub api_addr: String,
+    pub monitor_addr: Option<String>,
+    pub webrtc_sessions: WebrtcRegistry,
+    pub resource_state: Arc<SystemResourceState>,
+    pub static_caps: Arc<crate::engine::hardware_probe::StaticCapabilities>,
+    pub live_gpu: Arc<crate::engine::hardware_probe::LiveUtilizationState>,
+    pub standby_listeners: Option<Arc<crate::engine::standby_listeners::StandbyListenerManager>>,
+    pub cellular_cache: Arc<crate::util::cellular::CellularCache>,
+    pub starlink_cache: Arc<crate::util::starlink::StarlinkCache>,
+    pub start_time: Instant,
+    pub manager_link: Arc<crate::manager::link_state::ManagerLinkState>,
+}
+
 pub fn start_manager_client(
     config: ManagerConfig,
-    flow_manager: Arc<FlowManager>,
-    tunnel_manager: Arc<TunnelManager>,
-    ws_stats_rx: broadcast::Sender<String>,
-    app_config: Arc<RwLock<AppConfig>>,
-    config_path: PathBuf,
-    secrets_path: PathBuf,
-    api_addr: String,
-    monitor_addr: Option<String>,
-    webrtc_sessions: WebrtcRegistry,
+    deps: ManagerClientDeps,
     event_rx: mpsc::Receiver<Event>,
-    resource_state: Arc<SystemResourceState>,
-    static_caps: Arc<crate::engine::hardware_probe::StaticCapabilities>,
-    live_gpu: Arc<crate::engine::hardware_probe::LiveUtilizationState>,
-    standby_listeners: Option<Arc<crate::engine::standby_listeners::StandbyListenerManager>>,
-    cellular_cache: Arc<crate::util::cellular::CellularCache>,
-    starlink_cache: Arc<crate::util::starlink::StarlinkCache>,
-    start_time: Instant,
-    manager_link: Arc<crate::manager::link_state::ManagerLinkState>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        manager_client_loop(
-            config, flow_manager, tunnel_manager, ws_stats_rx, app_config, config_path,
-            secrets_path, api_addr, monitor_addr, webrtc_sessions, event_rx, resource_state,
-            static_caps, live_gpu, standby_listeners, cellular_cache, starlink_cache, start_time,
-            manager_link,
-        ).await;
+        manager_client_loop(config, deps, event_rx).await;
     })
 }
 
 async fn manager_client_loop(
     mut config: ManagerConfig,
-    flow_manager: Arc<FlowManager>,
-    tunnel_manager: Arc<TunnelManager>,
-    ws_stats_tx: broadcast::Sender<String>,
-    app_config: Arc<RwLock<AppConfig>>,
-    config_path: PathBuf,
-    secrets_path: PathBuf,
-    api_addr: String,
-    monitor_addr: Option<String>,
-    webrtc_sessions: WebrtcRegistry,
+    deps: ManagerClientDeps,
     mut event_rx: mpsc::Receiver<Event>,
-    resource_state: Arc<SystemResourceState>,
-    static_caps: Arc<crate::engine::hardware_probe::StaticCapabilities>,
-    live_gpu: Arc<crate::engine::hardware_probe::LiveUtilizationState>,
-    standby_listeners: Option<Arc<crate::engine::standby_listeners::StandbyListenerManager>>,
-    cellular_cache: Arc<crate::util::cellular::CellularCache>,
-    starlink_cache: Arc<crate::util::starlink::StarlinkCache>,
-    start_time: Instant,
-    manager_link: Arc<crate::manager::link_state::ManagerLinkState>,
 ) {
+    // Destructured back into the original bindings so the body below is
+    // untouched by this refactor.
+    let ManagerClientDeps {
+        flow_manager,
+        tunnel_manager,
+        ws_stats_tx,
+        app_config,
+        config_path,
+        secrets_path,
+        api_addr,
+        monitor_addr,
+        webrtc_sessions,
+        resource_state,
+        static_caps,
+        live_gpu,
+        standby_listeners,
+        cellular_cache,
+        starlink_cache,
+        start_time,
+        manager_link,
+    } = deps;
     // If we already have a node_id from config, set it on the tunnel manager
     // so relay tunnels can identify this edge before the first manager connection.
     if let Some(ref node_id) = config.node_id {
@@ -273,28 +282,27 @@ async fn manager_client_loop(
             config.urls.len(),
         );
 
-        match try_connect(
-            &current_url,
-            &config,
-            &flow_manager,
-            &tunnel_manager,
-            &ws_stats_tx,
-            &app_config,
-            &config_path,
-            &secrets_path,
-            &api_addr,
-            monitor_addr.as_deref(),
-            &webrtc_sessions,
-            &mut event_rx,
-            &resource_state,
-            &static_caps,
-            &live_gpu,
-            &standby_listeners,
-            &cellular_cache,
-            &starlink_cache,
+        // Re-bundled per attempt; every field is an Arc/clone-cheap handle.
+        let attempt_deps = ManagerClientDeps {
+            flow_manager: flow_manager.clone(),
+            tunnel_manager: tunnel_manager.clone(),
+            ws_stats_tx: ws_stats_tx.clone(),
+            app_config: app_config.clone(),
+            config_path: config_path.clone(),
+            secrets_path: secrets_path.clone(),
+            api_addr: api_addr.clone(),
+            monitor_addr: monitor_addr.clone(),
+            webrtc_sessions: webrtc_sessions.clone(),
+            resource_state: resource_state.clone(),
+            static_caps: static_caps.clone(),
+            live_gpu: live_gpu.clone(),
+            standby_listeners: standby_listeners.clone(),
+            cellular_cache: cellular_cache.clone(),
+            starlink_cache: starlink_cache.clone(),
             start_time,
-            &manager_link,
-        )
+            manager_link: manager_link.clone(),
+        };
+        match try_connect(&current_url, &config, &attempt_deps, &mut event_rx)
         .await
         {
             Ok(ConnectResult::Closed) => {
@@ -362,29 +370,32 @@ enum ConnectResult {
 async fn try_connect(
     current_url: &str,
     config: &ManagerConfig,
-    flow_manager: &Arc<FlowManager>,
-    tunnel_manager: &Arc<TunnelManager>,
-    ws_stats_tx: &broadcast::Sender<String>,
-    app_config: &Arc<RwLock<AppConfig>>,
-    // Not `&Path`: both are cloned into spawned tasks that outlive this
-    // frame, so the owned type is what the body actually needs.
-    #[allow(clippy::ptr_arg)]
-    config_path: &PathBuf,
-    #[allow(clippy::ptr_arg)]
-    secrets_path: &PathBuf,
-    api_addr: &str,
-    monitor_addr: Option<&str>,
-    webrtc_sessions: &WebrtcRegistry,
+    deps: &ManagerClientDeps,
     event_rx: &mut mpsc::Receiver<Event>,
-    resource_state: &Arc<SystemResourceState>,
-    static_caps: &Arc<crate::engine::hardware_probe::StaticCapabilities>,
-    live_gpu: &Arc<crate::engine::hardware_probe::LiveUtilizationState>,
-    standby_listeners: &Option<Arc<crate::engine::standby_listeners::StandbyListenerManager>>,
-    cellular_cache: &Arc<crate::util::cellular::CellularCache>,
-    starlink_cache: &Arc<crate::util::starlink::StarlinkCache>,
-    start_time: Instant,
-    manager_link: &Arc<crate::manager::link_state::ManagerLinkState>,
 ) -> Result<ConnectResult, String> {
+    // Same destructure-back trick: the body keeps its original bindings.
+    let ManagerClientDeps {
+        flow_manager,
+        tunnel_manager,
+        ws_stats_tx,
+        app_config,
+        config_path,
+        secrets_path,
+        api_addr,
+        monitor_addr,
+        webrtc_sessions,
+        resource_state,
+        static_caps,
+        live_gpu,
+        standby_listeners,
+        cellular_cache,
+        starlink_cache,
+        start_time,
+        manager_link,
+    } = deps;
+    let api_addr = api_addr.as_str();
+    let monitor_addr = monitor_addr.as_deref();
+    let start_time = *start_time;
     // Enforce TLS — only wss:// connections are allowed
     if !current_url.starts_with("wss://") {
         return Err(

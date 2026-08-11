@@ -509,6 +509,42 @@ pub struct HotAddedInputInfo {
     pub whip_info: Option<WhipSessionInfo>,
 }
 
+/// What an output needs from its flow beyond its own config: the shared sinks,
+/// the negotiated audio/clock state, and the per-flow handles that only some
+/// output kinds consume. Bundled because every one of them is "the flow this
+/// output belongs to", and threading fifteen positional parameters through two
+/// call sites is how they get passed in the wrong order.
+struct OutputFlowCtx<'a> {
+    input_audio_format: Option<crate::engine::audio_transcode::InputFormat>,
+    compressed_audio_input: bool,
+    /// True when the flow's input set contains a `bonded` input.
+    /// Drives the auto-resolution of an unset `egress_pacing` on
+    /// UDP/RTP-family outputs (auto → `pcr` on bonded flows: the
+    /// reassembly buffer delivers in hold-time bursts, so the wire
+    /// emitter must re-pace against PCR instead of forwarding the
+    /// burst cadence). See `EgressPacingMode::resolve_auto`.
+    flow_has_bonded_input: bool,
+    #[cfg(feature = "webrtc")]
+    whep_session_rx: Option<tokio::sync::mpsc::Receiver<crate::api::webrtc::registry::NewSessionMsg>>,
+    frame_rate_rx: Option<tokio::sync::watch::Receiver<Option<f64>>>,
+    #[cfg(all(feature = "display", target_os = "linux"))]
+    display_claim_registry: &'a Arc<crate::display::claim_registry::DisplayClaimRegistry>,
+    /// Per-flow A/V sync pacer. Threaded into UDP/RTP/SRT/RIST outputs that
+    /// build a TsVideoReplacer so output PCR is generated from the master
+    /// clock instead of pts × 300 − preroll. `None` keeps the legacy
+    /// PTS-derived behaviour.
+    av_sync_pacer: Option<Arc<crate::engine::av_sync_mux::AvSyncPacer>>,
+    /// Subscriber to the flow's `active_input_tx` watch channel. Output spawn
+    /// functions that build TsVideoReplacer / TsAudioReplacer use this to flip
+    /// the replacers' external reset flag on every active-input change,
+    /// preventing the permanently-stuck-decoder symptom on switcher input
+    /// swaps between same-codec / same-PID inputs.
+    active_input_rx: watch::Receiver<String>,
+    /// Flow master clock — handed to the display output so a
+    /// `sync_mode = "genlock"` panel can lock its audio to it.
+    master_clock: &'a crate::engine::master_clock::MasterClockHandle,
+}
+
 impl FlowRuntime {
     /// Create and start a new flow from the provided configuration.
     ///
@@ -1299,17 +1335,19 @@ impl FlowRuntime {
                 &cancel_token,
                 &event_sender,
                 &config.config.id,
-                input_audio_format,
-                compressed_audio_input,
-                flow_has_bonded_input,
-                #[cfg(feature = "webrtc")]
-                whep_rx,
-                frame_rate_rx.clone(),
-                #[cfg(all(feature = "display", target_os = "linux"))]
-                &display_claim_registry,
-                av_sync_pacer.clone(),
-                active_input_tx.subscribe(),
-                &master_clock,
+                OutputFlowCtx {
+                    input_audio_format,
+                    compressed_audio_input,
+                    flow_has_bonded_input,
+                    #[cfg(feature = "webrtc")]
+                    whep_session_rx: whep_rx,
+                    frame_rate_rx: frame_rate_rx.clone(),
+                    #[cfg(all(feature = "display", target_os = "linux"))]
+                    display_claim_registry: &display_claim_registry,
+                    av_sync_pacer: av_sync_pacer.clone(),
+                    active_input_rx: active_input_tx.subscribe(),
+                    master_clock: &master_clock,
+                },
             ).await?;
             output_handles.insert(output_config.id().to_string(), output_rt);
         }
@@ -2120,37 +2158,23 @@ impl FlowRuntime {
         parent_cancel: &CancellationToken,
         event_sender: &EventSender,
         flow_id: &str,
-        input_audio_format: Option<crate::engine::audio_transcode::InputFormat>,
-        compressed_audio_input: bool,
-        // True when the flow's input set contains a `bonded` input.
-        // Drives the auto-resolution of an unset `egress_pacing` on
-        // UDP/RTP-family outputs (auto → `pcr` on bonded flows: the
-        // reassembly buffer delivers in hold-time bursts, so the wire
-        // emitter must re-pace against PCR instead of forwarding the
-        // burst cadence). See `EgressPacingMode::resolve_auto`.
-        flow_has_bonded_input: bool,
-        #[cfg(feature = "webrtc")]
-        whep_session_rx: Option<tokio::sync::mpsc::Receiver<crate::api::webrtc::registry::NewSessionMsg>>,
-        frame_rate_rx: Option<tokio::sync::watch::Receiver<Option<f64>>>,
-        #[cfg(all(feature = "display", target_os = "linux"))]
-        display_claim_registry: &Arc<crate::display::claim_registry::DisplayClaimRegistry>,
-        // Per-flow A/V sync pacer. Threaded into UDP/RTP/SRT/RIST
-        // outputs that build a TsVideoReplacer so output PCR is
-        // generated from the master clock instead of pts × 300 − preroll.
-        // `None` keeps the legacy PTS-derived behaviour.
-        av_sync_pacer: Option<Arc<crate::engine::av_sync_mux::AvSyncPacer>>,
-        // Subscriber to the flow's `active_input_tx` watch channel.
-        // Output spawn functions that build TsVideoReplacer /
-        // TsAudioReplacer use this to flip the replacers' external
-        // reset flag on every active-input change, preventing the
-        // permanently-stuck-decoder symptom on switcher input swaps
-        // between same-codec / same-PID inputs (where the replacers'
-        // internal codec/PID-change reset path doesn't fire).
-        active_input_rx: watch::Receiver<String>,
-        // Flow master clock — handed to the display output so a
-        // `sync_mode = "genlock"` panel can lock its audio to it.
-        master_clock: &crate::engine::master_clock::MasterClockHandle,
+        ctx: OutputFlowCtx<'_>,
     ) -> Result<OutputRuntime> {
+        // Destructured back into the original bindings so the body is unchanged.
+        let OutputFlowCtx {
+            input_audio_format,
+            compressed_audio_input,
+            flow_has_bonded_input,
+            #[cfg(feature = "webrtc")]
+            whep_session_rx,
+            frame_rate_rx,
+            #[cfg(all(feature = "display", target_os = "linux"))]
+            display_claim_registry,
+            av_sync_pacer,
+            active_input_rx,
+            master_clock,
+        } = ctx;
+
         let output_cancel = parent_cancel.child_token();
 
         match output_config {
@@ -2238,19 +2262,7 @@ impl FlowRuntime {
                         ));
                 }
 
-                let handle = spawn_srt_output(
-                    srt_config,
-                    broadcast_tx,
-                    output_stats.clone(),
-                    output_cancel.clone(),
-                    event_sender.clone(),
-                    flow_id.to_string(),
-                    input_audio_format,
-                    compressed_audio_input,
-                    frame_rate_rx,
-                    av_sync_pacer.clone(),
-                    active_input_rx.clone(),
-                );
+                let handle = spawn_srt_output(srt_config, broadcast_tx, output_stats.clone(), output_cancel.clone(), crate::engine::output_srt::SrtOutputCtx { event_sender: event_sender.clone(), flow_id: flow_id.to_string(), input_format: input_audio_format, compressed_audio_input, frame_rate_rx, av_sync_pacer: av_sync_pacer.clone(), active_input_rx: active_input_rx.clone() });
 
                 Ok(OutputRuntime {
                     handle,
@@ -2768,17 +2780,19 @@ impl FlowRuntime {
             &self.cancel_token,
             &self.event_sender,
             &self.config.config.id,
-            input_audio_format,
-            compressed_audio_input,
-            flow_has_bonded_input,
-            #[cfg(feature = "webrtc")]
-            None,
-            self.frame_rate_rx.clone(),
-            #[cfg(all(feature = "display", target_os = "linux"))]
-            &self.display_claim_registry,
-            av_sync_pacer,
-            self.active_input_tx.subscribe(),
-            &self.master_clock,
+            OutputFlowCtx {
+                input_audio_format,
+                compressed_audio_input,
+                flow_has_bonded_input,
+                #[cfg(feature = "webrtc")]
+                whep_session_rx: None,
+                frame_rate_rx: self.frame_rate_rx.clone(),
+                #[cfg(all(feature = "display", target_os = "linux"))]
+                display_claim_registry: &self.display_claim_registry,
+                av_sync_pacer,
+                active_input_rx: self.active_input_tx.subscribe(),
+                master_clock: &self.master_clock,
+            },
         ).await?;
 
         // Update output config metadata so stats snapshots reflect the new address/port

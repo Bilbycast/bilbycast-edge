@@ -590,7 +590,7 @@ pub fn rasterise_overlay(
     // halving every BGR lane in place — but here the kernel does the
     // alpha-blend against the primary plane at scanout, so the dim is
     // applied only to the strip area and only against the live video.
-    fill_rect_argb(dst, dst_pitch, dst_w, dst_h, 0, 0, dst_w, dst_h, 0, 0, 0, 0x80);
+    fill_rect_argb(Surface { dst, pitch: dst_pitch, dst_w, dst_h }, Rect { x: 0, y: 0, w: dst_w, h: dst_h }, (0, 0, 0, 0x80));
 
     // No audio PIDs locked yet — leave the buffer at background-only.
     if snapshot.per_pid.is_empty() {
@@ -805,20 +805,28 @@ pub fn rasterise_header_overlay(
 /// legacy XRGB8888 dumb-buffer path ignores the alpha lane — but a
 /// KMS overlay plane uses the lane to alpha-blend against the
 /// primary plane at scanout, so we let the caller pick `a`.
-fn fill_rect_argb(
-    dst: &mut [u8],
+/// A destination surface for the bar rasteriser: the pixel buffer plus the
+/// geometry needed to clip against it.
+struct Surface<'a> {
+    dst: &'a mut [u8],
     pitch: usize,
     dst_w: u32,
     dst_h: u32,
+}
+
+/// An axis-aligned rectangle in surface coordinates.
+#[derive(Clone, Copy)]
+struct Rect {
     x: u32,
     y: u32,
     w: u32,
     h: u32,
-    b: u8,
-    g: u8,
-    r: u8,
-    a: u8,
-) {
+}
+
+fn fill_rect_argb(surf: Surface<'_>, rect: Rect, (b, g, r, a): (u8, u8, u8, u8)) {
+    // Destructured back into the original bindings so the body is unchanged.
+    let Surface { dst, pitch, dst_w, dst_h } = surf;
+    let Rect { x, y, w, h } = rect;
     if x >= dst_w || y >= dst_h {
         return;
     }
@@ -880,7 +888,7 @@ fn draw_channel_bar(
     // Slot frame: dark grey background under the bar — drawn once
     // (full slot) and then overwritten by the colour bands within the
     // RMS fill area.
-    fill_rect(dst, pitch, dst_w, dst_h, x, y, w, h, 0x18, 0x18, 0x18);
+    fill_rect(Surface { dst, pitch, dst_w, dst_h }, Rect { x, y, w, h }, (0x18, 0x18, 0x18));
 
     let rms_frac = dbfs_to_frac(ch.rms_dbfs);
     let peak_hold_frac = if now < ch.peak_hold_until {
@@ -912,30 +920,18 @@ fn draw_channel_bar(
     // Red band: [bar_top, min(bar_bottom, red_split)).
     let red_end = bar_bottom.min(red_split);
     if red_end > bar_top {
-        fill_rect(
-            dst, pitch, dst_w, dst_h,
-            bar_x, bar_top, bar_w, red_end - bar_top,
-            0x30, 0x30, 0xF0,
-        );
+        fill_rect(Surface { dst, pitch, dst_w, dst_h }, Rect { x: bar_x, y: bar_top, w: bar_w, h: red_end - bar_top }, (0x30, 0x30, 0xF0));
     }
     // Yellow band: [max(bar_top, red_split), min(bar_bottom, yel_split)).
     let yellow_start = bar_top.max(red_split);
     let yellow_end = bar_bottom.min(yel_split);
     if yellow_end > yellow_start {
-        fill_rect(
-            dst, pitch, dst_w, dst_h,
-            bar_x, yellow_start, bar_w, yellow_end - yellow_start,
-            0x30, 0xC8, 0xF0,
-        );
+        fill_rect(Surface { dst, pitch, dst_w, dst_h }, Rect { x: bar_x, y: yellow_start, w: bar_w, h: yellow_end - yellow_start }, (0x30, 0xC8, 0xF0));
     }
     // Green band: [max(bar_top, yel_split), bar_bottom).
     let green_start = bar_top.max(yel_split);
     if bar_bottom > green_start {
-        fill_rect(
-            dst, pitch, dst_w, dst_h,
-            bar_x, green_start, bar_w, bar_bottom - green_start,
-            0x30, 0xE0, 0x30,
-        );
+        fill_rect(Surface { dst, pitch, dst_w, dst_h }, Rect { x: bar_x, y: green_start, w: bar_w, h: bar_bottom - green_start }, (0x30, 0xE0, 0x30));
     }
     // Peak-hold tick: 2-px white line at peak_hold_frac of the bar.
     let hold_pixels = ((h as f32) * peak_hold_frac) as u32;
@@ -944,19 +940,7 @@ fn draw_channel_bar(
         let tick_h = 2.min(h);
         let tick_h_clamped = (hold_y + tick_h).min(bar_bottom).saturating_sub(hold_y);
         if tick_h_clamped > 0 {
-            fill_rect(
-                dst,
-                pitch,
-                dst_w,
-                dst_h,
-                bar_x,
-                hold_y,
-                bar_w,
-                tick_h_clamped,
-                0xFF,
-                0xFF,
-                0xFF,
-            );
+            fill_rect(Surface { dst, pitch, dst_w, dst_h }, Rect { x: bar_x, y: hold_y, w: bar_w, h: tick_h_clamped }, (0xFF, 0xFF, 0xFF));
         }
     }
 }
@@ -1008,19 +992,10 @@ fn blend_strip_background(dst: &mut [u8], pitch: usize, dst_w: u32, y: u32, h: u
     }
 }
 
-fn fill_rect(
-    dst: &mut [u8],
-    pitch: usize,
-    dst_w: u32,
-    dst_h: u32,
-    x: u32,
-    y: u32,
-    w: u32,
-    h: u32,
-    b: u8,
-    g: u8,
-    r: u8,
-) {
+fn fill_rect(surf: Surface<'_>, rect: Rect, (b, g, r): (u8, u8, u8)) {
+    // Destructured back into the original bindings so the body is unchanged.
+    let Surface { dst, pitch, dst_w, dst_h } = surf;
+    let Rect { x, y, w, h } = rect;
     if x >= dst_w || y >= dst_h {
         return;
     }
@@ -1142,7 +1117,7 @@ fn draw_text(
                 if (row_bits >> (4 - col)) & 1 == 1 {
                     let px_x = cx + col * scale;
                     let px_y = y + (row_idx as u32) * scale;
-                    fill_rect(dst, pitch, dst_w, dst_h, px_x, px_y, scale, scale, b, g, r);
+                    fill_rect(Surface { dst, pitch, dst_w, dst_h }, Rect { x: px_x, y: px_y, w: scale, h: scale }, (b, g, r));
                 }
             }
         }

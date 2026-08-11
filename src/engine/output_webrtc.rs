@@ -711,22 +711,7 @@ async fn whep_server_loop(
         let viewer_video_encode = config.video_encode.clone();
 
         tokio::spawn(async move {
-            whep_viewer_loop(
-                &output_id,
-                &session_id,
-                session,
-                viewer_rx,
-                viewer_stats,
-                viewer_cancel,
-                video_only,
-                viewer_program,
-                &viewer_events,
-                &viewer_flow_id,
-                viewer_audio_encode,
-                viewer_transcode,
-                viewer_compressed,
-                viewer_video_encode,
-            ).await;
+            whep_viewer_loop(&output_id, &session_id, session, viewer_rx, WhepViewerCfg { stats: viewer_stats, cancel: viewer_cancel, video_only, program_number: viewer_program, events: &viewer_events, flow_id: &viewer_flow_id, audio_encode: viewer_audio_encode, transcode: viewer_transcode, compressed_audio_input: viewer_compressed, video_encode: viewer_video_encode }).await;
         });
     }
 
@@ -735,22 +720,42 @@ async fn whep_server_loop(
 
 /// Per-viewer send loop: demux TS → packetize H.264 → send via WebRTC to one viewer.
 #[cfg(feature = "webrtc")]
+/// Fixed per-viewer settings for a WHEP session: identity, the program it
+/// carries, and the audio/video transcode selection.
+struct WhepViewerCfg<'a> {
+    stats: Arc<OutputStatsAccumulator>,
+    cancel: CancellationToken,
+    video_only: bool,
+    program_number: Option<u16>,
+    events: &'a EventSender,
+    flow_id: &'a str,
+    audio_encode: Option<crate::config::models::AudioEncodeConfig>,
+    transcode: Option<super::audio_transcode::TranscodeJson>,
+    compressed_audio_input: bool,
+    video_encode: Option<VideoEncodeConfig>,
+}
+
 async fn whep_viewer_loop(
     output_id: &str,
     session_id: &str,
     mut session: super::webrtc::session::WebrtcSession,
     mut rx: broadcast::Receiver<RtpPacket>,
-    stats: Arc<OutputStatsAccumulator>,
-    cancel: CancellationToken,
-    video_only: bool,
-    program_number: Option<u16>,
-    events: &EventSender,
-    flow_id: &str,
-    audio_encode: Option<crate::config::models::AudioEncodeConfig>,
-    transcode: Option<super::audio_transcode::TranscodeJson>,
-    compressed_audio_input: bool,
-    video_encode: Option<VideoEncodeConfig>,
+    params: WhepViewerCfg<'_>,
 ) {
+    // Destructured back into the original bindings so the body is unchanged.
+    let WhepViewerCfg {
+        stats,
+        cancel,
+        video_only,
+        program_number,
+        events,
+        flow_id,
+        audio_encode,
+        transcode,
+        compressed_audio_input,
+        video_encode,
+    } = params;
+
     use super::ts_parse::strip_rtp_header;
     use super::webrtc::ts_demux::TsDemuxer;
     use super::webrtc::session::SessionEvent;

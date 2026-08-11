@@ -114,7 +114,7 @@ rand = "0.10.1"
 # transcode stage in `engine::audio_transcode` to bridge mismatched
 # ST 2110-30 / -31 / rtp_audio formats and feed the SMPTE 302M-over-SRT
 # pipeline). No C deps.
-rubato = "4.0.0"
+rubato = "5.0.0"
 
 # Pure-Rust audio codec decoder (used by `engine::audio_decode` to convert
 # ── AAC backend ─────────────────────────────────────────────────────────

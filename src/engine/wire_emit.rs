@@ -794,11 +794,7 @@ pub fn spawn_wire_emitter(
                 sched_fifo,
                 pinned_to,
             );
-            run_emitter(
-                thread_id, socket, dest, anchor, releaser, dejitter, epoch_offset_ns,
-                epoch_anchor, epoch_anchor_cell,
-                stats_for_thread, cancel, rx,
-            );
+            run_emitter(thread_id, socket, dest, EmitterCfg { anchor, releaser, dejitter, epoch_offset_ns, epoch_anchor, epoch_anchor_cell, stats: stats_for_thread, cancel, rx });
         })
         .expect("wire-emit thread spawn");
     tx
@@ -1824,10 +1820,9 @@ fn report_epoch_deficit(state: &TargetState, stats: &OutputStatsAccumulator, had
     }
 }
 
-fn run_emitter(
-    id: String,
-    socket: UdpSocket,
-    dest: SocketAddr,
+/// How one wire emitter paces and reports: the anchor + releaser pair, the
+/// de-jitter and epoch-lock settings, and where stats and cancellation go.
+struct EmitterCfg {
     anchor: AnchorSource,
     releaser: Releaser,
     dejitter: DejitterConfig,
@@ -1837,7 +1832,27 @@ fn run_emitter(
     stats: Arc<OutputStatsAccumulator>,
     cancel: CancellationToken,
     rx: WireTxReceiver,
+}
+
+fn run_emitter(
+    id: String,
+    socket: UdpSocket,
+    dest: SocketAddr,
+    params: EmitterCfg,
 ) {
+    // Destructured back into the original bindings so the body is unchanged.
+    let EmitterCfg {
+        anchor,
+        releaser,
+        dejitter,
+        epoch_offset_ns,
+        epoch_anchor,
+        epoch_anchor_cell,
+        stats,
+        cancel,
+        rx,
+    } = params;
+
     let mut state = TargetState {
         epoch_offset_ns,
         epoch_anchor,

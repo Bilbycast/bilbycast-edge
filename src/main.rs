@@ -819,27 +819,29 @@ async fn main() -> anyhow::Result<()> {
             });
             manager::client::start_manager_client(
                 mgr_config.clone(),
-                flow_manager.clone(),
-                tunnel_manager.clone(),
-                ws_stats_tx.clone(),
-                state.config.clone(),
-                cli.config.clone(),
-                secrets_path.clone(),
-                mgr_api_addr,
-                mgr_monitor_addr,
-                #[cfg(feature = "webrtc")]
-                { state.webrtc_sessions.clone() },
-                #[cfg(not(feature = "webrtc"))]
-                (),
+                manager::client::ManagerClientDeps {
+                    flow_manager: flow_manager.clone(),
+                    tunnel_manager: tunnel_manager.clone(),
+                    ws_stats_tx: ws_stats_tx.clone(),
+                    app_config: state.config.clone(),
+                    config_path: cli.config.clone(),
+                    secrets_path: secrets_path.clone(),
+                    api_addr: mgr_api_addr,
+                    monitor_addr: mgr_monitor_addr,
+                    #[cfg(feature = "webrtc")]
+                    webrtc_sessions: state.webrtc_sessions.clone(),
+                    #[cfg(not(feature = "webrtc"))]
+                    webrtc_sessions: (),
+                    resource_state: resource_state.clone(),
+                    static_caps: static_capabilities.clone(),
+                    live_gpu: live_gpu_state.clone(),
+                    standby_listeners: Some(standby_listeners.clone()),
+                    cellular_cache: cellular_cache.clone(),
+                    starlink_cache: starlink_cache.clone(),
+                    start_time: state.start_time,
+                    manager_link: manager_link.clone(),
+                },
                 event_rx,
-                resource_state.clone(),
-                static_capabilities.clone(),
-                live_gpu_state.clone(),
-                Some(standby_listeners.clone()),
-                cellular_cache.clone(),
-                starlink_cache.clone(),
-                state.start_time,
-                manager_link.clone(),
             );
         }
 
