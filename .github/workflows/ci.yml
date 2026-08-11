@@ -201,8 +201,18 @@ jobs:
             echo "       The repo must contain the SDK's Linux/include directory." >&2
             exit 1
           fi
-          DECKLINK_SDK_DIR="$(dirname "${API_H}")"
+          # MUST be absolute. This step runs with working-directory
+          # bilbycast-edge, but libdecklink-sys/build.rs runs with cwd set to
+          # its OWN crate dir, so a relative DECKLINK_SDK_DIR resolves against
+          # the wrong root and build.rs panics with "does not look like the
+          # SDK's Linux/include". Caught by run 31471223148.
+          DECKLINK_SDK_DIR="$(cd "$(dirname "${API_H}")" && pwd)"
           export DECKLINK_SDK_DIR
+          if [ ! -f "${DECKLINK_SDK_DIR}/DeckLinkAPIDispatch.cpp" ]; then
+            echo "ERROR: found DeckLinkAPI.h but no DeckLinkAPIDispatch.cpp beside it" >&2
+            echo "       in ${DECKLINK_SDK_DIR}. Both are required." >&2
+            exit 1
+          fi
           echo "DECKLINK_SDK_DIR=${DECKLINK_SDK_DIR}"
           cargo check --all-targets --locked --features sdi-decklink
 
