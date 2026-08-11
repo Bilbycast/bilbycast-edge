@@ -1119,13 +1119,27 @@ impl TargetState {
         // Pick up a re-mint. Staged rather than applied on sight so the
         // switch happens on a content coordinate; see below.
         if let Some(published) = self.epoch_anchor_cell.as_ref().and_then(|c| c.load()) {
-            let live_gen = self.epoch_anchor.map(|a| a.generation).unwrap_or(0);
-            let staged_gen = self.epoch_pending_anchor.map(|a| a.generation);
-            if published.generation != live_gen && staged_gen != Some(published.generation) {
-                if published.effective_from_pcr.is_some() {
-                    self.epoch_pending_anchor = Some(published);
-                } else {
-                    self.epoch_anchor = Some(published);
+            let live_gen = self
+                .epoch_anchor
+                .map(|a| a.generation)
+                .unwrap_or(crate::engine::epoch_lock::DISARM_GENERATION);
+            if published.generation == crate::engine::epoch_lock::DISARM_GENERATION {
+                // The group withdrew. Drop back to the closed form (still
+                // covered by the plausibility gate) and let
+                // `report_epoch_deficit` resume publishing mint
+                // observations, which is what lets the manager re-mint.
+                // Idempotent: once cleared, live_gen is itself DISARM and
+                // this stops firing.
+                self.epoch_anchor = None;
+                self.epoch_pending_anchor = None;
+            } else {
+                let staged_gen = self.epoch_pending_anchor.map(|a| a.generation);
+                if published.generation != live_gen && staged_gen != Some(published.generation) {
+                    if published.effective_from_pcr.is_some() {
+                        self.epoch_pending_anchor = Some(published);
+                    } else {
+                        self.epoch_anchor = Some(published);
+                    }
                 }
             }
         }
@@ -1802,13 +1816,23 @@ fn report_epoch_deficit(state: &TargetState, stats: &OutputStatsAccumulator, had
         // Mint observation, only while unarmed: once the emitter is
         // dwelling, its dequeue instant no longer answers "when did this
         // node have this content".
-        if state.epoch_anchor.is_none()
-            && let Some(pcr) = state.pcr_anchor {
+        if state.epoch_anchor.is_none() {
+            if let Some(pcr) = state.pcr_anchor {
                 // CLOCK_TAI -> CLOCK_REALTIME with the skew already cached
                 // for the derivation, so this costs no extra clock read.
                 let unix_ns = state.last_returned_ns as i128 - state.epoch_tai_skew_ns as i128;
                 stats.record_epoch_mint_observation(pcr, unix_ns as i64);
             }
+        } else {
+            // Armed: retire the pair rather than leaving the last unarmed
+            // reading standing. A stale pair is indistinguishable from a
+            // live one on the wire, so the manager would re-mint the very
+            // same anchor from each member's frozen first-engagement
+            // reading — a re-mint that reports success and moves nothing.
+            // The field doc has always promised this; until now nothing
+            // did it.
+            stats.clear_epoch_mint_observation();
+        }
         stats.record_epoch_lock_anchor(
             state.epoch_engaged,
             state.epoch_deficit_ns / 1_000,
@@ -2983,6 +3007,63 @@ mod tests {
         }
         assert!(!classic.epoch_engaged);
         assert_eq!(classic.epoch_deficit_ns, 0);
+    }
+
+    /// A published withdrawal takes the emitter off the group timeline and
+    /// back onto the closed form, without restarting the output.
+    ///
+    /// This is the half that makes a manager re-mint real: while armed, a
+    /// member publishes no mint observation, so the manager cannot derive a
+    /// fresh anchor until every member has been disarmed.
+    #[test]
+    fn a_published_withdrawal_drops_the_group_anchor() {
+        use crate::engine::epoch_lock::{EpochAnchorCell, DISARM_GENERATION};
+
+        let (pcr_now, anchor, now) = source_timeline();
+        let cell = Arc::new(EpochAnchorCell::new());
+        cell.store(anchor);
+
+        let mut state = TargetState {
+            epoch_anchor_cell: Some(cell.clone()),
+            ..epoch_state(400, anchor)
+        };
+
+        // Armed: the target is the anchored one, i.e. a pure function of
+        // (pcr, anchor) with no local clock in it.
+        let armed = state.epoch_anchor_ns(pcr_now, now).expect("armed target");
+        assert_eq!(state.epoch_anchor.map(|a| a.generation), Some(1));
+        assert_eq!(
+            armed as i128,
+            crate::engine::epoch_lock::target_tai_ns_anchored(pcr_now, 0, 400_000_000, &anchor),
+            "armed egress rides the group anchor"
+        );
+
+        // Withdraw.
+        cell.store_disarm();
+        let _ = state.epoch_anchor_ns(pcr_now, now);
+        assert!(
+            state.epoch_anchor.is_none() && state.epoch_pending_anchor.is_none(),
+            "the withdrawal must clear both the live and the staged anchor"
+        );
+
+        // Idempotent — a level-triggered cell re-reads the same withdrawal
+        // on every subsequent datagram and must not thrash.
+        let _ = state.epoch_anchor_ns(pcr_now, now);
+        assert!(state.epoch_anchor.is_none());
+        assert_eq!(
+            cell.load().map(|a| a.generation),
+            Some(DISARM_GENERATION),
+            "the withdrawal stays published; it is not consumed by being read"
+        );
+
+        // A fresh anchor after a withdrawal is adopted normally.
+        let regen = crate::engine::epoch_lock::SourceAnchor {
+            generation: 2,
+            ..anchor
+        };
+        cell.store(regen);
+        let _ = state.epoch_anchor_ns(pcr_now, now);
+        assert_eq!(state.epoch_anchor.map(|a| a.generation), Some(2));
     }
 
     // ── Egress de-jitter: residence-cap shed (Phase 1) ──────────────────

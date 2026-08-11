@@ -2542,8 +2542,17 @@ pub struct EpochLockStats {
     #[serde(default)]
     pub anchor_generation: u32,
     /// Mint observation: a source PCR this node saw, and the wall instant
-    /// it had that content ready to release. Zero once the group anchor is
-    /// armed — see `OutputStatsAccumulator::epoch_mint_pcr_27mhz`.
+    /// it had that content ready to release.
+    ///
+    /// **Zero once the group anchor is armed**, via
+    /// `OutputStatsAccumulator::clear_epoch_mint_observation` — a dwelling
+    /// emitter's dequeue instant no longer answers "when did this node have
+    /// this content", so the reading must retire rather than stand.
+    /// Retiring it is what lets the manager tell a fresh observation from a
+    /// frozen one, and therefore what makes a re-mint move egress phase
+    /// instead of re-deriving the identical anchor. (This sentence
+    /// described the intent long before anything implemented it; the clear
+    /// landed alongside the `set_epoch_anchor` withdrawal form.)
     ///
     /// The manager normalises every member's pair onto one reference PCR
     /// and anchors on the **slowest**, which is what makes the required

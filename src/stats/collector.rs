@@ -1006,6 +1006,22 @@ impl OutputStatsAccumulator {
         self.epoch_mint_unix_ns.store(unix_ns, Ordering::Relaxed);
     }
 
+    /// Retire the mint observation once the group anchor is in force.
+    ///
+    /// Called from the wire thread on every PCR-bearing datagram while
+    /// armed, so it loads before it stores: the steady state is a single
+    /// relaxed load and a not-taken branch, and the pair of stores happens
+    /// once per arm rather than ~25-50 times a second.
+    #[inline]
+    pub fn clear_epoch_mint_observation(&self) {
+        if self.epoch_mint_pcr_27mhz.load(Ordering::Relaxed) != 0
+            || self.epoch_mint_unix_ns.load(Ordering::Relaxed) != 0
+        {
+            self.epoch_mint_pcr_27mhz.store(0, Ordering::Relaxed);
+            self.epoch_mint_unix_ns.store(0, Ordering::Relaxed);
+        }
+    }
+
     #[inline]
     pub fn record_epoch_lock_anchor(
         &self,

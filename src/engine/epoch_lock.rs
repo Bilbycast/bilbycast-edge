@@ -389,9 +389,50 @@ pub struct EpochAnchorCell {
 
 const NO_TRIGGER: u64 = u64::MAX;
 
+/// Generation reserved to mean "the group withdrew its anchor".
+///
+/// The manager mints from 1 (`previous.generation + 1`, starting at 0+1), so
+/// 0 can never name a real anchor and is free to carry the disarm.
+///
+/// A disarm has to be its own signal rather than "stop publishing": the cell
+/// is level-triggered, so a member that simply stopped hearing from the
+/// manager would hold its last anchor forever. That is right for a control-
+/// plane outage — a running group must not fall apart because the manager
+/// restarted — and wrong for a deliberate withdrawal, which is why the two
+/// are distinguished here rather than by a timeout.
+///
+/// # Why a sentinel generation and not `armed = false`
+///
+/// Clearing `armed` looks like the obvious encoding, and it is the wrong
+/// one: [`EpochAnchorCell::load`] already returns `None` for a torn read
+/// (the bounded retry giving up), so "withdrawn" would be indistinguishable
+/// from "the writer was preempted mid-update". The reader would then drop a
+/// live anchor — taking a healthy member off the group timeline mid-air —
+/// on a transient it is specifically designed to tolerate. A published
+/// sentinel keeps `None` meaning exactly one thing: *no information this
+/// datagram, keep what you have*.
+pub const DISARM_GENERATION: u32 = 0;
+
 impl EpochAnchorCell {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Withdraw the group anchor.
+    ///
+    /// The emitter drops back to the closed-form inversion (still covered by
+    /// the plausibility gate) and — the point of the exercise — resumes
+    /// publishing mint observations, so the manager can re-mint from fresh
+    /// arrivals. Without this a re-mint re-derives the *same* anchor from
+    /// each member's frozen first-engagement pair and egress phase never
+    /// moves, which is exactly the drift it was invoked to correct.
+    pub fn store_disarm(&self) {
+        self.store(SourceAnchor {
+            pcr_27mhz: 0,
+            unix_ns: 0,
+            generation: DISARM_GENERATION,
+            effective_from_pcr: None,
+        });
     }
 
     /// Publish a new anchor. Single-writer (the manager command handler).
@@ -649,5 +690,40 @@ mod tests {
         assert!(next.is_effective_for(2_000_001), "after the trigger");
         // Still correct once the PCR has wrapped past the trigger.
         assert!(next.is_effective_for(2_000_000 + 27_000_000));
+    }
+
+    /// A withdrawal is a published generation-0 anchor, not an absent one.
+    ///
+    /// The cell is level-triggered, so "stop publishing" cannot mean
+    /// "disarm" — a member must hold its anchor through a manager restart.
+    /// The reader therefore has to be able to *see* the withdrawal.
+    #[test]
+    fn a_withdrawal_is_readable_and_distinct_from_never_armed() {
+        let cell = EpochAnchorCell::new();
+        assert!(cell.load().is_none(), "never armed reads as absent");
+
+        cell.store(SourceAnchor {
+            pcr_27mhz: 4_242_424_242,
+            unix_ns: 1_786_000_000_000_000_000,
+            generation: 3,
+            effective_from_pcr: None,
+        });
+        assert_eq!(cell.load().expect("armed").generation, 3);
+
+        cell.store_disarm();
+        let withdrawn = cell.load().expect("a withdrawal is published, not absent");
+        assert_eq!(withdrawn.generation, DISARM_GENERATION);
+    }
+
+    /// The sentinel must never collide with a real anchor. The manager
+    /// mints `previous + 1` starting from 0, so the first real generation
+    /// is 1 and 0 is always free. (Pinned here because the emitter treats 0 as
+    /// "drop the anchor" — a real anchor arriving as 0 would be read as a
+    /// withdrawal and silently unalign the member.)
+    #[test]
+    fn disarm_generation_is_below_the_first_minted_generation() {
+        let first_minted = 0u32 + 1;
+        assert!(DISARM_GENERATION < first_minted);
+        assert_eq!(DISARM_GENERATION, 0);
     }
 }

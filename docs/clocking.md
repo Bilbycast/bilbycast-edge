@@ -499,6 +499,36 @@ Re-mints carry `effective_from_pcr` so every member switches on the same
 *packet* rather than at the same moment on its own clock. Without that,
 the switch opens a divergence window equal to the whole anchor step.
 
+### Withdrawing the anchor
+
+`set_epoch_anchor` has a second form, `{"output_id": "...", "clear": true}`,
+which takes the output back off the group timeline: it drops to the
+closed-form inversion (still covered by the plausibility gate) and resumes
+publishing mint observations. The manager sends it when a group is deleted,
+when a member leaves the roster, and as the **first half of a re-mint**.
+
+That last one is what makes a re-mint mean anything. An armed emitter
+publishes no mint observation — its dequeue instant no longer answers "when
+did this node have this content" — so the manager cannot derive a fresh
+anchor until every member has been withdrawn. Re-minting without withdrawing
+first re-derives the *identical* anchor from each member's frozen
+first-engagement reading: generation increments, the UI turns green, and
+egress phase does not move.
+
+The withdrawal is a **published generation-0 anchor**, not an absent one.
+`EpochAnchorCell::load` already returns `None` for a torn read (its bounded
+retry giving up), so encoding "withdrawn" as `armed = false` would make it
+indistinguishable from a preempted writer — and the emitter would drop a live
+anchor mid-air on a transient it is specifically built to tolerate. The
+manager mints generations from 1, so 0 can never name a real anchor; the edge
+rejects a non-withdrawal command carrying generation 0 rather than let the
+sentinel be spoofed.
+
+Correspondingly, the edge **retires the mint pair on adopt**
+(`OutputStatsAccumulator::clear_epoch_mint_observation`) so an armed member
+reports zeros rather than a stale reading. `EpochLockStats` documented this
+behaviour long before anything implemented it.
+
 ### Sizing `egress_offset_ms`
 
 Bounded 150–800 ms, and both ends are derived rather than chosen:

@@ -5316,6 +5316,29 @@ async fn execute_command(
             let output_id = action["output_id"].as_str().ok_or_else(|| {
                 CommandError::with_code("set_epoch_anchor: missing 'output_id'", "missing_field")
             })?;
+
+            // Withdrawal form: `{"clear": true}` carries no anchor fields.
+            // The manager sends it when a group is deleted, when a member
+            // leaves the roster, and as the first half of a re-mint — the
+            // emitter drops back to the closed form and resumes publishing
+            // mint observations so a fresh anchor can be derived. Checked
+            // before the field extraction below, which would otherwise
+            // reject a well-formed disarm for "missing 'pcr_27mhz'".
+            if action["clear"].as_bool().unwrap_or(false) {
+                let acc = flow_manager.output_stats(output_id).ok_or_else(|| {
+                    CommandError::with_code(
+                        format!("set_epoch_anchor: unknown or not-running output '{output_id}'"),
+                        "unknown_output",
+                    )
+                })?;
+                acc.epoch_anchor_cell.store_disarm();
+                tracing::info!(output_id, "epoch-lock group anchor withdrawn");
+                return Ok(Some(serde_json::json!({
+                    "output_id": output_id,
+                    "cleared": true,
+                })));
+            }
+
             let pcr_27mhz = action["pcr_27mhz"].as_u64().ok_or_else(|| {
                 CommandError::with_code("set_epoch_anchor: missing 'pcr_27mhz'", "missing_field")
             })?;
@@ -5339,6 +5362,19 @@ async fn execute_command(
             if unix_ns <= 0 {
                 return Err(CommandError::with_code(
                     "set_epoch_anchor: unix_ns must be a positive UNIX-epoch nanosecond instant",
+                    "invalid_field",
+                ));
+            }
+            // Generation 0 is the disarm sentinel, so it can never name a
+            // real anchor. Refusing it here keeps a manager bug (or a
+            // hand-rolled command) from publishing an "anchor" the emitter
+            // would read as a withdrawal and then report as generation 0 —
+            // which the manager would see as a member permanently a
+            // generation behind, and re-push forever.
+            if generation == crate::engine::epoch_lock::DISARM_GENERATION {
+                return Err(CommandError::with_code(
+                    "set_epoch_anchor: generation 0 is reserved for the withdrawal form \
+                     (send {\"clear\": true}); real anchors are minted from 1",
                     "invalid_field",
                 ));
             }
