@@ -370,8 +370,8 @@ pub async fn oauth_token_handler(
         .ok_or_else(|| ApiError::BadRequest("authentication is not enabled".into()))?;
 
     // Rate limit check
-    if let Some(ref limiter) = state.token_rate_limiter {
-        if !limiter.check(addr.ip()) {
+    if let Some(ref limiter) = state.token_rate_limiter
+        && !limiter.check(addr.ip()) {
             return Ok((
                 StatusCode::TOO_MANY_REQUESTS,
                 [("retry-after", "60")],
@@ -382,7 +382,6 @@ pub async fn oauth_token_handler(
             )
                 .into_response());
         }
-    }
 
     // Try to parse as form-urlencoded first, then as JSON.
     let params: TokenRequest = serde_urlencoded::from_bytes(&body)

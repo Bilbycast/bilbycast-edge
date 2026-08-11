@@ -417,12 +417,10 @@ pub async fn list_frames(
             Ok(p) => p,
             Err(_) => continue,
         };
-        if let Some(lo) = from_pts {
-            if pts < lo { continue; }
-        }
-        if let Some(hi) = to_pts {
-            if pts > hi { continue; }
-        }
+        if let Some(lo) = from_pts
+            && pts < lo { continue; }
+        if let Some(hi) = to_pts
+            && pts > hi { continue; }
         let size = ent.metadata().await.map(|m| m.len()).unwrap_or(0);
         out.push((pts, size));
     }

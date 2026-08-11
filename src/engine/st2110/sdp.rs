@@ -599,12 +599,11 @@ fn apply_media_attribute(
         ("fmtp", Some(v)) => {
             // Format: "<pt> <params>". We strip the PT prefix if it matches
             // the media's payload type; otherwise we keep the whole string.
-            if let Some((pt, rest)) = v.split_once(' ') {
-                if pt.parse::<u8>().ok() == Some(m.payload_type) {
+            if let Some((pt, rest)) = v.split_once(' ')
+                && pt.parse::<u8>().ok() == Some(m.payload_type) {
                     m.fmtp = Some(rest.to_string());
                     return Ok(());
                 }
-            }
             m.fmtp = Some(v.to_string());
         }
         ("ptime", Some(v)) => {

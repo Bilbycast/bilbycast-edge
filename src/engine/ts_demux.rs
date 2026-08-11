@@ -583,12 +583,11 @@ impl TsDemuxer {
 
         // PMT — only honour the PMT for our locked program.
         if Some(pid) == self.selected_pmt_pid {
-            if let Some(payload) = Self::psi_payload(pkt) {
-                if let Some(section) = self.pmt_section.feed(ts_pusi(pkt), payload) {
+            if let Some(payload) = Self::psi_payload(pkt)
+                && let Some(section) = self.pmt_section.feed(ts_pusi(pkt), payload) {
                     let section = section.to_vec();
                     self.parse_pmt(&section);
                 }
-            }
             return Vec::new();
         }
 

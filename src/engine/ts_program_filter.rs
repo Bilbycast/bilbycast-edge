@@ -245,11 +245,10 @@ impl TsProgramFilter {
             for pid in es_pids {
                 self.allowed_pids.insert(pid);
             }
-            if let Some(pcr) = pcr_pid {
-                if pcr != 0x1FFF {
+            if let Some(pcr) = pcr_pid
+                && pcr != 0x1FFF {
                     self.allowed_pids.insert(pcr);
                 }
-            }
         }
     }
 

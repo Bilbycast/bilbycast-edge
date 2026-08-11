@@ -488,13 +488,11 @@ async fn http_put_inner(
     if let Some(status_line) = response_str.lines().next() {
         // e.g. "HTTP/1.1 200 OK"
         let parts: Vec<&str> = status_line.splitn(3, ' ').collect();
-        if parts.len() >= 2 {
-            if let Ok(status) = parts[1].parse::<u16>() {
-                if !(200..300).contains(&status) {
+        if parts.len() >= 2
+            && let Ok(status) = parts[1].parse::<u16>()
+                && !(200..300).contains(&status) {
                     anyhow::bail!("HTTP PUT returned status {status}: {status_line}");
                 }
-            }
-        }
     }
 
     Ok(())
@@ -716,11 +714,10 @@ fn remux_ts_audio_inprocess(
 
         if pusi {
             // Flush previous PES
-            if pes_started && !pes_buffer.is_empty() {
-                if let Some((es_data, pts)) = extract_pes_audio(&pes_buffer) {
+            if pes_started && !pes_buffer.is_empty()
+                && let Some((es_data, pts)) = extract_pes_audio(&pes_buffer) {
                     audio_pes_list.push((es_data, pts));
                 }
-            }
             pes_buffer.clear();
             pes_buffer.extend_from_slice(payload);
             pes_started = true;
@@ -729,11 +726,10 @@ fn remux_ts_audio_inprocess(
         }
     }
     // Flush last PES
-    if pes_started && !pes_buffer.is_empty() {
-        if let Some((es_data, pts)) = extract_pes_audio(&pes_buffer) {
+    if pes_started && !pes_buffer.is_empty()
+        && let Some((es_data, pts)) = extract_pes_audio(&pes_buffer) {
             audio_pes_list.push((es_data, pts));
         }
-    }
 
     if audio_pes_list.is_empty() {
         // No audio to re-encode — return original segment unchanged

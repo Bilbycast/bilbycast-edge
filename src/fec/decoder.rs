@@ -210,11 +210,10 @@ impl FecDecoder {
         // media packet of a group was lost, `self.base_seq` was set to a
         // later sequence and every cell sits at a shifted position.
         // Realign the matrix against `sn_base` before storing this FEC.
-        if hdr.sn_base != self.base_seq {
-            if !self.align_base_to(hdr.sn_base) {
+        if hdr.sn_base != self.base_seq
+            && !self.align_base_to(hdr.sn_base) {
                 return result;
             }
-        }
 
         self.store_fec(&hdr, payload);
         self.attempt_recovery(&mut result);
@@ -295,23 +294,19 @@ impl FecDecoder {
             for c in 0..self.columns {
                 if self.col_fec[c as usize].is_some()
                     && self.matrix.col_count(c) == self.rows.saturating_sub(1)
-                {
-                    if let Some(pkt) = self.recover_column(c, &template) {
+                    && let Some(pkt) = self.recover_column(c, &template) {
                         out.push(pkt);
                         progressed = true;
                     }
-                }
             }
 
             for r in 0..self.rows {
                 if self.row_fec[r as usize].is_some()
                     && self.matrix.row_count(r) == self.columns.saturating_sub(1)
-                {
-                    if let Some(pkt) = self.recover_row(r, &template) {
+                    && let Some(pkt) = self.recover_row(r, &template) {
                         out.push(pkt);
                         progressed = true;
                     }
-                }
             }
 
             if !progressed {

@@ -1136,12 +1136,11 @@ impl TargetState {
 
         // Adopt a staged anchor once the source timeline reaches its
         // trigger, so every member switches on the same packet.
-        if let Some(pending) = self.epoch_pending_anchor {
-            if pending.is_effective_for(pcr) {
+        if let Some(pending) = self.epoch_pending_anchor
+            && pending.is_effective_for(pcr) {
                 self.epoch_anchor = Some(pending);
                 self.epoch_pending_anchor = None;
             }
-        }
 
         let target = match self.epoch_anchor.as_ref() {
             // Group-shared anchor: a pure function of (pcr, anchor). No
@@ -1807,14 +1806,13 @@ fn report_epoch_deficit(state: &TargetState, stats: &OutputStatsAccumulator, had
         // Mint observation, only while unarmed: once the emitter is
         // dwelling, its dequeue instant no longer answers "when did this
         // node have this content".
-        if state.epoch_anchor.is_none() {
-            if let Some(pcr) = state.pcr_anchor {
+        if state.epoch_anchor.is_none()
+            && let Some(pcr) = state.pcr_anchor {
                 // CLOCK_TAI -> CLOCK_REALTIME with the skew already cached
                 // for the derivation, so this costs no extra clock read.
                 let unix_ns = state.last_returned_ns as i128 - state.epoch_tai_skew_ns as i128;
                 stats.record_epoch_mint_observation(pcr, unix_ns as i64);
             }
-        }
         stats.record_epoch_lock_anchor(
             state.epoch_engaged,
             state.epoch_deficit_ns / 1_000,
@@ -2008,13 +2006,12 @@ fn run_emitter(
         // or `clock_nanosleep` (~100 µs); we trust the kernel to
         // place the packet on the wire at the right instant rather
         // than rewriting the PCR field.
-        if let Releaser::ClockNanosleep = releaser {
-            if target_ns > now_ns {
+        if let Releaser::ClockNanosleep = releaser
+            && target_ns > now_ns {
                 let before = monotonic_now_ns();
                 sleep_until_monotonic_ns(target_ns);
                 diag_sleep_ns = diag_sleep_ns.saturating_add(monotonic_now_ns().saturating_sub(before));
             }
-        }
         if pcr_27mhz.is_some() { diag_pcr_events += 1; }
 
         // ── ClockNanosleep tier: batch send via sendmmsg ────────────
@@ -2059,11 +2056,10 @@ fn run_emitter(
                                 &next_dg.bytes[off..],
                                 state.anchor_pid,
                             );
-                        if let Some((_, pid)) = next_pcr_with_pid {
-                            if state.anchor_pid.is_none() {
+                        if let Some((_, pid)) = next_pcr_with_pid
+                            && state.anchor_pid.is_none() {
                                 state.anchor_pid = Some(pid);
                             }
-                        }
                         let next_pcr_27mhz = next_pcr_with_pid.map(|(pcr, _)| pcr);
                         refresh_epoch_skew(&mut state, now_ns);
                         let next_target = state.derive_target_paced(

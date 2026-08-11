@@ -164,11 +164,10 @@ async fn summarize_recording(recording_id: &str, dir: &Path) -> RecordingSummary
             if let Ok(meta) = e.metadata().await {
                 segment_count = segment_count.saturating_add(1);
                 total_bytes = total_bytes.saturating_add(meta.len());
-                if let Ok(modified) = meta.modified() {
-                    if let Ok(d) = modified.duration_since(std::time::UNIX_EPOCH) {
+                if let Ok(modified) = meta.modified()
+                    && let Ok(d) = modified.duration_since(std::time::UNIX_EPOCH) {
                         last_modified_unix = last_modified_unix.max(d.as_secs());
                     }
-                }
             }
         }
     }
@@ -252,11 +251,10 @@ async fn sum_dir_bytes(dir: &Path) -> u64 {
             };
             if ft.is_dir() {
                 stack.push(e.path());
-            } else if ft.is_file() {
-                if let Ok(m) = e.metadata().await {
+            } else if ft.is_file()
+                && let Ok(m) = e.metadata().await {
                     acc = acc.saturating_add(m.len());
                 }
-            }
         }
     }
     acc

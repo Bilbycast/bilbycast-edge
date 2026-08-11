@@ -1245,30 +1245,34 @@ fn demux_decode_loop(
                         pts,
                         is_keyframe,
                         VideoCodec::H264,
-                        &mut last_video_pts,
-                        &mut keyframe_gate,
-                        &mut video_decoder,
-                        &mut current_video_codec,
-                        &mut aac_decoder,
-                        &mut ff_audio_decoder,
-                        &mut hw_open_state,
-                        &mut deint_state,
-                        &mut last_unsupported_pixfmt_at,
-                        &counters,
-                        &vtx,
-                        &event_sender,
-                        &flow_id,
-                        &output_id,
-                        &frame_gen,
-                        panel_hdr_capable,
-                        &force_cpu_blit_for_bars,
-                        &prime_scanout_failed,
-                        &prime_cache_stale,
-                        #[cfg(feature = "rga-transfer")]
-                        &rga_transfer_active,
-                        stream_ids,
-                        &video_decode_counters,
-                        &output_stats,
+                        VideoAuState {
+                            last_video_pts: &mut last_video_pts,
+                            keyframe_gate: &mut keyframe_gate,
+                            video_decoder: &mut video_decoder,
+                            current_video_codec: &mut current_video_codec,
+                            aac_decoder: &mut aac_decoder,
+                            ff_audio_decoder: &mut ff_audio_decoder,
+                            hw_open_state: &mut hw_open_state,
+                            deint: &mut deint_state,
+                            last_unsupported_pixfmt_at: &mut last_unsupported_pixfmt_at,
+                        },
+                        VideoAuCtx {
+                            counters: &counters,
+                            vtx: &vtx,
+                            event_sender: &event_sender,
+                            flow_id: &flow_id,
+                            output_id: &output_id,
+                            frame_gen: &frame_gen,
+                            panel_hdr_capable,
+                            force_cpu_blit_for_bars: &force_cpu_blit_for_bars,
+                            prime_scanout_failed: &prime_scanout_failed,
+                            prime_cache_stale: &prime_cache_stale,
+                            #[cfg(feature = "rga-transfer")]
+                            rga_transfer_active: &rga_transfer_active,
+                            stream_ids,
+                            video_decode_counters: &video_decode_counters,
+                            output_stats: &output_stats,
+                        },
                     );
                 }
                 DemuxedFrame::H265 { nalus, pts, is_keyframe } => {
@@ -1282,30 +1286,34 @@ fn demux_decode_loop(
                         pts,
                         is_keyframe,
                         VideoCodec::Hevc,
-                        &mut last_video_pts,
-                        &mut keyframe_gate,
-                        &mut video_decoder,
-                        &mut current_video_codec,
-                        &mut aac_decoder,
-                        &mut ff_audio_decoder,
-                        &mut hw_open_state,
-                        &mut deint_state,
-                        &mut last_unsupported_pixfmt_at,
-                        &counters,
-                        &vtx,
-                        &event_sender,
-                        &flow_id,
-                        &output_id,
-                        &frame_gen,
-                        panel_hdr_capable,
-                        &force_cpu_blit_for_bars,
-                        &prime_scanout_failed,
-                        &prime_cache_stale,
-                        #[cfg(feature = "rga-transfer")]
-                        &rga_transfer_active,
-                        stream_ids,
-                        &video_decode_counters,
-                        &output_stats,
+                        VideoAuState {
+                            last_video_pts: &mut last_video_pts,
+                            keyframe_gate: &mut keyframe_gate,
+                            video_decoder: &mut video_decoder,
+                            current_video_codec: &mut current_video_codec,
+                            aac_decoder: &mut aac_decoder,
+                            ff_audio_decoder: &mut ff_audio_decoder,
+                            hw_open_state: &mut hw_open_state,
+                            deint: &mut deint_state,
+                            last_unsupported_pixfmt_at: &mut last_unsupported_pixfmt_at,
+                        },
+                        VideoAuCtx {
+                            counters: &counters,
+                            vtx: &vtx,
+                            event_sender: &event_sender,
+                            flow_id: &flow_id,
+                            output_id: &output_id,
+                            frame_gen: &frame_gen,
+                            panel_hdr_capable,
+                            force_cpu_blit_for_bars: &force_cpu_blit_for_bars,
+                            prime_scanout_failed: &prime_scanout_failed,
+                            prime_cache_stale: &prime_cache_stale,
+                            #[cfg(feature = "rga-transfer")]
+                            rga_transfer_active: &rga_transfer_active,
+                            stream_ids,
+                            video_decode_counters: &video_decode_counters,
+                            output_stats: &output_stats,
+                        },
                     );
                 }
                 DemuxedFrame::Mpeg2 { es, pts, is_keyframe } => {
@@ -1328,30 +1336,34 @@ fn demux_decode_loop(
                         pts,
                         is_keyframe,
                         VideoCodec::Mpeg2,
-                        &mut last_video_pts,
-                        &mut keyframe_gate,
-                        &mut video_decoder,
-                        &mut current_video_codec,
-                        &mut aac_decoder,
-                        &mut ff_audio_decoder,
-                        &mut hw_open_state,
-                        &mut deint_state,
-                        &mut last_unsupported_pixfmt_at,
-                        &counters,
-                        &vtx,
-                        &event_sender,
-                        &flow_id,
-                        &output_id,
-                        &frame_gen,
-                        panel_hdr_capable,
-                        &force_cpu_blit_for_bars,
-                        &prime_scanout_failed,
-                        &prime_cache_stale,
-                        #[cfg(feature = "rga-transfer")]
-                        &rga_transfer_active,
-                        stream_ids,
-                        &video_decode_counters,
-                        &output_stats,
+                        VideoAuState {
+                            last_video_pts: &mut last_video_pts,
+                            keyframe_gate: &mut keyframe_gate,
+                            video_decoder: &mut video_decoder,
+                            current_video_codec: &mut current_video_codec,
+                            aac_decoder: &mut aac_decoder,
+                            ff_audio_decoder: &mut ff_audio_decoder,
+                            hw_open_state: &mut hw_open_state,
+                            deint: &mut deint_state,
+                            last_unsupported_pixfmt_at: &mut last_unsupported_pixfmt_at,
+                        },
+                        VideoAuCtx {
+                            counters: &counters,
+                            vtx: &vtx,
+                            event_sender: &event_sender,
+                            flow_id: &flow_id,
+                            output_id: &output_id,
+                            frame_gen: &frame_gen,
+                            panel_hdr_capable,
+                            force_cpu_blit_for_bars: &force_cpu_blit_for_bars,
+                            prime_scanout_failed: &prime_scanout_failed,
+                            prime_cache_stale: &prime_cache_stale,
+                            #[cfg(feature = "rga-transfer")]
+                            rga_transfer_active: &rga_transfer_active,
+                            stream_ids,
+                            video_decode_counters: &video_decode_counters,
+                            output_stats: &output_stats,
+                        },
                     );
                 }
                 DemuxedFrame::Aac { data, pts } => {
@@ -1365,11 +1377,10 @@ fn demux_decode_loop(
                         last_audio_codec_label = Some("AAC-LC");
                     }
                     if let Some(asc) = demuxer.cached_aac_config() {
-                        if aac_decoder.is_none() {
-                            if let Ok(d) = aac_decoder_from_adts_config(asc) {
+                        if aac_decoder.is_none()
+                            && let Ok(d) = aac_decoder_from_adts_config(asc) {
                                 aac_decoder = Some(d);
                             }
-                        }
                         if let Some(decoder) = aac_decoder.as_mut() {
                             audio_decode_counters.inc_input();
                             match decoder.decode_frame(&data) {
@@ -2136,15 +2147,14 @@ fn open_video_decoder_with_retry(
     // `cpu` for exactly this case.
     // Falls through to the HW path if the CPU open itself fails (then the
     // normal retry+demote handles it).
-    if mpeg2_pin_active(codec, state.backend, state.mpeg2_cpu_pinned, state.mpeg2_cpu_override) {
-        if let Ok(d) = VideoDecoder::open_with_backend(codec, DecoderBackend::Cpu) {
+    if mpeg2_pin_active(codec, state.backend, state.mpeg2_cpu_pinned, state.mpeg2_cpu_override)
+        && let Ok(d) = VideoDecoder::open_with_backend(codec, DecoderBackend::Cpu) {
             // MPEG-2 on CPU while `state.backend` stays HW for other
             // codecs — plain `Cpu`, not a failure. This is the report
             // that used to lie as `vaapi-zerocopy`/`rkmpp-zerocopy`.
             counters.set_active_decoder_label(DisplayDecoderLabel::Cpu);
             return Some(d);
         }
-    }
 
     const ATTEMPT_DELAYS_MS: [u64; 3] = [50, 100, 200];
     let mut last_err: Option<String> = None;
@@ -2723,35 +2733,79 @@ fn force_cpu_fallback(
 /// H265 arms in `demux_decode_loop` stay one-line dispatches and every
 /// piece of book-keeping (pts_jump flush, decoder ensure, send,
 /// drain, watchdog) lives in lock-step in one place.
+/// The mutable pipeline state `handle_video_au` carries between access
+/// units. Bundled because it is one cohesive thing — the decode pipeline —
+/// not because the argument list was long.
+struct VideoAuState<'a> {
+    last_video_pts: &'a mut Option<u64>,
+    keyframe_gate: &'a mut KeyframeGate,
+    video_decoder: &'a mut Option<VideoDecoder>,
+    current_video_codec: &'a mut Option<VideoCodec>,
+    aac_decoder: &'a mut Option<AacDecoder>,
+    ff_audio_decoder: &'a mut Option<FfAudioDecoder>,
+    hw_open_state: &'a mut HwOpenState,
+    deint: &'a mut DeintState,
+    last_unsupported_pixfmt_at: &'a mut Option<Instant>,
+}
+
+/// The immutable per-output context: sinks, identifiers and the shared
+/// atomics the display thread reads. Fixed for the life of the output.
+struct VideoAuCtx<'a> {
+    counters: &'a DisplayStatsCounters,
+    vtx: &'a mpsc::Sender<VideoFrame>,
+    event_sender: &'a EventSender,
+    flow_id: &'a str,
+    output_id: &'a str,
+    frame_gen: &'a AtomicU64,
+    panel_hdr_capable: bool,
+    force_cpu_blit_for_bars: &'a AtomicBool,
+    prime_scanout_failed: &'a AtomicBool,
+    prime_cache_stale: &'a AtomicBool,
+    #[cfg(feature = "rga-transfer")]
+    rga_transfer_active: &'a AtomicBool,
+    stream_ids: StreamIds,
+    video_decode_counters: &'a VideoDecodeStats,
+    output_stats: &'a OutputStatsAccumulator,
+}
+
 fn handle_video_au(
     nalus: &[Vec<u8>],
     pts: u64,
     is_keyframe: bool,
     codec: VideoCodec,
-    last_video_pts: &mut Option<u64>,
-    keyframe_gate: &mut KeyframeGate,
-    video_decoder: &mut Option<VideoDecoder>,
-    current_video_codec: &mut Option<VideoCodec>,
-    aac_decoder: &mut Option<AacDecoder>,
-    ff_audio_decoder: &mut Option<FfAudioDecoder>,
-    hw_open_state: &mut HwOpenState,
-    deint: &mut DeintState,
-    last_unsupported_pixfmt_at: &mut Option<Instant>,
-    counters: &DisplayStatsCounters,
-    vtx: &mpsc::Sender<VideoFrame>,
-    event_sender: &EventSender,
-    flow_id: &str,
-    output_id: &str,
-    frame_gen: &AtomicU64,
-    panel_hdr_capable: bool,
-    force_cpu_blit_for_bars: &AtomicBool,
-    prime_scanout_failed: &AtomicBool,
-    prime_cache_stale: &AtomicBool,
-    #[cfg(feature = "rga-transfer")] rga_transfer_active: &AtomicBool,
-    stream_ids: StreamIds,
-    video_decode_counters: &VideoDecodeStats,
-    output_stats: &OutputStatsAccumulator,
+    state: VideoAuState<'_>,
+    ctx: VideoAuCtx<'_>,
 ) {
+    // Destructured straight back into the original bindings so the body below
+    // is untouched by this refactor — the change is the signature, nothing else.
+    let VideoAuState {
+        last_video_pts,
+        keyframe_gate,
+        video_decoder,
+        current_video_codec,
+        aac_decoder,
+        ff_audio_decoder,
+        hw_open_state,
+        deint,
+        last_unsupported_pixfmt_at,
+    } = state;
+    let VideoAuCtx {
+        counters,
+        vtx,
+        event_sender,
+        flow_id,
+        output_id,
+        frame_gen,
+        panel_hdr_capable,
+        force_cpu_blit_for_bars,
+        prime_scanout_failed,
+        prime_cache_stale,
+        #[cfg(feature = "rga-transfer")]
+        rga_transfer_active,
+        stream_ids,
+        video_decode_counters,
+        output_stats,
+    } = ctx;
     if pts_jump(*last_video_pts, pts) {
         // Section 5: count + log every PTS jump so the operator can
         // tell whether the Reolink "degraded picture" is the
@@ -3032,8 +3086,7 @@ fn handle_video_au(
         && !hw_open_state.fell_back_to_cpu
         && !speculative_grace
         && counters.frames_received_since_open.load(Ordering::Relaxed) == 0
-    {
-        if let Some(first_send) = hw_open_state.first_send_after_open {
+        && let Some(first_send) = hw_open_state.first_send_after_open {
             let elapsed = first_send.elapsed();
             if elapsed >= std::time::Duration::from_millis(WATCHDOG_NO_FRAMES_MS) {
                 let backend = backend_name(hw_open_state.backend);
@@ -3066,7 +3119,6 @@ fn handle_video_au(
                 );
             }
         }
-    }
 }
 
 /// True when `pts` is far enough from `prev` that the upstream stream
@@ -4404,8 +4456,8 @@ fn display_loop(
 
         // Re-arm autodetect if the source resolution shifted (operator
         // switched from 1080p to 720p, etc).
-        if let Some((mw, mh)) = matched_dims {
-            if mw != next.width || mh != next.height {
+        if let Some((mw, mh)) = matched_dims
+            && (mw != next.width || mh != next.height) {
                 tracing::info!(
                     output_id = %output_id,
                     "display source resolution changed {mw}x{mh} → {}x{} — re-arming panel mode match",
@@ -4418,7 +4470,6 @@ fn display_loop(
                 fps_locked = false;
                 frames_since_period_reset = 0;
             }
-        }
         // A previous auto-match attempt failed — retry once the backoff
         // elapses (the failure was transient more often than not:
         // SETCRTC-vs-flip EBUSY, EDID probe flake).
@@ -5186,8 +5237,8 @@ fn blit_and_present(
     // (forced `hw_decode: vaapi`), and the legacy `set_crtc` path
     // can't compose multi-plane.
     if let Some(prime) = frame.prime.as_ref() {
-        if let (Some(snapshot), Some((dst_w, dst_h))) = (meter, kms.bars_overlay_dims()) {
-            if let Some(mut map) = kms.bars_overlay_buffer() {
+        if let (Some(snapshot), Some((dst_w, dst_h))) = (meter, kms.bars_overlay_dims())
+            && let Some(mut map) = kms.bars_overlay_buffer() {
                 let snap = snapshot.load();
                 let pitch = map.pitch() as usize;
                 crate::display::audio_bars::rasterise_overlay(
@@ -5206,7 +5257,6 @@ fn blit_and_present(
                     dst_h,
                 );
             }
-        }
         // HDR signalling on the prime path. When the source carries
         // PQ / HLG transfer AND the panel can do HDR (the decode
         // task only routes HDR sources here when both are true), set
@@ -5379,8 +5429,8 @@ fn blit_and_present(
     // double-rasterise above (bake-into-dumb + paint-overlay) means
     // the bars stay visible whichever plane the kernel ends up
     // scanning out.
-    if let Some(snapshot) = meter {
-        if let (Some((dst_w_ov, dst_h_ov)), Some(mut ov_map)) =
+    if let Some(snapshot) = meter
+        && let (Some((dst_w_ov, dst_h_ov)), Some(mut ov_map)) =
             (kms.bars_overlay_dims(), kms.bars_overlay_buffer())
         {
             let snap = snapshot.load();
@@ -5401,7 +5451,6 @@ fn blit_and_present(
                 dst_h_ov,
             );
         }
-    }
 
     // Atomic commit when available — keeps the bars overlay plane
     // programmed every frame. Falls back to legacy `page_flip`

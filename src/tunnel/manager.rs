@@ -309,8 +309,8 @@ impl TunnelManager {
             )
             .await;
 
-            if let Err(e) = result {
-                if !cancel.is_cancelled() {
+            if let Err(e) = result
+                && !cancel.is_cancelled() {
                     tracing::error!(tunnel_id = %config_id, "Relay tunnel failed: {e}");
                     event_sender.emit_flow_with_details(
                         EventSeverity::Critical,
@@ -322,7 +322,6 @@ impl TunnelManager {
                     // Remove from DashMap so manager re-push can re-create it
                     tunnels.remove(&config_id);
                 }
-            }
         });
 
         Ok(active_idx_rx)
@@ -508,8 +507,8 @@ impl TunnelManager {
             )
             .await;
 
-            if let Err(e) = result {
-                if !cancel.is_cancelled() {
+            if let Err(e) = result
+                && !cancel.is_cancelled() {
                     tracing::error!(tunnel_id = %config_id, "Native-UDP relay tunnel failed: {e}");
                     event_sender.emit_flow_with_details(
                         EventSeverity::Critical,
@@ -520,7 +519,6 @@ impl TunnelManager {
                     );
                     tunnels.remove(&config_id);
                 }
-            }
         });
 
         Ok(active_idx_rx)

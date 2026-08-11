@@ -563,8 +563,8 @@ impl TsAudioReplacer {
         // Output-side path: look the handle up through the per-output
         // accumulator. Same lookup as before — kept for backward compat
         // with output-side TS replacers.
-        if let Some(stats) = self.output_stats.as_ref() {
-            if let Some(h) = stats.audio_decode_stats_handle() {
+        if let Some(stats) = self.output_stats.as_ref()
+            && let Some(h) = stats.audio_decode_stats_handle() {
                 if !codec_label.is_empty() {
                     h.set_input_codec(codec_label);
                 }
@@ -572,7 +572,6 @@ impl TsAudioReplacer {
                     h.set_output_shape(self.resolved_sample_rate, self.resolved_channels);
                 }
             }
-        }
         // Input-side path: handle held directly. Skips the
         // accumulator-level indirection because ingress-side handles are
         // keyed by `input_id` and the replacer never sees the flow-stats
@@ -658,8 +657,8 @@ impl TsAudioReplacer {
             // source_stream_type on every PMT so input switches
             // between inputs with different audio codecs / PIDs are
             // handled seamlessly.
-            if let Some(pmt_pid) = self.pmt_pid {
-                if pid == pmt_pid && ts_pusi(pkt) {
+            if let Some(pmt_pid) = self.pmt_pid
+                && pid == pmt_pid && ts_pusi(pkt) {
                     if let Some((apid, ast)) = parse_pmt_audio(pkt, self.source_audio_pid_pin) {
                         // Operator pinned a specific PID but the PMT
                         // resolved to a different one — they got the
@@ -744,7 +743,6 @@ impl TsAudioReplacer {
                     }
                     continue;
                 }
-            }
 
             // Audio packets: route to the PES accumulator only when the
             // source codec is one we can actually decode. Anything else
@@ -785,8 +783,8 @@ impl TsAudioReplacer {
 
         #[cfg(feature = "media-codecs")]
         {
-            if let Some(ref mut enc) = self.av_encoder {
-                if let Ok(frames) = enc.flush() {
+            if let Some(ref mut enc) = self.av_encoder
+                && let Ok(frames) = enc.flush() {
                     let pid = match self.audio_pid {
                         Some(p) => p,
                         None => return,
@@ -803,7 +801,6 @@ impl TsAudioReplacer {
                             self.samples_since_anchor.saturating_add(ef.num_samples as u64);
                     }
                 }
-            }
         }
     }
 
@@ -1314,8 +1311,8 @@ impl TsAudioReplacer {
             self.av_sync_pacer.as_ref(),
             self.first_pes_master_27mhz,
             self.first_pes_src_pts_90k,
-        ) {
-            if self.resolved_sample_rate > 0 && pacer.is_locked() {
+        )
+            && self.resolved_sample_rate > 0 && pacer.is_locked() {
                 let master_now_27m = pacer.now_27mhz();
                 let master_elapsed_27m =
                     master_now_27m.wrapping_sub(first_master_27m) as i64;
@@ -1391,7 +1388,6 @@ impl TsAudioReplacer {
                     );
                 }
             }
-        }
 
         // ── Phase 1: decode every codec frame in this PES ──
         //
@@ -2107,11 +2103,10 @@ fn rewrite_pmt_audio_stream_type(
                 }
                 // AAC profile_and_level rewrite (tag 0x7C, AAC family
                 // descriptor — ETSI TS 101 154 Annex G).
-                if tag == 0x7C && dlen >= 1 {
-                    if let Some(pal) = new_aac_profile_and_level {
+                if tag == 0x7C && dlen >= 1
+                    && let Some(pal) = new_aac_profile_and_level {
                         pkt[dpos + 2] = pal;
                     }
-                }
                 // registration_descriptor (tag 0x05) — neutralise
                 // when the inherited format_identifier doesn't match
                 // the rewritten stream_type. Zeroing the body keeps

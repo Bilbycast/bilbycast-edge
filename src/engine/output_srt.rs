@@ -409,14 +409,13 @@ fn apply_srt_output_interface_bindings(config: &mut SrtOutputConfig) -> anyhow::
     )? {
         config.local_addr = Some(addr);
     }
-    if let Some(red) = config.redundancy.as_mut() {
-        if let Some(addr) = crate::util::socket::srt_local_addr_from_binding(
+    if let Some(red) = config.redundancy.as_mut()
+        && let Some(addr) = crate::util::socket::srt_local_addr_from_binding(
             red.interface_binding.as_ref(),
             red.local_addr.as_deref(),
         )? {
             red.local_addr = Some(addr);
         }
-    }
     if let Some(bonding) = config.bonding.as_mut() {
         for ep in bonding.endpoints.iter_mut() {
             if let Some(addr) = crate::util::socket::srt_local_addr_from_binding(
@@ -1177,13 +1176,12 @@ async fn srt_output_forward_loop(
     let mut send_queue_warned_at: Option<Instant> = None;
 
     let connection_lost = loop {
-        if let Some(ref db) = delay_buf {
-            if let Some(release_us) = db.next_release_time() {
+        if let Some(ref db) = delay_buf
+            && let Some(release_us) = db.next_release_time() {
                 let now = now_us();
                 let wait = release_us.saturating_sub(now);
                 delay_sleep.as_mut().reset(Instant::now() + Duration::from_micros(wait));
             }
-        }
 
         // Payloads to send via the SRT mpsc channel after the select.
         // Each entry carries (data, recv_time_us) for end-to-end latency tracking.
@@ -1217,8 +1215,8 @@ async fn srt_output_forward_loop(
                                 &mut logged_302m_decode_error,
                                 &decode_stats_302m,
                             );
-                            if !decode_stats_302m_registered {
-                                if let Some(dec) = aac_decoder_302m.as_ref() {
+                            if !decode_stats_302m_registered
+                                && let Some(dec) = aac_decoder_302m.as_ref() {
                                     stats.set_decode_stats(
                                         decode_stats_302m.clone(),
                                         dec.codec_name(),
@@ -1227,7 +1225,6 @@ async fn srt_output_forward_loop(
                                     );
                                     decode_stats_302m_registered = true;
                                 }
-                            }
                             if let Some(pipeline) = audio_302m.as_mut() {
                                 for datagram in pipeline.take_ready_datagrams() {
                                     match send_tx.try_send((datagram, packet.recv_time_us)) {
@@ -1729,13 +1726,12 @@ async fn srt_output_redundant_loop(
         // Packet forwarding loop — runs until both legs die or cancel
         let mut broadcast_closed = false;
         loop {
-            if let Some(ref db) = delay_buf {
-                if let Some(release_us) = db.next_release_time() {
+            if let Some(ref db) = delay_buf
+                && let Some(release_us) = db.next_release_time() {
                     let now = now_us();
                     let wait = release_us.saturating_sub(now);
                     delay_sleep.as_mut().reset(Instant::now() + Duration::from_micros(wait));
                 }
-            }
 
             let mut payloads_to_send: Vec<(Bytes, u64)> = Vec::new();
 

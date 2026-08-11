@@ -91,11 +91,10 @@ pub async fn bind_udp_input(
             .context("Failed to create UDP socket")?;
         socket.set_nonblocking(true)?;
         set_socket_buffers(&socket, DEFAULT_RECV_BUF_SIZE, DEFAULT_SEND_BUF_SIZE);
-        if let Some(r) = resolved.as_ref() {
-            if let Some(name) = r.name_for_strict.as_deref() {
+        if let Some(r) = resolved.as_ref()
+            && let Some(name) = r.name_for_strict.as_deref() {
                 apply_strict_binding(&socket, name)?;
             }
-        }
         socket
             .bind(&SockAddr::from(addr))
             .map_err(|e| crate::util::port_error::annotate_bind_error(e, addr, "UDP/RTP input"))?;
@@ -138,11 +137,10 @@ async fn bind_multicast_input(
     socket.set_reuse_port(true)?;
     socket.set_nonblocking(true)?;
     set_socket_buffers(&socket, DEFAULT_RECV_BUF_SIZE, DEFAULT_SEND_BUF_SIZE);
-    if let Some(r) = binding {
-        if let Some(name) = r.name_for_strict.as_deref() {
+    if let Some(r) = binding
+        && let Some(name) = r.name_for_strict.as_deref() {
             apply_strict_binding(&socket, name)?;
         }
-    }
 
     let wildcard: SocketAddr = match mcast_addr {
         SocketAddr::V4(v4) => SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), v4.port()),
@@ -288,11 +286,10 @@ pub async fn create_udp_output(
     socket.set_reuse_address(true)?;
     socket.set_nonblocking(true)?;
     set_socket_buffers(&socket, DEFAULT_RECV_BUF_SIZE, DEFAULT_SEND_BUF_SIZE);
-    if let Some(r) = resolved.as_ref() {
-        if let Some(name) = r.name_for_strict.as_deref() {
+    if let Some(r) = resolved.as_ref()
+        && let Some(name) = r.name_for_strict.as_deref() {
             apply_strict_binding(&socket, name)?;
         }
-    }
 
     socket
         .bind(&SockAddr::from(bind_to))

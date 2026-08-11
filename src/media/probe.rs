@@ -657,15 +657,14 @@ fn skip_profile_tier_level(br: &mut BitReader, max_sub_layers_minus1: u8) -> boo
         }
     }
     for i in 0..max_sub_layers_minus1 as usize {
-        if sub_layer_profile_present[i] == 1 {
-            if br.read_bits(32).is_none()
+        if sub_layer_profile_present[i] == 1
+            && (br.read_bits(32).is_none()
                 || br.read_bits(32).is_none()
                 || br.read_bits(16).is_none()
-                || br.read_bits(32).is_none()
+                || br.read_bits(32).is_none())
             {
                 return false;
             }
-        }
         if sub_layer_level_present[i] == 1 && br.read_bits(8).is_none() {
             return false;
         }

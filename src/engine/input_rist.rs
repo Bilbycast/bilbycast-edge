@@ -79,8 +79,8 @@ pub fn spawn_rist_input(
                     if let Some(ip) = r.ipv4_for_loose {
                         // Replace the host part of bind_addr if it's
                         // currently 0.0.0.0. Operator-specified IPs win.
-                        if let Ok(addr) = config.bind_addr.parse::<std::net::SocketAddr>() {
-                            if addr.ip().is_unspecified() {
+                        if let Ok(addr) = config.bind_addr.parse::<std::net::SocketAddr>()
+                            && addr.ip().is_unspecified() {
                                 let new_bind = format!("{ip}:{}", addr.port());
                                 tracing::info!(
                                     "RIST input '{}': interface_binding {} → bind_addr {}",
@@ -88,7 +88,6 @@ pub fn spawn_rist_input(
                                 );
                                 config.bind_addr = new_bind;
                             }
-                        }
                     }
                 }
                 Ok(None) => {}

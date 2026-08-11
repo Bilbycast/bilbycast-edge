@@ -474,13 +474,12 @@ async fn udp_output_loop(
     let mut packets_to_send: Vec<RtpPacket> = Vec::with_capacity(4);
 
     loop {
-        if let Some(ref db) = delay_buf {
-            if let Some(release_us) = db.next_release_time() {
+        if let Some(ref db) = delay_buf
+            && let Some(release_us) = db.next_release_time() {
                 let now = now_us();
                 let wait = release_us.saturating_sub(now);
                 delay_sleep.as_mut().reset(Instant::now() + Duration::from_micros(wait));
             }
-        }
 
         packets_to_send.clear();
 

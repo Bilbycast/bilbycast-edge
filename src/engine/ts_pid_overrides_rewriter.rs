@@ -272,12 +272,11 @@ impl TsPidOverridesRewriter {
                 }
             });
             entry.source_pmt_pid = source_pmt_pid;
-            if let Some(o) = self.overrides.get(&program_number) {
-                if let Some(target_pmt) = o.pmt_pid {
+            if let Some(o) = self.overrides.get(&program_number)
+                && let Some(target_pmt) = o.pmt_pid {
                     self.pid_remap_table[(source_pmt_pid & 0x1FFF) as usize] = target_pmt;
                     self.has_any_remap = true;
                 }
-            }
         }
     }
 
@@ -388,11 +387,10 @@ impl TsPidOverridesRewriter {
                 }
             }
         }
-        if let (Some(src), Some(target)) = (first_audio, o.audio_pid) {
-            if !audio_remap.contains_key(&src) && !claimed_targets.contains(&target) {
+        if let (Some(src), Some(target)) = (first_audio, o.audio_pid)
+            && !audio_remap.contains_key(&src) && !claimed_targets.contains(&target) {
                 audio_remap.insert(src, target);
             }
-        }
         state.audio_remap = audio_remap;
 
         // Seed the per-PID remap table.
@@ -588,15 +586,13 @@ fn rewrite_pat(pkt: &[u8], overrides: &TsPidOverridesMap) -> Option<Vec<u8>> {
     let mut changed = false;
     while pos + 4 <= data_end {
         let program_number = ((buf[pos] as u16) << 8) | (buf[pos + 1] as u16);
-        if program_number != 0 {
-            if let Some(o) = overrides.get(&program_number) {
-                if let Some(new_pmt) = o.pmt_pid {
+        if program_number != 0
+            && let Some(o) = overrides.get(&program_number)
+                && let Some(new_pmt) = o.pmt_pid {
                     buf[pos + 2] = (buf[pos + 2] & 0xE0) | (((new_pmt >> 8) as u8) & 0x1F);
                     buf[pos + 3] = (new_pmt & 0xFF) as u8;
                     changed = true;
                 }
-            }
-        }
         pos += 4;
     }
     if changed {
@@ -670,9 +666,8 @@ fn rewrite_pmt(
         Some(p)
     } else if let Some(s) = state {
         s.source_pcr_pid.map(|src| {
-            if let Some((vsrc, vdst)) = video_remap {
-                if src == vsrc { return vdst; }
-            }
+            if let Some((vsrc, vdst)) = video_remap
+                && src == vsrc { return vdst; }
             if let Some(&adst) = audio_remap.get(&src) {
                 return adst;
             }
@@ -694,13 +689,12 @@ fn rewrite_pmt(
     while pos + 5 <= data_end {
         let es_pid = ((buf[pos + 1] as u16 & 0x1F) << 8) | buf[pos + 2] as u16;
         let es_info_len = (((buf[pos + 3] & 0x0F) as usize) << 8) | (buf[pos + 4] as usize);
-        if let Some((src, dst)) = video_remap {
-            if es_pid == src {
+        if let Some((src, dst)) = video_remap
+            && es_pid == src {
                 buf[pos + 1] = (buf[pos + 1] & 0xE0) | (((dst >> 8) as u8) & 0x1F);
                 buf[pos + 2] = (dst & 0xFF) as u8;
                 changed = true;
             }
-        }
         if let Some(&dst) = audio_remap.get(&es_pid) {
             buf[pos + 1] = (buf[pos + 1] & 0xE0) | (((dst >> 8) as u8) & 0x1F);
             buf[pos + 2] = (dst & 0xFF) as u8;

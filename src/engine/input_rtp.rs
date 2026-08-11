@@ -345,12 +345,11 @@ async fn rtp_input_loop(
                         let data = &buf[..len];
 
                         // ── C5: Source IP filter ──
-                        if let Some(ref allowed) = source_filter {
-                            if !allowed.contains(&src.ip()) {
+                        if let Some(ref allowed) = source_filter
+                            && !allowed.contains(&src.ip()) {
                                 stats.input_filtered.fetch_add(1, Ordering::Relaxed);
                                 continue;
                             }
-                        }
 
                         // ── FEC repair packet (SMPTE 2022-1, bilbycast framing) ──
                         // Route to the decoder before the RTP-shape check so the
@@ -381,12 +380,11 @@ async fn rtp_input_loop(
                         }
 
                         // ── C7: Rate limit ──
-                        if let Some(ref mut limiter) = rate_limiter {
-                            if !limiter.try_consume(len) {
+                        if let Some(ref mut limiter) = rate_limiter
+                            && !limiter.try_consume(len) {
                                 stats.input_filtered.fetch_add(1, Ordering::Relaxed);
                                 continue;
                             }
-                        }
 
                         let seq = parse_rtp_sequence_number(data).unwrap_or(0);
                         let ts = parse_rtp_timestamp(data).unwrap_or(0);
@@ -820,12 +818,11 @@ fn process_redundant_rtp_packet(
     post: &mut Option<InputPostProcess>,
 ) {
     // C5: Source IP filter
-    if let Some(allowed) = source_filter {
-        if !allowed.contains(&src_ip) {
+    if let Some(allowed) = source_filter
+        && !allowed.contains(&src_ip) {
             stats.input_filtered.fetch_add(1, Ordering::Relaxed);
             return;
         }
-    }
 
     // FEC repair packet on this leg. Recovery feeds straight through the
     // merger like any other media packet so 2022-7 dedup still applies.
@@ -857,12 +854,11 @@ fn process_redundant_rtp_packet(
     }
 
     // C7: Rate limit
-    if let Some(limiter) = rate_limiter {
-        if !limiter.try_consume(data.len()) {
+    if let Some(limiter) = rate_limiter
+        && !limiter.try_consume(data.len()) {
             stats.input_filtered.fetch_add(1, Ordering::Relaxed);
             return;
         }
-    }
 
     let seq = parse_rtp_sequence_number(data).unwrap_or(0);
     let ts = parse_rtp_timestamp(data).unwrap_or(0);

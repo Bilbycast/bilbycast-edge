@@ -113,8 +113,8 @@ impl AvInterleaveSampler {
                 state.last_pat_version = Some(version);
             }
             let programs = ts_parse::parse_pat_programs(pkt);
-            if let Some(&(_, pmt_pid)) = programs.first() {
-                if state.pmt_pid != Some(pmt_pid) {
+            if let Some(&(_, pmt_pid)) = programs.first()
+                && state.pmt_pid != Some(pmt_pid) {
                     state.pmt_pid = Some(pmt_pid);
                     // PMT PID changed — reset downstream state
                     state.video_pid = None;
@@ -123,13 +123,12 @@ impl AvInterleaveSampler {
                     state.last_video_pts_90k = None;
                     state.last_audio_pts_90k = None;
                 }
-            }
             return;
         }
 
         // PMT — learn video/audio PIDs
-        if let Some(pmt_pid) = state.pmt_pid {
-            if pid == pmt_pid && ts_parse::ts_pusi(pkt) {
+        if let Some(pmt_pid) = state.pmt_pid
+            && pid == pmt_pid && ts_parse::ts_pusi(pkt) {
                 if let Some(version) = psi_version(pkt) {
                     if state.last_pmt_version == Some(version) {
                         return;
@@ -185,28 +184,24 @@ impl AvInterleaveSampler {
                 }
                 return;
             }
-        }
 
         // Video PES PTS
-        if let Some(vpid) = state.video_pid {
-            if pid == vpid && ts_parse::ts_pusi(pkt) {
+        if let Some(vpid) = state.video_pid
+            && pid == vpid && ts_parse::ts_pusi(pkt) {
                 if let Some(pts) = ts_parse::extract_pes_pts(pkt) {
                     state.last_video_pts_90k = Some(pts);
                     try_record_drift(&mut state);
                 }
                 return;
             }
-        }
 
         // Audio PES PTS
-        if let Some(apid) = state.audio_pid {
-            if pid == apid && ts_parse::ts_pusi(pkt) {
-                if let Some(pts) = ts_parse::extract_pes_pts(pkt) {
+        if let Some(apid) = state.audio_pid
+            && pid == apid && ts_parse::ts_pusi(pkt)
+                && let Some(pts) = ts_parse::extract_pes_pts(pkt) {
                     state.last_audio_pts_90k = Some(pts);
                     try_record_drift(&mut state);
                 }
-            }
-        }
     }
 
     pub fn snapshot(&self) -> Option<AvInterleaveStats> {

@@ -51,23 +51,21 @@ pub struct SetOutputActiveRequest {
 /// Register a WHIP input channel with the WebRTC session registry (if applicable).
 #[cfg(feature = "webrtc")]
 fn register_whip_if_needed(state: &AppState, runtime: &crate::engine::flow::FlowRuntime) {
-    if let Some((tx, bearer_token)) = &runtime.whip_session_tx {
-        if let Some(ref registry) = state.webrtc_sessions {
+    if let Some((tx, bearer_token)) = &runtime.whip_session_tx
+        && let Some(ref registry) = state.webrtc_sessions {
             registry.register_whip_input(&runtime.config.config.id, tx.clone(), bearer_token.clone());
             tracing::info!("Registered WHIP input for flow '{}'", runtime.config.config.id);
         }
-    }
 }
 
 /// Register a WHEP output channel with the WebRTC session registry (if applicable).
 #[cfg(feature = "webrtc")]
 fn register_whep_if_needed(state: &AppState, runtime: &crate::engine::flow::FlowRuntime) {
-    if let Some((tx, bearer_token)) = &runtime.whep_session_tx {
-        if let Some(ref registry) = state.webrtc_sessions {
+    if let Some((tx, bearer_token)) = &runtime.whep_session_tx
+        && let Some(ref registry) = state.webrtc_sessions {
             registry.register_whep_output(&runtime.config.config.id, tx.clone(), bearer_token.clone());
             tracing::info!("Registered WHEP output for flow '{}'", runtime.config.config.id);
         }
-    }
 }
 
 /// Resolve a flow's references against the config and return a `ResolvedFlow`.
@@ -394,12 +392,11 @@ pub async fn update_flow_assembly(
     )
     .map_err(|e| ApiError::BadRequest(format!("Invalid assembly: {e}")))?;
 
-    if let Some(cur) = runtime.current_assembly().await {
-        if cur == new_assembly {
+    if let Some(cur) = runtime.current_assembly().await
+        && cur == new_assembly {
             tracing::info!("update_flow_assembly '{flow_id}': no-op (unchanged)");
             return Ok(Json(ApiResponse::ok(())));
         }
-    }
 
     runtime
         .replace_assembly(new_assembly.clone(), None)
@@ -540,11 +537,10 @@ pub async fn add_output(
     drop(config);
 
     // Hot-add output to running flow
-    if state.flow_manager.is_running(&flow_id) {
-        if let Err(e) = state.flow_manager.add_output(&flow_id, output).await {
+    if state.flow_manager.is_running(&flow_id)
+        && let Err(e) = state.flow_manager.add_output(&flow_id, output).await {
             tracing::warn!("Output '{output_id}' assigned but failed to hot-add: {e}");
         }
-    }
 
     tracing::info!("Assigned output '{}' to flow '{}'", output_id, flow_id);
     Ok(Json(ApiResponse::ok(())))
@@ -824,14 +820,13 @@ pub async fn set_output_active(
         .map_err(|e| ApiError::Internal(e.to_string()))?;
     drop(config);
     // Apply the toggle at runtime if the flow is running.
-    if let Some(flow_id) = owning_flow_id {
-        if state.flow_manager.is_running(&flow_id) {
+    if let Some(flow_id) = owning_flow_id
+        && state.flow_manager.is_running(&flow_id) {
             state
                 .flow_manager
                 .set_output_active(&flow_id, &output_id, req.active)
                 .await
                 .map_err(|e| ApiError::Internal(e.to_string()))?;
         }
-    }
     Ok(Json(ApiResponse::ok(())))
 }

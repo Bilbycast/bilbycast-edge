@@ -347,11 +347,10 @@ pub fn derive_bars(sig: &CellularSignal) -> Option<u8> {
     }
     // RSSI only counts when there's no RSRP (LTE/NR RSSI is noisy / less useful
     // than RSRP, but on 2G/3G it's all we have).
-    if sig.rsrp_dbm.is_none() {
-        if let Some(v) = sig.rssi_dbm {
+    if sig.rsrp_dbm.is_none()
+        && let Some(v) = sig.rssi_dbm {
             fold(rssi_bars(v));
         }
-    }
     bars
 }
 
@@ -538,11 +537,10 @@ pub async fn request_wake(iface: &str, apn: Option<&str>) -> Result<WakeOutcome,
     // so a heartbeat write never clobbers our response before we read it.
     let deadline = tokio::time::Instant::now() + WAKE_CONFIRM_TIMEOUT;
     loop {
-        if let Some((sn, state, detail, addr)) = read_wake_status() {
-            if sn == nonce && (state == "connected" || state == "failed") {
+        if let Some((sn, state, detail, addr)) = read_wake_status()
+            && sn == nonce && (state == "connected" || state == "failed") {
                 return Ok(WakeOutcome { state, detail, addr });
             }
-        }
         if tokio::time::Instant::now() >= deadline {
             break;
         }

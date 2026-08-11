@@ -560,11 +560,10 @@ async fn node_monitor_loop(
         // 2) Grandmaster change.
         if slaved {
             if let Some(gm) = state.grandmaster_id {
-                if let Some(prev) = st.last_gm_id {
-                    if prev != gm {
+                if let Some(prev) = st.last_gm_id
+                    && prev != gm {
                         emit_gm_change(&events, prev, gm, domain);
                     }
-                }
                 st.last_gm_id = Some(gm);
             }
         } else {
@@ -826,12 +825,10 @@ fn poll_once(config: &PtpReporterConfig) -> Result<PtpState, PtpPollError> {
             let mut buf3 = [0u8; 1500];
             if let Ok((_, data)) =
                 recv_management_response(&sock, &mut buf3, MANAGEMENT_ID_PORT_DATA_SET)
-            {
-                if data.len() > 10 {
+                && data.len() > 10 {
                     found = Some(data[10]);
                     break;
                 }
-            }
         }
         found
     };

@@ -129,11 +129,10 @@ impl MdiSampler {
         // no packets arrived the window silently extends, which is fine —
         // we want NDF to keep reflecting reality, not reset to zero because
         // the publish cadence fired.
-        if let Some(last) = self.current.last_packet_us {
-            if last.saturating_sub(self.current.start_us) >= self.window_len_us {
+        if let Some(last) = self.current.last_packet_us
+            && last.saturating_sub(self.current.start_us) >= self.window_len_us {
                 self.roll_window(last);
             }
-        }
     }
 
     fn roll_window(&mut self, now_us: u64) {

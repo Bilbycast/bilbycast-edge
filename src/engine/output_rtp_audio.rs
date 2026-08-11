@@ -227,8 +227,8 @@ async fn run_rtp_audio_302m_output(
                             // accumulator so the manager UI can see decode
                             // activity. Done lazily because we need the
                             // decoder's sample rate / channel count.
-                            if !decode_stats_registered {
-                                if let Some(dec) = aac_decoder.as_ref() {
+                            if !decode_stats_registered
+                                && let Some(dec) = aac_decoder.as_ref() {
                                     stats.set_decode_stats(
                                         decode_stats.clone(),
                                         dec.codec_name(),
@@ -237,7 +237,6 @@ async fn run_rtp_audio_302m_output(
                                     );
                                     decode_stats_registered = true;
                                 }
-                            }
                         } else if let Some(p) = pipeline.as_mut() {
                             p.process(&packet);
                         }

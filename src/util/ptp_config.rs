@@ -199,11 +199,10 @@ impl PtpSettings {
         // WS + the REST mirror) call this before validate + save, so a stale
         // grandmaster priority1 carried into slave-only never reaches ptp4l.
         self.priority1 = self.effective_priority1();
-        if let Some(t) = self.scan_timeout {
-            if !(1..=60).contains(&t) {
+        if let Some(t) = self.scan_timeout
+            && !(1..=60).contains(&t) {
                 self.scan_timeout = Some(t.clamp(1, 60));
             }
-        }
         // Treat an explicit 0 as "disabled" so the on-disk `= 0` form and an
         // empty value mean the same thing.
         if self.offset_warn_ns == Some(0) {
@@ -240,24 +239,22 @@ impl PtpSettings {
                 ));
             }
         }
-        if let Some(t) = self.scan_timeout {
-            if !(1..=60).contains(&t) {
+        if let Some(t) = self.scan_timeout
+            && !(1..=60).contains(&t) {
                 return Err(format!(
                     "scan_timeout {t}s out of range (1..=60)"
                 ));
             }
-        }
         // Monitoring thresholds are absolute-nanosecond bounds — must be
         // non-negative and within a sane ceiling (1 s).
         for (name, v) in [
             ("offset_warn_ns", self.offset_warn_ns),
             ("path_delay_warn_ns", self.path_delay_warn_ns),
         ] {
-            if let Some(v) = v {
-                if !(0..=1_000_000_000).contains(&v) {
+            if let Some(v) = v
+                && !(0..=1_000_000_000).contains(&v) {
                     return Err(format!("{name} {v} out of range (0..=1_000_000_000 ns)"));
                 }
-            }
         }
         Ok(())
     }
@@ -304,11 +301,10 @@ pub fn config_path() -> PathBuf {
         return PathBuf::from(p);
     }
     let default = PathBuf::from(DEFAULT_CONF_PATH);
-    if let Some(parent) = default.parent() {
-        if parent.exists() && is_dir_writable(parent) {
+    if let Some(parent) = default.parent()
+        && parent.exists() && is_dir_writable(parent) {
             return default;
         }
-    }
     if let Ok(xdg) = std::env::var("XDG_DATA_HOME") {
         return PathBuf::from(xdg).join("bilbycast/ptp.conf");
     }

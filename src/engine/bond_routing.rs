@@ -256,8 +256,7 @@ impl BondRouteManager {
             .add(if_index, source.addr, source.prefix)
             .execute()
             .await
-        {
-            if !is_exists(&e) {
+            && !is_exists(&e) {
                 self.alloc.lock().await.free(slot);
                 return Err(anyhow!(
                     "bond gateway routing: add address {}/{} dev {interface}: {e}",
@@ -265,7 +264,6 @@ impl BondRouteManager {
                     source.prefix
                 ));
             }
-        }
 
         // 2. default route via the gateway in our private table.
         if let Err(e) = self

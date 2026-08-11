@@ -378,8 +378,8 @@ async fn run(
     // `Next` works and natural EOS / loop / Next all commit through one path.
     // Otherwise fall straight through to the legacy sequential loop below,
     // which is left byte-for-byte unchanged (the rollback guarantee).
-    if controller::controller_enabled(config.operator_control) {
-        if let Some(cmd_rx) = cmd_rx {
+    if controller::controller_enabled(config.operator_control)
+        && let Some(cmd_rx) = cmd_rx {
             run_controlled(
                 &config, &per_input_tx, &stats, &cancel, &events, &flow_id, &input_id,
                 &mut seq_num, &mut cont, &mut transcoder, &mut post, &mut demux_cache,
@@ -388,7 +388,6 @@ async fn run(
             .await;
             return;
         }
-    }
 
     loop {
         let mut order: Vec<usize> = (0..config.sources.len()).collect();
@@ -1317,15 +1316,14 @@ async fn play_ts_file(
     // duration regardless of program down-selection). VBR makes this
     // approximate; it's a progress hint, not a seek index. `None`/0 leaves the
     // duration unknown → the UI shows an indeterminate "live" head.
-    if let (Some(total_bps), Ok(meta)) = (head_bitrate_raw, tokio::fs::metadata(path).await) {
-        if total_bps > 0 && meta.len() > 0 {
+    if let (Some(total_bps), Ok(meta)) = (head_bitrate_raw, tokio::fs::metadata(path).await)
+        && total_bps > 0 && meta.len() > 0 {
             let dur_ms = (meta.len() as u128 * 8 * 1000 / total_bps as u128) as u64;
             session
                 .media_stats
                 .current_source_duration_ms
                 .store(dur_ms, Ordering::Relaxed);
         }
-    }
     drop(head);
     file.seek(std::io::SeekFrom::Start(0))
         .await
@@ -1591,12 +1589,11 @@ async fn play_ts_file(
         // rewriting only — fine for the brief lead-in before the first
         // PCR-bearing packet (typically arrives within the first few
         // packets of every well-formed TS file).
-        if splice_offset_27m.is_none() {
-            if let Some(pcr) = raw_pcr {
+        if splice_offset_27m.is_none()
+            && let Some(pcr) = raw_pcr {
                 splice_offset_27m =
                     Some((target_pts_90k as i128 * 300 - pcr as i128) as i64);
             }
-        }
 
         if let Some(pcr) = raw_pcr {
             // Windowed bitrate estimation. The window re-anchors every
@@ -1698,11 +1695,10 @@ async fn play_ts_file(
             if let Some((_, pmt_pid)) = programs.first() {
                 pat_first_pmt_pid = Some(*pmt_pid);
             }
-        } else if let Some(pmt_pid) = pat_first_pmt_pid {
-            if pkt_pid == pmt_pid && pkt_pusi {
+        } else if let Some(pmt_pid) = pat_first_pmt_pid
+            && pkt_pid == pmt_pid && pkt_pusi {
                 refresh_audio_pids_from_pmt(&packet, &mut audio_pids);
             }
-        }
 
         // ── Smooth-splice rewriters (in place, no allocation) ──────────
         rewrite_cc(&mut packet, session.cont);
@@ -1721,14 +1717,13 @@ async fn play_ts_file(
             // cross-PID max would push the next loop's target forward
             // by the inter-PID clock skew (often seconds), corrupting
             // smooth-splice arithmetic.
-            if anchor_pcr_pid == Some(pcr_pid_early) {
-                if let Some(out_pcr_27m) = extract_pcr_27mhz(&packet) {
+            if anchor_pcr_pid == Some(pcr_pid_early)
+                && let Some(out_pcr_27m) = extract_pcr_27mhz(&packet) {
                     let out_pcr_90k = (out_pcr_27m / 300) & 0x1_FFFF_FFFF;
                     if out_pcr_90k > max_emitted_pcr_90k {
                         max_emitted_pcr_90k = out_pcr_90k;
                     }
                 }
-            }
             let off_90k = off_27m / 300;
             // Track the high-water-mark emitted PTS overall *and* on
             // audio PIDs separately. `close_file` prefers the audio

@@ -135,19 +135,17 @@ impl TsAvRealigner {
             let pid = ts_pid(pkt);
 
             // ── PID discovery ──
-            if pid == 0 && ts_pusi(pkt) {
-                if let Some((_, pmt)) = parse_pat_programs(pkt).into_iter().next() {
+            if pid == 0 && ts_pusi(pkt)
+                && let Some((_, pmt)) = parse_pat_programs(pkt).into_iter().next() {
                     self.pmt_pid = Some(pmt);
                 }
-            }
-            if Some(pid) == self.pmt_pid {
-                if let Ok(arr) = <&[u8; TS_PACKET]>::try_from(pkt) {
+            if Some(pid) == self.pmt_pid
+                && let Ok(arr) = <&[u8; TS_PACKET]>::try_from(pkt) {
                     crate::engine::input_media_player::refresh_audio_pids_from_pmt(
                         arr,
                         &mut self.audio_pids,
                     );
                 }
-            }
             // The PCR PID is the video PID (transcoder forces PCR→video).
             if let Some(pcr_27) = extract_pcr(pkt) {
                 self.video_pid = Some(pid);
@@ -159,12 +157,11 @@ impl TsAvRealigner {
             let is_audio = self.audio_pids.contains(&pid);
 
             if is_video {
-                if ts_pusi(pkt) {
-                    if let Some(pts) = extract_pes_pts(pkt) {
+                if ts_pusi(pkt)
+                    && let Some(pts) = extract_pes_pts(pkt) {
                         self.latest_video_pts = pts;
                         self.have_video_pts = true;
                     }
-                }
                 output.extend_from_slice(pkt);
                 // Drain INTERLEAVED right after each video frame — NOT batched
                 // at chunk end. The HW encoder emits video in bursts (several
@@ -179,13 +176,12 @@ impl TsAvRealigner {
                 // audio-vs-PCR / "ever late" to a healthy positive lead.)
                 self.drain(output, false);
             } else if is_audio {
-                if ts_pusi(pkt) {
-                    if let Some(pts) = extract_pes_pts(pkt) {
+                if ts_pusi(pkt)
+                    && let Some(pts) = extract_pes_pts(pkt) {
                         self.cur_pes_pts.insert(pid, pts);
                         self.latest_audio_pts = pts;
                         self.have_audio_pts = true;
                     }
-                }
                 let tag = self.cur_pes_pts.get(&pid).copied().unwrap_or(0);
                 let mut b = [0u8; TS_PACKET];
                 b.copy_from_slice(pkt);

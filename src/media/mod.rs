@@ -586,8 +586,8 @@ impl MediaLibrary {
             .programs
             .iter()
             .find_map(|p| p.pcr_pid);
-        if let Some(pcr_pid) = pcr_pid {
-            if let Some((stride, start)) = head_stride {
+        if let Some(pcr_pid) = pcr_pid
+            && let Some((stride, start)) = head_stride {
                 let first_pcr = probe::find_first_pcr(&head, stride, start, pcr_pid);
                 if let Some(first_pcr) = first_pcr {
                     let tail_window = TAIL_PROBE_BYTES.min(file_size as usize) as u64;
@@ -603,8 +603,7 @@ impl MediaLibrary {
                                 tail.truncate(tn);
                                 if let Some((tail_stride, tail_start)) =
                                     detect_ts_stride(&tail)
-                                {
-                                    if let Some(last_pcr) = probe::find_last_pcr(
+                                    && let Some(last_pcr) = probe::find_last_pcr(
                                         &tail,
                                         tail_stride,
                                         tail_start,
@@ -628,13 +627,11 @@ impl MediaLibrary {
                                             }
                                         }
                                     }
-                                }
                             }
                         }
                     }
                 }
             }
-        }
 
         // Per-program / per-stream bitrate split. Only meaningful once a
         // whole-mux rate is known; each PID gets its share of the counted
@@ -679,11 +676,9 @@ impl MediaLibrary {
         })
         .await
         .map_err(|e| anyhow!("manifest cache load join: {e}"))?
-        {
-            if cached.is_fresh_for(size, mtime_ms) {
+            && cached.is_fresh_for(size, mtime_ms) {
                 return Ok(Some(cached));
             }
-        }
 
         // Miss / stale: probe and persist. Probing is blocking (parses the
         // MP4 moov / image header), so it runs off the async runtime.

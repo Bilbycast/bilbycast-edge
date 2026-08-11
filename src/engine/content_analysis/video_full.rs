@@ -229,8 +229,8 @@ impl VideoFullState {
                 if self.freeze_since.is_none() {
                     self.freeze_since = Some(now);
                 }
-                if let Some(since) = self.freeze_since {
-                    if now.duration_since(since) >= FREEZE_DEBOUNCE && !self.freeze_active {
+                if let Some(since) = self.freeze_since
+                    && now.duration_since(since) >= FREEZE_DEBOUNCE && !self.freeze_active {
                         self.freeze_active = true;
                         let fire = self.last_freeze_event_at
                             .is_none_or(|t| t.elapsed() >= EVENT_RATELIMIT);
@@ -255,7 +255,6 @@ impl VideoFullState {
                             self.last_freeze_event_at = Some(now);
                         }
                     }
-                }
             } else {
                 self.freeze_since = None;
                 self.freeze_active = false;

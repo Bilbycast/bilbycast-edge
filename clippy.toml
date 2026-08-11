@@ -1,0 +1,16 @@
+# Clippy's default `too_many_arguments` threshold is 7, which is aggressive for
+# systems code: an engine spawn function routinely takes a config, a broadcast
+# sender, a stats accumulator, a cancellation token and three or four protocol
+# parameters before it has done anything unusual. 68 of the 89 findings at the
+# default sat at exactly 8 or 9 arguments, all of that shape.
+#
+# 10 is where the count stops describing "this function takes its dependencies"
+# and starts describing a function that is doing too much. Everything that
+# exceeded 10 was refactored into parameter structs rather than allowed — see
+# `VideoAuState` / `VideoAuCtx` in engine::output_display for the pattern:
+# bundle by lifetime and mutability (long-lived &mut pipeline state vs. fixed
+# per-output context), then destructure at the top so the body is unchanged.
+#
+# This is a calibration of a heuristic, not a suppression: the lint is still on,
+# still `-D warnings`, and still fires on genuinely overloaded functions.
+too-many-arguments-threshold = 10

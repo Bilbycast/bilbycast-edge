@@ -670,14 +670,13 @@ pub fn resolve_transcode(
                 .map(|row| row.iter().map(|&ch| (ch, 1.0_f32)).collect())
                 .collect(),
         );
-        if let Some(max) = mat.max_input_channel() {
-            if max >= input.channels {
+        if let Some(max) = mat.max_input_channel()
+            && max >= input.channels {
                 return Err(format!(
                     "transcode.channel_map references input channel {max} but input has only {} channels",
                     input.channels
                 ));
             }
-        }
         mat
     } else if let Some(map) = json.channel_map_with_gain.as_ref() {
         // Per-channel gain matrix: each entry is [channel_index, gain].
@@ -710,14 +709,13 @@ pub fn resolve_transcode(
                 })
                 .collect(),
         );
-        if let Some(max) = mat.max_input_channel() {
-            if max >= input.channels {
+        if let Some(max) = mat.max_input_channel()
+            && max >= input.channels {
                 return Err(format!(
                     "transcode.channel_map_with_gain references input channel {max} but input has only {} channels",
                     input.channels
                 ));
             }
-        }
         mat
     } else if let Some(preset) = json.channel_map_preset.as_deref() {
         let mat = expand_preset(preset, input.channels)?;

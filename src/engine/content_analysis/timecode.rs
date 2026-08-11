@@ -257,8 +257,8 @@ impl TimecodeTracker {
 
             // Monotonic check: allow equal (same-frame duplication) and
             // +N forward; any backwards step counts as non-monotonic.
-            if let Some(prev) = self.last_total_frames {
-                if total_frames + 5 < prev {
+            if let Some(prev) = self.last_total_frames
+                && total_frames + 5 < prev {
                     // large backward step — either wraparound at
                     // 24h or a genuine glitch. Count as non-monotonic
                     // only if it's not a ~24h wrap.
@@ -268,7 +268,6 @@ impl TimecodeTracker {
                         self.non_monotonic_count += 1;
                     }
                 }
-            }
             self.seen = true;
             self.last = Some(tc);
             self.last_total_frames = Some(total_frames);

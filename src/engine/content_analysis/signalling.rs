@@ -591,11 +591,10 @@ fn skip_profile_tier_level(br: &mut BitReader, max_sub_layers_minus1: u8) -> boo
                 return false;
             }
         }
-        if sub_layer_level_present[i] == 1 {
-            if br.read_bits(8).is_none() {
+        if sub_layer_level_present[i] == 1
+            && br.read_bits(8).is_none() {
                 return false;
             }
-        }
     }
     true
 }

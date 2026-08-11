@@ -180,11 +180,10 @@ async fn encode_loop(
     };
 
     let mut ts_mux = TsMuxer::new();
-    if let Some(po) = session.pid_overrides {
-        if let Some(entry) = po.get(&1) {
+    if let Some(po) = session.pid_overrides
+        && let Some(entry) = po.get(&1) {
                 ts_mux.set_pids(entry.pmt_pid, entry.video_pid, entry.audio_pid, entry.pcr_pid);
             }
-    }
     ts_mux.set_has_video(true);
     ts_mux.set_video_stream_type(STREAM_TYPE_H264);
     let has_audio = audio_state.is_some();
@@ -244,11 +243,10 @@ async fn encode_loop(
     let play_until = duration_secs.map(|d| start + Duration::from_secs(d as u64));
 
     loop {
-        if let Some(deadline) = play_until {
-            if Instant::now() >= deadline {
+        if let Some(deadline) = play_until
+            && Instant::now() >= deadline {
                 break;
             }
-        }
         tokio::select! {
             _ = session.cancel.cancelled() => break,
             _ = ticker.tick() => {}

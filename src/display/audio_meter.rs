@@ -310,11 +310,10 @@ impl MeterState {
             } else {
                 Some(stream_type)
             };
-            if let Some(st) = effective_type {
-                if is_audio_stream_type(st) {
+            if let Some(st) = effective_type
+                && is_audio_stream_type(st) {
                     discovered.insert(es_pid, st);
                 }
-            }
             i += 5 + es_info_length;
         }
         for (pid, stype) in discovered.iter() {

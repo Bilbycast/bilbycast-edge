@@ -646,11 +646,10 @@ impl S302mOutputPipeline {
         let transcode = TranscodeStage::new(input, cfg, matrix, stats, 0xCAFE_BABE, 0, 0);
         let packetizer = S302mPacketizer::new(out_channels, out_bit_depth)?;
         let mut ts_mux = TsMuxer::new();
-        if let Some(po) = pid_overrides {
-            if let Some(entry) = po.get(&1) {
+        if let Some(po) = pid_overrides
+            && let Some(entry) = po.get(&1) {
                 ts_mux.set_pids(entry.pmt_pid, entry.video_pid, entry.audio_pid, entry.pcr_pid);
             }
-        }
         ts_mux.set_has_video(false);
         ts_mux.set_has_audio(true);
         ts_mux.set_audio_stream(STREAM_TYPE_S302M, Some(BSSD_FORMAT_ID));

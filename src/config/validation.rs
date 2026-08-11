@@ -135,11 +135,10 @@ pub fn validate_config(config: &AppConfig) -> Result<()> {
     }
 
     // Validate device name if present
-    if let Some(ref name) = config.device_name {
-        if name.len() > 256 {
+    if let Some(ref name) = config.device_name
+        && name.len() > 256 {
             bail!("Device name must be at most 256 characters");
         }
-    }
 
     // Validate NMOS registration-client config if present
     if let Some(ref nr) = config.nmos_registration {
@@ -152,8 +151,8 @@ pub fn validate_config(config: &AppConfig) -> Result<()> {
     }
 
     // Validate manager config if present
-    if let Some(ref mgr) = config.manager {
-        if mgr.enabled {
+    if let Some(ref mgr) = config.manager
+        && mgr.enabled {
             if mgr.urls.is_empty() {
                 bail!(
                     "Manager urls[] cannot be empty when manager is enabled. \
@@ -185,13 +184,11 @@ pub fn validate_config(config: &AppConfig) -> Result<()> {
                     bail!("Manager urls[{i}] = {url:?} is a duplicate");
                 }
             }
-            if let Some(ref token) = mgr.registration_token {
-                if token.len() > 4096 {
+            if let Some(ref token) = mgr.registration_token
+                && token.len() > 4096 {
                     bail!("Manager registration token must be at most 4096 characters");
                 }
-            }
         }
-    }
 
     // ── Top-level input definitions ──────────────────────────────────
     let mut input_ids: HashSet<String> = HashSet::new();
@@ -252,11 +249,10 @@ pub fn validate_config(config: &AppConfig) -> Result<()> {
                 );
             }
             // Count active inputs. At most one input per flow may be active.
-            if let Some(def) = config.inputs.iter().find(|d| d.id == *iid) {
-                if def.active {
+            if let Some(def) = config.inputs.iter().find(|d| d.id == *iid)
+                && def.active {
                     active_input_count += 1;
                 }
-            }
         }
         // For passthrough flows only one input's bytes reach
         // `broadcast_tx` at any moment, but with the PES Switch / Node
@@ -523,15 +519,14 @@ pub fn validate_flow(flow: &FlowConfig) -> Result<()> {
     // Validate thumbnail capture cadence. The edge accepts any sane value in
     // 1..=60 s (the manager UI offers a curated subset); the freeze /
     // no-signal windows in `engine::thumbnail` scale with whatever lands here.
-    if let Some(secs) = flow.thumbnail_interval_secs {
-        if !(1..=60).contains(&secs) {
+    if let Some(secs) = flow.thumbnail_interval_secs
+        && !(1..=60).contains(&secs) {
             bail!(
                 "Flow '{}' thumbnail_interval_secs must be between 1 and 60 (got {})",
                 flow.id,
                 secs
             );
         }
-    }
 
     // Validate optional PID-bus assembly plan (schema-only — runtime is
     // not yet implemented and `FlowRuntime::start` refuses to bring up
@@ -572,16 +567,14 @@ pub fn validate_flow(flow: &FlowConfig) -> Result<()> {
     }
 
     // Validate optional content-analysis configuration.
-    if let Some(ref ca) = flow.content_analysis {
-        if let Some(hz) = ca.video_full_hz {
-            if !(hz.is_finite() && hz > 0.0 && hz <= 30.0) {
+    if let Some(ref ca) = flow.content_analysis
+        && let Some(hz) = ca.video_full_hz
+            && !(hz.is_finite() && hz > 0.0 && hz <= 30.0) {
                 bail!(
                     "Flow '{}': content_analysis.video_full_hz must be in (0.0, 30.0], got {}",
                     flow.id, hz
                 );
             }
-        }
-    }
 
     // Validate optional recording attributes (replay server, Phase 1).
     if let Some(ref rec) = flow.recording {
@@ -622,17 +615,15 @@ pub fn validate_flow(flow: &FlowConfig) -> Result<()> {
     // accept 5..=300 s: shorter than 5 s gives legitimate sources no
     // chance to converge; longer than 300 s defeats the point of a
     // fallback timeout.
-    if let Some(ref mc) = flow.master_clock {
-        if let Some(t) = mc.pll_lock_timeout_s {
-            if t != 0 && !(5..=300).contains(&t) {
+    if let Some(ref mc) = flow.master_clock
+        && let Some(t) = mc.pll_lock_timeout_s
+            && t != 0 && !(5..=300).contains(&t) {
                 bail!(
                     "Flow '{}': master_clock.pll_lock_timeout_s = {} out of range \
                      (allowed: 0 to opt out, or 5..=300)",
                     flow.id, t
                 );
             }
-        }
-    }
 
     // Note: input/output validation is done at the top level in validate_config()
     // since inputs and outputs are now independent top-level definitions referenced
@@ -684,14 +675,13 @@ pub fn validate_input_definition(def: &InputDefinition) -> Result<()> {
     if def.name.len() > 256 {
         bail!("Input definition name must be at most 256 characters");
     }
-    if let Some(ref group) = def.group {
-        if group.len() > 64 {
+    if let Some(ref group) = def.group
+        && group.len() > 64 {
             bail!(
                 "Input '{}': group tag must be at most 64 characters",
                 def.id
             );
         }
-    }
     validate_input(&def.config)?;
     validate_input_interface_bindings(&def.id, &def.config)?;
     validate_ingress_delay(&def.id, &def.config)?;
@@ -711,13 +701,12 @@ fn validate_ingress_delay(input_id: &str, cfg: &InputConfig) -> Result<()> {
         InputConfig::Rtsp(c) => c.ingress_delay_ms,
         _ => None,
     };
-    if let Some(v) = ms {
-        if v > 1000 {
+    if let Some(v) = ms
+        && v > 1000 {
             bail!(
                 "Input '{input_id}': ingress_delay_ms = {v} out of range (0..=1000)"
             );
         }
-    }
     Ok(())
 }
 
@@ -732,13 +721,12 @@ fn validate_ingress_dejitter(input_id: &str, cfg: &InputConfig) -> Result<()> {
         InputConfig::Udp(c) => c.ingress_dejitter_ms,
         _ => None,
     };
-    if let Some(v) = ms {
-        if !(20..=2000).contains(&v) {
+    if let Some(v) = ms
+        && !(20..=2000).contains(&v) {
             bail!(
                 "Input '{input_id}': ingress_dejitter_ms = {v} out of range (20..=2000 ms)"
             );
         }
-    }
     Ok(())
 }
 
@@ -752,11 +740,10 @@ fn validate_input_interface_bindings(input_id: &str, cfg: &InputConfig) -> Resul
             if let Some(b) = &c.interface_binding {
                 validate_interface_binding(b, &format!("input '{input_id}' (RTP)"))?;
             }
-            if let Some(red) = &c.redundancy {
-                if let Some(b) = &red.interface_binding {
+            if let Some(red) = &c.redundancy
+                && let Some(b) = &red.interface_binding {
                     validate_interface_binding(b, &format!("input '{input_id}' (RTP leg 2)"))?;
                 }
-            }
         }
         InputConfig::Udp(c) => {
             if let Some(b) = &c.interface_binding {
@@ -767,11 +754,10 @@ fn validate_input_interface_bindings(input_id: &str, cfg: &InputConfig) -> Resul
             if let Some(b) = &c.interface_binding {
                 validate_interface_binding(b, &format!("input '{input_id}' (SRT)"))?;
             }
-            if let Some(red) = &c.redundancy {
-                if let Some(b) = &red.interface_binding {
+            if let Some(red) = &c.redundancy
+                && let Some(b) = &red.interface_binding {
                     validate_interface_binding(b, &format!("input '{input_id}' (SRT leg 2)"))?;
                 }
-            }
             if let Some(bonding) = &c.bonding {
                 for (i, ep) in bonding.endpoints.iter().enumerate() {
                     if let Some(b) = &ep.interface_binding {
@@ -1224,14 +1210,13 @@ fn validate_input(input: &InputConfig) -> Result<()> {
                     red.source_addr.as_deref(),
                     "RTP input redundancy",
                 )?;
-                if let Some(ms) = red.path_differential_ms {
-                    if !(5..=2000).contains(&ms) {
+                if let Some(ms) = red.path_differential_ms
+                    && !(5..=2000).contains(&ms) {
                         bail!(
                             "RTP input redundancy: path_differential_ms must be in 5..=2000 \
                              (got {ms})"
                         );
                     }
-                }
             }
             validate_input_transcode_group_a(
                 rtp.audio_encode.as_ref(),
@@ -1316,14 +1301,13 @@ fn validate_input(input: &InputConfig) -> Result<()> {
             if let Some(ref bond) = srt.bonding {
                 validate_srt_bonding(bond, &srt.mode, "SRT input")?;
             }
-            if let Some(ref tm) = srt.transport_mode {
-                if !matches!(tm.as_str(), "ts" | "audio_302m") {
+            if let Some(ref tm) = srt.transport_mode
+                && !matches!(tm.as_str(), "ts" | "audio_302m") {
                     bail!(
                         "SRT input: transport_mode must be 'ts' or 'audio_302m', got '{}'",
                         tm
                     );
                 }
-            }
             validate_input_transcode_group_a(
                 srt.audio_encode.as_ref(),
                 srt.transcode.as_ref(),
@@ -1351,11 +1335,10 @@ fn validate_input(input: &InputConfig) -> Result<()> {
             if rtmp.app.len() > 64 {
                 bail!("RTMP input app name must be at most 64 characters");
             }
-            if let Some(ref key) = rtmp.stream_key {
-                if key.len() > 256 {
+            if let Some(ref key) = rtmp.stream_key
+                && key.len() > 256 {
                     bail!("RTMP input stream_key must be at most 256 characters");
                 }
-            }
             validate_input_transcode_group_a(
                 rtmp.audio_encode.as_ref(),
                 rtmp.transcode.as_ref(),
@@ -1370,16 +1353,14 @@ fn validate_input(input: &InputConfig) -> Result<()> {
             if rtsp.rtsp_url.len() > 2048 {
                 bail!("RTSP input: rtsp_url must be at most 2048 characters");
             }
-            if let Some(ref user) = rtsp.username {
-                if user.len() > 256 {
+            if let Some(ref user) = rtsp.username
+                && user.len() > 256 {
                     bail!("RTSP input: username must be at most 256 characters");
                 }
-            }
-            if let Some(ref pass) = rtsp.password {
-                if pass.len() > 256 {
+            if let Some(ref pass) = rtsp.password
+                && pass.len() > 256 {
                     bail!("RTSP input: password must be at most 256 characters");
                 }
-            }
             validate_input_transcode_group_a(
                 rtsp.audio_encode.as_ref(),
                 rtsp.transcode.as_ref(),
@@ -1388,26 +1369,22 @@ fn validate_input(input: &InputConfig) -> Result<()> {
             )?;
         }
         InputConfig::Webrtc(webrtc) => {
-            if let Some(ref bind) = webrtc.bind_addr {
-                if bind.parse::<std::net::SocketAddr>().is_err() {
+            if let Some(ref bind) = webrtc.bind_addr
+                && bind.parse::<std::net::SocketAddr>().is_err() {
                     bail!("WebRTC input: invalid bind_addr '{}'", bind);
                 }
-            }
-            if let Some(ref token) = webrtc.bearer_token {
-                if token.len() > 4096 {
+            if let Some(ref token) = webrtc.bearer_token
+                && token.len() > 4096 {
                     bail!("WebRTC input: bearer_token must be at most 4096 characters");
                 }
-            }
-            if let Some(ref ip) = webrtc.public_ip {
-                if ip.parse::<std::net::IpAddr>().is_err() {
+            if let Some(ref ip) = webrtc.public_ip
+                && ip.parse::<std::net::IpAddr>().is_err() {
                     bail!("WebRTC input: invalid public_ip '{}'", ip);
                 }
-            }
-            if let Some(ref stun) = webrtc.stun_server {
-                if stun.len() > 2048 {
+            if let Some(ref stun) = webrtc.stun_server
+                && stun.len() > 2048 {
                     bail!("WebRTC input: stun_server must be at most 2048 characters");
                 }
-            }
             validate_input_transcode_group_a(
                 webrtc.audio_encode.as_ref(),
                 webrtc.transcode.as_ref(),
@@ -1422,11 +1399,10 @@ fn validate_input(input: &InputConfig) -> Result<()> {
             if whep.whep_url.len() > 2048 {
                 bail!("WHEP input: whep_url must be at most 2048 characters");
             }
-            if let Some(ref token) = whep.bearer_token {
-                if token.len() > 4096 {
+            if let Some(ref token) = whep.bearer_token
+                && token.len() > 4096 {
                     bail!("WHEP input: bearer_token must be at most 4096 characters");
                 }
-            }
             if let Some(ref fp) = whep.cert_fingerprint {
                 crate::util::tls::canonicalise_fingerprint(fp)
                     .map_err(|e| anyhow::anyhow!("WHEP input: cert_fingerprint: {}", e))?;
@@ -1533,13 +1509,12 @@ fn validate_recording_config(
             );
         }
     }
-    if let Some(fs) = c.filmstrip_seconds {
-        if !(1..=30).contains(&fs) {
+    if let Some(fs) = c.filmstrip_seconds
+        && !(1..=30).contains(&fs) {
             bail!(
                 "Flow '{flow_id}': recording.filmstrip_seconds must be in 1..=30 (got {fs})"
             );
         }
-    }
     Ok(())
 }
 
@@ -1644,13 +1619,12 @@ fn validate_media_player_input(c: &crate::config::models::MediaPlayerInputConfig
                 validate_media_filename(name, &format!("media-player input sources[{i}].name"))?;
             }
         }
-        if let MediaPlayerSource::Ts { program_number: Some(n), .. } = src {
-            if *n == 0 {
+        if let MediaPlayerSource::Ts { program_number: Some(n), .. } = src
+            && *n == 0 {
                 bail!(
                     "media-player input sources[{i}]: program_number must be > 0 (program 0 is reserved for the NIT)"
                 );
             }
-        }
         if let MediaPlayerSource::Image { fps, bitrate_kbps, duration_secs, .. } = src {
             if *fps == 0 || *fps > 60 {
                 bail!(
@@ -1664,14 +1638,13 @@ fn validate_media_player_input(c: &crate::config::models::MediaPlayerInputConfig
                     bitrate_kbps
                 );
             }
-            if let Some(d) = duration_secs {
-                if *d == 0 || *d > 86_400 {
+            if let Some(d) = duration_secs
+                && (*d == 0 || *d > 86_400) {
                     bail!(
                         "media-player input sources[{i}]: image duration_secs must be in 1..=86400 (got {})",
                         d
                     );
                 }
-            }
         }
     }
     validate_input_transcode_group_a(
@@ -1680,13 +1653,12 @@ fn validate_media_player_input(c: &crate::config::models::MediaPlayerInputConfig
         c.video_encode.as_ref(),
         "Media-player input",
     )?;
-    if let Some(bps) = c.paced_bitrate_bps {
-        if !(100_000..=200_000_000).contains(&bps) {
+    if let Some(bps) = c.paced_bitrate_bps
+        && !(100_000..=200_000_000).contains(&bps) {
             bail!(
                 "media-player input: paced_bitrate_bps must be in 100000..=200000000 (got {bps})"
             );
         }
-    }
     // Datagram packetization: how many 188-byte TS packets ride in each
     // published RtpPacket. 7 × 188 = 1316 B is the default (SRT payload size,
     // internet-safe MTU); 348 × 188 = 65 424 B is the largest that fits a
@@ -1763,13 +1735,12 @@ fn validate_bonded_input(c: &crate::config::models::BondedInputConfig) -> Result
             &p.name,
         )?;
     }
-    if let Some(ms) = c.hold_ms {
-        if !(10..=30_000).contains(&ms) {
+    if let Some(ms) = c.hold_ms
+        && !(10..=30_000).contains(&ms) {
             return Err(anyhow::anyhow!(
                 "bonded input hold_ms must be in [10, 30000], got {ms}"
             ));
         }
-    }
     if let Some(ms) = c.hold_max_ms {
         if !(10..=30_000).contains(&ms) {
             return Err(anyhow::anyhow!(
@@ -1799,13 +1770,12 @@ fn validate_bonded_input(c: &crate::config::models::BondedInputConfig) -> Result
             ));
         }
     }
-    if let Some(ms) = c.ingress_dejitter_ms {
-        if ms != 0 && !(20..=2000).contains(&ms) {
+    if let Some(ms) = c.ingress_dejitter_ms
+        && ms != 0 && !(20..=2000).contains(&ms) {
             return Err(anyhow::anyhow!(
                 "bonded input ingress_dejitter_ms must be 0 or in [20, 2000], got {ms}"
             ));
         }
-    }
     validate_bond_encryption_key(&c.encryption_key, "bonded input")?;
     validate_bond_fec(&c.fec, "bonded input")?;
     validate_bond_fec_exclusive(&c.fec, &c.paths, "bonded input")?;
@@ -2089,13 +2059,12 @@ fn validate_bond_path_transport(
                     validate_socket_addr(b, "bonded RIST path local_bind")?;
                 }
             }
-            if let Some(ms) = buffer_ms {
-                if !(50..=30_000).contains(ms) {
+            if let Some(ms) = buffer_ms
+                && !(50..=30_000).contains(ms) {
                     return Err(anyhow::anyhow!(
                         "bonded RIST path '{path_name}' buffer_ms must be in [50, 30000]"
                     ));
                 }
-            }
         }
         BondPathTransportConfig::Quic {
             role,
@@ -2135,13 +2104,12 @@ fn validate_bond_path_transport(
                 }
                 validate_socket_addr(b, "bonded QUIC path bind")?;
             }
-            if let Some(iface) = interface {
-                if iface.is_empty() || iface.len() > 64 {
+            if let Some(iface) = interface
+                && (iface.is_empty() || iface.len() > 64) {
                     return Err(anyhow::anyhow!(
                         "bonded QUIC path '{path_name}': interface name must be 1..=64 chars"
                     ));
                 }
-            }
             validate_bond_tls(tls, path_name)?;
         }
     }
@@ -2365,15 +2333,14 @@ fn validate_st2110_audio_output(
             )?;
         }
     }
-    if let Some(idx) = c.audio_track_index {
-        if idx > 15 {
+    if let Some(idx) = c.audio_track_index
+        && idx > 15 {
             bail!(
                 "{label} output '{}': audio_track_index must be 0-15, got {}",
                 c.id,
                 idx
             );
         }
-    }
     Ok(())
 }
 
@@ -2386,35 +2353,30 @@ pub(crate) fn validate_transcode_block(
     in_channels: u8,
     context: &str,
 ) -> Result<()> {
-    if let Some(sr) = tj.sample_rate {
-        if !matches!(sr, 32_000 | 44_100 | 48_000 | 88_200 | 96_000) {
+    if let Some(sr) = tj.sample_rate
+        && !matches!(sr, 32_000 | 44_100 | 48_000 | 88_200 | 96_000) {
             bail!(
                 "{context}.sample_rate must be one of 32000, 44100, 48000, 88200, 96000, got {sr}"
             );
         }
-    }
-    if let Some(bd) = tj.bit_depth {
-        if !matches!(bd, 16 | 20 | 24) {
+    if let Some(bd) = tj.bit_depth
+        && !matches!(bd, 16 | 20 | 24) {
             bail!("{context}.bit_depth must be 16, 20, or 24, got {bd}");
         }
-    }
-    if let Some(ch) = tj.channels {
-        if ch == 0 || ch > 16 {
+    if let Some(ch) = tj.channels
+        && (ch == 0 || ch > 16) {
             bail!("{context}.channels must be 1..=16, got {ch}");
         }
-    }
-    if let Some(pt) = tj.packet_time_us {
-        if !matches!(pt, 125 | 250 | 333 | 500 | 1_000 | 4_000) {
+    if let Some(pt) = tj.packet_time_us
+        && !matches!(pt, 125 | 250 | 333 | 500 | 1_000 | 4_000) {
             bail!(
                 "{context}.packet_time_us must be one of 125, 250, 333, 500, 1000, 4000, got {pt}"
             );
         }
-    }
-    if let Some(pt) = tj.payload_type {
-        if !(96..=127).contains(&pt) {
+    if let Some(pt) = tj.payload_type
+        && !(96..=127).contains(&pt) {
             bail!("{context}.payload_type must be in dynamic range 96-127, got {pt}");
         }
-    }
     {
         let sources = [
             tj.channel_map.is_some(),
@@ -2430,15 +2392,14 @@ pub(crate) fn validate_transcode_block(
     }
     // Validate channel_map_with_gain entries.
     if let Some(ref map) = tj.channel_map_with_gain {
-        if let Some(ch) = tj.channels {
-            if map.len() != ch as usize {
+        if let Some(ch) = tj.channels
+            && map.len() != ch as usize {
                 bail!(
                     "{context}: channel_map_with_gain has {} rows but channels is {}",
                     map.len(),
                     ch
                 );
             }
-        }
         for (row_idx, row) in map.iter().enumerate() {
             for (col_idx, pair) in row.iter().enumerate() {
                 let ch_idx = pair[0];
@@ -2501,35 +2462,30 @@ pub(crate) fn validate_transcode_block_deferred(
     tj: &crate::engine::audio_transcode::TranscodeJson,
     context: &str,
 ) -> Result<()> {
-    if let Some(sr) = tj.sample_rate {
-        if !matches!(sr, 32_000 | 44_100 | 48_000 | 88_200 | 96_000) {
+    if let Some(sr) = tj.sample_rate
+        && !matches!(sr, 32_000 | 44_100 | 48_000 | 88_200 | 96_000) {
             bail!(
                 "{context}.sample_rate must be one of 32000, 44100, 48000, 88200, 96000, got {sr}"
             );
         }
-    }
-    if let Some(bd) = tj.bit_depth {
-        if !matches!(bd, 16 | 20 | 24) {
+    if let Some(bd) = tj.bit_depth
+        && !matches!(bd, 16 | 20 | 24) {
             bail!("{context}.bit_depth must be 16, 20, or 24, got {bd}");
         }
-    }
-    if let Some(ch) = tj.channels {
-        if ch == 0 || ch > 16 {
+    if let Some(ch) = tj.channels
+        && (ch == 0 || ch > 16) {
             bail!("{context}.channels must be 1..=16, got {ch}");
         }
-    }
-    if let Some(pt) = tj.packet_time_us {
-        if !matches!(pt, 125 | 250 | 333 | 500 | 1_000 | 4_000) {
+    if let Some(pt) = tj.packet_time_us
+        && !matches!(pt, 125 | 250 | 333 | 500 | 1_000 | 4_000) {
             bail!(
                 "{context}.packet_time_us must be one of 125, 250, 333, 500, 1000, 4000, got {pt}"
             );
         }
-    }
-    if let Some(pt) = tj.payload_type {
-        if !(96..=127).contains(&pt) {
+    if let Some(pt) = tj.payload_type
+        && !(96..=127).contains(&pt) {
             bail!("{context}.payload_type must be in dynamic range 96-127, got {pt}");
         }
-    }
     let sources = [
         tj.channel_map.is_some(),
         tj.channel_map_with_gain.is_some(),
@@ -2541,27 +2497,24 @@ pub(crate) fn validate_transcode_block_deferred(
              are mutually exclusive — specify at most one"
         );
     }
-    if let Some(ref map) = tj.channel_map {
-        if let Some(ch) = tj.channels {
-            if map.len() != ch as usize {
+    if let Some(ref map) = tj.channel_map
+        && let Some(ch) = tj.channels
+            && map.len() != ch as usize {
                 bail!(
                     "{context}: channel_map has {} rows but channels is {}",
                     map.len(),
                     ch
                 );
             }
-        }
-    }
     if let Some(ref map) = tj.channel_map_with_gain {
-        if let Some(ch) = tj.channels {
-            if map.len() != ch as usize {
+        if let Some(ch) = tj.channels
+            && map.len() != ch as usize {
                 bail!(
                     "{context}: channel_map_with_gain has {} rows but channels is {}",
                     map.len(),
                     ch
                 );
             }
-        }
         for (row_idx, row) in map.iter().enumerate() {
             for (col_idx, pair) in row.iter().enumerate() {
                 let ch_idx = pair[0];
@@ -2722,11 +2675,10 @@ fn validate_st2110_video_input(c: &St2110VideoInputConfig) -> Result<()> {
             );
         }
     }
-    if let Some(rate) = c.max_bitrate_mbps {
-        if rate <= 0.0 || rate > 100_000.0 {
+    if let Some(rate) = c.max_bitrate_mbps
+        && (rate <= 0.0 || rate > 100_000.0) {
             bail!("{LABEL}: max_bitrate_mbps must be > 0 and <= 100000, got {rate}");
         }
-    }
     if let Some(ref red) = c.redundancy {
         validate_red_blue_bind(red, &c.bind_addr, &format!("{LABEL} redundancy"))?;
     }
@@ -2927,24 +2879,22 @@ fn validate_rtp_audio_output(
             )?;
         }
     }
-    if let Some(idx) = c.audio_track_index {
-        if idx > 15 {
+    if let Some(idx) = c.audio_track_index
+        && idx > 15 {
             bail!(
                 "rtp_audio output '{}': audio_track_index must be 0-15, got {}",
                 c.id,
                 idx
             );
         }
-    }
-    if let Some(ref tm) = c.transport_mode {
-        if !matches!(tm.as_str(), "rtp" | "audio_302m") {
+    if let Some(ref tm) = c.transport_mode
+        && !matches!(tm.as_str(), "rtp" | "audio_302m") {
             bail!(
                 "rtp_audio output '{}': transport_mode must be 'rtp' or 'audio_302m', got '{}'",
                 c.id,
                 tm
             );
         }
-    }
     Ok(())
 }
 
@@ -3065,11 +3015,10 @@ fn validate_rtp_payload_type(pt: u8, context: &str) -> Result<()> {
 }
 
 fn validate_clock_domain(domain: Option<u8>, context: &str) -> Result<()> {
-    if let Some(d) = domain {
-        if d > 127 {
+    if let Some(d) = domain
+        && d > 127 {
             bail!("{context}: clock_domain must be 0-127 (IEEE 1588), got {d}");
         }
-    }
     Ok(())
 }
 
@@ -3172,11 +3121,10 @@ fn validate_starlink_uplinks(
             .as_deref()
             .map(str::trim)
             .filter(|s| !s.is_empty());
-        if let Some(s) = src {
-            if s.parse::<std::net::IpAddr>().is_err() {
+        if let Some(s) = src
+            && s.parse::<std::net::IpAddr>().is_err() {
                 bail!("{ctx}: source_address must be a valid IP address, got '{s}'");
             }
-        }
         // gateway (optional) — must be a valid IP when set (the edge programs
         // the dish-subnet route via it).
         if let Some(g) = u
@@ -3184,11 +3132,9 @@ fn validate_starlink_uplinks(
             .as_deref()
             .map(str::trim)
             .filter(|s| !s.is_empty())
-        {
-            if g.parse::<std::net::IpAddr>().is_err() {
+            && g.parse::<std::net::IpAddr>().is_err() {
                 bail!("{ctx}: gateway must be a valid IP address, got '{g}'");
             }
-        }
         by_address
             .entry(addr.to_string())
             .or_default()
@@ -3250,22 +3196,20 @@ pub(crate) fn validate_bond_uplinks(
                 u.capacity_bps
             );
         }
-        if let Some(mv) = u.min_viable_bps {
-            if mv == 0 || mv > u.capacity_bps {
+        if let Some(mv) = u.min_viable_bps
+            && (mv == 0 || mv > u.capacity_bps) {
                 bail!(
                     "bond_uplinks[{i}] ('{iface}'): min_viable_bps must be in (0, capacity_bps={}], got {mv}",
                     u.capacity_bps
                 );
             }
-        }
-        if let Some(da) = u.demand_active_bps {
-            if da == 0 || da > u.capacity_bps {
+        if let Some(da) = u.demand_active_bps
+            && (da == 0 || da > u.capacity_bps) {
                 bail!(
                     "bond_uplinks[{i}] ('{iface}'): demand_active_bps must be in (0, capacity_bps={}], got {da}",
                     u.capacity_bps
                 );
             }
-        }
     }
     Ok(())
 }
@@ -3306,16 +3250,14 @@ fn validate_cellular_uplinks(uplinks: &[crate::config::models::CellularUplinkCon
         if addr.contains("://") || addr.contains('/') {
             bail!("{ctx}: address must be a bare host or IP (no scheme or path)");
         }
-        if let Some(ref user) = u.username {
-            if user.len() > 64 {
+        if let Some(ref user) = u.username
+            && user.len() > 64 {
                 bail!("{ctx}: username must be at most 64 characters");
             }
-        }
-        if let Some(ref pass) = u.password {
-            if pass.len() > 256 {
+        if let Some(ref pass) = u.password
+            && pass.len() > 256 {
                 bail!("{ctx}: password must be at most 256 characters");
             }
-        }
         // cert_fingerprint — SHA-256 hex (32 bytes), optional `:` separators.
         if let Some(ref fp) = u.cert_fingerprint {
             let hex: String = fp.chars().filter(|c| !c.is_whitespace() && *c != ':').collect();
@@ -3520,14 +3462,13 @@ fn validate_flow_assembly(
                 prog.pmt_pid
             );
         }
-        if let Some(ref name) = prog.service_name {
-            if name.len() > 128 {
+        if let Some(ref name) = prog.service_name
+            && name.len() > 128 {
                 bail!(
                     "{context}: program {} service_name exceeds 128 chars",
                     prog.program_number
                 );
             }
-        }
 
         let mut seen_out = std::collections::HashSet::new();
         for stream in &prog.streams {
@@ -3564,13 +3505,12 @@ fn validate_flow_assembly(
                 );
             }
             mux_out_pids.insert(stream.out_pid, prog.program_number);
-            if let Some(ref label) = stream.label {
-                if label.len() > 256 {
+            if let Some(ref label) = stream.label
+                && label.len() > 256 {
                     bail!(
                         "{context}: stream label exceeds 256 chars"
                     );
                 }
-            }
             validate_slot_source(&stream.source, &check_input, &check_pid, context, false)?;
             collect_slot_ref(
                 &stream.source,
@@ -3697,28 +3637,25 @@ where
                     "{context}: hitless slot source cannot nest another hitless"
                 );
             }
-            if let Some(ms) = stall_ms {
-                if !(20..=5000).contains(ms) {
+            if let Some(ms) = stall_ms
+                && !(20..=5000).contains(ms) {
                     bail!(
                         "{context}: hitless stall_ms must be in 20..=5000 (got {ms})"
                     );
                 }
-            }
-            if let Some(w) = reorder_window {
-                if !(64..=4096).contains(w) || w % 64 != 0 {
+            if let Some(w) = reorder_window
+                && (!(64..=4096).contains(w) || w % 64 != 0) {
                     bail!(
                         "{context}: hitless reorder_window must be a multiple of 64 in \
                          64..=4096 (got {w})"
                     );
                 }
-            }
-            if let Some(ms) = path_differential_ms {
-                if !(5..=2000).contains(ms) {
+            if let Some(ms) = path_differential_ms
+                && !(5..=2000).contains(ms) {
                     bail!(
                         "{context}: hitless path_differential_ms must be in 5..=2000 (got {ms})"
                     );
                 }
-            }
             validate_slot_source(primary, check_input, check_pid, context, true)?;
             validate_slot_source(backup, check_input, check_pid, context, true)?;
         }
@@ -3728,8 +3665,8 @@ where
             splice_mode: _,
             splice_budget_ms,
         } => {
-            if let Some(ms) = splice_budget_ms {
-                if !crate::engine::pes_splice::SPLICE_BUDGET_MS_RANGE.contains(ms) {
+            if let Some(ms) = splice_budget_ms
+                && !crate::engine::pes_splice::SPLICE_BUDGET_MS_RANGE.contains(ms) {
                     let range = &crate::engine::pes_splice::SPLICE_BUDGET_MS_RANGE;
                     bail!(
                         "{context}: switch splice_budget_ms must be in {}..={} (got {ms}) \
@@ -3738,7 +3675,6 @@ where
                         range.end()
                     );
                 }
-            }
             if inside_hitless {
                 bail!(
                     "{context}: switch slot source cannot nest inside hitless \
@@ -3842,11 +3778,10 @@ where
 /// Validate an optional MPEG-TS program_number selector. program_number 0 is
 /// reserved for the NIT and never identifies a real program.
 fn validate_program_number(prog: Option<u16>, context: &str) -> Result<()> {
-    if let Some(n) = prog {
-        if n == 0 {
+    if let Some(n) = prog
+        && n == 0 {
             bail!("{context}: program_number must be > 0 (0 is reserved for the NIT)");
         }
-    }
     Ok(())
 }
 
@@ -3975,21 +3910,18 @@ fn validate_pid_overrides_entry(
     let pmt = entry.pmt_pid;
     let video = entry.video_pid;
     let audio = entry.audio_pid;
-    if let (Some(p), Some(v)) = (pmt, video) {
-        if p == v {
+    if let (Some(p), Some(v)) = (pmt, video)
+        && p == v {
             bail!("{context}: pmt_pid (0x{p:04X}) collides with video_pid");
         }
-    }
-    if let (Some(p), Some(a)) = (pmt, audio) {
-        if p == a {
+    if let (Some(p), Some(a)) = (pmt, audio)
+        && p == a {
             bail!("{context}: pmt_pid (0x{p:04X}) collides with audio_pid");
         }
-    }
-    if let (Some(v), Some(a)) = (video, audio) {
-        if v == a {
+    if let (Some(v), Some(a)) = (video, audio)
+        && v == a {
             bail!("{context}: video_pid (0x{v:04X}) collides with audio_pid");
         }
-    }
     if let Some(pcr) = entry.pcr_pid {
         if Some(pcr) == pmt {
             bail!("{context}: pcr_pid (0x{pcr:04X}) collides with pmt_pid; PCR must ride an ES PID, not the PMT PID");
@@ -4078,8 +4010,8 @@ fn validate_webrtc_compatible(
     if !enabled {
         return Ok(());
     }
-    if let Some(ve) = video_encode {
-        if matches!(
+    if let Some(ve) = video_encode
+        && matches!(
             ve.codec.as_str(),
             "x265" | "hevc_nvenc" | "hevc_qsv" | "hevc_vaapi" | "hevc_rkmpp" | "hevc_auto"
         ) {
@@ -4090,7 +4022,6 @@ fn validate_webrtc_compatible(
                 ve.codec
             );
         }
-    }
     // Validate the browser-safe re-encode the edge will actually synthesise,
     // which also confirms an H.264 encoder backend is compiled in.
     let effective = crate::config::models::webrtc_safe_video_encode(video_encode);
@@ -4205,16 +4136,14 @@ fn validate_video_encode(
         }
         (None, None) => {}
     }
-    if let Some(b) = enc.bitrate_kbps {
-        if !(100..=100_000).contains(&b) {
+    if let Some(b) = enc.bitrate_kbps
+        && !(100..=100_000).contains(&b) {
             bail!("{context}: video_encode.bitrate_kbps must be 100..=100000, got {b}");
         }
-    }
-    if let Some(g) = enc.gop_size {
-        if !(1..=600).contains(&g) {
+    if let Some(g) = enc.gop_size
+        && !(1..=600).contains(&g) {
             bail!("{context}: video_encode.gop_size must be 1..=600, got {g}");
         }
-    }
     if let Some(ref p) = enc.preset {
         match p.as_str() {
             "ultrafast" | "superfast" | "veryfast" | "faster" | "fast" | "medium"
@@ -4261,13 +4190,12 @@ fn validate_video_encode(
             ),
         }
     }
-    if let Some(bd) = enc.bit_depth {
-        if bd != 8 && bd != 10 {
+    if let Some(bd) = enc.bit_depth
+        && bd != 8 && bd != 10 {
             bail!(
                 "{context}: video_encode.bit_depth must be 8 or 10, got {bd}"
             );
         }
-    }
     // NVENC backend restrictions — catch at validation time rather than
     // at encoder-open. Mirrors the runtime gates in
     // `video_engine/src/video_encoder.rs::open()` (lines 235-262).
@@ -4388,38 +4316,34 @@ fn validate_video_encode(
             ),
         }
     }
-    if let Some(crf) = enc.crf {
-        if crf > 51 {
+    if let Some(crf) = enc.crf
+        && crf > 51 {
             bail!(
                 "{context}: video_encode.crf must be 0..=51, got {crf}"
             );
         }
-    }
     if let Some(mb) = enc.max_bitrate_kbps {
         if !(100..=100_000).contains(&mb) {
             bail!(
                 "{context}: video_encode.max_bitrate_kbps must be 100..=100000, got {mb}"
             );
         }
-        if let Some(br) = enc.bitrate_kbps {
-            if mb < br {
+        if let Some(br) = enc.bitrate_kbps
+            && mb < br {
                 bail!(
                     "{context}: video_encode.max_bitrate_kbps ({mb}) must be >= bitrate_kbps ({br})"
                 );
             }
-        }
     }
     // ── frame structure ───────────────────────────────────────────────
-    if let Some(bf) = enc.bframes {
-        if bf > 16 {
+    if let Some(bf) = enc.bframes
+        && bf > 16 {
             bail!("{context}: video_encode.bframes must be 0..=16, got {bf}");
         }
-    }
-    if let Some(rf) = enc.refs {
-        if !(1..=16).contains(&rf) {
+    if let Some(rf) = enc.refs
+        && !(1..=16).contains(&rf) {
             bail!("{context}: video_encode.refs must be 1..=16, got {rf}");
         }
-    }
     if let Some(ref lv) = enc.level {
         if lv.len() > 8 {
             bail!(
@@ -4494,13 +4418,12 @@ fn validate_video_encode(
             ),
         }
     }
-    if let Some(pid) = enc.source_video_pid {
-        if !(0x0010..=0x1FFE).contains(&pid) {
+    if let Some(pid) = enc.source_video_pid
+        && !(0x0010..=0x1FFE).contains(&pid) {
             bail!(
                 "{context}: video_encode.source_video_pid 0x{pid:04X} out of range; must be in 0x0010..=0x1FFE"
             );
         }
-    }
     Ok(())
 }
 
@@ -4529,32 +4452,29 @@ fn validate_audio_encode(
                  (302M is a lossless PCM wrap, not a compressed codec)"
             );
         }
-        if let Some(sr) = enc.sample_rate {
-            if sr != 48_000 {
+        if let Some(sr) = enc.sample_rate
+            && sr != 48_000 {
                 bail!(
                     "{context}: audio_encode.sample_rate must be 48000 for s302m, got {sr}"
                 );
             }
-        }
-        if let Some(ch) = enc.channels {
-            if !matches!(ch, 2 | 4 | 6 | 8) {
+        if let Some(ch) = enc.channels
+            && !matches!(ch, 2 | 4 | 6 | 8) {
                 bail!(
                     "{context}: audio_encode.channels must be 2, 4, 6, or 8 for s302m \
                      (SMPTE 302M-2007), got {ch}"
                 );
             }
-        }
         return Ok(());
     }
 
-    if let Some(br) = enc.bitrate_kbps {
-        if !(16..=512).contains(&br) {
+    if let Some(br) = enc.bitrate_kbps
+        && !(16..=512).contains(&br) {
             bail!(
                 "{context}: audio_encode.bitrate_kbps must be 16..=512, got {}",
                 br
             );
         }
-    }
     if let Some(sr) = enc.sample_rate {
         const ALLOWED_SR: &[u32] = &[8_000, 16_000, 22_050, 24_000, 32_000, 44_100, 48_000];
         if !ALLOWED_SR.contains(&sr) {
@@ -4604,29 +4524,26 @@ fn validate_audio_encode(
             enc.codec
         );
     }
-    if let Some(ref m) = enc.opus_vbr_mode {
-        if !matches!(m.as_str(), "vbr" | "cbr") {
+    if let Some(ref m) = enc.opus_vbr_mode
+        && !matches!(m.as_str(), "vbr" | "cbr") {
             bail!(
                 "{context}: audio_encode.opus_vbr_mode must be 'vbr' or 'cbr', got '{m}'"
             );
         }
-    }
-    if let Some(d) = enc.opus_frame_duration_ms {
-        if !matches!(d, 5 | 10 | 20 | 40 | 60) {
+    if let Some(d) = enc.opus_frame_duration_ms
+        && !matches!(d, 5 | 10 | 20 | 40 | 60) {
             bail!(
                 "{context}: audio_encode.opus_frame_duration_ms must be one of 5, 10, 20, 40, 60, got {d}"
             );
         }
-    }
     // Source PID override: must sit in the user-PID range; reserved
     // system PIDs (0x0000..=0x000F) and the NULL PID (0x1FFF) refused.
-    if let Some(pid) = enc.source_audio_pid {
-        if !(0x0010..=0x1FFE).contains(&pid) {
+    if let Some(pid) = enc.source_audio_pid
+        && !(0x0010..=0x1FFE).contains(&pid) {
             bail!(
                 "{context}: audio_encode.source_audio_pid 0x{pid:04X} out of range; must be in 0x0010..=0x1FFE"
             );
         }
-    }
     Ok(())
 }
 
@@ -4715,11 +4632,10 @@ fn validate_output_interface_bindings(output: &OutputConfig) -> Result<()> {
             if let Some(b) = &c.interface_binding {
                 validate_interface_binding(b, &format!("output '{}' (RTP)", c.id))?;
             }
-            if let Some(red) = &c.redundancy {
-                if let Some(b) = &red.interface_binding {
+            if let Some(red) = &c.redundancy
+                && let Some(b) = &red.interface_binding {
                     validate_interface_binding(b, &format!("output '{}' (RTP leg 2)", c.id))?;
                 }
-            }
         }
         OutputConfig::Udp(c) => {
             if let Some(b) = &c.interface_binding {
@@ -4730,11 +4646,10 @@ fn validate_output_interface_bindings(output: &OutputConfig) -> Result<()> {
             if let Some(b) = &c.interface_binding {
                 validate_interface_binding(b, &format!("output '{}' (SRT)", c.id))?;
             }
-            if let Some(red) = &c.redundancy {
-                if let Some(b) = &red.interface_binding {
+            if let Some(red) = &c.redundancy
+                && let Some(b) = &red.interface_binding {
                     validate_interface_binding(b, &format!("output '{}' (SRT leg 2)", c.id))?;
                 }
-            }
             if let Some(bonding) = &c.bonding {
                 for (i, ep) in bonding.endpoints.iter().enumerate() {
                     if let Some(b) = &ep.interface_binding {
@@ -4884,11 +4799,10 @@ fn validate_output_epoch_lock(output: &OutputConfig) -> Result<()> {
         );
     }
 
-    if let Some(g) = epoch.group_label.as_deref() {
-        if g.len() > 64 {
+    if let Some(g) = epoch.group_label.as_deref()
+        && g.len() > 64 {
             bail!("{label}: epoch_lock.group_label must be at most 64 characters");
         }
-    }
 
     // `wire_emit` latches "the first PCR-bearing PID this emitter ever
     // saw". Two members joining an MPTS at different byte offsets can
@@ -4911,11 +4825,10 @@ fn validate_output_epoch_lock(output: &OutputConfig) -> Result<()> {
              different byte offsets can latch different programs"
         );
     }
-    if let Some(pid) = epoch.pcr_pid {
-        if pid >= 0x1FFF {
+    if let Some(pid) = epoch.pcr_pid
+        && pid >= 0x1FFF {
             bail!("{label}: epoch_lock.pcr_pid must be < 0x1FFF (0x1FFF is the null PID)");
         }
-    }
     Ok(())
 }
 
@@ -5088,14 +5001,13 @@ pub fn validate_flow_epoch_lock(
 /// Validates the optional `group` tag on an output. Returns an error if the
 /// group string exceeds 64 characters. Used by [`validate_output_with_input`].
 fn validate_output_group(group: Option<&str>, output_id: &str) -> Result<()> {
-    if let Some(g) = group {
-        if g.len() > 64 {
+    if let Some(g) = group
+        && g.len() > 64 {
             bail!(
                 "Output '{}': group tag must be at most 64 characters",
                 output_id
             );
         }
-    }
     Ok(())
 }
 
@@ -5140,11 +5052,10 @@ pub fn validate_output_with_input(
                 if let Some(ref iface) = red.interface_addr {
                     validate_ip_addr(iface, "RTP output redundancy interface_addr")?;
                 }
-                if let Some(dscp) = red.dscp {
-                    if dscp > 63 {
+                if let Some(dscp) = red.dscp
+                    && dscp > 63 {
                         bail!("RTP output '{}' redundancy: DSCP must be 0-63, got {}", rtp.id, dscp);
                     }
-                }
                 // Validate address family consistency between legs
                 let leg1: SocketAddr = rtp.dest_addr.parse()?;
                 let leg2: SocketAddr = red.dest_addr.parse()?;
@@ -5742,28 +5653,25 @@ pub fn validate_output_with_input(
                     }
                 }
                 crate::config::models::WebrtcOutputMode::WhepServer => {
-                    if let Some(max) = webrtc.max_viewers {
-                        if max == 0 || max > 100 {
+                    if let Some(max) = webrtc.max_viewers
+                        && (max == 0 || max > 100) {
                             bail!("WebRTC output '{}': max_viewers must be 1-100, got {}", webrtc.id, max);
                         }
-                    }
                 }
             }
-            if let Some(ref token) = webrtc.bearer_token {
-                if token.len() > 4096 {
+            if let Some(ref token) = webrtc.bearer_token
+                && token.len() > 4096 {
                     bail!("WebRTC output '{}': bearer_token must be at most 4096 characters", webrtc.id);
                 }
-            }
             if let Some(ref fp) = webrtc.cert_fingerprint {
                 crate::util::tls::canonicalise_fingerprint(fp).map_err(|e| {
                     anyhow::anyhow!("WebRTC output '{}': cert_fingerprint: {}", webrtc.id, e)
                 })?;
             }
-            if let Some(ref ip) = webrtc.public_ip {
-                if ip.parse::<std::net::IpAddr>().is_err() {
+            if let Some(ref ip) = webrtc.public_ip
+                && ip.parse::<std::net::IpAddr>().is_err() {
                     bail!("WebRTC output '{}': invalid public_ip '{}'", webrtc.id, ip);
                 }
-            }
             if let Some(ref enc) = webrtc.audio_encode {
                 if webrtc.video_only {
                     bail!(
@@ -5873,14 +5781,13 @@ fn validate_bonded_output(c: &crate::config::models::BondedOutputConfig) -> Resu
             &p.name,
         )?;
     }
-    if let Some(ms) = c.max_bonding_latency_ms {
-        if !(50..=5_000).contains(&ms) {
+    if let Some(ms) = c.max_bonding_latency_ms
+        && !(50..=5_000).contains(&ms) {
             return Err(anyhow::anyhow!(
                 "bonded output '{}': max_bonding_latency_ms must be in [50, 5000]",
                 c.id
             ));
         }
-    }
     if let Some(mtu) = c.path_mtu {
         // 576 = conservative IPv4 floor (leaves ≥2 TS packets of budget under
         // worst-case overheads); 9000 = jumbo frames.
@@ -5892,14 +5799,13 @@ fn validate_bonded_output(c: &crate::config::models::BondedOutputConfig) -> Resu
             ));
         }
     }
-    if let Some(pn) = c.program_number {
-        if pn == 0 {
+    if let Some(pn) = c.program_number
+        && pn == 0 {
             return Err(anyhow::anyhow!(
                 "bonded output '{}' program_number must be > 0",
                 c.id
             ));
         }
-    }
     validate_bond_encryption_key(&c.encryption_key, &format!("bonded output '{}'", c.id))?;
     validate_bond_congestion(&c.congestion, &format!("bonded output '{}'", c.id))?;
     validate_bond_fec(&c.fec, &format!("bonded output '{}'", c.id))?;
@@ -5933,15 +5839,13 @@ fn validate_bond_redundancy(
     c: &Option<crate::config::models::BondRedundancyConfig>,
     ctx: &str,
 ) -> Result<()> {
-    if let Some(r) = c {
-        if let Some(n) = r.replicas {
-            if !(2..=8).contains(&n) {
+    if let Some(r) = c
+        && let Some(n) = r.replicas
+            && !(2..=8).contains(&n) {
                 return Err(anyhow::anyhow!(
                     "{ctx}: redundancy.replicas must be in [2, 8], got {n}"
                 ));
             }
-        }
-    }
     Ok(())
 }
 
@@ -6035,71 +5939,62 @@ fn validate_bond_congestion(
     ctx: &str,
 ) -> Result<()> {
     let Some(c) = c else { return Ok(()) };
-    if let Some(v) = c.min_rate_kbps {
-        if !(50..=10_000_000).contains(&v) {
+    if let Some(v) = c.min_rate_kbps
+        && !(50..=10_000_000).contains(&v) {
             return Err(anyhow::anyhow!(
                 "{ctx}: congestion.min_rate_kbps must be in [50, 10000000]"
             ));
         }
-    }
-    if let Some(v) = c.start_rate_kbps {
-        if !(50..=10_000_000).contains(&v) {
+    if let Some(v) = c.start_rate_kbps
+        && !(50..=10_000_000).contains(&v) {
             return Err(anyhow::anyhow!(
                 "{ctx}: congestion.start_rate_kbps must be in [50, 10000000]"
             ));
         }
-    }
     for (label, v) in [("loss_low_pct", c.loss_low_pct), ("loss_high_pct", c.loss_high_pct)] {
-        if let Some(v) = v {
-            if !(0.0..=100.0).contains(&v) || v.is_nan() {
+        if let Some(v) = v
+            && (!(0.0..=100.0).contains(&v) || v.is_nan()) {
                 return Err(anyhow::anyhow!(
                     "{ctx}: congestion.{label} must be in [0, 100]"
                 ));
             }
-        }
     }
-    if let (Some(lo), Some(hi)) = (c.loss_low_pct, c.loss_high_pct) {
-        if lo > hi {
+    if let (Some(lo), Some(hi)) = (c.loss_low_pct, c.loss_high_pct)
+        && lo > hi {
             return Err(anyhow::anyhow!(
                 "{ctx}: congestion.loss_low_pct ({lo}) must not exceed loss_high_pct ({hi})"
             ));
         }
-    }
-    if let Some(v) = c.delay_inflation_ms {
-        if !(1..=10_000).contains(&v) {
+    if let Some(v) = c.delay_inflation_ms
+        && !(1..=10_000).contains(&v) {
             return Err(anyhow::anyhow!(
                 "{ctx}: congestion.delay_inflation_ms must be in [1, 10000]"
             ));
         }
-    }
-    if let Some(v) = c.burst_ms {
-        if !(1..=5_000).contains(&v) {
+    if let Some(v) = c.burst_ms
+        && !(1..=5_000).contains(&v) {
             return Err(anyhow::anyhow!(
                 "{ctx}: congestion.burst_ms must be in [1, 5000]"
             ));
         }
-    }
-    if let Some(v) = c.probe_cap_mult {
-        if !(1.1..=10.0).contains(&v) || v.is_nan() {
+    if let Some(v) = c.probe_cap_mult
+        && (!(1.1..=10.0).contains(&v) || v.is_nan()) {
             return Err(anyhow::anyhow!(
                 "{ctx}: congestion.probe_cap_mult must be in [1.1, 10.0]"
             ));
         }
-    }
-    if let Some(v) = c.rtt_min_window_ms {
-        if !(1_000..=120_000).contains(&v) {
+    if let Some(v) = c.rtt_min_window_ms
+        && !(1_000..=120_000).contains(&v) {
             return Err(anyhow::anyhow!(
                 "{ctx}: congestion.rtt_min_window_ms must be in [1000, 120000]"
             ));
         }
-    }
-    if let Some(v) = c.jitter_demote_ms {
-        if v > 5_000 {
+    if let Some(v) = c.jitter_demote_ms
+        && v > 5_000 {
             return Err(anyhow::anyhow!(
                 "{ctx}: congestion.jitter_demote_ms must be in [0, 5000] (0 disables)"
             ));
         }
-    }
     Ok(())
 }
 
@@ -6225,8 +6120,8 @@ fn validate_display_output(c: &crate::config::models::DisplayOutputConfig) -> Re
     }
 
     // ALSA device pattern (optional). Empty == None == mute.
-    if let Some(aud) = c.audio_device.as_deref() {
-        if !aud.is_empty() {
+    if let Some(aud) = c.audio_device.as_deref()
+        && !aud.is_empty() {
             if aud.len() > 64 {
                 return Err(anyhow::anyhow!(
                     "display output '{}': audio_device too long (>64 chars)",
@@ -6242,7 +6137,6 @@ fn validate_display_output(c: &crate::config::models::DisplayOutputConfig) -> Re
                 ));
             }
         }
-    }
 
     if c.audio_channel_pair[0] >= 8 || c.audio_channel_pair[1] >= 8 {
         return Err(anyhow::anyhow!(
@@ -6257,22 +6151,20 @@ fn validate_display_output(c: &crate::config::models::DisplayOutputConfig) -> Re
         ));
     }
 
-    if let Some(p) = c.program_number {
-        if p == 0 {
+    if let Some(p) = c.program_number
+        && p == 0 {
             return Err(anyhow::anyhow!(
                 "display output '{}' program_number must be > 0 (0 is reserved for the NIT)",
                 c.id
             ));
         }
-    }
-    if let Some(t) = c.audio_track_index {
-        if t >= 16 {
+    if let Some(t) = c.audio_track_index
+        && t >= 16 {
             return Err(anyhow::anyhow!(
                 "display output '{}' audio_track_index must be < 16",
                 c.id
             ));
         }
-    }
 
     // `resolution` / `refresh_hz` are deprecated and ignored at runtime —
     // replaced by `scaling_mode`. We still accept them on the wire so old
@@ -6343,11 +6235,10 @@ fn validate_mxl_domain(mxl: &crate::config::models::MxlDomainRef, ctx: &str) -> 
 }
 
 fn validate_mxl_clock_domain(clock: Option<u8>, ctx: &str) -> Result<()> {
-    if let Some(d) = clock {
-        if d > 127 {
+    if let Some(d) = clock
+        && d > 127 {
             bail!("{ctx}: clock_domain must be 0..=127, got {d}");
         }
-    }
     Ok(())
 }
 
@@ -6493,11 +6384,10 @@ fn validate_sdi_output(c: &crate::config::models::SdiOutputConfig) -> Result<()>
             c.audio_channels
         );
     }
-    if let Some(p) = c.program_number {
-        if p == 0 {
+    if let Some(p) = c.program_number
+        && p == 0 {
             bail!("{ctx}: program_number 0 is reserved for the NIT and never identifies a program");
         }
-    }
     if !(-1000..=1000).contains(&c.audio_offset_ms) {
         bail!(
             "{ctx}: audio_offset_ms must be within -1000..=1000 ms (got {})",
@@ -6786,40 +6676,35 @@ fn validate_srt_common(
         SrtMode::Listener => {}
     }
 
-    if let Some(pass) = passphrase {
-        if pass.len() < 10 || pass.len() > 79 {
+    if let Some(pass) = passphrase
+        && (pass.len() < 10 || pass.len() > 79) {
             bail!("{context}: passphrase must be 10-79 characters, got {}", pass.len());
         }
-    }
 
-    if let Some(key_len) = aes_key_len {
-        if key_len != 16 && key_len != 24 && key_len != 32 {
+    if let Some(key_len) = aes_key_len
+        && key_len != 16 && key_len != 24 && key_len != 32 {
             bail!("{context}: aes_key_len must be 16, 24, or 32, got {key_len}");
         }
-    }
 
     if let Some(cm) = crypto_mode {
         if cm != "aes-ctr" && cm != "aes-gcm" {
             bail!("{context}: crypto_mode must be \"aes-ctr\" or \"aes-gcm\", got \"{cm}\"");
         }
-        if cm == "aes-gcm" {
-            if let Some(24) = aes_key_len {
+        if cm == "aes-gcm"
+            && let Some(24) = aes_key_len {
                 bail!("{context}: AES-GCM does not support AES-192 (aes_key_len 24); use 16 or 32");
             }
-        }
     }
 
-    if let Some(bw) = max_rexmit_bw {
-        if bw < -1 {
+    if let Some(bw) = max_rexmit_bw
+        && bw < -1 {
             bail!("{context}: max_rexmit_bw must be -1 (unlimited), 0 (disable), or > 0 (bytes/sec), got {bw}");
         }
-    }
 
-    if let Some(sid) = stream_id {
-        if sid.len() > 512 {
+    if let Some(sid) = stream_id
+        && sid.len() > 512 {
             bail!("{context}: stream_id must be at most 512 characters (per SRT spec), got {}", sid.len());
         }
-    }
 
     if let Some(pf) = packet_filter {
         if pf.len() > 512 {
@@ -6867,89 +6752,75 @@ fn validate_srt_common(
         }
     }
 
-    if let Some(bw) = max_bw {
-        if bw < 0 {
+    if let Some(bw) = max_bw
+        && bw < 0 {
             bail!("{context}: max_bw must be >= 0 (0 = unlimited), got {bw}");
         }
-    }
 
-    if let Some(pct) = overhead_bw {
-        if !(5..=100).contains(&pct) {
+    if let Some(pct) = overhead_bw
+        && !(5..=100).contains(&pct) {
             bail!("{context}: overhead_bw must be 5-100 (percentage), got {pct}");
         }
-    }
 
-    if let Some(ffs) = flight_flag_size {
-        if ffs < 32 {
+    if let Some(ffs) = flight_flag_size
+        && ffs < 32 {
             bail!("{context}: flight_flag_size must be >= 32 packets, got {ffs}");
         }
-    }
 
-    if let Some(s) = send_buffer_size {
-        if s < 32 {
+    if let Some(s) = send_buffer_size
+        && s < 32 {
             bail!("{context}: send_buffer_size must be >= 32 packets, got {s}");
         }
-    }
 
-    if let Some(s) = recv_buffer_size {
-        if s < 32 {
+    if let Some(s) = recv_buffer_size
+        && s < 32 {
             bail!("{context}: recv_buffer_size must be >= 32 packets, got {s}");
         }
-    }
 
-    if let Some(t) = ip_tos {
-        if !(0..=255).contains(&t) {
+    if let Some(t) = ip_tos
+        && !(0..=255).contains(&t) {
             bail!("{context}: ip_tos must be 0-255, got {t}");
         }
-    }
 
-    if let Some(algo) = retransmit_algo {
-        if algo != "default" && algo != "reduced" {
+    if let Some(algo) = retransmit_algo
+        && algo != "default" && algo != "reduced" {
             bail!("{context}: retransmit_algo must be \"default\" or \"reduced\", got \"{algo}\"");
         }
-    }
 
-    if let Some(d) = send_drop_delay {
-        if d < -1 {
+    if let Some(d) = send_drop_delay
+        && d < -1 {
             bail!("{context}: send_drop_delay must be >= -1, got {d}");
         }
-    }
 
-    if let Some(t) = loss_max_ttl {
-        if t < 0 {
+    if let Some(t) = loss_max_ttl
+        && t < 0 {
             bail!("{context}: loss_max_ttl must be >= 0, got {t}");
         }
-    }
 
-    if let Some(r) = km_refresh_rate {
-        if r == 0 {
+    if let Some(r) = km_refresh_rate
+        && r == 0 {
             bail!("{context}: km_refresh_rate must be > 0");
         }
-    }
 
-    if let Some(r) = km_pre_announce {
-        if r == 0 {
+    if let Some(r) = km_pre_announce
+        && r == 0 {
             bail!("{context}: km_pre_announce must be > 0");
         }
-    }
 
-    if let Some(s) = payload_size {
-        if !(188..=1456).contains(&s) {
+    if let Some(s) = payload_size
+        && !(188..=1456).contains(&s) {
             bail!("{context}: payload_size must be 188-1456, got {s}");
         }
-    }
 
-    if let Some(s) = mss {
-        if !(76..=9000).contains(&s) {
+    if let Some(s) = mss
+        && !(76..=9000).contains(&s) {
             bail!("{context}: mss must be 76-9000, got {s}");
         }
-    }
 
-    if let Some(t) = ip_ttl {
-        if !(1..=255).contains(&t) {
+    if let Some(t) = ip_ttl
+        && !(1..=255).contains(&t) {
             bail!("{context}: ip_ttl must be 1-255, got {t}");
         }
-    }
 
     Ok(())
 }
@@ -6980,13 +6851,12 @@ fn validate_srt_bonding(bond: &SrtBondingConfig, mode: &SrtMode, context: &str) 
                 );
             }
         }
-        if let Some(w) = ep.weight {
-            if matches!(bond.mode, SrtBondingMode::Broadcast) && w != 0 {
+        if let Some(w) = ep.weight
+            && matches!(bond.mode, SrtBondingMode::Broadcast) && w != 0 {
                 bail!(
                     "{context}: bonding endpoint[{i}] weight is only meaningful in backup mode"
                 );
             }
-        }
     }
     Ok(())
 }
@@ -7043,26 +6913,22 @@ fn validate_rist_common_knobs(
     rtcp_interval_ms: Option<u32>,
     context: &str,
 ) -> Result<()> {
-    if let Some(b) = buffer_ms {
-        if !(50..=30_000).contains(&b) {
+    if let Some(b) = buffer_ms
+        && !(50..=30_000).contains(&b) {
             bail!("{context}: buffer_ms must be 50-30000, got {b}");
         }
-    }
-    if let Some(r) = max_nack_retries {
-        if r > 50 {
+    if let Some(r) = max_nack_retries
+        && r > 50 {
             bail!("{context}: max_nack_retries must be ≤ 50, got {r}");
         }
-    }
-    if let Some(c) = cname {
-        if c.len() > 256 {
+    if let Some(c) = cname
+        && c.len() > 256 {
             bail!("{context}: cname must be at most 256 characters");
         }
-    }
-    if let Some(i) = rtcp_interval_ms {
-        if i == 0 || i > 1000 {
+    if let Some(i) = rtcp_interval_ms
+        && (i == 0 || i > 1000) {
             bail!("{context}: rtcp_interval_ms must be 1-1000 (TR-06-1 prefers ≤100), got {i}");
         }
-    }
     Ok(())
 }
 
@@ -7112,14 +6978,13 @@ fn validate_rist_output(rist: &RistOutputConfig) -> Result<()> {
         rist.rtcp_interval_ms,
         &format!("RIST output '{}'", rist.id),
     )?;
-    if let Some(cap) = rist.retransmit_buffer_capacity {
-        if !(64..=65_536).contains(&cap) {
+    if let Some(cap) = rist.retransmit_buffer_capacity
+        && !(64..=65_536).contains(&cap) {
             bail!(
                 "RIST output '{}': retransmit_buffer_capacity must be 64-65536, got {cap}",
                 rist.id
             );
         }
-    }
     if let Some(ref red) = rist.redundancy {
         validate_rist_addr(
             &red.remote_addr,
@@ -7750,16 +7615,14 @@ pub fn validate_tunnel(tunnel: &crate::tunnel::TunnelConfig) -> Result<()> {
     }
 
     // Validate optional string field lengths
-    if let Some(ref s) = tunnel.tunnel_psk {
-        if s.len() > 256 {
+    if let Some(ref s) = tunnel.tunnel_psk
+        && s.len() > 256 {
             bail!("Tunnel '{}': tunnel_psk must be at most 256 characters", tunnel.id);
         }
-    }
-    if let Some(ref addr) = tunnel.peer_addr {
-        if addr.len() > 256 {
+    if let Some(ref addr) = tunnel.peer_addr
+        && addr.len() > 256 {
             bail!("Tunnel '{}': peer_addr must be at most 256 characters", tunnel.id);
         }
-    }
     if let Some(ref addr) = tunnel.direct_listen_addr {
         validate_socket_addr(addr, &format!("Tunnel '{}' direct_listen_addr", tunnel.id))?;
     }
@@ -8050,15 +7913,13 @@ fn validate_port_conflicts(config: &AppConfig) -> Result<()> {
         // Direct mode ingress binds a QUIC listener on direct_listen_addr.
         if tunnel.mode == crate::tunnel::config::TunnelMode::Direct
             && tunnel.direction == crate::tunnel::config::TunnelDirection::Ingress
-        {
-            if let Some(ref addr) = tunnel.direct_listen_addr {
+            && let Some(ref addr) = tunnel.direct_listen_addr {
                 register(
                     addr,
                     Proto::Udp, // QUIC runs over UDP
                     format!("Tunnel '{}' (direct QUIC listener)", tunnel.name),
                 )?;
             }
-        }
     }
 
     // ── Inputs ──
@@ -8092,15 +7953,14 @@ fn validate_port_conflicts(config: &AppConfig) -> Result<()> {
                         format!("{label_prefix} (SRT {})", srt_bind_role(cfg.mode)),
                     )?;
                 }
-                if let Some(ref red) = cfg.redundancy {
-                    if let Some(ref addr) = red.local_addr {
+                if let Some(ref red) = cfg.redundancy
+                    && let Some(ref addr) = red.local_addr {
                         register(
                             addr,
                             Proto::Udp,
                             format!("{label_prefix} (SRT redundancy leg 2)"),
                         )?;
                     }
-                }
             }
             InputConfig::Rist(cfg) => {
                 // RIST binds RTP on the even port and RTCP on port+1. Register

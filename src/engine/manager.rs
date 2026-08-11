@@ -553,8 +553,8 @@ impl FlowManager {
     /// bind failure, SRT connection error).
     pub async fn create_flow(self: &Arc<Self>, config: ResolvedFlow) -> Result<Arc<FlowRuntime>> {
         // Gate flow creation when system resources are critical
-        if self.resource_state.resources_critical.load(Ordering::Relaxed) {
-            if matches!(self.resource_action, Some(ResourceLimitAction::GateFlows)) {
+        if self.resource_state.resources_critical.load(Ordering::Relaxed)
+            && matches!(self.resource_action, Some(ResourceLimitAction::GateFlows)) {
                 self.event_sender.emit_flow_with_details(
                     EventSeverity::Warning,
                     category::SYSTEM_RESOURCES,
@@ -567,7 +567,6 @@ impl FlowManager {
                     config.config.id
                 );
             }
-        }
 
         if self.flows.contains_key(&config.config.id) {
             bail!("Flow '{}' is already running", config.config.id);
@@ -638,8 +637,8 @@ impl FlowManager {
                 (enc.vaapi_max_sessions, usage.vaapi_in_use, "vaapi"),
             ];
             for (max, in_use, family) in checks {
-                if let Some(max) = max {
-                    if in_use > max {
+                if let Some(max) = max
+                    && in_use > max {
                         let msg = format!(
                             "Flow '{flow_id}' caused {family} encoder oversubscription: \
                             {in_use} sessions in use, {max} probed at startup. \
@@ -660,7 +659,6 @@ impl FlowManager {
                             }),
                         );
                     }
-                }
             }
         }
 
@@ -676,8 +674,8 @@ impl FlowManager {
                 (dec.vaapi_max_sessions, usage.vaapi_decode_in_use, "vaapi"),
             ];
             for (max, in_use, family) in dec_checks {
-                if let Some(max) = max {
-                    if in_use > max {
+                if let Some(max) = max
+                    && in_use > max {
                         let msg = format!(
                             "Flow '{flow_id}' caused {family} decoder oversubscription: \
                             {in_use} sessions in use, {max} probed at startup. \
@@ -698,7 +696,6 @@ impl FlowManager {
                             }),
                         );
                     }
-                }
             }
         }
     }

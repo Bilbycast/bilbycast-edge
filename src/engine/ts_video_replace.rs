@@ -957,8 +957,8 @@ mod inner {
                     }
                 }
 
-                if let Some(pmt_pid) = self.pmt_pid {
-                    if pid == pmt_pid && ts_pusi(pkt) {
+                if let Some(pmt_pid) = self.pmt_pid
+                    && pid == pmt_pid && ts_pusi(pkt) {
                         // Learn the audio PIDs so the PCR can be floored on
                         // PASSTHROUGH audio when this is a video-only transcode.
                         if let Ok(arr) = <&[u8; TS_PACKET_SIZE]>::try_from(pkt) {
@@ -1045,7 +1045,6 @@ mod inner {
                         }
                         continue;
                     }
-                }
 
                 if Some(pid) == self.video_pid {
                     self.feed_video_packet(pkt, output);
@@ -1055,11 +1054,10 @@ mod inner {
                 // Passthrough. Track passthrough audio PES PTS so the PCR can
                 // be floored on it (video-only transcode, where no audio
                 // replacer publishes via `audio_pts_floor`).
-                if ts_pusi(pkt) && self.audio_pids.contains(&pid) {
-                    if let Some(apts) = extract_pes_pts(pkt) {
+                if ts_pusi(pkt) && self.audio_pids.contains(&pid)
+                    && let Some(apts) = extract_pes_pts(pkt) {
                         self.passthrough_audio_pts = apts;
                     }
-                }
                 output.extend_from_slice(pkt);
             }
 
@@ -1158,19 +1156,18 @@ mod inner {
                 let _ = self.consume_pes(&pes, output);
                 self.pes_started = false;
             }
-            if self.pipeline.is_open() {
-                if let Ok(frames) = self.pipeline.flush() {
+            if self.pipeline.is_open()
+                && let Ok(frames) = self.pipeline.flush() {
                     let vpid = match self.video_pid {
                         Some(p) => p,
                         None => return,
                     };
                     for ef in frames {
                         let queued = self.src_pts_queue.pop_front();
-                        if queued.is_some() {
-                            if let Some(rep) = self.av_skew.as_ref() {
+                        if queued.is_some()
+                            && let Some(rep) = self.av_skew.as_ref() {
                                 rep.set_video_delta(0); // PTS == source value
                             }
-                        }
                         let pts_for_pes = queued.unwrap_or(self.pts_90k);
                         let pes = build_video_pes(&ef.data, pts_for_pes);
                         // PCR is derived from the source PES PTS —
@@ -1201,7 +1198,6 @@ mod inner {
                         self.pts_90k = pts_for_pes.wrapping_add(self.pts_step_90k);
                     }
                 }
-            }
         }
 
         fn feed_video_packet(&mut self, pkt: &[u8], output: &mut Vec<u8>) {
@@ -1518,11 +1514,10 @@ mod inner {
                     // (encoder catch-up burst emitting more frames than
                     // we've pushed inputs for since the last drain).
                     let queued = self.src_pts_queue.pop_front();
-                    if queued.is_some() {
-                        if let Some(rep) = self.av_skew.as_ref() {
+                    if queued.is_some()
+                        && let Some(rep) = self.av_skew.as_ref() {
                             rep.set_video_delta(0); // PTS == source value
                         }
-                    }
                     let pts_for_pes = queued.unwrap_or(self.pts_90k);
                     let pes = build_video_pes(&ef.data, pts_for_pes);
                     // PCR sits PCR_PREROLL_27MHZ behind the master clock

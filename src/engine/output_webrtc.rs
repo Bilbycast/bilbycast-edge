@@ -127,8 +127,8 @@ fn resolve_webrtc_video_backend(
     // at H.264 — if the resolver picked an HEVC backend (because Auto
     // got hevc_auto / auto), reject with the same not-supported event
     // shape. WebRTC browsers only decode H.264.
-    if codec == "h264_auto" || codec == "auto" {
-        if crate::engine::hardware_probe::static_capabilities().is_some() {
+    if (codec == "h264_auto" || codec == "auto")
+        && crate::engine::hardware_probe::static_capabilities().is_some() {
             match crate::engine::hardware_probe::resolve_for_video_encode_config(cfg) {
                 Ok(r) if r.family() == crate::engine::hardware_probe::EncoderFamily::H264 => {
                     tracing::info!(
@@ -174,7 +174,6 @@ fn resolve_webrtc_video_backend(
         // No probe snapshot → fall through to legacy mapping (which
         // doesn't recognise auto, so reports unknown_codec). Production
         // always has caps installed; this is just a test-path fallback.
-    }
     match codec {
         "x264" => Some(video_codec::VideoEncoderCodec::X264),
         "h264_nvenc" => Some(video_codec::VideoEncoderCodec::H264Nvenc),
@@ -955,8 +954,8 @@ async fn whep_viewer_loop(
                                         Some(audio_pt),
                                     ) = (&mut encoder_state, audio_mid, audio_pt)
                                     {
-                                        if decoder.is_none() {
-                                            if let Some(c) = demuxer.cached_aac_config() {
+                                        if decoder.is_none()
+                                            && let Some(c) = demuxer.cached_aac_config() {
                                                 let ep = encoder.params().clone();
                                                 webrtc_lazy_build_decoder_and_transcoder(
                                                     decoder,
@@ -967,7 +966,6 @@ async fn whep_viewer_loop(
                                                     output_id,
                                                 );
                                             }
-                                        }
                                         if let Some(sg) = silence.as_mut() {
                                             sg.mark_real_audio(pts);
                                         }
@@ -1117,12 +1115,11 @@ async fn whep_viewer_loop(
                         }
 
                         // Drive str0m: process incoming RTCP/STUN + send queued output.
-                        if let Some(ev) = session.drive_udp_io().await {
-                            if let SessionEvent::Disconnected = ev {
+                        if let Some(ev) = session.drive_udp_io().await
+                            && let SessionEvent::Disconnected = ev {
                                 tracing::info!("WHEP viewer '{}' disconnected during send", session_id);
                                 break;
                             }
-                        }
                     }
                     Err(broadcast::error::RecvError::Lagged(n)) => {
                         stats.packets_dropped.fetch_add(n, Ordering::Relaxed);
@@ -1455,8 +1452,8 @@ async fn whip_client_loop(
                                             Some(audio_pt),
                                         ) = (&mut encoder_state, audio_mid, audio_pt)
                                         {
-                                            if decoder.is_none() {
-                                                if let Some(c) = demuxer.cached_aac_config() {
+                                            if decoder.is_none()
+                                                && let Some(c) = demuxer.cached_aac_config() {
                                                     let ep = encoder.params().clone();
                                                     webrtc_lazy_build_decoder_and_transcoder(
                                                         decoder,
@@ -1467,7 +1464,6 @@ async fn whip_client_loop(
                                                         &config.id,
                                                     );
                                                 }
-                                            }
                                             if let Some(sg) = silence.as_mut() {
                                                 sg.mark_real_audio(pts);
                                             }

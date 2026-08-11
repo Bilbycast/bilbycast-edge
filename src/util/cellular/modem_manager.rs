@@ -223,11 +223,10 @@ fn band_label(bands: &[u32], access_tech: u32) -> Option<String> {
     let nr = |v: u32| (301..=599).contains(&v).then(|| format!("n{}", v - 300));
     let eutran = |v: u32| (31..=130).contains(&v).then(|| format!("B{}", v - 30));
     let prefer_nr = access_tech & MM_AT_5GNR != 0;
-    if prefer_nr {
-        if let Some(b) = bands.iter().find_map(|&v| nr(v)) {
+    if prefer_nr
+        && let Some(b) = bands.iter().find_map(|&v| nr(v)) {
             return Some(b);
         }
-    }
     if let Some(b) = bands.iter().find_map(|&v| eutran(v)) {
         return Some(b);
     }
@@ -283,11 +282,10 @@ fn build_signal(s: &ModemSnapshot) -> Option<CellularSignal> {
     sig.bars = derive_bars(&sig);
     // If the per-tech signal dict was empty, fall back to the coarse
     // SignalQuality percentage for the bar glyph.
-    if sig.bars.is_none() {
-        if let Some(pct) = s.signal_quality_pct {
+    if sig.bars.is_none()
+        && let Some(pct) = s.signal_quality_pct {
             sig.bars = Some(((pct as f32 / 20.0).round() as u8).min(5));
         }
-    }
     let empty = sig.rsrp_dbm.is_none()
         && sig.rsrq_db.is_none()
         && sig.sinr_db.is_none()
@@ -393,11 +391,10 @@ mod dbus {
         if let Ok(sim) = modem.get_property::<OwnedObjectPath>("Sim").await {
             snap.has_sim = sim.as_str() != "/";
         }
-        if let Ok(slot) = modem.get_property::<u32>("PrimarySimSlot").await {
-            if slot > 0 {
+        if let Ok(slot) = modem.get_property::<u32>("PrimarySimSlot").await
+            && slot > 0 {
                 snap.sim_slot = Some(slot.min(u8::MAX as u32) as u8);
             }
-        }
 
         // 3GPP registration + operator (absent until registered).
         if let Ok(m3gpp) = zbus::Proxy::new(conn, MM_DEST, path, IFACE_3GPP).await {

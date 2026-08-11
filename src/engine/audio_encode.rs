@@ -1546,11 +1546,10 @@ fn is_opus_header(packet: &[u8], header_type_flag: u8) -> bool {
     if (header_type_flag & 0x02) != 0 {
         return true;
     }
-    if packet.len() >= 8 {
-        if &packet[..8] == b"OpusHead" || &packet[..8] == b"OpusTags" {
+    if packet.len() >= 8
+        && (&packet[..8] == b"OpusHead" || &packet[..8] == b"OpusTags") {
             return true;
         }
-    }
     false
 }
 

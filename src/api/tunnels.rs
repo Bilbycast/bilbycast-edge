@@ -147,8 +147,8 @@ pub async fn delete_tunnel(
     let before = cfg.tunnels.len();
     cfg.tunnels.retain(|t| t.id != id);
     let removed_from_config = cfg.tunnels.len() != before;
-    if was_live || removed_from_config {
-        if let Err(e) = save_config_split_async(
+    if (was_live || removed_from_config)
+        && let Err(e) = save_config_split_async(
             state.config_path.clone(),
             state.secrets_path.clone(),
             cfg.clone(),
@@ -161,7 +161,6 @@ pub async fn delete_tunnel(
             )
                 .into_response();
         }
-    }
     Json(serde_json::json!({
         "status": "deleted",
         "was_live": was_live,

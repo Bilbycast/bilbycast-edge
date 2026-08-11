@@ -96,23 +96,21 @@ impl MediaAwareScheduler {
         while i + 3 < slice.len() {
             // 4-byte start code
             if slice[i] == 0 && slice[i + 1] == 0 && slice[i + 2] == 0 && slice[i + 3] == 1 {
-                if let Some(nal) = slice.get(i + 4) {
-                    if is_critical_h264(*nal) || is_critical_hevc(*nal) {
+                if let Some(nal) = slice.get(i + 4)
+                    && (is_critical_h264(*nal) || is_critical_hevc(*nal)) {
                         critical = true;
                         break;
                     }
-                }
                 i += 4;
                 continue;
             }
             // 3-byte start code
             if slice[i] == 0 && slice[i + 1] == 0 && slice[i + 2] == 1 {
-                if let Some(nal) = slice.get(i + 3) {
-                    if is_critical_h264(*nal) || is_critical_hevc(*nal) {
+                if let Some(nal) = slice.get(i + 3)
+                    && (is_critical_h264(*nal) || is_critical_hevc(*nal)) {
                         critical = true;
                         break;
                     }
-                }
                 i += 3;
                 continue;
             }

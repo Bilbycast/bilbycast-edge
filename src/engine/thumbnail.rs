@@ -980,12 +980,11 @@ fn warm_decode_loop(
                 let due = last_encode
                     .map(|t| t.elapsed() >= WARM_ENCODE_MIN_GAP)
                     .unwrap_or(true);
-                if due {
-                    if let Some(result) = warm_scale_encode(&f, &mut scaler, &encoder, &cfg) {
+                if due
+                    && let Some(result) = warm_scale_encode(&f, &mut scaler, &encoder, &cfg) {
                         *latest.lock().unwrap() = Some(result);
                         last_encode = Some(std::time::Instant::now());
                     }
-                }
             }
         }
     }
@@ -1425,12 +1424,11 @@ fn build_annex_b(nalus: &[Vec<u8>]) -> Vec<u8> {
 fn build_headers(demuxer: &TsDemuxer, codec: video_codec::VideoCodec) -> Vec<u8> {
     let mut out = Vec::with_capacity(128);
     let push = |out: &mut Vec<u8>, nalu: Option<&[u8]>| {
-        if let Some(n) = nalu {
-            if !n.is_empty() {
+        if let Some(n) = nalu
+            && !n.is_empty() {
                 out.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]);
                 out.extend_from_slice(n);
             }
-        }
     };
     match codec {
         video_codec::VideoCodec::H264 => {
@@ -1985,11 +1983,10 @@ mod tests {
                 while let Ok(f) = decoder.receive_frame() {
                     frame_no += 1;
                     // Sample roughly the rate the async loop would at ~1 s.
-                    if frame_no.is_multiple_of(25) {
-                        if let Some(r) = warm_scale_encode(&f, &mut scaler, &encoder, &cfg) {
+                    if frame_no.is_multiple_of(25)
+                        && let Some(r) = warm_scale_encode(&f, &mut scaler, &encoder, &cfg) {
                             warm_hashes.insert(hash_jpeg(&r.jpeg));
                         }
-                    }
                 }
             }
         }

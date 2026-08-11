@@ -142,11 +142,10 @@ pub async fn export_recording_mp4_chunk(
     byte_offset: u64,
     max_bytes: u64,
 ) -> Result<ExportChunk> {
-    if let (Some(from), Some(to)) = (from_pts_90khz, to_pts_90khz) {
-        if to <= from {
+    if let (Some(from), Some(to)) = (from_pts_90khz, to_pts_90khz)
+        && to <= from {
             bail!("replay_invalid_range");
         }
-    }
     let cache_key = format!(
         "rec:{recording_id}:{}:{}",
         from_pts_90khz.unwrap_or(0),

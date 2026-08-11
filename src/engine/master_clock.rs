@@ -831,11 +831,10 @@ impl MasterClock for PcrPllWithFallback {
             // The first time it loses lock, demote one-way to wallclock so
             // we never emit PCR off an unlocked, undisciplined PTP clock.
             if self.fallback_uses_ptp.load(Ordering::Acquire) {
-                if let Some(ptp) = &self.ptp_fallback {
-                    if ptp.is_locked() {
+                if let Some(ptp) = &self.ptp_fallback
+                    && ptp.is_locked() {
                         return ptp.now_27mhz();
                     }
-                }
                 self.fallback_uses_ptp.store(false, Ordering::Release);
             }
             self.wallclock.now_27mhz()

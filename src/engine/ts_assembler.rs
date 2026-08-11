@@ -199,11 +199,10 @@ fn slot_health_identity(
     key: (usize, u16),
     active_leg_input: &HashMap<(usize, u16), String>,
 ) -> (String, u16) {
-    if let (Some(legs), Some(active)) = (&slot.switch_legs, active_leg_input.get(&key)) {
-        if let Some((iid, pid)) = legs.iter().find(|(iid, _)| iid == active) {
+    if let (Some(legs), Some(active)) = (&slot.switch_legs, active_leg_input.get(&key))
+        && let Some((iid, pid)) = legs.iter().find(|(iid, _)| iid == active) {
             return (iid.clone(), *pid);
         }
-    }
     slot.source.clone()
 }
 
@@ -885,8 +884,8 @@ async fn run_assembler(
                         if matches!(
                             splice_mode_override,
                             Some(crate::config::models::SpliceMode::PesAligned)
-                        ) {
-                            if let Some(es_) = &event_sender {
+                        )
+                            && let Some(es_) = &event_sender {
                                 es_.emit_flow_with_details(
                                     crate::manager::events::EventSeverity::Warning,
                                     crate::manager::events::category::FLOW,
@@ -904,7 +903,6 @@ async fn run_assembler(
                                     }),
                                 );
                             }
-                        }
                         // Arm DI on every out_pid — the next PCR-bearing
                         // TS packet on each will carry
                         // `discontinuity_indicator = 1`. Without this,
@@ -1033,8 +1031,8 @@ async fn run_assembler(
                                     // through to PmtBump silently
                                     // (first switch on a freshly-armed
                                     // flow).
-                                } else if want_video {
-                                    if let Some(&last_pts) = last_a_pts.get(&key) {
+                                } else if want_video
+                                    && let Some(&last_pts) = last_a_pts.get(&key) {
                                         let budget_ms = slot
                                             .splice_budget_ms
                                             .unwrap_or(DEFAULT_VIDEO_SPLICE_BUDGET_MS);
@@ -1072,7 +1070,6 @@ async fn run_assembler(
                                     }
                                     // No prior PTS observed → fall
                                     // through to PmtBump silently.
-                                }
 
                                 // PES-aligned was requested (override or
                                 // slot config) but we reached the PmtBump
@@ -1085,8 +1082,8 @@ async fn run_assembler(
                                 // Budget-exhaustion degrades emit
                                 // `pes_splice_timeout` separately on the
                                 // flush tick.
-                                if pes_aligned {
-                                    if let Some(es_) = &event_sender {
+                                if pes_aligned
+                                    && let Some(es_) = &event_sender {
                                         let reason = if want_audio || want_video {
                                             "no_aligned_pes_reference"
                                         } else {
@@ -1115,7 +1112,6 @@ async fn run_assembler(
                                             }),
                                         );
                                     }
-                                }
 
                                 // PmtBump path (today's behaviour).
                                 active_leg_input.insert(key, new_input_id.clone());
@@ -1214,14 +1210,13 @@ async fn run_assembler(
                             ) {
                                 last_a_pts.insert(key, pts);
                             }
-                            if matches!(slot.stream_type, 0x0F | 0x11) {
-                                if let Some(p) = extract_aac_params_from_pes(
+                            if matches!(slot.stream_type, 0x0F | 0x11)
+                                && let Some(p) = extract_aac_params_from_pes(
                                     &es.payload,
                                     slot.stream_type,
                                 ) {
                                     last_a_aac_params.insert(key, p);
                                 }
-                            }
                             // Snapshot SPS-derived params for video slots
                             // on every active-leg PUSI=1 that carries a
                             // parseable SPS. Most encoders emit SPS on
@@ -1233,14 +1228,13 @@ async fn run_assembler(
                             // video splice slot. Well off the per-packet
                             // hot path (PUSI=1 is once per frame, not per
                             // 188 B).
-                            if is_supported_video_stream_type(slot.stream_type) {
-                                if let Some(p) = extract_video_params_from_pes(
+                            if is_supported_video_stream_type(slot.stream_type)
+                                && let Some(p) = extract_video_params_from_pes(
                                     &es.payload,
                                     slot.stream_type,
                                 ) {
                                     last_a_video_params.insert(key, p);
                                 }
-                            }
                         }
                         if audio_splice_pending {
                             // Pending audio splice: keep A's AAC params
@@ -1251,11 +1245,9 @@ async fn run_assembler(
                             // completion state.
                             if matches!(slot.stream_type, 0x0F | 0x11)
                                 && crate::engine::ts_parse::ts_pusi(&es.payload)
-                            {
-                                if let Some(s) = splice_state.get_mut(&key) {
+                                && let Some(s) = splice_state.get_mut(&key) {
                                     s.record_a_audio_params(&es.payload);
                                 }
-                            }
                             let action = splice_state
                                 .get_mut(&key)
                                 .map(|s| s.observe_a_packet(&es.payload))
@@ -1270,11 +1262,10 @@ async fn run_assembler(
                             // completion (matters when A emits another
                             // IDR between arm and AU end). Then decide
                             // forward vs drop based on AU completion.
-                            if crate::engine::ts_parse::ts_pusi(&es.payload) {
-                                if let Some(s) = video_splice_state.get_mut(&key) {
+                            if crate::engine::ts_parse::ts_pusi(&es.payload)
+                                && let Some(s) = video_splice_state.get_mut(&key) {
                                     s.record_a_video_params(&es.payload);
                                 }
-                            }
                             let action = video_splice_state
                                 .get_mut(&key)
                                 .map(|s| s.observe_a_packet(&es.payload))
@@ -1540,14 +1531,13 @@ async fn run_assembler(
                                 last_a_pts.insert(key, first_b_pts);
                                 // Refresh A's AAC snapshot to B's params
                                 // (B is the new A for the next splice).
-                                if matches!(slot.stream_type, 0x0F | 0x11) {
-                                    if let Some(p) = extract_aac_params_from_pes(
+                                if matches!(slot.stream_type, 0x0F | 0x11)
+                                    && let Some(p) = extract_aac_params_from_pes(
                                         &es.payload,
                                         slot.stream_type,
                                     ) {
                                         last_a_aac_params.insert(key, p);
                                     }
-                                }
                                 // Fall through to rewrite + emit this packet
                                 // — it's now the first byte of the new
                                 // active leg.
@@ -1794,11 +1784,9 @@ async fn run_assembler(
                 for pn in refresh_slot_es_info(&plan, &catalogs, &mut es_info_by_slot, true) {
                     if let Some(pidx) =
                         plan.programs.iter().position(|p| p.program_number == pn)
-                    {
-                        if let Some(v) = pmt_versions.get_mut(pidx) {
+                        && let Some(v) = pmt_versions.get_mut(pidx) {
                             *v = v.wrapping_add(1) & 0x1F;
                         }
-                    }
                 }
                 push_psi(
                     &mut buf,
@@ -1936,11 +1924,10 @@ async fn run_assembler(
                         );
                     }
                 }
-                if let Some(cell) = &health_cell {
-                    if let Ok(mut g) = cell.write() {
+                if let Some(cell) = &health_cell
+                    && let Ok(mut g) = cell.write() {
                         *g = Some(health);
                     }
-                }
             }
         }
     }

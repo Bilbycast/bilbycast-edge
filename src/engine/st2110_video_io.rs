@@ -735,11 +735,10 @@ fn encode_worker(
         );
     }
     let mut ts_mux = TsMuxer::new();
-    if let Some(po) = pid_overrides.as_ref() {
-        if let Some(entry) = po.get(&1) {
+    if let Some(po) = pid_overrides.as_ref()
+        && let Some(entry) = po.get(&1) {
                 ts_mux.set_pids(entry.pmt_pid, entry.video_pid, entry.audio_pid, entry.pcr_pid);
             }
-    }
     let mut pts: i64 = 0;
     let mut last_rtp_ts: Option<u32> = None;
 
@@ -954,8 +953,8 @@ fn encode_worker(
     // frames in flight; synchronous backends drain nothing here. Only
     // matters when downstream subscribers are still up during teardown,
     // but it keeps output_frames == input_frames at end of stream.
-    if pipeline.is_open() {
-        if let Ok(frames) = pipeline.flush() {
+    if pipeline.is_open()
+        && let Ok(frames) = pipeline.flush() {
             for ef in frames {
                 encode_stats.output_frames.fetch_add(1, Ordering::Relaxed);
                 let ts_packets =
@@ -978,7 +977,6 @@ fn encode_worker(
                 }
             }
         }
-    }
 }
 
 #[cfg(not(feature = "media-codecs"))]

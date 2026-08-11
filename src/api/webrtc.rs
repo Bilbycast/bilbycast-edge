@@ -38,15 +38,14 @@ pub mod handlers {
         }
 
         // Validate Content-Type
-        if let Some(ct) = headers.get(header::CONTENT_TYPE) {
-            if ct.to_str().unwrap_or("") != "application/sdp" {
+        if let Some(ct) = headers.get(header::CONTENT_TYPE)
+            && ct.to_str().unwrap_or("") != "application/sdp" {
                 return Err(StatusCode::UNSUPPORTED_MEDIA_TYPE);
             }
-        }
 
         // Validate Bearer token if configured
-        if let Some(ref registry) = state.webrtc_sessions {
-            if let Some(ref expected_token) = registry.whip_bearer_token(&flow_id) {
+        if let Some(ref registry) = state.webrtc_sessions
+            && let Some(ref expected_token) = registry.whip_bearer_token(&flow_id) {
                 let provided = headers
                     .get(header::AUTHORIZATION)
                     .and_then(|v| v.to_str().ok())
@@ -56,7 +55,6 @@ pub mod handlers {
                     _ => return Err(StatusCode::UNAUTHORIZED),
                 }
             }
-        }
 
         // Create WebRTC session and process SDP offer
         let registry = state.webrtc_sessions.as_ref().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
@@ -105,15 +103,14 @@ pub mod handlers {
             return Err(StatusCode::NOT_FOUND);
         }
 
-        if let Some(ct) = headers.get(header::CONTENT_TYPE) {
-            if ct.to_str().unwrap_or("") != "application/sdp" {
+        if let Some(ct) = headers.get(header::CONTENT_TYPE)
+            && ct.to_str().unwrap_or("") != "application/sdp" {
                 return Err(StatusCode::UNSUPPORTED_MEDIA_TYPE);
             }
-        }
 
         // Validate Bearer token if configured
-        if let Some(ref registry) = state.webrtc_sessions {
-            if let Some(ref expected_token) = registry.whep_bearer_token(&flow_id) {
+        if let Some(ref registry) = state.webrtc_sessions
+            && let Some(ref expected_token) = registry.whep_bearer_token(&flow_id) {
                 let provided = headers
                     .get(header::AUTHORIZATION)
                     .and_then(|v| v.to_str().ok())
@@ -123,7 +120,6 @@ pub mod handlers {
                     _ => return Err(StatusCode::UNAUTHORIZED),
                 }
             }
-        }
 
         let registry = state.webrtc_sessions.as_ref().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
         let (answer_sdp, session_id) = registry

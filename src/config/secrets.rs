@@ -317,11 +317,10 @@ impl SecretsConfig {
 
         // Cellular-uplink secrets (keyed by interface).
         for uplink in &mut config.cellular_uplinks {
-            if let Some(cs) = self.cellular_uplinks.get(&uplink.interface) {
-                if cs.password.is_some() && uplink.password.is_none() {
+            if let Some(cs) = self.cellular_uplinks.get(&uplink.interface)
+                && cs.password.is_some() && uplink.password.is_none() {
                     uplink.password = cs.password.clone();
                 }
-            }
         }
 
         // Legacy flow secrets migration: if old secrets.json had flow secrets,
@@ -356,13 +355,11 @@ impl SecretsConfig {
                 if is.passphrase.is_some() && srt.passphrase.is_none() {
                     srt.passphrase = is.passphrase.clone();
                 }
-                if is.redundancy_passphrase.is_some() {
-                    if let Some(ref mut red) = srt.redundancy {
-                        if red.passphrase.is_none() {
+                if is.redundancy_passphrase.is_some()
+                    && let Some(ref mut red) = srt.redundancy
+                        && red.passphrase.is_none() {
                             red.passphrase = is.redundancy_passphrase.clone();
                         }
-                    }
-                }
             }
             InputConfig::Rtmp(rtmp) => {
                 if is.stream_key.is_some() && rtmp.stream_key.is_none() {
@@ -421,20 +418,17 @@ impl SecretsConfig {
                 if os.passphrase.is_some() && srt.passphrase.is_none() {
                     srt.passphrase = os.passphrase.clone();
                 }
-                if os.redundancy_passphrase.is_some() {
-                    if let Some(ref mut red) = srt.redundancy {
-                        if red.passphrase.is_none() {
+                if os.redundancy_passphrase.is_some()
+                    && let Some(ref mut red) = srt.redundancy
+                        && red.passphrase.is_none() {
                             red.passphrase = os.redundancy_passphrase.clone();
                         }
-                    }
-                }
             }
             OutputConfig::Rtmp(rtmp) => {
-                if let Some(ref key) = os.stream_key {
-                    if rtmp.stream_key.is_empty() {
+                if let Some(ref key) = os.stream_key
+                    && rtmp.stream_key.is_empty() {
                         rtmp.stream_key = key.clone();
                     }
-                }
             }
             OutputConfig::Hls(hls) => {
                 if os.auth_token.is_some() && hls.auth_token.is_none() {
@@ -571,11 +565,10 @@ impl AppConfig {
 /// secrets for this purpose — they stay in `config.json`.
 pub fn has_secrets(config: &AppConfig) -> bool {
     // Manager secrets
-    if let Some(ref mgr) = config.manager {
-        if mgr.node_secret.is_some() || mgr.registration_token.is_some() {
+    if let Some(ref mgr) = config.manager
+        && (mgr.node_secret.is_some() || mgr.registration_token.is_some()) {
             return true;
         }
-    }
 
     // Server TLS/auth
     if config.server.tls.is_some() || config.server.auth.is_some() {
@@ -588,11 +581,10 @@ pub fn has_secrets(config: &AppConfig) -> bool {
     }
 
     // NMOS registration bearer token
-    if let Some(ref nr) = config.nmos_registration {
-        if nr.bearer_token.is_some() {
+    if let Some(ref nr) = config.nmos_registration
+        && nr.bearer_token.is_some() {
             return true;
         }
-    }
 
     // Tunnel secrets
     for tunnel in &config.tunnels {

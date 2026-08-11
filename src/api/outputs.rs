@@ -129,8 +129,8 @@ pub async fn update_output(
 
     // If a flow uses this output and is running, hot-swap it
     let flow_id = config.flow_using_output(&output_id).map(|f| f.id.clone());
-    if let Some(fid) = &flow_id {
-        if state.flow_manager.is_running(fid) && old_output != output {
+    if let Some(fid) = &flow_id
+        && state.flow_manager.is_running(fid) && old_output != output {
             // Hot-remove old, hot-add new
             if let Err(e) = state.flow_manager.remove_output(fid, &output_id).await {
                 tracing::warn!("Failed to remove output '{output_id}' from flow '{fid}': {e}");
@@ -139,7 +139,6 @@ pub async fn update_output(
                 tracing::error!("Failed to re-add output '{output_id}' to flow '{fid}': {e}");
             }
         }
-    }
 
     save_config_split_async(state.config_path.clone(), state.secrets_path.clone(), config.clone())
         .await

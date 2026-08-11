@@ -108,13 +108,12 @@ pub async fn fetch_with_sha256(
                     backoff(attempt).await;
                     continue;
                 }
-                if let Some(len) = resp.content_length() {
-                    if (len as usize) > MAX_TARBALL_BYTES {
+                if let Some(len) = resp.content_length()
+                    && (len as usize) > MAX_TARBALL_BYTES {
                         bail!(
                             "{url} content-length {len} exceeds tarball cap {MAX_TARBALL_BYTES}"
                         );
                     }
-                }
                 let mut stream = resp.bytes_stream();
                 use futures_util::StreamExt as _;
                 while let Some(chunk) = stream.next().await {

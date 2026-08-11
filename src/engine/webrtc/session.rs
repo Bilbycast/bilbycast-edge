@@ -559,11 +559,10 @@ fn select_local_candidate_ips(
     }
     let mut out: Vec<std::net::IpAddr> =
         vec![std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)];
-    if let Some(lan) = route_discovered_lan_ip() {
-        if !out.contains(&lan) {
+    if let Some(lan) = route_discovered_lan_ip()
+        && !out.contains(&lan) {
             out.push(lan);
         }
-    }
     out
 }
 

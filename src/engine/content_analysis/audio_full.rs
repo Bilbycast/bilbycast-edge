@@ -76,12 +76,11 @@ fn hard_mute_threshold_samples(sample_rate: u32) -> u64 {
 /// mode, which keeps callers branch-free.
 fn update_window_true_peak(r128: &EbuR128, channels: u32, window: &mut Option<f64>) {
     for ch in 0..channels {
-        if let Ok(linear) = r128.prev_true_peak(ch) {
-            if linear > 0.0 {
+        if let Ok(linear) = r128.prev_true_peak(ch)
+            && linear > 0.0 {
                 let dbtp = 20.0 * linear.log10();
                 *window = Some(window.map_or(dbtp, |prev| prev.max(dbtp)));
             }
-        }
     }
 }
 
@@ -415,9 +414,9 @@ impl AudioPidState {
             let channel_config = ((buf[2] & 0x01) << 2) | ((buf[3] >> 6) & 0x03);
 
             // Initialise decoder lazily once we have a valid config.
-            if self.aac_decoder.is_none() {
-                if let Some(sr) = sample_rate_from_index(sr_index) {
-                    if (1..=7).contains(&channel_config)
+            if self.aac_decoder.is_none()
+                && let Some(sr) = sample_rate_from_index(sr_index)
+                    && (1..=7).contains(&channel_config)
                         && let Ok(dec) =
                             AacDecoder::from_adts_config(profile, sr_index, channel_config)
                     {
@@ -436,8 +435,6 @@ impl AudioPidState {
                             self.r128 = Some(r128);
                         }
                     }
-                }
-            }
             let frame = &buf[header_len..frame_len];
             if let Some(ref mut dec) = self.aac_decoder {
                 match dec.decode_frame(frame) {
@@ -539,8 +536,8 @@ impl AudioPidState {
             if self.silent_since.is_none() {
                 self.silent_since = Some(now);
             }
-            if let Some(since) = self.silent_since {
-                if now.duration_since(since) >= SILENCE_DEBOUNCE && !self.likely_silent {
+            if let Some(since) = self.silent_since
+                && now.duration_since(since) >= SILENCE_DEBOUNCE && !self.likely_silent {
                     self.likely_silent = true;
                     let fire = self
                         .last_silence_event_at
@@ -570,7 +567,6 @@ impl AudioPidState {
                         self.last_silence_event_at = Some(now);
                     }
                 }
-            }
         } else {
             self.silent_since = None;
             self.likely_silent = false;
@@ -989,15 +985,14 @@ impl PcmAudioState {
         self.hard_mute_active = self.zero_sample_run >= mute_threshold;
 
         // Feed R128 with the interleaved buffer (ebur128 wants interleaved).
-        if let Some(ref mut r128) = self.r128 {
-            if r128.add_frames_f32(&self.interleaved_scratch).is_ok() {
+        if let Some(ref mut r128) = self.r128
+            && r128.add_frames_f32(&self.interleaved_scratch).is_ok() {
                 update_window_true_peak(
                     r128,
                     self.channels as u32,
                     &mut self.window_true_peak_dbtp,
                 );
             }
-        }
 
         if self.clip_run_sec_start.elapsed() >= Duration::from_secs(1) {
             self.clip_rate_pps = self.clip_samples_this_second as f64;
@@ -1027,8 +1022,8 @@ impl PcmAudioState {
             if self.silent_since.is_none() {
                 self.silent_since = Some(now);
             }
-            if let Some(since) = self.silent_since {
-                if now.duration_since(since) >= SILENCE_DEBOUNCE && !self.likely_silent {
+            if let Some(since) = self.silent_since
+                && now.duration_since(since) >= SILENCE_DEBOUNCE && !self.likely_silent {
                     self.likely_silent = true;
                     let fire = self
                         .last_silence_event_at
@@ -1054,7 +1049,6 @@ impl PcmAudioState {
                         self.last_silence_event_at = Some(now);
                     }
                 }
-            }
         } else {
             self.silent_since = None;
             self.likely_silent = false;

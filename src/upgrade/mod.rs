@@ -305,8 +305,8 @@ impl UpgradeCoordinator {
         // semver alone would otherwise allow it.
         let state_path = state::path(&cfg.install_root);
         let prev_state = state::load(&state_path).ok();
-        if let Some(ref s) = prev_state {
-            if manifest.sequence <= s.last_sequence {
+        if let Some(ref s) = prev_state
+            && manifest.sequence <= s.last_sequence {
                 return Err(UpgradeError::new(
                     error_codes::UPGRADE_SEQUENCE_TOO_OLD,
                     format!(
@@ -315,7 +315,6 @@ impl UpgradeCoordinator {
                     ),
                 ));
             }
-        }
 
         let artefact = manifest
             .pick_artefact(&arch, &variant)

@@ -187,11 +187,10 @@ async fn process_media(
     pid_overrides: Option<crate::config::models::TsPidOverridesMap>,
 ) {
     let mut muxer = TsMuxer::new();
-    if let Some(po) = pid_overrides.as_ref() {
-        if let Some(entry) = po.get(&1) {
+    if let Some(po) = pid_overrides.as_ref()
+        && let Some(entry) = po.get(&1) {
                 muxer.set_pids(entry.pmt_pid, entry.video_pid, entry.audio_pid, entry.pcr_pid);
             }
-    }
     let mut seq_num: u16 = 0;
     let mut has_sent_sps_pps = false;
     let mut sps: Option<Vec<u8>> = None;

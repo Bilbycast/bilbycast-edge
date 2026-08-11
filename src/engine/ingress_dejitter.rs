@@ -402,8 +402,8 @@ async fn run_drainer(
         // couldn't absorb the burst / rate offset. Drop it + the stale
         // backlog down to the floor, re-anchor, and re-clock from PCR
         // downstream. Bounds latency by construction.
-        if let Some(front) = buffer.front() {
-            if now.saturating_sub(front.recv_time_us) > cfg.shed_residence_us {
+        if let Some(front) = buffer.front()
+            && now.saturating_sub(front.recv_time_us) > cfg.shed_residence_us {
                 buffer.pop_front();
                 let mut shed: u64 = 1;
                 while buffer.len() > cfg.drain_floor_pkts {
@@ -415,7 +415,6 @@ async fn run_drainer(
                 dj_stats.depth.store(buffer.len(), Ordering::Relaxed);
                 continue; // re-evaluate with the trimmed buffer
             }
-        }
 
         // ── Release every front packet whose target has arrived ──
         let mut next_deadline_us: Option<u64> = None;

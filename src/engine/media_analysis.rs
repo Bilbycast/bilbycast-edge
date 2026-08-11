@@ -248,11 +248,10 @@ async fn media_analyzer_loop(
                 // Only send None if frame rate was already unknown before
                 // the switch. Otherwise preserve the old value — the
                 // detection loop will update it when the new rate differs.
-                if preserved_fps.is_none() {
-                    if let Some(ref tx) = frame_rate_tx {
+                if preserved_fps.is_none()
+                    && let Some(ref tx) = frame_rate_tx {
                         let _ = tx.send(None);
                     }
-                }
 
                 tracing::info!("Media analyzer reset for new active input '{new_id}'");
             }
@@ -343,12 +342,11 @@ fn calculate_bitrates(stats: &MediaAnalysisAccumulator) {
     // Decay PIDs we tracked previously but didn't see this tick.
     let known_pids: Vec<u16> = state.pid_bitrates.keys().copied().collect();
     for pid in known_pids {
-        if !updated.contains(&pid) {
-            if let Some(prev) = state.pid_bitrates.get(&pid).copied() {
+        if !updated.contains(&pid)
+            && let Some(prev) = state.pid_bitrates.get(&pid).copied() {
                 let decayed = (prev as f64 * (1.0 - ALPHA)) as u64;
                 state.pid_bitrates.insert(pid, decayed);
             }
-        }
     }
     // Total reflects the full smoothed PID set, not only what the lock
     // observed in the latest tick — the legacy "sum this-tick's drained
@@ -437,11 +435,10 @@ fn process_ts_packet(pkt: &[u8], state: &mut MediaAnalysisState) {
     }
 
     // PMT handling — find the program owning this PID and update its streams.
-    if ts_pusi(pkt) {
-        if let Some(program_idx) = state.programs.iter().position(|p| p.pmt_pid == pid) {
+    if ts_pusi(pkt)
+        && let Some(program_idx) = state.programs.iter().position(|p| p.pmt_pid == pid) {
             parse_pmt_streams(pkt, &mut state.programs[program_idx]);
         }
-    }
 
     // PES header detection for codec detail extraction
     if ts_pusi(pkt) && ts_has_payload(pkt) && pid != PAT_PID {
@@ -766,9 +763,9 @@ fn detect_private_stream_codec(descriptors: &[u8]) -> Option<String> {
             0x7B => return Some("DTS".to_string()),        // DTS descriptor
             0x7C => return Some("AAC".to_string()),        // AAC descriptor
             0xAC => return Some("AC-4".to_string()),       // Dolby AC-4 descriptor
-            0x05 => {
+            0x05
                 // Registration descriptor — check format_identifier
-                if len >= 4 {
+                if len >= 4 => {
                     let id = &descriptors[pos + 2..pos + 6];
                     match id {
                         b"AC-3" => return Some("AC-3".to_string()),
@@ -778,7 +775,6 @@ fn detect_private_stream_codec(descriptors: &[u8]) -> Option<String> {
                         _ => {}
                     }
                 }
-            }
             _ => {}
         }
         pos += 2 + len;
@@ -925,9 +921,9 @@ fn try_parse_video_pes(pkt: &[u8], pid: u16, state: &mut MediaAnalysisState) {
         .flat_map(|p| p.video_streams.iter())
         .any(|v| v.pid == pid && v.frame_rate.is_none());
 
-    if needs_ts_fps {
-        if let Some(ts) = extract_pes_decode_timestamp(payload) {
-            if let Some(v) = state
+    if needs_ts_fps
+        && let Some(ts) = extract_pes_decode_timestamp(payload)
+            && let Some(v) = state
                 .programs
                 .iter_mut()
                 .find_map(|p| p.video_streams.iter_mut().find(|v| v.pid == pid))
@@ -965,8 +961,6 @@ fn try_parse_video_pes(pkt: &[u8], pid: u16, state: &mut MediaAnalysisState) {
                 }
                 v.last_pts = Some(ts);
             }
-        }
-    }
 }
 
 /// Extract a monotonic decode timestamp from a PES header for frame rate measurement.
@@ -1036,9 +1030,9 @@ fn try_parse_audio_pes(pkt: &[u8], pid: u16, state: &mut MediaAnalysisState) {
     match stream_type {
         // MPEG-1 / MPEG-2 audio (Layer I/II/III) — 4-byte header beginning 0xFFE_.
         Some(0x03) | Some(0x04) => {
-            if es_data.len() >= 4 {
-                if let Some(mp) = parse_mpeg_audio_header(es_data) {
-                    if let Some(a) = state
+            if es_data.len() >= 4
+                && let Some(mp) = parse_mpeg_audio_header(es_data)
+                    && let Some(a) = state
                         .programs
                         .iter_mut()
                         .find_map(|p| p.audio_streams.iter_mut().find(|a| a.pid == pid))
@@ -1055,8 +1049,6 @@ fn try_parse_audio_pes(pkt: &[u8], pid: u16, state: &mut MediaAnalysisState) {
                             a.codec,
                         );
                     }
-                }
-            }
         }
         // AAC-LATM (LOAS) — sync 0x2B7 in the top 11 bits. Real broadcasts
         // emit the full StreamMuxConfig in the first frame after a
@@ -1099,8 +1091,8 @@ fn try_parse_audio_pes(pkt: &[u8], pid: u16, state: &mut MediaAnalysisState) {
                         // (latched from an earlier `FullConfig` frame),
                         // reapply it to the live state — this is the
                         // dominant case in real broadcasts.
-                        if !a.header_detected {
-                            if let Some(cached) = a.latm_cached.clone() {
+                        if !a.header_detected
+                            && let Some(cached) = a.latm_cached.clone() {
                                 a.sample_rate_hz = Some(cached.sample_rate);
                                 a.channels = Some(cached.channels);
                                 a.codec = cached.profile_name;
@@ -1114,7 +1106,6 @@ fn try_parse_audio_pes(pkt: &[u8], pid: u16, state: &mut MediaAnalysisState) {
                                     a.codec,
                                 );
                             }
-                        }
                     }
                     LoasParseResult::Unsupported => {}
                 }
@@ -1122,9 +1113,9 @@ fn try_parse_audio_pes(pkt: &[u8], pid: u16, state: &mut MediaAnalysisState) {
         }
         // AAC-ADTS (stream_type 0x0F) — sync 0xFFF.
         _ => {
-            if es_data.len() >= 7 && es_data[0] == 0xFF && (es_data[1] & 0xF0) == 0xF0 {
-                if let Some(adts) = parse_adts_header(es_data) {
-                    if let Some(a) = state
+            if es_data.len() >= 7 && es_data[0] == 0xFF && (es_data[1] & 0xF0) == 0xF0
+                && let Some(adts) = parse_adts_header(es_data)
+                    && let Some(a) = state
                         .programs
                         .iter_mut()
                         .find_map(|p| p.audio_streams.iter_mut().find(|a| a.pid == pid))
@@ -1141,8 +1132,6 @@ fn try_parse_audio_pes(pkt: &[u8], pid: u16, state: &mut MediaAnalysisState) {
                             a.codec,
                         );
                     }
-                }
-            }
         }
     }
 }
@@ -1820,8 +1809,8 @@ fn find_and_parse_mpeg2_sequence(data: &[u8]) -> Option<SpsInfo> {
             // Look for sequence_extension immediately after this header — skip
             // forward past optional load_intra_quantiser_matrix /
             // load_non_intra_quantiser_matrix to find the next start code.
-            if let Some(ext) = find_next_start_code(body, 8) {
-                if ext.code == 0xB5 && ext.body.len() >= 6 {
+            if let Some(ext) = find_next_start_code(body, 8)
+                && ext.code == 0xB5 && ext.body.len() >= 6 {
                     let id = (ext.body[0] >> 4) & 0x0F;
                     if id == 1 {
                         // sequence_extension layout (8 bits skipped above for id+1 nibble):
@@ -1861,7 +1850,6 @@ fn find_and_parse_mpeg2_sequence(data: &[u8]) -> Option<SpsInfo> {
                         h |= vsize_ext << 12;
                     }
                 }
-            }
 
             if w == 0 || h == 0 {
                 return None;

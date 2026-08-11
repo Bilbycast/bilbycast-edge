@@ -176,8 +176,8 @@ pub fn spawn_rtmp_output(
             }
 
             attempt += 1;
-            if let Some(max) = config.max_reconnect_attempts {
-                if attempt > max + 1 {
+            if let Some(max) = config.max_reconnect_attempts
+                && attempt > max + 1 {
                     tracing::error!(
                         "RTMP output '{}': exceeded max reconnect attempts ({})",
                         config.id, max,
@@ -195,7 +195,6 @@ pub fn spawn_rtmp_output(
                     ));
                     break;
                 }
-            }
 
             if attempt > 1 {
                 tracing::info!(
@@ -493,8 +492,8 @@ async fn publish_loop(
                     // expect AOT=2 in the ASC and detect SBR / PS from
                     // the bitstream itself. This matches what `ffmpeg
                     // -c:a aac -profile:a aac_he -f flv` writes.
-                    if !sent_audio_header {
-                        if let Some((profile, sr_idx, ch_cfg)) = demuxer.cached_aac_config() {
+                    if !sent_audio_header
+                        && let Some((profile, sr_idx, ch_cfg)) = demuxer.cached_aac_config() {
                             let _ = profile;
                             let (asc_sr_idx, asc_ch_cfg) = match &encoder_state {
                                 EncoderState::Active { encoder, .. } => {
@@ -511,7 +510,6 @@ async fn publish_loop(
                             sent_audio_header = true;
                             tracing::debug!("RTMP output '{}': sent AAC sequence header", config.id);
                         }
-                    }
 
                     if !sent_audio_header {
                         continue;
@@ -539,8 +537,8 @@ async fn publish_loop(
                             // Silent-fallback mode: lazily build decoder +
                             // resampler against the source's real AAC
                             // config on the first real frame.
-                            if decoder.is_none() {
-                                if let Some((profile, sr_idx, ch_cfg)) =
+                            if decoder.is_none()
+                                && let Some((profile, sr_idx, ch_cfg)) =
                                     demuxer.cached_aac_config()
                                 {
                                     let encoder_params = encoder.params().clone();
@@ -553,7 +551,6 @@ async fn publish_loop(
                                         &config.id,
                                     );
                                 }
-                            }
                             // Reset the drop watchdog: real audio is
                             // flowing, suppress silence until the next
                             // grace-window expiry.
@@ -1232,24 +1229,22 @@ async fn passthrough_video(
             // the first NALU tag being non-IDR — they treat it as
             // "wait for next IDR" but the sequence header is what
             // they actually need to initialise the decoder.
-            if !*sent_video_header {
-                if let (Some(sps), Some(pps)) = (demuxer.cached_sps(), demuxer.cached_pps()) {
+            if !*sent_video_header
+                && let (Some(sps), Some(pps)) = (demuxer.cached_sps(), demuxer.cached_pps()) {
                     let header = build_avc_sequence_header(sps, pps);
                     client.send_video(&header, ts_ms).await?;
                     *sent_video_header = true;
                     tracing::debug!("RTMP output '{}': sent AVC sequence header", config.id);
                 }
-            }
             if !*sent_video_header {
                 return Ok(true);
             }
             // Re-send sequence header on each keyframe (some servers need this)
-            if is_keyframe {
-                if let (Some(sps), Some(pps)) = (demuxer.cached_sps(), demuxer.cached_pps()) {
+            if is_keyframe
+                && let (Some(sps), Some(pps)) = (demuxer.cached_sps(), demuxer.cached_pps()) {
                     let header = build_avc_sequence_header(sps, pps);
                     client.send_video(&header, ts_ms).await?;
                 }
-            }
             let tag = build_avc_nalu_tag(nalus, is_keyframe);
             let tag_len = tag.len();
             client.send_video(&tag, ts_ms).await?;
@@ -1262,23 +1257,21 @@ async fn passthrough_video(
             // VPS / SPS / PPS on the first frame where they're available.
             // Same rationale as the H.264 path: open-GOP broadcast streams
             // may not surface a true IDR (`is_keyframe`) for many seconds.
-            if !*sent_video_header {
-                if let Some(hvcc) = build_hvcc_from_cached(demuxer) {
+            if !*sent_video_header
+                && let Some(hvcc) = build_hvcc_from_cached(demuxer) {
                     let header = build_hevc_sequence_header_from_hvcc(&hvcc);
                     client.send_video(&header, ts_ms).await?;
                     *sent_video_header = true;
                     tracing::debug!("RTMP output '{}': sent HEVC sequence header", config.id);
                 }
-            }
             if !*sent_video_header {
                 return Ok(true);
             }
-            if is_keyframe {
-                if let Some(hvcc) = build_hvcc_from_cached(demuxer) {
+            if is_keyframe
+                && let Some(hvcc) = build_hvcc_from_cached(demuxer) {
                     let header = build_hevc_sequence_header_from_hvcc(&hvcc);
                     client.send_video(&header, ts_ms).await?;
                 }
-            }
             // Filter out VPS/SPS/PPS from the coded-frames payload — they
             // travel out-of-band via the sequence header.
             let avcc = annex_b_to_avcc_filtered_h265(nalus);
@@ -1566,8 +1559,8 @@ async fn encode_one_frame(
                 // First time the pipeline reported itself open, capture
                 // its extradata and build the FLV sequence header —
                 // classic AVC for H.264, Enhanced RTMP hvcC for HEVC.
-                if !was_open && active.pipeline.is_open() {
-                    if let Some(ed) = active.pipeline.extradata() {
+                if !was_open && active.pipeline.is_open()
+                    && let Some(ed) = active.pipeline.extradata() {
                         active.sequence_header_tag = Some(match active.target_family {
                             video_codec::VideoCodec::H264 => {
                                 build_avc_sequence_header_from_avcc(&ed)
@@ -1584,7 +1577,6 @@ async fn encode_one_frame(
                             }
                         });
                     }
-                }
                 active.out_frame_count += 1;
                 for ef in encoded {
                     out.push((ef.data, ef.keyframe, ef.pts));

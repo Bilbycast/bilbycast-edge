@@ -782,12 +782,11 @@ impl<T: Clone> BufferedHitlessMerger<T> {
                 // entire point of hitless: TS CC discontinuities, PCR jumps,
                 // decoder hiccups. The right behaviour is to drop the late
                 // gap-fill — the receiver has already moved on.
-                if let Some(c) = self.cursor {
-                    if virt < c {
+                if let Some(c) = self.cursor
+                    && virt < c {
                         self.stats.late_dropped.fetch_add(1, Ordering::Relaxed);
                         return self.drain_ready(now);
                     }
-                }
                 if self.buffer.len() >= self.max_buffer_packets {
                     self.stats
                         .buffer_overflow_dropped
@@ -827,12 +826,11 @@ impl<T: Clone> BufferedHitlessMerger<T> {
                 break;
             }
             // Account for any seq gap relative to the cursor.
-            if let Some(c) = self.cursor {
-                if virt > c {
+            if let Some(c) = self.cursor
+                && virt > c {
                     let gap = (virt - c) as u64;
                     self.stats.gap_lost.fetch_add(gap, Ordering::Relaxed);
                 }
-            }
             // Emit. Update gap_filled / failover stats based on which
             // leg actually carried this packet first.
             let entry = self.buffer.remove(&virt).unwrap();
@@ -873,11 +871,10 @@ impl<T: Clone> BufferedHitlessMerger<T> {
                 _ => {}
             }
             // Failover counter: changed leg at emission.
-            if let Some(last) = last_emit_leg {
-                if last != entry.first_leg && entry.first_leg != ActiveLeg::None {
+            if let Some(last) = last_emit_leg
+                && last != entry.first_leg && entry.first_leg != ActiveLeg::None {
                     self.stats.failovers.fetch_add(1, Ordering::Relaxed);
                 }
-            }
             last_emit_leg = Some(entry.first_leg);
             out.push((entry.first_leg, entry.payload));
         }

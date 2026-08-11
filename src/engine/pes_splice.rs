@@ -492,8 +492,8 @@ impl AudioSpliceState {
         } else {
             None
         };
-        if let (Some(a), Some(b)) = (a_params, b_params) {
-            if a != b {
+        if let (Some(a), Some(b)) = (a_params, b_params)
+            && a != b {
                 let outcome = SpliceOutcome::CodecParamMismatch {
                     to_input_id: std::mem::take(to_input_id),
                     a_params: a,
@@ -502,7 +502,6 @@ impl AudioSpliceState {
                 *self = AudioSpliceState::Idle;
                 return Some(outcome);
             }
-        }
         let outcome = SpliceOutcome::Committed { first_b_pts: pts };
         *self = AudioSpliceState::Idle;
         Some(outcome)
@@ -1216,8 +1215,8 @@ impl VideoSpliceState {
         } else {
             None
         };
-        if let (Some(a), Some(b)) = (a_params, b_params) {
-            if a != b {
+        if let (Some(a), Some(b)) = (a_params, b_params)
+            && a != b {
                 let outcome = SpliceOutcome::VideoCodecParamMismatch {
                     to_input_id: std::mem::take(to_input_id),
                     a_params: a,
@@ -1226,7 +1225,6 @@ impl VideoSpliceState {
                 *self = VideoSpliceState::Idle;
                 return Some(outcome);
             }
-        }
         let outcome = SpliceOutcome::Committed { first_b_pts: pts };
         *self = VideoSpliceState::Idle;
         Some(outcome)

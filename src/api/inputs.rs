@@ -132,13 +132,13 @@ pub async fn update_input(
 
     let flow_id = config.flow_using_input(&input_id).map(|f| f.id.clone());
 
-    if let Some(fid) = &flow_id {
-        if state.flow_manager.is_running(fid) && config_or_metadata_changed {
+    if let Some(fid) = &flow_id
+        && state.flow_manager.is_running(fid) && config_or_metadata_changed {
             if let Err(e) = state.flow_manager.destroy_flow(fid).await {
                 tracing::warn!("Failed to stop flow '{fid}' for input update: {e}");
             }
-            if let Some(flow) = config.flows.iter().find(|f| f.id == *fid) {
-                if flow.enabled {
+            if let Some(flow) = config.flows.iter().find(|f| f.id == *fid)
+                && flow.enabled {
                     match config.resolve_flow(flow) {
                         Ok(resolved) => match state.flow_manager.create_flow(resolved).await {
                             Ok(_) => tracing::info!("Restarted flow '{fid}' after input update"),
@@ -147,9 +147,7 @@ pub async fn update_input(
                         Err(e) => tracing::error!("Failed to resolve flow '{fid}': {e}"),
                     }
                 }
-            }
         }
-    }
 
     save_config_split_async(state.config_path.clone(), state.secrets_path.clone(), config.clone())
         .await

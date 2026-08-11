@@ -157,8 +157,8 @@ impl RutosSource {
                 "jsonrpc": "2.0", "id": 2, "method": "call",
                 "params": [token, "gsm.modem0", method, {}]
             });
-            if let Ok(resp) = self.post_json::<Value>(&url, &call).await {
-                if let Some(obj) = resp
+            if let Ok(resp) = self.post_json::<Value>(&url, &call).await
+                && let Some(obj) = resp
                     .get("result")
                     .and_then(|r| r.as_array())
                     .filter(|a| a.first().and_then(|s| s.as_i64()) == Some(0))
@@ -169,7 +169,6 @@ impl RutosSource {
                         merged.insert(k.clone(), v.clone());
                     }
                 }
-            }
         }
         if merged.is_empty() {
             return Err("ubus login ok but modem returned no info/signal data".to_string());

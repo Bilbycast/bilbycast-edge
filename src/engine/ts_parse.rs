@@ -126,14 +126,13 @@ pub fn first_pcr_in_ts_buffer_pid(data: &[u8], filter_pid: Option<u16>) -> Optio
     let mut i = 0;
     while i + TS_PACKET_SIZE <= data.len() {
         let pkt = &data[i..i + TS_PACKET_SIZE];
-        if pkt[0] == TS_SYNC_BYTE {
-            if let Some(pcr) = extract_pcr(pkt) {
+        if pkt[0] == TS_SYNC_BYTE
+            && let Some(pcr) = extract_pcr(pkt) {
                 let pid = ts_pid(pkt);
                 if filter_pid.is_none_or(|f| f == pid) {
                     return Some((pcr, pid));
                 }
             }
-        }
         i += TS_PACKET_SIZE;
     }
     None

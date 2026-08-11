@@ -170,11 +170,10 @@ impl Reader {
                 Some(s) => s,
                 None => continue,
             };
-            if let Some(stem) = s.strip_suffix(".ts") {
-                if let Ok(id) = stem.parse::<u32>() {
+            if let Some(stem) = s.strip_suffix(".ts")
+                && let Ok(id) = stem.parse::<u32>() {
                     ids.push(id);
                 }
-            }
         }
         ids.sort_unstable();
         Ok(ids)

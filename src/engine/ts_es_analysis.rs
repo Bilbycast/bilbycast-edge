@@ -120,18 +120,16 @@ fn process(pkt: &EsPacket, acc: &PerEsAccumulator) {
     // discontinuity: PCR advanced more than 100 ms (2_700_000 ticks) or
     // went backwards. Matches the threshold the flow-level TR-101290
     // analyzer uses for `pcr_discontinuity_errors`.
-    if pkt.has_pcr {
-        if let Some(pcr) = pkt.pcr {
+    if pkt.has_pcr
+        && let Some(pcr) = pkt.pcr {
             const MAX_FORWARD_27MHZ: u64 = 100 * 27_000; // 100 ms in 27 MHz ticks
             let prev = acc.last_pcr_27mhz.load(Ordering::Relaxed);
-            if prev != u64::MAX {
-                if pcr < prev || (pcr - prev) > MAX_FORWARD_27MHZ {
+            if prev != u64::MAX
+                && (pcr < prev || (pcr - prev) > MAX_FORWARD_27MHZ) {
                     acc.pcr_discontinuity_errors.fetch_add(1, Ordering::Relaxed);
                 }
-            }
             acc.last_pcr_27mhz.store(pcr, Ordering::Relaxed);
         }
-    }
 }
 
 #[cfg(test)]

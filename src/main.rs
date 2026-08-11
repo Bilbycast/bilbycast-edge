@@ -299,11 +299,10 @@ async fn main() -> anyhow::Result<()> {
             .collect();
         app_config.server.listen_addrs = Some(entries);
     }
-    if let Some(mp) = cli.monitor_port {
-        if let Some(ref mut mon) = app_config.monitor {
+    if let Some(mp) = cli.monitor_port
+        && let Some(ref mut mon) = app_config.monitor {
             mon.listen_port = mp;
         }
-    }
 
     // First-boot setup-token bootstrap. Auto-generates a 256-bit one-shot
     // bearer token if the wizard is still open and no token has been
@@ -551,11 +550,10 @@ async fn main() -> anyhow::Result<()> {
     );
 
     // Set the manager node_id on the tunnel manager so relay tunnels can identify this edge
-    if let Some(ref mgr) = app_config.manager {
-        if let Some(ref node_id) = mgr.node_id {
+    if let Some(ref mgr) = app_config.manager
+        && let Some(ref node_id) = mgr.node_id {
             tunnel_manager.set_manager_node_id(node_id.clone());
         }
-    }
 
     // Build auth state from config (None if auth not configured or disabled)
     let auth_state = app_config
@@ -652,20 +650,18 @@ async fn main() -> anyhow::Result<()> {
                     tracing::info!("Auto-started flow '{}'", flow.id);
                     // Register WHIP input channel with session registry if this is a WebRTC flow
                     #[cfg(feature = "webrtc")]
-                    if let Some((tx, bearer_token)) = &_runtime.whip_session_tx {
-                        if let Some(ref registry) = state.webrtc_sessions {
+                    if let Some((tx, bearer_token)) = &_runtime.whip_session_tx
+                        && let Some(ref registry) = state.webrtc_sessions {
                             registry.register_whip_input(&flow.id, tx.clone(), bearer_token.clone());
                             tracing::info!("Registered WHIP input for flow '{}'", flow.id);
                         }
-                    }
                     // Register WHEP output channel with session registry
                     #[cfg(feature = "webrtc")]
-                    if let Some((tx, bearer_token)) = &_runtime.whep_session_tx {
-                        if let Some(ref registry) = state.webrtc_sessions {
+                    if let Some((tx, bearer_token)) = &_runtime.whep_session_tx
+                        && let Some(ref registry) = state.webrtc_sessions {
                             registry.register_whep_output(&flow.id, tx.clone(), bearer_token.clone());
                             tracing::info!("Registered WHEP output for flow '{}'", flow.id);
                         }
-                    }
                 }
                 Err(e) => tracing::error!("Failed to auto-start flow '{}': {e}", flow.id),
             }
@@ -808,8 +804,8 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // Optionally start manager client
-    if let Some(ref mgr_config) = app_config.manager {
-        if mgr_config.enabled {
+    if let Some(ref mgr_config) = app_config.manager
+        && mgr_config.enabled {
             tracing::info!(
                 "Manager client enabled, connecting to {} URL(s): {}",
                 mgr_config.urls.len(),
@@ -846,7 +842,6 @@ async fn main() -> anyhow::Result<()> {
                 manager_link.clone(),
             );
         }
-    }
 
     // Optionally start the AMWA IS-04 registration client. When enabled, it
     // POSTs the node + IS-04 resources to the configured registry and
@@ -1084,16 +1079,14 @@ fn resolve_local_ip() -> String {
     // UDP connect trick — works on Mac and Linux without extra crates.
     // Connecting a UDP socket to a public IP sets the OS routing table
     // source address without sending any packets.
-    if let Ok(sock) = std::net::UdpSocket::bind("0.0.0.0:0") {
-        if sock.connect("8.8.8.8:80").is_ok() {
-            if let Ok(addr) = sock.local_addr() {
+    if let Ok(sock) = std::net::UdpSocket::bind("0.0.0.0:0")
+        && sock.connect("8.8.8.8:80").is_ok()
+            && let Ok(addr) = sock.local_addr() {
                 let ip = addr.ip().to_string();
                 if ip != "0.0.0.0" {
                     return ip;
                 }
             }
-        }
-    }
     "127.0.0.1".to_string()
 }
 

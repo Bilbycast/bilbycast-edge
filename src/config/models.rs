@@ -5732,14 +5732,13 @@ pub fn webrtc_safe_video_encode(existing: Option<&VideoEncodeConfig>) -> VideoEn
     enc.chroma = Some("yuv420p".to_string());
     enc.bit_depth = Some(8);
     // Downgrade profiles that imply >8-bit or >4:2:0 to Main.
-    if let Some(p) = enc.profile.as_deref() {
-        if matches!(
+    if let Some(p) = enc.profile.as_deref()
+        && matches!(
             p,
             "high10" | "high422" | "high444" | "main10" | "main422-10" | "main422-10-intra"
         ) {
             enc.profile = Some("main".to_string());
         }
-    }
     // Low-latency by default (also independently disables B-frames in x264).
     if enc.tune.is_none() {
         enc.tune = Some("zerolatency".to_string());

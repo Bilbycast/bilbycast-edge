@@ -406,15 +406,14 @@ async fn rist_output_loop(
     tokio::pin!(delay_sleep);
 
     loop {
-        if let Some(ref db) = delay_buf {
-            if let Some(release_us) = db.next_release_time() {
+        if let Some(ref db) = delay_buf
+            && let Some(release_us) = db.next_release_time() {
                 let now = now_us();
                 let wait = release_us.saturating_sub(now);
                 delay_sleep
                     .as_mut()
                     .reset(Instant::now() + Duration::from_micros(wait));
             }
-        }
 
         let mut packets_to_send: Vec<RtpPacket> = Vec::new();
 
@@ -557,14 +556,13 @@ async fn rist_output_loop(
                             off += 188;
                         }
                     }
-                    if let Some(ref s2) = socket_leg2 {
-                        if let Err(e) = s2.send(datagram).await {
+                    if let Some(ref s2) = socket_leg2
+                        && let Err(e) = s2.send(datagram).await {
                             tracing::warn!(
                                 "RIST output '{}' leg 2 send error: {e}",
                                 config.id
                             );
                         }
-                    }
                 }
             }
         }

@@ -388,14 +388,12 @@ pub(crate) mod sigstore_inner {
         for spki in rekor_keys.values().copied() {
             if let Ok(key) =
                 CosignVerificationKey::from_der(spki, &SigningScheme::ECDSA_P256_SHA256_ASN1)
-            {
-                if key
+                && key
                     .verify_signature(Signature::Raw(&set_sig), canonical.as_bytes())
                     .is_ok()
                 {
                     return Ok(());
                 }
-            }
         }
         bail!("SignedEntryTimestamp did not verify against any trusted Rekor public key")
     }
@@ -476,11 +474,10 @@ pub(crate) mod sigstore_inner {
                 }
                 // SAN is OID 2.5.29.17. Cosign's keyless flow puts the
                 // workflow URI in the URI form of the SAN.
-                if oid == "2.5.29.17" {
-                    if let Some(s) = first_san_uri(bytes) {
+                if oid == "2.5.29.17"
+                    && let Some(s) = first_san_uri(bytes) {
                         id.workflow_uri = Some(s);
                     }
-                }
             }
         }
 

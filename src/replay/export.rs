@@ -126,11 +126,10 @@ pub async fn export_recording_chunk(
     byte_offset: u64,
     max_bytes: u64,
 ) -> Result<ExportChunk> {
-    if let (Some(from), Some(to)) = (from_pts_90khz, to_pts_90khz) {
-        if to <= from {
+    if let (Some(from), Some(to)) = (from_pts_90khz, to_pts_90khz)
+        && to <= from {
             bail!("replay_invalid_range");
         }
-    }
     let dir = super::recording_dir(recording_id);
     if !fs::try_exists(&dir).await.unwrap_or(false) {
         return Err(anyhow!("replay_clip_not_found"));

@@ -413,15 +413,14 @@ fn handle_pmt_packet(pkt: &[u8], pmt_pid: u16, state: &mut ObserverState, store:
         }
         // Bytes before the pointer target are the TAIL of the previous
         // section — fold them into an in-flight partial if CC is contiguous.
-        if let Some(mut part) = state.pmt_partials.remove(&pmt_pid) {
-            if pointer > 0 && cc == ((part.last_cc + 1) & 0x0F) {
+        if let Some(mut part) = state.pmt_partials.remove(&pmt_pid)
+            && pointer > 0 && cc == ((part.last_cc + 1) & 0x0F) {
                 part.buf.extend_from_slice(&pkt[tail_start..sec_start]);
                 if part.buf.len() >= part.needed {
                     complete_pmt_section(part.buf, part.needed, true, pmt_pid, state, store);
                 }
             }
             // CC gap or no tail → the partial is unrecoverable; drop it.
-        }
         start_pmt_section(&pkt[sec_start..TS_PACKET_SIZE], cc, pmt_pid, state, store);
     } else if let Some(part) = state.pmt_partials.get_mut(&pmt_pid) {
         if cc != ((part.last_cc + 1) & 0x0F) {

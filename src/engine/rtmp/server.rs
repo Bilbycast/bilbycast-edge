@@ -300,8 +300,8 @@ async fn handle_rtmp_client<S: AsyncRead + AsyncWrite + Unpin + Send>(
                         tracing::info!("RTMP publish: app='{app_name}' key='{stream_key}'");
 
                         // Validate stream key
-                        if let Some(expected) = expected_stream_key {
-                            if stream_key != expected {
+                        if let Some(expected) = expected_stream_key
+                            && stream_key != expected {
                                 tracing::warn!("RTMP: rejected publish with wrong stream key");
                                 let resp = amf0::encode_values(&[
                                     Amf0Value::String("onStatus".into()),
@@ -317,7 +317,6 @@ async fn handle_rtmp_client<S: AsyncRead + AsyncWrite + Unpin + Send>(
                                 stream.flush().await?;
                                 bail!("Stream key mismatch");
                             }
-                        }
 
                         // Send onStatus success
                         let resp = amf0::encode_values(&[

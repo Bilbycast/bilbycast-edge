@@ -423,11 +423,10 @@ impl LegBroker {
                 let key = leg.key().clone();
                 if let Ok(mut st) = leg.value().lock() {
                     st.cfg = self.configs.get(&key).map(|c| c.clone());
-                    if let Some(cap) = st.configured_capacity() {
-                        if st.est_bps <= 0.0 {
+                    if let Some(cap) = st.configured_capacity()
+                        && st.est_bps <= 0.0 {
                             st.est_bps = cap;
                         }
-                    }
                 }
             }
         } else {
@@ -502,8 +501,8 @@ impl LegBroker {
 
     fn deregister(&self, entries: &[(String, u32, u8, u64)]) {
         for (key, flow_id, path_id, generation) in entries {
-            if let Some(leg) = self.legs.get(key) {
-                if let Ok(mut st) = leg.value().lock() {
+            if let Some(leg) = self.legs.get(key)
+                && let Ok(mut st) = leg.value().lock() {
                     // Match on generation too: never remove a member that a
                     // later re-registration installed for the same (flow, path).
                     st.members.retain(|x| {
@@ -512,7 +511,6 @@ impl LegBroker {
                             && x.generation == *generation)
                     });
                 }
-            }
         }
         // Drop now-empty legs so the map doesn't grow unbounded.
         self.legs
@@ -563,8 +561,8 @@ impl LegBroker {
         if st.oversubscribed == st.was_oversubscribed {
             return;
         }
-        if let Ok(g) = self.events.lock() {
-            if let Some(ev) = g.as_ref() {
+        if let Ok(g) = self.events.lock()
+            && let Some(ev) = g.as_ref() {
                 if st.oversubscribed {
                     ev.emit_with_details(
                         EventSeverity::Warning,
@@ -599,7 +597,6 @@ impl LegBroker {
                     );
                 }
             }
-        }
         st.was_oversubscribed = st.oversubscribed;
     }
 

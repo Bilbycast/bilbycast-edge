@@ -196,8 +196,8 @@ pub async fn apply_setup(
     }
 
     // Validate registration token length
-    if let Some(ref token) = payload.registration_token {
-        if token.len() > 4096 {
+    if let Some(ref token) = payload.registration_token
+        && token.len() > 4096 {
             return (
                 StatusCode::BAD_REQUEST,
                 Json(SetupResponse {
@@ -209,11 +209,10 @@ pub async fn apply_setup(
                 }),
             );
         }
-    }
 
     // Validate device name length
-    if let Some(ref name) = payload.device_name {
-        if name.len() > 256 {
+    if let Some(ref name) = payload.device_name
+        && name.len() > 256 {
             return (
                 StatusCode::BAD_REQUEST,
                 Json(SetupResponse {
@@ -223,11 +222,10 @@ pub async fn apply_setup(
                 }),
             );
         }
-    }
 
     // Validate listen port
-    if let Some(port) = payload.listen_port {
-        if port == 0 {
+    if let Some(port) = payload.listen_port
+        && port == 0 {
             return (
                 StatusCode::BAD_REQUEST,
                 Json(SetupResponse {
@@ -237,7 +235,6 @@ pub async fn apply_setup(
                 }),
             );
         }
-    }
 
     // Patch the config
     let mut config = state.config.write().await;

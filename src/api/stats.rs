@@ -548,14 +548,13 @@ pub async fn prometheus_metrics(State(state): State<AppState>) -> impl IntoRespo
         output.push_str("# TYPE bilbycast_edge_flow_output_latency_frames gauge\n");
         for fs in &flow_snapshots {
             for os in &fs.outputs {
-                if let Some(ref lat) = os.latency {
-                    if let Some(frames) = lat.latency_frames {
+                if let Some(ref lat) = os.latency
+                    && let Some(frames) = lat.latency_frames {
                         output.push_str(&format!(
                             "bilbycast_edge_flow_output_latency_frames{{flow_id=\"{}\",output_id=\"{}\"}} {:.2}\n",
                             fs.flow_id, os.output_id, frames
                         ));
                     }
-                }
             }
         }
 

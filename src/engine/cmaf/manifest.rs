@@ -111,8 +111,8 @@ pub fn build_hls_playlist(
     // to the *last* entry. The part URIs are expressed as segment URIs
     // with a `?part=N` query suffix, which our chunked PUT handler
     // recognises and routes to the same streaming upload.
-    if ll_hints.is_some() {
-        if let Some(last) = entries.last() {
+    if ll_hints.is_some()
+        && let Some(last) = entries.last() {
             for p in &last.parts {
                 out.push_str(&format!(
                     "#EXT-X-PART:DURATION={:.3},URI=\"{}\"{}\n",
@@ -122,7 +122,6 @@ pub fn build_hls_playlist(
                 ));
             }
         }
-    }
 
     out
 }

@@ -191,11 +191,10 @@ async fn whip_input_loop(
         // + "Opus" registration descriptor in the PMT, per-AU control
         // header in the private PES).
         let mut ts_muxer = crate::engine::rtmp::ts_mux::TsMuxer::new();
-        if let Some(po) = config.pid_overrides.as_ref() {
-            if let Some(entry) = po.get(&1) {
+        if let Some(po) = config.pid_overrides.as_ref()
+            && let Some(entry) = po.get(&1) {
                 ts_muxer.set_pids(entry.pmt_pid, entry.video_pid, entry.audio_pid, entry.pcr_pid);
             }
-        }
         ts_muxer.set_audio_stream(0x06, Some(*b"Opus"));
         let mut seq_num: u16 = 0;
         let mut last_audio_pts_90khz: u64 = 0;
@@ -495,11 +494,10 @@ async fn whep_input_loop(
         session.drain_pending_events();
 
         let mut ts_muxer = crate::engine::rtmp::ts_mux::TsMuxer::new();
-        if let Some(po) = config.pid_overrides.as_ref() {
-            if let Some(entry) = po.get(&1) {
+        if let Some(po) = config.pid_overrides.as_ref()
+            && let Some(entry) = po.get(&1) {
                 ts_muxer.set_pids(entry.pmt_pid, entry.video_pid, entry.audio_pid, entry.pcr_pid);
             }
-        }
         let mut seq_num: u16 = 0;
 
         // Receive loop

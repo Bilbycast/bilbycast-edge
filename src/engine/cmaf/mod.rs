@@ -889,8 +889,7 @@ async fn handle_video(
         if state.init_uploaded
             && state.audio_seg.is_some()
             && seg.sequence_number == 0
-        {
-            if let Some(v) = state.video_seg.as_ref() {
+            && let Some(v) = state.video_seg.as_ref() {
                 let audio_track = state.audio_seg.as_ref().map(|a| &a.track);
                 let init_bytes = if let Some(c) = state.cenc.as_ref() {
                     let params = fmp4::CencInitParams {
@@ -910,7 +909,6 @@ async fn handle_video(
                 )
                 .await;
             }
-        }
 
         // Apply CENC by rebuilding the segment from the raw Sample
         // vector with per-sample encryption applied.
@@ -1217,8 +1215,8 @@ async fn handle_ll_cmaf(
     recv_time_us: u64,
 ) {
     // Publish init.mp4 if we haven't yet.
-    if !state.init_uploaded {
-        if let Some(v) = state.video_seg.as_ref() {
+    if !state.init_uploaded
+        && let Some(v) = state.video_seg.as_ref() {
             let init_bytes =
                 fmp4::build_init_segment(&v.track, state.audio_seg.as_ref().map(|a| &a.track));
             match http_put(init_url, init_bytes, "video/mp4", config.auth_token.as_deref()).await {
@@ -1237,7 +1235,6 @@ async fn handle_ll_cmaf(
                 }
             }
         }
-    }
 
     // On a new segment boundary, finalise the previous LL PUT and open
     // a new one.
@@ -1527,8 +1524,8 @@ async fn publish_manifests(
         }
     }
 
-    if publish_dash {
-        if let Some(v) = state.video_seg.as_ref() {
+    if publish_dash
+        && let Some(v) = state.video_seg.as_ref() {
             let video_rep = DashVideoRep {
                 codec: v.track.codec,
                 sps: &v.track.sps,
@@ -1576,5 +1573,4 @@ async fn publish_manifests(
                 );
             }
         }
-    }
 }

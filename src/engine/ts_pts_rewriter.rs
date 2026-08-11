@@ -619,8 +619,8 @@ impl TsPtsRewriter {
                 if matches!(
                     role,
                     Some(PidRole::Audio | PidRole::Video | PidRole::OtherPes)
-                ) {
-                    if let Some(src_pts) = extract_pes_pts(pkt) {
+                )
+                    && let Some(src_pts) = extract_pes_pts(pkt) {
                         if !rewritten {
                             buf.copy_from_slice(pkt);
                         }
@@ -640,7 +640,6 @@ impl TsPtsRewriter {
                             // source bytes unchanged.
                         }
                     }
-                }
             }
 
             // Stamp the rewriter's monotonic CC onto every natural PSI
@@ -1312,8 +1311,8 @@ fn write_pes_timestamps(
         pts_marker_top_nibble,
         new_pts,
     );
-    if pts_dts_flags == 0b11 {
-        if let Some(d) = new_dts {
+    if pts_dts_flags == 0b11
+        && let Some(d) = new_dts {
             if payload_offset + 19 > TS_PACKET_SIZE {
                 return None;
             }
@@ -1323,7 +1322,6 @@ fn write_pes_timestamps(
                 d,
             );
         }
-    }
     Some(())
 }
 

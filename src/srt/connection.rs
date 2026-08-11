@@ -233,17 +233,15 @@ fn build_socket_builder(p: &SrtConnectionParams) -> SrtSocketBuilder {
         builder = builder.max_rexmit_bw(bw);
     }
 
-    if let Some(sid) = p.stream_id {
-        if !sid.is_empty() {
+    if let Some(sid) = p.stream_id
+        && !sid.is_empty() {
             builder = builder.stream_id(sid.to_string());
         }
-    }
 
-    if let Some(pf) = p.packet_filter {
-        if !pf.is_empty() {
+    if let Some(pf) = p.packet_filter
+        && !pf.is_empty() {
             builder = builder.packet_filter(pf.to_string());
         }
-    }
 
     builder = apply_advanced_options(builder, p);
     builder
@@ -307,11 +305,10 @@ fn build_listener_builder(p: &SrtConnectionParams) -> srt_transport::SrtListener
         lb = lb.max_rexmit_bw(bw);
     }
 
-    if let Some(pf) = p.packet_filter {
-        if !pf.is_empty() {
+    if let Some(pf) = p.packet_filter
+        && !pf.is_empty() {
             lb = lb.packet_filter(pf.to_string());
         }
-    }
 
     lb = apply_advanced_options_listener(lb, p);
     lb
@@ -355,8 +352,8 @@ pub async fn connect_srt(p: &SrtConnectionParams<'_>) -> Result<Arc<SrtSocket>> 
             let mut listener_builder = build_listener_builder(p);
 
             // Add access control for stream_id filtering on listener
-            if let Some(expected_sid) = p.stream_id {
-                if !expected_sid.is_empty() {
+            if let Some(expected_sid) = p.stream_id
+                && !expected_sid.is_empty() {
                     let expected = expected_sid.to_string();
                     listener_builder = listener_builder.access_control_fn(move |info| {
                         if info.stream_id == expected {
@@ -370,7 +367,6 @@ pub async fn connect_srt(p: &SrtConnectionParams<'_>) -> Result<Arc<SrtSocket>> 
                         }
                     });
                 }
-            }
 
             let mut listener = listener_builder
                 .bind(local_sa)
@@ -543,8 +539,8 @@ pub async fn bind_srt_listener(p: &SrtConnectionParams<'_>) -> Result<SrtListene
     let mut listener_builder = build_listener_builder(p);
 
     // Add access control for stream_id filtering on listener
-    if let Some(expected_sid) = p.stream_id {
-        if !expected_sid.is_empty() {
+    if let Some(expected_sid) = p.stream_id
+        && !expected_sid.is_empty() {
             let expected = expected_sid.to_string();
             listener_builder = listener_builder.access_control_fn(move |info| {
                 if info.stream_id == expected {
@@ -558,7 +554,6 @@ pub async fn bind_srt_listener(p: &SrtConnectionParams<'_>) -> Result<SrtListene
                 }
             });
         }
-    }
 
     let listener = listener_builder
         .bind(local_sa)
@@ -805,17 +800,15 @@ pub fn build_group_builder(p: &SrtConnectionParams, mode: GroupMode) -> SrtGroup
         builder = builder.max_rexmit_bw(bw);
     }
 
-    if let Some(sid) = p.stream_id {
-        if !sid.is_empty() {
+    if let Some(sid) = p.stream_id
+        && !sid.is_empty() {
             builder = builder.stream_id(sid.to_string());
         }
-    }
 
-    if let Some(pf) = p.packet_filter {
-        if !pf.is_empty() {
+    if let Some(pf) = p.packet_filter
+        && !pf.is_empty() {
             builder = builder.packet_filter(pf.to_string());
         }
-    }
 
     if let Some(bw) = p.max_bw { builder = builder.max_bw(bw); }
     if let Some(bw) = p.input_bw { builder = builder.input_bw(bw); }

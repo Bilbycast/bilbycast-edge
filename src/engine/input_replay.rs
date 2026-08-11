@@ -233,12 +233,11 @@ async fn handle_command(
             // mistakes and produces no audit trail. The same guard
             // applies whether `from`/`to` are explicit or implied by the
             // clip's stored bounds.
-            if let (Some(from), Some(to)) = (from_pts_90khz, to_pts_90khz) {
-                if to < from {
+            if let (Some(from), Some(to)) = (from_pts_90khz, to_pts_90khz)
+                && to < from {
                     let _ = reply.send(Err(anyhow!("replay_invalid_range")));
                     return;
                 }
-            }
             // Re-scope if the operator overrode the range.
             if let Some(cid) = clip_id {
                 match Reader::open_clip(&config.recording_id, &cid).await {
@@ -249,12 +248,11 @@ async fn handle_command(
                     }
                 }
             }
-            if let Some(from) = from_pts_90khz {
-                if let Err(e) = reader.scrub_to(from).await {
+            if let Some(from) = from_pts_90khz
+                && let Err(e) = reader.scrub_to(from).await {
                     let _ = reply.send(Err(e));
                     return;
                 }
-            }
             if let Some(to) = to_pts_90khz {
                 if to < reader.range.from_pts_90khz {
                     let _ = reply.send(Err(anyhow!("replay_invalid_range")));
@@ -748,8 +746,8 @@ fn rewrite_packet_in_place(ts: &mut [u8], pacing: &mut PacingState) -> RewriteOu
             let pts_dts_flags = (p[7] >> 6) & 0x03;
             // 0b10 = PTS only; 0b11 = PTS + DTS.
             let pts_off = 9usize;
-            if pts_dts_flags == 0b10 || pts_dts_flags == 0b11 {
-                if let Some(new_pts) = read_pts_field(&p[pts_off..pts_off + 5])
+            if (pts_dts_flags == 0b10 || pts_dts_flags == 0b11)
+                && let Some(new_pts) = read_pts_field(&p[pts_off..pts_off + 5])
                     .and_then(|v| pacing.rewrite_value(v))
                 {
                     write_pts_field(
@@ -758,7 +756,6 @@ fn rewrite_packet_in_place(ts: &mut [u8], pacing: &mut PacingState) -> RewriteOu
                         if pts_dts_flags == 0b11 { 0b0011 } else { 0b0010 },
                     );
                 }
-            }
             if pts_dts_flags == 0b11 {
                 let dts_off = 14usize;
                 if payload_start + dts_off + 5 <= TS_PACKET

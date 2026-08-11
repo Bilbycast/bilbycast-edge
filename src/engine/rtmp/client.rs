@@ -222,8 +222,8 @@ impl RtmpClient {
     async fn wait_for_result(&mut self, expected_tx_id: f64) -> Result<()> {
         for _ in 0..50 {
             let msg = self.reader.read_message(&mut self.stream).await?;
-            if msg.msg_type == msg_type::COMMAND_AMF0 {
-                if let Ok(values) = amf0::decode_all(&msg.payload) {
+            if msg.msg_type == msg_type::COMMAND_AMF0
+                && let Ok(values) = amf0::decode_all(&msg.payload) {
                     let cmd = values.first().and_then(|v| v.as_str()).unwrap_or("");
                     let tx_id = values.get(1).and_then(|v| v.as_f64()).unwrap_or(0.0);
                     if cmd == "_result" && tx_id == expected_tx_id {
@@ -237,7 +237,6 @@ impl RtmpClient {
                         .into());
                     }
                 }
-            }
             // Ignore other messages (Window Ack Size, Set Peer Bandwidth, etc.)
         }
         bail!("timed out waiting for _result (txId={})", expected_tx_id);
@@ -247,8 +246,8 @@ impl RtmpClient {
     async fn wait_for_create_stream_result(&mut self, expected_tx_id: f64) -> Result<u32> {
         for _ in 0..50 {
             let msg = self.reader.read_message(&mut self.stream).await?;
-            if msg.msg_type == msg_type::COMMAND_AMF0 {
-                if let Ok(values) = amf0::decode_all(&msg.payload) {
+            if msg.msg_type == msg_type::COMMAND_AMF0
+                && let Ok(values) = amf0::decode_all(&msg.payload) {
                     let cmd = values.first().and_then(|v| v.as_str()).unwrap_or("");
                     let tx_id = values.get(1).and_then(|v| v.as_f64()).unwrap_or(0.0);
                     if cmd == "_result" && tx_id == expected_tx_id {
@@ -259,7 +258,6 @@ impl RtmpClient {
                         bail!("server returned _error for createStream");
                     }
                 }
-            }
         }
         bail!("timed out waiting for createStream result");
     }
@@ -268,8 +266,8 @@ impl RtmpClient {
     async fn wait_for_publish_start(&mut self) -> Result<()> {
         for _ in 0..50 {
             let msg = self.reader.read_message(&mut self.stream).await?;
-            if msg.msg_type == msg_type::COMMAND_AMF0 {
-                if let Ok(values) = amf0::decode_all(&msg.payload) {
+            if msg.msg_type == msg_type::COMMAND_AMF0
+                && let Ok(values) = amf0::decode_all(&msg.payload) {
                     let cmd = values.first().and_then(|v| v.as_str()).unwrap_or("");
                     if cmd == "onStatus" {
                         // Check for success or error
@@ -299,7 +297,6 @@ impl RtmpClient {
                         .into());
                     }
                 }
-            }
         }
         bail!("timed out waiting for publish start");
     }

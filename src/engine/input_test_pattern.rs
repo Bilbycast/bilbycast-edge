@@ -244,11 +244,10 @@ async fn run_inner(
     };
 
     let mut ts_muxer = crate::engine::rtmp::ts_mux::TsMuxer::new();
-    if let Some(po) = config.pid_overrides.as_ref() {
-        if let Some(entry) = po.get(&1) {
+    if let Some(po) = config.pid_overrides.as_ref()
+        && let Some(entry) = po.get(&1) {
                 ts_muxer.set_pids(entry.pmt_pid, entry.video_pid, entry.audio_pid, entry.pcr_pid);
             }
-    }
     // Without this the PMT never advertises the audio PID and downstream
     // decoders silently drop the muxed AAC PES packets.
     if audio_ctx.is_some() {
@@ -297,11 +296,10 @@ async fn run_inner(
         y_plane.copy_from_slice(&y_base);
         draw_bouncing_box(&mut y_plane, width as usize, height as usize, frame_idx);
         draw_timecode(&mut y_plane, width as usize, height as usize, frame_idx, fps);
-        if let Some(id) = config.screen_id.as_deref() {
-            if !id.is_empty() {
+        if let Some(id) = config.screen_id.as_deref()
+            && !id.is_empty() {
                 draw_screen_id(&mut y_plane, width as usize, height as usize, id);
             }
-        }
         if config.av_sync_marker {
             match config.av_sync_style {
                 crate::config::models::TestPatternAvSyncStyle::Flash => {
@@ -971,11 +969,10 @@ fn build_audio_encoder(
 /// fall back to counted beeps, so the feature works before any are added.
 #[cfg(all(feature = "media-codecs", feature = "fdk-aac"))]
 fn testgen_voice_dir() -> std::path::PathBuf {
-    if let Ok(d) = std::env::var("BILBYCAST_TESTGEN_VOICE_DIR") {
-        if !d.trim().is_empty() {
+    if let Ok(d) = std::env::var("BILBYCAST_TESTGEN_VOICE_DIR")
+        && !d.trim().is_empty() {
             return std::path::PathBuf::from(d);
         }
-    }
     crate::media::media_dir().join("testgen_voice")
 }
 

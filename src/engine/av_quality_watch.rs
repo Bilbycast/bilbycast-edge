@@ -98,8 +98,8 @@ pub fn spawn_av_quality_watch(
                     // "consecutive polls" requirement.
                     skew_over = 0;
                 }
-                if s.mode == "measured" && s.skew_ms.abs() < SKEW_RECOVER_MS {
-                    if skew_alerted {
+                if s.mode == "measured" && s.skew_ms.abs() < SKEW_RECOVER_MS
+                    && skew_alerted {
                         skew_alerted = false;
                         events.emit_flow_with_details(
                             EventSeverity::Info,
@@ -115,7 +115,6 @@ pub fn spawn_av_quality_watch(
                             }),
                         );
                     }
-                }
             }
 
             // ── A/V mux interleave depth ──
@@ -148,8 +147,8 @@ pub fn spawn_av_quality_watch(
                 } else {
                     il_over = 0;
                 }
-                if p95 < INTERLEAVE_RECOVER_MS {
-                    if il_alerted {
+                if p95 < INTERLEAVE_RECOVER_MS
+                    && il_alerted {
                         il_alerted = false;
                         events.emit_flow_with_details(
                             EventSeverity::Info,
@@ -165,7 +164,6 @@ pub fn spawn_av_quality_watch(
                             }),
                         );
                     }
-                }
             }
         }
     })

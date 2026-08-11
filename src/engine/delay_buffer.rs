@@ -262,8 +262,8 @@ pub async fn resolve_output_delay(
                 let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
                 loop {
                     let fps = *rx.borrow_and_update();
-                    if let Some(fps) = fps {
-                        if fps > 0.0 {
+                    if let Some(fps) = fps
+                        && fps > 0.0 {
                             let ms = (*frames * 1000.0 / fps).round() as u64;
                             tracing::info!(
                                 "Output '{}': target latency {} frames at {:.2} fps = {} ms",
@@ -272,7 +272,6 @@ pub async fn resolve_output_delay(
                             resolved_ms = Some(ms.clamp(1, 10000));
                             break;
                         }
-                    }
                     // Wait for a change or timeout
                     tokio::select! {
                         _ = cancel.cancelled() => return None,
@@ -295,17 +294,15 @@ pub async fn resolve_output_delay(
             }
 
             // Fall back to fallback_ms if frame rate wasn't detected
-            if resolved_ms.is_none() {
-                if let Some(fb) = fallback_ms {
-                    if *fb > 0 {
+            if resolved_ms.is_none()
+                && let Some(fb) = fallback_ms
+                    && *fb > 0 {
                         tracing::info!(
                             "Output '{}': using fallback delay {} ms (frame rate not detected)",
                             output_id, fb
                         );
                         resolved_ms = Some(*fb);
                     }
-                }
-            }
 
             match resolved_ms {
                 Some(ms) if ms > 0 => {

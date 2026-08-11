@@ -458,11 +458,10 @@ fn build_synth(
     // Muxer carries audio only, AAC with ADTS stream_type = 0x0F (no
     // registration descriptor).
     let mut ts_mux = TsMuxer::new();
-    if let Some(po) = pid_overrides {
-        if let Some(entry) = po.get(&1) {
+    if let Some(po) = pid_overrides
+        && let Some(entry) = po.get(&1) {
                 ts_mux.set_pids(entry.pmt_pid, entry.video_pid, entry.audio_pid, entry.pcr_pid);
             }
-    }
     ts_mux.set_has_video(false);
     ts_mux.set_has_audio(true);
     ts_mux.set_audio_stream(0x0F, None);

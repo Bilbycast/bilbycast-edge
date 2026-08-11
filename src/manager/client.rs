@@ -48,12 +48,11 @@ fn register_whip_if_needed(
     webrtc_sessions: &WebrtcRegistry,
     runtime: &FlowRuntime,
 ) {
-    if let Some((tx, bearer_token)) = &runtime.whip_session_tx {
-        if let Some(registry) = webrtc_sessions {
+    if let Some((tx, bearer_token)) = &runtime.whip_session_tx
+        && let Some(registry) = webrtc_sessions {
             registry.register_whip_input(&runtime.config.config.id, tx.clone(), bearer_token.clone());
             tracing::info!("Registered WHIP input for flow '{}'", runtime.config.config.id);
         }
-    }
 }
 
 /// Register a WHEP output channel with the WebRTC session registry (if applicable).
@@ -62,12 +61,11 @@ fn register_whep_if_needed(
     webrtc_sessions: &WebrtcRegistry,
     runtime: &FlowRuntime,
 ) {
-    if let Some((tx, bearer_token)) = &runtime.whep_session_tx {
-        if let Some(registry) = webrtc_sessions {
+    if let Some((tx, bearer_token)) = &runtime.whep_session_tx
+        && let Some(registry) = webrtc_sessions {
             registry.register_whep_output(&runtime.config.config.id, tx.clone(), bearer_token.clone());
             tracing::info!("Registered WHEP output for flow '{}'", runtime.config.config.id);
         }
-    }
 }
 
 /// Compute SHA-256 fingerprint of a DER-encoded certificate.
@@ -653,11 +651,10 @@ async fn try_connect(
                             "timestamp": chrono::Utc::now().to_rfc3339(),
                             "payload": payload
                         });
-                        if let Ok(json) = serde_json::to_string(&envelope) {
-                            if ws_write.send(Message::Text(json.into())).await.is_err() {
+                        if let Ok(json) = serde_json::to_string(&envelope)
+                            && ws_write.send(Message::Text(json.into())).await.is_err() {
                                 break;
                             }
-                        }
                         // Reset the periodic timer since we just sent stats
                         stats_interval.reset();
                     }
@@ -697,11 +694,10 @@ async fn try_connect(
                     "timestamp": chrono::Utc::now().to_rfc3339(),
                     "payload": payload
                 });
-                if let Ok(json) = serde_json::to_string(&envelope) {
-                    if ws_write.send(Message::Text(json.into())).await.is_err() {
+                if let Ok(json) = serde_json::to_string(&envelope)
+                    && ws_write.send(Message::Text(json.into())).await.is_err() {
                         break;
                     }
-                }
             }
 
             // Drain queued outbound frames produced by spawned per-command
@@ -776,11 +772,10 @@ async fn try_connect(
                         start_time,
                     )
                 });
-                if let Ok(json) = serde_json::to_string(&pong) {
-                    if ws_write.send(Message::Text(json.into())).await.is_err() {
+                if let Ok(json) = serde_json::to_string(&pong)
+                    && ws_write.send(Message::Text(json.into())).await.is_err() {
                         break;
                     }
-                }
             }
 
             // Thumbnail push — fires when any ThumbnailAccumulator stores a
@@ -803,11 +798,10 @@ async fn try_connect(
             // Forward queued events to the manager
             Some(event) = event_rx.recv() => {
                 let envelope = build_event_envelope(&event);
-                if let Ok(json) = serde_json::to_string(&envelope) {
-                    if ws_write.send(Message::Text(json.into())).await.is_err() {
+                if let Ok(json) = serde_json::to_string(&envelope)
+                    && ws_write.send(Message::Text(json.into())).await.is_err() {
                         break;
                     }
-                }
             }
         }
     }
@@ -975,13 +969,12 @@ pub(crate) fn build_health_payload(
             Some(sampler) => sampler.sample(),
             None => crate::util::network_interfaces::enumerate(),
         };
-        if !ifaces.is_empty() {
-            if let Ok(v) = serde_json::to_value(&ifaces) {
+        if !ifaces.is_empty()
+            && let Ok(v) = serde_json::to_value(&ifaces) {
                 payload
                     .as_object_mut()
                     .map(|o| o.insert("network_interfaces".into(), v));
             }
-        }
     }
     // Shared-leg capacity-broker contention — one entry per physical uplink
     // shared by ≥1 bonded flow, each flow's demand vs. its fair-share
@@ -989,13 +982,12 @@ pub(crate) fn build_health_payload(
     // capability (additive field; older managers ignore it).
     {
         let contention = crate::engine::bond_leg_broker::broker().contention_snapshot();
-        if !contention.is_empty() {
-            if let Ok(v) = serde_json::to_value(&contention) {
+        if !contention.is_empty()
+            && let Ok(v) = serde_json::to_value(&contention) {
                 payload
                     .as_object_mut()
                     .map(|o| o.insert("bond_leg_contention".into(), v));
             }
-        }
     }
     // Local-display enumeration. Linux-only and gated on the `display`
     // Cargo feature; absent on every other build so older managers /
@@ -1003,13 +995,12 @@ pub(crate) fn build_health_payload(
     #[cfg(all(feature = "display", target_os = "linux"))]
     {
         let devs = crate::display::cached_displays();
-        if !devs.is_empty() {
-            if let Ok(json) = serde_json::to_value(devs.as_slice()) {
+        if !devs.is_empty()
+            && let Ok(json) = serde_json::to_value(devs.as_slice()) {
                 payload
                     .as_object_mut()
                     .map(|o| o.insert("display_devices".into(), json));
             }
-        }
     }
     // Per-port DeckLink hardware status (signal lock, genlock, detected raster,
     // PCIe link). Gated on the `sdi-decklink` Cargo feature; absent on every
@@ -1033,13 +1024,12 @@ pub(crate) fn build_health_payload(
     // Manager UI hides the card unless the `"clock-sync"` capability is also
     // present. Reflects the wallclock master's underlying CLOCK_MONOTONIC
     // discipline (chrony / ntpd / phc2sys vs free-running).
-    if let Some(status) = crate::util::clock_sync::probe() {
-        if let Ok(v) = serde_json::to_value(&status) {
+    if let Some(status) = crate::util::clock_sync::probe()
+        && let Ok(v) = serde_json::to_value(&status) {
             payload
                 .as_object_mut()
                 .map(|o| o.insert("clock_sync".into(), v));
         }
-    }
     payload
 }
 
@@ -1095,50 +1085,45 @@ fn build_resource_budget_payload(
     // ignore unknown fields. Only emit when at least one family was
     // probed so we don't waste 18 bytes of `{}` per health tick on
     // hosts that have no HW accelerators or where probing was disabled.
-    if !static_caps.hw_encoder_session_limits.is_empty() {
-        if let Ok(v) = serde_json::to_value(&static_caps.hw_encoder_session_limits) {
+    if !static_caps.hw_encoder_session_limits.is_empty()
+        && let Ok(v) = serde_json::to_value(&static_caps.hw_encoder_session_limits) {
             payload
                 .as_object_mut()
                 .map(|o| o.insert("hw_encoder_session_limits".into(), v));
         }
-    }
-    if !static_caps.hw_decoder_session_limits.is_empty() {
-        if let Ok(v) = serde_json::to_value(&static_caps.hw_decoder_session_limits) {
+    if !static_caps.hw_decoder_session_limits.is_empty()
+        && let Ok(v) = serde_json::to_value(&static_caps.hw_decoder_session_limits) {
             payload
                 .as_object_mut()
                 .map(|o| o.insert("hw_decoder_session_limits".into(), v));
         }
-    }
-    if !static_caps.hw_encoder_chroma.is_empty() {
-        if let Ok(v) = serde_json::to_value(&static_caps.hw_encoder_chroma) {
+    if !static_caps.hw_encoder_chroma.is_empty()
+        && let Ok(v) = serde_json::to_value(&static_caps.hw_encoder_chroma) {
             payload
                 .as_object_mut()
                 .map(|o| o.insert("hw_encoder_chroma".into(), v));
         }
-    }
     // VAAPI direction-tagged capability (WS_PROTOCOL_VERSION ≥ 2). Older
     // managers ignore the field; newer ones prefer it over the legacy
     // `hw_encoders.{h264,hevc}_vaapi` mirror, which we keep populating
     // for backwards compatibility.
-    if !static_caps.vaapi.is_empty() {
-        if let Ok(v) = serde_json::to_value(&static_caps.vaapi) {
+    if !static_caps.vaapi.is_empty()
+        && let Ok(v) = serde_json::to_value(&static_caps.vaapi) {
             payload
                 .as_object_mut()
                 .map(|o| o.insert("vaapi".into(), v));
         }
-    }
     // Why a compiled-in HW encoder family is unavailable — "blocked" (GPU
     // present but the sandbox / permissions won't let us open it) vs
     // "no_driver" (no GPU on this box). Additive; only present when at
     // least one compiled-in family failed to open, so healthy hosts and
     // no-HW-encoder builds pay nothing.
-    if let Some(diags) = &static_caps.hw_encoder_diagnostics {
-        if let Ok(v) = serde_json::to_value(diags) {
+    if let Some(diags) = &static_caps.hw_encoder_diagnostics
+        && let Ok(v) = serde_json::to_value(diags) {
             payload
                 .as_object_mut()
                 .map(|o| o.insert("hw_encoder_diagnostics".into(), v));
         }
-    }
     // Live thread inventory — counts of hot-path OS threads currently
     // running. Surfaces the Stage 1 codec-thread fleet, Stage 2 PID-bus
     // threads (when wired), and Stage 3 PCR PLL sampler threads (when
@@ -1429,34 +1414,26 @@ fn edge_capabilities() -> Vec<&'static str> {
     // these to populate the "HW Decoder" dropdown on transcode flow
     // outputs (separate from the display-output decoder dropdown which
     // keys off the legacy `display-*` strings emitted below).
-    if cfg!(feature = "video-decoder-nvdec") {
-        if let Some(c) = crate::engine::hardware_probe::static_capabilities() {
-            if c.hw_decoders.h264_nvenc || c.hw_decoders.hevc_nvenc {
+    if cfg!(feature = "video-decoder-nvdec")
+        && let Some(c) = crate::engine::hardware_probe::static_capabilities()
+            && (c.hw_decoders.h264_nvenc || c.hw_decoders.hevc_nvenc) {
                 caps.push("video-decoder-nvdec");
             }
-        }
-    }
-    if cfg!(feature = "video-decoder-qsv") {
-        if let Some(c) = crate::engine::hardware_probe::static_capabilities() {
-            if c.hw_decoders.h264_qsv || c.hw_decoders.hevc_qsv {
+    if cfg!(feature = "video-decoder-qsv")
+        && let Some(c) = crate::engine::hardware_probe::static_capabilities()
+            && (c.hw_decoders.h264_qsv || c.hw_decoders.hevc_qsv) {
                 caps.push("video-decoder-qsv");
             }
-        }
-    }
-    if cfg!(feature = "video-decoder-vaapi") {
-        if let Some(c) = crate::engine::hardware_probe::static_capabilities() {
-            if c.hw_decoders.h264_vaapi || c.hw_decoders.hevc_vaapi {
+    if cfg!(feature = "video-decoder-vaapi")
+        && let Some(c) = crate::engine::hardware_probe::static_capabilities()
+            && (c.hw_decoders.h264_vaapi || c.hw_decoders.hevc_vaapi) {
                 caps.push("video-decoder-vaapi");
             }
-        }
-    }
-    if cfg!(feature = "video-decoder-rkmpp") {
-        if let Some(c) = crate::engine::hardware_probe::static_capabilities() {
-            if c.hw_decoders.h264_rkmpp || c.hw_decoders.hevc_rkmpp {
+    if cfg!(feature = "video-decoder-rkmpp")
+        && let Some(c) = crate::engine::hardware_probe::static_capabilities()
+            && (c.hw_decoders.h264_rkmpp || c.hw_decoders.hevc_rkmpp) {
                 caps.push("video-decoder-rkmpp");
             }
-        }
-    }
     if cfg!(feature = "fdk-aac") {
         caps.push("fdk-aac");
     }
@@ -1507,11 +1484,10 @@ fn edge_capabilities() -> Vec<&'static str> {
     // kernels don't. Note: capability says the kernel ACCEPTS SO_TXTIME
     // — operator-side ETF qdisc setup is still required for actual
     // pacing (see packaging/setup-etf-qdisc.sh).
-    if let Some(c) = crate::engine::hardware_probe::static_capabilities() {
-        if c.wire_pacing_txtime {
+    if let Some(c) = crate::engine::hardware_probe::static_capabilities()
+        && c.wire_pacing_txtime {
             caps.push("wire_pacing_txtime");
         }
-    }
     // System-clock discipline indicator. Advertised only when the adjtimex
     // read succeeds (Linux + syscall permitted). Manager UI gates the "Clock
     // Sync" card on this so non-Linux / seccomp-blocked / older edges hide
@@ -1615,11 +1591,10 @@ where
                             "height": 180
                         }
                     });
-                    if let Ok(json) = serde_json::to_string(&envelope) {
-                        if ws_write.send(Message::Text(json.into())).await.is_err() {
+                    if let Ok(json) = serde_json::to_string(&envelope)
+                        && ws_write.send(Message::Text(json.into())).await.is_err() {
                             return Err(());
                         }
-                    }
                     thumbnail_generations.insert(gen_key, thumb_gen);
                 }
             }
@@ -1650,11 +1625,10 @@ where
                             "height": 180
                         }
                     });
-                    if let Ok(json) = serde_json::to_string(&envelope) {
-                        if ws_write.send(Message::Text(json.into())).await.is_err() {
+                    if let Ok(json) = serde_json::to_string(&envelope)
+                        && ws_write.send(Message::Text(json.into())).await.is_err() {
                             return Err(());
                         }
-                    }
                     thumbnail_generations.insert(gen_key, thumb_gen);
                 }
             }
@@ -2331,14 +2305,13 @@ async fn execute_command(
 
             // No-op short-circuit — preserves CC/PSI continuity by not
             // taking the merger/assembler through a transient state.
-            if let Some(cur) = runtime.current_assembly().await {
-                if cur == new_assembly {
+            if let Some(cur) = runtime.current_assembly().await
+                && cur == new_assembly {
                     tracing::info!(
                         "update_flow_assembly '{flow_id}': no-op (assembly unchanged)"
                     );
                     return Ok(None);
                 }
-            }
 
             // Hot-swap the running plan. `replace_assembly` validates,
             // resolves essence, spawns Hitless mergers, and dispatches
@@ -2475,11 +2448,10 @@ async fn execute_command(
                 cfg.outputs.push(output);
             }
             // Add output_id reference to the flow
-            if let Some(flow) = cfg.flows.iter_mut().find(|f| f.id == flow_id) {
-                if !flow.output_ids.contains(&output_id) {
+            if let Some(flow) = cfg.flows.iter_mut().find(|f| f.id == flow_id)
+                && !flow.output_ids.contains(&output_id) {
                     flow.output_ids.push(output_id);
                 }
-            }
             persist_config(&cfg, config_path, secrets_path).await?;
             Ok(None)
         }
@@ -2560,14 +2532,13 @@ async fn execute_command(
             // registry registration (operators had to restart). Surfacing
             // `whip_info` from `add_input` closes that gap.
             #[cfg(feature = "webrtc")]
-            if let Some((tx, bearer_token)) = hot_added.whip_info {
-                if let Some(registry) = _webrtc_sessions {
+            if let Some((tx, bearer_token)) = hot_added.whip_info
+                && let Some(registry) = _webrtc_sessions {
                     registry.register_whip_input(&flow_id, tx, bearer_token);
                     tracing::info!(
                         "Registered hot-added WHIP input '{input_id}' for flow '{flow_id}'"
                     );
                 }
-            }
             // Suppress unused-variable warnings when webrtc feature is off.
             #[cfg(not(feature = "webrtc"))]
             let _ = hot_added;
@@ -2593,11 +2564,10 @@ async fn execute_command(
             if !cfg.inputs.iter().any(|i| i.id == input_id) {
                 cfg.inputs.push(input);
             }
-            if let Some(flow) = cfg.flows.iter_mut().find(|f| f.id == flow_id) {
-                if !flow.input_ids.contains(&input_id) {
+            if let Some(flow) = cfg.flows.iter_mut().find(|f| f.id == flow_id)
+                && !flow.input_ids.contains(&input_id) {
                     flow.input_ids.push(input_id.clone());
                 }
-            }
             persist_config(&cfg, config_path, secrets_path).await?;
             Ok(None)
         }
@@ -2682,8 +2652,8 @@ async fn execute_command(
             let config_or_meta_changed =
                 old.config != input.config || old.name != input.name || old.group != input.group;
             cfg.inputs[idx] = input.clone();
-            if let Some(flow) = cfg.flow_using_input(input_id).cloned() {
-                if flow.enabled && flow_manager.is_running(&flow.id) && config_or_meta_changed {
+            if let Some(flow) = cfg.flow_using_input(input_id).cloned()
+                && flow.enabled && flow_manager.is_running(&flow.id) && config_or_meta_changed {
                     let _ = flow_manager.destroy_flow(&flow.id).await;
                     if let Ok(resolved) = cfg.resolve_flow(&flow) {
                         match flow_manager.create_flow(resolved).await {
@@ -2692,7 +2662,6 @@ async fn execute_command(
                         }
                     }
                 }
-            }
             persist_config(&cfg, config_path, secrets_path).await?;
             flow_manager.event_sender().emit_input(
                 EventSeverity::Info, category::FLOW,
@@ -2823,14 +2792,13 @@ async fn execute_command(
                 .find(|o| o.id() == output_id)
                 .ok_or_else(|| format!("Output '{output_id}' not found"))?;
             output.set_active(active);
-            if flow_manager.is_running(&flow_id) {
-                if let Err(e) = flow_manager
+            if flow_manager.is_running(&flow_id)
+                && let Err(e) = flow_manager
                     .set_output_active(&flow_id, &output_id, active)
                     .await
                 {
                     tracing::warn!("set_output_active failed for '{flow_id}': {e}");
                 }
-            }
             persist_config(&cfg, config_path, secrets_path).await?;
             Ok(None)
         }
@@ -2904,8 +2872,8 @@ async fn execute_command(
             // exact trap behind "I changed the display connector and nothing
             // happened, had to restart the node".
             let mut swap_error: Option<String> = None;
-            if let Some(flow) = cfg.flow_using_output(output_id).cloned() {
-                if flow_manager.is_running(&flow.id) && old_output != output {
+            if let Some(flow) = cfg.flow_using_output(output_id).cloned()
+                && flow_manager.is_running(&flow.id) && old_output != output {
                     if let Err(e) = flow_manager.remove_output(&flow.id, output_id).await {
                         tracing::warn!(
                             "update_output '{output_id}': remove_output on flow '{}' failed: {e}",
@@ -2920,7 +2888,6 @@ async fn execute_command(
                         swap_error = Some(e.to_string());
                     }
                 }
-            }
             // Persist regardless: config.json is the operator's stated intent
             // and the change still takes effect at the next (re)start even if
             // the live hot-swap failed.
@@ -4292,14 +4259,13 @@ async fn execute_command(
                 .find(|i| i.id == input_id)
                 .ok_or_else(|| format!("Input '{input_id}' not found"))?;
             // Reject if assigned to a running flow (port conflict)
-            if let Some(flow) = cfg.flows.iter().find(|f| f.input_ids.iter().any(|id| id == input_id)) {
-                if flow_manager.is_running(&flow.id) {
+            if let Some(flow) = cfg.flows.iter().find(|f| f.input_ids.iter().any(|id| id == input_id))
+                && flow_manager.is_running(&flow.id) {
                     return Err(CommandError::new(format!(
                         "Input '{input_id}' is in use by running flow '{}'",
                         flow.id
                     )));
                 }
-            }
             let input_config = input_def.config.clone();
             drop(cfg);
 
@@ -4318,14 +4284,13 @@ async fn execute_command(
                 .find(|o| o.id() == output_id)
                 .ok_or_else(|| format!("Output '{output_id}' not found"))?;
             // Reject if assigned to a running flow (port conflict)
-            if let Some(flow) = cfg.flows.iter().find(|f| f.output_ids.iter().any(|oid| oid == output_id)) {
-                if flow_manager.is_running(&flow.id) {
+            if let Some(flow) = cfg.flows.iter().find(|f| f.output_ids.iter().any(|oid| oid == output_id))
+                && flow_manager.is_running(&flow.id) {
                     return Err(CommandError::new(format!(
                         "Output '{output_id}' is in use by running flow '{}'",
                         flow.id
                     )));
                 }
-            }
             let output_config = output.clone();
             drop(cfg);
 
@@ -5034,13 +4999,12 @@ async fn execute_command(
                         Ok(s) => s,
                         Err(_) => continue,
                     };
-                    if store.get(clip_id).await.is_some() {
-                        if store.delete(clip_id).await.unwrap_or(false) {
+                    if store.get(clip_id).await.is_some()
+                        && store.delete(clip_id).await.unwrap_or(false) {
                             deleted = true;
                             owning_recording = Some(rid);
                             break;
                         }
-                    }
                 }
             }
             if deleted {
@@ -6750,14 +6714,13 @@ async fn diff_inputs(
         // Register WHIP session channel if this hot-added input is a
         // WHIP server, so browsers can pair without a flow restart.
         #[cfg(feature = "webrtc")]
-        if let Some((tx, bearer_token)) = hot_added.whip_info {
-            if let Some(registry) = webrtc_sessions {
+        if let Some((tx, bearer_token)) = hot_added.whip_info
+            && let Some(registry) = webrtc_sessions {
                 registry.register_whip_input(flow_id, tx, bearer_token);
                 tracing::info!(
                     "Registered hot-added WHIP input '{id}' for flow '{flow_id}' (diff path)"
                 );
             }
-        }
         #[cfg(not(feature = "webrtc"))]
         let _ = hot_added;
     }

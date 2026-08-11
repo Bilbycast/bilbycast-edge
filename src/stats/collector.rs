@@ -2290,16 +2290,14 @@ impl MediaAnalysisAccumulator {
                     // Format: "SMPTE 2022-1 (L=5, D=5)"
                     let mut cols = 0u8;
                     let mut rows = 0u8;
-                    if let Some(l_start) = ft.find("L=") {
-                        if let Some(end) = ft[l_start + 2..].find(|c: char| !c.is_ascii_digit()) {
+                    if let Some(l_start) = ft.find("L=")
+                        && let Some(end) = ft[l_start + 2..].find(|c: char| !c.is_ascii_digit()) {
                             cols = ft[l_start + 2..l_start + 2 + end].parse().unwrap_or(0);
                         }
-                    }
-                    if let Some(d_start) = ft.find("D=") {
-                        if let Some(end) = ft[d_start + 2..].find(|c: char| !c.is_ascii_digit()) {
+                    if let Some(d_start) = ft.find("D=")
+                        && let Some(end) = ft[d_start + 2..].find(|c: char| !c.is_ascii_digit()) {
                             rows = ft[d_start + 2..d_start + 2 + end].parse().unwrap_or(0);
                         }
-                    }
                     FecInfo {
                         standard: "SMPTE 2022-1".to_string(),
                         columns: cols,
@@ -3659,11 +3657,10 @@ impl FlowStatsAccumulator {
     /// the trim knob.
     #[allow(dead_code)]
     pub fn set_master_clock_lipsync(&self, lipsync_offset_90k: i64) {
-        if let Ok(mut g) = self.master_clock_state.write() {
-            if let Some(s) = g.as_mut() {
+        if let Ok(mut g) = self.master_clock_state.write()
+            && let Some(s) = g.as_mut() {
                 s.lipsync_offset_90k = lipsync_offset_90k;
             }
-        }
     }
 
     pub fn reset_counters(&self, scope: &str) {
@@ -4129,8 +4126,8 @@ impl FlowStatsAccumulator {
         // Inject frame-based latency into outputs when video frame rate is known.
         if let Some(ref ma) = media_analysis {
             let frame_rate = ma.video_streams.first().and_then(|v| v.frame_rate);
-            if let Some(fps) = frame_rate {
-                if fps > 0.0 {
+            if let Some(fps) = frame_rate
+                && fps > 0.0 {
                     let us_per_frame = 1_000_000.0 / fps;
                     for out in &mut outputs {
                         if let Some(ref mut lat) = out.latency {
@@ -4138,7 +4135,6 @@ impl FlowStatsAccumulator {
                         }
                     }
                 }
-            }
         }
 
         // Build per-output EgressMediaSummary. Combines the static descriptors
@@ -5097,8 +5093,8 @@ fn build_pipeline_summary(
                 .video_target_fps
                 .or_else(|| src_video.and_then(|v| v.frame_rate.map(|f| f as f32)));
             summary.video_bitrate_kbps = stat_desc.video_target_bitrate_kbps;
-        } else if stat_desc.video_passthrough {
-            if let Some(v) = src_video {
+        } else if stat_desc.video_passthrough
+            && let Some(v) = src_video {
                 summary.video_codec = Some(v.codec.clone());
                 summary.video_resolution = v.resolution.clone();
                 summary.video_fps = v.frame_rate.map(|f| f as f32);
@@ -5106,7 +5102,6 @@ fn build_pipeline_summary(
                     summary.video_bitrate_kbps = Some((v.bitrate_bps / 1000) as u32);
                 }
             }
-        }
     }
 
     // ── Audio fields ──────────────────────────────────────────────────────
@@ -5145,8 +5140,8 @@ fn build_pipeline_summary(
         summary.audio_codec = Some("pcm".to_string());
         summary.audio_sample_rate_hz = Some(ad.output_sample_rate_hz);
         summary.audio_channels = Some(ad.output_channels);
-    } else if stat_desc.audio_passthrough {
-        if let Some(a) = src_audio {
+    } else if stat_desc.audio_passthrough
+        && let Some(a) = src_audio {
             summary.audio_codec = Some(a.codec.clone());
             summary.audio_sample_rate_hz = a.sample_rate_hz;
             summary.audio_channels = a.channels;
@@ -5154,7 +5149,6 @@ fn build_pipeline_summary(
                 summary.audio_bitrate_kbps = Some((a.bitrate_bps / 1000) as u32);
             }
         }
-    }
 
     Some(summary)
 }
@@ -5380,8 +5374,8 @@ fn derive_flow_health(
     }
 
     // ── TR-101290 Priority 2 — PCR/PTS accuracy, CRC, TEI ──
-    if let Some(tr) = tr101290 {
-        if !tr.priority2_ok {
+    if let Some(tr) = tr101290
+        && !tr.priority2_ok {
             // Windowed counters again — match the `priority2_ok` gate so the
             // named categories reflect the current window, not lifetime totals.
             let mut parts: Vec<&str> = Vec::new();
@@ -5411,7 +5405,6 @@ fn derive_flow_health(
                 detail,
             });
         }
-    }
 
     // Most-severe-first so the UI leads with the dominant cause; the badge
     // is the worst contributing severity (Healthy when there are none).

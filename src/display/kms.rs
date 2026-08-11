@@ -114,11 +114,10 @@ fn enumerate_card_paths() -> Vec<PathBuf> {
     for entry in dir.flatten() {
         let fname = entry.file_name();
         let name = fname.to_string_lossy();
-        if let Some(rest) = name.strip_prefix("card") {
-            if let Ok(n) = rest.parse::<u32>() {
+        if let Some(rest) = name.strip_prefix("card")
+            && let Ok(n) = rest.parse::<u32>() {
                 cards.push((n, entry.path()));
             }
-        }
     }
     cards.sort_by_key(|(n, _)| *n);
     cards.into_iter().map(|(_, p)| p).collect()
@@ -303,14 +302,13 @@ fn card_has_hdmi_pcm(card_dir: &Path) -> bool {
             continue;
         }
         let info = card_dir.join(&*n).join("info");
-        if let Ok(text) = std::fs::read_to_string(&info) {
-            if text.lines().any(|l| {
+        if let Ok(text) = std::fs::read_to_string(&info)
+            && text.lines().any(|l| {
                 let l = l.trim();
                 l.starts_with("id:") && (l.contains("HDMI") || l.contains("DP"))
             }) {
                 return true;
             }
-        }
     }
     false
 }
@@ -343,15 +341,14 @@ fn infer_alsa_pcm_for(connector_name: &str) -> u32 {
     // Per Intel + AMD KMS conventions, the first HDMI connector lands
     // on PCM 3, second on PCM 7, third on PCM 8 (rough heuristic;
     // operators with non-standard layouts override via the form).
-    if let Some(suffix) = connector_name.rsplit('-').next() {
-        if let Ok(n) = suffix.parse::<u32>() {
+    if let Some(suffix) = connector_name.rsplit('-').next()
+        && let Ok(n) = suffix.parse::<u32>() {
             return match n {
                 1 => 3,
                 2 => 7,
                 _ => 8,
             };
         }
-    }
     3
 }
 
@@ -906,8 +903,8 @@ impl KmsDisplay {
                 "HDR_OUTPUT_METADATA not supported on this connector — panel/driver lacks HDR signalling"
             );
         }
-        if let Some(state) = self.hdr_state.as_ref() {
-            if state.eotf == eotf {
+        if let Some(state) = self.hdr_state.as_ref()
+            && state.eotf == eotf {
                 // Already programmed with this EOTF — keep the
                 // existing blob; static-metadata refinements are
                 // not yet plumbed (would require freeing + re-
@@ -915,7 +912,6 @@ impl KmsDisplay {
                 // mastering metadata is constant.
                 return Ok(());
             }
-        }
         let bytes = build_hdr_output_metadata_blob(
             eotf,
             bt2020_primaries(),
@@ -1518,11 +1514,10 @@ impl KmsDisplay {
     /// drivers, so the next HDR-bearing flip re-allocates the blob.
     fn invalidate_atomic_modeset(&mut self) {
         self.atomic_modeset_done = false;
-        if let Some(setup) = self.atomic.as_mut() {
-            if let Some(blob) = setup.mode_blob_id.take() {
+        if let Some(setup) = self.atomic.as_mut()
+            && let Some(blob) = setup.mode_blob_id.take() {
                 let _ = self.card.destroy_property_blob(blob);
             }
-        }
         if let Some(prev) = self.hdr_state.take() {
             let _ = self.card.destroy_property_blob(prev.blob_id);
             self.hdr_dirty = true;
@@ -1807,13 +1802,12 @@ fn pick_mode(
         anyhow::bail!("display_resolution_unsupported: connector has no modes");
     }
     // 1. Exact (W,H,Hz) match if all three were specified.
-    if let (Some(w), Some(h), Some(hz)) = (width, height, refresh_hz) {
-        if let Some(m) = modes.iter().find(|m| {
+    if let (Some(w), Some(h), Some(hz)) = (width, height, refresh_hz)
+        && let Some(m) = modes.iter().find(|m| {
             m.size().0 as u32 == w && m.size().1 as u32 == h && m.vrefresh() == hz
         }) {
             return Ok(*m);
         }
-    }
     // 2. (W, H) match — pick highest refresh.
     if let (Some(w), Some(h)) = (width, height) {
         let mut candidates: Vec<&drm::control::Mode> = modes
@@ -3101,8 +3095,8 @@ impl KmsDisplay {
         // of this `KmsDisplay`. One `display_atomic_unavailable`
         // Warning event is emitted by the caller via
         // `take_atomic_fallback_reason()` so an operator sees why.
-        if self.use_atomic {
-            if self.atomic.is_none() {
+        if self.use_atomic
+            && self.atomic.is_none() {
                 match discover_atomic_setup(&self.card, self.crtc, self.connector) {
                     Ok(setup) => self.atomic = Some(setup),
                     Err(e) => {
@@ -3117,7 +3111,6 @@ impl KmsDisplay {
                     }
                 }
             }
-        }
 
         if self.use_atomic && self.atomic.is_some() {
             match self.atomic_present(new_fb, descriptor.width, descriptor.height, fourcc_is_yuv(fourcc)) {
@@ -3310,8 +3303,8 @@ impl KmsDisplay {
         // present never leaves a destroyed handle in the cache. Every
         // error path above returns before this point, having destroyed
         // the FB only if this call created it.
-        if !fb_is_cached {
-            if let Some(key) = cache_key {
+        if !fb_is_cached
+            && let Some(key) = cache_key {
                 if let Some(old) = self.prime_fb_cache.remove(&key) {
                     // Format changed for a recurring buffer object
                     // (rare — e.g. a decoder resolution change reusing
@@ -3321,13 +3314,11 @@ impl KmsDisplay {
                     let _ = self.card.destroy_framebuffer(old.fb);
                     self.prime_fb_cache_order.retain(|k| *k != key);
                 }
-                if self.prime_fb_cache.len() >= PRIME_FB_CACHE_CAPACITY {
-                    if let Some(oldest_key) = self.prime_fb_cache_order.pop_front() {
-                        if let Some(evicted) = self.prime_fb_cache.remove(&oldest_key) {
+                if self.prime_fb_cache.len() >= PRIME_FB_CACHE_CAPACITY
+                    && let Some(oldest_key) = self.prime_fb_cache_order.pop_front()
+                        && let Some(evicted) = self.prime_fb_cache.remove(&oldest_key) {
                             let _ = self.card.destroy_framebuffer(evicted.fb);
                         }
-                    }
-                }
                 self.prime_fb_cache_order.push_back(key);
                 self.prime_fb_cache.insert(
                     key,
@@ -3341,7 +3332,6 @@ impl KmsDisplay {
                 );
                 fb_is_cached = true;
             }
-        }
         // Silence the unused-assignment lint: `fb_is_cached` is written
         // above purely to document that ownership has transferred to
         // the cache, and is not read again in this function.
@@ -3543,13 +3533,12 @@ impl KmsDisplay {
         // changed EOTF. The first commit carrying a metadata change
         // also takes ALLOW_MODESET because the HDMI / DP sink
         // re-trains on EOTF change.
-        if self.hdr_dirty {
-            if let Some(hdr_prop_id) = hdr_prop {
+        if self.hdr_dirty
+            && let Some(hdr_prop_id) = hdr_prop {
                 let blob_id = self.hdr_state.as_ref().map(|s| s.blob_id).unwrap_or(0);
                 req.add_property(self.connector, hdr_prop_id, property::Value::Blob(blob_id));
                 flags |= AtomicCommitFlags::ALLOW_MODESET;
             }
-        }
 
         // Audio-bars overlay plane composition. Same atomic commit, no
         // second flip event — the kernel posts one PageFlip event for
@@ -3571,8 +3560,8 @@ impl KmsDisplay {
         // this guard skips, which made the log claim the bars plane
         // had landed on hosts where every real bars commit was failing.
         let mut bars_included = false;
-        if self.atomic_modeset_done {
-        if let Some(bars) = self.bars_overlay.as_mut() {
+        if self.atomic_modeset_done
+        && let Some(bars) = self.bars_overlay.as_mut() {
             bars_included = true;
             let bp = &bars.plane_props;
             // Reference the BACK buffer — the one the rasteriser just
@@ -3651,7 +3640,6 @@ impl KmsDisplay {
                     property::Value::UnsignedRange(bars.pixel_blend_coverage_value),
                 );
             }
-        }
         } // bars skip on first modeset commit
 
         match self.card.atomic_commit(flags, req) {
@@ -3665,8 +3653,8 @@ impl KmsDisplay {
                 // commit above skips them, and crediting it here used to
                 // log "first atomic_commit OK" (and set `committed`) on
                 // hosts where every real bars-bearing commit was failing.
-                if bars_included {
-                    if let Some(bars) = self.bars_overlay.as_mut() {
+                if bars_included
+                    && let Some(bars) = self.bars_overlay.as_mut() {
                         // First successful commit that programmed the bars
                         // plane: log so an operator debugging "bars don't show
                         // on the panel" can confirm the atomic_commit path
@@ -3689,7 +3677,6 @@ impl KmsDisplay {
                         }
                         bars.committed = true;
                     }
-                }
                 Ok(())
             }
             Err(e) => Err(self.classify_atomic_commit_err(e, bars_included)),
@@ -3835,9 +3822,9 @@ impl KmsDisplay {
                 // bars plane land on the panel. Gated on `bars_included`
                 // so a failing bars-less modeset commit doesn't get
                 // mis-blamed on the bars plane.
-                if bars_included {
-                    if let Some(bars) = self.bars_overlay.as_ref() {
-                        if !bars.committed {
+                if bars_included
+                    && let Some(bars) = self.bars_overlay.as_ref()
+                        && !bars.committed {
                             tracing::warn!(
                                 bars_plane = format!("{:?}", bars.plane),
                                 errno = ?raw,
@@ -3845,8 +3832,6 @@ impl KmsDisplay {
                                 "audio-bars overlay first atomic_commit FAILED — bars plane property set may be wrong for this driver"
                             );
                         }
-                    }
-                }
         if unsupported {
             AtomicCommitError::Unsupported(e)
         } else if raw == Some(libc_ebusy()) {
@@ -3954,11 +3939,10 @@ impl KmsDisplay {
                 .receive_events()
                 .context("display_page_flip_failed: receive_events")?;
             for ev in events {
-                if let Event::PageFlip(p) = ev {
-                    if p.crtc == self.crtc {
+                if let Event::PageFlip(p) = ev
+                    && p.crtc == self.crtc {
                         return Ok(());
                     }
-                }
             }
             // Unrelated event(s) drained ahead of ours — re-poll for the
             // remaining budget.

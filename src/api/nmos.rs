@@ -501,8 +501,8 @@ async fn node_self(State(state): State<AppState>) -> Json<NmosNode> {
     let mut clocks: Vec<serde_json::Value> = Vec::new();
     let mut seen_domains: std::collections::HashSet<u8> = std::collections::HashSet::new();
     for flow in &config.flows {
-        if let Some(d) = flow.clock_domain {
-            if seen_domains.insert(d) {
+        if let Some(d) = flow.clock_domain
+            && seen_domains.insert(d) {
                 clocks.push(serde_json::json!({
                     "name": "clk0",
                     "ref_type": "ptp",
@@ -512,7 +512,6 @@ async fn node_self(State(state): State<AppState>) -> Json<NmosNode> {
                     "locked": false
                 }));
             }
-        }
     }
 
     Json(NmosNode {
@@ -840,8 +839,8 @@ pub fn build_node_value(
     let mut clocks: Vec<serde_json::Value> = Vec::new();
     let mut seen_domains: std::collections::HashSet<u8> = std::collections::HashSet::new();
     for flow in &config.flows {
-        if let Some(d) = flow.clock_domain {
-            if seen_domains.insert(d) {
+        if let Some(d) = flow.clock_domain
+            && seen_domains.insert(d) {
                 clocks.push(serde_json::json!({
                     "name": "clk0",
                     "ref_type": "ptp",
@@ -851,7 +850,6 @@ pub fn build_node_value(
                     "locked": false
                 }));
             }
-        }
     }
 
     serde_json::json!({

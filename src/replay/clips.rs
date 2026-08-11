@@ -307,15 +307,14 @@ pub(crate) fn validate_clip_strings(
             ));
         }
     }
-    if let Some(d) = description {
-        if d.len() > CLIP_DESCRIPTION_MAX {
+    if let Some(d) = description
+        && d.len() > CLIP_DESCRIPTION_MAX {
             return Err(anyhow!(
                 "replay_invalid_field: clip description length {} exceeds max {}",
                 d.len(),
                 CLIP_DESCRIPTION_MAX
             ));
         }
-    }
     Ok(())
 }
 

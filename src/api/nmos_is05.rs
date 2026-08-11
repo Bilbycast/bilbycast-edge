@@ -160,12 +160,11 @@ fn apply_receiver_params_to_input(
             }
         }
     }
-    if let Some(iface) = new_iface {
-        if obj.get("interface_addr").and_then(|d| d.as_str()) != Some(iface) {
+    if let Some(iface) = new_iface
+        && obj.get("interface_addr").and_then(|d| d.as_str()) != Some(iface) {
             obj.insert("interface_addr".into(), serde_json::Value::String(iface.to_owned()));
             changed = true;
         }
-    }
 
     if !changed { return Ok(None); }
     let new_input: InputConfig = serde_json::from_value(v)
@@ -487,13 +486,11 @@ async fn patch_sender_staged(
     }
 
     // Scheduled modes not supported yet
-    if let Some(ref act) = patch.activation {
-        if let Some(ref mode) = act.mode {
-            if mode != "activate_immediate" {
+    if let Some(ref act) = patch.activation
+        && let Some(ref mode) = act.mode
+            && mode != "activate_immediate" {
                 return Err(StatusCode::NOT_IMPLEMENTED);
             }
-        }
-    }
 
     // Just stage without activation
     state.is05_state.staged_senders.insert(uuid, patch.clone());
@@ -635,9 +632,8 @@ async fn patch_receiver_staged(
                     // Find the input marked active; fall back to the first
                     // input if none flagged.
                     for iid in &f.input_ids {
-                        if let Some(def) = cfg.inputs.iter().find(|i| &i.id == iid) {
-                            if def.active { return Some(def.id.clone()); }
-                        }
+                        if let Some(def) = cfg.inputs.iter().find(|i| &i.id == iid)
+                            && def.active { return Some(def.id.clone()); }
                     }
                     f.input_ids.first().cloned()
                 })
@@ -683,11 +679,10 @@ async fn patch_receiver_staged(
             // resolved new input set, persist.
             {
                 let mut cfg = state.config.write().await;
-                if let Some(ref id) = active_input_id {
-                    if let Some(existing) = cfg.inputs.iter_mut().find(|i| &i.id == id) {
+                if let Some(ref id) = active_input_id
+                    && let Some(existing) = cfg.inputs.iter_mut().find(|i| &i.id == id) {
                         existing.config = new_input.clone();
                     }
-                }
                 // Resolve+restart the flow under the write lock's snapshot.
                 let flow_cfg = cfg.flows.iter().find(|f| f.id == receiver_flow_id).cloned();
                 let resolved = flow_cfg
@@ -695,8 +690,8 @@ async fn patch_receiver_staged(
                 drop(cfg);
 
                 let _ = state.flow_manager.destroy_flow(&receiver_flow_id).await;
-                if let Some(r) = resolved {
-                    if let Err(e) = state.flow_manager.create_flow(r).await {
+                if let Some(r) = resolved
+                    && let Err(e) = state.flow_manager.create_flow(r).await {
                         if let Some(ref tx) = state.event_sender {
                             tx.emit_flow_with_details(
                                 EventSeverity::Critical,
@@ -713,7 +708,6 @@ async fn patch_receiver_staged(
                         }
                         return Err(StatusCode::INTERNAL_SERVER_ERROR);
                     }
-                }
                 let cfg_snapshot = state.config.read().await.clone();
                 let cfg_path = state.config_path.clone();
                 let secrets_path = state.secrets_path.clone();
@@ -758,13 +752,11 @@ async fn patch_receiver_staged(
         return Ok(Json(result));
     }
 
-    if let Some(ref act) = patch.activation {
-        if let Some(ref mode) = act.mode {
-            if mode != "activate_immediate" {
+    if let Some(ref act) = patch.activation
+        && let Some(ref mode) = act.mode
+            && mode != "activate_immediate" {
                 return Err(StatusCode::NOT_IMPLEMENTED);
             }
-        }
-    }
 
     state.is05_state.staged_receivers.insert(uuid, patch.clone());
     Ok(Json(patch))

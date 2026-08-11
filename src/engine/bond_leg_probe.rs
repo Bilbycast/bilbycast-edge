@@ -220,21 +220,18 @@ pub fn busy_keys() -> BusyKeys {
 /// Refuse a capacity probe that would share a physical link with live
 /// traffic. `None` = safe to probe.
 pub(crate) fn capacity_conflict(net: &LegNet, busy: &BusyKeys) -> Option<String> {
-    if let Some(i) = &net.interface {
-        if busy.interfaces.contains(i) {
+    if let Some(i) = &net.interface
+        && busy.interfaces.contains(i) {
             return Some(format!("interface '{i}' is in use by a running bonded flow"));
         }
-    }
-    if let Some(ip) = net.source.as_deref().and_then(ip_only) {
-        if busy.sources.contains(&ip) {
+    if let Some(ip) = net.source.as_deref().and_then(ip_only)
+        && busy.sources.contains(&ip) {
             return Some(format!("source {ip} is in use by a running bonded flow"));
         }
-    }
-    if let Some(ip) = net.gateway.as_deref().and_then(ip_only) {
-        if busy.gateways.contains(&ip) {
+    if let Some(ip) = net.gateway.as_deref().and_then(ip_only)
+        && busy.gateways.contains(&ip) {
             return Some(format!("gateway {ip} is in use by a running bonded flow"));
         }
-    }
     if net.interface.is_none() && net.source.is_none() && !busy.is_empty() {
         return Some(
             "this leg has no NIC/source pin (default route); refusing the capacity probe while bonded flows are running — it would share the default uplink".to_string(),
@@ -732,11 +729,10 @@ pub(crate) async fn run_leg_probe(
 
     let result = run_probe_inner(&net, &nics, responder, mode, opts).await;
 
-    if let Some((fid, pid)) = programmed {
-        if let Ok(mgr) = crate::engine::bond_routing::BondRouteManager::global().await {
+    if let Some((fid, pid)) = programmed
+        && let Ok(mgr) = crate::engine::bond_routing::BondRouteManager::global().await {
             mgr.teardown(&fid, pid).await;
         }
-    }
 
     match result {
         Ok(r) => r,

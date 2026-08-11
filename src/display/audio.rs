@@ -268,12 +268,11 @@ impl AudioBackend {
         // old epoch's offset (which would saturate the ratio and leave audio
         // permanently off-pitch). The `ratio_ppm` crystal estimate is for the
         // same soundcard so it stays. Mirrors the old explicit re-anchor.
-        if let Some(now_pts) = clock.current_pts_90k() {
-            if (pts_90k as i64 - now_pts as i64).unsigned_abs() > 45_000 {
+        if let Some(now_pts) = clock.current_pts_90k()
+            && (pts_90k as i64 - now_pts as i64).unsigned_abs() > 45_000 {
                 self.genlock_anchor = None;
                 self.genlock_settle = GENLOCK_SETTLE_WRITES;
             }
-        }
 
         // ── 3. Compute + apply the adaptive resample ratio. ──
         let rel_ratio = self.compute_ratio(clock);

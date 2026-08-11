@@ -493,11 +493,10 @@ async fn run_bond_leg_autodiagnose(
                         continue;
                     };
                     let now = std::time::Instant::now();
-                    if let Some(t) = last.get(&ev.path_id) {
-                        if now.duration_since(*t) < DEBOUNCE {
+                    if let Some(t) = last.get(&ev.path_id)
+                        && now.duration_since(*t) < DEBOUNCE {
                             continue;
                         }
-                    }
                     last.insert(ev.path_id, now);
                     let report = crate::engine::bond_leg_test::test_leg(transport, false);
                     let sev = if report.ok {

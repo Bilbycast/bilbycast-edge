@@ -172,13 +172,12 @@ impl GopTracker {
                     self.record_idr();
                 }
             }
-            Codec::Mpeg2 => {
+            Codec::Mpeg2
                 // MPEG-2 start code 0x00 = picture_start_code; 0xB3 = sequence_header;
                 // 0xB8 = group_of_pictures_start. GOP start ⇒ treat as IDR-equivalent.
-                if nal == 0xB8 {
+                if nal == 0xB8 => {
                     self.record_idr();
                 }
-            }
             _ => {}
         }
     }

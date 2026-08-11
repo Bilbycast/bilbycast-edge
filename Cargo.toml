@@ -20,15 +20,6 @@ publish = false
 # ~650 call sites across the engine to satisfy them would be unreviewable
 # and would bury real findings.
 [lints.clippy]
-# Fires on every `if let … { if let … { } }` (500 sites), suggesting the
-# edition-2024 let-chain form. The nesting is correct code; a mass rewrite of
-# the engine's option-unwrapping is churn with no defect-catching value.
-collapsible_if = "allow"
-collapsible_match = "allow"
-# Engine constructors legitimately take many parameters (spawn_hitless_es_merger_full
-# takes 8: uid, primary, backup, bus, stall, seq_aware, path_differential, cancel).
-# The fix is a builder or a params struct per call site — a design change, not a lint fix.
-too_many_arguments = "allow"
 # Doc-comment list formatting only. No effect on rendered rustdoc for our style.
 doc_lazy_continuation = "allow"
 doc_overindented_list_items = "allow"

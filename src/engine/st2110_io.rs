@@ -606,8 +606,8 @@ pub async fn run_st2110_audio_output(
                             // stats accumulator once, lazily — we need the
                             // decoder's sample rate / channel count to
                             // label the stage for the UI.
-                            if !compressed_decode_stats_registered {
-                                if let Some(dec) = aac_decoder.as_ref() {
+                            if !compressed_decode_stats_registered
+                                && let Some(dec) = aac_decoder.as_ref() {
                                     stats.set_decode_stats(
                                         compressed_decode_stats.clone(),
                                         dec.codec_name(),
@@ -616,7 +616,6 @@ pub async fn run_st2110_audio_output(
                                     );
                                     compressed_decode_stats_registered = true;
                                 }
-                            }
                             out
                         } else if let Some(stage) = transcode.as_mut() {
                             stage.process(&packet)
@@ -1118,15 +1117,14 @@ fn run_compressed_audio_step(
                         flow_id,
                         label,
                     );
-                    if transcode.is_none() {
-                        if !*logged_init_failure {
+                    if transcode.is_none()
+                        && !*logged_init_failure {
                             tracing::error!(
                                 "{label} output '{}' compressed-audio transcode stage build failed",
                                 config.id
                             );
                             *logged_init_failure = true;
                         }
-                    }
                 }
                 Err(e) => {
                     if !*logged_init_failure {

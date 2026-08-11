@@ -758,12 +758,11 @@ fn translate_path_event(
             // Flap-dedup: if the last transition for this path was
             // Dead within the grace window, treat this revival as
             // a blip and suppress.
-            if let Some((PathEventKindMarker::Dead, at)) = last_per_path.get(&ev.path_id) {
-                if now.saturating_duration_since(*at) < BOND_EVENT_FLAP_GRACE {
+            if let Some((PathEventKindMarker::Dead, at)) = last_per_path.get(&ev.path_id)
+                && now.saturating_duration_since(*at) < BOND_EVENT_FLAP_GRACE {
                     last_per_path.insert(ev.path_id, (PathEventKindMarker::Alive, now));
                     return None;
                 }
-            }
             last_per_path.insert(ev.path_id, (PathEventKindMarker::Alive, now));
             (
                 EventSeverity::Info,
@@ -778,12 +777,11 @@ fn translate_path_event(
             alive_count,
             total,
         } => {
-            if let Some((PathEventKindMarker::Alive, at)) = last_per_path.get(&ev.path_id) {
-                if now.saturating_duration_since(*at) < BOND_EVENT_FLAP_GRACE {
+            if let Some((PathEventKindMarker::Alive, at)) = last_per_path.get(&ev.path_id)
+                && now.saturating_duration_since(*at) < BOND_EVENT_FLAP_GRACE {
                     last_per_path.insert(ev.path_id, (PathEventKindMarker::Dead, now));
                     return None;
                 }
-            }
             last_per_path.insert(ev.path_id, (PathEventKindMarker::Dead, now));
             let reason_str = reason.as_str();
             (
@@ -887,13 +885,12 @@ fn translate_path_event(
             BondEventScope::Output => "output",
         },
     });
-    if let serde_json::Value::Object(ref mut base) = details {
-        if let serde_json::Value::Object(extra) = details_extra {
+    if let serde_json::Value::Object(ref mut base) = details
+        && let serde_json::Value::Object(extra) = details_extra {
             for (k, v) in extra {
                 base.insert(k, v);
             }
         }
-    }
     let (input_id, output_id) = match scope {
         BondEventScope::Input => (Some(target_id.to_string()), None),
         BondEventScope::Output => (None, Some(target_id.to_string())),

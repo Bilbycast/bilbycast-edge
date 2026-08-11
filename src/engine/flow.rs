@@ -727,11 +727,10 @@ impl FlowRuntime {
         // per-input rewriters skip — the assembler runs its own
         // shared-anchor rewriter on the assembled output. Avoids per-
         // input anchors clashing with cross-input PES splice math.
-        if config.config.assembly.is_some() {
-            if let Some(p) = av_sync_pacer.as_ref() {
+        if config.config.assembly.is_some()
+            && let Some(p) = av_sync_pacer.as_ref() {
                 p.mark_assembler_owned();
             }
-        }
 
         // Spawn every input task (warm passive). Each input publishes to its
         // own per-input broadcast channel; a forwarder task drains it and
@@ -1240,13 +1239,11 @@ impl FlowRuntime {
                             // failing on <input_id>". `acc` holds the
                             // canonical active-input under an RwLock —
                             // empty string maps to None.
-                            if !clock_pinned && t.active_input_id.is_none() {
-                                if let Ok(g) = acc.active_input_id.read() {
-                                    if !g.is_empty() {
+                            if !clock_pinned && t.active_input_id.is_none()
+                                && let Ok(g) = acc.active_input_id.read()
+                                    && !g.is_empty() {
                                         t.active_input_id = Some(g.clone());
                                     }
-                                }
-                            }
                             acc.set_master_clock_telemetry(t);
                             acc.set_master_clock_lipsync(mc.lipsync_offset_90k());
                         }
@@ -1643,11 +1640,10 @@ impl FlowRuntime {
                         .map(|s| s.input_id.as_str())
                 })
         }
-        if let Some(cur) = self.current_assembly.lock().await.as_ref() {
-            if let (Some(old_in), Some(new_in)) =
+        if let Some(cur) = self.current_assembly.lock().await.as_ref()
+            && let (Some(old_in), Some(new_in)) =
                 (effective_pcr_input(cur), effective_pcr_input(&new_assembly))
-            {
-                if old_in != new_in {
+                && old_in != new_in {
                     // Only refuse when the master clock is actually GENLOCKED
                     // to the pcr_source input (the SourcePcrPll family — the
                     // PLL sampler, fallback watcher, and C4 attribution key
@@ -1694,8 +1690,6 @@ impl FlowRuntime {
                         self.master_clock.kind(),
                     );
                 }
-            }
-        }
 
         // Build the new plan against the current `ResolvedFlow.inputs`.
         // `build_assembly_plan` emits Critical events on every failure
@@ -1741,11 +1735,10 @@ impl FlowRuntime {
             {
                 Ok(pairs) => {
                     for ((program_idx, slot_idx, leg_idx), pid) in pairs {
-                        if let Some(prog) = build.plan.programs.get_mut(program_idx) {
-                            if let Some(slot) = prog.slots.get_mut(slot_idx) {
+                        if let Some(prog) = build.plan.programs.get_mut(program_idx)
+                            && let Some(slot) = prog.slots.get_mut(slot_idx) {
                                 patch_essence_pid(slot, leg_idx, pid);
                             }
-                        }
                     }
                 }
                 Err(err) => {
@@ -3066,11 +3059,10 @@ impl FlowRuntime {
         ));
         // Mirror the start-time `mark_assembler_owned` so hot-added
         // inputs on an assembled flow also skip their per-input rewriter.
-        if self.config.config.assembly.is_some() {
-            if let Some(p) = av_sync_pacer.as_ref() {
+        if self.config.config.assembly.is_some()
+            && let Some(p) = av_sync_pacer.as_ref() {
                 p.mark_assembler_owned();
             }
-        }
         let spawn_ctx = InputSpawnContext {
             flow_id: &self.config.config.id,
             flow_cancel: &self.cancel_token,
@@ -3260,8 +3252,8 @@ impl FlowRuntime {
             // is symmetric with the `register_whip_input` we did on
             // hot-add. WHEP outputs for the flow stay registered.
             #[cfg(feature = "webrtc")]
-            if removed_was_whip_server {
-                if let Some(reg) = fm.webrtc_sessions() {
+            if removed_was_whip_server
+                && let Some(reg) = fm.webrtc_sessions() {
                     reg.unregister_whip_input(&self.config.config.id);
                     tracing::info!(
                         "Unregistered WHIP-server input '{}' from flow '{}'",
@@ -3269,7 +3261,6 @@ impl FlowRuntime {
                         self.config.config.id
                     );
                 }
-            }
         }
 
         // Pull the runtime out of input_handles, cancel its token, and
@@ -3343,13 +3334,12 @@ impl FlowRuntime {
         // because the manager is held via `Weak` — upgrading is
         // best-effort; if the manager is already dropped (during
         // shutdown) the entry was already torn down with it.
-        if let Some(fm) = self.flow_manager_weak.upgrade() {
-            if let Ok(ids) = self.registered_input_ids.lock() {
+        if let Some(fm) = self.flow_manager_weak.upgrade()
+            && let Ok(ids) = self.registered_input_ids.lock() {
                 for id in ids.iter() {
                     fm.unregister_input_publisher(id);
                 }
             }
-        }
         self.cancel_token.cancel();
         // Await all output task handles so sockets (especially SRT listeners)
         // are fully closed and ports released before the flow is considered stopped.
@@ -3399,17 +3389,15 @@ impl FlowRuntime {
     pub async fn input_used_by_assembly(&self, input_id: &str) -> bool {
         let guard = self.current_assembly.lock().await;
         let Some(asm) = guard.as_ref() else { return false; };
-        if let Some(pcr) = &asm.pcr_source {
-            if pcr.input_id == input_id {
+        if let Some(pcr) = &asm.pcr_source
+            && pcr.input_id == input_id {
                 return true;
             }
-        }
         for program in &asm.programs {
-            if let Some(pcr) = &program.pcr_source {
-                if pcr.input_id == input_id {
+            if let Some(pcr) = &program.pcr_source
+                && pcr.input_id == input_id {
                     return true;
                 }
-            }
             for stream in &program.streams {
                 if slot_source_references_input(&stream.source, input_id) {
                     return true;
@@ -4709,11 +4697,10 @@ fn spawn_input_forwarder(
                     // Only emit keepalive when *this* input is the active
                     // one. Otherwise every passive forwarder would spam
                     // null packets into the broadcast channel.
-                    if *active_input_rx.borrow() == input_id {
-                        if fixer_tx.try_send(FixerCommand::Keepalive).is_err() {
+                    if *active_input_rx.borrow() == input_id
+                        && fixer_tx.try_send(FixerCommand::Keepalive).is_err() {
                             FIXER_TS_KEEPALIVE_FULL.fetch_add(1, Ordering::Relaxed);
                         }
-                    }
                 }
             }
         }
@@ -4828,11 +4815,10 @@ async fn finalize_spts_assembler(
         {
             Ok(pairs) => {
                 for ((program_idx, slot_idx, leg_idx), pid) in pairs {
-                    if let Some(prog) = build.plan.programs.get_mut(program_idx) {
-                        if let Some(slot) = prog.slots.get_mut(slot_idx) {
+                    if let Some(prog) = build.plan.programs.get_mut(program_idx)
+                        && let Some(slot) = prog.slots.get_mut(slot_idx) {
                             patch_essence_pid(slot, leg_idx, pid);
                         }
-                    }
                 }
             }
             Err(err) => {
@@ -5045,11 +5031,10 @@ fn collect_psi_catalogs_for_plan(
                 .map(|legs| legs.iter().map(|(id, _)| id.as_str()).collect())
                 .unwrap_or_else(|| vec![slot.source.0.as_str()]);
             for id in ids {
-                if !map.contains_key(id) {
-                    if let Some(c) = flow_manager.psi_catalog_for_input(id) {
+                if !map.contains_key(id)
+                    && let Some(c) = flow_manager.psi_catalog_for_input(id) {
                         map.insert(id.to_string(), c);
                     }
-                }
             }
         }
     }
@@ -5085,11 +5070,10 @@ fn non_ts_spts_error_code(input: &InputConfig) -> Option<&'static str> {
             InputConfig::St2110_31(c) => c.audio_encode.as_ref().map(|a| a.codec.as_str()),
             _ => None,
         };
-        if let Some(codec) = ae_codec {
-            if !super::input_pcm_encode::codec_supported_first_light(codec) {
+        if let Some(codec) = ae_codec
+            && !super::input_pcm_encode::codec_supported_first_light(codec) {
                 return Some("pid_bus_audio_encode_codec_not_supported_on_input");
             }
-        }
         return None;
     }
     match input {
@@ -5477,8 +5461,7 @@ fn build_assembly_plan(
             for iid in inputs_to_check {
                 if let Some(expected_st) =
                     expected_stream_type_for_synthesised_input(&flow.inputs, iid)
-                {
-                    if stream.stream_type != expected_st {
+                    && stream.stream_type != expected_st {
                         let msg = format!(
                             "flow '{}': program {} out_pid {}: slot declares stream_type = 0x{:02X} \
                              but input '{}' has `audio_encode` that publishes stream_type = 0x{:02X}. \
@@ -5504,7 +5487,6 @@ fn build_assembly_plan(
                         );
                         bail!(msg);
                     }
-                }
             }
 
             slots.push(AssemblySlot {

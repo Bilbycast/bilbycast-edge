@@ -338,12 +338,11 @@ fn process_ts_packet(
             stats.pat_count.fetch_add(1, Ordering::Relaxed);
 
             // CRC-32 verification (Priority 2)
-            if let Some(section_start) = psi_section_start(pkt) {
-                if !verify_psi_crc(pkt, section_start) {
+            if let Some(section_start) = psi_section_start(pkt)
+                && !verify_psi_crc(pkt, section_start) {
                     stats.crc_errors.fetch_add(1, Ordering::Relaxed);
                     stats.window_crc_errors.fetch_add(1, Ordering::Relaxed);
                 }
-            }
 
             let pmt_pids = parse_pat_pmt_pids(pkt);
             // Update known PMT PIDs — add new ones, keep existing timestamps
@@ -366,12 +365,11 @@ fn process_ts_packet(
             stats.pmt_count.fetch_add(1, Ordering::Relaxed);
 
             // CRC-32 verification (Priority 2)
-            if let Some(section_start) = psi_section_start(pkt) {
-                if !verify_psi_crc(pkt, section_start) {
+            if let Some(section_start) = psi_section_start(pkt)
+                && !verify_psi_crc(pkt, section_start) {
                     stats.crc_errors.fetch_add(1, Ordering::Relaxed);
                     stats.window_crc_errors.fetch_add(1, Ordering::Relaxed);
                 }
-            }
 
             // Extract ES PIDs from PMT for PID error tracking (Priority 1)
             extract_es_pids_from_pmt(pkt, state);
@@ -435,9 +433,9 @@ fn process_ts_packet(
         });
 
         let wall_us = now.duration_since(entry.history_anchor).as_micros() as u64;
-        if entry.history.len() >= PCR_HISTORY_MIN && !discontinuity_expected {
-            if let Some(residual_ns) = pcr_residual_ns(&entry.history, pcr_value, wall_us) {
-                if residual_ns > PCR_JITTER_THRESHOLD_NS {
+        if entry.history.len() >= PCR_HISTORY_MIN && !discontinuity_expected
+            && let Some(residual_ns) = pcr_residual_ns(&entry.history, pcr_value, wall_us)
+                && residual_ns > PCR_JITTER_THRESHOLD_NS {
                     stats
                         .pcr_accuracy_errors
                         .fetch_add(1, Ordering::Relaxed);
@@ -445,8 +443,6 @@ fn process_ts_packet(
                         .window_pcr_accuracy_errors
                         .fetch_add(1, Ordering::Relaxed);
                 }
-            }
-        }
 
         // Append the new sample, bounded.
         if entry.history.len() == PCR_HISTORY_LEN {
@@ -471,14 +467,12 @@ fn process_ts_packet(
         CAT_PID => {
             state.cat_seen = true;
             state.last_cat_time = Some(now);
-            if ts_pusi(pkt) {
-                if let Some(section_start) = psi_section_start(pkt) {
-                    if !verify_psi_crc(pkt, section_start) {
+            if ts_pusi(pkt)
+                && let Some(section_start) = psi_section_start(pkt)
+                    && !verify_psi_crc(pkt, section_start) {
                         stats.crc_errors.fetch_add(1, Ordering::Relaxed);
                         stats.window_crc_errors.fetch_add(1, Ordering::Relaxed);
                     }
-                }
-            }
         }
         SDT_BAT_PID => {
             state.sdt_seen = true;
@@ -538,12 +532,11 @@ fn process_ts_packet(
     // only need the wall-clock of the most recent PTS to detect a
     // 700 ms gap. The PES PTS_DTS_flags live at byte 7 of the PES
     // header; bit 7 (0x80) signals "PTS present".
-    if ts_pusi(pkt) && state.es_pids.contains_key(&pid) && ts_has_payload(pkt) {
-        if let Some(pts_value) = crate::engine::ts_parse::extract_pes_pts(pkt) {
+    if ts_pusi(pkt) && state.es_pids.contains_key(&pid) && ts_has_payload(pkt)
+        && let Some(pts_value) = crate::engine::ts_parse::extract_pes_pts(pkt) {
             state.pts_tracker.insert(pid, (pts_value, now));
             state.pts_errored.remove(&pid);
         }
-    }
 }
 
 /// Compute |residual_ns| of a new (pcr_27mhz, wall_us) sample against the
@@ -853,15 +846,14 @@ fn check_pat_pmt_timeouts(stats: &Tr101290Accumulator) {
 
     // PAT timeout — singleton, no per-PID latch needed; just only fire
     // once per stall window.
-    if let Some(last) = state.last_pat_time {
-        if now.duration_since(last) > PAT_PMT_TIMEOUT {
+    if let Some(last) = state.last_pat_time
+        && now.duration_since(last) > PAT_PMT_TIMEOUT {
             // Fire once per stall window: re-anchor `last_pat_time` to now
             // so the next PAT_PMT_TIMEOUT must elapse before we count again.
             stats.pat_errors.fetch_add(1, Ordering::Relaxed);
             stats.window_pat_errors.fetch_add(1, Ordering::Relaxed);
             state.last_pat_time = Some(now);
         }
-    }
 
     // PMT timeouts — latched.
     let pmt_stale: Vec<u16> = state
@@ -965,19 +957,17 @@ fn check_pat_pmt_timeouts(stats: &Tr101290Accumulator) {
     }
 
     // CAT error (§5.2.4): once observed, must repeat within 500 ms.
-    if state.cat_seen {
-        if let Some(last) = state.last_cat_time {
-            if now.duration_since(last) > CAT_TIMEOUT {
+    if state.cat_seen
+        && let Some(last) = state.last_cat_time
+            && now.duration_since(last) > CAT_TIMEOUT {
                 stats.cat_errors.fetch_add(1, Ordering::Relaxed);
                 stats.window_cat_errors.fetch_add(1, Ordering::Relaxed);
             }
-        }
-    }
 
     // ── P3 timeouts (only count once observed, mirror `pat_seen`) ──
-    if state.sdt_seen {
-        if let Some(last) = state.last_sdt_time {
-            if now.duration_since(last) > SDT_TIMEOUT {
+    if state.sdt_seen
+        && let Some(last) = state.last_sdt_time
+            && now.duration_since(last) > SDT_TIMEOUT {
                 stats.sdt_errors.fetch_add(1, Ordering::Relaxed);
                 stats.window_sdt_errors.fetch_add(1, Ordering::Relaxed);
                 stats.si_repetition_errors.fetch_add(1, Ordering::Relaxed);
@@ -985,40 +975,30 @@ fn check_pat_pmt_timeouts(stats: &Tr101290Accumulator) {
                     .window_si_repetition_errors
                     .fetch_add(1, Ordering::Relaxed);
             }
-        }
-    }
-    if state.nit_seen {
-        if let Some(last) = state.last_nit_time {
-            if now.duration_since(last) > NIT_TIMEOUT {
+    if state.nit_seen
+        && let Some(last) = state.last_nit_time
+            && now.duration_since(last) > NIT_TIMEOUT {
                 stats.nit_errors.fetch_add(1, Ordering::Relaxed);
                 stats.window_nit_errors.fetch_add(1, Ordering::Relaxed);
             }
-        }
-    }
-    if state.eit_seen {
-        if let Some(last) = state.last_eit_time {
-            if now.duration_since(last) > EIT_TIMEOUT {
+    if state.eit_seen
+        && let Some(last) = state.last_eit_time
+            && now.duration_since(last) > EIT_TIMEOUT {
                 stats.eit_errors.fetch_add(1, Ordering::Relaxed);
                 stats.window_eit_errors.fetch_add(1, Ordering::Relaxed);
             }
-        }
-    }
-    if state.tdt_seen {
-        if let Some(last) = state.last_tdt_time {
-            if now.duration_since(last) > TDT_TIMEOUT {
+    if state.tdt_seen
+        && let Some(last) = state.last_tdt_time
+            && now.duration_since(last) > TDT_TIMEOUT {
                 stats.tdt_errors.fetch_add(1, Ordering::Relaxed);
                 stats.window_tdt_errors.fetch_add(1, Ordering::Relaxed);
             }
-        }
-    }
-    if state.rst_seen {
-        if let Some(last) = state.last_rst_time {
-            if now.duration_since(last) > RST_TIMEOUT {
+    if state.rst_seen
+        && let Some(last) = state.last_rst_time
+            && now.duration_since(last) > RST_TIMEOUT {
                 stats.rst_errors.fetch_add(1, Ordering::Relaxed);
                 stats.window_rst_errors.fetch_add(1, Ordering::Relaxed);
             }
-        }
-    }
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────────
