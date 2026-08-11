@@ -131,10 +131,17 @@ jobs:
     runs-on: ${{ matrix.runner }}
     steps:
       # Runs before any checkout / apt / x264-from-source / cargo, so a missing
-      # token costs seconds instead of failing ~40 minutes in. SDI is in every
-      # full artefact by policy: an absent SDK is a release-blocking
-      # misconfiguration, never a reason to quietly publish a "full" binary that
-      # lacks an I/O type operators expect.
+      # token costs seconds instead of failing ~40 minutes in.
+      #
+      # SDI is wanted in every full artefact, but an absent SDK is NOT
+      # release-blocking: the step below warns, `sdi=off` is emitted, the build
+      # job strips `sdi-decklink` from the feature list and the release ships
+      # without it. This comment used to assert the opposite ("a
+      # release-blocking misconfiguration, never a reason to quietly publish")
+      # while the code warned and continued — every release from v0.99.2 to
+      # v0.102.0 shipped with SDI dropped. If you want it to block, make this
+      # step `exit 1`; as written, the honest statement is that SDI is
+      # best-effort and the release notes report which way it went.
       - name: Preflight - DeckLink SDK access
         id: decklink
         if: matrix.variant == 'full'
@@ -858,9 +865,25 @@ jobs:
       - name: Create tag and GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
+          # Does this release's artefacts actually carry SDI? The build job
+          # drops `sdi-decklink` when DECKLINK_SDK_TOKEN is absent (the
+          # warn-and-continue path), so the notes have to state which of the
+          # two happened. They asserted SDI unconditionally from v0.99.2
+          # through v0.102.0 while no shipped artefact contained it, telling
+          # customers to fit a card and install Desktop Video for a feature
+          # that was never in the binary.
+          SDI_BUILT: ${{ secrets.DECKLINK_SDK_TOKEN != '' }}
         run: |
           TAG="${{ needs.check-version.outputs.tag }}"
           VERSION="${{ needs.check-version.outputs.version }}"
+
+          if [ "${SDI_BUILT}" = "true" ]; then
+            SDI_NOTE="**SDI** (Blackmagic DeckLink capture + playout) is compiled in. Autodetected at runtime exactly like NVENC: the edge \`dlopen\`s \`libDeckLinkAPI.so\` at boot and enumerates cards, so a host without Blackmagic **Desktop Video** installed — or with no DeckLink card fitted — simply does not advertise the \`sdi-decklink\` capability, and the manager UI hides the SDI input / output types for that node. There is nothing to configure and no separate build to install: fit a card, install Desktop Video, restart the edge, and SDI appears."
+            SDI_RUNTIME=" **For SDI (DeckLink)**: install Blackmagic **Desktop Video** (kernel driver + \`libDeckLinkAPI.so\`) from https://www.blackmagicdesign.com/support/ — needed only on hosts with a DeckLink card. The binary carries no link-time dependency on it, so hosts without it run normally and just don't offer SDI."
+          else
+            SDI_NOTE="**SDI** (Blackmagic DeckLink capture + playout) is **not** included in this build. The Blackmagic SDK headers are EULA-gated and cannot be vendored publicly, so the release workflow compiles SDI only when a \`DECKLINK_SDK_TOKEN\` is configured — it was not for this release. These artefacts carry no \`sdi\` input or output type, do not advertise the \`sdi-decklink\` capability, and the manager UI hides SDI for nodes running them. To get SDI, build from source with \`--features sdi-decklink\` and \`DECKLINK_SDK_DIR\` pointing at the SDK headers."
+            SDI_RUNTIME=""
+          fi
 
           # Skip tag creation when the workflow was triggered by a tag
           # push (the tag already exists in that case).
@@ -886,10 +909,10 @@ jobs:
 
           **MXL** (Media eXchange Layer) support is compiled in. MXL is a shared-memory IPC protocol — the edge discovers the system-installed \`libmxl.so\` at runtime via \`dlopen\` and advertises MXL capabilities only when the library is present. Install MXL system-wide so all MXL-speaking applications on the host share the same library.
 
-          **SDI** (Blackmagic DeckLink capture + playout) is compiled in. Autodetected at runtime exactly like NVENC: the edge \`dlopen\`s \`libDeckLinkAPI.so\` at boot and enumerates cards, so a host without Blackmagic **Desktop Video** installed — or with no DeckLink card fitted — simply does not advertise the \`sdi-decklink\` capability, and the manager UI hides the SDI input / output types for that node. There is nothing to configure and no separate build to install: fit a card, install Desktop Video, restart the edge, and SDI appears.
+          ${SDI_NOTE}
 
           ### Runtime dependencies
-          libx264 / libx265 are **statically linked** into this binary — no \`libx264\` / \`libx265\` runtime package is required, and the binary is not tied to a distro's ABI-versioned \`libx264.so.<build>\` / \`libx265.so.<build>\` SONAME (so it runs on Ubuntu 24.04, 26.04+, Debian, etc. without hunting for a matching \`libx264-NNN\` package). Install the remaining stable-SONAME runtime libraries before running: \`sudo apt install libva2 libva-drm2 libasound2t64\` (use \`libasound2\` on Ubuntu 22.04 / Debian 12). No extra packages needed for NVENC beyond the NVIDIA driver. **For QSV (x86_64 only)**: \`sudo apt install libvpl2 intel-media-va-driver-non-free\` (or \`intel-media-driver\`). **For VAAPI**: install a vendor driver — \`mesa-va-drivers\` for AMD or \`intel-media-va-driver-non-free\` for Intel — then add the running user to the \`render\` group so the edge can open \`/dev/dri/renderD*\`. (\`install-edge.sh\` installs these automatically.) **For SDI (DeckLink)**: install Blackmagic **Desktop Video** (kernel driver + \`libDeckLinkAPI.so\`) from https://www.blackmagicdesign.com/support/ — needed only on hosts with a DeckLink card. The binary carries no link-time dependency on it, so hosts without it run normally and just don't offer SDI.
+          libx264 / libx265 are **statically linked** into this binary — no \`libx264\` / \`libx265\` runtime package is required, and the binary is not tied to a distro's ABI-versioned \`libx264.so.<build>\` / \`libx265.so.<build>\` SONAME (so it runs on Ubuntu 24.04, 26.04+, Debian, etc. without hunting for a matching \`libx264-NNN\` package). Install the remaining stable-SONAME runtime libraries before running: \`sudo apt install libva2 libva-drm2 libasound2t64\` (use \`libasound2\` on Ubuntu 22.04 / Debian 12). No extra packages needed for NVENC beyond the NVIDIA driver. **For QSV (x86_64 only)**: \`sudo apt install libvpl2 intel-media-va-driver-non-free\` (or \`intel-media-driver\`). **For VAAPI**: install a vendor driver — \`mesa-va-drivers\` for AMD or \`intel-media-va-driver-non-free\` for Intel — then add the running user to the \`render\` group so the edge can open \`/dev/dri/renderD*\`. (\`install-edge.sh\` installs these automatically.)${SDI_RUNTIME}
 
           ## Verify checksums
           \`\`\`
