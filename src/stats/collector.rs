@@ -720,6 +720,14 @@ pub struct DisplayStatsCounters {
     pub present_interval_us_max: AtomicU64,
     /// Intervals at least half a vblank (>=10 ms) off the running frame
     /// period — frames that did not hold their expected vblank count.
+    ///
+    /// **Use this within one run, never to compare two.** Its reference is
+    /// `frame_period_ms`, an EMA fed by the same frame-to-frame deltas being
+    /// measured, so the threshold moves with the signal. That is not
+    /// hypothetical: it scored one identical configuration at 1.4 % and then
+    /// 34.6 %, and a fix claim was published off the low reading and
+    /// retracted (#104). `present_bucket` exists because of this and is what
+    /// any A/B must be read from.
     pub present_interval_outliers: AtomicU64,
     /// Present intervals in **fixed** microsecond buckets. Deliberately not
     /// keyed off `frame_period_ms`: that is an EMA fed by the same

@@ -4547,18 +4547,13 @@ impl DisplayPresentLatch {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-/// Anchor-servo step in microseconds, overridable via
-/// `BILBYCAST_DISPLAY_SERVO_US` (0 disables the servo entirely).
-///
-/// Exists to test the #104 phase-slide hypothesis on hardware without a
-/// rebuild: this servo slides the presentation phase relative to vblank, and
-/// on a 25 fps source driving a 50 Hz panel a phase crossing costs a visible
-/// hitch. Default is the previous hard-coded 250 us.
-/// Lead applied on the RKMPP display path only. See [`display_lead_ms`].
+/// Default presentation lead applied on the RKMPP display path only.
+/// See [`display_lead_ms`] for the mechanism and the measurements.
 ///
 /// 200 ms is where the dose-response saturates on this backend; the elbow
-/// is ~120 ms and one frame period (40 ms) buys nothing.
+/// is ~120 ms and one frame period (40 ms) buys nothing. Expressed as a
+/// duration rather than a frame count because it is bounding *decoder
+/// delivery* jitter, which is a wall-clock property of the backend.
 const RKMPP_PRESENT_LEAD_MS: u64 = 200;
 
 /// Presentation lead time in milliseconds for the **wall-clock** pacing
@@ -4578,6 +4573,17 @@ const RKMPP_PRESENT_LEAD_MS: u64 = 200;
 /// does not need it (`receive_frame` returns in ~1 us and drift never moved
 /// >=20 ms across 148 samples); RKMPP blocks up to 17 ms and bursts.
 ///
+/// **What the lead physically buys is decode-queue depth.** The decoder is
+/// fed by a live source, so it cannot run ahead of real time; presenting
+/// `L` later simply means `L / frame_period` frames sit in the `vrx` mpsc
+/// at any instant, and a delivery burst is served out of that backlog
+/// instead of stalling `recv()`. That is why the elbow (~120 ms ≈ 3 frames)
+/// sits so far above RKMPP's 17 ms worst-case `receive_frame`: it is
+/// bounding a burst, not a single late hand-over. It is also why the lead
+/// is clamped against [`MPSC_VIDEO_DEPTH`] — a lead the queue cannot hold
+/// does not deepen the backlog, it just spills onto
+/// `frames_dropped_mpsc_full`.
+///
 /// Measured on bilby-pi (RK3568), 110 s per arm, fixed-bucket metric whose
 /// noise floor is +/-1.6 pp across three consecutive runs:
 ///
@@ -4592,41 +4598,77 @@ const RKMPP_PRESENT_LEAD_MS: u64 = 200;
 ///
 /// Confirmed A/B/A/B (0 -> 200 -> 0 -> 200) with every arm replicated.
 /// One frame period (40 ms) buys nothing; the elbow is ~120 ms and 200 ms
-/// saturates. 200 is the default because on this path the latency is free:
+/// saturates.
 ///
-/// **This only applies where there is no audio to sync against.** It is set
-/// inside the `wall_anchor` branch, which is reached only when
+/// **This only applies where there is no audio to sync against**, which is
+/// also the reason 200 ms is an acceptable default rather than an expensive
+/// one. It is set inside the `wall_anchor` branch, reached only when
 /// `AudioClock::current_pts_90k_smoothed()` returns `None` — i.e. muted or
 /// video-only output. On the audio-master path `wall_anchor` is cleared and
 /// never consulted, so this cannot shift video against audio and carries no
-/// lip-sync risk. Setting it to 0 restores the previous behaviour.
+/// lip-sync risk. The cost is therefore pure display latency: a confidence
+/// monitor sits 200 ms further behind the source, with nothing to fall out
+/// of sync with. Set `present_lead_ms: 0` where that latency matters more
+/// than the smoothness — that restores the previous behaviour exactly.
+///
+/// Corollary worth stating plainly: an **audio-enabled** display output
+/// still has the fault and this does not fix it. The audio branch paces
+/// against the measured ALSA playout position, which has no anchor to seed.
 fn display_lead_ms(
     counters: &DisplayStatsCounters,
     configured: Option<u32>,
+    frame_period_ms: f64,
 ) -> u64 {
     // Operator intent wins: an explicit value (including 0) is honoured as
     // written, so a deployment that would rather keep the latency than the
     // smoothness can say so.
-    if let Some(v) = configured {
-        return v as u64;
-    }
-    if let Some(v) = std::env::var("BILBYCAST_DISPLAY_LEAD_MS")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-    {
-        return v;
-    }
-    // Keyed off the decoder that is actually running, not off host or
-    // config guesswork. Only the backend measured to hand frames over
-    // late gets the lead; every other path keeps its existing timing and
-    // its existing latency, so this cannot regress deployments that do
-    // not have the fault.
-    match counters.load_active_decoder_label() {
-        DisplayDecoderLabel::RkmppZeroCopy => RKMPP_PRESENT_LEAD_MS,
-        _ => 0,
-    }
+    let requested = if let Some(v) = configured {
+        v as u64
+    } else if let Some(v) = display_lead_env_ms() {
+        v
+    } else {
+        // Keyed off the decoder that is actually running, not off host or
+        // config guesswork. Only the backend measured to hand frames over
+        // late gets the lead; every other path keeps its existing timing
+        // and its existing latency, so this cannot regress deployments
+        // that do not have the fault.
+        match counters.load_active_decoder_label() {
+            DisplayDecoderLabel::RkmppZeroCopy => RKMPP_PRESENT_LEAD_MS,
+            _ => 0,
+        }
+    };
+
+    // The lead is realised as decode-queue depth, so it cannot exceed what
+    // the queue holds. A third of the depth keeps burst headroom for the
+    // drain-to-newest catch-up above it; beyond this the decoder's
+    // `try_send` starts failing and the "fix" reads as dropped frames.
+    // `frame_period_ms` is still the 33 ms default at the seed, which
+    // *over*-estimates the period of a 50/60 fps source and so lands the
+    // ceiling further inside the queue rather than outside it.
+    let ceiling = (MPSC_VIDEO_DEPTH as u64 / 3) * frame_period_ms.max(1.0) as u64;
+    requested.min(ceiling)
 }
 
+/// Cached parse of `BILBYCAST_DISPLAY_LEAD_MS`. Cached because the seed
+/// expression is evaluated on every frame of the muted path (`get_or_insert`
+/// is eager) — an uncached `env::var` would allocate a `String` per frame on
+/// the display hot path.
+fn display_lead_env_ms() -> Option<u64> {
+    static CACHED: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *CACHED.get_or_init(|| {
+        std::env::var("BILBYCAST_DISPLAY_LEAD_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+    })
+}
+
+/// Anchor-servo step in microseconds, overridable via
+/// `BILBYCAST_DISPLAY_SERVO_US` (0 disables the servo entirely).
+///
+/// Exists to test the #104 phase-slide hypothesis on hardware without a
+/// rebuild: the servo slides the presentation phase relative to vblank, and
+/// on a 25 fps source driving a 50 Hz panel a phase crossing costs a visible
+/// hitch. Default is the previous hard-coded 250 us.
 fn display_servo_step_us() -> u64 {
     static CACHED: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *CACHED.get_or_init(|| {
@@ -4637,6 +4679,7 @@ fn display_servo_step_us() -> u64 {
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn display_loop(
     mut kms: KmsDisplay,
     mut vrx: mpsc::Receiver<VideoFrame>,
@@ -5220,10 +5263,26 @@ fn display_loop(
             // target sits that much later, giving a burst-late frame room
             // to arrive before its slot rather than being presented
             // immediately on top of the previous one (#104).
-            let (anchor_pts, anchor_at) = wall_anchor.get_or_insert((
-                next.pts_90k,
-                now + std::time::Duration::from_millis(display_lead_ms(&counters, configured_lead_ms)),
-            ));
+            //
+            // `_with` matters: `get_or_insert` evaluates its argument on
+            // every frame, not just on the seed, so the plain form ran the
+            // whole resolver — env lookup included — per frame.
+            let (anchor_pts, anchor_at) = wall_anchor.get_or_insert_with(|| {
+                let lead_ms = display_lead_ms(&counters, configured_lead_ms, frame_period_ms);
+                if lead_ms > 0 {
+                    tracing::debug!(
+                        flow_id = %flow_id,
+                        output_id = %output_id,
+                        lead_ms,
+                        decoder = ?counters.load_active_decoder_label(),
+                        "display: seeding wall-clock anchor with presentation lead"
+                    );
+                }
+                (
+                    next.pts_90k,
+                    now + std::time::Duration::from_millis(lead_ms),
+                )
+            });
             let pts_delta_ms = (next.pts_90k.wrapping_sub(*anchor_pts) as i64) / 90;
             let wall_delta_ms = now.duration_since(*anchor_at).as_millis() as i64;
             let drift_ms = pts_delta_ms - wall_delta_ms;
@@ -6318,6 +6377,91 @@ mod tests {
     /// because it was measured end-to-end on bilby-z440 once
     /// `mpeg2_cuvid` was compiled into the vendored FFmpeg — its
     /// original "failure" was that build gap, not the silicon.
+
+    // ── Presentation lead resolution (issue #104) ─────────────────────
+    //
+    // The lead exists to stop a burst-late RKMPP hand-over from being
+    // presented on top of the previous frame. It is scoped to the *live*
+    // decoder precisely so it cannot add latency to a backend that does
+    // not have the fault, and these pin that scoping.
+
+    /// 25 fps: the ceiling is 8 frames, so nothing below 320 ms clamps.
+    const TEST_PERIOD_MS: f64 = 40.0;
+
+    fn counters_on(label: DisplayDecoderLabel) -> DisplayStatsCounters {
+        let c = DisplayStatsCounters::default();
+        c.set_active_decoder_label(label);
+        c
+    }
+
+    #[test]
+    fn lead_applies_only_to_the_rkmpp_path() {
+        assert_eq!(
+            display_lead_ms(
+                &counters_on(DisplayDecoderLabel::RkmppZeroCopy),
+                None,
+                TEST_PERIOD_MS
+            ),
+            RKMPP_PRESENT_LEAD_MS
+        );
+        // Every other backend must be bit-for-bit unchanged. VAAPI in
+        // particular measured 0 of ~148 samples moving >=20 ms, so a lead
+        // here would be pure added latency for no benefit.
+        for label in [
+            DisplayDecoderLabel::VaapiZeroCopy,
+            DisplayDecoderLabel::Nvdec,
+            DisplayDecoderLabel::Qsv,
+            DisplayDecoderLabel::Cpu,
+            DisplayDecoderLabel::CpuHwUnavailable,
+            DisplayDecoderLabel::Unset,
+        ] {
+            assert_eq!(
+                display_lead_ms(&counters_on(label), None, TEST_PERIOD_MS),
+                0,
+                "{label:?} must not take a presentation lead"
+            );
+        }
+    }
+
+    /// Operator intent outranks the per-decoder default in both directions
+    /// — including `Some(0)`, which is the documented way to opt a Rockchip
+    /// node out and must not be confused with "unset".
+    #[test]
+    fn configured_lead_overrides_the_decoder_default() {
+        let rk = counters_on(DisplayDecoderLabel::RkmppZeroCopy);
+        assert_eq!(display_lead_ms(&rk, Some(0), TEST_PERIOD_MS), 0);
+        assert_eq!(display_lead_ms(&rk, Some(120), TEST_PERIOD_MS), 120);
+        // ...and can add a lead to a backend whose default is 0.
+        let vaapi = counters_on(DisplayDecoderLabel::VaapiZeroCopy);
+        assert_eq!(display_lead_ms(&vaapi, Some(80), TEST_PERIOD_MS), 80);
+    }
+
+    /// The lead is realised as decode-queue depth, so it cannot exceed what
+    /// the queue holds — past that the decoder's `try_send` fails and the
+    /// "fix" would read as dropped frames instead of added smoothness.
+    #[test]
+    fn lead_is_clamped_to_what_the_decode_queue_can_hold() {
+        let rk = counters_on(DisplayDecoderLabel::RkmppZeroCopy);
+        let ceiling = (MPSC_VIDEO_DEPTH as u64 / 3) * TEST_PERIOD_MS as u64;
+        assert_eq!(display_lead_ms(&rk, Some(1000), TEST_PERIOD_MS), ceiling);
+    }
+
+    /// The shipped default must fit the queue **at the period the seed
+    /// actually sees**. `wall_anchor` is seeded on the first frame, when
+    /// `frame_period_ms` is still `display_loop`'s 33 ms starting estimate
+    /// — a tighter ceiling than any real 25 fps source would give. Pinning
+    /// against 40 ms would let the default be raised to a value that then
+    /// clamps silently in production.
+    #[test]
+    fn shipped_rkmpp_default_fits_the_queue_at_the_seed_period() {
+        const SEED_PERIOD_MS: f64 = 33.0; // display_loop's initial estimate
+        let rk = counters_on(DisplayDecoderLabel::RkmppZeroCopy);
+        assert_eq!(
+            display_lead_ms(&rk, None, SEED_PERIOD_MS),
+            RKMPP_PRESENT_LEAD_MS,
+            "the shipped default must not be clamped at the seed period"
+        );
+    }
 
     // ── HW re-promotion backoff (issue #97) ───────────────────────────
     //

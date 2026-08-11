@@ -6666,23 +6666,6 @@ fn default_st2110_anc_pt() -> u8 {
 /// output at `start_output()` with `display_device_invalid`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DisplayOutputConfig {
-    /// Presentation lead in milliseconds for the wall-clock (muted /
-    /// video-only) pacing path.
-    ///
-    /// The pacer cannot present a frame that has not arrived: a frame handed
-    /// over past its target is shown immediately on top of the previous one,
-    /// and the next frame then waits its full slot — a short/long pair the
-    /// operator sees as stutter. Lead time moves every target later so a
-    /// late-arriving frame still makes its slot, costing exactly that much
-    /// added display latency.
-    ///
-    /// Unset (the default) picks per decoder: the RKMPP path gets 200 ms,
-    /// where its dose-response saturates (elbow ~120 ms, one frame period
-    /// buys nothing); every other backend gets 0 and is unchanged. Set this
-    /// to override — `0` disables it outright, useful where the added
-    /// latency matters more than the stutter. Range 0..=1000.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub present_lead_ms: Option<u32>,
     /// Unique output ID within this flow.
     pub id: String,
     /// Human-readable name.
@@ -6804,6 +6787,33 @@ pub struct DisplayOutputConfig {
     /// policy, so opting out can cost frames but can never wedge the output.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mpeg2_cpu_decode: Option<bool>,
+
+    /// Presentation lead in milliseconds for the wall-clock (muted /
+    /// video-only) pacing path.
+    ///
+    /// The pacer cannot present a frame that has not arrived: a frame handed
+    /// over past its target is shown immediately on top of the previous one,
+    /// and the next frame then waits its full slot — a short/long pair the
+    /// operator sees as stutter. Lead time moves every target later, which in
+    /// practice keeps `lead / frame_period` frames buffered ahead of the
+    /// panel so a delivery burst is served from that backlog instead of
+    /// stalling the present. It costs exactly that much added display
+    /// latency.
+    ///
+    /// Unset (the default) picks per **live decoder**: the RKMPP path gets
+    /// 200 ms, where its dose-response saturates (elbow ~120 ms, one frame
+    /// period buys nothing); every other backend gets 0 and is bit-for-bit
+    /// unchanged. Set this to override — `0` disables it outright, useful
+    /// where the added latency matters more than the stutter.
+    ///
+    /// Range 0..=1000, and additionally clamped at run time to what the
+    /// decode queue can actually hold (`MPSC_VIDEO_DEPTH / 3` frames), since
+    /// a lead deeper than the queue spills onto `frames_dropped_mpsc_full`
+    /// instead of buffering. **Applies only to outputs with no audio device**
+    /// — an audio-enabled display output paces against the ALSA playout
+    /// position and ignores this entirely.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub present_lead_ms: Option<u32>,
 }
 
 fn default_audio_channel_pair() -> [u8; 2] {

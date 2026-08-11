@@ -711,6 +711,19 @@ field. All counters are lock-free atomic loads sampled at the regular
 | `decoder_kind` | What the runtime decoder resolver actually opened on this host: `"cpu"`, `"cpu (hw unavailable)"` (operator requested a HW backend the host can't open), `"nvdec"`, `"qsv"`, `"vaapi-zerocopy"`, or `"rkmpp-zerocopy"` (the aarch64 Rockchip HW decode path) |
 | `video_codec` | Source video codec (`"h264"` / `"hevc"`) |
 | `audio_codec` | Source audio codec (`"aac"` / `"mp2"` / `"ac3"` / `"eac3"` / `"opus"` / `"none"` when audio is muted) |
+| `present_interval_count` | Successful page-flips with a predecessor to measure against — the denominator for every field below |
+| `present_interval_us_min` / `_us_max` | Shortest / longest gap between successive flips, in µs, since the output started. **`min` is the diagnostic**: a value below one vblank period (e.g. 13 000 µs on a 50 Hz panel) cannot be produced by a vblank-locked flip, so it is direct evidence that two frames were presented back-to-back with no wait |
+| `present_bucket` | Eight-bin histogram of the flip interval, in **fixed** µs boundaries: `<10k`, `10–20k`, `20–30k`, `30–38k`, `38–42k`, `42–60k`, `60–100k`, `≥100k`. Bin 4 (`38–42k`) is "on target" **for a 25 fps source specifically** — at 50 fps that role falls to bin 2. Read as a distribution, not a ratio |
+| `present_interval_outliers` | Intervals ≥ 10 ms off the running frame period. **Single-run use only** — its reference is the `frame_period_ms` EMA, fed by the very deltas being measured, so the threshold moves with the signal; it scored one identical configuration at 1.4 % and then 34.6 % (#104). Compare arms with `present_bucket`, never with this |
+| `present_no_sleep` | Frames presented immediately because they reached the display task at or past their due time, leaving nothing to sleep. Separates "the decoder handed it over late" from "we slept correctly and still missed the vblank" — the outlier count conflates the two and they need different fixes. This is the counter `present_lead_ms` exists to drive to zero |
+
+**Why these exist.** Every other counter in this table records a *loss*,
+and the stutter class in issue #104 loses nothing — the frames are all
+presented, just at irregular times, so `frames_dropped_late` sat at 0–3
+while the panel visibly hitched. These are the only fields that measure
+what the panel actually shows. The bucket boundaries are **constants on
+purpose**; see `present_interval_outliers` above for what happens when
+they are not.
 
 Manager UI wiring:
 
