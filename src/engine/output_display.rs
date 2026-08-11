@@ -4546,6 +4546,72 @@ impl DisplayPresentLatch {
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Anchor-servo step in microseconds, overridable via
+/// `BILBYCAST_DISPLAY_SERVO_US` (0 disables the servo entirely).
+///
+/// Exists to test the #104 phase-slide hypothesis on hardware without a
+/// rebuild: this servo slides the presentation phase relative to vblank, and
+/// on a 25 fps source driving a 50 Hz panel a phase crossing costs a visible
+/// hitch. Default is the previous hard-coded 250 us.
+/// Presentation lead time in milliseconds for the **wall-clock** pacing
+/// path, overridable via `BILBYCAST_DISPLAY_LEAD_MS`.
+///
+/// The wall-clock pacer targets `anchor_at + pts_delta`, which is already an
+/// absolute anchored schedule — per-frame arrival jitter cannot move it. What
+/// it cannot do is present a frame that has not arrived yet: a frame handed
+/// over *past* its target is presented immediately, collapsing the interval
+/// against the previous on-time present. Measured on RKMPP (#104) as drift
+/// dipping to -20..-56 ms while sitting at +39/40 ms the rest of the time,
+/// producing present intervals as short as 13 ms on a panel whose vblank is
+/// 20 ms — i.e. two flips inside one vblank period.
+///
+/// Pushing the anchor later gives every frame that much more time to arrive
+/// before its target, at the cost of exactly that much added latency. VAAPI
+/// does not need it (`receive_frame` returns in ~1 us and drift never moved
+/// >=20 ms across 148 samples); RKMPP blocks up to 17 ms and bursts.
+///
+/// Measured on bilby-pi (RK3568), 110 s per arm, fixed-bucket metric whose
+/// noise floor is +/-1.6 pp across three consecutive runs:
+///
+/// | lead ms | presents on target (38-42 ms) | arrived late |
+/// |---|---|---|
+/// | 0 | 70.5 - 72.1 % | ~19 % |
+/// | 40 | 68.0 % | 22.5 % |
+/// | 80 | 81.2 % | 9.3 % |
+/// | 120 | 98.1 % | 0.2 % |
+/// | 160 | 98.1 % | 0.0 % |
+/// | **200** | **99.7 - 99.9 %** | **0.0 %** |
+///
+/// Confirmed A/B/A/B (0 -> 200 -> 0 -> 200) with every arm replicated.
+/// One frame period (40 ms) buys nothing; the elbow is ~120 ms and 200 ms
+/// saturates. 200 is the default because on this path the latency is free:
+///
+/// **This only applies where there is no audio to sync against.** It is set
+/// inside the `wall_anchor` branch, which is reached only when
+/// `AudioClock::current_pts_90k_smoothed()` returns `None` — i.e. muted or
+/// video-only output. On the audio-master path `wall_anchor` is cleared and
+/// never consulted, so this cannot shift video against audio and carries no
+/// lip-sync risk. Setting it to 0 restores the previous behaviour.
+fn display_lead_ms() -> u64 {
+    static CACHED: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *CACHED.get_or_init(|| {
+        std::env::var("BILBYCAST_DISPLAY_LEAD_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(200)
+    })
+}
+
+fn display_servo_step_us() -> u64 {
+    static CACHED: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *CACHED.get_or_init(|| {
+        std::env::var("BILBYCAST_DISPLAY_SERVO_US")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(250)
+    })
+}
+
 fn display_loop(
     mut kms: KmsDisplay,
     mut vrx: mpsc::Receiver<VideoFrame>,
@@ -4652,6 +4718,7 @@ fn display_loop(
     // resolution change or large PTS jump so a stream switch starts
     // fresh.
     let mut wall_anchor: Option<(u64, Instant)> = None;
+    let mut last_flip_at: Option<Instant> = None;
 
     // Sustained present-shortfall latch (issue #68). Polled once per
     // presented frame; see `DisplayPresentLatch`.
@@ -5123,8 +5190,14 @@ fn display_loop(
         } else {
             // Audio muted — pace on wall-clock seeded by the first frame.
             let now = Instant::now();
-            let (anchor_pts, anchor_at) =
-                wall_anchor.get_or_insert((next.pts_90k, now));
+            // Seed the anchor `display_lead_ms()` in the future so every
+            // target sits that much later, giving a burst-late frame room
+            // to arrive before its slot rather than being presented
+            // immediately on top of the previous one (#104).
+            let (anchor_pts, anchor_at) = wall_anchor.get_or_insert((
+                next.pts_90k,
+                now + std::time::Duration::from_millis(display_lead_ms()),
+            ));
             let pts_delta_ms = (next.pts_90k.wrapping_sub(*anchor_pts) as i64) / 90;
             let wall_delta_ms = now.duration_since(*anchor_at).as_millis() as i64;
             let drift_ms = pts_delta_ms - wall_delta_ms;
@@ -5144,7 +5217,7 @@ fn display_loop(
             let deadband_ms = frame_period_ms as i64;
             if drift_ms.unsigned_abs() as i64 > deadband_ms {
                 let excess_ms = (drift_ms.unsigned_abs() as i64 - deadband_ms) as u64;
-                let step = std::time::Duration::from_micros(250)
+                let step = std::time::Duration::from_micros(display_servo_step_us())
                     .min(std::time::Duration::from_millis(excess_ms));
                 if drift_ms > 0 {
                     // Frame runs ahead of the wall timeline — pull the
@@ -5262,6 +5335,15 @@ fn display_loop(
             // startup mux interleave (audio buffered ~1 s ahead of the
             // matching video) converges over ~a second of gentle slow-in
             // rather than a single long freeze.
+            if raw_drift_ms <= PRESENT_MARGIN_MS {
+                // No time left to sleep: this frame reached the display task at
+                // or past its target, so it is presented immediately on top of
+                // whatever was shown last. Counting these separates "the
+                // decoder handed it over late" from "we slept correctly and
+                // still missed the vblank" — different causes, different fixes,
+                // and the interval counter alone cannot tell them apart.
+                counters.present_no_sleep.fetch_add(1, Ordering::Relaxed);
+            }
             if raw_drift_ms > PRESENT_MARGIN_MS {
                 let sleep_ms =
                     (raw_drift_ms - PRESENT_MARGIN_MS).min(catchup_cap_ms) as u64;
@@ -5423,6 +5505,46 @@ fn display_loop(
             );
         }
         let blit_us = blit_start.elapsed().as_micros() as u64;
+        // Interval between successive flips — the only direct measure of
+        // what the panel shows. Recorded only on a successful flip so a
+        // failed present cannot masquerade as a long interval. See #104.
+        if blit_ok {
+            let flip_now = Instant::now();
+            if let Some(prev) = last_flip_at {
+                let iv_us = flip_now.duration_since(prev).as_micros() as u64;
+                counters
+                    .present_interval_us_max
+                    .fetch_max(iv_us, Ordering::Relaxed);
+                let _ = counters.present_interval_us_min.fetch_update(
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                    |cur| Some(if cur == 0 { iv_us } else { cur.min(iv_us) }),
+                );
+                counters
+                    .present_interval_count
+                    .fetch_add(1, Ordering::Relaxed);
+                // Fixed bucket boundaries — see `present_bucket`. Independent
+                // of the frame-period EMA so two runs are comparable.
+                let bin = match iv_us {
+                    0..=9_999 => 0,
+                    10_000..=19_999 => 1,
+                    20_000..=29_999 => 2,
+                    30_000..=37_999 => 3,
+                    38_000..=42_000 => 4,
+                    42_001..=59_999 => 5,
+                    60_000..=99_999 => 6,
+                    _ => 7,
+                };
+                counters.present_bucket[bin].fetch_add(1, Ordering::Relaxed);
+                let expect_us = (frame_period_ms * 1000.0) as i64;
+                if (iv_us as i64 - expect_us).abs() >= 10_000 {
+                    counters
+                        .present_interval_outliers
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            last_flip_at = Some(flip_now);
+        }
         counters.blit_count.fetch_add(1, Ordering::Relaxed);
         counters.blit_us_total.fetch_add(blit_us, Ordering::Relaxed);
         counters
