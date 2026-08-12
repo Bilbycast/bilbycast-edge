@@ -140,13 +140,15 @@ pub const RESIDENCE_MAX_MS: u64 = 5_000;
 /// somewhere to work before the hard shed fires.
 pub const RESIDENCE_HEADROOM_MS: u64 = 40;
 
-/// Node-wide de-jitter defaults, resolved once at startup from
-/// `AppConfig.tuning` (falling back to the deprecated environment
-/// variables) and installed via [`install_node_defaults`].
+/// Node-wide de-jitter defaults, resolved from `AppConfig.tuning` (falling
+/// back to the deprecated environment variables) and installed via
+/// [`install_node_defaults`] — at startup, and again on every manager
+/// `update_config` that changes them.
 ///
 /// These are *defaults*, not overrides: a per-input `ingress_dejitter_ms` /
-/// `ingress_residence_ms` always wins.
-#[derive(Clone, Copy, Debug, Default)]
+/// `ingress_residence_ms` always wins. The setpoint additionally decides
+/// whether the buffer runs at all for a UDP/RTP input that names none.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct IngressDejitterDefaults {
     /// Node default setpoint. `None` → [`DEFAULT_SETPOINT_MS`].
     pub dejitter_ms: Option<u32>,
@@ -154,19 +156,52 @@ pub struct IngressDejitterDefaults {
     pub residence_ms: Option<u32>,
 }
 
-static NODE_DEFAULTS: std::sync::OnceLock<IngressDejitterDefaults> = std::sync::OnceLock::new();
+/// `Option<u32>` in one atomic word: `u64::MAX` is `None`, anything else is
+/// `Some(v as u32)`. Two of these rather than a lock, because an input spawn
+/// reads them and a manager push writes them from a different task.
+const NONE_SENTINEL: u64 = u64::MAX;
 
-/// Install the node-wide de-jitter defaults. Called once from `main` after
-/// the config is loaded and before any flow starts. Later calls are ignored
-/// (the value is process-wide and read from input tasks on every spawn).
-pub fn install_node_defaults(defaults: IngressDejitterDefaults) {
-    let _ = NODE_DEFAULTS.set(defaults);
+static NODE_DEJITTER_MS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(NONE_SENTINEL);
+static NODE_RESIDENCE_MS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(NONE_SENTINEL);
+
+fn pack(v: Option<u32>) -> u64 {
+    v.map_or(NONE_SENTINEL, u64::from)
 }
 
-/// The installed node defaults, or all-`None` if `install_node_defaults`
+fn unpack(v: u64) -> Option<u32> {
+    (v != NONE_SENTINEL).then_some(v as u32)
+}
+
+/// Install the node-wide de-jitter defaults.
+///
+/// Called from `main` once the config is loaded and before any flow starts,
+/// **and again from the `update_config` handler**. It used to be a
+/// `OnceLock` that silently dropped every later call, which meant a value an
+/// operator set on the manager's Tuning tab validated, persisted, echoed
+/// back on `GetConfig` and appeared in Config History while the running
+/// process kept the value it booted with — visible nowhere, and not even
+/// fixed by restarting the flow.
+///
+/// The two fields are written separately, so an input spawning concurrently
+/// with a push can observe a new setpoint against an old cap. That is
+/// harmless: both are bounds-checked by validation before they get here, and
+/// `resolve_with` clamps the cap against whichever setpoint it reads.
+pub fn install_node_defaults(defaults: IngressDejitterDefaults) {
+    use std::sync::atomic::Ordering;
+    NODE_DEJITTER_MS.store(pack(defaults.dejitter_ms), Ordering::Relaxed);
+    NODE_RESIDENCE_MS.store(pack(defaults.residence_ms), Ordering::Relaxed);
+}
+
+/// The installed node defaults, or all-`None` if [`install_node_defaults`]
 /// was never called (unit tests, and any binary that doesn't load a config).
 pub fn node_defaults() -> IngressDejitterDefaults {
-    NODE_DEFAULTS.get().copied().unwrap_or_default()
+    use std::sync::atomic::Ordering;
+    IngressDejitterDefaults {
+        dejitter_ms: unpack(NODE_DEJITTER_MS.load(Ordering::Relaxed)),
+        residence_ms: unpack(NODE_RESIDENCE_MS.load(Ordering::Relaxed)),
+    }
 }
 
 /// De-jitter policy. Built from the per-input setpoint / residence cap,

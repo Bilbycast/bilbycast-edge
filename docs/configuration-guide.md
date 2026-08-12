@@ -15,6 +15,7 @@ Complete reference for the bilbycast-edge JSON configuration file. This guide co
 - [Monitor Configuration](#monitor-configuration)
 - [Manager Configuration](#manager-configuration)
 - [Resource Limits](#resource-limits)
+- [Node Tuning](#node-tuning)
 - [Tunnel Configuration](#tunnel-configuration)
 - [Flow Configuration](#flow-configuration)
 - [Input Types](#input-types)
@@ -193,6 +194,7 @@ If neither file exists at startup, an empty default configuration is used. Both 
 | `server` | object | Yes | - | API server configuration. |
 | `monitor` | object | No | `null` | Web monitoring dashboard configuration. |
 | `manager` | object | No | `null` | Manager WebSocket connection configuration. See [Manager Configuration](#manager-configuration). |
+| `tuning` | object | No | `null` | Node-wide tuning defaults. See [Node Tuning](#node-tuning). |
 | `inputs` | array | No | `[]` | Top-level input definitions. Each is an `InputDefinition` with `id`, `name`, and flattened protocol-specific fields (enum-tagged by `type`). See [Input Types](#input-types). Inputs exist independently and are referenced by flows via `input_ids`. |
 | `outputs` | array | No | `[]` | Top-level output definitions. Each is an `OutputConfig` with `id`, `name`, and protocol-specific fields (enum-tagged by `type`). See [Output Types](#output-types). Outputs exist independently and are referenced by flows via `output_ids`. |
 | `flows` | array | No | `[]` | List of flow configurations. Each flow references one or more inputs (one active at a time) and zero or more outputs by ID. See [Flow Configuration](#flow-configuration). |
@@ -443,6 +445,79 @@ Events emitted (category `system_resources`):
 `system_resources_recovered`. With `critical_action: "gate_flows"`,
 new-flow rejections additionally surface as a save-time error on
 the manager UI.
+
+---
+
+## Node Tuning
+
+Optional top-level `tuning` block holding node-wide defaults. Every
+field here was previously reachable **only** through an environment
+variable, which meant the manager could neither show nor set it, an
+operator had to edit a systemd unit and restart per node, and nothing
+was audited. They are ordinary config fields now, so they arrive over
+the same validated `UpdateConfig` path as everything else.
+
+Every field is optional; omitting one (or omitting the whole block)
+uses the built-in default.
+
+```json
+{
+  "version": 2,
+  "tuning": {
+    "ingress_dejitter_ms": 80,       // node default de-jitter setpoint (UDP/RTP)
+    "ingress_residence_ms": 320,     // hard-shed cap for that buffer
+    "probe_session_limits": true,    // startup HW session-capacity probe
+    "probe_4k": false                // skip the second-tier 4K pass
+  },
+  "inputs": [],
+  "outputs": [],
+  "flows": []
+}
+```
+
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| `ingress_dejitter_ms` | integer | No | `60` | Node-wide default ingress de-jitter setpoint, in ms of content. Range 20–2000. Applies to raw **UDP and RTP** inputs that do not carry their own `ingress_dejitter_ms`, and it both **switches the buffer on** and sets its depth — so setting it here de-jitters every such input on the node. It does **not** apply to SRT (TSBPD de-jitters at the transport layer), RTSP, RTMP or `bonded` inputs, which run ingress passthrough by design. |
+| `ingress_residence_ms` | integer | No | `max(4 × setpoint, 250)` ms | Node-wide default hard-shed residence cap for that buffer. A packet older than this is shed rather than released late, which is what bounds ingress latency when a burst or a source-rate offset exceeds the servo's ±5 % authority. Range `ingress_dejitter_ms + 40` .. `5000`; node-wide the floor is checked against `tuning.ingress_dejitter_ms`, or the built-in 60 ms when that is unset. A per-input `ingress_residence_ms` overrides it. |
+| `probe_session_limits` | boolean | No | `true` | Run the startup hardware encoder/decoder session-capacity probe. `false` trades the manager's "sessions used **of** max" denominator for a faster boot, and disables **both** tiers. See [Capacity & resource budget](#capacity--resource-budget). |
+| `probe_4k` | boolean | No | `true` | Run the second-tier 4K session-capacity probe. Ignored when `probe_session_limits` is `false` — that disables both tiers. |
+
+**When a pushed change lands.** The two probe switches are read once at
+node start, so an edit to either takes effect at the node's next
+restart; the push says so — it raises a Warning `tuning_requires_restart`
+event naming both fields, rather than leaving the operator to infer it
+from an unchanged Resources card. The two ingress knobs are re-installed
+on the push and re-read on every input spawn, so a flow restart or a hot
+input swap picks them up; an input already running keeps the values it
+spawned with.
+
+**Per-input overrides.** UDP and RTP inputs carry their own
+`ingress_dejitter_ms` and `ingress_residence_ms` (see
+[RTP Input](#rtp-input)), so one input can be tuned without moving the
+node default. Precedence, highest first: **per-input field → `tuning`
+→ the legacy environment variable, where one is still read → the
+built-in default.**
+
+The environment variable sits **below** the config field deliberately.
+Env-above-config would reintroduce exactly the trap this block exists
+to close: an operator sets the field in the UI, sees it saved, and it
+never applies because a unit file outranks it. Setting one of the
+legacy variables raises a Warning `deprecated_env_var` event once at
+startup (category `config`, with `details.env_var` / `.replacement` /
+`.status`) and logs to the journal, so a stale unit file is visible on
+the manager's Events page rather than silently steering the node.
+
+| Config field | Legacy environment variable | Status |
+|---|---|---|
+| `tuning.ingress_dejitter_ms` | `BILBYCAST_INGRESS_BUFFER_MS` | **Removed** — it never had any effect, in any release: the node-wide setpoint was only consulted after the per-input setpoint had already answered, so no value it held could change behaviour. Still reported at startup so a unit file that sets it cannot state an intent that isn't being applied. |
+| `tuning.ingress_residence_ms` | `BILBYCAST_INGRESS_RESIDENCE_MS` | Deprecated — still read for one release, below the config field. |
+| `tuning.probe_session_limits` | `BILBYCAST_PROBE_SESSION_LIMITS` | Deprecated — still read for one release, below the config field. |
+| `tuning.probe_4k` | `BILBYCAST_PROBE_4K` | Deprecated — still read for one release, below the config field. |
+
+**Manager UI.** Manager → node → **Configure** → **Tuning**. The tab is
+gated on the `node_tuning` capability advertised on
+`HealthPayload.capabilities` — an edge without the bit accepts the
+block and ignores it, which looks exactly like success.
 
 ---
 
@@ -775,6 +850,8 @@ Receives RTP-wrapped MPEG-TS packets (SMPTE ST 2022-2). Requires valid RTP v2 he
 | `allowed_sources` | array of strings | No | `null` | Source IP allow-list (RP 2129 C5). Only RTP packets from these source IPs are accepted. Each entry must be a valid IP address. When `null`, all sources are allowed. |
 | `allowed_payload_types` | array of integers | No | `null` | RTP payload type allow-list (RP 2129 U4). Only packets with these PT values (0-127) are accepted. When `null`, all payload types are allowed. |
 | `max_bitrate_mbps` | float | No | `null` | Maximum ingress bitrate in megabits per second (RP 2129 C7). Excess packets are dropped. Must be positive. When `null`, no rate limiting is applied. |
+| `ingress_dejitter_ms` | integer | No | node `tuning.ingress_dejitter_ms`, else `60` | Ingress **de-jitter** buffer setpoint, in ms of content. Packets are buffered and released paced at the recovered source rate (a leaky bucket trimmed ±5 % by the buffer-fill error, with a hard residence-cap shed), so every downstream consumer sees a smooth cadence regardless of network packet-delay variation. Range 20–2000. On a SMPTE 2022-7 dual-leg input it runs *after* the hitless merger, re-pacing the merger's bursty seq-ordered drain. Supersedes `ingress_delay_ms`, which is a pure delay line and *preserves* jitter. |
+| `ingress_residence_ms` | integer | No | node `tuning.ingress_residence_ms`, else `max(4 × setpoint, 250)` ms | Hard-shed residence cap for this input's de-jitter buffer. A packet older than this is shed rather than released late, which is what bounds ingress latency when a burst or a source-rate offset exceeds the servo's ±5 % authority. Range `ingress_dejitter_ms + 40` .. `5000`. **Refused without `ingress_dejitter_ms` on the same input** — see the validation rules below. |
 
 **Validation rules:**
 - `bind_addr` must be a valid `ip:port` socket address.
@@ -782,6 +859,9 @@ Receives RTP-wrapped MPEG-TS packets (SMPTE ST 2022-2). Requires valid RTP v2 he
 - `source_addr` is only valid when `bind_addr` is multicast, must be a unicast IP, and must share the address family of `bind_addr`.
 - `allowed_payload_types` values must be 0-127.
 - `max_bitrate_mbps` must be positive.
+- `ingress_dejitter_ms` must be 20–2000 ms.
+- `ingress_residence_ms` is **rejected unless the same input also sets `ingress_dejitter_ms`** — it caps how long a packet may sit in the de-jitter buffer, and without a buffer there is nothing to cap, so accepting it would be a silent no-op.
+- `ingress_residence_ms` must be within `ingress_dejitter_ms + 40` .. `5000` ms. The floor is the setpoint plus 40 ms because a cap at or below the setpoint would shed the very buffer the setpoint asks the servo to hold.
 
 ### UDP Input
 
@@ -802,11 +882,15 @@ Receives raw UDP datagrams without requiring RTP headers. Suitable for raw MPEG-
 | `bind_addr` | string | Yes | - | Local socket address to bind (`ip:port`). For multicast, use the group address. |
 | `interface_addr` | string | No | `null` | Network interface IP for multicast group join. Must be the same address family as `bind_addr`. |
 | `source_addr` | string | No | `null` | SSM source address — see [RTP Input](#rtp-input) above. |
+| `ingress_dejitter_ms` | integer | No | node `tuning.ingress_dejitter_ms`, else `60` | Ingress de-jitter buffer setpoint, in ms of content (20–2000). Same servo as the RTP input — see [RTP Input](#rtp-input) above. |
+| `ingress_residence_ms` | integer | No | node `tuning.ingress_residence_ms`, else `max(4 × setpoint, 250)` ms | Hard-shed residence cap for this input's de-jitter buffer. Range `ingress_dejitter_ms + 40` .. `5000`. **Refused without `ingress_dejitter_ms` on the same input.** See [RTP Input](#rtp-input) above. |
 
 **Validation rules:**
 - `bind_addr` must be a valid `ip:port` socket address.
 - `interface_addr` must be a valid IP address in the same address family as `bind_addr`.
 - `source_addr` rules: see [RTP Input](#rtp-input) above.
+- `ingress_dejitter_ms` must be 20–2000 ms.
+- `ingress_residence_ms` is **rejected unless the same input also sets `ingress_dejitter_ms`** (there is no de-jitter buffer to cap, so it would be a silent no-op), and must be within `ingress_dejitter_ms + 40` .. `5000` ms.
 
 ### Source-Specific Multicast (SSM) vs Any-Source Multicast (ASM)
 

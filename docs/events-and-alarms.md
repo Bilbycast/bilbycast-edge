@@ -60,24 +60,32 @@ Events are queued in an unbounded in-memory channel. When the edge is not connec
 |----------|---------|---------|
 | Warning | `<VAR> is deprecated and will be removed…` | Raised once at startup, per variable, when the host's environment still sets a variable that has moved into `config.json`. The variable is **still honoured** this release (it sits below the config field), so nothing about the node's behaviour changes — this is telling the operator where the knob now lives. |
 | Warning | `<VAR> has been removed and does nothing…` | Raised once at startup, per variable, when the host still sets a variable that is read by nothing. Its intent is **not** being applied. Silence here would be worse than the warning: the unit file states one thing and the node does another, and nobody finds out until a stream misbehaves. |
+| Warning | `<VAR> is set to …, which could not be read as a value for it…` | Raised once at startup when a still-honoured variable holds a value that will not parse. The value is **discarded**, not honoured, and the layer below answers. Distinct from the plain deprecation on purpose — telling an operator their variable "is still honoured" while dropping the value it carries is the same lie as a unit file nothing applies. |
+| Warning | `tuning.probe_session_limits / tuning.probe_4k changed…` | Raised on an `update_config` that changes either probe switch. Carries `error_code: "tuning_requires_restart"` and `details.fields`. The hardware session-capacity probe runs once at node start, so the push is persisted and echoed but takes effect at the next restart; the two **ingress** knobs in the same block are re-installed immediately and need no restart. |
 
-Both carry `error_code: "deprecated_env_var"` plus structured
+The first three carry `error_code: "deprecated_env_var"` plus structured
 `details.env_var`, `details.replacement`, `details.status`
-(`"deprecated"` / `"removed"`) and `details.value`, so the Events page can
-show what to set instead and what the current value was. The events are
-raised before the manager WebSocket connects and flush from the queue on
-the first successful auth. Source of truth for the two lists:
+(`"deprecated"` / `"removed"` / `"unparseable"`) and `details.value`, so the
+Events page can show what to set instead and what the current value was. The
+events are raised before the manager WebSocket connects and flush from the
+queue on the first successful auth. Source of truth for the two lists:
 [`src/config/env_compat.rs`](../src/config/env_compat.rs).
 
-Currently reported as **deprecated**: `BILBYCAST_INGRESS_BUFFER_MS` →
-`tuning.ingress_dejitter_ms`, `BILBYCAST_INGRESS_RESIDENCE_MS` →
+Currently reported as **deprecated**: `BILBYCAST_INGRESS_RESIDENCE_MS` →
 `tuning.ingress_residence_ms` (or the per-input field),
 `BILBYCAST_PROBE_SESSION_LIMITS` → `tuning.probe_session_limits`,
 `BILBYCAST_PROBE_4K` → `tuning.probe_4k`. As **removed**:
 `BILBYCAST_ENABLE_SO_TXTIME` (collapsed onto `BILBYCAST_ENABLE_TXTIME`),
 `BILBYCAST_EGRESS_PACING` / `_BUFFER_MS` / `_RESIDENCE_MS` (per-output
 config fields since 2026-06), `BILBYCAST_BOND_FWMARK_BASE` (never read by
-anything).
+anything), and `BILBYCAST_INGRESS_BUFFER_MS`.
+
+That last one is not a relocation. It is reported as removed because it never
+had any effect in **any** release — the node-wide setpoint it carried was
+consulted only after the per-input setpoint had already answered, so no value
+it held could change behaviour. `tuning.ingress_dejitter_ms` is the field that
+works; reviving the variable as a fallback would have started adding ingress
+latency to every UDP/RTP input on a host whose unit file still pins it.
 
 ### Flow Lifecycle (`flow`)
 

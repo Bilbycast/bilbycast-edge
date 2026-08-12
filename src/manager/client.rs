@@ -3133,6 +3133,55 @@ async fn execute_command(
             crate::engine::bond_leg_broker::broker()
                 .configure(&new_config.bond_uplinks, new_config.shared_leg_broker);
 
+            // Same reason, for the node `tuning` block: without this, a value
+            // set on the manager's Tuning tab validated, persisted and echoed
+            // back on GetConfig while the running process kept whatever it
+            // booted with. The two ingress knobs are read on every input
+            // spawn, so re-installing them here is enough for a flow restart —
+            // or a hot input swap — to pick them up.
+            //
+            // The two probe switches are NOT re-applied: the hardware probe
+            // runs once at startup and there is nothing to re-run. Changing
+            // one raises a Warning so the operator is told the node needs a
+            // restart instead of being left to infer it from an unchanged
+            // Resources card.
+            {
+                let (tuning, _) = crate::config::env_compat::resolve_tuning(new_config.tuning.as_ref());
+                crate::engine::ingress_dejitter::install_node_defaults(
+                    crate::engine::ingress_dejitter::IngressDejitterDefaults {
+                        dejitter_ms: tuning.ingress_dejitter_ms,
+                        residence_ms: tuning.ingress_residence_ms,
+                    },
+                );
+                let (old_tuning, _) =
+                    crate::config::env_compat::resolve_tuning(old_config.tuning.as_ref());
+                if old_tuning.probe_session_limits != tuning.probe_session_limits
+                    || old_tuning.probe_4k != tuning.probe_4k
+                {
+                    let msg = format!(
+                        "tuning.probe_session_limits / tuning.probe_4k changed \
+                         (session_limits {} → {}, probe_4k {} → {}). The hardware \
+                         session-capacity probe runs once at node start, so this \
+                         takes effect at the node's next restart.",
+                        old_tuning.probe_session_limits,
+                        tuning.probe_session_limits,
+                        old_tuning.probe_4k,
+                        tuning.probe_4k
+                    );
+                    tracing::warn!("{msg}");
+                    flow_manager.event_sender().emit_with_details(
+                        crate::manager::events::EventSeverity::Warning,
+                        crate::manager::events::category::CONFIG,
+                        msg,
+                        None,
+                        serde_json::json!({
+                            "error_code": "tuning_requires_restart",
+                            "fields": ["tuning.probe_session_limits", "tuning.probe_4k"],
+                        }),
+                    );
+                }
+            }
+
             // --- Diff flows ---
             let old_flow_map: HashMap<&str, &FlowConfig> =
                 old_config.flows.iter().map(|f| (f.id.as_str(), f)).collect();

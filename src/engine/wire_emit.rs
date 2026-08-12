@@ -632,16 +632,16 @@ pub fn spawn_wire_emitter(
     // that *do* have a properly-configured ETF qdisc (see
     // `packaging/setup-etf-qdisc.sh` and the boot-time systemd template
     // `packaging/bilbycast-etf-qdisc@.service`) **and** a PTP discipline
-    // stack (`ptp4l` + `phc2sys`) running. Set `BILBYCAST_ENABLE_TXTIME=1`
-    // (or the more verbose alias `BILBYCAST_ENABLE_SO_TXTIME=1`, both
-    // accepted) to take that path on those hosts. The testbed start
-    // SO_TXTIME is opt-in via BILBYCAST_ENABLE_TXTIME=1 because the
-    // setsockopt probe succeeding does NOT guarantee an ETF qdisc is
-    // configured on the output NIC. Without ETF, the kernel ignores the
-    // per-packet timestamp and sends immediately — losing all PCR
-    // pacing. The operator must set up the ETF qdisc first (see
-    // packaging/setup-etf-qdisc.sh), then enable this flag.
-    // BILBYCAST_FORCE_NANOSLEEP=1 forces the fallback for diagnostics.
+    // stack (`ptp4l` + `phc2sys`) running. Set `BILBYCAST_ENABLE_TXTIME=1` to
+    // take that path on those hosts.
+    //
+    // It is opt-in rather than probed because the `setsockopt` probe
+    // succeeding does NOT guarantee an ETF qdisc is configured on the output
+    // NIC. Without ETF the kernel ignores the per-packet timestamp and sends
+    // immediately, losing all PCR pacing — so the operator must set the qdisc
+    // up first (`packaging/setup-etf-qdisc.sh`), then set this.
+    // `BILBYCAST_FORCE_NANOSLEEP=1` forces the fallback for diagnostics.
+    //
     // One name for one knob. `BILBYCAST_ENABLE_SO_TXTIME` was a second
     // spelling of this and has been removed; a host that still sets it is
     // told so at startup by `config::env_compat` rather than quietly

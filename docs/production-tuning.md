@@ -190,12 +190,47 @@ worst-case latency well under 50 µs on an otherwise-idle box.
 | `BILBYCAST_CODEC_CPUS` | unset | Same parser as `WIRE_EMIT_CPUS`; CPU-affinity set for codec (encode/decode) threads |
 | `BILBYCAST_PID_BUS_CPUS` | unset | Same parser; CPU-affinity set for the PID-bus / TS-assembler runtime |
 | `BILBYCAST_PLL_CPUS` | unset | Same parser; CPU-affinity set for the PCR-ingress / PLL sampler threads |
-| `BILBYCAST_ENABLE_TXTIME` | `0` | Opt in to the SO_TXTIME wire-pacing tier (tier 1 / 2). Requires ETF qdisc + `CAP_NET_ADMIN` (and PTP + HW-PTP NIC for tier 1). Without this the edge stays on the `clock_nanosleep` default. Alias: `BILBYCAST_ENABLE_TXTIME=1` |
+| `BILBYCAST_ENABLE_TXTIME` | `0` | Opt in to the SO_TXTIME wire-pacing tier (tier 1 / 2). Requires ETF qdisc + `CAP_NET_ADMIN` (and PTP + HW-PTP NIC for tier 1). Without this the edge stays on the `clock_nanosleep` default |
 | `BILBYCAST_ETF_SO_PRIORITY` | TC-map default | Override the `SO_PRIORITY` mapped onto the ETF qdisc class for SO_TXTIME outputs (layer 3 / only meaningful when SO_TXTIME is enabled) |
 | `BILBYCAST_LOSSLESS_SO_PRIORITY` | `4` | `SO_PRIORITY` pinning compressed (lossless-carrier) outputs **off** the etf class, so they aren't held to the wire-pacing schedule |
-| `BILBYCAST_FORCE_NANOSLEEP` | `0` | No-op alias kept for back-compat. Since `clock_nanosleep` is the wire-pacing default, the flag has no effect; old configs that set it still work |
-| `BILBYCAST_PROBE_SESSION_LIMITS` | `1` | HW encoder session-capacity probe at startup |
+| `BILBYCAST_FORCE_NANOSLEEP` | `0` | Back-compat no-op — `clock_nanosleep` is already the wire-pacing default, so on its own the flag changes nothing. It only matters alongside `BILBYCAST_ENABLE_TXTIME=1`, where it forces the `clock_nanosleep` fallback for diagnostics |
+| `BILBYCAST_PROBE_SESSION_LIMITS` | `1` | **Deprecated → `tuning.probe_session_limits`** (Manager → node → Configure → **Tuning**). Runs the startup HW encoder/decoder session-capacity probe. The config field wins; this variable is only the fallback beneath it, and a node that still sets it raises a Warning `deprecated_env_var` event at startup |
 | `BILBYCAST_ALLOW_INSECURE` | `0` | Allow `accept_self_signed_cert: true` |
+
+## Reference: node tuning knobs that moved into config
+
+Four node-wide knobs that used to be environment-only now live in the
+root `tuning` block of `config.json`, editable at Manager → node →
+Configure → **Tuning** (gated on the `node_tuning` capability), so a
+fleet-wide value is visible, validated and audited instead of buried in a
+unit file:
+
+| Config field | Former env var | Status of the env var |
+|---|---|---|
+| `tuning.ingress_dejitter_ms` | `BILBYCAST_INGRESS_BUFFER_MS` | **Removed** — it never had any effect in any release, because the node-wide setpoint was read only after the per-input setpoint had already answered |
+| `tuning.ingress_residence_ms` | `BILBYCAST_INGRESS_RESIDENCE_MS` | Deprecated — read below the config field |
+| `tuning.probe_session_limits` | `BILBYCAST_PROBE_SESSION_LIMITS` | Deprecated — read below the config field |
+| `tuning.probe_4k` | `BILBYCAST_PROBE_4K` | Deprecated — read below the config field |
+
+On the edge the **config field wins** and a deprecated variable is the
+fallback beneath it, above the built-in default. Env-above-config would
+reintroduce the silent no-op this move exists to close: an operator sets
+the field in the UI, sees it saved, and a unit file on the host outranks
+it. Either way the edge raises a Warning `deprecated_env_var` event at
+startup naming the variable, its replacement, and what actually happened
+to it: still honoured beneath the config field (`status: "deprecated"`),
+read by nothing (`status: "removed"`), or set to a value the edge could
+not parse and therefore discarded rather than applied
+(`status: "unparseable"`). So a stale unit file cannot state an intent
+that isn't being applied.
+
+The two **probe** switches are read once at node start, so a pushed
+change takes effect at the node's next restart; the two **ingress** knobs
+apply on the push. A per-input `ingress_dejitter_ms` /
+`ingress_residence_ms` (UDP + RTP inputs) overrides the node default.
+Ranges, defaults and the validation rules are in
+[`configuration-guide.md`](configuration-guide.md) — this table is only
+the environment-variable mapping.
 
 ## Reference: full set of systemd unit limits
 

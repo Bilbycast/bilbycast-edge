@@ -245,7 +245,7 @@ and restart per node, and nothing was audited:
 
 | Field | Replaces | Effect |
 |-------|----------|--------|
-| `ingress_dejitter_ms` | `BILBYCAST_INGRESS_BUFFER_MS` | Node default de-jitter setpoint, 20–2000 ms. `None` → 60 ms. |
+| `ingress_dejitter_ms` | `BILBYCAST_INGRESS_BUFFER_MS` (**removed**, see below) | Node default de-jitter setpoint, 20–2000 ms. `None` → 60 ms. **Also switches the buffer on** for a raw UDP / RTP input that names no setpoint of its own. |
 | `ingress_residence_ms` | `BILBYCAST_INGRESS_RESIDENCE_MS` | Node default hard-shed residence cap. `None` → `max(4 × setpoint, 250)` ms. Clamped to `[setpoint + 40, 5000]`. |
 | `probe_session_limits` | `BILBYCAST_PROBE_SESSION_LIMITS` | Run the startup HW session-capacity probe. `None` → `true`. |
 | `probe_4k` | `BILBYCAST_PROBE_4K` | Run the second-tier 4K pass. `None` → `true`; ignored when `probe_session_limits` is false. |
@@ -253,7 +253,35 @@ and restart per node, and nothing was audited:
 A matching **per-input** `ingress_residence_ms` lands on `RtpInputConfig` /
 `UdpInputConfig` beside the existing `ingress_dejitter_ms`, so the cap can
 be set for one input without moving the node default. Precedence is
-per-input → `tuning` → deprecated env → built-in.
+per-input → `tuning` → deprecated env → built-in; **the config field wins
+and the environment is the fallback below it**, deliberately — env-above-config
+would mean an operator sets the field in the UI, sees it saved, and it never
+applies because a unit file outranks it, which is the trap this move exists
+to close.
+
+`ingress_dejitter_ms` is honoured only by the transports that take part in
+ingress de-jitter — **raw UDP and RTP** (`IngressBuffering::honours_node_defaults`,
+`false` in the `Default` so a transport opts out by construction). SRT
+de-jitters at the transport layer via TSBPD, RTMP and RTSP synthesise their
+own clock, and a bonded input's buffer would shed the bond's bursts.
+
+**`BILBYCAST_INGRESS_BUFFER_MS` is `REMOVED`, not deprecated**, and it is the
+one row here that is not a straight relocation. It never had any effect in
+any release: the node-wide setpoint was consulted only *after* the per-input
+setpoint had already answered, so with no per-input value the publisher never
+reached the resolver, and with one the per-input value won. Honouring it now
+as a fallback would start adding ingress latency to every UDP/RTP input on any
+host whose unit file still pins it, so it is reported as removed instead. The
+same defect had been carried into `tuning.ingress_dejitter_ms` — validated,
+UI-exposed, capability-gated and inert — and is fixed by resolving
+*enablement* from the node default in `IngressPublisher::new`, not just the
+setpoint.
+
+The two **ingress** knobs are re-installed on every `update_config`
+(`install_node_defaults` is atomics, not a `OnceLock`), so a push from the
+manager reaches the next input spawn. The two **probe** switches are read once
+at node start; changing one raises a Warning `tuning_requires_restart` rather
+than leaving the operator to infer that nothing happened.
 
 Validation refuses a per-input `ingress_residence_ms` **without**
 `ingress_dejitter_ms`: without a de-jitter buffer there is no residence to

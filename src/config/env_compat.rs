@@ -31,6 +31,13 @@ pub enum EnvStatus {
     Deprecated,
     /// Read by nothing. Set on this host and doing nothing at all.
     Removed,
+    /// Still read, but the value this host holds could not be parsed, so it
+    /// was discarded and the layer below answered. Distinct from
+    /// [`EnvStatus::Deprecated`] on purpose: telling an operator their
+    /// variable "is still honoured" while quietly dropping the value it
+    /// carries is the same lie as a unit file that states an intent nothing
+    /// applies.
+    Unparseable,
 }
 
 impl EnvStatus {
@@ -40,6 +47,7 @@ impl EnvStatus {
         match self {
             EnvStatus::Deprecated => "deprecated",
             EnvStatus::Removed => "removed",
+            EnvStatus::Unparseable => "unparseable",
         }
     }
 }
@@ -75,6 +83,13 @@ impl DeprecatedEnvUse {
                  so its intent is NOT being applied. Use `{}` instead.",
                 self.var, self.value, self.replacement
             ),
+            EnvStatus::Unparseable => format!(
+                "{} is set to {:?}, which could not be read as a value for it — \
+                 it has been DISCARDED, not honoured. \
+                 Set `{}` in the node's configuration (Manager → node → Configure → Tuning) \
+                 and remove the environment variable.",
+                self.var, self.value, self.replacement
+            ),
         }
     }
 }
@@ -94,19 +109,41 @@ const REMOVED: &[(&str, &str)] = &[
         "BILBYCAST_EGRESS_BUFFER_MS",
         "the per-output `egress_buffer_ms` config field",
     ),
+    // No field carries this one across: the egress servo derives its
+    // residence from the cushion it is asked to hold. Naming `egress_pacing`
+    // here (as an earlier revision did) sent the operator to the mode switch,
+    // which cannot express a residence at all.
     (
         "BILBYCAST_EGRESS_RESIDENCE_MS",
-        "the per-output `egress_pacing` config field",
+        "the per-output `egress_buffer_ms` config field, which the residence is derived from",
     ),
     (
         "BILBYCAST_BOND_FWMARK_BASE",
         "BILBYCAST_BOND_RT_TABLE_BASE / BILBYCAST_BOND_RT_PRIO_BASE",
     ),
+    (
+        "BILBYCAST_TESTBED_TRACE_EVENTS",
+        "RUST_LOG=info,bilbycast_edge::testbed_events=debug (the trace has its own \
+         tracing target, so the level selects it — note the leading `info`, since a \
+         bare target directive sets the global default to off)",
+    ),
+    // Not "removed as part of the move to config" — removed because it never
+    // did anything, in any release. The node-wide setpoint it carried was
+    // consulted only *after* the per-input setpoint had already answered, so
+    // no value it held could change behaviour: with no per-input value the
+    // publisher never reached the resolver, and with one the per-input value
+    // won. Reviving it as a deprecated fallback would have made a knob that
+    // was inert for its whole life suddenly start adding ingress latency to
+    // every UDP/RTP input on any host whose unit file still pins it. The
+    // config field is the one that works.
+    (
+        "BILBYCAST_INGRESS_BUFFER_MS",
+        "tuning.ingress_dejitter_ms (this variable never had any effect)",
+    ),
 ];
 
 /// Deprecated variables, paired with the `tuning` field that replaces each.
 const DEPRECATED: &[(&str, &str)] = &[
-    ("BILBYCAST_INGRESS_BUFFER_MS", "tuning.ingress_dejitter_ms"),
     (
         "BILBYCAST_INGRESS_RESIDENCE_MS",
         "tuning.ingress_residence_ms",
@@ -170,29 +207,44 @@ pub fn resolve_tuning(tuning: Option<&NodeTuningConfig>) -> (ResolvedTuning, Vec
         }
     }
 
-    let mut env_of = |var: &'static str| -> Option<String> {
+    // Parse first, THEN record the status. Recording `Deprecated` up front
+    // and parsing afterwards told an operator with a typo'd value that their
+    // variable was "still honoured" while the value was being dropped on the
+    // floor — the same class of lie this module exists to stop.
+    let mut env_of = |var: &'static str, parse: &dyn Fn(&str) -> bool| -> Option<String> {
         let value = std::env::var(var).ok()?;
         let replacement = DEPRECATED
             .iter()
             .find(|(name, _)| *name == var)
             .map(|(_, r)| *r)
             .unwrap_or("the node's configuration");
+        let parsed = parse(&value);
         found.push(DeprecatedEnvUse {
             var,
             replacement,
-            status: EnvStatus::Deprecated,
+            status: if parsed {
+                EnvStatus::Deprecated
+            } else {
+                EnvStatus::Unparseable
+            },
             value: value.clone(),
         });
-        Some(value)
+        parsed.then_some(value)
     };
 
-    let env_dejitter = env_of("BILBYCAST_INGRESS_BUFFER_MS").and_then(|v| v.trim().parse().ok());
-    let env_residence =
-        env_of("BILBYCAST_INGRESS_RESIDENCE_MS").and_then(|v| v.trim().parse().ok());
-    let env_probe = env_of("BILBYCAST_PROBE_SESSION_LIMITS").map(|v| env_flag(&v));
-    let env_probe_4k = env_of("BILBYCAST_PROBE_4K").map(|v| env_flag(&v));
+    // `env_flag` accepts anything (unrecognised reads as "on"), matching the
+    // parser these two switches have always had — so they can never be
+    // unparseable, and passing `|_| true` states that rather than hiding it.
+    let env_residence = env_of("BILBYCAST_INGRESS_RESIDENCE_MS", &|v: &str| {
+        v.trim().parse::<u32>().is_ok()
+    })
+    .and_then(|v| v.trim().parse().ok());
+    let env_probe = env_of("BILBYCAST_PROBE_SESSION_LIMITS", &|_| true).map(|v| env_flag(&v));
+    let env_probe_4k = env_of("BILBYCAST_PROBE_4K", &|_| true).map(|v| env_flag(&v));
 
-    out.ingress_dejitter_ms = tuning.and_then(|t| t.ingress_dejitter_ms).or(env_dejitter);
+    // No env fallback for the setpoint: `BILBYCAST_INGRESS_BUFFER_MS` is in
+    // `REMOVED`, for the reason given there.
+    out.ingress_dejitter_ms = tuning.and_then(|t| t.ingress_dejitter_ms);
     out.ingress_residence_ms = tuning.and_then(|t| t.ingress_residence_ms).or(env_residence);
     out.probe_session_limits = tuning
         .and_then(|t| t.probe_session_limits)
@@ -210,19 +262,112 @@ pub fn resolve_tuning(tuning: Option<&NodeTuningConfig>) -> (ResolvedTuning, Vec
 mod tests {
     use super::*;
 
+    /// Guard for the whole module: these tests mutate process-wide
+    /// environment state, so they must not interleave. `cargo test` runs a
+    /// crate's tests on N threads by default, and two of these racing
+    /// produced the classic 1-in-20 red build.
+    static ENV_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Set the listed variables, run `f`, then remove them again — including
+    /// on panic, so one failing assertion cannot leak a variable into every
+    /// later test in the process.
+    fn with_env<T>(vars: &[(&str, &str)], f: impl FnOnce() -> T) -> T {
+        let _guard = ENV_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        for (k, v) in vars {
+            unsafe { std::env::set_var(k, v) };
+        }
+        let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+        for (k, _) in vars {
+            unsafe { std::env::remove_var(k) };
+        }
+        match out {
+            Ok(v) => v,
+            Err(p) => std::panic::resume_unwind(p),
+        }
+    }
+
     #[test]
     fn config_wins_over_the_deprecated_env() {
         // The env fallback must never override an explicit config field —
         // that would reintroduce exactly the silent-no-op trap the move
         // away from environment variables exists to close.
         let tuning = NodeTuningConfig {
-            ingress_dejitter_ms: Some(120),
+            ingress_residence_ms: Some(900),
             probe_session_limits: Some(false),
             ..Default::default()
         };
-        let (resolved, _) = resolve_tuning(Some(&tuning));
-        assert_eq!(resolved.ingress_dejitter_ms, Some(120));
-        assert!(!resolved.probe_session_limits);
+        let (resolved, found) = with_env(
+            &[
+                ("BILBYCAST_INGRESS_RESIDENCE_MS", "4321"),
+                ("BILBYCAST_PROBE_SESSION_LIMITS", "1"),
+            ],
+            || resolve_tuning(Some(&tuning)),
+        );
+        assert_eq!(resolved.ingress_residence_ms, Some(900), "config must win");
+        assert!(!resolved.probe_session_limits, "config must win");
+        // ...and the now-ineffective variables are still reported, so the
+        // operator learns to delete them rather than wondering why editing
+        // one changed nothing.
+        assert_eq!(found.len(), 2, "{found:?}");
+        assert!(found.iter().all(|f| f.status == EnvStatus::Deprecated));
+    }
+
+    #[test]
+    fn the_env_answers_only_when_the_config_field_is_absent() {
+        let (resolved, found) = with_env(
+            &[
+                ("BILBYCAST_INGRESS_RESIDENCE_MS", "777"),
+                ("BILBYCAST_PROBE_4K", "off"),
+            ],
+            || resolve_tuning(None),
+        );
+        assert_eq!(resolved.ingress_residence_ms, Some(777));
+        assert!(!resolved.probe_4k);
+        assert!(resolved.probe_session_limits, "untouched knob keeps its default");
+        assert_eq!(found.len(), 2, "{found:?}");
+    }
+
+    #[test]
+    fn the_removed_ingress_setpoint_is_reported_and_never_applied() {
+        // BILBYCAST_INGRESS_BUFFER_MS never had an effect in any release.
+        // Honouring it now would start adding ingress latency to every
+        // UDP/RTP input on a host whose unit file still pins it, so it is
+        // reported as removed and the resolved setpoint stays empty.
+        let (resolved, found) = with_env(&[("BILBYCAST_INGRESS_BUFFER_MS", "250")], || {
+            resolve_tuning(None)
+        });
+        assert_eq!(resolved.ingress_dejitter_ms, None, "must not be applied");
+        let hit = found
+            .iter()
+            .find(|f| f.var == "BILBYCAST_INGRESS_BUFFER_MS")
+            .expect("must still be reported");
+        assert_eq!(hit.status, EnvStatus::Removed);
+        assert!(hit.replacement.contains("tuning.ingress_dejitter_ms"));
+    }
+
+    #[test]
+    fn a_clean_environment_reports_nothing() {
+        // A false positive here would put a Warning on the manager's Events
+        // page for every node in the fleet on every boot.
+        let (_, found) = with_env(&[], || resolve_tuning(None));
+        assert!(found.is_empty(), "{found:?}");
+    }
+
+    #[test]
+    fn an_unparseable_deprecated_value_is_reported_and_falls_through() {
+        // Reporting it as honoured while silently dropping it would be the
+        // worst of both worlds: the operator is told the variable still
+        // works, and the value it holds is discarded.
+        let (resolved, found) = with_env(&[("BILBYCAST_INGRESS_RESIDENCE_MS", "not-a-number")], || {
+            resolve_tuning(None)
+        });
+        assert_eq!(resolved.ingress_residence_ms, None);
+        let hit = found
+            .iter()
+            .find(|f| f.var == "BILBYCAST_INGRESS_RESIDENCE_MS")
+            .expect("must be reported even though it could not be parsed");
+        assert_eq!(hit.status, EnvStatus::Unparseable);
+        assert!(hit.message().contains("could not be read"), "{}", hit.message());
     }
 
     #[test]
@@ -259,17 +404,45 @@ mod tests {
 
     #[test]
     fn every_listed_variable_names_a_distinct_replacement() {
-        // A copy-paste that pointed two variables at the same field would
-        // send an operator to the wrong knob.
+        // This used to dedup the variable NAMES and assert on that, which is
+        // not what its name says and not the mistake worth catching: a
+        // copy-paste that points two variables at the SAME field sends an
+        // operator to a knob that cannot express what they asked for. That
+        // had actually happened — BILBYCAST_EGRESS_RESIDENCE_MS pointed at
+        // `egress_pacing`, the mode switch, which carries no residence.
         let mut names: Vec<&str> = DEPRECATED.iter().map(|(n, _)| *n).collect();
         names.extend(REMOVED.iter().map(|(n, _)| *n));
         let before = names.len();
         names.sort_unstable();
         names.dedup();
         assert_eq!(before, names.len(), "duplicate variable in the tables");
-        for (var, replacement) in DEPRECATED {
+
+        let mut replacements: Vec<&str> = DEPRECATED.iter().map(|(_, r)| *r).collect();
+        replacements.extend(REMOVED.iter().map(|(_, r)| *r));
+        let before = replacements.len();
+        replacements.sort_unstable();
+        replacements.dedup();
+        assert_eq!(
+            before,
+            replacements.len(),
+            "two variables point at the same replacement: {replacements:?}"
+        );
+
+        for (var, replacement) in DEPRECATED.iter().chain(REMOVED) {
             assert!(!replacement.is_empty(), "{var} has no replacement");
             assert_ne!(var, replacement);
+        }
+    }
+
+    #[test]
+    fn the_deprecated_and_removed_tables_do_not_overlap() {
+        // A variable in both would be reported twice with contradictory
+        // statuses, and the resolver would honour one it had just called dead.
+        for (var, _) in DEPRECATED {
+            assert!(
+                !REMOVED.iter().any(|(r, _)| r == var),
+                "{var} is in both tables"
+            );
         }
     }
 

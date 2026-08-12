@@ -106,6 +106,7 @@ pub fn spawn_udp_input(
                 delay_ms: config.ingress_delay_ms,
                 dejitter_ms: config.ingress_dejitter_ms,
                 residence_ms: config.ingress_residence_ms,
+                honours_node_defaults: true,
             },
             broadcast_tx,
             &input_id,

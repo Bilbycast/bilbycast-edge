@@ -132,8 +132,11 @@ impl EventSender {
         // environment-variable read — and an allocation — on every event.
         // `RUST_LOG` already selects by target, so the level is the gate:
         // production is quiet at the default level, and
-        // `RUST_LOG=bilbycast_edge::testbed_events=debug` turns it on with
-        // no separate switch to discover.
+        // `RUST_LOG=info,bilbycast_edge::testbed_events=debug` turns it on
+        // with no separate switch to discover. The leading `info` is not
+        // decoration — a bare target directive sets the global default to
+        // `off`, so the one-directive form turns this trace on and every
+        // other log line off.
         if tracing::enabled!(target: "bilbycast_edge::testbed_events", tracing::Level::DEBUG) {
             let ec = event
                 .details
