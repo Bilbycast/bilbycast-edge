@@ -21,32 +21,94 @@ const DEFAULT_RECV_BUF_SIZE: usize = 4 * 1024 * 1024;
 /// Default send socket buffer size (4 MB).
 const DEFAULT_SEND_BUF_SIZE: usize = 4 * 1024 * 1024;
 
+/// Effective socket-buffer size the kernel actually stored, from the value
+/// `getsockopt` reports.
+///
+/// Linux reports back **twice** what it stored — the doubling covers its own
+/// `sk_buff` bookkeeping overhead — so a healthy 4 MiB request reads back as
+/// 8 MiB, and a request clamped by `net.core.rmem_max` reads back as twice
+/// the clamp. Comparing the raw read-back against the request therefore
+/// almost never fires on Linux, which is why the clamp check here was
+/// effectively dead. Other platforms report the stored value directly.
+#[inline]
+fn effective_buffer_size(reported: usize) -> usize {
+    if cfg!(target_os = "linux") {
+        reported / 2
+    } else {
+        reported
+    }
+}
+
+/// Warn at most once per process per direction. A node opens one socket per
+/// input and per output, so an under-configured `sysctl` would otherwise
+/// produce one identical line per socket; the operator needs the fact once,
+/// not N times. Per-socket detail stays available at `debug`.
+static RCVBUF_CLAMP_WARNED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+static SNDBUF_CLAMP_WARNED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+fn report_clamp(
+    which: &str,
+    sysctl: &str,
+    requested: usize,
+    reported: usize,
+    latch: &std::sync::atomic::AtomicBool,
+) {
+    let effective = effective_buffer_size(reported);
+    if effective >= requested {
+        return;
+    }
+    // Always available per-socket under RUST_LOG=debug.
+    tracing::debug!(
+        "{which}: requested {requested} bytes, kernel stored {effective} (reported {reported})",
+    );
+    if !latch.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        tracing::warn!(
+            "{which} clamped by the kernel: requested {requested} bytes, got {effective}. \
+             Raise {sysctl} (e.g. `sysctl -w {sysctl}={requested}`). Undersized socket \
+             buffers show up as bursty loss under load rather than as an error — at \
+             contribution bitrates the default is far too small. Logged once per \
+             process; set RUST_LOG=debug for the per-socket detail.",
+        );
+    }
+}
+
 /// Apply receive and send socket buffer sizes via SO_RCVBUF / SO_SNDBUF.
 ///
-/// Best-effort: logs a warning if the kernel clamps to a lower value (e.g.,
+/// Best-effort: reports if the kernel clamps to a lower value (e.g.,
 /// `net.core.rmem_max` / `net.core.wmem_max` is too low) but does not fail.
+/// Both directions are read back — a write-only `SO_SNDBUF` tells you
+/// nothing, and the send side is the one that matters on a high-bitrate
+/// egress.
 fn set_socket_buffers(socket: &Socket, recv_size: usize, send_size: usize) {
-    if let Err(e) = socket.set_recv_buffer_size(recv_size) {
-        tracing::warn!(
+    match socket.set_recv_buffer_size(recv_size) {
+        Err(e) => tracing::warn!(
             "Failed to set SO_RCVBUF to {} bytes: {e}. \
              Increase net.core.rmem_max for optimal performance.",
             recv_size
-        );
-    } else {
-        let actual = socket.recv_buffer_size().unwrap_or(0);
-        if actual < recv_size {
-            tracing::debug!(
-                "SO_RCVBUF requested {} bytes, kernel set {} bytes",
-                recv_size, actual
-            );
-        }
+        ),
+        Ok(()) => report_clamp(
+            "SO_RCVBUF",
+            "net.core.rmem_max",
+            recv_size,
+            socket.recv_buffer_size().unwrap_or(0),
+            &RCVBUF_CLAMP_WARNED,
+        ),
     }
-    if let Err(e) = socket.set_send_buffer_size(send_size) {
-        tracing::warn!(
+    match socket.set_send_buffer_size(send_size) {
+        Err(e) => tracing::warn!(
             "Failed to set SO_SNDBUF to {} bytes: {e}. \
              Increase net.core.wmem_max for optimal performance.",
             send_size
-        );
+        ),
+        Ok(()) => report_clamp(
+            "SO_SNDBUF",
+            "net.core.wmem_max",
+            send_size,
+            socket.send_buffer_size().unwrap_or(0),
+            &SNDBUF_CLAMP_WARNED,
+        ),
     }
 }
 
