@@ -1508,6 +1508,31 @@ pub struct NodeTuningConfig {
     /// Replaces `BILBYCAST_PROBE_4K`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub probe_4k: Option<bool>,
+    /// Node-wide default for the media-player operator-control (transition)
+    /// path. `None` → `true`. A per-input
+    /// [`MediaPlayerInputConfig::operator_control`] always wins.
+    ///
+    /// Also decides whether the node advertises the
+    /// `media-player-control-v1` capability, so turning it off here withdraws
+    /// the manager's **Next** button node-wide rather than leaving a button
+    /// that answers `media_player_control_unavailable`.
+    ///
+    /// Replaces `BILBYCAST_MEDIA_PLAYER_CONTROLLER`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub media_player_controller: Option<bool>,
+    /// Node-wide default for PCR-anchored TS playout pacing. `None` → `true`
+    /// (deadlines anchored on the asset's own PCR); `false` falls back to the
+    /// legacy byte-rate estimate. A per-input
+    /// [`MediaPlayerInputConfig::pcr_deadlines`] always wins.
+    ///
+    /// Both layers exist because the failure modes are *both* host-dependent
+    /// (a stalling disk, a clock step — node-wide) and asset-dependent (a
+    /// spliced file — one input), so neither granularity alone can express
+    /// the rollback an operator actually needs.
+    ///
+    /// Replaces `BILBYCAST_MEDIA_PLAYER_PCR_DEADLINES`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub media_player_pcr_deadlines: Option<bool>,
 }
 
 /// System resource monitoring and threshold configuration.
@@ -2185,6 +2210,17 @@ pub struct MediaPlayerInputConfig {
     /// where this field is unset (explicit config wins over the env var).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub operator_control: Option<bool>,
+    /// Pace TS playout on deadlines anchored to the asset's own PCR
+    /// (`None` → the node default, itself defaulting to `true`) or on the
+    /// legacy byte-rate estimate (`false`).
+    ///
+    /// Per-input because the failure modes this mode can have are
+    /// *asset*-dependent — a spliced file whose PCR steps mid-asset paces
+    /// badly while every other asset on the same node is fine, so pinning one
+    /// playlist to byte-rate must not drag the rest of the node back with it.
+    /// The node-wide half lives on `tuning.media_player_pcr_deadlines`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pcr_deadlines: Option<bool>,
 }
 
 fn default_image_fps() -> u8 {

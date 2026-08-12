@@ -9856,14 +9856,28 @@ mod tests {
         let t = crate::config::models::NodeTuningConfig::default();
         assert_eq!(serde_json::to_string(&t).unwrap(), "{}");
 
+        // Deliberately exhaustive — no `..Default::default()`. Adding a field
+        // to `NodeTuningConfig` must fail here, so whoever adds it decides
+        // consciously whether it round-trips and whether it stays off the wire
+        // when unset. That is the whole contract this test pins.
         let t = crate::config::models::NodeTuningConfig {
             ingress_dejitter_ms: Some(120),
             ingress_residence_ms: Some(600),
             probe_session_limits: Some(false),
             probe_4k: None,
+            media_player_controller: Some(false),
+            media_player_pcr_deadlines: None,
         };
         let json = serde_json::to_string(&t).unwrap();
         assert!(!json.contains("probe_4k"), "an unset field stays off the wire: {json}");
+        assert!(
+            !json.contains("media_player_pcr_deadlines"),
+            "an unset field stays off the wire: {json}"
+        );
+        assert!(
+            json.contains("media_player_controller"),
+            "a set field reaches the wire: {json}"
+        );
         let back: crate::config::models::NodeTuningConfig =
             serde_json::from_str(&json).unwrap();
         assert_eq!(back, t);

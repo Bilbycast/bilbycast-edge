@@ -140,6 +140,20 @@ const REMOVED: &[(&str, &str)] = &[
         "BILBYCAST_INGRESS_BUFFER_MS",
         "tuning.ingress_dejitter_ms (this variable never had any effect)",
     ),
+    // Not migrated to config on purpose. Its "off" position selects the
+    // whole-file MP4 demux, which holds an entire asset resident — a 4 GiB
+    // file is a 4 GiB spike, and that OOM is precisely what the bounded
+    // reader was written to fix. A knob whose disabled state is a known
+    // out-of-memory must not be reachable from an operator's screen, so it
+    // did not earn a `tuning` field; it survives only under
+    // `cfg(debug_assertions)` for diagnostics, exactly like
+    // `BILBYCAST_TESTBED_SHARED_WALLCLOCK`. A release binary ignores it.
+    (
+        "BILBYCAST_MEDIA_PLAYER_INCREMENTAL_MP4",
+        "nothing — the bounded incremental reader is unconditional in release \
+         builds. The whole-file demux it selected is retained for debug builds \
+         only, because its resident-memory cost is the OOM this replaced",
+    ),
 ];
 
 /// Deprecated variables, paired with the `tuning` field that replaces each.
@@ -153,6 +167,14 @@ const DEPRECATED: &[(&str, &str)] = &[
         "tuning.probe_session_limits",
     ),
     ("BILBYCAST_PROBE_4K", "tuning.probe_4k"),
+    (
+        "BILBYCAST_MEDIA_PLAYER_CONTROLLER",
+        "tuning.media_player_controller (or per-input `operator_control`)",
+    ),
+    (
+        "BILBYCAST_MEDIA_PLAYER_PCR_DEADLINES",
+        "tuning.media_player_pcr_deadlines (or per-input `pcr_deadlines`)",
+    ),
 ];
 
 /// The tuning values actually in force, after config and the deprecated
@@ -163,6 +185,8 @@ pub struct ResolvedTuning {
     pub ingress_residence_ms: Option<u32>,
     pub probe_session_limits: bool,
     pub probe_4k: bool,
+    pub media_player_controller: bool,
+    pub media_player_pcr_deadlines: bool,
 }
 
 impl Default for ResolvedTuning {
@@ -172,6 +196,8 @@ impl Default for ResolvedTuning {
             ingress_residence_ms: None,
             probe_session_limits: true,
             probe_4k: true,
+            media_player_controller: true,
+            media_player_pcr_deadlines: true,
         }
     }
 }
@@ -241,6 +267,12 @@ pub fn resolve_tuning(tuning: Option<&NodeTuningConfig>) -> (ResolvedTuning, Vec
     .and_then(|v| v.trim().parse().ok());
     let env_probe = env_of("BILBYCAST_PROBE_SESSION_LIMITS", &|_| true).map(|v| env_flag(&v));
     let env_probe_4k = env_of("BILBYCAST_PROBE_4K", &|_| true).map(|v| env_flag(&v));
+    // Same "unrecognised reads as on" parser as the probe switches, which is
+    // the one both media-player levers have always used.
+    let env_mp_controller =
+        env_of("BILBYCAST_MEDIA_PLAYER_CONTROLLER", &|_| true).map(|v| env_flag(&v));
+    let env_mp_pcr_deadlines =
+        env_of("BILBYCAST_MEDIA_PLAYER_PCR_DEADLINES", &|_| true).map(|v| env_flag(&v));
 
     // No env fallback for the setpoint: `BILBYCAST_INGRESS_BUFFER_MS` is in
     // `REMOVED`, for the reason given there.
@@ -253,6 +285,14 @@ pub fn resolve_tuning(tuning: Option<&NodeTuningConfig>) -> (ResolvedTuning, Vec
     out.probe_4k = tuning
         .and_then(|t| t.probe_4k)
         .or(env_probe_4k)
+        .unwrap_or(true);
+    out.media_player_controller = tuning
+        .and_then(|t| t.media_player_controller)
+        .or(env_mp_controller)
+        .unwrap_or(true);
+    out.media_player_pcr_deadlines = tuning
+        .and_then(|t| t.media_player_pcr_deadlines)
+        .or(env_mp_pcr_deadlines)
         .unwrap_or(true);
 
     (out, found)

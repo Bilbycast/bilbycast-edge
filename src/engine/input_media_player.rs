@@ -434,6 +434,7 @@ async fn run(
                 post: &mut post,
                 splice_gap_signal: gap_signal,
                 bundle_size,
+                pcr_deadlines: controller::pcr_deadlines_enabled(config.pcr_deadlines),
                 media_stats: &media_stats,
                 events: &events,
                 flow_id: &flow_id,
@@ -522,6 +523,15 @@ pub(super) struct PlayerSession<'a> {
     /// more, smaller datagrams for a low-MTU / tunnel path; larger → jumbo
     /// datagrams for a LAN. Tests construct with the module [`BUNDLE_SIZE`].
     pub(super) bundle_size: usize,
+    /// Whether TS playout paces on deadlines anchored to the asset's own PCR
+    /// (`true`) or on the legacy byte-rate estimate (`false`).
+    ///
+    /// Resolved once at input spawn — per-input
+    /// [`crate::config::models::MediaPlayerInputConfig::pcr_deadlines`], then
+    /// the node-wide `tuning.media_player_pcr_deadlines` — in exactly the same
+    /// shape as [`Self::bundle_size`] above, which is likewise read from the
+    /// input's config once and carried rather than re-resolved per source.
+    pub(super) pcr_deadlines: bool,
     /// Playout telemetry for the whole input's lifetime — see
     /// [`MediaPlayerStats`] doc comment. Shared (not per-source) so progress
     /// counters and pacer-lateness history survive across playlist entries.
@@ -999,6 +1009,7 @@ async fn run_controlled(
             post: &mut *post,
             splice_gap_signal: gap_signal,
             bundle_size,
+            pcr_deadlines: controller::pcr_deadlines_enabled(config.pcr_deadlines),
             media_stats,
             events,
             flow_id,
@@ -1431,14 +1442,16 @@ async fn play_ts_file(
     let mut last_pcr_target_ns: Option<u64> = None;
     let mut last_anchor_pcr_27mhz: Option<u64> = None;
     let mut bytes_since_pcr: u64 = 0;
-    // Rollback lever for the whole PCR-anchored scheme, matching the two
-    // levers `input_media_player::controller` already carries. The failure
-    // modes this mode can have are asset- and host-dependent (a spliced
-    // asset, a stalling disk, a clock step), which is exactly the class
-    // that shows up on one customer node and nowhere in the lab — and the
-    // only other remedy is rolling the whole release back, which also
-    // takes away the black-panel fix this exists to deliver.
-    let pcr_deadlines_enabled = pcr_deadline_pacing_enabled();
+    // Rollback lever for the whole PCR-anchored scheme, matching the
+    // operator-control lever `input_media_player::controller` already
+    // carries. The failure modes this mode can have are asset- AND
+    // host-dependent (a spliced asset; a stalling disk, a clock step), which
+    // is exactly the class that shows up on one customer node and nowhere in
+    // the lab — and the only other remedy is rolling the whole release back,
+    // which also takes away the black-panel fix this exists to deliver.
+    // Hence two layers: the per-input field here, falling back to
+    // `tuning.media_player_pcr_deadlines` node-wide.
+    let pcr_deadlines_enabled = session.pcr_deadlines;
     let mut bytes_emitted: u64 = 0;
     // Source bytes the transcoder buffered without emitting yet. Credited to
     // the next emitted message so the pacer's content clock stays conserved
@@ -2536,23 +2549,6 @@ fn fake_rtp_ts(_session: &PlayerSession<'_>) -> u32 {
 /// of magnitude below this.
 const PCR_STEP_DISCONTINUITY_27MHZ: i64 = 13_500_000;
 
-/// Whether TS playout paces on PCR-anchored deadlines (default) or on the
-/// legacy byte-rate estimate.
-///
-/// Rollback lever, same shape as `BILBYCAST_MEDIA_PLAYER_CONTROLLER` and
-/// `BILBYCAST_MEDIA_PLAYER_INCREMENTAL_MP4`. Set
-/// `BILBYCAST_MEDIA_PLAYER_PCR_DEADLINES` to `0`/`false`/`off` to fall back
-/// to byte-rate pacing on a single node without rolling back the release.
-fn pcr_deadline_pacing_enabled() -> bool {
-    match std::env::var("BILBYCAST_MEDIA_PLAYER_PCR_DEADLINES") {
-        Ok(v) => !matches!(
-            v.trim().to_ascii_lowercase().as_str(),
-            "0" | "false" | "off" | "no"
-        ),
-        Err(_) => true,
-    }
-}
-
 fn ts_bundle_deadline(
     base: Option<u64>,
     bytes_since_pcr: u64,
@@ -3289,6 +3285,7 @@ mod tests {
             post: &mut post,
             splice_gap_signal: None,
             bundle_size: BUNDLE_SIZE,
+            pcr_deadlines: true,
             media_stats: &media_stats,
             events: &events,
             flow_id: "test-flow",
@@ -3772,6 +3769,7 @@ mod tests {
                 post: &mut None,
                 splice_gap_signal: None,
                 bundle_size: BUNDLE_SIZE,
+                pcr_deadlines: true,
                 media_stats: &media_stats,
                 events: &events,
                 flow_id: "test-flow",
@@ -4000,6 +3998,7 @@ mod tests {
                 post: &mut None,
                 splice_gap_signal: None,
                 bundle_size: BUNDLE_SIZE,
+                pcr_deadlines: true,
                 media_stats: &media_stats,
                 events: &events,
                 flow_id: "test-flow",
@@ -4023,6 +4022,7 @@ mod tests {
                 post: &mut None,
                 splice_gap_signal: None,
                 bundle_size: BUNDLE_SIZE,
+                pcr_deadlines: true,
                 media_stats: &media_stats,
                 events: &events,
                 flow_id: "test-flow",

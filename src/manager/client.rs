@@ -1310,6 +1310,16 @@ fn edge_capabilities() -> Vec<&'static str> {
         // looks exactly like success. Manager UI gates the Tuning surface
         // and the per-input residence field on it.
         "node_tuning",
+        // The `tuning` block ALSO carries the two media-player defaults
+        // (`media_player_controller` / `media_player_pcr_deadlines`) and
+        // the per-input `pcr_deadlines` override. Deliberately a separate
+        // bit from `node_tuning` rather than widening it: these landed
+        // after `node_tuning` shipped, so an edge from that release
+        // advertises `node_tuning`, accepts the new fields on a push, and
+        // ignores them — the exact accept-and-ignore trap `node_tuning`
+        // itself was added to close. Reusing the bit would have recreated
+        // it one release later.
+        "media_player_tuning",
         // Per-input/per-output `interface_binding` field is honoured
         // (loose source-IP binding via NIC name lookup, plus per-leg
         // binding inside 2022-7 redundancy and per-endpoint binding
@@ -3167,6 +3177,15 @@ async fn execute_command(
                     crate::engine::ingress_dejitter::IngressDejitterDefaults {
                         dejitter_ms: tuning.ingress_dejitter_ms,
                         residence_ms: tuning.ingress_residence_ms,
+                    },
+                );
+                // Same re-install reasoning as the ingress pair: read at input
+                // spawn, so a push reaches the next spawned media player (and
+                // the next health tick's capability list) without a restart.
+                crate::engine::input_media_player::controller::install_media_player_defaults(
+                    crate::engine::input_media_player::controller::MediaPlayerDefaults {
+                        controller: tuning.media_player_controller,
+                        pcr_deadlines: tuning.media_player_pcr_deadlines,
                     },
                 );
                 let (old_tuning, _) =

@@ -201,7 +201,10 @@ worst-case latency well under 50 µs on an otherwise-idle box.
 
 Four node-wide knobs that used to be environment-only now live in the
 root `tuning` block of `config.json`, editable at Manager → node →
-Configure → **Tuning** (gated on the `node_tuning` capability), so a
+Configure → **Tuning** (gated on the `node_tuning` capability; the Media
+Player section is gated separately on `media_player_tuning`, since those
+two fields landed later and an edge advertising only the older bit would
+accept and ignore them), so a
 fleet-wide value is visible, validated and audited instead of buried in a
 unit file:
 
@@ -211,6 +214,9 @@ unit file:
 | `tuning.ingress_residence_ms` | `BILBYCAST_INGRESS_RESIDENCE_MS` | Deprecated — read below the config field |
 | `tuning.probe_session_limits` | `BILBYCAST_PROBE_SESSION_LIMITS` | Deprecated — read below the config field |
 | `tuning.probe_4k` | `BILBYCAST_PROBE_4K` | Deprecated — read below the config field |
+| `tuning.media_player_controller` | `BILBYCAST_MEDIA_PLAYER_CONTROLLER` | Deprecated — read below the config field |
+| `tuning.media_player_pcr_deadlines` | `BILBYCAST_MEDIA_PLAYER_PCR_DEADLINES` | Deprecated — read below the config field |
+| *(none — deliberately)* | `BILBYCAST_MEDIA_PLAYER_INCREMENTAL_MP4` | **Removed** — its "off" position selected the whole-file MP4 demux, which holds an entire asset resident; that OOM is what the bounded reader fixed, so it was withdrawn rather than migrated. Debug builds only |
 
 On the edge the **config field wins** and a deprecated variable is the
 fallback beneath it, above the built-in default. Env-above-config would

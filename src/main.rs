@@ -450,6 +450,12 @@ async fn main() -> anyhow::Result<()> {
         session_limits: tuning.probe_session_limits,
         tier_4k: tuning.probe_4k,
     });
+    engine::input_media_player::controller::install_media_player_defaults(
+        engine::input_media_player::controller::MediaPlayerDefaults {
+            controller: tuning.media_player_controller,
+            pcr_deadlines: tuning.media_player_pcr_deadlines,
+        },
+    );
     // Surfaced twice on purpose: `journalctl` for whoever is on the box,
     // and a manager event for the fleet operator who never logs in. The
     // event queue flushes on the first manager auth, so this reaches the
