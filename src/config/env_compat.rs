@@ -372,7 +372,12 @@ mod tests {
 
     #[test]
     fn absent_config_and_absent_env_is_the_documented_default() {
-        let (resolved, _) = resolve_tuning(None);
+        // Must take the guard even though it sets nothing: `resolve_tuning`
+        // READS the environment, so without the mutex a sibling test that is
+        // mid-`with_env` makes this one fail intermittently. Every test that
+        // touches this resolver has to be in the same critical section, not
+        // just the ones that write.
+        let (resolved, _) = with_env(&[], || resolve_tuning(None));
         assert_eq!(resolved, ResolvedTuning::default());
         assert!(resolved.probe_session_limits);
         assert!(resolved.probe_4k);

@@ -232,72 +232,7 @@ impl IngressPublisher {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::engine::ingress_dejitter::{install_node_defaults, IngressDejitterDefaults};
 
-    fn publisher(buffering: IngressBuffering) -> IngressPublisher {
-        let (tx, _rx) = broadcast::channel(16);
-        IngressPublisher::new(
-            buffering,
-            tx,
-            "test-input",
-            CancellationToken::new(),
-            Arc::new(FlowStatsAccumulator::new(
-                "test-flow".to_string(),
-                "test-flow".to_string(),
-                "udp".to_string(),
-            )),
-        )
-    }
-
-    /// The regression this whole change exists for. `tuning.ingress_dejitter_ms`
-    /// has to be able to switch the buffer ON for an input that names no
-    /// setpoint of its own — gating on the per-input field alone made the
-    /// node-wide value unreachable in every configuration.
-    ///
-    /// The three cases share one test because `install_node_defaults` writes
-    /// process-wide statics: split across `#[test]` fns they would race.
-    #[tokio::test]
-    async fn the_node_default_enables_dejitter_and_a_per_input_value_still_wins() {
-        assert_eq!(
-            publisher(IngressBuffering {
-                honours_node_defaults: true,
-                ..Default::default()
-            })
-            .mode(),
-            "direct",
-            "no node default installed yet: nothing should buffer"
-        );
-
-        install_node_defaults(IngressDejitterDefaults {
-            dejitter_ms: Some(150),
-            residence_ms: None,
-        });
-
-        assert_eq!(
-            publisher(IngressBuffering {
-                honours_node_defaults: true,
-                ..Default::default()
-            })
-            .mode(),
-            "dejitter",
-            "the node default must enable the buffer for a UDP/RTP input"
-        );
-
-        // SRT/RTSP/RTMP/bonded pass `..Default::default()`, so they must be
-        // untouched by a node-wide setpoint: SRT already de-jitters via TSBPD
-        // and a bonded input's buffer would shed the bond's bursts.
-        assert_eq!(
-            publisher(IngressBuffering::default()).mode(),
-            "direct",
-            "a transport that opted out must not be enrolled by the node default"
-        );
-
-        install_node_defaults(IngressDejitterDefaults::default());
-    }
-}
 
 /// Fixed-delay drainer task that owns the `DelayBuffer` and the broadcast
 /// sender. Periodically wakes to release any packets whose
@@ -389,5 +324,72 @@ pub fn warn_if_double_buffer_srt(
                 "srt_latency_ms": l,
             }),
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engine::ingress_dejitter::{install_node_defaults, IngressDejitterDefaults};
+
+    fn publisher(buffering: IngressBuffering) -> IngressPublisher {
+        let (tx, _rx) = broadcast::channel(16);
+        IngressPublisher::new(
+            buffering,
+            tx,
+            "test-input",
+            CancellationToken::new(),
+            Arc::new(FlowStatsAccumulator::new(
+                "test-flow".to_string(),
+                "test-flow".to_string(),
+                "udp".to_string(),
+            )),
+        )
+    }
+
+    /// The regression this whole change exists for. `tuning.ingress_dejitter_ms`
+    /// has to be able to switch the buffer ON for an input that names no
+    /// setpoint of its own — gating on the per-input field alone made the
+    /// node-wide value unreachable in every configuration.
+    ///
+    /// The three cases share one test because `install_node_defaults` writes
+    /// process-wide statics: split across `#[test]` fns they would race.
+    #[tokio::test]
+    async fn the_node_default_enables_dejitter_and_a_per_input_value_still_wins() {
+        assert_eq!(
+            publisher(IngressBuffering {
+                honours_node_defaults: true,
+                ..Default::default()
+            })
+            .mode(),
+            "direct",
+            "no node default installed yet: nothing should buffer"
+        );
+
+        install_node_defaults(IngressDejitterDefaults {
+            dejitter_ms: Some(150),
+            residence_ms: None,
+        });
+
+        assert_eq!(
+            publisher(IngressBuffering {
+                honours_node_defaults: true,
+                ..Default::default()
+            })
+            .mode(),
+            "dejitter",
+            "the node default must enable the buffer for a UDP/RTP input"
+        );
+
+        // SRT/RTSP/RTMP/bonded pass `..Default::default()`, so they must be
+        // untouched by a node-wide setpoint: SRT already de-jitters via TSBPD
+        // and a bonded input's buffer would shed the bond's bursts.
+        assert_eq!(
+            publisher(IngressBuffering::default()).mode(),
+            "direct",
+            "a transport that opted out must not be enrolled by the node default"
+        );
+
+        install_node_defaults(IngressDejitterDefaults::default());
     }
 }

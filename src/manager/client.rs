@@ -3111,6 +3111,22 @@ async fn execute_command(
             if new_config.device_name.is_none() {
                 new_config.device_name = old_config.device_name.clone();
             }
+            // Node tuning is preserved when the push omits it, like the blocks
+            // above — but for a sharper reason than "don't lose an operator's
+            // setting". `tuning.ingress_dejitter_ms` now ENABLES the ingress
+            // de-jitter buffer for raw UDP/RTP inputs with no per-input
+            // setpoint, so treating an absent block as "clear it" would let any
+            // push that does not carry `tuning` — a device rename, a visual
+            // deploy, a config restore, a reconcile retry — silently switch a
+            // live buffer off on every such input.
+            //
+            // Clearing the block is therefore an explicit empty object
+            // (`"tuning": {}`), which deserialises to all-`None` and resolves
+            // to the built-in defaults, NOT an absent key. The manager's Tuning
+            // tab sends `{}` for exactly this reason; see `config/tuning.js`.
+            if new_config.tuning.is_none() {
+                new_config.tuning = old_config.tuning.clone();
+            }
 
             // Activation is owned by the `activate_input` command, so a
             // whole-config push must not move what is on air. Runs before
@@ -3550,6 +3566,21 @@ async fn execute_command(
                 cfg.logging = new_config.logging.clone();
                 cfg.nmos_registration = new_config.nmos_registration.clone();
                 cfg.upgrades = new_config.upgrades.clone();
+                // Node tuning — the same silent-drop class again, and the one
+                // that hurts most now that the block actually does something.
+                // `install_node_defaults` above applies it to the LIVE policy,
+                // so a push visibly changes the media path; without this copy
+                // the value never reaches `AppConfig` or `config.json`, so
+                // `GetConfig` echoes whatever the node booted with, the Tuning
+                // tab says "saved" and then reads back blank, and the change is
+                // gone at the next restart with the node's real ingress policy
+                // recorded nowhere.
+                //
+                // Deliberately a straight copy, NOT restore-if-None like
+                // `logging` / `upgrades` above: the UI clears the block with
+                // `delete cfg.tuning`, so preserving an absent one would make
+                // it un-clearable.
+                cfg.tuning = new_config.tuning.clone();
                 if let Err(e) = save_config_split_async(config_path.to_path_buf(), secrets_path.to_path_buf(), cfg.clone()).await {
                     tracing::error!("Failed to persist config after manager command: {e}");
                     tunnel_manager.event_sender().emit(
@@ -7308,5 +7339,142 @@ mod persist_config_tests {
             .await
             .expect("persist to a writable directory must succeed");
         assert!(cfg_path.exists(), "config.json should be written on the success path");
+    }
+}
+
+#[cfg(test)]
+mod update_config_commit_coverage {
+    //! A guard for the silent-drop class that has now bitten seven times.
+    //!
+    //! `update_config` validates an incoming config, applies the interesting
+    //! parts live, ACKs — and then commits a hand-written list of fields into
+    //! the in-memory `AppConfig` before persisting. A root field missing from
+    //! that list is accepted, applied (sometimes), reported successful, echoed
+    //! back at its OLD value by `GetConfig`, and lost at the next restart.
+    //! `cellular_uplinks`, `starlink_uplinks`, `bond_uplinks`,
+    //! `shared_leg_broker`, `logging`, `nmos_registration` and `upgrades` each
+    //! carry a comment recording their turn; `tuning` was the seventh.
+    //!
+    //! Source-scanning rather than behavioural, because the failure is an
+    //! omission: there is no wrong value to assert on, only an absent line. A
+    //! new root field now fails this test until it is either committed or
+    //! explicitly exempted with a reason.
+
+    /// Root fields deliberately NOT copied by the commit block, with why.
+    /// Adding to this list is a decision; leaving a field out of both lists is
+    /// the bug.
+    const EXEMPT: &[(&str, &str)] = &[
+        ("version", "schema version, not operator-settable"),
+        ("node_id", "node identity — a push must never move it"),
+        (
+            "setup_enabled",
+            "owned by the setup wizard + first manager registration",
+        ),
+        ("setup_token", "local-only secret, stripped from GetConfig"),
+        (
+            "manager",
+            "carries node_secret / registration_token; merged from secrets.json, \
+             never taken from a manager push",
+        ),
+    ];
+
+    fn app_config_fields() -> Vec<String> {
+        let src = include_str!("../config/models.rs");
+        let start = src
+            .find("pub struct AppConfig {")
+            .expect("AppConfig must exist");
+        let body = &src[start..];
+        let end = body.find("\n}").expect("AppConfig must be closed");
+        body[..end]
+            .lines()
+            .filter_map(|l| {
+                let l = l.trim();
+                l.strip_prefix("pub ")
+                    .and_then(|r| r.split(':').next())
+                    .filter(|n| !n.is_empty() && n.chars().all(|c| c.is_alphanumeric() || c == '_'))
+                    .map(str::to_string)
+            })
+            .collect()
+    }
+
+    fn committed_fields() -> Vec<String> {
+        let src = include_str!("client.rs");
+        let start = src
+            .find("// Apply new config and persist")
+            .expect("the commit block must be findable by its comment");
+        let block = &src[start..];
+        let end = block
+            .find("save_config_split_async")
+            .expect("the commit block ends at the persist call");
+        block[..end]
+            .lines()
+            .filter_map(|l| {
+                let l = l.trim();
+                l.strip_prefix("cfg.")
+                    .and_then(|r| r.split(&[' ', '='][..]).next())
+                    .map(str::to_string)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn every_root_config_field_is_committed_or_explicitly_exempt() {
+        let committed = committed_fields();
+        let mut missing = Vec::new();
+        for field in app_config_fields() {
+            if committed.contains(&field) || EXEMPT.iter().any(|(n, _)| *n == field) {
+                continue;
+            }
+            missing.push(field);
+        }
+        assert!(
+            missing.is_empty(),
+            "these root config fields are neither committed by `update_config` nor \
+             listed in EXEMPT: {missing:?}\n\
+             A field in neither list is accepted from the manager, reported saved, \
+             echoed back at its old value by GetConfig, and lost on restart. Either \
+             add `cfg.<field> = new_config.<field>.clone();` to the commit block, or \
+             add it to EXEMPT with the reason it must not be taken from a push."
+        );
+    }
+
+    #[test]
+    fn an_absent_tuning_block_is_preserved_rather_than_clearing_it() {
+        // `tuning.ingress_dejitter_ms` ENABLES the ingress de-jitter buffer,
+        // so treating an omitted block as "clear" would let any push that
+        // does not carry tuning — a device rename, a visual deploy, a config
+        // restore, a reconcile retry — silently switch a live buffer off on
+        // every raw UDP/RTP input. Clearing is an explicit `{}`.
+        let src = include_str!("client.rs");
+        assert!(
+            src.contains("if new_config.tuning.is_none() {")
+                && src.contains("new_config.tuning = old_config.tuning.clone();"),
+            "an absent `tuning` block must be restored from the old config"
+        );
+    }
+
+    #[test]
+    fn tuning_is_committed() {
+        // The specific regression: `tuning` was applied live by
+        // `install_node_defaults` but never stored, so the Tuning tab changed
+        // the media path, then read back blank.
+        assert!(
+            committed_fields().iter().any(|f| f == "tuning"),
+            "config.tuning must be committed, or a pushed Tuning tab value is \
+             applied to the live node defaults and then lost"
+        );
+    }
+
+    #[test]
+    fn the_exempt_list_only_names_real_fields() {
+        // A typo'd or stale exemption would silently excuse a field that no
+        // longer exists while hiding one that does.
+        let fields = app_config_fields();
+        for (name, _why) in EXEMPT {
+            assert!(
+                fields.iter().any(|f| f == name),
+                "EXEMPT names `{name}`, which is not a field of AppConfig"
+            );
+        }
     }
 }
