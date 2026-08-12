@@ -105,9 +105,13 @@ the cap.
 
 - **setpoint 60 ms** — same as egress; one inter-PCR window plus headroom,
   inside any pro receiver's T-STD envelope. Precedence: per-input
-  `ingress_dejitter_ms` > `BILBYCAST_INGRESS_BUFFER_MS` env > 60 ms,
+  `ingress_dejitter_ms` > node `tuning.ingress_dejitter_ms` >
+  `BILBYCAST_INGRESS_BUFFER_MS` env (deprecated) > 60 ms,
   clamped [20, 2000] ms.
-- **residence cap `max(4×setpoint, 250)` ms** (env `BILBYCAST_INGRESS_RESIDENCE_MS`),
+- **residence cap `max(4×setpoint, 250)` ms** (per-input
+  `ingress_residence_ms` > node `tuning.ingress_residence_ms` >
+  `BILBYCAST_INGRESS_RESIDENCE_MS` env, deprecated; clamped to
+  `[setpoint + 40, 5000]`),
   so a bigger buffer gets proportionally more burst headroom before the
   hard shed.
 - **authority ±5 %** — enough to absorb any realistic source-vs-CLOCK

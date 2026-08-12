@@ -686,7 +686,7 @@ against a real reference monitor.
 **Operational prerequisites**:
 
 * Blackmagic **Desktop Video** installed (kernel driver + `libDeckLinkAPI.so`).
-* Run with `BILBYCAST_PROBE_SESSION_LIMITS=0` if NVENC session probing stalls
+* Run with `tuning.probe_session_limits=false` if NVENC session probing stalls
   startup on this driver.
 * `format: "auto"` on inputs; an explicit `mode` FourCC on outputs.
 * For broadcast-grade wire pacing on TS egress, grant `CAP_SYS_NICE` (the

@@ -81,6 +81,25 @@ enum IngressPublisherInner {
     },
 }
 
+/// The three per-input ingress buffering knobs, travelling together so that
+/// adding one doesn't push [`IngressPublisher::new`] past clippy's argument
+/// threshold — and so a caller can't silently transpose two `Option<u32>`s.
+///
+/// All-`None` (the [`Default`]) is direct passthrough, which is what the
+/// transports carrying their own transport-layer de-jitter (SRT's TSBPD) or
+/// a locally-synthesised clock (RTMP, RTSP) pass.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct IngressBuffering {
+    /// Fixed delay line in ms — shifts the timeline, preserves jitter.
+    pub delay_ms: Option<u16>,
+    /// De-jitter setpoint in ms — actually removes jitter. Supersedes
+    /// `delay_ms`.
+    pub dejitter_ms: Option<u32>,
+    /// Hard-shed residence cap in ms for the de-jitter buffer. Ignored
+    /// unless `dejitter_ms` is set.
+    pub residence_ms: Option<u32>,
+}
+
 impl IngressPublisher {
     /// Build an `IngressPublisher`. Mode precedence:
     ///
@@ -96,13 +115,17 @@ impl IngressPublisher {
     /// `IngressPublisher` (and all its clones) are dropped, closing the
     /// mpsc.
     pub fn new(
-        delay_ms: Option<u16>,
-        dejitter_ms: Option<u32>,
+        buffering: IngressBuffering,
         broadcast_tx: broadcast::Sender<RtpPacket>,
         input_id: &str,
         cancel: CancellationToken,
         stats: Arc<FlowStatsAccumulator>,
     ) -> Self {
+        let IngressBuffering {
+            delay_ms,
+            dejitter_ms,
+            residence_ms,
+        } = buffering;
         if let Some(dj) = dejitter_ms.filter(|v| *v > 0) {
             if delay_ms.filter(|v| *v > 0).is_some() {
                 tracing::warn!(
@@ -111,7 +134,10 @@ impl IngressPublisher {
                      unset ingress_delay_ms to silence this)"
                 );
             }
-            let cfg = crate::engine::ingress_dejitter::IngressDejitterConfig::from_ms(Some(dj));
+            let cfg = crate::engine::ingress_dejitter::IngressDejitterConfig::resolve(
+                Some(dj),
+                residence_ms,
+            );
             let submit = crate::engine::ingress_dejitter::start(
                 broadcast_tx,
                 cfg,

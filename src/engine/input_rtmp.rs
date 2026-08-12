@@ -161,10 +161,12 @@ pub fn spawn_rtmp_input(
         }
         // Per-input ingress publisher (fixed-delay + de-jitter modes).
         let publisher = crate::engine::ingress_publisher::IngressPublisher::new(
-            config.ingress_delay_ms,
             // RTMP is TCP + a locally-synthesised TS clock — no media-rate
             // ingress de-jitter.
-            None,
+            crate::engine::ingress_publisher::IngressBuffering {
+                delay_ms: config.ingress_delay_ms,
+                ..Default::default()
+            },
             broadcast_tx,
             &input_id,
             cancel.clone(),

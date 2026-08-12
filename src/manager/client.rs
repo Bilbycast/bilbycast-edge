@@ -1300,6 +1300,16 @@ fn edge_capabilities() -> Vec<&'static str> {
         // report it. Cooperates with SMPTE 2022-7 (runs after the merger).
         // Manager UI gates the per-input de-jitter knob on this.
         "ingress_dejitter",
+        // Node-wide `tuning` block: the ingress de-jitter defaults
+        // (`ingress_dejitter_ms` / `ingress_residence_ms`) and the startup
+        // hardware-probe switches (`probe_session_limits` / `probe_4k`),
+        // plus the per-input `ingress_residence_ms` override. Each of
+        // these used to be an environment variable only, so an edge
+        // WITHOUT this bit accepts the fields on a config push and
+        // silently ignores them (serde unknown-field tolerance) — which
+        // looks exactly like success. Manager UI gates the Tuning surface
+        // and the per-input residence field on it.
+        "node_tuning",
         // Per-input/per-output `interface_binding` field is honoured
         // (loose source-IP binding via NIC name lookup, plus per-leg
         // binding inside 2022-7 redundancy and per-endpoint binding

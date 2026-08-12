@@ -430,6 +430,49 @@ async fn main() -> anyhow::Result<()> {
 
     let global_stats = Arc::new(StatsCollector::new());
 
+    // Node-wide tuning. These four knobs used to be environment-only,
+    // which made them invisible to the manager and impossible to audit per
+    // node. They are config fields now; the environment is read only as a
+    // deprecated fallback, and anything still set is reported to the
+    // operator below (log + manager event) rather than applied silently.
+    //
+    // Must run BEFORE the hardware probe and before any flow starts —
+    // both read the installed policy.
+    let (tuning, stale_env) =
+        config::env_compat::resolve_tuning(app_config.tuning.as_ref());
+    engine::ingress_dejitter::install_node_defaults(
+        engine::ingress_dejitter::IngressDejitterDefaults {
+            dejitter_ms: tuning.ingress_dejitter_ms,
+            residence_ms: tuning.ingress_residence_ms,
+        },
+    );
+    engine::hardware_probe::install_probe_policy(engine::hardware_probe::ProbePolicy {
+        session_limits: tuning.probe_session_limits,
+        tier_4k: tuning.probe_4k,
+    });
+    // Surfaced twice on purpose: `journalctl` for whoever is on the box,
+    // and a manager event for the fleet operator who never logs in. The
+    // event queue flushes on the first manager auth, so this reaches the
+    // Events page even though it is raised before the WS connects.
+    for stale in &stale_env {
+        tracing::warn!("{}", stale.message());
+        event_sender.send(manager::events::Event {
+            severity: manager::events::EventSeverity::Warning,
+            category: "config".to_string(),
+            message: stale.message(),
+            details: Some(serde_json::json!({
+                "error_code": "deprecated_env_var",
+                "env_var": stale.var,
+                "replacement": stale.replacement,
+                "status": stale.status.label(),
+                "value": stale.value,
+            })),
+            flow_id: None,
+            input_id: None,
+            output_id: None,
+        });
+    }
+
     // System resource monitoring (CPU, RAM)
     let resource_state = Arc::new(engine::resource_monitor::SystemResourceState::new());
     // Static hardware capabilities — probed once at startup.

@@ -642,12 +642,13 @@ pub fn spawn_wire_emitter(
     // pacing. The operator must set up the ETF qdisc first (see
     // packaging/setup-etf-qdisc.sh), then enable this flag.
     // BILBYCAST_FORCE_NANOSLEEP=1 forces the fallback for diagnostics.
+    // One name for one knob. `BILBYCAST_ENABLE_SO_TXTIME` was a second
+    // spelling of this and has been removed; a host that still sets it is
+    // told so at startup by `config::env_compat` rather than quietly
+    // running on the default tier.
     let enable_so_txtime = std::env::var("BILBYCAST_ENABLE_TXTIME")
         .map(|v| v == "1")
-        .unwrap_or(false)
-        || std::env::var("BILBYCAST_ENABLE_SO_TXTIME")
-            .map(|v| v == "1")
-            .unwrap_or(false);
+        .unwrap_or(false);
     let force_nanosleep = std::env::var("BILBYCAST_FORCE_NANOSLEEP")
         .map(|v| v == "1")
         .unwrap_or(false);

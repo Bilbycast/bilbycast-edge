@@ -125,16 +125,22 @@ impl EventSender {
     /// in-process recent-event tracker so command handlers can poll for the
     /// outcome of a freshly spawned input/output.
     pub fn send(&self, event: Event) {
-        // Phase 4 verification: mirror every event onto tracing so the
-        // testbed can observe pes_splice_* without a manager connected.
-        // Guarded by env var so production stays quiet.
-        if std::env::var("BILBYCAST_TESTBED_TRACE_EVENTS").as_deref() == Ok("1") {
+        // Mirror every event onto tracing so a testbed (or an operator
+        // debugging a node with no manager attached) can observe
+        // pes_splice_* and friends. This used to be gated on
+        // `BILBYCAST_TESTBED_TRACE_EVENTS=1`, which meant an
+        // environment-variable read — and an allocation — on every event.
+        // `RUST_LOG` already selects by target, so the level is the gate:
+        // production is quiet at the default level, and
+        // `RUST_LOG=bilbycast_edge::testbed_events=debug` turns it on with
+        // no separate switch to discover.
+        if tracing::enabled!(target: "bilbycast_edge::testbed_events", tracing::Level::DEBUG) {
             let ec = event
                 .details
                 .as_ref()
                 .and_then(|d| d.get("error_code").and_then(|v| v.as_str()))
                 .unwrap_or("(no_error_code)");
-            tracing::info!(
+            tracing::debug!(
                 target: "bilbycast_edge::testbed_events",
                 "EVENT severity={:?} category={} error_code={} flow_id={:?} msg={:?} details={:?}",
                 event.severity, event.category, ec, event.flow_id, event.message, event.details

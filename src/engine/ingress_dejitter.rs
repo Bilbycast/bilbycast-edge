@@ -124,8 +124,53 @@ const ANCHOR_STALE_US: u64 = 2_000_000;
 /// burst racing the drainer wake-up.
 const DRAINER_QUEUE_CAP: usize = 4096;
 
-/// De-jitter policy. Built from the per-input `ingress_dejitter_ms`
-/// (`None` → env / 60 ms default), mirroring
+/// Built-in de-jitter setpoint (ms of content) when neither the input nor
+/// the node's `tuning` block names one.
+pub const DEFAULT_SETPOINT_MS: u64 = 60;
+
+/// Setpoint bounds. Mirrored by `config::validation` and by the manager UI
+/// so an operator is told before the push, not after.
+pub const SETPOINT_BOUNDS_MS: (u64, u64) = (20, 2000);
+
+/// Absolute residence-cap ceiling. The floor is `setpoint + 40`, which is
+/// per-input and so can't be a constant.
+pub const RESIDENCE_MAX_MS: u64 = 5_000;
+
+/// How far above the setpoint the residence cap must sit, so the servo has
+/// somewhere to work before the hard shed fires.
+pub const RESIDENCE_HEADROOM_MS: u64 = 40;
+
+/// Node-wide de-jitter defaults, resolved once at startup from
+/// `AppConfig.tuning` (falling back to the deprecated environment
+/// variables) and installed via [`install_node_defaults`].
+///
+/// These are *defaults*, not overrides: a per-input `ingress_dejitter_ms` /
+/// `ingress_residence_ms` always wins.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct IngressDejitterDefaults {
+    /// Node default setpoint. `None` → [`DEFAULT_SETPOINT_MS`].
+    pub dejitter_ms: Option<u32>,
+    /// Node default residence cap. `None` → `max(4 × setpoint, 250)`.
+    pub residence_ms: Option<u32>,
+}
+
+static NODE_DEFAULTS: std::sync::OnceLock<IngressDejitterDefaults> = std::sync::OnceLock::new();
+
+/// Install the node-wide de-jitter defaults. Called once from `main` after
+/// the config is loaded and before any flow starts. Later calls are ignored
+/// (the value is process-wide and read from input tasks on every spawn).
+pub fn install_node_defaults(defaults: IngressDejitterDefaults) {
+    let _ = NODE_DEFAULTS.set(defaults);
+}
+
+/// The installed node defaults, or all-`None` if `install_node_defaults`
+/// was never called (unit tests, and any binary that doesn't load a config).
+pub fn node_defaults() -> IngressDejitterDefaults {
+    NODE_DEFAULTS.get().copied().unwrap_or_default()
+}
+
+/// De-jitter policy. Built from the per-input setpoint / residence cap,
+/// falling back to the node-wide defaults, mirroring
 /// [`crate::engine::wire_emit::DejitterConfig::servo_with`].
 #[derive(Clone, Copy, Debug)]
 pub struct IngressDejitterConfig {
@@ -140,27 +185,43 @@ pub struct IngressDejitterConfig {
 }
 
 impl IngressDejitterConfig {
-    /// Resolve the policy. Precedence for the setpoint: explicit per-input
-    /// `ingress_dejitter_ms` > `BILBYCAST_INGRESS_BUFFER_MS` env > 60 ms
-    /// default (all clamped to [20, 2000] ms). Residence cap defaults to
-    /// `max(4×setpoint, 250)` ms (overridable via
-    /// `BILBYCAST_INGRESS_RESIDENCE_MS`) so a bigger buffer gets
-    /// proportionally more burst headroom before the hard shed.
-    pub fn from_ms(ingress_dejitter_ms: Option<u32>) -> Self {
+    /// Resolve the policy against the node-wide defaults installed at
+    /// startup. Precedence, highest first:
+    ///
+    /// 1. the per-input field,
+    /// 2. the node's `tuning` block,
+    /// 3. the built-in default.
+    ///
+    /// Setpoint is clamped to [`SETPOINT_BOUNDS_MS`]; the residence cap
+    /// defaults to `max(4 × setpoint, 250)` ms so a bigger buffer gets
+    /// proportionally more burst headroom, and is clamped to
+    /// `[setpoint + 40, 5000]` so it can never be configured below the
+    /// setpoint it is supposed to bound.
+    pub fn resolve(ingress_dejitter_ms: Option<u32>, ingress_residence_ms: Option<u32>) -> Self {
+        Self::resolve_with(ingress_dejitter_ms, ingress_residence_ms, node_defaults())
+    }
+
+    /// [`Self::resolve`] against explicit defaults. Pure — the unit tests
+    /// drive this directly rather than mutating process-wide state.
+    pub fn resolve_with(
+        ingress_dejitter_ms: Option<u32>,
+        ingress_residence_ms: Option<u32>,
+        defaults: IngressDejitterDefaults,
+    ) -> Self {
+        let (lo, hi) = SETPOINT_BOUNDS_MS;
         let setpoint_ms = ingress_dejitter_ms
-            .map(|m| m as u64)
-            .or_else(|| {
-                std::env::var("BILBYCAST_INGRESS_BUFFER_MS")
-                    .ok()
-                    .and_then(|v| v.parse::<u64>().ok())
-            })
-            .unwrap_or(60)
-            .clamp(20, 2000);
-        let cap_ms = std::env::var("BILBYCAST_INGRESS_RESIDENCE_MS")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
+            .or(defaults.dejitter_ms)
+            .map(u64::from)
+            .unwrap_or(DEFAULT_SETPOINT_MS)
+            .clamp(lo, hi);
+        let cap_ms = ingress_residence_ms
+            .or(defaults.residence_ms)
+            .map(u64::from)
             .unwrap_or_else(|| (setpoint_ms.saturating_mul(4)).max(250))
-            .clamp(setpoint_ms.saturating_add(40), 5_000);
+            .clamp(
+                setpoint_ms.saturating_add(RESIDENCE_HEADROOM_MS),
+                RESIDENCE_MAX_MS,
+            );
         Self {
             setpoint_ms,
             authority_permille: 50,
@@ -688,13 +749,66 @@ mod tests {
     }
 
     #[test]
-    fn config_from_ms_clamps_and_derives_cap() {
-        let c = IngressDejitterConfig::from_ms(Some(80));
+    fn config_resolve_clamps_and_derives_cap() {
+        let c = IngressDejitterConfig::resolve(Some(80), None);
         assert_eq!(c.setpoint_ms, 80);
         assert_eq!(c.shed_residence_us, 320_000, "cap = 4×setpoint when > 250 ms");
-        let c2 = IngressDejitterConfig::from_ms(Some(40));
+        let c2 = IngressDejitterConfig::resolve(Some(40), None);
         assert_eq!(c2.shed_residence_us, 250_000, "cap floored at 250 ms");
-        let c3 = IngressDejitterConfig::from_ms(Some(5000));
+        let c3 = IngressDejitterConfig::resolve(Some(5000), None);
         assert_eq!(c3.setpoint_ms, 2000, "setpoint clamped to 2000 ms");
+    }
+
+    #[test]
+    fn per_input_beats_node_default_beats_builtin() {
+        let defaults = IngressDejitterDefaults {
+            dejitter_ms: Some(150),
+            residence_ms: Some(900),
+        };
+        // Per-input wins outright.
+        let per_input = IngressDejitterConfig::resolve_with(Some(200), Some(600), defaults);
+        assert_eq!(per_input.setpoint_ms, 200);
+        assert_eq!(per_input.shed_residence_us, 600_000);
+        // Nothing per-input → the node default.
+        let node = IngressDejitterConfig::resolve_with(None, None, defaults);
+        assert_eq!(node.setpoint_ms, 150);
+        assert_eq!(node.shed_residence_us, 900_000);
+        // Neither → the built-in.
+        let builtin = IngressDejitterConfig::resolve_with(None, None, Default::default());
+        assert_eq!(builtin.setpoint_ms, DEFAULT_SETPOINT_MS);
+        assert_eq!(builtin.shed_residence_us, 250_000);
+    }
+
+    #[test]
+    fn the_two_knobs_are_resolved_independently() {
+        // A node-wide residence cap must still apply when the setpoint
+        // comes from the input, and vice versa — resolving them as a pair
+        // would silently drop one of the two.
+        let defaults = IngressDejitterDefaults {
+            dejitter_ms: None,
+            residence_ms: Some(1_000),
+        };
+        let c = IngressDejitterConfig::resolve_with(Some(120), None, defaults);
+        assert_eq!(c.setpoint_ms, 120, "setpoint from the input");
+        assert_eq!(c.shed_residence_us, 1_000_000, "cap from the node default");
+    }
+
+    #[test]
+    fn the_residence_cap_can_never_land_under_the_setpoint() {
+        // The clamp is the last line of defence behind validation: a cap at
+        // or below the setpoint would shed exactly the buffer the setpoint
+        // asks the servo to hold, emptying it every cycle.
+        let c = IngressDejitterConfig::resolve(Some(500), Some(10));
+        assert_eq!(
+            c.shed_residence_us,
+            (500 + RESIDENCE_HEADROOM_MS) * 1_000,
+            "raised to setpoint + headroom"
+        );
+        let c2 = IngressDejitterConfig::resolve(Some(60), Some(99_999));
+        assert_eq!(
+            c2.shed_residence_us,
+            RESIDENCE_MAX_MS * 1_000,
+            "clamped to the absolute ceiling"
+        );
     }
 }

@@ -54,6 +54,31 @@ Events are queued in an unbounded in-memory channel. When the edge is not connec
 
 ## Event Reference
 
+### Configuration (`config`)
+
+| Severity | Message | Trigger |
+|----------|---------|---------|
+| Warning | `<VAR> is deprecated and will be removed…` | Raised once at startup, per variable, when the host's environment still sets a variable that has moved into `config.json`. The variable is **still honoured** this release (it sits below the config field), so nothing about the node's behaviour changes — this is telling the operator where the knob now lives. |
+| Warning | `<VAR> has been removed and does nothing…` | Raised once at startup, per variable, when the host still sets a variable that is read by nothing. Its intent is **not** being applied. Silence here would be worse than the warning: the unit file states one thing and the node does another, and nobody finds out until a stream misbehaves. |
+
+Both carry `error_code: "deprecated_env_var"` plus structured
+`details.env_var`, `details.replacement`, `details.status`
+(`"deprecated"` / `"removed"`) and `details.value`, so the Events page can
+show what to set instead and what the current value was. The events are
+raised before the manager WebSocket connects and flush from the queue on
+the first successful auth. Source of truth for the two lists:
+[`src/config/env_compat.rs`](../src/config/env_compat.rs).
+
+Currently reported as **deprecated**: `BILBYCAST_INGRESS_BUFFER_MS` →
+`tuning.ingress_dejitter_ms`, `BILBYCAST_INGRESS_RESIDENCE_MS` →
+`tuning.ingress_residence_ms` (or the per-input field),
+`BILBYCAST_PROBE_SESSION_LIMITS` → `tuning.probe_session_limits`,
+`BILBYCAST_PROBE_4K` → `tuning.probe_4k`. As **removed**:
+`BILBYCAST_ENABLE_SO_TXTIME` (collapsed onto `BILBYCAST_ENABLE_TXTIME`),
+`BILBYCAST_EGRESS_PACING` / `_BUFFER_MS` / `_RESIDENCE_MS` (per-output
+config fields since 2026-06), `BILBYCAST_BOND_FWMARK_BASE` (never read by
+anything).
+
 ### Flow Lifecycle (`flow`)
 
 | Severity | Message | Trigger |
@@ -723,7 +748,7 @@ Requires `resource_limits` config block. When `critical_action` is `"gate_flows"
 
 **Details** (decoder): `{ error_code: "hw_decoder_oversubscribed", family: "nvdec"|"qsv", role: "decoder", in_use: u32, max_sessions: u32, flow_id }`
 
-**Source**: `src/engine/manager.rs::create_flow` → `emit_hw_oversubscribe_warnings`. The probed-max-sessions number comes from `engine::hardware_probe::probe_encoder_session_limits` / `probe_decoder_session_limits` at startup (capped at 8; see [`docs/configuration-guide.md`](configuration-guide.md#capacity--resource-budget) and the `BILBYCAST_PROBE_SESSION_LIMITS=0` opt-out). Soft warning matches the existing modal `updateResourceImpact` 80/100 % units pattern — the alarm tells the operator to fix it without blocking flow creation.
+**Source**: `src/engine/manager.rs::create_flow` → `emit_hw_oversubscribe_warnings`. The probed-max-sessions number comes from `engine::hardware_probe::probe_encoder_session_limits` / `probe_decoder_session_limits` at startup (capped at 8; see [`docs/configuration-guide.md`](configuration-guide.md#capacity--resource-budget) and the `tuning.probe_session_limits=false` opt-out). Soft warning matches the existing modal `updateResourceImpact` 80/100 % units pattern — the alarm tells the operator to fix it without blocking flow creation.
 
 ### Remote upgrade (`upgrade`)
 

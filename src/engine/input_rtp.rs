@@ -173,8 +173,11 @@ pub fn spawn_rtp_input(
         // through the same publisher so the hitless merger sees the
         // legs with reduced inter-arrival jitter.
         let publisher = crate::engine::ingress_publisher::IngressPublisher::new(
-            config.ingress_delay_ms,
-            config.ingress_dejitter_ms,
+            crate::engine::ingress_publisher::IngressBuffering {
+                delay_ms: config.ingress_delay_ms,
+                dejitter_ms: config.ingress_dejitter_ms,
+                residence_ms: config.ingress_residence_ms,
+            },
             broadcast_tx,
             &input_id,
             cancel.clone(),

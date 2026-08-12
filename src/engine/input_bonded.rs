@@ -377,8 +377,7 @@ pub fn spawn_bonded_input(
         }
         // Direct passthrough — no rate-paced de-jitter on a bonded input (see above).
         let publisher = crate::engine::ingress_publisher::IngressPublisher::new(
-            None,
-            None,
+            crate::engine::ingress_publisher::IngressBuffering::default(),
             broadcast_tx,
             &input_id,
             cancel.clone(),

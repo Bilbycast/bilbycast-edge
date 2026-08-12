@@ -154,7 +154,7 @@ pub struct SwCapacityEstimate {
 /// per-family probe failed at session 0 (so capacity is 0 — but we omit
 /// the field instead of writing 0 to keep the wire shape distinguishable
 /// from "limit is zero"), or the operator disabled session-count probing
-/// via `BILBYCAST_PROBE_SESSION_LIMITS=0`.
+/// via `tuning.probe_session_limits = false`.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct HwSessionLimits {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -171,7 +171,7 @@ pub struct HwSessionLimits {
     /// Concurrent 4K-grade NVENC encode sessions (probed at
     /// 3840×2160). Capacity at 4K is materially smaller than at 1080p
     /// on consumer GPUs (VRAM, engine throughput). `None` when the 4K
-    /// tier was disabled via `BILBYCAST_PROBE_4K=0` or when the family
+    /// tier was disabled via `tuning.probe_4k = false` or when the family
     /// is absent / failed to open at 4K.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub nvenc_max_sessions_4k: Option<u32>,
@@ -502,7 +502,7 @@ pub struct LiveUtilizationSnapshot {
 ///    loop until one fails, capped at 8 (covers consumer + most pro
 ///    cards in <300 ms). Skipped per-family when no codec in that
 ///    family probed available. Disable globally with
-///    `BILBYCAST_PROBE_SESSION_LIMITS=0` if startup latency matters.
+///    `tuning.probe_session_limits = false` if startup latency matters.
 pub fn probe_static_capabilities() -> StaticCapabilities {
     let cpu = probe_cpu_info();
     let sw_capacity = estimate_sw_capacity(&cpu);
@@ -545,7 +545,7 @@ pub fn probe_static_capabilities() -> StaticCapabilities {
         probe_encoder_session_limits(&hw_encoders)
     } else {
         tracing::info!(
-            "session-limit probe disabled via BILBYCAST_PROBE_SESSION_LIMITS=0; \
+            "session-limit probe disabled via tuning.probe_session_limits=false; \
             manager will report HW sessions used without a max-sessions denominator"
         );
         HwSessionLimits::default()
@@ -693,33 +693,55 @@ fn probe_vaapi_chroma(name: &str, chroma: video_engine::ProbeChroma) -> bool {
     }
 }
 
-/// Honour `BILBYCAST_PROBE_SESSION_LIMITS=0` (or `false`) to skip the
-/// loop-open session-capacity probe. Default on. Operators with strict
-/// startup-latency budgets opt out.
-fn session_limit_probe_enabled() -> bool {
-    match std::env::var("BILBYCAST_PROBE_SESSION_LIMITS") {
-        Ok(v) => {
-            let lower = v.trim().to_ascii_lowercase();
-            !matches!(lower.as_str(), "0" | "false" | "no" | "off")
+/// Startup-probe policy, resolved from `AppConfig.tuning` (falling back to
+/// the deprecated `BILBYCAST_PROBE_*` environment variables) and installed
+/// by `main` before [`probe_static_capabilities`] runs.
+#[derive(Clone, Copy, Debug)]
+pub struct ProbePolicy {
+    /// Run the loop-open session-capacity probe at all. `false` trades the
+    /// manager's "sessions used **of** max" denominator for a faster boot.
+    pub session_limits: bool,
+    /// Run the second-tier 4K pass. Ignored when `session_limits` is
+    /// `false` — that already disables both tiers.
+    pub tier_4k: bool,
+}
+
+impl Default for ProbePolicy {
+    fn default() -> Self {
+        Self {
+            session_limits: true,
+            tier_4k: true,
         }
-        Err(_) => true,
     }
 }
 
-/// Honour `BILBYCAST_PROBE_4K=0` (or `false`) to skip the additional
-/// 4K-tier session-capacity probe. Default on. Operators on
-/// 1080p-only deployments who want a faster startup opt out — the
-/// existing 1080p probe still runs, only the second-tier 4K pass is
-/// skipped. The global `BILBYCAST_PROBE_SESSION_LIMITS=0` switch
-/// disables both tiers.
+static PROBE_POLICY: std::sync::OnceLock<ProbePolicy> = std::sync::OnceLock::new();
+
+/// Install the startup-probe policy. Called once from `main` after the
+/// config is loaded and before [`probe_static_capabilities`]; later calls
+/// are ignored.
+pub fn install_probe_policy(policy: ProbePolicy) {
+    let _ = PROBE_POLICY.set(policy);
+}
+
+/// The installed policy, or the all-on default when `main` never installed
+/// one (unit tests, and any binary that doesn't load a config).
+fn probe_policy() -> ProbePolicy {
+    PROBE_POLICY.get().copied().unwrap_or_default()
+}
+
+/// Whether to run the loop-open session-capacity probe.
+/// Configured by `tuning.probe_session_limits`.
+fn session_limit_probe_enabled() -> bool {
+    probe_policy().session_limits
+}
+
+/// Whether to run the additional 4K-tier session-capacity probe. The
+/// 1080p baseline still runs when this is off; only the second-tier pass is
+/// skipped. Configured by `tuning.probe_4k`.
+#[cfg_attr(not(feature = "media-codecs"), allow(dead_code))]
 fn probe_4k_enabled() -> bool {
-    match std::env::var("BILBYCAST_PROBE_4K") {
-        Ok(v) => {
-            let lower = v.trim().to_ascii_lowercase();
-            !matches!(lower.as_str(), "0" | "false" | "no" | "off")
-        }
-        Err(_) => true,
-    }
+    probe_policy().tier_4k
 }
 
 /// Upper bound on the 1080p session count probe. Bumped past the
@@ -743,7 +765,7 @@ const FOUR_K_UPPER_BOUND: u32 = 8;
 /// passes: a 1080p baseline (the dominant HD-tier broadcast workload
 /// class — mapped onto the existing `*_max_sessions` wire fields) and
 /// an optional 4K tier (mapped onto the new `*_max_sessions_4k`
-/// fields, gated by `BILBYCAST_PROBE_4K`). Probes one codec per
+/// fields, gated by `tuning.probe_4k`). Probes one codec per
 /// family (the H.264 variant — H.264 + HEVC share the engine on
 /// every supported backend) so we don't double the startup cost.
 /// Returns `None` for families where no codec was available at

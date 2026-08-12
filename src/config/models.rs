@@ -81,6 +81,12 @@ pub struct AppConfig {
     /// when thresholds are exceeded. See [`ResourceLimitConfig`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resource_limits: Option<ResourceLimitConfig>,
+    /// Optional node-wide tuning defaults. Every field here previously
+    /// existed only as an environment variable, which made it invisible to
+    /// the manager, undiscoverable per node and unauditable. See
+    /// [`NodeTuningConfig`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tuning: Option<NodeTuningConfig>,
     /// OPTIONAL host-level policy caps for the shared-leg capacity broker — one
     /// hard ceiling per physical NIC that the broker's auto-discovered capacity
     /// estimate must never probe past. Only needed for a metered / rate-limited
@@ -261,6 +267,7 @@ impl Default for AppConfig {
             inputs: Vec::new(),
             outputs: Vec::new(),
             resource_limits: None,
+            tuning: None,
             logging: None,
             flows: Vec::new(),
             tunnels: Vec::new(),
@@ -1455,6 +1462,54 @@ fn default_true_opt() -> Option<bool> {
     Some(true)
 }
 
+/// Node-wide tuning defaults.
+///
+/// Everything here used to be reachable **only** through an environment
+/// variable, which meant the manager could neither show it nor set it: an
+/// operator had to edit a systemd unit and restart, per node, with no audit
+/// trail and no way to tell one node's tuning from another's. These are
+/// ordinary config fields now, so they arrive over the same validated
+/// `UpdateConfig` path as everything else.
+///
+/// The legacy environment variables are still read for one release as a
+/// fallback *below* this block, and using one raises a Warning
+/// `deprecated_env_var` event naming the field that replaces it — see
+/// [`crate::config::env_compat`].
+///
+/// Every field is `Option`: `None` means "use the built-in default", which
+/// is what an absent `tuning` block gives you.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct NodeTuningConfig {
+    /// Default ingress de-jitter setpoint in ms for inputs that don't carry
+    /// their own `ingress_dejitter_ms`. Bounded 20–2000. `None` → 60 ms.
+    ///
+    /// Replaces `BILBYCAST_INGRESS_BUFFER_MS`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ingress_dejitter_ms: Option<u32>,
+    /// Default ingress de-jitter hard-shed residence cap in ms. Bounded
+    /// `setpoint + 40` .. 5000. `None` → `max(4 × setpoint, 250)`, so a
+    /// bigger buffer gets proportionally more burst headroom.
+    ///
+    /// Replaces `BILBYCAST_INGRESS_RESIDENCE_MS`. A per-input
+    /// `ingress_residence_ms` overrides this for that input.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ingress_residence_ms: Option<u32>,
+    /// Run the startup hardware encoder/decoder session-capacity probe.
+    /// `None` → `true`. Turning it off trades the manager's "sessions used
+    /// **of** max" denominator for a faster boot.
+    ///
+    /// Replaces `BILBYCAST_PROBE_SESSION_LIMITS`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub probe_session_limits: Option<bool>,
+    /// Run the second-tier 4K session-capacity probe. `None` → `true`.
+    /// Ignored when `probe_session_limits` is `false` — that disables both
+    /// tiers.
+    ///
+    /// Replaces `BILBYCAST_PROBE_4K`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub probe_4k: Option<bool>,
+}
+
 /// System resource monitoring and threshold configuration.
 ///
 /// When configured at the node level, the edge periodically samples CPU and RAM
@@ -2370,13 +2425,25 @@ pub struct RtpInputConfig {
     /// regardless of network packet-delay-variation. Unlike
     /// `ingress_delay_ms` (a pure delay line that *preserves* jitter)
     /// this actually removes it — it's the real broadcast-grade input
-    /// de-jitter. `None` → env (`BILBYCAST_INGRESS_BUFFER_MS`) / 60 ms
+    /// de-jitter. `None` → node-wide `tuning.ingress_dejitter_ms` / 60 ms
     /// default; bounded 20–2000 ms. De-jitter supersedes smoothing if both
     /// are set. On a SMPTE 2022-7 dual-leg RTP input it runs *after* the
     /// hitless merger (re-pacing the merger's bursty seq-ordered drain).
     /// See [`crate::engine::ingress_dejitter`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ingress_dejitter_ms: Option<u32>,
+    /// Hard-shed residence cap for this input's de-jitter buffer, in ms.
+    /// A packet older than this is shed rather than released late, which
+    /// is what bounds ingress latency when a burst or a source-rate offset
+    /// exceeds the servo's ±5 % authority.
+    ///
+    /// `None` → node-wide `tuning.ingress_residence_ms`, else
+    /// `max(4 × setpoint, 250)` ms. Bounded `setpoint + 40` .. 5000 ms.
+    /// Only meaningful alongside `ingress_dejitter_ms` — without a
+    /// de-jitter buffer there is no residence to cap, and validation
+    /// rejects the combination rather than accepting a silent no-op.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ingress_residence_ms: Option<u32>,
     /// Opt OUT of muxer-mode PCR + PES PTS regeneration. Default
     /// `false` (muxer mode ON) — bilbycast-edge regenerates PCR and
     /// PES PTS/DTS values from the per-flow master clock per the
@@ -2464,6 +2531,10 @@ pub struct UdpInputConfig {
     /// [`RtpInputConfig::ingress_dejitter_ms`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ingress_dejitter_ms: Option<u32>,
+    /// Hard-shed residence cap for this input's de-jitter buffer, in ms.
+    /// See [`RtpInputConfig::ingress_residence_ms`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ingress_residence_ms: Option<u32>,
     /// Muxer-mode PCR + PES PTS regeneration opt-out. See
     /// [`RtpInputConfig::passthrough_clock`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -7502,6 +7573,7 @@ mod tests {
             monitor: None,
             manager: None,
             resource_limits: None,
+            tuning: None,
             logging: None,
             tunnels: Vec::new(),
             flow_groups: Vec::new(),
@@ -7536,6 +7608,7 @@ mod tests {
                     interface_binding: None,
                     ingress_delay_ms: None,
                     ingress_dejitter_ms: None,
+                    ingress_residence_ms: None,
                     passthrough_clock: None,
                 }),
             }],
@@ -7615,6 +7688,7 @@ mod tests {
                     interface_binding: None,
                     ingress_delay_ms: None,
                     ingress_dejitter_ms: None,
+                    ingress_residence_ms: None,
                     passthrough_clock: None,
                 }),
             }],

@@ -13,6 +13,7 @@
 
 pub mod audio_pids_serde;
 pub mod crypto;
+pub mod env_compat;
 pub mod models;
 pub mod persistence;
 pub mod pid_map_serde;

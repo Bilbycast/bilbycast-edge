@@ -48,6 +48,11 @@ pub fn validate_config(config: &AppConfig) -> Result<()> {
         parse_listen_addrs(addrs, "server.listen_addrs")?;
     }
 
+    // Node-wide tuning defaults.
+    if let Some(ref tuning) = config.tuning {
+        validate_node_tuning(tuning)?;
+    }
+
     // Validate monitor config if present
     if let Some(ref monitor) = config.monitor {
         let monitor_addr = format!("{}:{}", monitor.listen_addr, monitor.listen_port);
@@ -716,10 +721,10 @@ fn validate_ingress_delay(input_id: &str, cfg: &InputConfig) -> Result<()> {
 /// de-jitter). Bound mirrors the per-output `egress_buffer_ms` servo so
 /// the two de-jitter stages share one operator mental model.
 fn validate_ingress_dejitter(input_id: &str, cfg: &InputConfig) -> Result<()> {
-    let ms = match cfg {
-        InputConfig::Rtp(c) => c.ingress_dejitter_ms,
-        InputConfig::Udp(c) => c.ingress_dejitter_ms,
-        _ => None,
+    let (ms, residence) = match cfg {
+        InputConfig::Rtp(c) => (c.ingress_dejitter_ms, c.ingress_residence_ms),
+        InputConfig::Udp(c) => (c.ingress_dejitter_ms, c.ingress_residence_ms),
+        _ => (None, None),
     };
     if let Some(v) = ms
         && !(20..=2000).contains(&v) {
@@ -727,6 +732,56 @@ fn validate_ingress_dejitter(input_id: &str, cfg: &InputConfig) -> Result<()> {
                 "Input '{input_id}': ingress_dejitter_ms = {v} out of range (20..=2000 ms)"
             );
         }
+    // The residence cap bounds how long a packet may sit in the de-jitter
+    // buffer. Without a de-jitter buffer there is nothing to bound, so
+    // accepting the field alone would be a silent no-op — exactly the trap
+    // the move off environment variables exists to close. Refuse it
+    // instead, and say which field to set.
+    if let Some(v) = residence {
+        let Some(setpoint) = ms else {
+            bail!(
+                "Input '{input_id}': ingress_residence_ms = {v} has no effect without \
+                 ingress_dejitter_ms — it caps how long a packet may sit in the de-jitter \
+                 buffer, and there is no buffer to cap. Set ingress_dejitter_ms too, or \
+                 remove ingress_residence_ms."
+            );
+        };
+        // The floor is what the servo needs to work in before the hard shed
+        // fires; the ceiling is the absolute residence bound.
+        let floor = setpoint.saturating_add(40);
+        if !(floor..=5000).contains(&v) {
+            bail!(
+                "Input '{input_id}': ingress_residence_ms = {v} out of range \
+                 ({floor}..=5000 ms). The floor is ingress_dejitter_ms + 40 ms — a cap at or \
+                 below the setpoint would shed the buffer the setpoint asks the servo to hold."
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Validate the node-wide `tuning` block. Bounds mirror the per-input
+/// fields exactly, so an operator who sets a node default and then a
+/// per-input override is told the same thing by the same numbers.
+fn validate_node_tuning(tuning: &crate::config::models::NodeTuningConfig) -> Result<()> {
+    if let Some(v) = tuning.ingress_dejitter_ms
+        && !(20..=2000).contains(&v)
+    {
+        bail!("tuning.ingress_dejitter_ms = {v} out of range (20..=2000 ms)");
+    }
+    if let Some(v) = tuning.ingress_residence_ms {
+        // Node-wide, the setpoint this is paired with may be overridden
+        // per input, so the floor is checked against the node default
+        // (or the built-in 60 ms) rather than any one input's value.
+        let setpoint = tuning.ingress_dejitter_ms.unwrap_or(60);
+        let floor = setpoint.saturating_add(40);
+        if !(floor..=5000).contains(&v) {
+            bail!(
+                "tuning.ingress_residence_ms = {v} out of range ({floor}..=5000 ms). \
+                 The floor is tuning.ingress_dejitter_ms + 40 ms (default 60 + 40)."
+            );
+        }
+    }
     Ok(())
 }
 
@@ -9572,6 +9627,7 @@ mod tests {
                         interface_binding: None,
                         ingress_delay_ms: None,
                         ingress_dejitter_ms: None,
+                        ingress_residence_ms: None,
                         passthrough_clock: None,
             }),
         });
@@ -9674,8 +9730,151 @@ mod tests {
             interface_binding: None,
             ingress_delay_ms: None,
             ingress_dejitter_ms: ms,
+            ingress_residence_ms: None,
             passthrough_clock: None,
         })
+    }
+
+    fn rtp_input_with_buffering(dejitter: Option<u32>, residence: Option<u32>) -> InputConfig {
+        let InputConfig::Rtp(mut c) = rtp_input_with_dejitter(dejitter) else {
+            unreachable!("helper builds an Rtp input")
+        };
+        c.ingress_residence_ms = residence;
+        InputConfig::Rtp(c)
+    }
+
+    // ── per-input ingress_residence_ms ──────────────────────────────────
+
+    #[test]
+    fn residence_cap_without_a_setpoint_is_refused() {
+        // There is no de-jitter buffer whose residence it could bound, so
+        // accepting it would be a silent no-op — the exact trap the move
+        // off environment variables exists to close.
+        let config = make_config_input_only(rtp_input_with_buffering(None, Some(500)));
+        let err = validate_config(&config).unwrap_err().to_string();
+        assert!(err.contains("no effect without ingress_dejitter_ms"), "{err}");
+    }
+
+    #[test]
+    fn residence_cap_at_or_below_the_setpoint_is_refused() {
+        // A cap at or below the setpoint sheds the very buffer the setpoint
+        // asks the servo to hold.
+        for cap in [10u32, 200, 239] {
+            let config = make_config_input_only(rtp_input_with_buffering(Some(200), Some(cap)));
+            assert!(
+                validate_config(&config).is_err(),
+                "residence {cap} must be refused against a 200 ms setpoint"
+            );
+        }
+        // setpoint + 40 exactly is the inclusive floor.
+        let config = make_config_input_only(rtp_input_with_buffering(Some(200), Some(240)));
+        assert!(validate_config(&config).is_ok(), "the floor itself is legal");
+    }
+
+    #[test]
+    fn residence_cap_above_the_ceiling_is_refused() {
+        let config = make_config_input_only(rtp_input_with_buffering(Some(60), Some(5001)));
+        assert!(validate_config(&config).is_err());
+        let config = make_config_input_only(rtp_input_with_buffering(Some(60), Some(5000)));
+        assert!(validate_config(&config).is_ok(), "5000 is the inclusive ceiling");
+    }
+
+    // ── node-wide tuning block ──────────────────────────────────────────
+
+    fn config_with_tuning(tuning: crate::config::models::NodeTuningConfig) -> AppConfig {
+        AppConfig {
+            tuning: Some(tuning),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn node_tuning_defaults_are_accepted() {
+        assert!(validate_config(&config_with_tuning(Default::default())).is_ok());
+    }
+
+    #[test]
+    fn node_tuning_setpoint_bounds_match_the_per_input_bounds() {
+        for ms in [20u32, 60, 2000] {
+            let t = crate::config::models::NodeTuningConfig {
+                ingress_dejitter_ms: Some(ms),
+                ..Default::default()
+            };
+            assert!(validate_config(&config_with_tuning(t)).is_ok(), "{ms} in range");
+        }
+        for ms in [19u32, 2001] {
+            let t = crate::config::models::NodeTuningConfig {
+                ingress_dejitter_ms: Some(ms),
+                ..Default::default()
+            };
+            assert!(validate_config(&config_with_tuning(t)).is_err(), "{ms} out of range");
+        }
+    }
+
+    #[test]
+    fn node_tuning_residence_floor_follows_the_node_setpoint() {
+        // With a node setpoint of 500, the floor is 540 — not the 100 the
+        // built-in 60 ms default would imply.
+        let t = crate::config::models::NodeTuningConfig {
+            ingress_dejitter_ms: Some(500),
+            ingress_residence_ms: Some(400),
+            ..Default::default()
+        };
+        let err = validate_config(&config_with_tuning(t)).unwrap_err().to_string();
+        assert!(err.contains("540..=5000"), "{err}");
+
+        let t = crate::config::models::NodeTuningConfig {
+            ingress_dejitter_ms: Some(500),
+            ingress_residence_ms: Some(540),
+            ..Default::default()
+        };
+        assert!(validate_config(&config_with_tuning(t)).is_ok());
+    }
+
+    #[test]
+    fn node_tuning_residence_without_a_setpoint_uses_the_builtin_default_floor() {
+        let t = crate::config::models::NodeTuningConfig {
+            ingress_residence_ms: Some(100),
+            ..Default::default()
+        };
+        assert!(
+            validate_config(&config_with_tuning(t)).is_ok(),
+            "60 (built-in) + 40 = 100 is the floor when no node setpoint is set"
+        );
+        let t = crate::config::models::NodeTuningConfig {
+            ingress_residence_ms: Some(99),
+            ..Default::default()
+        };
+        assert!(validate_config(&config_with_tuning(t)).is_err());
+    }
+
+    #[test]
+    fn the_tuning_block_round_trips_through_json_without_restating_defaults() {
+        // Every field is skip_serializing_if=None, so an untouched block
+        // serialises to `{}` rather than writing the defaults back into the
+        // operator's config file.
+        let t = crate::config::models::NodeTuningConfig::default();
+        assert_eq!(serde_json::to_string(&t).unwrap(), "{}");
+
+        let t = crate::config::models::NodeTuningConfig {
+            ingress_dejitter_ms: Some(120),
+            ingress_residence_ms: Some(600),
+            probe_session_limits: Some(false),
+            probe_4k: None,
+        };
+        let json = serde_json::to_string(&t).unwrap();
+        assert!(!json.contains("probe_4k"), "an unset field stays off the wire: {json}");
+        let back: crate::config::models::NodeTuningConfig =
+            serde_json::from_str(&json).unwrap();
+        assert_eq!(back, t);
+
+        // And an absent block deserialises cleanly from a config that
+        // predates it — every existing config.json on disk.
+        let cfg: AppConfig = serde_json::from_str(
+            r#"{"version":2,"server":{"listen_addr":"127.0.0.1","listen_port":8080}}"#,
+        )
+        .expect("a config with no tuning block still loads");
+        assert!(cfg.tuning.is_none());
     }
 
     #[test]
@@ -9731,6 +9930,7 @@ mod tests {
                 interface_binding: None,
                 ingress_delay_ms: None,
                 ingress_dejitter_ms: None,
+                ingress_residence_ms: None,
                 passthrough_clock: None,
         }));
         assert!(validate_config(&config).is_err());
@@ -9850,6 +10050,7 @@ mod tests {
                         interface_binding: None,
                         ingress_delay_ms: None,
                         ingress_dejitter_ms: None,
+                        ingress_residence_ms: None,
                         passthrough_clock: None,
             }),
         });
@@ -9878,6 +10079,7 @@ mod tests {
                         interface_binding: None,
                         ingress_delay_ms: None,
                         ingress_dejitter_ms: None,
+                        ingress_residence_ms: None,
                         passthrough_clock: None,
             }),
         });
@@ -9997,6 +10199,7 @@ mod tests {
                         interface_binding: None,
                         ingress_delay_ms: None,
                         ingress_dejitter_ms: None,
+                        ingress_residence_ms: None,
                         passthrough_clock: None,
             }),
         });
@@ -10074,6 +10277,7 @@ mod tests {
                         interface_binding: None,
                         ingress_delay_ms: None,
                         ingress_dejitter_ms: None,
+                        ingress_residence_ms: None,
                         passthrough_clock: None,
             }),
         });
@@ -10147,6 +10351,7 @@ mod tests {
                 interface_binding: None,
                 ingress_delay_ms: None,
                 ingress_dejitter_ms: None,
+                ingress_residence_ms: None,
                 passthrough_clock: None,
         }));
         assert!(validate_config(&config).is_err());
@@ -10180,6 +10385,7 @@ mod tests {
                         interface_binding: None,
                         ingress_delay_ms: None,
                         ingress_dejitter_ms: None,
+                        ingress_residence_ms: None,
                         passthrough_clock: None,
             }),
         });
@@ -10257,6 +10463,7 @@ mod tests {
                         interface_binding: None,
                         ingress_delay_ms: None,
                         ingress_dejitter_ms: None,
+                        ingress_residence_ms: None,
                         passthrough_clock: None,
             }),
         });
@@ -10334,6 +10541,7 @@ mod tests {
                         interface_binding: None,
                         ingress_delay_ms: None,
                         ingress_dejitter_ms: None,
+                        ingress_residence_ms: None,
                         passthrough_clock: None,
             }),
         });
@@ -11820,6 +12028,7 @@ mod tests {
                         interface_binding: None,
                         ingress_delay_ms: None,
                         ingress_dejitter_ms: None,
+                        ingress_residence_ms: None,
                         passthrough_clock: None,
             }),
         });
@@ -11848,6 +12057,7 @@ mod tests {
                         interface_binding: None,
                         ingress_delay_ms: None,
                         ingress_dejitter_ms: None,
+                        ingress_residence_ms: None,
                         passthrough_clock: None,
             }),
         });
