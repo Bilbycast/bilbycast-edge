@@ -34,6 +34,7 @@
 
 use std::collections::VecDeque;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::engine::ts_parse;
 use crate::stats::models::AvInterleaveStats;
@@ -49,7 +50,35 @@ pub const AV_INTERLEAVE_WINDOW_SAMPLES: usize = 256;
 /// filtering genuine discontinuities.
 pub const AV_INTERLEAVE_MAX_MS: i64 = 2000;
 
+/// Sentinel for "no PID tracked yet" inside [`AvInterleaveSampler::tracked_pids`].
+///
+/// A TS PID is 13 bits (0..=8191), so `0xFFFF` can never collide with a real one.
+const NO_PID: u64 = 0xFFFF;
+
+/// Pack the three tracked PIDs into one word: `pmt << 32 | video << 16 | audio`.
+#[inline]
+fn pack_tracked(pmt: Option<u16>, video: Option<u16>, audio: Option<u16>) -> u64 {
+    let f = |p: Option<u16>| p.map(u64::from).unwrap_or(NO_PID);
+    (f(pmt) << 32) | (f(video) << 16) | f(audio)
+}
+
 pub struct AvInterleaveSampler {
+    /// Lock-free triage hint mirroring `state`'s `pmt_pid` / `video_pid` /
+    /// `audio_pid`, so the per-packet fast path can reject a packet without
+    /// touching the mutex.
+    ///
+    /// All three live in one word rather than three atomics so a single
+    /// `Relaxed` load yields a mutually consistent view — and so the fast
+    /// path costs one load, not three.
+    ///
+    /// Kept in step with `state` by [`AvInterleaveSampler::sync_tracked`],
+    /// always called while the mutex is held. `Relaxed` is sufficient: the
+    /// hint is only ever used to decide whether to *take* the lock, and the
+    /// authoritative values are re-read under it. After the wire emitter's
+    /// `carries_ts` gate there is exactly one writer per sampler, so the
+    /// hint cannot lag its own writer at all; the worst a stale read could
+    /// ever cost is one skipped sample out of a 4096-entry reservoir.
+    tracked_pids: AtomicU64,
     state: Mutex<AvInterleaveState>,
 }
 
@@ -75,6 +104,7 @@ struct AvInterleaveState {
 impl AvInterleaveSampler {
     pub fn new() -> Self {
         Self {
+            tracked_pids: AtomicU64::new(pack_tracked(None, None, None)),
             state: Mutex::new(AvInterleaveState {
                 samples: VecDeque::with_capacity(AV_INTERLEAVE_RESERVOIR_SIZE),
                 pmt_pid: None,
@@ -90,6 +120,30 @@ impl AvInterleaveSampler {
         }
     }
 
+    /// Whether `pid` is one of the PIDs this sampler currently follows.
+    /// One `Relaxed` load; see [`AvInterleaveSampler::tracked_pids`].
+    #[inline]
+    fn is_tracked(&self, pid: u16) -> bool {
+        let packed = self.tracked_pids.load(Ordering::Relaxed);
+        let p = u64::from(pid);
+        ((packed >> 32) & 0xFFFF) == p
+            || ((packed >> 16) & 0xFFFF) == p
+            || (packed & 0xFFFF) == p
+    }
+
+    /// Republish the triage hint from the authoritative state. Must be
+    /// called while the mutex is held, after any change to `pmt_pid`,
+    /// `video_pid` or `audio_pid` — a missed call silently stops the
+    /// sampler seeing that PID, which reads as "no samples" rather than as
+    /// an error.
+    #[inline]
+    fn sync_tracked(&self, state: &AvInterleaveState) {
+        self.tracked_pids.store(
+            pack_tracked(state.pmt_pid, state.video_pid, state.audio_pid),
+            Ordering::Relaxed,
+        );
+    }
+
     /// Feed one 188-byte TS packet at egress. Internally tracks PAT/PMT
     /// to discover video/audio PIDs, then measures V−A PTS offset on
     /// PUSI-marked PES packets.
@@ -98,6 +152,32 @@ impl AvInterleaveSampler {
             return;
         }
         let pid = ts_parse::ts_pid(pkt);
+
+        // ── Lock-free triage ────────────────────────────────────────────
+        // Every branch below is guarded by `ts_pusi(pkt)` AND by the packet
+        // being the PAT, the PMT, or the tracked video/audio PID. A packet
+        // failing both tests therefore cannot change any state, so deciding
+        // that here — rather than after acquiring the mutex — is exactly
+        // equivalent, and is what makes the module's own documented cost
+        // ("~50–75 Hz") true of the lock as well as of the PTS extraction.
+        //
+        // This matters far more than the raw instruction count. The caller
+        // is `wire_emit`'s releaser thread, which runs SCHED_FIFO 50, while
+        // `snapshot()` is driven from ordinary Tokio workers (1 Hz stats
+        // tick, REST, the stats WebSocket, the Prometheus scrape). A
+        // `std::sync::Mutex` is a plain futex with no priority inheritance,
+        // so every acquisition on the hot path is an opportunity for the
+        // real-time thread to be parked behind a lower-priority one — the
+        // inversion `engine::epoch_lock` refuses to accept at 25–50 reads/s
+        // and solves with a seqlock. Taking the lock ~50 times a second
+        // instead of once per 188-byte packet removes that exposure without
+        // changing a single observable value.
+        if !ts_parse::ts_pusi(pkt) {
+            return;
+        }
+        if pid != ts_parse::PAT_PID && !self.is_tracked(pid) {
+            return;
+        }
 
         let mut state = match self.state.lock() {
             Ok(g) => g,
@@ -122,6 +202,7 @@ impl AvInterleaveSampler {
                     state.last_pmt_version = None;
                     state.last_video_pts_90k = None;
                     state.last_audio_pts_90k = None;
+                    self.sync_tracked(&state);
                 }
             return;
         }
@@ -181,6 +262,7 @@ impl AvInterleaveSampler {
                         state.audio_pid = new_audio;
                         state.last_audio_pts_90k = None;
                     }
+                    self.sync_tracked(&state);
                 }
                 return;
             }
@@ -205,16 +287,51 @@ impl AvInterleaveSampler {
     }
 
     pub fn snapshot(&self) -> Option<AvInterleaveStats> {
-        let state = match self.state.lock() {
-            Ok(g) => g,
-            Err(poisoned) => poisoned.into_inner(),
+        // Copy the reservoir out under the lock, then release it before
+        // sorting. The two sorts and their allocations used to run *inside*
+        // the critical section, which put an unbounded amount of work —
+        // including two `malloc`s, each taking the allocator's arena lock —
+        // between a SCHED_FIFO wire-emit thread and the mutex it needs.
+        //
+        // The destination buffer is allocated *before* the lock is taken so
+        // the critical section holds no allocation at all: what remains is a
+        // bounded memcpy of at most `AV_INTERLEAVE_RESERVOIR_SIZE` i64
+        // (32 KiB), which is a few microseconds against the tens this used
+        // to hold for. Every value below is computed from the copy, so the
+        // result is identical to the previous implementation.
+        let mut samples: Vec<i64> = Vec::with_capacity(AV_INTERLEAVE_RESERVOIR_SIZE);
+        let (ewma_raw, cumulative_samples, video_pid, audio_pid) = {
+            let state = match self.state.lock() {
+                Ok(g) => g,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            if state.samples.is_empty() {
+                return None;
+            }
+            samples.extend(state.samples.iter().copied());
+            (
+                state.ewma_ms,
+                state.cumulative_samples,
+                state.video_pid,
+                state.audio_pid,
+            )
         };
-        if state.samples.is_empty() {
-            return None;
-        }
+
+        // Short-window p95 is taken over the most recent samples, so it must
+        // be built from the arrival-ordered copy before that copy is sorted.
+        let window_len = samples.len().min(AV_INTERLEAVE_WINDOW_SAMPLES);
+        let mut window: Vec<i64> = samples
+            .iter()
+            .rev()
+            .take(window_len)
+            .map(|s| s.abs())
+            .collect();
 
         // Compute percentiles on absolute values
-        let mut abs_sorted: Vec<i64> = state.samples.iter().map(|s| s.abs()).collect();
+        let mut abs_sorted = samples;
+        for s in abs_sorted.iter_mut() {
+            *s = s.abs();
+        }
         abs_sorted.sort_unstable();
 
         let p50_abs_ms = abs_percentile(&abs_sorted, 50.0);
@@ -222,27 +339,18 @@ impl AvInterleaveSampler {
         let p99_abs_ms = abs_percentile(&abs_sorted, 99.0);
         let max_abs_ms = *abs_sorted.last().unwrap_or(&0);
 
-        // Short-window p95
-        let window_len = abs_sorted.len().min(AV_INTERLEAVE_WINDOW_SAMPLES);
         let window_p95_abs_ms = if window_len >= 2 {
-            let mut window: Vec<i64> = state
-                .samples
-                .iter()
-                .rev()
-                .take(window_len)
-                .map(|s| s.abs())
-                .collect();
             window.sort_unstable();
             abs_percentile(&window, 95.0)
         } else {
             p95_abs_ms
         };
 
-        let ewma_ms = state.ewma_ms.map(|e| e.round() as i64).unwrap_or(0);
+        let ewma_ms = ewma_raw.map(|e| e.round() as i64).unwrap_or(0);
 
         Some(AvInterleaveStats {
-            samples: state.samples.len() as u64,
-            cumulative_samples: state.cumulative_samples,
+            samples: abs_sorted.len() as u64,
+            cumulative_samples,
             ewma_ms,
             p50_abs_ms,
             p95_abs_ms,
@@ -250,8 +358,8 @@ impl AvInterleaveSampler {
             max_abs_ms,
             window_samples: window_len as u64,
             window_p95_abs_ms,
-            video_pid: state.video_pid.unwrap_or(0),
-            audio_pid: state.audio_pid.unwrap_or(0),
+            video_pid: video_pid.unwrap_or(0),
+            audio_pid: audio_pid.unwrap_or(0),
         })
     }
 
@@ -861,6 +969,89 @@ mod tests {
         assert_eq!(snap2.video_pid, 0x200);
         assert_eq!(snap2.audio_pid, 0x201);
         assert_eq!(snap2.samples, 2);
+    }
+
+    /// Clear PUSI on an otherwise-valid PES packet. The lock-free triage in
+    /// `observe_packet` rejects non-PUSI packets before taking the mutex, on
+    /// the grounds that every branch downstream is PUSI-guarded and so such
+    /// a packet could not have changed anything anyway. This pins that
+    /// equivalence: if the triage ever became more aggressive than the
+    /// branches it stands in for, these samples would go missing.
+    fn clear_pusi(mut pkt: [u8; TS]) -> [u8; TS] {
+        pkt[1] &= !0x40;
+        pkt
+    }
+
+    #[test]
+    fn non_pusi_packets_record_nothing() {
+        let s = AvInterleaveSampler::new();
+        let (video_pid, audio_pid, pmt_pid) = (0x100, 0x101, 0x1000);
+
+        s.observe_packet(&build_pat(pmt_pid, 0));
+        s.observe_packet(&build_pmt(pmt_pid, 0, video_pid, 0x1B, audio_pid, 0x0F));
+
+        // Continuation packets on the tracked PIDs: no PUSI, no PES header,
+        // therefore no sample — before and after the triage change alike.
+        s.observe_packet(&clear_pusi(build_pes_with_pts(video_pid, 90_000)));
+        s.observe_packet(&clear_pusi(build_pes_with_pts(audio_pid, 90_000)));
+        assert!(
+            s.snapshot().is_none(),
+            "non-PUSI packets must not produce samples"
+        );
+
+        // The same two packets WITH PUSI do produce one.
+        s.observe_packet(&build_pes_with_pts(video_pid, 90_000));
+        s.observe_packet(&build_pes_with_pts(audio_pid, 90_000));
+        assert_eq!(s.snapshot().expect("sample").samples, 1);
+    }
+
+    #[test]
+    fn untracked_pid_records_nothing() {
+        let s = AvInterleaveSampler::new();
+        let (video_pid, audio_pid, pmt_pid) = (0x100, 0x101, 0x1000);
+
+        s.observe_packet(&build_pat(pmt_pid, 0));
+        s.observe_packet(&build_pmt(pmt_pid, 0, video_pid, 0x1B, audio_pid, 0x0F));
+
+        // A PID the PMT never announced — triage drops it without locking.
+        s.observe_packet(&build_pes_with_pts(0x1FF, 90_000));
+        s.observe_packet(&build_pes_with_pts(0x2FF, 180_000));
+        assert!(s.snapshot().is_none());
+    }
+
+    /// The triage hint is a cache of `pmt_pid` / `video_pid` / `audio_pid`.
+    /// A PMT that re-points the ES PIDs must republish it, or the sampler
+    /// goes permanently deaf on the new PIDs — a failure that would surface
+    /// as "no samples", not as an error.
+    #[test]
+    fn triage_hint_follows_a_pmt_repoint() {
+        let s = AvInterleaveSampler::new();
+        let pmt_pid = 0x1000;
+
+        s.observe_packet(&build_pat(pmt_pid, 0));
+        s.observe_packet(&build_pmt(pmt_pid, 0, 0x100, 0x1B, 0x101, 0x0F));
+        s.observe_packet(&build_pes_with_pts(0x100, 90_000));
+        s.observe_packet(&build_pes_with_pts(0x101, 90_000));
+        assert_eq!(s.snapshot().expect("first").samples, 1);
+
+        // Version bump moving both ES onto new PIDs.
+        s.observe_packet(&build_pmt(pmt_pid, 1, 0x200, 0x1B, 0x201, 0x0F));
+        s.observe_packet(&build_pes_with_pts(0x200, 90_000));
+        s.observe_packet(&build_pes_with_pts(0x201, 90_000));
+
+        let snap = s.snapshot().expect("after repoint");
+        assert_eq!(snap.video_pid, 0x200);
+        assert_eq!(snap.audio_pid, 0x201);
+        assert_eq!(snap.samples, 2, "new PIDs must still be sampled");
+
+        // And the PIDs it used to follow are now untracked.
+        s.observe_packet(&build_pes_with_pts(0x100, 900_000));
+        s.observe_packet(&build_pes_with_pts(0x101, 900_000));
+        assert_eq!(
+            s.snapshot().expect("unchanged").samples,
+            2,
+            "stale PIDs must stop contributing"
+        );
     }
 
     #[test]

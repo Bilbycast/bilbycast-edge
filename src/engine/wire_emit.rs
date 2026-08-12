@@ -771,6 +771,10 @@ pub fn spawn_wire_emitter(
     } else {
         DejitterConfig::disabled()
     };
+    // Same partition as `dejitter` above, and for the same underlying
+    // reason: `Lossless` is compressed MPEG-TS, `EtfEligible` is ST 2110
+    // essence. See `EmitterCfg::carries_ts`.
+    let carries_ts = matches!(pacing, WirePacingClass::Lossless);
     std::thread::Builder::new()
         .name(format!("wire-emit-{}", id))
         .spawn(move || {
@@ -795,7 +799,7 @@ pub fn spawn_wire_emitter(
                 sched_fifo,
                 pinned_to,
             );
-            run_emitter(thread_id, socket, dest, EmitterCfg { anchor, releaser, dejitter, epoch_offset_ns, epoch_anchor, epoch_anchor_cell, stats: stats_for_thread, cancel, rx });
+            run_emitter(thread_id, socket, dest, EmitterCfg { anchor, releaser, dejitter, epoch_offset_ns, epoch_anchor, epoch_anchor_cell, stats: stats_for_thread, carries_ts, cancel, rx });
         })
         .expect("wire-emit thread spawn");
     tx
@@ -1855,6 +1859,33 @@ struct EmitterCfg {
     epoch_anchor: Option<crate::engine::epoch_lock::SourceAnchor>,
     epoch_anchor_cell: Option<Arc<crate::engine::epoch_lock::EpochAnchorCell>>,
     stats: Arc<OutputStatsAccumulator>,
+    /// Whether this output's payload is MPEG-TS, and therefore whether the
+    /// A/V mux-interleave sampler should be fed at all.
+    ///
+    /// Derived from [`WirePacingClass`], which already draws exactly this
+    /// line: `Lossless` is compressed MPEG-TS (UDP / RTP / SMPTE 302M),
+    /// `EtfEligible` is ST 2110 essence (-20/-23 video, -30/-31 audio,
+    /// -40 ANC). It is deliberately NOT derived from `AnchorSource`, which
+    /// does not partition the same way — ST 2110-30/-31/-40 are spawned
+    /// with `AnchorSource::Pcr` (`st2110_io.rs:469`, `:924`), so an anchor
+    /// test would leave four of the five non-TS output types feeding the
+    /// sampler.
+    ///
+    /// Without this gate the emitter walks *every* payload in 188-byte
+    /// windows and calls `observe_av_interleave_packet` on each; the
+    /// sampler's only rejection test is a first-byte `0x47` compare
+    /// (`stats::av_interleave::observe_packet`), which roughly 1 in 256
+    /// windows of uncompressed video passes by chance. On ST 2110-20/-23
+    /// that is both a false sample injected into an operator-facing metric
+    /// and a lock acquisition on a SCHED_FIFO thread.
+    ///
+    /// It is also a **soundness** precondition, not just a cost one: an
+    /// ST 2110-23 output hands one `Arc<OutputStatsAccumulator>` to every
+    /// one of its 2..=16 sub-stream emitters (`st2110_video_io.rs:1931`),
+    /// so the sampler can be entered concurrently from several OS threads.
+    /// This gate is what makes each remaining (Lossless) sampler
+    /// single-writer.
+    carries_ts: bool,
     cancel: CancellationToken,
     rx: WireTxReceiver,
 }
@@ -1874,6 +1905,7 @@ fn run_emitter(
         epoch_anchor,
         epoch_anchor_cell,
         stats,
+        carries_ts,
         cancel,
         rx,
     } = params;
@@ -2156,13 +2188,17 @@ fn run_emitter(
                         if let Some(pcr) = entry.pcr_27mhz {
                             stats.record_pcr_egress(pcr, now_us);
                         }
-                        // A/V interleave: feed every TS packet.
-                        let ts_start = entry.dg.ts_offset.min(entry.dg.bytes.len());
-                        let ts_data = &entry.dg.bytes[ts_start..];
-                        let mut off = 0;
-                        while off + 188 <= ts_data.len() {
-                            stats.observe_av_interleave_packet(&ts_data[off..off + 188]);
-                            off += 188;
+                        // A/V interleave: feed every TS packet. Skipped
+                        // entirely on non-TS outputs — see
+                        // `EmitterCfg::carries_ts`.
+                        if carries_ts {
+                            let ts_start = entry.dg.ts_offset.min(entry.dg.bytes.len());
+                            let ts_data = &entry.dg.bytes[ts_start..];
+                            let mut off = 0;
+                            while off + 188 <= ts_data.len() {
+                                stats.observe_av_interleave_packet(&ts_data[off..off + 188]);
+                                off += 188;
+                            }
                         }
                     }
                     stats
@@ -2269,12 +2305,14 @@ fn run_emitter(
                         stats.record_pcr_egress(pcr, crate::util::time::now_us());
                     }
                     // A/V interleave: feed every TS packet.
-                    let ts_start = dg.ts_offset.min(dg.bytes.len());
-                    let ts_data = &dg.bytes[ts_start..];
-                    let mut off = 0;
-                    while off + 188 <= ts_data.len() {
-                        stats.observe_av_interleave_packet(&ts_data[off..off + 188]);
-                        off += 188;
+                    if carries_ts {
+                        let ts_start = dg.ts_offset.min(dg.bytes.len());
+                        let ts_data = &dg.bytes[ts_start..];
+                        let mut off = 0;
+                        while off + 188 <= ts_data.len() {
+                            stats.observe_av_interleave_packet(&ts_data[off..off + 188]);
+                            off += 188;
+                        }
                     }
                 }
                 Err(e) => {
