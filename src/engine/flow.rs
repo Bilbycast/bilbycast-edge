@@ -940,6 +940,8 @@ impl FlowRuntime {
                                 },
                             ),
                         );
+                        let demuxer_events = event_sender.clone();
+                        let demuxer_flow_id = config.config.id.clone();
                         let demuxer_handle = flow_manager.acquire_demuxer(
                             iid,
                             move |rx, cancel| {
@@ -949,6 +951,8 @@ impl FlowRuntime {
                                     bus_for_demuxer,
                                     cancel,
                                     stub_counters,
+                                    demuxer_events,
+                                    demuxer_flow_id,
                                 ))
                             },
                         );
@@ -3980,6 +3984,8 @@ pub(crate) fn spawn_input_runtime(
         let bus_clone = bus.clone();
         let pic = per_input_counters.clone();
         let input_id_for_demuxer = input_id.clone();
+        let demuxer_events = ctx.event_sender.clone();
+        let demuxer_flow_id = ctx.flow_id.to_string();
         let demuxer_handle = ctx.flow_manager.acquire_demuxer(
             &input_id,
             move |rx, cancel| {
@@ -3989,6 +3995,8 @@ pub(crate) fn spawn_input_runtime(
                     bus_clone,
                     cancel,
                     pic,
+                    demuxer_events,
+                    demuxer_flow_id,
                 ))
             },
         );
@@ -5566,6 +5574,8 @@ fn spawn_ts_es_demuxer_consumer(
     bus: Arc<NodeEsBus>,
     cancel: CancellationToken,
     per_input_counters: Arc<crate::stats::collector::PerInputCounters>,
+    event_sender: EventSender,
+    flow_id: String,
 ) -> JoinHandle<()> {
     // Stage 2 of the data-plane redesign: run the demuxer on a
     // dedicated SCHED_FIFO OS thread with its own
@@ -5581,7 +5591,8 @@ fn spawn_ts_es_demuxer_consumer(
             "BILBYCAST_PID_BUS_CPUS",
         ),
         async move {
-            let mut demuxer = TsEsDemuxer::new(input_id_for_demuxer.clone(), bus);
+            let mut demuxer = TsEsDemuxer::new(input_id_for_demuxer.clone(), bus)
+                .with_events(event_sender, flow_id);
             loop {
                 tokio::select! {
                     biased;
