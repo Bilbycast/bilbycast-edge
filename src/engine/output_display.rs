@@ -804,6 +804,7 @@ async fn run_display_output(
     let display_prime_scanout_failed = Arc::clone(&prime_scanout_failed);
     let display_prime_cache_stale = Arc::clone(&prime_cache_stale);
     let display_configured_lead_ms = config.present_lead_ms;
+    let display_vblank_snap = config.present_vblank_snap.unwrap_or(false);
     #[cfg(feature = "rga-transfer")]
     let display_rga_transfer_active = Arc::clone(&rga_transfer_active);
     // Independent DRM-master release handle (a dup of the card fd) captured
@@ -818,6 +819,7 @@ async fn run_display_output(
             display_clock,
             display_counters,
             display_configured_lead_ms,
+            display_vblank_snap,
             display_cancel,
             display_output_stats,
             decoder_kind_label,
@@ -4621,6 +4623,63 @@ const RKMPP_PRESENT_LEAD_MS: u64 = 200;
 /// restart where a config edit restarts only the output, unvalidated, and
 /// silently shadowed by any output that sets the field. The per-decoder
 /// default already covers the case it was reaching for.
+/// Round a present target up to the next real vblank instant (#112, #115).
+///
+/// The wall-clock target free-runs against the scanout raster: source and
+/// panel are independent crystals (~33 ppm apart on this fleet), so the target
+/// walks through a whole vblank every ~10 minutes. Whenever it passes close to
+/// a boundary, sub-millisecond scheduling noise decides which of two adjacent
+/// vblanks the flip lands on, and the panel shows one frame for one vblank and
+/// the next for three. Nothing is dropped, so every loss counter reads clean.
+///
+/// Anchoring on the kernel's own last flip timestamp and stepping in whole
+/// vblank periods makes every target a grid point with full margin on both
+/// sides. The drift is not corrected — it cannot be, the crystals differ — it
+/// is *absorbed*, surfacing as one whole-vblank step per beat period rather
+/// than continuous sub-frame slide.
+///
+/// Returns `None` when the flip clock is unusable (no flip completed yet, no
+/// period available, or a target behind the anchor), leaving the caller on its
+/// existing wall-clock path rather than on a guess. Deliberately does **not**
+/// extrapolate past `SNAP_MAX_VBLANKS_AHEAD`: far from the anchor the accrued
+/// error in the period estimate exceeds what snapping buys.
+///
+/// Rounding to nearest rather than up is load-bearing, not a detail — see the
+/// comment at the rounding step. A `div_ceil` version of this measured
+/// *better* than baseline on the mean (95.3% vs 90.7%) while introducing
+/// twice-per-beat bursts of 350–400 late frames that the baseline never had.
+fn snap_target_to_vblank(kms: &KmsDisplay, raw_target_ns: u64) -> Option<u64> {
+    const SNAP_MAX_VBLANKS_AHEAD: u64 = 16;
+
+    let flip = kms.last_flip()?;
+    let period_ns = kms.vblank_period_ns()?;
+    if period_ns == 0 {
+        return None;
+    }
+    let anchor_ns = u64::try_from(flip.timestamp.as_nanos()).ok()?;
+    // Target already behind the last flip — the caller is catching up, and the
+    // grid is not the constraint. Leave it alone.
+    let ahead_ns = raw_target_ns.checked_sub(anchor_ns)?;
+    // Round to *nearest*, not up. Measured on RK3588: rounding up cost a mean
+    // half-vblank (~10 ms at 50 Hz) of permanent latency debt, which ate into
+    // the presentation lead until frames began arriving with no slack — 350+
+    // `present_no_sleep` per minute, twice per beat period. Worse, `ceil` puts
+    // the decision boundary *exactly on a grid point*, which is where the
+    // target dwells while the beat walks it across the raster, so sub-ms noise
+    // flipped the choice between adjacent vblanks precisely when it mattered
+    // most.
+    //
+    // Nearest costs zero mean latency and moves the unstable point to the
+    // midpoint between grid points, where a flip changes which vblank is
+    // targeted but the target is a half-period away from either edge — the
+    // furthest it can be from a boundary.
+    let vblanks = (ahead_ns + period_ns / 2) / period_ns;
+    if vblanks > SNAP_MAX_VBLANKS_AHEAD {
+        return None;
+    }
+    anchor_ns.checked_add(vblanks.checked_mul(period_ns)?)
+}
+
 fn display_lead_ms(
     counters: &DisplayStatsCounters,
     configured: Option<u32>,
@@ -4661,6 +4720,7 @@ fn display_loop(
     clock: Arc<AudioClock>,
     counters: Arc<DisplayStatsCounters>,
     configured_lead_ms: Option<u32>,
+    vblank_snap: bool,
     cancel: CancellationToken,
     output_stats: Arc<OutputStatsAccumulator>,
     decoder_kind_label: &'static str,
@@ -5411,8 +5471,13 @@ fn display_loop(
                 // slop of `std::thread::sleep` on SCHED_OTHER, which at
                 // 60 Hz can push the next page-flip a full vblank late on
                 // frames whose target sits near a vblank boundary.
-                let target_ns = display_monotonic_now_ns()
+                let raw_target_ns = display_monotonic_now_ns()
                     .saturating_add(sleep_ms.saturating_mul(1_000_000));
+                let target_ns = if vblank_snap {
+                    snap_target_to_vblank(&kms, raw_target_ns).unwrap_or(raw_target_ns)
+                } else {
+                    raw_target_ns
+                };
                 display_sleep_until_monotonic_ns(target_ns);
             }
         }

@@ -590,6 +590,12 @@ pub struct KmsDisplay {
     anchor_seq: AtomicU32,
     anchor_ts_ns: AtomicU64,
     flips_since_anchor: AtomicU64,
+    /// Vblank period in ns as *measured* from flip timestamps, or 0 before the
+    /// first measurement window completes. Preferred over the mode's
+    /// advertised refresh because panels are not on their nominal rate — this
+    /// fleet's sit between −54.69 and +64.32 ppm, and it is exactly that error
+    /// which walks presentation across the raster.
+    measured_vblank_ns: AtomicU64,
     /// PRIME scanout state — set when `present_prime` has flipped a
     /// VAAPI-decoded surface onto the CRTC. `None` while the CPU-blit
     /// path is active. Holding the previous-frame keepalive here means
@@ -890,6 +896,7 @@ impl KmsDisplay {
             anchor_seq: AtomicU32::new(0),
             anchor_ts_ns: AtomicU64::new(0),
             flips_since_anchor: AtomicU64::new(0),
+            measured_vblank_ns: AtomicU64::new(0),
             prime_state: None,
             prime_fb_cache: std::collections::HashMap::new(),
             prime_fb_cache_order: std::collections::VecDeque::new(),
@@ -4037,6 +4044,12 @@ impl KmsDisplay {
                 let vblanks = u64::from(p.frame.wrapping_sub(anchor_seq));
                 let span_ns = ts_ns.saturating_sub(anchor_ts);
                 if vblanks > 0 && span_ns > 0 {
+                    // Endpoint measurement: one timestamp's jitter spread over
+                    // the whole window, so accuracy improves with window
+                    // length rather than as sqrt(n). Over ~24 s that resolves
+                    // single-ppm offsets.
+                    self.measured_vblank_ns
+                        .store(span_ns / vblanks, Ordering::Relaxed);
                     let period_us = span_ns as f64 / 1_000.0 / vblanks as f64;
                     // Debug, not info: this is a per-node calibration figure,
                     // not an event. It exists so the "is this driver honest?"
@@ -4061,6 +4074,23 @@ impl KmsDisplay {
         self.last_flip_ts_ns.store(ts_ns, Ordering::Relaxed);
         // Released last so a reader that sees `valid` also sees both fields.
         self.last_flip_valid.store(true, Ordering::Release);
+    }
+
+    /// Vblank period in nanoseconds — measured if a window has completed,
+    /// otherwise derived from the mode's advertised refresh.
+    ///
+    /// Returns `None` when the mode reports no refresh rate and nothing has
+    /// been measured yet, so callers must keep their existing timing path
+    /// rather than divide by a guess.
+    pub fn vblank_period_ns(&self) -> Option<u64> {
+        let measured = self.measured_vblank_ns.load(Ordering::Relaxed);
+        if measured > 0 {
+            return Some(measured);
+        }
+        match self.mode.vrefresh() {
+            0 => None,
+            hz => Some(1_000_000_000 / u64::from(hz)),
+        }
     }
 
     /// Restart the vblank-clock measurement window at this flip.

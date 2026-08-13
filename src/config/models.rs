@@ -6814,6 +6814,32 @@ pub struct DisplayOutputConfig {
     /// position and ignores this entirely.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub present_lead_ms: Option<u32>,
+
+    /// Snap each frame's present instant to the panel's real vblank grid.
+    ///
+    /// `present_lead_ms` fixes frames arriving *late*. This fixes a different
+    /// fault that survives it (#112): the present target free-runs against the
+    /// raster, so when it drifts near a vblank boundary, sub-millisecond
+    /// scheduling noise decides which of two adjacent vblanks catches the
+    /// flip. The panel then shows one frame for a single vblank and the next
+    /// for three — balanced short/long pairs, nothing dropped, every loss
+    /// counter clean.
+    ///
+    /// The drift is not removable: source and panel are independent crystals.
+    /// Measured on this fleet the difference is ~33 ppm, which walks the phase
+    /// through a whole vblank every ~10 minutes. Snapping *absorbs* it — the
+    /// target is rounded up to a true vblank instant taken from the kernel's
+    /// own flip timestamps, so every present aims at a grid point with full
+    /// margin either side, and the accumulated drift lands as one whole-vblank
+    /// step per beat period instead of continuous sub-frame slide.
+    ///
+    /// Requires the driver to report honest flip timestamps; where it does
+    /// not, the resolver falls back to the previous wall-clock behaviour
+    /// automatically. Applies only to outputs with **no audio device** — the
+    /// audio-master path paces against ALSA playout and has no target of its
+    /// own to snap. Unset defaults to **off** pending fleet validation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub present_vblank_snap: Option<bool>,
 }
 
 fn default_audio_channel_pair() -> [u8; 2] {
