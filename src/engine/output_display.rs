@@ -4649,14 +4649,23 @@ const RKMPP_PRESENT_LEAD_MS: u64 = 200;
 /// *better* than baseline on the mean (95.3% vs 90.7%) while introducing
 /// twice-per-beat bursts of 350–400 late frames that the baseline never had.
 fn snap_target_to_vblank(kms: &KmsDisplay, raw_target_ns: u64) -> Option<u64> {
-    const SNAP_MAX_VBLANKS_AHEAD: u64 = 16;
-
     let flip = kms.last_flip()?;
     let period_ns = kms.vblank_period_ns()?;
+    let anchor_ns = u64::try_from(flip.timestamp.as_nanos()).ok()?;
+    snap_to_grid(anchor_ns, period_ns, raw_target_ns)
+}
+
+/// The arithmetic half of [`snap_target_to_vblank`], split out so it can be
+/// tested without a DRM device.
+///
+/// `anchor_ns` is the instant of a completed flip and `period_ns` the vblank
+/// period; the returned instant is always a point on that grid.
+fn snap_to_grid(anchor_ns: u64, period_ns: u64, raw_target_ns: u64) -> Option<u64> {
+    const SNAP_MAX_VBLANKS_AHEAD: u64 = 16;
+
     if period_ns == 0 {
         return None;
     }
-    let anchor_ns = u64::try_from(flip.timestamp.as_nanos()).ok()?;
     // Target already behind the last flip — the caller is catching up, and the
     // grid is not the constraint. Leave it alone.
     let ahead_ns = raw_target_ns.checked_sub(anchor_ns)?;
@@ -4673,7 +4682,17 @@ fn snap_target_to_vblank(kms: &KmsDisplay, raw_target_ns: u64) -> Option<u64> {
     // midpoint between grid points, where a flip changes which vblank is
     // targeted but the target is a half-period away from either edge — the
     // furthest it can be from a boundary.
-    let vblanks = (ahead_ns + period_ns / 2) / period_ns;
+    //
+    // `.max(1)` is not defensive tidying — without it this is broken at 1:1.
+    // The anchor is a flip that has *already completed*, so the earliest
+    // instant anything can be presented at is one whole vblank later. At 25p
+    // on 50 Hz targets sit ~2 vblanks out and the question never arises; at
+    // **50p on 50 Hz they sit ~1 vblank out**, and any jitter that puts a
+    // target under half a period rounds it to zero — collapsing the target
+    // onto the anchor, an instant already in the past. The absolute sleep
+    // then returns immediately and the frame is presented unpaced, which is
+    // precisely the fault this function exists to prevent.
+    let vblanks = ((ahead_ns + period_ns / 2) / period_ns).max(1);
     if vblanks > SNAP_MAX_VBLANKS_AHEAD {
         return None;
     }
@@ -6504,6 +6523,69 @@ mod tests {
             RKMPP_PRESENT_LEAD_MS,
             "the shipped default must not be clamped at the seed period"
         );
+    }
+
+    // ── vblank snapping (issue #115) ──────────────────────────────────
+
+    const P50: u64 = 20_000_000; // 50 Hz vblank period, ns
+
+    #[test]
+    fn snap_rounds_to_the_nearest_grid_point_not_upward() {
+        // Just past a grid point rounds back to it; rounding up would add a
+        // near-whole vblank of latency for a sub-millisecond overshoot.
+        assert_eq!(snap_to_grid(0, P50, 2 * P50 + 1_000_000), Some(2 * P50));
+        // Just short of one rounds up to it.
+        assert_eq!(snap_to_grid(0, P50, 3 * P50 - 1_000_000), Some(3 * P50));
+    }
+
+    /// Regression test for the 1:1 case (50p on a 50 Hz panel).
+    ///
+    /// The anchor is a flip that has already completed, so nothing can be
+    /// presented earlier than one vblank later. A target under half a period
+    /// ahead must still resolve to the *next* vblank — not to the anchor,
+    /// which is in the past and would be presented immediately and unpaced.
+    #[test]
+    fn snap_never_targets_the_anchor_itself() {
+        let anchor = 1_000_000_000;
+        for ahead_ns in [0, 1, P50 / 4, P50 / 2 - 1] {
+            let got = snap_to_grid(anchor, P50, anchor + ahead_ns);
+            assert_eq!(
+                got,
+                Some(anchor + P50),
+                "target {ahead_ns} ns ahead must land on the next vblank, not the anchor"
+            );
+            assert!(got.unwrap() > anchor, "snapped target must be in the future");
+        }
+    }
+
+    #[test]
+    fn snap_declines_rather_than_extrapolating_far_from_the_anchor() {
+        // Beyond the ceiling the accrued error in the period estimate exceeds
+        // what snapping buys, so the caller keeps its wall-clock target.
+        assert_eq!(snap_to_grid(0, P50, 17 * P50), None);
+        assert!(snap_to_grid(0, P50, 16 * P50).is_some());
+    }
+
+    #[test]
+    fn snap_declines_on_an_unusable_clock() {
+        // Target behind the anchor: the caller is catching up, leave it alone.
+        assert_eq!(snap_to_grid(1_000_000_000, P50, 999_000_000), None);
+        // No period available.
+        assert_eq!(snap_to_grid(0, 0, P50), None);
+    }
+
+    #[test]
+    fn snap_output_is_always_on_the_grid() {
+        let anchor = 12_345_678_901;
+        for k in 1..=16u64 {
+            let target = anchor + k * P50 + 3_000_000; // offset off-grid
+            let snapped = snap_to_grid(anchor, P50, target).expect("within ceiling");
+            assert_eq!(
+                (snapped - anchor) % P50,
+                0,
+                "snapped instant must be a whole number of vblanks from the anchor"
+            );
+        }
     }
 
     // ── HW re-promotion backoff (issue #97) ───────────────────────────
