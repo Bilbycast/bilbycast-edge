@@ -17,6 +17,8 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use drm::buffer::{Buffer, DrmFourcc, DrmModifier, PlanarBuffer};
@@ -532,6 +534,32 @@ struct YuvOverlay {
     zpos_value: u64,
 }
 
+/// The kernel's own record of a completed page flip.
+///
+/// `DRM_EVENT_FLIP_COMPLETE` carries the vblank the flip actually landed on
+/// and the instant that vblank occurred. Both are measured by the display
+/// hardware, not inferred in userspace, so they are the only trustworthy view
+/// of the scanout raster available to this process.
+///
+/// This matters because the alternative — timestamping in userspace after
+/// `poll()` returns and the event queue is drained — folds scheduler wake-up
+/// latency, poll granularity and drain time into the number. On RK3588 the
+/// real vblank interval measures 20 000.7 µs with ~50 µs of jitter; a
+/// userspace estimate of the same quantity is noisier by orders of magnitude,
+/// and a control loop fed that estimate chases the noise (see #112, where
+/// exactly that produced a servo which hit its own target perfectly and made
+/// the picture worse).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FlipRecord {
+    /// Vblank sequence number the flip landed on. Monotonic per CRTC, so the
+    /// delta between consecutive flips counts the vblanks that actually
+    /// elapsed — a delta larger than the frame's expected cadence is a
+    /// *missed* vblank, which no existing counter records.
+    pub sequence: u32,
+    /// When that vblank occurred, as reported by the kernel.
+    pub timestamp: Duration,
+}
+
 /// Holder for the active KMS master + double-buffered framebuffers.
 /// One per display output. Created by `output_display` after mode-set;
 /// owns the lifetime of the dumb buffers and the CRTC lease.
@@ -545,6 +573,23 @@ pub struct KmsDisplay {
     // Two framebuffers we ping-pong between for tear-free page flips.
     bufs: [DumbBuffer; 2],
     front_idx: usize,
+    /// Last completed flip as the kernel described it. Written by
+    /// [`Self::wait_page_flip`], read via [`Self::last_flip`].
+    ///
+    /// Atomics rather than a `Cell` so capturing this cannot alter whether
+    /// `KmsDisplay` is `Send`/`Sync` — it moves into the render thread and a
+    /// dup'd fd handle is held elsewhere for teardown, and this change is not
+    /// the place to perturb that.
+    last_flip_seq: AtomicU32,
+    last_flip_ts_ns: AtomicU64,
+    last_flip_valid: AtomicBool,
+    /// Anchor for the periodic vblank-clock measurement in
+    /// [`Self::record_flip`]. Endpoint-style: the error is one timestamp's
+    /// jitter spread over the whole window, so a long window beats averaging
+    /// per-flip deltas.
+    anchor_seq: AtomicU32,
+    anchor_ts_ns: AtomicU64,
+    flips_since_anchor: AtomicU64,
     /// PRIME scanout state — set when `present_prime` has flipped a
     /// VAAPI-decoded surface onto the CRTC. `None` while the CPU-blit
     /// path is active. Holding the previous-frame keepalive here means
@@ -689,6 +734,14 @@ struct DumbBuffer {
 /// loop responsive to its cancel token.
 const FLIP_EVENT_TIMEOUT_MS: u64 = 500;
 
+/// Flips between vblank-clock measurements in [`KmsDisplay::record_flip`].
+///
+/// 600 flips is ~24 s of 25 fps content — long enough that the endpoint
+/// measurement resolves single-ppm crystal offsets (one ~50 µs timestamp
+/// jitter over a 24 s baseline is ~2 ppm), short enough that a node logs a
+/// calibration line a few times a minute at debug level.
+const VBLANK_MEASURE_FLIPS: u64 = 600;
+
 impl KmsDisplay {
     /// Duplicate the card fd into a standalone [`MasterReleaseHandle`] so a
     /// supervisor can drop this display's DRM master even when the thread
@@ -831,6 +884,12 @@ impl KmsDisplay {
             height: h as u32,
             bufs: [a, b],
             front_idx: 0,
+            last_flip_seq: AtomicU32::new(0),
+            last_flip_ts_ns: AtomicU64::new(0),
+            last_flip_valid: AtomicBool::new(false),
+            anchor_seq: AtomicU32::new(0),
+            anchor_ts_ns: AtomicU64::new(0),
+            flips_since_anchor: AtomicU64::new(0),
             prime_state: None,
             prime_fb_cache: std::collections::HashMap::new(),
             prime_fb_cache_order: std::collections::VecDeque::new(),
@@ -3941,12 +4000,100 @@ impl KmsDisplay {
             for ev in events {
                 if let Event::PageFlip(p) = ev
                     && p.crtc == self.crtc {
+                        self.record_flip(&p);
                         return Ok(());
                     }
             }
             // Unrelated event(s) drained ahead of ours — re-poll for the
             // remaining budget.
         }
+    }
+
+    /// Store the kernel's account of a completed flip.
+    ///
+    /// Purely observational: nothing in the present path reads this yet, so
+    /// capturing it cannot change timing behaviour. It exists so the display
+    /// loop can eventually schedule against the real raster instead of a
+    /// wall clock (#115), and so that missed vblanks become countable at all
+    /// — every present-path counter today records a *loss*, and this fault
+    /// class drops nothing.
+    fn record_flip(&self, p: &drm::control::PageFlipEvent) {
+        // Saturating: `Duration::as_nanos` is u128 and the kernel's clock is
+        // CLOCK_MONOTONIC since boot, so this cannot realistically overflow —
+        // but a garbage timestamp from a broken driver must not panic the
+        // render thread.
+        let ts_ns = p.duration.as_nanos().min(u64::MAX as u128) as u64;
+        let flips = self.flips_since_anchor.fetch_add(1, Ordering::Relaxed) + 1;
+
+        match self.last_flip() {
+            // First flip on this CRTC — seed the measurement anchor.
+            None => self.reseat_vblank_anchor(p.frame, ts_ns),
+            Some(_) if flips >= VBLANK_MEASURE_FLIPS => {
+                let anchor_seq = self.anchor_seq.load(Ordering::Relaxed);
+                let anchor_ts = self.anchor_ts_ns.load(Ordering::Relaxed);
+                // `wrapping_sub` because the kernel's vblank sequence is u32
+                // and does wrap — after ~994 days at 50 Hz, but a long-lived
+                // signage node is exactly the deployment that would hit it.
+                let vblanks = u64::from(p.frame.wrapping_sub(anchor_seq));
+                let span_ns = ts_ns.saturating_sub(anchor_ts);
+                if vblanks > 0 && span_ns > 0 {
+                    let period_us = span_ns as f64 / 1_000.0 / vblanks as f64;
+                    // Debug, not info: this is a per-node calibration figure,
+                    // not an event. It exists so the "is this driver honest?"
+                    // question is answerable from a log on hardware nobody has
+                    // measured by hand — a driver reporting zeros or a frozen
+                    // sequence shows up here immediately, and anything derived
+                    // from these timestamps would be worthless on such a host.
+                    tracing::debug!(
+                        measured_vblank_us = period_us,
+                        measured_hz = 1_000_000.0 / period_us,
+                        advertised_hz = self.mode.vrefresh(),
+                        vblanks_per_flip = vblanks as f64 / flips as f64,
+                        "display: vblank clock"
+                    );
+                }
+                self.reseat_vblank_anchor(p.frame, ts_ns);
+            }
+            Some(_) => {}
+        }
+
+        self.last_flip_seq.store(p.frame, Ordering::Relaxed);
+        self.last_flip_ts_ns.store(ts_ns, Ordering::Relaxed);
+        // Released last so a reader that sees `valid` also sees both fields.
+        self.last_flip_valid.store(true, Ordering::Release);
+    }
+
+    /// Restart the vblank-clock measurement window at this flip.
+    fn reseat_vblank_anchor(&self, seq: u32, ts_ns: u64) {
+        self.anchor_seq.store(seq, Ordering::Relaxed);
+        self.anchor_ts_ns.store(ts_ns, Ordering::Relaxed);
+        self.flips_since_anchor.store(0, Ordering::Relaxed);
+    }
+
+    /// The kernel's record of the last completed flip, or `None` if no flip
+    /// has completed on this CRTC yet.
+    ///
+    /// Two things worth knowing before building on this:
+    ///
+    /// 1. **Verify the driver is honest first.** Not every DRM driver reports
+    ///    real vblank timestamps. Measured good on RK3588 (`rockchip-vop2`):
+    ///    sequence strictly +1, no zero timestamps, 20 000.7 µs period with
+    ///    ~50 µs jitter. Check before trusting it on new hardware — a driver
+    ///    that reports zeros or a frozen sequence would silently poison any
+    ///    timing derived from it.
+    /// 2. **`sequence` is the useful field, not `timestamp`.** Expressing
+    ///    presentation in vblank counts is what makes the source-vs-panel
+    ///    crystal difference (33 ppm measured on this fleet) land as one
+    ///    predictable repeated frame per beat, instead of continuous
+    ///    sub-frame slide against a wall clock.
+    pub fn last_flip(&self) -> Option<FlipRecord> {
+        if !self.last_flip_valid.load(Ordering::Acquire) {
+            return None;
+        }
+        Some(FlipRecord {
+            sequence: self.last_flip_seq.load(Ordering::Relaxed),
+            timestamp: Duration::from_nanos(self.last_flip_ts_ns.load(Ordering::Relaxed)),
+        })
     }
 
     /// Destroy every cached imported framebuffer, **without** touching
