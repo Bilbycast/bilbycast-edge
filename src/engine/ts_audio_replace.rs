@@ -57,7 +57,8 @@ use crate::config::models::AudioEncodeConfig;
 use super::audio_encode::AudioCodec;
 use super::audio_transcode::{PlanarAudioTranscoder, TranscodeJson};
 use super::ts_parse::{
-    mpeg2_crc32, parse_pat_programs, ts_has_adaptation, ts_has_payload, ts_payload_offset, ts_pid,
+    mpeg2_crc32, parse_pat_programs, psi_crc_offset, ts_has_adaptation, ts_has_payload,
+    ts_payload_offset, ts_pid,
     ts_pusi, PAT_PID, TS_PACKET_SIZE, TS_SYNC_BYTE,
 };
 
@@ -2129,8 +2130,7 @@ fn rewrite_pmt_audio_stream_type(
         pos += 5 + es_info_len;
     }
 
-    let crc_offset = section_start + 3 + section_length - 4;
-    if crc_offset + 4 <= TS_PACKET_SIZE {
+    if let Some(crc_offset) = psi_crc_offset(section_start, section_length) {
         let crc = mpeg2_crc32(&pkt[section_start..crc_offset]);
         pkt[crc_offset] = (crc >> 24) as u8;
         pkt[crc_offset + 1] = (crc >> 16) as u8;

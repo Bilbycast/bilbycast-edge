@@ -3096,7 +3096,16 @@ async fn execute_command(
             // The manager doesn't have infrastructure secrets (GetConfig strips
             // node credentials, TLS, and tunnel keys), so merge the node's
             // existing secrets into the incoming config before validation.
+            //
+            // Drop anything the manager supplied for the node-local fields
+            // first. `merge_into` only fills an *absent* value, so without this
+            // a push naming `server.auth` explicitly would win and then be
+            // committed wholesale below — letting a compromised manager
+            // disable this node's own API authentication. See
+            // `AppConfig::clear_node_local_secrets` for why the list is
+            // narrow (tunnel keys really are manager-supplied).
             let old_config = app_config.read().await.clone();
+            new_config.clear_node_local_secrets();
             let existing_secrets = SecretsConfig::extract_from(&old_config);
             existing_secrets.merge_into(&mut new_config);
 
