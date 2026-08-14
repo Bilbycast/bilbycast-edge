@@ -6,6 +6,25 @@
 //! Manages the lifecycle of a single WebRTC PeerConnection: ICE, DTLS,
 //! SRTP, and media I/O. Integrates str0m's sans-I/O model with tokio
 //! by driving the UDP socket and str0m poll loop in a select! loop.
+//!
+//! **KNOWN DIVERGENCE FROM THE RELAY'S VENDORED COPY — do not "resync" it
+//! away.** `bilbycast-relay::distribution::webrtc::session` is vendored from
+//! this file and is meant to track it, but it carries one thing this copy does
+//! not: `PeerPin`, an ingress source filter that closes an ICE-Lite
+//! peer-reflexive UDP reflector. In lite mode `is` mints a peer-reflexive
+//! candidate from any STUN Binding Request carrying a valid MESSAGE-INTEGRITY
+//! and nominates it on the sender's own PRIORITY, so a client that completed
+//! one legitimate session (it holds our ice-pwd from the answer) can repoint
+//! the whole SRTP stream at a spoofed address with one ~100-byte datagram.
+//!
+//! This file runs the same state machine in the same ICE-Lite server role from
+//! `engine::input_webrtc` (WHIP ingest) and `engine::output_webrtc` (WHEP
+//! output), so **the reflector is still present here**. It is recorded as
+//! accepted residual risk rather than fixed: the edge's `/whip` and `/whep`
+//! routes sit behind `api::server`'s `auth_middleware`, so exploiting it costs
+//! one valid edge API credential — which any legitimate WHEP viewer of this
+//! edge already holds. Porting `PeerPin` over is the fix; until then a sync in
+//! either direction must carry the relay's control forward, never delete it.
 
 use std::net::SocketAddr;
 use std::sync::Arc;

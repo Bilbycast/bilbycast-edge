@@ -231,6 +231,22 @@ pub struct UdpForwarderStats {
     /// dropped silently with no media. The tunnel manager's stats watchdog
     /// keys its Critical `tunnel_decrypt_failure` event off exactly that shape.
     pub decrypt_errors: AtomicU64,
+    /// Inbound datagrams dropped because their 16-byte `tunnel_id` prefix was
+    /// not this tunnel's.
+    ///
+    /// The prefix rides OUTSIDE the AEAD (`crypto.rs` — the AAD is empty), so
+    /// it is a plaintext routing label, not authentication. A conforming peer
+    /// can never produce a foreign one: both ends of a tunnel carry the same
+    /// id, proven by the QUIC bind (`PeerAuth`) or the native-UDP register
+    /// token, and both carriers forward the framing byte-for-byte. So any count
+    /// here means a mis-routing carrier, a cross-tunnel replay, or a mis-framed
+    /// sender.
+    ///
+    /// Counted rather than logged, deliberately: this is untrusted input on the
+    /// receive path, and a per-datagram log line would let a flood turn
+    /// `RUST_LOG=debug` into a write amplifier — the same reasoning
+    /// `decrypt_errors` next door already follows.
+    pub framing_errors: AtomicU64,
 }
 
 /// Run the UDP forwarder for an **egress** tunnel.
@@ -297,24 +313,41 @@ pub async fn run_egress<L: DatagramLink>(
             // Carrier → Local: receive a framed datagram, decrypt, forward to last-seen local sender
             result = link.recv_datagram() => {
                 let datagram = result?;
-                if let Some((_tid, encrypted_payload)) = protocol::decode_udp_datagram(&datagram) {
-                    let payload = if let Some(ref c) = cipher {
-                        match c.decrypt(encrypted_payload) {
-                            Ok(decrypted) => decrypted,
-                            Err(e) => {
-                                stats.decrypt_errors.fetch_add(1, Ordering::Relaxed);
-                                tracing::debug!(tunnel_id = %tunnel_id, "Decryption error: {e}");
-                                continue;
-                            }
+                let Some((datagram_id, encrypted_payload)) = protocol::decode_udp_datagram(&datagram) else { continue };
+                // Refuse a datagram framed for a DIFFERENT tunnel. This is the
+                // return path of a direct-mode tunnel whose listener already
+                // refuses one (`udp_relay_client::run_native_direct_listener`),
+                // so without it the mirror direction accepts what the peer
+                // rejects. Safe for every conforming peer: both ends of a tunnel
+                // carry one id — the QUIC direct path proves it with
+                // `PeerAuth { tunnel_id }` equality, the native-UDP path with the
+                // register token, and the configuration guide requires the pair
+                // to be provisioned with the same id — and both relay carriers
+                // forward the framing verbatim (bilbycast-relay `session.rs`
+                // "Forward the full datagram (with tunnel_id prefix)" and
+                // `udp_relay.rs`). The relay routes QUIC datagrams on this prefix
+                // alone with no per-datagram bind auth, so the receiving edge is
+                // the only place a re-addressed datagram can be refused.
+                if datagram_id != tunnel_id {
+                    stats.framing_errors.fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
+                let payload = if let Some(ref c) = cipher {
+                    match c.decrypt(encrypted_payload) {
+                        Ok(decrypted) => decrypted,
+                        Err(e) => {
+                            stats.decrypt_errors.fetch_add(1, Ordering::Relaxed);
+                            tracing::debug!(tunnel_id = %tunnel_id, "Decryption error: {e}");
+                            continue;
                         }
-                    } else {
-                        encrypted_payload.to_vec()
-                    };
-                    if let Some(addr) = peer_addr.load() {
-                        let _ = socket.send_to(&payload, addr).await;
-                        stats.packets_received.fetch_add(1, Ordering::Relaxed);
-                        stats.bytes_received.fetch_add(payload.len() as u64, Ordering::Relaxed);
                     }
+                } else {
+                    encrypted_payload.to_vec()
+                };
+                if let Some(addr) = peer_addr.load() {
+                    let _ = socket.send_to(&payload, addr).await;
+                    stats.packets_received.fetch_add(1, Ordering::Relaxed);
+                    stats.bytes_received.fetch_add(payload.len() as u64, Ordering::Relaxed);
                 }
             }
 
@@ -359,23 +392,31 @@ pub async fn run_ingress<L: DatagramLink>(
             // Carrier → Local: receive a framed datagram, decrypt, forward to local app
             result = link.recv_datagram() => {
                 let datagram = result?;
-                if let Some((_tid, encrypted_payload)) = protocol::decode_udp_datagram(&datagram) {
-                    let payload = if let Some(ref c) = cipher {
-                        match c.decrypt(encrypted_payload) {
-                            Ok(decrypted) => decrypted,
-                            Err(e) => {
-                                stats.decrypt_errors.fetch_add(1, Ordering::Relaxed);
-                                tracing::debug!(tunnel_id = %tunnel_id, "Decryption error: {e}");
-                                continue;
-                            }
-                        }
-                    } else {
-                        encrypted_payload.to_vec()
-                    };
-                    let _ = socket.send_to(&payload, forward_addr).await;
-                    stats.packets_received.fetch_add(1, Ordering::Relaxed);
-                    stats.bytes_received.fetch_add(payload.len() as u64, Ordering::Relaxed);
+                let Some((datagram_id, encrypted_payload)) = protocol::decode_udp_datagram(&datagram) else { continue };
+                // Same refusal as `run_egress` above, same safety argument: one
+                // tunnel carries one id at both ends, both carriers forward the
+                // framing verbatim, and the prefix is outside the AEAD so the
+                // receiving edge is the only place a re-addressed datagram can be
+                // refused.
+                if datagram_id != tunnel_id {
+                    stats.framing_errors.fetch_add(1, Ordering::Relaxed);
+                    continue;
                 }
+                let payload = if let Some(ref c) = cipher {
+                    match c.decrypt(encrypted_payload) {
+                        Ok(decrypted) => decrypted,
+                        Err(e) => {
+                            stats.decrypt_errors.fetch_add(1, Ordering::Relaxed);
+                            tracing::debug!(tunnel_id = %tunnel_id, "Decryption error: {e}");
+                            continue;
+                        }
+                    }
+                } else {
+                    encrypted_payload.to_vec()
+                };
+                let _ = socket.send_to(&payload, forward_addr).await;
+                stats.packets_received.fetch_add(1, Ordering::Relaxed);
+                stats.bytes_received.fetch_add(payload.len() as u64, Ordering::Relaxed);
             }
 
             // Local → Carrier: receive return traffic from local app, encrypt, send back
@@ -414,4 +455,163 @@ pub async fn run_ingress<L: DatagramLink>(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tunnel_prefix_tests {
+    use super::*;
+    use tokio::sync::{mpsc, Mutex};
+    use tokio::time::{timeout, Duration};
+
+    const PATIENCE: Duration = Duration::from_secs(2);
+
+    /// An in-memory [`DatagramLink`] so the carrier→local direction can be
+    /// driven with exact bytes and no relay, socket or QUIC endpoint.
+    ///
+    /// `recv_datagram` pends forever once the queue drains (the test keeps the
+    /// sender alive), which is what a quiet carrier looks like — returning an
+    /// error instead would end the forwarder before a negative assertion could
+    /// be made.
+    struct MockLink {
+        rx: Mutex<mpsc::UnboundedReceiver<Bytes>>,
+    }
+
+    impl MockLink {
+        fn new() -> (Self, mpsc::UnboundedSender<Bytes>) {
+            let (tx, rx) = mpsc::unbounded_channel();
+            (Self { rx: Mutex::new(rx) }, tx)
+        }
+    }
+
+    impl DatagramLink for MockLink {
+        fn send_datagram(&self, _data: Bytes) -> Result<()> {
+            Ok(())
+        }
+
+        async fn recv_datagram(&self) -> Result<Bytes> {
+            let mut rx = self.rx.lock().await;
+            match rx.recv().await {
+                Some(b) => Ok(b),
+                // Sender dropped: park rather than error, see the type doc.
+                None => std::future::pending().await,
+            }
+        }
+    }
+
+    /// A datagram framed for a DIFFERENT tunnel must never reach the local
+    /// application.
+    ///
+    /// The 16-byte prefix rides outside the AEAD, and the relay routes purely on
+    /// it with no per-datagram bind auth, so the receiving edge is the only
+    /// place a re-addressed datagram can be refused. The foreign datagram is
+    /// queued FIRST so a leak shows up as the wrong bytes arriving, not as a
+    /// timeout that a slow machine could also produce.
+    #[tokio::test]
+    async fn ingress_drops_a_datagram_framed_for_another_tunnel() {
+        let tunnel_id = Uuid::new_v4();
+        let app = UdpSocket::bind("127.0.0.1:0").await.expect("app bind");
+        let forward_addr = app.local_addr().expect("app addr");
+        let (link, tx) = MockLink::new();
+        let stats = Arc::new(UdpForwarderStats::default());
+        let cancel = CancellationToken::new();
+        let task = tokio::spawn(run_ingress(
+            tunnel_id,
+            forward_addr,
+            link,
+            stats.clone(),
+            cancel.clone(),
+            None,
+        ));
+
+        tx.send(Bytes::from(protocol::encode_udp_datagram(
+            &Uuid::new_v4(),
+            b"foreign",
+        )))
+        .expect("queue foreign");
+        tx.send(Bytes::from(protocol::encode_udp_datagram(
+            &tunnel_id, b"ours",
+        )))
+        .expect("queue ours");
+
+        let mut buf = [0u8; 512];
+        let n = timeout(PATIENCE, app.recv(&mut buf))
+            .await
+            .expect("our own datagram must still be forwarded")
+            .expect("app recv");
+        assert_eq!(
+            &buf[..n],
+            b"ours",
+            "a datagram addressed to another tunnel must not be forwarded"
+        );
+        assert_eq!(stats.framing_errors.load(Ordering::Relaxed), 1);
+        assert_eq!(stats.packets_received.load(Ordering::Relaxed), 1);
+
+        cancel.cancel();
+        let _ = timeout(PATIENCE, task).await;
+    }
+
+    /// The same refusal on the egress return path — the direction that is the
+    /// peer of the hardened direct-mode listener, so without it one end refuses
+    /// a foreign prefix while the other accepts it.
+    #[tokio::test]
+    async fn egress_drops_a_datagram_framed_for_another_tunnel() {
+        let tunnel_id = Uuid::new_v4();
+        // Reserve a port, then let `run_egress` bind it. Losing the race is a
+        // loud bind error, never a silent pass.
+        let local_addr: SocketAddr = {
+            let probe = std::net::UdpSocket::bind("127.0.0.1:0").expect("probe bind");
+            probe.local_addr().expect("probe addr")
+        };
+        let (link, tx) = MockLink::new();
+        let stats = Arc::new(UdpForwarderStats::default());
+        let cancel = CancellationToken::new();
+        let task = tokio::spawn(run_egress(
+            tunnel_id,
+            local_addr,
+            link,
+            stats.clone(),
+            cancel.clone(),
+            None,
+        ));
+
+        // The return path only exists once a local app has sent something. Retry
+        // until the forwarder counts it, which proves both that it has bound the
+        // port and that it has latched us as the local sender — a fixed sleep
+        // would race the bind on a loaded machine.
+        let app = UdpSocket::bind("127.0.0.1:0").await.expect("app bind");
+        let mut buf = [0u8; 512];
+        let deadline = tokio::time::Instant::now() + PATIENCE;
+        while stats.packets_sent.load(Ordering::Relaxed) == 0 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the egress forwarder never picked up a local packet"
+            );
+            let _ = app.send_to(b"outbound", local_addr).await;
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        tx.send(Bytes::from(protocol::encode_udp_datagram(
+            &Uuid::new_v4(),
+            b"foreign",
+        )))
+        .expect("queue foreign");
+        tx.send(Bytes::from(protocol::encode_udp_datagram(
+            &tunnel_id, b"ours",
+        )))
+        .expect("queue ours");
+
+        let n = timeout(PATIENCE, app.recv(&mut buf))
+            .await
+            .expect("our own datagram must still be returned")
+            .expect("app recv");
+        assert_eq!(
+            &buf[..n],
+            b"ours",
+            "a datagram addressed to another tunnel must not be returned to the local app"
+        );
+        assert_eq!(stats.framing_errors.load(Ordering::Relaxed), 1);
+
+        cancel.cancel();
+        let _ = timeout(PATIENCE, task).await;
+    }
 }

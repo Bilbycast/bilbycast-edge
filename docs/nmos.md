@@ -180,6 +180,54 @@ NMOS auth follows a secure-by-default policy tied to the main `auth.enabled` swi
 
 When NMOS auth is active, controllers must obtain a token via `/oauth/token` first, then include `Authorization: Bearer <token>` in all NMOS requests. Both `admin` and `monitor` roles have full access.
 
+## Browser-hosted controllers (`server.nmos_browser_control`)
+
+Auth is a separate axis from **browser** reachability, and the two are often
+confused. `/x-nmos/**` keeps its wildcard `Access-Control-Allow-Origin` so a
+browser-hosted controller can discover the node, and `Accept`, `Content-Type`
+and `Authorization` are always in `Access-Control-Allow-Headers` — without
+`authorization` a browser could not attach a Bearer token and an auth-enabled
+node would be unreachable from one even for a `GET`.
+
+**Connection management from a browser is refused by default.** An IS-05
+`PATCH .../staged` with `activate_immediate` re-points a live sender and
+persists the change, and on the shipped default (`auth.enabled: false`) it is
+unauthenticated — so any web page the operator happened to load could do it.
+`api::server::guard_cross_origin_write` refuses a state-changing request that
+carries browser fetch metadata (`Sec-Fetch-Site` / `-Mode` / `-Dest`, which
+every current browser sends on every request and no native controller sends).
+This is keyed on "a browser issued this" rather than on `Origin` disagreeing
+with the request authority, because under DNS rebinding those two agree.
+
+Native controllers (Sony, Riedel, Lawo, the AMWA testing tool) and `curl` send
+neither header and are unaffected.
+
+To run a browser-hosted controller such as `sony/nmos-js`, list its exact
+origin:
+
+```json
+{
+  "server": {
+    "nmos_browser_control": ["https://nmos-js.example.tv"]
+  }
+}
+```
+
+Listed origins get `PATCH` / `POST` advertised in the NMOS preflight and pass
+the guard. Scheme + authority only — no trailing slash, no path, no wildcard
+(validation rejects all three, because a browser sends only
+`scheme://host[:port]` in `Origin` and anything else would silently never
+match). The list applies to `/x-nmos/**` alone; it never widens `/api/v1`.
+
+Residual risk: this is *mitigated-partially*. IS-05 / IS-08 writes remain
+unauthenticated by specification on auth-off nodes, so anything on the LAN that
+is not a browser can still drive them; and when auth is on, a `monitor`-role
+token is sufficient to re-point a live sender. The AMWA NMOS Testing Tool has
+**not** been run against the method-restricted default policy — its generic
+CORS check expects an `OPTIONS` to advertise the methods a resource supports,
+which the default policy does not do for `.../staged` PATCH.
+`nmos_browser_control` is the supported way to restore that.
+
 ## Backward compatibility
 
 Multi-essence audio + data + video resources are additive — old NMOS

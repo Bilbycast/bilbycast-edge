@@ -537,6 +537,30 @@ pub struct ServerConfig {
     /// When absent or `enabled: false`, all endpoints are unauthenticated.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth: Option<crate::api::auth::AuthConfig>,
+    /// Browser origins permitted to drive **NMOS connection management**
+    /// (IS-05 `PATCH .../staged` / `.../activate`, IS-08 `POST /map/*`) from a
+    /// web page.
+    ///
+    /// Absent or empty — the default — refuses every browser-issued NMOS state
+    /// change: a foreign page can re-point a live sender and the change is
+    /// persisted, and NMOS writes are unauthenticated by specification on a
+    /// node with `server.auth` off. Native controllers (Sony, Riedel, Lawo,
+    /// the AMWA testing tool) send no `Origin` and no `Sec-Fetch-*`, so they
+    /// are unaffected either way.
+    ///
+    /// Populate it with the exact origins of the browser-hosted controllers
+    /// you run (`["https://nmos-js.example.tv"]`, scheme + authority, no
+    /// trailing slash, no wildcard). Those origins then get `PATCH` / `POST`
+    /// in the NMOS preflight and pass
+    /// `api::server::guard_cross_origin_write`.
+    ///
+    /// Read once, when the router is built at node start — a pushed change
+    /// therefore lands on the next restart, exactly like `server.listen_addrs`
+    /// and `server.auth`. It is deliberately not re-read per request: the
+    /// router holds the resolved list, so the guard takes no lock on the
+    /// shared config and cannot fail open.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nmos_browser_control: Option<Vec<String>>,
 }
 
 impl ServerConfig {
@@ -576,6 +600,7 @@ impl Default for ServerConfig {
             listen_port: 8080,
             tls: None,
             auth: None,
+            nmos_browser_control: None,
         }
     }
 }

@@ -48,6 +48,11 @@ pub fn validate_config(config: &AppConfig) -> Result<()> {
         parse_listen_addrs(addrs, "server.listen_addrs")?;
     }
 
+    // Browser origins allowed to drive NMOS connection management.
+    if let Some(ref origins) = config.server.nmos_browser_control {
+        validate_browser_origins(origins, "server.nmos_browser_control")?;
+    }
+
     // Node-wide tuning defaults.
     if let Some(ref tuning) = config.tuning {
         validate_node_tuning(tuning)?;
@@ -7447,6 +7452,47 @@ pub fn parse_listen_addrs(entries: &[String], context: &str) -> Result<Vec<std::
     Ok(out)
 }
 
+/// Validate a list of browser origins (RFC 6454 serialisation: `scheme://host`
+/// with an optional `:port`, no path, no trailing slash, no wildcard).
+///
+/// These are compared verbatim against a request's `Origin` header, so a
+/// trailing slash or an embedded path would silently never match — accepting
+/// one would be a config field that looks applied and does nothing, which is
+/// precisely the trap this surface must not repeat.
+pub fn validate_browser_origins(entries: &[String], context: &str) -> Result<()> {
+    const MAX_ORIGINS: usize = 16;
+    if entries.len() > MAX_ORIGINS {
+        bail!("{context}: at most {MAX_ORIGINS} origins may be listed, got {}", entries.len());
+    }
+    for raw in entries {
+        if raw.trim() != raw {
+            bail!("{context}: origin '{raw}' has leading or trailing whitespace");
+        }
+        if raw.is_empty() || raw.len() > 255 {
+            bail!("{context}: origin must be 1..=255 characters, got {}", raw.len());
+        }
+        if raw.contains('*') {
+            bail!(
+                "{context}: origin '{raw}' must name one exact origin — a wildcard \
+                 would readmit every web page the operator loads"
+            );
+        }
+        let Some((scheme, authority)) = raw.split_once("://") else {
+            bail!("{context}: origin '{raw}' must be of the form 'https://host[:port]'");
+        };
+        if scheme != "http" && scheme != "https" {
+            bail!("{context}: origin '{raw}': scheme must be 'http' or 'https'");
+        }
+        if authority.is_empty() || authority.contains('/') {
+            bail!(
+                "{context}: origin '{raw}' must carry a host and no path — a browser \
+                 sends only 'scheme://host[:port]' in Origin, so anything more never matches"
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Validate an `InterfaceBinding`.
 ///
 /// `name` must satisfy the Linux `IFNAMSIZ` constraint (1..=15 bytes,
@@ -8311,6 +8357,34 @@ mod tests {
         AssembledProgram, AssembledStream, AssemblyKind, EssenceKind, FlowAssembly, PcrSource,
         SlotSource, TsPidOverridesEntry, TsPidOverridesMap,
     };
+
+    /// `server.nmos_browser_control` entries are compared verbatim against a
+    /// browser's `Origin` header, which is always `scheme://host[:port]` and
+    /// nothing else. Anything with a path, a trailing slash or a wildcard
+    /// could therefore never match — accepting one would be a config field
+    /// that looks applied and silently does nothing, and it would leave the
+    /// operator believing their controller is authorised when it is not.
+    #[test]
+    fn browser_origins_must_be_an_exact_scheme_and_authority() {
+        let ok = |o: &str| validate_browser_origins(&[o.to_string()], "ctx").is_ok();
+
+        assert!(ok("https://nmos-js.example.tv"));
+        assert!(ok("http://10.0.0.5:8080"));
+        assert!(validate_browser_origins(&[], "ctx").is_ok());
+
+        assert!(!ok("https://nmos-js.example.tv/"), "trailing slash never matches");
+        assert!(!ok("https://nmos-js.example.tv/ui"), "path never matches");
+        assert!(!ok("nmos-js.example.tv"), "scheme is mandatory");
+        assert!(!ok("ftp://nmos-js.example.tv"), "http/https only");
+        assert!(!ok("https://"), "authority is mandatory");
+        assert!(!ok("*"), "a wildcard would readmit every page");
+        assert!(!ok("https://*.example.tv"), "no wildcard subdomains");
+        assert!(!ok(" https://nmos-js.example.tv"), "whitespace never matches");
+        assert!(!ok(""));
+
+        let too_many: Vec<String> = (0..17).map(|i| format!("https://h{i}.example")).collect();
+        assert!(validate_browser_origins(&too_many, "ctx").is_err());
+    }
 
     #[test]
     fn starlink_uplinks_multi_dish_collision_rules() {

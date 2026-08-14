@@ -5,7 +5,10 @@
 //!
 //! Both edges share a 32-byte symmetric key. All tunnel data payloads are
 //! encrypted before sending through the relay. The relay sees only ciphertext
-//! and cannot read or tamper with the traffic.
+//! and cannot read the payload or forge one. It **can** replay, drop, reorder,
+//! truncate and re-address frames undetectably — see
+//! "[What this layer does NOT protect against](#what-this-layer-does-not-protect-against)"
+//! below before concluding that nothing further is needed.
 //!
 //! Wire format per encrypted message:
 //! ```text
@@ -35,6 +38,59 @@
 //! nonce) which eliminates the rotation requirement entirely; that's a
 //! wire-format change and is gated on the next bump of
 //! `TUNNEL_PROTOCOL_VERSION`.
+//!
+//! ## What this layer does NOT protect against
+//!
+//! The AEAD authenticates the payload under a per-message random nonce with an
+//! **empty AAD**, and the 16-byte `tunnel_id` that prefixes every datagram
+//! ([`super::protocol::encode_udp_datagram`]) rides *outside* that
+//! authentication. Two consequences follow. Both are current, deliberate
+//! properties rather than oversights, and closing either one properly is a
+//! wire change that BOTH edges must take in the same release — one end alone
+//! blacks the tunnel out — so both are gated on the next
+//! `TUNNEL_PROTOCOL_VERSION` bump alongside the XChaCha20 move above.
+//!
+//! - **Replay.** There is no sequence number, timestamp or receive window, so a
+//!   captured datagram opens successfully however often it is re-injected.
+//!
+//!   Where the tunnel carries **SRT, RIST or a bond leg**, the payload protocol
+//!   dedups by its own sequence number and a replay is absorbed there. That is
+//!   the load-bearing mitigation, and a window at this layer would duplicate it
+//!   while having to be wide enough to pass genuine reordering — which is
+//!   exactly the width a replay fits through.
+//!
+//!   It does **not** cover two shapes this cipher also protects, and for those
+//!   replay resistance is genuinely absent rather than delegated:
+//!   - A **TCP tunnel** ([`super::tcp_forwarder`], documented in
+//!     [`super`] as camera control / signalling). Nothing dedups at any layer,
+//!     and a replayed chunk does not duplicate a packet — it inserts bytes into
+//!     a byte stream, re-issuing a control command (PTZ, record start/stop) or
+//!     desynchronising a signalling protocol. The relay pipes those bytes, so
+//!     it is squarely inside the stated threat model.
+//!   - A **generic UDP tunnel** carrying raw MPEG-TS or RTP. Nothing restricts
+//!     a UDP tunnel to SRT/RIST — `run_egress` forwards whatever arrives on
+//!     `local_addr` — and a replayed 1316-byte datagram is 7 duplicate TS
+//!     packets and a continuity-counter fault.
+//!
+//!   Closing this properly needs a counter on the wire, so it is gated on the
+//!   next `TUNNEL_PROTOCOL_VERSION` bump; until then it is residual risk, not
+//!   an absent one.
+//! - **Cross-tunnel movement.** With `tunnel_id` outside the AAD, a datagram
+//!   captured on one tunnel can be re-framed with another tunnel's id. It still
+//!   only *opens* on a tunnel that shares the key, and the manager mints a
+//!   distinct random `tunnel_encryption_key` per tunnel, so in a
+//!   manager-provisioned fleet this is confined to hand-written configs that
+//!   reuse one key across tunnels. Independently of the key, every receive path
+//!   now drops a datagram whose prefix is not its own tunnel id —
+//!   [`super::udp_forwarder::run_egress`] / [`super::udp_forwarder::run_ingress`],
+//!   the relayed bond leg, and `udp_relay_client::run_native_direct_listener`
+//!   — counted on `UdpForwarderStats::framing_errors`. That is a plaintext
+//!   routing check, not authentication: it refuses a *mis-addressed* datagram,
+//!   while an attacker who can reach the receive path can trivially write the
+//!   correct 16 bytes.
+//!
+//! Binding `tunnel_id` (and, with a counter on the wire, a receive window) into
+//! the AAD is the complete fix; neither can be made unilaterally.
 
 use anyhow::{Context, Result};
 use ring::aead;

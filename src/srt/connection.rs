@@ -9,6 +9,7 @@ use anyhow::{Context, Result, bail};
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
+use srt_protocol::access_control::StreamIdInfo;
 use srt_protocol::config::{CryptoModeConfig, KeySize, MemberStatus, RetransmitAlgo};
 use srt_transport::{GroupMode, SrtGroup, SrtGroupBuilder, SrtListener, SrtSocket, SrtSocketBuilder};
 
@@ -314,6 +315,58 @@ fn build_listener_builder(p: &SrtConnectionParams) -> srt_transport::SrtListener
     lb
 }
 
+/// Does a caller's presented `stream_id` satisfy the configured one?
+///
+/// Compared per the **SRT Access Control spec**, not byte-for-byte. Both
+/// `docs/CONFIGURATION.md` and `docs/supported-protocols.md` promise that
+/// `stream_id` "supports plain strings or the structured
+/// `#!::r=name,m=publish,u=user` format", and `StreamIdInfo::parse` maps a bare
+/// string onto `resource` — so a configured `mystream` matches a caller sending
+/// `#!::r=mystream,m=publish`, which is what OBS Studio and ffmpeg emit once a
+/// stream key is set, and vice versa.
+///
+/// That promise cost nothing while this filter was dead: until the 2026-08
+/// libsrt-rs fix, `srt_listen_callback` was registered *after* `srt_listen`,
+/// which libsrt refuses silently, so no access-control policy on any SRT
+/// listener ever ran. Now that it does run, a byte-for-byte comparison would
+/// take a working `#!::`-emitting ingest dark on upgrade.
+///
+/// This only ever **widens** the match — an exact match is still a match — so
+/// it cannot reject a caller that the verbatim comparison would have admitted.
+fn stream_id_matches(expected: &str, presented: &str) -> bool {
+    if presented == expected {
+        return true;
+    }
+    let want = StreamIdInfo::parse(expected);
+    let got = StreamIdInfo::parse(presented);
+    want.resource.is_some() && want.resource == got.resource
+}
+
+/// Install the `stream_id` access-control filter on a listener builder, if one
+/// is configured. Shared by every listener bind path so the two cannot drift.
+fn apply_stream_id_access_control(
+    mut lb: srt_transport::SrtListenerBuilder,
+    p: &SrtConnectionParams,
+) -> srt_transport::SrtListenerBuilder {
+    if let Some(expected_sid) = p.stream_id
+        && !expected_sid.is_empty()
+    {
+        let expected = expected_sid.to_string();
+        lb = lb.access_control_fn(move |info| {
+            if stream_id_matches(&expected, &info.stream_id) {
+                Ok(())
+            } else {
+                tracing::warn!(
+                    "SRT listener: rejecting connection from {} — stream_id {:?} does not match expected {:?}",
+                    info.peer_addr, info.stream_id, expected
+                );
+                Err(srt_protocol::error::RejectReason::Peer)
+            }
+        });
+    }
+    lb
+}
+
 /// Connect an SRT socket based on mode (caller / listener).
 pub async fn connect_srt(p: &SrtConnectionParams<'_>) -> Result<Arc<SrtSocket>> {
     match p.mode {
@@ -349,24 +402,7 @@ pub async fn connect_srt(p: &SrtConnectionParams<'_>) -> Result<Arc<SrtSocket>> 
 
             tracing::info!("SRT listener waiting on {}", local_addr_str);
 
-            let mut listener_builder = build_listener_builder(p);
-
-            // Add access control for stream_id filtering on listener
-            if let Some(expected_sid) = p.stream_id
-                && !expected_sid.is_empty() {
-                    let expected = expected_sid.to_string();
-                    listener_builder = listener_builder.access_control_fn(move |info| {
-                        if info.stream_id == expected {
-                            Ok(())
-                        } else {
-                            tracing::warn!(
-                                "SRT listener: rejecting connection from {} — stream_id {:?} does not match expected {:?}",
-                                info.peer_addr, info.stream_id, expected
-                            );
-                            Err(srt_protocol::error::RejectReason::Peer)
-                        }
-                    });
-                }
+            let listener_builder = apply_stream_id_access_control(build_listener_builder(p), p);
 
             let mut listener = listener_builder
                 .bind(local_sa)
@@ -536,24 +572,7 @@ pub async fn bind_srt_listener(p: &SrtConnectionParams<'_>) -> Result<SrtListene
         .parse()
         .context(format!("Invalid local address: {}", local_addr_str))?;
 
-    let mut listener_builder = build_listener_builder(p);
-
-    // Add access control for stream_id filtering on listener
-    if let Some(expected_sid) = p.stream_id
-        && !expected_sid.is_empty() {
-            let expected = expected_sid.to_string();
-            listener_builder = listener_builder.access_control_fn(move |info| {
-                if info.stream_id == expected {
-                    Ok(())
-                } else {
-                    tracing::warn!(
-                        "SRT listener: rejecting connection from {} — stream_id {:?} does not match expected {:?}",
-                        info.peer_addr, info.stream_id, expected
-                    );
-                    Err(srt_protocol::error::RejectReason::Peer)
-                }
-            });
-        }
+    let listener_builder = apply_stream_id_access_control(build_listener_builder(p), p);
 
     let listener = listener_builder
         .bind(local_sa)
@@ -1048,4 +1067,61 @@ fn parse_local_bind(p: &SrtConnectionParams) -> Result<SocketAddr> {
         .ok_or_else(|| anyhow::anyhow!("SRT listener requires local_addr"))?;
     addr.parse()
         .with_context(|| format!("parse SRT listener local_addr '{addr}'"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The listener filter is compared per the SRT Access Control spec, not
+    /// byte-for-byte. Until the 2026-08 libsrt-rs fix the filter was never
+    /// installed at all (`srt_listen_callback` after `srt_listen`, which libsrt
+    /// refuses silently), so a verbatim comparison had no observable
+    /// consequence. It does now: an ingest whose caller emits
+    /// `#!::r=name,m=publish` — the shape OBS Studio and ffmpeg produce once a
+    /// stream key is set, and the format both `docs/CONFIGURATION.md` and
+    /// `docs/supported-protocols.md` promise is supported — must keep working
+    /// against a plainly configured `name`.
+    #[test]
+    fn a_structured_stream_id_matches_the_plain_resource_it_names() {
+        assert!(stream_id_matches("mystream", "#!::r=mystream,m=publish"));
+        assert!(stream_id_matches("mystream", "#!::m=publish,r=mystream"));
+        assert!(stream_id_matches("mystream", "#!::r=mystream"));
+        // ... and the mirror case: configured structured, caller plain.
+        assert!(stream_id_matches("#!::r=mystream,m=publish", "mystream"));
+        // ... and structured on both sides, differing only in the extras.
+        assert!(stream_id_matches(
+            "#!::r=mystream,m=publish",
+            "#!::r=mystream,m=request,u=bob"
+        ));
+    }
+
+    /// Widening must not become "accepts anything". These are the callers the
+    /// filter exists to keep out, and every one of them is still refused.
+    #[test]
+    fn a_stream_id_naming_a_different_resource_is_still_rejected() {
+        assert!(!stream_id_matches("mystream", "otherstream"));
+        assert!(!stream_id_matches("mystream", "#!::r=otherstream,m=publish"));
+        assert!(!stream_id_matches("mystream", "#!::m=publish,u=bob"));
+        assert!(!stream_id_matches("mystream", ""));
+        assert!(!stream_id_matches("mystream", "#!::"));
+        // A near-miss must not pass: no prefix or substring matching.
+        assert!(!stream_id_matches("mystream", "mystream2"));
+        assert!(!stream_id_matches("mystream", "#!::r=mystream2"));
+    }
+
+    /// Exact equality is still a match, whatever the shape — the widening is
+    /// strictly additive, so no caller the old comparison admitted is lost.
+    #[test]
+    fn an_exactly_equal_stream_id_still_matches() {
+        assert!(stream_id_matches("mystream", "mystream"));
+        assert!(stream_id_matches(
+            "#!::r=mystream,m=publish",
+            "#!::r=mystream,m=publish"
+        ));
+        // No configured filter is never installed (see
+        // `apply_stream_id_access_control`), but an empty expected value must
+        // not silently match every caller if one ever reaches here.
+        assert!(!stream_id_matches("", "anything"));
+    }
 }

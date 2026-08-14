@@ -649,8 +649,9 @@ apply — the media player is file-backed and binds no sockets.
 | critical | Tunnel '{name}' failed: {error} | Tunnel task exited with fatal error | `{ tunnel_name }` |
 | critical | Tunnel bind rejected by relay: {reason} | HMAC bind token verification failed | `{ relay_addr }` |
 | critical | Tunnel '{name}': {N} decrypt failures and zero packets delivered in {W}s — likely tunnel_encryption_key mismatch between edges | AEAD (ChaCha20-Poly1305) decrypt kept failing on inbound tunnel traffic while nothing was delivered across a full window — almost always the two edges hold different `tunnel_encryption_key` values. Emitted once per window | `{ error_code: "tunnel_decrypt_failure", tunnel_name, decrypt_errors_window, packets_delivered_window, window_secs }` |
+| warning | Direct tunnel listener refused a register from {addr}: {why} | A native-UDP **direct-mode** listener refused a `Register` whose PSK token verified. `reason: "slot_held"` — the tunnel is carrying media from a different address, so a replayed token cannot move a live peer (the register PSK is a static `HMAC(tunnel_id, psk)` re-sent in the clear every 5 s, so anyone who observes one can replay it forever). `reason: "unlatchable_source"` — the source address cannot belong to a real peer (port 0, unspecified, multicast, broadcast) and latching it would send the tunnel's return traffic nowhere. **Rate-limited to one report per 12 s hold-down window**, since the path is entirely attacker-driven; `suppressed` counts the refusals hidden since the last report. A `slot_held` refusal is not permanent — a challenger continuously present for 60 s takes the slot, so a hijacked tunnel recovers rather than blacking out for the life of the process | `{ error_code: "tunnel_register_refused", tunnel_id, reason, refused_addr, held_addr, suppressed }` |
 
-**Source**: `src/tunnel/manager.rs`, `src/tunnel/relay_client.rs`
+**Source**: `src/tunnel/manager.rs`, `src/tunnel/relay_client.rs`, `src/tunnel/udp_relay_client.rs`
 
 ---
 
@@ -839,7 +840,7 @@ These are generated server-side in `bilbycast-manager/crates/manager-server/src/
 | `webrtc` | 8 | WHIP/WHEP session lifecycle |
 | `audio_encode` | 9 | Audio encoder lifecycle — ffmpeg sidecar (RTMP/HLS/WebRTC) + in-process TsAudioReplacer (SRT/RIST/RTP/UDP) |
 | `video_encode` | 2 | Video transcoder lifecycle — in-process TsVideoReplacer (SRT/RIST/RTP/UDP) |
-| `tunnel` | 10 | Tunnel connection state (now with structured details) + AEAD decrypt failure (`tunnel_decrypt_failure`) |
+| `tunnel` | 11 | Tunnel connection state (now with structured details) + AEAD decrypt failure (`tunnel_decrypt_failure`) + direct-listener register refusal (`tunnel_register_refused`) |
 | `manager` | 3 | Manager WebSocket connection |
 | `config` | 2 | Configuration changes |
 | `master_clock` | 2 | Source-PCR PLL lock-state transitions (fallback to wallclock, recovery) |

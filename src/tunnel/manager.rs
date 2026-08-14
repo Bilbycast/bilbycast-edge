@@ -583,6 +583,7 @@ impl TunnelManager {
                     cancel.clone(),
                     stats.clone(),
                     cipher.clone(),
+                    event_sender.clone(),
                 )
                 .await;
 

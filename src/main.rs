@@ -742,8 +742,16 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    // Build router and start server
-    let router = build_router(state.clone());
+    // Build router and start server. The NMOS browser-control origin list is
+    // passed explicitly: `build_router` is synchronous and could only
+    // `try_read` the shared config, and a fail-open fallback on a browser
+    // security policy is not acceptable.
+    let nmos_browser_control = app_config
+        .server
+        .nmos_browser_control
+        .clone()
+        .unwrap_or_default();
+    let router = build_router(state.clone(), &nmos_browser_control);
     tracing::info!("API server listening on {listen_addr}");
 
     // Best-effort NMOS mDNS-SD registration. Kept alive for the lifetime of
