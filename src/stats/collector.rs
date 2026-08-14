@@ -1608,6 +1608,11 @@ impl OutputStatsAccumulator {
                     h.counters.present_bucket[i].load(Ordering::Relaxed)
                 }),
                 present_no_sleep: h.counters.present_no_sleep.load(Ordering::Relaxed),
+                cadence_drift_absorbed: h
+                    .counters
+                    .cadence_drift_absorbed
+                    .load(Ordering::Relaxed),
+                cadence_hold_aborted: h.counters.cadence_hold_aborted.load(Ordering::Relaxed),
                 present_interval_count: h
                     .counters
                     .present_interval_count

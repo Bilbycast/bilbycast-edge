@@ -1372,6 +1372,20 @@ pub struct DisplayStats {
     pub present_bucket: [u64; 8],
     #[serde(default)]
     pub present_no_sleep: u64,
+    /// Frames whose vblank hold departed from the cadence's nominal length
+    /// (#115). Expected and periodic — it is the source-vs-panel crystal
+    /// difference being paid off a whole vblank at a time, so a 33 ppm
+    /// difference at 25 fps absorbs roughly once every ten minutes. The
+    /// diagnostic signal is the *rate*: frequent absorbs mean the scheduler
+    /// was handed the wrong rates, not that the panel is drifting fast.
+    #[serde(default)]
+    pub cadence_drift_absorbed: u64,
+    /// Holds abandoned because the driver stopped posting vblanks mid-hold
+    /// (#115). Non-zero means the panel is not receiving the computed
+    /// cadence at all, so treat any timing measurement from that window as
+    /// describing something other than the scheduler.
+    #[serde(default)]
+    pub cadence_hold_aborted: u64,
     #[serde(default)]
     pub present_interval_count: u64,
     /// Average `blit_and_present` duration since startup, in µs.
