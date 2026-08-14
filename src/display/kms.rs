@@ -596,6 +596,10 @@ pub struct KmsDisplay {
     /// fleet's sit between −54.69 and +64.32 ppm, and it is exactly that error
     /// which walks presentation across the raster.
     measured_vblank_ns: AtomicU64,
+    /// Whether the flip clock is fit to schedule against — see
+    /// [`Self::vblank_clock_trusted`]. Starts `false` and is only ever set by
+    /// a completed measurement window.
+    clock_trusted: AtomicBool,
     /// PRIME scanout state — set when `present_prime` has flipped a
     /// VAAPI-decoded surface onto the CRTC. `None` while the CPU-blit
     /// path is active. Holding the previous-frame keepalive here means
@@ -897,6 +901,7 @@ impl KmsDisplay {
             anchor_ts_ns: AtomicU64::new(0),
             flips_since_anchor: AtomicU64::new(0),
             measured_vblank_ns: AtomicU64::new(0),
+            clock_trusted: AtomicBool::new(false),
             prime_state: None,
             prime_fb_cache: std::collections::HashMap::new(),
             prime_fb_cache_order: std::collections::VecDeque::new(),
@@ -4048,8 +4053,48 @@ impl KmsDisplay {
                     // the whole window, so accuracy improves with window
                     // length rather than as sqrt(n). Over ~24 s that resolves
                     // single-ppm offsets.
-                    self.measured_vblank_ns
-                        .store(span_ns / vblanks, Ordering::Relaxed);
+                    let period = span_ns / vblanks;
+                    self.measured_vblank_ns.store(period, Ordering::Relaxed);
+                    // Decide whether anything may *schedule* against this
+                    // clock. Not every DRM driver reports honest flip
+                    // timestamps, and a scheduler fed a fabricated timebase
+                    // fails silently — the picture is wrong while every
+                    // counter derived from the same bad clock looks correct.
+                    //
+                    // Verified good on RK3588 (`rockchip-vop2`): sequence
+                    // strictly +1, no zero timestamps, 20 000.7 us period,
+                    // ~50 us jitter. i915's *period* is likewise measured
+                    // sane, but its phase semantics are unverified — hence a
+                    // check that can fail per-host rather than an assumption.
+                    let advertised_ns = match self.mode.vrefresh() {
+                        0 => 0,
+                        hz => 1_000_000_000 / u64::from(hz),
+                    };
+                    // Within 5% of the mode's advertised rate. Real crystal
+                    // error is tens of ppm, so this rejects only a driver
+                    // reporting something structurally wrong (a different
+                    // time base, a stalled counter), never a genuinely
+                    // off-nominal panel.
+                    let plausible = advertised_ns > 0
+                        && period > 0
+                        && period.abs_diff(advertised_ns) * 20 < advertised_ns;
+                    // `vblanks` counts sequence advance across the window; if
+                    // the counter were frozen this would be 0 and we would not
+                    // be in this branch at all. A wildly excessive advance
+                    // means the sequence is not a vblank count.
+                    let sane_sequence = vblanks <= flips.saturating_mul(16);
+                    let trusted = plausible && sane_sequence;
+                    if !trusted {
+                        tracing::warn!(
+                            measured_vblank_ns = period,
+                            advertised_vblank_ns = advertised_ns,
+                            vblanks_in_window = vblanks,
+                            flips_in_window = flips,
+                            "display: flip clock is not trustworthy — vblank-derived \
+                             scheduling stays disabled on this output"
+                        );
+                    }
+                    self.clock_trusted.store(trusted, Ordering::Release);
                     let period_us = span_ns as f64 / 1_000.0 / vblanks as f64;
                     // Debug, not info: this is a per-node calibration figure,
                     // not an event. It exists so the "is this driver honest?"
@@ -4091,6 +4136,18 @@ impl KmsDisplay {
             0 => None,
             hz => Some(1_000_000_000 / u64::from(hz)),
         }
+    }
+
+    /// Whether the flip clock may be scheduled against (#115 P2).
+    ///
+    /// `false` until a measurement window has completed *and* agreed with the
+    /// mode's advertised refresh, so a driver reporting a fabricated or stalled
+    /// timebase can never become the reference. Callers must keep their
+    /// existing timing path while this is `false` rather than fall back to a
+    /// guess: a scheduler on a bad clock fails silently, because the metrics
+    /// that would reveal it are derived from the same clock.
+    pub fn vblank_clock_trusted(&self) -> bool {
+        self.clock_trusted.load(Ordering::Acquire)
     }
 
     /// Restart the vblank-clock measurement window at this flip.
