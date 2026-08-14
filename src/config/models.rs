@@ -6840,6 +6840,27 @@ pub struct DisplayOutputConfig {
     /// own to snap. Unset defaults to **off** pending fleet validation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub present_vblank_snap: Option<bool>,
+
+    /// Assign frames to whole vblanks instead of to wall-clock instants
+    /// (#115 P3).
+    ///
+    /// `present_vblank_snap` moves *when* a flip is requested; this decides
+    /// *which vblanks a frame occupies*. At 25p on 50 Hz it holds every
+    /// frame for 2 vblanks; at 24p on 60 Hz it generates 2:3 pulldown
+    /// (3,2,3,2) rather than hoping the wall clock lands on it. Crystal
+    /// drift is absorbed as one longer or shorter hold per beat period
+    /// instead of continuous sub-frame slide.
+    ///
+    /// Engages only where the flip clock has earned trust
+    /// (`KmsDisplay::vblank_clock_trusted`), the measured rates give a
+    /// schedulable ratio, and the source rate has stabilised. Anything else
+    /// keeps the existing wall-clock path. A source faster than the panel
+    /// needs frame *dropping*, which is a different algorithm and is not
+    /// implemented — 60p on a 50 Hz panel is declined.
+    ///
+    /// Unset defaults to **off** pending fleet validation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub present_vblank_cadence: Option<bool>,
 }
 
 fn default_audio_channel_pair() -> [u8; 2] {

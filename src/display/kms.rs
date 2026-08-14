@@ -600,6 +600,9 @@ pub struct KmsDisplay {
     /// [`Self::vblank_clock_trusted`]. Starts `false` and is only ever set by
     /// a completed measurement window.
     clock_trusted: AtomicBool,
+    /// Cached kernel pipe index for [`Self::crtc`], resolved on first use.
+    /// `u32::MAX` means "not yet resolved".
+    crtc_pipe: AtomicU32,
     /// PRIME scanout state — set when `present_prime` has flipped a
     /// VAAPI-decoded surface onto the CRTC. `None` while the CPU-blit
     /// path is active. Holding the previous-frame keepalive here means
@@ -902,6 +905,7 @@ impl KmsDisplay {
             flips_since_anchor: AtomicU64::new(0),
             measured_vblank_ns: AtomicU64::new(0),
             clock_trusted: AtomicBool::new(false),
+            crtc_pipe: AtomicU32::new(u32::MAX),
             prime_state: None,
             prime_fb_cache: std::collections::HashMap::new(),
             prime_fb_cache_order: std::collections::VecDeque::new(),
@@ -4136,6 +4140,56 @@ impl KmsDisplay {
             0 => None,
             hz => Some(1_000_000_000 / u64::from(hz)),
         }
+    }
+
+    /// Block until one more vblank has passed on our CRTC, **without**
+    /// committing anything (#115 P3).
+    ///
+    /// This is how a frame is held for more than one vblank. The panel
+    /// re-scans the framebuffer already programmed, so holding costs nothing
+    /// but the wait — no flip, no buffer churn, and the previous frame stays
+    /// on screen exactly as intended rather than by accident.
+    ///
+    /// Needs no DRM master (verified: the same ioctl measured these panels
+    /// while the edge held the CRTC), so it cannot contend with the present
+    /// path.
+    ///
+    /// Returns `Err` rather than blocking indefinitely if the driver stops
+    /// posting vblanks — the caller must treat that as it treats a flip
+    /// timeout, by falling back rather than wedging the render thread.
+    pub fn wait_vblank(&self) -> Result<()> {
+        use drm::{VblankWaitFlags, VblankWaitTarget};
+
+        let pipe = self.crtc_pipe_index()?;
+        self.card
+            .wait_vblank(VblankWaitTarget::Relative(1), VblankWaitFlags::empty(), pipe, 0)
+            .map(|_| ())
+            .map_err(|e| anyhow::Error::new(e).context("display_wait_vblank_failed"))
+    }
+
+    /// The kernel's pipe index for our CRTC, which `wait_vblank` addresses by
+    /// position rather than by handle.
+    ///
+    /// Resolved once and cached: enumerating resources is an ioctl, and this
+    /// is called on every held vblank.
+    fn crtc_pipe_index(&self) -> Result<u32> {
+        let cached = self.crtc_pipe.load(Ordering::Relaxed);
+        if cached != u32::MAX {
+            return Ok(cached);
+        }
+        let res = self
+            .card
+            .resource_handles()
+            .context("display_wait_vblank_failed: resource_handles")?;
+        let idx = res
+            .crtcs()
+            .iter()
+            .position(|c| *c == self.crtc)
+            .ok_or_else(|| anyhow::anyhow!("display_wait_vblank_failed: CRTC not in resources"))?;
+        let idx = u32::try_from(idx)
+            .map_err(|_| anyhow::anyhow!("display_wait_vblank_failed: implausible CRTC index"))?;
+        self.crtc_pipe.store(idx, Ordering::Relaxed);
+        Ok(idx)
     }
 
     /// Whether the flip clock may be scheduled against (#115 P2).

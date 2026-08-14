@@ -743,6 +743,17 @@ pub struct DisplayStatsCounters {
     /// but missed vblank" — the outlier count conflates the two, and they
     /// need different fixes.
     pub present_no_sleep: AtomicU64,
+    /// Frames whose cadence hold differed from the nominal integer, i.e.
+    /// the source/panel crystal difference accumulated past a whole vblank
+    /// and was absorbed as one longer or shorter hold (#115). Expected, and
+    /// periodic at the beat rate — a *rate* far above that means the two
+    /// rates are not what the scheduler was told.
+    pub cadence_drift_absorbed: AtomicU64,
+    /// Cadence holds cut short because the driver stopped posting vblanks.
+    /// Nonzero means frames are being shown for fewer vblanks than the
+    /// cadence intended, so the panel is not receiving the pattern the
+    /// scheduler computed.
+    pub cadence_hold_aborted: AtomicU64,
     /// Denominator for the above.
     pub present_interval_count: AtomicU64,
     /// Sum of `blit_and_present` durations since startup (µs). Read

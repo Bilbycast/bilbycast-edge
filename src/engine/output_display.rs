@@ -53,6 +53,7 @@ use video_engine::{
 
 use crate::config::models::{DisplayOutputConfig, DisplayScalingMode};
 use crate::display::audio_bars::{new_shared_meter, SharedMeter, StreamHeader};
+use crate::engine::display_cadence::{CadenceScheduler, HoldKind};
 use crate::display::audio_meter::spawn_audio_meter;
 use crate::display::{audio::AudioBackend, clock::AudioClock, kms::KmsDisplay};
 use crate::engine::audio_decode::DecodeStats;
@@ -805,6 +806,7 @@ async fn run_display_output(
     let display_prime_cache_stale = Arc::clone(&prime_cache_stale);
     let display_configured_lead_ms = config.present_lead_ms;
     let display_vblank_snap = config.present_vblank_snap.unwrap_or(false);
+    let display_vblank_cadence = config.present_vblank_cadence.unwrap_or(false);
     #[cfg(feature = "rga-transfer")]
     let display_rga_transfer_active = Arc::clone(&rga_transfer_active);
     // Independent DRM-master release handle (a dup of the card fd) captured
@@ -820,6 +822,7 @@ async fn run_display_output(
             display_counters,
             display_configured_lead_ms,
             display_vblank_snap,
+            display_vblank_cadence,
             display_cancel,
             display_output_stats,
             decoder_kind_label,
@@ -4740,6 +4743,7 @@ fn display_loop(
     counters: Arc<DisplayStatsCounters>,
     configured_lead_ms: Option<u32>,
     vblank_snap: bool,
+    vblank_cadence: bool,
     cancel: CancellationToken,
     output_stats: Arc<OutputStatsAccumulator>,
     decoder_kind_label: &'static str,
@@ -4815,6 +4819,13 @@ fn display_loop(
     // that's an integer multiple of the source. Stays `true` from then
     // on until the resolution / input switch path resets it.
     let mut fps_locked: bool = false;
+    // Per-vblank cadence scheduler (#115 P3). `None` unless the operator
+    // opted in AND the flip clock earned trust AND the measured rates give
+    // a schedulable ratio — every one of those is a reason to keep the
+    // existing wall-clock path rather than schedule against a guess.
+    // Rebuilt whenever the panel mode or the source rate changes.
+    let mut cadence: Option<CadenceScheduler> = None;
+    let mut cadence_built_for: Option<(u32, u32)> = None; // (panel_hz, fps milli)
     let mut frames_since_period_reset: u32 = 0;
     // The `(width, height, fps)` hint from the last *fresh*
     // (EMA-stabilised) fps-locked modeset. Carried across PTS jumps /
@@ -5522,6 +5533,50 @@ fn display_loop(
         if prime_cache_stale.swap(false, Ordering::Relaxed) {
             kms.invalidate_prime_fb_cache();
         }
+        // (Re)build the cadence scheduler when the panel mode or the measured
+        // source rate changes. Both inputs are *measured*, never advertised:
+        // `frame_period_ms` is an EMA of PTS deltas, and the vblank period
+        // comes from the kernel's own flip timestamps. `ingress_summary`'s
+        // reported fps is not used — it was observed pinned at 50.0 for
+        // minutes while the stream was actually 24 fps.
+        if vblank_cadence {
+            let panel_hz = kms.refresh_hz();
+            // Quantise the rate so EMA wobble does not rebuild every frame.
+            let fps_milli = if frame_period_ms > 0.0 {
+                (1000.0 / frame_period_ms * 1000.0).round() as u32
+            } else {
+                0
+            };
+            let key = (panel_hz, fps_milli);
+            let stabilised = frames_since_period_reset >= 40;
+            if stabilised && cadence_built_for != Some(key) && kms.vblank_clock_trusted() {
+                let source_fps = f64::from(fps_milli) / 1000.0;
+                let panel_measured = kms
+                    .vblank_period_ns()
+                    .filter(|ns| *ns > 0)
+                    .map(|ns| 1_000_000_000.0 / ns as f64)
+                    .unwrap_or_else(|| f64::from(panel_hz));
+                cadence = CadenceScheduler::new(panel_measured, source_fps);
+                cadence_built_for = Some(key);
+                match cadence.as_ref() {
+                    Some(c) => tracing::info!(
+                        output_id = %output_id,
+                        panel_hz = panel_measured,
+                        source_fps,
+                        vblanks_per_frame = c.vblanks_per_frame(),
+                        "display: per-vblank cadence engaged"
+                    ),
+                    None => tracing::info!(
+                        output_id = %output_id,
+                        panel_hz = panel_measured,
+                        source_fps,
+                        "display: cadence not schedulable for this rate pair — \
+                         keeping wall-clock pacing"
+                    ),
+                }
+            }
+        }
+
         let blit_start = Instant::now();
         let blit_ok = match blit_and_present(
             &mut kms,
@@ -5537,6 +5592,52 @@ fn display_loop(
                 if flip_wedged {
                     flip_wedged = false;
                     last_flip_timeout_warn_at = None;
+                }
+                // Per-vblank cadence (#115 P3). The flip that just completed
+                // put this frame on the panel for ONE vblank; if the cadence
+                // allocated it more, hold the rest by waiting vblanks without
+                // committing. The panel re-scans the same framebuffer, so a
+                // hold costs nothing but the wait.
+                //
+                // This is the half `present_vblank_snap` cannot do. Snapping
+                // only moves *when* a flip is asked for, which is why it goes
+                // inert at 1:1 (measured 100% no-sleep at 50p on a 50 Hz
+                // panel — the branch it lives in is never taken). Holding
+                // decides *which* vblanks a frame occupies, so it still acts
+                // there, and it generates 2:3 pulldown at 24p rather than
+                // hoping the wall clock lands on it.
+                if let Some(sched) = cadence.as_mut() {
+                    let hold = sched.next_hold();
+                    if hold.kind == HoldKind::DriftAbsorb {
+                        counters.cadence_drift_absorbed.fetch_add(1, Ordering::Relaxed);
+                    }
+                    let mut aborted = false;
+                    for _ in 1..hold.vblanks {
+                        if cancel.is_cancelled() {
+                            break;
+                        }
+                        if let Err(e) = kms.wait_vblank() {
+                            // Treat exactly like a flip timeout: the driver has
+                            // stopped posting vblanks. Abandon the hold rather
+                            // than wedge the render thread, and let the next
+                            // frame's present surface the real error.
+                            tracing::debug!(
+                                output_id = %output_id,
+                                "display: vblank wait failed mid-hold, abandoning: {e:#}"
+                            );
+                            counters.cadence_hold_aborted.fetch_add(1, Ordering::Relaxed);
+                            aborted = true;
+                            break;
+                        }
+                    }
+                    if aborted {
+                        // The frame did not occupy the vblanks the schedule
+                        // allocated it, so the fractional debt carried in
+                        // `accum` no longer describes where we are on the
+                        // raster. Re-seed rather than pay back a debt against
+                        // a phase we never actually reached.
+                        sched.reset();
+                    }
                 }
                 true
             }
