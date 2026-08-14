@@ -1485,6 +1485,7 @@ impl KmsDisplay {
                 )
                 .context("display_mode_set_failed: auto-match refresh re-modeset")?;
             self.mode = new_mode;
+            self.invalidate_vblank_clock();
             self.invalidate_atomic_modeset();
             return Ok(());
         }
@@ -1543,6 +1544,7 @@ impl KmsDisplay {
             let _ = self.card.destroy_dumb_buffer(handle);
         }
         self.mode = new_mode;
+        self.invalidate_vblank_clock();
         self.width = new_w;
         self.height = new_h;
         self.front_idx = 0;
@@ -1635,6 +1637,7 @@ impl KmsDisplay {
                 )
                 .context("display_mode_set_failed: monitor-native refresh re-modeset")?;
             self.mode = new_mode;
+            self.invalidate_vblank_clock();
             self.invalidate_atomic_modeset();
             return Ok(());
         }
@@ -1657,6 +1660,7 @@ impl KmsDisplay {
             let _ = self.card.destroy_dumb_buffer(handle);
         }
         self.mode = new_mode;
+        self.invalidate_vblank_clock();
         self.width = new_w;
         self.height = new_h;
         self.front_idx = 0;
@@ -4208,6 +4212,26 @@ impl KmsDisplay {
     fn reseat_vblank_anchor(&self, seq: u32, ts_ns: u64) {
         self.anchor_seq.store(seq, Ordering::Relaxed);
         self.anchor_ts_ns.store(ts_ns, Ordering::Relaxed);
+        self.flips_since_anchor.store(0, Ordering::Relaxed);
+    }
+
+    /// Discard the vblank-clock measurement because the panel is no longer
+    /// running the mode it was measured on.
+    ///
+    /// Without this the window that spans a modeset averages the two rates
+    /// and yields a period belonging to neither. Measured on bilby-pir6s: a
+    /// 60 Hz → 50 Hz auto-match produced 50.61 Hz for a panel independently
+    /// measured at 49.998 Hz, which turned an exact 2.000 vblanks/frame
+    /// cadence into 2.024 — a scheduler dutifully inserting an extra vblank
+    /// every 41 frames, i.e. manufacturing the judder it exists to remove.
+    ///
+    /// `clock_trusted` drops too: until a full window has been measured on
+    /// the *new* mode there is no trustworthy period, and the honest answer
+    /// to "may I schedule against this?" is no.
+    fn invalidate_vblank_clock(&self) {
+        self.clock_trusted.store(false, Ordering::Release);
+        self.measured_vblank_ns.store(0, Ordering::Relaxed);
+        self.last_flip_valid.store(false, Ordering::Release);
         self.flips_since_anchor.store(0, Ordering::Relaxed);
     }
 

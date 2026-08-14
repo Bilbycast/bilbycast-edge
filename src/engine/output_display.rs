@@ -4825,7 +4825,8 @@ fn display_loop(
     // existing wall-clock path rather than schedule against a guess.
     // Rebuilt whenever the panel mode or the source rate changes.
     let mut cadence: Option<CadenceScheduler> = None;
-    let mut cadence_built_for: Option<(u32, u32)> = None; // (panel_hz, fps milli)
+    // (measured vblank period in 10 µs units, source fps in milli-fps)
+    let mut cadence_built_for: Option<(u64, u32)> = None;
     let mut frames_since_period_reset: u32 = 0;
     // The `(width, height, fps)` hint from the last *fresh*
     // (EMA-stabilised) fps-locked modeset. Carried across PTS jumps /
@@ -5540,14 +5541,23 @@ fn display_loop(
         // reported fps is not used — it was observed pinned at 50.0 for
         // minutes while the stream was actually 24 fps.
         if vblank_cadence {
-            let panel_hz = kms.refresh_hz();
             // Quantise the rate so EMA wobble does not rebuild every frame.
             let fps_milli = if frame_period_ms > 0.0 {
                 (1000.0 / frame_period_ms * 1000.0).round() as u32
             } else {
                 0
             };
-            let key = (panel_hz, fps_milli);
+            // The panel half of the key is the MEASURED period, not the
+            // advertised integer Hz. Keying on advertised Hz meant a
+            // measurement that later corrected itself — 50.61 Hz refined to
+            // 49.998 once a full window ran on the settled mode — left the
+            // key unchanged at 50, so the scheduler kept the first, worst
+            // reading for the life of the flow and drove a cadence of 2.024
+            // where the truth was 2.000. Quantising to 10 µs is ~25 ppm at
+            // 50 Hz: fine enough to notice a wrong measurement, coarse
+            // enough that ordinary jitter does not rebuild the scheduler.
+            let period_key = kms.vblank_period_ns().unwrap_or(0) / 10_000;
+            let key = (period_key, fps_milli);
             let stabilised = frames_since_period_reset >= 40;
             if stabilised && cadence_built_for != Some(key) && kms.vblank_clock_trusted() {
                 let source_fps = f64::from(fps_milli) / 1000.0;
@@ -5555,7 +5565,7 @@ fn display_loop(
                     .vblank_period_ns()
                     .filter(|ns| *ns > 0)
                     .map(|ns| 1_000_000_000.0 / ns as f64)
-                    .unwrap_or_else(|| f64::from(panel_hz));
+                    .unwrap_or_else(|| f64::from(kms.refresh_hz()));
                 cadence = CadenceScheduler::new(panel_measured, source_fps);
                 cadence_built_for = Some(key);
                 match cadence.as_ref() {

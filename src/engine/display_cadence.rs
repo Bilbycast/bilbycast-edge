@@ -166,6 +166,25 @@ impl CadenceScheduler {
     }
 }
 
+/// The identity of the rate pair a scheduler was built for.
+///
+/// The display loop rebuilds its scheduler when this changes, so the
+/// quantisation decides what counts as "the same panel". It must be fine
+/// enough that a *wrong* measurement is a different key from the right one,
+/// and coarse enough that ordinary jitter is not.
+///
+/// The panel half was originally the advertised integer Hz, which failed the
+/// first requirement completely: a measurement of 50.61 Hz and a corrected
+/// one of 49.998 Hz both truncate to 50, so the scheduler never rebuilt and
+/// kept a cadence of 2.024 vblanks/frame against a true 2.000 — inserting one
+/// extra vblank every 41 frames on a panel that needed none.
+pub fn rebuild_key(vblank_period_ns: u64, fps_milli: u32) -> (u64, u32) {
+    // 10 µs is ~25 ppm at 50 Hz. Crystal error is tens of ppm and measurement
+    // jitter over a 600-flip window is well under that; a structurally wrong
+    // reading is orders of magnitude larger.
+    (vblank_period_ns / 10_000, fps_milli)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -292,6 +311,57 @@ mod tests {
             s.next_hold().vblanks,
             first,
             "reset must reproduce the seed state, not carry the old stream's debt"
+        );
+    }
+
+    fn hz_to_period_ns(hz: f64) -> u64 {
+        (1_000_000_000.0 / hz).round() as u64
+    }
+
+    #[test]
+    fn rebuild_key_separates_a_wrong_measurement_from_the_right_one() {
+        // The exact pair observed on bilby-pir6s: a window that straddled a
+        // 60 -> 50 Hz modeset measured 50.61 Hz for a panel independently
+        // measured at 49.998 Hz. Keying on advertised integer Hz made these
+        // the same key, so the bad reading was never replaced.
+        let bad = rebuild_key(hz_to_period_ns(50.60964376883944), 25_000);
+        let good = rebuild_key(hz_to_period_ns(49.998), 25_000);
+        assert_ne!(
+            bad, good,
+            "a 1.2% panel-rate error must force a scheduler rebuild"
+        );
+    }
+
+    #[test]
+    fn rebuild_key_is_stable_across_ordinary_measurement_jitter() {
+        // Same panel, successive windows, differing by a few ppm. These must
+        // NOT rebuild -- a scheduler rebuilt every window would reset its
+        // fractional debt every window and never absorb drift at all.
+        let a = rebuild_key(hz_to_period_ns(49.998), 25_000);
+        let b = rebuild_key(hz_to_period_ns(49.9985), 25_000);
+        let c = rebuild_key(hz_to_period_ns(49.9975), 25_000);
+        assert_eq!(a, b, "sub-ppm drift must not rebuild the scheduler");
+        assert_eq!(a, c, "sub-ppm drift must not rebuild the scheduler");
+    }
+
+    #[test]
+    fn a_wrong_panel_rate_manufactures_judder() {
+        // Why the key matters at all: state the cost of the stale reading in
+        // terms of what reaches the panel. The true cadence is exactly 2, so
+        // a correct scheduler emits nothing but 2s.
+        let mut good = CadenceScheduler::new(49.998, 25.0).expect("valid");
+        let holds: Vec<u32> = (0..500).map(|_| good.next_hold().vblanks).collect();
+        assert!(
+            holds.iter().all(|v| *v == 2),
+            "an exact 2:1 cadence must never vary the hold"
+        );
+
+        // The stale reading does not, and every departure is a visible hitch.
+        let mut bad = CadenceScheduler::new(50.60964376883944, 25.0).expect("valid");
+        let hitches = (0..500).filter(|_| bad.next_hold().vblanks != 2).count();
+        assert!(
+            hitches > 5,
+            "the 50.61 Hz misreading should inject repeated hitches, saw {hitches}"
         );
     }
 }
