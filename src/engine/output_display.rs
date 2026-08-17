@@ -4778,6 +4778,10 @@ fn display_loop(
     let mut cadence_last_build_at: Option<Instant> = None;
     let mut cadence_guard_checked_at: Option<Instant> = None;
     let mut cadence_guard_strikes: u32 = 0;
+    // Per-frame cost sampled only while cadence is disengaged — see the
+    // headroom precondition at the engage gate for why that matters.
+    let mut cadence_offpath_cost_us: Option<u64> = None;
+    let mut cadence_no_headroom_logged = false;
     let mut cadence_failures: u32 = 0;
     let mut frames_since_period_reset: u32 = 0;
     // The `(width, height, fps)` hint from the last *fresh*
@@ -5558,9 +5562,79 @@ fn display_loop(
             const MIN_REBUILD_INTERVAL: Duration = Duration::from_secs(10);
             let rebuild_allowed = cadence_last_build_at
                 .is_none_or(|t: Instant| t.elapsed() >= MIN_REBUILD_INTERVAL);
+            // Headroom precondition. Holding a frame for an extra vblank only
+            // works if the per-frame work finishes well inside the frame
+            // period; where it does not, the hold pushes the next decode past
+            // its slot, the queue backs up and the scheduler sheds — which is
+            // what the runaway guard below catches, 79 s and several hundred
+            // dropped frames later. Refusing up front costs nothing and skips
+            // that entirely.
+            //
+            // Measured on this fleet, cadence off (per 40 ms frame):
+            //
+            // | node  | blit + download | of budget | cadence |
+            // |-------|-----------------|-----------|---------|
+            // | pi    |  3 749 us       |   9.4 %   | works   |
+            // | bite  | 10 750 us       |  26.9 %   | works   |
+            // | pir6s | 13 891 us       |  34.7 %   | works   |
+            // | nuc   | 32 093 us       |  80.2 %   | SHEDS   |
+            //
+            // 60 % sits in the gap with margin either side. The nuc is the
+            // expensive case for a structural reason, not a slow one: Gen9
+            // advertises NV12 on no plane, so every frame pays a GPU download
+            // plus a CPU blit and `decoder_kind` reads `vaapi-zerocopy` while
+            // nothing is zero-copy.
+            //
+            // **Only sampled while disengaged.** `blit_us_avg` measures
+            // blit-and-present, so once cadence holds a frame across its
+            // allocated vblanks the average absorbs the hold — pir6s reads
+            // 13 891 us off and 39 536 us on, i.e. 98.8 % of budget, and
+            // gating on that would refuse to engage on the node where this
+            // works best. Sampling only when `cadence.is_none()` keeps the
+            // reference independent of the thing it gates. After a guard
+            // disengage the average is still contaminated for a while, but it
+            // is biased *upward*, i.e. toward refusing — the safe direction.
+            const CADENCE_MAX_BUDGET_PCT: u64 = 60;
+            if cadence.is_none() {
+                let blit = counters.blit_count.load(Ordering::Relaxed);
+                let dl = counters.download_count.load(Ordering::Relaxed);
+                if blit > 0 {
+                    cadence_offpath_cost_us = Some(
+                        counters.blit_us_total.load(Ordering::Relaxed) / blit
+                            + if dl > 0 {
+                                counters.download_us_total.load(Ordering::Relaxed) / dl
+                            } else {
+                                0
+                            },
+                    );
+                }
+            }
+            let frame_period_us = (frame_period_ms * 1000.0) as u64;
+            let has_headroom = match (cadence_offpath_cost_us, frame_period_us) {
+                // No measurement yet, or no period to measure against: let the
+                // runtime guard be the safety net rather than blocking on a
+                // number we do not have.
+                (None, _) | (_, 0) => true,
+                (Some(cost), period) => cost * 100 < period * CADENCE_MAX_BUDGET_PCT,
+            };
+            if !has_headroom && !cadence_no_headroom_logged {
+                cadence_no_headroom_logged = true;
+                tracing::info!(
+                    output_id = %output_id,
+                    frame_cost_us = cadence_offpath_cost_us.unwrap_or(0),
+                    frame_period_us,
+                    max_budget_pct = CADENCE_MAX_BUDGET_PCT,
+                    "display: per-vblank cadence not engaged — this output spends \
+                     too much of each frame period decoding, downloading and \
+                     blitting to have room to hold a frame. Wall-clock pacing \
+                     is the correct choice here and no picture quality is lost \
+                     relative to not having the feature."
+                );
+            }
             if stabilised
                 && !blocked
                 && rebuild_allowed
+                && has_headroom
                 && cadence_built_for != Some(key)
                 && kms.vblank_clock_trusted()
             {
