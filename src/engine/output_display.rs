@@ -805,7 +805,6 @@ async fn run_display_output(
     let display_prime_scanout_failed = Arc::clone(&prime_scanout_failed);
     let display_prime_cache_stale = Arc::clone(&prime_cache_stale);
     let display_configured_lead_ms = config.present_lead_ms;
-    let display_vblank_snap = config.present_vblank_snap.unwrap_or(false);
     let display_vblank_cadence = config.present_vblank_cadence.unwrap_or(false);
     #[cfg(feature = "rga-transfer")]
     let display_rga_transfer_active = Arc::clone(&rga_transfer_active);
@@ -821,7 +820,6 @@ async fn run_display_output(
             display_clock,
             display_counters,
             display_configured_lead_ms,
-            display_vblank_snap,
             display_vblank_cadence,
             display_cancel,
             display_output_stats,
@@ -2422,6 +2420,45 @@ fn reset_decoder_open_window(state: &mut HwOpenState, counters: &DisplayStatsCou
         .store(0, Ordering::Relaxed);
 }
 
+/// Record the source frame period from *inside the decode task*, before the
+/// frame is offered to the display queue (#115).
+///
+/// This exists because the display loop's own `frame_period_ms` EMA is taken
+/// after the queue and therefore only sees frames that survived it. For the
+/// vblank cadence that closed a positive feedback loop — holding too long shed
+/// frames, the survivors showed doubled PTS gaps, the estimate reported a
+/// slower source, so the cadence held longer still, without bound. Measured
+/// here it cannot be corrupted that way: nothing has been dropped yet.
+///
+/// Call once per frame *offered to the panel*, so bob-deinterlaced fields are
+/// counted individually and the result is the presentation rate the cadence
+/// schedules against, not the decoder's frame rate.
+fn note_upstream_frame_period(counters: &DisplayStatsCounters, pts_90k: u64) {
+    let prev = counters.upstream_last_pts_90k.swap(pts_90k, Ordering::Relaxed);
+    if prev == 0 {
+        return;
+    }
+    let forward = pts_90k.wrapping_sub(prev) as i64;
+    let dms = forward / 90;
+    // Same window the display loop uses: 10..=200 ms covers 5-100 fps and
+    // rejects a discontinuity or a reordered PTS rather than folding it in.
+    if !(10..=200).contains(&dms) {
+        // A jump means a source change or a seek; drop the history so the new
+        // rate is measured clean instead of averaged with the old one.
+        counters.upstream_frame_period_us.store(0, Ordering::Relaxed);
+        return;
+    }
+    let sample_us = (forward as f64 / 90.0 * 1000.0) as u64;
+    let cur = counters.upstream_frame_period_us.load(Ordering::Relaxed);
+    let next = if cur == 0 {
+        sample_us
+    } else {
+        // Same 0.875/0.125 weighting as the display-side EMA.
+        ((cur as f64) * 0.875 + (sample_us as f64) * 0.125) as u64
+    };
+    counters.upstream_frame_period_us.store(next, Ordering::Relaxed);
+}
+
 /// Post-flush keyframe gate for the demux loop's video path.
 ///
 /// While armed (startup, and re-armed by every decoder flush in
@@ -3352,6 +3389,15 @@ fn prime_scanout_permanently_rejected(err_msg: &str) -> bool {
         return true;
     }
 
+    // The plane published, via IN_FORMATS, that it will not scan out this
+    // (fourcc, modifier) pair at all (#116). That is a fixed property of the
+    // display engine — Intel Gen9 advertises no NV12 on any plane — so it is
+    // as permanent as a rejected addfb, just discovered before the ioctl
+    // rather than after it.
+    if err_msg.contains("display_prime_format_unsupported") {
+        return true;
+    }
+
     // `display_prime_page_flip_failed` is NOT permanent on its own — it
     // covers three very different conditions, and only one is terminal:
     //
@@ -3879,7 +3925,15 @@ fn drain_video_frames(
         let rga_prepared: Option<(Vec<u8>, usize, VideoFrameChroma, i32)> = None;
         let frame =
             if need_sysmem && rga_prepared.is_none() {
-                match frame.download_to_sysmem() {
+                match {
+                    let dl_start = Instant::now();
+                    let r = frame.download_to_sysmem();
+                    counters
+                        .download_us_total
+                        .fetch_add(dl_start.elapsed().as_micros() as u64, Ordering::Relaxed);
+                    counters.download_count.fetch_add(1, Ordering::Relaxed);
+                    r
+                } {
                     Ok(sysmem) => sysmem,
                     // PERMANENT (see the companion arm further down):
                     // no downloadable `sw_format`, so every future
@@ -3999,6 +4053,7 @@ fn drain_video_frames(
                         audio_pid: stream_ids.audio_pid,
                         program_number: stream_ids.program_number,
                     };
+                    note_upstream_frame_period(counters, pts_90k);
                     if vtx.try_send(out_frame).is_err() {
                         counters
                             .frames_dropped_mpsc_full
@@ -4045,7 +4100,18 @@ fn drain_video_frames(
                     // Recover to sysmem and fall through to the
                     // ordinary semi-planar codepath below with it —
                     // NOT a `continue`, unlike every other arm here.
-                    match frame.download_to_sysmem() {
+                    match {
+                        // Time the copy specifically: `decode_us` spans feed +
+                        // drain and cannot distinguish a slow decoder from an
+                        // expensive GPU->CPU transfer.
+                        let dl_start = Instant::now();
+                        let r = frame.download_to_sysmem();
+                        counters
+                            .download_us_total
+                            .fetch_add(dl_start.elapsed().as_micros() as u64, Ordering::Relaxed);
+                        counters.download_count.fetch_add(1, Ordering::Relaxed);
+                        r
+                    } {
                         Ok(sysmem) => sysmem,
                         Err(video_codec::VideoError::UnsupportedHwFormat) => {
                             // PERMANENT: the HW frames context has no
@@ -4273,6 +4339,10 @@ fn drain_video_frames(
                     audio_pid: stream_ids.audio_pid,
                     program_number: stream_ids.program_number,
                 };
+                note_upstream_frame_period(
+                    counters,
+                    pts_90k.wrapping_add(i as u64 * deint.field_dur_90k),
+                );
                 if vtx.try_send(out_frame).is_err() {
                     counters
                         .frames_dropped_mpsc_full
@@ -4300,6 +4370,7 @@ fn drain_video_frames(
             audio_pid: stream_ids.audio_pid,
             program_number: stream_ids.program_number,
         };
+        note_upstream_frame_period(counters, pts_90k);
         if vtx.try_send(out_frame).is_err() {
             // Distinct from the display-thread `frames_dropped_late` —
             // this is the demux→display mpsc backing up because per-frame
@@ -4561,147 +4632,6 @@ impl DisplayPresentLatch {
 /// delivery* jitter, which is a wall-clock property of the backend.
 const RKMPP_PRESENT_LEAD_MS: u64 = 200;
 
-/// Presentation lead time in milliseconds for the **wall-clock** pacing
-/// path, set per output by `DisplayOutputConfig::present_lead_ms`.
-///
-/// The wall-clock pacer targets `anchor_at + pts_delta`, which is already an
-/// absolute anchored schedule — per-frame arrival jitter cannot move it. What
-/// it cannot do is present a frame that has not arrived yet: a frame handed
-/// over *past* its target is presented immediately, collapsing the interval
-/// against the previous on-time present. Measured on RKMPP (#104) as drift
-/// dipping to -20..-56 ms while sitting at +39/40 ms the rest of the time,
-/// producing present intervals as short as 13 ms on a panel whose vblank is
-/// 20 ms — i.e. two flips inside one vblank period.
-///
-/// Pushing the anchor later gives every frame that much more time to arrive
-/// before its target, at the cost of exactly that much added latency. VAAPI
-/// does not need it (`receive_frame` returns in ~1 us and drift never moved
-/// >=20 ms across 148 samples); RKMPP blocks up to 17 ms and bursts.
-///
-/// **What the lead physically buys is decode-queue depth.** The decoder is
-/// fed by a live source, so it cannot run ahead of real time; presenting
-/// `L` later simply means `L / frame_period` frames sit in the `vrx` mpsc
-/// at any instant, and a delivery burst is served out of that backlog
-/// instead of stalling `recv()`. That is why the elbow (~120 ms ≈ 3 frames)
-/// sits so far above RKMPP's 17 ms worst-case `receive_frame`: it is
-/// bounding a burst, not a single late hand-over. It is also why the lead
-/// is clamped against [`MPSC_VIDEO_DEPTH`] — a lead the queue cannot hold
-/// does not deepen the backlog, it just spills onto
-/// `frames_dropped_mpsc_full`.
-///
-/// Measured on bilby-pi (RK3568), 110 s per arm, fixed-bucket metric whose
-/// noise floor is +/-1.6 pp across three consecutive runs:
-///
-/// | lead ms | presents on target (38-42 ms) | arrived late |
-/// |---|---|---|
-/// | 0 | 70.5 - 72.1 % | ~19 % |
-/// | 40 | 68.0 % | 22.5 % |
-/// | 80 | 81.2 % | 9.3 % |
-/// | 120 | 98.1 % | 0.2 % |
-/// | 160 | 98.1 % | 0.0 % |
-/// | **200** | **99.7 - 99.9 %** | **0.0 %** |
-///
-/// Confirmed A/B/A/B (0 -> 200 -> 0 -> 200) with every arm replicated.
-/// One frame period (40 ms) buys nothing; the elbow is ~120 ms and 200 ms
-/// saturates.
-///
-/// **This only applies where there is no audio to sync against**, which is
-/// also the reason 200 ms is an acceptable default rather than an expensive
-/// one. It is set inside the `wall_anchor` branch, reached only when
-/// `AudioClock::current_pts_90k_smoothed()` returns `None` — i.e. muted or
-/// video-only output. On the audio-master path `wall_anchor` is cleared and
-/// never consulted, so this cannot shift video against audio and carries no
-/// lip-sync risk. The cost is therefore pure display latency: a confidence
-/// monitor sits 200 ms further behind the source, with nothing to fall out
-/// of sync with. Set `present_lead_ms: 0` where that latency matters more
-/// than the smoothness — that restores the previous behaviour exactly.
-///
-/// Corollary worth stating plainly: an **audio-enabled** display output
-/// still has the fault and this does not fix it. The audio branch paces
-/// against the measured ALSA playout position, which has no anchor to seed.
-///
-/// There is deliberately **no env-var override**. One existed while this
-/// was being measured, and it is strictly worse than the config field on
-/// every axis: node-wide where the fault is per-decoder, needing a process
-/// restart where a config edit restarts only the output, unvalidated, and
-/// silently shadowed by any output that sets the field. The per-decoder
-/// default already covers the case it was reaching for.
-/// Round a present target up to the next real vblank instant (#112, #115).
-///
-/// The wall-clock target free-runs against the scanout raster: source and
-/// panel are independent crystals (~33 ppm apart on this fleet), so the target
-/// walks through a whole vblank every ~10 minutes. Whenever it passes close to
-/// a boundary, sub-millisecond scheduling noise decides which of two adjacent
-/// vblanks the flip lands on, and the panel shows one frame for one vblank and
-/// the next for three. Nothing is dropped, so every loss counter reads clean.
-///
-/// Anchoring on the kernel's own last flip timestamp and stepping in whole
-/// vblank periods makes every target a grid point with full margin on both
-/// sides. The drift is not corrected — it cannot be, the crystals differ — it
-/// is *absorbed*, surfacing as one whole-vblank step per beat period rather
-/// than continuous sub-frame slide.
-///
-/// Returns `None` when the flip clock is unusable (no flip completed yet, no
-/// period available, or a target behind the anchor), leaving the caller on its
-/// existing wall-clock path rather than on a guess. Deliberately does **not**
-/// extrapolate past `SNAP_MAX_VBLANKS_AHEAD`: far from the anchor the accrued
-/// error in the period estimate exceeds what snapping buys.
-///
-/// Rounding to nearest rather than up is load-bearing, not a detail — see the
-/// comment at the rounding step. A `div_ceil` version of this measured
-/// *better* than baseline on the mean (95.3% vs 90.7%) while introducing
-/// twice-per-beat bursts of 350–400 late frames that the baseline never had.
-fn snap_target_to_vblank(kms: &KmsDisplay, raw_target_ns: u64) -> Option<u64> {
-    let flip = kms.last_flip()?;
-    let period_ns = kms.vblank_period_ns()?;
-    let anchor_ns = u64::try_from(flip.timestamp.as_nanos()).ok()?;
-    snap_to_grid(anchor_ns, period_ns, raw_target_ns)
-}
-
-/// The arithmetic half of [`snap_target_to_vblank`], split out so it can be
-/// tested without a DRM device.
-///
-/// `anchor_ns` is the instant of a completed flip and `period_ns` the vblank
-/// period; the returned instant is always a point on that grid.
-fn snap_to_grid(anchor_ns: u64, period_ns: u64, raw_target_ns: u64) -> Option<u64> {
-    const SNAP_MAX_VBLANKS_AHEAD: u64 = 16;
-
-    if period_ns == 0 {
-        return None;
-    }
-    // Target already behind the last flip — the caller is catching up, and the
-    // grid is not the constraint. Leave it alone.
-    let ahead_ns = raw_target_ns.checked_sub(anchor_ns)?;
-    // Round to *nearest*, not up. Measured on RK3588: rounding up cost a mean
-    // half-vblank (~10 ms at 50 Hz) of permanent latency debt, which ate into
-    // the presentation lead until frames began arriving with no slack — 350+
-    // `present_no_sleep` per minute, twice per beat period. Worse, `ceil` puts
-    // the decision boundary *exactly on a grid point*, which is where the
-    // target dwells while the beat walks it across the raster, so sub-ms noise
-    // flipped the choice between adjacent vblanks precisely when it mattered
-    // most.
-    //
-    // Nearest costs zero mean latency and moves the unstable point to the
-    // midpoint between grid points, where a flip changes which vblank is
-    // targeted but the target is a half-period away from either edge — the
-    // furthest it can be from a boundary.
-    //
-    // `.max(1)` is not defensive tidying — without it this is broken at 1:1.
-    // The anchor is a flip that has *already completed*, so the earliest
-    // instant anything can be presented at is one whole vblank later. At 25p
-    // on 50 Hz targets sit ~2 vblanks out and the question never arises; at
-    // **50p on 50 Hz they sit ~1 vblank out**, and any jitter that puts a
-    // target under half a period rounds it to zero — collapsing the target
-    // onto the anchor, an instant already in the past. The absolute sleep
-    // then returns immediately and the frame is presented unpaced, which is
-    // precisely the fault this function exists to prevent.
-    let vblanks = ((ahead_ns + period_ns / 2) / period_ns).max(1);
-    if vblanks > SNAP_MAX_VBLANKS_AHEAD {
-        return None;
-    }
-    anchor_ns.checked_add(vblanks.checked_mul(period_ns)?)
-}
-
 fn display_lead_ms(
     counters: &DisplayStatsCounters,
     configured: Option<u32>,
@@ -4742,7 +4672,6 @@ fn display_loop(
     clock: Arc<AudioClock>,
     counters: Arc<DisplayStatsCounters>,
     configured_lead_ms: Option<u32>,
-    vblank_snap: bool,
     vblank_cadence: bool,
     cancel: CancellationToken,
     output_stats: Arc<OutputStatsAccumulator>,
@@ -4827,6 +4756,29 @@ fn display_loop(
     let mut cadence: Option<CadenceScheduler> = None;
     // (measured vblank period in 10 µs units, source fps in milli-fps)
     let mut cadence_built_for: Option<(u64, u32)> = None;
+    // Runaway guard (#115). The scheduler's source-rate input is an EMA of
+    // PTS deltas taken *inside this loop*, so it only ever sees frames that
+    // survived the mpsc queue. That closes a positive feedback loop: hold
+    // slightly too long -> the queue backs up -> frames are shed on
+    // `mpsc_full` -> the surviving frames show doubled PTS gaps -> the EMA
+    // reports a slower source -> hold longer still. Nothing pulls it back.
+    //
+    // Measured on bilby-nuc over 20 minutes: presents decayed 1079 -> 454
+    // per minute while mpsc drops climbed 0 -> 841, the scheduler rebuilding
+    // dozens of times and walking 2.000 -> 2.25 -> 3.96 vblanks/frame, while
+    // the decoder was demonstrably still delivering 25.0 fps throughout.
+    //
+    // A correct cadence sheds NOTHING — bite, pi and pir6s all recorded
+    // mpsc = 0 across the same 20 minutes — so sustained shedding while
+    // engaged is unambiguous evidence the cadence is wrong, and the loop is
+    // broken by disengaging rather than by trying to servo back.
+    let mut cadence_mpsc_baseline: u64 = 0;
+    let mut cadence_engaged_at: Option<Instant> = None;
+    let mut cadence_blocked_until: Option<Instant> = None;
+    let mut cadence_last_build_at: Option<Instant> = None;
+    let mut cadence_guard_checked_at: Option<Instant> = None;
+    let mut cadence_guard_strikes: u32 = 0;
+    let mut cadence_failures: u32 = 0;
     let mut frames_since_period_reset: u32 = 0;
     // The `(width, height, fps)` hint from the last *fresh*
     // (EMA-stabilised) fps-locked modeset. Carried across PTS jumps /
@@ -5504,12 +5456,7 @@ fn display_loop(
                 // frames whose target sits near a vblank boundary.
                 let raw_target_ns = display_monotonic_now_ns()
                     .saturating_add(sleep_ms.saturating_mul(1_000_000));
-                let target_ns = if vblank_snap {
-                    snap_target_to_vblank(&kms, raw_target_ns).unwrap_or(raw_target_ns)
-                } else {
-                    raw_target_ns
-                };
-                display_sleep_until_monotonic_ns(target_ns);
+                display_sleep_until_monotonic_ns(raw_target_ns);
             }
         }
 
@@ -5535,15 +5482,52 @@ fn display_loop(
             kms.invalidate_prime_fb_cache();
         }
         // (Re)build the cadence scheduler when the panel mode or the measured
-        // source rate changes. Both inputs are *measured*, never advertised:
-        // `frame_period_ms` is an EMA of PTS deltas, and the vblank period
-        // comes from the kernel's own flip timestamps. `ingress_summary`'s
-        // reported fps is not used — it was observed pinned at 50.0 for
-        // minutes while the stream was actually 24 fps.
-        if vblank_cadence {
-            // Quantise the rate so EMA wobble does not rebuild every frame.
-            let fps_milli = if frame_period_ms > 0.0 {
-                (1000.0 / frame_period_ms * 1000.0).round() as u32
+        // source rate changes. Both inputs are *measured*, never advertised —
+        // `ingress_summary`'s reported fps is not used anywhere here, having
+        // been observed pinned at 50.0 for minutes while the stream was
+        // actually 24 fps.
+        //
+        // The source rate comes from `upstream_frame_period_us`, recorded in
+        // the decode task *before* the display queue. The loop's own
+        // `frame_period_ms` is measured after it and so only sees frames that
+        // survived, which made it a feedback path: hold too long -> shed ->
+        // survivors show doubled PTS gaps -> estimate slows -> hold longer.
+        // Video-only. An output with an audio device paces against the
+        // measured ALSA playout position (`AudioClock`), and holding frames on
+        // the vblank raster would fight that master clock: the hold decides
+        // presentation independently of where audio actually is, so the two
+        // diverge with nothing to pull them back. Locking video to the panel
+        // is only sound once audio is resampled to the same clock — mpv's
+        // display-sync does exactly that, and this does not (yet) — so decline
+        // rather than run somewhere the design has never been tested.
+        //
+        // `current_pts_90k_smoothed()` returning Some is the same condition
+        // the pacer below uses to choose the audio-master branch, so the two
+        // can never disagree about which clock is in charge.
+        let audio_is_master = clock.current_pts_90k_smoothed().is_some();
+        if audio_is_master && cadence.is_some() {
+            tracing::info!(
+                output_id = %output_id,
+                "display: audio clock became master — disengaging per-vblank cadence (video-only feature)"
+            );
+            cadence = None;
+            cadence_engaged_at = None;
+            cadence_built_for = None;
+        }
+        if vblank_cadence && !audio_is_master {
+            // Quantise to 0.1 fps. Milli-fps resolution meant every EMA
+            // wobble was a different key and rebuilt the scheduler — bilby-nuc
+            // rebuilt dozens of times in 20 minutes. Each rebuild reseeds
+            // `accum`, so drift absorption never survived long enough to act:
+            // the nuc absorbed ZERO over the whole run while bilby-pi, stable
+            // on one scheduler, absorbed 17. 0.1 fps keeps every broadcast
+            // rate distinct (23.976 and 24 differ by 0.1% of cadence, far
+            // inside the near-integer tolerance) while ignoring jitter.
+            const FPS_QUANTUM_MILLI: u32 = 100;
+            let upstream_us = counters.upstream_frame_period_us.load(Ordering::Relaxed);
+            let fps_milli = if upstream_us > 0 {
+                let raw = (1_000_000_000.0 / upstream_us as f64).round() as u32;
+                ((raw + FPS_QUANTUM_MILLI / 2) / FPS_QUANTUM_MILLI) * FPS_QUANTUM_MILLI
             } else {
                 0
             };
@@ -5559,15 +5543,48 @@ fn display_loop(
             let period_key = kms.vblank_period_ns().unwrap_or(0) / 10_000;
             let key = (period_key, fps_milli);
             let stabilised = frames_since_period_reset >= 40;
-            if stabilised && cadence_built_for != Some(key) && kms.vblank_clock_trusted() {
+            // Honour a runaway cooldown. Re-engaging straight after a
+            // disengage would just re-enter the loop that tripped it, since
+            // the EMA that caused it is still recovering.
+            let blocked = cadence_blocked_until.is_some_and(|t| Instant::now() < t);
+            // Unconditional rebuild rate-limit. Key changes alone are not a
+            // sufficient brake: bilby-nuc logged ~800 rebuilds in five minutes
+            // because a corrupted rate estimate swings across many quantisation
+            // buckets rather than jittering inside one. Each rebuild reseeds
+            // the accumulator, so churn does not merely waste work — it stops
+            // drift absorption from ever completing, and it re-armed the
+            // runaway guard's settle timer often enough that the guard could
+            // never fire.
+            const MIN_REBUILD_INTERVAL: Duration = Duration::from_secs(10);
+            let rebuild_allowed = cadence_last_build_at
+                .is_none_or(|t: Instant| t.elapsed() >= MIN_REBUILD_INTERVAL);
+            if stabilised
+                && !blocked
+                && rebuild_allowed
+                && cadence_built_for != Some(key)
+                && kms.vblank_clock_trusted()
+            {
                 let source_fps = f64::from(fps_milli) / 1000.0;
                 let panel_measured = kms
                     .vblank_period_ns()
                     .filter(|ns| *ns > 0)
                     .map(|ns| 1_000_000_000.0 / ns as f64)
                     .unwrap_or_else(|| f64::from(kms.refresh_hz()));
+                let was_engaged = cadence.is_some();
                 cadence = CadenceScheduler::new(panel_measured, source_fps);
                 cadence_built_for = Some(key);
+                cadence_last_build_at = Some(Instant::now());
+                // Baseline the runaway guard once per *engagement episode*, not
+                // per rebuild. Re-baselining on every rebuild walked the
+                // reference up with the damage and reset the settle timer, so
+                // the guard read 0 through 151 shed frames on bilby-nuc.
+                if !was_engaged {
+                    cadence_mpsc_baseline =
+                        counters.frames_dropped_mpsc_full.load(Ordering::Relaxed);
+                    cadence_engaged_at = Some(Instant::now());
+                    cadence_guard_checked_at = None;
+                    cadence_guard_strikes = 0;
+                }
                 match cadence.as_ref() {
                     Some(c) => tracing::info!(
                         output_id = %output_id,
@@ -5583,6 +5600,81 @@ fn display_loop(
                         "display: cadence not schedulable for this rate pair — \
                          keeping wall-clock pacing"
                     ),
+                }
+            }
+
+            // Runaway guard. A cadence that consumes slower than the source
+            // fills the decode queue and sheds on `mpsc_full`. Watch that one
+            // signal and stop rather than servo.
+            //
+            // Triggers on shedding being *ongoing*, not on a cumulative count.
+            // A count-based limit was measured too slow on bilby-nuc: it bled
+            // ~0.26 frames/s and took 100 seconds to cross a 25-frame
+            // threshold — 100 seconds of visibly bad picture, confirmed by the
+            // operator, while every counter said the guard was working. A
+            // healthy cadence sheds *exactly* zero (three units, 20 minutes,
+            // zero each), so any shedding that persists across consecutive
+            // checks is diagnostic on its own and the rate does not matter.
+            if let Some(engaged_at) = cadence_engaged_at
+                && cadence.is_some()
+            {
+                // A decoder re-open or a mode change can shed a handful of
+                // frames for reasons unrelated to the cadence.
+                const GUARD_SETTLE: Duration = Duration::from_secs(3);
+                // How often to look. Two consecutive positive samples means a
+                // decision inside ~4 s instead of ~100 s.
+                const GUARD_SAMPLE: Duration = Duration::from_secs(2);
+                const GUARD_STRIKES: u32 = 2;
+                if engaged_at.elapsed() > GUARD_SETTLE
+                    && cadence_guard_checked_at
+                        .is_none_or(|t: Instant| t.elapsed() >= GUARD_SAMPLE)
+                {
+                    cadence_guard_checked_at = Some(Instant::now());
+                    let shed_now = counters.frames_dropped_mpsc_full.load(Ordering::Relaxed);
+                    let shed_delta = shed_now.saturating_sub(cadence_mpsc_baseline);
+                    cadence_mpsc_baseline = shed_now;
+                    if shed_delta > 0 {
+                        cadence_guard_strikes += 1;
+                    } else {
+                        cadence_guard_strikes = 0;
+                    }
+                    if cadence_guard_strikes >= GUARD_STRIKES {
+                        // Escalating backoff. On a host where the cadence
+                        // cannot work, a fixed retry is worse than never
+                        // engaging: bilby-nuc would take ~100 s of stutter
+                        // every 5 minutes forever. Give up entirely after a
+                        // few attempts and say so once.
+                        cadence_failures = cadence_failures.saturating_add(1);
+                        const GIVE_UP_AFTER: u32 = 3;
+                        let cooldown = if cadence_failures >= GIVE_UP_AFTER {
+                            None
+                        } else {
+                            Some(Duration::from_secs(300 * u64::from(cadence_failures)))
+                        };
+                        tracing::warn!(
+                            output_id = %output_id,
+                            engaged_secs = engaged_at.elapsed().as_secs(),
+                            failures = cadence_failures,
+                            retry_in_secs = cooldown.map(|d| d.as_secs()),
+                            "display: per-vblank cadence is shedding frames — disengaging                              and reverting to wall-clock pacing. The scheduled cadence is                              slower than the source, which on this host means it has no                              headroom to hold frames at all."
+                        );
+                        if cooldown.is_none() {
+                            tracing::warn!(
+                                output_id = %output_id,
+                                "display: per-vblank cadence has failed {cadence_failures}                                  times on this output and will not be retried for the life                                  of this flow — this host cannot pace on the vblank raster"
+                            );
+                        }
+                        counters.cadence_disengaged.fetch_add(1, Ordering::Relaxed);
+                        cadence = None;
+                        cadence_engaged_at = None;
+                        cadence_guard_strikes = 0;
+                        cadence_built_for = None;
+                        cadence_blocked_until = match cooldown {
+                            Some(d) => Some(Instant::now() + d),
+                            // Far enough out to mean "never" for any real flow.
+                            None => Some(Instant::now() + Duration::from_secs(86_400 * 365)),
+                        };
+                    }
                 }
             }
         }
@@ -5609,13 +5701,14 @@ fn display_loop(
                 // committing. The panel re-scans the same framebuffer, so a
                 // hold costs nothing but the wait.
                 //
-                // This is the half `present_vblank_snap` cannot do. Snapping
-                // only moves *when* a flip is asked for, which is why it goes
-                // inert at 1:1 (measured 100% no-sleep at 50p on a 50 Hz
-                // panel — the branch it lives in is never taken). Holding
-                // decides *which* vblanks a frame occupies, so it still acts
-                // there, and it generates 2:3 pulldown at 24p rather than
-                // hoping the wall clock lands on it.
+                // Deciding *which* vblanks a frame occupies is what makes
+                // this work at 1:1, where merely rounding a wall-clock target
+                // to the nearest vblank cannot act at all (an earlier
+                // `present_vblank_snap` prototype measured 100% no-sleep at
+                // 50p on a 50 Hz panel — the branch it lived in was never
+                // taken, so it was deleted rather than shipped alongside
+                // this). Holding also *generates* 2:3 pulldown at 24p rather
+                // than hoping the wall clock lands on it.
                 if let Some(sched) = cadence.as_mut() {
                     let hold = sched.next_hold();
                     if hold.kind == HoldKind::DriftAbsorb {
@@ -6634,69 +6727,6 @@ mod tests {
             RKMPP_PRESENT_LEAD_MS,
             "the shipped default must not be clamped at the seed period"
         );
-    }
-
-    // ── vblank snapping (issue #115) ──────────────────────────────────
-
-    const P50: u64 = 20_000_000; // 50 Hz vblank period, ns
-
-    #[test]
-    fn snap_rounds_to_the_nearest_grid_point_not_upward() {
-        // Just past a grid point rounds back to it; rounding up would add a
-        // near-whole vblank of latency for a sub-millisecond overshoot.
-        assert_eq!(snap_to_grid(0, P50, 2 * P50 + 1_000_000), Some(2 * P50));
-        // Just short of one rounds up to it.
-        assert_eq!(snap_to_grid(0, P50, 3 * P50 - 1_000_000), Some(3 * P50));
-    }
-
-    /// Regression test for the 1:1 case (50p on a 50 Hz panel).
-    ///
-    /// The anchor is a flip that has already completed, so nothing can be
-    /// presented earlier than one vblank later. A target under half a period
-    /// ahead must still resolve to the *next* vblank — not to the anchor,
-    /// which is in the past and would be presented immediately and unpaced.
-    #[test]
-    fn snap_never_targets_the_anchor_itself() {
-        let anchor = 1_000_000_000;
-        for ahead_ns in [0, 1, P50 / 4, P50 / 2 - 1] {
-            let got = snap_to_grid(anchor, P50, anchor + ahead_ns);
-            assert_eq!(
-                got,
-                Some(anchor + P50),
-                "target {ahead_ns} ns ahead must land on the next vblank, not the anchor"
-            );
-            assert!(got.unwrap() > anchor, "snapped target must be in the future");
-        }
-    }
-
-    #[test]
-    fn snap_declines_rather_than_extrapolating_far_from_the_anchor() {
-        // Beyond the ceiling the accrued error in the period estimate exceeds
-        // what snapping buys, so the caller keeps its wall-clock target.
-        assert_eq!(snap_to_grid(0, P50, 17 * P50), None);
-        assert!(snap_to_grid(0, P50, 16 * P50).is_some());
-    }
-
-    #[test]
-    fn snap_declines_on_an_unusable_clock() {
-        // Target behind the anchor: the caller is catching up, leave it alone.
-        assert_eq!(snap_to_grid(1_000_000_000, P50, 999_000_000), None);
-        // No period available.
-        assert_eq!(snap_to_grid(0, 0, P50), None);
-    }
-
-    #[test]
-    fn snap_output_is_always_on_the_grid() {
-        let anchor = 12_345_678_901;
-        for k in 1..=16u64 {
-            let target = anchor + k * P50 + 3_000_000; // offset off-grid
-            let snapped = snap_to_grid(anchor, P50, target).expect("within ceiling");
-            assert_eq!(
-                (snapped - anchor) % P50,
-                0,
-                "snapped instant must be a whole number of vblanks from the anchor"
-            );
-        }
     }
 
     // ── HW re-promotion backoff (issue #97) ───────────────────────────

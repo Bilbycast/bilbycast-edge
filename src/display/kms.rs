@@ -610,6 +610,10 @@ pub struct KmsDisplay {
     /// completes, eliminating the green-flash / stuck-frame artefacts
     /// the VA pool causes when surfaces recycle mid-scanout.
     prime_state: Option<PrimeState>,
+    /// `(fourcc, modifier)` pairs the primary plane advertises via
+    /// `IN_FORMATS` (#116). `None` until the atomic plane is resolved, or on
+    /// a driver that does not advertise the property — "unknown", not "none".
+    scanout_formats: Option<Vec<(u32, u64)>>,
     /// Imported-framebuffer cache keyed by [`dmabuf_identity`] — see
     /// [`PrimeFbCacheEntry`]. Avoids re-running `prime_fd_to_buffer` +
     /// `add_planar_framebuffer` for a decode buffer this session has
@@ -888,6 +892,36 @@ impl KmsDisplay {
             }
         }
 
+        // Ask the plane which (fourcc, modifier) pairs it will scan out,
+        // BEFORE any frame is presented (#116). Discovering this lazily inside
+        // `present_prime` was useless: the atomic setup is resolved there
+        // *after* the import it is meant to pre-empt, so the first frame
+        // always tried and failed, and the sticky "scanout permanently
+        // rejected" demotion had already fired by the time the answer existed.
+        let scanout_formats =
+            find_primary_plane(&card, crtc).and_then(|p| read_plane_in_formats(&card, p));
+        match scanout_formats.as_ref() {
+            Some(f) => {
+                let nv12 = f.iter().any(|(fourcc, _)| *fourcc == NV12_FOURCC);
+                tracing::info!(
+                    pairs = f.len(),
+                    nv12_scanout = nv12,
+                    "display: scanout formats discovered"
+                );
+                if !nv12 {
+                    // Not fatal — the CPU-blit path uses XRGB and works. But
+                    // it is the whole reason zero-copy can never engage on
+                    // this host, and it is otherwise invisible.
+                    tracing::warn!(
+                        "display: this plane cannot scan out NV12 — zero-copy is                          unavailable on this hardware and every frame will take a                          sysmem download plus a software blit (#116)"
+                    );
+                }
+            }
+            None => tracing::debug!(
+                "display: driver does not advertise IN_FORMATS — scanout support                  stays unknown, imports will be attempted"
+            ),
+        }
+
         Ok(Self {
             card,
             crtc,
@@ -907,6 +941,7 @@ impl KmsDisplay {
             clock_trusted: AtomicBool::new(false),
             crtc_pipe: AtomicU32::new(u32::MAX),
             prime_state: None,
+            scanout_formats,
             prime_fb_cache: std::collections::HashMap::new(),
             prime_fb_cache_order: std::collections::VecDeque::new(),
             use_atomic,
@@ -2627,6 +2662,102 @@ fn discover_yuv_overlay_zpos(
 /// Read a u64-valued property by name, returning `None` when the
 /// property is absent on the object. Used to snapshot the primary
 /// plane's `zpos` so the bars plane can be ordered above it.
+/// The (fourcc, modifier) pairs a plane will actually scan out, read from its
+/// `IN_FORMATS` blob (#116).
+///
+/// Worth asking *before* attempting an import rather than after. Intel Gen9
+/// (Skylake) advertises no NV12 on any plane under any modifier — only packed
+/// YUV — so a VAAPI NV12 surface can never be scanned out there. Discovering
+/// that from a per-frame `addfb` EINVAL means a stream of warnings and a
+/// silent demotion to a sysmem download plus a software blit; discovering it
+/// here means one clear line at open and a deliberate choice of path.
+///
+/// Returns `None` when the driver does not advertise `IN_FORMATS` at all, in
+/// which case the caller must keep its previous try-and-see behaviour — an
+/// absent blob means "unknown", never "unsupported".
+/// `DRM_FORMAT_NV12` — the format every zero-copy decoder on this fleet
+/// (VAAPI, RKMPP) produces.
+const NV12_FOURCC: u32 = u32::from_le_bytes(*b"NV12");
+
+/// The primary plane driving `crtc`, found without building the whole
+/// [`AtomicSetup`].
+///
+/// Needed because scanout-format discovery has to happen *before* the first
+/// PRIME import, and the atomic setup is discovered lazily inside
+/// `present_prime` — after the import it is meant to prevent. Placing the
+/// question here means the answer exists when it is first asked.
+fn find_primary_plane(
+    card: &CardFile,
+    crtc: drm::control::crtc::Handle,
+) -> Option<drm::control::plane::Handle> {
+    let res = card.resource_handles().ok()?;
+    for p in card.plane_handles().ok()? {
+        let info = card.get_plane(p).ok()?;
+        if !res.filter_crtcs(info.possible_crtcs()).contains(&crtc) {
+            continue;
+        }
+        if read_plane_type(card, p).ok()? == PlaneType::Primary as u64 {
+            return Some(p);
+        }
+    }
+    None
+}
+
+fn read_plane_in_formats(
+    card: &CardFile,
+    plane: drm::control::plane::Handle,
+) -> Option<Vec<(u32, u64)>> {
+    let set = card.get_properties(plane).ok()?;
+    let (ids, vals) = set.as_props_and_values();
+    let mut blob_id = None;
+    for (id, val) in ids.iter().zip(vals.iter()) {
+        if let Ok(info) = card.get_property(*id)
+            && info.name().to_bytes() == b"IN_FORMATS"
+        {
+            blob_id = Some(*val);
+            break;
+        }
+    }
+    let raw = card.get_property_blob(blob_id?).ok()?;
+    // struct drm_format_modifier_blob { u32 version, flags, count_formats,
+    //   formats_offset, count_modifiers, modifiers_offset; }
+    // followed by a u32 fourcc array and a
+    // struct drm_format_modifier { u64 formats; u32 offset; u32 pad;
+    //   u64 modifier; } array.
+    if raw.len() < 24 {
+        return None;
+    }
+    let rd32 = |o: usize| -> u32 { u32::from_ne_bytes(raw[o..o + 4].try_into().unwrap()) };
+    let rd64 = |o: usize| -> u64 { u64::from_ne_bytes(raw[o..o + 8].try_into().unwrap()) };
+    let count_formats = rd32(8) as usize;
+    let formats_offset = rd32(12) as usize;
+    let count_modifiers = rd32(16) as usize;
+    let modifiers_offset = rd32(20) as usize;
+    if formats_offset + count_formats * 4 > raw.len()
+        || modifiers_offset + count_modifiers * 24 > raw.len()
+    {
+        return None;
+    }
+    let fourccs: Vec<u32> = (0..count_formats)
+        .map(|i| rd32(formats_offset + i * 4))
+        .collect();
+    let mut out = Vec::new();
+    for i in 0..count_modifiers {
+        let base = modifiers_offset + i * 24;
+        let mask = rd64(base);
+        let offset = rd32(base + 8) as usize;
+        let modifier = rd64(base + 16);
+        for bit in 0..64usize {
+            if (mask >> bit) & 1 == 1
+                && let Some(fourcc) = fourccs.get(offset + bit)
+            {
+                out.push((*fourcc, modifier));
+            }
+        }
+    }
+    Some(out)
+}
+
 fn read_property_u64(
     card: &CardFile,
     handle: impl drm::control::ResourceHandle,
@@ -3004,6 +3135,28 @@ impl KmsDisplay {
         } else {
             Some(DrmModifier::from(modifier_raw))
         };
+
+        // Ask before importing (#116). The plane published exactly which
+        // (fourcc, modifier) pairs it will scan out; attempting an import the
+        // kernel has already told us it will refuse costs an ioctl and a
+        // warning per frame, and — worse — reports as a runtime failure what
+        // is really a fixed property of the hardware. Intel Gen9 advertises no
+        // NV12 on any plane under any modifier, so on that host this is never
+        // going to work and the caller should take the sysmem path
+        // deliberately rather than as an error recovery.
+        //
+        // `Some(false)` is the only refusal. `None` means the driver did not
+        // advertise IN_FORMATS, and an absent answer must never be read as
+        // "no" — those hosts keep the previous try-and-see behaviour.
+        if self.scanout_supports(descriptor.fourcc, modifier_raw) == Some(false) {
+            anyhow::bail!(
+                "display_prime_format_unsupported: this plane does not scan out \
+                 fourcc 0x{:08x} with modifier 0x{:016x} — not a failure, a \
+                 capability of the display engine (#116)",
+                descriptor.fourcc,
+                modifier_raw
+            );
+        }
 
         // Check the import cache first — a decoder buffer pool recycles
         // a small fixed set of underlying DMA-BUFs (RKMPP: ≤16), and
@@ -4204,6 +4357,23 @@ impl KmsDisplay {
     /// existing timing path while this is `false` rather than fall back to a
     /// guess: a scheduler on a bad clock fails silently, because the metrics
     /// that would reveal it are derived from the same clock.
+    /// Whether the primary plane will scan out this `(fourcc, modifier)`
+    /// pair (#116).
+    ///
+    /// `None` means "the driver did not say" — no `IN_FORMATS` blob, or the
+    /// atomic plane is not yet resolved. Callers must treat that as unknown
+    /// and keep trying the import, never as a refusal.
+    pub fn scanout_supports(&self, fourcc: u32, modifier: u64) -> Option<bool> {
+        let formats = self.scanout_formats.as_ref()?;
+        Some(formats.iter().any(|(f, m)| *f == fourcc && *m == modifier))
+    }
+
+    /// Every `(fourcc, modifier)` pair the primary plane accepts, for
+    /// diagnostics and for choosing a convertible target format.
+    pub fn scanout_formats(&self) -> Option<&[(u32, u64)]> {
+        self.scanout_formats.as_deref()
+    }
+
     pub fn vblank_clock_trusted(&self) -> bool {
         self.clock_trusted.load(Ordering::Acquire)
     }

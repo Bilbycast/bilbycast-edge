@@ -1386,6 +1386,24 @@ pub struct DisplayStats {
     /// describing something other than the scheduler.
     #[serde(default)]
     pub cadence_hold_aborted: u64,
+    /// Times the runaway guard disengaged the cadence (#115). Any non-zero
+    /// value means the feature failed closed on this output: the scheduled
+    /// cadence ran slower than the source, the decode queue shed frames, and
+    /// the shed frames corrupted the very rate estimate driving the cadence.
+    #[serde(default)]
+    pub cadence_disengaged: u64,
+    /// Source frame period (µs) measured in the decode task, before the
+    /// display queue (#115). Compare against the presented rate: a large
+    /// divergence means frames are being shed between decode and panel.
+    #[serde(default)]
+    pub upstream_frame_period_us: u64,
+    /// Mean `download_to_sysmem` cost (µs) and how many ran. Non-zero only on
+    /// hosts where zero-copy scanout is unavailable, and the number that says
+    /// whether removing the copy is worth doing.
+    #[serde(default)]
+    pub download_us_avg: u64,
+    #[serde(default)]
+    pub download_count: u64,
     #[serde(default)]
     pub present_interval_count: u64,
     /// Average `blit_and_present` duration since startup, in µs.

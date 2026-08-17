@@ -6817,35 +6817,12 @@ pub struct DisplayOutputConfig {
 
     /// Snap each frame's present instant to the panel's real vblank grid.
     ///
-    /// `present_lead_ms` fixes frames arriving *late*. This fixes a different
-    /// fault that survives it (#112): the present target free-runs against the
-    /// raster, so when it drifts near a vblank boundary, sub-millisecond
-    /// scheduling noise decides which of two adjacent vblanks catches the
-    /// flip. The panel then shows one frame for a single vblank and the next
-    /// for three — balanced short/long pairs, nothing dropped, every loss
-    /// counter clean.
-    ///
-    /// The drift is not removable: source and panel are independent crystals.
-    /// Measured on this fleet the difference is ~33 ppm, which walks the phase
-    /// through a whole vblank every ~10 minutes. Snapping *absorbs* it — the
-    /// target is rounded up to a true vblank instant taken from the kernel's
-    /// own flip timestamps, so every present aims at a grid point with full
-    /// margin either side, and the accumulated drift lands as one whole-vblank
-    /// step per beat period instead of continuous sub-frame slide.
-    ///
-    /// Requires the driver to report honest flip timestamps; where it does
-    /// not, the resolver falls back to the previous wall-clock behaviour
-    /// automatically. Applies only to outputs with **no audio device** — the
-    /// audio-master path paces against ALSA playout and has no target of its
-    /// own to snap. Unset defaults to **off** pending fleet validation.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub present_vblank_snap: Option<bool>,
-
     /// Assign frames to whole vblanks instead of to wall-clock instants
     /// (#115 P3).
     ///
-    /// `present_vblank_snap` moves *when* a flip is requested; this decides
-    /// *which vblanks a frame occupies*. At 25p on 50 Hz it holds every
+    /// Decides *which vblanks a frame occupies*, rather than computing a
+    /// wall-clock instant and hoping it lands on the right one. At 25p on
+    /// 50 Hz it holds every
     /// frame for 2 vblanks; at 24p on 60 Hz it generates 2:3 pulldown
     /// (3,2,3,2) rather than hoping the wall clock lands on it. Crystal
     /// drift is absorbed as one longer or shorter hold per beat period
@@ -6857,6 +6834,13 @@ pub struct DisplayOutputConfig {
     /// keeps the existing wall-clock path. A source faster than the panel
     /// needs frame *dropping*, which is a different algorithm and is not
     /// implemented — 60p on a 50 Hz panel is declined.
+    ///
+    /// **Video-only outputs.** An output with an audio device paces against
+    /// the measured ALSA playout position, and holding frames on the vblank
+    /// raster would fight that master clock. Locking video to the panel is
+    /// only sound once audio is resampled to the same clock (what mpv's
+    /// display-sync does, and what this does not yet do), so the resolver
+    /// declines to engage where an audio clock is driving the output.
     ///
     /// Unset defaults to **off** pending fleet validation.
     #[serde(default, skip_serializing_if = "Option::is_none")]

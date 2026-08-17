@@ -754,6 +754,44 @@ pub struct DisplayStatsCounters {
     /// cadence intended, so the panel is not receiving the pattern the
     /// scheduler computed.
     pub cadence_hold_aborted: AtomicU64,
+    /// Times the runaway guard tore the cadence down (#115). Non-zero means
+    /// the scheduler was consuming slower than the source and the picture
+    /// reverted to wall-clock pacing — the feature did not hold on this host.
+    pub cadence_disengaged: AtomicU64,
+    /// Source frame period (µs) measured **upstream of the display queue**,
+    /// in the decode task, immediately before each frame is offered to the
+    /// mpsc (#115).
+    ///
+    /// The display loop's own `frame_period_ms` EMA is taken *after* the
+    /// queue, so it only ever sees frames that survived it. That closed a
+    /// positive feedback loop for the vblank cadence: holding too long shed
+    /// frames, the survivors showed doubled PTS gaps, the estimate reported a
+    /// slower source, and the cadence held longer still (bilby-nuc walked
+    /// 2.0 -> 3.96 vblanks/frame and ended shedding 17 frames in 25). Measured
+    /// here the estimate is immune, because it is taken before anything can be
+    /// dropped.
+    ///
+    /// Recorded per *presented* frame, so bob-deinterlaced fields count
+    /// individually and the value is the presentation rate the cadence needs,
+    /// not the decoder's frame rate.
+    ///
+    /// Single-writer (the decode task); `Relaxed` throughout.
+    pub upstream_frame_period_us: AtomicU64,
+    /// Previous PTS seen by [`Self::upstream_frame_period_us`]; `0` means
+    /// "none yet" (a genuine PTS of 0 merely costs one skipped sample, which
+    /// is why this needs no custom `Default`). Decode task only.
+    pub upstream_last_pts_90k: AtomicU64,
+    /// Time spent in `download_to_sysmem` (µs, running total) and the number
+    /// of downloads, so the GPU->CPU copy can be separated from decode itself.
+    ///
+    /// Exists to answer one question before any work is done to remove the
+    /// copy: on a host that cannot scan out the decoder's format, is the copy
+    /// actually the cost, or is the decoder simply slower? bilby-nuc's
+    /// `decode_us` is 5x bilby-bite's, but an isolated benchmark put the copy
+    /// at only ~0.4 ms — which would make the copy a minor term and a GPU-side
+    /// format conversion largely pointless. Measure, then decide.
+    pub download_us_total: AtomicU64,
+    pub download_count: AtomicU64,
     /// Denominator for the above.
     pub present_interval_count: AtomicU64,
     /// Sum of `blit_and_present` durations since startup (µs). Read
@@ -1613,6 +1651,20 @@ impl OutputStatsAccumulator {
                     .cadence_drift_absorbed
                     .load(Ordering::Relaxed),
                 cadence_hold_aborted: h.counters.cadence_hold_aborted.load(Ordering::Relaxed),
+                cadence_disengaged: h.counters.cadence_disengaged.load(Ordering::Relaxed),
+                upstream_frame_period_us: h
+                    .counters
+                    .upstream_frame_period_us
+                    .load(Ordering::Relaxed),
+                download_us_avg: {
+                    let n = h.counters.download_count.load(Ordering::Relaxed);
+                    if n == 0 {
+                        0
+                    } else {
+                        h.counters.download_us_total.load(Ordering::Relaxed) / n
+                    }
+                },
+                download_count: h.counters.download_count.load(Ordering::Relaxed),
                 present_interval_count: h
                     .counters
                     .present_interval_count
