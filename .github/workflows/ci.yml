@@ -162,6 +162,33 @@ jobs:
         working-directory: bilbycast-edge
         run: cargo check --all-targets --locked
 
+      # ─── Multiviewer compile gate ────────────────────────────────────────
+      # `multiviewer` is off by default, so the steps above never compile the
+      # ~1,450 lines behind it (`engine::mosaic`, `engine::input_mosaic`) nor
+      # run their 35 tests. That is the same hole `sdi-decklink` sat in until
+      # the gate below was written, and it is worse here: the feature's only
+      # callers of `video-engine`'s `av_pix_fmt_bgra` live inside the gated
+      # module, and every sibling repo is checked out at its DEFAULT BRANCH
+      # with no `ref:` pin — so without this step nothing in CI would ever
+      # notice bilbycast-edge and bilbycast-ffmpeg-video-rs disagreeing about
+      # that API.
+      #
+      # Unconditional and cheap: `multiviewer` implies only `media-codecs`,
+      # which the default set already carries, so it adds no apt dependency
+      # and reuses the target dir the step above just filled. Required by
+      # docs/MULTIVIEWER_PLAN.md §6.3 item 1.
+      #
+      # Clippy is here as well as `check`, unlike the SDI gate, because the
+      # repo-wide clippy step below runs on default features and would leave
+      # the compositor the only unlinted module in the tree.
+      - name: cargo check (multiviewer)
+        working-directory: bilbycast-edge
+        run: cargo check --all-targets --locked --features multiviewer
+
+      - name: cargo clippy (multiviewer)
+        working-directory: bilbycast-edge
+        run: cargo clippy --all-targets --locked --features multiviewer -- -D warnings
+
       # ─── SDI (DeckLink) compile gate ─────────────────────────────────────
       # The ~2.2k lines behind `sdi-decklink` were never compiled anywhere in
       # CI, because the release workflow drops the feature whenever the SDK
