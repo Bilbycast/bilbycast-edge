@@ -4349,14 +4349,6 @@ impl KmsDisplay {
         Ok(idx)
     }
 
-    /// Whether the flip clock may be scheduled against (#115 P2).
-    ///
-    /// `false` until a measurement window has completed *and* agreed with the
-    /// mode's advertised refresh, so a driver reporting a fabricated or stalled
-    /// timebase can never become the reference. Callers must keep their
-    /// existing timing path while this is `false` rather than fall back to a
-    /// guess: a scheduler on a bad clock fails silently, because the metrics
-    /// that would reveal it are derived from the same clock.
     /// Whether the primary plane will scan out this `(fourcc, modifier)`
     /// pair (#116).
     ///
@@ -4368,7 +4360,14 @@ impl KmsDisplay {
         Some(formats.iter().any(|(f, m)| *f == fourcc && *m == modifier))
     }
 
-
+    /// Whether the flip clock may be scheduled against (#115 P2).
+    ///
+    /// `false` until a measurement window has completed *and* agreed with the
+    /// mode's advertised refresh, so a driver reporting a fabricated or stalled
+    /// timebase can never become the reference. Callers must keep their
+    /// existing timing path while this is `false` rather than fall back to a
+    /// guess: a scheduler on a bad clock fails silently, because the metrics
+    /// that would reveal it are derived from the same clock.
     pub fn vblank_clock_trusted(&self) -> bool {
         self.clock_trusted.load(Ordering::Acquire)
     }

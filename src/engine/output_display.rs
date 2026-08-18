@@ -53,10 +53,10 @@ use video_engine::{
 
 use crate::config::models::{DisplayOutputConfig, DisplayScalingMode};
 use crate::display::audio_bars::{new_shared_meter, SharedMeter, StreamHeader};
-use crate::engine::display_cadence::{rebuild_key, CadenceScheduler, HoldKind};
 use crate::display::audio_meter::spawn_audio_meter;
 use crate::display::{audio::AudioBackend, clock::AudioClock, kms::KmsDisplay};
 use crate::engine::audio_decode::DecodeStats;
+use crate::engine::display_cadence::{rebuild_key, CadenceScheduler, HoldKind};
 use crate::engine::packet::RtpPacket;
 use crate::engine::ts_demux::{DemuxedFrame, TsDemuxer};
 use crate::engine::video_decode_stats::VideoDecodeStats;
@@ -4634,6 +4634,71 @@ impl DisplayPresentLatch {
 /// delivery* jitter, which is a wall-clock property of the backend.
 const RKMPP_PRESENT_LEAD_MS: u64 = 200;
 
+/// Presentation lead time in milliseconds for the **wall-clock** pacing
+/// path, set per output by `DisplayOutputConfig::present_lead_ms`.
+///
+/// The wall-clock pacer targets `anchor_at + pts_delta`, which is already an
+/// absolute anchored schedule — per-frame arrival jitter cannot move it. What
+/// it cannot do is present a frame that has not arrived yet: a frame handed
+/// over *past* its target is presented immediately, collapsing the interval
+/// against the previous on-time present. Measured on RKMPP (#104) as drift
+/// dipping to -20..-56 ms while sitting at +39/40 ms the rest of the time,
+/// producing present intervals as short as 13 ms on a panel whose vblank is
+/// 20 ms — i.e. two flips inside one vblank period.
+///
+/// Pushing the anchor later gives every frame that much more time to arrive
+/// before its target, at the cost of exactly that much added latency. VAAPI
+/// does not need it (`receive_frame` returns in ~1 us and drift never moved
+/// >=20 ms across 148 samples); RKMPP blocks up to 17 ms and bursts.
+///
+/// **What the lead physically buys is decode-queue depth.** The decoder is
+/// fed by a live source, so it cannot run ahead of real time; presenting
+/// `L` later simply means `L / frame_period` frames sit in the `vrx` mpsc
+/// at any instant, and a delivery burst is served out of that backlog
+/// instead of stalling `recv()`. That is why the elbow (~120 ms ≈ 3 frames)
+/// sits so far above RKMPP's 17 ms worst-case `receive_frame`: it is
+/// bounding a burst, not a single late hand-over. It is also why the lead
+/// is clamped against [`MPSC_VIDEO_DEPTH`] — a lead the queue cannot hold
+/// does not deepen the backlog, it just spills onto
+/// `frames_dropped_mpsc_full`.
+///
+/// Measured on bilby-pi (RK3568), 110 s per arm, fixed-bucket metric whose
+/// noise floor is +/-1.6 pp across three consecutive runs:
+///
+/// | lead ms | presents on target (38-42 ms) | arrived late |
+/// |---|---|---|
+/// | 0 | 70.5 - 72.1 % | ~19 % |
+/// | 40 | 68.0 % | 22.5 % |
+/// | 80 | 81.2 % | 9.3 % |
+/// | 120 | 98.1 % | 0.2 % |
+/// | 160 | 98.1 % | 0.0 % |
+/// | **200** | **99.7 - 99.9 %** | **0.0 %** |
+///
+/// Confirmed A/B/A/B (0 -> 200 -> 0 -> 200) with every arm replicated.
+/// One frame period (40 ms) buys nothing; the elbow is ~120 ms and 200 ms
+/// saturates.
+///
+/// **This only applies where there is no audio to sync against**, which is
+/// also the reason 200 ms is an acceptable default rather than an expensive
+/// one. It is set inside the `wall_anchor` branch, reached only when
+/// `AudioClock::current_pts_90k_smoothed()` returns `None` — i.e. muted or
+/// video-only output. On the audio-master path `wall_anchor` is cleared and
+/// never consulted, so this cannot shift video against audio and carries no
+/// lip-sync risk. The cost is therefore pure display latency: a confidence
+/// monitor sits 200 ms further behind the source, with nothing to fall out
+/// of sync with. Set `present_lead_ms: 0` where that latency matters more
+/// than the smoothness — that restores the previous behaviour exactly.
+///
+/// Corollary worth stating plainly: an **audio-enabled** display output
+/// still has the fault and this does not fix it. The audio branch paces
+/// against the measured ALSA playout position, which has no anchor to seed.
+///
+/// There is deliberately **no env-var override**. One existed while this
+/// was being measured, and it is strictly worse than the config field on
+/// every axis: node-wide where the fault is per-decoder, needing a process
+/// restart where a config edit restarts only the output, unvalidated, and
+/// silently shadowed by any output that sets the field. The per-decoder
+/// default already covers the case it was reaching for.
 fn display_lead_ms(
     counters: &DisplayStatsCounters,
     configured: Option<u32>,
@@ -5460,9 +5525,9 @@ fn display_loop(
                 // slop of `std::thread::sleep` on SCHED_OTHER, which at
                 // 60 Hz can push the next page-flip a full vblank late on
                 // frames whose target sits near a vblank boundary.
-                let raw_target_ns = display_monotonic_now_ns()
+                let target_ns = display_monotonic_now_ns()
                     .saturating_add(sleep_ms.saturating_mul(1_000_000));
-                display_sleep_until_monotonic_ns(raw_target_ns);
+                display_sleep_until_monotonic_ns(target_ns);
             }
         }
 
@@ -5731,12 +5796,17 @@ fn display_loop(
                             engaged_secs = engaged_at.elapsed().as_secs(),
                             failures = cadence_failures,
                             retry_in_secs = cooldown.map(|d| d.as_secs()),
-                            "display: per-vblank cadence is shedding frames — disengaging                              and reverting to wall-clock pacing. The scheduled cadence is                              slower than the source, which on this host means it has no                              headroom to hold frames at all."
+                            "display: per-vblank cadence is shedding frames — disengaging \
+                             and reverting to wall-clock pacing. The scheduled cadence \
+                             is slower than the source, which on this host means it has \
+                             no headroom to hold frames at all."
                         );
                         if cooldown.is_none() {
                             tracing::warn!(
                                 output_id = %output_id,
-                                "display: per-vblank cadence has failed {cadence_failures}                                  times on this output and will not be retried for the life                                  of this flow — this host cannot pace on the vblank raster"
+                                "display: per-vblank cadence has failed {cadence_failures} times on \
+                                 this output and will not be retried for the life of \
+                                 this flow — this host cannot pace on the vblank raster"
                             );
                         }
                         counters.cadence_disengaged.fetch_add(1, Ordering::Relaxed);
