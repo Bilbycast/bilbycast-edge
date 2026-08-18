@@ -56,7 +56,7 @@ use crate::display::audio_bars::{new_shared_meter, SharedMeter, StreamHeader};
 use crate::display::audio_meter::spawn_audio_meter;
 use crate::display::{audio::AudioBackend, clock::AudioClock, kms::KmsDisplay};
 use crate::engine::audio_decode::DecodeStats;
-use crate::engine::display_cadence::{rebuild_key, CadenceScheduler, HoldKind};
+use crate::engine::display_cadence::{cadence_is_stale, rebuild_key, CadenceScheduler, HoldKind};
 use crate::engine::packet::RtpPacket;
 use crate::engine::ts_demux::{DemuxedFrame, TsDemuxer};
 use crate::engine::video_decode_stats::VideoDecodeStats;
@@ -4848,7 +4848,16 @@ fn display_loop(
     // Per-frame cost sampled only while cadence is disengaged — see the
     // headroom precondition at the engage gate for why that matters.
     let mut cadence_offpath_cost_us: Option<u64> = None;
-    let mut cadence_no_headroom_logged = false;
+    // Snapshot of (blit_us_total, blit_count, download_us_total, download_count)
+    // taken at the start of a run of DISENGAGED frames, so the cost above can be
+    // a windowed delta rather than a lifetime mean. Cleared whenever the cadence
+    // is engaged, so a window can never span an engaged frame.
+    let mut cadence_cost_window: Option<(u64, u64, u64, u64)> = None;
+    // Throttle, not a one-shot. The cost is now a windowed measurement that can
+    // legitimately change answer, and the stale check makes re-engagement
+    // routine, so a node persistently refused would otherwise say why once and
+    // then never again for the life of the flow.
+    let mut cadence_no_headroom_logged_at: Option<Instant> = None;
     let mut cadence_failures: u32 = 0;
     let mut frames_since_period_reset: u32 = 0;
     // The `(width, height, fps)` hint from the last *fresh*
@@ -5591,9 +5600,17 @@ fn display_loop(
             // rebuilt dozens of times in 20 minutes. Each rebuild reseeds
             // `accum`, so drift absorption never survived long enough to act:
             // the nuc absorbed ZERO over the whole run while bilby-pi, stable
-            // on one scheduler, absorbed 17. 0.1 fps keeps every broadcast
-            // rate distinct (23.976 and 24 differ by 0.1% of cadence, far
-            // inside the near-integer tolerance) while ignoring jitter.
+            // on one scheduler, absorbed 17.
+            //
+            // It does NOT keep every broadcast rate distinct, which an earlier
+            // comment here claimed: 23.976 and 24.000 both key 24 000, and
+            // 29.97 and 30.000 both key 30 000. (59.94 is the odd one out — it
+            // keys 59 900, being nearer that than 60 000.) The collapse is
+            // accepted rather than fixed: a real 23.976 <-> 24 switch leaves a
+            // 0.1 % ratio error, one extra absorbed hold roughly every 17
+            // minutes, which is precisely what `accum` exists to absorb. State
+            // it plainly instead of denying it — this is an IDENTITY for
+            // deciding "same rate pair?", not a rate anything computes with.
             const FPS_QUANTUM_MILLI: u32 = 100;
             let upstream_us = counters.upstream_frame_period_us.load(Ordering::Relaxed);
             let fps_milli = if upstream_us > 0 {
@@ -5608,10 +5625,70 @@ fn display_loop(
             // 49.998 once a full window ran on the settled mode — left the
             // key unchanged at 50, so the scheduler kept the first, worst
             // reading for the life of the flow and drove a cadence of 2.024
-            // where the truth was 2.000. Quantising to 10 µs is ~25 ppm at
-            // 50 Hz: fine enough to notice a wrong measurement, coarse
-            // enough that ordinary jitter does not rebuild the scheduler.
-            let key = rebuild_key(kms.vblank_period_ns().unwrap_or(0), fps_milli);
+            // where the truth was 2.000. Quantising to 10 µs is 500 ppm at
+            // 50 Hz — ~170x the endpoint estimator's noise, and 24 bins away
+            // from that 1.2 % misreading: fine enough to notice a wrong
+            // measurement, coarse enough that jitter does not rebuild.
+            let panel_period_ns = kms.vblank_period_ns();
+            let key = rebuild_key(panel_period_ns.unwrap_or(0), fps_milli);
+
+            // A key change says a better scheduler is AVAILABLE. It cannot say
+            // the running one is still SAFE, and those come apart exactly when
+            // it matters: `invalidate_vblank_clock` drops `clock_trusted` on
+            // every modeset, which blocks the rebuild below for a whole
+            // re-measurement window (600 flips, ~24 s at 25 fps) — while
+            // nothing disengages the scheduler already running. It keeps
+            // allocating vblanks at the old panel's rate against the new
+            // panel. On a 60 -> 50 Hz auto-match that is 2.4 vblanks/frame
+            // against a panel delivering 2.0, i.e. every frame held 20 % too
+            // long, and the surplus is shed by the catch-up drain above as
+            // `frames_dropped_late` — a counter the runaway guard does not
+            // read, so nothing stops it either.
+            //
+            // Keyed on the RATIO, deliberately not on `vblank_clock_trusted()`.
+            // The commonest modeset changes resolution at an unchanged refresh,
+            // where the running scheduler is still numerically correct;
+            // disengaging on the trust bit would tear it down and reseed
+            // `accum` for nothing. The ratio notices a real rate change and
+            // ignores that one. It also catches a source rate change, which
+            // performs no modeset at all and so never clears the trust bit.
+            //
+            // The advertised refresh is a fit input HERE even though it is not
+            // fit to build from: `invalidate_vblank_clock` runs after
+            // `self.mode = new_mode`, so `vblank_period_ns()` already reports
+            // the new mode, and advertised-vs-measured is at most 0.1 % — far
+            // inside `CADENCE_STALE_TOLERANCE` and far outside a real change.
+            let cadence_stale = cadence.as_ref().is_some_and(|s| {
+                cadence_is_stale(s.vblanks_per_frame(), panel_period_ns, upstream_us)
+            });
+            if cadence_stale {
+                tracing::info!(
+                    output_id = %output_id,
+                    built_vblanks_per_frame = cadence.as_ref().map(|s| s.vblanks_per_frame()),
+                    panel_period_ns,
+                    source_period_us = upstream_us,
+                    "display: per-vblank cadence no longer matches the measured \
+                     rates — disengaging until a scheduler can be rebuilt on the \
+                     new clocks"
+                );
+                counters
+                    .cadence_disengaged_stale
+                    .fetch_add(1, Ordering::Relaxed);
+                cadence = None;
+                cadence_engaged_at = None;
+                // Must be cleared, not left. This is a lifecycle transition, so
+                // the rates can return to exactly what they were (a transient
+                // source excursion that recovers) — and then the key matches
+                // `cadence_built_for` again, the rebuild condition is false,
+                // and the disengage would be permanent.
+                cadence_built_for = None;
+            }
+            // Deliberately NOT charged to `cadence_failures` / `cadence_blocked_until`:
+            // that budget retires the feature after three strikes and logs
+            // "this host cannot pace on the vblank raster". A mode change is
+            // not evidence about the host, and spending a life per modeset
+            // would retire the feature on a node where it works.
+
             let stabilised = frames_since_period_reset >= 40;
             // Honour a runaway cooldown. Re-engaging straight after a
             // disengage would just re-enter the loop that tripped it, since
@@ -5661,18 +5738,45 @@ fn display_loop(
             // disengage the average is still contaminated for a while, but it
             // is biased *upward*, i.e. toward refusing — the safe direction.
             const CADENCE_MAX_BUDGET_PCT: u64 = 60;
-            if cadence.is_none() {
-                let blit = counters.blit_count.load(Ordering::Relaxed);
-                let dl = counters.download_count.load(Ordering::Relaxed);
-                if blit > 0 {
-                    cadence_offpath_cost_us = Some(
-                        counters.blit_us_total.load(Ordering::Relaxed) / blit
-                            + if dl > 0 {
-                                counters.download_us_total.load(Ordering::Relaxed) / dl
-                            } else {
-                                0
-                            },
-                    );
+            //
+            // Measured over a WINDOW of disengaged frames, never over lifetime
+            // totals. `blit_us` is sampled after the hold loop, so an engaged
+            // frame's cost includes its own hold — pir6s reads 13 891 µs
+            // disengaged and 39 536 µs engaged, the figures in the table above.
+            // A lifetime mean therefore climbs permanently with time spent
+            // engaged, and crosses the 60 % gate once pir6s has spent ~39 % of
+            // its life engaged: `13 891 + 25 645f > 24 000` at `f > 0.394`.
+            // That never mattered while the only way to disengage was a guard
+            // trip that also armed a cooldown. The stale check above makes
+            // disengaging routine, which would turn a 24 s outage into a
+            // permanent refusal to re-engage, one-shot-logged and then silent.
+            const CADENCE_COST_WINDOW_FRAMES: u64 = 40;
+            let cost_now = (
+                counters.blit_us_total.load(Ordering::Relaxed),
+                counters.blit_count.load(Ordering::Relaxed),
+                counters.download_us_total.load(Ordering::Relaxed),
+                counters.download_count.load(Ordering::Relaxed),
+            );
+            if cadence.is_some() {
+                cadence_cost_window = None;
+            } else {
+                match cadence_cost_window {
+                    None => cadence_cost_window = Some(cost_now),
+                    Some(base) => {
+                        let blits = cost_now.1.saturating_sub(base.1);
+                        if blits >= CADENCE_COST_WINDOW_FRAMES {
+                            let dls = cost_now.3.saturating_sub(base.3);
+                            cadence_offpath_cost_us = Some(
+                                cost_now.0.saturating_sub(base.0) / blits
+                                    + if dls > 0 {
+                                        cost_now.2.saturating_sub(base.2) / dls
+                                    } else {
+                                        0
+                                    },
+                            );
+                            cadence_cost_window = Some(cost_now);
+                        }
+                    }
                 }
             }
             let frame_period_us = (frame_period_ms * 1000.0) as u64;
@@ -5683,8 +5787,12 @@ fn display_loop(
                 (None, _) | (_, 0) => true,
                 (Some(cost), period) => cost * 100 < period * CADENCE_MAX_BUDGET_PCT,
             };
-            if !has_headroom && !cadence_no_headroom_logged {
-                cadence_no_headroom_logged = true;
+            const NO_HEADROOM_RELOG: Duration = Duration::from_secs(600);
+            if !has_headroom
+                && cadence_no_headroom_logged_at
+                    .is_none_or(|t: Instant| t.elapsed() >= NO_HEADROOM_RELOG)
+            {
+                cadence_no_headroom_logged_at = Some(Instant::now());
                 tracing::info!(
                     output_id = %output_id,
                     frame_cost_us = cadence_offpath_cost_us.unwrap_or(0),
@@ -5705,8 +5813,7 @@ fn display_loop(
                 && kms.vblank_clock_trusted()
             {
                 let source_fps = f64::from(fps_milli) / 1000.0;
-                let panel_measured = kms
-                    .vblank_period_ns()
+                let panel_measured = panel_period_ns
                     .filter(|ns| *ns > 0)
                     .map(|ns| 1_000_000_000.0 / ns as f64)
                     .unwrap_or_else(|| f64::from(kms.refresh_hz()));

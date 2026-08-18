@@ -179,10 +179,85 @@ impl CadenceScheduler {
 /// kept a cadence of 2.024 vblanks/frame against a true 2.000 — inserting one
 /// extra vblank every 41 frames on a panel that needed none.
 pub fn rebuild_key(vblank_period_ns: u64, fps_milli: u32) -> (u64, u32) {
-    // 10 µs is ~25 ppm at 50 Hz. Crystal error is tens of ppm and measurement
-    // jitter over a 600-flip window is well under that; a structurally wrong
-    // reading is orders of magnitude larger.
+    // 10 µs is 500 ppm at 50 Hz (10 000 / 20 000 000) — an earlier comment here
+    // said 25 ppm, which is wrong by 20x and made the bin look far tighter than
+    // it is. The property that actually makes it safe is the ratio to the
+    // measurement noise, not the absolute figure: the endpoint estimator over a
+    // 600-flip window resolves ~59 ns (√2 × 50 µs of timestamp jitter spread
+    // over ~1200 vblanks), so a bin is ~170σ wide, while the structurally wrong
+    // reading it exists to catch — 50.61 Hz against a true 49.998 — is 24 bins
+    // away.
+    //
+    // Note the bin edge is not evenly placed against real panels, and that is
+    // load-bearing rather than lucky: at 50 Hz the nominal period lands exactly
+    // ON an edge, but a panel sitting there is at 0 ppm and has no drift to
+    // absorb, so a rebuild costs it nothing. Panels that DO have drift to
+    // absorb — this fleet's sit 12–65 ppm off nominal — are 11–57σ from the
+    // nearest edge and never straddle one. The straddle case and the harmful
+    // case are anti-correlated, which is why this stays a plain bucket.
     (vblank_period_ns / 10_000, fps_milli)
+}
+
+/// How far the live ratio may depart from the one a running scheduler was built
+/// with before that scheduler has stopped describing the panel in front of it.
+///
+/// Sized between two measured populations rather than picked round:
+///
+///   * **Legitimate spread, which must never trip this.** The panel is
+///     re-measured endpoint-style (~2 ppm), the source EMA truncates to whole
+///     microseconds (≤ 480 ppm at 59.94), and after a modeset the candidate is
+///     computed from the mode's *advertised* refresh while the running
+///     scheduler was built from a *measured* one — on an NTSC mode advertising
+///     integer 60 Hz that gap is 1000 ppm, the largest term by far. Budget the
+///     sum at 0.1 %.
+///   * **Departures worth catching.** A 60 → 50 Hz auto-match is 16.7 %,
+///     50 → 60 is 20 %, and a 25 → 50 fps source change is 100 %.
+///
+/// 2.5 % sits 25x above the first and 6.7x below the second.
+///
+/// Deliberately **coarser** than [`rebuild_key`]'s 500 ppm bin, because the two
+/// answer different questions. The bin asks "is a better scheduler available?"
+/// and wants to notice a 1.2 % misreading. This asks "is the running one now
+/// unsafe?", and a scheduler that is merely improvable must keep running until
+/// its replacement can be built.
+pub const CADENCE_STALE_TOLERANCE: f64 = 0.025;
+
+/// Whether a running scheduler still matches the two clocks in front of it.
+///
+/// The display loop cannot rely on [`rebuild_key`] for this. A key change says
+/// a rebuild is *wanted*; it cannot say the running scheduler is still safe,
+/// because the rebuild it gates is rate-limited and — after a modeset — blocked
+/// outright until the vblank clock has been re-measured over a fresh 600-flip
+/// window. Through that window the old scheduler would otherwise go on
+/// allocating vblanks at the old panel's rate.
+///
+/// Unknown resolves to **stale**: an unmeasurable panel or an unseeded source
+/// means the honest answer is "stop and fall back to wall-clock pacing", never
+/// "carry on with the last ratio".
+pub fn cadence_is_stale(
+    built_vblanks_per_frame: f64,
+    panel_period_ns: Option<u64>,
+    source_period_us: u64,
+) -> bool {
+    let Some(panel_ns) = panel_period_ns.filter(|ns| *ns > 0) else {
+        return true;
+    };
+    // `is_finite` first so a NaN ratio takes the stale path rather than falling
+    // through a comparison that is false for every operand.
+    if source_period_us == 0
+        || !built_vblanks_per_frame.is_finite()
+        || built_vblanks_per_frame <= 0.0
+    {
+        return true;
+    }
+    // panel_hz / source_fps, rearranged so both measurements stay as the raw
+    // periods they were taken as: (1/panel_s) / (1/source_s) = source_s / panel_s.
+    let candidate = 1_000.0 * source_period_us as f64 / panel_ns as f64;
+    if !candidate.is_finite() {
+        return true;
+    }
+    (candidate - built_vblanks_per_frame).abs()
+        > built_vblanks_per_frame * CADENCE_STALE_TOLERANCE
 }
 
 #[cfg(test)]
@@ -316,6 +391,127 @@ mod tests {
 
     fn hz_to_period_ns(hz: f64) -> u64 {
         (1_000_000_000.0 / hz).round() as u64
+    }
+
+    fn fps_to_period_us(fps: f64) -> u64 {
+        (1_000_000.0 / fps).round() as u64
+    }
+
+    #[test]
+    fn a_refresh_change_makes_the_running_scheduler_stale() {
+        // The harmful direction, and the one the auto-match actually performs:
+        // built for 60 Hz (2.4 vblanks/frame at 25 fps), panel is now 50 Hz, so
+        // every hold is 20 % too long and the surplus has to go somewhere.
+        assert!(cadence_is_stale(
+            60.0 / 25.0,
+            Some(hz_to_period_ns(50.0)),
+            fps_to_period_us(25.0)
+        ));
+        // And the benign direction still counts as stale — the ratio is wrong
+        // either way, and re-deriving it is cheap.
+        assert!(cadence_is_stale(
+            50.0 / 25.0,
+            Some(hz_to_period_ns(60.0)),
+            fps_to_period_us(25.0)
+        ));
+    }
+
+    #[test]
+    fn a_resolution_only_modeset_leaves_the_scheduler_valid() {
+        // The modal modeset: 1080p -> 720p at an unchanged 50 Hz. The scheduler
+        // was built from a MEASURED 49.998 Hz; the candidate is computed from
+        // the new mode's ADVERTISED 50 Hz because the measurement was just
+        // discarded. Tearing the scheduler down here would reseed `accum` and
+        // lose the drift absorption for nothing.
+        assert!(!cadence_is_stale(
+            49.998 / 25.0,
+            Some(hz_to_period_ns(50.0)),
+            fps_to_period_us(25.0)
+        ));
+    }
+
+    #[test]
+    fn an_ntsc_mode_advertising_integer_hz_is_not_stale() {
+        // Largest legitimate gap in the whole budget: built from a measured
+        // 59.94 Hz, candidate from the mode's advertised 60. 0.1 %, which must
+        // stay well inside the tolerance or every NTSC panel disengages on
+        // every modeset forever.
+        assert!(!cadence_is_stale(
+            59.94 / 29.97,
+            Some(hz_to_period_ns(60.0)),
+            fps_to_period_us(29.97)
+        ));
+    }
+
+    #[test]
+    fn a_source_rate_change_makes_the_running_scheduler_stale() {
+        // No modeset at all — the panel is untouched and only the source
+        // changed. A fix keyed on the vblank-clock trust bit would miss this
+        // case completely.
+        assert!(cadence_is_stale(
+            50.0 / 25.0,
+            Some(hz_to_period_ns(50.0)),
+            fps_to_period_us(50.0)
+        ));
+    }
+
+    #[test]
+    fn ordinary_crystal_drift_never_makes_the_scheduler_stale() {
+        // The no-churn requirement, over both axes at once — something the
+        // two-part rebuild key could not express. +/-100 ppm is beyond this
+        // fleet's measured 12-65 ppm spread.
+        for panel_ppm in [-100.0, -33.0, 0.0, 33.0, 100.0] {
+            for source_ppm in [-100.0, -33.0, 0.0, 33.0, 100.0] {
+                for (panel_hz, fps) in [(50.0, 25.0), (50.0, 50.0), (60.0, 24.0), (60.0, 20.0)] {
+                    let panel = panel_hz * (1.0 + panel_ppm / 1e6);
+                    let source = fps * (1.0 + source_ppm / 1e6);
+                    assert!(
+                        !cadence_is_stale(
+                            panel_hz / fps,
+                            Some(hz_to_period_ns(panel)),
+                            fps_to_period_us(source)
+                        ),
+                        "{panel_ppm} ppm panel / {source_ppm} ppm source at \
+                         {panel_hz}Hz/{fps}fps must not disengage"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn an_unmeasurable_clock_makes_the_scheduler_stale() {
+        // Unknown must resolve to the benign side: disengage and let the
+        // wall-clock pacer have it, rather than keep holding on a guess.
+        assert!(cadence_is_stale(2.0, None, fps_to_period_us(25.0)));
+        assert!(cadence_is_stale(2.0, Some(0), fps_to_period_us(25.0)));
+        // `upstream_frame_period_us` is reset to 0 by a PTS discontinuity.
+        assert!(cadence_is_stale(2.0, Some(hz_to_period_ns(50.0)), 0));
+        // A scheduler that never built cannot be matched against.
+        assert!(cadence_is_stale(0.0, Some(hz_to_period_ns(50.0)), fps_to_period_us(25.0)));
+    }
+
+    #[test]
+    fn the_stale_tolerance_sits_between_drift_and_a_mode_change() {
+        // Pin the constant against both populations it was sized from, driven
+        // through the real function so the property is what is tested rather
+        // than the literal. Departures are applied to the PANEL period, which
+        // is where a mode change lands.
+        let built = 2.0;
+        let fps_us = fps_to_period_us(25.0);
+        let panel_at = |departure: f64| {
+            // built = 1000 * fps_us / panel_ns, so a ratio departure of `d`
+            // means a panel period scaled by 1/(1+d).
+            Some((1_000.0 * fps_us as f64 / (built * (1.0 + departure))).round() as u64)
+        };
+        // 0.1 % — the largest legitimate gap, advertised-vs-measured on an NTSC
+        // mode. Must NOT disengage, in either direction.
+        assert!(!cadence_is_stale(built, panel_at(0.001), fps_us));
+        assert!(!cadence_is_stale(built, panel_at(-0.001), fps_us));
+        // 16.7 % — the smallest real departure, a 60 -> 50 Hz auto-match. Must
+        // disengage, in either direction.
+        assert!(cadence_is_stale(built, panel_at(0.167), fps_us));
+        assert!(cadence_is_stale(built, panel_at(-0.167), fps_us));
     }
 
     #[test]

@@ -758,6 +758,11 @@ pub struct DisplayStatsCounters {
     /// the scheduler was consuming slower than the source and the picture
     /// reverted to wall-clock pacing — the feature did not hold on this host.
     pub cadence_disengaged: AtomicU64,
+    /// Disengagements caused by the measured rates no longer matching the
+    /// running scheduler (a mode change or a source rate change), as opposed
+    /// to the runaway guard tripping. Kept separate because the two mean
+    /// opposite things about the host.
+    pub cadence_disengaged_stale: AtomicU64,
     /// Source frame period (µs) measured **upstream of the display queue**,
     /// in the decode task, immediately before each frame is offered to the
     /// mpsc (#115).
@@ -1652,6 +1657,10 @@ impl OutputStatsAccumulator {
                     .load(Ordering::Relaxed),
                 cadence_hold_aborted: h.counters.cadence_hold_aborted.load(Ordering::Relaxed),
                 cadence_disengaged: h.counters.cadence_disengaged.load(Ordering::Relaxed),
+                cadence_disengaged_stale: h
+                    .counters
+                    .cadence_disengaged_stale
+                    .load(Ordering::Relaxed),
                 upstream_frame_period_us: h
                     .counters
                     .upstream_frame_period_us
