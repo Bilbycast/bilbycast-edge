@@ -6946,6 +6946,37 @@ pub struct DisplayOutputConfig {
     /// position and ignores this entirely.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub present_lead_ms: Option<u32>,
+
+    /// Snap each frame's present instant to the panel's real vblank grid.
+    ///
+    /// Assign frames to whole vblanks instead of to wall-clock instants
+    /// (#115 P3).
+    ///
+    /// Decides *which vblanks a frame occupies*, rather than computing a
+    /// wall-clock instant and hoping it lands on the right one. At 25p on
+    /// 50 Hz it holds every
+    /// frame for 2 vblanks; at 24p on 60 Hz it generates 2:3 pulldown
+    /// (3,2,3,2) rather than hoping the wall clock lands on it. Crystal
+    /// drift is absorbed as one longer or shorter hold per beat period
+    /// instead of continuous sub-frame slide.
+    ///
+    /// Engages only where the flip clock has earned trust
+    /// (`KmsDisplay::vblank_clock_trusted`), the measured rates give a
+    /// schedulable ratio, and the source rate has stabilised. Anything else
+    /// keeps the existing wall-clock path. A source faster than the panel
+    /// needs frame *dropping*, which is a different algorithm and is not
+    /// implemented — 60p on a 50 Hz panel is declined.
+    ///
+    /// **Video-only outputs.** An output with an audio device paces against
+    /// the measured ALSA playout position, and holding frames on the vblank
+    /// raster would fight that master clock. Locking video to the panel is
+    /// only sound once audio is resampled to the same clock (what mpv's
+    /// display-sync does, and what this does not yet do), so the resolver
+    /// declines to engage where an audio clock is driving the output.
+    ///
+    /// Unset defaults to **off** pending fleet validation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub present_vblank_cadence: Option<bool>,
 }
 
 fn default_audio_channel_pair() -> [u8; 2] {

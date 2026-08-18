@@ -17,6 +17,8 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use drm::buffer::{Buffer, DrmFourcc, DrmModifier, PlanarBuffer};
@@ -532,6 +534,32 @@ struct YuvOverlay {
     zpos_value: u64,
 }
 
+/// The kernel's own record of a completed page flip.
+///
+/// `DRM_EVENT_FLIP_COMPLETE` carries the vblank the flip actually landed on
+/// and the instant that vblank occurred. Both are measured by the display
+/// hardware, not inferred in userspace, so they are the only trustworthy view
+/// of the scanout raster available to this process.
+///
+/// This matters because the alternative — timestamping in userspace after
+/// `poll()` returns and the event queue is drained — folds scheduler wake-up
+/// latency, poll granularity and drain time into the number. On RK3588 the
+/// real vblank interval measures 20 000.7 µs with ~50 µs of jitter; a
+/// userspace estimate of the same quantity is noisier by orders of magnitude,
+/// and a control loop fed that estimate chases the noise (see #112, where
+/// exactly that produced a servo which hit its own target perfectly and made
+/// the picture worse).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FlipRecord {
+    /// Vblank sequence number the flip landed on. Monotonic per CRTC, so the
+    /// delta between consecutive flips counts the vblanks that actually
+    /// elapsed — a delta larger than the frame's expected cadence is a
+    /// *missed* vblank, which no existing counter records.
+    pub sequence: u32,
+    /// When that vblank occurred, as reported by the kernel.
+    pub timestamp: Duration,
+}
+
 /// Holder for the active KMS master + double-buffered framebuffers.
 /// One per display output. Created by `output_display` after mode-set;
 /// owns the lifetime of the dumb buffers and the CRTC lease.
@@ -545,6 +573,36 @@ pub struct KmsDisplay {
     // Two framebuffers we ping-pong between for tear-free page flips.
     bufs: [DumbBuffer; 2],
     front_idx: usize,
+    /// Last completed flip as the kernel described it. Written by
+    /// [`Self::wait_page_flip`], read via [`Self::last_flip`].
+    ///
+    /// Atomics rather than a `Cell` so capturing this cannot alter whether
+    /// `KmsDisplay` is `Send`/`Sync` — it moves into the render thread and a
+    /// dup'd fd handle is held elsewhere for teardown, and this change is not
+    /// the place to perturb that.
+    last_flip_seq: AtomicU32,
+    last_flip_ts_ns: AtomicU64,
+    last_flip_valid: AtomicBool,
+    /// Anchor for the periodic vblank-clock measurement in
+    /// [`Self::record_flip`]. Endpoint-style: the error is one timestamp's
+    /// jitter spread over the whole window, so a long window beats averaging
+    /// per-flip deltas.
+    anchor_seq: AtomicU32,
+    anchor_ts_ns: AtomicU64,
+    flips_since_anchor: AtomicU64,
+    /// Vblank period in ns as *measured* from flip timestamps, or 0 before the
+    /// first measurement window completes. Preferred over the mode's
+    /// advertised refresh because panels are not on their nominal rate — this
+    /// fleet's sit between −54.69 and +64.32 ppm, and it is exactly that error
+    /// which walks presentation across the raster.
+    measured_vblank_ns: AtomicU64,
+    /// Whether the flip clock is fit to schedule against — see
+    /// [`Self::vblank_clock_trusted`]. Starts `false` and is only ever set by
+    /// a completed measurement window.
+    clock_trusted: AtomicBool,
+    /// Cached kernel pipe index for [`Self::crtc`], resolved on first use.
+    /// `u32::MAX` means "not yet resolved".
+    crtc_pipe: AtomicU32,
     /// PRIME scanout state — set when `present_prime` has flipped a
     /// VAAPI-decoded surface onto the CRTC. `None` while the CPU-blit
     /// path is active. Holding the previous-frame keepalive here means
@@ -552,6 +610,10 @@ pub struct KmsDisplay {
     /// completes, eliminating the green-flash / stuck-frame artefacts
     /// the VA pool causes when surfaces recycle mid-scanout.
     prime_state: Option<PrimeState>,
+    /// `(fourcc, modifier)` pairs the primary plane advertises via
+    /// `IN_FORMATS` (#116). `None` until the atomic plane is resolved, or on
+    /// a driver that does not advertise the property — "unknown", not "none".
+    scanout_formats: Option<Vec<(u32, u64)>>,
     /// Imported-framebuffer cache keyed by [`dmabuf_identity`] — see
     /// [`PrimeFbCacheEntry`]. Avoids re-running `prime_fd_to_buffer` +
     /// `add_planar_framebuffer` for a decode buffer this session has
@@ -689,6 +751,14 @@ struct DumbBuffer {
 /// loop responsive to its cancel token.
 const FLIP_EVENT_TIMEOUT_MS: u64 = 500;
 
+/// Flips between vblank-clock measurements in [`KmsDisplay::record_flip`].
+///
+/// 600 flips is ~24 s of 25 fps content — long enough that the endpoint
+/// measurement resolves single-ppm crystal offsets (one ~50 µs timestamp
+/// jitter over a 24 s baseline is ~2 ppm), short enough that a node logs a
+/// calibration line a few times a minute at debug level.
+const VBLANK_MEASURE_FLIPS: u64 = 600;
+
 impl KmsDisplay {
     /// Duplicate the card fd into a standalone [`MasterReleaseHandle`] so a
     /// supervisor can drop this display's DRM master even when the thread
@@ -822,6 +892,36 @@ impl KmsDisplay {
             }
         }
 
+        // Ask the plane which (fourcc, modifier) pairs it will scan out,
+        // BEFORE any frame is presented (#116). Discovering this lazily inside
+        // `present_prime` was useless: the atomic setup is resolved there
+        // *after* the import it is meant to pre-empt, so the first frame
+        // always tried and failed, and the sticky "scanout permanently
+        // rejected" demotion had already fired by the time the answer existed.
+        let scanout_formats =
+            find_primary_plane(&card, crtc).and_then(|p| read_plane_in_formats(&card, p));
+        match scanout_formats.as_ref() {
+            Some(f) => {
+                let nv12 = f.iter().any(|(fourcc, _)| *fourcc == NV12_FOURCC);
+                tracing::info!(
+                    pairs = f.len(),
+                    nv12_scanout = nv12,
+                    "display: scanout formats discovered"
+                );
+                if !nv12 {
+                    // Not fatal — the CPU-blit path uses XRGB and works. But
+                    // it is the whole reason zero-copy can never engage on
+                    // this host, and it is otherwise invisible.
+                    tracing::warn!(
+                        "display: this plane cannot scan out NV12 — zero-copy is                          unavailable on this hardware and every frame will take a                          sysmem download plus a software blit (#116)"
+                    );
+                }
+            }
+            None => tracing::debug!(
+                "display: driver does not advertise IN_FORMATS — scanout support                  stays unknown, imports will be attempted"
+            ),
+        }
+
         Ok(Self {
             card,
             crtc,
@@ -831,7 +931,17 @@ impl KmsDisplay {
             height: h as u32,
             bufs: [a, b],
             front_idx: 0,
+            last_flip_seq: AtomicU32::new(0),
+            last_flip_ts_ns: AtomicU64::new(0),
+            last_flip_valid: AtomicBool::new(false),
+            anchor_seq: AtomicU32::new(0),
+            anchor_ts_ns: AtomicU64::new(0),
+            flips_since_anchor: AtomicU64::new(0),
+            measured_vblank_ns: AtomicU64::new(0),
+            clock_trusted: AtomicBool::new(false),
+            crtc_pipe: AtomicU32::new(u32::MAX),
             prime_state: None,
+            scanout_formats,
             prime_fb_cache: std::collections::HashMap::new(),
             prime_fb_cache_order: std::collections::VecDeque::new(),
             use_atomic,
@@ -1410,6 +1520,7 @@ impl KmsDisplay {
                 )
                 .context("display_mode_set_failed: auto-match refresh re-modeset")?;
             self.mode = new_mode;
+            self.invalidate_vblank_clock();
             self.invalidate_atomic_modeset();
             return Ok(());
         }
@@ -1468,6 +1579,7 @@ impl KmsDisplay {
             let _ = self.card.destroy_dumb_buffer(handle);
         }
         self.mode = new_mode;
+        self.invalidate_vblank_clock();
         self.width = new_w;
         self.height = new_h;
         self.front_idx = 0;
@@ -1560,6 +1672,7 @@ impl KmsDisplay {
                 )
                 .context("display_mode_set_failed: monitor-native refresh re-modeset")?;
             self.mode = new_mode;
+            self.invalidate_vblank_clock();
             self.invalidate_atomic_modeset();
             return Ok(());
         }
@@ -1582,6 +1695,7 @@ impl KmsDisplay {
             let _ = self.card.destroy_dumb_buffer(handle);
         }
         self.mode = new_mode;
+        self.invalidate_vblank_clock();
         self.width = new_w;
         self.height = new_h;
         self.front_idx = 0;
@@ -2548,6 +2662,138 @@ fn discover_yuv_overlay_zpos(
 /// Read a u64-valued property by name, returning `None` when the
 /// property is absent on the object. Used to snapshot the primary
 /// plane's `zpos` so the bars plane can be ordered above it.
+/// The (fourcc, modifier) pairs a plane will actually scan out, read from its
+/// `IN_FORMATS` blob (#116).
+///
+/// Worth asking *before* attempting an import rather than after. Intel Gen9
+/// (Skylake) advertises no NV12 on any plane under any modifier — only packed
+/// YUV — so a VAAPI NV12 surface can never be scanned out there. Discovering
+/// that from a per-frame `addfb` EINVAL means a stream of warnings and a
+/// silent demotion to a sysmem download plus a software blit; discovering it
+/// here means one clear line at open and a deliberate choice of path.
+///
+/// Returns `None` when the driver does not advertise `IN_FORMATS` at all, in
+/// which case the caller must keep its previous try-and-see behaviour — an
+/// absent blob means "unknown", never "unsupported".
+/// `DRM_FORMAT_NV12` — the format every zero-copy decoder on this fleet
+/// (VAAPI, RKMPP) produces.
+const NV12_FOURCC: u32 = u32::from_le_bytes(*b"NV12");
+
+/// The primary plane driving `crtc`, found without building the whole
+/// [`AtomicSetup`].
+///
+/// Needed because scanout-format discovery has to happen *before* the first
+/// PRIME import, and the atomic setup is discovered lazily inside
+/// `present_prime` — after the import it is meant to prevent. Placing the
+/// question here means the answer exists when it is first asked.
+fn find_primary_plane(
+    card: &CardFile,
+    crtc: drm::control::crtc::Handle,
+) -> Option<drm::control::plane::Handle> {
+    let res = card.resource_handles().ok()?;
+    for p in card.plane_handles().ok()? {
+        let info = card.get_plane(p).ok()?;
+        if !res.filter_crtcs(info.possible_crtcs()).contains(&crtc) {
+            continue;
+        }
+        if read_plane_type(card, p).ok()? == PlaneType::Primary as u64 {
+            return Some(p);
+        }
+    }
+    None
+}
+
+/// Does a plane's `IN_FORMATS` list advertise this `(fourcc, modifier)` pair?
+///
+/// Split out from [`KmsDisplay::scanout_supports`] so it can be tested without
+/// a DRM device — the refusal it backs is *permanent* (see
+/// `prime_scanout_permanently_rejected`), so a wrong answer here costs a host
+/// its zero-copy path for the life of the flow.
+///
+/// **`DRM_FORMAT_MOD_INVALID` is normalised to `DRM_FORMAT_MOD_LINEAR` before
+/// the lookup**, which is the whole reason this is not a one-line `any()`.
+/// VAAPI hands back `INVALID` for a surface with no defined tiling layout, and
+/// the importer below already treats it as interchangeable with `LINEAR` —
+/// it drops the `MODIFIERS` flag and lets the kernel take the buffer untiled.
+/// An `IN_FORMATS` blob, though, enumerates real kernel modifiers: it
+/// describes an untiled buffer as `LINEAR` and never emits the `INVALID`
+/// sentinel at all. Comparing the sentinel verbatim therefore answers "this
+/// plane does not scan that out" for a pair the plane scans out perfectly
+/// well, and because the caller treats the refusal as a fixed hardware
+/// property it demotes to the CPU download path permanently — the ~106 ms/
+/// frame copy that `rga-transfer` exists to avoid, on hosts where zero-copy
+/// was working.
+fn formats_advertise(formats: &[(u32, u64)], fourcc: u32, modifier: u64) -> bool {
+    let wanted = if modifier == DRM_FORMAT_MOD_INVALID {
+        DRM_FORMAT_MOD_LINEAR
+    } else {
+        modifier
+    };
+    formats.iter().any(|(f, m)| {
+        let advertised = if *m == DRM_FORMAT_MOD_INVALID {
+            DRM_FORMAT_MOD_LINEAR
+        } else {
+            *m
+        };
+        *f == fourcc && advertised == wanted
+    })
+}
+
+fn read_plane_in_formats(
+    card: &CardFile,
+    plane: drm::control::plane::Handle,
+) -> Option<Vec<(u32, u64)>> {
+    let set = card.get_properties(plane).ok()?;
+    let (ids, vals) = set.as_props_and_values();
+    let mut blob_id = None;
+    for (id, val) in ids.iter().zip(vals.iter()) {
+        if let Ok(info) = card.get_property(*id)
+            && info.name().to_bytes() == b"IN_FORMATS"
+        {
+            blob_id = Some(*val);
+            break;
+        }
+    }
+    let raw = card.get_property_blob(blob_id?).ok()?;
+    // struct drm_format_modifier_blob { u32 version, flags, count_formats,
+    //   formats_offset, count_modifiers, modifiers_offset; }
+    // followed by a u32 fourcc array and a
+    // struct drm_format_modifier { u64 formats; u32 offset; u32 pad;
+    //   u64 modifier; } array.
+    if raw.len() < 24 {
+        return None;
+    }
+    let rd32 = |o: usize| -> u32 { u32::from_ne_bytes(raw[o..o + 4].try_into().unwrap()) };
+    let rd64 = |o: usize| -> u64 { u64::from_ne_bytes(raw[o..o + 8].try_into().unwrap()) };
+    let count_formats = rd32(8) as usize;
+    let formats_offset = rd32(12) as usize;
+    let count_modifiers = rd32(16) as usize;
+    let modifiers_offset = rd32(20) as usize;
+    if formats_offset + count_formats * 4 > raw.len()
+        || modifiers_offset + count_modifiers * 24 > raw.len()
+    {
+        return None;
+    }
+    let fourccs: Vec<u32> = (0..count_formats)
+        .map(|i| rd32(formats_offset + i * 4))
+        .collect();
+    let mut out = Vec::new();
+    for i in 0..count_modifiers {
+        let base = modifiers_offset + i * 24;
+        let mask = rd64(base);
+        let offset = rd32(base + 8) as usize;
+        let modifier = rd64(base + 16);
+        for bit in 0..64usize {
+            if (mask >> bit) & 1 == 1
+                && let Some(fourcc) = fourccs.get(offset + bit)
+            {
+                out.push((*fourcc, modifier));
+            }
+        }
+    }
+    Some(out)
+}
+
 fn read_property_u64(
     card: &CardFile,
     handle: impl drm::control::ResourceHandle,
@@ -2925,6 +3171,28 @@ impl KmsDisplay {
         } else {
             Some(DrmModifier::from(modifier_raw))
         };
+
+        // Ask before importing (#116). The plane published exactly which
+        // (fourcc, modifier) pairs it will scan out; attempting an import the
+        // kernel has already told us it will refuse costs an ioctl and a
+        // warning per frame, and — worse — reports as a runtime failure what
+        // is really a fixed property of the hardware. Intel Gen9 advertises no
+        // NV12 on any plane under any modifier, so on that host this is never
+        // going to work and the caller should take the sysmem path
+        // deliberately rather than as an error recovery.
+        //
+        // `Some(false)` is the only refusal. `None` means the driver did not
+        // advertise IN_FORMATS, and an absent answer must never be read as
+        // "no" — those hosts keep the previous try-and-see behaviour.
+        if self.scanout_supports(descriptor.fourcc, modifier_raw) == Some(false) {
+            anyhow::bail!(
+                "display_prime_format_unsupported: this plane does not scan out \
+                 fourcc 0x{:08x} with modifier 0x{:016x} — not a failure, a \
+                 capability of the display engine (#116)",
+                descriptor.fourcc,
+                modifier_raw
+            );
+        }
 
         // Check the import cache first — a decoder buffer pool recycles
         // a small fixed set of underlying DMA-BUFs (RKMPP: ≤16), and
@@ -3941,12 +4209,256 @@ impl KmsDisplay {
             for ev in events {
                 if let Event::PageFlip(p) = ev
                     && p.crtc == self.crtc {
+                        self.record_flip(&p);
                         return Ok(());
                     }
             }
             // Unrelated event(s) drained ahead of ours — re-poll for the
             // remaining budget.
         }
+    }
+
+    /// Store the kernel's account of a completed flip.
+    ///
+    /// Purely observational: nothing in the present path reads this yet, so
+    /// capturing it cannot change timing behaviour. It exists so the display
+    /// loop can eventually schedule against the real raster instead of a
+    /// wall clock (#115), and so that missed vblanks become countable at all
+    /// — every present-path counter today records a *loss*, and this fault
+    /// class drops nothing.
+    fn record_flip(&self, p: &drm::control::PageFlipEvent) {
+        // Saturating: `Duration::as_nanos` is u128 and the kernel's clock is
+        // CLOCK_MONOTONIC since boot, so this cannot realistically overflow —
+        // but a garbage timestamp from a broken driver must not panic the
+        // render thread.
+        let ts_ns = p.duration.as_nanos().min(u64::MAX as u128) as u64;
+        let flips = self.flips_since_anchor.fetch_add(1, Ordering::Relaxed) + 1;
+
+        match self.last_flip() {
+            // First flip on this CRTC — seed the measurement anchor.
+            None => self.reseat_vblank_anchor(p.frame, ts_ns),
+            Some(_) if flips >= VBLANK_MEASURE_FLIPS => {
+                let anchor_seq = self.anchor_seq.load(Ordering::Relaxed);
+                let anchor_ts = self.anchor_ts_ns.load(Ordering::Relaxed);
+                // `wrapping_sub` because the kernel's vblank sequence is u32
+                // and does wrap — after ~994 days at 50 Hz, but a long-lived
+                // signage node is exactly the deployment that would hit it.
+                let vblanks = u64::from(p.frame.wrapping_sub(anchor_seq));
+                let span_ns = ts_ns.saturating_sub(anchor_ts);
+                if vblanks > 0 && span_ns > 0 {
+                    // Endpoint measurement: one timestamp's jitter spread over
+                    // the whole window, so accuracy improves with window
+                    // length rather than as sqrt(n). Over ~24 s that resolves
+                    // single-ppm offsets.
+                    let period = span_ns / vblanks;
+                    self.measured_vblank_ns.store(period, Ordering::Relaxed);
+                    // Decide whether anything may *schedule* against this
+                    // clock. Not every DRM driver reports honest flip
+                    // timestamps, and a scheduler fed a fabricated timebase
+                    // fails silently — the picture is wrong while every
+                    // counter derived from the same bad clock looks correct.
+                    //
+                    // Verified good on RK3588 (`rockchip-vop2`): sequence
+                    // strictly +1, no zero timestamps, 20 000.7 us period,
+                    // ~50 us jitter. i915's *period* is likewise measured
+                    // sane, but its phase semantics are unverified — hence a
+                    // check that can fail per-host rather than an assumption.
+                    let advertised_ns = match self.mode.vrefresh() {
+                        0 => 0,
+                        hz => 1_000_000_000 / u64::from(hz),
+                    };
+                    // Within 5% of the mode's advertised rate. Real crystal
+                    // error is tens of ppm, so this rejects only a driver
+                    // reporting something structurally wrong (a different
+                    // time base, a stalled counter), never a genuinely
+                    // off-nominal panel.
+                    let plausible = advertised_ns > 0
+                        && period > 0
+                        && period.abs_diff(advertised_ns) * 20 < advertised_ns;
+                    // `vblanks` counts sequence advance across the window; if
+                    // the counter were frozen this would be 0 and we would not
+                    // be in this branch at all. A wildly excessive advance
+                    // means the sequence is not a vblank count.
+                    let sane_sequence = vblanks <= flips.saturating_mul(16);
+                    let trusted = plausible && sane_sequence;
+                    if !trusted {
+                        tracing::warn!(
+                            measured_vblank_ns = period,
+                            advertised_vblank_ns = advertised_ns,
+                            vblanks_in_window = vblanks,
+                            flips_in_window = flips,
+                            "display: flip clock is not trustworthy — vblank-derived \
+                             scheduling stays disabled on this output"
+                        );
+                    }
+                    self.clock_trusted.store(trusted, Ordering::Release);
+                    let period_us = span_ns as f64 / 1_000.0 / vblanks as f64;
+                    // Debug, not info: this is a per-node calibration figure,
+                    // not an event. It exists so the "is this driver honest?"
+                    // question is answerable from a log on hardware nobody has
+                    // measured by hand — a driver reporting zeros or a frozen
+                    // sequence shows up here immediately, and anything derived
+                    // from these timestamps would be worthless on such a host.
+                    tracing::debug!(
+                        measured_vblank_us = period_us,
+                        measured_hz = 1_000_000.0 / period_us,
+                        advertised_hz = self.mode.vrefresh(),
+                        vblanks_per_flip = vblanks as f64 / flips as f64,
+                        "display: vblank clock"
+                    );
+                }
+                self.reseat_vblank_anchor(p.frame, ts_ns);
+            }
+            Some(_) => {}
+        }
+
+        self.last_flip_seq.store(p.frame, Ordering::Relaxed);
+        self.last_flip_ts_ns.store(ts_ns, Ordering::Relaxed);
+        // Released last so a reader that sees `valid` also sees both fields.
+        self.last_flip_valid.store(true, Ordering::Release);
+    }
+
+    /// Vblank period in nanoseconds — measured if a window has completed,
+    /// otherwise derived from the mode's advertised refresh.
+    ///
+    /// Returns `None` when the mode reports no refresh rate and nothing has
+    /// been measured yet, so callers must keep their existing timing path
+    /// rather than divide by a guess.
+    pub fn vblank_period_ns(&self) -> Option<u64> {
+        let measured = self.measured_vblank_ns.load(Ordering::Relaxed);
+        if measured > 0 {
+            return Some(measured);
+        }
+        match self.mode.vrefresh() {
+            0 => None,
+            hz => Some(1_000_000_000 / u64::from(hz)),
+        }
+    }
+
+    /// Block until one more vblank has passed on our CRTC, **without**
+    /// committing anything (#115 P3).
+    ///
+    /// This is how a frame is held for more than one vblank. The panel
+    /// re-scans the framebuffer already programmed, so holding costs nothing
+    /// but the wait — no flip, no buffer churn, and the previous frame stays
+    /// on screen exactly as intended rather than by accident.
+    ///
+    /// Needs no DRM master (verified: the same ioctl measured these panels
+    /// while the edge held the CRTC), so it cannot contend with the present
+    /// path.
+    ///
+    /// Returns `Err` rather than blocking indefinitely if the driver stops
+    /// posting vblanks — the caller must treat that as it treats a flip
+    /// timeout, by falling back rather than wedging the render thread.
+    pub fn wait_vblank(&self) -> Result<()> {
+        use drm::{VblankWaitFlags, VblankWaitTarget};
+
+        let pipe = self.crtc_pipe_index()?;
+        self.card
+            .wait_vblank(VblankWaitTarget::Relative(1), VblankWaitFlags::empty(), pipe, 0)
+            .map(|_| ())
+            .map_err(|e| anyhow::Error::new(e).context("display_wait_vblank_failed"))
+    }
+
+    /// The kernel's pipe index for our CRTC, which `wait_vblank` addresses by
+    /// position rather than by handle.
+    ///
+    /// Resolved once and cached: enumerating resources is an ioctl, and this
+    /// is called on every held vblank.
+    fn crtc_pipe_index(&self) -> Result<u32> {
+        let cached = self.crtc_pipe.load(Ordering::Relaxed);
+        if cached != u32::MAX {
+            return Ok(cached);
+        }
+        let res = self
+            .card
+            .resource_handles()
+            .context("display_wait_vblank_failed: resource_handles")?;
+        let idx = res
+            .crtcs()
+            .iter()
+            .position(|c| *c == self.crtc)
+            .ok_or_else(|| anyhow::anyhow!("display_wait_vblank_failed: CRTC not in resources"))?;
+        let idx = u32::try_from(idx)
+            .map_err(|_| anyhow::anyhow!("display_wait_vblank_failed: implausible CRTC index"))?;
+        self.crtc_pipe.store(idx, Ordering::Relaxed);
+        Ok(idx)
+    }
+
+    /// Whether the primary plane will scan out this `(fourcc, modifier)`
+    /// pair (#116).
+    ///
+    /// `None` means "the driver did not say" — no `IN_FORMATS` blob, or the
+    /// atomic plane is not yet resolved. Callers must treat that as unknown
+    /// and keep trying the import, never as a refusal.
+    pub fn scanout_supports(&self, fourcc: u32, modifier: u64) -> Option<bool> {
+        let formats = self.scanout_formats.as_ref()?;
+        Some(formats_advertise(formats, fourcc, modifier))
+    }
+
+    /// Whether the flip clock may be scheduled against (#115 P2).
+    ///
+    /// `false` until a measurement window has completed *and* agreed with the
+    /// mode's advertised refresh, so a driver reporting a fabricated or stalled
+    /// timebase can never become the reference. Callers must keep their
+    /// existing timing path while this is `false` rather than fall back to a
+    /// guess: a scheduler on a bad clock fails silently, because the metrics
+    /// that would reveal it are derived from the same clock.
+    pub fn vblank_clock_trusted(&self) -> bool {
+        self.clock_trusted.load(Ordering::Acquire)
+    }
+
+    /// Restart the vblank-clock measurement window at this flip.
+    fn reseat_vblank_anchor(&self, seq: u32, ts_ns: u64) {
+        self.anchor_seq.store(seq, Ordering::Relaxed);
+        self.anchor_ts_ns.store(ts_ns, Ordering::Relaxed);
+        self.flips_since_anchor.store(0, Ordering::Relaxed);
+    }
+
+    /// Discard the vblank-clock measurement because the panel is no longer
+    /// running the mode it was measured on.
+    ///
+    /// Without this the window that spans a modeset averages the two rates
+    /// and yields a period belonging to neither. Measured on bilby-pir6s: a
+    /// 60 Hz → 50 Hz auto-match produced 50.61 Hz for a panel independently
+    /// measured at 49.998 Hz, which turned an exact 2.000 vblanks/frame
+    /// cadence into 2.024 — a scheduler dutifully inserting an extra vblank
+    /// every 41 frames, i.e. manufacturing the judder it exists to remove.
+    ///
+    /// `clock_trusted` drops too: until a full window has been measured on
+    /// the *new* mode there is no trustworthy period, and the honest answer
+    /// to "may I schedule against this?" is no.
+    fn invalidate_vblank_clock(&self) {
+        self.clock_trusted.store(false, Ordering::Release);
+        self.measured_vblank_ns.store(0, Ordering::Relaxed);
+        self.last_flip_valid.store(false, Ordering::Release);
+        self.flips_since_anchor.store(0, Ordering::Relaxed);
+    }
+
+    /// The kernel's record of the last completed flip, or `None` if no flip
+    /// has completed on this CRTC yet.
+    ///
+    /// Two things worth knowing before building on this:
+    ///
+    /// 1. **Verify the driver is honest first.** Not every DRM driver reports
+    ///    real vblank timestamps. Measured good on RK3588 (`rockchip-vop2`):
+    ///    sequence strictly +1, no zero timestamps, 20 000.7 µs period with
+    ///    ~50 µs jitter. Check before trusting it on new hardware — a driver
+    ///    that reports zeros or a frozen sequence would silently poison any
+    ///    timing derived from it.
+    /// 2. **`sequence` is the useful field, not `timestamp`.** Expressing
+    ///    presentation in vblank counts is what makes the source-vs-panel
+    ///    crystal difference (33 ppm measured on this fleet) land as one
+    ///    predictable repeated frame per beat, instead of continuous
+    ///    sub-frame slide against a wall clock.
+    pub fn last_flip(&self) -> Option<FlipRecord> {
+        if !self.last_flip_valid.load(Ordering::Acquire) {
+            return None;
+        }
+        Some(FlipRecord {
+            sequence: self.last_flip_seq.load(Ordering::Relaxed),
+            timestamp: Duration::from_nanos(self.last_flip_ts_ns.load(Ordering::Relaxed)),
+        })
     }
 
     /// Destroy every cached imported framebuffer, **without** touching
@@ -4017,6 +4529,56 @@ impl KmsDisplay {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The pair a Rockchip/Intel plane typically publishes for untiled NV12.
+    const NV12: u32 = u32::from_le_bytes(*b"NV12");
+    const XRGB: u32 = u32::from_le_bytes(*b"XR24");
+
+    #[test]
+    fn an_untiled_plane_accepts_the_vaapi_invalid_sentinel() {
+        // The regression this guards. VAAPI reports DRM_FORMAT_MOD_INVALID for
+        // a surface with no defined tiling; IN_FORMATS describes that same
+        // buffer as DRM_FORMAT_MOD_LINEAR and never emits the sentinel. A
+        // verbatim comparison answers "unsupported" for a pair the plane
+        // scans out, and the caller demotes zero-copy PERMANENTLY on that.
+        let plane = [(NV12, DRM_FORMAT_MOD_LINEAR), (XRGB, DRM_FORMAT_MOD_LINEAR)];
+        assert!(
+            formats_advertise(&plane, NV12, DRM_FORMAT_MOD_INVALID),
+            "INVALID must be normalised to LINEAR before the lookup"
+        );
+        assert!(formats_advertise(&plane, NV12, DRM_FORMAT_MOD_LINEAR));
+    }
+
+    #[test]
+    fn a_plane_that_really_lacks_the_format_still_refuses() {
+        // The case the check exists for: Intel Gen9 advertises no NV12 on any
+        // plane. This must stay a refusal or #116 is not fixed at all.
+        let gen9 = [(XRGB, DRM_FORMAT_MOD_LINEAR)];
+        assert!(!formats_advertise(&gen9, NV12, DRM_FORMAT_MOD_INVALID));
+        assert!(!formats_advertise(&gen9, NV12, DRM_FORMAT_MOD_LINEAR));
+        assert!(formats_advertise(&gen9, XRGB, DRM_FORMAT_MOD_LINEAR));
+    }
+
+    #[test]
+    fn a_real_tiling_modifier_is_matched_exactly() {
+        // Normalisation applies only to the two "no tiling" sentinels; a real
+        // modifier must not be widened into matching anything else.
+        const RK_TILED: u64 = 0x0300_0000_0000_0001;
+        const OTHER_TILED: u64 = 0x0100_0000_0000_0002;
+        let plane = [(NV12, RK_TILED)];
+        assert!(formats_advertise(&plane, NV12, RK_TILED));
+        assert!(!formats_advertise(&plane, NV12, OTHER_TILED));
+        // A tiled-only plane genuinely cannot take a linear buffer.
+        assert!(!formats_advertise(&plane, NV12, DRM_FORMAT_MOD_LINEAR));
+        assert!(!formats_advertise(&plane, NV12, DRM_FORMAT_MOD_INVALID));
+    }
+
+    #[test]
+    fn an_empty_format_list_refuses_everything() {
+        // Distinct from `scanout_supports` returning None (no IN_FORMATS blob
+        // at all), which means "unknown" and must keep the try-and-see path.
+        assert!(!formats_advertise(&[], NV12, DRM_FORMAT_MOD_LINEAR));
+    }
 
     #[test]
     fn infer_alsa_pcm_positional_heuristic() {

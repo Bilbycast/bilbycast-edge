@@ -45,6 +45,7 @@ pub mod cmaf;
 pub mod content_analysis;
 pub mod degradation_monitor;
 pub mod delay_buffer;
+pub mod display_cadence;
 /// Epoch-locked egress — deriving a wall-clock release instant from a PCR
 /// value alone, so independent nodes carrying the same stream emit in
 /// alignment without any peer coordination. Pure integer maths; see

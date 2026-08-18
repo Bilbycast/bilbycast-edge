@@ -56,6 +56,7 @@ use crate::display::audio_bars::{new_shared_meter, SharedMeter, StreamHeader};
 use crate::display::audio_meter::spawn_audio_meter;
 use crate::display::{audio::AudioBackend, clock::AudioClock, kms::KmsDisplay};
 use crate::engine::audio_decode::DecodeStats;
+use crate::engine::display_cadence::{rebuild_key, CadenceScheduler, HoldKind};
 use crate::engine::packet::RtpPacket;
 use crate::engine::ts_demux::{DemuxedFrame, TsDemuxer};
 use crate::engine::video_decode_stats::VideoDecodeStats;
@@ -804,6 +805,7 @@ async fn run_display_output(
     let display_prime_scanout_failed = Arc::clone(&prime_scanout_failed);
     let display_prime_cache_stale = Arc::clone(&prime_cache_stale);
     let display_configured_lead_ms = config.present_lead_ms;
+    let display_vblank_cadence = config.present_vblank_cadence.unwrap_or(false);
     #[cfg(feature = "rga-transfer")]
     let display_rga_transfer_active = Arc::clone(&rga_transfer_active);
     // Independent DRM-master release handle (a dup of the card fd) captured
@@ -818,6 +820,7 @@ async fn run_display_output(
             display_clock,
             display_counters,
             display_configured_lead_ms,
+            display_vblank_cadence,
             display_cancel,
             display_output_stats,
             decoder_kind_label,
@@ -2417,6 +2420,45 @@ fn reset_decoder_open_window(state: &mut HwOpenState, counters: &DisplayStatsCou
         .store(0, Ordering::Relaxed);
 }
 
+/// Record the source frame period from *inside the decode task*, before the
+/// frame is offered to the display queue (#115).
+///
+/// This exists because the display loop's own `frame_period_ms` EMA is taken
+/// after the queue and therefore only sees frames that survived it. For the
+/// vblank cadence that closed a positive feedback loop — holding too long shed
+/// frames, the survivors showed doubled PTS gaps, the estimate reported a
+/// slower source, so the cadence held longer still, without bound. Measured
+/// here it cannot be corrupted that way: nothing has been dropped yet.
+///
+/// Call once per frame *offered to the panel*, so bob-deinterlaced fields are
+/// counted individually and the result is the presentation rate the cadence
+/// schedules against, not the decoder's frame rate.
+fn note_upstream_frame_period(counters: &DisplayStatsCounters, pts_90k: u64) {
+    let prev = counters.upstream_last_pts_90k.swap(pts_90k, Ordering::Relaxed);
+    if prev == 0 {
+        return;
+    }
+    let forward = pts_90k.wrapping_sub(prev) as i64;
+    let dms = forward / 90;
+    // Same window the display loop uses: 10..=200 ms covers 5-100 fps and
+    // rejects a discontinuity or a reordered PTS rather than folding it in.
+    if !(10..=200).contains(&dms) {
+        // A jump means a source change or a seek; drop the history so the new
+        // rate is measured clean instead of averaged with the old one.
+        counters.upstream_frame_period_us.store(0, Ordering::Relaxed);
+        return;
+    }
+    let sample_us = (forward as f64 / 90.0 * 1000.0) as u64;
+    let cur = counters.upstream_frame_period_us.load(Ordering::Relaxed);
+    let next = if cur == 0 {
+        sample_us
+    } else {
+        // Same 0.875/0.125 weighting as the display-side EMA.
+        ((cur as f64) * 0.875 + (sample_us as f64) * 0.125) as u64
+    };
+    counters.upstream_frame_period_us.store(next, Ordering::Relaxed);
+}
+
 /// Post-flush keyframe gate for the demux loop's video path.
 ///
 /// While armed (startup, and re-armed by every decoder flush in
@@ -3347,6 +3389,15 @@ fn prime_scanout_permanently_rejected(err_msg: &str) -> bool {
         return true;
     }
 
+    // The plane published, via IN_FORMATS, that it will not scan out this
+    // (fourcc, modifier) pair at all (#116). That is a fixed property of the
+    // display engine — Intel Gen9 advertises no NV12 on any plane — so it is
+    // as permanent as a rejected addfb, just discovered before the ioctl
+    // rather than after it.
+    if err_msg.contains("display_prime_format_unsupported") {
+        return true;
+    }
+
     // `display_prime_page_flip_failed` is NOT permanent on its own — it
     // covers three very different conditions, and only one is terminal:
     //
@@ -3874,7 +3925,16 @@ fn drain_video_frames(
         let rga_prepared: Option<(Vec<u8>, usize, VideoFrameChroma, i32)> = None;
         let frame =
             if need_sysmem && rga_prepared.is_none() {
-                match frame.download_to_sysmem() {
+                let downloaded = {
+                    let dl_start = Instant::now();
+                    let r = frame.download_to_sysmem();
+                    counters
+                        .download_us_total
+                        .fetch_add(dl_start.elapsed().as_micros() as u64, Ordering::Relaxed);
+                    counters.download_count.fetch_add(1, Ordering::Relaxed);
+                    r
+                };
+                match downloaded {
                     Ok(sysmem) => sysmem,
                     // PERMANENT (see the companion arm further down):
                     // no downloadable `sw_format`, so every future
@@ -3994,6 +4054,7 @@ fn drain_video_frames(
                         audio_pid: stream_ids.audio_pid,
                         program_number: stream_ids.program_number,
                     };
+                    note_upstream_frame_period(counters, pts_90k);
                     if vtx.try_send(out_frame).is_err() {
                         counters
                             .frames_dropped_mpsc_full
@@ -4040,7 +4101,19 @@ fn drain_video_frames(
                     // Recover to sysmem and fall through to the
                     // ordinary semi-planar codepath below with it —
                     // NOT a `continue`, unlike every other arm here.
-                    match frame.download_to_sysmem() {
+                    // Time the copy specifically: `decode_us` spans feed +
+                    // drain and cannot distinguish a slow decoder from an
+                    // expensive GPU->CPU transfer.
+                    let downloaded = {
+                        let dl_start = Instant::now();
+                        let r = frame.download_to_sysmem();
+                        counters
+                            .download_us_total
+                            .fetch_add(dl_start.elapsed().as_micros() as u64, Ordering::Relaxed);
+                        counters.download_count.fetch_add(1, Ordering::Relaxed);
+                        r
+                    };
+                    match downloaded {
                         Ok(sysmem) => sysmem,
                         Err(video_codec::VideoError::UnsupportedHwFormat) => {
                             // PERMANENT: the HW frames context has no
@@ -4268,6 +4341,10 @@ fn drain_video_frames(
                     audio_pid: stream_ids.audio_pid,
                     program_number: stream_ids.program_number,
                 };
+                note_upstream_frame_period(
+                    counters,
+                    pts_90k.wrapping_add(i as u64 * deint.field_dur_90k),
+                );
                 if vtx.try_send(out_frame).is_err() {
                     counters
                         .frames_dropped_mpsc_full
@@ -4295,6 +4372,7 @@ fn drain_video_frames(
             audio_pid: stream_ids.audio_pid,
             program_number: stream_ids.program_number,
         };
+        note_upstream_frame_period(counters, pts_90k);
         if vtx.try_send(out_frame).is_err() {
             // Distinct from the display-thread `frames_dropped_late` —
             // this is the demux→display mpsc backing up because per-frame
@@ -4661,6 +4739,7 @@ fn display_loop(
     clock: Arc<AudioClock>,
     counters: Arc<DisplayStatsCounters>,
     configured_lead_ms: Option<u32>,
+    vblank_cadence: bool,
     cancel: CancellationToken,
     output_stats: Arc<OutputStatsAccumulator>,
     decoder_kind_label: &'static str,
@@ -4736,6 +4815,41 @@ fn display_loop(
     // that's an integer multiple of the source. Stays `true` from then
     // on until the resolution / input switch path resets it.
     let mut fps_locked: bool = false;
+    // Per-vblank cadence scheduler (#115 P3). `None` unless the operator
+    // opted in AND the flip clock earned trust AND the measured rates give
+    // a schedulable ratio — every one of those is a reason to keep the
+    // existing wall-clock path rather than schedule against a guess.
+    // Rebuilt whenever the panel mode or the source rate changes.
+    let mut cadence: Option<CadenceScheduler> = None;
+    // (measured vblank period in 10 µs units, source fps in milli-fps)
+    let mut cadence_built_for: Option<(u64, u32)> = None;
+    // Runaway guard (#115). The scheduler's source-rate input is an EMA of
+    // PTS deltas taken *inside this loop*, so it only ever sees frames that
+    // survived the mpsc queue. That closes a positive feedback loop: hold
+    // slightly too long -> the queue backs up -> frames are shed on
+    // `mpsc_full` -> the surviving frames show doubled PTS gaps -> the EMA
+    // reports a slower source -> hold longer still. Nothing pulls it back.
+    //
+    // Measured on bilby-nuc over 20 minutes: presents decayed 1079 -> 454
+    // per minute while mpsc drops climbed 0 -> 841, the scheduler rebuilding
+    // dozens of times and walking 2.000 -> 2.25 -> 3.96 vblanks/frame, while
+    // the decoder was demonstrably still delivering 25.0 fps throughout.
+    //
+    // A correct cadence sheds NOTHING — bite, pi and pir6s all recorded
+    // mpsc = 0 across the same 20 minutes — so sustained shedding while
+    // engaged is unambiguous evidence the cadence is wrong, and the loop is
+    // broken by disengaging rather than by trying to servo back.
+    let mut cadence_mpsc_baseline: u64 = 0;
+    let mut cadence_engaged_at: Option<Instant> = None;
+    let mut cadence_blocked_until: Option<Instant> = None;
+    let mut cadence_last_build_at: Option<Instant> = None;
+    let mut cadence_guard_checked_at: Option<Instant> = None;
+    let mut cadence_guard_strikes: u32 = 0;
+    // Per-frame cost sampled only while cadence is disengaged — see the
+    // headroom precondition at the engage gate for why that matters.
+    let mut cadence_offpath_cost_us: Option<u64> = None;
+    let mut cadence_no_headroom_logged = false;
+    let mut cadence_failures: u32 = 0;
     let mut frames_since_period_reset: u32 = 0;
     // The `(width, height, fps)` hint from the last *fresh*
     // (EMA-stabilised) fps-locked modeset. Carried across PTS jumps /
@@ -5438,6 +5552,278 @@ fn display_loop(
         if prime_cache_stale.swap(false, Ordering::Relaxed) {
             kms.invalidate_prime_fb_cache();
         }
+        // (Re)build the cadence scheduler when the panel mode or the measured
+        // source rate changes. Both inputs are *measured*, never advertised —
+        // `ingress_summary`'s reported fps is not used anywhere here, having
+        // been observed pinned at 50.0 for minutes while the stream was
+        // actually 24 fps.
+        //
+        // The source rate comes from `upstream_frame_period_us`, recorded in
+        // the decode task *before* the display queue. The loop's own
+        // `frame_period_ms` is measured after it and so only sees frames that
+        // survived, which made it a feedback path: hold too long -> shed ->
+        // survivors show doubled PTS gaps -> estimate slows -> hold longer.
+        // Video-only. An output with an audio device paces against the
+        // measured ALSA playout position (`AudioClock`), and holding frames on
+        // the vblank raster would fight that master clock: the hold decides
+        // presentation independently of where audio actually is, so the two
+        // diverge with nothing to pull them back. Locking video to the panel
+        // is only sound once audio is resampled to the same clock — mpv's
+        // display-sync does exactly that, and this does not (yet) — so decline
+        // rather than run somewhere the design has never been tested.
+        //
+        // `current_pts_90k_smoothed()` returning Some is the same condition
+        // the pacer below uses to choose the audio-master branch, so the two
+        // can never disagree about which clock is in charge.
+        let audio_is_master = clock.current_pts_90k_smoothed().is_some();
+        if audio_is_master && cadence.is_some() {
+            tracing::info!(
+                output_id = %output_id,
+                "display: audio clock became master — disengaging per-vblank cadence (video-only feature)"
+            );
+            cadence = None;
+            cadence_engaged_at = None;
+            cadence_built_for = None;
+        }
+        if vblank_cadence && !audio_is_master {
+            // Quantise to 0.1 fps. Milli-fps resolution meant every EMA
+            // wobble was a different key and rebuilt the scheduler — bilby-nuc
+            // rebuilt dozens of times in 20 minutes. Each rebuild reseeds
+            // `accum`, so drift absorption never survived long enough to act:
+            // the nuc absorbed ZERO over the whole run while bilby-pi, stable
+            // on one scheduler, absorbed 17. 0.1 fps keeps every broadcast
+            // rate distinct (23.976 and 24 differ by 0.1% of cadence, far
+            // inside the near-integer tolerance) while ignoring jitter.
+            const FPS_QUANTUM_MILLI: u32 = 100;
+            let upstream_us = counters.upstream_frame_period_us.load(Ordering::Relaxed);
+            let fps_milli = if upstream_us > 0 {
+                let raw = (1_000_000_000.0 / upstream_us as f64).round() as u32;
+                ((raw + FPS_QUANTUM_MILLI / 2) / FPS_QUANTUM_MILLI) * FPS_QUANTUM_MILLI
+            } else {
+                0
+            };
+            // The panel half of the key is the MEASURED period, not the
+            // advertised integer Hz. Keying on advertised Hz meant a
+            // measurement that later corrected itself — 50.61 Hz refined to
+            // 49.998 once a full window ran on the settled mode — left the
+            // key unchanged at 50, so the scheduler kept the first, worst
+            // reading for the life of the flow and drove a cadence of 2.024
+            // where the truth was 2.000. Quantising to 10 µs is ~25 ppm at
+            // 50 Hz: fine enough to notice a wrong measurement, coarse
+            // enough that ordinary jitter does not rebuild the scheduler.
+            let key = rebuild_key(kms.vblank_period_ns().unwrap_or(0), fps_milli);
+            let stabilised = frames_since_period_reset >= 40;
+            // Honour a runaway cooldown. Re-engaging straight after a
+            // disengage would just re-enter the loop that tripped it, since
+            // the EMA that caused it is still recovering.
+            let blocked = cadence_blocked_until.is_some_and(|t| Instant::now() < t);
+            // Unconditional rebuild rate-limit. Key changes alone are not a
+            // sufficient brake: bilby-nuc logged ~800 rebuilds in five minutes
+            // because a corrupted rate estimate swings across many quantisation
+            // buckets rather than jittering inside one. Each rebuild reseeds
+            // the accumulator, so churn does not merely waste work — it stops
+            // drift absorption from ever completing, and it re-armed the
+            // runaway guard's settle timer often enough that the guard could
+            // never fire.
+            const MIN_REBUILD_INTERVAL: Duration = Duration::from_secs(10);
+            let rebuild_allowed = cadence_last_build_at
+                .is_none_or(|t: Instant| t.elapsed() >= MIN_REBUILD_INTERVAL);
+            // Headroom precondition. Holding a frame for an extra vblank only
+            // works if the per-frame work finishes well inside the frame
+            // period; where it does not, the hold pushes the next decode past
+            // its slot, the queue backs up and the scheduler sheds — which is
+            // what the runaway guard below catches, 79 s and several hundred
+            // dropped frames later. Refusing up front costs nothing and skips
+            // that entirely.
+            //
+            // Measured on this fleet, cadence off (per 40 ms frame):
+            //
+            // | node  | blit + download | of budget | cadence |
+            // |-------|-----------------|-----------|---------|
+            // | pi    |  3 749 us       |   9.4 %   | works   |
+            // | bite  | 10 750 us       |  26.9 %   | works   |
+            // | pir6s | 13 891 us       |  34.7 %   | works   |
+            // | nuc   | 32 093 us       |  80.2 %   | SHEDS   |
+            //
+            // 60 % sits in the gap with margin either side. The nuc is the
+            // expensive case for a structural reason, not a slow one: Gen9
+            // advertises NV12 on no plane, so every frame pays a GPU download
+            // plus a CPU blit and `decoder_kind` reads `vaapi-zerocopy` while
+            // nothing is zero-copy.
+            //
+            // **Only sampled while disengaged.** `blit_us_avg` measures
+            // blit-and-present, so once cadence holds a frame across its
+            // allocated vblanks the average absorbs the hold — pir6s reads
+            // 13 891 us off and 39 536 us on, i.e. 98.8 % of budget, and
+            // gating on that would refuse to engage on the node where this
+            // works best. Sampling only when `cadence.is_none()` keeps the
+            // reference independent of the thing it gates. After a guard
+            // disengage the average is still contaminated for a while, but it
+            // is biased *upward*, i.e. toward refusing — the safe direction.
+            const CADENCE_MAX_BUDGET_PCT: u64 = 60;
+            if cadence.is_none() {
+                let blit = counters.blit_count.load(Ordering::Relaxed);
+                let dl = counters.download_count.load(Ordering::Relaxed);
+                if blit > 0 {
+                    cadence_offpath_cost_us = Some(
+                        counters.blit_us_total.load(Ordering::Relaxed) / blit
+                            + if dl > 0 {
+                                counters.download_us_total.load(Ordering::Relaxed) / dl
+                            } else {
+                                0
+                            },
+                    );
+                }
+            }
+            let frame_period_us = (frame_period_ms * 1000.0) as u64;
+            let has_headroom = match (cadence_offpath_cost_us, frame_period_us) {
+                // No measurement yet, or no period to measure against: let the
+                // runtime guard be the safety net rather than blocking on a
+                // number we do not have.
+                (None, _) | (_, 0) => true,
+                (Some(cost), period) => cost * 100 < period * CADENCE_MAX_BUDGET_PCT,
+            };
+            if !has_headroom && !cadence_no_headroom_logged {
+                cadence_no_headroom_logged = true;
+                tracing::info!(
+                    output_id = %output_id,
+                    frame_cost_us = cadence_offpath_cost_us.unwrap_or(0),
+                    frame_period_us,
+                    max_budget_pct = CADENCE_MAX_BUDGET_PCT,
+                    "display: per-vblank cadence not engaged — this output spends \
+                     too much of each frame period decoding, downloading and \
+                     blitting to have room to hold a frame. Wall-clock pacing \
+                     is the correct choice here and no picture quality is lost \
+                     relative to not having the feature."
+                );
+            }
+            if stabilised
+                && !blocked
+                && rebuild_allowed
+                && has_headroom
+                && cadence_built_for != Some(key)
+                && kms.vblank_clock_trusted()
+            {
+                let source_fps = f64::from(fps_milli) / 1000.0;
+                let panel_measured = kms
+                    .vblank_period_ns()
+                    .filter(|ns| *ns > 0)
+                    .map(|ns| 1_000_000_000.0 / ns as f64)
+                    .unwrap_or_else(|| f64::from(kms.refresh_hz()));
+                let was_engaged = cadence.is_some();
+                cadence = CadenceScheduler::new(panel_measured, source_fps);
+                cadence_built_for = Some(key);
+                cadence_last_build_at = Some(Instant::now());
+                // Baseline the runaway guard once per *engagement episode*, not
+                // per rebuild. Re-baselining on every rebuild walked the
+                // reference up with the damage and reset the settle timer, so
+                // the guard read 0 through 151 shed frames on bilby-nuc.
+                if !was_engaged {
+                    cadence_mpsc_baseline =
+                        counters.frames_dropped_mpsc_full.load(Ordering::Relaxed);
+                    cadence_engaged_at = Some(Instant::now());
+                    cadence_guard_checked_at = None;
+                    cadence_guard_strikes = 0;
+                }
+                match cadence.as_ref() {
+                    Some(c) => tracing::info!(
+                        output_id = %output_id,
+                        panel_hz = panel_measured,
+                        source_fps,
+                        vblanks_per_frame = c.vblanks_per_frame(),
+                        "display: per-vblank cadence engaged"
+                    ),
+                    None => tracing::info!(
+                        output_id = %output_id,
+                        panel_hz = panel_measured,
+                        source_fps,
+                        "display: cadence not schedulable for this rate pair — \
+                         keeping wall-clock pacing"
+                    ),
+                }
+            }
+
+            // Runaway guard. A cadence that consumes slower than the source
+            // fills the decode queue and sheds on `mpsc_full`. Watch that one
+            // signal and stop rather than servo.
+            //
+            // Triggers on shedding being *ongoing*, not on a cumulative count.
+            // A count-based limit was measured too slow on bilby-nuc: it bled
+            // ~0.26 frames/s and took 100 seconds to cross a 25-frame
+            // threshold — 100 seconds of visibly bad picture, confirmed by the
+            // operator, while every counter said the guard was working. A
+            // healthy cadence sheds *exactly* zero (three units, 20 minutes,
+            // zero each), so any shedding that persists across consecutive
+            // checks is diagnostic on its own and the rate does not matter.
+            if let Some(engaged_at) = cadence_engaged_at
+                && cadence.is_some()
+            {
+                // A decoder re-open or a mode change can shed a handful of
+                // frames for reasons unrelated to the cadence.
+                const GUARD_SETTLE: Duration = Duration::from_secs(3);
+                // How often to look. Two consecutive positive samples means a
+                // decision inside ~4 s instead of ~100 s.
+                const GUARD_SAMPLE: Duration = Duration::from_secs(2);
+                const GUARD_STRIKES: u32 = 2;
+                if engaged_at.elapsed() > GUARD_SETTLE
+                    && cadence_guard_checked_at
+                        .is_none_or(|t: Instant| t.elapsed() >= GUARD_SAMPLE)
+                {
+                    cadence_guard_checked_at = Some(Instant::now());
+                    let shed_now = counters.frames_dropped_mpsc_full.load(Ordering::Relaxed);
+                    let shed_delta = shed_now.saturating_sub(cadence_mpsc_baseline);
+                    cadence_mpsc_baseline = shed_now;
+                    if shed_delta > 0 {
+                        cadence_guard_strikes += 1;
+                    } else {
+                        cadence_guard_strikes = 0;
+                    }
+                    if cadence_guard_strikes >= GUARD_STRIKES {
+                        // Escalating backoff. On a host where the cadence
+                        // cannot work, a fixed retry is worse than never
+                        // engaging: bilby-nuc would take ~100 s of stutter
+                        // every 5 minutes forever. Give up entirely after a
+                        // few attempts and say so once.
+                        cadence_failures = cadence_failures.saturating_add(1);
+                        const GIVE_UP_AFTER: u32 = 3;
+                        let cooldown = if cadence_failures >= GIVE_UP_AFTER {
+                            None
+                        } else {
+                            Some(Duration::from_secs(300 * u64::from(cadence_failures)))
+                        };
+                        tracing::warn!(
+                            output_id = %output_id,
+                            engaged_secs = engaged_at.elapsed().as_secs(),
+                            failures = cadence_failures,
+                            retry_in_secs = cooldown.map(|d| d.as_secs()),
+                            "display: per-vblank cadence is shedding frames — disengaging \
+                             and reverting to wall-clock pacing. The scheduled cadence \
+                             is slower than the source, which on this host means it has \
+                             no headroom to hold frames at all."
+                        );
+                        if cooldown.is_none() {
+                            tracing::warn!(
+                                output_id = %output_id,
+                                "display: per-vblank cadence has failed {cadence_failures} times on \
+                                 this output and will not be retried for the life of \
+                                 this flow — this host cannot pace on the vblank raster"
+                            );
+                        }
+                        counters.cadence_disengaged.fetch_add(1, Ordering::Relaxed);
+                        cadence = None;
+                        cadence_engaged_at = None;
+                        cadence_guard_strikes = 0;
+                        cadence_built_for = None;
+                        cadence_blocked_until = match cooldown {
+                            Some(d) => Some(Instant::now() + d),
+                            // Far enough out to mean "never" for any real flow.
+                            None => Some(Instant::now() + Duration::from_secs(86_400 * 365)),
+                        };
+                    }
+                }
+            }
+        }
+
         let blit_start = Instant::now();
         let blit_ok = match blit_and_present(
             &mut kms,
@@ -5453,6 +5839,53 @@ fn display_loop(
                 if flip_wedged {
                     flip_wedged = false;
                     last_flip_timeout_warn_at = None;
+                }
+                // Per-vblank cadence (#115 P3). The flip that just completed
+                // put this frame on the panel for ONE vblank; if the cadence
+                // allocated it more, hold the rest by waiting vblanks without
+                // committing. The panel re-scans the same framebuffer, so a
+                // hold costs nothing but the wait.
+                //
+                // Deciding *which* vblanks a frame occupies is what makes
+                // this work at 1:1, where merely rounding a wall-clock target
+                // to the nearest vblank cannot act at all (an earlier
+                // `present_vblank_snap` prototype measured 100% no-sleep at
+                // 50p on a 50 Hz panel — the branch it lived in was never
+                // taken, so it was deleted rather than shipped alongside
+                // this). Holding also *generates* 2:3 pulldown at 24p rather
+                // than hoping the wall clock lands on it.
+                if let Some(sched) = cadence.as_mut() {
+                    let hold = sched.next_hold();
+                    if hold.kind == HoldKind::DriftAbsorb {
+                        counters.cadence_drift_absorbed.fetch_add(1, Ordering::Relaxed);
+                    }
+                    let mut aborted = false;
+                    for _ in 1..hold.vblanks {
+                        if cancel.is_cancelled() {
+                            break;
+                        }
+                        if let Err(e) = kms.wait_vblank() {
+                            // Treat exactly like a flip timeout: the driver has
+                            // stopped posting vblanks. Abandon the hold rather
+                            // than wedge the render thread, and let the next
+                            // frame's present surface the real error.
+                            tracing::debug!(
+                                output_id = %output_id,
+                                "display: vblank wait failed mid-hold, abandoning: {e:#}"
+                            );
+                            counters.cadence_hold_aborted.fetch_add(1, Ordering::Relaxed);
+                            aborted = true;
+                            break;
+                        }
+                    }
+                    if aborted {
+                        // The frame did not occupy the vblanks the schedule
+                        // allocated it, so the fractional debt carried in
+                        // `accum` no longer describes where we are on the
+                        // raster. Re-seed rather than pay back a debt against
+                        // a phase we never actually reached.
+                        sched.reset();
+                    }
                 }
                 true
             }
