@@ -2703,6 +2703,42 @@ fn find_primary_plane(
     None
 }
 
+/// Does a plane's `IN_FORMATS` list advertise this `(fourcc, modifier)` pair?
+///
+/// Split out from [`KmsDisplay::scanout_supports`] so it can be tested without
+/// a DRM device — the refusal it backs is *permanent* (see
+/// `prime_scanout_permanently_rejected`), so a wrong answer here costs a host
+/// its zero-copy path for the life of the flow.
+///
+/// **`DRM_FORMAT_MOD_INVALID` is normalised to `DRM_FORMAT_MOD_LINEAR` before
+/// the lookup**, which is the whole reason this is not a one-line `any()`.
+/// VAAPI hands back `INVALID` for a surface with no defined tiling layout, and
+/// the importer below already treats it as interchangeable with `LINEAR` —
+/// it drops the `MODIFIERS` flag and lets the kernel take the buffer untiled.
+/// An `IN_FORMATS` blob, though, enumerates real kernel modifiers: it
+/// describes an untiled buffer as `LINEAR` and never emits the `INVALID`
+/// sentinel at all. Comparing the sentinel verbatim therefore answers "this
+/// plane does not scan that out" for a pair the plane scans out perfectly
+/// well, and because the caller treats the refusal as a fixed hardware
+/// property it demotes to the CPU download path permanently — the ~106 ms/
+/// frame copy that `rga-transfer` exists to avoid, on hosts where zero-copy
+/// was working.
+fn formats_advertise(formats: &[(u32, u64)], fourcc: u32, modifier: u64) -> bool {
+    let wanted = if modifier == DRM_FORMAT_MOD_INVALID {
+        DRM_FORMAT_MOD_LINEAR
+    } else {
+        modifier
+    };
+    formats.iter().any(|(f, m)| {
+        let advertised = if *m == DRM_FORMAT_MOD_INVALID {
+            DRM_FORMAT_MOD_LINEAR
+        } else {
+            *m
+        };
+        *f == fourcc && advertised == wanted
+    })
+}
+
 fn read_plane_in_formats(
     card: &CardFile,
     plane: drm::control::plane::Handle,
@@ -4357,7 +4393,7 @@ impl KmsDisplay {
     /// and keep trying the import, never as a refusal.
     pub fn scanout_supports(&self, fourcc: u32, modifier: u64) -> Option<bool> {
         let formats = self.scanout_formats.as_ref()?;
-        Some(formats.iter().any(|(f, m)| *f == fourcc && *m == modifier))
+        Some(formats_advertise(formats, fourcc, modifier))
     }
 
     /// Whether the flip clock may be scheduled against (#115 P2).
@@ -4493,6 +4529,56 @@ impl KmsDisplay {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The pair a Rockchip/Intel plane typically publishes for untiled NV12.
+    const NV12: u32 = u32::from_le_bytes(*b"NV12");
+    const XRGB: u32 = u32::from_le_bytes(*b"XR24");
+
+    #[test]
+    fn an_untiled_plane_accepts_the_vaapi_invalid_sentinel() {
+        // The regression this guards. VAAPI reports DRM_FORMAT_MOD_INVALID for
+        // a surface with no defined tiling; IN_FORMATS describes that same
+        // buffer as DRM_FORMAT_MOD_LINEAR and never emits the sentinel. A
+        // verbatim comparison answers "unsupported" for a pair the plane
+        // scans out, and the caller demotes zero-copy PERMANENTLY on that.
+        let plane = [(NV12, DRM_FORMAT_MOD_LINEAR), (XRGB, DRM_FORMAT_MOD_LINEAR)];
+        assert!(
+            formats_advertise(&plane, NV12, DRM_FORMAT_MOD_INVALID),
+            "INVALID must be normalised to LINEAR before the lookup"
+        );
+        assert!(formats_advertise(&plane, NV12, DRM_FORMAT_MOD_LINEAR));
+    }
+
+    #[test]
+    fn a_plane_that_really_lacks_the_format_still_refuses() {
+        // The case the check exists for: Intel Gen9 advertises no NV12 on any
+        // plane. This must stay a refusal or #116 is not fixed at all.
+        let gen9 = [(XRGB, DRM_FORMAT_MOD_LINEAR)];
+        assert!(!formats_advertise(&gen9, NV12, DRM_FORMAT_MOD_INVALID));
+        assert!(!formats_advertise(&gen9, NV12, DRM_FORMAT_MOD_LINEAR));
+        assert!(formats_advertise(&gen9, XRGB, DRM_FORMAT_MOD_LINEAR));
+    }
+
+    #[test]
+    fn a_real_tiling_modifier_is_matched_exactly() {
+        // Normalisation applies only to the two "no tiling" sentinels; a real
+        // modifier must not be widened into matching anything else.
+        const RK_TILED: u64 = 0x0300_0000_0000_0001;
+        const OTHER_TILED: u64 = 0x0100_0000_0000_0002;
+        let plane = [(NV12, RK_TILED)];
+        assert!(formats_advertise(&plane, NV12, RK_TILED));
+        assert!(!formats_advertise(&plane, NV12, OTHER_TILED));
+        // A tiled-only plane genuinely cannot take a linear buffer.
+        assert!(!formats_advertise(&plane, NV12, DRM_FORMAT_MOD_LINEAR));
+        assert!(!formats_advertise(&plane, NV12, DRM_FORMAT_MOD_INVALID));
+    }
+
+    #[test]
+    fn an_empty_format_list_refuses_everything() {
+        // Distinct from `scanout_supports` returning None (no IN_FORMATS blob
+        // at all), which means "unknown" and must keep the try-and-see path.
+        assert!(!formats_advertise(&[], NV12, DRM_FORMAT_MOD_LINEAR));
+    }
 
     #[test]
     fn infer_alsa_pcm_positional_heuristic() {
