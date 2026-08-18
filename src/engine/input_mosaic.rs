@@ -148,6 +148,82 @@ pub struct MosaicCounters {
     pub tile_decode_errors: AtomicU64,
 }
 
+// ─────────────────────── head advertisement ───────────────────────
+//
+// `MULTIVIEWER_PLAN.md` §"The minimum separation that must land in phase 1",
+// item 2: *a Head is a capability advertised by a node —
+// `{head_id, node_id, kind, max_canvas, encoder_backends}`, discovered from
+// `HealthPayload`, exactly the shape `DisplayDevice` already uses.* This is
+// that shape. The manager mirrors it into `mv_heads`, which is why every
+// derived column over there is documented as health-tick owned.
+
+/// The node-local id of the phase-1 stream head.
+///
+/// A **constant**, and that is load-bearing rather than lazy. `mv_heads` keys
+/// on `(node_id, head_id)` and its schema requires the id be "stable across
+/// reboots on the node's side" — so anything derived from runtime state (a flow
+/// id, an input id, a uuid minted at boot) would mint a *second* head row on
+/// every restart and strand the wall pointing at the retired one. A constant is
+/// stable by construction.
+///
+/// One head, because phase 1 is scoped "one wall, one head, one node" and the
+/// manager enforces exactly that in `refuse_double_booking`. Panel and SDI
+/// heads are enumerable — a KMS connector each, a DeckLink port each — and
+/// arrive with their own ids in phase 2.
+pub const STREAM_HEAD_ID: &str = "stream0";
+
+/// What this node says about one of its heads, on the health tick.
+///
+/// Field names are the manager's `HeadAdvertisement` (`manager-core`,
+/// `db::multiviewer`), which deserialises this verbatim. Renaming a field here
+/// silently stops that column being refreshed — the value simply stops arriving
+/// and `last_seen_at` keeps advancing, which looks like a healthy head with
+/// stale capabilities rather than like a bug.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct HeadAdvertisement {
+    pub head_id: String,
+    /// `"stream"`, `"panel"` or `"sdi"` — a CHECK constraint on the manager
+    /// side rejects anything else, so this is not free-form.
+    pub kind: &'static str,
+    /// A KMS connector or DeckLink port name for the phase-2 kinds; `None` for
+    /// a stream head, which occupies no physical port.
+    pub connector: Option<String>,
+    pub max_canvas_width: u32,
+    pub max_canvas_height: u32,
+    /// Free-form JSON, stored as JSONB. A column per capability would be a
+    /// migration per firmware.
+    pub capabilities: serde_json::Value,
+}
+
+/// The heads this node can actually drive, for `HealthPayload`.
+///
+/// Empty — so the manager mirrors nothing — unless an encoder backend resolves.
+/// That is the same condition that gates the `mv-compositor` capability bit,
+/// and deliberately so: the flow bus carries MPEG-TS, so a composite reaches an
+/// output only by being encoded, and a build with the feature but no encoder
+/// refuses at flow start. Advertising a head such a node cannot drive would put
+/// it in the operator's picker and fail at the moment it went to air.
+///
+/// `encoder_backends` carries the backend this head **will use**, not every
+/// backend compiled in: `select_video_backend` returns the first match in
+/// preference order and the compositor takes that one, so listing the rest
+/// would advertise capacity nothing routes to.
+pub fn advertised_heads() -> Vec<HeadAdvertisement> {
+    let Some(codec) = crate::engine::input_test_pattern::select_video_backend() else {
+        return Vec::new();
+    };
+    vec![HeadAdvertisement {
+        head_id: STREAM_HEAD_ID.to_string(),
+        kind: "stream",
+        connector: None,
+        max_canvas_width: mosaic::MAX_CANVAS_W,
+        max_canvas_height: mosaic::MAX_CANVAS_H,
+        capabilities: serde_json::json!({
+            "encoder_backends": [codec.ffmpeg_name()],
+        }),
+    }]
+}
+
 /// Spawn the compositor for one mosaic input.
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_mosaic_input(
@@ -1330,5 +1406,78 @@ mod tests {
             a, b,
             "a fault and an empty slot must not render identically"
         );
+    }
+    // ───────────────────── head advertisement ─────────────────────
+
+    /// The advertisement serialises to exactly the field names the manager's
+    /// `HeadAdvertisement` deserialises.
+    ///
+    /// This is a **cross-repo contract test with only one end in this repo**,
+    /// which is the most it can be: the two sides are separate crates in
+    /// separate git repositories, so no compiler checks that
+    /// `bilbycast-manager`'s `HeadAdvertisement` still names these fields.
+    /// Every field there is `#[serde(default)]`, so a rename on either side
+    /// does not fail — the value silently stops arriving while `last_seen_at`
+    /// keeps advancing, which reads as a healthy head with stale capabilities.
+    /// Pinning the wire keys here at least makes the edge half deliberate.
+    #[test]
+    fn the_advertisement_uses_the_wire_names_the_manager_reads() {
+        let head = HeadAdvertisement {
+            head_id: STREAM_HEAD_ID.to_string(),
+            kind: "stream",
+            connector: None,
+            max_canvas_width: 1920,
+            max_canvas_height: 1080,
+            capabilities: serde_json::json!({ "encoder_backends": ["libx264"] }),
+        };
+        let v = serde_json::to_value(&head).expect("serialise");
+        let obj = v.as_object().expect("an object");
+
+        let mut keys: Vec<&str> = obj.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "capabilities",
+                "connector",
+                "head_id",
+                "kind",
+                "max_canvas_height",
+                "max_canvas_width",
+            ],
+            "these are mv_heads' column names; a rename stops that column \
+             refreshing without failing anything"
+        );
+
+        // `kind` is checked by a CHECK constraint on the manager side, so an
+        // unrecognised value is a failed INSERT rather than a soft default.
+        assert_eq!(obj["kind"], "stream");
+        // A stream head occupies no physical port; the column is documented
+        // NULL for exactly this kind.
+        assert!(obj["connector"].is_null());
+    }
+
+    /// A node with no encoder backend advertises no head at all.
+    ///
+    /// The compositor cannot reach an output without one — the flow bus carries
+    /// MPEG-TS — so a head here would appear in the operator's picker and fail
+    /// at flow start. The condition is the same one gating the `mv-compositor`
+    /// capability bit, and the two must not drift apart.
+    #[test]
+    fn a_head_is_advertised_only_when_an_encoder_backend_resolves() {
+        let heads = advertised_heads();
+        let has_backend = crate::engine::input_test_pattern::select_video_backend().is_some();
+        assert_eq!(
+            heads.is_empty(),
+            !has_backend,
+            "advertised_heads() must agree with select_video_backend(), which \
+             is what gates the mv-compositor capability"
+        );
+        if has_backend {
+            assert_eq!(heads.len(), 1, "phase 1 is one wall, one head, one node");
+            assert_eq!(heads[0].head_id, STREAM_HEAD_ID);
+            assert_eq!(heads[0].max_canvas_width, mosaic::MAX_CANVAS_W);
+            assert_eq!(heads[0].max_canvas_height, mosaic::MAX_CANVAS_H);
+        }
     }
 }

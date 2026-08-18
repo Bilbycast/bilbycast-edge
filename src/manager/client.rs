@@ -1013,6 +1013,28 @@ pub(crate) fn build_health_payload(
                     .map(|o| o.insert("display_devices".into(), json));
             }
     }
+    // Multiviewer heads this node can drive. Same shape and same placement as
+    // `display_devices` directly above, which is the precedent
+    // MULTIVIEWER_PLAN.md names for it: a head is a capability discovered from
+    // the health tick, never operator-declared config.
+    //
+    // The manager mirrors these into `mv_heads` keyed on `(node_id, head_id)`,
+    // so re-advertising the same head on every tick updates one row rather than
+    // minting a new one, and `last_seen_at` is what ages a head out.
+    //
+    // Empty → omit the field entirely, matching every other optional block
+    // here. An edge with no encoder backend advertises no head, so the manager
+    // never offers a wall on a node that would refuse it at flow start.
+    #[cfg(feature = "multiviewer")]
+    {
+        let heads = crate::engine::input_mosaic::advertised_heads();
+        if !heads.is_empty()
+            && let Ok(json) = serde_json::to_value(heads.as_slice()) {
+                payload
+                    .as_object_mut()
+                    .map(|o| o.insert("mv_heads".into(), json));
+            }
+    }
     // Per-port DeckLink hardware status (signal lock, genlock, detected raster,
     // PCIe link). Gated on the `sdi-decklink` Cargo feature; absent on every
     // other build so older managers / non-SDI edges stay wire-compatible. A
