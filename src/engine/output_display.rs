@@ -53,7 +53,7 @@ use video_engine::{
 
 use crate::config::models::{DisplayOutputConfig, DisplayScalingMode};
 use crate::display::audio_bars::{new_shared_meter, SharedMeter, StreamHeader};
-use crate::engine::display_cadence::{CadenceScheduler, HoldKind};
+use crate::engine::display_cadence::{rebuild_key, CadenceScheduler, HoldKind};
 use crate::display::audio_meter::spawn_audio_meter;
 use crate::display::{audio::AudioBackend, clock::AudioClock, kms::KmsDisplay};
 use crate::engine::audio_decode::DecodeStats;
@@ -3925,7 +3925,7 @@ fn drain_video_frames(
         let rga_prepared: Option<(Vec<u8>, usize, VideoFrameChroma, i32)> = None;
         let frame =
             if need_sysmem && rga_prepared.is_none() {
-                match {
+                let downloaded = {
                     let dl_start = Instant::now();
                     let r = frame.download_to_sysmem();
                     counters
@@ -3933,7 +3933,8 @@ fn drain_video_frames(
                         .fetch_add(dl_start.elapsed().as_micros() as u64, Ordering::Relaxed);
                     counters.download_count.fetch_add(1, Ordering::Relaxed);
                     r
-                } {
+                };
+                match downloaded {
                     Ok(sysmem) => sysmem,
                     // PERMANENT (see the companion arm further down):
                     // no downloadable `sw_format`, so every future
@@ -4100,10 +4101,10 @@ fn drain_video_frames(
                     // Recover to sysmem and fall through to the
                     // ordinary semi-planar codepath below with it —
                     // NOT a `continue`, unlike every other arm here.
-                    match {
-                        // Time the copy specifically: `decode_us` spans feed +
-                        // drain and cannot distinguish a slow decoder from an
-                        // expensive GPU->CPU transfer.
+                    // Time the copy specifically: `decode_us` spans feed +
+                    // drain and cannot distinguish a slow decoder from an
+                    // expensive GPU->CPU transfer.
+                    let downloaded = {
                         let dl_start = Instant::now();
                         let r = frame.download_to_sysmem();
                         counters
@@ -4111,7 +4112,8 @@ fn drain_video_frames(
                             .fetch_add(dl_start.elapsed().as_micros() as u64, Ordering::Relaxed);
                         counters.download_count.fetch_add(1, Ordering::Relaxed);
                         r
-                    } {
+                    };
+                    match downloaded {
                         Ok(sysmem) => sysmem,
                         Err(video_codec::VideoError::UnsupportedHwFormat) => {
                             // PERMANENT: the HW frames context has no
@@ -5544,8 +5546,7 @@ fn display_loop(
             // where the truth was 2.000. Quantising to 10 µs is ~25 ppm at
             // 50 Hz: fine enough to notice a wrong measurement, coarse
             // enough that ordinary jitter does not rebuild the scheduler.
-            let period_key = kms.vblank_period_ns().unwrap_or(0) / 10_000;
-            let key = (period_key, fps_milli);
+            let key = rebuild_key(kms.vblank_period_ns().unwrap_or(0), fps_milli);
             let stabilised = frames_since_period_reset >= 40;
             // Honour a runaway cooldown. Re-engaging straight after a
             // disengage would just re-enter the loop that tripped it, since

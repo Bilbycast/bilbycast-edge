@@ -4368,11 +4368,6 @@ impl KmsDisplay {
         Some(formats.iter().any(|(f, m)| *f == fourcc && *m == modifier))
     }
 
-    /// Every `(fourcc, modifier)` pair the primary plane accepts, for
-    /// diagnostics and for choosing a convertible target format.
-    pub fn scanout_formats(&self) -> Option<&[(u32, u64)]> {
-        self.scanout_formats.as_deref()
-    }
 
     pub fn vblank_clock_trusted(&self) -> bool {
         self.clock_trusted.load(Ordering::Acquire)

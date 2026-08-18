@@ -110,7 +110,7 @@ impl CadenceScheduler {
         // dropped rather than held. That is a different algorithm with
         // different perceptual trade-offs (which frame to discard), and it is
         // not implemented here — 60p on a 50 Hz panel keeps the old path.
-        if vpf < 1.0 || vpf > 16.0 {
+        if !(1.0..=16.0).contains(&vpf) {
             return None;
         }
         // "Near-integer" spans real crystal error (tens of ppm) with room to
