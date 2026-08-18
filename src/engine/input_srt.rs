@@ -329,10 +329,12 @@ pub fn spawn_srt_input(
             &event_sender,
         );
         let publisher = crate::engine::ingress_publisher::IngressPublisher::new(
-            config.ingress_delay_ms,
             // SRT has libsrt TSBPD as its transport de-jitter — no
             // media-rate ingress de-jitter (would double-buffer).
-            None,
+            crate::engine::ingress_publisher::IngressBuffering {
+                delay_ms: config.ingress_delay_ms,
+                ..Default::default()
+            },
             broadcast_tx,
             &input_id,
             cancel.clone(),

@@ -1351,12 +1351,21 @@ pub fn clock_identity_for_input(
     use crate::config::models::InputConfig;
     // Testbed-only escape hatch for Phase 4 PES-splice verification:
     // when `BILBYCAST_TESTBED_SHARED_WALLCLOCK=1`, treat every input as
-    // co-clocked on the host wallclock. NEVER set this in production —
-    // it removes the silent A/V-drift guard for cross-flow ES routing.
+    // co-clocked on the host wallclock. This removes the A/V-drift guard
+    // that stops the PID-bus assembler putting two un-co-clocked sources
+    // in one output program, so it is compiled **out** of release builds
+    // entirely rather than left one environment variable away from a
+    // silently drifting programme. A release binary ignores the variable.
+    #[cfg(debug_assertions)]
     if matches!(
         std::env::var("BILBYCAST_TESTBED_SHARED_WALLCLOCK").as_deref(),
         Ok("1") | Ok("true")
     ) {
+        tracing::warn!(
+            "BILBYCAST_TESTBED_SHARED_WALLCLOCK is set — every input is being reported as \
+             co-clocked on the host wallclock. This disables the cross-flow A/V-drift guard \
+             and is for testbed verification only."
+        );
         return ClockIdentity::Wallclock;
     }
     match &input.config {

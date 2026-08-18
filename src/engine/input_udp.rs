@@ -102,8 +102,12 @@ pub fn spawn_udp_input(
         // spawns a drainer task that releases packets at
         // recv_time_us + delay_ms (fixed delay; NOT a jitter buffer).
         let publisher = crate::engine::ingress_publisher::IngressPublisher::new(
-            config.ingress_delay_ms,
-            config.ingress_dejitter_ms,
+            crate::engine::ingress_publisher::IngressBuffering {
+                delay_ms: config.ingress_delay_ms,
+                dejitter_ms: config.ingress_dejitter_ms,
+                residence_ms: config.ingress_residence_ms,
+                honours_node_defaults: true,
+            },
             broadcast_tx,
             &input_id,
             cancel.clone(),

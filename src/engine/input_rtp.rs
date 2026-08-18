@@ -168,13 +168,23 @@ pub fn spawn_rtp_input(
             let _ = p;
         }
         // Per-input ingress publisher (fixed-delay + de-jitter modes) — covers both single-
-        // leg and 2022-7 dual-leg paths. When the operator sets
-        // `ingress_delay_ms` on a -7 RTP input, both legs go
-        // through the same publisher so the hitless merger sees the
-        // legs with reduced inter-arrival jitter.
+        // leg and 2022-7 dual-leg paths. On a -7 input the publisher sits
+        // **downstream** of the merger, not upstream: each leg is fed to
+        // `merger.ingest(...)` and only the merged output reaches the
+        // publisher (`publish_emitted_redundant_packet`). So the buffer
+        // smooths what the merger emitted; it does not present the merger
+        // with de-jittered legs, which is what an earlier version of this
+        // comment claimed.
+        //
+        // `dejitter_ms` may also be answered by the node's
+        // `tuning.ingress_dejitter_ms` — see `honours_node_defaults`.
         let publisher = crate::engine::ingress_publisher::IngressPublisher::new(
-            config.ingress_delay_ms,
-            config.ingress_dejitter_ms,
+            crate::engine::ingress_publisher::IngressBuffering {
+                delay_ms: config.ingress_delay_ms,
+                dejitter_ms: config.ingress_dejitter_ms,
+                residence_ms: config.ingress_residence_ms,
+                honours_node_defaults: true,
+            },
             broadcast_tx,
             &input_id,
             cancel.clone(),

@@ -81,6 +81,12 @@ pub struct AppConfig {
     /// when thresholds are exceeded. See [`ResourceLimitConfig`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resource_limits: Option<ResourceLimitConfig>,
+    /// Optional node-wide tuning defaults. Every field here previously
+    /// existed only as an environment variable, which made it invisible to
+    /// the manager, undiscoverable per node and unauditable. See
+    /// [`NodeTuningConfig`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tuning: Option<NodeTuningConfig>,
     /// OPTIONAL host-level policy caps for the shared-leg capacity broker — one
     /// hard ceiling per physical NIC that the broker's auto-discovered capacity
     /// estimate must never probe past. Only needed for a metered / rate-limited
@@ -261,6 +267,7 @@ impl Default for AppConfig {
             inputs: Vec::new(),
             outputs: Vec::new(),
             resource_limits: None,
+            tuning: None,
             logging: None,
             flows: Vec::new(),
             tunnels: Vec::new(),
@@ -530,6 +537,30 @@ pub struct ServerConfig {
     /// When absent or `enabled: false`, all endpoints are unauthenticated.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth: Option<crate::api::auth::AuthConfig>,
+    /// Browser origins permitted to drive **NMOS connection management**
+    /// (IS-05 `PATCH .../staged` / `.../activate`, IS-08 `POST /map/*`) from a
+    /// web page.
+    ///
+    /// Absent or empty — the default — refuses every browser-issued NMOS state
+    /// change: a foreign page can re-point a live sender and the change is
+    /// persisted, and NMOS writes are unauthenticated by specification on a
+    /// node with `server.auth` off. Native controllers (Sony, Riedel, Lawo,
+    /// the AMWA testing tool) send no `Origin` and no `Sec-Fetch-*`, so they
+    /// are unaffected either way.
+    ///
+    /// Populate it with the exact origins of the browser-hosted controllers
+    /// you run (`["https://nmos-js.example.tv"]`, scheme + authority, no
+    /// trailing slash, no wildcard). Those origins then get `PATCH` / `POST`
+    /// in the NMOS preflight and pass
+    /// `api::server::guard_cross_origin_write`.
+    ///
+    /// Read once, when the router is built at node start — a pushed change
+    /// therefore lands on the next restart, exactly like `server.listen_addrs`
+    /// and `server.auth`. It is deliberately not re-read per request: the
+    /// router holds the resolved list, so the guard takes no lock on the
+    /// shared config and cannot fail open.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nmos_browser_control: Option<Vec<String>>,
 }
 
 impl ServerConfig {
@@ -569,6 +600,7 @@ impl Default for ServerConfig {
             listen_port: 8080,
             tls: None,
             auth: None,
+            nmos_browser_control: None,
         }
     }
 }
@@ -1455,6 +1487,79 @@ fn default_true_opt() -> Option<bool> {
     Some(true)
 }
 
+/// Node-wide tuning defaults.
+///
+/// Everything here used to be reachable **only** through an environment
+/// variable, which meant the manager could neither show it nor set it: an
+/// operator had to edit a systemd unit and restart, per node, with no audit
+/// trail and no way to tell one node's tuning from another's. These are
+/// ordinary config fields now, so they arrive over the same validated
+/// `UpdateConfig` path as everything else.
+///
+/// The legacy environment variables are still read for one release as a
+/// fallback *below* this block, and using one raises a Warning
+/// `deprecated_env_var` event naming the field that replaces it — see
+/// [`crate::config::env_compat`].
+///
+/// Every field is `Option`: `None` means "use the built-in default", which
+/// is what an absent `tuning` block gives you.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct NodeTuningConfig {
+    /// Default ingress de-jitter setpoint in ms for inputs that don't carry
+    /// their own `ingress_dejitter_ms`. Bounded 20–2000. `None` → 60 ms.
+    ///
+    /// Replaces `BILBYCAST_INGRESS_BUFFER_MS`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ingress_dejitter_ms: Option<u32>,
+    /// Default ingress de-jitter hard-shed residence cap in ms. Bounded
+    /// `setpoint + 40` .. 5000. `None` → `max(4 × setpoint, 250)`, so a
+    /// bigger buffer gets proportionally more burst headroom.
+    ///
+    /// Replaces `BILBYCAST_INGRESS_RESIDENCE_MS`. A per-input
+    /// `ingress_residence_ms` overrides this for that input.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ingress_residence_ms: Option<u32>,
+    /// Run the startup hardware encoder/decoder session-capacity probe.
+    /// `None` → `true`. Turning it off trades the manager's "sessions used
+    /// **of** max" denominator for a faster boot.
+    ///
+    /// Replaces `BILBYCAST_PROBE_SESSION_LIMITS`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub probe_session_limits: Option<bool>,
+    /// Run the second-tier 4K session-capacity probe. `None` → `true`.
+    /// Ignored when `probe_session_limits` is `false` — that disables both
+    /// tiers.
+    ///
+    /// Replaces `BILBYCAST_PROBE_4K`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub probe_4k: Option<bool>,
+    /// Node-wide default for the media-player operator-control (transition)
+    /// path. `None` → `true`. A per-input
+    /// [`MediaPlayerInputConfig::operator_control`] always wins.
+    ///
+    /// Also decides whether the node advertises the
+    /// `media-player-control-v1` capability, so turning it off here withdraws
+    /// the manager's **Next** button node-wide rather than leaving a button
+    /// that answers `media_player_control_unavailable`.
+    ///
+    /// Replaces `BILBYCAST_MEDIA_PLAYER_CONTROLLER`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub media_player_controller: Option<bool>,
+    /// Node-wide default for PCR-anchored TS playout pacing. `None` → `true`
+    /// (deadlines anchored on the asset's own PCR); `false` falls back to the
+    /// legacy byte-rate estimate. A per-input
+    /// [`MediaPlayerInputConfig::pcr_deadlines`] always wins.
+    ///
+    /// Both layers exist because the failure modes are *both* host-dependent
+    /// (a stalling disk, a clock step — node-wide) and asset-dependent (a
+    /// spliced file — one input), so neither granularity alone can express
+    /// the rollback an operator actually needs.
+    ///
+    /// Replaces `BILBYCAST_MEDIA_PLAYER_PCR_DEADLINES`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub media_player_pcr_deadlines: Option<bool>,
+}
+
 /// System resource monitoring and threshold configuration.
 ///
 /// When configured at the node level, the edge periodically samples CPU and RAM
@@ -2130,6 +2235,17 @@ pub struct MediaPlayerInputConfig {
     /// where this field is unset (explicit config wins over the env var).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub operator_control: Option<bool>,
+    /// Pace TS playout on deadlines anchored to the asset's own PCR
+    /// (`None` → the node default, itself defaulting to `true`) or on the
+    /// legacy byte-rate estimate (`false`).
+    ///
+    /// Per-input because the failure modes this mode can have are
+    /// *asset*-dependent — a spliced file whose PCR steps mid-asset paces
+    /// badly while every other asset on the same node is fine, so pinning one
+    /// playlist to byte-rate must not drag the rest of the node back with it.
+    /// The node-wide half lives on `tuning.media_player_pcr_deadlines`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pcr_deadlines: Option<bool>,
 }
 
 fn default_image_fps() -> u8 {
@@ -2370,13 +2486,25 @@ pub struct RtpInputConfig {
     /// regardless of network packet-delay-variation. Unlike
     /// `ingress_delay_ms` (a pure delay line that *preserves* jitter)
     /// this actually removes it — it's the real broadcast-grade input
-    /// de-jitter. `None` → env (`BILBYCAST_INGRESS_BUFFER_MS`) / 60 ms
+    /// de-jitter. `None` → node-wide `tuning.ingress_dejitter_ms` / 60 ms
     /// default; bounded 20–2000 ms. De-jitter supersedes smoothing if both
     /// are set. On a SMPTE 2022-7 dual-leg RTP input it runs *after* the
     /// hitless merger (re-pacing the merger's bursty seq-ordered drain).
     /// See [`crate::engine::ingress_dejitter`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ingress_dejitter_ms: Option<u32>,
+    /// Hard-shed residence cap for this input's de-jitter buffer, in ms.
+    /// A packet older than this is shed rather than released late, which
+    /// is what bounds ingress latency when a burst or a source-rate offset
+    /// exceeds the servo's ±5 % authority.
+    ///
+    /// `None` → node-wide `tuning.ingress_residence_ms`, else
+    /// `max(4 × setpoint, 250)` ms. Bounded `setpoint + 40` .. 5000 ms.
+    /// Only meaningful alongside `ingress_dejitter_ms` — without a
+    /// de-jitter buffer there is no residence to cap, and validation
+    /// rejects the combination rather than accepting a silent no-op.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ingress_residence_ms: Option<u32>,
     /// Opt OUT of muxer-mode PCR + PES PTS regeneration. Default
     /// `false` (muxer mode ON) — bilbycast-edge regenerates PCR and
     /// PES PTS/DTS values from the per-flow master clock per the
@@ -2464,6 +2592,10 @@ pub struct UdpInputConfig {
     /// [`RtpInputConfig::ingress_dejitter_ms`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ingress_dejitter_ms: Option<u32>,
+    /// Hard-shed residence cap for this input's de-jitter buffer, in ms.
+    /// See [`RtpInputConfig::ingress_residence_ms`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ingress_residence_ms: Option<u32>,
     /// Muxer-mode PCR + PES PTS regeneration opt-out. See
     /// [`RtpInputConfig::passthrough_clock`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -7533,6 +7665,7 @@ mod tests {
             monitor: None,
             manager: None,
             resource_limits: None,
+            tuning: None,
             logging: None,
             tunnels: Vec::new(),
             flow_groups: Vec::new(),
@@ -7567,6 +7700,7 @@ mod tests {
                     interface_binding: None,
                     ingress_delay_ms: None,
                     ingress_dejitter_ms: None,
+                    ingress_residence_ms: None,
                     passthrough_clock: None,
                 }),
             }],
@@ -7646,6 +7780,7 @@ mod tests {
                     interface_binding: None,
                     ingress_delay_ms: None,
                     ingress_dejitter_ms: None,
+                    ingress_residence_ms: None,
                     passthrough_clock: None,
                 }),
             }],

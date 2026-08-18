@@ -18,7 +18,7 @@ Without pacing of *any* kind, encoder bursts arrive at the wire as bursts. PCR j
 
 ## Capability tiers
 
-`engine::wire_emit::spawn_wire_emitter` only takes the SO_TXTIME path when **all three** of the following hold: `BILBYCAST_ENABLE_TXTIME=1` (alias `BILBYCAST_ENABLE_SO_TXTIME=1`) is set and `BILBYCAST_FORCE_NANOSLEEP` is not, the output is **etf-eligible** (`WirePacingClass::EtfEligible` — ST 2110 uncompressed essence), **and** the `try_enable_so_txtime(&socket, clockid)` probe succeeds on the socket. If any of the three fails — including a compressed (`Lossless`) output even with the env var set — it falls back to the `clock_nanosleep` releaser. The chosen tier is logged at info level on output start and surfaced on `OutputStats.wire_pacing_tier`.
+`engine::wire_emit::spawn_wire_emitter` only takes the SO_TXTIME path when **all three** of the following hold: `BILBYCAST_ENABLE_TXTIME=1` is set and `BILBYCAST_FORCE_NANOSLEEP` is not, the output is **etf-eligible** (`WirePacingClass::EtfEligible` — ST 2110 uncompressed essence), **and** the `try_enable_so_txtime(&socket, clockid)` probe succeeds on the socket. If any of the three fails — including a compressed (`Lossless`) output even with the env var set — it falls back to the `clock_nanosleep` releaser. The chosen tier is logged at info level on output start and surfaced on `OutputStats.wire_pacing_tier`.
 
 | Tier | Mechanism | Inter-packet jitter | Requires | When |
 |---|---|---|---|---|
@@ -84,12 +84,13 @@ sudo tc qdisc del dev enp1s0 root
 
 ## Enabling the SO_TXTIME tier on the edge
 
-After the qdisc is in place + PTP is running, opt in to the SO_TXTIME release path by setting **one** of these env vars on the edge process:
+After the qdisc is in place + PTP is running, opt in to the SO_TXTIME release path by setting this env var on the edge process:
 
 ```
-BILBYCAST_ENABLE_TXTIME=1       # short form (preferred)
-BILBYCAST_ENABLE_SO_TXTIME=1    # long form (accepted alias)
+BILBYCAST_ENABLE_TXTIME=1
 ```
+
+The former alias `BILBYCAST_ENABLE_SO_TXTIME` is **removed** — one name for one knob. A host that still sets it is reported at startup as a Warning `deprecated_env_var` with `details.status = "removed"` and stays on the `clock_nanosleep` tier, so a stale unit file cannot state an intent that isn't being applied.
 
 Production via the systemd unit: add the line to `/etc/bilbycast/edge.env`. The installer's default env file ships with this line commented — uncomment it after the qdisc + PTP prerequisites are confirmed.
 
@@ -105,7 +106,7 @@ After restart, the edge log shows `tier=so_txtime` on each output start; otherwi
 
 ## Operator escape hatch
 
-`BILBYCAST_FORCE_NANOSLEEP=1` is kept as a no-op alias for back-compat — since `clock_nanosleep` is the default already, the flag does nothing now. Old configs that set it still work.
+`BILBYCAST_FORCE_NANOSLEEP=1` is a back-compat no-op on its own — `clock_nanosleep` is already the default, so setting it alone changes nothing and old configs that set it still work. It only matters alongside `BILBYCAST_ENABLE_TXTIME=1`, where it forces the `clock_nanosleep` fallback for diagnostics (the `force_nanosleep` term in the tier test above).
 
 ## Architecture
 

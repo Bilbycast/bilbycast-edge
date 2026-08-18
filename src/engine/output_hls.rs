@@ -1368,7 +1368,7 @@ fn packetize_ts(pid: u16, pes: &[u8], cc: &mut u8) -> Vec<[u8; 188]> {
 /// Rewrite the audio stream_type in a PMT TS packet and recalculate CRC.
 #[cfg(feature = "media-codecs")]
 fn rewrite_pmt_audio_stream_type(pkt: &mut [u8], audio_pid: u16, new_stream_type: u8) {
-    use super::ts_parse::{ts_has_adaptation, mpeg2_crc32};
+    use super::ts_parse::{ts_has_adaptation, mpeg2_crc32, psi_crc_offset};
     const TS_PACKET_SIZE: usize = 188;
 
     let mut offset = 4;
@@ -1403,8 +1403,7 @@ fn rewrite_pmt_audio_stream_type(pkt: &mut [u8], audio_pid: u16, new_stream_type
     }
 
     // Recalculate CRC32 over the section (excluding the CRC bytes themselves)
-    let crc_offset = section_start + 3 + section_length - 4;
-    if crc_offset + 4 <= TS_PACKET_SIZE {
+    if let Some(crc_offset) = psi_crc_offset(section_start, section_length) {
         let crc = mpeg2_crc32(&pkt[section_start..crc_offset]);
         pkt[crc_offset] = (crc >> 24) as u8;
         pkt[crc_offset + 1] = (crc >> 16) as u8;

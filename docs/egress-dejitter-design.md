@@ -6,7 +6,8 @@
 > ships*. Specifically (verify against `src/engine/wire_emit.rs`):
 >
 > - **The cushion is now OPT-IN.** With `egress_buffer_ms` (per-output) /
->   `BILBYCAST_EGRESS_BUFFER_MS` unset, `seed_cushion = false`: the servo
+>   unset (`BILBYCAST_EGRESS_BUFFER_MS`, named here when this was written, has
+>   since been removed), `seed_cushion = false`: the servo
 >   emits byte-for-byte on arrival with only a gentle rate trim and **no 60 ms
 >   startup cushion** — zero added latency, zero regression. The 60 ms
 >   setpoint cushion is seeded **only** when an operator sets one of those

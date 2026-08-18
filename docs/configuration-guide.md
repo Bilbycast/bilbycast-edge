@@ -15,6 +15,7 @@ Complete reference for the bilbycast-edge JSON configuration file. This guide co
 - [Monitor Configuration](#monitor-configuration)
 - [Manager Configuration](#manager-configuration)
 - [Resource Limits](#resource-limits)
+- [Node Tuning](#node-tuning)
 - [Tunnel Configuration](#tunnel-configuration)
 - [Flow Configuration](#flow-configuration)
 - [Input Types](#input-types)
@@ -193,6 +194,7 @@ If neither file exists at startup, an empty default configuration is used. Both 
 | `server` | object | Yes | - | API server configuration. |
 | `monitor` | object | No | `null` | Web monitoring dashboard configuration. |
 | `manager` | object | No | `null` | Manager WebSocket connection configuration. See [Manager Configuration](#manager-configuration). |
+| `tuning` | object | No | `null` | Node-wide tuning defaults. See [Node Tuning](#node-tuning). |
 | `inputs` | array | No | `[]` | Top-level input definitions. Each is an `InputDefinition` with `id`, `name`, and flattened protocol-specific fields (enum-tagged by `type`). See [Input Types](#input-types). Inputs exist independently and are referenced by flows via `input_ids`. |
 | `outputs` | array | No | `[]` | Top-level output definitions. Each is an `OutputConfig` with `id`, `name`, and protocol-specific fields (enum-tagged by `type`). See [Output Types](#output-types). Outputs exist independently and are referenced by flows via `output_ids`. |
 | `flows` | array | No | `[]` | List of flow configurations. Each flow references one or more inputs (one active at a time) and zero or more outputs by ID. See [Flow Configuration](#flow-configuration). |
@@ -443,6 +445,95 @@ Events emitted (category `system_resources`):
 `system_resources_recovered`. With `critical_action: "gate_flows"`,
 new-flow rejections additionally surface as a save-time error on
 the manager UI.
+
+---
+
+## Node Tuning
+
+Optional top-level `tuning` block holding node-wide defaults. Every
+field here was previously reachable **only** through an environment
+variable, which meant the manager could neither show nor set it, an
+operator had to edit a systemd unit and restart per node, and nothing
+was audited. They are ordinary config fields now, so they arrive over
+the same validated `UpdateConfig` path as everything else.
+
+Every field is optional; omitting one (or omitting the whole block)
+uses the built-in default.
+
+```json
+{
+  "version": 2,
+  "tuning": {
+    "ingress_dejitter_ms": 80,       // node default de-jitter setpoint (UDP/RTP)
+    "ingress_residence_ms": 320,     // hard-shed cap for that buffer
+    "probe_session_limits": true,    // startup HW session-capacity probe
+    "probe_4k": false,               // skip the second-tier 4K pass
+    "media_player_controller": true, // media-player operator transport control
+    "media_player_pcr_deadlines": true // PCR-anchored TS playout pacing
+  },
+  "inputs": [],
+  "outputs": [],
+  "flows": []
+}
+```
+
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| `ingress_dejitter_ms` | integer | No | `60` | Node-wide default ingress de-jitter setpoint, in ms of content. Range 20–2000. Applies to raw **UDP and RTP** inputs that do not carry their own `ingress_dejitter_ms`, and it both **switches the buffer on** and sets its depth — so setting it here de-jitters every such input on the node. It does **not** apply to SRT (TSBPD de-jitters at the transport layer), RTSP, RTMP or `bonded` inputs, which run ingress passthrough by design. |
+| `ingress_residence_ms` | integer | No | `max(4 × setpoint, 250)` ms | Node-wide default hard-shed residence cap for that buffer. A packet older than this is shed rather than released late, which is what bounds ingress latency when a burst or a source-rate offset exceeds the servo's ±5 % authority. Range `ingress_dejitter_ms + 40` .. `5000`; node-wide the floor is checked against `tuning.ingress_dejitter_ms`, or the built-in 60 ms when that is unset. A per-input `ingress_residence_ms` overrides it. |
+| `probe_session_limits` | boolean | No | `true` | Run the startup hardware encoder/decoder session-capacity probe. `false` trades the manager's "sessions used **of** max" denominator for a faster boot, and disables **both** tiers. See [Capacity & resource budget](#capacity--resource-budget). |
+| `probe_4k` | boolean | No | `true` | Run the second-tier 4K session-capacity probe. Ignored when `probe_session_limits` is `false` — that disables both tiers. |
+| `media_player_controller` | boolean | No | `true` | Node-wide default for the media-player operator-control (transition) path — the state machine the manager's **Next** button drives. `false` selects the legacy sequential playout loop **and** withdraws the `media-player-control-v1` capability, so Next disappears from every media-player flow on the node rather than being offered and refused. A per-input `operator_control` always wins. |
+| `media_player_pcr_deadlines` | boolean | No | `true` | Node-wide default for PCR-anchored TS playout pacing. `false` selects the legacy byte-rate estimate, whose error integrates without bound on variable-bitrate assets. A per-input `pcr_deadlines` always wins. |
+
+**When a pushed change lands.** The two probe switches are read once at
+node start, so an edit to either takes effect at the node's next
+restart; the push says so — it raises a Warning `tuning_requires_restart`
+event naming both fields, rather than leaving the operator to infer it
+from an unchanged Resources card. The two ingress knobs and the two
+media-player knobs are re-installed on the push and re-read on every
+input spawn, so a flow restart or a hot input swap picks them up; an
+input already running keeps the values it spawned with. No restart
+warning is raised for those four, because none is needed.
+
+**Per-input overrides.** UDP and RTP inputs carry their own
+`ingress_dejitter_ms` and `ingress_residence_ms` (see
+[RTP Input](#rtp-input)), and `media_player` inputs carry
+`operator_control` and `pcr_deadlines`, so one input can be tuned
+without moving the node default. Precedence, highest first: **per-input field → `tuning`
+→ the legacy environment variable, where one is still read → the
+built-in default.**
+
+The environment variable sits **below** the config field deliberately.
+Env-above-config would reintroduce exactly the trap this block exists
+to close: an operator sets the field in the UI, sees it saved, and it
+never applies because a unit file outranks it. Setting one of the
+legacy variables raises a Warning `deprecated_env_var` event once at
+startup (category `config`, with `details.env_var` / `.replacement` /
+`.status`) and logs to the journal, so a stale unit file is visible on
+the manager's Events page rather than silently steering the node.
+
+| Config field | Legacy environment variable | Status |
+|---|---|---|
+| `tuning.ingress_dejitter_ms` | `BILBYCAST_INGRESS_BUFFER_MS` | **Removed** — it never had any effect, in any release: the node-wide setpoint was only consulted after the per-input setpoint had already answered, so no value it held could change behaviour. Still reported at startup so a unit file that sets it cannot state an intent that isn't being applied. |
+| `tuning.ingress_residence_ms` | `BILBYCAST_INGRESS_RESIDENCE_MS` | Deprecated — still read for one release, below the config field. |
+| `tuning.probe_session_limits` | `BILBYCAST_PROBE_SESSION_LIMITS` | Deprecated — still read for one release, below the config field. |
+| `tuning.probe_4k` | `BILBYCAST_PROBE_4K` | Deprecated — still read for one release, below the config field. |
+| `tuning.media_player_controller` | `BILBYCAST_MEDIA_PLAYER_CONTROLLER` | Deprecated — still read for one release, below the config field. |
+| `tuning.media_player_pcr_deadlines` | `BILBYCAST_MEDIA_PLAYER_PCR_DEADLINES` | Deprecated — still read for one release, below the config field. |
+| *(none — deliberately)* | `BILBYCAST_MEDIA_PLAYER_INCREMENTAL_MP4` | **Removed.** The bounded incremental MP4/MOV reader is unconditional in release builds. This selected the whole-file demux, which holds an entire asset resident — the out-of-memory the bounded reader was written to fix. A control whose "off" position is a known OOM does not belong on an operator's screen, so unlike its two siblings it was not given a config field; it survives in debug builds only. |
+
+**Manager UI.** Manager → node → **Configure** → **Tuning**. The tab is
+gated on the `node_tuning` capability advertised on
+`HealthPayload.capabilities` — an edge without the bit accepts the
+block and ignores it, which looks exactly like success.
+
+The **Media Player** section of that tab is gated separately, on
+`media_player_tuning`. Those two fields landed after `node_tuning`
+shipped, so an edge from that release advertises `node_tuning`, accepts
+them and ignores them — the very accept-and-ignore failure `node_tuning`
+exists to prevent, recreated one release later by reusing the bit. The
+rest of the tab still renders on such an edge.
 
 ---
 
@@ -775,6 +866,8 @@ Receives RTP-wrapped MPEG-TS packets (SMPTE ST 2022-2). Requires valid RTP v2 he
 | `allowed_sources` | array of strings | No | `null` | Source IP allow-list (RP 2129 C5). Only RTP packets from these source IPs are accepted. Each entry must be a valid IP address. When `null`, all sources are allowed. |
 | `allowed_payload_types` | array of integers | No | `null` | RTP payload type allow-list (RP 2129 U4). Only packets with these PT values (0-127) are accepted. When `null`, all payload types are allowed. |
 | `max_bitrate_mbps` | float | No | `null` | Maximum ingress bitrate in megabits per second (RP 2129 C7). Excess packets are dropped. Must be positive. When `null`, no rate limiting is applied. |
+| `ingress_dejitter_ms` | integer | No | node `tuning.ingress_dejitter_ms`, else `60` | Ingress **de-jitter** buffer setpoint, in ms of content. Packets are buffered and released paced at the recovered source rate (a leaky bucket trimmed ±5 % by the buffer-fill error, with a hard residence-cap shed), so every downstream consumer sees a smooth cadence regardless of network packet-delay variation. Range 20–2000. On a SMPTE 2022-7 dual-leg input it runs *after* the hitless merger, re-pacing the merger's bursty seq-ordered drain. Supersedes `ingress_delay_ms`, which is a pure delay line and *preserves* jitter. |
+| `ingress_residence_ms` | integer | No | node `tuning.ingress_residence_ms`, else `max(4 × setpoint, 250)` ms | Hard-shed residence cap for this input's de-jitter buffer. A packet older than this is shed rather than released late, which is what bounds ingress latency when a burst or a source-rate offset exceeds the servo's ±5 % authority. Range `ingress_dejitter_ms + 40` .. `5000`. **Refused without `ingress_dejitter_ms` on the same input** — see the validation rules below. |
 
 **Validation rules:**
 - `bind_addr` must be a valid `ip:port` socket address.
@@ -782,6 +875,9 @@ Receives RTP-wrapped MPEG-TS packets (SMPTE ST 2022-2). Requires valid RTP v2 he
 - `source_addr` is only valid when `bind_addr` is multicast, must be a unicast IP, and must share the address family of `bind_addr`.
 - `allowed_payload_types` values must be 0-127.
 - `max_bitrate_mbps` must be positive.
+- `ingress_dejitter_ms` must be 20–2000 ms.
+- `ingress_residence_ms` is **rejected unless the same input also sets `ingress_dejitter_ms`** — it caps how long a packet may sit in the de-jitter buffer, and without a buffer there is nothing to cap, so accepting it would be a silent no-op.
+- `ingress_residence_ms` must be within `ingress_dejitter_ms + 40` .. `5000` ms. The floor is the setpoint plus 40 ms because a cap at or below the setpoint would shed the very buffer the setpoint asks the servo to hold.
 
 ### UDP Input
 
@@ -802,11 +898,15 @@ Receives raw UDP datagrams without requiring RTP headers. Suitable for raw MPEG-
 | `bind_addr` | string | Yes | - | Local socket address to bind (`ip:port`). For multicast, use the group address. |
 | `interface_addr` | string | No | `null` | Network interface IP for multicast group join. Must be the same address family as `bind_addr`. |
 | `source_addr` | string | No | `null` | SSM source address — see [RTP Input](#rtp-input) above. |
+| `ingress_dejitter_ms` | integer | No | node `tuning.ingress_dejitter_ms`, else `60` | Ingress de-jitter buffer setpoint, in ms of content (20–2000). Same servo as the RTP input — see [RTP Input](#rtp-input) above. |
+| `ingress_residence_ms` | integer | No | node `tuning.ingress_residence_ms`, else `max(4 × setpoint, 250)` ms | Hard-shed residence cap for this input's de-jitter buffer. Range `ingress_dejitter_ms + 40` .. `5000`. **Refused without `ingress_dejitter_ms` on the same input.** See [RTP Input](#rtp-input) above. |
 
 **Validation rules:**
 - `bind_addr` must be a valid `ip:port` socket address.
 - `interface_addr` must be a valid IP address in the same address family as `bind_addr`.
 - `source_addr` rules: see [RTP Input](#rtp-input) above.
+- `ingress_dejitter_ms` must be 20–2000 ms.
+- `ingress_residence_ms` is **rejected unless the same input also sets `ingress_dejitter_ms`** (there is no de-jitter buffer to cap, so it would be a silent no-op), and must be within `ingress_dejitter_ms + 40` .. `5000` ms.
 
 ### Source-Specific Multicast (SSM) vs Any-Source Multicast (ASM)
 
@@ -976,7 +1076,7 @@ of the local file kicks in transparently.
 | `sources` | array | Yes | - | 1–256 entries. Each entry is a `MediaPlayerSource` (see below). Files are referenced by name within the edge's media library; upload them via the manager UI before starting the flow. |
 | `loop_playback` | boolean | No | `true` | Restart at the head of the playlist when the last source ends. Leave on for fallback duty. |
 | `shuffle` | boolean | No | `false` | Randomise source order each time the playlist starts — a fresh permutation is drawn at flow start and again on every loop wrap. |
-| `operator_control` | boolean | No | unset | Transport control (the manager's **Next** button) and the transition state machine. Unset resolves to the node default, which is **on**; `false` pins this input to the legacy sequential loop and makes the edge answer `media_player_control_unavailable` for a `Next`. Resolution order: explicit config → `BILBYCAST_MEDIA_PLAYER_CONTROLLER` → on. |
+| `operator_control` | boolean | No | unset | Transport control (the manager's **Next** button) and the transition state machine. Unset resolves to the node default, which is **on**; `false` pins this input to the legacy sequential loop and makes the edge answer `media_player_control_unavailable` for a `Next`. Resolution order: this field → `tuning.media_player_controller` → the deprecated `BILBYCAST_MEDIA_PLAYER_CONTROLLER` → on. |
 | `paced_bitrate_bps` | integer | No | `null` | TS-only override for the egress pacer when the source has no usable PCR. Range 100 000 – 200 000 000 (100 kbps – 200 Mbps). Leave `null` to pace from PCR (default for any healthy TS asset). |
 | `ts_packets_per_datagram` | integer | No | `7` | How many 188-byte MPEG-TS packets the player bundles into each UDP datagram on the flow broadcast channel and the QUIC/UDP tunnel path (both forward each datagram unchanged). Applies to every source kind (`ts` / `mp4` / `image`). `7 × 188 = 1316 B` is the standard / SRT datagram size. Range `[1, 348]` (`348 × 188 = 65 424 B`, the largest that fits one UDP datagram; `0` is rejected). **Lower** it (e.g. `4`–`5`) for constrained / low-MTU internet or cellular paths where a big datagram IP-fragments and drops; **raise** it (`8`+) for jumbo datagrams on a LAN. Independent of any downstream UDP/RTP/SRT output, which re-chunks to its own fixed 1316 B wire size. |
 
@@ -1019,26 +1119,41 @@ are stored on the edge. Resolution order:
 > `Permission denied (os error 13)`. If you create the service user by hand
 > (outside `install-edge.sh`), set `BILBYCAST_MEDIA_DIR` yourself.
 
-**Media-player rollback escape hatches.** Two behaviours are **on by
-default** and can be turned off with an environment variable. These are
-rollback levers, not feature switches — setting them to `1` does nothing,
-because `1` is already the default. Both are read once at startup, so they
-must be set on the *process*: a hand-rolled `systemd-run` / `nohup` relaunch
-that forgets them silently restores the default behaviour.
+**Media-player rollback levers.** Three behaviours are **on by default** and
+can be turned off so one node can be reverted without rolling back a release.
+These are rollback levers, not feature switches — turning them *on* does
+nothing, because on is already the default. Two are now **config fields**;
+the third was withdrawn.
 
-| Env var | Default | Effect when set to `0` / `false` / `off` |
-|---------|---------|------------------------------------------|
-| `BILBYCAST_MEDIA_PLAYER_CONTROLLER` | **on** | Falls back to the legacy sequential playout loop. The edge then stops advertising the **`media-player-control-v1`** capability, and because the manager gates its playlist **Next** button on that capability, the button disappears while the edge looks otherwise healthy — the most confusing symptom of a dropped env var. Prefer the per-input `operator_control: false` (below) to pin one player to the legacy loop without changing the node default. |
-| `BILBYCAST_MEDIA_PLAYER_INCREMENTAL_MP4` | **on** | Falls back to the whole-file MP4/MOV demux, which holds an entire MP4 in memory — a 4 GiB asset is a 4 GiB resident spike, and that was the principal driver of the media-player OOM the bounded reader was written to fix. Only useful for diagnosing a suspected incremental-reader defect. |
+| Setting | Scope | Effect when set to `false` |
+|---------|-------|----------------------------|
+| `operator_control` | per media-player input | Pins **this** input to the legacy sequential playout loop. The edge answers `media_player_control_unavailable` for a `Next` issued against it. |
+| `tuning.media_player_controller` | node-wide | Same, for every media-player input that sets no `operator_control` of its own — **and** the edge stops advertising the `media-player-control-v1` capability. Because the manager gates its playlist **Next** button on that capability, the button disappears node-wide while the edge looks otherwise healthy. That is the honest behaviour (the button would refuse anyway), but it is worth knowing before you flip it. |
+| `pcr_deadlines` | per media-player input | Paces **this** input's TS playout from the legacy byte-rate estimate instead of deadlines anchored on the asset's own PCR. Use where one asset paces badly — a spliced file whose PCR steps mid-asset — without moving the rest of the node. |
+| `tuning.media_player_pcr_deadlines` | node-wide | Same, for every media-player input that sets no `pcr_deadlines` of its own. Use where the *host* is the problem — a stalling disk, a clock step. |
 
-`operator_control` (per media-player input, `Option<bool>`, default unset)
-takes precedence over `BILBYCAST_MEDIA_PLAYER_CONTROLLER` — the resolution
-order is **explicit config → env var → on**. Set it to `false` to pin one
-input to the legacy loop; the edge then answers
-`media_player_control_unavailable` for a `Next` issued against that input.
-Note the capability bit reflects only the node-wide default, so the manager
-must gate its Next button on
-`capabilities.includes('media-player-control-v1') && operator_control !== false`.
+Resolution order for both pairs: **per-input field → `tuning` → the deprecated
+environment variable → on.** `BILBYCAST_MEDIA_PLAYER_CONTROLLER` and
+`BILBYCAST_MEDIA_PLAYER_PCR_DEADLINES` are still read for one release, *below*
+the config field, and a node that sets either raises a Warning
+`deprecated_env_var` event naming the replacement. Set the config field
+instead: Manager → node → Configure → **Tuning → Media Player**, gated on the
+`media_player_tuning` capability.
+
+Unlike the environment variables they replace, these are re-applied on the
+config push and read when an input next starts, so **restarting the flow**
+applies them — no node restart, and no `systemd-run` / `nohup` relaunch to get
+wrong.
+
+> **`BILBYCAST_MEDIA_PLAYER_INCREMENTAL_MP4` has been removed** and has no
+> config field, deliberately. It selected the whole-file MP4/MOV demux, which
+> holds an entire asset in memory — a 4 GiB asset is a 4 GiB resident spike,
+> and that was the principal driver of the media-player OOM the bounded reader
+> was written to fix. A control whose "off" position is a known out-of-memory
+> does not belong on an operator's screen, so it was withdrawn rather than
+> migrated with its two siblings. It survives in debug builds only, for
+> diagnosing a suspected incremental-reader defect; a release binary ignores it
+> and reports it as removed at startup.
 
 Files are written `0644`. Per-asset cap: **4 GiB** (`MAX_FILE_BYTES`).
 Library cap: **16 GiB** total (`MAX_TOTAL_BYTES`). Partial uploads stage

@@ -514,6 +514,38 @@ impl AppConfig {
 }
 
 impl AppConfig {
+    /// Discard values the **manager** has no business supplying, so the node's
+    /// own copy survives an `update_config` push.
+    ///
+    /// [`AppConfig::strip_secrets`] blanks these before every `get_config`
+    /// response, on the stated invariant that they are node-local
+    /// infrastructure the manager must never see. The write direction had no
+    /// matching guard: [`SecretsConfig::merge_into`] restores a local secret
+    /// only when the incoming value is **absent**, so a push that names one
+    /// explicitly won outright and was then committed wholesale
+    /// (`cfg.server = new_config.server.clone()`). A compromised manager — or
+    /// anyone who obtained a node secret and impersonated one — could push
+    /// `server.auth = { enabled: false, .. }` and switch off the edge's own
+    /// local API authentication, or replace its TLS material. Validation did
+    /// not object: it only checks `jwt_secret`/`clients` when `enabled` is
+    /// true.
+    ///
+    /// Deliberately narrow. It covers exactly the node-local fields nothing
+    /// upstream ever legitimately sets, and **not** the secrets the manager
+    /// really does distribute — `tunnel_encryption_key` / `tunnel_bind_secret`
+    /// (minted by the manager and pushed to both edges) and
+    /// `cellular_uplinks[].password` (entered by an operator in the manager
+    /// UI). Clearing those here would break tunnel provisioning rather than
+    /// harden anything.
+    ///
+    /// Call this **before** `merge_into`, which then reinstates the node's own
+    /// values from `secrets.json`.
+    pub fn clear_node_local_secrets(&mut self) {
+        self.server.tls = None;
+        self.server.auth = None;
+        self.setup_token = None;
+    }
+
     /// Strip infrastructure secrets for local API display.
     ///
     /// Internal secrets (manager credentials, server TLS/auth, tunnel keys)
@@ -779,6 +811,7 @@ mod tests {
                 gateway: None,
             }],
             resource_limits: None,
+            tuning: None,
             logging: None,
             flow_groups: vec![],
             nmos_registration: None,
@@ -924,6 +957,7 @@ mod tests {
                                 interface_binding: None,
                                 ingress_delay_ms: None,
                                 ingress_dejitter_ms: None,
+                                ingress_residence_ms: None,
                                 passthrough_clock: None,
                 }),
             }],
@@ -1027,5 +1061,119 @@ mod tests {
             }
             _ => panic!("Expected SRT input"),
         }
+    }
+}
+
+#[cfg(test)]
+mod node_local_secret_tests {
+    use super::*;
+    fn auth(enabled: bool, jwt_secret: &str) -> AuthConfig {
+        AuthConfig {
+            enabled,
+            jwt_secret: jwt_secret.to_string(),
+            token_lifetime_secs: 3600,
+            clients: Vec::new(),
+            public_metrics: true,
+            nmos_require_auth: None,
+            token_rate_limit_per_minute: 10,
+        }
+    }
+
+    /// Build a config whose node-local secrets are set, as `secrets.json`
+    /// would supply them after a normal load.
+    fn node_config() -> AppConfig {
+        let mut cfg = AppConfig::default();
+        cfg.server.auth = Some(auth(true, "node-local-jwt-secret"));
+        cfg.server.tls = Some(TlsConfig {
+            cert_path: "/etc/bilbycast/node.crt".into(),
+            key_path: "/etc/bilbycast/node.key".into(),
+        });
+        cfg.setup_token = Some("node-local-setup-token".into());
+        cfg
+    }
+
+    #[test]
+    fn a_manager_push_cannot_disable_local_api_auth() {
+        // THE BUG. `strip_secrets` blanks `server.auth` on every get_config,
+        // so the manager never legitimately holds a value for it — but the
+        // write direction accepted one, and `merge_into` only fills absent
+        // fields, so the pushed value won and was committed wholesale.
+        let node = node_config();
+        let secrets = SecretsConfig::extract_from(&node);
+
+        let mut pushed = AppConfig::default();
+        // <- attacker turns the edge's own API auth off
+        pushed.server.auth = Some(auth(false, ""));
+
+        pushed.clear_node_local_secrets();
+        secrets.merge_into(&mut pushed);
+
+        let auth = pushed.server.auth.expect("node's own auth must survive");
+        assert!(auth.enabled, "a manager push must not disable local API auth");
+        assert_eq!(auth.jwt_secret, "node-local-jwt-secret");
+    }
+
+    #[test]
+    fn a_manager_push_cannot_replace_tls_material_or_the_setup_token() {
+        let node = node_config();
+        let secrets = SecretsConfig::extract_from(&node);
+
+        let mut pushed = AppConfig::default();
+        pushed.server.tls = Some(TlsConfig {
+            cert_path: "/tmp/attacker.crt".into(),
+            key_path: "/tmp/attacker.key".into(),
+        });
+        pushed.setup_token = Some("attacker-token".into());
+
+        pushed.clear_node_local_secrets();
+        secrets.merge_into(&mut pushed);
+
+        let tls = pushed.server.tls.expect("node's own TLS must survive");
+        assert_eq!(tls.cert_path, "/etc/bilbycast/node.crt");
+        assert_eq!(tls.key_path, "/etc/bilbycast/node.key");
+        assert_eq!(pushed.setup_token.as_deref(), Some("node-local-setup-token"));
+    }
+
+    #[test]
+    fn manager_supplied_tunnel_secrets_are_left_alone() {
+        // The manager genuinely mints and distributes these. Clearing them
+        // here would break tunnel provisioning rather than harden anything —
+        // which is why `clear_node_local_secrets` is deliberately narrow.
+        let tunnel: crate::tunnel::config::TunnelConfig =
+            serde_json::from_value(serde_json::json!({
+                "id": "11111111-2222-3333-4444-555555555555",
+                "name": "t",
+                "enabled": true,
+                "mode": "direct",
+                "protocol": "udp",
+                "direction": "egress",
+                "local_addr": "0.0.0.0:8180",
+                "remote_addr": "127.0.0.1:4433",
+                "tunnel_encryption_key": "a".repeat(64),
+                "tunnel_bind_secret": "b".repeat(64),
+            }))
+            .expect("fixture must deserialize");
+        let mut pushed = AppConfig::default();
+        pushed.tunnels.push(tunnel);
+
+        pushed.clear_node_local_secrets();
+
+        assert_eq!(pushed.tunnels[0].tunnel_encryption_key, Some("a".repeat(64)));
+        assert_eq!(pushed.tunnels[0].tunnel_bind_secret, Some("b".repeat(64)));
+    }
+
+    #[test]
+    fn clear_covers_exactly_the_server_fields_strip_secrets_blanks() {
+        // If `strip_secrets` starts blanking another `server.*` field, this
+        // fails until the write-direction guard is widened to match — the
+        // read/write asymmetry is the whole defect class.
+        let mut stripped = node_config();
+        stripped.strip_secrets();
+        let mut cleared = node_config();
+        cleared.clear_node_local_secrets();
+
+        assert_eq!(stripped.server.auth.is_none(), cleared.server.auth.is_none());
+        assert_eq!(stripped.server.tls.is_none(), cleared.server.tls.is_none());
+        assert_eq!(stripped.setup_token.is_none(), cleared.setup_token.is_none());
     }
 }

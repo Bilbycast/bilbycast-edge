@@ -128,11 +128,18 @@ touches `main`/`local`/`default` tables.
 |----------|--------------------------|--------------|----------------|
 | Route table id | `48128‑48383` (`0xBC00 + slot`) | `BILBYCAST_BOND_RT_TABLE_BASE` | base + slot |
 | `ip rule` priority | `10000‑10255` | `BILBYCAST_BOND_RT_PRIO_BASE` | base + slot |
-| fwmark | `0xBC000000 + slot` (mask `0xFFFFFF00`) | `BILBYCAST_BOND_FWMARK_BASE` | base + slot |
 
 (`0xBC` echoes the bond wire magic, making our entries recognizable. Ranges are
 **host-level OS tuning** → env-configurable, per the project convention that
 behavior knobs are manager-config but host/OS knobs are env.)
+
+> An earlier version of this table listed a third row, `fwmark`, with a
+> `BILBYCAST_BOND_FWMARK_BASE` override. There is no fwmark in
+> `engine::bond_routing` and never was — the leg is selected by source
+> address in the `ip rule`, not by a packet mark — and no code reads that
+> variable. The row is removed rather than corrected: documenting an
+> override that does nothing is worse than documenting nothing, because an
+> operator who sets it to dodge a collision believes they have.
 
 `slot` = a per-host index allocated from an in-process slab keyed by
 `(flow_id, path_id)`, freed on teardown. Max 256 concurrent bonded-output paths

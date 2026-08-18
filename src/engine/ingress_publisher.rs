@@ -81,13 +81,43 @@ enum IngressPublisherInner {
     },
 }
 
+/// The three per-input ingress buffering knobs, travelling together so that
+/// adding one doesn't push [`IngressPublisher::new`] past clippy's argument
+/// threshold — and so a caller can't silently transpose two `Option<u32>`s.
+///
+/// All-`None` (the [`Default`]) is direct passthrough, which is what the
+/// transports carrying their own transport-layer de-jitter (SRT's TSBPD) or
+/// a locally-synthesised clock (RTMP, RTSP) pass.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct IngressBuffering {
+    /// Fixed delay line in ms — shifts the timeline, preserves jitter.
+    pub delay_ms: Option<u16>,
+    /// De-jitter setpoint in ms — actually removes jitter. Supersedes
+    /// `delay_ms`.
+    pub dejitter_ms: Option<u32>,
+    /// Hard-shed residence cap in ms for the de-jitter buffer. Ignored
+    /// unless `dejitter_ms` is set.
+    pub residence_ms: Option<u32>,
+    /// Whether this transport takes part in node-wide ingress de-jitter —
+    /// i.e. whether `tuning.ingress_dejitter_ms` may **switch the buffer on**
+    /// for an input that names no setpoint of its own. Only raw UDP and RTP
+    /// set it: SRT already de-jitters at the transport layer (TSBPD), RTMP
+    /// and RTSP synthesise their own clock, and a bonded input's reordering
+    /// buffer would shed the bond's bursts.
+    ///
+    /// `false` in the [`Default`], so a transport that opts out by writing
+    /// `..Default::default()` cannot be enrolled by accident.
+    pub honours_node_defaults: bool,
+}
+
 impl IngressPublisher {
     /// Build an `IngressPublisher`. Mode precedence:
     ///
-    /// 1. `dejitter_ms` set (> 0) → **de-jitter** drainer (rate-paced
-    ///    release; the real broadcast-grade buffer that absorbs PDV).
-    ///    Supersedes the fixed delay — if both are set, de-jitter wins and
-    ///    a warning is logged.
+    /// 1. `dejitter_ms` set (> 0) — either per-input, or from the node's
+    ///    `tuning.ingress_dejitter_ms` when `honours_node_defaults` is set →
+    ///    **de-jitter** drainer (rate-paced release; the real broadcast-grade
+    ///    buffer that absorbs PDV). Supersedes the fixed delay — if both are
+    ///    set, de-jitter wins and a warning is logged.
     /// 2. `delay_ms` set (> 0) → **fixed-delay** drainer (constant offset,
     ///    does not remove jitter).
     /// 3. neither → direct passthrough (zero overhead).
@@ -96,14 +126,33 @@ impl IngressPublisher {
     /// `IngressPublisher` (and all its clones) are dropped, closing the
     /// mpsc.
     pub fn new(
-        delay_ms: Option<u16>,
-        dejitter_ms: Option<u32>,
+        buffering: IngressBuffering,
         broadcast_tx: broadcast::Sender<RtpPacket>,
         input_id: &str,
         cancel: CancellationToken,
         stats: Arc<FlowStatsAccumulator>,
     ) -> Self {
-        if let Some(dj) = dejitter_ms.filter(|v| *v > 0) {
+        let IngressBuffering {
+            delay_ms,
+            dejitter_ms,
+            residence_ms,
+            honours_node_defaults,
+        } = buffering;
+        // Enablement, not just the setpoint. The node-wide default has to be
+        // able to switch the buffer ON for an input that names no setpoint —
+        // gating this branch on the per-input field alone made
+        // `tuning.ingress_dejitter_ms` unreachable in every configuration
+        // (with no per-input value the resolver was never called; with one it
+        // won), so the field was validated, UI-exposed and inert. Note the
+        // RAW per-input value, not this one, is what goes to `resolve` below:
+        // that keeps the "per-input → node → built-in" layering inside the
+        // resolver where it is unit-tested, instead of pre-flattening it here.
+        let effective_dejitter_ms = if honours_node_defaults {
+            dejitter_ms.or(crate::engine::ingress_dejitter::node_defaults().dejitter_ms)
+        } else {
+            dejitter_ms
+        };
+        if let Some(dj) = effective_dejitter_ms.filter(|v| *v > 0) {
             if delay_ms.filter(|v| *v > 0).is_some() {
                 tracing::warn!(
                     "input '{input_id}': both ingress_dejitter_ms={dj} and ingress_delay_ms \
@@ -111,7 +160,10 @@ impl IngressPublisher {
                      unset ingress_delay_ms to silence this)"
                 );
             }
-            let cfg = crate::engine::ingress_dejitter::IngressDejitterConfig::from_ms(Some(dj));
+            let cfg = crate::engine::ingress_dejitter::IngressDejitterConfig::resolve(
+                dejitter_ms,
+                residence_ms,
+            );
             let submit = crate::engine::ingress_dejitter::start(
                 broadcast_tx,
                 cfg,
@@ -166,7 +218,21 @@ impl IngressPublisher {
             IngressPublisherInner::Dejitter { .. } => 0,
         }
     }
+
+    /// Which of the three publish paths was built. Test-only, because the
+    /// choice is not observable from `send`/`delay_ms` — which is how the
+    /// node-wide setpoint came to be inert with every test still green.
+    #[cfg(test)]
+    fn mode(&self) -> &'static str {
+        match self.inner.as_ref() {
+            IngressPublisherInner::Direct(_) => "direct",
+            IngressPublisherInner::Delayed { .. } => "delayed",
+            IngressPublisherInner::Dejitter { .. } => "dejitter",
+        }
+    }
 }
+
+
 
 /// Fixed-delay drainer task that owns the `DelayBuffer` and the broadcast
 /// sender. Periodically wakes to release any packets whose
@@ -258,5 +324,72 @@ pub fn warn_if_double_buffer_srt(
                 "srt_latency_ms": l,
             }),
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engine::ingress_dejitter::{install_node_defaults, IngressDejitterDefaults};
+
+    fn publisher(buffering: IngressBuffering) -> IngressPublisher {
+        let (tx, _rx) = broadcast::channel(16);
+        IngressPublisher::new(
+            buffering,
+            tx,
+            "test-input",
+            CancellationToken::new(),
+            Arc::new(FlowStatsAccumulator::new(
+                "test-flow".to_string(),
+                "test-flow".to_string(),
+                "udp".to_string(),
+            )),
+        )
+    }
+
+    /// The regression this whole change exists for. `tuning.ingress_dejitter_ms`
+    /// has to be able to switch the buffer ON for an input that names no
+    /// setpoint of its own — gating on the per-input field alone made the
+    /// node-wide value unreachable in every configuration.
+    ///
+    /// The three cases share one test because `install_node_defaults` writes
+    /// process-wide statics: split across `#[test]` fns they would race.
+    #[tokio::test]
+    async fn the_node_default_enables_dejitter_and_a_per_input_value_still_wins() {
+        assert_eq!(
+            publisher(IngressBuffering {
+                honours_node_defaults: true,
+                ..Default::default()
+            })
+            .mode(),
+            "direct",
+            "no node default installed yet: nothing should buffer"
+        );
+
+        install_node_defaults(IngressDejitterDefaults {
+            dejitter_ms: Some(150),
+            residence_ms: None,
+        });
+
+        assert_eq!(
+            publisher(IngressBuffering {
+                honours_node_defaults: true,
+                ..Default::default()
+            })
+            .mode(),
+            "dejitter",
+            "the node default must enable the buffer for a UDP/RTP input"
+        );
+
+        // SRT/RTSP/RTMP/bonded pass `..Default::default()`, so they must be
+        // untouched by a node-wide setpoint: SRT already de-jitters via TSBPD
+        // and a bonded input's buffer would shed the bond's bursts.
+        assert_eq!(
+            publisher(IngressBuffering::default()).mode(),
+            "direct",
+            "a transport that opted out must not be enrolled by the node default"
+        );
+
+        install_node_defaults(IngressDejitterDefaults::default());
     }
 }

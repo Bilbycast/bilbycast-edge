@@ -630,6 +630,39 @@ pub fn mpeg2_crc32(data: &[u8]) -> u32 {
     crc
 }
 
+/// Byte offset of a PSI section's trailing CRC-32 inside a single TS packet,
+/// or `None` when the declared `section_length` cannot describe a real section
+/// that fits.
+///
+/// `section_length` counts the bytes *after* the length field and includes the
+/// 4-byte CRC, so the section ends at `section_start + 3 + section_length` and
+/// the CRC begins four bytes before that.
+///
+/// **Why this is a function.** Five PSI rewriters open-coded
+/// `section_start + 3 + section_length - 4` with an upper-bound-only guard
+/// (`crc_offset + 4 <= TS_PACKET_SIZE`), and four of them were wrong in the
+/// same way: `section_length == 0` puts the CRC offset *before* the section
+/// start, and the following `&pkt[section_start..crc_offset]` is a reversed
+/// range, which panics. A remote attacker needs one 188-byte packet whose
+/// payload begins `00 02 B0 00` (pointer_field 0, table_id 0x02,
+/// section_length 0) to kill a transcode or output task — no credentials, and
+/// the parse happens long before any authentication. See the lower-bound
+/// check below, which is the half that was missing.
+pub fn psi_crc_offset(section_start: usize, section_length: usize) -> Option<usize> {
+    let section_end = section_start.checked_add(3)?.checked_add(section_length)?;
+    let crc_offset = section_end.checked_sub(4)?;
+    // The CRC is computed over `pkt[section_start..crc_offset]`, which must
+    // cover at least the 3-byte table header. Equivalently: a section must be
+    // long enough to hold its own CRC (`section_length >= 4`).
+    if crc_offset < section_start + 3 {
+        return None;
+    }
+    if crc_offset.checked_add(4)? > TS_PACKET_SIZE {
+        return None;
+    }
+    Some(crc_offset)
+}
+
 /// Verify the CRC-32 of a PSI section starting at `section_start` in a TS packet.
 /// `section_start` points to the table_id byte. Returns `true` if the CRC is valid.
 /// Returns `false` if the section is truncated or the CRC does not match.
@@ -943,5 +976,72 @@ mod tests {
         let d = [0x6A, 0x40, 0x00];
         assert_eq!(descriptor_audio_kind(&d), None);
         assert!(!descriptors_indicate_text_service(&[0x56, 0x40, 0x00]));
+    }
+}
+
+#[cfg(test)]
+mod psi_crc_offset_tests {
+    use super::*;
+
+    /// `section_start` for a PUSI packet with `pointer_field == 0`:
+    /// 4-byte TS header + 1 pointer byte.
+    const SECTION_START: usize = 5;
+
+    #[test]
+    fn well_formed_pmt_yields_the_crc_offset() {
+        // A minimal legal PMT body is 13 bytes: 9 after the length field
+        // plus the 4-byte CRC.
+        let off = psi_crc_offset(SECTION_START, 13).expect("13 is a legal PMT section_length");
+        assert_eq!(off, SECTION_START + 3 + 13 - 4);
+        // The CRC slice covers the 3-byte table header plus the body.
+        assert!(off > SECTION_START);
+    }
+
+    #[test]
+    fn zero_section_length_is_rejected_not_reversed() {
+        // THE BUG. `section_start + 3 + 0 - 4` is `section_start - 1`, so
+        // `&pkt[section_start..crc_offset]` was a reversed range and panicked.
+        // One 188-byte datagram carrying `00 02 B0 00` reached this from the
+        // network, pre-auth, and killed the task.
+        assert_eq!(psi_crc_offset(SECTION_START, 0), None);
+    }
+
+    #[test]
+    fn section_shorter_than_its_own_crc_is_rejected() {
+        for len in 0..4 {
+            assert_eq!(
+                psi_crc_offset(SECTION_START, len),
+                None,
+                "section_length {len} cannot hold a 4-byte CRC"
+            );
+        }
+        assert!(psi_crc_offset(SECTION_START, 4).is_some(), "4 is the minimum");
+    }
+
+    #[test]
+    fn section_overrunning_the_packet_is_rejected() {
+        // section_length is 12 bits, so the wire can declare up to 4095 in a
+        // 188-byte packet.
+        assert_eq!(psi_crc_offset(SECTION_START, 4095), None);
+        assert_eq!(psi_crc_offset(SECTION_START, 0x0FFF), None);
+        // Exactly filling the packet is fine; one more byte is not.
+        let max_len = TS_PACKET_SIZE - SECTION_START - 3;
+        assert!(psi_crc_offset(SECTION_START, max_len).is_some());
+        assert_eq!(psi_crc_offset(SECTION_START, max_len + 1), None);
+    }
+
+    #[test]
+    fn never_panics_over_the_whole_reachable_input_space() {
+        // section_length is 12 bits on the wire; section_start is bounded by
+        // the packet. Every combination must return, not unwind — and any
+        // offset it does return must be a valid, non-reversed slice bound.
+        for section_start in 0..TS_PACKET_SIZE {
+            for section_length in 0..=0x0FFF {
+                if let Some(off) = psi_crc_offset(section_start, section_length) {
+                    assert!(off >= section_start, "reversed slice range");
+                    assert!(off + 4 <= TS_PACKET_SIZE, "write past the packet");
+                }
+            }
+        }
     }
 }

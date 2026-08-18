@@ -46,11 +46,42 @@ pub const DESIRED_CHUNK_SIZE: u32 = 4096;
 /// Hard cap on the length of any single RTMP message we will reassemble. The
 /// RTMP `message_length` field is 24-bit, so a valid message can never exceed
 /// this — the cap therefore NEVER rejects a conformant stream (media,
-/// aggregate, command, or data). It is a per-connection memory backstop only;
-/// the actual DoS protections are the AMF0 recursion-depth limit (which stops
-/// nested-object stack-overflow regardless of message size) plus the
-/// connection cap + read timeouts in `server.rs`.
-const MAX_RTMP_MSG_LEN: usize = 16 * 1024 * 1024;
+/// aggregate, command, or data). It is a per-connection memory backstop only.
+pub const MAX_RTMP_MSG_LEN: usize = 16 * 1024 * 1024;
+
+/// Cap the RTMP server puts on any single **command or data** message
+/// (`COMMAND_AMF0` / `DATA_AMF0`) — the only two types it AMF0-decodes.
+/// Installed once, immediately after the credential-free handshake, and never
+/// lifted for the life of the connection.
+///
+/// [`MAX_RTMP_MSG_LEN`] is the protocol maximum and by construction rejects
+/// nothing, which makes it useless as a bound here: a 24-bit `message_length`
+/// of `0xFFFFFF` is what feeds ~16 MiB of attacker bytes into the AMF0 decoder
+/// per connection. Nothing legitimate is anywhere near that size — a real
+/// `connect` is 200–600 bytes from OBS / ffmpeg / Wirecast, and stays inside a
+/// couple of KB even with a long `tcUrl`, `pageUrl` and `swfUrl`;
+/// `releaseStream` / `FCPublish` / `createStream` / `publish` are tens of
+/// bytes; a live `onMetaData` is a few hundred. The one AMF0 payload that
+/// exists in the wild anywhere near this size is an FLV **VOD** keyframe index
+/// (`filepositions` + `times`) — a file construct a live publisher cannot
+/// produce. 256 KiB is ~400× the largest of those, and for comparison
+/// nginx-rtmp's `max_message` default (1 MiB) applies to *every* message
+/// including video.
+///
+/// The cap is scoped **by message type, not by connection phase**. `VIDEO` /
+/// `AUDIO` (and every control type) keep [`MAX_RTMP_MSG_LEN`], so a keyframe at
+/// contribution bitrates is never constrained. Phase scoping looked equivalent
+/// and is not: an RTMP input may legally carry no stream key at all
+/// (`RtmpInputConfig.stream_key` is an `Option`), and on such an input the
+/// post-`publish` phase is reachable by any anonymous peer after one round
+/// trip — a phase-scoped cap buys that deployment nothing.
+///
+/// Note this is a *memory* bound, not the amplification fix. The decoded-value
+/// budget in [`super::amf0`] is what stops a small message from becoming a
+/// large heap, and `MAX_CHUNK_STREAMS` is what stops a flood of fresh `cs_id`s
+/// from retaining a map entry each. All three, deliberately — each alone
+/// leaves a gap.
+pub const MAX_PREPUBLISH_MSG_LEN: usize = 256 * 1024;
 
 /// RTMP message type IDs.
 pub mod msg_type {
@@ -209,6 +240,19 @@ fn write_basic_header(buf: &mut BytesMut, fmt: u8, cs_id: u32) {
 // ChunkReader — reads incoming RTMP messages (reassembles chunks)
 // ---------------------------------------------------------------------------
 
+/// Chunk streams one connection may open. RTMP multiplexes a handful
+/// (2 = control, 3 = command, 4/6 = media); nginx-rtmp's `max_streams` default
+/// is 32. Unbounded, a 3-byte `fmt 3` basic header on a fresh `cs_id` both
+/// allocates a permanent map entry AND returns a complete zero-length message
+/// (a default state's `msg_len` is 0, so the reassembly completes without a
+/// body ever arriving) — measured at ~17× retained amplification on the
+/// unauthenticated pre-publish path, with every one of those messages also
+/// resetting the pre-publish read timeout.
+///
+/// 64 is >10× what any real encoder opens, so it cannot reject a conforming
+/// peer.
+const MAX_CHUNK_STREAMS: usize = 64;
+
 /// Tracks per-chunk-stream state needed for reassembly.
 #[derive(Clone, Debug, Default)]
 struct ChunkStreamState {
@@ -233,7 +277,14 @@ pub struct RtmpMessage {
 pub struct ChunkReader {
     /// Inbound chunk size (may be updated by Set Chunk Size messages).
     chunk_size: u32,
-    /// Per-chunk-stream reassembly state (indexed by cs_id).
+    /// Largest `COMMAND_AMF0` / `DATA_AMF0` message this reader will
+    /// reassemble. Defaults to the protocol maximum; the RTMP server tightens
+    /// it to [`MAX_PREPUBLISH_MSG_LEN`] via
+    /// [`ChunkReader::set_max_command_len`]. Media and control types are not
+    /// affected — they are always bounded by [`MAX_RTMP_MSG_LEN`].
+    max_command_len: usize,
+    /// Per-chunk-stream reassembly state (indexed by cs_id), bounded by
+    /// `MAX_CHUNK_STREAMS`.
     streams: std::collections::HashMap<u32, ChunkStreamState>,
 }
 
@@ -241,8 +292,20 @@ impl ChunkReader {
     pub fn new() -> Self {
         Self {
             chunk_size: DEFAULT_CHUNK_SIZE,
+            max_command_len: MAX_RTMP_MSG_LEN,
             streams: std::collections::HashMap::new(),
         }
+    }
+
+    /// Set the largest AMF0-bearing message (`COMMAND_AMF0` / `DATA_AMF0`)
+    /// this reader will reassemble.
+    ///
+    /// Used by the RTMP server to hold every peer — authenticated or not — to
+    /// [`MAX_PREPUBLISH_MSG_LEN`] on the two types it hands to the AMF0
+    /// decoder, without ever constraining media. Outbound clients never call
+    /// this, so their behaviour is the protocol maximum, unchanged.
+    pub fn set_max_command_len(&mut self, max: usize) {
+        self.max_command_len = max;
     }
 
     /// Read and reassemble the next complete RTMP message.
@@ -274,6 +337,14 @@ impl ChunkReader {
                 }
                 n => n as u32,
             };
+
+            // Bound the reassembly map. A fresh cs_id costs the peer three
+            // wire bytes and costs us a map entry retained for the life of the
+            // connection, so the entry must not be created before the count is
+            // checked. Keyed on `streams.len()`, never on `cs_id` itself.
+            if !self.streams.contains_key(&cs_id) && self.streams.len() >= MAX_CHUNK_STREAMS {
+                bail!("RTMP peer opened more than {MAX_CHUNK_STREAMS} chunk streams");
+            }
 
             let state = self
                 .streams
@@ -329,12 +400,33 @@ impl ChunkReader {
                 state.timestamp = read_u32_be(stream).await?;
             }
 
-            // -- Per-connection memory backstop (never rejects valid RTMP) --
-            if state.msg_len as usize > MAX_RTMP_MSG_LEN {
+            // -- Per-message memory bound, scoped by message TYPE. The two
+            //    AMF0-bearing types take whatever the owner installed (the
+            //    server: MAX_PREPUBLISH_MSG_LEN, for the whole connection);
+            //    media and control types take the protocol maximum, which by
+            //    construction rejects nothing conformant. Checked before any
+            //    allocation, so an over-long declared length costs nothing but
+            //    the header bytes.
+            //
+            //    Scope note: the *negotiated chunk size* is not a second
+            //    allocation primitive — `to_read` below is
+            //    `min(remaining, chunk_size)` and `remaining` never exceeds
+            //    `msg_len`, so an attacker-chosen 16 MiB Set Chunk Size can
+            //    only make the reassembly buffer reach this cap in one step
+            //    instead of many. That clears `chunk_size` and nothing else:
+            //    `cs_id` genuinely is a second primitive (a fresh one retains
+            //    a map entry for the life of the connection) and is bounded
+            //    separately by MAX_CHUNK_STREAMS above.
+            let cap = match state.msg_type {
+                msg_type::COMMAND_AMF0 | msg_type::DATA_AMF0 => self.max_command_len,
+                _ => MAX_RTMP_MSG_LEN,
+            };
+            if state.msg_len as usize > cap {
                 bail!(
-                    "RTMP message length {} exceeds protocol maximum {}",
+                    "RTMP message type {} length {} exceeds the {} byte cap in force for this message type",
+                    state.msg_type,
                     state.msg_len,
-                    MAX_RTMP_MSG_LEN
+                    cap
                 );
             }
 
@@ -385,6 +477,38 @@ impl ChunkReader {
 // Helpers — small async read utilities
 // ---------------------------------------------------------------------------
 
+/// Serialise one RTMP message into `fmt 0` + `fmt 3` chunks. Test-only mirror
+/// of [`ChunkWriter::write_message`] that produces bytes instead of driving an
+/// async writer, shared with the RTMP server's tests.
+#[cfg(test)]
+pub(super) fn test_chunk_message(
+    cs_id: u8,
+    msg_type: u8,
+    payload: &[u8],
+    chunk_size: usize,
+) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut offset = 0usize;
+    let mut first = true;
+    loop {
+        let take = (payload.len() - offset).min(chunk_size);
+        out.push(if first { cs_id } else { (3u8 << 6) | cs_id });
+        if first {
+            out.extend_from_slice(&[0, 0, 0]); // timestamp
+            let len = payload.len() as u32;
+            out.extend_from_slice(&[(len >> 16) as u8, (len >> 8) as u8, len as u8]);
+            out.push(msg_type);
+            out.extend_from_slice(&0u32.to_le_bytes()); // message stream id
+            first = false;
+        }
+        out.extend_from_slice(&payload[offset..offset + take]);
+        offset += take;
+        if offset >= payload.len() {
+            return out;
+        }
+    }
+}
+
 async fn read_u8<S: AsyncReadExt + Unpin>(s: &mut S) -> Result<u8> {
     let mut buf = [0u8; 1];
     s.read_exact(&mut buf).await.context("read_u8")?;
@@ -407,4 +531,194 @@ async fn read_u32_le<S: AsyncReadExt + Unpin>(s: &mut S) -> Result<u32> {
     let mut buf = [0u8; 4];
     s.read_exact(&mut buf).await.context("read_u32_le")?;
     Ok(u32::from_le_bytes(buf))
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A bare `fmt 0` header declaring the 24-bit maximum message length and
+    /// nothing else — the first half of the unauthenticated amplification
+    /// primitive (the second half is the AMF0 body it would have fed).
+    fn oversized_fmt0_header(msg_type: u8) -> Vec<u8> {
+        let mut hdr = vec![0x03u8]; // fmt 0, cs_id 3
+        hdr.extend_from_slice(&[0, 0, 0]); // timestamp
+        hdr.extend_from_slice(&[0xFF, 0xFF, 0xFF]); // message_length = 16 777 215
+        hdr.push(msg_type);
+        hdr.extend_from_slice(&0u32.to_le_bytes());
+        hdr
+    }
+
+    /// A bare `fmt 3` basic header — three wire bytes at most, no message
+    /// header, no body. On a fresh cs_id this both creates a map entry and
+    /// completes a zero-length message, which is the retained-amplification
+    /// primitive `MAX_CHUNK_STREAMS` exists to bound.
+    fn bare_fmt3_header(cs_id: u32) -> Vec<u8> {
+        let mut buf = BytesMut::new();
+        write_basic_header(&mut buf, 3, cs_id);
+        buf.to_vec()
+    }
+
+    #[tokio::test]
+    async fn prepublish_cap_refuses_a_24_bit_maximum_message_length() {
+        let mut reader = ChunkReader::new();
+        reader.set_max_command_len(MAX_PREPUBLISH_MSG_LEN);
+        let bytes = oversized_fmt0_header(msg_type::COMMAND_AMF0);
+        let mut cursor: &[u8] = &bytes;
+        let err = reader
+            .read_message(&mut cursor)
+            .await
+            .expect_err("a 16 MiB pre-publish message must be refused");
+        assert!(
+            format!("{err:#}").contains("exceeds the"),
+            "expected the phase cap to fire before any allocation, got: {err:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn prepublish_cap_admits_a_realistically_sized_command() {
+        // Far larger than any real `connect` (200–600 bytes), still accepted.
+        let payload = vec![0xAAu8; 8 * 1024];
+        let bytes = test_chunk_message(3, msg_type::COMMAND_AMF0, &payload, 128);
+        let mut reader = ChunkReader::new();
+        reader.set_max_command_len(MAX_PREPUBLISH_MSG_LEN);
+        let mut cursor: &[u8] = &bytes;
+        let msg = reader.read_message(&mut cursor).await.expect("8 KiB command must be accepted");
+        assert_eq!(msg.msg_type, msg_type::COMMAND_AMF0);
+        assert_eq!(msg.payload, payload);
+    }
+
+    #[tokio::test]
+    async fn default_reader_still_reassembles_a_large_media_message() {
+        // The post-publish path is unchanged: a Set Chunk Size followed by a
+        // 300 KiB video message — well past MAX_PREPUBLISH_MSG_LEN — still
+        // reassembles byte-for-byte on a default reader.
+        let payload: Vec<u8> = (0..300 * 1024).map(|i| (i % 251) as u8).collect();
+        let mut bytes = test_chunk_message(2, msg_type::SET_CHUNK_SIZE, &65_536u32.to_be_bytes(), 128);
+        bytes.extend_from_slice(&test_chunk_message(4, msg_type::VIDEO, &payload, 65_536));
+
+        let mut reader = ChunkReader::new();
+        let mut cursor: &[u8] = &bytes;
+        let set = reader.read_message(&mut cursor).await.unwrap();
+        assert_eq!(set.msg_type, msg_type::SET_CHUNK_SIZE);
+        let video = reader.read_message(&mut cursor).await.expect("large media message");
+        assert_eq!(video.msg_type, msg_type::VIDEO);
+        assert_eq!(video.payload, payload);
+    }
+
+    #[tokio::test]
+    async fn command_cap_does_not_constrain_media_on_the_same_reader() {
+        // The cap is scoped by message type, not by connection phase: one
+        // reader holding the command cap must still reassemble a 300 KiB
+        // keyframe (well past MAX_PREPUBLISH_MSG_LEN) and must still refuse an
+        // over-long COMMAND_AMF0 — no phase transition involved, so an input
+        // configured with no stream key is protected too.
+        let mut reader = ChunkReader::new();
+        reader.set_max_command_len(MAX_PREPUBLISH_MSG_LEN);
+
+        let payload: Vec<u8> = (0..300 * 1024).map(|i| (i % 251) as u8).collect();
+        let bytes = test_chunk_message(4, msg_type::VIDEO, &payload, 128);
+        let mut cursor: &[u8] = &bytes;
+        let video = reader
+            .read_message(&mut cursor)
+            .await
+            .expect("media must never be held to the command cap");
+        assert_eq!(video.msg_type, msg_type::VIDEO);
+        assert_eq!(video.payload, payload);
+
+        let hdr = oversized_fmt0_header(msg_type::COMMAND_AMF0);
+        let mut cursor: &[u8] = &hdr;
+        let err = reader
+            .read_message(&mut cursor)
+            .await
+            .expect_err("an over-long command must still be refused");
+        assert!(
+            format!("{err:#}").contains("exceeds the"),
+            "expected the command cap to fire, got: {err:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn chunk_stream_map_admits_sixty_four_and_refuses_the_sixty_fifth() {
+        // Each bare `fmt 3` header on a fresh cs_id returns a complete
+        // zero-length message and retains a map entry. Unbounded, 3 wire bytes
+        // buy a permanent entry — the ~17x retained amplification. Bounded, the
+        // 65th distinct cs_id ends the connection.
+        let ids: Vec<u32> = (2..=63).chain(64..=65).collect();
+        assert_eq!(ids.len(), MAX_CHUNK_STREAMS);
+
+        let mut reader = ChunkReader::new();
+        for id in &ids {
+            let bytes = bare_fmt3_header(*id);
+            let mut cursor: &[u8] = &bytes;
+            let msg = reader
+                .read_message(&mut cursor)
+                .await
+                .unwrap_or_else(|e| panic!("cs_id {id} must be accepted, got: {e:#}"));
+            assert_eq!(msg.payload.len(), 0);
+        }
+
+        let bytes = bare_fmt3_header(66);
+        let mut cursor: &[u8] = &bytes;
+        let err = reader
+            .read_message(&mut cursor)
+            .await
+            .expect_err("the 65th distinct chunk stream must be refused");
+        assert!(
+            format!("{err:#}").contains("chunk streams"),
+            "expected the chunk-stream bound to fire, got: {err:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_normal_four_chunk_stream_session_still_works() {
+        // The shape every real encoder uses: control on 2, commands on 3,
+        // audio on 4, video on 6 — interleaved, and revisited. Must pass with
+        // or without the bound.
+        let mut bytes = test_chunk_message(2, msg_type::SET_CHUNK_SIZE, &4096u32.to_be_bytes(), 128);
+        bytes.extend_from_slice(&test_chunk_message(3, msg_type::COMMAND_AMF0, b"cmd", 4096));
+        bytes.extend_from_slice(&test_chunk_message(4, msg_type::AUDIO, &[0xAF; 700], 4096));
+        bytes.extend_from_slice(&test_chunk_message(6, msg_type::VIDEO, &[0x17; 9000], 4096));
+        bytes.extend_from_slice(&test_chunk_message(4, msg_type::AUDIO, &[0xAF; 700], 4096));
+        bytes.extend_from_slice(&test_chunk_message(6, msg_type::VIDEO, &[0x27; 9000], 4096));
+
+        let mut reader = ChunkReader::new();
+        let mut cursor: &[u8] = &bytes;
+        let types: Vec<u8> = {
+            let mut got = Vec::new();
+            for _ in 0..6 {
+                got.push(reader.read_message(&mut cursor).await.unwrap().msg_type);
+            }
+            got
+        };
+        assert_eq!(
+            types,
+            vec![
+                msg_type::SET_CHUNK_SIZE,
+                msg_type::COMMAND_AMF0,
+                msg_type::AUDIO,
+                msg_type::VIDEO,
+                msg_type::AUDIO,
+                msg_type::VIDEO,
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn default_reader_does_not_apply_the_prepublish_cap() {
+        // MAX_RTMP_MSG_LEN behaviour is untouched: 0xFFFFFF is legal, so the
+        // default reader accepts the header and goes on to read the body.
+        let mut reader = ChunkReader::new();
+        let bytes = oversized_fmt0_header(msg_type::VIDEO);
+        let mut cursor: &[u8] = &bytes;
+        let err = reader.read_message(&mut cursor).await.unwrap_err();
+        assert!(
+            format!("{err:#}").contains("failed to read chunk payload"),
+            "default reader must not apply the pre-publish cap, got: {err:#}"
+        );
+    }
 }

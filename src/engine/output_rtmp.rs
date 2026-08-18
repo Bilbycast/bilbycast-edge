@@ -7,6 +7,7 @@
 //! H.264 + AAC elementary streams, wraps them in FLV tags, and publishes
 //! them via the RTMP client to servers like Twitch, YouTube, etc.
 
+use std::borrow::Cow;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
@@ -158,7 +159,7 @@ pub fn spawn_rtmp_output(
         tracing::info!(
             "RTMP output '{}' started -> {}",
             config.id,
-            config.dest_url,
+            redact_dest_url(&config.dest_url),
         );
 
         let mut attempt = 0u32;
@@ -187,7 +188,7 @@ pub fn spawn_rtmp_output(
                         "rtmp_output_gave_up",
                         format!(
                             "RTMP output '{}' gave up after {} failed connection attempts to {}",
-                            config.id, max, config.dest_url,
+                            config.id, max, redact_dest_url(&config.dest_url),
                         ),
                         &config,
                         &flow_id,
@@ -206,14 +207,22 @@ pub fn spawn_rtmp_output(
             // Connect to RTMP server
             let mut client = match RtmpClient::connect(&config.dest_url, &config.stream_key).await {
                 Ok(c) => {
-                    tracing::info!("RTMP output '{}': connected to {}", config.id, config.dest_url);
+                    tracing::info!(
+                        "RTMP output '{}': connected to {}",
+                        config.id,
+                        redact_dest_url(&config.dest_url),
+                    );
                     // If we had been alarming, clear it with a recovery event
                     // so the operator's alarm resolves.
                     if signalled_code.take().is_some() {
                         event_sender.send(rtmp_output_event(
                             EventSeverity::Info,
                             "rtmp_output_connected",
-                            format!("RTMP output '{}' connected to {}", config.id, config.dest_url),
+                            format!(
+                                "RTMP output '{}' connected to {}",
+                                config.id,
+                                redact_dest_url(&config.dest_url),
+                            ),
                             &config,
                             &flow_id,
                             serde_json::json!({}),
@@ -290,7 +299,7 @@ pub fn spawn_rtmp_output(
                             code,
                             format!(
                                 "RTMP output '{}' lost its connection to {}",
-                                config.id, config.dest_url,
+                                config.id, redact_dest_url(&config.dest_url),
                             ),
                             &config,
                             &flow_id,
@@ -2294,6 +2303,50 @@ fn classify_rtmp_failure(
     )
 }
 
+/// Everything a log line or an operator-facing event may say about an RTMP
+/// destination: `scheme://authority/<first path segment>` — which is exactly
+/// what [`super::rtmp::client`]'s `parse_rtmp_url` keeps and the connection
+/// actually uses. Everything past it is dropped before it can be written
+/// anywhere.
+///
+/// `RtmpClient::connect` documents `rtmp://live.twitch.tv/app/stream_key` as an
+/// acceptable value for `dest_url` and silently discards everything past the
+/// first path segment, so an operator who pastes a full platform ingest URL
+/// would otherwise publish their channel key to the journal at INFO and — via
+/// `details["dest_url"]` — off-box to the manager, which stores it. A query
+/// string goes the same way: it is discarded by the connection too, and is
+/// where several CDNs put a token.
+///
+/// `user:pass@` userinfo is dropped for the same reason and by the same
+/// authority: `parse_rtmp_url` reads only `host`, `port` and the first path
+/// segment off the parsed URL, so credentials in the authority are as ignored
+/// by the connection as the trailing path is — and just as much a credential
+/// in a log line if they survive. Akamai-style `rtmp://user:pass@host/app` is
+/// the shape an operator would paste.
+///
+/// Borrows whenever nothing has to be removed from the middle, so a URL that
+/// carries no secret is echoed back byte-for-byte and an operator's
+/// diagnostics read exactly as they always have.
+fn redact_dest_url(url: &str) -> Cow<'_, str> {
+    let Some(authority) = url.find("://").map(|i| i + 3) else {
+        return Cow::Borrowed(url);
+    };
+    // The authority (optional `user:pass@`, host, optional `:port`, bracketed
+    // for IPv6) runs to the first `/`, `?` or `#`; the app is the path segment
+    // after a `/`, and there is nothing to keep after any other terminator.
+    let rest = &url[authority..];
+    let authority_len = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let mut end = authority + authority_len;
+    if rest.as_bytes().get(authority_len) == Some(&b'/') {
+        let app = &url[end + 1..];
+        end += 1 + app.find(['/', '?', '#']).unwrap_or(app.len());
+    }
+    match rest[..authority_len].rfind('@') {
+        Some(at) => Cow::Owned(format!("{}{}", &url[..authority], &url[authority + at + 1..end])),
+        None => Cow::Borrowed(&url[..end]),
+    }
+}
+
 /// Build an output-scoped RTMP event carrying a stable `error_code` plus the
 /// (secret-free) destination URL, merging any caller-supplied `extra` details.
 /// Flow- and output-scoped so the manager UI can attribute it to the right
@@ -2309,7 +2362,7 @@ fn rtmp_output_event(
 ) -> Event {
     let mut details = serde_json::json!({
         "error_code": error_code,
-        "dest_url": config.dest_url,
+        "dest_url": redact_dest_url(&config.dest_url),
     });
     if let (serde_json::Value::Object(base), serde_json::Value::Object(extra)) =
         (&mut details, extra)
@@ -2527,6 +2580,106 @@ mod tests {
         assert!(
             !blob.contains("SUPER_SECRET"),
             "stream key leaked into event payload: {blob}"
+        );
+    }
+
+    /// The case the test above could not catch, because its fixture URL was
+    /// already clean: the credential embedded in `dest_url` itself. The
+    /// documented form of that field is a full platform ingest URL, so this is
+    /// what an operator who pastes one from Twitch/YouTube actually stores.
+    #[test]
+    fn a_stream_key_embedded_in_dest_url_never_reaches_an_event() {
+        let config: RtmpOutputConfig = serde_json::from_value(serde_json::json!({
+            "id": "out-1",
+            "name": "twitch",
+            "dest_url": "rtmp://live.twitch.tv/app/live_000_SUPER_SECRET_KEY",
+            "stream_key": "",
+        }))
+        .expect("minimal RTMP output config deserialises");
+
+        let ev = rtmp_output_event(
+            EventSeverity::Critical,
+            "rtmp_connect_failed",
+            format!(
+                "RTMP output '{}' lost its connection to {}",
+                config.id,
+                redact_dest_url(&config.dest_url)
+            ),
+            &config,
+            "flow-xyz",
+            serde_json::json!({}),
+        );
+
+        let details = ev.details.clone().expect("details present");
+        assert_eq!(details["dest_url"], "rtmp://live.twitch.tv/app");
+        let blob = format!(
+            "{} {}",
+            ev.message,
+            serde_json::to_string(&ev.details).unwrap()
+        );
+        assert!(
+            !blob.contains("SUPER_SECRET"),
+            "stream key embedded in dest_url leaked into the event: {blob}"
+        );
+    }
+
+    #[test]
+    fn redact_dest_url_keeps_exactly_what_the_connection_uses() {
+        // Unchanged when there is nothing to drop — an operator's existing
+        // diagnostics must read byte-for-byte as they always have.
+        for clean in [
+            "rtmp://live.twitch.tv/app",
+            "rtmps://host:1936/live",
+            "rtmp://[2001:db8::1]:1935/live",
+            "rtmp://host",
+            "not a url at all",
+        ] {
+            assert_eq!(redact_dest_url(clean), clean, "must not rewrite {clean}");
+        }
+        // Everything past the app segment is what `parse_rtmp_url` discards,
+        // and is where the credential rides.
+        assert_eq!(
+            redact_dest_url("rtmp://live.twitch.tv/app/live_000_SECRET"),
+            "rtmp://live.twitch.tv/app"
+        );
+        assert_eq!(
+            redact_dest_url("rtmps://a.rtmp.youtube.com:443/live2/abcd-efgh-ijkl"),
+            "rtmps://a.rtmp.youtube.com:443/live2"
+        );
+        assert_eq!(
+            redact_dest_url("rtmp://[2001:db8::1]:1935/live/key/extra"),
+            "rtmp://[2001:db8::1]:1935/live"
+        );
+        // A query string is discarded by the connection too, and is where
+        // several CDNs put their token.
+        assert_eq!(
+            redact_dest_url("rtmp://cdn.example.com/live?token=SECRET"),
+            "rtmp://cdn.example.com/live"
+        );
+        assert_eq!(
+            redact_dest_url("rtmp://cdn.example.com?token=SECRET"),
+            "rtmp://cdn.example.com"
+        );
+        // `parse_rtmp_url` reads host / port / first path segment only, so
+        // userinfo is ignored by the connection exactly like the trailing path
+        // — and is a credential in a log line if it survives.
+        assert_eq!(
+            redact_dest_url("rtmp://user:hunter2@cdn.example.com/live"),
+            "rtmp://cdn.example.com/live"
+        );
+        assert_eq!(
+            redact_dest_url("rtmp://user:hunter2@cdn.example.com/live/key"),
+            "rtmp://cdn.example.com/live"
+        );
+        assert_eq!(
+            redact_dest_url("rtmps://user:hunter2@[2001:db8::1]:1936"),
+            "rtmps://[2001:db8::1]:1936"
+        );
+        // An `@` in the path is not userinfo and must not be treated as a
+        // credential boundary.
+        assert_eq!(
+            redact_dest_url("rtmp://cdn.example.com/live@2"),
+            "rtmp://cdn.example.com/live@2"
         );
     }
 }

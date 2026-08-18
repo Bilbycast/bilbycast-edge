@@ -54,6 +54,39 @@ Events are queued in an unbounded in-memory channel. When the edge is not connec
 
 ## Event Reference
 
+### Configuration (`config`)
+
+| Severity | Message | Trigger |
+|----------|---------|---------|
+| Warning | `<VAR> is deprecated and will be removed…` | Raised once at startup, per variable, when the host's environment still sets a variable that has moved into `config.json`. The variable is **still honoured** this release (it sits below the config field), so nothing about the node's behaviour changes — this is telling the operator where the knob now lives. |
+| Warning | `<VAR> has been removed and does nothing…` | Raised once at startup, per variable, when the host still sets a variable that is read by nothing. Its intent is **not** being applied. Silence here would be worse than the warning: the unit file states one thing and the node does another, and nobody finds out until a stream misbehaves. |
+| Warning | `<VAR> is set to …, which could not be read as a value for it…` | Raised once at startup when a still-honoured variable holds a value that will not parse. The value is **discarded**, not honoured, and the layer below answers. Distinct from the plain deprecation on purpose — telling an operator their variable "is still honoured" while dropping the value it carries is the same lie as a unit file nothing applies. |
+| Warning | `tuning.probe_session_limits / tuning.probe_4k changed…` | Raised on an `update_config` that changes either probe switch. Carries `error_code: "tuning_requires_restart"` and `details.fields`. The hardware session-capacity probe runs once at node start, so the push is persisted and echoed but takes effect at the next restart; the two **ingress** knobs in the same block are re-installed immediately and need no restart. |
+
+The first three carry `error_code: "deprecated_env_var"` plus structured
+`details.env_var`, `details.replacement`, `details.status`
+(`"deprecated"` / `"removed"` / `"unparseable"`) and `details.value`, so the
+Events page can show what to set instead and what the current value was. The
+events are raised before the manager WebSocket connects and flush from the
+queue on the first successful auth. Source of truth for the two lists:
+[`src/config/env_compat.rs`](../src/config/env_compat.rs).
+
+Currently reported as **deprecated**: `BILBYCAST_INGRESS_RESIDENCE_MS` →
+`tuning.ingress_residence_ms` (or the per-input field),
+`BILBYCAST_PROBE_SESSION_LIMITS` → `tuning.probe_session_limits`,
+`BILBYCAST_PROBE_4K` → `tuning.probe_4k`. As **removed**:
+`BILBYCAST_ENABLE_SO_TXTIME` (collapsed onto `BILBYCAST_ENABLE_TXTIME`),
+`BILBYCAST_EGRESS_PACING` / `_BUFFER_MS` / `_RESIDENCE_MS` (per-output
+config fields since 2026-06), `BILBYCAST_BOND_FWMARK_BASE` (never read by
+anything), and `BILBYCAST_INGRESS_BUFFER_MS`.
+
+That last one is not a relocation. It is reported as removed because it never
+had any effect in **any** release — the node-wide setpoint it carried was
+consulted only after the per-input setpoint had already answered, so no value
+it held could change behaviour. `tuning.ingress_dejitter_ms` is the field that
+works; reviving the variable as a fallback would have started adding ingress
+latency to every UDP/RTP input on a host whose unit file still pins it.
+
 ### Flow Lifecycle (`flow`)
 
 | Severity | Message | Trigger |
@@ -616,8 +649,9 @@ apply — the media player is file-backed and binds no sockets.
 | critical | Tunnel '{name}' failed: {error} | Tunnel task exited with fatal error | `{ tunnel_name }` |
 | critical | Tunnel bind rejected by relay: {reason} | HMAC bind token verification failed | `{ relay_addr }` |
 | critical | Tunnel '{name}': {N} decrypt failures and zero packets delivered in {W}s — likely tunnel_encryption_key mismatch between edges | AEAD (ChaCha20-Poly1305) decrypt kept failing on inbound tunnel traffic while nothing was delivered across a full window — almost always the two edges hold different `tunnel_encryption_key` values. Emitted once per window | `{ error_code: "tunnel_decrypt_failure", tunnel_name, decrypt_errors_window, packets_delivered_window, window_secs }` |
+| warning | Direct tunnel listener refused a register from {addr}: {why} | A native-UDP **direct-mode** listener refused a `Register` whose PSK token verified. `reason: "slot_held"` — the tunnel is carrying media from a different address, so a replayed token cannot move a live peer (the register PSK is a static `HMAC(tunnel_id, psk)` re-sent in the clear every 5 s, so anyone who observes one can replay it forever). `reason: "unlatchable_source"` — the source address cannot belong to a real peer (port 0, unspecified, multicast, broadcast) and latching it would send the tunnel's return traffic nowhere. **Rate-limited to one report per 12 s hold-down window**, since the path is entirely attacker-driven; `suppressed` counts the refusals hidden since the last report. A `slot_held` refusal is not permanent — a challenger continuously present for 60 s takes the slot, so a hijacked tunnel recovers rather than blacking out for the life of the process | `{ error_code: "tunnel_register_refused", tunnel_id, reason, refused_addr, held_addr, suppressed }` |
 
-**Source**: `src/tunnel/manager.rs`, `src/tunnel/relay_client.rs`
+**Source**: `src/tunnel/manager.rs`, `src/tunnel/relay_client.rs`, `src/tunnel/udp_relay_client.rs`
 
 ---
 
@@ -723,7 +757,7 @@ Requires `resource_limits` config block. When `critical_action` is `"gate_flows"
 
 **Details** (decoder): `{ error_code: "hw_decoder_oversubscribed", family: "nvdec"|"qsv", role: "decoder", in_use: u32, max_sessions: u32, flow_id }`
 
-**Source**: `src/engine/manager.rs::create_flow` → `emit_hw_oversubscribe_warnings`. The probed-max-sessions number comes from `engine::hardware_probe::probe_encoder_session_limits` / `probe_decoder_session_limits` at startup (capped at 8; see [`docs/configuration-guide.md`](configuration-guide.md#capacity--resource-budget) and the `BILBYCAST_PROBE_SESSION_LIMITS=0` opt-out). Soft warning matches the existing modal `updateResourceImpact` 80/100 % units pattern — the alarm tells the operator to fix it without blocking flow creation.
+**Source**: `src/engine/manager.rs::create_flow` → `emit_hw_oversubscribe_warnings`. The probed-max-sessions number comes from `engine::hardware_probe::probe_encoder_session_limits` / `probe_decoder_session_limits` at startup (capped at 8; see [`docs/configuration-guide.md`](configuration-guide.md#capacity--resource-budget) and the `tuning.probe_session_limits=false` opt-out). Soft warning matches the existing modal `updateResourceImpact` 80/100 % units pattern — the alarm tells the operator to fix it without blocking flow creation.
 
 ### Remote upgrade (`upgrade`)
 
@@ -806,7 +840,7 @@ These are generated server-side in `bilbycast-manager/crates/manager-server/src/
 | `webrtc` | 8 | WHIP/WHEP session lifecycle |
 | `audio_encode` | 9 | Audio encoder lifecycle — ffmpeg sidecar (RTMP/HLS/WebRTC) + in-process TsAudioReplacer (SRT/RIST/RTP/UDP) |
 | `video_encode` | 2 | Video transcoder lifecycle — in-process TsVideoReplacer (SRT/RIST/RTP/UDP) |
-| `tunnel` | 10 | Tunnel connection state (now with structured details) + AEAD decrypt failure (`tunnel_decrypt_failure`) |
+| `tunnel` | 11 | Tunnel connection state (now with structured details) + AEAD decrypt failure (`tunnel_decrypt_failure`) + direct-listener register refusal (`tunnel_register_refused`) |
 | `manager` | 3 | Manager WebSocket connection |
 | `config` | 2 | Configuration changes |
 | `master_clock` | 2 | Source-PCR PLL lock-state transitions (fallback to wallclock, recovery) |

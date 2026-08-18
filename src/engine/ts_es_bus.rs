@@ -246,12 +246,77 @@ impl Default for NodeEsBus {
 /// unknown PIDs (before their PMT has been observed) are published
 /// with `stream_type = 0` and the assembler can fall back to the
 /// configured plan.
+/// Ceiling on distinct PIDs this demuxer will ever publish for one input.
+///
+/// Sized against real transponder captures rather than the 8192-PID
+/// theoretical space: the widest MPTS in the repo's own corpus
+/// (`astra192E-ts1080`, a full DVB-S transponder) carries 133 distinct
+/// non-null PIDs, and typical MPTS run 22–48. 256 clears the worst real
+/// capture by nearly 2× while bounding what a corrupt stream can cost.
+const MAX_PIDS_PER_INPUT: usize = 256;
+
+/// Ceiling on distinct PIDs that no PMT ever announced.
+///
+/// Far tighter than [`MAX_PIDS_PER_INPUT`] because legitimate content has
+/// essentially none: an ES PID that no PMT declares is either a brief
+/// pre-PAT window at stream start or garbage. It is garbage that matters
+/// here — a 204-byte (188 + 16 Reed-Solomon) TS walked with this loop's
+/// fixed 188-byte stride puts the sync byte at a sliding offset, and on
+/// `BTS204.ts` in the media library that yields 658 distinct bogus PIDs.
+/// At a video-class ring apiece that is ~500 MB of permanently-retained
+/// channel for a stream carrying no valid PID at all.
+///
+/// Deliberately a cap and NOT a "publish only PMT-declared PIDs" rule:
+/// `ingest_pmt` parses only the first TS packet of a PMT section, so a
+/// multi-packet PMT's tail entries never reach `stream_types`, and a
+/// declared-only rule would silently drop those ES — partial black on a
+/// CA-heavy transponder. A cap tolerates that parser limit; a whitelist
+/// would not.
+const MAX_UNDECLARED_PIDS_PER_INPUT: usize = 32;
+
+/// Largest parent datagram for which an `EsPacket` payload is taken as a
+/// zero-copy `slice_ref` of the source rather than a fresh 188-byte copy.
+///
+/// `slice_ref` avoids one allocation + memcpy per TS packet — at 10 Gbps
+/// that is millions of `malloc`s a second off a SCHED_FIFO thread. The
+/// cost is that a retained slice keeps its whole parent alive, so a
+/// datagram whose packets are mostly dropped (null / PAT / PMT) is held
+/// for the few that are published. At the shipped `ts_packets_per_datagram`
+/// of 5–7 the parent is ~1316 B and sharing it is strictly cheaper than
+/// seven separate allocations; the field accepts up to 348, where a
+/// single retained packet would pin 65 KB. This bound keeps the win for
+/// every realistic configuration and caps worst-case retention at ~22×.
+const MAX_SLICE_REF_PARENT: usize = 4096;
+
 pub struct TsEsDemuxer {
     /// Node-globally-unique input ID — used as the bus key together with the PID.
     input_id: String,
     /// Shared node-wide bus. Cloned from the [`NodeEsBus`] owned by the
     /// `FlowManager`.
     bus: Arc<NodeEsBus>,
+    /// Per-PID sender cache, so the hot path touches the node-wide
+    /// `DashMap` once per PID instead of once per 188-byte TS packet.
+    ///
+    /// Sound because [`NodeEsBus::channels`] is append-only: it has no
+    /// `remove`, `clear`, `retain` or bare `insert` anywhere in the tree,
+    /// and [`NodeEsBus::subscribe`] resolves through the same
+    /// [`NodeEsBus::sender_for`], so a cached `Sender` is the very
+    /// instance any later subscriber attaches to. **If an eviction path is
+    /// ever added to that map, this cache must be invalidated with it.**
+    ///
+    /// Positive resolutions only. Caching a refusal would make a PID
+    /// rejected during the pre-PMT window rejected for the life of the
+    /// demuxer — and that life is the *input's*, not the flow's — which is
+    /// a session-long silent ES drop.
+    senders: std::collections::HashMap<u16, broadcast::Sender<EsPacket>>,
+    /// Count of cached PIDs that no PMT had declared when first seen.
+    undeclared_pids: usize,
+    /// Latch so a sustained cap breach reports once, not per packet.
+    pid_cap_reported: bool,
+    /// Optional operator-facing event channel. `None` in tests.
+    events: Option<crate::manager::events::EventSender>,
+    /// Flow this demuxer's input belongs to, for event attribution.
+    flow_id: String,
     /// Known PMT PIDs, learned from PAT.
     pmt_pids: std::collections::HashSet<u16>,
     /// Learned `stream_type` per source PID, keyed from PMT entries.
@@ -267,11 +332,77 @@ impl TsEsDemuxer {
         Self {
             input_id: input_id.into(),
             bus,
+            senders: std::collections::HashMap::new(),
+            undeclared_pids: 0,
+            pid_cap_reported: false,
+            events: None,
+            flow_id: String::new(),
             pmt_pids: std::collections::HashSet::new(),
             stream_types: std::collections::HashMap::new(),
             last_pat_version: None,
             last_pmt_versions: std::collections::HashMap::new(),
         }
+    }
+
+    /// Attach the operator-facing event channel used to report a PID-cap
+    /// breach. Without it the breach is still enforced and still logged,
+    /// but only to the process log.
+    pub fn with_events(
+        mut self,
+        events: crate::manager::events::EventSender,
+        flow_id: impl Into<String>,
+    ) -> Self {
+        self.events = Some(events);
+        self.flow_id = flow_id.into();
+        self
+    }
+
+    /// Admit `pid` to the per-input PID set, or refuse it if a cap is hit.
+    ///
+    /// Evaluated on the cache-miss path only, so the steady-state cost is
+    /// nil. Reports the first refusal and stays quiet thereafter.
+    fn admit_pid(&mut self, pid: u16, declared: bool) -> bool {
+        if self.senders.len() >= MAX_PIDS_PER_INPUT
+            || (!declared && self.undeclared_pids >= MAX_UNDECLARED_PIDS_PER_INPUT)
+        {
+            if !self.pid_cap_reported {
+                self.pid_cap_reported = true;
+                let detail = format!(
+                    "input '{}' reached the elementary-stream PID cap ({} distinct PIDs, \
+                     {} of them never announced by a PMT); PID 0x{:04X} and any further \
+                     new PID are dropped. This normally means the stream is not \
+                     188-byte-aligned MPEG-TS — a 204-byte (Reed-Solomon) capture is \
+                     the usual cause.",
+                    self.input_id,
+                    self.senders.len(),
+                    self.undeclared_pids,
+                    pid,
+                );
+                tracing::warn!("{}", detail);
+                if let Some(events) = &self.events {
+                    events.emit_flow_with_details(
+                        crate::manager::events::EventSeverity::Warning,
+                        crate::manager::events::category::FLOW,
+                        detail,
+                        &self.flow_id,
+                        serde_json::json!({
+                            "error_code": "pid_bus_pid_cap_reached",
+                            "input_id": self.input_id,
+                            "first_refused_pid": pid,
+                            "distinct_pids": self.senders.len(),
+                            "undeclared_pids": self.undeclared_pids,
+                            "max_pids": MAX_PIDS_PER_INPUT,
+                            "max_undeclared_pids": MAX_UNDECLARED_PIDS_PER_INPUT,
+                        }),
+                    );
+                }
+            }
+            return false;
+        }
+        if !declared {
+            self.undeclared_pids += 1;
+        }
+        true
     }
 
     /// Feed one `RtpPacket` into the demuxer. Dispatches each embedded
@@ -314,25 +445,48 @@ impl TsEsDemuxer {
                 continue;
             }
             // Elementary stream packet — publish onto the bus.
+            let declared = self.stream_types.contains_key(&pid);
             let stream_type = self.stream_types.get(&pid).copied().unwrap_or(0);
+
+            // Resolve the channel. The cap is checked before the cache is
+            // written, never after, so a refused PID is re-evaluated on its
+            // next packet rather than being negatively cached.
+            if !self.senders.contains_key(&pid) {
+                if !self.admit_pid(pid, declared) {
+                    continue;
+                }
+                let tx = self.bus.sender_for(&self.input_id, pid, stream_type);
+                self.senders.insert(pid, tx);
+            }
+
             let is_pusi = ts_pusi(ts);
             let pcr = extract_pcr(ts);
+            // Zero-copy where the parent is small enough to share; see
+            // `MAX_SLICE_REF_PARENT`. `ts` is always a subslice of
+            // `pkt.data` (`data` is either `&pkt.data` or `&pkt.data[12..]`),
+            // which is what `slice_ref` requires.
+            let payload = if pkt.data.len() <= MAX_SLICE_REF_PARENT {
+                pkt.data.slice_ref(ts)
+            } else {
+                Bytes::copy_from_slice(ts)
+            };
             let es = EsPacket {
                 source_pid: pid,
                 stream_type,
-                payload: Bytes::copy_from_slice(ts),
+                payload,
                 is_pusi,
                 has_pcr: pcr.is_some(),
                 pcr,
                 recv_time_us: pkt.recv_time_us,
                 upstream_seq: pkt.upstream_seq,
             };
-            let tx = self.bus.sender_for(&self.input_id, pid, stream_type);
             // `send` returns `Err` only when there are no active
             // subscribers — that's fine, we don't hold packets for the
             // future. Count attempts, not actual receivers.
-            let _ = tx.send(es);
-            published += 1;
+            if let Some(tx) = self.senders.get(&pid) {
+                let _ = tx.send(es);
+                published += 1;
+            }
         }
         published
     }
@@ -518,6 +672,137 @@ mod tests {
         let a = rx_audio.try_recv().expect("audio packet");
         assert_eq!(a.source_pid, 0x102);
         assert_eq!(a.stream_type, 0x0F);
+    }
+
+    /// The published payload must be the exact 188 bytes of the source TS
+    /// packet. Nothing else in the suite reads `EsPacket.payload` back, so
+    /// without this an off-by-N in the zero-copy `slice_ref` path — which
+    /// derives the payload from an *offset into the parent datagram* rather
+    /// than from a fresh copy — would ship green.
+    #[test]
+    fn published_payload_is_the_exact_source_packet() {
+        let bus = Arc::new(NodeEsBus::new());
+        let mut demux = TsEsDemuxer::new("in-a", bus.clone());
+        let mut rx = bus.subscribe("in-a", 0x101);
+
+        let es_a = build_es(0x101, 3);
+        let es_b = build_es(0x101, 4);
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&build_pat(&[(1, 0x100)], 0));
+        buf.extend_from_slice(&build_pmt(0x100, &[(0x1B, 0x101)], 0x101, 0));
+        buf.extend_from_slice(&es_a);
+        buf.extend_from_slice(&es_b);
+        assert_eq!(demux.process(&wrap(buf)), 2);
+
+        // Both packets, in order, byte-for-byte — and specifically NOT the
+        // PAT or PMT that preceded them in the same parent buffer.
+        let first = rx.try_recv().expect("first ES");
+        assert_eq!(first.payload.len(), TS_PACKET_SIZE);
+        assert_eq!(&first.payload[..], &es_a[..], "first payload must match");
+        let second = rx.try_recv().expect("second ES");
+        assert_eq!(&second.payload[..], &es_b[..], "second payload must match");
+    }
+
+    /// Same guarantee on the non-raw-TS arm, where `data` is a slice taken
+    /// 12 bytes into the parent. This is the arm most likely to be got
+    /// wrong by a zero-copy rewrite, because the payload offset and the
+    /// parent offset differ.
+    #[test]
+    fn published_payload_is_exact_behind_an_rtp_header() {
+        let bus = Arc::new(NodeEsBus::new());
+        let mut demux = TsEsDemuxer::new("in-a", bus.clone());
+        let mut rx = bus.subscribe("in-a", 0x101);
+
+        let es = build_es(0x101, 9);
+        let mut buf = vec![0u8; RTP_HEADER_MIN_SIZE];
+        buf.extend_from_slice(&build_pat(&[(1, 0x100)], 0));
+        buf.extend_from_slice(&build_pmt(0x100, &[(0x1B, 0x101)], 0x101, 0));
+        buf.extend_from_slice(&es);
+
+        let mut pkt = wrap(buf);
+        pkt.is_raw_ts = false;
+        assert_eq!(demux.process(&pkt), 1);
+
+        let got = rx.try_recv().expect("ES packet");
+        assert_eq!(&got.payload[..], &es[..], "payload must skip the RTP header");
+    }
+
+    /// A parent larger than `MAX_SLICE_REF_PARENT` takes the copying path
+    /// so one retained packet cannot pin a large datagram. The bytes must
+    /// be identical either way — this pins the fallback, not the offset.
+    #[test]
+    fn large_parent_falls_back_to_copy_with_identical_bytes() {
+        let bus = Arc::new(NodeEsBus::new());
+        let mut demux = TsEsDemuxer::new("in-a", bus.clone());
+        let mut rx = bus.subscribe("in-a", 0x101);
+
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&build_pat(&[(1, 0x100)], 0));
+        buf.extend_from_slice(&build_pmt(0x100, &[(0x1B, 0x101)], 0x101, 0));
+        let marker = build_es(0x101, 5);
+        buf.extend_from_slice(&marker);
+        // Pad past the slice_ref threshold with null packets.
+        while buf.len() <= MAX_SLICE_REF_PARENT {
+            buf.extend_from_slice(&build_es(NULL_PID, 0));
+        }
+        assert!(buf.len() > MAX_SLICE_REF_PARENT);
+
+        assert_eq!(demux.process(&wrap(buf)), 1);
+        let got = rx.try_recv().expect("ES packet");
+        assert_eq!(&got.payload[..], &marker[..]);
+    }
+
+    /// A stream that is not 188-byte aligned (the 204-byte Reed-Solomon
+    /// case) walks the PID space and would otherwise allocate a permanent
+    /// broadcast ring per bogus PID. The undeclared-PID cap bounds it.
+    #[test]
+    fn undeclared_pid_cap_bounds_channel_allocation() {
+        let bus = Arc::new(NodeEsBus::new());
+        let mut demux = TsEsDemuxer::new("in-a", bus.clone());
+
+        // No PAT/PMT at all, so every PID is undeclared.
+        let mut buf = Vec::new();
+        for pid in 0x200..0x200 + (MAX_UNDECLARED_PIDS_PER_INPUT as u16 * 4) {
+            buf.extend_from_slice(&build_es(pid, 0));
+        }
+        let published = demux.process(&wrap(buf));
+
+        assert_eq!(
+            published, MAX_UNDECLARED_PIDS_PER_INPUT,
+            "only the first {MAX_UNDECLARED_PIDS_PER_INPUT} undeclared PIDs may publish"
+        );
+        assert_eq!(demux.senders.len(), MAX_UNDECLARED_PIDS_PER_INPUT);
+        assert!(demux.pid_cap_reported, "the breach must be reported once");
+    }
+
+    /// The cap must not negatively cache: a PID refused before its PMT
+    /// arrived has to be admitted once the PMT declares it, or an ES goes
+    /// silent for the life of the input.
+    #[test]
+    fn a_declared_pid_is_still_admitted_after_the_undeclared_cap_is_hit() {
+        let bus = Arc::new(NodeEsBus::new());
+        let mut demux = TsEsDemuxer::new("in-a", bus.clone());
+        let mut rx = bus.subscribe("in-a", 0x101);
+
+        // Exhaust the undeclared budget first.
+        let mut junk = Vec::new();
+        for pid in 0x200..0x200 + (MAX_UNDECLARED_PIDS_PER_INPUT as u16 * 2) {
+            junk.extend_from_slice(&build_es(pid, 0));
+        }
+        demux.process(&wrap(junk));
+        assert!(demux.pid_cap_reported);
+
+        // Now a real PAT/PMT arrives declaring 0x101, followed by its ES.
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&build_pat(&[(1, 0x100)], 0));
+        buf.extend_from_slice(&build_pmt(0x100, &[(0x1B, 0x101)], 0x101, 0));
+        buf.extend_from_slice(&build_es(0x101, 1));
+        assert_eq!(
+            demux.process(&wrap(buf)),
+            1,
+            "a PMT-declared PID must still be admitted"
+        );
+        assert_eq!(rx.try_recv().expect("ES packet").source_pid, 0x101);
     }
 
     #[test]

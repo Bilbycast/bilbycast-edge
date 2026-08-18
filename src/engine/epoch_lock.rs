@@ -376,6 +376,31 @@ pub fn target_tai_ns_anchored(
 /// to even; a reader that sees an odd or changed `seq` retries.
 #[derive(Debug, Default)]
 pub struct EpochAnchorCell {
+    /// Serialises writers. **Readers never take it** — [`EpochAnchorCell::load`]
+    /// stays wait-free, which is the whole point of the seqlock.
+    ///
+    /// The doc above used to say this cell was single-writer (the manager
+    /// command handler). It is not, and has not been for as long as three
+    /// separate writers have existed:
+    ///
+    /// - `set_epoch_anchor` → `store` (`manager/client.rs:5484`)
+    /// - the `{"clear": true}` withdrawal → `store_disarm` (`:5424`)
+    /// - the spawn-time seed in `wire_emit::spawn_wire_emitter` (`:606`)
+    ///
+    /// and the WS reader `tokio::spawn`s a task **per message**
+    /// (`manager/client.rs:739`), so two commands for one output run
+    /// concurrently. Without serialisation `seq.load` + `seq.store` is a
+    /// non-atomic read-modify-write: two writers can each read `s`, each
+    /// write `s + 1`, then each write `s + 2`, leaving `seq` *even* while
+    /// their payload stores interleaved — so a reader validates a torn
+    /// anchor instead of retrying. No memory barrier can fix that; it needs
+    /// mutual exclusion.
+    ///
+    /// Writes are rare (an alignment-group mint or withdrawal) and the
+    /// critical section is a handful of atomic stores with no `.await`, so
+    /// holding a `std::sync::Mutex` here costs nothing and cannot park the
+    /// SCHED_FIFO wire thread — that thread only ever reads.
+    write_lock: std::sync::Mutex<()>,
     seq: std::sync::atomic::AtomicU64,
     pcr_27mhz: std::sync::atomic::AtomicU64,
     unix_ns: std::sync::atomic::AtomicI64,
@@ -435,17 +460,39 @@ impl EpochAnchorCell {
         });
     }
 
-    /// Publish a new anchor. Single-writer (the manager command handler).
+    /// Publish a new anchor.
+    ///
+    /// Writers are serialised by `write_lock` (see the field for why the
+    /// former single-writer claim was wrong). Readers are unaffected.
     pub fn store(&self, a: SourceAnchor) {
         use std::sync::atomic::Ordering::{Relaxed, Release};
+        use std::sync::atomic::fence;
+        // Poisoning carries no meaning here: the guarded data is the atomics
+        // below, and a panic between the odd and even bump leaves `seq` odd,
+        // which readers already treat as "write in progress" and retry past.
+        let _writer = self
+            .write_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
         let s = self.seq.load(Relaxed);
-        self.seq.store(s.wrapping_add(1), Release); // odd: write in progress
+        self.seq.store(s.wrapping_add(1), Relaxed); // odd: write in progress
+        // The odd bump must be visible BEFORE any payload store. A `Release`
+        // *store* on `seq` would not give that: release ordering constrains
+        // operations sequenced *before* the store, and says nothing about the
+        // ones after it, so the payload stores below were free to be hoisted
+        // above the bump — letting a reader observe an even `seq` alongside
+        // half-updated fields and accept it. A `Release` fence here is the
+        // constraint that was actually wanted.
+        fence(Release);
         self.pcr_27mhz.store(a.pcr_27mhz, Relaxed);
         self.unix_ns.store(a.unix_ns as i64, Relaxed);
         self.generation.store(a.generation, Relaxed);
         self.effective_from_pcr
             .store(a.effective_from_pcr.unwrap_or(NO_TRIGGER), Relaxed);
         self.armed.store(true, Relaxed);
+        // Release: every payload store above happens-before a reader's
+        // matching acquire of this value.
         self.seq.store(s.wrapping_add(2), Release); // even: consistent
     }
 
@@ -475,7 +522,15 @@ impl EpochAnchorCell {
                     v => Some(v),
                 },
             };
-            if self.seq.load(Acquire) == before {
+            // Mirror image of the writer's fence, and needed for the mirror
+            // reason: the payload loads above must not sink BELOW the
+            // validating re-read of `seq`. An `Acquire` *load* orders what
+            // follows it, not what precedes it, so `seq.load(Acquire)` alone
+            // left the payload reads free to move after it — and a validation
+            // that can be reordered after the data it validates is not a
+            // validation. With the fence, the re-read only needs `Relaxed`.
+            std::sync::atomic::fence(Acquire);
+            if self.seq.load(Relaxed) == before {
                 return Some(a);
             }
         }
@@ -486,6 +541,71 @@ impl EpochAnchorCell {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Concurrent writers must never let a reader validate a mixture of two
+    /// anchors.
+    ///
+    /// Every field published here is derived from one generation number, so
+    /// any blend of two writers' anchors is detectable by arithmetic rather
+    /// than by timing. The assertion is an invariant, not a race outcome, so
+    /// this test cannot fail spuriously when the primitive is correct — it
+    /// simply stops catching regressions if the window closes.
+    ///
+    /// It targets the defect the `Release`/`Acquire` fences alone do NOT
+    /// address: `seq.load` + `seq.store` is a non-atomic read-modify-write,
+    /// so two unserialised writers can both leave `seq` even while their
+    /// payload stores interleave.
+    #[test]
+    fn concurrent_writers_never_publish_a_torn_anchor() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let cell = Arc::new(EpochAnchorCell::new());
+        let stop = Arc::new(AtomicBool::new(false));
+
+        let writers: Vec<_> = (0..3u32)
+            .map(|w| {
+                let cell = Arc::clone(&cell);
+                let stop = Arc::clone(&stop);
+                std::thread::spawn(move || {
+                    // Disjoint per-writer ranges, and never DISARM_GENERATION.
+                    let mut g = w * 1_000_000 + 1;
+                    while !stop.load(Ordering::Relaxed) {
+                        cell.store(SourceAnchor {
+                            pcr_27mhz: u64::from(g),
+                            unix_ns: i128::from(g) * 1_000,
+                            generation: g,
+                            effective_from_pcr: Some(u64::from(g) * 7),
+                        });
+                        g += 1;
+                    }
+                })
+            })
+            .collect();
+
+        let mut seen = 0u64;
+        let mut torn = 0u64;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(200);
+        while std::time::Instant::now() < deadline {
+            if let Some(a) = cell.load() {
+                seen += 1;
+                let g = a.generation;
+                if a.pcr_27mhz != u64::from(g)
+                    || a.unix_ns != i128::from(g) * 1_000
+                    || a.effective_from_pcr != Some(u64::from(g) * 7)
+                {
+                    torn += 1;
+                }
+            }
+        }
+        stop.store(true, Ordering::Relaxed);
+        for w in writers {
+            w.join().expect("writer thread");
+        }
+
+        assert!(seen > 0, "reader never observed a published anchor");
+        assert_eq!(torn, 0, "observed {torn} torn anchors across {seen} reads");
+    }
 
     /// A representative 2026 wall instant, well away from any wrap
     /// boundary.
