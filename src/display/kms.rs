@@ -4534,6 +4534,118 @@ mod tests {
     const NV12: u32 = u32::from_le_bytes(*b"NV12");
     const XRGB: u32 = u32::from_le_bytes(*b"XR24");
 
+    /// Hardware probe, `#[ignore]`d because it needs a real DRM device with a
+    /// connected output. Run with:
+    ///
+    /// ```sh
+    /// cargo test --features display real_hardware_in_formats -- --ignored --nocapture
+    /// ```
+    ///
+    /// Exercises the REAL `open_card` / `find_primary_plane` /
+    /// `read_plane_in_formats` / `formats_advertise` chain rather than a copy,
+    /// because the thing worth checking is that the `IN_FORMATS` blob parse and
+    /// the modifier normalisation agree with a driver that actually exists. The
+    /// pure tests above can only check the arithmetic against a list this file
+    /// made up.
+    ///
+    /// Read-only: it sets the UniversalPlanes client capability and reads
+    /// properties. It never becomes DRM master, so it cannot disturb a running
+    /// display.
+    #[test]
+    #[ignore = "needs a real DRM device with a connected output"]
+    fn real_hardware_in_formats_parse_and_normalisation() {
+        let mut probed = 0usize;
+        for n in 0..8 {
+            let path = PathBuf::from(format!("/dev/dri/card{n}"));
+            if !path.exists() {
+                continue;
+            }
+            let Ok(card) = open_card(&path) else { continue };
+            // Without this the primary plane is not even enumerable.
+            if card
+                .set_client_capability(ClientCapability::UniversalPlanes, true)
+                .is_err()
+            {
+                continue;
+            }
+            let Ok(res) = card.resource_handles() else {
+                continue;
+            };
+            for crtc in res.crtcs() {
+                let Some(plane) = find_primary_plane(&card, *crtc) else {
+                    continue;
+                };
+                let Some(formats) = read_plane_in_formats(&card, plane) else {
+                    println!("card{n} crtc {crtc:?}: no IN_FORMATS blob (driver does not advertise)");
+                    continue;
+                };
+                probed += 1;
+                assert!(
+                    !formats.is_empty(),
+                    "IN_FORMATS parsed to an empty list — the blob layout is being \
+                     misread, and every (fourcc, modifier) pair would then answer \
+                     'unsupported' and permanently demote zero-copy"
+                );
+                let nv12: Vec<u64> = formats
+                    .iter()
+                    .filter(|(f, _)| *f == NV12_FOURCC)
+                    .map(|(_, m)| *m)
+                    .collect();
+                println!(
+                    "card{n} crtc {crtc:?}: {} pairs, {} distinct fourccs, NV12 modifiers {:x?}",
+                    formats.len(),
+                    formats
+                        .iter()
+                        .map(|(f, _)| *f)
+                        .collect::<std::collections::BTreeSet<_>>()
+                        .len(),
+                    nv12
+                );
+
+                // Every fourcc must be four printable ASCII bytes. A blob read at
+                // the wrong offset yields noise, which would still be "non-empty".
+                for (fourcc, _) in &formats {
+                    let b = fourcc.to_le_bytes();
+                    assert!(
+                        b.iter().all(|c| c.is_ascii_graphic() || *c == b' '),
+                        "fourcc 0x{fourcc:08x} is not printable ASCII — blob misparsed"
+                    );
+                }
+
+                // THE POINT OF THIS TEST. VAAPI hands back DRM_FORMAT_MOD_INVALID
+                // for an untiled surface; an IN_FORMATS blob spells that same
+                // buffer DRM_FORMAT_MOD_LINEAR and never emits the sentinel. So
+                // wherever the plane advertises a LINEAR pair, the sentinel must
+                // resolve to the same answer — and before the normalisation
+                // landed it did not, which permanently demoted working zero-copy
+                // to the CPU download path.
+                for (fourcc, modifier) in &formats {
+                    if *modifier == DRM_FORMAT_MOD_LINEAR {
+                        assert!(
+                            formats_advertise(&formats, *fourcc, DRM_FORMAT_MOD_INVALID),
+                            "plane advertises fourcc 0x{fourcc:08x} LINEAR but the \
+                             INVALID sentinel was refused"
+                        );
+                    }
+                    // A modifier the plane really lists must always be accepted.
+                    assert!(formats_advertise(&formats, *fourcc, *modifier));
+                }
+
+                // And a refusal must still be a refusal: a fourcc absent from the
+                // list stays unsupported however it is spelled.
+                let absent = u32::from_le_bytes(*b"ZZZZ");
+                assert!(!formats_advertise(&formats, absent, DRM_FORMAT_MOD_LINEAR));
+                assert!(!formats_advertise(&formats, absent, DRM_FORMAT_MOD_INVALID));
+            }
+        }
+        assert!(
+            probed > 0,
+            "no DRM plane with an IN_FORMATS blob was found — this test asserts \
+             nothing on this host, so do not read it as a pass"
+        );
+        println!("probed {probed} plane(s)");
+    }
+
     #[test]
     fn an_untiled_plane_accepts_the_vaapi_invalid_sentinel() {
         // The regression this guards. VAAPI reports DRM_FORMAT_MOD_INVALID for
