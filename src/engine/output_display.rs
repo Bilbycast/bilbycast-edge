@@ -56,7 +56,9 @@ use crate::display::audio_bars::{new_shared_meter, SharedMeter, StreamHeader};
 use crate::display::audio_meter::spawn_audio_meter;
 use crate::display::{audio::AudioBackend, clock::AudioClock, kms::KmsDisplay};
 use crate::engine::audio_decode::DecodeStats;
-use crate::engine::display_cadence::{cadence_is_stale, rebuild_key, CadenceScheduler, HoldKind};
+use crate::engine::display_cadence::{
+    cadence_is_stale, rebuild_key, CadenceScheduler, HoldKind, StaleDwell,
+};
 use crate::engine::packet::RtpPacket;
 use crate::engine::ts_demux::{DemuxedFrame, TsDemuxer};
 use crate::engine::video_decode_stats::VideoDecodeStats;
@@ -4858,6 +4860,9 @@ fn display_loop(
     // routine, so a node persistently refused would otherwise say why once and
     // then never again for the life of the flow.
     let mut cadence_no_headroom_logged_at: Option<Instant> = None;
+    // Debounce for the staleness check below — a rate estimate recovering from
+    // a PTS discontinuity is briefly, wrongly, out of tolerance.
+    let mut cadence_stale_dwell = StaleDwell::default();
     let mut cadence_failures: u32 = 0;
     let mut frames_since_period_reset: u32 = 0;
     // The `(width, height, fps)` hint from the last *fresh*
@@ -5593,6 +5598,7 @@ fn display_loop(
             cadence = None;
             cadence_engaged_at = None;
             cadence_built_for = None;
+            cadence_stale_dwell.clear();
         }
         if vblank_cadence && !audio_is_master {
             // Quantise to 0.1 fps. Milli-fps resolution meant every EMA
@@ -5658,9 +5664,20 @@ fn display_loop(
             // `self.mode = new_mode`, so `vblank_period_ns()` already reports
             // the new mode, and advertised-vs-measured is at most 0.1 % — far
             // inside `CADENCE_STALE_TOLERANCE` and far outside a real change.
-            let cadence_stale = cadence.as_ref().is_some_and(|s| {
+            //
+            // Debounced. A stale READING is not a stale scheduler: at every loop
+            // point of a looping source the PTS discontinuity resets
+            // `upstream_frame_period_us`, and the EMA re-converges through
+            // values that are briefly out of tolerance — measured on this dev
+            // host as 42 191 µs against a true 40 000 (5.5 %), back inside 2.5 %
+            // within 200 ms, with the rate identical either side. Acting on that
+            // disengaged the cadence on every single loop. A real rate change
+            // does not recover, so requiring the reading to persist separates
+            // them; see CADENCE_STALE_DWELL for the margins.
+            let cadence_stale_now = cadence.as_ref().is_some_and(|s| {
                 cadence_is_stale(s.vblanks_per_frame(), panel_period_ns, upstream_us)
             });
+            let cadence_stale = cadence_stale_dwell.observe(cadence_stale_now, Instant::now());
             if cadence_stale {
                 tracing::info!(
                     output_id = %output_id,
@@ -5917,6 +5934,7 @@ fn display_loop(
                             );
                         }
                         counters.cadence_disengaged.fetch_add(1, Ordering::Relaxed);
+                        cadence_stale_dwell.clear();
                         cadence = None;
                         cadence_engaged_at = None;
                         cadence_guard_strikes = 0;
