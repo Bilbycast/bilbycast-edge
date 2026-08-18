@@ -4534,6 +4534,25 @@ mod tests {
     const NV12: u32 = u32::from_le_bytes(*b"NV12");
     const XRGB: u32 = u32::from_le_bytes(*b"XR24");
 
+    /// Companion hardware probe: what this host's connectors actually offer.
+    /// Read-only, `#[ignore]`d for the same reason as the one below.
+    ///
+    /// ```sh
+    /// cargo test --features display real_hardware_enumerate -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "needs a real DRM device with a connected output"]
+    fn real_hardware_enumerate_connectors_and_modes() {
+        let devs = enumerate_displays_kms();
+        assert!(
+            !devs.is_empty(),
+            "no DRM connector enumerated — this test asserts nothing here"
+        );
+        for d in &devs {
+            println!("{d:?}");
+        }
+    }
+
     /// Hardware probe, `#[ignore]`d because it needs a real DRM device with a
     /// connected output. Run with:
     ///

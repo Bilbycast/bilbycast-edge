@@ -46,6 +46,8 @@
 //! #112) and a `div_ceil` rounding variant that introduced twice-per-beat
 //! bursts of late frames. An accumulator has no gain to mistune.
 
+use std::time::{Duration, Instant};
+
 /// How a frame's vblank allocation was decided — reported so a mistimed
 /// present can be told apart from a correctly-held one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -260,6 +262,71 @@ pub fn cadence_is_stale(
         > built_vblanks_per_frame * CADENCE_STALE_TOLERANCE
 }
 
+/// How long a stale reading must persist before the scheduler is dropped.
+///
+/// A rate estimate can depart from the built ratio for two very different
+/// reasons, and the tolerance alone cannot tell them apart:
+///
+///   * **A transient.** `upstream_frame_period_us` is reset by a PTS
+///     discontinuity and then re-converges through its EMA. Measured on this
+///     dev host against a 15 s file on loop: at each loop boundary the estimate
+///     stepped to 42 191 µs (5.5 % off a true 40 000) and was back inside 2.5 %
+///     **within 200 ms**. The rates either side of the loop were identical, so
+///     dropping the scheduler there achieved nothing but losing the cadence for
+///     the several seconds it takes to re-engage — measured as a disengage on
+///     every single loop.
+///   * **A real change.** A mode change or a source rate change moves the ratio
+///     and it stays moved.
+///
+/// One second separates them with margin either way: 5x longer than the
+/// measured transient, and 5x shorter than the ~4.9 s it takes an over-holding
+/// stale cadence to fill the 24-slot decode queue and start shedding.
+pub const CADENCE_STALE_DWELL: Duration = Duration::from_secs(1);
+
+/// Debounce for [`cadence_is_stale`].
+///
+/// Split out from the display loop so the edge-timing can be tested with
+/// synthetic instants — the loop itself has no test harness, and an
+/// off-by-one-edge here either flaps the cadence off on every source hiccup or
+/// leaves a stale scheduler running.
+#[derive(Debug, Default, Clone)]
+pub struct StaleDwell {
+    since: Option<Instant>,
+}
+
+impl StaleDwell {
+    /// Feed one observation. Returns `true` exactly once per episode, on the
+    /// first observation at or past [`CADENCE_STALE_DWELL`] — the caller acts on
+    /// that and the episode is then closed, so a caller that keeps reporting
+    /// `stale` is not told to disengage over and over.
+    pub fn observe(&mut self, stale: bool, now: Instant) -> bool {
+        if !stale {
+            self.since = None;
+            return false;
+        }
+        match self.since {
+            None => {
+                self.since = Some(now);
+                false
+            }
+            Some(t) => {
+                if now.duration_since(t) >= CADENCE_STALE_DWELL {
+                    self.since = None;
+                    true
+                } else {
+                    false
+                }
+            }
+        }
+    }
+
+    /// Forget any episode in progress — used when the scheduler goes away for
+    /// an unrelated reason, so the next one starts clean.
+    pub fn clear(&mut self) {
+        self.since = None;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -395,6 +462,63 @@ mod tests {
 
     fn fps_to_period_us(fps: f64) -> u64 {
         (1_000_000.0 / fps).round() as u64
+    }
+
+    #[test]
+    fn a_transient_stale_reading_never_disengages() {
+        // The measured loop-boundary excursion: out of tolerance, back inside
+        // within 200 ms. Sampled at the 25 fps loop rate that is 5 observations.
+        let mut d = StaleDwell::default();
+        let t0 = Instant::now();
+        for i in 0..5 {
+            assert!(
+                !d.observe(true, t0 + Duration::from_millis(40 * i)),
+                "a 200 ms excursion must not disengage"
+            );
+        }
+        // Recovered — the episode is forgotten.
+        assert!(!d.observe(false, t0 + Duration::from_millis(240)));
+        // ...and a later, equally short excursion must not inherit its age.
+        assert!(!d.observe(true, t0 + Duration::from_secs(30)));
+        assert!(!d.observe(
+            true,
+            t0 + Duration::from_secs(30) + Duration::from_millis(200)
+        ));
+    }
+
+    #[test]
+    fn a_persistent_stale_reading_disengages_once() {
+        let mut d = StaleDwell::default();
+        let t0 = Instant::now();
+        assert!(!d.observe(true, t0));
+        assert!(!d.observe(true, t0 + CADENCE_STALE_DWELL - Duration::from_millis(1)));
+        assert!(
+            d.observe(true, t0 + CADENCE_STALE_DWELL),
+            "must fire at the dwell boundary"
+        );
+        // Exactly once: the caller has acted, and a still-true reading must not
+        // re-fire on the very next frame.
+        assert!(!d.observe(true, t0 + CADENCE_STALE_DWELL + Duration::from_millis(40)));
+    }
+
+    #[test]
+    fn the_dwell_is_shorter_than_the_damage_and_longer_than_the_transient() {
+        // Pin both margins. 200 ms is the measured EMA recovery after a PTS
+        // discontinuity; ~4.9 s is the simulated time for an over-holding stale
+        // cadence to fill the 24-slot decode queue and begin shedding.
+        assert!(CADENCE_STALE_DWELL >= Duration::from_millis(600));
+        assert!(CADENCE_STALE_DWELL <= Duration::from_millis(2500));
+    }
+
+    #[test]
+    fn clearing_the_dwell_abandons_the_episode() {
+        let mut d = StaleDwell::default();
+        let t0 = Instant::now();
+        assert!(!d.observe(true, t0));
+        d.clear();
+        // Age is gone, so the dwell restarts from here.
+        assert!(!d.observe(true, t0 + CADENCE_STALE_DWELL));
+        assert!(d.observe(true, t0 + CADENCE_STALE_DWELL + CADENCE_STALE_DWELL));
     }
 
     #[test]
