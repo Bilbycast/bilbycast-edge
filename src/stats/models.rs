@@ -1392,6 +1392,14 @@ pub struct DisplayStats {
     /// the shed frames corrupted the very rate estimate driving the cadence.
     #[serde(default)]
     pub cadence_disengaged: u64,
+    /// Times the cadence was disengaged because the measured rates stopped
+    /// matching the running scheduler — a panel mode change or a source rate
+    /// change (#115). Distinct from `cadence_disengaged`, which means the
+    /// runaway guard tripped: this one is an ordinary lifecycle event and
+    /// says nothing bad about the host, so it is expected to be non-zero on
+    /// any output that switches sources.
+    #[serde(default)]
+    pub cadence_disengaged_stale: u64,
     /// Source frame period (µs) measured in the decode task, before the
     /// display queue (#115). Compare against the presented rate: a large
     /// divergence means frames are being shed between decode and panel.
