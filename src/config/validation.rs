@@ -1603,7 +1603,6 @@ fn validate_recording_config(
     Ok(())
 }
 
-/// Validate a synthetic test-pattern input. All fields have sensible
 /// Validate a mosaic (multiviewer wall) input.
 ///
 /// The geometry rules live in [`crate::engine::mosaic`] and are shared with the
@@ -1680,6 +1679,7 @@ fn validate_mosaic_input(cfg: &crate::config::models::MosaicInputConfig) -> Resu
     Ok(())
 }
 
+/// Validate a synthetic test-pattern input. All fields have sensible
 /// defaults; this is the sanity-bound check.
 fn validate_test_pattern_input(c: &crate::config::models::TestPatternInputConfig) -> Result<()> {
     if c.width < 64 || c.width > 7680 || !c.width.is_multiple_of(2) {
