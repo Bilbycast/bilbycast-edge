@@ -5610,13 +5610,32 @@ fn display_loop(
             //
             // It does NOT keep every broadcast rate distinct, which an earlier
             // comment here claimed: 23.976 and 24.000 both key 24 000, and
-            // 29.97 and 30.000 both key 30 000. (59.94 is the odd one out — it
-            // keys 59 900, being nearer that than 60 000.) The collapse is
-            // accepted rather than fixed: a real 23.976 <-> 24 switch leaves a
-            // 0.1 % ratio error, one extra absorbed hold roughly every 17
-            // minutes, which is precisely what `accum` exists to absorb. State
-            // it plainly instead of denying it — this is an IDENTITY for
-            // deciding "same rate pair?", not a rate anything computes with.
+            // 29.97 and 30.000 both key 30 000. The collapse is accepted: a
+            // real 23.976 <-> 24 switch leaves a 0.1 % ratio error, one extra
+            // absorbed hold roughly every 17 minutes, which is what `accum`
+            // exists for.
+            //
+            // 59.94 is the one to be careful with, and worse than a collapse.
+            // Simulating the real `note_upstream_frame_period` chain (integer
+            // 90 kHz deltas, truncating sample, truncating EMA) the estimate
+            // settles into a cycle of {16 679, 16 680, 16 681} µs against a
+            // true 16 683.33 — and the 59 950 milli-fps bin edge lands at
+            // 16 680.57, INSIDE that cycle. A 59.94 source therefore keys
+            // 59 900 and 60 000 alternately. Every other broadcast rate keys
+            // stably to one value. `MIN_REBUILD_INTERVAL` bounds the cost to
+            // one rebuild per 10 s, each reseeding `accum`; bounded and
+            // self-limiting, but do not read the key as stable at this rate.
+            //
+            // This is an identity for deciding "same rate pair?" — and, at the
+            // build below, ALSO the rate the scheduler is constructed from
+            // (`source_fps = fps_milli / 1000`). Two jobs, and the second is
+            // why the quantum must not simply be removed: the estimator
+            // truncates twice, so an unquantised rate reads ~40 ppm FAST, vpf
+            // falls under `CadenceScheduler::new`'s 1.0 floor, and 60p/60 Hz,
+            // 30p/30 Hz and 24p/24 Hz stop engaging even at 0 ppm of panel
+            // error (measured: vpf 0.999960 / 0.999990 / 0.999984 raw against
+            // exactly 1.000000 quantised). The quantum is doing load-bearing
+            // snap-to-nominal work at integer rates, not just churn control.
             const FPS_QUANTUM_MILLI: u32 = 100;
             let upstream_us = counters.upstream_frame_period_us.load(Ordering::Relaxed);
             let fps_milli = if upstream_us > 0 {
@@ -5971,14 +5990,23 @@ fn display_loop(
                 // committing. The panel re-scans the same framebuffer, so a
                 // hold costs nothing but the wait.
                 //
-                // Deciding *which* vblanks a frame occupies is what makes
-                // this work at 1:1, where merely rounding a wall-clock target
-                // to the nearest vblank cannot act at all (an earlier
-                // `present_vblank_snap` prototype measured 100% no-sleep at
-                // 50p on a 50 Hz panel — the branch it lived in was never
-                // taken, so it was deleted rather than shipped alongside
-                // this). Holding also *generates* 2:3 pulldown at 24p rather
-                // than hoping the wall clock lands on it.
+                // This earns its keep wherever a frame owns more than one
+                // vblank: a flat 2,2,2 at 25p on 50 Hz, and a *generated*
+                // 3,2,3,2 at 24p on 60 Hz rather than hoping the wall clock
+                // lands on it.
+                //
+                // It does NOT act at an exact 1:1 rate pair, and an earlier
+                // version of this comment claimed it did. `hold.vblanks` is 1,
+                // `for _ in 1..1` runs zero times, and the wall-clock pacer
+                // above decides the instant — the very path this module was
+                // written to supersede. A panel measured slower than the
+                // source is declined outright (vpf < 1); a panel measured
+                // faster contributes only the drift-beat hold, a few times an
+                // hour across this fleet's 12-65 ppm spread. The deleted
+                // `present_vblank_snap` prototype was inert at 50p on 50 Hz
+                // for a structurally identical reason (100 % no-sleep, its
+                // branch never taken); this module is the other half of that
+                // story everywhere EXCEPT 1:1, where neither acts.
                 if let Some(sched) = cadence.as_mut() {
                     let hold = sched.next_hold();
                     if hold.kind == HoldKind::DriftAbsorb {
