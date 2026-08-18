@@ -650,7 +650,9 @@ commit message or release note and delete the bullet.
      outright (`source_fps_locked`), so a wrong pin is never corrected.
    - **RTMP, WebRTC and CMAF outputs have no auto-detect** and fall
      back to 30/1, so on those the field must be set to match the
-     source.
+     source. On RTMP it no longer affects A/V sync — FLV timestamps come
+     from the source clock — but it still mistunes rate control, the
+     default GOP and the SPS VUI.
 
    A pin that disagrees with the source does **not** cause a
    proportional lipsync drift on the TS path (output PES PTS carry the
@@ -663,7 +665,13 @@ commit message or release note and delete the bullet.
    `tune=zerolatency` option and rely on defaults for VBV buffer size,
    CRF, look-ahead, etc. CBR-strict profiles (true constant-bitrate
    muxing) may need extra work for hard-rate contribution paths.
-4. **No B-frames.** `max_b_frames = 0` is hard-coded to simplify
+4. **No B-frames on RTMP.** `bframes` is configurable (0–16) on the TS
+   paths, but the RTMP output pins it to 0 and warns
+   (`rtmp_bframes_unsupported`) if asked otherwise: FLV carries DTS in the
+   tag timestamp and both tag writers hard-code the composition-time offset
+   to 0 (the Enhanced-RTMP HEVC path has no CTS field at all), so a
+   reordering encoder would drive DTS backwards and most ingests answer that
+   by dropping the publisher. Elsewhere `max_b_frames = 0` is the default to simplify
    decoder interop. Enabling them later would improve quality at a
    given bitrate.
 5. **No keyframe alignment with source.** The encoder emits IDRs on

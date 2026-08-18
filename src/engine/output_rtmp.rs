@@ -105,11 +105,22 @@ struct VideoActive {
     /// libavcodec silently crop the top-left quadrant.
     pipeline: crate::engine::video_encode_util::ScaledVideoEncoder,
     target_family: video_codec::VideoCodec,
-    /// Cached encoder fps — needed to convert encoder-PTS into FLV-style
-    /// millisecond timestamps after each frame encode. Mirrors the
-    /// numbers the pipeline uses at lazy-open time.
-    fps_num: u32,
-    fps_den: u32,
+    /// Source PTS (90 kHz, display order) for every decoded frame handed to
+    /// the encoder. libavcodec echoes `pkt.pts → frame.pts` through its
+    /// reorder queue, so a batch drain yields N distinct increasing stamps —
+    /// the property the old frame-counter was chosen to guarantee, now
+    /// obtained without discarding the source clock. Popped one per emitted
+    /// frame. Same contract as `ts_video_replace`'s queue of the same name.
+    src_pts_queue: std::collections::VecDeque<u64>,
+    /// Last wire PTS emitted, for the strictly-increasing guard.
+    ///
+    /// The encoder's `fps_num`/`fps_den` are deliberately no longer held here.
+    /// They still open the encoder (rate control, VBV, default GOP, SPS VUI)
+    /// but they no longer reach the FLV timestamp — that comes from the source
+    /// clock — and keeping a copy invited the next reader to use it again.
+    last_wire_pts_90k: Option<u64>,
+    /// One nominal frame step, substituted when the source PTS is unusable.
+    nominal_step_90k: u64,
     /// Cached FLV sequence-header payload built from the encoder's
     /// `extradata` on first-encoder-open. `None` until the encoder opens
     /// and emits its out-of-band SPS/PPS (or VPS/SPS/PPS).
@@ -393,6 +404,7 @@ async fn publish_loop(
                     &mut encoder_state,
                     &mut sent_audio_header,
                     stats,
+                    base_pts,
                 )
                 .await?;
                 client.flush().await?;
@@ -442,6 +454,7 @@ async fn publish_loop(
                         VideoFrameSource::H264 { nalus: &nalus, is_keyframe },
                         pts,
                         ts_ms,
+                        &mut base_pts,
                         recv_time_us,
                         &demuxer,
                         &mut sent_video_header,
@@ -463,6 +476,7 @@ async fn publish_loop(
                         VideoFrameSource::H265 { nalus: &nalus, is_keyframe },
                         pts,
                         ts_ms,
+                        &mut base_pts,
                         recv_time_us,
                         &demuxer,
                         &mut sent_video_header,
@@ -616,7 +630,15 @@ async fn publish_loop(
                                 // for the FLV tag so AAC frames drained as
                                 // a batch don't all share the source PES
                                 // ts_ms — keeps DTS strictly monotonic.
-                                let frame_ts_ms = (frame.pts / 90) as u32;
+                                // Share the connection's FLV epoch. This was
+                                // the raw absolute source PTS in ms, so on any
+                                // source whose PTS does not start near zero —
+                                // every feed from an upstream bilbycast edge,
+                                // whose rewriter anchors on the master clock —
+                                // audio tags landed up to ~26.5 h ahead of
+                                // 0-based video tags.
+                                let base = *base_pts.get_or_insert(frame.pts);
+                                let frame_ts_ms = rel_ms_monotonic(frame.pts, base);
                                 client.send_audio(&tag, frame_ts_ms).await?;
                                 stats.packets_sent.fetch_add(1, Ordering::Relaxed);
                                 stats.bytes_sent.fetch_add(tag_len as u64, Ordering::Relaxed);
@@ -708,7 +730,10 @@ async fn publish_loop(
                     for frame in drained {
                         let tag = build_aac_raw_tag(&frame.data);
                         let tag_len = tag.len();
-                        let frame_ts_ms = (frame.pts / 90) as u32;
+                        // Share the connection's FLV epoch — see the AAC
+                        // path above.
+                        let base = *base_pts.get_or_insert(frame.pts);
+                        let frame_ts_ms = rel_ms_monotonic(frame.pts, base);
                         client.send_audio(&tag, frame_ts_ms).await?;
                         stats.packets_sent.fetch_add(1, Ordering::Relaxed);
                         stats.bytes_sent.fetch_add(tag_len as u64, Ordering::Relaxed);
@@ -739,8 +764,61 @@ async fn publish_loop(
 /// Convert 90kHz PTS to milliseconds relative to the first frame.
 fn pts_to_ms(pts: u64, base_pts: &mut Option<u64>) -> u32 {
     let base = *base_pts.get_or_insert(pts);
+    rel_ms_wrapping(pts, base)
+}
+
+/// Largest 33-bit PTS distance still read as "forward". Only meaningful for a
+/// raw source PTS, which wraps at 2^33.
+const MAX_FORWARD_90K: u64 = 1 << 33;
+
+/// Raw (wrapping, 33-bit) source PTS → FLV milliseconds relative to the epoch.
+fn rel_ms_wrapping(pts: u64, base: u64) -> u32 {
     let delta = pts.wrapping_sub(base);
+    if delta >= MAX_FORWARD_90K {
+        return 0;
+    }
     (delta / 90) as u32
+}
+
+/// An already-monotonic 90 kHz timeline → FLV milliseconds relative to the
+/// epoch.
+///
+/// `v` is non-decreasing by construction — either the wire-PTS guard below, or
+/// the audio encoder's once-anchored sample counter — so no wrap heuristic is
+/// wanted here. Applying one would cap the output at 2^33 ticks (~26.5 h) and
+/// then pin every later tag to 0. A value behind the epoch (the other essence
+/// anchored first) clamps to 0.
+fn rel_ms_monotonic(v: u64, base: u64) -> u32 {
+    (v.saturating_sub(base) / 90) as u32
+}
+
+/// Ticks beyond which a forward step is read as a source discontinuity rather
+/// than a real gap. Two seconds: past any legitimate inter-frame interval,
+/// well short of a splice or a clock re-anchor.
+const MAX_FORWARD_STEP_90K: u64 = 180_000;
+
+/// Wire PTS (90 kHz) for one encoded video frame.
+///
+/// FLV carries DTS in the tag timestamp and RTMP servers drop a publisher whose
+/// DTS goes backwards, so the result is forced strictly increasing. It is also
+/// forced not to *leap*: the transcoded-audio timeline anchors once and then
+/// free-runs on a sample count, so it physically cannot follow a forward source
+/// jump. Letting video jump while audio cannot is the very A/V split this fix
+/// exists to close, so both directions substitute one nominal frame step. On a
+/// genuine ingest gap this compresses the video timeline by exactly the amount
+/// the audio timeline is already compressed — the two stay together, which is
+/// the property that matters.
+fn next_wire_pts_90k(
+    queue: &mut std::collections::VecDeque<u64>,
+    last: Option<u64>,
+    step_90k: u64,
+) -> u64 {
+    let raw = queue.pop_front().unwrap_or(0);
+    match last {
+        None => raw,
+        Some(l) if raw > l && raw - l <= MAX_FORWARD_STEP_90K => raw,
+        Some(l) => l.wrapping_add(step_90k),
+    }
 }
 
 /// Build an AVC sequence header FLV video tag (AVCDecoderConfigurationRecord).
@@ -1171,6 +1249,7 @@ async fn process_video_frame(
     src: VideoFrameSource<'_>,
     pts_90k: u64,
     ts_ms: u32,
+    base_pts: &mut Option<u64>,
     recv_time_us: u64,
     demuxer: &TsDemuxer,
     sent_video_header: &mut bool,
@@ -1204,11 +1283,11 @@ async fn process_video_frame(
                 return Ok(true);
             }
             // Fall through to Active on the very same frame.
-            encode_one_frame(&src, pts_90k, ts_ms, recv_time_us, sent_video_header, video_state, client, config, stats, flow_id, event_sender).await
+            encode_one_frame(&src, pts_90k, ts_ms, base_pts, recv_time_us, sent_video_header, video_state, client, config, stats, flow_id, event_sender).await
         }
         #[cfg(feature = "media-codecs")]
         VideoEncoderState::Active(_) => {
-            encode_one_frame(&src, pts_90k, ts_ms, recv_time_us, sent_video_header, video_state, client, config, stats, flow_id, event_sender).await
+            encode_one_frame(&src, pts_90k, ts_ms, base_pts, recv_time_us, sent_video_header, video_state, client, config, stats, flow_id, event_sender).await
         }
     }
 }
@@ -1489,6 +1568,25 @@ fn open_video_active(
         (Some(n), Some(d)) => (n, d),
         _ => (30, 1),
     };
+    // B-frames are pinned off on this path. FLV carries DTS in the tag
+    // timestamp and the two tag writers hard-code CTS = 0 (the Enhanced-RTMP
+    // HEVC path has no CTS field at all), so an encoder that reordered would
+    // stamp display-order PTS as DTS and drive it backwards — which most
+    // ingests answer by dropping the publisher. It is also the precondition
+    // for the source-PTS FIFO below being a plain queue. `webrtc_safe_
+    // video_encode` pins the same knob for the same class of reason.
+    let mut cfg = cfg.clone();
+    if cfg.bframes.unwrap_or(0) != 0 {
+        tracing::warn!(
+            error_code = "rtmp_bframes_unsupported",
+            requested = cfg.bframes.unwrap_or(0),
+            "RTMP output '{}': video_encode.bframes is not supported on the RTMP path \
+             (FLV tags carry no composition-time offset) — encoding with bframes = 0",
+            config.id
+        );
+        cfg.bframes = Some(0);
+    }
+    let cfg = &cfg;
     let mut pipeline = crate::engine::video_encode_util::ScaledVideoEncoder::with_backend_chain(
         cfg.clone(),
         backend_chain,
@@ -1502,8 +1600,11 @@ fn open_video_active(
         decoder,
         pipeline,
         target_family,
-        fps_num,
-        fps_den,
+        src_pts_queue: std::collections::VecDeque::with_capacity(64),
+        last_wire_pts_90k: None,
+        // One frame period in 90 kHz ticks, from the declared rate. Only used
+        // as a substitute step when the source PTS is unusable.
+        nominal_step_90k: (90_000u64 * fps_den.max(1) as u64) / fps_num.max(1) as u64,
         sequence_header_tag: None,
         sequence_header_sent: false,
         out_frame_count: 0,
@@ -1517,8 +1618,11 @@ fn open_video_active(
 #[allow(clippy::too_many_arguments)]
 async fn encode_one_frame(
     src: &VideoFrameSource<'_>,
-    _pts_90k: u64,
+    pts_90k: u64,
     _ts_ms: u32,
+    // Shared FLV epoch for this connection — anchored by whichever essence
+    // arrives first, so audio and video land on one timeline.
+    base_pts: &mut Option<u64>,
     recv_time_us: u64,
     sent_video_header: &mut bool,
     video_state: &mut VideoEncoderState,
@@ -1543,7 +1647,11 @@ async fn encode_one_frame(
         crate::engine::perf::TRANSCODE_BLOCK_WARN_MS,
         {
             active.stats.input_frames.fetch_add(1, Ordering::Relaxed);
-            if let Err(e) = active.decoder.send_packet(&annex_b) {
+            // Feed the source PTS in so libavcodec can echo it back per
+            // decoded frame. `send_packet` (no pts) threw it away at the door,
+            // which is why the emit path had nothing but a frame counter to
+            // work from.
+            if let Err(e) = active.decoder.send_packet_with_pts(&annex_b, pts_90k as i64) {
                 tracing::debug!("RTMP output '{}': decoder send_packet: {e:?}", config.id);
             }
             let mut out = Vec::new();
@@ -1552,7 +1660,19 @@ async fn encode_one_frame(
                     Ok(f) => f,
                     Err(_) => break,
                 };
+                // Display-order source PTS for this frame, straight from the
+                // decoder's reorder queue. Falls back to the access unit's own
+                // PTS when the source PES carried none.
+                let src_pts_for_frame = match frame.pts() {
+                    Some(p) if p >= 0 => p as u64,
+                    _ => pts_90k,
+                };
+                active.src_pts_queue.push_back(src_pts_for_frame);
+
                 let was_open = active.pipeline.is_open();
+                // The encoder still gets the monotonic frame counter — it wants
+                // a rate-control tick, not a clock, and passing 90 kHz ticks
+                // against a 1/fps timebase is the documented VBV hazard.
                 let encoded = match active.pipeline.encode(&frame, Some(active.out_frame_count)) {
                     Ok(frames) => frames,
                     Err(e) => {
@@ -1562,6 +1682,8 @@ async fn encode_one_frame(
                         }
                         tracing::debug!("RTMP output '{}': encode error: {e}", config.id);
                         active.stats.dropped_frames.fetch_add(1, Ordering::Relaxed);
+                        // Keep the FIFO balanced: this frame produced no output.
+                        active.src_pts_queue.pop_back();
                         continue;
                     }
                 };
@@ -1621,15 +1743,28 @@ async fn encode_one_frame(
         _ => return Ok(true),
     };
 
-    // Convert encoder-PTS (in 1/fps_num ticks) to FLV-style milliseconds.
-    // Using the encoder's per-frame PTS — instead of replaying the source
-    // `ts_ms` for every output frame in this batch — keeps DTS strictly
-    // monotonic when the decoder drains several queued frames at once
-    // (which is the common path on the very first non-IDR access units).
-    let fps_num = active.fps_num.max(1);
-    let fps_den = active.fps_den.max(1);
-    for (annex_b_encoded, keyframe, enc_pts) in encoded {
-        let frame_ts_ms = (enc_pts.max(0) as u64 * 1000 * fps_den as u64 / fps_num as u64) as u32;
+    // FLV timestamps come from the SOURCE clock, popped one per emitted frame
+    // from the FIFO the decode loop filled. The previous form derived them from
+    // the encoder's frame index and the *declared* rate, so video ran on the
+    // configured fps while transcoded audio ran on the source clock — the two
+    // diverged at the rate ratio, unbounded and with no resync.
+    //
+    // Monotonicity, which the old form got for free, is preserved by
+    // `next_wire_pts_90k`: DTS is forced strictly increasing (RTMP servers drop
+    // a publisher whose DTS goes backwards) and forced not to leap, so a source
+    // discontinuity does not split video away from an audio timeline that
+    // cannot follow it.
+    let step = active.nominal_step_90k.max(1);
+    for (annex_b_encoded, keyframe, _enc_pts) in encoded {
+        let wire_pts = next_wire_pts_90k(
+            &mut active.src_pts_queue,
+            active.last_wire_pts_90k,
+            step,
+        );
+        active.last_wire_pts_90k = Some(wire_pts);
+        // Anchor the shared FLV epoch if this is the first essence to arrive.
+        let base = *base_pts.get_or_insert(wire_pts);
+        let frame_ts_ms = rel_ms_monotonic(wire_pts, base);
         // Send the sequence header once, then re-send on each subsequent
         // keyframe (mirrors the passthrough policy — some servers require
         // the ASC before they start demuxing).
@@ -1975,6 +2110,9 @@ async fn emit_silence_if_needed(
     encoder_state: &mut EncoderState,
     sent_audio_header: &mut bool,
     stats: &Arc<OutputStatsAccumulator>,
+    // Taken by value, deliberately: silence must never *anchor* the shared
+    // epoch, only read it.
+    base_pts: Option<u64>,
 ) -> anyhow::Result<()> {
     let EncoderState::Active {
         encoder,
@@ -1982,6 +2120,19 @@ async fn emit_silence_if_needed(
         ..
     } = encoder_state
     else {
+        return Ok(());
+    };
+
+    // Wait for a real essence to anchor the epoch. Until one has, there is
+    // nothing for silence to be in sync with, and emitting is worse than
+    // waiting: the generator starts at 0 and the audio encoder latches its
+    // anchor from the first submission, so a chunk sent now would pin the
+    // whole audio timeline to 0 while video lands on the source clock. The
+    // cost is that an output connecting before any essence arrives emits no
+    // audio tag until the first access unit, where it used to emit silence
+    // from t≈0 — the right trade, since a video-only opening is universally
+    // tolerated and a split A/V timeline is not.
+    let Some(base) = base_pts else {
         return Ok(());
     };
 
@@ -2020,7 +2171,7 @@ async fn emit_silence_if_needed(
     for frame in encoder.drain() {
         let tag = build_aac_raw_tag(&frame.data);
         let tag_len = tag.len();
-        let frame_ts_ms = (frame.pts / 90) as u32;
+        let frame_ts_ms = rel_ms_monotonic(frame.pts, base);
         client.send_audio(&tag, frame_ts_ms).await?;
         stats.packets_sent.fetch_add(1, Ordering::Relaxed);
         stats.bytes_sent.fetch_add(tag_len as u64, Ordering::Relaxed);
@@ -2379,6 +2530,115 @@ fn rtmp_output_event(
         flow_id: Some(flow_id.to_string()),
         input_id: None,
         output_id: Some(config.id.clone()),
+    }
+}
+
+#[cfg(test)]
+mod flv_timestamp_tests {
+    use super::*;
+    use std::collections::VecDeque;
+
+    const STEP_25FPS: u64 = 3600; // 90_000 / 25
+
+    /// The defect: FLV video timestamps came from the encoder's output frame
+    /// index times the *declared* rate, while transcoded audio came from the
+    /// source clock. On a 25 fps source at the 30/1 default the two diverged
+    /// by 166.7 ms per second of playout, unbounded.
+    #[test]
+    fn wire_pts_tracks_the_source_not_the_declared_rate() {
+        let mut q: VecDeque<u64> = (0..5).map(|i| 1_000_000 + i * STEP_25FPS).collect();
+        let mut last = None;
+        let mut out = Vec::new();
+        for _ in 0..5 {
+            let p = next_wire_pts_90k(&mut q, last, 3000 /* 30 fps step */);
+            last = Some(p);
+            out.push(p);
+        }
+        // Spacing follows the source's 25 fps, not the declared 30 fps.
+        for w in out.windows(2) {
+            assert_eq!(w[1] - w[0], STEP_25FPS);
+        }
+    }
+
+    #[test]
+    fn wire_pts_is_strictly_increasing_across_a_batch_drain() {
+        // A decoder draining several frames at once must still yield distinct
+        // increasing stamps — the property the old frame counter guaranteed.
+        let mut q: VecDeque<u64> = VecDeque::from(vec![9_000, 12_600, 16_200]);
+        let mut last = None;
+        let mut prev = 0u64;
+        for i in 0..3 {
+            let p = next_wire_pts_90k(&mut q, last, STEP_25FPS);
+            if i > 0 {
+                assert!(p > prev, "DTS must not stall or go backwards");
+            }
+            prev = p;
+            last = Some(p);
+        }
+    }
+
+    #[test]
+    fn a_backwards_source_pts_substitutes_one_step() {
+        let mut q: VecDeque<u64> = VecDeque::from(vec![100_000, 50_000]);
+        let first = next_wire_pts_90k(&mut q, None, STEP_25FPS);
+        let second = next_wire_pts_90k(&mut q, Some(first), STEP_25FPS);
+        assert_eq!(second, first + STEP_25FPS, "never emit a backwards DTS");
+    }
+
+    /// The audio timeline anchors once and free-runs on a sample count, so it
+    /// cannot follow a forward source jump. Letting video jump while audio
+    /// cannot is exactly the A/V split this fix closes, so a leap is clamped
+    /// to one nominal step in both directions.
+    #[test]
+    fn a_forward_source_leap_is_clamped_to_one_step() {
+        let mut q: VecDeque<u64> = VecDeque::from(vec![0, 90_000 * 60]);
+        let first = next_wire_pts_90k(&mut q, None, STEP_25FPS);
+        let second = next_wire_pts_90k(&mut q, Some(first), STEP_25FPS);
+        assert_eq!(second, first + STEP_25FPS, "a 60s leap must not split A/V");
+    }
+
+    #[test]
+    fn a_gap_within_tolerance_is_honoured() {
+        // A real one-second gap is under the 2s threshold and passes through.
+        let mut q: VecDeque<u64> = VecDeque::from(vec![0, 90_000]);
+        let first = next_wire_pts_90k(&mut q, None, STEP_25FPS);
+        let second = next_wire_pts_90k(&mut q, Some(first), STEP_25FPS);
+        assert_eq!(second, 90_000);
+    }
+
+    /// Audio and video share one epoch, so equal source instants produce equal
+    /// FLV timestamps. Before the fix, audio used the raw absolute source PTS
+    /// while video started at 0 — on a feed from an upstream bilbycast edge
+    /// (whose rewriter anchors on the master clock) that put audio tags up to
+    /// ~26.5 h ahead of video.
+    #[test]
+    fn audio_and_video_share_one_epoch() {
+        let epoch = 4_000_000_000u64; // a large, realistic source PTS
+        let one_second_later = epoch + 90_000;
+        assert_eq!(rel_ms_monotonic(epoch, epoch), 0);
+        assert_eq!(rel_ms_monotonic(one_second_later, epoch), 1000);
+    }
+
+    /// A monotonic timeline must not have a wrap heuristic applied — doing so
+    /// caps it at 2^33 ticks (~26.5 h) and then pins every later tag to 0.
+    #[test]
+    fn a_monotonic_timeline_does_not_wrap_at_33_bits() {
+        let base = 0u64;
+        let past_33_bits = (1u64 << 33) + 90_000;
+        assert!(rel_ms_monotonic(past_33_bits, base) > 95_000_000);
+    }
+
+    #[test]
+    fn a_value_behind_the_epoch_clamps_to_zero() {
+        assert_eq!(rel_ms_monotonic(500, 90_000), 0);
+    }
+
+    /// The raw-source helper keeps its wrap heuristic — a 33-bit PTS really
+    /// does wrap, and a value that appears to be far in the future is a wrap.
+    #[test]
+    fn a_wrapped_raw_source_pts_clamps_to_zero() {
+        assert_eq!(rel_ms_wrapping(0, 90_000), 0, "one frame behind reads as a wrap");
+        assert_eq!(rel_ms_wrapping(180_000, 90_000), 1000);
     }
 }
 
