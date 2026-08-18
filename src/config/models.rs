@@ -1733,6 +1733,23 @@ pub enum InputConfig {
     /// the problem is upstream of the edge), and idle fill.
     #[serde(rename = "test_pattern")]
     TestPattern(TestPatternInputConfig),
+    /// Mosaic compositor: composite N node-local inputs into one canvas
+    /// and publish it as a fresh MPEG-TS feed — the multiviewer wall's
+    /// stream head.
+    ///
+    /// Unlike every other input type this one **consumes other inputs on
+    /// the same node**. A tile's source is a node-local input id, and it
+    /// makes no difference to the compositor whether that input is a
+    /// full-resolution local SDI feed or a small proxy arriving over SRT
+    /// from somewhere else — which is what lets proxies be added later
+    /// without touching the compositor.
+    ///
+    /// Behind the off-by-default `multiviewer` Cargo feature: a wall is a
+    /// deployment choice, and compositing is the most expensive thing this
+    /// binary does. See the feature's own note in `Cargo.toml`.
+    #[cfg(feature = "multiviewer")]
+    #[serde(rename = "mosaic")]
+    Mosaic(MosaicInputConfig),
     /// File-based media player: replays a local `.ts` / `.mp4` / `.mov` /
     /// image asset (single file or sequential playlist) as a
     /// fresh MPEG-TS feed onto the flow broadcast channel. Used as a
@@ -1905,6 +1922,85 @@ pub enum TestPatternChannelIdentLayout {
     /// whenever you listen to it alone); a cacophony on a downmix. This was
     /// the original behaviour before the sequential layout was added.
     Simultaneous,
+}
+
+/// One tile of a mosaic wall.
+#[cfg(feature = "multiviewer")]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MosaicTileConfig {
+    /// Stable identity, minted by whoever authored the layout.
+    ///
+    /// Routing keys on this rather than on a display name, so renaming a
+    /// tile cannot silently re-point a signal. Same rule the visual
+    /// editor's layout table follows.
+    pub id: String,
+    /// The node-local input id feeding this tile. `None` renders the
+    /// tile as UNASSIGNED rather than leaving a hole in the canvas.
+    #[serde(default)]
+    pub source_input_id: Option<String>,
+    pub x: u32,
+    pub y: u32,
+    pub width: u32,
+    pub height: u32,
+    /// Paint order; higher is drawn later, therefore on top. Overlap is
+    /// legal — it is how a picture-in-picture is built.
+    #[serde(default)]
+    pub z: i32,
+    /// Operator-facing label burned into the tile. Empty = no label.
+    #[serde(default)]
+    pub label: String,
+}
+
+/// Mosaic compositor input — the multiviewer wall's stream head.
+#[cfg(feature = "multiviewer")]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MosaicInputConfig {
+    /// Canvas width in pixels. Default 1920.
+    #[serde(default = "default_mosaic_width")]
+    pub width: u32,
+    /// Canvas height in pixels. Default 1080.
+    #[serde(default = "default_mosaic_height")]
+    pub height: u32,
+    /// Canvas frame rate. Default 25.
+    ///
+    /// This is the wall's own cadence and is deliberately independent of
+    /// any source's rate: tiles arrive at whatever rate their sources
+    /// run, and the compositor samples the newest frame of each at every
+    /// canvas tick. A tile slower than the canvas repeats; a tile faster
+    /// is decimated. Neither is an error, and neither may stall the
+    /// canvas.
+    #[serde(default = "default_mosaic_fps")]
+    pub fps: u16,
+    /// Target bitrate for the composited stream, kbit/s. Default 8000.
+    #[serde(default = "default_mosaic_bitrate")]
+    pub video_bitrate_kbps: u32,
+    /// Which encoder to use. Accepts the same names as an output's
+    /// `video_encode.codec` — `h264_auto`, `x264`, `h264_nvenc`, …
+    #[serde(default = "default_mosaic_codec")]
+    pub codec: String,
+    /// The tiles. At least one.
+    pub tiles: Vec<MosaicTileConfig>,
+}
+
+#[cfg(feature = "multiviewer")]
+fn default_mosaic_width() -> u32 {
+    1920
+}
+#[cfg(feature = "multiviewer")]
+fn default_mosaic_height() -> u32 {
+    1080
+}
+#[cfg(feature = "multiviewer")]
+fn default_mosaic_fps() -> u16 {
+    25
+}
+#[cfg(feature = "multiviewer")]
+fn default_mosaic_bitrate() -> u32 {
+    8000
+}
+#[cfg(feature = "multiviewer")]
+fn default_mosaic_codec() -> String {
+    "h264_auto".into()
 }
 
 /// Configuration for an in-process synthetic test-pattern input.
@@ -2278,6 +2374,8 @@ impl InputConfig {
             InputConfig::RtpAudio(_) => "rtp_audio",
             InputConfig::Bonded(_) => "bonded",
             InputConfig::TestPattern(_) => "test_pattern",
+            #[cfg(feature = "multiviewer")]
+            InputConfig::Mosaic(_) => "mosaic",
             InputConfig::MediaPlayer(_) => "media_player",
             InputConfig::Replay(_) => "replay",
             InputConfig::MxlVideo(_) => "mxl_video",
@@ -2297,6 +2395,10 @@ impl InputConfig {
     /// the analyzer on them log-spams "sync lost" warnings forever.
     pub fn is_ts_carrier(&self) -> bool {
         match self {
+            // The compositor muxes its canvas into MPEG-TS, so a mosaic is a
+            // TS carrier exactly like the other synthetic producers.
+            #[cfg(feature = "multiviewer")]
+            InputConfig::Mosaic(_) => true,
             InputConfig::Rtp(_)
             | InputConfig::Udp(_)
             | InputConfig::Srt(_)

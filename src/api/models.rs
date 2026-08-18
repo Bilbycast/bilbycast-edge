@@ -102,6 +102,8 @@ impl FlowSummary {
             // more than one path is configured.
             Some(InputConfig::Bonded(c)) => ("bonded", c.paths.len() > 1),
             Some(InputConfig::TestPattern(_)) => ("test_pattern", false),
+            #[cfg(feature = "multiviewer")]
+            Some(InputConfig::Mosaic(_)) => ("mosaic", false),
             Some(InputConfig::MediaPlayer(_)) => ("media_player", false),
             Some(InputConfig::Replay(_)) => ("replay", false),
             // MXL is same-host shared memory — no transport-level

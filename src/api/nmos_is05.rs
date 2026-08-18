@@ -961,6 +961,10 @@ fn active_receiver_params(
         InputConfig::Bonded(_) => TransportParamSet::default(),
         // Synthetic input — no transport parameters to report.
         InputConfig::TestPattern(_) => TransportParamSet::default(),
+        // A mosaic has no transport of its own — its sources are other
+        // inputs on this node.
+        #[cfg(feature = "multiviewer")]
+        InputConfig::Mosaic(_) => TransportParamSet::default(),
         // Media player reads from local disk — no network transport.
         InputConfig::MediaPlayer(_) => TransportParamSet::default(),
         // Replay reads from the local replay store — no network transport.

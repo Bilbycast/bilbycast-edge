@@ -440,6 +440,31 @@ video-encoders-full = [
     "video-decoder-qsv",
     "video-decoder-vaapi",
 ]
+# Distributed multiviewer — the mosaic compositor and its stream head.
+#
+# **Off by default and deliberately so**, on the same reasoning as the
+# encoder features it depends on. A multiviewer wall is a specific
+# deployment choice, not something every contribution node should carry:
+# a head composites N decoded tiles into a canvas every frame, which is
+# the most expensive thing this binary can be asked to do, and it is
+# pure cost on a node that will never run a wall.
+#
+# It also cannot work without one: the composite reaches SRT / RTP / UDP
+# / WebRTC / CMAF by being **encoded and muxed onto the flow's MPEG-TS
+# bus**, so a build with no video encoder has nothing to publish. That
+# is not a theory — a default `cargo build` resolves every encoder
+# backend to `FeatureDisabled`. The feature therefore requires
+# `media-codecs` for tile decode and leaves the choice of encoder to the
+# operator, exactly as transcoding does; `engine::mosaic` refuses to
+# start with a named reason when none was compiled in, rather than
+# failing obscurely at the first frame.
+#
+# Enable it alongside whichever encoder suits the host, e.g.
+#   cargo build --features "multiviewer,video-encoder-x264"   (GPL v2+)
+#   cargo build --features "multiviewer,video-encoder-nvenc"  (LGPL-clean)
+# The `*-full` release artefacts carry `video-encoders-full`, so adding
+# `multiviewer` there needs no further encoder choice.
+multiviewer = ["media-codecs"]
 # Local-display output — decode the flow's video + audio and render to a
 # Linux KMS connector (HDMI / DisplayPort) plus an ALSA audio device.
 # Linux-only (the optional `drm` / `alsa` deps are target-gated below).

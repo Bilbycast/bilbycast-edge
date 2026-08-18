@@ -56,6 +56,9 @@ pub mod flow;
 /// the `resource_budget` block on the manager `HealthPayload`. One-shot
 /// probe at startup, no async / no I/O. See [`hardware_probe`].
 pub mod hardware_probe;
+#[cfg(feature = "multiviewer")]
+pub mod input_mosaic;
+pub mod mosaic;
 pub mod input_bonded;
 /// File-backed media-player input — TS / MP4 / image fallback source.
 /// See [`crate::config::models::MediaPlayerInputConfig`] for the config

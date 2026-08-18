@@ -3656,6 +3656,11 @@ fn spawn_sdi_unavailable(
 }
 
 #[allow(clippy::too_many_arguments)]
+// `flow_manager` is consumed only by the mosaic arm, which is behind the
+// off-by-default `multiviewer` feature. Naming it `_flow_manager` would be
+// worse: the parameter is genuinely used in the configuration that matters, and
+// an underscore would invite the next reader to delete it.
+#[cfg_attr(not(feature = "multiviewer"), allow(unused_variables))]
 fn spawn_single_input(
     input_def: &InputDefinition,
     flow_id: &str,
@@ -3670,11 +3675,29 @@ fn spawn_single_input(
     #[cfg(feature = "replay")]
     replay_command_txs: &dashmap::DashMap<String, tokio::sync::mpsc::Sender<crate::replay::ReplayCommand>>,
     media_player_command_txs: &dashmap::DashMap<String, tokio::sync::mpsc::Sender<crate::engine::input_media_player::controller::MediaPlayerCommand>>,
+    // The node's flow manager. Threaded in for the mosaic compositor, which is
+    // the first input type that **consumes other inputs on this node** — it
+    // needs `FlowManager::subscribe_input` to reach each tile's source. Every
+    // other variant ignores it. `InputSpawnContext` already held the handle; it
+    // simply was not being passed down, which is why nothing could consume an
+    // input before now.
+    flow_manager: &Arc<crate::engine::manager::FlowManager>,
 ) -> (JoinHandle<()>, Option<WhipSessionInfo>) {
     let input_id = input_def.id.clone();
     let mut whip_info: Option<WhipSessionInfo> = None;
 
     let handle = match &input_def.config {
+        #[cfg(feature = "multiviewer")]
+        InputConfig::Mosaic(mosaic_config) => crate::engine::input_mosaic::spawn_mosaic_input(
+            mosaic_config.clone(),
+            per_input_tx.clone(),
+            flow_stats.clone(),
+            input_cancel.clone(),
+            event_sender.clone(),
+            flow_id.to_string(),
+            input_id.clone(),
+            Arc::clone(flow_manager),
+        ),
         InputConfig::Rtp(rtp_config) => spawn_rtp_input(
             rtp_config.clone(), per_input_tx.clone(), flow_stats.clone(),
             input_cancel.clone(), event_sender.clone(), flow_id.to_string(),
@@ -4046,6 +4069,7 @@ pub(crate) fn spawn_input_runtime(
         #[cfg(feature = "replay")]
         ctx.replay_command_txs,
         ctx.media_player_command_txs,
+        ctx.flow_manager,
     );
 
     if input_def.config.is_ts_carrier() {
@@ -4146,6 +4170,15 @@ struct MediaAnalysisMeta {
 /// Classify an input for media-analysis accumulator construction.
 fn media_analysis_metadata(input: &InputConfig) -> MediaAnalysisMeta {
     match input {
+        #[cfg(feature = "multiviewer")]
+        InputConfig::Mosaic(_) => MediaAnalysisMeta {
+            protocol: "mosaic".to_string(),
+            payload_format: "mpegts".to_string(),
+            fec_enabled: false,
+            fec_type: None,
+            redundancy_enabled: false,
+            redundancy_type: None,
+        },
         InputConfig::Rtp(rtp) => {
             let (fec_enabled, fec_type) = rtp
                 .fec_decode
@@ -4318,6 +4351,8 @@ fn media_analysis_metadata(input: &InputConfig) -> MediaAnalysisMeta {
 /// with the equivalent active-input lookup at flow startup.
 fn input_type_str(input: &InputConfig) -> &'static str {
     match input {
+        #[cfg(feature = "multiviewer")]
+        InputConfig::Mosaic(_) => "mosaic",
         InputConfig::Rtp(_) => "rtp",
         InputConfig::Udp(_) => "udp",
         InputConfig::Srt(_) => "srt",
@@ -4393,6 +4428,13 @@ fn derive_audio_full_mode(
 fn build_input_config_meta(input: &InputConfig) -> crate::stats::collector::InputConfigMeta {
     use crate::stats::collector::InputConfigMeta;
     match input {
+        // A mosaic has no transport addresses of its own to report.
+        #[cfg(feature = "multiviewer")]
+        InputConfig::Mosaic(_) => InputConfigMeta {
+            mode: None, local_addr: None, remote_addr: None,
+            listen_addr: None, bind_addr: None,
+            rtsp_url: None, whep_url: None,
+        },
         InputConfig::Rtp(c) => InputConfigMeta {
             mode: None, local_addr: None, remote_addr: None,
             listen_addr: None, bind_addr: Some(c.bind_addr.clone()),
@@ -6086,6 +6128,11 @@ fn derive_cost_plan(flow: &ResolvedFlow) -> crate::engine::hardware_probe::FlowC
         inp: &crate::config::models::InputDefinition,
     ) -> Option<&crate::config::models::VideoEncodeConfig> {
         match &inp.config {
+            // The compositor owns its encoder directly rather than through a
+            // `video_encode` block, so there is nothing to return here — its
+            // cost is charged by the mosaic arm of the cost model instead.
+            #[cfg(feature = "multiviewer")]
+            InputConfig::Mosaic(_) => None,
             InputConfig::Srt(c) => c.video_encode.as_ref(),
             InputConfig::Udp(c) => c.video_encode.as_ref(),
             InputConfig::Rtp(c) => c.video_encode.as_ref(),
@@ -6680,6 +6727,8 @@ fn input_encode_blocks(
 ) -> (Option<&crate::config::models::AudioEncodeConfig>, Option<&str>) {
     use crate::config::models::InputConfig::*;
     match &inp.config {
+        #[cfg(feature = "multiviewer")]
+        Mosaic(c) => (None, Some(c.codec.as_str())),
         Srt(c) => (
             c.audio_encode.as_ref(),
             c.video_encode.as_ref().map(|v| v.codec.as_str()),

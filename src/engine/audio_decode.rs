@@ -250,6 +250,10 @@ pub fn input_can_carry_ts_audio(input: &crate::config::models::InputConfig) -> b
         // SDI muxes captured embedded audio into the TS audio PID as AAC
         // in ADTS (stream_type 0x0F), and audio capture is on by default.
         | InputConfig::Sdi(_) => true,
+        // A mosaic muxes its own AAC alongside the composited video, so it
+        // carries decodable audio exactly as the other synthetic producers do.
+        #[cfg(feature = "multiviewer")]
+        InputConfig::Mosaic(_) => true,
         // WebRTC audio is always Opus, carried as stream_type 0x06 + an
         // "Opus" registration descriptor — never AAC. The bridge decodes
         // AAC only and drops every other elementary stream, so claiming

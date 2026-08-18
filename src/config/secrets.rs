@@ -400,6 +400,9 @@ impl SecretsConfig {
             InputConfig::Bonded(_) => {}
             // Synthetic input has no secrets.
             InputConfig::TestPattern(_) => {}
+            // No credentials: a mosaic dials nothing.
+            #[cfg(feature = "multiviewer")]
+            InputConfig::Mosaic(_) => {}
             // Media player reads files off local disk; the filenames
             // are operational config, not secrets.
             InputConfig::MediaPlayer(_) => {}

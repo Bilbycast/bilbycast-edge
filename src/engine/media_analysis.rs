@@ -64,6 +64,11 @@ pub fn spawn_media_analyzer(
 /// Extract transport-level information from an input configuration.
 fn populate_transport_info(input: &InputConfig, state: &mut MediaAnalysisState) {
     match input {
+        #[cfg(feature = "multiviewer")]
+        InputConfig::Mosaic(_) => {
+            state.protocol = "mosaic".to_string();
+            state.payload_format = "mpegts".to_string();
+        }
         InputConfig::Rtp(rtp) => {
             state.protocol = "rtp".to_string();
             state.payload_format = "rtp_ts".to_string();

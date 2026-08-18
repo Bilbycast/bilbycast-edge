@@ -1477,6 +1477,22 @@ fn edge_capabilities() -> Vec<&'static str> {
     if cfg!(feature = "tls") {
         caps.push("tls");
     }
+    // Mosaic compositor (multiviewer stream head). Advertised only when the
+    // `multiviewer` feature is compiled in **and** a video encoder is, because
+    // a wall that cannot encode its canvas has nothing to publish — the flow
+    // bus carries MPEG-TS, so a composite reaches an output by being encoded
+    // and muxed, never by being handed over.
+    //
+    // Gating on both is what stops the manager offering a wall on a node that
+    // would refuse it at start. An edge advertising the bit can run one; an
+    // edge without it hides the surface entirely, which is the same contract
+    // `display` and `sdi-decklink` follow.
+    #[cfg(feature = "multiviewer")]
+    {
+        if crate::engine::input_test_pattern::select_video_backend().is_some() {
+            caps.push("mv-compositor");
+        }
+    }
     // Local-display output. Advertised only when (a) the `display`
     // Cargo feature is on, AND (b) the host actually has at least one
     // KMS connector enumerated (so headless build servers don't see

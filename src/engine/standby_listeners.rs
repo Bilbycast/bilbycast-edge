@@ -203,6 +203,9 @@ fn is_passive_listener(config: &InputConfig) -> bool {
         InputConfig::Bonded(_) => false,
         // Synthetic input — never listens on a socket.
         InputConfig::TestPattern(_) => false,
+        // Nothing to pre-warm: a mosaic binds no listener.
+        #[cfg(feature = "multiviewer")]
+        InputConfig::Mosaic(_) => false,
         // Media player reads from local disk — no socket.
         InputConfig::MediaPlayer(_) => false,
         // Replay reads from the local replay store — no socket.

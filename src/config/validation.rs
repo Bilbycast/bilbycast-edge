@@ -881,6 +881,10 @@ fn validate_input_interface_bindings(input_id: &str, cfg: &InputConfig) -> Resul
 /// exist (none today, but the helper is forward-compatible).
 fn input_pid_overrides(input: &InputConfig) -> Option<&crate::config::models::TsPidOverridesMap> {
     match input {
+        // A mosaic synthesises its own SPTS and exposes none of these
+        // ingress knobs — its per-tile handling is in the compositor.
+        #[cfg(feature = "multiviewer")]
+        InputConfig::Mosaic(_) => None,
         InputConfig::Rtp(c) => c.pid_overrides.as_ref(),
         InputConfig::Udp(c) => c.pid_overrides.as_ref(),
         InputConfig::Srt(c) => c.pid_overrides.as_ref(),
@@ -916,6 +920,10 @@ fn input_pid_overrides(input: &InputConfig) -> Option<&crate::config::models::Ts
 /// input config variant. None for variants without the field.
 fn input_program_number(input: &InputConfig) -> Option<u16> {
     match input {
+        // A mosaic synthesises its own SPTS and exposes none of these
+        // ingress knobs — its per-tile handling is in the compositor.
+        #[cfg(feature = "multiviewer")]
+        InputConfig::Mosaic(_) => None,
         InputConfig::Rtp(c) => c.program_number,
         InputConfig::Udp(c) => c.program_number,
         InputConfig::Srt(c) => c.program_number,
@@ -948,6 +956,10 @@ fn input_program_number(input: &InputConfig) -> Option<u16> {
 /// variant. None for variants without the field.
 fn input_pid_map(input: &InputConfig) -> Option<&std::collections::BTreeMap<u16, u16>> {
     match input {
+        // A mosaic synthesises its own SPTS and exposes none of these
+        // ingress knobs — its per-tile handling is in the compositor.
+        #[cfg(feature = "multiviewer")]
+        InputConfig::Mosaic(_) => None,
         InputConfig::Rtp(c) => c.pid_map.as_ref(),
         InputConfig::Udp(c) => c.pid_map.as_ref(),
         InputConfig::Srt(c) => c.pid_map.as_ref(),
@@ -976,6 +988,10 @@ fn input_pid_map(input: &InputConfig) -> Option<&std::collections::BTreeMap<u16,
 /// Pull `audio_encode` from any input that supports it.
 fn input_audio_encode(input: &InputConfig) -> Option<&crate::config::models::AudioEncodeConfig> {
     match input {
+        // A mosaic synthesises its own SPTS and exposes none of these
+        // ingress knobs — its per-tile handling is in the compositor.
+        #[cfg(feature = "multiviewer")]
+        InputConfig::Mosaic(_) => None,
         InputConfig::Rtp(c) => c.audio_encode.as_ref(),
         InputConfig::Udp(c) => c.audio_encode.as_ref(),
         InputConfig::Srt(c) => c.audio_encode.as_ref(),
@@ -1003,6 +1019,10 @@ fn input_audio_encode(input: &InputConfig) -> Option<&crate::config::models::Aud
 /// Pull `video_encode` from any input that supports it.
 fn input_video_encode(input: &InputConfig) -> Option<&crate::config::models::VideoEncodeConfig> {
     match input {
+        // A mosaic synthesises its own SPTS and exposes none of these
+        // ingress knobs — its per-tile handling is in the compositor.
+        #[cfg(feature = "multiviewer")]
+        InputConfig::Mosaic(_) => None,
         InputConfig::Rtp(c) => c.video_encode.as_ref(),
         InputConfig::Udp(c) => c.video_encode.as_ref(),
         InputConfig::Srt(c) => c.video_encode.as_ref(),
@@ -1127,6 +1147,9 @@ fn check_multi_program_transcode_combo(
 /// MPTS files (MediaPlayer/Replay) return `false`.
 fn input_is_synthetic_ts(input: &InputConfig) -> bool {
     match input {
+        // Wrapped in TsMuxer, always SPTS program 1 — same as a test pattern.
+        #[cfg(feature = "multiviewer")]
+        InputConfig::Mosaic(_) => true,
         // Wrapped in TsMuxer at ingress — always SPTS, program 1.
         InputConfig::Rtmp(_)
         | InputConfig::Rtsp(_)
@@ -1482,6 +1505,8 @@ fn validate_input(input: &InputConfig) -> Result<()> {
         InputConfig::RtpAudio(c) => validate_rtp_audio_input(c)?,
         InputConfig::Bonded(c) => validate_bonded_input(c)?,
         InputConfig::TestPattern(c) => validate_test_pattern_input(c)?,
+        #[cfg(feature = "multiviewer")]
+        InputConfig::Mosaic(c) => validate_mosaic_input(c)?,
         InputConfig::MediaPlayer(c) => validate_media_player_input(c)?,
         InputConfig::Replay(c) => validate_replay_input(c)?,
         InputConfig::MxlVideo(c) => validate_mxl_video_input(c)?,
@@ -1579,6 +1604,82 @@ fn validate_recording_config(
 }
 
 /// Validate a synthetic test-pattern input. All fields have sensible
+/// Validate a mosaic (multiviewer wall) input.
+///
+/// The geometry rules live in [`crate::engine::mosaic`] and are shared with the
+/// compositor itself, so an operator is refused here for exactly the reasons
+/// the renderer would refuse them at run time — rather than the two drifting
+/// apart and a wall being accepted that cannot be drawn.
+#[cfg(feature = "multiviewer")]
+fn validate_mosaic_input(cfg: &crate::config::models::MosaicInputConfig) -> Result<()> {
+    use crate::engine::mosaic::{Canvas, MosaicLayout, Tile, TileLiveness, TileRect};
+
+    if !(1..=60).contains(&cfg.fps) {
+        return Err(anyhow::anyhow!("mosaic: fps must be in 1..=60 (got {})", cfg.fps));
+    }
+    if !(100..=200_000).contains(&cfg.video_bitrate_kbps) {
+        return Err(anyhow::anyhow!(
+            "mosaic: video_bitrate_kbps must be in 100..=200000 (got {})",
+            cfg.video_bitrate_kbps
+        ));
+    }
+    // Every 4:2:0 encoder needs even dimensions; refusing here beats an opaque
+    // `avcodec_open2` failure at the first frame.
+    if !cfg.width.is_multiple_of(2) || !cfg.height.is_multiple_of(2) {
+        return Err(anyhow::anyhow!(
+            "mosaic: canvas width and height must both be even (got {}x{})",
+            cfg.width,
+            cfg.height
+        ));
+    }
+    if cfg.codec.len() > 64 {
+        return Err(anyhow::anyhow!("mosaic: codec name is too long"));
+    }
+
+    for tile in &cfg.tiles {
+        if tile.id.is_empty() || tile.id.len() > 64 {
+            return Err(anyhow::anyhow!(
+                "mosaic: tile id must be 1..=64 characters (got {:?})",
+                tile.id
+            ));
+        }
+        if tile.label.len() > 64 {
+            return Err(anyhow::anyhow!("mosaic: tile '{}' label is too long", tile.id));
+        }
+        if let Some(ref src) = tile.source_input_id
+            && (src.is_empty() || src.len() > 64)
+        {
+            return Err(anyhow::anyhow!(
+                "mosaic: tile '{}' source_input_id must be 1..=64 characters",
+                tile.id
+            ));
+        }
+    }
+
+    // Hand the geometry to the renderer's own validator. Liveness is
+    // irrelevant to a geometric check, so every tile is built assigned — the
+    // shape is what is being checked, not the routing.
+    let layout = MosaicLayout {
+        canvas: Canvas::new(cfg.width, cfg.height),
+        tiles: cfg
+            .tiles
+            .iter()
+            .map(|t| Tile {
+                id: t.id.clone(),
+                rect: TileRect::new(t.x, t.y, t.width, t.height),
+                z: t.z,
+                source_input_id: t.source_input_id.clone(),
+                liveness: TileLiveness::assigned(),
+            })
+            .collect(),
+    };
+    layout
+        .validate()
+        .map_err(|e| anyhow::anyhow!("mosaic: {e}"))?;
+
+    Ok(())
+}
+
 /// defaults; this is the sanity-bound check.
 fn validate_test_pattern_input(c: &crate::config::models::TestPatternInputConfig) -> Result<()> {
     if c.width < 64 || c.width > 7680 || !c.width.is_multiple_of(2) {
@@ -8039,6 +8140,10 @@ fn validate_port_conflicts(config: &AppConfig) -> Result<()> {
     for input in &config.inputs {
         let label_prefix = format!("Input '{}' [{}]", input.name, input.id);
         match &input.config {
+            // Binds no socket — its sources are other inputs on this node, and
+            // each of those registers its own bind.
+            #[cfg(feature = "multiviewer")]
+            InputConfig::Mosaic(_) => {}
             InputConfig::Rtp(cfg) => {
                 register(&cfg.bind_addr, Proto::Udp, format!("{label_prefix} (RTP)"))?;
                 if let Some(ref red) = cfg.redundancy {

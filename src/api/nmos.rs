@@ -136,6 +136,8 @@ fn input_transport(input: &InputConfig) -> &'static str {
         // Synthetic input — advertise as generic RTP so NMOS controllers
         // see the flow; there is no real network transport.
         InputConfig::TestPattern(_) => "urn:x-nmos:transport:rtp",
+        #[cfg(feature = "multiviewer")]
+        InputConfig::Mosaic(_) => "urn:x-nmos:transport:rtp",
         // Media player synthesises MPEG-TS from local files; advertise
         // as generic RTP for NMOS surface compatibility.
         InputConfig::MediaPlayer(_) => "urn:x-nmos:transport:rtp",
@@ -320,6 +322,8 @@ fn input_type_str(input: &InputConfig) -> &'static str {
         InputConfig::RtpAudio(_) => "rtp_audio",
         InputConfig::Bonded(_) => "bonded",
         InputConfig::TestPattern(_) => "test_pattern",
+        #[cfg(feature = "multiviewer")]
+        InputConfig::Mosaic(_) => "mosaic",
         InputConfig::Sdi(_) => "sdi",
         InputConfig::MediaPlayer(_) => "media_player",
         InputConfig::Replay(_) => "replay",

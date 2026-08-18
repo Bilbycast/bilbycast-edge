@@ -367,6 +367,57 @@ The edge accepts `upgrade_binary` WS commands from the manager and stages a Sigs
 - **Trust model + threat-model**: [`docs/security.md`](docs/security.md). Operator runbook + config reference: [`docs/upgrade.md`](docs/upgrade.md). Operator install bundle (curl-pipe-bash + systemd unit): [`packaging/install-edge.sh`](packaging/install-edge.sh) and [`packaging/bilbycast-edge.service`](packaging/bilbycast-edge.service).
 - **Release pipeline**: [`scripts/build-manifest.sh`](scripts/build-manifest.sh) builds canonical `manifest.json`; the GitHub Actions workflow signs it with `cosign sign-blob --bundle` (Sigstore keyless, no long-lived signing key) and publishes both alongside the tarballs. The same workflow re-runs `cosign verify-blob` against the production identity allowlist before publishing — a typo in the allowlist gets caught here, not in production.
 
+## Multiviewer (mosaic compositor + stream head, `multiviewer` feature)
+
+**Off by default**, like the encoders it depends on. Composites N node-local
+inputs into one canvas and publishes it as a fresh MPEG-TS feed, so a wall is an
+ordinary flow source — it restreams, records, nests and thumbnails with no new
+output code. Full reference: [`docs/multiviewer.md`](docs/multiviewer.md).
+
+- **`multiviewer` implies `media-codecs` and *requires* a `video-encoder-*`
+  feature at runtime.** The flow bus carries MPEG-TS, so a composite reaches an
+  output by being **encoded and muxed**, never handed over — and a default
+  `cargo build` resolves every encoder backend to `FeatureDisabled` (verified,
+  not assumed). A build with `multiviewer` and no encoder compiles and refuses
+  at flow start with a message naming the rebuild. Capability `mv-compositor` is
+  advertised only when both halves are present.
+- **`InputConfig::Mosaic` is the first input type that consumes other inputs.**
+  A tile's source is a node-local input id reached through
+  `FlowManager::subscribe_input`. That handle existed on `InputSpawnContext` but
+  was never passed to `spawn_single_input` — it is now, which is the whole of
+  the "no input consumes another input" gap. The compositor cannot tell a local
+  SDI feed from a proxy over SRT, which is what lets #106 slot underneath later
+  with no rework.
+- **Nothing blocks a media path.** Each tile decodes independently into a
+  `watch` channel (send overwrites, never queues, never blocks, never grows);
+  the compositor takes whatever is there at each canvas tick and never waits;
+  `RecvError::Lagged` is counted and skipped; decode and encode run under
+  `block_in_place`. A wall is a monitoring surface and must never backpressure
+  the feeds it watches.
+- **`engine::mosaic` is pure geometry** — rects, letterbox fit, z-order, badge
+  state — and is compiled unfeatured so the rules stay testable anywhere.
+  `engine::input_mosaic` is the moving parts. Config validation calls the
+  renderer's own validator, so an operator is refused for exactly the reasons
+  the renderer would refuse them.
+- **A stale frame is never presented as live.** A `watch` channel retains its
+  last value forever, so "is there a frame?" stays true after a source dies —
+  arrival is therefore keyed on `has_changed()`, not on a frame being present.
+  Get that wrong and `NO SIGNAL` never appears on a frozen tile. Pinned by a
+  mutation-verified source scan (`the_compositor_only_counts_a_new_frame_as_an_arrival`).
+- **Two measured corrections to the design document**, both in
+  `bilbycast-ffmpeg-video-rs/video-engine/tests/canvas_subrect_blit.rs`: the
+  canvas is **packed BGRA8** (planar destinations are refused), so it costs 4
+  bytes/pixel rather than 1.5 and must be converted to YUV before encoding —
+  but needs no even tile alignment; and the scaler's bounds check demanded
+  `pitch * height` when the true requirement is `(h-1)*pitch + w*4`, which
+  **refused the bottom row of every wall** and made a mosaic impossible on the
+  panel path. Fixed upstream.
+- **Canvas capped at 1920x1080** in phase 1, mirroring `SW_BLIT_MAX_W/H`.
+  A stream head is not bound by that number — it composites into cached sysmem,
+  not a write-combining KMS buffer — but the stream-head shape has not been
+  measured, and shipping an unmeasured UHD path is how the display output earned
+  its own ceiling.
+
 ## Verifying Broadcast Quality
 
 Any change to a transcoding / encoding / transport / playback path is verified against the 12 gates in the root `CLAUDE.md` "Verifying Broadcast Quality" section. Full procedure with commands in [`../testbed/BROADCAST_QUALITY_GATES.md`](../testbed/BROADCAST_QUALITY_GATES.md). PCR_AC sampler is in [`src/stats/pcr_trust.rs`](src/stats/pcr_trust.rs); pull `pcr_trust_flow.p99_us` from `FlowStats` for gate 4. **Wallclock rate** (gate 1) is the gate most commonly mis-tested — never derive output rate from PTS span (tautological — output PTSes are built from the encoder's frame_size, so `pes_count / (last_pts - first_pts)` always reports the theoretical frame rate even when audio is emitting at half realtime).

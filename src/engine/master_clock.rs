@@ -1383,6 +1383,12 @@ pub fn clock_identity_for_input(
         | InputConfig::Bonded(_) => ClockIdentity::SourcePcr {
             input_id: input.id.clone(),
         },
+        // A mosaic synthesises its own timeline from the canvas cadence, so
+        // it is its own clock source — same shape as a test pattern.
+        #[cfg(feature = "multiviewer")]
+        InputConfig::Mosaic(_) => ClockIdentity::SourcePcr {
+            input_id: input.id.clone(),
+        },
         // PTP family — identity is the configured grandmaster domain.
         InputConfig::St2110_20(c) => ClockIdentity::Ptp { domain: c.clock_domain.unwrap_or(0) },
         InputConfig::St2110_23(c) => ClockIdentity::Ptp { domain: c.clock_domain.unwrap_or(0) },
@@ -1538,6 +1544,9 @@ pub fn select_master_kind_for_input(
         | InputConfig::RtpAudio(_)
         | InputConfig::Bonded(_)
         | InputConfig::Sdi(_) => MasterClockKind::Wallclock,
+        // Wallclock: a composited canvas has no upstream clock to recover.
+        #[cfg(feature = "multiviewer")]
+        InputConfig::Mosaic(_) => MasterClockKind::Wallclock,
         // ST 2110 + WebRTC handled above; arms here are for completeness
         // of the match (won't be reached).
         InputConfig::Webrtc(_) | InputConfig::Whep(_) => MasterClockKind::Wallclock,

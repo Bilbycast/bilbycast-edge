@@ -89,6 +89,21 @@ pub async fn test_input(config: &InputConfig) -> TestResult {
             InputConfig::Webrtc(_) => {
                 TestResult::ok("ready", "WebRTC WHIP server — test requires active flow", start.elapsed())
             }
+            // A mosaic binds no socket and dials nothing — its sources are
+            // other inputs on this node, each of which is testable in its own
+            // right. There is nothing here a connectivity probe could reach.
+            #[cfg(feature = "multiviewer")]
+            InputConfig::Mosaic(m) => TestResult::ok(
+                "configured",
+                format!(
+                    "Mosaic wall: {}x{} at {} fps, {} tile(s). Test each tile's source input instead.",
+                    m.width,
+                    m.height,
+                    m.fps,
+                    m.tiles.len()
+                ),
+                start.elapsed(),
+            ),
             InputConfig::Whep(whep) => {
                 TestResult::ok("configured", format!("WHEP client configured for {}", whep.whep_url), start.elapsed())
             }

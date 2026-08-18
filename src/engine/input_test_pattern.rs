@@ -470,7 +470,7 @@ fn publish_chunks(
 
 #[cfg(all(feature = "media-codecs", feature = "fdk-aac"))]
 #[allow(unused_imports, unreachable_code)]
-fn select_video_backend() -> Option<video_codec::VideoEncoderCodec> {
+pub(crate) fn select_video_backend() -> Option<video_codec::VideoEncoderCodec> {
     use video_codec::VideoEncoderCodec;
     // Return the first compiled-in backend. Preference: x264 (CPU,
     // widely available), x265, NVENC (NVIDIA hardware), QSV (Intel
@@ -496,7 +496,7 @@ fn select_video_backend() -> Option<video_codec::VideoEncoderCodec> {
 }
 
 #[cfg(all(feature = "media-codecs", feature = "fdk-aac"))]
-fn backend_codec_string(codec: video_codec::VideoEncoderCodec) -> &'static str {
+pub(crate) fn backend_codec_string(codec: video_codec::VideoEncoderCodec) -> &'static str {
     use video_codec::VideoEncoderCodec;
     // Exhaustive matches for feature-gated variants trigger unused-import
     // warnings on some backend combos; the `use` above is intentional.
