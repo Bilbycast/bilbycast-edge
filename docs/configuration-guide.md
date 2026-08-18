@@ -1979,6 +1979,66 @@ output.
   position, which has no anchor to seed, so an audio-enabled display
   output on RKMPP still has the fault.
 
+- **`present_vblank_cadence`** — schedule frames onto whole vblanks
+  instead of onto wall-clock instants. Boolean, **default off**, safe to
+  toggle on a running node (it applies at the next frame; no restart).
+
+  `present_lead_ms` above fixes frames arriving late. This fixes a
+  different fault that survives it: the panel and the source run on
+  independent crystals — this fleet's panels sit between −54.69 and
+  +64.32 ppm of nominal — so even a perfectly-paced target slides against
+  the scanout raster. When it drifts near a vblank boundary,
+  sub-millisecond scheduling noise decides which of two adjacent vblanks
+  catches the flip, and the panel shows one frame for one vblank and the
+  next for three. Nothing is late and nothing is dropped, so **every loss
+  counter reads clean while the picture judders** (issue #112).
+
+  With this on, each frame is held for the whole number of vblanks its
+  cadence allocates — a flat 2,2,2 at 25p on a 50 Hz panel, a generated
+  3,2,3,2 pulldown at 24p on 60 Hz. Crystal drift is *absorbed* rather
+  than corrected, surfacing as one longer or shorter hold per beat
+  period (roughly every ten minutes at 33 ppm) instead of a continuous
+  sub-frame slide.
+
+  **It declines to engage more often than it engages, by design.** All of
+  the following must hold, and any one of them keeps the existing
+  wall-clock path with no loss of behaviour:
+
+  - The driver's flip clock has earned trust — a full measurement window
+    completed and agreed with the mode's advertised refresh. A driver
+    reporting a fabricated or stalled timebase is never scheduled against.
+  - The rate pair is schedulable: panel ÷ source must land in `1.0..=16.0`.
+    A source *faster* than the panel needs frame dropping, which is a
+    different algorithm and is not implemented — 60p on a 50 Hz panel is
+    declined.
+  - The output has **no `audio_device`**. Audio is master on that path and
+    holding frames on the vblank raster would fight it; locking video to
+    the panel is only sound once audio is resampled to the same clock,
+    which this does not do.
+  - There is **headroom**: the per-frame decode + download + blit cost
+    must sit under 60 % of the frame period. Where it does not, holding a
+    frame pushes the next decode past its slot and the queue sheds.
+    Measured per 40 ms frame: RK3568 3 749 µs (9.4 %), bilby-bite
+    10 750 µs (26.9 %), RK3588 13 891 µs (34.7 %) all engage; an Intel
+    Gen9 NUC at 32 093 µs (80.2 %) is refused.
+
+  A **runaway guard** backs all of that at run time. A correct cadence
+  sheds exactly zero frames, so any shedding that persists across two
+  consecutive 2-second samples disengages the feature and reverts to
+  wall-clock pacing, with an escalating cooldown that gives up entirely
+  after three failures on one output. Watch `cadence_disengaged` — any
+  non-zero value means this host could not hold frames and said so.
+
+  Measured on RK3588 at 25p on a 50 Hz panel: presents on target 94.0 %
+  off, 100.0 % on (71 of 72 five-second windows exact). On the Gen9 NUC
+  the headroom precondition refuses and the node is untouched; forced on
+  before that precondition existed it fell to 49.5 % on-target and
+  24.999 → 19.988 fps with 441 dropped frames, which is what the guard
+  and the precondition exist to prevent.
+
+  Off by default pending fleet validation. Turn it on where you can see
+  a panel and confirm the result.
+
 **Build prerequisites.** `display` is Linux-only and gated on the
 `display` Cargo feature (off by default). Schema is unconditional —
 configs round-trip on every platform. On non-Linux / non-feature
