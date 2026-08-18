@@ -1213,6 +1213,40 @@ mod tests {
         assert_eq!(snap.tei_errors, 1);
     }
 
+    /// The 1 Hz WS publisher owns the per-interval windows. `GET
+    /// /api/v1/stats`, `GET /api/v1/stats/{id}` and `GET /metrics` all used
+    /// to roll them too — and the edge dashboard polls the first of those —
+    /// so a transport error landing between publisher ticks was consumed by
+    /// an observer and the operator never saw `priority1_ok` drop. A
+    /// read-only snapshot must report the error and leave it in place for
+    /// the owner.
+    #[test]
+    fn read_only_snapshot_does_not_steal_the_window() {
+        let stats = Tr101290Accumulator::new();
+        stats.cc_errors.fetch_add(1, Ordering::Relaxed);
+        stats.window_cc_errors.fetch_add(1, Ordering::Relaxed);
+
+        // Any number of observers see the error and consume nothing.
+        for _ in 0..3 {
+            let observed = stats.snapshot_read_only();
+            assert!(
+                !observed.priority1_ok,
+                "a read-only reader must still see the windowed CC error"
+            );
+            assert_eq!(observed.cc_errors, 1);
+        }
+
+        // The owner still gets it, exactly once.
+        let owned = stats.snapshot();
+        assert!(
+            !owned.priority1_ok,
+            "the owner's window must survive every observer read"
+        );
+        // And the owner's read is what clears it.
+        let after = stats.snapshot();
+        assert!(after.priority1_ok, "the owner's read rolls the window");
+    }
+
     #[test]
     fn test_mpeg2_crc32_known_value() {
         // MPEG-2 CRC-32 of an empty payload with initial 0xFFFFFFFF should produce a known value

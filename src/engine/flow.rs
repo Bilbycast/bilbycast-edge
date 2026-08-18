@@ -373,6 +373,62 @@ pub struct FlowRuntime {
 /// - A child cancellation token (`cancel_token`) scoped to this input
 ///   individually. Cancelling it stops just this input (and its forwarder)
 ///   without disturbing sibling inputs or any outputs.
+/// Unwinds a [`FlowRuntime::start`] that bails after the flow token and the
+/// node-wide registrations exist.
+///
+/// `start` never constructs the runtime on those paths, so nothing that
+/// outlives the stack frame can reach the tasks it spawned — their
+/// `JoinHandle`s and the flow token die with it, and no sweeper exists.
+/// Before this guard, a failed start left every input task, socket,
+/// assembler thread and demuxer refcount running unreapably for the life of
+/// the process, and the operator's retry then met its own bound ports.
+///
+/// Cancelling the flow token is what releases the *tasks*: input sockets,
+/// the SCHED_FIFO assembler thread, the display claim, and each demuxer
+/// shim's `DemuxerHandle` — whose `Drop` returns the shared slot's refcount,
+/// so a shared source is not pinned for the process lifetime.
+///
+/// The two registrations are **not** cancel-driven and must be removed
+/// explicitly: [`FlowManager::input_publishers`] and the global
+/// `StatsCollector` flow entry — otherwise a failed flow keeps appearing in
+/// `all_snapshots()`, and therefore in the manager's `stats` message, for
+/// ever.
+///
+/// Ordering mirrors [`FlowRuntime::stop`]: publishers first, so a cross-flow
+/// subscriber observes a closed channel rather than a live `Sender` with no
+/// producer behind it, then cancel.
+///
+/// A guard rather than explicit calls at each `?` because `start` is ~925
+/// lines: a future early return — or a panic — must not be able to
+/// reintroduce the leak.
+struct StartUnwind {
+    cancel: CancellationToken,
+    flow_manager: Arc<crate::engine::manager::FlowManager>,
+    global_stats: Arc<crate::stats::collector::StatsCollector>,
+    flow_id: String,
+    input_ids: Vec<String>,
+    armed: bool,
+}
+
+impl Drop for StartUnwind {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        for id in &self.input_ids {
+            self.flow_manager.unregister_input_publisher(id);
+        }
+        self.cancel.cancel();
+        self.global_stats.unregister_flow(&self.flow_id);
+        tracing::warn!(
+            "flow '{}': start failed — unwound {} input publisher(s), cancelled the flow \
+             token and dropped the stats registration",
+            self.flow_id,
+            self.input_ids.len(),
+        );
+    }
+}
+
 pub struct InputRuntime {
     /// The protocol-specific input task (rtp/srt/rtmp/... receiver).
     /// Held for ownership — shutdown is driven via `cancel_token`.
@@ -661,6 +717,18 @@ impl FlowRuntime {
             input_type.to_string(),
         );
 
+        // Armed from here, because `register_flow` above is the first
+        // node-wide registration `start` makes. Disarmed just before
+        // `Ok(Self { .. })`; every path in between unwinds on drop.
+        let mut unwind = StartUnwind {
+            cancel: cancel_token.clone(),
+            flow_manager: Arc::clone(&flow_manager),
+            global_stats: Arc::clone(&global_stats),
+            flow_id: config.config.id.clone(),
+            input_ids: Vec::new(),
+            armed: true,
+        };
+
         // Watch channel carrying the currently-active input ID. All per-input
         // forwarder tasks subscribe to this; switching inputs is a single
         // send() that does not disturb any running task.
@@ -830,6 +898,11 @@ impl FlowRuntime {
             }
             input_handles.insert(spawned.input_id, spawned.input_runtime);
         }
+        // `spawn_input_runtime` is a pure spawn — no awaits, no `Result` — so
+        // the loop cannot bail part-way and one copy after it is sufficient.
+        // Any future fallible work inside that loop must instead push into
+        // `unwind.input_ids` per iteration.
+        unwind.input_ids.clone_from(&registered_input_ids);
 
         // If the flow has no inputs at all, note it in the log. The broadcast
         // channel will stay silent until inputs are added by the manager.
@@ -1487,6 +1560,11 @@ impl FlowRuntime {
         // master_clock + pacer + ingress sampler + 1 Hz telemetry
         // mirror were built above, before output spawn, so each output's
         // replacer could attach to the per-flow pacer.
+
+        // Past every fallible step — the runtime now owns the token, the
+        // publishers and the stats registration, and `stop()` is responsible
+        // for all three.
+        unwind.armed = false;
 
         Ok(Self {
             live_inputs: RwLock::new(config.inputs.clone()),
@@ -5596,7 +5674,7 @@ fn spawn_ts_es_demuxer_consumer(
             loop {
                 tokio::select! {
                     biased;
-                    _ = cancel.cancelled() => return,
+                    _ = cancel.cancelled() => break,
                     r = rx.recv() => match r {
                         Ok(pkt) => {
                             per_input_counters
@@ -5614,10 +5692,22 @@ fn spawn_ts_es_demuxer_consumer(
                             );
                             continue;
                         }
-                        Err(broadcast::error::RecvError::Closed) => return,
+                        // The publisher's sender was dropped — the input
+                        // stopped. Fall out and mark the slot dead below.
+                        Err(broadcast::error::RecvError::Closed) => break,
                     }
                 }
             }
+            // Mark this slot dead on EVERY exit path. `rx` is bound to one
+            // specific publisher `Sender`, and `register_input_publisher`
+            // installs a *new* channel when the input restarts, so this
+            // task can never follow it. `FlowManager::acquire_demuxer`
+            // treats a cancelled slot as absent and rebuilds it against the
+            // live publisher; without this the slot stays mapped forever
+            // and every later consumer of the input adopts a dead demuxer
+            // and goes silent with no error anywhere. Idempotent, so the
+            // cancel-initiated exit above is unaffected.
+            cancel.cancel();
         },
     );
     // Bridge to the existing `JoinHandle<()>` shape via a tokio

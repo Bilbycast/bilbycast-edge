@@ -350,7 +350,8 @@ leave the PMT untouched.
   //             | "h264_auto" | "hevc_auto" | "auto",
   "width":       1920,       // optional — see "Limitations"
   "height":      1080,       // optional — see "Limitations"
-  "fps_num":     30,         // recommended — operator-supplied, no auto-detect yet
+  "fps_num":     30,         // set to MATCH THE SOURCE; may be omitted on TS
+                             // outputs (auto-detected). Not a resampler.
   "fps_den":     1,
   "bitrate_kbps": 4000,      // optional, default 4000; range 100–100000
   "gop_size":    60,         // optional, default 2 × fps_num
@@ -638,11 +639,26 @@ commit message or release note and delete the bullet.
    scaling: 4:2:0 8-bit, 4:2:2 8-bit, 4:2:2 10-bit. Unsupported
    (4:2:0 10-bit, 4:4:4): the pipeline logs a warning and falls back
    to no-scale encode.
-2. **No frame-rate auto-detection.** The encoder must know fps at
-   `open` time; we default to 30/1 when the config omits it. The right
-   answer is to read the source SPS / VPS and pass the detected fps
-   in. Until then, operators should set `fps_num` / `fps_den`
-   explicitly.
+2. **Frame rate: set it to match the source. It is never a resampler.**
+   No path converts frame rate — every source frame is encoded, so
+   `fps_num` / `fps_den` *declares* the rate rather than resampling to
+   it. Where the value comes from differs by path:
+   - **SRT / UDP / RTP / RIST outputs and the TS ingress transcoder**
+     (`engine::ts_video_replace`) measure the source rate from PES DTS
+     deltas and lock the encoder to it before it opens — but **only
+     when the field is unset**. Pinning suppresses the measurement
+     outright (`source_fps_locked`), so a wrong pin is never corrected.
+   - **RTMP, WebRTC and CMAF outputs have no auto-detect** and fall
+     back to 30/1, so on those the field must be set to match the
+     source.
+
+   A pin that disagrees with the source does **not** cause a
+   proportional lipsync drift on the TS path (output PES PTS carry the
+   source clock), but it does mistune the encoder: actual bitrate runs
+   at the rate ratio times the configured value, the default GOP
+   (`2 × fps`) spans the wrong duration, and the SPS VUI advertises the
+   wrong rate. The edge logs `video_encode_fps_mismatch` once per
+   encoder run when it detects this.
 3. **No rate-control tuning knobs.** We pass `bitrate_kbps` + a
    `tune=zerolatency` option and rely on defaults for VBV buffer size,
    CRF, look-ahead, etc. CBR-strict profiles (true constant-bitrate

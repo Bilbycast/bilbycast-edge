@@ -2124,7 +2124,37 @@ impl Tr101290Accumulator {
     /// report" for operational dashboards. `priority1_ok` / `priority2_ok` are
     /// derived from the **windowed** counters so they reflect current stream
     /// health, not historical errors.
+    /// Roll the 1-second windows as part of the read. The **owner** of the
+    /// window is the 1 Hz WS publisher; every other reader must pass
+    /// `false`.
+    ///
+    /// The windows are per-interval by design — `priority1_ok` /
+    /// `priority2_ok` mean "clean since the last tick", not "clean ever" —
+    /// so reading them destructively is correct for exactly one caller.
+    /// It was not: `GET /api/v1/stats`, `GET /api/v1/stats/{id}` and
+    /// `GET /metrics` all rolled it too, and the edge dashboard polls the
+    /// first of those. A transport error landing between the publisher's
+    /// tick and an HTTP read was consumed by the reader and the operator
+    /// never saw the flag drop. Rolling is now owned rather than
+    /// time-guarded: no constant, no lock, no interval coupling.
     pub fn snapshot(&self) -> Tr101290Stats {
+        self.snapshot_with(true)
+    }
+
+    /// Non-rolling read for observers. See [`Self::snapshot`].
+    pub fn snapshot_read_only(&self) -> Tr101290Stats {
+        self.snapshot_with(false)
+    }
+
+    fn snapshot_with(&self, roll_window: bool) -> Tr101290Stats {
+        // Read a window counter, rolling it to zero only for the owner.
+        let take = |c: &std::sync::atomic::AtomicU64| -> u64 {
+            if roll_window {
+                c.swap(0, Ordering::Relaxed)
+            } else {
+                c.load(Ordering::Relaxed)
+            }
+        };
         // Cumulative totals
         let sync_loss = self.sync_loss_count.load(Ordering::Relaxed);
         let sync_byte = self.sync_byte_errors.load(Ordering::Relaxed);
@@ -2150,28 +2180,24 @@ impl Tr101290Accumulator {
         let tdt = self.tdt_errors.load(Ordering::Relaxed);
 
         // Windowed counters — swap to zero atomically
-        let w_cc = self.window_cc_errors.swap(0, Ordering::Relaxed);
-        let w_pat = self.window_pat_errors.swap(0, Ordering::Relaxed);
-        let w_pmt = self.window_pmt_errors.swap(0, Ordering::Relaxed);
-        let w_pid = self.window_pid_errors.swap(0, Ordering::Relaxed);
-        let w_tei = self.window_tei_errors.swap(0, Ordering::Relaxed);
-        let w_crc = self.window_crc_errors.swap(0, Ordering::Relaxed);
-        let w_pcr_disc = self
-            .window_pcr_discontinuity_errors
-            .swap(0, Ordering::Relaxed);
-        let w_pcr_acc = self.window_pcr_accuracy_errors.swap(0, Ordering::Relaxed);
-        let w_pts = self.window_pts_errors.swap(0, Ordering::Relaxed);
-        let w_cat = self.window_cat_errors.swap(0, Ordering::Relaxed);
-        let w_pcr_rep = self.window_pcr_repetition_errors.swap(0, Ordering::Relaxed);
-        let w_nit = self.window_nit_errors.swap(0, Ordering::Relaxed);
-        let w_si_rep = self.window_si_repetition_errors.swap(0, Ordering::Relaxed);
-        let w_unref = self
-            .window_unreferenced_pid_errors
-            .swap(0, Ordering::Relaxed);
-        let w_sdt = self.window_sdt_errors.swap(0, Ordering::Relaxed);
-        let w_eit = self.window_eit_errors.swap(0, Ordering::Relaxed);
-        let w_rst = self.window_rst_errors.swap(0, Ordering::Relaxed);
-        let w_tdt = self.window_tdt_errors.swap(0, Ordering::Relaxed);
+        let w_cc = take(&self.window_cc_errors);
+        let w_pat = take(&self.window_pat_errors);
+        let w_pmt = take(&self.window_pmt_errors);
+        let w_pid = take(&self.window_pid_errors);
+        let w_tei = take(&self.window_tei_errors);
+        let w_crc = take(&self.window_crc_errors);
+        let w_pcr_disc = take(&self.window_pcr_discontinuity_errors);
+        let w_pcr_acc = take(&self.window_pcr_accuracy_errors);
+        let w_pts = take(&self.window_pts_errors);
+        let w_cat = take(&self.window_cat_errors);
+        let w_pcr_rep = take(&self.window_pcr_repetition_errors);
+        let w_nit = take(&self.window_nit_errors);
+        let w_si_rep = take(&self.window_si_repetition_errors);
+        let w_unref = take(&self.window_unreferenced_pid_errors);
+        let w_sdt = take(&self.window_sdt_errors);
+        let w_eit = take(&self.window_eit_errors);
+        let w_rst = take(&self.window_rst_errors);
+        let w_tdt = take(&self.window_tdt_errors);
 
         // Priority flags based on windowed counters (current health, not historical)
         let in_sync = { self.state.lock().unwrap().in_sync };
@@ -4225,7 +4251,19 @@ impl FlowStatsAccumulator {
 
     /// Take a point-in-time snapshot of all input counters and every registered
     /// output's counters, assembling them into a [`FlowStats`] value.
+    /// Full flow snapshot. Rolls the per-interval TR-101290 windows — only
+    /// the 1 Hz WS publisher may do that. Observers use
+    /// [`Self::snapshot_read_only`].
     pub fn snapshot(&self) -> FlowStats {
+        self.snapshot_with(true)
+    }
+
+    /// Non-rolling snapshot for HTTP/metrics readers. See [`Self::snapshot`].
+    pub fn snapshot_read_only(&self) -> FlowStats {
+        self.snapshot_with(false)
+    }
+
+    fn snapshot_with(&self, roll_window: bool) -> FlowStats {
         let mut outputs: Vec<OutputStats> = self
             .output_stats
             .iter()
@@ -4255,7 +4293,13 @@ impl FlowStatsAccumulator {
         let input_bytes = self.input_bytes.load(Ordering::Relaxed);
         let input_bitrate = self.input_throughput.sample(input_bytes);
 
-        let tr101290_snap = self.tr101290.get().map(|acc| acc.snapshot());
+        let tr101290_snap = self.tr101290.get().map(|acc| {
+            if roll_window {
+                acc.snapshot()
+            } else {
+                acc.snapshot_read_only()
+            }
+        });
 
         // Extract IAT/PDV from the TR-101290 analyzer state
         let (iat, pdv_jitter_us) = self
@@ -5631,6 +5675,21 @@ impl StatsCollector {
     }
 
     /// Snapshot every registered flow and return a `Vec` of [`FlowStats`].
+    /// Non-rolling variants for HTTP/metrics readers — see
+    /// [`FlowStatsAccumulator::snapshot`] for why rolling is owned.
+    pub fn all_snapshots_read_only(&self) -> Vec<FlowStats> {
+        self.flow_stats
+            .iter()
+            .map(|entry| entry.value().snapshot_read_only())
+            .collect()
+    }
+
+    pub fn flow_snapshot_read_only(&self, flow_id: &str) -> Option<FlowStats> {
+        self.flow_stats
+            .get(flow_id)
+            .map(|entry| entry.snapshot_read_only())
+    }
+
     pub fn all_snapshots(&self) -> Vec<FlowStats> {
         self.flow_stats
             .iter()
@@ -5638,10 +5697,11 @@ impl StatsCollector {
             .collect()
     }
 
-    /// Snapshot a single flow by ID. Returns `None` if the flow is not registered.
-    pub fn flow_snapshot(&self, flow_id: &str) -> Option<FlowStats> {
-        self.flow_stats.get(flow_id).map(|entry| entry.snapshot())
-    }
+    // NOTE: there is deliberately no rolling per-flow `flow_snapshot`.
+    // Rolling the TR-101290 windows is owned by the 1 Hz WS publisher, which
+    // takes `all_snapshots`; a per-flow rolling read had exactly one caller
+    // (`GET /api/v1/stats/{id}`) and that caller was stealing the
+    // publisher's window. Observers use `flow_snapshot_read_only`.
 }
 
 #[cfg(test)]

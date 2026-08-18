@@ -751,13 +751,13 @@ Requires `resource_limits` config block. When `critical_action` is `"gate_flows"
 | Severity | Message | Trigger |
 |----------|---------|---------|
 | warning | Flow '{id}' caused {family} encoder oversubscription: {in_use} sessions in use, {max} probed at startup. Reduce HW transcodes or restart on a host with more capacity. | A new flow's HW `video_encode` outputs push the per-family in-use count above the startup-probed `max_sessions`. Soft warning only — the flow still starts. |
-| warning | Flow '{id}' caused {family} decoder oversubscription: {in_use} sessions in use, {max} probed at startup. Drop a HW-decoded display output or restart on a host with more capacity. | A new flow's HW **decode** sessions (NVDEC / QSV — transcode-input decode or a HW-decoded display output) push the per-family in-use count above the startup-probed `max_sessions`. Soft warning only — the flow still starts. |
+| warning | Flow '{id}' caused {family} decoder oversubscription: {in_use} sessions in use, {max} probed at startup. Drop a HW-decoded display output or restart on a host with more capacity. | A new flow's HW **decode** sessions (NVDEC / QSV / VAAPI / RKMPP — transcode-input decode or a HW-decoded display output) push the per-family in-use count above the startup-probed `max_sessions`. Soft warning only — the flow still starts. |
 
-**Details** (encoder): `{ error_code: "hw_encoder_oversubscribed", family: "nvenc"|"qsv"|"amf", role: "encoder", in_use: u32, max_sessions: u32, flow_id }`
+**Details** (encoder): `{ error_code: "hw_encoder_oversubscribed", family: "nvenc"|"qsv"|"amf"|"vaapi"|"rkmpp", role: "encoder", in_use: u32, max_sessions: u32, flow_id }`
 
-**Details** (decoder): `{ error_code: "hw_decoder_oversubscribed", family: "nvdec"|"qsv", role: "decoder", in_use: u32, max_sessions: u32, flow_id }`
+**Details** (decoder): `{ error_code: "hw_decoder_oversubscribed", family: "nvdec"|"qsv"|"vaapi"|"rkmpp", role: "decoder", in_use: u32, max_sessions: u32, flow_id }`
 
-**Source**: `src/engine/manager.rs::create_flow` → `emit_hw_oversubscribe_warnings`. The probed-max-sessions number comes from `engine::hardware_probe::probe_encoder_session_limits` / `probe_decoder_session_limits` at startup (capped at 8; see [`docs/configuration-guide.md`](configuration-guide.md#capacity--resource-budget) and the `tuning.probe_session_limits=false` opt-out). Soft warning matches the existing modal `updateResourceImpact` 80/100 % units pattern — the alarm tells the operator to fix it without blocking flow creation.
+**Source**: `src/engine/manager.rs::create_flow` → `emit_hw_oversubscribe_warnings`. The probed-max-sessions number comes from `engine::hardware_probe::probe_encoder_session_limits` / `probe_decoder_session_limits` at startup (the 1080p tier probes up to 32 sessions, the 4K tier up to 8; see [`docs/configuration-guide.md`](configuration-guide.md#capacity--resource-budget) and the `tuning.probe_session_limits=false` opt-out). Soft warning matches the existing modal `updateResourceImpact` 80/100 % units pattern — the alarm tells the operator to fix it without blocking flow creation.
 
 ### Remote upgrade (`upgrade`)
 

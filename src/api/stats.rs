@@ -33,7 +33,9 @@ pub async fn gather_all_stats(state: &AppState) -> AllStatsResponse {
     let config = state.config.read().await;
     let uptime = state.start_time.elapsed().as_secs();
 
-    let mut flow_stats = state.flow_manager.stats().all_snapshots();
+    // Read-only: the 1 Hz WS publisher owns rolling the TR-101290 windows.
+    // Rolling here consumed transport errors the operator then never saw.
+    let mut flow_stats = state.flow_manager.stats().all_snapshots_read_only();
 
     // Include configured-but-not-running flows as idle
     for flow_cfg in &config.flows {
@@ -169,7 +171,12 @@ pub async fn flow_stats(
     Path(flow_id): Path<String>,
 ) -> Result<Json<ApiResponse<FlowStats>>, ApiError> {
     // First check if we have live stats from the engine
-    if let Some(stats) = state.flow_manager.stats().flow_snapshot(&flow_id) {
+    // Read-only — see `all_snapshots_read_only` above.
+    if let Some(stats) = state
+        .flow_manager
+        .stats()
+        .flow_snapshot_read_only(&flow_id)
+    {
         return Ok(Json(ApiResponse::ok(stats)));
     }
 
@@ -253,7 +260,8 @@ pub async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
 pub async fn prometheus_metrics(State(state): State<AppState>) -> impl IntoResponse {
     let config = state.config.read().await;
     let uptime = state.start_time.elapsed().as_secs();
-    let flow_snapshots = state.flow_manager.stats().all_snapshots();
+    // Read-only — /metrics must never roll the publisher's window.
+    let flow_snapshots = state.flow_manager.stats().all_snapshots_read_only();
 
     let mut output = String::new();
 

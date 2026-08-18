@@ -1305,17 +1305,34 @@ mod inner {
                             let ratio = measured_fps / pinned_fps;
                             let off_pct = (ratio - 1.0).abs() * 100.0;
                             if off_pct > 0.1 && !self.fps_mismatch_warned {
+                                // Default GOP when the operator left
+                                // `gop_size` unset — mirrors
+                                // `video_encode_util::build_encoder_config`
+                                // exactly, integer division included.
+                                let default_gop_frames = 2 * (n / d.max(1)).max(1);
                                 tracing::warn!(
                                     error_code = "video_encode_fps_mismatch",
                                     measured_fps = format!("{:.3}", measured_fps),
                                     pinned_fps_num = n,
                                     pinned_fps_den = d,
                                     pinned_fps = format!("{:.3}", pinned_fps),
+                                    // Field name is published in
+                                    // docs/events-and-alarms.md and may back
+                                    // out-of-tree alerting rules — do not
+                                    // rename it. `bitrate_multiplier` is
+                                    // additive alongside it.
                                     drift_pct = format!("{:.2}", off_pct),
+                                    bitrate_multiplier = format!("{:.2}", ratio),
                                     "ts_video_replace: source fps ({:.3}) disagrees \
                                      with `video_encode.fps_num`/`fps_den` \
-                                     ({}/{} = {:.3}); A/V sync will drift by ~{:.1}% \
-                                     of elapsed time. Remove the pinned fps to let \
+                                     ({}/{} = {:.3}). Every source frame is still \
+                                     encoded and output PES PTS still carry the \
+                                     source clock, so this does not cause a \
+                                     proportional lipsync drift on this path — but \
+                                     the encoder is tuned for the wrong rate: actual \
+                                     bitrate runs ~{:.2}x the configured value, and \
+                                     a default GOP of {} frames spans {:.2}s instead \
+                                     of the intended 2s. Remove the pinned fps to let \
                                      the encoder auto-lock to the source rate, or \
                                      set it to match the source (e.g. 30000/1001 \
                                      for NTSC 29.97).",
@@ -1323,7 +1340,9 @@ mod inner {
                                     n,
                                     d,
                                     pinned_fps,
-                                    off_pct,
+                                    ratio,
+                                    default_gop_frames,
+                                    default_gop_frames as f64 / measured_fps,
                                 );
                                 self.fps_mismatch_warned = true;
                             }

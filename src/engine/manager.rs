@@ -191,7 +191,17 @@ impl Drop for DemuxerHandle {
                 // Remove the slot from the map so a subsequent
                 // `acquire_demuxer` for the same input spawns a fresh
                 // demuxer rather than reusing a cancelled one.
-                manager.demuxers.remove(&self.slot.input_id);
+                //
+                // By identity, not by key: between our `fetch_sub` above
+                // and this removal a concurrent `acquire_demuxer` may have
+                // installed a *successor* slot under the same input id.
+                // Removing by key alone would evict that live demuxer,
+                // which this handle never owned. The predicate runs under
+                // the shard write lock, so the test and the removal are
+                // atomic.
+                manager
+                    .demuxers
+                    .remove_if(&self.slot.input_id, |_, v| Arc::ptr_eq(v, &self.slot));
             }
         }
     }
@@ -372,23 +382,32 @@ impl FlowManager {
     {
         // Fast path: existing slot. Use `entry` API to avoid a
         // get-then-insert race when two flows acquire simultaneously.
-        let slot = self
-            .demuxers
-            .entry(input_id.to_string())
-            .or_try_insert_with(|| -> Result<Arc<DemuxerSlot>, ()> {
-                let rx = self.subscribe_input(input_id).ok_or(())?;
-                let cancel = CancellationToken::new();
-                let join = spawn_fn(rx, cancel.clone()).ok_or(())?;
-                Ok(Arc::new(DemuxerSlot {
-                    join: tokio::sync::Mutex::new(Some(join)),
-                    cancel,
-                    refcount: AtomicUsize::new(0),
-                    input_id: input_id.to_string(),
-                }))
-            })
-            .ok()?
-            .value()
-            .clone();
+        //
+        // A mapped slot is only reusable while its task is still alive.
+        // The demuxer holds a `broadcast::Receiver` derived from ONE
+        // specific publisher `Sender`, and `register_input_publisher`
+        // *replaces* that sender when an input restarts — an already
+        // attached demuxer can never follow. The task therefore cancels
+        // its own token on every exit path (see the demuxer consumer in
+        // `flow.rs`), and a cancelled slot is treated as absent here so
+        // the entry is rebuilt against the live publisher. Without this,
+        // a slot whose task has exited stays mapped forever and every
+        // later consumer of that input adopts the corpse and goes silent.
+        let entry = self.demuxers.entry(input_id.to_string());
+        let rebuild = |slot: &Arc<DemuxerSlot>| slot.cancel.is_cancelled();
+        let slot = match entry {
+            dashmap::Entry::Occupied(mut occupied) if rebuild(occupied.get()) => {
+                let fresh = Self::spawn_demuxer_slot(self, input_id, spawn_fn)?;
+                occupied.insert(Arc::clone(&fresh));
+                fresh
+            }
+            dashmap::Entry::Occupied(occupied) => Arc::clone(occupied.get()),
+            dashmap::Entry::Vacant(vacant) => {
+                let fresh = Self::spawn_demuxer_slot(self, input_id, spawn_fn)?;
+                vacant.insert(Arc::clone(&fresh));
+                fresh
+            }
+        };
         // Bump the refcount BEFORE returning the handle so concurrent
         // Drop of a sibling handle never falsely cancels the task.
         slot.refcount.fetch_add(1, Ordering::AcqRel);
@@ -396,6 +415,30 @@ impl FlowManager {
             slot,
             manager: Arc::downgrade(self),
         })
+    }
+
+    /// Build one demuxer slot: subscribe to the input's *current*
+    /// publisher, mint a cancel token, and hand both to `spawn_fn`.
+    /// Returns `None` when the input has no publisher registered or the
+    /// caller declines to spawn — the two conditions that used to be
+    /// folded into `or_try_insert_with`'s `Result<_, ()>`.
+    fn spawn_demuxer_slot<F>(
+        self: &Arc<Self>,
+        input_id: &str,
+        spawn_fn: F,
+    ) -> Option<Arc<DemuxerSlot>>
+    where
+        F: FnOnce(broadcast::Receiver<RtpPacket>, CancellationToken) -> Option<JoinHandle<()>>,
+    {
+        let rx = self.subscribe_input(input_id)?;
+        let cancel = CancellationToken::new();
+        let join = spawn_fn(rx, cancel.clone())?;
+        Some(Arc::new(DemuxerSlot {
+            join: tokio::sync::Mutex::new(Some(join)),
+            cancel,
+            refcount: AtomicUsize::new(0),
+            input_id: input_id.to_string(),
+        }))
     }
 
     /// Get a clone of the event sender for passing to sub-components.
@@ -630,11 +673,12 @@ impl FlowManager {
         // shape as before; `error_code: hw_encoder_oversubscribed`.
         let enc = &caps.hw_encoder_session_limits;
         if !enc.is_empty() {
-            let checks: [(Option<u32>, u32, &'static str); 4] = [
+            let checks: [(Option<u32>, u32, &'static str); 5] = [
                 (enc.nvenc_max_sessions, usage.nvenc_in_use, "nvenc"),
                 (enc.qsv_max_sessions, usage.qsv_in_use, "qsv"),
                 (enc.amf_max_sessions, usage.amf_in_use, "amf"),
                 (enc.vaapi_max_sessions, usage.vaapi_in_use, "vaapi"),
+                (enc.rkmpp_max_sessions, usage.rkmpp_in_use, "rkmpp"),
             ];
             for (max, in_use, family) in checks {
                 if let Some(max) = max
@@ -668,10 +712,15 @@ impl FlowManager {
         // discriminators.
         let dec = &caps.hw_decoder_session_limits;
         if !dec.is_empty() {
-            let dec_checks: [(Option<u32>, u32, &'static str); 3] = [
+            // RKMPP encode and decode are separate probes against one
+            // physical VPU (`hardware_probe`: "a distinct probe … not a
+            // shared counter"), so a decoder check independent of the
+            // encoder one above is the correct shape, not a duplicate.
+            let dec_checks: [(Option<u32>, u32, &'static str); 4] = [
                 (dec.nvdec_max_sessions, usage.nvdec_in_use, "nvdec"),
                 (dec.qsv_max_sessions, usage.qsv_decode_in_use, "qsv"),
                 (dec.vaapi_max_sessions, usage.vaapi_decode_in_use, "vaapi"),
+                (dec.rkmpp_max_sessions, usage.rkmpp_decode_in_use, "rkmpp"),
             ];
             for (max, in_use, family) in dec_checks {
                 if let Some(max) = max
@@ -1426,6 +1475,79 @@ mod tests {
             spawn_count.load(Ordering::Relaxed),
             2,
             "after cleanup, next acquire spawns a new demuxer"
+        );
+    }
+
+    /// A demuxer whose task has exited must not be adopted by the next
+    /// consumer. The task's `broadcast::Receiver` is bound to one specific
+    /// publisher `Sender`; `register_input_publisher` installs a *new*
+    /// channel on restart, so an already-attached demuxer can never follow
+    /// it. Before this was fixed the dead slot stayed mapped forever and
+    /// every later consumer of that input adopted the corpse and went
+    /// silent with no error — reachable with a single assembled flow
+    /// referencing a passthrough input-host flow's input.
+    #[tokio::test]
+    async fn dead_demuxer_slot_is_rebuilt_not_adopted() {
+        let fm = make_fm();
+        let (tx, _keep) = broadcast::channel::<RtpPacket>(8);
+        fm.register_input_publisher("in-a", tx);
+        let spawn_count = Arc::new(AtomicUsize::new(0));
+        let spawn_fn = |spawn_count: Arc<AtomicUsize>| {
+            move |_rx: broadcast::Receiver<RtpPacket>,
+                  cancel: CancellationToken|
+                  -> Option<JoinHandle<()>> {
+                spawn_count.fetch_add(1, Ordering::Relaxed);
+                // Model the real consumer: cancel our own token on exit.
+                Some(tokio::spawn(async move {
+                    cancel.cancelled().await;
+                    cancel.cancel();
+                }))
+            }
+        };
+
+        // Consumer A acquires and keeps its handle held — this is the
+        // input-host case, where the flow that owns the input is NOT the
+        // flow holding the demuxer handle.
+        let held = fm
+            .acquire_demuxer("in-a", spawn_fn(spawn_count.clone()))
+            .expect("first acquire");
+        assert_eq!(spawn_count.load(Ordering::Relaxed), 1);
+
+        // The demuxer task dies on its own (upstream closed), marking the
+        // slot dead. The handle is still held, so refcount never reaches
+        // zero and the old code would never remove the slot.
+        held.slot.cancel.cancel();
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert!(held.slot.cancel.is_cancelled());
+
+        // The input restarts with a brand new channel.
+        let (tx2, _keep2) = broadcast::channel::<RtpPacket>(8);
+        fm.register_input_publisher("in-a", tx2);
+
+        // Consumer B must get a FRESH demuxer bound to the live publisher,
+        // not the dead one still sitting in the map.
+        let fresh = fm
+            .acquire_demuxer("in-a", spawn_fn(spawn_count.clone()))
+            .expect("acquire after the task died must rebuild");
+        assert_eq!(
+            spawn_count.load(Ordering::Relaxed),
+            2,
+            "a cancelled slot must be replaced, not adopted"
+        );
+        assert!(
+            !fresh.slot.cancel.is_cancelled(),
+            "the rebuilt slot must be live"
+        );
+        assert!(
+            !Arc::ptr_eq(&fresh.slot, &held.slot),
+            "the rebuilt slot must be a different object"
+        );
+
+        // Dropping the stale handle must NOT evict the successor slot.
+        drop(held);
+        assert!(
+            fm.demuxers.contains_key("in-a"),
+            "dropping a stale handle must not remove the live successor"
         );
     }
 

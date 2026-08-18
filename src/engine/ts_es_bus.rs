@@ -66,9 +66,14 @@ use super::ts_parse::*;
 /// of a flow's compressed bitrate at a few hundred Mbps runs at
 /// ~40 kpps; 8192 slots ≈ 200 ms of buffer at that rate — enough for
 /// input switches, PMT updates, and 2022-7 dual-leg merge transients
-/// without lagging consumers losing data. Memory cost: ~60 B per slot
-/// × 8192 ≈ 480 KB per video PID. Audio and data PIDs use far smaller
-/// channels (see the helper) since their bitrates are 1000× lower.
+/// without lagging consumers losing data. Memory cost: the ring is a
+/// `Box<[Mutex<Slot<EsPacket>>]>` allocated eagerly at construction, and
+/// `Mutex<Slot<EsPacket>>` measures **96 B** — so a video ring is
+/// ~768 KiB, not the ~480 KB an earlier version of this comment claimed.
+/// Audio and data PIDs use far smaller channels (see the helper) since
+/// their bitrates are 1000× lower: ~96 KiB each, ~48 KiB for SCTE-35.
+/// The map itself is append-only (see `NodeEsBus`), so these rings are
+/// retained for the life of the process once minted.
 #[allow(dead_code)]
 pub const BUS_CHANNEL_CAPACITY: usize = 8192;
 
