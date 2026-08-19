@@ -7544,3 +7544,58 @@ mod update_config_commit_coverage {
         }
     }
 }
+
+#[cfg(test)]
+mod multiviewer_capability_gate {
+    //! The **negative** half of the `mv-compositor` gate, required by
+    //! MULTIVIEWER_PLAN.md §10.4.
+    //!
+    //! The positive half — that the bit appears when the feature and an encoder
+    //! are both present — is asserted in `engine::input_mosaic`, and only runs
+    //! under `cargo test --features multiviewer`. This one runs in the DEFAULT
+    //! suite, which is the half that matters for the failure mode the plan
+    //! names: a manager that sees `mv-compositor` offers the operator a wall,
+    //! and an edge that cannot composite one accepts the input and then dies at
+    //! the first frame with "no video encoder is compiled into this build".
+    //!
+    //! Cheap enough to be free — it rides the existing default `cargo test`.
+    //! Without it, nothing mechanically stops the bit being hoisted out of its
+    //! `#[cfg]` during a refactor, and the default suite would not notice.
+
+    #[cfg(not(feature = "multiviewer"))]
+    #[test]
+    fn a_build_without_the_feature_never_advertises_a_compositor() {
+        let caps = super::edge_capabilities();
+        assert!(
+            !caps.contains(&"mv-compositor"),
+            "a default build advertised mv-compositor; a manager would offer a \
+             wall this binary cannot composite. caps = {caps:?}"
+        );
+    }
+
+    /// The positive half: with the feature on, the bit tracks the encoder.
+    ///
+    /// Not a restatement of the code. Both halves of the gate are compile-time,
+    /// so this pins that they stay *the same* condition: the bit is advertised
+    /// exactly when `select_video_backend()` resolves. Drift either way is a
+    /// real failure — a bit without an encoder puts a wall in the operator's
+    /// picker that dies at the first frame, and an encoder without the bit
+    /// hides a wall the node could actually draw.
+    ///
+    /// On a CI runner with no `video-encoder-*` feature both sides take the
+    /// None branch, so this passes while exercising only half the space. That
+    /// is worth stating rather than hiding: the assertion is an equivalence,
+    /// and the runner only ever proves one side of it.
+    #[cfg(feature = "multiviewer")]
+    #[test]
+    fn with_the_feature_the_bit_tracks_the_encoder_backend() {
+        let caps = super::edge_capabilities();
+        let has_backend = crate::engine::input_test_pattern::select_video_backend().is_some();
+        assert_eq!(
+            caps.contains(&"mv-compositor"),
+            has_backend,
+            "the capability and the encoder must be the same condition; \
+             caps = {caps:?}, backend resolved = {has_backend}"
+        );
+    }
+}
