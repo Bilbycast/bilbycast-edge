@@ -83,6 +83,13 @@ struct Cli {
     /// file and exit. Useful when the first-boot stdout banner was missed.
     #[arg(long)]
     print_setup_token: bool,
+
+    /// Print this binary's compiled-in Cargo features and the capability list
+    /// it would advertise to the manager, then exit. Loads no config, opens no
+    /// socket, runs no hardware probe — safe on a build runner, which is what
+    /// the release workflow's `Verify binary` step relies on.
+    #[arg(long)]
+    print_capabilities: bool,
 }
 
 /// SIGSEGV / SIGBUS / SIGABRT handler — diagnostic only. Captures a
@@ -127,6 +134,48 @@ fn install_diag_signal_handlers() {
 async fn main() -> anyhow::Result<()> {
     install_diag_signal_handlers();
     let cli = Cli::parse();
+
+    // --print-capabilities: emit what this binary contains, then exit.
+    //
+    // FIRST, ahead of the setup-token branch and ahead of tracing init: it must
+    // touch no config file, open no socket and run no boot probe, so a release
+    // job can run it against a freshly built artefact on a headless runner.
+    // That is exactly what `nightly-release.yml`'s `Verify binary` step does.
+    //
+    // Two lists, two different truths, and conflating them would make this
+    // useless:
+    //
+    //   feature <name>    — pure `cfg!()`. What was COMPILED IN. This is the
+    //                       question a release-artefact assertion has to ask:
+    //                       every `*-full` binary before v0.103.0 shipped
+    //                       without SDI while its notes claimed otherwise, and
+    //                       every one of those builds was green.
+    //   capability <name> — `edge_capabilities()` evaluated COLD. Probe-gated
+    //                       bits (`display`, `sdi-decklink`, the
+    //                       `video-decoder-*` set) are ABSENT here even when
+    //                       compiled in, because their boot probe has not run.
+    //                       `mv-compositor` is the bit that makes this usable
+    //                       as a gate: both halves of its condition are
+    //                       compile-time, so its presence is exact on a
+    //                       headless runner with no hardware.
+    //
+    // One token per line, never a comma-joined list: the release step matches
+    // whole lines with `grep -qx`, so a future `multiviewer-panel` cannot
+    // satisfy an assertion about `multiviewer`.
+    if cli.print_capabilities {
+        // The bin's own `mod manager` (line 27), not the lib crate's copy.
+        // `main.rs` re-declares the whole module tree rather than importing the
+        // lib, so calling `bilbycast_edge::manager::…` here would leave the
+        // bin's own copy of these two functions unreferenced and trip
+        // `dead_code` under the CI gate's `-D warnings`.
+        for f in manager::client::compiled_features() {
+            println!("feature {f}");
+        }
+        for c in manager::client::edge_capabilities() {
+            println!("capability {c}");
+        }
+        return Ok(());
+    }
 
     // --print-setup-token: load the secrets file, print the token (or a clear
     // "already registered" message), and exit. Runs before tracing init so the

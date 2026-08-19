@@ -1180,7 +1180,56 @@ fn build_resource_budget_payload(
 /// build — ffmpeg itself is a runtime dependency, gated lazily on the
 /// per-output `audio_encode` block). The `ptp-internal` feature is
 /// reflected as an additional `"ptp-internal"` string for completeness.
-fn edge_capabilities() -> Vec<&'static str> {
+/// Every Cargo feature compiled into this binary, resolved purely by `cfg!`.
+///
+/// Deliberately distinct from [`edge_capabilities`], and the difference is the
+/// whole point. A capability answers "can this node offer X, here, now" — for
+/// several bits that means a feature **and** a boot probe that found hardware,
+/// so a cold call omits `display`, `sdi-decklink` and the `video-decoder-*`
+/// bits even in a binary that contains them. This answers "did feature X reach
+/// the binary at all", which is the question a release-artefact assertion has
+/// to ask: the `*-full` binaries before v0.103.0 shipped with no
+/// `sdi-decklink` in them while the release notes said otherwise, and every one
+/// of those builds was green.
+///
+/// `pub` rather than `pub(crate)`: this crate has both a lib and a bin root and
+/// each compiles this module, so a `pub(crate)` version is unreachable from the
+/// *lib* crate, `dead_code` fires, and `cargo clippy -- -D warnings` fails the
+/// CI gate. `pub` in a `pub mod` silences that honestly rather than with an
+/// `#[allow]`.
+///
+/// Ordered as in `Cargo.toml`'s `[features]` block rather than alphabetically,
+/// so a reviewer can diff the two by eye.
+pub fn compiled_features() -> Vec<&'static str> {
+    let mut f: Vec<&'static str> = Vec::new();
+    if cfg!(feature = "replay") { f.push("replay"); }
+    if cfg!(feature = "fdk-aac") { f.push("fdk-aac"); }
+    if cfg!(feature = "media-codecs") { f.push("media-codecs"); }
+    if cfg!(feature = "video-encoder-x264") { f.push("video-encoder-x264"); }
+    if cfg!(feature = "video-encoder-x265") { f.push("video-encoder-x265"); }
+    if cfg!(feature = "video-encoder-nvenc") { f.push("video-encoder-nvenc"); }
+    if cfg!(feature = "video-encoder-qsv") { f.push("video-encoder-qsv"); }
+    if cfg!(feature = "video-encoder-vaapi") { f.push("video-encoder-vaapi"); }
+    if cfg!(feature = "video-encoder-rkmpp") { f.push("video-encoder-rkmpp"); }
+    if cfg!(feature = "video-encoders-full") { f.push("video-encoders-full"); }
+    if cfg!(feature = "multiviewer") { f.push("multiviewer"); }
+    if cfg!(feature = "display") { f.push("display"); }
+    if cfg!(feature = "mxl") { f.push("mxl"); }
+    if cfg!(feature = "sdi-decklink") { f.push("sdi-decklink"); }
+    if cfg!(feature = "mxl-not-built") { f.push("mxl-not-built"); }
+    if cfg!(feature = "video-decoder-nvdec") { f.push("video-decoder-nvdec"); }
+    if cfg!(feature = "video-decoder-qsv") { f.push("video-decoder-qsv"); }
+    if cfg!(feature = "video-decoder-vaapi") { f.push("video-decoder-vaapi"); }
+    if cfg!(feature = "video-decoder-rkmpp") { f.push("video-decoder-rkmpp"); }
+    if cfg!(feature = "rga-transfer") { f.push("rga-transfer"); }
+    if cfg!(feature = "tls") { f.push("tls"); }
+    if cfg!(feature = "webrtc") { f.push("webrtc"); }
+    if cfg!(feature = "hardware-monitor-nvml") { f.push("hardware-monitor-nvml"); }
+    if cfg!(feature = "ptp-internal") { f.push("ptp-internal"); }
+    f
+}
+
+pub fn edge_capabilities() -> Vec<&'static str> {
     let mut caps = vec![
         // SMPTE ST 2110 Phase 1 (audio + ancillary)
         "st2110-30",
@@ -7561,6 +7610,22 @@ mod multiviewer_capability_gate {
     //! Cheap enough to be free — it rides the existing default `cargo test`.
     //! Without it, nothing mechanically stops the bit being hoisted out of its
     //! `#[cfg]` during a refactor, and the default suite would not notice.
+
+    /// `feature multiviewer` — the exact line `nightly-release.yml`'s
+    /// `Verify binary` step matches with `grep -qx`.
+    ///
+    /// A rename here turns that release gate **vacuous**, which is the failure
+    /// this whole area exists to prevent: a `grep` that matches nothing passes
+    /// silently unless something pins the string.
+    #[test]
+    fn compiled_features_reports_multiviewer_iff_it_is_compiled_in() {
+        assert_eq!(
+            super::compiled_features().contains(&"multiviewer"),
+            cfg!(feature = "multiviewer"),
+            "nightly-release.yml asserts `feature multiviewer` with grep -qx; \
+             this list must track the cfg"
+        );
+    }
 
     #[cfg(not(feature = "multiviewer"))]
     #[test]

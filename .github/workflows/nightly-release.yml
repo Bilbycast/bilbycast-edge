@@ -105,13 +105,13 @@ jobs:
             artifact_suffix: x86_64-linux-full
             variant: full
             sdi: "true"
-            cargo_features: "video-encoders-full display mxl mxl-not-built sdi-decklink"
+            cargo_features: "video-encoders-full display multiviewer mxl mxl-not-built sdi-decklink"
           - runner: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
             artifact_suffix: aarch64-linux-full
             variant: full
             sdi: "true"
-            cargo_features: "video-encoder-x264 video-encoder-x265 video-encoder-nvenc video-encoder-vaapi video-decoder-nvdec video-decoder-vaapi display mxl mxl-not-built sdi-decklink"
+            cargo_features: "video-encoder-x264 video-encoder-x265 video-encoder-nvenc video-encoder-vaapi video-decoder-nvdec video-decoder-vaapi display multiviewer mxl mxl-not-built sdi-decklink"
           # ─── Rockchip variant: aarch64 full bundle PLUS the RK3568/RK3588
           # RKMPP hardware H.264/HEVC encoder (h264_rkmpp / hevc_rkmpp, 8-bit
           # 4:2:0). Built NATIVELY on the same ubuntu-24.04-arm runner — no
@@ -139,7 +139,7 @@ jobs:
             artifact_suffix: aarch64-linux-rockchip
             variant: full
             rkmpp: "true"
-            cargo_features: "video-encoder-x264 video-encoder-x265 video-encoder-rkmpp video-decoder-rkmpp rga-transfer display mxl mxl-not-built"
+            cargo_features: "video-encoder-x264 video-encoder-x265 video-encoder-rkmpp video-decoder-rkmpp rga-transfer display multiviewer mxl mxl-not-built"
     runs-on: ${{ matrix.runner }}
     steps:
       # Runs before any checkout / apt / x264-from-source / cargo, so a missing
@@ -684,6 +684,61 @@ jobs:
             echo "SKIP: SDI requested for this variant but no SDK credential reached CI — feature was stripped, dl_read_frame not expected."
           fi
 
+          echo "=== Positive check: multiviewer compiled in and offerable ==="
+          # Same reasoning as the dl_read_frame gate above, and the same
+          # history behind it: a green build is not evidence a feature shipped.
+          # v0.103.0 was the first release whose *-full binaries actually
+          # contained SDI, and earlier releases' notes said otherwise.
+          # `multiviewer` is pure Rust — there is no C symbol to nm for — so
+          # assert on what the binary says about itself.
+          #
+          # Safe to execute here: --print-capabilities loads no config, opens
+          # no socket and runs no boot probe (handled immediately after
+          # Cli::parse()), and every matrix entry builds NATIVELY, so the
+          # binary just built runs on its own runner.
+          #
+          # Two assertions, because they prove different things and only the
+          # pair is worth anything:
+          #   `feature multiviewer`      - the compositor is in the binary.
+          #   `capability mv-compositor` - and a video encoder resolved, so
+          #                                advertised_heads() is non-empty and
+          #                                the manager will actually offer a
+          #                                wall. Without the second, a wall
+          #                                ships that no operator can ever see.
+          #
+          # DELIBERATELY UNCONDITIONAL — not derived from matrix.cargo_features
+          # the way the SDI gate is derived from matrix.sdi. All three artefacts
+          # must carry multiviewer (MULTIVIEWER_PLAN.md §6.3 item 3), and an
+          # expectation that a matrix edit can silently switch off is exactly
+          # the failure this block exists to prevent.
+          #
+          # grep -qx matches whole lines, which is why the flag prints one
+          # token per line: `grep -q multiviewer` would be satisfied by a
+          # future `multiviewer-panel`.
+          if ! CAPS_OUT="$("${BINARY}" --print-capabilities)"; then
+            echo "ERROR: '${BINARY} --print-capabilities' did not run."
+            echo "  Either the flag was removed from src/main.rs, or this binary"
+            echo "  cannot start on its own build runner — check the ldd output above."
+            exit 1
+          fi
+          printf '%s\n' "${CAPS_OUT}"
+          if ! printf '%s\n' "${CAPS_OUT}" | grep -qx 'feature multiviewer'; then
+            echo "ERROR: 'multiviewer' is not compiled into this binary."
+            echo "  engine::mosaic + engine::input_mosaic are absent from the"
+            echo "  ${ARTIFACT_SUFFIX} artefact. Check its cargo_features list."
+            exit 1
+          fi
+          if ! printf '%s\n' "${CAPS_OUT}" | grep -qx 'capability mv-compositor'; then
+            echo "ERROR: 'mv-compositor' capability absent — a wall would never be offered."
+            echo "  The feature compiled in but select_video_backend() resolved to None,"
+            echo "  so advertised_heads() returns empty and the manager hides every wall"
+            echo "  surface for nodes running this binary. Add an encoder feature that"
+            echo "  select_video_backend() knows about (x264 / x265 / NVENC / QSV) to the"
+            echo "  cargo_features list for ${ARTIFACT_SUFFIX}."
+            exit 1
+          fi
+          echo "OK: multiviewer compiled in, mv-compositor advertised (encoder backend resolved)"
+
           echo "=== MXL ==="
           # MXL uses dlopen (libloading) at runtime — no link-time dep.
           # The `mxl-not-built` feature skips the cmake C++ build; the
@@ -958,6 +1013,8 @@ jobs:
           - \`bilbycast-edge-aarch64-linux-rockchip.tar.gz\` — Linux ARM64 **Rockchip RK3568/RK3588** (NanoPi R5S/R6S, Orange Pi 5, Radxa Rock 5B…) — adds the **RKMPP** hardware H.264/HEVC encoder (\`h264_rkmpp\` / \`hevc_rkmpp\`, 8-bit 4:2:0) on top of x264 + x265 CPU fallback; **no** NVENC/QSV/VAAPI (none exist on Rockchip). **Runtime prereqs:** a Rockchip **BSP kernel** exposing \`/dev/mpp_service\` plus the BSP's \`librockchip_mpp.so\` (this binary links it dynamically) and the running user in the \`video\` group. Edges compiled with rkmpp auto-select this artefact (upgrade variant \`rockchip\`). See \`docs/installation.md\` §ARM Rockchip.
 
           **MXL** (Media eXchange Layer) support is compiled in. MXL is a shared-memory IPC protocol — the edge discovers the system-installed \`libmxl.so\` at runtime via \`dlopen\` and advertises MXL capabilities only when the library is present. Install MXL system-wide so all MXL-speaking applications on the host share the same library.
+
+          **Multiviewer** (mosaic compositor + stream head) is compiled into all three artefacts. A wall composites node-local inputs onto one canvas — up to 1920x1080 in this phase — and publishes it as an ordinary MPEG-TS flow source, so it restreams over SRT / RTP / UDP / WebRTC / CMAF, records, nests inside another wall and produces thumbnails with no extra output configuration. Unlike SDI and MXL there is nothing to install: the canvas is encoded by the x264 / x265 / NVENC / QSV / VAAPI / RKMPP backends this artefact already carries, so nodes running these binaries advertise the \`mv-compositor\` capability and the manager's wall surfaces appear automatically. Confirm with \`bilbycast-edge --print-capabilities\`.
 
           ${SDI_NOTE}
 
