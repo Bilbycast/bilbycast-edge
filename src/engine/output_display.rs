@@ -2354,8 +2354,14 @@ fn open_video_decoder_with_retry(
         event_sender.emit_flow_with_details(
             EventSeverity::Warning,
             crate::manager::events::category::SYSTEM_RESOURCES,
+            // Derived, not written out. The loop is `once(0).chain(
+            // ATTEMPT_DELAYS_MS)` — four attempts — and `details.attempts`
+            // below computes that correctly, but this sentence said "3" and is
+            // the half an operator actually reads. Two numbers for one fact,
+            // disagreeing, in adjacent lines.
             format!(
-                "Display HW decode unavailable on flow '{flow_id}' — fell back to CPU after 3 attempts"
+                "Display HW decode unavailable on flow '{flow_id}' — fell back to CPU after {} attempts",
+                ATTEMPT_DELAYS_MS.len() + 1
             ),
             flow_id,
             serde_json::json!({
