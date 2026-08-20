@@ -4,9 +4,11 @@ Read-only radio-state monitoring for bond legs (and any interface) that egress
 over a mobile uplink — a USB/PCIe modem or a Teltonika RutOS router. The edge
 attaches live signal / operator / access-tech / registration state to the
 network interface, the manager renders it on the **Network Interfaces** card
-(node detail) and as a signal strip on **bond legs**, and the edge emits a few
-debounced events. **No writes to the devices, no sidecar, nothing installed on
-the Teltonika hardware.**
+(node detail) and as a compact signal strip on the bond legs that report an
+egress netdev (a narrow subset — see [Where the bond-leg strip
+appears](#where-the-bond-leg-strip-appears)), and the edge emits a few debounced
+events. **No writes to the devices, no sidecar, nothing installed on the
+Teltonika hardware.**
 
 > Scope: read-only telemetry. APN / band-lock / reboot / SIM-switch and
 > data-cap *enforcement* are explicitly out of scope.
@@ -32,22 +34,48 @@ Both produce the same `CellularMetrics` block on
   "operator": "Telstra",
   "plmn": "50501",
   "band": "n78",
-  "cell_id": "0x1A2B3C",
+  "cell_id": "0x1A2B3C",              // RutOS only — modem_manager hard-codes None
   "signal": { "rsrp_dbm": -95, "rsrq_db": -11, "sinr_db": 12, "rssi_dbm": -67, "bars": 3 },
   "roaming": false,
   "sim_slot": 1,
-  "temperature_c": 41.0,              // best-effort (RutOS)
-  "data_used_bytes": 0,              // best-effort (RutOS)
+  "temperature_c": 41.0,              // RutOS only (best-effort)
+  "data_used_bytes": 0,               // RutOS only (best-effort)
+  "data_limit_bytes": null,           // RutOS only (best-effort)
+  "last_error": null,                 // set ⇒ failure placeholder, not a sample (below)
+  "keeper_active": true,              // modem_manager only — host keep-alive heartbeat
   "sampled_at_unix_ms": 1750000000000
 }
 ```
 
+Four of those fields are source-specific, not merely best-effort:
+`snapshot_to_metrics` in `modem_manager.rs` hard-codes `cell_id`,
+`temperature_c`, `data_used_bytes` and `data_limit_bytes` to `None`, so they are
+only ever populated from a RutOS router. `roaming` and `sim_slot` come from both
+sources. `last_error` is set **only** on a failure placeholder — see
+[Architecture](#architecture).
+
 All fields are additive `Option` (`skip_serializing_if`), enums have
 `#[serde(other)]` catch-alls — **no `WS_PROTOCOL_VERSION` bump**. Older managers
-ignore the block; older edges omit it. The edge advertises the `"cellular"`
-capability on `HealthPayload.capabilities` whenever the poller has at least one
-source (configured uplink or auto-detected modem); the manager UI gates the
-signal strips on that bit.
+ignore the block; older edges omit it.
+
+### The `"cellular"` capability gates nothing today
+
+The edge advertises `"cellular"` on `HealthPayload.capabilities` whenever the
+poller has at least one source — configured uplink or auto-detected modem
+(`manager/client.rs`, gated on `CellularCache::has_sources()`). **No manager UI
+surface reads that bit.** Both strips render on *data presence*: `flows.js`
+draws the Network Interfaces strip on `if (n.cellular)` and the bond-leg strip
+on the leg's `interface` resolving into an interface that carries a `cellular`
+block. The router authoring form is ungated on purpose (`cellular_uplinks.js`
+says so at the top — a router is configured *before* the edge has any data).
+
+The one cellular surface that is genuinely capability-gated is the **Wake**
+button, on `"cellular-control"` (`caps.indexOf('cellular-control')` for the
+Network Interfaces copy, `bondCanControl` for the per-leg copy). So `"cellular"`
+is emitted and currently unconsumed — treat it as available for a future gate,
+not as the reason a strip appears. (The equivalent claim *is* still written down
+on the Starlink side, in the comment beside its capability push in
+`manager/client.rs` — see [starlink.md](starlink.md#the-starlink-capability-gates-nothing-today).)
 
 ## Architecture
 
@@ -55,8 +83,18 @@ A single background **poller** task (`util::cellular`, under the app cancellatio
 tree) samples every source on a slow cadence (10 s), each sample time-bounded
 (4 s). It writes the latest snapshot into a lock-free `DashMap` cache keyed by
 kernel netdev. The ~15 s health tick joins that cache onto each interface — no
-HTTP/D-Bus on the tick, **never on the data path**. Stale snapshots (>60 s)
-age out so the UI shows "no data / acquiring" rather than a frozen value.
+HTTP/D-Bus on the tick, **never on the data path**.
+
+**Staleness, precisely.** Each cycle ends with
+`cache.evict_older_than(now_ms − 60 s)`, so an interface the poller has *stopped
+sampling* drops off the card rather than freezing on a stale value — an
+unplugged modem, or one ModemManager no longer reports, takes that path. **A
+configured RutOS router that goes dark does not.** Every failing cycle inserts a
+fresh `CellularMetrics::unreachable(...)` placeholder stamped with the current
+time, so the entry is never older than one poll interval and the eviction can
+never reach it: the row renders `⚠ UNREACHABLE` with the failure cause
+indefinitely. That is the intent — a misconfigured router stays diagnosable at a
+glance instead of vanishing to "no data".
 
 The poller reads `config.cellular_uplinks` from the live `AppConfig` each cycle,
 so a config change is picked up within one interval with **no flow restart** and
@@ -99,6 +137,18 @@ Per-uplink `reqwest` client honouring its TLS policy:
 then `gsm.modem0 get_signal_query` + `info` merged. **REST** (RutOS 7.x):
 `POST /api/login` → bearer → `GET /api/modems/status`.
 
+**Reachability probe.** `test_cellular_uplink` (WS command, operator role,
+`manager/client.rs`) builds a transient `CellularUplinkConfig` from the posted
+fields, runs one real login + modem-status fetch through the same
+`rutos::build_sources` → `sample()` path the poller uses, and returns
+`{ ok: true, operator, access_tech, band, signal, state }` or
+`{ ok: false, error: "<cause>" }`. It backs the router form's **Test
+reachability** button (`config/cellular_uplinks.js`, `.bc-cell-test` →
+`#bcCellTestResult`). On an edit with the password field left blank it falls
+back to the stored secret for that interface, so an existing router can be
+re-tested without re-typing the credential. It probes **RutOS only** — a
+ModemManager modem has no configuration to validate.
+
 > The exact RutOS field names vary by model + firmware. The mapper
 > (`rutos::json_to_metrics`) is deliberately tolerant — it tries multiple key
 > spellings and coerces string-or-number values — and is the item to confirm
@@ -136,9 +186,13 @@ re-merged on `UpdateConfig` — the manager never round-trips it.
 "cellular_uplinks": { "eno4": { "password": "•••" } }
 ```
 
-In the manager UI, configure routers via **Node config → Cellular Monitoring →
-Add Router** (the password field is write-only; blank keeps the stored value).
-Modems show up automatically with no config.
+In the manager UI, configure routers via **Node config → Uplink Monitoring →
+Cellular (mobile uplinks) → Add Router**. There is no "Cellular Monitoring" tab:
+`node_config.html` carries one tab `data-tab="uplinks"` labelled **Uplink
+Monitoring**, and Cellular is a sub-section inside it, alongside Starlink and
+the shared-uplink capacity broker. The password field is write-only (blank keeps
+the stored value); **Test reachability** runs the probe described above before
+you save. Modems show up automatically with no config.
 
 ## Device-side prerequisite (RutOS)
 
@@ -192,7 +246,13 @@ The fix is a **request/execute split**, mirroring the PTP-helper file-IPC
    `CellularMetrics.keeper_active` (modem sources only) and advertises the
    `cellular-control` capability only while it's fresh — so the manager shows a
    **Wake** button (Network Interfaces card + bond-leg row) that can never be
-   dead. A modem stuck `disabled`/`searching` with no keeper raises the debounced
+   dead. `cellular-control` is the **only** cellular capability any manager
+   surface reads. The bond-leg copy of the button rides inside the compact strip,
+   so it reaches only the legs that get a strip at all
+   ([below](#where-the-bond-leg-strip-appears)), and only when that leg's modem
+   is dormant (`disabled` / `searching` / `unknown`); the Network Interfaces copy
+   has no such dormancy condition. A modem stuck `disabled`/`searching` with no
+   keeper raises the debounced
    `cellular_keeper_missing` Warning so the operator knows to provision the
    keeper (one `sudo install-cellular-modem.sh --enable` at rack time).
 
@@ -218,13 +278,52 @@ Node-level, category `cellular`, debounced (catalogued in
 | `cellular_uplink_recovered` | info | a RutOS poll succeeds after being unreachable |
 | `cellular_keeper_missing` | warning | a modem is `disabled`/`searching` for 3 cycles with no host keep-alive daemon running (can't be woken from the UI — provision `bilbycast-cellular-modem.service`) |
 
-## Signal thresholds (UI colour)
+## Where the bond-leg strip appears
 
-- **RSRP (dBm):** good > −90 · fair −90…−105 · poor −105…−115 · bad < −115
-- **SINR (dB):** good > 13 · fair 0…13 · bad < 0
+The Network Interfaces card draws a strip for **every** interface carrying a
+`cellular` block. The bond-leg strip is far narrower, because it is a *join*:
+`flows.js` builds `cellByIface` from `network_interfaces[].cellular`, then looks
+each leg up by `BondPathLegStats.interface`. A leg that reports no `interface`
+gets no strip — and only two leg shapes ever set it.
 
-Bars (0..=5) are the worst-of RSRP/SINR (RSSI fallback on 2G/3G). Operators read
-colour first (green ≥ 4 bars, amber 2–3, red ≤ 1), numbers on hover.
+| Leg | `BondPathLegStats.interface` | Strip? |
+|---|---|---|
+| **Sender**, UDP, interface-mode (`gateway` unset) | configured netdev | yes |
+| **Sender**, Relay, interface-mode (`gateway` unset) | configured netdev | yes |
+| Sender, UDP or Relay, gateway-mode (`gateway` set) | `None` — steering is a policy route, not a NIC pin | no |
+| Sender, QUIC | `None` — `bond_path_interface` has no `Quic` arm, even though the config variant *does* carry an `interface` field | no |
+| Sender, RIST | `None` | no |
+| **Receiver** (`input_bonded`), any transport | `None` — a listening leg has no meaningful egress NIC | no |
+
+`engine::input_bonded::bond_path_interface` is the predicate and
+`engine::output_bonded.rs` is its **only** caller; `stats::collector`
+additionally nulls the field whenever `p.gateway_mode`. The doc comment on
+`BondPathLegStats.interface` reads "interface-mode UDP legs only", which
+understates its own code — interface-mode **relay** legs qualify too.
+
+## Bars and colour
+
+`bars` is the only thing the manager colours on — there is no per-metric
+threshold table on the UI side. `util::cellular::derive_bars` bins each figure
+onto its own **six**-step ladder and folds the results with `min` (worst-of);
+`flows.js::cellBarsColor` then maps the count to a colour.
+
+| bars | 5 | 4 | 3 | 2 | 1 | 0 |
+|---|---|---|---|---|---|---|
+| **RSRP** (dBm) | ≥ −80 | ≥ −90 | ≥ −100 | ≥ −105 | ≥ −115 | < −115 |
+| **SINR** (dB) | ≥ 20 | ≥ 13 | ≥ 6 | ≥ 0 | ≥ −5 | < −5 |
+| **RSSI** (dBm) | ≥ −65 | ≥ −75 | ≥ −85 | ≥ −95 | ≥ −105 | < −105 |
+| **colour** | green | green | amber | amber | red | red |
+
+Green is `#3fb950` (≥ 4 bars), amber `#d29922` (2–3), red `#f85149` (≤ 1), grey
+`#8b949e` when `bars` is `null`. Six signal steps therefore collapse onto three
+colours plus "no reading" — an operator cannot tell 1 bar from 0 bars by colour,
+only by the glyph and the hover numbers.
+
+RSSI is folded in **when and only when RSRP is absent**. The intent is "RSSI is
+all there is on 2G/3G", but the rule is mechanical rather than
+technology-aware: a 4G/5G source publishing RSSI and no RSRP is scored on the
+RSSI ladder. Operators read colour first, numbers on hover.
 
 ## Code map
 
@@ -236,17 +335,24 @@ colour first (green ≥ 4 bars, amber 2–3, red ≤ 1), numbers on hover.
   `src/config/models.rs` (`CellularUplinkConfig`), `src/config/secrets.rs`
   (`CellularUplinkSecrets` split), `src/config/validation.rs`
   (`validate_cellular_uplinks`, `validate_interface_name`), `src/manager/client.rs`
-  (`"cellular"` + `"cellular-control"` capabilities, `wake_uplink` command),
-  `src/stats/{models,collector}.rs` +
-  `src/engine/{output_bonded,input_bonded}.rs` (per-leg `interface` for the join).
+  (`"cellular"` + `"cellular-control"` capabilities, `test_cellular_uplink` +
+  `wake_uplink` commands), `src/stats/{models,collector}.rs`
+  (`BondPathLegStats.interface`; `collector` nulls it on gateway-mode legs),
+  `src/engine/input_bonded.rs` (`bond_path_interface` — the predicate; the
+  receive side sets no interface of its own) and `src/engine/output_bonded.rs`
+  (its only caller).
 - Host keeper (execute side): `packaging/{bilbycast-cellular-modem.service,
   setup-cellular-modem.sh, install-cellular-modem.sh, bilbycast-cellular-modem.default}`
   (root daemon: `--simple-connect` keep-alive + `--signal-setup` + wake-request
   servicing + status heartbeat). File-IPC at `/var/lib/bilbycast/cellular-wake.{req,status}`.
 - Manager: `crates/manager-core/src/models/ws_protocol.rs` (mirror),
-  `crates/manager-server/src/ui/static/js/detail/flows.js`
-  (`renderCellularStrip` + bond-leg + Network Interfaces card),
-  `crates/manager-server/src/ui/static/js/config/cellular_uplinks.js` (router form).
+  `crates/device-edge/src/lib.rs` (`test_cellular_uplink` + `wake_uplink` in
+  `EDGE_COMMANDS`), `crates/manager-server/src/ui/static/js/detail/flows.js`
+  (`renderCellularStrip` + `cellBarsColor` + `cellByIface` bond-leg join +
+  Network Interfaces card),
+  `crates/manager-server/src/ui/static/js/config/cellular_uplinks.js` (router
+  form + Test reachability), `crates/manager-server/src/ui/node_config.html`
+  (**Uplink Monitoring** tab, Cellular sub-section).
 
 ## Not applicable
 
