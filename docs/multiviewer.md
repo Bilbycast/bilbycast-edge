@@ -81,9 +81,12 @@ runtime state, and that is load-bearing: the manager keys its head rows on
 `(node_id, head_id)`, so an id minted per boot would create a second row on
 every restart and strand the wall pointing at the retired one. `connector` is
 `null` because a stream head occupies no physical port. `encoder_backends`
-carries the FFmpeg name of the one backend this head **will use** — the first
-`select_video_backend()` match, not every backend compiled in — so on every
-published release artefact it reads `["libx264"]`. The field names are a wire
+carries the FFmpeg names of the backends a wall on this node **would actually
+use**, head first — the resolved `h264_auto` chain, filtered by what this host
+can open, so on an Intel host with QuickSync it reads
+`["h264_qsv", "h264_vaapi", "x264"]`. Before v0.105.0 it named
+`select_video_backend()`'s answer and read `["libx264"]` on every artefact
+whatever the host had. The field names are a wire
 contract: the manager's `HeadAdvertisement` deserialises this verbatim.
 
 Phase 1 is one stream head per node. Panel and SDI heads are enumerable — a KMS
@@ -122,7 +125,7 @@ you want it seen on.
 | `width` / `height` | 1920x1080 | Must be even. Capped at 1920x1080 in phase 1 — see *Why UHD is refused*. |
 | `fps` | 25 | The **canvas's own** cadence, independent of any source's rate. Range 1–60. |
 | `video_bitrate_kbps` | 8000 | 100–200000. |
-| `codec` | `h264_auto` | **Accepted but not honoured in phase 1** — see *`codec` selects nothing today* below. Only its length is checked (≤ 64 chars), so `"banana"` is accepted. |
+| `codec` | `h264_auto` | Same names as an output's `video_encode.codec` — `h264_auto`, `hevc_auto`, `x264`, `x265`, `h264_qsv`, `h264_vaapi`, `h264_nvenc`, `h264_rkmpp`, … An unrecognised name is refused at save time. |
 | `tiles` | **required** | 1–64 tiles. |
 | `tiles[].id` | **required** | Stable identity, 1–64 chars, unique within the wall. Routing keys on it, so renaming a tile cannot re-point a signal. |
 | `tiles[].x` / `.y` | **required** | Top-left of the tile on the canvas, in pixels. |
@@ -145,19 +148,34 @@ task with its own `watch` channel and its own tile-sized buffer, so cost is
 linear in tile count and is paid on a node that is usually also carrying the
 live feeds being watched. 64 is comfortably above a 7x7 wall.
 
-**`codec` selects nothing today.** The compositor resolves its encoder with
-`select_video_backend()` — a function that takes no argument and returns the
-first backend compiled into this binary in a fixed order, x264 ≻ x265 ≻ NVENC ≻
-QSV, with VAAPI and RKMPP not considered at all — and then *overwrites* the
-encode config's codec with that backend's name. The configured string reaches
-nothing but the error text emitted when no encoder is compiled in. Every
-published release artefact carries `video-encoder-x264`, which wins that order,
-so **a wall on a release binary always encodes with libx264 on the CPU**,
-whatever this field says. The manager knows this: it emits the constant
-`h264_auto` and offers no dropdown. One consequence worth knowing — the
-resource-cost model charges the *configured* codec, so a wall written as
-`h264_nvenc` is billed against the node's NVENC session budget while actually
-running x264.
+**`codec` picks a real encoder.** The canvas resolves through
+`hardware_probe::resolve_chain_for_video_encode_config` against the host's probed
+capabilities, exactly as an output's `video_encode` does, and the configured
+string is what is honoured. `h264_auto` resolves to a chain — hardware first,
+CPU last — and the encoder falls through it at `avcodec_open2` failure. On an
+Intel host with QuickSync that is `["h264_qsv", "h264_vaapi", "x264"]`; on an
+NVIDIA host NVENC leads; on RK3568/RK3588 it is RKMPP; on a node with no
+hardware encoder it is x264 and nothing is lost.
+
+The chain is family-pure by construction, so `hevc_auto` can only ever resolve
+to HEVC backends. That is what lets the PMT's `stream_type` be settled from the
+resolved chain before the encoder opens, instead of from a second, separate
+question — which is how a wall could previously encode HEVC and be announced as
+H.264 (0x1B) with nothing downstream parsing the elementary stream to notice.
+
+> **Until v0.105.0 this field selected nothing.** The compositor resolved with
+> `select_video_backend()` — a function that takes no argument and returns the
+> first backend compiled into the binary in a fixed order, x264 ≻ x265 ≻ NVENC ≻
+> QSV, with VAAPI and RKMPP not considered at all — and then *overwrote* the
+> encode config's codec with that backend's name. Every published artefact
+> carries `video-encoder-x264`, which wins that order, so a wall always encoded
+> with libx264 on the CPU whatever this field said, and a wall asked for HEVC
+> silently got H.264. Two further consequences are also gone with it: the
+> resource-cost model charged the *configured* codec, so a wall written as
+> `h264_nvenc` was billed against the node's NVENC budget while running x264;
+> and the field was length-checked only, so `"banana"` saved cleanly. Fixed in
+> edge #129, measured on an Intel Core Ultra 9 285HX: `h264_auto` resolved to
+> `["h264_qsv", "h264_vaapi", "x264"]` and the wall ran on QuickSync.
 
 A tile source may be a full-resolution local SDI feed or a small proxy arriving
 over SRT from another site. The compositor cannot tell the difference, which is
@@ -213,10 +231,14 @@ Nothing above is free — it is *non-blocking*, which is a different property.
 Every tile is an **independent software decode**: `VideoDecoder::open` is CPU
 libavcodec, single-threaded (`open_threaded` exists and is deliberately not used
 here), one decoder per tile, plus a libswscale scale into the tile rect. The
-canvas encode is CPU too on every release artefact, because the backend selector
-prefers x264 over every hardware encoder. So an N-tile wall costs N software
-decodes + N scales + one canvas-sized software encode per canvas tick, on a node
-that is usually also carrying the very feeds being watched. That is what
+canvas encode goes to **hardware wherever the host has it** — the wall's `codec`
+resolves against the probed backends, so QuickSync, NVENC, VAAPI or RKMPP carries
+it and libx264 is only the floor. (Through v0.105.0 it was always CPU, because
+the backend selector preferred x264 over every hardware encoder — #129.) So an
+N-tile wall costs N software decodes + N scales per canvas tick, plus one
+canvas-sized encode that is usually *not* on the CPU, on a node that is often
+also carrying the very feeds being watched. Tile decode is still the term that
+scales with the wall, and it is still software. That is what
 `canvas_over_budget` is measuring when it rises.
 
 **Tiles can show H.264, HEVC and MPEG-2 only.** Those are the three video access

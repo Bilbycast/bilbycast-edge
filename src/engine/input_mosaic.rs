@@ -204,14 +204,54 @@ pub struct HeadAdvertisement {
 /// refuses at flow start. Advertising a head such a node cannot drive would put
 /// it in the operator's picker and fail at the moment it went to air.
 ///
-/// `encoder_backends` carries the backend this head **will use**, not every
-/// backend compiled in: `select_video_backend` returns the first match in
-/// preference order and the compositor takes that one, so listing the rest
-/// would advertise capacity nothing routes to.
+/// `encoder_backends` carries the backends a wall on this node **would
+/// actually use**, head first — the resolved `h264_auto` chain for the default
+/// canvas codec, filtered by what this host can open.
+///
+/// It used to name `select_video_backend`'s answer, which is x264 on every
+/// published artefact whatever the host has, so the manager was told a wall on a
+/// 32-session QSV box would encode on the CPU. It now would not (#129).
+///
+/// **The gate stays compile-time**, deliberately. Whether a head exists at all
+/// is `select_video_backend().is_some()` — "is any encoder in this binary" —
+/// which is the question that function is right for, is the same one behind the
+/// `mv-compositor` capability, and is answerable cold. The release workflow
+/// asserts that capability against a freshly built binary with no probe run, so
+/// making head *existence* depend on the runtime probe would fail every release.
+/// Only the reported backend list consults the probe, and it falls back to the
+/// compile-time answer before the probe has run.
 pub fn advertised_heads() -> Vec<HeadAdvertisement> {
     let Some(codec) = crate::engine::input_test_pattern::select_video_backend() else {
         return Vec::new();
     };
+    #[cfg(feature = "media-codecs")]
+    let backends: Vec<String> = {
+        let probe = crate::engine::hardware_probe::static_capabilities();
+        match probe.as_deref().and_then(|caps| {
+            crate::engine::hardware_probe::resolve_video_encoder_chain(
+                &crate::config::models::default_mosaic_codec(),
+                None,
+                None,
+                Some(caps),
+            )
+            .ok()
+        }) {
+            Some(chain) if !chain.is_empty() => {
+                // Through `as_video_encoder_codec` so both branches spell a
+                // backend the same way. `ResolvedVideoEncoder::ffmpeg_name`
+                // says "x264" where `VideoEncoderCodec::ffmpeg_name` says
+                // "libx264", and this field is documented as a verbatim wire
+                // contract the manager deserialises.
+                chain
+                    .iter()
+                    .map(|r| r.as_video_encoder_codec().ffmpeg_name().to_string())
+                    .collect()
+            }
+            _ => vec![codec.ffmpeg_name().to_string()],
+        }
+    };
+    #[cfg(not(feature = "media-codecs"))]
+    let backends: Vec<String> = vec![codec.ffmpeg_name().to_string()];
     vec![HeadAdvertisement {
         head_id: STREAM_HEAD_ID.to_string(),
         kind: "stream",
@@ -219,7 +259,7 @@ pub fn advertised_heads() -> Vec<HeadAdvertisement> {
         max_canvas_width: mosaic::MAX_CANVAS_W,
         max_canvas_height: mosaic::MAX_CANVAS_H,
         capabilities: serde_json::json!({
-            "encoder_backends": [codec.ffmpeg_name()],
+            "encoder_backends": backends,
         }),
     }]
 }
@@ -709,7 +749,7 @@ async fn run_compositor(
         )
         .map_err(|e| format!("canvas colour conversion unavailable: {e:?}"))?;
 
-        let mut encoder = build_encoder(&config, &flow_id)?;
+        let (mut encoder, backend_chain) = build_encoder(&config, &flow_id)?;
 
         // **The PMT must describe what the encoder actually produces.**
         //
@@ -720,14 +760,14 @@ async fn run_compositor(
         // stream would look healthy at every layer that does not parse the
         // elementary stream, which is most of them.
         let mut muxer = crate::engine::rtmp::ts_mux::TsMuxer::new();
-        let backend = crate::engine::input_test_pattern::select_video_backend();
-        if matches!(
-            backend,
-            Some(video_codec::VideoEncoderCodec::X265)
-                | Some(video_codec::VideoEncoderCodec::HevcNvenc)
-                | Some(video_codec::VideoEncoderCodec::HevcQsv)
-                | Some(video_codec::VideoEncoderCodec::HevcVaapi)
-        ) {
+        // **From the chain that was actually resolved, not from a second
+        // opinion.** This asked `select_video_backend()` again, which answers a
+        // different question from the one `build_encoder` had just answered — so
+        // a wall encoding HEVC could be announced in the PMT as H.264 (0x1B).
+        // Nothing downstream of the mux parses the elementary stream to notice.
+        // The chain is family-pure, so its head settles this even though the
+        // encoder has not opened yet.
+        if chain_is_hevc(&backend_chain) {
             muxer.set_video_stream_type(crate::engine::rtmp::ts_mux::STREAM_TYPE_H265);
         }
 
@@ -846,27 +886,65 @@ async fn run_compositor(
                     0,
                     &[],
                     0,
-                )?;
-                let (y, ys) = yuv.plane(0).ok_or(video_codec::VideoError::AllocFrame)?;
-                let (u, us) = yuv.plane(1).ok_or(video_codec::VideoError::AllocFrame)?;
-                let (v, vs) = yuv.plane(2).ok_or(video_codec::VideoError::AllocFrame)?;
+                )
+                .map_err(EncodeStep::Scale)?;
+                let (y, ys) = yuv.plane(0).ok_or(EncodeStep::MissingPlane("Y"))?;
+                let (u, us) = yuv.plane(1).ok_or(EncodeStep::MissingPlane("U"))?;
+                let (v, vs) = yuv.plane(2).ok_or(EncodeStep::MissingPlane("V"))?;
                 let pts_90k = frame_index * 90_000 / i64::from(config.fps.max(1));
-                Ok::<_, video_codec::VideoError>((
-                    encoder
-                        .encode_raw_planes(
-                            canvas.width,
-                            canvas.height,
-                            video_engine::av_pix_fmt_for_yuv(video_codec::VideoChroma::Yuv420, 8)
-                                .unwrap_or(0),
-                            y, ys, u, us, v, vs,
-                            Some(pts_90k),
-                        )
-                        .unwrap_or_default(),
-                    pts_90k,
-                ))
+                // **The encode result, not `unwrap_or_default()`.**
+                //
+                // The encoder lazy-opens on this call, so the whole backend
+                // chain refusing to open arrives here as an `Err`. Discarding it
+                // left the wall ticking forever with `canvas_frames` climbing,
+                // zero packets published, and nothing in a log or an event.
+                //
+                // Unreachable in practice while the chain was always `[X264]`,
+                // which essentially never fails `avcodec_open2` for a valid
+                // canvas. Honouring `config.codec` (#129) makes it reachable: an
+                // explicit backend resolves to a **one-element** chain with
+                // nothing to fall through to, and a hardware open fails for
+                // reasons the boot probe cannot see — sessions exhausted, a
+                // driver replaced, a render node re-permissioned.
+                let frames = encoder
+                    .encode_raw_planes(
+                        canvas.width,
+                        canvas.height,
+                        video_engine::av_pix_fmt_for_yuv(video_codec::VideoChroma::Yuv420, 8)
+                            .unwrap_or(0),
+                        y, ys, u, us, v, vs,
+                        Some(pts_90k),
+                    )
+                    .map_err(EncodeStep::Encode)?;
+                Ok::<_, EncodeStep>((frames, pts_90k))
             });
 
-            if let Ok((frames, pts_90k)) = encoded {
+            let (frames, pts_90k) = match encoded {
+                Ok(value) => value,
+                Err(EncodeStep::Encode(reason)) if !encoder.is_open() => {
+                    // **An encoder that never opened is a dead input, not a bad
+                    // frame.** `is_open()` is what separates the chain refusing
+                    // every candidate from an open encoder rejecting one canvas.
+                    // Returning routes through the Critical `mosaic_failed` event
+                    // `spawn_mosaic_input` already emits, which is the honest
+                    // operator-facing outcome: a wall that cannot encode is not a
+                    // wall, and it must not sit there looking alive.
+                    return Err(format!(
+                        "multiviewer wall on flow '{flow_id}': the canvas encoder never opened: {reason}"
+                    ));
+                }
+                Err(reason) => {
+                    // An open encoder that refused one canvas, or a colour
+                    // conversion that failed. Costs a frame, not the wall.
+                    tracing::warn!(
+                        flow_id = %flow_id,
+                        "mosaic: dropping a canvas frame: {reason}",
+                    );
+                    frame_index += 1;
+                    continue;
+                }
+            };
+            {
                 for ef in frames {
                     let ts = muxer.mux_video(
                         &ef.data,
@@ -949,28 +1027,155 @@ async fn run_compositor(
     }
 }
 
-/// Resolve and open the canvas encoder.
+/// The backends this canvas may be encoded with, head first.
 ///
-/// A default build has **no video encoder at all** — every backend resolves to
-/// `FeatureDisabled` — so this is where that becomes a named refusal naming the
-/// rebuild, rather than an obscure failure at the first frame.
+/// **Through the probe, never through `select_video_backend`.** That function
+/// answers a *compile-time* question — "is any encoder in this binary?" — by
+/// returning the first `cfg!` match in a fixed order, x264 first. It has no
+/// VAAPI or RKMPP arm at all, and its NVENC and QSV arms are gated
+/// `not(video-encoder-x264)`, which every published artefact defines. So it
+/// returns X264 unconditionally on every shipped build: a wall on an Intel host
+/// with 32 idle QSV sessions encoded on the CPU, and on `-rockchip` the VPU that
+/// artefact exists for sat idle. `MULTIVIEWER_PLAN.md` §6 forbids copying it
+/// here, by name, for exactly this reason; edge #129 is it having been copied.
+///
+/// `resolve_chain_for_video_encode_config` asks the *runtime* question instead,
+/// against probed `StaticCapabilities`, and honours the operator's `codec` —
+/// which `MosaicInputConfig::codec` has always documented as accepting
+/// `h264_auto` / `x264` / `h264_nvenc` / … and defaulting to `h264_auto`.
+///
+/// The chain is family-pure by construction (`auto_priority_chain` returns all
+/// H.264 backends or all HEVC ones), so a demote at `avcodec_open2` changes the
+/// backend and never the wire codec. That is what lets the caller settle the
+/// PMT stream type from this without waiting for the encoder to open.
+///
+/// Falls back to `select_video_backend` only where there is no probe snapshot —
+/// in-process tests and early startup — which is the presence question it is
+/// actually right for.
 #[cfg(feature = "media-codecs")]
-fn build_encoder(
-    config: &MosaicInputConfig,
+fn canvas_backend_chain(
+    video_cfg: &crate::config::models::VideoEncodeConfig,
     flow_id: &str,
-) -> Result<crate::engine::video_encode_util::ScaledVideoEncoder, String> {
-    use crate::config::models::VideoEncodeConfig;
-
-    let fps = u32::from(config.fps.max(1));
-    let backend = crate::engine::input_test_pattern::select_video_backend().ok_or_else(|| {
+    caps: Option<&crate::engine::hardware_probe::StaticCapabilities>,
+) -> Result<Vec<video_codec::VideoEncoderCodec>, String> {
+    let no_encoder = || {
         format!(
-            "no video encoder is compiled into this build, so a multiviewer wall has              nothing to publish its canvas with. Rebuild with an encoder alongside the              feature, e.g. --features \"multiviewer,video-encoder-x264\" (GPL v2+) or              --features \"multiviewer,video-encoder-nvenc\". Requested codec was '{}'.",
-            config.codec
+            "no video encoder is compiled into this build, so a multiviewer wall has \
+             nothing to publish its canvas with. Rebuild with an encoder alongside the \
+             feature, e.g. --features \"multiviewer,video-encoder-x264\" (GPL v2+) or \
+             --features \"multiviewer,video-encoder-nvenc\". Requested codec was '{}'.",
+            video_cfg.codec
         )
-    })?;
+    };
+    // **Nothing compiled in is a compile-time fact, answered before the
+    // resolver.** Mapping a resolver error onto it instead would over-fire —
+    // `hevc_auto` on an x264-only build fails to resolve and is not a
+    // no-encoder build — and would lose `FeatureDisabled`'s more precise text.
+    // This is also the message that names the rebuild, which was the whole point
+    // of having it and which became unreachable when the resolver moved in front.
+    if !crate::engine::hardware_probe::any_video_encoder_compiled() {
+        return Err(no_encoder());
+    }
+    // Caps arrive as an argument rather than out of the global, so this is a
+    // pure function of `(cfg, caps)` — which is what lets a test drive the
+    // Rockchip, NVIDIA and bare-CPU hosts on an x86 runner, as
+    // `MULTIVIEWER_PLAN.md` §6 requires. `install_static_capabilities` is a
+    // set-once `OnceLock`, so faking the global would leak into every other test
+    // in the binary.
+    if let Some(caps) = caps {
+        let chain = crate::engine::hardware_probe::resolve_video_encoder_chain(
+            &video_cfg.codec,
+            video_cfg.chroma.as_deref(),
+            video_cfg.bit_depth,
+            Some(caps),
+        )
+        .map_err(|e| {
+                format!(
+                    "multiviewer wall on flow '{flow_id}': no encoder can carry codec '{}': {}",
+                    video_cfg.codec,
+                    e.message()
+                )
+            })?;
+        if chain.is_empty() {
+            return Err(no_encoder());
+        }
+        tracing::info!(
+            "multiviewer wall on flow '{flow_id}': codec '{}' resolved to {:?}",
+            video_cfg.codec,
+            chain.iter().map(|r| r.ffmpeg_name()).collect::<Vec<_>>(),
+        );
+        return Ok(chain.iter().map(|r| r.as_video_encoder_codec()).collect());
+    }
+    // No probed snapshot — the compile-time answer is the only one available,
+    // and it is the question `select_video_backend` genuinely answers.
+    crate::engine::input_test_pattern::select_video_backend()
+        .map(|backend| vec![backend])
+        .ok_or_else(no_encoder)
+}
 
-    let video_cfg = VideoEncodeConfig {
-        codec: crate::engine::input_test_pattern::backend_codec_string(backend).to_string(),
+/// The wire codec family a chain will produce.
+///
+/// Safe to read off the head: the chain is family-pure, so a fall-through at
+/// open time cannot change the answer. The PMT depends on this.
+#[cfg(feature = "media-codecs")]
+fn chain_is_hevc(chain: &[video_codec::VideoEncoderCodec]) -> bool {
+    // `family()` rather than a local `matches!` over the HEVC variants: that
+    // duplicate would compile happily after a new backend is added upstream and
+    // put stream_type 0x1B on an HEVC elementary stream, which nothing
+    // downstream of the mux parses the ES to notice.
+    chain.first().map(|codec| codec.family()) == Some(video_codec::VideoCodec::Hevc)
+}
+
+/// Why one canvas frame did not reach the muxer.
+///
+/// Typed rather than a bare string because the caller has to tell **the encoder
+/// never opened** — a dead wall — from an open encoder refusing one frame, which
+/// costs a frame. `ScaledVideoEncoder::is_open()` makes that call; this carries
+/// the reason so whichever way it goes, it is named.
+#[cfg(feature = "media-codecs")]
+#[derive(Debug)]
+enum EncodeStep {
+    Scale(video_codec::VideoError),
+    MissingPlane(&'static str),
+    Encode(String),
+}
+
+#[cfg(feature = "media-codecs")]
+impl std::fmt::Display for EncodeStep {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            EncodeStep::Scale(e) => write!(f, "canvas colour conversion failed: {e}"),
+            EncodeStep::MissingPlane(p) => write!(f, "canvas frame missing {p} plane"),
+            EncodeStep::Encode(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+/// The `video_encode` config a wall's canvas is encoded with.
+///
+/// Lifted out of [`build_encoder`] so the **resource-cost model resolves the
+/// same backend the compositor will actually open**. `derive_cost_plan` has no
+/// other way in — a mosaic carries no `video_encode` block of its own — and
+/// without this it falls through to `HwEncoderFamily::classify`, a substring
+/// match that returns `None` for `h264_auto` and bills every wall as a software
+/// encode. The manager emits `h264_auto` for every wall it deploys and offers no
+/// dropdown, so that is *every* wall.
+///
+/// Harmless while the canvas always ran x264 — software billing was accidentally
+/// right. Once the canvas started resolving hardware (#129) it became an
+/// undercount that hides a real QSV/NVENC session from the
+/// `hw_encoder_oversubscribed` watchdog and from the manager's Resources card.
+pub(crate) fn mosaic_video_encode_config(
+    config: &MosaicInputConfig,
+) -> crate::config::models::VideoEncodeConfig {
+    use crate::config::models::VideoEncodeConfig;
+    let fps = u32::from(config.fps.max(1));
+    VideoEncodeConfig {
+        // **The operator's codec, carried through.** This used to be
+        // overwritten with `backend_codec_string(select_video_backend())`, so
+        // `config.codec` reached the encoder only as text in an error message:
+        // a wall asked for HEVC was given H.264, silently (#129).
+        codec: config.codec.clone(),
         width: Some(config.width),
         height: Some(config.height),
         fps_num: Some(fps),
@@ -999,11 +1204,34 @@ fn build_encoder(
         color_range: None,
         source_video_pid: None,
         hw_decode: None,
-    };
+    }
+}
 
-    let mut encoder = crate::engine::video_encode_util::ScaledVideoEncoder::new(
+/// Resolve and open the canvas encoder.
+///
+/// A default build has **no video encoder at all** — every backend resolves to
+/// `FeatureDisabled` — so this is where that becomes a named refusal naming the
+/// rebuild, rather than an obscure failure at the first frame.
+///
+/// Returns the resolved chain alongside the encoder: the caller settles the
+/// PMT's `stream_type` from it, and asking a second, separate question there is
+/// how a wall could encode HEVC and be announced as H.264.
+#[cfg(feature = "media-codecs")]
+fn build_encoder(
+    config: &MosaicInputConfig,
+    flow_id: &str,
+) -> Result<(crate::engine::video_encode_util::ScaledVideoEncoder, Vec<video_codec::VideoEncoderCodec>), String> {
+    let fps = u32::from(config.fps.max(1));
+    let video_cfg = mosaic_video_encode_config(config);
+
+    let chain = canvas_backend_chain(
+        &video_cfg,
+        flow_id,
+        crate::engine::hardware_probe::static_capabilities().as_deref(),
+    )?;
+    let mut encoder = crate::engine::video_encode_util::ScaledVideoEncoder::with_backend_chain(
         video_cfg,
-        backend,
+        chain.clone(),
         fps,
         1,
         false,
@@ -1025,7 +1253,7 @@ fn build_encoder(
     // `the_canvas_encoder_declares_90khz_pts` below, because there is no
     // runtime signal that would catch it.
     encoder.set_pts_90k();
-    Ok(encoder)
+    Ok((encoder, chain))
 }
 
 /// Paint a badge over a tile.
@@ -1300,7 +1528,7 @@ mod tests {
         if crate::engine::input_test_pattern::select_video_backend().is_none() {
             return;
         }
-        let encoder = build_encoder(&cfg(vec![tile("a", 0, 0, 64, 64, Some("in-a"))]), "test")
+        let (encoder, _chain) = build_encoder(&cfg(vec![tile("a", 0, 0, 64, 64, Some("in-a"))]), "test")
             .expect("an encoder backend is compiled in");
         assert!(
             encoder.is_pts_90k(),
@@ -1462,6 +1690,154 @@ mod tests {
     /// The compositor cannot reach an output without one — the flow bus carries
     /// MPEG-TS — so a head here would appear in the operator's picker and fail
     /// at flow start. The condition is the same one gating the `mv-compositor`
+    /// The canvas honours the operator's codec, and the PMT follows it.
+    ///
+    /// Both halves of #129. `build_encoder` used to overwrite `config.codec`
+    /// with `backend_codec_string(select_video_backend())` — always `x264` on a
+    /// shipped build — so a wall asked for HEVC silently got H.264, and the
+    /// muxer asked `select_video_backend()` a second time rather than reading
+    /// what had just been resolved.
+    #[cfg(feature = "media-codecs")]
+    #[test]
+    fn the_pmt_family_read_matches_the_encoders_own() {
+        // Deliberately needs no encoder feature and no probe: CI runs
+        // `--features multiviewer` over the default set, which compiles in no
+        // `video-encoder-*` at all, so anything gated on a backend existing
+        // asserts nothing on the only machine that runs this automatically.
+        //
+        // Checked against `VideoEncoderCodec::family()` rather than a literal
+        // table, because `chain_is_hevc` hand-rolls what upstream already
+        // decides. A backend added to `auto_priority_chain` and missed in that
+        // `matches!` would put stream_type 0x1B on an HEVC elementary stream,
+        // with nothing downstream parsing the ES to notice.
+        use video_codec::VideoEncoderCodec as C;
+        for backend in [
+            C::X264, C::X265,
+            C::H264Nvenc, C::HevcNvenc,
+            C::H264Qsv, C::HevcQsv,
+            C::H264Vaapi, C::HevcVaapi,
+            C::H264Rkmpp, C::HevcRkmpp,
+        ] {
+            assert_eq!(
+                chain_is_hevc(&[backend]),
+                backend.family() == video_codec::VideoCodec::Hevc,
+                "chain_is_hevc disagrees with the codec's own family for {backend:?}",
+            );
+        }
+        assert!(!chain_is_hevc(&[]), "no chain is not an HEVC chain");
+    }
+
+    /// The resolver picks the host's hardware, on hosts this runner is not.
+    ///
+    /// `MULTIVIEWER_PLAN.md` §6 requires exactly this — "that resolution must
+    /// itself be unit-tested against synthetic `StaticCapabilities` so the
+    /// rk3588 case is covered on an x86 runner". Possible because
+    /// `canvas_backend_chain` takes its caps as an argument instead of reading
+    /// the set-once global.
+    ///
+    /// **A backend needs both halves**: `host_supports_encoder` intersects the
+    /// compiled-in Cargo feature with the probed host capability, so synthetic
+    /// caps alone cannot conjure RKMPP into a binary that lacks the feature —
+    /// and *that* is the honest assertion. Each host below is checked against
+    /// its `cfg!`: where the feature is in, the hardware must lead; where it is
+    /// not, the wall must still resolve and fall to the CPU tail rather than
+    /// refusing. Writing it as a bare "rk3588 leads with its VPU" made the test
+    /// pass only on a Rockchip build and fail everywhere else.
+    #[cfg(feature = "media-codecs")]
+    #[test]
+    fn the_canvas_resolves_the_hosts_hardware_not_the_binarys_first_arm() {
+        use crate::engine::hardware_probe::{HwCodecCapability, tests::make_caps};
+        use video_codec::VideoEncoderCodec as C;
+
+        let chain_on = |codec: &str, caps: &_| {
+            let mut c = cfg(vec![tile("a", 0, 0, 64, 64, Some("in-a"))]);
+            c.codec = codec.to_string();
+            canvas_backend_chain(&mosaic_video_encode_config(&c), "test", Some(caps))
+        };
+
+        // (host capability, the feature that must also be compiled in, the
+        // backend that should then lead) — the whole point of #129 is that
+        // `select_video_backend` could never reach the last two at all.
+        let hosts: [(HwCodecCapability, bool, C); 4] = [
+            (HwCodecCapability { h264_rkmpp: true, ..Default::default() },
+             cfg!(feature = "video-encoder-rkmpp"), C::H264Rkmpp),
+            (HwCodecCapability { h264_nvenc: true, ..Default::default() },
+             cfg!(feature = "video-encoder-nvenc"), C::H264Nvenc),
+            (HwCodecCapability { h264_qsv: true, ..Default::default() },
+             cfg!(feature = "video-encoder-qsv"), C::H264Qsv),
+            (HwCodecCapability { h264_vaapi: true, ..Default::default() },
+             cfg!(feature = "video-encoder-vaapi"), C::H264Vaapi),
+        ];
+
+        for (caps, compiled_in, expected) in hosts {
+            let caps = make_caps(caps);
+            let Ok(chain) = chain_on("h264_auto", &caps) else {
+                // No encoder in this build at all — nothing to assert about
+                // which one leads. `any_video_encoder_compiled` covers that.
+                continue;
+            };
+            assert!(!chain.is_empty(), "a resolved chain is never empty");
+            if compiled_in {
+                assert_eq!(
+                    chain.first(),
+                    Some(&expected),
+                    "{expected:?} is compiled in and the host has it, so it must lead: {chain:?}",
+                );
+            } else {
+                assert_ne!(
+                    chain.first(),
+                    Some(&expected),
+                    "{expected:?} is not compiled into this build and must not be selected",
+                );
+            }
+            // Whatever leads, an H.264 request stays an H.264 chain — the PMT
+            // is settled from its head before the encoder opens.
+            assert!(
+                chain.iter().all(|b| b.family() != video_codec::VideoCodec::Hevc),
+                "an H.264 request resolved a mixed-family chain: {chain:?}",
+            );
+        }
+
+        // A host with no hardware at all still gets a wall: the CPU tail is the
+        // floor, not a failure.
+        let bare = make_caps(HwCodecCapability::default());
+        if let Ok(chain) = chain_on("h264_auto", &bare) {
+            assert!(!chain.is_empty(), "a bare host still resolves the CPU tail: {chain:?}");
+            assert!(chain.iter().all(|b| b.family() != video_codec::VideoCodec::Hevc));
+        }
+    }
+    /// A resolved chain never mixes families.
+    ///
+    /// Load-bearing rather than incidental: the PMT stream type is settled from
+    /// the chain's head before the encoder opens, so a chain that could demote
+    /// from HEVC to H.264 at `avcodec_open2` would put the wrong `stream_type`
+    /// on the wire with nothing downstream parsing the ES to notice.
+    #[cfg(feature = "media-codecs")]
+    #[test]
+    fn a_resolved_chain_is_family_pure() {
+        if crate::engine::hardware_probe::static_capabilities().is_none() {
+            return;
+        }
+        for (codec, want_hevc) in [("h264_auto", false), ("hevc_auto", true)] {
+            let mut config = cfg(vec![tile("a", 0, 0, 64, 64, Some("in-a"))]);
+            config.codec = codec.to_string();
+            let Ok((_, chain)) = build_encoder(&config, "test") else {
+                continue;
+            };
+            for backend in &chain {
+                assert_eq!(
+                    chain_is_hevc(std::slice::from_ref(backend)),
+                    want_hevc,
+                    "{codec} resolved a mixed-family chain: {chain:?}",
+                );
+            }
+        }
+    }
+
+    /// A node with no encoder backend advertises no head at all.
+    ///
+    /// The manager must not offer a wall on a node that would refuse it at flow
+    /// start. The condition is the same one gating the `mv-compositor`
     /// capability bit, and the two must not drift apart.
     #[test]
     fn a_head_is_advertised_only_when_an_encoder_backend_resolves() {

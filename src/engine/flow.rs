@@ -6068,6 +6068,13 @@ fn input_video_encode_is_transcode(inp: &crate::config::models::InputDefinition)
         InputConfig::St2110_20(_) | InputConfig::St2110_23(_) => false,
         #[cfg(feature = "mxl")]
         InputConfig::MxlVideo(_) => false,
+        // A wall encodes but does not *transcode*: its tiles are decoded by
+        // `video_engine::VideoDecoder::open`, which is `DecoderBackend::Cpu`
+        // unconditionally. Pairing a decoder session here would charge an
+        // NVDEC/QSV/VAAPI session that never opens, and could raise a spurious
+        // `hw_decoder_oversubscribed` off it.
+        #[cfg(feature = "multiviewer")]
+        InputConfig::Mosaic(_) => false,
         _ => true,
     }
 }
@@ -6331,6 +6338,28 @@ fn derive_cost_plan(flow: &ResolvedFlow) -> crate::engine::hardware_probe::FlowC
             plan.audio_encode_inputs = plan.audio_encode_inputs.saturating_add(1);
         }
         if let Some(codec) = video {
+            // **A wall's encoder has no `video_encode` block, so synthesise the
+            // one the compositor actually opens.** Without it `ve` is `None`,
+            // the resolver branch below is skipped, and `HwEncoderFamily::classify`
+            // — a substring match — returns `None` for `h264_auto`, so the wall
+            // is billed as a software encode. That was accidentally right while
+            // the canvas always ran x264; since it resolves hardware (#129) it
+            // hides a real QSV/NVENC session from the oversubscribe watchdog and
+            // from the manager's Resources card. The manager emits `h264_auto`
+            // for every wall it deploys, so this is every wall, not a corner.
+            //
+            // Same struct the compositor builds, by construction, so the cost
+            // model and the runtime cannot resolve different backends.
+            #[cfg(feature = "multiviewer")]
+            let synthesised = match &inp.config {
+                InputConfig::Mosaic(c) => {
+                    Some(crate::engine::input_mosaic::mosaic_video_encode_config(c))
+                }
+                _ => None,
+            };
+            #[cfg(feature = "multiviewer")]
+            let ve = input_video_encode_block(inp).or(synthesised.as_ref());
+            #[cfg(not(feature = "multiviewer"))]
             let ve = input_video_encode_block(inp);
             let (w, h, fn_, fd, bd, chroma) = match ve {
                 Some(v) => (

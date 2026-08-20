@@ -139,8 +139,13 @@ jobs:
           # clang, openssl), vendored FFmpeg via media-codecs (nasm), and the
           # `display` output's alsa-sys link (libasound2-dev).
           sudo apt-get update
+          # `libx264-dev` is for the multiviewer gates below, not the default
+          # set: without a `video-encoder-*` feature the mosaic compiles but
+          # every one of its encoder-resolution tests short-circuits, because
+          # `any_video_encoder_compiled()` is false and no chain ever resolves.
+          # One apt package is what makes those assertions actually run.
           sudo apt-get install -y cmake make clang libclang-dev pkg-config \
-            libssl-dev g++ libasound2-dev nasm
+            libssl-dev g++ libasound2-dev nasm libx264-dev
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -173,9 +178,16 @@ jobs:
       # `sdi-decklink` sat in until the gate below it was written.
       #
       # Unconditional and cheap: `multiviewer` implies only `media-codecs`,
-      # already in the default set, so it adds no apt dependency and reuses the
-      # target dir `cargo check` just filled. docs/MULTIVIEWER_PLAN.md §6.3
-      # item 1.
+      # already in the default set, and it reuses the target dir `cargo check`
+      # just filled. docs/MULTIVIEWER_PLAN.md §6.3 item 1.
+      #
+      # **Paired with `video-encoder-x264`**, which costs one apt package and is
+      # what makes the encoder half testable at all. Without a `video-encoder-*`
+      # feature `any_video_encoder_compiled()` is false, `canvas_backend_chain`
+      # refuses before it resolves, and every assertion about which backend a
+      # wall picks passes vacuously — including the synthetic-capabilities test
+      # §6 requires precisely so the rk3588 case is covered on an x86 runner.
+      # GPL is not a concern here: CI builds nothing that is distributed.
       #
       # **Clippy only, no separate `cargo check`.** §6.3 lists both, and a
       # `cargo check --all-targets --locked --features multiviewer` step did
@@ -187,7 +199,7 @@ jobs:
       # because at the time no clippy-with-feature step was proposed.
       - name: cargo clippy (multiviewer)
         working-directory: bilbycast-edge
-        run: cargo clippy --all-targets --locked --features multiviewer -- -D warnings
+        run: cargo clippy --all-targets --locked --features "multiviewer video-encoder-x264" -- -D warnings
 
       # ─── SDI (DeckLink) compile gate ─────────────────────────────────────
       # The ~2.2k lines behind `sdi-decklink` were never compiled anywhere in
@@ -298,4 +310,4 @@ jobs:
       # sides rather than a compile error anywhere.
       - name: cargo test (multiviewer)
         working-directory: bilbycast-edge
-        run: cargo test --locked --features multiviewer --lib --test mosaic_wire_shape
+        run: cargo test --locked --features "multiviewer video-encoder-x264" --lib --test mosaic_wire_shape
