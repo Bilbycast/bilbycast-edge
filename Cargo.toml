@@ -54,6 +54,18 @@ identity_op = "allow"
 # "the sample rate is not known yet", which is the condition the reader cares
 # about, not "this division might trap".
 manual_checked_ops = "allow"
+# New in clippy 1.98, and it turned `main` red on a toolchain bump alone — CI
+# tracks `dtolnay/rust-toolchain@stable`, so 32 pre-existing call sites became
+# errors under `-D warnings` with no commit touching them.
+#
+# The suggestion is not a rename. `chunks_exact(TS_PACKET_SIZE)` yields
+# `&[u8]`; `as_chunks::<TS_PACKET_SIZE>().0` yields `&[[u8; 188]]`, so every
+# loop body would be retyped from slice to fixed array. That is a mechanical
+# edit across the TS demux, the PID filter and the PTS rewriter — the packet
+# hot path — for no functional or performance gain, and the two forms discard
+# the trailing partial chunk identically. Not a risk worth taking on the paths
+# where a mistake is a corrupted transport stream.
+chunks_exact_to_as_chunks = "allow"
 # Index arithmetic over byte, sample and pixel buffers is the domain language
 # here — `for b in dpos + 2..dpos + 2 + dlen` walks a descriptor body, and the
 # iterator rewrite is longer and easier to get wrong. Rewriting 27 such loops
