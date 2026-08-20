@@ -10,6 +10,7 @@ This document covers the authentication, authorization, and transport security a
 - [OAuth 2.0 Client Credentials Flow](#oauth-20-client-credentials-flow)
 - [JWT Token Structure and Validation](#jwt-token-structure-and-validation)
 - [Role-Based Access Control (RBAC)](#role-based-access-control-rbac)
+- [Browser-origin policy](#browser-origin-policy)
 - [TLS/HTTPS Setup](#tlshttps-setup)
 - [Auth Configuration Reference](#auth-configuration-reference)
 - [Getting Started with API Security](#getting-started-with-api-security)
@@ -33,8 +34,9 @@ bilbycast-edge implements a self-contained API security layer with the following
 5. **Public endpoints** -- `/health`, `/oauth/token`, and `/setup` are always accessible without authentication. `/metrics` is public by default but can be placed behind auth. The `/setup` wizard is gated by the `setup_enabled` config flag (default: true for unprovisioned nodes) and is intended for initial provisioning. Once the node successfully registers with a manager, `setup_enabled` is automatically flipped to `false` and persisted, so `/setup` returns a "Setup Disabled" page on subsequent starts.
 6. **NMOS endpoint auth** -- NMOS IS-04, IS-05, and IS-08 endpoints require JWT Bearer auth by default whenever `auth.enabled` is `true`. Set `nmos_require_auth: false` to explicitly opt out (a loud `SECURITY:` warning is logged at startup). When auth is disabled, NMOS endpoints stay public. Both `admin` and `monitor` roles have access.
 7. **OAuth token rate limiting** -- The `/oauth/token` endpoint is rate-limited per client IP address to prevent brute-force attacks on client credentials. Default: 10 requests per minute per IP. Configurable via `token_rate_limit_per_minute`.
+8. **Browser-origin policy** -- The private API sends no CORS headers at all, and browser-initiated state changes on `/api/v1/**` and `/x-nmos/**` are refused with HTTP 403 regardless of whether auth is enabled. See [Browser-origin policy](#browser-origin-policy) below.
 
-When the `auth` configuration block is absent or has `enabled: false`, all endpoints are open with no authentication. This is suitable for development but should never be used in production.
+When the `auth` configuration block is absent or has `enabled: false`, all endpoints are open with no authentication. This is suitable for development but should never be used in production. **One exception**: browser-initiated state changes on `/api/v1/**` and `/x-nmos/**` are refused with HTTP 403 whether or not auth is enabled -- see [Browser-origin policy](#browser-origin-policy).
 
 ---
 
@@ -210,6 +212,63 @@ endpoint (`/api/v1/ptp`).
 - The auth middleware validates the JWT and inserts the `Claims` (including `role`) into the request extensions.
 - Write endpoints use a `RequireAdmin` extractor that checks `claims.role == "admin"` and returns HTTP 403 if not.
 - When auth is disabled (no `AuthState`), the `RequireAdmin` extractor creates a synthetic `admin` identity, allowing all operations.
+
+---
+
+## Browser-origin policy
+
+RBAC answers "who may do this". This section answers a different question: "may a **web page** the operator happened to load do this at all". The two are independent, and this one applies even with auth off.
+
+### No CORS on the private API
+
+The edge API used to run a permissive CORS layer -- `Access-Control-Allow-Origin: *` on every route. Auth is off in the shipped default, so any page the operator had open could `fetch('http://<edge>:8080/api/v1/config')`, read the response through the wildcard, and harvest the SRT passphrases and RTMP stream keys that live in `config.json` by design (see "Config file security" below -- that placement is deliberate, for manager-UI visibility).
+
+The private API now sends **no `Access-Control-*` header on any route**, unmatched paths included: the router carries an explicit not-found fallback so a layered NMOS default cannot answer an unmatched path with a wildcard. This costs nothing outside a browser -- CORS is a browser-only mechanism, and `curl`, Prometheus, the manager's outbound WebSocket and every native NMOS controller never read those headers.
+
+Exactly two surfaces still carry CORS, each because it has a genuine browser client:
+
+| Surface | Policy |
+|---------|--------|
+| `/x-nmos/**` | Wildcard origin (AMWA requires NMOS APIs to support CORS, and IS-04 discovery is public by specification), but **safe methods only** unless `server.nmos_browser_control` names the controller's origin. |
+| The four WHIP / WHEP signalling routes | Their own CORS, with auth applied *inside* it. Browsers are the documented client and RFC 9725 requires preflight support. |
+
+### The cross-origin write guard
+
+CORS stops a browser *reading* a response. It never stops the *write*: a request with no non-safelisted header and no non-safelisted content type is "simple" and is never preflighted. `POST /api/v1/flows/{id}/stop` takes no body extractor, so before this guard any page the operator loaded could take a live flow off air on an auth-off node.
+
+`guard_cross_origin_write` therefore sits on **both** mutation surfaces -- `/api/v1/**` (inside the auth middleware, so it can read `Claims`) and `/x-nmos/**`. A request passes if any of the following holds:
+
+- the method is safe (`GET`, `HEAD`, `OPTIONS`);
+- the request carries valid `Claims` (i.e. a Bearer token was accepted);
+- the request carries **no browser fingerprint** -- no `Sec-Fetch-*` header, and either no `Origin` or an `Origin` matching the authority it was addressed to. Every current browser stamps `Sec-Fetch-*` on every request it issues; `curl`, the AMWA testing tool and native NMOS controllers stamp none, so on-prem controllers are unaffected;
+- the `Origin` is listed in `server.nmos_browser_control` (**`/x-nmos/**` only** -- the private API's allow-list is empty by construction, because no browser client of `/api/v1` writes: the monitor dashboard and the setup wizard both fetch relative paths off their own origins).
+
+Everything else gets HTTP 403 with:
+
+```json
+{
+  "success": false,
+  "error": "browser-initiated state changes are refused; use a Bearer token, a non-browser client, or list the controller's origin in server.nmos_browser_control"
+}
+```
+
+Each refusal also logs a `SECURITY:` warning with the matched route, the method and a since-boot refusal count. The `Origin` is deliberately **not** logged: one attacker-sized string per forged request would be a journal-amplification primitive on a box whose disk carries media.
+
+### `server.nmos_browser_control`
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `nmos_browser_control` | array of strings (optional) | *unset / empty* | Browser origins permitted to drive **NMOS connection management** (IS-05 `PATCH .../staged` and `.../activate`, IS-08 `POST /map/*`) from a web page. Exact scheme + authority, no trailing slash, no wildcard -- e.g. `["https://nmos-js.example.tv"]`. Once the list is **non-empty**, the NMOS preflight advertises `PATCH` / `POST` to **every** origin, not only the listed ones -- CORS cannot express a per-origin method set, and the layer is built once from "is the list empty". The write guard, not CORS, is what restricts the mutation itself: an unlisted origin that goes ahead and sends the `PATCH` still gets 403. Read once when the router is built, so a pushed change lands at the next restart (same as `server.auth` and `server.listen_addrs`); it is deliberately not re-read per request, so the guard takes no lock and cannot fail open. |
+
+It sits on `server`, alongside `auth` and `tls` -- not inside the `auth` block.
+
+### Residual risk, stated plainly
+
+This is mitigated-partially, not closed.
+
+- IS-05 / IS-08 writes remain **unauthenticated by specification** on auth-off nodes: anything on the LAN that is not a browser can still drive them.
+- With auth on, a `monitor`-role token is enough to re-point a live sender, because NMOS connection management deliberately does not require the `admin` role.
+- The AMWA NMOS Testing Tool has **not** been run against this policy. Its generic CORS check asserts that an `OPTIONS` advertises the methods a resource supports, which the default policy does not do for `.../staged` `PATCH`. `nmos_browser_control` is the supported way to restore that.
 
 ---
 
@@ -698,7 +757,8 @@ Note: Query parameter authentication is less secure than headers because tokens 
 - `config.json` contains operational configuration plus flow parameters. It is safe to inspect and back up (but note it contains user-configured credentials for protocols like SRT and RTSP).
 - When the manager requests the node's config (`GetConfig`), infrastructure secrets are stripped before sending — the manager never receives `node_secret`, tunnel keys, or TLS/auth config. Flow parameters are included for UI visibility.
 - Config changes via the API (PUT /api/v1/config) are persisted atomically: flow configs and operational fields to `config.json`, infrastructure secrets to `secrets.json` (write to temp file, then rename).
-- The auth section is not modifiable via the API -- it can only be changed by editing `secrets.json` and restarting.
+- A manager `update_config` push can **not** change this node's own `server.auth`, `server.tls` or `setup_token`. The edge drops manager-supplied values for exactly those three fields (`AppConfig::clear_node_local_secrets`) before merging its local secrets back in, so a compromised manager cannot switch off the node's API authentication. The guard is deliberately narrow: `tunnel_encryption_key` / `tunnel_bind_secret` (minted by the manager) and cellular uplink passwords (entered in the manager UI) are still accepted from a push, because those genuinely are manager-supplied.
+- A local, admin-authenticated `PUT /api/v1/config` **does** write the `server.auth` block it is given into `secrets.json`. The router resolves auth once, when it is built, so the change takes effect at the next restart -- not immediately. Omitting the block does not reliably delete it either: `secrets.json` is rewritten only when the extracted secret set is non-empty, so a push that empties every secret leaves the previous file, and therefore the previous auth config, in place.
 
 ---
 

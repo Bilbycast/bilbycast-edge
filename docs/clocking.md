@@ -554,8 +554,10 @@ mutually exclusive.
 
 ### Telemetry
 
-`OutputStats.epoch_lock` carries `engaged`, `disengaged`, `deficit_us`,
-`deficit_max_us`, `clamped`, `implausible`, and `anchor_generation`.
+`OutputStats.epoch_lock` carries `group_label`, `egress_offset_us`,
+`engaged`, `disengaged`, `deficit_us`, `deficit_max_us`, `clamped`,
+`implausible`, `anchor_generation`, and the mint observation pair
+`mint_pcr_27mhz` / `mint_unix_ns`.
 
 - `deficit_us` — this node released **late**: it cannot meet the offset.
   Remedy: raise the offset, or fix the slow path.
@@ -566,6 +568,17 @@ mutually exclusive.
   running, but it is *not aligned*.
 - `anchor_generation` — members on different generations are misaligned by
   the difference between their anchors, which no other field reveals.
+- `mint_pcr_27mhz` / `mint_unix_ns` — a source PCR this node saw and the
+  wall instant it had that content ready to release. The manager
+  normalises every member's pair onto one reference PCR and anchors on
+  the **slowest**, which is what makes the required dwell the inter-node
+  latency *spread* rather than the absolute end-to-end latency. Both read
+  **zero while the output is armed** — retired on adopt via
+  `clear_epoch_mint_observation`, because a dwelling emitter's dequeue
+  instant no longer answers "when did this node have this content". That
+  retirement is what lets the manager tell a fresh observation from a
+  frozen one, and therefore why a re-mint must withdraw the anchor first
+  rather than re-deriving the identical one.
 
 **This is not an alignment measurement.** A node cannot verify its own
 alignment; that needs an external observer timestamping every member

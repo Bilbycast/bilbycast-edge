@@ -1530,7 +1530,7 @@ All API errors return a JSON body with `"success": false` and an `"error"` messa
 |-------------|-----------|-------------|
 | 400 | Bad Request | Request body failed validation, malformed JSON, unsupported grant type |
 | 401 | Unauthorized | Missing or invalid Authorization header, expired token, bad signature |
-| 403 | Forbidden | Valid token but insufficient role (admin required) |
+| 403 | Forbidden | Valid token but insufficient role (admin required), **or** a browser-initiated state change refused by the cross-origin write guard — any non-safe method carrying `Sec-Fetch-*` metadata or a foreign `Origin`, with no Bearer token and no listed origin. That second cause applies on `/api/v1/**` and `/x-nmos/**` **even when auth is disabled** |
 | 404 | Not Found | Flow or output does not exist |
 | 409 | Conflict | Resource already exists, flow already running/stopped |
 | 500 | Internal Server Error | Disk I/O failure, engine error, JWT signing failure |
@@ -1544,10 +1544,16 @@ All API errors return a JSON body with `"success": false` and an `"error"` messa
   "error": "missing Authorization header"
 }
 
-// 403 Forbidden
+// 403 Forbidden — role
 {
   "success": false,
   "error": "admin role required"
+}
+
+// 403 Forbidden — cross-origin write guard
+{
+  "success": false,
+  "error": "browser-initiated state changes are refused; use a Bearer token, a non-browser client, or list the controller's origin in server.nmos_browser_control"
 }
 
 // 404 Not Found

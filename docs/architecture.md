@@ -541,8 +541,8 @@ The runtime never forwards the inputs' original TS bytes directly onto `broadcas
 ### Per-ES bus primitives (`engine/ts_es_bus.rs`)
 
 - **`EsPacket`** — one 188-byte TS packet (source bytes untouched) + `source_pid`, PMT `stream_type`, PUSI flag, `has_pcr`, extracted 27 MHz PCR value (when present), and the upstream `recv_time_us`. The source CC stays in-band for the assembler to rewrite.
-- **`NodeEsBus`** — node-wide `DashMap<(input_id, source_pid), broadcast::Sender<EsPacket>>`. Lazily creates the channel on first observation of a PID; channel capacity is stream-type aware (see `bus_capacity_for_stream_type` — 8192 slots for video, 1024 for audio/data, 512 for SCTE-35). Slow consumers see `RecvError::Lagged(n)` and drop — no cascade backpressure. PAT / PMT / NULL-PID packets are not published.
-- **`TsEsDemuxer`** — the per-input bridge. Parses the input's TS, maintains a per-input PSI catalogue via `ts_psi_catalog` (Phase 2), and publishes every ES packet onto its bus key. One demuxer per input; active whenever the flow is assembled.
+- **`NodeEsBus`** — node-wide `DashMap<(input_id, source_pid), broadcast::Sender<EsPacket>>`. Lazily creates the channel on first observation of a PID; channel capacity is stream-type aware (see `bus_capacity_for_stream_type` — 8192 slots for video, 1024 for audio/data, 512 for SCTE-35). Slow consumers see `RecvError::Lagged(n)` and drop — no cascade backpressure. PAT / PMT / NULL-PID packets are not published. **Publication is bounded per input by the demuxer**: at most 256 distinct PIDs, of which at most 32 may be undeclared (observed before their PMT). A breach drops that PID and every further new PID, and raises a latched Warning `pid_bus_pid_cap_reached`. The guard exists because a stream that is not 188-byte-aligned walks the PID space — a 204-byte Reed-Solomon capture read with a 188-byte stride yields hundreds of bogus PIDs — and would otherwise mint a permanent ring per bogus PID in a map with no eviction path. It is a cap and deliberately **not** a "publish only PMT-declared PIDs" rule: `ingest_pmt` parses only the first TS packet of a PMT section, so a multi-packet PMT's tail entries never reach `stream_types`, and a whitelist would silently drop those ES.
+- **`TsEsDemuxer`** — the per-input bridge. Parses the input's TS, maintains a per-input PSI catalogue via `ts_psi_catalog` (Phase 2), and publishes every ES packet onto its bus key. One demuxer per input; active whenever the flow is assembled. It keeps its own per-PID `Sender` cache so the shared `NodeEsBus` map is touched once per PID rather than once per packet, and it caches **positive resolutions only** — the cap is checked before the cache is written, so a PID refused during the pre-PMT window is re-evaluated on its next packet rather than being negatively cached.
 
 ### Decoded-ES cache for non-TS audio (`engine/input_pcm_encode.rs`)
 
@@ -597,7 +597,7 @@ The pattern is the operator-friendly answer to "share one input across multiple 
 | Stopping the flow drops siblings? | Only siblings referencing its inputs | Same — but more likely to have many |
 | UI badge | (none) | `INPUT HOST` (purple) on flow card + master flows page + Node Bus Sources pane chip |
 
-**Lifecycle dependency.** When the host flow is stopped, the input task is cancelled and its `broadcast::Sender<EsPacket>` drops. Sibling flows referencing the host's input via assembly slots see `RecvError::Closed` on the `(input_id, source_pid)` channel and the slot's fan-in task exits. `engine::ts_assembler::slot_fanin` distinguishes legitimate teardown (the parent assembler's `cancel.cancelled()` arm wins on flow stop / hot-swap / edge shutdown) from the unexpected upstream-close case — the latter emits a Warning `pid_bus_slot_source_closed` event with structured `details = { error_code, program_number, out_pid, source_input_id, source_pid }` so the operator sees why output went silent. The bus channel re-arms automatically when the host restarts and the next packet wakes the assembler — no operator-driven recovery step is needed.
+**Lifecycle dependency.** When the host flow is stopped, the input task is cancelled and stops publishing. Sibling flows referencing the host's input via assembly slots go silent, and each affected slot latches a Warning `pid_bus_slot_stalled` within ~5 s — `details = { error_code, flow_id, program_number, out_pid, input_id, source_pid, seconds_since_data }` — cleared by Info `pid_bus_slot_recovered` when the host restarts and packets resume. The `broadcast::Sender<EsPacket>` itself is **not** dropped: `NodeEsBus::channels` is append-only for the life of the node, so the sender outlives every producer. `slot_fanin`'s `RecvError::Closed` arm — and the Warning `pid_bus_slot_source_closed` it guards — is therefore a defensive tripwire that cannot fire in production; it is catalogued as such in [`events-and-alarms.md`](events-and-alarms.md). The bus channel re-arms automatically when the host restarts and the next packet wakes the assembler — no operator-driven recovery step is needed.
 
 **One owner per input.** Validation enforces that an input ID is in at most one **enabled** flow's `input_ids` (`config/validation.rs`). Disabled flows are exempt — operators can stage alternative wiring on a disabled flow and toggle `enabled` to switch. Cross-flow input *references* happen via `assembly`, never via duplicating the ID into a second flow's `input_ids`.
 
@@ -723,14 +723,22 @@ bitrates are 1000× lower:
 
 | Stream class | Capacity | Memory |
 |---|---:|---:|
-| Video (H.264, HEVC, MPEG-2, JPEG 2000, etc.) | 8 192 slots | ~480 KB / PID |
-| Audio (MP2, AAC, AC-3, E-AC-3, DTS, etc.) | 1 024 slots | ~60 KB / PID |
-| Data, private, DSM-CC | 1 024 slots | ~60 KB / PID |
-| SCTE-35 (`0x86`) | 512 slots | ~30 KB / PID |
-| Unknown / pre-PMT | 8 192 slots | ~480 KB / PID (safe video fallback) |
+| Video (H.264, HEVC, MPEG-2, JPEG 2000, etc.) | 8 192 slots | ~768 KiB / PID |
+| Audio (MP2, AAC, AC-3, E-AC-3, DTS, etc.) | 1 024 slots | ~96 KiB / PID |
+| Data, private, DSM-CC | 1 024 slots | ~96 KiB / PID |
+| SCTE-35 (`0x86`) | 512 slots | ~48 KiB / PID |
+| Unknown / pre-PMT | 8 192 slots | ~768 KiB / PID (safe video fallback) |
+
+The ring is a `Box<[Mutex<Slot<EsPacket>>]>` allocated **eagerly** at
+construction, and `Mutex<Slot<EsPacket>>` measures 96 B — so the memory
+column is `slots × 96 B`, paid in full the moment the channel is minted
+and retained for the life of the process, because the map is
+append-only. An earlier version of this table quoted ~480 KB / ~60 KB /
+~30 KB, which understated every row by a factor of 1.6.
 
 A typical SCTE-35 broadcast feed (1 video + 4 audio + 4 captions + 1
-SCTE-35) drops from ~4.9 MB to ~570 KB of bus-channel memory — ~88 %
-saved with no functional change. See
+SCTE-35) therefore costs ~1.6 MiB of bus-channel memory against ~7.5 MiB
+in the uniform-8192 model — about 79 % saved with no functional change
+(the source comment rounds this to ~75 %). See
 [`bus_capacity_for_stream_type`](../src/engine/ts_es_bus.rs) for the
 exact stream-type → capacity table.

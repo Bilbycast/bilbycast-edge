@@ -361,9 +361,23 @@ measure; skip it on un-metered links.
 
 ```json
 // AppConfig root — optional; only for a metered/rate-limited NIC:
-"bond_uplinks": [ { "interface": "eno4", "capacity_bps": 10000000 } ],
+"bond_uplinks": [
+  {
+    "interface": "eno4",
+    "capacity_bps": 10000000,
+    "min_viable_bps": 200000,      // optional
+    "demand_active_bps": 50000     // optional
+  }
+],
 "shared_leg_broker": true   // optional; unset = ON by default
 ```
+
+| Field | Required | Notes |
+|---|---|---|
+| `interface` | yes | NIC name (`eno4`, `wwp151s0u1i4`, `wlo5`), matched against each bonded leg's `interface`. Duplicate interfaces are refused. |
+| `capacity_bps` | yes | Physical uplink capacity in **bits** per second — the amount divided across every bonded flow sharing this NIC, and the ceiling the adaptive estimate never probes past. Must be in **[100 000, 400 000 000 000]** (100 kbps – 400 Gbps), so a value written in Mbps by mistake is refused at save time rather than silently capping every flow on the leg. |
+| `min_viable_bps` | no — default 200 kbps | Per-flow minimum-viable rate on this leg. When the viable minimums across the leg's flows exceed `capacity_bps`, the broker flags admission pressure and raises `bond_leg_oversubscribed`. Must be in `(0, capacity_bps]`. |
+| `demand_active_bps` | no — default 50 kbps | Activity-grace threshold: a flow delivering at least this on the leg keeps its min-viable reservation; below it, once the grace window lapses, the flow releases its share so a co-flow that actually wants the leg can use it. Must be in `(0, capacity_bps]`. Raise it when sporadic keyframe-duplication traffic on a leg a flow does not really use holds an unused reservation and starves the flow that does. |
 
 ### Honest limit
 

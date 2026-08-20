@@ -1,6 +1,6 @@
 # Configuration Reference
 
-> ⚠️ **SUPERSEDED — legacy version-1 model.** This document describes the legacy **version-1 inline-flow** config model, where each flow embedded its `input` and `outputs` directly. The current schema is **version 2**, which makes inputs and outputs top-level, first-class entities that flows reference by ID (`input_ids` / `output_ids`). The authoritative, up-to-date reference is **[docs/configuration-guide.md](configuration-guide.md)** — use it for all new work. The persistence, secrets-split, and manager-update concepts below remain accurate, but the inline-flow JSON examples do not reflect the current shape.
+> ⚠️ **SUPERSEDED — legacy version-1 model.** This document describes the legacy **version-1 inline-flow** config model, where each flow embedded its `input` and `outputs` directly. The current schema is **version 2**, which makes inputs and outputs top-level, first-class entities that flows reference by ID (`input_ids` / `output_ids`). The authoritative, up-to-date reference is **[docs/configuration-guide.md](configuration-guide.md)** — use it for all new work, including the SRT advanced socket parameters that used to be documented only here. The persistence and secrets-split concepts below still hold, and the manager-update section has been re-checked against the shipping `update_config` path, but the inline-flow JSON examples and every field table do not reflect the current shape. Where this page and the guide disagree, the guide wins.
 
 bilbycast-edge is configured via two JSON files:
 
@@ -54,9 +54,15 @@ When the manager sends an `update_config` or `update_flow` command:
 6. The in-memory config is updated and **saved to disk** (operational fields to `config.json`, secrets to `secrets.json`)
 7. A `command_ack` is sent back to the manager
 
-**Fields replaced** by UpdateConfig: `flows`, `tunnels`, `server`, `monitor`
+**Replaced wholesale** by an `update_config` push — whatever the push carries becomes the node's value: `inputs`, `outputs`, `flows`, `flow_groups`, `tunnels`, `server`, `cellular_uplinks`, `starlink_uplinks`, `bond_uplinks`, `shared_leg_broker`. The last two are additionally re-applied to the live shared-leg capacity broker on every push, so an edit takes effect without a node restart.
 
-**Fields preserved** (not overwritten): `version`, `node_id`, `device_name`, `setup_enabled`, `manager` (connection credentials)
+**Preserved when the push omits the key**: `monitor`, `upgrades`, `resource_limits`, `logging`, `nmos_registration`, `device_name`, `tuning`. The manager does not manage these node-local blocks, so an absent key means "not mine to touch", not "clear it". Clearing one therefore needs an **explicit empty value** — the manager's Tuning tab sends `"tuning": {}` for exactly this reason. Note the asymmetry: a push that *does* carry one of these keys overwrites it like any other field.
+
+**Never taken from the push**: infrastructure secrets — `server.tls`, `server.auth` and the setup token are cleared from the incoming config (`clear_node_local_secrets`) and re-merged from the node's own `secrets.json` before validation, so a manager cannot disable this node's API authentication. Each flow's **active input** is held to whatever is on air (`hold_active_inputs`); activation belongs to the `activate_input` command, so restoring a config never performs a Take.
+
+The `manager` block — connection URL, `node_id`, `node_secret`, `registration_token` — is also never taken from a push, but by a **different mechanism**, and the difference is worth knowing. `clear_node_local_secrets` does *not* clear it, and `SecretsConfig::merge_into` only fills values the push left *absent*, so an explicitly-named `node_secret` would win that merge. What actually protects the block is the apply step: it copies a fixed list of fields out of the pushed config, and `manager` is not on that list — so neither the in-memory config nor `secrets.json` picks up manager credentials from an `update_config`. The only things that write it are registration (which stores the issued `node_id` / `node_secret` and clears the registration token) and the explicit `rotate_secret` command.
+
+> The current, authoritative field-by-field reference is [`configuration-guide.md`](configuration-guide.md) — including the version-2 top-level `inputs` / `outputs` arrays, which the list above mentions but the JSON examples further down this page predate.
 
 ### Reboot behavior
 

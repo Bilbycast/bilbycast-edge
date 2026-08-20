@@ -64,13 +64,18 @@ any frame is encoded.
 | **NVDEC** (`video-decoder-nvdec`) | ✓ zero-copy scanout | ✓ (Auto resolves it on NVIDIA hosts) | x86_64; 4:2:0 only |
 | **QSV-decode** (`video-decoder-qsv`) | ✓ | ✓ (Auto resolves it on Intel iGPU hosts) | x86_64; 4:2:0 only |
 | **VAAPI-decode** (`video-decoder-vaapi`) | ✓ zero-copy DMA-BUF | ✓ (Auto preferred on Intel iHD / AMD radeonsi) | Linux; Intel iHD does 4:2:2 + Main10 |
+| **RKMPP-decode** (`video-decoder-rkmpp`) | ✓ zero-copy DRM_PRIME | ✓ (Auto resolves it on Rockchip hosts) | aarch64 Rockchip RK3568 / RK3588 only. **8-bit 4:2:0 only** — the DRM hwcontext RKMPP rides on reports `sw_format` for `DRM_FORMAT_NV12` and nothing else (mainline libdrm has no `DRM_FORMAT_NV12_10`), so a 10-bit stream cannot be downloaded to sysmem and the output demotes to CPU decode. **No MPEG-2**: the vendored rkmpp FFmpeg fork registers no MPEG-2 decoder, so `(Rkmpp, Mpeg2)` maps to `None` and MPEG-2 is pinned to CPU. Shipped enabled in the `*-aarch64-linux-rockchip` artefact. |
 
 **Auto resolution priority** (display + transcode share the same
 priority via [`resolve_display_decoder`] and [`resolve_transcode_decoder`]):
 
 ```
-VAAPI ≻ NVDEC ≻ QSV ≻ CPU
+VAAPI ≻ NVDEC ≻ QSV ≻ RKMPP ≻ CPU
 ```
+
+RKMPP sits second-to-last but is never actually contending: it only ever
+compiles on ARM Rockchip, where VAAPI / NVDEC / QSV do not exist, so on
+those boards it is the only hardware option ahead of the CPU last resort.
 
 The display path also relies on KMS atomic-commit zero-copy (VAAPI →
 DRM PRIME); the transcode path doesn't get the same fast path but
@@ -157,6 +162,7 @@ tooltip.
 | `video-decoder-nvdec` | `video-decoder-nvdec` + runtime probe | NVDEC decode available (transcode + display) |
 | `video-decoder-qsv` | `video-decoder-qsv` + runtime probe | QSV decode available |
 | `video-decoder-vaapi` | `video-decoder-vaapi` + runtime probe | VAAPI decode available |
+| `video-decoder-rkmpp` | `video-decoder-rkmpp` + runtime probe | RKMPP decode available (Rockchip RK3568/RK3588); shipped in the `*-aarch64-linux-rockchip` artefact |
 | `display` | `display` + ≥ 1 KMS connector enumerated | Local-display output usable |
 | `fdk-aac` | `fdk-aac` | In-process AAC family |
 | `media-codecs` | `media-codecs` (default on) | libavcodec for video decode + Opus / MP2 / AC-3 audio decode |

@@ -164,6 +164,36 @@ broken down by release variant and architecture. Tested on Ubuntu 24.04 LTS
 > rates (distro defaults clamp it to 4 MB ≈ 8 ms at 2160p50). Manual
 > installs should apply the same file; see
 > [st2110.md → Host kernel tuning](st2110.md#host-kernel-tuning-receive-side).
+>
+> **The send side needs the same treatment, and the shipped file does
+> not cover it.** Every socket the edge opens *itself* for raw UDP / RTP —
+> unicast input, multicast input and output alike — requests a 4 MiB
+> `SO_SNDBUF`, reads the value back, and warns once per process when the
+> kernel clamped it:
+>
+> ```
+> SO_SNDBUF clamped by the kernel: requested 4194304 bytes, got 212992.
+> Raise net.core.wmem_max (e.g. `sysctl -w net.core.wmem_max=4194304`). ...
+> ```
+>
+> (Truncated — the real line continues with the bursty-loss note and the
+> `RUST_LOG=debug` hint repeated below.) SRT, RIST and QUIC sockets are
+> opened by their own stacks and never pass through this code, so they
+> neither request the 4 MiB nor produce this warning; they still benefit
+> from a raised `wmem_max`.
+>
+> The distro default `net.core.wmem_max` is 212992 bytes, so on a stock
+> host that warning fires as soon as a UDP output starts. Undersized send
+> buffers surface as bursty loss under load rather than as an error, so
+> add the matching line yourself until the packaged drop-in carries it:
+>
+> ```bash
+> echo 'net.core.wmem_max = 67108864' | sudo tee -a /etc/sysctl.d/90-bilbycast-edge.conf
+> sudo sysctl --system
+> ```
+>
+> `RUST_LOG=debug` turns the once-per-process warning into per-socket
+> detail if you need to know which socket was clamped.
 
 ### Default (from-source) build — runtime
 
@@ -1176,6 +1206,24 @@ nm bilbycast-edge 2>/dev/null | grep -qE ' [Tt] x26[45]_encoder_open' \
 The `NOTICE` file inside the tarball is the authoritative bundled-library
 manifest: the full variant ships `NOTICE.full` (lists libx264 / libx265 +
 the GPL terms); a default (from-source) build ships the AGPL-only `NOTICE`.
+
+**Ask the binary directly.** `--print-capabilities` loads no config, opens
+no socket and runs no hardware probe, so it is safe on a build runner or a
+headless host — it prints one token per line and exits:
+
+```bash
+./bilbycast-edge --print-capabilities
+# feature <name>     — a Cargo feature COMPILED IN (sdi-decklink, multiviewer, mxl, …)
+# capability <name>  — the capability list evaluated COLD
+```
+
+The two lists answer different questions. `feature` is what the build
+contains, which is the honest way to check whether a downloaded artefact
+really has SDI or the multiviewer — the `ldd` and `nm` checks above only
+speak to the statically linked encoders. `capability` is evaluated before
+any boot probe, so probe-gated bits (`display`, `sdi-decklink`, the
+`video-decoder-*` set) are absent here even when compiled in; the live
+list a node advertises to the manager is on its health tick.
 
 ---
 

@@ -2,7 +2,7 @@
 
 ## Overview
 
-bilbycast-edge is a media gateway supporting multiple transport protocols for professional broadcast and streaming workflows. The transport/protocol logic is Rust throughout, but the **default build is not C-free**: it links libsrt (via `bilbycast-libsrt-rs`, the default SRT backend selected in `Cargo.toml`'s `── SRT backend ──` block), Fraunhofer FDK AAC (the default `fdk-aac` feature), and FFmpeg/libavcodec (the default `media-codecs` feature). A fully pure-Rust binary is only achievable by switching the SRT backend to `bilbycast-srt` **and** disabling the default codec features (`--no-default-features --features tls,webrtc,replay`); RIST and the tunnel/relay stack are pure Rust regardless.
+bilbycast-edge is a media gateway supporting multiple transport protocols for professional broadcast and streaming workflows. The transport/protocol logic is Rust throughout, but the **default build is not C-free**: it links libsrt (via `bilbycast-libsrt-rs`), Fraunhofer FDK AAC (the default `fdk-aac` feature), and FFmpeg/libavcodec (the default `media-codecs` feature). **There is no fully C-free build today.** The sibling pure-Rust SRT implementation, `bilbycast-srt`, is not a drop-in: the edge references libsrt socket-group types (`SrtGroup`, `SrtGroupBuilder`, `GroupMode`, `GroupMemberStats`, `MemberStatus`) unconditionally for native SRT bonding, so swapping the backend fails to compile — 9 errors, all of that shape (edge issue #102). Restoring the swap would mean feature-gating the entire bonding surface. Disabling the default codec features (`--no-default-features --features tls,webrtc,replay`) does build and removes FDK AAC + FFmpeg, but libsrt stays linked. RIST and the tunnel/relay stack are pure Rust regardless.
 
 ## Input Protocols
 
@@ -111,7 +111,7 @@ bilbycast-edge is a media gateway supporting multiple transport protocols for pr
   protocol — see [bonding.md](bonding.md) for the full config schema,
   worked examples, and tuning guidance.
 
-### Synthetic / local inputs (`test_pattern`, `media_player`, `replay`)
+### Synthetic / local inputs (`test_pattern`, `media_player`, `replay`, `mosaic`)
 - **Direction:** Input
 - **`test_pattern`** — generates a synthetic colour-bar / test raster with
   optional screen-ID text, tone/beep ident, and an A/V-sync sweep, muxed as
@@ -125,6 +125,17 @@ bilbycast-edge is a media gateway supporting multiple transport protocols for pr
 - **`replay`** (default-on `replay` feature) — plays a recorded clip or
   recording back into the flow as a fresh input, driven by the replay
   command channel (cue / play / scrub). See [replay.md](replay.md).
+- **`mosaic`** (behind the off-by-default `multiviewer` feature, and needs a
+  `video-encoder-*` feature to run — all three published release artefacts
+  carry both) — composites N node-local inputs into one canvas and muxes it
+  as a fresh MPEG-TS on the flow's broadcast channel, so a multiviewer wall
+  is an ordinary flow source. Its tiles reference other inputs on the same
+  node by id: the only input type in the tree that consumes other inputs.
+  **Video only** — the PMT declares no audio PID, deliberately. Tiles render
+  H.264 / HEVC / MPEG-2 sources; anything else leaves the tile at NO SIGNAL.
+  Canvas capped at 1920x1080 and 64 tiles in phase 1. The node advertises
+  `mv-compositor` and one `mv_heads` entry when an encoder resolves. See
+  [multiviewer.md](multiviewer.md).
 
 ## Output Protocols
 

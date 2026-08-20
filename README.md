@@ -280,9 +280,20 @@ bilbycast-edge [OPTIONS]
 Options:
   -c, --config <PATH>         Path to configuration file [default: ./config.json]
   -p, --port <PORT>           Override API listen port
-  -b, --bind <ADDR>           Override API listen address
+  -b, --bind <ADDR>           Override API listen address (legacy single-address override)
+      --bind-addrs <ADDRS>    Override API dual-stack listener addresses, comma-separated
+                              (e.g. `0.0.0.0,[::]`). Takes precedence over --bind and over
+                              the config file's server.listen_addr / server.listen_addrs;
+                              v6 entries get IPV6_V6ONLY=1 so they coexist with v4 on the
+                              same port
       --monitor-port <PORT>   Override monitor dashboard port
   -l, --log-level <LEVEL>     Log level: trace, debug, info, warn, error [default: info]
+      --print-setup-token     Print the one-shot setup-wizard bearer token from the loaded
+                              secrets file and exit (for when the first-boot banner was missed)
+      --print-capabilities    Print this binary's compiled-in Cargo features and the
+                              capability list it would advertise to the manager, then exit.
+                              Loads no config, opens no socket, runs no hardware probe — the
+                              release workflow's `Verify binary` step relies on that
   -V, --version               Print version
   -h, --help                  Print help
 ```

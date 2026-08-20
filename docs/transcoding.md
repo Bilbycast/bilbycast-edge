@@ -170,16 +170,48 @@ codec listed in the matrix below works regardless of source codec.
   "bitrate_kbps": 128,       // optional; per-codec default
   "sample_rate":  48000,     // optional; defaults to source
   "channels":     2,         // optional; defaults to source
-  "silent_fallback": false   // optional; RTMP / WebRTC / CMAF only
+  "silent_fallback": false,  // optional; RTMP / WebRTC / CMAF only
+
+  // Opus only — REFUSED at validation on any other codec (see below):
+  "opus_vbr_mode":          "cbr",  // optional; unset | "vbr" | "cbr"
+  "opus_fec":               false,  // optional; default false
+  "opus_dtx":               false,  // optional; default false
+  "opus_frame_duration_ms": 20      // optional; 5 | 10 | 20 | 40 | 60
 }
 ```
+
+### Opus-specific options
+
+All four are **refused**, not ignored, when `codec` is not `opus`: config load / save fails with
+`audio_encode.opus_* fields only apply to codec=opus`. That is deliberate — a mis-set knob is
+made visible instead of running silently with default Opus behaviour. (The two booleans only
+trip the check when set to `true`; `false` is indistinguishable from unset.)
+
+| Field | Default | Notes |
+|---|---|---|
+| `opus_vbr_mode` | unset | Rate control. Unset uses libopus's own default (full VBR); `"vbr"` is *constrained* VBR; `"cbr"` is constant bitrate. Maps to ffmpeg `-vbr on` / `constrained` / `off` respectively. |
+| `opus_fec` | `false` | In-band forward error correction — each packet carries redundancy for the previous frame. Worth turning on over a lossy WebRTC path; it costs bitrate that would otherwise go to the primary frame. |
+| `opus_dtx` | `false` | Discontinuous transmission: the encoder skips frames during silence to save bandwidth. **Leave it off for broadcast.** A gapped audio stream costs receivers their A/V sync; DTX is appropriate for conversational audio, not contribution. |
+| `opus_frame_duration_ms` | `20` | One of 5, 10, 20, 40, 60. Shorter frames lower latency at the cost of coding efficiency; longer frames are higher quality at low bitrates. |
 
 ### `silent_fallback`
 
 When `true`, the edge injects a zero-filled (silent) PCM track into the
 encoder whenever the upstream source has no audio PID, or stops
 delivering audio mid-stream (500 ms grace window). Guarantees the
-output container always carries a valid, continuous audio track.
+output container carries a valid, continuous audio track **from the
+first access unit onward**.
+
+On RTMP there is one deliberate exception at the front of that window:
+silence does not start until a real essence — audio or video — has
+anchored the connection's FLV epoch. Silence must never anchor it, or
+the audio timeline pins to 0 while video runs on the source clock. So
+an RTMP output that connects *before* any essence arrives opens
+video-only rather than emitting silence from t≈0, which is what it used
+to do. For the headline case here (a genuinely video-only source) video
+anchors the epoch on its first access unit and the silent track resumes
+immediately after, so the exposed window is publish-to-first-essence
+only.
 
 Required whenever:
 
@@ -356,9 +388,52 @@ leave the PMT untouched.
   "bitrate_kbps": 4000,      // optional, default 4000; range 100–100000
   "gop_size":    60,         // optional, default 2 × fps_num
   "preset":      "medium",   // optional, default medium; `ultrafast`..`veryslow`
-  "profile":     "high"      // optional, auto if unset; `baseline` / `main` / `high`
+  "profile":     "high",     // optional, auto if unset; `baseline` / `main` / `high`
+
+  "chroma":      "yuv420p",  // optional; see the per-vendor chroma matrix below
+  "bit_depth":   8,          // optional; 8 (default) or 10 — same matrix
+
+  "rate_control": "vbr",     // optional; "vbr" (default) | "cbr" | "crf" | "abr"
+  "crf":          23,        // optional; only for rate_control "crf"
+  "max_bitrate_kbps": 6000,  // optional; VBV ceiling — vbr / abr only
+  "bframes":      0,         // optional; default 0
+  "refs":         3,         // optional; encoder default when unset
+  "level":        "4.0",     // optional; encoder picks when unset
+  "tune":         "zerolatency",  // optional; x264 / x265 vocabulary —
+                             // NVENC wants hq / ll / ull / lossless
+
+  "color_primaries": "bt709",
+  "color_transfer":  "bt709",
+  "color_matrix":    "bt709",
+  "color_range":     "tv"
 }
 ```
+
+| Field | Default | Notes |
+|---|---|---|
+| `rate_control` | `vbr` | One of `vbr`, `cbr`, `crf`, `abr`. In `crf` mode `bitrate_kbps` is ignored and `crf` drives quantisation instead. |
+| `crf` | unset | 0–51, lower is better quality; broadcast typical 18–28. Only meaningful with `rate_control: "crf"`. Translated to `cq` on NVENC. |
+| `max_bitrate_kbps` | unset | VBV ceiling in `vbr` / `abr` only: sets `rc_max_rate` plus a 2 s VBV buffer. **Ignored in `cbr`** — that mode pins `bit_rate` = `rc_min_rate` = `rc_max_rate` to `bitrate_kbps`, which is the ceiling — and ignored in `crf`. Validation still enforces 100–100 000 and `max_bitrate_kbps >= bitrate_kbps` in every mode. |
+| `bframes` | `0` | Consecutive B-frames, 0–16. **Not available on RTMP outputs** — see *No B-frames on RTMP* under "Known limitations"; the encoder is opened with 0 regardless and logs `rtmp_bframes_unsupported`. |
+| `refs` | unset | Reference frames, 1–16. The encoder's own default when unset. |
+| `level` | unset | Codec level, e.g. `"3.0"`, `"4.0"`, `"5.1"`. Unset lets the encoder pick from resolution / bitrate / frame rate. |
+| `tune` | backend-resolved: `zerolatency` on x264 / x265, **unset on every hardware backend** | The vocabularies are disjoint. x264 / x265 accept `zerolatency`, `film`, `animation`, `grain`, `stillimage`, `fastdecode`, `psnr`, `ssim`; NVENC accepts `hq`, `ll`, `ull`, `lossless`; QSV and VAAPI expose no `tune` option at all. Config validation is permissive over the union, because an `h264_auto` / `hevc_auto` output does not know its backend until flow start. A tune the resolved backend cannot accept is therefore **dropped** at flow start (`video_encode_util::sanitise_tune`), with a log line carrying `error_code = encoder_tune_not_supported` — a log line only, no manager event. Dropping matters: handing NVENC `zerolatency` makes `avcodec_open2` fail with `EINVAL (-22)`. An empty string means "unset — encoder chooses". |
+| `chroma` / `bit_depth` | `yuv420p` / `8` | Which backend can carry which combination is genuinely per-vendor; the matrix is later in this document rather than duplicated here. |
+
+#### Colour metadata
+
+Four fields carry the signalling a re-encode would otherwise lose. **A
+re-encode does not infer them from the source** — leave them unset on an
+HDR or BT.2020 contribution feed and the output carries no colour
+signalling at all, which a downstream display reads as BT.709 SDR even
+though the pixels are not, and has no way to recover from.
+
+| Field | Default | Accepted values |
+|---|---|---|
+| `color_primaries` | unset | `bt709`, `bt2020`, `smpte170m`, `smpte240m`, `bt470m`, `bt470bg` |
+| `color_transfer` | unset | `bt709`, `smpte170m`, `smpte2084` (alias `pq`), `arib-std-b67` (alias `hlg`), `bt2020-10`, `bt2020-12` |
+| `color_matrix` | unset | `bt709`, `bt2020nc`, `bt2020c`, `smpte170m`, `smpte240m` |
+| `color_range` | unset | `tv` (aliases `limited`, `mpeg`) or `pc` (aliases `full`, `jpeg`). Unset really is unset — nothing is signalled and the encoder's own default stands. |
 
 ### Backend availability
 
