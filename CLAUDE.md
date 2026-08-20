@@ -392,24 +392,40 @@ nests and thumbnails with no new output code. Full reference: [`docs/multiviewer
   the health tick, both gated on `select_video_backend()` resolving: the
   capability `mv-compositor`, and a one-entry `HealthPayload.mv_heads` array —
   `{head_id: "stream0", kind: "stream", connector: null, max_canvas_width: 1920,
-  max_canvas_height: 1080, capabilities: {encoder_backends: ["libx264"]}}`.
+  max_canvas_height: 1080, capabilities: {encoder_backends: ["h264_qsv",
+  "h264_vaapi", "x264"]}}` — the resolved chain for this host.
   `STREAM_HEAD_ID` is a **constant** because the manager keys its head rows on
   `(node_id, head_id)`; a per-boot id would mint a second row on every restart
-  and strand the wall on the retired one. `encoder_backends` carries the FFmpeg
-  name of the one backend this head will use, not every backend compiled in.
+  and strand the wall on the retired one. `encoder_backends` carries the resolved
+  chain for the default canvas codec, head first, filtered by what this host can
+  open. **The head's existence stays a compile-time question** —
+  `select_video_backend()` resolving, which is answerable cold — because the
+  release workflow asserts `capability mv-compositor` against a freshly built
+  binary with no probe run.
   The manager gates no UI on the capability bit — it reads it once, at deploy,
   and refuses an undeployable wall with `422 wall_not_deployable` /
   `node_no_compositor`.
-- **`MosaicInputConfig.codec` is accepted but not honoured.** `build_encoder`
-  calls the no-argument `select_video_backend()` (x264 ≻ x265 ≻ NVENC ≻ QSV;
-  VAAPI and RKMPP are not considered) and then *overwrites* the encode config's
-  codec with `backend_codec_string(backend)`, so the configured string reaches
-  nothing but the no-encoder error text. Every release artefact carries x264, so
-  a wall always encodes on the CPU. Worth knowing because the cost model charges
-  the **configured** codec (`input_encode_blocks`: `Mosaic(c) => (None,
-  Some(c.codec.as_str()))`), so a wall written as `h264_nvenc` is billed against
-  the NVENC session budget while running x264. The doc comment on
-  `MosaicInputConfig::codec` still claims it selects an encoder.
+- **`MosaicInputConfig.codec` selects a real encoder** (edge #129, fixed after
+  v0.105.0). `build_encoder` resolves through
+  `hardware_probe::resolve_chain_for_video_encode_config` against probed
+  `StaticCapabilities`, exactly as an output's `video_encode` does, and hands
+  `ScaledVideoEncoder::with_backend_chain` the whole chain so it falls through on
+  `avcodec_open2` failure. Measured on an Intel Core Ultra 9 285HX: `h264_auto`
+  resolved to `["h264_qsv", "h264_vaapi", "x264"]` and the wall ran on QuickSync
+  at 6.18 Mbps with no fall-through. The chain is **family-pure**, which is
+  load-bearing: the PMT's `stream_type` is settled from its head before the
+  encoder opens, so a demote changes the backend and never the wire codec.
+  Until v0.105.0 it called the no-argument `select_video_backend()` (x264 ≻ x265
+  ≻ NVENC ≻ QSV; VAAPI and RKMPP not considered) and *overwrote* the encode
+  config's codec, so every wall encoded on CPU x264 whatever the field said, a
+  wall asked for HEVC silently got H.264, the muxer asked the same wrong question
+  a second time and could announce H.264 in the PMT while encoding HEVC, and the
+  cost model charged the **configured** codec (`input_encode_blocks`:
+  `Mosaic(c) => (None, Some(c.codec.as_str()))`) — so a wall written as
+  `h264_nvenc` was billed against the NVENC budget while running x264. That
+  mismatch is gone with it: the configured codec is now what runs. An
+  unrecognised name is refused at save time by `validate_encoder_codec_name`,
+  shared with the output path so the two lists cannot drift.
 - **A wall carries pictures only.** `muxer.set_has_audio(false)` and the only
   mux call is `mux_video`; tile ingest matches `DemuxedFrame::{H264, H265,
   Mpeg2}` and drops everything else at `_ => continue`. So the PMT declares no

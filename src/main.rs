@@ -310,10 +310,28 @@ async fn main() -> anyhow::Result<()> {
         save_config_split(&cli.config, &secrets_path, &app_config)?;
     }
 
+    // **Repair before validating, not after.** A mosaic codec this build no
+    // longer accepts is a *load*-path hazard rather than a mutation one: every
+    // route that writes one validates first, but a value persisted by a release
+    // that only length-checked the field (everything through v0.105.0, where it
+    // selected nothing) would otherwise turn the upgrade into a node that exits
+    // at boot — and a node that will not start has no manager WebSocket, so it
+    // cannot be fixed remotely. Coerced to the default and reported below.
+    #[cfg(feature = "multiviewer")]
+    let repaired_mosaic_codecs = config::validation::repair_legacy_mosaic_codecs(&mut app_config);
+
     // Validate config
     if let Err(e) = validate_config(&app_config) {
         tracing::error!("Invalid configuration: {e}");
         return Err(e);
+    }
+    #[cfg(feature = "multiviewer")]
+    for (input_id, was) in &repaired_mosaic_codecs {
+        tracing::warn!(
+            "mosaic input '{input_id}': codec '{was}' is not one this build can encode with; \
+             using '{}' instead. Set a codec this edge supports, or rebuild with its backend.",
+            config::models::default_mosaic_codec(),
+        );
     }
 
     // Install the shared-leg broker. Enabled BY DEFAULT (unless explicitly

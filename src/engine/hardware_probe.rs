@@ -2990,6 +2990,25 @@ fn parse_chroma_str(s: Option<&str>) -> video_codec::VideoChroma {
 
 /// `*_auto` codec-string parser. Returns the requested output family for
 /// `h264_auto` / `hevc_auto`, `None` for explicit backend strings.
+/// `true` when this binary contains at least one video encoder backend.
+///
+/// The one encoder question `cfg!` is genuinely right for — unlike
+/// `input_test_pattern::select_video_backend`, which answers it with a *ranked
+/// first match* whose arms cover only x264 / x265 / NVENC / QSV, so it reports
+/// "none" on a VAAPI-only or Rockchip-only build that encodes perfectly well.
+///
+/// Shared so the save-time refusal (`validate_video_encode`) and the flow-start
+/// refusal (`input_mosaic::canvas_backend_chain`) cannot drift apart about what
+/// the build contains.
+pub(crate) fn any_video_encoder_compiled() -> bool {
+    cfg!(feature = "video-encoder-x264")
+        || cfg!(feature = "video-encoder-x265")
+        || cfg!(feature = "video-encoder-nvenc")
+        || cfg!(feature = "video-encoder-qsv")
+        || cfg!(feature = "video-encoder-vaapi")
+        || cfg!(feature = "video-encoder-rkmpp")
+}
+
 fn parse_auto_family(codec: &str) -> Option<EncoderFamily> {
     match codec {
         "h264_auto" | "auto_h264" => Some(EncoderFamily::H264),
@@ -3317,7 +3336,7 @@ pub fn resolve_video_encoder(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     #[test]
@@ -3902,7 +3921,7 @@ mod tests {
     // ── Video-encoder resolution tests ─────────────────────────────
 
     #[cfg(feature = "media-codecs")]
-    fn make_caps(hw_encoders: HwCodecCapability) -> StaticCapabilities {
+    pub(crate) fn make_caps(hw_encoders: HwCodecCapability) -> StaticCapabilities {
         StaticCapabilities {
             hw_encoders,
             hw_decoders: HwCodecCapability::default(),

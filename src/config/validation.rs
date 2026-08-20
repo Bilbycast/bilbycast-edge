@@ -1635,8 +1635,27 @@ fn validate_mosaic_input(cfg: &crate::config::models::MosaicInputConfig) -> Resu
             cfg.height
         ));
     }
+    // The canvas honours this now (#129), so an unrecognised name has to be
+    // refused here. It used to be length-checked only, on the reasoning that the
+    // value reached nothing — which was true, and was the defect: `"banana"`
+    // saved cleanly and the wall quietly encoded x264 regardless. Same list as
+    // an output's `video_encode.codec`, shared rather than copied.
     if cfg.codec.len() > 64 {
         return Err(anyhow::anyhow!("mosaic: codec name is too long"));
+    }
+    validate_encoder_codec_name(&cfg.codec, "mosaic: codec")?;
+    // Explicit backends only. Naming `h264_qsv` on a build without
+    // `video-encoder-qsv` is a mistake worth catching at save time, with a
+    // message naming the rebuild.
+    //
+    // An **auto** string is deliberately let through, unlike an output's. A
+    // build with `multiviewer` and no encoder at all is a real, CI-exercised
+    // configuration, and a wall must still be *storable* on it: `build_encoder`
+    // refuses at flow start with the message that names the rebuild, which is
+    // both later and better than refusing to save the config that would work
+    // the moment the node is rebuilt.
+    if !matches!(cfg.codec.as_str(), "h264_auto" | "hevc_auto" | "auto") {
+        encoder_backend_feature_missing(&cfg.codec, "mosaic: codec")?;
     }
     // Tile-count ceiling, asked for by MULTIVIEWER_PLAN.md §1.5 and omitted
     // when the compositor shipped.
@@ -4211,30 +4230,71 @@ fn validate_webrtc_compatible(
     Ok(())
 }
 
-fn validate_video_encode(
-    enc: &crate::config::models::VideoEncodeConfig,
-    context: &str,
-) -> anyhow::Result<()> {
-    match enc.codec.as_str() {
+/// The encoder names an operator may write, shared by every surface that takes
+/// one.
+///
+/// Extracted so a second caller cannot drift from the first. A multiviewer
+/// canvas takes the same strings as an output's `video_encode.codec` — its field
+/// doc has always said so — and once the wall started honouring the value
+/// (#129) an unrecognised one had to be refused at save time here rather than
+/// surfacing as a flow that will not start.
+pub(crate) fn validate_encoder_codec_name(codec: &str, context: &str) -> anyhow::Result<()> {
+    match codec {
         "x264" | "x265" | "h264_nvenc" | "hevc_nvenc" | "h264_qsv" | "hevc_qsv"
         | "h264_vaapi" | "hevc_vaapi" | "h264_rkmpp" | "hevc_rkmpp"
         // Auto strings — resolved per-host at flow start.
-        | "h264_auto" | "hevc_auto" | "auto" => {}
+        | "h264_auto" | "hevc_auto" | "auto" => Ok(()),
         other => bail!(
-            "{context}: video_encode.codec '{other}' is not recognised; \
+            "{context} '{other}' is not recognised; \
              expected one of x264, x265, h264_nvenc, hevc_nvenc, h264_qsv, hevc_qsv, \
              h264_vaapi, hevc_vaapi, h264_rkmpp, hevc_rkmpp, h264_auto, hevc_auto"
         ),
     }
-    // Reject codecs whose backend wasn't compiled into this build. Runtime
-    // would surface a Critical event and passthrough the video anyway, but
-    // that's confusing UX — catch it here so the manager's command_ack
-    // carries a human-readable "rebuild with ..." message straight into
-    // the modal error banner. Auto strings are deliberately exempt — they
-    // resolve per-host at flow start, and a build that compiled in *any*
-    // encoder (the typical case) will satisfy at least the SW fallback
-    // libx264 / libx265 tail of the priority chain.
-    let backend_feature: Option<&'static str> = match enc.codec.as_str() {
+}
+
+/// The Cargo feature a codec name needs, when this build lacks it.
+///
+/// Extracted alongside [`validate_encoder_codec_name`] so the mosaic gets the
+/// same refusal an output gets. Naming `h264_qsv` on a build without
+/// `video-encoder-qsv` has to fail at save time with a message naming the
+/// rebuild — at flow start it is a wall that will not come up, and the operator
+/// has no way to tell that from a bad address.
+/// Coerce a persisted mosaic codec this build no longer accepts, and say so.
+///
+/// The refusals above are right for a *mutation*: `UpdateConfig` and the REST
+/// flow routes validate before they persist, so a bad value is rejected with a
+/// clean `command_ack` and never reaches disk. The **load** path has no such
+/// luxury — `main.rs` turns a validation error into `return Err(e)` and the
+/// process exits, and a node that will not start has no manager WebSocket, so
+/// it cannot be repaired remotely.
+///
+/// Releases through v0.105.0 length-checked this field only — the value reached
+/// nothing, which was the defect — so `"banana"` could be written through a
+/// shipped build's API and is sitting in configs now. Falling those back to the
+/// default and reporting them beats refusing to boot over a field that, until
+/// this release, selected nothing.
+#[cfg(feature = "multiviewer")]
+pub fn repair_legacy_mosaic_codecs(
+    config: &mut crate::config::models::AppConfig,
+) -> Vec<(String, String)> {
+    let mut repaired = Vec::new();
+    for input in &mut config.inputs {
+        if let crate::config::models::InputConfig::Mosaic(mosaic) = &mut input.config
+            && (validate_encoder_codec_name(&mosaic.codec, "mosaic: codec").is_err()
+                || encoder_backend_feature_missing(&mosaic.codec, "mosaic: codec").is_err())
+        {
+            let was = std::mem::replace(
+                &mut mosaic.codec,
+                crate::config::models::default_mosaic_codec(),
+            );
+            repaired.push((input.id.clone(), was));
+        }
+    }
+    repaired
+}
+
+pub(crate) fn encoder_backend_feature_missing(codec: &str, context: &str) -> anyhow::Result<()> {
+    let backend_feature: Option<&'static str> = match codec {
         "x264" => {
             if cfg!(feature = "video-encoder-x264") { None } else { Some("video-encoder-x264") }
         }
@@ -4256,13 +4316,7 @@ fn validate_video_encode(
         "h264_auto" | "hevc_auto" | "auto" => {
             // Auto needs at least one encoder family in the build to land
             // somewhere. Reject only when nothing is present.
-            if cfg!(feature = "video-encoder-x264")
-                || cfg!(feature = "video-encoder-x265")
-                || cfg!(feature = "video-encoder-nvenc")
-                || cfg!(feature = "video-encoder-qsv")
-                || cfg!(feature = "video-encoder-vaapi")
-                || cfg!(feature = "video-encoder-rkmpp")
-            {
+            if crate::engine::hardware_probe::any_video_encoder_compiled() {
                 None
             } else {
                 Some("video-encoder-x264 (or x265 / nvenc / qsv / vaapi / rkmpp)")
@@ -4272,12 +4326,27 @@ fn validate_video_encode(
     };
     if let Some(feat) = backend_feature {
         bail!(
-            "{context}: video_encode.codec '{codec}' requires this edge to be built \
-             with the `{feat}` Cargo feature; rebuild the edge or pick a codec whose \
-             backend is compiled in",
-            codec = enc.codec,
+            "{context} '{codec}' requires this edge to be built with the `{feat}` Cargo \
+             feature; rebuild the edge or pick a codec whose backend is compiled in",
         );
     }
+    Ok(())
+}
+
+fn validate_video_encode(
+    enc: &crate::config::models::VideoEncodeConfig,
+    context: &str,
+) -> anyhow::Result<()> {
+    validate_encoder_codec_name(&enc.codec, &format!("{context}: video_encode.codec"))?;
+    // Reject codecs whose backend wasn't compiled into this build. Runtime
+    // would surface a Critical event and passthrough the video anyway, but
+    // that's confusing UX — catch it here so the manager's command_ack
+    // carries a human-readable "rebuild with ..." message straight into
+    // the modal error banner. Auto strings are deliberately exempt — they
+    // resolve per-host at flow start, and a build that compiled in *any*
+    // encoder (the typical case) will satisfy at least the SW fallback
+    // libx264 / libx265 tail of the priority chain.
+    encoder_backend_feature_missing(&enc.codec, &format!("{context}: video_encode.codec"))?;
     if let Some(w) = enc.width {
         if !(64..=7680).contains(&w) {
             bail!("{context}: video_encode.width must be 64..=7680, got {w}");

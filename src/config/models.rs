@@ -1999,7 +1999,12 @@ fn default_mosaic_bitrate() -> u32 {
     8000
 }
 #[cfg(feature = "multiviewer")]
-fn default_mosaic_codec() -> String {
+/// The canvas codec a wall gets when the operator names none.
+///
+/// `pub(crate)` so `advertised_heads` can resolve the same string it will
+/// actually encode with — advertising a backend list for one codec while
+/// encoding another is the disagreement #129 was.
+pub(crate) fn default_mosaic_codec() -> String {
     "h264_auto".into()
 }
 
