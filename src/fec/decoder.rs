@@ -404,12 +404,8 @@ impl FecDecoder {
     fn reset_cycle(&mut self) {
         self.matrix.reset();
         self.media_count = 0;
-        for slot in &mut self.col_fec {
-            *slot = None;
-        }
-        for slot in &mut self.row_fec {
-            *slot = None;
-        }
+        self.col_fec.fill(None);
+        self.row_fec.fill(None);
     }
 }
 

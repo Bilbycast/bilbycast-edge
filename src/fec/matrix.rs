@@ -100,21 +100,15 @@ impl FecMatrix {
 
     /// Clear the matrix for the next cycle.
     pub fn reset(&mut self) {
-        for cell in &mut self.cells {
-            *cell = None;
-        }
+        self.cells.fill(None);
         for p in &mut self.col_parity {
             p.clear();
         }
         for p in &mut self.row_parity {
             p.clear();
         }
-        for c in &mut self.col_count {
-            *c = 0;
-        }
-        for c in &mut self.row_count {
-            *c = 0;
-        }
+        self.col_count.fill(0);
+        self.row_count.fill(0);
         self.max_payload_len = 0;
     }
 
