@@ -6991,10 +6991,17 @@ pub struct DisplayOutputConfig {
     /// compiled in and probed at startup, fall back to CPU if none are
     /// available. `"cpu"` forces software libavcodec, leaving HW
     /// resources free for transcode flows elsewhere on the node.
-    /// `"nvdec"` / `"qsv"` force a specific HW backend; the edge
-    /// rejects the output at start with `display_hw_decode_unavailable`
-    /// when the host can't satisfy the choice (feature missing, driver
-    /// missing, or session capacity exhausted at probe time).
+    /// `"nvdec"` / `"qsv"` / `"vaapi"` force a specific HW backend.
+    ///
+    /// A forced backend the host cannot satisfy (feature missing, driver
+    /// missing, or session capacity exhausted at probe time) is **not** a
+    /// refusal: `output_display` emits a Warning
+    /// `display_hw_decode_unavailable_falling_back` and runs CPU, so the
+    /// picture stays on screen and the operator decides what to do about the
+    /// alarm. `derive_cost_plan` makes the same `.unwrap_or(Cpu)` choice, so
+    /// cost accounting matches what actually runs. The Critical
+    /// `display_hw_decode_unavailable` code is reserved for a future
+    /// "neither HW nor CPU works" path and is not emitted here.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hw_decode: Option<HwDecodePreference>,
 
