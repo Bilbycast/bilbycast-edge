@@ -1603,6 +1603,10 @@ fn validate_recording_config(
     Ok(())
 }
 
+/// Most tiles one mosaic canvas may carry (MULTIVIEWER_PLAN.md §1.5).
+#[cfg(feature = "multiviewer")]
+pub const MAX_MOSAIC_TILES: usize = 64;
+
 /// Validate a mosaic (multiviewer wall) input.
 ///
 /// The geometry rules live in [`crate::engine::mosaic`] and are shared with the
@@ -1633,6 +1637,23 @@ fn validate_mosaic_input(cfg: &crate::config::models::MosaicInputConfig) -> Resu
     }
     if cfg.codec.len() > 64 {
         return Err(anyhow::anyhow!("mosaic: codec name is too long"));
+    }
+    // Tile-count ceiling, asked for by MULTIVIEWER_PLAN.md §1.5 and omitted
+    // when the compositor shipped.
+    //
+    // Not arbitrary tidiness: every tile is an independent decode + scale task
+    // with its own `watch` channel and its own tile-sized buffer, so the cost is
+    // linear in tile count and paid on a node that is also carrying the live
+    // feeds being watched. `MosaicLayout::validate` bounds geometry but not
+    // population, so without this a config asking for ten thousand tiles is
+    // accepted and spawns ten thousand tasks.
+    //
+    // 64 is the plan's number and comfortably above a 7x7 wall.
+    if cfg.tiles.len() > MAX_MOSAIC_TILES {
+        return Err(anyhow::anyhow!(
+            "mosaic: at most {MAX_MOSAIC_TILES} tiles (got {})",
+            cfg.tiles.len()
+        ));
     }
 
     for tile in &cfg.tiles {
@@ -13774,6 +13795,55 @@ mod tests {
         assert!(
             !json.contains("present_lead_ms"),
             "unset must not serialise, got: {json}"
+        );
+    }
+    // ───────────────────── mosaic tile ceiling ─────────────────────
+
+    #[cfg(feature = "multiviewer")]
+    fn mosaic_with_tiles(n: usize) -> crate::config::models::MosaicInputConfig {
+        use crate::config::models::{MosaicInputConfig, MosaicTileConfig};
+        MosaicInputConfig {
+            width: 1920,
+            height: 1080,
+            fps: 25,
+            video_bitrate_kbps: 8000,
+            codec: "h264_auto".into(),
+            // Every tile is 16x16 at the origin. Overlap is legal — z-order is
+            // what PiP is built from — so this isolates the count from geometry.
+            tiles: (0..n)
+                .map(|i| MosaicTileConfig {
+                    id: format!("t{i}"),
+                    source_input_id: None,
+                    x: 0,
+                    y: 0,
+                    width: 16,
+                    height: 16,
+                    z: 0,
+                    label: String::new(),
+                })
+                .collect(),
+        }
+    }
+
+    /// The ceiling is enforced, and one below it is not.
+    ///
+    /// Both halves matter. A cap that also refuses the largest legal wall is a
+    /// worse defect than no cap, and geometry is deliberately held constant
+    /// here so a failure can only be about the count.
+    #[cfg(feature = "multiviewer")]
+    #[test]
+    fn a_mosaic_is_capped_at_sixty_four_tiles() {
+        assert!(
+            super::validate_mosaic_input(&mosaic_with_tiles(super::MAX_MOSAIC_TILES)).is_ok(),
+            "exactly {} tiles must be accepted",
+            super::MAX_MOSAIC_TILES
+        );
+        let err = super::validate_mosaic_input(&mosaic_with_tiles(super::MAX_MOSAIC_TILES + 1))
+            .expect_err("one over the cap must be refused");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("65") && msg.contains("64"),
+            "the refusal must name both the cap and what was asked for, got: {msg}"
         );
     }
 }

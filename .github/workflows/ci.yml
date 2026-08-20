@@ -283,12 +283,19 @@ jobs:
       # always run in the step above. Verified by running them on a default
       # build: 24 passed.
       #
-      # `--lib`, not `--all-targets`, and that is the cost argument. Every test
-      # the feature adds lives in a lib module, so `--lib` builds one test
-      # binary instead of re-linking every integration target under a second
-      # feature set. Measured locally at ~2 min against a warm target dir,
-      # against the ~80 s reclaimed by dropping the redundant `cargo check`
-      # above — net roughly +40 s on a ~20 min job.
+      # `--lib` plus ONE named integration target, not `--all-targets`, and
+      # that is the cost argument. Nearly every test the feature adds lives in a
+      # lib module, so this builds two test binaries instead of re-linking every
+      # integration target under a second feature set. Measured locally at ~2
+      # min against a warm target dir, against the ~80 s reclaimed by dropping
+      # the redundant `cargo check` above — net roughly +40 s on a ~20 min job.
+      #
+      # `mosaic_wire_shape` is named explicitly because it is the edge half of a
+      # cross-repo contract — it pins the exact JSON body bilbycast-manager's
+      # `compile_wall` emits for a deployed wall — and `--lib` alone would skip
+      # it. A contract test nothing runs is worse than no contract test: the
+      # push path is raw JSON, so a renamed field is a silent default on both
+      # sides rather than a compile error anywhere.
       - name: cargo test (multiviewer)
         working-directory: bilbycast-edge
-        run: cargo test --locked --features multiviewer --lib
+        run: cargo test --locked --features multiviewer --lib --test mosaic_wire_shape
