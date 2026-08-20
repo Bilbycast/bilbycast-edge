@@ -5829,6 +5829,27 @@ pub fn validate_output_with_input(
                     cmaf.id, cmaf.max_segments
                 );
             }
+            if let Some(w) = cmaf.dvr_window_secs {
+                if !w.is_finite() || w < 1.0 {
+                    bail!(
+                        "CMAF output '{}': dvr_window_secs must be >= 1.0, got {}",
+                        cmaf.id, w
+                    );
+                }
+                // Bound the derived entry count, not the raw window: a long
+                // window with long segments is cheap, it is entries that cost.
+                let derived = (w / cmaf.segment_duration_secs).ceil() as usize;
+                if derived > crate::config::models::MAX_PLAYLIST_SEGMENTS {
+                    bail!(
+                        "CMAF output '{}': dvr_window_secs {} over segment_duration_secs {} derives {} playlist entries, above the {} cap. Every viewer refetches the whole playlist each segment, so lengthen segment_duration_secs or shorten the window.",
+                        cmaf.id,
+                        w,
+                        cmaf.segment_duration_secs,
+                        derived,
+                        crate::config::models::MAX_PLAYLIST_SEGMENTS
+                    );
+                }
+            }
             if cmaf.manifests.is_empty() {
                 bail!(
                     "CMAF output '{}': manifests must be a non-empty subset of [\"hls\",\"dash\"]",

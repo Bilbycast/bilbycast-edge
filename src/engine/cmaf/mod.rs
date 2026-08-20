@@ -259,11 +259,12 @@ async fn run(
     flow_id: &str,
 ) -> anyhow::Result<()> {
     tracing::info!(
-        "CMAF output '{}' started -> {} (segment={}s, max_segments={}, manifests={:?}, audio_encode={:?}, video_encode={:?})",
+        "CMAF output '{}' started -> {} (segment={}s, window={} segments (~{:.0}s), manifests={:?}, audio_encode={:?}, video_encode={:?})",
         config.id,
         config.ingest_url,
         config.segment_duration_secs,
-        config.max_segments,
+        config.playlist_window_segments(),
+        config.playlist_window_segments() as f64 * config.segment_duration_secs,
         config.manifests,
         config.audio_encode.as_ref().map(|a| &a.codec),
         config.video_encode.as_ref().map(|v| &v.codec),
@@ -977,7 +978,8 @@ async fn handle_video(
             uri: Some(uri),
             parts: Vec::new(),
         });
-        while state.playlist.len() > config.max_segments {
+        let window = config.playlist_window_segments();
+        while state.playlist.len() > window {
             state.playlist.pop_front();
         }
 
@@ -1272,7 +1274,8 @@ async fn handle_ll_cmaf(
                 uri: Some(uri),
                 parts: Vec::new(),
             });
-            while state.playlist.len() > config.max_segments {
+            let window = config.playlist_window_segments();
+            while state.playlist.len() > window {
                 state.playlist.pop_front();
             }
         }
