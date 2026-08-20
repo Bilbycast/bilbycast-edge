@@ -245,10 +245,15 @@ async fn run_display_output(
     //    the dropdown alone or switch it to `cpu` permanently. The
     //    cost-plan resolver in `derive_cost_plan` already does the
     //    same `.unwrap_or(Cpu)` so cost accounting matches what we
-    //    actually run here. The Critical
-    //    `display_hw_decode_unavailable` code is reserved for a future
-    //    "neither HW nor CPU works" path (e.g. CPU decode disabled at
-    //    build); not reachable today.
+    //    actually run here. The plain `display_hw_decode_unavailable`
+    //    code is the *runtime* sibling of this one, emitted by
+    //    `force_cpu_fallback` further down when a backend that resolved
+    //    fine here then failed to open three times — same Warning
+    //    severity, different moment, and it carries `attempts` and
+    //    `last_error`. This comment used to call it Critical and
+    //    "reserved for a future path; not reachable today", which was
+    //    wrong on both counts and got copied verbatim into the
+    //    `hw_decode` field rustdoc, where far more people read it.
     let pref = config.hw_decode.unwrap_or_default();
     let (resolved, hw_unavailable_reason) =
         match crate::engine::hardware_probe::resolve_display_decoder(
