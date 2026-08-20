@@ -749,13 +749,22 @@ async fn handle_video(
     flow_id: &str,
     recv_time_us: u64,
 ) {
-    if !ensure_video_segmenter(
-        &mut state.video_seg,
-        codec,
-        demuxer,
-        config.segment_duration_secs,
-        &config.id,
-    ) {
+    // Passthrough: the samples we forward ARE the source stream, so the
+    // demuxer's cached parameter sets describe them and the track can be built
+    // now. With `video_encode` the samples are the re-encoder's output, whose
+    // SPS/PPS differ (resolution, profile, level, coding tools) — building the
+    // track from the source sets would hand the decoder parameter sets that do
+    // not describe the bitstream, which decodes as macroblock garbage rather
+    // than failing cleanly. Defer until the re-encoder has emitted its own.
+    if state.video_reencoder.is_none()
+        && !ensure_video_segmenter(
+            &mut state.video_seg,
+            codec,
+            demuxer,
+            config.segment_duration_secs,
+            &config.id,
+        )
+    {
         return;
     }
 
@@ -788,6 +797,25 @@ async fn handle_video(
     } else {
         pushed_nalus = nalus;
         pushed_is_keyframe = is_keyframe;
+    }
+
+    // The re-encoder is opened with `global_header = false`, so every IDR it
+    // emits carries its SPS/PPS in-band. Those are the parameter sets that
+    // actually describe these samples, so the track is built from them. They
+    // are filtered back out of the frame before packing (`filter_frame_nalus_*`),
+    // exactly as for passthrough.
+    if state.video_reencoder.is_some()
+        && state.video_seg.is_none()
+        && !ensure_video_segmenter_from_nalus(
+            &mut state.video_seg,
+            codec,
+            &pushed_nalus,
+            config.segment_duration_secs,
+            &config.id,
+        )
+    {
+        // No parameter sets yet — wait for the encoder's first IDR.
+        return;
     }
 
     let outcome: PushOutcome = state
@@ -1147,6 +1175,64 @@ fn build_muxed_segment_for_seq(
     let _ = (v_seg, a_seq, a_base);
 
     None
+}
+
+/// Build the video track from parameter sets carried in an encoded frame.
+///
+/// Used for the `video_encode` path, where [`ensure_video_segmenter`]'s
+/// demuxer-cached sets describe the *source* rather than what is being written.
+/// Returns false until a frame carrying the sets shows up, which for a
+/// `global_header = false` encoder is its first IDR.
+fn ensure_video_segmenter_from_nalus(
+    slot: &mut Option<VideoSegmenter>,
+    codec: VideoCodec,
+    nalus: &[Vec<u8>],
+    segment_duration_secs: f64,
+    output_id: &str,
+) -> bool {
+    if slot.is_some() {
+        return true;
+    }
+    let track = match codec {
+        VideoCodec::H264 => {
+            let mut sps = None;
+            let mut pps = None;
+            for n in nalus {
+                match nalu::h264_nal_type(n) {
+                    7 => sps.get_or_insert_with(|| n.clone()),
+                    8 => pps.get_or_insert_with(|| n.clone()),
+                    _ => continue,
+                };
+            }
+            match (sps, pps) {
+                (Some(s), Some(p)) => VideoTrack::from_h264(s, p),
+                _ => return false,
+            }
+        }
+        VideoCodec::H265 => {
+            let mut vps = None;
+            let mut sps = None;
+            let mut pps = None;
+            for n in nalus {
+                match nalu::h265_nal_type(n) {
+                    32 => vps.get_or_insert_with(|| n.clone()),
+                    33 => sps.get_or_insert_with(|| n.clone()),
+                    34 => pps.get_or_insert_with(|| n.clone()),
+                    _ => continue,
+                };
+            }
+            match (vps, sps, pps) {
+                (Some(v), Some(s), Some(p)) => VideoTrack::from_h265(v, s, p),
+                _ => return false,
+            }
+        }
+    };
+    tracing::info!(
+        "CMAF output '{}': video track from re-encoder {:?} {}x{}",
+        output_id, track.codec, track.width, track.height,
+    );
+    *slot = Some(VideoSegmenter::new(track, segment_duration_secs));
+    true
 }
 
 fn ensure_video_segmenter(
