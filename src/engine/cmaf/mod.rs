@@ -862,67 +862,65 @@ async fn handle_video(
     }
 
     // Publish init.mp4 the first time a video track is materialised.
-    if !state.init_uploaded {
-        if let Some(v) = state.video_seg.as_ref() {
-            {
-                // **Video-only, deliberately.** Muxing audio into the
-                // fragments is unimplemented: `try_build_muxed_segment`
-                // takes the pending audio samples and then returns `None`,
-                // so `build_muxed_segment_for_seq` always falls back to the
-                // video-only bytes. Every fragment we publish is video-only.
-                //
-                // Advertising an audio track in `init.mp4` that no fragment
-                // ever fills makes the whole output unplayable in a browser,
-                // and does it silently: MSE initialises the track, waits
-                // forever for data that never arrives, buffers nothing and
-                // reports no error. The manifest, the segments and the origin
-                // all look perfectly healthy. Until audio muxing lands, the
-                // init segment must describe what we actually send.
-                if state.audio_seg.is_some() || state.audio_ready {
-                    tracing::warn!(
-                        "CMAF output '{}': source has audio, but CMAF audio muxing \
-                         is not implemented — publishing a video-only init segment. \
-                         Advertising an audio track that is never filled would stall \
-                         browser playback.",
-                        config.id,
-                    );
-                }
-                let audio_track = None;
-                let init_bytes = if let Some(c) = state.cenc.as_ref() {
-                    let params = fmp4::CencInitParams {
-                        scheme: c.scheme,
-                        key_id: &c.key_id,
-                        extra_pssh: c.extra_pssh.clone(),
-                    };
-                    fmp4::build_encrypted_init_segment(&v.track, audio_track, &params)
-                } else {
-                    fmp4::build_init_segment(&v.track, audio_track)
-                };
-                match http_put(init_url, init_bytes, "video/mp4", config.auth_token.as_deref()).await {
-                    Ok(_) => {
-                        state.init_uploaded = true;
-                        tracing::info!(
-                            "CMAF output '{}': uploaded init.mp4 ({}x{}, {:?}{})",
-                            config.id,
-                            v.track.width,
-                            v.track.height,
-                            v.track.codec,
-                            if audio_track.is_some() { " + audio" } else { "" },
-                        );
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            "CMAF output '{}': init.mp4 upload failed: {e}",
-                            config.id,
-                        );
-                        event_sender.emit_flow(
-                            EventSeverity::Warning,
-                            category::CMAF,
-                            format!("CMAF output '{}': init upload failed: {e}", config.id),
-                            flow_id,
-                        );
-                    }
-                }
+    if !state.init_uploaded
+        && let Some(v) = state.video_seg.as_ref()
+    {
+        // **Video-only, deliberately.** Muxing audio into the
+        // fragments is unimplemented: `try_build_muxed_segment`
+        // takes the pending audio samples and then returns `None`,
+        // so `build_muxed_segment_for_seq` always falls back to the
+        // video-only bytes. Every fragment we publish is video-only.
+        //
+        // Advertising an audio track in `init.mp4` that no fragment
+        // ever fills makes the whole output unplayable in a browser,
+        // and does it silently: MSE initialises the track, waits
+        // forever for data that never arrives, buffers nothing and
+        // reports no error. The manifest, the segments and the origin
+        // all look perfectly healthy. Until audio muxing lands, the
+        // init segment must describe what we actually send.
+        if state.audio_seg.is_some() || state.audio_ready {
+            tracing::warn!(
+                "CMAF output '{}': source has audio, but CMAF audio muxing \
+                 is not implemented — publishing a video-only init segment. \
+                 Advertising an audio track that is never filled would stall \
+                 browser playback.",
+                config.id,
+            );
+        }
+        let audio_track = None;
+        let init_bytes = if let Some(c) = state.cenc.as_ref() {
+            let params = fmp4::CencInitParams {
+                scheme: c.scheme,
+                key_id: &c.key_id,
+                extra_pssh: c.extra_pssh.clone(),
+            };
+            fmp4::build_encrypted_init_segment(&v.track, audio_track, &params)
+        } else {
+            fmp4::build_init_segment(&v.track, audio_track)
+        };
+        match http_put(init_url, init_bytes, "video/mp4", config.auth_token.as_deref()).await {
+            Ok(_) => {
+                state.init_uploaded = true;
+                tracing::info!(
+                    "CMAF output '{}': uploaded init.mp4 ({}x{}, {:?}{})",
+                    config.id,
+                    v.track.width,
+                    v.track.height,
+                    v.track.codec,
+                    if audio_track.is_some() { " + audio" } else { "" },
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "CMAF output '{}': init.mp4 upload failed: {e}",
+                    config.id,
+                );
+                event_sender.emit_flow(
+                    EventSeverity::Warning,
+                    category::CMAF,
+                    format!("CMAF output '{}': init upload failed: {e}", config.id),
+                    flow_id,
+                );
             }
         }
     }
