@@ -14,7 +14,8 @@ green (the full edge debug binary links):
   `SO_BINDTODEVICE`, automatic fallback to unprivileged `IP_UNICAST_IF`
   on `EPERM`. Resolved mechanism surfaced on `BondPathLegStats.binding`.
 - **Gateway mode** (`engine::bond_routing`): per-leg policy route via
-  **pure-Rust netlink** (`rtnetlink` 0.21), using the edge process's
+  **pure-Rust netlink** (`rtnetlink` 0.23 + `netlink-packet-route` 0.33 — the
+  two are version-locked, see the note in `Cargo.toml`), using the edge process's
   `CAP_NET_ADMIN` (already granted by the default unit and the binary's
   file caps). Config fields `gateway` + `source` on the bonded-output UDP
   path; `engine::output_bonded` programs routes before the socket binds

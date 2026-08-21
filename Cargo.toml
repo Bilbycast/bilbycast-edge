@@ -75,43 +75,59 @@ needless_range_loop = "allow"
 [dependencies]
 # Async runtime
 tokio = { version = "1.52", features = ["full"] }
-tokio-util = "0.7.18"
+tokio-util = "0.7.19"
 # Bridges `tokio::sync::mpsc::Receiver<T>` to `futures::Stream<Item=T>`,
 # which reqwest::Body::wrap_stream expects (used by CMAF-LL chunked PUT).
-tokio-stream = "0.1.18"
+tokio-stream = "0.1.19"
 
 # HTTP framework
 axum = { version = "0.8.9", features = ["ws"] }
 tower-http = { version = "0.7.0", features = ["cors", "trace"] }
 
 # Serialization
-serde = { version = "1.0.228", features = ["derive"] }
-serde_json = "1.0.149"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
 
 # Logging
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 
 # CLI
-clap = { version = "4.6.1", features = ["derive"] }
+clap = { version = "4.6.6", features = ["derive"] }
 
 # Time
-chrono = "0.4.44"
+chrono = "0.4.45"
 
 # Concurrency
+# PINNED to a release candidate on purpose, and the version number is
+# misleading: the 7.0 line is STALLED, not merely unreleased. 7.0.0-rc2 was
+# published 2025-03-05, there has never been an rc3, and upstream went on to
+# publish stable 6.2.1 on 2026-05-17 — fourteen months LATER. So `cargo update`
+# cannot move this, no fix will ever land on it, and an advisory against it
+# would have no upgrade path. It is NOT drift; do not "refresh" it to 6.2.1
+# without doing the attached work.
+#
+# Reverting to 6.2.1 is API-clean for our usage — every call site is `DashMap`,
+# `DashMap::new` or `Entry`, both versions re-export Entry/OccupiedEntry/
+# VacantEntry at the crate root, what 7.0 removed (the `Map` trait,
+# `SharedValue`, the `raw-api` feature) appears nowhere here, and no manifest
+# declares a dashmap feature. What stops it being a free swap is that 7.0
+# replaced hashbrown's RawTable with HashTable internally, and these maps are
+# the lock-free hot-path registries of Key Design Constraints #1/#2. Bench the
+# registries before moving, in edge, manager and relay together.
 dashmap = "7.0.0-rc2"
 arc-swap = "1.9"
 
 # Byte buffers
-bytes = "1.11.1"
+bytes = "1.12.1"
 
 # Enum utilities
 strum = { version = "0.28.0", features = ["derive"] }
 strum_macros = "0.28.0"
 
 # Socket config
-socket2 = "0.6.3"
-libc = "0.2.186"
+socket2 = "0.6.5"
+libc = "0.2.189"
 
 # Network interface enumeration (used by util::network_interfaces to populate
 # HealthPayload.network_interfaces — name, IPv4/IPv6, MAC, MTU, loopback).
@@ -120,7 +136,7 @@ libc = "0.2.186"
 if-addrs = "0.15"
 
 # Random
-rand = "0.10.1"
+rand = "0.10.2"
 
 # Pure-Rust audio sample rate conversion (used by the per-output PCM
 # transcode stage in `engine::audio_transcode` to bridge mismatched
@@ -166,7 +182,7 @@ aac-codec = { path = "../bilbycast-fdk-aac-rs/aac-codec", optional = true }
 # Still true, and the reason this stays a fallback: no shipped release artefact
 # exercises it. All three publish with `display` on, which forces `fdk-aac`, so
 # fdk-aac is the active AAC decoder everywhere in production.
-symphonia = { version = "0.6.0", features = ["aac"], default-features = false }
+symphonia = { version = "0.6.1", features = ["aac"], default-features = false }
 
 # ── FFmpeg / libav base codec layer (the `media-codecs` feature) ──────
 # In-process video decode, JPEG thumbnail encode, audio decode/encode
@@ -215,15 +231,15 @@ decklink-rs = { path = "../bilbycast-decklink-rs/decklink-rs", optional = true }
 rga-rs = { path = "../bilbycast-rga-rs/rga-rs", optional = true }
 
 # System resource monitoring (CPU, RAM)
-sysinfo = "0.39.1"
+sysinfo = "0.39.6"
 
 # Error handling
-anyhow = "1.0.102"
+anyhow = "1.0.104"
 
 # Auth (JWT / HMAC-SHA256)
 hmac = "0.13.0"
 sha2 = "0.11.0"
-base64 = "0.23.0"
+base64 = "0.23.1"
 serde_urlencoded = "0.7.1"
 subtle = "2.6"
 
@@ -237,24 +253,56 @@ ctr = "0.10"
 cbc = "0.2"
 
 # UUID for flow IDs
-uuid = { version = "1.23.1", features = ["v4", "v5", "serde"] }
+uuid = { version = "1.24.1", features = ["v4", "v5", "serde"] }
 
 # WebSocket client for manager connection
 tokio-tungstenite = { version = "0.30.0", features = ["rustls-tls-webpki-roots"] }
-webpki-roots = "1.0.7"
-futures-util = "0.3.32"
+webpki-roots = "1.0.9"
+futures-util = "0.3.34"
 url = "2.5.8"
 
 # Netlink (gateway-mode bonded-path policy routing — engine::bond_routing).
 # Pure Rust; uses the edge process's CAP_NET_ADMIN at runtime.
-rtnetlink = "0.21"
-# HELD at 0.30 deliberately — netlink-packet-route 0.31.0 is out, but
-# rtnetlink 0.21 (the latest) requires ^0.30, and `engine::bond_routing`
-# passes RouteMessage / RuleAction straight between the two crates. Bumping
-# ours alone resolves BOTH into the graph and those types stop unifying
+#
+# THESE TWO MOVE TOGETHER, ALWAYS. `engine::bond_routing` passes RouteMessage /
+# RuleMessage / RuleAction straight between the two crates, so resolving two
+# netlink-packet-route versions into the graph makes those types stop unifying
 # (E0308: "multiple different versions of crate netlink_packet_route").
-# Move this in lockstep with rtnetlink, not ahead of it.
-netlink-packet-route = "0.30"
+# rtnetlink is what pins the pair — each release requires exactly one
+# netlink-packet-route range:
+#     rtnetlink 0.21 -> netlink-packet-route ^0.30
+#     rtnetlink 0.22 -> netlink-packet-route ^0.32.1
+#     rtnetlink 0.23 -> netlink-packet-route ^0.33
+# Bump ours only in lockstep with rtnetlink's requirement, never ahead of it.
+#
+# Moving rtnetlink 0.21 -> 0.23 drags THREE more 0.x majors that we never name
+# in this manifest: netlink-packet-core 0.8.2 -> 0.9.0, netlink-proto
+# 0.12.1 -> 0.13.0 and netlink-sys 0.8.8 -> 0.9.0. Those own the socket and the
+# async framing under rtnetlink, and they were resolved, not source-audited —
+# so the bench verification below is covering five crates, not two.
+#
+# 0.30 -> 0.33 carried no source edits here: the 0.31/0.32/0.33 breaking changes
+# are in the link / vxlan / tc modules plus a zerocopy rewrite of the *buffer*
+# parsing types, and RouteMessage, RouteHeader, RouteAttribute, RuleMessage,
+# RuleHeader, RuleAction and RuleAttribute — the whole of what we touch — are
+# unchanged. That zerocopy rewrite is nonetheless the one thing to watch: it
+# rewrote the parse path that feeds `route_table()` and `rule_priority()`, and a
+# regression there would be SILENT (a healthy leg reported dead by `is_intact`,
+# a GC sweep that removes nothing) rather than a crash — `is_intact` and
+# `del_*` drive their dumps with `while let Ok(Some(..))`, which cannot tell a
+# failed dump from an empty one. And the exposure is wider than the two fields
+# we read: `del_rules_with_priority` / `del_routes_in_table` / `gc_reserved`
+# hand the DUMPED message straight back to the kernel as RTM_DELRULE /
+# RTM_DELROUTE, so every attribute round-trips through the new parser, not just
+# `route_table()` and `rule_priority()`. The netlink calls need a live kernel +
+# CAP_NET_ADMIN and no unit test covers them, so a green build is not evidence.
+# Verify on a bench host that also carries a nexthop-group or multipath route
+# (the 0.32 additions most likely to round-trip differently): program a
+# gateway-mode leg, check `ip rule show` / `ip route show table <T>` against
+# what `program()` claims, then kill the edge and confirm the startup GC sweep
+# removes the orphans on the next boot.
+rtnetlink = "0.23"
+netlink-packet-route = "0.33"
 
 # ── SRT backend ──────────────────────────────────────────────────────────
 # Haivision libsrt wrapper. Native SRT bonding, guaranteed FEC/encryption
@@ -295,13 +343,13 @@ bonding-transport = { path = "../bilbycast-bonding/bonding-transport", default-f
 bonding-protocol = { path = "../bilbycast-bonding/bonding-protocol" }
 
 # QUIC transport for IP tunneling (relay and direct modes)
-quinn = "0.11.9"
+quinn = "0.11.11"
 # rustls and rustls-pemfile are always needed (tunnel subsystem uses QUIC/TLS)
-rustls = { version = "0.23.40", features = ["ring"] }
+rustls = { version = "0.23.43", features = ["ring"] }
 # AEAD encryption for end-to-end tunnel encryption (ChaCha20-Poly1305)
 ring = "0.17.14"
 rustls-pemfile = "2.2.0"
-rcgen = "0.14.7"
+rcgen = "0.14.9"
 
 # EBU R128 loudness + true-peak measurement for the Audio Full
 # content-analysis tier. Pure-Rust (Sebastian Dröge's port of libebur128);
@@ -618,30 +666,53 @@ features = ["tls-rustls"]
 optional = true
 
 [dependencies.str0m]
-# 0.22.0 (2026-08-11), up from 0.19.0. The previous hold listed five breaking
-# changes; on audit only ONE reaches this crate:
-#   * `MediaData.data` moved `Vec<u8>` -> `Arc<[u8]>` (0.20). Handled in
-#     `engine::webrtc::session` by widening `SessionEvent::MediaData.data`
-#     to match, rather than copying per frame.
-# The other four do not apply: we never call `write_rtp` / `RtpWrite` (only the
-# sample-level `writer(mid).write(..)`, whose signature widened compatibly via
-# `Vec<u8>: Into<Arc<[u8]>>`), never touch abs-capture-time, and negotiate
-# H.264 + Opus only so the permissive-VP8 depacketizer fix is irrelevant. dimpl
-# 0.7 is transitive — we use the `openssl` DTLS backend, not dimpl.
+# 0.23.0 (2026-08-13), up from 0.22.0. An API-only bump: the crates.io
+# dependency list and feature table are byte-identical between the two
+# versions (dimpl ^0.7.1, is ^0.11.0, str0m-proto ^0.7.0, sctp-proto ^0.10.3;
+# same openssl / aws-lc-rs feature set; rust_version 1.85.0 either side), so it
+# drags no transitive churn. Upstream lists no breaking changes, and the
+# 0.22.0...0.23.0 diff touches four source files, none of them ours:
+#   * `DirectApi::send_pli_feedback` (#1025) — an additive `pub fn`. We never
+#     build a `DirectApi`; keyframes come from the sample-level
+#     `Event::KeyframeRequest` in `engine::webrtc::session`.
+#   * RRTR -> DLRR responder (#1022) — str0m now answers a peer's RRTR with
+#     RTCP XR DLRR blocks piggybacked on an outgoing Sender Report, bounded at
+#     300 pending and 50 blocks per report. New bytes toward peers that ask.
+#   * RRTR originator-SSRC fix (#1027) — wire-visible on the RECEIVE path, and
+#     unconditionally so, unlike #1022: the XR reports str0m already emits as a
+#     receiver now carry a local SSRC as `ExtendedReport.ssrc` instead of the
+#     remote stream's. Private Rust API (`StreamRx::create_extended_receiver_
+#     report` is not `pub`), but the bytes on the wire change for every WHIP
+#     ingest we already run.
+#   * `Dlrr::write_to` block-length fix — latent in 0.22, which had no DLRR
+#     sender at all.
+# `src/media/`, `src/rtc.rs` and `src/lib.rs` are untouched, so `Event` gained
+# no variant and `Rtc::writer(mid).write(..)` is unchanged.
 #
-# `is` moves 0.9.0 -> 0.11.0 with it (str0m 0.22 requires `is ^0.11.0`); the
-# vendored PRIORITY patch below has been re-applied. Upstream 0.11.0 still
-# hard-rejects PRIORITY-less Binding Requests, so the vendor tree stays.
+# The 0.19 -> 0.22 audit that preceded this: of five listed breaking changes
+# only `MediaData.data` moving `Vec<u8>` -> `Arc<[u8]>` (0.20) ever reached us,
+# handled in `engine::webrtc::session` by widening `SessionEvent::MediaData.data`
+# to match rather than copying per frame. We never call `write_rtp` / `RtpWrite`
+# (only the sample-level `writer(mid).write(..)`, whose signature widened
+# compatibly via `Vec<u8>: Into<Arc<[u8]>>`), never touch abs-capture-time, and
+# negotiate H.264 + Opus only so the permissive-VP8 depacketizer fix is
+# irrelevant. dimpl 0.7 is transitive — we use the `openssl` DTLS backend.
 #
-# NOT yet re-verified on live A/V: WHIP/WHEP interop against ffmpeg, OBS and a
-# browser, plus quality gates 3 / 7 / 9. Do that before shipping a release.
+# str0m 0.23 still requires `is ^0.11.0`, unchanged from 0.22, so the vendored
+# PRIORITY patch below keeps applying with no re-vendor. Upstream `is` 0.11.0
+# still hard-rejects PRIORITY-less Binding Requests, so the vendor tree stays.
+#
+# NOT yet re-verified on live A/V, and now two bumps deep: WHIP/WHEP interop
+# against ffmpeg, OBS and a browser, plus quality gates 3 / 7 / 9. #1022 adds
+# RTCP bytes toward those peers, so gate 7 in particular wants a run before
+# shipping a release.
 #
 # Opportunity left on the table deliberately: 0.22 (#1016) stopped rejecting an
 # offered H.264 level above the local config's, which is exactly what the four
 # extra level-5.1 PT registrations in `engine::webrtc::session` work around.
 # Removing them would change the answered SDP m-line PT set — interop-visible,
 # so it wants its own change with its own interop run.
-version = "0.22.0"
+version = "0.23.0"
 optional = true
 # Use OpenSSL DTLS backend instead of the default aws-lc-rs + dimpl. The
 # pure-Rust dimpl DTLS implementation stalls when the active side (WHEP
@@ -654,7 +725,7 @@ default-features = false
 features = ["openssl"]
 
 [dependencies.reqwest]
-version = "0.13.3"
+version = "0.13.4"
 default-features = false
 # Used by:
 #  - WebRTC WHIP client signaling (feature-gated imports inside engine::webrtc)
@@ -666,13 +737,30 @@ default-features = false
 features = ["rustls", "stream", "http2"]
 
 [dependencies.retina]
-version = "0.4.19"
+# 0.4.20 (2026-08-14), up from 0.4.19. The one entry in the 2026-08-21 freshness
+# sweep that is NOT cosmetic: 0.4.20 moved the RTSP read + depacketize path onto
+# an internal ring buffer, replacing the `tokio_util::codec::Framed` approach, to
+# cut read syscalls and allocations (upstream measures the client/h264 bench
+# 2.1 -> 4.6 GiB/s). The dependency set moves with it — `tokio-util` dropped,
+# `socket2 ^0.5` added, tokio floor 1.11 -> 1.13 — so the edge graph now carries
+# socket2 0.5 alongside our own 0.6. Harmless (no socket2 type crosses that
+# boundary) but it is why the lock gained a second socket2 major.
+#
+# Upstream's own caveat: the direct packet API (`Session<Playing> as Stream`)
+# now copies each packet into a fresh `Bytes` where the old Framed path could
+# hand over a pre-sized BytesMut. `engine::input_rtsp` uses the higher-level
+# `Demuxed` stream, which upstream says is the unaffected path — but that is
+# upstream's judgement, not a measurement of ours. 0.4.20 also accepts a
+# schemeless `Content-Base` header, which some cameras send.
+#
+# NOT verified on a real camera. RTSP ingest wants a live run before a release.
+version = "0.4.20"
 
 # Pure-Rust mDNS-SD service registration for NMOS IS-04 discovery
 # (`_nmos-node._tcp`). Best-effort: registration is gated at runtime so
 # environments without multicast on the chosen interface degrade cleanly.
 [dependencies.mdns-sd]
-version = "0.20.3"
+version = "0.21.0"
 
 [dev-dependencies]
 tempfile = "3.27.0"
@@ -709,7 +797,9 @@ zbus = { version = "5", default-features = false, features = ["tokio"] }
 # BILBYCAST PATCH: vendored `is` 0.11.0 with the strict-PRIORITY check on ICE
 # Binding Requests removed. Originally vendored against `is` 0.8.0 (2026-04-09);
 # re-vendored against 0.9.0 (2026-05-12, str0m 0.19) and 0.11.0 (2026-08-11,
-# str0m 0.22). Upstream still hard-rejects PRIORITY-less Binding Requests in 0.11.0.
+# str0m 0.22); carried unchanged to str0m 0.23, which still requires `is ^0.11.0`
+# — no re-vendor was needed for that bump. Upstream still hard-rejects
+# PRIORITY-less Binding Requests in 0.11.0.
 #
 # Why: ffmpeg's WHIP muxer (and a few other production WHIP publishers)
 # sends ICE connectivity-check Binding Requests without the PRIORITY
