@@ -84,7 +84,7 @@ every restart and strand the wall pointing at the retired one. `connector` is
 carries the FFmpeg names of the backends a wall on this node **would actually
 use**, head first — the resolved `h264_auto` chain, filtered by what this host
 can open, so on an Intel host with QuickSync it reads
-`["h264_qsv", "h264_vaapi", "x264"]`. Before v0.105.0 it named
+`["h264_qsv", "h264_vaapi", "x264"]`. Before v0.106.0 it named
 `select_video_backend()`'s answer and read `["libx264"]` on every artefact
 whatever the host had. The field names are a wire
 contract: the manager's `HeadAdvertisement` deserialises this verbatim.
@@ -163,7 +163,7 @@ resolved chain before the encoder opens, instead of from a second, separate
 question — which is how a wall could previously encode HEVC and be announced as
 H.264 (0x1B) with nothing downstream parsing the elementary stream to notice.
 
-> **Until v0.105.0 this field selected nothing.** The compositor resolved with
+> **Until v0.106.0 this field selected nothing.** The compositor resolved with
 > `select_video_backend()` — a function that takes no argument and returns the
 > first backend compiled into the binary in a fixed order, x264 ≻ x265 ≻ NVENC ≻
 > QSV, with VAAPI and RKMPP not considered at all — and then *overwrote* the

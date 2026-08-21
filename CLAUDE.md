@@ -405,8 +405,8 @@ nests and thumbnails with no new output code. Full reference: [`docs/multiviewer
   The manager gates no UI on the capability bit — it reads it once, at deploy,
   and refuses an undeployable wall with `422 wall_not_deployable` /
   `node_no_compositor`.
-- **`MosaicInputConfig.codec` selects a real encoder** (edge #129, fixed after
-  v0.105.0). `build_encoder` resolves through
+- **`MosaicInputConfig.codec` selects a real encoder** (edge #129, fixed in
+  v0.106.0). `build_encoder` resolves through
   `hardware_probe::resolve_chain_for_video_encode_config` against probed
   `StaticCapabilities`, exactly as an output's `video_encode` does, and hands
   `ScaledVideoEncoder::with_backend_chain` the whole chain so it falls through on
@@ -415,7 +415,7 @@ nests and thumbnails with no new output code. Full reference: [`docs/multiviewer
   at 6.18 Mbps with no fall-through. The chain is **family-pure**, which is
   load-bearing: the PMT's `stream_type` is settled from its head before the
   encoder opens, so a demote changes the backend and never the wire codec.
-  Until v0.105.0 it called the no-argument `select_video_backend()` (x264 ≻ x265
+  Until v0.106.0 it called the no-argument `select_video_backend()` (x264 ≻ x265
   ≻ NVENC ≻ QSV; VAAPI and RKMPP not considered) and *overwrote* the encode
   config's codec, so every wall encoded on CPU x264 whatever the field said, a
   wall asked for HEVC silently got H.264, the muxer asked the same wrong question
