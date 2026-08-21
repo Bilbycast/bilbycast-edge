@@ -54,7 +54,7 @@ use super::ts_program_filter::TsProgramFilter;
 
 use codecs::aac_audio_specific_config;
 use encode::{AudioReencoder, VideoReencoder};
-use fmp4::{AudioTrack, VideoCodec, VideoTrack};
+use fmp4::{AudioTrack, Sample, VideoCodec, VideoTrack};
 use manifest::{
     DashAudioRep, DashInput, DashVideoRep, HlsPartEntry, LowLatencyHints, M3u8Entry,
     build_dash_mpd, build_hls_playlist, default_segment_uri,
@@ -181,6 +181,21 @@ struct CmafState {
     /// observed). Init.mp4 is published only after both video + (if
     /// configured) audio are ready.
     audio_ready: bool,
+    /// Latched at the first init.mp4 publish: does this output carry audio?
+    ///
+    /// `init.mp4` declares the track list, and a browser builds its decoders
+    /// from it once. So the answer has to be decided *before* the first
+    /// publish and then never change: declaring an audio track that no
+    /// fragment fills stalls MSE silently (see #130), and muxing audio into
+    /// fragments whose init never declared the track is just as broken.
+    ///
+    /// `None` until decided. The video track can materialise before the
+    /// first audio frame arrives, so the decision waits out
+    /// [`AUDIO_DETECT_GRACE`] before settling on video-only.
+    audio_muxing: Option<bool>,
+    /// When the video track first materialised — the clock that bounds the
+    /// wait above. `None` until there is a video track.
+    video_ready_at: Option<std::time::Instant>,
     /// Estimated video bitrate in bps (EWMA over emitted segments).
     video_bps_ewma: u64,
     /// Estimated audio bitrate in bps.
@@ -245,6 +260,8 @@ impl CmafState {
             video_seg: None,
             audio_seg: None,
             audio_ready: false,
+            audio_muxing: None,
+            video_ready_at: None,
             video_bps_ewma: 0,
             audio_bps_ewma: 0,
             availability_start_unix: 0,
@@ -872,33 +889,41 @@ async fn handle_video(
         return;
     }
 
+    // Start the audio-detection clock the moment a video track exists.
+    if state.video_ready_at.is_none() && state.video_seg.is_some() {
+        state.video_ready_at = Some(std::time::Instant::now());
+    }
+
     // Publish init.mp4 the first time a video track is materialised.
     if init_publish_due(state)
+        && state.video_seg.is_some()
+        && let Some(with_audio) = resolve_audio_muxing(state)
         && let Some(v) = state.video_seg.as_ref()
     {
-        // **Video-only, deliberately.** Muxing audio into the
-        // fragments is unimplemented: `try_build_muxed_segment`
-        // takes the pending audio samples and then returns `None`,
-        // so `build_muxed_segment_for_seq` always falls back to the
-        // video-only bytes. Every fragment we publish is video-only.
-        //
-        // Advertising an audio track in `init.mp4` that no fragment
-        // ever fills makes the whole output unplayable in a browser,
-        // and does it silently: MSE initialises the track, waits
-        // forever for data that never arrives, buffers nothing and
-        // reports no error. The manifest, the segments and the origin
-        // all look perfectly healthy. Until audio muxing lands, the
-        // init segment must describe what we actually send.
-        if state.audio_seg.is_some() || state.audio_ready {
+        // The track list here and the tracks the fragments actually carry
+        // must agree exactly, in both directions. Declaring an audio track
+        // no fragment fills stalls MSE silently — it initialises the track,
+        // waits forever for data that never comes, buffers nothing and
+        // reports no error, while the manifest, the segments and the origin
+        // all look healthy (#130). Sending audio the init never declared
+        // fails just as quietly. `audio_muxing` is the single latched answer
+        // both sides read.
+        let audio_track = if with_audio {
+            state.audio_seg.as_ref().map(|a| &a.track)
+        } else {
+            None
+        };
+        if !with_audio && (state.audio_seg.is_some() || state.audio_ready) {
+            // Audio turned up after the track list was already committed.
+            // Nothing to do but say so: adopting it now would mean widening
+            // the moov under a player that has already built its decoders.
             tracing::warn!(
-                "CMAF output '{}': source has audio, but CMAF audio muxing \
-                 is not implemented — publishing a video-only init segment. \
-                 Advertising an audio track that is never filled would stall \
-                 browser playback.",
+                "CMAF output '{}': audio appeared after init.mp4 was already \
+                 published as video-only — it will not be carried. Restart \
+                 the flow if the source is expected to have audio.",
                 config.id,
             );
         }
-        let audio_track = None;
         let init_bytes = if let Some(c) = state.cenc.as_ref() {
             let params = fmp4::CencInitParams {
                 scheme: c.scheme,
@@ -951,8 +976,13 @@ async fn handle_video(
             encrypt_and_build_video_segment(state, &seg, completed)
             .map(|b| (b, SegmentKind::Video, seg.duration_90k))
             .unwrap_or((seg.bytes, seg.kind, seg.duration_90k))
-        } else if state.audio_seg.is_some() {
-            build_muxed_segment_for_seq(state, &seg)
+        } else if state.audio_muxing == Some(true) {
+            // Falls back to the video-only bytes when this segment happens to
+            // have no audio buffered (a gap in the source, or the very first
+            // segment). That stays playable: the fragment simply carries no
+            // run for the audio track, which is legal and which MSE handles
+            // as a gap rather than a failure.
+            build_muxed_segment_for_seq(state, &seg, outcome.completed_video_samples.as_ref())
                 .unwrap_or((seg.bytes, seg.kind, seg.duration_90k))
         } else {
             (seg.bytes, seg.kind, seg.duration_90k)
@@ -1144,8 +1174,10 @@ fn encrypt_and_build_video_segment(
 fn build_muxed_segment_for_seq(
     state: &mut CmafState,
     seg: &CompletedSegment,
+    video_samples: Option<&(u64, u64, Vec<Sample>)>,
 ) -> Option<(Vec<u8>, SegmentKind, u64)> {
-    let v_seg = state.video_seg.as_mut()?;
+    let (v_seq, v_base, v_samples) = video_samples?;
+    let (v_seq, v_base) = (*v_seq, *v_base);
     let a_seg = state.audio_seg.as_mut()?;
 
     // Convert video segment boundary DTS (90 kHz) into the audio
@@ -1153,32 +1185,28 @@ fn build_muxed_segment_for_seq(
     let boundary_video_dts = seg.base_dts_90k + seg.duration_90k;
     let boundary_audio_ts = boundary_video_dts * a_seg.track.sample_rate as u64 / 90_000;
 
-    // Take whatever audio is buffered. We deliberately do NOT use the
-    // video segmenter's take_pending_samples (the segment is already
-    // closed); the bytes inside `seg.bytes` are a video-only fMP4.
-    // Rebuild as muxed if we have audio for this segment.
-    let audio_data = a_seg.take_pending_samples(boundary_audio_ts)?;
-    let (a_seq, a_base, a_samples) = audio_data;
+    // Take whatever audio is buffered for this segment's span.
+    let (_a_seq, a_base, a_samples) = a_seg.take_pending_samples(boundary_audio_ts)?;
     if a_samples.is_empty() {
         return None;
     }
 
-    // For muxed output we drop the video-only bytes and rebuild from
-    // the next-pending video samples. But by the time we get here,
-    // those samples have already been consumed by the segmenter to
-    // produce `seg.bytes`. Cheapest fix: re-derive video samples by
-    // parsing seg.bytes is expensive — we instead leave the existing
-    // single-track segments in place and emit a parallel audio-only
-    // segment alongside (CMAF supports both modes).
+    // Rebuild the fragment with both tracks. `seg.bytes` is a video-only
+    // fMP4 and is discarded — the video samples that built it come back
+    // through `PushOutcome::completed_video_samples`, so nothing has to be
+    // re-parsed out of the serialised segment.
     //
-    // We synthesize an audio-only segment and upload it separately by
-    // returning the rebuilt audio bytes. The video bytes stay as-is.
-    //
-    // Simpler approach taken here: keep video-only seg, separately
-    // emit audio-only seg (caller is responsible for upload).
-    let _ = (v_seg, a_seq, a_base);
-
-    None
+    // The video sequence number is reused for the muxed fragment so the
+    // fragment number keeps matching the segment number the playlist lists;
+    // the audio segmenter's own counter is irrelevant here and dropped.
+    let bytes = fmp4::build_muxed_segment(
+        v_seq as u32,
+        v_base,
+        v_samples,
+        a_base,
+        &a_samples,
+    );
+    Some((bytes, SegmentKind::Muxed, seg.duration_90k))
 }
 
 /// Build the video track from parameter sets carried in an encoded frame.
@@ -1250,6 +1278,51 @@ fn init_publish_due(state: &CmafState) -> bool {
     match state.init_last_upload {
         None => true,
         Some(t) => t.elapsed() >= INIT_REPUBLISH_INTERVAL,
+    }
+}
+
+/// How long the first `init.mp4` waits for an audio track to appear before
+/// committing to a video-only output.
+///
+/// Video and audio materialise independently: video needs an IDR (plus, on
+/// the re-encode path, the encoder's first in-band SPS/PPS), audio needs one
+/// frame carrying the codec config. Either can be first. Publishing the
+/// instant video is ready would declare video-only for a source that does
+/// have audio — and because the track list is latched, that choice would
+/// stick for the life of the flow.
+///
+/// A segment is typically 2 s, so this costs at most one segment of startup
+/// and only when the source turns out to be silent.
+const AUDIO_DETECT_GRACE: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Decide, once, whether this output carries audio.
+///
+/// Returns `None` while the answer is still genuinely unknown — the caller
+/// must hold off publishing `init.mp4` until it resolves.
+fn resolve_audio_muxing(state: &mut CmafState) -> Option<bool> {
+    if let Some(decided) = state.audio_muxing {
+        return Some(decided);
+    }
+    // Audio is here — settle immediately, no reason to wait out the grace.
+    if state.audio_seg.is_some() {
+        state.audio_muxing = Some(true);
+        return Some(true);
+    }
+    // CENC encrypts video only today (`encrypt_audio_sample` is written but
+    // unwired), so an encrypted output stays video-only rather than shipping
+    // an audio track in the clear under an init that claims it is encrypted.
+    if state.cenc.is_some() {
+        state.audio_muxing = Some(false);
+        return Some(false);
+    }
+    match state.video_ready_at {
+        Some(t) if t.elapsed() >= AUDIO_DETECT_GRACE => {
+            state.audio_muxing = Some(false);
+            Some(false)
+        }
+        Some(_) => None,
+        // No video track yet; the caller is not publishing init anyway.
+        None => None,
     }
 }
 

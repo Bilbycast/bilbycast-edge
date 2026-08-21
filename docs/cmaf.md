@@ -16,7 +16,10 @@ players without transcoding twice. Supports:
 - **Video**: H.264 or HEVC passthrough, or re-encode via libx264 /
   libx265 / NVENC with explicit GoP alignment.
 - **Audio**: AAC-LC / HE-AACv1 / HE-AACv2 passthrough, or re-encode via
-  the in-process fdk-aac backend.
+  the in-process fdk-aac backend. Audio is **muxed into the same
+  fragment as the video** — one `moof` addressing both tracks — so a
+  browser needs a single MSE SourceBuffer and there is no second
+  timeline to keep aligned.
 - **Delivery**: whole-segment HTTP PUT (`low_latency: false`) or
   chunked-transfer streaming PUT (`low_latency: true`, LL-CMAF) with
   per-segment `moof + mdat` chunks emitted every `chunk_duration_ms`
@@ -77,6 +80,37 @@ segments will drift and the manifest's per-segment `EXTINF` may exceed
 
 For re-encoded video (`video_encode` block set), the edge forces
 `gop_size = segment_duration_secs * fps` so boundaries are guaranteed.
+
+## Playlist window (`dvr_window_secs`)
+
+By default the playlist lists the last `max_segments` segments — a live
+window, a handful of segments deep. `dvr_window_secs` replaces that
+with a **duration**, and the playlist is trimmed to
+`ceil(dvr_window_secs / segment_duration_secs)` segments instead
+(capped at 21 600, which is 12 hours of 2 s segments).
+
+That is what makes a browser able to seek backwards: `video.seekable`
+is derived from what the playlist lists, so a 5-segment live window
+gives a viewer 10 seconds of history no matter how much the origin
+still holds.
+
+Two things have to agree, and neither is derived from the other:
+
+- **The edge's playlist** must not list segments the origin has already
+  evicted, or a seek into them 404s mid-playback.
+- **The origin's retention** must not be shorter than the window the
+  playlist advertises. On bilbycast-relay this is
+  `origin_retention_secs`, or a per-stream override pushed by the
+  manager.
+
+Size the origin's retention to the advertised window **plus headroom** —
+a viewer parked mid-window must not have the segment under them deleted
+while they are watching it.
+
+The playlist also stops declaring `#EXT-X-PLAYLIST-TYPE:EVENT`, which it
+previously did unconditionally. `EVENT` promises a playlist that only
+ever grows (RFC 8216 §4.3.3.5); a trimmed playlist is not one, and
+hls.js computed a seekable range that included segments already dropped.
 
 ## LL-CMAF
 
@@ -251,8 +285,9 @@ The edge uses the following filenames under `{ingest_url}`:
 - `init.mp4` — init segment (ftyp + moov).
 - `seg-NNNNN.m4s` — video / muxed media segment (5-digit zero-padded
   sequence number).
-- `aud-NNNNN.m4s` — audio-only media segment (reserved; not emitted in
-  the default muxed-segment configuration).
+- `aud-NNNNN.m4s` — audio-only media segment. **Reserved and not
+  emitted**: when a source has audio it is muxed into `seg-NNNNN.m4s`
+  alongside the video, so a separate audio object never appears.
 - `manifest.m3u8` — HLS playlist.
 - `manifest.mpd` — DASH manifest.
 - `seg-NNNNN.m4s?part=K` — LL-HLS part URI (query string distinguishes
@@ -291,6 +326,19 @@ should set up a URL-rewriting reverse proxy in front of their ingest.
 - Only single-rendition outputs are supported today. Multi-bitrate ABR
   is produced by running multiple CMAF outputs and merging at the
   CDN / origin (standard workflow).
+- **The track list is fixed at the first `init.mp4`.** A browser builds
+  its decoders from that file once, so a track cannot be added later:
+  declaring an audio track no fragment fills stalls MSE *silently*
+  (decoders initialise, nothing ever arrives, nothing errors), and
+  sending audio the init never declared fails the same quiet way. The
+  first init therefore waits up to 3 s for an audio track to appear
+  before committing to video-only; a source whose audio starts after
+  that is carried as video-only for the life of the flow, with a
+  warning, and needs a flow restart to pick it up.
+- **Encrypted (CENC) outputs are video-only.** `encrypt_audio_sample`
+  exists but is unwired, and shipping the audio track in the clear
+  under an init that declares the output encrypted would be worse than
+  omitting it.
 - No live-to-VOD archival — the rolling playlist caps at `max_segments`
   and old `.m4s` files are not deleted on the ingest side. Operators
   must configure CDN / object-store retention externally.
