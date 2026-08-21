@@ -728,9 +728,21 @@ pub fn build_multi_track_segment(
             let mut traf = moof.child(*b"traf");
             // tfhd: default-base-is-moof flag (0x020000) — sample offsets
             // are then implicitly relative to moof start.
+            // tfhd: default-base-is-moof (0x020000) + default-sample-flags
+            // (0x000020). The per-fragment default is chosen per *track*:
+            // an audio traf is all-sync, an all-intra video traf is all-sync,
+            // a long-GOP video traf is not. Without this the samples after
+            // sample 0 fall through to `trex.default_sample_flags`, which is
+            // non-sync for every track — see the note on `SAMPLE_FLAGS_SYNC`
+            // and #127, which fixed the single-track writer but not this one.
             {
-                let mut tfhd = traf.child_full(*b"tfhd", 0, 0x0002_0000);
+                let mut tfhd = traf.child_full(*b"tfhd", 0, 0x0002_0020);
                 tfhd.u32(t.track_id);
+                tfhd.u32(if t.samples.iter().all(|s| s.is_sync) {
+                    SAMPLE_FLAGS_SYNC
+                } else {
+                    SAMPLE_FLAGS_NON_SYNC
+                });
             }
             {
                 let mut tfdt = traf.child_full(*b"tfdt", 1, 0);
@@ -744,7 +756,11 @@ pub fn build_multi_track_segment(
             data_offset_patches.push(trun.cursor_pos());
             trun.u32(0); // placeholder data_offset
             let first_sync = t.samples.first().map(|s| s.is_sync).unwrap_or(false);
-            let first_flags: u32 = if first_sync { 0x0200_0000 } else { 0x0100_0000 };
+            let first_flags: u32 = if first_sync {
+                SAMPLE_FLAGS_SYNC
+            } else {
+                SAMPLE_FLAGS_NON_SYNC
+            };
             trun.u32(first_flags);
             for s in t.samples {
                 trun.u32(s.duration);
@@ -950,8 +966,16 @@ pub fn build_segment_chunk(
         {
             let mut traf = moof.child(*b"traf");
             {
-                let mut tfhd = traf.child_full(*b"tfhd", 0, 0x0002_0000);
+                // default-base-is-moof + default-sample-flags. See #127: the
+                // samples after sample 0 otherwise inherit
+                // `trex.default_sample_flags`, which is non-sync.
+                let mut tfhd = traf.child_full(*b"tfhd", 0, 0x0002_0020);
                 tfhd.u32(track_id);
+                tfhd.u32(if samples.iter().all(|s| s.is_sync) {
+                    SAMPLE_FLAGS_SYNC
+                } else {
+                    SAMPLE_FLAGS_NON_SYNC
+                });
             }
             {
                 let mut tfdt = traf.child_full(*b"tfdt", 1, 0);
@@ -963,9 +987,9 @@ pub fn build_segment_chunk(
             data_offset_patch = trun.cursor_pos();
             trun.u32(0);
             let first_flags: u32 = if samples.first().map(|s| s.is_sync).unwrap_or(false) {
-                0x0200_0000
+                SAMPLE_FLAGS_SYNC
             } else {
-                0x0100_0000
+                SAMPLE_FLAGS_NON_SYNC
             };
             trun.u32(first_flags);
             for s in samples {
@@ -1024,8 +1048,16 @@ pub fn build_encrypted_media_segment(
         {
             let mut traf = moof.child(*b"traf");
             {
-                let mut tfhd = traf.child_full(*b"tfhd", 0, 0x0002_0000);
+                // default-base-is-moof + default-sample-flags. See #127: the
+                // samples after sample 0 otherwise inherit
+                // `trex.default_sample_flags`, which is non-sync.
+                let mut tfhd = traf.child_full(*b"tfhd", 0, 0x0002_0020);
                 tfhd.u32(track_id);
+                tfhd.u32(if samples.iter().all(|s| s.is_sync) {
+                    SAMPLE_FLAGS_SYNC
+                } else {
+                    SAMPLE_FLAGS_NON_SYNC
+                });
             }
             {
                 let mut tfdt = traf.child_full(*b"tfdt", 1, 0);
@@ -1143,6 +1175,14 @@ mod tests {
     /// `trun`, else `first_sample_flags` for sample 0, else
     /// `tfhd.default_sample_flags`. Returns (sync_count, total).
     fn resolve_sync_samples(seg: &[u8]) -> (usize, usize) {
+        resolve_sync_samples_filtered(seg, None)
+    }
+
+    /// As above, but counting only the traf belonging to `want_track`. A
+    /// muxed fragment resolves its two tracks independently — long-GOP video
+    /// and all-sync audio in the same moof — so a whole-fragment count cannot
+    /// tell you whether either one is right.
+    fn resolve_sync_samples_filtered(seg: &[u8], want_track: Option<u32>) -> (usize, usize) {
         fn boxes(buf: &[u8], mut off: usize, end: usize) -> Vec<([u8; 4], usize, usize)> {
             let mut out = Vec::new();
             while off + 8 <= end {
@@ -1169,10 +1209,14 @@ mod tests {
                     continue;
                 }
                 let mut tfhd_default: Option<u32> = None;
+                let mut track_matches = want_track.is_none();
                 for (t3, s3, _e3) in boxes(seg, s2, e2) {
                     match &t3 {
                         b"tfhd" => {
                             let fl = be32(&seg[s3..]) & 0x00FF_FFFF;
+                            if let Some(want) = want_track {
+                                track_matches = be32(&seg[s3 + 4..]) == want;
+                            }
                             let mut p = s3 + 8; // version/flags + track_ID
                             if fl & 0x01 != 0 {
                                 p += 8;
@@ -1191,6 +1235,9 @@ mod tests {
                             }
                         }
                         b"trun" => {
+                            if !track_matches {
+                                continue;
+                            }
                             let tf = be32(&seg[s3..]) & 0x00FF_FFFF;
                             let cnt = be32(&seg[s3 + 4..]) as usize;
                             let mut p = s3 + 8;
@@ -1220,7 +1267,12 @@ mod tests {
                                 if i == 0 && first.is_some() {
                                     f = first;
                                 }
-                                let f = f.or(tfhd_default).unwrap_or(0);
+                                // Last resort is `trex.default_sample_flags`,
+                                // which the init segment sets to non-sync.
+                                // Defaulting to 0 here would read as "sync"
+                                // and quietly excuse a fragment that declares
+                                // no flags at all.
+                                let f = f.or(tfhd_default).unwrap_or(SAMPLE_FLAGS_NON_SYNC);
                                 total += 1;
                                 if f & 0x0001_0000 == 0 {
                                     sync += 1;
@@ -1271,6 +1323,58 @@ mod tests {
             resolve_sync_samples(&seg),
             (25, 25),
             "an all-intra fragment must report every sample as seekable"
+        );
+    }
+
+    /// A muxed fragment must resolve each track's sync flags on its own.
+    ///
+    /// The muxed writer never got #127's fix, so every sample past sample 0
+    /// fell through to `trex.default_sample_flags` — non-sync for *every*
+    /// track. That mismarks all but the first frame of an AAC track, where
+    /// every sample is a random-access point by construction.
+    #[test]
+    fn muxed_fragment_resolves_each_track_independently() {
+        let mut video = vec![sample(true)];
+        video.extend((0..24).map(|_| sample(false)));
+        let audio: Vec<Sample> = (0..94).map(|_| sample(true)).collect();
+
+        let seg = build_muxed_segment(1, 0, &video, 0, &audio);
+
+        assert_eq!(
+            resolve_sync_samples_filtered(&seg, Some(VIDEO_TRACK_ID)),
+            (1, 25),
+            "long-GOP video in a muxed fragment must report one random-access point"
+        );
+        assert_eq!(
+            resolve_sync_samples_filtered(&seg, Some(AUDIO_TRACK_ID)),
+            (94, 94),
+            "every AAC sample is a random-access point and the fragment must say so"
+        );
+    }
+
+    /// Both tracks must actually be present, addressed and carried — a moof
+    /// declaring two trafs over an mdat holding one track's bytes is the
+    /// silent-stall shape this whole feature keeps producing.
+    #[test]
+    fn muxed_fragment_carries_both_tracks() {
+        let video: Vec<Sample> = (0..3).map(|_| sample(true)).collect();
+        let audio: Vec<Sample> = (0..5).map(|_| sample(true)).collect();
+        let seg = build_muxed_segment(7, 90_000, &video, 48_000, &audio);
+
+        let (v_sync, v_total) = resolve_sync_samples_filtered(&seg, Some(VIDEO_TRACK_ID));
+        let (a_sync, a_total) = resolve_sync_samples_filtered(&seg, Some(AUDIO_TRACK_ID));
+        assert_eq!((v_sync, v_total), (3, 3), "video traf missing or miscounted");
+        assert_eq!((a_sync, a_total), (5, 5), "audio traf missing or miscounted");
+
+        // mdat must hold every sample's bytes from both tracks.
+        let payload: usize = video.iter().chain(audio.iter()).map(|s| s.data.len()).sum();
+        let mdat = seg
+            .windows(4)
+            .position(|w| w == b"mdat")
+            .expect("muxed fragment has no mdat");
+        assert!(
+            seg.len() - mdat >= payload,
+            "mdat is too small to hold both tracks' samples"
         );
     }
 

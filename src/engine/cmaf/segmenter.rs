@@ -82,6 +82,11 @@ pub struct CompletedSegment {
 pub enum SegmentKind {
     Video,
     Audio,
+    /// One fragment carrying both the video and the audio track, which is
+    /// what a browser wants: a single MSE SourceBuffer, one timeline, no
+    /// second playlist to keep aligned. Named like a video segment because
+    /// it *is* the media segment the playlist lists.
+    Muxed,
 }
 
 // ────────────────────────────────────────────────────────────────────────
