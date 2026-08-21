@@ -5507,6 +5507,17 @@ pub struct CmafOutputConfig {
     /// Default: 5.
     #[serde(default = "default_max_segments")]
     pub max_segments: usize,
+    /// Rolling playlist window expressed in **time**, for DVR / scrub-back
+    /// surfaces. When set it supersedes `max_segments`: the segment count is
+    /// derived as `ceil(dvr_window_secs / segment_duration_secs)`, so the
+    /// window stays the intended duration if the segment length changes.
+    /// Range: 1.0 s .. 21600 entries once derived (see validation).
+    ///
+    /// The playlist is a *sliding* window — it advertises exactly what the
+    /// origin still holds, so origin retention must be sized to match or
+    /// clients will seek to evicted segments.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dvr_window_secs: Option<f64>,
     /// Manifests to publish. Non-empty subset of `["hls", "dash"]`.
     /// Default: both. **Phase 1 MVP ships only `"hls"` — validation
     /// rejects `"dash"` until Phase 2 lands.**
@@ -5554,6 +5565,28 @@ pub struct CmafOutputConfig {
     /// every upload.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth_token: Option<String>,
+}
+
+/// Upper bound on derived playlist length. A 21600-entry playlist is ~650 KB
+/// and is refetched by every viewer on every segment, so this is a guard
+/// against manifest traffic dwarfing the media, not a storage limit.
+pub const MAX_PLAYLIST_SEGMENTS: usize = 21_600;
+
+impl CmafOutputConfig {
+    /// Effective rolling-playlist length in segments.
+    ///
+    /// `dvr_window_secs` wins when set — the whole point of expressing the
+    /// window in time is that it survives a change to `segment_duration_secs`.
+    /// Falls back to `max_segments` otherwise. Always at least 1: a playlist
+    /// with no segments is not playable.
+    pub fn playlist_window_segments(&self) -> usize {
+        match self.dvr_window_secs {
+            Some(w) if self.segment_duration_secs > 0.0 => {
+                ((w / self.segment_duration_secs).ceil() as usize).clamp(1, MAX_PLAYLIST_SEGMENTS)
+            }
+            _ => self.max_segments.max(1),
+        }
+    }
 }
 
 /// Common Encryption (ISO/IEC 23001-7) configuration for a CMAF output.
@@ -7473,6 +7506,63 @@ pub struct MxlAncOutputConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `dvr_window_secs` expresses the rolling playlist window in time and
+    /// supersedes `max_segments`. The point is that the window stays the
+    /// intended *duration* when `segment_duration_secs` changes, so the
+    /// derivation — not the raw field — is what needs pinning.
+    #[test]
+    fn cmaf_dvr_window_derives_segment_count() {
+        let cfg = |extra: &str| -> CmafOutputConfig {
+            serde_json::from_str(&format!(
+                r#"{{"id":"c","name":"c","ingest_url":"https://h/o"{extra}}}"#
+            ))
+            .expect("minimal CMAF config should deserialize")
+        };
+
+        // Unset: falls back to max_segments (default 5).
+        assert_eq!(cfg("").playlist_window_segments(), 5);
+
+        // 60 minutes of 1 s segments.
+        assert_eq!(
+            cfg(r#","segment_duration_secs":1.0,"dvr_window_secs":3600.0"#)
+                .playlist_window_segments(),
+            3600
+        );
+
+        // Same window, longer segments: half the entries, same duration.
+        assert_eq!(
+            cfg(r#","segment_duration_secs":2.0,"dvr_window_secs":3600.0"#)
+                .playlist_window_segments(),
+            1800
+        );
+
+        // Wins over an explicit max_segments rather than being min-ed with it.
+        assert_eq!(
+            cfg(r#","segment_duration_secs":1.0,"max_segments":5,"dvr_window_secs":600.0"#)
+                .playlist_window_segments(),
+            600
+        );
+
+        // Rounds up — a partial trailing segment still has to be listed.
+        assert_eq!(
+            cfg(r#","segment_duration_secs":2.0,"dvr_window_secs":61.0"#)
+                .playlist_window_segments(),
+            31
+        );
+
+        // Clamped to the manifest-size cap, and never zero.
+        assert_eq!(
+            cfg(r#","segment_duration_secs":1.0,"dvr_window_secs":99999.0"#)
+                .playlist_window_segments(),
+            MAX_PLAYLIST_SEGMENTS
+        );
+        assert_eq!(
+            cfg(r#","segment_duration_secs":10.0,"dvr_window_secs":1.0"#)
+                .playlist_window_segments(),
+            1
+        );
+    }
 
     /// `egress_pacing` is tri-state on the wire: absent = auto (`None`),
     /// explicit `forward` / `pcr` survive untouched. Existing configs

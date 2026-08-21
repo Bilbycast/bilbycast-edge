@@ -5829,6 +5829,27 @@ pub fn validate_output_with_input(
                     cmaf.id, cmaf.max_segments
                 );
             }
+            if let Some(w) = cmaf.dvr_window_secs {
+                if !w.is_finite() || w < 1.0 {
+                    bail!(
+                        "CMAF output '{}': dvr_window_secs must be >= 1.0, got {}",
+                        cmaf.id, w
+                    );
+                }
+                // Bound the derived entry count, not the raw window: a long
+                // window with long segments is cheap, it is entries that cost.
+                let derived = (w / cmaf.segment_duration_secs).ceil() as usize;
+                if derived > crate::config::models::MAX_PLAYLIST_SEGMENTS {
+                    bail!(
+                        "CMAF output '{}': dvr_window_secs {} over segment_duration_secs {} derives {} playlist entries, above the {} cap. Every viewer refetches the whole playlist each segment, so lengthen segment_duration_secs or shorten the window.",
+                        cmaf.id,
+                        w,
+                        cmaf.segment_duration_secs,
+                        derived,
+                        crate::config::models::MAX_PLAYLIST_SEGMENTS
+                    );
+                }
+            }
             if cmaf.manifests.is_empty() {
                 bail!(
                     "CMAF output '{}': manifests must be a non-empty subset of [\"hls\",\"dash\"]",
@@ -8547,6 +8568,49 @@ fn validate_port_conflicts(config: &AppConfig) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+
+    /// `dvr_window_secs` is bounded by the *derived* entry count, not the raw
+    /// window: a long window made of long segments is cheap to advertise, and
+    /// it is the per-segment refetch of a huge playlist that actually hurts.
+    #[test]
+    fn validate_output_cmaf_dvr_window_bounds() {
+        use crate::config::models::OutputConfig;
+        let out = |extra: &str| -> OutputConfig {
+            serde_json::from_str(&format!(
+                r#"{{"type":"cmaf","id":"c","name":"c","ingest_url":"https://h/o","manifests":["hls"]{extra}}}"#
+            ))
+            .expect("CMAF output should deserialize")
+        };
+
+        // 60 min of 1 s segments: 3600 entries, well under the cap.
+        assert!(
+            validate_output(&out(
+                r#","segment_duration_secs":1.0,"dvr_window_secs":3600.0"#
+            ))
+            .is_ok()
+        );
+
+        // Absent is still fine — max_segments keeps working.
+        assert!(validate_output(&out("")).is_ok());
+
+        // Below the floor.
+        assert!(validate_output(&out(r#","dvr_window_secs":0.5"#)).is_err());
+
+        // Same 6 h window: rejected at 1 s segments, accepted at 10 s, because
+        // only the entry count differs.
+        assert!(
+            validate_output(&out(
+                r#","segment_duration_secs":1.0,"dvr_window_secs":86400.0"#
+            ))
+            .is_err()
+        );
+        assert!(
+            validate_output(&out(
+                r#","segment_duration_secs":10.0,"dvr_window_secs":86400.0"#
+            ))
+            .is_ok()
+        );
+    }
     use super::*;
     use crate::config::models::{
         AssembledProgram, AssembledStream, AssemblyKind, EssenceKind, FlowAssembly, PcrSource,

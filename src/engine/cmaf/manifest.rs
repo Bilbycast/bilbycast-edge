@@ -78,7 +78,15 @@ pub fn build_hls_playlist(
     });
     out.push_str(&format!("#EXT-X-TARGETDURATION:{target_duration}\n"));
     out.push_str(&format!("#EXT-X-MEDIA-SEQUENCE:{media_sequence}\n"));
-    out.push_str("#EXT-X-PLAYLIST-TYPE:EVENT\n");
+    // No `#EXT-X-PLAYLIST-TYPE`. This playlist is a rolling window:
+    // the segmenter trims the oldest entries and `#EXT-X-MEDIA-SEQUENCE`
+    // advances with them. RFC 8216 §4.3.3.5 reserves `EVENT` for
+    // playlists segments are only ever *appended* to, and `VOD` for ones
+    // that never change. Declaring either while trimming makes the
+    // advertised seekable range a lie — clients that trust it (hls.js
+    // derives its seekable range from `EVENT`) will seek to segments the
+    // origin has already dropped. Omitting the tag is the correct signal
+    // for a live sliding window.
     out.push_str(&format!("#EXT-X-MAP:URI=\"{init_uri}\"\n"));
     out.push_str("#EXT-X-INDEPENDENT-SEGMENTS\n");
     if let Some(ll) = ll_hints {
@@ -399,6 +407,30 @@ mod tests {
         assert!(p.contains("#EXT-X-MEDIA-SEQUENCE:0"));
         assert!(p.contains("#EXT-X-MAP:URI=\"init.mp4\""));
         assert!(!p.contains("#EXTINF"));
+    }
+
+    #[test]
+    fn playlist_declares_no_playlist_type() {
+        // The playlist is a trimmed rolling window, so it must not claim
+        // to be `EVENT` (append-only) or `VOD` (immutable). hls.js derives
+        // its seekable range from `EVENT`, and would offer seeks to
+        // segments the origin has already evicted.
+        let entries = vec![simple_entry(10, 2.0), simple_entry(11, 2.0)];
+        for p in [
+            build_hls_playlist(2.0, &entries, "init.mp4", None),
+            build_hls_playlist(
+                2.0,
+                &entries,
+                "init.mp4",
+                Some(&LowLatencyHints {
+                    part_target_secs: 0.5,
+                    can_block_reload: true,
+                }),
+            ),
+        ] {
+            assert!(!p.contains("#EXT-X-PLAYLIST-TYPE"), "{p}");
+            assert!(!p.contains("#EXT-X-ENDLIST"), "{p}");
+        }
     }
 
     #[test]

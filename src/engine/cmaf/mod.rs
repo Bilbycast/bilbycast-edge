@@ -187,8 +187,18 @@ struct CmafState {
     audio_bps_ewma: u64,
     /// Wall-clock unix seconds of first segment emission.
     availability_start_unix: i64,
-    /// True after init.mp4 has been published at least once.
+    /// True after init.mp4 has been published at least once. Controls the
+    /// one-time log line, not whether it is published again.
     init_uploaded: bool,
+    /// When init.mp4 was last published. `None` until the first upload.
+    ///
+    /// Publishing it exactly once made the output unrecoverable if the origin
+    /// ever lost it — a restart, a cache wipe, a CDN eviction. Segments keep
+    /// arriving and the manifest keeps listing them, but every player 404s on
+    /// `#EXT-X-MAP` and can decode nothing, with no way back short of
+    /// restarting the flow. The relay's own origin wipes its store on startup,
+    /// so this was reachable just by restarting the relay.
+    init_last_upload: Option<std::time::Instant>,
     /// Rolling window of muxed segments (newest last).
     playlist: VecDeque<M3u8Entry>,
     /// Optional re-encoder for audio (Phase 3).
@@ -239,6 +249,7 @@ impl CmafState {
             audio_bps_ewma: 0,
             availability_start_unix: 0,
             init_uploaded: false,
+            init_last_upload: None,
             playlist: VecDeque::new(),
             audio_reencoder: None,
             video_reencoder: None,
@@ -259,11 +270,12 @@ async fn run(
     flow_id: &str,
 ) -> anyhow::Result<()> {
     tracing::info!(
-        "CMAF output '{}' started -> {} (segment={}s, max_segments={}, manifests={:?}, audio_encode={:?}, video_encode={:?})",
+        "CMAF output '{}' started -> {} (segment={}s, window={} segments (~{:.0}s), manifests={:?}, audio_encode={:?}, video_encode={:?})",
         config.id,
         config.ingest_url,
         config.segment_duration_secs,
-        config.max_segments,
+        config.playlist_window_segments(),
+        config.playlist_window_segments() as f64 * config.segment_duration_secs,
         config.manifests,
         config.audio_encode.as_ref().map(|a| &a.codec),
         config.video_encode.as_ref().map(|v| &v.codec),
@@ -748,13 +760,22 @@ async fn handle_video(
     flow_id: &str,
     recv_time_us: u64,
 ) {
-    if !ensure_video_segmenter(
-        &mut state.video_seg,
-        codec,
-        demuxer,
-        config.segment_duration_secs,
-        &config.id,
-    ) {
+    // Passthrough: the samples we forward ARE the source stream, so the
+    // demuxer's cached parameter sets describe them and the track can be built
+    // now. With `video_encode` the samples are the re-encoder's output, whose
+    // SPS/PPS differ (resolution, profile, level, coding tools) — building the
+    // track from the source sets would hand the decoder parameter sets that do
+    // not describe the bitstream, which decodes as macroblock garbage rather
+    // than failing cleanly. Defer until the re-encoder has emitted its own.
+    if state.video_reencoder.is_none()
+        && !ensure_video_segmenter(
+            &mut state.video_seg,
+            codec,
+            demuxer,
+            config.segment_duration_secs,
+            &config.id,
+        )
+    {
         return;
     }
 
@@ -787,6 +808,25 @@ async fn handle_video(
     } else {
         pushed_nalus = nalus;
         pushed_is_keyframe = is_keyframe;
+    }
+
+    // The re-encoder is opened with `global_header = false`, so every IDR it
+    // emits carries its SPS/PPS in-band. Those are the parameter sets that
+    // actually describe these samples, so the track is built from them. They
+    // are filtered back out of the frame before packing (`filter_frame_nalus_*`),
+    // exactly as for passthrough.
+    if state.video_reencoder.is_some()
+        && state.video_seg.is_none()
+        && !ensure_video_segmenter_from_nalus(
+            &mut state.video_seg,
+            codec,
+            &pushed_nalus,
+            config.segment_duration_secs,
+            &config.id,
+        )
+    {
+        // No parameter sets yet — wait for the encoder's first IDR.
+        return;
     }
 
     let outcome: PushOutcome = state
@@ -833,82 +873,75 @@ async fn handle_video(
     }
 
     // Publish init.mp4 the first time a video track is materialised.
-    if !state.init_uploaded {
-        let need_audio = config.audio_encode.is_some()
-            || state.audio_seg.is_some()
-            || state.audio_ready;
-        if let Some(v) = state.video_seg.as_ref() {
-            // If audio is configured but not yet ready, defer init.mp4
-            // until the first audio frame so we can include the audio
-            // track in the init segment.
-            if !need_audio || state.audio_seg.is_some() {
-                let audio_track = state.audio_seg.as_ref().map(|a| &a.track);
-                let init_bytes = if let Some(c) = state.cenc.as_ref() {
-                    let params = fmp4::CencInitParams {
-                        scheme: c.scheme,
-                        key_id: &c.key_id,
-                        extra_pssh: c.extra_pssh.clone(),
-                    };
-                    fmp4::build_encrypted_init_segment(&v.track, audio_track, &params)
-                } else {
-                    fmp4::build_init_segment(&v.track, audio_track)
-                };
-                match http_put(init_url, init_bytes, "video/mp4", config.auth_token.as_deref()).await {
-                    Ok(_) => {
-                        state.init_uploaded = true;
-                        tracing::info!(
-                            "CMAF output '{}': uploaded init.mp4 ({}x{}, {:?}{})",
-                            config.id,
-                            v.track.width,
-                            v.track.height,
-                            v.track.codec,
-                            if audio_track.is_some() { " + audio" } else { "" },
-                        );
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            "CMAF output '{}': init.mp4 upload failed: {e}",
-                            config.id,
-                        );
-                        event_sender.emit_flow(
-                            EventSeverity::Warning,
-                            category::CMAF,
-                            format!("CMAF output '{}': init upload failed: {e}", config.id),
-                            flow_id,
-                        );
-                    }
-                }
+    if init_publish_due(state)
+        && let Some(v) = state.video_seg.as_ref()
+    {
+        // **Video-only, deliberately.** Muxing audio into the
+        // fragments is unimplemented: `try_build_muxed_segment`
+        // takes the pending audio samples and then returns `None`,
+        // so `build_muxed_segment_for_seq` always falls back to the
+        // video-only bytes. Every fragment we publish is video-only.
+        //
+        // Advertising an audio track in `init.mp4` that no fragment
+        // ever fills makes the whole output unplayable in a browser,
+        // and does it silently: MSE initialises the track, waits
+        // forever for data that never arrives, buffers nothing and
+        // reports no error. The manifest, the segments and the origin
+        // all look perfectly healthy. Until audio muxing lands, the
+        // init segment must describe what we actually send.
+        if state.audio_seg.is_some() || state.audio_ready {
+            tracing::warn!(
+                "CMAF output '{}': source has audio, but CMAF audio muxing \
+                 is not implemented — publishing a video-only init segment. \
+                 Advertising an audio track that is never filled would stall \
+                 browser playback.",
+                config.id,
+            );
+        }
+        let audio_track = None;
+        let init_bytes = if let Some(c) = state.cenc.as_ref() {
+            let params = fmp4::CencInitParams {
+                scheme: c.scheme,
+                key_id: &c.key_id,
+                extra_pssh: c.extra_pssh.clone(),
+            };
+            fmp4::build_encrypted_init_segment(&v.track, audio_track, &params)
+        } else {
+            fmp4::build_init_segment(&v.track, audio_track)
+        };
+        match http_put(init_url, init_bytes, "video/mp4", config.auth_token.as_deref()).await {
+            Ok(_) => {
+                state.init_uploaded = true;
+                state.init_last_upload = Some(std::time::Instant::now());
+                tracing::info!(
+                    "CMAF output '{}': uploaded init.mp4 ({}x{}, {:?}{})",
+                    config.id,
+                    v.track.width,
+                    v.track.height,
+                    v.track.codec,
+                    if audio_track.is_some() { " + audio" } else { "" },
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "CMAF output '{}': init.mp4 upload failed: {e}",
+                    config.id,
+                );
+                event_sender.emit_flow(
+                    EventSeverity::Warning,
+                    category::CMAF,
+                    format!("CMAF output '{}': init upload failed: {e}", config.id),
+                    flow_id,
+                );
             }
         }
     }
 
     if let Some(seg) = outcome.completed_video {
-        // Re-publish init.mp4 if we captured an audio track *after* the
-        // first video frame already pushed init.mp4. This lets us add
-        // the audio trak into the moov before continuing.
-        if state.init_uploaded
-            && state.audio_seg.is_some()
-            && seg.sequence_number == 0
-            && let Some(v) = state.video_seg.as_ref() {
-                let audio_track = state.audio_seg.as_ref().map(|a| &a.track);
-                let init_bytes = if let Some(c) = state.cenc.as_ref() {
-                    let params = fmp4::CencInitParams {
-                        scheme: c.scheme,
-                        key_id: &c.key_id,
-                        extra_pssh: c.extra_pssh.clone(),
-                    };
-                    fmp4::build_encrypted_init_segment(&v.track, audio_track, &params)
-                } else {
-                    fmp4::build_init_segment(&v.track, audio_track)
-                };
-                let _ = http_put(
-                    init_url,
-                    init_bytes,
-                    "video/mp4",
-                    config.auth_token.as_deref(),
-                )
-                .await;
-            }
+        // (Removed: a re-publish of init.mp4 to add an audio track once one
+        // was detected. It existed to widen the moov after the fact, but the
+        // track it added was never filled by any fragment — see the note at
+        // the first init upload above. Restore it alongside audio muxing.)
 
         // Apply CENC by rebuilding the segment from the raw Sample
         // vector with per-sample encryption applied.
@@ -977,7 +1010,8 @@ async fn handle_video(
             uri: Some(uri),
             parts: Vec::new(),
         });
-        while state.playlist.len() > config.max_segments {
+        let window = config.playlist_window_segments();
+        while state.playlist.len() > window {
             state.playlist.pop_front();
         }
 
@@ -1147,6 +1181,78 @@ fn build_muxed_segment_for_seq(
     None
 }
 
+/// Build the video track from parameter sets carried in an encoded frame.
+///
+/// Used for the `video_encode` path, where [`ensure_video_segmenter`]'s
+/// demuxer-cached sets describe the *source* rather than what is being written.
+/// Returns false until a frame carrying the sets shows up, which for a
+/// `global_header = false` encoder is its first IDR.
+fn ensure_video_segmenter_from_nalus(
+    slot: &mut Option<VideoSegmenter>,
+    codec: VideoCodec,
+    nalus: &[Vec<u8>],
+    segment_duration_secs: f64,
+    output_id: &str,
+) -> bool {
+    if slot.is_some() {
+        return true;
+    }
+    let track = match codec {
+        VideoCodec::H264 => {
+            let mut sps = None;
+            let mut pps = None;
+            for n in nalus {
+                match nalu::h264_nal_type(n) {
+                    7 => sps.get_or_insert_with(|| n.clone()),
+                    8 => pps.get_or_insert_with(|| n.clone()),
+                    _ => continue,
+                };
+            }
+            match (sps, pps) {
+                (Some(s), Some(p)) => VideoTrack::from_h264(s, p),
+                _ => return false,
+            }
+        }
+        VideoCodec::H265 => {
+            let mut vps = None;
+            let mut sps = None;
+            let mut pps = None;
+            for n in nalus {
+                match nalu::h265_nal_type(n) {
+                    32 => vps.get_or_insert_with(|| n.clone()),
+                    33 => sps.get_or_insert_with(|| n.clone()),
+                    34 => pps.get_or_insert_with(|| n.clone()),
+                    _ => continue,
+                };
+            }
+            match (vps, sps, pps) {
+                (Some(v), Some(s), Some(p)) => VideoTrack::from_h265(v, s, p),
+                _ => return false,
+            }
+        }
+    };
+    tracing::info!(
+        "CMAF output '{}': video track from re-encoder {:?} {}x{}",
+        output_id, track.codec, track.width, track.height,
+    );
+    *slot = Some(VideoSegmenter::new(track, segment_duration_secs));
+    true
+}
+
+/// How often `init.mp4` is re-published.
+///
+/// It is ~1 KB, so the cost is negligible next to the media, and it bounds how
+/// long an origin that lost it stays broken.
+const INIT_REPUBLISH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Should `init.mp4` be published now — never published, or due a refresh?
+fn init_publish_due(state: &CmafState) -> bool {
+    match state.init_last_upload {
+        None => true,
+        Some(t) => t.elapsed() >= INIT_REPUBLISH_INTERVAL,
+    }
+}
+
 fn ensure_video_segmenter(
     slot: &mut Option<VideoSegmenter>,
     codec: VideoCodec,
@@ -1222,6 +1328,7 @@ async fn handle_ll_cmaf(
             match http_put(init_url, init_bytes, "video/mp4", config.auth_token.as_deref()).await {
                 Ok(_) => {
                     state.init_uploaded = true;
+                    state.init_last_upload = Some(std::time::Instant::now());
                 }
                 Err(e) => {
                     tracing::warn!("CMAF LL output '{}': init upload failed: {e}", config.id);
@@ -1272,7 +1379,8 @@ async fn handle_ll_cmaf(
                 uri: Some(uri),
                 parts: Vec::new(),
             });
-            while state.playlist.len() > config.max_segments {
+            let window = config.playlist_window_segments();
+            while state.playlist.len() > window {
                 state.playlist.pop_front();
             }
         }
