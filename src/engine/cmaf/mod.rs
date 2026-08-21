@@ -187,8 +187,18 @@ struct CmafState {
     audio_bps_ewma: u64,
     /// Wall-clock unix seconds of first segment emission.
     availability_start_unix: i64,
-    /// True after init.mp4 has been published at least once.
+    /// True after init.mp4 has been published at least once. Controls the
+    /// one-time log line, not whether it is published again.
     init_uploaded: bool,
+    /// When init.mp4 was last published. `None` until the first upload.
+    ///
+    /// Publishing it exactly once made the output unrecoverable if the origin
+    /// ever lost it — a restart, a cache wipe, a CDN eviction. Segments keep
+    /// arriving and the manifest keeps listing them, but every player 404s on
+    /// `#EXT-X-MAP` and can decode nothing, with no way back short of
+    /// restarting the flow. The relay's own origin wipes its store on startup,
+    /// so this was reachable just by restarting the relay.
+    init_last_upload: Option<std::time::Instant>,
     /// Rolling window of muxed segments (newest last).
     playlist: VecDeque<M3u8Entry>,
     /// Optional re-encoder for audio (Phase 3).
@@ -239,6 +249,7 @@ impl CmafState {
             audio_bps_ewma: 0,
             availability_start_unix: 0,
             init_uploaded: false,
+            init_last_upload: None,
             playlist: VecDeque::new(),
             audio_reencoder: None,
             video_reencoder: None,
@@ -862,7 +873,7 @@ async fn handle_video(
     }
 
     // Publish init.mp4 the first time a video track is materialised.
-    if !state.init_uploaded
+    if init_publish_due(state)
         && let Some(v) = state.video_seg.as_ref()
     {
         // **Video-only, deliberately.** Muxing audio into the
@@ -901,6 +912,7 @@ async fn handle_video(
         match http_put(init_url, init_bytes, "video/mp4", config.auth_token.as_deref()).await {
             Ok(_) => {
                 state.init_uploaded = true;
+                state.init_last_upload = Some(std::time::Instant::now());
                 tracing::info!(
                     "CMAF output '{}': uploaded init.mp4 ({}x{}, {:?}{})",
                     config.id,
@@ -1227,6 +1239,20 @@ fn ensure_video_segmenter_from_nalus(
     true
 }
 
+/// How often `init.mp4` is re-published.
+///
+/// It is ~1 KB, so the cost is negligible next to the media, and it bounds how
+/// long an origin that lost it stays broken.
+const INIT_REPUBLISH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Should `init.mp4` be published now — never published, or due a refresh?
+fn init_publish_due(state: &CmafState) -> bool {
+    match state.init_last_upload {
+        None => true,
+        Some(t) => t.elapsed() >= INIT_REPUBLISH_INTERVAL,
+    }
+}
+
 fn ensure_video_segmenter(
     slot: &mut Option<VideoSegmenter>,
     codec: VideoCodec,
@@ -1302,6 +1328,7 @@ async fn handle_ll_cmaf(
             match http_put(init_url, init_bytes, "video/mp4", config.auth_token.as_deref()).await {
                 Ok(_) => {
                     state.init_uploaded = true;
+                    state.init_last_upload = Some(std::time::Instant::now());
                 }
                 Err(e) => {
                     tracing::warn!("CMAF LL output '{}': init upload failed: {e}", config.id);
