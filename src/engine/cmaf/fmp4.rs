@@ -326,13 +326,37 @@ fn build_init_segment_inner(
     buf
 }
 
+/// `sample_flags` per ISO/IEC 14496-12 8.8.3.1, MSB-first:
+///
+/// ```text
+///  4 reserved | 2 is_leading | 2 sample_depends_on | 2 sample_is_depended_on
+///  2 sample_has_redundancy | 3 sample_padding_value
+///  1 sample_is_non_sync_sample | 16 sample_degradation_priority
+/// ```
+///
+/// So `sample_depends_on` is bits 25-24 (1 = depends on others, 2 = does not)
+/// and `sample_is_non_sync_sample` is **bit 16**.
+///
+/// A sync sample: does not depend on others, and is not flagged non-sync.
+const SAMPLE_FLAGS_SYNC: u32 = 0x0200_0000;
+
+/// A non-sync sample: depends on others, **and** bit 16 set. Setting only
+/// `sample_depends_on` (0x0100_0000) leaves bit 16 clear, so it still reads as
+/// a sync sample — which is what previously made every P-frame in a long-GOP
+/// fragment look like a valid place to start decoding.
+const SAMPLE_FLAGS_NON_SYNC: u32 = 0x0101_0000;
+
 fn write_trex(parent: &mut BoxWriter<'_>, track_id: u32) {
     let mut trex = parent.child_full(*b"trex", 0, 0);
     trex.u32(track_id);
     trex.u32(1); // default_sample_description_index
     trex.u32(0); // default_sample_duration (per-sample in trun)
     trex.u32(0); // default_sample_size
-    trex.u32(0); // default_sample_flags
+    // default_sample_flags. Zero would mean `non_sync = 0` — an explicit claim
+    // that every sample inheriting this default is a random-access point. Each
+    // fragment overrides this in its `tfhd`, but the safe default for anything
+    // that does not is "not seekable".
+    trex.u32(SAMPLE_FLAGS_NON_SYNC);
 }
 
 fn write_video_trak(
@@ -793,11 +817,25 @@ pub fn build_media_segment(
         // traf
         {
             let mut traf = moof.child(*b"traf");
-            // tfhd — flags 0x020000 (default-base-is-moof) makes sample offsets
-            // relative to the moof start, which is what CMAF requires.
+            // tfhd — 0x020000 (default-base-is-moof) makes sample offsets
+            // relative to the moof start, which is what CMAF requires, plus
+            // 0x000020 (default-sample-flags-present).
+            //
+            // `trun` below carries no per-sample flags, so every sample after
+            // the first inherits this default. Declaring it per fragment lets
+            // an all-intra rendition state that *every* frame is a random
+            // access point instead of leaving a player to infer it — which is
+            // what frame-exact seeking on the DVR proxy depends on — while a
+            // long-GOP fragment correctly reports its P-frames as non-sync.
+            let all_sync = !samples.is_empty() && samples.iter().all(|s| s.is_sync);
             {
-                let mut tfhd = traf.child_full(*b"tfhd", 0, 0x0002_0000);
+                let mut tfhd = traf.child_full(*b"tfhd", 0, 0x0002_0020);
                 tfhd.u32(track_id);
+                tfhd.u32(if all_sync {
+                    SAMPLE_FLAGS_SYNC
+                } else {
+                    SAMPLE_FLAGS_NON_SYNC
+                });
             }
             // tfdt v1 (u64 base_media_decode_time)
             {
@@ -817,22 +855,13 @@ pub fn build_media_segment(
             // Placeholder data_offset; patched after we know moof size.
             data_offset_patch = trun.cursor_pos();
             trun.u32(0);
-            // first_sample_flags: use sync-sample encoding from ISO/IEC 14496-12
-            //   bits 16-17: reserved(2)
-            //   bit   18:  is_leading(2)
-            //   bits 19-20: sample_depends_on(2)
-            //   bits 21-22: sample_is_depended_on(2)
-            //   bits 23-24: sample_has_redundancy(2)
-            //   bits 25-27: sample_padding_value(3)
-            //   bit   28:  sample_is_non_sync_sample
-            //   bits 29-31: sample_degradation_priority(16 lsbits, we use 0)
-            // For the first sample of a fragment that starts with an IDR,
-            // sample_is_non_sync_sample=0 and sample_depends_on=2 (doesn't
-            // depend on others). Encodes to 0x0200_0000.
+            // first_sample_flags — bit layout documented on `SAMPLE_FLAGS_SYNC`.
+            // A fragment normally opens on an IDR; when it does not, say so
+            // rather than letting a reader assume it can start decoding here.
             let first_flags: u32 = if samples.first().map(|s| s.is_sync).unwrap_or(false) {
-                0x0200_0000
+                SAMPLE_FLAGS_SYNC
             } else {
-                0x0100_0000 // non-sync
+                SAMPLE_FLAGS_NON_SYNC
             };
             trun.u32(first_flags);
             for s in samples {
@@ -1108,6 +1137,153 @@ mod tests {
 
     fn synthetic_audio_track() -> AudioTrack {
         AudioTrack::aac([0x11, 0x90], 48000, 2, 128_000)
+    }
+
+    /// Resolve a sample's sync flag the way a player does: per-sample flags in
+    /// `trun`, else `first_sample_flags` for sample 0, else
+    /// `tfhd.default_sample_flags`. Returns (sync_count, total).
+    fn resolve_sync_samples(seg: &[u8]) -> (usize, usize) {
+        fn boxes(buf: &[u8], mut off: usize, end: usize) -> Vec<([u8; 4], usize, usize)> {
+            let mut out = Vec::new();
+            while off + 8 <= end {
+                let size = u32::from_be_bytes(buf[off..off + 4].try_into().unwrap()) as usize;
+                let typ: [u8; 4] = buf[off + 4..off + 8].try_into().unwrap();
+                let size = if size == 0 { end - off } else { size };
+                if size < 8 {
+                    break;
+                }
+                out.push((typ, off + 8, off + size));
+                off += size;
+            }
+            out
+        }
+        let be32 = |b: &[u8]| u32::from_be_bytes(b[..4].try_into().unwrap());
+
+        let (mut sync, mut total) = (0usize, 0usize);
+        for (typ, s, e) in boxes(seg, 0, seg.len()) {
+            if &typ != b"moof" {
+                continue;
+            }
+            for (t2, s2, e2) in boxes(seg, s, e) {
+                if &t2 != b"traf" {
+                    continue;
+                }
+                let mut tfhd_default: Option<u32> = None;
+                for (t3, s3, _e3) in boxes(seg, s2, e2) {
+                    match &t3 {
+                        b"tfhd" => {
+                            let fl = be32(&seg[s3..]) & 0x00FF_FFFF;
+                            let mut p = s3 + 8; // version/flags + track_ID
+                            if fl & 0x01 != 0 {
+                                p += 8;
+                            }
+                            if fl & 0x02 != 0 {
+                                p += 4;
+                            }
+                            if fl & 0x08 != 0 {
+                                p += 4;
+                            }
+                            if fl & 0x10 != 0 {
+                                p += 4;
+                            }
+                            if fl & 0x20 != 0 {
+                                tfhd_default = Some(be32(&seg[p..]));
+                            }
+                        }
+                        b"trun" => {
+                            let tf = be32(&seg[s3..]) & 0x00FF_FFFF;
+                            let cnt = be32(&seg[s3 + 4..]) as usize;
+                            let mut p = s3 + 8;
+                            if tf & 0x0001 != 0 {
+                                p += 4;
+                            }
+                            let mut first = None;
+                            if tf & 0x0004 != 0 {
+                                first = Some(be32(&seg[p..]));
+                                p += 4;
+                            }
+                            for i in 0..cnt {
+                                let mut f = None;
+                                if tf & 0x0100 != 0 {
+                                    p += 4;
+                                }
+                                if tf & 0x0200 != 0 {
+                                    p += 4;
+                                }
+                                if tf & 0x0400 != 0 {
+                                    f = Some(be32(&seg[p..]));
+                                    p += 4;
+                                }
+                                if tf & 0x0800 != 0 {
+                                    p += 4;
+                                }
+                                if i == 0 && first.is_some() {
+                                    f = first;
+                                }
+                                let f = f.or(tfhd_default).unwrap_or(0);
+                                total += 1;
+                                if f & 0x0001_0000 == 0 {
+                                    sync += 1;
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        (sync, total)
+    }
+
+    fn sample(is_sync: bool) -> Sample {
+        Sample {
+            duration: 3600,
+            data: vec![0u8; 64],
+            composition_time_offset: 0,
+            is_sync,
+        }
+    }
+
+    /// A fragment must report exactly the sync samples it contains.
+    ///
+    /// This is what a player uses to decide where it may start decoding. It
+    /// previously reported *every* sample as a sync sample whatever the GOP,
+    /// so a seek could land on a P-frame; and an all-intra rendition was only
+    /// correct by accident, because "everything is seekable" happened to be
+    /// true for it.
+    #[test]
+    fn fragment_reports_only_its_real_sync_samples() {
+        // Long-GOP: one IDR then 24 inter frames.
+        let mut long_gop = vec![sample(true)];
+        long_gop.extend((0..24).map(|_| sample(false)));
+        let seg = build_media_segment(VIDEO_TRACK_ID, 0, 0, &long_gop);
+        assert_eq!(
+            resolve_sync_samples(&seg),
+            (1, 25),
+            "a long-GOP fragment must report exactly one random-access point"
+        );
+
+        // All-intra: every frame is a random-access point, and the fragment
+        // must say so — frame-exact seeking on the DVR proxy depends on it.
+        let all_intra: Vec<Sample> = (0..25).map(|_| sample(true)).collect();
+        let seg = build_media_segment(VIDEO_TRACK_ID, 0, 0, &all_intra);
+        assert_eq!(
+            resolve_sync_samples(&seg),
+            (25, 25),
+            "an all-intra fragment must report every sample as seekable"
+        );
+    }
+
+    /// The two encodings differ in bit 16, which is the one that matters and
+    /// the one the previous "non-sync" constant left clear.
+    #[test]
+    fn sample_flag_constants_differ_in_the_non_sync_bit() {
+        assert_eq!(SAMPLE_FLAGS_SYNC & 0x0001_0000, 0, "sync must not set bit 16");
+        assert_ne!(
+            SAMPLE_FLAGS_NON_SYNC & 0x0001_0000,
+            0,
+            "non-sync must set bit 16, or it still reads as a sync sample"
+        );
     }
 
     #[test]
