@@ -1042,11 +1042,25 @@ fn buffer_audio_frames<I: IntoIterator<Item = (Vec<u8>, u64)>>(
     // past. docs/cmaf.md promises this warning.
     if state.audio_muxing == Some(false) && !state.late_audio_warned {
         state.late_audio_warned = true;
+        // Say which of the three reasons applies, because only one of them is
+        // worth restarting for. `low_latency` and `encryption` are structural:
+        // those paths cannot carry audio at all, and telling an operator to
+        // restart a flow sends them round a loop that ends where it started.
+        let remedy = if config.low_latency {
+            "low_latency outputs carry one track per chunk, so this output cannot carry audio \
+             at all — use low_latency = false if the audio matters more than the latency"
+        } else if state.cenc.is_some() {
+            "encrypted outputs are video-only (audio encryption is unwired), so this output \
+             cannot carry audio at all"
+        } else {
+            "the track list is committed at the first init.mp4 and a browser builds its \
+             decoders from it once — restart the flow to pick the audio up"
+        };
         tracing::warn!(
-            "CMAF output '{}': audio appeared after init.mp4 committed the track \
-             list — it will not be carried. Restart the flow if this source is \
-             expected to have audio.",
+            "CMAF output '{}': audio appeared after init.mp4 committed the track list — it \
+             will not be carried. {}.",
             config.id,
+            remedy,
         );
     }
     let Some(seg) = state.audio_seg.as_mut() else {

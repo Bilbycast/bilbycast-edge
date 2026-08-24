@@ -209,7 +209,10 @@ DRM and universally supported by Shaka, hls.js, and dash.js.
    the VCL NAL is encrypted. Parameter-set NALs stay fully clear.
 3. For `cbcs`, the encrypted span is rounded down to a multiple of 16
    bytes (AES block size).
-4. AAC samples are whole-encrypted with no subsample split.
+4. AAC samples *would be* whole-encrypted with no subsample split —
+   `encrypt_audio_sample` implements it, but nothing calls it. **An
+   encrypted output is video-only** (see Limitations), so no audio
+   sample reaches this path at all today.
 5. `senc` / `saio` / `saiz` boxes with byte-accurate offsets are
    emitted in every `traf`.
 6. A version-1 ClearKey `pssh` box is added to `moov` carrying the

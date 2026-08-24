@@ -5926,6 +5926,28 @@ pub fn validate_output_with_input(
                 )?;
             }
             if let Some(ref ve) = cmaf.video_encode {
+                // Checked BEFORE the generic validator, because this reason
+                // holds on every build: it is about what the CMAF re-encoder
+                // can resolve, not about which backends were compiled in.
+                //
+                // The CMAF re-encoder resolves no `*_auto` alias: its codec
+                // match in `engine::cmaf::encode::VideoReencoder::new` lists
+                // the explicit backends and bails on anything else. The
+                // general validator accepts the aliases, so a CMAF output
+                // carrying one passed here and then failed at flow start —
+                // raising a Critical event and, worse, carrying on with the
+                // re-encoder unset, i.e. publishing the SOURCE encoding under
+                // a config that says it is being re-encoded.
+                if matches!(ve.codec.as_str(), "h264_auto" | "hevc_auto" | "auto") {
+                    bail!(
+                        "CMAF output '{}': video_encode.codec '{}' is not resolvable here — \
+                         a CMAF output needs an explicit backend (x264, x265, h264_nvenc, \
+                         hevc_nvenc, h264_qsv, hevc_qsv, h264_vaapi, hevc_vaapi, h264_rkmpp, \
+                         hevc_rkmpp), because the CMAF re-encoder does not resolve the \
+                         `*_auto` aliases",
+                        cmaf.id, ve.codec
+                    );
+                }
                 validate_video_encode(ve, &format!("CMAF output '{}'", cmaf.id))?;
             }
         }
@@ -8589,6 +8611,38 @@ fn validate_port_conflicts(config: &AppConfig) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+
+    /// A CMAF output must name a backend its own re-encoder can open.
+    ///
+    /// The general codec validator accepts `h264_auto`, but the CMAF
+    /// re-encoder does not resolve it — so the config used to pass, fail at
+    /// flow start, and leave the output publishing the source encoding under a
+    /// config that says it is being re-encoded.
+    #[test]
+    fn validate_output_cmaf_refuses_an_unresolvable_auto_codec() {
+        use crate::config::models::OutputConfig;
+        let out = |codec: &str| -> OutputConfig {
+            serde_json::from_str(&format!(
+                r#"{{"type":"cmaf","id":"c","name":"c","ingest_url":"https://h/o",
+                    "manifests":["hls"],"video_encode":{{"codec":"{codec}","bitrate_kbps":4000}}}}"#
+            ))
+            .expect("CMAF output should deserialize")
+        };
+        for bad in ["h264_auto", "hevc_auto", "auto"] {
+            let err = validate_output(&out(bad))
+                .expect_err(&format!("{bad} must be refused on a CMAF output"));
+            assert!(err.to_string().contains("explicit backend"), "{err}");
+        }
+        // An explicit backend gets past THIS check. Whether it then passes
+        // depends on the Cargo features this build carries, which is a
+        // different refusal with a different message.
+        if let Err(e) = validate_output(&out("x264")) {
+            assert!(
+                e.to_string().contains("Cargo feature"),
+                "x264 must only ever be refused for not being compiled in: {e}"
+            );
+        }
+    }
 
     /// An encrypted low-latency output would put its media on the wire in the
     /// clear: the chunk builder writes no senc/saiz/saio and applies no CENC

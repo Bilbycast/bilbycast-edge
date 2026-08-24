@@ -2094,7 +2094,7 @@ When `encryption` is set, the edge:
 
 1. Emits `encv` / `enca` sample entries that wrap `avc1` / `hvc1` / `mp4a` via a `sinf/frma/schm/schi/tenc` chain (ISO/IEC 23001-7 §8).
 2. Subsample-encrypts each H.264 / HEVC sample — NAL length prefix + NAL header + 32 bytes of slice header are left clear; the rest of the VCL NAL payload is encrypted. Parameter-set NALs (SPS / PPS / VPS / SEI / AUD) stay fully clear. For `cbcs` the encrypted span is rounded down to a multiple of 16 bytes.
-3. AAC samples are whole-encrypted with no subsample split.
+3. AAC samples *would be* whole-encrypted with no subsample split — `encrypt_audio_sample` implements it and nothing calls it. **An encrypted output is video-only**: the track list is decided before "does this source have audio", so an encrypted output never declares an audio track it cannot fill, and no audio sample reaches this path.
 4. Writes `senc` / `saio` / `saiz` into every `traf` with correctly back-patched offsets.
 5. Emits a ClearKey `pssh` (system ID `1077efec-c0b2-4d02-ace3-3c1e52e2fb4b`, version 1) into `moov`, plus any operator-supplied `pssh_boxes` verbatim.
 
