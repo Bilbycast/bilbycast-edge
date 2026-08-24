@@ -164,6 +164,65 @@ fn sanitise_tune(backend: VideoEncoderCodec, tune: String) -> String {
     String::new()
 }
 
+/// Drop a `profile` the resolved backend cannot accept, rather than letting
+/// `avcodec_open2` fail with an opaque `EINVAL (-22)`.
+///
+/// `tune`'s sibling, and dropped rather than mapped for the same reason: an
+/// absent profile lets the encoder pick one that works, whereas a *substituted*
+/// one silently changes what the operator asked for. Nothing downstream depends
+/// on a specific profile — the DVR proxy's `gop_size: 1` is what makes it
+/// all-intra, not its profile.
+///
+/// Two separate reasons a profile can be wrong for a backend:
+///
+/// **Wrong codec family.** `main422-10` is an HEVC profile and means nothing to
+/// x264; `high` is an H.264 profile and means nothing to x265. Structural, not
+/// vendor-specific.
+///
+/// **The backend takes no profile names at all.** RKMPP's `profile` is a plain
+/// integer option with no named constants, so libavcodec answers a name with
+/// `Undefined constant or missing '(' in 'high'` and the flow never starts
+/// (#126, measured on bilby-pir6s). Leaving it unset works on the same box.
+///
+/// NVENC, QSV and VAAPI are deliberately **not** filtered here. They do accept
+/// named profiles, their vocabularies differ from each other in ways this
+/// codebase has not measured, and dropping a profile that would have worked is
+/// its own bug. When one of them is measured to reject something, it earns a
+/// row — not before.
+fn sanitise_profile(backend: VideoEncoderCodec, profile: VideoProfile) -> VideoProfile {
+    let Some(name) = profile.as_str() else {
+        return profile; // Auto — nothing is passed to the encoder.
+    };
+
+    const H264_PROFILES: &[&str] = &["baseline", "main", "high", "high10", "high422", "high444"];
+    const HEVC_PROFILES: &[&str] = &["main", "main10", "main422-10", "main422-10-intra"];
+
+    let (acceptable, why): (&[&str], &str) = match backend {
+        VideoEncoderCodec::X264 => (H264_PROFILES, "H.264 profile names"),
+        VideoEncoderCodec::X265 => (HEVC_PROFILES, "HEVC profile names"),
+        // Rockchip: `profile` is an int option with no named constants.
+        VideoEncoderCodec::H264Rkmpp | VideoEncoderCodec::HevcRkmpp => (&[], "no profile names"),
+        // Not measured — pass through rather than guess.
+        _ => return profile,
+    };
+
+    if acceptable.contains(&name) {
+        return profile;
+    }
+    let accepts = if acceptable.is_empty() {
+        why.to_string()
+    } else {
+        format!("{why}: {}", acceptable.join(", "))
+    };
+    tracing::warn!(
+        error_code = "encoder_profile_not_supported",
+        "video_encode.profile '{name}' is not supported by the {} backend ({accepts}); \
+         ignoring it — the encoder would otherwise fail to open with EINVAL",
+        backend_label(backend),
+    );
+    VideoProfile::Auto
+}
+
 /// Map a preset the resolved backend cannot accept onto its nearest
 /// equivalent, rather than letting `avcodec_open2` fail with `EINVAL (-22)`.
 ///
@@ -248,7 +307,7 @@ pub fn build_encoder_config(
         max_bitrate_kbps: cfg.max_bitrate_kbps.unwrap_or(0),
         gop_size,
         preset: sanitise_preset(backend, resolve_preset(cfg.preset.as_deref())),
-        profile: resolve_profile(cfg.profile.as_deref()),
+        profile: sanitise_profile(backend, resolve_profile(cfg.profile.as_deref())),
         chroma: resolve_chroma(cfg.chroma.as_deref()),
         bit_depth: cfg.bit_depth.unwrap_or(8),
         rate_control: resolve_rate_control(cfg.rate_control.as_deref()),
@@ -948,6 +1007,94 @@ mod scaler_selection_tests {
         assert!(conversion_needed(src_8, VideoChroma::Yuv420, 10));
         let src_10 = video_engine::av_pix_fmt_for_yuv(VideoChroma::Yuv420, 10).unwrap();
         assert!(conversion_needed(src_10, VideoChroma::Yuv420, 8));
+    }
+}
+
+#[cfg(test)]
+mod profile_tests {
+    use super::{resolve_profile, sanitise_profile};
+    use video_codec::VideoEncoderCodec::*;
+    use video_codec::VideoProfile;
+
+    /// The exact case from #126, measured on bilby-pir6s.
+    ///
+    /// `h264_rkmpp`'s `profile` is a plain integer option with no named
+    /// constants, so libavcodec answers a name with "Undefined constant or
+    /// missing '(' in 'high'" and `avcodec_open2` returns EINVAL. The flow
+    /// never starts, and the operator gets `FFmpeg error -22` with nothing
+    /// naming the offending option. Leaving it unset works on the same box,
+    /// which is what dropping it does.
+    #[test]
+    fn rkmpp_takes_no_profile_name() {
+        for name in ["high", "main", "baseline", "high10", "main10"] {
+            let asked = resolve_profile(Some(name));
+            assert_ne!(asked, VideoProfile::Auto, "test bug: '{name}' did not resolve");
+            for backend in [H264Rkmpp, HevcRkmpp] {
+                assert_eq!(
+                    sanitise_profile(backend, asked),
+                    VideoProfile::Auto,
+                    "'{name}' reached {backend:?}, which cannot parse a profile name"
+                );
+            }
+        }
+    }
+
+    /// A profile from the wrong codec family is refused whichever way round.
+    /// Structural, not vendor-specific: `main422-10` is HEVC and means nothing
+    /// to x264; `high` is H.264 and means nothing to x265.
+    #[test]
+    fn a_profile_from_the_other_codec_family_is_dropped() {
+        for name in ["main422-10", "main422-10-intra"] {
+            assert_eq!(
+                sanitise_profile(X264, resolve_profile(Some(name))),
+                VideoProfile::Auto,
+                "HEVC profile '{name}' survived onto x264"
+            );
+        }
+        for name in ["high", "baseline", "high422", "high444"] {
+            assert_eq!(
+                sanitise_profile(X265, resolve_profile(Some(name))),
+                VideoProfile::Auto,
+                "H.264 profile '{name}' survived onto x265"
+            );
+        }
+    }
+
+    /// The profiles that do belong must survive untouched — dropping one that
+    /// would have worked is its own bug.
+    #[test]
+    fn the_right_profile_for_the_backend_survives() {
+        for name in ["baseline", "main", "high", "high10", "high422", "high444"] {
+            let p = resolve_profile(Some(name));
+            assert_eq!(sanitise_profile(X264, p), p, "x264 lost '{name}'");
+        }
+        for name in ["main", "main10", "main422-10", "main422-10-intra"] {
+            let p = resolve_profile(Some(name));
+            assert_eq!(sanitise_profile(X265, p), p, "x265 lost '{name}'");
+        }
+    }
+
+    /// NVENC, QSV and VAAPI accept named profiles and their vocabularies have
+    /// not been measured here, so they pass through. Pinned so that adding a
+    /// row for one of them is a deliberate act with a measurement behind it,
+    /// not an accident.
+    #[test]
+    fn unmeasured_backends_are_left_alone() {
+        for backend in [H264Nvenc, HevcNvenc, H264Qsv, HevcQsv, H264Vaapi, HevcVaapi] {
+            let p = resolve_profile(Some("main"));
+            assert_eq!(sanitise_profile(backend, p), p, "{backend:?} was filtered");
+        }
+    }
+
+    /// No profile asked for stays no profile, on every backend — the encoder
+    /// picks, which is what the default has always done.
+    #[test]
+    fn auto_stays_auto_everywhere() {
+        for backend in [X264, X265, H264Rkmpp, HevcRkmpp, H264Nvenc, H264Qsv, H264Vaapi] {
+            assert_eq!(sanitise_profile(backend, VideoProfile::Auto), VideoProfile::Auto);
+            assert_eq!(sanitise_profile(backend, resolve_profile(None)), VideoProfile::Auto);
+            assert_eq!(sanitise_profile(backend, resolve_profile(Some("nonsense"))), VideoProfile::Auto);
+        }
     }
 }
 
