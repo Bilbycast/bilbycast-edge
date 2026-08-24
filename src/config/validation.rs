@@ -5884,6 +5884,27 @@ pub fn validate_output_with_input(
             }
             if let Some(ref cenc) = cmaf.encryption {
                 validate_cenc_block(cenc, &format!("CMAF output '{}'", cmaf.id))?;
+                // The low-latency path does not encrypt. Its chunks come from
+                // `fmp4::build_segment_chunk`, which writes no senc/saiz/saio
+                // and applies no CENC transform — so with `low_latency` set,
+                // the media goes out in the clear while `state.cenc` is
+                // initialised, "CENC active" is logged, and every surface says
+                // the output is encrypted.
+                //
+                // Refused rather than warned: a configuration whose security
+                // property silently does not hold is worse than one that will
+                // not start, and an operator who wanted DRM would rather be
+                // told now than discover it from a packet capture. See
+                // bilbycast-edge#135 — closing this properly means encrypting
+                // the chunks, at which point this check goes away.
+                if cmaf.low_latency {
+                    bail!(
+                        "CMAF output '{}': encryption is not applied on the low-latency path — \
+                         its chunks are written unencrypted. Use low_latency = false for an \
+                         encrypted output, or drop `encryption` if low latency matters more.",
+                        cmaf.id
+                    );
+                }
             }
             if let Some(ref enc) = cmaf.audio_encode {
                 validate_audio_encode(
@@ -8568,6 +8589,37 @@ fn validate_port_conflicts(config: &AppConfig) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+
+    /// An encrypted low-latency output would put its media on the wire in the
+    /// clear: the chunk builder writes no senc/saiz/saio and applies no CENC
+    /// transform, while `state.cenc` is initialised and every surface reports
+    /// the output as encrypted. Refused, not warned.
+    #[test]
+    fn validate_output_cmaf_refuses_encryption_on_the_low_latency_path() {
+        use crate::config::models::OutputConfig;
+        let cenc = r#","encryption":{"scheme":"cenc","key_id":"0123456789abcdef0123456789abcdef","key":"fedcba9876543210fedcba9876543210"}"#;
+        let out = |extra: &str| -> OutputConfig {
+            serde_json::from_str(&format!(
+                r#"{{"type":"cmaf","id":"c","name":"c","ingest_url":"https://h/o","manifests":["hls"]{extra}}}"#
+            ))
+            .expect("CMAF output should deserialize")
+        };
+
+        // Encrypted whole-segment output: fine, that path really does encrypt.
+        assert!(validate_output(&out(cenc)).is_ok());
+        // Low latency without encryption: fine.
+        assert!(
+            validate_output(&out(r#","low_latency":true,"chunk_duration_ms":500"#)).is_ok()
+        );
+        // Both: refused, and the message has to name why.
+        let err = validate_output(&out(&format!(
+            r#","low_latency":true,"chunk_duration_ms":500{cenc}"#
+        )))
+        .expect_err("encryption on the low-latency path must be refused");
+        let msg = err.to_string();
+        assert!(msg.contains("low-latency"), "{msg}");
+        assert!(msg.contains("unencrypted"), "{msg}");
+    }
 
     /// `dvr_window_secs` is bounded by the *derived* entry count, not the raw
     /// window: a long window made of long segments is cheap to advertise, and

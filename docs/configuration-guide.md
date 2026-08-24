@@ -2034,17 +2034,16 @@ PlayReady PSSH passthrough.
 }
 ```
 
-LL-CMAF example with DRM:
+CMAF with DRM:
 
 ```json
 {
   "type": "cmaf",
-  "id": "cmaf-ll-drm",
-  "name": "LL-CMAF with ClearKey",
+  "id": "cmaf-drm",
+  "name": "CMAF with ClearKey",
   "ingest_url": "https://ingest.cdn.example.com/live",
   "segment_duration_secs": 2.0,
-  "chunk_duration_ms": 500,
-  "low_latency": true,
+  "low_latency": false,
   "manifests": ["hls", "dash"],
   "encryption": {
     "scheme": "cenc",
@@ -2054,6 +2053,15 @@ LL-CMAF example with DRM:
   }
 }
 ```
+
+> **`encryption` and `low_latency` cannot be combined**, and the config is
+> refused rather than started. The low-latency path writes its chunks through
+> a builder that emits no `senc` / `saiz` / `saio` and applies no CENC
+> transform, so an LL output with `encryption` set would put its media on the
+> wire **in the clear** while the log said `CENC active` and every surface
+> reported the output as encrypted. This example previously showed exactly
+> that combination. Tracked as bilbycast-edge#135; when the chunks are
+> encrypted the restriction goes away.
 
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
@@ -2067,7 +2075,7 @@ LL-CMAF example with DRM:
 | `manifests` | array | No | `["hls","dash"]` | Subset of `{"hls", "dash"}`, non-empty. Both manifests reference the same fMP4 segments — enable either or both. |
 | `low_latency` | bool | No | `false` | Enable LL-CMAF: emits a moof+mdat chunk every `chunk_duration_ms` inside a single chunked-transfer PUT per segment, advertises parts via `#EXT-X-PART` (HLS) and `availabilityTimeOffset` (DASH). Target end-to-end latency <3 s with 500 ms chunks. |
 | `chunk_duration_ms` | integer | No | `500` | LL-CMAF chunk duration in ms. Range: 100-2000. Ignored when `low_latency = false`. |
-| `encryption` | object | No | `null` | Common Encryption configuration. See [`encryption`](#the-cmaf-encryption-block) below. |
+| `encryption` | object | No | `null` | Common Encryption configuration. **Refused together with `low_latency = true`** — the LL path does not encrypt its chunks (bilbycast-edge#135). See [`encryption`](#the-cmaf-encryption-block) below. |
 | `audio_encode` | object | No | `null` | Optional AAC re-encode. Allowed `codec`: `aac_lc`, `he_aac_v1`, `he_aac_v2`. Source must already be AAC (TsDemuxer decodes via fdk-aac). When omitted, the source AAC passes through unchanged. |
 | `video_encode` | object | No | `null` | Optional H.264 / HEVC re-encode with explicit GoP alignment to `segment_duration_secs`. See the [`video_encode` block](#the-video_encode-block) for backends and fields. H.264 → H.264 or HEVC → H.264 conversion is supported when the matching `video-encoder-*` Cargo feature is enabled. |
 | `program_number` | integer | No | `null` | MPTS → SPTS program filter. Must be `> 0`. See [MPTS → SPTS filtering](#mpts--spts-filtering). |

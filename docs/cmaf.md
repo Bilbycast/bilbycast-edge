@@ -345,8 +345,9 @@ should set up a URL-rewriting reverse proxy in front of their ingest.
 - **LL-CMAF outputs are video-only.** A chunk is built by
   `build_segment_chunk`, which writes one `traf` for the video track,
   so `low_latency: true` publishes a video-only `init.mp4` whatever the
-  source carries. LL-CMAF also does **not** apply `encryption` — its
-  chunks are written in the clear even when CENC is configured
+  source carries. LL-CMAF also does **not** apply `encryption`, so the two
+  are now **refused together at validation** rather than starting an output
+  whose chunks go out in the clear while every surface says it is encrypted
   (bilbycast-edge#135).
 - No live-to-VOD archival — the rolling playlist caps at `max_segments`
   and old `.m4s` files are not deleted on the ingest side. Operators
