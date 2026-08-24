@@ -324,6 +324,17 @@ struct PendingAudioSample {
     data: Vec<u8>,
 }
 
+/// How much audio may accumulate before frames are shed, as a multiple of the
+/// segment target.
+///
+/// The muxed fragment drains the buffer every time a video segment closes, so
+/// running this far past the target means video has stopped closing segments —
+/// no IDR, or the video track gone. Nothing is being published in that state,
+/// so the oldest audio is dead weight; shedding it is what keeps a stalled
+/// video track from growing the buffer without bound. It is reported, not
+/// silent: `push` hands the shed audio back to the caller.
+const MAX_PENDING_AUDIO_MULTIPLE: u64 = 4;
+
 impl AudioSegmenter {
     pub fn new(track: AudioTrack, target_duration_secs: f64) -> Self {
         let target_duration_ts = (target_duration_secs * track.sample_rate as f64) as u64;
@@ -339,6 +350,11 @@ impl AudioSegmenter {
 
     /// Append one AAC frame. PTS is the source 90 kHz value; we
     /// convert into the audio track timescale.
+    ///
+    /// Returns a segment only when audio has been **shed** — see
+    /// [`MAX_PENDING_AUDIO_MULTIPLE`]. In normal operation this is `None` and
+    /// the buffer is drained by [`Self::take_pending_samples`] when the video
+    /// segment closes.
     pub fn push(&mut self, frame: &[u8], pts90k: u64) -> Option<CompletedSegment> {
         let unwrapped = self.pts_unwrap.unwrap(pts90k);
         let dts_ts = unwrapped * self.track.sample_rate as u64 / 90_000;
@@ -349,26 +365,55 @@ impl AudioSegmenter {
             data: frame.to_vec(),
         });
 
+        // Deliberately NOT cut at the segment target. The muxed fragment is
+        // built from these frames when the *video* segment closes, and video
+        // closes on the first IDR at or after its own target — which is at or
+        // after this one, and usually after. Cutting here handed the caller a
+        // segment it discards while draining the buffer the muxed fragment
+        // was about to read: measured at 3 of 98 frames surviving, i.e. 65 ms
+        // of audio carried per 2 s segment, silently.
+        //
+        // The buffer still has to be bounded, because a video track that has
+        // stopped producing IDRs never drains it.
         if let Some(base) = self.segment_base_dts {
             let elapsed = dts_ts.saturating_sub(base);
-            if elapsed >= self.target_duration_ts {
+            if elapsed >= self.target_duration_ts * MAX_PENDING_AUDIO_MULTIPLE {
                 return self.flush_current_segment(dts_ts + 1024);
             }
         }
         None
     }
 
-    /// Drain pending audio frames as a `Sample` vector for a muxed
-    /// segment. Returns `(sequence_number, base_dts_ts, samples)`.
+    /// Take the audio frames belonging to a segment that ends at
+    /// `boundary_dts_ts`, as a `Sample` vector for a muxed fragment.
+    /// Returns `(sequence_number, base_dts_ts, samples)`.
+    ///
+    /// Frames at or past the boundary stay queued for the next fragment. They
+    /// are routinely present: a TS audio PES carries several ADTS frames at
+    /// once and a video PES is only released when the next PUSI arrives, so at
+    /// the moment a video segment closes the buffer normally holds audio from
+    /// after the cut.
+    ///
+    /// `base_dts_ts` is the first taken frame's own DTS, not the boundary.
+    /// The video traf's `base_media_decode_time` is likewise its first
+    /// sample's exact DTS, and the two trafs share one moof: anchoring audio
+    /// on the boundary instead declares it starting earlier than it does, by
+    /// however far the buffer ran past the previous cut — a fixed A/V offset
+    /// for the life of the flow, plus a zero-duration sample at each junction.
     pub fn take_pending_samples(
         &mut self,
         boundary_dts_ts: u64,
     ) -> Option<(u64, u64, Vec<Sample>)> {
-        if self.samples.is_empty() {
+        let taken = self
+            .samples
+            .iter()
+            .take_while(|f| f.dts_ts < boundary_dts_ts)
+            .count();
+        if taken == 0 {
             return None;
         }
-        let base = self.segment_base_dts?;
-        let frames: Vec<PendingAudioSample> = self.samples.drain(..).collect();
+        let frames: Vec<PendingAudioSample> = self.samples.drain(..taken).collect();
+        let base = frames[0].dts_ts;
         let samples_out: Vec<Sample> = frames
             .iter()
             .enumerate()
@@ -387,7 +432,10 @@ impl AudioSegmenter {
             .collect();
         let seq = self.next_seq;
         self.next_seq += 1;
-        self.segment_base_dts = Some(boundary_dts_ts);
+        // Anchor the shed-cap clock on what is actually still buffered. Left
+        // as `None` it would be re-anchored by `push` on the next *new* frame,
+        // which is later than the frames already queued.
+        self.segment_base_dts = self.samples.front().map(|f| f.dts_ts);
         Some((seq, base, samples_out))
     }
 
@@ -481,22 +529,89 @@ mod tests {
         assert_eq!(s.samples.len(), 1);
     }
 
+    /// Audio is shed only when it has run far past the segment target, which
+    /// means the video track has stopped closing segments. At the target
+    /// itself it must be retained — the muxed fragment is built from it.
     #[test]
-    fn audio_segmenter_cuts_on_target_duration() {
+    fn audio_segmenter_sheds_only_after_the_buffer_cap() {
         let a = AudioTrack::aac([0x11, 0x90], 48000, 2, 128_000);
         let mut s = AudioSegmenter::new(a, 2.0);
         let data = vec![0xFF; 200];
         let mut seg = None;
-        for i in 0..100 {
+        let mut shed_at = None;
+        // 2 s of audio is 94 frames, so 4x the target is around 375.
+        for i in 0..500 {
             let pts = (i * 1920) as u64;
             if let Some(s) = s.push(&data, pts) {
                 seg = Some(s);
+                shed_at = Some(i);
                 break;
             }
         }
-        let seg = seg.expect("audio segment should flush");
+        let seg = seg.expect("audio should be shed once the cap is passed");
         assert_eq!(seg.kind, SegmentKind::Audio);
         assert!(seg.duration_90k > 0);
+        let shed_at = shed_at.expect("shed index");
+        assert!(
+            (350..400).contains(&shed_at),
+            "shed at frame {shed_at}, expected around 4x the 94-frame target"
+        );
+    }
+
+    /// A full segment's worth of audio must still be there when the video
+    /// segment closes and the muxed fragment drains it.
+    #[test]
+    fn audio_survives_until_the_video_boundary_drains_it() {
+        let a = AudioTrack::aac([0x11, 0x90], 48000, 2, 128_000);
+        let mut s = AudioSegmenter::new(a, 2.0);
+        // 2 s of AAC at 48 kHz: 1024 samples per frame, 1920 ticks of 90 kHz.
+        // 98 frames is 2.09 s — the video segment closes on the first IDR at
+        // or after 2 s, so audio for a little past the target is normal and
+        // the exact overshoot depends on where the source's IDRs fall.
+        const FRAMES: u64 = 98;
+        for i in 0..FRAMES {
+            s.push(&[0xFF; 200], i * 1920);
+        }
+        // The video segment closes on its IDR and drains the audio buffer.
+        let (_seq, _base, samples) = s
+            .take_pending_samples(FRAMES * 1024)
+            .expect("a segment of audio should be waiting");
+        assert_eq!(
+            samples.len(),
+            FRAMES as usize,
+            "the muxed fragment must carry every audio frame of the segment"
+        );
+    }
+
+    /// The audio traf must be anchored on its own first sample, and frames
+    /// from after the video cut must stay for the next fragment.
+    ///
+    /// Anchoring on the boundary instead declares the audio starting earlier
+    /// than it does — a fixed A/V offset for the life of the flow — and
+    /// draining past the boundary gives the last sample a zero duration.
+    #[test]
+    fn audio_split_anchors_on_its_own_first_sample() {
+        let a = AudioTrack::aac([0x11, 0x90], 48000, 2, 128_000);
+        let mut s = AudioSegmenter::new(a, 2.0);
+        // 10 frames on the 1024-sample grid: DTS 0, 1024, ... 9216.
+        for i in 0..10u64 {
+            s.push(&[0xFF; 200], i * 1920);
+        }
+        // The video segment closes between frame 4 (4096) and frame 5 (5120).
+        let (_seq, base, samples) = s.take_pending_samples(5000).expect("audio waiting");
+        assert_eq!(base, 0, "first fragment anchors on its first sample");
+        assert_eq!(samples.len(), 5, "only frames before the cut belong here");
+        assert!(
+            samples.iter().all(|s| s.duration > 0),
+            "a sample drained past the boundary would have zero duration"
+        );
+        assert_eq!(samples[4].duration, (5000 - 4096) as u32);
+
+        // The next fragment starts at the first frame that was left queued —
+        // 5120, not the 5000 boundary.
+        let (_seq, base, samples) = s.take_pending_samples(20_000).expect("audio waiting");
+        assert_eq!(base, 5120, "second fragment anchors on its own first sample");
+        assert_eq!(samples.len(), 5);
     }
 
     #[test]

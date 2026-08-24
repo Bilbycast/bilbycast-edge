@@ -196,6 +196,9 @@ struct CmafState {
     /// When the video track first materialised — the clock that bounds the
     /// wait above. `None` until there is a video track.
     video_ready_at: Option<std::time::Instant>,
+    /// Latched once the "audio arrived too late to be carried" warning has
+    /// been raised, so it is said once per flow rather than on every frame.
+    late_audio_warned: bool,
     /// Estimated video bitrate in bps (EWMA over emitted segments).
     video_bps_ewma: u64,
     /// Estimated audio bitrate in bps.
@@ -267,6 +270,7 @@ impl CmafState {
             audio_ready: false,
             audio_muxing: None,
             video_ready_at: None,
+            late_audio_warned: false,
             video_bps_ewma: 0,
             audio_bps_ewma: 0,
             availability_start_unix: 0,
@@ -471,11 +475,7 @@ async fn run(
                         { reenc.encode_silence_if_needed() }
                     ) {
                         Ok(frames) if !frames.is_empty() => {
-                            if let Some(seg) = state.audio_seg.as_mut() {
-                                for (data, pts) in frames {
-                                    seg.push(&data, pts);
-                                }
-                            }
+                            buffer_audio_frames(&mut state, config, frames);
                         }
                         Ok(_) => {}
                         Err(e) => {
@@ -741,11 +741,7 @@ fn handle_other_audio_frame(
             }
         }
     }
-    if let Some(seg) = state.audio_seg.as_mut() {
-        for f in frames_to_buffer {
-            seg.push(&f, pts);
-        }
-    }
+    buffer_audio_frames(state, config, frames_to_buffer.into_iter().map(|f| (f, pts)));
 }
 
 #[cfg(not(feature = "media-codecs"))]
@@ -1001,19 +997,74 @@ async fn handle_video(
             state.playlist.pop_front();
         }
 
-        publish_manifests(
-            state,
-            config,
-            init_name,
-            m3u8_url,
-            mpd_url,
-            publish_hls,
-            publish_dash,
-            seg.sequence_number,
-            event_sender,
-            flow_id,
-        )
-        .await;
+        // Every playlist names `init.mp4` in `#EXT-X-MAP`, so publishing one
+        // before that object exists hands players a manifest they can fetch,
+        // parse and then fail on. The first init can be up to
+        // `AUDIO_DETECT_GRACE` behind the first segment, because the track
+        // list cannot be committed until it is known whether the source has
+        // audio. Segments are uploaded meanwhile — they are what the first
+        // playlist will list.
+        if state.init_uploaded {
+            publish_manifests(
+                state,
+                config,
+                init_name,
+                m3u8_url,
+                mpd_url,
+                publish_hls,
+                publish_dash,
+                seg.sequence_number,
+                event_sender,
+                flow_id,
+            )
+            .await;
+        }
+    }
+}
+
+/// Buffer AAC frames for the muxed fragment, reporting any the segmenter had
+/// to shed.
+///
+/// Shedding means the video track has not closed a segment in four segment
+/// durations — no IDR, or no video at all. Nothing is being published in that
+/// state, so the audio is genuinely dead, but it is a real symptom and must
+/// not be dropped on the floor the way the return value used to be.
+fn buffer_audio_frames<I: IntoIterator<Item = (Vec<u8>, u64)>>(
+    state: &mut CmafState,
+    config: &CmafOutputConfig,
+    frames: I,
+) {
+    // The track list is committed at the first `init.mp4` and a browser builds
+    // its decoders from that file once, so audio arriving after it cannot be
+    // adopted — the moov would have to widen under a player already running.
+    // Say so, once: the operator's only remedy is a flow restart, and the sole
+    // other signal is a missing " + audio" in a log line long since scrolled
+    // past. docs/cmaf.md promises this warning.
+    if state.audio_muxing == Some(false) && !state.late_audio_warned {
+        state.late_audio_warned = true;
+        tracing::warn!(
+            "CMAF output '{}': audio appeared after init.mp4 committed the track \
+             list — it will not be carried. Restart the flow if this source is \
+             expected to have audio.",
+            config.id,
+        );
+    }
+    let Some(seg) = state.audio_seg.as_mut() else {
+        return;
+    };
+    let mut shed_90k = 0u64;
+    for (data, pts) in frames {
+        if let Some(dropped) = seg.push(&data, pts) {
+            shed_90k += dropped.duration_90k;
+        }
+    }
+    if shed_90k > 0 {
+        tracing::warn!(
+            "CMAF output '{}': shed {} ms of buffered audio — the video track \
+             has not closed a segment, so there is no fragment to carry it",
+            config.id,
+            shed_90k / 90,
+        );
     }
 }
 
@@ -1084,11 +1135,7 @@ fn handle_audio_frame(
         vec![data.to_vec()]
     };
 
-    if let Some(seg) = state.audio_seg.as_mut() {
-        for f in frames_to_buffer {
-            seg.push(&f, pts);
-        }
-    }
+    buffer_audio_frames(state, config, frames_to_buffer.into_iter().map(|f| (f, pts)));
 }
 
 /// Encrypt `samples` in place and re-build the video segment with
@@ -1274,17 +1321,21 @@ fn resolve_audio_muxing(state: &mut CmafState) -> Option<bool> {
     if let Some(decided) = state.audio_muxing {
         return Some(decided);
     }
+    // CENC first, before "audio exists": an encrypted output takes the
+    // `encrypt_and_build_video_segment` branch, which rebuilds the fragment
+    // from the video samples alone and never carries an audio run. Settling
+    // on "audio is here" would declare a track those fragments cannot fill —
+    // the #130 stall, on exactly the outputs that are hardest to debug.
+    // (`encrypt_audio_sample` is written but unwired, so audio cannot be
+    // carried encrypted either.)
+    if state.cenc.is_some() {
+        state.audio_muxing = Some(false);
+        return Some(false);
+    }
     // Audio is here — settle immediately, no reason to wait out the grace.
     if state.audio_seg.is_some() {
         state.audio_muxing = Some(true);
         return Some(true);
-    }
-    // CENC encrypts video only today (`encrypt_audio_sample` is written but
-    // unwired), so an encrypted output stays video-only rather than shipping
-    // an audio track in the clear under an init that claims it is encrypted.
-    if state.cenc.is_some() {
-        state.audio_muxing = Some(false);
-        return Some(false);
     }
     match state.video_ready_at {
         Some(t) if t.elapsed() >= AUDIO_DETECT_GRACE => {
@@ -1383,19 +1434,18 @@ async fn publish_init_if_due(
     let first = !state.init_uploaded;
 
     if first && !with_audio && (state.audio_seg.is_some() || state.audio_ready) {
-        // Audio exists but is not being carried. Say which reason applies:
-        // the operator can act on one of them and not the other.
+        // Audio exists but is not being carried, and the reason is structural
+        // — it will not change for the life of the flow. (Audio that turns up
+        // *later* is reported from the audio path, which is the only place
+        // that can see it: this block runs once.)
         let why = match audio {
             AudioPolicy::Never => "low_latency chunks carry a single track",
-            AudioPolicy::MuxWhenPresent if state.cenc.is_some() => {
+            AudioPolicy::MuxWhenPresent => {
                 "CENC encrypts video only, and shipping audio in the clear \
                  under an init that declares the output encrypted is worse"
             }
-            AudioPolicy::MuxWhenPresent => {
-                "audio appeared after the track list was already committed; \
-                 restart the flow to pick it up"
-            }
         };
+        state.late_audio_warned = true;
         tracing::warn!(
             "CMAF output '{}': source has audio but the output is video-only — {}.",
             config.id,

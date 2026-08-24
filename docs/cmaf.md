@@ -19,7 +19,9 @@ players without transcoding twice. Supports:
   the in-process fdk-aac backend. Audio is **muxed into the same
   fragment as the video** — one `moof` addressing both tracks — so a
   browser needs a single MSE SourceBuffer and there is no second
-  timeline to keep aligned.
+  timeline to keep aligned. Two configurations are **video-only**, and
+  both say so at startup: `low_latency: true` (a chunk carries one
+  track) and `encryption` (CENC covers video only). See Limitations.
 - **Delivery**: whole-segment HTTP PUT (`low_latency: false`) or
   chunked-transfer streaming PUT (`low_latency: true`, LL-CMAF) with
   per-segment `moof + mdat` chunks emitted every `chunk_duration_ms`
@@ -338,7 +340,14 @@ should set up a URL-rewriting reverse proxy in front of their ingest.
 - **Encrypted (CENC) outputs are video-only.** `encrypt_audio_sample`
   exists but is unwired, and shipping the audio track in the clear
   under an init that declares the output encrypted would be worse than
-  omitting it.
+  omitting it. The decision is taken before "does this source have
+  audio", so an encrypted output never declares a track it cannot fill.
+- **LL-CMAF outputs are video-only.** A chunk is built by
+  `build_segment_chunk`, which writes one `traf` for the video track,
+  so `low_latency: true` publishes a video-only `init.mp4` whatever the
+  source carries. LL-CMAF also does **not** apply `encryption` — its
+  chunks are written in the clear even when CENC is configured
+  (bilbycast-edge#135).
 - No live-to-VOD archival — the rolling playlist caps at `max_segments`
   and old `.m4s` files are not deleted on the ingest side. Operators
   must configure CDN / object-store retention externally.
