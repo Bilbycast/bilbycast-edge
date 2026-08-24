@@ -736,19 +736,35 @@ pub fn build_multi_track_segment(
                 let mut tfdt = traf.child_full(*b"tfdt", 1, 0);
                 tfdt.u64(t.base_media_decode_time);
             }
-            // trun v1 with: data-offset, first-sample-flags, per-sample
-            // duration / size / cts-offset.
-            let flags: u32 = 0x0001 | 0x0004 | 0x0100 | 0x0200 | 0x0800;
+            // trun v1 with: data-offset, per-sample duration / size / flags /
+            // cts-offset.
+            //
+            // Per-sample flags (0x000400), not first-sample-flags (0x000004).
+            // This writer produces ONE fragment holding a whole recording —
+            // the replay MP4 exporter builds a 30-second clip as a single
+            // moof/mdat — so it mixes many IDRs with their inter frames, and
+            // audio samples that are every one of them a random-access point.
+            // First-sample-flags can only describe sample 0; every other
+            // sample would fall through to `trex.default_sample_flags`, which
+            // is a single value and cannot be right for both. A player reads
+            // this to decide where it may start decoding, so the whole clip
+            // would resolve to one seek point at t=0.
+            //
+            // ISO/IEC 14496-12 8.8.8.2: first-sample-flags and sample-flags
+            // are mutually exclusive, hence 0x0004 is dropped here.
+            let flags: u32 = 0x0001 | 0x0100 | 0x0200 | 0x0400 | 0x0800;
             let mut trun = traf.child_full(*b"trun", 1, flags);
             trun.u32(t.samples.len() as u32);
             data_offset_patches.push(trun.cursor_pos());
             trun.u32(0); // placeholder data_offset
-            let first_sync = t.samples.first().map(|s| s.is_sync).unwrap_or(false);
-            let first_flags: u32 = if first_sync { 0x0200_0000 } else { 0x0100_0000 };
-            trun.u32(first_flags);
             for s in t.samples {
                 trun.u32(s.duration);
                 trun.u32(s.data.len() as u32);
+                trun.u32(if s.is_sync {
+                    SAMPLE_FLAGS_SYNC
+                } else {
+                    SAMPLE_FLAGS_NON_SYNC
+                });
                 trun.i32(s.composition_time_offset);
             }
         }
@@ -1272,6 +1288,43 @@ mod tests {
             (25, 25),
             "an all-intra fragment must report every sample as seekable"
         );
+    }
+
+    /// A whole-recording fragment must report every one of its random-access
+    /// points, not just the first.
+    ///
+    /// `build_multi_track_segment` is what the replay MP4 exporter writes a
+    /// clip with: one moof holding the entire clip, so tens of IDRs, hundreds
+    /// of inter frames, and an audio track whose samples are every one of them
+    /// seekable. `trex.default_sample_flags` is a single value and cannot
+    /// describe that, so the samples carry their own flags.
+    #[test]
+    fn multi_track_fragment_reports_every_random_access_point() {
+        // 3 GOPs of 5: IDR, then four inter frames.
+        let video: Vec<Sample> = (0..15).map(|i| sample(i % 5 == 0)).collect();
+        // Audio: every frame is a random-access point.
+        let audio: Vec<Sample> = (0..40).map(|_| sample(true)).collect();
+
+        let seg = build_multi_track_segment(
+            1,
+            &[
+                TrackFragment {
+                    track_id: VIDEO_TRACK_ID,
+                    base_media_decode_time: 0,
+                    samples: &video,
+                },
+                TrackFragment {
+                    track_id: AUDIO_TRACK_ID,
+                    base_media_decode_time: 0,
+                    samples: &audio,
+                },
+            ],
+        );
+
+        // 3 video IDRs + 40 audio samples = 43 of 55 seekable. Reporting
+        // (1, 55) would mean a clip that can only ever seek to t=0; reporting
+        // (55, 55) is the pre-#127 lie that let a seek land on a P-frame.
+        assert_eq!(resolve_sync_samples(&seg), (43, 55));
     }
 
     /// The two encodings differ in bit 16, which is the one that matters and

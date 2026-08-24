@@ -363,6 +363,27 @@ pub struct VideoOutFrame {
     pub is_keyframe: bool,
 }
 
+/// The codec family a `video_encode.codec` string produces.
+///
+/// The re-encoder's output family is not necessarily the source's: an H.264
+/// source re-encoded with `x265` emits HEVC. Anything reading the encoder's
+/// NAL units — the CMAF track builder, above all — has to know which set of
+/// NAL header semantics applies, and the demuxed frame's codec is the wrong
+/// answer there.
+///
+/// `None` for a string [`VideoReencoder::new`] would reject anyway.
+pub fn encoded_codec_family(codec: &str) -> Option<CmafVideoCodec> {
+    match codec {
+        "x264" | "h264_nvenc" | "h264_qsv" | "h264_vaapi" | "h264_rkmpp" => {
+            Some(CmafVideoCodec::H264)
+        }
+        "x265" | "hevc_nvenc" | "hevc_qsv" | "hevc_vaapi" | "hevc_rkmpp" => {
+            Some(CmafVideoCodec::H265)
+        }
+        _ => None,
+    }
+}
+
 #[cfg(feature = "media-codecs")]
 impl VideoReencoder {
     pub fn new(cfg: &VideoEncodeConfig, output_id: &str) -> Result<Self> {
@@ -613,6 +634,24 @@ mod reencoder_tests {
 #[cfg(test)]
 #[cfg(feature = "media-codecs")]
 mod tests {
+    /// Every codec string `VideoReencoder::new` accepts must resolve to a
+    /// family here, and to the family it actually encodes — the CMAF track is
+    /// built by parsing the encoder's NAL headers, and reading HEVC as H.264
+    /// finds no parameter sets at all, so the output publishes nothing.
+    #[test]
+    fn encoded_codec_family_covers_every_accepted_codec() {
+        use super::encoded_codec_family;
+        for c in ["x264", "h264_nvenc", "h264_qsv", "h264_vaapi", "h264_rkmpp"] {
+            assert_eq!(encoded_codec_family(c), Some(CmafVideoCodec::H264), "{c}");
+        }
+        for c in ["x265", "hevc_nvenc", "hevc_qsv", "hevc_vaapi", "hevc_rkmpp"] {
+            assert_eq!(encoded_codec_family(c), Some(CmafVideoCodec::H265), "{c}");
+        }
+        // Not a codec the re-encoder accepts; CMAF has no `*_auto` resolution.
+        assert_eq!(encoded_codec_family("h264_auto"), None);
+        assert_eq!(encoded_codec_family(""), None);
+    }
+
     use super::*;
 
     #[test]
