@@ -67,7 +67,7 @@ const FRAME_QUALITY: u32 = 5;
 /// so a single typical-GOP keyframe is always in scope. ~32 MB ≈ 12 s at
 /// 21 Mbps, ≈ 25 s at 10 Mbps. One allocation per recording, not per
 /// packet.
-const MAX_BUFFER_BYTES: usize = 32 * 1024 * 1024;
+pub(crate) const MAX_BUFFER_BYTES: usize = 32 * 1024 * 1024;
 
 /// Minimum gap between `replay_filmstrip_decode_failed` events when the
 /// decoder is continuously rejecting buffered TS (e.g. an audio-only
@@ -170,7 +170,7 @@ async fn filmstrip_loop(
                     continue;
                 }
                 let snapshot = collect_buffer(&buffer);
-                match try_capture_frame(&snapshot).await {
+                match try_capture_frame(&snapshot, CaptureSpec::default()).await {
                     Ok(Some((pts_90khz, jpeg))) => {
                         let path = thumbs_dir.join(format!("{pts_90khz}.jpg"));
                         if path.exists() {
@@ -255,7 +255,7 @@ async fn filmstrip_loop(
 
 /// Concatenate the ring buffer into one contiguous slice for the
 /// extraction + decode path. Same idiom as [`crate::engine::thumbnail`].
-fn collect_buffer(buffer: &VecDeque<Bytes>) -> Bytes {
+pub(crate) fn collect_buffer(buffer: &VecDeque<Bytes>) -> Bytes {
     let total: usize = buffer.iter().map(|b| b.len()).sum();
     let mut out = BytesMut::with_capacity(total);
     for chunk in buffer {
@@ -264,11 +264,41 @@ fn collect_buffer(buffer: &VecDeque<Bytes>) -> Bytes {
     out.freeze()
 }
 
+/// Size and quality for one captured frame.
+///
+/// Parameterised because the CMAF thumbnail track ([`crate::engine::cmaf`])
+/// packs frames into sprite sheets at its own dimensions, and the issue asking
+/// for it was explicit that it should reuse this decode path rather than stand
+/// up a second generator.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct CaptureSpec {
+    pub width: u32,
+    pub height: u32,
+    /// libavcodec scale, 1 = highest.
+    pub quality: u32,
+}
+
+impl Default for CaptureSpec {
+    fn default() -> Self {
+        Self {
+            width: FRAME_WIDTH,
+            height: FRAME_HEIGHT,
+            #[cfg(feature = "media-codecs")]
+            quality: FRAME_QUALITY,
+            #[cfg(not(feature = "media-codecs"))]
+            quality: 5,
+        }
+    }
+}
+
 /// Try to decode + JPEG-encode one frame from the snapshot, returning
 /// `(pts_90khz, jpeg_bytes)` on success. `Ok(None)` means "no video
 /// data in the buffer" (audio-only / warm-up); `Err` is a hard decoder
 /// failure.
-async fn try_capture_frame(ts_data: &Bytes) -> Result<Option<(u64, Vec<u8>)>, String> {
+pub(crate) async fn try_capture_frame(
+    ts_data: &Bytes,
+    spec: CaptureSpec,
+) -> Result<Option<(u64, Vec<u8>)>, String> {
     // Snap the filename PTS to the first PCR observed in the buffer.
     // PCR is in 27 MHz ticks; divide by 300 → 90 kHz PTS units, matching
     // the rest of the system (`index.bin`, `clips.json`, etc.).
@@ -295,9 +325,9 @@ async fn try_capture_frame(ts_data: &Bytes) -> Result<Option<(u64, Vec<u8>)>, St
             };
             let (headers, packets, codec) = snapshot;
             let cfg = ThumbnailConfig {
-                width: FRAME_WIDTH,
-                height: FRAME_HEIGHT,
-                quality: FRAME_QUALITY,
+                width: spec.width,
+                height: spec.height,
+                quality: spec.quality,
             };
             let result =
                 video_engine::decode_thumbnail_packets(&headers, &packets, codec, &cfg)
@@ -320,6 +350,7 @@ async fn try_capture_frame(ts_data: &Bytes) -> Result<Option<(u64, Vec<u8>)>, St
         // rather than spawning a parallel ffmpeg per cadence tick.
         let _ = ts_data;
         let _ = pts_90khz;
+        let _ = spec;
         Err("filmstrip requires the `media-codecs` feature".to_string())
     }
 }

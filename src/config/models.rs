@@ -5565,6 +5565,65 @@ pub struct CmafOutputConfig {
     /// every upload.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth_token: Option<String>,
+    /// Publish a thumbnail track (sprite sheets + a WebVTT index) beside the
+    /// media, for browser scrub preview. Off unless configured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thumbnails: Option<CmafThumbnailConfig>,
+}
+
+/// Thumbnail track settings for a CMAF output.
+///
+/// Sized against a measurement rather than a guess: a drag issues ~20 seeks a
+/// second, and outside the player's back buffer each one costs a media segment
+/// fetch, so 0-1 frames of 40 are presented. One sprite sheet is about the
+/// size of one media segment and covers `frames_per_sheet` positions.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CmafThumbnailConfig {
+    /// Seconds between preview frames. Range 1-30. Default 2.
+    ///
+    /// The default matches a typical segment duration, so there is one preview
+    /// frame per segment and the bar has no gaps a drag can fall into.
+    #[serde(default = "default_thumbnail_interval_secs")]
+    pub interval_secs: u32,
+    /// Frames packed into one sheet before it is published. Range 1-200.
+    /// Default 100.
+    ///
+    /// This is the latency of the *newest* preview: at the default cadence a
+    /// sheet closes every 200 s, and until it does those positions have no
+    /// picture. They are also the positions most likely to still be in the
+    /// player's buffer, where a real frame is already instant.
+    #[serde(default = "default_thumbnail_frames_per_sheet")]
+    pub frames_per_sheet: u32,
+    /// Preview frame width in pixels. Range 64-640. Default 160.
+    #[serde(default = "default_thumbnail_width")]
+    pub width: u32,
+    /// Preview frame height in pixels. Range 36-360. Default 90.
+    #[serde(default = "default_thumbnail_height")]
+    pub height: u32,
+}
+
+impl Default for CmafThumbnailConfig {
+    fn default() -> Self {
+        Self {
+            interval_secs: default_thumbnail_interval_secs(),
+            frames_per_sheet: default_thumbnail_frames_per_sheet(),
+            width: default_thumbnail_width(),
+            height: default_thumbnail_height(),
+        }
+    }
+}
+
+fn default_thumbnail_interval_secs() -> u32 {
+    2
+}
+fn default_thumbnail_frames_per_sheet() -> u32 {
+    100
+}
+fn default_thumbnail_width() -> u32 {
+    160
+}
+fn default_thumbnail_height() -> u32 {
+    90
 }
 
 /// Upper bound on derived playlist length. A 21600-entry playlist is ~650 KB

@@ -5882,6 +5882,43 @@ pub fn validate_output_with_input(
                     cmaf.id, cmaf.chunk_duration_ms
                 );
             }
+            if let Some(ref th) = cmaf.thumbnails {
+                if th.interval_secs < 1 || th.interval_secs > 30 {
+                    bail!(
+                        "CMAF output '{}': thumbnails.interval_secs must be 1-30, got {}",
+                        cmaf.id, th.interval_secs
+                    );
+                }
+                if th.frames_per_sheet < 1 || th.frames_per_sheet > 200 {
+                    bail!(
+                        "CMAF output '{}': thumbnails.frames_per_sheet must be 1-200, got {}",
+                        cmaf.id, th.frames_per_sheet
+                    );
+                }
+                if th.width < 64 || th.width > 640 {
+                    bail!(
+                        "CMAF output '{}': thumbnails.width must be 64-640, got {}",
+                        cmaf.id, th.width
+                    );
+                }
+                if th.height < 36 || th.height > 360 {
+                    bail!(
+                        "CMAF output '{}': thumbnails.height must be 36-360, got {}",
+                        cmaf.id, th.height
+                    );
+                }
+                // A sheet wider than a common maximum texture size is refused
+                // outright by browsers on the Android hardware this targets,
+                // and a refused image is a preview that shows nothing with no
+                // error anywhere. 10 columns is the layout; bound the product.
+                let sheet_width = th.width * 10;
+                if sheet_width > 4096 {
+                    bail!(
+                        "CMAF output '{}': thumbnails.width {} makes a {} px sheet, over the                          4096 px many mobile GPUs will decode; use 409 or less",
+                        cmaf.id, th.width, sheet_width
+                    );
+                }
+            }
             if let Some(ref cenc) = cmaf.encryption {
                 validate_cenc_block(cenc, &format!("CMAF output '{}'", cmaf.id))?;
             }
@@ -8568,6 +8605,45 @@ fn validate_port_conflicts(config: &AppConfig) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+
+    /// A thumbnail sheet must stay inside the texture size a phone will
+    /// decode.
+    ///
+    /// Sheets are ten frames wide, so the frame width sets the sheet width.
+    /// Past roughly 4096 px many mobile GPUs refuse the image outright — and
+    /// a refused image is a scrub preview that shows nothing, with no error
+    /// the player or the operator can see. Catching it here means an
+    /// unusable width is a config error at push time rather than a blank
+    /// preview discovered on a tablet.
+    #[test]
+    fn validate_output_cmaf_thumbnail_bounds() {
+        use crate::config::models::OutputConfig;
+        let out = |thumbs: &str| -> OutputConfig {
+            serde_json::from_str(&format!(
+                r#"{{"type":"cmaf","id":"c","name":"c","ingest_url":"https://h/o","manifests":["hls"],"thumbnails":{thumbs}}}"#
+            ))
+            .expect("CMAF output should deserialize")
+        };
+
+        // Defaults: 160 px frames, a 1600 px sheet.
+        assert!(validate_output(&out("{}")).is_ok());
+        assert!(validate_output(&out(r#"{"width":409,"height":230}"#)).is_ok());
+
+        // 410 px frames make a 4100 px sheet — over the line.
+        let err = validate_output(&out(r#"{"width":410,"height":230}"#))
+            .expect_err("an unusable sheet width must be refused");
+        assert!(
+            format!("{err}").contains("4100"),
+            "the error should name the sheet width that fails: {err}"
+        );
+
+        // Cadence and packing bounds.
+        assert!(validate_output(&out(r#"{"interval_secs":0}"#)).is_err());
+        assert!(validate_output(&out(r#"{"interval_secs":31}"#)).is_err());
+        assert!(validate_output(&out(r#"{"frames_per_sheet":0}"#)).is_err());
+        assert!(validate_output(&out(r#"{"frames_per_sheet":201}"#)).is_err());
+        assert!(validate_output(&out(r#"{"interval_secs":5,"frames_per_sheet":200}"#)).is_ok());
+    }
 
     /// `dvr_window_secs` is bounded by the *derived* entry count, not the raw
     /// window: a long window made of long segments is cheap to advertise, and

@@ -33,6 +33,7 @@ mod manifest;
 #[allow(dead_code)]
 pub(crate) mod nalu;
 mod segmenter;
+mod thumbnails;
 mod upload;
 
 use std::collections::VecDeque;
@@ -92,6 +93,40 @@ pub fn spawn_cmaf_output(
         egress_static = egress_static.with_audio_encode_target(ae);
     }
     output_stats.set_egress_static(egress_static);
+
+    // The thumbnail track is a sibling subscriber on the same broadcast, not a
+    // stage in the media path: it must never be able to stall or fail the
+    // output it sits beside.
+    if let Some(th) = config.thumbnails.clone() {
+        let interval = std::time::Duration::from_secs(th.interval_secs as u64);
+        // The index may only describe sheets the origin still holds. Derive
+        // the count from the same window the playlist uses, plus one so the
+        // oldest is dropped a sheet *after* it could still be referenced
+        // rather than a sheet before.
+        let window_secs = config
+            .dvr_window_secs
+            .unwrap_or(config.max_segments as f64 * config.segment_duration_secs);
+        let secs_per_sheet = (th.interval_secs * th.frames_per_sheet).max(1) as f64;
+        let window_sheets = ((window_secs / secs_per_sheet).ceil() as usize).max(1) + 1;
+        thumbnails::spawn_thumbnail_track(
+            config.id.clone(),
+            config.ingest_url.clone(),
+            config.auth_token.clone(),
+            broadcast_tx,
+            crate::replay::filmstrip::CaptureSpec {
+                width: th.width,
+                height: th.height,
+                ..Default::default()
+            },
+            interval,
+            th.frames_per_sheet,
+            window_sheets,
+            Arc::new(thumbnails::ThumbnailStats::default()),
+            event_sender.clone(),
+            flow_id.clone(),
+            cancel.clone(),
+        );
+    }
 
     tokio::spawn(async move {
         if let Err(e) = run(
