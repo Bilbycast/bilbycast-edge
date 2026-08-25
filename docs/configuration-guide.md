@@ -2067,11 +2067,33 @@ LL-CMAF example with DRM:
 | `manifests` | array | No | `["hls","dash"]` | Subset of `{"hls", "dash"}`, non-empty. Both manifests reference the same fMP4 segments — enable either or both. |
 | `low_latency` | bool | No | `false` | Enable LL-CMAF: emits a moof+mdat chunk every `chunk_duration_ms` inside a single chunked-transfer PUT per segment, advertises parts via `#EXT-X-PART` (HLS) and `availabilityTimeOffset` (DASH). Target end-to-end latency <3 s with 500 ms chunks. |
 | `chunk_duration_ms` | integer | No | `500` | LL-CMAF chunk duration in ms. Range: 100-2000. Ignored when `low_latency = false`. |
+| `thumbnails` | object | No | `null` | Scrub-preview sprite sheets plus a WebVTT index, PUT beside the media. See [`thumbnails`](#the-cmaf-thumbnails-block) below. Off when omitted. |
 | `encryption` | object | No | `null` | Common Encryption configuration. See [`encryption`](#the-cmaf-encryption-block) below. |
 | `audio_encode` | object | No | `null` | Optional AAC re-encode. Allowed `codec`: `aac_lc`, `he_aac_v1`, `he_aac_v2`. Source must already be AAC (TsDemuxer decodes via fdk-aac). When omitted, the source AAC passes through unchanged. |
 | `video_encode` | object | No | `null` | Optional H.264 / HEVC re-encode with explicit GoP alignment to `segment_duration_secs`. See the [`video_encode` block](#the-video_encode-block) for backends and fields. H.264 → H.264 or HEVC → H.264 conversion is supported when the matching `video-encoder-*` Cargo feature is enabled. |
 | `program_number` | integer | No | `null` | MPTS → SPTS program filter. Must be `> 0`. See [MPTS → SPTS filtering](#mpts--spts-filtering). |
 | `auth_token` | string | No | `null` | Bearer token sent with every HTTP PUT / chunked PUT. |
+
+#### The CMAF `thumbnails` block
+
+Scrub-preview frames for a browser DVR player, packed into sprite sheets and
+indexed by a WebVTT file. Published to the same ingest as the media so they age
+out with it. See [`cmaf.md`](cmaf.md#thumbnail-track-thumbnails).
+
+| Field | Type | Required | Default | Notes |
+|---|---|---|---|---|
+| `interval_secs` | integer | No | `2` | Seconds between preview frames. Range 1-30. Matching `segment_duration_secs` gives one frame per segment and no gap a drag can fall into. |
+| `frames_per_sheet` | integer | No | `20` | Frames packed before a sheet is published. Range 1-200. **This is the lag of the newest preview**, not a size knob: a sheet only exists once full, so the most recent `interval_secs x frames_per_sheet` of the window has no picture. |
+| `width` | integer | No | `160` | Preview frame width. Range 64-640, and refused if `width x 10` exceeds 4096 — sheets are ten frames wide and many mobile GPUs will not decode a wider image. |
+| `height` | integer | No | `90` | Preview frame height. Range 36-360. |
+
+```json
+"thumbnails": { "interval_secs": 2, "frames_per_sheet": 20, "width": 160, "height": 90 }
+```
+
+Requires `#EXT-X-PROGRAM-DATE-TIME` on the playlist, which the CMAF writer emits
+unconditionally — the player maps a scrub position to a picture through wall
+clock, having no timeline in common with the generator otherwise.
 
 #### The CMAF `encryption` block
 

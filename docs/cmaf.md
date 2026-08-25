@@ -112,6 +112,66 @@ previously did unconditionally. `EVENT` promises a playlist that only
 ever grows (RFC 8216 §4.3.3.5); a trimmed playlist is not one, and
 hls.js computed a seekable range that included segments already dropped.
 
+## Absolute time on the playlist (`#EXT-X-PROGRAM-DATE-TIME`)
+
+Each playlist row carries the wall clock of its own first sample, and the writer
+emits one `#EXT-X-PROGRAM-DATE-TIME` for whichever row is **currently first**.
+
+The clock is per row rather than once per stream on purpose. The playlist is a
+rolling window: the first row changes as the oldest are trimmed, and a tag
+anchored to when the *stream* started would go on naming a segment that is no
+longer listed, with the error growing without bound for as long as the session
+runs. Nothing would report it.
+
+This is what lets a browser relate a position on its own timeline to a moment in
+the real world — hls.js zeroes its timeline at whichever fragment it happened to
+load first, so `currentTime` means nothing across sessions. The scrub-preview
+index below depends on it, and so does any "what time was that?" surface.
+
+## Thumbnail track (`thumbnails`)
+
+Sprite sheets plus a WebVTT index, PUT to the same ingest as the media so they
+age out with it. Off unless configured.
+
+```json
+"thumbnails": { "interval_secs": 2, "frames_per_sheet": 20, "width": 160, "height": 90 }
+```
+
+**What it is for.** Dragging a scrub bar issues ~20 seeks a second. A seek into
+buffered media is immediate; every other position costs a media segment fetch.
+Measured with `requestVideoFrameCallback` on a live 1080p feed, 40 seeks over
+2 s on spans the player had not visited presented **0–1 frames** — at LAN speed,
+at 25 Mbit/s and at 8 Mbit/s alike, and identically on a low-resolution
+all-intra rendition, because the cost is the fetch and not the decode. One
+sprite sheet is about the size of one media segment and covers a hundred
+positions.
+
+**Sizing.** `frames_per_sheet` bounds the *lag*, not the object count: a sheet
+only exists once it is full, so the newest `interval_secs × frames_per_sheet` of
+the window has no preview. At 100 frames that was the newest 200 s, which on a
+300 s window is most of the bar. See #138.
+
+**Layout.** Ten frames wide, not one strip. A hundred 160 px frames in a row is
+16 000 px, past the maximum texture size on plenty of Android hardware — and a
+browser that refuses the image shows no preview at all, with no error. The
+validator refuses a frame width that would cross 4096 px at push time rather
+than leaving it to be found on a tablet.
+
+**The index is a rolling window.** Sheets are dropped from it by **age**, so a
+sheet leaves no later than the origin evicts it. Pruning by a count derived from
+the window is how this was first written, and the arithmetic erred one sheet
+long — which meant the oldest stretch of the bar was permanently blank while the
+index insisted it was covered.
+
+Cue times are offsets from a UTC epoch written into the file's own header
+(`X-BILBYCAST-EPOCH`), and that epoch moves with the window as sheets age out.
+Held at the first sheet ever published, every cue would drift further from the
+picture it names for as long as the session ran.
+
+Decoding reuses `replay::filmstrip` — a sibling broadcast subscriber that drops
+on `Lagged` and never blocks the data path. A failure here costs a preview and
+never the media.
+
 ## LL-CMAF
 
 LL-CMAF trades compatibility for latency. Enable it with:
@@ -288,6 +348,9 @@ The edge uses the following filenames under `{ingest_url}`:
 - `aud-NNNNN.m4s` — audio-only media segment. **Reserved and not
   emitted**: when a source has audio it is muxed into `seg-NNNNN.m4s`
   alongside the video, so a separate audio object never appears.
+- `thumbs-NNNNN.jpg` — scrub-preview sprite sheet (see below). Only when
+  `thumbnails` is configured.
+- `thumbs.vtt` — the WebVTT index describing those sheets.
 - `manifest.m3u8` — HLS playlist.
 - `manifest.mpd` — DASH manifest.
 - `seg-NNNNN.m4s?part=K` — LL-HLS part URI (query string distinguishes
