@@ -30,6 +30,14 @@ pub struct M3u8Entry {
     /// advertised so players can start fetching chunks before the
     /// segment closes.
     pub parts: Vec<HlsPartEntry>,
+    /// Wall-clock time of this segment's first sample, if known.
+    ///
+    /// Carried per entry rather than once for the stream because the
+    /// playlist is a rolling window: the first row changes as the oldest are
+    /// trimmed, and a `#EXT-X-PROGRAM-DATE-TIME` anchored to when the
+    /// *stream* started would name a segment that is no longer listed. That
+    /// error grows for as long as the session runs.
+    pub program_date_time: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// One `#EXT-X-PART` row.
@@ -87,6 +95,15 @@ pub fn build_hls_playlist(
     // derives its seekable range from `EVENT`) will seek to segments the
     // origin has already dropped. Omitting the tag is the correct signal
     // for a live sliding window.
+    // Absolute time for the window. One row is enough -- a player derives
+    // every later segment by accumulating `EXTINF` -- and it must describe
+    // whichever segment is *currently* first.
+    if let Some(pdt) = entries.first().and_then(|e| e.program_date_time) {
+        out.push_str(&format!(
+            "#EXT-X-PROGRAM-DATE-TIME:{}\n",
+            pdt.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+        ));
+    }
     out.push_str(&format!("#EXT-X-MAP:URI=\"{init_uri}\"\n"));
     out.push_str("#EXT-X-INDEPENDENT-SEGMENTS\n");
     if let Some(ll) = ll_hints {
@@ -396,7 +413,64 @@ mod tests {
             duration_secs: dur,
             uri: None,
             parts: Vec::new(),
+            program_date_time: None,
         }
+    }
+
+    fn dated_entry(seq: u64, dur: f64, iso: &str) -> M3u8Entry {
+        M3u8Entry {
+            program_date_time: Some(
+                chrono::DateTime::parse_from_rfc3339(iso)
+                    .expect("test timestamp")
+                    .with_timezone(&chrono::Utc),
+            ),
+            ..simple_entry(seq, dur)
+        }
+    }
+
+    /// The absolute time must describe whichever segment is *currently* first.
+    ///
+    /// This is the whole reason the clock is carried per entry. A playlist is
+    /// a rolling window; anchoring `#EXT-X-PROGRAM-DATE-TIME` to when the
+    /// stream started would keep naming a segment that has been trimmed, and
+    /// the error grows without bound for as long as the session runs. Nothing
+    /// would report it — a scrub preview would simply show the wrong picture,
+    /// by more and more, the longer the session had been up.
+    #[test]
+    fn the_absolute_time_follows_the_window_as_it_rolls() {
+        let all = [
+            dated_entry(10, 2.0, "2026-08-25T01:00:00Z"),
+            dated_entry(11, 2.0, "2026-08-25T01:00:02Z"),
+            dated_entry(12, 2.0, "2026-08-25T01:00:04Z"),
+        ];
+
+        let p = build_hls_playlist(2.0, &all, "init.mp4", None);
+        assert!(
+            p.contains("#EXT-X-PROGRAM-DATE-TIME:2026-08-25T01:00:00.000Z"),
+            "{p}"
+        );
+
+        // Trim the oldest, as the segmenter does, and the tag must move with it.
+        let rolled = build_hls_playlist(2.0, &all[1..], "init.mp4", None);
+        assert!(
+            rolled.contains("#EXT-X-PROGRAM-DATE-TIME:2026-08-25T01:00:02.000Z"),
+            "{rolled}"
+        );
+        assert!(
+            !rolled.contains("01:00:00.000Z"),
+            "still dating the window from a segment that is no longer in it"
+        );
+
+        // Exactly one row: a player derives the rest from EXTINF, and two
+        // disagreeing anchors is worse than none.
+        assert_eq!(p.matches("#EXT-X-PROGRAM-DATE-TIME").count(), 1, "{p}");
+    }
+
+    /// No clock, no tag. An invented one would be believed.
+    #[test]
+    fn an_unknown_time_is_omitted_rather_than_guessed() {
+        let p = build_hls_playlist(2.0, &[simple_entry(0, 2.0)], "init.mp4", None);
+        assert!(!p.contains("#EXT-X-PROGRAM-DATE-TIME"), "{p}");
     }
 
     #[test]
@@ -455,6 +529,7 @@ mod tests {
             duration_secs: 2.0,
             uri: Some("custom/path/x.m4s".to_string()),
             parts: Vec::new(),
+            program_date_time: None,
         }];
         let p = build_hls_playlist(2.0, &entries, "init.mp4", None);
         assert!(p.contains("custom/path/x.m4s"));

@@ -250,6 +250,9 @@ struct LlSegment {
     chunks_emitted: u32,
     /// Parts advertised on the current manifest for this segment.
     parts: Vec<HlsPartEntry>,
+    /// Wall clock when this segment opened, so the row it contributes to the
+    /// playlist can carry a `#EXT-X-PROGRAM-DATE-TIME` like a closed one.
+    started_at: chrono::DateTime<chrono::Utc>,
     /// The filename this segment is being uploaded under.
     uri: String,
 }
@@ -1034,11 +1037,18 @@ async fn handle_video(
                 .unwrap_or(0);
         }
 
+        let seg_secs = duration_90k as f64 / 90_000.0;
         state.playlist.push_back(M3u8Entry {
             sequence_number: seg.sequence_number,
-            duration_secs: duration_90k as f64 / 90_000.0,
+            duration_secs: seg_secs,
             uri: Some(uri),
             parts: Vec::new(),
+            // The segment has just closed, so its first sample is `now` less
+            // its own duration. Good to a scheduling jitter, which is orders
+            // below the second a scrub preview needs.
+            program_date_time: Some(
+                chrono::Utc::now() - chrono::Duration::nanoseconds((seg_secs * 1e9) as i64),
+            ),
         });
         let window = config.playlist_window_segments();
         while state.playlist.len() > window {
@@ -1451,6 +1461,12 @@ async fn handle_ll_cmaf(
                 duration_secs: config.segment_duration_secs,
                 uri: Some(uri),
                 parts: Vec::new(),
+                program_date_time: Some(
+                    chrono::Utc::now()
+                        - chrono::Duration::nanoseconds(
+                            (config.segment_duration_secs * 1e9) as i64,
+                        ),
+                ),
             });
             let window = config.playlist_window_segments();
             while state.playlist.len() > window {
@@ -1473,6 +1489,7 @@ async fn handle_ll_cmaf(
                 sequence_number: seq,
                 chunks_emitted: 0,
                 parts: Vec::new(),
+                started_at: chrono::Utc::now(),
                 uri,
             });
             if state.availability_start_unix == 0 {
@@ -1639,6 +1656,7 @@ async fn publish_ll_hls(
             duration_secs: config.segment_duration_secs,
             uri: Some(ll.uri.clone()),
             parts: ll.parts.clone(),
+            program_date_time: Some(ll.started_at),
         });
     }
     let hints = LowLatencyHints {
