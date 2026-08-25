@@ -5586,12 +5586,15 @@ pub struct CmafThumbnailConfig {
     #[serde(default = "default_thumbnail_interval_secs")]
     pub interval_secs: u32,
     /// Frames packed into one sheet before it is published. Range 1-200.
-    /// Default 100.
+    /// Default 20.
     ///
-    /// This is the latency of the *newest* preview: at the default cadence a
-    /// sheet closes every 200 s, and until it does those positions have no
-    /// picture. They are also the positions most likely to still be in the
-    /// player's buffer, where a real frame is already instant.
+    /// This is the latency of the *newest* preview: a sheet only exists once
+    /// it is full, so the most recent `interval_secs * frames_per_sheet` of
+    /// the window has no picture. Sized to bound that lag at ~40 s rather
+    /// than to minimise the object count — at 100 frames the newest 200 s
+    /// had no preview, which on a 300 s window is most of the bar.
+    ///
+    /// Two full rows of the ten-wide grid, so no tile is wasted.
     #[serde(default = "default_thumbnail_frames_per_sheet")]
     pub frames_per_sheet: u32,
     /// Preview frame width in pixels. Range 64-640. Default 160.
@@ -5617,7 +5620,7 @@ fn default_thumbnail_interval_secs() -> u32 {
     2
 }
 fn default_thumbnail_frames_per_sheet() -> u32 {
-    100
+    20
 }
 fn default_thumbnail_width() -> u32 {
     160

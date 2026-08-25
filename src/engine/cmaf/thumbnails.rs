@@ -211,9 +211,14 @@ fn vtt_time(secs: f64) -> String {
 /// Spawn the thumbnail track subscriber.
 ///
 /// `interval` is the capture cadence, `frames_per_sheet` how many are packed
-/// before a sheet is published, and `window_sheets` how many sheets the index
-/// describes before the oldest is dropped — which must match what the origin
-/// still holds, or the index points at evicted objects.
+/// before a sheet is published, and `window` the DVR depth — a sheet is
+/// dropped from the index once its newest frame is older than that.
+///
+/// Pruning by **age** rather than by a sheet count is deliberate. A count has
+/// to be derived from the window, and the arithmetic is easy to get slightly
+/// wrong in the direction that hurts: a list one sheet too long always names
+/// an object the origin has already evicted, so the oldest stretch of the bar
+/// is permanently blank. Age is the thing the origin actually evicts on.
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_thumbnail_track(
     output_id: String,
@@ -223,7 +228,7 @@ pub fn spawn_thumbnail_track(
     spec: CaptureSpec,
     interval: Duration,
     frames_per_sheet: u32,
-    window_sheets: usize,
+    window: Duration,
     stats: Arc<ThumbnailStats>,
     events: EventSender,
     flow_id: String,
@@ -238,7 +243,7 @@ pub fn spawn_thumbnail_track(
         spec,
         interval,
         frames_per_sheet,
-        window_sheets,
+        window,
         stats,
         events,
         flow_id,
@@ -255,7 +260,7 @@ async fn thumbnail_loop(
     spec: CaptureSpec,
     interval: Duration,
     frames_per_sheet: u32,
-    window_sheets: usize,
+    window: Duration,
     stats: Arc<ThumbnailStats>,
     events: EventSender,
     flow_id: String,
@@ -316,7 +321,7 @@ async fn thumbnail_loop(
                         &mut next_sheet,
                         spec,
                         interval,
-                        window_sheets,
+                        window,
                         &stats,
                     )
                     .await;
@@ -359,7 +364,7 @@ async fn publish_sheet(
     next_sheet: &mut u64,
     spec: CaptureSpec,
     interval: Duration,
-    window_sheets: usize,
+    window: Duration,
     stats: &ThumbnailStats,
 ) {
     let frames = std::mem::take(pending);
@@ -414,9 +419,7 @@ async fn publish_sheet(
     // The index must describe only what the origin still holds. A cue naming
     // an evicted sheet is a broken image at exactly the moment the operator
     // is looking for a picture.
-    while sheets.len() > window_sheets {
-        sheets.pop_front();
-    }
+    prune_expired(sheets, Utc::now(), window);
 
     let vtt = render_vtt(sheets.make_contiguous());
     if let Err(e) = http_put(
@@ -428,6 +431,29 @@ async fn publish_sheet(
     .await
     {
         tracing::warn!("CMAF output '{output_id}': thumbnail index PUT failed: {e}");
+    }
+}
+
+/// Drop sheets whose newest frame has aged out of the DVR window.
+pub(crate) fn prune_expired(
+    sheets: &mut VecDeque<SheetRecord>,
+    now: DateTime<Utc>,
+    window: Duration,
+) {
+    let Ok(window) = chrono::Duration::from_std(window) else {
+        return;
+    };
+    while let Some(front) = sheets.front() {
+        let last_frame = front.first_at
+            + chrono::Duration::milliseconds(
+                (front.interval.as_secs_f64() * 1000.0 * (front.frame_count.saturating_sub(1)) as f64)
+                    as i64,
+            );
+        if now - last_frame > window {
+            sheets.pop_front();
+        } else {
+            break;
+        }
     }
 }
 
@@ -535,6 +561,70 @@ mod tests {
             !rolled.contains("thumbs-00000.jpg"),
             "index still names an evicted sheet: {rolled}"
         );
+    }
+
+    /// A sheet must leave the index no later than the origin evicts it.
+    ///
+    /// This was a count derived from the window, and the arithmetic was one
+    /// sheet too generous: 11 sheets of 30 s against a 300 s window meant the
+    /// oldest was always already gone. Measured on the live rig — 11 named,
+    /// 10 present — and the symptom is the oldest stretch of the scrub bar
+    /// permanently blank while the index insists it is covered. Erring the
+    /// other way costs nothing: one sheet of preview dropped slightly early.
+    #[test]
+    fn a_sheet_leaves_the_index_before_the_origin_evicts_it() {
+        let window = Duration::from_secs(300);
+        let mut sheets: VecDeque<SheetRecord> = (0..11)
+            .map(|i| sheet(&format!("thumbs-{i:05}.jpg"), i * 30, 15))
+            .collect();
+
+        // `now` is the moment after the last sheet's final frame.
+        let now = at(10 * 30 + 28);
+        prune_expired(&mut sheets, now, window);
+
+        // The property is about the *object*, not its first frame. A sheet is
+        // stored on the origin when it is published — that is, when its last
+        // frame was captured — and evicted `retention` after that. So its
+        // oldest frame is legitimately older than the window by the sheet's
+        // own span, and asserting on `first_at` here would condemn correct
+        // behaviour.
+        let oldest = sheets.front().expect("some sheets must survive");
+        let last_frame = oldest.first_at
+            + chrono::Duration::seconds(
+                (oldest.interval.as_secs() * (oldest.frame_count - 1) as u64) as i64,
+            );
+        let age = (now - last_frame).num_seconds();
+        assert!(
+            age <= 300,
+            "oldest sheet was published {age}s ago against a 300s window — the origin has it gone"
+        );
+        assert!(sheets.len() >= 9, "pruned far more than the window needed: {}", sheets.len());
+
+        // The boundary itself: a sheet published just past the window must be
+        // gone, and one published just inside must stay. Without a case in
+        // this band, a bound that is merely *close* passes.
+        let mut band: VecDeque<SheetRecord> = vec![
+            sheet("thumbs-00100.jpg", 0, 15),   // published at +28
+            sheet("thumbs-00101.jpg", 30, 15),  // published at +58
+        ]
+        .into();
+        prune_expired(&mut band, at(28 + 301), window);
+        assert_eq!(
+            band.len(),
+            1,
+            "a sheet published 301s ago is still named against a 300s window"
+        );
+        assert_eq!(band.front().unwrap().uri, "thumbs-00101.jpg");
+
+        // Nothing survives a window it is wholly outside of.
+        let mut old: VecDeque<SheetRecord> = vec![sheet("thumbs-00000.jpg", 0, 15)].into();
+        prune_expired(&mut old, at(1000), window);
+        assert!(old.is_empty(), "a sheet an age past the window was kept");
+
+        // And a fresh sheet is never dropped.
+        let mut fresh: VecDeque<SheetRecord> = vec![sheet("thumbs-00042.jpg", 900, 15)].into();
+        prune_expired(&mut fresh, at(928), window);
+        assert_eq!(fresh.len(), 1, "the newest sheet was pruned");
     }
 
     /// No sheets, no index — rather than a header promising cues that are not

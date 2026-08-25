@@ -99,15 +99,12 @@ pub fn spawn_cmaf_output(
     // output it sits beside.
     if let Some(th) = config.thumbnails.clone() {
         let interval = std::time::Duration::from_secs(th.interval_secs as u64);
-        // The index may only describe sheets the origin still holds. Derive
-        // the count from the same window the playlist uses, plus one so the
-        // oldest is dropped a sheet *after* it could still be referenced
-        // rather than a sheet before.
+        // The index may only describe sheets the origin still holds, so it is
+        // bounded by the same window the playlist is.
         let window_secs = config
             .dvr_window_secs
             .unwrap_or(config.max_segments as f64 * config.segment_duration_secs);
-        let secs_per_sheet = (th.interval_secs * th.frames_per_sheet).max(1) as f64;
-        let window_sheets = ((window_secs / secs_per_sheet).ceil() as usize).max(1) + 1;
+        let window = std::time::Duration::from_secs_f64(window_secs.max(1.0));
         thumbnails::spawn_thumbnail_track(
             config.id.clone(),
             config.ingest_url.clone(),
@@ -120,7 +117,7 @@ pub fn spawn_cmaf_output(
             },
             interval,
             th.frames_per_sheet,
-            window_sheets,
+            window,
             Arc::new(thumbnails::ThumbnailStats::default()),
             event_sender.clone(),
             flow_id.clone(),
