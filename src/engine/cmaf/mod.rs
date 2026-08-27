@@ -294,9 +294,10 @@ fn segment_date(
         }
         Some(&held) => {
             tracing::info!(
-                "CMAF flow '{flow_id}': media timeline re-anchored, epoch {} -> {}                  (a source restart or PTS discontinuity, not jitter)",
-                held.to_rfc3339(),
-                implied.to_rfc3339(),
+                flow_id,
+                from = %held.to_rfc3339(),
+                to = %implied.to_rfc3339(),
+                "CMAF: media timeline re-anchored (a source restart or PTS                  discontinuity, not jitter)"
             );
             guard.insert(flow_id.to_string(), implied);
             implied
