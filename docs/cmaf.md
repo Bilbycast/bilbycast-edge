@@ -160,7 +160,7 @@ through a discontinuity with no way to see it. On a 2h30m window that is
 several thousand additions resting on one number. A tag per row costs ~50 bytes
 against a segment of a couple of megabytes.
 
-### The epoch slews, because a media timeline is not a wall clock
+### The epoch is steered, because a media timeline is not a wall clock
 
 Deriving the date from the media timeline removes the jitter, but pins wall
 clock to a single sample. Measured on the demo rig over 16 minutes, the source
@@ -168,48 +168,91 @@ publishes **960.00 s of media in 960.39 s of real time — 407 ppm slow**,
 steadily. Held, that is **3.7 s** of walk in the operator's time-of-day readout
 across a 2h30m session.
 
-So the epoch tracks it: each sample moves it toward the wall clock that sample
-implies, by at most **5 ms per segment**. That covers a source up to 2500 ppm
-out, while no single date moves more than an eighth of a frame — against the
-27-67 ms of noise that re-sampling produced, and monotonic rather than random.
+So the epoch tracks it, through a small control loop with three parts. Each
+matters, and the middle one was learned the hard way.
 
-**Two renditions must still agree exactly**, and slewing threatens that: they
+**Filter the sample.** `implied` — the wall clock this segment's publish time
+suggests for the epoch — carries the publish jitter. It is low-passed into
+`FlowClock::filtered` at a gain of 0.02, roughly a 200 s time constant at 2 s
+segments.
+
+**Steer towards the filtered value, not the raw one.** This is the part that
+was wrong first time round. The correction is a clamp, and publish jitter is
+larger than the clamp, so comparing against the raw sample made the clamp bind
+on nearly every segment: the loop moved its full step toward whichever side
+the noise fell, and only the *imbalance* between those excursions corrected
+the drift. It was chasing noise, and it recovered only about three quarters of
+the error. Filtered first, the clamp bounds how fast the epoch may move rather
+than deciding how far.
+
+**Clamp the step to 5 ms per segment.** That covers a source up to 2500 ppm
+out, while no single date moves more than an eighth of a frame — against the
+27-67 ms of noise that re-sampling the wall clock produced, and monotonic
+rather than random.
+
+**Two renditions must still agree exactly**, and steering threatens that: they
 date the same segment at different instants, so the second would otherwise see
 an epoch that had already moved. `FlowClock` therefore remembers the epoch in
 force for each of the last sixteen segments, and a second caller for the same
 `base_dts_90k` reproduces the first answer rather than recomputing it.
 
 Verified on the rig: renditions **0 ms apart over 41 shared segments**, wander
-within a rendition **5 ms** — the slew bound, by design.
-
-**Measured effect, and what is left.** The same 16-minute rate measurement,
-before and after:
+within a rendition **5 ms** — the clamp, by design.
 
 | | drift | walk across 2h30m |
 |---|---|---|
 | epoch pinned | 407 ppm | 3.7 s |
-| epoch slewing | **102 ppm** | **0.9 s** |
+| clamped against the raw sample | 102 ppm | 0.9 s |
+| filtered, then clamped | **89 ppm** | **0.8 s** |
 
-Not zero, and the reason is worth knowing: the correction is a clamp on a
-noisy error. Publish jitter is larger than the 5 ms bound, so the clamp binds
-on nearly every segment and the controller saturates on noise rather than
-tracking the slow rate error — it moves 5 ms toward whichever side the jitter
-fell, and only the *imbalance* corrects the drift. Filtering `implied` (an
-EWMA) before comparing would let the clamp track the rate instead of the
-noise, and take the residual to near zero.
+**The filter did not deliver what the theory predicted, and that is unresolved.**
+With a gain of 0.02 the filtered estimate should lag the ramp by about 40 ms
+and then track it exactly, leaving the epoch moving at the source's own rate
+and the residual near zero. Measured, it recovers 78 % of the drift and the
+remainder is steady — the lag grew 27, 10, 26 and 22 ms across four
+four-minute intervals, with no sign of converging further. So there is a term
+here that this model does not account for; it has not been chased, because the
+constant below is four times larger and swamps it.
 
-Whether that is worth doing depends on a constant this does not address at
-all. The live edge sits ~1.6 s behind wall clock, which is the pipeline delay:
-the epoch is established from one publish-time sample, so it inherits that
-delay and holds it. The old implementation hid this by *defining* the date as
-publish time — the readout then read ~0 s behind, while claiming the content
-happened when the edge finished writing it rather than when it was captured.
-Neither knows the true capture time without a source clock (PTP, or RTCP
-sender reports). So absolute accuracy is bounded by ~1.6 s regardless, and the
-0.9 s of walk sits inside that.
+If a future source is genuinely clock-locked, the loop simply never has
+anything to do; the clamp only caps how fast it may correct.
 
-If a future source is genuinely clock-locked, the slew simply never has
-anything to do; the bound only caps how fast it may correct.
+#### Testing this: the endpoint is not enough
+
+A tracking test that checks only where the clock ends up **does not fail when
+the loop chases noise**. It still arrives in roughly the right place; it gets
+there by bouncing. Steering from the raw sample survived exactly such a test.
+
+The tell is in the *steps*: raw-sample steering makes consecutive published
+dates differ from a clean segment-length step by the full clamp, every
+segment. Assert that, over a run long enough for the filter to settle, and the
+fault is unmissable.
+
+### What this does *not* fix: the constant
+
+The live edge sits **~1.6 s behind wall clock**. That is pipeline delay, baked
+into the epoch's founding sample and then held. The old implementation hid it
+by *defining* the date as publish time — the readout then showed ~0 s behind
+while claiming the content happened when the edge finished writing it, rather
+than when it was captured.
+
+Neither knows the true capture time, because this input cannot supply it.
+**SRT/MPEG-TS carries no absolute clock**: PCR is relative and there is no
+RTCP sender-report path. So absolute accuracy is bounded by that constant
+whatever the loop does, and the drift figures above sit inside it.
+
+Closing it needs a source of real time. Two exist in principle:
+
+* **Native SDI.** The edge already extracts SMPTE 12M timecode from VANC
+  (bilbycast-edge#59) — but on the `sdi_io` input path, not on an SRT ingest
+  of an SDI feed. A flow taking SDI directly could date segments from the
+  source's own time of day.
+* **A source that embeds time** in the transport — an ID3 or KLV timestamp, or
+  SCTE-35 with a real `pts_adjustment` reference.
+
+Until one of those is wired in, treat the published time of day as accurate to
+about a second in absolute terms, and exact in relative terms — which is what
+the DVR player actually depends on.
 
 This is what lets a browser relate a position on its own timeline to a moment in
 the real world — hls.js zeroes its timeline at whichever fragment it happened to
