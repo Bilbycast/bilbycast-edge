@@ -237,8 +237,31 @@ fn hex_nibble(c: u8) -> Result<u8, String> {
 /// *same* date for the same content, which is what lets a player put a
 /// full-resolution still over a low-resolution picture and land on the frame
 /// it replaced.
-static FLOW_EPOCHS: std::sync::OnceLock<std::sync::Mutex<HashMap<String, chrono::DateTime<chrono::Utc>>>> =
+static FLOW_EPOCHS: std::sync::OnceLock<std::sync::Mutex<HashMap<String, FlowClock>>> =
     std::sync::OnceLock::new();
+
+/// A flow's shared clock: the epoch, plus the epoch that was in force for each
+/// of the last few segments.
+///
+/// The history is what keeps two renditions in exact agreement while the epoch
+/// slews. Both date the same segment, but not at the same instant — one
+/// encoder finishes before the other — so whichever arrives second would
+/// otherwise see an epoch that had already moved on, and publish a date a slew
+/// step away from its sibling. Remembering the epoch *per segment* makes the
+/// second caller reproduce the first one's answer exactly.
+///
+/// A handful of entries is enough: the renditions run within a segment or two
+/// of each other, and anything further behind has bigger problems than a
+/// five-millisecond disagreement.
+struct FlowClock {
+    epoch: chrono::DateTime<chrono::Utc>,
+    /// `(base_dts_90k, epoch used)`, oldest first.
+    recent: VecDeque<(u64, chrono::DateTime<chrono::Utc>)>,
+}
+
+/// How many segments' epochs to remember. Two renditions, a segment or two of
+/// skew, and room to spare.
+const FLOW_CLOCK_HISTORY: usize = 16;
 
 /// How far the implied epoch may move before it is treated as a new timeline
 /// rather than as jitter.
@@ -247,6 +270,24 @@ static FLOW_EPOCHS: std::sync::OnceLock<std::sync::Mutex<HashMap<String, chrono:
 /// discontinuity, or a flow reconfigured under the same id moves it by the
 /// whole elapsed time, so there is a wide gap to sit in.
 const EPOCH_REANCHOR_SECS: f64 = 10.0;
+
+/// The most the epoch may move for any one segment, tracking the source clock.
+///
+/// A media timeline is not a wall clock. Measured on the demo rig, the source
+/// publishes 480.00 s of media in 480.22 s of real time — about 450 ppm slow —
+/// so an epoch pinned once and held drifts 4.1 s across a 2h30m session, and
+/// the operator's time-of-day readout drifts with it.
+///
+/// Holding it is wrong; re-sampling it per segment is what this replaced, and
+/// put ~50 ms of publish jitter into every tag. So slew: move toward what each
+/// sample implies, by at most this much. At 5 ms per 2 s segment the epoch can
+/// track a source up to 2500 ppm out, while no single segment's date moves by
+/// more than an eighth of a frame — far below anything the jitter used to do,
+/// and monotonic rather than noisy.
+///
+/// Both renditions of a flow share the epoch, so they slew together and go on
+/// publishing identical dates.
+const EPOCH_SLEW_SECS: f64 = 0.005;
 
 /// The date to publish for a segment starting at `base_dts_90k`.
 ///
@@ -285,28 +326,41 @@ fn segment_date(
         // A poisoned lock must not take the output down over a timestamp.
         Err(e) => e.into_inner(),
     };
-    let epoch = match guard.get(flow_id) {
-        Some(&held)
-            if (held - implied).num_milliseconds().abs() as f64 / 1000.0
-                <= EPOCH_REANCHOR_SECS =>
-        {
-            held
-        }
-        Some(&held) => {
-            tracing::info!(
-                flow_id,
-                from = %held.to_rfc3339(),
-                to = %implied.to_rfc3339(),
-                "CMAF: media timeline re-anchored (a source restart or PTS                  discontinuity, not jitter)"
-            );
-            guard.insert(flow_id.to_string(), implied);
-            implied
-        }
-        None => {
-            guard.insert(flow_id.to_string(), implied);
-            implied
-        }
-    };
+    let clock = guard.entry(flow_id.to_string()).or_insert_with(|| FlowClock {
+        epoch: implied,
+        recent: VecDeque::new(),
+    });
+
+    // This segment already dated by the other rendition: reproduce that answer
+    // exactly rather than dating it against an epoch that has since slewed.
+    if let Some((_, was)) = clock.recent.iter().find(|(d, _)| *d == base_dts_90k) {
+        return *was + secs(media_secs);
+    }
+
+    let off = (clock.epoch - implied).num_milliseconds().abs() as f64 / 1000.0;
+    if off > EPOCH_REANCHOR_SECS {
+        tracing::info!(
+            flow_id,
+            from = %clock.epoch.to_rfc3339(),
+            to = %implied.to_rfc3339(),
+            "CMAF: media timeline re-anchored (a source restart or PTS discontinuity, not jitter)"
+        );
+        clock.epoch = implied;
+        clock.recent.clear();
+    } else {
+        // Track the source clock rather than pinning to the first sample — see
+        // `EPOCH_SLEW_SECS`. Bounded, so publish jitter moves the date by a
+        // fraction of what taking the sample at face value would.
+        let err = (implied - clock.epoch).num_nanoseconds().unwrap_or(0) as f64 / 1e9;
+        let step = err.clamp(-EPOCH_SLEW_SECS, EPOCH_SLEW_SECS);
+        clock.epoch += chrono::Duration::nanoseconds((step * 1e9) as i64);
+    }
+
+    let epoch = clock.epoch;
+    clock.recent.push_back((base_dts_90k, epoch));
+    while clock.recent.len() > FLOW_CLOCK_HISTORY {
+        clock.recent.pop_front();
+    }
     epoch + secs(media_secs)
 }
 
@@ -2154,14 +2208,27 @@ mod date_tests {
         // The proxy closes the same content 45 ms later, as measured.
         let b = segment_date(flow, 900_000, 2.0, ts("2026-08-27T00:00:10.045Z"));
         assert_eq!(a, b, "two renditions disagree about the same content");
+        // Exactly, not nearly — and it has to stay exact while the epoch
+        // slews to track the source clock, which is why the epoch in force for
+        // each segment is remembered rather than recomputed.
+        for later in [
+            "2026-08-27T00:00:10.200Z",
+            "2026-08-27T00:00:11.900Z",
+        ] {
+            assert_eq!(
+                segment_date(flow, 900_000, 2.0, ts(later)),
+                a,
+                "the same content was dated differently once the epoch moved"
+            );
+        }
 
-        // And a later segment is derived, not re-sampled: 2 s of media is
-        // exactly 2 s of clock however late the publish happened to be.
+        // And a later segment is derived, not re-sampled: 2 s of media is 2 s
+        // of clock, give or take the bounded slew that tracks the source.
         let later = segment_date(flow, 900_000 + 180_000, 2.0, ts("2026-08-27T00:00:12.400Z"));
-        assert_eq!(
-            (later - a).num_milliseconds(),
-            2000,
-            "the published clock does not advance with the media timeline"
+        let step = (later - a).num_milliseconds();
+        assert!(
+            (2000 - step).abs() <= (EPOCH_SLEW_SECS * 1000.0) as i64,
+            "the published clock does not advance with the media timeline: {step}ms"
         );
     }
 
@@ -2172,12 +2239,62 @@ mod date_tests {
     /// the proxy — and because only one date was written per playlist, that
     /// wander moved the entire derived window every time it slid.
     #[test]
-    fn a_late_publish_does_not_move_the_clock() {
+    fn a_late_publish_barely_moves_the_clock() {
         let flow = "flow-jitter";
-        let first = segment_date(flow, 0, 2.0, ts("2026-08-27T00:00:02.000Z"));
-        // Same media position, published a quarter of a second late.
-        let late = segment_date(flow, 0, 2.0, ts("2026-08-27T00:00:02.250Z"));
-        assert_eq!(first, late, "publish jitter reached the published date");
+        // The same segment, dated twice, is the *other* rendition arriving —
+        // it must reproduce the first answer exactly. That is asserted
+        // elsewhere; here the question is what publish jitter does to the
+        // spacing of consecutive segments.
+        let base = ts("2026-08-27T00:00:00.000Z");
+        let mut prev = None;
+        let mut worst = 0i64;
+        // Publish on time, then 250 ms late, then early, then on time again.
+        for (i, jitter_ms) in [0i64, 250, -120, 0, 300].into_iter().enumerate() {
+            let wall = base
+                + chrono::Duration::milliseconds((i as i64 + 1) * 2000 + jitter_ms);
+            let got = segment_date(flow, i as u64 * 180_000, 2.0, wall);
+            if let Some(p) = prev {
+                let step: chrono::TimeDelta = got - p;
+                worst = worst.max((step.num_milliseconds() - 2000).abs());
+            }
+            prev = Some(got);
+        }
+        // Taken at face value those samples would move the date by up to
+        // 370 ms between segments — which is what put ~50 ms of noise into
+        // every tag on the rig and left the renditions disagreeing.
+        assert!(
+            worst <= (EPOCH_SLEW_SECS * 1000.0) as i64,
+            "publish jitter reached the published date: {worst}ms off a 2 s step"
+        );
+    }
+
+    /// The epoch tracks a source clock that is not a wall clock.
+    ///
+    /// Measured on the demo rig: 480.00 s of media published in 480.22 s of
+    /// real time, about 450 ppm slow. Pinned to its first sample the epoch
+    /// would drift 4.1 s across a 2h30m session, and the operator's
+    /// time-of-day readout with it.
+    #[test]
+    fn the_epoch_tracks_a_slow_source_clock() {
+        let flow = "flow-slow";
+        // 450 ppm: each 2 s segment is published 0.9 ms later than the last.
+        let base = ts("2026-08-27T00:00:00.000Z");
+        let mut last = None;
+        for i in 0..600u64 {
+            let media = i * 180_000; // 2 s in 90 kHz
+            let wall = base
+                + chrono::Duration::milliseconds((i as i64 + 1) * 2000)
+                + chrono::Duration::microseconds(i as i64 * 900);
+            last = Some(segment_date(flow, media, 2.0, wall));
+        }
+        // After twenty minutes of media the published date must still be close
+        // to the wall clock the samples implied, not 0.54 s behind it.
+        let want = base + chrono::Duration::milliseconds(599 * 2000 + 540);
+        let drift = (last.unwrap() - want).num_milliseconds().abs();
+        assert!(
+            drift < 50,
+            "the epoch did not track the source: {drift}ms adrift after 20 minutes"
+        );
     }
 
     /// A source restart is re-anchored rather than absorbed.
