@@ -182,6 +182,32 @@ force for each of the last sixteen segments, and a second caller for the same
 Verified on the rig: renditions **0 ms apart over 41 shared segments**, wander
 within a rendition **5 ms** — the slew bound, by design.
 
+**Measured effect, and what is left.** The same 16-minute rate measurement,
+before and after:
+
+| | drift | walk across 2h30m |
+|---|---|---|
+| epoch pinned | 407 ppm | 3.7 s |
+| epoch slewing | **102 ppm** | **0.9 s** |
+
+Not zero, and the reason is worth knowing: the correction is a clamp on a
+noisy error. Publish jitter is larger than the 5 ms bound, so the clamp binds
+on nearly every segment and the controller saturates on noise rather than
+tracking the slow rate error — it moves 5 ms toward whichever side the jitter
+fell, and only the *imbalance* corrects the drift. Filtering `implied` (an
+EWMA) before comparing would let the clamp track the rate instead of the
+noise, and take the residual to near zero.
+
+Whether that is worth doing depends on a constant this does not address at
+all. The live edge sits ~1.6 s behind wall clock, which is the pipeline delay:
+the epoch is established from one publish-time sample, so it inherits that
+delay and holds it. The old implementation hid this by *defining* the date as
+publish time — the readout then read ~0 s behind, while claiming the content
+happened when the edge finished writing it rather than when it was captured.
+Neither knows the true capture time without a source clock (PTP, or RTCP
+sender reports). So absolute accuracy is bounded by ~1.6 s regardless, and the
+0.9 s of walk sits inside that.
+
 If a future source is genuinely clock-locked, the slew simply never has
 anything to do; the bound only caps how fast it may correct.
 
