@@ -160,12 +160,30 @@ through a discontinuity with no way to see it. On a 2h30m window that is
 several thousand additions resting on one number. A tag per row costs ~50 bytes
 against a segment of a couple of megabytes.
 
-**The trade this makes.** Re-sampling the wall clock kept the published time
-pinned to it. Deriving from the media timeline pins them together only once, so
-a source clock running fast or slow walks the published time away from real
-time over a session. At 10 ppm that is 90 ms across 2h30m and invisible; at
-1000 ppm it is 9 s and is not. Worth measuring on a free-running source: the
-live edge's distance from `now` should not change over a long session.
+### The epoch slews, because a media timeline is not a wall clock
+
+Deriving the date from the media timeline removes the jitter, but pins wall
+clock to a single sample. Measured on the demo rig over 16 minutes, the source
+publishes **960.00 s of media in 960.39 s of real time — 407 ppm slow**,
+steadily. Held, that is **3.7 s** of walk in the operator's time-of-day readout
+across a 2h30m session.
+
+So the epoch tracks it: each sample moves it toward the wall clock that sample
+implies, by at most **5 ms per segment**. That covers a source up to 2500 ppm
+out, while no single date moves more than an eighth of a frame — against the
+27-67 ms of noise that re-sampling produced, and monotonic rather than random.
+
+**Two renditions must still agree exactly**, and slewing threatens that: they
+date the same segment at different instants, so the second would otherwise see
+an epoch that had already moved. `FlowClock` therefore remembers the epoch in
+force for each of the last sixteen segments, and a second caller for the same
+`base_dts_90k` reproduces the first answer rather than recomputing it.
+
+Verified on the rig: renditions **0 ms apart over 41 shared segments**, wander
+within a rendition **5 ms** — the slew bound, by design.
+
+If a future source is genuinely clock-locked, the slew simply never has
+anything to do; the bound only caps how fast it may correct.
 
 This is what lets a browser relate a position on its own timeline to a moment in
 the real world — hls.js zeroes its timeline at whichever fragment it happened to
