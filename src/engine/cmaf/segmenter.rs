@@ -236,6 +236,15 @@ impl VideoSegmenter {
         self.next_seq
     }
 
+    /// 90 kHz DTS the currently-open segment starts at, if one is open.
+    ///
+    /// The low-latency path advertises a segment while it is still being
+    /// written, so it needs the segment's position on the media timeline
+    /// before `CompletedSegment` exists to carry it.
+    pub fn open_segment_base_dts_90k(&self) -> Option<u64> {
+        self.segment_base_dts
+    }
+
     /// LL-CMAF: take *a subset* of the pending samples that span at
     /// least `chunk_duration_90k` ticks from the current chunk anchor,
     /// and rebuild them as a standalone moof+mdat chunk. Returns the

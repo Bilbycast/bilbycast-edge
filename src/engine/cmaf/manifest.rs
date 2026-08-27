@@ -95,15 +95,6 @@ pub fn build_hls_playlist(
     // derives its seekable range from `EVENT`) will seek to segments the
     // origin has already dropped. Omitting the tag is the correct signal
     // for a live sliding window.
-    // Absolute time for the window. One row is enough -- a player derives
-    // every later segment by accumulating `EXTINF` -- and it must describe
-    // whichever segment is *currently* first.
-    if let Some(pdt) = entries.first().and_then(|e| e.program_date_time) {
-        out.push_str(&format!(
-            "#EXT-X-PROGRAM-DATE-TIME:{}\n",
-            pdt.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
-        ));
-    }
     out.push_str(&format!("#EXT-X-MAP:URI=\"{init_uri}\"\n"));
     out.push_str("#EXT-X-INDEPENDENT-SEGMENTS\n");
     if let Some(ll) = ll_hints {
@@ -124,11 +115,31 @@ pub fn build_hls_playlist(
         ));
     }
 
+    // Absolute time on **every** segment, rather than once at the head.
+    //
+    // One row is spec-legal, and a player derives the rest by accumulating
+    // `EXTINF`. But then the whole window rests on a single value — the one
+    // belonging to whichever segment is currently first — so the derived
+    // timeline shifts every time the window slides and that row is replaced.
+    // It also leaves a consumer no way to notice a discontinuity: it simply
+    // accumulates through it. On a 2h30m window that is several thousand
+    // additions resting on one number.
+    //
+    // Affordable: about 50 bytes against a segment of a couple of megabytes.
+    // And now that the dates come from the media timeline rather than from
+    // `Utc::now()` at publish, each row is an independent statement about its
+    // own segment rather than the same sample restated.
     for e in entries {
         let uri = e
             .uri
             .clone()
             .unwrap_or_else(|| default_segment_uri(e.sequence_number));
+        if let Some(pdt) = e.program_date_time {
+            out.push_str(&format!(
+                "#EXT-X-PROGRAM-DATE-TIME:{}\n",
+                pdt.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+            ));
+        }
         out.push_str(&format!("#EXTINF:{:.3},\n{uri}\n", e.duration_secs));
     }
 
@@ -461,9 +472,61 @@ mod tests {
             "still dating the window from a segment that is no longer in it"
         );
 
-        // Exactly one row: a player derives the rest from EXTINF, and two
-        // disagreeing anchors is worse than none.
-        assert_eq!(p.matches("#EXT-X-PROGRAM-DATE-TIME").count(), 1, "{p}");
+        // One row per segment, not one for the window.
+        //
+        // This asserted exactly one row, on the reasoning that a player
+        // derives the rest from `EXTINF` and two anchors could disagree. They
+        // cannot disagree any more: the dates come from the media timeline
+        // through a per-flow epoch, so every row is the same statement made
+        // independently rather than a second sample of a wall clock.
+        //
+        // And one row is actively harmful on a long window: the whole
+        // timeline hangs off whichever segment is currently first, so it
+        // shifts every time the window slides, and a consumer accumulates
+        // straight through any discontinuity without being able to see it.
+        assert_eq!(
+            p.matches("#EXT-X-PROGRAM-DATE-TIME").count(),
+            all.len(),
+            "expected a date on every segment: {p}"
+        );
+        // Each one describes its own segment.
+        assert!(
+            p.contains("#EXT-X-PROGRAM-DATE-TIME:2026-08-25T01:00:02.000Z")
+                && p.contains("#EXT-X-PROGRAM-DATE-TIME:2026-08-25T01:00:04.000Z"),
+            "later segments are not dated from their own position: {p}"
+        );
+        // A date belongs immediately before the segment it describes, or it
+        // describes the one before.
+        for stamp in ["01:00:00.000Z", "01:00:02.000Z", "01:00:04.000Z"] {
+            let at = p.find(stamp).expect("stamp present");
+            let after = &p[at..];
+            assert!(
+                after.find("#EXTINF").unwrap_or(usize::MAX)
+                    < after.find("#EXT-X-PROGRAM-DATE-TIME:").unwrap_or(usize::MAX),
+                "a date is not followed by the segment it describes: {p}"
+            );
+        }
+    }
+
+    /// A segment with no date of its own does not borrow its neighbour's.
+    ///
+    /// With a tag per segment, an undated row simply has none — the player
+    /// falls back to accumulating `EXTINF` from the last dated one, which is
+    /// what it did for the whole playlist before. Emitting a neighbour's date
+    /// against it would be an invented time that reads as authoritative.
+    #[test]
+    fn an_undated_segment_is_left_undated() {
+        let mixed = [
+            dated_entry(10, 2.0, "2026-08-25T01:00:00Z"),
+            simple_entry(11, 2.0),
+            dated_entry(12, 2.0, "2026-08-25T01:00:04Z"),
+        ];
+        let p = build_hls_playlist(2.0, &mixed, "init.mp4", None);
+        assert_eq!(
+            p.matches("#EXT-X-PROGRAM-DATE-TIME").count(),
+            2,
+            "an undated segment was given a date: {p}"
+        );
     }
 
     /// No clock, no tag. An invented one would be believed.

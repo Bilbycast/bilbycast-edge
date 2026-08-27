@@ -39,7 +39,7 @@ mod segmenter;
 mod thumbnails;
 mod upload;
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::SystemTime;
@@ -228,6 +228,87 @@ fn hex_nibble(c: u8) -> Result<u8, String> {
 }
 
 /// Mid-loop output state.
+/// Wall clock corresponding to source PTS 0, per flow.
+///
+/// Keyed on the **flow**, not the output, and that is the point: two
+/// renditions of one source are two CMAF outputs of one flow, they see the
+/// same RTP packets, and `PtsUnwrap` does not rebase — so `base_dts_90k` is
+/// the same number in both. Given one shared epoch they therefore publish the
+/// *same* date for the same content, which is what lets a player put a
+/// full-resolution still over a low-resolution picture and land on the frame
+/// it replaced.
+static FLOW_EPOCHS: std::sync::OnceLock<std::sync::Mutex<HashMap<String, chrono::DateTime<chrono::Utc>>>> =
+    std::sync::OnceLock::new();
+
+/// How far the implied epoch may move before it is treated as a new timeline
+/// rather than as jitter.
+///
+/// Scheduling noise is tens of milliseconds. A source restart, a PTS
+/// discontinuity, or a flow reconfigured under the same id moves it by the
+/// whole elapsed time, so there is a wide gap to sit in.
+const EPOCH_REANCHOR_SECS: f64 = 10.0;
+
+/// The date to publish for a segment starting at `base_dts_90k`.
+///
+/// This used to be `Utc::now() - segment_duration`, sampled afresh for every
+/// segment. That records when the edge got round to closing the segment, not
+/// when the content happened, and it made the tag carry the scheduling and
+/// pipeline delay between the two. Because only one date is written per
+/// playlist — for whichever segment is currently first — that sample also
+/// anchored the entire window, and was re-taken every time the window slid.
+///
+/// Measured on the demo rig before this change: each rendition's head date
+/// wandered 27 ms (main) and 67 ms (proxy) against a steady clock, and the two
+/// renditions placed the same segment 31-81 ms apart, moving ~50 ms from one
+/// sample to the next. At 25 fps that is a picture that lands one to two
+/// frames from where it was asked for, differently each time.
+///
+/// Now the media timeline decides, and wall clock is consulted exactly once
+/// per flow to place it. `now` is passed in so the arithmetic can be tested
+/// without a clock.
+fn segment_date(
+    flow_id: &str,
+    base_dts_90k: u64,
+    seg_secs: f64,
+    now: chrono::DateTime<chrono::Utc>,
+) -> chrono::DateTime<chrono::Utc> {
+    let media_secs = base_dts_90k as f64 / 90_000.0;
+    let secs = |d: f64| chrono::Duration::nanoseconds((d * 1e9) as i64);
+    // What this sample says the epoch is: the segment closed about now, so its
+    // first sample was `seg_secs` ago, and that sample sits `media_secs` into
+    // the timeline.
+    let implied = now - secs(seg_secs) - secs(media_secs);
+
+    let map = FLOW_EPOCHS.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
+    let mut guard = match map.lock() {
+        Ok(g) => g,
+        // A poisoned lock must not take the output down over a timestamp.
+        Err(e) => e.into_inner(),
+    };
+    let epoch = match guard.get(flow_id) {
+        Some(&held)
+            if (held - implied).num_milliseconds().abs() as f64 / 1000.0
+                <= EPOCH_REANCHOR_SECS =>
+        {
+            held
+        }
+        Some(&held) => {
+            tracing::info!(
+                "CMAF flow '{flow_id}': media timeline re-anchored, epoch {} -> {}                  (a source restart or PTS discontinuity, not jitter)",
+                held.to_rfc3339(),
+                implied.to_rfc3339(),
+            );
+            guard.insert(flow_id.to_string(), implied);
+            implied
+        }
+        None => {
+            guard.insert(flow_id.to_string(), implied);
+            implied
+        }
+    };
+    epoch + secs(media_secs)
+}
+
 struct CmafState {
     video_seg: Option<VideoSegmenter>,
     audio_seg: Option<AudioSegmenter>,
@@ -312,9 +393,12 @@ struct LlSegment {
     chunks_emitted: u32,
     /// Parts advertised on the current manifest for this segment.
     parts: Vec<HlsPartEntry>,
-    /// Wall clock when this segment opened, so the row it contributes to the
-    /// playlist can carry a `#EXT-X-PROGRAM-DATE-TIME` like a closed one.
-    started_at: chrono::DateTime<chrono::Utc>,
+    /// 90 kHz DTS this segment starts at, so the row it contributes to the
+    /// playlist is dated off the media timeline exactly as a closed segment
+    /// is. It used to hold the wall clock at which the segment opened, which
+    /// made the in-progress row disagree with every row around it by whatever
+    /// the pipeline delay happened to be at that instant.
+    base_dts_90k: u64,
     /// The filename this segment is being uploaded under.
     uri: String,
 }
@@ -1049,12 +1133,17 @@ async fn handle_video(
             duration_secs: seg_secs,
             uri: Some(uri),
             parts: Vec::new(),
-            // The segment has just closed, so its first sample is `now` less
-            // its own duration. Good to a scheduling jitter, which is orders
-            // below the second a scrub preview needs.
-            program_date_time: Some(
-                chrono::Utc::now() - chrono::Duration::nanoseconds((seg_secs * 1e9) as i64),
-            ),
+            // From the media timeline, through the flow's shared epoch — see
+            // `segment_date`. Sampling the wall clock here instead put the
+            // scheduling and pipeline delay into the tag, and because only one
+            // date is written per playlist it anchored the whole window on
+            // that one sample.
+            program_date_time: Some(segment_date(
+                flow_id,
+                seg.base_dts_90k,
+                seg_secs,
+                chrono::Utc::now(),
+            )),
         });
         let window = config.playlist_window_segments();
         while state.playlist.len() > window {
@@ -1688,6 +1777,7 @@ async fn handle_ll_cmaf(
         if let Some(ll) = state.ll_current.take() {
             let uri = ll.uri.clone();
             let seq = ll.sequence_number;
+            let base_dts_90k = ll.base_dts_90k;
             let finish = ll.handle.finish().await;
             match finish {
                 Ok(()) => {
@@ -1716,12 +1806,12 @@ async fn handle_ll_cmaf(
                 duration_secs: config.segment_duration_secs,
                 uri: Some(uri),
                 parts: Vec::new(),
-                program_date_time: Some(
-                    chrono::Utc::now()
-                        - chrono::Duration::nanoseconds(
-                            (config.segment_duration_secs * 1e9) as i64,
-                        ),
-                ),
+                program_date_time: Some(segment_date(
+                    flow_id,
+                    base_dts_90k,
+                    config.segment_duration_secs,
+                    chrono::Utc::now(),
+                )),
             });
             let window = config.playlist_window_segments();
             while state.playlist.len() > window {
@@ -1744,7 +1834,7 @@ async fn handle_ll_cmaf(
                 sequence_number: seq,
                 chunks_emitted: 0,
                 parts: Vec::new(),
-                started_at: chrono::Utc::now(),
+                base_dts_90k: vs.open_segment_base_dts_90k().unwrap_or(0),
                 uri,
             });
             if state.availability_start_unix == 0 {
@@ -1911,7 +2001,12 @@ async fn publish_ll_hls(
             duration_secs: config.segment_duration_secs,
             uri: Some(ll.uri.clone()),
             parts: ll.parts.clone(),
-            program_date_time: Some(ll.started_at),
+            program_date_time: Some(segment_date(
+                flow_id,
+                ll.base_dts_90k,
+                config.segment_duration_secs,
+                chrono::Utc::now(),
+            )),
         });
     }
     let hints = LowLatencyHints {
@@ -2027,4 +2122,90 @@ async fn publish_manifests(
                 );
             }
         }
+}
+
+#[cfg(test)]
+mod date_tests {
+    use super::*;
+
+    fn ts(s: &str) -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&chrono::Utc)
+    }
+
+    /// Two renditions of one source publish the *same* date for the same
+    /// content.
+    ///
+    /// This is the whole point of keying the epoch on the flow. The two are
+    /// separate CMAF outputs with separate encoders and separate scheduling,
+    /// so their `Utc::now()` calls land at different instants — 31-81 ms
+    /// apart, measured, moving ~50 ms between samples. `PtsUnwrap` does not
+    /// rebase, so `base_dts_90k` is the same number in both, and one shared
+    /// epoch makes the published dates identical.
+    ///
+    /// The player relates the two renditions through these dates in order to
+    /// put a full-resolution still over a low-resolution picture. Any
+    /// disagreement here is a still that lands on a different frame.
+    #[test]
+    fn two_renditions_of_one_flow_date_the_same_content_identically() {
+        let flow = "flow-identical";
+        // The main rendition closes its segment first.
+        let a = segment_date(flow, 900_000, 2.0, ts("2026-08-27T00:00:10.000Z"));
+        // The proxy closes the same content 45 ms later, as measured.
+        let b = segment_date(flow, 900_000, 2.0, ts("2026-08-27T00:00:10.045Z"));
+        assert_eq!(a, b, "two renditions disagree about the same content");
+
+        // And a later segment is derived, not re-sampled: 2 s of media is
+        // exactly 2 s of clock however late the publish happened to be.
+        let later = segment_date(flow, 900_000 + 180_000, 2.0, ts("2026-08-27T00:00:12.400Z"));
+        assert_eq!(
+            (later - a).num_milliseconds(),
+            2000,
+            "the published clock does not advance with the media timeline"
+        );
+    }
+
+    /// Publish jitter does not reach the tag.
+    ///
+    /// Before this, every segment sampled `Utc::now()`, so each rendition's
+    /// head date wandered against a steady clock — 27 ms on main, 67 ms on
+    /// the proxy — and because only one date was written per playlist, that
+    /// wander moved the entire derived window every time it slid.
+    #[test]
+    fn a_late_publish_does_not_move_the_clock() {
+        let flow = "flow-jitter";
+        let first = segment_date(flow, 0, 2.0, ts("2026-08-27T00:00:02.000Z"));
+        // Same media position, published a quarter of a second late.
+        let late = segment_date(flow, 0, 2.0, ts("2026-08-27T00:00:02.250Z"));
+        assert_eq!(first, late, "publish jitter reached the published date");
+    }
+
+    /// A source restart is re-anchored rather than absorbed.
+    ///
+    /// Jitter is tens of milliseconds; a restart or a PTS discontinuity moves
+    /// the implied epoch by the whole elapsed time. Holding the old epoch
+    /// through that would date every later segment hours out, silently.
+    #[test]
+    fn a_restarted_timeline_re_anchors() {
+        let flow = "flow-restart";
+        let before = segment_date(flow, 900_000, 2.0, ts("2026-08-27T00:00:12.000Z"));
+        // The source restarts: PTS back near zero, wall clock much later.
+        let after = segment_date(flow, 0, 2.0, ts("2026-08-27T01:00:00.000Z"));
+        assert!(
+            (after - before).num_minutes() >= 59,
+            "a restarted source was dated from the old epoch: {before} -> {after}"
+        );
+        assert_eq!(
+            after,
+            ts("2026-08-27T00:59:58.000Z"),
+            "re-anchoring did not use the new sample"
+        );
+    }
+
+    /// Flows do not share an epoch with each other.
+    #[test]
+    fn separate_flows_keep_separate_epochs() {
+        let a = segment_date("flow-a", 0, 2.0, ts("2026-08-27T00:00:02.000Z"));
+        let b = segment_date("flow-b", 0, 2.0, ts("2026-08-27T05:00:02.000Z"));
+        assert_ne!(a, b, "two flows were given one epoch");
+    }
 }
