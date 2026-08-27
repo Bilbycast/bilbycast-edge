@@ -116,14 +116,56 @@ hls.js computed a seekable range that included segments already dropped.
 
 ## Absolute time on the playlist (`#EXT-X-PROGRAM-DATE-TIME`)
 
-Each playlist row carries the wall clock of its own first sample, and the writer
-emits one `#EXT-X-PROGRAM-DATE-TIME` for whichever row is **currently first**.
+Each playlist row carries the wall clock of its own first sample, and **every**
+row emits its own `#EXT-X-PROGRAM-DATE-TIME`.
 
 The clock is per row rather than once per stream on purpose. The playlist is a
 rolling window: the first row changes as the oldest are trimmed, and a tag
 anchored to when the *stream* started would go on naming a segment that is no
 longer listed, with the error growing without bound for as long as the session
 runs. Nothing would report it.
+
+### The date comes from the media timeline, not from the clock at publish
+
+`program_date_time` was `Utc::now() - segment_duration`, sampled as each
+segment closed. That records when the edge got round to writing the segment,
+not when the content happened, so the tag carried whatever scheduling and
+pipeline delay sat between the two.
+
+It is derived now: `seg.base_dts_90k` — the source's own 90 kHz PTS, which
+`PtsUnwrap` does not rebase — placed against a wall-clock epoch consulted
+**once per flow**. `FLOW_EPOCHS` is keyed on the flow rather than the output
+precisely so that two renditions of one source, which see the same RTP packets
+and therefore the same `base_dts_90k`, publish *identical* dates. A sample
+implying an epoch more than ten seconds from the held one is a source restart
+or a PTS discontinuity rather than jitter, so it re-anchors and logs.
+
+Measured on the demo rig, before and after:
+
+| | before | after |
+|---|---|---|
+| wander within a rendition | 27 ms (main), 67 ms (proxy) | **0 ms** over 96 segments |
+| same segment, the two renditions apart | 31–81 ms, moving ~50 ms per sample | **0 ms** over 96 segments |
+
+Why it mattered: ~68 ms is 1.7 frames at 25 fps, and the DVR player relates its
+two renditions through these dates in order to lay a full-resolution still over
+a low-resolution picture. The still measured two frames late, differently each
+time — which a viewer describes as the picture jumping to a different moment.
+
+**One tag was also not enough.** It is spec-legal, and a player derives the
+rest by accumulating `EXTINF` — but that hangs the whole window off a value
+belonging to whichever segment is currently first, so the derived timeline
+shifts every time the window slides, and a consumer accumulates straight
+through a discontinuity with no way to see it. On a 2h30m window that is
+several thousand additions resting on one number. A tag per row costs ~50 bytes
+against a segment of a couple of megabytes.
+
+**The trade this makes.** Re-sampling the wall clock kept the published time
+pinned to it. Deriving from the media timeline pins them together only once, so
+a source clock running fast or slow walks the published time away from real
+time over a session. At 10 ppm that is 90 ms across 2h30m and invisible; at
+1000 ppm it is 9 s and is not. Worth measuring on a free-running source: the
+live edge's distance from `now` should not change over a long session.
 
 This is what lets a browser relate a position on its own timeline to a moment in
 the real world — hls.js zeroes its timeline at whichever fragment it happened to
