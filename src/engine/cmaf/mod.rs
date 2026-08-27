@@ -255,6 +255,9 @@ static FLOW_EPOCHS: std::sync::OnceLock<std::sync::Mutex<HashMap<String, FlowClo
 /// five-millisecond disagreement.
 struct FlowClock {
     epoch: chrono::DateTime<chrono::Utc>,
+    /// Low-passed estimate of the wall clock the samples imply, which is what
+    /// the epoch is steered towards. See [`EPOCH_FILTER_GAIN`].
+    filtered: chrono::DateTime<chrono::Utc>,
     /// `(base_dts_90k, epoch used)`, oldest first.
     recent: VecDeque<(u64, chrono::DateTime<chrono::Utc>)>,
 }
@@ -288,6 +291,20 @@ const EPOCH_REANCHOR_SECS: f64 = 10.0;
 /// Both renditions of a flow share the epoch, so they slew together and go on
 /// publishing identical dates.
 const EPOCH_SLEW_SECS: f64 = 0.005;
+
+/// How much of each new sample the filtered estimate takes.
+///
+/// The slew above is a clamp on an error, and publish jitter is larger than
+/// the clamp — so it bound on nearly every segment and the loop saturated on
+/// noise instead of tracking the rate. It moved 5 ms toward whichever side the
+/// jitter happened to fall, and only the *imbalance* corrected the drift:
+/// measured, 407 ppm became 102 ppm rather than nothing.
+///
+/// So filter first and correct against the filtered value. At 0.02 with 2 s
+/// segments the estimate has a time constant of about 200 s, which takes the
+/// jitter well below the clamp and leaves the clamp free to do what it is for
+/// — bounding how fast the epoch may move, not deciding how far.
+const EPOCH_FILTER_GAIN: f64 = 0.02;
 
 /// The date to publish for a segment starting at `base_dts_90k`.
 ///
@@ -328,6 +345,7 @@ fn segment_date(
     };
     let clock = guard.entry(flow_id.to_string()).or_insert_with(|| FlowClock {
         epoch: implied,
+        filtered: implied,
         recent: VecDeque::new(),
     });
 
@@ -346,12 +364,20 @@ fn segment_date(
             "CMAF: media timeline re-anchored (a source restart or PTS discontinuity, not jitter)"
         );
         clock.epoch = implied;
+        clock.filtered = implied;
         clock.recent.clear();
     } else {
+        // Filter, then steer towards the filtered value — see
+        // `EPOCH_FILTER_GAIN`. Comparing against the raw sample let publish
+        // jitter saturate the clamp, so the loop chased noise instead of the
+        // rate.
+        let raw = (implied - clock.filtered).num_nanoseconds().unwrap_or(0) as f64 / 1e9;
+        clock.filtered +=
+            chrono::Duration::nanoseconds((raw * EPOCH_FILTER_GAIN * 1e9) as i64);
+
         // Track the source clock rather than pinning to the first sample — see
-        // `EPOCH_SLEW_SECS`. Bounded, so publish jitter moves the date by a
-        // fraction of what taking the sample at face value would.
-        let err = (implied - clock.epoch).num_nanoseconds().unwrap_or(0) as f64 / 1e9;
+        // `EPOCH_SLEW_SECS`. Bounded, so no one segment's date moves far.
+        let err = (clock.filtered - clock.epoch).num_nanoseconds().unwrap_or(0) as f64 / 1e9;
         let step = err.clamp(-EPOCH_SLEW_SECS, EPOCH_SLEW_SECS);
         clock.epoch += chrono::Duration::nanoseconds((step * 1e9) as i64);
     }
@@ -2316,6 +2342,62 @@ mod date_tests {
             after,
             ts("2026-08-27T00:59:58.000Z"),
             "re-anchoring did not use the new sample"
+        );
+    }
+
+    /// The clock still tracks the source when the samples are noisy.
+    ///
+    /// This is the case the plain clamp could not handle. Publish jitter is
+    /// larger than the 5 ms bound, so the clamp bound on nearly every segment
+    /// and the loop moved 5 ms toward whichever side the noise fell — only the
+    /// imbalance corrected the drift. Measured on the rig, that left 102 ppm
+    /// of the original 407, or 0.9 s of walk across a 2h30m session.
+    ///
+    /// With the sample filtered first, the clamp bounds how fast the epoch may
+    /// move rather than deciding how far, and the loop tracks the rate.
+    #[test]
+    fn the_epoch_tracks_a_slow_source_through_publish_jitter() {
+        let flow = "flow-noisy";
+        let base = ts("2026-08-27T00:00:00.000Z");
+        // 450 ppm slow, plus ±30 ms of publish jitter — deterministic, so a
+        // failure is reproducible rather than a bad afternoon.
+        let mut rng: u64 = 0x9E3779B97F4A7C15;
+        let mut last: Option<chrono::DateTime<chrono::Utc>> = None;
+        // How far each published date sits from a clean 2 s step. This is what
+        // separates a loop that tracks from one that chases noise: correcting
+        // against the raw sample makes the clamp bind either way each segment,
+        // so the dates jitter by the bound while still arriving in roughly the
+        // right place. The endpoint alone cannot see that.
+        let mut worst_step_err = 0i64;
+        for i in 0..900u64 {
+            rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            let jitter_ms = ((rng >> 33) % 61) as i64 - 30;
+            let wall = base
+                + chrono::Duration::milliseconds((i as i64 + 1) * 2000)
+                + chrono::Duration::microseconds(i as i64 * 900)
+                + chrono::Duration::milliseconds(jitter_ms);
+            let got = segment_date(flow, i * 180_000, 2.0, wall);
+            if let Some(prev) = last {
+                // Ignore the first hundred, while the filter is still settling.
+                if i > 100 {
+                    let step = (got - prev).num_milliseconds();
+                    worst_step_err = worst_step_err.max((step - 2000).abs());
+                }
+            }
+            last = Some(got);
+        }
+        assert!(
+            worst_step_err <= 2,
+            "the published dates jitter with the samples: {worst_step_err}ms off a clean 2 s step"
+        );
+        // Thirty minutes of media. Pinned, the epoch would be 0.81 s adrift;
+        // clamped against the raw sample it recovered only about three
+        // quarters of that.
+        let want = base + chrono::Duration::milliseconds(899 * 2000 + 899 * 900 / 1000);
+        let drift = (last.unwrap() - want).num_milliseconds().abs();
+        assert!(
+            drift < 120,
+            "the loop did not track the source through jitter: {drift}ms adrift"
         );
     }
 
