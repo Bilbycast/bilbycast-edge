@@ -1119,6 +1119,44 @@ fn probe_hw_encoder_diagnostics(_: &HwCodecCapability) -> Vec<HwEncoderDiagnosti
     Vec::new()
 }
 
+/// The family is absent from this build — while its hardware is present.
+///
+/// `is_encoder_available` returning false means libavcodec has no such
+/// encoder. On a host without that hardware it is uninteresting, which is why
+/// this case used to produce no diagnostic at all. On a host that *has* the
+/// hardware it is the single most useful thing the probe can say: the GPU is
+/// idle because the binary cannot address it, and every other surface reports
+/// exactly what a missing GPU reports — `false`, and silence.
+///
+/// Measured cost of that silence, once: a healthy GTX 1080 Ti, driver and
+/// kernel module matched, device nodes world-readable, no sandboxing — and it
+/// still took a driver check, `strings` over two binaries and a read of the
+/// feature table to establish that the build simply had no NVENC in it.
+///
+/// The hardware-encoder features are all off by default and arrive through
+/// the `video-encoders-full` composite, so a build that omits them looks
+/// deliberate from the outside and accidental from the inside. `--features`
+/// is additive, which makes it easy to add one encoder while believing you
+/// have added them all.
+#[cfg(feature = "media-codecs")]
+fn not_built_diagnostic(
+    family: &str,
+    node_present: bool,
+    feature: &str,
+) -> Option<HwEncoderDiagnostic> {
+    // No hardware, nothing to report — the original behaviour, and right.
+    if !node_present {
+        return None;
+    }
+    Some(HwEncoderDiagnostic {
+        family: family.to_string(),
+        status: "not_built".to_string(),
+        detail: format!(
+            "{family} hardware is present and usable, but this binary has no {family} encoder compiled in. Rebuild with `--features {feature}` — it is off by default; the *-full release artefact enables it via `video-encoders-full`."
+        ),
+    })
+}
+
 /// Reduce a [`video_engine::ProbeError`] to an [`EncoderFailure`] axis.
 #[cfg(feature = "media-codecs")]
 fn encoder_failure_from(err: &video_engine::ProbeError) -> EncoderFailure {
@@ -1211,17 +1249,17 @@ fn nvenc_unavailable_diagnostic(hw: &HwCodecCapability) -> Option<HwEncoderDiagn
     if hw.h264_nvenc || hw.hevc_nvenc {
         return None;
     }
+    let node_present = std::path::Path::new("/dev/nvidiactl").exists()
+        || std::path::Path::new("/dev/nvidia0").exists();
     if !video_engine::is_encoder_available("h264_nvenc")
         && !video_engine::is_encoder_available("hevc_nvenc")
     {
-        return None;
+        return not_built_diagnostic("nvenc", node_present, "video-encoder-nvenc");
     }
     let failure = match video_engine::probe_open_encoder("h264_nvenc") {
         Ok(()) => return None, // recovered since the first probe (was transiently busy)
         Err(e) => encoder_failure_from(&e),
     };
-    let node_present = std::path::Path::new("/dev/nvidiactl").exists()
-        || std::path::Path::new("/dev/nvidia0").exists();
     let status = classify_encoder_status(failure, node_present);
     let detail = match failure {
         EncoderFailure::Busy => {
@@ -1395,16 +1433,16 @@ fn qsv_unavailable_diagnostic(hw: &HwCodecCapability) -> Option<HwEncoderDiagnos
     if hw.h264_qsv || hw.hevc_qsv {
         return None;
     }
+    let node_present = render_node_matches(&dri_render_node_drivers(), QSV_DRM_DRIVERS);
     if !video_engine::is_encoder_available("h264_qsv")
         && !video_engine::is_encoder_available("hevc_qsv")
     {
-        return None;
+        return not_built_diagnostic("qsv", node_present, "video-encoder-qsv");
     }
     let failure = match video_engine::probe_open_encoder("h264_qsv") {
         Ok(()) => return None,
         Err(e) => encoder_failure_from(&e),
     };
-    let node_present = render_node_matches(&dri_render_node_drivers(), QSV_DRM_DRIVERS);
     let status = classify_encoder_status(failure, node_present);
     let detail = match failure {
         EncoderFailure::PermissionDenied => {
@@ -1438,16 +1476,16 @@ fn vaapi_unavailable_diagnostic(hw: &HwCodecCapability) -> Option<HwEncoderDiagn
     if hw.h264_vaapi || hw.hevc_vaapi {
         return None;
     }
+    let node_present = render_node_matches(&dri_render_node_drivers(), VAAPI_DRM_DRIVERS);
     if !video_engine::is_encoder_available("h264_vaapi")
         && !video_engine::is_encoder_available("hevc_vaapi")
     {
-        return None;
+        return not_built_diagnostic("vaapi", node_present, "video-encoder-vaapi");
     }
     let failure = match video_engine::probe_open_vaapi_encoder("h264_vaapi") {
         Ok(()) => return None,
         Err(e) => encoder_failure_from(&e),
     };
-    let node_present = render_node_matches(&dri_render_node_drivers(), VAAPI_DRM_DRIVERS);
     let status = classify_encoder_status(failure, node_present);
     let detail = match failure {
         EncoderFailure::PermissionDenied => {
@@ -3707,6 +3745,48 @@ pub(crate) mod tests {
         assert_eq!(HwEncoderFamily::classify("libx264"), None);
         assert_eq!(HwEncoderFamily::classify("libx265"), None);
         assert_eq!(HwEncoderFamily::classify("h264"), None);
+    }
+
+    /// Hardware present + encoder absent from the build is its own answer.
+    ///
+    /// This produced no diagnostic at all, because "the encoder is not in
+    /// libavcodec" was read as "there is no such hardware here" — true on most
+    /// hosts and exactly wrong on the one where somebody is staring at an idle
+    /// GPU. The two states an operator most needs to separate reported
+    /// identically: all `false`, and silence.
+    ///
+    /// Measured once on a healthy GTX 1080 Ti — matched driver, accessible
+    /// device nodes, no sandboxing — where establishing the cause took a
+    /// driver check, `strings` over two binaries and a read of the feature
+    /// table.
+    #[cfg(feature = "media-codecs")]
+    #[test]
+    fn a_missing_encoder_on_present_hardware_says_so() {
+        let d = not_built_diagnostic("nvenc", true, "video-encoder-nvenc")
+            .expect("hardware present and no encoder built in must be reported");
+        assert_eq!(d.family, "nvenc");
+        // A status of its own: "blocked" would send the operator to the
+        // sandbox runbook, and nothing about the host is misconfigured.
+        assert_eq!(d.status, "not_built");
+        // And it must name the remedy, which is a build flag rather than
+        // anything the operator can change on the box.
+        assert!(
+            d.detail.contains("--features video-encoder-nvenc"),
+            "the detail does not name the feature that would fix it: {}",
+            d.detail
+        );
+    }
+
+    /// No hardware, no diagnostic — the original behaviour, and right.
+    ///
+    /// Reporting "not built" on every host without a GPU would put a warning
+    /// on the majority of nodes, which is how a real one stops being read.
+    #[cfg(feature = "media-codecs")]
+    #[test]
+    fn a_missing_encoder_on_absent_hardware_stays_quiet() {
+        assert!(not_built_diagnostic("nvenc", false, "video-encoder-nvenc").is_none());
+        assert!(not_built_diagnostic("qsv", false, "video-encoder-qsv").is_none());
+        assert!(not_built_diagnostic("vaapi", false, "video-encoder-vaapi").is_none());
     }
 
     #[test]
