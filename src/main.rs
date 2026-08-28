@@ -130,8 +130,62 @@ fn install_diag_signal_handlers() {
     }
 }
 
+/// Leave the process without running static destructors.
+///
+/// libsrt's receive-queue and multiplexer worker threads outlive `main`:
+/// `libsrt-sys` holds its `srt_startup()` guard in a `static OnceLock`, and
+/// Rust never drops statics, so `srt_cleanup()` — the call that joins those
+/// threads — never runs. Returning from `main` therefore hands control to the
+/// C++ runtime, which destroys libsrt's globals while libsrt's own workers are
+/// still walking them, and the process dies with SIGSEGV *after* a completely
+/// successful shutdown:
+///
+/// ```text
+/// srt::CRcvQueue::worker
+///   srt::CRendezvousQueue::updateConnStatus
+///     srt::CRendezvousQueue::qualifyToHandle
+///       std::__detail::_List_node_base::_M_unhook   <- node already freed
+/// ```
+///
+/// Measured on bilby-z440: three clean stops, three SIGSEGVs. The unit lands
+/// in `failed` after shutting down correctly, which is worse than untidy — it
+/// makes "did it crash or was it stopped?" unanswerable, and leaves
+/// `systemctl --failed` permanently noisy, which is how a real failure gets
+/// ignored.
+///
+/// `srt-transport`'s access-control test target already does exactly this, for
+/// exactly this reason (`harness = false` plus `_exit`, documented at the top
+/// of `listener_access_control.rs`). The binary never got the same treatment.
+///
+/// Nothing is lost by skipping teardown. Everything this process owns —
+/// flows, tunnels, bond routes, the config file — is stopped and flushed
+/// before this is called, and `tracing_subscriber::fmt` writes through a
+/// `LineWriter`, so completed log lines are already out. What is skipped is
+/// precisely the C++ global teardown that has nothing safe left to do.
+fn exit_without_static_teardown(code: i32) -> ! {
+    use std::io::Write;
+    let _ = std::io::stdout().flush();
+    let _ = std::io::stderr().flush();
+    // SAFETY: `_exit` is async-signal-safe and does not return. Skipping the
+    // atexit chain is the entire point of calling it.
+    unsafe { libc::_exit(code) }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // Both arms leave through `_exit`, not by returning: an early failure can
+    // also have started SRT, and the crash does not care whether the shutdown
+    // was successful.
+    match real_main().await {
+        Ok(()) => exit_without_static_teardown(0),
+        Err(e) => {
+            tracing::error!("bilbycast-edge exiting: {e:#}");
+            exit_without_static_teardown(1)
+        }
+    }
+}
+
+async fn real_main() -> anyhow::Result<()> {
     install_diag_signal_handlers();
     let cli = Cli::parse();
 
