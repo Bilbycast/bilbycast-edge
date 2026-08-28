@@ -5921,6 +5921,27 @@ pub fn validate_output_with_input(
             }
             if let Some(ref cenc) = cmaf.encryption {
                 validate_cenc_block(cenc, &format!("CMAF output '{}'", cmaf.id))?;
+                // The low-latency path does not encrypt. Its chunks come from
+                // `fmp4::build_segment_chunk`, which writes no senc/saiz/saio
+                // and applies no CENC transform — so with `low_latency` set,
+                // the media goes out in the clear while `state.cenc` is
+                // initialised, "CENC active" is logged, and every surface says
+                // the output is encrypted.
+                //
+                // Refused rather than warned: a configuration whose security
+                // property silently does not hold is worse than one that will
+                // not start, and an operator who wanted DRM would rather be
+                // told now than discover it from a packet capture. See
+                // bilbycast-edge#135 — closing this properly means encrypting
+                // the chunks, at which point this check goes away.
+                if cmaf.low_latency {
+                    bail!(
+                        "CMAF output '{}': encryption is not applied on the low-latency path — \
+                         its chunks are written unencrypted. Use low_latency = false for an \
+                         encrypted output, or drop `encryption` if low latency matters more.",
+                        cmaf.id
+                    );
+                }
             }
             if let Some(ref enc) = cmaf.audio_encode {
                 validate_audio_encode(
@@ -5942,6 +5963,28 @@ pub fn validate_output_with_input(
                 )?;
             }
             if let Some(ref ve) = cmaf.video_encode {
+                // Checked BEFORE the generic validator, because this reason
+                // holds on every build: it is about what the CMAF re-encoder
+                // can resolve, not about which backends were compiled in.
+                //
+                // The CMAF re-encoder resolves no `*_auto` alias: its codec
+                // match in `engine::cmaf::encode::VideoReencoder::new` lists
+                // the explicit backends and bails on anything else. The
+                // general validator accepts the aliases, so a CMAF output
+                // carrying one passed here and then failed at flow start —
+                // raising a Critical event and, worse, carrying on with the
+                // re-encoder unset, i.e. publishing the SOURCE encoding under
+                // a config that says it is being re-encoded.
+                if matches!(ve.codec.as_str(), "h264_auto" | "hevc_auto" | "auto") {
+                    bail!(
+                        "CMAF output '{}': video_encode.codec '{}' is not resolvable here — \
+                         a CMAF output needs an explicit backend (x264, x265, h264_nvenc, \
+                         hevc_nvenc, h264_qsv, hevc_qsv, h264_vaapi, hevc_vaapi, h264_rkmpp, \
+                         hevc_rkmpp), because the CMAF re-encoder does not resolve the \
+                         `*_auto` aliases",
+                        cmaf.id, ve.codec
+                    );
+                }
                 validate_video_encode(ve, &format!("CMAF output '{}'", cmaf.id))?;
             }
         }
@@ -8605,6 +8648,69 @@ fn validate_port_conflicts(config: &AppConfig) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+
+    /// A CMAF output must name a backend its own re-encoder can open.
+    ///
+    /// The general codec validator accepts `h264_auto`, but the CMAF
+    /// re-encoder does not resolve it — so the config used to pass, fail at
+    /// flow start, and leave the output publishing the source encoding under a
+    /// config that says it is being re-encoded.
+    #[test]
+    fn validate_output_cmaf_refuses_an_unresolvable_auto_codec() {
+        use crate::config::models::OutputConfig;
+        let out = |codec: &str| -> OutputConfig {
+            serde_json::from_str(&format!(
+                r#"{{"type":"cmaf","id":"c","name":"c","ingest_url":"https://h/o",
+                    "manifests":["hls"],"video_encode":{{"codec":"{codec}","bitrate_kbps":4000}}}}"#
+            ))
+            .expect("CMAF output should deserialize")
+        };
+        for bad in ["h264_auto", "hevc_auto", "auto"] {
+            let err = validate_output(&out(bad))
+                .expect_err(&format!("{bad} must be refused on a CMAF output"));
+            assert!(err.to_string().contains("explicit backend"), "{err}");
+        }
+        // An explicit backend gets past THIS check. Whether it then passes
+        // depends on the Cargo features this build carries, which is a
+        // different refusal with a different message.
+        if let Err(e) = validate_output(&out("x264")) {
+            assert!(
+                e.to_string().contains("Cargo feature"),
+                "x264 must only ever be refused for not being compiled in: {e}"
+            );
+        }
+    }
+
+    /// An encrypted low-latency output would put its media on the wire in the
+    /// clear: the chunk builder writes no senc/saiz/saio and applies no CENC
+    /// transform, while `state.cenc` is initialised and every surface reports
+    /// the output as encrypted. Refused, not warned.
+    #[test]
+    fn validate_output_cmaf_refuses_encryption_on_the_low_latency_path() {
+        use crate::config::models::OutputConfig;
+        let cenc = r#","encryption":{"scheme":"cenc","key_id":"0123456789abcdef0123456789abcdef","key":"fedcba9876543210fedcba9876543210"}"#;
+        let out = |extra: &str| -> OutputConfig {
+            serde_json::from_str(&format!(
+                r#"{{"type":"cmaf","id":"c","name":"c","ingest_url":"https://h/o","manifests":["hls"]{extra}}}"#
+            ))
+            .expect("CMAF output should deserialize")
+        };
+
+        // Encrypted whole-segment output: fine, that path really does encrypt.
+        assert!(validate_output(&out(cenc)).is_ok());
+        // Low latency without encryption: fine.
+        assert!(
+            validate_output(&out(r#","low_latency":true,"chunk_duration_ms":500"#)).is_ok()
+        );
+        // Both: refused, and the message has to name why.
+        let err = validate_output(&out(&format!(
+            r#","low_latency":true,"chunk_duration_ms":500{cenc}"#
+        )))
+        .expect_err("encryption on the low-latency path must be refused");
+        let msg = err.to_string();
+        assert!(msg.contains("low-latency"), "{msg}");
+        assert!(msg.contains("unencrypted"), "{msg}");
+    }
 
     /// A thumbnail sheet must stay inside the texture size a phone will
     /// decode.

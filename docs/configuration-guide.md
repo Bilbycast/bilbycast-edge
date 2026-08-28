@@ -2034,17 +2034,16 @@ PlayReady PSSH passthrough.
 }
 ```
 
-LL-CMAF example with DRM:
+CMAF with DRM:
 
 ```json
 {
   "type": "cmaf",
-  "id": "cmaf-ll-drm",
-  "name": "LL-CMAF with ClearKey",
+  "id": "cmaf-drm",
+  "name": "CMAF with ClearKey",
   "ingest_url": "https://ingest.cdn.example.com/live",
   "segment_duration_secs": 2.0,
-  "chunk_duration_ms": 500,
-  "low_latency": true,
+  "low_latency": false,
   "manifests": ["hls", "dash"],
   "encryption": {
     "scheme": "cenc",
@@ -2055,6 +2054,15 @@ LL-CMAF example with DRM:
 }
 ```
 
+> **`encryption` and `low_latency` cannot be combined**, and the config is
+> refused rather than started. The low-latency path writes its chunks through
+> a builder that emits no `senc` / `saiz` / `saio` and applies no CENC
+> transform, so an LL output with `encryption` set would put its media on the
+> wire **in the clear** while the log said `CENC active` and every surface
+> reported the output as encrypted. This example previously showed exactly
+> that combination. Tracked as bilbycast-edge#135; when the chunks are
+> encrypted the restriction goes away.
+
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
 | `type` | string | Yes | - | Must be `"cmaf"`. |
@@ -2063,12 +2071,12 @@ LL-CMAF example with DRM:
 | `ingest_url` | string | Yes | - | CMAF ingest base URL. Must start with `http://` or `https://`. Artifacts are PUT to `{ingest_url}/init.mp4`, `{ingest_url}/seg-{00001}.m4s`, `{ingest_url}/manifest.m3u8`, `{ingest_url}/manifest.mpd`. |
 | `segment_duration_secs` | float | No | `2.0` | Target segment duration in seconds. Range: 1.0-10.0. Segments cut on IDR — source must emit an IDR at least every `segment_duration_secs` unless `video_encode` is set (which forces GoP alignment). |
 | `max_segments` | integer | No | `5` | Rolling playlist window. Range: 1-30. |
-| `dvr_window_secs` | float | No | - | Rolling playlist window expressed in **time**, for DVR / scrub-back. Supersedes `max_segments`: the entry count is derived as `ceil(dvr_window_secs / segment_duration_secs)`, so the window keeps its intended duration if segment length changes. Minimum `1.0`; rejected if it derives more than 21600 entries. The playlist is a *sliding* window, so origin retention must be sized to match or clients will seek to evicted segments. |
+| `dvr_window_secs` | float | No | - | Rolling playlist window expressed in **time**, for DVR / scrub-back. Supersedes `max_segments`: the entry count is derived as `ceil(dvr_window_secs / segment_duration_secs)`, so the window keeps its intended duration if segment length changes. Minimum `1.0`; rejected if it derives more than 21600 entries. The count is derived from the *target* duration, but segments close on the first IDR at or after it, so a source whose GoP does not divide `segment_duration_secs` holds a window somewhat longer than asked for. The playlist is a *sliding* window, so origin retention must be sized to match or clients will seek to evicted segments. |
 | `manifests` | array | No | `["hls","dash"]` | Subset of `{"hls", "dash"}`, non-empty. Both manifests reference the same fMP4 segments — enable either or both. |
 | `low_latency` | bool | No | `false` | Enable LL-CMAF: emits a moof+mdat chunk every `chunk_duration_ms` inside a single chunked-transfer PUT per segment, advertises parts via `#EXT-X-PART` (HLS) and `availabilityTimeOffset` (DASH). Target end-to-end latency <3 s with 500 ms chunks. |
 | `chunk_duration_ms` | integer | No | `500` | LL-CMAF chunk duration in ms. Range: 100-2000. Ignored when `low_latency = false`. |
 | `thumbnails` | object | No | `null` | Scrub-preview sprite sheets plus a WebVTT index, PUT beside the media. See [`thumbnails`](#the-cmaf-thumbnails-block) below. Off when omitted. |
-| `encryption` | object | No | `null` | Common Encryption configuration. See [`encryption`](#the-cmaf-encryption-block) below. |
+| `encryption` | object | No | `null` | Common Encryption configuration. **Refused together with `low_latency = true`** — the LL path does not encrypt its chunks (bilbycast-edge#135). See [`encryption`](#the-cmaf-encryption-block) below. |
 | `audio_encode` | object | No | `null` | Optional AAC re-encode. Allowed `codec`: `aac_lc`, `he_aac_v1`, `he_aac_v2`. Source must already be AAC (TsDemuxer decodes via fdk-aac). When omitted, the source AAC passes through unchanged. |
 | `video_encode` | object | No | `null` | Optional H.264 / HEVC re-encode with explicit GoP alignment to `segment_duration_secs`. See the [`video_encode` block](#the-video_encode-block) for backends and fields. H.264 → H.264 or HEVC → H.264 conversion is supported when the matching `video-encoder-*` Cargo feature is enabled. |
 | `program_number` | integer | No | `null` | MPTS → SPTS program filter. Must be `> 0`. See [MPTS → SPTS filtering](#mpts--spts-filtering). |
@@ -2108,7 +2116,7 @@ When `encryption` is set, the edge:
 
 1. Emits `encv` / `enca` sample entries that wrap `avc1` / `hvc1` / `mp4a` via a `sinf/frma/schm/schi/tenc` chain (ISO/IEC 23001-7 §8).
 2. Subsample-encrypts each H.264 / HEVC sample — NAL length prefix + NAL header + 32 bytes of slice header are left clear; the rest of the VCL NAL payload is encrypted. Parameter-set NALs (SPS / PPS / VPS / SEI / AUD) stay fully clear. For `cbcs` the encrypted span is rounded down to a multiple of 16 bytes.
-3. AAC samples are whole-encrypted with no subsample split.
+3. AAC samples *would be* whole-encrypted with no subsample split — `encrypt_audio_sample` implements it and nothing calls it. **An encrypted output is video-only**: the track list is decided before "does this source have audio", so an encrypted output never declares an audio track it cannot fill, and no audio sample reaches this path.
 4. Writes `senc` / `saio` / `saiz` into every `traf` with correctly back-patched offsets.
 5. Emits a ClearKey `pssh` (system ID `1077efec-c0b2-4d02-ace3-3c1e52e2fb4b`, version 1) into `moov`, plus any operator-supplied `pssh_boxes` verbatim.
 
