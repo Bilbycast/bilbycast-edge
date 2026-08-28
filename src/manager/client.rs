@@ -2577,10 +2577,31 @@ async fn execute_command(
             let flow_id = action["flow_id"].as_str().ok_or("Missing flow_id")?;
             let output_id = action["output_id"].as_str().ok_or("Missing output_id")?;
             tracing::info!("Manager command: remove output '{output_id}' from flow '{flow_id}'");
-            flow_manager
-                .remove_output(flow_id, output_id)
-                .await
-                .map_err(|e| e.to_string())?;
+            // Stopping the running instance is best-effort; **detaching it from
+            // the flow is the job**.
+            //
+            // This used to abort on a runtime failure, before the config below
+            // was touched — which left an output that is in the config but not
+            // running impossible to remove at all: this path refused because
+            // the runtime had no such output ("not found in flow"), and
+            // `delete_output` refused because the config still listed it
+            // ("is assigned to a flow — unassign first"). Two contradictory
+            // answers about one output, and no way out of it.
+            //
+            // Observed on the demo rig: two CMAF outputs that never started —
+            // their source was deactivated — sat permanently attached to a
+            // flow after their DVR session had been deleted, with the manager
+            // reporting the removal as successful.
+            //
+            // So proceed regardless. The operator asked for the output to
+            // leave the flow; if the runtime cannot oblige, the config should
+            // still say what was asked for, and a restart reconciles it.
+            if let Err(e) = flow_manager.remove_output(flow_id, output_id).await {
+                tracing::warn!(
+                    output_id, flow_id, error = %e,
+                    "remove_output: runtime removal failed; detaching from the config anyway"
+                );
+            }
             // Remove output_id reference from the flow (and optionally from top-level outputs)
             let mut cfg = app_config.write().await;
             if let Some(flow) = cfg.flows.iter_mut().find(|f| f.id == flow_id) {
