@@ -172,7 +172,18 @@ picture it names for as long as the session ran.
 
 Decoding reuses `replay::filmstrip` — a sibling broadcast subscriber that drops
 on `Lagged` and never blocks the data path. A failure here costs a preview and
-never the media.
+never the media. Reusing it is also why **the thumbnail track needs the
+`replay` Cargo feature** (on by default): without it the capture and JPEG
+encode it calls do not exist, and a build that has `thumbnails` configured
+raises a Warning `config` event naming the rebuild rather than publishing
+nothing silently.
+
+Cue times come from each frame's own capture instant, not from
+`interval_secs x i`. Captures are skipped rather than padded when a tick yields
+no frame, so a derived cadence pulled every cue after a drop earlier by the
+length of the gap, accumulating across the sheet. Each cue now runs to the next
+frame's real instant, so a gap is covered by the frame before it instead of
+becoming a stretch of bar with no preview at all.
 
 ## LL-CMAF
 

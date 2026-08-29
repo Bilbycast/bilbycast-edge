@@ -33,6 +33,9 @@ mod manifest;
 #[allow(dead_code)]
 pub(crate) mod nalu;
 mod segmenter;
+// The thumbnail track reuses the replay filmstrip's capture and JPEG
+// encoding rather than duplicating them, so it exists only when `replay` does.
+#[cfg(feature = "replay")]
 mod thumbnails;
 mod upload;
 
@@ -97,6 +100,7 @@ pub fn spawn_cmaf_output(
     // The thumbnail track is a sibling subscriber on the same broadcast, not a
     // stage in the media path: it must never be able to stall or fail the
     // output it sits beside.
+    #[cfg(feature = "replay")]
     if let Some(th) = config.thumbnails.clone() {
         let interval = std::time::Duration::from_secs(th.interval_secs as u64);
         // The index may only describe sheets the origin still holds, so it is
@@ -122,6 +126,24 @@ pub fn spawn_cmaf_output(
             event_sender.clone(),
             flow_id.clone(),
             cancel.clone(),
+        );
+    }
+    // Say so rather than publish nothing. The config validates and the output
+    // runs either way, so a build without `replay` would otherwise present as
+    // a scrub bar that simply never shows a picture — indistinguishable from a
+    // source the capture could not decode.
+    #[cfg(not(feature = "replay"))]
+    if config.thumbnails.is_some() {
+        event_sender.emit_flow(
+            EventSeverity::Warning,
+            category::CONFIG,
+            format!(
+                "CMAF output '{}': `thumbnails` is configured but this build has no \
+                 `replay` feature, which owns the frame capture it uses — no scrub \
+                 preview will be published. Rebuild with `--features replay`.",
+                config.id,
+            ),
+            &flow_id,
         );
     }
 

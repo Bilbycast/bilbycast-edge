@@ -81,8 +81,17 @@ pub(crate) struct SheetRecord {
     pub(crate) uri: String,
     /// Wall clock of the first frame on the sheet.
     pub(crate) first_at: DateTime<Utc>,
-    /// Cadence the frames were captured at.
+    /// Cadence the frames were *asked* for. Still the cue length, and the
+    /// fallback span for the last frame on a sheet.
     pub(crate) interval: Duration,
+    /// Milliseconds from `first_at` to each frame on the sheet, in tile order.
+    ///
+    /// Not derivable from `interval`: a tick whose capture fails is skipped,
+    /// not padded, so the frames on a sheet are only evenly spaced when
+    /// nothing was dropped. Deriving cue times as `interval * i` shifted every
+    /// cue after a drop, which puts the scrub preview progressively further
+    /// from the frame the operator is pointing at.
+    pub(crate) offsets_ms: Vec<u32>,
     pub(crate) frame_count: u32,
     pub(crate) frame_width: u32,
     pub(crate) frame_height: u32,
@@ -173,10 +182,26 @@ pub(crate) fn render_vtt(sheets: &[SheetRecord]) -> String {
     ));
 
     for sheet in sheets {
+        let sheet_base = (sheet.first_at - epoch).num_milliseconds() as f64 / 1000.0;
         for i in 0..sheet.frame_count {
-            let start = (sheet.first_at - epoch).num_milliseconds() as f64 / 1000.0
-                + sheet.interval.as_secs_f64() * i as f64;
-            let end = start + sheet.interval.as_secs_f64();
+            // Fall back to the nominal cadence only for a record that carries
+            // no offsets; every sheet this module publishes carries them.
+            let at = |j: u32| {
+                sheet
+                    .offsets_ms
+                    .get(j as usize)
+                    .map(|ms| f64::from(*ms) / 1000.0)
+                    .unwrap_or_else(|| sheet.interval.as_secs_f64() * f64::from(j))
+            };
+            let start = sheet_base + at(i);
+            // A cue runs to the next frame, so a gap left by a dropped capture
+            // is covered by the frame before it rather than becoming a hole
+            // the player has no preview for at all.
+            let end = if i + 1 < sheet.frame_count {
+                sheet_base + at(i + 1)
+            } else {
+                start + sheet.interval.as_secs_f64()
+            };
             let (x, y) = tile_origin(i, sheet.frame_width, sheet.frame_height);
             out.push_str(&format!(
                 "\n{} --> {}\n{}#xywh={},{},{},{}\n",
@@ -371,6 +396,15 @@ async fn publish_sheet(
     let Some(first) = frames.first() else { return };
     let first_at = first.at;
     let count = frames.len() as u32;
+    // Taken before `frames` is moved into the blocking compose.
+    let offsets_ms: Vec<u32> = frames
+        .iter()
+        .map(|f| {
+            (f.at - first_at)
+                .num_milliseconds()
+                .clamp(0, i64::from(u32::MAX)) as u32
+        })
+        .collect();
 
     #[cfg(feature = "media-codecs")]
     let composed = tokio::task::spawn_blocking(move || {
@@ -400,18 +434,20 @@ async fn publish_sheet(
     let uri = format!("thumbs-{:05}.jpg", *next_sheet);
     *next_sheet += 1;
     let url = format!("{base}/{uri}");
-    if let Err(e) = http_put(&url, jpeg.clone(), "image/jpeg", auth_token).await {
+    let jpeg_len = jpeg.len() as u64;
+    if let Err(e) = http_put(&url, jpeg, "image/jpeg", auth_token).await {
         tracing::warn!("CMAF output '{output_id}': sheet PUT failed: {e}");
         stats.capture_drops.fetch_add(count as u64, Ordering::Relaxed);
         return;
     }
     stats.sheets_published.fetch_add(1, Ordering::Relaxed);
-    stats.bytes_published.fetch_add(jpeg.len() as u64, Ordering::Relaxed);
+    stats.bytes_published.fetch_add(jpeg_len, Ordering::Relaxed);
 
     sheets.push_back(SheetRecord {
         uri,
         first_at,
         interval,
+        offsets_ms,
         frame_count: count,
         frame_width: spec.width,
         frame_height: spec.height,
@@ -466,11 +502,18 @@ mod tests {
     }
 
     fn sheet(uri: &str, first: i64, frames: u32) -> SheetRecord {
+        // Evenly spaced, i.e. nothing was dropped — the ordinary case.
+        sheet_at(uri, first, (0..frames).map(|i| i * 2000).collect())
+    }
+
+    /// A sheet whose frames landed at the given offsets from `first_at`.
+    fn sheet_at(uri: &str, first: i64, offsets_ms: Vec<u32>) -> SheetRecord {
         SheetRecord {
             uri: uri.to_string(),
             first_at: at(first),
             interval: Duration::from_secs(2),
-            frame_count: frames,
+            frame_count: offsets_ms.len() as u32,
+            offsets_ms,
             frame_width: 160,
             frame_height: 90,
         }
@@ -633,6 +676,36 @@ mod tests {
     fn an_empty_index_declares_no_epoch() {
         let vtt = render_vtt(&[]);
         assert_eq!(vtt, "WEBVTT\n");
+    }
+
+    /// A dropped capture must move only its own cue, not every later one.
+    ///
+    /// Captures are skipped, never padded: a tick whose `try_capture_frame`
+    /// yields nothing leaves a hole in the cadence. Deriving cue times as
+    /// `interval * i` therefore pulled every cue after the hole earlier by the
+    /// length of the gap, and the error accumulated across the sheet — so the
+    /// preview an operator saw came from progressively further from the point
+    /// they were pointing at.
+    #[test]
+    fn a_dropped_capture_does_not_shift_the_cues_after_it() {
+        // Frames at 0 s, 2 s, then a drop, then 6 s and 8 s.
+        let vtt = render_vtt(&[sheet_at("t.jpg", 0, vec![0, 2000, 6000, 8000])]);
+        let starts: Vec<&str> = vtt
+            .lines()
+            .filter(|l| l.contains(" --> "))
+            .map(|l| l.split(" --> ").next().unwrap())
+            .collect();
+        assert_eq!(
+            starts,
+            ["00:00:00.000", "00:00:02.000", "00:00:06.000", "00:00:08.000"],
+            "cues after a dropped capture were re-spaced onto the nominal cadence"
+        );
+        // The cue before the gap covers it, so the bar has no preview-less
+        // hole — it holds the last frame that was actually captured.
+        assert!(
+            vtt.contains("00:00:02.000 --> 00:00:06.000"),
+            "the gap left by the drop is not covered by the cue before it: {vtt}"
+        );
     }
 
     #[test]

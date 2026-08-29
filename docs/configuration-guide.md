@@ -2093,9 +2093,19 @@ out with it. See [`cmaf.md`](cmaf.md#thumbnail-track-thumbnails).
 | `interval_secs` | integer | No | `2` | Seconds between preview frames. Range 1-30. Matching `segment_duration_secs` gives one frame per segment and no gap a drag can fall into. |
 | `frames_per_sheet` | integer | No | `20` | Frames packed before a sheet is published. Range 1-200. **This is the lag of the newest preview**, not a size knob: a sheet only exists once full, so the most recent `interval_secs x frames_per_sheet` of the window has no picture. |
 | `width` | integer | No | `160` | Preview frame width. Range 64-640, and refused if `width x 10` exceeds 4096 — sheets are ten frames wide and many mobile GPUs will not decode a wider image. |
-| `height` | integer | No | `90` | Preview frame height. Range 36-360. |
+| `height` | integer | No | `90` | Preview frame height. Range 36-360, and refused if `ceil(frames_per_sheet / 10) x height` exceeds 4096 — the same texture limit applies to the tall axis, which is the easier one to reach by accident because it grows with a field not named in pixels. |
+
+**The sheet lag must fit inside the playlist window**, or the config is refused:
+`interval_secs x frames_per_sheet` must be **less than** `dvr_window_secs` (or
+`max_segments x segment_duration_secs` when no DVR window is set). Past that, the
+first sheet describes only segments the playlist has already evicted, so the
+scrub bar shows a preview nowhere — the exact symptom the track exists to
+remove, and one with no operator-visible failure to warn on. Note the default
+window is 5 x 2 s = 10 s, which is shorter than the default 40 s sheet lag: a
+thumbnail track is a DVR feature and expects `dvr_window_secs` to be set with it.
 
 ```json
+"dvr_window_secs": 3600.0,
 "thumbnails": { "interval_secs": 2, "frames_per_sheet": 20, "width": 160, "height": 90 }
 ```
 

@@ -5911,11 +5911,59 @@ pub fn validate_output_with_input(
                 // outright by browsers on the Android hardware this targets,
                 // and a refused image is a preview that shows nothing with no
                 // error anywhere. 10 columns is the layout; bound the product.
-                let sheet_width = th.width * 10;
-                if sheet_width > 4096 {
+                const MAX_SHEET_PX: u32 = 4096;
+                const SHEET_COLUMNS: u32 = 10;
+                let sheet_width = th.width * SHEET_COLUMNS;
+                if sheet_width > MAX_SHEET_PX {
                     bail!(
-                        "CMAF output '{}': thumbnails.width {} makes a {} px sheet, over the                          4096 px many mobile GPUs will decode; use 409 or less",
-                        cmaf.id, th.width, sheet_width
+                        "CMAF output '{}': thumbnails.width {} makes a {} px sheet, over the \
+                         {} px many mobile GPUs will decode; use {} or less",
+                        cmaf.id,
+                        th.width,
+                        sheet_width,
+                        MAX_SHEET_PX,
+                        MAX_SHEET_PX / SHEET_COLUMNS
+                    );
+                }
+                // Both axes hit the same limit. A tall sheet is the easier one
+                // to reach by accident, because it grows with `frames_per_sheet`
+                // rather than with a field named in pixels.
+                let rows = th.frames_per_sheet.div_ceil(SHEET_COLUMNS);
+                let sheet_height = rows * th.height;
+                if sheet_height > MAX_SHEET_PX {
+                    bail!(
+                        "CMAF output '{}': thumbnails.frames_per_sheet {} at height {} makes \
+                         a {} px tall sheet, over the {} px many mobile GPUs will decode; \
+                         lower either",
+                        cmaf.id,
+                        th.frames_per_sheet,
+                        th.height,
+                        sheet_height,
+                        MAX_SHEET_PX
+                    );
+                }
+                // A sheet is only published once it is full, so the newest
+                // `interval_secs * frames_per_sheet` of the window has no
+                // picture. Sized past the window itself, the index never
+                // describes anything the player can still seek to — a scrub
+                // bar that shows a preview nowhere, which is the symptom the
+                // track exists to remove.
+                let window_secs = cmaf
+                    .dvr_window_secs
+                    .unwrap_or(cmaf.max_segments as f64 * cmaf.segment_duration_secs);
+                let sheet_lag_secs = f64::from(th.interval_secs * th.frames_per_sheet);
+                if sheet_lag_secs >= window_secs {
+                    bail!(
+                        "CMAF output '{}': thumbnails.interval_secs {} x frames_per_sheet {} \
+                         is {:.0} s of lag before the first sheet is published, but the \
+                         playlist window is only {:.0} s — no sheet would ever describe a \
+                         segment the playlist still lists. Lower either, or raise \
+                         dvr_window_secs",
+                        cmaf.id,
+                        th.interval_secs,
+                        th.frames_per_sheet,
+                        sheet_lag_secs,
+                        window_secs
                     );
                 }
             }
@@ -8724,9 +8772,12 @@ mod tests {
     #[test]
     fn validate_output_cmaf_thumbnail_bounds() {
         use crate::config::models::OutputConfig;
+        // A window wide enough that the sheet-lag rule (tested separately in
+        // `validate_output_cmaf_thumbnail_lag_must_fit_the_window`) never
+        // fires here — this test is about the per-field and texture bounds.
         let out = |thumbs: &str| -> OutputConfig {
             serde_json::from_str(&format!(
-                r#"{{"type":"cmaf","id":"c","name":"c","ingest_url":"https://h/o","manifests":["hls"],"thumbnails":{thumbs}}}"#
+                r#"{{"type":"cmaf","id":"c","name":"c","ingest_url":"https://h/o","manifests":["hls"],"dvr_window_secs":3600.0,"thumbnails":{thumbs}}}"#
             ))
             .expect("CMAF output should deserialize")
         };
@@ -8748,7 +8799,63 @@ mod tests {
         assert!(validate_output(&out(r#"{"interval_secs":31}"#)).is_err());
         assert!(validate_output(&out(r#"{"frames_per_sheet":0}"#)).is_err());
         assert!(validate_output(&out(r#"{"frames_per_sheet":201}"#)).is_err());
-        assert!(validate_output(&out(r#"{"interval_secs":5,"frames_per_sheet":200}"#)).is_ok());
+
+        // A tall sheet hits the same texture limit as a wide one, and is the
+        // easier of the two to reach by accident: it grows with
+        // `frames_per_sheet`, which is not named in pixels. 200 frames is 20
+        // rows, and at the maximum 360 px that is a 7200 px sheet.
+        let err = validate_output(&out(r#"{"frames_per_sheet":200,"height":360}"#))
+            .expect_err("an unusable sheet height must be refused");
+        assert!(format!("{err}").contains("7200"), "{err}");
+    }
+
+    /// The preview must describe segments the playlist still lists.
+    ///
+    /// A sheet is published only once it is full, so the newest
+    /// `interval_secs * frames_per_sheet` of the window has no picture. Let
+    /// that reach the window length and no sheet ever describes a segment the
+    /// player can still seek to — the config validates, the output runs, and
+    /// the scrub bar shows a preview nowhere, which is precisely the symptom
+    /// the thumbnail track exists to remove. It is refused rather than
+    /// warned because there is no operator-visible failure to warn on.
+    #[test]
+    fn validate_output_cmaf_thumbnail_lag_must_fit_the_window() {
+        use crate::config::models::OutputConfig;
+        let out = |extra: &str, thumbs: &str| -> OutputConfig {
+            serde_json::from_str(&format!(
+                r#"{{"type":"cmaf","id":"c","name":"c","ingest_url":"https://h/o",
+                    "manifests":["hls"]{extra},"thumbnails":{thumbs}}}"#
+            ))
+            .expect("CMAF output should deserialize")
+        };
+
+        // Defaults: 5 segments x 2 s is a 10 s window, and the default sheet
+        // is 2 s x 20 frames = 40 s of lag.
+        let err = validate_output(&out("", "{}"))
+            .expect_err("a sheet slower than the window must be refused");
+        let msg = err.to_string();
+        assert!(msg.contains("40"), "the error must name the lag: {msg}");
+        assert!(msg.contains("10"), "the error must name the window: {msg}");
+
+        // A window long enough to hold the lag is fine.
+        assert!(validate_output(&out(r#","dvr_window_secs":300.0"#, "{}")).is_ok());
+        // So is a sheet packed small enough for a short window.
+        assert!(
+            validate_output(&out("", r#"{"interval_secs":1,"frames_per_sheet":5}"#)).is_ok()
+        );
+
+        // The manager provisions 2 s x 20 frames against a window whose
+        // schema floor is 60 s. That combination must stay accepted, or
+        // activating a DVR session at the shortest window it allows would be
+        // refused by the node it was just pushed to.
+        assert!(
+            validate_output(&out(
+                r#","dvr_window_secs":60.0"#,
+                r#"{"interval_secs":2,"frames_per_sheet":20}"#
+            ))
+            .is_ok(),
+            "the manager's own provisioning no longer validates"
+        );
     }
 
     /// `dvr_window_secs` is bounded by the *derived* entry count, not the raw
