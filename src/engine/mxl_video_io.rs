@@ -207,10 +207,16 @@ fn video_input_blocking_loop(
     let mut cb_scratch: Vec<u8> = vec![0u8; cw * h * bps];
     let mut cr_scratch: Vec<u8> = vec![0u8; cw * h * bps];
 
-    let mut index: u64 = match reader.get_runtime_info().map(|r| r.headIndex) {
-        Ok(hd) => hd,
-        Err(_) => 0,
-    };
+    // Start at the writer's current head so we don't replay the whole ring.
+    // If the runtime info is unreadable, fall back to grain 0 rather than
+    // refusing to start: a reader that cannot yet see a head is the ordinary
+    // race at flow-open, not a fatal condition, and `get_complete_grain` below
+    // simply waits on whatever index we name. `unwrap_or(0)` rather than
+    // `unwrap_or_default()` because 0 is a real grain index here, not a type
+    // default. Swallowing the error is tolerable on this path only because the
+    // Info event immediately below reports the resolved `starting grain`, so
+    // the fallback is still visible to an operator.
+    let mut index: u64 = reader.get_runtime_info().map(|r| r.headIndex).unwrap_or(0);
 
     event_sender.emit(
         EventSeverity::Info,

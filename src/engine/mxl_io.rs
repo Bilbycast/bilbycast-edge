@@ -448,10 +448,16 @@ fn anc_input_blocking_loop(
         format!("{ctx}: GrainReader opened (mxl_reader_opened)"),
     );
 
-    let mut index: u64 = match reader.get_runtime_info().map(|r| r.headIndex) {
-        Ok(h) => h,
-        Err(_) => 0,
-    };
+    // Start at the writer's current head so we don't replay the whole ring.
+    // If the runtime info is unreadable, fall back to grain 0 rather than
+    // refusing to start: a reader that cannot yet see a head is the ordinary
+    // race at flow-open, not a fatal condition, and `get_complete_grain` below
+    // simply waits on whatever index we name. `unwrap_or(0)` rather than
+    // `unwrap_or_default()` because 0 is a real grain index here, not a type
+    // default. Note the asymmetry with the audio reader earlier in this file,
+    // which logs a `warn!` on this same fallback — this path is silent, so a
+    // wrong start index shows up only as an unexplained wait.
+    let mut index: u64 = reader.get_runtime_info().map(|r| r.headIndex).unwrap_or(0);
 
     loop {
         if cancel.is_cancelled() {

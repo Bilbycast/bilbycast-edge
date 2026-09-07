@@ -9,6 +9,7 @@ use serde::Deserialize;
 use crate::config::models::{AppConfig, FlowConfig};
 use crate::config::persistence::save_config_split_async;
 use crate::config::validation::{validate_config, validate_flow};
+use crate::manager::client::{OutputDetachRefusal, resolve_failed_output_removal};
 
 use super::auth::RequireAdmin;
 use super::errors::ApiError;
@@ -549,25 +550,92 @@ pub async fn add_output(
 /// `DELETE /api/v1/flows/{flow_id}/outputs/{output_id}` -- Unassign an output from a flow.
 ///
 /// Removes the `output_id` from the flow's `output_ids` list. The output definition
-/// remains in `AppConfig.outputs` (it is simply unassigned from the flow). If the flow
-/// is currently running, the output is hot-removed from the engine first.
+/// remains in `AppConfig.outputs` (it is simply unassigned from the flow) — that is
+/// what distinguishes this endpoint from the manager's `remove_output` command, which
+/// also drops an output nothing else references. The runtime removal is attempted
+/// first and its failure is classified, not swallowed.
 ///
 /// # Errors
 ///
 /// - [`ApiError::NotFound`] (404) if the flow does not exist or the output_id is not
 ///   assigned to the flow.
+/// - [`ApiError::Conflict`] (409) if the runtime removal failed in a way that means the
+///   config must not be edited: the flow is between lives (retry), or it is running and
+///   still holds the output. Matches the 409 this file already returns for "flow is not
+///   running" on `stop_flow`.
 /// - [`ApiError::Internal`] (500) if persisting the config to disk fails.
 pub async fn remove_output(
     _admin: RequireAdmin,
     State(state): State<AppState>,
     Path((flow_id, output_id)): Path<(String, String)>,
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
-    // Remove from running engine first
-    if state.flow_manager.is_running(&flow_id) {
-        let _ = state.flow_manager.remove_output(&flow_id, &output_id).await;
+    // Answer the 404s BEFORE touching either plane. The runtime removal below
+    // cannot run under the write guard (`FlowRuntime::remove_output` awaits the
+    // output task's join with a 5 s timeout), so the guard is taken afterwards
+    // and the checks would otherwise land after the removal — stopping an
+    // output and then telling the caller nothing happened. It also keeps a
+    // typo'd id from raising a `output_detached_without_runtime_removal` event
+    // about a flow that does not exist.
+    {
+        let config = state.config.read().await;
+        let flow = config
+            .flows
+            .iter()
+            .find(|f| f.id == flow_id)
+            .ok_or_else(|| ApiError::NotFound(format!("Flow '{flow_id}' not found")))?;
+        if !flow.output_ids.iter().any(|oid| oid == &output_id) {
+            return Err(ApiError::NotFound(format!(
+                "Output '{output_id}' is not assigned to flow '{flow_id}'"
+            )));
+        }
     }
 
+    // Remove from the running engine first — deliberately NOT gated on
+    // `is_running`.
+    //
+    // The gate looked like a cheap skip and was the same divergence the
+    // manager-WS path closed. `is_running` is false for the whole of a restart
+    // (`destroy_flow` drops the flow from the registry before awaiting a stop
+    // that runs to tens of seconds; `create_flow` inserts it only once every
+    // task has spawned), so a flow that is merely between lives skipped the
+    // runtime plane entirely and had its config edited anyway. The rebuild then
+    // resolves from a snapshot that still lists the output and brings it back
+    // up — running, absent from `config.json`, and removable by nobody, which
+    // is the exact state this endpoint exists to get out of.
+    //
+    // So attempt it unconditionally and let `resolve_failed_output_removal`
+    // read the failure. It is the same helper the `remove_output` WS command
+    // uses, on purpose: two hand-written copies of this decision is how the two
+    // surfaces came to disagree in the first place.
+    let runtime_removal = state.flow_manager.remove_output(&flow_id, &output_id).await;
+
     let mut config = state.config.write().await;
+
+    if let Err(e) = runtime_removal {
+        // `enabled` is read under the same guard the config edit runs under, so
+        // it cannot move between the decision and the act.
+        let enabled = config.flows.iter().any(|f| f.id == flow_id && f.enabled);
+        if let Err(refusal) = resolve_failed_output_removal(
+            &state.flow_manager,
+            &flow_id,
+            &output_id,
+            enabled,
+            &e,
+        )
+        .await
+        {
+            // Both refusals are "the request conflicts with the current state
+            // of the resource", which is what 409 means here already — see
+            // `stop_flow`'s "Flow is not running". The message carries the
+            // retry advice; inventing a 503 for the retryable one would be a
+            // second convention for the same class of answer.
+            return Err(ApiError::Conflict(match refusal {
+                OutputDetachRefusal::StillAttached(msg) | OutputDetachRefusal::BetweenLives(msg) => {
+                    msg
+                }
+            }));
+        }
+    }
 
     let flow = config
         .flows

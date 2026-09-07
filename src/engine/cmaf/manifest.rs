@@ -26,9 +26,14 @@ pub struct M3u8Entry {
     /// Optional relative URL for the segment. When `None`, defaults to
     /// `seg-{sequence_number:05}.m4s`.
     pub uri: Option<String>,
-    /// LL-CMAF: partial-segment rows for the *next* segment, pre-
-    /// advertised so players can start fetching chunks before the
-    /// segment closes.
+    /// LL-CMAF: partial-segment rows for the segment still being
+    /// written, so players can fetch chunks before it closes.
+    ///
+    /// These are the rows of the entry that CARRIES them — the open
+    /// segment's own parts, hung off the last entry because that is the
+    /// entry the open segment is. They are emitted after that entry's
+    /// `#EXTINF`, which RFC 8216bis §4.4.4.9 orders the other way round;
+    /// see the known limitation in `docs/cmaf.md`.
     pub parts: Vec<HlsPartEntry>,
     /// Wall-clock time of this segment's first sample, if known.
     ///
@@ -38,6 +43,15 @@ pub struct M3u8Entry {
     /// *stream* started would name a segment that is no longer listed. That
     /// error grows for as long as the session runs.
     pub program_date_time: Option<chrono::DateTime<chrono::Utc>>,
+    /// This segment does not continue the timeline of the one before it.
+    ///
+    /// Set when the flow clock re-anchored under this segment — a source
+    /// restart or PTS discontinuity, or a source whose clock is running
+    /// further out than the epoch's slew limit can track, which falls behind
+    /// until it snaps. Either way the row's date is not the previous row's
+    /// date plus its `EXTINF`, and RFC 8216 §6.2.1 requires the server to say
+    /// so rather than leaving a player to accumulate straight through it.
+    pub discontinuity: bool,
 }
 
 /// One `#EXT-X-PART` row.
@@ -61,21 +75,65 @@ pub struct LowLatencyHints {
     pub can_block_reload: bool,
 }
 
+/// The largest `#EXT-X-TARGETDURATION` these rows require of a playlist.
+///
+/// RFC 8216 §4.3.3.1 states the constraint on the rows, not on the config:
+/// every `EXTINF`, **rounded to the nearest integer**, must be less than or
+/// equal to the advertised target. Nearest, not up — a 2.4 s row is 2 against
+/// a target of 2, and only a 2.5 s row needs 3.
+///
+/// The configured target is kept as a floor. Segments cut on the first IDR at
+/// or past it, so every row is at least that long anyway, and holding the
+/// floor keeps the tag on its familiar value instead of letting it be
+/// discovered from whichever row happened to arrive first.
+pub fn required_target_duration(config_target_secs: f64, entries: &[M3u8Entry]) -> u64 {
+    // A target of zero is not a playlist any player can schedule against, and
+    // `#EXT-X-TARGETDURATION:0` would take `HOLD-BACK` with it. Validation
+    // bounds `segment_duration_secs` to 1.0-10.0, so this only catches a
+    // config that reached here without passing through it.
+    max_rounded_extinf(entries)
+        .max(config_target_secs.max(0.0).ceil() as u64)
+        .max(1)
+}
+
+/// The longest row in the window, rounded the way §4.3.3.1 rounds it.
+fn max_rounded_extinf(entries: &[M3u8Entry]) -> u64 {
+    entries
+        .iter()
+        .map(|e| e.duration_secs.max(0.0).round() as u64)
+        .max()
+        .unwrap_or(0)
+}
+
 /// Build the HLS media playlist.
 ///
-/// - `target_duration_secs` is the **configured** target (rounded up to
-///   the next integer per RFC 8216 §4.3.3.1).
+/// - `target_duration` is the integer to publish as `#EXT-X-TARGETDURATION`,
+///   which the caller derives with [`required_target_duration`] and then holds
+///   as a high-water mark — see `CmafState::advertised_target_duration`. It is
+///   raised here to whatever these rows require, so a playlist can never
+///   advertise a target its own `#EXTINF` rows contradict, whatever the caller
+///   passes.
 /// - `entries` is the rolling window, newest last.
 /// - `init_uri` is the path (relative to the m3u8) of the init segment.
+/// - `discontinuity_sequence` is how many discontinuous entries have already
+///   been trimmed off the front of that window.
 /// - `ll_hints` — when `Some`, emit LL-HLS headers and part rows.
 pub fn build_hls_playlist(
-    target_duration_secs: f64,
+    target_duration: u64,
     entries: &[M3u8Entry],
     init_uri: &str,
+    discontinuity_sequence: u64,
     ll_hints: Option<&LowLatencyHints>,
 ) -> String {
     let media_sequence = entries.first().map(|e| e.sequence_number).unwrap_or(0);
-    let target_duration = target_duration_secs.ceil() as u64;
+    // Deriving this from the configured target — which is what it did — was
+    // legal only while every row was the configured length. The segmenter cuts
+    // on the first IDR at or past the target, so a GOP that does not divide it
+    // gives 5 s rows against a 2 s target, and once those rows started
+    // advertising their real length (they used to advertise the nominal one,
+    // which is a worse lie) the tag became a number its own playlist broke.
+    // `mediastreamvalidator` errors on it.
+    let target_duration = target_duration.max(max_rounded_extinf(entries)).max(1);
 
     let mut out = String::with_capacity(256 + entries.len() * 80);
     out.push_str("#EXTM3U\n");
@@ -86,6 +144,16 @@ pub fn build_hls_playlist(
     });
     out.push_str(&format!("#EXT-X-TARGETDURATION:{target_duration}\n"));
     out.push_str(&format!("#EXT-X-MEDIA-SEQUENCE:{media_sequence}\n"));
+    // Only when non-zero: an absent tag means zero (RFC 8216 §4.3.3.3), so a
+    // stream that has never re-anchored writes exactly the playlist it always
+    // did. It has to sit here — before the first media segment, and before any
+    // `#EXT-X-DISCONTINUITY` — because a player reads it to seed the running
+    // count it keeps for the rows it can still see.
+    if discontinuity_sequence > 0 {
+        out.push_str(&format!(
+            "#EXT-X-DISCONTINUITY-SEQUENCE:{discontinuity_sequence}\n"
+        ));
+    }
     // No `#EXT-X-PLAYLIST-TYPE`. This playlist is a rolling window:
     // the segmenter trims the oldest entries and `#EXT-X-MEDIA-SEQUENCE`
     // advances with them. RFC 8216 §4.3.3.5 reserves `EVENT` for
@@ -102,10 +170,13 @@ pub fn build_hls_playlist(
             "#EXT-X-PART-INF:PART-TARGET={:.3}\n",
             ll.part_target_secs
         ));
-        // Player hold-back: 3× target_duration is the spec default for
-        // LL-HLS. Setting CAN-BLOCK-RELOAD=YES signals support for
-        // `_HLS_msn`/`_HLS_part` blocking reloads.
-        let hold_back = (target_duration_secs * 3.0).max(3.0);
+        // `HOLD-BACK` must be at least three times the Target Duration, and
+        // the Target Duration is the tag above — not the configured segment
+        // length. Taken from the config, a 5 s GOP against a 2 s target
+        // published `HOLD-BACK=6.000` against `#EXT-X-TARGETDURATION:5`: 1.2
+        // segments of hold-back, which asks a player to start inside a segment
+        // that does not exist yet.
+        let hold_back = (target_duration as f64 * 3.0).max(3.0);
         let part_hold_back = (ll.part_target_secs * 3.0).max(ll.part_target_secs * 2.0 + 0.1);
         out.push_str(&format!(
             "#EXT-X-SERVER-CONTROL:CAN-BLOCK-RELOAD={},HOLD-BACK={:.3},PART-HOLD-BACK={:.3}\n",
@@ -129,11 +200,25 @@ pub fn build_hls_playlist(
     // And now that the dates come from the media timeline rather than from
     // `Utc::now()` at publish, each row is an independent statement about its
     // own segment rather than the same sample restated.
+    //
+    // Independent statements can contradict each other, which is what
+    // `#EXT-X-DISCONTINUITY` is for. The flow clock re-anchors on a source
+    // restart, and it also snaps when a source runs further out than its slew
+    // limit tracks — at 5 ms per 2 s segment, a 4000 ppm source snaps by ten
+    // seconds every couple of hours. Without the tag the window then holds
+    // thousands of rows on the old epoch and one on the new, every one of them
+    // claiming a clean `EXTINF` step from its neighbour.
     for e in entries {
         let uri = e
             .uri
             .clone()
             .unwrap_or_else(|| default_segment_uri(e.sequence_number));
+        // Before the date, not after: the tag declares that what follows it
+        // does not continue what came before, and the date that follows is
+        // the first statement made on the new timeline.
+        if e.discontinuity {
+            out.push_str("#EXT-X-DISCONTINUITY\n");
+        }
         if let Some(pdt) = e.program_date_time {
             out.push_str(&format!(
                 "#EXT-X-PROGRAM-DATE-TIME:{}\n",
@@ -143,10 +228,16 @@ pub fn build_hls_playlist(
         out.push_str(&format!("#EXTINF:{:.3},\n{uri}\n", e.duration_secs));
     }
 
-    // For LL-HLS we append the pre-advertised parts of the next segment
-    // to the *last* entry. The part URIs are expressed as segment URIs
-    // with a `?part=N` query suffix, which our chunked PUT handler
-    // recognises and routes to the same streaming upload.
+    // For LL-HLS we append the open segment's own parts after the last
+    // entry, which is that segment's row. The part URIs are expressed as
+    // segment URIs with a `?part=N` query suffix, which our chunked PUT
+    // handler recognises and routes to the same streaming upload.
+    //
+    // Note the ordering: §4.4.4.9 puts a segment's `EXT-X-PART` rows
+    // BEFORE its `#EXTINF`, and these land after it. Documented as a
+    // known limitation rather than silently tolerated — it is why a
+    // conforming player attributes these parts to the following media
+    // sequence number, which breaks `_HLS_msn`/`_HLS_part` addressing.
     if ll_hints.is_some()
         && let Some(last) = entries.last() {
             for p in &last.parts {
@@ -425,6 +516,7 @@ mod tests {
             uri: None,
             parts: Vec::new(),
             program_date_time: None,
+            discontinuity: false,
         }
     }
 
@@ -455,14 +547,14 @@ mod tests {
             dated_entry(12, 2.0, "2026-08-25T01:00:04Z"),
         ];
 
-        let p = build_hls_playlist(2.0, &all, "init.mp4", None);
+        let p = build_hls_playlist(2, &all, "init.mp4", 0, None);
         assert!(
             p.contains("#EXT-X-PROGRAM-DATE-TIME:2026-08-25T01:00:00.000Z"),
             "{p}"
         );
 
         // Trim the oldest, as the segmenter does, and the tag must move with it.
-        let rolled = build_hls_playlist(2.0, &all[1..], "init.mp4", None);
+        let rolled = build_hls_playlist(2, &all[1..], "init.mp4", 0, None);
         assert!(
             rolled.contains("#EXT-X-PROGRAM-DATE-TIME:2026-08-25T01:00:02.000Z"),
             "{rolled}"
@@ -521,7 +613,7 @@ mod tests {
             simple_entry(11, 2.0),
             dated_entry(12, 2.0, "2026-08-25T01:00:04Z"),
         ];
-        let p = build_hls_playlist(2.0, &mixed, "init.mp4", None);
+        let p = build_hls_playlist(2, &mixed, "init.mp4", 0, None);
         assert_eq!(
             p.matches("#EXT-X-PROGRAM-DATE-TIME").count(),
             2,
@@ -532,13 +624,13 @@ mod tests {
     /// No clock, no tag. An invented one would be believed.
     #[test]
     fn an_unknown_time_is_omitted_rather_than_guessed() {
-        let p = build_hls_playlist(2.0, &[simple_entry(0, 2.0)], "init.mp4", None);
+        let p = build_hls_playlist(2, &[simple_entry(0, 2.0)], "init.mp4", 0, None);
         assert!(!p.contains("#EXT-X-PROGRAM-DATE-TIME"), "{p}");
     }
 
     #[test]
     fn empty_playlist_has_headers_only() {
-        let p = build_hls_playlist(2.0, &[], "init.mp4", None);
+        let p = build_hls_playlist(2, &[], "init.mp4", 0, None);
         assert!(p.contains("#EXTM3U"));
         assert!(p.contains("#EXT-X-TARGETDURATION:2"));
         assert!(p.contains("#EXT-X-MEDIA-SEQUENCE:0"));
@@ -554,11 +646,12 @@ mod tests {
         // segments the origin has already evicted.
         let entries = vec![simple_entry(10, 2.0), simple_entry(11, 2.0)];
         for p in [
-            build_hls_playlist(2.0, &entries, "init.mp4", None),
+            build_hls_playlist(2, &entries, "init.mp4", 0, None),
             build_hls_playlist(
-                2.0,
+                2,
                 &entries,
                 "init.mp4",
+                0,
                 Some(&LowLatencyHints {
                     part_target_secs: 0.5,
                     can_block_reload: true,
@@ -577,7 +670,7 @@ mod tests {
             simple_entry(11, 1.95),
             simple_entry(12, 2.05),
         ];
-        let p = build_hls_playlist(2.0, &entries, "init.mp4", None);
+        let p = build_hls_playlist(2, &entries, "init.mp4", 0, None);
         assert!(p.contains("#EXT-X-MEDIA-SEQUENCE:10"));
         assert!(p.contains("#EXTINF:2.000,\nseg-00010.m4s"));
         assert!(p.contains("#EXTINF:1.950,\nseg-00011.m4s"));
@@ -593,18 +686,146 @@ mod tests {
             uri: Some("custom/path/x.m4s".to_string()),
             parts: Vec::new(),
             program_date_time: None,
+            discontinuity: false,
         }];
-        let p = build_hls_playlist(2.0, &entries, "init.mp4", None);
+        let p = build_hls_playlist(2, &entries, "init.mp4", 0, None);
         assert!(p.contains("custom/path/x.m4s"));
         assert!(!p.contains("seg-00001.m4s"));
     }
 
+    /// A row the flow clock re-anchored under says so, before its own date.
+    ///
+    /// Without the tag the playlist carries the contradiction in silence: on a
+    /// `dvr_window_secs: 9000` window that is 4499 rows on the old epoch and
+    /// one on the new, every one of them advertising a clean `EXTINF` step
+    /// from its neighbour. A player accumulates straight through it. RFC 8216
+    /// §6.2.1 makes signalling this the server's job.
+    #[test]
+    fn a_re_anchored_row_carries_a_discontinuity_tag() {
+        let mut entries = [
+            dated_entry(10, 2.0, "2026-08-25T01:00:00Z"),
+            dated_entry(11, 2.0, "2026-08-25T01:00:02Z"),
+            // The source restarted here, so this row's date does not follow
+            // its neighbour's.
+            dated_entry(12, 2.0, "2026-08-25T02:30:00Z"),
+        ];
+        entries[2].discontinuity = true;
+
+        let p = build_hls_playlist(2, &entries, "init.mp4", 0, None);
+        assert_eq!(
+            p.matches("#EXT-X-DISCONTINUITY\n").count(),
+            1,
+            "one break, one tag: {p}"
+        );
+        let tag = p.find("#EXT-X-DISCONTINUITY\n").expect("tag");
+        let date = p
+            .find("#EXT-X-PROGRAM-DATE-TIME:2026-08-25T02:30:00.000Z")
+            .expect("date");
+        assert!(tag < date, "the tag must precede the date it explains: {p}");
+        assert!(
+            p.find("seg-00011.m4s").expect("row") < tag,
+            "the tag landed on the wrong row: {p}"
+        );
+        // Nothing has aged out of the window, so there is no sequence tag.
+        assert!(!p.contains("#EXT-X-DISCONTINUITY-SEQUENCE"), "{p}");
+    }
+
+    /// The count of discontinuities that have already aged out is carried too.
+    ///
+    /// Once the tagged row is trimmed the playlist holds no trace of it, and a
+    /// player reloading across that trim would otherwise see its own
+    /// discontinuity count go backwards.
+    #[test]
+    fn the_discontinuity_sequence_counts_what_left_the_window() {
+        let p = build_hls_playlist(2, &[simple_entry(40, 2.0)], "init.mp4", 3, None);
+        assert!(p.contains("#EXT-X-DISCONTINUITY-SEQUENCE:3"), "{p}");
+        assert!(
+            p.find("#EXT-X-DISCONTINUITY-SEQUENCE:3").expect("tag")
+                < p.find("seg-00040.m4s").expect("row"),
+            "the tag must come before the first media segment: {p}"
+        );
+        // Absent means zero (RFC 8216 §4.3.3.3), so a stream that has never
+        // re-anchored writes exactly the playlist it always did.
+        let clean = build_hls_playlist(2, &[simple_entry(40, 2.0)], "init.mp4", 0, None);
+        assert!(!clean.contains("#EXT-X-DISCONTINUITY-SEQUENCE"), "{clean}");
+    }
+
+    /// An empty window still advertises the configured target, rounded up.
+    ///
+    /// Nothing in it constrains the tag, so the config is all there is, and
+    /// rounding a 1.4 s target down to 1 would put the very first row —
+    /// which cannot be shorter than 1.4 s, because the segmenter cuts at or
+    /// past the target — straight over the value just published.
     #[test]
     fn target_duration_rounded_up() {
-        let p = build_hls_playlist(1.4, &[], "init.mp4", None);
-        assert!(p.contains("#EXT-X-TARGETDURATION:2"));
-        let p = build_hls_playlist(6.01, &[], "init.mp4", None);
-        assert!(p.contains("#EXT-X-TARGETDURATION:7"));
+        assert_eq!(required_target_duration(1.4, &[]), 2);
+        assert_eq!(required_target_duration(6.01, &[]), 7);
+        let p = build_hls_playlist(required_target_duration(1.4, &[]), &[], "init.mp4", 0, None);
+        assert!(p.contains("#EXT-X-TARGETDURATION:2"), "{p}");
+    }
+
+    /// The tag describes the rows, not the config.
+    ///
+    /// RFC 8216 §4.3.3.1 constrains every `EXTINF` rounded to the nearest
+    /// integer to be no greater than the target. The segmenter cuts on the
+    /// first IDR at or past the configured target, so a GOP that does not
+    /// divide it produces rows longer than it — 5 s rows against a 2 s
+    /// target for a 5 s GOP. Those rows now carry their real length (the
+    /// alternative, which shipped, was a row claiming 2.000 while its
+    /// neighbour's `#EXT-X-PROGRAM-DATE-TIME` was 5 s later), so the tag has
+    /// to follow them or the playlist contradicts itself and Apple's
+    /// `mediastreamvalidator` errors on it.
+    #[test]
+    fn target_duration_follows_the_longest_row() {
+        let rows = [
+            simple_entry(10, 5.0),
+            simple_entry(11, 5.0),
+            simple_entry(12, 5.0),
+        ];
+        assert_eq!(required_target_duration(2.0, &rows), 5);
+        let p = build_hls_playlist(required_target_duration(2.0, &rows), &rows, "init.mp4", 0, None);
+        assert!(p.contains("#EXT-X-TARGETDURATION:5"), "{p}");
+        // Nearest, not up: a 2.4 s row rounds to 2 and needs no widening,
+        // and 2.5 s is where it does.
+        assert_eq!(required_target_duration(2.0, &[simple_entry(1, 2.4)]), 2);
+        assert_eq!(required_target_duration(2.0, &[simple_entry(1, 2.5)]), 3);
+    }
+
+    /// A caller that hands over a stale target does not get a broken playlist.
+    ///
+    /// The published value is a high-water mark held by the output, so it is
+    /// computed a call earlier than it is used. The builder raises it to what
+    /// the rows in front of it require, because a playlist advertising less
+    /// than it lists is the failure this whole tag exists to prevent — and
+    /// it is one line here versus a proof obligation on every caller.
+    #[test]
+    fn a_playlist_never_advertises_less_than_its_own_rows() {
+        let rows = [simple_entry(10, 2.0), simple_entry(11, 6.0)];
+        let p = build_hls_playlist(2, &rows, "init.mp4", 0, None);
+        assert!(p.contains("#EXT-X-TARGETDURATION:6"), "{p}");
+    }
+
+    /// `HOLD-BACK` is three times the target that was published.
+    ///
+    /// Derived from the configured segment length instead — which is what it
+    /// did — a 5 s GOP against a 2 s target published `HOLD-BACK=6.000`
+    /// beneath `#EXT-X-TARGETDURATION:5`: 1.2 segments, under the three
+    /// target durations the tag's own definition requires, and a player
+    /// starting there begins inside a segment the origin has not finished.
+    #[test]
+    fn hold_back_tracks_the_target_that_was_published() {
+        let ll = LowLatencyHints {
+            part_target_secs: 0.5,
+            can_block_reload: true,
+        };
+        let rows = [simple_entry(10, 5.0), simple_entry(11, 5.0)];
+        let target = required_target_duration(2.0, &rows);
+        let p = build_hls_playlist(target, &rows, "init.mp4", 0, Some(&ll));
+        assert!(p.contains("#EXT-X-TARGETDURATION:5"), "{p}");
+        assert!(p.contains("HOLD-BACK=15.000"), "{p}");
+        // PART-HOLD-BACK answers to the part target, not to this one, and
+        // three parts already clears its own two-part floor.
+        assert!(p.contains("PART-HOLD-BACK=1.500"), "{p}");
     }
 
     #[test]
@@ -613,7 +834,7 @@ mod tests {
             part_target_secs: 0.5,
             can_block_reload: true,
         };
-        let p = build_hls_playlist(2.0, &[], "init.mp4", Some(&ll));
+        let p = build_hls_playlist(2, &[], "init.mp4", 0, Some(&ll));
         assert!(p.contains("#EXT-X-VERSION:9"));
         assert!(p.contains("#EXT-X-PART-INF:PART-TARGET=0.500"));
         assert!(p.contains("#EXT-X-SERVER-CONTROL:"));
@@ -639,7 +860,7 @@ mod tests {
                 independent: false,
             },
         ];
-        let p = build_hls_playlist(2.0, &[last], "init.mp4", Some(&ll));
+        let p = build_hls_playlist(2, &[last], "init.mp4", 0, Some(&ll));
         assert!(p.contains("#EXT-X-PART:DURATION=0.500,URI=\"seg-00043.m4s?part=0\",INDEPENDENT=YES"));
         assert!(p.contains("#EXT-X-PART:DURATION=0.500,URI=\"seg-00043.m4s?part=1\"\n"));
     }

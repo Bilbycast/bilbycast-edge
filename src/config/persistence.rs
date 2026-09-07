@@ -115,8 +115,48 @@ pub fn load_config_split(config_path: &Path, secrets_path: &Path) -> Result<AppC
 
 /// Save configuration to split files (`config.json` + `secrets.json`).
 ///
-/// Extracts secrets from the in-memory `AppConfig`, writes the stripped
-/// operational config to `config.json` and encrypted secrets to `secrets.json`.
+/// Extracts secrets from the in-memory `AppConfig`, writes the encrypted
+/// secrets to `secrets.json` and the stripped operational config to
+/// `config.json`.
+///
+/// # Why `secrets.json` is written FIRST
+///
+/// Each file is already written atomically on its own — `save_config` and
+/// `save_secrets` both write a `.json.tmp` sibling and `rename(2)` it into
+/// place, so no reader ever sees a half-written file and a cut leaves either
+/// the whole old file or the whole new one. What was never ordered is the gap
+/// *between* the two renames, and that gap became reachable when `main` started
+/// leaving through `libc::_exit` (see `exit_without_static_teardown`): a cut
+/// there strands the node with one file updated and the other not.
+///
+/// The two orderings are not equally survivable, because the two files are not
+/// equally recoverable:
+///
+/// - **Old order (config first).** A cut leaves the new `config.json` beside
+///   the OLD `secrets.json`. For a `rotate_secret` that means the node is still
+///   holding the previous `node_secret` while the manager has recorded the new
+///   one, so the node fails auth on its next reconnect and the only way back is
+///   re-registration — a truck roll on an unattended edge.
+/// - **New order (secrets first).** A cut leaves the new `secrets.json` beside
+///   a stale `config.json`. The node authenticates, reconnects, and the manager
+///   reconciles the config drift on that reconnect exactly as it does for any
+///   other divergence — which is the whole point of config reconciliation. It
+///   strands nothing that cannot fix itself.
+///
+/// Moving the machine-seed lookup ahead of the `config.json` write is part of
+/// the same reasoning: it can fail (no `/etc/machine-id`, unreadable
+/// `.secrets_key`), and failing it after `config.json` had been rewritten
+/// produced precisely the stranding above with no crash needed.
+///
+/// # What this deliberately does NOT add
+///
+/// No `fsync`. The failure this ordering closes is a **process** exit, and
+/// `_exit` does not discard writes already handed to the kernel — a completed
+/// `rename(2)` stays completed, so the data is in the page cache and the next
+/// reader sees it. `fsync` buys durability against **power loss**, which is a
+/// different question, which neither file has ever had, and which paying for on
+/// every config mutation is a decision for whoever wants that guarantee to make
+/// deliberately rather than a side effect of fixing this.
 pub fn save_config_split(
     config_path: &Path,
     secrets_path: &Path,
@@ -124,18 +164,19 @@ pub fn save_config_split(
 ) -> Result<()> {
     let secrets = SecretsConfig::extract_from(config);
 
-    // Write stripped config to config.json
-    let mut stripped = config.clone();
-    stripped.strip_secrets();
-    save_config(config_path, &stripped)?;
-
-    // Write encrypted secrets to secrets.json (only if there are any)
+    // Write encrypted secrets to secrets.json FIRST (only if there are any) —
+    // see the ordering note above.
     if !secrets.is_empty() {
         let secrets_dir = secrets_path.parent().unwrap_or(Path::new("."));
         let machine_seed = crypto::get_machine_seed(secrets_dir)
             .context("Failed to obtain machine seed for secrets encryption")?;
         save_secrets(secrets_path, &secrets, &machine_seed)?;
     }
+
+    // Then the stripped config to config.json
+    let mut stripped = config.clone();
+    stripped.strip_secrets();
+    save_config(config_path, &stripped)?;
 
     Ok(())
 }
@@ -260,6 +301,65 @@ mod tests {
         let secrets = load_secrets(tmp.path(), "test-seed")
             .expect("`{}` secrets file must parse");
         assert!(secrets.is_empty());
+    }
+
+    /// `secrets.json` must be durable before `config.json` is touched.
+    ///
+    /// `main` leaves through `libc::_exit`, so a cut between the two writes
+    /// inside `save_config_split` is reachable. Written config-first, a
+    /// `rotate_secret` interrupted there strands the node on the OLD
+    /// `node_secret` while the manager has recorded the new one: the node fails
+    /// auth on reconnect and only re-registration gets it back. Written
+    /// secrets-first, the same cut leaves fresh credentials beside a stale
+    /// `config.json`, which the manager reconciles on the reconnect that now
+    /// succeeds.
+    ///
+    /// A failed `config.json` write stands in for the cut, because it is the
+    /// same question asked synchronously: did `secrets.json` land before
+    /// anything could stop us reaching it? Pointing `config_path` into a
+    /// directory that does not exist makes the temp-write leg of
+    /// `save_config`'s write-then-rename fail. Under the old ordering this test
+    /// fails at `load_secrets` with "No such file" — `secrets.json` was never
+    /// written at all.
+    #[test]
+    fn secrets_are_durable_before_config_json_is_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let secrets_path = dir.path().join("secrets.json");
+        // Parent does not exist, so `save_config`'s `.json.tmp` write fails.
+        let config_path = dir.path().join("no-such-dir").join("config.json");
+
+        let config = AppConfig {
+            manager: Some(
+                serde_json::from_value(serde_json::json!({
+                    "enabled": true,
+                    "urls": ["wss://manager.example/ws"],
+                    "node_id": "node-1",
+                    "node_secret": "rotated-secret",
+                }))
+                .expect("manager fixture"),
+            ),
+            ..Default::default()
+        };
+
+        let err = save_config_split(&config_path, &secrets_path, &config)
+            .expect_err("the config.json write must fail — otherwise this proves nothing");
+        assert!(
+            format!("{err:#}").contains("config"),
+            "expected the config.json write to be what failed, got: {err:#}"
+        );
+        assert!(
+            !config_path.exists(),
+            "config.json must not exist — the failure injection is not working"
+        );
+
+        let seed = crypto::get_machine_seed(dir.path()).unwrap();
+        let secrets = load_secrets(&secrets_path, &seed)
+            .expect("secrets.json must already be on disk when the config write fails");
+        assert_eq!(
+            secrets.manager_node_secret.as_deref(),
+            Some("rotated-secret"),
+            "the rotated node_secret must be the one that survived the cut"
+        );
     }
 
     #[test]

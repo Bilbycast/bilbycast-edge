@@ -1146,11 +1146,18 @@ fn build_resource_budget_payload(
                 .as_object_mut()
                 .map(|o| o.insert("vaapi".into(), v));
         }
-    // Why a compiled-in HW encoder family is unavailable — "blocked" (GPU
-    // present but the sandbox / permissions won't let us open it) vs
-    // "no_driver" (no GPU on this box). Additive; only present when at
-    // least one compiled-in family failed to open, so healthy hosts and
-    // no-HW-encoder builds pay nothing.
+    // Why a hardware encoder family is unusable here — "blocked" (GPU
+    // present but the sandbox / permissions won't let us open it),
+    // "busy" (session slots exhausted), "no_driver" (no such GPU on this
+    // box) or "not_built" (the GPU is present and healthy; this binary
+    // simply has no encoder for it — the `video-encoder-*` features are
+    // off by default). Additive; present whenever at least one family
+    // answered one of those, so a healthy host sends nothing and so does
+    // a host whose missing families have no hardware behind them. A
+    // no-HW-encoder build on a box with a GPU now DOES send this, which
+    // is the whole point of `not_built` — the manager must not fold an
+    // unrecognised status into "blocked", or an idle-but-fine GPU reads
+    // as a misconfigured one.
     if let Some(diags) = &static_caps.hw_encoder_diagnostics
         && let Ok(v) = serde_json::to_value(diags) {
             payload
@@ -2181,6 +2188,15 @@ async fn execute_command(
                     };
                     let force_restart = input_touches_hitless || restart_required;
 
+                    // What the surgical reconcile below could not apply in
+                    // place. Both halves report into these and the escalation
+                    // after the chain is shared, because an output-only edit
+                    // against a flow that is between lives needs exactly the
+                    // rebuild an input edit does — and used to get nothing at
+                    // all, since only the input half had a caller looking.
+                    let mut unreconciled_inputs: Vec<String> = Vec::new();
+                    let mut outputs_deferred = false;
+
                     if force_restart {
                         // Input change that touches a hitless leg, or any of
                         // the flow-level fields baked in at start — must
@@ -2232,8 +2248,12 @@ async fn execute_command(
                             _webrtc_sessions,
                         )
                         .await;
-                        diff_outputs(flow_manager, flow_id, &new_flow.output_ids, &cfg).await;
+                        outputs_deferred =
+                            diff_outputs(flow_manager, flow_id, &new_flow.output_ids, &cfg)
+                                .await
+                                .deferred_to_restart;
                         drop(cfg);
+                        unreconciled_inputs = unreconciled;
                         // The reconciler put a survivor on air because this push
                         // deleted the input that was active. Record it, or
                         // config.json stops tracking the runtime and the flow's
@@ -2241,50 +2261,6 @@ async fn execute_command(
                         if let Some(survivor) = forced_active.as_deref() {
                             let mut cfg = app_config.write().await;
                             apply_forced_active(&mut cfg, flow_id, survivor);
-                        }
-                        // An input the engine would not surrender means the
-                        // runtime is now carrying something the new config
-                        // does not contain. Escalating to a restart is the
-                        // only honest outcome: the alternative is to ack
-                        // success on a flow that is still forwarding it.
-                        if !unreconciled.is_empty() {
-                            tracing::warn!(
-                                "Update flow '{flow_id}': restarting — inputs [{}] could not be reconciled in place",
-                                unreconciled.join(", ")
-                            );
-                            // Resolve BEFORE destroying. This restart is a
-                            // recovery action on a flow nobody asked to
-                            // restart, so a rebuild that cannot even be
-                            // resolved must leave the flow alone rather than
-                            // take it off air to discover that.
-                            let resolved = {
-                                let cfg = app_config.read().await;
-                                cfg.resolve_flow(&new_flow).map_err(|e| e.to_string())?
-                            };
-                            let _ = flow_manager.destroy_flow(flow_id).await;
-                            let spawn_started_at = std::time::Instant::now();
-                            let _runtime = flow_manager
-                                .create_flow(resolved)
-                                .await
-                                .map_err(|e| e.to_string())?;
-                            #[cfg(feature = "webrtc")]
-                            register_whip_if_needed(_webrtc_sessions, &_runtime);
-                            #[cfg(feature = "webrtc")]
-                            register_whep_if_needed(_webrtc_sessions, &_runtime);
-                            // Same bind-failure gate the `force_restart` arm
-                            // above runs, for the same reason: without it a
-                            // flow that came back up unable to bind reports
-                            // success and only says otherwise in the journal.
-                            if let Some(err) = wait_for_first_bind_failure(
-                                flow_manager.event_sender(),
-                                flow_id,
-                                spawn_started_at,
-                            )
-                            .await
-                            {
-                                let _ = flow_manager.destroy_flow(flow_id).await;
-                                return Err(err);
-                            }
                         }
                     } else {
                         // Only outputs changed — diff surgically against the runtime.
@@ -2296,7 +2272,61 @@ async fn execute_command(
                             new_flow.output_ids.len(),
                         );
                         let cfg = app_config.read().await;
-                        diff_outputs(flow_manager, flow_id, &new_flow.output_ids, &cfg).await;
+                        outputs_deferred =
+                            diff_outputs(flow_manager, flow_id, &new_flow.output_ids, &cfg)
+                                .await
+                                .deferred_to_restart;
+                    }
+
+                    // An input the engine would not surrender means the runtime
+                    // is now carrying something the new config does not contain;
+                    // a deferred output reconcile means the runtime never saw
+                    // the edit at all. Escalating to a restart is the only
+                    // honest outcome for either: the alternative is to ack
+                    // success on a flow that did not take the change.
+                    if !unreconciled_inputs.is_empty() || outputs_deferred {
+                        let why = if unreconciled_inputs.is_empty() {
+                            "the output reconcile found no runtime to diff against".to_string()
+                        } else {
+                            format!(
+                                "inputs [{}] could not be reconciled in place",
+                                unreconciled_inputs.join(", ")
+                            )
+                        };
+                        tracing::warn!("Update flow '{flow_id}': restarting — {why}");
+                        // Resolve BEFORE destroying. This restart is a
+                        // recovery action on a flow nobody asked to
+                        // restart, so a rebuild that cannot even be
+                        // resolved must leave the flow alone rather than
+                        // take it off air to discover that.
+                        let resolved = {
+                            let cfg = app_config.read().await;
+                            cfg.resolve_flow(&new_flow).map_err(|e| e.to_string())?
+                        };
+                        let _ = flow_manager.destroy_flow(flow_id).await;
+                        let spawn_started_at = std::time::Instant::now();
+                        let _runtime = flow_manager
+                            .create_flow(resolved)
+                            .await
+                            .map_err(|e| e.to_string())?;
+                        #[cfg(feature = "webrtc")]
+                        register_whip_if_needed(_webrtc_sessions, &_runtime);
+                        #[cfg(feature = "webrtc")]
+                        register_whep_if_needed(_webrtc_sessions, &_runtime);
+                        // Same bind-failure gate the `force_restart` arm
+                        // above runs, for the same reason: without it a
+                        // flow that came back up unable to bind reports
+                        // success and only says otherwise in the journal.
+                        if let Some(err) = wait_for_first_bind_failure(
+                            flow_manager.event_sender(),
+                            flow_id,
+                            spawn_started_at,
+                        )
+                        .await
+                        {
+                            let _ = flow_manager.destroy_flow(flow_id).await;
+                            return Err(err);
+                        }
                     }
 
                     // Thumbnail cadence applies LIVE — push it to the running
@@ -2577,33 +2607,92 @@ async fn execute_command(
             let flow_id = action["flow_id"].as_str().ok_or("Missing flow_id")?;
             let output_id = action["output_id"].as_str().ok_or("Missing output_id")?;
             tracing::info!("Manager command: remove output '{output_id}' from flow '{flow_id}'");
-            // Stopping the running instance is best-effort; **detaching it from
-            // the flow is the job**.
+            // Stopping the running instance is best-effort; **detaching it
+            // from the flow is the job** — but only once the runtime has been
+            // asked whether it really has nothing to stop.
             //
-            // This used to abort on a runtime failure, before the config below
-            // was touched — which left an output that is in the config but not
-            // running impossible to remove at all: this path refused because
-            // the runtime had no such output ("not found in flow"), and
-            // `delete_output` refused because the config still listed it
+            // This used to abort on any runtime failure, before the config
+            // below was touched, which left an output that is in the config
+            // but not running impossible to remove at all: this path refused
+            // because the runtime had no such output ("not found in flow"),
+            // and `delete_output` refused because the config still listed it
             // ("is assigned to a flow — unassign first"). Two contradictory
-            // answers about one output, and no way out of it.
+            // answers about one output, and no way out of it. Observed on the
+            // demo rig: two CMAF outputs that never started sat permanently
+            // attached to a flow after their DVR session had been deleted,
+            // with the manager reporting the removal as successful. An output
+            // is spawned only when `OutputConfig::active()` (see the start
+            // loop in `FlowRuntime::start`), so a passive one has no handle
+            // for the whole life of the flow and that refusal was permanent.
             //
-            // Observed on the demo rig: two CMAF outputs that never started —
-            // their source was deactivated — sat permanently attached to a
-            // flow after their DVR session had been deleted, with the manager
-            // reporting the removal as successful.
+            // Swallowing *every* failure fixes that and opens a worse one,
+            // because the two errors `FlowManager::remove_output` can return
+            // do not mean the same thing:
             //
-            // So proceed regardless. The operator asked for the output to
-            // leave the flow; if the runtime cannot oblige, the config should
-            // still say what was asked for, and a restart reconciles it.
-            if let Err(e) = flow_manager.remove_output(flow_id, output_id).await {
-                tracing::warn!(
-                    output_id, flow_id, error = %e,
-                    "remove_output: runtime removal failed; detaching from the config anyway"
-                );
-            }
+            //   "Output '<id>' not found in flow '<flow>'" — the flow is
+            //     running and holds no handle for this output. Authoritative:
+            //     nothing of it is on the wire, and the config is the only
+            //     plane left to edit.
+            //   "Flow '<flow>' is not running" — says nothing whatsoever
+            //     about the output. `destroy_flow` removes the flow from the
+            //     registry BEFORE awaiting a stop that runs to tens of
+            //     seconds, and `create_flow` only inserts it once every task
+            //     has spawned; WS commands are spawned per frame and overlap
+            //     freely, so a restart in flight answers this too. Read as
+            //     "not present" it drops the output from the config while the
+            //     rebuild brings it back up from the snapshot it resolved —
+            //     running, absent from the config, invisible to the manager,
+            //     and removable by nobody, which is where this started.
+            //
+            // So classify rather than swallow — `classify_failed_output_removal`,
+            // on the same runtime-vs-registry evidence `diff_inputs` uses for
+            // #88 (and unit-tested against a live `FlowManager` for the same
+            // reason: every bug in that family was in how the helpers compose
+            // against a real runtime). `is_stopping` covers the
+            // teardown half of a restart and `enabled` in the config covers
+            // the rest of it — a flow that is enabled yet absent from the
+            // registry is between lives, and wants a retry rather than a
+            // config edit made against a runtime nobody can see. The cost of
+            // that is a flow which is enabled and permanently failed to start:
+            // its outputs cannot be detached until it is disabled, which the
+            // refusal says. That is the same trade `activate_input` makes a
+            // few hundred lines up, for the same ambiguity.
+            //
+            // The write guard is taken before the decision and held through
+            // it, so `enabled` cannot move between being read and being acted
+            // on. Lock order is app_config → output_handles, matching every
+            // other caller here (`diff_outputs` runs under a read guard);
+            // nothing under `src/engine/` touches `app_config`, so there is no
+            // inversion to create.
+            //
+            // The classification, the event and the two refusals all live in
+            // `resolve_failed_output_removal` rather than here, because this
+            // is not the only surface that detaches an output:
+            // `DELETE /api/v1/flows/{id}/outputs/{id}` does the same edit
+            // against the same two planes. It had its own copy of this logic
+            // and its own answer (gate on `is_running`, swallow the result),
+            // which is how the two ended up disagreeing about a flow that is
+            // between lives — one refusing, one editing the config anyway.
+            let runtime_removal = flow_manager.remove_output(flow_id, output_id).await;
             // Remove output_id reference from the flow (and optionally from top-level outputs)
             let mut cfg = app_config.write().await;
+            if let Err(e) = runtime_removal {
+                let enabled = cfg.flows.iter().any(|f| f.id == flow_id && f.enabled);
+                if let Err(refusal) =
+                    resolve_failed_output_removal(flow_manager, flow_id, output_id, enabled, &e)
+                        .await
+                {
+                    // Same two refusals, spelled for this surface: the manager
+                    // reads `command_ack.error_code`, so the retryable one
+                    // carries `flow_not_running` and the other carries none.
+                    return Err(match refusal {
+                        OutputDetachRefusal::StillAttached(msg) => CommandError::new(msg),
+                        OutputDetachRefusal::BetweenLives(msg) => {
+                            CommandError::with_code(msg, "flow_not_running")
+                        }
+                    });
+                }
+            }
             if let Some(flow) = cfg.flows.iter_mut().find(|f| f.id == flow_id) {
                 flow.output_ids.retain(|id| id != output_id);
             }
@@ -3480,6 +3569,16 @@ async fn execute_command(
                                 || flow_restart_required
                                 || !unswappable_inputs.is_empty();
 
+                            // What the surgical reconcile below could not apply
+                            // in place. Both halves report into these and the
+                            // escalation after the chain is shared — the same
+                            // shape the per-flow `update_flow` route uses, and
+                            // for the same reason: an output-only edit against a
+                            // flow that is between lives needs exactly the
+                            // rebuild an input edit does.
+                            let mut unreconciled_inputs: Vec<String> = Vec::new();
+                            let mut outputs_deferred = false;
+
                             if force_restart {
                                 tracing::info!(
                                     "Config diff: restarting flow '{id}' (input_touches_hitless={input_touches_hitless}, fields changed=[{}], inputs needing restart=[{}])",
@@ -3525,83 +3624,16 @@ async fn execute_command(
                                 if let Some(survivor) = forced_active {
                                     forced_actives.push((id.to_string(), survivor));
                                 }
-                                diff_outputs_with_configs(
+                                outputs_deferred = diff_outputs_with_configs(
                                     flow_manager,
                                     id,
                                     &new_flow.output_ids,
                                     &old_config,
                                     &new_config,
                                 )
-                                .await;
-                                // Same escalation as the per-flow update path:
-                                // an input the engine kept is an input this
-                                // config push did not actually apply, so
-                                // rebuild the flow from the config rather than
-                                // leave the two disagreeing.
-                                if !unreconciled.is_empty() {
-                                    tracing::warn!(
-                                        "Config diff: flow '{id}' restarting — inputs [{}] could not be reconciled in place",
-                                        unreconciled.join(", ")
-                                    );
-                                    // Resolve BEFORE destroying. A config push
-                                    // touches every flow and cannot abort on
-                                    // one of them, so a rebuild that was never
-                                    // going to resolve has to leave the flow
-                                    // running rather than take it off air on
-                                    // the way to finding that out.
-                                    match new_config.resolve_flow(new_flow) {
-                                        Ok(resolved) => {
-                                            let _ = flow_manager.destroy_flow(id).await;
-                                            match flow_manager.create_flow(resolved).await {
-                                                Ok(_runtime) => {
-                                                    #[cfg(feature = "webrtc")]
-                                                    register_whip_if_needed(
-                                                        _webrtc_sessions,
-                                                        &_runtime,
-                                                    );
-                                                    #[cfg(feature = "webrtc")]
-                                                    register_whep_if_needed(
-                                                        _webrtc_sessions,
-                                                        &_runtime,
-                                                    );
-                                                }
-                                                // This push still persists and
-                                                // still acks success, so a line
-                                                // in the journal is not enough:
-                                                // the flow is off air and only
-                                                // an event says so.
-                                                Err(e) => {
-                                                    tracing::error!(
-                                                        "Config diff: flow '{id}' failed to restart after unreconciled inputs: {e}"
-                                                    );
-                                                    flow_manager.event_sender().emit_flow(
-                                                        EventSeverity::Critical,
-                                                        category::FLOW,
-                                                        format!(
-                                                            "Flow '{id}' was stopped to apply a configuration change and could not be \
-                                                             restarted: {e}"
-                                                        ),
-                                                        id,
-                                                    );
-                                                }
-                                            }
-                                        }
-                                        Err(e) => {
-                                            tracing::error!(
-                                                "Config diff: flow '{id}' could not be resolved for restart: {e} — left running on its previous inputs"
-                                            );
-                                            flow_manager.event_sender().emit_flow(
-                                                EventSeverity::Critical,
-                                                category::FLOW,
-                                                format!(
-                                                    "Flow '{id}' is still carrying inputs the pushed configuration removed, and that \
-                                                     configuration could not be resolved to restart it: {e}"
-                                                ),
-                                                id,
-                                            );
-                                        }
-                                    }
-                                }
+                                .await
+                                .deferred_to_restart;
+                                unreconciled_inputs = unreconciled;
                             } else {
                                 // Roster unchanged — any definition edit was
                                 // already swapped in place above; reconcile
@@ -3612,7 +3644,95 @@ async fn execute_command(
                                     old_flow.output_ids.len(),
                                     new_flow.output_ids.len(),
                                 );
-                                diff_outputs_with_configs(flow_manager, id, &new_flow.output_ids, &old_config, &new_config).await;
+                                outputs_deferred = diff_outputs_with_configs(
+                                    flow_manager,
+                                    id,
+                                    &new_flow.output_ids,
+                                    &old_config,
+                                    &new_config,
+                                )
+                                .await
+                                .deferred_to_restart;
+                            }
+
+                            // Same escalation as the per-flow update path:
+                            // an input the engine kept is an input this
+                            // config push did not actually apply, and a
+                            // deferred output reconcile is a push the
+                            // runtime never saw at all. Rebuild the flow
+                            // from the config rather than leave the two
+                            // disagreeing.
+                            if !unreconciled_inputs.is_empty() || outputs_deferred {
+                                let why = if unreconciled_inputs.is_empty() {
+                                    "the output reconcile found no runtime to diff against"
+                                        .to_string()
+                                } else {
+                                    format!(
+                                        "inputs [{}] could not be reconciled in place",
+                                        unreconciled_inputs.join(", ")
+                                    )
+                                };
+                                tracing::warn!(
+                                    "Config diff: flow '{id}' restarting — {why}"
+                                );
+                                // Resolve BEFORE destroying. A config push
+                                // touches every flow and cannot abort on
+                                // one of them, so a rebuild that was never
+                                // going to resolve has to leave the flow
+                                // running rather than take it off air on
+                                // the way to finding that out.
+                                match new_config.resolve_flow(new_flow) {
+                                    Ok(resolved) => {
+                                        let _ = flow_manager.destroy_flow(id).await;
+                                        match flow_manager.create_flow(resolved).await {
+                                            Ok(_runtime) => {
+                                                #[cfg(feature = "webrtc")]
+                                                register_whip_if_needed(
+                                                    _webrtc_sessions,
+                                                    &_runtime,
+                                                );
+                                                #[cfg(feature = "webrtc")]
+                                                register_whep_if_needed(
+                                                    _webrtc_sessions,
+                                                    &_runtime,
+                                                );
+                                            }
+                                            // This push still persists and
+                                            // still acks success, so a line
+                                            // in the journal is not enough:
+                                            // the flow is off air and only
+                                            // an event says so.
+                                            Err(e) => {
+                                                tracing::error!(
+                                                    "Config diff: flow '{id}' failed to restart after an unreconciled diff: {e}"
+                                                );
+                                                flow_manager.event_sender().emit_flow(
+                                                    EventSeverity::Critical,
+                                                    category::FLOW,
+                                                    format!(
+                                                        "Flow '{id}' was stopped to apply a configuration change and could not be \
+                                                         restarted: {e}"
+                                                    ),
+                                                    id,
+                                                );
+                                            }
+                                        }
+                                    }
+                                    Err(e) => {
+                                        tracing::error!(
+                                            "Config diff: flow '{id}' could not be resolved for restart: {e} — left running on its previous configuration"
+                                        );
+                                        flow_manager.event_sender().emit_flow(
+                                            EventSeverity::Critical,
+                                            category::FLOW,
+                                            format!(
+                                                "Flow '{id}' is still running the inputs and outputs the pushed configuration \
+                                                 replaced, and that configuration could not be resolved to restart it: {e}"
+                                            ),
+                                            id,
+                                        );
+                                    }
+                                }
                             }
                         }
                         // else: !was_running && !should_run → no-op
@@ -5755,6 +5875,163 @@ async fn dispatch_replay_input_command(
     }
 }
 
+/// What a failed `FlowManager::remove_output` actually means, so the config
+/// edit behind it can be allowed or refused on evidence instead of on hope.
+///
+/// `remove_output` returns exactly two errors and they do not mean the same
+/// thing: "Output '<id>' not found in flow" is authoritative about the output,
+/// while "Flow '<id>' is not running" says nothing about it at all. Reading
+/// the second as the first is what lets an output keep emitting after the
+/// config has dropped it — see the long note at the `remove_output` command
+/// arm for how a restart resurrects it.
+#[derive(Debug, PartialEq, Eq)]
+enum FailedOutputRemoval {
+    /// The flow is running and holds no task for this output — a passive
+    /// output (only `OutputConfig::active()` ones are spawned), or one that
+    /// is already gone. Nothing of it is on the wire.
+    NotAttached,
+    /// The flow is running and still holds the output, so the removal failed
+    /// for some other reason. Unreachable today, kept because acking success
+    /// here is the one outcome that must never happen.
+    StillAttached,
+    /// Absent from the registry while something is bringing it back —
+    /// `destroy_flow` mid-teardown, or `create_flow` not yet finished
+    /// inserting. Its rebuild resolves from a snapshot taken before the
+    /// config edit, so the edit has to wait.
+    BetweenLives { why: &'static str },
+    /// Absent from the registry and not coming back on its own: a disabled
+    /// flow, or one no longer in the config. The config is the only plane
+    /// that still describes this output.
+    FlowAbsent,
+}
+
+/// Classify a failed runtime removal. `enabled_in_config` must be read under
+/// the same guard the config edit will run under, or it can move between the
+/// decision and the act.
+async fn classify_failed_output_removal(
+    flow_manager: &FlowManager,
+    flow_id: &str,
+    output_id: &str,
+    enabled_in_config: bool,
+) -> FailedOutputRemoval {
+    match flow_manager.running_output_ids(flow_id).await {
+        Some(ids) if ids.iter().any(|id| id == output_id) => {
+            FailedOutputRemoval::StillAttached
+        }
+        Some(_) => FailedOutputRemoval::NotAttached,
+        // `is_stopping` catches the teardown half of a restart. It does NOT
+        // catch the bring-up half: `create_flow` inserts into the registry
+        // only after every task has spawned, so for the length of a flow's
+        // bring-up it is in neither map while its outputs come up. `enabled`
+        // is what covers that, on the same reasoning `activate_input` uses to
+        // refuse a Take against a flow it cannot see.
+        None if flow_manager.is_stopping(flow_id) => FailedOutputRemoval::BetweenLives {
+            why: "is being torn down",
+        },
+        None if enabled_in_config => FailedOutputRemoval::BetweenLives {
+            why: "is enabled but not in the registry, so it is most likely restarting",
+        },
+        None => FailedOutputRemoval::FlowAbsent,
+    }
+}
+
+/// A failed runtime removal that must NOT be followed by a config edit, plus
+/// the sentence to hand back to whichever control surface asked.
+///
+/// Both surfaces refuse on both variants; they differ only in how a refusal is
+/// spelled on the wire — `command_ack.error_code` on the manager WS path, an
+/// HTTP status on the REST one — so the message is built here and the envelope
+/// is chosen by the caller.
+pub(crate) enum OutputDetachRefusal {
+    /// The flow is running and still holds the output. Acking success here is
+    /// the one outcome that must never happen.
+    StillAttached(String),
+    /// The flow is between lives. Retryable, and the message says so.
+    BetweenLives(String),
+}
+
+/// Reconcile a failed `FlowManager::remove_output` against the runtime, and say
+/// whether the config edit behind it may proceed.
+///
+/// `Ok(())` means nothing of the output can be running, the two planes have
+/// been reconciled by hand, and a Warning `output_detached_without_runtime_removal`
+/// event has been emitted recording that. `Err(_)` means the caller must leave
+/// the config alone and report the refusal.
+///
+/// **`enabled_in_config` must be read under the same guard the config edit will
+/// run under**, or it can move between the decision and the act. This function
+/// deliberately does not read it itself: the runtime removal cannot be done
+/// under that guard (`FlowRuntime::remove_output` awaits the output task's join
+/// with a 5 s timeout), so the sequence is removal → take guard → read
+/// `enabled` → call this, and only the caller holds the guard.
+///
+/// Shared by the `remove_output` manager command and
+/// `DELETE /api/v1/flows/{flow_id}/outputs/{output_id}`. It is shared rather
+/// than duplicated because the duplicate is what went wrong: the REST mirror
+/// gated its runtime removal on `is_running` and swallowed the result, so a
+/// flow that was mid-teardown or mid-bring-up skipped the runtime plane
+/// entirely and had its config edited anyway — the divergence the WS side had
+/// just closed.
+pub(crate) async fn resolve_failed_output_removal(
+    flow_manager: &FlowManager,
+    flow_id: &str,
+    output_id: &str,
+    enabled_in_config: bool,
+    runtime_error: &anyhow::Error,
+) -> Result<(), OutputDetachRefusal> {
+    // Only the two "nothing of it can be running" verdicts allow the config
+    // edit; the other two are refused so no surface reports a removal that did
+    // not happen.
+    let detached_because =
+        match classify_failed_output_removal(flow_manager, flow_id, output_id, enabled_in_config)
+            .await
+        {
+            FailedOutputRemoval::NotAttached => {
+                "the flow is running and had no task for it (a passive output, or one \
+                 already gone)"
+            }
+            FailedOutputRemoval::FlowAbsent => "the flow is not running",
+            FailedOutputRemoval::StillAttached => {
+                return Err(OutputDetachRefusal::StillAttached(format!(
+                    "Output '{output_id}' is still attached to running flow '{flow_id}' \
+                     after a failed removal: {runtime_error}"
+                )));
+            }
+            FailedOutputRemoval::BetweenLives { why } => {
+                return Err(OutputDetachRefusal::BetweenLives(format!(
+                    "Flow '{flow_id}' {why} — refusing to detach output '{output_id}' from \
+                     the config, because a rebuild resolves from a snapshot that still lists \
+                     it and would leave it running with nothing in the config to remove it \
+                     by. Retry shortly, or disable the flow first if it is not coming back."
+                )));
+            }
+        };
+    tracing::warn!(
+        output_id, flow_id, error = %runtime_error, reason = detached_because,
+        "remove_output: nothing to stop in the runtime; detaching from the config"
+    );
+    // The success path already emits from `FlowManager::remove_output`; this
+    // degraded one emitted nothing at all, so the only record that the two
+    // planes had been reconciled by hand was a log line on the node.
+    flow_manager.event_sender().emit_flow_with_details(
+        EventSeverity::Warning,
+        category::FLOW,
+        format!(
+            "Output '{output_id}' detached from flow '{flow_id}' in the config only — \
+             {detached_because}"
+        ),
+        flow_id,
+        serde_json::json!({
+            "error_code": "output_detached_without_runtime_removal",
+            "flow_id": flow_id,
+            "output_id": output_id,
+            "reason": detached_because,
+            "runtime_error": runtime_error.to_string(),
+        }),
+    );
+    Ok(())
+}
+
 /// Diff outputs between old and new config, applying surgical hot-add/remove.
 ///
 /// Reconcile a running flow's outputs against the new config.
@@ -5778,8 +6055,8 @@ async fn diff_outputs(
     flow_id: &str,
     new_output_ids: &[String],
     new_config: &AppConfig,
-) {
-    diff_outputs_inner(flow_manager, flow_id, new_output_ids, new_config, new_config).await;
+) -> OutputDiffOutcome {
+    diff_outputs_inner(flow_manager, flow_id, new_output_ids, new_config, new_config).await
 }
 
 /// Surgically reconcile a running flow's input set against `new_input_ids`,
@@ -6604,6 +6881,412 @@ mod config_diff_live_flow_tests {
 }
 
 #[cfg(test)]
+mod failed_output_removal_tests {
+    //! A failed `remove_output` is classified against a **live**
+    //! `FlowManager`, not asserted about.
+    //!
+    //! The command arm's whole job is to tell "the runtime has nothing to
+    //! stop" from "the runtime cannot answer right now", and the two are
+    //! reported by the same `Result::Err`. Get it wrong in the permissive
+    //! direction and an output keeps emitting after the config has dropped
+    //! it — running, absent from `config.json`, invisible to the manager and
+    //! removable by nobody. Get it wrong in the restrictive direction and a
+    //! passive output can never be detached, which is the bug the swallow was
+    //! added to fix.
+    //!
+    //! UDP on loopback throughout: real sockets, no peer required, hermetic.
+    use super::*;
+    use crate::config::models::{AppConfig, FlowConfig, InputDefinition, OutputConfig};
+    use crate::stats::collector::StatsCollector;
+
+    fn fm() -> Arc<FlowManager> {
+        let stats = Arc::new(StatsCollector::new());
+        let (event_sender, rx) = crate::manager::events::event_channel();
+        // Keep the receiver alive so the best-effort emitters don't turn every
+        // event into a send error under `-- --nocapture`.
+        Box::leak(Box::new(rx));
+        let resource_state = Arc::new(crate::engine::resource_monitor::SystemResourceState::new());
+        Arc::new(FlowManager::new(
+            stats,
+            false,
+            event_sender,
+            resource_state,
+            None,
+            None,
+            #[cfg(all(feature = "display", target_os = "linux"))]
+            crate::display::claim_registry::DisplayClaimRegistry::new(),
+            #[cfg(feature = "webrtc")]
+            None,
+        ))
+    }
+
+    fn udp_input(id: &str, port: u16) -> InputDefinition {
+        serde_json::from_value(serde_json::json!({
+            "id": id, "name": id, "active": true,
+            "type": "udp", "bind_addr": format!("127.0.0.1:{port}")
+        }))
+        .expect("input fixture")
+    }
+
+    /// `active: false` is the case the demo rig hit: `FlowRuntime::start`
+    /// loops over `config.outputs.iter().filter(|o| o.active())`, so a passive
+    /// output has no handle for the whole life of the flow.
+    fn udp_output(id: &str, port: u16, active: bool) -> OutputConfig {
+        serde_json::from_value(serde_json::json!({
+            "id": id, "name": id, "active": active,
+            "type": "udp", "dest_addr": format!("127.0.0.1:{port}")
+        }))
+        .expect("output fixture")
+    }
+
+    fn config(input: InputDefinition, output: OutputConfig) -> AppConfig {
+        let flow: FlowConfig = serde_json::from_value(serde_json::json!({
+            "id": "f1", "name": "f1",
+            "input_ids": [input.id.clone()],
+            "output_ids": [output.id().to_string()],
+        }))
+        .expect("flow fixture");
+        AppConfig {
+            inputs: vec![input],
+            outputs: vec![output],
+            flows: vec![flow],
+            ..Default::default()
+        }
+    }
+
+    async fn start(fm: &Arc<FlowManager>, cfg: &AppConfig) {
+        let resolved = cfg.resolve_flow(&cfg.flows[0]).expect("resolve");
+        fm.create_flow(resolved).await.expect("create_flow");
+    }
+
+    /// The permissive half, and the one the swallow was written for: a passive
+    /// output on a running flow. `remove_output` really does fail, and the
+    /// failure really does mean "nothing is running".
+    #[tokio::test]
+    async fn a_passive_output_on_a_running_flow_is_not_attached() {
+        let fm = fm();
+        let cfg = config(udp_input("a", 41901), udp_output("o", 41951, false));
+        start(&fm, &cfg).await;
+
+        assert_eq!(
+            fm.running_output_ids("f1").await,
+            Some(Vec::new()),
+            "a passive output must not have been spawned"
+        );
+        assert!(
+            fm.remove_output("f1", "o").await.is_err(),
+            "this is the failure the classification has to interpret; if it \
+             starts succeeding the arm below is dead code"
+        );
+
+        assert_eq!(
+            classify_failed_output_removal(&fm, "f1", "o", true).await,
+            FailedOutputRemoval::NotAttached,
+            "a running flow that holds no task for the output is authoritative — refusing \
+             here is what made a passive output impossible to detach at all"
+        );
+        let _ = fm.destroy_flow("f1").await;
+    }
+
+    /// The restrictive half. An output the runtime is still holding must never
+    /// be reported as absent, whatever the error said.
+    #[tokio::test]
+    async fn an_output_the_runtime_still_holds_is_never_read_as_absent() {
+        let fm = fm();
+        let cfg = config(udp_input("a", 41902), udp_output("o", 41952, true));
+        start(&fm, &cfg).await;
+
+        assert_eq!(
+            fm.running_output_ids("f1").await,
+            Some(vec!["o".to_string()]),
+            "an active output must be spawned"
+        );
+        assert_eq!(
+            classify_failed_output_removal(&fm, "f1", "o", true).await,
+            FailedOutputRemoval::StillAttached,
+        );
+        let _ = fm.destroy_flow("f1").await;
+    }
+
+    /// The window this change exists to close. "Flow is not running" says
+    /// nothing about the output, and an enabled flow that is absent from the
+    /// registry is between lives — `destroy_flow` removes it before awaiting a
+    /// stop that runs to tens of seconds, and `create_flow` inserts it only
+    /// after every task has spawned. A rebuild resolves from a snapshot that
+    /// still lists the output, so editing the config here leaves it running
+    /// and unremovable.
+    #[tokio::test]
+    async fn an_enabled_flow_absent_from_the_registry_is_refused() {
+        let fm = fm();
+        // Deliberately never started, which is what mid-restart looks like
+        // from the outside.
+        assert_eq!(
+            classify_failed_output_removal(&fm, "f1", "o", true).await,
+            FailedOutputRemoval::BetweenLives {
+                why: "is enabled but not in the registry, so it is most likely restarting",
+            },
+        );
+    }
+
+    /// And the escape hatch that keeps the original bug fixed: a disabled flow
+    /// is not coming back on its own, so nothing of the output can be running
+    /// and the config is the only plane left to edit.
+    #[tokio::test]
+    async fn a_disabled_flow_absent_from_the_registry_detaches() {
+        let fm = fm();
+        assert_eq!(
+            classify_failed_output_removal(&fm, "f1", "o", false).await,
+            FailedOutputRemoval::FlowAbsent,
+        );
+    }
+
+    /// A flow mid-teardown is neither running nor absent, and must be told
+    /// apart from both — the same `stopping` evidence #88 added for inputs.
+    ///
+    /// The window is held open deterministically rather than raced for: the
+    /// test takes a read guard on the runtime's `output_handles`, and
+    /// `FlowRuntime::stop` parks on the matching write. `destroy_flow` has by
+    /// then removed the flow from the registry and set the `stopping` mark,
+    /// and cannot clear it until `stop()` returns — which it cannot do until
+    /// the guard drops. A first version of this test spawned the teardown and
+    /// polled for the window; on a current-thread runtime the whole teardown
+    /// ran inside one scheduling slice, the window was never observed, and a
+    /// racy test that passes by never reaching its assertion proves nothing.
+    #[tokio::test]
+    async fn a_flow_being_torn_down_is_refused_even_when_disabled_in_config() {
+        let fm = fm();
+        let cfg = config(udp_input("a", 41903), udp_output("o", 41953, true));
+        start(&fm, &cfg).await;
+
+        let runtime = fm.get_runtime("f1").expect("flow should be running");
+        let handles_guard = runtime.output_handles.read().await;
+
+        let fm2 = Arc::clone(&fm);
+        let stop = tokio::spawn(async move { fm2.destroy_flow("f1").await });
+        // Hand the teardown the scheduler until it has published the mark.
+        // It cannot get past the `output_handles` write while the guard is
+        // held, so this terminates and then stays put.
+        let mut parked = false;
+        for _ in 0..1000 {
+            if fm.is_stopping("f1") {
+                parked = true;
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(parked, "teardown never published the `stopping` mark");
+        assert!(
+            !fm.is_running("f1"),
+            "`destroy_flow` removes the flow from the registry before stopping it — that \
+             gap is the whole reason `is_stopping` has to be consulted"
+        );
+
+        assert_eq!(
+            classify_failed_output_removal(&fm, "f1", "o", false).await,
+            FailedOutputRemoval::BetweenLives {
+                why: "is being torn down",
+            },
+            "a flow mid-teardown must not be read as absent — `enabled` is false here, so \
+             `is_stopping` is the only thing standing between the config edit and a \
+             runtime nobody can see"
+        );
+
+        drop(handles_guard);
+        let _ = stop.await;
+    }
+}
+
+#[cfg(test)]
+mod output_diff_live_flow_tests {
+    //! #88, output half: drive `diff_outputs` against a live `FlowManager`.
+    //!
+    //! The input half of this reconcile was fixed and the output half was not,
+    //! so `running_output_ids(..).unwrap_or_default()` kept fabricating an
+    //! empty running set for a flow that is not in the registry. Everything
+    //! downstream then reads as "already reconciled": the removal loop iterates
+    //! nothing, every add fails "Flow is not running" into a `tracing::warn!`,
+    //! and the push persists and acks success having applied none of it.
+    //!
+    //! UDP on loopback throughout: real sockets, no peer required, hermetic.
+    use super::*;
+    use crate::config::models::{AppConfig, FlowConfig, InputDefinition, OutputConfig};
+    use crate::stats::collector::StatsCollector;
+
+    fn fm() -> Arc<FlowManager> {
+        let stats = Arc::new(StatsCollector::new());
+        let (event_sender, rx) = crate::manager::events::event_channel();
+        // Keep the receiver alive so the best-effort emitters don't turn every
+        // event into a send error under `-- --nocapture`.
+        Box::leak(Box::new(rx));
+        let resource_state = Arc::new(crate::engine::resource_monitor::SystemResourceState::new());
+        Arc::new(FlowManager::new(
+            stats,
+            false,
+            event_sender,
+            resource_state,
+            None,
+            None,
+            #[cfg(all(feature = "display", target_os = "linux"))]
+            crate::display::claim_registry::DisplayClaimRegistry::new(),
+            #[cfg(feature = "webrtc")]
+            None,
+        ))
+    }
+
+    fn udp_input(id: &str, port: u16) -> InputDefinition {
+        serde_json::from_value(serde_json::json!({
+            "id": id, "name": id, "active": true,
+            "type": "udp", "bind_addr": format!("127.0.0.1:{port}")
+        }))
+        .expect("input fixture")
+    }
+
+    fn udp_output(id: &str, port: u16) -> OutputConfig {
+        serde_json::from_value(serde_json::json!({
+            "id": id, "name": id, "active": true,
+            "type": "udp", "dest_addr": format!("127.0.0.1:{port}")
+        }))
+        .expect("output fixture")
+    }
+
+    /// `outputs` are the flow's members; `spare` are defined on the node but
+    /// not attached, so a diff can add them.
+    fn config(input: InputDefinition, outputs: Vec<OutputConfig>, spare: Vec<OutputConfig>) -> AppConfig {
+        let flow: FlowConfig = serde_json::from_value(serde_json::json!({
+            "id": "f1", "name": "f1",
+            "input_ids": [input.id.clone()],
+            "output_ids": outputs.iter().map(|o| o.id().to_string()).collect::<Vec<_>>(),
+        }))
+        .expect("flow fixture");
+        let mut all = outputs;
+        all.extend(spare);
+        AppConfig {
+            inputs: vec![input],
+            outputs: all,
+            flows: vec![flow],
+            ..Default::default()
+        }
+    }
+
+    async fn start(fm: &Arc<FlowManager>, cfg: &AppConfig) {
+        let resolved = cfg.resolve_flow(&cfg.flows[0]).expect("resolve");
+        fm.create_flow(resolved).await.expect("create_flow");
+    }
+
+    /// The positive control, and the reason the guard cannot simply be "always
+    /// defer": against a flow that really is in the registry, the reconcile
+    /// still adds and removes in place and reports nothing to escalate.
+    #[tokio::test]
+    async fn a_running_flow_is_reconciled_in_place_and_defers_nothing() {
+        let fm = fm();
+        let cfg = config(
+            udp_input("a", 42001),
+            vec![udp_output("o1", 42051)],
+            vec![udp_output("o2", 42052)],
+        );
+        start(&fm, &cfg).await;
+
+        let outcome = diff_outputs(&fm, "f1", &["o2".to_string()], &cfg).await;
+
+        assert_eq!(
+            outcome,
+            OutputDiffOutcome::default(),
+            "a live flow needs no restart to take an output edit — that is the whole \
+             point of the surgical path"
+        );
+        assert_eq!(
+            fm.running_output_ids("f1").await,
+            Some(vec!["o2".to_string()]),
+            "o1 should have been torn down and o2 spawned"
+        );
+        let _ = fm.destroy_flow("f1").await;
+    }
+
+    /// #88: a flow that is not in the registry must not be diffed as if it were
+    /// running with zero outputs. Nothing was reconciled, so the caller has to
+    /// rebuild — the alternative is the push persisting and acking success
+    /// while the rebuild in flight brings the OLD output set back up.
+    #[tokio::test]
+    async fn an_absent_flow_defers_the_whole_output_set_to_a_restart() {
+        let fm = fm();
+        let cfg = config(
+            udp_input("a", 42002),
+            vec![udp_output("o1", 42053)],
+            vec![udp_output("o2", 42054)],
+        );
+        // Deliberately never started, which is what mid-restart looks like
+        // from the outside.
+        let outcome = diff_outputs(&fm, "f1", &["o2".to_string()], &cfg).await;
+        assert!(
+            outcome.deferred_to_restart,
+            "diffing outputs against a flow that is not running must escalate, not \
+             report success"
+        );
+    }
+
+    /// Why the outcome is a flag and not the id list the input half returns.
+    ///
+    /// A flow with no outputs at all is legal, so "the new output set" is an
+    /// empty list on exactly the push that removed the last output — the push
+    /// that most needs the escalation. Carried as ids, that push would report
+    /// nothing to escalate and slip straight back through the #88 hole.
+    #[tokio::test]
+    async fn removing_the_last_output_from_an_absent_flow_still_escalates() {
+        let fm = fm();
+        let cfg = config(udp_input("a", 42003), vec![udp_output("o1", 42055)], vec![]);
+        let outcome = diff_outputs(&fm, "f1", &[], &cfg).await;
+        assert!(
+            outcome.deferred_to_restart,
+            "an empty new output set is a real edit, not 'nothing to do'"
+        );
+    }
+
+    /// A flow mid-teardown is neither running nor absent and must be told apart
+    /// from both — `destroy_flow` drops it from the registry before awaiting a
+    /// stop that runs to tens of seconds.
+    ///
+    /// The window is held open deterministically rather than raced for: the
+    /// test takes a read guard on the runtime's `output_handles` and
+    /// `FlowRuntime::stop` parks on the matching write, so the flow stays in
+    /// the gap until the guard drops. A version that spawned the teardown and
+    /// polled would, on a current-thread runtime, run the whole teardown inside
+    /// one scheduling slice and pass by never reaching its assertion.
+    #[tokio::test]
+    async fn a_flow_being_torn_down_defers_rather_than_reporting_an_empty_runtime() {
+        let fm = fm();
+        let cfg = config(udp_input("a", 42004), vec![udp_output("o1", 42056)], vec![]);
+        start(&fm, &cfg).await;
+
+        let runtime = fm.get_runtime("f1").expect("flow should be running");
+        let handles_guard = runtime.output_handles.read().await;
+
+        let fm2 = Arc::clone(&fm);
+        let stop = tokio::spawn(async move { fm2.destroy_flow("f1").await });
+        let mut parked = false;
+        for _ in 0..1000 {
+            if fm.is_stopping("f1") {
+                parked = true;
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(parked, "teardown never published the `stopping` mark");
+
+        // Not under the guard: `running_output_ids` takes a read lock too, and
+        // read locks are shared, so this observes the registry miss rather than
+        // deadlocking on the parked writer.
+        let outcome = diff_outputs(&fm, "f1", &["o1".to_string()], &cfg).await;
+        assert!(
+            outcome.deferred_to_restart,
+            "a flow mid-teardown must not be read as 'running with no outputs'"
+        );
+
+        drop(handles_guard);
+        let _ = stop.await;
+    }
+}
+
+#[cfg(test)]
 mod forced_active_writeback_tests {
     //! #87: the reconciler's forced Take must reach `config.json`.
     //!
@@ -7311,8 +7994,28 @@ async fn diff_outputs_with_configs(
     new_output_ids: &[String],
     old_config: &AppConfig,
     new_config: &AppConfig,
-) {
-    diff_outputs_inner(flow_manager, flow_id, new_output_ids, old_config, new_config).await;
+) -> OutputDiffOutcome {
+    diff_outputs_inner(flow_manager, flow_id, new_output_ids, old_config, new_config).await
+}
+
+/// What [`diff_outputs`] could not apply in place, and therefore what the
+/// caller has to escalate to a full flow restart.
+///
+/// A flag rather than the id list [`InputDiffOutcome`] carries, because the two
+/// halves are not symmetric: a flow with **no** outputs at all is a legal flow,
+/// so an empty list would read as "nothing to escalate" on exactly the push
+/// that removed the last output — the case this type exists for.
+///
+/// `#[must_use]` deliberately. This is a `bool` in a coat, and the defect it
+/// closes was a reconcile whose result nobody looked at; a future call site
+/// that forgets to look has to be a compile-time warning, not a repeat.
+#[must_use]
+#[derive(Debug, Default, PartialEq, Eq)]
+struct OutputDiffOutcome {
+    /// The flow was absent from the registry, so **nothing** was reconciled —
+    /// no removal, no add, no replacement — and the new output set reaches the
+    /// runtime only via a rebuild.
+    deferred_to_restart: bool,
 }
 
 async fn diff_outputs_inner(
@@ -7321,13 +8024,44 @@ async fn diff_outputs_inner(
     new_output_ids: &[String],
     old_config: &AppConfig,
     new_config: &AppConfig,
-) {
+) -> OutputDiffOutcome {
     use std::collections::HashSet;
 
-    let running_ids: Vec<String> = flow_manager
-        .running_output_ids(flow_id)
-        .await
-        .unwrap_or_default();
+    // The #88 trap, on the output half of the same reconcile the input half
+    // already had fixed. `running_output_ids` returns `None` for a flow that is
+    // not in the registry, and `unwrap_or_default()` turns that into "running
+    // with no outputs at all": the removal loop iterates nothing, every add
+    // fails "Flow is not running" into a `tracing::warn!`, the replacement arm
+    // is never reached — and `update_flow` / `update_config` persist the new
+    // config and ack success having applied none of it.
+    //
+    // That is not a narrow window. A flow is absent from the registry for the
+    // whole of a restart: `destroy_flow` removes it before awaiting a stop that
+    // runs to tens of seconds, and `create_flow` inserts it only once every
+    // task has spawned. Whatever rebuild is in flight resolved from a snapshot
+    // taken BEFORE this edit, so it brings the old output set back up while the
+    // config on disk describes the new one — an output running, absent from
+    // `config.json`, and removable by nobody.
+    //
+    // Report it as unreconciled instead of retrying, exactly as `diff_inputs`
+    // does: the caller destroys and rebuilds the flow from the new config,
+    // which is the only outcome that actually applies the operator's edit. A
+    // retry loop would have to guess how long a teardown takes and would still
+    // be racing the same rebuild.
+    let Some(running_ids) = flow_manager.running_output_ids(flow_id).await else {
+        let why = if flow_manager.is_stopping(flow_id) {
+            "mid-teardown"
+        } else {
+            "not in the registry"
+        };
+        tracing::warn!(
+            "Config diff: flow '{flow_id}' is {why} — deferring its output reconcile to a \
+             full restart rather than diffing against a flow that is not there"
+        );
+        return OutputDiffOutcome {
+            deferred_to_restart: true,
+        };
+    };
     let running_set: HashSet<&str> = running_ids.iter().map(|s| s.as_str()).collect();
     let new_set: HashSet<&str> = new_output_ids.iter().map(|s| s.as_str()).collect();
 
@@ -7408,6 +8142,13 @@ async fn diff_outputs_inner(
             }
         }
     }
+
+    // The flow was in the registry throughout, so every delta above was
+    // dispatched against a runtime that could answer. Per-output failures are
+    // reported as events by the arms that raise them and deliberately do not
+    // condemn the whole flow to a restart — only "there was no runtime to diff
+    // against at all" does.
+    OutputDiffOutcome::default()
 }
 
 /// Persist config to disk (fire-and-forget, logs on error).

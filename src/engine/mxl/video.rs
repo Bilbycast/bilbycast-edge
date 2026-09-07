@@ -18,7 +18,7 @@
 
 /// Bytes per row for V210 video at the given pixel width.
 pub fn v210_row_stride(width: u32) -> usize {
-    let groups = (width as usize + 47) / 48;
+    let groups = (width as usize).div_ceil(48);
     groups * 128
 }
 
@@ -88,13 +88,21 @@ pub fn pack_v210(
             let mut yp = [64u16; 6];
             let mut cbp = [512u16; 3];
             let mut crp = [512u16; 3];
-            for i in 0..rem {
-                yp[i] = y_row[yi + i];
-            }
-            for i in 0..(rem + 1) / 2 {
-                cbp[i] = cb_row[ci + i];
-                crp[i] = cr_row[ci + i];
-            }
+            // These are `copy_from_slice`, not indexed loops, so a length
+            // mismatch is a panic rather than a quiet short copy — state the
+            // bound that makes them equal. `rem` is `w % 6`, so 1..=5 luma
+            // samples; `crem` is its 4:2:2 chroma half, so 1..=3. Both fit the
+            // fixed-size pads above. On the source side `yi + rem == w` and,
+            // for the even widths 4:2:2 requires, `ci + crem == cw` — so each
+            // copy stops exactly at the end of this row and never spills into
+            // the next one, which `y_row`/`cb_row`/`cr_row` (open-ended slices
+            // into the whole plane) would otherwise happily let it do.
+            // Everything past `rem`/`crem` keeps the limited-range 10-bit black
+            // initialised above: that is what pads the group out to 6 pixels.
+            let crem = rem.div_ceil(2);
+            yp[..rem].copy_from_slice(&y_row[yi..yi + rem]);
+            cbp[..crem].copy_from_slice(&cb_row[ci..ci + crem]);
+            crp[..crem].copy_from_slice(&cr_row[ci..ci + crem]);
             let w0 = (cbp[0] as u32 & 0x3FF)
                 | ((yp[0] as u32 & 0x3FF) << 10)
                 | ((crp[0] as u32 & 0x3FF) << 20);
@@ -197,16 +205,62 @@ pub fn unpack_v210(
                 (w2 & 0x3FF) as u16,
                 ((w3 >> 10) & 0x3FF) as u16,
             ];
-            for i in 0..rem {
-                y_row[yi + i] = yp[i];
-            }
-            for i in 0..(rem + 1) / 2 {
-                cb_row[ci + i] = cbp[i];
-                cr_row[ci + i] = crp[i];
-            }
+            // Mirror of the pack side's tail, and the same bound proof
+            // applies in reverse: `copy_from_slice` panics on a length
+            // mismatch instead of truncating, and `rem` (1..=5) / `crem`
+            // (1..=3) land exactly on `yi + rem == w` and `ci + crem == cw`,
+            // so a decoded group writes this row and stops. The group's
+            // remaining pixels were decoded into `yp`/`cbp`/`crp` above and
+            // are deliberately dropped here — they are the packer's black
+            // padding, not source samples, and writing them would run past
+            // the row into the next one's leading pixels.
+            let crem = rem.div_ceil(2);
+            y_row[yi..yi + rem].copy_from_slice(&yp[..rem]);
+            cb_row[ci..ci + crem].copy_from_slice(&cbp[..crem]);
+            cr_row[ci..ci + crem].copy_from_slice(&crp[..crem]);
         }
     }
     (y, cb, cr)
+}
+
+/// Build the libmxl video flow definition JSON (v210_flow.json shape, per
+/// `vendor/mxl/lib/tests/data/v210_flow.json`). Used by the writer side of
+/// MXL video outputs to declare the flow before opening a GrainWriter.
+pub fn build_video_flow_def(
+    flow_name: &str,
+    width: u32,
+    height: u32,
+    frame_rate_num: u32,
+    frame_rate_den: u32,
+) -> (String, uuid::Uuid) {
+    let flow_id = uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_DNS, flow_name.as_bytes());
+    let json = format!(
+        r#"{{
+            "description": "bilbycast-edge MXL video flow {flow_name}",
+            "id": "{flow_id}",
+            "tags": {{ "urn:x-nmos:tag:grouphint/v1.0": ["{flow_name}:Video"] }},
+            "format": "urn:x-nmos:format:video",
+            "label": "{flow_name}",
+            "parents": [],
+            "media_type": "video/v210",
+            "grain_rate": {{
+                "numerator": {frame_rate_num},
+                "denominator": {frame_rate_den}
+            }},
+            "frame_width": {width},
+            "frame_height": {height},
+            "interlace_mode": "progressive",
+            "colorspace": "BT709",
+            "components": [
+                {{ "name": "Y",  "width": {width},     "height": {height}, "bit_depth": 10 }},
+                {{ "name": "Cb", "width": {}, "height": {height}, "bit_depth": 10 }},
+                {{ "name": "Cr", "width": {}, "height": {height}, "bit_depth": 10 }}
+            ]
+        }}"#,
+        width / 2,
+        width / 2
+    );
+    (json, flow_id)
 }
 
 #[cfg(test)]
@@ -295,44 +349,36 @@ mod tests {
         assert_eq!(v210_row_stride(1280), 3456);  // ceil(1280/48) = 27 groups
         assert_eq!(v210_row_stride(3840), 10240); // 3840/48 = 80 groups
     }
-}
 
-/// Build the libmxl video flow definition JSON (v210_flow.json shape, per
-/// `vendor/mxl/lib/tests/data/v210_flow.json`). Used by the writer side of
-/// MXL video outputs to declare the flow before opening a GrainWriter.
-pub fn build_video_flow_def(
-    flow_name: &str,
-    width: u32,
-    height: u32,
-    frame_rate_num: u32,
-    frame_rate_den: u32,
-) -> (String, uuid::Uuid) {
-    let flow_id = uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_DNS, flow_name.as_bytes());
-    let json = format!(
-        r#"{{
-            "description": "bilbycast-edge MXL video flow {flow_name}",
-            "id": "{flow_id}",
-            "tags": {{ "urn:x-nmos:tag:grouphint/v1.0": ["{flow_name}:Video"] }},
-            "format": "urn:x-nmos:format:video",
-            "label": "{flow_name}",
-            "parents": [],
-            "media_type": "video/v210",
-            "grain_rate": {{
-                "numerator": {frame_rate_num},
-                "denominator": {frame_rate_den}
-            }},
-            "frame_width": {width},
-            "frame_height": {height},
-            "interlace_mode": "progressive",
-            "colorspace": "BT709",
-            "components": [
-                {{ "name": "Y",  "width": {width},     "height": {height}, "bit_depth": 10 }},
-                {{ "name": "Cb", "width": {}, "height": {height}, "bit_depth": 10 }},
-                {{ "name": "Cr", "width": {}, "height": {height}, "bit_depth": 10 }}
-            ]
-        }}"#,
-        width / 2,
-        width / 2
-    );
-    (json, flow_id)
+    #[test]
+    fn tail_group_round_trips_at_every_reachable_remainder() {
+        // The tail of each row (`rem = w % 6` pixels that don't fill a
+        // 6-pixel V210 group) is copied with `copy_from_slice`, where a
+        // wrong length is a panic or a corrupted row rather than a lint.
+        // 4:2:2 only ever presents an even width, so the reachable
+        // remainders are exactly {0, 2, 4} — and until this test only
+        // rem == 4 was covered, by `round_trip_width_not_divisible_by_6`
+        // at w = 1918. Pin all three so a future edit to that arithmetic
+        // cannot quietly drop or duplicate the last pixels of a row.
+        for w in [12u32, 1920, 8, 1916, 10, 1918] {
+            let h = 3u32;
+            let (wu, hu) = (w as usize, h as usize);
+            let cw = wu / 2;
+            let rem = wu % 6;
+            let y: Vec<u16> = (0..wu * hu).map(|i| ((i * 7) % 1024) as u16).collect();
+            let cb: Vec<u16> = (0..cw * hu).map(|i| ((i * 11) % 1024) as u16).collect();
+            let cr: Vec<u16> = (0..cw * hu).map(|i| ((i * 13) % 1024) as u16).collect();
+
+            let packed = pack_v210(&y, &cb, &cr, w, h);
+            assert_eq!(packed.len(), v210_frame_bytes(w, h), "w={w} rem={rem}");
+
+            // Every real sample must survive — the tail writes exactly to the
+            // row end (`yi + rem == w`, `ci + rem/2 == cw`), so nothing is
+            // left unwritten and nothing bleeds into the next row.
+            let (y2, cb2, cr2) = unpack_v210(&packed, w, h);
+            assert_eq!(y, y2, "luma w={w} rem={rem}");
+            assert_eq!(cb, cb2, "cb w={w} rem={rem}");
+            assert_eq!(cr, cr2, "cr w={w} rem={rem}");
+        }
+    }
 }

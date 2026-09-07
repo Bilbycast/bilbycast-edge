@@ -61,7 +61,7 @@ use encode::{AudioReencoder, VideoReencoder};
 use fmp4::{AudioTrack, Sample, VideoCodec, VideoTrack};
 use manifest::{
     DashAudioRep, DashInput, DashVideoRep, HlsPartEntry, LowLatencyHints, M3u8Entry,
-    build_dash_mpd, build_hls_playlist, default_segment_uri,
+    build_dash_mpd, build_hls_playlist, default_segment_uri, required_target_duration,
 };
 use segmenter::{
     AudioSegmenter, CompletedSegment, PushOutcome, SegmentKind, VideoSegmenter,
@@ -227,7 +227,6 @@ fn hex_nibble(c: u8) -> Result<u8, String> {
     }
 }
 
-/// Mid-loop output state.
 /// Wall clock corresponding to source PTS 0, per flow.
 ///
 /// Keyed on the **flow**, not the output, and that is the point: two
@@ -237,8 +236,36 @@ fn hex_nibble(c: u8) -> Result<u8, String> {
 /// *same* date for the same content, which is what lets a player put a
 /// full-resolution still over a low-resolution picture and land on the frame
 /// it replaced.
+///
+/// "The same number in both" holds only while both outputs have counted the
+/// same 33-bit PTS wraps, and `PtsUnwrap` is per output. A rendition added —
+/// or restarted under `UpdateFlow` — after a wrap counts none and reports the
+/// same content 2^33 ticks lower, so [`FlowClock::align`] puts an incoming
+/// position back on the flow's own lap before anything else looks at it.
 static FLOW_EPOCHS: std::sync::OnceLock<std::sync::Mutex<HashMap<String, FlowClock>>> =
     std::sync::OnceLock::new();
+
+/// The flow-clock map, created on first use.
+fn flow_clocks() -> &'static std::sync::Mutex<HashMap<String, FlowClock>> {
+    FLOW_EPOCHS.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+/// Take the flow-clock lock, recovering from poisoning rather than unwrapping.
+///
+/// A panic somewhere else must not take an output down over a timestamp: what
+/// sits behind this lock is a clock estimate, and the worst a recovered entry
+/// can hold is one stale epoch, which the re-anchor test corrects.
+fn lock_flow_clocks() -> std::sync::MutexGuard<'static, HashMap<String, FlowClock>> {
+    match flow_clocks().lock() {
+        Ok(g) => g,
+        Err(e) => e.into_inner(),
+    }
+}
+
+/// `d` seconds as a `chrono::Duration`.
+fn secs(d: f64) -> chrono::Duration {
+    chrono::Duration::nanoseconds((d * 1e9) as i64)
+}
 
 /// A flow's shared clock: the epoch, plus the epoch that was in force for each
 /// of the last few segments.
@@ -258,13 +285,51 @@ struct FlowClock {
     /// Low-passed estimate of the wall clock the samples imply, which is what
     /// the epoch is steered towards. See [`EPOCH_FILTER_GAIN`].
     filtered: chrono::DateTime<chrono::Utc>,
-    /// `(base_dts_90k, epoch used)`, oldest first.
-    recent: VecDeque<(u64, chrono::DateTime<chrono::Utc>)>,
+    /// The last media position this flow dated, after alignment. Incoming
+    /// positions are brought onto the same 33-bit lap as this one — see
+    /// [`FlowClock::align`].
+    dts_ref: u64,
+    /// `(base_dts_90k, epoch used, whether that segment re-anchored)`, oldest
+    /// first.
+    ///
+    /// The flag is remembered alongside the epoch because a re-anchor is
+    /// discovered exactly once — by whichever rendition closes the segment
+    /// first — and the sibling closing that same segment is answered from this
+    /// cache instead of taking a sample of its own. Left out, the sibling
+    /// reproduced the date and published it bare: the identical jump, tagged
+    /// on one playlist and silent on the other, so the two renditions
+    /// disagreed about `#EXT-X-DISCONTINUITY-SEQUENCE` — which RFC 8216
+    /// §4.3.3.3 makes a cross-rendition invariant, because a player switching
+    /// renditions carries its count across.
+    ///
+    /// **That invariant holds only while the two renditions are less than one
+    /// segment apart in wall time**, and the bound is set by
+    /// [`FlowClock::reanchor`] clearing this cache. A rendition still holding a
+    /// *pre*-restart segment to close when its sibling re-anchors finds nothing
+    /// here, samples for itself, implies the old epoch and re-anchors back —
+    /// after which the two take turns re-anchoring each other. Modelled on a
+    /// 2 s-segment flow restarting at segment 20: 45 ms, 0.5 s, 1.5 s and 1.9 s
+    /// of skew agree exactly; 2.5 s gives two date and two flag disagreements;
+    /// 8 s gives six. Pinned by
+    /// `renditions_agree_across_a_re_anchor_within_a_segment_of_skew`, and
+    /// argued out in `docs/cmaf.md` — including why the clear stays (a source
+    /// restarting at PTS 0 re-uses `base_dts` values this cache still holds,
+    /// and the lookup below returns the *oldest* match, so keeping them would
+    /// answer a post-restart segment out of the pre-restart epoch: an
+    /// hour-stale date with no tag at all).
+    recent: VecDeque<(u64, chrono::DateTime<chrono::Utc>, bool)>,
+    /// When the timeline last re-anchored, and how many re-anchors have
+    /// arrived in an unbroken run of them — see [`REANCHOR_THRASH_SECS`].
+    last_reanchor: Option<chrono::DateTime<chrono::Utc>>,
+    reanchor_run: u32,
 }
 
 /// How many segments' epochs to remember. Two renditions, a segment or two of
 /// skew, and room to spare.
 const FLOW_CLOCK_HISTORY: usize = 16;
+
+/// One lap of the 33-bit MPEG-TS PTS clock, in 90 kHz ticks — 26 h 30 m.
+const PTS_LAP_90K: u64 = 1 << 33;
 
 /// How far the implied epoch may move before it is treated as a new timeline
 /// rather than as jitter.
@@ -273,6 +338,13 @@ const FLOW_CLOCK_HISTORY: usize = 16;
 /// discontinuity, or a flow reconfigured under the same id moves it by the
 /// whole elapsed time, so there is a wide gap to sit in.
 const EPOCH_REANCHOR_SECS: f64 = 10.0;
+
+/// Two re-anchors closer together than this are not two source restarts.
+const REANCHOR_THRASH_SECS: f64 = 60.0;
+
+/// How long a run of rapid re-anchors gets before it is reported as a fault
+/// rather than as news.
+const REANCHOR_THRASH_RUN: u32 = 3;
 
 /// The most the epoch may move for any one segment, tracking the source clock.
 ///
@@ -290,6 +362,12 @@ const EPOCH_REANCHOR_SECS: f64 = 10.0;
 ///
 /// Both renditions of a flow share the epoch, so they slew together and go on
 /// publishing identical dates.
+///
+/// A source outside that 2500 ppm band cannot be tracked: the epoch falls
+/// behind until the error crosses [`EPOCH_REANCHOR_SECS`] and snaps. That is
+/// a real jump in the published dates, and it is why the snap is reported to
+/// the playlist rather than made quietly — see
+/// [`FlowClock::date_closed_segment`].
 const EPOCH_SLEW_SECS: f64 = 0.005;
 
 /// How much of each new sample the filtered estimate takes.
@@ -306,7 +384,281 @@ const EPOCH_SLEW_SECS: f64 = 0.005;
 /// — bounding how fast the epoch may move, not deciding how far.
 const EPOCH_FILTER_GAIN: f64 = 0.02;
 
-/// The date to publish for a segment starting at `base_dts_90k`.
+impl FlowClock {
+    /// A clock founded on one sample. The flow has never been dated, so this
+    /// segment is what places its timeline against wall clock.
+    fn new(
+        base_dts_90k: u64,
+        seg_secs: f64,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Self {
+        let implied = now - secs(seg_secs) - secs(base_dts_90k as f64 / 90_000.0);
+        Self {
+            epoch: implied,
+            filtered: implied,
+            dts_ref: base_dts_90k,
+            recent: VecDeque::new(),
+            last_reanchor: None,
+            reanchor_run: 0,
+        }
+    }
+
+    /// Bring a media position onto this flow's timeline, undoing a 33-bit PTS
+    /// wrap that one output has counted and another has not.
+    ///
+    /// `PtsUnwrap` lives in the segmenter, so there is one per output *and*
+    /// per track, and each starts counting from whatever it saw first. A
+    /// 24/7 channel wraps every 2^33 ticks — 26 h 30 m — so a rendition added
+    /// or restarted after a wrap reports the same content 2^33 ticks below its
+    /// sibling. Uncorrected, the two imply epochs 26.5 hours apart: every
+    /// sample from each re-anchors the other, `recent` is permanently cleared,
+    /// the renditions can never agree, and the epoch collapses to
+    /// `now - seg_secs` — the per-segment sampling this whole mechanism exists
+    /// to replace — while the node logs a source restart twice per segment
+    /// forever.
+    ///
+    /// Rebasing inside `PtsUnwrap` itself (returning `pts - first_pts`) would
+    /// fix it at the source, and cannot be done: video and audio hold
+    /// *separate* `PtsUnwrap` instances whose first samples are different
+    /// frames, while `build_muxed_segment` writes both tracks'
+    /// `base_media_decode_time` into one `moof` and relies on them sharing the
+    /// source's absolute timeline. Rebasing each independently offsets audio
+    /// from video by the gap between their first samples, permanently, on
+    /// every flow. So the correction lives here, where it is a presentation
+    /// detail that nothing downstream of the muxer can see.
+    ///
+    /// Anything within half a lap of the flow's last position is taken to be
+    /// on that lap. A genuine restart moves by minutes or hours, nowhere near
+    /// the 13-hour half-lap, so it survives this untouched for the re-anchor
+    /// test to catch.
+    fn align(&self, base_dts_90k: u64) -> u64 {
+        let lap = PTS_LAP_90K as i128;
+        let half = lap / 2;
+        let mut delta = base_dts_90k as i128 - self.dts_ref as i128;
+        // Round the gap to the nearest whole lap and take it out. Written as
+        // arithmetic rather than a subtract-until-in-range loop because an
+        // output restarted after a year of flow uptime is hundreds of laps
+        // from the reference, and this runs on every segment.
+        delta -= (delta + half).div_euclid(lap) * lap;
+        // A position that would land before zero belongs to an output that
+        // started less than a lap before the flow's own first segment; the
+        // clamp costs that one segment its exact offset and nothing else.
+        (self.dts_ref as i128 + delta).max(0) as u64
+    }
+
+    /// The date to publish for a segment that has just **closed**, steering
+    /// the clock with it.
+    ///
+    /// Returns the date, and whether this sample re-anchored the media
+    /// timeline — which the playlist has to declare with
+    /// `#EXT-X-DISCONTINUITY`, because a re-anchor moves every date after it
+    /// relative to every date before it.
+    fn date_closed_segment(
+        &mut self,
+        base_dts_90k: u64,
+        seg_secs: f64,
+        now: chrono::DateTime<chrono::Utc>,
+        flow_id: &str,
+    ) -> (chrono::DateTime<chrono::Utc>, bool) {
+        let base = self.align(base_dts_90k);
+        self.dts_ref = base;
+        let media_secs = base as f64 / 90_000.0;
+        // What this sample says the epoch is: the segment closed about now, so
+        // its first sample was `seg_secs` ago, and that sample sits
+        // `media_secs` into the timeline.
+        let implied = now - secs(seg_secs) - secs(media_secs);
+
+        // The discontinuity test runs *before* the per-segment cache, and the
+        // order is the whole point. The other way round, a source that
+        // restarts while its `base_dts` is still one of the sixteen remembered
+        // ones is absorbed in silence: the cache answers with the epoch from
+        // an hour ago, the re-anchor branch is unreachable, `recent` is never
+        // cleared and nothing is logged, so the operator gets no signal at
+        // all. Sixteen entries is about 32 s at 2 s segments — precisely when
+        // a flapping source restarts. The cache exists to make two renditions
+        // agree about one segment; it must not outvote the detector.
+        let off = (implied - self.epoch).num_milliseconds().abs() as f64 / 1000.0;
+        if off > EPOCH_REANCHOR_SECS {
+            self.reanchor(implied, now, flow_id);
+            self.remember(base, true);
+            return (self.epoch + secs(media_secs), true);
+        }
+
+        // This segment already dated by the other rendition: reproduce that
+        // answer exactly rather than dating it against an epoch that has since
+        // slewed — and reproduce the discontinuity it was published with too.
+        //
+        // A hard-coded `false` here is how a re-anchor reached only one
+        // rendition of a flow. The sibling's sample lands within a few tens of
+        // milliseconds of the epoch the first one just re-anchored to, so it
+        // never trips the test above; it falls through to this cache and
+        // published the identical hour-long jump with a clean `#EXTINF` step
+        // and no tag at all.
+        if let Some((_, was, disc)) = self.recent.iter().find(|(d, _, _)| *d == base) {
+            return (*was + secs(media_secs), *disc);
+        }
+
+        // Filter, then steer towards the filtered value — see
+        // `EPOCH_FILTER_GAIN`. Comparing against the raw sample let publish
+        // jitter saturate the clamp, so the loop chased noise instead of the
+        // rate.
+        let raw = (implied - self.filtered).num_nanoseconds().unwrap_or(0) as f64 / 1e9;
+        self.filtered +=
+            chrono::Duration::nanoseconds((raw * EPOCH_FILTER_GAIN * 1e9) as i64);
+
+        // Track the source clock rather than pinning to the first sample — see
+        // `EPOCH_SLEW_SECS`. Bounded, so no one segment's date moves far.
+        let err = (self.filtered - self.epoch).num_nanoseconds().unwrap_or(0) as f64 / 1e9;
+        let step = err.clamp(-EPOCH_SLEW_SECS, EPOCH_SLEW_SECS);
+        self.epoch += chrono::Duration::nanoseconds((step * 1e9) as i64);
+
+        self.remember(base, false);
+        (self.epoch + secs(media_secs), false)
+    }
+
+    /// The date to publish for a segment that has just **opened**, without
+    /// touching the clock.
+    ///
+    /// The low-latency path advertises a segment while it is still being
+    /// written, on every chunk emission, so it may only *read*. Dating an open
+    /// segment through [`Self::date_closed_segment`] — which is what it did —
+    /// hands the steering loop a sample that assumes the segment has closed
+    /// when it has only just started: `implied` lands `seg_secs - chunk_secs`
+    /// early, so every date the flow publishes is early by that much (1.8 s at
+    /// 2 s segments and 200 ms chunks), from segment zero and permanently,
+    /// because the founding `or_insert_with` sample is one of those. The
+    /// biased call also *remembers* the segment, so the honest sample taken
+    /// when it genuinely closes hits the cache above and is discarded. And
+    /// both renditions of a flow share the epoch, so a correct
+    /// non-low-latency sibling is dragged with it: the two agree, and both are
+    /// wrong.
+    ///
+    /// Returns the date, and whether a *sibling* has already declared a
+    /// discontinuity under this segment — never a discontinuity of its own,
+    /// since this path takes no sample and so discovers nothing. Reproducing
+    /// one is not declaring one: once the other rendition has re-anchored, the
+    /// date this row is about to publish has moved with it, and a moved date
+    /// with no tag is exactly the contradiction `#EXT-X-DISCONTINUITY` exists
+    /// to close.
+    ///
+    /// Returns `None` when the position is on a timeline this clock does not
+    /// describe — a source that has restarted since the last close. Its
+    /// caller [`open_segment_date`] returns `None` for the other case, a flow
+    /// that has closed nothing yet and so has no clock at all. Either way the
+    /// row carries no `#EXT-X-PROGRAM-DATE-TIME`, which is spec-legal (the
+    /// tag is optional under RFC 8216 §4.3.2.6)
+    /// and self-healing: the first close settles it, one segment in. Seeding
+    /// the epoch here instead would found the flow's clock — and its
+    /// sibling's — on a sample taken at an arbitrary point inside a segment,
+    /// carrying whatever the pipeline delay was at that instant, in exchange
+    /// for one segment's worth of tag.
+    fn date_open_segment(
+        &self,
+        base_dts_90k: u64,
+        seg_secs: f64,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Option<(chrono::DateTime<chrono::Utc>, bool)> {
+        let base = self.align(base_dts_90k);
+        let media_secs = base as f64 / 90_000.0;
+
+        // `now` sits somewhere inside the open segment, so an honest sample
+        // implies an epoch up to one segment *later* than the held one, and
+        // never earlier. (The pipeline delay cancels: it is already baked into
+        // the epoch.) Outside that band plus the re-anchor tolerance is a
+        // timeline this clock does not describe — a source that has restarted
+        // since the last close — and the honest answer is no date at all,
+        // rather than an hour-stale one with no `#EXT-X-DISCONTINUITY` to
+        // explain it, since only the close path may declare one.
+        let off = (now - secs(media_secs) - self.epoch).num_milliseconds() as f64 / 1000.0;
+        if !(-EPOCH_REANCHOR_SECS..=EPOCH_REANCHOR_SECS + seg_secs).contains(&off) {
+            return None;
+        }
+
+        // If a sibling has already dated this segment, reproduce its answer —
+        // and the discontinuity it declared — for the same reason a closing
+        // segment does.
+        if let Some((_, was, disc)) = self.recent.iter().find(|(d, _, _)| *d == base) {
+            return Some((*was + secs(media_secs), *disc));
+        }
+        // Nothing has closed this segment, so nothing has found a re-anchor
+        // under it. This path may not invent one.
+        Some((self.epoch + secs(media_secs), false))
+    }
+
+    /// Take a sample too far out to be jitter as a new timeline.
+    ///
+    /// The log escalates deliberately. One of these is news — a source
+    /// restarted, a flow was reconfigured under the same id — and INFO is the
+    /// level for it. A *run* of them is a fault, and it used to read exactly
+    /// like the routine case: before [`Self::align`], two renditions on
+    /// opposite sides of a PTS wrap re-anchored each other twice per segment
+    /// forever, every line naming a source restart that had not happened.
+    /// Alignment closes that particular door; the escalation stays because a
+    /// re-anchor loop must never again be indistinguishable from routine
+    /// news.
+    fn reanchor(
+        &mut self,
+        implied: chrono::DateTime<chrono::Utc>,
+        now: chrono::DateTime<chrono::Utc>,
+        flow_id: &str,
+    ) {
+        let rapid = self.last_reanchor.is_some_and(|t| {
+            (now - t).num_milliseconds() as f64 / 1000.0 < REANCHOR_THRASH_SECS
+        });
+        self.reanchor_run = if rapid { self.reanchor_run + 1 } else { 1 };
+        self.last_reanchor = Some(now);
+
+        if !rapid {
+            tracing::info!(
+                flow_id,
+                from = %self.epoch.to_rfc3339(),
+                to = %implied.to_rfc3339(),
+                "CMAF: media timeline re-anchored (a source restart or PTS discontinuity, not jitter)"
+            );
+        } else if self.reanchor_run == REANCHOR_THRASH_RUN
+            || self.reanchor_run.is_multiple_of(100)
+        {
+            tracing::warn!(
+                flow_id,
+                runs = self.reanchor_run,
+                from = %self.epoch.to_rfc3339(),
+                to = %implied.to_rfc3339(),
+                "CMAF: media timeline re-anchoring repeatedly — the published dates are unusable while it continues. Either two outputs of this flow disagree about the timeline, or the source restarts on every segment."
+            );
+        }
+
+        self.epoch = implied;
+        self.filtered = implied;
+        // The clear is load-bearing, not tidiness. A source restarting at PTS 0
+        // re-uses the `base_dts` values still sitting in this cache, and the
+        // lookup takes the *oldest* match, so a retained entry would answer the
+        // next post-restart segment with the epoch from before the restart — an
+        // hour-stale date, published with no `#EXT-X-DISCONTINUITY`, which is
+        // the exact failure the cache's own discontinuity flag was added to
+        // close.
+        //
+        // The price is [`FlowClock::recent`]'s cross-rendition bound: a sibling
+        // more than a segment behind loses the answer it was going to
+        // reproduce. Widening that means honouring an entry only when the fresh
+        // sample agrees with it to within `EPOCH_REANCHOR_SECS`, and consulting
+        // the cache *before* the re-anchor test rather than after — the reverse
+        // of an ordering that was itself a fix. Not done blind.
+        self.recent.clear();
+    }
+
+    /// Remember the epoch this segment was dated with — and whether dating it
+    /// re-anchored the timeline — so the flow's other rendition reproduces
+    /// both exactly.
+    fn remember(&mut self, base_dts_90k: u64, discontinuity: bool) {
+        self.recent.push_back((base_dts_90k, self.epoch, discontinuity));
+        while self.recent.len() > FLOW_CLOCK_HISTORY {
+            self.recent.pop_front();
+        }
+    }
+}
+
+/// The date to publish for a closed segment starting at `base_dts_90k`, and
+/// whether the media timeline re-anchored under it.
 ///
 /// This used to be `Utc::now() - segment_duration`, sampled afresh for every
 /// segment. That records when the edge got round to closing the segment, not
@@ -323,73 +675,48 @@ const EPOCH_FILTER_GAIN: f64 = 0.02;
 ///
 /// Now the media timeline decides, and wall clock is consulted exactly once
 /// per flow to place it. `now` is passed in so the arithmetic can be tested
-/// without a clock.
+/// without a clock; the arithmetic itself lives on [`FlowClock`] so it can be
+/// tested without the process-global map as well.
+fn segment_date_marking(
+    flow_id: &str,
+    base_dts_90k: u64,
+    seg_secs: f64,
+    now: chrono::DateTime<chrono::Utc>,
+) -> (chrono::DateTime<chrono::Utc>, bool) {
+    let mut guard = lock_flow_clocks();
+    let clock = guard
+        .entry(flow_id.to_string())
+        .or_insert_with(|| FlowClock::new(base_dts_90k, seg_secs, now));
+    clock.date_closed_segment(base_dts_90k, seg_secs, now, flow_id)
+}
+
+/// [`segment_date_marking`] without the discontinuity flag. Every caller in
+/// the output wants the flag, so this exists for the tests that predate it.
+#[cfg(test)]
 fn segment_date(
     flow_id: &str,
     base_dts_90k: u64,
     seg_secs: f64,
     now: chrono::DateTime<chrono::Utc>,
 ) -> chrono::DateTime<chrono::Utc> {
-    let media_secs = base_dts_90k as f64 / 90_000.0;
-    let secs = |d: f64| chrono::Duration::nanoseconds((d * 1e9) as i64);
-    // What this sample says the epoch is: the segment closed about now, so its
-    // first sample was `seg_secs` ago, and that sample sits `media_secs` into
-    // the timeline.
-    let implied = now - secs(seg_secs) - secs(media_secs);
-
-    let map = FLOW_EPOCHS.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
-    let mut guard = match map.lock() {
-        Ok(g) => g,
-        // A poisoned lock must not take the output down over a timestamp.
-        Err(e) => e.into_inner(),
-    };
-    let clock = guard.entry(flow_id.to_string()).or_insert_with(|| FlowClock {
-        epoch: implied,
-        filtered: implied,
-        recent: VecDeque::new(),
-    });
-
-    // This segment already dated by the other rendition: reproduce that answer
-    // exactly rather than dating it against an epoch that has since slewed.
-    if let Some((_, was)) = clock.recent.iter().find(|(d, _)| *d == base_dts_90k) {
-        return *was + secs(media_secs);
-    }
-
-    let off = (clock.epoch - implied).num_milliseconds().abs() as f64 / 1000.0;
-    if off > EPOCH_REANCHOR_SECS {
-        tracing::info!(
-            flow_id,
-            from = %clock.epoch.to_rfc3339(),
-            to = %implied.to_rfc3339(),
-            "CMAF: media timeline re-anchored (a source restart or PTS discontinuity, not jitter)"
-        );
-        clock.epoch = implied;
-        clock.filtered = implied;
-        clock.recent.clear();
-    } else {
-        // Filter, then steer towards the filtered value — see
-        // `EPOCH_FILTER_GAIN`. Comparing against the raw sample let publish
-        // jitter saturate the clamp, so the loop chased noise instead of the
-        // rate.
-        let raw = (implied - clock.filtered).num_nanoseconds().unwrap_or(0) as f64 / 1e9;
-        clock.filtered +=
-            chrono::Duration::nanoseconds((raw * EPOCH_FILTER_GAIN * 1e9) as i64);
-
-        // Track the source clock rather than pinning to the first sample — see
-        // `EPOCH_SLEW_SECS`. Bounded, so no one segment's date moves far.
-        let err = (clock.filtered - clock.epoch).num_nanoseconds().unwrap_or(0) as f64 / 1e9;
-        let step = err.clamp(-EPOCH_SLEW_SECS, EPOCH_SLEW_SECS);
-        clock.epoch += chrono::Duration::nanoseconds((step * 1e9) as i64);
-    }
-
-    let epoch = clock.epoch;
-    clock.recent.push_back((base_dts_90k, epoch));
-    while clock.recent.len() > FLOW_CLOCK_HISTORY {
-        clock.recent.pop_front();
-    }
-    epoch + secs(media_secs)
+    segment_date_marking(flow_id, base_dts_90k, seg_secs, now).0
 }
 
+/// The date to publish for a segment that has just opened, and whether a
+/// sibling rendition has already declared a discontinuity under it — read-only,
+/// see [`FlowClock::date_open_segment`]. `None` when the flow has no epoch yet,
+/// or when the one it has does not describe this segment's timeline.
+fn open_segment_date(
+    flow_id: &str,
+    base_dts_90k: u64,
+    seg_secs: f64,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Option<(chrono::DateTime<chrono::Utc>, bool)> {
+    let guard = lock_flow_clocks();
+    guard.get(flow_id)?.date_open_segment(base_dts_90k, seg_secs, now)
+}
+
+/// Mid-loop output state.
 struct CmafState {
     video_seg: Option<VideoSegmenter>,
     audio_seg: Option<AudioSegmenter>,
@@ -440,6 +767,34 @@ struct CmafState {
     init_last_upload: Option<std::time::Instant>,
     /// Rolling window of muxed segments (newest last).
     playlist: VecDeque<M3u8Entry>,
+    /// The largest `#EXT-X-TARGETDURATION` this output has ever published.
+    ///
+    /// A high-water mark rather than the current window's maximum, and the
+    /// difference matters both ways. It has to *rise* the moment a row longer
+    /// than the advertised target enters the window, or the playlist breaks
+    /// RFC 8216 §4.3.3.1 against a row it is listing right now. It must not
+    /// *fall* when that row is trimmed: a player reads this once and sizes its
+    /// reload cadence, its buffer and — in low-latency mode — the hold-back it
+    /// starts at from it, so a value that shrinks between reloads retracts a
+    /// decision it has already acted on: the spec's model is a playlist a
+    /// server appends to and trims, not one whose declared bounds move under a
+    /// player. A window that alternates 2 s and 5 s segments would otherwise
+    /// oscillate the tag on every trim.
+    ///
+    /// The cost of holding the high mark is a reload interval sized for the
+    /// longest segment the flow has ever produced, which is the conservative
+    /// direction. `0` until the first playlist is published.
+    target_duration_published: u64,
+    /// How many discontinuous entries have already been trimmed off the front
+    /// of that window.
+    ///
+    /// This is `#EXT-X-DISCONTINUITY-SEQUENCE`: RFC 8216 §4.3.3.3 defines it
+    /// as the count of discontinuities *before* the first segment the playlist
+    /// still lists, and a player uses it to keep its own count consistent
+    /// across reloads once the tagged row has aged out of the window. It only
+    /// grows, so it is counted as entries leave rather than derived from what
+    /// is left.
+    discontinuities_trimmed: u64,
     /// Optional re-encoder for audio (Phase 3).
     audio_reencoder: Option<AudioReencoder>,
     /// Optional re-encoder for video (Phase 3).
@@ -500,12 +855,68 @@ impl CmafState {
             init_upload_failing: false,
             init_last_upload: None,
             playlist: VecDeque::new(),
+            target_duration_published: 0,
+            discontinuities_trimmed: 0,
             audio_reencoder: None,
             video_reencoder: None,
             ll_current: None,
             cenc: None,
             #[cfg(feature = "media-codecs")]
             ff_audio_decoder: None,
+        }
+    }
+
+    /// The `#EXT-X-TARGETDURATION` to publish for `entries`, never below one
+    /// already published — see [`CmafState::target_duration_published`].
+    fn advertised_target_duration(
+        &mut self,
+        config_target_secs: f64,
+        entries: &[M3u8Entry],
+    ) -> u64 {
+        self.target_duration_published = self
+            .target_duration_published
+            .max(required_target_duration(config_target_secs, entries));
+        self.target_duration_published
+    }
+
+    /// Where the segment that just closed ended, on the media timeline.
+    ///
+    /// `push()` has already moved the segmenter on to the new segment — it
+    /// runs in `handle_video`, before the close is published — so the base it
+    /// reports now is the end of the one that just closed, and the difference
+    /// between the two is that segment's real length.
+    ///
+    /// This is a named function rather than four lines at the call site
+    /// because it is the whole of the fix for a closed low-latency row dated
+    /// by the configured target instead of by how long it actually ran, and
+    /// nothing could reach it: `closed_ll_entry` took the answer as a
+    /// parameter and both of its tests handed it a literal, so reverting the
+    /// derivation to `None` restored the bug with the suite green. Pinned by
+    /// `the_closed_row_takes_its_length_from_the_segmenter`, which drives a
+    /// real [`VideoSegmenter`] rather than passing the number in.
+    ///
+    /// `None` before the first IDR, when no segment is open yet;
+    /// `closed_ll_entry` then falls back to the nominal length.
+    fn closed_segment_end_dts_90k(&self) -> Option<u64> {
+        self.video_seg
+            .as_ref()
+            .and_then(|vs| vs.open_segment_base_dts_90k())
+    }
+
+    /// Trim the playlist back to the advertised window, counting any
+    /// discontinuity that leaves with an entry.
+    ///
+    /// The count has to be taken here rather than reconstructed later: once
+    /// the tagged row is gone the playlist holds no trace of it, and a player
+    /// that reloads across the trim would see its discontinuity count go
+    /// backwards.
+    fn trim_playlist(&mut self, window: usize) {
+        while self.playlist.len() > window {
+            match self.playlist.pop_front() {
+                Some(e) if e.discontinuity => self.discontinuities_trimmed += 1,
+                Some(_) => {}
+                None => break,
+            }
         }
     }
 }
@@ -1123,6 +1534,31 @@ async fn handle_video(
         return;
     }
 
+    // The clock is read *here*: after `push()` cut the segment a few
+    // microseconds ago, and before anything on this path can wait on the
+    // origin. It is only used when a segment actually closed, below.
+    //
+    // `date_closed_segment` reads its `now` as the instant the segment closed —
+    // it subtracts the segment's length and its media position from it to imply
+    // the flow's epoch. Sampling after the upload instead, which is what this
+    // did, folded the origin's response time into that epoch. The upload
+    // client's request timeout is 30 s (`upload.rs`), so a slow-but-*successful*
+    // PUT could hand the clock a sample past `EPOCH_REANCHOR_SECS` and
+    // re-anchor a timeline that never moved: a real `#EXT-X-DISCONTINUITY` on
+    // both renditions and a real jump in the published dates, caused by nothing
+    // but a busy origin. Modelled, a 10 s stall produces two tags — the stalled
+    // segment and the one after it — before the clock settles.
+    //
+    // Above `publish_init_if_due` rather than below it for the same reason:
+    // init.mp4 is republished every 30 s, and on an origin that is failing
+    // those uploads the retry is a full request timeout parked directly between
+    // the cut and the sample.
+    //
+    // It also takes the origin's latency out of every *ordinary* sample, where
+    // the filter had been absorbing it, and stops two renditions publishing to
+    // different origins disagreeing by the difference in their response times.
+    let closed_at = chrono::Utc::now();
+
     // Publish init.mp4 the first time a video track is materialised, and
     // republish it periodically thereafter.
     publish_init_if_due(
@@ -1209,27 +1645,26 @@ async fn handle_video(
         }
 
         let seg_secs = duration_90k as f64 / 90_000.0;
+        // From the media timeline, through the flow's shared epoch — see
+        // `segment_date_marking`. Sampling the wall clock here instead put the
+        // scheduling and pipeline delay into the tag, and because only one
+        // date is written per playlist it anchored the whole window on that
+        // one sample.
+        let (pdt, discontinuity) = segment_date_marking(
+            flow_id,
+            seg.base_dts_90k,
+            seg_secs,
+            closed_at,
+        );
         state.playlist.push_back(M3u8Entry {
             sequence_number: seg.sequence_number,
             duration_secs: seg_secs,
             uri: Some(uri),
             parts: Vec::new(),
-            // From the media timeline, through the flow's shared epoch — see
-            // `segment_date`. Sampling the wall clock here instead put the
-            // scheduling and pipeline delay into the tag, and because only one
-            // date is written per playlist it anchored the whole window on
-            // that one sample.
-            program_date_time: Some(segment_date(
-                flow_id,
-                seg.base_dts_90k,
-                seg_secs,
-                chrono::Utc::now(),
-            )),
+            program_date_time: Some(pdt),
+            discontinuity,
         });
-        let window = config.playlist_window_segments();
-        while state.playlist.len() > window {
-            state.playlist.pop_front();
-        }
+        state.trim_playlist(config.playlist_window_segments());
 
         // Every playlist names `init.mp4` in `#EXT-X-MAP`, so publishing one
         // before that object exists hands players a manifest they can fetch,
@@ -1834,6 +2269,13 @@ async fn handle_ll_cmaf(
     flow_id: &str,
     recv_time_us: u64,
 ) {
+    // Before anything here can wait on the origin — the init republish just
+    // below, and the closing PUT's `finish()` after it. `push()` cut the
+    // segment a few microseconds ago in `handle_video`, and this is the instant
+    // the row that closes below is dated from. See the same sample on the plain
+    // path for what sampling after an upload does to the flow's epoch.
+    let closed_at = chrono::Utc::now();
+
     // Publish init.mp4 if it is due — first time, or a periodic republish.
     // Chunks are meaningless to a player that cannot fetch `#EXT-X-MAP`, so
     // nothing is emitted until it has landed at least once.
@@ -1882,22 +2324,20 @@ async fn handle_ll_cmaf(
                     );
                 }
             }
-            state.playlist.push_back(M3u8Entry {
-                sequence_number: seq,
-                duration_secs: config.segment_duration_secs,
-                uri: Some(uri),
-                parts: Vec::new(),
-                program_date_time: Some(segment_date(
-                    flow_id,
-                    base_dts_90k,
-                    config.segment_duration_secs,
-                    chrono::Utc::now(),
-                )),
-            });
-            let window = config.playlist_window_segments();
-            while state.playlist.len() > window {
-                state.playlist.pop_front();
-            }
+            // Where the segment ended, from the segmenter — see
+            // `CmafState::closed_segment_end_dts_90k`, which is a named
+            // function precisely so this derivation is reachable from a test.
+            let next_base_dts_90k = state.closed_segment_end_dts_90k();
+            state.playlist.push_back(closed_ll_entry(
+                flow_id,
+                seq,
+                uri,
+                base_dts_90k,
+                next_base_dts_90k,
+                config.segment_duration_secs,
+                closed_at,
+            ));
+            state.trim_playlist(config.playlist_window_segments());
         }
         // Open new segment.
         if let Some(vs) = state.video_seg.as_ref() {
@@ -2063,6 +2503,146 @@ async fn publish_ll_dash(
     }
 }
 
+/// The segment a low-latency output is currently writing, as the playlist
+/// needs to see it.
+///
+/// Deliberately not [`LlSegment`] itself: that owns a live chunked-PUT handle,
+/// which cannot be built without a socket, so anything taking one is untestable
+/// and the row-building was therefore never tested at all. That is how the
+/// open-segment dating bug survived — every date test called the close path,
+/// so reverting the one line that fixed it left the suite green. This struct is
+/// the seam that closes it.
+struct OpenSegmentRow<'a> {
+    sequence_number: u64,
+    uri: &'a str,
+    parts: &'a [HlsPartEntry],
+    base_dts_90k: u64,
+}
+
+/// The rows a low-latency playlist publishes: every closed segment in the
+/// window, plus a synthetic row for the one still being written, so its parts
+/// are advertised before it closes.
+fn ll_playlist_entries(
+    closed: &VecDeque<M3u8Entry>,
+    open: Option<OpenSegmentRow<'_>>,
+    nominal_segment_secs: f64,
+    flow_id: &str,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Vec<M3u8Entry> {
+    let mut entries: Vec<M3u8Entry> = closed.iter().cloned().collect();
+    if let Some(open) = open {
+        // Read the flow clock; never steer it. This row describes a segment
+        // that has *opened*, and it is rebuilt on every chunk emission —
+        // feeding those samples to the steering loop, which assumes a segment
+        // that has closed, put every date this flow published
+        // `segment_duration - chunk_duration` early, for the life of the flow
+        // and for its sibling rendition too. See
+        // `FlowClock::date_open_segment`.
+        //
+        // `None` until the flow's first segment closes, so a low-latency
+        // output's opening playlist carries no `#EXT-X-PROGRAM-DATE-TIME` for
+        // about one segment. The tag is optional under RFC 8216 §4.3.2.6; a
+        // date wrong by most of a segment is not.
+        // How much of this segment has actually been published: the parts
+        // listed under the row, which are the chunks already on the origin.
+        //
+        // A closed row advertises the length it really ran. An open one cannot
+        // — the length is settled by the IDR that ends it, which has not
+        // arrived — so it needs a figure that is honest about that. RFC 8216's
+        // own answer for a segment still being written is that it has no
+        // `#EXTINF` at all until it is complete; it is advertised by its
+        // `#EXT-X-PART` rows, and the `#EXTINF` appears when the segment does.
+        // Emitting the row early is what makes this implementation's part rows
+        // reachable (`build_hls_playlist` hangs them off the last entry), so
+        // the row stays — but its duration must be a floor rather than a
+        // guess, because an over-claim is a player seeking to media that does
+        // not exist yet and, since the tag is derived from the longest row in
+        // the window, an over-claim also widens `#EXT-X-TARGETDURATION` for
+        // the rest of the session on the strength of a prediction.
+        //
+        // The nominal target alone was that guess in the other direction: with
+        // a 5 s GOP against a 2 s target the row said `#EXTINF:2.000` while
+        // twenty-five `#EXT-X-PART:DURATION=0.200` rows beneath it — in the
+        // same playlist — accounted for 5 s. Taking the larger of the two ends
+        // that contradiction without ever claiming media that has not been
+        // written: the parts are already on the origin, and their advertised
+        // durations are the chunk target, which the segmenter meets or exceeds
+        // before it emits one.
+        let published_secs: f64 = open.parts.iter().map(|p| p.duration_secs).sum();
+        let open_secs = nominal_segment_secs.max(published_secs);
+        // The same figure goes to the clock, where it is the upper end of the
+        // band that decides whether `now` can plausibly sit inside this
+        // segment: `EPOCH_REANCHOR_SECS + seg_secs`. Fixed at the nominal
+        // target that ceiling does not grow with the segment, so a segment that
+        // runs more than ten seconds past the target falls outside its own
+        // band and the in-progress row silently loses its date for the tail of
+        // every one. Measured on a 15 s segment against a 2 s target: undated
+        // from t = 12.2 s to the close — the last fifteen manifest publishes at
+        // 200 ms chunks — and dated throughout once the figure tracks the parts
+        // already written.
+        let dated = open_segment_date(flow_id, open.base_dts_90k, open_secs, now);
+        entries.push(M3u8Entry {
+            sequence_number: open.sequence_number,
+            // At least the nominal target, and at least what the parts under
+            // this row already carry. The row is rewritten with the true
+            // figure when the segment closes and enters the window properly.
+            duration_secs: open_secs,
+            uri: Some(open.uri.to_string()),
+            parts: open.parts.to_vec(),
+            program_date_time: dated.map(|(pdt, _)| pdt),
+            // This path takes no sample, so it discovers no discontinuity of
+            // its own. What it can carry is one a *sibling* rendition already
+            // found under this segment: that re-anchor has already moved the
+            // date above, and a moved date published without the tag is the
+            // contradiction the tag exists to close.
+            discontinuity: dated.is_some_and(|(_, disc)| disc),
+        });
+    }
+    entries
+}
+
+/// The playlist row a low-latency segment contributes when it closes.
+///
+/// `next_base_dts_90k` is where the *following* segment starts, which is how
+/// long this one actually ran. The segmenter cuts on the first IDR at or past
+/// the target, so that equals the target only when the GOP divides it; a 1.5 s
+/// GOP against a 2 s target produces 3 s segments. Passing the nominal figure
+/// instead — which is what this did — tells the flow clock a segment closed
+/// (actual − nominal) earlier than it did, so the epoch it founds is late by
+/// that much, permanently, from segment zero: a full second in that example,
+/// three seconds for a 5 s GOP against a 2 s target. Both renditions of a flow
+/// share the epoch and the per-segment cache makes the second reproduce the
+/// first's answer, so the low-latency output — which normally dates first,
+/// because it publishes on the final chunk PUT rather than waiting for the
+/// whole-segment PUT — drags its correct sibling along with it. It is the
+/// open-segment bug one magnitude down.
+fn closed_ll_entry(
+    flow_id: &str,
+    sequence_number: u64,
+    uri: String,
+    base_dts_90k: u64,
+    next_base_dts_90k: Option<u64>,
+    nominal_segment_secs: f64,
+    now: chrono::DateTime<chrono::Utc>,
+) -> M3u8Entry {
+    let seg_secs = next_base_dts_90k
+        .filter(|next| *next > base_dts_90k)
+        .map(|next| (next - base_dts_90k) as f64 / 90_000.0)
+        .unwrap_or(nominal_segment_secs);
+    // From the media timeline, through the flow's shared epoch — see
+    // `segment_date_marking`, and the plain path, which has always passed the
+    // segment's real duration here.
+    let (pdt, discontinuity) = segment_date_marking(flow_id, base_dts_90k, seg_secs, now);
+    M3u8Entry {
+        sequence_number,
+        duration_secs: seg_secs,
+        uri: Some(uri),
+        parts: Vec::new(),
+        program_date_time: Some(pdt),
+        discontinuity,
+    }
+}
+
 async fn publish_ll_hls(
     state: &mut CmafState,
     config: &CmafOutputConfig,
@@ -2071,31 +2651,34 @@ async fn publish_ll_hls(
     event_sender: &EventSender,
     flow_id: &str,
 ) {
-    // Attach the current segment's parts to the last playlist entry
-    // (or append a synthetic "in-progress" entry).
-    let mut entries: Vec<M3u8Entry> = state.playlist.iter().cloned().collect();
-    if let Some(ll) = state.ll_current.as_ref() {
-        // Synthesize an in-progress entry for the current segment so
-        // its parts are part of the manifest even before it closes.
-        entries.push(M3u8Entry {
+    let entries = ll_playlist_entries(
+        &state.playlist,
+        state.ll_current.as_ref().map(|ll| OpenSegmentRow {
             sequence_number: ll.sequence_number,
-            duration_secs: config.segment_duration_secs,
-            uri: Some(ll.uri.clone()),
-            parts: ll.parts.clone(),
-            program_date_time: Some(segment_date(
-                flow_id,
-                ll.base_dts_90k,
-                config.segment_duration_secs,
-                chrono::Utc::now(),
-            )),
-        });
-    }
+            uri: &ll.uri,
+            parts: &ll.parts,
+            base_dts_90k: ll.base_dts_90k,
+        }),
+        config.segment_duration_secs,
+        flow_id,
+        chrono::Utc::now(),
+    );
     let hints = LowLatencyHints {
         part_target_secs: config.chunk_duration_ms as f64 / 1000.0,
         can_block_reload: true,
     };
-    let body =
-        build_hls_playlist(config.segment_duration_secs, &entries, init_name, Some(&hints));
+    // Not the configured segment length: the segmenter cuts at or past it, so
+    // the rows can be longer, and `HOLD-BACK` is three times whatever this
+    // says. See `CmafState::target_duration_published`.
+    let target_duration =
+        state.advertised_target_duration(config.segment_duration_secs, &entries);
+    let body = build_hls_playlist(
+        target_duration,
+        &entries,
+        init_name,
+        state.discontinuities_trimmed,
+        Some(&hints),
+    );
     if let Err(e) = http_put(
         m3u8_url,
         body.into_bytes(),
@@ -2132,7 +2715,15 @@ async fn publish_manifests(
 ) {
     if publish_hls {
         let entries: Vec<M3u8Entry> = state.playlist.iter().cloned().collect();
-        let body = build_hls_playlist(config.segment_duration_secs, &entries, init_name, None);
+        let target_duration =
+            state.advertised_target_duration(config.segment_duration_secs, &entries);
+        let body = build_hls_playlist(
+            target_duration,
+            &entries,
+            init_name,
+            state.discontinuities_trimmed,
+            None,
+        );
         if let Err(e) = http_put(
             m3u8_url,
             body.into_bytes(),
@@ -2407,5 +2998,841 @@ mod date_tests {
         let a = segment_date("flow-a", 0, 2.0, ts("2026-08-27T00:00:02.000Z"));
         let b = segment_date("flow-b", 0, 2.0, ts("2026-08-27T05:00:02.000Z"));
         assert_ne!(a, b, "two flows were given one epoch");
+    }
+
+    /// `secs_f` seconds after `base`.
+    fn at(base: chrono::DateTime<chrono::Utc>, secs_f: f64) -> chrono::DateTime<chrono::Utc> {
+        base + secs(secs_f)
+    }
+
+    /// The low-latency path reads the flow clock; it must never steer it.
+    ///
+    /// `publish_ll_hls` dates the segment that has just *opened*, and it runs
+    /// on every chunk emission. Routed through the close-time arithmetic —
+    /// which is what it did — the first of those calls founds the flow's epoch
+    /// on a sample that is `segment_duration - chunk_duration` early, and the
+    /// flow then publishes every date early by that much for as long as it
+    /// runs: 1.8 s at 2 s segments and 200 ms chunks, from segment zero,
+    /// never converging. The suite was green throughout, because every date
+    /// test called the close path only.
+    #[test]
+    fn the_low_latency_path_publishes_open_segments_on_wall_time() {
+        let flow = "flow-ll-open";
+        let seg = 2.0;
+        let chunk = 0.2;
+        // Wall clock at media position 0. The pipeline delay is left at zero
+        // so the assertion is about the content's own time rather than about
+        // the constant the epoch's founding sample carries.
+        let origin = ts("2026-08-27T00:00:00.000Z");
+
+        let mut dated_open = 0usize;
+        for n in 0..8u64 {
+            let base = n * 180_000;
+            let opened = at(origin, n as f64 * seg);
+            // Every chunk emission republishes the manifest, and with it the
+            // in-progress row for this segment.
+            let mut chunks = 1u32;
+            while chunks as f64 * chunk <= seg {
+                let now = at(opened, chunks as f64 * chunk);
+                if let Some((got, disc)) = open_segment_date(flow, base, seg, now) {
+                    assert!(!disc, "segment {n} chunk {chunks}: the read-only path invented a discontinuity");
+                    let err = (got - opened).num_milliseconds();
+                    assert!(
+                        err.abs() <= 5,
+                        "segment {n} chunk {chunks}: the in-progress row is {err}ms off its own content"
+                    );
+                    dated_open += 1;
+                }
+                chunks += 1;
+            }
+            // Then it closes — the only sample allowed to steer the clock.
+            let (closed, disc) = segment_date_marking(flow, base, seg, at(opened, seg));
+            let err = (closed - opened).num_milliseconds();
+            assert!(err.abs() <= 5, "segment {n} closed {err}ms off its own content");
+            assert!(!disc, "segment {n} claimed a discontinuity");
+        }
+        // The first segment carries no date — nothing has closed on this flow
+        // yet — and all ten publishes of every segment after it do.
+        assert_eq!(
+            dated_open, 70,
+            "the in-progress row stopped carrying a date after the clock existed"
+        );
+    }
+
+    /// Reading the clock must leave no trace in it.
+    ///
+    /// The old low-latency call also *remembered* the epoch it dated the open
+    /// segment with, so when that segment genuinely closed two seconds later
+    /// the honest sample hit the per-segment cache and was discarded. The bias
+    /// could not correct itself even in principle.
+    #[test]
+    fn dating_an_open_segment_leaves_the_clock_untouched() {
+        let origin = ts("2026-08-27T00:00:00.000Z");
+        let mut clock = FlowClock::new(0, 2.0, at(origin, 2.0));
+        let epoch_before = clock.epoch;
+        for j in 1..=10 {
+            let _ = clock.date_open_segment(180_000, 2.0, at(origin, 2.0 + j as f64 * 0.2));
+        }
+        assert_eq!(clock.epoch, epoch_before, "reading the clock steered it");
+        assert!(clock.recent.is_empty(), "reading the clock filled the per-segment cache");
+        // So the sample taken when the segment does close is the one that
+        // decides, and it puts the date on the content.
+        let (got, _) = clock.date_closed_segment(180_000, 2.0, at(origin, 4.0), "flow-readonly");
+        assert_eq!(got, at(origin, 2.0), "the close-time sample was discarded");
+    }
+
+    /// A low-latency rendition must not drag its plain sibling off wall time.
+    ///
+    /// They share one epoch by design — that is what makes them agree about a
+    /// frame — so a bias introduced by either is published by both. Asserting
+    /// only that the two agree cannot see it: they agreed while both were
+    /// 1.8 s early.
+    #[test]
+    fn a_low_latency_rendition_does_not_drag_its_plain_sibling() {
+        let flow = "flow-ll-sibling";
+        let seg = 2.0;
+        let origin = ts("2026-08-27T00:00:00.000Z");
+        let mut last_ll = None;
+        let mut last_plain = None;
+        let mut last_opened = origin;
+        for n in 0..30u64 {
+            let base = n * 180_000;
+            let opened = at(origin, n as f64 * seg);
+            // The low-latency output republishes on every 200 ms chunk.
+            for j in 1..=10 {
+                let _ = open_segment_date(flow, base, seg, at(opened, j as f64 * 0.2));
+            }
+            let (ll, _) = segment_date_marking(flow, base, seg, at(opened, seg));
+            // The plain rendition closes the same content 45 ms later, as
+            // measured on the rig.
+            let (plain, _) = segment_date_marking(
+                flow,
+                base,
+                seg,
+                at(opened, seg) + chrono::Duration::milliseconds(45),
+            );
+            last_ll = Some(ll);
+            last_plain = Some(plain);
+            last_opened = opened;
+        }
+        assert_eq!(last_ll, last_plain, "the two renditions disagree about one segment");
+        let err = (last_plain.unwrap() - last_opened).num_milliseconds();
+        assert!(
+            err.abs() <= 5,
+            "both renditions agree on a date {err}ms off the content — the whole flow is dragged"
+        );
+    }
+
+    /// A restart is re-anchored even when the segment it lands on is still
+    /// remembered.
+    ///
+    /// The per-segment cache used to be consulted before the discontinuity
+    /// test, so a source coming back at PTS 0 while `0` was one of the sixteen
+    /// remembered positions was answered from the hour-old epoch: no
+    /// re-anchor, no `recent.clear()`, no log line, nothing on the Events
+    /// page. Sixteen entries is about 32 s of a 2 s-segment flow — exactly
+    /// when a flapping source comes back.
+    #[test]
+    fn a_restart_onto_a_remembered_segment_still_re_anchors() {
+        let flow = "flow-restart-cached";
+        segment_date_marking(flow, 0, 2.0, ts("2026-08-27T00:00:02.000Z"));
+        segment_date_marking(flow, 180_000, 2.0, ts("2026-08-27T00:00:04.000Z"));
+        // An hour later the source restarts, back at a position the cache
+        // still holds.
+        let (after, disc) = segment_date_marking(flow, 0, 2.0, ts("2026-08-27T01:00:02.000Z"));
+        assert!(disc, "a restart onto a remembered position was absorbed silently");
+        assert_eq!(
+            after,
+            ts("2026-08-27T01:00:00.000Z"),
+            "the restart was dated from the stale epoch"
+        );
+    }
+
+    /// A rendition added after a 33-bit PTS wrap joins the flow's timeline
+    /// rather than fighting it.
+    ///
+    /// `PtsUnwrap` is per output and counts wraps from whenever that output
+    /// started, so a rendition added — or restarted by an `UpdateFlow` — after
+    /// the 26 h 30 m wrap reports the same content 2^33 ticks below its
+    /// sibling. Uncorrected, each sample re-anchored the other: `recent`
+    /// permanently empty, the renditions unable to agree, the epoch collapsed
+    /// back to `now - seg_secs`, and the node logging a source restart twice
+    /// per segment forever.
+    #[test]
+    fn a_rendition_added_after_a_pts_wrap_joins_the_timeline() {
+        let flow = "flow-wrap";
+        let lap = PTS_LAP_90K;
+        let t0 = ts("2026-08-28T03:00:10.000Z");
+        // The established output has counted the wrap.
+        let (a, disc_a) = segment_date_marking(flow, lap + 900_000, 2.0, t0);
+        assert!(!disc_a);
+        // The new one has not, and reports the same content a lap lower.
+        let (b, disc_b) = segment_date_marking(
+            flow,
+            900_000,
+            2.0,
+            t0 + chrono::Duration::milliseconds(45),
+        );
+        assert!(!disc_b, "the second rendition re-anchored the flow's timeline");
+        assert_eq!(a, b, "the two renditions dated one segment 26.5 hours apart");
+        // And the flow's own clock is intact: the next segment is 2 s on, not
+        // re-founded on a collapsed epoch.
+        let (c, disc_c) = segment_date_marking(flow, lap + 1_080_000, 2.0, at(t0, 2.0));
+        assert!(!disc_c);
+        let step = (c - a).num_milliseconds();
+        assert!(
+            (step - 2000).abs() <= (EPOCH_SLEW_SECS * 1000.0) as i64,
+            "the published clock lost the timeline: {step}ms for a 2 s segment"
+        );
+    }
+
+    /// The lap correction moves whole laps and nothing else.
+    ///
+    /// It is arithmetic rather than a subtract-until-in-range loop, so the
+    /// distances that actually occur are worth pinning: one lap for a
+    /// rendition added just after a wrap, hundreds for an output restarted
+    /// late in a long session, and zero for anything a restart produces.
+    #[test]
+    fn lap_alignment_moves_whole_laps_and_nothing_else() {
+        let origin = ts("2026-08-27T00:00:00.000Z");
+        let lap = PTS_LAP_90K;
+        let clock = FlowClock::new(lap + 900_000, 2.0, at(origin, 2.0));
+        // The flow's own position, and the ordinary step to the next segment.
+        assert_eq!(clock.align(lap + 900_000), lap + 900_000);
+        assert_eq!(clock.align(lap + 1_080_000), lap + 1_080_000);
+        // A rendition that has counted one wrap fewer.
+        assert_eq!(clock.align(900_000), lap + 900_000);
+        // And one that has counted several hundred fewer — an output added a
+        // year into the flow.
+        let far = FlowClock::new(300 * lap + 900_000, 2.0, at(origin, 2.0));
+        assert_eq!(far.align(900_000), 300 * lap + 900_000);
+        // A restart moves by minutes or hours, nowhere near a lap, so it is
+        // left alone for the re-anchor test to catch.
+        assert_eq!(clock.align(lap), lap);
+    }
+
+    /// A source the slew cannot track snaps, and the snap is declared.
+    ///
+    /// The epoch corrects by at most 5 ms per segment, so a source further out
+    /// than ~2500 ppm falls behind until the error crosses
+    /// `EPOCH_REANCHOR_SECS` and the clock jumps ten seconds at once. That is
+    /// not a bug to remove — the alternative is an unbounded lie — but it is a
+    /// real break in the published timeline, and every row on either side of
+    /// it still advertises a clean `EXTINF` step. RFC 8216 §6.2.1 puts the
+    /// obligation to say so on the server.
+    #[test]
+    fn a_source_outside_the_slew_band_declares_its_snap() {
+        let flow = "flow-snap";
+        let seg = 2.0;
+        let origin = ts("2026-08-27T00:00:00.000Z");
+        // 10 000 ppm — ordinary for a poor contribution encoder, and four
+        // times what the slew can absorb.
+        let ppm = 10_000.0;
+        let mut snapped = 0usize;
+        let mut prev: Option<chrono::DateTime<chrono::Utc>> = None;
+        for n in 0..900u64 {
+            let wall = at(origin, (n as f64 + 1.0) * seg * (1.0 + ppm / 1e6));
+            let (got, disc) = segment_date_marking(flow, n * 180_000, seg, wall);
+            if disc {
+                snapped += 1;
+            } else if let Some(p) = prev {
+                // Every row that does *not* carry the tag must be within a
+                // slew step of a clean segment-length advance, which is what
+                // makes the tag land on exactly the row that moved.
+                let step = (got - p).num_milliseconds();
+                assert!(
+                    (step - 2000).abs() <= (EPOCH_SLEW_SECS * 1000.0) as i64,
+                    "segment {n} moved {step}ms with no discontinuity declared"
+                );
+            }
+            prev = Some(got);
+        }
+        assert_eq!(
+            snapped, 1,
+            "the epoch did not snap in 30 minutes of a 10 000 ppm source, so this test no longer covers the case it was written for"
+        );
+    }
+
+    /// A low-latency segment is dated by the length it actually ran, not by
+    /// the configured target.
+    ///
+    /// The segmenter cuts on the first IDR at or *past* the target, so the two
+    /// are equal only when the GOP divides it — a 1.5 s GOP against a 2 s
+    /// target gives 3 s segments, and a 5 s GOP against the same target gives
+    /// 5 s ones. The low-latency close passed the nominal figure, which tells
+    /// the clock the segment ended (actual - nominal) earlier than it did, so
+    /// the epoch it founds is late by exactly that, from segment zero and
+    /// permanently: the sample says the same wrong thing every time, so there
+    /// is nothing for the slew to correct against. The plain path has always
+    /// passed the real duration, which is why only low-latency outputs carried
+    /// it — and why they then dragged their plain sibling, since the two share
+    /// one epoch and the low-latency output normally dates first.
+    #[test]
+    fn a_low_latency_segment_is_dated_by_its_real_length() {
+        let flow = "flow-ll-gop";
+        // 2 s target, 1.5 s GOP: every segment closes at its second IDR, 3 s
+        // in. Nominal minus actual is a full second.
+        let nominal = 2.0;
+        let real = 3.0;
+        let ticks = (real * 90_000.0) as u64;
+        let origin = ts("2026-08-27T00:00:00.000Z");
+        for n in 0..20u64 {
+            let base = n * ticks;
+            let opened = at(origin, n as f64 * real);
+            let entry = closed_ll_entry(
+                flow,
+                n,
+                default_segment_uri(n),
+                base,
+                Some(base + ticks),
+                nominal,
+                at(opened, real),
+            );
+            assert!(
+                (entry.duration_secs - real).abs() < 1e-9,
+                "segment {n} advertises #EXTINF:{:.3} for a {real}s segment",
+                entry.duration_secs
+            );
+            let pdt = entry.program_date_time.expect("a closed row is always dated");
+            let err = (pdt - opened).num_milliseconds();
+            assert!(
+                err.abs() <= 5,
+                "segment {n} is dated {err}ms off its own content — the nominal duration reached the flow clock"
+            );
+        }
+    }
+
+    /// A re-anchor reaches *both* renditions of a flow, not only the one that
+    /// noticed it.
+    ///
+    /// The second rendition to close a segment lands within tens of
+    /// milliseconds of the epoch the first has just re-anchored to, so it
+    /// never trips the re-anchor test itself — it is answered from the
+    /// per-segment cache, which used to hand back a hard-coded `false`. Both
+    /// playlists then carried the identical hour-long jump, one tagged and one
+    /// bare, and their `#EXT-X-DISCONTINUITY-SEQUENCE` counts diverged for the
+    /// rest of the session. RFC 8216 §4.3.3.3 makes that count something a
+    /// player carries across a rendition switch.
+    #[test]
+    fn a_re_anchor_reaches_both_renditions() {
+        let flow = "flow-disc-both";
+        let seg = 2.0;
+        let origin = ts("2026-08-27T00:00:00.000Z");
+        let mut main = CmafState::new();
+        let mut proxy = CmafState::new();
+        let mut tagged = 0usize;
+        for n in 0..6u64 {
+            // The source restarts at segment 3: PTS back to zero, an hour of
+            // wall clock gone.
+            let (base, closed_at) = if n < 3 {
+                (n * 180_000, at(origin, (n + 1) as f64 * seg))
+            } else {
+                ((n - 3) * 180_000, at(origin, 3600.0 + (n - 2) as f64 * seg))
+            };
+            // The main rendition closes first; the proxy 45 ms later, as
+            // measured on the rig.
+            let (a_pdt, a_disc) = segment_date_marking(flow, base, seg, closed_at);
+            let (b_pdt, b_disc) = segment_date_marking(
+                flow,
+                base,
+                seg,
+                closed_at + chrono::Duration::milliseconds(45),
+            );
+            assert_eq!(a_pdt, b_pdt, "segment {n}: the renditions disagree about the date");
+            assert_eq!(
+                a_disc, b_disc,
+                "segment {n}: one rendition declared a discontinuity the other published in silence"
+            );
+            if a_disc {
+                tagged += 1;
+            }
+            for (state, disc) in [(&mut main, a_disc), (&mut proxy, b_disc)] {
+                state.playlist.push_back(M3u8Entry {
+                    sequence_number: n,
+                    duration_secs: seg,
+                    uri: None,
+                    parts: Vec::new(),
+                    program_date_time: Some(a_pdt),
+                    discontinuity: disc,
+                });
+            }
+        }
+        assert_eq!(tagged, 1, "the restart was not declared at all");
+
+        // Both playlists carry the tag, on the same row.
+        let rows_main: Vec<M3u8Entry> = main.playlist.iter().cloned().collect();
+        let rows_proxy: Vec<M3u8Entry> = proxy.playlist.iter().cloned().collect();
+        for (name, rows) in [("main", &rows_main), ("proxy", &rows_proxy)] {
+            let p = build_hls_playlist(
+                required_target_duration(seg, rows),
+                rows,
+                "init.mp4",
+                0,
+                None,
+            );
+            assert_eq!(
+                p.matches("#EXT-X-DISCONTINUITY\n").count(),
+                1,
+                "the {name} rendition published the jump without a tag: {p}"
+            );
+        }
+
+        // And once the tagged row ages out of the window, both reach the same
+        // discontinuity sequence — which is the number a player carries when
+        // it switches between them.
+        main.trim_playlist(2);
+        proxy.trim_playlist(2);
+        assert_eq!(
+            main.discontinuities_trimmed, proxy.discontinuities_trimmed,
+            "the renditions disagree about #EXT-X-DISCONTINUITY-SEQUENCE"
+        );
+        assert_eq!(main.discontinuities_trimmed, 1);
+    }
+
+    /// Publishing a low-latency playlist must not found the flow's clock.
+    ///
+    /// This drives the real row-building path rather than the arithmetic under
+    /// it, and that is the point: the fix for the open-segment bug is a call
+    /// site, and both of the tests written for it called `open_segment_date`
+    /// directly. Reverting the call site left every one of them green.
+    #[test]
+    fn a_low_latency_playlist_never_founds_the_flow_clock() {
+        let flow = "flow-ll-founding";
+        let entries = ll_playlist_entries(
+            &VecDeque::new(),
+            Some(OpenSegmentRow {
+                sequence_number: 0,
+                uri: "seg-00000.m4s",
+                parts: &[],
+                base_dts_90k: 0,
+            }),
+            2.0,
+            flow,
+            ts("2026-08-27T00:00:00.200Z"),
+        );
+        assert_eq!(entries.len(), 1, "the in-progress row is missing");
+        assert!(
+            entries[0].program_date_time.is_none(),
+            "an in-progress row was dated before the flow had closed anything"
+        );
+        assert!(!entries[0].discontinuity);
+        assert!(
+            lock_flow_clocks().get(flow).is_none(),
+            "publishing an in-progress row founded the flow's clock — on a sample taken part-way into a segment"
+        );
+    }
+
+    /// The whole low-latency publish sequence keeps the flow on wall time.
+    ///
+    /// Open, ten chunk publishes, close, thirty times over — through the same
+    /// functions the output calls, so a revert of the read-only call site
+    /// fails here rather than passing quietly. Routed through the close-time
+    /// arithmetic the very first chunk publish founds the epoch 1.8 s early
+    /// (`segment_duration - chunk_duration`), and every date the flow ever
+    /// publishes carries it.
+    #[test]
+    fn publishing_a_low_latency_playlist_does_not_drag_the_flow_epoch() {
+        let flow = "flow-ll-wired";
+        let seg = 2.0;
+        let chunk = 0.2;
+        let origin = ts("2026-08-27T00:00:00.000Z");
+        let mut closed: VecDeque<M3u8Entry> = VecDeque::new();
+        let mut dated_open = 0usize;
+        for n in 0..30u64 {
+            let base = n * 180_000;
+            let opened = at(origin, n as f64 * seg);
+            let uri = default_segment_uri(n);
+            // Every chunk emission rebuilds the manifest, and with it the
+            // in-progress row. This is where the biased sample was taken.
+            let mut chunks = 1u32;
+            while chunks as f64 * chunk <= seg {
+                let rows = ll_playlist_entries(
+                    &closed,
+                    Some(OpenSegmentRow {
+                        sequence_number: n,
+                        uri: &uri,
+                        parts: &[],
+                        base_dts_90k: base,
+                    }),
+                    seg,
+                    flow,
+                    at(opened, chunks as f64 * chunk),
+                );
+                let row = rows.last().expect("the in-progress row");
+                assert_eq!(row.sequence_number, n);
+                if let Some(pdt) = row.program_date_time {
+                    let err = (pdt - opened).num_milliseconds();
+                    assert!(
+                        err.abs() <= 5,
+                        "segment {n} chunk {chunks}: the in-progress row is {err}ms off its own content"
+                    );
+                    dated_open += 1;
+                }
+                chunks += 1;
+            }
+            // Then it closes — the only sample allowed to steer the clock.
+            let entry = closed_ll_entry(
+                flow,
+                n,
+                uri,
+                base,
+                Some(base + 180_000),
+                seg,
+                at(opened, seg),
+            );
+            let pdt = entry.program_date_time.expect("a closed row is always dated");
+            let err = (pdt - opened).num_milliseconds();
+            assert!(err.abs() <= 5, "segment {n} closed {err}ms off its own content");
+            assert!(!entry.discontinuity, "segment {n} claimed a discontinuity");
+            closed.push_back(entry);
+        }
+        // The first segment carries no date — nothing has closed on this flow
+        // yet — and all ten publishes of every segment after it do.
+        assert_eq!(
+            dated_open, 290,
+            "the in-progress row stopped carrying a date after the clock existed"
+        );
+    }
+
+    /// The length a closed low-latency row advertises comes from the
+    /// segmenter, not from a number the caller happened to have.
+    ///
+    /// `closed_ll_entry` takes "where the next segment starts" as an argument,
+    /// and both tests that drive it hand it a literal `Some(base + ticks)`.
+    /// That leaves the derivation itself — `CmafState::closed_segment_end_dts_90k`,
+    /// reading the segmenter that `push()` has already advanced — with no test
+    /// caller at all: reverting it to `None` restores the whole bug (every row
+    /// dated by the configured target, a second early for a 1.5 s GOP and
+    /// three for a 5 s one, permanently and from segment zero) with the suite
+    /// green. So this test drives a real [`VideoSegmenter`] and asks the state
+    /// the same question the output asks it.
+    #[test]
+    fn the_closed_row_takes_its_length_from_the_segmenter() {
+        let flow = "flow-ll-close-wired";
+        // 2 s configured target, 1.5 s GOP: the segmenter cuts on the first
+        // IDR at or past the target, so every segment runs 3 s.
+        let nominal = 2.0;
+        let gop_90k = 135_000u64;
+        let origin = ts("2026-08-27T00:00:00.000Z");
+
+        let mut state = CmafState::new();
+        state.video_seg = Some(VideoSegmenter::new(
+            VideoTrack::from_h264(vec![0x67, 0x42, 0xC0, 0x1E], vec![0x68, 0xCE]),
+            nominal,
+        ));
+        let idr = vec![vec![0x65, 0xB8]];
+
+        let mut closed = 0usize;
+        for n in 0..12u64 {
+            let outcome = state
+                .video_seg
+                .as_mut()
+                .expect("segmenter")
+                .push(&idr, n * gop_90k, true);
+            let Some(seg) = outcome.completed_video else {
+                continue;
+            };
+            // Exactly the production route: the segmenter has already moved on,
+            // and the state is asked where the segment that just closed ended.
+            let next_base = state.closed_segment_end_dts_90k();
+            let opened = at(origin, seg.base_dts_90k as f64 / 90_000.0);
+            let real_secs = seg.duration_90k as f64 / 90_000.0;
+            let row = closed_ll_entry(
+                flow,
+                seg.sequence_number,
+                default_segment_uri(seg.sequence_number),
+                seg.base_dts_90k,
+                next_base,
+                nominal,
+                at(opened, real_secs),
+            );
+            assert!(
+                (row.duration_secs - 3.0).abs() < 1e-9,
+                "segment {} advertises #EXTINF:{:.3} for a 3 s segment",
+                seg.sequence_number,
+                row.duration_secs
+            );
+            let pdt = row.program_date_time.expect("a closed row is always dated");
+            let err = (pdt - opened).num_milliseconds();
+            assert!(
+                err.abs() <= 5,
+                "segment {} is dated {err}ms off its own content — the nominal \
+                 duration reached the flow clock",
+                seg.sequence_number
+            );
+            closed += 1;
+        }
+        assert_eq!(closed, 5, "the segmenter did not close the segments this test is about");
+    }
+
+    /// The in-progress row never advertises less media than the parts listed
+    /// underneath it.
+    ///
+    /// Its length is genuinely unknown — the IDR that ends the segment has not
+    /// arrived — so the row carries a floor rather than a guess: the greater of
+    /// the configured target and what the parts already published account for.
+    /// Pinned at the nominal target, a 5 s segment with 200 ms chunks
+    /// published `#EXTINF:2.000` with twenty-five `#EXT-X-PART:DURATION=0.200`
+    /// rows beneath it, in the same playlist, accounting for 5 s.
+    #[test]
+    fn the_in_progress_row_covers_the_parts_it_lists() {
+        let flow = "flow-ll-open-parts";
+        let seg = 2.0;
+        let now = ts("2026-08-27T00:00:05.000Z");
+        let part = |i: usize| HlsPartEntry {
+            uri: format!("seg-00000.m4s?part={i}"),
+            duration_secs: 0.2,
+            independent: i == 0,
+        };
+
+        // Early in the segment the parts account for less than the target, and
+        // the target is the better floor: the segment cannot close before it.
+        let few: Vec<HlsPartEntry> = (0..3).map(part).collect();
+        let rows = ll_playlist_entries(
+            &VecDeque::new(),
+            Some(OpenSegmentRow {
+                sequence_number: 0,
+                uri: "seg-00000.m4s",
+                parts: &few,
+                base_dts_90k: 0,
+            }),
+            seg,
+            flow,
+            now,
+        );
+        assert!((rows[0].duration_secs - seg).abs() < 1e-9, "{}", rows[0].duration_secs);
+
+        // A 5 s GOP against the same 2 s target: twenty-five parts are on the
+        // origin and the row has to say so.
+        let many: Vec<HlsPartEntry> = (0..25).map(part).collect();
+        let rows = ll_playlist_entries(
+            &VecDeque::new(),
+            Some(OpenSegmentRow {
+                sequence_number: 0,
+                uri: "seg-00000.m4s",
+                parts: &many,
+                base_dts_90k: 0,
+            }),
+            seg,
+            flow,
+            now,
+        );
+        let advertised = rows[0].duration_secs;
+        let listed: f64 = rows[0].parts.iter().map(|p| p.duration_secs).sum();
+        assert!(
+            advertised + 1e-9 >= listed,
+            "the row advertises {advertised:.3}s over parts accounting for {listed:.3}s"
+        );
+        assert!((advertised - 5.0).abs() < 1e-9, "{advertised}");
+
+        // And the playlist that carries it advertises a target the row fits
+        // inside, rather than the 2 it would have inherited from the config.
+        let ll = LowLatencyHints {
+            part_target_secs: 0.2,
+            can_block_reload: true,
+        };
+        let p = build_hls_playlist(
+            required_target_duration(seg, &rows),
+            &rows,
+            "init.mp4",
+            0,
+            Some(&ll),
+        );
+        assert!(p.contains("#EXT-X-TARGETDURATION:5"), "{p}");
+        assert!(p.contains("#EXTINF:5.000,"), "{p}");
+        assert_eq!(p.matches("#EXT-X-PART:").count(), 25, "{p}");
+    }
+
+    /// `#EXT-X-TARGETDURATION` rises with the window and never falls back.
+    ///
+    /// It has to rise the moment a row longer than the advertised target
+    /// enters, or the playlist breaks RFC 8216 §4.3.3.1 against a row it is
+    /// listing. It must not fall when that row is trimmed: a player reads the
+    /// value once and sizes its reload cadence, its buffer and its hold-back
+    /// from it, so a value that shrinks between reloads retracts a decision it
+    /// has already acted on. A source alternating GOP lengths would otherwise
+    /// move the tag on every trim.
+    #[test]
+    fn the_target_duration_rises_with_the_window_and_stays_risen() {
+        let row = |seq: u64, dur: f64| M3u8Entry {
+            sequence_number: seq,
+            duration_secs: dur,
+            uri: None,
+            parts: Vec::new(),
+            program_date_time: None,
+            discontinuity: false,
+        };
+        let mut state = CmafState::new();
+        let steady = [row(0, 2.0), row(1, 2.0)];
+        assert_eq!(state.advertised_target_duration(2.0, &steady), 2);
+        // A long segment arrives — one IDR late, or a source that changed GOP.
+        let with_long = [row(1, 2.0), row(2, 5.0)];
+        assert_eq!(state.advertised_target_duration(2.0, &with_long), 5);
+        // It rolls out of the window again, and the tag stays where it is.
+        let after = [row(3, 2.0), row(4, 2.0)];
+        assert_eq!(
+            state.advertised_target_duration(2.0, &after),
+            5,
+            "the target dropped back under a player that had already read it"
+        );
+        // The high-water is what holds it, not the config: a fresh output with
+        // the same config and the same rows advertises the configured target.
+        assert_eq!(CmafState::new().advertised_target_duration(2.0, &after), 2);
+    }
+
+    /// Two renditions agree across a re-anchor while their skew is under one
+    /// segment — and one segment is where that stops.
+    ///
+    /// The invariant RFC 8216 §4.3.3.3 needs (both renditions tag the same row,
+    /// so a player carries one `#EXT-X-DISCONTINUITY-SEQUENCE` across a switch)
+    /// is conditional on how far apart in wall time the two renditions close
+    /// the same segment, and the condition is not stated anywhere the reader of
+    /// `recent` would find it.
+    ///
+    /// The bound is one segment duration, measured against this model at a
+    /// restart on segment 20: 0.045 s, 0.5 s, 1.5 s and 1.9 s of skew agree
+    /// exactly; 2.5 s gives two date and two flag disagreements (the leader
+    /// tags rows 20 and 21, the laggard tags 19 and 21) and 8 s gives six.
+    /// `reanchor` clears `recent`, so a laggard that still has a *pre*-restart
+    /// segment to close when the leader re-anchors finds an empty cache, takes
+    /// a fresh sample implying the old epoch, and re-anchors back — after which
+    /// the two take turns re-anchoring each other. It is reported, at least:
+    /// three re-anchors inside a minute escalate to the WARN that names this
+    /// exact cause.
+    #[test]
+    fn renditions_agree_across_a_re_anchor_within_a_segment_of_skew() {
+        let seg = 2.0;
+        let restart_at = 20u64;
+        for skew in [0.045f64, 0.5, 1.9] {
+            let flow = format!("flow-skew-{skew}");
+            let origin = ts("2026-08-27T00:00:00.000Z");
+            // Both renditions close every segment, the laggard `skew` later,
+            // interleaved by wall clock exactly as the two outputs would run.
+            let mut events: Vec<(f64, bool, u64)> = Vec::new();
+            for n in 0..26u64 {
+                let closed = (n + 1) as f64 * seg;
+                events.push((closed, true, n));
+                events.push((closed + skew, false, n));
+            }
+            events.sort_by(|a, b| a.0.partial_cmp(&b.0).expect("finite"));
+
+            let mut leader = std::collections::HashMap::new();
+            let mut laggard = std::collections::HashMap::new();
+            for (t, is_leader, n) in events {
+                // The source restarts at segment 20: PTS back to zero while
+                // the wall clock runs on.
+                let base = if n < restart_at {
+                    n * 180_000
+                } else {
+                    (n - restart_at) * 180_000
+                };
+                let got = segment_date_marking(&flow, base, seg, at(origin, t));
+                if is_leader {
+                    leader.insert(n, got);
+                } else {
+                    laggard.insert(n, got);
+                }
+            }
+            let mut tagged = 0usize;
+            for n in 0..26u64 {
+                let (a_pdt, a_disc) = leader[&n];
+                let (b_pdt, b_disc) = laggard[&n];
+                assert_eq!(
+                    a_pdt, b_pdt,
+                    "skew {skew}s, segment {n}: the renditions disagree about the date"
+                );
+                assert_eq!(
+                    a_disc, b_disc,
+                    "skew {skew}s, segment {n}: one rendition declared a discontinuity the other published in silence"
+                );
+                if a_disc {
+                    tagged += 1;
+                }
+            }
+            assert_eq!(
+                tagged, 1,
+                "skew {skew}s: the restart was declared {tagged} times rather than once"
+            );
+        }
+    }
+
+    /// A segment that runs far past the target keeps its date to the close.
+    ///
+    /// `date_open_segment` accepts `now` only inside
+    /// `EPOCH_REANCHOR_SECS + seg_secs` of the segment's own start — outside
+    /// that it is a timeline the clock does not describe, and no date is
+    /// better than an hour-stale one. Handing it the nominal target fixed that
+    /// ceiling at 12 s whatever the segment was doing, so a 15 s segment
+    /// dropped its `#EXT-X-PROGRAM-DATE-TIME` from t = 12.2 s to the close:
+    /// the last fifteen manifest publishes of every segment, silently, with a
+    /// dated row before it and a dated row after it.
+    #[test]
+    fn a_long_segments_in_progress_row_keeps_its_date() {
+        let flow = "flow-ll-long-gop";
+        let nominal = 2.0;
+        let real = 15.0;
+        let origin = ts("2026-08-27T00:00:00.000Z");
+        // One closed segment, so the flow has a clock to read.
+        segment_date_marking(flow, 0, real, at(origin, real));
+
+        let base = (real * 90_000.0) as u64;
+        let mut dated = 0usize;
+        let mut chunks = 1u32;
+        while chunks as f64 * 0.2 <= real {
+            let parts: Vec<HlsPartEntry> = (0..chunks)
+                .map(|i| HlsPartEntry {
+                    uri: format!("seg-00001.m4s?part={i}"),
+                    duration_secs: 0.2,
+                    independent: i == 0,
+                })
+                .collect();
+            let rows = ll_playlist_entries(
+                &VecDeque::new(),
+                Some(OpenSegmentRow {
+                    sequence_number: 1,
+                    uri: "seg-00001.m4s",
+                    parts: &parts,
+                    base_dts_90k: base,
+                }),
+                nominal,
+                flow,
+                at(origin, real + chunks as f64 * 0.2),
+            );
+            let row = rows.last().expect("the in-progress row");
+            assert!(
+                row.program_date_time.is_some(),
+                "the in-progress row lost its date {:.1}s into a {real}s segment",
+                chunks as f64 * 0.2
+            );
+            dated += 1;
+            chunks += 1;
+        }
+        assert_eq!(dated, 75, "the segment was not driven to its close");
+    }
+
+    /// The discontinuity sequence counts what has aged out of the window.
+    #[test]
+    fn trimming_a_discontinuous_row_advances_the_discontinuity_sequence() {
+        let mut state = CmafState::new();
+        for n in 0..4u64 {
+            state.playlist.push_back(M3u8Entry {
+                sequence_number: n,
+                duration_secs: 2.0,
+                uri: None,
+                parts: Vec::new(),
+                program_date_time: None,
+                discontinuity: n == 1,
+            });
+        }
+        state.trim_playlist(4);
+        assert_eq!(state.discontinuities_trimmed, 0, "nothing had left the window yet");
+        state.trim_playlist(2);
+        assert_eq!(
+            state.discontinuities_trimmed, 1,
+            "the tagged row left the window without being counted"
+        );
+        // It only ever grows, and a trim that drops nothing changes nothing.
+        state.trim_playlist(2);
+        assert_eq!(state.discontinuities_trimmed, 1);
     }
 }

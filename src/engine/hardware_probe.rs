@@ -97,13 +97,20 @@ impl HwCodecCapability {
 /// "there is no GPU here" (`no_driver`) apart from "the GPU is present but
 /// something is blocking us from opening it" (`blocked`, typically a
 /// systemd `DeviceAllow` / cgroup sandbox or a missing group membership).
-/// Only emitted for a family that is compiled into this build yet failed
-/// to open at probe time — working families and families that were never
-/// compiled in produce no entry.
+/// Emitted for a family that does not work on this host, in two shapes.
+/// A family compiled into this build that failed to open at probe time is
+/// the original one. A family that is **not** compiled in gets an entry too
+/// — but only when its hardware is present (`not_built`), because on a host
+/// with no such GPU there is nothing to say and warning on the majority of
+/// nodes is how a real warning stops being read. A working family produces
+/// no entry.
 ///
 /// - `family`: `"nvenc"` / `"qsv"` / `"vaapi"`.
-/// - `status`: `"blocked"` / `"no_driver"` / `"busy"` / `"other"`.
-/// - `detail`: operator-facing one-liner pointing at the fix.
+/// - `status`: `"blocked"` / `"busy"` / `"no_driver"` / `"not_built"`.
+///   `EncoderFailure::Other` folds into `blocked` or `no_driver` by device-
+///   node presence, so no entry ever carries a bare `"other"`.
+/// - `detail`: operator-facing one-liner pointing at the fix. For
+///   `not_built` that fix is a rebuild, not anything on the box.
 #[derive(Debug, Clone, Serialize)]
 pub struct HwEncoderDiagnostic {
     pub family: String,
@@ -508,11 +515,13 @@ pub fn probe_static_capabilities() -> StaticCapabilities {
     let sw_capacity = estimate_sw_capacity(&cpu);
     let hw_encoders = probe_hw_encoders();
     let hw_decoders = probe_hw_decoders();
-    // Classify any compiled-in-but-unavailable encoder family so the
+    // Classify every encoder family that does not work here, so the
     // manager can tell "no GPU" from "GPU blocked by the sandbox /
-    // permissions". Empty on healthy hosts (and on builds with no HW
-    // encoders compiled in), which we fold to `None` to keep the field
-    // off the wire entirely.
+    // permissions" from "GPU fine, this binary has no encoder for it"
+    // (`not_built`). Empty on a healthy host, and on any host whose
+    // hardware for the missing families is genuinely absent — which is
+    // still most of the fleet. Folded to `None` so the field stays off
+    // the wire entirely in that case.
     let hw_encoder_diagnostics = {
         let diags = probe_hw_encoder_diagnostics(&hw_encoders);
         for d in &diags {
@@ -1097,11 +1106,19 @@ fn classify_encoder_status(failure: EncoderFailure, node_present: bool) -> &'sta
     }
 }
 
-/// Build the per-family diagnostics for every compiled-in encoder family
-/// that failed to open. Cheap: for each family it's a free registry check
-/// plus (only when that family is compiled-in-and-broken) a single
-/// re-open and a couple of `Path::exists` calls. Healthy hosts and
-/// no-HW-encoder builds pay nothing.
+/// Build the per-family diagnostics for every encoder family that does not
+/// work on this host — compiled in and failing to open, or absent from the
+/// build while its hardware is present.
+///
+/// Cheap, but no longer free for a family that is missing from the build:
+/// device-node presence has to be established BEFORE the registry check
+/// can be turned into an answer, because "no encoder in libavcodec" only
+/// means something once you know whether the hardware is there. So a build
+/// with no hardware encoders at all pays two `Path::exists` calls (NVENC)
+/// plus one `read_dir("/dev/dri")` with a `canonicalize` per render node in
+/// each of the QSV and VAAPI arms — two directory walks, once, at startup.
+/// A host on which a family already works pays nothing for that family: its
+/// arm returns at the first check, before any of this.
 #[cfg(feature = "media-codecs")]
 fn probe_hw_encoder_diagnostics(hw: &HwCodecCapability) -> Vec<HwEncoderDiagnostic> {
     [
@@ -1239,11 +1256,16 @@ fn intel_render_node_present() -> bool {
     render_node_matches(&dri_render_node_drivers(), QSV_DRM_DRIVERS)
 }
 
-/// NVENC diagnostic. `None` unless NVENC is compiled in yet unavailable.
+/// NVENC diagnostic. `None` when NVENC works, and when it is neither
+/// compiled in nor present in hardware.
+///
 /// Distinguishes a present-but-unopenable NVIDIA stack (`blocked` —
 /// `/dev/nvidia*` on disk but `cuInit` / open fails, the DeviceAllow /
 /// cgroup sandbox case) from a box with no NVIDIA driver at all
-/// (`no_driver`).
+/// (`no_driver`). When libavcodec carries no `h264_nvenc` / `hevc_nvenc`
+/// at all there is nothing to open and nothing to classify: that reports
+/// `not_built` if `/dev/nvidia*` says the hardware is there, and stays
+/// silent if it does not.
 #[cfg(feature = "media-codecs")]
 fn nvenc_unavailable_diagnostic(hw: &HwCodecCapability) -> Option<HwEncoderDiagnostic> {
     if hw.h264_nvenc || hw.hevc_nvenc {
@@ -1425,9 +1447,15 @@ fn nvidia_driver_version_mismatch() -> Option<(String, String)> {
     (kernel != userspace).then_some((kernel, userspace))
 }
 
-/// QSV diagnostic. `None` unless QSV is compiled in yet unavailable. The
-/// `EACCES` case (service user not in the `render` group) is the common,
-/// actionable one and reports `blocked` with the group fix.
+/// QSV diagnostic. `None` when QSV works, and when it is neither compiled
+/// in nor backed by an Intel render node.
+///
+/// The `EACCES` case (service user not in the `render` group) is the
+/// common, actionable one and reports `blocked` with the group fix. A build
+/// carrying no `h264_qsv` / `hevc_qsv` reports `not_built` instead — but
+/// only when `/dev/dri` holds a render node owned by one of
+/// `QSV_DRM_DRIVERS`, so a discrete-NVIDIA or AMD box is not told to
+/// rebuild for an iGPU it does not have.
 #[cfg(feature = "media-codecs")]
 fn qsv_unavailable_diagnostic(hw: &HwCodecCapability) -> Option<HwEncoderDiagnostic> {
     if hw.h264_qsv || hw.hevc_qsv {
@@ -1467,10 +1495,14 @@ fn qsv_unavailable_diagnostic(hw: &HwCodecCapability) -> Option<HwEncoderDiagnos
     })
 }
 
-/// VAAPI diagnostic. `None` unless VAAPI encode is compiled in yet
-/// unavailable. Same `EACCES` → `blocked` (render group) and
-/// node-present → `blocked` (driver / sandbox) vs node-absent →
-/// `no_driver` split as QSV.
+/// VAAPI diagnostic. `None` when VAAPI encode works, and when it is
+/// neither compiled in nor backed by a VAAPI-capable render node.
+///
+/// Same `EACCES` → `blocked` (render group) and node-present → `blocked`
+/// (driver / sandbox) vs node-absent → `no_driver` split as QSV, and the
+/// same `not_built` arm: a build with no `h264_vaapi` / `hevc_vaapi` says
+/// so when `/dev/dri` holds a render node owned by one of
+/// `VAAPI_DRM_DRIVERS`, and says nothing when it does not.
 #[cfg(feature = "media-codecs")]
 fn vaapi_unavailable_diagnostic(hw: &HwCodecCapability) -> Option<HwEncoderDiagnostic> {
     if hw.h264_vaapi || hw.hevc_vaapi {

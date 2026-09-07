@@ -538,6 +538,64 @@ mod tests {
         assert_eq!(s.samples.len(), 1);
     }
 
+    /// The segment that just closed ends exactly where the open one begins.
+    ///
+    /// This identity is what dates a closed low-latency row: the row is built
+    /// after `push()` has already moved the segmenter on, so the length it
+    /// advertises — and the length the flow clock is steered with — is
+    /// `open_segment_base_dts_90k()` minus the closed segment's own base. It
+    /// had no test caller anywhere, on either side of the subtraction, while
+    /// the whole of `closed_ll_entry` rested on it.
+    ///
+    /// A 1.5 s GOP against a 2 s target is the case that matters: the
+    /// segmenter cuts on the first IDR at or *past* the target, so the segment
+    /// runs 3 s and the configured 2 s is not its length. Passing the nominal
+    /// figure instead dated every row a second early, permanently.
+    #[test]
+    fn the_open_segment_begins_where_the_closed_one_ended() {
+        let v = VideoTrack::from_h264(vec![0x67, 0x42, 0xC0, 0x1E], vec![0x68, 0xCE]);
+        let mut s = VideoSegmenter::new(v, 2.0);
+        let idr = vec![vec![0x65, 0xB8]];
+
+        // Nothing is open before the first IDR, and the caller must be able to
+        // tell that apart from a segment that starts at zero.
+        assert_eq!(s.open_segment_base_dts_90k(), None);
+
+        let gop = 90_000 + 45_000; // 1.5 s
+        s.push(&idr, 0, true);
+        assert_eq!(s.open_segment_base_dts_90k(), Some(0));
+        // 1.5 s in: past a GOP, short of the 2 s target, so no cut.
+        assert!(s.push(&idr, gop, true).completed_video.is_none());
+        assert_eq!(s.open_segment_base_dts_90k(), Some(0));
+
+        // 3 s in: the first IDR at or past the target closes the segment.
+        let seg = s
+            .push(&idr, 2 * gop, true)
+            .completed_video
+            .expect("the second IDR past the target closes the segment");
+        assert_eq!(seg.base_dts_90k, 0);
+        assert_eq!(seg.duration_90k, 2 * gop, "a 1.5 s GOP gives 3 s segments");
+        assert_eq!(
+            s.open_segment_base_dts_90k(),
+            Some(seg.base_dts_90k + seg.duration_90k),
+            "the open segment does not begin where the closed one ended, so a \
+             row dated by the difference is dated by a fiction"
+        );
+
+        // And it holds for the second segment too, where the base is not zero
+        // and an off-by-one in either direction would still land somewhere
+        // plausible.
+        let seg = s
+            .push(&idr, 4 * gop, true)
+            .completed_video
+            .expect("segment two closes on the same rule");
+        assert_eq!(seg.base_dts_90k, 2 * gop);
+        assert_eq!(
+            s.open_segment_base_dts_90k(),
+            Some(seg.base_dts_90k + seg.duration_90k)
+        );
+    }
+
     /// Audio is shed only when it has run far past the segment target, which
     /// means the video track has stopped closing segments. At the target
     /// itself it must be retained — the muxed fragment is built from it.

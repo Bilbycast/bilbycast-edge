@@ -162,6 +162,56 @@ fn install_diag_signal_handlers() {
 /// before this is called, and `tracing_subscriber::fmt` writes through a
 /// `LineWriter`, so completed log lines are already out. What is skipped is
 /// precisely the C++ global teardown that has nothing safe left to do.
+///
+/// # What else this skips, and why no on-disk state needed it
+///
+/// Leaving from inside `block_on` also skips `Runtime::drop`, so the next
+/// reader does not have to re-derive what that was doing for us. It was
+/// doing less than it looks: runtime drop waits for **blocking-pool
+/// closures that have already started** and simply drops every async task.
+/// So the writers that actually own files on this node — the replay
+/// segment/index writer, the CMAF uploader, the media-library chunk
+/// session, the manager WS command handlers — are plain async tasks and
+/// never had that guarantee to lose in the first place.
+///
+/// The `spawn_blocking` closures that really do touch disk are three, and
+/// each writes one file atomically — unique temp, then `rename(2)` — so a
+/// cut leaves either the old file or the new one, never a half-written one:
+///
+/// - `config::persistence::save_config_split` — `config.json` via
+///   `.json.tmp` + rename, then `secrets.json` the same way.
+/// - `media::MediaLibrary` chunk upload — appends to a staging file, then
+///   one rename onto the library on the final chunk.
+/// - `media::manifest::store_sidecar` — pid+counter-qualified temp, rename;
+///   a cut leaves a scratch file in `.manifests/`, and the sidecar is
+///   re-derived from the asset's bytes when it is missing.
+///
+/// (The replay segment/index writer and `replay::filmstrip`'s JPEG write
+/// look like they belong on that list and do not: both write through
+/// `tokio::fs`, so they are async tasks. Filmstrip's blocking half only
+/// decodes and encodes.)
+///
+/// `_exit` does not discard writes already handed to the kernel, so a
+/// `rename(2)` that completed stays completed; durability against power
+/// loss is unchanged either way (`save_config` never fsynced).
+///
+/// The one exposure is that `save_config_split` writes **two** files inside
+/// one closure, so a cut between them is newly reachable. Most of what that
+/// can strand is re-pushed by the manager on reconnect, but `node_secret`
+/// is not: a `rotate_secret` cut there leaves the node on the old secret
+/// while the manager has recorded the new one, and the node then fails auth
+/// on reconnect and needs re-registering. The window is the sub-millisecond
+/// gap between two renames against a shutdown that takes seconds, and it is
+/// the same window a SIGKILL has always had — but the honest fix is to save
+/// `secrets.json` FIRST (a stale `config.json` alongside fresh secrets
+/// strands nothing), which belongs in `config::persistence`, not here.
+///
+/// Worth knowing in the other direction: `observability::log_shipper`'s
+/// file target is a `spawn_blocking` loop over `rx.blocking_recv()` that
+/// returns only when every `EventSender` clone has dropped, which is not
+/// part of the shutdown sequence. On the old path runtime drop would have
+/// *waited on that*, so what is being skipped here is closer to a hang than
+/// to a flush.
 fn exit_without_static_teardown(code: i32) -> ! {
     use std::io::Write;
     let _ = std::io::stdout().flush();
@@ -179,6 +229,37 @@ async fn main() -> anyhow::Result<()> {
     match real_main().await {
         Ok(()) => exit_without_static_teardown(0),
         Err(e) => {
+            // Both lines, deliberately — not one or the other.
+            //
+            // Returning the `Err` from `main` used to hand it to std's
+            // `Termination` impl, which printed `Error: <chain>` to stderr
+            // unconditionally: no subscriber to install, no filter to satisfy.
+            // Leaving through `_exit` took that away, and a `tracing::error!`
+            // on its own does not replace it. Two real cases lose the message
+            // entirely:
+            //
+            //   * `--print-setup-token` against an unreadable or malformed
+            //     `config.json` fails at `load_config_split` in `real_main`,
+            //     which runs BEFORE `tracing_subscriber::fmt().init()` — there
+            //     is no subscriber yet, so the process would exit 1 having
+            //     printed nothing at all. That command is the documented way
+            //     an operator reads a node's registration token, so it is a
+            //     first-contact failure with no output to go on.
+            //   * After init the line is subject to the env filter. The
+            //     two-directive `RUST_LOG` form the root CLAUDE.md recommends
+            //     (`RUST_LOG=info,bilbycast_edge::testbed_events=debug`) sets
+            //     the global default to `off`, which would swallow the only
+            //     record of why the node died and leave systemd an exit code
+            //     and an empty journal.
+            //
+            // `{e:?}` rather than `{e:#}`: on `anyhow::Error` the Debug format
+            // is exactly what `Termination` printed — the message plus the
+            // indented `Caused by:` chain — so stderr says what it always
+            // said. The `tracing::error!` stays because it carries the level
+            // and target a log pipeline keys on; on a host with a subscriber
+            // installed the failure is simply reported twice, on two streams,
+            // which is the price of the stderr line being unconditional.
+            eprintln!("Error: {e:?}");
             tracing::error!("bilbycast-edge exiting: {e:#}");
             exit_without_static_teardown(1)
         }
