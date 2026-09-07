@@ -82,7 +82,7 @@ tokio-stream = "0.1.19"
 
 # HTTP framework
 axum = { version = "0.8.9", features = ["ws"] }
-tower-http = { version = "0.7.0", features = ["cors", "trace"] }
+tower-http = { version = "0.7.1", features = ["cors", "trace"] }
 
 # Serialization
 serde = { version = "1.0.229", features = ["derive"] }
@@ -102,20 +102,33 @@ chrono = "0.4.45"
 # PINNED to a release candidate on purpose, and the version number is
 # misleading: the 7.0 line is STALLED, not merely unreleased. 7.0.0-rc2 was
 # published 2025-03-05, there has never been an rc3, and upstream went on to
-# publish stable 6.2.1 on 2026-05-17 — fourteen months LATER. So `cargo update`
-# cannot move this, no fix will ever land on it, and an advisory against it
-# would have no upgrade path. It is NOT drift; do not "refresh" it to 6.2.1
-# without doing the attached work.
+# publish stable 6.2.1 on 2026-05-17 — fourteen months LATER. No fix will ever
+# land on rc2, and an advisory against it would have no upgrade path. It is NOT
+# drift; do not "refresh" it to 6.2.1 without doing the attached work.
+#
+# The requirement is `=7.0.0-rc2`, EXACT, and that matters: a caret on a
+# prerelease crosses to later prereleases of the same base version, so plain
+# "7.0.0-rc2" would take an rc3 or a 7.0.0 final on the next `cargo update`
+# — the routine bump procedure this monorepo uses, since dependabot's cargo
+# ecosystem is deliberately off — and land it in the hot-path registries with
+# no review. Nothing in [7.0.0-rc2, 8.0.0) has been published since
+# 2025-03-05, but the range would have taken it silently.
 #
 # Reverting to 6.2.1 is API-clean for our usage — every call site is `DashMap`,
 # `DashMap::new` or `Entry`, both versions re-export Entry/OccupiedEntry/
-# VacantEntry at the crate root, what 7.0 removed (the `Map` trait,
-# `SharedValue`, the `raw-api` feature) appears nowhere here, and no manifest
-# declares a dashmap feature. What stops it being a free swap is that 7.0
+# VacantEntry at the crate root, what 7.0 removed (the `Map` trait and
+# `SharedValue` — `raw-api` is declared in BOTH versions and was not removed)
+# appears nowhere here, and no manifest declares a dashmap feature. The lookup
+# bounds on get/remove/contains_key/remove_if do differ — `K: Borrow<Q>, Q:
+# Hash + Eq` in 6.2.1 against `Q: Hash + Equivalent<K>` in rc2 — which is
+# compile-compatible for our keys only because `equivalent`'s single impl is
+# the Borrow blanket. A revert also drags hashbrown 0.14.5 and once_cell into
+# three graphs that carry no 0.14.x, and steps back to edition 2018 / MSRV
+# 1.65. What stops it being a free swap is that 7.0
 # replaced hashbrown's RawTable with HashTable internally, and these maps are
 # the lock-free hot-path registries of Key Design Constraints #1/#2. Bench the
 # registries before moving, in edge, manager and relay together.
-dashmap = "7.0.0-rc2"
+dashmap = "=7.0.0-rc2"
 arc-swap = "1.9"
 
 # Byte buffers
@@ -244,7 +257,7 @@ serde_urlencoded = "0.7.1"
 subtle = "2.6"
 
 # Secrets encryption at rest (AES-256-GCM for secrets.json)
-aes-gcm = "0.11.0"
+aes-gcm = "0.11.1"
 # Pure-Rust CENC ciphers for CMAF output (Common Encryption ISO/IEC 23001-7):
 #   cenc scheme → AES-128-CTR, cbcs scheme → AES-128-CBC with 1:9 block
 #   pattern. RustCrypto audited crates, MIT/Apache-2.0. Tiny binary cost.
@@ -253,7 +266,7 @@ ctr = "0.10"
 cbc = "0.2"
 
 # UUID for flow IDs
-uuid = { version = "1.24.1", features = ["v4", "v5", "serde"] }
+uuid = { version = "1.26.0", features = ["v4", "v5", "serde"] }
 
 # WebSocket client for manager connection
 tokio-tungstenite = { version = "0.30.0", features = ["rustls-tls-webpki-roots"] }
@@ -349,7 +362,7 @@ rustls = { version = "0.23.43", features = ["ring"] }
 # AEAD encryption for end-to-end tunnel encryption (ChaCha20-Poly1305)
 ring = "0.17.14"
 rustls-pemfile = "2.2.0"
-rcgen = "0.14.9"
+rcgen = "0.14.10"
 
 # EBU R128 loudness + true-peak measurement for the Audio Full
 # content-analysis tier. Pure-Rust (Sebastian Dröge's port of libebur128);
@@ -657,7 +670,7 @@ hardware-monitor-nvml = ["dep:nvml-wrapper"]
 ptp-internal = []
 
 [dependencies.tokio-rustls]
-version = "0.26.4"
+version = "0.26.5"
 optional = true
 
 [dependencies.axum-server]
@@ -666,6 +679,11 @@ features = ["tls-rustls"]
 optional = true
 
 [dependencies.str0m]
+# 0.23.1 (patch on top of 0.23.0): the only change between them is the
+# `sctp-proto` requirement, ^0.10.3 -> ^0.10.4. Feature table, MSRV (1.85.0)
+# and every other dependency are byte-identical in the index, so nothing in
+# the audit below moves.
+#
 # 0.23.0 (2026-08-13), up from 0.22.0. An API-only bump: the crates.io
 # dependency list and feature table are byte-identical between the two
 # versions (dimpl ^0.7.1, is ^0.11.0, str0m-proto ^0.7.0, sctp-proto ^0.10.3;
@@ -712,7 +730,7 @@ optional = true
 # extra level-5.1 PT registrations in `engine::webrtc::session` work around.
 # Removing them would change the answered SDP m-line PT set — interop-visible,
 # so it wants its own change with its own interop run.
-version = "0.23.0"
+version = "0.23.1"
 optional = true
 # Use OpenSSL DTLS backend instead of the default aws-lc-rs + dimpl. The
 # pure-Rust dimpl DTLS implementation stalls when the active side (WHEP
@@ -760,7 +778,7 @@ version = "0.4.20"
 # (`_nmos-node._tcp`). Best-effort: registration is gated at runtime so
 # environments without multicast on the chosen interface degrade cleanly.
 [dependencies.mdns-sd]
-version = "0.21.0"
+version = "0.21.2"
 
 [dev-dependencies]
 tempfile = "3.27.0"
@@ -771,7 +789,7 @@ tempfile = "3.27.0"
 # macOS / BSD because it links libnvidia-ml at runtime. Enable explicitly
 # on release builds for those targets; the rest stays cleanly opt-out.
 [target.'cfg(any(target_os = "linux", target_os = "windows"))'.dependencies]
-nvml-wrapper = { version = "0.12", optional = true }
+nvml-wrapper = { version = "0.13", optional = true }
 
 # Local-display output — Linux-only. `drm` is the pure-Rust drm-rs
 # crate (ioctl-based KMS, /dev/dri/cardN, no libdrm linkage), `alsa`

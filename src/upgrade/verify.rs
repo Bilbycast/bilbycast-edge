@@ -170,7 +170,10 @@ fn identity_matches_allowlist(claims: &CertIdentity, allowed: &[AllowedSigner]) 
 /// **Implementation note**: the sigstore-rs crate has churned across
 /// 0.x releases. We use a small set of stable primitives here:
 /// * `sigstore::trust::sigstore::SigstoreTrustRoot` for the Fulcio root.
-/// * X.509 parsing via `x509-cert` (which sigstore-rs re-exports).
+/// * X.509 parsing via `x509-cert`, our own direct dependency — sigstore-rs
+///   does NOT re-export it, so this is not a redundant dep to "simplify"
+///   away. It is held at 0.2 to match sigstore's own `^0.2`; see the
+///   HELD note in Cargo.toml.
 /// * RustCrypto's `p256` / `ed25519-dalek` for signature verification.
 ///
 /// Because Sigstore Fulcio always issues ECDSA-P256 certs and cosign's
