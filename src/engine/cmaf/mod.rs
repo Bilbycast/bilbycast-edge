@@ -25,6 +25,7 @@
 mod box_writer;
 mod cenc;
 mod cenc_boxes;
+mod clips;
 pub(crate) mod codecs;
 mod encode;
 #[allow(dead_code)]
@@ -953,6 +954,21 @@ async fn run(
     );
 
     let base_url = config.ingest_url.trim_end_matches('/').to_string();
+
+    // Clip export watches the passthrough rendition only.
+    //
+    // An operator exporting a moment wants the full-resolution picture, not the
+    // 640x360 proxy that exists so scrubbing stays cheap — and the player asks
+    // for clips against the main stream, so a proxy poller would find nothing
+    // and spend a request every five seconds proving it.
+    if config.video_encode.is_none() {
+        tokio::spawn(clips::run(
+            base_url.clone(),
+            config.auth_token.clone(),
+            cancel.clone(),
+        ));
+    }
+
     let init_name = "init.mp4".to_string();
     let init_url = format!("{base_url}/{init_name}");
     let m3u8_url = format!("{base_url}/manifest.m3u8");
