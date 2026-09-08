@@ -140,8 +140,118 @@ async fn http_get(url: &str, auth: Option<&str>) -> Result<Vec<u8>> {
     Ok(resp.bytes().await?.to_vec())
 }
 
+/// A wall-clock instant as a PTS in the recording, via its anchor.
+///
+/// `pts = anchor_pts + (wall - anchor_wall) * 90_000 / 1_000_000`, computed in
+/// i128 so a mark well before the recording began cannot wrap a u64 into a
+/// range near the end of time and hand the exporter something absurd. `None`
+/// means "before this recording started", which is a real answer: the media
+/// does not exist and the caller falls back rather than cutting nonsense.
+fn pts_for_wall(anchor_wall_us: i64, anchor_pts: u64, wall_us: i64) -> Option<u64> {
+    let delta_us = (wall_us as i128) - (anchor_wall_us as i128);
+    let ticks = anchor_pts as i128 + delta_us * 90_000 / 1_000_000;
+    u64::try_from(ticks).ok()
+}
+
+/// Cut exactly, from the local replay recording.
+///
+/// Returns `Ok(None)` when there is nothing to cut from — no recording for
+/// this flow, or one made before the wall-clock anchor existed — so the caller
+/// can fall back to whole segments rather than fail.
+///
+/// The mapping is the anchor written on the recording's first indexed frame:
+/// `pts = anchor_pts + (wall - anchor_wall) * 90_000`. Measured on the rig at
+/// -36ms against the CMAF published dates, inside one frame at 25fps, where
+/// `created_at_unix` was out by anywhere from half a second to nineteen.
+#[cfg(feature = "replay")]
+async fn cut_exact(flow_id: &str, rec: &ClipRecord) -> Result<Option<Vec<u8>>> {
+    let dir = crate::replay::recording_dir(flow_id);
+    let Ok(raw) = tokio::fs::read(dir.join("recording.json")).await else {
+        return Ok(None);
+    };
+    let meta: serde_json::Value = serde_json::from_slice(&raw)?;
+    let (Some(anchor_wall_us), Some(anchor_pts)) = (
+        meta.get("anchor_wall_us").and_then(|v| v.as_i64()),
+        meta.get("anchor_pts_90khz").and_then(|v| v.as_u64()),
+    ) else {
+        tracing::info!(
+            flow_id, clip = %rec.name,
+            "clip exporter: recording has no wall-clock anchor; \
+             falling back to whole segments"
+        );
+        return Ok(None);
+    };
+
+    let at: DateTime<Utc> = DateTime::parse_from_rfc3339(&rec.at)?.with_timezone(&Utc);
+    let (Some(from), Some(to)) = (
+        pts_for_wall(
+            anchor_wall_us,
+            anchor_pts,
+            (at - chrono::Duration::seconds(rec.pre_secs as i64)).timestamp_micros(),
+        ),
+        pts_for_wall(
+            anchor_wall_us,
+            anchor_pts,
+            (at + chrono::Duration::seconds(rec.post_secs as i64)).timestamp_micros(),
+        ),
+    ) else {
+        return Ok(None);
+    };
+    if to <= from {
+        bail!("clip '{}': the window is empty after mapping to PTS", rec.name);
+    }
+
+    // The exporter chunks; a clip is wanted whole.
+    let mut out: Vec<u8> = Vec::new();
+    let mut offset = 0u64;
+    loop {
+        let chunk = crate::replay::export_mp4::export_recording_mp4_chunk(
+            flow_id,
+            Some(from),
+            Some(to),
+            offset,
+            8 * 1024 * 1024,
+        )
+        .await?;
+        let got = chunk.data.len() as u64;
+        out.extend_from_slice(&chunk.data);
+        if chunk.eof || got == 0 {
+            break;
+        }
+        offset += got;
+    }
+    if out.is_empty() {
+        return Ok(None);
+    }
+    tracing::info!(
+        flow_id, clip = %rec.name, from_pts = from, to_pts = to, bytes = out.len(),
+        "clip exporter: cut exactly from the replay recording"
+    );
+    Ok(Some(out))
+}
+
+#[cfg(not(feature = "replay"))]
+async fn cut_exact(_flow_id: &str, _rec: &ClipRecord) -> Result<Option<Vec<u8>>> {
+    Ok(None)
+}
+
 /// Assemble and upload one clip.
-async fn cut_one(base: &str, auth: Option<&str>, rec: &ClipRecord) -> Result<usize> {
+async fn cut_one(base: &str, auth: Option<&str>, flow_id: &str, rec: &ClipRecord) -> Result<usize> {
+    // Exact if the recorder is running for this flow; whole segments if not.
+    // The fallback is not a lesser mode to be ashamed of — it needs no second
+    // copy of the media on the edge — but it lands on segment boundaries, so
+    // prefer the cut that lands on the frame.
+    if let Some(bytes) = cut_exact(flow_id, rec).await? {
+        let target = format!("{base}/clips/{}.mp4", urlencoding_light(&rec.name));
+        let n = bytes.len();
+        http_put(&target, bytes, "video/mp4", auth).await?;
+        return Ok(n);
+    }
+    cut_from_segments(base, auth, rec).await
+}
+
+/// Assemble from whole segments — the fallback when nothing is recorded locally.
+async fn cut_from_segments(base: &str, auth: Option<&str>, rec: &ClipRecord) -> Result<usize> {
     let at: DateTime<Utc> = DateTime::parse_from_rfc3339(&rec.at)
         .with_context(|| format!("clip '{}' has an unparseable timestamp", rec.name))?
         .with_timezone(&Utc);
@@ -192,7 +302,12 @@ fn urlencoding_light(name: &str) -> String {
 }
 
 /// Poll one origin for pending clips until cancelled.
-pub async fn run(base_url: String, auth_token: Option<String>, cancel: tokio_util::sync::CancellationToken) {
+pub async fn run(
+    base_url: String,
+    auth_token: Option<String>,
+    flow_id: String,
+    cancel: tokio_util::sync::CancellationToken,
+) {
     let base = base_url.trim_end_matches('/').to_string();
     let auth = auth_token.as_deref();
     tracing::info!(origin = %base, "clip exporter: watching for clip requests");
@@ -221,7 +336,7 @@ pub async fn run(base_url: String, auth_token: Option<String>, cancel: tokio_uti
         };
 
         for rec in records.iter().filter(|r| !r.ready) {
-            match cut_one(&base, auth, rec).await {
+            match cut_one(&base, auth, &flow_id, rec).await {
                 Ok(bytes) => tracing::info!(
                     clip = %rec.name, bytes, pre = rec.pre_secs, post = rec.post_secs,
                     "clip exporter: cut and uploaded"
@@ -310,6 +425,42 @@ mod tests {
         let segs = parse_playlist(&mangled);
         assert_eq!(segs.len(), 3);
         assert!(segs.iter().all(|s| s.uri != "seg-00101.m4s"));
+    }
+
+    /// The anchor measured on the rig, mapped back.
+    ///
+    /// Real values from bilby-z440: the recording anchored PTS 158400 to
+    /// 1788827202551745 us. A mark one second later must land exactly 90000
+    /// ticks on, and the identity case must return the anchor untouched — an
+    /// error of one 90 kHz tick here is invisible in review and wrong in every
+    /// clip.
+    #[test]
+    fn a_wall_instant_maps_to_the_pts_the_anchor_implies() {
+        let aw = 1_788_827_202_551_745_i64;
+        let ap = 158_400_u64;
+        assert_eq!(pts_for_wall(aw, ap, aw), Some(ap), "the anchor itself must not move");
+        assert_eq!(pts_for_wall(aw, ap, aw + 1_000_000), Some(ap + 90_000), "one second");
+        assert_eq!(pts_for_wall(aw, ap, aw + 40_000), Some(ap + 3_600), "one frame at 25fps");
+        assert_eq!(
+            pts_for_wall(aw, ap, aw - 1_000_000),
+            Some(ap - 90_000),
+            "a second before the anchor is still inside the recording"
+        );
+    }
+
+    /// A mark from before the recording began has no media behind it.
+    ///
+    /// The subtraction must not wrap: a u64 underflow would ask the exporter
+    /// for a range near the end of time, which reads as a corrupt request
+    /// rather than an absent one.
+    #[test]
+    fn a_mark_before_the_recording_started_is_refused_not_wrapped() {
+        let aw = 1_788_827_202_551_745_i64;
+        let ap = 158_400_u64; // 1.76s of media before the anchor
+        // Two seconds earlier is past the start of the recording.
+        assert_eq!(pts_for_wall(aw, ap, aw - 2_000_000), None);
+        // An hour earlier certainly is.
+        assert_eq!(pts_for_wall(aw, ap, aw - 3_600_000_000), None);
     }
 
     #[test]

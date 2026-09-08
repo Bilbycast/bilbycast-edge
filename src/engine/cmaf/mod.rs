@@ -965,6 +965,10 @@ async fn run(
         tokio::spawn(clips::run(
             base_url.clone(),
             config.auth_token.clone(),
+            // The flow is how the exporter finds the local recording: a
+            // recorder's `storage_id` defaults to the flow id, which is what
+            // an exact cut is read from.
+            flow_id.to_string(),
             cancel.clone(),
         ));
     }
