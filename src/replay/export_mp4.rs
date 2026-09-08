@@ -554,8 +554,8 @@ fn reencode_all_intra(
         // affordable where it would not be on a live output.
         codec: "x264".to_string(),
         source_video_pid: None,
-        width: Some(source.width as u32),
-        height: Some(source.height as u32),
+        width: Some(source.width),
+        height: Some(source.height),
         fps_num: Some(fps_num),
         fps_den: Some(1000),
         bitrate_kbps: None,
@@ -652,27 +652,6 @@ fn reencode_all_intra(
     bail!("this build has no encoder")
 }
 
-/// Where each fragment starts: sample 0, then every later sync sample.
-///
-/// A fragment has to open on a random-access point, or it is not one — a
-/// player that seeks to it has nothing to decode from. Returned as boundaries
-/// rather than slices so the caller can walk them in pairs.
-///
-/// The trailing element is the sample count, so `windows(2)` yields every
-/// fragment including the last.
-fn fragment_bounds(samples: &[Sample]) -> Vec<usize> {
-    if samples.is_empty() {
-        return vec![0, 0];
-    }
-    let mut bounds = vec![0usize];
-    for (i, s) in samples.iter().enumerate().skip(1) {
-        if s.is_sync {
-            bounds.push(i);
-        }
-    }
-    bounds.push(samples.len());
-    bounds
-}
 
 /// Walk the AC-3 / E-AC-3 PES blobs collected during demux, split each
 /// on the syncword, and produce an `AudioTrack` plus the per-frame
@@ -798,46 +777,6 @@ fn build_mp2_track(blobs: &[(u64, u8, Vec<u8>)]) -> Result<(Option<AudioTrack>, 
 mod tests {
     use super::*;
 
-    fn sample(is_sync: bool) -> Sample {
-        Sample { duration: 3600, data: vec![0u8; 8], composition_time_offset: 0, is_sync }
-    }
-
-    /// Every fragment opens on a keyframe, or seeking to it lands on nothing.
-    ///
-    /// The export used to be a single `moof` holding the whole clip, with no
-    /// `sidx` and no `mfra`, so a player had nothing to seek by at all — which
-    /// is why an exported clip could not be scrubbed. One fragment per GOP is
-    /// the structure that fixes it, and it is only a fix if each one starts at
-    /// a random-access point.
-    #[test]
-    fn every_fragment_starts_on_a_keyframe() {
-        // Two full GOPs of five, then a short tail.
-        let mut v = Vec::new();
-        for g in 0..3 {
-            v.push(sample(true));
-            for _ in 0..(if g == 2 { 1 } else { 4 }) {
-                v.push(sample(false));
-            }
-        }
-        let b = fragment_bounds(&v);
-        assert_eq!(b, vec![0, 5, 10, 12], "fragments do not split on the keyframes");
-
-        for w in b.windows(2) {
-            assert!(
-                v[w[0]].is_sync,
-                "fragment starting at sample {} opens on a non-keyframe",
-                w[0]
-            );
-        }
-
-        // A clip with no keyframe at all is still one fragment rather than
-        // none: better a file that plays from the top than no file.
-        let none: Vec<Sample> = (0..4).map(|_| sample(false)).collect();
-        assert_eq!(fragment_bounds(&none), vec![0, 4]);
-
-        // And nothing at all does not panic on the windows(2) walk.
-        assert_eq!(fragment_bounds(&[]), vec![0, 0]);
-    }
     use crate::engine::cmaf::fmp4::AudioCodec as FmpAudioCodec;
 
     #[test]

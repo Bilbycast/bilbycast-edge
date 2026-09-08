@@ -2017,8 +2017,8 @@ fn write_progressive_video_trak(
         for &m in &UNITY_MATRIX {
             tkhd.u32(m);
         }
-        tkhd.u32((v.width as u32) << 16);
-        tkhd.u32((v.height as u32) << 16);
+        tkhd.u32(v.width << 16);
+        tkhd.u32(v.height << 16);
     }
     {
         let mut mdia = trak.child(*b"mdia");

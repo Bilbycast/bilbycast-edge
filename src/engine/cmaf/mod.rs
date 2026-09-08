@@ -1089,25 +1089,23 @@ async fn run(
     // every viewer's DVR history disappears and refills only in real time.
     // Segment numbering continues from where the old manifest left off, or
     // the new run would overwrite the very segments it just restored.
-    match restore_published_window(
+    // Nothing to resume means a fresh stream, or an origin that cannot be
+    // reached. Neither is a reason to refuse to start: the cost is a shorter
+    // window, and the cost of failing here would be no output at all.
+    if let Some((rows, next_seq)) = restore_published_window(
         &base_url,
         config.auth_token.as_deref(),
         config.playlist_window_segments(),
     )
     .await
     {
-        Some((rows, next_seq)) => {
-            tracing::info!(
-                output = %config.id, segments = rows.len(), next_seq,
-                "CMAF output: resumed the window the origin already holds"
-            );
-            state.playlist = rows;
-            state.resume_seq = next_seq;
-            state.restore_discontinuity = true;
-        }
-        // A fresh stream, or an origin that cannot be reached. Neither is a
-        // reason to refuse to start: the cost is a shorter window.
-        None => {}
+        tracing::info!(
+            output = %config.id, segments = rows.len(), next_seq,
+            "CMAF output: resumed the window the origin already holds"
+        );
+        state.playlist = rows;
+        state.resume_seq = next_seq;
+        state.restore_discontinuity = true;
     }
 
     // Pre-flight Phase 3 re-encoders.
