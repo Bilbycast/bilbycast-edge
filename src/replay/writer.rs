@@ -120,6 +120,27 @@ struct RecordingMeta {
     segment_seconds: u32,
     /// Current segment ID (next NNNNNN.ts to write).
     current_segment_id: u32,
+    /// Wall clock at `anchor_pts_90khz`, in **microseconds** since the Unix
+    /// epoch — the pair that lets a wall-clock instant be turned into a PTS.
+    ///
+    /// `created_at_unix` cannot do this job. It is whole seconds, and it marks
+    /// when the writer opened rather than when the first frame landed:
+    /// measured against the CMAF published dates over 124s of media it sat a
+    /// stable +0.47s out, so a mark converted through it lands about half a
+    /// second from the frame the operator chose. That is no better than
+    /// cutting on segment boundaries, which is the thing exact cutting exists
+    /// to avoid.
+    ///
+    /// Written once, when the first index entry is appended, and preserved
+    /// across a writer restart. Absent on recordings made before this existed;
+    /// readers fall back to `created_at_unix` and inherit its coarseness.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    anchor_wall_us: Option<i64>,
+    /// The PTS `anchor_wall_us` describes. Stored explicitly rather than
+    /// assumed to be the first entry, because the index prunes from the front:
+    /// `wall(pts) = anchor_wall_us + (pts - anchor_pts_90khz) / 90_000`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    anchor_pts_90khz: Option<u64>,
 }
 
 /// Public handle returned by [`spawn_writer`]. Owns the JoinHandle for
@@ -240,9 +261,14 @@ pub async fn spawn_writer(
     let meta = RecordingMeta {
         schema_version: 1,
         recording_id: recording_id.clone(),
-        created_at_unix: existing_meta.map(|m| m.created_at_unix).unwrap_or(now_unix),
+        created_at_unix: existing_meta.as_ref().map(|m| m.created_at_unix).unwrap_or(now_unix),
         segment_seconds: config.segment_seconds,
         current_segment_id: starting_segment,
+        // Carried across a restart: the anchor describes the media already on
+        // disk, and re-taking it against a later PTS would silently shift
+        // every clip cut from what came before.
+        anchor_wall_us: existing_meta.as_ref().and_then(|m| m.anchor_wall_us),
+        anchor_pts_90khz: existing_meta.as_ref().and_then(|m| m.anchor_pts_90khz),
     };
     write_meta_atomic(&meta_path, &meta).await?;
 
@@ -610,6 +636,41 @@ impl WriterState {
                 // Mirror in memory so mark-in / mark-out can resolve
                 // SMPTE TC by PTS without re-reading index.bin.
                 self.index_mirror.entries.push(entry);
+
+                // Take the wall-clock anchor on the first indexed frame.
+                //
+                // Here rather than at writer start, because the gap between
+                // opening the writer and the first frame arriving is exactly
+                // the error that made `created_at_unix` useless for this. This
+                // still carries the pipeline delay — the frame is timestamped
+                // when it reaches us, not when it was shot — but that delay is
+                // the same one the CMAF epoch is founded on, so a mark placed
+                // through the published dates and a cut made through this
+                // anchor agree with each other, which is what matters.
+                if self.meta.anchor_wall_us.is_none() {
+                    let us = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .map(|d| d.as_micros() as i64)
+                        .unwrap_or(0);
+                    self.meta.anchor_wall_us = Some(us);
+                    self.meta.anchor_pts_90khz = Some(entry.pts_90khz);
+                    // Persisted immediately: an anchor only in memory is lost
+                    // to the first restart, and every clip cut afterwards
+                    // would fall back to the coarse `created_at_unix`.
+                    if let Err(e) = write_meta_atomic(&self.meta_path, &self.meta).await {
+                        tracing::warn!(
+                            recording_id = %self.recording_id, error = %e,
+                            "replay: could not persist the wall-clock anchor; \
+                             clip cuts will fall back to created_at_unix"
+                        );
+                    } else {
+                        tracing::info!(
+                            recording_id = %self.recording_id,
+                            anchor_pts = entry.pts_90khz, anchor_wall_us = us,
+                            "replay: wall-clock anchor taken on the first indexed frame"
+                        );
+                    }
+                }
             }
         }
         Ok(())
