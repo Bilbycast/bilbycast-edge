@@ -118,6 +118,38 @@ previously did unconditionally. `EVENT` promises a playlist that only
 ever grows (RFC 8216 §4.3.3.5); a trimmed playlist is not one, and
 hls.js computed a seekable range that included segments already dropped.
 
+## A restart keeps the published window
+
+A CMAF output starts with an empty playlist. Left there, a restart republishes
+a manifest covering only what it has produced *since* — while the origin still
+holds the previous hour. Every viewer's DVR history disappears, and in the
+browser player marks grey out, because reachability is read from the playlist.
+The window then refills only in real time.
+
+So on start the output reads back the manifest the origin is already serving
+and seeds its window from those rows, each keeping its own
+`EXT-X-PROGRAM-DATE-TIME`. Three things fall out of that:
+
+* **Segment numbering continues** past the highest sequence in the restored
+  playlist. Restarting at zero would overwrite the very segments just restored
+  — which is what a restart used to do, leaving orphaned high-numbered segments
+  on the origin until retention swept them.
+* **The join is a discontinuity.** `base_dts` restarts with the process and the
+  flow clock is process-global, so it cannot know the timeline broke. The first
+  row published after a restore carries `EXT-X-DISCONTINUITY` regardless.
+* **Never more than the configured window.** Restoring more rows than the
+  output advertises would claim a window the retention policy does not keep.
+
+Best-effort throughout: a fresh stream 404s, and an origin that cannot be
+reached is not a reason to refuse to start. The cost of failing here is no
+output at all; the cost of the restore not happening is a shorter window.
+
+Measured on the rig: 1800 segments and sequence `seg-04097` before a restart,
+1800 segments and `seg-04115` after, with one discontinuity at the join.
+
+This is the mirror of the relay-side failure where the origin holds *less* than
+the edge advertises — see `bilbycast-relay/docs/distribution.md`.
+
 ## Target duration (`#EXT-X-TARGETDURATION`)
 
 The tag is derived from the **rows** — the longest one in the window, held as a

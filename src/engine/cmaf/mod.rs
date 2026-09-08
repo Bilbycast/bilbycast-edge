@@ -27,7 +27,7 @@ mod cenc;
 mod cenc_boxes;
 mod clips;
 pub(crate) mod codecs;
-mod encode;
+pub(crate) mod encode;
 #[allow(dead_code)]
 pub(crate) mod fmp4;
 mod manifest;
@@ -768,6 +768,17 @@ struct CmafState {
     init_last_upload: Option<std::time::Instant>,
     /// Rolling window of muxed segments (newest last).
     playlist: VecDeque<M3u8Entry>,
+    /// The first segment of this run joins a window a previous run wrote, and
+    /// does not continue its media timeline: `base_dts` restarts with the
+    /// process, and the flow clock is process-global so it cannot know. Set
+    /// when a window was restored, and consumed by the first row published.
+    restore_discontinuity: bool,
+    /// Sequence number the next segment should take.
+    ///
+    /// Non-zero when a previous run's window was restored: numbering has to
+    /// continue past what the origin already holds, or the new run overwrites
+    /// the segments it just restored.
+    resume_seq: u64,
     /// The largest `#EXT-X-TARGETDURATION` this output has ever published.
     ///
     /// A high-water mark rather than the current window's maximum, and the
@@ -820,6 +831,82 @@ struct CencRuntime {
     extra_pssh: Vec<Vec<u8>>,
 }
 
+/// Rebuild the published window from what the origin already holds.
+///
+/// A CMAF output starts with an empty playlist, so a restart republishes a
+/// manifest covering only what it has produced *since* — while the origin
+/// still holds the previous hour. Every viewer's DVR history vanishes, marks
+/// grey out because the player reads reachability from the playlist, and the
+/// window refills only in real time. This is the mirror of the relay-side
+/// failure where the origin holds less than the edge advertises.
+///
+/// So the previous manifest is read back and its rows become the starting
+/// window. Best-effort by design: a fresh stream 404s, and an origin that
+/// cannot be reached must not stop an output starting — the cost of getting
+/// this wrong is a shorter window, and the cost of failing here is no output
+/// at all.
+///
+/// Returns the restored rows and the sequence number to carry on from.
+async fn restore_published_window(
+    base: &str,
+    auth: Option<&str>,
+    limit: usize,
+) -> Option<(VecDeque<M3u8Entry>, u64)> {
+    let body = clips::fetch_manifest(base, auth).await.ok()?;
+    let text = String::from_utf8_lossy(&body);
+    parse_published_window(&text, limit)
+}
+
+/// The rows of a served media playlist, and the sequence to carry on from.
+fn parse_published_window(text: &str, limit: usize) -> Option<(VecDeque<M3u8Entry>, u64)> {
+    let mut rows: Vec<M3u8Entry> = Vec::new();
+    let mut pdt: Option<chrono::DateTime<chrono::Utc>> = None;
+    let mut dur: Option<f64> = None;
+    for line in text.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("#EXT-X-PROGRAM-DATE-TIME:") {
+            pdt = chrono::DateTime::parse_from_rfc3339(rest.trim())
+                .ok()
+                .map(|d| d.with_timezone(&chrono::Utc));
+        } else if let Some(rest) = line.strip_prefix("#EXTINF:") {
+            dur = rest.trim_end_matches(',').trim().parse::<f64>().ok();
+        } else if !line.is_empty() && !line.starts_with('#') {
+            // The origin rewrites URIs to carry a viewer token; the name is
+            // the part that matters, and the sequence number is in it.
+            let uri = line.split(['?', '#']).next().unwrap_or(line).to_string();
+            let seq = uri
+                .rsplit('/')
+                .next()
+                .and_then(|n| n.strip_prefix("seg-"))
+                .and_then(|n| n.split('.').next())
+                .and_then(|n| n.parse::<u64>().ok());
+            if let (Some(seq), Some(d)) = (seq, dur) {
+                rows.push(M3u8Entry {
+                    sequence_number: seq,
+                    duration_secs: d,
+                    uri: Some(uri),
+                    parts: Vec::new(),
+                    program_date_time: pdt,
+                    discontinuity: false,
+                });
+            }
+            pdt = None;
+            dur = None;
+        }
+    }
+    if rows.is_empty() {
+        return None;
+    }
+    // Never restore more than this output is configured to advertise, or the
+    // first trim would drop most of it anyway and the manifest would briefly
+    // claim a window the retention policy does not keep.
+    if rows.len() > limit {
+        rows.drain(..rows.len() - limit);
+    }
+    let next_seq = rows.iter().map(|r| r.sequence_number).max().unwrap_or(0) + 1;
+    Some((rows.into_iter().collect(), next_seq))
+}
+
 /// LL-CMAF state held across the duration of one segment upload.
 struct LlSegment {
     handle: ChunkedPutHandle,
@@ -856,6 +943,8 @@ impl CmafState {
             init_upload_failing: false,
             init_last_upload: None,
             playlist: VecDeque::new(),
+            restore_discontinuity: false,
+            resume_seq: 0,
             target_duration_published: 0,
             discontinuities_trimmed: 0,
             audio_reencoder: None,
@@ -993,6 +1082,34 @@ async fn run(
     let mut demuxer = TsDemuxer::new(config.program_number);
     let mut state = CmafState::new();
 
+    // Pick up the window this stream was already publishing.
+    //
+    // Without this a restart republishes a manifest covering only what it has
+    // produced since, while the origin still holds the previous hour — so
+    // every viewer's DVR history disappears and refills only in real time.
+    // Segment numbering continues from where the old manifest left off, or
+    // the new run would overwrite the very segments it just restored.
+    match restore_published_window(
+        &base_url,
+        config.auth_token.as_deref(),
+        config.playlist_window_segments(),
+    )
+    .await
+    {
+        Some((rows, next_seq)) => {
+            tracing::info!(
+                output = %config.id, segments = rows.len(), next_seq,
+                "CMAF output: resumed the window the origin already holds"
+            );
+            state.playlist = rows;
+            state.resume_seq = next_seq;
+            state.restore_discontinuity = true;
+        }
+        // A fresh stream, or an origin that cannot be reached. Neither is a
+        // reason to refuse to start: the cost is a shorter window.
+        None => {}
+    }
+
     // Pre-flight Phase 3 re-encoders.
     if let Some(enc_cfg) = &config.audio_encode {
         match AudioReencoder::new(enc_cfg, &cancel, &config.id, flow_id) {
@@ -1019,7 +1136,8 @@ async fn run(
                                 .map(|k| k * 1000)
                                 .unwrap_or(128_000),
                         );
-                        state.audio_seg = Some(AudioSegmenter::new(track, config.segment_duration_secs));
+                        state.audio_seg =
+                            Some(AudioSegmenter::new_from_seq(track, config.segment_duration_secs, state.resume_seq));
                         state.audio_ready = true;
                         tracing::info!(
                             "CMAF output '{}': audio track pre-built for silent_fallback (sr={} ch={})",
@@ -1356,7 +1474,8 @@ fn handle_other_audio_frame(
                 .map(|k| k * 1000)
                 .unwrap_or(128_000),
         );
-        state.audio_seg = Some(AudioSegmenter::new(track, config.segment_duration_secs));
+        state.audio_seg =
+                            Some(AudioSegmenter::new_from_seq(track, config.segment_duration_secs, state.resume_seq));
         state.audio_ready = true;
         tracing::info!(
             "CMAF output '{}': audio track detected (re-encoded from \
@@ -1441,6 +1560,7 @@ async fn handle_video(
     // than failing cleanly. Defer until the re-encoder has emitted its own.
     if state.video_reencoder.is_none()
         && !ensure_video_segmenter(
+            state.resume_seq,
             &mut state.video_seg,
             codec,
             demuxer,
@@ -1500,6 +1620,7 @@ async fn handle_video(
             .and_then(|e| encode::encoded_codec_family(&e.codec))
             .unwrap_or(codec);
         if !ensure_video_segmenter_from_nalus(
+            state.resume_seq,
             &mut state.video_seg,
             encoded_codec,
             &pushed_nalus,
@@ -1682,7 +1803,11 @@ async fn handle_video(
             uri: Some(uri),
             parts: Vec::new(),
             program_date_time: Some(pdt),
-            discontinuity,
+            // The first row after a restored window always breaks the
+            // timeline, whatever the flow clock believes: it was built fresh
+            // with this process and has nothing to compare against.
+            discontinuity: discontinuity
+                || std::mem::take(&mut state.restore_discontinuity),
         });
         state.trim_playlist(config.playlist_window_segments());
 
@@ -1799,7 +1924,8 @@ fn handle_audio_frame(
                 .map(|k| k * 1000)
                 .unwrap_or(128_000),
         );
-        state.audio_seg = Some(AudioSegmenter::new(track, config.segment_duration_secs));
+        state.audio_seg =
+                            Some(AudioSegmenter::new_from_seq(track, config.segment_duration_secs, state.resume_seq));
         state.audio_ready = true;
         tracing::info!(
             "CMAF output '{}': audio track detected AAC sr={} ch={}",
@@ -1922,6 +2048,7 @@ fn build_muxed_segment_for_seq(
 /// Returns false until a frame carrying the sets shows up, which for a
 /// `global_header = false` encoder is its first IDR.
 fn ensure_video_segmenter_from_nalus(
+    resume_seq: u64,
     slot: &mut Option<VideoSegmenter>,
     codec: VideoCodec,
     nalus: &[Vec<u8>],
@@ -1969,7 +2096,7 @@ fn ensure_video_segmenter_from_nalus(
         "CMAF output '{}': video track from re-encoder {:?} {}x{}",
         output_id, track.codec, track.width, track.height,
     );
-    *slot = Some(VideoSegmenter::new(track, segment_duration_secs));
+    *slot = Some(VideoSegmenter::new_from_seq(track, segment_duration_secs, resume_seq));
     true
 }
 
@@ -2223,6 +2350,7 @@ async fn publish_init_if_due(
 }
 
 fn ensure_video_segmenter(
+    resume_seq: u64,
     slot: &mut Option<VideoSegmenter>,
     codec: VideoCodec,
     demuxer: &TsDemuxer,
@@ -2264,7 +2392,7 @@ fn ensure_video_segmenter(
         "CMAF output '{}': video track detected {:?} {}x{}",
         output_id, track.codec, track.width, track.height,
     );
-    *slot = Some(VideoSegmenter::new(track, segment_duration_secs));
+    *slot = Some(VideoSegmenter::new_from_seq(track, segment_duration_secs, resume_seq));
     true
 }
 
@@ -2819,6 +2947,58 @@ async fn publish_manifests(
 #[cfg(test)]
 mod date_tests {
     use super::*;
+
+    /// A restart picks up the window the origin already holds.
+    ///
+    /// Without this the edge republishes a manifest covering only what it has
+    /// produced since it started, while the origin still holds the previous
+    /// hour — so every viewer's DVR history disappears and marks grey out,
+    /// because the player reads reachability from the playlist.
+    #[test]
+    fn a_served_playlist_can_be_read_back_as_a_window() {
+        let m3u8 = concat!(
+            "#EXTM3U
+#EXT-X-VERSION:9
+#EXT-X-TARGETDURATION:2
+",
+            "#EXT-X-MAP:URI=\"init.mp4\"
+",
+            "#EXT-X-PROGRAM-DATE-TIME:2026-09-08T10:00:00.000Z
+#EXTINF:2.000,
+seg-00040.m4s?token=abc
+",
+            "#EXT-X-PROGRAM-DATE-TIME:2026-09-08T10:00:02.000Z
+#EXTINF:2.000,
+seg-00041.m4s?token=abc
+",
+            "#EXT-X-PROGRAM-DATE-TIME:2026-09-08T10:00:04.000Z
+#EXTINF:1.960,
+seg-00042.m4s?token=abc
+",
+        );
+
+        let (rows, next) = parse_published_window(m3u8, 100).expect("a window");
+        assert_eq!(rows.len(), 3);
+        // Numbering continues past what the origin holds. Restarting at zero
+        // is what let a new run overwrite the segments it had just restored.
+        assert_eq!(next, 43, "the next segment would overwrite an existing one");
+        assert_eq!(rows[0].sequence_number, 40);
+        assert!((rows[2].duration_secs - 1.960).abs() < 1e-6);
+        assert!(rows[0].program_date_time.is_some(), "the row lost its date");
+        // The viewer token in the URI is the *player's*, not this edge's.
+        assert_eq!(rows[0].uri.as_deref(), Some("seg-00040.m4s"));
+
+        // Never restore more than the output will advertise.
+        let (trimmed, _) = parse_published_window(m3u8, 2).expect("a window");
+        assert_eq!(trimmed.len(), 2);
+        assert_eq!(trimmed[0].sequence_number, 41, "the wrong end was trimmed");
+
+        // A fresh stream has nothing to restore, and must not look like it does.
+        assert!(parse_published_window("#EXTM3U
+#EXT-X-VERSION:9
+", 100).is_none());
+        assert!(parse_published_window("", 100).is_none());
+    }
 
     fn ts(s: &str) -> chrono::DateTime<chrono::Utc> {
         chrono::DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&chrono::Utc)
