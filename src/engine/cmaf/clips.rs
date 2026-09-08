@@ -51,6 +51,54 @@ pub struct ClipRecord {
     pub post_secs: u32,
     #[serde(default)]
     pub ready: bool,
+    /// Already given up on. Skipped rather than retried for the life of the
+    /// session.
+    #[serde(default)]
+    pub failed: bool,
+}
+
+/// How many times a clip is attempted before it is called impossible.
+///
+/// Some failures are worth retrying — the origin restarting mid-fetch, a
+/// segment not yet uploaded. Most are not, and a clip that can never be cut
+/// was previously attempted every five seconds until the session ended,
+/// logging a warning each time and telling the viewer it was still "being
+/// cut".
+const MAX_ATTEMPTS: u32 = 3;
+
+/// Does this failure have any prospect of coming good?
+///
+/// The window aging out and the clip being too large are settled facts: the
+/// media is gone, or it will be exactly as large next time. Retrying either
+/// wastes the edge's time and delays the operator learning the truth.
+fn is_permanent(err: &str) -> bool {
+    let e = err.to_ascii_lowercase();
+    e.contains("outside the")
+        || e.contains("413")
+        || e.contains("too large")
+        || e.contains("empty after mapping")
+        || e.contains("no dated segments")
+        // Retrying cannot move the restart. Without this the operator waits
+        // through three attempts for an answer that was settled at the first.
+        || e.contains("spans a recorder restart")
+}
+
+/// Tell the origin a clip cannot be produced, so it stops being pending.
+async fn report_failure(base: &str, auth: Option<&str>, name: &str, reason: &str) {
+    let url = format!("{base}/clips/{}.mp4/failed", urlencoding_light(name));
+    let mut req = client()
+        .post(&url)
+        .json(&serde_json::json!({ "reason": reason }));
+    if let Some(t) = auth {
+        req = req.header("Authorization", format!("Bearer {t}"));
+    }
+    match req.send().await {
+        Ok(r) if r.status().is_success() => {}
+        Ok(r) => tracing::warn!(clip = %name, status = r.status().as_u16(),
+            "clip exporter: origin would not record the failure"),
+        Err(e) => tracing::warn!(clip = %name, error = %e,
+            "clip exporter: could not reach the origin to record the failure"),
+    }
 }
 
 /// One entry of the media playlist: when it starts, and how long it runs.
@@ -128,6 +176,15 @@ fn client() -> reqwest::Client {
         .expect("build reqwest client")
 }
 
+/// Fetch a stream's current media playlist from the origin.
+///
+/// Exposed for the output-start path, which reads back the previous run's
+/// manifest so a restart does not republish an empty window. Same credential
+/// and same helper the clip poller uses.
+pub(super) async fn fetch_manifest(base: &str, auth: Option<&str>) -> Result<Vec<u8>> {
+    http_get(&format!("{base}/manifest.m3u8"), auth).await
+}
+
 async fn http_get(url: &str, auth: Option<&str>) -> Result<Vec<u8>> {
     let mut req = client().get(url);
     if let Some(t) = auth {
@@ -201,18 +258,83 @@ async fn cut_exact(flow_id: &str, rec: &ClipRecord) -> Result<Option<Vec<u8>>> {
         bail!("clip '{}': the window is empty after mapping to PTS", rec.name);
     }
 
+    // A moment that spans a recorder restart cannot be exported at all.
+    //
+    // The index's own timeline is continuous across a restart — the writer
+    // resumes its counter — but the *media* is not: the PCR in the TS begins
+    // again with the process. Muxing across the join produced a playable file
+    // declaring itself 7.5 hours long from 30 seconds of video.
+    //
+    // Handing it to the segment fallback was the first answer here, and it is
+    // wrong: the relay's CMAF renditions restart with the same edge, so their
+    // media timeline resets at exactly the same instant. Measured, rather than
+    // assumed — the fallback answered a 30-second request with a file
+    // declaring 70,567 seconds. Both paths have the same join in them.
+    //
+    // So this is refused, with words an operator can act on. Producing a file
+    // that plays but lies about its own length is the worse outcome: it is
+    // discovered in an edit suite, not here.
+    let index = crate::replay::index::InMemoryIndex::load(&dir.join("index.bin"))
+        .await
+        .unwrap_or_default();
+    if index.spans_discontinuity(from, to) {
+        bail!(
+            "clip '{}' spans a recorder restart, and the media either side of it \
+             is two separate timelines — move the mark clear of the restart and \
+             export it again",
+            rec.name
+        );
+    }
+
+    // Ask for one random-access point past the end, so the clip covers the
+    // window instead of stopping short of it.
+    //
+    // The exporter bounds a range with `find_floor` at both ends. At the start
+    // that rounds outward and the opening moment is safe. At the end it rounds
+    // *inward*: the range stops at the last random-access point at or before
+    // `to`, so up to a whole GOP of what was asked for is missing — measured
+    // at 26.35s of a 30s request. Naming the next point instead makes the
+    // exporter's floor land exactly on it.
+    //
+    // Done here rather than in `plan_pts_range`, which is shared with the
+    // manager's mark-in/mark-out export and has its own settled semantics.
+    let to_covering = index.first_after(to).unwrap_or(to);
+
     // The exporter chunks; a clip is wanted whole.
     let mut out: Vec<u8> = Vec::new();
     let mut offset = 0u64;
     loop {
-        let chunk = crate::replay::export_mp4::export_recording_mp4_chunk(
+        let chunk = match crate::replay::export_mp4::export_recording_mp4_chunk(
             flow_id,
             Some(from),
-            Some(to),
+            Some(to_covering),
             offset,
             8 * 1024 * 1024,
         )
-        .await?;
+        .await
+        {
+            Ok(c) => c,
+            // The recording could not serve this moment — which is exactly
+            // what the segment fallback is for, so hand it over rather than
+            // failing the export.
+            //
+            // The common cause is retention: the index still names a segment
+            // that has since been pruned, and the exporter answers "stat
+            // segment …: No such file". The relay's origin window is
+            // configured independently and often still holds the media, so a
+            // clip that the recorder has aged out of is frequently still
+            // cuttable — just on segment boundaries instead of the frame.
+            //
+            // Any other failure lands here too, and deliberately: a coarser
+            // clip beats no clip, and the reason is logged either way.
+            Err(e) => {
+                tracing::warn!(
+                    flow_id, clip = %rec.name, error = %format!("{e:#}"),
+                    "clip exporter: the recording could not serve this moment;                      cutting from whole segments instead"
+                );
+                return Ok(None);
+            }
+        };
         let got = chunk.data.len() as u64;
         out.extend_from_slice(&chunk.data);
         if chunk.eof || got == 0 {
@@ -310,6 +432,13 @@ pub async fn run(
 ) {
     let base = base_url.trim_end_matches('/').to_string();
     let auth = auth_token.as_deref();
+    // Attempts per clip, in memory only: a restart is a fresh chance, which is
+    // the right default when the reason for failing may have been the restart.
+    let mut attempts: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+    // Whether the "cannot read the clip list" warning has already been said
+    // for the current spell of failures. Cleared by the first success, so a
+    // fault that comes back is reported again.
+    let mut quiet = false;
     tracing::info!(origin = %base, "clip exporter: watching for clip requests");
 
     loop {
@@ -322,10 +451,28 @@ pub async fn run(
         }
 
         let listing = match http_get(&format!("{base}/clips"), auth).await {
-            Ok(b) => b,
-            // A relay that predates clip export answers 404. Not worth a warning
-            // every five seconds.
-            Err(_) => continue,
+            Ok(b) => {
+                quiet = false;
+                b
+            }
+            Err(e) => {
+                // A relay that predates clip export answers 404, and saying so
+                // every five seconds helps nobody. Everything else does need
+                // saying: swallowing all of it hid a 403 on every single poll
+                // — the exporter was locked out of its own work queue and the
+                // log looked perfectly healthy. Said once per spell, so a
+                // persistent fault is visible without becoming a firehose.
+                let msg = format!("{e:#}");
+                if !msg.contains("404") && !quiet {
+                    tracing::warn!(
+                        origin = %base, error = %msg,
+                        "clip exporter: cannot read the clip list; nothing will be cut \
+                         until this clears"
+                    );
+                    quiet = true;
+                }
+                continue;
+            }
         };
         let records: Vec<ClipRecord> = match serde_json::from_slice(&listing) {
             Ok(r) => r,
@@ -335,16 +482,33 @@ pub async fn run(
             }
         };
 
-        for rec in records.iter().filter(|r| !r.ready) {
+        for rec in records.iter().filter(|r| !r.ready && !r.failed) {
             match cut_one(&base, auth, &flow_id, rec).await {
-                Ok(bytes) => tracing::info!(
-                    clip = %rec.name, bytes, pre = rec.pre_secs, post = rec.post_secs,
-                    "clip exporter: cut and uploaded"
-                ),
-                // Left pending on purpose: the next pass retries. A window that
-                // has aged out will keep failing, which is visible in the log
-                // and honest — the clip genuinely cannot be produced.
-                Err(e) => tracing::warn!(clip = %rec.name, error = %e, "clip exporter: could not cut"),
+                Ok(bytes) => {
+                    attempts.remove(&rec.name);
+                    tracing::info!(
+                        clip = %rec.name, bytes, pre = rec.pre_secs, post = rec.post_secs,
+                        "clip exporter: cut and uploaded"
+                    );
+                }
+                Err(e) => {
+                    let msg = format!("{e:#}");
+                    let n = attempts.entry(rec.name.clone()).or_insert(0);
+                    *n += 1;
+                    if is_permanent(&msg) || *n >= MAX_ATTEMPTS {
+                        tracing::warn!(
+                            clip = %rec.name, attempts = *n, error = %msg,
+                            "clip exporter: giving up on this clip"
+                        );
+                        report_failure(&base, auth, &rec.name, &msg).await;
+                        attempts.remove(&rec.name);
+                    } else {
+                        tracing::info!(
+                            clip = %rec.name, attempt = *n, error = %msg,
+                            "clip exporter: could not cut; will try again"
+                        );
+                    }
+                }
             }
         }
     }
@@ -353,6 +517,30 @@ pub async fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A clip spanning a recorder restart is refused once, not three times.
+    ///
+    /// Retrying cannot move the restart, and the operator waiting through
+    /// three attempts learns nothing they could not have been told at the
+    /// first. Both paths carry the same join — the recorder's TS and the
+    /// relay's CMAF renditions restart with the same process — so there is no
+    /// fallback left to try.
+    #[test]
+    fn a_clip_across_a_restart_is_not_retried() {
+        assert!(
+            is_permanent("clip 'Goal' spans a recorder restart, and the media either side"),
+            "the operator would wait through three attempts for a settled answer"
+        );
+        // And the transient cases must stay retryable: a segment that has not
+        // been uploaded yet is exactly what a second attempt fixes.
+        for e in [
+            "GET https://origin/manifest.m3u8 returned HTTP 503",
+            "connection reset by peer",
+            "GET https://origin/seg-00042.m4s returned HTTP 404",
+        ] {
+            assert!(!is_permanent(e), "{e} must still be retried");
+        }
+    }
 
     fn t(s: &str) -> DateTime<Utc> {
         DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc)
@@ -461,6 +649,23 @@ mod tests {
         assert_eq!(pts_for_wall(aw, ap, aw - 2_000_000), None);
         // An hour earlier certainly is.
         assert_eq!(pts_for_wall(aw, ap, aw - 3_600_000_000), None);
+    }
+
+    /// Some failures are worth retrying and most are not.
+    ///
+    /// A window that has aged out and a clip that is too large are settled
+    /// facts — retrying either burns the edge's time and delays the operator
+    /// learning the truth. A refused connection might be the origin restarting.
+    #[test]
+    fn a_settled_failure_is_not_retried_and_a_transient_one_is() {
+        assert!(is_permanent("clip 'x': the window .. is outside the 1800 segments"));
+        assert!(is_permanent("PUT https://relay/clips/x.mp4 returned HTTP 413 — clip too large"));
+        assert!(is_permanent("clip 'x': the window is empty after mapping to PTS"));
+        assert!(is_permanent("clip 'x': the playlist carries no dated segments"));
+
+        assert!(!is_permanent("error sending request for url: connection refused"));
+        assert!(!is_permanent("GET https://relay/manifest.m3u8 returned HTTP 503"));
+        assert!(!is_permanent("operation timed out"));
     }
 
     #[test]
