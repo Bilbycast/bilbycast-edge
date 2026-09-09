@@ -246,9 +246,20 @@ fn exit_without_static_teardown(code: i32) -> ! {
 /// growth without putting a recurring stall in the media path.
 #[cfg(target_env = "gnu")]
 fn spawn_heap_trimmer(cancel: tokio_util::sync::CancellationToken) {
-    // Long enough that the lock traffic is irrelevant, short enough that a
-    // burst of activity is given back within one broadcast segment of time.
-    const EVERY: Duration = Duration::from_secs(180);
+    // Every minute.
+    //
+    // The interval sets how much slack the process carries, because it is the
+    // window in which freed pages accumulate. Measured on the demo rig with a
+    // single session and no clip activity, the live path churns about
+    // 330 MB/min of transient allocation — so at three minutes the resident
+    // size oscillated between 1.6 GB and 2.6 GB, and at one it stays within a
+    // few hundred megabytes of the floor.
+    //
+    // That gigabyte matters on a box sharing 15 GB with the edge doing the SDI
+    // capture. The cost is per-arena locks taken briefly once a minute, which
+    // is far lighter than the clip cut this same process already does without
+    // disturbing segment cadence.
+    const EVERY: Duration = Duration::from_secs(60);
     tokio::spawn(async move {
         let mut ticks = tokio::time::interval(EVERY);
         ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
