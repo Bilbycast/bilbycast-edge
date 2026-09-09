@@ -67,10 +67,13 @@ in the microsecond domain, driving the `IngressPublisher`'s drainer task:
    re-anchored, `ingress_dejitter_shed` bumped. The downstream re-clocks
    from PCR exactly as it would after any network loss.
 
-`recv_time_us` is re-stamped to the release instant on the way out, so the
-input buffer and the egress buffer each measure their own residence — the
-egress shed (which keys off `recv_time_us`) never double-counts this
-buffer's hold toward a false shed. `sequence_number` / `rtp_timestamp` are
+`recv_time_us` is re-stamped to the release instant on the way out, so every
+downstream stage that measures from it — chiefly `record_latency()`, whose
+min / avg / max land on `OutputStats.latency` — reports its own residence
+rather than this buffer's hold plus its own. (The **egress** residence-cap
+shed does not read `recv_time_us` at all: it anchors on `enqueue_us`,
+stamped at wire-queue entry, precisely so configured upstream holds cannot
+spend the egress runaway budget.) `sequence_number` / `rtp_timestamp` are
 untouched.
 
 ## Cooperation with SMPTE 2022-7
@@ -105,9 +108,14 @@ the cap.
 
 - **setpoint 60 ms** — same as egress; one inter-PCR window plus headroom,
   inside any pro receiver's T-STD envelope. Precedence: per-input
-  `ingress_dejitter_ms` > node `tuning.ingress_dejitter_ms` >
-  `BILBYCAST_INGRESS_BUFFER_MS` env (deprecated) > 60 ms,
-  clamped [20, 2000] ms.
+  `ingress_dejitter_ms` > node `tuning.ingress_dejitter_ms` > 60 ms,
+  clamped [20, 2000] ms. There is **no** env fallback under those two:
+  `BILBYCAST_INGRESS_BUFFER_MS` was removed rather than deprecated, because
+  it never had an effect in any release — the node-wide setpoint it carried
+  was consulted only after the per-input setpoint had already answered — and
+  reviving it would have started adding ingress latency on every host whose
+  unit file still pins it. A host that sets it raises `deprecated_env_var`
+  with `status = "removed"` and nothing changes.
 - **residence cap `max(4×setpoint, 250)` ms** (per-input
   `ingress_residence_ms` > node `tuning.ingress_residence_ms` >
   `BILBYCAST_INGRESS_RESIDENCE_MS` env, deprecated; clamped to
@@ -117,11 +125,19 @@ the cap.
 - **authority ±5 %** — enough to absorb any realistic source-vs-CLOCK
   offset, small enough that the induced PCR jitter stays inside the
   receiver T-STD.
-- **default OFF.** A passthrough UDP→UDP flow whose only consumer is one
-  egress-de-jittered output gets no benefit from also de-jittering the
-  input (the egress servo already re-paces the wire) — it just adds
-  latency. The value is for the *other* consumers (analysers, PCR PLL,
-  PID-bus, SRT/RIST outputs). Operators opt in per-input based on their
+- **default OFF — but two knobs turn it on.** The buffer starts when either
+  the per-input `ingress_dejitter_ms` or the node-wide
+  `tuning.ingress_dejitter_ms` is set; the node-wide value is an **enable**,
+  not merely a setpoint fallback, so setting it de-jitters (and adds latency
+  to) every raw UDP/RTP input on the node that names no setpoint of its own.
+  Only `input_udp` and `input_rtp` enrol in the node default
+  (`honours_node_defaults`); SRT, RTSP, RTMP and bonded inputs opt out and
+  are unaffected. Both fields are unset in a shipped config, which is what
+  makes the buffer off by default. A passthrough UDP→UDP flow whose only
+  consumer is one egress-de-jittered output gets no benefit from also
+  de-jittering the input (the egress servo already re-paces the wire) — it
+  just adds latency. The value is for the *other* consumers (analysers, PCR
+  PLL, PID-bus, SRT/RIST outputs). Operators opt in per-input based on their
   consumer mix. De-jitter supersedes `ingress_delay_ms` if both are
   set (warned at startup).
 

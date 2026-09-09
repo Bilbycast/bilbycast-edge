@@ -294,6 +294,15 @@ between studios that don't share a PTP fabric, ffmpeg / OBS / GStreamer
 interop, and any general PCM-over-RTP source where ST 2110-30's PTP
 assumption is overkill.
 
+The manager offers **RTP Audio (RFC 3551 PCM)** as a first-class entry
+in the output-type dropdown alongside the ST 2110 entries — no raw-JSON
+editing needed — and mirrors `OutputConfig::RtpAudio` plus the three
+ST 2110-30/-31/-40 variants in `crates/device-edge/src/flow.rs`. Its
+`transcode` block is deliberately kept **opaque** on the manager side
+(`Option<serde_json::Value>`): the edge owns that schema, and the
+manager only round-trips it. That is settled design, not a missing
+mirror.
+
 ### Example: `rtp_audio` input
 
 ```json
@@ -1083,37 +1092,22 @@ guide that are marked READY.
    combined with `redundancy` to surface this constraint at config
    load time.
 
-4. **Manager UI: dedicated `rtp_audio` option in the output-type
-   dropdown.** The runtime supports `OutputConfig::RtpAudio` end-to-end,
-   but the manager UI dropdown still hides it behind raw JSON. Edit the
-   flow config directly to use `"type": "rtp_audio"` for now. The
-   underlying gap is wider than just the dropdown — `manager-core`'s
-   `OutputConfig` enum is missing the `RtpAudio`, `St2110_30`,
-   `St2110_31`, and `St2110_40` variants entirely, plus the
-   `TranscodeJson` mirror struct. Closing those is tracked as a
-   separate manager mirror catch-up effort.
-
-5. **Custom channel-map gains in JSON.** The `transcode.channel_map`
+4. **Custom channel-map gains in JSON.** The `transcode.channel_map`
    field currently treats every routed input as unity gain. For
    non-unity routing today, use one of the named presets (which apply
    −3 dB / −6 dB internally). First-class JSON support for per-entry
    gains (`[[in_ch, gain], ...]`) is on the roadmap.
 
-6. **L20 wire format.** L20 is accepted by the validator and the
+5. **L20 wire format.** L20 is accepted by the validator and the
    transcoder; it's serialized on the wire as L24 with the bottom 4
    bits zeroed per RFC 3190 §4.5. If you specifically need L20-aware
    receivers to advertise L20 in their SDP, raise this with the
    maintainer — the on-the-wire bytes are correct but the NMOS
    advertisement may need a follow-up to surface L20 explicitly.
 
-7. **Latency benchmark numbers per use case.** The plan called for
+6. **Latency benchmark numbers per use case.** The plan called for
    measured `transcode_latency_us` and glass-to-glass numbers per use
    case to be reported here. Those need a real test bench (or `tc qdisc`
    network simulation) and will be added once the bench is set up. The
    `transcode_stats.last_latency_us` field is plumbed end-to-end and
    you can read it today via `GET /api/v1/stats`.
-
-For the implementation history and the chunk-by-chunk breakdown of how
-the audio gateway feature set was built, see
-[`AUDIO_GATEWAY_REPORT.md`](../../AUDIO_GATEWAY_REPORT.md) at the
-monorepo root.

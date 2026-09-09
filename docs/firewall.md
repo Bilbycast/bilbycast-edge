@@ -61,6 +61,11 @@ The public inbound surface is the relay's, not the edge's.
 - Use this when both ends are behind NAT. (`mode: direct` instead requires
   *one* side to be reachable — that side needs an inbound rule for
   `direct_listen_addr`.)
+- The same holds for a **bonded** input: a leg with `transport: relay` dials
+  its `relay_addrs` outbound from an ephemeral local port, so it needs no
+  inbound rule. That is the reason to prefer relay legs when the receiving
+  edge is behind NAT — a `udp` / `rist` / `quic` leg on a bonded *input*
+  always binds (see the matrix).
 
 ## Port matrix
 
@@ -71,6 +76,7 @@ input/output/server config — the values below are the common defaults.
 |-----------|----------------|-------|---------|-------------|
 | Outbound | 443 / 8443 | TCP | Edge → manager (WSS) | Always (control plane) |
 | Outbound | 4433 | UDP (QUIC) | Edge → relay tunnel | Only with relay/direct tunnels |
+| Outbound | *operator-configured* | UDP (incl. QUIC) | Bonded **output** legs → the far edge (`remote`, or the QUIC leg's `addr`, or `relay_addrs` on a relay leg) | Only for bonded outputs |
 | Inbound | *operator-configured* | UDP | SRT **listener** input | Only for SRT listener-mode inputs |
 | Inbound | *operator-configured* | UDP | RTP / UDP receiver input | Only for RTP/UDP inputs |
 | Inbound | 1935 (operator-configured) | TCP | RTMP ingest | Only for RTMP listener inputs |
@@ -78,9 +84,13 @@ input/output/server config — the values below are the common defaults.
 | Inbound | *operator-configured* | TCP+UDP | WebRTC WHIP/WHEP server (signaling + ICE/media) | Only for WebRTC server-mode inputs |
 | Inbound | *operator-configured* | TCP | HLS / CMAF pull (edge serves) | Only if clients pull from the edge |
 | Inbound | *operator-configured* | UDP (multicast) | ST 2110-20/-23/-30/-31/-40 receive | Only for ST 2110 inputs |
+| Inbound | *operator-configured* | UDP | Bonded **input** leg, `transport: udp` — the leg's `bind` (mandatory on the receive side) | Only for bonded inputs with a UDP leg |
+| Inbound | *operator-configured* (even) **and that port + 1** | UDP | Bonded **input** leg, `transport: rist` — `local_bind` carries RTP, `local_bind + 1` carries RTCP (derived, not configurable) | Only for bonded inputs with a RIST leg |
+| Inbound | *operator-configured* | UDP (QUIC) | Bonded **input** leg, `transport: quic` — the leg's `addr`; a bonded input is **always** the QUIC server whatever `role` the config carries | Only for bonded inputs with a QUIC leg |
 | In/out | 319, 320 | UDP | PTP (IEEE 1588) | Only for ST 2110 / PTP-disciplined setups |
-| In/out | 5353 | UDP (mcast) | NMOS / mDNS-SD discovery | Only for NMOS environments |
+| In/out | 5353 | UDP (mcast) | NMOS / mDNS-SD **discovery** only — the IS-04/IS-05/IS-08 APIs themselves ride the 8080 API listener under `/x-nmos/**` | Only for NMOS environments |
 | Inbound | 8080 (operator-configured) | TCP | Edge local HTTP API + setup wizard | Optional, on-site access only — see note |
+| Inbound | *operator-configured* (examples use 9090) | TCP | Edge monitor dashboard — a **second** HTTP server, separate from the 8080 API | Only when a `monitor` block is present |
 
 > **Local HTTP API (8080).** This is the edge's own REST API + setup
 > wizard. It is **not** required for manager control (that's the outbound
@@ -90,6 +100,11 @@ input/output/server config — the values below are the common defaults.
 > `server.listen_addrs` (or `--bind-addrs 0.0.0.0,[::]`) and turn on
 > auth — see [`api-security.md`](api-security.md) for OAuth2/JWT — or
 > leave it loopback and reach it over an SSH tunnel / port-forward.
+> "On-site access only" is the default posture, not a rule: an **NMOS**
+> deployment has to expose 8080 to the registry and controller, because the
+> IS-04/IS-05/IS-08 routes are nested on this listener (`/x-nmos/**`) — 5353
+> only carries discovery. See [`api-security.md`](api-security.md) for what
+> `auth.enabled` and `nmos_require_auth` do to those routes.
 
 ## Listing the ports a config needs
 

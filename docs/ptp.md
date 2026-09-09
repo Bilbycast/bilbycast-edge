@@ -315,10 +315,13 @@ view; alert on e.g. `abs(bilbycast_edge_ptp_offset_ns) > 1000` sustained.
 Full list: [`metrics.md`](metrics.md#ptp-clock-metrics).
 
 **2. Events (discrete forensics, in the manager's Events feed + backups).**
-Always on: lock-state transitions (`ptp_acquiring` / `ptp_lock_acquired` /
-`ptp_lock_lost` / `ptp_holdover` / `ptp_unavailable`) and
-`ptp_grandmaster_changed`. Opt-in magnitude alarms fire when you set the two
-thresholds on the Time page (blank / `0` = off):
+Always on: lock-state transitions, emitted under category `ptp` with the new
+state in `details.lock_state` (`acquiring` / `locked` / `holdover` / `master` /
+`unknown` / `unavailable`) and severity escalating to Critical when Locked or
+Holdover goes Unavailable. **These carry no `error_code`** — alert on `category = ptp` plus
+`details.lock_state`, never on an event name. `ptp_grandmaster_changed` and the
+opt-in magnitude alarms below *do* set `details.error_code`; those alarms fire
+when you set the two thresholds on the Time page (blank / `0` = off):
 
 | Field (`ptp.conf` key) | Fires |
 |---|---|

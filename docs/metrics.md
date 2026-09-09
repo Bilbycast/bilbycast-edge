@@ -1,9 +1,13 @@
 # bilbycast-edge Prometheus Metrics Reference
 
 The edge exposes `/metrics` in standard Prometheus text format, served by
-`api::stats::prometheus_metrics` and gated behind `/metrics` (public by
-default; restricted when `auth.enabled` is on). One scrape returns the
-current snapshot of every flow, input, output, tunnel and system resource.
+`api::stats::prometheus_metrics`. It is **public by default and turning auth
+on does not change that**: the route is registered on the unauthenticated
+router whenever `auth.public_metrics` is `true`, which is its serde default
+even with `auth.enabled: true`. Only setting `auth.public_metrics: false`
+moves `/metrics` onto the authenticated router (JWT, any role) — see
+[`api-security.md`](api-security.md). One scrape returns the current
+snapshot of every flow, input and output, plus node-level system resources.
 
 This document lists the metric families emitted today, grouped by subsystem.
 Labels are quoted verbatim so you can copy-paste into Grafana / alerting
@@ -11,13 +15,32 @@ rules. Every metric is prefixed `bilbycast_edge_`.
 
 ## Label conventions
 
-- `flow_id`, `output_id`, `input_id` — stable IDs from `config.json`.
-- `leg_role` — `"input"` (receive leg) or `"output"` (send leg). Used where
-  the same metric is emitted for both sides.
-- `leg` — `"primary"` | `"leg2"` for SMPTE 2022-7 redundancy, or
-  `"red"` | `"blue"` for ST 2110 Red/Blue pairs.
+- `flow_id`, `output_id` — stable IDs from `config.json`. There is no
+  `input_id` label on any Prometheus series — it appears only as a JSON
+  field, on the WS `per_es` / `inputs_live` payloads and on the REST
+  `/api/v1/stats` input inventory.
+- `leg_role` — `"input"` (receive leg) or `"output"` (send leg). Emitted on
+  the RIST and bonding families only; SRT carries no `leg_role`.
+- `leg` — SRT uses `"input"` / `"input_leg2"` on inputs and `"leg1"` /
+  `"leg2"` on outputs; RIST uses `"leg1"` / `"leg2"` on both sides. No metric
+  emits `leg="primary"`, and no metric emits `"red"` / `"blue"` — ST 2110
+  Red/Blue counters are not Prometheus families at all (see below).
 - `path_id`, `path_name`, `transport` — per-path labels on bonding metrics.
-- `severity` — event-level label on alarm counters.
+- `stat` — `"min"` / `"avg"` / `"max"` on `bilbycast_edge_flow_output_latency_us`.
+- `version`, `domain`, `state`, `pid`, `codec`, `resolution`, `profile`,
+  `level`, `sample_rate`, `channels`, `language`, `type` — subsystem-local
+  labels on the app-info, PTP and media-analysis families.
+
+## Node-level gauges
+
+Emitted unconditionally at the top of every scrape.
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `bilbycast_edge_info` | gauge | `version` | Always 1; carries the build version as a label. |
+| `bilbycast_edge_uptime_seconds` | gauge | — | Seconds since process start. |
+| `bilbycast_edge_flows_total` | gauge | — | Configured flows (`config.flows.len()`). |
+| `bilbycast_edge_flows_active` | gauge | — | Flows currently running. |
 
 ## Flow-level counters and gauges
 
@@ -26,28 +49,74 @@ rules. Every metric is prefixed `bilbycast_edge_`.
 | `bilbycast_edge_flow_input_packets_total` | counter | `flow_id` | Packets received on the active input. |
 | `bilbycast_edge_flow_input_bytes_total` | counter | `flow_id` | Bytes received on the active input. |
 | `bilbycast_edge_flow_input_bitrate_bps` | gauge | `flow_id` | Input bitrate estimate (bits/sec). |
-| `bilbycast_edge_flow_input_packets_lost_total` | counter | `flow_id` | Sequence gaps detected. |
-| `bilbycast_edge_flow_input_packets_recovered_fec_total` | counter | `flow_id` | Packets recovered by 2022-1 FEC. |
+| `bilbycast_edge_flow_input_packets_lost` | counter | `flow_id` | Sequence gaps detected. |
+| `bilbycast_edge_flow_input_fec_recovered_total` | counter | `flow_id` | Packets recovered by 2022-1 FEC. |
 | `bilbycast_edge_flow_output_packets_total` | counter | `flow_id,output_id` | Packets emitted per output. |
 | `bilbycast_edge_flow_output_bytes_total` | counter | `flow_id,output_id` | Bytes emitted per output. |
-| `bilbycast_edge_flow_output_packets_dropped_total` | counter | `flow_id,output_id` | Packets dropped by a slow output subscriber. |
+| `bilbycast_edge_flow_output_packets_dropped` | counter | `flow_id,output_id` | Packets dropped by a slow output subscriber. |
+| `bilbycast_edge_flow_output_latency_us` | gauge | `flow_id,output_id,stat` | End-to-end output latency (µs), one series each for `stat="min"`/`"avg"`/`"max"`. Emitted only when the output has a latency sample. |
+| `bilbycast_edge_flow_output_latency_frames` | gauge | `flow_id,output_id` | The same latency expressed in video frames. Emitted only when the frame duration is known. |
+
+`_packets_lost` and `_packets_dropped` are counters despite carrying no
+`_total` suffix — that is what `api::stats::prometheus_metrics` emits, so
+don't "correct" the names in a dashboard. Six further per-flow families —
+`bilbycast_edge_flow_input_redundancy_switches_total`,
+`bilbycast_edge_flow_input_packets_filtered`,
+`bilbycast_edge_flow_pdv_jitter_us`, `bilbycast_edge_flow_iat_avg_us`,
+`bilbycast_edge_flow_output_bitrate_bps` and
+`bilbycast_edge_flow_output_fec_sent_total` — are catalogued in
+[`api-reference.md`](api-reference.md#get-metrics). The two `_us` gauges are
+emitted only when the flow has a jitter / inter-arrival sample.
 
 ## SRT / RIST per-leg metrics
 
 Emitted once per leg for every input/output that uses the relevant
-transport. Legs appear as `leg="primary"` or `leg="leg2"` (2022-7).
+transport. **The two transports do not share a label convention**, so a
+dashboard selector written for one matches nothing on the other.
+
+### SRT
+
+Two families only. Labels are `flow_id` plus `leg` — there is **no**
+`leg_role` on any SRT series. Input legs are `leg="input"` and
+`leg="input_leg2"`; output legs carry `output_id` plus `leg="leg1"` or
+`leg="leg2"`.
 
 | Metric | Type | Description |
 |--------|------|-------------|
 | `bilbycast_edge_srt_rtt_ms` | gauge | SRT round-trip time (milliseconds). |
-| `bilbycast_edge_srt_packets_retransmitted_total` | counter | Packets retransmitted on sender side (ARQ). |
-| `bilbycast_edge_srt_packets_recovered_total` | counter | Packets recovered via ARQ on receiver side. |
-| `bilbycast_edge_rist_rtt_ms` | gauge | RIST RTCP RR-derived RTT (milliseconds). |
-| `bilbycast_edge_rist_packets_lost_total` | counter | RIST packets declared lost. |
-| `bilbycast_edge_rist_packets_recovered_total` | counter | RIST packets recovered by ARQ or 2022-7. |
+| `bilbycast_edge_srt_loss_total` | counter | SRT cumulative packet loss (`pkt_loss_total`). |
 
-Labels: `flow_id,leg_role="input|output",leg="primary|leg2"` plus
-`output_id` on outputs.
+`srt_loss_total` currently has no 2022-7 arm: it is emitted for the primary
+input leg and for `leg="leg1"` on outputs only, so a leg2 loss series does
+not exist even though `srt_rtt_ms` has one. Sender-retransmit and
+receiver-recovery counters are **not** on `/metrics` at all — they ride the
+WS `stats` message as `pkt_retransmit_total` / `pkt_recv_retransmit_total`
+on the SRT block of `FlowStats`.
+
+### RIST
+
+Six families, all emitted together per leg. Labels are `flow_id`,
+`leg_role="input"|"output"` (plus `output_id` on the output side) and
+`leg="leg1"|"leg2"`.
+
+| Metric | Type | Description |
+|--------|------|-------------|
+| `bilbycast_edge_rist_rtt_ms` | gauge | RIST RTCP RR-derived RTT (milliseconds). |
+| `bilbycast_edge_rist_nack_sent_total` | counter | RIST NACK messages sent by the receiver. |
+| `bilbycast_edge_rist_nack_received_total` | counter | RIST NACK messages received by the sender. |
+| `bilbycast_edge_rist_retransmit_total` | counter | RIST packets retransmitted by the sender. |
+| `bilbycast_edge_rist_packets_lost_total` | counter | RIST packets not recovered by ARQ. |
+| `bilbycast_edge_rist_packets_recovered_total` | counter | Packets that filled a slot already flagged as a gap. The HELP string says "recovered via retransmit", but the reorder buffer sets the flag on *any* arrival that closes a gap, so late-but-in-window packets are counted too; `retransmits_received` (WS-only) is the authoritative ARQ count. |
+
+**A leg only ever fills its own half of this table.** `nack_sent_total`,
+`packets_lost_total` and `packets_recovered_total` are receiver-side, so
+they move on `leg_role="input"` and sit at 0 on `leg_role="output"`;
+`nack_received_total` and `retransmit_total` are sender-side and do the
+reverse. A ratio that mixes the two halves on one leg is always a division
+by zero — pair `packets_recovered_total` with `nack_sent_total` on the
+receiving edge, and `retransmit_total` with `nack_received_total` on the
+sending one. `packets_lost_total` alone won't separate a genuinely clean
+link from one whose ARQ is quietly carrying it: both read ~0.
 
 ## PTP clock metrics
 
@@ -85,6 +154,7 @@ receive side and `"output"` on the send side.
 | `bilbycast_edge_bond_rtt_ms` | gauge | `flow_id,leg_role,[output_id,]path_id,path_name,transport` | Path round-trip time (ms). |
 | `bilbycast_edge_bond_loss_fraction` | gauge | same | Recent loss rate on this path (0.0–1.0). |
 | `bilbycast_edge_bond_path_dead` | gauge | same | 1 = path flagged dead by the liveness probe, 0 = alive. |
+| `bilbycast_edge_bond_path_throughput_bps` | gauge | same | Per-path bond bandwidth (bits/sec). |
 
 ### Per-path counters
 
@@ -99,13 +169,19 @@ receive side and `"output"` on the send side.
 
 Labels on every counter above: `flow_id,leg_role,[output_id,]path_id,path_name,transport`.
 
-### Aggregate bond counters (one per bond leg, not per path)
+### Aggregate bond metrics (one per bond leg, not per path)
 
 | Metric | Type | Labels | Description |
 |--------|------|--------|-------------|
 | `bilbycast_edge_bond_gaps_recovered` | counter | `flow_id,leg_role[,output_id]` | Sequence gaps recovered by the bond ARQ. |
 | `bilbycast_edge_bond_gaps_lost` | counter | same | Sequence gaps that could not be recovered. |
 | `bilbycast_edge_bond_packets_duplicated` | counter | same | Packets the sender scheduler duplicated across multiple paths. |
+| `bilbycast_edge_bond_throughput_bps` | gauge | same | Aggregate bond bandwidth (bits/sec), the sum of the per-path gauges. |
+
+Both `_throughput_bps` families track the JSON `throughput_bps` field —
+media + ARQ + duplicates + bond header — so they exclude FEC repair and
+AEAD overhead. The JSON-only `fec_throughput_bps` and `wire_throughput_bps`
+have no Prometheus family; see [`bonding.md`](bonding.md).
 
 ### Useful PromQL for bonding
 
@@ -123,22 +199,35 @@ bilbycast_edge_bond_path_dead == 1
 # Rolling 60s duplication ratio (bandwidth overhead of dup mode)
 rate(bilbycast_edge_bond_packets_duplicated[60s])
   / rate(bilbycast_edge_bond_path_packets_sent[60s])
+
+# Share of the bond each path is actually carrying — a leg near 0 is dead weight
+bilbycast_edge_bond_path_throughput_bps
+  / ignoring (path_id, path_name, transport) group_left
+    bilbycast_edge_bond_throughput_bps
 ```
 
 ## ST 2110 Red/Blue redundancy
 
-For ST 2110-30/-31/-40 flows with Red/Blue configured.
+> **Not exposed through Prometheus.** No `bilbycast_edge_st2110_*` family is
+> emitted by `/metrics`. The per-leg counters ride the WS `stats` message and
+> `GET /api/v1/stats[/{flow_id}]` as `FlowStats.network_legs`, present only
+> when the input has `redundancy` configured.
 
-| Metric | Type | Labels | Description |
-|--------|------|--------|-------------|
-| `bilbycast_edge_st2110_leg_packets_received` | counter | `flow_id,leg="red\|blue"` | Packets received on each leg. |
-| `bilbycast_edge_st2110_leg_packets_forwarded` | counter | `flow_id,leg` | Packets accepted post-dedupe (reach downstream). |
-| `bilbycast_edge_st2110_leg_packets_duplicate` | counter | `flow_id,leg` | Packets dropped as duplicates by the merger. |
-| `bilbycast_edge_st2110_leg_switches` | counter | `flow_id` | Active-leg switch events (2022-7 failovers). |
+| Field | Meaning |
+|---|---|
+| `red.packets_received` / `blue.packets_received` | Packets received on each leg. |
+| `red.bytes_received` / `blue.bytes_received` | Bytes received on each leg. |
+| `red.packets_forwarded` / `blue.packets_forwarded` | Packets accepted post-dedupe (reach downstream). |
+| `red.packets_duplicate` / `blue.packets_duplicate` | Packets dropped as duplicates by the merger. |
+| `leg_switches` | Active-leg switch events (2022-7 failovers). |
+
+**Source:** `src/stats/models.rs::NetworkLegsStats` / `LegCounters`,
+populated in `src/stats/collector.rs`.
 
 ## TR-101290 analyzer
 
-One counter family per TR-101290 Priority 1 / Priority 2 error class.
+One counter family per TR-101290 Priority 1 / Priority 2 error class. PCR is
+split across **two** families — there is no combined `_pcr_errors_total`.
 
 | Metric | Type | Labels | Description |
 |--------|------|--------|-------------|
@@ -147,7 +236,28 @@ One counter family per TR-101290 Priority 1 / Priority 2 error class.
 | `bilbycast_edge_tr101290_cc_errors_total` | counter | `flow_id` | Continuity counter discontinuities. |
 | `bilbycast_edge_tr101290_pat_errors_total` | counter | `flow_id` | PAT-related errors. |
 | `bilbycast_edge_tr101290_pmt_errors_total` | counter | `flow_id` | PMT-related errors. |
-| `bilbycast_edge_tr101290_pcr_errors_total` | counter | `flow_id` | PCR repetition / discontinuity errors. |
+| `bilbycast_edge_tr101290_pid_errors_total` | counter | `flow_id` | PID errors — expected ES PIDs missing. |
+| `bilbycast_edge_tr101290_tei_errors_total` | counter | `flow_id` | Transport error indicator set. |
+| `bilbycast_edge_tr101290_crc_errors_total` | counter | `flow_id` | CRC-32 errors on PAT/PMT sections. |
+| `bilbycast_edge_tr101290_pcr_discontinuity_errors_total` | counter | `flow_id` | PCR discontinuity errors. |
+| `bilbycast_edge_tr101290_pcr_accuracy_errors_total` | counter | `flow_id` | PCR accuracy errors. |
+
+Every family here is emitted per flow only while `FlowStats.tr101290` is
+populated — i.e. while the analyzer is running. A stopped analyzer gaps the
+series rather than reporting zero, so alert on `absent()` if you need to
+distinguish "no errors" from "not watching".
+
+## Media-analysis metrics
+
+Emitted per running flow while `FlowStats.media_analysis` is populated.
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `bilbycast_edge_media_video_info` | gauge | `flow_id,pid,codec,resolution,profile,level` | Always 1; carries the video ES description as labels. Unknown fields render as `"unknown"`, never absent. |
+| `bilbycast_edge_media_video_framerate` | gauge | `flow_id,pid` | Detected frame rate. Emitted only when a frame rate was resolved. |
+| `bilbycast_edge_media_audio_info` | gauge | `flow_id,pid,codec,sample_rate,channels[,language]` | Always 1; `language` is present **only** when the elementary stream declares one, so the label set differs between series of the same family. |
+| `bilbycast_edge_media_pid_bitrate_bps` | gauge | `flow_id,pid,type="video\|audio"` | Per-ES bitrate. Suppressed when the measured bitrate is 0. |
+| `bilbycast_edge_media_total_bitrate_bps` | gauge | `flow_id` | Total measured bitrate. Suppressed when 0. |
 
 ## PID-bus per-ES counters
 
@@ -315,24 +425,52 @@ Present on raw UDP / RTP inputs running the ingress de-jitter buffer
 
 **Source:** `src/engine/ingress_dejitter.rs` (wired via `input_udp.rs` / `input_rtp.rs`), `src/stats/models.rs::InputStats`. Background: [`ingress-dejitter-design.md`](ingress-dejitter-design.md).
 
-## Tunnel metrics
+## Tunnel telemetry
 
-Emitted for every active QUIC tunnel.
+> **Not exposed through Prometheus.** No `bilbycast_edge_tunnel_*` family is
+> emitted — `/metrics` contains no tunnel data at all. The same
+> `TunnelStatus` list reaches two other surfaces: the WS `stats` message
+> carries it as `payload.tunnels` on every tick, and REST serves it at
+> `GET /api/v1/tunnels` for all, `GET /api/v1/tunnels/{id}` for one. A
+> tunnel-only node is not a blind spot on the WS path — the periodic arm
+> sends `"flows": []` alongside the same tunnel list.
 
-| Metric | Type | Labels | Description |
-|--------|------|--------|-------------|
-| `bilbycast_edge_tunnel_state` | gauge | `tunnel_id,direction="ingress\|egress"` | 1 = connected, 0 = down. |
-| `bilbycast_edge_tunnel_bytes_ingress_total` | counter | same | Bytes received from the peer edge. |
-| `bilbycast_edge_tunnel_bytes_egress_total` | counter | same | Bytes sent to the peer edge. |
-| `bilbycast_edge_tunnel_rtt_ms` | gauge | same | QUIC RTT estimate. |
+Each entry is a `TunnelStatus` — `id`, `name`, `protocol`, `mode`,
+`direction`, `local_addr`, `state`, plus `relay_addrs` /
+`active_relay_idx` / `active_relay_addr` on relay-mode tunnels — carrying a
+`stats` object:
+
+| Field | Meaning |
+|---|---|
+| `packets_sent` / `packets_received` | Datagram counts in each direction. |
+| `bytes_sent` / `bytes_received` | Byte counts in each direction. |
+| `bitrate_in_bps` / `bitrate_out_bps` | Estimated throughput each way. |
+| `send_errors` | Transmit failures on the carrier socket. |
+| `decrypt_errors` | Inbound AEAD failures (native-UDP carrier). Sustained growth with flat `packets_received` ⇒ `tunnel_encryption_key` mismatch. |
+| `connections_total` / `connections_active` | Cumulative and current carrier connections. |
+
+There is **no per-tunnel RTT on any surface** — `TunnelStatsSnapshot` has no
+such field, so the QUIC RTT estimate this section used to promise cannot be
+served by REST or the WS feed either.
+
+**Source:** `src/tunnel/manager.rs::TunnelStatus` / `TunnelStatsSnapshot`,
+`src/api/tunnels.rs`, and the `"tunnels"` key built in
+`src/manager/client.rs`.
 
 ## Bandwidth monitor (RP 2129 trust boundary)
 
-| Metric | Type | Labels | Description |
-|--------|------|--------|-------------|
-| `bilbycast_edge_flow_bandwidth_limit_mbps` | gauge | `flow_id` | Configured limit (absent when unconfigured). |
-| `bilbycast_edge_flow_bandwidth_exceeded` | gauge | `flow_id` | 1 while the flow is over-limit within grace period. |
-| `bilbycast_edge_flow_bandwidth_blocked` | gauge | `flow_id` | 1 while ingress is blocked (block action only). |
+> **Not exposed through Prometheus.** No `bilbycast_edge_flow_bandwidth_*`
+> family is emitted. Bandwidth-limit state rides the WS `stats` message and
+> `GET /api/v1/stats[/{flow_id}]` as fields on `FlowStats`.
+
+| Field | Meaning |
+|---|---|
+| `bandwidth_exceeded` | `true` while the flow is over-limit within the grace period. Omitted from the JSON when false. |
+| `bandwidth_blocked` | `true` while ingress is blocked (block action only). Omitted from the JSON when false. |
+| `bandwidth_limit_mbps` | Configured limit, for dashboard display. Omitted when no limit is configured. |
+
+**Source:** `src/stats/models.rs::FlowStats`, populated in
+`src/stats/collector.rs`.
 
 ## System resources
 
@@ -340,7 +478,12 @@ Emitted for every active QUIC tunnel.
 |--------|------|-------------|
 | `bilbycast_edge_system_cpu_percent` | gauge | Whole-system CPU utilisation (0–100). |
 | `bilbycast_edge_system_ram_percent` | gauge | Whole-system RAM utilisation (0–100). |
-| `bilbycast_edge_system_resource_critical` | gauge | 1 while CPU or RAM is above the configured critical threshold. |
+| `bilbycast_edge_system_ram_used_bytes` | gauge | System RAM used, bytes. |
+| `bilbycast_edge_system_ram_total_bytes` | gauge | System RAM total, bytes. |
+| `bilbycast_edge_system_resources_critical` | gauge | 1 while CPU or RAM is above the configured critical threshold. Note the plural `resources` — the singular form matches no series. |
+
+All five are unlabelled and emitted on every scrape, whether or not
+`resource_limits` is configured.
 
 ## Event emission
 
@@ -352,7 +495,14 @@ logs, not `/metrics`.
 
 ## Scraping
 
-`/metrics` returns every family above on every scrape. Recommended scrape
+`/metrics` is a snapshot of what exists right now, not a fixed family list:
+the node-level and system gauges are unconditional, as are the four replay
+recording / orphan gauges in any build carrying the `replay` feature (they
+report 0, they don't vanish), but the per-flow, per-leg, bond, TR-101290 and
+media-analysis families appear only while their subsystem is running and
+populated, and a few (output latency, media bitrates) are suppressed even
+then when the underlying sample is missing. Those series gap rather than
+reporting zero. Recommended scrape
 interval is 10 s for the bonding + redundancy metrics (fast-moving) and
 30 s for everything else. A single 10 s interval works fine; scrape volume
 is dominated by the counter cardinality, not sampling frequency.
@@ -552,6 +702,23 @@ rate-limited (one per 5 s under sustained lag) so the events feed
 isn't drowned during a disk hiccup. `packets_dropped` continues to
 increment on every drop so dashboards can chart the real impact.
 
+### Prometheus families
+
+Node-level, unlabelled, gated on the `replay` Cargo feature (default on) —
+a binary built without it emits none of these.
+
+| Metric | Type | Description |
+|--------|------|-------------|
+| `bilbycast_edge_replay_recordings_count` | gauge | Recordings on disk under the replay root. |
+| `bilbycast_edge_replay_recordings_bytes` | gauge | Bytes consumed by those recordings. |
+| `bilbycast_edge_replay_orphan_recordings_count` | gauge | Recordings with no flow currently armed against them. |
+| `bilbycast_edge_replay_orphan_bytes` | gauge | Bytes consumed by orphan recordings. |
+| `bilbycast_edge_replay_root_free_bytes` | gauge | Free bytes on the replay-root filesystem. Emitted only when `replay::replay_disk_usage()` resolves the filesystem. |
+| `bilbycast_edge_replay_root_total_bytes` | gauge | Total bytes on that filesystem. Same conditional. |
+
+Alarm guidance for orphan creep is in the manager's
+[`USER_GUIDE.md`](../../bilbycast-manager/docs/USER_GUIDE.md).
+
 ## SDI telemetry (`sdi_stats` / `sdi_devices`)
 
 Native SDI (Blackmagic DeckLink, `sdi-decklink` Cargo feature) reports on
@@ -636,12 +803,14 @@ invent a fact the hardware refused to state.
 
 ### Capability
 
-`sdi-decklink` on `HealthPayload.capabilities`, gated on the boot probe
-reaching the SDK. A card-less host with Desktop Video installed still
-advertises it — the capability means "this edge can do SDI"; the
-`sdi_devices[]` list says which ports actually exist. Manager UI gates
-the SDI surfaces on the capability bit, so edges built without the
-feature hide them automatically.
+`sdi-decklink` on `HealthPayload.capabilities`, advertised only when the
+feature is compiled in, the boot probe reached the SDK (Desktop Video
+present) **and** at least one card is enumerated in the live status cache.
+A host with Desktop Video but no card advertises nothing, and the manager
+hides the SDI surfaces entirely — the bit means "this edge has SDI ports",
+not "this edge could do SDI". The device list is re-probed every 10 s, so
+the bit tracks hot-plug in both directions: a card fitted at runtime starts
+offering SDI within a poll interval, with no edge restart.
 
 Config schema: [`configuration-guide.md`](configuration-guide.md#sdi-input-blackmagic-decklink).
 Events: [`events-and-alarms.md`](events-and-alarms.md#sdi-input-flow-sdi-decklink-feature).

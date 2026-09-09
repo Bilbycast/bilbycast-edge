@@ -72,7 +72,7 @@ resolving at build time: the `mv-compositor` capability bit, and a one-entry
   "connector": null,
   "max_canvas_width": 1920,
   "max_canvas_height": 1080,
-  "capabilities": { "encoder_backends": ["libx264"] }
+  "capabilities": { "encoder_backends": ["h264_qsv", "h264_vaapi", "libx264"] }
 }
 ```
 
@@ -84,7 +84,12 @@ every restart and strand the wall pointing at the retired one. `connector` is
 carries the FFmpeg names of the backends a wall on this node **would actually
 use**, head first — the resolved `h264_auto` chain, filtered by what this host
 can open, so on an Intel host with QuickSync it reads
-`["h264_qsv", "h264_vaapi", "x264"]`. Before v0.106.0 it named
+`["h264_qsv", "h264_vaapi", "libx264"]`. Mind the spelling: this list is built
+through `VideoEncoderCodec::ffmpeg_name`, which says `libx264` where the
+resolved chain described below says `x264`. A single-entry `["libx264"]` is
+still a live answer — it is what a host with no hardware encoder, or one whose
+boot probe has not run yet, advertises today — so that value alone is not
+evidence of a pre-v0.106.0 binary. Before v0.106.0 it named
 `select_video_backend()`'s answer and read `["libx264"]` on every artefact
 whatever the host had. The field names are a wire
 contract: the manager's `HeadAdvertisement` deserialises this verbatim.

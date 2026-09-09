@@ -42,7 +42,7 @@ with its current status and a brief description of the implementation.
 | U3 | DPP Live IP flow profiles | missing | No DPP-specific profile validation. |
 | U4 | RTP payload type filtering | **met** | `allowed_payload_types` on `RtpInputConfig` accepts a list of PT values (0-127). Packets with non-matching PTs are dropped. The check is a single byte comparison (`data[1] & 0x7F`) performed after the `is_likely_rtp` validation. |
 | U5 | ST 2110 essence timing adjustment | missing | Would require per-packet timestamp manipulation on the hot path. |
-| U6 | ST 2110 packet pacing | missing | Would require per-packet timing manipulation on the hot path. |
+| U6 | ST 2110 packet pacing | **met** | Every ST 2110-20 and -23 output is paced unconditionally — there is no unpaced setting. `build_pacer` in `src/engine/st2110_video_io.rs` always constructs a `St2110_21Pacer` (`src/engine/st2110/pacer.rs`) from the raster (frame period, packets per frame); the -23 sub-stream sender builds its own pacer the same way off the per-sub-stream packet count. Both senders compute `target_for_packet(frame, packet_in_frame)` per packet and set `WireDatagram.target_tx_time_ns`. The `narrow` / `narrow_linear` / `wide` selector is carried but **not honoured** — the pacer's `profile` field is `#[allow(dead_code)]` and never read, so `target_for_packet` spreads packets linearly across the frame period for every profile, and the only way to ask for a non-default one is the deprecated `wire_pacing` config field, which warns and is otherwise ignored. The schedule lives on `CLOCK_TAI` (what `ptp4l` + `phc2sys` discipline): the constructor snaps the epoch to a frame boundary and the sender re-anchors via `rebase_for_frame` on the first decoded frame and again on sustained lateness. The explicit PTP-sample hook `anchor_to_ptp` has **no production caller**, so `is_ptp_anchored()` is false in shipping builds — anchoring is only ever as good as the host's TAI discipline. Release is done by `engine::wire_emit` on the `clock_nanosleep` SCHED_FIFO tier by default; kernel-paced `SO_TXTIME` + ETF qdisc is opt-in via `BILBYCAST_ENABLE_TXTIME=1`. |
 | U7 | ST 2022-7 flow duplication | **met** | SRT outputs support dual-leg duplication via the `redundancy` config. Each packet is sent to both SRT legs independently using non-blocking `try_send`. Implementation in `src/engine/output_srt.rs`. |
 | U8 | ST 2022-7 hitless merge | **met** | SRT inputs support dual-leg merge via the `redundancy` config. `HitlessMerger` in `src/redundancy/merger.rs` performs sequence-based deduplication per SMPTE 2022-7. Redundancy leg switches are tracked in stats. |
 | U9 | Alarm-based flow protection switching | partial | `FlowHealth` enum (Healthy / Warning / Error / Critical) is derived from monitoring metrics during the 1/sec stats snapshot. Automatic protection switching is not yet implemented. |
@@ -96,21 +96,26 @@ with its current status and a brief description of the implementation.
 
 ## Summary
 
-| Section | Met | Partial | Missing | Total |
-|---------|-----|---------|---------|-------|
-| Core (C1-C10) | 6 | 0 | 4 | 10 |
-| Use Case 1 (U1-U10) | 5 | 1 | 4 | 10 |
-| Use Case 2 (F1) | 1 | 0 | 0 | 1 |
-| Use Case 3 (A1-A3) | 2 | 1 | 0 | 3 |
-| Monitoring (M1-M6) | 6 | 0 | 0 | 6 |
-| Network (N1-N6) | 0 | 1 | 1 | 6 |
-| **Total** | **20** | **3** | **9** | **36** |
+| Section | Met | Partial | Missing | n/a | Total |
+|---------|-----|---------|---------|-----|-------|
+| Core (C1-C10) | 6 | 0 | 4 | 0 | 10 |
+| Use Case 1 (U1-U10) | 6 | 1 | 3 | 0 | 10 |
+| Use Case 2 (F1) | 1 | 0 | 0 | 0 | 1 |
+| Use Case 3 (A1-A3) | 2 | 1 | 0 | 0 | 3 |
+| Monitoring (M1-M6) | 6 | 0 | 0 | 0 | 6 |
+| Network (N1-N6) | 1 | 0 | 1 | 4 | 6 |
+| **Total** | **22** | **2** | **8** | **4** | **36** |
 
-All monitoring requirements (M1-M6) are fully met. The missing items are either
-architectural concerns (interface zones, deny-all firewall) that require OS-level
-enforcement, or features that would require per-packet manipulation on the media
-hot path (NAT, timing adjustment, pacing, payload translation) which were excluded
-to preserve QoS.
+All monitoring requirements (M1-M6) are fully met. The four `n/a` rows are the
+Network-topology guidelines (N1, N2, N5, N6) — network-design concerns that no
+software setting can enforce. The missing items are either architectural concerns
+(interface zones, deny-all firewall) that require OS-level enforcement, or features
+that would require per-packet manipulation on the media hot path (NAT, essence
+timing adjustment, payload translation) which were excluded to preserve QoS. ST
+2110-21 packet pacing (U6) is the one hot-path manipulation the edge does do, and
+it is unconditional on the uncompressed *video* outputs (-20 and -23). The -30 /
+-31 / -40 essence outputs are not paced: `st2110_io.rs` forwards each RTP packet
+with `target_tx_time_ns: None` and does not re-packetize at all.
 
 ---
 

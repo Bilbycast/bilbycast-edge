@@ -1,6 +1,8 @@
 # Wire pacing
 
-PCR-anchored / PTP-raster-anchored wire emission for every output that owns a UDP socket directly: UDP, RTP (single-leg, FEC, 2022-7 dual-leg), 302M, ST 2110-20/-23/-30/-31/-40. SRT, RIST, RTMP, HLS, CMAF, and WebRTC are out of scope — they have their own protocol-layer pacing.
+The wire emitter owns release timing for every output that owns a UDP socket directly: UDP, RTP (single-leg, FEC, 2022-7 dual-leg), 302M, ST 2110-20/-23/-30/-31/-40. SRT, RIST, RTMP, HLS, CMAF, and WebRTC are out of scope — they have their own protocol-layer pacing.
+
+**The release *model* is per-output, and the default is not PCR anchoring.** Compressed MPEG-TS (UDP / RTP / 302M) defaults to **forward cadence** — emit each datagram at the instant it arrived, no re-pacing, the receiver re-clocks from the untouched PCR. The PCR-delta anchoring described below is reached only when the output sets `egress_pacing: "pcr"`, or when `egress_pacing` is unset on a flow that has a **bonded input**, which auto-resolves to `pcr` (`EgressPacingMode::resolve_auto`). The third mode, `servo`, is a closed-loop rate leaky-bucket and also skips the anchor math. See [Egress pacing auto-resolution](configuration-guide.md#egress-pacing-auto-resolution). ST 2110 is unaffected by any of this: -20 / -23 keep raster anchoring, and -30 / -31 / -40 always take the PCR-delta path because their de-jitter config is disabled by construction.
 
 ## Two paths, one default
 
@@ -33,13 +35,15 @@ The pre-2026-05-16 default of "try SO_TXTIME first, fall back to clock_nanosleep
 
 ## When to enable ETF qdisc
 
-**Default answer: don't.** The userspace tier handles compressed TS through at least 2 Gbps with sub-3 ms PCR_AC max on a normal NIC. ETF only earns its keep in three specific cases:
+**Default answer: don't.** The userspace tier handles compressed TS through at least 2 Gbps with sub-3 ms PCR_AC max on a normal NIC. ETF only earns its keep in two specific cases — the third row is the case operators reach for and is the one ETF does not solve:
 
 | Case | Reason | Action |
 |---|---|---|
 | Per-packet budget < 50 µs (typical: single-flow ST 2110-20 1080p ≈ 4 µs, ST 2110-20 4K ≈ 1 µs) | Userspace round-trip can't reach µs precision at that rate | Enable tier 1, accept the PTP + HW-PTP NIC + ETF dependency stack |
-| Strict T-STD compliance for contribution-grade receivers (Appear X10, Cobalt 9202, Cisco D9824 with `PCR_AC` alarm enabled) | These reject streams with PCR jitter > 500 ns | Enable tier 1 |
-| Sustained CPU contention pushing tier-4 p99 above ~30 ms (e.g. many transcoded outputs on a tight box) | Kernel ETF moves pacing off the SCHED_FIFO thread, so CPU contention no longer perturbs it | Enable tier 2 (software ETF, no HW-PTP NIC needed) |
+| Strict T-STD compliance for contribution-grade receivers (Appear X10, Cobalt 9202, Cisco D9824 with `PCR_AC` alarm enabled) **fed ST 2110 essence** | These reject streams with PCR jitter > 500 ns | Enable tier 1 |
+| Sustained CPU contention pushing tier-4 p99 above ~30 ms (e.g. many transcoded outputs on a tight box) | **Does not apply.** Transcoded TS outputs are `WirePacingClass::Lossless` and always release in userspace, so ETF never touches them | Grant SCHED_FIFO and pin the releasers with `BILBYCAST_WIRE_EMIT_CPUS` — not ETF |
+
+**ETF / SO_TXTIME only ever engages on ST 2110-20/-23/-30/-31/-40.** The releaser gate requires `WirePacingClass::EtfEligible`, and every compressed egress — UDP, RTP (incl. FEC and 2022-7 legs), 302M — is constructed `Lossless` unconditionally. Setting `BILBYCAST_ENABLE_TXTIME=1` on a box of transcoded TS outputs leaves every one of them on `clock_nanosleep`; its only effect there is pinning their `SO_PRIORITY` **off** the etf class so plain sends are queued rather than late-dropped. For a T-STD-strict decoder on a *compressed* feed the lever is `egress_pacing: "pcr"`, not ETF.
 
 If none of those apply — keep the default. Enabling ETF without the full prerequisite stack (PTP, `phc2sys -O 37`, the qdisc itself, `CAP_NET_ADMIN`) produces *silent degradation* worse than the default, not better.
 
@@ -140,9 +144,9 @@ One `WireEmitter` instance per UDP socket. Two anchor strategies, selected at sp
 - **`AnchorSource::Pcr`** (TS regime): the emitter parses each datagram for an MPEG-TS PCR sample. PCR-bearing datagrams re-anchor the wallclock target. Non-PCR datagrams pace by `bytes_since_anchor / observed_rate_bps`. The rate is exclusively from inter-PCR observations (EMA, ~10 PCRs to 95 % convergence). There is **no declared-bitrate parameter** — open-loop pacing on a configured rate drifts when the encoder runs above (or below) the configured target, which is what reverted the prior wire_emit integration on 2026-05-09. Closed-loop on observed rate is the universal fix regardless of codec, RC mode, or encoder backend.
 - **`AnchorSource::St2110Raster`** (uncompressed video regime): the caller computes a per-packet `target_tx_time_ns` against the active ST 2110-21 frame raster (via `St2110_21Pacer`) and passes it on the `WireDatagram`. The emitter just delivers at the requested time.
 
-For PCR-anchored datagrams:
+For PCR-anchored datagrams — i.e. an output running `egress_pacing: "pcr"` (explicit or auto-resolved), plus ST 2110-30/-31/-40, which always take this path. A compressed output on the `forward` default never reaches any of it:
 
-- First datagram emits at `wall_anchor = now + 50 ms` (preroll).
+- First datagram emits at `wall_anchor = now + 50 ms` (preroll) — **unless the output carries an `epoch_lock` block**, in which case every PCR-bearing datagram's release instant is derived analytically from the manager-minted group anchor instead, and the relative-anchor rules below do not apply for as long as the anchor holds. It is not unconditional: a cold start that has not seen a PCR yet still takes the 50 ms preroll and picks the anchor up on the first PCR, and a run of analytic targets the plausibility gate rejects disengages the anchor and hands the output back to the relative rules — counted and reported, never silent. See [Cross-node egress alignment](clocking.md#cross-node-egress-alignment-epoch_lock).
 - Subsequent PCR-bearing datagrams: `target = wall_anchor + (pcr − pcr_anchor) × 1000 / 27` ns. Re-anchor: `wall_anchor = target`, `pcr_anchor = pcr`.
 - Non-PCR datagrams interpolate: `target = wall_anchor + bytes_since_anchor × 8e9 / observed_rate_bps`. Cold-start (no rate yet): target the wall_anchor (preserves FIFO order through preroll).
 - **Late-rebase**: if a PCR target lands more than 5 ms behind real time (encoder burst), `wall_anchor` snaps to `now`. One-time jitter step instead of a steady-state degradation.
@@ -164,6 +168,7 @@ For PCR-anchored datagrams:
 | RTP single-leg, no FEC | `Pcr` | RTP wrap done in encoder task before `try_send`. |
 | RTP single-leg + FEC | `Pcr` | Media + FEC RTP both flow through one `wire_emit` (same socket). |
 | RTP 2022-7 dual-leg | `Pcr` | Two `wire_emit` instances; same `Bytes::clone()` to both. Leg 2 stats are private (avoids double-counting on the shared accumulator). |
+| UDP / RTP (TS) with `epoch_lock` | `Pcr` + analytic epoch anchor | The relative `now + 50 ms` anchor is replaced by a release instant derived from the manager-minted group anchor. See [clocking.md](clocking.md#cross-node-egress-alignment-epoch_lock). |
 | ST 2110-20 / -23 (uncompressed video) | `St2110Raster` | Per-output (-20) or per-sub-stream (-23) `St2110_21Pacer` computes per-packet `target_tx_time_ns`. Always paced. |
 | ST 2110-30 / -31 / -40 (audio + ANC) | `Pcr` | These are RTP-paced upstream by the RFC 3550 sender clock; the pacer rides through (cold-start ASAP — same as today, but on the SO_TXTIME path when available). |
 | SRT, RIST, RTMP, HLS, CMAF, WebRTC | n/a | Internally paced by their own protocol layers; not touched. |

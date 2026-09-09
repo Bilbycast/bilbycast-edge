@@ -32,7 +32,7 @@
                             │  │  │                                          │  │  │
                             │  │  │   ┌─────────── Flow N ──────────────┐   │  │  │
                             │  │  │   │                                 │   │  │  │
-                            │  │  │   │  ┌─────────┐   broadcast(2048) │   │  │  │
+                            │  │  │   │  ┌─────────┐ broadcast(16 384) │   │  │  │
                             │  │  │   │  │  Input  │──────┬──────────┐ │   │  │  │
                             │  │  │   │  │  Task   │      │          │ │   │  │  │
                             │  │  │   │  └─────────┘      ▼          ▼ │   │  │  │
@@ -67,15 +67,35 @@
                             │  └────────────────────────────────────────────────┘  │
                             └──────────────────────────────────────────────────────┘
 
-  ┌─────────────┐                        │                      ┌─────────────┐
-  │ SRT Sources │─── SRT (AES) ──────────┤                      │ SRT Dest    │
-  │ RTP Sources │─── RTP/UDP ────────────┤     bilbycast-edge   ├── SRT ──────│
-  │ RTMP (OBS)  │─── RTMP ──────────────►│     (data plane)     │── RTP/UDP ──│
-  │ IP Cameras  │─── RTSP ─────────────►│                      │── RTMP(S) ──│
-  │ WHIP (OBS)  │─── WebRTC ───────────►│                      │── HLS ──────│
-  └─────────────┘                        │                      │── WebRTC ───│
-                                         │                      └─────────────┘
+  ┌────────────────────────┐                          ┌────────────────────────┐
+  │ NETWORK SOURCES        │                          │ NETWORK SINKS          │
+  │  srt · rtp · udp       │                          │  srt · rtp · udp       │
+  │  rist · rtmp · rtsp    │──┐                    ┌─►│  rist · rtmp · hls     │
+  │  webrtc (WHIP) · whep  │  │                    │  │  cmaf / cmaf-LL        │
+  │  bonded · rtp_audio    │  │   ┌─────────────┐  │  │  webrtc (WHEP)         │
+  │  st2110_20/23/30/31/40 │  ├──►│  bilbycast  ├──┤  │  bonded · rtp_audio    │
+  └────────────────────────┘  │   │    -edge    │  │  │  st2110_20/23/30/31/40 │
+  ┌────────────────────────┐  │   │ (data plane)│  │  └────────────────────────┘
+  │ LOCAL / SYNTHETIC SRC  │  │   └─────────────┘  │  ┌────────────────────────┐
+  │  test_pattern          │  │                    │  │ LOCAL SINKS            │
+  │  media_player · replay │──┘                    └─►│  display (HDMI/DP+ALSA)│
+  │  mosaic (multiviewer)  │                          │  sdi (DeckLink)        │
+  │  sdi (DeckLink)        │                          │  mxl_video/_audio/_anc │
+  │  mxl_video/_audio/_anc │                          │                        │
+  └────────────────────────┘                          └────────────────────────┘
 ```
+
+23 `InputConfig` variants and 20 `OutputConfig` variants ship today
+(`src/config/models.rs`). `mosaic` is the only `#[cfg]`-gated variant
+(`multiviewer`); the `sdi` and `mxl_*` variants always parse, and are refused
+at flow start when their Cargo feature is absent. Per-protocol
+detail lives in [supported-protocols.md](supported-protocols.md),
+[multiviewer.md](multiviewer.md) and [replay.md](replay.md) — this document
+carries the structure only.
+
+The `broadcast(16 384)` above is the `Standard` default. Fan-out capacity is
+per-flow and chosen by the flow's `BandwidthProfile` — see
+[Channel sizing](#channel-sizing-bandwidthprofile).
 
 ## Data Plane: Packet Flow
 
@@ -98,7 +118,7 @@ the engine's `FlowRuntime` receives. The engine never sees raw ID references.
   │  │  │ UDP Recv │─┼──▶  Ingress      │                                      │
   │  │  └─────────┘ │  │  Filters       │     ┌───────────────────┐            │
   │  │  ┌─────────┐ │  │  ┌───────────┐ │     │  broadcast::      │            │
-  │  │  │ FEC     │◀┼──┤  │ C5: Src IP│ │     │  channel(2048)    │            │
+  │  │  │ FEC     │◀┼──┤  │ C5: Src IP│ │     │  channel(16 384)  │            │
   │  │  │ Decode  │ │  │  │ U4: PT    │ ├────▶│                   │            │
   │  │  │ (2022-1)│─┼──▶  │ C7: Rate  │ │     │  Sender ────┐    │            │
   │  │  └─────────┘ │  │  └───────────┘ │     │             │    │            │
@@ -130,6 +150,17 @@ the engine's `FlowRuntime` receives. The engine never sees raw ID references.
   │  └──────────────┘                                                          │
   │                                                                            │
   │  ┌──────────────┐                                                          │
+  │  │ test_pattern │                                                          │
+  │  │ media_player │─ no socket: in-process encode / file demux ── TsMuxer ─▶│
+  │  │ replay       │                                                          │
+  │  └──────────────┘                                                          │
+  │                                                                            │
+  │  ┌──────────────┐                                                          │
+  │  │    mosaic    │─ composites N node-local inputs ── encode ── TsMuxer ──▶│
+  │  │ (multiviewer)│    engine/input_mosaic.rs                                │
+  │  └──────────────┘                                                          │
+  │                                                                            │
+  │  ┌──────────────┐                                                          │
   │  │  TR-101290   │◀── subscribe() ── (independent quality analyzer)         │
   │  │  Analyzer    │                                                          │
   │  └──────────────┘                                                          │
@@ -139,6 +170,12 @@ the engine's `FlowRuntime` receives. The engine never sees raw ID references.
   │  └──────────────┘                                                          │
   └─────────────────────────────────────────────────────────────────────────────┘
 ```
+
+Every output subscribes to that one fan-out channel, so the egress column is
+illustrative rather than exhaustive: `rist`, `cmaf` (CMAF / CMAF-LL),
+`bonded`, `rtp_audio`, the `st2110_*` / `mxl_*` sinks and the local `display`
+and `sdi` sinks all consume it the same way. Capacity is per-flow — see
+[Channel sizing](#channel-sizing-bandwidthprofile).
 
 ## Input Switching & TS Continuity
 
@@ -296,15 +333,32 @@ treat TS payloads as opaque bytes or maintain independent state.
   └────────────┬───────────────────────────┘
                ▼
   ┌────────────────────────────────────────┐
-  │  Layer 3: Route-level RBAC            │
-  │  Public:    /health, /oauth/token,   │
-  │             /setup (gated by config) │
-  │  Read-only: GET /api/v1/* (any role)  │
-  │  Admin:     POST/PUT/DELETE (admin)   │
+  │  Layer 3: Browser-origin write guard  │
+  │  guard_cross_origin_write on          │
+  │  /api/v1/** and /x-nmos/**            │
+  │  403s browser-initiated POST/PUT/     │
+  │  DELETE even when auth is OFF         │
+  │  No router-wide CORS layer; explicit  │
+  │  not-found fallback                   │
+  │  WHIP/WHEP exempt (own CORS layer +   │
+  │  per-flow bearer_token)               │
   └────────────┬───────────────────────────┘
                ▼
   ┌────────────────────────────────────────┐
-  │  Layer 4: Data plane ingress filters  │
+  │  Layer 4: Route-level RBAC            │
+  │  Public:    /health, /oauth/token,   │
+  │             /setup (gated by config) │
+  │  Read-only: GET /api/v1/* (any role)  │
+  │  Admin:     POST/PUT/DELETE on flows, │
+  │             inputs, outputs, config   │
+  │             (RequireAdmin extractor)  │
+  │  NOT admin-gated: PUT /api/v1/ptp,    │
+  │             POST+DELETE /api/v1/      │
+  │             tunnels, WHIP/WHEP        │
+  └────────────┬───────────────────────────┘
+               ▼
+  ┌────────────────────────────────────────┐
+  │  Layer 5: Data plane ingress filters  │
   │  (RP 2129 / SMPTE trust boundaries)  │
   │  C5: Source IP allow-list (HashSet)   │
   │  U4: Payload type filter             │
@@ -329,35 +383,62 @@ treat TS payloads as opaque bytes or maintain independent state.
   └────────────────────────────────────────┘
 ```
 
+Layer 3 is what the private API leans on when auth is off — which it is
+unless the config carries an `auth` block: `RequireAdmin` returns `Ok` when
+there are no claims, so route-level RBAC alone would let any page the operator
+has loaded take a flow off air. Detail
+and the exact browser fingerprint tests:
+[api-security.md — Browser-origin policy](api-security.md#browser-origin-policy).
+
 ## Module Dependency Graph
 
 ```
-                    ┌──────────┐
-                    │  main.rs │
-                    └────┬─────┘
-           ┌─────────┬──┴──┬─────────┬──────────┐
-           ▼         ▼     ▼         ▼          ▼
-       ┌───────┐ ┌──────┐┌──────┐┌────────┐┌────────┐
-       │  api  │ │engine││config││ tunnel │ │monitor │ │setup │
-       └──┬────┘ └──┬───┘└──────┘└───┬────┘ └────────┘ └──────┘
-          │         │                │
-          ├────────▶│◀───────────────┘
-          │         │
-          │    ┌────┼────────┐
-          │    ▼    ▼        ▼
-          │ ┌─────┐┌───┐┌──────────┐
-          │ │stats││fec││redundancy│
-          │ └─────┘└───┘└──────────┘
-          │    ▲
-          └────┘
-                ┌────┐  ┌─────┐
-                │util│  │ srt │
-                └────┘  └─────┘
-                   ▲       ▲
-                   └───┬───┘
-                       │
-                    (engine, tunnel)
+                             ┌──────────┐
+                             │  main.rs │
+                             └────┬─────┘
+    ┌────────┬────────┬───────────┼───────────┬────────┬─────────┐
+    ▼        ▼        ▼           ▼           ▼        ▼         ▼
+┌───────┐┌───────┐┌──────┐  ┌────────┐  ┌────────┐┌───────┐┌─────────┐
+│  api  ││manager││config│  │ engine │  │ tunnel ││ setup ││ monitor │
+└───┬───┘└───┬───┘└──────┘  └───┬────┘  └───┬────┘└───────┘└─────────┘
+    │        │                  │           │
+    └────────┴─────────────────►│◄──────────┘
+                                │
+   ┌───────┬─────┬──────────────┼──────────┬─────────┬──────────┐
+   ▼       ▼     ▼              ▼          ▼         ▼          ▼
+┌─────┐ ┌───┐ ┌──────────┐ ┌─────────┐ ┌───────┐ ┌────────┐ ┌───────┐
+│stats│ │fec│ │redundancy│ │ display │ │ media │ │ replay │ │  srt  │
+└─────┘ └───┘ └──────────┘ └─────────┘ └───────┘ └────────┘ └───────┘
+
+           ┌──────┐  ┌───────────────┐  ┌─────────┐
+           │ util │  │ observability │  │ upgrade │
+           └──────┘  └───────────────┘  └─────────┘
 ```
+
+The graph depicts `src/main.rs`; `src/lib.rs` declares the same set **minus
+`monitor`**, which is binary-only. Roles of the modules the older version of
+this diagram omitted:
+
+- `manager` — WebSocket client to bilbycast-manager: registration, health /
+  stats push, and command dispatch (`manager/client.rs::execute_command`).
+  Event catalogue: [events-and-alarms.md](events-and-alarms.md).
+- `display` — local HDMI / DisplayPort + ALSA playout. Behind the `display`
+  feature, Linux only.
+- `media` — media-library storage (list / upload-chunk / delete) backing the
+  `media_player` input.
+- `replay` — rolling flow recording + playback, behind the `replay` feature.
+  See [replay.md](replay.md).
+- `upgrade` — Sigstore-verified binary upgrade driven by the manager's
+  `upgrade_binary` command. See [upgrade.md](upgrade.md).
+- `observability` — structured-JSON log shipper for SIEM / NMS pickup,
+  alongside the manager event stream and Prometheus. See
+  [configuration-guide.md](configuration-guide.md).
+- `monitor` — the node's own dashboard on its own listener
+  (`monitor/server.rs`): the HTML page plus `/api/stats`, `/api/health`,
+  `/api/thumbnail/*`, `/api/tunnels` and `/api/ws`. Prometheus `/metrics`
+  is **not** here — that route is registered in `api::server`.
+
+`util` and `srt` are leaf helpers used by `engine` and `tunnel`.
 
 ## Audio gateway pipeline (`engine::audio_transcode`, `engine::audio_302m`)
 
@@ -439,14 +520,15 @@ flows connect one or more inputs (one active at a time) to N outputs by referenc
   config.json (version 2)
   ┌──────────────────────────────────────────────���───────┐
   │  "inputs": [                                         │
-  │    { "id": "srt-in", "type": "srt", ... }            │
-  │    { "id": "rtp-in", "type": "rtp", ... }            │
+  │    { "id": "srt-in",  "type": "srt", ... }           │
+  │    { "id": "bars-in", "type": "test_pattern", ... }  │
+  │    { "id": "sdi-in",  "type": "sdi", ... }           │
   │  ]                                                   │
   │                                                      │
   │  "outputs": [                                        │
-  │    { "id": "rtp-out", "type": "rtp", ... }           │
-  │    { "id": "srt-out", "type": "srt", ... }           │
-  │    { "id": "rtmp-out", "type": "rtmp", ... }         │
+  │    { "id": "udp-out",  "type": "udp", ... }          │
+  │    { "id": "cmaf-out", "type": "cmaf", ... }         │
+  │    { "id": "disp-out", "type": "display", ... }      │
   │  ]                                                   │
   │                                                      │
   │  "flows": [                                          │
@@ -487,15 +569,61 @@ Current pattern requires changes in these locations:
 | 6 | `src/engine/flow.rs` | Add `match` arm in `start()` or `start_output()` |
 | 7 | `src/engine/flow.rs` | Add config metadata extraction |
 
-The spawn function signature convention:
+The spawn function signature convention — this four-parameter prefix, in this
+order:
 ```rust
 pub fn spawn_xxx_output(
     config: XxxOutputConfig,
     broadcast_tx: &broadcast::Sender<RtpPacket>,
-    stats: Arc<OutputStatsAccumulator>,
+    output_stats: Arc<OutputStatsAccumulator>,
     cancel: CancellationToken,
 ) -> JoinHandle<()>
 ```
+
+There is no fixed arity beyond that prefix: the output spawn functions run
+from 4 to 9 parameters, each appending the plumbing it actually needs.
+`spawn_st2110_40_output` is the minimum (the prefix alone);
+`spawn_udp_output` and `spawn_rist_output` are the widest at nine;
+`spawn_srt_output` packs its extras into a single `SrtOutputCtx` struct
+rather than growing the list. The two near-universal extras are
+`flow_id: String` and an event sender —
+`event_sender: EventSender`, spelled `events` on the UDP path and carried
+inside `SrtOutputCtx` on SRT. The pacing trio
+`frame_rate_rx: Option<watch::Receiver<Option<f64>>>`,
+`av_sync_pacer: Option<Arc<AvSyncPacer>>` and
+`active_input_rx: watch::Receiver<String>` reaches only the three wire-paced
+TS outputs (`udp`, `rtp`, `rist`); `input_format: Option<InputFormat>` only
+the four that need the upstream audio shape (`udp`, `rtp_audio`,
+`st2110_30`, `st2110_31`). Take an event sender unless the output will never
+raise an operational event — `spawn_rtp_audio_output` and the
+`spawn_st2110_30/31/40_output` trio are the only ones that take none, and
+without it the output is event-silent, which is invisible until an operator
+asks why a failure never reached the manager.
+
+## Cross-node egress alignment (`epoch_lock`)
+
+An `epoch_lock` block on a UDP or RTP output (`EpochLockConfig`,
+`src/config/models.rs`) moves that output's release instant off "as soon as
+the pipeline hands it over" and onto a wall-clock target derived from the
+datagram's own PCR — `engine::epoch_lock` inverts the PCR → wall mapping,
+`engine::wire_emit` schedules the release at `that instant + egress_offset`.
+Two edges forwarding the same feed then emit it together, giving a
+downstream switcher a clean **cut** (not a seamless 2022-7 merge — RTP
+sequence numbers stay per-node counters).
+
+The scope is narrow and `validate_flow_epoch_lock` (`src/config/validation.rs`)
+**refuses the config** rather than degrading quietly: exactly one input, no
+`assembly`, no `video_encode` / `audio_encode` / `transcode` on the locked
+output, no `cbr_pad_to_kbps`, an explicit `egress_pacing: "pcr"`, an
+unambiguous PCR PID, `egress_offset_ms` within 150–800 ms, and every input
+either `bonded` or `passthrough_clock: true` — so alignment and PCR/PTS
+regeneration are mutually exclusive. The shared `source_anchor` is minted by
+the manager, not by the node; without it the emitter falls back to the
+closed-form UNIX-epoch inversion, which only aligns when the source is itself
+epoch-locked. The capability bit is `epoch_lock`; an edge that lacks it
+ignores the field silently, which looks exactly like success.
+
+Arithmetic and the alignment-group workflow: [clocking.md](clocking.md).
 
 ## PID bus (Flow Assembly — SPTS / MPTS synthesis)
 

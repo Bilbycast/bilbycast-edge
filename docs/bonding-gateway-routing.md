@@ -45,6 +45,11 @@ pending — run on a box with real interfaces.
 
 # Design proposal (original) — gateway-based path selection
 
+**Where this proposal and the As-built section above disagree, As-built wins.**
+The places where the difference would actively mislead have been folded back in
+below (source-IP rules rather than fwmark, relay-leg gateway support, the event
+names that actually ship); everything else is retained as rationale.
+
 Open questions at the bottom were resolved as: Q1→b, Q2→defaults kept,
 Q3→hard-refuse, Q4→leave addresses, Q5→edge-only (bonding crate untouched).
 
@@ -59,10 +64,22 @@ The edge programs the per-path policy route itself via **netlink**, using
 `CAP_NET_ADMIN` — which the default `bilbycast-edge.service` unit **already
 grants** (it's there for `SO_TXTIME`). No new capability, no `CAP_NET_RAW`.
 
-Scope: **sender side only** (the field box's bonded *output* paths). The hub's
-bonded *input* does not need gateway selection — its NACK/keepalive return
-traffic rides the hub's single default route, and NAT on each field-side router
-steers the return packets back per-path automatically.
+Scope: **sender side only for plain `udp` legs** (the field box's bonded
+*output* paths). The hub's bonded *input* does not need gateway selection there
+— its NACK/keepalive return traffic rides the hub's single default route, and
+NAT on each field-side router steers the return packets back per-path
+automatically.
+
+**As-built exception — `relay` legs.** Gateway mode is valid on **both** ends of
+a relay leg: both ends dial *out* to the relay, so each can pin its own egress
+uplink. The route is programmed by
+`tunnel::udp_relay_client::program_tunnel_gateway`, keyed `(tunnel_id, 0)`. Two
+behavioural differences from the bonded-output path an operator will otherwise
+trip on: it is **best-effort** (a netlink or program failure logs a warning and
+the tunnel continues *without* the policy route, so a silently un-pinned relay
+leg is possible), and it is **not covered by the 5 s route-integrity
+re-assert** — `gateway_legs` in `output_bonded.rs` matches `udp` transports
+only.
 
 ## 2. The addressing reality (read first — there's no free lunch)
 
@@ -97,9 +114,10 @@ Add an optional `gateway` (and, for option-b addressing, `source`) to the bonded
 UDP path transport. Lives in **both** crates:
 
 - `bilbycast-edge` `BondPathTransportConfig::Udp` (config/models.rs)
-- `bonding-transport` `PathTransport::Udp` — gains only a `fwmark: Option<u32>`
-  (the edge fills it; the bonding crate just calls `setsockopt(SO_MARK)`). The
-  bonding crate never touches routing tables.
+- `bonding-transport` — **unchanged**. As built, gateway mode needed no field in
+  the bonding crate at all: the policy rule is keyed `from <source>` and the
+  bond socket already binds `<source>`. The crate has zero fwmark references and
+  never touches routing tables.
 
 ```jsonc
 // bonded OUTPUT path
@@ -115,10 +133,14 @@ UDP path transport. Lives in **both** crates:
 
 **Validation** (config/validation.rs `validate_bond_path_transport`):
 - `gateway` is a valid unicast IP; reject multicast/loopback/unspecified.
-- `gateway` only permitted on **sender** paths (reject on bonded *input*).
+- On a `udp` leg, `gateway` is only permitted on **sender** paths (rejected on a
+  bonded *input*). On a `relay` leg it is accepted on **both** ends — see §1.
 - If `source` set: valid CIDR; `gateway` must be inside that prefix (else the
   gateway is unreachable → reject at config time, not silently blackhole).
-- `gateway` + `interface` may co-exist (route gets `dev <interface>`).
+- `gateway` requires **both** `source` and `interface` — the route is installed
+  `dev <interface>` and the rule is keyed `from <source>`. `source` without
+  `gateway` is refused ("`source` is only meaningful with `gateway`"). Same on
+  the `udp` and `relay` arms.
 
 ## 4. Routing-table ownership model  ← the part to sign off
 
@@ -149,18 +171,20 @@ per host (configurable); exceeding it is a loud config error, never a silent cap
 **What gets programmed per path (option-b), all via netlink:**
 1. (if `source` not already on the NIC) `RTM_NEWADDR` add `source` to the NIC.
 2. `RTM_NEWROUTE` in table `T`: `default via <gateway> [dev <iface>]`.
-3. `RTM_NEWRULE` priority `P`: `fwmark <M> lookup <T>`.
-4. Bond path socket created with `SO_MARK = M` (in the bonding-transport adapter).
+3. `RTM_NEWRULE` priority `P`: `from <source-ip> lookup <T>`. The bond socket
+   binds `<source>`, so its packets match the rule — no packet mark is involved
+   anywhere.
 
-Identification of "our" entries for GC = anything whose table ∈ table-range **and**
-rule-priority ∈ prio-range **and** fwmark ∈ fwmark-range. No external tags needed.
+Identification of "our" entries for GC = **two independent sweeps**: every rule
+whose priority ∈ prio-range, and every route whose table ∈ table-range. No
+external tags needed.
 
 ## 5. Lifecycle
 
 | Event | Action |
 |-------|--------|
 | **Edge startup** | **GC first:** scan netlink; delete any rule/route/addr in our reserved ranges (orphans from a prior crash) before starting any flow. |
-| **Bonded-output flow start** | For each gateway path: allocate slot → program addr/route/rule → set `fwmark` on the socket config → bring up bond socket. |
+| **Bonded-output flow start** | For each gateway path: allocate slot → program addr/route/rule → bring up bond socket bound to `source`. |
 | **Flow stop / path remove** | Drop socket → delete rule, route, flush table, (optionally) remove edge-added addr → free slot. Order: socket first, then routing teardown. |
 | **Hot-swap** (`UpdateFlow`, add/remove path) | Allocate/free incrementally; untouched paths keep their (slot, route, rule). |
 | **Edge crash / SIGKILL** | Entries linger until next startup GC (step 1). Idempotent. |
@@ -173,15 +197,26 @@ New dependency: a netlink crate (`rtnetlink` or `neli`).
 
 | Condition | Behavior |
 |-----------|----------|
-| `CAP_NET_ADMIN` missing (hardened host / netns) | Refuse to start the gateway path; emit **Critical** `bond_route_program_failed` with the cap hint. **Do not** fall through to the default route (that silently collapses every path onto one router — the exact trap). If the path also has `interface`, optionally fall back to interface mode. |
-| Gateway not in any connected subnet | Rejected at config validation (§3). At runtime (route add EHOSTUNREACH) → Critical `bond_gateway_unreachable`. |
+| `CAP_NET_ADMIN` missing (hardened host / netns) | Refuse to start the gateway path; emit a **Critical** `media` event carrying the cap hint. **Do not** fall through to the default route (that silently collapses every path onto one router — the exact trap). If the path also has `interface`, optionally fall back to interface mode. |
+| Gateway not in any connected subnet | Rejected at config validation (§3). A runtime route-add failure — EHOSTUNREACH included — aborts the flow start from `BondRouteManager::program` and emits its own **Critical** `media` event naming the path, the gateway and the netlink error (no cap hint, no `error_code`). There is no reachability-specific event. |
 | Gateway reachable but dead uplink | Route installs, packets blackhole → bond keepalive marks the path dead (existing health path). No new code. |
-| fwmark collides with host firewall (nftables/Docker/VPN) | Configurable base (§4) + startup log of the chosen marks; documented. |
+| Route disappears after start (link flap, device re-plug, route flush) | The 5 s re-assert task re-programs it. If that fails it emits **Critical** `media` with `error_code: "bond_gateway_route_lost"` (details `output_id` / `path_id` / `path_name` / `gateway`), latched once per failing streak, and says plainly that the leg rides the default route — a cosmetic bond — until it succeeds. UDP gateway legs only; relay legs are not re-asserted (§1). |
 | Netlink unavailable | Same as cap-missing. |
 
-Active mechanism per path surfaced in bond path stats (mirrors
-`OutputStats.wire_pacing_tier`): `gateway` / `interface` / `none`, plus the
-programmed `(table, mark)` for observability.
+> **As-built:** the two flow-start failures above go out through `emit_flow`
+> with **no details object**, so they carry no `error_code` and cannot be
+> filtered or alarmed on programmatically — only `bond_gateway_route_lost` is
+> coded. `bond_route_program_failed` and `bond_gateway_unreachable`, named in
+> earlier drafts of this table, exist in no source tree. Event catalogue:
+> [events-and-alarms.md](events-and-alarms.md).
+
+Active mechanism per leg is surfaced on `BondPathLegStats.binding`: `gateway`
+for a gateway-mode leg, otherwise the kernel primitive that actually bound the
+socket — `so_bindtodevice`, `ip_unicast_if`, `ip_bound_if` or `none`.
+Interface-mode legs additionally carry the egress netdev on
+`BondPathLegStats.interface`, which is `None` on gateway-mode legs. Neither the
+reserved table id nor any mark reaches the stats surface — and no mark is
+programmed in the first place.
 
 ## 7. Interaction with the rest of the edge (verified)
 
@@ -191,7 +226,7 @@ programmed `(table, mark)` for observability.
 - Single NIC, all gateways on one L2 → return traffic arrives on that one NIC →
   **`rp_filter` strict passes** (reverse path is the same interface). No sysctl
   needed in this topology (unlike the multi-NIC interface mode). ✔
-- `SO_MARK` egress + per-router NAT handles the return path; no ingress route
+- Source-bound egress + per-router NAT handles the return path; no ingress route
   selection required. ✔
 
 So gateway mode is orthogonal to the precision-timing stack; a box could ingest
@@ -228,7 +263,7 @@ mode is the one that matches your physical plan.
 ## 10. Open questions for sign-off
 
 - **Q1.** Addressing: option **a** (operator/static), **b** (edge-programmed static, *recommended first*), or **c** (edge DHCP-per-path) — which do we build first?
-- **Q2.** Reserved-range defaults (table `48128+`, prio `10000+`, fwmark `0xBC000000+`) — acceptable, or align to an existing convention on your hosts?
+- **Q2.** Reserved-range defaults (table `48128+`, prio `10000+`) — acceptable, or align to an existing convention on your hosts?
 - **Q3.** On `CAP_NET_ADMIN` missing: hard-refuse-with-event (recommended) vs fall back to interface mode if `interface` is set?
 - **Q4.** Should the edge ever **remove** an address it added on teardown, or leave it (safer for a shared NIC)? Recommendation: only remove addresses the edge itself added; leave pre-existing ones.
-- **Q5.** Build it in `bonding-transport` (so the standalone `bilbycast-bonder` gets it too) or keep the netlink/route ownership **edge-only** and leave the bonding crate with just the `fwmark` field? Recommendation: **edge-only** route ownership; bonding crate stays I/O-policy-free.
+- **Q5.** Build it in `bonding-transport` (so the standalone `bilbycast-bonder` gets it too) or keep the netlink/route ownership **edge-only**? Recommendation: **edge-only** route ownership; bonding crate stays I/O-policy-free — as built it needed no change at all.

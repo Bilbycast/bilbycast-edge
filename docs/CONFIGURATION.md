@@ -44,7 +44,16 @@ When the manager sends an `update_config` or `update_flow` command:
    - Removed flows → destroyed
    - Added flows → created
    - Unchanged flows → **not touched** (input and all outputs keep running)
-   - Changed flows: if only outputs changed, outputs are surgically hot-added/removed; if the input or metadata changed, the flow is fully restarted
+   - Changed flows: outputs are surgically hot-added/removed, and an `input_ids` roster
+     add/remove goes through the surgical `add_input` / `remove_input` engine paths so the
+     other inputs and every output keep running. An edit to a **member's definition** is
+     swapped in place (`remove_input` + `add_input`) unless the engine refuses it — the
+     edited member is the flow's **active** input, a PID-bus slot source or a hitless leg —
+     or the flow also changed one of the five start-time fields that force a full restart:
+     `bandwidth_limit`, `content_analysis`, `recording`, `master_clock`, `assembly`
+     (`flow_fields_requiring_restart`). Metadata — `name`, `media_analysis`, `thumbnail`,
+     `thumbnail_interval_secs` — never restarts anything: it is persisted and binds at the
+     next flow start
 4. **Tunnels** are compared similarly — only changed tunnels are restarted
 5. **Outputs** within a flow are diffed by ID:
    - Removed outputs → hot-removed (other outputs unaffected)
@@ -440,8 +449,10 @@ The input is discriminated by the `"type"` field.
 > **Incomplete list (legacy doc).** The types below are only the subset this
 > version-1 document covered. The current schema also ships `rist`,
 > `st2110_20` / `st2110_23` (uncompressed video), `st2110_30` / `st2110_31` /
-> `st2110_40`, `sdi` (Blackmagic DeckLink), `media_player`, `replay`, `bonded`,
-> and `mxl_video` / `mxl_audio` / `mxl_anc` (with the `mxl` feature). See
+> `st2110_40`, `sdi` (Blackmagic DeckLink), `test_pattern`, `media_player`,
+> `replay`, `bonded`, `mxl_video` / `mxl_audio` / `mxl_anc` (with the `mxl`
+> feature), and `mosaic` (behind the off-by-default `multiviewer` feature, so
+> it is absent from a default build's schema entirely). See
 > [docs/configuration-guide.md](configuration-guide.md) for the full,
 > up-to-date type reference and field schemas.
 
@@ -501,7 +512,7 @@ Accepts incoming RTMP publish connections from OBS, ffmpeg, Wirecast, or any RTM
 | `listen_addr`    | `string`  | --       | RTMP listen address, e.g. `"0.0.0.0:1935"`     |
 | `app`            | `string`  | `"live"` | RTMP application name (URL path component)      |
 | `stream_key`     | `string?` | `null`   | Stream key for authentication (null = accept any)|
-| `max_publishers` | `u32`     | `1`      | Max simultaneous publishers                     |
+| `max_publishers` | `u32`     | `1`      | **Not read by anything.** Parsed and defaulted, but never reaches `RtmpServerConfig` (`listen_addr` / `expected_app` / `expected_stream_key` only), and nothing else reads it. Concurrent RTMP *connections* are bounded instead by a fixed internal cap of 8 (`MAX_RTMP_CONNECTIONS`, a semaphore in `engine::rtmp::server`); the newcomer past that is dropped at accept. The `Arc<AtomicBool>` the server carries is a publish-liveness flag — it is only ever stored, never tested — so it is not an admission gate either and no second publisher is refused. Kept so existing `config.json` files still parse; [configuration-guide.md](configuration-guide.md) records the same. |
 
 **Example:**
 
@@ -661,7 +672,7 @@ Sends raw MPEG-TS over UDP without RTP headers. Datagrams are TS-aligned (7×188
 
 H.264/AAC only. Supports RTMPS (TLS) via `rtmps://` URLs. Audio is
 passthrough by default; the optional `audio_encode` block runs the
-input AAC through the Phase B ffmpeg-sidecar encoder so the operator
+input AAC through the Phase B in-process encoder (fdk-aac) so the operator
 can normalise bitrate / sample rate / channel count or upgrade to
 HE-AAC v1/v2 — see [`audio-gateway.md`](audio-gateway.md#the-audio_encode-block--compressed-audio-egress-rtmp--hls--webrtc).
 
@@ -675,7 +686,7 @@ HE-AAC v1/v2 — see [`audio-gateway.md`](audio-gateway.md#the-audio_encode-bloc
 | `reconnect_delay_secs`     | `u64`   | `5`     | Delay between reconnection attempts             |
 | `max_reconnect_attempts`   | `u32?`  | `null`  | Maximum reconnect attempts (null = unlimited)   |
 | `program_number`           | `u16?`  | `null`  | MPTS program selector. `null` = lock onto the lowest program_number in the PAT (deterministic default for MPTS inputs); `Some(N)` = extract elementary streams from program N only. RTMP is single-program by spec, so this only changes *which* program is published. Must be `> 0`. |
-| `audio_encode`             | `AudioEncodeConfig?` | `null`  | Optional ffmpeg-sidecar audio encoder. Allowed `codec`: `aac_lc` (default), `he_aac_v1`, `he_aac_v2`. Requires ffmpeg in PATH at runtime; outputs without `audio_encode` set keep working without ffmpeg. The same-codec passthrough fast path applies when `codec == aac_lc` with no overrides on an AAC-LC source (disabled when `transcode` is set). See `AudioEncodeConfig` shape below. |
+| `audio_encode`             | `AudioEncodeConfig?` | `null`  | Optional audio re-encode. Allowed `codec`: `aac_lc` (default), `he_aac_v1`, `he_aac_v2`. On a default build these encode **in-process** via fdk-aac — no ffmpeg binary is needed; the `spawn_ffmpeg` subprocess backend is reached only when `fdk-aac` is compiled out. The same-codec passthrough fast path applies when `codec == aac_lc` with no overrides on an AAC-LC source (disabled when `transcode` is set). See `AudioEncodeConfig` shape below. |
 | `transcode`                | `TranscodeJson?`     | `null`  | Optional channel shuffle / sample-rate conversion applied to decoded PCM **before** `audio_encode` re-encodes. Setting `transcode` disables the same-codec passthrough fast path. Ignored when `audio_encode` is unset. See [`transcoding.md`](transcoding.md#transcode--channel-shuffle--sample-rate-conversion). |
 
 ### HLS Output (`"type": "hls"`)
@@ -692,7 +703,7 @@ Segment-based HTTP ingest. Supports HEVC/HDR content.
 | `auth_token`           | `string?` | `null`  | Bearer token for Authorization header            |
 | `max_segments`         | `usize`   | `5`     | Maximum segments in rolling playlist             |
 | `program_number`       | `u16?`    | `null`  | MPTS → SPTS program filter. `null` = each segment carries the full MPTS; `Some(N)` = each segment carries only program N as a rewritten single-program TS. Must be `> 0`. |
-| `audio_encode`         | `AudioEncodeConfig?` | `null` | Optional per-segment ffmpeg remuxer. Allowed `codec`: `aac_lc` (default), `he_aac_v1`, `he_aac_v2`, `mp2`, `ac3`. Each segment is piped through `ffmpeg -i pipe:0 -c:v copy -c:a {codec} -f mpegts pipe:1`. Requires ffmpeg in PATH; the output refuses to start if ffmpeg is missing and emits a Critical `audio_encode` event. |
+| `audio_encode`         | `AudioEncodeConfig?` | `null` | Optional per-segment audio remux. Allowed `codec`: `aac_lc` (default), `he_aac_v1`, `he_aac_v2`, `mp2`, `ac3`. On a default build (`media-codecs`) each segment is remuxed **in-process** — `remux_segment_via_ffmpeg` is `#[cfg(not(feature = "media-codecs"))]`, so it is not even compiled in. Only that subprocess fallback needs ffmpeg in PATH, and only there does a missing binary refuse the output at start with a Critical `audio_encode` event. |
 | `transcode`            | `TranscodeJson?`     | `null` | Optional channel shuffle / sample-rate conversion applied to decoded PCM **before** `audio_encode` re-encodes. Honoured only on the in-process remux path (`media-codecs` feature, default); the subprocess fallback logs a warning and ignores it. Ignored when `audio_encode` is unset. See [`transcoding.md`](transcoding.md#transcode--channel-shuffle--sample-rate-conversion). |
 
 ### WebRTC Output (`"type": "webrtc"`)
@@ -705,8 +716,9 @@ enabled by default. Video: H.264 only.
 carries AAC. Setting an `audio_encode` block (codec: `opus`) enables
 the Phase B chain — input AAC is decoded in-process via the Phase A
 `AacDecoder` (FDK AAC by default, supporting AAC-LC/HE-AAC v1/v2/multichannel),
-encoded to Opus via the `AudioEncoder` (ffmpeg subprocess for Opus),
-and written to the WebRTC audio MID via str0m. This is the marquee
+encoded to Opus via the `AudioEncoder` (libopus through libavcodec,
+in-process on any `media-codecs` build), and written to the WebRTC
+audio MID via str0m. This is the marquee
 "AAC contribution → Opus distribution" path. Requires `video_only=false`
 so SDP negotiates an audio MID.
 
@@ -722,7 +734,7 @@ so SDP negotiates an audio MID.
 | `public_ip`    | `string?` | `null`         | Public IP for ICE candidates (NAT traversal)     |
 | `video_only`   | `bool`    | `false`        | Send only video (audio omitted). Mutually exclusive with `audio_encode`. |
 | `program_number` | `u16?`  | `null`         | MPTS program selector. `null` = lock onto the lowest program_number in the PAT (deterministic default); `Some(N)` = extract elementary streams from program N only. WebRTC is single-program by spec, so this only changes *which* program is sent. Must be `> 0`. |
-| `audio_encode` | `AudioEncodeConfig?` | `null` | Optional ffmpeg-sidecar audio encoder. Only `codec: opus` is allowed for WebRTC. Validation rejects `audio_encode` + `video_only=true` (an audio MID must be negotiated in SDP). Requires ffmpeg in PATH; the encoder builds lazily on the first AAC frame after a viewer connects. |
+| `audio_encode` | `AudioEncodeConfig?` | `null` | Optional audio re-encode. Only `codec: opus` is allowed for WebRTC. Validation rejects `audio_encode` + `video_only=true` (an audio MID must be negotiated in SDP). Opus encodes in-process via libavcodec/libopus on any `media-codecs` build, so no ffmpeg binary is required; the encoder builds lazily on the first AAC frame after a viewer connects. |
 | `transcode`    | `TranscodeJson?`     | `null` | Optional channel shuffle / sample-rate conversion applied to decoded PCM **before** the Opus encoder. `transcode.channels` overrides the Opus encoder's channel count; unset keeps the source channel count. Opus on the wire is always 48 kHz regardless of either block. Ignored when `audio_encode` is unset. See [`transcoding.md`](transcoding.md#transcode--channel-shuffle--sample-rate-conversion). |
 
 #### `AudioEncodeConfig` block (Phase B)

@@ -161,7 +161,7 @@ Edge UpgradeCoordinator (src/upgrade/mod.rs)
 read state.json
    │
    ├── status == stable          → return Continue (normal boot path)
-   ├── status == staged_manual   → return Continue (operator drives swap via SIGUSR1)
+   ├── status == staged_manual   → return Continue (dead arm: nothing writes this status)
    │
    ├── status == rolled_back     → emit upgrade_rolled_back Critical
    │                                set status = stable
@@ -204,7 +204,7 @@ When both conditions hold the watchdog flips the status to `stable` and emits `u
 | New binary boots but never authenticates to manager | Periodic watchdog times out at `boot_health_window_secs` (default 120 s); state stays `pending_health`, manager UI surfaces it, operator can manually roll back. |
 | Power loss mid-stage | Atomic `rename(2)` for partial → final and current.tmp → current. fsync'd state.json + parent dir. Partial extractions live under `versions/<new>.partial/` and are GC'd on next boot. |
 | Two `upgrade_binary` commands in flight | In-process `Mutex<bool>` single-flight guard; on-disk `flock(2)` on state.json. Second command returns `upgrade_in_progress`. |
-| Operator wants high-value site to refuse all auto-upgrades | `upgrades.enabled = false` (rejects every command) **or** `upgrades.manual_only = true` (manager can stage; operator must `kill -USR1` to apply). |
+| Operator wants high-value site to refuse all auto-upgrades | `upgrades.enabled = false` — rejects every command. **Not** `manual_only = true`: that verifies the download and then discards it (see the field table below), so it refuses upgrades by failing, not by staging them. |
 | Detect unauthorised releases after the fact | Optional Rekor monitor (deferred): scheduled job polls Rekor for any signatures by Bilbycast workflow identities, cross-references against authorised tags. Public log makes this a one-shot cron. |
 
 ### Manifest schema (canonical JSON)
@@ -296,7 +296,7 @@ Add an `upgrades` block to `config.json`:
 | `install_root` | path | `/opt/bilbycast/edge` | Where `versions/`, `current`, `previous`, and `state.json` live. Must be absolute. |
 | `boot_health_window_secs` | u32 | `120` | After respawning into the new binary, the edge has this long to authenticate to the manager. Failure rolls the symlink back. |
 | `max_boot_attempts` | u32 | `3` | Maximum boot loops on the new binary before automatic rollback. |
-| `manual_only` | bool | `false` | Stage-without-apply mode for high-value sites. Manager can stage; the actual symlink swap waits for a local `kill -USR1 <pid>` on the running edge. |
+| `manual_only` | bool | `false` | **Half-built — it does not stage anything.** The node downloads and SHA-256/Sigstore-verifies the tarball, emits `upgrade_staged_manual`, then returns an error *before* `apply::stage_new_version` runs: nothing is extracted, no `versions/<v>/` appears, `state.json` is not written, and the command acks as a **failure** with `error_code: upgrade_staged_manual`. There is no SIGUSR1 handler in `main.rs` (it registers SIGTERM + SIGINT only) and `upgrade::manual_apply_pending` has no callers, so nothing can complete the swap. Use `enabled = false` if the intent is to refuse upgrades. |
 
 Validation lives in `src/config/validation.rs::validate_upgrade_config`.
 
@@ -346,7 +346,7 @@ sudo systemctl start bilbycast-edge
 Two options:
 
 * **Soft disable**: `upgrades.enabled = false` in `config.json`. The edge rejects every `upgrade_binary` with `error_code: upgrade_disabled`.
-* **Stage-but-don't-apply**: `upgrades.manual_only = true`. The manager can stage the new version onto disk; an operator must `kill -USR1 <pid>` on the running edge to actually swap the symlink and exit.
+* **Stage-but-don't-apply**: `upgrades.manual_only = true` — **not implemented, despite the name.** The edge downloads and verifies the tarball and then aborts before extracting it: nothing lands under `versions/`, `state.json` is untouched, and the `upgrade_binary` command is acked as a failure with `error_code: upgrade_staged_manual`. There is no SIGUSR1 apply path, so nothing on the node can finish the swap. To recover: clear `manual_only` **and restart the edge** — the coordinator snapshots the `upgrades` block at startup and `UpgradeCoordinator::set_config` has no callers, so a config push alone never reaches the running process — then re-issue the command. Nothing was persisted, so the sequence guard does not block the retry. Prefer the soft disable above unless you specifically want a node that verifies releases and throws them away.
 
 Either way, the edge's compiled-in `ALLOWED_SIGNERS` allowlist still gates which signed releases it would accept — a compromised manager cannot install attacker-controlled bytes regardless of these flags.
 

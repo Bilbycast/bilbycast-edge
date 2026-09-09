@@ -12,6 +12,18 @@ uncompressed-video subsets of the AMWA NMOS specifications:
 | BCP-004 | embedded in IS-04 receiver caps | constraint_sets for ST 2110 audio, data, and video inputs |
 | mDNS-SD | `_nmos-node._tcp` | best-effort registration via `mdns-sd` (pure Rust) |
 
+**Known gap — sender transport files.** Every IS-04 sender is serialised with
+an empty `manifest_href` and an empty `interface_bindings` list, at all three
+construction sites in `api::nmos` (list, single-get, and the registration-client
+snapshot), and nothing anywhere fills either in. IS-05 matches: both `active`
+responses hard-code `transport_file: null`, and the PATCH body type has no
+`transport_file` field at all, so an SDP a controller stages against a receiver
+is silently dropped by serde. Activating *this* node's sender still works — the
+controller supplies `destination_ip` / port directly — but there is no transport
+file to hand a downstream receiver and no NIC binding for a controller to pick
+an interface from. `engine::st2110::sdp` can already generate and parse the SDP
+that would go there, but it has no caller.
+
 ## Format detection
 
 Each flow's input is classified at IS-04 list time:
@@ -52,9 +64,10 @@ view.
 The IS-08 endpoints expose every ST 2110-30/-31 audio input and output
 under `/io`. The active map is persisted to
 `<config_dir>/nmos_channel_map.json` (next to `config.json`) and reloaded
-on startup. Both staged and active maps support the standard PUT/POST
-+ activate workflow. Bilbycast does not currently re-route channels
-internally — the map is a passthrough — but the endpoints exist so
+on startup. The staged map is `GET` + `POST`, the active map is read-only
+`GET`, and activation is a `POST` to `/map/activate` — there is no `PUT` on
+either. Bilbycast does not currently re-route channels internally — the
+map is a passthrough — but the endpoints exist so
 external NMOS controllers can stage and activate maps and the manager UI
 can render the channel layout.
 
@@ -239,6 +252,28 @@ set (graceful degrade). The IS-08 router is mounted under a fresh URL
 prefix and is invisible to controllers that don't speak it. The mDNS-SD
 registration is supplementary to manual NMOS registry configuration.
 
+## IS-05 activation refusal
+
+A `PATCH .../single/senders/{id}/staged` (or the receiver equivalent) carrying
+`activation.mode: "activate_immediate"` is validated **before** the runtime is
+touched. (Any other mode returns 501; a patch with no activation at all is
+stored in the staged map unvalidated, because nothing has been applied yet.)
+The controller's `destination_ip` / `source_port` arrive unchecked — applying
+the patch only round-trips through serde, which type-checks the shape and
+happily accepts `"not-an-ip:5004"` as a string — so the patched entity goes
+through `validate_output` / `validate_input_definition` and then through a
+cross-entity port check (`validate_port_conflicts_with_output` /
+`..._with_input`, because a rewritten `bind_addr` moves a *local* port and can
+newly collide with another input, output or tunnel on this node). Any failure
+returns **HTTP 400** and the flow is left exactly as it was.
+
+The handler's error type is a bare status code, so there is nowhere to put the
+reason for the controller. It surfaces only as a Warning event on category
+`nmos` with `error_code: "invalid_transport_params"` and details
+`{ subsystem: "is-05", action: "sender_activation_refused" |
+"receiver_activation_refused", resource_id, entity_id, error }` — so when a
+controller reports a bare 400, the Events page is where the reason is.
+
 ## IS-05 and ST 2110-23
 
 IS-05 `/transportparams` reports the **primary sub-stream leg** for
@@ -256,8 +291,9 @@ available in the test lab:
   Expected pass matrix:
   - IS-04: pass on `test_01` (resources have valid UUIDs / formats /
     transports) through `test_19` (clocks).
-  - IS-05: pass on staged/active round-trip for sender + receiver, with
-    transport-file SDP advertisement for ST 2110 senders.
+  - IS-05: pass on staged/active round-trip for sender + receiver.
+    Transport-file SDP advertisement for ST 2110 senders is **not** expected
+    to pass — see the sender-transport-file gap above.
   - IS-08: pass on `io`, `map/active`, `map/staged`, `map/activate`
     happy paths.
   - BCP-004: pass on receiver caps containing `media_types` plus a

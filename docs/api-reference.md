@@ -2,7 +2,7 @@
 
 Complete REST API reference for bilbycast-edge. The API server listens on the addresses and port configured in `server.listen_addrs` / `server.listen_addr` and `server.listen_port` (new installs default to loopback only — `127.0.0.1` + `[::1]` on port `8080`; expose on the LAN with `--bind-addrs 0.0.0.0,[::]` and enable `server.auth`).
 
-All successful responses use a standard envelope:
+Most successful responses use a standard envelope. The exceptions are `/api/v1/tunnels*`, the WHIP/WHEP routes and `/x-nmos/**`, plus the three public endpoints that serve their own shapes (`/health`, `/setup/status`, `/metrics`) — see [Error Codes](#error-codes):
 
 ```json
 {
@@ -11,7 +11,7 @@ All successful responses use a standard envelope:
 }
 ```
 
-All error responses use the same envelope without `data`:
+Most error responses use the same envelope without `data` — see [Error Codes](#error-codes) for the surfaces that do not:
 
 ```json
 {
@@ -57,7 +57,12 @@ Lightweight health check suitable for load balancers, orchestrators, and monitor
   "version": "0.1.0",
   "uptime_secs": 3661,
   "active_flows": 2,
-  "total_flows": 3
+  "total_flows": 3,
+  "manager": {
+    "enabled": true,
+    "connected": true,
+    "reconnecting": false
+  }
 }
 ```
 
@@ -68,6 +73,13 @@ Lightweight health check suitable for load balancers, orchestrators, and monitor
 | `uptime_secs` | integer | Seconds since the application started |
 | `active_flows` | integer | Number of flows currently running |
 | `total_flows` | integer | Total flows defined in configuration |
+| `manager` | object | The edge's own view of its manager WebSocket link (always present) |
+| `manager.enabled` | boolean | Whether a manager client is configured on this node at all. `false` means "unmanaged", not "disconnected" |
+| `manager.connected` | boolean | `true` while an authenticated WS session to the manager is live |
+| `manager.disconnected_secs` | integer | Seconds since the link went down. **Omitted** while connected and before the first successful connection — render its absence at boot as "connecting" |
+| `manager.reconnecting` | boolean | `true` when a manager is enabled but the link is down; the client loop is retrying |
+
+`status` reflects the edge's **own** health and stays `"ok"` while the manager link is down — a probe wired to `status` alone will never see a manager outage. Read the `manager` block for that.
 
 **curl example:**
 
@@ -79,7 +91,7 @@ curl http://localhost:8080/health
 
 ## Setup Wizard
 
-Browser-based initial provisioning for edge nodes deployed on COTS hardware. All setup endpoints are public (no authentication required). Access is controlled by the `setup_enabled` config flag (default: `true`). Once the node completes its first successful registration with a manager, the flag is automatically flipped to `false` and persisted to disk — subsequent requests to `/setup` return the "Setup Disabled" page.
+Browser-based initial provisioning for edge nodes deployed on COTS hardware. `GET /setup` and `GET /setup/status` are public (no authentication required); `POST /setup` additionally requires a setup-token Bearer credential unless the request arrives from loopback (see below). Access is controlled by the `setup_enabled` config flag (default: `true`). Once the node completes its first successful registration with a manager, the flag is automatically flipped to `false` and persisted to disk — subsequent requests to `/setup` return the "Setup Disabled" page.
 
 ### GET /setup
 
@@ -93,9 +105,9 @@ Returns the current setup-relevant configuration as JSON for pre-filling the for
 
 ```json
 {
-  "listen_addr": "0.0.0.0",
+  "listen_addr": "0.0.0.0,[::]",
   "listen_port": 8080,
-  "manager_url": null,
+  "manager_urls": [],
   "accept_self_signed_cert": false,
   "registration_token": null,
   "device_name": null,
@@ -103,9 +115,13 @@ Returns the current setup-relevant configuration as JSON for pre-filling the for
 }
 ```
 
+`manager_urls` is the node's ordered manager list — `[]` when no manager block is configured. `listen_addr` is the comma-separated join of `server.effective_listen_addrs()`, so it carries a single address only while `server.listen_addrs` is unset and falls back to `server.listen_addr`; a dual-stack node returns e.g. `"0.0.0.0,[::]"`.
+
 ### POST /setup
 
 Validates and saves setup configuration. Returns 403 if `setup_enabled` is false.
+
+**Auth:** requests whose TCP source address is loopback (`127.0.0.0/8` or `::1`) need no credential — an operator already on the box has authenticated by other means. Every other caller must send `Authorization: Bearer <setup_token>`, compared in constant time; a missing or wrong token is 401. The token is auto-generated on first boot, printed once to stdout, and re-printable with `bilbycast-edge --config <path> --print-setup-token`. It is cleared automatically on the node's first successful manager registration (which also flips `setup_enabled` to `false`). See [Securing the setup wizard](installation.md#securing-the-setup-wizard).
 
 **Request body:**
 
@@ -113,7 +129,7 @@ Validates and saves setup configuration. Returns 403 if `setup_enabled` is false
 {
   "listen_addr": "0.0.0.0",
   "listen_port": 8080,
-  "manager_url": "wss://manager.example.com:8443/ws/node",
+  "manager_urls": ["wss://manager.example.com:8443/ws/node"],
   "accept_self_signed_cert": false,
   "registration_token": "token-from-manager",
   "device_name": "Studio-A Encoder"
@@ -124,7 +140,7 @@ Validates and saves setup configuration. Returns 403 if `setup_enabled` is false
 |-------|------|----------|-------------|
 | `listen_addr` | `string` | No | API server bind address |
 | `listen_port` | `u16` | No | 1-65535 |
-| `manager_url` | `string` | Yes | Must start with `wss://`, max 2048 chars |
+| `manager_urls` | `array of string` | Yes | 1-16 entries after trimming and dropping empties; each must start with `wss://` and be at most 2048 chars. A single-instance deploy still sends a one-element array — there is no scalar `manager_url` alias |
 | `accept_self_signed_cert` | `bool` | No | Default: false |
 | `registration_token` | `string` | No | Max 4096 chars |
 | `device_name` | `string` | No | Max 256 chars |
@@ -138,14 +154,22 @@ Validates and saves setup configuration. Returns 403 if `setup_enabled` is false
 }
 ```
 
-**Error response (400/403):**
+**Error response (400/401/403/422/500):**
 
 ```json
 {
   "success": false,
-  "error": "Manager URL must start with wss:// (TLS required)"
+  "error": "Manager URL \"http://manager.example.com\" must start with wss:// (TLS required)"
 }
 ```
+
+| Status | Condition |
+|--------|-----------|
+| 400 | Empty `manager_urls`, more than 16 entries, an entry that is not `wss://` or exceeds 2048 chars, an over-long `registration_token` or `device_name`, `listen_port: 0`, or a full-config validation failure on the patched config |
+| 401 | Non-loopback caller with a missing or wrong `Authorization: Bearer <setup_token>` |
+| 403 | `setup_enabled` is false |
+| 422 | Body does not deserialize into the payload — this is what a legacy scalar `"manager_url": "…"` produces, rejected by the JSON extractor before any of the friendly 400 messages can fire |
+| 500 | Writing `config.json` / `secrets.json` failed. Note the config was already patched in memory at that point and is not rolled back |
 
 ---
 
@@ -202,6 +226,7 @@ grant_type=client_credentials&client_id=admin-client&client_secret=super-secret-
 | Status | Condition |
 |--------|-----------|
 | 400 | Auth not enabled, unsupported grant_type, invalid credentials, unparseable body |
+| 429 | Per-IP token rate limit exceeded. Reachable only while a limiter is active (auth enabled and `token_rate_limit_per_minute > 0` — see the [Endpoint Summary](#endpoint-summary) auth notes for the 10/min default). The response carries a `retry-after: 60` header and the body `{"success": false, "error": "rate limit exceeded, try again later"}`; treat it as a throttle to retry, not as a credential failure |
 
 **curl examples:**
 
@@ -234,7 +259,7 @@ The returned JWT contains these claims:
 
 Inputs are **top-level, first-class entities**. They are created and managed independently of flows; a flow references inputs by ID via `input_ids`. An input may be unassigned, or assigned to exactly one flow at a time.
 
-An input definition is an `InputDefinition`: `{ "id", "name", "active", "group"?, ... }` plus the protocol-specific `InputConfig` fields flattened in (enum-tagged by `"type"`, e.g. `"type": "srt"`). The `type` value is a free-form string; common values are `rtp`, `udp`, `srt`, `rist`, `rtmp`, `rtsp`, `webrtc`, `whep`, `rtp_audio`, `bonded`, `media_player`, `test_pattern`, `replay`, `st2110_20`, `st2110_23`, `st2110_30`, `st2110_31`, `st2110_40`, and (with the `mxl` feature) `mxl_video` / `mxl_audio` / `mxl_anc`. See the [Configuration Guide](configuration-guide.md) for each type's fields.
+An input definition is an `InputDefinition`: `{ "id", "name", "active", "group"?, ... }` plus the protocol-specific `InputConfig` fields flattened in (enum-tagged by `"type"`, e.g. `"type": "srt"`). The `type` value is a free-form string; common values are `rtp`, `udp`, `srt`, `rist`, `rtmp`, `rtsp`, `webrtc`, `whep`, `rtp_audio`, `bonded`, `media_player`, `test_pattern`, `replay`, `sdi`, `st2110_20`, `st2110_23`, `st2110_30`, `st2110_31`, `st2110_40`, and (with the `mxl` feature) `mxl_video` / `mxl_audio` / `mxl_anc`. `mosaic` (multiviewer canvas) is the one variant compiled out of the schema entirely without the `multiviewer` feature; `sdi` and the `mxl_*` variants always parse and are gated at runtime instead. See the [Configuration Guide](configuration-guide.md) for each type's fields.
 
 ### GET /api/v1/inputs
 
@@ -262,7 +287,7 @@ Delete an input definition. **Auth:** `admin`. Returns 404 if not found; rejecte
 
 Outputs are **top-level, first-class entities**, managed independently of flows; a flow references outputs by ID via `output_ids`. An output may be unassigned, or assigned to exactly one flow at a time.
 
-An output definition is an `OutputConfig` enum, tagged by `"type"`, carrying its own `id` and `name`. The `type` value is a free-form string; common values are `rtp`, `udp`, `srt`, `rist`, `rtmp`, `hls`, `cmaf`, `webrtc`, `rtp_audio`, `bonded`, `display`, `st2110_20`, `st2110_23`, `st2110_30`, `st2110_31`, `st2110_40`, and (with the `mxl` feature) `mxl_video` / `mxl_audio` / `mxl_anc`. See the [Configuration Guide](configuration-guide.md) for each type's fields.
+An output definition is an `OutputConfig` enum, tagged by `"type"`, carrying its own `id` and `name`. The `type` value is a free-form string; common values are `rtp`, `udp`, `srt`, `rist`, `rtmp`, `hls`, `cmaf`, `webrtc`, `rtp_audio`, `bonded`, `display`, `sdi`, `st2110_20`, `st2110_23`, `st2110_30`, `st2110_31`, `st2110_40`, and (with the `mxl` feature) `mxl_video` / `mxl_audio` / `mxl_anc`. The `sdi` and `mxl_*` variants always parse; they are gated at runtime by the `sdi-decklink` / `mxl` features. See the [Configuration Guide](configuration-guide.md) for each type's fields.
 
 ### GET /api/v1/outputs
 
@@ -874,13 +899,44 @@ Retrieve aggregated system-wide and per-flow statistics. Running flows include l
           "cc_errors": 0,
           "pat_errors": 0,
           "pmt_errors": 0,
+          "pid_errors": 0,
           "tei_errors": 0,
+          "crc_errors": 0,
           "pcr_discontinuity_errors": 0,
           "pcr_accuracy_errors": 0,
+          "window_cc_errors": 0,
+          "window_pat_errors": 0,
+          "window_pmt_errors": 0,
+          "window_pid_errors": 0,
+          "window_tei_errors": 0,
+          "window_crc_errors": 0,
+          "window_pcr_discontinuity_errors": 0,
+          "window_pcr_accuracy_errors": 0,
           "priority1_ok": true,
+          "missing_continuous_pids": 0,
           "priority2_ok": true,
-          "tr07_compliant": false,
-          "jpeg_xs_pid": null
+          "priority3_ok": true,
+          "pts_errors": 0,
+          "cat_errors": 0,
+          "pcr_repetition_errors": 0,
+          "nit_errors": 0,
+          "si_repetition_errors": 0,
+          "unreferenced_pid_errors": 0,
+          "sdt_errors": 0,
+          "eit_errors": 0,
+          "rst_errors": 0,
+          "tdt_errors": 0,
+          "window_pts_errors": 0,
+          "window_cat_errors": 0,
+          "window_pcr_repetition_errors": 0,
+          "window_nit_errors": 0,
+          "window_si_repetition_errors": 0,
+          "window_unreferenced_pid_errors": 0,
+          "window_sdt_errors": 0,
+          "window_eit_errors": 0,
+          "window_rst_errors": 0,
+          "window_tdt_errors": 0,
+          "tr07_compliant": false
         },
         "media_analysis": {
           "protocol": "srt",
@@ -982,12 +1038,29 @@ Retrieve aggregated system-wide and per-flow statistics. Running flows include l
 | `bandwidth_exceeded` | boolean | `true` if the flow's input bitrate currently exceeds the configured `bandwidth_limit`. Omitted when `false`. |
 | `bandwidth_blocked` | boolean | `true` if the flow is currently gated (packets dropped) due to bandwidth limit enforcement. Omitted when `false`. |
 | `bandwidth_limit_mbps` | float/null | Configured bandwidth limit in Mbps (for display). Absent if no limit configured. |
+| `active_input_id` | string | ID of the input currently publishing to the flow's broadcast channel. Omitted when the flow has no inputs or is idle |
+| `health_reasons` | array | Structured explanation of `health`: one entry per triggered condition, most-severe first, each `{ code, severity, detail }`. `health` equals the maximum `severity` across the entries, so badge and explanation always agree. **Omitted when empty** (a healthy flow) |
+| `thumbnail` | object | Thumbnail-generation counters — `{ enabled, total_captured, capture_errors, has_thumbnail, alarm?, last_error? }` |
+| `ptp_state` | object | PTP clock state — `{ lock_state, domain?, grandmaster_id?, offset_ns?, mean_path_delay_ns?, steps_removed?, last_update_ms? }`. Populated by ST 2110 flows whose `clock_domain` is set |
+| `network_legs` | object | SMPTE 2022-7 Red/Blue per-leg counters — `{ red, blue, leg_switches }`, each leg carrying `packets_received` / `bytes_received` / `packets_forwarded` / `packets_duplicate`. Present only when the input has `redundancy` set |
+| `essence_flows` | array | Per-essence breakdown when the flow is part of a multi-essence ST 2110 flow group — `{ flow_id, essence_type, label? }` per entry |
+| `inputs_live` | array | Per-input liveness snapshot, one entry per configured input (including passive / non-switched ones) — `input_id`, `input_type`, `state`, byte/packet counters, endpoint fields and `signal_present`. This is what drives per-input "NO SIGNAL" rendering |
+| `per_es` | array | Per-elementary-stream counters from the PID bus — `{ input_id, source_pid, out_pid?, stream_type, kind, packets, bytes, bitrate_bps, cc_errors, pcr_discontinuity_errors }`. Assembled flows only; passthrough flows use `media_analysis.program_bitrates` instead |
+| `pcr_trust_flow` | object | Flow-wide PCR-accuracy rollup over the union of every output's drift reservoir — `samples`, `cumulative_samples`, `avg_us`, `p50_us`, `p95_us`, `p99_us`, `max_us`, `window_samples`, `window_p95_us`. `p99_us` is the number broadcast quality gate 4 reads; see [metrics.md](metrics.md) |
+| `av_interleave_flow` | object | Flow-wide A/V **mux-interleave** rollup (worst-case p95 across outputs). Interleave bounds receiver buffering — it is not lip-sync |
+| `av_skew` | object | Edge-added A/V skew (lip-sync error introduced by this edge's PTS-touching stages) on the active input's path — `{ skew_ms, worst_abs_ms, lipsync_trim_ms, mode }`. The PID pair lives on `av_interleave_flow`, not here |
+| `content_analysis` | object | In-depth content analysis — `{ lite?, audio_full?, video_full? }`, each tier independently optional. Present when the flow enables `content_analysis` |
+| `recording` | object | Replay-server recording snapshot — `armed`, `recording_id?`, `current_pts_90khz`, `segments_written`, `bytes_written`, `segments_pruned`, `packets_dropped`, `index_entries`, `last_write_unix_ms`, `mode?`. Requires a `recording` block and the `replay` feature |
+| `master_clock` | object | Master-clock telemetry — `{ kind, locked, rate_offset_ppm, jitter_us, lipsync_offset_90k, configured_kind?, fallback_active, fallback_reason?, active_input_id? }`. Populated for every running flow (every flow has a master clock) |
+| `assembly_health` | object | Assembly-slot liveness for PID-bus flows — `{ total_slots, stalled_slot_count, stalled_slots[] }`, a slot counting as stalled after ≥ 5 s without an ES packet (10 s grace from flow start). Absent on passthrough flows |
+
+Every field from `active_input_id` down is `skip_serializing_if`-guarded: its **absence is normal**, not an error, and the JSON example above shows a plain passthrough flow with none of them set. `health_reasons` is skipped when the vector is empty; the rest are skipped when `None`.
 
 **Input stats fields:**
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `input_type` | string | Free-form input type string — common values include `"rtp"`, `"udp"`, `"srt"`, `"rist"`, `"rtmp"`, `"rtsp"`, `"webrtc"`, `"whep"`, `"rtp_audio"`, `"bonded"`, `"media_player"`, `"test_pattern"`, `"replay"`, `"st2110_20/23/30/31/40"` (full list under [Inputs](#inputs)) |
+| `input_type` | string | Free-form input type string — common values include `"rtp"`, `"udp"`, `"srt"`, `"rist"`, `"rtmp"`, `"rtsp"`, `"webrtc"`, `"whep"`, `"rtp_audio"`, `"bonded"`, `"media_player"`, `"test_pattern"`, `"replay"`, `"sdi"`, `"mosaic"`, `"st2110_20/23/30/31/40"` (full list under [Inputs](#inputs)) |
 | `state` | string | Connection state (e.g., `"receiving"`, `"connecting"`) |
 | `packets_received` | integer | Total RTP packets received |
 | `bytes_received` | integer | Total bytes received |
@@ -1005,7 +1078,7 @@ Retrieve aggregated system-wide and per-flow statistics. Running flows include l
 |-------|------|-------------|
 | `output_id` | string | Output identifier |
 | `output_name` | string | Display name |
-| `output_type` | string | Free-form output type string — common values include `"udp"`, `"rtp"`, `"srt"`, `"rist"`, `"rtmp"`, `"hls"`, `"cmaf"`, `"webrtc"`, `"rtp_audio"`, `"bonded"`, `"display"`, `"st2110_20/23/30/31/40"` (full list under [Outputs](#outputs)) |
+| `output_type` | string | Free-form output type string — common values include `"udp"`, `"rtp"`, `"srt"`, `"rist"`, `"rtmp"`, `"hls"`, `"cmaf"`, `"webrtc"`, `"rtp_audio"`, `"bonded"`, `"display"`, `"sdi"`, `"st2110_20/23/30/31/40"` (full list under [Outputs](#outputs)) |
 | `state` | string | Connection state |
 | `packets_sent` | integer | Total packets sent |
 | `bytes_sent` | integer | Total bytes sent |
@@ -1026,6 +1099,37 @@ Retrieve aggregated system-wide and per-flow statistics. Running flows include l
 | `pkt_loss_total` | integer | Total packets lost |
 | `pkt_retransmit_total` | integer | Total retransmitted packets |
 | `uptime_ms` | integer | Socket uptime in milliseconds |
+
+**TR-101290 fields:**
+
+Every counter below is a `u64`. The bare counters are **lifetime totals** since the flow started; each `window_*` twin holds the errors seen **since the previous snapshot** and is reset to zero as the reporting reader takes it, so it is the one to graph as a rate.
+
+| Field | Group | Description |
+|-------|-------|-------------|
+| `ts_packets_analyzed` | — | TS packets inspected by the analyzer |
+| `pat_count` / `pmt_count` | — | PAT / PMT sections received |
+| `sync_loss_count` | P1 | Sync-loss events |
+| `sync_byte_errors` | P1 | Packets whose sync byte was not `0x47` |
+| `cc_errors` | P1 | Continuity-counter discontinuities |
+| `pat_errors` / `pmt_errors` | P1 | PAT / PMT not seen within the required interval |
+| `pid_errors` | P1 | PMT-referenced ES PIDs that went missing |
+| `tei_errors` | P2 | Packets with the Transport Error Indicator set |
+| `crc_errors` | P2 | CRC-32 failures on PAT/PMT sections |
+| `pcr_discontinuity_errors` | P2 | Unrecoverable PCR jumps |
+| `pcr_accuracy_errors` | P2 | PCR jitter beyond the accuracy limit |
+| `window_cc_errors`, `window_pat_errors`, `window_pmt_errors`, `window_pid_errors`, `window_tei_errors`, `window_crc_errors`, `window_pcr_discontinuity_errors`, `window_pcr_accuracy_errors` | P1/P2 window | Rolling-window twins of the eight counters above |
+| `pts_errors` | P2-extended | PES PIDs that stopped emitting PTS |
+| `cat_errors` | P2-extended | CAT referenced or observed, then absent |
+| `pcr_repetition_errors` | P2-extended | A PCR-bearing PID stopped emitting PCR (split out of `pcr_discontinuity_errors`, which now strictly counts jumps) |
+| `nit_errors`, `si_repetition_errors`, `unreferenced_pid_errors`, `sdt_errors`, `eit_errors`, `rst_errors`, `tdt_errors` | P3 | Priority-3 (application-specific) SI checks |
+| `window_pts_errors`, `window_cat_errors`, `window_pcr_repetition_errors`, `window_nit_errors`, `window_si_repetition_errors`, `window_unreferenced_pid_errors`, `window_sdt_errors`, `window_eit_errors`, `window_rst_errors`, `window_tdt_errors` | P2-ext/P3 window | Rolling-window twins of the ten counters above |
+| `missing_continuous_pids` | gauge | PMT-referenced continuous-media PIDs (video/audio) currently absent. Sparse essences — teletext, subtitles, SCTE-35 — never count |
+| `priority1_ok` / `priority2_ok` | boolean | Summary flags |
+| `priority3_ok` | boolean/omitted | Summary flag, typed `Option<bool>` for wire compatibility with an edge that does not report Priority 3; this edge always populates it |
+| `tr07_compliant` | boolean | Stream is VSF TR-07 compliant (JPEG XS signalled in the PMT) |
+| `jpeg_xs_pid` | integer | PID of the JPEG XS elementary stream. **Omitted** — not `null` — when none was detected |
+
+The three priority flags are computed from the **windowed** counters plus the `missing_continuous_pids` gauge, not from the lifetime totals: they describe current health and recover once a window passes clean. `priority1_ok` additionally requires the analyzer to be in sync and `missing_continuous_pids == 0`, so a P1 PID outage holds the flag false for its whole duration rather than for the single snapshot that latched it.
 
 **curl example:**
 
@@ -1069,7 +1173,9 @@ curl -H "Authorization: Bearer $TOKEN" http://localhost:8080/api/v1/stats/main-f
 
 ### GET /api/v1/config
 
-Retrieve the running application configuration. Secrets are **masked** before the response is serialized (`AppConfig::mask_secrets()`) — infrastructure secrets (`node_secret`, tunnel encryption keys, JWT secrets, client credentials, TLS config) and inline credentials are replaced with masked placeholders rather than returned in cleartext. The operational config (server settings, the top-level `inputs` / `outputs` arrays, and flow definitions) is otherwise returned in full.
+Retrieve the running application configuration. Infrastructure secrets are **stripped**, not masked: `AppConfig::mask_secrets()` sets `manager.node_secret`, `manager.registration_token`, `server.tls`, `server.auth`, `setup_token`, `nmos_registration.bearer_token`, every per-tunnel `tunnel_encryption_key` / `tunnel_bind_secret` / `tunnel_psk` / `tls_cert_pem` / `tls_key_pem`, and `cellular_uplinks[].password` to `null`. There is no placeholder, so the response cannot distinguish "configured" from "unset".
+
+**Flow-level credentials are returned in full, by design** — SRT passphrases, RTMP stream keys and RTSP credentials live in `config.json` so the manager UI can display them, and no masking is applied to `flows`, `inputs` or `outputs`. Treat the whole response as sensitive; see [Security Guide](api-security.md). The operational config (server settings, the top-level `inputs` / `outputs` arrays, and flow definitions) is otherwise returned in full.
 
 **Auth:** Requires valid JWT (any role).
 
@@ -1184,6 +1290,8 @@ Return the current PTP settings. **Auth:** any role.
     "domain": 0,
     "priority1": 128,
     "scan_timeout": 5,
+    "offset_warn_ns": 1000000,
+    "path_delay_warn_ns": 10000000,
     "config_path": "/var/lib/bilbycast/ptp.conf"
   }
 }
@@ -1191,12 +1299,12 @@ Return the current PTP settings. **Auth:** any role.
 
 ### PUT /api/v1/ptp
 
-Update PTP settings and persist them. **Auth:** `admin`.
+Update PTP settings and persist them. **Auth:** any role — the handler takes no `RequireAdmin` extractor, so any valid JWT can change the node's PTP mode, interface, domain and priority1 when auth is enabled.
 
 **Request body:**
 
 ```json
-{ "mode": "grandmaster", "iface": "eth0", "domain": 0, "priority1": 128, "scan_timeout": 5 }
+{ "mode": "grandmaster", "iface": "eth0", "domain": 0, "priority1": 128, "scan_timeout": 5, "offset_warn_ns": 1000000, "path_delay_warn_ns": 10000000 }
 ```
 
 | Field | Type | Required | Description |
@@ -1204,8 +1312,12 @@ Update PTP settings and persist them. **Auth:** `admin`.
 | `mode` | string | Yes | One of `auto`, `grandmaster` (aliases `gm`/`master`), `slave-only` (alias `slave`), `off` (aliases `disabled`/`none`) |
 | `iface` | string | No | Network interface |
 | `domain` | `u8` | No | PTP domain |
-| `priority1` | `u8` | No | PTP priority1 |
-| `scan_timeout` | `u8` | No | BMCA scan timeout (seconds) |
+| `priority1` | `u8` | No | PTP priority1. Pinned to 255 for `slave-only` before persisting, whatever was sent |
+| `scan_timeout` | `u8` | No | BMCA scan timeout (seconds). Clamped to 1-60 |
+| `offset_warn_ns` | `i64` | No | Master-offset alarm threshold, arming the `ptp_offset_high` event. `0` is folded to "disabled" (see [ptp.md](ptp.md)) |
+| `path_delay_warn_ns` | `i64` | No | Mean-path-delay alarm threshold, arming the `ptp_path_delay_high` event. `0` is folded to "disabled" |
+
+> **This is a whole-object replace, with no server-side merge.** The handler builds a fresh settings object out of the request body alone and persists it, so any field the body omits is written as unset — a PUT without `offset_warn_ns` / `path_delay_warn_ns` silently disables those alarms. Clients must GET the current object, edit it, and PUT it back in full.
 
 Returns 400 on an unknown mode or failed validation.
 
@@ -1253,6 +1365,8 @@ Prometheus-compatible metrics endpoint. Returns metrics in the Prometheus text e
 | `bilbycast_edge_flow_output_bitrate_bps` | gauge | Output bitrate (bits/sec) |
 | `bilbycast_edge_flow_output_packets_dropped` | counter | Packets dropped |
 | `bilbycast_edge_flow_output_fec_sent_total` | counter | FEC packets sent |
+| `bilbycast_edge_flow_output_latency_us` | gauge | End-to-end output latency in microseconds (extra label `stat` = `min` / `avg` / `max`) |
+| `bilbycast_edge_flow_output_latency_frames` | gauge | The same latency expressed in video frames |
 
 **SRT metrics** (labeled by `flow_id`, optionally `output_id` and `leg`):
 
@@ -1270,6 +1384,8 @@ Prometheus-compatible metrics endpoint. Returns metrics in the Prometheus text e
 | `bilbycast_edge_tr101290_cc_errors_total` | counter | Continuity counter errors |
 | `bilbycast_edge_tr101290_pat_errors_total` | counter | PAT timeout errors |
 | `bilbycast_edge_tr101290_pmt_errors_total` | counter | PMT timeout errors |
+| `bilbycast_edge_tr101290_pid_errors_total` | counter | PID errors (PMT-referenced ES PIDs missing) |
+| `bilbycast_edge_tr101290_crc_errors_total` | counter | CRC-32 errors on PAT/PMT sections |
 | `bilbycast_edge_tr101290_tei_errors_total` | counter | Transport error indicator errors |
 | `bilbycast_edge_tr101290_pcr_discontinuity_errors_total` | counter | PCR discontinuity errors |
 | `bilbycast_edge_tr101290_pcr_accuracy_errors_total` | counter | PCR accuracy errors |
@@ -1285,6 +1401,8 @@ Prometheus-compatible metrics endpoint. Returns metrics in the Prometheus text e
 | `bilbycast_edge_media_total_bitrate_bps` | gauge | Total TS bitrate in bits/sec |
 
 Only metrics for currently running flows are emitted.
+
+The tables above are a **summary, not the full exposition**. The endpoint also emits `bilbycast_edge_system_*` (CPU, RAM used/total/percent, a resources-critical flag), `bilbycast_edge_ptp_*` (state, lock, offset, mean path delay, steps removed), `bilbycast_edge_rist_*` (RTT, loss, recovered, NACKs sent/received, retransmits), `bilbycast_edge_bond_*` and `bilbycast_edge_bond_path_*` (per-bond and per-leg throughput, RTT, NACKs, retransmits, keepalives, gaps, duplication, loss fraction, dead-path flag) and `bilbycast_edge_replay_*` (recording count/bytes, orphan count/bytes, replay-root free/total bytes). See [metrics.md](metrics.md) for the per-family reference.
 
 **curl example:**
 
@@ -1368,7 +1486,7 @@ Get status of a specific tunnel.
 
 Create a new IP tunnel. The tunnel configuration is validated before creation.
 
-**Auth:** Requires valid JWT with `admin` role when auth is enabled.
+**Auth:** Requires a valid JWT (**any role**) when auth is enabled — unlike the inputs / outputs / flows write routes, this handler carries no `RequireAdmin` extractor, so a `monitor` token can create a tunnel and have it persisted to `config.json` / `secrets.json`.
 
 **Request body:** A `TunnelConfig` JSON object. See [Tunnel Configuration](configuration-guide.md#tunnel-configuration) for all fields.
 
@@ -1415,21 +1533,27 @@ For a native SRT/RIST stream that should avoid QUIC, add `"transport": "udp"` (r
 
 Destroy a tunnel and clean up its connections.
 
-**Auth:** Requires valid JWT with `admin` role when auth is enabled.
+**Auth:** Requires a valid JWT (**any role**) when auth is enabled — this handler carries no `RequireAdmin` extractor either.
 
 **Response (200 OK):**
 
 ```json
 {
-  "status": "deleted"
+  "status": "deleted",
+  "was_live": true,
+  "removed_from_config": true
 }
 ```
 
-**Response (404 Not Found):**
+The delete is **idempotent and has no 404 path**. A tunnel that already left the runtime registry — one that self-evicted after a connect failure, say — is still reconciled out of `config.json`, so an orphaned config entry can always be removed. `was_live` reports whether a live tunnel was torn down; `removed_from_config` whether a persisted entry was dropped; both `false` means there was nothing to delete. A client written to read 404 as "already gone" will never see it.
+
+**Response (500 Internal Server Error):**
+
+The only error responses. Either the destroy failed, or the config persist failed after the destroy succeeded:
 
 ```json
 {
-  "error": "Tunnel not found"
+  "error": "tunnel destroyed but config persist failed: ..."
 }
 ```
 
@@ -1524,7 +1648,7 @@ wscat -c "ws://localhost:8080/api/v1/ws/stats" \
 
 ## Error Codes
 
-All API errors return a JSON body with `"success": false` and an `"error"` message string.
+Handlers built on the shared `ApiError` type — inputs, outputs, flows, flow actions, config and `PUT /api/v1/ptp` — return a JSON body with `"success": false` and an `"error"` message string, as do the auth middleware's 401/403 and the 404 fallback. **Three surfaces differ:** `/api/v1/tunnels*` returns a bare `{"error": "..."}` with no `success` key, and the WHIP/WHEP routes and the `/x-nmos/**` routes return a bare HTTP status with an **empty body**. Do not key error handling on `success` for those.
 
 | HTTP Status | Error Type | Description |
 |-------------|-----------|-------------|
@@ -1576,6 +1700,8 @@ All API errors return a JSON body with `"success": false` and an `"error"` messa
 | Method | Path | Auth | Role | Description |
 |--------|------|------|------|-------------|
 | GET | `/health` | No | - | Health check |
+| GET | `/setup` | No | - | Setup wizard page |
+| POST | `/setup` | Loopback: no. Otherwise setup token | - | Apply setup wizard |
 | GET | `/setup/status` | No | - | Setup config for pre-filling the wizard |
 | POST | `/oauth/token` | No (rate-limited) | - | Get JWT token |
 | GET | `/metrics` | Configurable | any | Prometheus metrics |
@@ -1602,21 +1728,21 @@ All API errors return a JSON body with `"success": false` and an `"error"` messa
 | PUT | `/api/v1/flows/{flow_id}/assembly` | Yes | admin | Hot-swap the PID-bus assembly plan |
 | POST | `/api/v1/flows/{flow_id}/outputs` | Yes | admin | Assign an existing output to the flow |
 | DELETE | `/api/v1/flows/{flow_id}/outputs/{output_id}` | Yes | admin | Unassign an output from the flow |
-| POST | `/api/v1/flows/{flow_id}/whip` | Yes | admin | WHIP: Accept WebRTC publisher (SDP offer → answer) |
-| DELETE | `/api/v1/flows/{flow_id}/whip/{session_id}` | Yes | admin | WHIP: Disconnect publisher |
-| POST | `/api/v1/flows/{flow_id}/whep` | Yes | admin | WHEP: Accept WebRTC viewer (SDP offer → answer) |
-| DELETE | `/api/v1/flows/{flow_id}/whep/{session_id}` | Yes | admin | WHEP: Disconnect viewer |
+| POST | `/api/v1/flows/{flow_id}/whip` | Yes | any | WHIP: Accept WebRTC publisher (SDP offer → answer) |
+| DELETE | `/api/v1/flows/{flow_id}/whip/{session_id}` | Yes | any | WHIP: Disconnect publisher |
+| POST | `/api/v1/flows/{flow_id}/whep` | Yes | any | WHEP: Accept WebRTC viewer (SDP offer → answer) |
+| DELETE | `/api/v1/flows/{flow_id}/whep/{session_id}` | Yes | any | WHEP: Disconnect viewer |
 | GET | `/api/v1/tunnels` | Yes | any | List all tunnels |
 | GET | `/api/v1/tunnels/{id}` | Yes | any | Get tunnel status |
-| POST | `/api/v1/tunnels` | Yes | admin | Create tunnel |
-| DELETE | `/api/v1/tunnels/{id}` | Yes | admin | Delete tunnel |
+| POST | `/api/v1/tunnels` | Yes | any | Create tunnel |
+| DELETE | `/api/v1/tunnels/{id}` | Yes | any | Delete tunnel |
 | GET | `/api/v1/stats` | Yes | any | All statistics |
 | GET | `/api/v1/stats/{flow_id}` | Yes | any | Single flow stats |
-| GET | `/api/v1/config` | Yes | any | Get running config (secrets masked) |
+| GET | `/api/v1/config` | Yes | any | Get running config (infrastructure secrets stripped; flow credentials in cleartext) |
 | PUT | `/api/v1/config` | Yes | admin | Replace entire config |
 | POST | `/api/v1/config/reload` | Yes | admin | Reload config from disk |
 | GET | `/api/v1/ptp` | Yes | any | Get PTP settings |
-| PUT | `/api/v1/ptp` | Yes | admin | Update PTP settings |
+| PUT | `/api/v1/ptp` | Yes | any | Update PTP settings |
 | GET | `/api/v1/ws/stats` | Yes | any | WebSocket stats stream |
 | GET | `/x-nmos/node/v1.3/` | Configurable | any | NMOS IS-04: Node API root |
 | GET | `/x-nmos/node/v1.3/self` | Configurable | any | NMOS IS-04: Node resource |
@@ -1652,3 +1778,6 @@ All API errors return a JSON body with `"success": false` and an `"error"` messa
 - "Configurable" for NMOS: requires JWT whenever `auth.enabled: true` (the secure-by-default). Set `nmos_require_auth: false` to opt out — a `SECURITY:` warning is logged at startup.
 - "Configurable" for `/metrics`: public by default, requires JWT when `public_metrics: false`
 - `/oauth/token` is rate-limited to 10 requests/minute per IP by default (configurable via `token_rate_limit_per_minute`)
+- The `admin` role is enforced by the `RequireAdmin` extractor on the handler itself, not by a router layer, so the three write routes that omit it — `POST /api/v1/tunnels`, `DELETE /api/v1/tunnels/{id}` and `PUT /api/v1/ptp` — accept any valid JWT. With auth off, `RequireAdmin` returns `Ok` anyway, so the distinction exists only on auth-enabled nodes
+- WHIP/WHEP need only a valid JWT (any role) when auth is enabled. The per-flow `bearer_token` is the real gate and it covers the two SDP-offer routes only — the two session `DELETE`s validate no bearer token at all, so on an auth-off node (the shipped default) any caller who knows a session id can tear that session down
+- NMOS collection paths are registered both with and without a trailing slash, and the navigation roots (`/x-nmos/connection/v1.1/`, `/single`, `/single/senders/{id}`, `/single/receivers/{id}`, `/x-nmos/channelmapping/v1.0/`, `/map`, `/io/`, `/map/active/`, `/map/staged/`) are registered too. The table lists the canonical form only

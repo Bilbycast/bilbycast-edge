@@ -105,8 +105,12 @@ bilbycast-edge is a media gateway supporting multiple transport protocols for pr
   - `program_number` filter on the output side for MPTS → SPTS
     down-selection before bonding
 - **When not to use it:** For two SRT legs to the same SRT receiver use
-  libsrt socket groups (configured on the SRT output `redundancy`
-  block); for two RIST legs use RIST native SMPTE 2022-7. Bonded is the
+  libsrt socket groups — the SRT input/output `bonding` block (`mode`:
+  `broadcast` | `backup`, plus 2–8 `endpoints[]`), libsrt backend only and
+  mutually exclusive with `redundancy`, which is the separate app-layer
+  2022-7 duplicate over two independent SRT sessions; see
+  [configuration-guide.md](configuration-guide.md#native-libsrt-srt-bonding-socket-groups).
+  For two RIST legs use RIST native SMPTE 2022-7. Bonded is the
   universal option for N ≥ 2 heterogeneous links carrying any inner
   protocol — see [bonding.md](bonding.md) for the full config schema,
   worked examples, and tuning guidance.
@@ -370,7 +374,7 @@ bilbycast-edge is a media gateway supporting multiple transport protocols for pr
   - **WHEP output** (server): Serve browser viewers — endpoint at `/api/v1/flows/{id}/whep`
   - **WHEP input** (client): Pull media from external WHEP servers
 - **Video:** H.264 only (RFC 6184 RTP packetization/depacketization)
-- **Audio:** Opus passthrough by default. Opus flows natively on WebRTC paths and gets muxed into MPEG-TS for SRT/RTP/UDP outputs. **Without `audio_encode`, AAC sources going to a WebRTC output automatically fall back to video-only.** Setting an `audio_encode` block (codec: `opus`) enables the Phase B chain: input AAC is decoded in-process via the Phase A `engine::audio_decode::AacDecoder` (FDK AAC by default, supporting AAC-LC/HE-AAC v1/v2/multichannel) and re-encoded as Opus via the Phase B `engine::audio_encode::AudioEncoder` (ffmpeg subprocess for Opus), then written to the WebRTC audio MID via str0m. This is the marquee Phase A+B chain — **AAC RTMP contribution → Opus WebRTC distribution** — all inside one bilbycast-edge process with no external transcoder. Requires `video_only=false` and ffmpeg in PATH (for Opus encoding). The WebRTC output also accepts an optional companion `transcode` block: `transcode.channels` overrides the Opus encoder's channel count (unset keeps the source), and the full channel-routing matrix / per-channel gain surface works identically to the other outputs — see [transcoding.md](transcoding.md#transcode--channel-shuffle--sample-rate-conversion).
+- **Audio:** Opus passthrough by default. Opus flows natively on WebRTC paths and gets muxed into MPEG-TS for SRT/RTP/UDP outputs. **Without `audio_encode`, AAC sources going to a WebRTC output automatically fall back to video-only.** Setting an `audio_encode` block (codec: `opus`) enables the Phase B chain: input AAC is decoded in-process via the Phase A `engine::audio_decode::AacDecoder` (FDK AAC by default, supporting AAC-LC/HE-AAC v1/v2/multichannel) and re-encoded as Opus via the Phase B `engine::audio_encode::AudioEncoder` (libopus through libavcodec, in-process, on any `media-codecs` build; the ffmpeg subprocess backend is reached only when `media-codecs` is compiled out), then written to the WebRTC audio MID via str0m. This is the marquee Phase A+B chain — **AAC RTMP contribution → Opus WebRTC distribution** — all inside one bilbycast-edge process with no external transcoder. Requires `video_only=false`; no ffmpeg binary is needed on a default build. The WebRTC output also accepts an optional companion `transcode` block: `transcode.channels` overrides the Opus encoder's channel count (unset keeps the source), and the full channel-routing matrix / per-channel gain surface works identically to the other outputs — see [transcoding.md](transcoding.md#transcode--channel-shuffle--sample-rate-conversion).
 - **MPTS-aware outputs:** on an MPTS input, WHIP/WHEP outputs select program by `program_number` or (default) lock onto the lowest-numbered program in the PAT. Single-program by spec.
 - **Interoperability:** Compatible with OBS, browsers, Cloudflare, LiveKit, and other standard WHIP/WHEP implementations.
 - **Security:** Bearer token authentication on WHIP/WHEP endpoints, DTLS/SRTP encryption, ICE-lite for server modes.
@@ -488,7 +492,7 @@ default = ["tls", "webrtc", "fdk-aac", "media-codecs", "replay", "display"]
 | `replay` | Continuous flow recording to disk + clip playback as a fresh input |
 | `display` | Local-display output (HDMI / DisplayPort + ALSA), Linux-only |
 
-The software video encoders (`video-encoder-x264` / `-x265` / `-nvenc` / `-qsv` / `-vaapi`), their HW-decoder counterparts, and `mxl` are **off** by default. The `*-linux-full` release variant bundles the encoder set via `video-encoders-full`. See root `CLAUDE.md` for the full matrix.
+Everything outside that `default` list is **off** in a plain `cargo build`: the video encoders (`video-encoder-x264` / `-x265` / `-nvenc` / `-qsv` / `-vaapi` / `-rkmpp`) and their HW-decoder counterparts (`video-decoder-nvdec` / `-qsv` / `-vaapi` / `-rkmpp`), the `video-encoders-full` composite, `multiviewer`, `mxl` (with its `mxl-not-built` CI sub-toggle), `sdi-decklink`, `rga-transfer`, `hardware-monitor-nvml` and `ptp-internal`. The published release artefacts turn on different subsets: `multiviewer` and `mxl` are requested on all three; `sdi-decklink` on the two `*-linux-full` builds only; the Rockchip trio (`video-encoder-rkmpp` / `video-decoder-rkmpp` / `rga-transfer`) on `aarch64-linux-rockchip` only; `hardware-monitor-nvml` and `ptp-internal` on none of them. See root `CLAUDE.md` for the full matrix.
 
 ## Configuration Examples
 

@@ -181,24 +181,37 @@ fi
 
 # 3. PTP coexistence — keep PTP traffic OUT of the ETF class.
 #
-#    The mqprio priomap above sends socket-priority 0 (the default for ALL
-#    traffic, including ptp4l's Sync/Delay_Req — they carry no SO_TXTIME)
-#    into the ETF class 100:1. On some kernels (verified broken on Ubuntu
-#    7.0.0-15 / ice / E810, May 2026) ETF does NOT release those zero-txtime
-#    packets even with skip_sock_check, so ptp4l's Sync never egresses and the
-#    grandmaster flaps MASTER<->FAULTY with "timed out polling for tx
-#    timestamp". That makes ETF and a PTP master/slave mutually exclusive on
-#    the same NIC — which is fatal, because ST 2110 needs BOTH.
+#    The priomap installed above (`1 1 1 1 1 0 1 1 2 2 2 2 1 1 1 1`) already
+#    keeps ordinary traffic off the ETF class on its own: only socket-priority
+#    5 maps to TC0, and 5 is unreachable via DSCP marking (`ip_tos2prio` only
+#    ever derives 0/2/4/6), so nothing lands there but a socket that asked for
+#    it by name. ptp4l at its default socket priority is already on tc1.
+#    The filter below is therefore belt-and-braces under this map — kept
+#    because it is what was actually measured to fix the flap, because it also
+#    covers a ptp4l configured with a non-default socket priority, and because
+#    it still holds if an operator widens the map back out.
+#
+#    The failure it fixes, for when priority 0 DOES reach the ETF class (the
+#    old `0 0 0 0 1 1 1 1 2 2 2 2 0 0 0 0` map): on some kernels (verified
+#    broken on Ubuntu 7.0.0-15 / ice / E810, May 2026) ETF does NOT release
+#    those zero-txtime packets even with skip_sock_check, so ptp4l's Sync never
+#    egresses and the grandmaster flaps MASTER<->FAULTY with "timed out polling
+#    for tx timestamp". That makes ETF and a PTP master/slave mutually
+#    exclusive on the same NIC — which is fatal, because ST 2110 needs BOTH.
 #
 #    Fix: a clsact EGRESS filter that matches PTP event (UDP 319) + general
 #    (UDP 320) and rewrites the skb priority to PTP_BYPASS_PRIO, which the
 #    priomap routes to a NON-ETF traffic class (fq_codel). The clsact egress
 #    hook runs in dev_queue_xmit BEFORE mqprio picks the queue, so the
-#    priority rewrite actually changes the class. Media (other UDP ports)
-#    stays priority 0 -> ETF and keeps its SO_TXTIME pacing; only PTP is
-#    carved out. PTP then egresses normally and gets its TX timestamp.
+#    priority rewrite actually changes the class. Media rides the opposite
+#    carve-out — an SO_TXTIME output reaches the etf class only when the edge is
+#    run with BILBYCAST_ETF_SO_PRIORITY=5 (the edge's own default is 0, so this
+#    is the REQUIRED COMPANION flagged in step 1) — which leaves the etf class with
+#    nothing on it but that traffic, and only PTP needing an explicit exit. PTP
+#    then egresses normally and gets its TX timestamp.
 #
-#    PTP_BYPASS_PRIO defaults to 4 -> tc1 per the priomap "0 0 0 0 1 1 1 1..".
+#    PTP_BYPASS_PRIO defaults to 4 -> tc1 per the priomap above (every priority
+#    except 5 -> tc0 and 8-11 -> tc2 lands on tc1).
 #    Set BILBYCAST_SKIP_PTP_BYPASS=1 to skip (e.g. NICs that never carry PTP).
 PTP_BYPASS_PRIO="${PTP_BYPASS_PRIO:-4}"
 if [[ "${BILBYCAST_SKIP_PTP_BYPASS:-0}" != "1" ]]; then

@@ -21,11 +21,20 @@
 > - **The residence-cap shed fires on `dejitter.enabled` regardless of
 >   releaser**, and `dejitter.enabled` is **Lossless-only** (`want_egress_servo
 >   = matches!(pacing, WirePacingClass::Lossless)`).
+> - **The shed no longer anchors on input arrival.** Residence is measured
+>   from `enqueue_us` — the instant the datagram entered the wire queue —
+>   not from `recv_time_us`, so configured upstream holds (RIST ARQ
+>   `buffer_ms`, output delay, the hitless merger) cannot spend the egress
+>   runaway budget. With arrival anchoring a RIST input whose `buffer_ms`
+>   reached the cap pre-aged every datagram and the shed dropped 100 % of
+>   traffic (2026-06-06).
 >
 > The **numeric defaults below still match** the shipped code: 60 ms setpoint,
 > ±5 % authority (`authority_permille = 50`), 32-datagram drain floor,
-> residence cap `max(4×setpoint, 1000)` ms. For the shipped ingress
-> counterpart, [`ingress-dejitter-design.md`](ingress-dejitter-design.md) is
+> residence cap `max(4×setpoint, 1000)` ms, hard-capped at 5000 ms (so an
+> `egress_buffer_ms` above 1250 ms stops buying more burst headroom). For the
+> shipped ingress counterpart,
+> [`ingress-dejitter-design.md`](ingress-dejitter-design.md) is
 > accurate and current.
 >
 > **2026-06-05 update — pacing model + config surface.** The shipped default
@@ -78,9 +87,11 @@ Replace the open-loop PCR integration with a **leaky-bucket release servo + hard
 3. **Pace** each datagram as a true leaky bucket from `last_returned` at `release` (no frozen
    anchor, no source-PCR integration → a steady ppm offset has no integrator to accumulate).
 4. **Underflow floor** `target.max(now)` (ASAP when drained).
-5. **Hard residence cap** (controlled overflow, IRD-style): when residence (`now − oldest
-   recv_time`, = `last_latency_us`) exceeds the cap, **shed oldest** datagrams (count them) and
-   snap forward — bounds latency by construction. The receiver re-clocks from the untouched PCR.
+5. **Hard residence cap** (controlled overflow, IRD-style): when residence
+   (`now − enqueue_us` — wire-queue dwell, **not** the `last_latency_us` stat,
+   which still measures from input arrival) exceeds the cap, **shed oldest**
+   datagrams (count them) and snap forward — bounds latency by construction.
+   The receiver re-clocks from the untouched PCR.
    *(Shipped: the cap is `max(4×setpoint, 1000)` ms — 1000 ms at the 60 ms default setpoint —
    and the shed fires on `dejitter.enabled` regardless of releaser, not just on the
    `clock_nanosleep` path.)*
@@ -93,7 +104,7 @@ its clock). *(Shipped: the residence-cap shed is **Lossless-only** — `dejitter
 | Knob | Default | Basis |
 |---|---|---|
 | setpoint (centre) | 60 ms of content | US10313276 (120 ms @ 50%) |
-| residence cap | 250 ms | ~2× setpoint, inside T-STD (≤0.7 s) + SRT RCVLATENCY headroom |
+| residence cap | 250 ms — **superseded**; shipped is `max(4×setpoint, 1000)` ms capped at 5000 ms | ~2× setpoint, inside T-STD (≤0.7 s) + SRT RCVLATENCY headroom. 250 ms sat only 50 ms above the servo's own 200 ms lookahead, so it shed datagrams the pacer was legitimately holding |
 | rate authority | ±5 % | converges <1 s; receiver T-STD absorbs the induced PCR_OJ |
 Setpoint in datagrams computed live from `observed_rate_bps` (~34 dgms @6 Mbps). The deep
 8192-slot wire channel **stays** as the transient burst reservoir; the servo holds occupancy far

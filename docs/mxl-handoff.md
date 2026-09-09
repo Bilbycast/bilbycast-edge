@@ -11,13 +11,16 @@
 > the broadcast channel via `drain_until_cancel` and emits
 > `mxl_audio_decode_pending`). The **audio codec bridge is the
 > remaining gap** — the audio-in / audio-out steps in Part 2 below are
-> the live work; the V210 / video steps are done. Kept for reference.
+> the live work; the V210 / video steps are done. The **release-matrix
+> deferral in Part 2 is also spent**: `mxl mxl-not-built` joined the
+> matrix on 2026-05-25, a week after this doc was written and without
+> waiting for the gates, and all three artefacts carry it today
+> (`.github/workflows/nightly-release.yml:108/114/142`). Kept for reference.
 
 Self-contained operator setup + next-session prompt for finishing the MXL
 (Media eXchange Layer) integration. Generated 2026-05-18 at the end of
 the scaffolding session; current state is documented in
-`bilbycast-edge/docs/mxl-integration-plan.md` and in the user's memory
-file `project_mxl_integration_deferred.md`.
+`bilbycast-edge/docs/mxl-integration-plan.md`.
 
 ## Part 1 — Operator setup (do this before the AI session)
 
@@ -128,8 +131,8 @@ Paste everything below into a new Claude Code session in
 `~/Development/bilbycast/`:
 
 > Pick up the MXL (Media eXchange Layer) integration where the previous
-> session left off. Memory file `project_mxl_integration_deferred.md` has
-> the full current state — read it first.
+> session left off. `bilbycast-edge/docs/mxl-integration-plan.md` has the
+> full current state — read it first.
 >
 > **Current state:** all 6 milestones shipped scaffolding-clean; ANC
 > pass-through works end-to-end. The four codec-conversion bridges are
@@ -219,7 +222,7 @@ Paste everything below into a new Claude Code session in
 >
 > **Don't do** in this session: actual broadcast-quality gate execution
 > (needs hardware + a real receiver, separate workstream), manager UI
-> gating (separate repo), release-matrix `mxl` entry (waits for gates).
+> gating (separate repo).
 >
 > **Stop and ask if:** `AV_PIX_FMT_V210` turns out to need substantial
 > work in `bilbycast-ffmpeg-video-rs`, or libmxl's flow_def JSON shape

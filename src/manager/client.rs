@@ -5387,7 +5387,8 @@ async fn execute_command(
             }
         }
         #[cfg(feature = "replay")]
-        "cue_clip" | "play_clip" | "stop_playback" | "scrub_playback" => {
+        "cue_clip" | "play_clip" | "stop_playback" | "scrub_playback" | "set_speed"
+        | "step_frame" => {
             let flow_id = action["flow_id"].as_str()
                 .ok_or_else(|| CommandError::new(format!(
                     "{action_type}: missing 'flow_id'"

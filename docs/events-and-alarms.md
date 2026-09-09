@@ -36,7 +36,15 @@ Events are sent as WebSocket messages with type `"event"`:
 | `category` | string | yes | Event category (see tables below) |
 | `message` | string | yes | Human-readable description |
 | `flow_id` | string | no | Associated flow or tunnel ID |
+| `input_id` | string | no | Associated input ID |
+| `output_id` | string | no | Associated output ID |
 | `details` | object | no | Structured context (error codes, peer addresses, etc.) |
+
+Input- and output-scoped events (`emit_input` / `emit_output` /
+`emit_input_with_details` / `emit_output_with_details`, and bind failures
+raised with `BindScope::input`) set only `input_id` or `output_id` and leave
+`flow_id` **unset**, so an alarm rule keyed solely on `flow_id` will not
+attribute them.
 
 ### Deduplication
 
@@ -48,7 +56,19 @@ SRT caller-mode inputs additionally latch a Critical `SRT input connection faile
 
 ### Buffering
 
-Events are queued in an unbounded in-memory channel. When the edge is not connected to the manager (e.g., during reconnection), events accumulate and are delivered once the connection is re-established.
+Events are queued in a **bounded** in-memory channel — 4096 entries
+(`EVENT_CHANNEL_CAPACITY` in [`src/manager/events.rs`](../src/manager/events.rs)).
+The receiver is drained only while the manager WebSocket session is up, so
+while the edge is disconnected (e.g., during reconnection) events accumulate
+and the first 4096 of them flush on the next successful auth. Past that the
+queue is full and `EventSender::send` tail-drops: the **newest** event is
+discarded and the queued backlog is kept, so a long outage or an error storm
+loses the *end* of the record, not the beginning. No manager-visible event is
+raised about the loss — the only trace is a node-local `tracing::warn!`
+sampled to at most once per second, carrying the interval and cumulative drop
+counts. The structured-JSON log shipper is fanned out to **before** the
+`try_send`, so a SIEM/NMS pickup still captures events the manager channel
+drops.
 
 ---
 
@@ -71,17 +91,27 @@ events are raised before the manager WebSocket connects and flush from the
 queue on the first successful auth. Source of truth for the two lists:
 [`src/config/env_compat.rs`](../src/config/env_compat.rs).
 
-Currently reported as **deprecated**: `BILBYCAST_INGRESS_RESIDENCE_MS` →
-`tuning.ingress_residence_ms` (or the per-input field),
-`BILBYCAST_PROBE_SESSION_LIMITS` → `tuning.probe_session_limits`,
-`BILBYCAST_PROBE_4K` → `tuning.probe_4k`. As **removed**:
-`BILBYCAST_ENABLE_SO_TXTIME` (collapsed onto `BILBYCAST_ENABLE_TXTIME`),
-`BILBYCAST_EGRESS_PACING` / `_BUFFER_MS` / `_RESIDENCE_MS` (per-output
-config fields since 2026-06), `BILBYCAST_BOND_FWMARK_BASE` (never read by
-anything), and `BILBYCAST_INGRESS_BUFFER_MS`.
+Currently reported as **deprecated** (five entries, `DEPRECATED`):
+`BILBYCAST_INGRESS_RESIDENCE_MS` → `tuning.ingress_residence_ms` (or the
+per-input field), `BILBYCAST_PROBE_SESSION_LIMITS` →
+`tuning.probe_session_limits`, `BILBYCAST_PROBE_4K` → `tuning.probe_4k`,
+`BILBYCAST_MEDIA_PLAYER_CONTROLLER` → `tuning.media_player_controller` (or the
+per-input `operator_control`), and `BILBYCAST_MEDIA_PLAYER_PCR_DEADLINES` →
+`tuning.media_player_pcr_deadlines` (or the per-input `pcr_deadlines`). As
+**removed** (eight entries, `REMOVED`): `BILBYCAST_ENABLE_SO_TXTIME`
+(collapsed onto `BILBYCAST_ENABLE_TXTIME`), `BILBYCAST_EGRESS_PACING` /
+`_BUFFER_MS` / `_RESIDENCE_MS` (per-output config fields since 2026-06),
+`BILBYCAST_BOND_FWMARK_BASE` (never read by anything),
+`BILBYCAST_TESTBED_TRACE_EVENTS` (the trace has its own tracing target, so
+`RUST_LOG=info,bilbycast_edge::testbed_events=debug` selects it),
+`BILBYCAST_MEDIA_PLAYER_INCREMENTAL_MP4` (→ nothing: the bounded incremental
+MP4 reader is unconditional in release builds, and the whole-file demux this
+selected survives under `cfg(debug_assertions)` only, because its
+resident-memory cost is the OOM the bounded reader fixed), and
+`BILBYCAST_INGRESS_BUFFER_MS`.
 
-That last one is not a relocation. It is reported as removed because it never
-had any effect in **any** release — the node-wide setpoint it carried was
+`BILBYCAST_INGRESS_BUFFER_MS` is not a relocation. It is reported as removed
+because it never had any effect in **any** release — the node-wide setpoint it carried was
 consulted only after the per-input setpoint had already answered, so no value
 it held could change behaviour. `tuning.ingress_dejitter_ms` is the field that
 works; reviving the variable as a fallback would have started adding ingress
@@ -125,6 +155,22 @@ latency to every UDP/RTP input on a host whose unit file still pins it.
 > Note: the R5 `master_clock_input_removed` event above rides the **`flow`**
 > category. The PLL fallback / recovery events below use a separate
 > **`master_clock`** category.
+
+### Flow groups (`flow_group`)
+
+Start / stop of a whole flow group, distinct from the per-member `flow`
+lifecycle events each member also emits. All three are message-only — no
+`details`, therefore no `error_code`.
+
+| Severity | Message | Trigger |
+|----------|---------|---------|
+| critical | Flow group '{group_id}' start rolled back: member '{id}' failed: {error} | One member failed to start, so every member already started was destroyed again. The group-start command then fails. |
+| info | Flow group '{group_id}' started ({n} members) | Every member came up. |
+| info | Flow group '{group_id}' stopped ({n} members; {m} failures) | Group stop finished. Best-effort: an individual member's stop failure is counted here and logged, it does not abort the remaining stops. |
+
+**Source**: `src/engine/manager.rs` (`start_flow_group`, `stop_flow_group`).
+
+---
 
 ### SDI (`sdi`, `sdi-decklink` feature)
 
@@ -430,6 +476,33 @@ The disconnect event fires **once per connection cycle** — if the RTSP server 
 
 ---
 
+### CMAF / CMAF-LL output (`cmaf`)
+
+Lifecycle + origin-upload events for the CMAF / LL-CMAF output. **None of
+these carries `details` at all** — every site uses `emit_flow`, whose body sets
+`details: None` — so `details.error_code` is empty for the whole category and
+an alarm rule must match on category `cmaf` plus the message text until the
+emitters move to `emit_flow_with_details`.
+
+| Severity | Message | Trigger |
+|----------|---------|---------|
+| info | CMAF output '{id}' started (segment={n}s, manifests={list}) | Output task came up. |
+| critical | CMAF output '{id}' error: {error} | The output task exited with an error. |
+| critical | CMAF output '{id}': CENC init failed: {error} | The `cenc` block was configured but the encryption runtime would not initialise. The output keeps running **unencrypted** — this event is the only signal. |
+| warning | CMAF output '{id}': segment upload failed: {error} | HTTP PUT of a completed segment to the origin failed. |
+| warning | CMAF output '{id}': init upload failed: {error} | `init.mp4` PUT failed. **Latched** by `init_upload_failing` — one event per failing episode, not one per frame, because init is re-pushed continuously while the origin is unreachable. |
+| warning | CMAF output '{id}': LL PUT failed: {error} | The low-latency chunked PUT returned an error on the segment's final response. |
+| warning | CMAF output '{id}': LL chunk enqueue full (seg {n}) — aborting | The LL chunk queue to the origin filled. The in-flight segment is aborted and its samples discarded; the output waits for the next IDR to open a fresh one. |
+| warning | CMAF output '{id}': LL mpd upload failed: {error} | Low-latency DASH manifest PUT failed. |
+| warning | CMAF output '{id}': LL m3u8 upload failed: {error} | Low-latency HLS playlist PUT failed. |
+| warning | CMAF output '{id}': m3u8 upload failed: {error} | Non-LL `manifest.m3u8` PUT failed. |
+| warning | CMAF output '{id}': mpd upload failed: {error} | Non-LL `manifest.mpd` PUT failed. |
+| warning | CMAF output '{id}': thumbnail capture failed ({error}); the scrub preview will be missing | The filmstrip/scrub thumbnail capture rejected the stream (e.g. no video). **Latched once per output** — a stream with no video yields nothing on every tick. |
+
+**Source**: `src/engine/cmaf/mod.rs`, `src/engine/cmaf/thumbnails.rs`.
+
+---
+
 ### WebRTC (`webrtc`)
 
 | Severity | Message | Trigger |
@@ -515,6 +588,9 @@ Critical events emitted by `build_assembly_plan()` at flow bring-up and by `Flow
 | `pid_bus_pid_cap_reached` | Warning, latched once per demuxer. Runtime: an input reached the elementary-stream PID cap — **256 distinct PIDs**, of which at most **32** may never have been announced by a PMT. The named PID and every further new PID are dropped, so an assembled program can go partly black. Normally means the stream is not 188-byte-aligned MPEG-TS: a 204-byte (Reed-Solomon) capture read with a 188-byte stride puts the sync byte at a sliding offset and manufactures hundreds of bogus PIDs (`BTS204.ts` in the media library yields 658). The refusal is not negatively cached, so a PID refused during the pre-PMT window is re-evaluated on its next packet. | `{ error_code: "pid_bus_pid_cap_reached", input_id, first_refused_pid, distinct_pids, undeclared_pids, max_pids, max_undeclared_pids }` | Check the source really is 188-byte TS. The widest real capture in the repo's corpus (a full DVB-S transponder) carries 133 distinct PIDs and typical MPTS run 22–48, so a breach is almost always misalignment rather than legitimate width. |
 | `pid_bus_slot_recovered` | Info. Runtime: first ES packet forwarded on a slot after a `pid_bus_slot_stalled` latch — the pair brackets each outage so the manager event log shows outage duration without polling. Re-arms stall detection for the slot. | `{ error_code: "pid_bus_slot_recovered", flow_id, program_number, out_pid, input_id, source_pid }` | None — confirmation the slot's source resumed. |
 | `pid_bus_pcr_source_change_requires_restart` | Critical (rides `command_ack.error_code`). `UpdateFlowAssembly` hot-swap rejected because the **effective `pcr_source` input** differs from the running plan's. The master clock (PCR ingress sampler subscription, fallback-watcher pin, telemetry attribution) is resolved once at flow start and cannot re-key in place — accepting the swap would silently keep clocking the flow from the de-designated input. PID-only `pcr_source` changes on the same input hot-swap fine. | `{ error_code: "pid_bus_pcr_source_change_requires_restart", old_input_id, new_input_id }` | Re-issue the edit as a full `update_flow` (restart) — the manager's flow editor does this automatically; the Node Bus matrix surfaces the refusal. |
+| `pid_bus_master_clock_mismatch` | Critical. Two inputs feeding the **same program** resolve to different master clocks, so the program would carry two uncorrelated time bases. Refused at flow start (`finalize_spts_assembler`) and again on `replace_assembly`, both of which `bail!` after emitting — the flow does not start / the hot-swap does not apply. | `{ error_code, program_number, slot_out_pid, slot_input_id, slot_clock, reference_input_id, reference_clock }` | Put the offending inputs on one clock (the details name both sides), or split them into separate programs. |
+| `pid_bus_stream_type_mismatch` | Warning, **runtime**. The live source's codec disagrees with the `stream_type` the assembly slot declares; the assembler **corrects the outgoing PMT to the observed codec** and keeps forwarding. Distinct from `pid_bus_spts_stream_type_mismatch` above, which is the config-time check. | `{ error_code, program_number, out_pid, declared_stream_type, observed_stream_type, source_input_id, source_pid }` | Update the assembly config's `stream_type` to the observed value to clear the warning — the stream is already going out correct. |
+| `st2110_video_codec_mismatch` | Warning. The codec the incoming PMT declares for the video PID disagrees with the codec sniffed out of the elementary stream, once the sniff window is decisive; the output decodes with the **detected** codec and keeps running. **Category is `flow`, despite the name** — and it is output-scoped (`emit_output_with_details`), so it carries `output_id` and no `flow_id`. | `{ error_code, declared_codec, detected_codec }` | Fix the `stream_type` on the assembly / source PMT feeding this output — the declared codec comes from there, not from a field on the output. |
 | `splice_override_ignored` | Warning. A per-switch `splice_mode_override` arrived on a path that cannot honour it. Two reasons: `flow_not_assembled` — `activate_input` with an override on a **passthrough** flow (no PID-bus assembler; the default seamless cut was used); `bus_route_slot_retarget` — `update_flow_assembly` with `pes_aligned` on a **pinned-slot bus_route swap** (a Take translated by the manager, or a matrix Swap). Plan replacement is inherently a PMT-bump cut — old fan-in cancelled, new fan-in spawned, PMT v+1 + DI=1 — so `pes_aligned` has nothing to drive; PES-aligned splicing needs a Switch slot carrying both inputs as legs. `pmt_bump` overrides on this path are a no-op (it already IS the behaviour) and emit nothing. | `{ error_code: "splice_override_ignored", requested_mode, reason, new_input_id? }` | If you need glitch-free PES-aligned cuts between two specific inputs, author the slot as `SlotSource::Switch` with both inputs as legs (Node Bus matrix → slot inspector) instead of relying on Take's bus_route translation. |
 
 **Source:** `src/engine/flow.rs` (`build_assembly_plan`, `non_ts_spts_error_code`, `resolve_essence_slots`), `src/engine/ts_assembler.rs` (`run_assembler` — splice commit / timeout, 1 Hz stall scan — `pid_bus_slot_stalled` / `pid_bus_slot_recovered`, `slot_fanin` — `pid_bus_slot_source_closed`), `src/engine/ts_es_bus.rs` (`TsEsDemuxer::admit_pid` — `pid_bus_pid_cap_reached`), `src/engine/pes_splice.rs` (audio + video splice state machines, AAC sentinel, IDR-aware video boundary detector), `src/config/validation.rs` (`validate_slot_source`). The edge manager-WS client also lifts these codes onto `command_ack.error_code` for `UpdateFlowAssembly` so the manager UI can highlight the offending field without needing the event stream.
@@ -564,8 +640,12 @@ without parsing the human-readable message.
 |---|---|---|---|---|
 | `encoder_chroma_not_supported` | warn | ST 2110-20 ingress encoder open path detects that the operator-pinned HW backend (`hevc_vaapi`, `hevc_qsv`, `hevc_nvenc`, `h264_vaapi`, `h264_qsv`, `h264_nvenc`) doesn't support the requested `(chroma, bit_depth)` on this host's probe matrix. The flow keeps running on a SW fallback (`x265` for HEVC, `x264` for H.264). | `requested`, `backend`, `chroma`, `bit_depth`, `fallback` | This host's iGPU/driver lacks the matching VAAPI/QSV/NVENC entrypoint (e.g. Arrow Lake iHD has no `VAProfileHEVCMain422_10`). Use `hevc_auto` / `h264_auto` to let the resolver pick the cheapest supported backend, or pin to the SW backend explicitly to suppress the warn. Same error code is used by the manager-side preflight in `device-edge/src/validation.rs`. |
 | `video_encode_fps_mismatch` | warn | `engine::ts_video_replace::TsVideoReplacer` measures the source frame rate from DTS deltas and finds it disagrees with `video_encode.fps_num` / `fps_den` by more than 0.1 % (one-shot per encoder run). | `measured_fps`, `pinned_fps_num`, `pinned_fps_den`, `pinned_fps`, `drift_pct`, `bitrate_multiplier` | The encoder runs at the operator's pinned time_base while frames arrive at the source rate. This does **not** cause a proportional lipsync drift on this path — every source frame is still encoded and output PES PTS still carry the source clock — but the encoder is mistuned: actual bitrate runs `bitrate_multiplier` times the configured value, the default GOP (2 × pinned fps) spans the wrong duration instead of the intended 2 s, and the SPS VUI advertises the wrong rate. Common case: NTSC source (29.97 fps = 30000/1001) into a `25/1` pinned encoder. Either remove the pin (the encoder auto-locks to the measured source rate when unpinned) or set it to the source rate explicitly. `drift_pct` is retained as a published field name for out-of-tree alerting rules; an earlier version of this row read it as a lipsync drift, which it is not. |
+| `encoder_tune_not_supported` | warn | `video_encode.tune` names a tune the resolved backend does not accept (`sanitise_tune`). The tune is **dropped** — the encoder opens without it rather than failing `avcodec_open2` with `EINVAL`. | none beyond the message (the tune, the backend label and the accepted list are interpolated) | Your `tune` is a no-op on this backend. Either pick one the backend lists or leave it unset. |
+| `encoder_preset_not_supported` | warn | `video_encode.preset` names a preset the resolved backend does not accept (`sanitise_preset`). Unlike `tune`, the preset is **mapped to the nearest legal value** rather than dropped, again to avoid an `EINVAL` open failure. | none beyond the message (requested preset, backend label and substituted preset are interpolated) | The encoder is not running at the preset you configured — it is running at the substituted one, with the speed/quality trade-off that implies. |
+| `audio_source_pid_not_found` | warn | `audio_encode.source_audio_pid` pins a PID that is not in the PMT, so the replacer fell back to first-matching-codec audio. De-duplicated per distinct `(pinned, actual)` pair and re-armed when the pin reappears, so it recurs on a PMT-version bump where the pin is still missing. | `pinned_pid`, `actual_pid`, `actual_stream_type` | The stream being transcoded is **not** the one the operator pinned. On an MPTS or a multi-language SPTS that silently transcodes the wrong track. |
+| `video_source_pid_not_found` | warn | Same as above for `video_encode.source_video_pid` (`src/engine/ts_video_replace.rs`). | `pinned_pid`, `actual_pid`, `actual_stream_type` | Same consequence on the video side. |
 
-**Source**: `src/engine/st2110_video_io.rs` (chroma resolver), `src/engine/ts_video_replace.rs` (fps mismatch).
+**Source**: `src/engine/st2110_video_io.rs` (chroma resolver), `src/engine/ts_video_replace.rs` (fps mismatch, video PID pin), `src/engine/video_encode_util.rs` (tune / preset sanitisers), `src/engine/ts_audio_replace.rs` (audio PID pin).
 
 ---
 
@@ -599,12 +679,25 @@ Per-input/per-output `interface_binding` field (loose source-IP bind by default;
 
 | Severity | Error code | Trigger | Details |
 |----------|-----------|---------|---------|
-| critical | `interface_not_found` | `name` doesn't match any interface enumerated on the host at bind time. The error message lists available NIC names. | `{ name, available }` |
-| critical | `interface_binding_strict_denied` | `setsockopt(SO_BINDTODEVICE)` returned `EPERM`. Edge process lacks `CAP_NET_RAW` — install `packaging/strict-binding.conf` and restart. | `{ name }` |
-| warning | `interface_binding_legacy_addr_ignored` | Both `interface_binding` and a legacy `interface_addr` are set on the same struct. New field wins; legacy is ignored. Operator should pick one and remove the other. | `{ field }` |
+| critical | `interface_not_found` | `name` doesn't match any interface enumerated on the host at bind time. The error message lists available NIC names. Emitted from **one** site only — the RIST input path (`src/engine/input_rist.rs:101`) — not from every per-NIC bind site. | `{ error_code }` only — the NIC name and the available-NIC list are interpolated into the message, not into `details` |
+| — | `interface_binding_strict_denied` | **Never implemented.** No emitter exists: `apply_strict_binding` (`src/util/socket.rs`) takes no `EventSender` and returns the `EPERM` as an error with context, and the missing-`CAP_NET_RAW` case is rejected earlier still by `resolve_interface_binding`, which `bail!`s. The denial reaches the operator as a start-time error / `command_ack`, never as an event — so an alarm rule keyed on this string can never fire. | — |
+| — | `interface_binding_legacy_addr_ignored` | **Never implemented.** `validate_interface_binding` (`src/config/validation.rs`) only delegates to `validate_interface_name`; there is no `interface_addr` conflict check and no warning emitter anywhere, despite a stale comment in `src/util/socket.rs` claiming the validator warns. | — |
 | critical | `srt_strict_binding_unsupported` | `strict: true` requested on an SRT/RIST surface or SRT bonding endpoint. Phase 1 limitation — pending `SRTO_BINDTODEVICE` plumbing in `bilbycast-libsrt-rs` / librist. Use `strict: false` (loose source-IP binding) or pin via UDP-based protocols. | `{ where }` |
 
 **Source**: `src/util/socket.rs` (`resolve_interface_binding`, `apply_strict_binding`, `srt_local_addr_from_binding`), `src/config/validation.rs` (`validate_interface_binding`).
+
+---
+
+### Standby listeners (`standby`)
+
+| Severity | Message | Trigger |
+|----------|---------|---------|
+| warning | Standby listener for input '{id}' failed: {error} | A standby SRT/UDP/TCP listener ended in the `error` state. **Post-bind failures only** — a bind-time port conflict is already a Critical `port_conflict` / `bind_failed` event from the inner bind helper, so this is the belt-and-braces signal for everything after the socket came up (e.g. a `recv` failure). |
+
+Scoped with `emit_input`, so the event carries `input_id` and **no**
+`flow_id`. Message-only — no `details`, no `error_code`.
+
+**Source**: `src/engine/standby_listeners.rs`.
 
 ---
 
@@ -792,52 +885,95 @@ Requires `resource_limits` config block. When `critical_action` is `"gate_flows"
 
 Surface for the `upgrade_binary` lifecycle. Manager UI gates the per-node "Upgrade" button on the `"upgrade"` capability bit; older edges that predate this surface never see the controls.
 
+**Events** — the whole of what the `upgrade` category actually emits. Six
+lifecycle codes plus one code-less Warning. Five of the six are progress
+signals; the sixth, `upgrade_rolled_back`, is the one failure on the surface,
+and it comes from the boot watchdog after the fact. **No *staging* failure is
+emitted as an event**: the staging path turns every failure into an
+`UpgradeError` and the `upgrade_binary` WS arm maps it straight onto
+`command_ack.error_code` without touching the event sender — so a rollback is
+the only upgrade failure an event-driven alarm rule can ever see.
+
 | Severity | Error code | Trigger |
 |----------|------------|---------|
 | info | `upgrade_started` | Manager command accepted, staging begins. Carries `from_version`, `to_version`, `channel`, `arch`, `variant`. |
-| info | `upgrade_downloaded` | Manifest verified + tarball downloaded + SHA-256 matched. |
+| info | `upgrade_downloaded` | Manifest verified + tarball downloaded + SHA-256 matched. Carries `to_version`, `size_bytes`. |
 | info | `upgrade_staged` | Tarball extracted, symlink swapped. Edge is about to drain flows + exit for systemd respawn. |
-| info | `upgrade_completed` | New binary booted + authenticated to manager + healthy for `boot_health_window_secs`. Status flipped to `stable`. |
+| info | `upgrade_completed` | New binary booted + authenticated to manager + healthy for `boot_health_window_secs`. Status flipped to `stable`. Carries `healthy_seconds`. |
 | info | `upgrade_staged_manual` | `manual_only = true` — tarball is on disk under `versions/<v>/` but the symlink swap is deferred until a SIGUSR1. |
 | critical | `upgrade_rolled_back` | Boot watchdog reverted the symlink to `previous` after `max_boot_attempts` failed boots, **or** the new binary failed to authenticate within `boot_health_window_secs`. Carries `from_version`, `to_version`. |
-| critical | `upgrade_signature_invalid` | Sigstore bundle signature did not verify against the manifest bytes. |
-| critical | `upgrade_identity_not_allowed` | Bundle was signed but the cert's identity claims (issuer / repo / workflow / ref) do not match the compiled-in `ALLOWED_SIGNERS` allowlist. The actual identity claims are logged for forensic review. |
-| critical | `upgrade_rekor_invalid` | Rekor inclusion proof missing or malformed. |
-| warning | `upgrade_disabled` | Edge received `upgrade_binary` while `upgrades.enabled = false`. The command is rejected; this event is purely audit. |
-| warning | `upgrade_channel_not_allowed` | Edge received `upgrade_binary` for a channel not in `upgrades.allowed_channels`. |
-| warning | `upgrade_version_too_old` | Requested version is below `min_version` or further back than `rollback_grace`. |
-| warning | `upgrade_sequence_too_old` | Manifest's `sequence` is `≤` the last installed sequence — replay defence. |
-| warning | `upgrade_in_progress` | A second `upgrade_binary` arrived while the first was still staging. |
-| warning | `upgrade_url_invalid` | Manifest tarball URL host is not in the upgrade host whitelist (`github.com` + the `*.githubusercontent.com` release-asset CDN). |
-| warning | `upgrade_checksum_mismatch` | Downloaded tarball SHA-256 did not match the value in the verified manifest. |
-| warning | `upgrade_extract_failed` | Tarball extracted but the binary couldn't be located, hoisted, or made executable. |
-| warning | `upgrade_disk_full` | `ENOSPC` while extracting. |
-| warning | `upgrade_network_error` | Manifest, bundle, or tarball fetch failed after retries. |
-| warning | `upgrade_arch_mismatch` | Manifest carries no artefact for the host's `(arch, variant)` tuple. |
-| warning | `upgrade_version_invalid` | The requested version — or the edge's own current version — did not parse as valid semver. Rides on `command_ack.error_code`. |
-| warning | `upgrade_manifest_invalid` | The fetched `manifest.json` was not valid JSON, or failed the `(version, channel, "edge")` cross-check. Rides on `command_ack.error_code`. |
+| warning | *(none)* | `Manager requested cross-arch install: arch={arch}, host={host}` — the manager asked for an artefact whose arch is not the host's, and passed `target_arch` explicitly to say it meant it. Message-only: this event carries **no** `details` and therefore no `error_code`, so it is invisible to a code-keyed alarm rule. |
 
-**Details**: `{ error_code, from_version, to_version, channel, arch, variant, … }` (fields populated according to the lifecycle stage).
+**Details**: `{ error_code, from_version, to_version, channel, arch, variant, … }` (fields populated according to the lifecycle stage) — on the six coded rows only.
 
-**Source**: `src/upgrade/mod.rs::error_codes`, emitted by `src/upgrade/{mod,watchdog,verify,download,apply}.rs`. The full operator-facing trust model and runbook live in [`docs/upgrade.md`](upgrade.md).
+**`command_ack`-only error codes** — these are `UpgradeError` codes returned to
+the operator on the `command_ack` for `upgrade_binary`. **None of them is ever
+emitted as an event**, so a manager alarm rule keyed on one will never fire;
+they are visible on the command result and in the node's log, nowhere else.
+
+| Error code | Trigger |
+|------------|---------|
+| `upgrade_signature_invalid` | Sigstore bundle signature did not verify against the manifest bytes. |
+| `upgrade_identity_not_allowed` | Bundle was signed but the cert's identity claims (issuer / repo / workflow / ref) do not match the compiled-in `ALLOWED_SIGNERS` allowlist. The actual identity claims are logged for forensic review. |
+| `upgrade_rekor_invalid` | Rekor inclusion proof missing or malformed. |
+| `upgrade_disabled` | Edge received `upgrade_binary` while `upgrades.enabled = false`. The command is rejected. |
+| `upgrade_channel_not_allowed` | Edge received `upgrade_binary` for a channel not in `upgrades.allowed_channels`. |
+| `upgrade_version_too_old` | Requested version is below `min_version` or further back than `rollback_grace`. |
+| `upgrade_sequence_too_old` | Manifest's `sequence` is `≤` the last installed sequence — replay defence. |
+| `upgrade_in_progress` | A second `upgrade_binary` arrived while the first was still staging. |
+| `upgrade_url_invalid` | Manifest tarball URL host is not in the upgrade host whitelist (`github.com` + the `*.githubusercontent.com` release-asset CDN). |
+| `upgrade_checksum_mismatch` | Downloaded tarball SHA-256 did not match the value in the verified manifest. |
+| `upgrade_extract_failed` | Tarball extracted but the binary couldn't be located, hoisted, or made executable. |
+| `upgrade_disk_full` | `ENOSPC` while extracting. |
+| `upgrade_network_error` | Manifest, bundle, or tarball fetch failed after retries. |
+| `upgrade_arch_mismatch` | Manifest carries no artefact for the host's `(arch, variant)` tuple. |
+| `upgrade_version_invalid` | The requested version — or the edge's own current version — did not parse as valid semver. |
+| `upgrade_manifest_invalid` | The fetched `manifest.json` was not valid JSON, or failed the `(version, channel, "edge")` cross-check. |
+
+`error_codes::UPGRADE_VARIANT_MISMATCH` (`"upgrade_variant_mismatch"`) is
+declared in the same module and has **no producer at all** — nothing returns it
+and nothing emits it. Deliberately not tabulated above; either wire it or
+delete the const.
+
+**Source**: `src/upgrade/mod.rs::error_codes` for the strings; the events come
+from `src/upgrade/mod.rs` (started / downloaded / staged / staged_manual /
+cross-arch) and `src/upgrade/watchdog.rs` (rolled_back / completed) only —
+`verify.rs`, `download.rs` and `apply.rs` emit nothing. The full operator-facing
+trust model and runbook live in [`docs/upgrade.md`](upgrade.md).
 
 ### MXL (Media eXchange Layer) (`flow`)
 
 Lifecycle + format events for MXL inputs / outputs. Gated by the `mxl` Cargo feature (default off). The manager UI surfaces these events only when an edge advertises one of `mxl-video` / `mxl-audio` / `mxl-anc` on `HealthPayload.capabilities`. See [`docs/mxl-integration-plan.md`](mxl-integration-plan.md) for the integration plan and [`bilbycast-mxl-rs/CLAUDE.md`](../../bilbycast-mxl-rs/CLAUDE.md) for the build prereq footprint.
 
+**Every MXL code below is interpolated into the event *message*, not into
+`details`.** All of them are raised with the plain `event_sender.emit(…)` under
+category `flow` with no `details` payload at all, so `details.error_code` is
+empty for the whole MXL surface — an alarm rule keyed on `error_code` will
+never fire on one. Match on the message text (`(error_code: mxl_…)`), and note
+that `mxl_reader_opened` is the one code written **without** the `error_code:`
+prefix — its message reads `(mxl_reader_opened)`.
+
 | Severity | Error code | Trigger |
 |----------|------------|---------|
-| critical | `mxl_domain_unavailable` | Boot-time `MxlDomainManager::probe()` failed to locate or dlopen libmxl.so. Capability bits are not advertised; existing MXL flow configs refuse to start. |
-| critical | `mxl_ptp_required` | Flow validation: `master_clock = wallclock` was configured on a flow that references any MXL input or output. MXL is PTP-anchored at v1.0; wallclock would silently drift relative to upstream / downstream MXL pods. |
-| critical | `mxl_input_not_wired` | M2-pending stub fires when a flow with an MXL input starts on a build whose engine modules haven't been wired yet. Will be removed when M2 engine modules land. |
-| critical | `mxl_output_not_wired` | Same as `mxl_input_not_wired` but on the output side. M2/M3 engine modules land per essence. |
-| warning | `mxl_domain_not_tmpfs` | The configured `domain_path` is not on `tmpfs` or `ramfs` per `statfs(2)`. libmxl's perf model degrades sharply off tmpfs; recommend operator mount the path on tmpfs (the default for `/dev/shm`). |
-| warning | `mxl_format_unsupported` | Operator config specifies a format not yet supported by upstream MXL v1.0 (non-V210 video, non-Float32 audio, non-48 kHz sample rate). |
-| warning | `mxl_grain_drop` | An MXL output dropped grains because the broadcast subscriber lagged. Increments `OutputStats.packets_dropped`. |
+| critical | `mxl_domain_unavailable` | An MXL **input** spawns on a host whose boot libmxl probe found nothing (`engine::flow::spawn_mxl_unavailable`). The task emits and then parks on the input's cancel token. The **output** path returns the same string from `anyhow!` instead, so it reaches the operator as a `command_ack` error, not as an event. |
+| critical | `mxl_feature_disabled` | An MXL **input** is configured on a binary built without the `mxl` Cargo feature. Same shape as above: the output arm `bail!`s the same string onto `command_ack` rather than emitting. |
+| critical | `mxl_attach_failed` | `attach_instance` on the configured `domain_path` failed. Raised on every essence, input and output (`mxl_io.rs`, `mxl_video_io.rs`). |
+| critical | `mxl_reader_open_failed` | `create_flow_reader` (audio `SamplesReader` / ANC `GrainReader`) failed to open the MXL flow. |
+| info | `mxl_reader_opened` | Reader opened successfully. Written without the `error_code:` prefix. |
+| critical | `mxl_writer_open_failed` | `create_flow_writer` failed on an MXL output. |
+| critical | `mxl_writer_kind_mismatch` | The writer opened but would not convert to the essence's concrete writer (`to_samples_writer` / `to_grain_writer`) — the MXL flow on the bus is a different kind from the one configured. |
+| info | `mxl_writer_opened` | Writer opened successfully. Message carries `was_created=…`, i.e. whether this edge created the MXL flow or attached to an existing one. |
+| warning | `mxl_audio_no_encode_set` | An MXL audio **input** has no `audio_encode`. Float32 PCM samples are consumed and drained but not republished onto the broadcast channel; set `audio_encode` to bridge into a TS-carrying flow. Raised once at input start. |
+| warning | `mxl_audio_decode_pending` | An MXL audio **output** is scaffolded only — broadcast TS audio is consumed but not yet decoded to Float32 PCM onto the MXL bus. Raised once at output start. |
+| critical | `mxl_video_no_media_codecs` | An MXL video input or output on a binary built without `media-codecs`. The V210↔compressed bridge needs the codec layer. |
+| critical | `mxl_video_encode_config_failed` | The MXL video input's `video_encode` config was rejected before the encoder opened. |
+| critical | `mxl_video_encode_failed` | The encoder failed to open on the MXL video input's first frame; the reader loop breaks. |
 
-**Details**: `{ error_code, domain_path, flow_name, kind ("video" | "audio" | "anc"), … }`.
+**Details**: none — see the note above the table. The `domain_path` / flow name / essence are carried in the message prefix (`{ctx}`) instead.
 
-**Source**: M1 wired `mxl_domain_unavailable` from the boot probe path (`src/main.rs`); the per-flow events land alongside the M2/M3 engine modules in `src/engine/mxl_io.rs` and `src/engine/mxl_video_io.rs`. Until then, `mxl_input_not_wired` / `mxl_output_not_wired` are emitted from the flow dispatch stub in `src/engine/flow.rs::spawn_single_input` / `start_output`.
+**Source**: `src/engine/mxl_io.rs` (audio + ANC), `src/engine/mxl_video_io.rs` (video) and `src/engine/flow.rs::spawn_mxl_unavailable`. The boot probe in `src/main.rs` emits **nothing** — success and miss are both `tracing::info!` only; the probe's outcome becomes operator-visible when a flow tries to spawn an MXL input. The M1/M2/M3 milestone framing this section used to carry is stale: all six `input_mxl_*` / `output_mxl_*` modules plus `mxl_io.rs` and `mxl_video_io.rs` shipped, and `spawn_single_input` / `start_output` dispatch to them.
+
+Five codes this section listed historically — `mxl_ptp_required`, `mxl_input_not_wired`, `mxl_output_not_wired`, `mxl_format_unsupported` and `mxl_grain_drop` — were **never implemented**: no emitter, no `anyhow!`, nothing anywhere under `src/`. `mxl_domain_not_tmpfs` is the same, and worse: the tmpfs check exists (`engine::mxl::domain::is_tmpfs` at boot) but only logs, while a rustdoc on the config field still promises the Warning event. There is also no MXL `master_clock` / PTP rule in `src/config/validation.rs`, so nothing enforces what `mxl_ptp_required` described.
 
 ---
 
@@ -879,16 +1015,31 @@ These are generated server-side in `bilbycast-manager/crates/manager-server/src/
 | `rist` | 4 | RIST Simple Profile connection lifecycle |
 | `bond` | 14 | Bonded input/output — per-path alive/dead, bond-aggregate degraded/down/recovered, session reset (`bond_session_reset`), socket rebuild (`bond_path_rebuilt`), interface lost (`bond_interface_lost`), MTU-budget exceedance (`bond_payload_exceeds_mtu`), gateway route lost (`bond_gateway_route_lost`), leg reconnecting (`bond_leg_reconnecting`), per-leg diagnosis (`bond_leg_diagnosis`), protocol-version mismatch (`bond_protocol_version_mismatch`), ingress-dejitter ignored (`bond_ingress_dejitter_ignored`). **Note:** the shared-leg broker's `bond_leg_oversubscribed` / `_cleared` + `bond_leg_admission_pressure` ride category `bonding`, and `bond_legs_unencrypted` rides category `media` — see the Bonding section |
 | `ptp` | — | SMPTE ST 2110 PTP slave clock state changes (Phase 1) |
-| `network_leg` | — | SMPTE 2022-7 Red/Blue per-leg loss / recovery (Phase 1) |
+| `network_leg` | 4 | SMPTE 2022-7 Red/Blue leg-up + active-leg switch. Leg **loss / recovery** is not here — it rides `redundancy` |
 | `nmos` | — | NMOS IS-04 / IS-05 / IS-08 controller activity (Phase 1) |
 | `nmos_registry` | 4 | IS-04 registration client lifecycle (registered, heartbeat lost, registration failed, registry unreachable) |
 | `scte104` | — | SCTE-104 splice events parsed from ST 2110-40 ANC (Phase 1) |
 | `sdi` | 28 | Native SDI (DeckLink) capture **and** playout lifecycle — signal lost/restored, raster or chroma the mode cannot carry, device open refused / lost, a card that stops draining scheduled frames, audio that stops scheduling. `sdi-decklink` feature. See the [SDI section](#sdi-sdi-sdi-decklink-feature) |
+| `cmaf` | 12 | CMAF / CMAF-LL output lifecycle + origin upload failures + CENC init + scrub-thumbnail capture. See the [CMAF section](#cmaf--cmaf-ll-output-cmaf) |
+| `media` | 10 | Bonded input/output spawn + socket-rebuild failures (Critical), bond start/stop (Info) and the unencrypted-legs warning (`bond_legs_unencrypted`) — `src/engine/{input,output}_bonded.rs`. Kept distinct from `bond`, which carries the per-path telemetry; see the Bonding section |
+| `flow_group` | 3 | Flow-group start rollback / started / stopped. See the [Flow groups section](#flow-groups-flow_group) |
+| `standby` | 1 | Standby listener post-bind failure. See the [Standby listeners section](#standby-listeners-standby) |
+| `port_conflict` | — | EADDRINUSE at a runtime bind site, or an internal collision between two configured entities. See [Unified bind-failure events](#unified-bind-failure-events-port_conflict--bind_failed) |
+| `bind_failed` | — | Every other bind failure (permission denied, no such device, multicast group rejected). Same section as `port_conflict` |
+| `display` | — | Local-display (HDMI / DisplayPort + ALSA) output lifecycle and runtime health. See [Display-output events](#display-output-events-display) |
+| `replay` | — | Replay-server recording + playback lifecycle, disk pressure, crash recovery, filmstrip. See [Replay-server events](#replay-server-events) |
+| `upgrade` | 7 | Remote binary upgrade lifecycle. See the [Remote upgrade section](#remote-upgrade-upgrade) — the failure codes there are `command_ack`-only, not events |
+| `cellular` | — | Cellular uplink telemetry (modem / RutOS). See [Cellular uplink events](#cellular-uplink-events-cellular) |
+| `starlink` | — | Starlink dish telemetry. See [Starlink dish events](#starlink-dish-events-starlink) |
 | **Total** | **113** | |
 
-**The numbers in the Count column are not audited.** They are hand-maintained,
-they have drifted, and the column does not sum to the **Total** row. `flow` is
-the clearest case and is why it now reads *unaudited*: its emitters are a mix of
+**The numbers in the Count column are not audited, and the row list has drifted
+too.** `src/manager/events.rs::category` declares 36 constants; this table long
+carried 25 rows, and the eleven at the bottom were added back by hand — so
+treat it as a directory, not as a generated index. The numbers are
+hand-maintained, they have drifted, and the column does not sum to the
+**Total** row. `flow` is the clearest case and is why it now reads
+*unaudited*: its emitters are a mix of
 structured `error_code` events and message-only lifecycle events, so "how many
 `flow` events exist" has no single answer until somebody counts `category::FLOW`
 across the tree. Read the Description column as the authoritative part of each
@@ -905,9 +1056,9 @@ mapping:
 
 | Category | Typical severity | Triggers |
 |----------|------------------|----------|
-| `ptp` | info / warning / critical | Lock state (each carries `details.lock_state` = `acquiring` / `locked` / `holdover` / `master` / `unavailable`): `ptp_acquiring` (running but not yet locked — e.g. slave-only with the grandmaster off), `ptp_lock_acquired`, `ptp_lock_lost`, `ptp_holdover`, `ptp_unavailable`. Clock-quality monitoring (from the node-level PTP monitor, `details.error_code`): `ptp_offset_high` / `ptp_offset_recovered` (absolute offset crossed the operator's `offset_warn_ns`, 80 % hysteresis), `ptp_path_delay_high` / `ptp_path_delay_recovered` (mean path delay crossed `path_delay_warn_ns`), `ptp_grandmaster_changed` (`details.grandmaster_id` / `previous_grandmaster_id`). Thresholds are off by default; the continuous offset/path-delay trend is on the edge's Prometheus `/metrics` (`bilbycast_edge_ptp_*`) |
-| `network_leg` | warning / critical | `red_leg_lost`, `blue_leg_lost`, `leg_recovered`, `both_legs_lost` |
-| `nmos` | info | NMOS controller IS-05 activations, IS-08 channel-map changes |
+| `ptp` | info / warning / critical | Lock state — **message-only, no `error_code`**: filter on `details.lock_state`, which takes six values, not five: `acquiring` (Info), `locked` (Info), `holdover` (Warning), `master` (Warning — this node is the grandmaster), `unknown` (Warning — the reporter returned a state we don't model) and `unavailable`, whose severity is state-dependent: **Info** on first sight (ptp4l simply isn't running yet) but **Critical** when the previous state was `locked` or `holdover`. Details also carry `domain`, `offset_ns`, `mean_path_delay_ns`, `grandmaster_id`. There are no `ptp_acquiring` / `ptp_lock_acquired` / `ptp_lock_lost` / `ptp_holdover` / `ptp_unavailable` identifiers — those never existed in code and an alarm rule keyed on one can never fire. Clock-quality monitoring (from the node-level PTP monitor) is the half that *does* carry `details.error_code`: `ptp_offset_high` / `ptp_offset_recovered` (absolute offset crossed the operator's `offset_warn_ns`, 80 % hysteresis), `ptp_path_delay_high` / `ptp_path_delay_recovered` (mean path delay crossed `path_delay_warn_ns`), `ptp_grandmaster_changed` (`details.grandmaster_id` / `previous_grandmaster_id`). Thresholds are off by default; the continuous offset/path-delay trend is on the edge's Prometheus `/metrics` (`bilbycast_edge_ptp_*`) |
+| `network_leg` | info / warning | **Message-only, no `error_code`** — details are `{ leg, dual_leg }` only, so filter by category or message text. Four messages, all from `RedBluePair` (`src/engine/st2110/redblue.rs`): `Red leg up (first packet received)` / `Blue leg up (first packet received)` (Info, once per leg) and `2022-7 active leg switched to Red` / `…to Blue` (Warning, on every merge-order flip). `dual_leg` is what separates a real 2022-7 switch from a single-leg input. **Leg loss and recovery are not on this category** — they alarm under `redundancy` as `redundancy_leg_dropped` (Warning), `redundancy_both_legs_down` (Critical) and `redundancy_leg_recovered` (Info), emitted by `emit_leg_health_event` in `src/engine/input_rtp.rs` from the buffered hitless merger, and those *do* carry a structured `details.error_code`. Of the `red_leg_lost` / `blue_leg_lost` / `leg_recovered` / `both_legs_lost` names this row used to list, three appear nowhere under `src/` at all; only `leg_recovered` survives, and only inside comments (`src/redundancy/merger.rs`, `src/engine/input_rtp.rs`) that predate the `redundancy_`-prefixed codes above. |
+| `nmos` | info / warning | NMOS controller IS-05 activations, IS-08 channel-map changes. One coded failure: **`invalid_transport_params`** (Warning) — an IS-05 sender/receiver activation was refused and answered HTTP 400. Flow-scoped, details `{ subsystem: "is-05", action, error_code, resource_id, entity_id, error }` (`src/api/nmos_is05.rs`) |
 | `scte104` | info | Cue-out / cue-in / cancel splice messages parsed from ANC |
 
 ### By Severity
@@ -1000,7 +1151,7 @@ also set `details.error_code` for `command_ack` correlation.
 | `replay_event` | Severity | When it fires | Stable `error_code` |
 |---|---|---|---|
 | `recording_started` | Info | A flow with `recording.enabled = true` brought up its writer | — |
-| `recording_stopped` | Info | A `stop_recording` command was acked | — |
+| `recording_stopped` | — | **Never implemented.** The `stop_recording` handler in `src/manager/client.rs` returns an empty ack and emits nothing, and there is no writer-side emitter either. A stop is visible only as the absence of further recording activity — no `replay_event` string of this name exists anywhere under `src/`. | — |
 | `recording_start_failed` | Critical | The writer task failed to start (storage unavailable, permission denied) | `replay_disk_full` |
 | `clip_created` | Info | A `mark_out` materialised a new clip into `clips.json` (with fsync). `details.clip` carries the full `ClipInfo`. | — |
 | `clip_deleted` | Info | A `delete_clip` succeeded | — |
@@ -1014,6 +1165,8 @@ also set `details.error_code` for `command_ack` correlation.
 | `recovery_alert` | Warning | Edge restarted after a crash; `.tmp/` orphan segments were unlinked and / or `recording.json` was corrupt. Resume continues from the largest segment id on disk + 1. `details.tmp_orphans_removed`, `details.meta_corrupt`, `details.next_segment_id`. | `replay_recovery_alert` |
 | `metadata_stale` | Warning | `recording.json` write failed on segment roll. Recovery scan on next start derives the resume id from the directory listing. | `replay_metadata_stale` |
 | `max_bytes_below_segment` | Warning | Retention can't satisfy `max_bytes` without unlinking the live edge — the operator's cap is smaller than one segment. | `replay_max_bytes_below_segment` |
+| `filmstrip_setup_failed` | Warning | The filmstrip writer for a recording could not create its `thumbs/.tmp` staging directory; the filmstrip is abandoned for that recording (the recording itself continues). `details.recording_id`. | `replay_filmstrip_setup_failed` |
+| `filmstrip_decode_failed` | Warning | The filmstrip writer's decoder rejected the buffered TS (e.g. an audio-only flow that will never yield a video frame). `details.detail` carries the decoder's reason. Rate-limited to one event per 60 s (`DECODE_FAIL_EVENT_INTERVAL`) while the decoder keeps failing, so a cadence tick can't spam the feed. | `replay_filmstrip_decode_failed` |
 
 Stable `command_ack.error_code` values surfaced by the replay-server WS
 actions (`start_recording`, `mark_in`, `mark_out`, `cue_clip`,
@@ -1027,13 +1180,13 @@ actions (`start_recording`, `mark_in`, `mark_out`, `cue_clip`,
 | `replay_writer_lagged` | The recording writer dropped packets — see the matching Critical event |
 | `replay_disk_pressure` | Recording disk usage at 80 %+ — see the matching Warning event. Operators should free disk before the recorder trips ENOSPC |
 | `replay_disk_full` | The recording writer could not write a segment — typically EOSPC |
-| `replay_index_corrupt` | `index.bin` failed CRC / size validation on startup; the writer surfaces this as a Warning + rebuild |
-| `replay_invalid_segment_seconds` / `replay_invalid_recording_id` / `replay_storage_id_invalid` | Validation rejection at config save / `update_flow` time |
+| `replay_storage_id_invalid` | The `delete_recording` handler's `recording_id` was rejected (empty, > 64 chars, or a character outside `[A-Za-z0-9_-]`), or the directory unlink itself failed. Emitted from exactly one site, `src/manager/client.rs` — **not** at config save / `update_flow` time, as this row claimed. (Two codes this row used to name alongside it — `replay_invalid_segment_seconds` and `replay_invalid_recording_id` — have no producer anywhere under `src/` and were removed; so was `replay_index_corrupt`, which described an `index.bin` CRC / size check that does not exist. The only crash-recovery signal that ships is `replay_recovery_alert` below.) |
 | `replay_invalid_field` | `mark_out` / `rename_clip` / `update_clip` `name` exceeded 256 chars / contained control characters, or `description` exceeded 4096 chars |
 | `replay_invalid_range` | `play_clip` / `scrub_playback` was given a `to_pts_90khz` < `from_pts_90khz` (or below the clip's `in_pts`); `update_clip` was given a prospective `in_pts_90khz` / `out_pts_90khz` that would invert the clip range |
 | `replay_invalid_tag` | Phase 2 / 1.5 — `update_clip` (or any tag-bearing path) carried a tag that failed `[A-Z0-9_-]{1,32}`, or > 16 tags per clip |
 | `replay_clip_update_failed` | `update_clip` produced no result (clip vanished mid-update or persistence failed for an unclassified reason) |
 | `replay_recovery_alert` | Crash-recovery scan ran on writer init — see matching Warning event |
+| `replay_filmstrip_setup_failed` / `replay_filmstrip_decode_failed` | The filmstrip writer could not create its staging directory, or its decoder rejected the buffered TS — see the matching Warning events above. Both carry a real structured `details.error_code` |
 | `replay_metadata_stale` | `recording.json` write failed; resume id is derived from disk on restart |
 | `replay_max_bytes_below_segment` | `max_bytes` smaller than one segment — retention can't keep usage under the cap without deleting the live edge |
 | `replay_recording_active` | `delete_recording` was sent for a recording that the writer is currently appending to — operator must `stop_recording` first |
@@ -1105,8 +1258,8 @@ Operator-driven `command_ack.error_code` values (lifted from
 | `display_device_invalid` | `device` regex failed at config-load OR connector not present in `enumerate_displays()` at runtime OR build was compiled without the `display` Cargo feature / for a non-Linux target |
 | `display_audio_device_invalid` | `audio_device` regex failed OR ALSA refused to open it |
 | `display_resolution_unsupported` | Configured `resolution` / `refresh_hz` does not match any mode the connector advertises |
-| `display_program_not_found` | After 5 s, the demuxer hasn't seen the configured `program_number` in the PAT |
-| `display_audio_track_not_found` | Configured `audio_track_index` exceeds the PMT's audio-stream count |
+| `display_program_not_found` | **Never implemented.** No emitter exists in `engine::output_display`: `config.program_number` is handed straight to `TsDemuxer::with_audio_track` with no not-found branch and no PAT-watch timer. A rule keyed on this string can never fire |
+| `display_audio_track_not_found` | **Never implemented.** Same shape — `config.audio_track_index` reaches `TsDemuxer::with_audio_track` unchecked; nothing counts the PMT's audio streams or reports an out-of-range index |
 | `display_device_busy` | Reserved for future use. The previous "static-config rejection on duplicate `(device, audio_device)`" semantics no longer apply: the validator now logs a `warn!` and allows duplicates so the runtime `DisplayClaimRegistry` can serialise them via take-over. Runtime contention emits `display_output_waiting` / `display_output_acquired` instead |
 | `display_decoder_overload_predicted` | Validation-time warning when 4K60 is requested without HW decode — does NOT block save; surfaced as a hint in the manager UI |
 

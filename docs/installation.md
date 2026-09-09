@@ -18,7 +18,13 @@ curl -fsSL https://github.com/Bilbycast/bilbycast-edge/releases/latest/download/
 Optional flags: `--channel stable|nightly|beta`,
 `--output-nics <nic1,nic2>` (enable SO_TXTIME wire pacing), `--upgrade-installer`
 (refresh the script + service unit without touching config or installed
-binaries).
+binaries), `--accept-self-signed` (see [Manager with a self-signed / untrusted
+TLS cert](#manager-with-a-self-signed--untrusted-tls-cert)), and
+`--variant default|full` (defaults to `full`). Note that `--variant` accepts
+**only** those two names, and `--variant default` currently fails outright —
+no `default` artefact is published, so the manifest lookup finds nothing. There
+is no `--variant rockchip`; see [ARM Rockchip
+SBCs](#arm-rockchip-sbcs-rk3568--rk3588--rkmpp-hardware-encode).
 
 ### What the installer does for you
 
@@ -406,12 +412,20 @@ on-chip VPU reachable through the Rockchip **Media Process Platform (MPP)**.
 Building with `--features video-encoder-rkmpp` adds the `h264_rkmpp` /
 `hevc_rkmpp` FFmpeg encoders (both **8-bit 4:2:0 only**).
 
-**Prefer the prebuilt binary.** The release matrix publishes a dedicated
-`bilbycast-edge-aarch64-linux-rockchip.tar.gz` artefact with rkmpp already
-compiled in (plus x264 / x265 CPU fallback for 10-bit / 4:2:2). On a stock
-Rockchip BSP you can install that directly instead of building, and the
-manager's remote-upgrade path auto-selects it for nodes running the Rockchip
-variant. Build from source only when you need a custom feature set.
+**Prefer the prebuilt binary — but install it by hand.** The release matrix
+publishes a dedicated `bilbycast-edge-aarch64-linux-rockchip.tar.gz` artefact
+with rkmpp already compiled in (plus x264 / x265 CPU fallback for 10-bit /
+4:2:2, and the RGA transfer path). **`install-edge.sh` cannot fetch it**: its
+`--variant` whitelist accepts only `default | full`, it detects nothing about
+Rockchip, and it defaults to `full` — so a curl-pipe-bash install on an
+RK3568/RK3588 board lands the generic `aarch64-linux-full` binary, with no
+RKMPP and no RGA. Nothing warns you — the only trace is the `Variant : full`
+line and the `aarch64-linux-full` tarball name in the download log. Fetch the
+`-rockchip` tarball and lay it out yourself ([Manual install](#manual-install)).
+Once the node *is* running the rkmpp build, remote upgrade does the right
+thing on its own — the binary reports variant `rockchip`
+(`src/upgrade/mod.rs::default_variant`) and the manager selects the matching
+artefact. Build from source only when you need a custom feature set.
 
 **Building from source.** rkmpp links `librockchip_mpp` (>= 1.3.8) via
 pkg-config. The build needs that userspace dev package present, but **not** the
@@ -449,7 +463,7 @@ world-writable and the user correctly in `video`: `avcodec_open2` fails with
 `Failed to initialize MPP context (-1)`. The unit installed by `install-edge.sh`
 already includes `DeviceAllow=/dev/mpp_service rwm` (the path form — `mpp_service`
 has its own dedicated major so the `char-mpp_service` class form also resolves,
-but the path form is used for consistency with the RGA line below it, which
+but the path form is used for consistency with the unit's `/dev/rga` rule, which
 *requires* the path form since RGA is a `misc`-class device shared with many
 unrelated drivers). If you're running a custom unit or one built before this
 was added, add:
@@ -459,6 +473,22 @@ DeviceAllow=/dev/mpp_service rwm
 ```
 
 then `sudo systemctl daemon-reload && sudo systemctl restart bilbycast-edge`.
+
+**`/dev/rga` needs the same treatment.** The `*-aarch64-linux-rockchip`
+artefact also carries `rga-transfer` — the hardware DRM_PRIME→sysmem copy on
+the local-display path (see the feature-flag rundown in
+[`supported-protocols.md`](supported-protocols.md)). It opens `/dev/rga` at
+runtime. The packaged unit already carries `DeviceAllow=/dev/rga rwm`, and
+here the path form is not a style choice: RGA is a `misc`-class device, and
+`DeviceAllow=char-rga rwm` was confirmed on an RK3588 board to leave
+`/dev/rga` open()s failing `EPERM` while systemd accepted the directive
+without complaint. A custom or pre-existing unit that omits the rule loses
+the acceleration silently — the display path falls back to FFmpeg's CPU
+`mmap`+`memcpy`:
+
+```ini
+DeviceAllow=/dev/rga rwm
+```
 
 **Headless hardening — mask sleep targets on BSP desktop images.** The
 FriendlyELEC / vendor Ubuntu BSP images ship a full GNOME desktop whose

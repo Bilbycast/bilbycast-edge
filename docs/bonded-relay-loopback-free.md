@@ -40,29 +40,30 @@ sockets, so we can't inject an in-process sink — see the conversation rational
 ## Seam (code-grounded, from the datapath map)
 
 ### bilbycast-bonding / bonding-transport
-- `src/config.rs:161` — add `PathTransport::Attached { primary_peer: SocketAddr }`.
+- `src/config.rs` — add `PathTransport::Attached { primary_peer: SocketAddr }`.
   Channels travel in a **separate, non-Clone attachments argument** (the enum is
   `Clone+Debug`, so mpsc endpoints can't live in `PathConfig`).
-- `src/path/attached.rs` (new) + `src/path/mod.rs:76-240` — add `Path::Attached`
+- `src/path/attached.rs` (new) + `Path` in `src/path/mod.rs` — add `Path::Attached`
   to every match arm (`id`/`name`/`send_to`/`send`/`wire_overhead`/`take_rx`/
   `primary_peer`). `AttachedPath::send_to` **ignores the `to` arg**, seals `0xBD`
   when a `BondCrypto` is set, then `outbound.try_send` (drop-on-full, NOT await);
   `take_rx` returns the inbound `PathDatagram` receiver; `primary_peer` returns
-  `Some(synthetic)` (else `sender.rs:700-703` silently skips the leg's keepalive
-  and drops it from aggregation).
-- `src/socket.rs:280,487` — add `sender_attached` / `receiver_attached` + an
+  `Some(synthetic)` (else the keepalive loop's `path.primary_peer()` gate in
+  `sender.rs` silently skips the leg's keepalive and drops it from aggregation).
+- `src/socket.rs` — add `BondSocket::{sender_attached, receiver_attached}` + an
   attachments map keyed by `PathId`; `build_one_path` gets an `Attached` arm
   pulling the leg channels + the shared `BondCrypto`.
 
 ### bilbycast-edge
-- `src/config/models.rs:4427` — add `BondPathTransportConfig::Relay { tunnel_id,
+- `src/config/models.rs` — add `BondPathTransportConfig::Relay { tunnel_id,
   relay_addrs, tunnel_bind_secret?, tunnel_encryption_key?, interface?, source?,
   gateway? }` (the leg→tunnel FK on the leg). Keep `Udp/Rist/Quic` for back-compat.
 - `src/config/validation.rs` — **fail-closed**: a relay leg must carry exactly one
   encryption layer (bond `encryption_key` **or** tunnel `tunnel_encryption_key`);
   reject neither (blackhole) and reject both (double-encrypt). gateway ⇒ source.
-- `src/tunnel/udp_relay_client.rs:217` — refactor `run_native_relay_tunnel` to share
-  the relay-socket lifecycle (connect, Register/keepalive `:303-349`, failover);
+- `src/tunnel/udp_relay_client.rs` — refactor `run_native_relay_tunnel` to share
+  the relay-socket lifecycle (connect, `Register`/keepalive on
+  `KEEPALIVE_INTERVAL`, failover);
   add `run_native_relay_leg_inproc(params, cancel, stats, cipher, to_bond, from_bond)`
   that bridges over the same `PlainUdpLink`: egress drains `from_bond`, conditional
   encrypt, `encode_udp_datagram`, `send_datagram`; ingress `recv_datagram`, decode,

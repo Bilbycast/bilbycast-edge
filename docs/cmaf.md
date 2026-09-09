@@ -13,8 +13,16 @@ can emit both HLS (`.m3u8`) and DASH (`.mpd`) manifests against the same
 segments, so a single CMAF flow reaches Apple and Android/Widevine
 players without transcoding twice. Supports:
 
-- **Video**: H.264 or HEVC passthrough, or re-encode via libx264 /
-  libx265 / NVENC with explicit GoP alignment.
+- **Video**: H.264 or HEVC passthrough, or re-encode with explicit GoP
+  alignment via one of ten named backends — `x264`, `x265`,
+  `h264_nvenc`, `hevc_nvenc`, `h264_qsv`, `hevc_qsv`, `h264_vaapi`,
+  `hevc_vaapi`, `h264_rkmpp`, `hevc_rkmpp` — subject to the matching
+  `video-encoder-*` Cargo feature. **`h264_auto` / `hevc_auto` / `auto`
+  are refused at config load on a CMAF output**, where the generic
+  validator would accept them and resolve per host at flow start: the
+  CMAF re-encoder resolves no `*_auto` alias, so accepting one used to
+  load and then leave the re-encoder unset at flow start — publishing the
+  source encoding under a config that says it is being re-encoded.
 - **Audio**: AAC-LC / HE-AACv1 / HE-AACv2 passthrough, or re-encode via
   the in-process fdk-aac backend. Audio is **muxed into the same
   fragment as the video** — one `moof` addressing both tracks — so a
@@ -862,7 +870,13 @@ for `.mpd`, the edge has no override today — open an issue.
 
 The edge uses the following filenames under `{ingest_url}`:
 
-- `init.mp4` — init segment (ftyp + moov).
+- `init.mp4` — init segment (ftyp + moov). **Re-PUT every 30 s for the
+  life of the flow**, and retried at 1 s while an upload is failing, so
+  an origin that lost it self-heals instead of staying broken until the
+  flow restarts; budget the PUT rate and size origin cache TTLs for that.
+  The track list it declares is still latched the first time the init is
+  built — before the PUT, so a failed first upload does not reopen it —
+  and never widened; see [Known limitations](#known-limitations).
 - `seg-NNNNN.m4s` — video / muxed media segment (5-digit zero-padded
   sequence number).
 - `aud-NNNNN.m4s` — audio-only media segment. **Reserved and not

@@ -51,7 +51,7 @@ anything documented below for outputs applies to inputs verbatim.
 | **ST 2110-20 / -23** | ❌ | ❌ | ✅ (**required**) | Uncompressed RFC 4175 → H.264/HEVC on ingest — mandatory, was shipped in Phase 2. |
 | **ST 2110-30** | ⏳ (see below) | ✅ (native PCM reshape) | ❌ | `transcode` reshapes linear PCM in place. `audio_encode` changes the broadcast-channel shape to TS (rejects PCM-only outputs on the same flow); the AAC family (`aac_lc` / `he_aac_v1` / `he_aac_v2`) + `s302m` are wired, while `mp2` / `ac3` are deferred — picking one returns `PcmInputError::UnsupportedAudioEncodeCodec` and the flow surfaces a Critical `pid_bus_audio_encode_codec_not_supported_on_input` event. |
 | **`rtp_audio`** | ⏳ | ✅ | ❌ | Same story as ST 2110-30. |
-| **ST 2110-31** | ❌ | ❌ | ❌ | AES3 opaque — validation rejects any transcode/encode; would destroy SMPTE 337M metadata. |
+| **ST 2110-31** | ✅ (`s302m` only) | ❌ | ❌ | AES3 opaque. `transcode` is rejected outright — a linear-PCM stage would destroy the SMPTE 337M sub-frames. `audio_encode` is accepted for `s302m` alone, which re-packetises the AES3 bytes into a SMPTE 302M private PES with no decode step. See "Allowed codecs per input" below. |
 | **ST 2110-40** | ❌ | ❌ | ❌ | Ancillary data. |
 
 ### Why use input-side transcoding?
@@ -166,7 +166,9 @@ codec listed in the matrix below works regardless of source codec.
 
 ```jsonc
 "audio_encode": {
-  "codec": "aac_lc" | "he_aac_v1" | "he_aac_v2" | "opus" | "mp2" | "ac3",
+  "codec": "aac_lc",         // not one closed union — the accepted set is
+                             // per input / output class, see below
+  "source_audio_pid": 4352,  // optional; pin the source audio ES PID
   "bitrate_kbps": 128,       // optional; per-codec default
   "sample_rate":  48000,     // optional; defaults to source
   "channels":     2,         // optional; defaults to source
@@ -179,6 +181,41 @@ codec listed in the matrix below works regardless of source codec.
   "opus_frame_duration_ms": 20      // optional; 5 | 10 | 20 | 40 | 60
 }
 ```
+
+### `source_audio_pid` — pinning the source track
+
+Unset (the default), the replacer locks onto the **first** audio stream
+in the active program's PMT whose `stream_type` is one the replacer can
+decode: `0x0F` (AAC ADTS), `0x11` (AAC LATM), `0x03` / `0x04`
+(MPEG-1/2), `0x80` / `0x81` / `0xC1` (AC-3), `0x87` / `0xC2` (E-AC-3),
+or `0x06` (DVB private) resolved through its descriptor to one of AC-3 /
+E-AC-3 / LATM-AAC — a `0x06` that resolves to DTS, Opus, SMPTE 302M or
+AC-4 is walked past, not locked onto. Set it to
+pin a specific elementary PID instead — the case that matters is a
+program carrying several audio tracks (EN / FR / 5.1) where first-match
+would pick the wrong one, and the case where an input swap reorders the
+PMT. Range `0x0010..=0x1FFE`; anything outside that is rejected at
+config load (`source_audio_pid … out of range`), so the reserved
+system PIDs and the NULL PID cannot be named.
+
+If the pinned PID is **absent from the live PMT** the replacer does not
+fail — it falls back to first-matching-codec and logs a
+`tracing::warn!` carrying `error_code = audio_source_pid_not_found`
+plus `pinned_pid` / `actual_pid` / `actual_stream_type`. The warning is
+de-duplicated per distinct (pinned, actual) pair and re-arms when the
+pin reappears. **It is a log line only** — no manager WS event is
+raised, so a mis-typed pin never reaches the Events page and silently
+transcodes the wrong track. It is catalogued with the other
+log-only diagnostics under "Encoder runtime diagnostics" in
+[`events-and-alarms.md`](events-and-alarms.md), not with the WS events.
+
+**The in-place transcoder is single-program**, so one output transcodes
+exactly one audio PID. To pull two tracks out of an MPTS — say an
+English AAC output and a French AAC output — create **one output per
+track**, each with its own `program_number` filter *and* its own
+`source_audio_pid` pin. The validator refuses multi-program
+`pid_overrides` combined with `audio_encode` / `video_encode` on the
+same output.
 
 ### Opus-specific options
 
@@ -246,6 +283,27 @@ CMAF `src/engine/cmaf/encode.rs` via `AudioReencoder`).
 | WebRTC       | `opus`                                             |
 | **SRT / UDP / RTP** | `aac_lc`, `he_aac_v1`, `he_aac_v2`, `mp2`, `ac3` — `opus` is rejected here because MPEG-TS has no standard Opus mapping. |
 | **CMAF / CMAF-LL** | `aac_lc`, `he_aac_v1`, `he_aac_v2` — fragmented-MP4 audio sample entry is `mp4a`/`enca` (MPEG-4 AAC family); MP2 / AC-3 / Opus are not used. |
+
+### Allowed codecs per input
+
+The set is per input class, not one closed union — `codec` is validated
+against a different list depending on what the input carries.
+
+| Input | Allowed codecs |
+|---|---|
+| TS-carrying (SRT / UDP / RTP / RIST / RTMP / RTSP / WebRTC / test pattern / media player / replay) | `aac_lc`, `he_aac_v1`, `he_aac_v2`, `mp2`, `ac3` — `opus` is excluded here too, for the same missing-TS-mapping reason. |
+| PCM (**ST 2110-30**, `rtp_audio`) | the TS set **plus `s302m`**. At runtime only the AAC family and `s302m` are wired; `mp2` / `ac3` pass validation and then fail bring-up with `pid_bus_audio_encode_codec_not_supported_on_input` (see the input matrix at the top of this document). |
+| AES3 (**ST 2110-31**) | `s302m` and nothing else — a 302M wrap preserves the SMPTE 337M sub-frames bit-for-bit; every decode-and-re-encode codec is refused. |
+
+### `s302m` field contract
+
+`s302m` is a lossless PCM wrap, not an encoder, so it takes a different
+field set from the compressed codecs and validation checks it apart:
+
+- `bitrate_kbps` is **rejected**, not ignored — "not applicable to
+  s302m (302M is a lossless PCM wrap, not a compressed codec)".
+- `sample_rate`, if set, must be exactly `48000`.
+- `channels`, if set, must be `2`, `4`, `6` or `8` (SMPTE 302M-2007).
 
 ### Rejected combinations (validation bails at load time)
 
@@ -380,6 +438,9 @@ leave the PMT untouched.
   "codec":       "x264" | "x265" | "h264_nvenc" | "hevc_nvenc" | "h264_qsv" | "hevc_qsv"
   //             | "h264_vaapi" | "hevc_vaapi" | "h264_rkmpp" | "hevc_rkmpp"
   //             | "h264_auto" | "hevc_auto" | "auto",
+  "source_video_pid": 4113,  // optional; pin the source video ES PID
+  "hw_decode":   "auto",     // optional; "auto" | "cpu" | "nvdec" | "qsv"
+                             //           | "vaapi" | "rkmpp"
   "width":       1920,       // optional — see "Limitations"
   "height":      1080,       // optional — see "Limitations"
   "fps_num":     30,         // set to MATCH THE SOURCE; may be omitted on TS
@@ -419,6 +480,8 @@ leave the PMT untouched.
 | `level` | unset | Codec level, e.g. `"3.0"`, `"4.0"`, `"5.1"`. Unset lets the encoder pick from resolution / bitrate / frame rate. |
 | `tune` | backend-resolved: `zerolatency` on x264 / x265, **unset on every hardware backend** | The vocabularies are disjoint. x264 / x265 accept `zerolatency`, `film`, `animation`, `grain`, `stillimage`, `fastdecode`, `psnr`, `ssim`; NVENC accepts `hq`, `ll`, `ull`, `lossless`; QSV and VAAPI expose no `tune` option at all. Config validation is permissive over the union, because an `h264_auto` / `hevc_auto` output does not know its backend until flow start. A tune the resolved backend cannot accept is therefore **dropped** at flow start (`video_encode_util::sanitise_tune`), with a log line carrying `error_code = encoder_tune_not_supported` — a log line only, no manager event. Dropping matters: handing NVENC `zerolatency` makes `avcodec_open2` fail with `EINVAL (-22)`. An empty string means "unset — encoder chooses". |
 | `chroma` / `bit_depth` | `yuv420p` / `8` | Which backend can carry which combination is genuinely per-vendor; the matrix is later in this document rather than duplicated here. |
+| `source_video_pid` | unset | Pin the source video elementary PID instead of taking the first video stream in the active program's PMT (`stream_type` `0x01` / `0x02` / `0x1B` / `0x24`). Range `0x0010..=0x1FFE`, enforced at config load. Behaves exactly like `audio_encode.source_audio_pid` above, including the single-program rule and the log-only `error_code = video_source_pid_not_found` fallback — see that section for the MPTS recipe. |
+| `hw_decode` | `auto` | Which backend decodes the **source** ES before re-encode. `auto` walks VAAPI ≻ NVDEC ≻ QSV ≻ RKMPP ≻ CPU against the host's probed capabilities and the compiled-in `video-decoder-*` features; `cpu` forces software libavcodec, which is how you keep the host's HW decode sessions free for other flows. A forced backend the build or host cannot satisfy **does not fail the flow** — it logs `ts_video_replace: hw_decode preference … unavailable …; falling back to CPU` (a bare `warn`, no `error_code`, no manager event) and runs on CPU, and so does an edge whose startup probe never ran. That is deliberately unlike the display output, which raises `display_hw_decode_unavailable_falling_back`. Verification recipe: [`codec-matrix.md`](codec-matrix.md#verification-commands-per-host-class), item 4. |
 
 #### Colour metadata
 

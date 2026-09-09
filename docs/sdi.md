@@ -22,7 +22,6 @@ crate. Upstream tracking issue:
 | SCTE-35 → SCTE-104 VANC injection | Codec/demux unit verified; generic DeckLink VANC attachment **hardware loopback verified** (1080i50). Full edge TS→SDI→edge loop remains pending |
 | 10-bit (`v210`) | Rejected at config validation; unpacker not yet written |
 | Embedded audio onto the ST 2110-30/-31 PCM bus | **Not implemented** — capture audio is AAC-coded into the TS. A -30/-31 output on the flow does emit PCM, but via a PCM→AAC→PCM round-trip; there is no bit-transparent de-embed |
-| VANC / ancillary (SCTE-104, SMPTE 12M timecode, CEA-608/708) | **Not implemented** — no extraction anywhere in the stack; `sdi_devices[].ancillary_locked` is a status bit, not data |
 
 ## Why the Blackmagic SDK and not FFmpeg's `decklink` avdevice
 
@@ -717,15 +716,20 @@ gaps, not bugs waiting to be found:
   round-trip above, with AAC's coding loss and its added latency baked in.
   There is no configuration that gets the card's original samples onto a -30
   essence stream.
-* **VANC / ancillary extraction is entirely absent — there is no SDI →
-  ST 2110-40 path.** No SCTE-104, no SMPTE 12M timecode, no CEA-608/708
-  captions. Nothing in the stack decodes VANC: `decklink-rs` exposes no
-  ancillary API at all, and the only ancillary-adjacent field in the whole
-  subsystem is `sdi_devices[].ancillary_locked` — a **status bit** off
-  `IDeckLinkStatus` reporting that the card's ANC stream is locked. It is not
-  extraction, it carries no payload, and `true` there means only that ANC
-  exists on the wire, not that the edge can see it. Captions, timecode and
-  splice markers on an SDI feed are dropped on the floor today.
+* **VANC extraction exists, but there is no SDI → ST 2110-40 path and no
+  caption text.** `decklink-rs` hands every captured VANC packet up on
+  `CapturedVideo.ancillary`, and `sdi_io` parses it behind the three
+  `scte35_extraction` / `timecode_extraction` / `captions_extraction` switches
+  — but each lands somewhere narrow: SCTE-104 becomes a SCTE-35 section on a TS
+  PID, SMPTE 12M ATC becomes `InputStats.sdi_stats.timecode`, and captions are a
+  **presence flag** (`captions_cea608_present` / `captions_cea708_present` plus
+  a one-shot `sdi_captions_detected` event), never decoded text. Nothing
+  re-emits any of it as RFC 8331 ancillary RTP, so an ST 2110-40 output on an
+  SDI flow forwards the flow's TS bytes, not the card's ANC. All three parsers
+  are unit-verified only; none has met a live VANC source. Separately,
+  `sdi_devices[].ancillary_locked` is a **status bit** off `IDeckLinkStatus`
+  saying the card's ANC stream is locked — it carries no payload and is not
+  evidence that anything was extracted.
 * 10-bit (`v210`) capture unpack — unlocks the 10-bit HEVC hardware paths.
 * HW-decode for the playout path (CPU decode only today); audio resampling (48 kHz-only today); Opus/AC-4 playout audio.
 * 8/16-channel embedded audio and non-1080i50 rasters are implemented but

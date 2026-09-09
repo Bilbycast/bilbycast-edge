@@ -27,6 +27,14 @@ Supports NMOS IS-04 (Discovery & Registration), IS-05 (Connection Management), I
 | **SMPTE ST 2110-23** | Yes | Yes | Multi-stream single-essence video — 2SI and sample-row partition modes; otherwise same pipeline as -20 |
 | **`rtp_audio`** | Yes | Yes | Generic RFC 3551 PCM-over-RTP — wire-identical to ST 2110-30 but **no PTP requirement**, sample rates 32 / 44.1 / 48 / 88.2 / 96 kHz. For radio contribution, talkback, ffmpeg / OBS interop. Same `transcode` block as ST 2110-30. Output supports `transport_mode: "audio_302m"` (RTP/MP2T encapsulation per RFC 2250) |
 | **Media Player** | Yes | No | File-backed input — replays MPEG-TS / MP4 / MOV / still images from the edge's media library as a paced fresh MPEG-TS feed. Playlist with `loop_playback` + `shuffle`. 4 GiB per file, 16 GiB library cap, library path resolved via `BILBYCAST_MEDIA_DIR`. Files are uploaded over the manager's chunked REST endpoint (`POST /api/v1/nodes/{id}/media/upload`). Designed to drop onto a PID-bus Hitless leg as an automatic fallback to a live primary |
+| **CMAF / CMAF-LL** | No | Yes | Fragmented-MP4 egress over HTTP PUT with HLS + DASH manifests and optional ClearKey CENC; `low_latency: true` + `chunk_duration_ms` emits one `moof+mdat` chunk per chunk into a chunked-transfer PUT. Full reference: [`docs/cmaf.md`](docs/cmaf.md) |
+| **SDI** | Yes | Yes | Blackmagic DeckLink capture + playout on the card's own clock (no PTP). Behind the `sdi-decklink` Cargo feature — off in a plain `cargo build`, compiled into both `*-full` release artefacts. `libDeckLinkAPI.so` is `dlopen`ed at boot, so a host with no card simply does not advertise it. Full reference: [`docs/sdi.md`](docs/sdi.md) |
+| **Display** | No | Yes | Local-display playout — decodes the flow and renders to a KMS connector (HDMI / DisplayPort) plus an ALSA device, for confidence monitoring with no network egress. Behind the `display` Cargo feature (on by default, Linux-only effect) |
+| **MXL** (`mxl_video` / `mxl_audio` / `mxl_anc`) | Yes | Yes | EBU / Linux Foundation Media eXchange Layer — same-host shared-memory essence, mirroring the ST 2110-20/-30/-40 split (V210 4:2:2 10-bit / Float32 PCM @ 48 kHz / RFC 8331 ANC). PTP-disciplined: an MXL flow auto-selects the PTP master clock, keyed on the per-input `clock_domain` (validated `0..=127`) — config validation bounds that domain but does not itself refuse a flow whose `master_clock` is pinned elsewhere. Behind the `mxl` Cargo feature (off by default — heavy build prerequisites) |
+| **Bonded** | Yes | Yes | Media-aware multi-path aggregation over N ≥ 2 heterogeneous links (UDP + QUIC legs), with cross-leg ARQ + FEC. Requires a bilbycast node at both ends. Full reference: [`docs/bonding.md`](docs/bonding.md) |
+| **Replay** | Yes | No | Plays a clip out of a flow's continuous disk recording as a fresh paced MPEG-TS input; cue / play / stop / speed / step / scrub route to it over the per-flow replay command channel; the in/out marks that mint a clip are a recorder-side command instead. Behind the `replay` Cargo feature (on by default). Full reference: [`docs/replay.md`](docs/replay.md) |
+| **Mosaic** | Yes | No | The multiviewer compositor's stream head — composites N node-local inputs into one canvas (capped at 1920x1080 and 64 tiles) and publishes it as an ordinary MPEG-TS flow source. Behind the `multiviewer` Cargo feature (off in `cargo build`, requested by all three release artefacts) and requires a `video-encoder-*` backend. Full reference: [`docs/multiviewer.md`](docs/multiviewer.md) |
+| **Test Pattern** | Yes | No | Synthetic colour-bar / test raster with optional screen-ID text, tone / beep ident and an A/V-sync sweep, muxed as a paced MPEG-TS. No source required |
 
 **Compressed-audio bridge (Phase A + Phase B):** AAC contribution audio
 carried in MPEG-TS over RTMP / RTSP / SRT / UDP / RTP can be decoded
@@ -232,7 +240,7 @@ salvo export to a Switcher preset.
      "server": { "listen_addr": "0.0.0.0", "listen_port": 8080 },
      "manager": {
        "enabled": true,
-       "url": "wss://manager-host:8443/ws/node"
+       "urls": ["wss://manager-host:8443/ws/node"]
      },
      "inputs": [],
      "outputs": [],
@@ -250,6 +258,8 @@ salvo export to a Switcher preset.
 
    > **Tip**: You can also place the `registration_token` inside `config.json` under `manager` — it will be automatically migrated to `secrets.json` on first startup.
 
+   > **`urls` is a list, and there is no scalar form.** Single-manager deployments still use a one-element array — there is no `url` alias and no migration, so a config carrying the old scalar fails to start with `` missing field `urls` ``. The list takes 1–16 entries, each must start with `wss://` (plaintext `ws://` is rejected at load), each is capped at 2048 characters, and duplicates are rejected. The node connects to `urls[0]` first and rotates to the next entry on every close or auth failure, waiting a flat 5 s between attempts — the delay never escalates, so there is no exponential back-off to reset. The cursor advances regardless of outcome, so a flapping primary does not starve the standbys.
+
 4. **Start the node** -- it connects to the manager, authenticates with the registration token, and receives a permanent `node_id` and `node_secret`.
 
 5. **The node appears** in the manager dashboard and can be configured and monitored remotely. Commands from the manager (create/update/delete input, create/update/delete output, create/update/delete flow, start/stop flow, rotate secret) are executed automatically.
@@ -260,17 +270,17 @@ salvo export to a Switcher preset.
 
 For COTS hardware deployed at venues where SSH access is impractical:
 
-1. Follow build steps from Option 1. Start the node with a minimal or empty config.
+1. Follow build steps from Option 1. Start the node with `--bind-addrs 0.0.0.0,[::]` (or set `server.listen_addrs` in config.json). A fresh or absent config defaults to loopback-only — `127.0.0.1` + `[::1]` on port 8080 — so `http://<edge-ip>:8080/setup` is unreachable from another machine without it. `--bind` alone is **not** enough on a fresh config: it sets only the legacy scalar `server.listen_addr`, which `effective_listen_addrs()` ignores while the default `listen_addrs` list is present. Opening the listener to the LAN should be paired with enabling `server.auth`.
 
 2. **Open the setup wizard** in a browser at `http://<edge-ip>:8080/setup`.
 
-3. **Fill in the form**: device name, API listen address/port, manager URL, registration token, and whether to accept self-signed certificates.
+3. **Fill in the form**: device name, API listen address/port, manager URL, registration token, whether to accept self-signed certificates, and — for any browser that is not on the node itself — the **Setup Token** (see below).
 
 4. **Save** -- the configuration is written to disk.
 
 5. **Restart the service** to apply the new settings (e.g., `systemctl restart bilbycast-edge`).
 
-The setup wizard is enabled by default (`setup_enabled: true` in config). It auto-disables itself (writing `setup_enabled: false` to disk) as soon as the node completes its first successful registration with a manager, so `/setup` stops accepting reconfiguration after provisioning. Operators can also flip the flag manually. The wizard requires no authentication -- it is intended for initial setup of unconfigured nodes.
+The setup wizard is enabled by default (`setup_enabled: true` in config). It auto-disables itself (writing `setup_enabled: false` to disk) as soon as the node completes its first successful registration with a manager, so `/setup` stops accepting reconfiguration after provisioning. Operators can also flip the flag manually. **The wizard page loads without credentials, but saving is authenticated**: a POST from a non-loopback address must carry `Authorization: Bearer <setup_token>` or it is refused `401` — only `127.0.0.0/8` and `::1` callers bypass the check, so the browser workflow above needs the token. It is a one-shot 256-bit value generated on first boot and printed to stdout, re-printable with `bilbycast-edge --config <path> --print-setup-token`; paste it into the wizard's **Setup Token** field. It is cleared automatically on the node's first successful manager registration. See [`docs/installation.md`](docs/installation.md) for the `curl` recipe and the reverse-proxy caveat (a proxy that rewrites the source address to `127.0.0.1` defeats the loopback bypass).
 
 ## CLI Options
 
@@ -300,16 +310,45 @@ Options:
 
 ## Documentation
 
+**Getting started**
+
+- [Installing bilbycast-edge](docs/installation.md) — install bundle, systemd unit, first boot, the setup-wizard recipes
 - [Configuration Guide](docs/configuration-guide.md) — **authoritative** config reference: annotated examples for every input and output type, kept current with the shipping code
 - [Configuration Reference](docs/CONFIGURATION.md) — legacy/superseded field reference; consult the Configuration Guide above first
+- [Architecture](docs/architecture.md) — internal structure of the edge process
+
+**Protocols and I/O**
+
 - [Supported Protocols](docs/supported-protocols.md) — protocol matrix with feature lists
 - **[Audio Gateway Guide](docs/audio-gateway.md)** — bridging PCM audio between studios, transcoding, talkback, radio contribution, and SMPTE 302M LPCM-in-MPEG-TS over SRT/UDP/RTP. Read this if you're using Bilbycast for any audio that isn't strict byte-identical ST 2110-30 passthrough.
 - [SMPTE ST 2110](docs/st2110.md) — ST 2110-30/-31/-40 architecture, validation rules, PTP integration
+- [CMAF / CMAF-LL Output](docs/cmaf.md) — fragmented-MP4 egress, low-latency chunking, ClearKey CENC
+- [Native SDI I/O](docs/sdi.md) — Blackmagic DeckLink capture and playout
+- [Replay Server](docs/replay.md) — continuous flow recording and clip playback as a fresh input
+- [Multiviewer](docs/multiviewer.md) — the mosaic compositor and stream head
+- [Multi-Path Bonding](docs/bonding.md) — config schema, worked examples, tuning guidance
+- [Transcoding reference](docs/transcoding.md) — `audio_encode` + `transcode` + `video_encode`
+- [Codec matrix](docs/codec-matrix.md) — encoder / decoder support per backend, chroma, bit depth and host class
 - [NMOS](docs/nmos.md) — IS-04 / IS-05 / IS-08 / BCP-004 surface, mDNS-SD registration, channel mapping
+
+**Clocking and pacing**
+
+- [Clocking and A/V sync](docs/clocking.md) — master clocks, PCR generation, lipsync trim, cross-node egress alignment
+- [Wire pacing](docs/wire-pacing.md) — the SCHED_FIFO releaser, the opt-in SO_TXTIME + ETF qdisc tier, and how to set one up
+- [PTP operator mode](docs/ptp.md) — `ptp4l` integration, grandmaster setup, lock monitoring
+
+**Operations and security**
+
 - [Events and Alarms](docs/events-and-alarms.md) — operational event reference
 - [API Reference](docs/api-reference.md) — REST and WebSocket API
 - [API Security](docs/api-security.md) — TLS, JWT, RBAC, ingress filters
-- [Architecture](docs/architecture.md) — internal structure of the edge process
+- [Security model](docs/security.md) — trust roots, release signing, manual verification with cosign
+- [Remote upgrade](docs/upgrade.md) — manager-driven binary upgrades, manifest schema, boot watchdog
+- [Prometheus metrics reference](docs/metrics.md) — the `/metrics` surface
+- [Firewall patterns](docs/firewall.md) — which ports each protocol needs, in which direction
+- [Production tuning](docs/production-tuning.md) — host tuning for low-latency production
+- [Cellular uplink telemetry](docs/cellular.md) — ModemManager modems and RutOS routers
+- [Starlink dish telemetry](docs/starlink.md) — dish gRPC `get_status` polling
 
 ## Licensing
 

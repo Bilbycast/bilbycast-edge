@@ -1,8 +1,9 @@
 # Production tuning for bilbycast-edge
 
 This doc is the operator recipe for getting bilbycast-edge to its **tier-1
-pacing target** — sub-µs PCR_AC, broadcast-grade A/V sync, predictable
-behaviour under load. It assumes the systemd install
+pacing target** — sub-µs wire precision on the ST 2110 path (compressed TS
+tops out at layer 2, ~50–150 µs PCR_AC; see layer 3), broadcast-grade A/V
+sync, predictable behaviour under load. It assumes the systemd install
 (`packaging/install-edge.sh` + `packaging/bilbycast-edge.service`); a
 manual install needs to grant the same capabilities + limits by hand.
 
@@ -27,13 +28,15 @@ of `engine::wire_emit`).
 
 **Verify**:
 - `journalctl -u bilbycast-edge -g 'wire-emit'` should show one
-  `starting (tier=clock_nanosleep_fifo, sched_fifo=true, …)` line per
-  output. If `sched_fifo=false` appears, `LimitRTPRIO=99` didn't take
+  `starting (anchor=…, tier=clock_nanosleep_fifo, sched_fifo=true, pinned_cpu=None)`
+  line per output. If `sched_fifo=false` appears, `LimitRTPRIO=99` didn't take
   effect — check `systemctl status bilbycast-edge` for the active
   limit.
-- The manager UI's per-node **Resources** card shows
-  `scheduling_status.sched_fifo_granted = true` and
-  `mlockall = "locked"`.
+- The health tick carries `scheduling_status` (`mlockall: "locked"`,
+  `sched_fifo_granted: true`, plus `sched_fifo_failed` and
+  `rlimit_rtprio_max`), but **nothing in the manager reads that block** —
+  the per-node Resources card is fed by `resource_budget`, which is a
+  different field. The node's own log above is the check.
 
 ## Layer 1 — CPU pinning for wire-emit threads
 
@@ -52,8 +55,10 @@ layer 2.
 
 `sudo systemctl restart bilbycast-edge` to apply.
 
-**Verify**: the manager UI's per-output **Wire pacing** chip shows
-`pinned_cpu=2` (or whichever core landed on that output). `taskset -p
+**Verify**: the node's own `GET /api/v1/stats` reports
+`wire_pacing_pinned_cpu` per output (the boot log line above carries the
+same value as `pinned_cpu=`); it is on `OutputStats`, but no manager
+surface renders it. `taskset -p
 $(pidof bilbycast-edge)` shows the process-level affinity (still
 spans every core — pinning is per-thread, not per-process). `ps -o
 pid,psr,comm -T -p $(pidof bilbycast-edge)` lists every thread's
@@ -90,19 +95,36 @@ fighting.
 cores. `grep -E '(LOC|RES|TLB)' /proc/interrupts` should show very few
 ticks on the isolated cores after a few minutes of idle.
 
-**Expected PCR_AC p99 after layer 2**: still on `clock_nanosleep_fifo`
-unless you also wire up PTP + ETF qdisc (layer 3) — but the per-thread
-tail is now bounded by hardware interrupts, not by user-space scheduler
+**Expected PCR_AC p99 after layer 2**: still on `clock_nanosleep_fifo` —
+and for compressed TS that is the end of the ladder, because layer 3 only
+moves ST 2110 essence (see below) — but the per-thread tail is now
+bounded by hardware interrupts, not by user-space scheduler
 slop. p99 typically drops to ~50–150 µs, max stays under 5 ms even
 under heavy CPU load on the other cores.
 
 ## Layer 3 — PTP grandmaster + ETF qdisc (sub-µs pacing tier)
 
-This is the layer that puts you on the **tier-1** path: `SO_TXTIME` +
-kernel ETF + (optionally) NIC hardware-offload TX scheduling. PCR_AC
-becomes a function of the NIC's PTP timestamping accuracy and the
-qdisc's `delta` budget — typically ≤ 500 ns with hardware offload, ~1–10
-µs with software-only ETF.
+**This layer only moves ST 2110.** `spawn_wire_emitter` takes the
+SO_TXTIME releaser only for a `WirePacingClass::EtfEligible` output, and
+ST 2110-20/-23/-30/-31/-40 is the only egress constructed that way — every
+UDP and RTP output that owns a wire emitter (single-leg, FEC, both 2022-7
+legs, and the 302M-over-UDP path) is `Lossless` unconditionally and stays on
+`clock_nanosleep` however this layer is set up. That is
+deliberate: etf DROPS a packet whose launch time has already passed, which
+is unrecoverable corruption on bare UDP/RTP. So on a box of compressed TS
+outputs the ETF half of this layer buys nothing but the `SO_PRIORITY` pin
+below (the PTP half is a separate question — PTP is a rung of the
+master-clock cascade, see [`clocking.md`](clocking.md)), and
+**PCR_AC does not move** — it cannot even be read here, since the sampler
+runs only on PCR-bearing TS packets and ST 2110 essence carries no PCR.
+For a T-STD-strict decoder on a *compressed* feed the lever is
+`egress_pacing: "pcr"`, not ETF.
+
+For the outputs it does move, this is the **tier-1** path: `SO_TXTIME` +
+kernel ETF + (optionally) NIC hardware-offload TX scheduling. Wire
+precision becomes a function of the NIC's PTP timestamping accuracy and
+the qdisc's `delta` budget — typically ≤ 500 ns with hardware offload,
+~1–10 µs with software-only ETF.
 
 Prerequisites:
 - A NIC with **hardware PTP timestamping** (PHC + ETF support). Common
@@ -122,30 +144,53 @@ sudo apt install linuxptp ethtool iproute2
 # when you pick a PTP role from the manager UI's per-node Time
 # (PTP) page. Operator runbook: docs/ptp.md.
 
-# Install the ETF qdisc on the egress NIC.
-# bilbycast ships a setup script that handles the priomap +
-# `skip_sock_check on` flag (critical — see KNOWN ISSUES below).
+# Install the ETF qdisc on the egress NIC. bilbycast ships a setup
+# script that handles the priomap (critical — see KNOWN ISSUES below).
+# It installs SOFTWARE ETF by default; BILBYCAST_ETF_OFFLOAD=1 asks for
+# NIC launch-time offload, which needs a PHC actually disciplined to
+# CLOCK_TAI or the NIC silently rejects every packet.
 sudo packaging/setup-etf-qdisc.sh ${IFACE}
 ```
 
+**Then set `BILBYCAST_ETF_SO_PRIORITY=5` in `/etc/bilbycast/edge.env`.**
+The setup script's priomap reaches the etf class from socket-priority 5
+alone; the edge's compiled-in default is `0`, which that map sends to
+fq_codel — so without this the SO_TXTIME outputs you just enabled lose etf
+launch-time pacing while still reporting `tier=so_txtime`. The installer
+does not seed it.
+
 **Verify**:
 - `journalctl -u bilbycast-edge -g 'tier='` shows `tier=so_txtime` after
-  the next restart.
+  the next restart — **on ST 2110 outputs only**; a compressed output
+  still reports `tier=clock_nanosleep_fifo`, and that is correct.
 - `ethtool -T ${IFACE}` shows hardware TX timestamping capabilities.
 - `chronyc tracking` (or equivalent) shows PHC discipline error well
   under 1 µs.
-- The manager UI's per-output Wire-pacing chip flips to `so_txtime`.
-- PCR_AC p99 (manager UI flow detail) drops below 1 µs steady-state.
+- `GET /api/v1/stats` on the node reports `wire_pacing_tier: "so_txtime"`
+  on those outputs, with `wire_pacing_late` flat at 0 — a climbing
+  `wire_pacing_late` is the kernel rejecting launch times, usually the
+  CLOCK_TAI-vs-PHC skew below.
+- PCR_AC (the manager's per-flow **PCR accuracy** card) is **not** the
+  gauge for this layer — see the opening paragraph.
 
 ### KNOWN ISSUES on this layer
 
-- **ETF qdisc + missing `skip_sock_check`**: a bare `tc qdisc add etf …`
-  call routes *every default-priority packet* (ARP, ssh, every
-  non-SO_TXTIME UDP socket) through the etf class, which drops anything
-  without a `SCM_TXTIME` cmsg. This kills ARP resolution and produces
-  ENETUNREACH on the host. `packaging/setup-etf-qdisc.sh` installs with
-  `skip_sock_check on` so only sockets that explicitly opt into
-  SO_TXTIME are subject to ETF scheduling.
+- **ETF qdisc on the stock priomap**: a bare `tc qdisc add etf …` call
+  routes *every default-priority packet* (ARP, ssh, every non-SO_TXTIME
+  UDP socket) through the etf class, which drops anything carrying no
+  `SCM_TXTIME` cmsg — `skb->tstamp == 0` is a launch time in 1970, i.e.
+  already past. This kills ARP resolution and produces ENETUNREACH on the
+  host (measured 2026-06-06: etf class `Sent 0`, drop counter climbing,
+  ping 100 % loss). **`skip_sock_check` does not save you** — it skips
+  only the per-*socket* validation, never the per-packet launch-time
+  check, and the earlier belief that unstamped packets "fall through to
+  FIFO release" was measured false on the same day. What saves you is the
+  priomap: `packaging/setup-etf-qdisc.sh` installs `mqprio` with
+  `map 1 1 1 1 1 0 1 1 2 2 2 2 1 1 1 1`, so **only socket-priority 5**
+  reaches the etf class and everything default-priority rides fq_codel.
+  That is why `BILBYCAST_ETF_SO_PRIORITY=5` is a required companion. (The
+  script still passes `skip_sock_check`, so a legitimate SO_TXTIME sender
+  with mismatched socket flags isn't rejected.)
 - **CLOCK_TAI not disciplined by `phc2sys`**: if `phc2sys` isn't running
   with `-O 37` (or equivalent leap-second handling), CLOCK_TAI is ~37 s
   ahead of the PHC. `setsockopt(SCM_TXTIME, CLOCK_TAI)` succeeds but
@@ -190,16 +235,16 @@ worst-case latency well under 50 µs on an otherwise-idle box.
 | `BILBYCAST_CODEC_CPUS` | unset | Same parser as `WIRE_EMIT_CPUS`; CPU-affinity set for codec (encode/decode) threads |
 | `BILBYCAST_PID_BUS_CPUS` | unset | Same parser; CPU-affinity set for the PID-bus / TS-assembler runtime |
 | `BILBYCAST_PLL_CPUS` | unset | Same parser; CPU-affinity set for the PCR-ingress / PLL sampler threads |
-| `BILBYCAST_ENABLE_TXTIME` | `0` | Opt in to the SO_TXTIME wire-pacing tier (tier 1 / 2). Requires ETF qdisc + `CAP_NET_ADMIN` (and PTP + HW-PTP NIC for tier 1). Without this the edge stays on the `clock_nanosleep` default |
-| `BILBYCAST_ETF_SO_PRIORITY` | TC-map default | Override the `SO_PRIORITY` mapped onto the ETF qdisc class for SO_TXTIME outputs (layer 3 / only meaningful when SO_TXTIME is enabled) |
-| `BILBYCAST_LOSSLESS_SO_PRIORITY` | `4` | `SO_PRIORITY` pinning compressed (lossless-carrier) outputs **off** the etf class, so they aren't held to the wire-pacing schedule |
+| `BILBYCAST_ENABLE_TXTIME` | `0` | Opt in to the SO_TXTIME wire-pacing tier (tier 1 / 2). Requires ETF qdisc + `CAP_NET_ADMIN` (and PTP + HW-PTP NIC for tier 1). Without this the edge stays on the `clock_nanosleep` default — and **with** it, only ST 2110 outputs change tier; compressed TS stays on `clock_nanosleep` regardless (see layer 3) |
+| `BILBYCAST_ETF_SO_PRIORITY` | `0` | `SO_PRIORITY` pinned onto a SO_TXTIME output so a DSCP-derived priority can't route it off the etf class. `0` is TC0 only under the stock `0 0 0 0 1 1 1 1 …` map — **the shipped `setup-etf-qdisc.sh` puts etf behind priority 5**, so with that script this must be set to `5` or the output lands on fq_codel and loses etf pacing. The installer does not seed it. Read only where SO_TXTIME actually engages (layer 3, ST 2110) |
+| `BILBYCAST_LOSSLESS_SO_PRIORITY` | `4` | `SO_PRIORITY` pinning compressed (lossless-carrier) outputs **off** the etf class, so their plain sends are queued by fq_codel rather than late-dropped by etf. **Applied only when `BILBYCAST_ENABLE_TXTIME=1`** — with no etf qdisc in play the DSCP-derived priority is left exactly as it was. The on-wire DSCP byte (`IP_TOS`) is unaffected either way |
 | `BILBYCAST_FORCE_NANOSLEEP` | `0` | Back-compat no-op — `clock_nanosleep` is already the wire-pacing default, so on its own the flag changes nothing. It only matters alongside `BILBYCAST_ENABLE_TXTIME=1`, where it forces the `clock_nanosleep` fallback for diagnostics |
 | `BILBYCAST_PROBE_SESSION_LIMITS` | `1` | **Deprecated → `tuning.probe_session_limits`** (Manager → node → Configure → **Tuning**). Runs the startup HW encoder/decoder session-capacity probe. The config field wins; this variable is only the fallback beneath it, and a node that still sets it raises a Warning `deprecated_env_var` event at startup |
 | `BILBYCAST_ALLOW_INSECURE` | `0` | Allow `accept_self_signed_cert: true` |
 
 ## Reference: node tuning knobs that moved into config
 
-Four node-wide knobs that used to be environment-only now live in the
+Six node-wide knobs that used to be environment-only now live in the
 root `tuning` block of `config.json`, editable at Manager → node →
 Configure → **Tuning** (gated on the `node_tuning` capability; the Media
 Player section is gated separately on `media_player_tuning`, since those
@@ -231,9 +276,14 @@ not parse and therefore discarded rather than applied
 that isn't being applied.
 
 The two **probe** switches are read once at node start, so a pushed
-change takes effect at the node's next restart; the two **ingress** knobs
-apply on the push. A per-input `ingress_dejitter_ms` /
-`ingress_residence_ms` (UDP + RTP inputs) overrides the node default.
+change takes effect at the node's next restart — and the edge says so,
+raising a Warning `tuning_requires_restart` rather than leaving the
+operator to infer it. The two **ingress** knobs and the two
+**media-player** knobs are re-installed on every `update_config` and read
+at the next input spawn, so a flow restart applies them. A per-input
+`ingress_dejitter_ms` / `ingress_residence_ms` (UDP + RTP inputs), or
+`operator_control` / `pcr_deadlines` (media-player inputs), overrides the
+node default.
 Ranges, defaults and the validation rules are in
 [`configuration-guide.md`](configuration-guide.md) — this table is only
 the environment-variable mapping.
@@ -255,7 +305,7 @@ are the source of truth for "is this layer doing what the docs claim".
 Run them per-layer in this order: gate 4 (PCR_AC) → gate 6 (sample SNR) →
 gate 8 (long soak) → gate 7 (real receiver). A layer is "in" only when
 all four pass at the expected envelope; never report aggregate results
-(see `feedback_broadcast_quality_testing.md` rationale).
+(rationale: the monorepo `CLAUDE.md`, "Verifying Broadcast Quality").
 
 ## Tuning a bonded output for a cellular / low-MTU path
 
@@ -290,5 +340,6 @@ axis, independent of the wire-pacing tiers here.
   this doc references.
 - [`../packaging/install-edge.sh`](../packaging/install-edge.sh) — the installer that seeds the
   default env file.
-- [`../packaging/setup-etf-qdisc.sh`](../packaging/setup-etf-qdisc.sh) — the ETF qdisc installer with
-  the `skip_sock_check on` flag.
+- [`../packaging/setup-etf-qdisc.sh`](../packaging/setup-etf-qdisc.sh) — the ETF qdisc installer,
+  including the mqprio priomap that keeps everything but socket-priority 5
+  off the etf class.

@@ -80,9 +80,13 @@ section.)
 | `src/replay/index.rs` | 24 B append-only `index.bin` entries (timecode → segment + offset), in-memory load + binary search |
 | `src/replay/clips.rs` | `clips.json` persistence (atomic `tmp` + rename + fsync) |
 | `src/replay/paced_replayer.rs` | PCR-paced bundle yield for the replay input |
+| `src/replay/filmstrip.rs` | Opt-in JPEG thumbnail subscriber; `thumbs/` writer + `.tmp/` orphan scan; `list_frames` / `read_frame` |
+| `src/replay/recordings.rs` | On-disk recording enumeration for the Recordings library (including orphans with no live flow) |
+| `src/replay/export.rs` | MPEG-TS clip / recording export |
+| `src/replay/export_mp4.rs` | TS→fMP4 export (`replay_export_mp4` capability) |
 | `src/engine/input_replay.rs` | Replay input task; per-input command channel; lifecycle events |
 | `src/engine/flow.rs` | `FlowRuntime.recording_handle` lifecycle; spawn/teardown |
-| `src/manager/client.rs` (`start_recording` arm at line 2400, `scrub_playback` arm at line 2910) | WS command dispatch — all 14 replay arms `#[cfg(feature = "replay")]`-gated |
+| `src/manager/client.rs` (replay dispatch arms, `start_recording` through the `cue_clip \| play_clip \| stop_playback \| scrub_playback \| set_speed \| step_frame` arm) | WS command dispatch — 17 arms covering 22 command names, all `#[cfg(feature = "replay")]`-gated |
 
 ## Storage layout
 
@@ -97,6 +101,8 @@ section.)
     index.bin            ← 24 B / IDR; binary search resolves PTS → (segment_id, byte_offset)
     clips.json           ← Vec<ClipInfo>; atomic write-to-tmp + rename + fsync
     .tmp/                ← in-flight writes; atomic rename onto the final path on segment roll
+    thumbs/              ← filmstrip JPEGs, one per capture, named <pts_90khz>.jpg (only when filmstrip_seconds is set)
+      .tmp/              ← in-flight filmstrip encodes; fsync + rename onto thumbs/; orphans unlinked on writer init
 ```
 
 The same root is shared across recordings. Per-recording subdirectories
@@ -254,6 +260,9 @@ field on a Create/Update modal without parsing strings.
 | `replay_max_bytes_below_segment` | Warning | Retention can't satisfy `max_bytes` without deleting the live edge — operator's cap is smaller than one segment | Raise `max_bytes` to at least `segment_seconds × bitrate × 2` |
 | `replay_metadata_stale` | Warning | `recording.json` write failed on segment roll; recovery scan will derive next segment id from the directory listing on restart | Investigate the disk (typically ENOSPC on the replay volume) |
 | `replay_recovery_alert` | Warning | Edge restarted after a crash; orphan `.tmp/` segments cleaned and / or `recording.json` was corrupt | Informational — verify `details.tmp_orphans_removed` and `details.next_segment_id` match expectations |
+| `replay_filmstrip_setup_failed` | Warning | Filmstrip writer could not create `<recording_dir>/thumbs/.tmp/`; the subscriber returns and no filmstrip is written (the recording itself keeps rolling) | Check permissions / free space on the replay root, then re-arm the recording |
+| `replay_filmstrip_decode_failed` | Warning | Filmstrip decode failed on a capture tick; rate-limited to one event per 60 s per recording | Informational unless sustained — check the source has decodable video (`details.detail` carries the decoder error) |
+| `replay_filmstrip_frame_not_found` | Error (`command_ack.error_code` only — no event) | `get_filmstrip_frame` for a `pts_90khz` with no `thumbs/<pts>.jpg` | Re-run `list_filmstrip` — the frame may have been pruned with its recording, or the PTS was not a capture tick |
 
 ### Orphan-recovery list_clips
 
@@ -307,6 +316,75 @@ flow-form recording fields, the dedicated `/replay` page link, the
 "Open Replay" badge on flow cards. Manager → edge replay commands sent
 to a non-replay edge fall through to the generic `unknown_action` ack
 path, so old edges don't trip on new commands.
+
+## Filmstrip
+
+Opt-in JPEG thumbnails written alongside the segments so the manager's
+`/replay` scrubber can render a strip without decoding the recording.
+Off unless the flow sets `RecordingConfig.filmstrip_seconds` (validated
+`1..=30`; `None` = no filmstrip, and no extra decode cost on a
+recording-only flow). Capability bit: `replay-filmstrip`.
+
+It is a **sibling** of the segment writer, not a stage in it — the
+filmstrip task takes its own `broadcast_tx.subscribe()` on the flow's
+channel and drops on `Lagged` rather than awaiting, so a slow JPEG
+encode can never stall recording or the data path. On each cadence tick
+it decodes one frame out of the buffered TS and writes
+`<recording_dir>/thumbs/<pts_90khz>.jpg` at 160x90, via
+`thumbs/.tmp/<pts>.jpg` + `sync_all` + rename. A tick whose PTS already
+has a file (a stalled source that hasn't advanced its clock) is a no-op
+rather than an overwrite. Writer init unlinks any `.tmp/*` orphans left
+by a SIGKILL mid-encode — filmstrip frames are PTS-keyed, so unlike the
+segment writer there is no "next id" to derive.
+
+Counters (`frames_written`, `bytes_written`, `decode_drops`) accumulate
+on `FilmstripStats`, hung off the recording handle. They are not on the
+`FlowStats.recording` wire shape yet.
+
+### `list_filmstrip`
+
+Frame **metadata** for a window — deliberately no inline JPEG, because
+200 frames × ~5 KB is ~1 MB in one WS round-trip.
+
+```jsonc
+// Request — provide recording_id or flow_id. `recording_id` is
+// checked first and wins; flow_id resolves through the flow's live
+// recording handle. Same order as list_clips.
+{
+  "type": "list_filmstrip",
+  "flow_id": "flow-1",
+  "from_pts_90khz": 0,        // optional window start
+  "to_pts_90khz": 5400000,    // optional window end
+  "max_count": 60             // optional, default 60, clamped to 1..=200
+}
+
+// Response
+{
+  "recording_id": "show-a",
+  "frames": [ { "pts_90khz": 91000, "size_bytes": 4812 }, … ],
+  "total_count": 1873          // before downsampling
+}
+```
+
+When the window holds more than `max_count` frames the edge returns an
+evenly-spaced subset that always includes the first and last entry, so
+the strip's edges line up with the requested window.
+
+### `get_filmstrip_frame`
+
+One JPEG by exact PTS — the companion fetch behind each strip cell.
+
+```jsonc
+// Request
+{ "type": "get_filmstrip_frame", "recording_id": "show-a", "pts_90khz": 91000 }
+
+// Response
+{ "recording_id": "show-a", "pts_90khz": 91000, "data": "<base64 JPEG>", "width": 160, "height": 90 }
+```
+
+`<pts>.jpg` is content-addressed and never rewritten once flushed, so
+the manager proxies it with a long `Cache-Control` and a strong ETag.
+An unknown PTS returns `replay_filmstrip_frame_not_found`.
 
 ## Phase 2 / 1.5 — clip tags + `update_clip`
 

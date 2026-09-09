@@ -27,7 +27,7 @@ Please include:
 
 In scope:
 
-- All bilbycast projects published under this organisation (edge, manager, relay, srt, rist, fdk-aac-rs, ffmpeg-video-rs, libsrt-rs, appear-x-api-gateway)
+- **Every repository published under this organisation.** That includes the sibling crates the shipped binaries compile in — bonding (the `0xBC` wire protocol and its transports), libsrt-rs, rist, fdk-aac-rs, ffmpeg-video-rs, mxl-rs, rga-rs, decklink-rs — the pure-Rust `srt` crate, which no shipped binary links today (the edge depends on libsrt-rs) but which is still maintained, and gateway-sdk / gateway-template, which own the WSS auth every vendor sidecar runs on. A finding in one of those is in scope even though the crate is not a product on its own.
 - Authentication, authorisation, crypto, transport security, and data-path integrity issues
 - Dependency vulnerabilities with a realistic exploit path against bilbycast
 

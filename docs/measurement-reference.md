@@ -17,9 +17,11 @@ For each metric we list:
 Metrics are grouped by the section of the node-status page they appear in.
 
 The status page is rendered by
-[`bilbycast-manager/ui/static/js/flows.js`](../../bilbycast-manager/ui/static/js/flows.js)
-(lines 865–3811). The manager is a near-transparent passthrough — it does
-not recompute or smooth most values. The few exceptions are listed under
+[`bilbycast-manager/crates/manager-server/src/ui/static/js/detail/flows.js`](../../bilbycast-manager/crates/manager-server/src/ui/static/js/detail/flows.js),
+which is `include_str!`d into the manager binary. (The flow *config* modal is
+a separate file, `config/flows.js`, and renders none of these values.) The
+manager is a near-transparent passthrough — it does not recompute or smooth
+most values. The few exceptions are listed under
 [Manager-side caveats](#manager-side-caveats).
 
 > **A note on PCR-derived bitrate vs network bitrate.** The "Media Analysis"
@@ -283,7 +285,11 @@ Direct passthrough from Appear X JSON-RPC via the gateway sidecar.
 ## Thumbnails
 
 [`engine/thumbnail.rs`](../src/engine/thumbnail.rs) — in-process libavcodec
-decode, JPEG 320x180, generated every 10 s.
+decode, JPEG 320x180, captured every `FlowConfig.thumbnail_interval_secs`
+seconds (default 5, validated to 1–60; the manager UI offers 1 / 2 / 5 / 10 /
+30 s). The per-capture decode cap scales with the cadence and freeze detection
+samples on a fixed 5 s floor rather than once per capture, so the alarm windows
+stay correct at any setting.
 
 | Field | Verdict | Notes |
 |---|---|---|

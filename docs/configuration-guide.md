@@ -13,15 +13,18 @@ Complete reference for the bilbycast-edge JSON configuration file. This guide co
 - [TLS Configuration](#tls-configuration)
 - [Auth Configuration](#auth-configuration)
 - [Monitor Configuration](#monitor-configuration)
+- [NMOS Registration Configuration](#nmos-registration-configuration)
 - [Manager Configuration](#manager-configuration)
 - [Resource Limits](#resource-limits)
 - [Structured JSON Logging](#structured-json-logging-logging)
 - [Node Tuning](#node-tuning)
 - [Tunnel Configuration](#tunnel-configuration)
 - [Flow Configuration](#flow-configuration)
+- [Per-NIC Interface Binding](#per-nic-interface-binding)
 - [Input Types](#input-types)
   - [RTP Input](#rtp-input)
   - [UDP Input](#udp-input)
+  - [Source-Specific Multicast (SSM) vs Any-Source Multicast (ASM)](#source-specific-multicast-ssm-vs-any-source-multicast-asm)
   - [RIST Input](#rist-input)
   - [SRT Input](#srt-input)
   - [RTMP Input](#rtmp-input)
@@ -33,6 +36,7 @@ Complete reference for the bilbycast-edge JSON configuration file. This guide co
   - [Bonded Input](#bonded-input)
   - [Mosaic Input (multiviewer wall)](#mosaic-input-multiviewer-wall-multiviewer-feature)
   - [SDI Input (Blackmagic DeckLink)](#sdi-input-blackmagic-decklink)
+  - [MXL Inputs](#mxl-inputs-mxl_video--mxl_audio--mxl_anc)
 - [Output Types](#output-types)
   - [RTP Output](#rtp-output)
   - [UDP Output](#udp-output)
@@ -40,11 +44,15 @@ Complete reference for the bilbycast-edge JSON configuration file. This guide co
   - [SRT Output](#srt-output)
   - [RTMP Output](#rtmp-output)
   - [HLS Output](#hls-output)
+  - [CMAF / CMAF-LL Output](#cmaf--cmaf-ll-output)
   - [WebRTC Output](#webrtc-output)
+  - [The `audio_encode` block](#the-audio_encode-block-phase-b)
+  - [Display Output (HDMI / DisplayPort + ALSA)](#display-output-hdmi--displayport--alsa)
   - [Bonded Output](#bonded-output)
   - [SDI Output (Blackmagic DeckLink playout)](#sdi-output-blackmagic-decklink-playout)
-- **SMPTE ST 2110 audio + ANC** — see the dedicated section near the
-  end of this guide and the deep-dive in
+  - [MXL Outputs](#mxl-outputs-mxl_video--mxl_audio--mxl_anc)
+- [**SMPTE ST 2110** audio + ANC](#smpte-st-2110) — see the dedicated section
+  near the end of this guide and the deep-dive in
   [`audio-gateway.md`](audio-gateway.md). Covers ST 2110-30/-31 audio,
   ST 2110-40 ANC, the per-output `transcode` block (sample rate / bit
   depth / channel routing), the `rtp_audio` no-PTP variant, and SMPTE
@@ -69,7 +77,10 @@ Complete reference for the bilbycast-edge JSON configuration file. This guide co
   `video-encoder-*` feature at runtime; all three published release
   artefacts carry both. Config schema:
   [Mosaic Input](#mosaic-input-multiviewer-wall-multiviewer-feature).
+- [Flow Assembly (PID bus)](#flow-assembly-pid-bus--spts--mpts-from-n-inputs)
 - [MPTS → SPTS filtering](#mpts--spts-filtering)
+- [TS output PID remapping (`pid_map`)](#ts-output-pid-remapping-pid_map)
+- [Per-program PID pinning (`pid_overrides`)](#per-program-pid-pinning-pid_overrides)
 - [SMPTE 2022-1 FEC Configuration](#smpte-2022-1-fec-configuration)
 - [SMPTE 2022-7 SRT Redundancy](#smpte-2022-7-srt-redundancy)
 - [Native libsrt SRT Bonding (Socket Groups)](#native-libsrt-srt-bonding-socket-groups)
@@ -77,6 +88,10 @@ Complete reference for the bilbycast-edge JSON configuration file. This guide co
 - [CLI Argument Overrides](#cli-argument-overrides)
 - [Config Persistence Behavior](#config-persistence-behavior)
 - [Common Configuration Scenarios](#common-configuration-scenarios)
+- [SMPTE ST 2110](#smpte-st-2110)
+- [Content Analysis (in-depth)](#content-analysis-in-depth)
+- [Replay (recording + playback)](#replay-recording--playback)
+- [Capacity & resource budget](#capacity--resource-budget)
 
 ---
 
@@ -579,7 +594,7 @@ Tuning tab sends exactly that. The same preserve-when-absent rule covers
 
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
-| `ingress_dejitter_ms` | integer | No | `60` | Node-wide default ingress de-jitter setpoint, in ms of content. Range 20–2000. Applies to raw **UDP and RTP** inputs that do not carry their own `ingress_dejitter_ms`, and it both **switches the buffer on** and sets its depth — so setting it here de-jitters every such input on the node. It does **not** apply to SRT (TSBPD de-jitters at the transport layer), RTSP, RTMP or `bonded` inputs, which run ingress passthrough by design. |
+| `ingress_dejitter_ms` | integer | No | `null` — no node-wide de-jitter | Node-wide default ingress de-jitter setpoint, in ms of content. Range 20–2000. Applies to raw **UDP and RTP** inputs that do not carry their own `ingress_dejitter_ms`, and it both **switches the buffer on** and sets its depth — so setting it here de-jitters every such input on the node. Left unset, and with no per-input value either, those inputs run ingress **passthrough**: the built-in 60 ms is a setpoint applied only once some layer has enabled the buffer, never an enable in its own right. It does **not** apply to SRT (TSBPD de-jitters at the transport layer), RTSP, RTMP or `bonded` inputs, which run ingress passthrough by design. |
 | `ingress_residence_ms` | integer | No | `max(4 × setpoint, 250)` ms | Node-wide default hard-shed residence cap for that buffer. A packet older than this is shed rather than released late, which is what bounds ingress latency when a burst or a source-rate offset exceeds the servo's ±5 % authority. Range `ingress_dejitter_ms + 40` .. `5000`; node-wide the floor is checked against `tuning.ingress_dejitter_ms`, or the built-in 60 ms when that is unset. A per-input `ingress_residence_ms` overrides it. |
 | `probe_session_limits` | boolean | No | `true` | Run the startup hardware encoder/decoder session-capacity probe. `false` trades the manager's "sessions used **of** max" denominator for a faster boot, and disables **both** tiers. See [Capacity & resource budget](#capacity--resource-budget). |
 | `probe_4k` | boolean | No | `true` | Run the second-tier 4K session-capacity probe. Ignored when `probe_session_limits` is `false` — that disables both tiers. |
@@ -783,10 +798,16 @@ At startup (or on create/update), `AppConfig::resolve_flow()` dereferences the I
 | `media_analysis` | boolean | No | `true` | Enable media content analysis (codec, resolution, frame rate detection). |
 | `thumbnail` | boolean | No | `true` | Enable thumbnail generation (in-process via libavcodec; no external ffmpeg required). |
 | `thumbnail_program_number` | integer | No | `null` | When the input is an MPTS, render the thumbnail from this MPEG-TS program only. `null` uses the first program found. Must be `> 0` if set. See [MPTS → SPTS filtering](#mpts--spts-filtering). |
+| `thumbnail_interval_secs` | integer | No | `null` (= 5 s) | Thumbnail capture cadence. Validated 1–60 s. Freeze detection is deliberately *not* sped up with it — it samples on a fixed 5 s floor, so a fast cadence doesn't read a healthy feed as frozen. |
 | `bandwidth_limit` | object | No | `null` | Per-flow bandwidth monitoring (RP 2129). See [Bandwidth Limit](#bandwidth-limit). |
+| `flow_group_id` | string | No | `null` | ST 2110 essence-bundle membership. See [Flow groups (essence bundles)](#flow-groups-essence-bundles). |
+| `clock_domain` | integer | No | `null` | PTP clock domain (IEEE 1588), 0–127, scoping ST 2110 sync monitoring for this flow. Inherits from the flow group when set there. |
 | `input_ids` | array of strings | No | `[]` | IDs of inputs from the top-level `inputs` array. Each referenced input must exist and must not already be assigned to another flow. At most one input may be active at a time. Can be empty (output-only flow). |
 | `output_ids` | array of strings | No | `[]` | IDs of outputs from the top-level `outputs` array. Each referenced output must exist and must not already be assigned to another flow. Can be empty (input-only flow). |
 | `assembly` | object | No | `null` | Optional PID-bus assembly block. `null` (or `"kind": "passthrough"`) = legacy passthrough. Set `"kind": "spts"` / `"mpts"` to build a fresh TS from elementary streams pulled off any of the flow's inputs. See [Flow Assembly (PID bus)](#flow-assembly-pid-bus--spts--mpts-from-n-inputs). |
+| `content_analysis` | object | No | `null` | In-depth content analysis (lite / audio_full / video_full tiers). See [Content Analysis (in-depth)](#content-analysis-in-depth). |
+| `recording` | object | No | `null` | Continuous replay recording to disk. See [Recording (flow attribute)](#recording-flow-attribute). |
+| `master_clock` | object | No | `null` (= `kind: "auto"`) | Per-flow master-clock override: `kind`, `lipsync_offset_90k`, `pll_lock_timeout_s`, `pll_lock_jitter_us`. Left unset the kind is auto-selected from the flow's role. See [`clocking.md`](clocking.md). |
 | `bandwidth_profile` | string | No | auto | Per-flow broadcast-channel capacity tier. `"standard"` (16 384 slots / ~21 MB) handles TS-contribution up to ~500 Mbps; `"high_bitrate"` (32 768 / ~43 MB) for 500 Mbps – 3 Gbps compressed; `"uncompressed"` (65 536 / ~86 MB) for ST 2110-20/-23 + MXL video. Omit to auto-derive from inputs (ST 2110-20/-23 / MXL video → uncompressed, everything else → standard). Operators override only when auto picks too low a tier for an unusually-high-bitrate compressed source. |
 
 ### Multi-Input Flows and Seamless Switching
@@ -932,6 +953,12 @@ sudo systemctl daemon-reload && sudo systemctl restart bilbycast-edge
 
 Each entry in the top-level `inputs` array is an `InputDefinition` with `id`, `name`, and the protocol-specific fields flattened in (enum-tagged by `type`). Inputs are independent top-level entities that exist whether or not they are assigned to a flow. They are managed via REST at `/api/v1/inputs` (CRUD) and via manager WebSocket commands.
 
+Every input also carries `active` (boolean, default `true`) and `group`
+(string, max 64 chars, default `null` — free-form tag for UI grouping). At most
+one input per flow is active — the rest run warm-passive — and the switch is
+`POST /api/v1/flows/{flow_id}/activate-input`, never a config edit: a
+whole-config push holds `active` to whatever is already on air.
+
 The `type` discriminator field selects the input variant. The full set is
 `rtp`, `udp`, `srt`, `rist`, `rtmp`, `rtsp`, `webrtc`, `whep`, `bonded`,
 `test_pattern`, `media_player`, `replay`, `rtp_audio`, `st2110_20`,
@@ -970,6 +997,7 @@ Receives RTP-wrapped MPEG-TS packets (SMPTE ST 2022-2). Requires valid RTP v2 he
 |-------|------|----------|---------|-------------|
 | `type` | string | Yes | - | Must be `"rtp"`. |
 | `bind_addr` | string | Yes | - | Local socket address to bind (`ip:port`). For multicast, use the group address (e.g., `"239.1.1.1:5000"`). For unicast, use `"0.0.0.0:5000"`. IPv6: `"[::]:5000"` or `"[ff7e::1]:5000"`. |
+| `external_address` | string | No | `null` | Public `host:port` this listener is reachable on from outside (a firewall port-forward). **Hint to the manager UI only** — the edge binds `bind_addr` and ignores this semantically; the manager's topology matcher uses it so cross-NAT links draw correctly. |
 | `interface_addr` | string | No | `null` | Network interface IP for multicast group join. Required for multicast on multi-homed hosts. Must be the same address family as `bind_addr`. |
 | `source_addr` | string | No | `null` | Source-specific multicast (SSM, RFC 3678) source address. When set, the kernel uses an `(S,G)` join instead of an `(*,G)` join — only packets from this exact source reach the socket. See [SSM vs ASM](#source-specific-multicast-ssm-vs-any-source-multicast-asm) below. |
 | `fec_decode` | object | No | `null` | SMPTE 2022-1 FEC decode parameters. See [FEC Configuration](#smpte-2022-1-fec-configuration). |
@@ -977,7 +1005,8 @@ Receives RTP-wrapped MPEG-TS packets (SMPTE ST 2022-2). Requires valid RTP v2 he
 | `allowed_sources` | array of strings | No | `null` | Source IP allow-list (RP 2129 C5). Only RTP packets from these source IPs are accepted. Each entry must be a valid IP address. When `null`, all sources are allowed. |
 | `allowed_payload_types` | array of integers | No | `null` | RTP payload type allow-list (RP 2129 U4). Only packets with these PT values (0-127) are accepted. When `null`, all payload types are allowed. |
 | `max_bitrate_mbps` | float | No | `null` | Maximum ingress bitrate in megabits per second (RP 2129 C7). Excess packets are dropped. Must be positive. When `null`, no rate limiting is applied. |
-| `ingress_dejitter_ms` | integer | No | node `tuning.ingress_dejitter_ms`, else `60` | Ingress **de-jitter** buffer setpoint, in ms of content. Packets are buffered and released paced at the recovered source rate (a leaky bucket trimmed ±5 % by the buffer-fill error, with a hard residence-cap shed), so every downstream consumer sees a smooth cadence regardless of network packet-delay variation. Range 20–2000. On a SMPTE 2022-7 dual-leg input it runs *after* the hitless merger, re-pacing the merger's bursty seq-ordered drain. Supersedes `ingress_delay_ms`, which is a pure delay line and *preserves* jitter. |
+| `ingress_delay_ms` | integer | No | `null` | Fixed ingress delay line, 0–1000 ms. Packets are held per-input and released at `recv_time + ingress_delay_ms`, *before* fan-out, so every downstream consumer shares one constant-shifted timeline. It is a **deterministic-alignment / cross-device-sync** tool — the input-side counterpart to the per-output `delay` in `fixed` mode — and reproduces inter-arrival spacing exactly, so it does **not** remove network jitter; use `ingress_dejitter_ms` for that (de-jitter supersedes this when both are set on the same input, and logs that it did). Accepts the legacy name `ingress_smoothing_ms` as a serde alias. `null` or `0` disables. |
+| `ingress_dejitter_ms` | integer | No | node `tuning.ingress_dejitter_ms`, else off | Ingress **de-jitter** buffer setpoint, in ms of content. Packets are buffered and released paced at the recovered source rate (a leaky bucket trimmed ±5 % by the buffer-fill error, with a hard residence-cap shed), so every downstream consumer sees a smooth cadence regardless of network packet-delay variation. Range 20–2000. On a SMPTE 2022-7 dual-leg input it runs *after* the hitless merger, re-pacing the merger's bursty seq-ordered drain. Supersedes `ingress_delay_ms`, which is a pure delay line and *preserves* jitter. |
 | `ingress_residence_ms` | integer | No | node `tuning.ingress_residence_ms`, else `max(4 × setpoint, 250)` ms | Hard-shed residence cap for this input's de-jitter buffer. A packet older than this is shed rather than released late, which is what bounds ingress latency when a burst or a source-rate offset exceeds the servo's ±5 % authority. Range `ingress_dejitter_ms + 40` .. `5000`. **Refused without `ingress_dejitter_ms` on the same input** — see the validation rules below. |
 | `passthrough_clock` | boolean | No | `false` | Opt **out** of muxer-mode PCR + PES PTS/DTS regeneration. The default (`false`) regenerates PCR and PES PTS/DTS against the flow's master clock — the industry-standard remux model (Sencore RMX, Cobalt 9970-MX, Cisco D9036 mux mode). `true` emits the source's PCR/PTS bytes unchanged: relay / transparent-forwarder behaviour, which also inherits the source's clock jitter and discontinuities at the receiver. Carried by every TS-bearing input type — `rtp`, `udp`, `srt`, `rist`, `rtmp`, `rtsp`, `media_player` and `replay`. **Required (`true`, or a `bonded` input) on every input of a flow using [epoch-locked egress](#epoch-locked-egress-cross-node-alignment)**, so alignment and PCR/PTS regeneration are mutually exclusive. Full rationale in [`clocking.md`](clocking.md). |
 
@@ -1008,9 +1037,11 @@ Receives raw UDP datagrams without requiring RTP headers. Suitable for raw MPEG-
 |-------|------|----------|---------|-------------|
 | `type` | string | Yes | - | Must be `"udp"`. |
 | `bind_addr` | string | Yes | - | Local socket address to bind (`ip:port`). For multicast, use the group address. |
+| `external_address` | string | No | `null` | Public `host:port` this listener is reachable on from outside (a firewall port-forward). **Hint to the manager UI only** — the edge binds `bind_addr` and ignores this semantically; the manager's topology matcher uses it so cross-NAT links draw correctly. |
 | `interface_addr` | string | No | `null` | Network interface IP for multicast group join. Must be the same address family as `bind_addr`. |
 | `source_addr` | string | No | `null` | SSM source address — see [RTP Input](#rtp-input) above. |
-| `ingress_dejitter_ms` | integer | No | node `tuning.ingress_dejitter_ms`, else `60` | Ingress de-jitter buffer setpoint, in ms of content (20–2000). Same servo as the RTP input — see [RTP Input](#rtp-input) above. |
+| `ingress_delay_ms` | integer | No | `null` | Fixed ingress delay line, 0–1000 ms — a pure delay that preserves jitter rather than removing it. See [RTP Input](#rtp-input) above. |
+| `ingress_dejitter_ms` | integer | No | node `tuning.ingress_dejitter_ms`, else off | Ingress de-jitter buffer setpoint, in ms of content (20–2000). Same servo as the RTP input — see [RTP Input](#rtp-input) above. |
 | `ingress_residence_ms` | integer | No | node `tuning.ingress_residence_ms`, else `max(4 × setpoint, 250)` ms | Hard-shed residence cap for this input's de-jitter buffer. Range `ingress_dejitter_ms + 40` .. `5000`. **Refused without `ingress_dejitter_ms` on the same input.** See [RTP Input](#rtp-input) above. |
 | `passthrough_clock` | boolean | No | `false` | Opt out of muxer-mode PCR + PES PTS/DTS regeneration — see [RTP Input](#rtp-input) above. |
 
@@ -1117,6 +1148,7 @@ Receives RTP encapsulated in SRT. Supports caller, listener, and rendezvous mode
 | `aes_key_len` | integer | No | `16` | AES key length in bytes: `16` (AES-128), `24` (AES-192), or `32` (AES-256). Only meaningful if `passphrase` is set. |
 | `crypto_mode` | string | No | `null` | Cipher mode: `"aes-ctr"` (default) or `"aes-gcm"` (authenticated encryption). AES-GCM requires libsrt >= 1.5.2 on the peer and only supports AES-128/256 (not AES-192). |
 | `redundancy` | object | No | `null` | SMPTE 2022-7 redundancy configuration for a second SRT leg. See [SRT Redundancy](#smpte-2022-7-srt-redundancy). |
+| `ingress_delay_ms` | integer | No | `null` | Fixed ingress delay line, 0–1000 ms — a pure delay that preserves jitter rather than removing it. See [RTP Input](#rtp-input) above. |
 | `passthrough_clock` | boolean | No | `false` | Opt out of muxer-mode PCR + PES PTS/DTS regeneration — see [RTP Input](#rtp-input) above. |
 
 Beyond these, an SRT input or output accepts the full libsrt socket-tuning set
@@ -1185,6 +1217,27 @@ Accepts incoming RTMP publish connections from OBS, ffmpeg, Wirecast, etc.
 }
 ```
 
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| `type` | string | Yes | - | Must be `"rtmp"`. |
+| `listen_addr` | string | Yes | - | Local socket address to listen on (`ip:port`), e.g. `"0.0.0.0:1935"`. |
+| `external_address` | string | No | `null` | Public `host:port` this listener is reachable on from outside (a firewall port-forward). **Hint to the manager UI only** — the edge binds `listen_addr` and ignores this semantically; the manager's topology matcher uses it so cross-NAT links draw correctly. |
+| `app` | string | No | `"live"` | RTMP application name — the publisher's URL path component (`rtmp://host:port/<app>/<stream_key>`). Must be non-empty and at most 64 characters. |
+| `stream_key` | string | No | `null` | Stream key the publisher must present. `null` accepts any key. At most 256 characters. |
+| `max_publishers` | integer | No | `1` | Parsed and persisted, but **inert today** — nothing in the edge reads this field, not even validation. Concurrent RTMP connections are bounded instead by a fixed internal cap of 8 (`MAX_RTMP_CONNECTIONS`); excess connections are dropped at accept with a warning. |
+| `program_number` | integer | No | `null` | MPTS → SPTS ingress filter. Accepted and validated (`> 0`) but there is nothing for it to filter: RTMP ingest is remuxed locally by `TsMuxer`, which always emits SPTS **program 1**. See [MPTS → SPTS filtering](#mpts--spts-filtering). |
+| `pid_map` | object | No | `null` | Mechanical ingress PID remap table applied to the synthesised TS. Keys + values in `0x0010..=0x1FFE`; source PIDs not listed pass through. Same shape as the output-side [`pid_map`](#ts-output-pid-remapping-pid_map). |
+| `pid_overrides` | object | No | `null` | Role-keyed PID pinning, applied by `TsMuxer` as it builds the TS. Because RTMP is a synthetic-TS source, the map may hold at most one entry, and it must be keyed `"1"`. See [Per-program PID pinning](#per-program-pid-pinning-pid_overrides). |
+| `ingress_delay_ms` | integer | No | `null` | Fixed ingress delay line, 0–1000 ms — a pure delay that preserves jitter rather than removing it. See [RTP Input](#rtp-input) above. RTMP has no de-jitter path, so this is the only ingress-timing knob it carries. |
+| `passthrough_clock` | boolean | No | `false` | Opt out of muxer-mode PCR + PES PTS/DTS regeneration — see [RTP Input](#rtp-input) above. |
+| `audio_encode` / `transcode` / `video_encode` | object | No | `null` | Optional ingress re-encode. Same blocks as the [RTP Input](#rtp-input) — see [the `audio_encode` block](#the-audio_encode-block-phase-b) and [`transcoding.md`](transcoding.md). |
+
+**Validation rules:**
+- `listen_addr` and `external_address` must be valid `ip:port` socket addresses.
+- `app` must be non-empty and at most 64 characters.
+- `stream_key`, when set, must be at most 256 characters.
+- `ingress_delay_ms` must be 0–1000 ms.
+
 ### RTSP Input
 
 Pulls H.264 or H.265/HEVC video and AAC audio from RTSP sources (IP cameras, media servers). Uses the `retina` pure-Rust RTSP client with automatic reconnection. Produces MPEG-TS with proper PAT/PMT program tables. Audio-only streams are supported (PAT/PMT are emitted even without video).
@@ -1208,6 +1261,7 @@ Pulls H.264 or H.265/HEVC video and AAC audio from RTSP sources (IP cameras, med
 | `transport` | string | No | `"tcp"` | `"tcp"` (interleaved, reliable) or `"udp"` (lower latency). |
 | `timeout_secs` | integer | No | `10` | Connection timeout in seconds. |
 | `reconnect_delay_secs` | integer | No | `5` | Delay between reconnection attempts on failure. |
+| `ingress_delay_ms` | integer | No | `null` | Fixed ingress delay line, 0–1000 ms — a pure delay that preserves jitter rather than removing it. See [RTP Input](#rtp-input) above. |
 | `passthrough_clock` | boolean | No | `false` | Opt out of muxer-mode PCR + PES PTS/DTS regeneration — see [RTP Input](#rtp-input) above. |
 
 ### WebRTC/WHIP Input
@@ -1249,6 +1303,12 @@ Pulls media from an external WHEP server. The edge acts as a WHEP client. The `w
 | `whep_url` | string | Yes | - | WHEP endpoint URL to pull from. |
 | `bearer_token` | string | No | `null` | Bearer token for WHEP authentication. |
 | `video_only` | boolean | No | `false` | Receive only video (ignore audio). |
+| `accept_self_signed_cert` | boolean | No | **`true`** | **Defaults to ON — the WHEP client performs no TLS certificate validation** against an `https://` endpoint. Unlike the identically-named field in the [`manager` block](#manager-configuration), this one is **not** gated by `BILBYCAST_ALLOW_INSECURE=1` and nothing rejects it at validation time. Set `false` in production, or pin `cert_fingerprint`. |
+| `cert_fingerprint` | string | No | `null` | SHA-256 of the expected WHEP server leaf certificate (colon-separated hex). When set, full CA-chain validation runs **and** the leaf must match — it overrides `accept_self_signed_cert`. |
+
+The insecure default is historical. It differs from the `manager` block
+documented at [Manager Configuration](#manager-configuration), which defaults
+`false` and refuses to start without the env guard.
 
 ### Media Player Input
 
@@ -1479,10 +1539,20 @@ single ordered TS stream.
   "type": "bonded",
   "id": "in-bonded",
   "name": "Bonded receive",
-  "local_addr": "0.0.0.0:5500",
-  "psk": "<32-byte hex>"
+  "bond_flow_id": 42,
+  "paths": [
+    { "id": 0, "name": "lte-0", "transport": { "type": "udp", "bind": "0.0.0.0:5500" } },
+    { "id": 1, "name": "lte-1", "transport": { "type": "udp", "bind": "0.0.0.0:5501" } }
+  ],
+  "hold_ms": 500,
+  "encryption_key": "<64 hex chars>"
 }
 ```
+
+`bond_flow_id` and `paths` are required and must match the sender end;
+addresses are per-leg, inside `paths[].transport`. `encryption_key` is the
+shared 64-hex-char (32-byte) AEAD key — there is no `local_addr` or `psk`
+field on a bonded input.
 
 The full Bonded protocol — path adapters, link selection, latency
 budget, FEC — is covered in [`bilbycast-bonding/CLAUDE.md`](../../bilbycast-bonding/CLAUDE.md)
@@ -1631,8 +1701,11 @@ broadcast channel. Three variants mirror the ST 2110-20/-30/-40 pattern.
 Gated on the `mxl` Cargo feature (default **off**, heavy build prereqs —
 see [`../../bilbycast-mxl-rs/CLAUDE.md`](../../bilbycast-mxl-rs/CLAUDE.md)); the
 schema is always present so configs round-trip on builds without it.
-**PTP is mandatory** — validation rejects `master_clock: "wallclock"` on
-any MXL flow, and the flow resolves to the `ptp` master-clock kind. The
+**MXL is PTP-disciplined**: under the default `auto` policy an MXL flow
+resolves to the `ptp` master-clock kind. Nothing currently *rejects* an
+explicit override — a flow carrying `"master_clock": {"kind": "wallclock"}`
+validates and runs on wallclock, which will not track the MXL domain, so do
+not set it. The
 boot probe `dlopen`s `libmxl.so` and only advertises the `mxl-video` /
 `mxl-audio` / `mxl-anc` capability bits on success.
 
@@ -1688,7 +1761,10 @@ Architecture rationale + integration plan:
 
 Each entry in the top-level `outputs` array is an `OutputConfig` with `id`, `name`, and protocol-specific fields (enum-tagged by `type`). Outputs are independent top-level entities that exist whether or not they are assigned to a flow. They are managed via REST at `/api/v1/outputs` (CRUD) and via manager WebSocket commands.
 
-All outputs share `id` and `name` fields.
+All outputs share `id`, `name`, `active` (boolean, default `true` — a passive
+output is persisted in config but never spawned by the engine; toggle it live
+with `POST /api/v1/outputs/{output_id}/active`) and `group` (string, max 64
+chars, default `null` — free-form tag for UI grouping).
 
 ### RTP Output
 
@@ -1842,9 +1918,26 @@ recovers nothing shared. **Consequence the operator feels: alignment and PCR/PTS
 regeneration are mutually exclusive** — turning this on gives up muxer-mode
 rewriting on those inputs.
 
-A flow-level violation does not fail the config. The edge **strips `epoch_lock`
-from the flow's outputs and keeps running**, logging why; the absent
-`epoch_lock` telemetry block is what tells the manager the group never armed.
+**What a flow-level violation does depends on which path sees it, and the two
+paths disagree.** `validate_config` runs the scope rules above and **rejects**
+outright — a node started on such a config file logs `Invalid configuration` and
+exits (`main.rs`), and the same refusal covers the setup wizard, a whole-config
+`update_config` push, `PUT /api/v1/config`, `POST /api/v1/config/reload` and the
+`activate-input` / output-`active` toggles. The per-entity paths — flow start,
+restart and every hot edit, all of which land in `AppConfig::resolve_flow` —
+instead **strip `epoch_lock` from the flow's RTP/UDP outputs and keep running**,
+logging why at error level; the absent `epoch_lock` telemetry block is what
+tells the manager the group never armed.
+
+**The gap between the two is reachable on disk.** `POST` / `PUT
+/api/v1/outputs/{output_id}` and the WS `add_output` / `update_output` commands
+validate the *output* alone; `POST /api/v1/flows` / `PUT /api/v1/flows/{flow_id}`
+and the WS `create_flow` / `update_flow` commands run `validate_flow`, which is
+handed the flow record only and so cannot see an output at all. None of the six
+runs `validate_config`, and every one of them persists. `resolve_flow` strips
+in a clone and never writes back, so a flow-invalid `epoch_lock` block survives
+in `config.json` and kills the **next boot**, on a node that by then has no
+manager WebSocket to fix it over. Fix it on the box.
 
 Per-output telemetry rides `OutputStats.epoch_lock`: `engaged`, `disengaged`,
 `egress_offset_us`, `deficit_us` / `deficit_max_us` (released **late** — raise
@@ -1934,13 +2027,14 @@ Sends RTP encapsulated in SRT.
 | `mode` | string | Yes | - | SRT connection mode: `"caller"`, `"listener"`, or `"rendezvous"`. |
 | `local_addr` | string | Conditional | `0.0.0.0:0` | Local socket address to bind. For **caller** this is the **source socket** (bind-then-connect), not the destination — use `"0.0.0.0:0"` (ephemeral) unless pinning a source interface/port, and **never** set it equal to `remote_addr` or to a co-located egress tunnel's port. Required as the listen address for **listener/rendezvous**. A pinned port is checked against every other bind on the node (including tunnels) and rejected with `port_conflict` on collision. |
 | `remote_addr` | string | Conditional | `null` | Remote address. Required for `caller` and `rendezvous`. |
+| `external_address` | string | No | `null` | Public `host:port` this listener is reachable on from outside (a firewall port-forward). **Hint to the manager UI only** — the edge binds `local_addr` and ignores this semantically; the manager's topology matcher uses it so cross-NAT links draw correctly. **Rejected outside `mode: "listener"`** — a caller or rendezvous socket has no listen address to advertise. |
 | `latency_ms` | integer | No | `120` | SRT send latency in milliseconds. |
 | `passphrase` | string | No | `null` | AES encryption passphrase (10-79 characters). |
 | `aes_key_len` | integer | No | `16` | AES key length: 16, 24, or 32. |
 | `crypto_mode` | string | No | `null` | Cipher mode: `"aes-ctr"` (default) or `"aes-gcm"`. |
 | `redundancy` | object | No | `null` | SMPTE 2022-7 redundancy for a second SRT output leg. |
 | `program_number` | integer | No | `null` | MPTS → SPTS program filter. `null` = full MPTS passthrough; `Some(N)` = forward only program N as a rewritten single-program TS. Applied once and mirrored to both legs when 2022-7 is enabled. Must be `> 0`. See [MPTS → SPTS filtering](#mpts--spts-filtering). |
-| `delay_ms` | integer | No | `null` | Output delay in milliseconds (0–10000). When set and > 0, packets are buffered and released after this delay. Used for synchronizing parallel outputs with different processing latencies. Incompatible with `transport_mode: "audio_302m"`. |
+| `delay` | object | No | `null` | Output delay for stream synchronization — same modes as the RTP output: `{"mode":"fixed","ms":N}`, `{"mode":"target_ms","ms":N}`, `{"mode":"target_frames","frames":N,"fallback_ms":M}`. Used for synchronizing parallel outputs with different processing latencies. Incompatible with `transport_mode: "audio_302m"`. |
 | `cbr_pad_to_kbps` | integer | No | `null` | Pad the output to a constant wire bitrate (kbps) by injecting PID `0x1FFF` NULL packets between the transcoder pipeline and the wire emitter, so the rate is stable regardless of the encoder's natural VBR output — for downstream multiplexers and legacy receivers that expect CBR. Range **1000–1000000**. When the output declares `audio_encode.bitrate_kbps` and/or `video_encode.bitrate_kbps`, the target must exceed their sum by at least **5 %**: a target at or below the encoder budget would never inject a single NULL, so it is rejected at save time rather than silently doing nothing. SRT carries the padded TS opaquely, so a receiver measuring wire rate sees the inflated stream. |
 
 ### RTMP Output
@@ -1973,7 +2067,7 @@ Publishes to an RTMP/RTMPS server (e.g., Twitch, YouTube Live, Facebook Live). D
 | `reconnect_delay_secs` | integer | No | `5` | Seconds to wait before reconnecting after a failure. Must be > 0. |
 | `max_reconnect_attempts` | integer | No | `null` (unlimited) | Maximum reconnection attempts. When `null`, reconnects indefinitely. |
 | `program_number` | integer | No | `null` | MPTS program selector. `null` = lock onto the lowest program_number in the PAT (deterministic default); `Some(N)` = extract elementary streams from program N only. RTMP is single-program by spec, so this only changes *which* program is published. Must be `> 0`. See [MPTS → SPTS filtering](#mpts--spts-filtering). |
-| `audio_encode` | object | No | `null` | Optional ffmpeg-sidecar audio encoder. Enables PCM → compressed re-encode so the operator can normalise bitrate / sample rate / channel count or upgrade to HE-AAC v1/v2. Allowed `codec`: `aac_lc`, `he_aac_v1`, `he_aac_v2`. Same-codec passthrough fast path applies on AAC-LC source with no field overrides. Requires ffmpeg in PATH. See the [`audio_encode` block](#the-audio_encode-block-phase-b) below and [`audio-gateway.md`](audio-gateway.md#the-audio_encode-block--compressed-audio-egress-rtmp--hls--webrtc). |
+| `audio_encode` | object | No | `null` | Optional audio encoder. Enables PCM → compressed re-encode so the operator can normalise bitrate / sample rate / channel count or upgrade to HE-AAC v1/v2. Allowed `codec`: `aac_lc`, `he_aac_v1`, `he_aac_v2`. Same-codec passthrough fast path applies on AAC-LC source with no field overrides. Encoded **in-process** via Fraunhofer FDK AAC on any build carrying the default `fdk-aac` feature; no `ffmpeg` binary is involved. See the [`audio_encode` block](#the-audio_encode-block-phase-b) below and [`audio-gateway.md`](audio-gateway.md#the-audio_encode-block--compressed-audio-egress-rtmp--hls--webrtc). |
 
 **Limitations:**
 - Output only. RTMP input is not supported.
@@ -2005,7 +2099,7 @@ Segments MPEG-2 TS data and uploads via HTTP for HLS ingest (e.g., YouTube HLS).
 | `auth_token` | string | No | `null` | Bearer token sent with each HTTP upload request. |
 | `max_segments` | integer | No | `5` | Maximum segments in the rolling playlist. Range: 1-30. |
 | `program_number` | integer | No | `null` | MPTS → SPTS program filter. `null` = each segment carries the full MPTS; `Some(N)` = each segment carries only program N as a rewritten single-program TS. Must be `> 0`. See [MPTS → SPTS filtering](#mpts--spts-filtering). |
-| `audio_encode` | object | No | `null` | Optional per-segment ffmpeg remuxer. Each segment is piped through `ffmpeg -i pipe:0 -c:v copy -c:a {codec} -f mpegts pipe:1` before HTTP PUT. Allowed `codec`: `aac_lc`, `he_aac_v1`, `he_aac_v2`, `mp2`, `ac3`. Requires ffmpeg in PATH; the output refuses to start if ffmpeg is missing. See the [`audio_encode` block](#the-audio_encode-block-phase-b) below. |
+| `audio_encode` | object | No | `null` | Optional per-segment audio re-encode. On any build carrying the default `media-codecs` feature each segment is remuxed **in-process** via libavcodec / FDK AAC — no `ffmpeg` binary is involved. Allowed `codec`: `aac_lc`, `he_aac_v1`, `he_aac_v2`, `mp2`, `ac3` (`opus` is rejected on HLS-TS); HE-AAC v1/v2 additionally need the `fdk-aac` feature. Only a build with `media-codecs` compiled out pipes each segment through `ffmpeg -i pipe:0 -c:v copy -c:a {codec} -f mpegts pipe:1` and refuses to start when ffmpeg is missing. See the [`audio_encode` block](#the-audio_encode-block-phase-b) below. |
 
 **Limitations:**
 - Output only. Segment-based transport inherently adds 1-4 seconds of latency.
@@ -2078,7 +2172,7 @@ CMAF with DRM:
 | `thumbnails` | object | No | `null` | Scrub-preview sprite sheets plus a WebVTT index, PUT beside the media. See [`thumbnails`](#the-cmaf-thumbnails-block) below. Off when omitted. |
 | `encryption` | object | No | `null` | Common Encryption configuration. **Refused together with `low_latency = true`** — the LL path does not encrypt its chunks (bilbycast-edge#135). See [`encryption`](#the-cmaf-encryption-block) below. |
 | `audio_encode` | object | No | `null` | Optional AAC re-encode. Allowed `codec`: `aac_lc`, `he_aac_v1`, `he_aac_v2`. Source must already be AAC (TsDemuxer decodes via fdk-aac). When omitted, the source AAC passes through unchanged. |
-| `video_encode` | object | No | `null` | Optional H.264 / HEVC re-encode with explicit GoP alignment to `segment_duration_secs`. See the [`video_encode` block](#the-video_encode-block) for backends and fields. H.264 → H.264 or HEVC → H.264 conversion is supported when the matching `video-encoder-*` Cargo feature is enabled. |
+| `video_encode` | object | No | `null` | Optional H.264 / HEVC re-encode with explicit GoP alignment to `segment_duration_secs`. See [`video_encode`](transcoding.md#video_encode--h264--hevc-re-encoding) in `transcoding.md` for backends and fields. H.264 → H.264 or HEVC → H.264 conversion is supported when the matching `video-encoder-*` Cargo feature is enabled. |
 | `program_number` | integer | No | `null` | MPTS → SPTS program filter. Must be `> 0`. See [MPTS → SPTS filtering](#mpts--spts-filtering). |
 | `auth_token` | string | No | `null` | Bearer token sent with every HTTP PUT / chunked PUT. |
 
@@ -2164,7 +2258,6 @@ Supports two modes: WHIP client (push to external endpoint) and WHEP server (ser
   "id": "whep-serve",
   "name": "Browser Viewers",
   "mode": "whep_server",
-  "max_viewers": 20,
   "bearer_token": "viewer-auth-token"
 }
 ```
@@ -2179,18 +2272,21 @@ Viewers POST an SDP offer to `/api/v1/flows/{flow_id}/whep` and receive an SDP a
 | `mode` | string | No | `"whip_client"` | `"whip_client"` (push to endpoint) or `"whep_server"` (serve viewers). |
 | `whip_url` | string | WHIP only | - | WHIP endpoint URL. Required for `whip_client` mode. |
 | `bearer_token` | string | No | `null` | Bearer token for authentication. |
-| `max_viewers` | integer | No | `10` | Max concurrent viewers (WHEP server mode only, 1-100). |
+| `max_viewers` | integer | No | unset | WHEP server mode only. Accepted and range-validated (1-100) but **not enforced today** — nothing outside validation reads it, so the WHEP server admits viewers without an admission cap. |
 | `public_ip` | string | No | `null` | Public IP for ICE candidates (NAT traversal). |
+| `accept_self_signed_cert` | boolean | No | **`true`** | `whip_client` mode only. **Defaults to ON — no TLS certificate validation** when pushing to an `https://` WHIP endpoint. Unlike the identically-named field in the [`manager` block](#manager-configuration), this one is **not** gated by `BILBYCAST_ALLOW_INSECURE=1` and nothing rejects it at validation time. Set `false` in production, or pin `cert_fingerprint`. |
+| `cert_fingerprint` | string | No | `null` | SHA-256 of the expected WHIP server leaf certificate (colon-separated hex). When set, full CA-chain validation runs **and** the leaf must match — it overrides `accept_self_signed_cert`. |
+| `webrtc_compatible` | boolean | No | `false` | Force a browser-safe H.264 encode (no B-frames, 8-bit 4:2:0, inline SPS/PPS per IDR). Also available on SRT outputs. Full rationale: [`transcoding.md`](transcoding.md#the-webrtc_compatible-output-flag-browser-safe-h264). |
 | `video_only` | boolean | No | `false` | Only send video (audio omitted). Mutually exclusive with `audio_encode` — validation rejects the combination because an audio MID must be negotiated in SDP for the encoder to write to. |
 | `program_number` | integer | No | `null` | MPTS program selector. `null` = lock onto the lowest program_number in the PAT (deterministic default); `Some(N)` = extract elementary streams from program N only. WebRTC is single-program by spec, so this only changes *which* program is sent. Must be `> 0`. See [MPTS → SPTS filtering](#mpts--spts-filtering). |
-| `audio_encode` | object | No | `null` | Optional ffmpeg-sidecar audio encoder. The only realistic codec for WebRTC is `opus`, and validation rejects anything else. When set, input AAC-LC is decoded in-process via the Phase A `AacDecoder`, encoded to Opus via the Phase B ffmpeg sidecar, and written to the WebRTC audio MID via str0m. This is the marquee Phase A+B "AAC contribution → Opus distribution" path. Requires `video_only=false` and ffmpeg in PATH. The encoder builds lazily on the first AAC frame after a viewer connects. See the [`audio_encode` block](#the-audio_encode-block-phase-b) below. |
+| `audio_encode` | object | No | `null` | Optional audio encoder. The only realistic codec for WebRTC is `opus`, and validation rejects anything else. When set, input AAC-LC is decoded in-process via the Phase A `AacDecoder`, encoded to Opus **in-process** via libopus / libavcodec (the default `media-codecs` feature), and written to the WebRTC audio MID via str0m. This is the marquee Phase A+B "AAC contribution → Opus distribution" path. Requires `video_only=false`; no `ffmpeg` binary is needed on a default build. The encoder builds lazily on the first AAC frame after a viewer connects. See the [`audio_encode` block](#the-audio_encode-block-phase-b) below. |
 
 **Audio:** Without `audio_encode`, the WebRTC output is video-only when
 the source carries AAC (Opus passthrough only — Opus flows natively on
 WebRTC paths). Setting an `audio_encode` block (codec: `opus`) enables
 the marquee Phase A+B chain: AAC decoded in-process via Phase A's
-`AacDecoder`, re-encoded as Opus via Phase B's ffmpeg sidecar
-`AudioEncoder`, written to the str0m audio MID. See
+`AacDecoder`, re-encoded as Opus in-process via Phase B's libopus /
+libavcodec `AudioEncoder`, written to the str0m audio MID. See
 [`audio-gateway.md`](audio-gateway.md#the-audio_encode-block--compressed-audio-egress-rtmp--hls--webrtc).
 
 ### The `audio_encode` block (Phase B)
@@ -2221,24 +2317,36 @@ examples.
 
 | Field | Type | Required | Default | Description |
 |---|---|---|---|---|
-| `codec` | string | Yes | - | One of: `aac_lc`, `he_aac_v1`, `he_aac_v2`, `opus`, `mp2`, `ac3`. Must be valid for the parent output type per the matrix above. |
+| `codec` | string | Yes | - | One of: `aac_lc`, `he_aac_v1`, `he_aac_v2`, `opus`, `mp2`, `ac3`. Must be valid for the parent output type per the matrix above. A seventh value, `s302m`, exists **only on the input side** — ST 2110-30, ST 2110-31 and `rtp_audio` inputs reuse this same block to wrap their PCM into TS, and -31 accepts *nothing else*. No output type accepts it. It refuses `bitrate_kbps` (302M is a lossless PCM wrap) and, when `sample_rate` is set at all, requires 48000. |
 | `bitrate_kbps` | integer | No | per-codec default (AAC-LC=128, HE-AAC-v1=64, HE-AAC-v2=32, Opus=96, MP2=192, AC-3=192) | Output bitrate in kbps. Range 16..=512. |
 | `sample_rate` | integer | No | input sample rate | Output sample rate (Hz). Allowed: 8000, 16000, 22050, 24000, 32000, 44100, 48000. **Opus is always carried at 48 kHz on the wire** regardless of this field. |
-| `channels` | integer | No | input channel count | Output channel count, 1 or 2. |
+| `channels` | integer | No | input channel count | Output channel count. Per-codec maximum: `aac_lc` 1-8, `ac3` 1-6, `he_aac_v1` / `mp2` / `opus` 1-2, `he_aac_v2` exactly 2 (Parametric Stereo — mono and multichannel must use `aac_lc` / `he_aac_v1`), `s302m` 2, 4, 6 or 8. Out-of-range values are rejected at config load. |
+| `source_audio_pid` | integer | No | unset | Pin which source audio PID is re-encoded on a multi-track program. Unset = the first PID whose `stream_type` matches. A pin absent from the live PMT falls back to first-matching-codec audio and logs `error_code = audio_source_pid_not_found`. The in-place transcoder is single-program: to produce e.g. an English and a French output, create one output per track, each with its own `program_number` filter, this pin, and its own `audio_encode`. |
 
-**Failure modes:** the encoder is opt-in. When ffmpeg is missing in
-PATH, the input is non-AAC-LC, the flow input cannot carry TS audio
-(PCM-only sources), or the encoder spawn / restart cap is exhausted,
-the output emits a Critical `audio_encode` event to the manager and
-audio is dropped silently for the rest of the output's lifetime
-(video continues). HLS refuses to start outright when ffmpeg is
-missing because it can't degrade gracefully. See
+**Encoding is in-process on every shipped build.** `aac_lc` /
+`he_aac_v1` / `he_aac_v2` go to Fraunhofer FDK AAC (`fdk-aac`) and
+`opus` / `mp2` / `ac3` to libavcodec + libopus (`media-codecs`); both
+features are on by default and on all three release artefacts, so no
+`ffmpeg` binary is consulted at any point. The ffmpeg-subprocess
+backend — and the HLS "refuses to start when ffmpeg is missing in
+PATH" behaviour — exists only on a build with those features compiled
+out.
+
+**Failure modes:** the encoder is opt-in. When the input is
+non-AAC-LC, the flow input cannot carry TS audio (PCM-only sources),
+or the encoder spawn / restart cap is exhausted, the output emits a
+Critical `audio_encode` event to the manager and audio is dropped
+silently for the rest of the output's lifetime (video continues). See
 [`events-and-alarms.md`](events-and-alarms.md#audio-encoder-audio_encode)
 for the full event reference.
 
-**HE-AAC v2 caveat:** `aac_he_v2` requires an ffmpeg build with
-`libfdk_aac`. If the host's ffmpeg doesn't have it, the encoder
-fails fast on the first frame and emits the failure event.
+**HE-AAC v2 caveat:** `he_aac_v2` is a property of the binary, not of
+anything installed on the host — with `fdk-aac` compiled in (the
+default) the vendored Fraunhofer encoder handles it. Only on a build
+without that feature does it fall back to a subprocess, which then
+demands an ffmpeg built with `libfdk_aac` and refuses to start without
+it. (HLS is stricter: on a `media-codecs` build with `fdk-aac` compiled
+out it rejects HE-AAC v1/v2 outright rather than falling back.)
 
 ### Display Output (HDMI / DisplayPort + ALSA)
 
@@ -2673,10 +2781,20 @@ aggregated for throughput and failover.
   "type": "bonded",
   "id": "out-bonded",
   "name": "Bonded send",
-  "remote_addr": "203.0.113.10:5500",
-  "psk": "<32-byte hex>"
+  "bond_flow_id": 42,
+  "paths": [
+    { "id": 0, "name": "lte-0", "transport": { "type": "udp", "remote": "203.0.113.10:5500" } },
+    { "id": 1, "name": "lte-1", "transport": { "type": "udp", "remote": "203.0.113.10:5501" } }
+  ],
+  "scheduler": "adaptive",
+  "encryption_key": "<64 hex chars>"
 }
 ```
+
+`bond_flow_id` and `paths` are required and must match the receiver end;
+addresses are per-leg, inside `paths[].transport`. `encryption_key` is the
+shared 64-hex-char (32-byte) AEAD key — there is no `remote_addr` or `psk`
+field on a bonded output.
 
 The full Bonded protocol — path adapters, link selection, latency
 budget, FEC — is covered in [`bilbycast-bonding/CLAUDE.md`](../../bilbycast-bonding/CLAUDE.md)
@@ -2966,6 +3084,57 @@ Every TS-carrying output (`udp`, `rtp`, `srt`, `rist`, `hls`, `bonded`) accepts 
 - Source PIDs must be unique; target PIDs must be unique — so two different sources can never collide on the wire.
 - Applies to the whole TS stream on that output, including PSI PIDs. If you remap a PMT PID, set the `pmt_pid` on the corresponding assembly program to the *source* value — the `pid_map` rewrites it on egress.
 - Works equally on passthrough flows (rewrites upstream PIDs) and assembled flows (rewrites the assembly's `out_pid` values). For assembled flows, prefer picking the right `out_pid` in the assembly — `pid_map` is an escape hatch for downstream constraints you can't change.
+
+## Per-program PID pinning (`pid_overrides`)
+
+Where `pid_map` is a mechanical source→target rewrite of the whole TS,
+`pid_overrides` is **role-keyed**: it says which PID the *video*, the *audio*,
+the *PMT* and the *PCR* of a given program should land on. That is what lets a
+downstream decoder stay locked while the switcher cuts between inputs whose
+upstream layouts differ. Every input type carries the field except `bonded`,
+`mosaic` and the ANC-only `st2110_40` / `mxl_anc`; on the output side validation
+reads it on `rtp`, `udp`, `srt`, `rist`, `rtmp`, `webrtc` and `rtp_audio` only —
+`hls`, `bonded`, `display`, `sdi`, ST 2110 and MXL outputs have no such field,
+and the one a `cmaf` output does carry is parsed and then ignored.
+
+**The JSON key is the `program_number` as a decimal string**, not a bare
+integer — `"1"`, `"2"`. A key that does not parse as a `u16` is rejected with
+`pid_overrides key must be a u16 program_number (0-65535)`.
+
+```json
+"pid_overrides": {
+  "1": {
+    "pmt_pid": 4096,
+    "video_pid": 256,
+    "audio_pid": 257,
+    "pcr_pid": 256
+  },
+  "2": {
+    "pmt_pid": 4112,
+    "video_pid": 512,
+    "audio_pids": { "600": 513, "601": 514 }
+  }
+}
+```
+
+| Field | Type | Default | Meaning |
+|---|---|---|---|
+| `pmt_pid` | integer | unchanged | PID the program's PMT is emitted on. |
+| `video_pid` | integer | unchanged | PID the program's video PES is emitted on. |
+| `audio_pid` | integer | unchanged | PID the program's audio PES is emitted on. Singular — used by the synthetic-TS path (test pattern, media player, replay, slate, PCM encode), which only ever emits one audio ES. On a TS-passthrough multi-audio program it still remaps the **first** audio PID. |
+| `audio_pids` | object | unchanged | Source-PID → target-PID map for multi-language / multi-track programs, keyed by the **source** audio PID. Honoured by the passthrough rewriter and ignored by the synthetic-TS path. An entry here **wins over `audio_pid`** for the same source PID. Entries naming a PID absent from the live PMT are inert. |
+| `pcr_pid` | integer | rides video (or audio if no video) | PID the PMT declares as the PCR carrier. |
+
+**Rules (validated at config load and on WS command):**
+
+- Every PID — including both sides of an `audio_pids` entry — must be in `0x0010..=0x1FFE`. `0x0000`–`0x000F` and the NULL PID `0x1FFF` are refused.
+- Program `0` is refused: it is the NIT, not a program.
+- `pmt_pid` may not collide with `video_pid` or `audio_pid`, and `video_pid` may not collide with `audio_pid`.
+- `pcr_pid` may alias the video or an audio PID — that is the normal pattern — but **not** the PMT PID, and it must name a PID the muxer actually emits PCR on. PCR is written into a video (or audio-only) PES adaptation field; it is never synthesised onto a standalone PID, so a `pcr_pid` naming neither would advertise a PCR PID carrying no PCR (a TR 101 290 PCR_error, and a stream no receiver can clock).
+- On a synthetic-TS **input** — one that always emits a single SPTS program 1 (`rtmp`, `rtsp`, `webrtc`, `whep`, `test_pattern`, `sdi`, ST 2110-20/-23, `mxl_video`, plus a PCM input once `audio_encode` turns it into a TS carrier) — the map may hold **at most one** entry, keyed `"1"`; any other key is refused with a pointer to Flow Assembly for multi-program output. The **output** side is not narrowed the same way: `validate_output` always passes the multi-program rule, so an `rtmp` or `webrtc` output that can only ever emit program 1 still accepts a map keyed `"2"` — which then matches nothing.
+
+An `audio_pids` entry whose source PID stops appearing in the PMT raises the
+manager's `pid_overrides_stale_audio_pid` alarm rather than failing the flow.
 
 ---
 
@@ -4183,7 +4352,8 @@ clips.json       ← named (in_pts, out_pts) ranges
     "segment_seconds": 10,
     "retention_seconds": 86400,
     "max_bytes": 53687091200,
-    "pre_buffer_seconds": null
+    "pre_buffer_seconds": null,
+    "filmstrip_seconds": null
   }
 }]
 ```
@@ -4196,6 +4366,7 @@ clips.json       ← named (in_pts, out_pts) ranges
 | `retention_seconds` | `86400` (24h) | Oldest-first prune by mtime. `0` = unlimited |
 | `max_bytes` | `53687091200` (50 GiB) | Oldest-first prune by total size. `0` = unlimited (still subject to disk) |
 | `pre_buffer_seconds` | `null` | When set, the writer auto-arms in `PreBuffer` mode and rolls segments to disk with retention pinned at this value, so an operator pressing Start later picks up the last `N` seconds of pre-roll. `null` = no pre-buffer (writer starts in `Armed` mode the moment it spawns). Range `[1, 300]` when set. `RecordingStats.armed` stays `false` while in pre-buffer so the manager UI distinguishes pre-roll from a live recording session |
+| `filmstrip_seconds` | `null` (= off) | Filmstrip-thumbnail cadence in seconds. When set, a sibling drop-on-lag broadcast subscriber decodes one frame every `N` seconds and writes a 160-px-wide JPEG to `<recording_dir>/thumbs/<pts_90khz>.jpg` (staged in `.tmp/` and renamed, so a SIGKILL leaves no half-file), which the manager `/replay` page renders as the scrubber strip. Range `[1, 30]`. Independent of the live `FlowConfig.thumbnail` boolean — that one goes to the manager over WS, this one goes to disk. The `replay-filmstrip` capability, which is what the manager UI gates both this field and the `…/replay/filmstrip` fetch on, is advertised by any `replay` build whether or not this field is set |
 
 The writer is a sibling subscriber on the flow's broadcast channel —
 drop-on-lag with a Critical `replay_writer_lagged` event mirrors the

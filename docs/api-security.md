@@ -171,7 +171,7 @@ bilbycast-edge supports two roles:
 | `/health` | GET | Yes | Yes | Yes |
 | `/oauth/token` | POST | Yes | Yes | Yes |
 | `/setup` | GET | Yes | Yes | Yes (if setup_enabled) |
-| `/setup` | POST | Yes | Yes | Yes (if setup_enabled) |
+| `/setup` | POST | Yes | Yes | Yes (if setup_enabled; non-loopback callers must send `Authorization: Bearer <setup_token>`) |
 | `/setup/status` | GET | Yes | Yes | Yes (if setup_enabled) |
 | `/metrics` | GET | Yes | Yes | Yes (if public_metrics) |
 | `/x-nmos/**` | GET/PATCH/POST | Yes | Yes | Yes (only when auth is disabled, or `nmos_require_auth: false` is set) |
@@ -191,26 +191,52 @@ bilbycast-edge supports two roles:
 | `/api/v1/config` | PUT | Yes | **No (403)** | Yes |
 | `/api/v1/config/reload` | POST | Yes | **No (403)** | Yes |
 | `/api/v1/ws/stats` | GET | Yes | Yes | Yes |
-| `/api/v1/flows/{id}/whip` | POST | Yes | **No (403)** | Yes |
-| `/api/v1/flows/{id}/whip/{sid}` | DELETE | Yes | **No (403)** | Yes |
-| `/api/v1/flows/{id}/whep` | POST | Yes | **No (403)** | Yes |
-| `/api/v1/flows/{id}/whep/{sid}` | DELETE | Yes | **No (403)** | Yes |
+| `/api/v1/flows/{id}/whip` | POST | Yes | Yes | Yes |
+| `/api/v1/flows/{id}/whip/{sid}` | DELETE | Yes | Yes | Yes |
+| `/api/v1/flows/{id}/whep` | POST | Yes | Yes | Yes |
+| `/api/v1/flows/{id}/whep/{sid}` | DELETE | Yes | Yes | Yes |
 
-**Note:** This table is illustrative, not exhaustive. The same role rule
-applies uniformly to every route: `GET /api/v1/*` is read-only (any role),
-and every mutating `POST`/`PUT`/`DELETE` under `/api/v1/*` requires `admin`.
-Newer routes not listed above follow this rule too — e.g. the top-level
-inputs/outputs CRUD (`/api/v1/inputs`, `/api/v1/outputs` and their `{id}`
-variants), flow assembly (`PUT /api/v1/flows/{id}/assembly`), per-output
-active-flow management (`/api/v1/outputs/{id}/active`), and the PTP status
-endpoint (`/api/v1/ptp`).
+**Note:** This table is illustrative, not exhaustive. The role rule holds for
+most routes: `GET /api/v1/*` is read-only (any role), and mutating
+`POST`/`PUT`/`DELETE` under `/api/v1/*` requires `admin`. Newer routes not
+listed above generally follow it too — e.g. the top-level inputs/outputs CRUD
+(`/api/v1/inputs`, `/api/v1/outputs` and their `{id}` variants), flow assembly
+(`PUT /api/v1/flows/{id}/assembly`) and per-output active-flow management
+(`/api/v1/outputs/{id}/active`).
 
-**Note:** WHIP/WHEP endpoints additionally validate per-flow Bearer tokens configured in the flow's WebRTC input/output config. This is separate from the API auth — even with API auth disabled, the per-flow bearer_token protects WebRTC signaling.
+**Note:** `POST /setup` is not open just because `setup_enabled` is true. A
+non-loopback caller must also present `Authorization: Bearer <setup_token>`,
+compared in constant time; a missing or empty token is **401**. Loopback
+callers bypass the check. See "Securing the setup wizard" in
+[`installation.md`](installation.md) for the token's lifecycle
+(`--print-setup-token`, the first-boot banner, and automatic clearing on
+registration).
+
+**Exceptions (as shipped).** `RequireAdmin` is a per-handler extractor, not a
+router layer, and three write handlers do not take it: `PUT /api/v1/ptp`,
+`POST /api/v1/tunnels` and `DELETE /api/v1/tunnels/{id}`. Their only layers are
+`guard_cross_origin_write` and `auth_middleware`, and the middleware just
+decodes the JWT — so a `monitor` token reaches them and they execute, changing
+the node's PTP mode (persisted via `ptp_config::save`) or creating/destroying a
+tunnel and persisting the change to `config.json`. Treat a `monitor` token as
+able to do all three until the extractor is added to `ptp::put_ptp`,
+`tunnels::create_tunnel` and `tunnels::delete_tunnel`. The four WHIP/WHEP
+routes are the fourth exception, for the different reason below.
+
+**Note:** The WHIP/WHEP routes carry no role gate either — any valid JWT (or
+any caller when auth is disabled) reaches them, which is why the `monitor`
+column reads Yes. The only additional check is the optional per-flow
+`bearer_token` on the two **offer** endpoints, configured in the flow's WebRTC
+input/output config: it returns **401** when configured and mismatched, and is
+skipped entirely when unset. The two session-teardown `DELETE`s check no token
+at all, so any authenticated role can tear down a live WebRTC session. These
+routes also sit outside the cross-origin write guard by design (a player page
+is never same-origin), so they never emit 403 from any path.
 
 **How RBAC works internally:**
 
 - The auth middleware validates the JWT and inserts the `Claims` (including `role`) into the request extensions.
-- Write endpoints use a `RequireAdmin` extractor that checks `claims.role == "admin"` and returns HTTP 403 if not.
+- Most write endpoints use a `RequireAdmin` extractor that checks `claims.role == "admin"` and returns HTTP 403 if not — see the exception list above for the ones that do not.
 - When auth is disabled (no `AuthState`), the `RequireAdmin` extractor creates a synthetic `admin` identity, allowing all operations.
 
 ---
