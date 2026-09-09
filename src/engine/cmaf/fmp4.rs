@@ -497,7 +497,18 @@ fn write_video_stbl(
     cenc: Option<&CencInitParams<'_>>,
 ) {
     let mut stbl = parent.child(*b"stbl");
-    // stsd
+    write_video_stsd(&mut stbl, v, cenc);
+    write_empty_sample_tables(&mut stbl);
+}
+
+/// The video sample entry — `avc1` / `hvc1` (or `encv` under CENC) and its
+/// codec configuration. Shared by the fragmented and progressive writers: the
+/// description of the media is the same either way, only the tables differ.
+fn write_video_stsd(
+    stbl: &mut BoxWriter<'_>,
+    v: &VideoTrack,
+    cenc: Option<&CencInitParams<'_>>,
+) {
     {
         let mut stsd = stbl.child_full(*b"stsd", 0, 0);
         stsd.u32(1); // entry_count
@@ -548,9 +559,14 @@ fn write_video_stbl(
             );
         }
     }
-    // Empty stts / stsc / stsz / stco — required children of stbl for
-    // fragmented MP4. Each says "zero samples" because all sample data
-    // lives in moof/mdat fragments.
+}
+
+/// The four required `stbl` tables, each saying "zero samples".
+///
+/// Correct for a fragmented file, where every sample lives in a `moof`/`mdat`
+/// pair rather than in the movie box. A progressive file fills them in
+/// instead — see [`write_sample_tables`].
+fn write_empty_sample_tables(stbl: &mut BoxWriter<'_>) {
     {
         let mut stts = stbl.child_full(*b"stts", 0, 0);
         stts.u32(0);
@@ -576,6 +592,16 @@ fn write_audio_stbl(
     cenc: Option<&CencInitParams<'_>>,
 ) {
     let mut stbl = parent.child(*b"stbl");
+    write_audio_stsd(&mut stbl, a, cenc);
+    write_empty_sample_tables(&mut stbl);
+}
+
+/// The audio sample entry and its codec configuration. Shared, as for video.
+fn write_audio_stsd(
+    stbl: &mut BoxWriter<'_>,
+    a: &AudioTrack,
+    cenc: Option<&CencInitParams<'_>>,
+) {
     {
         let mut stsd = stbl.child_full(*b"stsd", 0, 0);
         stsd.u32(1);
@@ -1168,6 +1194,73 @@ pub fn video_sample_from_nalus(nalus: &[Vec<u8>]) -> Vec<u8> {
 mod tests {
     use super::*;
 
+    /// An exported clip is a progressive file with a real seek table.
+    ///
+    /// This is the difference between a clip you can scrub and one you cannot.
+    /// A fragmented file carries `mvex` and `trun` and no `stss`; a player then
+    /// has nothing to seek by unless there is a `sidx` or `mfra`, and the first
+    /// two attempts at clip export shipped neither. VLC would not scrub them.
+    ///
+    /// So this asserts the shape: no fragmentation, and a populated `stss`
+    /// naming exactly the sync samples, 1-based.
+    #[test]
+    fn an_exported_clip_is_progressive_and_carries_a_seek_table() {
+        fn sample(is_sync: bool) -> Sample {
+            Sample {
+                duration: 3600,
+                data: vec![0xAB; 16],
+                composition_time_offset: 0,
+                is_sync,
+            }
+        }
+        // Three GOPs of four frames.
+        let mut video = Vec::new();
+        for _ in 0..3 {
+            video.push(sample(true));
+            for _ in 0..3 {
+                video.push(sample(false));
+            }
+        }
+        let track = VideoTrack::from_h264(vec![0x67, 0x42, 0x00, 0x1f], vec![0x68, 0xce, 0x3c, 0x80]);
+        let out = build_progressive_mp4(&track, &video, None, &[]);
+
+        fn count(hay: &[u8], needle: &[u8]) -> usize {
+            hay.windows(needle.len()).filter(|w| *w == needle).count()
+        }
+        assert!(count(&out, b"moov") >= 1, "no movie box");
+        assert!(count(&out, b"mdat") >= 1, "no media data");
+        assert_eq!(count(&out, b"mvex"), 0, "still declaring itself fragmented");
+        assert_eq!(count(&out, b"moof"), 0, "still written as fragments");
+        assert_eq!(count(&out, b"trun"), 0, "still written as fragments");
+
+        // `stss` must name samples 1, 5 and 9 — the three keyframes, 1-based.
+        let at = out
+            .windows(4)
+            .position(|w| w == b"stss")
+            .expect("no sync-sample table, so nothing can seek");
+        let body = &out[at + 4..];
+        let count_entries = u32::from_be_bytes([body[4], body[5], body[6], body[7]]);
+        assert_eq!(count_entries, 3, "wrong number of seek points");
+        let idx: Vec<u32> = (0..3)
+            .map(|i| {
+                let o = 8 + i * 4;
+                u32::from_be_bytes([body[o], body[o + 1], body[o + 2], body[o + 3]])
+            })
+            .collect();
+        assert_eq!(idx, vec![1, 5, 9], "the seek points are not the keyframes");
+
+        // And the movie declares a real duration, or a player cannot draw a
+        // scrub bar at all. 12 frames at 3600/90000 = 0.48s.
+        let mvhd = out.windows(4).position(|w| w == b"mvhd").expect("no mvhd");
+        // After the "mvhd" fourcc: version+flags, creation, modification,
+        // timescale, then duration — so +20, not +16, which reads back the
+        // timescale and looks plausible.
+        let dur = u32::from_be_bytes([
+            out[mvhd + 20], out[mvhd + 21], out[mvhd + 22], out[mvhd + 23],
+        ]);
+        assert_eq!(dur, 480, "the movie duration is not set, so there is no scrub bar");
+    }
+
     fn synthetic_video_track() -> VideoTrack {
         VideoTrack::from_h264(vec![0x67, 0x42, 0xC0, 0x1E], vec![0x68, 0xCE, 0x3C, 0x80])
     }
@@ -1611,5 +1704,424 @@ mod tests {
 
     fn find_fourcc_pos(buf: &[u8], fc: [u8; 4]) -> Option<usize> {
         buf.windows(4).position(|w| w == fc)
+    }
+}
+
+// ── Progressive (non-fragmented) MP4 ────────────────────────────────────────
+
+/// One chunk of samples belonging to one track, at a byte offset in `mdat`.
+struct ChunkPlan {
+    /// Index of the first sample in the track's sample list.
+    first: usize,
+    /// How many samples this chunk holds.
+    count: usize,
+    /// Offset from the start of the `mdat` payload.
+    rel_offset: u64,
+}
+
+/// Split a track's samples into chunks, one per GOP, and lay them out
+/// interleaved with the other track so a player reading forward gets both.
+///
+/// Video chunks break at every sync sample; each audio chunk covers the same
+/// span of time as the video chunk it follows. Non-interleaved files (all the
+/// video, then all the audio) are legal and play, but they make a player seek
+/// the whole file to keep audio fed.
+fn plan_chunks(
+    video: &[Sample],
+    video_timescale: u32,
+    audio: &[Sample],
+    audio_timescale: u32,
+) -> (Vec<ChunkPlan>, Vec<ChunkPlan>, Vec<u8>) {
+    let mut v_chunks = Vec::new();
+    let mut a_chunks = Vec::new();
+    let mut payload: Vec<u8> = Vec::new();
+
+    // Fragment boundaries: sample 0, then every later sync sample.
+    let mut bounds: Vec<usize> = vec![0];
+    for (i, s) in video.iter().enumerate().skip(1) {
+        if s.is_sync {
+            bounds.push(i);
+        }
+    }
+    bounds.push(video.len());
+
+    let mut v_ticks_done: u64 = 0;
+    let mut a_cursor = 0usize;
+    let mut a_ticks_done: u64 = 0;
+
+    for w in bounds.windows(2) {
+        let (lo, hi) = (w[0], w[1]);
+        if lo >= hi {
+            continue;
+        }
+        let rel = payload.len() as u64;
+        for s in &video[lo..hi] {
+            payload.extend_from_slice(&s.data);
+        }
+        v_chunks.push(ChunkPlan { first: lo, count: hi - lo, rel_offset: rel });
+        v_ticks_done += video[lo..hi].iter().map(|s| s.duration as u64).sum::<u64>();
+
+        if audio.is_empty() || audio_timescale == 0 || a_cursor >= audio.len() {
+            continue;
+        }
+        // Audio up to the same point on the clock as the video just written.
+        let want = v_ticks_done * audio_timescale as u64 / video_timescale.max(1) as u64;
+        let mut end = a_cursor;
+        let mut acc = a_ticks_done;
+        while end < audio.len() && acc < want {
+            acc += audio[end].duration as u64;
+            end += 1;
+        }
+        if end > a_cursor {
+            let rel = payload.len() as u64;
+            for s in &audio[a_cursor..end] {
+                payload.extend_from_slice(&s.data);
+            }
+            a_chunks.push(ChunkPlan { first: a_cursor, count: end - a_cursor, rel_offset: rel });
+            a_ticks_done = acc;
+            a_cursor = end;
+        }
+    }
+
+    // Whatever audio is left over, so nothing is silently dropped.
+    if a_cursor < audio.len() {
+        let rel = payload.len() as u64;
+        for s in &audio[a_cursor..] {
+            payload.extend_from_slice(&s.data);
+        }
+        a_chunks.push(ChunkPlan {
+            first: a_cursor,
+            count: audio.len() - a_cursor,
+            rel_offset: rel,
+        });
+    }
+
+    (v_chunks, a_chunks, payload)
+}
+
+/// `stts` — sample durations, run-length encoded.
+fn write_stts(stbl: &mut BoxWriter<'_>, samples: &[Sample]) {
+    let mut runs: Vec<(u32, u32)> = Vec::new();
+    for s in samples {
+        match runs.last_mut() {
+            Some((count, delta)) if *delta == s.duration => *count += 1,
+            _ => runs.push((1, s.duration)),
+        }
+    }
+    let mut stts = stbl.child_full(*b"stts", 0, 0);
+    stts.u32(runs.len() as u32);
+    for (count, delta) in runs {
+        stts.u32(count);
+        stts.u32(delta);
+    }
+}
+
+/// `stss` — which samples are random-access points, 1-based.
+///
+/// This is the table VLC and every other player builds a seek from. Omitted
+/// entirely when every sample is a sync sample, which is what the spec says
+/// means "all of them" — writing one out for audio would be a longer way of
+/// saying the same thing.
+fn write_stss(stbl: &mut BoxWriter<'_>, samples: &[Sample]) {
+    if samples.iter().all(|s| s.is_sync) {
+        return;
+    }
+    let idx: Vec<u32> = samples
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| s.is_sync)
+        .map(|(i, _)| i as u32 + 1)
+        .collect();
+    let mut stss = stbl.child_full(*b"stss", 0, 0);
+    stss.u32(idx.len() as u32);
+    for i in idx {
+        stss.u32(i);
+    }
+}
+
+/// `stsc` — how many samples are in each chunk, run-length encoded by chunk.
+fn write_stsc(stbl: &mut BoxWriter<'_>, chunks: &[ChunkPlan]) {
+    let mut runs: Vec<(u32, u32)> = Vec::new(); // (first_chunk 1-based, samples)
+    for (i, c) in chunks.iter().enumerate() {
+        let per = c.count as u32;
+        if runs.last().map(|(_, p)| *p) != Some(per) {
+            runs.push((i as u32 + 1, per));
+        }
+    }
+    let mut stsc = stbl.child_full(*b"stsc", 0, 0);
+    stsc.u32(runs.len() as u32);
+    for (first, per) in runs {
+        stsc.u32(first);
+        stsc.u32(per);
+        stsc.u32(1); // sample_description_index
+    }
+}
+
+/// `stsz` — the size of every sample.
+fn write_stsz(stbl: &mut BoxWriter<'_>, samples: &[Sample]) {
+    let mut stsz = stbl.child_full(*b"stsz", 0, 0);
+    stsz.u32(0); // sample_size 0 = per-sample sizes follow
+    stsz.u32(samples.len() as u32);
+    for s in samples {
+        stsz.u32(s.data.len() as u32);
+    }
+}
+
+/// `stco` — where each chunk starts in the file.
+fn write_stco(stbl: &mut BoxWriter<'_>, chunks: &[ChunkPlan], mdat_base: u64) {
+    let mut stco = stbl.child_full(*b"stco", 0, 0);
+    stco.u32(chunks.len() as u32);
+    for c in chunks {
+        stco.u32((mdat_base + c.rel_offset) as u32);
+    }
+}
+
+/// Build a **progressive** MP4 — one `moov` with real sample tables, one
+/// `mdat`, no fragments.
+///
+/// This is what an exported clip is, and it is deliberately not the CMAF
+/// shape the live path publishes. A fragmented file is right for streaming,
+/// where the player follows a manifest; it is wrong for a file somebody
+/// downloads and opens. Without `sidx` or `mfra` a fragmented clip gives VLC
+/// nothing to seek by, so scrubbing either does nothing or walks the whole
+/// file — which is exactly how the first version of clip export behaved.
+///
+/// `moov` is written **before** `mdat` so the tables are readable without
+/// fetching the whole file first.
+pub fn build_progressive_mp4(
+    video: &VideoTrack,
+    video_samples: &[Sample],
+    audio: Option<&AudioTrack>,
+    audio_samples: &[Sample],
+) -> Vec<u8> {
+    let a_timescale = audio.map(|a| a.sample_rate).unwrap_or(0);
+    let (v_chunks, a_chunks, payload) =
+        plan_chunks(video_samples, video.timescale, audio_samples, a_timescale);
+
+    // Chunk offsets are absolute, so `moov` has to know where `mdat` starts —
+    // and that depends on how long `moov` is. The tables are a fixed size
+    // whatever the offset *values* are, so building it once against a base of
+    // zero measures it exactly, and the second build carries the real base.
+    let probe = build_moov(video, video_samples, &v_chunks, audio, audio_samples, &a_chunks, 0);
+    let ftyp = build_progressive_ftyp(video);
+    let mdat_base = (ftyp.len() + probe.len() + 8) as u64;
+    let moov = build_moov(
+        video, video_samples, &v_chunks, audio, audio_samples, &a_chunks, mdat_base,
+    );
+    debug_assert_eq!(probe.len(), moov.len(), "moov changed size with the offset base");
+
+    let mut out = Vec::with_capacity(ftyp.len() + moov.len() + payload.len() + 8);
+    out.extend_from_slice(&ftyp);
+    out.extend_from_slice(&moov);
+    {
+        let mut mdat = BoxWriter::open(&mut out, *b"mdat");
+        mdat.bytes(&payload);
+    }
+    out
+}
+
+fn build_progressive_ftyp(video: &VideoTrack) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(32);
+    let mut ftyp = BoxWriter::open(&mut buf, *b"ftyp");
+    // `isom` rather than `cmfc`: this is an ordinary file, not a CMAF segment,
+    // and saying so keeps players out of their fragmented-media paths.
+    ftyp.fourcc(*b"isom");
+    ftyp.u32(512);
+    ftyp.fourcc(*b"isom");
+    ftyp.fourcc(*b"iso2");
+    ftyp.fourcc(*b"mp41");
+    match video.codec {
+        VideoCodec::H264 => ftyp.fourcc(*b"avc1"),
+        VideoCodec::H265 => ftyp.fourcc(*b"hvc1"),
+    };
+    drop(ftyp);
+    buf
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_moov(
+    video: &VideoTrack,
+    video_samples: &[Sample],
+    v_chunks: &[ChunkPlan],
+    audio: Option<&AudioTrack>,
+    audio_samples: &[Sample],
+    a_chunks: &[ChunkPlan],
+    mdat_base: u64,
+) -> Vec<u8> {
+    const MOVIE_TIMESCALE: u32 = 1000;
+    let v_ticks: u64 = video_samples.iter().map(|s| s.duration as u64).sum();
+    let movie_ms = v_ticks * MOVIE_TIMESCALE as u64 / video.timescale.max(1) as u64;
+
+    let mut buf = Vec::with_capacity(4096);
+    {
+        let mut moov = BoxWriter::open(&mut buf, *b"moov");
+        {
+            let mut mvhd = moov.child_full(*b"mvhd", 0, 0);
+            mvhd.u32(0);
+            mvhd.u32(0);
+            mvhd.u32(MOVIE_TIMESCALE);
+            // A real duration, not zero: a fragmented file says "unknown" and
+            // lets the manifest speak, but a downloaded clip has to be able to
+            // draw its own scrub bar.
+            mvhd.u32(movie_ms as u32);
+            mvhd.u32(0x0001_0000); // rate 1.0
+            mvhd.u16(0x0100); // volume 1.0
+            mvhd.u16(0); // reserved
+            mvhd.zeros(8); // reserved[2]
+            for &v in &UNITY_MATRIX {
+                mvhd.u32(v);
+            }
+            mvhd.zeros(24); // pre_defined[6]
+            mvhd.u32(3); // next_track_ID
+        }
+        write_progressive_video_trak(
+            &mut moov, video, video_samples, v_chunks, movie_ms, mdat_base,
+        );
+        if let Some(a) = audio
+            && !audio_samples.is_empty()
+        {
+            write_progressive_audio_trak(
+                &mut moov, a, audio_samples, a_chunks, movie_ms, mdat_base,
+            );
+        }
+    }
+    buf
+}
+
+/// The 3x3 unity matrix every `tkhd` / `mvhd` carries, 16.16 fixed point
+/// except the last row which is 2.30.
+const UNITY_MATRIX: [u32; 9] = [0x0001_0000, 0, 0, 0, 0x0001_0000, 0, 0, 0, 0x4000_0000];
+
+fn write_progressive_video_trak(
+    moov: &mut BoxWriter<'_>,
+    v: &VideoTrack,
+    samples: &[Sample],
+    chunks: &[ChunkPlan],
+    movie_ms: u64,
+    mdat_base: u64,
+) {
+    let media_ticks: u64 = samples.iter().map(|s| s.duration as u64).sum();
+    let mut trak = moov.child(*b"trak");
+    {
+        let mut tkhd = trak.child_full(*b"tkhd", 0, 0x0000_0007);
+        tkhd.u32(0);
+        tkhd.u32(0);
+        tkhd.u32(VIDEO_TRACK_ID);
+        tkhd.u32(0);
+        tkhd.u32(movie_ms as u32);
+        tkhd.zeros(8);
+        tkhd.u16(0); // layer
+        tkhd.u16(0); // alternate_group
+        tkhd.u16(0); // volume (video)
+        tkhd.u16(0); // reserved
+        for &m in &UNITY_MATRIX {
+            tkhd.u32(m);
+        }
+        tkhd.u32(v.width << 16);
+        tkhd.u32(v.height << 16);
+    }
+    {
+        let mut mdia = trak.child(*b"mdia");
+        {
+            let mut mdhd = mdia.child_full(*b"mdhd", 0, 0);
+            mdhd.u32(0);
+            mdhd.u32(0);
+            mdhd.u32(v.timescale);
+            mdhd.u32(media_ticks as u32);
+            mdhd.u16(0x55C4); // 'und'
+            mdhd.u16(0);
+        }
+        {
+            let mut hdlr = mdia.child_full(*b"hdlr", 0, 0);
+            hdlr.u32(0);
+            hdlr.fourcc(*b"vide");
+            hdlr.zeros(12);
+            hdlr.bytes(b"VideoHandler\0");
+        }
+        {
+            let mut minf = mdia.child(*b"minf");
+            {
+                let mut vmhd = minf.child_full(*b"vmhd", 0, 1);
+                vmhd.u16(0);
+                vmhd.zeros(6);
+            }
+            write_null_dinf(&mut minf);
+            {
+                let mut stbl = minf.child(*b"stbl");
+                write_video_stsd(&mut stbl, v, None);
+                write_stts(&mut stbl, samples);
+                write_stss(&mut stbl, samples);
+                write_stsc(&mut stbl, chunks);
+                write_stsz(&mut stbl, samples);
+                write_stco(&mut stbl, chunks, mdat_base);
+            }
+        }
+    }
+}
+
+fn write_progressive_audio_trak(
+    moov: &mut BoxWriter<'_>,
+    a: &AudioTrack,
+    samples: &[Sample],
+    chunks: &[ChunkPlan],
+    movie_ms: u64,
+    mdat_base: u64,
+) {
+    let media_ticks: u64 = samples.iter().map(|s| s.duration as u64).sum();
+    let mut trak = moov.child(*b"trak");
+    {
+        let mut tkhd = trak.child_full(*b"tkhd", 0, 0x0000_0007);
+        tkhd.u32(0);
+        tkhd.u32(0);
+        tkhd.u32(AUDIO_TRACK_ID);
+        tkhd.u32(0);
+        tkhd.u32(movie_ms as u32);
+        tkhd.zeros(8);
+        tkhd.u16(0);
+        tkhd.u16(1); // alternate_group 1: audio
+        tkhd.u16(0x0100); // full volume
+        tkhd.u16(0);
+        for &m in &UNITY_MATRIX {
+            tkhd.u32(m);
+        }
+        tkhd.u32(0); // width
+        tkhd.u32(0); // height
+    }
+    {
+        let mut mdia = trak.child(*b"mdia");
+        {
+            let mut mdhd = mdia.child_full(*b"mdhd", 0, 0);
+            mdhd.u32(0);
+            mdhd.u32(0);
+            mdhd.u32(a.sample_rate);
+            mdhd.u32(media_ticks as u32);
+            mdhd.u16(0x55C4);
+            mdhd.u16(0);
+        }
+        {
+            let mut hdlr = mdia.child_full(*b"hdlr", 0, 0);
+            hdlr.u32(0);
+            hdlr.fourcc(*b"soun");
+            hdlr.zeros(12);
+            hdlr.bytes(b"SoundHandler\0");
+        }
+        {
+            let mut minf = mdia.child(*b"minf");
+            {
+                let mut smhd = minf.child_full(*b"smhd", 0, 0);
+                smhd.u16(0); // balance
+                smhd.u16(0); // reserved
+            }
+            write_null_dinf(&mut minf);
+            {
+                let mut stbl = minf.child(*b"stbl");
+                write_audio_stsd(&mut stbl, a, None);
+                write_stts(&mut stbl, samples);
+                write_stss(&mut stbl, samples);
+                write_stsc(&mut stbl, chunks);
+                write_stsz(&mut stbl, samples);
+                write_stco(&mut stbl, chunks, mdat_base);
+            }
+        }
     }
 }

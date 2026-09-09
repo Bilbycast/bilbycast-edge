@@ -93,7 +93,7 @@ section.)
     000001.ts
     ...
     NNNNNN.ts
-    recording.json       ← schema_version, recording_id, created_at_unix, segment_seconds, current_segment_id
+    recording.json       ← schema_version, recording_id, created_at_unix, segment_seconds, current_segment_id, anchor_wall_us, anchor_pts_90khz
     index.bin            ← 24 B / IDR; binary search resolves PTS → (segment_id, byte_offset)
     clips.json           ← Vec<ClipInfo>; atomic write-to-tmp + rename + fsync
     .tmp/                ← in-flight writes; atomic rename onto the final path on segment roll
@@ -127,12 +127,59 @@ defined and set by the writer:
 | Bit | Constant | Meaning |
 |---|---|---|
 | `1 << 0` | `IS_IDR` | Entry marks an IDR / GOP boundary (set on every entry) |
-| `1 << 1` | `PCR_DISCONTINUITY` | Set on the first IDR after a > 5 min PCR step (stream-source change); the reader skips wallclock-pacing across it |
+| `1 << 1` | `PCR_DISCONTINUITY` | Set on the first IDR after a > 5 min PCR step (stream-source change) **and on the first IDR after a writer restart**; the reader skips wallclock-pacing across it, and clip export refuses to cut across it |
 | `1 << 2` | `SMPTE_TC_VALID` | `smpte_tc` holds a decoded SMPTE timecode for this IDR |
 
 Entries are append-only; rebuild on corruption is a Phase 2 item — the
 current behaviour emits a `replay_index_corrupt` Warning and continues
 to append (a non-fatal recovery path).
+
+### The wall-clock anchor
+
+`recording.json` carries a pair — `anchor_wall_us` (microseconds since the Unix
+epoch) and `anchor_pts_90khz` — that turns a wall-clock instant into a PTS:
+
+```
+pts  = anchor_pts_90khz + (wall_us - anchor_wall_us) * 90_000 / 1_000_000
+wall = anchor_wall_us   + (pts - anchor_pts_90khz)   * 1_000_000 / 90_000
+```
+
+It is taken once, on the first index entry appended, and preserved across
+restarts. Both fields are absent on recordings made before it existed; readers
+fall back to `created_at_unix` and inherit its coarseness.
+
+**Why not `created_at_unix`.** It is whole seconds, and it marks when the writer
+opened rather than when the first frame landed. Measured against the CMAF
+published dates over 124 s of media it sat a stable +0.47 s out, and on another
+run −18.8 s. A mark converted through it lands about half a second from the
+frame the operator chose — no better than cutting on segment boundaries, which
+is the thing exact cutting exists to avoid. The anchor measured −36 ms on the
+same rig, inside one frame at 25 fps.
+
+### The PTS timeline across a restart
+
+`pts_90khz` in the index is **not the stream's PTS**. It is a 64-bit counter the
+writer accumulates from PCR deltas, so the index stays monotonic across the
+33-bit PCR wrap — and `find_floor` binary-searches it, so monotonic is a
+requirement, not a nicety.
+
+A restart resumes an existing recording: it continues the segment numbering,
+appends to the same `index.bin`, and keeps the anchor. The counter therefore has
+to be resumed too. It picks up at **the last indexed tick plus the wall-clock
+time the writer was down** — the gap is added, not skipped, because nothing was
+recorded during it but the anchor maps wall clock to ticks linearly, and a
+counter that ignored the outage would place everything after it earlier by
+exactly the downtime.
+
+Starting the counter again at zero writes a second, overlapping timeline into
+one file. Every wall-clock lookup after the restart then lands in a hole, and
+any that resolves can match a frame from before it.
+
+**The media is still discontinuous.** The index's own timeline is continuous
+across the join, but the PCR in the TS begins again with the process, so the two
+sides are two timelines however neatly the index numbers them. The first entry
+after a resume therefore carries `PCR_DISCONTINUITY`, and anything muxing a
+range has to honour it — see [Clip export](#clip-export) below.
 
 ## Lifecycle
 
@@ -483,6 +530,160 @@ instead). Unsupported essence (MPEG-2 video, Opus audio) surfaces
 `replay_export_format_unsupported`. The edge advertises the
 `replay_export_mp4` capability so the manager UI lights up the ⬇ MP4
 button alongside ⬇ TS.
+
+## Clip export
+
+**Not the same thing as a replay clip.** A *replay clip* is a mark-in/mark-out
+range an operator creates in the manager UI, stored in `clips.json` and played
+back or exported through `export_clip`. A *clip export* starts in the browser
+DVR player: a viewer marks a moment, asks for so many seconds either side, and
+gets an MP4 on their portal sign-in page. The two share this recording and
+nothing else.
+
+The recorder is what makes the export exact, which is why a DVR session arms one
+unconditionally — see the relay's [distribution.md](../../bilbycast-relay/docs/distribution.md)
+for the request/serve half and the manager for the provisioning half.
+
+### How the edge cuts one
+
+`src/engine/cmaf/clips.rs` runs one poller per **passthrough** CMAF output (the
+proxy rendition is skipped: an operator exporting a moment wants the
+full-resolution picture, and the player asks against the main stream). Every 5 s
+it asks the origin for that stream's pending clips and cuts each in turn.
+
+The poller authenticates with the CMAF output's **ingest** token — the same one
+it PUTs segments with. The origin's read gate therefore has to admit an ingest
+token as well as a viewer's, for both the clip list and the objects behind it.
+
+Two paths, in order:
+
+1. **Exact, from this recording.** The mark's wall clock maps to a PTS through
+   the anchor, and `export_recording_mp4_chunk` remuxes that range to fMP4.
+2. **Whole segments, from the relay's origin.** Used when there is no recording
+   for the flow, or the moment predates it. The clip is assembled from the init
+   segment plus every segment overlapping the window, so it lands on segment
+   boundaries — up to one segment early at the in-point and one late at the out.
+
+### The shape of the file
+
+A clip is **all-intra H.264 in a progressive MP4** — every frame an IDR, one
+`moov` with real sample tables, one `mdat`. Both halves are deliberate, and
+both were arrived at the hard way.
+
+**All-intra, because a clip is for reviewing.** The source is long-GOP: one IDR
+every ~49 frames (~2 s), the rest differences from what came before. That is
+right for transport and wrong for stepping. Only 1 frame in 49 stands alone, so
+stepping backward means decoding from the keyframe every time — which VLC does
+badly enough that it reads as the picture breaking up. **No container fixes
+this**; it is a property of the encode. So the cut is decoded and re-encoded
+with `gop_size = 1`, x264, CRF 20, no B-frames. Measured on the rig: ~25 Mbps
+and ~93 MB for 30 s, against ~8 Mbps for the passthrough it replaces, and about
+14 s of encode for a 30 s clip.
+
+`x264` specifically, not `h264_auto`: a hardware encoder is tuned for streaming
+and several will not honour a one-frame GOP at all, which would quietly hand
+back the long-GOP clip this exists to avoid.
+
+If the re-encode fails the export **falls back to the source's own GOP
+structure** rather than failing. A clip that steps poorly is worth more than no
+clip, and the reason goes to the log.
+
+**Progressive, because it is a file.** A fragmented MP4 is right for streaming,
+where the player follows a manifest, and wrong for something downloaded and
+opened. Two earlier shapes failed:
+
+* **One fragment holding the whole clip.** No `sidx`, no `mfra`, an empty
+  `moov` — nothing to seek by at all.
+* **One fragment per GOP.** Every fragment opened on a keyframe, and it still
+  would not scrub in VLC, because the index a player builds a seek from is
+  `stss` and a fragmented file has none.
+
+So the tables are written out: `stts`, `stss`, `stsc`, `stsz`, `stco`, and a
+real `mvhd` duration so a player can draw a scrub bar. `moov` precedes `mdat`
+so they are readable without fetching the whole file, and chunks interleave
+video and audio per GOP so a player reading forward keeps both fed.
+
+**Audio is never re-encoded.** AAC frames are already independently decodable,
+so there is nothing to gain and a generation of quality to lose.
+
+**Two trims worth knowing about.** The byte range opens on an IDR, but the
+demux ahead of the muxer still yields frames before the first it marks as sync
+— the tail of the previous GOP, reassembled from a PES that began before the
+cut. They are not decodable: measured, a 30-second clip carried 240 samples of
+which the leading 41 decoded to nothing, and the decoder rejects them outright
+when they are fed to the re-encoder. The cut therefore starts at the first real
+keyframe. Frames keep the PTS they were demuxed with rather than being
+re-stamped on an even step — the source drops frames when the link is lossy,
+and an even step spread 749 frames across the 31.4 s they really covered, so
+every clip came out longer than it was asked for.
+
+**Expect up to a GOP more than you asked for.** The range ends at the first
+index entry *past* the requested out-point, so the clip covers the window
+rather than stopping short of it: a 30 s request yields 30–32 s.
+
+### Memory: a spike, not a leak
+
+Cutting a clip is a burst, not a working set. For a thirty-second all-intra
+export the process transiently holds the source frames, the re-encoded frames,
+the interleaved payload and the finished file — around 300 MB, freed the moment
+the clip is uploaded.
+
+Freed to *the process*. glibc gives busy threads their own arenas — the edge
+runs about a hundred threads on a twelve-core box — and media work allocates in
+bursts of wildly different shapes, so those arenas fragment and the free runs
+are held rather than returned. Nothing is lost and the memory is reused, but
+the resident size only ever climbs.
+
+Measured on the demo rig: an edge sitting at **3399 MB dropped to 1786 MB on a
+single `malloc_trim`**, so 1.6 GB of it had been free all along. Eight clips in
+a row took it from 2.4 GB to 4.5 GB and it was still going.
+
+Two things address it, and neither is a leak fix because there is no leak:
+
+* the clip exporter trims when each cut finishes, so a burst is given back
+  immediately rather than waiting;
+* `main` runs a trimmer every three minutes for everything else. Slow on
+  purpose — it takes each arena's lock in turn and this process has real-time
+  work on those threads.
+
+Worth recognising, because it looks exactly like a leak from the outside: RSS
+climbing steadily on a process that is doing nothing unusual, with no single
+allocation to blame.
+
+### When the recording cannot serve the moment
+
+The recorder's retention and the relay's origin window are configured
+independently, so a moment can age out of one while the other still holds it.
+The index also keeps naming a segment for a little while after retention has
+pruned the file.
+
+Any failure from the exact path therefore hands the clip to the segment
+fallback rather than failing the export — the common one being
+`stat segment …: No such file`. The clip then lands on segment boundaries
+instead of the frame, which is the documented trade, and the reason is logged.
+It used to be a permanent failure after three attempts, with media sitting on
+the relay that would have served it.
+
+### What it will not do
+
+**A moment spanning a writer restart is refused**, permanently and on the first
+attempt. The media either side of the join is two timelines (see [The PTS
+timeline across a restart](#the-pts-timeline-across-a-restart)), and the segment
+fallback cannot rescue it either — the relay's CMAF renditions restart with the
+same process, so their timeline resets at the same instant. Measured: muxing
+across the join produced a playable 30-second clip declaring a duration of
+70,567 seconds. A file that plays but lies about its own length is discovered in
+an edit suite, not here, so the operator is told to move the mark instead.
+
+**Cuts are GOP-aligned, not frame-exact.** The exporter bounds a range with
+`find_floor` at both ends. At the in-point that rounds outward and the marked
+moment is safe; at the out-point it rounds inward, so a range naming the exact
+end loses everything back to the previous random-access point — 26.35 s of a
+30 s request on the rig. The exporter is therefore asked for the first index
+entry *past* the end, which makes that floor land on it and the clip cover what
+was asked for (31.6 s for 30 s). Trimming to the frame needs the leading GOP
+re-encoded, which is separate work.
+
 
 ## Cross-references
 

@@ -120,6 +120,50 @@ struct RecordingMeta {
     segment_seconds: u32,
     /// Current segment ID (next NNNNNN.ts to write).
     current_segment_id: u32,
+    /// Wall clock at `anchor_pts_90khz`, in **microseconds** since the Unix
+    /// epoch — the pair that lets a wall-clock instant be turned into a PTS.
+    ///
+    /// `created_at_unix` cannot do this job. It is whole seconds, and it marks
+    /// when the writer opened rather than when the first frame landed:
+    /// measured against the CMAF published dates over 124s of media it sat a
+    /// stable +0.47s out, so a mark converted through it lands about half a
+    /// second from the frame the operator chose. That is no better than
+    /// cutting on segment boundaries, which is the thing exact cutting exists
+    /// to avoid.
+    ///
+    /// Written once, when the first index entry is appended, and preserved
+    /// across a writer restart. Absent on recordings made before this existed;
+    /// readers fall back to `created_at_unix` and inherit its coarseness.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    anchor_wall_us: Option<i64>,
+    /// The PTS `anchor_wall_us` describes. Stored explicitly rather than
+    /// assumed to be the first entry, because the index prunes from the front:
+    /// `wall(pts) = anchor_wall_us + (pts - anchor_pts_90khz) / 90_000`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    anchor_pts_90khz: Option<u64>,
+}
+
+/// Where the pseudo-PTS counter must pick up when a recording is resumed.
+///
+/// `None` for a fresh recording, or one with no anchor to date the index by —
+/// both start at zero, which is correct because nothing precedes them.
+///
+/// Otherwise: the last indexed tick, plus the wall-clock time the writer was
+/// down. The gap has to be added. Nothing was recorded during it, but the
+/// anchor maps wall-clock to ticks linearly, so a counter that resumed without
+/// it would place everything after the restart earlier by exactly the outage,
+/// and a clip asked for by wall-clock would come back showing the wrong moment.
+fn resume_pts(
+    last_indexed: Option<u64>,
+    anchor_wall_us: Option<i64>,
+    anchor_pts: Option<u64>,
+    now_us: i64,
+) -> Option<u64> {
+    let last = last_indexed?;
+    let (aw, ap) = (anchor_wall_us?, anchor_pts?);
+    let last_wall_us = aw + i64::try_from(last.saturating_sub(ap)).ok()? * 1_000_000 / 90_000;
+    let gap_us = (now_us - last_wall_us).max(0);
+    Some(last + u64::try_from(gap_us).ok()? * 90_000 / 1_000_000)
 }
 
 /// Public handle returned by [`spawn_writer`]. Owns the JoinHandle for
@@ -240,9 +284,14 @@ pub async fn spawn_writer(
     let meta = RecordingMeta {
         schema_version: 1,
         recording_id: recording_id.clone(),
-        created_at_unix: existing_meta.map(|m| m.created_at_unix).unwrap_or(now_unix),
+        created_at_unix: existing_meta.as_ref().map(|m| m.created_at_unix).unwrap_or(now_unix),
         segment_seconds: config.segment_seconds,
         current_segment_id: starting_segment,
+        // Carried across a restart: the anchor describes the media already on
+        // disk, and re-taking it against a later PTS would silently shift
+        // every clip cut from what came before.
+        anchor_wall_us: existing_meta.as_ref().and_then(|m| m.anchor_wall_us),
+        anchor_pts_90khz: existing_meta.as_ref().and_then(|m| m.anchor_pts_90khz),
     };
     write_meta_atomic(&meta_path, &meta).await?;
 
@@ -322,6 +371,38 @@ pub async fn spawn_writer(
     // mirror.
     let index_mirror = InMemoryIndex::load(&index_path).await.unwrap_or_default();
 
+    // Resume the pseudo-PTS timeline; do not restart it at zero.
+    //
+    // `accumulated_pts` is not the stream's PTS — it is a 64-bit counter this
+    // writer accumulates from PCR deltas precisely so the index stays
+    // monotonic across a 33-bit wrap. A restart appends to the same index and
+    // continues the segment numbering, so starting the counter again at zero
+    // writes a second, overlapping timeline into one file: every wall-clock
+    // lookup after a restart lands in a hole, and any that resolves can match
+    // a frame from before it. That is what `replay_no_video_frames` was.
+    //
+    // The gap is added, not skipped. The edge was down for it, so nothing was
+    // recorded — but the anchor maps wall-clock to ticks linearly, and a
+    // resumed counter that ignored the outage would shift everything after it
+    // earlier by exactly the downtime.
+    let now_us = i64::try_from(
+        SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_micros()).unwrap_or(0),
+    )
+    .unwrap_or(0);
+    let resumed_pts = resume_pts(
+        index_mirror.span().map(|(_, last)| last),
+        meta.anchor_wall_us,
+        meta.anchor_pts_90khz,
+        now_us,
+    );
+    if let Some(p) = resumed_pts {
+        tracing::info!(
+            recording_id = %recording_id, resumed_pts = p,
+            last_indexed = index_mirror.span().map(|(_, last)| last).unwrap_or(0),
+            "replay: resuming the recording's PTS timeline across a restart"
+        );
+    }
+
     let writer_state = WriterState {
         recording_id: recording_id.clone(),
         dir,
@@ -335,9 +416,13 @@ pub async fn spawn_writer(
         current_segment: None,
         current_segment_started: None,
         disk_pressure_emitted: false,
-        accumulated_pts: 0,
+        accumulated_pts: resumed_pts.unwrap_or(0),
         last_pcr: None,
-        pending_pcr_discontinuity: false,
+        // A resume IS a discontinuity in the media, even though the index's
+        // own timeline is now continuous across it. The PCR in the TS restarts
+        // with the process, so the first frame back gets flagged and a reader
+        // can see that the two sides cannot be presented as one timeline.
+        pending_pcr_discontinuity: resumed_pts.is_some(),
         timecode: TimecodeTracker::new(),
         index_mirror,
         pending_mark_in: Arc::new(Mutex::new(None)),
@@ -610,6 +695,41 @@ impl WriterState {
                 // Mirror in memory so mark-in / mark-out can resolve
                 // SMPTE TC by PTS without re-reading index.bin.
                 self.index_mirror.entries.push(entry);
+
+                // Take the wall-clock anchor on the first indexed frame.
+                //
+                // Here rather than at writer start, because the gap between
+                // opening the writer and the first frame arriving is exactly
+                // the error that made `created_at_unix` useless for this. This
+                // still carries the pipeline delay — the frame is timestamped
+                // when it reaches us, not when it was shot — but that delay is
+                // the same one the CMAF epoch is founded on, so a mark placed
+                // through the published dates and a cut made through this
+                // anchor agree with each other, which is what matters.
+                if self.meta.anchor_wall_us.is_none() {
+                    let us = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .map(|d| d.as_micros() as i64)
+                        .unwrap_or(0);
+                    self.meta.anchor_wall_us = Some(us);
+                    self.meta.anchor_pts_90khz = Some(entry.pts_90khz);
+                    // Persisted immediately: an anchor only in memory is lost
+                    // to the first restart, and every clip cut afterwards
+                    // would fall back to the coarse `created_at_unix`.
+                    if let Err(e) = write_meta_atomic(&self.meta_path, &self.meta).await {
+                        tracing::warn!(
+                            recording_id = %self.recording_id, error = %e,
+                            "replay: could not persist the wall-clock anchor; \
+                             clip cuts will fall back to created_at_unix"
+                        );
+                    } else {
+                        tracing::info!(
+                            recording_id = %self.recording_id,
+                            anchor_pts = entry.pts_90khz, anchor_wall_us = us,
+                            "replay: wall-clock anchor taken on the first indexed frame"
+                        );
+                    }
+                }
             }
         }
         Ok(())
@@ -1176,6 +1296,49 @@ async fn write_meta_atomic(path: &PathBuf, meta: &RecordingMeta) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A restart must continue the recording's timeline, not start a new one.
+    ///
+    /// `accumulated_pts` is a pseudo-PTS the writer builds from PCR deltas so
+    /// the index stays monotonic across a 33-bit wrap — and `find_floor`
+    /// binary-searches it, so monotonic is not a nicety. A restart appends to
+    /// the same index and continues the segment numbering, so a counter that
+    /// began again at zero wrote a second overlapping timeline into one file.
+    /// Observed on the rig: 556 entries running 86,400 .. 74,606,400, then
+    /// dropping to 144,000 at the restart. Every wall-clock lookup after that
+    /// point missed, which is what `replay_no_video_frames` was.
+    #[test]
+    fn a_resumed_recording_continues_its_pts_timeline() {
+        // Anchor: wall 1_000.000_000s ↔ pts 86_400.
+        let anchor_wall_us = 1_000_000_000i64;
+        let anchor_pts = 86_400u64;
+        // Last indexed frame sits 100s after the anchor.
+        let last = anchor_pts + 100 * 90_000;
+        // The writer comes back 30s later.
+        let now_us = anchor_wall_us + 130 * 1_000_000;
+
+        let resumed = resume_pts(Some(last), Some(anchor_wall_us), Some(anchor_pts), now_us)
+            .expect("a resumed recording must resume its timeline");
+
+        assert!(resumed > last, "the timeline went backwards, and the index is no longer sorted");
+        // 130s after the anchor: the 100s recorded plus the 30s outage.
+        assert_eq!(
+            resumed,
+            anchor_pts + 130 * 90_000,
+            "the outage was not accounted for, so every later clip is shifted by it"
+        );
+
+        // A fresh recording has nothing to resume and starts at zero.
+        assert_eq!(resume_pts(None, Some(anchor_wall_us), Some(anchor_pts), now_us), None);
+        // So does one too old to carry an anchor: without it the index cannot
+        // be dated, and guessing would be worse than falling back to segments.
+        assert_eq!(resume_pts(Some(last), None, None, now_us), None);
+
+        // A clock that has gone backwards must not rewind the timeline either.
+        let backwards = resume_pts(Some(last), Some(anchor_wall_us), Some(anchor_pts), anchor_wall_us)
+            .expect("still resumable");
+        assert!(backwards >= last, "a backwards clock unsorted the index");
+    }
 
     fn entry(pts: u64, packed: u32, valid: bool) -> IndexEntry {
         IndexEntry {

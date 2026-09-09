@@ -509,6 +509,28 @@ impl VideoReencoder {
             is_keyframe,
         }))
     }
+
+    /// Drain whatever the encoder is still holding.
+    ///
+    /// Encoders buffer, so the last frames handed in are not the last frames
+    /// out. A live output never notices — it runs until it is stopped — but a
+    /// clip has an end, and without this the tail of every export is short by
+    /// however deep the encoder happens to buffer.
+    pub fn flush(&mut self) -> Result<Vec<VideoOutFrame>> {
+        let encoded = self
+            .pipeline
+            .flush()
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let mut out = Vec::new();
+        for frame in &encoded {
+            let mut nalus = Vec::new();
+            split_annex_b_to_nalus(&frame.data, &mut nalus);
+            if !nalus.is_empty() {
+                out.push(VideoOutFrame { nalus, is_keyframe: frame.keyframe });
+            }
+        }
+        Ok(out)
+    }
 }
 
 #[cfg(not(feature = "media-codecs"))]
