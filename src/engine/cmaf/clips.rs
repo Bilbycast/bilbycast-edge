@@ -83,6 +83,38 @@ fn is_permanent(err: &str) -> bool {
         || e.contains("spans a recorder restart")
 }
 
+/// Hand the allocator's free heap back to the operating system.
+///
+/// Cutting a clip is a spike, not a working set: for a thirty-second export
+/// the process transiently holds the source frames, the re-encoded frames, the
+/// interleaved payload and the finished file — around 300 MB, all of it freed
+/// the moment the clip is uploaded.
+///
+/// Freed to *the process*, that is. glibc keeps large runs of it in its arenas
+/// rather than returning them, and because each cut allocates a slightly
+/// different shape the arenas fragment instead of being reused. Measured on
+/// the rig: eight clips took the edge from 2.4 GB to 4.5 GB and kept climbing,
+/// on a box with 15 GB shared with a second edge — a demo of a dozen clips
+/// would have run it out of memory.
+///
+/// `malloc_trim` is the one call that fixes that, and it is safe to make here:
+/// the cut is over, nothing on this path holds a live allocation, and it runs
+/// once per clip rather than in any hot loop.
+#[cfg(target_env = "gnu")]
+fn release_free_heap() {
+    // SAFETY: `malloc_trim` inspects the allocator's own free lists and
+    // releases whole pages back to the kernel. It takes no pointer from us and
+    // cannot invalidate any live allocation.
+    unsafe {
+        libc::malloc_trim(0);
+    }
+}
+
+/// Nothing to do where the allocator is not glibc — musl and macOS return
+/// pages on free.
+#[cfg(not(target_env = "gnu"))]
+fn release_free_heap() {}
+
 /// Tell the origin a clip cannot be produced, so it stops being pending.
 async fn report_failure(base: &str, auth: Option<&str>, name: &str, reason: &str) {
     let url = format!("{base}/clips/{}.mp4/failed", urlencoding_light(name));
@@ -483,7 +515,12 @@ pub async fn run(
         };
 
         for rec in records.iter().filter(|r| !r.ready && !r.failed) {
-            match cut_one(&base, auth, &flow_id, rec).await {
+            let outcome = cut_one(&base, auth, &flow_id, rec).await;
+            // Whichever way it went, the spike is over — give the pages back
+            // before moving to the next one, so a run of exports does not
+            // accumulate a working set none of them still needs.
+            release_free_heap();
+            match outcome {
                 Ok(bytes) => {
                     attempts.remove(&rec.name);
                     tracing::info!(
