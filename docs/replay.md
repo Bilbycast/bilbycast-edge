@@ -621,6 +621,35 @@ every clip came out longer than it was asked for.
 index entry *past* the requested out-point, so the clip covers the window
 rather than stopping short of it: a 30 s request yields 30–32 s.
 
+### Memory: a spike, not a leak
+
+Cutting a clip is a burst, not a working set. For a thirty-second all-intra
+export the process transiently holds the source frames, the re-encoded frames,
+the interleaved payload and the finished file — around 300 MB, freed the moment
+the clip is uploaded.
+
+Freed to *the process*. glibc gives busy threads their own arenas — the edge
+runs about a hundred threads on a twelve-core box — and media work allocates in
+bursts of wildly different shapes, so those arenas fragment and the free runs
+are held rather than returned. Nothing is lost and the memory is reused, but
+the resident size only ever climbs.
+
+Measured on the demo rig: an edge sitting at **3399 MB dropped to 1786 MB on a
+single `malloc_trim`**, so 1.6 GB of it had been free all along. Eight clips in
+a row took it from 2.4 GB to 4.5 GB and it was still going.
+
+Two things address it, and neither is a leak fix because there is no leak:
+
+* the clip exporter trims when each cut finishes, so a burst is given back
+  immediately rather than waiting;
+* `main` runs a trimmer every three minutes for everything else. Slow on
+  purpose — it takes each arena's lock in turn and this process has real-time
+  work on those threads.
+
+Worth recognising, because it looks exactly like a leak from the outside: RSS
+climbing steadily on a process that is doing nothing unusual, with no single
+allocation to blame.
+
 ### When the recording cannot serve the moment
 
 The recorder's retention and the relay's origin window are configured

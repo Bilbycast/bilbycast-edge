@@ -221,6 +221,57 @@ fn exit_without_static_teardown(code: i32) -> ! {
     unsafe { libc::_exit(code) }
 }
 
+/// Hand the allocator's free pages back to the operating system, periodically.
+///
+/// The edge is a long-running multithreaded media process — around a hundred
+/// threads on a twelve-core box — and glibc gives busy threads their own
+/// arenas. Media work allocates in bursts of wildly different shapes: TS
+/// packets, whole segments, encoder frames, a clip held entire. Those arenas
+/// fragment, and glibc holds the free runs rather than returning them.
+///
+/// The result is not a leak. Nothing is lost and the memory is reused — but
+/// the resident size only ever climbs, and on a box sharing its RAM with
+/// another edge that is the difference between running and being killed.
+/// Measured on the demo rig: an edge sitting at 3399 MB dropped to 1786 MB on
+/// a single `malloc_trim`, so 1.6 GB of it was free all along.
+///
+/// **Why a timer rather than a threshold.** Reading the resident size to
+/// decide costs a `/proc` parse, and the call is close to free when there is
+/// nothing to release — it walks each arena's free list and unmaps whole pages
+/// at the top of the heap. Doing it on a slow tick is simpler than deciding
+/// when it is worth doing.
+///
+/// **Why not more often.** It takes each arena's lock in turn, and this
+/// process has real-time work on those threads. Every few minutes bounds the
+/// growth without putting a recurring stall in the media path.
+#[cfg(target_env = "gnu")]
+fn spawn_heap_trimmer(cancel: tokio_util::sync::CancellationToken) {
+    // Long enough that the lock traffic is irrelevant, short enough that a
+    // burst of activity is given back within one broadcast segment of time.
+    const EVERY: Duration = Duration::from_secs(180);
+    tokio::spawn(async move {
+        let mut ticks = tokio::time::interval(EVERY);
+        ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tokio::select! {
+                _ = cancel.cancelled() => return,
+                _ = ticks.tick() => {}
+            }
+            // SAFETY: `malloc_trim` inspects the allocator's own free lists and
+            // releases whole pages back to the kernel. It takes no pointer from
+            // us and cannot invalidate any live allocation.
+            unsafe {
+                libc::malloc_trim(0);
+            }
+        }
+    });
+}
+
+/// Nothing to do where the allocator is not glibc — musl and macOS return
+/// pages on free.
+#[cfg(not(target_env = "gnu"))]
+fn spawn_heap_trimmer(_cancel: tokio_util::sync::CancellationToken) {}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // Both arms leave through `_exit`, not by returning: an early failure can
@@ -1048,6 +1099,11 @@ async fn real_main() -> anyhow::Result<()> {
             stats_publisher_loop(ws_tx, stats_fm, stats_config).await;
         });
     }
+
+    // Give the allocator's free pages back on a slow tick. Not a leak — see
+    // `spawn_heap_trimmer` — but a resident size that only ever climbs, on a
+    // box that shares its RAM with the edge doing the SDI capture.
+    spawn_heap_trimmer(shutdown_token.clone());
 
     // Spawn the upgrade watchdog periodic task that promotes
     // `pending_health → stable` once the configured boot health window
