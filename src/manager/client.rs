@@ -4656,6 +4656,61 @@ async fn execute_command(
             Ok(Some(serde_json::to_value(result).unwrap()))
         }
         // ── Replay-server commands (recording + playback) ──
+        //
+        // Set or clear one flow's `RecordingConfig`, without touching the rest
+        // of the flow.
+        //
+        // `update_flow` can already do this, but only by taking a **whole**
+        // `FlowConfig` — so a caller that does not own the flow has to
+        // reconstruct it, and every field it does not model is silently lost.
+        // DVR sessions point at whatever flow an operator nominates, including
+        // ones hand-written in this edge's own config, so that is not a safe
+        // way to arm a recorder.
+        //
+        // `recording: null` clears it, which is what a session teardown wants.
+        //
+        // This persists only. The recorder is bound when the flow spawns — the
+        // same as `thumbnail` and `media_analysis` — so a running flow needs a
+        // restart before the change takes effect, and the reply says so rather
+        // than restarting here: `restart_flow` already does it properly,
+        // including the WHIP/WHEP re-registration this arm would have to
+        // duplicate and would eventually forget.
+        #[cfg(feature = "replay")]
+        "configure_recording" => {
+            let flow_id = action["flow_id"]
+                .as_str()
+                .ok_or("configure_recording: missing 'flow_id'")?;
+            let recording: Option<crate::config::models::RecordingConfig> =
+                if action["recording"].is_null() {
+                    None
+                } else {
+                    Some(
+                        serde_json::from_value(action["recording"].clone())
+                            .map_err(|e| format!("Invalid recording config: {e}"))?,
+                    )
+                };
+            let armed = recording.is_some();
+            let was_running = flow_manager.is_running(flow_id);
+            {
+                let mut cfg = app_config.write().await;
+                let flow = cfg
+                    .flows
+                    .iter_mut()
+                    .find(|f| f.id == flow_id)
+                    .ok_or_else(|| CommandError::new(format!("Unknown flow '{flow_id}'")))?;
+                flow.recording = recording;
+                persist_config(&cfg, config_path, secrets_path).await?;
+            }
+            tracing::info!(
+                "Manager command: configure_recording on flow '{flow_id}' \
+                 (armed={armed}, restart_required={was_running})"
+            );
+            Ok(Some(serde_json::json!({
+                "flow_id": flow_id,
+                "armed": armed,
+                "restart_required": was_running,
+            })))
+        }
         #[cfg(feature = "replay")]
         "start_recording" => {
             let flow_id = action["flow_id"].as_str()

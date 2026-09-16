@@ -197,6 +197,40 @@ impl InMemoryIndex {
         Some(self.entries[idx])
     }
 
+    /// Does a PTS range contain a break in the media's own timeline?
+    ///
+    /// The index stays monotonic across a writer restart — the counter is
+    /// resumed — but the TS underneath does not: its PCR begins again with the
+    /// process. An entry carrying `PCR_DISCONTINUITY` marks that join. Cutting
+    /// exactly across one muxes two timelines into a single track, which is how
+    /// 30 seconds of video came out declaring a duration of seven hours.
+    ///
+    /// The first entry cannot be a join by this definition — there is nothing
+    /// before it for the media to be discontinuous *with* — so it is skipped.
+    pub fn spans_discontinuity(&self, from_pts: u64, to_pts: u64) -> bool {
+        self.entries
+            .iter()
+            .skip(1)
+            .any(|e| e.flags & flag::PCR_DISCONTINUITY != 0
+                && e.pts_90khz > from_pts
+                && e.pts_90khz < to_pts)
+    }
+
+    /// The first indexed PTS strictly after `pts`, if there is one.
+    ///
+    /// The exporter ends a range at `find_floor(to)` — the random-access point
+    /// at or before the end — so a range asking for exactly the wanted window
+    /// comes back a GOP short at the tail. Asking instead for the entry just
+    /// past the end makes the floor land on it, and the clip covers what was
+    /// requested. `None` when nothing follows, which means the recording ends
+    /// inside the window and there is no more to include.
+    pub fn first_after(&self, pts: u64) -> Option<u64> {
+        self.entries
+            .iter()
+            .find(|e| e.pts_90khz > pts)
+            .map(|e| e.pts_90khz)
+    }
+
     /// First and last PTS in the index, if any.
     pub fn span(&self) -> Option<(u64, u64)> {
         let first = self.entries.first()?;
@@ -218,6 +252,70 @@ mod tests {
             byte_offset: off,
             flags: flag::IS_IDR,
         }
+    }
+
+    /// A clip must cover the window it asked for, not stop a GOP short.
+    ///
+    /// The exporter bounds both ends with `find_floor`. At the tail that
+    /// rounds inward, so a range naming the exact end loses everything back to
+    /// the previous random-access point — 26.35s of a 30s request on the rig.
+    /// Naming the next point instead makes that floor land on it.
+    #[test]
+    fn the_point_after_the_end_is_what_covers_the_window() {
+        let mut idx = InMemoryIndex::default();
+        for i in 0..5u64 {
+            idx.entries.push(make_entry(i * 180_000, 0, (i * 1000) as u32));
+        }
+        // 0, 2s, 4s, 6s, 8s at 90kHz.
+
+        // An end falling between points takes the next one, so the GOP that
+        // contains the end is included rather than dropped.
+        assert_eq!(idx.first_after(270_000), Some(360_000), "the tail GOP was dropped");
+        // An end landing exactly on a point still needs the one after it:
+        // `find_floor` would otherwise stop at that point, excluding its GOP.
+        assert_eq!(idx.first_after(360_000), Some(540_000));
+        // Past the end of the recording there is nothing more to include, and
+        // the caller keeps the end it asked for.
+        assert_eq!(idx.first_after(720_000), None);
+        assert_eq!(idx.first_after(999_999), None);
+    }
+
+    /// A clip must not be cut across a break in the media's timeline.
+    ///
+    /// The index is monotonic across a writer restart because the counter is
+    /// resumed, so nothing about the numbers says "the media restarted here".
+    /// The flag does. Muxing across one produced a 30-second clip that
+    /// declared a duration of 26,884 seconds — playable, and wrong in a way
+    /// no counter reported.
+    #[test]
+    fn a_range_containing_a_restart_is_reported_as_spanning_one() {
+        let mut idx = InMemoryIndex::default();
+        idx.entries.push(make_entry(1_000, 0, 0));
+        idx.entries.push(make_entry(90_000, 0, 100));
+        let mut joined = make_entry(180_000, 1, 0);
+        joined.flags |= flag::PCR_DISCONTINUITY;
+        idx.entries.push(joined);
+        idx.entries.push(make_entry(270_000, 1, 100));
+
+        assert!(
+            idx.spans_discontinuity(90_000, 270_000),
+            "a range straddling the join must be refused the exact path"
+        );
+        // Either side of it on its own is fine.
+        assert!(!idx.spans_discontinuity(1_000, 90_000), "the range before the join is clean");
+        assert!(!idx.spans_discontinuity(180_000, 270_000), "the range after the join is clean");
+
+        // The very first entry is not a join: nothing precedes it. A recording
+        // whose opening frame were treated as one could never cut exactly.
+        let mut first_flagged = InMemoryIndex::default();
+        let mut e0 = make_entry(1_000, 0, 0);
+        e0.flags |= flag::PCR_DISCONTINUITY;
+        first_flagged.entries.push(e0);
+        first_flagged.entries.push(make_entry(90_000, 0, 100));
+        assert!(
+            !first_flagged.spans_discontinuity(0, 90_000),
+            "the first entry must not lock the whole recording out of exact cutting"
+        );
     }
 
     #[test]

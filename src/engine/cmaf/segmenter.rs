@@ -128,6 +128,18 @@ pub struct PushOutcome {
 }
 
 impl VideoSegmenter {
+    /// Continue an existing stream's numbering.
+    ///
+    /// A restart appends to an origin that already holds this stream's
+    /// segments. Starting again at zero overwrites them from `seg-00000`
+    /// onward, which is how a restart used to destroy the DVR history it was
+    /// publishing into.
+    pub fn new_from_seq(track: VideoTrack, target_duration_secs: f64, next_seq: u64) -> Self {
+        let mut s = Self::new(track, target_duration_secs);
+        s.next_seq = next_seq;
+        s
+    }
+
     pub fn new(track: VideoTrack, target_duration_secs: f64) -> Self {
         let target_duration_90k = (target_duration_secs * 90_000.0) as u64;
         Self {
@@ -345,6 +357,14 @@ struct PendingAudioSample {
 const MAX_PENDING_AUDIO_MULTIPLE: u64 = 4;
 
 impl AudioSegmenter {
+    /// Continue an existing stream's numbering — see
+    /// [`VideoSegmenter::new_from_seq`].
+    pub fn new_from_seq(track: AudioTrack, target_duration_secs: f64, next_seq: u64) -> Self {
+        let mut s = Self::new(track, target_duration_secs);
+        s.next_seq = next_seq;
+        s
+    }
+
     pub fn new(track: AudioTrack, target_duration_secs: f64) -> Self {
         let target_duration_ts = (target_duration_secs * track.sample_rate as f64) as u64;
         Self {
