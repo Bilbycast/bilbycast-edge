@@ -261,6 +261,7 @@ and restart per node, and nothing was audited:
 | `probe_4k` | `BILBYCAST_PROBE_4K` | Run the second-tier 4K pass. `None` → `true`; ignored when `probe_session_limits` is false. |
 | `media_player_controller` | `BILBYCAST_MEDIA_PLAYER_CONTROLLER` | Node default for the media-player operator-control (transition) path. `None` → `true`. Also decides whether `media-player-control-v1` is advertised, so turning it off withdraws the manager's **Next** button node-wide instead of offering one that refuses. Per-input `operator_control` wins. |
 | `media_player_pcr_deadlines` | `BILBYCAST_MEDIA_PLAYER_PCR_DEADLINES` | Node default for PCR-anchored TS playout pacing. `None` → `true`; `false` selects the legacy byte-rate estimate. Per-input `pcr_deadlines` wins. |
+| `heap_trim_secs` | *(new — no env var)* | How often `malloc_trim(0)` hands the allocator's free pages back, in seconds. `None` → 60; `0` = off; otherwise 10–3600. Read once at node start. The call takes each glibc arena's lock in turn — measured at 12–13 ms over one ~320 MB fragmented arena — so a contribution node whose PCR gates leave no room for a recurring sweep can lengthen it or switch it off without rebuilding. Runs on `spawn_blocking`, never on a runtime worker. |
 
 A matching **per-input** `pcr_deadlines` lands on `MediaPlayerInputConfig`
 beside the existing `operator_control`. It gets both layers because its failure

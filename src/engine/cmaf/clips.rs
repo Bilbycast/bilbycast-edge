@@ -34,6 +34,7 @@ use chrono::{DateTime, Utc};
 use serde::Deserialize;
 
 use super::upload::http_put;
+use crate::manager::events::{EventSeverity, category};
 
 /// How often to ask the origin whether anything is waiting.
 ///
@@ -89,8 +90,16 @@ const UNSUPPORTED_GIVE_UP: u32 = 6;
 fn is_permanent(err: &str) -> bool {
     let e = err.to_ascii_lowercase();
     e.contains("outside the")
-        || e.contains("413")
-        || e.contains("too large")
+        // "returned http 413", not a bare "413". The formatted chain embeds
+        // the segment URI, and segment names are `seg-{seq:05}.m4s` — about
+        // three per cent of five-digit sequence numbers contain the literal
+        // 413, so a 30-second window had roughly a one-in-three chance of
+        // containing one. A transient 503 on `seg-00413.m4s` was then called
+        // settled and the viewer told the clip could not be produced, when a
+        // retry would have delivered it. Clip names are quoted in these
+        // messages too, which is how "Lap 413" made every failure permanent.
+        || e.contains("returned http 413")
+        || e.contains("clip too large")
         || e.contains("empty after mapping")
         || e.contains("no dated segments")
         // Retrying cannot move the restart. Without this the operator waits
@@ -532,8 +541,29 @@ async fn cut_one(base: &str, auth: Option<&str>, flow_id: &str, rec: &ClipRecord
     if let Some(bytes) = cut_exact(flow_id, rec).await? {
         let target = format!("{base}/clips/{}.mp4", urlencoding_light(&rec.name));
         let n = bytes.len();
-        http_put(&target, bytes, "video/mp4", auth).await?;
-        return Ok(n);
+        match http_put(&target, bytes, "video/mp4", auth).await {
+            Ok(()) => return Ok(n),
+            // The exact cut was too big for the origin to accept — try the
+            // coarse one before calling the clip impossible.
+            //
+            // The relay's 256 MiB body limit was sized against the *source*
+            // bytes a clip is cut from; the all-intra re-encode is a quality
+            // decision made after that, so a near-maximum window on a
+            // high-bitrate feed can produce a file the origin refuses. The
+            // segment path assembles from the origin's own rendition and is
+            // exactly what that number was sized for, so it very likely
+            // succeeds — but `?` propagated the 413 straight out, `is_permanent`
+            // matched it, and the operator was told the clip could not be
+            // produced after minutes of CPU and ~800 MB of uplink.
+            Err(e) if format!("{e:#}").contains("413") => {
+                tracing::warn!(
+                    flow_id, clip = %rec.name, bytes = n, error = %format!("{e:#}"),
+                    "clip exporter: the origin refused the exact cut as too large; \
+                     falling back to whole segments"
+                );
+            }
+            Err(e) => return Err(e),
+        }
     }
     cut_from_segments(base, auth, rec).await
 }
@@ -594,6 +624,7 @@ pub async fn run(
     base_url: String,
     auth_token: Option<String>,
     flow_id: String,
+    event_sender: crate::manager::events::EventSender,
     cancel: tokio_util::sync::CancellationToken,
 ) {
     let base = base_url.trim_end_matches('/').to_string();
@@ -662,6 +693,28 @@ pub async fn run(
                         "clip exporter: cannot read the clip list; nothing will be cut \
                          until this clears"
                     );
+                    // And on the Events page, not only in the log.
+                    //
+                    // An exporter locked out of its own queue can never mark
+                    // anything failed either — only the edge writes that
+                    // terminal state — so the viewer's page reads "being cut"
+                    // indefinitely for clips that are never coming, the
+                    // manager's session row reads healthy, and the only way to
+                    // find it is to SSH to the node.
+                    event_sender.emit_flow_with_details(
+                        EventSeverity::Warning,
+                        category::CMAF,
+                        format!(
+                            "Clip export blocked on flow '{flow_id}': the origin's clip \
+                             queue cannot be read, so no marked clip will be cut"
+                        ),
+                        &flow_id,
+                        serde_json::json!({
+                            "error_code": "clip_export_blocked",
+                            "origin": base,
+                            "error": msg,
+                        }),
+                    );
                     quiet = true;
                 }
                 continue;
@@ -711,6 +764,25 @@ pub async fn run(
                             clip = %rec.name, attempts = *n, error = %msg,
                             "clip exporter: giving up on this clip"
                         );
+                        // The viewer is told, via the relay's record. The
+                        // operator is told here — the manager has no clip
+                        // surface at all, so without this a run of failed
+                        // exports is invisible to the person running the event.
+                        event_sender.emit_flow_with_details(
+                            EventSeverity::Warning,
+                            category::CMAF,
+                            format!(
+                                "Clip '{}' on flow '{flow_id}' could not be cut: {msg}",
+                                rec.name
+                            ),
+                            &flow_id,
+                            serde_json::json!({
+                                "error_code": "clip_export_failed",
+                                "clip": rec.name,
+                                "attempts": *n,
+                                "error": msg,
+                            }),
+                        );
                         report_failure(&base, auth, &rec.name, &msg).await;
                         attempts.remove(&rec.name);
                     } else {
@@ -751,6 +823,30 @@ mod tests {
         ] {
             assert!(!is_permanent(e), "{e} must still be retried");
         }
+    }
+
+    /// A segment number is not a status code, and neither is a clip name.
+    ///
+    /// The formatted chain embeds the segment URI and the clip name, and
+    /// segments are `seg-{seq:05}.m4s` — about three per cent of five-digit
+    /// sequence numbers contain the literal 413, so a 30-second window had
+    /// roughly a one-in-three chance of holding one. Matching a bare "413"
+    /// turned a transient fetch failure on such a segment into a settled one,
+    /// and the viewer was told the clip could not be produced when a retry
+    /// would have delivered it.
+    #[test]
+    fn a_sequence_number_that_looks_like_a_status_code_is_still_retried() {
+        for e in [
+            "GET https://origin/seg-00413.m4s returned HTTP 503",
+            "GET https://origin/seg-41300.m4s returned HTTP 500",
+            "PUT https://relay/clips/Lap%20413.mp4 returned HTTP 502 — bad gateway",
+        ] {
+            assert!(!is_permanent(e), "{e} must still be retried");
+        }
+        // The real one still is permanent.
+        assert!(is_permanent(
+            "PUT https://relay/clips/Lap%20413.mp4 returned HTTP 413 — clip too large"
+        ));
     }
 
     fn t(s: &str) -> DateTime<Utc> {

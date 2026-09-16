@@ -251,24 +251,31 @@ fn exit_without_static_teardown(code: i32) -> ! {
 /// to release. Measured on this box at 12–13 ms over a single ~320 MB
 /// fragmented arena, plus ~20 000 minor faults to touch the returned pages
 /// again — so on a busy node the paying case is every tick, not the cheap one.
+/// How often the trimmer runs when `tuning.heap_trim_secs` says nothing.
+///
+/// Measured on the demo rig with a single session and no clip activity, the
+/// live path churns about 330 MB/min of transient allocation — so at three
+/// minutes the resident size oscillated between 1.6 GB and 2.6 GB, and at one
+/// it stays within a few hundred megabytes of the floor.
+const DEFAULT_HEAP_TRIM_SECS: u64 = 60;
+
 #[cfg(target_env = "gnu")]
-fn spawn_heap_trimmer(cancel: tokio_util::sync::CancellationToken) {
-    // Every minute.
-    //
+fn spawn_heap_trimmer(every_secs: u64, cancel: tokio_util::sync::CancellationToken) {
     // The interval sets how much slack the process carries, because it is the
-    // window in which freed pages accumulate. Measured on the demo rig with a
-    // single session and no clip activity, the live path churns about
-    // 330 MB/min of transient allocation — so at three minutes the resident
-    // size oscillated between 1.6 GB and 2.6 GB, and at one it stays within a
-    // few hundred megabytes of the floor.
+    // window in which freed pages accumulate — see `DEFAULT_HEAP_TRIM_SECS` for
+    // the measurement it is sized against, and `tuning.heap_trim_secs` for why
+    // an operator can move it.
     //
-    // That gigabyte matters on a box sharing 15 GB with the edge doing the SDI
-    // capture. The cost is per-arena locks taken briefly once a minute, which
-    // is far lighter than the clip cut this same process already does without
-    // disturbing segment cadence.
-    const EVERY: Duration = Duration::from_secs(60);
+    // Zero is off. A contribution node whose PCR gates leave no room for a
+    // recurring per-arena lock sweep should be able to say so from the manager
+    // rather than by rebuilding the binary.
+    if every_secs == 0 {
+        tracing::info!("heap trimmer disabled by tuning.heap_trim_secs = 0");
+        return;
+    }
+    let every = Duration::from_secs(every_secs);
     tokio::spawn(async move {
-        let mut ticks = tokio::time::interval(EVERY);
+        let mut ticks = tokio::time::interval(every);
         ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tokio::select! {
@@ -299,7 +306,7 @@ fn spawn_heap_trimmer(cancel: tokio_util::sync::CancellationToken) {
 /// Nothing to do where the allocator is not glibc — musl and macOS return
 /// pages on free.
 #[cfg(not(target_env = "gnu"))]
-fn spawn_heap_trimmer(_cancel: tokio_util::sync::CancellationToken) {}
+fn spawn_heap_trimmer(_every_secs: u64, _cancel: tokio_util::sync::CancellationToken) {}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -1132,7 +1139,14 @@ async fn real_main() -> anyhow::Result<()> {
     // Give the allocator's free pages back on a slow tick. Not a leak — see
     // `spawn_heap_trimmer` — but a resident size that only ever climbs, on a
     // box that shares its RAM with the edge doing the SDI capture.
-    spawn_heap_trimmer(shutdown_token.clone());
+    spawn_heap_trimmer(
+        app_config
+            .tuning
+            .as_ref()
+            .and_then(|t| t.heap_trim_secs)
+            .unwrap_or(DEFAULT_HEAP_TRIM_SECS),
+        shutdown_token.clone(),
+    );
 
     // Spawn the upgrade watchdog periodic task that promotes
     // `pending_health → stable` once the configured boot health window

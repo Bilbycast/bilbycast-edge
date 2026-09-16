@@ -1432,8 +1432,25 @@ fn build_moov(
     mdat_base: u64,
 ) -> Vec<u8> {
     const MOVIE_TIMESCALE: u32 = 1000;
+    // Each track's own length, in the movie timescale, and the movie's length
+    // as the longer of the two.
+    //
+    // `mvhd.duration` and both `tkhd.duration` fields used to carry the
+    // *video's* length. With no `edts`/`elst` in the file a `tkhd` is the only
+    // thing declaring how long its track runs, and the two lengths diverge in
+    // ordinary operation: AAC samples are laid out at a fixed 1024-sample
+    // duration each whatever their demuxed PTS said, so a lost audio frame
+    // shortens the audio timeline while the PTS-derived video timeline still
+    // spans the gap. Players that trust `tkhd` over `mdhd` then cut the audio
+    // short or pad it, and `ffprobe` reports a stream duration that is simply
+    // another track's.
     let v_ticks: u64 = video_samples.iter().map(|s| s.duration as u64).sum();
-    let movie_ms = v_ticks * MOVIE_TIMESCALE as u64 / video.timescale.max(1) as u64;
+    let video_ms = v_ticks * MOVIE_TIMESCALE as u64 / video.timescale.max(1) as u64;
+    let a_ticks: u64 = audio_samples.iter().map(|s| s.duration as u64).sum();
+    let audio_ms = audio
+        .map(|a| a_ticks * MOVIE_TIMESCALE as u64 / (a.sample_rate as u64).max(1))
+        .unwrap_or(0);
+    let movie_ms = video_ms.max(audio_ms);
 
     let mut buf = Vec::with_capacity(4096);
     {
@@ -1458,13 +1475,13 @@ fn build_moov(
             mvhd.u32(3); // next_track_ID
         }
         write_progressive_video_trak(
-            &mut moov, video, video_samples, v_chunks, movie_ms, mdat_base,
+            &mut moov, video, video_samples, v_chunks, video_ms, mdat_base,
         );
         if let Some(a) = audio
             && !audio_samples.is_empty()
         {
             write_progressive_audio_trak(
-                &mut moov, a, audio_samples, a_chunks, movie_ms, mdat_base,
+                &mut moov, a, audio_samples, a_chunks, audio_ms, mdat_base,
             );
         }
     }
@@ -1480,7 +1497,8 @@ fn write_progressive_video_trak(
     v: &VideoTrack,
     samples: &[Sample],
     chunks: &[ChunkPlan],
-    movie_ms: u64,
+    // This track's own duration in the movie timescale — not the movie's.
+    track_ms: u64,
     mdat_base: u64,
 ) {
     let media_ticks: u64 = samples.iter().map(|s| s.duration as u64).sum();
@@ -1491,7 +1509,7 @@ fn write_progressive_video_trak(
         tkhd.u32(0);
         tkhd.u32(VIDEO_TRACK_ID);
         tkhd.u32(0);
-        tkhd.u32(movie_ms as u32);
+        tkhd.u32(track_ms as u32);
         tkhd.zeros(8);
         tkhd.u16(0); // layer
         tkhd.u16(0); // alternate_group
@@ -1547,7 +1565,8 @@ fn write_progressive_audio_trak(
     a: &AudioTrack,
     samples: &[Sample],
     chunks: &[ChunkPlan],
-    movie_ms: u64,
+    // This track's own duration in the movie timescale — not the movie's.
+    track_ms: u64,
     mdat_base: u64,
 ) {
     let media_ticks: u64 = samples.iter().map(|s| s.duration as u64).sum();
@@ -1558,7 +1577,7 @@ fn write_progressive_audio_trak(
         tkhd.u32(0);
         tkhd.u32(AUDIO_TRACK_ID);
         tkhd.u32(0);
-        tkhd.u32(movie_ms as u32);
+        tkhd.u32(track_ms as u32);
         tkhd.zeros(8);
         tkhd.u16(0);
         tkhd.u16(1); // alternate_group 1: audio
@@ -1612,6 +1631,62 @@ fn write_progressive_audio_trak(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Each track declares its own length, and the movie the longer of them.
+    ///
+    /// With no `edts`/`elst` in the file, a `tkhd` is the only thing saying how
+    /// long its track runs. Both used to carry the *video's* length, and the
+    /// two diverge in ordinary operation: AAC samples are laid out at a fixed
+    /// 1024-sample duration whatever their demuxed PTS said, so a lost audio
+    /// frame shortens the audio timeline while the PTS-derived video timeline
+    /// still spans the gap. A player that trusts `tkhd` over `mdhd` then cuts
+    /// the audio short or pads it, and `ffprobe` reports one track's duration
+    /// against the other.
+    #[test]
+    fn each_track_declares_its_own_duration() {
+        fn sample(duration: u32) -> Sample {
+            Sample { duration, data: vec![0xAB; 16], composition_time_offset: 0, is_sync: true }
+        }
+        // 4 video frames at 90 kHz = 160 ms; 20 AAC frames at 48 kHz = ~427 ms,
+        // so the audio outlasts the video and `mvhd` has to follow the audio.
+        let video: Vec<Sample> = (0..4).map(|_| sample(3600)).collect();
+        let audio: Vec<Sample> = (0..20).map(|_| sample(1024)).collect();
+        let vtrack =
+            VideoTrack::from_h264(vec![0x67, 0x42, 0x00, 0x1f], vec![0x68, 0xce, 0x3c, 0x80]);
+        let atrack = AudioTrack::aac([0x11, 0x90], 48_000, 2, 128_000);
+        let out = build_progressive_mp4(&vtrack, &video, Some(&atrack), &audio);
+
+        // Durations, in movie-timescale (1000) units.
+        let video_ms = 4u32 * 3600 * 1000 / 90_000; // 160
+        let audio_ms = 20u32 * 1024 * 1000 / 48_000; // 426
+        let movie_ms = video_ms.max(audio_ms);
+
+        fn u32_at(buf: &[u8], pos: usize) -> u32 {
+            u32::from_be_bytes(buf[pos..pos + 4].try_into().unwrap())
+        }
+        fn find(buf: &[u8], fc: &[u8; 4]) -> Vec<usize> {
+            buf.windows(4)
+                .enumerate()
+                .filter(|(_, w)| *w == fc)
+                .map(|(i, _)| i)
+                .collect()
+        }
+        // `mvhd`: creation, modification, timescale, duration.
+        let mvhd = find(&out, b"mvhd")[0];
+        assert_eq!(u32_at(&out, mvhd + 4 + 4 + 12), movie_ms, "mvhd under-reports the clip");
+
+        // Both `tkhd`s: creation, modification, track_ID, reserved, duration.
+        let tkhds = find(&out, b"tkhd");
+        assert_eq!(tkhds.len(), 2, "expected a video and an audio track");
+        let mut declared: Vec<u32> =
+            tkhds.iter().map(|&p| u32_at(&out, p + 4 + 4 + 16)).collect();
+        declared.sort_unstable();
+        assert_eq!(
+            declared,
+            vec![video_ms, audio_ms],
+            "a track declared a length that is not its own"
+        );
+    }
 
     /// An exported clip is a progressive file with a real seek table.
     ///

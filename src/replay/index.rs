@@ -189,12 +189,51 @@ impl InMemoryIndex {
         // PTS-monotonic in non-pathological streams (PCR discontinuities
         // are flagged but don't reset the in-memory PTS — the writer
         // accumulates a 64-bit pseudo-PTS that monotonically advances).
+        //
+        // Except on an index a **shipped binary already corrupted**. Before the
+        // resume landed, every writer restart set the counter back to zero, so
+        // any recording that restarted holds a high-PTS run followed by a low
+        // one — and retention prunes `NNNNNN.ts` files only, never index
+        // entries, so that state is permanent. `binary_search_by_key` is
+        // documented as returning an unspecified result on unsorted input: a
+        // scrub or a clip export against such a file gets an arbitrary entry,
+        // which reads as the wrong media or a segment that no longer exists.
+        //
+        // The scan is O(n) on a file that is microseconds to read either way
+        // (24 bytes per IDR, ~1 MB a day), and it is only reached on data the
+        // binary search has no defined answer for.
+        if !self.is_sorted() {
+            return self.find_floor_linear(target_pts);
+        }
         let idx = match self.entries.binary_search_by_key(&target_pts, |e| e.pts_90khz) {
             Ok(i) => i,
             Err(0) => return Some(self.entries[0]),
             Err(i) => i - 1,
         };
         Some(self.entries[idx])
+    }
+
+    /// Is the index PTS-monotonic, as every writer since the resume landed
+    /// leaves it?
+    fn is_sorted(&self) -> bool {
+        self.entries.windows(2).all(|w| w[0].pts_90khz <= w[1].pts_90khz)
+    }
+
+    /// The largest entry at or below `target_pts`, without assuming order.
+    ///
+    /// Clamps at the low end the same way the binary search does — a target
+    /// before everything resolves to the earliest entry — so the two agree on
+    /// a sorted index and only their cost differs.
+    fn find_floor_linear(&self, target_pts: u64) -> Option<IndexEntry> {
+        let best = self
+            .entries
+            .iter()
+            .filter(|e| e.pts_90khz <= target_pts)
+            .max_by_key(|e| e.pts_90khz);
+        match best {
+            Some(e) => Some(*e),
+            None => self.entries.iter().min_by_key(|e| e.pts_90khz).copied(),
+        }
     }
 
     /// Does a PTS range contain a break in the media's own timeline?
@@ -232,6 +271,13 @@ impl InMemoryIndex {
     }
 
     /// First and last PTS in the index, if any.
+    ///
+    /// Positional rather than min/max, and deliberately: on every index a
+    /// current writer produces those are the same thing, and on one a shipped
+    /// binary already corrupted the *positional* pair is the honest answer —
+    /// it describes where the file begins and ends, which is what a reader
+    /// resuming or bounding it needs. Taking the maximum instead would pair a
+    /// wall-clock anchor with a tick from a different run.
     pub fn span(&self) -> Option<(u64, u64)> {
         let first = self.entries.first()?;
         let last = self.entries.last()?;
@@ -392,5 +438,55 @@ mod tests {
         let _w = IndexWriter::open(&path2).await.unwrap();
         let len = tokio::fs::metadata(&path2).await.unwrap().len();
         assert_eq!(len, (ENTRY_SIZE * 2) as u64);
+    }
+
+    /// An index a shipped binary already corrupted still resolves a floor.
+    ///
+    /// Before the counter was resumed, every writer restart set it back to
+    /// zero, so a recording that restarted holds a high-PTS run followed by a
+    /// low one — and retention prunes `NNNNNN.ts` files only, never index
+    /// entries, so that state is permanent for the life of the recording. Rust
+    /// documents `binary_search_by_key` as returning an unspecified result on
+    /// unsorted input, so a scrub or a clip export against such a file got an
+    /// arbitrary entry: the wrong media, or a segment that no longer exists.
+    #[test]
+    fn a_pre_corrupted_index_still_resolves_a_floor() {
+        // Run A: 86_400 .. 86_400 + 4 * 90_000. Run B restarts at zero.
+        let mut idx = InMemoryIndex::default();
+        for i in 0..5u64 {
+            idx.entries.push(make_entry(86_400 + i * 90_000, i as u32, 0));
+        }
+        for i in 0..5u64 {
+            idx.entries.push(make_entry(i * 90_000, 5 + i as u32, 0));
+        }
+        assert!(!idx.is_sorted(), "the fixture is supposed to be out of order");
+
+        // A target inside run A resolves to run A's frame, not to whatever the
+        // binary search happened to land on.
+        let got = idx.find_floor(86_400 + 2 * 90_000 + 10).expect("a floor");
+        assert_eq!(got.pts_90khz, 86_400 + 2 * 90_000);
+        assert_eq!(got.segment_id, 2);
+
+        // And one inside run B resolves to run B's.
+        let got = idx.find_floor(3 * 90_000 + 10).expect("a floor");
+        assert_eq!(got.pts_90khz, 3 * 90_000);
+        assert_eq!(got.segment_id, 8);
+
+        // Before everything clamps to the earliest, as the sorted path does.
+        assert_eq!(idx.find_floor(0).expect("a floor").pts_90khz, 0);
+
+        // A sorted index answers identically either way.
+        let mut sorted = InMemoryIndex::default();
+        for i in 0..5u64 {
+            sorted.entries.push(make_entry(i * 90_000, i as u32, 0));
+        }
+        assert!(sorted.is_sorted());
+        for t in [0, 1, 90_001, 4 * 90_000, 10 * 90_000] {
+            assert_eq!(
+                sorted.find_floor(t).map(|e| e.pts_90khz),
+                sorted.find_floor_linear(t).map(|e| e.pts_90khz),
+                "the two searches disagree at {t}"
+            );
+        }
     }
 }

@@ -478,11 +478,12 @@ The disconnect event fires **once per connection cycle** — if the RTSP server 
 
 ### CMAF / CMAF-LL output (`cmaf`)
 
-Lifecycle + origin-upload events for the CMAF / LL-CMAF output. **None of
-these carries `details` at all** — every site uses `emit_flow`, whose body sets
-`details: None` — so `details.error_code` is empty for the whole category and
-an alarm rule must match on category `cmaf` plus the message text until the
-emitters move to `emit_flow_with_details`.
+Lifecycle + origin-upload events for the CMAF / LL-CMAF output. **Most of
+these carry no `details` at all** — those sites use `emit_flow`, whose body sets
+`details: None` — so `details.error_code` is empty for them and an alarm rule
+must match on category `cmaf` plus the message text until the emitters move to
+`emit_flow_with_details`. The two clip-export rows at the bottom of the table
+are the exception and do carry `error_code`.
 
 | Severity | Message | Trigger |
 |----------|---------|---------|
@@ -498,8 +499,12 @@ emitters move to `emit_flow_with_details`.
 | warning | CMAF output '{id}': m3u8 upload failed: {error} | Non-LL `manifest.m3u8` PUT failed. |
 | warning | CMAF output '{id}': mpd upload failed: {error} | Non-LL `manifest.mpd` PUT failed. |
 | warning | CMAF output '{id}': thumbnail capture failed ({error}); the scrub preview will be missing | The filmstrip/scrub thumbnail capture rejected the stream (e.g. no video). **Latched once per output** — a stream with no video yields nothing on every tick. |
+| warning | CMAF output '{id}': the tracks changed across the restart, so {n} restored segment(s) were dropped — the DVR window refills in real time | The window restore read back rows published under a different `init.mp4` than this run writes (`#EXT-X-BILBYCAST-INIT` mismatch). Advertising them would leave the restored history described by an init that cannot decode it, which MSE answers by waiting for ever with nothing wrong on the wire. |
+| warning | Clip export blocked on flow '{flow}': the origin's clip queue cannot be read, so no marked clip will be cut | `GET {origin}/clips` is failing for a reason that is not "this origin does not serve clips". **Latched** per failure spell. Carries `error_code: "clip_export_blocked"`, `details.origin`, `details.error`. It matters because an exporter locked out of its own queue can never mark a clip *failed* either — only the edge writes that terminal state — so the viewer's page reads "being cut" indefinitely for clips that are never coming. |
+| warning | Clip '{name}' on flow '{flow}' could not be cut: {error} | A clip was given up on, either because the failure was settled or after `MAX_ATTEMPTS`. Carries `error_code: "clip_export_failed"`, `details.clip`, `details.attempts`, `details.error`. The viewer learns this from the relay's record; this is the only place an *operator* does, because the manager has no clip surface. |
 
-**Source**: `src/engine/cmaf/mod.rs`, `src/engine/cmaf/thumbnails.rs`.
+**Source**: `src/engine/cmaf/mod.rs`, `src/engine/cmaf/thumbnails.rs`,
+`src/engine/cmaf/clips.rs`.
 
 ---
 

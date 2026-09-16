@@ -787,6 +787,16 @@ fn validate_node_tuning(tuning: &crate::config::models::NodeTuningConfig) -> Res
             );
         }
     }
+    if let Some(v) = tuning.heap_trim_secs
+        && v != 0
+        && !(10..=3600).contains(&v)
+    {
+        // 0 is "off" and is deliberately outside the range: a trimmer every
+        // few seconds would put a per-arena lock sweep into the media path far
+        // more often than the thing it is reclaiming justifies, and one an hour
+        // apart is already slower than the growth it is sized against.
+        bail!("tuning.heap_trim_secs = {v} out of range (0 = off, otherwise 10..=3600 s)");
+    }
     Ok(())
 }
 
@@ -10489,6 +10499,7 @@ mod tests {
             probe_4k: None,
             media_player_controller: Some(false),
             media_player_pcr_deadlines: None,
+            heap_trim_secs: Some(180),
         };
         let json = serde_json::to_string(&t).unwrap();
         assert!(!json.contains("probe_4k"), "an unset field stays off the wire: {json}");

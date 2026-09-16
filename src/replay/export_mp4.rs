@@ -1,21 +1,30 @@
 // Copyright (c) 2026 Softside Tech Pty Ltd. All rights reserved.
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! TS → fragmented-MP4 remuxer for the Recordings library export path.
+//! TS → progressive-MP4 export for the Recordings library and the DVR clip
+//! cutter.
 //!
 //! Operators downloading a clip for review through QuickTime / VLC /
 //! editing tooling want a `.mp4` file, not a `.ts`. The recording
 //! engine stores everything as MPEG-TS on disk, so the export path
 //! re-uses [`crate::engine::ts_demux::TsDemuxer`] to recover access
 //! units + AAC frames and the `engine::cmaf::fmp4` builders to wrap
-//! them in a single `ftyp + moov + moof + mdat` fragmented-MP4 stream.
+//! them in one `ftyp + moov + mdat` file with real sample tables.
+//!
+//! **Not a remux, on any build with an encoder.** It was one, and the module
+//! doc said so for a while after it stopped being true. The video is decoded
+//! and re-encoded all-intra (libx264, `gop_size = 1`, CRF 20, no B-frames)
+//! because that is what makes a clip step — long-GOP is right for transport
+//! and wrong for review, and no container fixes it. A build without an x264
+//! encoder falls back to the source's own GOP structure with a log line.
+//! Audio is never re-encoded. See `docs/replay.md`, "The shape of the file".
 //!
 //! ## Scope
 //!
-//! - **Video**: H.264 (`avc1`) and HEVC (`hvc1`) — both packaged via the
-//!   existing CMAF box writer (`engine::cmaf::fmp4::VideoTrack::from_h264` /
-//!   `from_h265`). MPEG-1 / MPEG-2 video has no first-class MP4 mapping
-//!   wired today and falls back to `replay_export_format_unsupported`.
+//! - **Video in**: H.264 and HEVC. **Video out**: H.264 (`avc1`) whenever the
+//!   re-encode succeeds, and the source codec (`avc1` / `hvc1`) when it does
+//!   not. MPEG-1 / MPEG-2 video has no first-class MP4 mapping wired today and
+//!   falls back to `replay_export_format_unsupported`.
 //! - **Audio**: AAC (`mp4a` + `esds`), AC-3 (`ac-3` + `dac3`), E-AC-3
 //!   (`ec-3` + `dec3`), MP2 (`mp4a` + `esds` with MPEG-1-Audio OTI).
 //!   Opus surfaces `replay_export_format_unsupported` because
@@ -24,12 +33,14 @@
 //!   B-frame streams (most main / high profile broadcast) may decode
 //!   in incorrect display order in some players. The follow-up to
 //!   recover DTS through PES parsing is tracked separately.
-//! - **One-shot build, in-memory cache.** Exports cap at 256 MiB to
-//!   keep the cache footprint bounded; over-cap clips fail with
-//!   `replay_export_too_large` and the operator should download TS.
-//! - **Cache TTL** is 5 minutes — long enough for the manager's
-//!   chunk-by-chunk pulls to drain a 256 MiB clip on a slow link,
-//!   short enough that an operator who walks away doesn't pin RAM.
+//! - **One-shot build, bounded in-memory cache.** Both the source range and
+//!   the essence about to be muxed are capped at 256 MiB; over-cap exports
+//!   fail with `replay_export_too_large` and the operator should download TS.
+//!   The cache has a byte ceiling, an entry ceiling and LRU eviction on top of
+//!   its 5-minute TTL.
+//! - **One build at a time, off the runtime.** The decode + encode + mux runs
+//!   on `spawn_blocking` behind a process-wide single permit, shared by the
+//!   operator export commands and the DVR clip cutter.
 
 use std::collections::HashMap;
 use std::sync::Mutex;

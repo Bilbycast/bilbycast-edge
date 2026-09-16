@@ -1558,6 +1558,28 @@ pub struct NodeTuningConfig {
     /// Replaces `BILBYCAST_MEDIA_PLAYER_PCR_DEADLINES`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub media_player_pcr_deadlines: Option<bool>,
+    /// How often to hand the allocator's free pages back to the kernel, in
+    /// seconds. `None` → 60. `0` turns the trimmer off entirely.
+    ///
+    /// glibc gives busy threads their own arenas, and media work allocates in
+    /// bursts of wildly different shapes, so those arenas fragment and the
+    /// free runs are held rather than returned. Nothing is lost and the memory
+    /// is reused, but the resident size only ever climbs — measured on the demo
+    /// rig, an edge sitting at 3399 MB dropped to 1786 MB on a single
+    /// `malloc_trim`, so 1.6 GB had been free all along. That matters on a box
+    /// sharing its RAM with a second edge.
+    ///
+    /// It is a knob and not a constant because the cost is real and is not the
+    /// same on every node: the call takes each arena's lock in turn, measured
+    /// at 12–13 ms over one ~320 MB fragmented arena, plus the minor faults to
+    /// touch the returned pages again. A contribution node whose gates 4 and 5
+    /// leave no room for that should be able to lengthen it or switch it off
+    /// from the manager, rather than by editing a systemd unit — which is the
+    /// rule the rest of this block exists to follow.
+    ///
+    /// Read once at node start, so a pushed change lands at the next restart.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub heap_trim_secs: Option<u64>,
 }
 
 /// System resource monitoring and threshold configuration.

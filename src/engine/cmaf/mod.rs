@@ -1222,6 +1222,7 @@ async fn run(
             // recorder's `storage_id` defaults to the flow id, which is what
             // an exact cut is read from.
             flow_id.to_string(),
+            event_sender.clone(),
             cancel.clone(),
         ));
     }
