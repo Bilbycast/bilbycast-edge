@@ -671,6 +671,46 @@ produced **0.72 MB** for identical content — 53% larger. The proxy is what
 `balanced` mode streams and what a tablet pulls, and it has to stay readable
 frame by frame, so quality per bit is not a spare resource here.
 
+### The decode is the part worth moving, and only if it stays on the GPU
+
+Measured on real SDI content — a 10 s recorded segment of the live 1080p25
+feed, not a synthetic pattern — scaled to 640x360 and encoded all-intra:
+
+| pipeline | CPU | vs software |
+|---|---|---|
+| all software | 6.06 s | — |
+| **NVDEC decode, CPU scale, x264** | **2.96 s** | **-51%** |
+| NVDEC decode, `scale_cuda`, download, x264 | 7.61 s | **+26%** |
+| full GPU: NVDEC, `scale_cuda`, NVENC | 0.66 s | -89% |
+
+Two things to take from that.
+
+**The obvious middle path is a pessimisation.** Decoding and scaling on the
+GPU and then encoding on the CPU is *worse than doing nothing at all*, because
+the frames have to be pulled back across PCIe and that download costs more
+than the scale saves. A GPU pipeline is only cheap while the frames never
+leave the GPU.
+
+**NVDEC alone is the good trade.** Letting the hardware decode and handing
+frames straight back for a software scale and x264 encode halves the CPU while
+keeping everything x264 gives us: native all-intra with `gop_size: 1`, and the
+bitrate efficiency the proxy needs. It costs none of the NVENC compromises
+above.
+
+The full GPU chain is cheaper again, but it buys the last 38 points by taking
+on the forced-IDR work, the 53% bitrate penalty, and a hard dependency on the
+NVIDIA stack for a rendition that is meant to be the *reliable* one.
+
+**Whatever is done here needs a runtime fallback, not a probe.** On 2026-09-15
+a driver/userspace mismatch on the z440 left the capability probe cheerfully
+reporting `nvenc encoder 1080p session capacity probed: 8` while every real
+`OpenEncodeSessionEx` failed. A design that trusts the probe would have
+produced a DVR that silently stopped working. `output_display`'s
+`open_video_decoder_with_retry` (retry, then demote to `Cpu`) and
+`st2110_video_io`'s "HW decoder open failed — falling back to threaded
+software decode" are the patterns to copy; the CMAF path has neither, and no
+decode-side equivalent of the encoder's `["h264_nvenc", "x264"]` chain exists.
+
 ### Where that leaves it
 
 Moving the encode alone is not worth a tenth of a core against 53% more
