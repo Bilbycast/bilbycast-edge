@@ -147,10 +147,57 @@ and seeds its window from those rows, each keeping its own
   row published after a restore carries `EXT-X-DISCONTINUITY` regardless.
 * **Never more than the configured window.** Restoring more rows than the
   output advertises would claim a window the retention policy does not keep.
+* **Discontinuities inside the window come back with it.** Both the per-row
+  `EXT-X-DISCONTINUITY` tags and the `EXT-X-DISCONTINUITY-SEQUENCE` count of the
+  ones that have already aged out. Dropping the tags asserted one continuous
+  timeline across a real re-anchor whose post-jump dates *were* restored;
+  resetting the count to zero made the discontinuity sequence go backwards on a
+  playlist whose media sequence carried on normally, which RFC 8216 §6.3.3 makes
+  an incompatible playlist change.
+* **The init has to still describe the restored rows.** `init.mp4` is one fixed
+  object and the new run overwrites it with *its* track list, sample entries and
+  parameter sets. Any track or parameter change across a restart — toggling
+  `low_latency`, adding or removing `audio_encode`, an `h264`→`h265` edit, a
+  resolution change, enabling encryption, or the audio-detection race latching
+  differently on two runs of the same config — therefore left the whole restored
+  history described by an init that cannot decode it. MSE answers that by
+  initialising the declared track and then waiting for ever: nothing wrong on
+  the wire, nothing wrong in the manifest, no error anywhere (#130).
+
+  So each manifest carries a private `#EXT-X-BILBYCAST-INIT:<hash>` naming the
+  init it was published under — a tag players must ignore per RFC 8216 §4.1, and
+  one the relay origin copies through untouched. On a mismatch the restored rows
+  are **dropped** and a Warning event names how many: a short window beats an
+  hour of history that stalls the player. The sequence number is kept either
+  way, because renumbering would overwrite segments the origin still holds. A
+  manifest written before the tag existed says nothing, which is treated as a
+  match — refusing every such restore would cost the window on no evidence.
 
 Best-effort throughout: a fresh stream 404s, and an origin that cannot be
 reached is not a reason to refuse to start. The cost of failing here is no
 output at all; the cost of the restore not happening is a shorter window.
+
+**It has a three-second budget and is raced against the cancel token.** The
+read-back sits between subscribing the broadcast receiver and entering the
+packet loop, so every second it spends is a second the output is not draining
+its channel — about seventeen at the default capacity and 10 Mbps before the
+output opens on a `Lagged` and the window gains a hole at exactly the join the
+restore exists to make seamless. A connect that never completes was already
+bounded at five seconds, but an origin that accepts the connection and then
+stalls held the clip client's whole 60 s request timeout, which is sized for
+pulling segments rather than for a startup preflight.
+
+**Only a failure that is not a 404 is reported.** A fresh stream answering 404
+is the ordinary case and says nothing; anything else means the window this
+output was publishing is about to be replaced by an empty one, and the run will
+renumber from `seg-00000` over segments the origin still holds and still serves.
+That used to be silent — the only log line was on the success path.
+
+**HLS only.** The read-back is of `manifest.m3u8`, which is published only when
+`manifests` includes `"hls"`. A `manifests: ["dash"]` output — the documented
+shape for HEVC — 404s on every restart and starts from an empty window,
+renumbering from zero. DVR sessions are unaffected: the manager hard-codes
+`"manifests": ["hls"]` for both renditions it provisions.
 
 Measured on the rig: 1800 segments and sequence `seg-04097` before a restart,
 1800 segments and `seg-04115` after, with one discontinuity at the join.

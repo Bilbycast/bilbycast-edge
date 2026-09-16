@@ -66,6 +66,21 @@ pub struct ClipRecord {
 /// cut".
 const MAX_ATTEMPTS: u32 = 3;
 
+/// Statuses that mean "this endpoint is not a clip queue and never will be".
+///
+/// 404 is the bilbycast relay that predates clip export answering its own
+/// not-found; 400 is an older relay whose object handler rejects `clips` for
+/// having no file extension; 403 is an S3-style store without ListBucket; 405
+/// is a CDN ingest that accepts PUT and nothing else.
+const NOT_A_CLIP_ORIGIN: [u16; 4] = [400, 403, 404, 405];
+
+/// How many consecutive such answers before the poller stops asking.
+///
+/// Not one: a relay restarting can answer 404 for a poll or two. Six is half a
+/// minute at the poll interval, which no restart outlasts, and after that the
+/// endpoint is simply not one that serves clips.
+const UNSUPPORTED_GIVE_UP: u32 = 6;
+
 /// Does this failure have any prospect of coming good?
 ///
 /// The window aging out and the clip being too large are settled facts: the
@@ -213,13 +228,32 @@ fn covering(
         .collect()
 }
 
-fn client() -> reqwest::Client {
-    reqwest::Client::builder()
-        .timeout(Duration::from_secs(60))
-        .connect_timeout(Duration::from_secs(5))
-        .build()
-        .expect("build reqwest client")
+/// The process-wide client the segment uploads already use.
+///
+/// This module built a fresh `reqwest::Client` per request. That is not just
+/// pool churn: `ClientBuilder::build()` constructs the TLS config eagerly, and
+/// on Linux the platform verifier walks and parses the whole system trust store
+/// doing it — synchronously, on the calling thread, whether the origin is
+/// `http` or `https`. A five-second poll re-read `/etc/ssl/certs` every five
+/// seconds for the life of every DVR session, and a segment-fallback cut did it
+/// once per covering segment, ~31 times serially for a 60 s clip, each with a
+/// fresh TCP and TLS handshake to a relay that may be across the internet. The
+/// shared client pays it once per process and keeps its connections.
+fn client() -> &'static reqwest::Client {
+    super::upload::client()
 }
+
+/// Most bytes `http_get` will take from the origin.
+///
+/// A playlist of `MAX_PLAYLIST_SEGMENTS` rows is a few hundred KiB and a
+/// segment is a couple of MiB; this is generous for both. Without a ceiling the
+/// only bound was the request timeout, so a wrong, compromised or MITM'd origin
+/// — `ingest_url` is validated for scheme and length and nothing else, and
+/// plain `http://` is permitted — could answer with a multi-gigabyte body that
+/// `resp.bytes()` would allocate in full on a node whose whole design point is
+/// not to disturb the media path. `upgrade::download` has capped its equivalent
+/// fetch from the beginning, for the same reason.
+const MAX_GET_BYTES: usize = 64 * 1024 * 1024;
 
 /// Fetch a stream's current media playlist from the origin.
 ///
@@ -231,15 +265,29 @@ pub(super) async fn fetch_manifest(base: &str, auth: Option<&str>) -> Result<Vec
 }
 
 async fn http_get(url: &str, auth: Option<&str>) -> Result<Vec<u8>> {
-    let mut req = client().get(url);
+    let mut req = client().get(url).timeout(Duration::from_secs(60));
     if let Some(t) = auth {
         req = req.header("Authorization", format!("Bearer {t}"));
     }
-    let resp = req.send().await?;
+    let mut resp = req.send().await?;
     if !resp.status().is_success() {
         bail!("GET {url} returned HTTP {}", resp.status().as_u16());
     }
-    Ok(resp.bytes().await?.to_vec())
+    // Refuse on the declared length where there is one, and again as the body
+    // arrives where there is not — a chunked response declares nothing.
+    if let Some(len) = resp.content_length()
+        && len > MAX_GET_BYTES as u64
+    {
+        bail!("GET {url} declared {len} bytes, over the {MAX_GET_BYTES} cap");
+    }
+    let mut out: Vec<u8> = Vec::new();
+    while let Some(chunk) = resp.chunk().await? {
+        if out.len() + chunk.len() > MAX_GET_BYTES {
+            bail!("GET {url} body exceeds the {MAX_GET_BYTES} byte cap mid-stream");
+        }
+        out.extend_from_slice(&chunk);
+    }
+    Ok(out)
 }
 
 /// The nominal rate: 90 kHz ticks per microsecond, as a fraction.
@@ -557,6 +605,8 @@ pub async fn run(
     // for the current spell of failures. Cleared by the first success, so a
     // fault that comes back is reported again.
     let mut quiet = false;
+    // Consecutive answers that say "this endpoint is not a clip queue".
+    let mut unsupported = 0u32;
     tracing::info!(origin = %base, "clip exporter: watching for clip requests");
 
     loop {
@@ -574,14 +624,39 @@ pub async fn run(
                 b
             }
             Err(e) => {
-                // A relay that predates clip export answers 404, and saying so
-                // every five seconds helps nobody. Everything else does need
-                // saying: swallowing all of it hid a 403 on every single poll
-                // — the exporter was locked out of its own work queue and the
-                // log looked perfectly healthy. Said once per spell, so a
-                // persistent fault is visible without becoming a firehose.
+                // An origin that does not serve clips at all, and one that is
+                // temporarily unwell, are different problems.
+                //
+                // The poller is spawned for every passthrough CMAF output, and
+                // `ingest_url` is any operator-supplied http(s) URL — a
+                // third-party packager, an S3-compatible store, a relay on an
+                // older release. None of those will ever answer this, and
+                // asking them 17 280 times a day is somebody else's traffic.
+                // The answer is not always 404 either: a relay that predates
+                // clip export routes the path to its object handler, whose
+                // name validator wants a dot, and replies 400; S3 without
+                // ListBucket replies 403.
+                //
+                // So a run of those gives up and says so once, while anything
+                // else stays a transient fault and keeps polling. Swallowing
+                // the lot was the original sin here — it hid a 403 on every
+                // single poll while the log looked perfectly healthy.
                 let msg = format!("{e:#}");
-                if !msg.contains("404") && !quiet {
+                if NOT_A_CLIP_ORIGIN
+                    .iter()
+                    .any(|code| msg.contains(&format!("HTTP {code}")))
+                {
+                    unsupported += 1;
+                    if unsupported >= UNSUPPORTED_GIVE_UP {
+                        tracing::info!(
+                            origin = %base, error = %msg,
+                            "clip exporter: this origin does not serve clips; not asking again"
+                        );
+                        return;
+                    }
+                    continue;
+                }
+                if !quiet {
                     tracing::warn!(
                         origin = %base, error = %msg,
                         "clip exporter: cannot read the clip list; nothing will be cut \
@@ -592,6 +667,7 @@ pub async fn run(
                 continue;
             }
         };
+        unsupported = 0;
         let records: Vec<ClipRecord> = match serde_json::from_slice(&listing) {
             Ok(r) => r,
             Err(e) => {

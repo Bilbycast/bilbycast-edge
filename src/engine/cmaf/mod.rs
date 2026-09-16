@@ -773,6 +773,12 @@ struct CmafState {
     /// process, and the flow clock is process-global so it cannot know. Set
     /// when a window was restored, and consumed by the first row published.
     restore_discontinuity: bool,
+    /// The init the restored rows were published under, until it has been
+    /// compared against this run's. See the check in `publish_init_if_due`.
+    restored_init_fingerprint: Option<String>,
+    /// This run's init identity, published on every manifest so the next run
+    /// can make that comparison.
+    init_fingerprint: Option<String>,
     /// Sequence number the next segment should take.
     ///
     /// Non-zero when a previous run's window was restored: numbering has to
@@ -851,25 +857,171 @@ async fn restore_published_window(
     base: &str,
     auth: Option<&str>,
     limit: usize,
-) -> Option<(VecDeque<M3u8Entry>, u64)> {
-    let body = clips::fetch_manifest(base, auth).await.ok()?;
+    cancel: &tokio_util::sync::CancellationToken,
+) -> Option<RestoredWindow> {
+    // Its own budget, and racing the cancel token.
+    //
+    // This is awaited between subscribing the broadcast receiver and entering
+    // the packet loop, so every second it spends is a second the output is not
+    // draining its channel — at the default capacity, about seventeen seconds
+    // of headroom at 10 Mbps before the output opens on a `Lagged` and the
+    // window gains a hole at exactly the join the restore exists to make
+    // seamless. The clip client's 60 s request timeout is sized for pulling
+    // whole segments, not for a startup preflight, and an origin that accepts
+    // the connection and then stalls holds the whole of it.
+    //
+    // A window is a nicety; the media path is not. Three seconds is ample for
+    // a manifest, and a stop arriving during it is honoured rather than waited
+    // out.
+    const RESTORE_BUDGET: std::time::Duration = std::time::Duration::from_secs(3);
+    let body = tokio::select! {
+        _ = cancel.cancelled() => return None,
+        r = tokio::time::timeout(RESTORE_BUDGET, clips::fetch_manifest(base, auth)) => match r {
+            Ok(Ok(b)) => b,
+            // Distinguished, because they are different problems. A fresh
+            // stream 404s and that is the ordinary case; anything else means
+            // the window this output was publishing is about to be replaced by
+            // an empty one, and the run will renumber from seg-00000 over
+            // segments the origin still holds and still serves.
+            Ok(Err(e)) => {
+                let msg = format!("{e:#}");
+                if !msg.contains("404") {
+                    tracing::warn!(
+                        origin = %base, error = %msg,
+                        "CMAF output: could not read back the window this stream was \
+                         publishing; starting from an empty one, and segment numbering \
+                         restarts at zero"
+                    );
+                }
+                return None;
+            }
+            Err(_) => {
+                tracing::warn!(
+                    origin = %base, budget_secs = RESTORE_BUDGET.as_secs(),
+                    "CMAF output: the origin did not answer in time; starting from an \
+                     empty window rather than holding the media path"
+                );
+                return None;
+            }
+        },
+    };
     let text = String::from_utf8_lossy(&body);
     parse_published_window(&text, limit)
 }
 
-/// The rows of a served media playlist, and the sequence to carry on from.
-fn parse_published_window(text: &str, limit: usize) -> Option<(VecDeque<M3u8Entry>, u64)> {
+/// What a served media playlist says about the window it is advertising.
+struct RestoredWindow {
+    rows: VecDeque<M3u8Entry>,
+    /// The sequence number this run must carry on from.
+    next_seq: u64,
+    /// `#EXT-X-DISCONTINUITY-SEQUENCE` as served — how many discontinuities
+    /// have already aged out of the window.
+    discontinuity_sequence: u64,
+    /// Which init these rows were published under, if the previous run said.
+    /// `None` for a manifest written before this tag existed, which is treated
+    /// the same as a match — there is nothing to compare, and refusing every
+    /// such restore would cost the window for no evidence.
+    init_fingerprint: Option<String>,
+}
+
+/// A short, stable name for exactly these init bytes.
+///
+/// Sixteen hex characters of SHA-256 — this is an equality check between two
+/// runs of the same process family, not a defence against anyone choosing
+/// bytes, and the tag it rides in has to stay small enough to be free on every
+/// manifest publish.
+fn init_fingerprint(init_bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(init_bytes);
+    digest.iter().take(8).map(|b| format!("{b:02x}")).collect()
+}
+
+/// The tag the init fingerprint rides in.
+///
+/// A private `#EXT-` tag rather than a renamed `init.mp4` object: RFC 8216
+/// §4.1 requires a client to ignore a tag it does not recognise, so it costs
+/// players nothing, and the relay origin copies through every line it does not
+/// itself rewrite. Renaming the object would have worked too, and would have
+/// meant a second live init on the origin and a change to how the DASH
+/// `initialization` template is written — much more surface for the same
+/// answer.
+const INIT_FINGERPRINT_TAG: &str = "#EXT-X-BILBYCAST-INIT:";
+
+/// Write this run's init identity into a playlist, right after `#EXTM3U`.
+///
+/// Done here rather than inside `build_hls_playlist` so the tag costs the
+/// playlist builder and its twenty-odd call sites nothing: it is a private
+/// marker this edge writes for its own next run to read, not part of the HLS
+/// the builder is responsible for getting right.
+fn stamp_init_fingerprint(body: String, fingerprint: Option<&str>) -> String {
+    let Some(fp) = fingerprint else {
+        return body;
+    };
+    match body.find('\n') {
+        Some(nl) => {
+            let mut out = String::with_capacity(body.len() + fp.len() + 32);
+            out.push_str(&body[..=nl]);
+            out.push_str(INIT_FINGERPRINT_TAG);
+            out.push_str(fp);
+            out.push('\n');
+            out.push_str(&body[nl + 1..]);
+            out
+        }
+        None => body,
+    }
+}
+
+/// The longest `#EXTINF` this parser will accept, in seconds.
+///
+/// Validation bounds a configured segment duration to 1..=10 s, so anything
+/// past this is not a segment of ours. Rows are copied back out verbatim, so an
+/// unbounded or non-finite value would be republished as-is — `NaN` parses
+/// happily and prints back as `#EXTINF:NaN,`, which every player rejects, for
+/// the whole window until it slides out.
+const MAX_RESTORED_EXTINF_SECS: f64 = 60.0;
+
+/// The rows of a served media playlist, and what to carry on from.
+fn parse_published_window(text: &str, limit: usize) -> Option<RestoredWindow> {
     let mut rows: Vec<M3u8Entry> = Vec::new();
     let mut pdt: Option<chrono::DateTime<chrono::Utc>> = None;
     let mut dur: Option<f64> = None;
+    let mut pending_discontinuity = false;
+    let mut discontinuity_sequence = 0u64;
+    let mut init_fingerprint: Option<String> = None;
     for line in text.lines() {
         let line = line.trim();
+        if let Some(rest) = line.strip_prefix(INIT_FINGERPRINT_TAG) {
+            let fp = rest.trim();
+            if !fp.is_empty() {
+                init_fingerprint = Some(fp.to_string());
+            }
+            continue;
+        }
         if let Some(rest) = line.strip_prefix("#EXT-X-PROGRAM-DATE-TIME:") {
             pdt = chrono::DateTime::parse_from_rfc3339(rest.trim())
                 .ok()
                 .map(|d| d.with_timezone(&chrono::Utc));
         } else if let Some(rest) = line.strip_prefix("#EXTINF:") {
-            dur = rest.trim_end_matches(',').trim().parse::<f64>().ok();
+            dur = rest
+                .trim_end_matches(',')
+                .trim()
+                .parse::<f64>()
+                .ok()
+                .filter(|d| d.is_finite() && *d > 0.0 && *d <= MAX_RESTORED_EXTINF_SECS);
+        } else if let Some(rest) = line.strip_prefix("#EXT-X-DISCONTINUITY-SEQUENCE:") {
+            // Restored, not reset. `CmafState::new` starts it at 0, so a
+            // restart used to republish a playlist whose discontinuity count
+            // went backwards while its media sequence carried on normally —
+            // which RFC 8216 §6.3.3 makes an incompatible playlist change, and
+            // players answer by resynchronising or resetting the media element.
+            discontinuity_sequence = rest.trim().parse::<u64>().unwrap_or(0);
+        } else if line == "#EXT-X-DISCONTINUITY" {
+            // Carried onto the row it precedes. Dropping it asserted one
+            // continuous timeline across a real media-timeline re-anchor whose
+            // post-jump dates *were* restored: a viewer scrubbing back over the
+            // join decodes across it with no reset, and one who reloads sees a
+            // tag vanish from rows it had already parsed.
+            pending_discontinuity = true;
         } else if !line.is_empty() && !line.starts_with('#') {
             // The origin rewrites URIs to carry a viewer token; the name is
             // the part that matters, and the sequence number is in it.
@@ -887,8 +1039,9 @@ fn parse_published_window(text: &str, limit: usize) -> Option<(VecDeque<M3u8Entr
                     uri: Some(uri),
                     parts: Vec::new(),
                     program_date_time: pdt,
-                    discontinuity: false,
+                    discontinuity: pending_discontinuity,
                 });
+                pending_discontinuity = false;
             }
             pdt = None;
             dur = None;
@@ -903,8 +1056,17 @@ fn parse_published_window(text: &str, limit: usize) -> Option<(VecDeque<M3u8Entr
     if rows.len() > limit {
         rows.drain(..rows.len() - limit);
     }
-    let next_seq = rows.iter().map(|r| r.sequence_number).max().unwrap_or(0) + 1;
-    Some((rows.into_iter().collect(), next_seq))
+    // `checked_add`, because the release profile sets no overflow checks: a row
+    // named `seg-18446744073709551615.m4s` would otherwise wrap `next_seq` to 0
+    // and the run would renumber from `seg-00000` over the very segments it had
+    // just restored — the destructive behaviour this restore exists to remove.
+    let next_seq = rows.iter().map(|r| r.sequence_number).max().unwrap_or(0).checked_add(1)?;
+    Some(RestoredWindow {
+        rows: rows.into_iter().collect(),
+        next_seq,
+        discontinuity_sequence,
+        init_fingerprint,
+    })
 }
 
 /// LL-CMAF state held across the duration of one segment upload.
@@ -944,6 +1106,8 @@ impl CmafState {
             init_last_upload: None,
             playlist: VecDeque::new(),
             restore_discontinuity: false,
+            restored_init_fingerprint: None,
+            init_fingerprint: None,
             resume_seq: 0,
             target_duration_published: 0,
             discontinuities_trimmed: 0,
@@ -1092,19 +1256,24 @@ async fn run(
     // Nothing to resume means a fresh stream, or an origin that cannot be
     // reached. Neither is a reason to refuse to start: the cost is a shorter
     // window, and the cost of failing here would be no output at all.
-    if let Some((rows, next_seq)) = restore_published_window(
+    if let Some(restored) = restore_published_window(
         &base_url,
         config.auth_token.as_deref(),
         config.playlist_window_segments(),
+        &cancel,
     )
     .await
     {
         tracing::info!(
-            output = %config.id, segments = rows.len(), next_seq,
+            output = %config.id, segments = restored.rows.len(),
+            next_seq = restored.next_seq,
+            discontinuity_sequence = restored.discontinuity_sequence,
             "CMAF output: resumed the window the origin already holds"
         );
-        state.playlist = rows;
-        state.resume_seq = next_seq;
+        state.playlist = restored.rows;
+        state.resume_seq = restored.next_seq;
+        state.discontinuities_trimmed = restored.discontinuity_sequence;
+        state.restored_init_fingerprint = restored.init_fingerprint;
         state.restore_discontinuity = true;
     }
 
@@ -2310,6 +2479,55 @@ async fn publish_init_if_due(
         (bytes, v.track.width, v.track.height, v.track.codec)
     };
 
+    // Does the restored window still describe media this init can decode?
+    //
+    // `init.mp4` is one fixed object and this PUT overwrites it with *this*
+    // run's track list, sample entries and parameter sets — while the restored
+    // rows were published under the previous run's. Nothing compared them, so
+    // any track or parameter change across a restart left the whole restored
+    // history described by an init that does not match it: a muxed fragment
+    // under a video-only init, or the reverse, which is the failure MSE answers
+    // by initialising the declared track and then waiting for ever with nothing
+    // wrong on the wire (#130). An `h264`→`h265` edit makes `appendBuffer`
+    // throw outright, and a resolution change puts a new SPS in the `avcC`.
+    //
+    // The triggers are ordinary operator edits that both restart the output and
+    // change the tracks — toggling `low_latency`, adding or removing
+    // `audio_encode`, changing the video codec or resolution, enabling
+    // encryption — plus the audio-detection race, which can latch differently
+    // on two runs of the same config.
+    //
+    // So the init's identity is published with the manifest and read back with
+    // it. On a mismatch the restored rows are dropped: the window is a nicety,
+    // and a shorter one beats an hour of history that stalls the player. The
+    // sequence number is kept, because renumbering would overwrite segments the
+    // origin still holds.
+    let fingerprint = init_fingerprint(&init_bytes);
+    if let Some(prev) = state.restored_init_fingerprint.take()
+        && prev != fingerprint
+        && !state.playlist.is_empty()
+    {
+        let dropped = state.playlist.len();
+        state.playlist.clear();
+        tracing::warn!(
+            output = %config.id, dropped, was = %prev, now = %fingerprint,
+            "CMAF output: this run's init does not describe the window the origin \
+             was serving; dropping the restored history rather than advertising \
+             segments it cannot decode"
+        );
+        event_sender.emit_flow(
+            EventSeverity::Warning,
+            category::CMAF,
+            format!(
+                "CMAF output '{}': the tracks changed across the restart, so {dropped} \
+                 restored segment(s) were dropped — the DVR window refills in real time",
+                config.id
+            ),
+            flow_id,
+        );
+    }
+    state.init_fingerprint = Some(fingerprint);
+
     match http_put(init_url, init_bytes, "video/mp4", config.auth_token.as_deref()).await {
         Ok(_) => {
             state.init_uploaded = true;
@@ -2474,7 +2692,7 @@ async fn handle_ll_cmaf(
             // `CmafState::closed_segment_end_dts_90k`, which is a named
             // function precisely so this derivation is reachable from a test.
             let next_base_dts_90k = state.closed_segment_end_dts_90k();
-            state.playlist.push_back(closed_ll_entry(
+            let mut row = closed_ll_entry(
                 flow_id,
                 seq,
                 uri,
@@ -2482,7 +2700,21 @@ async fn handle_ll_cmaf(
                 next_base_dts_90k,
                 config.segment_duration_secs,
                 closed_at,
-            ));
+            );
+            // The restore's own discontinuity, consumed here too.
+            //
+            // The plain path takes the flag when it builds its row; this path
+            // returns above that point, so on a `low_latency` output the flag
+            // was set at start and never consumed. After a *process* restart
+            // the flow clock is fresh, so `segment_date_marking` has nothing to
+            // compare against and answers `false` — and the restored rows are
+            // parsed from a manifest whose tags this parser used to discard.
+            // The republished playlist then joined the previous run's rows to a
+            // timeline whose `base_dts` restarted at zero with no
+            // `EXT-X-DISCONTINUITY` anywhere, which is the opposite of what
+            // docs/cmaf.md promises.
+            row.discontinuity |= std::mem::take(&mut state.restore_discontinuity);
+            state.playlist.push_back(row);
             state.trim_playlist(config.playlist_window_segments());
         }
         // Open new segment.
@@ -2818,12 +3050,15 @@ async fn publish_ll_hls(
     // says. See `CmafState::target_duration_published`.
     let target_duration =
         state.advertised_target_duration(config.segment_duration_secs, &entries);
-    let body = build_hls_playlist(
-        target_duration,
-        &entries,
-        init_name,
-        state.discontinuities_trimmed,
-        Some(&hints),
+    let body = stamp_init_fingerprint(
+        build_hls_playlist(
+            target_duration,
+            &entries,
+            init_name,
+            state.discontinuities_trimmed,
+            Some(&hints),
+        ),
+        state.init_fingerprint.as_deref(),
     );
     if let Err(e) = http_put(
         m3u8_url,
@@ -2863,12 +3098,15 @@ async fn publish_manifests(
         let entries: Vec<M3u8Entry> = state.playlist.iter().cloned().collect();
         let target_duration =
             state.advertised_target_duration(config.segment_duration_secs, &entries);
-        let body = build_hls_playlist(
-            target_duration,
-            &entries,
-            init_name,
-            state.discontinuities_trimmed,
-            None,
+        let body = stamp_init_fingerprint(
+            build_hls_playlist(
+                target_duration,
+                &entries,
+                init_name,
+                state.discontinuities_trimmed,
+                None,
+            ),
+            state.init_fingerprint.as_deref(),
         );
         if let Err(e) = http_put(
             m3u8_url,
@@ -2975,7 +3213,8 @@ seg-00042.m4s?token=abc
 ",
         );
 
-        let (rows, next) = parse_published_window(m3u8, 100).expect("a window");
+        let restored = parse_published_window(m3u8, 100).expect("a window");
+        let (rows, next) = (restored.rows, restored.next_seq);
         assert_eq!(rows.len(), 3);
         // Numbering continues past what the origin holds. Restarting at zero
         // is what let a new run overwrite the segments it had just restored.
@@ -2987,7 +3226,7 @@ seg-00042.m4s?token=abc
         assert_eq!(rows[0].uri.as_deref(), Some("seg-00040.m4s"));
 
         // Never restore more than the output will advertise.
-        let (trimmed, _) = parse_published_window(m3u8, 2).expect("a window");
+        let trimmed = parse_published_window(m3u8, 2).expect("a window").rows;
         assert_eq!(trimmed.len(), 2);
         assert_eq!(trimmed[0].sequence_number, 41, "the wrong end was trimmed");
 
@@ -2996,6 +3235,111 @@ seg-00042.m4s?token=abc
 #EXT-X-VERSION:9
 ", 100).is_none());
         assert!(parse_published_window("", 100).is_none());
+    }
+
+    /// A discontinuity inside the restored window survives the restart.
+    ///
+    /// The tag really is on the wire — the relay origin passes through every
+    /// line it does not itself rewrite — so discarding it was a loss in this
+    /// parser. The republished playlist then asserted one continuous timeline
+    /// across a real media-timeline re-anchor whose post-jump dates *were*
+    /// restored: a viewer scrubbing back over the join decodes across it with
+    /// no reset, and one who reloads sees a tag vanish from rows already
+    /// parsed.
+    #[test]
+    fn a_discontinuity_inside_the_window_is_read_back_with_it() {
+        let m3u8 = concat!(
+            "#EXTM3U\n#EXT-X-VERSION:9\n#EXT-X-TARGETDURATION:2\n",
+            "#EXT-X-MEDIA-SEQUENCE:40\n#EXT-X-DISCONTINUITY-SEQUENCE:3\n",
+            "#EXT-X-MAP:URI=\"init.mp4\"\n",
+            "#EXT-X-PROGRAM-DATE-TIME:2026-09-08T10:00:00.000Z\n#EXTINF:2.000,\nseg-00040.m4s\n",
+            "#EXT-X-DISCONTINUITY\n",
+            "#EXT-X-PROGRAM-DATE-TIME:2026-09-08T11:00:00.000Z\n#EXTINF:2.000,\nseg-00041.m4s\n",
+            "#EXT-X-PROGRAM-DATE-TIME:2026-09-08T11:00:02.000Z\n#EXTINF:2.000,\nseg-00042.m4s\n",
+        );
+        let restored = parse_published_window(m3u8, 100).expect("a window");
+        assert!(!restored.rows[0].discontinuity, "the tag moved to the wrong row");
+        assert!(restored.rows[1].discontinuity, "the join was lost in the read-back");
+        assert!(!restored.rows[2].discontinuity, "the tag was not cleared after its row");
+
+        // And the count of the ones that have already aged out.
+        //
+        // `CmafState::new` starts this at 0, so without restoring it a restart
+        // republished a playlist whose discontinuity sequence went 3 → 0 while
+        // its media sequence carried on normally. RFC 8216 §6.3.3 makes that an
+        // incompatible playlist change, and a player answers by resynchronising
+        // or resetting the media element.
+        assert_eq!(restored.discontinuity_sequence, 3);
+    }
+
+    /// The init identity survives a round trip through a served playlist.
+    ///
+    /// This is what lets the next run tell "the same tracks as before" from
+    /// "an init that no longer describes the restored rows". `init.mp4` is one
+    /// fixed object the new run overwrites, so without it any track change
+    /// across a restart left an hour of restored history described by an init
+    /// that cannot decode it — and MSE answers that by initialising the
+    /// declared track and waiting for ever, with nothing wrong on the wire.
+    #[test]
+    fn the_init_identity_survives_a_round_trip_through_the_manifest() {
+        let plain = concat!(
+            "#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-TARGETDURATION:2\n",
+            "#EXT-X-MEDIA-SEQUENCE:40\n#EXT-X-MAP:URI=\"init.mp4\"\n",
+            "#EXT-X-PROGRAM-DATE-TIME:2026-09-08T10:00:00.000Z\n#EXTINF:2.000,\nseg-00040.m4s\n",
+        );
+        let fp = init_fingerprint(b"an init segment's bytes");
+        let stamped = stamp_init_fingerprint(plain.to_string(), Some(&fp));
+        assert!(
+            stamped.starts_with("#EXTM3U\n#EXT-X-BILBYCAST-INIT:"),
+            "the tag has to be inside the playlist, after the marker: {stamped}"
+        );
+
+        let restored = parse_published_window(&stamped, 100).expect("a window");
+        assert_eq!(restored.init_fingerprint.as_deref(), Some(fp.as_str()));
+        assert_eq!(restored.rows.len(), 1, "the tag consumed a media row");
+
+        // Different init bytes, different name.
+        assert_ne!(fp, init_fingerprint(b"a different init segment's bytes"));
+
+        // A manifest written before the tag existed says nothing, which is not
+        // the same as saying "different" — refusing every such restore would
+        // cost the window on no evidence.
+        assert!(parse_published_window(plain, 100).expect("a window").init_fingerprint.is_none());
+
+        // And a playlist is unchanged when there is nothing to stamp.
+        assert_eq!(stamp_init_fingerprint(plain.to_string(), None), plain);
+    }
+
+    /// A row the edge could not have written is not copied back out.
+    ///
+    /// Restored rows are republished verbatim, so `#EXTINF:NaN,` — which
+    /// `parse::<f64>()` accepts — would be served back to every viewer for the
+    /// whole window, and a `u64::MAX` sequence would wrap `next_seq` to 0 in a
+    /// release build and renumber from `seg-00000` over the segments just
+    /// restored. Neither is producible by this edge's own writer, so seeing one
+    /// means the manifest is not ours to trust.
+    #[test]
+    fn a_manifest_the_edge_did_not_write_is_not_trusted_blindly() {
+        let poisoned = concat!(
+            "#EXTM3U\n",
+            "#EXT-X-PROGRAM-DATE-TIME:2026-09-08T10:00:00.000Z\n#EXTINF:NaN,\nseg-00040.m4s\n",
+            "#EXT-X-PROGRAM-DATE-TIME:2026-09-08T10:00:02.000Z\n#EXTINF:inf,\nseg-00041.m4s\n",
+            "#EXT-X-PROGRAM-DATE-TIME:2026-09-08T10:00:04.000Z\n#EXTINF:600.0,\nseg-00042.m4s\n",
+            "#EXT-X-PROGRAM-DATE-TIME:2026-09-08T10:00:06.000Z\n#EXTINF:2.000,\nseg-00043.m4s\n",
+        );
+        let restored = parse_published_window(poisoned, 100).expect("one good row");
+        assert_eq!(restored.rows.len(), 1, "an unusable duration became a row anyway");
+        assert_eq!(restored.rows[0].sequence_number, 43);
+
+        // `u64::MAX + 1` has no answer, so there is no window to restore.
+        let overflowing = concat!(
+            "#EXTM3U\n#EXT-X-PROGRAM-DATE-TIME:2026-09-08T10:00:00.000Z\n#EXTINF:2.000,\n",
+            "seg-18446744073709551615.m4s\n",
+        );
+        assert!(
+            parse_published_window(overflowing, 100).is_none(),
+            "the sequence wrapped and the run would renumber from zero"
+        );
     }
 
     fn ts(s: &str) -> chrono::DateTime<chrono::Utc> {

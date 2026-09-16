@@ -21,7 +21,7 @@ use tokio::task::JoinHandle;
 use tokio_stream::wrappers::ReceiverStream;
 
 /// Process-wide HTTP client shared across all CMAF outputs.
-fn client() -> &'static reqwest::Client {
+pub(super) fn client() -> &'static reqwest::Client {
     static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
     CLIENT.get_or_init(|| {
         reqwest::Client::builder()
