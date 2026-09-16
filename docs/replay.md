@@ -151,8 +151,31 @@ wall = anchor_wall_us   + (pts - anchor_pts_90khz)   * 1_000_000 / 90_000
 ```
 
 It is taken once, on the first index entry appended, and preserved across
-restarts. Both fields are absent on recordings made before it existed; readers
-fall back to `created_at_unix` and inherit its coarseness.
+restarts. Both fields are absent on recordings made before it existed; the clip
+exporter refuses the exact cut on those and falls back to whole segments, which
+is the honest answer — there is no mapping to cut through.
+
+**And a second point, `recent_wall_us` / `recent_pts_90khz`,** re-taken every
+60 s while the writer runs and carried across a restart with the anchor. One
+point only gives a line if the rate is assumed, and the assumed 90 000 ticks per
+wall-clock second is not what the counter does: `pts_90khz` advances on the
+*source's* PCR, while a mark is placed from a wall-clock-true date. The CMAF half
+of this same feature measured its own source at ~450 ppm slow and added a
+slewing epoch because of it, recording that an epoch pinned once and held drifts
+4.1 s across a 2h30m session — and the recorder's anchor is exactly such a
+pinned epoch. Left at the nominal rate the cut drifts by (offset × the age of the
+**recording**, not of the clip): 1.6 s after an hour at that figure, past the 2 s
+segment-boundary fallback the exact cut exists to beat inside ninety minutes,
+and unbounded on a 24/7 DVR flow — silently, because `find_floor` clamps rather
+than erroring and hands back a playable clip of the wrong moment.
+
+The exporter therefore takes its rate from `(recent - anchor)` when that span is
+at least ten minutes and the result is within ±5 % of nominal, and from the
+nominal 90 kHz otherwise. A shorter span is dominated by the arrival jitter of
+the two sampled frames; a result outside the band is not a clock offset but a
+corrupt or mis-paired sample, and extrapolating on it would be worse than
+assuming nominal. The anchor end of the pair never moves, so the measurement
+gets better as the recording ages rather than worse.
 
 **Why not `created_at_unix`.** It is whole seconds, and it marks when the writer
 opened rather than when the first frame landed. Measured against the CMAF
@@ -180,6 +203,30 @@ exactly the downtime.
 Starting the counter again at zero writes a second, overlapping timeline into
 one file. Every wall-clock lookup after the restart then lands in a hole, and
 any that resolves can match a frame from before it.
+
+**Monotonicity does not depend on the anchor.** Dating the join does; keeping
+the index sorted does not. A recording with no anchor — one written before the
+pair existed, or one whose `recording.json` could not be read — resumes at the
+last indexed tick plus one. Refusing to resume those was the sharper form of the
+same bug, because they are precisely the recordings that have already restarted
+at least once.
+
+**The gap is measured when the media comes back, not when the writer opens.**
+Sampling the clock at writer start dates every later entry early by the
+spawn→first-frame interval — an SRT caller's reconnect, routinely a few hundred
+milliseconds and unbounded when the source is down — and since the anchor is
+never re-taken, that offset rides every clip cut from the rest of the recording.
+It is the same error the anchor itself is taken on the first indexed frame to
+avoid.
+
+**Three kinds of gap, one rule.** A writer restart, an operator's Stop/Start
+pair, and a PCR step too large to believe as elapsed time are all gaps in which
+wall-clock time passed and no media was written. All three now catch the counter
+up through the anchor at the first frame back. A Stop/Start used to freeze the
+counter outright and resume from the frozen value, so a ten-minute stop shifted
+the rest of the recording ten minutes against the anchor — and
+`spans_discontinuity` could not catch it, because the flagged entry sits *before*
+the shifted window rather than inside it.
 
 **The media is still discontinuous.** The index's own timeline is continuous
 across the join, but the PCR in the TS begins again with the process, so the two

@@ -137,22 +137,112 @@ struct RecordingMeta {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     anchor_wall_us: Option<i64>,
     /// The PTS `anchor_wall_us` describes. Stored explicitly rather than
-    /// assumed to be the first entry, because the index prunes from the front:
+    /// derived from the first index entry, so the pair is self-describing and
+    /// a reader needs only `recording.json` to date the timeline:
     /// `wall(pts) = anchor_wall_us + (pts - anchor_pts_90khz) / 90_000`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     anchor_pts_90khz: Option<u64>,
+    /// A second, much later `(wall, pts)` sample, refreshed while the writer
+    /// runs. With the anchor it gives two points on the line rather than one.
+    ///
+    /// One point forces an assumption the media does not honour: that the
+    /// counter advances at exactly 90 000 ticks per wall-clock second. It does
+    /// not — `accumulated_pts` advances on the *source's* PCR, and a source
+    /// free-running against this host's clock is the normal case. The CMAF
+    /// half of this same feature measured its own source at ~450 ppm slow and
+    /// added a slewing epoch for exactly this reason, recording that an epoch
+    /// pinned once and held drifts 4.1 s across a 2h30m session.
+    ///
+    /// A mark comes from wall-clock-true dates, so a single-point mapping puts
+    /// the cut out by (offset × the age of the *recording*, not of the clip):
+    /// 1.6 s after an hour at that rate, and unbounded on a 24/7 DVR flow —
+    /// silently, because the exporter clamps rather than erroring and hands
+    /// back a playable clip of the wrong moment. Two points give the measured
+    /// rate instead of an assumed one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    recent_wall_us: Option<i64>,
+    /// The PTS `recent_wall_us` describes. See [`Self::recent_wall_us`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    recent_pts_90khz: Option<u64>,
 }
+
+/// How often the second `(wall, pts)` sample is re-taken.
+///
+/// Long enough that the rate it implies is not dominated by the arrival jitter
+/// of one frame — at 60 s, a 5 ms sampling error is 83 ppm, the same order as
+/// the offset being measured, and it averages out over the growing span
+/// because the *anchor* end of the pair never moves. Short enough that the
+/// mapping never extrapolates far past the last measurement.
+const REANCHOR_INTERVAL_US: i64 = 60_000_000;
+
+/// Wall clock as microseconds since the Unix epoch, saturating at 0.
+fn now_unix_us() -> i64 {
+    i64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_micros())
+            .unwrap_or(0),
+    )
+    .unwrap_or(0)
+}
+
+/// A gap in the recording whose length is not known until the media comes back.
+///
+/// Three things produce one and they are the same problem: a writer restart, an
+/// operator's Stop/Start pair, and a PCR step large enough that the delta is not
+/// believable as elapsed time. In all three the counter must not simply carry on
+/// from where it stopped, because wall-clock time passed and the anchor maps
+/// wall clock to ticks linearly — a mark placed after the gap would resolve to
+/// media from before it.
+///
+/// Held until a PCR actually arrives, because that is the first instant at
+/// which the gap's true length is known.
+#[derive(Debug, Clone, Copy)]
+struct PendingResume {
+    /// The tick the counter must stay strictly above.
+    last_indexed: u64,
+    anchor_wall_us: Option<i64>,
+    anchor_pts_90khz: Option<u64>,
+}
+
+/// The largest outage `resume_pts` will believe, in microseconds — 90 days.
+///
+/// Past this the anchor is not evidence, it is arithmetic about a clock that
+/// was wrong: a host with no RTC boots at the Unix epoch, takes an anchor, and
+/// is stepped to the real date by NTP a few seconds later. The gap that
+/// implies is decades, and honouring it would place every later frame on a
+/// timeline nothing can look up.
+const MAX_RESUME_GAP_US: i128 = 90 * 24 * 60 * 60 * 1_000_000;
 
 /// Where the pseudo-PTS counter must pick up when a recording is resumed.
 ///
-/// `None` for a fresh recording, or one with no anchor to date the index by —
-/// both start at zero, which is correct because nothing precedes them.
+/// `None` only for a fresh recording — an empty index — because nothing
+/// precedes one.
 ///
-/// Otherwise: the last indexed tick, plus the wall-clock time the writer was
-/// down. The gap has to be added. Nothing was recorded during it, but the
-/// anchor maps wall-clock to ticks linearly, so a counter that resumed without
-/// it would place everything after the restart earlier by exactly the outage,
-/// and a clip asked for by wall-clock would come back showing the wrong moment.
+/// **Monotonicity is unconditional and needs no anchor.** A restart appends to
+/// the same `index.bin`, so a counter that restarted at zero wrote a second,
+/// overlapping timeline into one file: `find_floor` binary-searches unsorted
+/// data after that, and every wall-clock lookup either lands in a hole or
+/// matches a frame from the previous run. That used to happen to every
+/// recording made before the anchor existed, and to any whose `recording.json`
+/// could not be read — the two cases where the resume is *most* needed, and the
+/// two it refused. It no longer depends on the anchor: with no way to date the
+/// join, the counter still advances by one tick, which is enough to keep the
+/// index sorted and enough for the reader to see a discontinuity.
+///
+/// **The wall-clock gap is added when, and only when, there is an anchor to
+/// measure it with.** Nothing was recorded during the outage, but the anchor
+/// maps wall clock to ticks linearly, so a counter that resumed without the gap
+/// would place everything after the restart earlier by exactly the downtime,
+/// and a clip asked for by wall clock would come back showing the wrong moment.
+///
+/// Computed in i128 throughout. In u64 the multiply wrapped once the gap passed
+/// about 6.5 years — reachable on an RTC-less board that boots at the epoch,
+/// indexes a frame, and is then stepped to the real date — and a release build
+/// has no overflow checks, so it produced arithmetic garbage rather than an
+/// error, on a timeline that is then poisoned for the life of the recording.
+/// An implausible gap is clamped away rather than believed; see
+/// [`MAX_RESUME_GAP_US`].
 fn resume_pts(
     last_indexed: Option<u64>,
     anchor_wall_us: Option<i64>,
@@ -160,10 +250,17 @@ fn resume_pts(
     now_us: i64,
 ) -> Option<u64> {
     let last = last_indexed?;
-    let (aw, ap) = (anchor_wall_us?, anchor_pts?);
-    let last_wall_us = aw + i64::try_from(last.saturating_sub(ap)).ok()? * 1_000_000 / 90_000;
-    let gap_us = (now_us - last_wall_us).max(0);
-    Some(last + u64::try_from(gap_us).ok()? * 90_000 / 1_000_000)
+    // No anchor: monotonic, undated. One tick is the whole claim.
+    let (Some(aw), Some(ap)) = (anchor_wall_us, anchor_pts) else {
+        return Some(last.saturating_add(1));
+    };
+    let last_wall_us =
+        (aw as i128) + (last.saturating_sub(ap) as i128) * 1_000_000 / 90_000;
+    let gap_us = ((now_us as i128) - last_wall_us).clamp(0, MAX_RESUME_GAP_US);
+    let resumed = (last as i128) + gap_us * 90_000 / 1_000_000;
+    // Never below the floor: an anchor that implies a backwards gap must not be
+    // allowed to un-sort the index.
+    Some(u64::try_from(resumed).unwrap_or(last).max(last.saturating_add(1)))
 }
 
 /// Public handle returned by [`spawn_writer`]. Owns the JoinHandle for
@@ -292,6 +389,12 @@ pub async fn spawn_writer(
         // every clip cut from what came before.
         anchor_wall_us: existing_meta.as_ref().and_then(|m| m.anchor_wall_us),
         anchor_pts_90khz: existing_meta.as_ref().and_then(|m| m.anchor_pts_90khz),
+        // Carried too. The rate it implies was measured over the media on
+        // disk, which is the media a mark from before the restart resolves
+        // against; dropping it would send every such lookup back to the
+        // assumed 90 000 ticks/s the pair exists to replace.
+        recent_wall_us: existing_meta.as_ref().and_then(|m| m.recent_wall_us),
+        recent_pts_90khz: existing_meta.as_ref().and_then(|m| m.recent_pts_90khz),
     };
     write_meta_atomic(&meta_path, &meta).await?;
 
@@ -385,20 +488,28 @@ pub async fn spawn_writer(
     // recorded — but the anchor maps wall-clock to ticks linearly, and a
     // resumed counter that ignored the outage would shift everything after it
     // earlier by exactly the downtime.
-    let now_us = i64::try_from(
-        SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_micros()).unwrap_or(0),
-    )
-    .unwrap_or(0);
-    let resumed_pts = resume_pts(
-        index_mirror.span().map(|(_, last)| last),
-        meta.anchor_wall_us,
-        meta.anchor_pts_90khz,
-        now_us,
-    );
-    if let Some(p) = resumed_pts {
+    // The gap is measured at the first frame back, not here.
+    //
+    // Sampling `now()` at writer start dates every later index entry early by
+    // the spawn→first-frame interval — an SRT caller's reconnect, routinely a
+    // few hundred milliseconds and unbounded when the source is down — and the
+    // anchor is deliberately never re-taken, so that offset rides every clip
+    // cut from the rest of the recording. It is the same error the anchor
+    // itself is taken on the first indexed frame to avoid.
+    //
+    // So the floor is applied now, which keeps the index sorted from the first
+    // byte, and the wall-clock gap is resolved when a frame actually arrives.
+    let last_indexed = index_mirror.span().map(|(_, last)| last);
+    let resumed_pts = last_indexed.map(|last| last.saturating_add(1));
+    let pending_resume = last_indexed.map(|last| PendingResume {
+        last_indexed: last,
+        anchor_wall_us: meta.anchor_wall_us,
+        anchor_pts_90khz: meta.anchor_pts_90khz,
+    });
+    if let Some(last) = last_indexed {
         tracing::info!(
-            recording_id = %recording_id, resumed_pts = p,
-            last_indexed = index_mirror.span().map(|(_, last)| last).unwrap_or(0),
+            recording_id = %recording_id, last_indexed = last,
+            dated = meta.anchor_wall_us.is_some(),
             "replay: resuming the recording's PTS timeline across a restart"
         );
     }
@@ -418,10 +529,18 @@ pub async fn spawn_writer(
         disk_pressure_emitted: false,
         accumulated_pts: resumed_pts.unwrap_or(0),
         last_pcr: None,
+        pending_resume,
         // A resume IS a discontinuity in the media, even though the index's
         // own timeline is now continuous across it. The PCR in the TS restarts
         // with the process, so the first frame back gets flagged and a reader
         // can see that the two sides cannot be presented as one timeline.
+        //
+        // Keyed on there being an index to resume INTO, not on the resume being
+        // datable. Keying it on the anchor left the join unflagged in exactly
+        // the cases where the counter could not be dated either — a pre-anchor
+        // recording, or an unreadable `recording.json` — so `spans_discontinuity`
+        // reported clean across a real join and the clip exporter's refusal,
+        // which exists for that join, never fired.
         pending_pcr_discontinuity: resumed_pts.is_some(),
         timecode: TimecodeTracker::new(),
         index_mirror,
@@ -540,6 +659,10 @@ struct WriterState {
     disk_pressure_emitted: bool,
     accumulated_pts: u64,
     last_pcr: Option<u64>,
+    /// A resume whose wall-clock gap has not been measured yet, or an
+    /// in-process gap that has just ended. Consumed by the first PCR seen
+    /// afterwards; see [`PendingResume`].
+    pending_resume: Option<PendingResume>,
     /// Sticky bit set when an unusually large PCR step is observed.
     /// Cleared by the next IDR after stamping `flag::PCR_DISCONTINUITY`
     /// onto its index entry — readers use this to avoid wallclock-pacing
@@ -707,20 +830,17 @@ impl WriterState {
                 // through the published dates and a cut made through this
                 // anchor agree with each other, which is what matters.
                 if self.meta.anchor_wall_us.is_none() {
-                    let us = SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .map(|d| d.as_micros() as i64)
-                        .unwrap_or(0);
+                    let us = now_unix_us();
                     self.meta.anchor_wall_us = Some(us);
                     self.meta.anchor_pts_90khz = Some(entry.pts_90khz);
                     // Persisted immediately: an anchor only in memory is lost
                     // to the first restart, and every clip cut afterwards
-                    // would fall back to the coarse `created_at_unix`.
+                    // would fall back to whole segments.
                     if let Err(e) = write_meta_atomic(&self.meta_path, &self.meta).await {
                         tracing::warn!(
                             recording_id = %self.recording_id, error = %e,
                             "replay: could not persist the wall-clock anchor; \
-                             clip cuts will fall back to created_at_unix"
+                             clip cuts will fall back to whole segments"
                         );
                     } else {
                         tracing::info!(
@@ -729,10 +849,63 @@ impl WriterState {
                             "replay: wall-clock anchor taken on the first indexed frame"
                         );
                     }
+                } else {
+                    // Re-take the *second* point of the mapping on a slow tick.
+                    //
+                    // The anchor is deliberately fixed — moving it would shift
+                    // every clip cut from media already on disk — but one point
+                    // only gives a line if the rate is assumed, and the assumed
+                    // 90 000 ticks per wall-clock second is not what the counter
+                    // does: it advances on the source's PCR. This pair is what
+                    // lets the exporter use the rate the recording has actually
+                    // run at instead.
+                    let us = now_unix_us();
+                    let due = self
+                        .meta
+                        .recent_wall_us
+                        .is_none_or(|prev| us.saturating_sub(prev) >= REANCHOR_INTERVAL_US);
+                    if due {
+                        self.meta.recent_wall_us = Some(us);
+                        self.meta.recent_pts_90khz = Some(entry.pts_90khz);
+                        if let Err(e) = write_meta_atomic(&self.meta_path, &self.meta).await {
+                            tracing::debug!(
+                                recording_id = %self.recording_id, error = %e,
+                                "replay: could not persist the rolling clock sample"
+                            );
+                        }
+                    }
                 }
             }
         }
         Ok(())
+    }
+
+    /// Catch the counter up to wall clock after an in-process gap.
+    ///
+    /// Only meaningful with an anchor, because without one there is no mapping
+    /// to catch up *to*. Never moves the counter backwards: an untrustworthy
+    /// anchor must not be able to un-sort the index, so a derived value at or
+    /// below the current one is discarded and the caller's +1 tick stands.
+    fn resync_after_gap(&mut self) {
+        if self.meta.anchor_wall_us.is_none() {
+            return;
+        }
+        let Some(dated) = resume_pts(
+            Some(self.accumulated_pts),
+            self.meta.anchor_wall_us,
+            self.meta.anchor_pts_90khz,
+            now_unix_us(),
+        ) else {
+            return;
+        };
+        if dated > self.accumulated_pts {
+            tracing::info!(
+                recording_id = %self.recording_id,
+                from = self.accumulated_pts, to = dated,
+                "replay: catching the PTS counter up to wall clock across a gap in the feed"
+            );
+            self.accumulated_pts = dated;
+        }
     }
 
     fn observe_packet(&mut self, ts: &[u8], byte_offset_in_seg: u32) -> Option<IndexEntry> {
@@ -781,6 +954,24 @@ impl WriterState {
         // across the boundary.
         const PCR_DISCONTINUITY_THRESHOLD_90KHZ: u64 = 90_000 * 60 * 5; // 5 minutes
         if let Some(new_pcr) = pcr_field {
+            // A gap that ended: this is the first media back, so this is the
+            // instant its length can finally be measured.
+            if let Some(pending) = self.pending_resume.take() {
+                let now_us = now_unix_us();
+                let resumed = resume_pts(
+                    Some(pending.last_indexed),
+                    pending.anchor_wall_us,
+                    pending.anchor_pts_90khz,
+                    now_us,
+                )
+                .unwrap_or(pending.last_indexed.saturating_add(1));
+                self.accumulated_pts = resumed.max(self.accumulated_pts);
+                tracing::info!(
+                    recording_id = %self.recording_id, resumed_pts = self.accumulated_pts,
+                    last_indexed = pending.last_indexed,
+                    "replay: dated the gap at the first frame back"
+                );
+            }
             let wrap_modulus: u64 = 1u64 << 33;
             let delta = match self.last_pcr {
                 None => 0u64,
@@ -788,7 +979,20 @@ impl WriterState {
             };
             if delta > PCR_DISCONTINUITY_THRESHOLD_90KHZ {
                 self.pending_pcr_discontinuity = true;
+                // A step this large is either a genuine gap in the feed or a
+                // PCR base reset. A single tick is right for the second and
+                // wrong for the first: wall-clock time passed, so the counter
+                // has to catch up or every mark placed afterwards resolves to
+                // media from `gap` earlier — and `spans_discontinuity` cannot
+                // catch it, because the flagged entry sits *before* the
+                // shifted window rather than inside it.
+                //
+                // Re-dating through the anchor is correct for both: no wall
+                // time passes in a base reset, so it resolves to ~the current
+                // value there, and the floor below keeps the index sorted if
+                // the anchor is untrustworthy.
                 self.accumulated_pts = self.accumulated_pts.wrapping_add(1);
+                self.resync_after_gap();
             } else {
                 self.accumulated_pts = self.accumulated_pts.wrapping_add(delta);
             }
@@ -1063,6 +1267,26 @@ impl WriterState {
                 } else {
                     0
                 };
+                // Coming back from Idle is a gap like any other.
+                //
+                // `write_chunk` returns before `observe_packet` while Idle, so
+                // the counter is frozen and `last_pcr` is stale for however
+                // long the operator left it stopped. Resuming from the frozen
+                // value places every later frame earlier than it happened by
+                // exactly that interval — and a gap over five minutes was
+                // worth one tick, so a ten-minute Stop shifted the rest of the
+                // recording by ten minutes against the anchor, silently. The
+                // length is measured at the first frame back, the same way a
+                // restart's is.
+                if self.mode == WriterMode::Idle {
+                    self.last_pcr = None;
+                    self.pending_resume = Some(PendingResume {
+                        last_indexed: self.accumulated_pts,
+                        anchor_wall_us: self.meta.anchor_wall_us,
+                        anchor_pts_90khz: self.meta.anchor_pts_90khz,
+                    });
+                    self.pending_pcr_discontinuity = true;
+                }
                 self.mode = WriterMode::Armed;
                 self.stats.armed.store(true, Ordering::Relaxed);
                 self.stats.mode.store(MODE_ARMED, Ordering::Relaxed);
@@ -1330,14 +1554,68 @@ mod tests {
 
         // A fresh recording has nothing to resume and starts at zero.
         assert_eq!(resume_pts(None, Some(anchor_wall_us), Some(anchor_pts), now_us), None);
-        // So does one too old to carry an anchor: without it the index cannot
-        // be dated, and guessing would be worse than falling back to segments.
-        assert_eq!(resume_pts(Some(last), None, None, now_us), None);
 
         // A clock that has gone backwards must not rewind the timeline either.
         let backwards = resume_pts(Some(last), Some(anchor_wall_us), Some(anchor_pts), anchor_wall_us)
             .expect("still resumable");
         assert!(backwards >= last, "a backwards clock unsorted the index");
+    }
+
+    /// A recording with no anchor still resumes — monotonically.
+    ///
+    /// This is the case the resume most needed and refused: every recording
+    /// written before the anchor existed, plus any whose `recording.json` could
+    /// not be read. Returning `None` there set the counter back to zero into a
+    /// non-empty `index.bin`, so the file held two overlapping timelines,
+    /// `find_floor` binary-searched unsorted data, and the very bug the resume
+    /// was written to fix reappeared on exactly those recordings.
+    ///
+    /// Dating the join needs an anchor; keeping the index sorted does not.
+    #[test]
+    fn a_recording_with_no_anchor_still_resumes_monotonically() {
+        let last = 74_606_400u64;
+        let now_us = 1_788_827_202_551_745i64;
+
+        let resumed = resume_pts(Some(last), None, None, now_us)
+            .expect("an undatable recording must still continue its counter");
+        assert!(
+            resumed > last,
+            "the counter restarted below the index and un-sorted it"
+        );
+        assert_eq!(resumed, last + 1, "un-dated means the minimum honest step");
+
+        // Half an anchor is no anchor.
+        assert_eq!(resume_pts(Some(last), Some(1), None, now_us), Some(last + 1));
+        assert_eq!(resume_pts(Some(last), None, Some(1), now_us), Some(last + 1));
+    }
+
+    /// A clock that was wrong when the anchor was taken must not poison the
+    /// timeline.
+    ///
+    /// An RTC-less board — the shipped Rockchip artefact is one — boots at the
+    /// Unix epoch, indexes its first frame, and is stepped to the real date by
+    /// NTP moments later. The gap that implies is decades. In u64 the multiply
+    /// wrapped and a release build, which has no overflow checks, resumed on a
+    /// timeline about 4.7 years away from anything a lookup could reach; a
+    /// debug build panicked inside `spawn_writer`, which `FlowRuntime::start`
+    /// awaits inline, taking the whole flow start with it.
+    #[test]
+    fn an_absurd_gap_is_clamped_rather_than_wrapped() {
+        // Anchor taken at ten seconds past the epoch; now is 2026.
+        let anchor_wall_us = 10_000_000i64;
+        let anchor_pts = 0u64;
+        let last = 60 * 90_000u64; // 60s of media indexed
+        let now_us = 1_789_000_000_000_000i64;
+
+        let resumed = resume_pts(Some(last), Some(anchor_wall_us), Some(anchor_pts), now_us)
+            .expect("still resumable");
+        assert!(resumed > last, "the timeline went backwards");
+        let max_plausible = last + (MAX_RESUME_GAP_US as u64) * 90_000 / 1_000_000;
+        assert!(
+            resumed <= max_plausible,
+            "resumed to {resumed}, past the {max_plausible} the clamp allows — \
+             an arithmetic result, not a measurement"
+        );
     }
 
     fn entry(pts: u64, packed: u32, valid: bool) -> IndexEntry {
