@@ -66,15 +66,56 @@ use super::clips::ClipStore;
 use super::export::{ExportChunk, MAX_CHUNK_BYTES};
 use super::index::InMemoryIndex;
 
-/// Per-export hard cap. MP4 builds materialize the whole file in
-/// memory so the cache footprint stays predictable; whole-recording
-/// pulls bigger than this should use TS export.
+/// Per-export hard cap, applied to the **built file** and not only to the
+/// source range it was built from.
+///
+/// It used to bound `plan.total_bytes()`, the TS byte range read off disk, on
+/// the reasoning that a remux is roughly the size of its input. The all-intra
+/// re-encode broke that: output size is now a function of resolution and CRF,
+/// so a source range comfortably inside the cap can produce a file several
+/// times it. Both ends are checked now — the read, so a huge read is refused
+/// before it happens, and the essence the muxer is about to interleave, so the
+/// cap bounds what is actually held and handed on.
 const MP4_EXPORT_MAX_BYTES: usize = 256 * 1024 * 1024;
 
 /// Cache TTL after the last access. Operators draining a 200 MiB clip
 /// on a slow link finish well within 5 min; an operator who walks
 /// away doesn't pin RAM forever.
 const CACHE_TTL: Duration = Duration::from_secs(300);
+
+/// Ceiling on everything the cache holds at once.
+///
+/// The TTL alone bounded nothing. It was written for one operator draining one
+/// download, where a single entry expires on its own; it is not a bound when
+/// entries arrive faster than they expire, and `evict_expired` runs only from
+/// inside a lookup or an insert — so the last entry of a burst is pinned until
+/// somebody exports again, which on a node that stops cutting is for ever.
+///
+/// Sized at two maximum exports: enough that a caller re-reading the chunk it
+/// just read still hits the cache, small enough that the resident set cannot be
+/// walked up simply by asking for more clips.
+const CACHE_MAX_BYTES: usize = 2 * MP4_EXPORT_MAX_BYTES;
+
+/// And a count, so many small exports cannot do by number what the byte
+/// ceiling stops them doing by size.
+const CACHE_MAX_ENTRIES: usize = 8;
+
+/// How many exports may be built at once, process-wide.
+///
+/// A cut is a full decode plus a libx264 all-intra encode of the whole window —
+/// tens of seconds of CPU with auto thread counts, so one already contends for
+/// every core. There is one clip poller per passthrough CMAF output and no cap
+/// on DVR sessions per node, and the operator export commands reach the same
+/// builder, so without this N sessions clipping in the same five-second window
+/// run N of those at once on a node that is also carrying live transport.
+///
+/// One permit, not a pool: a clip is a deliberate act with a human waiting, so
+/// seconds of queueing are invisible — and the thing being protected, wire
+/// pacing on the live flows, is not.
+fn build_slot() -> &'static tokio::sync::Semaphore {
+    static SLOT: OnceLock<tokio::sync::Semaphore> = OnceLock::new();
+    SLOT.get_or_init(|| tokio::sync::Semaphore::new(1))
+}
 
 #[derive(Clone)]
 struct CachedMp4 {
@@ -90,6 +131,24 @@ fn cache() -> &'static Mutex<HashMap<String, CachedMp4>> {
 fn evict_expired(map: &mut HashMap<String, CachedMp4>) {
     let now = Instant::now();
     map.retain(|_, v| now.duration_since(v.last_access) < CACHE_TTL);
+}
+
+/// Drop least-recently-used entries until the map is inside both ceilings.
+fn evict_to_budget(map: &mut HashMap<String, CachedMp4>) {
+    fn over(m: &HashMap<String, CachedMp4>) -> bool {
+        m.len() > CACHE_MAX_ENTRIES
+            || m.values().map(|v| v.bytes.len()).sum::<usize>() > CACHE_MAX_BYTES
+    }
+    while over(map) {
+        let Some(oldest) = map
+            .iter()
+            .min_by_key(|(_, v)| v.last_access)
+            .map(|(k, _)| k.clone())
+        else {
+            return;
+        };
+        map.remove(&oldest);
+    }
 }
 
 fn lookup_cached(key: &str) -> Option<std::sync::Arc<Vec<u8>>> {
@@ -110,6 +169,7 @@ fn insert_cached(key: String, bytes: std::sync::Arc<Vec<u8>>) {
                 last_access: Instant::now(),
             },
         );
+        evict_to_budget(&mut map);
     }
 }
 
@@ -160,6 +220,29 @@ pub async fn export_recording_mp4_chunk(
         arc
     };
     Ok(slice_export_chunk(&bytes, byte_offset, max_bytes))
+}
+
+/// Build one whole MP4 and hand it over, without touching the cache.
+///
+/// For a caller that consumes the bytes once, in order, immediately — the DVR
+/// clip exporter, which uploads them and drops them. Through the chunked API
+/// that caller paid twice: the finished file was `Arc`-pinned in the cache for
+/// five minutes, while the loop copied the same bytes out slice by slice into a
+/// second full-size `Vec` to PUT. Two live copies of every clip at the moment
+/// of upload, and the first of them unreachable but unfreeable — which is why
+/// the `malloc_trim` after each cut could not reclaim it.
+#[cfg(feature = "replay")]
+pub async fn export_recording_mp4_whole(
+    recording_id: &str,
+    from_pts_90khz: Option<u64>,
+    to_pts_90khz: Option<u64>,
+) -> Result<Vec<u8>> {
+    if let (Some(from), Some(to)) = (from_pts_90khz, to_pts_90khz)
+        && to <= from
+    {
+        bail!("replay_invalid_range");
+    }
+    build_recording_mp4(recording_id, from_pts_90khz, to_pts_90khz).await
 }
 
 fn slice_export_chunk(bytes: &[u8], byte_offset: u64, max_bytes: u64) -> ExportChunk {
@@ -214,19 +297,57 @@ async fn build_recording_mp4(
         .or_else(|| index.entries.first().map(|e| e.pts_90khz))
         .ok_or_else(|| anyhow!("replay_no_index"))?;
 
-    // Pull the whole TS byte range into memory first. Bounded by the
-    // 256 MiB cap so the worst-case footprint is predictable.
+    // A range that crosses a recorder restart cannot be exported at all.
+    //
+    // Checked here rather than only in the clip exporter, so every consumer of
+    // the builder inherits it. The index's own timeline is continuous across a
+    // restart — the writer resumes its counter — but the media underneath is
+    // not: the PCR in the TS begins again with the process. Muxing across the
+    // join yields a file that plays and lies about its own length, measured at
+    // 70,567 seconds from a thirty-second request, which is discovered in an
+    // edit suite rather than here.
+    if index.spans_discontinuity(from_pts, to_pts_90khz.unwrap_or(u64::MAX)) {
+        bail!("replay_export_spans_restart");
+    }
+
+    // Pull the whole TS byte range into memory first. Refused up front past the
+    // cap so a huge read never happens; the built file is checked again below,
+    // because the re-encode makes output size independent of input size.
     let plan = super::export::plan_for_pts_range_pub(&index, &dir, from_pts, to_pts_90khz).await?;
     if plan.total_bytes() > MP4_EXPORT_MAX_BYTES as u64 {
         bail!("replay_export_too_large");
     }
     let ts = super::export::read_full_range(&dir, plan).await?;
+    drop(index);
 
+    // Everything from here is CPU: a software decode of every frame, a libx264
+    // all-intra encode of every frame, and an interleaving mux — seconds to
+    // minutes of it, with no await in the middle.
+    //
+    // Running that inline on a runtime worker is what the house rule against
+    // blocking the data path forbids, and the rest of this subsystem already
+    // knows it: the live CMAF re-encoder goes through `timed_block_in_place!`
+    // and the filmstrip writer through `spawn_blocking`. This was the one
+    // encoder call site that did neither, and the longest-running one.
+    //
+    // The permit is taken around the same section rather than around the whole
+    // function so the queue forms before the CPU is committed, not after.
+    let _permit = build_slot()
+        .acquire()
+        .await
+        .map_err(|_| anyhow!("replay_export_failed: the export slot closed"))?;
+    tokio::task::spawn_blocking(move || build_mp4_from_ts(&ts))
+        .await
+        .map_err(|e| anyhow!("replay_export_failed: {e}"))?
+}
+
+/// The CPU half of an export: demux, re-encode, mux. No IO, no await.
+fn build_mp4_from_ts(ts: &[u8]) -> Result<Vec<u8>> {
     // Demux + collect frames. We keep the whole list in memory because
     // we only know each sample's duration after seeing the next
     // sample's PTS. For the 256 MiB cap this is bounded and small.
     let mut demux = TsDemuxer::new(None);
-    let frames = demux.demux(&ts);
+    let frames = demux.demux(ts);
 
     // Per-frame video tuple: (pts, nalus, is_keyframe). Codec is implied
     // by `demux.video_stream_type()` after demux completes.
@@ -364,8 +485,16 @@ async fn build_recording_mp4(
     // forward and back, in anything that opens it.
     //
     // Audio is left alone: AAC frames are already independently decodable.
-    let (video_pts, video_track) = match reencode_all_intra(&video_pts, &video_track, &demux) {
-        Ok(out) => out,
+    let reencoded = reencode_all_intra(&video_pts, &video_track, &demux);
+    let (video_pts, video_track, reencode_trimmed_ticks) = match reencoded {
+        Ok((frames, track, trimmed)) => {
+            // Shadowing does not drop. The source list is a whole clip's worth
+            // of NAL payloads and the re-encoded one is larger again, so
+            // letting the old binding live to the end of the function held two
+            // full copies of the essence for no reason.
+            drop(video_pts);
+            (frames, track, trimmed)
+        }
         Err(e) => {
             // A clip that exists beats no clip. The operator gets the source
             // GOP structure and the stepping that comes with it, and the
@@ -374,7 +503,7 @@ async fn build_recording_mp4(
                 error = %e,
                 "replay export: could not re-encode all-intra;                  falling back to the source's own GOP structure"
             );
-            (video_pts, video_track)
+            (video_pts, video_track, 0)
         }
     };
 
@@ -382,7 +511,15 @@ async fn build_recording_mp4(
     // (and AUD on HEVC) out of the per-frame payload, since they live
     // in the sample entry's `avcC` / `hvcC` extradata in the init
     // segment instead.
-    let is_h265 = demux.video_stream_type() == STREAM_TYPE_H265;
+    //
+    // Selected by what the TRACK carries, not by what the source did. The
+    // re-encoder emits H.264 whatever went in, so deriving this from the
+    // demuxer ran an HEVC source's re-encoded H.264 through the HEVC filter,
+    // whose `(byte0 >> 1) & 0x3F` test reads an H.264 SPS as type 51 and
+    // strips nothing — leaving the parameter sets in-band in every sample of
+    // an `avc1`/`avcC` track, which is what `avc3` exists for and what strict
+    // players refuse. The live CMAF path already picks by the encoder's family.
+    let is_h265 = matches!(video_track.codec, CmafVideoCodec::H265);
     let mut video_samples: Vec<Sample> = Vec::with_capacity(video_pts.len());
     for (i, (pts, nalus, is_sync)) in video_pts.iter().enumerate() {
         let next_pts = video_pts.get(i + 1).map(|t| t.0).unwrap_or(*pts + 3000);
@@ -421,11 +558,16 @@ async fn build_recording_mp4(
     //
     // Measured on the rig: a 30s clip carried 240 samples of which the leading
     // 41 decoded to nothing at all, and the first sync sample sat at 41.
+    //
+    // The re-encoder does the same trim on the way in, for the same reason —
+    // it cannot decode those frames either — and what it discards has to be
+    // counted here too. It marks every frame it emits as sync, so `first_sync`
+    // is 0 on the re-encoded path and the sum below is over an empty slice: the
+    // audio drain was therefore skipped on exactly the path every release
+    // artefact takes, and every clip shipped with the audio leading the video
+    // by the length of the discarded lead-in. Tens of times gate 3's ±40 ms.
     let first_sync = video_samples.iter().position(|s| s.is_sync).unwrap_or(0);
-    let dropped_ticks: u64 = video_samples[..first_sync]
-        .iter()
-        .map(|s| s.duration as u64)
-        .sum();
+    let dropped_ticks = leading_trim_ticks(reencode_trimmed_ticks, &video_samples, first_sync);
     if first_sync > 0 {
         tracing::debug!(
             dropped = first_sync, ticks = dropped_ticks,
@@ -440,19 +582,13 @@ async fn build_recording_mp4(
     let mut audio_samples = audio_samples;
     if dropped_ticks > 0 && !audio_samples.is_empty() {
         let audio_ts = audio_track.as_ref().map(|a| a.sample_rate as u64).unwrap_or(0);
-        if audio_ts > 0 {
-            let want = dropped_ticks * audio_ts / video_track.timescale as u64;
-            let mut acc = 0u64;
-            let mut drop_n = 0usize;
-            for sm in &audio_samples {
-                if acc + sm.duration as u64 > want {
-                    break;
-                }
-                acc += sm.duration as u64;
-                drop_n += 1;
-            }
-            audio_samples.drain(..drop_n);
-        }
+        let drop_n = audio_samples_to_drop(
+            dropped_ticks,
+            video_track.timescale,
+            audio_ts,
+            &audio_samples,
+        );
+        audio_samples.drain(..drop_n);
     }
 
     // ── A progressive file, not a fragmented one ───────────────────────────
@@ -470,6 +606,24 @@ async fn build_recording_mp4(
     //
     // `moov` is written ahead of `mdat` so the tables are readable without
     // fetching the whole clip first.
+    //
+    // Checked here, on the essence about to be interleaved, because this is the
+    // last point at which refusing is cheap: `build_progressive_mp4` lays the
+    // whole payload out and then copies it into the finished buffer, so past
+    // this line an over-cap export costs two more full copies before anyone can
+    // say no. The cap on the source range upstream does not cover it — the
+    // re-encode decoupled output size from input size.
+    //
+    // It is also what keeps the 32-bit `stco` offsets and the 32-bit `mdat`
+    // size honest: at 256 MiB the file cannot approach the 4 GiB boundary where
+    // those would silently truncate into a file that parses and decodes
+    // garbage.
+    let payload_bytes: usize = video_samples.iter().map(|s| s.data.len()).sum::<usize>()
+        + audio_samples.iter().map(|s| s.data.len()).sum::<usize>();
+    if payload_bytes > MP4_EXPORT_MAX_BYTES {
+        bail!("replay_export_too_large");
+    }
+
     let buf = build_progressive_mp4(
         &video_track,
         &video_samples,
@@ -477,6 +631,54 @@ async fn build_recording_mp4(
         &audio_samples,
     );
     Ok(buf)
+}
+
+/// How much of the front of the clip the video lost, in video ticks.
+///
+/// Two trims, one number. The muxer drops whatever precedes the first sync
+/// sample, and the all-intra re-encoder has already dropped the same lead-in
+/// on its own way in — for the same reason, because neither can decode it.
+///
+/// Counting only the first is what made every clip on a release artefact lose
+/// lip sync: the re-encoder marks every frame it emits as sync, so `first_sync`
+/// is 0, the slice below is empty, and the audio drain that keeps the two
+/// tracks starting together never ran. Both tracks are written anchored at
+/// decode time zero with no edit list, so the audio simply led the picture by
+/// the length of the discarded lead-in.
+fn leading_trim_ticks(reencode_trimmed: u64, video_samples: &[Sample], first_sync: usize) -> u64 {
+    reencode_trimmed
+        + video_samples[..first_sync.min(video_samples.len())]
+            .iter()
+            .map(|s| s.duration as u64)
+            .sum::<u64>()
+}
+
+/// How many leading audio samples to drop so the two tracks still start
+/// together after the video lost `dropped_ticks` off its front.
+///
+/// Audio follows the video by *time*, not by sample count, and rounds down so
+/// the audio never starts late. Returns 0 when there is no audio timescale to
+/// convert through, which is the "no audio track" case.
+fn audio_samples_to_drop(
+    dropped_ticks: u64,
+    video_timescale: u32,
+    audio_rate: u64,
+    audio: &[Sample],
+) -> usize {
+    if audio_rate == 0 || video_timescale == 0 {
+        return 0;
+    }
+    let want = dropped_ticks * audio_rate / video_timescale as u64;
+    let mut acc = 0u64;
+    let mut drop_n = 0usize;
+    for sm in audio {
+        if acc + sm.duration as u64 > want {
+            break;
+        }
+        acc += sm.duration as u64;
+        drop_n += 1;
+    }
+    drop_n
 }
 
 /// The typical gap between one frame and the next, in 90 kHz ticks.
@@ -495,10 +697,19 @@ fn median_step(frames: &[(u64, Vec<Vec<u8>>, bool)]) -> Option<u64> {
 
 /// Re-encode a cut so every frame is an IDR.
 ///
-/// Returns the new frame list and a track description built from the
-/// **encoder's** parameter sets, not the source's: the SPS/PPS change with the
-/// encode, and an `avcC` carrying the old ones describes a stream that no
-/// longer exists.
+/// Returns the new frame list, a track description built from the **encoder's**
+/// parameter sets — not the source's: the SPS/PPS change with the encode, and
+/// an `avcC` carrying the old ones describes a stream that no longer exists —
+/// and **how many source ticks were discarded off the front**.
+///
+/// That last value is not bookkeeping. This function trims the undecodable
+/// lead-in before the first keyframe and then marks every frame it emits as
+/// sync, so the caller's own "open on a keyframe" trim finds nothing left to do
+/// and its compensating audio drain never runs. Without the number coming back
+/// out, the audio kept every frame from the start of the byte range while the
+/// video started a GOP later, and both tracks were written anchored at decode
+/// time zero with no edit list — audio ahead of picture by the length of the
+/// trim, on every clip, on every build that has an encoder.
 ///
 /// Errors rather than panicking on anything missing, because the caller's
 /// answer to a failed re-encode is to ship the source GOP instead — a clip
@@ -508,7 +719,7 @@ fn reencode_all_intra(
     frames: &[(u64, Vec<Vec<u8>>, bool)],
     source: &VideoTrack,
     demux: &TsDemuxer,
-) -> Result<(Vec<(u64, Vec<Vec<u8>>, bool)>, VideoTrack)> {
+) -> Result<(Vec<(u64, Vec<Vec<u8>>, bool)>, VideoTrack, u64)> {
     use crate::config::models::VideoEncodeConfig;
     use crate::engine::cmaf::encode::VideoReencoder;
 
@@ -530,6 +741,13 @@ fn reencode_all_intra(
     // decodable, and feeding them to the decoder is what made the first
     // version of this fail on packet one and fall back every single time.
     let start = frames.iter().position(|f| f.2).unwrap_or(0);
+    // Measured before the slice, and handed back, so the caller can drain the
+    // same amount of audio. See this function's doc comment.
+    let trimmed_ticks = if start > 0 {
+        frames[start].0.saturating_sub(frames[0].0)
+    } else {
+        0
+    };
     let frames = &frames[start..];
     if frames.len() < 2 {
         bail!("no keyframe to start from");
@@ -637,10 +855,10 @@ fn reencode_all_intra(
     };
     let track = VideoTrack::from_h264(sps, pps);
     tracing::info!(
-        frames = out.len(), width = track.width, height = track.height,
+        frames = out.len(), width = track.width, height = track.height, trimmed_ticks,
         "replay export: re-encoded all-intra"
     );
-    Ok((out, track))
+    Ok((out, track, trimmed_ticks))
 }
 
 #[cfg(not(feature = "media-codecs"))]
@@ -648,7 +866,7 @@ fn reencode_all_intra(
     _frames: &[(u64, Vec<Vec<u8>>, bool)],
     _source: &VideoTrack,
     _demux: &TsDemuxer,
-) -> Result<(Vec<(u64, Vec<Vec<u8>>, bool)>, VideoTrack)> {
+) -> Result<(Vec<(u64, Vec<Vec<u8>>, bool)>, VideoTrack, u64)> {
     bail!("this build has no encoder")
 }
 
@@ -881,5 +1099,111 @@ mod tests {
         let (_track, samples) =
             build_ac3_track(&blobs, false).expect("re-sync past garbage");
         assert_eq!(samples.len(), 1);
+    }
+
+    fn cached(key: &str, bytes: usize) {
+        insert_cached(key.to_string(), std::sync::Arc::new(vec![0u8; bytes]));
+    }
+
+    fn cache_len() -> usize {
+        cache().lock().expect("cache").len()
+    }
+
+    fn cache_bytes() -> usize {
+        cache().lock().expect("cache").values().map(|v| v.bytes.len()).sum()
+    }
+
+    fn clear_cache() {
+        cache().lock().expect("cache").clear();
+    }
+
+    fn sample(duration: u32, is_sync: bool) -> Sample {
+        Sample { duration, data: vec![0u8; 8], composition_time_offset: 0, is_sync }
+    }
+
+    /// The re-encoder's own lead-in trim has to reach the audio drain.
+    ///
+    /// This is the shape every release artefact produces: `reencode_all_intra`
+    /// drops the undecodable frames before the first keyframe and marks every
+    /// frame it emits as sync, so the muxer's own trim finds nothing to do.
+    /// Counting only the muxer's trim gave `dropped_ticks == 0`, the audio
+    /// drain was skipped, and the clip shipped with the audio leading the
+    /// picture by the whole lead-in — 41 samples of 240 on the rig, which at
+    /// 25 fps is 1.6 s against gate 3's ±40 ms.
+    #[test]
+    fn the_reencoders_lead_in_trim_is_counted_against_the_audio() {
+        // What the re-encoder hands back: 10 frames at 3600 ticks, all sync,
+        // having already discarded 40 source frames (144 000 ticks) ahead of
+        // the first keyframe.
+        let video: Vec<Sample> = (0..10).map(|_| sample(3600, true)).collect();
+        let first_sync = video.iter().position(|s| s.is_sync).unwrap_or(0);
+        assert_eq!(first_sync, 0, "the re-encoded list opens on a sync sample");
+
+        let ticks = leading_trim_ticks(144_000, &video, first_sync);
+        assert_eq!(ticks, 144_000, "the re-encoder's trim must survive to here");
+
+        // 1.6 s of 48 kHz AAC is 76 800 samples; at 1024 per frame that is 75
+        // whole frames the audio has to give up to stay in step.
+        let audio: Vec<Sample> = (0..200).map(|_| sample(1024, true)).collect();
+        assert_eq!(audio_samples_to_drop(ticks, 90_000, 48_000, &audio), 75);
+    }
+
+    /// And the muxer's own trim still counts on the fallback path, where the
+    /// re-encode failed and the source GOP structure is shipped as-is.
+    #[test]
+    fn the_muxers_own_trim_still_counts_when_there_was_no_re_encode() {
+        let mut video: Vec<Sample> = (0..3).map(|_| sample(3600, false)).collect();
+        video.extend((0..10).map(|_| sample(3600, true)));
+        let first_sync = video.iter().position(|s| s.is_sync).expect("a keyframe");
+        assert_eq!(leading_trim_ticks(0, &video, first_sync), 3 * 3600);
+    }
+
+    /// No audio track means nothing to drain, and no divide by its timescale.
+    #[test]
+    fn a_video_only_clip_drains_no_audio() {
+        assert_eq!(audio_samples_to_drop(144_000, 90_000, 0, &[]), 0);
+    }
+
+    /// The cache is bounded by size, not only by age.
+    ///
+    /// The 5-minute TTL is not a bound when entries arrive faster than they
+    /// expire — and a viewer may commission fifty cuts in one POST. Before the
+    /// LRU, a burst pinned every one of them for five minutes, in live
+    /// allocations `malloc_trim` cannot return.
+    ///
+    /// Serialised with the sibling cache tests by running them in one `#[test]`:
+    /// the cache is process-global and `cargo test` is threaded.
+    #[test]
+    fn the_export_cache_is_bounded_by_bytes_and_by_count() {
+        clear_cache();
+
+        // Byte ceiling: three maximum-size entries cannot all be resident.
+        for i in 0..3 {
+            cached(&format!("big-{i}"), MP4_EXPORT_MAX_BYTES);
+        }
+        assert!(
+            cache_bytes() <= CACHE_MAX_BYTES,
+            "the cache held {} bytes, over the {CACHE_MAX_BYTES} ceiling",
+            cache_bytes()
+        );
+        assert!(
+            lookup_cached("big-0").is_none(),
+            "the least recently used entry should have been evicted first"
+        );
+
+        // Entry ceiling: many small exports cannot do by number what the byte
+        // ceiling stops them doing by size.
+        clear_cache();
+        for i in 0..(CACHE_MAX_ENTRIES + 4) {
+            cached(&format!("small-{i}"), 16);
+        }
+        assert_eq!(cache_len(), CACHE_MAX_ENTRIES);
+        assert!(lookup_cached("small-0").is_none(), "oldest out first");
+        assert!(
+            lookup_cached(&format!("small-{}", CACHE_MAX_ENTRIES + 3)).is_some(),
+            "the newest entry must survive"
+        );
+
+        clear_cache();
     }
 }

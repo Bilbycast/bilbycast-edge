@@ -242,8 +242,15 @@ fn exit_without_static_teardown(code: i32) -> ! {
 /// when it is worth doing.
 ///
 /// **Why not more often.** It takes each arena's lock in turn, and this
-/// process has real-time work on those threads. Every few minutes bounds the
-/// growth without putting a recurring stall in the media path.
+/// process has real-time work on those threads. Once a minute bounds the
+/// growth without putting a recurring stall in the media path — and the call
+/// itself is made from `spawn_blocking`, so the tokio worker pool keeps every
+/// one of its threads while it runs.
+///
+/// **What "close to free" is worth.** Only in the case where there is nothing
+/// to release. Measured on this box at 12–13 ms over a single ~320 MB
+/// fragmented arena, plus ~20 000 minor faults to touch the returned pages
+/// again — so on a busy node the paying case is every tick, not the cheap one.
 #[cfg(target_env = "gnu")]
 fn spawn_heap_trimmer(cancel: tokio_util::sync::CancellationToken) {
     // Every minute.
@@ -268,12 +275,23 @@ fn spawn_heap_trimmer(cancel: tokio_util::sync::CancellationToken) {
                 _ = cancel.cancelled() => return,
                 _ = ticks.tick() => {}
             }
-            // SAFETY: `malloc_trim` inspects the allocator's own free lists and
-            // releases whole pages back to the kernel. It takes no pointer from
-            // us and cannot invalidate any live allocation.
-            unsafe {
-                libc::malloc_trim(0);
-            }
+            // On a blocking thread, not this one.
+            //
+            // The call takes each glibc arena's lock in turn and madvises its
+            // free runs; measured here at 12–13 ms over a single ~320 MB
+            // fragmented arena. A tokio worker that sits in it is a worker the
+            // runtime has lost for that long — the parallelism a node carrying
+            // live transport is relying on — and the rest of this process
+            // already routes work of that shape off the runtime.
+            let _ = tokio::task::spawn_blocking(|| {
+                // SAFETY: `malloc_trim` inspects the allocator's own free lists
+                // and releases whole pages back to the kernel. It takes no
+                // pointer from us and cannot invalidate any live allocation.
+                unsafe {
+                    libc::malloc_trim(0);
+                }
+            })
+            .await;
         }
     });
 }

@@ -97,23 +97,36 @@ fn is_permanent(err: &str) -> bool {
 /// on a box with 15 GB shared with a second edge — a demo of a dozen clips
 /// would have run it out of memory.
 ///
-/// `malloc_trim` is the one call that fixes that, and it is safe to make here:
-/// the cut is over, nothing on this path holds a live allocation, and it runs
-/// once per clip rather than in any hot loop.
+/// `malloc_trim` is the one call that fixes that, and it is worth making here:
+/// the cut is over and it runs once per clip rather than in any hot loop.
+///
+/// It is not a complete answer on its own, and the export cache is why: an
+/// entry the cache still holds is a **live** allocation, which `malloc_trim`
+/// cannot return however often it is called. The clip exporter therefore takes
+/// the uncached whole-file path (`export_recording_mp4_whole`), so by the time
+/// this runs there genuinely is nothing of the clip left alive.
+///
+/// Awaited on a blocking thread rather than called inline: the call takes each
+/// arena's lock in turn and runs for tens of milliseconds on a fragmented heap,
+/// which is not something to do on a runtime worker of a process carrying live
+/// transport.
 #[cfg(target_env = "gnu")]
-fn release_free_heap() {
-    // SAFETY: `malloc_trim` inspects the allocator's own free lists and
-    // releases whole pages back to the kernel. It takes no pointer from us and
-    // cannot invalidate any live allocation.
-    unsafe {
-        libc::malloc_trim(0);
-    }
+async fn release_free_heap() {
+    let _ = tokio::task::spawn_blocking(|| {
+        // SAFETY: `malloc_trim` inspects the allocator's own free lists and
+        // releases whole pages back to the kernel. It takes no pointer from us
+        // and cannot invalidate any live allocation.
+        unsafe {
+            libc::malloc_trim(0);
+        }
+    })
+    .await;
 }
 
 /// Nothing to do where the allocator is not glibc — musl and macOS return
 /// pages on free.
 #[cfg(not(target_env = "gnu"))]
-fn release_free_heap() {}
+async fn release_free_heap() {}
 
 /// Tell the origin a clip cannot be produced, so it stops being pending.
 async fn report_failure(base: &str, auth: Option<&str>, name: &str, reason: &str) {
@@ -309,14 +322,6 @@ async fn cut_exact(flow_id: &str, rec: &ClipRecord) -> Result<Option<Vec<u8>>> {
     let index = crate::replay::index::InMemoryIndex::load(&dir.join("index.bin"))
         .await
         .unwrap_or_default();
-    if index.spans_discontinuity(from, to) {
-        bail!(
-            "clip '{}' spans a recorder restart, and the media either side of it \
-             is two separate timelines — move the mark clear of the restart and \
-             export it again",
-            rec.name
-        );
-    }
 
     // Ask for one random-access point past the end, so the clip covers the
     // window instead of stopping short of it.
@@ -330,50 +335,59 @@ async fn cut_exact(flow_id: &str, rec: &ClipRecord) -> Result<Option<Vec<u8>>> {
     //
     // Done here rather than in `plan_pts_range`, which is shared with the
     // manager's mark-in/mark-out export and has its own settled semantics.
+    //
+    // Resolved BEFORE the restart guard below, so the guard is asked about the
+    // range that will actually be exported. Asked about `to` instead, it could
+    // not see a join sitting between `to` and `to_covering` — media the widened
+    // range does include — and that is precisely the entry a mark landing on a
+    // random-access point produces.
     let to_covering = index.first_after(to).unwrap_or(to);
 
-    // The exporter chunks; a clip is wanted whole.
-    let mut out: Vec<u8> = Vec::new();
-    let mut offset = 0u64;
-    loop {
-        let chunk = match crate::replay::export_mp4::export_recording_mp4_chunk(
-            flow_id,
-            Some(from),
-            Some(to_covering),
-            offset,
-            8 * 1024 * 1024,
-        )
-        .await
-        {
-            Ok(c) => c,
-            // The recording could not serve this moment — which is exactly
-            // what the segment fallback is for, so hand it over rather than
-            // failing the export.
-            //
-            // The common cause is retention: the index still names a segment
-            // that has since been pruned, and the exporter answers "stat
-            // segment …: No such file". The relay's origin window is
-            // configured independently and often still holds the media, so a
-            // clip that the recorder has aged out of is frequently still
-            // cuttable — just on segment boundaries instead of the frame.
-            //
-            // Any other failure lands here too, and deliberately: a coarser
-            // clip beats no clip, and the reason is logged either way.
-            Err(e) => {
-                tracing::warn!(
-                    flow_id, clip = %rec.name, error = %format!("{e:#}"),
-                    "clip exporter: the recording could not serve this moment;                      cutting from whole segments instead"
-                );
-                return Ok(None);
-            }
-        };
-        let got = chunk.data.len() as u64;
-        out.extend_from_slice(&chunk.data);
-        if chunk.eof || got == 0 {
-            break;
-        }
-        offset += got;
+    if index.spans_discontinuity(from, to_covering) {
+        bail!(
+            "clip '{}' spans a recorder restart, and the media either side of it \
+             is two separate timelines — move the mark clear of the restart and \
+             export it again",
+            rec.name
+        );
     }
+
+    // Asked for whole, not chunked.
+    //
+    // The chunked entry point exists because the manager's WS transport carries
+    // a download in base64 frames. This caller uploads the file in one PUT, and
+    // going through the chunked API cost it two live copies of every clip —
+    // the cache pinning the finished build for five minutes while this loop
+    // copied the same bytes out slice by slice into a second full-size buffer.
+    let out = match crate::replay::export_mp4::export_recording_mp4_whole(
+        flow_id,
+        Some(from),
+        Some(to_covering),
+    )
+    .await
+    {
+        Ok(b) => b,
+        // The recording could not serve this moment — which is exactly
+        // what the segment fallback is for, so hand it over rather than
+        // failing the export.
+        //
+        // The common cause is retention: the index still names a segment
+        // that has since been pruned, and the exporter answers "stat
+        // segment …: No such file". The relay's origin window is
+        // configured independently and often still holds the media, so a
+        // clip that the recorder has aged out of is frequently still
+        // cuttable — just on segment boundaries instead of the frame.
+        //
+        // Any other failure lands here too, and deliberately: a coarser
+        // clip beats no clip, and the reason is logged either way.
+        Err(e) => {
+            tracing::warn!(
+                flow_id, clip = %rec.name, error = %format!("{e:#}"),
+                "clip exporter: the recording could not serve this moment;                  cutting from whole segments instead"
+            );
+            return Ok(None);
+        }
+    };
     if out.is_empty() {
         return Ok(None);
     }
@@ -515,11 +529,23 @@ pub async fn run(
         };
 
         for rec in records.iter().filter(|r| !r.ready && !r.failed) {
+            // Cancellation is checked inside the batch, not only around the
+            // sleep. A batch can be up to the relay's 100 pending clips, each a
+            // multi-second all-intra encode, and the poller is spawned
+            // detached — so a flow stop or a config push that restarts the
+            // output left the old exporter grinding through the whole queue
+            // while a new one, spawned for the replacement output, polled the
+            // same queue. Two pollers then cut the same record, and their
+            // uploads share one `.part` file on the origin.
+            if cancel.is_cancelled() {
+                tracing::info!(origin = %base, "clip exporter stopping (cancelled) mid-batch");
+                return;
+            }
             let outcome = cut_one(&base, auth, &flow_id, rec).await;
             // Whichever way it went, the spike is over — give the pages back
             // before moving to the next one, so a run of exports does not
             // accumulate a working set none of them still needs.
-            release_free_heap();
+            release_free_heap().await;
             match outcome {
                 Ok(bytes) => {
                     attempts.remove(&rec.name);
