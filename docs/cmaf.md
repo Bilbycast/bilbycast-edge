@@ -629,6 +629,14 @@ not "fixed" by somebody reading the CPU graph.
 
 ### NVENC cannot express all-intra directly
 
+This is not a new finding: `manager-core`'s `dvr_provision.rs` already keeps an
+`ALL_INTRA_CAPABLE` allowlist of `h264_vaapi` and `h264_rkmpp`, with the note
+that *"NVENC's absence is the load-bearing one: it is the encoder a
+well-specified node is most likely to have, and picking it would break the
+feature on exactly the hardware an operator would expect to work best."* What
+follows is the edge-side confirmation and the numbers behind the trade, so the
+same question does not get re-opened from scratch on this side of the wire.
+
 The proxy must be all-intra — that is the whole reason it exists, so a jog
 lands on a frame without decoding from a keyframe. `gop_size: 1` is how that is
 asked for, and **NVENC refuses it**:
