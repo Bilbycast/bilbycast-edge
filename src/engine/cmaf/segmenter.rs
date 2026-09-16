@@ -344,6 +344,11 @@ struct PendingAudioSample {
 /// silent: `push` hands the shed audio back to the caller.
 const MAX_PENDING_AUDIO_MULTIPLE: u64 = 4;
 
+/// Samples per AAC frame, used only as the last-resort stride when a fragment
+/// is drained with nothing queued behind it and there is no observed spacing
+/// to copy. Every real AAC-LC frame on this path is 1024 samples.
+const AAC_FRAME_SAMPLES: u64 = 1024;
+
 impl AudioSegmenter {
     pub fn new(track: AudioTrack, target_duration_secs: f64) -> Self {
         let target_duration_ts = (target_duration_secs * track.sample_rate as f64) as u64;
@@ -423,14 +428,49 @@ impl AudioSegmenter {
         }
         let frames: Vec<PendingAudioSample> = self.samples.drain(..taken).collect();
         let base = frames[0].dts_ts;
+
+        // Where the LAST frame of this fragment ends.
+        //
+        // It must be the successor's own DTS, never the video boundary. The
+        // next fragment anchors on the successor (see the doc comment above),
+        // so ending this one at the boundary leaves a hole between the two of
+        // however far the audio grid overshot the video cut — up to one frame.
+        //
+        // That hole is not cosmetic. Chrome's MSE declares a discontinuity
+        // when the next decode timestamp jumps more than **twice the previous
+        // frame's duration**, and truncating makes the previous frame short
+        // exactly when the following gap is large, so the test trips on
+        // roughly every other segment. A discontinuity sets "need random
+        // access point" on every track buffer sharing the source buffer — the
+        // VIDEO track included — and Chrome then discards frames until the
+        // next IDR. On a 2 s GOP that is the entire next segment of picture,
+        // while the audio plays on untouched: a still image and continuing
+        // sound, every four seconds or so. An all-intra rendition loses a
+        // single frame to the same fault, which is why the proxy looked clean
+        // and only the full-resolution feed appeared broken.
+        //
+        // Audio may therefore end up to one frame past the video boundary in
+        // a fragment. That is allowed and is what ffmpeg's own muxer does;
+        // its seams measure zero, and this one now does too.
+        let successor = self.samples.front().map(|f| f.dts_ts);
+        let nominal = frames
+            .windows(2)
+            .last()
+            .map(|w| w[1].dts_ts.saturating_sub(w[0].dts_ts))
+            .filter(|d| *d > 0)
+            .unwrap_or(AAC_FRAME_SAMPLES);
+        let last_end = successor.unwrap_or_else(|| {
+            frames
+                .last()
+                .map(|f| f.dts_ts + nominal)
+                .unwrap_or(boundary_dts_ts)
+        });
+
         let samples_out: Vec<Sample> = frames
             .iter()
             .enumerate()
             .map(|(i, f)| {
-                let next = frames
-                    .get(i + 1)
-                    .map(|n| n.dts_ts)
-                    .unwrap_or(boundary_dts_ts);
+                let next = frames.get(i + 1).map(|n| n.dts_ts).unwrap_or(last_end);
                 Sample {
                     duration: next.saturating_sub(f.dts_ts) as u32,
                     data: f.data.clone(),
@@ -672,13 +712,64 @@ mod tests {
             samples.iter().all(|s| s.duration > 0),
             "a sample drained past the boundary would have zero duration"
         );
-        assert_eq!(samples[4].duration, (5000 - 4096) as u32);
+        // To its successor's DTS (5120), NOT to the 5000 video boundary. See
+        // `take_pending_samples`: truncating here opens a hole before the next
+        // fragment, and Chrome answers a hole by dropping video to the next
+        // IDR — two seconds of frozen picture over playing audio.
+        assert_eq!(
+            samples[4].duration,
+            (5120 - 4096) as u32,
+            "the last frame must reach the frame that follows it, not the video cut"
+        );
 
         // The next fragment starts at the first frame that was left queued —
         // 5120, not the 5000 boundary.
         let (_seq, base, samples) = s.take_pending_samples(20_000).expect("audio waiting");
         assert_eq!(base, 5120, "second fragment anchors on its own first sample");
         assert_eq!(samples.len(), 5);
+    }
+
+    /// Consecutive fragments must tile the audio timeline exactly.
+    ///
+    /// This is the guard for the frozen-picture bug. A seam of even a few
+    /// milliseconds is read by Chrome's MSE as a discontinuity when the frame
+    /// before it was truncated — and a discontinuity on the audio track sets
+    /// "need random access point" on the VIDEO track that shares the source
+    /// buffer, so the picture stops until the next IDR while the sound plays
+    /// on. It took a frame-presentation trace to see it: every counter the
+    /// player and the browser expose read healthy throughout.
+    ///
+    /// Video cuts land wherever an IDR falls, so the boundaries here are
+    /// deliberately off the audio grid — that misalignment is the whole point.
+    #[test]
+    fn consecutive_audio_fragments_leave_no_seam() {
+        let a = AudioTrack::aac([0x11, 0x90], 48000, 2, 128_000);
+        let mut s = AudioSegmenter::new(a, 2.0);
+        for i in 0..120u64 {
+            s.push(&[0xFF; 200], i * 1920); // 1024 samples @48k == 1920 ticks @90k
+        }
+
+        // Boundaries that do not fall on frame edges, as real IDR cuts do not.
+        let mut end: Option<u64> = None;
+        for boundary in [5000u64, 11_300, 17_900, 26_000, 33_333, 40_000] {
+            let Some((_seq, base, samples)) = s.take_pending_samples(boundary) else {
+                continue;
+            };
+            if let Some(prev_end) = end {
+                assert_eq!(
+                    base, prev_end,
+                    "fragment starts at {base} but the one before ended at {prev_end} — \
+                     a {} tick hole that costs the viewer a segment of picture",
+                    base as i64 - prev_end as i64
+                );
+            }
+            assert!(
+                samples.iter().all(|x| x.duration > 0),
+                "every audio sample must have a real duration"
+            );
+            end = Some(base + samples.iter().map(|x| x.duration as u64).sum::<u64>());
+        }
+        assert!(end.is_some(), "the fixture produced no fragments to check");
     }
 
     #[test]
