@@ -621,6 +621,65 @@ the real world — hls.js zeroes its timeline at whichever fragment it happened 
 load first, so `currentTime` means nothing across sessions. The scrub-preview
 index below depends on it, and so does any "what time was that?" surface.
 
+## Why the proxy rendition is encoded in software
+
+The DVR proxy is `x264`, on the CPU, even on a host with a working NVENC. That
+is a deliberate choice and it has been measured; this section exists so it is
+not "fixed" by somebody reading the CPU graph.
+
+### NVENC cannot express all-intra directly
+
+The proxy must be all-intra — that is the whole reason it exists, so a jog
+lands on a frame without decoding from a keyframe. `gop_size: 1` is how that is
+asked for, and **NVENC refuses it**:
+
+```
+[h264_nvenc] InitializeEncoder failed: invalid param (8):
+             Gop Length should be greater than number of B frames + 1
+```
+
+With `bf = 0` the check still demands `gop >= 2`, so there is no GOP setting
+that yields every-frame-intra. It is reachable only by forcing an IDR on each
+frame — `VideoEncoder::force_next_keyframe` does exactly that, and NVENC
+honours `AVFrame.pict_type = AV_PICTURE_TYPE_I` — but that is encoder-level
+work plus per-backend GOP sanitising, not a config change. Anything that
+silently accepted `gop_size: 1` on NVENC and produced a long-GOP stream would
+give a rendition that plays perfectly and cannot be jogged, which is the
+failure the manager's DVR page carries a badge for.
+
+### The encode is not where the cost is
+
+Measured on the z440 (Xeon E5-1650 v3, GTX 1080 Ti), 30 s of 1080p25 scaled to
+640x360:
+
+| pipeline | CPU |
+|---|---|
+| decode + scale only | 9.42 s |
+| decode + scale + x264 all-intra | 12.93 s |
+| decode + scale + NVENC forced-IDR | 10.06 s |
+| NVDEC + `scale_cuda` + NVENC | **0.39 s** |
+
+So the encode is **3.51 s of 12.93 s** — about a quarter. Moving only it to the
+GPU saves ~2.9 s per 30 s, roughly a tenth of one core. The decode and scale are
+the other three quarters, and they are what a GPU pipeline actually collapses:
+33x for the whole chain.
+
+### And it costs bitrate
+
+At the same 3000 kbps target, NVENC all-intra produced **1.10 MB** where x264
+produced **0.72 MB** for identical content — 53% larger. The proxy is what
+`balanced` mode streams and what a tablet pulls, and it has to stay readable
+frame by frame, so quality per bit is not a spare resource here.
+
+### Where that leaves it
+
+Moving the encode alone is not worth a tenth of a core against 53% more
+bitrate, encoder-level work, and a hard dependency on a GPU driver. A full GPU
+pipeline — NVDEC decode, CUDA scale, NVENC encode — is worth considering,
+because the decode is the real cost; it needs `hw_decode` plumbing that the
+CMAF path does not currently have at all, and it would tie the DVR to the
+NVIDIA stack on every host that runs one.
+
 ## Thumbnail track (`thumbnails`)
 
 Sprite sheets plus a WebVTT index, PUT to the same ingest as the media so they
