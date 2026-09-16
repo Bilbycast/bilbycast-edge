@@ -193,6 +193,16 @@ output was publishing is about to be replaced by an empty one, and the run will
 renumber from `seg-00000` over segments the origin still holds and still serves.
 That used to be silent — the only log line was on the success path.
 
+**It assumes an origin that prunes its served manifest to what it still
+holds.** The restored rows are re-advertised without probing that their `.m4s`
+objects still exist. The shipped relay origin satisfies this at PUT time —
+`trim_unbacked_head` head-trims every `.m3u8` against the segments the store
+currently holds — so the first manifest published after a restore drops any row
+the relay has since evicted, and a viewer never receives one it cannot fetch.
+An origin whose object retention is scoped to `seg-*` while keeping manifests
+indefinitely would not, and would already have been advertising unfetchable
+rows before any restart.
+
 **HLS only.** The read-back is of `manifest.m3u8`, which is published only when
 `manifests` includes `"hls"`. A `manifests: ["dash"]` output — the documented
 shape for HEVC — 404s on every restart and starts from an empty window,
