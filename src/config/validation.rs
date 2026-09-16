@@ -1561,7 +1561,7 @@ pub(crate) fn validate_replay_id(id: &str, label: &str) -> Result<()> {
 /// Validate a [`crate::config::models::RecordingConfig`]. Bounds-check the
 /// segment cadence, sanity-check the optional storage_id, and accept the
 /// retention / size caps as advisory (the writer enforces them at runtime).
-fn validate_recording_config(
+pub(crate) fn validate_recording_config(
     c: &crate::config::models::RecordingConfig,
     flow_id: &str,
 ) -> Result<()> {

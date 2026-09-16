@@ -1489,6 +1489,20 @@ pub fn edge_capabilities() -> Vec<&'static str> {
         // surface `replay_export_format_unsupported`.
         caps.push("replay_export_mp4");
     }
+    // DVR clip export — this binary runs the clip poller, so a DVR session
+    // pointed at it will actually have its marks cut.
+    //
+    // Advertised for the vintage, not for a feature flag: `engine::cmaf::clips`
+    // is compiled in unconditionally, and an edge that predates it simply never
+    // polls, so every mark a viewer makes stays pending on the relay for the
+    // life of the session while the node streams perfectly. That failure is
+    // indistinguishable from success from every surface an operator looks at,
+    // which is exactly the shape the capability rule exists for.
+    //
+    // It says "clips will be cut", not "cut to the frame". Frame-exact cutting
+    // additionally needs the `replay` recorder (above) plus an encoder; without
+    // them the exporter still answers, on segment boundaries.
+    caps.push("clip-export");
     if cfg!(any(
         feature = "video-encoder-x264",
         feature = "video-encoder-x265",
@@ -2129,12 +2143,29 @@ async fn execute_command(
             Ok(None)
         }
         "update_flow" => {
-            let new_flow: FlowConfig = serde_json::from_value(action["flow"].clone())
+            let mut new_flow: FlowConfig = serde_json::from_value(action["flow"].clone())
                 .map_err(|e| format!("Invalid flow config: {e}"))?;
-            validate_flow(&new_flow).map_err(|e| CommandError::from_validation("Invalid flow config", e))?;
             let flow_id = action["flow_id"]
                 .as_str()
-                .unwrap_or(&new_flow.id);
+                .unwrap_or(&new_flow.id)
+                .to_string();
+            let flow_id = flow_id.as_str();
+            // `recording` has a second owner — `configure_recording` — so a
+            // payload that does not model the field must not clear it. See
+            // `hold_recording` for why that matters: `recording` is in
+            // `flow_fields_requiring_restart`, so losing it both disarms a live
+            // DVR session's recorder and takes the flow off air to do it.
+            if !action["flow"]
+                .as_object()
+                .is_some_and(|o| o.contains_key("recording"))
+                && let Some(prev) = {
+                    let cfg = app_config.read().await;
+                    cfg.flows.iter().find(|f| f.id == flow_id).and_then(|f| f.recording.clone())
+                }
+            {
+                new_flow.recording = Some(prev);
+            }
+            validate_flow(&new_flow).map_err(|e| CommandError::from_validation("Invalid flow config", e))?;
             tracing::info!("Manager command: update flow '{flow_id}' (diff-based)");
 
             // Get old flow config for comparison
@@ -3349,6 +3380,8 @@ async fn execute_command(
             // validation and before the flow diff, so every later stage —
             // including `resolve_flow` on a restart — sees the held value.
             hold_active_inputs(&old_config, &mut new_config);
+            // Same rule for the recorder, which `configure_recording` owns.
+            hold_recording(&old_config, &mut new_config, &action["config"]);
 
             validate_config(&new_config).map_err(|e| CommandError::from_validation("Invalid config", e))?;
             tracing::info!("Manager command: update_config (diff-based)");
@@ -4680,17 +4713,10 @@ async fn execute_command(
             let flow_id = action["flow_id"]
                 .as_str()
                 .ok_or("configure_recording: missing 'flow_id'")?;
-            let recording: Option<crate::config::models::RecordingConfig> =
-                if action["recording"].is_null() {
-                    None
-                } else {
-                    Some(
-                        serde_json::from_value(action["recording"].clone())
-                            .map_err(|e| format!("Invalid recording config: {e}"))?,
-                    )
-                };
-            let armed = recording.is_some();
+            let incoming = action["recording"].clone();
+            let armed = !incoming.is_null();
             let was_running = flow_manager.is_running(flow_id);
+            let changed;
             {
                 let mut cfg = app_config.write().await;
                 let flow = cfg
@@ -4698,17 +4724,72 @@ async fn execute_command(
                     .iter_mut()
                     .find(|f| f.id == flow_id)
                     .ok_or_else(|| CommandError::new(format!("Unknown flow '{flow_id}'")))?;
+
+                let recording: Option<crate::config::models::RecordingConfig> = if incoming
+                    .is_null()
+                {
+                    None
+                } else {
+                    let mut rec: crate::config::models::RecordingConfig =
+                        serde_json::from_value(incoming.clone())
+                            .map_err(|e| format!("Invalid recording config: {e}"))?;
+                    // Merge, do not replace.
+                    //
+                    // The caller models five keys — enabled, storage_id,
+                    // segment_seconds, retention_seconds, max_bytes — and the
+                    // struct has two more. Deserialising a five-key object
+                    // gives `None` for both, so a plain assignment deletes an
+                    // operator's `pre_buffer_seconds` and `filmstrip_seconds`
+                    // on the flow it arms: the /replay scrubber strip stops
+                    // being generated as a side effect of starting a DVR
+                    // session. Absent means "not modelled", not "clear it";
+                    // an explicit `null` still clears, which is what a caller
+                    // that does model the field would send.
+                    if let Some(prev) = flow.recording.as_ref() {
+                        let obj = incoming.as_object();
+                        let omitted = |k: &str| obj.is_none_or(|o| !o.contains_key(k));
+                        if omitted("pre_buffer_seconds") {
+                            rec.pre_buffer_seconds = prev.pre_buffer_seconds;
+                        }
+                        if omitted("filmstrip_seconds") {
+                            rec.filmstrip_seconds = prev.filmstrip_seconds;
+                        }
+                    }
+                    // Validate before it reaches config.json. Every other
+                    // config-mutating arm validates first, and this one has to
+                    // for a sharper reason than symmetry: the flow-id charset
+                    // is wider than the replay-id charset, so arming a DVR
+                    // session on a legally-named flow like `stadium.cam1`
+                    // persists a `storage_id` that `validate_config` refuses at
+                    // the node's NEXT start — the process exits, and it no
+                    // longer has a manager socket to be repaired through.
+                    crate::config::validation::validate_recording_config(&rec, flow_id).map_err(
+                        |e| CommandError::from_validation("Invalid recording config", e),
+                    )?;
+                    Some(rec)
+                };
+
+                // "Did anything change", not "is the flow up".
+                //
+                // The manager fires `restart_flow` on this flag, so answering
+                // `is_running` restarts a live flow — every output on it,
+                // including another session's renditions — for a write that
+                // changed nothing. Activating a second DVR session on a flow
+                // already recording at an equal-or-wider window produces a
+                // byte-identical block, and that is the common case.
+                changed = flow.recording != recording;
                 flow.recording = recording;
                 persist_config(&cfg, config_path, secrets_path).await?;
             }
+            let restart_required = was_running && changed;
             tracing::info!(
                 "Manager command: configure_recording on flow '{flow_id}' \
-                 (armed={armed}, restart_required={was_running})"
+                 (armed={armed}, changed={changed}, restart_required={restart_required})"
             );
             Ok(Some(serde_json::json!({
                 "flow_id": flow_id,
                 "armed": armed,
-                "restart_required": was_running,
+                "restart_required": restart_required,
             })))
         }
         #[cfg(feature = "replay")]
@@ -6227,6 +6308,53 @@ fn hold_active_inputs(old: &AppConfig, new: &mut AppConfig) {
     }
 }
 
+/// Hold a flow's recorder across a whole-config push that does not model it.
+///
+/// `flow.recording` has a second owner: `configure_recording`, which the
+/// manager's DVR provisioning uses to arm a recorder on whatever flow an
+/// operator nominated — including one hand-written in this node's own config,
+/// which the manager has no row for. Nothing writes that value back into the
+/// manager's cached copy of the config, so the cached copy predates the arming.
+///
+/// Pushing that cached copy back would then deserialise `recording` as `None`,
+/// and `recording` is in [`flow_fields_requiring_restart`] — so a config-history
+/// restore, a visual deploy, or a reconcile retry would both disarm the live
+/// DVR session's recorder *and* take the flow off air to do it, leaving the
+/// session reading healthy while every later clip silently degrades to
+/// whole-segment precision.
+///
+/// The test is key presence in the pushed JSON, not `None` after
+/// deserialisation: **absent** means "this caller does not model the field",
+/// while an explicit `"recording": null` is a caller that does model it and
+/// means to clear it. That distinction is what keeps the manager's flow modal —
+/// which does round-trip `recording` — able to turn recording off.
+fn hold_recording(old: &AppConfig, new: &mut AppConfig, pushed: &serde_json::Value) {
+    let pushed_flows = pushed.get("flows").and_then(|f| f.as_array());
+    for flow in &mut new.flows {
+        let modelled = pushed_flows.is_some_and(|flows| {
+            flows.iter().any(|f| {
+                f.get("id").and_then(|v| v.as_str()) == Some(flow.id.as_str())
+                    && f.get("recording").is_some()
+            })
+        });
+        if modelled {
+            continue;
+        }
+        let Some(prev) = old.flows.iter().find(|f| f.id == flow.id).and_then(|f| f.recording.clone())
+        else {
+            continue;
+        };
+        if flow.recording.as_ref() != Some(&prev) {
+            tracing::info!(
+                "Config diff: holding flow '{}' recorder as configured — the push does not \
+                 model `recording`, which the configure_recording command owns",
+                flow.id,
+            );
+        }
+        flow.recording = Some(prev);
+    }
+}
+
 /// The flow-level fields whose change forces a full restart of a running
 /// flow, named. Empty means nothing restart-worthy changed.
 ///
@@ -6477,6 +6605,88 @@ mod hold_active_inputs_tests {
         let mut pushed = config(&[("a", true), ("spare", true)], passthrough(&["a"]));
         hold_active_inputs(&on_node, &mut pushed);
         assert_eq!(active_of(&pushed), vec!["a", "spare"]);
+    }
+}
+
+#[cfg(test)]
+mod hold_recording_tests {
+    use super::hold_recording;
+    use crate::config::models::AppConfig;
+
+    fn config(flow: serde_json::Value) -> (AppConfig, serde_json::Value) {
+        let blob = serde_json::json!({
+            "version": 2,
+            "server": {"listen_addr": "127.0.0.1", "listen_port": 8080},
+            "inputs": [], "outputs": [], "flows": [flow]
+        });
+        (serde_json::from_value(blob.clone()).expect("fixture"), blob)
+    }
+
+    fn armed() -> serde_json::Value {
+        serde_json::json!({"enabled": true, "storage_id": "f", "segment_seconds": 10})
+    }
+
+    /// The failure this exists for: `configure_recording` armed the recorder,
+    /// the manager's cached config predates that, and replaying it would both
+    /// disarm the live DVR session and restart the flow to do it — because
+    /// `recording` is a restart-forcing field.
+    #[test]
+    fn a_push_that_does_not_model_recording_cannot_disarm_it() {
+        let (on_node, _) = config(serde_json::json!({
+            "id": "f", "name": "F", "input_ids": ["a"], "recording": armed()
+        }));
+        let (mut stale, blob) =
+            config(serde_json::json!({"id": "f", "name": "F", "input_ids": ["a"]}));
+        hold_recording(&on_node, &mut stale, &blob);
+        assert_eq!(
+            stale.flows[0].recording,
+            on_node.flows[0].recording,
+            "the armed recorder must survive a push that says nothing about it"
+        );
+    }
+
+    /// A caller that *does* model the field keeps its authority: an explicit
+    /// null is the flow modal turning recording off, and must not be undone.
+    #[test]
+    fn an_explicit_null_still_clears_it() {
+        let (on_node, _) = config(serde_json::json!({
+            "id": "f", "name": "F", "input_ids": ["a"], "recording": armed()
+        }));
+        let (mut pushed, blob) = config(serde_json::json!({
+            "id": "f", "name": "F", "input_ids": ["a"], "recording": null
+        }));
+        hold_recording(&on_node, &mut pushed, &blob);
+        assert!(
+            pushed.flows[0].recording.is_none(),
+            "a push that models `recording` owns the answer"
+        );
+    }
+
+    /// And a modelled change is applied, not held.
+    #[test]
+    fn a_modelled_edit_is_applied() {
+        let (on_node, _) = config(serde_json::json!({
+            "id": "f", "name": "F", "input_ids": ["a"], "recording": armed()
+        }));
+        let (mut pushed, blob) = config(serde_json::json!({
+            "id": "f", "name": "F", "input_ids": ["a"],
+            "recording": {"enabled": false, "storage_id": "f", "segment_seconds": 10}
+        }));
+        hold_recording(&on_node, &mut pushed, &blob);
+        assert_eq!(
+            pushed.flows[0].recording.as_ref().map(|r| r.enabled),
+            Some(false)
+        );
+    }
+
+    /// A flow that never had a recorder gains nothing.
+    #[test]
+    fn a_flow_with_no_recorder_is_left_alone() {
+        let (on_node, _) = config(serde_json::json!({"id": "f", "name": "F", "input_ids": ["a"]}));
+        let (mut pushed, blob) =
+            config(serde_json::json!({"id": "f", "name": "F", "input_ids": ["a"]}));
+        hold_recording(&on_node, &mut pushed, &blob);
+        assert!(pushed.flows[0].recording.is_none());
     }
 }
 

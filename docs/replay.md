@@ -86,7 +86,7 @@ section.)
 | `src/replay/export_mp4.rs` | TS→fMP4 export (`replay_export_mp4` capability) |
 | `src/engine/input_replay.rs` | Replay input task; per-input command channel; lifecycle events |
 | `src/engine/flow.rs` | `FlowRuntime.recording_handle` lifecycle; spawn/teardown |
-| `src/manager/client.rs` (replay dispatch arms, `start_recording` through the `cue_clip \| play_clip \| stop_playback \| scrub_playback \| set_speed \| step_frame` arm) | WS command dispatch — 17 arms covering 22 command names, all `#[cfg(feature = "replay")]`-gated |
+| `src/manager/client.rs` (replay dispatch arms, `start_recording` through the `cue_clip \| play_clip \| stop_playback \| scrub_playback \| set_speed \| step_frame` arm) | WS command dispatch — 18 arms covering 23 command names, all `#[cfg(feature = "replay")]`-gated |
 
 ## Storage layout
 
@@ -364,6 +364,49 @@ flow-form recording fields, the dedicated `/replay` page link, the
 to a non-replay edge fall through to the generic `unknown_action` ack
 path, so old edges don't trip on new commands.
 
+`"clip-export"` is a separate bit and is advertised **unconditionally**,
+because `engine::cmaf::clips` is compiled in unconditionally. It answers a
+different question: *will a mark a viewer places actually get cut?* An edge
+that predates clip export runs no poller, so every mark stays pending on the
+relay for the life of the session while the node streams perfectly — a
+degradation indistinguishable from success on every surface an operator looks
+at, which is why the manager refuses to provision a DVR session against a node
+that does not advertise it. The bit promises a clip, not a frame-exact one:
+cutting to the frame additionally needs the `replay` recorder armed on the
+source flow (see [Clip export](#clip-export)), and without it the exporter
+falls back to whole segments.
+
+### Arming the recorder: `configure_recording`
+
+A DVR session points at whatever flow an operator nominates, including one
+hand-written in this node's own config that the manager has no row for.
+`update_flow` could arm it, but only by taking a **whole** `FlowConfig` the
+caller would have to reconstruct — and every field it did not model would be
+silently lost. `configure_recording { flow_id, recording }` sets or clears one
+flow's `RecordingConfig` and persists it, touching nothing else;
+`"recording": null` clears it, which is what a session teardown wants.
+
+Three properties worth knowing:
+
+* **It validates.** The block goes through `validate_recording_config` before
+  it reaches `config.json`. Skipping that was a latent node-down bug: the
+  flow-id charset is wider than the replay-id charset, so arming a session on a
+  legally-named flow such as `stadium.cam1` persisted a `storage_id` the
+  boot-time validator refuses — the node ran on until its next restart and then
+  would not come back, with no manager socket left to repair it through.
+* **It merges, it does not replace.** A caller that models five keys does not
+  delete the two it does not (`pre_buffer_seconds`, `filmstrip_seconds`). An
+  explicit `null` still clears a field; an absent key means "not modelled".
+* **`restart_required` answers "did the value change", not "is the flow up".**
+  The recorder binds at flow spawn, so a genuine change does need a restart —
+  but a byte-identical re-arm (a second DVR session on a flow already recording
+  at an equal-or-wider window) must not take a live feed off air for a write
+  that changed nothing.
+
+The field has two owners as a result, so a whole-config push that does not
+model `recording` holds the value the node already has rather than clearing it
+— the same rule, and the same reason, as `hold_active_inputs`.
+
 ## Filmstrip
 
 Opt-in JPEG thumbnails written alongside the segments so the manager's
@@ -597,14 +640,21 @@ The exported bytes are **packet-aligned MPEG-TS** — the manager can
 concatenate chunks in order and serve the result as
 `Content-Type: application/mp2t` without resyncing the first byte.
 
-**MP4 export has shipped.** Passing `format: "mp4"` runs the
-`src/replay/export_mp4.rs` TS→fragmented-MP4 remuxer (reuses the CMAF
-fMP4 box writer): video H.264 (`avc1`) / HEVC (`hvc1`), audio AAC
-(`mp4a`) / AC-3 / E-AC-3 / MP2. The remuxer assumes PTS == DTS (DTS
-recovery via PES parsing is a follow-up), builds the file one-shot into
-a 5-minute-TTL in-memory cache, and caps exports at 256 MiB —
-over-cap clips fail with `replay_export_too_large` (download TS
-instead). Unsupported essence (MPEG-2 video, Opus audio) surfaces
+**MP4 export has shipped.** Passing `format: "mp4"` runs
+`src/replay/export_mp4.rs`, which builds a **progressive** MP4 — one `moov`
+carrying real sample tables (`stts` / `stss` / `stsc` / `stsz` / `stco`) ahead
+of one `mdat`, not the fragmented shape the CMAF path publishes. Audio is AAC
+(`mp4a`) / AC-3 / E-AC-3 / MP2, remuxed and never re-encoded. **Video is not a
+remux**: on any build carrying an x264 encoder — which is all three release
+artefacts — the range is decoded and re-encoded all-intra (`gop_size = 1`,
+CRF 20, no B-frames, H.264 out whatever went in), because that is what makes a
+clip step; a build with no encoder falls back to the source's own GOP structure
+with a log line. See [The shape of the file](#the-shape-of-the-file) for why.
+The demuxer assumes PTS == DTS (DTS recovery via PES parsing is a follow-up).
+The result is built one-shot into a bounded in-memory cache (5-minute TTL, byte
+and entry ceilings, LRU) and refused past 256 MiB **on the built file**, not on
+the source range — over-cap exports fail with `replay_export_too_large`
+(download TS instead). Unsupported essence (MPEG-2 video, Opus audio) surfaces
 `replay_export_format_unsupported`. The edge advertises the
 `replay_export_mp4` capability so the manager UI lights up the ⬇ MP4
 button alongside ⬇ TS.
@@ -615,8 +665,9 @@ button alongside ⬇ TS.
 range an operator creates in the manager UI, stored in `clips.json` and played
 back or exported through `export_clip`. A *clip export* starts in the browser
 DVR player: a viewer marks a moment, asks for so many seconds either side, and
-gets an MP4 on their portal sign-in page. The two share this recording and
-nothing else.
+gets an MP4 on their portal sign-in page. The two share this recording, the
+progressive muxer and the all-intra re-encode — the difference is who asks and
+where the answer lands.
 
 The recorder is what makes the export exact, which is why a DVR session arms one
 unconditionally — see the relay's [distribution.md](../../bilbycast-relay/docs/distribution.md)
@@ -636,7 +687,8 @@ token as well as a viewer's, for both the clip list and the objects behind it.
 Two paths, in order:
 
 1. **Exact, from this recording.** The mark's wall clock maps to a PTS through
-   the anchor, and `export_recording_mp4_chunk` remuxes that range to fMP4.
+   the anchor, and the exporter builds that range into the progressive,
+   all-intra MP4 described below.
 2. **Whole segments, from the relay's origin.** Used when there is no recording
    for the flow, or the moment predates it. The clip is assembled from the init
    segment plus every segment overlapping the window, so it lands on segment
@@ -720,9 +772,13 @@ Two things address it, and neither is a leak fix because there is no leak:
 
 * the clip exporter trims when each cut finishes, so a burst is given back
   immediately rather than waiting;
-* `main` runs a trimmer every three minutes for everything else. Slow on
-  purpose — it takes each arena's lock in turn and this process has real-time
-  work on those threads.
+* `main` runs a trimmer every minute for everything else, on a blocking
+  thread rather than a runtime worker. Every minute rather than every three
+  because the live path churns about 330 MB/min of transient allocation, so at
+  three the resident size oscillated between 1.6 GB and 2.6 GB and at one it
+  stays within a few hundred megabytes of the floor. It is still deliberately
+  slow: it takes each arena's lock in turn and this process has real-time work
+  on those threads.
 
 Worth recognising, because it looks exactly like a leak from the outside: RSS
 climbing steadily on a process that is doing nothing unusual, with no single
