@@ -186,11 +186,11 @@ fn parse_playlist(body: &str) -> Vec<SegmentEntry> {
 /// Overlap rather than containment: a window that starts halfway through a
 /// segment still needs that segment, or the clip opens after the moment the
 /// operator marked.
-fn covering<'a>(
-    segments: &'a [SegmentEntry],
+fn covering(
+    segments: &[SegmentEntry],
     from: DateTime<Utc>,
     to: DateTime<Utc>,
-) -> Vec<&'a SegmentEntry> {
+) -> Vec<&SegmentEntry> {
     segments
         .iter()
         .filter(|s| {
