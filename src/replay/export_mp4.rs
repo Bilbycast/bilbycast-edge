@@ -29,10 +29,21 @@
 //!   (`ec-3` + `dec3`), MP2 (`mp4a` + `esds` with MPEG-1-Audio OTI).
 //!   Opus surfaces `replay_export_format_unsupported` because
 //!   `engine::ts_demux` doesn't yet extract Opus PES payload.
-//! - **PTS == DTS assumption.** ts_demux only recovers PTS today.
-//!   B-frame streams (most main / high profile broadcast) may decode
-//!   in incorrect display order in some players. The follow-up to
-//!   recover DTS through PES parsing is tracked separately.
+//! - **PTS == DTS assumption, on the fallback path only.** ts_demux
+//!   recovers PTS but not DTS. The all-intra re-encode is unaffected: the
+//!   decoder is fed in the order the transport carried the frames and its
+//!   output is labelled in display order, and what it emits has no B-frames.
+//!   When the re-encode is unavailable the source samples are written in
+//!   display order with DTS == PTS, so a B-frame source (most main / high
+//!   profile broadcast) may decode in the wrong order in some players. The
+//!   follow-up to recover DTS through PES parsing is tracked separately.
+//! - **The two tracks open on the same instant, by PTS.** A transport
+//!   stream muxes video ahead of its PTS by the VBV delay and audio by much
+//!   less, so at any byte position the first audio frame is earlier than the
+//!   first picture by hundreds of milliseconds. Leading audio that ends
+//!   before the first kept picture is dropped; on the re-encoded path, where
+//!   every frame is a keyframe, leading video that ends before the first
+//!   audio frame is dropped too. Residual within one frame either way.
 //! - **One-shot build, bounded in-memory cache.** Both the source range and
 //!   the essence about to be muxed are capped at 256 MiB; over-cap exports
 //!   fail with `replay_export_too_large` and the operator should download TS.
@@ -442,7 +453,7 @@ fn build_mp4_from_ts(ts: &[u8]) -> Result<Vec<u8>> {
     // Build the audio track + per-sample list. AAC takes the
     // already-split frames; AC-3 / E-AC-3 / MP2 split each PES blob on
     // the codec's sync word and assign per-frame PTS from frame size.
-    let (audio_track, audio_samples_built) = if !aac_pts.is_empty() {
+    let (audio_track, audio_samples_built, audio_pts) = if !aac_pts.is_empty() {
         let (profile, sr_idx, ch_cfg) = demux
             .cached_aac_config()
             .ok_or_else(|| anyhow!("replay_export_failed: missing AAC config"))?;
@@ -461,7 +472,10 @@ fn build_mp4_from_ts(ts: &[u8]) -> Result<Vec<u8>> {
                 is_sync: true,
             })
             .collect();
-        (Some(track), samples)
+        // The demuxer dates every ADTS frame; that is what the two tracks
+        // are aligned on below.
+        let pts: Vec<u64> = aac_pts.iter().map(|(pts, _)| *pts).collect();
+        (Some(track), samples, pts)
     } else if !other_audio.is_empty() {
         let stream_type = other_audio[0].1;
         match stream_type {
@@ -475,12 +489,8 @@ fn build_mp4_from_ts(ts: &[u8]) -> Result<Vec<u8>> {
             _ => bail!("replay_export_format_unsupported"),
         }
     } else {
-        (None, Vec::new())
+        (None, Vec::new(), Vec::new())
     };
-
-    // Sort video PTS to defend against minor packet reordering at the
-    // PES boundary; demux already returns frames in order in practice.
-    video_pts.sort_by_key(|t| t.0);
 
     // ── Re-encode all-intra ────────────────────────────────────────────────
     //
@@ -496,15 +506,21 @@ fn build_mp4_from_ts(ts: &[u8]) -> Result<Vec<u8>> {
     // forward and back, in anything that opens it.
     //
     // Audio is left alone: AAC frames are already independently decodable.
+    //
+    // Handed over in the order the transport carried the frames. That is
+    // decode order, which is the only order a decoder accepts: sorting by PTS
+    // first put every B-frame ahead of the reference it predicts from, and
+    // the decoder concealed the missing picture and emitted a corrupt one,
+    // which x264 then faithfully re-encoded as an IDR.
     let reencoded = reencode_all_intra(&video_pts, &video_track, &demux);
-    let (video_pts, video_track, reencode_trimmed_ticks) = match reencoded {
-        Ok((frames, track, trimmed)) => {
+    let (video_pts, video_track, video_all_sync) = match reencoded {
+        Ok((frames, track)) => {
             // Shadowing does not drop. The source list is a whole clip's worth
             // of NAL payloads and the re-encoded one is larger again, so
             // letting the old binding live to the end of the function held two
             // full copies of the essence for no reason.
             drop(video_pts);
-            (frames, track, trimmed)
+            (frames, track, true)
         }
         Err(e) => {
             // A clip that exists beats no clip. The operator gets the source
@@ -512,9 +528,14 @@ fn build_mp4_from_ts(ts: &[u8]) -> Result<Vec<u8>> {
             // reason is in the log rather than in a failed export.
             tracing::warn!(
                 error = %e,
-                "replay export: could not re-encode all-intra;                  falling back to the source's own GOP structure"
+                "replay export: could not re-encode all-intra; \
+                 falling back to the source's own GOP structure"
             );
-            (video_pts, video_track, 0)
+            // Written in display order with DTS == PTS — the documented
+            // limitation of this path. The sort also absorbs minor reordering
+            // at the PES boundary.
+            video_pts.sort_by_key(|t| t.0);
+            (video_pts, video_track, false)
         }
     };
 
@@ -532,6 +553,9 @@ fn build_mp4_from_ts(ts: &[u8]) -> Result<Vec<u8>> {
     // players refuse. The live CMAF path already picks by the encoder's family.
     let is_h265 = matches!(video_track.codec, CmafVideoCodec::H265);
     let mut video_samples: Vec<Sample> = Vec::with_capacity(video_pts.len());
+    // The PTS of each sample in `video_samples`, index for index. Frames the
+    // NAL filter empties are skipped from both, so the two stay aligned.
+    let mut video_sample_pts: Vec<u64> = Vec::with_capacity(video_pts.len());
     for (i, (pts, nalus, is_sync)) in video_pts.iter().enumerate() {
         let next_pts = video_pts.get(i + 1).map(|t| t.0).unwrap_or(*pts + 3000);
         let duration = (next_pts.saturating_sub(*pts)) as u32;
@@ -550,14 +574,11 @@ fn build_mp4_from_ts(ts: &[u8]) -> Result<Vec<u8>> {
             composition_time_offset: 0,
             is_sync: *is_sync,
         });
+        video_sample_pts.push(*pts);
     }
     if video_samples.is_empty() {
         bail!("replay_no_video_frames");
     }
-    // Anchor video DTS at 0 so the timeline reads "0:00" in players.
-    let _video_pts_base = video_pts.first().map(|t| t.0).unwrap_or(0);
-
-    let audio_samples = audio_samples_built;
 
     // ── Open on a keyframe ─────────────────────────────────────────────────
     //
@@ -571,35 +592,54 @@ fn build_mp4_from_ts(ts: &[u8]) -> Result<Vec<u8>> {
     // 41 decoded to nothing at all, and the first sync sample sat at 41.
     //
     // The re-encoder does the same trim on the way in, for the same reason —
-    // it cannot decode those frames either — and what it discards has to be
-    // counted here too. It marks every frame it emits as sync, so `first_sync`
-    // is 0 on the re-encoded path and the sum below is over an empty slice: the
-    // audio drain was therefore skipped on exactly the path every release
-    // artefact takes, and every clip shipped with the audio leading the video
-    // by the length of the discarded lead-in. Tens of times gate 3's ±40 ms.
+    // it cannot decode those frames either — so `first_sync` is 0 on that
+    // path and this finds nothing left to do.
     let first_sync = video_samples.iter().position(|s| s.is_sync).unwrap_or(0);
-    let dropped_ticks = leading_trim_ticks(reencode_trimmed_ticks, &video_samples, first_sync);
     if first_sync > 0 {
-        tracing::debug!(
-            dropped = first_sync, ticks = dropped_ticks,
-            "replay export: trimming to the first keyframe"
-        );
+        tracing::debug!(dropped = first_sync, "replay export: trimming to the first keyframe");
         video_samples.drain(..first_sync);
+        video_sample_pts.drain(..first_sync);
     }
 
-    // Audio follows the video by time, not by sample count: the two tracks
-    // start together at decode time zero, so dropping the same *duration*
-    // keeps them in step. Rounded down, so audio never starts late.
-    let mut audio_samples = audio_samples;
-    if dropped_ticks > 0 && !audio_samples.is_empty() {
-        let audio_ts = audio_track.as_ref().map(|a| a.sample_rate as u64).unwrap_or(0);
-        let drop_n = audio_samples_to_drop(
-            dropped_ticks,
-            video_track.timescale,
-            audio_ts,
-            &audio_samples,
+    // ── Start the two tracks together ──────────────────────────────────────
+    //
+    // Both are written anchored at decode time zero with no edit list, so
+    // whatever sample opens each track is what plays at 0:00 — and the two
+    // do not open on the same instant in a transport stream. Video is muxed
+    // ahead of its PTS by the VBV delay and audio by far less, so at the byte
+    // the range starts on the first audio frame is earlier than the first
+    // picture by hundreds of milliseconds. Counting audio out by the length
+    // of the video's own lead-in trim kept the two tracks' *offsets* equal
+    // and left that skew in every clip, audio ahead, well past gate 3's
+    // ±40 ms. Aligning on PTS is the only thing that removes it: audio that
+    // ends before the first kept picture goes, and on the all-intra path —
+    // where every picture is a keyframe and any of them can open the file —
+    // video that ends before the first kept audio frame goes too.
+    let mut audio_samples = audio_samples_built;
+    let mut audio_pts = audio_pts;
+    let audio_frame_ticks = audio_track
+        .as_ref()
+        .zip(audio_samples.first())
+        .map(|(a, first)| first.duration as u64 * 90_000 / (a.sample_rate as u64).max(1))
+        .unwrap_or(0);
+    let (drop_audio, drop_video) = align_tracks(
+        &video_sample_pts,
+        &audio_pts,
+        audio_frame_ticks,
+        video_all_sync,
+    );
+    if drop_audio > 0 || drop_video > 0 {
+        tracing::debug!(
+            drop_audio, drop_video,
+            "replay export: aligning the two tracks on the same instant"
         );
-        audio_samples.drain(..drop_n);
+        audio_samples.drain(..drop_audio);
+        audio_pts.drain(..drop_audio);
+        video_samples.drain(..drop_video);
+        video_sample_pts.drain(..drop_video);
+    }
+    if video_samples.is_empty() {
+        bail!("replay_no_video_frames");
     }
 
     // ── A progressive file, not a fragmented one ───────────────────────────
@@ -644,52 +684,43 @@ fn build_mp4_from_ts(ts: &[u8]) -> Result<Vec<u8>> {
     Ok(buf)
 }
 
-/// How much of the front of the clip the video lost, in video ticks.
+/// How many leading audio samples and leading video samples to drop so the
+/// two tracks open on the same instant.
 ///
-/// Two trims, one number. The muxer drops whatever precedes the first sync
-/// sample, and the all-intra re-encoder has already dropped the same lead-in
-/// on its own way in — for the same reason, because neither can decode it.
-///
-/// Counting only the first is what made every clip on a release artefact lose
-/// lip sync: the re-encoder marks every frame it emits as sync, so `first_sync`
-/// is 0, the slice below is empty, and the audio drain that keeps the two
-/// tracks starting together never ran. Both tracks are written anchored at
-/// decode time zero with no edit list, so the audio simply led the picture by
-/// the length of the discarded lead-in.
-fn leading_trim_ticks(reencode_trimmed: u64, video_samples: &[Sample], first_sync: usize) -> u64 {
-    reencode_trimmed
-        + video_samples[..first_sync.min(video_samples.len())]
-            .iter()
-            .map(|s| s.duration as u64)
-            .sum::<u64>()
-}
-
-/// How many leading audio samples to drop so the two tracks still start
-/// together after the video lost `dropped_ticks` off its front.
-///
-/// Audio follows the video by *time*, not by sample count, and rounds down so
-/// the audio never starts late. Returns 0 when there is no audio timescale to
-/// convert through, which is the "no audio track" case.
-fn audio_samples_to_drop(
-    dropped_ticks: u64,
-    video_timescale: u32,
-    audio_rate: u64,
-    audio: &[Sample],
-) -> usize {
-    if audio_rate == 0 || video_timescale == 0 {
-        return 0;
+/// `video_pts` and `audio_pts` are the 90 kHz timestamps of the samples each
+/// track would otherwise open with, in order; `audio_frame_ticks` is the
+/// length of one audio frame in the same units. Audio is dropped while a
+/// frame ends at or before the first picture. Video is dropped while a
+/// picture ends at or before the first remaining audio frame — but only
+/// when `video_all_sync`, because on the fallback path the first sample is
+/// the one keyframe the rest of the GOP decodes against and cannot go. What
+/// is left starts within one frame of the other track, either way round.
+fn align_tracks(
+    video_pts: &[u64],
+    audio_pts: &[u64],
+    audio_frame_ticks: u64,
+    video_all_sync: bool,
+) -> (usize, usize) {
+    let (Some(&first_video), Some(_)) = (video_pts.first(), audio_pts.first()) else {
+        return (0, 0);
+    };
+    let drop_audio = audio_pts
+        .iter()
+        .take_while(|&&a| a.saturating_add(audio_frame_ticks) <= first_video)
+        .count();
+    let Some(&first_audio) = audio_pts.get(drop_audio) else {
+        // Every audio frame ends before the picture starts: none of it belongs
+        // in this clip. The caller writes a video-only file.
+        return (drop_audio, 0);
+    };
+    if !video_all_sync || first_audio <= first_video {
+        return (drop_audio, 0);
     }
-    let want = dropped_ticks * audio_rate / video_timescale as u64;
-    let mut acc = 0u64;
-    let mut drop_n = 0usize;
-    for sm in audio {
-        if acc + sm.duration as u64 > want {
-            break;
-        }
-        acc += sm.duration as u64;
-        drop_n += 1;
-    }
-    drop_n
+    let drop_video = video_pts
+        .windows(2)
+        .take_while(|w| w[1] <= first_audio)
+        .count();
+    (drop_audio, drop_video)
 }
 
 /// The typical gap between one frame and the next, in 90 kHz ticks.
@@ -708,19 +739,21 @@ fn median_step(frames: &[(u64, Vec<Vec<u8>>, bool)]) -> Option<u64> {
 
 /// Re-encode a cut so every frame is an IDR.
 ///
-/// Returns the new frame list, a track description built from the **encoder's**
-/// parameter sets — not the source's: the SPS/PPS change with the encode, and
-/// an `avcC` carrying the old ones describes a stream that no longer exists —
-/// and **how many source ticks were discarded off the front**.
+/// `frames` must be in the order the transport carried them — decode order —
+/// because that is the only order a decoder accepts. What comes back is in
+/// display order, labelled with the source's own timestamps: a decoder emits
+/// pictures in display order, so the k-th picture out carries the k-th
+/// smallest PTS that went in. See [`display_order_labels`].
 ///
-/// That last value is not bookkeeping. This function trims the undecodable
-/// lead-in before the first keyframe and then marks every frame it emits as
-/// sync, so the caller's own "open on a keyframe" trim finds nothing left to do
-/// and its compensating audio drain never runs. Without the number coming back
-/// out, the audio kept every frame from the start of the byte range while the
-/// video started a GOP later, and both tracks were written anchored at decode
-/// time zero with no edit list — audio ahead of picture by the length of the
-/// trim, on every clip, on every build that has an encoder.
+/// The track description is built from the **encoder's** parameter sets, not
+/// the source's: the SPS/PPS change with the encode, and an `avcC` carrying
+/// the old ones describes a stream that no longer exists.
+///
+/// The undecodable lead-in before the first keyframe is trimmed on the way in,
+/// and every frame that comes out is marked sync. The caller aligns the audio
+/// against the timestamps that come back, not against how much was trimmed —
+/// see the alignment step in `build_mp4_from_ts` for why the two are not the
+/// same number.
 ///
 /// Errors rather than panicking on anything missing, because the caller's
 /// answer to a failed re-encode is to ship the source GOP instead — a clip
@@ -730,7 +763,7 @@ fn reencode_all_intra(
     frames: &[(u64, Vec<Vec<u8>>, bool)],
     source: &VideoTrack,
     demux: &TsDemuxer,
-) -> Result<(Vec<(u64, Vec<Vec<u8>>, bool)>, VideoTrack, u64)> {
+) -> Result<(Vec<(u64, Vec<Vec<u8>>, bool)>, VideoTrack)> {
     use crate::config::models::VideoEncodeConfig;
     use crate::engine::cmaf::encode::VideoReencoder;
 
@@ -752,23 +785,18 @@ fn reencode_all_intra(
     // decodable, and feeding them to the decoder is what made the first
     // version of this fail on packet one and fall back every single time.
     let start = frames.iter().position(|f| f.2).unwrap_or(0);
-    // Measured before the slice, and handed back, so the caller can drain the
-    // same amount of audio. See this function's doc comment.
-    let trimmed_ticks = if start > 0 {
-        frames[start].0.saturating_sub(frames[0].0)
-    } else {
-        0
-    };
     let frames = &frames[start..];
     if frames.len() < 2 {
         bail!("no keyframe to start from");
     }
+    let labels = display_order_labels(frames);
 
     // Measured on the TRIMMED list, and that matters: taking the span across
     // the frames that were about to be dropped and then applying it to the
     // ones that were kept stretched every clip by the share the trim removed
-    // — 31.57s for a 30s request.
-    let span = frames.last().unwrap().0.saturating_sub(frames[0].0);
+    // — 31.57s for a 30s request. Measured in display order, because in decode
+    // order the last frame in is not the last frame shown.
+    let span = labels.last().unwrap().saturating_sub(labels[0]);
     let fps_num = if span > 0 {
         (((frames.len() - 1) as u64 * 90_000 * 1000) / span) as u32
     } else {
@@ -816,8 +844,15 @@ fn reencode_all_intra(
     let mut out: Vec<(u64, Vec<Vec<u8>>, bool)> = Vec::with_capacity(frames.len());
     let mut rejected = 0usize;
     for (pts, nalus, is_key) in frames {
-        match enc.encode_frame(nalus, *pts, *is_key, src_codec) {
-            Ok(Some(f)) => out.push((*pts, f.nalus, true)),
+        // The picture that comes out of this call, if one does, is the next
+        // one in display order — not the one that went in. On a source with
+        // B-frames the decoder holds pictures back until their references
+        // have arrived, so labelling its output with the input's PTS put the
+        // wrong time on every frame. The label is looked up ahead of the
+        // call so the encoder is stamped with it too.
+        let label = labels.get(out.len()).copied().unwrap_or(*pts);
+        match enc.encode_frame(nalus, label, *is_key, src_codec) {
+            Ok(Some(f)) => out.push((label, f.nalus, true)),
             // Buffered. The encoder will hand it back later, or on flush.
             Ok(None) => {}
             // One bad frame is not worth losing the clip over — a dropped
@@ -866,10 +901,10 @@ fn reencode_all_intra(
     };
     let track = VideoTrack::from_h264(sps, pps);
     tracing::info!(
-        frames = out.len(), width = track.width, height = track.height, trimmed_ticks,
+        frames = out.len(), width = track.width, height = track.height, trimmed = start,
         "replay export: re-encoded all-intra"
     );
-    Ok((out, track, trimmed_ticks))
+    Ok((out, track))
 }
 
 #[cfg(not(feature = "media-codecs"))]
@@ -877,8 +912,22 @@ fn reencode_all_intra(
     _frames: &[(u64, Vec<Vec<u8>>, bool)],
     _source: &VideoTrack,
     _demux: &TsDemuxer,
-) -> Result<(Vec<(u64, Vec<Vec<u8>>, bool)>, VideoTrack, u64)> {
+) -> Result<(Vec<(u64, Vec<Vec<u8>>, bool)>, VideoTrack)> {
     bail!("this build has no encoder")
+}
+
+/// The timestamps a decoder's output will carry, in the order it emits them.
+///
+/// A decoder takes frames in decode order and hands pictures back in display
+/// order, so the k-th picture out is the one with the k-th smallest PTS that
+/// went in. On a source with no B-frames the two orders are the same and this
+/// is the input list; on one with B-frames it is the input list sorted. Either
+/// way it also absorbs the minor reordering a PES boundary can introduce.
+#[cfg(any(feature = "media-codecs", test))]
+fn display_order_labels(frames: &[(u64, Vec<Vec<u8>>, bool)]) -> Vec<u64> {
+    let mut labels: Vec<u64> = frames.iter().map(|f| f.0).collect();
+    labels.sort_unstable();
+    labels
 }
 
 
@@ -891,13 +940,18 @@ fn reencode_all_intra(
 fn build_ac3_track(
     blobs: &[(u64, u8, Vec<u8>)],
     eac3: bool,
-) -> Result<(Option<AudioTrack>, Vec<Sample>)> {
+) -> Result<(Option<AudioTrack>, Vec<Sample>, Vec<u64>)> {
     let mut samples: Vec<Sample> = Vec::new();
+    // One 90 kHz PTS per sample: the PES's own for its first frame, and each
+    // frame after it one frame's worth later. That is what the track is
+    // aligned against the video with.
+    let mut pts_list: Vec<u64> = Vec::new();
     let mut track: Option<AudioTrack> = None;
     let mut first_info: Option<Ac3FrameInfo> = None;
 
-    for (_pes_pts, _stream_type, blob) in blobs {
+    for (pes_pts, _stream_type, blob) in blobs {
         let mut off = 0;
+        let mut in_pes = 0u64;
         while off + 7 <= blob.len() {
             // Re-sync to the next syncword if present.
             if blob[off] != 0x0B || blob[off + 1] != 0x77 {
@@ -928,6 +982,8 @@ fn build_ac3_track(
                 composition_time_offset: 0,
                 is_sync: true,
             });
+            pts_list.push(pes_pts + in_pes * 1536 * 90_000 / (info.sample_rate as u64).max(1));
+            in_pes += 1;
             if first_info.is_none() {
                 first_info = Some(info);
             }
@@ -951,17 +1007,21 @@ fn build_ac3_track(
     if samples.is_empty() {
         bail!("replay_export_format_unsupported");
     }
-    Ok((track, samples))
+    Ok((track, samples, pts_list))
 }
 
 /// MP2 counterpart of [`build_ac3_track`]. MP2 frames carry 1152 samples
 /// (Layer II) at the configured sample rate.
-fn build_mp2_track(blobs: &[(u64, u8, Vec<u8>)]) -> Result<(Option<AudioTrack>, Vec<Sample>)> {
+fn build_mp2_track(
+    blobs: &[(u64, u8, Vec<u8>)],
+) -> Result<(Option<AudioTrack>, Vec<Sample>, Vec<u64>)> {
     let mut samples: Vec<Sample> = Vec::new();
+    let mut pts_list: Vec<u64> = Vec::new();
     let mut first_info: Option<Mp2FrameInfo> = None;
 
-    for (_pes_pts, _stream_type, blob) in blobs {
+    for (pes_pts, _stream_type, blob) in blobs {
         let mut off = 0;
+        let mut in_pes = 0u64;
         while off + 4 <= blob.len() {
             if blob[off] != 0xFF || (blob[off + 1] & 0xE0) != 0xE0 {
                 off += 1;
@@ -983,6 +1043,8 @@ fn build_mp2_track(blobs: &[(u64, u8, Vec<u8>)]) -> Result<(Option<AudioTrack>, 
                 composition_time_offset: 0,
                 is_sync: true,
             });
+            pts_list.push(pes_pts + in_pes * 1152 * 90_000 / (info.sample_rate as u64).max(1));
+            in_pes += 1;
             if first_info.is_none() {
                 first_info = Some(info);
             }
@@ -999,7 +1061,7 @@ fn build_mp2_track(blobs: &[(u64, u8, Vec<u8>)]) -> Result<(Option<AudioTrack>, 
         sample_rate: info.sample_rate,
         channels: info.channels,
     };
-    Ok((Some(track), samples))
+    Ok((Some(track), samples, pts_list))
 }
 
 #[cfg(test)]
@@ -1046,7 +1108,7 @@ mod tests {
         blob.extend_from_slice(&frame);
         let blobs = vec![(0u64, super::STREAM_TYPE_AC3_A, blob)];
 
-        let (track, samples) = build_ac3_track(&blobs, /*eac3=*/ false)
+        let (track, samples, pts) = build_ac3_track(&blobs, /*eac3=*/ false)
             .expect("AC-3 track build");
         let track = track.expect("non-empty track");
         match track.codec {
@@ -1059,6 +1121,9 @@ mod tests {
         // AC-3 frame duration is 1536 samples in the track timescale.
         assert!(samples.iter().all(|s| s.duration == 1536 && s.is_sync));
         assert!(samples.iter().all(|s| s.data.len() == frame_size));
+        // The second frame in the PES is dated one frame after the first:
+        // 1536 samples at 48 kHz is 2880 ticks.
+        assert_eq!(pts, vec![0, 2880]);
     }
 
     /// Same property end-to-end for MP2 — ensure sample-rate / channel
@@ -1077,7 +1142,7 @@ mod tests {
         blob.extend_from_slice(&frame);
         let blobs = vec![(0u64, super::STREAM_TYPE_MP2_A, blob)];
 
-        let (track, samples) = build_mp2_track(&blobs).expect("MP2 track build");
+        let (track, samples, pts) = build_mp2_track(&blobs).expect("MP2 track build");
         let track = track.expect("non-empty track");
         match track.codec {
             FmpAudioCodec::Mp2 { avg_bitrate } => assert_eq!(avg_bitrate, 192_000),
@@ -1088,6 +1153,7 @@ mod tests {
         assert_eq!(samples.len(), 2);
         // MP2 frame duration is 1152 samples in the track timescale.
         assert!(samples.iter().all(|s| s.duration == 1152 && s.is_sync));
+        assert_eq!(pts, vec![0, 2160], "1152 samples at 48 kHz is 2160 ticks");
     }
 
     /// Synthetic AC-3 blob whose first byte is junk before the syncword
@@ -1107,7 +1173,7 @@ mod tests {
         blob.extend_from_slice(&frame);
         let blobs = vec![(0u64, super::STREAM_TYPE_AC3_B, blob)];
 
-        let (_track, samples) =
+        let (_track, samples, _pts) =
             build_ac3_track(&blobs, false).expect("re-sync past garbage");
         assert_eq!(samples.len(), 1);
     }
@@ -1128,51 +1194,68 @@ mod tests {
         cache().lock().expect("cache").clear();
     }
 
-    fn sample(duration: u32, is_sync: bool) -> Sample {
-        Sample { duration, data: vec![0u8; 8], composition_time_offset: 0, is_sync }
-    }
-
-    /// The re-encoder's own lead-in trim has to reach the audio drain.
+    /// The two tracks open on the same instant, decided by PTS.
     ///
-    /// This is the shape every release artefact produces: `reencode_all_intra`
-    /// drops the undecodable frames before the first keyframe and marks every
-    /// frame it emits as sync, so the muxer's own trim finds nothing to do.
-    /// Counting only the muxer's trim gave `dropped_ticks == 0`, the audio
-    /// drain was skipped, and the clip shipped with the audio leading the
-    /// picture by the whole lead-in — 41 samples of 240 on the rig, which at
-    /// 25 fps is 1.6 s against gate 3's ±40 ms.
+    /// A transport stream muxes video ahead of its PTS by the VBV delay and
+    /// audio by far less, so at the byte a range opens on the first audio
+    /// frame is earlier than the first picture — by 300 ms here, which is
+    /// ordinary. Dropping audio by the *length of the video's own trim* kept
+    /// both tracks' offsets equal and left that skew in every clip, audio
+    /// ahead, well past gate 3's ±40 ms.
     #[test]
-    fn the_reencoders_lead_in_trim_is_counted_against_the_audio() {
-        // What the re-encoder hands back: 10 frames at 3600 ticks, all sync,
-        // having already discarded 40 source frames (144 000 ticks) ahead of
-        // the first keyframe.
-        let video: Vec<Sample> = (0..10).map(|_| sample(3600, true)).collect();
-        let first_sync = video.iter().position(|s| s.is_sync).unwrap_or(0);
-        assert_eq!(first_sync, 0, "the re-encoded list opens on a sync sample");
-
-        let ticks = leading_trim_ticks(144_000, &video, first_sync);
-        assert_eq!(ticks, 144_000, "the re-encoder's trim must survive to here");
-
-        // 1.6 s of 48 kHz AAC is 76 800 samples; at 1024 per frame that is 75
-        // whole frames the audio has to give up to stay in step.
-        let audio: Vec<Sample> = (0..200).map(|_| sample(1024, true)).collect();
-        assert_eq!(audio_samples_to_drop(ticks, 90_000, 48_000, &audio), 75);
+    fn audio_that_ends_before_the_first_picture_is_dropped() {
+        // Video from 27 000 ticks (300 ms), 25 fps; AAC at 48 kHz (1920
+        // ticks a frame) from 0.
+        let video: Vec<u64> = (0..50).map(|i| 27_000 + i * 3600).collect();
+        let audio: Vec<u64> = (0..100).map(|i| i * 1920).collect();
+        let (drop_audio, drop_video) = align_tracks(&video, &audio, 1920, true);
+        // Frames 0..=13 end at or before 27 000 (14 x 1920 = 26 880); frame
+        // 14 straddles the first picture and stays.
+        assert_eq!((drop_audio, drop_video), (14, 0));
+        let residual = video[0] as i64 - audio[drop_audio] as i64;
+        assert!(residual.abs() < 1920, "within one audio frame, was {residual}");
     }
 
-    /// And the muxer's own trim still counts on the fallback path, where the
-    /// re-encode failed and the source GOP structure is shipped as-is.
+    /// Audio that starts after the picture trims the picture instead — but
+    /// only where every picture is a keyframe.
     #[test]
-    fn the_muxers_own_trim_still_counts_when_there_was_no_re_encode() {
-        let mut video: Vec<Sample> = (0..3).map(|_| sample(3600, false)).collect();
-        video.extend((0..10).map(|_| sample(3600, true)));
-        let first_sync = video.iter().position(|s| s.is_sync).expect("a keyframe");
-        assert_eq!(leading_trim_ticks(0, &video, first_sync), 3 * 3600);
+    fn video_that_ends_before_the_first_audio_frame_is_dropped_when_all_intra() {
+        let video: Vec<u64> = (0..50).map(|i| i * 3600).collect();
+        let audio: Vec<u64> = (0..100).map(|i| 10_000 + i * 1920).collect();
+        // All-intra: pictures 0 and 1 end at 3600 and 7200, before 10 000;
+        // picture 2 ends at 10 800 and stays.
+        assert_eq!(align_tracks(&video, &audio, 1920, true), (0, 2));
+        // Source GOP: the first sample is the keyframe the rest decode
+        // against, so nothing can go. The residual is documented.
+        assert_eq!(align_tracks(&video, &audio, 1920, false), (0, 0));
     }
 
-    /// No audio track means nothing to drain, and no divide by its timescale.
+    /// Nothing to align without both tracks; audio entirely before the
+    /// picture yields a video-only file rather than a panic.
     #[test]
-    fn a_video_only_clip_drains_no_audio() {
-        assert_eq!(audio_samples_to_drop(144_000, 90_000, 0, &[]), 0);
+    fn alignment_degrades_gracefully_at_the_edges() {
+        assert_eq!(align_tracks(&[], &[0, 1920], 1920, true), (0, 0));
+        assert_eq!(align_tracks(&[0, 3600], &[], 1920, true), (0, 0));
+        let audio: Vec<u64> = (0..10).map(|i| i * 1920).collect();
+        assert_eq!(align_tracks(&[100_000, 103_600], &audio, 1920, true), (10, 0));
+        // Already aligned: nothing moves.
+        assert_eq!(align_tracks(&[0, 3600], &[0, 1920], 1920, true), (0, 0));
+    }
+
+    /// A decoder emits pictures in display order whatever order they went in.
+    ///
+    /// On a source with B-frames the transport carries I P B B; the decoder
+    /// hands back I B B P. Labelling each output with the input it arrived
+    /// with put the P's time on the first B and so on; the labels are the
+    /// sorted input times, one per picture out.
+    #[test]
+    fn display_order_labels_are_the_sorted_input_times() {
+        let f = |pts: u64, key: bool| (pts, vec![vec![0u8; 4]], key);
+        let decode_order = vec![f(0, true), f(10_800, false), f(3600, false), f(7200, false)];
+        assert_eq!(display_order_labels(&decode_order), vec![0, 3600, 7200, 10_800]);
+        // No B-frames: the input order is the display order already.
+        let plain = vec![f(0, true), f(3600, false), f(7200, false)];
+        assert_eq!(display_order_labels(&plain), vec![0, 3600, 7200]);
     }
 
     /// The cache is bounded by size, not only by age.
