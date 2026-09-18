@@ -457,6 +457,18 @@ impl PcmResampler {
         })
     }
 
+    /// Forget queued input and the filter's history: a new anchor starts
+    /// from nothing, exactly as the encoder's accumulator does, or up to a
+    /// chunk of the old timeline would be converted first and come out
+    /// under the new one.
+    fn reset(&mut self) {
+        use rubato::Resampler;
+        for ch in self.pending.iter_mut() {
+            ch.clear();
+        }
+        self.inner.reset();
+    }
+
     /// Queue `planar` and append whatever whole chunks it completes, converted,
     /// to `sink`. Returns how many output frames were appended.
     fn push(&mut self, planar: &[Vec<f32>], sink: &mut [Vec<f32>]) -> Result<usize, String> {
@@ -591,6 +603,33 @@ impl AudioEncoder {
         if params.sample_rate == 0 || params.sample_rate > 192_000 {
             return Err(AudioEncoderError::InvalidPcmFormat {
                 reason: format!("sample_rate={} (must be 1..=192000 Hz)", params.sample_rate),
+            });
+        }
+
+        // The in-process backends convert rate but not layout: the
+        // accumulator is sized by the target's channel count and indexed by
+        // the input's, so a mismatch was an out-of-range drain on the first
+        // frame — a panic on the output task — not a wrong mix. The caller
+        // maps the layout (see `cmaf::encode::to_layout`); this refuses the
+        // combination the backends cannot take.
+        #[cfg(any(feature = "fdk-aac", feature = "media-codecs"))]
+        if params.channels != params.target_channels
+            && matches!(
+                params.codec,
+                AudioCodec::AacLc
+                    | AudioCodec::HeAacV1
+                    | AudioCodec::HeAacV2
+                    | AudioCodec::Opus
+                    | AudioCodec::Mp2
+                    | AudioCodec::Ac3
+            )
+        {
+            return Err(AudioEncoderError::InvalidPcmFormat {
+                reason: format!(
+                    "the in-process encoder takes input at its output layout: channels={} \
+                     but target_channels={}",
+                    params.channels, params.target_channels
+                ),
             });
         }
 
@@ -1077,10 +1116,14 @@ impl AudioEncoder {
                 accumulated_samples,
                 samples_since_anchor,
                 pts_anchor_set,
+                resampler,
                 ..
             } => {
                 for ch in accumulator.iter_mut() {
                     ch.clear();
+                }
+                if let Some(r) = resampler {
+                    r.reset();
                 }
                 *accumulated_samples = 0;
                 *samples_since_anchor = 0;
@@ -1092,10 +1135,14 @@ impl AudioEncoder {
                 accumulated_samples,
                 samples_since_anchor,
                 pts_anchor_set,
+                resampler,
                 ..
             } => {
                 for ch in accumulator.iter_mut() {
                     ch.clear();
+                }
+                if let Some(r) = resampler {
+                    r.reset();
                 }
                 *accumulated_samples = 0;
                 *samples_since_anchor = 0;

@@ -965,8 +965,10 @@ async fn restore_published_window(
     // hand — a single timeout over the whole fetch dropped everything read.
     const HELD_INITS_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
     let deadline = tokio::time::Instant::now() + HELD_INITS_BUDGET;
+    // Newest first: if the budget runs out, the init the longest-lived rows
+    // name — and the one a mismatch retires — is the one in hand.
     let mut wanted: Vec<String> = Vec::new();
-    for name in window.rows.iter().map(CmafState::row_init_name) {
+    for name in window.rows.iter().rev().map(CmafState::row_init_name) {
         if !wanted.iter().any(|w| w == name) {
             wanted.push(name.to_string());
         }
@@ -1553,6 +1555,15 @@ async fn run(
             .partition(|h| h.uri == state.init_uri);
         state.init_history = older;
         state.restored_current_init = current.into_iter().next();
+        // A manifest from before the stamp existed says nothing about its
+        // init — but the object itself does, now that it has been read back,
+        // so the comparison covers that window too rather than publishing
+        // over it on trust.
+        if state.restored_init_fingerprint.is_none()
+            && let Some(kept) = state.restored_current_init.as_ref()
+        {
+            state.restored_init_fingerprint = Some(init_fingerprint(&kept.bytes));
+        }
         state.restore_discontinuity = true;
     }
 
@@ -2919,11 +2930,6 @@ async fn publish_init_if_due(
             {
                 ll.generation = to;
             }
-            // The restored rows keep naming the previous run's init, so
-            // its bytes join the republish set.
-            if let Some(kept) = state.restored_current_init.take() {
-                state.init_history.push(kept);
-            }
             adopt_generation(state, &config.id);
         }
         tracing::warn!(
@@ -2944,8 +2950,15 @@ async fn publish_init_if_due(
         );
     }
     state.init_fingerprint = Some(fingerprint);
-    // Compared, and matching or moot: this run publishes that name itself.
-    state.restored_current_init = None;
+    // The restored generation's bytes are needed only if this run will not
+    // put that name up itself — after a mismatch, or after a rotation that
+    // moved on before the first publish — and the restored rows still name
+    // it. Keyed on the name, which both cases have settled by now.
+    if let Some(kept) = state.restored_current_init.take()
+        && kept.uri != state.init_uri
+    {
+        state.init_history.push(kept);
+    }
 
     // A rotated init is a NEW object, not an overwrite. Overwriting would
     // strand every segment already in the window: their media decodes against
@@ -3312,6 +3325,11 @@ async fn handle_ll_cmaf(
                         "CMAF output '{}': LL seg {} PUT final response error: {e}",
                         config.id, seq,
                     );
+                    // Probe the origin with the 1 KB init on the next publish
+                    // rather than trusting a success up to 30 s old: it lands
+                    // and the reopen may proceed, or it fails and the reopen
+                    // is refused, with the 1 s retry floor engaged.
+                    state.init_last_upload = None;
                     // Once per episode: an origin that is down fails every
                     // close, one every segment, for as long as it is down.
                     if !state.ll_put_failing {
@@ -3503,6 +3521,8 @@ async fn handle_ll_cmaf(
                                  {chunks} chunk(s), aborting",
                                 config.id
                             );
+                            // See the close path: the next publish probes.
+                            state.init_last_upload = None;
                             if !state.ll_put_failing {
                                 state.ll_put_failing = true;
                                 event_sender.emit_flow(

@@ -152,9 +152,10 @@ impl AudioReencoder {
                 opus_dtx: cfg.opus_dtx,
                 opus_frame_duration_ms: cfg.opus_frame_duration_ms,
             };
+            // A child, so retiring this encoder later cancels it alone.
             let enc = AudioEncoder::spawn(
                 params,
-                cancel.clone(),
+                cancel.child_token(),
                 flow_id.to_string(),
                 output_id.to_string(),
                 out_stats.clone(),
@@ -277,7 +278,6 @@ impl AudioReencoder {
             return Ok(Vec::new());
         };
         let target = video.saturating_sub(self.video_lead_90k);
-        self.in_silence = true;
         match self.input_position() {
             None => self.anchor_input(target),
             // A picture that moved further than any gap this would fill is a
@@ -305,6 +305,7 @@ impl AudioReencoder {
             let (planar, _) = sg.next_chunk();
             enc.submit_planar(planar, at);
             self.input_since_anchor += chunk_samples;
+            self.in_silence = true;
             while let Some(f) = enc.try_recv() {
                 out.push((f.data.to_vec(), f.pts));
             }
@@ -313,19 +314,42 @@ impl AudioReencoder {
     }
 
     /// What to do with a real submit at `pts`, given where the encoder's
-    /// input is. See [`SOURCE_PTS_SLACK_TICKS`].
-    fn place_source(&mut self, pts: u64) -> Placement {
+    /// input is. See [`SOURCE_PTS_SLACK_TICKS`]. Frames a forward gap is
+    /// covered with go to `out`.
+    fn place_source(&mut self, pts: u64, out: &mut Vec<(Vec<u8>, u64)>) -> Placement {
         let Some(at) = self.input_position() else {
             self.anchor_input(pts);
             return Placement::Submit;
         };
         if pts > at + SOURCE_PTS_SLACK_TICKS {
+            let gap = pts - at;
+            if self.silence.is_some() && gap <= SILENCE_FILL_CAP_TICKS {
+                // A gap the silent fallback exists to cover: the fill stops
+                // one chunk short of the picture, and a return lands past
+                // that residual — up to a chunk at the source's rate, most
+                // of a frame at 16 kHz. Covered with zeros and continued,
+                // rather than re-anchored and the last silent sample
+                // stretched over it.
+                let samples = gap * self.input_sr.max(1) as u64 / 90_000;
+                let channels = self
+                    .encoder
+                    .as_ref()
+                    .map_or(2, |e| e.params().channels as usize);
+                let zeros = vec![vec![0.0f32; samples as usize]; channels];
+                if let Some(enc) = self.encoder.as_mut() {
+                    enc.submit_planar(&zeros, at);
+                    self.input_since_anchor += samples;
+                    while let Some(f) = enc.try_recv() {
+                        out.push((f.data.to_vec(), f.pts));
+                    }
+                }
+                return Placement::Submit;
+            }
             // A gap: the source moved on without the encoder. Re-anchor.
             tracing::debug!(
-                "CMAF output '{}': audio source PTS {pts} is {} ticks past the encoder's \
+                "CMAF output '{}': audio source PTS {pts} is {gap} ticks past the encoder's \
                  input; re-anchoring",
                 self.output_id,
-                pts - at,
             );
             self.anchor_input(pts);
             Placement::Submit
@@ -354,11 +378,16 @@ impl AudioReencoder {
     /// flat, and a drift no PTS comparison could see. Rebuilt on the first
     /// real frame that differs; the silence already emitted was at the
     /// track's rate and is unaffected.
-    fn ensure_encoder_for(&mut self, source_sr: u32, source_ch: u8) -> Result<()> {
+    ///
+    /// The encoder's input layout is always its output layout — the
+    /// in-process backends take no other, and refuse it at spawn — so a
+    /// source at another channel count is mixed on the way in
+    /// (`to_layout`), and only its rate decides whether to rebuild.
+    fn ensure_encoder_for(&mut self, source_sr: u32, source_ch: u8, pts: u64) -> Result<()> {
         let matches = self
             .encoder
             .as_ref()
-            .is_some_and(|e| e.params().sample_rate == source_sr && e.params().channels == source_ch);
+            .is_some_and(|e| e.params().sample_rate == source_sr);
         if matches {
             return Ok(());
         }
@@ -372,10 +401,11 @@ impl AudioReencoder {
             .as_ref()
             .map(|e| e.params().target_channels)
             .unwrap_or_else(|| self.target_channels.unwrap_or(source_ch));
+        let at = self.input_position();
         let params = EncoderParams {
             codec: self.target_codec,
             sample_rate: source_sr,
-            channels: source_ch,
+            channels: target_channels,
             target_bitrate_kbps: self.target_bitrate_kbps,
             target_sample_rate,
             target_channels,
@@ -390,16 +420,19 @@ impl AudioReencoder {
         if let Some(old) = self.encoder.take() {
             tracing::info!(
                 "CMAF output '{}': audio source is {source_sr} Hz / {source_ch} ch, the \
-                 encoder was built for {} Hz / {} ch; rebuilding it for the source",
+                 encoder was built for {} Hz; rebuilding it for the source's rate",
                 self.output_id,
                 old.params().sample_rate,
-                old.params().channels,
             );
             old.cancel();
         }
+        // On a child of the output's token: `old.cancel()` above reached
+        // only the encoder being retired, and this one will be retired the
+        // same way. Cancelling the output's own token here ended the output
+        // on the first frame of a 44.1 kHz source.
         let enc = AudioEncoder::spawn(
             params,
-            self.cancel.clone(),
+            self.cancel.child_token(),
             self.flow_id.clone(),
             self.output_id.clone(),
             self.out_stats.clone(),
@@ -407,15 +440,43 @@ impl AudioReencoder {
         )
         .map_err(|e| anyhow::anyhow!("AudioEncoder spawn failed: {e}"))?;
         self.encoder = Some(enc);
-        // The silence has to be at the encoder's input rate too.
+        // The silence has to be at the encoder's input rate and layout too,
+        // and its watchdog carries over: this runs on a real frame, so the
+        // new generator has just heard one.
         if self.silence.is_some() {
-            self.silence = Some(SilenceGenerator::new(source_sr, source_ch.clamp(1, 2), 0));
+            let mut sg = SilenceGenerator::new(source_sr, target_channels.clamp(1, 2), 0);
+            sg.mark_real_audio(pts);
+            self.silence = Some(sg);
         }
-        // A new encoder is a new timeline; the next submit anchors it.
-        self.input_anchor_pts = None;
+        // The input position is a property of what has been handed to the
+        // segmenter, not of the encoder: it carries over, and the new encoder
+        // is anchored there by the next submit.
+        self.input_anchor_pts = at;
         self.input_since_anchor = 0;
         self.input_sr = source_sr;
         Ok(())
+    }
+
+    /// `planar` in the layout the encoder takes: its own when it already is,
+    /// otherwise mixed to it. Mono is duplicated to both channels, stereo
+    /// averaged to one, and more than two channels take the first two (L/R)
+    /// or their average — enough for the sources silent fallback exists for,
+    /// which are mono cameras and stereo encoders. The in-process encoders
+    /// index their accumulators by the target layout and take no other.
+    fn to_layout(planar: &[Vec<f32>], channels: usize) -> std::borrow::Cow<'_, [Vec<f32>]> {
+        use std::borrow::Cow;
+        if planar.len() == channels || planar.is_empty() || channels == 0 {
+            return Cow::Borrowed(planar);
+        }
+        let n = planar[0].len();
+        let mixed: Vec<Vec<f32>> = match (planar.len(), channels) {
+            (1, _) => vec![planar[0].clone(); channels],
+            (_, 1) => vec![(0..n)
+                .map(|i| planar.iter().map(|c| c[i]).sum::<f32>() / planar.len() as f32)
+                .collect()],
+            (_, c) => (0..c).map(|k| planar[k.min(planar.len() - 1)].clone()).collect(),
+        };
+        Cow::Owned(mixed)
     }
 
     /// Reset the drop watchdog on a real source AAC frame so silence goes
@@ -472,20 +533,25 @@ impl AudioReencoder {
         }
         let source_sr = dec.sample_rate();
         let source_ch = dec.channels();
-        self.ensure_encoder_for(source_sr, source_ch)?;
+        self.ensure_encoder_for(source_sr, source_ch, pts)?;
         self.submit_real(&planar, pts)
     }
 
     /// Submit real PCM at `pts`, placed on the encoder's input timeline.
     fn submit_real(&mut self, planar: &[Vec<f32>], pts: u64) -> Result<Vec<(Vec<u8>, u64)>> {
-        if self.place_source(pts) == Placement::Skip {
-            return Ok(Vec::new());
+        let mut out = Vec::new();
+        if self.place_source(pts, &mut out) == Placement::Skip {
+            return Ok(out);
         }
         let n = planar.first().map_or(0, |c| c.len() as u64);
+        let channels = self
+            .encoder
+            .as_ref()
+            .map_or(planar.len(), |e| e.params().channels as usize);
+        let planar = Self::to_layout(planar, channels);
         let enc = self.encoder.as_mut().expect("ensured by the caller");
-        enc.submit_planar(planar, pts);
+        enc.submit_planar(&planar, pts);
         self.input_since_anchor += n;
-        let mut out = Vec::new();
         while let Some(frame) = enc.try_recv() {
             out.push((frame.data.to_vec(), frame.pts));
         }
@@ -516,7 +582,7 @@ impl AudioReencoder {
         if planar.is_empty() {
             return Ok(Vec::new());
         }
-        self.ensure_encoder_for(source_sr, source_ch)?;
+        self.ensure_encoder_for(source_sr, source_ch, pts)?;
         self.submit_real(planar, pts)
     }
 }
@@ -977,6 +1043,50 @@ mod reencoder_tests {
         let span = out[out.len() - 1].1 - out[0].1;
         assert_eq!(span, (out.len() as u64 - 1) * 1_920);
         assert!(r.silence.as_ref().unwrap().sample_rate() == 44_100, "silence follows the encoder's input rate");
+        // The retired encoder was cancelled — on its own token. The output's
+        // token, which the first version cancelled with it, is untouched:
+        // that ended the whole output on the first 44.1 kHz frame.
+        assert!(!cancel.is_cancelled(), "the output's token survived the rebuild");
+        assert!(
+            !r.encode_planar(&pcm, 1_000_000 + 40 * frame_441, 44_100, 2).unwrap().is_empty()
+                || !r.encode_planar(&pcm, 1_000_000 + 41 * frame_441, 44_100, 2).unwrap().is_empty(),
+            "and the rebuilt encoder keeps encoding"
+        );
+    }
+
+    /// A source at another channel count is mixed to the encoder's layout on
+    /// the way in; the in-process backends take no other, and indexing their
+    /// accumulators by the source's count was a panic on the first frame.
+    #[test]
+    #[cfg(feature = "fdk-aac")]
+    fn a_mono_source_is_mixed_to_the_tracks_layout() {
+        let cancel = CancellationToken::new();
+        let mut r = AudioReencoder::new(&ae("aac_lc", true), &cancel, "out5", "flow5")
+            .expect("fdk-aac in-process encoder");
+        let mono = vec![vec![0.25f32; 1024]];
+        let mut out = Vec::new();
+        for i in 0..8u64 {
+            let pts = 5_000_000 + i * 1_920;
+            r.mark_real_audio(pts, None);
+            out.extend(r.encode_planar(&mono, pts, 48_000, 1).unwrap());
+        }
+        assert!(!out.is_empty(), "mono frames were encoded, not dropped or panicked on");
+        let p = r.encoder.as_ref().unwrap().params();
+        assert_eq!((p.channels, p.target_channels), (2, 2), "the encoder stays at the track's layout");
+        assert!(!cancel.is_cancelled());
+
+        // The mapping itself.
+        let up = AudioReencoder::to_layout(&mono, 2);
+        assert_eq!(up.len(), 2);
+        assert_eq!(up[0], up[1]);
+        let stereo = vec![vec![1.0f32; 4], vec![0.0f32; 4]];
+        let down = AudioReencoder::to_layout(&stereo, 1);
+        assert_eq!(down.len(), 1);
+        assert!(down[0].iter().all(|v| (*v - 0.5).abs() < 1e-6));
+        let six: Vec<Vec<f32>> = (0..6).map(|k| vec![k as f32; 2]).collect();
+        let lr = AudioReencoder::to_layout(&six, 2);
+        assert_eq!((lr[0][0], lr[1][0]), (0.0, 1.0), "L/R of a 5.1 source");
+        assert!(matches!(AudioReencoder::to_layout(&stereo, 2), std::borrow::Cow::Borrowed(_)));
     }
 }
 

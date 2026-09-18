@@ -215,8 +215,8 @@ impl VideoSegmenter {
         self.generation = self.generation.saturating_add(1);
     }
 
-    /// 90 kHz DTS of the newest sample pushed, if any — where the picture
-    /// is, for a track that has to keep up with it.
+    /// 90 kHz timestamp of the newest sample pushed, if any — where the
+    /// picture is, for a track that has to keep up with it. Monotonic.
     pub fn last_dts_90k(&self) -> Option<u64> {
         self.last_dts
     }
@@ -252,7 +252,10 @@ impl VideoSegmenter {
     ) -> PushOutcome {
         let unwrapped = self.pts_unwrap.unwrap(pts90k);
         let dts = unwrapped;
-        self.last_dts = Some(dts);
+        // The newest, not the last: with B-frames the pushed timestamps
+        // swing by the reorder depth, and a track measured against them
+        // would swing with them.
+        self.last_dts = Some(self.last_dts.map_or(dts, |d| d.max(dts)));
 
         let mut completed = None;
         let mut completed_samples: Option<(u64, u64, Vec<Sample>)> = None;
