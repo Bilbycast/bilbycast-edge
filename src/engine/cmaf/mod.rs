@@ -2462,25 +2462,27 @@ fn handle_audio_frame(
     event_sender: &EventSender,
     flow_id: &str,
 ) {
-    // Lazily construct the audio track on first AAC frame (we need the
-    // demuxer-cached AAC config to derive the AudioSpecificConfig).
-    if state.audio_seg.is_none() {
+    let bitrate = config
+        .audio_encode
+        .as_ref()
+        .and_then(|e| e.bitrate_kbps)
+        .map(|k| k * 1000)
+        .unwrap_or(128_000);
+
+    // Passthrough: the track is the source's, from the demuxer-cached ADTS
+    // config. With `audio_encode` it is the ENCODER's — built below, after
+    // the first frame has settled what the encoder actually emits. A source
+    // whose rate or layout differs from the configured target is converted
+    // on the way in, so a track built from the source declared one channel
+    // count (or rate) while every frame carried another, which a browser's
+    // decoder refuses as a mid-stream change.
+    if state.audio_seg.is_none() && state.audio_reencoder.is_none() {
         let Some((profile, sr_idx, ch_cfg)) = demuxer.cached_aac_config() else {
             return;
         };
         let asc = aac_audio_specific_config(profile, sr_idx, ch_cfg);
         let sample_rate = codecs::sample_rate_from_index(sr_idx);
-        let track = AudioTrack::aac(
-            asc,
-            sample_rate,
-            ch_cfg as u16,
-            config
-                .audio_encode
-                .as_ref()
-                .and_then(|e| e.bitrate_kbps)
-                .map(|k| k * 1000)
-                .unwrap_or(128_000),
-        );
+        let track = AudioTrack::aac(asc, sample_rate, ch_cfg as u16, bitrate);
         state.audio_seg =
                             Some(AudioSegmenter::new_from_seq(track, config.segment_duration_secs, state.resume_seq));
         state.audio_ready = true;
@@ -2502,7 +2504,7 @@ fn handle_audio_frame(
         if let Some((profile, sr_idx, ch_cfg)) = demuxer.cached_aac_config() {
             reenc.set_adts_config(profile, sr_idx, ch_cfg);
         }
-        match crate::timed_block_in_place!(
+        let out = match crate::timed_block_in_place!(
             "cmaf.audio_reencoder",
             crate::engine::perf::TRANSCODE_BLOCK_WARN_MS,
             { reenc.encode_aac_frame(data, pts) }
@@ -2518,7 +2520,25 @@ fn handle_audio_frame(
                 );
                 Vec::new()
             }
+        };
+        // The encoder has now settled its target from the decoder's real
+        // output — SBR-doubled rate and PS-widened layout included — and the
+        // track is built from that, so the init describes the frames.
+        if state.audio_seg.is_none()
+            && let Some((profile, sr_idx, ch)) = reenc.encoder_track()
+        {
+            let sample_rate = codecs::sample_rate_from_index(sr_idx);
+            let track =
+                AudioTrack::aac(aac_audio_specific_config(profile, sr_idx, ch), sample_rate, ch as u16, bitrate);
+            state.audio_seg =
+                Some(AudioSegmenter::new_from_seq(track, config.segment_duration_secs, state.resume_seq));
+            state.audio_ready = true;
+            tracing::info!(
+                "CMAF output '{}': audio track re-encoded to AAC sr={} ch={}",
+                config.id, sample_rate, ch,
+            );
         }
+        out
     } else {
         vec![(data.to_vec(), pts)]
     };

@@ -612,17 +612,24 @@ impl AudioEncoder {
         // frame — a panic on the output task — not a wrong mix. The caller
         // maps the layout (see `cmaf::encode::to_layout`); this refuses the
         // combination the backends cannot take.
-        #[cfg(any(feature = "fdk-aac", feature = "media-codecs"))]
+        // Each guard mirrors the dispatch arm below it exactly: a codec that
+        // falls through to the ffmpeg subprocess converts layout with `-ac`
+        // and is not refused.
+        #[cfg(feature = "fdk-aac")]
         if params.channels != params.target_channels
-            && matches!(
-                params.codec,
-                AudioCodec::AacLc
-                    | AudioCodec::HeAacV1
-                    | AudioCodec::HeAacV2
-                    | AudioCodec::Opus
-                    | AudioCodec::Mp2
-                    | AudioCodec::Ac3
-            )
+            && matches!(params.codec, AudioCodec::AacLc | AudioCodec::HeAacV1 | AudioCodec::HeAacV2)
+        {
+            return Err(AudioEncoderError::InvalidPcmFormat {
+                reason: format!(
+                    "the in-process encoder takes input at its output layout: channels={} \
+                     but target_channels={}",
+                    params.channels, params.target_channels
+                ),
+            });
+        }
+        #[cfg(feature = "media-codecs")]
+        if params.channels != params.target_channels
+            && matches!(params.codec, AudioCodec::Opus | AudioCodec::Mp2 | AudioCodec::Ac3)
         {
             return Err(AudioEncoderError::InvalidPcmFormat {
                 reason: format!(

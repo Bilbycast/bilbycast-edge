@@ -204,6 +204,17 @@ impl AudioReencoder {
         self.silence.as_ref().map(|sg| sg.chunk_duration())
     }
 
+    /// AudioSpecificConfig tuple `(profile, sr_index, ch_cfg)` describing
+    /// what the encoder emits, once it exists: its target rate and layout,
+    /// which a source at any other rate or layout is converted to. `None`
+    /// before the first frame has built it, or for a target rate with no
+    /// ADTS index.
+    pub fn encoder_track(&self) -> Option<(u8, u8, u8)> {
+        let p = self.encoder.as_ref()?.params();
+        let sr_idx = crate::engine::audio_decode::sr_index_from_hz(p.target_sample_rate)?;
+        Some((1, sr_idx, p.target_channels))
+    }
+
     /// AudioSpecificConfig tuple `(profile, sr_index, ch_cfg)` for the
     /// silent-fallback track, so the caller can eagerly build the
     /// CMAF `AudioSegmenter` before any source audio arrives. `None`
@@ -549,8 +560,13 @@ impl AudioReencoder {
             .as_ref()
             .map_or(planar.len(), |e| e.params().channels as usize);
         let planar = Self::to_layout(planar, channels);
+        // At the input position, not the frame's PTS: equal on a first
+        // anchor or a re-anchor, ignored once anchored, and after a rebuild
+        // it is what puts the new encoder where the retired one left off
+        // rather than up to a slack away.
+        let anchor = self.input_position().unwrap_or(pts);
         let enc = self.encoder.as_mut().expect("ensured by the caller");
-        enc.submit_planar(&planar, pts);
+        enc.submit_planar(&planar, anchor);
         self.input_since_anchor += n;
         while let Some(frame) = enc.try_recv() {
             out.push((frame.data.to_vec(), frame.pts));

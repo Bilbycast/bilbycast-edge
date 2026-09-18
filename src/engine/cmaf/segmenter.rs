@@ -254,8 +254,15 @@ impl VideoSegmenter {
         let dts = unwrapped;
         // The newest, not the last: with B-frames the pushed timestamps
         // swing by the reorder depth, and a track measured against them
-        // would swing with them.
-        self.last_dts = Some(self.last_dts.map_or(dts, |d| d.max(dts)));
+        // would swing with them. A step back further than any reorder —
+        // a source restarting below its old timeline, short of a wrap —
+        // is followed, or the picture's position would stay stale until
+        // it climbed past the old maximum.
+        const REORDER_SLACK_90K: u64 = 90_000;
+        self.last_dts = Some(match self.last_dts {
+            Some(d) if dts + REORDER_SLACK_90K >= d => d.max(dts),
+            _ => dts,
+        });
 
         let mut completed = None;
         let mut completed_samples: Option<(u64, u64, Vec<Sample>)> = None;
