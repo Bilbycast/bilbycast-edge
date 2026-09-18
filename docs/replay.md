@@ -59,27 +59,28 @@ section.)
 ```
 
 - The recorder is **another broadcast subscriber**, exactly like the
-  TR-101290 / content-analysis tiers. `RecvError::Lagged(n)` increments
-  `packets_dropped` and emits a Critical `replay_writer_lagged` event;
-  the input task is never blocked.
+  TR-101290 / content-analysis tiers. `RecvError::Lagged(n)` adds `n` to
+  `packets_dropped` silently; the Critical `replay_writer_lagged` event
+  fires when the writer mpsc is full and a packet is dropped there
+  (rate-limited to one event per 5 s); the input task is never blocked.
 - Disk I/O lives behind a bounded `tokio::sync::mpsc` (default capacity
   1024 packets) feeding a dedicated writer task. The subscriber drops
   rather than awaiting `write_all`.
 - Playback is a **new input type** (`type: "replay"`). The replayer
-  reads segments back, paces them by PCR via
-  `replay::paced_replayer::PacedReplayer`, and publishes onto the
-  flow's broadcast channel just like any other input.
+  reads segments back, paces them by PCR from an inline pump in
+  `engine::input_replay` (`pump_one_bundle` + `PacingState`), and
+  publishes onto the flow's broadcast channel just like any other input.
 
 ### Module map
 
 | Path | Role |
 |---|---|
-| `src/replay/mod.rs` | Public types (`RecordingHandle`, `ReplayCommand`, `ClipInfo`), storage-root resolution |
+| `src/replay/mod.rs` | Public types (`RecordingCommand`, `ReplayCommand`, `ClipInfo`), storage-root resolution + `statvfs` disk usage |
 | `src/replay/writer.rs` | Subscriber + writer task; segment roll, retention prune, fsync, stats |
 | `src/replay/reader.rs` | Segment-by-segment streaming reads with seek across segment boundaries |
 | `src/replay/index.rs` | 24 B append-only `index.bin` entries (timecode → segment + offset), in-memory load + binary search |
 | `src/replay/clips.rs` | `clips.json` persistence (atomic `tmp` + rename + fsync) |
-| `src/replay/paced_replayer.rs` | PCR-paced bundle yield for the replay input |
+| `src/replay/paced_replayer.rs` | Standalone PCR-paced `pump` (cancel-token only — no per-input command channel, so cue / scrub / stop cannot interrupt it mid-playback); **dead code today** (`#![allow(dead_code)]`, no callers) — the replay input paces inline in `engine::input_replay::pump_one_bundle` |
 | `src/replay/filmstrip.rs` | Opt-in JPEG thumbnail subscriber; `thumbs/` writer + `.tmp/` orphan scan; `list_frames` / `read_frame` |
 | `src/replay/recordings.rs` | On-disk recording enumeration for the Recordings library (including orphans with no live flow) |
 | `src/replay/export.rs` | MPEG-TS clip / recording export |
@@ -134,12 +135,17 @@ defined and set by the writer:
 | Bit | Constant | Meaning |
 |---|---|---|
 | `1 << 0` | `IS_IDR` | Entry marks an IDR / GOP boundary (set on every entry) |
-| `1 << 1` | `PCR_DISCONTINUITY` | Set on the first IDR after a > 5 min PCR step (stream-source change) **and on the first IDR after a writer restart**; the reader skips wallclock-pacing across it, and clip export refuses to cut across it |
+| `1 << 1` | `PCR_DISCONTINUITY` | Set on the first IDR after a > 5 min PCR step (stream-source change) **and on the first IDR after a writer restart**; MP4 clip export refuses to cut across it (`InMemoryIndex::spans_discontinuity`, checked by both `export_mp4` and the DVR clip cutter in `engine::cmaf::clips`); the raw-TS export (`replay::export`) does not check it, and the playback pacer does not consult the flag |
 | `1 << 2` | `SMPTE_TC_VALID` | `smpte_tc` holds a decoded SMPTE timecode for this IDR |
 
 Entries are append-only; rebuild on corruption is a Phase 2 item — the
-current behaviour emits a `replay_index_corrupt` Warning and continues
-to append (a non-fatal recovery path).
+only corruption handled today is a truncated tail: `IndexWriter::open`
+silently `set_len`s an `index.bin` whose length is not a multiple of 24
+down to the last whole entry and continues to append, and every reader
+(`InMemoryIndex::load`) ignores the trailing partial entry the same way.
+Nothing else is validated (no magic, no CRC), and no event or log line
+is emitted — `replay_recovery_alert` covers `.tmp` orphans and a corrupt
+`recording.json`, not the index.
 
 ### The wall-clock anchor
 
@@ -222,8 +228,13 @@ avoid.
 
 **Three kinds of gap, one rule.** A writer restart, an operator's Stop/Start
 pair, and a PCR step too large to believe as elapsed time are all gaps in which
-wall-clock time passed and no media was written. All three now catch the counter
-up through the anchor at the first frame back. A Stop/Start used to freeze the
+wall-clock time passed and no media was written. All three now date the gap at
+the first frame back — by the source's own PCR step when there is a previous PCR
+and the step is inside the 5-minute discontinuity threshold (a short Stop/Start,
+during which the source's clock kept running), and through the anchor otherwise
+(a restart, which has no previous PCR to compare against; a stop longer than the
+threshold; and the over-threshold PCR step itself, which by definition cannot be
+believed as elapsed time). A Stop/Start used to freeze the
 counter outright and resume from the frozen value, so a ten-minute stop shifted
 the rest of the recording ten minutes against the anchor — and
 `spans_discontinuity` could not catch it, because the flagged entry sits *before*
@@ -239,25 +250,47 @@ range has to honour it — see [Clip export](#clip-export) below.
 
 ### Recording arm → roll → prune
 
-1. Operator sends `start_recording { flow_id }` (or armed at flow
-   start when `RecordingConfig.enabled = true`). Edge spawns the
-   subscriber + writer tasks via
-   `FlowRuntime::start_recording_for_flow`.
-2. `recording_started` Info event fires. `RecordingStats.armed = true`.
+1. The subscriber + writer tasks are spawned once, at flow start, by
+   `FlowRuntime::start` → `replay::writer::spawn_writer` when
+   `RecordingConfig.enabled = true`. With no `pre_buffer_seconds` the
+   writer starts already `Armed`; with one it starts in `PreBuffer`.
+   `start_recording { flow_id }` does not spawn anything — it sends
+   `RecordingCommand::Start` to that writer (arming it from
+   `PreBuffer`, or from `Idle` after a Stop) and fails with
+   `replay_recording_not_active` on a flow with no recording configured
+   (or `enabled = false`, which spawns no writer either).
+2. `RecordingStats.armed = true`, and the `recording_started` Info
+   event fires — at flow start when no `pre_buffer_seconds` is
+   configured, or on the operator's Start while the writer is still in
+   pre-buffer mode (that event's `details.pre_buffered_seconds` is the
+   configured `pre_buffer_seconds`). With `pre_buffer_seconds` set,
+   flow start emits `recording_pre_buffer_started` instead and `armed`
+   stays `false` until that Start. A Start after a Stop (or while
+   already armed) flips `armed` but emits no event.
 3. The writer appends 188 B-aligned packets to a staging file under
    `.tmp/`. PCR is tracked from the data; SMPTE timecode is extracted
    via `engine::content_analysis::timecode::TimecodeTracker`.
 4. Every `segment_seconds` (default 10 s, validated `[2, 60]`):
    - `seg.file.sync_all()` on the current segment.
    - Atomic rename `.tmp/<n>.ts` → `<n>.ts`.
-   - Append index entries for the IDR boundaries inside that segment;
-     `index_writer.write().sync_all()`.
+   - `index_writer.flush_and_sync()` — the IDR entries themselves were
+     already appended one by one in `write_chunk` as each random-access
+     point was observed; the roll only flushes + fsyncs them.
    - Run retention prune — oldest-first by mtime, capped by both
      `retention_seconds` and `max_bytes`. Either being `0` disables
      that axis (still bounded by free disk on the size axis).
-5. On stop (`stop_recording`) or fatal I/O error: subscriber
-   detaches, current segment closes + fsyncs, `RecordingStats.armed
-   = false`, `recording_stopped` Info event.
+5. On stop (`stop_recording`): the writer goes Idle
+   (`RecordingCommand::Stop`), the current segment closes + fsyncs and
+   is renamed into place, the index is flushed, `RecordingStats.armed
+   = false`. The writer task and its broadcast subscriber stay alive —
+   `write_chunk` returns early while Idle, so the channel keeps
+   draining but nothing reaches disk — and no event is emitted (there
+   is no `recording_stopped` event). On a fatal write error: Critical
+   `replay_disk_full` (`replay_event: disk_full`); the partial segment
+   is closed and renamed into place, or its `.tmp/` staging file
+   unlinked when that close itself fails; the writer stays armed
+   (`armed` is not cleared) and the next roll boundary opens a fresh
+   segment.
 6. Retention will **never** unlink the just-finalized segment id
    (`meta.current_segment_id`) — losing the live edge would tear out
    clips that touch the most recent few seconds. A `max_bytes` cap
@@ -274,10 +307,15 @@ opening a new segment:
    partial segment the writer never atomically renamed onto the
    recording — unlinked unconditionally.
 2. **Resume id derivation.** The next segment id is
-   `max(<NNNNNN>.ts on disk) + 1`, never just `recording.json`'s
-   `current_segment_id`. The meta file is best-effort on the roll
-   path (and may be corrupt after a SIGKILL); trusting it would
-   cause segment-id reuse and overwrite finalized data.
+   `max(largest <NNNNNN>.ts on disk, recording.json's current_segment_id) + 1`.
+   With finalized segments on disk the meta file is never trusted
+   alone: if `recording.json` is missing or fails to parse, the id is
+   `largest <NNNNNN>.ts on disk + 1`. Only when no finalized segment
+   exists is the meta's `current_segment_id` resumed as-is (a
+   brand-new recording, with neither, starts at 0). The meta file is
+   best-effort on the roll path (and may be corrupt after a SIGKILL);
+   trusting it alone would cause segment-id reuse and overwrite
+   finalized data.
 3. **`index.bin` alignment.** If the file length isn't a 24-byte
    multiple (a SIGKILL between `append` and `flush_and_sync` can
    leave a partial entry), `IndexWriter::open` aligns down to the
@@ -293,8 +331,10 @@ opening a new segment:
 
 ### Clip create
 
-1. Operator presses **I** (or `mark_in`). `replay_command_channel`
-   sends `MarkIn { pts? }`. If `pts` is omitted, the writer's
+1. Operator presses **I** (or `mark_in`). The WS arm sends
+   `RecordingCommand::MarkIn { explicit_pts }` down the writer's
+   `RecordingHandle.command_tx` (`explicit_pts` is the command's
+   optional `pts_90khz`). If `pts_90khz` is omitted, the writer's
    current PTS (most recent PCR-derived) is used. Reply carries the
    resolved `pts_90khz` and (best-effort) the SMPTE timecode at that
    PTS.
@@ -326,31 +366,44 @@ pointed at a known clip).
    ≤ target), seeks to the IDR's byte offset, and yields paced bundles
    to the broadcast channel.
 4. **K** key or `stop_playback` halts playback (`playback_stopped`
-   Info). On reaching `clip.out_pts_90khz` with `loop_playback = false`
-   the replayer fires `playback_eof` and idles on the last frame with
-   NULL-PID padding.
+   Info). On reaching the end of the recording on disk (no next
+   `<NNNNNN>.ts` segment) with `loop_playback = false` the replayer
+   fires `playback_eof` and idles with NULL-PID padding; with
+   `loop_playback = true` it wraps to the range's `from_pts_90khz` at
+   that same point. The clip's `out_pts_90khz` (and a `play_clip`
+   `to_pts_90khz`) is recorded on the reader's range and reported in
+   the `playback_started` event, but is not enforced by the inline
+   pump today — a cued clip plays through to the end of the
+   recording. The out-point check exists only in the unused
+   `replay::paced_replayer::pump`.
 
 ## Error matrix
 
-Every error path emits a structured event under category `replay`
-with `details.error_code`. The same `error_code` rides on
-`command_ack.error_code` so the manager UI can highlight the offending
-field on a Create/Update modal without parsing strings.
+Two disjoint channels carry a replay `error_code`, and no code rides on
+both. Recorder-side failures — the writer (`replay::writer`), the
+flow-start arming path (`engine::flow`, which raises `replay_disk_full`
+when the recorder fails to start) and the filmstrip subscriber
+(`replay::filmstrip`) — happen asynchronously with no command in
+flight, so they emit a structured event under category `replay` with
+`details.error_code` and surface on the manager's Events page. Command
+rejections (`mark_in` / `mark_out` / `play_clip` / `update_clip` /
+`delete_recording` / the export verbs, …) carry the code on
+`command_ack.error_code` **only** — no event is raised — so the manager
+UI can highlight the offending field on a Create/Update modal without
+parsing strings.
 
 | `error_code` | Severity | Trigger | Operator action |
 |---|---|---|---|
-| `replay_recording_not_active` | Error | `mark_in`/`mark_out` while flow has no recording armed | Send `start_recording` first |
+| `replay_recording_not_active` | Error | `start_recording` / `stop_recording` / `mark_in` / `mark_out` on a flow whose `recording` block is absent or has `enabled: false` (no writer is spawned at flow start — `engine/flow.rs` filters on `enabled`); `start_recording` on an unknown `flow_id` (the other three return a bare error with no code for that); `mark_in` without an explicit `pts_90khz` on a fresh recording before the writer has seen its first PCR (the counter is still 0), or `mark_out` with no pending `mark_in` (or with `pts_90khz` at or before the pending in-point — the arm lifts every writer-side error under this code) | Add a `RecordingConfig` with `enabled: true` via `configure_recording` (the edge reports `restart_required`; the recorder binds at the next flow start) or `update_flow` (`recording` is a restart-triggering field). For the mark cases, wait for the source to deliver, or send `mark_in` first |
 | `replay_no_playback_input` | Error | `play_clip`/`scrub_playback` on a flow with no `replay` input | Add a `replay` input to the flow |
 | `replay_clip_not_found` | Error | `play_clip`/`delete_clip` with an unknown `clip_id` | Refresh the clip list (it may have been pruned by retention) |
 | `replay_writer_lagged` | Critical | Writer mpsc full; recorder dropped packets | Check disk throughput; reduce concurrent recording flows; investigate fs latency |
 | `replay_disk_pressure` | Warning | Recording usage ≥ 80 % of `max_bytes` (or of replay-root filesystem when `max_bytes = 0`); sticky until back below 70 % | Free disk before ENOSPC; raise `max_bytes` if appropriate; reduce retention |
 | `replay_disk_full` | Critical | Segment write hit ENOSPC | Free disk, then `stop_recording` + `start_recording` to re-arm |
-| `replay_index_corrupt` | Warning | `index.bin` failed validation on open | Phase 1 keeps going (appends new entries); Phase 2 will do a full rebuild from segments |
-| `replay_invalid_segment_seconds` | Error | `RecordingConfig.segment_seconds` outside `[2, 60]` | Use a value in range |
-| `replay_invalid_recording_id` | Error | `start_recording` references a flow with no `recording` config | Add `RecordingConfig` to the flow first |
-| `replay_storage_id_invalid` | Error | `RecordingConfig.storage_id` fails the alphanumeric + `._-` ≤ 64 char rule | Use a valid id |
+| `validation_error` | Error (`command_ack.error_code` only — no event) | `configure_recording`, `create_flow`, `update_flow` or `update_config` carrying a `recording` block whose `segment_seconds` is outside `[2, 60]`, `pre_buffer_seconds` outside `[1, 300]` or above a non-zero `retention_seconds`, `filmstrip_seconds` outside `[1, 30]`, `storage_id` not 1–64 ASCII alphanumerics + `_-`, or no `storage_id` on a flow whose id is not a single path component (`.`, `..`, or containing `/` `\`). The same check refuses `config.json` at node start, where there is no ack at all | Use a value in range, or set a valid `storage_id` |
+| `replay_storage_id_invalid` | Error (`command_ack.error_code` only — no event) | `delete_recording` whose `recording_id` is empty, > 64 chars, or contains a character outside ASCII alphanumerics + `_-`, or whose directory could not be removed (`remove_dir_all` failed; a directory that does not exist is acked with `bytes_freed: 0`, not refused). A bad `RecordingConfig.storage_id` is never reported under this code — it is refused as `validation_error` (row above), and `.` is not permitted in the charset | Use a valid id / check the replay volume |
 | `replay_invalid_field` | Error | `mark_out` / `rename_clip` / `update_clip` `name` > 256 chars or contains control chars; `description` > 4096 chars | Trim to limits |
-| `replay_invalid_range` | Error | `play_clip` / `scrub_playback` with `to_pts_90khz < from_pts_90khz` (or below the clip's `in_pts`); `update_clip` with the prospective `in_pts_90khz / out_pts_90khz` inverted | Pass a forward range |
+| `replay_invalid_range` | Error | `update_clip` whose prospective `out_pts_90khz <= in_pts_90khz` (empty or inverted); `export_recording` (TS or MP4) with both bounds supplied and `to_pts_90khz <= from_pts_90khz`; `export_clip` (TS or MP4) on a clip whose stored `out_pts_90khz <= in_pts_90khz`. `play_clip` with `to_pts_90khz < from_pts_90khz` (or below the clip's `in_pts` when `from` is omitted) is refused too, but its ack carries `replay_clip_not_found` with `replay_invalid_range` as the message; `scrub_playback` takes a single `pts_90khz` and cannot raise it | Pass a forward range |
 | `replay_invalid_tag` | Error | `update_clip` (or any tag-bearing path) with a tag that fails `[A-Z0-9_-]{1,32}`, more than 16 tags per clip | Use the v1 fixed set (`GOAL`/`FOUL`/`OFFSIDE`/`SAVE`/`YELLOW`/`VAR-CHECK`) or shorten / re-case |
 | `replay_max_bytes_below_segment` | Warning | Retention can't satisfy `max_bytes` without deleting the live edge — operator's cap is smaller than one segment | Raise `max_bytes` to at least `segment_seconds × bitrate × 2` |
 | `replay_metadata_stale` | Warning | `recording.json` write failed on segment roll; recovery scan will derive next segment id from the directory listing on restart | Investigate the disk (typically ENOSPC on the replay volume) |
@@ -368,12 +421,14 @@ references it any more). The latter is the recovery path when a
 flow has been deleted but its segments + clips persisted on disk
 under the same `<recording_id>` — the operator points a fresh flow
 at it via a `replay` input and uses `recording_id` to enumerate the
-clips. When both fields are present, `flow_id` wins.
+clips. When both fields are present, `recording_id` wins and `flow_id`
+is not consulted.
 
 Disk-pressure monitoring runs alongside the reactive ENOSPC handling.
 On every segment roll the writer computes a usage percentage —
-`bytes_written / max_bytes` when the operator set a per-recording
-cap, or filesystem `(total - free) / total` when `max_bytes = 0`.
+`(on-disk segment bytes after prune) / max_bytes` when the operator
+set a per-recording cap, or filesystem `(total - free) / total` when
+`max_bytes = 0`.
 Crossing 80 % emits a sticky `replay_disk_pressure` Warning;
 recovery is signalled when usage falls back below 70 % (hysteresis
 on the same sticky bit), so a continuously-pressured recorder
@@ -390,7 +445,7 @@ render a coloured disk meter as soon as the recorder is armed.
 | Field | Meaning |
 |---|---|
 | `armed` | `true` while a recording session is active. Pre-buffer mode keeps `armed = false` so the manager UI can distinguish pre-roll from a recording session and the stall detector doesn't fire on pre-buffered flows. |
-| `mode` | Phase 2 / 1.5 — wire-string mirror of [`WriterMode`]: `"armed"` when a session is live, `"pre_buffer"` when the writer is rolling pre-roll TS but the operator hasn't pressed Start, `"idle"` when the writer is stopped (post-Stop with no pre-buffer, or post-cancel). Drives the `/replay` page's tri-state `Recording / Pre-roll / Idle` badge and the flow-card `● PRE-ROLL` chip. Older edges omit the field; the manager falls back to `armed`-derived state. |
+| `mode` | Phase 2 / 1.5 — wire-string mirror of [`WriterMode`]: `"armed"` when a session is live, `"pre_buffer"` when the writer is rolling pre-roll TS but the operator hasn't pressed Start, `"idle"` when the writer is stopped — after any Stop (pre-buffer configured or not; a Stop never returns to `pre_buffer`), or after cancel. Drives the `/replay` page's tri-state `Recording / Pre-roll / Idle` badge and the flow-card `● PRE-ROLL` chip. Older edges omit the field; the manager falls back to `armed`-derived state. |
 | `segments_written` | Completed, rolled, fsynced segments |
 | `bytes_written` | Total bytes appended (across all segments, including pruned) |
 | `segments_pruned` | Segments evicted by retention (mtime / size) |
@@ -532,10 +587,18 @@ workflows. Bounds:
 - Each tag matches `^[A-Z0-9_-]{1,32}$` (operator-friendly enum
   shorthand — `GOAL`, `FOUL`, `VAR-CHECK`, etc.).
 - ≤ 16 tags per clip. Server-side dedup'd in input order.
-- Hard-coded set in the manager UI's quick-tag bar for v1 (`GOAL`,
-  `FOUL`, `OFFSIDE`, `SAVE`, `YELLOW`, `VAR-CHECK`); the edge stores
-  whatever the manager sends so per-group customisation later doesn't
-  need an edge release.
+- The manager's quick-tag bar is configured per group rather than
+  hard-coded: Admin → Groups → Replay quick-tags (`/admin/replay-tags`)
+  stores up to 20 named profiles on `groups.replay_tag_profiles`, each
+  of at most 9 tags (one per hotkey 1–9), seeded from built-in sport
+  presets in `shared/replay_tag_presets.js`; each operator picks their
+  active profile per group (`ui_preferences.replay_tag_profile_id`). A
+  group with no profile config falls back to the built-in Soccer preset
+  (`GOAL`, `FOUL`, `OFFSIDE`, `SAVE`, `YELLOW`, `VAR-CHECK`); a group
+  that saved an empty list hides the bar. The edge
+  stores whatever the manager sends, validating shape only
+  (`replay::clips`), which is why that customisation needed no edge
+  release.
 
 ### `update_clip` (the unified clip-mutation command)
 
@@ -554,9 +617,13 @@ workflows. Bounds:
 At least one of `name` / `description` / `tags` / `in_pts_90khz` /
 `out_pts_90khz` must be set. Returns the updated `ClipInfo`.
 
-**SMPTE TC handling on trim.** The IDR index doesn't carry SMPTE
-strings (just PTS / segment / offset / flags), so the edge can't
-cheaply re-derive a fresh `HH:MM:SS:FF` for a new in/out PTS. When
+**SMPTE TC handling on trim.** Every `index.bin` entry carries a packed
+SMPTE timecode (`smpte_tc: u32`, bytes 8..12, flagged
+`SMPTE_TC_VALID`), and the writer already resolves `HH:MM:SS:FF` for an
+arbitrary PTS through it (`lookup_smpte_in_index` + `unpack_smpte_tc`,
+used by `mark_in` / `mark_out`). `update_clip`, however, runs through
+`ClipStore` alone, which holds no index handle, so it does not
+re-derive the timecode for a new in/out PTS. When
 `in_pts_90khz` is set, `smpte_in` is cleared on the clip (and likewise
 for the out side); the manager UI renders `—` until the operator
 re-marks. Persisting a stale SMPTE that no longer matches the PTS
@@ -576,17 +643,32 @@ edges keep accepting the legacy shape.
   audio-on-scrub toggle remain follow-ups.
 - **Seeks snap to the nearest IDR ≤ target.** Frame-accurate
   scrubbing is still a follow-up.
-- **No index rebuild on corruption.** `replay_index_corrupt` is a
-  Warning today; the writer keeps appending. Phase 2 will rebuild
-  from segments at open time.
+- **No index rebuild on corruption.** The only check `index.bin` gets
+  on open is length alignment: a file whose length is not a multiple
+  of 24 bytes (a SIGKILL between `append` and `flush_and_sync`) is
+  silently truncated down to the last whole entry by
+  `IndexWriter::open`, the reader (`InMemoryIndex::load`) ignores the
+  same partial tail, and the writer keeps appending. There is no CRC
+  or content validation, no `replay_index_corrupt` event, and nothing
+  is surfaced to the operator (the start-up `replay_recovery_alert`
+  covers `.tmp` orphans and `recording.json`, not the index). Phase 2
+  will rebuild from segments at open time.
 - **Clip IDs are edge-side generated.** Cross-edge collision
   handling isn't in scope — clip IDs are scoped to a recording.
 - **SMPTE TC cleared on trim.** When `update_clip` changes
   `in_pts_90khz` / `out_pts_90khz`, the corresponding `smpte_in` /
-  `smpte_out` is cleared (the IDR index doesn't carry SMPTE strings,
-  so the edge can't cheaply re-derive a fresh `HH:MM:SS:FF`). The
-  manager UI shows `—` until the operator re-marks. A Phase 3 index
-  schema bump could carry SMPTE alongside PTS to remove this gap.
+  `smpte_out` is cleared and the manager UI shows `—` until the
+  operator re-marks. This is not an index-schema gap: every
+  `index.bin` entry already carries a packed SMPTE TC (bytes 8..12,
+  `SMPTE_TC_VALID` flag), and `mark_in` / `mark_out` already resolve
+  `HH:MM:SS:FF` from it by floor-IDR lookup (`lookup_smpte_in_index`
+  in `src/replay/writer.rs`). `ClipStore::update` simply never
+  consults the index — the `update_clip` handler opens the store from
+  `clips.json` alone. Closing the gap means loading the recording's
+  `index.bin` (`InMemoryIndex::load`, as the reader does) in that
+  handler and running the same floor lookup for the new PTS (the
+  lookup helper is private to the writer today and would need
+  exposing); no schema change is needed.
 
 ## Recordings library (browse / export / delete after recording stops)
 

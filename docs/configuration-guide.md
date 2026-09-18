@@ -553,8 +553,8 @@ that does not manage this block cannot silently switch a SIEM feed off.
 ## Node Tuning
 
 Optional top-level `tuning` block holding node-wide defaults. Every
-field here was previously reachable **only** through an environment
-variable, which meant the manager could neither show nor set it, an
+field here but `heap_trim_secs` was previously reachable **only** through an
+environment variable, which meant the manager could neither show nor set it, an
 operator had to edit a systemd unit and restart per node, and nothing
 was audited. They are ordinary config fields now, so they arrive over
 the same validated `UpdateConfig` path as everything else.
@@ -570,8 +570,12 @@ buffer, so treating an absent key as "clear it" would let any unrelated push —
 a device rename, a visual deploy, a config restore, a reconcile retry —
 silently switch a live buffer off on every raw UDP/RTP input on the node.
 **Clearing the block therefore needs an explicit `"tuning": {}`**, which
-deserialises to all-`None` and resolves to the built-in defaults; the manager's
-Tuning tab sends exactly that. The same preserve-when-absent rule covers
+deserialises to all-`None` and resolves to the built-in defaults. The manager's
+Tuning tab always sends the key rather than omitting it — starting from the
+block the node holds, rewriting only the six fields it models and carrying
+every other key (`heap_trim_secs` today) across untouched — so an all-blank
+Save clears exactly those six and never resets a field the tab does not show.
+The same preserve-when-absent rule covers
 `monitor`, `upgrades`, `resource_limits`, `logging`, `nmos_registration` and
 `device_name`.
 
@@ -584,7 +588,8 @@ Tuning tab sends exactly that. The same preserve-when-absent rule covers
     "probe_session_limits": true,    // startup HW session-capacity probe
     "probe_4k": false,               // skip the second-tier 4K pass
     "media_player_controller": true, // media-player operator transport control
-    "media_player_pcr_deadlines": true // PCR-anchored TS playout pacing
+    "media_player_pcr_deadlines": true, // PCR-anchored TS playout pacing
+    "heap_trim_secs": 60             // malloc_trim cadence, 0 = off (glibc builds)
   },
   "inputs": [],
   "outputs": [],
@@ -600,16 +605,24 @@ Tuning tab sends exactly that. The same preserve-when-absent rule covers
 | `probe_4k` | boolean | No | `true` | Run the second-tier 4K session-capacity probe. Ignored when `probe_session_limits` is `false` — that disables both tiers. |
 | `media_player_controller` | boolean | No | `true` | Node-wide default for the media-player operator-control (transition) path — the state machine the manager's **Next** button drives. `false` selects the legacy sequential playout loop **and** withdraws the `media-player-control-v1` capability, so Next disappears from every media-player flow on the node rather than being offered and refused. A per-input `operator_control` always wins. |
 | `media_player_pcr_deadlines` | boolean | No | `true` | Node-wide default for PCR-anchored TS playout pacing. `false` selects the legacy byte-rate estimate, whose error integrates without bound on variable-bitrate assets. A per-input `pcr_deadlines` always wins. |
+| `heap_trim_secs` | integer | No | `60` | How often, in seconds, the process hands the glibc allocator's free pages back to the kernel with `malloc_trim(0)`, run on a blocking thread rather than a runtime worker. `0` switches the trimmer off; otherwise the range is `10`..`3600` (validation refuses anything else). Each pass takes every arena's lock in turn, so a contribution node whose PCR gates leave no room for a recurring sweep can lengthen or disable it here. Read **once at node start**, so a pushed change lands at the node's next restart — and unlike the two probe switches the push raises **no** `tuning_requires_restart` warning for it. glibc builds only (all three published artefacts are `*-linux-gnu` targets): a musl or macOS build validates the value and otherwise ignores it, because those allocators return pages on free. Unlike every other field here it never had an environment variable, and the manager's Tuning tab does not yet show it: set it in `config.json` or through the raw JSON editor under **Node Configuration** on the manager's node page — the Tuning tab carries it across a Save untouched. |
 
-**When a pushed change lands.** The two probe switches are read once at
-node start, so an edit to either takes effect at the node's next
-restart; the push says so — it raises a Warning `tuning_requires_restart`
-event naming both fields, rather than leaving the operator to infer it
-from an unchanged Resources card. The two ingress knobs and the two
-media-player knobs are re-installed on the push and re-read on every
-input spawn, so a flow restart or a hot input swap picks them up; an
-input already running keeps the values it spawned with. No restart
-warning is raised for those four, because none is needed.
+**When a pushed change lands.** The two probe switches and
+`heap_trim_secs` are read once at node start, so an edit to any of the
+three takes effect at the node's next restart. For the probe switches
+the push says so — it raises a Warning `tuning_requires_restart` event
+whose `details.fields` names `tuning.probe_session_limits` and
+`tuning.probe_4k`, rather than leaving the operator to infer it from an
+unchanged Resources card. **No such warning is raised for
+`heap_trim_secs`**: the event's field list is fixed to the two probe
+switches and the push-time diff does not compare `heap_trim_secs` at
+all, so a pushed change to it is accepted and saved while the running
+trimmer keeps the interval it booted with, silently, until the next
+restart. The two ingress knobs and the two media-player knobs are
+re-installed on the push and re-read on every input spawn, so a flow
+restart or a hot input swap picks them up; an input already running
+keeps the values it spawned with. No restart warning is raised for
+those four, because none is needed.
 
 **Per-input overrides.** UDP and RTP inputs carry their own
 `ingress_dejitter_ms` and `ingress_residence_ms` (see
@@ -636,6 +649,7 @@ the manager's Events page rather than silently steering the node.
 | `tuning.probe_4k` | `BILBYCAST_PROBE_4K` | Deprecated — still read for one release, below the config field. |
 | `tuning.media_player_controller` | `BILBYCAST_MEDIA_PLAYER_CONTROLLER` | Deprecated — still read for one release, below the config field. |
 | `tuning.media_player_pcr_deadlines` | `BILBYCAST_MEDIA_PLAYER_PCR_DEADLINES` | Deprecated — still read for one release, below the config field. |
+| `tuning.heap_trim_secs` | *(none)* | Never an environment variable — it arrived as a config field, which is where a behaviour knob belongs. **Not yet on the Tuning tab** — set it in `config.json` or the manager's raw JSON config editor; the tab carries it across a Save untouched. |
 | *(none — deliberately)* | `BILBYCAST_MEDIA_PLAYER_INCREMENTAL_MP4` | **Removed.** The bounded incremental MP4/MOV reader is unconditional in release builds. This selected the whole-file demux, which holds an entire asset resident — the out-of-memory the bounded reader was written to fix. A control whose "off" position is a known OOM does not belong on an operator's screen, so unlike its two siblings it was not given a config field; it survives in debug builds only. |
 
 **Manager UI.** Manager → node → **Configure** → **Tuning**. The tab is
@@ -2171,8 +2185,8 @@ CMAF with DRM:
 | `chunk_duration_ms` | integer | No | `500` | LL-CMAF chunk duration in ms. Range: 100-2000. Ignored when `low_latency = false`. |
 | `thumbnails` | object | No | `null` | Scrub-preview sprite sheets plus a WebVTT index, PUT beside the media. See [`thumbnails`](#the-cmaf-thumbnails-block) below. Off when omitted. |
 | `encryption` | object | No | `null` | Common Encryption configuration. **Refused together with `low_latency = true`** — the LL path does not encrypt its chunks (bilbycast-edge#135). See [`encryption`](#the-cmaf-encryption-block) below. |
-| `audio_encode` | object | No | `null` | Optional AAC re-encode. Allowed `codec`: `aac_lc`, `he_aac_v1`, `he_aac_v2`. Source must already be AAC (TsDemuxer decodes via fdk-aac). When omitted, the source AAC passes through unchanged. |
-| `video_encode` | object | No | `null` | Optional H.264 / HEVC re-encode; the operator's `gop_size` is honoured and segments cut on its IDRs. See [`video_encode`](transcoding.md#video_encode--h264--hevc-re-encoding) in `transcoding.md` for backends and fields. H.264 → H.264 or HEVC → H.264 conversion is supported when the matching `video-encoder-*` Cargo feature is enabled. |
+| `audio_encode` | object | No | `null` | Optional AAC re-encode. Allowed `codec`: `aac_lc`, `he_aac_v1`, `he_aac_v2`. With it set, the source audio is decoded and re-encoded to the configured profile: ADTS-carried AAC (stream_type `0x0F`) through the in-process AAC decoder (fdk-aac under the default `fdk-aac` feature, symphonia without it); MP2, AC-3, E-AC-3 and LATM-carried AAC (`0x11`) through libavcodec, which needs the default `media-codecs` feature — a build without it drops those frames. Opus and AC-4 sources contribute no audio even with `audio_encode` set. When omitted, ADTS AAC passes through unchanged and every other source codec — LATM AAC included — contributes no audio: CMAF wants AAC on the wire and there is no transmux without a re-encode, so an MP2 / AC-3 / E-AC-3 / AAC-LATM source needs this block. |
+| `video_encode` | object | No | `null` | Optional H.264 / HEVC re-encode; the operator's `gop_size` is honoured and segments cut on its IDRs. See [`video_encode`](transcoding.md#video_encode--h264--hevc-re-encoding) in `transcoding.md` for backends and fields. Either direction is supported — H.264 or HEVC in, H.264 or HEVC out, as the chosen backend dictates (the track is built as the family the encoder emits, so `x265` fed an H.264 source publishes HEVC) — when the matching `video-encoder-*` Cargo feature is compiled in. `codec` must name an explicit backend (`x264`, `x265`, `h264_nvenc`, `hevc_nvenc`, `h264_qsv`, `hevc_qsv`, `h264_vaapi`, `hevc_vaapi`, `h264_rkmpp`, `hevc_rkmpp`); the `h264_auto` / `hevc_auto` / `auto` aliases that other outputs resolve per-host are refused on a CMAF output. |
 | `program_number` | integer | No | `null` | MPTS → SPTS program filter. Must be `> 0`. See [MPTS → SPTS filtering](#mpts--spts-filtering). |
 | `auth_token` | string | No | `null` | Bearer token sent with every HTTP PUT / chunked PUT. |
 
@@ -2219,7 +2233,7 @@ clock, having no timeline in common with the generator otherwise.
 When `encryption` is set, the edge:
 
 1. Emits `encv` / `enca` sample entries that wrap `avc1` / `hvc1` / `mp4a` via a `sinf/frma/schm/schi/tenc` chain (ISO/IEC 23001-7 §8).
-2. Subsample-encrypts each H.264 / HEVC sample — NAL length prefix + NAL header + 32 bytes of slice header are left clear; the rest of the VCL NAL payload is encrypted. Parameter-set NALs (SPS / PPS / VPS / SEI / AUD) stay fully clear. For `cbcs` the encrypted span is rounded down to a multiple of 16 bytes.
+2. Subsample-encrypts each H.264 / HEVC sample — NAL length prefix + NAL header + 32 bytes of slice header are left clear; the rest of the VCL NAL payload is encrypted. Parameter sets and AUDs never reach the encryptor — the segmenter strips SPS / PPS / VPS / AUD from every fragment sample (`filter_frame_nalus_h264` / `_h265` in `src/engine/cmaf/nalu.rs`) and they ride in the init segment's `avcC` / `hvcC`, which is never encrypted. Of what remains, the only NAL type left fully clear is an H.264 SEI: `fully_clear` in `src/engine/cmaf/cenc.rs` allowlists SPS / PPS / AUD / SEI for H.264 but only VPS / SPS / PPS / AUD for HEVC, so every HEVC NAL in a fragment — prefix and suffix SEI (types 39 / 40) included — and any H.264 NAL outside that list takes the slice treatment above. For `cbcs` the encrypted span is rounded down to a multiple of 16 bytes.
 3. AAC samples *would be* whole-encrypted with no subsample split — `encrypt_audio_sample` implements it and nothing calls it. **An encrypted output is video-only**: the track list is decided before "does this source have audio", so an encrypted output never declares an audio track it cannot fill, and no audio sample reaches this path.
 4. Writes `senc` / `saio` / `saiz` into every `traf` with correctly back-patched offsets.
 5. Emits a ClearKey `pssh` (system ID `1077efec-c0b2-4d02-ace3-3c1e52e2fb4b`, version 1) into `moov`, plus any operator-supplied `pssh_boxes` verbatim.
@@ -2228,7 +2242,7 @@ When `encryption` is set, the edge:
 
 - Output only. Standard-mode segment-based transport adds 1-4 s latency; LL-CMAF with 500 ms chunks targets <3 s glass-to-glass.
 - Source must emit an IDR at least every `segment_duration_secs` unless `video_encode` is set.
-- `video_encode` requires the `media-codecs` feature plus a matching `video-encoder-x264` / `-x265` / `-nvenc` / `-qsv` backend compiled in.
+- `video_encode` requires the `media-codecs` feature plus a matching `video-encoder-x264` / `-x265` / `-nvenc` / `-qsv` / `-vaapi` / `-rkmpp` backend compiled in, named explicitly in `codec` — a CMAF output refuses `h264_auto` / `hevc_auto` / `auto` at validation, because the CMAF re-encoder does not resolve the aliases.
 - Whip-style signaling is not needed — CMAF is stateless HTTP push.
 
 See [`docs/cmaf.md`](cmaf.md) for the full reference, ingest compatibility notes, and performance tuning.
@@ -4331,7 +4345,9 @@ the flow id; override via `RecordingConfig.storage_id`):
 
 ```
 000000.ts  000001.ts  ...  NNNNNN.ts
-recording.json   ← created_at, segment_seconds, schema_version
+recording.json   ← schema_version, recording_id, created_at_unix, segment_seconds, current_segment_id
+                   (+ anchor_wall_us / anchor_pts_90khz once the first index entry lands, and
+                    recent_wall_us / recent_pts_90khz re-sampled every 60 s while the writer runs)
 index.bin        ← timecode → byte-offset (24 B / IDR)
 clips.json       ← named (in_pts, out_pts) ranges
 .tmp/            ← in-flight segment writes; atomic rename on roll
@@ -4360,13 +4376,13 @@ clips.json       ← named (in_pts, out_pts) ranges
 
 | Field | Default | Notes |
 |---|---|---|
-| `enabled` | `true` | When `false`, the writer is built but doesn't subscribe — useful for cron-armed recording via routines |
-| `storage_id` | `null` (= flow id) | Subdirectory under the replay root. Same character set as media filenames (alphanumeric + `._-`, ≤ 64 chars) |
+| `enabled` | `true` | When `false` the configuration is kept but no writer is spawned at all (`engine::flow` filters on it before `spawn_writer`), so `start_recording` / `stop_recording` — and therefore a routine's `start_recording` action — answer `replay_recording_not_active` ("has no recording configured"). To arm later from a routine keep `enabled: true`: with no `pre_buffer_seconds` the writer starts `Armed` at flow start and records until a `stop_recording`, after which the task stays alive in `Idle` and `start_recording` re-arms it; or set `pre_buffer_seconds` so the writer starts in pre-buffer mode and `start_recording` opens the session with the pre-roll as its head. The toggle is read at flow start: changing it on a running flow restarts the flow (`flow_fields_requiring_restart`) |
+| `storage_id` | `null` (= flow id) | Subdirectory under the replay root. ASCII alphanumerics plus `_` and `-` only, 1–64 chars — narrower than a media filename: no `.` and no space. When unset the flow id is used as the directory name, checked only for being a single path component: a flow id that contains `/` or `\`, or is `.` / `..`, is refused at validation (config load and `configure_recording` alike), so such a flow must set `storage_id` explicitly — while a dotted flow id such as `stadium.cam1` is still accepted as the default directory, even though an explicit `storage_id` may not contain a `.` |
 | `segment_seconds` | `10` | Wall-clock segment roll cadence. Range `[2, 60]` |
 | `retention_seconds` | `86400` (24h) | Oldest-first prune by mtime. `0` = unlimited |
 | `max_bytes` | `53687091200` (50 GiB) | Oldest-first prune by total size. `0` = unlimited (still subject to disk) |
 | `pre_buffer_seconds` | `null` | When set, the writer auto-arms in `PreBuffer` mode and rolls segments to disk with retention pinned at this value, so an operator pressing Start later picks up the last `N` seconds of pre-roll. `null` = no pre-buffer (writer starts in `Armed` mode the moment it spawns). Range `[1, 300]` when set. `RecordingStats.armed` stays `false` while in pre-buffer so the manager UI distinguishes pre-roll from a live recording session |
-| `filmstrip_seconds` | `null` (= off) | Filmstrip-thumbnail cadence in seconds. When set, a sibling drop-on-lag broadcast subscriber decodes one frame every `N` seconds and writes a 160-px-wide JPEG to `<recording_dir>/thumbs/<pts_90khz>.jpg` (staged in `.tmp/` and renamed, so a SIGKILL leaves no half-file), which the manager `/replay` page renders as the scrubber strip. Range `[1, 30]`. Independent of the live `FlowConfig.thumbnail` boolean — that one goes to the manager over WS, this one goes to disk. The `replay-filmstrip` capability, which is what the manager UI gates both this field and the `…/replay/filmstrip` fetch on, is advertised by any `replay` build whether or not this field is set |
+| `filmstrip_seconds` | `null` (= off) | Filmstrip-thumbnail cadence in seconds. When set, a sibling drop-on-lag broadcast subscriber decodes one frame every `N` seconds and writes a 160-px-wide JPEG to `<recording_dir>/thumbs/<pts_90khz>.jpg` (staged in `.tmp/` and renamed, so a SIGKILL leaves no half-file), which the manager `/replay` page renders as the scrubber strip. Range `[1, 30]`. Independent of the live `FlowConfig.thumbnail` boolean — that one goes to the manager over WS, this one goes to disk. The `replay-filmstrip` capability is advertised by any `replay` build whether or not this field is set, and nothing in the manager actually tests it: the flow form shows this field on the plain `replay` bit (with the rest of the Recording sub-section), and the `/replay` page fetches `…/replay/filmstrip` unconditionally, dropping back to a strip-less timeline only when the manager reports `supported: false` after an `unknown_action` ack from an edge that predates the `list_filmstrip` command |
 
 The writer is a sibling subscriber on the flow's broadcast channel —
 drop-on-lag with a Critical `replay_writer_lagged` event mirrors the
@@ -4392,15 +4408,35 @@ never blocks on `write_all`.
 |---|---|---|
 | `recording_id` | (required) | The on-disk recording to read from |
 | `clip_id` | `null` | Optional — when set, only that clip's `[in_pts, out_pts]` range plays. Otherwise the whole recording is available |
-| `start_paused` | `true` | When `true`, the input idles on flow start until a `play_clip` / `cue_clip` command activates playback |
+| `start_paused` | `true` | When `true`, the input idles on flow start until a `play_clip` command starts playback (`cue_clip` only pre-loads a clip and leaves the input paused). When `false`, playback begins immediately at the configured `clip_id` start or the beginning of the recording |
 | `loop_playback` | `false` | When `true`, restart at the beginning on EOF |
 | `passthrough_clock` | `false` | Opt out of muxer-mode PCR + PES PTS/DTS regeneration on the replayed TS — see [RTP Input](#rtp-input) |
 
-Phase 1 supports 1.0× forward playback only — no reverse, no
-slow-mo. Mark / cue / play / scrub / stop commands flow via the WS
-`mark_in` / `mark_out` / `cue_clip` / `play_clip` / `scrub_playback`
-/ `stop_playback` actions and route through the per-flow replay
-command channel.
+Playback runs forward only — there is no reverse — but not only at
+1.0×: `play_clip` and `set_speed` take a `speed` in `(0, 1.0]` for slow
+motion, with PCR and PES PTS/DTS rewritten so the receiver's clock
+still advances at wall-clock rate (`set_speed` re-anchors on the next
+PCR so the change is continuous; 1.0× keeps the zero-rewrite fast
+path). An out-of-range value is refused with the message
+`replay_invalid_speed` — that is also the `command_ack.error_code` on
+`set_speed`, but on `play_clip` every refusal (invalid speed, or a
+`start_at_unix_ms` more than 5 s in the future, `replay_invalid_start_at`)
+is coded `replay_clip_not_found`. `step_frame { direction: "backward" }`
+re-seeks to the last IDR before the current position and pauses;
+`direction: "forward"` (the default) emits the packets up to the next
+video PES start as one bundle but then leaves the input playing at the
+current speed — the pause after a forward step that the code comments
+describe is not implemented. All of `cue_clip` / `play_clip` /
+`stop_playback` / `scrub_playback` / `set_speed` / `step_frame` are WS
+actions addressed by `flow_id` and routed through the command channel
+of the flow's *active* replay input (`replay_no_playback_input` if the
+active input is not one); `mark_in` / `mark_out` address the flow's
+recording writer instead (`replay_recording_not_active` when it has
+none). The manager shows the speed presets and the
+`,` / `.` step buttons only when the node advertises the `replay-v2`
+capability (without it the `,` / `.` hotkeys and touch buttons fall
+back to a 33 ms `scrub_playback` seek), and its `…/replay/speed`
+proxy rejects an out-of-range speed with HTTP 400 before forwarding.
 
 ### Events
 
@@ -4408,8 +4444,14 @@ See [`events-and-alarms.md`](events-and-alarms.md#replay-server-events)
 for the full list of `replay_event` values and `command_ack.error_code`
 codes (`replay_recording_not_active`, `replay_no_playback_input`,
 `replay_clip_not_found`, `replay_writer_lagged`, `replay_disk_full`,
-`replay_index_corrupt`, `replay_invalid_field`, `replay_invalid_range`,
-`replay_invalid_tag`).
+`replay_recovery_alert`, `replay_invalid_field`, `replay_invalid_range`,
+`replay_invalid_tag`). `replay_recovery_alert` is the only
+restart-recovery code — the Warning `spawn_writer` raises when it has
+cleaned `.tmp/` orphans, found `recording.json` corrupt, or found a
+finalized segment on disk newer than the one `recording.json` records
+(`details.tmp_orphans_removed` / `.meta_corrupt` / `.next_segment_id`);
+a short `index.bin` is aligned down to the last 24-byte boundary
+silently and raises nothing.
 
 ### `recording_status` response shape
 

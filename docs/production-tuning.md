@@ -261,7 +261,7 @@ unit file:
 | `tuning.probe_4k` | `BILBYCAST_PROBE_4K` | Deprecated — read below the config field |
 | `tuning.media_player_controller` | `BILBYCAST_MEDIA_PLAYER_CONTROLLER` | Deprecated — read below the config field |
 | `tuning.media_player_pcr_deadlines` | `BILBYCAST_MEDIA_PLAYER_PCR_DEADLINES` | Deprecated — read below the config field |
-| `tuning.heap_trim_secs` | *(none — new)* | No env var ever existed; it arrived as a config field, which is where a behaviour knob belongs. **Not yet on the Tuning tab**: set it in `config.json` (or the manager's raw config editor). The tab carries it across a Save untouched — it used to rebuild the block from its own fields and silently dropped it |
+| `tuning.heap_trim_secs` | *(none — new)* | No env var ever existed; it arrived as a config field, which is where a behaviour knob belongs. **Not yet on the Tuning tab**: set it in `config.json` (or the manager's raw config editor). The tab carries it across a Save untouched — it used to rebuild the block from its own fields and silently dropped it. Like the two probe switches it is read once at node start (`spawn_heap_trimmer` in `main.rs`), so a value set either way — in `config.json` or pushed through the raw editor — lands at the node's next restart; but unlike them the edge raises no `tuning_requires_restart` for it (the `update_config` diff names only the two probe fields), so the operator has to know |
 | *(none — deliberately)* | `BILBYCAST_MEDIA_PLAYER_INCREMENTAL_MP4` | **Removed** — its "off" position selected the whole-file MP4 demux, which holds an entire asset resident; that OOM is what the bounded reader fixed, so it was withdrawn rather than migrated. Debug builds only |
 
 On the edge the **config field wins** and a deprecated variable is the
@@ -279,7 +279,8 @@ that isn't being applied.
 The two **probe** switches are read once at node start, so a pushed
 change takes effect at the node's next restart — and the edge says so,
 raising a Warning `tuning_requires_restart` rather than leaving the
-operator to infer it. The two **ingress** knobs and the two
+operator to infer it. `heap_trim_secs` is also read once at start, but a
+change to it raises no such warning. The two **ingress** knobs and the two
 **media-player** knobs are re-installed on every `update_config` and read
 at the next input spawn, so a flow restart applies them. A per-input
 `ingress_dejitter_ms` / `ingress_residence_ms` (UDP + RTP inputs), or

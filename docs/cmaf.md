@@ -70,8 +70,10 @@ project-wide "never block the data path" invariant.
 - LL-CMAF uses `reqwest::Body::wrap_stream` over a
   `tokio::sync::mpsc::channel(8)`. Chunks are pushed with `try_send`;
   if the channel is full (ingest is too slow) the PUT is aborted, a
-  throttled Warning event is emitted, and the current segment is
-  discarded — the broadcast subscriber is **never blocked**.
+  Warning event is emitted (once per aborted segment — it is the
+  origin-closed case, not this one, that is held to one Warning per
+  failure episode), and the current segment is discarded — the
+  broadcast subscriber is **never blocked**.
 
 Under 60 s of 15 Mbps 1080p30 H.264+AAC passthrough, peak edge CPU
 measured 3 % with zero broadcast lag events
@@ -81,8 +83,8 @@ measured 3 % with zero broadcast lag events
 
 CMAF segments must begin with an IDR / RAP. The segmenter:
 
-1. Tracks the wall-clock DTS of the first sample of the current
-   segment (`segment_base_dts`).
+1. Tracks the media-timeline DTS (the source's unwrapped 90 kHz PTS) of
+   the first sample of the current segment (`segment_base_dts`).
 2. On each arriving IDR / RAP, checks whether `dts - base >=
    target_duration_90k`. If yes, closes the current segment and opens
    a new one at this sample.
@@ -187,8 +189,13 @@ and seeds its window from those rows, each keeping its own
   is kept either way, because renumbering would overwrite segments the origin
   still holds, and so is the generation: a run that finds rows naming
   `init-3.mp4` continues at 3. A manifest written before the tag existed says
-  nothing, which is treated as a match — refusing every such restore would
-  cost the window on no evidence.
+  nothing, but the init object its rows name does: every init the restored
+  rows name is read back at restore anyway (the republish needs the bytes),
+  so with no tag the served object is fingerprinted and compared in the tag's
+  place, and the comparison covers that window too. Only when that read-back
+  also failed — the GET erred, or the two-second budget ran out — is there
+  nothing to compare, and the restore proceeds as a match: the rows are kept
+  either way, and refusing it would cost the window on no evidence.
 
 Best-effort throughout: a fresh stream 404s, and an origin that cannot be
 reached is not a reason to refuse to start. The cost of failing here is no
@@ -1008,7 +1015,7 @@ Per segment, the edge:
    it (spec-compliant).
 2. Every `chunk_duration_ms` of accumulated media, emits one
    `moof + mdat` chunk into the PUT's body stream.
-3. Updates `manifest.m3u8` with `#EXT-X-PART:URI="seg-NNNNN.m4s?part=N",DURATION=0.500[,INDEPENDENT=YES]`
+3. Updates `manifest.m3u8` with `#EXT-X-PART:DURATION=0.500,URI="seg-NNNNN.m4s?part=N"[,INDEPENDENT=YES]`
    advertising the part. DASH `manifest.mpd` carries
    `availabilityTimeOffset` on the `SegmentTemplate`. The in-progress row
    carries `#EXT-X-PROGRAM-DATE-TIME` only once the flow has closed its first
@@ -1044,9 +1051,22 @@ The DASH writer emits a dynamic MPD conforming to
 - `availabilityStartTime` — Unix epoch of the first emitted segment.
 - `minimumUpdatePeriod` — one segment duration; clients re-fetch the
   MPD on that cadence.
-- `timeShiftBufferDepth` — `available_segments × segment_duration`.
-- `SegmentTemplate` with `$Number%05d$` matching the HLS media
-  filenames, so both manifests reference the same `.m4s` files.
+- `timeShiftBufferDepth` — `available_segments × segment_duration`, floored at 30 s.
+- `SegmentTemplate` with `$Number%05d$`. The video `AdaptationSet`
+  addresses the same `seg-NNNNN.m4s` objects the HLS playlist lists.
+  The audio `AdaptationSet` does not: whenever this output has built an
+  audio track (a source with audio, or `silent_fallback`),
+  `write_segment_template` writes it against `aud-$Number%05d$.m4s` — a
+  name this output never publishes (see [File naming](#file-naming)).
+  Where audio is carried at all it is muxed into `seg-NNNNN.m4s`; on
+  the low-latency and encrypted paths it is not carried and `init.mp4`
+  declares no audio track, yet the `AdaptationSet` is emitted just the
+  same, because both MPD publish sites key it on the audio segmenter's
+  existence rather than on the latched `audio_muxing` decision. A DASH
+  player that selects the audio representation fetches objects that do
+  not exist. Known gap: DASH is a consistent path only for an output
+  that has built no audio track; HLS is the path for a source with
+  audio.
 - `@codecs` — derived from SPS / AudioSpecificConfig:
   - H.264 → `avc1.{profile_idc:02X}{constraint:02X}{level_idc:02X}`
   - HEVC → `hvc1.{profile}.{compat_hex}.{L|H}{level}`
@@ -1143,8 +1163,19 @@ servers. Instead, operators:
 
 **Security note.** The content key itself still lives in the edge
 config (`encryption.key`). Operators are responsible for protecting
-the node config and, if needed, rotating keys via the secret-rotation
-flow documented in the root `CLAUDE.md`.
+the node config. There is no rotation flow for this key — the root
+`CLAUDE.md`'s secret rotation (`POST /api/v1/nodes/{id}/rotate-secret`)
+covers only the node's manager-auth secret — so rotating it is an edit
+to the output's `encryption` block, which the edge applies by stopping
+and restarting that one output (`remove_output` + `add_output`; the
+flow keeps running, and the encryptor is built once at output start).
+Rotate `key_id` together with `key`: the init segment carries only the
+key ID (`tenc.default_KID` and the ClearKey `pssh`), never the key, so
+a new `key_id` changes the init and the restart opens a new init
+generation at the join (see [Init generations](#init-generations)),
+whereas a change to `key` alone leaves the init byte-identical — the
+restored window's rows, encrypted under the old key, stay advertised
+under the same `default_KID` as the new ones.
 
 ### FairPlay (cbcs only)
 
@@ -1215,7 +1246,7 @@ should set up a URL-rewriting reverse proxy in front of their ingest.
 
 ## Testing
 
-- **Unit tests** (`cargo test cmaf::`): 116 tests covering `BoxWriter`
+- **Unit tests** (`cargo test cmaf::`): 156 tests covering `BoxWriter`
   round-trips, `avcC` / `hvcC` / `esds` shape, SPS resolution parsing,
   m3u8 and MPD golden files, media-segment `data_offset` patching,
   `tfdt` base DTS, AES-CTR / AES-CBC round-trips, CENC subsample
@@ -1250,7 +1281,7 @@ should set up a URL-rewriting reverse proxy in front of their ingest.
   pushed until it cuts) and by the segmenter's own
   `the_open_segment_begins_where_the_closed_one_ended`, which pins the identity
   underneath it. Verified by mutation: reverting the derivation to `None` fails
-  exactly that one test and leaves the other 115 green.
+  exactly that one test and leaves the other 155 green.
 - **Interop matrix**
   (`testbed/scripts/cmaf_full_interop_test.sh`): 6 scenarios — H.264
   HLS, H.264 HLS+DASH, HEVC DASH, H.264 LL with chunks, CENC `cenc`,
@@ -1258,8 +1289,10 @@ should set up a URL-rewriting reverse proxy in front of their ingest.
   and validates init.mp4 + segments + manifests via ffprobe + binary
   inspection.
 - **Load test** (`testbed/scripts/cmaf_load_test.sh`): 60 s of 15 Mbps
-  1080p30 H.264+AAC; verifies no broadcast lag, peak CPU <10 %,
-  correct bitrate, segment count, and ffprobe acceptance.
+  1080p30 H.264+AAC; verifies no broadcast lag, peak CPU not above 200 %
+  (it prints the measured peak — 3 % on the rig — but fails only above two
+  cores, `MAX_CPU -gt 200`), correct bitrate, segment count, and ffprobe
+  acceptance.
 - **CMAF HTTP sink** (`testbed/scripts/cmaf_sink.py`): minimal Python
   HTTP server that accepts PUT + POST (including chunked transfer) and
   saves the body under the last path component. Reusable for local
@@ -1334,7 +1367,8 @@ should set up a URL-rewriting reverse proxy in front of their ingest.
   and what the parts already published account for, never more. It is rewritten
   with the segment's real length the moment it closes.
 - No live-to-VOD archival — the rolling playlist caps at `max_segments`
-  and old `.m4s` files are not deleted on the ingest side. Operators
+  (or the count derived from `dvr_window_secs`, up to 21 600) and old
+  `.m4s` files are not deleted on the ingest side. Operators
   must configure CDN / object-store retention externally.
 - **`#EXT-X-DISCONTINUITY` covers the clock and the parameter sets, not the
   codec family.** It is emitted when the flow clock re-anchors — a source
