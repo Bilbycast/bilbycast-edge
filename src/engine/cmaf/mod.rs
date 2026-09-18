@@ -755,6 +755,26 @@ struct CmafState {
     /// one-time log lines, and whether a low-latency output may start
     /// emitting chunks — not whether it is published again.
     init_uploaded: bool,
+    /// How many times the source's parameter sets have changed under us.
+    ///
+    /// Zero is the ordinary life of a stream and keeps the name `init.mp4`,
+    /// so a stream whose encoder never changes publishes exactly what it
+    /// always did. Each change past that publishes `init-{n}.mp4` and leaves
+    /// the older ones in place: the rows already in the window still name
+    /// them, and a viewer seeking back into that media needs them to decode
+    /// it.
+    init_generation: u32,
+    /// The init the rows being written now belong to.
+    init_uri: String,
+    /// Set when the parameter sets change, cleared when the new init has been
+    /// published. The next row to close carries the new map and a
+    /// discontinuity — it must not be advertised before the init it names
+    /// exists, or a player fetches a 404 and stops.
+    init_rotation_pending: bool,
+    /// Set once the rotated init is actually on the origin, and consumed by
+    /// the next row to close. Separate from `init_rotation_pending` because a
+    /// row must be marked only after the init it names can be fetched.
+    init_rotation_published: bool,
     /// True while init.mp4 uploads are failing. Two jobs: it shortens the
     /// republish interval to a retry interval, and it makes the manager
     /// Warning fire once per failure *episode* rather than once per attempt.
@@ -1137,6 +1157,10 @@ impl CmafState {
             audio_bps_ewma: 0,
             availability_start_unix: 0,
             init_uploaded: false,
+            init_generation: 0,
+            init_uri: "init.mp4".to_string(),
+            init_rotation_pending: false,
+            init_rotation_published: false,
             init_upload_failing: false,
             init_last_upload: None,
             playlist: VecDeque::new(),
@@ -1794,17 +1818,22 @@ async fn handle_video(
     // track from the source sets would hand the decoder parameter sets that do
     // not describe the bitstream, which decodes as macroblock garbage rather
     // than failing cleanly. Defer until the re-encoder has emitted its own.
-    if state.video_reencoder.is_none()
-        && !ensure_video_segmenter(
+    if state.video_reencoder.is_none() {
+        match ensure_video_segmenter(
             state.resume_seq,
             &mut state.video_seg,
             codec,
             demuxer,
             config.segment_duration_secs,
             &config.id,
-        )
-    {
-        return;
+        ) {
+            TrackCheck::NotReady => return,
+            TrackCheck::Unchanged => {}
+            // The parameter sets moved under us. Everything written from here
+            // decodes against the new ones, so a fresh init has to go up and
+            // the rows that follow have to name it — see `rotate_init`.
+            TrackCheck::Rotated => rotate_init(state, &config.id),
+        }
     }
 
     // Phase 3: video_encode hooks here. For passthrough we forward the
@@ -2033,17 +2062,29 @@ async fn handle_video(
             seg_secs,
             closed_at,
         );
+        // Generation 0 leaves this `None`, so a stream whose encoder never
+        // changed writes exactly the playlist it always did. Past that, the
+        // row names the init its media actually decodes against — the rows
+        // before it keep naming the older one, which is what makes seeking
+        // back into that media work rather than fail silently.
+        let row_init = (state.init_generation > 0).then(|| state.init_uri.clone());
+        // The first row on a new init is a discontinuity whatever the clock
+        // says: different parameter sets are a break in the decode chain, and
+        // a player that carries its decoder across one gets garbage.
+        let rotated_here = std::mem::take(&mut state.init_rotation_published);
         state.playlist.push_back(M3u8Entry {
             sequence_number: seg.sequence_number,
             duration_secs: seg_secs,
             uri: Some(uri),
             parts: Vec::new(),
+            init_uri: row_init,
             program_date_time: Some(pdt),
             // The first row after a restored window always breaks the
             // timeline, whatever the flow clock believes: it was built fresh
             // with this process and has nothing to compare against.
             discontinuity: discontinuity
-                || std::mem::take(&mut state.restore_discontinuity),
+                || std::mem::take(&mut state.restore_discontinuity)
+                || rotated_here,
         });
         state.trim_playlist(config.playlist_window_segments());
 
@@ -2594,11 +2635,32 @@ async fn publish_init_if_due(
     }
     state.init_fingerprint = Some(fingerprint);
 
-    match http_put(init_url, init_bytes, "video/mp4", config.auth_token.as_deref()).await {
+    // A rotated init is a NEW object, not an overwrite. Overwriting would
+    // strand every segment already in the window: their media decodes against
+    // the old parameter sets, and the playlist still points them at that name.
+    let versioned_url = if state.init_generation > 0 {
+        match init_url.rsplit_once('/') {
+            Some((base, _)) => format!("{base}/{}", state.init_uri),
+            None => state.init_uri.clone(),
+        }
+    } else {
+        init_url.to_string()
+    };
+
+    match http_put(&versioned_url, init_bytes, "video/mp4", config.auth_token.as_deref()).await {
         Ok(_) => {
             state.init_uploaded = true;
             state.init_upload_failing = false;
             state.init_last_upload = Some(std::time::Instant::now());
+            if std::mem::take(&mut state.init_rotation_pending) {
+                // Only now may a row name it.
+                state.init_rotation_published = true;
+                tracing::info!(
+                    "CMAF output '{}': published '{}'; rows from here decode against it",
+                    config.id,
+                    state.init_uri,
+                );
+            }
             if first {
                 tracing::info!(
                     "CMAF output '{}': uploaded init.mp4 ({}x{}, {:?}{})",
@@ -2631,6 +2693,18 @@ async fn publish_init_if_due(
     state.init_uploaded
 }
 
+/// What a look at the incoming parameter sets concluded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum TrackCheck {
+    /// No usable parameter sets yet — nothing to publish from.
+    NotReady,
+    /// The track stands as it is.
+    Unchanged,
+    /// The source's parameter sets changed. The track has been replaced and
+    /// the init must be republished before any further row is advertised.
+    Rotated,
+}
+
 fn ensure_video_segmenter(
     resume_seq: u64,
     slot: &mut Option<VideoSegmenter>,
@@ -2638,34 +2712,72 @@ fn ensure_video_segmenter(
     demuxer: &TsDemuxer,
     segment_duration_secs: f64,
     output_id: &str,
-) -> bool {
-    if slot.is_some() {
-        return true;
+) -> TrackCheck {
+    if let Some(seg) = slot.as_mut() {
+        // Look again on every call rather than only at the start. The first
+        // IDR's parameter sets used to be taken as the stream's for life,
+        // which is true right up until an encoder changes underneath — and
+        // then every sample after it decodes against the wrong SPS.
+        let fresh = match codec {
+            VideoCodec::H264 => match (demuxer.cached_sps(), demuxer.cached_pps()) {
+                (Some(s), Some(p)) => Some((s.to_vec(), p.to_vec(), Vec::new())),
+                _ => None,
+            },
+            VideoCodec::H265 => match (
+                demuxer.cached_h265_vps(),
+                demuxer.cached_h265_sps(),
+                demuxer.cached_h265_pps(),
+            ) {
+                (Some(v), Some(s), Some(p)) => Some((s.to_vec(), p.to_vec(), v.to_vec())),
+                _ => None,
+            },
+        };
+        let Some((sps, pps, vps)) = fresh else {
+            return TrackCheck::Unchanged;
+        };
+        if sps == seg.track.sps && pps == seg.track.pps && vps == seg.track.vps {
+            return TrackCheck::Unchanged;
+        }
+        let track = match codec {
+            VideoCodec::H264 => VideoTrack::from_h264(sps, pps),
+            VideoCodec::H265 => VideoTrack::from_h265(vps, sps, pps),
+        };
+        tracing::warn!(
+            "CMAF output '{}': the source's parameter sets changed ({}x{} -> {}x{}); \
+             republishing the init so what is written stays decodable",
+            output_id,
+            seg.track.width,
+            seg.track.height,
+            track.width,
+            track.height,
+        );
+        seg.track = track;
+        return TrackCheck::Rotated;
     }
     let track = match codec {
         VideoCodec::H264 => {
             let sps = match demuxer.cached_sps() {
                 Some(s) => s.to_vec(),
-                None => return false,
+                None => return TrackCheck::NotReady,
             };
             let pps = match demuxer.cached_pps() {
                 Some(p) => p.to_vec(),
-                None => return false,
+                None => return TrackCheck::NotReady,
             };
             VideoTrack::from_h264(sps, pps)
         }
         VideoCodec::H265 => {
             let vps = match demuxer.cached_h265_vps() {
                 Some(v) => v.to_vec(),
-                None => return false,
+                None => return TrackCheck::NotReady,
             };
             let sps = match demuxer.cached_h265_sps() {
                 Some(s) => s.to_vec(),
-                None => return false,
+                None => return TrackCheck::NotReady,
             };
             let pps = match demuxer.cached_h265_pps() {
                 Some(p) => p.to_vec(),
-                None => return false,
+                None => return TrackCheck::NotReady,
             };
             VideoTrack::from_h265(vps, sps, pps)
         }
@@ -2675,7 +2787,37 @@ fn ensure_video_segmenter(
         output_id, track.codec, track.width, track.height,
     );
     *slot = Some(VideoSegmenter::new_from_seq(track, segment_duration_secs, resume_seq));
-    true
+    // A track that has only just appeared still needs its init published, and
+    // the ordinary first-publish path does that. Nothing has been advertised
+    // against an older init yet, so this is not a rotation.
+    TrackCheck::Unchanged
+}
+
+
+/// Begin a new init generation, because the source's parameter sets changed.
+///
+/// The old init stays where it is and keeps its name. Rows already in the
+/// window still point at it, and they have to: their media decodes against
+/// those parameter sets and nothing else. Only the rows written from here name
+/// the new one.
+///
+/// This does not publish anything. It marks the intent, and the ordinary init
+/// path publishes on its next pass — a row must never be advertised against an
+/// init that is not yet on the origin, or a player fetches a 404 and gives up
+/// where it would otherwise have recovered.
+fn rotate_init(state: &mut CmafState, output_id: &str) {
+    state.init_generation = state.init_generation.saturating_add(1);
+    state.init_uri = format!("init-{}.mp4", state.init_generation);
+    state.init_rotation_pending = true;
+    // Force the publish rather than wait for the republish interval: until the
+    // new init is up, nothing further can be advertised.
+    state.init_last_upload = None;
+    state.init_uploaded = false;
+    tracing::info!(
+        "CMAF output '{output_id}': init rotated to '{}' (generation {})",
+        state.init_uri,
+        state.init_generation,
+    );
 }
 
 /// LL-CMAF chunk pump. Called once per video frame push; it opens a
@@ -3033,6 +3175,7 @@ fn ll_playlist_entries(
             duration_secs: open_secs,
             uri: Some(open.uri.to_string()),
             parts: open.parts.to_vec(),
+            init_uri: None,
             program_date_time: dated.map(|(pdt, _)| pdt),
             // This path takes no sample, so it discovers no discontinuity of
             // its own. What it can carry is one a *sibling* rendition already
@@ -3082,6 +3225,7 @@ fn closed_ll_entry(
         duration_secs: seg_secs,
         uri: Some(uri),
         parts: Vec::new(),
+        init_uri: None,
         program_date_time: Some(pdt),
         discontinuity,
     }
@@ -4077,6 +4221,7 @@ seg-00042.m4s?token=abc
                     duration_secs: seg,
                     uri: None,
                     parts: Vec::new(),
+                    init_uri: None,
                     program_date_time: Some(a_pdt),
                     discontinuity: disc,
                 });
@@ -4384,6 +4529,7 @@ seg-00042.m4s?token=abc
             duration_secs: dur,
             uri: None,
             parts: Vec::new(),
+            init_uri: None,
             program_date_time: None,
             discontinuity: false,
         };
@@ -4545,6 +4691,7 @@ seg-00042.m4s?token=abc
                 duration_secs: 2.0,
                 uri: None,
                 parts: Vec::new(),
+                init_uri: None,
                 program_date_time: None,
                 discontinuity: n == 1,
             });

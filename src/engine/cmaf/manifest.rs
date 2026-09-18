@@ -26,6 +26,18 @@ pub struct M3u8Entry {
     /// Optional relative URL for the segment. When `None`, defaults to
     /// `seg-{sequence_number:05}.m4s`.
     pub uri: Option<String>,
+    /// The init segment this row needs, when it is not the stream's.
+    ///
+    /// A source that changes encoder mid-stream changes its SPS/PPS with it,
+    /// and every sample after that point decodes against different parameter
+    /// sets. One `#EXT-X-MAP` for the whole playlist cannot describe both, so
+    /// rows after such a change name their own — and rows before it keep
+    /// naming the old one, which is what lets a viewer seek back into media
+    /// the newer init cannot decode.
+    ///
+    /// `None` means "the stream's init", which is every row on a stream whose
+    /// encoder never changed.
+    pub init_uri: Option<String>,
     /// LL-CMAF: partial-segment rows for the segment still being
     /// written, so players can fetch chunks before it closes.
     ///
@@ -163,7 +175,15 @@ pub fn build_hls_playlist(
     // derives its seekable range from `EVENT`) will seek to segments the
     // origin has already dropped. Omitting the tag is the correct signal
     // for a live sliding window.
-    out.push_str(&format!("#EXT-X-MAP:URI=\"{init_uri}\"\n"));
+    // The head map is whatever the FIRST row needs, not whatever the stream
+    // started life with. The window slides, so the oldest row it still holds
+    // may already sit past an encoder change — and a head map naming the
+    // original init would then describe none of the media on the playlist.
+    let head_map = entries
+        .first()
+        .and_then(|e| e.init_uri.clone())
+        .unwrap_or_else(|| init_uri.to_string());
+    out.push_str(&format!("#EXT-X-MAP:URI=\"{head_map}\"\n"));
     out.push_str("#EXT-X-INDEPENDENT-SEGMENTS\n");
     if let Some(ll) = ll_hints {
         out.push_str(&format!(
@@ -208,11 +228,25 @@ pub fn build_hls_playlist(
     // seconds every couple of hours. Without the tag the window then holds
     // thousands of rows on the old epoch and one on the new, every one of them
     // claiming a clean `EXTINF` step from its neighbour.
+    let mut current_map = head_map.clone();
     for e in entries {
         let uri = e
             .uri
             .clone()
             .unwrap_or_else(|| default_segment_uri(e.sequence_number));
+        // A row whose init differs from the one in force re-declares it. RFC
+        // 8216 §4.4.4.5 allows `#EXT-X-MAP` more than once and applies each to
+        // the rows that follow it — exactly the shape of "the encoder changed
+        // here". It goes before the discontinuity tag so the new map is in
+        // force for the timeline the tag opens.
+        let want_map = e
+            .init_uri
+            .clone()
+            .unwrap_or_else(|| init_uri.to_string());
+        if want_map != current_map {
+            out.push_str(&format!("#EXT-X-MAP:URI=\"{want_map}\"\n"));
+            current_map = want_map;
+        }
         // Before the date, not after: the tag declares that what follows it
         // does not continue what came before, and the date that follows is
         // the first statement made on the new timeline.
@@ -515,9 +549,86 @@ mod tests {
             duration_secs: dur,
             uri: None,
             parts: Vec::new(),
+            init_uri: None,
             program_date_time: None,
             discontinuity: false,
         }
+    }
+
+    /// A row that names its own init re-declares the map, and the rows before
+    /// it keep the one they had.
+    ///
+    /// This is what makes an encoder change survivable. The source's SPS/PPS
+    /// can move under a running output — an operator pinning a codec, or
+    /// `h264_auto` falling between NVENC and x264 — and every sample after
+    /// that decodes against different parameter sets. With one map for the
+    /// whole playlist, a browser builds its decoder from the wrong ones and
+    /// rejects the appends outright: `bufferAppendError`, no frames, and a
+    /// buffer that fills normally throughout. Nothing else reports it.
+    #[test]
+    fn a_new_init_is_declared_where_it_starts() {
+        let mut entries: Vec<M3u8Entry> = (0..4).map(|i| simple_entry(i, 2.0)).collect();
+        // The encoder changed at row 2.
+        for e in entries.iter_mut().skip(2) {
+            e.init_uri = Some("init-1.mp4".to_string());
+        }
+        let p = build_hls_playlist(2, &entries, "init.mp4", 0, None);
+
+        assert_eq!(
+            p.matches("#EXT-X-MAP").count(),
+            2,
+            "one map for each generation the window still holds:\n{p}"
+        );
+        let head = p.find("#EXT-X-MAP:URI=\"init.mp4\"").expect("the head map");
+        let second = p.find("#EXT-X-MAP:URI=\"init-1.mp4\"").expect("the rotated map");
+        assert!(head < second, "the maps must appear in playlist order:\n{p}");
+        // The rotated map must precede the row it applies to, not follow it.
+        let row2 = p.find("seg-00002.m4s").expect("row 2");
+        assert!(
+            second < row2,
+            "the new map has to be in force before the row that needs it:\n{p}"
+        );
+        let row1 = p.find("seg-00001.m4s").expect("row 1");
+        assert!(
+            row1 < second,
+            "the row before the change must stay on the old init:\n{p}"
+        );
+    }
+
+    /// The head map follows the window, not the stream's origin.
+    ///
+    /// The playlist is a sliding window. Once every row from before an encoder
+    /// change has been trimmed, a head map still naming the original init
+    /// describes none of the media on the playlist — and that init may well
+    /// have been swept from the origin.
+    #[test]
+    fn the_head_map_names_what_the_first_row_needs() {
+        let entries: Vec<M3u8Entry> = (10..13)
+            .map(|i| {
+                let mut e = simple_entry(i, 2.0);
+                e.init_uri = Some("init-2.mp4".to_string());
+                e
+            })
+            .collect();
+        let p = build_hls_playlist(2, &entries, "init.mp4", 0, None);
+        assert!(
+            p.contains("#EXT-X-MAP:URI=\"init-2.mp4\""),
+            "the head map must name the first row's init:\n{p}"
+        );
+        assert!(
+            !p.contains("#EXT-X-MAP:URI=\"init.mp4\""),
+            "nothing on this playlist decodes against the original init:\n{p}"
+        );
+        assert_eq!(p.matches("#EXT-X-MAP").count(), 1, "one generation, one map:\n{p}");
+    }
+
+    /// A stream whose encoder never changes writes exactly what it always did.
+    #[test]
+    fn an_unrotated_stream_declares_one_map() {
+        let entries: Vec<M3u8Entry> = (0..3).map(|i| simple_entry(i, 2.0)).collect();
+        let p = build_hls_playlist(2, &entries, "init.mp4", 0, None);
+        assert_eq!(p.matches("#EXT-X-MAP").count(), 1, "{p}");
+        assert!(p.contains("#EXT-X-MAP:URI=\"init.mp4\""), "{p}");
     }
 
     fn dated_entry(seq: u64, dur: f64, iso: &str) -> M3u8Entry {
@@ -685,6 +796,7 @@ mod tests {
             duration_secs: 2.0,
             uri: Some("custom/path/x.m4s".to_string()),
             parts: Vec::new(),
+            init_uri: None,
             program_date_time: None,
             discontinuity: false,
         }];
