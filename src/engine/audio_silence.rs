@@ -141,20 +141,9 @@ impl SilenceGenerator {
         self.sample_rate
     }
 
-    /// Place the generator on a timeline, without touching the watchdog.
-    ///
-    /// A generator built before any media has arrived is seeded at zero, and
-    /// silence stamped from zero sits hours away from the video it is meant
-    /// to accompany — the caller seeds it from the first video timestamp it
-    /// sees, and only emits once it has one.
-    pub fn seed_pts(&mut self, pts_90k: u64) {
-        self.pts_90k = pts_90k;
-    }
-
-    /// The 90 kHz PTS the next silent chunk would carry — how far the
-    /// silence has been laid down.
-    pub fn next_pts_90k(&self) -> u64 {
-        self.pts_90k
+    /// Samples per chunk, per channel.
+    pub fn chunk_samples(&self) -> usize {
+        self.samples_per_chunk
     }
 
     /// Reset the watchdog after a real audio frame arrived. `pts_90k`

@@ -267,6 +267,25 @@ Required whenever:
 - Packaging **low-latency CMAF / CMAF-LL** — the segmenter expects
   monotonic audio timestamps per segment; gaps cause player stalls.
 
+On CMAF the silence is **measured against the picture, not ticked by
+the clock**. The 500 ms grace is the trigger; once it has elapsed, each
+tick lays down as much silence as it takes to bring the audio up to
+where the audio would be — the newest video DTS less the picture's lead
+over the audio, measured over the preceding run of real audio (a
+hardware encoder sends video ahead of its DTS by its VBV delay) — and no
+further. So a delivery stall inserts nothing (neither track moves), a
+tick the output loop observed late is made up on the next, and real
+audio returning lands where the silence ends. Real and silent frames are
+stamped from one encoder timeline: the re-encoder tracks where the
+encoder's input is on the source's timeline and re-anchors the encoder
+when a real frame is more than a frame past it (a splice, a lost PES, a
+gap), holds a frame back that is behind it (silence overshot the return
+by the part of the lead the estimate missed), and otherwise continues.
+The eager silent-fallback encoder is built at the declared rate and
+rebuilt, with a resampler, on the first real frame whose rate or channel
+count differs — a 44.1 kHz source through a 48 kHz encoder used to run
+8.8 % slow.
+
 Wired for RTMP, WebRTC (both WHIP client and WHEP server paths), and
 CMAF (HLS + DASH output) in this release. HLS (standalone HLS output,
 not the CMAF-HLS manifest) is tracked for a follow-up because its

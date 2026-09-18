@@ -778,6 +778,11 @@ struct CmafState {
     /// inits were published by a previous run and their bytes are not here
     /// — unless the restore fetched them, which it tries to.
     init_history: Vec<PublishedInit>,
+    /// The restored generation's init as the origin served it, until this
+    /// run's own has been compared with it: on a mismatch it goes into
+    /// `init_history`, because the restored rows keep naming it and nothing
+    /// else holds its bytes.
+    restored_current_init: Option<PublishedInit>,
     /// True while low-latency PUTs are failing to close, so the Warning
     /// fires once per failure episode rather than once per segment.
     ll_put_failing: bool,
@@ -949,32 +954,48 @@ async fn restore_published_window(
     // cover them — a relay that lost its store would come back with the live
     // edge decodable and every older row 404ing on its map. They are a few
     // kilobytes each and there are rarely more than one or two.
+    //
+    // The current generation's too: this run rebuilds it from its own track,
+    // and if that turns out to differ, the mismatch opens a new generation
+    // and the restored rows keep naming this one — which then has to be
+    // republished from these bytes, since nothing else holds them.
+    //
+    // One deadline across the list, applied per GET, so an origin that
+    // answers the first and stalls on the second still leaves the first in
+    // hand — a single timeout over the whole fetch dropped everything read.
     const HELD_INITS_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
-    let current = init_object_name(window.init_generation);
+    let deadline = tokio::time::Instant::now() + HELD_INITS_BUDGET;
     let mut wanted: Vec<String> = Vec::new();
     for name in window.rows.iter().map(CmafState::row_init_name) {
-        if name != current && !wanted.iter().any(|w| w == name) {
+        if !wanted.iter().any(|w| w == name) {
             wanted.push(name.to_string());
         }
     }
-    let fetch = async {
-        let mut held = Vec::new();
-        for name in wanted {
-            match clips::http_get(&format!("{base}/{name}"), auth).await {
-                Ok(bytes) => held.push(PublishedInit { uri: name, bytes }),
-                Err(e) => tracing::warn!(
-                    origin = %base, init = %name, error = %format!("{e:#}"),
-                    "CMAF output: an older init the restored window names could not be \
-                     read back; it will not be republished if the origin loses it"
-                ),
+    let mut held = Vec::new();
+    for name in wanted {
+        let url = format!("{base}/{name}");
+        let r = tokio::select! {
+            _ = cancel.cancelled() => return None,
+            r = tokio::time::timeout_at(deadline, clips::http_get(&url, auth)) => r,
+        };
+        match r {
+            Ok(Ok(bytes)) => held.push(PublishedInit { uri: name, bytes }),
+            Ok(Err(e)) => tracing::warn!(
+                origin = %base, init = %name, error = %format!("{e:#}"),
+                "CMAF output: an init the restored window names could not be read back; \
+                 it will not be republished if the origin loses it"
+            ),
+            Err(_) => {
+                tracing::warn!(
+                    origin = %base, init = %name, budget_secs = HELD_INITS_BUDGET.as_secs(),
+                    "CMAF output: the origin did not return an init the restored window \
+                     names in time; it and any after it will not be republished"
+                );
+                break;
             }
         }
-        held
-    };
-    window.held_inits = tokio::select! {
-        _ = cancel.cancelled() => return None,
-        r = tokio::time::timeout(HELD_INITS_BUDGET, fetch) => r.unwrap_or_default(),
-    };
+    }
+    window.held_inits = held;
     Some(window)
 }
 
@@ -1001,8 +1022,8 @@ struct RestoredWindow {
     /// newest rows decode against, and the one this run continues or, if its
     /// own init differs, rotates past.
     init_generation: u32,
-    /// The older inits the rows name, read back so this run can republish
-    /// them. Empty when the parser built the window; the restore fills it.
+    /// Every init the rows name, read back so this run can republish them.
+    /// Empty when the parser built the window; the restore fills it.
     held_inits: Vec<PublishedInit>,
 }
 
@@ -1272,6 +1293,7 @@ impl CmafState {
             init_uri: init_object_name(0),
             last_init_bytes: None,
             init_history: Vec::new(),
+            restored_current_init: None,
             ll_put_failing: false,
             family_change_warned: false,
             init_upload_failing: false,
@@ -1522,7 +1544,15 @@ async fn run(
         // `init.mp4` would overwrite the object the oldest rows name.
         state.init_generation = restored.init_generation;
         state.init_uri = init_object_name(restored.init_generation);
-        state.init_history = restored.held_inits;
+        // The current generation's bytes are held apart: this run publishes
+        // that name itself unless its init differs, in which case they join
+        // the republish set under the mismatch.
+        let (current, older): (Vec<_>, Vec<_>) = restored
+            .held_inits
+            .into_iter()
+            .partition(|h| h.uri == state.init_uri);
+        state.init_history = older;
+        state.restored_current_init = current.into_iter().next();
         state.restore_discontinuity = true;
     }
 
@@ -1906,10 +1936,11 @@ fn handle_other_audio_frame(
 
     // CMAF wants AAC on the wire — without `audio_encode` we have no
     // way to transmux a non-AAC source.
+    let video_at = state.video_seg.as_ref().and_then(VideoSegmenter::last_dts_90k);
     let Some(reenc) = state.audio_reencoder.as_mut() else {
         return;
     };
-    reenc.mark_real_audio(pts);
+    reenc.mark_real_audio(pts, video_at);
 
     let mut frames_to_buffer: Vec<(Vec<u8>, u64)> = Vec::new();
     // A PES carries several access units under one PTS; each is submitted
@@ -2450,9 +2481,11 @@ fn handle_audio_frame(
 
     // Phase 3: audio_encode hook — pump the source AAC frame through
     // the AudioReencoder and substitute the re-encoded frame(s).
+    let video_at = state.video_seg.as_ref().and_then(VideoSegmenter::last_dts_90k);
     let frames_to_buffer: Vec<(Vec<u8>, u64)> = if let Some(reenc) = state.audio_reencoder.as_mut() {
-        // Reset the silent-fallback drop watchdog — real audio is flowing.
-        reenc.mark_real_audio(pts);
+        // Reset the silent-fallback drop watchdog — real audio is flowing —
+        // and let it measure the picture's lead over the audio.
+        reenc.mark_real_audio(pts, video_at);
         // Propagate the ADTS triplet from the demuxer so lazy decoder
         // construction inside AudioReencoder can succeed.
         if let Some((profile, sr_idx, ch_cfg)) = demuxer.cached_aac_config() {
@@ -2878,6 +2911,19 @@ async fn publish_init_if_due(
         });
         if let Some((from, to)) = bumped {
             state.relabel_own_rows(from, to);
+            // The low-latency segment open now was opened under `from`
+            // before this comparison could run, and has carried nothing yet
+            // — chunks wait for the init this publish is about to put up.
+            if let Some(ll) = state.ll_current.as_mut()
+                && ll.generation == from
+            {
+                ll.generation = to;
+            }
+            // The restored rows keep naming the previous run's init, so
+            // its bytes join the republish set.
+            if let Some(kept) = state.restored_current_init.take() {
+                state.init_history.push(kept);
+            }
             adopt_generation(state, &config.id);
         }
         tracing::warn!(
@@ -2898,6 +2944,8 @@ async fn publish_init_if_due(
         );
     }
     state.init_fingerprint = Some(fingerprint);
+    // Compared, and matching or moot: this run publishes that name itself.
+    state.restored_current_init = None;
 
     // A rotated init is a NEW object, not an overwrite. Overwriting would
     // strand every segment already in the window: their media decodes against
@@ -3128,6 +3176,40 @@ fn adopt_generation(state: &mut CmafState, output_id: &str) -> bool {
     true
 }
 
+/// The chunk that closes a low-latency segment: the samples the chunker had
+/// not taken when the IDR cut it, as one more `moof`+`mdat` on the same PUT.
+struct TailChunk {
+    bytes: Vec<u8>,
+    /// Where the tail starts on the media timeline — its `tfdt`.
+    tfdt_90k: u64,
+    /// How long it runs; with the chunks before it, the segment's length.
+    duration_90k: u64,
+    /// Whether it opens the object: true only when nothing was chunked
+    /// before it, so the tail is the whole segment.
+    includes_styp: bool,
+}
+
+/// Build the tail from what the cut carried. `seg.first_pending_dts_90k` is
+/// the first sample still queued at the cut — the segment base when nothing
+/// was chunked, the start of the tail otherwise — and the tail's durations
+/// were computed against the next segment's start, so it tiles exactly to
+/// the boundary.
+fn ll_tail_chunk(seg: &CompletedSegment, tail: &[Sample], chunks_emitted: u32) -> TailChunk {
+    let includes_styp = chunks_emitted == 0;
+    TailChunk {
+        bytes: fmp4::build_segment_chunk(
+            fmp4::VIDEO_TRACK_ID,
+            seg.sequence_number as u32,
+            seg.first_pending_dts_90k,
+            tail,
+            includes_styp,
+        ),
+        tfdt_90k: seg.first_pending_dts_90k,
+        duration_90k: tail.iter().map(|s| s.duration as u64).sum(),
+        includes_styp,
+    }
+}
+
 /// LL-CMAF chunk pump. Called once per video frame push; it opens a
 /// chunked PUT at segment boundaries, flushes accumulated samples as
 /// moof+mdat chunks every `chunk_duration_ms` worth of media, and
@@ -3182,13 +3264,17 @@ async fn handle_ll_cmaf(
                 (outcome.completed_video.as_ref(), outcome.completed_video_samples.as_ref())
                 && !tail.is_empty()
             {
-                let bytes = fmp4::build_segment_chunk(
-                    fmp4::VIDEO_TRACK_ID,
-                    seg.sequence_number as u32,
-                    seg.first_pending_dts_90k,
-                    tail,
-                    ll.chunks_emitted == 0,
+                let t = ll_tail_chunk(seg, tail, ll.chunks_emitted);
+                tracing::trace!(
+                    "CMAF output '{}': LL seg {} tail at {} for {} ticks ({} samples{})",
+                    config.id,
+                    seq,
+                    t.tfdt_90k,
+                    t.duration_90k,
+                    tail.len(),
+                    if t.includes_styp { ", whole segment" } else { "" },
                 );
+                let bytes = t.bytes;
                 tail_stored = match ll.handle.send_chunk(bytes.clone()) {
                     Ok(()) => true,
                     // A PUT that died before carrying anything — opened into
@@ -3353,8 +3439,12 @@ async fn handle_ll_cmaf(
                 // The PUT died before it carried anything — opened into an
                 // origin that was down, and now the init has landed and the
                 // origin is back. A fresh PUT for the same object loses
-                // nothing: this is the segment's first chunk.
-                Err(upload::ChunkSendError::Closed) if ll.chunks_emitted == 0 => {
+                // nothing: this is the segment's first chunk. Only when the
+                // init is landing, though: while it is not, the origin is
+                // still down and a second PUT is a second failure.
+                Err(upload::ChunkSendError::Closed)
+                    if ll.chunks_emitted == 0 && !state.init_upload_failing =>
+                {
                     ll.handle = chunked_put(
                         &format!("{}/{}", base_url, ll.uri),
                         "video/mp4",
@@ -3381,24 +3471,52 @@ async fn handle_ll_cmaf(
                         config.id, ll.sequence_number, ll.chunks_emitted - 1, bytes_len
                     );
                 }
-                Err(_) => {
-                    // Backpressure, or an origin that closed a PUT mid-body:
-                    // abort the PUT, discard accumulated samples for this
+                Err(why) => {
+                    // Abort the PUT, discard accumulated samples for this
                     // segment, and wait for the next IDR to open a fresh
-                    // segment.
-                    tracing::warn!(
-                        "CMAF output '{}': LL ingest stall, aborting seg {}",
-                        config.id, ll.sequence_number
-                    );
-                    event_sender.emit_flow(
-                        EventSeverity::Warning,
-                        category::CMAF,
-                        format!(
-                            "CMAF output '{}': LL chunk enqueue full (seg {}) — aborting",
-                            config.id, ll.sequence_number
-                        ),
-                        flow_id,
-                    );
+                    // segment. Named by what happened: a full queue is the
+                    // ingest not keeping up, a closed request is the origin
+                    // gone — and the second is one Warning per episode, the
+                    // same episode the close path tracks, not one per
+                    // segment for as long as the origin is away.
+                    let seq = ll.sequence_number;
+                    let chunks = ll.chunks_emitted;
+                    match why {
+                        upload::ChunkSendError::Full => {
+                            tracing::warn!(
+                                "CMAF output '{}': LL ingest stall, aborting seg {seq}",
+                                config.id
+                            );
+                            event_sender.emit_flow(
+                                EventSeverity::Warning,
+                                category::CMAF,
+                                format!(
+                                    "CMAF output '{}': LL chunk enqueue full (seg {seq}) — aborting",
+                                    config.id
+                                ),
+                                flow_id,
+                            );
+                        }
+                        upload::ChunkSendError::Closed => {
+                            tracing::warn!(
+                                "CMAF output '{}': origin closed the PUT for seg {seq} after \
+                                 {chunks} chunk(s), aborting",
+                                config.id
+                            );
+                            if !state.ll_put_failing {
+                                state.ll_put_failing = true;
+                                event_sender.emit_flow(
+                                    EventSeverity::Warning,
+                                    category::CMAF,
+                                    format!(
+                                        "CMAF output '{}': the origin closed an LL PUT (seg {seq})",
+                                        config.id
+                                    ),
+                                    flow_id,
+                                );
+                            }
+                        }
+                    }
                     let ll = state.ll_current.take().unwrap();
                     ll.handle.abort();
                     return;
@@ -4182,6 +4300,110 @@ seg-00042.m4s?token=abc
         fresh.video_seg = Some(seg);
         assert!(adopt_generation(&mut fresh, "out"));
         assert_eq!(fresh.init_history.len(), 1, "kept for the row still to come");
+    }
+
+    /// Read a chunk's `tfdt` and its `trun` sample durations. The chunk's
+    /// `trun` flags are fixed by `build_segment_chunk` (data offset, first
+    /// sample flags, and per-sample duration / size / composition offset).
+    fn chunk_timeline(bytes: &[u8]) -> (u64, Vec<u32>, bool) {
+        fn find(bytes: &[u8], kind: &[u8; 4]) -> Option<usize> {
+            (0..bytes.len().saturating_sub(4)).find(|&i| &bytes[i..i + 4] == kind)
+        }
+        fn be32(b: &[u8]) -> u32 {
+            u32::from_be_bytes([b[0], b[1], b[2], b[3]])
+        }
+        let styp = find(bytes, b"styp").is_some();
+        let tfdt = find(bytes, b"tfdt").expect("tfdt") + 4;
+        let base = u64::from_be_bytes(bytes[tfdt + 4..tfdt + 12].try_into().unwrap());
+        let trun = find(bytes, b"trun").expect("trun") + 4;
+        let flags = be32(&bytes[trun..]) & 0x00FF_FFFF;
+        assert_eq!(flags, 0x0001 | 0x0004 | 0x0100 | 0x0200 | 0x0800);
+        let count = be32(&bytes[trun + 4..]) as usize;
+        let mut p = trun + 8 + 4 + 4; // data offset + first sample flags
+        let mut durations = Vec::with_capacity(count);
+        for _ in 0..count {
+            durations.push(be32(&bytes[p..]));
+            p += 12;
+        }
+        (base, durations, styp)
+    }
+
+    /// The chunks a low-latency segment sends, plus the tail that closes it,
+    /// tile the segment exactly — every sample pushed reaches the origin,
+    /// with the tail's `tfdt` where the last chunk ended.
+    ///
+    /// The tail was dropped: `push()` snapshots the un-chunked samples into
+    /// the completed segment and clears them, and the low-latency path
+    /// never read that, so every segment's object stopped up to one chunk
+    /// short of its row — 25 % of each at the default 2 s / 500 ms, a hole
+    /// MSE gap-jumped or stalled on every segment. Driven in production
+    /// order: push, then the chunk loop, then the tail at the cut.
+    #[test]
+    fn a_low_latency_segment_is_written_whole_including_its_tail() {
+        for (fps, chunk_ms) in [(25u64, 500u64), (30, 500), (25, 2000)] {
+            let track = VideoTrack::from_h264(vec![0x67, 0x42, 0xC0, 0x1E], vec![0x68, 0xCE]);
+            let mut seg = VideoSegmenter::new(track, 2.0);
+            let chunk_90k = chunk_ms * 90_000 / 1_000;
+            let frame_90k = 90_000 / fps;
+            let idr = vec![vec![0x65, 0xB8]];
+            let p = vec![vec![0x41, 0x00]];
+            let mut chunks_emitted = 0u32;
+            // Samples the origin has for the open segment, and where the
+            // next chunk must start.
+            let mut written = 0usize;
+            let mut next_start: Option<u64> = None;
+            let mut segments = 0;
+            // Frame n is an IDR every 2 s exactly.
+            for n in 0..(3 * 2 * fps + 1) {
+                let dts = n * frame_90k;
+                let is_idr = n % (2 * fps) == 0;
+                let out = seg.push(if is_idr { &idr } else { &p }, dts, is_idr);
+                if let (Some(done), Some((_, _, tail))) =
+                    (out.completed_video.as_ref(), out.completed_video_samples.as_ref())
+                {
+                    // The boundary: the tail closes the segment.
+                    let t = ll_tail_chunk(done, tail, chunks_emitted);
+                    let (base, durations, styp) = chunk_timeline(&t.bytes);
+                    assert_eq!(base, t.tfdt_90k);
+                    assert_eq!(styp, t.includes_styp);
+                    assert_eq!(styp, chunks_emitted == 0, "styp opens the object, once");
+                    assert_eq!(durations.iter().map(|d| *d as u64).sum::<u64>(), t.duration_90k);
+                    if let Some(e) = next_start {
+                        assert_eq!(base, e, "{fps} fps / {chunk_ms} ms: the tail starts where the last chunk ended");
+                    } else {
+                        assert_eq!(base, done.base_dts_90k, "nothing chunked: the tail is the segment");
+                    }
+                    assert_eq!(
+                        t.tfdt_90k + t.duration_90k,
+                        dts,
+                        "{fps} fps / {chunk_ms} ms: the tail ends where the next segment starts"
+                    );
+                    written += durations.len();
+                    assert_eq!(
+                        written,
+                        (2 * fps) as usize,
+                        "{fps} fps / {chunk_ms} ms: every frame of the segment was written"
+                    );
+                    written = 0;
+                    next_start = None;
+                    chunks_emitted = 0;
+                    segments += 1;
+                    continue;
+                }
+                // The chunk loop, as handle_ll_cmaf runs it after every push.
+                while let Some(bytes) = seg.take_pending_chunk(0, chunk_90k, chunks_emitted) {
+                    let (base, durations, styp) = chunk_timeline(&bytes);
+                    assert_eq!(styp, chunks_emitted == 0);
+                    if let Some(e) = next_start {
+                        assert_eq!(base, e, "chunks tile");
+                    }
+                    next_start = Some(base + durations.iter().map(|d| *d as u64).sum::<u64>());
+                    chunks_emitted += 1;
+                    written += durations.len();
+                }
+            }
+            assert_eq!(segments, 3, "{fps} fps / {chunk_ms} ms");
+        }
     }
 
     /// A row that names a different init from the last row in the window

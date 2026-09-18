@@ -410,6 +410,88 @@ pub struct AudioEncoder {
     encode_stats: Arc<EncodeStats>,
 }
 
+/// A sample-rate converter in front of an in-process encoder, fed planar PCM
+/// of any length.
+///
+/// rubato's fixed-input resampler takes exactly `chunk` frames per call, and
+/// what arrives is whatever the decoder produced: 1024 for AAC-LC, 1536 for
+/// AC-3, 1152 for MP2, 2048 for an HE-AAC element. Handing it those directly
+/// errored on every frame whose size was not the chunk's — which the
+/// libavcodec arm did, dropping the audio of any AC-3 source that needed a
+/// rate change. Input is queued here and converted a chunk at a time.
+struct PcmResampler {
+    inner: rubato::Async<f32>,
+    chunk: usize,
+    pending: Vec<Vec<f32>>,
+    out: Vec<Vec<f32>>,
+}
+
+impl PcmResampler {
+    fn new(from_hz: u32, to_hz: u32, channels: usize) -> Result<Self, String> {
+        use rubato::Resampler;
+        let ratio = to_hz as f64 / from_hz as f64;
+        let sinc_params = rubato::SincInterpolationParameters {
+            sinc_len: 64,
+            // Explicit cutoff — rubato 4's `None` would derive its own.
+            f_cutoff: Some(0.92),
+            interpolation: rubato::SincInterpolationType::Linear,
+            oversampling_factor: 128,
+            window: rubato::WindowFunction::Hann,
+        };
+        let chunk = 1024;
+        let inner = rubato::Async::<f32>::new_sinc(
+            ratio,
+            2.0,
+            &sinc_params,
+            chunk,
+            channels,
+            rubato::FixedAsync::Input,
+        )
+        .map_err(|e| format!("rubato resampler init failed: {e}"))?;
+        let max_out = inner.output_frames_max();
+        Ok(Self {
+            inner,
+            chunk,
+            pending: vec![Vec::with_capacity(chunk * 2); channels],
+            out: (0..channels).map(|_| vec![0.0f32; max_out]).collect(),
+        })
+    }
+
+    /// Queue `planar` and append whatever whole chunks it completes, converted,
+    /// to `sink`. Returns how many output frames were appended.
+    fn push(&mut self, planar: &[Vec<f32>], sink: &mut [Vec<f32>]) -> Result<usize, String> {
+        use rubato::Resampler;
+        use rubato::audioadapter_buffers::direct::SequentialSliceOfVecs;
+        for (ch, samples) in planar.iter().enumerate() {
+            self.pending[ch].extend_from_slice(samples);
+        }
+        let channels = self.pending.len();
+        let mut appended = 0;
+        while self.pending[0].len() >= self.chunk {
+            let chunk: Vec<Vec<f32>> = self
+                .pending
+                .iter_mut()
+                .map(|ch| ch.drain(..self.chunk).collect())
+                .collect();
+            let in_adapter = SequentialSliceOfVecs::new(&chunk, channels, self.chunk)
+                .map_err(|e| format!("resampler input: {e}"))?;
+            let out_max = self.out.first().map(|v| v.len()).unwrap_or(0);
+            let mut out_adapter =
+                SequentialSliceOfVecs::new_mut(self.out.as_mut_slice(), channels, out_max)
+                    .map_err(|e| format!("resampler output: {e}"))?;
+            let (_, produced) = self
+                .inner
+                .process_into_buffer(&in_adapter, &mut out_adapter, None)
+                .map_err(|e| format!("resampler: {e}"))?;
+            for (ch, buf) in self.out.iter().enumerate() {
+                sink[ch].extend_from_slice(&buf[..produced]);
+            }
+            appended += produced;
+        }
+        Ok(appended)
+    }
+}
+
 /// Internal backend variants. The public API is identical regardless.
 enum EncoderBackend {
     /// ffmpeg subprocess with supervisor, channels, and process management.
@@ -443,6 +525,11 @@ enum EncoderBackend {
         samples_since_anchor: u64,
         pts_anchor_set: bool,
         cancel: CancellationToken,
+        /// Rate conversion when the input PCM rate differs from the target's.
+        /// The fdk encoder is opened at the target rate and consumed whatever
+        /// it was given as if it were: a 44.1 kHz source through a 48 kHz
+        /// encoder ran 8.8 % slow and a third of a semitone flat.
+        resampler: Option<PcmResampler>,
     },
     /// In-process audio encoder via FFmpeg libavcodec (Opus, MP2, AC-3).
     /// Synchronous — encode happens inline in `submit_planar`.
@@ -457,12 +544,10 @@ enum EncoderBackend {
         samples_since_anchor: u64,
         pts_anchor_set: bool,
         cancel: CancellationToken,
-        /// Optional sample rate converter (rubato) when the input PCM rate
-        /// differs from the encoder's target rate (e.g. 44.1 kHz AAC → 48 kHz
-        /// Opus). `None` when rates match and no conversion is needed.
-        resampler: Option<rubato::Async<f32>>,
-        /// Scratch buffer for resampler output (one Vec per channel).
-        resample_out: Vec<Vec<f32>>,
+        /// Optional sample rate converter when the input PCM rate differs
+        /// from the encoder's target rate (e.g. 44.1 kHz AAC → 48 kHz Opus).
+        /// `None` when rates match and no conversion is needed.
+        resampler: Option<PcmResampler>,
     },
 }
 
@@ -613,6 +698,7 @@ impl AudioEncoder {
 
         let frame_size = encoder.frame_size() as usize;
         let channels = params.target_channels as usize;
+        let resampler = Self::resampler_for(&params, channels, flow_id, output_id)?;
 
         tracing::info!(
             flow_id,
@@ -635,9 +721,39 @@ impl AudioEncoder {
                 samples_since_anchor: 0,
                 pts_anchor_set: false,
                 cancel,
+                resampler,
             },
             encode_stats,
         })
+    }
+
+    /// A rate converter when the input and target rates differ, for either
+    /// in-process backend.
+    #[cfg(any(feature = "fdk-aac", feature = "media-codecs"))]
+    fn resampler_for(
+        params: &EncoderParams,
+        channels: usize,
+        flow_id: &str,
+        output_id: &str,
+    ) -> Result<Option<PcmResampler>, AudioEncoderError> {
+        let needs_resample = params.sample_rate != params.target_sample_rate
+            && params.sample_rate > 0
+            && params.target_sample_rate > 0;
+        if !needs_resample {
+            return Ok(None);
+        }
+        let r = PcmResampler::new(params.sample_rate, params.target_sample_rate, channels)
+            .map_err(|reason| AudioEncoderError::InvalidPcmFormat { reason })?;
+        tracing::info!(
+            flow_id,
+            output_id,
+            input_sr = params.sample_rate,
+            target_sr = params.target_sample_rate,
+            "audio encoder: resampling {} Hz → {} Hz",
+            params.sample_rate,
+            params.target_sample_rate
+        );
+        Ok(Some(r))
     }
 
     /// Spawn the in-process libavcodec encoder backend for Opus, MP2, AC-3.
@@ -677,50 +793,7 @@ impl AudioEncoder {
         let frame_size = encoder.frame_size();
         let channels = params.target_channels as usize;
 
-        // Build a rubato resampler when input and target rates differ.
-        let needs_resample = params.sample_rate != params.target_sample_rate
-            && params.sample_rate > 0
-            && params.target_sample_rate > 0;
-
-        let (resampler, resample_out) = if needs_resample {
-            use rubato::Resampler;
-            let ratio = params.target_sample_rate as f64 / params.sample_rate as f64;
-            let sinc_params = rubato::SincInterpolationParameters {
-                sinc_len: 64,
-                // Explicit cutoff — rubato 4's `None` would derive its own.
-                f_cutoff: Some(0.92),
-                interpolation: rubato::SincInterpolationType::Linear,
-                oversampling_factor: 128,
-                window: rubato::WindowFunction::Hann,
-            };
-            // Use a reasonable chunk size — 1024 samples is typical for AAC frame output.
-            let chunk_size = 1024;
-            let r = rubato::Async::<f32>::new_sinc(
-                ratio,
-                2.0,
-                &sinc_params,
-                chunk_size,
-                channels,
-                rubato::FixedAsync::Input,
-            )
-            .map_err(|e| AudioEncoderError::InvalidPcmFormat {
-                reason: format!("rubato resampler init failed: {e}"),
-            })?;
-            let max_out = r.output_frames_max();
-            let scratch = (0..channels).map(|_| vec![0.0f32; max_out]).collect();
-            tracing::info!(
-                flow_id,
-                output_id,
-                input_sr = params.sample_rate,
-                target_sr = params.target_sample_rate,
-                "audio encoder: resampling {} Hz → {} Hz",
-                params.sample_rate,
-                params.target_sample_rate
-            );
-            (Some(r), scratch)
-        } else {
-            (None, Vec::new())
-        };
+        let resampler = Self::resampler_for(&params, channels, flow_id, output_id)?;
 
         tracing::info!(
             flow_id,
@@ -744,7 +817,6 @@ impl AudioEncoder {
                 pts_anchor_set: false,
                 cancel,
                 resampler,
-                resample_out,
             },
             encode_stats,
         })
@@ -828,6 +900,7 @@ impl AudioEncoder {
                 pts_90k,
                 samples_since_anchor,
                 pts_anchor_set,
+                resampler,
                 ..
             } => {
                 if !*pts_anchor_set {
@@ -850,11 +923,23 @@ impl AudioEncoder {
 
                 let frame_size = encoder.frame_size() as usize;
 
-                // Append incoming samples to the accumulator
-                for (ch, samples) in planar.iter().enumerate() {
-                    accumulator[ch].extend_from_slice(samples);
+                // Append incoming samples to the accumulator, converted to
+                // the target rate first if the input is not at it.
+                if let Some(r) = resampler {
+                    match r.push(planar, accumulator) {
+                        Ok(produced) => *accumulated_samples += produced,
+                        Err(e) => {
+                            tracing::debug!("fdk-aac resampler error: {e}");
+                            self.encode_stats.inc_dropped();
+                            return true;
+                        }
+                    }
+                } else {
+                    for (ch, samples) in planar.iter().enumerate() {
+                        accumulator[ch].extend_from_slice(samples);
+                    }
+                    *accumulated_samples += frames;
                 }
-                *accumulated_samples += frames;
 
                 // Encode complete frames
                 while *accumulated_samples >= frame_size {
@@ -899,7 +984,6 @@ impl AudioEncoder {
                 samples_since_anchor,
                 pts_anchor_set,
                 resampler,
-                resample_out,
                 ..
             } => {
                 if !*pts_anchor_set {
@@ -913,41 +997,9 @@ impl AudioEncoder {
                 // If a resampler is active, convert the input PCM to the
                 // target sample rate before accumulation. Otherwise pass
                 // through directly.
-                if let Some(resampler) = resampler {
-                    use rubato::Resampler;
-                    use rubato::audioadapter_buffers::direct::SequentialSliceOfVecs;
-
-                    let channels = planar.len();
-                    let in_adapter = match SequentialSliceOfVecs::new(
-                        planar,
-                        channels,
-                        frames,
-                    ) {
-                        Ok(a) => a,
-                        Err(_) => {
-                            self.encode_stats.inc_dropped();
-                            return false;
-                        }
-                    };
-                    let out_max = resample_out.first().map(|v| v.len()).unwrap_or(0);
-                    let mut out_adapter = match SequentialSliceOfVecs::new_mut(
-                        resample_out.as_mut_slice(),
-                        channels,
-                        out_max,
-                    ) {
-                        Ok(a) => a,
-                        Err(_) => {
-                            self.encode_stats.inc_dropped();
-                            return false;
-                        }
-                    };
-                    match resampler.process_into_buffer(&in_adapter, &mut out_adapter, None) {
-                        Ok((_, produced)) => {
-                            for (ch, buf) in resample_out.iter().enumerate() {
-                                accumulator[ch].extend_from_slice(&buf[..produced]);
-                            }
-                            *accumulated_samples += produced;
-                        }
+                if let Some(r) = resampler {
+                    match r.push(planar, accumulator) {
+                        Ok(produced) => *accumulated_samples += produced,
                         Err(e) => {
                             tracing::debug!("libavcodec resampler error: {e}");
                             self.encode_stats.inc_dropped();
