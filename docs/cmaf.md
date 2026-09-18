@@ -264,14 +264,22 @@ track's:
   and a player that carries its decoder across one gets garbage.
 - Nothing is advertised under the new init until it is on the origin — the
   manifest publish waits for the PUT, and on the low-latency path so does
-  chunk emission (the samples queue in the segmenter meanwhile).
+  chunk emission: the samples queue in the segmenter meanwhile, and a
+  segment that closes before its init landed is written whole at the
+  close, as one chunk. A segment the origin did not take is not advertised,
+  as on the plain path.
 - The 30 s republish covers **every generation the window still names**,
-  not just the current one, and forgets a generation once no row does. It
-  can only republish generations *this process* produced: a restored
-  window's older inits were published by the previous run and their bytes
-  are not here.
-- Across a restart the generation is continued from the restored playlist,
-  and a mismatching init opens a new one — see the restore section above.
+  not just the current one, and forgets a generation only when the last
+  row naming it leaves the window — never at the rotation itself, where
+  the retired generation's last segment is the one still being written.
+- Across a restart the generation is continued from the restored playlist
+  — the highest of what the rows name and what the stamp says (`#EXT-X-BILBYCAST-INIT:<hash>,gen=<n>`),
+  because the manifest published in the segment after a rotation names the
+  old generation on every row while its stamp already describes the new
+  init — and a mismatching init opens a new one; see the restore section
+  above. The older inits the restored rows name are read back from the
+  origin at restore (a few kilobytes each, two-second budget) so the
+  republish covers them too.
 
 What it does not cover:
 
@@ -279,11 +287,17 @@ What it does not cover:
   (sample rate, channels, object type) is still described by the original
   init. The track list is committed at the first init and never widened.
 - **A codec-family change.** H.264 ↔ HEVC is a new sample entry, not new
-  parameter sets, and MSE needs `changeType()` for it; the limitation in
-  [Known limitations](#known-limitations) stands.
+  parameter sets, and MSE needs `changeType()` for it, which no playlist
+  tag asks for. The comparison refuses to rotate across one: the new
+  family's samples are not published, a Warning event names the restart,
+  and the limitation in [Known limitations](#known-limitations) stands.
 - **DASH.** One `SegmentTemplate` names one `initialization`, so the MPD
-  follows the newest generation: a DASH player joining live decodes, one
-  seeking back across the change does not. HLS is the DVR path.
+  follows the newest generation. Its `@startNumber` addresses only the
+  live edge (see [DASH manifest](#dash-manifest)), so there is no seeking
+  back through it at all; the one MPD revision published when the last
+  old-generation segment closes lists that segment under the new init,
+  reachable only by a player whose live delay still reaches it. HLS is
+  the DVR path; a Period per generation is the DASH answer (#144).
 - **Clip export from whole segments.** The fallback that concatenates
   segments fetches the init those segments name; a window straddling a
   change is refused as settled rather than retried, because the two halves
@@ -1269,7 +1283,13 @@ should set up a URL-rewriting reverse proxy in front of their ingest.
   `chunk_duration_90k`, so the advertised figure under-claims. The
   direction is safe — it is what lets the in-progress row's floor never
   advertise media the origin does not hold — but the parts do not sum to
-  the segment's `#EXTINF` when it lands.
+  the segment's `#EXTINF` when it lands. (The object does: the samples the
+  chunker had not taken when the IDR cut the segment are written as its
+  final chunk at the close. They used to be dropped — `push()` snapshots
+  them into the completed segment, which the low-latency path never read
+  — so every segment's object stopped up to one chunk short of its row,
+  25 % of each at the default 2 s / 500 ms, a hole MSE gap-jumped or
+  stalled on every segment.)
 
 - The 32-byte slice-header conservative estimate for CENC subsample
   splitting is safe but leaves ~32 more bytes clear than a bit-accurate

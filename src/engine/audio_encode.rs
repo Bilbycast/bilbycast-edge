@@ -433,8 +433,14 @@ enum EncoderBackend {
         accumulated_samples: usize,
         /// Queue of encoded frames ready for drain/try_recv.
         output_queue: std::collections::VecDeque<EncodedFrame>,
-        /// Running PTS in 90 kHz units.
+        /// The output timeline's anchor in 90 kHz units — the delay-corrected
+        /// PTS of the first submit — and how many output samples have been
+        /// emitted since. Each frame is stamped `anchor + emitted * 90_000 /
+        /// sr` from the running total, so the division's remainder is never
+        /// dropped: advancing the stamp per frame instead truncated 0.8 tick
+        /// on every 44.1 kHz frame, 1.37 s an hour.
         pts_90k: u64,
+        samples_since_anchor: u64,
         pts_anchor_set: bool,
         cancel: CancellationToken,
     },
@@ -446,7 +452,9 @@ enum EncoderBackend {
         accumulator: Vec<Vec<f32>>,
         accumulated_samples: usize,
         output_queue: std::collections::VecDeque<EncodedFrame>,
+        /// Anchor and running count, as on the fdk backend.
         pts_90k: u64,
+        samples_since_anchor: u64,
         pts_anchor_set: bool,
         cancel: CancellationToken,
         /// Optional sample rate converter (rubato) when the input PCM rate
@@ -624,6 +632,7 @@ impl AudioEncoder {
                 accumulated_samples: 0,
                 output_queue: std::collections::VecDeque::new(),
                 pts_90k: 0,
+                samples_since_anchor: 0,
                 pts_anchor_set: false,
                 cancel,
             },
@@ -731,6 +740,7 @@ impl AudioEncoder {
                 accumulated_samples: 0,
                 output_queue: std::collections::VecDeque::new(),
                 pts_90k: 0,
+                samples_since_anchor: 0,
                 pts_anchor_set: false,
                 cancel,
                 resampler,
@@ -816,6 +826,7 @@ impl AudioEncoder {
                 accumulated_samples,
                 output_queue,
                 pts_90k,
+                samples_since_anchor,
                 pts_anchor_set,
                 ..
             } => {
@@ -833,6 +844,7 @@ impl AudioEncoder {
                     let delay_ticks =
                         (encoder.codec_delay_samples() as u64) * 90_000 / sr;
                     *pts_90k = pts.saturating_sub(delay_ticks);
+                    *samples_since_anchor = 0;
                     *pts_anchor_set = true;
                 }
 
@@ -858,14 +870,10 @@ impl AudioEncoder {
 
                     match encoder.encode_frame(&frame_planar) {
                         Ok(encoded) => {
-                            let current_pts = *pts_90k;
-                            // Advance PTS: samples * 90000 / sample_rate
-                            let sr = self.params.target_sample_rate as u64;
-                            if sr > 0 {
-                                *pts_90k = pts_90k.saturating_add(
-                                    (encoded.num_samples as u64) * 90_000 / sr,
-                                );
-                            }
+                            let sr = self.params.target_sample_rate.max(1) as u64;
+                            let current_pts =
+                                pts_90k.saturating_add(*samples_since_anchor * 90_000 / sr);
+                            *samples_since_anchor += encoded.num_samples as u64;
                             output_queue.push_back(EncodedFrame {
                                 data: Bytes::from(encoded.bytes),
                                 pts: current_pts,
@@ -888,6 +896,7 @@ impl AudioEncoder {
                 accumulated_samples,
                 output_queue,
                 pts_90k,
+                samples_since_anchor,
                 pts_anchor_set,
                 resampler,
                 resample_out,
@@ -895,6 +904,7 @@ impl AudioEncoder {
             } => {
                 if !*pts_anchor_set {
                     *pts_90k = pts;
+                    *samples_since_anchor = 0;
                     *pts_anchor_set = true;
                 }
 
@@ -961,13 +971,10 @@ impl AudioEncoder {
                     match encoder.encode_frame(&frame_planar) {
                         Ok(encoded_frames) => {
                             for ef in encoded_frames {
-                                let current_pts = *pts_90k;
-                                let sr = encoder.sample_rate() as u64;
-                                if sr > 0 {
-                                    *pts_90k = pts_90k.saturating_add(
-                                        (ef.num_samples as u64) * 90_000 / sr,
-                                    );
-                                }
+                                let sr = (encoder.sample_rate() as u64).max(1);
+                                let current_pts = pts_90k
+                                    .saturating_add(*samples_since_anchor * 90_000 / sr);
+                                *samples_since_anchor += ef.num_samples as u64;
                                 output_queue.push_back(EncodedFrame {
                                     data: ef.data,
                                     pts: current_pts,
@@ -999,8 +1006,16 @@ impl AudioEncoder {
     /// followed by nothing: the audio runs on the old timeline while the
     /// video moves, for the life of the flow. A caller that has seen the
     /// jump calls this; the partial frame in the accumulator belongs to the
-    /// old timeline and is dropped with it. The ffmpeg backend carries a PTS
-    /// per chunk and needs nothing.
+    /// old timeline and is dropped with it. What is not dropped is the
+    /// codec's own delay line — fdk holds ~2 600 samples (54 ms at 48 kHz)
+    /// of the previous programme, which come out first under the new
+    /// anchor; after a silence burst that is 54 ms of silence, after a
+    /// splice the tail of what preceded it.
+    ///
+    /// The ffmpeg subprocess backend cannot be re-anchored: it discards the
+    /// PTS on every chunk and stamps from a framer anchored at zero, so its
+    /// output is not on the media timeline in the first place. It is not the
+    /// backend a CMAF output gets for AAC while `fdk-aac` is built in.
     pub fn reanchor_pts(&mut self) {
         match &mut self.backend {
             EncoderBackend::Ffmpeg { .. } => {}
@@ -1008,6 +1023,7 @@ impl AudioEncoder {
             EncoderBackend::InProcess {
                 accumulator,
                 accumulated_samples,
+                samples_since_anchor,
                 pts_anchor_set,
                 ..
             } => {
@@ -1015,12 +1031,14 @@ impl AudioEncoder {
                     ch.clear();
                 }
                 *accumulated_samples = 0;
+                *samples_since_anchor = 0;
                 *pts_anchor_set = false;
             }
             #[cfg(feature = "media-codecs")]
             EncoderBackend::InProcessLibav {
                 accumulator,
                 accumulated_samples,
+                samples_since_anchor,
                 pts_anchor_set,
                 ..
             } => {
@@ -1028,6 +1046,7 @@ impl AudioEncoder {
                     ch.clear();
                 }
                 *accumulated_samples = 0;
+                *samples_since_anchor = 0;
                 *pts_anchor_set = false;
             }
         }
@@ -2727,6 +2746,73 @@ mod tests {
         assert!(first.data.len() >= 7, "encoded frame too small for ADTS");
         assert_eq!(first.data[0], 0xFF, "ADTS sync byte 0");
         assert_eq!(first.data[1] & 0xF0, 0xF0, "ADTS sync byte 1");
+    }
+
+    /// The output timeline is exact at any rate, and a re-anchor restarts
+    /// it where the caller says.
+    ///
+    /// Stamping each frame one truncated step after the last dropped 0.8 of
+    /// a tick on every 44.1 kHz frame — 1.37 s an hour, a slow drift the
+    /// picture never shares. From an anchor plus a running sample count the
+    /// error is bounded below one tick for the life of the anchor.
+    #[cfg(feature = "fdk-aac")]
+    #[test]
+    fn in_process_timeline_does_not_accumulate_truncation() {
+        let params = EncoderParams {
+            codec: AudioCodec::AacLc,
+            sample_rate: 44_100,
+            channels: 2,
+            target_bitrate_kbps: 128,
+            target_sample_rate: 44_100,
+            target_channels: 2,
+            opus_vbr_mode: None,
+            opus_fec: false,
+            opus_dtx: false,
+            opus_frame_duration_ms: None,
+        };
+        let cancel = CancellationToken::new();
+        let stats = Arc::new(OutputStatsAccumulator::new(
+            "test-output".into(),
+            "test output".into(),
+            "cmaf".into(),
+        ));
+        let mut enc = AudioEncoder::spawn(
+            params, cancel, "test-flow".into(), "test-output".into(), stats, None,
+        )
+        .expect("in-process fdk-aac encoder should open");
+        let silence = vec![vec![0.0f32; 1024]; 2];
+        // Ten minutes at 44.1 kHz.
+        let n = 25_840u64;
+        for _ in 0..n {
+            assert!(enc.submit_planar(&silence, 1_000_000));
+        }
+        let frames = enc.drain();
+        assert!(frames.len() >= n as usize - 4, "{} frames", frames.len());
+        let first = frames[0].pts;
+        let last = frames[frames.len() - 1].pts;
+        let k = (frames.len() - 1) as u128;
+        let exact = first as u128 + k * 1024 * 90_000 / 44_100;
+        assert!(
+            (last as i128 - exact as i128).abs() <= 1,
+            "after {k} frames the stamp is {last}, exact is {exact}: {} ticks adrift",
+            last as i128 - exact as i128
+        );
+        // Per-frame truncation would have been 0.8 tick a frame behind.
+        assert!(exact - last as u128 <= 1, "the old drift would read {}", k * 8 / 10);
+
+        // A re-anchor lands the next frame where the caller says, less the
+        // codec delay, and counts from there.
+        enc.reanchor_pts();
+        for _ in 0..8 {
+            assert!(enc.submit_planar(&silence, 50_000_000));
+        }
+        let after = enc.drain();
+        assert!(!after.is_empty());
+        let delay = match &enc.backend {
+            EncoderBackend::InProcess { encoder, .. } => encoder.codec_delay_samples() as u64,
+            _ => unreachable!(),
+        };
+        assert_eq!(after[0].pts, 50_000_000 - delay * 90_000 / 44_100);
     }
 
     /// Test that HE-AAC v1 uses the in-process path when fdk-aac is enabled.

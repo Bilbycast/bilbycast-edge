@@ -2163,7 +2163,7 @@ CMAF with DRM:
 | `id` | string | Yes | - | Unique output ID. Max 64 chars. |
 | `name` | string | Yes | - | Human-readable display name. |
 | `ingest_url` | string | Yes | - | CMAF ingest base URL. Must start with `http://` or `https://`. Artifacts are PUT to `{ingest_url}/init.mp4`, `{ingest_url}/seg-{00001}.m4s`, `{ingest_url}/manifest.m3u8`, `{ingest_url}/manifest.mpd`. |
-| `segment_duration_secs` | float | No | `2.0` | Target segment duration in seconds. Range: 1.0-10.0. Segments cut on IDR — source must emit an IDR at least every `segment_duration_secs` unless `video_encode` is set (which forces GoP alignment). |
+| `segment_duration_secs` | float | No | `2.0` | Target segment duration in seconds. Range: 1.0-10.0. Segments cut on IDR — source must emit an IDR at least every `segment_duration_secs`; with `video_encode` set, that is the configured `gop_size` (60 when unset). |
 | `max_segments` | integer | No | `5` | Rolling playlist window. Range: 1-30. |
 | `dvr_window_secs` | float | No | - | Rolling playlist window expressed in **time**, for DVR / scrub-back. Supersedes `max_segments`: the entry count is derived as `ceil(dvr_window_secs / segment_duration_secs)`, so the window keeps its intended duration if segment length changes. Minimum `1.0`; rejected if it derives more than 21600 entries. The count is derived from the *target* duration, but segments close on the first IDR at or after it, so a source whose GoP does not divide `segment_duration_secs` holds a window somewhat longer than asked for. The playlist is a *sliding* window, so origin retention must be sized to match or clients will seek to evicted segments. |
 | `manifests` | array | No | `["hls","dash"]` | Subset of `{"hls", "dash"}`, non-empty. Both manifests reference the same fMP4 segments — enable either or both. |
@@ -2172,7 +2172,7 @@ CMAF with DRM:
 | `thumbnails` | object | No | `null` | Scrub-preview sprite sheets plus a WebVTT index, PUT beside the media. See [`thumbnails`](#the-cmaf-thumbnails-block) below. Off when omitted. |
 | `encryption` | object | No | `null` | Common Encryption configuration. **Refused together with `low_latency = true`** — the LL path does not encrypt its chunks (bilbycast-edge#135). See [`encryption`](#the-cmaf-encryption-block) below. |
 | `audio_encode` | object | No | `null` | Optional AAC re-encode. Allowed `codec`: `aac_lc`, `he_aac_v1`, `he_aac_v2`. Source must already be AAC (TsDemuxer decodes via fdk-aac). When omitted, the source AAC passes through unchanged. |
-| `video_encode` | object | No | `null` | Optional H.264 / HEVC re-encode with explicit GoP alignment to `segment_duration_secs`. See [`video_encode`](transcoding.md#video_encode--h264--hevc-re-encoding) in `transcoding.md` for backends and fields. H.264 → H.264 or HEVC → H.264 conversion is supported when the matching `video-encoder-*` Cargo feature is enabled. |
+| `video_encode` | object | No | `null` | Optional H.264 / HEVC re-encode; the operator's `gop_size` is honoured and segments cut on its IDRs. See [`video_encode`](transcoding.md#video_encode--h264--hevc-re-encoding) in `transcoding.md` for backends and fields. H.264 → H.264 or HEVC → H.264 conversion is supported when the matching `video-encoder-*` Cargo feature is enabled. |
 | `program_number` | integer | No | `null` | MPTS → SPTS program filter. Must be `> 0`. See [MPTS → SPTS filtering](#mpts--spts-filtering). |
 | `auth_token` | string | No | `null` | Bearer token sent with every HTTP PUT / chunked PUT. |
 

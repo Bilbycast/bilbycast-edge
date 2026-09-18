@@ -318,7 +318,7 @@ pub(super) async fn fetch_manifest(base: &str, auth: Option<&str>) -> Result<Vec
     http_get(&format!("{base}/manifest.m3u8"), auth).await
 }
 
-async fn http_get(url: &str, auth: Option<&str>) -> Result<Vec<u8>> {
+pub(super) async fn http_get(url: &str, auth: Option<&str>) -> Result<Vec<u8>> {
     let mut req = client().get(url).timeout(Duration::from_secs(60));
     if let Some(t) = auth {
         req = req.header("Authorization", format!("Bearer {t}"));

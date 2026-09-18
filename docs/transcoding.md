@@ -116,8 +116,13 @@ When a multi-input flow switches to an input that has `video_encode`
 (ingress transcoding), the switch forwarder sets a one-shot
 `Arc<AtomicBool>` that the target input's `TsVideoReplacer` consumes
 before its next `VideoEncoder::encode_frame` call. The replacer then
-sets `AVFrame.pict_type = AV_PICTURE_TYPE_I`, which libx264 / libx265 /
-NVENC all honour by emitting an IDR for that frame.
+sets `AVFrame.pict_type = AV_PICTURE_TYPE_I`, which libx264 / libx265
+honour by emitting an IDR for that frame. **NVENC does not**: it codes a
+forced *intra* picture (`NV_ENC_PIC_FLAG_FORCEINTRA`), not an IDR, unless
+the encoder's `forced-idr` private option is set, which the wrapper does
+not do — and only an IDR gets `AV_PKT_FLAG_KEY`, so the frame comes back
+`keyframe = false` and a receiver still resyncs on NVENC's next natural
+IDR.
 
 Without this hook, downstream decoders had to wait for the next natural
 keyframe from the ingress re-encoder, which at the default
@@ -420,7 +425,7 @@ channel count; if unset, the Opus encoder follows the source.
 **Status:** Shipped. Active on SRT / UDP / RTP / RIST outputs (TS
 pipeline via `TsVideoReplacer`), RTMP (`output_rtmp::VideoEncoderState`),
 WebRTC (H.264 only, `output_webrtc::WebrtcVideoEncoderState`), CMAF /
-CMAF-LL (segmenter forces GoP alignment), and ST 2110-20 / -23
+CMAF-LL (the operator's `gop_size` is honoured), and ST 2110-20 / -23
 (mandatory on those inputs). **HLS is the only remaining output
 without `video_encode`** (deferred — see below).
 

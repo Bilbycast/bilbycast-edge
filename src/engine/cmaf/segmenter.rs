@@ -87,6 +87,15 @@ pub struct CompletedSegment {
     /// is a decode discontinuity whatever the clock says, and the row that
     /// lists it has to say so.
     pub first_of_generation: bool,
+    /// The codec the samples were filtered and must be encrypted under —
+    /// the track's at the cut, which a rotation applied by the same push
+    /// has already replaced by the time the caller looks.
+    pub codec: VideoCodec,
+    /// 90 kHz DTS of the first sample still queued at the cut. The segment
+    /// base on the plain path; on the low-latency path, where chunks have
+    /// been drained as they filled, the start of the tail that closes the
+    /// segment.
+    pub first_pending_dts_90k: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -123,6 +132,8 @@ pub struct VideoSegmenter {
     pending_track: Option<VideoTrack>,
     /// Set at the swap, carried onto the next segment to close.
     open_first_of_generation: bool,
+    /// The newest DTS pushed, whether or not a segment is open.
+    last_dts: Option<u64>,
 }
 
 struct PendingVideoSample {
@@ -175,6 +186,7 @@ impl VideoSegmenter {
             generation: 0,
             pending_track: None,
             open_first_of_generation: false,
+            last_dts: None,
         }
     }
 
@@ -194,9 +206,19 @@ impl VideoSegmenter {
     /// it when this run's init turns out not to describe the window it
     /// restored: rather than overwrite the previous run's init under rows
     /// that decode against it, this run publishes its own under a new name.
+    ///
+    /// The open segment is not marked first-of-generation: the join this
+    /// bump makes is between the restored rows and this run's first row,
+    /// which the restore's own discontinuity already tags, and the segment
+    /// open now is continuous with whatever own rows precede it.
     pub fn bump_generation(&mut self) {
         self.generation = self.generation.saturating_add(1);
-        self.open_first_of_generation = true;
+    }
+
+    /// 90 kHz DTS of the newest sample pushed, if any — where the picture
+    /// is, for a track that has to keep up with it.
+    pub fn last_dts_90k(&self) -> Option<u64> {
+        self.last_dts
     }
 
     /// The source's parameter sets changed. Swap the track in at the next
@@ -230,6 +252,7 @@ impl VideoSegmenter {
     ) -> PushOutcome {
         let unwrapped = self.pts_unwrap.unwrap(pts90k);
         let dts = unwrapped;
+        self.last_dts = Some(dts);
 
         let mut completed = None;
         let mut completed_samples: Option<(u64, u64, Vec<Sample>)> = None;
@@ -244,6 +267,7 @@ impl VideoSegmenter {
             if let Some(base) = self.segment_base_dts {
                 let elapsed = dts.saturating_sub(base);
                 if (elapsed >= self.target_duration_90k || rotating) && !self.samples.is_empty() {
+                    let first_pending_dts_90k = self.samples[0].dts;
                     let (seq, sb, samples) = self.snapshot_samples(dts);
                     completed = Some(CompletedSegment {
                         sequence_number: seq,
@@ -253,6 +277,8 @@ impl VideoSegmenter {
                         base_dts_90k: sb,
                         generation: self.generation,
                         first_of_generation: std::mem::take(&mut self.open_first_of_generation),
+                        codec: self.track.codec,
+                        first_pending_dts_90k,
                     });
                     completed_samples = Some((seq, sb, samples));
                     self.samples.clear();
@@ -640,6 +666,10 @@ impl AudioSegmenter {
             // audio-only segment path has no init generation of its own.
             generation: 0,
             first_of_generation: false,
+            // Audio is never encrypted and never chunked, so neither field
+            // is read for this kind; the codec is a placeholder.
+            codec: VideoCodec::H264,
+            first_pending_dts_90k: base * 90_000 / self.track.sample_rate as u64,
         })
     }
 }
@@ -749,6 +779,62 @@ mod tests {
         assert_eq!(seg.generation, 1);
         assert!(seg.first_of_generation);
         assert!(!s.open_segment_first_of_generation());
+    }
+
+    /// A restart's generation bump marks nothing: the join to the restored
+    /// rows is the restore discontinuity's to tag, and the segment open at
+    /// the bump continues whatever own rows precede it.
+    #[test]
+    fn a_restart_bump_does_not_mark_the_open_segment() {
+        let v = VideoTrack::from_h264(vec![0x67, 0x42, 0xC0, 0x1E], vec![0x68, 0xCE]);
+        let mut s = VideoSegmenter::new(v, 2.0);
+        let idr = vec![vec![0x65, 0xB8]];
+        let p = vec![vec![0x41, 0x00]];
+        s.push(&idr, 0, true);
+        for i in 1..61 {
+            s.push(&p, (i * 3000) as u64, false);
+        }
+        let a = s.push(&idr, 2 * 90_000, true).completed_video.expect("A");
+        assert_eq!(a.generation, 0);
+        s.bump_generation();
+        assert!(!s.open_segment_first_of_generation());
+        for i in 1..61 {
+            s.push(&p, 2 * 90_000 + (i * 3000) as u64, false);
+        }
+        let b = s.push(&idr, 4 * 90_000, true).completed_video.expect("B");
+        assert_eq!(b.generation, 1);
+        assert!(!b.first_of_generation);
+        assert_eq!(b.codec, VideoCodec::H264);
+        assert_eq!(b.first_pending_dts_90k, 2 * 90_000, "nothing was drained: the tail is the segment");
+        assert_eq!(s.last_dts_90k(), Some(4 * 90_000));
+    }
+
+    /// On the low-latency path chunks are drained as they fill, so what the
+    /// cut carries is the tail — and its own first DTS, which is where the
+    /// final chunk's `tfdt` has to point.
+    #[test]
+    fn the_cut_carries_the_tails_own_first_dts() {
+        let v = VideoTrack::from_h264(vec![0x67, 0x42, 0xC0, 0x1E], vec![0x68, 0xCE]);
+        let mut s = VideoSegmenter::new(v, 2.0);
+        let idr = vec![vec![0x65, 0xB8]];
+        let p = vec![vec![0x41, 0x00]];
+        s.push(&idr, 0, true);
+        for i in 1..50 {
+            s.push(&p, (i * 3600) as u64, false); // 25 fps
+        }
+        // 500 ms chunks: three go out, at frames 0..13, 13..26, 26..39.
+        let mut drained = 0;
+        while s.take_pending_chunk(0, 45_000, drained).is_some() {
+            drained += 1;
+        }
+        assert_eq!(drained, 3);
+        let tail_first = s.samples[0].dts;
+        assert_eq!(tail_first, 39 * 3600);
+        let seg = s.push(&idr, 50 * 3600, true).completed_video.expect("the cut");
+        assert_eq!(seg.first_pending_dts_90k, tail_first);
+        assert_eq!(seg.base_dts_90k, 0, "the segment still starts where it started");
+        let tail: u64 = seg.duration_90k;
+        assert_eq!(tail, 50 * 3600);
     }
 
     /// A rotation requested before any segment is open has nothing to cut:

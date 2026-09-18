@@ -133,8 +133,11 @@ BSP's `librockchip_mpp.so`, and the running user in the `video` group.
 
 **Known RKMPP limitation — on-demand forced IDR.** The seamless-input-switch
 path asks the encoder for an immediate keyframe (`force_next_keyframe()` →
-`AVFrame.pict_type = AV_PICTURE_TYPE_I`). NVENC / QSV / VAAPI / libx264 /
-libx265 honour that; the Rockchip MPP encoders do **not** — upstream
+`AVFrame.pict_type = AV_PICTURE_TYPE_I`). QSV / VAAPI / libx264 / libx265
+honour that; NVENC codes a forced intra picture rather than an IDR unless
+`forced-idr` is set (the wrapper does not set it), so it reports
+`keyframe = false` and resyncs on its natural IDR — see
+`transcoding.md`; the Rockchip MPP encoders do **not** — upstream
 `rkmppenc.c` has no input-side forced-IDR path (it needs the out-of-band
 `MPP_ENC_SET_IDR_FRAME` control call). So on RKMPP an input switch resyncs on
 the encoder's next GOP IDR instead of instantly. Mitigation: keep `gop_size`

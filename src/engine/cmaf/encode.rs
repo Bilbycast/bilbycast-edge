@@ -59,20 +59,32 @@ pub struct AudioReencoder {
     /// It is built before any media exists and seeded at zero; the first
     /// emission seeds it from the anchor the caller supplies.
     silence_seeded: bool,
-    /// The PTS of the last source frame submitted, to notice a jump.
-    last_source_pts: Option<u64>,
+    /// Where, on the source's timeline, the encoder's next input sample
+    /// belongs: the last submit's PTS plus what was submitted, silence
+    /// included. The encoder free-runs from one anchor and ignores every
+    /// later PTS, so this is the only way to know when the source and the
+    /// encoder have parted company.
+    expected_source_pts: Option<u64>,
 }
 
-/// How far the source PTS may move between consecutive frames before the
-/// encoder's output timeline is re-anchored on it.
+/// How far a submit's PTS may sit from where the encoder expects it before
+/// the encoder's output timeline is re-anchored on it.
 ///
 /// The in-process encoder free-runs from one anchor (see
-/// `AudioEncoder::reanchor_pts`), so a splice, a silence gap or a wrap that
-/// the unwrapper did not absorb would otherwise leave the audio on the old
-/// timeline for good. Half a second is far past any frame-to-frame step a
-/// real source makes (an AC-3 frame is 32 ms) and short enough that a jump
-/// which does happen costs one re-anchor, not a lasting offset.
-const SOURCE_PTS_JUMP_TICKS: u64 = 45_000;
+/// `AudioEncoder::reanchor_pts`), so a splice, a lost PES, a wrap the
+/// unwrapper did not absorb, or silence inserted between two contiguous
+/// real frames would otherwise leave the audio on a timeline the picture is
+/// no longer on — for good. Compared against the *expected* PTS rather than
+/// the previous submit's, so a source that packs half a second of audio
+/// into one PES is not a jump, and a 200 ms silence burst between two
+/// contiguous frames is. Two 48 kHz frames of slack covers the rounding a
+/// PES-to-frame PTS carries.
+const SOURCE_PTS_SLACK_TICKS: u64 = 4_000;
+
+/// How much silence one fill may emit before it is treated as a jump in the
+/// picture rather than a gap to cover: a splice or a wrap on the video moves
+/// the target by hours, and nobody wants hours of silence encoded to reach it.
+const SILENCE_FILL_CAP_TICKS: u64 = 4 * 90_000;
 
 struct LazyAudioInit {
     /// ADTS config tuple cached by the demuxer. `None` until first
@@ -156,7 +168,7 @@ impl AudioReencoder {
             out_stats,
             silence,
             silence_seeded: false,
-            last_source_pts: None,
+            expected_source_pts: None,
         })
     }
 
@@ -187,25 +199,33 @@ impl AudioReencoder {
         Some((1, sr_idx, ch))
     }
 
-    /// Produce zero or more silent AAC frames `(data, pts)` if the drop
-    /// watchdog says real audio is absent or stalled. Idempotent and
-    /// cheap when audio is flowing — returns an empty vec when
-    /// `silent_fallback` is off OR when real audio arrived within the
-    /// grace window. The PTS attached to each emitted frame is the
-    /// encoder's output PTS so segment-boundary math stays consistent
-    /// with the real-audio path.
+    /// Produce silent AAC frames `(data, pts)` if the drop watchdog says real
+    /// audio is absent or stalled — as many as it takes to bring the silence
+    /// up to `target_pts_90k`, where the picture is. Idempotent and cheap
+    /// when audio is flowing: an empty vec when `silent_fallback` is off,
+    /// when real audio arrived within the grace window, or when the silence
+    /// has already reached the picture. The PTS on each frame is the
+    /// encoder's output PTS, the same timeline the real-audio path stamps.
     ///
-    /// `anchor_pts_90k` is where the media timeline currently is — the
-    /// video's, since silence exists to accompany a picture — and nothing is
-    /// emitted until the caller has one. The generator is built before any
-    /// media has arrived and seeded at zero; the first silent chunk used to
-    /// be submitted at zero, the encoder anchored its output counter there
-    /// once and for all, and every silent frame from startup sat hours below
-    /// the video's DTS. MSE never had both tracks buffered at one position
-    /// and the feed stalled with nothing wrong on the wire.
+    /// Filled to the picture, not ticked by the clock. The tick is the
+    /// watchdog; it used to also be the meter — one chunk per tick, and every
+    /// tick the output loop observed late (a segment PUT, a re-encode in
+    /// `block_in_place`) was a chunk the audio never made up, so a video-only
+    /// feed's silence fell a second or two a minute behind its picture until
+    /// MSE ran out of buffered audio at the playhead. And a delivery stall
+    /// ticked silence into the encoder while the picture stood still, so the
+    /// real audio that followed was stamped that much late for the life of
+    /// the flow. Measured against the picture, neither happens: a stall
+    /// advances neither track, and lost ticks are made up on the next.
+    ///
+    /// Nothing is emitted until the caller has a picture to measure against.
+    /// The generator is built before any media has arrived and seeded at
+    /// zero; the first silent chunk used to be submitted at zero, the
+    /// encoder anchored its output counter there once and for all, and every
+    /// silent frame from startup sat hours below the video's DTS.
     pub fn encode_silence_if_needed(
         &mut self,
-        anchor_pts_90k: Option<u64>,
+        target_pts_90k: Option<u64>,
     ) -> Result<Vec<(Vec<u8>, u64)>> {
         let Some(sg) = self.silence.as_mut() else {
             return Ok(Vec::new());
@@ -216,37 +236,49 @@ impl AudioReencoder {
         let Some(enc) = self.encoder.as_mut() else {
             return Ok(Vec::new());
         };
+        let Some(target) = target_pts_90k else {
+            return Ok(Vec::new());
+        };
         if !self.silence_seeded {
-            let Some(anchor) = anchor_pts_90k else {
-                return Ok(Vec::new());
-            };
-            sg.seed_pts(anchor);
+            sg.seed_pts(target);
             self.silence_seeded = true;
         }
-        let (planar, gen_pts) = sg.next_chunk();
-        enc.submit_planar(planar, gen_pts);
-        let mut out = Vec::new();
-        while let Some(f) = enc.try_recv() {
-            out.push((f.data.to_vec(), f.pts));
+        // A picture that moved further than any gap this would fill is a
+        // splice or a wrap: the silence follows it rather than chasing it,
+        // and the encoder is told the same way a source jump tells it.
+        if target.saturating_sub(sg.next_pts_90k()) > SILENCE_FILL_CAP_TICKS {
+            sg.seed_pts(target);
+            enc.reanchor_pts();
         }
+        let mut out = Vec::new();
+        while sg.next_pts_90k() <= target {
+            let (planar, gen_pts) = sg.next_chunk();
+            enc.submit_planar(planar, gen_pts);
+            while let Some(f) = enc.try_recv() {
+                out.push((f.data.to_vec(), f.pts));
+            }
+        }
+        // Where the encoder's next input sample now belongs.
+        self.expected_source_pts = Some(sg.next_pts_90k());
         Ok(out)
     }
 
-    /// Notice a source PTS jump before `pts` is submitted, and re-anchor the
-    /// encoder's output timeline on it if there was one. See
-    /// [`SOURCE_PTS_JUMP_TICKS`]. Real audio returning after a silence burst
-    /// takes this path too: the silence ran on the wall clock and the source
-    /// has moved on without it.
-    fn note_source_pts(&mut self, pts: u64) {
+    /// Notice, before `pts` is submitted, that the source is not where the
+    /// encoder expects it, and re-anchor the encoder there if so. See
+    /// [`SOURCE_PTS_SLACK_TICKS`]. The first real frame after silence primed
+    /// the encoder takes this path too: the silence ran to the picture, and
+    /// the source's own timeline is wherever it is.
+    fn note_source_pts(&mut self, pts: u64, submitted_ticks: u64) {
         let jumped = self
-            .last_source_pts
-            .is_some_and(|last| pts < last || pts - last > SOURCE_PTS_JUMP_TICKS);
-        self.last_source_pts = Some(pts);
+            .expected_source_pts
+            .is_some_and(|expected| pts.abs_diff(expected) > SOURCE_PTS_SLACK_TICKS);
+        self.expected_source_pts = Some(pts.saturating_add(submitted_ticks));
         if jumped
             && let Some(enc) = self.encoder.as_mut()
         {
             tracing::debug!(
-                "CMAF output '{}': audio source PTS jumped to {pts}; re-anchoring the encoder",
+                "CMAF output '{}': audio source PTS {pts} is off the encoder's timeline; \
+                 re-anchoring",
                 self.output_id,
             );
             enc.reanchor_pts();
@@ -298,6 +330,7 @@ impl AudioReencoder {
         }
         let source_sr = dec.sample_rate();
         let source_ch = dec.channels();
+        let submitted_ticks = planar[0].len() as u64 * 90_000 / source_sr.max(1) as u64;
 
         if self.encoder.is_none() {
             let params = EncoderParams {
@@ -327,7 +360,7 @@ impl AudioReencoder {
             .map_err(|e| anyhow::anyhow!("AudioEncoder spawn failed: {e}"))?;
             self.encoder = Some(enc);
         }
-        self.note_source_pts(pts);
+        self.note_source_pts(pts, submitted_ticks);
         let enc = self.encoder.as_mut().unwrap();
         enc.submit_planar(&planar, pts);
         let mut out = Vec::new();
@@ -389,7 +422,8 @@ impl AudioReencoder {
             .map_err(|e| anyhow::anyhow!("AudioEncoder spawn failed: {e}"))?;
             self.encoder = Some(enc);
         }
-        self.note_source_pts(pts);
+        let submitted_ticks = planar[0].len() as u64 * 90_000 / source_sr.max(1) as u64;
+        self.note_source_pts(pts, submitted_ticks);
         let enc = self.encoder.as_mut().unwrap();
         enc.submit_planar(planar, pts);
         let mut out = Vec::new();
@@ -722,6 +756,61 @@ mod reencoder_tests {
         let track = r.silent_fallback_track().expect("default sr has ADTS index");
         // profile=1 (AAC-LC), sr_idx=3 (48000 Hz), ch_cfg=2.
         assert_eq!(track, (1, 3, 2));
+    }
+
+    /// Silence is laid down to the picture and no further, and the real
+    /// audio that follows lands on the source's own timeline, not where the
+    /// silence counter happened to be.
+    ///
+    /// With one chunk per tick the silence fell behind the picture by every
+    /// tick the output loop observed late, and with no re-anchor the first
+    /// real frame inherited the silence timeline's offset for the life of
+    /// the flow.
+    #[test]
+    #[cfg(feature = "fdk-aac")]
+    fn silence_fills_to_the_picture_and_real_audio_re_anchors() {
+        let cancel = CancellationToken::new();
+        let mut r = AudioReencoder::new(&ae("aac_lc", true), &cancel, "out3", "flow3")
+            .expect("fdk-aac in-process encoder");
+
+        // No picture yet: nothing to measure against, nothing emitted.
+        assert!(r.encode_silence_if_needed(None).unwrap().is_empty());
+
+        // The picture is at 10 s; the silence is laid down up to it in one
+        // call, however many ticks that took to notice.
+        let video = 10 * 90_000u64;
+        let frames = r.encode_silence_if_needed(Some(video)).unwrap();
+        assert!(!frames.is_empty());
+        let first = frames[0].1;
+        let delay = video - first;
+        assert!(delay < 90_000 / 10, "the first silent frame sits at the picture (minus codec delay): {first}");
+        let laid = r.expected_source_pts.expect("the fill records where it got to");
+        assert!(laid > video && laid - video <= 1_920 + 1, "one chunk past the target: {laid}");
+        // Two more seconds of picture: two seconds of silence, ~94 frames.
+        let more = r.encode_silence_if_needed(Some(video + 2 * 90_000)).unwrap();
+        assert!((90..=96).contains(&more.len()), "{} frames for 2 s", more.len());
+        // Nothing to add while the picture stands still.
+        assert!(r.encode_silence_if_needed(Some(video + 2 * 90_000)).unwrap().is_empty());
+
+        // Real audio arrives on its own timeline, an hour away from the
+        // silence counter: the encoder is re-anchored on it.
+        let real_pts = 3_600 * 90_000u64;
+        let pcm = vec![vec![0.1f32; 1024]; 2];
+        let mut out = Vec::new();
+        for i in 0..6u64 {
+            out.extend(r.encode_planar(&pcm, real_pts + i * 1_920, 48_000, 2).unwrap());
+        }
+        assert!(!out.is_empty());
+        assert!(
+            out[0].1.abs_diff(real_pts - delay) <= 1,
+            "the first real frame must sit at the source's PTS (minus codec delay), got {} for {real_pts}",
+            out[0].1
+        );
+        // And contiguous source frames stay put — no re-anchor on rounding.
+        let a = out[0].1;
+        for (k, (_, pts)) in out.iter().enumerate() {
+            assert_eq!(*pts, a + k as u64 * 1_920, "frame {k}");
+        }
     }
 }
 

@@ -151,6 +151,12 @@ impl SilenceGenerator {
         self.pts_90k = pts_90k;
     }
 
+    /// The 90 kHz PTS the next silent chunk would carry — how far the
+    /// silence has been laid down.
+    pub fn next_pts_90k(&self) -> u64 {
+        self.pts_90k
+    }
+
     /// Reset the watchdog after a real audio frame arrived. `pts_90k`
     /// is the frame's presentation timestamp; the generator snaps its
     /// internal PTS counter to it so the next silent chunk (if we

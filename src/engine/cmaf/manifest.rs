@@ -16,7 +16,6 @@
 
 use super::fmp4::VideoCodec;
 
-/// One entry in the rolling playlist.
 /// The object name of an init generation.
 ///
 /// Generation zero is `init.mp4`, so a stream whose parameter sets never
@@ -32,7 +31,10 @@ pub fn init_object_name(generation: u32) -> String {
 }
 
 /// The generation an init object name denotes — the inverse of
-/// [`init_object_name`]. `None` for a name this edge never writes.
+/// [`init_object_name`]. `None` for a name this edge never writes,
+/// including a number past [`MAX_INIT_GENERATION`]: a served manifest is
+/// copied back out on trust, and a count this edge could not have reached
+/// would saturate the bump a mismatch relies on.
 pub fn init_generation_of(name: &str) -> Option<u32> {
     let name = name.rsplit('/').next().unwrap_or(name);
     if name == "init.mp4" {
@@ -42,9 +44,14 @@ pub fn init_generation_of(name: &str) -> Option<u32> {
         .strip_suffix(".mp4")?
         .parse::<u32>()
         .ok()
-        .filter(|g| *g > 0)
+        .filter(|g| (1..=MAX_INIT_GENERATION).contains(g))
 }
 
+/// The highest init generation a served playlist is believed on. One
+/// rotation a second for eleven days; nothing real gets there.
+pub const MAX_INIT_GENERATION: u32 = 1_000_000;
+
+/// One entry in the rolling playlist.
 #[derive(Clone)]
 pub struct M3u8Entry {
     /// Media sequence number (matches the segment filename numbering).

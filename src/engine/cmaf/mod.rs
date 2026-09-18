@@ -775,8 +775,15 @@ struct CmafState {
     /// Older generations the window still references, republished alongside
     /// the current one on the same cadence and forgotten once no row names
     /// them. Only this process's own generations: a restored window's older
-    /// inits were published by a previous run and their bytes are not here.
+    /// inits were published by a previous run and their bytes are not here
+    /// — unless the restore fetched them, which it tries to.
     init_history: Vec<PublishedInit>,
+    /// True while low-latency PUTs are failing to close, so the Warning
+    /// fires once per failure episode rather than once per segment.
+    ll_put_failing: bool,
+    /// The codec-family-change Warning has been raised; it does not repeat
+    /// on every frame of a source that is not coming back.
+    family_change_warned: bool,
     /// True while init.mp4 uploads are failing. Two jobs: it shortens the
     /// republish interval to a retry interval, and it makes the manager
     /// Warning fire once per failure *episode* rather than once per attempt.
@@ -934,7 +941,41 @@ async fn restore_published_window(
         },
     };
     let text = String::from_utf8_lossy(&body);
-    parse_published_window(&text, limit)
+    let mut window = parse_published_window(&text, limit)?;
+
+    // The older inits the restored rows name. This run rebuilds only the
+    // generation it continues; the ones before it were published by a
+    // previous run, and without their bytes the 30 s republish could not
+    // cover them — a relay that lost its store would come back with the live
+    // edge decodable and every older row 404ing on its map. They are a few
+    // kilobytes each and there are rarely more than one or two.
+    const HELD_INITS_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
+    let current = init_object_name(window.init_generation);
+    let mut wanted: Vec<String> = Vec::new();
+    for name in window.rows.iter().map(CmafState::row_init_name) {
+        if name != current && !wanted.iter().any(|w| w == name) {
+            wanted.push(name.to_string());
+        }
+    }
+    let fetch = async {
+        let mut held = Vec::new();
+        for name in wanted {
+            match clips::http_get(&format!("{base}/{name}"), auth).await {
+                Ok(bytes) => held.push(PublishedInit { uri: name, bytes }),
+                Err(e) => tracing::warn!(
+                    origin = %base, init = %name, error = %format!("{e:#}"),
+                    "CMAF output: an older init the restored window names could not be \
+                     read back; it will not be republished if the origin loses it"
+                ),
+            }
+        }
+        held
+    };
+    window.held_inits = tokio::select! {
+        _ = cancel.cancelled() => return None,
+        r = tokio::time::timeout(HELD_INITS_BUDGET, fetch) => r.unwrap_or_default(),
+    };
+    Some(window)
 }
 
 /// What a served media playlist says about the window it is advertising.
@@ -960,6 +1001,9 @@ struct RestoredWindow {
     /// newest rows decode against, and the one this run continues or, if its
     /// own init differs, rotates past.
     init_generation: u32,
+    /// The older inits the rows name, read back so this run can republish
+    /// them. Empty when the parser built the window; the restore fills it.
+    held_inits: Vec<PublishedInit>,
 }
 
 /// A short, stable name for exactly these init bytes.
@@ -991,16 +1035,26 @@ const INIT_FINGERPRINT_TAG: &str = "#EXT-X-BILBYCAST-INIT:";
 /// playlist builder and its twenty-odd call sites nothing: it is a private
 /// marker this edge writes for its own next run to read, not part of the HLS
 /// the builder is responsible for getting right.
-fn stamp_init_fingerprint(body: String, fingerprint: Option<&str>) -> String {
+///
+/// The generation rides with the hash, because the two are minted together
+/// and the rows cannot stand in for it: a manifest published in the segment
+/// after a rotation names the old generation on every row while its stamp
+/// describes the new init — the one the next run must continue, or it would
+/// publish under the old name and over the object every restored row decodes
+/// against. `<hash>,gen=<n>`; a stamp with no generation is from a build
+/// before rotations existed, and says nothing about it.
+fn stamp_init_fingerprint(body: String, fingerprint: Option<&str>, generation: u32) -> String {
     let Some(fp) = fingerprint else {
         return body;
     };
     match body.find('\n') {
         Some(nl) => {
-            let mut out = String::with_capacity(body.len() + fp.len() + 32);
+            let mut out = String::with_capacity(body.len() + fp.len() + 48);
             out.push_str(&body[..=nl]);
             out.push_str(INIT_FINGERPRINT_TAG);
             out.push_str(fp);
+            out.push_str(",gen=");
+            out.push_str(&generation.to_string());
             out.push('\n');
             out.push_str(&body[nl + 1..]);
             out
@@ -1054,9 +1108,17 @@ fn parse_published_window(text: &str, limit: usize) -> Option<RestoredWindow> {
     for line in text.lines() {
         let line = line.trim();
         if let Some(rest) = line.strip_prefix(INIT_FINGERPRINT_TAG) {
-            let fp = rest.trim();
+            let (fp, attrs) = rest.trim().split_once(',').unwrap_or((rest.trim(), ""));
             if !fp.is_empty() {
                 init_fingerprint = Some(fp.to_string());
+            }
+            if let Some(g) = attrs
+                .split(',')
+                .find_map(|a| a.trim().strip_prefix("gen="))
+                .and_then(|g| g.parse::<u32>().ok())
+                .filter(|g| *g <= manifest::MAX_INIT_GENERATION)
+            {
+                init_generation = init_generation.max(g);
             }
             continue;
         }
@@ -1163,6 +1225,7 @@ fn parse_published_window(text: &str, limit: usize) -> Option<RestoredWindow> {
         discontinuity_sequence,
         init_fingerprint,
         init_generation,
+        held_inits: Vec::new(),
     })
 }
 
@@ -1209,6 +1272,8 @@ impl CmafState {
             init_uri: init_object_name(0),
             last_init_bytes: None,
             init_history: Vec::new(),
+            ll_put_failing: false,
+            family_change_warned: false,
             init_upload_failing: false,
             init_last_upload: None,
             playlist: VecDeque::new(),
@@ -1279,6 +1344,10 @@ impl CmafState {
                 None => break,
             }
         }
+        // Here and nowhere else: a row leaving the window is the only event
+        // that can un-name a generation. Trimming at the rotation instead
+        // forgot a generation whose only row was the segment still in flight.
+        self.trim_init_history();
     }
 
     /// Does this run's init differ from the one the restored rows were
@@ -1297,19 +1366,39 @@ impl CmafState {
     /// object they always named.
     fn restored_init_differs(&mut self, fingerprint: &str) -> Option<bool> {
         let prev = self.restored_init_fingerprint.take()?;
-        Some(prev != fingerprint)
+        // With no restored row there is nothing the previous init describes,
+        // and nothing to keep apart from this run's.
+        let any_restored = self.playlist.iter().any(|r| r.sequence_number < self.resume_seq);
+        Some(any_restored && prev != fingerprint)
     }
 
-    /// Point this run's own rows — numbered from `resume_seq` — at
-    /// `generation`. A segment can close before the first init is built (the
-    /// audio-detection grace is three seconds and a segment is two), and if
-    /// that init then opens a new generation the row was stamped with the
-    /// old one while its media decodes against the new.
-    fn relabel_own_rows(&mut self, generation: u32) {
-        let name = (generation > 0).then(|| init_object_name(generation));
-        for row in self.playlist.iter_mut().filter(|r| r.sequence_number >= self.resume_seq) {
+    /// Point this run's own rows — numbered from `resume_seq` — that were
+    /// cut under generation `from` at generation `to`. A segment can close
+    /// before the first init is built (the audio-detection grace is three
+    /// seconds and a segment is two), and if that init then opens a new
+    /// generation the row was stamped with the old one while its media
+    /// decodes against the new. Only rows of `from`: a row cut under an
+    /// earlier generation of this run decodes against that one.
+    fn relabel_own_rows(&mut self, from: u32, to: u32) {
+        let was = init_object_name(from);
+        let name = (to > 0).then(|| init_object_name(to));
+        let resume_seq = self.resume_seq;
+        for row in self
+            .playlist
+            .iter_mut()
+            .filter(|r| r.sequence_number >= resume_seq && Self::row_init_name(r) == was)
+        {
             row.init_uri = name.clone();
         }
+    }
+
+    /// Whether the last row in the window names a different init from the
+    /// one a row of `generation` would — a change of map between consecutive
+    /// rows is a break in the decode chain and the row has to say so, whether
+    /// or not the segment that opened the generation was ever advertised.
+    fn generation_break(&self, generation: u32) -> bool {
+        let name = init_object_name(generation);
+        self.playlist.back().is_some_and(|last| Self::row_init_name(last) != name)
     }
 
     /// The init object a row decodes against.
@@ -1433,6 +1522,7 @@ async fn run(
         // `init.mp4` would overwrite the object the oldest rows name.
         state.init_generation = restored.init_generation;
         state.init_uri = init_object_name(restored.init_generation);
+        state.init_history = restored.held_inits;
         state.restore_discontinuity = true;
     }
 
@@ -1566,17 +1656,14 @@ async fn run(
             }
             _ = silence_tick => {
                 if let Some(reenc) = state.audio_reencoder.as_mut() {
-                    // Silence accompanies a picture, so it is placed where
-                    // the picture is: nothing is emitted until video has
-                    // opened a segment, and the first chunk is seeded there.
-                    let anchor = state
-                        .video_seg
-                        .as_ref()
-                        .and_then(VideoSegmenter::open_segment_base_dts_90k);
+                    // Silence accompanies a picture, so it is laid down to
+                    // where the picture is — the newest video DTS — and no
+                    // further: nothing is emitted until video has arrived.
+                    let target = state.video_seg.as_ref().and_then(VideoSegmenter::last_dts_90k);
                     match crate::timed_block_in_place!(
                         "cmaf.audio_silence_encode",
                         crate::engine::perf::TRANSCODE_BLOCK_WARN_MS,
-                        { reenc.encode_silence_if_needed(anchor) }
+                        { reenc.encode_silence_if_needed(target) }
                     ) {
                         Ok(frames) if !frames.is_empty() => {
                             buffer_audio_frames(&mut state, config, frames);
@@ -1825,11 +1912,17 @@ fn handle_other_audio_frame(
     reenc.mark_real_audio(pts);
 
     let mut frames_to_buffer: Vec<(Vec<u8>, u64)> = Vec::new();
+    // A PES carries several access units under one PTS; each is submitted
+    // at its own place in it, or the re-encoder reads the second and later
+    // ones as the source standing still and re-anchors on every PES.
+    let mut au_offset_ticks = 0u64;
     for (planar, sr, ch) in decoded {
+        let au_pts = pts.saturating_add(au_offset_ticks);
+        au_offset_ticks += planar.first().map_or(0, |c| c.len() as u64) * 90_000 / sr.max(1) as u64;
         match crate::timed_block_in_place!(
             "cmaf.audio_reencoder",
             crate::engine::perf::TRANSCODE_BLOCK_WARN_MS,
-            { reenc.encode_planar(&planar, pts, sr, ch) }
+            { reenc.encode_planar(&planar, au_pts, sr, ch) }
         ) {
             Ok(out) => frames_to_buffer.extend(out),
             Err(e) => {
@@ -1891,6 +1984,37 @@ async fn handle_video(
     // track from the source sets would hand the decoder parameter sets that do
     // not describe the bitstream, which decodes as macroblock garbage rather
     // than failing cleanly. Defer until the re-encoder has emitted its own.
+    // A change of codec family is not a change of parameter sets: the init's
+    // sample entry (`avc1` / `hvc1`) is committed with the track list, and a
+    // browser needs `changeType()` to move between them, which no playlist
+    // tag asks for. The samples are dropped — packing HEVC under an H.264
+    // track decodes as garbage — and the operator is told once what the
+    // remedy is. See docs/cmaf.md, Known limitations.
+    if state.video_reencoder.is_none()
+        && let Some(seg) = state.video_seg.as_ref()
+        && seg.track.codec != codec
+    {
+        if !state.family_change_warned {
+            state.family_change_warned = true;
+            tracing::warn!(
+                "CMAF output '{}': the source changed codec family ({:?} -> {:?}); the \
+                 init has already declared {:?}, so the new samples are not published — \
+                 restart the output to follow the source",
+                config.id, seg.track.codec, codec, seg.track.codec,
+            );
+            event_sender.emit_flow(
+                EventSeverity::Warning,
+                category::CMAF,
+                format!(
+                    "CMAF output '{}': the source changed codec family to {codec:?}; \
+                     restart the output to follow it",
+                    config.id
+                ),
+                flow_id,
+            );
+        }
+        return;
+    }
     if state.video_reencoder.is_none()
         && !ensure_video_segmenter(
             state.resume_seq,
@@ -2036,20 +2160,27 @@ async fn handle_video(
     // different origins disagreeing by the difference in their response times.
     let closed_at = chrono::Utc::now();
 
-    // Publish init.mp4 the first time a video track is materialised, and
-    // republish it periodically thereafter.
-    publish_init_if_due(
-        state,
-        config,
-        init_url,
-        InitEncryption::AsConfigured,
-        AudioPolicy::MuxWhenPresent,
-        event_sender,
-        flow_id,
-    )
-    .await;
-
-    if let Some(seg) = outcome.completed_video {
+    // The init is published — first time, periodic republish, or a new
+    // generation — AFTER the segment this push closed has entered the
+    // window, never before. Everything the publish does to the window
+    // assumes the closing segment is in it: a rotation retires the
+    // generation that segment was cut under and forgets or drops what no
+    // row names, and a restart's mismatch relabels this run's rows. Run
+    // first, it saw a window one row short and got all three wrong.
+    let Some(seg) = outcome.completed_video else {
+        publish_init_if_due(
+            state,
+            config,
+            init_url,
+            InitEncryption::AsConfigured,
+            AudioPolicy::MuxWhenPresent,
+            event_sender,
+            flow_id,
+        )
+        .await;
+        return;
+    };
+    {
         // (Removed: a re-publish of init.mp4 to add an audio track once one
         // was detected. It existed to widen the moov after the fact, but the
         // track it added was never filled by any fragment — see the note at
@@ -2112,8 +2243,18 @@ async fn handle_video(
                 );
                 // A segment the origin does not hold is not advertised. The
                 // rotation the same IDR may have applied is not lost with it:
-                // the segmenter carries the generation, and the next init
-                // publish reads it from there.
+                // the segmenter carries the generation, and the init publish
+                // below reads it from there.
+                publish_init_if_due(
+                    state,
+                    config,
+                    init_url,
+                    InitEncryption::AsConfigured,
+                    AudioPolicy::MuxWhenPresent,
+                    event_sender,
+                    flow_id,
+                )
+                .await;
                 return;
             }
         }
@@ -2137,6 +2278,14 @@ async fn handle_video(
             seg_secs,
             closed_at,
         );
+        // Taken whatever the clock said, or a clock-reported break on the
+        // first own row would leave the restore's flag armed for the next.
+        let restored_join = std::mem::take(&mut state.restore_discontinuity);
+        // Against the last row actually in the window, not against the
+        // segmenter's mark: a mark rides on the segment that opened the
+        // generation, and if that segment's upload failed it went out with
+        // it, leaving the next row to change the map with no tag.
+        let generation_break = state.generation_break(seg.generation);
         state.playlist.push_back(M3u8Entry {
             sequence_number: seg.sequence_number,
             duration_secs: seg_secs,
@@ -2144,10 +2293,10 @@ async fn handle_video(
             parts: Vec::new(),
             // From the segment, not from the output's state: the segment
             // that closes at a parameter-set change is the last of the OLD
-            // generation, while the state — synced when the new init was
-            // published a moment ago, above — already names the new one.
-            // Generation 0 leaves this `None`, so a stream whose encoder
-            // never changed writes exactly the playlist it always did.
+            // generation, and the state moves on only when the init publish
+            // below adopts the new one. Generation 0 leaves this `None`, so
+            // a stream whose encoder never changed writes exactly the
+            // playlist it always did.
             init_uri: (seg.generation > 0).then(|| init_object_name(seg.generation)),
             program_date_time: Some(pdt),
             // The first row after a restored window always breaks the
@@ -2157,10 +2306,25 @@ async fn handle_video(
             // are a break in the decode chain, and a player that carries its
             // decoder across one gets garbage.
             discontinuity: discontinuity
-                || std::mem::take(&mut state.restore_discontinuity)
-                || seg.first_of_generation,
+                || restored_join
+                || seg.first_of_generation
+                || generation_break,
         });
         state.trim_playlist(config.playlist_window_segments());
+
+        // Publish init.mp4 the first time a video track is materialised, and
+        // republish it periodically thereafter — with the closed row in the
+        // window, see above.
+        publish_init_if_due(
+            state,
+            config,
+            init_url,
+            InitEncryption::AsConfigured,
+            AudioPolicy::MuxWhenPresent,
+            event_sender,
+            flow_id,
+        )
+        .await;
 
         // Every playlist names `init.mp4` in `#EXT-X-MAP`, so publishing one
         // before that object exists hands players a manifest they can fetch,
@@ -2327,7 +2491,11 @@ fn encrypt_and_build_video_segment(
 ) -> Option<Vec<u8>> {
     use fmp4::{Sample as FSample, VideoCodec};
     let cenc_rt = state.cenc.as_mut()?;
-    let v_track_codec = state.video_seg.as_ref()?.track.codec;
+    // The segment's, not the live track's: a rotation applied by the push
+    // that cut this segment has already swapped the track, and the NAL
+    // grammar the subsample split is computed under must be the one these
+    // samples were filtered with.
+    let v_track_codec = seg.codec;
     let (_seq, base, samples) = snapshot;
     let mut mutable: Vec<FSample> = samples.clone();
     let mut cenc_info = Vec::with_capacity(mutable.len());
@@ -2703,12 +2871,13 @@ async fn publish_init_if_due(
     // about to be overwritten.
     let fingerprint = init_fingerprint(&init_bytes);
     if state.restored_init_differs(&fingerprint) == Some(true) {
-        let generation = state.video_seg.as_mut().map(|seg| {
+        let bumped = state.video_seg.as_mut().map(|seg| {
+            let from = seg.generation();
             seg.bump_generation();
-            seg.generation()
+            (from, seg.generation())
         });
-        if let Some(generation) = generation {
-            state.relabel_own_rows(generation);
+        if let Some((from, to)) = bumped {
+            state.relabel_own_rows(from, to);
             adopt_generation(state, &config.id);
         }
         tracing::warn!(
@@ -2758,7 +2927,6 @@ async fn publish_init_if_due(
             // cadence and for the same reason: an origin that lost its store
             // has lost them too, and a viewer seeking back into those rows
             // would 404 on their map while the live edge plays on.
-            state.trim_init_history();
             for held in &state.init_history {
                 let url = format!("{init_base}/{}", held.uri);
                 if let Err(e) =
@@ -2929,6 +3097,9 @@ fn adopt_generation(state: &mut CmafState, output_id: &str) -> bool {
     if state.init_uploaded && let Some(bytes) = state.last_init_bytes.take() {
         state.init_history.push(PublishedInit { uri: previous, bytes });
     } else {
+        // The segment closed at this very IDR is stamped with the retired
+        // generation and is already in the window — both paths push the row
+        // before the init publish runs — so this catches it too.
         let resume_seq = state.resume_seq;
         let before = state.playlist.len();
         state.playlist.retain(|r| {
@@ -2949,7 +3120,6 @@ fn adopt_generation(state: &mut CmafState, output_id: &str) -> bool {
     state.init_uploaded = false;
     state.init_last_upload = None;
     state.last_init_bytes = None;
-    state.trim_init_history();
     tracing::info!(
         "CMAF output '{output_id}': init generation {generation}: publishing '{}'; the \
          window keeps naming the older init(s) for the rows that decode against them",
@@ -2986,33 +3156,62 @@ async fn handle_ll_cmaf(
     // path for what sampling after an upload does to the flow's epoch.
     let closed_at = chrono::Utc::now();
 
-    // Publish the init if it is due — first time, a periodic republish, or a
-    // new generation. Chunks are meaningless to a player that cannot fetch
-    // `#EXT-X-MAP`, so none is emitted until it has landed at least once —
-    // but the segment boundary below is handled first regardless. A rotation
-    // whose init is still going up is a boundary like any other; skipping it
-    // until the init landed left the previous segment's PUT open, and the
-    // new generation's samples would have been chunked into it.
-    let init_ready = publish_init_if_due(
-        state,
-        config,
-        init_url,
-        InitEncryption::Never,
-        AudioPolicy::Never,
-        event_sender,
-        flow_id,
-    )
-    .await;
-
-    // On a new segment boundary, finalise the previous LL PUT and open
-    // a new one.
+    // On a new segment boundary, finalise the previous LL PUT and open a new
+    // one — before the init publish, whatever state the init is in. A
+    // rotation whose init is still going up is a boundary like any other;
+    // skipping it until the init landed left the previous segment's PUT open
+    // with the new generation's samples chunked into it. And the init
+    // publish wants the closing row in the window when it runs: see the
+    // plain path for the three things it gets wrong otherwise.
     if outcome.new_segment_started {
         // Close previous LL segment if any.
-        if let Some(ll) = state.ll_current.take() {
+        if let Some(mut ll) = state.ll_current.take() {
             let uri = ll.uri.clone();
             let seq = ll.sequence_number;
             let base_dts_90k = ll.base_dts_90k;
+            // The tail: the samples the chunker had not taken when the IDR
+            // cut the segment. `push()` snapshots them into the completed
+            // segment and clears them, and this path never read that, so
+            // every segment's object stopped up to one chunk short of the
+            // duration its row advertised — a hole at the end of every
+            // segment, 25 % of each at the default 2 s / 500 ms. With no
+            // chunk emitted yet (the init landed late) the tail is the whole
+            // segment, `styp` and all.
+            let mut tail_stored = false;
+            if let (Some(seg), Some((_, _, tail))) =
+                (outcome.completed_video.as_ref(), outcome.completed_video_samples.as_ref())
+                && !tail.is_empty()
+            {
+                let bytes = fmp4::build_segment_chunk(
+                    fmp4::VIDEO_TRACK_ID,
+                    seg.sequence_number as u32,
+                    seg.first_pending_dts_90k,
+                    tail,
+                    ll.chunks_emitted == 0,
+                );
+                tail_stored = match ll.handle.send_chunk(bytes.clone()) {
+                    Ok(()) => true,
+                    // A PUT that died before carrying anything — opened into
+                    // an origin that was down — is opened again for the
+                    // same object: the tail is the whole segment, so nothing
+                    // is missing from it.
+                    Err(upload::ChunkSendError::Closed) if ll.chunks_emitted == 0 => {
+                        ll.handle = chunked_put(
+                            &format!("{base_url}/{uri}"),
+                            "video/mp4",
+                            config.auth_token.as_deref(),
+                            8,
+                        );
+                        ll.handle.send_chunk(bytes).is_ok()
+                    }
+                    Err(_) => false,
+                };
+                if tail_stored {
+                    ll.chunks_emitted += 1;
+                }
+            }
             let finish = ll.handle.finish().await;
+            let stored = tail_stored && finish.is_ok();
             match finish {
                 Ok(()) => {
                     stats.packets_sent.fetch_add(1, Ordering::Relaxed);
@@ -3027,44 +3226,62 @@ async fn handle_ll_cmaf(
                         "CMAF output '{}': LL seg {} PUT final response error: {e}",
                         config.id, seq,
                     );
-                    event_sender.emit_flow(
-                        EventSeverity::Warning,
-                        category::CMAF,
-                        format!("CMAF output '{}': LL PUT failed: {e}", config.id),
-                        flow_id,
-                    );
+                    // Once per episode: an origin that is down fails every
+                    // close, one every segment, for as long as it is down.
+                    if !state.ll_put_failing {
+                        state.ll_put_failing = true;
+                        event_sender.emit_flow(
+                            EventSeverity::Warning,
+                            category::CMAF,
+                            format!("CMAF output '{}': LL PUT failed: {e}", config.id),
+                            flow_id,
+                        );
+                    }
                 }
             }
-            // Where the segment ended, from the segmenter — see
-            // `CmafState::closed_segment_end_dts_90k`, which is a named
-            // function precisely so this derivation is reachable from a test.
-            let next_base_dts_90k = state.closed_segment_end_dts_90k();
-            let mut row = closed_ll_entry(
-                flow_id,
-                seq,
-                uri,
-                base_dts_90k,
-                next_base_dts_90k,
-                config.segment_duration_secs,
-                closed_at,
-                ll.generation,
-                ll.first_of_generation,
-            );
-            // The restore's own discontinuity, consumed here too.
-            //
-            // The plain path takes the flag when it builds its row; this path
-            // returns above that point, so on a `low_latency` output the flag
-            // was set at start and never consumed. After a *process* restart
-            // the flow clock is fresh, so `segment_date_marking` has nothing to
-            // compare against and answers `false` — and the restored rows are
-            // parsed from a manifest whose tags this parser used to discard.
-            // The republished playlist then joined the previous run's rows to a
-            // timeline whose `base_dts` restarted at zero with no
-            // `EXT-X-DISCONTINUITY` anywhere, which is the opposite of what
-            // docs/cmaf.md promises.
-            row.discontinuity |= std::mem::take(&mut state.restore_discontinuity);
-            state.playlist.push_back(row);
-            state.trim_playlist(config.playlist_window_segments());
+            if stored {
+                state.ll_put_failing = false;
+                // Where the segment ended, from the segmenter — see
+                // `CmafState::closed_segment_end_dts_90k`, which is a named
+                // function precisely so this derivation is reachable from a test.
+                let next_base_dts_90k = state.closed_segment_end_dts_90k();
+                let mut row = closed_ll_entry(
+                    flow_id,
+                    seq,
+                    uri,
+                    base_dts_90k,
+                    next_base_dts_90k,
+                    config.segment_duration_secs,
+                    closed_at,
+                    ll.generation,
+                    ll.first_of_generation,
+                );
+                // The restore's own discontinuity, consumed here too.
+                //
+                // The plain path takes the flag when it builds its row; this path
+                // returns above that point, so on a `low_latency` output the flag
+                // was set at start and never consumed. After a *process* restart
+                // the flow clock is fresh, so `segment_date_marking` has nothing to
+                // compare against and answers `false` — and the restored rows are
+                // parsed from a manifest whose tags this parser used to discard.
+                // The republished playlist then joined the previous run's rows to a
+                // timeline whose `base_dts` restarted at zero with no
+                // `EXT-X-DISCONTINUITY` anywhere, which is the opposite of what
+                // docs/cmaf.md promises.
+                row.discontinuity |= std::mem::take(&mut state.restore_discontinuity)
+                    || state.generation_break(ll.generation);
+                state.playlist.push_back(row);
+                state.trim_playlist(config.playlist_window_segments());
+            } else {
+                // A segment the origin does not hold is not advertised — the
+                // plain path's rule. The restore flag stays armed for the
+                // next row that is.
+                tracing::warn!(
+                    "CMAF output '{}': LL seg {} did not reach the origin and is not \
+                     advertised",
+                    config.id, seq,
+                );
+            }
         }
         // Open new segment.
         if let Some(vs) = state.video_seg.as_ref() {
@@ -3096,9 +3313,22 @@ async fn handle_ll_cmaf(
         }
     }
 
+    // Publish the init if it is due — first time, a periodic republish, or a
+    // new generation. Chunks are meaningless to a player that cannot fetch
+    // `#EXT-X-MAP`, so none is emitted until it has landed at least once; the
+    // samples stay queued in the segmenter meanwhile, and the segment they
+    // belong to is written whole at its close if none was chunked by then.
+    let init_ready = publish_init_if_due(
+        state,
+        config,
+        init_url,
+        InitEncryption::Never,
+        AudioPolicy::Never,
+        event_sender,
+        flow_id,
+    )
+    .await;
     if !init_ready {
-        // The samples stay queued in the segmenter; they are chunked once the
-        // init they decode against is on the origin.
         return;
     }
 
@@ -3119,7 +3349,23 @@ async fn handle_ll_cmaf(
                 break;
             };
             let bytes_len = bytes.len();
-            match ll.handle.send_chunk(bytes) {
+            let sent = match ll.handle.send_chunk(bytes.clone()) {
+                // The PUT died before it carried anything — opened into an
+                // origin that was down, and now the init has landed and the
+                // origin is back. A fresh PUT for the same object loses
+                // nothing: this is the segment's first chunk.
+                Err(upload::ChunkSendError::Closed) if ll.chunks_emitted == 0 => {
+                    ll.handle = chunked_put(
+                        &format!("{}/{}", base_url, ll.uri),
+                        "video/mp4",
+                        config.auth_token.as_deref(),
+                        8,
+                    );
+                    ll.handle.send_chunk(bytes)
+                }
+                other => other,
+            };
+            match sent {
                 Ok(()) => {
                     ll.chunks_emitted += 1;
                     did_emit = true;
@@ -3135,10 +3381,11 @@ async fn handle_ll_cmaf(
                         config.id, ll.sequence_number, ll.chunks_emitted - 1, bytes_len
                     );
                 }
-                Err(()) => {
-                    // Backpressure: ingest is too slow. Abort the PUT,
-                    // discard accumulated samples for this segment, and
-                    // wait for the next IDR to open a fresh segment.
+                Err(_) => {
+                    // Backpressure, or an origin that closed a PUT mid-body:
+                    // abort the PUT, discard accumulated samples for this
+                    // segment, and wait for the next IDR to open a fresh
+                    // segment.
                     tracing::warn!(
                         "CMAF output '{}': LL ingest stall, aborting seg {}",
                         config.id, ll.sequence_number
@@ -3254,7 +3501,12 @@ struct OpenSegmentRow<'a> {
     parts: &'a [HlsPartEntry],
     base_dts_90k: u64,
     generation: u32,
-    first_of_generation: bool,
+    /// The open segment breaks the decode chain from the last closed row:
+    /// it opened a generation, or names a different init from that row's,
+    /// or is this run's first after a restore. The closed row it becomes
+    /// carries the same tag, so a player does not see one appear on a row
+    /// it already parsed.
+    breaks_chain: bool,
 }
 
 /// The rows a low-latency playlist publishes: every closed segment in the
@@ -3333,9 +3585,9 @@ fn ll_playlist_entries(
             // its own. What it can carry is one a *sibling* rendition already
             // found under this segment: that re-anchor has already moved the
             // date above, and a moved date published without the tag is the
-            // contradiction the tag exists to close. And the one its own
-            // generation opened with, which the segmenter settled at the IDR.
-            discontinuity: dated.is_some_and(|(_, disc)| disc) || open.first_of_generation,
+            // contradiction the tag exists to close. And the break its own
+            // row will carry when it closes — see `OpenSegmentRow`.
+            discontinuity: dated.is_some_and(|(_, disc)| disc) || open.breaks_chain,
         });
     }
     entries
@@ -3403,7 +3655,10 @@ async fn publish_ll_hls(
             parts: &ll.parts,
             base_dts_90k: ll.base_dts_90k,
             generation: ll.generation,
-            first_of_generation: ll.first_of_generation,
+            // Peeked, not taken: the close is what consumes the restore flag.
+            breaks_chain: ll.first_of_generation
+                || state.restore_discontinuity
+                || state.generation_break(ll.generation),
         }),
         config.segment_duration_secs,
         flow_id,
@@ -3427,6 +3682,7 @@ async fn publish_ll_hls(
             Some(&hints),
         ),
         state.init_fingerprint.as_deref(),
+        state.init_generation,
     );
     if let Err(e) = http_put(
         m3u8_url,
@@ -3475,6 +3731,7 @@ async fn publish_manifests(
                 None,
             ),
             state.init_fingerprint.as_deref(),
+            state.init_generation,
         );
         if let Err(e) = http_put(
             m3u8_url,
@@ -3657,7 +3914,7 @@ seg-00042.m4s?token=abc
             "#EXT-X-PROGRAM-DATE-TIME:2026-09-08T10:00:00.000Z\n#EXTINF:2.000,\nseg-00040.m4s\n",
         );
         let fp = init_fingerprint(b"an init segment's bytes");
-        let stamped = stamp_init_fingerprint(plain.to_string(), Some(&fp));
+        let stamped = stamp_init_fingerprint(plain.to_string(), Some(&fp), 0);
         assert!(
             stamped.starts_with("#EXTM3U\n#EXT-X-BILBYCAST-INIT:"),
             "the tag has to be inside the playlist, after the marker: {stamped}"
@@ -3666,6 +3923,23 @@ seg-00042.m4s?token=abc
         let restored = parse_published_window(&stamped, 100).expect("a window");
         assert_eq!(restored.init_fingerprint.as_deref(), Some(fp.as_str()));
         assert_eq!(restored.rows.len(), 1, "the tag consumed a media row");
+        assert_eq!(restored.init_generation, 0);
+
+        // The stamp carries the generation its hash describes, and the
+        // restore continues it even when no row has reached it yet: the
+        // manifest published in the segment after a rotation names the old
+        // generation on every row, and a run that continued from the rows
+        // would publish under that name and over the object they decode
+        // against.
+        let ahead = stamp_init_fingerprint(plain.to_string(), Some(&fp), 3);
+        assert!(ahead.contains(&format!("#EXT-X-BILBYCAST-INIT:{fp},gen=3\n")), "{ahead}");
+        let restored = parse_published_window(&ahead, 100).expect("a window");
+        assert_eq!(restored.init_fingerprint.as_deref(), Some(fp.as_str()));
+        assert_eq!(restored.init_generation, 3, "the stamp's generation, past the rows'");
+
+        // A number this edge could not have written does not steer it.
+        let absurd = format!("#EXTM3U\n#EXT-X-BILBYCAST-INIT:{fp},gen=4294967295\n#EXTINF:2.000,\nseg-00001.m4s\n");
+        assert_eq!(parse_published_window(&absurd, 100).expect("a window").init_generation, 0);
 
         // Different init bytes, different name.
         assert_ne!(fp, init_fingerprint(b"a different init segment's bytes"));
@@ -3676,7 +3950,7 @@ seg-00042.m4s?token=abc
         assert!(parse_published_window(plain, 100).expect("a window").init_fingerprint.is_none());
 
         // And a playlist is unchanged when there is nothing to stamp.
-        assert_eq!(stamp_init_fingerprint(plain.to_string(), None), plain);
+        assert_eq!(stamp_init_fingerprint(plain.to_string(), None, 0), plain);
     }
 
     /// A low-latency playlist's open segment is not restored as a closed one.
@@ -3782,7 +4056,7 @@ seg-00042.m4s?token=abc
         // Compared once: the fingerprint is consumed.
         assert_eq!(state.restored_init_differs("new"), None);
 
-        state.relabel_own_rows(3);
+        state.relabel_own_rows(2, 3);
         let names: Vec<&str> =
             state.playlist.iter().map(CmafState::row_init_name).collect();
         assert_eq!(
@@ -3792,6 +4066,24 @@ seg-00042.m4s?token=abc
         );
         assert_eq!(state.playlist.len(), 4, "nothing is dropped");
         assert!(state.playlist[3].discontinuity, "and the join keeps its tag");
+
+        // Only rows of the generation being bumped: an own row this run cut
+        // under an earlier generation of its own decodes against that one.
+        let mut two = CmafState::new();
+        two.playlist = [row(43, true), row(44, false)].into_iter().collect();
+        two.playlist[1].init_uri = Some("init-5.mp4".to_string());
+        two.resume_seq = 43;
+        two.relabel_own_rows(5, 6);
+        let names: Vec<&str> = two.playlist.iter().map(CmafState::row_init_name).collect();
+        assert_eq!(names, vec!["init-2.mp4", "init-6.mp4"]);
+
+        // A window with no restored row has nothing the previous init
+        // describes: a differing fingerprint opens no generation.
+        let mut empty = CmafState::new();
+        empty.playlist = [row(43, true)].into_iter().collect();
+        empty.resume_seq = 43;
+        empty.restored_init_fingerprint = Some("old".into());
+        assert_eq!(empty.restored_init_differs("new"), Some(false));
 
         // A match says so, and is also consumed.
         let mut same = CmafState::new();
@@ -3867,11 +4159,54 @@ seg-00042.m4s?token=abc
         assert_eq!(state.init_history[0].bytes, b"generation zero");
         assert!(!adopt_generation(&mut state, "out"), "adopted once");
 
-        // The generation-0 rows leave the window; the held init goes with them.
-        state.playlist.clear();
+        // The held init is forgotten only when the window stops naming it —
+        // which is a row leaving the window, never the rotation itself.
         state.playlist.push_back(row(2, Some("init-1.mp4")));
-        state.trim_init_history();
-        assert!(state.init_history.is_empty());
+        state.trim_playlist(3);
+        assert_eq!(state.init_history.len(), 1, "two rows still name it");
+        state.trim_playlist(1);
+        assert!(state.init_history.is_empty(), "none does");
+
+        // A rotation whose retired generation has no row in the window yet
+        // — its only segment is the one closing at this IDR — keeps the init
+        // until that row has been pushed and has left.
+        let mut fresh = CmafState::new();
+        fresh.init_uploaded = true;
+        fresh.last_init_bytes = Some(b"only one segment".to_vec());
+        let mut seg = VideoSegmenter::new(
+            VideoTrack::from_h264(vec![0x67, 0x42, 0x00, 0x1e], vec![0x68, 0xce]),
+            2.0,
+        );
+        seg.rotate_track(VideoTrack::from_h264(vec![0x67, 0x64, 0x00, 0x1f], vec![0x68, 0xee]));
+        seg.push(&[vec![0x65, 0x88]], 0, true);
+        fresh.video_seg = Some(seg);
+        assert!(adopt_generation(&mut fresh, "out"));
+        assert_eq!(fresh.init_history.len(), 1, "kept for the row still to come");
+    }
+
+    /// A row that names a different init from the last row in the window
+    /// is a break in the decode chain, whatever became of the segment that
+    /// opened the generation.
+    #[test]
+    fn a_change_of_map_between_rows_is_a_break() {
+        let row = |seq: u64, init: Option<&str>| M3u8Entry {
+            sequence_number: seq,
+            duration_secs: 2.0,
+            uri: None,
+            parts: Vec::new(),
+            init_uri: init.map(str::to_string),
+            program_date_time: None,
+            discontinuity: false,
+        };
+        let mut state = CmafState::new();
+        assert!(!state.generation_break(0), "an empty window breaks from nothing");
+        assert!(!state.generation_break(3));
+        state.playlist.push_back(row(0, None));
+        assert!(!state.generation_break(0));
+        assert!(state.generation_break(1), "init.mp4 -> init-1.mp4");
+        state.playlist.push_back(row(1, Some("init-1.mp4")));
+        assert!(!state.generation_break(1));
+        assert!(state.generation_break(0), "and back again, should a source flap");
     }
 
     /// A rotation before the previous init ever reached the origin drops the
@@ -4549,7 +4884,7 @@ seg-00042.m4s?token=abc
                 parts: &[],
                 base_dts_90k: 0,
                     generation: 0,
-                    first_of_generation: false,
+                    breaks_chain: false,
             }),
             2.0,
             flow,
@@ -4599,7 +4934,7 @@ seg-00042.m4s?token=abc
                         parts: &[],
                         base_dts_90k: base,
                     generation: 0,
-                    first_of_generation: false,
+                    breaks_chain: false,
                     }),
                     seg,
                     flow,
@@ -4747,7 +5082,7 @@ seg-00042.m4s?token=abc
                 parts: &few,
                 base_dts_90k: 0,
                     generation: 0,
-                    first_of_generation: false,
+                    breaks_chain: false,
             }),
             seg,
             flow,
@@ -4766,7 +5101,7 @@ seg-00042.m4s?token=abc
                 parts: &many,
                 base_dts_90k: 0,
                     generation: 0,
-                    first_of_generation: false,
+                    breaks_chain: false,
             }),
             seg,
             flow,
@@ -4950,7 +5285,7 @@ seg-00042.m4s?token=abc
                     parts: &parts,
                     base_dts_90k: base,
                     generation: 0,
-                    first_of_generation: false,
+                    breaks_chain: false,
                 }),
                 nominal,
                 flow,

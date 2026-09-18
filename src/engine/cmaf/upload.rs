@@ -99,14 +99,25 @@ pub struct ChunkedPutHandle {
     url: String,
 }
 
+/// Why a chunk could not be enqueued.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChunkSendError {
+    /// The ingest is not draining the body fast enough: backpressure. The
+    /// caller drops the chunk, warns, and abandons the segment.
+    Full,
+    /// The request is over — the origin refused or closed it, or never
+    /// accepted the connection. Nothing sent so far reached it; a segment
+    /// that has not started can be opened again.
+    Closed,
+}
+
 impl ChunkedPutHandle {
-    /// Enqueue a chunk. Returns `Ok(())` on success, `Err(())` if the
-    /// channel is full or closed. The caller should treat full as a
-    /// backpressure event: drop the chunk, emit a warning, and abort
-    /// the current segment.
-    pub fn send_chunk(&mut self, bytes: Vec<u8>) -> Result<(), ()> {
+    /// Enqueue a chunk. Returns which way it failed, because the two mean
+    /// opposite things: full is the origin being slow, closed is the origin
+    /// being gone, and only the second is worth a second attempt.
+    pub fn send_chunk(&mut self, bytes: Vec<u8>) -> Result<(), ChunkSendError> {
         let Some(tx) = self.tx.as_ref() else {
-            return Err(());
+            return Err(ChunkSendError::Closed);
         };
         let len = bytes.len() as u64;
         match tx.try_send(Ok(Bytes::from(bytes))) {
@@ -114,9 +125,13 @@ impl ChunkedPutHandle {
                 self.sent_bytes += len;
                 Ok(())
             }
-            Err(_) => {
+            Err(mpsc::error::TrySendError::Full(_)) => {
                 self.dropped_chunks += 1;
-                Err(())
+                Err(ChunkSendError::Full)
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                self.dropped_chunks += 1;
+                Err(ChunkSendError::Closed)
             }
         }
     }

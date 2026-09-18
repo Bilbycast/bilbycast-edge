@@ -232,7 +232,7 @@ bilbycast-edge is a media gateway supporting multiple transport protocols for pr
 - **Use case:** AWS MediaStore, Fastly OA, Akamai MSL, Wowza, nimble — any modern CDN ingest accepting fragmented-MP4 push
 - **Features:**
   - ISO/IEC 23000-19 CMAF media profile (`cmfc` brand) with hand-rolled fMP4 muxer (no external MP4 crate dep)
-  - **Video:** H.264 + HEVC passthrough; optional `video_encode` block (libx264 / libx265 / NVENC, feature-gated) with explicit GoP alignment to `segment_duration_secs × fps` so segments always cut on IDR
+  - **Video:** H.264 + HEVC passthrough; optional `video_encode` block (libx264 / libx265 / NVENC, feature-gated); the operator's `gop_size` is honoured (60 when unset) and segments cut on that GOP's IDRs, so choose one that divides `segment_duration_secs × fps`
   - **Audio:** AAC-LC / HE-AAC v1 / HE-AAC v2 passthrough or re-encode (in-process via fdk-aac)
   - **Manifests:** HLS `manifest.m3u8` and/or DASH `manifest.mpd` over the same fMP4 segments — emit either or both
   - **Low-Latency CMAF:** `low_latency: true` + `chunk_duration_ms` (100-2000) emits one `moof+mdat` chunk per chunk_duration into a single chunked-transfer PUT per segment; HLS `#EXT-X-PART` rows + DASH `availabilityTimeOffset` advertise parts to LL-aware players. Targets <3 s glass-to-glass with 500 ms chunks
