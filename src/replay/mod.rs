@@ -42,6 +42,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
 
 pub mod clips;
+pub mod clock;
 pub mod export;
 pub mod export_mp4;
 pub mod filmstrip;

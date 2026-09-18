@@ -46,6 +46,7 @@ use crate::manager::events::{EventSender, EventSeverity, category};
 
 use super::clips::ClipStore;
 use super::filmstrip::{FilmstripStats, spawn_filmstrip_writer};
+use super::clock;
 use super::index::{flag, InMemoryIndex, IndexEntry, IndexWriter};
 use super::{MarkInAck, RecordingCommand};
 
@@ -133,7 +134,8 @@ struct RecordingMeta {
     ///
     /// Written once, when the first index entry is appended, and preserved
     /// across a writer restart. Absent on recordings made before this existed;
-    /// readers fall back to `created_at_unix` and inherit its coarseness.
+    /// the clip exporter then has no way to date the timeline and falls back
+    /// to whole segments.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     anchor_wall_us: Option<i64>,
     /// The PTS `anchor_wall_us` describes. Stored explicitly rather than
@@ -203,6 +205,9 @@ struct PendingResume {
     last_indexed: u64,
     anchor_wall_us: Option<i64>,
     anchor_pts_90khz: Option<u64>,
+    /// The rolling second sample, so the gap is filled at the rate the
+    /// recording has actually run at — see [`super::clock`].
+    recent: Option<(i64, u64)>,
 }
 
 /// The largest outage `resume_pts` will believe, in microseconds — 90 days.
@@ -243,10 +248,19 @@ const MAX_RESUME_GAP_US: i128 = 90 * 24 * 60 * 60 * 1_000_000;
 /// error, on a timeline that is then poisoned for the life of the recording.
 /// An implausible gap is clamped away rather than believed; see
 /// [`MAX_RESUME_GAP_US`].
+///
+/// **Filled at the recording's own rate**, through [`clock::advance_to_wall`],
+/// with the same measured line the clip exporter reads. Dating the last tick
+/// on the nominal 90 kHz line instead — which is what this did — re-based
+/// every resume by the whole drift the source had accumulated: after a day at
+/// 450 ppm a 10 s Stop/Start moved the counter 49 s, the rolling sample then
+/// read that kink as the source speeding up, and a mark placed minutes before
+/// the Stop resolved 39 s late.
 fn resume_pts(
     last_indexed: Option<u64>,
     anchor_wall_us: Option<i64>,
     anchor_pts: Option<u64>,
+    recent: Option<(i64, u64)>,
     now_us: i64,
 ) -> Option<u64> {
     let last = last_indexed?;
@@ -254,13 +268,7 @@ fn resume_pts(
     let (Some(aw), Some(ap)) = (anchor_wall_us, anchor_pts) else {
         return Some(last.saturating_add(1));
     };
-    let last_wall_us =
-        (aw as i128) + (last.saturating_sub(ap) as i128) * 1_000_000 / 90_000;
-    let gap_us = ((now_us as i128) - last_wall_us).clamp(0, MAX_RESUME_GAP_US);
-    let resumed = (last as i128) + gap_us * 90_000 / 1_000_000;
-    // Never below the floor: an anchor that implies a backwards gap must not be
-    // allowed to un-sort the index.
-    Some(u64::try_from(resumed).unwrap_or(last).max(last.saturating_add(1)))
+    Some(clock::advance_to_wall(last, aw, ap, recent, now_us, MAX_RESUME_GAP_US))
 }
 
 /// Public handle returned by [`spawn_writer`]. Owns the JoinHandle for
@@ -505,6 +513,7 @@ pub async fn spawn_writer(
         last_indexed: last,
         anchor_wall_us: meta.anchor_wall_us,
         anchor_pts_90khz: meta.anchor_pts_90khz,
+        recent: meta.recent_wall_us.zip(meta.recent_pts_90khz),
     });
     if let Some(last) = last_indexed {
         tracing::info!(
@@ -859,11 +868,18 @@ impl WriterState {
                     // does: it advances on the source's PCR. This pair is what
                     // lets the exporter use the rate the recording has actually
                     // run at instead.
+                    //
+                    // Never on a counter a gap has not yet dated: an index entry
+                    // can land before the first PCR back (an RAI on a packet
+                    // with no PCR field), and pairing *now* with a tick from
+                    // before the gap would teach the mapping a rate that is
+                    // wrong by the whole outage for the next sixty seconds.
                     let us = now_unix_us();
-                    let due = self
-                        .meta
-                        .recent_wall_us
-                        .is_none_or(|prev| us.saturating_sub(prev) >= REANCHOR_INTERVAL_US);
+                    let due = self.pending_resume.is_none()
+                        && self
+                            .meta
+                            .recent_wall_us
+                            .is_none_or(|prev| us.saturating_sub(prev) >= REANCHOR_INTERVAL_US);
                     if due {
                         self.meta.recent_wall_us = Some(us);
                         self.meta.recent_pts_90khz = Some(entry.pts_90khz);
@@ -894,6 +910,7 @@ impl WriterState {
             Some(self.accumulated_pts),
             self.meta.anchor_wall_us,
             self.meta.anchor_pts_90khz,
+            self.meta.recent_wall_us.zip(self.meta.recent_pts_90khz),
             now_unix_us(),
         ) else {
             return;
@@ -954,30 +971,52 @@ impl WriterState {
         // across the boundary.
         const PCR_DISCONTINUITY_THRESHOLD_90KHZ: u64 = 90_000 * 60 * 5; // 5 minutes
         if let Some(new_pcr) = pcr_field {
-            // A gap that ended: this is the first media back, so this is the
-            // instant its length can finally be measured.
-            if let Some(pending) = self.pending_resume.take() {
-                let now_us = now_unix_us();
-                let resumed = resume_pts(
-                    Some(pending.last_indexed),
-                    pending.anchor_wall_us,
-                    pending.anchor_pts_90khz,
-                    now_us,
-                )
-                .unwrap_or(pending.last_indexed.saturating_add(1));
-                self.accumulated_pts = resumed.max(self.accumulated_pts);
-                tracing::info!(
-                    recording_id = %self.recording_id, resumed_pts = self.accumulated_pts,
-                    last_indexed = pending.last_indexed,
-                    "replay: dated the gap at the first frame back"
-                );
-            }
             let wrap_modulus: u64 = 1u64 << 33;
             let delta = match self.last_pcr {
                 None => 0u64,
                 Some(prev) => new_pcr.wrapping_sub(prev) & (wrap_modulus - 1),
             };
-            if delta > PCR_DISCONTINUITY_THRESHOLD_90KHZ {
+            // A gap that ended: this is the first media back, so this is the
+            // instant its length can finally be measured.
+            //
+            // Measured two ways, and the PCR wins when it can. Across an
+            // operator's Stop/Start the source's clock kept running, so a
+            // step still inside the discontinuity threshold is the exact
+            // length of the gap in the source's own ticks — better than any
+            // estimate made from this host's clock. Only a restart (no PCR to
+            // compare against) or a stop longer than the threshold falls back
+            // to the wall clock.
+            if let Some(pending) = self.pending_resume.take() {
+                if self.last_pcr.is_some() && delta <= PCR_DISCONTINUITY_THRESHOLD_90KHZ {
+                    self.accumulated_pts = self
+                        .accumulated_pts
+                        .wrapping_add(delta)
+                        .max(pending.last_indexed.saturating_add(1));
+                    tracing::info!(
+                        recording_id = %self.recording_id, resumed_pts = self.accumulated_pts,
+                        last_indexed = pending.last_indexed, pcr_ticks = delta,
+                        "replay: dated the gap by the source's own PCR"
+                    );
+                } else {
+                    let now_us = now_unix_us();
+                    let resumed = resume_pts(
+                        Some(pending.last_indexed),
+                        pending.anchor_wall_us,
+                        pending.anchor_pts_90khz,
+                        pending.recent,
+                        now_us,
+                    )
+                    .unwrap_or(pending.last_indexed.saturating_add(1));
+                    self.accumulated_pts = resumed.max(self.accumulated_pts);
+                    tracing::info!(
+                        recording_id = %self.recording_id, resumed_pts = self.accumulated_pts,
+                        last_indexed = pending.last_indexed,
+                        "replay: dated the gap at the first frame back"
+                    );
+                }
+                self.last_pcr = Some(new_pcr);
+                self.stats.current_pts_90khz.store(self.accumulated_pts, Ordering::Relaxed);
+            } else if delta > PCR_DISCONTINUITY_THRESHOLD_90KHZ {
                 self.pending_pcr_discontinuity = true;
                 // A step this large is either a genuine gap in the feed or a
                 // PCR base reset. A single tick is right for the second and
@@ -987,17 +1026,19 @@ impl WriterState {
                 // catch it, because the flagged entry sits *before* the
                 // shifted window rather than inside it.
                 //
-                // Re-dating through the anchor is correct for both: no wall
-                // time passes in a base reset, so it resolves to ~the current
-                // value there, and the floor below keeps the index sorted if
-                // the anchor is untrustworthy.
+                // Re-dating along the recording's own line serves both: no
+                // wall time passes in a base reset, so the counter resolves to
+                // within a tick of where it already is, and the floor keeps the
+                // index sorted if the anchor is untrustworthy.
                 self.accumulated_pts = self.accumulated_pts.wrapping_add(1);
                 self.resync_after_gap();
+                self.last_pcr = Some(new_pcr);
+                self.stats.current_pts_90khz.store(self.accumulated_pts, Ordering::Relaxed);
             } else {
                 self.accumulated_pts = self.accumulated_pts.wrapping_add(delta);
+                self.last_pcr = Some(new_pcr);
+                self.stats.current_pts_90khz.store(self.accumulated_pts, Ordering::Relaxed);
             }
-            self.last_pcr = Some(new_pcr);
-            self.stats.current_pts_90khz.store(self.accumulated_pts, Ordering::Relaxed);
         }
 
         // Feed the timecode tracker (filters internally; harmless on non-video).
@@ -1277,13 +1318,15 @@ impl WriterState {
                 // worth one tick, so a ten-minute Stop shifted the rest of the
                 // recording by ten minutes against the anchor, silently. The
                 // length is measured at the first frame back, the same way a
-                // restart's is.
+                // restart's is — by the source's own PCR when the stop was
+                // short enough for the step to be believable, which is why
+                // `last_pcr` is kept, and by the wall clock otherwise.
                 if self.mode == WriterMode::Idle {
-                    self.last_pcr = None;
                     self.pending_resume = Some(PendingResume {
                         last_indexed: self.accumulated_pts,
                         anchor_wall_us: self.meta.anchor_wall_us,
                         anchor_pts_90khz: self.meta.anchor_pts_90khz,
+                        recent: self.meta.recent_wall_us.zip(self.meta.recent_pts_90khz),
                     });
                     self.pending_pcr_discontinuity = true;
                 }
@@ -1541,7 +1584,7 @@ mod tests {
         // The writer comes back 30s later.
         let now_us = anchor_wall_us + 130 * 1_000_000;
 
-        let resumed = resume_pts(Some(last), Some(anchor_wall_us), Some(anchor_pts), now_us)
+        let resumed = resume_pts(Some(last), Some(anchor_wall_us), Some(anchor_pts), None, now_us)
             .expect("a resumed recording must resume its timeline");
 
         assert!(resumed > last, "the timeline went backwards, and the index is no longer sorted");
@@ -1553,10 +1596,10 @@ mod tests {
         );
 
         // A fresh recording has nothing to resume and starts at zero.
-        assert_eq!(resume_pts(None, Some(anchor_wall_us), Some(anchor_pts), now_us), None);
+        assert_eq!(resume_pts(None, Some(anchor_wall_us), Some(anchor_pts), None, now_us), None);
 
         // A clock that has gone backwards must not rewind the timeline either.
-        let backwards = resume_pts(Some(last), Some(anchor_wall_us), Some(anchor_pts), anchor_wall_us)
+        let backwards = resume_pts(Some(last), Some(anchor_wall_us), Some(anchor_pts), None, anchor_wall_us)
             .expect("still resumable");
         assert!(backwards >= last, "a backwards clock unsorted the index");
     }
@@ -1576,7 +1619,7 @@ mod tests {
         let last = 74_606_400u64;
         let now_us = 1_788_827_202_551_745i64;
 
-        let resumed = resume_pts(Some(last), None, None, now_us)
+        let resumed = resume_pts(Some(last), None, None, None, now_us)
             .expect("an undatable recording must still continue its counter");
         assert!(
             resumed > last,
@@ -1585,8 +1628,8 @@ mod tests {
         assert_eq!(resumed, last + 1, "un-dated means the minimum honest step");
 
         // Half an anchor is no anchor.
-        assert_eq!(resume_pts(Some(last), Some(1), None, now_us), Some(last + 1));
-        assert_eq!(resume_pts(Some(last), None, Some(1), now_us), Some(last + 1));
+        assert_eq!(resume_pts(Some(last), Some(1), None, None, now_us), Some(last + 1));
+        assert_eq!(resume_pts(Some(last), None, Some(1), None, now_us), Some(last + 1));
     }
 
     /// A clock that was wrong when the anchor was taken must not poison the
@@ -1607,7 +1650,7 @@ mod tests {
         let last = 60 * 90_000u64; // 60s of media indexed
         let now_us = 1_789_000_000_000_000i64;
 
-        let resumed = resume_pts(Some(last), Some(anchor_wall_us), Some(anchor_pts), now_us)
+        let resumed = resume_pts(Some(last), Some(anchor_wall_us), Some(anchor_pts), None, now_us)
             .expect("still resumable");
         assert!(resumed > last, "the timeline went backwards");
         let max_plausible = last + (MAX_RESUME_GAP_US as u64) * 90_000 / 1_000_000;
