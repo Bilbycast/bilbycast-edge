@@ -80,6 +80,7 @@ pub fn spawn_cmaf_output(
     cancel: CancellationToken,
     event_sender: EventSender,
     flow_id: String,
+    flow_stats: Arc<crate::stats::collector::FlowStatsAccumulator>,
 ) -> JoinHandle<()> {
     let mut rx = broadcast_tx.subscribe();
 
@@ -156,6 +157,7 @@ pub fn spawn_cmaf_output(
             cancel,
             &event_sender,
             &flow_id,
+            flow_stats,
         )
         .await
         {
@@ -1182,6 +1184,7 @@ async fn run(
     cancel: CancellationToken,
     event_sender: &EventSender,
     flow_id: &str,
+    flow_stats: Arc<crate::stats::collector::FlowStatsAccumulator>,
 ) -> anyhow::Result<()> {
     tracing::info!(
         "CMAF output '{}' started -> {} (segment={}s, window={} segments (~{:.0}s), manifests={:?}, audio_encode={:?}, video_encode={:?})",
@@ -1218,10 +1221,12 @@ async fn run(
         tokio::spawn(clips::run(
             base_url.clone(),
             config.auth_token.clone(),
-            // The flow is how the exporter finds the local recording: a
-            // recorder's `storage_id` defaults to the flow id, which is what
-            // an exact cut is read from.
+            // The flow names the recording an exact cut is read from, but only
+            // by default: the recorder files under its `storage_id`, and the
+            // exporter reads the id the writer really used off the flow's
+            // stats rather than assuming the default.
             flow_id.to_string(),
+            flow_stats,
             event_sender.clone(),
             cancel.clone(),
         ));

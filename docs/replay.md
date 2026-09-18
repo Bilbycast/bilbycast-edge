@@ -697,12 +697,23 @@ artefacts — the range is decoded and re-encoded all-intra (`gop_size = 1`,
 CRF 20, no B-frames, H.264 out whatever went in), because that is what makes a
 clip step; a build with no encoder falls back to the source's own GOP structure
 with a log line. See [The shape of the file](#the-shape-of-the-file) for why.
-The demuxer assumes PTS == DTS (DTS recovery via PES parsing is a follow-up).
-The result is built one-shot into a bounded in-memory cache (5-minute TTL, byte
-and entry ceilings, LRU) and refused past 256 MiB **on the built file**, not on
-the source range — over-cap exports fail with `replay_export_too_large`
-(download TS instead). Unsupported essence (MPEG-2 video, Opus audio) surfaces
-`replay_export_format_unsupported`. The edge advertises the
+The re-encode is fed in the order the transport carried the frames — decode
+order, the only order a decoder accepts — and its output is labelled in display
+order, so a source with B-frames comes out right. Only the no-encoder fallback
+assumes PTS == DTS (DTS recovery via PES parsing is a follow-up). The audio and
+video tracks are aligned **by PTS**: a transport stream muxes video ahead of
+its PTS by the VBV delay and audio by much less, so the first audio frame in a
+range is earlier than the first picture by hundreds of milliseconds, and it is
+dropped rather than played ahead of a picture it does not belong to. The
+result is built one-shot into a bounded in-memory cache (5-minute TTL, byte and
+entry ceilings, LRU) and refused past 256 MiB on **either** the source range or
+the muxed essence — the built file itself is never measured — with
+`replay_export_too_large` (download TS instead). A range that crosses a
+recorder restart is refused with `replay_export_spans_restart`, which is
+settled rather than transient; with no `to_pts_90khz` that guard covers the
+whole recording, so a `format: "mp4"` export of a recording that has ever
+restarted is refused this way. Unsupported essence (MPEG-2 video, Opus audio)
+surfaces `replay_export_format_unsupported`. The edge advertises the
 `replay_export_mp4` capability so the manager UI lights up the ⬇ MP4
 button alongside ⬇ TS.
 
@@ -756,6 +767,19 @@ this**; it is a property of the encode. So the cut is decoded and re-encoded
 with `gop_size = 1`, x264, CRF 20, no B-frames. Measured on the rig: ~25 Mbps
 and ~93 MB for 30 s, against ~8 Mbps for the passthrough it replaces, and about
 14 s of encode for a 30 s clip.
+
+A file that size is uploaded under its own deadline, a minute plus the body at
+2 Mbit/s (capped at fifteen minutes), not the segment client's 30 s — which
+covers the whole exchange, body included, and would have failed every clip
+larger than thirty seconds of uplink, then re-encoded and re-sent it twice more
+before calling it failed.
+
+The recording is read from wherever the recorder filed it: `storage_id` when
+one is set, the flow id otherwise. The exporter takes the id the writer
+published on the flow's stats rather than assuming the default, because the
+manager keeps an operator's own `storage_id` when it arms a DVR session, and
+looking under the flow id then found no recording and cut every clip from
+whole segments while the session read healthy.
 
 `x264` specifically, not `h264_auto`: a hardware encoder is tuned for streaming
 and several will not honour a one-frame GOP at all, which would quietly hand

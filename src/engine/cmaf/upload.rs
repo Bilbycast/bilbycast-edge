@@ -32,17 +32,38 @@ pub(super) fn client() -> &'static reqwest::Client {
     })
 }
 
-/// PUT `body` to `url`. Returns Err on non-2xx responses.
+/// PUT `body` to `url` under the client's own 30 s deadline. Returns Err on
+/// non-2xx responses.
 pub async fn http_put(
     url: &str,
     body: Vec<u8>,
     content_type: &str,
     auth_token: Option<&str>,
 ) -> Result<()> {
+    http_put_within(url, body, content_type, auth_token, None).await
+}
+
+/// [`http_put`] with its own total deadline in place of the client's.
+///
+/// The client's 30 s is sized for a two-second segment. A finished clip is up
+/// to 256 MiB, and reqwest's timeout covers the whole exchange, body included,
+/// so the same deadline failed every clip larger than thirty seconds of
+/// uplink — on a cellular or Starlink contribution link, most of them — and
+/// each failure was retried through a full decode and all-intra encode.
+pub async fn http_put_within(
+    url: &str,
+    body: Vec<u8>,
+    content_type: &str,
+    auth_token: Option<&str>,
+    timeout: Option<Duration>,
+) -> Result<()> {
     let mut req = client()
         .put(url)
         .header("Content-Type", content_type)
         .body(body);
+    if let Some(t) = timeout {
+        req = req.timeout(t);
+    }
     if let Some(token) = auth_token {
         req = req.header("Authorization", format!("Bearer {token}"));
     }

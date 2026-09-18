@@ -1195,8 +1195,9 @@ actions (`start_recording`, `mark_in`, `mark_out`, `cue_clip`,
 | `replay_metadata_stale` | `recording.json` write failed; resume id is derived from disk on restart |
 | `replay_max_bytes_below_segment` | `max_bytes` smaller than one segment — retention can't keep usage under the cap without deleting the live edge |
 | `replay_recording_active` | `delete_recording` was sent for a recording that the writer is currently appending to — operator must `stop_recording` first |
-| `replay_export_format_unsupported` | `export_clip` / `export_recording` was given a `format` other than `"ts"` (Phase 1 ships TS only) |
-| `replay_export_too_large` | `export_recording` resolved to > 4 GiB of bytes — operator should mark a clip first to bound the pull |
+| `replay_export_format_unsupported` | `export_clip` / `export_recording` was given a `format` other than `"ts"` / `"mp4"`, or an MP4 export met essence the muxer has no mapping for (MPEG-2 video, Opus audio) |
+| `replay_export_too_large` | A TS export resolved to > 4 GiB of bytes, or an MP4 export's source range or muxed essence passed 256 MiB — operator should mark a clip first to bound the pull, or download TS |
+| `replay_export_spans_restart` | An MP4 export's range crosses a recorder restart, and the media either side of the join is two separate timelines. Settled, not transient — retrying cannot move the restart; export each side separately, or download TS. A `format: "mp4"` export with no `to_pts_90khz` is refused this way on any recording that has ever restarted |
 | `replay_export_failed` | `export_clip` / `export_recording` hit an unclassified read error mid-pull (transient I/O, segment removed by retention between calls). Manager retries from the same `byte_offset`. |
 | `replay_no_segments` | `export_recording` ran against a recording with no segments on disk yet |
 | `replay_no_index` | `export_clip` / `export_recording` ran against a recording with an empty `index.bin` (no IDR captured yet) |

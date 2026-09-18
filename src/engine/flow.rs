@@ -2435,6 +2435,7 @@ impl FlowRuntime {
                     output_cancel.clone(),
                     event_sender.clone(),
                     flow_id.to_string(),
+                    flow_stats.clone(),
                 );
                 Ok(OutputRuntime {
                     handle,

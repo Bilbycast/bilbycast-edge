@@ -5397,6 +5397,11 @@ async fn execute_command(
                     s if s.contains("replay_no_index") => "replay_no_index",
                     s if s.contains("replay_export_format_unsupported") => "replay_export_format_unsupported",
                     s if s.contains("replay_export_too_large") => "replay_export_too_large",
+                    // Settled, not transient: retrying cannot move the restart.
+                    // Left to fall through to `replay_export_failed`, which the
+                    // manager documents as "retry from the same offset", the
+                    // operator retried an answer that was final.
+                    s if s.contains("replay_export_spans_restart") => "replay_export_spans_restart",
                     _ => "replay_export_failed",
                 };
                 CommandError::with_code(e.to_string(), code)
@@ -5451,6 +5456,11 @@ async fn execute_command(
                     s if s.contains("replay_no_index") => "replay_no_index",
                     s if s.contains("replay_no_segments") => "replay_no_segments",
                     s if s.contains("replay_export_too_large") => "replay_export_too_large",
+                    // Settled, not transient: retrying cannot move the restart.
+                    // Left to fall through to `replay_export_failed`, which the
+                    // manager documents as "retry from the same offset", the
+                    // operator retried an answer that was final.
+                    s if s.contains("replay_export_spans_restart") => "replay_export_spans_restart",
                     s if s.contains("replay_export_format_unsupported") => "replay_export_format_unsupported",
                     _ => "replay_export_failed",
                 };

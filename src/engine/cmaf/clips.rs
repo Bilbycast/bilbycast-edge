@@ -33,7 +33,7 @@ use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
 
-use super::upload::http_put;
+use super::upload::http_put_within;
 use crate::manager::events::{EventSeverity, category};
 
 /// How often to ask the origin whether anything is waiting.
@@ -385,8 +385,23 @@ fn measured_rate(
 /// -36ms against the CMAF published dates, inside one frame at 25fps, where
 /// `created_at_unix` was out by anywhere from half a second to nineteen.
 #[cfg(feature = "replay")]
-async fn cut_exact(flow_id: &str, rec: &ClipRecord) -> Result<Option<Vec<u8>>> {
-    let dir = crate::replay::recording_dir(flow_id);
+async fn cut_exact(
+    flow_id: &str,
+    flow_stats: &crate::stats::collector::FlowStatsAccumulator,
+    rec: &ClipRecord,
+) -> Result<Option<Vec<u8>>> {
+    // The recording is filed under the recorder's `storage_id`, which is the
+    // flow id only by default. An operator may name one — the flow modal
+    // offers it, and the manager keeps theirs when it arms a DVR session on
+    // top — and looking under the flow id then found no recording at all, so
+    // every clip fell back to whole segments while the session read healthy.
+    // The writer publishes the id it is really using on the flow's stats.
+    let recording_id = flow_stats
+        .recording_id
+        .get()
+        .map(String::as_str)
+        .unwrap_or(flow_id);
+    let dir = crate::replay::recording_dir(recording_id);
     let Ok(raw) = tokio::fs::read(dir.join("recording.json")).await else {
         return Ok(None);
     };
@@ -489,7 +504,7 @@ async fn cut_exact(flow_id: &str, rec: &ClipRecord) -> Result<Option<Vec<u8>>> {
     // the cache pinning the finished build for five minutes while this loop
     // copied the same bytes out slice by slice into a second full-size buffer.
     let out = match crate::replay::export_mp4::export_recording_mp4_whole(
-        flow_id,
+        recording_id,
         Some(from),
         Some(to_covering),
     )
@@ -512,7 +527,8 @@ async fn cut_exact(flow_id: &str, rec: &ClipRecord) -> Result<Option<Vec<u8>>> {
         Err(e) => {
             tracing::warn!(
                 flow_id, clip = %rec.name, error = %format!("{e:#}"),
-                "clip exporter: the recording could not serve this moment;                  cutting from whole segments instead"
+                "clip exporter: the recording could not serve this moment; \
+                 cutting from whole segments instead"
             );
             return Ok(None);
         }
@@ -528,20 +544,47 @@ async fn cut_exact(flow_id: &str, rec: &ClipRecord) -> Result<Option<Vec<u8>>> {
 }
 
 #[cfg(not(feature = "replay"))]
-async fn cut_exact(_flow_id: &str, _rec: &ClipRecord) -> Result<Option<Vec<u8>>> {
+async fn cut_exact(
+    _flow_id: &str,
+    _flow_stats: &crate::stats::collector::FlowStatsAccumulator,
+    _rec: &ClipRecord,
+) -> Result<Option<Vec<u8>>> {
     Ok(None)
 }
 
+/// How long a clip upload is given: a minute, plus the body at 2 Mbit/s.
+///
+/// The shared client's 30 s covers the whole exchange, body included, and was
+/// sized for a two-second segment. A 30 s clip is ~93 MB all-intra and needs
+/// a 25 Mbit/s uplink to land inside it; the 60 s maximum needs 50. Below
+/// that — a cellular or Starlink link, the field case — every clip timed out,
+/// was re-encoded and re-sent twice more, then called failed. The floor rate
+/// is the slowest link worth waiting for; above the cap the link is the
+/// problem and the retry will find out.
+fn clip_upload_budget(bytes: usize) -> Duration {
+    const FLOOR_BYTES_PER_SEC: u64 = 2_000_000 / 8;
+    const CAP: Duration = Duration::from_secs(15 * 60);
+    let body = Duration::from_secs(bytes as u64 / FLOOR_BYTES_PER_SEC);
+    (Duration::from_secs(60) + body).min(CAP)
+}
+
 /// Assemble and upload one clip.
-async fn cut_one(base: &str, auth: Option<&str>, flow_id: &str, rec: &ClipRecord) -> Result<usize> {
+async fn cut_one(
+    base: &str,
+    auth: Option<&str>,
+    flow_id: &str,
+    flow_stats: &crate::stats::collector::FlowStatsAccumulator,
+    rec: &ClipRecord,
+) -> Result<usize> {
     // Exact if the recorder is running for this flow; whole segments if not.
     // The fallback is not a lesser mode to be ashamed of — it needs no second
     // copy of the media on the edge — but it lands on segment boundaries, so
     // prefer the cut that lands on the frame.
-    if let Some(bytes) = cut_exact(flow_id, rec).await? {
+    if let Some(bytes) = cut_exact(flow_id, flow_stats, rec).await? {
         let target = format!("{base}/clips/{}.mp4", urlencoding_light(&rec.name));
         let n = bytes.len();
-        match http_put(&target, bytes, "video/mp4", auth).await {
+        let budget = clip_upload_budget(n);
+        match http_put_within(&target, bytes, "video/mp4", auth, Some(budget)).await {
             Ok(()) => return Ok(n),
             // The exact cut was too big for the origin to accept — try the
             // coarse one before calling the clip impossible.
@@ -555,7 +598,11 @@ async fn cut_one(base: &str, auth: Option<&str>, flow_id: &str, rec: &ClipRecord
             // succeeds — but `?` propagated the 413 straight out, `is_permanent`
             // matched it, and the operator was told the clip could not be
             // produced after minutes of CPU and ~800 MB of uplink.
-            Err(e) if format!("{e:#}").contains("413") => {
+            // "returned HTTP 413", never a bare "413": the message carries
+            // the clip's URL, so a clip named "Lap 413" would otherwise send
+            // every failed upload down this branch — `is_permanent` learned
+            // the same lesson.
+            Err(e) if format!("{e:#}").contains("returned HTTP 413") => {
                 tracing::warn!(
                     flow_id, clip = %rec.name, bytes = n, error = %format!("{e:#}"),
                     "clip exporter: the origin refused the exact cut as too large; \
@@ -607,7 +654,8 @@ async fn cut_from_segments(base: &str, auth: Option<&str>, rec: &ClipRecord) -> 
 
     let target = format!("{base}/clips/{}.mp4", urlencoding_light(&rec.name));
     let bytes = body.len();
-    http_put(&target, body, "video/mp4", auth).await?;
+    let budget = clip_upload_budget(bytes);
+    http_put_within(&target, body, "video/mp4", auth, Some(budget)).await?;
     Ok(bytes)
 }
 
@@ -624,6 +672,7 @@ pub async fn run(
     base_url: String,
     auth_token: Option<String>,
     flow_id: String,
+    flow_stats: std::sync::Arc<crate::stats::collector::FlowStatsAccumulator>,
     event_sender: crate::manager::events::EventSender,
     cancel: tokio_util::sync::CancellationToken,
 ) {
@@ -742,7 +791,7 @@ pub async fn run(
                 tracing::info!(origin = %base, "clip exporter stopping (cancelled) mid-batch");
                 return;
             }
-            let outcome = cut_one(&base, auth, &flow_id, rec).await;
+            let outcome = cut_one(&base, auth, &flow_id, &flow_stats, rec).await;
             // Whichever way it went, the spike is over — give the pages back
             // before moving to the next one, so a run of exports does not
             // accumulate a working set none of them still needs.
@@ -847,6 +896,33 @@ mod tests {
         assert!(is_permanent(
             "PUT https://relay/clips/Lap%20413.mp4 returned HTTP 413 — clip too large"
         ));
+    }
+
+    /// The upload budget follows the body, and never the segment client's 30 s.
+    ///
+    /// A 30 s clip is ~93 MB all-intra. Under the shared client's deadline it
+    /// needed a 25 Mbit/s uplink to land; on anything slower it timed out,
+    /// was re-encoded and re-sent twice more, and was then called failed.
+    #[test]
+    fn the_upload_budget_scales_with_the_clip() {
+        assert_eq!(clip_upload_budget(0), Duration::from_secs(60));
+        // 93 MB at 2 Mbit/s is 372 s, plus the minute.
+        assert_eq!(clip_upload_budget(93_000_000), Duration::from_secs(60 + 372));
+        // And it is capped: a 256 MiB clip at the floor rate would be over
+        // eighteen minutes, which is a link problem the retry should find.
+        assert_eq!(clip_upload_budget(256 << 20), Duration::from_secs(15 * 60));
+    }
+
+    /// The exact-cut fallback keys on the status the origin returned, not on
+    /// a bare "413" — which the clip's own URL, and so a clip called
+    /// "Lap 413", would match on every failed upload.
+    #[test]
+    fn the_too_large_fallback_reads_the_status_not_the_url() {
+        let put_error = |url: &str, code: u16| format!("PUT {url} returned HTTP {code} — body");
+        let lap = "https://relay/origin/feed/clips/Lap%20413.mp4";
+        assert!(!put_error(lap, 502).contains("returned HTTP 413"));
+        assert!(put_error(lap, 502).contains("413"), "the bare match would have fired");
+        assert!(put_error(lap, 413).contains("returned HTTP 413"));
     }
 
     fn t(s: &str) -> DateTime<Utc> {
