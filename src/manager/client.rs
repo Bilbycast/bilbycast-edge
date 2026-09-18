@@ -8689,6 +8689,21 @@ mod multiviewer_capability_gate {
     /// None branch, so this passes while exercising only half the space. That
     /// is worth stating rather than hiding: the assertion is an equivalence,
     /// and the runner only ever proves one side of it.
+    /// The string the manager gates DVR provisioning on, spelled the same
+    /// way on both sides of the wire.
+    ///
+    /// `dvr_edge.rs` in bilbycast-manager refuses to activate a session on an
+    /// edge whose health tick does not carry exactly this, because such an
+    /// edge takes every command and never cuts a clip. Advertised on every
+    /// build, because the exporter is compiled in on every build; diverge
+    /// the spelling here and every DVR activation in the fleet fails with the
+    /// manager's own refusal.
+    #[test]
+    fn clip_export_is_advertised_under_the_name_the_manager_reads() {
+        let caps = super::edge_capabilities();
+        assert!(caps.contains(&"clip-export"), "caps = {caps:?}");
+    }
+
     #[cfg(feature = "multiviewer")]
     #[test]
     fn with_the_feature_the_bit_tracks_the_encoder_backend() {

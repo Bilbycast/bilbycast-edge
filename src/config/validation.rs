@@ -1568,6 +1568,15 @@ pub(crate) fn validate_replay_id(id: &str, label: &str) -> Result<()> {
     Ok(())
 }
 
+/// Is this string exactly one ordinary path component — no separators, not
+/// `.` or `..`, nothing the filesystem would read as more than a name?
+fn is_single_path_component(s: &str) -> bool {
+    !s.is_empty()
+        && s != "."
+        && s != ".."
+        && !s.contains(['/', '\\', '\0'])
+}
+
 /// Validate a [`crate::config::models::RecordingConfig`]. Bounds-check the
 /// segment cadence, sanity-check the optional storage_id, and accept the
 /// retention / size caps as advisory (the writer enforces them at runtime).
@@ -1581,8 +1590,23 @@ pub(crate) fn validate_recording_config(
             c.segment_seconds
         );
     }
-    if let Some(ref sid) = c.storage_id {
-        validate_replay_id(sid, &format!("Flow '{flow_id}' recording.storage_id"))?;
+    match c.storage_id {
+        Some(ref sid) => {
+            validate_replay_id(sid, &format!("Flow '{flow_id}' recording.storage_id"))?;
+        }
+        // With no `storage_id` the recorder files under the flow id, and a flow
+        // id is bounded by length alone — it may carry `.` and `/`, because
+        // `stadium.cam1` is a legitimate name. The strict replay charset cannot
+        // be applied here: it would refuse, at config load, every dotted flow
+        // that records today and crash-loop the node on upgrade. What is
+        // refused is only what the filesystem would read as a path: the
+        // directory is `replay_root().join(id)`, so `../x` escapes the root
+        // and `/tmp/x` replaces it outright.
+        None if !is_single_path_component(flow_id) => bail!(
+            "Flow '{flow_id}': recording has no storage_id and the flow id cannot be \
+             used as a directory name — set recording.storage_id explicitly"
+        ),
+        None => {}
     }
     if let Some(pb) = c.pre_buffer_seconds {
         if !(1..=300).contains(&pb) {
@@ -10417,6 +10441,57 @@ mod tests {
         AppConfig {
             tuning: Some(tuning),
             ..Default::default()
+        }
+    }
+
+    /// `heap_trim_secs` is off, or between ten seconds and an hour.
+    #[test]
+    fn node_tuning_heap_trim_is_off_or_bounded() {
+        for v in [0u64, 10, 60, 3600] {
+            let t = crate::config::models::NodeTuningConfig {
+                heap_trim_secs: Some(v),
+                ..Default::default()
+            };
+            assert!(validate_config(&config_with_tuning(t)).is_ok(), "{v} is allowed");
+        }
+        for v in [1u64, 9, 3601] {
+            let t = crate::config::models::NodeTuningConfig {
+                heap_trim_secs: Some(v),
+                ..Default::default()
+            };
+            let err = validate_config(&config_with_tuning(t)).unwrap_err().to_string();
+            assert!(err.contains("heap_trim_secs"), "{v}: {err}");
+        }
+    }
+
+    /// A flow id that the filesystem would read as a path cannot stand in
+    /// for a missing `storage_id`.
+    ///
+    /// The recorder files under `storage_id`, or the flow id when there is
+    /// none, and the directory is `replay_root().join(id)` — so `../x`
+    /// escapes the root and `/tmp/x` replaces it. Only what is path-like is
+    /// refused: `stadium.cam1` records today and must go on doing so, and
+    /// this runs at config load, where a refusal is a node that will not boot.
+    #[test]
+    fn a_path_like_flow_id_needs_an_explicit_storage_id() {
+        let rec = |storage_id: Option<&str>| crate::config::models::RecordingConfig {
+            enabled: true,
+            storage_id: storage_id.map(str::to_string),
+            segment_seconds: 10,
+            retention_seconds: 3600,
+            max_bytes: 0,
+            pre_buffer_seconds: None,
+            filmstrip_seconds: None,
+        };
+        for id in ["../elsewhere", "a/b", "/tmp/x", ".", "..", "c\\d"] {
+            let err = validate_recording_config(&rec(None), id).unwrap_err().to_string();
+            assert!(err.contains("storage_id"), "{id}: {err}");
+            // Named explicitly, the id is checked on its own terms and the
+            // flow id no longer matters.
+            assert!(validate_recording_config(&rec(Some("archive-1")), id).is_ok(), "{id}");
+        }
+        for id in ["stadium.cam1", "cam-1", "Flow_2"] {
+            assert!(validate_recording_config(&rec(None), id).is_ok(), "{id}");
         }
     }
 

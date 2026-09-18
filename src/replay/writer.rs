@@ -257,18 +257,17 @@ const MAX_RESUME_GAP_US: i128 = 90 * 24 * 60 * 60 * 1_000_000;
 /// read that kink as the source speeding up, and a mark placed minutes before
 /// the Stop resolved 39 s late.
 fn resume_pts(
-    last_indexed: Option<u64>,
+    last: u64,
     anchor_wall_us: Option<i64>,
     anchor_pts: Option<u64>,
     recent: Option<(i64, u64)>,
     now_us: i64,
-) -> Option<u64> {
-    let last = last_indexed?;
+) -> u64 {
     // No anchor: monotonic, undated. One tick is the whole claim.
     let (Some(aw), Some(ap)) = (anchor_wall_us, anchor_pts) else {
-        return Some(last.saturating_add(1));
+        return last.saturating_add(1);
     };
-    Some(clock::advance_to_wall(last, aw, ap, recent, now_us, MAX_RESUME_GAP_US))
+    clock::advance_to_wall(last, aw, ap, recent, now_us, MAX_RESUME_GAP_US)
 }
 
 /// Public handle returned by [`spawn_writer`]. Owns the JoinHandle for
@@ -899,30 +898,27 @@ impl WriterState {
     /// Catch the counter up to wall clock after an in-process gap.
     ///
     /// Only meaningful with an anchor, because without one there is no mapping
-    /// to catch up *to*. Never moves the counter backwards: an untrustworthy
-    /// anchor must not be able to un-sort the index, so a derived value at or
-    /// below the current one is discarded and the caller's +1 tick stands.
-    fn resync_after_gap(&mut self) {
+    /// to catch up *to* — `false` then, and the caller's one tick stands.
+    /// Never moves the counter backwards: `resume_pts` floors at one tick past
+    /// where it was, so an untrustworthy anchor cannot un-sort the index.
+    fn resync_after_gap(&mut self) -> bool {
         if self.meta.anchor_wall_us.is_none() {
-            return;
+            return false;
         }
-        let Some(dated) = resume_pts(
-            Some(self.accumulated_pts),
+        let dated = resume_pts(
+            self.accumulated_pts,
             self.meta.anchor_wall_us,
             self.meta.anchor_pts_90khz,
             self.meta.recent_wall_us.zip(self.meta.recent_pts_90khz),
             now_unix_us(),
-        ) else {
-            return;
-        };
-        if dated > self.accumulated_pts {
-            tracing::info!(
-                recording_id = %self.recording_id,
-                from = self.accumulated_pts, to = dated,
-                "replay: catching the PTS counter up to wall clock across a gap in the feed"
-            );
-            self.accumulated_pts = dated;
-        }
+        );
+        tracing::debug!(
+            recording_id = %self.recording_id,
+            from = self.accumulated_pts, to = dated,
+            "replay: catching the PTS counter up to wall clock across a gap in the feed"
+        );
+        self.accumulated_pts = dated;
+        true
     }
 
     fn observe_packet(&mut self, ts: &[u8], byte_offset_in_seg: u32) -> Option<IndexEntry> {
@@ -998,15 +994,13 @@ impl WriterState {
                         "replay: dated the gap by the source's own PCR"
                     );
                 } else {
-                    let now_us = now_unix_us();
                     let resumed = resume_pts(
-                        Some(pending.last_indexed),
+                        pending.last_indexed,
                         pending.anchor_wall_us,
                         pending.anchor_pts_90khz,
                         pending.recent,
-                        now_us,
-                    )
-                    .unwrap_or(pending.last_indexed.saturating_add(1));
+                        now_unix_us(),
+                    );
                     self.accumulated_pts = resumed.max(self.accumulated_pts);
                     tracing::info!(
                         recording_id = %self.recording_id, resumed_pts = self.accumulated_pts,
@@ -1029,9 +1023,11 @@ impl WriterState {
                 // Re-dating along the recording's own line serves both: no
                 // wall time passes in a base reset, so the counter resolves to
                 // within a tick of where it already is, and the floor keeps the
-                // index sorted if the anchor is untrustworthy.
-                self.accumulated_pts = self.accumulated_pts.wrapping_add(1);
-                self.resync_after_gap();
+                // index sorted if the anchor is untrustworthy. With no anchor
+                // there is nothing to date against, and one tick is the claim.
+                if !self.resync_after_gap() {
+                    self.accumulated_pts = self.accumulated_pts.wrapping_add(1);
+                }
                 self.last_pcr = Some(new_pcr);
                 self.stats.current_pts_90khz.store(self.accumulated_pts, Ordering::Relaxed);
             } else {
@@ -1584,8 +1580,7 @@ mod tests {
         // The writer comes back 30s later.
         let now_us = anchor_wall_us + 130 * 1_000_000;
 
-        let resumed = resume_pts(Some(last), Some(anchor_wall_us), Some(anchor_pts), None, now_us)
-            .expect("a resumed recording must resume its timeline");
+        let resumed = resume_pts(last, Some(anchor_wall_us), Some(anchor_pts), None, now_us);
 
         assert!(resumed > last, "the timeline went backwards, and the index is no longer sorted");
         // 130s after the anchor: the 100s recorded plus the 30s outage.
@@ -1595,13 +1590,9 @@ mod tests {
             "the outage was not accounted for, so every later clip is shifted by it"
         );
 
-        // A fresh recording has nothing to resume and starts at zero.
-        assert_eq!(resume_pts(None, Some(anchor_wall_us), Some(anchor_pts), None, now_us), None);
-
         // A clock that has gone backwards must not rewind the timeline either.
-        let backwards = resume_pts(Some(last), Some(anchor_wall_us), Some(anchor_pts), None, anchor_wall_us)
-            .expect("still resumable");
-        assert!(backwards >= last, "a backwards clock unsorted the index");
+        let backwards = resume_pts(last, Some(anchor_wall_us), Some(anchor_pts), None, anchor_wall_us);
+        assert!(backwards > last, "a backwards clock unsorted the index");
     }
 
     /// A recording with no anchor still resumes — monotonically.
@@ -1619,8 +1610,7 @@ mod tests {
         let last = 74_606_400u64;
         let now_us = 1_788_827_202_551_745i64;
 
-        let resumed = resume_pts(Some(last), None, None, None, now_us)
-            .expect("an undatable recording must still continue its counter");
+        let resumed = resume_pts(last, None, None, None, now_us);
         assert!(
             resumed > last,
             "the counter restarted below the index and un-sorted it"
@@ -1628,8 +1618,8 @@ mod tests {
         assert_eq!(resumed, last + 1, "un-dated means the minimum honest step");
 
         // Half an anchor is no anchor.
-        assert_eq!(resume_pts(Some(last), Some(1), None, None, now_us), Some(last + 1));
-        assert_eq!(resume_pts(Some(last), None, Some(1), None, now_us), Some(last + 1));
+        assert_eq!(resume_pts(last, Some(1), None, None, now_us), last + 1);
+        assert_eq!(resume_pts(last, None, Some(1), None, now_us), last + 1);
     }
 
     /// A clock that was wrong when the anchor was taken must not poison the
@@ -1650,8 +1640,7 @@ mod tests {
         let last = 60 * 90_000u64; // 60s of media indexed
         let now_us = 1_789_000_000_000_000i64;
 
-        let resumed = resume_pts(Some(last), Some(anchor_wall_us), Some(anchor_pts), None, now_us)
-            .expect("still resumable");
+        let resumed = resume_pts(last, Some(anchor_wall_us), Some(anchor_pts), None, now_us);
         assert!(resumed > last, "the timeline went backwards");
         let max_plausible = last + (MAX_RESUME_GAP_US as u64) * 90_000 / 1_000_000;
         assert!(

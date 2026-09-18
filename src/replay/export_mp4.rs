@@ -195,7 +195,7 @@ fn insert_cached(key: String, bytes: std::sync::Arc<Vec<u8>>) {
     }
 }
 
-/// Build (or reuse a cached) fMP4 byte buffer for the given clip and
+/// Build (or reuse a cached) MP4 byte buffer for the given clip and
 /// return the chunk starting at `byte_offset`.
 pub async fn export_clip_mp4_chunk(
     recording_id: &str,
@@ -396,12 +396,12 @@ fn build_mp4_from_ts(ts: &[u8]) -> Result<Vec<u8>> {
                 other_audio.push((pts, stream_type, data));
             }
             DemuxedFrame::Mpeg2 { .. } => {
-                // No fragmented-MP4 mapping wired today — operators with
+                // No MP4 mapping wired today — operators with
                 // MPEG-2 sources should download TS.
                 bail!("replay_export_format_unsupported");
             }
             DemuxedFrame::Opus { .. } => {
-                // Opus → MP4 carriage (`Opus`-in-`fmp4` boxes) is not
+                // Opus → MP4 carriage (`Opus`-in-MP4 boxes) is not
                 // wired today. Display playback decodes Opus through
                 // libopus directly; export-to-MP4 is the missing path.
                 bail!("replay_export_format_unsupported");
@@ -512,7 +512,15 @@ fn build_mp4_from_ts(ts: &[u8]) -> Result<Vec<u8>> {
     // first put every B-frame ahead of the reference it predicts from, and
     // the decoder concealed the missing picture and emitted a corrupt one,
     // which x264 then faithfully re-encoded as an IDR.
-    let reencoded = reencode_all_intra(&video_pts, &video_track, &demux);
+    //
+    // Budgeted: the encoder stops the moment its output passes what the file
+    // may hold, less the audio already built. Measuring the essence only after
+    // the whole clip had been encoded — and copied once more into samples —
+    // meant a 60 s 1080p50 cut at CRF 20 held some 400 MB twice, plus the
+    // source, and spent the whole encode, before it was refused.
+    let audio_bytes: usize = audio_samples_built.iter().map(|s| s.data.len()).sum();
+    let video_budget = MP4_EXPORT_MAX_BYTES.saturating_sub(audio_bytes);
+    let reencoded = reencode_all_intra(&video_pts, &video_track, &demux, video_budget);
     let (video_pts, video_track, video_all_sync) = match reencoded {
         Ok((frames, track)) => {
             // Shadowing does not drop. The source list is a whole clip's worth
@@ -521,6 +529,12 @@ fn build_mp4_from_ts(ts: &[u8]) -> Result<Vec<u8>> {
             // full copies of the essence for no reason.
             drop(video_pts);
             (frames, track, true)
+        }
+        // Over the cap is not a re-encode failure to fall back from: the
+        // source GOP would be muxed and refused at the same cap a few lines
+        // on, after two more copies.
+        Err(e) if e.downcast_ref::<EssenceOverCap>().is_some() => {
+            bail!("replay_export_too_large");
         }
         Err(e) => {
             // A clip that exists beats no clip. The operator gets the source
@@ -763,6 +777,7 @@ fn reencode_all_intra(
     frames: &[(u64, Vec<Vec<u8>>, bool)],
     source: &VideoTrack,
     demux: &TsDemuxer,
+    budget_bytes: usize,
 ) -> Result<(Vec<(u64, Vec<Vec<u8>>, bool)>, VideoTrack)> {
     use crate::config::models::VideoEncodeConfig;
     use crate::engine::cmaf::encode::VideoReencoder;
@@ -843,6 +858,7 @@ fn reencode_all_intra(
     let mut enc = VideoReencoder::new(&cfg, "clip-export")?;
     let mut out: Vec<(u64, Vec<Vec<u8>>, bool)> = Vec::with_capacity(frames.len());
     let mut rejected = 0usize;
+    let mut emitted_bytes = 0usize;
     for (pts, nalus, is_key) in frames {
         // The picture that comes out of this call, if one does, is the next
         // one in display order — not the one that went in. On a source with
@@ -852,7 +868,13 @@ fn reencode_all_intra(
         // call so the encoder is stamped with it too.
         let label = labels.get(out.len()).copied().unwrap_or(*pts);
         match enc.encode_frame(nalus, label, *is_key, src_codec) {
-            Ok(Some(f)) => out.push((label, f.nalus, true)),
+            Ok(Some(f)) => {
+                emitted_bytes += f.nalus.iter().map(Vec::len).sum::<usize>();
+                if emitted_bytes > budget_bytes {
+                    return Err(EssenceOverCap.into());
+                }
+                out.push((label, f.nalus, true));
+            }
             // Buffered. The encoder will hand it back later, or on flush.
             Ok(None) => {}
             // One bad frame is not worth losing the clip over — a dropped
@@ -876,6 +898,10 @@ fn reencode_all_intra(
     let step = median_step(&out).unwrap_or(3600);
     let mut next = out.last().map(|f| f.0 + step).unwrap_or(0);
     for f in enc.flush()? {
+        emitted_bytes += f.nalus.iter().map(Vec::len).sum::<usize>();
+        if emitted_bytes > budget_bytes {
+            return Err(EssenceOverCap.into());
+        }
         out.push((next, f.nalus, true));
         next += step;
     }
@@ -912,9 +938,26 @@ fn reencode_all_intra(
     _frames: &[(u64, Vec<Vec<u8>>, bool)],
     _source: &VideoTrack,
     _demux: &TsDemuxer,
+    _budget_bytes: usize,
 ) -> Result<(Vec<(u64, Vec<Vec<u8>>, bool)>, VideoTrack)> {
     bail!("this build has no encoder")
 }
+
+/// The re-encode passed the bytes the file may hold.
+///
+/// A type rather than a string, so the caller can tell it from an encoder
+/// failure without matching on prose — the two have opposite answers: a
+/// failed encode falls back to the source GOP, an over-cap one is refused.
+#[derive(Debug)]
+struct EssenceOverCap;
+
+impl std::fmt::Display for EssenceOverCap {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "the all-intra re-encode passed the {MP4_EXPORT_MAX_BYTES} byte cap")
+    }
+}
+
+impl std::error::Error for EssenceOverCap {}
 
 /// The timestamps a decoder's output will carry, in the order it emits them.
 ///

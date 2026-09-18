@@ -152,7 +152,7 @@ and seeds its window from those rows, each keeping its own
   ones that have already aged out. Dropping the tags asserted one continuous
   timeline across a real re-anchor whose post-jump dates *were* restored;
   resetting the count to zero made the discontinuity sequence go backwards on a
-  playlist whose media sequence carried on normally, which RFC 8216 §6.3.3 makes
+  playlist whose media sequence carried on normally, which RFC 8216 makes
   an incompatible playlist change.
 * **The init has to still describe the restored rows.** `init.mp4` is one fixed
   object and the new run overwrites it with *its* track list, sample entries and
@@ -165,7 +165,7 @@ and seeds its window from those rows, each keeping its own
   the wire, nothing wrong in the manifest, no error anywhere (#130).
 
   So each manifest carries a private `#EXT-X-BILBYCAST-INIT:<hash>` naming the
-  init it was published under — a tag players must ignore per RFC 8216 §4.1, and
+  init it was published under — a tag players must ignore (RFC 8216 requires a client to skip any tag it does not recognise), and
   one the relay origin copies through untouched. On a mismatch the restored rows
   are **dropped** and a Warning event names how many: a short window beats an
   hour of history that stalls the player. The sequence number is kept either

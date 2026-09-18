@@ -83,10 +83,11 @@ section.)
 | `src/replay/filmstrip.rs` | Opt-in JPEG thumbnail subscriber; `thumbs/` writer + `.tmp/` orphan scan; `list_frames` / `read_frame` |
 | `src/replay/recordings.rs` | On-disk recording enumeration for the Recordings library (including orphans with no live flow) |
 | `src/replay/export.rs` | MPEG-TS clip / recording export |
-| `src/replay/export_mp4.rs` | TS→fMP4 export (`replay_export_mp4` capability) |
+| `src/replay/export_mp4.rs` | TS→progressive MP4 export, all-intra re-encode (`replay_export_mp4` capability) |
+| `src/replay/clock.rs` | The one wall-clock ↔ PTS mapping the writer and the clip exporter share |
 | `src/engine/input_replay.rs` | Replay input task; per-input command channel; lifecycle events |
 | `src/engine/flow.rs` | `FlowRuntime.recording_handle` lifecycle; spawn/teardown |
-| `src/manager/client.rs` (replay dispatch arms, `start_recording` through the `cue_clip \| play_clip \| stop_playback \| scrub_playback \| set_speed \| step_frame` arm) | WS command dispatch — 18 arms covering 23 command names, all `#[cfg(feature = "replay")]`-gated |
+| `src/manager/client.rs` (replay dispatch arms, `configure_recording` through the `cue_clip \| play_clip \| stop_playback \| scrub_playback \| set_speed \| step_frame` arm) | WS command dispatch — 18 arms covering 23 command names, all `#[cfg(feature = "replay")]`-gated |
 
 ## Storage layout
 

@@ -261,7 +261,7 @@ unit file:
 | `tuning.probe_4k` | `BILBYCAST_PROBE_4K` | Deprecated — read below the config field |
 | `tuning.media_player_controller` | `BILBYCAST_MEDIA_PLAYER_CONTROLLER` | Deprecated — read below the config field |
 | `tuning.media_player_pcr_deadlines` | `BILBYCAST_MEDIA_PLAYER_PCR_DEADLINES` | Deprecated — read below the config field |
-| `tuning.heap_trim_secs` | *(none — new)* | No env var ever existed; it arrived as a config field, which is where a behaviour knob belongs |
+| `tuning.heap_trim_secs` | *(none — new)* | No env var ever existed; it arrived as a config field, which is where a behaviour knob belongs. **Not yet on the Tuning tab**: set it in `config.json` (or the manager's raw config editor). The tab carries it across a Save untouched — it used to rebuild the block from its own fields and silently dropped it |
 | *(none — deliberately)* | `BILBYCAST_MEDIA_PLAYER_INCREMENTAL_MP4` | **Removed** — its "off" position selected the whole-file MP4 demux, which holds an entire asset resident; that OOM is what the bounded reader fixed, so it was withdrawn rather than migrated. Debug builds only |
 
 On the edge the **config field wins** and a deprecated variable is the
