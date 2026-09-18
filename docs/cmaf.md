@@ -710,6 +710,113 @@ the real world — hls.js zeroes its timeline at whichever fragment it happened 
 load first, so `currentTime` means nothing across sessions. The scrub-preview
 index below depends on it, and so does any "what time was that?" surface.
 
+## Why the proxy rendition is encoded in software
+
+The DVR proxy is `x264`, on the CPU, even on a host with a working NVENC. That
+is a deliberate choice and it has been measured; this section exists so it is
+not "fixed" by somebody reading the CPU graph.
+
+### NVENC cannot express all-intra directly
+
+This is not a new finding: `manager-core`'s `dvr_provision.rs` already keeps an
+`ALL_INTRA_CAPABLE` allowlist of `h264_vaapi` and `h264_rkmpp`, with the note
+that *"NVENC's absence is the load-bearing one: it is the encoder a
+well-specified node is most likely to have, and picking it would break the
+feature on exactly the hardware an operator would expect to work best."* What
+follows is the edge-side confirmation and the numbers behind the trade, so the
+same question does not get re-opened from scratch on this side of the wire.
+
+The proxy must be all-intra — that is the whole reason it exists, so a jog
+lands on a frame without decoding from a keyframe. `gop_size: 1` is how that is
+asked for, and **NVENC refuses it**:
+
+```
+[h264_nvenc] InitializeEncoder failed: invalid param (8):
+             Gop Length should be greater than number of B frames + 1
+```
+
+With `bf = 0` the check still demands `gop >= 2`, so there is no GOP setting
+that yields every-frame-intra. It is reachable only by forcing an IDR on each
+frame — `VideoEncoder::force_next_keyframe` does exactly that, and NVENC
+honours `AVFrame.pict_type = AV_PICTURE_TYPE_I` — but that is encoder-level
+work plus per-backend GOP sanitising, not a config change. Anything that
+silently accepted `gop_size: 1` on NVENC and produced a long-GOP stream would
+give a rendition that plays perfectly and cannot be jogged, which is the
+failure the manager's DVR page carries a badge for.
+
+### The encode is not where the cost is
+
+Measured on the z440 (Xeon E5-1650 v3, GTX 1080 Ti), 30 s of 1080p25 scaled to
+640x360:
+
+| pipeline | CPU |
+|---|---|
+| decode + scale only | 9.42 s |
+| decode + scale + x264 all-intra | 12.93 s |
+| decode + scale + NVENC forced-IDR | 10.06 s |
+| NVDEC + `scale_cuda` + NVENC | **0.39 s** |
+
+So the encode is **3.51 s of 12.93 s** — about a quarter. Moving only it to the
+GPU saves ~2.9 s per 30 s, roughly a tenth of one core. The decode and scale are
+the other three quarters, and they are what a GPU pipeline actually collapses:
+33x for the whole chain.
+
+### And it costs bitrate
+
+At the same 3000 kbps target, NVENC all-intra produced **1.10 MB** where x264
+produced **0.72 MB** for identical content — 53% larger. The proxy is what
+`balanced` mode streams and what a tablet pulls, and it has to stay readable
+frame by frame, so quality per bit is not a spare resource here.
+
+### The decode is the part worth moving, and only if it stays on the GPU
+
+Measured on real SDI content — a 10 s recorded segment of the live 1080p25
+feed, not a synthetic pattern — scaled to 640x360 and encoded all-intra:
+
+| pipeline | CPU | vs software |
+|---|---|---|
+| all software | 6.06 s | — |
+| **NVDEC decode, CPU scale, x264** | **2.96 s** | **-51%** |
+| NVDEC decode, `scale_cuda`, download, x264 | 7.61 s | **+26%** |
+| full GPU: NVDEC, `scale_cuda`, NVENC | 0.66 s | -89% |
+
+Two things to take from that.
+
+**The obvious middle path is a pessimisation.** Decoding and scaling on the
+GPU and then encoding on the CPU is *worse than doing nothing at all*, because
+the frames have to be pulled back across PCIe and that download costs more
+than the scale saves. A GPU pipeline is only cheap while the frames never
+leave the GPU.
+
+**NVDEC alone is the good trade.** Letting the hardware decode and handing
+frames straight back for a software scale and x264 encode halves the CPU while
+keeping everything x264 gives us: native all-intra with `gop_size: 1`, and the
+bitrate efficiency the proxy needs. It costs none of the NVENC compromises
+above.
+
+The full GPU chain is cheaper again, but it buys the last 38 points by taking
+on the forced-IDR work, the 53% bitrate penalty, and a hard dependency on the
+NVIDIA stack for a rendition that is meant to be the *reliable* one.
+
+**Whatever is done here needs a runtime fallback, not a probe.** On 2026-09-15
+a driver/userspace mismatch on the z440 left the capability probe cheerfully
+reporting `nvenc encoder 1080p session capacity probed: 8` while every real
+`OpenEncodeSessionEx` failed. A design that trusts the probe would have
+produced a DVR that silently stopped working. `output_display`'s
+`open_video_decoder_with_retry` (retry, then demote to `Cpu`) and
+`st2110_video_io`'s "HW decoder open failed — falling back to threaded
+software decode" are the patterns to copy; the CMAF path has neither, and no
+decode-side equivalent of the encoder's `["h264_nvenc", "x264"]` chain exists.
+
+### Where that leaves it
+
+Moving the encode alone is not worth a tenth of a core against 53% more
+bitrate, encoder-level work, and a hard dependency on a GPU driver. A full GPU
+pipeline — NVDEC decode, CUDA scale, NVENC encode — is worth considering,
+because the decode is the real cost; it needs `hw_decode` plumbing that the
+CMAF path does not currently have at all, and it would tie the DVR to the
+NVIDIA stack on every host that runs one.
+
 ## Thumbnail track (`thumbnails`)
 
 Sprite sheets plus a WebVTT index, PUT to the same ingest as the media so they
