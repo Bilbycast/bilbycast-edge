@@ -4713,7 +4713,15 @@ async fn execute_command(
             let flow_id = action["flow_id"]
                 .as_str()
                 .ok_or("configure_recording: missing 'flow_id'")?;
-            let incoming = action["recording"].clone();
+            // The key has to be there. `action["recording"]` reads an absent
+            // key as `Null`, and null means "clear the recorder" — so a
+            // malformed command that simply forgot the field disarmed a live
+            // recorder and restarted the flow to do it.
+            let Some(incoming) = action.get("recording").cloned() else {
+                return Err(CommandError::new(
+                    "configure_recording: missing 'recording' (send null to clear)",
+                ));
+            };
             let armed = !incoming.is_null();
             let was_running = flow_manager.is_running(flow_id);
             let changed;

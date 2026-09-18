@@ -20,12 +20,17 @@
 //! by construction — a job stays pending until its media exists, so a crash
 //! mid-cut simply means it is picked up again.
 //!
-//! **What "covering" means today.** The clip is assembled from whole segments:
-//! the init segment followed by every segment that overlaps the window. The
-//! out-point is therefore up to one segment late and the in-point up to one
-//! segment early. Trimming to the exact frame needs the leading GOP
-//! re-encoded — the passthrough rendition only carries a keyframe every two
-//! seconds — which is a separate piece of work on top of this one.
+//! **Two ways to cut.** The primary path cuts *exactly*, from the flow's own
+//! Replay recording: the mark's wall-clock dates are mapped to PTS through
+//! the recording's anchor and measured rate (`replay::clock`), the covering
+//! range is read from the recording, decoded, re-encoded all-intra and muxed
+//! as a progressive MP4 (`replay::export_mp4`). When there is no recording to
+//! cut from — no recorder on the flow, a recording made before the anchor
+//! existed, or a moment the recording has since aged out of — the clip is
+//! assembled from whole segments instead: the init segment followed by every
+//! segment that overlaps the window, so the out-point is up to one segment
+//! late and the in-point up to one segment early. A coarser clip, not a
+//! broken one.
 
 use std::time::Duration;
 
@@ -322,10 +327,14 @@ async fn http_get(url: &str, auth: Option<&str>) -> Result<Vec<u8>> {
 /// this flow, or one made before the wall-clock anchor existed — so the caller
 /// can fall back to whole segments rather than fail.
 ///
-/// The mapping is the anchor written on the recording's first indexed frame:
-/// `pts = anchor_pts + (wall - anchor_wall) * 90_000`. Measured on the rig at
-/// -36ms against the CMAF published dates, inside one frame at 25fps, where
-/// `created_at_unix` was out by anywhere from half a second to nineteen.
+/// The mapping is the recording's own line through the anchor written on its
+/// first indexed frame and the rolling sample the writer re-takes every minute
+/// — the measured rate when the span is long enough to trust, the nominal
+/// 90 kHz otherwise; see `replay::clock`. The one-point nominal form was
+/// measured on the rig at -36 ms against the CMAF published dates, inside one
+/// frame at 25 fps, where `created_at_unix` was out by anywhere from half a
+/// second to nineteen — and drifted by the source's clock offset times the age
+/// of the recording, which the second point removes.
 #[cfg(feature = "replay")]
 async fn cut_exact(
     flow_id: &str,

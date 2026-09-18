@@ -199,9 +199,10 @@ impl InMemoryIndex {
         // scrub or a clip export against such a file gets an arbitrary entry,
         // which reads as the wrong media or a segment that no longer exists.
         //
-        // The scan is O(n) on a file that is microseconds to read either way
-        // (24 bytes per IDR, ~1 MB a day), and it is only reached on data the
-        // binary search has no defined answer for.
+        // Both the order check and the scan are O(n), on a file that is
+        // microseconds to read either way (24 bytes per IDR, ~1 MB a day);
+        // the scan itself is only reached on data the binary search has no
+        // defined answer for.
         if !self.is_sorted() {
             return self.find_floor_linear(target_pts);
         }
