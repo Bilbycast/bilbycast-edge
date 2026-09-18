@@ -854,7 +854,8 @@ struct CencRuntime {
 /// this wrong is a shorter window, and the cost of failing here is no output
 /// at all.
 ///
-/// Returns the restored rows and the sequence number to carry on from.
+/// Returns what the origin's playlist said — see [`RestoredWindow`] for the
+/// four things it carries.
 async fn restore_published_window(
     base: &str,
     auth: Option<&str>,
@@ -886,8 +887,11 @@ async fn restore_published_window(
             // an empty one, and the run will renumber from seg-00000 over
             // segments the origin still holds and still serves.
             Ok(Err(e)) => {
+                // "HTTP 404", not a bare "404": the message carries the
+                // manifest's URL, and a stream or host with 404 in its name
+                // would otherwise silence every real failure.
                 let msg = format!("{e:#}");
-                if !msg.contains("404") {
+                if !msg.contains("returned HTTP 404") {
                     tracing::warn!(
                         origin = %base, error = %msg,
                         "CMAF output: could not read back the window this stream was \
@@ -975,14 +979,23 @@ fn stamp_init_fingerprint(body: String, fingerprint: Option<&str>) -> String {
 
 /// The longest `#EXTINF` this parser will accept, in seconds.
 ///
-/// Validation bounds a configured segment duration to 1..=10 s, so anything
-/// past this is not a segment of ours. Rows are copied back out verbatim, so an
-/// unbounded or non-finite value would be republished as-is — `NaN` parses
-/// happily and prints back as `#EXTINF:NaN,`, which every player rejects, for
-/// the whole window until it slides out.
-const MAX_RESTORED_EXTINF_SECS: f64 = 60.0;
+/// Validation bounds a configured segment duration to 1..=10 s, but the
+/// segmenter cuts on the first IDR at or past the target, so a long-GOP
+/// contribution encoder can legitimately produce rows several times that. Ten
+/// minutes is past anything a real source does and still refuses what a
+/// hand-written or corrupt manifest could carry: rows are copied back out
+/// verbatim, so an unbounded or non-finite value would be republished as-is —
+/// `NaN` parses happily and prints back as `#EXTINF:NaN,`, which every player
+/// rejects, for the whole window until it slides out.
+const MAX_RESTORED_EXTINF_SECS: f64 = 600.0;
 
 /// The rows of a served media playlist, and what to carry on from.
+///
+/// `None` only when the playlist names no segment at all — a fresh stream. A
+/// playlist whose every row is unusable still yields a window, an empty one,
+/// carrying the number to continue from: the numbering is protected by every
+/// `seg-N` the origin advertises, usable row or not, because a run that
+/// restarted at zero would overwrite segments the origin still serves.
 fn parse_published_window(text: &str, limit: usize) -> Option<RestoredWindow> {
     let mut rows: Vec<M3u8Entry> = Vec::new();
     let mut pdt: Option<chrono::DateTime<chrono::Utc>> = None;
@@ -990,6 +1003,14 @@ fn parse_published_window(text: &str, limit: usize) -> Option<RestoredWindow> {
     let mut pending_discontinuity = false;
     let mut discontinuity_sequence = 0u64;
     let mut init_fingerprint: Option<String> = None;
+    // The highest segment number the origin advertises, usable or not.
+    let mut max_seq: Option<u64> = None;
+    // Whether `#EXT-X-PART` lines followed the last row. A low-latency
+    // playlist writes the segment still being uploaded exactly like a closed
+    // one and hangs its parts beneath it; if the previous run died mid-PUT
+    // that segment was never stored, so restoring the row advertises a 404
+    // in the middle of the window for as long as the window lasts.
+    let mut last_row_open = false;
     for line in text.lines() {
         let line = line.trim();
         if let Some(rest) = line.strip_prefix(INIT_FINGERPRINT_TAG) {
@@ -1024,6 +1045,8 @@ fn parse_published_window(text: &str, limit: usize) -> Option<RestoredWindow> {
             // join decodes across it with no reset, and one who reloads sees a
             // tag vanish from rows it had already parsed.
             pending_discontinuity = true;
+        } else if line.starts_with("#EXT-X-PART:") {
+            last_row_open = true;
         } else if !line.is_empty() && !line.starts_with('#') {
             // The origin rewrites URIs to carry a viewer token; the name is
             // the part that matters, and the sequence number is in it.
@@ -1034,6 +1057,9 @@ fn parse_published_window(text: &str, limit: usize) -> Option<RestoredWindow> {
                 .and_then(|n| n.strip_prefix("seg-"))
                 .and_then(|n| n.split('.').next())
                 .and_then(|n| n.parse::<u64>().ok());
+            if let Some(seq) = seq {
+                max_seq = max_seq.max(Some(seq));
+            }
             if let (Some(seq), Some(d)) = (seq, dur) {
                 rows.push(M3u8Entry {
                     sequence_number: seq,
@@ -1044,25 +1070,32 @@ fn parse_published_window(text: &str, limit: usize) -> Option<RestoredWindow> {
                     discontinuity: pending_discontinuity,
                 });
                 pending_discontinuity = false;
+                last_row_open = false;
             }
             pdt = None;
             dur = None;
         }
     }
-    if rows.is_empty() {
-        return None;
+    // `checked_add`, because the release profile sets no overflow checks: a row
+    // named `seg-18446744073709551615.m4s` would otherwise wrap `next_seq` to 0.
+    // With no answer there is no number to carry on from, and no window either
+    // — a manifest this edge could not have written is not one to trust.
+    let next_seq = max_seq?.checked_add(1)?;
+    if last_row_open {
+        // The number is kept — `max_seq` counted it — so the segment the
+        // previous run was uploading is neither advertised nor reused.
+        rows.pop();
     }
     // Never restore more than this output is configured to advertise, or the
     // first trim would drop most of it anyway and the manifest would briefly
-    // claim a window the retention policy does not keep.
+    // claim a window the retention policy does not keep. Counted the way
+    // `trim_playlist` counts: a tagged row that leaves the window advances the
+    // discontinuity sequence, or a player that loaded the served playlist sees
+    // its count go backwards on the next fetch.
     if rows.len() > limit {
-        rows.drain(..rows.len() - limit);
+        let excess = rows.len() - limit;
+        discontinuity_sequence += rows.drain(..excess).filter(|r| r.discontinuity).count() as u64;
     }
-    // `checked_add`, because the release profile sets no overflow checks: a row
-    // named `seg-18446744073709551615.m4s` would otherwise wrap `next_seq` to 0
-    // and the run would renumber from `seg-00000` over the very segments it had
-    // just restored — the destructive behaviour this restore exists to remove.
-    let next_seq = rows.iter().map(|r| r.sequence_number).max().unwrap_or(0).checked_add(1)?;
     Some(RestoredWindow {
         rows: rows.into_iter().collect(),
         next_seq,
@@ -1174,6 +1207,36 @@ impl CmafState {
                 None => break,
             }
         }
+    }
+
+    /// Does this run's init describe the rows restored from the origin? If not,
+    /// drop them — and only them.
+    ///
+    /// Restored rows are exactly the ones numbered below `resume_seq`. The
+    /// first version cleared the whole playlist, which also took this run's
+    /// own first segment when it had closed before the fingerprint could be
+    /// compared — the audio-detection grace is three seconds and a segment is
+    /// two — and with it the one row carrying `#EXT-X-DISCONTINUITY` for the
+    /// join. A viewer live across the restart then saw the media sequence jump
+    /// with no discontinuity and a new timeline underneath it, which is the
+    /// stall this check exists to prevent, and the uploaded segment sat on the
+    /// origin advertised by nothing.
+    ///
+    /// Returns how many rows went. `Some(0)` is a match; `None` is nothing to
+    /// compare against — no fingerprint was restored, or the playlist is empty.
+    fn reconcile_restored_init(&mut self, fingerprint: &str) -> Option<usize> {
+        let prev = self.restored_init_fingerprint.take()?;
+        if prev == fingerprint || self.playlist.is_empty() {
+            return Some(0);
+        }
+        let mut dropped = 0usize;
+        while self.playlist.front().is_some_and(|r| r.sequence_number < self.resume_seq) {
+            if self.playlist.pop_front().is_some_and(|r| r.discontinuity) {
+                self.discontinuities_trimmed += 1;
+            }
+            dropped += 1;
+        }
+        Some(dropped)
     }
 }
 
@@ -2509,14 +2572,11 @@ async fn publish_init_if_due(
     // sequence number is kept, because renumbering would overwrite segments the
     // origin still holds.
     let fingerprint = init_fingerprint(&init_bytes);
-    if let Some(prev) = state.restored_init_fingerprint.take()
-        && prev != fingerprint
-        && !state.playlist.is_empty()
+    if let Some(dropped) = state.reconcile_restored_init(&fingerprint)
+        && dropped > 0
     {
-        let dropped = state.playlist.len();
-        state.playlist.clear();
         tracing::warn!(
-            output = %config.id, dropped, was = %prev, now = %fingerprint,
+            output = %config.id, dropped, now = %fingerprint,
             "CMAF output: this run's init does not describe the window the origin \
              was serving; dropping the restored history rather than advertising \
              segments it cannot decode"
@@ -3316,6 +3376,121 @@ seg-00042.m4s?token=abc
         assert_eq!(stamp_init_fingerprint(plain.to_string(), None), plain);
     }
 
+    /// A low-latency playlist's open segment is not restored as a closed one.
+    ///
+    /// The LL writer lists the segment still being uploaded exactly like a
+    /// finished one and hangs its `#EXT-X-PART` rows beneath it. If the
+    /// previous run died mid-PUT the origin never stored that segment, so
+    /// restoring the row advertised a 404 in the middle of the window for as
+    /// long as the window lasted — and the origin's head trim cannot reach it,
+    /// because it stops at the first row that is backed. The number is still
+    /// kept, so the new run does not reuse it either.
+    #[test]
+    fn a_low_latency_playlists_open_segment_is_not_restored() {
+        let m3u8 = concat!(
+            "#EXTM3U\n#EXT-X-VERSION:9\n#EXT-X-TARGETDURATION:2\n",
+            "#EXT-X-MAP:URI=\"init.mp4\"\n",
+            "#EXT-X-PROGRAM-DATE-TIME:2026-09-08T10:00:00.000Z\n#EXTINF:2.000,\nseg-00040.m4s\n",
+            "#EXT-X-PROGRAM-DATE-TIME:2026-09-08T10:00:02.000Z\n#EXTINF:2.000,\nseg-00041.m4s\n",
+            "#EXT-X-PART:DURATION=0.500,URI=\"seg-00041.m4s?part=0\"\n",
+            "#EXT-X-PART:DURATION=0.500,URI=\"seg-00041.m4s?part=1\"\n",
+        );
+        let restored = parse_published_window(m3u8, 100).expect("a window");
+        assert_eq!(restored.rows.len(), 1, "the open segment was restored as closed");
+        assert_eq!(restored.rows[0].sequence_number, 40);
+        assert_eq!(restored.next_seq, 42, "the interrupted segment's number must not be reused");
+    }
+
+    /// Numbering is protected by every segment the origin advertises, usable
+    /// row or not; and trimming the restored window to its limit counts the
+    /// discontinuities it drops.
+    ///
+    /// A window whose every row was unusable used to restore nothing at all,
+    /// which left `resume_seq` at zero — and the new run then renumbered from
+    /// `seg-00000` over segments the origin still served, the destructive
+    /// outcome the restore exists to prevent.
+    #[test]
+    fn an_unusable_window_still_protects_the_numbering() {
+        let unusable = concat!(
+            "#EXTM3U\n",
+            "#EXT-X-PROGRAM-DATE-TIME:2026-09-08T10:00:00.000Z\n#EXTINF:NaN,\nseg-00040.m4s\n",
+            "#EXT-X-PROGRAM-DATE-TIME:2026-09-08T10:00:02.000Z\n#EXTINF:inf,\nseg-00041.m4s\n",
+        );
+        let restored = parse_published_window(unusable, 100).expect("a number to carry on from");
+        assert!(restored.rows.is_empty(), "an unusable row became a row anyway");
+        assert_eq!(restored.next_seq, 42);
+
+        // A long-GOP source can legitimately close a segment well past the
+        // configured target; a row like that is ours and is kept.
+        let long_gop = concat!(
+            "#EXTM3U\n",
+            "#EXT-X-PROGRAM-DATE-TIME:2026-09-08T10:00:00.000Z\n#EXTINF:75.000,\nseg-00040.m4s\n",
+        );
+        assert_eq!(parse_published_window(long_gop, 100).expect("a window").rows.len(), 1);
+
+        // Trimming to the limit advances the discontinuity sequence by every
+        // tagged row it drops, exactly as `trim_playlist` would.
+        let tagged = concat!(
+            "#EXTM3U\n#EXT-X-DISCONTINUITY-SEQUENCE:3\n",
+            "#EXTINF:2.000,\nseg-00040.m4s\n",
+            "#EXT-X-DISCONTINUITY\n#EXTINF:2.000,\nseg-00041.m4s\n",
+            "#EXTINF:2.000,\nseg-00042.m4s\n",
+            "#EXTINF:2.000,\nseg-00043.m4s\n",
+        );
+        let restored = parse_published_window(tagged, 2).expect("a window");
+        assert_eq!(restored.rows.len(), 2);
+        assert_eq!(restored.rows[0].sequence_number, 42);
+        assert_eq!(restored.discontinuity_sequence, 4, "the dropped tag was not counted");
+    }
+
+    /// An init mismatch drops the restored rows and only the restored rows.
+    ///
+    /// The first version cleared the whole playlist. This run's own first
+    /// segment can close before the fingerprint is compared — the
+    /// audio-detection grace is three seconds and a segment is two — and it
+    /// is the row that carries `#EXT-X-DISCONTINUITY` for the join. Clearing
+    /// it left a viewer live across the restart with a media sequence that
+    /// jumped, no discontinuity, and a new timeline underneath: the stall the
+    /// check exists to prevent, plus a segment on the origin advertised by
+    /// nothing.
+    #[test]
+    fn an_init_mismatch_drops_only_the_restored_rows() {
+        let row = |seq: u64, discontinuity: bool| M3u8Entry {
+            sequence_number: seq,
+            duration_secs: 2.0,
+            uri: None,
+            parts: Vec::new(),
+            program_date_time: None,
+            discontinuity,
+        };
+        let mut state = CmafState::new();
+        state.playlist = [row(40, false), row(41, true), row(42, false), row(43, true)]
+            .into_iter()
+            .collect();
+        state.resume_seq = 43;
+        state.discontinuities_trimmed = 3;
+        state.restored_init_fingerprint = Some("old".into());
+
+        assert_eq!(state.reconcile_restored_init("new"), Some(3));
+        let left: Vec<u64> = state.playlist.iter().map(|r| r.sequence_number).collect();
+        assert_eq!(left, vec![43], "this run's own row must survive");
+        assert!(state.playlist[0].discontinuity, "and keep its join tag");
+        assert_eq!(state.discontinuities_trimmed, 4, "the restored tag that left was not counted");
+        // Compared once: the fingerprint is consumed.
+        assert_eq!(state.reconcile_restored_init("new"), None);
+
+        // A match drops nothing.
+        let mut same = CmafState::new();
+        same.playlist = [row(40, false)].into_iter().collect();
+        same.resume_seq = 41;
+        same.restored_init_fingerprint = Some("fp".into());
+        assert_eq!(same.reconcile_restored_init("fp"), Some(0));
+        assert_eq!(same.playlist.len(), 1);
+
+        // Nothing restored, nothing to say.
+        assert_eq!(CmafState::new().reconcile_restored_init("fp"), None);
+    }
+
     /// A row the edge could not have written is not copied back out.
     ///
     /// Restored rows are republished verbatim, so `#EXTINF:NaN,` — which
@@ -3330,21 +3505,23 @@ seg-00042.m4s?token=abc
             "#EXTM3U\n",
             "#EXT-X-PROGRAM-DATE-TIME:2026-09-08T10:00:00.000Z\n#EXTINF:NaN,\nseg-00040.m4s\n",
             "#EXT-X-PROGRAM-DATE-TIME:2026-09-08T10:00:02.000Z\n#EXTINF:inf,\nseg-00041.m4s\n",
-            "#EXT-X-PROGRAM-DATE-TIME:2026-09-08T10:00:04.000Z\n#EXTINF:600.0,\nseg-00042.m4s\n",
+            "#EXT-X-PROGRAM-DATE-TIME:2026-09-08T10:00:04.000Z\n#EXTINF:6000.0,\nseg-00042.m4s\n",
             "#EXT-X-PROGRAM-DATE-TIME:2026-09-08T10:00:06.000Z\n#EXTINF:2.000,\nseg-00043.m4s\n",
         );
         let restored = parse_published_window(poisoned, 100).expect("one good row");
         assert_eq!(restored.rows.len(), 1, "an unusable duration became a row anyway");
         assert_eq!(restored.rows[0].sequence_number, 43);
 
-        // `u64::MAX + 1` has no answer, so there is no window to restore.
+        // `u64::MAX + 1` has no answer: a number this edge could not have
+        // written, so nothing of the manifest is trusted and the run starts
+        // fresh rather than carrying on from a wrapped zero.
         let overflowing = concat!(
             "#EXTM3U\n#EXT-X-PROGRAM-DATE-TIME:2026-09-08T10:00:00.000Z\n#EXTINF:2.000,\n",
             "seg-18446744073709551615.m4s\n",
         );
         assert!(
             parse_published_window(overflowing, 100).is_none(),
-            "the sequence wrapped and the run would renumber from zero"
+            "a sequence number that cannot be continued was restored anyway"
         );
     }
 
