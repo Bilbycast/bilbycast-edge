@@ -72,16 +72,32 @@ const MAX_ATTEMPTS: u32 = 3;
 ///
 /// 404 is the bilbycast relay that predates clip export answering its own
 /// not-found; 400 is an older relay whose object handler rejects `clips` for
-/// having no file extension; 403 is an S3-style store without ListBucket; 405
-/// is a CDN ingest that accepts PUT and nothing else.
-const NOT_A_CLIP_ORIGIN: [u16; 4] = [400, 403, 404, 405];
+/// having no file extension; 405 is a CDN ingest that accepts PUT and nothing
+/// else. **Not 403.** On the bilbycast relay a 403 is a bearer it rejected —
+/// this edge's `auth_token` no longer matching the relay's secret — and with
+/// segment PUTs still landing nothing else about the session is loud, so
+/// treating it as "not a clip origin" abandoned the queue in thirty seconds,
+/// silently, in the one case a fix on the manager side would have cured. It
+/// takes the fault branch below instead, which warns, raises the event and
+/// keeps asking.
+const NOT_A_CLIP_ORIGIN: [u16; 3] = [400, 404, 405];
 
-/// How many consecutive such answers before the poller stops asking.
+/// How many consecutive such answers before the poller backs off.
 ///
 /// Not one: a relay restarting can answer 404 for a poll or two. Six is half a
 /// minute at the poll interval, which no restart outlasts, and after that the
-/// endpoint is simply not one that serves clips.
+/// endpoint is simply not one that serves clips — until it is upgraded, so the
+/// poller does not stop, it slows to [`UNSUPPORTED_POLL_INTERVAL`].
 const UNSUPPORTED_GIVE_UP: u32 = 6;
+
+/// How often an origin that does not serve clips is asked again.
+///
+/// Asking a third-party packager every five seconds for the life of the flow
+/// is somebody else's traffic; asking it never means a relay upgraded
+/// mid-session is not noticed until the flow restarts. Once every five
+/// minutes is 288 requests a day, and a queue picked up within five minutes of
+/// the upgrade.
+const UNSUPPORTED_POLL_INTERVAL: Duration = Duration::from_secs(300);
 
 /// Does this failure have any prospect of coming good?
 ///
@@ -616,12 +632,17 @@ pub async fn run(
     tracing::info!(origin = %base, "clip exporter: watching for clip requests");
 
     loop {
+        let interval = if unsupported >= UNSUPPORTED_GIVE_UP {
+            UNSUPPORTED_POLL_INTERVAL
+        } else {
+            POLL_INTERVAL
+        };
         tokio::select! {
             _ = cancel.cancelled() => {
                 tracing::info!(origin = %base, "clip exporter stopping (cancelled)");
                 return;
             }
-            _ = tokio::time::sleep(POLL_INTERVAL) => {}
+            _ = tokio::time::sleep(interval) => {}
         }
 
         let listing = match http_get(&format!("{base}/clips"), auth).await {
@@ -643,25 +664,47 @@ pub async fn run(
                 // name validator wants a dot, and replies 400; S3 without
                 // ListBucket replies 403.
                 //
-                // So a run of those gives up and says so once, while anything
-                // else stays a transient fault and keeps polling. Swallowing
-                // the lot was the original sin here — it hid a 403 on every
-                // single poll while the log looked perfectly healthy.
+                // So a run of those backs off to a slow poll and says so once
+                // — in the log and on the Events page, because a DVR session
+                // pointed at such an origin will never cut a clip and nothing
+                // else would say why — while anything else stays a transient
+                // fault and keeps polling. Swallowing the lot was the original
+                // sin here — it hid a 403 on every single poll while the log
+                // looked perfectly healthy.
                 let msg = format!("{e:#}");
                 if NOT_A_CLIP_ORIGIN
                     .iter()
                     .any(|code| msg.contains(&format!("HTTP {code}")))
                 {
-                    unsupported += 1;
-                    if unsupported >= UNSUPPORTED_GIVE_UP {
-                        tracing::info!(
+                    unsupported = unsupported.saturating_add(1);
+                    if unsupported == UNSUPPORTED_GIVE_UP {
+                        tracing::warn!(
                             origin = %base, error = %msg,
-                            "clip exporter: this origin does not serve clips; not asking again"
+                            "clip exporter: this origin does not serve clips; asking every \
+                             five minutes from now on"
                         );
-                        return;
+                        event_sender.emit_flow_with_details(
+                            EventSeverity::Warning,
+                            category::CMAF,
+                            format!(
+                                "Clip export unsupported on flow '{flow_id}': the origin \
+                                 does not serve a clip queue, so no marked clip will be cut"
+                            ),
+                            &flow_id,
+                            serde_json::json!({
+                                "error_code": "clip_export_unsupported",
+                                "origin": base,
+                                "error": msg,
+                                "consecutive": unsupported,
+                            }),
+                        );
                     }
                     continue;
                 }
+                // Anything else breaks the run: the counter is of consecutive
+                // not-a-clip-origin answers, and a relay that flaps between
+                // 404 and 503 while it restarts is not one that has settled.
+                unsupported = 0;
                 if !quiet {
                     tracing::warn!(
                         origin = %base, error = %msg,
