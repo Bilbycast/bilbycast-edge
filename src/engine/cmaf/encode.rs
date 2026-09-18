@@ -17,9 +17,8 @@
 //!
 //! Source H.264/HEVC access unit → Annex-B framing → `VideoDecoder`
 //! → `VideoEncoder` (x264 / x265 / NVENC, feature-gated) → target
-//! H.264/HEVC NAL units. GoP alignment is forced to
-//! `segment_duration_secs * fps` so CMAF segment boundaries always
-//! land on an IDR.
+//! H.264/HEVC NAL units. The operator's `gop_size` is honoured (60 when
+//! unset); CMAF segment boundaries land on that GOP's IDRs.
 
 use std::sync::Arc;
 
@@ -56,7 +55,24 @@ pub struct AudioReencoder {
     /// so silent AAC frames can start flowing before any source
     /// audio arrives.
     silence: Option<SilenceGenerator>,
+    /// Whether the silence generator has been placed on the media timeline.
+    /// It is built before any media exists and seeded at zero; the first
+    /// emission seeds it from the anchor the caller supplies.
+    silence_seeded: bool,
+    /// The PTS of the last source frame submitted, to notice a jump.
+    last_source_pts: Option<u64>,
 }
+
+/// How far the source PTS may move between consecutive frames before the
+/// encoder's output timeline is re-anchored on it.
+///
+/// The in-process encoder free-runs from one anchor (see
+/// `AudioEncoder::reanchor_pts`), so a splice, a silence gap or a wrap that
+/// the unwrapper did not absorb would otherwise leave the audio on the old
+/// timeline for good. Half a second is far past any frame-to-frame step a
+/// real source makes (an AC-3 frame is 32 ms) and short enough that a jump
+/// which does happen costs one re-anchor, not a lasting offset.
+const SOURCE_PTS_JUMP_TICKS: u64 = 45_000;
 
 struct LazyAudioInit {
     /// ADTS config tuple cached by the demuxer. `None` until first
@@ -139,6 +155,8 @@ impl AudioReencoder {
             cancel: cancel.clone(),
             out_stats,
             silence,
+            silence_seeded: false,
+            last_source_pts: None,
         })
     }
 
@@ -176,7 +194,19 @@ impl AudioReencoder {
     /// grace window. The PTS attached to each emitted frame is the
     /// encoder's output PTS so segment-boundary math stays consistent
     /// with the real-audio path.
-    pub fn encode_silence_if_needed(&mut self) -> Result<Vec<(Vec<u8>, u64)>> {
+    ///
+    /// `anchor_pts_90k` is where the media timeline currently is — the
+    /// video's, since silence exists to accompany a picture — and nothing is
+    /// emitted until the caller has one. The generator is built before any
+    /// media has arrived and seeded at zero; the first silent chunk used to
+    /// be submitted at zero, the encoder anchored its output counter there
+    /// once and for all, and every silent frame from startup sat hours below
+    /// the video's DTS. MSE never had both tracks buffered at one position
+    /// and the feed stalled with nothing wrong on the wire.
+    pub fn encode_silence_if_needed(
+        &mut self,
+        anchor_pts_90k: Option<u64>,
+    ) -> Result<Vec<(Vec<u8>, u64)>> {
         let Some(sg) = self.silence.as_mut() else {
             return Ok(Vec::new());
         };
@@ -186,6 +216,13 @@ impl AudioReencoder {
         let Some(enc) = self.encoder.as_mut() else {
             return Ok(Vec::new());
         };
+        if !self.silence_seeded {
+            let Some(anchor) = anchor_pts_90k else {
+                return Ok(Vec::new());
+            };
+            sg.seed_pts(anchor);
+            self.silence_seeded = true;
+        }
         let (planar, gen_pts) = sg.next_chunk();
         enc.submit_planar(planar, gen_pts);
         let mut out = Vec::new();
@@ -193,6 +230,27 @@ impl AudioReencoder {
             out.push((f.data.to_vec(), f.pts));
         }
         Ok(out)
+    }
+
+    /// Notice a source PTS jump before `pts` is submitted, and re-anchor the
+    /// encoder's output timeline on it if there was one. See
+    /// [`SOURCE_PTS_JUMP_TICKS`]. Real audio returning after a silence burst
+    /// takes this path too: the silence ran on the wall clock and the source
+    /// has moved on without it.
+    fn note_source_pts(&mut self, pts: u64) {
+        let jumped = self
+            .last_source_pts
+            .is_some_and(|last| pts < last || pts - last > SOURCE_PTS_JUMP_TICKS);
+        self.last_source_pts = Some(pts);
+        if jumped
+            && let Some(enc) = self.encoder.as_mut()
+        {
+            tracing::debug!(
+                "CMAF output '{}': audio source PTS jumped to {pts}; re-anchoring the encoder",
+                self.output_id,
+            );
+            enc.reanchor_pts();
+        }
     }
 
     /// Reset the drop watchdog on a real source AAC frame so silence
@@ -203,10 +261,21 @@ impl AudioReencoder {
         }
     }
 
-    /// Encode one source AAC frame. Returns zero or more re-encoded
-    /// AAC frames (the encoder may buffer one input before emitting
-    /// depending on the codec's frame size).
-    pub fn encode_aac_frame(&mut self, frame: &[u8], pts: u64) -> Result<Vec<Vec<u8>>> {
+    /// Encode one source AAC frame. Returns zero or more re-encoded AAC
+    /// frames, each with its own PTS (the encoder may buffer one input
+    /// before emitting depending on the codec's frame size).
+    ///
+    /// The PTS is the encoder's, not the source's. The encoder emits a frame
+    /// per `frame_size` samples, and a source frame is that size only when
+    /// the source is AAC-LC too: an AC-3 source (1536 samples) yields two
+    /// output frames on every second submit, an MP2 one (1152) every eighth,
+    /// an HE-AAC element over LATM (2048) on every one. Stamping every frame
+    /// of a submit with the source PTS gave the second a duration of zero,
+    /// and Chrome's MSE treats the frame after a zero-duration one as a
+    /// discontinuity — need-RAP on the video track, picture dropped to the
+    /// next IDR — on every such pair. The frozen-picture symptom, from the
+    /// re-encode path this time.
+    pub fn encode_aac_frame(&mut self, frame: &[u8], pts: u64) -> Result<Vec<(Vec<u8>, u64)>> {
         // Lazy decoder / encoder construction — we can't initialise
         // either until we know the source sample rate + channels, which
         // come from the demuxer-cached ADTS config. The caller passes
@@ -258,11 +327,12 @@ impl AudioReencoder {
             .map_err(|e| anyhow::anyhow!("AudioEncoder spawn failed: {e}"))?;
             self.encoder = Some(enc);
         }
+        self.note_source_pts(pts);
         let enc = self.encoder.as_mut().unwrap();
         enc.submit_planar(&planar, pts);
         let mut out = Vec::new();
         while let Some(frame) = enc.try_recv() {
-            out.push(frame.data.to_vec());
+            out.push((frame.data.to_vec(), frame.pts));
         }
         Ok(out)
     }
@@ -279,14 +349,15 @@ impl AudioReencoder {
     /// supplied source sample-rate / channel count on first call, then
     /// hands the planar frame straight to the encoder. Mirrors the back
     /// half of [`Self::encode_aac_frame`] without touching the AAC
-    /// decoder slot.
+    /// decoder slot. Frames carry the encoder's PTS, as in
+    /// [`Self::encode_aac_frame`], and for the same reason.
     pub fn encode_planar(
         &mut self,
         planar: &[Vec<f32>],
         pts: u64,
         source_sr: u32,
         source_ch: u8,
-    ) -> Result<Vec<Vec<u8>>> {
+    ) -> Result<Vec<(Vec<u8>, u64)>> {
         if planar.is_empty() {
             return Ok(Vec::new());
         }
@@ -318,11 +389,12 @@ impl AudioReencoder {
             .map_err(|e| anyhow::anyhow!("AudioEncoder spawn failed: {e}"))?;
             self.encoder = Some(enc);
         }
+        self.note_source_pts(pts);
         let enc = self.encoder.as_mut().unwrap();
         enc.submit_planar(planar, pts);
         let mut out = Vec::new();
         while let Some(frame) = enc.try_recv() {
-            out.push(frame.data.to_vec());
+            out.push((frame.data.to_vec(), frame.pts));
         }
         Ok(out)
     }

@@ -76,6 +76,17 @@ pub struct CompletedSegment {
     pub kind: SegmentKind,
     /// 90 kHz DTS of the first sample in the segment.
     pub base_dts_90k: u64,
+    /// Which init this segment's samples decode against — see
+    /// [`VideoSegmenter::generation`]. Stamped by the segmenter at the cut,
+    /// not read off the output's state by the caller, because the segment
+    /// that closes *at* a parameter-set change is the last of the old
+    /// generation while the state, by the time the row is written, may
+    /// already describe the new one.
+    pub generation: u32,
+    /// True for the first segment cut after the parameter sets changed. It
+    /// is a decode discontinuity whatever the clock says, and the row that
+    /// lists it has to say so.
+    pub first_of_generation: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -100,6 +111,18 @@ pub struct VideoSegmenter {
     samples: Vec<PendingVideoSample>,
     segment_base_dts: Option<u64>,
     next_seq: u64,
+    /// How many times the parameter sets have changed under this stream,
+    /// counting from whatever the restored window said. Zero is the ordinary
+    /// life of a stream: one `init.mp4`, never renamed.
+    generation: u32,
+    /// A track to swap in at the next IDR. The source's SPS/PPS changed, so
+    /// everything from that IDR on decodes against different parameter sets;
+    /// the swap waits for the IDR because that is where the new sets take
+    /// effect, and the segment open at that moment is cut first so no segment
+    /// ever carries samples from both sides of the change.
+    pending_track: Option<VideoTrack>,
+    /// Set at the swap, carried onto the next segment to close.
+    open_first_of_generation: bool,
 }
 
 struct PendingVideoSample {
@@ -113,9 +136,9 @@ struct PendingVideoSample {
 pub struct PushOutcome {
     /// Set if a previously-open video segment closed because of this
     /// frame's IDR (and the previous segment had reached the duration
-    /// target). The bytes inside are the *video-only* fMP4 segment;
-    /// callers that want a muxed segment should drain the audio buffer
-    /// concurrently.
+    /// target, or a track rotation forced the cut). The bytes inside are
+    /// the *video-only* fMP4 segment; callers that want a muxed segment
+    /// should drain the audio buffer concurrently.
     pub completed_video: Option<CompletedSegment>,
     /// True iff this frame opened a new segment. Callers use this to
     /// signal the audio segmenter to flush its buffered frames into
@@ -149,7 +172,52 @@ impl VideoSegmenter {
             samples: Vec::new(),
             segment_base_dts: None,
             next_seq: 0,
+            generation: 0,
+            pending_track: None,
+            open_first_of_generation: false,
         }
+    }
+
+    /// The init generation the segments being cut now belong to.
+    pub fn generation(&self) -> u32 {
+        self.generation
+    }
+
+    /// Continue an existing stream's generation, as `new_from_seq` continues
+    /// its numbering: a restart that finds rows naming `init-3.mp4` must not
+    /// publish `init.mp4` over the object those rows decode against.
+    pub fn set_generation(&mut self, generation: u32) {
+        self.generation = generation;
+    }
+
+    /// Open a new generation without a track change. The restart path uses
+    /// it when this run's init turns out not to describe the window it
+    /// restored: rather than overwrite the previous run's init under rows
+    /// that decode against it, this run publishes its own under a new name.
+    pub fn bump_generation(&mut self) {
+        self.generation = self.generation.saturating_add(1);
+        self.open_first_of_generation = true;
+    }
+
+    /// The source's parameter sets changed. Swap the track in at the next
+    /// IDR, cutting whatever segment is open first.
+    ///
+    /// Nothing changes until that IDR: the samples already queued were coded
+    /// against the track in force and stay with it.
+    pub fn rotate_track(&mut self, track: VideoTrack) {
+        self.pending_track = Some(track);
+    }
+
+    /// True while a rotation is waiting for its IDR.
+    pub fn rotation_pending(&self) -> bool {
+        self.pending_track.is_some()
+    }
+
+    /// Whether the segment open now is the first of its generation — the
+    /// low-latency path advertises a segment before it closes, so it needs
+    /// the answer `CompletedSegment` will carry before that exists.
+    pub fn open_segment_first_of_generation(&self) -> bool {
+        self.open_first_of_generation
     }
 
     /// Push one access unit. Returns `PushOutcome` describing any
@@ -167,9 +235,15 @@ impl VideoSegmenter {
         let mut completed_samples: Option<(u64, u64, Vec<Sample>)> = None;
         let mut new_segment_started = false;
         if is_keyframe {
+            // A pending rotation cuts here whatever the elapsed time says:
+            // the samples queued so far decode against the old parameter
+            // sets and this IDR is the first that does not, so they cannot
+            // share a segment. A short segment is legal; a segment whose
+            // second half needs a different SPS is not decodable.
+            let rotating = self.pending_track.is_some();
             if let Some(base) = self.segment_base_dts {
                 let elapsed = dts.saturating_sub(base);
-                if elapsed >= self.target_duration_90k && !self.samples.is_empty() {
+                if (elapsed >= self.target_duration_90k || rotating) && !self.samples.is_empty() {
                     let (seq, sb, samples) = self.snapshot_samples(dts);
                     completed = Some(CompletedSegment {
                         sequence_number: seq,
@@ -177,6 +251,8 @@ impl VideoSegmenter {
                         bytes: super::fmp4::build_video_segment(seq as u32, sb, &samples),
                         kind: SegmentKind::Video,
                         base_dts_90k: sb,
+                        generation: self.generation,
+                        first_of_generation: std::mem::take(&mut self.open_first_of_generation),
                     });
                     completed_samples = Some((seq, sb, samples));
                     self.samples.clear();
@@ -187,6 +263,11 @@ impl VideoSegmenter {
             if self.segment_base_dts.is_none() {
                 self.segment_base_dts = Some(dts);
                 new_segment_started = true;
+            }
+            if let Some(track) = self.pending_track.take() {
+                self.track = track;
+                self.generation = self.generation.saturating_add(1);
+                self.open_first_of_generation = true;
             }
         }
 
@@ -356,9 +437,12 @@ struct PendingAudioSample {
 /// silent: `push` hands the shed audio back to the caller.
 const MAX_PENDING_AUDIO_MULTIPLE: u64 = 4;
 
-/// Samples per AAC frame, used only as the last-resort stride when a fragment
-/// is drained with nothing queued behind it and there is no observed spacing
-/// to copy. Every real AAC-LC frame on this path is 1024 samples.
+/// The last-resort stride, in track ticks, for a frame with nothing after
+/// it: a fragment drained with nothing queued behind it, or the shed path.
+///
+/// An AAC-LC frame is 1024 samples and an HE-AAC (SBR) frame 2048 at the
+/// output rate, which is why the observed spacing is preferred whenever two
+/// frames have been seen — this is only for the first frame of a stream.
 const AAC_FRAME_SAMPLES: u64 = 1024;
 
 impl AudioSegmenter {
@@ -412,7 +496,8 @@ impl AudioSegmenter {
         if let Some(base) = self.segment_base_dts {
             let elapsed = dts_ts.saturating_sub(base);
             if elapsed >= self.target_duration_ts * MAX_PENDING_AUDIO_MULTIPLE {
-                return self.flush_current_segment(dts_ts + 1024);
+                let stride = Self::frame_stride(self.samples.make_contiguous());
+                return self.flush_current_segment(dts_ts + stride);
             }
         }
         None
@@ -473,18 +558,8 @@ impl AudioSegmenter {
         // a fragment. That is allowed and is what ffmpeg's own muxer does;
         // its seams measure zero, and this one now does too.
         let successor = self.samples.front().map(|f| f.dts_ts);
-        let nominal = frames
-            .windows(2)
-            .last()
-            .map(|w| w[1].dts_ts.saturating_sub(w[0].dts_ts))
-            .filter(|d| *d > 0)
-            .unwrap_or(AAC_FRAME_SAMPLES);
-        let last_end = successor.unwrap_or_else(|| {
-            frames
-                .last()
-                .map(|f| f.dts_ts + nominal)
-                .unwrap_or(boundary_dts_ts)
-        });
+        // `taken > 0`, so `frames` is not empty.
+        let last_end = successor.unwrap_or(frames[taken - 1].dts_ts + Self::frame_stride(&frames));
 
         let samples_out: Vec<Sample> = frames
             .iter()
@@ -506,6 +581,23 @@ impl AudioSegmenter {
         // which is later than the frames already queued.
         self.segment_base_dts = self.samples.front().map(|f| f.dts_ts);
         Some((seq, base, samples_out))
+    }
+
+    /// The stride one frame runs when nothing follows it to say.
+    ///
+    /// The smallest spacing seen between the frames given, not the last: a
+    /// source gap in the final pair — a dropped PES, a splice — would
+    /// otherwise be copied onto the last frame as its duration, extending it
+    /// past where the audio actually ends. The smallest is a real frame's
+    /// length or one tick short of it from the 90 kHz → sample-rate
+    /// rounding, never a gap.
+    fn frame_stride(frames: &[PendingAudioSample]) -> u64 {
+        frames
+            .windows(2)
+            .map(|w| w[1].dts_ts.saturating_sub(w[0].dts_ts))
+            .filter(|d| *d > 0)
+            .min()
+            .unwrap_or(AAC_FRAME_SAMPLES)
     }
 
     fn flush_current_segment(&mut self, next_seg_start_dts: u64) -> Option<CompletedSegment> {
@@ -543,6 +635,11 @@ impl AudioSegmenter {
             bytes,
             kind: SegmentKind::Audio,
             base_dts_90k: base * 90_000 / self.track.sample_rate as u64,
+            // Audio-only segments are cut on the video's signal and never
+            // rotate: the audio track is committed at the first init and the
+            // audio-only segment path has no init generation of its own.
+            generation: 0,
+            first_of_generation: false,
         })
     }
 }
@@ -596,6 +693,75 @@ mod tests {
         assert!(outcome.new_segment_started);
         assert_eq!(seg.kind, SegmentKind::Video);
         assert_eq!(s.samples.len(), 1);
+    }
+
+    /// A track rotation cuts the open segment at the IDR that carries the new
+    /// parameter sets, before that IDR is queued — so the segment that closes
+    /// is all old-generation samples, stamped with the old generation, and
+    /// the segment that opens is the first of the new one.
+    ///
+    /// Without the forced cut the samples either side of the change shared a
+    /// segment, and the row that listed it named whichever init the output
+    /// had adopted by the time it was written — the new one, so a player
+    /// re-initialised its decoder from the new SPS and was fed the old
+    /// slices. Reproduced the very fault the rotation exists to fix, on
+    /// every rotation.
+    #[test]
+    fn a_rotation_cuts_at_its_idr_and_stamps_both_sides() {
+        let v = VideoTrack::from_h264(vec![0x67, 0x42, 0xC0, 0x1E], vec![0x68, 0xCE]);
+        let mut s = VideoSegmenter::new(v, 2.0);
+        let idr = vec![vec![0x65, 0xB8]];
+        let p = vec![vec![0x41, 0x00]];
+        s.push(&idr, 0, true);
+        for i in 1..10 {
+            s.push(&p, (i * 3000) as u64, false);
+        }
+        assert_eq!(s.generation(), 0);
+        assert!(!s.open_segment_first_of_generation());
+
+        // The change is noticed on a P-frame's worth of lookahead; nothing
+        // happens until an IDR.
+        s.rotate_track(VideoTrack::from_h264(vec![0x67, 0x64, 0x00, 0x1F], vec![0x68, 0xEE]));
+        assert!(s.rotation_pending());
+        let out = s.push(&p, 30_000, false);
+        assert!(out.completed_video.is_none());
+        assert_eq!(s.generation(), 0);
+
+        // Well short of the 2 s target, the IDR still cuts.
+        let out = s.push(&idr, 33_000, true);
+        let seg = out.completed_video.expect("the rotation forces a cut");
+        assert_eq!(seg.generation, 0, "the closed segment is the old generation");
+        assert!(!seg.first_of_generation);
+        assert_eq!(seg.duration_90k, 33_000);
+        assert!(out.new_segment_started);
+        assert!(!s.rotation_pending());
+        assert_eq!(s.generation(), 1);
+        assert_eq!(s.track.sps, vec![0x67, 0x64, 0x00, 0x1F]);
+        assert!(s.open_segment_first_of_generation(), "the open segment is the first of the new one");
+        assert_eq!(s.samples.len(), 1, "the IDR itself opens the new segment");
+
+        // The next ordinary cut carries the mark, and only that one does.
+        for i in 1..61 {
+            s.push(&p, 33_000 + (i * 3000) as u64, false);
+        }
+        let out = s.push(&idr, 33_000 + 2 * 90_000, true);
+        let seg = out.completed_video.expect("an ordinary cut");
+        assert_eq!(seg.generation, 1);
+        assert!(seg.first_of_generation);
+        assert!(!s.open_segment_first_of_generation());
+    }
+
+    /// A rotation requested before any segment is open has nothing to cut:
+    /// the first IDR opens generation 1 directly.
+    #[test]
+    fn a_rotation_before_the_first_idr_opens_the_new_generation() {
+        let v = VideoTrack::from_h264(vec![0x67, 0x42, 0xC0, 0x1E], vec![0x68, 0xCE]);
+        let mut s = VideoSegmenter::new(v, 2.0);
+        s.rotate_track(VideoTrack::from_h264(vec![0x67, 0x64, 0x00, 0x1F], vec![0x68, 0xEE]));
+        let out = s.push(&[vec![0x65, 0xB8]], 0, true);
+        assert!(out.completed_video.is_none());
+        assert!(out.new_segment_started);
+        assert_eq!(s.generation(), 1);
     }
 
     /// The segment that just closed ends exactly where the open one begins.
@@ -771,10 +937,12 @@ mod tests {
 
         // Boundaries that do not fall on frame edges, as real IDR cuts do not.
         let mut end: Option<u64> = None;
+        let mut fragments = 0;
         for boundary in [5000u64, 11_300, 17_900, 26_000, 33_333, 40_000] {
             let Some((_seq, base, samples)) = s.take_pending_samples(boundary) else {
                 continue;
             };
+            fragments += 1;
             if let Some(prev_end) = end {
                 assert_eq!(
                     base, prev_end,
@@ -789,7 +957,59 @@ mod tests {
             );
             end = Some(base + samples.iter().map(|x| x.duration as u64).sum::<u64>());
         }
-        assert!(end.is_some(), "the fixture produced no fragments to check");
+        assert_eq!(fragments, 6, "every boundary has audio queued before it");
+        // Frame 40 (at 40 960) sits past the 40 000 cut and stays queued, so the
+        // last fragment ends exactly where it starts.
+        assert_eq!(end, Some(40 * 1024));
+    }
+
+    /// The frame with nothing behind it runs one real frame, on every rate.
+    ///
+    /// Only the successor branch was pinned: reverting the fallback alone —
+    /// ending the last frame at the video cut — passed every test, and that
+    /// is the branch a fragment takes whenever the buffer is drained to the
+    /// cut, which the muxed path does on every segment the audio has not run
+    /// ahead of the video.
+    #[test]
+    fn a_last_frame_with_no_successor_runs_one_frame() {
+        for (rate, samples_per_frame) in [(48_000u32, 1024u64), (44_100, 1024)] {
+            let a = AudioTrack::aac([0x11, 0x90], rate, 2, 128_000);
+            let mut s = AudioSegmenter::new(a, 2.0);
+            let ticks_per_frame = samples_per_frame * 90_000 / rate as u64;
+            for i in 0..10u64 {
+                s.push(&[0xFF; 200], i * ticks_per_frame);
+            }
+            // Everything queued is before the boundary: no successor.
+            let (_, base, out) = s.take_pending_samples(u64::MAX / 2).expect("a fragment");
+            assert_eq!(out.len(), 10);
+            let stride = out[0].duration as u64;
+            assert!(
+                (stride as i64 - samples_per_frame as i64).abs() <= 1,
+                "{rate} Hz: one frame is {samples_per_frame} samples, got {stride}"
+            );
+            assert!(
+                (out[9].duration as i64 - stride as i64).abs() <= 1,
+                "{rate} Hz: the last frame must run a real frame, not to the cut: {}",
+                out[9].duration
+            );
+            assert_eq!(base, 0);
+        }
+    }
+
+    /// A gap before the last frame is not copied onto it as its duration.
+    #[test]
+    fn a_source_gap_does_not_stretch_the_last_frame() {
+        let a = AudioTrack::aac([0x11, 0x90], 48_000, 2, 128_000);
+        let mut s = AudioSegmenter::new(a, 2.0);
+        for i in 0..5u64 {
+            s.push(&[0xFF; 200], i * 1920);
+        }
+        // Ten frames lost, then one more.
+        s.push(&[0xFF; 200], 15 * 1920);
+        let (_, _, out) = s.take_pending_samples(u64::MAX / 2).expect("a fragment");
+        assert_eq!(out.len(), 6);
+        assert_eq!(out[4].duration, 11 * 1024, "the gap itself is real and stays");
+        assert_eq!(out[5].duration, 1024, "the frame after it is one frame long");
     }
 
     #[test]

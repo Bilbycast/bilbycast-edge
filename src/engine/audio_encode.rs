@@ -987,6 +987,52 @@ impl AudioEncoder {
         }
     }
 
+    /// Re-anchor the output timeline at the next submitted PTS.
+    ///
+    /// The in-process backends anchor once, at the first submit, and then
+    /// free-run: every output frame is stamped `frame_size` samples after the
+    /// last, whatever PTS the input carried. That is what makes their output
+    /// contiguous — a caller stamping frames from the input PTS instead gets
+    /// zero-duration samples whenever the input frame is not the codec's
+    /// (AC-3 is 1536 samples, MP2 1152, an HE-AAC LATM element 2048) — but it
+    /// also means a source whose PTS jumps, a splice or a silence gap, is
+    /// followed by nothing: the audio runs on the old timeline while the
+    /// video moves, for the life of the flow. A caller that has seen the
+    /// jump calls this; the partial frame in the accumulator belongs to the
+    /// old timeline and is dropped with it. The ffmpeg backend carries a PTS
+    /// per chunk and needs nothing.
+    pub fn reanchor_pts(&mut self) {
+        match &mut self.backend {
+            EncoderBackend::Ffmpeg { .. } => {}
+            #[cfg(feature = "fdk-aac")]
+            EncoderBackend::InProcess {
+                accumulator,
+                accumulated_samples,
+                pts_anchor_set,
+                ..
+            } => {
+                for ch in accumulator.iter_mut() {
+                    ch.clear();
+                }
+                *accumulated_samples = 0;
+                *pts_anchor_set = false;
+            }
+            #[cfg(feature = "media-codecs")]
+            EncoderBackend::InProcessLibav {
+                accumulator,
+                accumulated_samples,
+                pts_anchor_set,
+                ..
+            } => {
+                for ch in accumulator.iter_mut() {
+                    ch.clear();
+                }
+                *accumulated_samples = 0;
+                *pts_anchor_set = false;
+            }
+        }
+    }
+
     /// Pull the next encoded frame, if any. Non-blocking.
     pub fn try_recv(&mut self) -> Option<EncodedFrame> {
         let frame = match &mut self.backend {

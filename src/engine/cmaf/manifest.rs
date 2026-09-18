@@ -17,6 +17,34 @@
 use super::fmp4::VideoCodec;
 
 /// One entry in the rolling playlist.
+/// The object name of an init generation.
+///
+/// Generation zero is `init.mp4`, so a stream whose parameter sets never
+/// change publishes exactly the object it always did; every generation past
+/// that is a *new* object, `init-{n}.mp4`, because overwriting the old one
+/// would strand every segment still in the window that decodes against it.
+pub fn init_object_name(generation: u32) -> String {
+    if generation == 0 {
+        "init.mp4".to_string()
+    } else {
+        format!("init-{generation}.mp4")
+    }
+}
+
+/// The generation an init object name denotes — the inverse of
+/// [`init_object_name`]. `None` for a name this edge never writes.
+pub fn init_generation_of(name: &str) -> Option<u32> {
+    let name = name.rsplit('/').next().unwrap_or(name);
+    if name == "init.mp4" {
+        return Some(0);
+    }
+    name.strip_prefix("init-")?
+        .strip_suffix(".mp4")?
+        .parse::<u32>()
+        .ok()
+        .filter(|g| *g > 0)
+}
+
 #[derive(Clone)]
 pub struct M3u8Entry {
     /// Media sequence number (matches the segment filename numbering).
@@ -325,6 +353,12 @@ pub struct DashInput<'a> {
     /// players may request partial chunks that early relative to the
     /// segment's nominal availability time.
     pub availability_time_offset_secs: f64,
+    /// The init the live edge decodes against. One `SegmentTemplate` names
+    /// one `initialization`, so the MPD follows the newest generation: a
+    /// DASH player joining live decodes, and one seeking back across a
+    /// parameter-set change does not — that history is reachable only
+    /// through HLS, where each row names its own map.
+    pub init_uri: &'a str,
 }
 
 pub struct DashVideoRep<'a> {
@@ -440,6 +474,7 @@ fn write_dash_video_adaptation_set(
         (mpd.target_segment_duration_secs * v.timescale as f64) as u64,
         mpd.latest_segment_number,
         mpd.availability_time_offset_secs,
+        mpd.init_uri,
         true, // video
     );
     s.push_str("      </Representation>\n");
@@ -472,6 +507,7 @@ fn write_dash_audio_adaptation_set(
         (mpd.target_segment_duration_secs * a.sample_rate as f64) as u64,
         mpd.latest_segment_number,
         mpd.availability_time_offset_secs,
+        mpd.init_uri,
         false,
     );
     s.push_str("      </Representation>\n");
@@ -484,13 +520,13 @@ fn write_segment_template(
     segment_duration_ts: u64,
     latest_segment_number: u64,
     availability_time_offset_secs: f64,
+    init_uri: &str,
     is_video: bool,
 ) {
     // Segment numbering starts at 1 by DASH convention; `startNumber`
     // anchors the template. We follow the edge's monotonic sequence
     // numbers directly.
     let start_number = latest_segment_number.max(1);
-    let init_uri = "init.mp4";
     let media_pattern = if is_video {
         "seg-$Number%05d$.m4s"
     } else {
@@ -996,6 +1032,7 @@ mod tests {
             latest_segment_number: 5,
             available_segments: 5,
             availability_time_offset_secs: 0.0,
+            init_uri: "init.mp4",
         });
         assert!(mpd.contains("<MPD"));
         assert!(mpd.contains("type=\"dynamic\""));
@@ -1023,6 +1060,7 @@ mod tests {
             latest_segment_number: 1,
             available_segments: 1,
             availability_time_offset_secs: 0.0,
+            init_uri: "init.mp4",
         });
         assert!(mpd.contains("contentType=\"audio\""));
         assert!(mpd.contains("codecs=\"mp4a.40.2\""));
@@ -1047,6 +1085,7 @@ mod tests {
             latest_segment_number: 1,
             available_segments: 1,
             availability_time_offset_secs: 1.5,
+            init_uri: "init.mp4",
         });
         assert!(mpd.contains("availabilityTimeOffset=\"1.500\""));
         assert!(mpd.contains("availabilityTimeComplete=\"false\""));

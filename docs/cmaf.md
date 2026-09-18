@@ -27,7 +27,14 @@ players without transcoding twice. Supports:
   the in-process fdk-aac backend. Audio is **muxed into the same
   fragment as the video** — one `moof` addressing both tracks — so a
   browser needs a single MSE SourceBuffer and there is no second
-  timeline to keep aligned. Two configurations are **video-only**, and
+  timeline to keep aligned. The audio run in a fragment tiles the audio
+  grid exactly: its last sample runs to the next audio frame's own DTS,
+  so audio may end up to one AAC frame (21 ms at 48 kHz) *after* the
+  video cut. That is deliberate and matches ffmpeg's muxer — truncating
+  the last sample to the video cut leaves a hole before the next
+  fragment, and Chrome's MSE answers a hole with a discontinuity on the
+  shared SourceBuffer, dropping the *picture* to the next IDR while the
+  audio plays on (edge #149). Two configurations are **video-only**, and
   both say so at startup: `low_latency: true` (a chunk carries one
   track) and `encryption` (CENC covers video only). See Limitations.
 - **Delivery**: whole-segment HTTP PUT (`low_latency: false`) or
@@ -92,8 +99,11 @@ the window rather than from the config precisely so that stays legal; see
 (a reload cadence and a low-latency hold-back sized for the longest segment
 the flow has produced).
 
-For re-encoded video (`video_encode` block set), the edge forces
-`gop_size = segment_duration_secs * fps` so boundaries are guaranteed.
+For re-encoded video (`video_encode` block set), the operator's `gop_size`
+is honoured (60 when unset) and segment boundaries land on that GOP's IDRs,
+so choose one that divides `segment_duration_secs * fps` — nothing forces
+the GOP to the segment length. (`gop_size: 1` is how the DVR proxy asks for
+all-intra; see [the proxy section](#why-the-proxy-rendition-is-x264-on-nvidia-hosts).)
 
 ## Playlist window (`dvr_window_secs`)
 
@@ -154,24 +164,31 @@ and seeds its window from those rows, each keeping its own
   resetting the count to zero made the discontinuity sequence go backwards on a
   playlist whose media sequence carried on normally, which RFC 8216 makes
   an incompatible playlist change.
-* **The init has to still describe the restored rows.** `init.mp4` is one fixed
-  object and the new run overwrites it with *its* track list, sample entries and
-  parameter sets. Any track or parameter change across a restart — toggling
-  `low_latency`, adding or removing `audio_encode`, an `h264`→`h265` edit, a
-  resolution change, enabling encryption, or the audio-detection race latching
-  differently on two runs of the same config — therefore left the whole restored
-  history described by an init that cannot decode it. MSE answers that by
-  initialising the declared track and then waiting for ever: nothing wrong on
-  the wire, nothing wrong in the manifest, no error anywhere (#130).
+* **The init has to still describe the restored rows.** The restored rows
+  were published under the previous run's track list, sample entries and
+  parameter sets, and nothing used to compare them with this run's. Any track
+  or parameter change across a restart — toggling `low_latency`, adding or
+  removing `audio_encode`, an `h264`→`h265` edit, a resolution change,
+  enabling encryption, or the audio-detection race latching differently on
+  two runs of the same config — therefore left the whole restored history
+  described by an init that cannot decode it. MSE answers that by
+  initialising the declared track and then waiting for ever: nothing wrong
+  on the wire, nothing wrong in the manifest, no error anywhere (#130).
 
   So each manifest carries a private `#EXT-X-BILBYCAST-INIT:<hash>` naming the
-  init it was published under — a tag players must ignore (RFC 8216 requires a client to skip any tag it does not recognise), and
-  one the relay origin copies through untouched. On a mismatch the restored rows
-  are **dropped** and a Warning event names how many: a short window beats an
-  hour of history that stalls the player. The sequence number is kept either
-  way, because renumbering would overwrite segments the origin still holds. A
-  manifest written before the tag existed says nothing, which is treated as a
-  match — refusing every such restore would cost the window on no evidence.
+  init it was published under — a tag players must ignore (RFC 8216 requires a
+  client to skip any tag it does not recognise), and one the relay origin
+  copies through untouched. On a mismatch this run's init is published as a
+  **new generation** (`init-{n}.mp4`, see [Init generations](#init-generations))
+  and the restored rows are **kept**, still naming the init they decode
+  against; a Warning event says the tracks changed and the join is a
+  discontinuity. The first version dropped the restored rows instead, because
+  `init.mp4` was one fixed object about to be overwritten. The sequence number
+  is kept either way, because renumbering would overwrite segments the origin
+  still holds, and so is the generation: a run that finds rows naming
+  `init-3.mp4` continues at 3. A manifest written before the tag existed says
+  nothing, which is treated as a match — refusing every such restore would
+  cost the window on no evidence.
 
 Best-effort throughout: a fresh stream 404s, and an origin that cannot be
 reached is not a reason to refuse to start. The cost of failing here is no
@@ -214,6 +231,63 @@ Measured on the rig: 1800 segments and sequence `seg-04097` before a restart,
 
 This is the mirror of the relay-side failure where the origin holds *less* than
 the edge advertises — see `bilbycast-relay/docs/distribution.md`.
+
+## Init generations
+
+The video track is built from the first IDR's SPS/PPS, and it used to stay
+that way for life — which is true right up until the encoder upstream changes
+underneath: an operator pinning a codec, `h264_auto` falling between NVENC
+and x264, a contribution encoder rebooting into a different profile. Every
+sample after that decodes against different parameter sets from the ones in
+`init.mp4`, and browsers reject it outright — `bufferAppendError`, five
+frames decoded, then nothing, with `buffered` filling normally the whole time
+and zero errors reported by the pipeline (edge #150).
+
+So the parameter sets are re-checked **on every IDR** (only there: that is
+where new sets take effect, and a source that re-sends a differing PPS
+between IDRs must not rotate on every frame). When they differ from the
+track's:
+
+- The segment open at that IDR is **cut first**, whatever the elapsed time
+  says, so no segment ever carries samples from both sides of the change. A
+  short segment is legal; one whose second half needs a different SPS is not
+  decodable.
+- The IDR opens a new **generation**. Generation 0 is `init.mp4`; each change
+  past that publishes `init-{n}.mp4` — a *new* object, never an overwrite,
+  because the rows already in the window decode against the old one and a
+  viewer seeking back into them needs it. Rows written from here name the
+  new init with their own `#EXT-X-MAP` (RFC 8216 §4.4.4.5 allows the tag more
+  than once; each applies to the rows that follow), and the playlist's head
+  map is whatever its *first* row needs, since the window slides.
+- The first row of a new generation carries `#EXT-X-DISCONTINUITY` whatever
+  the clock says: different parameter sets are a break in the decode chain,
+  and a player that carries its decoder across one gets garbage.
+- Nothing is advertised under the new init until it is on the origin — the
+  manifest publish waits for the PUT, and on the low-latency path so does
+  chunk emission (the samples queue in the segmenter meanwhile).
+- The 30 s republish covers **every generation the window still names**,
+  not just the current one, and forgets a generation once no row does. It
+  can only republish generations *this process* produced: a restored
+  window's older inits were published by the previous run and their bytes
+  are not here.
+- Across a restart the generation is continued from the restored playlist,
+  and a mismatching init opens a new one — see the restore section above.
+
+What it does not cover:
+
+- **The audio track.** An AAC configuration change under a running output
+  (sample rate, channels, object type) is still described by the original
+  init. The track list is committed at the first init and never widened.
+- **A codec-family change.** H.264 ↔ HEVC is a new sample entry, not new
+  parameter sets, and MSE needs `changeType()` for it; the limitation in
+  [Known limitations](#known-limitations) stands.
+- **DASH.** One `SegmentTemplate` names one `initialization`, so the MPD
+  follows the newest generation: a DASH player joining live decodes, one
+  seeking back across the change does not. HLS is the DVR path.
+- **Clip export from whole segments.** The fallback that concatenates
+  segments fetches the init those segments name; a window straddling a
+  change is refused as settled rather than retried, because the two halves
+  cannot share a file without re-encoding — which the exact-cut path does.
 
 ## Target duration (`#EXT-X-TARGETDURATION`)
 
@@ -710,11 +784,12 @@ the real world — hls.js zeroes its timeline at whichever fragment it happened 
 load first, so `currentTime` means nothing across sessions. The scrub-preview
 index below depends on it, and so does any "what time was that?" surface.
 
-## Why the proxy rendition is encoded in software
+## Why the proxy rendition is x264 on NVIDIA hosts
 
-The DVR proxy is `x264`, on the CPU, even on a host with a working NVENC. That
-is a deliberate choice and it has been measured; this section exists so it is
-not "fixed" by somebody reading the CPU graph.
+On any node that does not advertise `h264_vaapi` or `h264_rkmpp` — which is
+every NVIDIA host — the DVR proxy is `x264`, on the CPU, even with a working
+NVENC. That is a deliberate choice and it has been measured; this section
+exists so it is not "fixed" by somebody reading the CPU graph.
 
 ### NVENC cannot express all-intra directly
 
@@ -735,14 +810,27 @@ asked for, and **NVENC refuses it**:
              Gop Length should be greater than number of B frames + 1
 ```
 
-With `bf = 0` the check still demands `gop >= 2`, so there is no GOP setting
-that yields every-frame-intra. It is reachable only by forcing an IDR on each
-frame — `VideoEncoder::force_next_keyframe` does exactly that, and NVENC
-honours `AVFrame.pict_type = AV_PICTURE_TYPE_I` — but that is encoder-level
-work plus per-backend GOP sanitising, not a config change. Anything that
-silently accepted `gop_size: 1` on NVENC and produced a long-GOP stream would
-give a rendition that plays perfectly and cannot be jogged, which is the
-failure the manager's DVR page carries a badge for.
+With `bf = 0` the check still demands `gop >= 2`. NVENC's own all-intra mode
+is FFmpeg's `gop_size = 0` (`frameIntervalP = 0`, "intra-only" in the
+vendored `nvenc.c`), which bilbycast cannot express: `validate_video_encode`
+floors `gop_size` at 1 and the wrapper passes the value straight to
+`avctx->gop_size`. Reaching it would be a per-backend sanitiser in the
+wrapper's open (`gop_size: 1` → `avctx.gop_size = 0` on the NVENC backends
+only — not a 0 accepted in validation, which resolves before the backend is
+known and means something different on every other encoder), and it is
+unverified on hardware. Forcing an IDR per frame is *not* the route:
+`VideoEncoder::force_next_keyframe` sets `AVFrame.pict_type =
+AV_PICTURE_TYPE_I`, which NVENC treats as a forced *intra* picture
+(`NV_ENC_PIC_FLAG_FORCEINTRA`), not an IDR, unless the encoder's `forced-idr`
+private option is set — and the wrapper does not set it. Only an IDR gets
+`AV_PKT_FLAG_KEY`, so through the wrapper today every such frame reports
+`keyframe = false`; the segmenter marks sync samples at NVENC's natural IDR
+cadence and the rendition jogs only there. Either way: anything that silently
+accepted `gop_size: 1` on NVENC and produced a long-GOP stream would give a
+rendition that plays perfectly and cannot be jogged, which is the failure the
+manager's DVR page exists to make visible — it shows the proxy encoder each
+session actually got (`proxy_codec`, also returned by
+`POST /api/v1/dvr/sessions/{id}/activate`).
 
 ### The encode is not where the cost is
 
@@ -763,10 +851,16 @@ the other three quarters, and they are what a GPU pipeline actually collapses:
 
 ### And it costs bitrate
 
-At the same 3000 kbps target, NVENC all-intra produced **1.10 MB** where x264
-produced **0.72 MB** for identical content — 53% larger. The proxy is what
-`balanced` mode streams and what a tablet pulls, and it has to stay readable
-frame by frame, so quality per bit is not a spare resource here.
+On the same 30 s synthetic clip as the table above, with a 3000 kbps target
+that neither encoder came near (the content is near-static, so rate control
+was not binding), NVENC all-intra produced **1.10 MB** where x264 produced
+**0.72 MB** for identical content — 53% larger, i.e. NVENC needs about half
+as many bits again for the same all-intra picture. The provisioned proxy is
+CBR at 3000 kbps, where both emit the same number of bytes by construction,
+so there it is the picture that pays. The proxy is what `balanced` mode
+streams and what a tablet pulls, and it has to stay readable frame by frame,
+so quality per bit is not a spare resource here. (Not re-measured at the
+provisioned CBR rate.)
 
 ### The decode is the part worth moving, and only if it stays on the GPU
 
@@ -799,23 +893,33 @@ on the forced-IDR work, the 53% bitrate penalty, and a hard dependency on the
 NVIDIA stack for a rendition that is meant to be the *reliable* one.
 
 **Whatever is done here needs a runtime fallback, not a probe.** On 2026-09-15
-a driver/userspace mismatch on the z440 left the capability probe cheerfully
-reporting `nvenc encoder 1080p session capacity probed: 8` while every real
-`OpenEncodeSessionEx` failed. A design that trusts the probe would have
+the boot-time capability probe on the z440 had opened eight real NVENC
+sessions and reported `nvenc encoder 1080p session capacity probed: 8`; by
+the afternoon a driver/userspace mismatch made every `OpenEncodeSessionEx`
+fail, and nothing re-probes. A design that trusts the probe would have
 produced a DVR that silently stopped working. `output_display`'s
 `open_video_decoder_with_retry` (retry, then demote to `Cpu`) and
 `st2110_video_io`'s "HW decoder open failed — falling back to threaded
-software decode" are the patterns to copy; the CMAF path has neither, and no
-decode-side equivalent of the encoder's `["h264_nvenc", "x264"]` chain exists.
+software decode" are the patterns to copy. The CMAF path has neither — and
+unlike the transcode outputs' `h264_auto` resolver, whose chain on this host
+is `["h264_nvenc", "x264"]`, the CMAF re-encoder pins a single backend
+(`ScaledVideoEncoder::new` is a one-element chain, and `*_auto` is refused on
+CMAF outputs), so an encoder that will not open is a re-open attempt and a
+warning on every frame and an empty rendition, never a fall-through. That is
+reachable today: the manager provisions `h264_vaapi` / `h264_rkmpp` off the
+boot-time probe bit on hosts that advertise them.
 
 ### Where that leaves it
 
 Moving the encode alone is not worth a tenth of a core against 53% more
 bitrate, encoder-level work, and a hard dependency on a GPU driver. A full GPU
 pipeline — NVDEC decode, CUDA scale, NVENC encode — is worth considering,
-because the decode is the real cost; it needs `hw_decode` plumbing that the
-CMAF path does not currently have at all, and it would tie the DVR to the
-NVIDIA stack on every host that runs one.
+because the decode is the real cost. It needs `hw_decode` plumbing the CMAF
+path does not have: `video_encode.hw_decode` is *accepted* on a CMAF output,
+because the block is the shared `VideoEncodeConfig`, but `VideoReencoder`
+ignores it and always opens a CPU decoder — setting it is a silent no-op
+today. And it would tie the DVR to the NVIDIA stack on every host that runs
+one.
 
 ## Thumbnail track (`thumbnails`)
 
@@ -1073,6 +1177,12 @@ The edge uses the following filenames under `{ingest_url}`:
   The track list it declares is still latched the first time the init is
   built — before the PUT, so a failed first upload does not reopen it —
   and never widened; see [Known limitations](#known-limitations).
+- `init-N.mp4` — the init for generation N, published when the source's
+  parameter sets change under a running output (see
+  [Init generations](#init-generations)). A new object each time, never
+  an overwrite; the republish covers every generation the window still
+  names. An origin that keeps objects by name keeps these until the flow
+  is torn down — the relay's origin holds them for the stream's life.
 - `seg-NNNNN.m4s` — video / muxed media segment (5-digit zero-padded
   sequence number).
 - `aud-NNNNN.m4s` — audio-only media segment. **Reserved and not
@@ -1206,12 +1316,15 @@ should set up a URL-rewriting reverse proxy in front of their ingest.
 - No live-to-VOD archival — the rolling playlist caps at `max_segments`
   and old `.m4s` files are not deleted on the ingest side. Operators
   must configure CDN / object-store retention externally.
-- **`#EXT-X-DISCONTINUITY` covers the clock, not the codec.** It is emitted
-  when the flow clock re-anchors — a source restart, a PTS discontinuity, or a
-  source clock too far out for the epoch to slew after (see [A re-anchor is
-  declared, not absorbed](#a-re-anchor-is-declared-not-absorbed)). A source
-  *format* change mid-stream is a different break and the tag does not rescue
-  it: `init.mp4` has already declared the track list, so an input switch
-  between H.264 and HEVC produces a segment sequence the player cannot decode
-  whatever the playlist says. Input-switch flows should still restart the CMAF
-  output when the source codec family changes.
+- **`#EXT-X-DISCONTINUITY` covers the clock and the parameter sets, not the
+  codec family.** It is emitted when the flow clock re-anchors — a source
+  restart, a PTS discontinuity, or a source clock too far out for the epoch
+  to slew after (see [A re-anchor is declared, not
+  absorbed](#a-re-anchor-is-declared-not-absorbed)) — and on the first row of
+  a new init generation (see [Init generations](#init-generations)). A source
+  *format* change mid-stream is a different break and neither rescues it: the
+  init has declared the sample entry, so an input switch between H.264 and
+  HEVC produces a segment sequence the player cannot decode whatever the
+  playlist says. Input-switch flows should still restart the CMAF output when
+  the source codec family changes, and an audio configuration change is not
+  followed at all.

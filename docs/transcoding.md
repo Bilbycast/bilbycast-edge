@@ -24,7 +24,7 @@ applicable / by design.
 | **ST 2110-30 / `rtp_audio`** | ✅ (auto via compressed-audio bridge) | ✅ (native PCM transcode, bit-depth + SRC + shuffle) | ❌ | Uncompressed PCM outputs; transcode is first-class here. |
 | **ST 2110-31** | ✅ | ❌ (AES3 opaque — channel labels inside SMPTE 337M payload, not addressable from the pipeline) | ❌ | |
 | **ST 2110-40** | ❌ | ❌ | ❌ | Ancillary data — no codec concept. |
-| **CMAF / CMAF-LL** | ✅ (AAC family only) | ✅ (requires `audio_encode`) | ✅ | fMP4 / CMAF segments with HLS m3u8 + DASH MPD; segmenter forces `gop_size = segment_duration × fps` when `video_encode` is set so segments always cut on IDR. Codec work runs in `block_in_place`. See [`docs/cmaf.md`](cmaf.md) for the full reference. |
+| **CMAF / CMAF-LL** | ✅ (AAC family only) | ✅ (requires `audio_encode`) | ✅ | fMP4 / CMAF segments with HLS m3u8 + DASH MPD; the operator's `gop_size` is honoured when `video_encode` is set (60 when unset) and segments cut on that GOP's IDRs, so choose one that divides `segment_duration × fps`. Codec work runs in `block_in_place`. See [`docs/cmaf.md`](cmaf.md) for the full reference. |
 
 ---
 

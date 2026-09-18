@@ -127,6 +127,9 @@ fn is_permanent(err: &str) -> bool {
         // Retrying cannot move the restart. Without this the operator waits
         // through three attempts for an answer that was settled at the first.
         || e.contains("spans a recorder restart")
+        // Nor the encoder change: the segments either side of it are what
+        // they are.
+        || e.contains("spans an encoder change")
 }
 
 /// Hand the allocator's free heap back to the operating system.
@@ -198,6 +201,11 @@ struct SegmentEntry {
     uri: String,
     start: DateTime<Utc>,
     duration: f64,
+    /// The init this segment decodes against — the `#EXT-X-MAP` in force
+    /// where the row sits. The stream's own `init.mp4` for the life of a
+    /// stream whose encoder never changed; `init-{n}.mp4` past a
+    /// parameter-set change.
+    init: String,
 }
 
 /// Parse the served media playlist into dated segments.
@@ -210,9 +218,23 @@ fn parse_playlist(body: &str) -> Vec<SegmentEntry> {
     let mut out = Vec::new();
     let mut pending_date: Option<DateTime<Utc>> = None;
     let mut pending_dur: Option<f64> = None;
+    let mut init = "init.mp4".to_string();
     for line in body.lines() {
         let line = line.trim();
-        if let Some(rest) = line.strip_prefix("#EXT-X-PROGRAM-DATE-TIME:") {
+        if let Some(rest) = line.strip_prefix("#EXT-X-MAP:") {
+            // Re-declared where a generation starts. Name only, for the same
+            // reason as the segment URIs below.
+            if let Some(name) = rest
+                .split(',')
+                .find_map(|attr| attr.trim().strip_prefix("URI="))
+                .map(|v| v.trim_matches('"'))
+                .map(|v| v.split(['?', '#']).next().unwrap_or(v))
+                .map(|v| v.rsplit('/').next().unwrap_or(v))
+                .filter(|v| !v.is_empty())
+            {
+                init = name.to_string();
+            }
+        } else if let Some(rest) = line.strip_prefix("#EXT-X-PROGRAM-DATE-TIME:") {
             pending_date = DateTime::parse_from_rfc3339(rest.trim())
                 .ok()
                 .map(|d| d.with_timezone(&Utc));
@@ -231,6 +253,7 @@ fn parse_playlist(body: &str) -> Vec<SegmentEntry> {
                     uri,
                     start,
                     duration,
+                    init: init.clone(),
                 });
             }
             pending_date = None;
@@ -591,9 +614,22 @@ async fn cut_from_segments(base: &str, auth: Option<&str>, rec: &ClipRecord) -> 
         );
     }
 
-    // init.mp4 first, then the fragments: that concatenation *is* a playable
-    // fragmented MP4, which is why no muxing is needed to produce one.
-    let mut body = http_get(&format!("{base}/init.mp4"), auth).await?;
+    // The init first, then the fragments: that concatenation *is* a playable
+    // fragmented MP4, which is why no muxing is needed to produce one. It has
+    // to be the init these segments decode against, which after an encoder
+    // change is not `init.mp4` — and segments either side of the change
+    // cannot share one, so a window that straddles it is not cut this way.
+    // That is settled, not transient: the segments will not change.
+    let init = &wanted[0].init;
+    if let Some(other) = wanted.iter().find(|s| &s.init != init) {
+        bail!(
+            "clip '{}': the window spans an encoder change ({init} -> {}), which whole \
+             segments cannot be joined across",
+            rec.name,
+            other.init
+        );
+    }
+    let mut body = http_get(&format!("{base}/{init}"), auth).await?;
     for seg in &wanted {
         let url = if seg.uri.starts_with("http") {
             seg.uri.clone()
@@ -905,6 +941,29 @@ mod tests {
 
     fn t(s: &str) -> DateTime<Utc> {
         DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc)
+    }
+
+    /// Each segment carries the map in force where it sits, so the fallback
+    /// fetches the init those segments decode against rather than the name
+    /// the stream started life with.
+    #[test]
+    fn a_segment_carries_the_map_in_force_where_it_sits() {
+        let rotated = "#EXTM3U\n\
+            #EXT-X-MAP:URI=\"init.mp4?token=viewer\"\n\
+            #EXT-X-PROGRAM-DATE-TIME:2026-09-07T10:00:00.000Z\n\
+            #EXTINF:2.000,\n\
+            seg-00100.m4s\n\
+            #EXT-X-MAP:URI=\"init-1.mp4\"\n\
+            #EXT-X-DISCONTINUITY\n\
+            #EXT-X-PROGRAM-DATE-TIME:2026-09-07T10:00:02.000Z\n\
+            #EXTINF:2.000,\n\
+            seg-00101.m4s\n";
+        let segs = parse_playlist(rotated);
+        assert_eq!(segs.len(), 2);
+        assert_eq!(segs[0].init, "init.mp4", "the viewer token is not the init's name");
+        assert_eq!(segs[1].init, "init-1.mp4");
+        // And a window across the change is a settled failure, not a retry.
+        assert!(is_permanent("clip 'x': the window spans an encoder change (init.mp4 -> init-1.mp4)"));
     }
 
     const PLAYLIST: &str = "#EXTM3U\n\
