@@ -1980,6 +1980,10 @@ impl EncoderStage {
     /// Build (or rebuild, on a format change) for decoded `(rate, channels)`
     /// and return the output format.
     pub fn prepare(&mut self, rate: u32, channels: u8) -> Result<(u32, u8), String> {
+        if rate == 0 || channels == 0 {
+            // Nothing decoded: never let it fix the output format.
+            return Err(format!("EncoderStage: no format in {rate} Hz x {channels}"));
+        }
         if !self.built || self.input != (rate, channels) {
             let stage = encoder_stage(
                 self.block.as_ref(),
@@ -2003,6 +2007,9 @@ impl EncoderStage {
     /// Convert decoded PCM at `rate` (planar, its channel count) to the
     /// output format.
     pub fn process(&mut self, planar: &[Vec<f32>], rate: u32) -> Result<Vec<Vec<f32>>, String> {
+        if planar.first().is_none_or(|c| c.is_empty()) {
+            return Ok(Vec::new());
+        }
         self.prepare(rate, planar.len() as u8)?;
         match self.stage.as_mut() {
             Some(t) => t.process(planar),
@@ -3023,6 +3030,12 @@ mod tests {
         assert_eq!(out.len(), 2);
         assert_eq!(st.output(), Some((48_000, 2)));
         assert!(st.delay() > 0, "a resampler now");
+        // A frame that decoded to nothing changes nothing.
+        let mut fresh = EncoderStage::new(None, None, None);
+        assert!(fresh.process(&[], 48_000).unwrap().is_empty());
+        assert!(fresh.prepare(48_000, 0).is_err());
+        assert_eq!((fresh.output(), fresh.delay()), (None, 0), "no format fixed");
+        assert_eq!(fresh.prepare(44_100, 2).unwrap(), (44_100, 2));
         // Pinned before any source: converts to the pinned format.
         let mut pinned = EncoderStage::new(None, None, None);
         pinned.pin_output(48_000, 1);
