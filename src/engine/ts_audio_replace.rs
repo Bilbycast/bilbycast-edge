@@ -273,11 +273,10 @@ struct Latency {
     applied_90k: u64,
 }
 
-/// One decoded PCM frame.
+/// One decoded PCM frame; its channel count is `planar.len()`.
 struct Decoded {
     planar: Vec<Vec<f32>>,
     sample_rate: u32,
-    channels: u8,
 }
 
 /// MPEG-TS audio elementary-stream replacer.
@@ -489,9 +488,27 @@ pub struct TsAudioReplacer {
     /// planar PCM form between the AAC decoder and the target encoder.
     /// `None` preserves the pre-transcode behaviour exactly.
     transcode_cfg: Option<TranscodeJson>,
-    /// Lazily constructed planar transcoder. Opened on the first decoded
-    /// frame, once the input rate + channel count are known.
+    /// The channel / rate stage between decoder and encoder (`None` = no
+    /// conversion). Built on the first decoded frame; rebuilt when the
+    /// source changes format in-band (see [`Self::reformat`]).
     transcoder: Option<PlanarAudioTranscoder>,
+    /// The decoded format `(rate, channels)` the stage was built for.
+    stage_in: (u32, u8),
+    /// The first stage's resampler delay (output frames), folded into the
+    /// stamps when the pipeline opened: content from source time `t` is
+    /// placed at model position `t` plus this, whichever stage converts it.
+    stage_delay_latched: u64,
+    /// Output frames of zero history still to drop from the head of a
+    /// stage that replaced another: the one it replaced was run out, so the
+    /// pipeline's delay is already in the stream.
+    stage_skip: u64,
+    /// Source frames sent into the current stage and output frames kept
+    /// from it, and the history it keeps at its head (the first stage's
+    /// resampler delay; none for a replacement): where its content ends,
+    /// for running it out.
+    stage_fed: u64,
+    stage_kept: u64,
+    stage_head: u64,
 
     /// One-shot "input was switched" request. The flow's per-output
     /// switch watcher flips this to `true` when the active input
@@ -591,6 +608,12 @@ impl TsAudioReplacer {
             codecs_ready: false,
             transcode_cfg: transcode,
             transcoder: None,
+            stage_in: (0, 0),
+            stage_delay_latched: 0,
+            stage_skip: 0,
+            stage_fed: 0,
+            stage_kept: 0,
+            stage_head: 0,
             external_reset: Arc::new(AtomicBool::new(false)),
         })
     }
@@ -1144,9 +1167,11 @@ impl TsAudioReplacer {
     /// Content placed but not yet in an emitted frame, in 90 kHz ticks: the
     /// encoder's input accumulator (output rate) plus the resampler's queue
     /// and the crossfade tail (source rate). Where the next source sample
-    /// lands is `next_output_pts_90k + pending_out_90k`. The resampler's own
-    /// delay line is not in it: that is part of the declared latency, which
-    /// the zero history it started from already accounts for.
+    /// lands is `next_output_pts_90k + pending_out_90k` plus what the
+    /// resampler's delay line holds. That is part of the declared latency
+    /// (the zero history the first stage started from accounts for it) —
+    /// exactly, until a stage replaces the first: [`Self::stage_offset_90k`]
+    /// is the difference.
     fn pending_out_90k(&self) -> u64 {
         let out_rate = self.resolved_sample_rate as u128;
         let in_rate = self.timeline.rate as u128;
@@ -1157,6 +1182,20 @@ impl TsAudioReplacer {
         let src = self.tail.first().map_or(0, |c| c.len()) as u128
             + self.transcoder.as_ref().map_or(0, |t| t.buffered_frames()) as u128;
         ((acc * in_rate + src * out_rate) * 90_000 / (out_rate * in_rate)) as u64
+    }
+
+    /// What the current stage's delay line holds (its delay, less the zero
+    /// history it still has to drop) minus the delay the stamps assume
+    /// (the first stage's), in signed 90 kHz ticks. 0 until a stage
+    /// replaces the first.
+    fn stage_offset_90k(&self) -> i64 {
+        let out_rate = self.resolved_sample_rate as i64;
+        if out_rate == 0 {
+            return 0;
+        }
+        let delay = self.transcoder.as_ref().map_or(0, |t| t.output_delay() as i64);
+        let held = delay - self.stage_skip as i64;
+        (held - self.stage_delay_latched as i64) * 90_000 / out_rate
     }
 
     // ── Internal helpers ─────────────────────────────────────────────
@@ -1207,6 +1246,12 @@ impl TsAudioReplacer {
             self.av_encoder = None;
         }
         self.transcoder = None;
+        self.stage_in = (0, 0);
+        self.stage_delay_latched = 0;
+        self.stage_skip = 0;
+        self.stage_fed = 0;
+        self.stage_kept = 0;
+        self.stage_head = 0;
         self.accumulator.clear();
         self.tail.clear();
         self.xf_len = 0;
@@ -1339,8 +1384,8 @@ impl TsAudioReplacer {
     /// but not yet emitted goes out just before it, and everything from
     /// this PES on is measured from here.
     fn anchor_at(&mut self, pts: u64) {
-        let pending = self.pending_out_90k();
-        self.out_pts_90k = pts.wrapping_sub(pending) & PTS_MASK;
+        let at = pts as i128 - self.pending_out_90k() as i128 - self.stage_offset_90k() as i128;
+        self.out_pts_90k = at.rem_euclid(PTS_MASK as i128 + 1) as u64;
         self.samples_since_anchor = 0;
         let rate = self.timeline.rate;
         self.timeline = Timeline {
@@ -1425,7 +1470,6 @@ impl TsAudioReplacer {
             return Ok(vec![Decoded {
                 planar: d.planar,
                 sample_rate: decoder.sample_rate().unwrap_or(48_000),
-                channels: decoder.channels().unwrap_or(2),
             }]);
         }
         // MP2 / AC-3 / E-AC-3 / AAC-LATM via libavcodec, one AU per
@@ -1445,7 +1489,6 @@ impl TsAudioReplacer {
                 frames.push(Decoded {
                     planar: frame.planar,
                     sample_rate: frame.sample_rate,
-                    channels: frame.channels,
                 });
             }
             return Ok(frames);
@@ -1455,13 +1498,19 @@ impl TsAudioReplacer {
     }
 
     /// Count one decoded frame on the timeline and send it on, opening the
-    /// pipeline on the first.
+    /// pipeline on the first and rebuilding its channel / rate stage when
+    /// the source changes format in-band.
     fn push_decoded(&mut self, d: Decoded, output: &mut Vec<u8>) {
         let n = d.planar.first().map_or(0, |c| c.len()) as u64;
         if n == 0 {
             return;
         }
-        if !self.codecs_ready && self.init_pipeline(d.sample_rate, d.channels).is_err() {
+        let format = (d.sample_rate, d.planar.len() as u8);
+        if !self.codecs_ready {
+            if self.init_pipeline(format.0, format.1).is_err() {
+                return;
+            }
+        } else if format != self.stage_in && self.reformat(format.0, format.1, output).is_err() {
             return;
         }
         if self.timeline.rate == 0 {
@@ -1475,60 +1524,100 @@ impl TsAudioReplacer {
             }
         } else if self.timeline.rate != d.sample_rate {
             // The source changed rate in-band: the content so far ends
-            // where it ends; count on at the new rate.
+            // where it ends; count on at the new rate, and so does a drop
+            // still owed.
             self.timeline.base_90k = self.timeline.end_90k();
             self.timeline.samples = 0;
+            self.pending_drop = (self.pending_drop as u128 * d.sample_rate as u128
+                / self.timeline.rate as u128) as u64;
             self.timeline.rate = d.sample_rate;
         }
         self.timeline.samples += n as i64;
         self.push_content(d.planar, output);
     }
 
+    /// The channel / rate stage from decoded `(rate, channels)`: to `out`,
+    /// the output format, once the encoder is open; before that, to what
+    /// the configuration asks. A transcode block wins, with
+    /// audio_encode.sample_rate / channels folding in for the fields it
+    /// leaves unset; without one, those two alone still need a conversion
+    /// when they differ from the source — the encoder is opened at them, and
+    /// PCM at another rate would play at the wrong speed, another channel
+    /// count would be truncated. A block whose routing is for another
+    /// layout than a later format (a 5.1 preset over a stereo stretch) gives
+    /// way to the default conversion. `Ok(None)`: no conversion.
+    fn build_stage(
+        &self,
+        rate: u32,
+        channels: u8,
+        out: Option<(u32, u8)>,
+    ) -> Result<Option<PlanarAudioTranscoder>, String> {
+        let (want_rate, want_channels) = match out {
+            Some((r, c)) => (Some(r), Some(c)),
+            None => (self.sample_rate_override, self.channels_override),
+        };
+        let open = |json: &TranscodeJson| {
+            PlanarAudioTranscoder::new(rate, channels, json)
+                .and_then(|t| t.with_fixed_chunk(SRC_CHUNK_FRAMES))
+        };
+        let default = || {
+            override_transcode(
+                channels,
+                want_rate.filter(|&r| r != rate),
+                want_channels.filter(|&c| c != channels),
+            )
+            .map(|tj| TranscodeJson {
+                src_quality: self.transcode_cfg.as_ref().and_then(|b| b.src_quality),
+                ..tj
+            })
+        };
+        let Some(block) = self.transcode_cfg.as_ref() else {
+            return default().map(|json| open(&json)).transpose();
+        };
+        let json = TranscodeJson {
+            sample_rate: out.map(|o| o.0).or(block.sample_rate).or(self.sample_rate_override),
+            channels: out.map(|o| o.1).or(block.channels).or(self.channels_override),
+            ..block.clone()
+        };
+        match (open(&json), out) {
+            (Ok(t), None) => Ok(Some(t)),
+            (Ok(t), Some(o)) if (t.out_sample_rate(), t.out_channels()) == o => Ok(Some(t)),
+            (Err(e), None) => Err(e),
+            (_, Some(_)) => default().map(|json| open(&json)).transpose(),
+        }
+    }
+
     /// Open the channel / rate stage and the encoder for the first decoded
     /// format, and latch the pipeline's latency.
     fn init_pipeline(&mut self, sample_rate: u32, channels: u8) -> Result<(), ()> {
-        // A transcode block wins; audio_encode.sample_rate / channels fold
-        // in for the fields it leaves unset. Without one, those two alone
-        // still need a conversion when they differ from the source: the
-        // encoder is opened at them, and PCM at another rate would play at
-        // the wrong speed, another channel count would be truncated.
-        let json = match self.transcode_cfg.as_ref() {
-            Some(tj) => Some(TranscodeJson {
-                sample_rate: tj.sample_rate.or(self.sample_rate_override),
-                channels: tj.channels.or(self.channels_override),
-                ..tj.clone()
-            }),
-            None => override_transcode(
-                channels,
-                self.sample_rate_override.filter(|&r| r != sample_rate),
-                self.channels_override.filter(|&c| c != channels),
-            ),
-        };
-        if let Some(json) = json {
-            let built = PlanarAudioTranscoder::new(sample_rate, channels, &json)
-                .and_then(|t| t.with_fixed_chunk(SRC_CHUNK_FRAMES));
-            match built {
-                Ok(tc) => {
-                    self.resolved_sample_rate = tc.out_sample_rate();
-                    self.resolved_channels = tc.out_channels();
-                    self.transcoder = Some(tc);
-                }
-                Err(e) => {
-                    if !self.init_failure_reported {
-                        self.init_failure_reported = true;
-                        tracing::warn!(
-                            "TsAudioReplacer: transcode init failed ({e}); dropping the audio"
-                        );
-                    }
-                    return Err(());
-                }
+        match self.build_stage(sample_rate, channels, None) {
+            Ok(Some(tc)) => {
+                self.resolved_sample_rate = tc.out_sample_rate();
+                self.resolved_channels = tc.out_channels();
+                self.transcoder = Some(tc);
             }
-        } else {
-            self.resolved_sample_rate = sample_rate;
-            self.resolved_channels = channels;
+            Ok(None) => {
+                self.resolved_sample_rate = sample_rate;
+                self.resolved_channels = channels;
+            }
+            Err(e) => {
+                if !self.init_failure_reported {
+                    self.init_failure_reported = true;
+                    tracing::warn!(
+                        "TsAudioReplacer: transcode init failed ({e}); dropping the audio"
+                    );
+                }
+                return Err(());
+            }
         }
         self.accumulator = vec![Vec::new(); self.resolved_channels as usize];
         self.init_encoder()?;
+        self.stage_in = (sample_rate, channels);
+        self.stage_delay_latched = self.transcoder.as_ref().map_or(0, |t| t.output_delay() as u64);
+        self.stage_head = self.stage_delay_latched;
+        self.stage_skip = 0;
+        self.stage_fed = 0;
+        self.stage_kept = 0;
         self.xf_len = (sample_rate / 500) as usize;
         self.tail = vec![Vec::new(); channels as usize];
         self.fade_in_left = 0;
@@ -1536,6 +1625,87 @@ impl TsAudioReplacer {
         self.codecs_ready = true;
         self.refresh_decode_stats_label();
         Ok(())
+    }
+
+    /// The source changed format in-band: a 5.1 ↔ 2.0 switch between
+    /// programme and ads (AC-3 and AAC decoders follow acmod /
+    /// channel_config frame by frame), a splice to another rate. The
+    /// encoder stays open at the output format — the PMT and every
+    /// receiver keep it — and the channel / rate stage is rebuilt to
+    /// convert the new format to it. What the old stage holds (the crossfade
+    /// tail, its resampler's queue and delay line) goes out first, up to
+    /// exactly the content it was given, and the new stage's zero history
+    /// is dropped: the pipeline's delay is already in the stream, so every
+    /// sample keeps its place and the stamps stay what they were.
+    fn reformat(&mut self, rate: u32, channels: u8, output: &mut Vec<u8>) -> Result<(), ()> {
+        let out = (self.resolved_sample_rate, self.resolved_channels);
+        let stage = match self.build_stage(rate, channels, Some(out)) {
+            Ok(s) => s,
+            Err(e) => {
+                if !self.init_failure_reported {
+                    self.init_failure_reported = true;
+                    tracing::warn!(
+                        "TsAudioReplacer: no conversion from {rate} Hz x {channels} to the \
+                         output's {} Hz x {} ({e}); dropping the audio while the source \
+                         stays in that format",
+                        out.0,
+                        out.1
+                    );
+                }
+                return Err(());
+            }
+        };
+        tracing::info!(
+            from_rate = self.stage_in.0,
+            from_channels = self.stage_in.1,
+            rate,
+            channels,
+            out_rate = out.0,
+            out_channels = out.1,
+            "ts_audio_replace: the source changed format in-band; converting it to the output's"
+        );
+        let tail = std::mem::take(&mut self.tail);
+        self.send_pcm(tail, output);
+        self.run_out_stage(output);
+        self.stage_skip = stage.as_ref().map_or(0, |t| t.output_delay() as u64);
+        self.transcoder = stage;
+        self.stage_in = (rate, channels);
+        self.stage_fed = 0;
+        self.stage_kept = 0;
+        self.stage_head = 0;
+        self.xf_len = (rate / 500) as usize;
+        self.tail = vec![Vec::new(); channels as usize];
+        self.fade_in_left = self.fade_in_left.min(self.xf_len);
+        self.refresh_decode_stats_label();
+        Ok(())
+    }
+
+    /// Run the stage's resampler queue and delay line out with zeros, up to
+    /// exactly the content it was given: its head (the first stage's
+    /// history) plus its input at the output rate. A stage without rate
+    /// conversion holds nothing.
+    fn run_out_stage(&mut self, output: &mut Vec<u8>) {
+        let Some(tc) = self.transcoder.as_ref() else {
+            return;
+        };
+        let (in_rate, out_rate) = (tc.in_sample_rate() as u128, tc.out_sample_rate() as u128);
+        if in_rate == out_rate {
+            return;
+        }
+        let end = self.stage_head + ((self.stage_fed as u128 * out_rate + in_rate / 2) / in_rate) as u64;
+        let zeros = vec![vec![0.0f32; SRC_CHUNK_FRAMES]; tc.in_channels() as usize];
+        // A few chunks cover the queue and the delay line; the bound only
+        // guards against a resampler that stops producing.
+        for _ in 0..16 {
+            if self.stage_kept >= end {
+                break;
+            }
+            let Some(Ok(pcm)) = self.transcoder.as_mut().map(|t| t.process(&zeros)) else {
+                break;
+            };
+            self.keep_stage_output(pcm, end - self.stage_kept);
+        }
+        self.drain_encoder(output);
     }
 
     /// Latch the latency the libraries declare for this pipeline: the
@@ -1636,11 +1806,8 @@ impl TsAudioReplacer {
     /// silence, hold its last `xf_len` samples back and send the rest.
     fn push_content(&mut self, mut planar: Vec<Vec<f32>>, output: &mut Vec<u8>) {
         let n = planar.first().map_or(0, |c| c.len());
-        if planar.len() != self.tail.len() {
-            // An in-band channel-count change: no tail to blend with.
-            self.send_pcm(planar, output);
-            return;
-        }
+        // `push_decoded` rebuilt the stage (and the tail) for this format.
+        debug_assert_eq!(planar.len(), self.tail.len());
         let mut start = 0;
         if self.pending_drop > 0 {
             let d = (self.pending_drop as usize).min(n);
@@ -1691,12 +1858,16 @@ impl TsAudioReplacer {
     /// Send PCM at the decoded format through the channel / rate stage into
     /// the encoder accumulator, and encode what is ready.
     fn send_pcm(&mut self, planar: Vec<Vec<f32>>, output: &mut Vec<u8>) {
-        if planar.first().is_none_or(|c| c.is_empty()) {
+        let n = planar.first().map_or(0, |c| c.len());
+        if n == 0 {
             return;
         }
-        let shuffled: Vec<Vec<f32>> = if let Some(ref mut tc) = self.transcoder {
+        let converted: Vec<Vec<f32>> = if let Some(ref mut tc) = self.transcoder {
             match tc.process(&planar) {
-                Ok(p) => p,
+                Ok(p) => {
+                    self.stage_fed += n as u64;
+                    p
+                }
                 Err(e) => {
                     tracing::warn!(
                         "TsAudioReplacer: transcode process failed ({e}); dropping frame"
@@ -1707,14 +1878,25 @@ impl TsAudioReplacer {
         } else {
             planar
         };
-        for ch in 0..self.resolved_channels as usize {
-            if ch < shuffled.len() {
-                self.accumulator[ch].extend_from_slice(&shuffled[ch]);
-            } else if !shuffled.is_empty() {
-                self.accumulator[ch].extend(std::iter::repeat_n(0.0f32, shuffled[0].len()));
+        self.keep_stage_output(converted, u64::MAX);
+        self.drain_encoder(output);
+    }
+
+    /// Queue what the stage produced for the encoder: after the zero
+    /// history a replacement stage still has to drop, at most `limit`
+    /// frames. A channel the stage does not produce is silence.
+    fn keep_stage_output(&mut self, pcm: Vec<Vec<f32>>, limit: u64) {
+        let n = pcm.first().map_or(0, |c| c.len());
+        let skip = (self.stage_skip as usize).min(n);
+        let keep = ((n - skip) as u64).min(limit) as usize;
+        self.stage_skip -= skip as u64;
+        self.stage_kept += keep as u64;
+        for (ch, acc) in self.accumulator.iter_mut().enumerate() {
+            match pcm.get(ch) {
+                Some(src) => acc.extend_from_slice(&src[skip..skip + keep]),
+                None => acc.extend(std::iter::repeat_n(0.0f32, keep)),
             }
         }
-        self.drain_encoder(output);
     }
 
     /// Publish the audio path's edge-added skew at a PES PTS: where this
@@ -1732,11 +1914,12 @@ impl TsAudioReplacer {
             }
             self.av_skew_from_90k = None;
         }
-        // Model position of this PES's first sample (still to be pushed)…
-        let at = self
-            .next_output_pts_90k(self.resolved_sample_rate)
-            .wrapping_add(self.pending_out_90k())
-            & PTS_MASK;
+        // Model position of this PES's first sample (still to be pushed), as
+        // the stamps assume the stage places it…
+        let at = (self.next_output_pts_90k(self.resolved_sample_rate) as i128
+            + self.pending_out_90k() as i128
+            + self.stage_offset_90k() as i128)
+            .rem_euclid(PTS_MASK as i128 + 1) as u64;
         // …which is the first sample after any overlap still to be dropped.
         let first = pts.wrapping_add(self.pending_drop * 90_000 / self.timeline.rate as u64) & PTS_MASK;
         // Presented at the model position plus the latency the stamps do
@@ -3501,8 +3684,13 @@ mod tests {
 
         /// `len` samples of silence with the burst at sample `at`.
         pub fn content(at: usize, len: usize) -> Vec<f32> {
+            content_at(RATE, at, len)
+        }
+
+        /// `content` at another rate.
+        pub fn content_at(rate: u32, at: usize, len: usize) -> Vec<f32> {
             let mut pcm = vec![0.0f32; len];
-            let b = burst(RATE);
+            let b = burst(rate);
             pcm[at..at + b.len()].copy_from_slice(&b);
             pcm
         }
@@ -3525,22 +3713,28 @@ mod tests {
             }
         }
 
-        fn pts_at(samples: i64) -> u64 {
-            (P0 as i64 + samples * 90_000 / RATE as i64) as u64
-        }
-
         /// Encode mono `pcm` (as stereo) in `src`. Each AU carries the PTS a
         /// source muxer stamps — its first decoded sample's presentation
         /// time — so content sample `j` is presented at `P0 + j / 48 kHz`.
         pub fn encode_source(src: Src, pcm: &[f32]) -> Vec<(Vec<u8>, u64)> {
+            encode_source_as(src, pcm, 2, RATE)
+        }
+
+        /// `encode_source` with `channels` channels (the content in the
+        /// first two, L and R; the rest silent) at `rate`.
+        pub fn encode_source_as(src: Src, pcm: &[f32], channels: u8, rate: u32) -> Vec<(Vec<u8>, u64)> {
+            let pts_at = |samples: i64| (P0 as i64 + samples * 90_000 / rate as i64) as u64;
+            let frame = |c: &[f32]| -> Vec<Vec<f32>> {
+                (0..channels).map(|ch| if ch < 2 { c.to_vec() } else { vec![0.0; c.len()] }).collect()
+            };
             let mut out = Vec::new();
             match src {
                 Src::Aac | Src::HeAac => {
                     let he = matches!(src, Src::HeAac);
                     let mut e = aac_audio::AacEncoder::open(&aac_codec::EncoderConfig {
                         profile: if he { aac_codec::AacProfile::HeAacV1 } else { aac_codec::AacProfile::AacLc },
-                        sample_rate: RATE,
-                        channels: 2,
+                        sample_rate: rate,
+                        channels,
                         bitrate: if he { 64_000 } else { 128_000 },
                         afterburner: true,
                         sbr_signaling: aac_codec::SbrSignaling::default(),
@@ -3553,7 +3747,7 @@ mod tests {
                     for chunk in pcm.chunks(fs) {
                         let mut c = chunk.to_vec();
                         c.resize(fs, 0.0);
-                        let ed = e.encode_frame(&[c.clone(), c]).unwrap();
+                        let ed = e.encode_frame(&frame(&c)).unwrap();
                         if ed.bytes.is_empty() {
                             continue;
                         }
@@ -3568,8 +3762,8 @@ mod tests {
                     };
                     let mut e = video_engine::AudioEncoder::open(&video_codec::AudioEncoderConfig {
                         codec,
-                        sample_rate: RATE,
-                        channels: 2,
+                        sample_rate: rate,
+                        channels,
                         bitrate_kbps: kbps,
                     })
                     .unwrap();
@@ -3577,7 +3771,7 @@ mod tests {
                     for chunk in pcm.chunks(fs) {
                         let mut c = chunk.to_vec();
                         c.resize(fs, 0.0);
-                        for f in e.encode_frame(&[c.clone(), c]).unwrap() {
+                        for f in e.encode_frame(&frame(&c)).unwrap() {
                             out.push((f.data.to_vec(), pts_at(f.pts)));
                         }
                     }
@@ -4065,6 +4259,134 @@ mod tests {
         assert_eq!(stalled.stats_handle().timeline_corrections.load(Ordering::Relaxed), 0);
         assert_eq!(a, b, "a stall between PES changes nothing");
         assert_eq!(a, whole, "nor does the chunking");
+    }
+
+    /// An in-band channel-count change with `audio_encode.channels: 2`: an
+    /// AC-3 source switching 5.1 → 2.0 (programme to ads) and 2.0 → 5.1,
+    /// and 5.1 → 2.0 under a `transcode` block whose BS.775 preset only
+    /// fits 5.1 (the default conversion stands in for it). The stage
+    /// converting to the output's stereo is rebuilt for each format, so the
+    /// audio after the switch is on time with nothing inserted or dropped.
+    /// The downmix built for 5.1 used to refuse the stereo frames, and the
+    /// output went silent until the source returned to 5.1.
+    #[cfg(all(feature = "media-codecs", feature = "fdk-aac"))]
+    #[test]
+    fn an_in_band_channel_change_keeps_the_audio() {
+        use e2e::*;
+        let at = 48_000 * 2 + 50;
+        let pcm = content(at, 48_000 * 3);
+        let preset = TranscodeJson {
+            channels: Some(2),
+            channel_map_preset: Some("5_1_to_stereo_bs775".into()),
+            ..Default::default()
+        };
+        for (first, then, block) in [(6u8, 2u8, None), (2, 6, None), (6, 2, Some(preset))] {
+            let a = encode_source_as(Src::Ac3, &pcm, first, RATE);
+            let b = encode_source_as(Src::Ac3, &pcm, then, RATE);
+            // AC-3 frame 40 starts 1.28 s in; the burst is 0.72 s later.
+            let spliced: Vec<_> = a[..40].iter().chain(&b[40..]).cloned().collect();
+            let ts = mux(0x81, &pack(&spliced, 1));
+            let mut cfg = enc("aac_lc");
+            cfg.channels = Some(2);
+            let mut r = TsAudioReplacer::new(&cfg, block).unwrap();
+            let out = run(&mut r, &ts);
+            let s = r.stats_handle();
+            assert_eq!(s.silence_inserted_samples.load(Ordering::Relaxed), 0, "{first} -> {then}");
+            assert_eq!(s.dropped_samples.load(Ordering::Relaxed), 0, "{first} -> {then}");
+            assert_eq!(r.stage_in, (48_000, then));
+            let e = err_samples("aac_lc", &out, src_time(at), 48_000);
+            assert!(e.abs() <= 3.0, "{first} -> {then}: {e}");
+        }
+    }
+
+    /// After an in-band channel-count change with the output following the
+    /// source's first format, a later overlap is still dropped (and the
+    /// crossfade tail of the old format goes out): the audio after it is on
+    /// time. Frames of the new count used to bypass the drop, so the audio
+    /// stayed late by it while `av_skew` counted the drop as pending.
+    #[cfg(all(feature = "media-codecs", feature = "fdk-aac"))]
+    #[test]
+    fn an_overlap_after_an_in_band_channel_change_is_dropped() {
+        use e2e::*;
+        let at = 48_000 * 2 + 50;
+        let pcm = content(at, 48_000 * 3);
+        let a = encode_source_as(Src::Ac3, &pcm, 2, RATE);
+        let b = encode_source_as(Src::Ac3, &pcm, 6, RATE);
+        let mut spliced: Vec<_> = a[..20].iter().chain(&b[20..]).cloned().collect();
+        for au in spliced.iter_mut().skip(40) {
+            au.1 -= 900;
+        }
+        let ts = mux(0x81, &pack(&spliced, 1));
+        let mut r = replacer("aac_lc", None, None);
+        let out = run(&mut r, &ts);
+        assert_eq!(r.resolved_channels, 2, "the output keeps the first format");
+        assert_eq!(r.stats_handle().dropped_samples.load(Ordering::Relaxed), 480);
+        let e = err_samples("aac_lc", &out, src_time(at) - 900.0, 48_000);
+        assert!(e.abs() <= 3.0, "{e}");
+    }
+
+    /// A splice 1 s in from a 48 kHz to a 44.1 kHz AAC source (AUs from
+    /// each on either side of it), the 44.1 kHz AUs shifted by `shift`
+    /// ticks and, from 1.5 s on, stepped by `step`.
+    #[cfg(all(feature = "media-codecs", feature = "fdk-aac"))]
+    fn rate_splice(shift: i64, step: i64) -> Vec<u8> {
+        use e2e::*;
+        let a = encode_source_as(Src::Aac, &content_at(48_000, 96_000, 48_000 * 3), 2, 48_000);
+        let b = encode_source_as(Src::Aac, &content_at(44_100, 88_200, 44_100 * 3), 2, 44_100);
+        let split = P0 + 90_000;
+        let spliced: Vec<(Vec<u8>, u64)> = a
+            .iter()
+            .filter(|au| au.1 < split)
+            .cloned()
+            .chain(b.iter().filter(|au| au.1 >= split).map(|(es, pts)| {
+                let stepped = if *pts >= P0 + 135_000 { step } else { 0 };
+                (es.clone(), pts.wrapping_add_signed(shift + stepped))
+            }))
+            .collect();
+        mux(0x0F, &pack(&spliced, 1))
+    }
+
+    /// An in-band sample-rate change (a splice from a 48 kHz to a 44.1 kHz
+    /// AAC source), with and without a 1 s step after it: with the output
+    /// at 48 kHz a resampler is inserted and its zero history dropped; with
+    /// `sample_rate: 44100` the resampler the output needed so far is run
+    /// out exactly and none follows. Either way the audio after the change
+    /// (and after the re-anchor) is on time and `av_skew` reads 0. The
+    /// encoder used to be fed 44.1 kHz PCM as if it were 48 kHz.
+    #[cfg(all(feature = "media-codecs", feature = "fdk-aac"))]
+    #[test]
+    fn an_in_band_rate_change_keeps_the_audio_on_time() {
+        use e2e::*;
+        for step in [0i64, 90_000] {
+            let ts = rate_splice(0, step);
+            for (sr, out_rate) in [(None, 48_000u32), (Some(44_100), 44_100)] {
+                let mut r = replacer("aac_lc", sr, None);
+                let rep = Arc::new(crate::stats::av_skew::AvSkewReporter::new());
+                r.set_av_skew_reporter(rep.clone());
+                let out = run(&mut r, &ts);
+                assert_eq!(r.stage_in.0, 44_100);
+                assert_eq!(r.resolved_sample_rate, out_rate);
+                let e = err_samples("aac_lc", &out, src_time(96_000) + step as f64, out_rate);
+                assert!(e.abs() <= 4.0, "output {out_rate}, step {step}: {e}");
+                assert_eq!(rep.snapshot().skew_ms, 0, "output {out_rate}, step {step}");
+            }
+        }
+    }
+
+    /// A drop found at the first PES of the new rate (the 44.1 kHz source
+    /// stamped 150 ms early, over 100 ms: dropped at once) was counted at
+    /// the old rate: it is taken at the new one, and the audio after it is
+    /// on time.
+    #[cfg(all(feature = "media-codecs", feature = "fdk-aac"))]
+    #[test]
+    fn a_drop_owed_across_an_in_band_rate_change_is_counted_at_the_new_rate() {
+        use e2e::*;
+        let ts = rate_splice(-13_500, 0);
+        let mut r = replacer("aac_lc", None, None);
+        let out = run(&mut r, &ts);
+        assert_eq!(r.stats_handle().timeline_corrections.load(Ordering::Relaxed), 1);
+        let e = err_samples("aac_lc", &out, src_time(96_000) - 13_500.0, 48_000);
+        assert!(e.abs() <= 4.0, "{e}");
     }
 
     // ── PCR on the audio PID (defect x) and the pre-PMT gate (4) ──
