@@ -925,6 +925,95 @@ impl SectionAssembler {
     }
 }
 
+/// Longest payload unit a [`PmtUnitCollector`] collects before giving it
+/// up: a PMT section is at most 1024 bytes (about six packets), so a unit
+/// still in flight past this is garbage.
+const PMT_UNIT_MAX_PACKETS: usize = 32;
+
+/// Collects, on one PMT PID, the whole payload unit a PMT arrives in —
+/// every packet of it — for a cache that re-emits PSI: the continuity
+/// fixer's switch injection and the PTS rewriter's PSI_RR repetition. A PMT
+/// may span packets and is only useful re-emitted complete; the rewriter
+/// used to cache just the PUSI packet, so its repetition of a two-packet
+/// PMT was a lone first packet no receiver could complete.
+///
+/// A unit is handed out only when a PMT section with a valid CRC_32
+/// completed in it and nothing aborted it (a CC gap mid-unit, a failed
+/// CRC): a truncated unit must never replace the last good one — the
+/// continuity fixer once cached `[PUSI, gapped continuation]` over a good
+/// unit and injected it corrupt. Every section each packet completes is
+/// shown to the caller as well, so one that learns from the PMT needs no
+/// second assembler on the PID.
+#[derive(Default)]
+pub struct PmtUnitCollector {
+    /// Says when no section is in flight any more (the unit is complete)
+    /// and when a CC gap aborted one.
+    asm: SectionAssembler,
+    packets: Vec<[u8; TS_PACKET_SIZE]>,
+    /// A PMT section with a valid CRC_32 completed in this unit.
+    pmt_ok: bool,
+}
+
+impl PmtUnitCollector {
+    /// Feed one 188-byte packet on the PID. `on_section` sees every section
+    /// the packet completes, whatever its table. Returns the unit's packets
+    /// when this one completed a unit worth caching.
+    pub fn push_packet(
+        &mut self,
+        pkt: &[u8],
+        mut on_section: impl FnMut(&[u8]),
+    ) -> Option<Vec<[u8; TS_PACKET_SIZE]>> {
+        let pusi = ts_pusi(pkt);
+        let was_in_flight = self.asm.in_flight();
+        // `tail_done`: the section in flight completed in this packet. A
+        // valid PMT counts for the unit it started in.
+        let (mut tail_done, mut pmt_tail, mut pmt_here) = (false, false, false);
+        for (sec, spanned) in self.asm.push_packet(pkt).with_span() {
+            on_section(sec);
+            let pmt_ok = sec.first() == Some(&0x02) && mpeg2_crc32(sec) == 0;
+            if spanned {
+                tail_done = true;
+                pmt_tail |= pmt_ok;
+            } else {
+                pmt_here |= pmt_ok;
+            }
+        }
+        let mut cached = [0u8; TS_PACKET_SIZE];
+        cached.copy_from_slice(&pkt[..TS_PACKET_SIZE]);
+        let mut aborted = false;
+        if pusi && !(was_in_flight && tail_done) {
+            // A new unit. (Had a section been in flight, the pointer tail
+            // truncated it: the previous unit is abandoned.)
+            self.packets.clear();
+            self.packets.push(cached);
+            self.pmt_ok = pmt_here;
+        } else if pusi {
+            // The pointer tail finished the section in flight: this packet
+            // belongs to the same unit (as in `PsiUnitStage`).
+            self.packets.push(cached);
+            self.pmt_ok |= pmt_tail || pmt_here;
+        } else {
+            if self.packets.is_empty() {
+                return None; // joined mid-unit
+            }
+            self.packets.push(cached);
+            self.pmt_ok |= pmt_tail;
+            // The section in flight ended without completing: the assembler
+            // aborted it (CC gap, bad header, failed CRC).
+            aborted = was_in_flight && !tail_done && !self.asm.in_flight();
+        }
+        if self.asm.in_flight() {
+            if self.packets.len() > PMT_UNIT_MAX_PACKETS {
+                self.packets.clear();
+                self.pmt_ok = false;
+            }
+            return None;
+        }
+        let packets = std::mem::take(&mut self.packets);
+        (std::mem::take(&mut self.pmt_ok) && !aborted).then_some(packets)
+    }
+}
+
 // ── PMT ES-info descriptor classification ───────────────────────────────
 //
 // `stream_type = 0x06` (ISO/IEC 13818-1 "PES private data") is the DVB

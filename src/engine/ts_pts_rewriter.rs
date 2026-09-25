@@ -143,7 +143,7 @@ use super::ts_parse::{
     descriptor_audio_kind, extract_pcr, extract_pes_dts, extract_pes_pts, mpeg2_crc32,
     parse_pat_programs, set_discontinuity_indicator, strip_to_af_only, ts_discontinuity_indicator,
     ts_has_adaptation, ts_has_payload, ts_pid, ts_pusi, CcRenumber,
-    SectionAssembler, NULL_PID, PAT_PID, TS_PACKET_SIZE, TS_SYNC_BYTE,
+    PmtUnitCollector, NULL_PID, PAT_PID, TS_PACKET_SIZE, TS_SYNC_BYTE,
 };
 
 /// PCR pre-roll in 27 MHz ticks. Matches `av_sync_mux::PCR_PREROLL_27MHZ`.
@@ -336,12 +336,15 @@ pub struct TsPtsRewriter {
     last_cc_on_pcr_pid: HashMap<u16, u8>,
     /// Cached most-recent PAT packet for PSI_RR injection.
     cached_pat: Option<[u8; TS_PACKET_SIZE]>,
-    /// Cached most-recent PMT packets keyed by PMT PID.
-    cached_pmts: HashMap<u16, [u8; TS_PACKET_SIZE]>,
-    /// Section reassembly per PMT PID. Every section a packet completes is
-    /// considered — a PMT PID may carry other tables ahead of the PMT
-    /// (ATSC / DigiCipher 0xC0 sections), and a PMT may span packets.
-    pmt_asm: HashMap<u16, SectionAssembler>,
+    /// Cached most-recent complete PMT unit — every packet of it — keyed
+    /// by PMT PID. A PMT may span packets; the cache used to hold only the
+    /// PUSI packet, so PSI_RR re-emitted a multi-packet PMT truncated.
+    cached_pmts: HashMap<u16, Vec<[u8; TS_PACKET_SIZE]>>,
+    /// Section reassembly and unit collection per PMT PID. Every section a
+    /// packet completes is considered — a PMT PID may carry other tables
+    /// ahead of the PMT (ATSC / DigiCipher 0xC0 sections), and a PMT may
+    /// span packets.
+    pmt_units: HashMap<u16, PmtUnitCollector>,
     /// True once a PMT section has been parsed (roles learned). Cleared
     /// again when the PAT drops every PMT PID a PMT was learned from (a
     /// playlist item or a re-muxed upstream moving to a new program), so
@@ -489,7 +492,7 @@ impl TsPtsRewriter {
             last_cc_on_pcr_pid: HashMap::new(),
             cached_pat: None,
             cached_pmts: HashMap::new(),
-            pmt_asm: HashMap::new(),
+            pmt_units: HashMap::new(),
             pmt_learned: false,
             learned_by_pmt: HashMap::new(),
             unlearned_src_27mhz: 0,
@@ -615,7 +618,6 @@ impl TsPtsRewriter {
                 self.note_psi_emitted();
             } else if on_pmt_pid {
                 if ts_pusi(pkt) {
-                    self.cache_pmt_packet(pkt);
                     self.note_psi_emitted();
                 }
                 self.observe_pmt(pkt);
@@ -1031,8 +1033,10 @@ impl TsPtsRewriter {
         let mut pmt_pids: Vec<u16> = self.cached_pmts.keys().copied().collect();
         pmt_pids.sort_unstable();
         for pid in pmt_pids {
-            if let Some(pmt) = self.cached_pmts.get(&pid).copied() {
-                let mut buf = pmt;
+            // The whole unit, each packet on the next CC: a multi-packet PMT
+            // re-emitted as its first packet alone is no PMT at all.
+            let unit = self.cached_pmts.get(&pid).cloned().unwrap_or_default();
+            for mut buf in unit {
                 self.stamp_psi_cc(pid, &mut buf);
                 out.extend_from_slice(&buf);
             }
@@ -1335,7 +1339,7 @@ impl TsPtsRewriter {
         for pid in lost {
             self.last_pmt_versions.remove(&pid);
             self.cached_pmts.remove(&pid);
-            self.pmt_asm.remove(&pid);
+            self.pmt_units.remove(&pid);
             self.forget_program(pid);
         }
         self.pmt_pids = new_pmt_pids;
@@ -1380,27 +1384,22 @@ impl TsPtsRewriter {
         }
     }
 
-    /// Cache the latest PUSI packet on a PMT PID for PSI_RR injection.
-    fn cache_pmt_packet(&mut self, pkt: &[u8]) {
-        let mut cached = [0u8; TS_PACKET_SIZE];
-        cached.copy_from_slice(pkt);
-        self.cached_pmts.insert(ts_pid(pkt), cached);
-    }
-
-    /// Feed one packet on a PMT PID through its section assembler and learn
-    /// PCR PIDs and ES roles from every complete PMT section. Walking every
-    /// section (not just the one at the pointer target) is what finds a
-    /// PMT sitting behind a user-private table on its PID.
+    /// Feed one packet on a PMT PID through its unit collector: cache each
+    /// complete PMT unit (every packet of it) for PSI_RR injection, and
+    /// learn PCR PIDs and ES roles from every complete PMT section. Walking
+    /// every section (not just the one at the pointer target) is what finds
+    /// a PMT sitting behind a user-private table on its PID.
     fn observe_pmt(&mut self, pkt: &[u8]) {
         let pmt_pid = ts_pid(pkt);
-        let sections: Vec<Vec<u8>> = self
-            .pmt_asm
-            .entry(pmt_pid)
-            .or_default()
-            .push_packet(pkt)
-            .filter(|s| s.first() == Some(&0x02) && s.len() >= 16)
-            .map(|s| s.to_vec())
-            .collect();
+        let mut sections: Vec<Vec<u8>> = Vec::new();
+        let unit = self.pmt_units.entry(pmt_pid).or_default().push_packet(pkt, |s| {
+            if s.first() == Some(&0x02) && s.len() >= 16 {
+                sections.push(s.to_vec());
+            }
+        });
+        if let Some(unit) = unit {
+            self.cached_pmts.insert(pmt_pid, unit);
+        }
         for section in sections {
             self.learn_pmt_section(pmt_pid, &section);
         }
@@ -2721,6 +2720,47 @@ mod tests {
             2,
             "next natural PMT continues at CC=2 post-injection"
         );
+    }
+
+    /// PSI_RR re-emits a PMT that spans two packets whole — both packets,
+    /// on consecutive CCs — so a receiver can reassemble it. The cache used
+    /// to hold only the PUSI packet: the injection was a lone first packet,
+    /// a PMT no receiver could complete. A later unit that a CC gap cut
+    /// short does not replace the cached good one.
+    #[test]
+    fn psi_rr_injects_a_multi_packet_pmt_whole() {
+        use crate::engine::ts_test_fixtures::{packetize_sections, pat_packet, two_packet_pmt};
+        const PMT_PID: u16 = 0x1000;
+        let (sec, _) = two_packet_pmt(1, 0);
+        let pmt = packetize_sections(PMT_PID, &[&sec], 3);
+        assert_eq!(pmt.len(), 2);
+        let pacer = make_wallclock_pacer();
+        let mut r = TsPtsRewriter::new(pacer.clone());
+        let mut natural = Vec::new();
+        r.process(&pat_packet(&[(1, PMT_PID)], 0, 0), &mut natural);
+        r.process(&[pmt[0], pmt[1]].concat(), &mut natural);
+        // A damaged repeat: the continuation lost (CC gap) — cut short.
+        let mut cut = pmt;
+        cut[1][3] = (cut[1][3] & 0xF0) | ((cut[1][3] + 5) & 0x0F);
+        r.process(&[cut[0], cut[1]].concat(), &mut natural);
+        let last_natural_cc = natural[natural.len() - TS_PACKET_SIZE + 3] & 0x0F;
+
+        r.last_psi_emit_master_27mhz = Some(pacer.now_27mhz().wrapping_sub(600 * 27_000));
+        let mut out = Vec::new();
+        r.process(&build_pcr_packet(0x100, 50_000_000), &mut out);
+
+        let pkts: Vec<&[u8]> = out.chunks(TS_PACKET_SIZE).collect();
+        let pids: Vec<u16> = pkts.iter().map(|p| ts_pid(p)).collect();
+        assert_eq!(pids, vec![PAT_PID, PMT_PID, PMT_PID, 0x100], "PAT, the whole PMT, then source");
+        assert_eq!(pkts[1][3] & 0x0F, (last_natural_cc + 1) & 0x0F);
+        assert_eq!(pkts[2][3] & 0x0F, (last_natural_cc + 2) & 0x0F);
+        let mut asm = crate::engine::ts_parse::SectionAssembler::new();
+        let mut got = Vec::new();
+        for p in &pkts[1..3] {
+            got.extend(asm.push_packet(p).map(|s| s.to_vec()));
+        }
+        assert_eq!(got, vec![sec.clone()], "the injected packets reassemble the source PMT");
+        assert_eq!(mpeg2_crc32(&got[0]), 0);
     }
 
     /// First-emit CC seeding — the rewriter's first emit on a PSI PID
