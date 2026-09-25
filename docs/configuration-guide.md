@@ -1384,6 +1384,43 @@ of the local file kicks in transparently.
 > omitting the declaration makes rate control over-allocate by orders of
 > magnitude rather than fail loudly.
 
+**How a `ts` source is spliced.** Every file start — flow start, each
+loop, each playlist transition — continues one wire timeline:
+
+- Packets ahead of the file's first PCR are held until it arrives, then go
+  out with the file's offset applied. They used to leave with the file's
+  raw timestamps (Sky's first video PES sits at packet 14, its first PCR at
+  23): ~20 550 s off the live timeline, and a DI downstream at every loop.
+  A file with no PCR in its first 4096 packets keeps only its PSI from that
+  stretch and plays the rest as before.
+- Video starts at a random-access point. Video PES are dropped until an
+  H.264 SPS / IDR, HEVC VPS / SPS / IRAP, MPEG-2 sequence header or a
+  `random_access_indicator`, then the open-GOP leading pictures presented
+  before it. Broadcast captures start mid-GOP; played from byte 0 those
+  pictures decoded against the previous loop's references. A dropped packet
+  that carries a PCR stays as an adaptation-field-only packet. After 3 s
+  without one the gate gives up and passes the video. The video PID comes
+  from the file's first 512 KiB (2 MiB with `program_number`); when its PMT
+  lies further in, the gate starts at the PMT only if no video has gone out
+  yet.
+- The next file's timeline starts past the previous file's last video
+  decode time, not only its last audio and PCR — a capture leads its PCR by
+  more video at its end than at its start, which stepped video DTS back at
+  every loop.
+- With PCR deadlines (the default) the next file's first PCR is scheduled
+  exactly the PCR gap after the previous file's last one on the wall clock,
+  with PCRs at most 35 ms apart across the gap — each sent as a full
+  1316-byte datagram (the PCR and six null packets), since the UDP / RTP /
+  SRT outputs re-chunk to seven packets per datagram and would otherwise
+  hold a lone PCR packet until the next file's data. Re-epoching at the
+  moment the file opened ran each loop ~70–85 ms ahead of real time. With
+  `pcr_deadlines: false` each file keeps its own epoch and this carry does
+  not apply.
+
+Expect up to about a second of held picture at each loop point of a
+capture that starts mid-GOP (the audio keeps playing) instead of corrupt
+pictures.
+
 **Media library directory** — the on-disk location where uploaded files
 are stored on the edge. Resolution order:
 

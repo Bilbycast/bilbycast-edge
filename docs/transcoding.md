@@ -346,6 +346,21 @@ on a PID the PAT maps to one program only, the first PMT section is
 accepted too, as before — the rule the shared demuxer and the display
 audio meter apply as well.
 
+### Before the PMT: nothing but PSI
+
+Until the program's PMT has been parsed, both replacers forward only PSI /
+SI (PIDs 0x00–0x1F — PAT, NIT, SDT, EIT, TDT — the PMT PID) and null
+packets, and drop everything else (`pre_pmt_dropped_packets` on the encode
+stats). An output used to open with the source's own video PES (raw
+timestamps, no SPS / PPS), source audio and source PCRs, then jump its CC
+when the replacer took the PID over; nothing ahead of the PMT is decodable
+anyway. The gate re-arms when the PAT moves the program to a new PMT PID.
+A PMT that never parses opens it after **5 s** — today's passthrough; the
+engage watchdog below says why. When a replacer takes over a PID that
+carried passthrough packets (the gate fallback, a program re-layout, a
+switch from a codec it cannot decode), its first packet continues that
+PID's CC.
+
 ### When the transcoder finds nothing to re-encode
 
 Passing the source ES through is the intended fallback when there is
@@ -600,7 +615,8 @@ Decodes the source video ES (H.264 or HEVC) in-process via
 and muxes the new bitstream back into the output TS. The program's PMT
 is rebuilt through the same `ts_pmt_edit` stage as the audio replacer
 (see "What the output PMT says" above): the target `stream_type`,
-`PCR_PID` forced to the video PID (this module carries the PCR), and the
+`PCR_PID` forced to the video PID (the input's PCRs are carried onto it —
+see [Output PCR](#output-pcr--the-remux-model) below), and the
 video descriptor policy on the re-encoded ES — the source codec's video
 descriptors (MPEG-2 0x02, MPEG-4 0x1B, AVC 0x28 / 0x2A, HEVC 0x38),
 maximum_bitrate (0x0E), an ES-level CA descriptor (0x09) and a
@@ -906,7 +922,57 @@ Same set as `audio_encode`:
 - Core stage: `src/engine/ts_video_replace.rs` (streaming `TsVideoReplacer`).
 - Pipeline per decoded frame: `VideoDecoder` → `DecodedFrame::yuv_planes()` → `VideoEncoder::encode_frame(y, u, v, pts)` → fresh video PES → 188-byte TS packets.
 - Wiring: `output_udp.rs`, `output_rtp.rs`, `output_srt.rs` chain
-  `program_filter → audio_replacer → video_replacer → egress`.
+  `program_filter → audio_replacer → video_replacer → pcr_remux → egress`.
+- **Output DTS never steps back.** A decoded frame whose PTS does not
+  advance past the last one admitted to the encoder — by up to 1 s — is
+  dropped *before* it is queued or encoded: FFmpeg's H.264 decoder emits the
+  leading pictures of a splice without a clean random-access point in decode
+  order, and their PTS used to go straight to the wire (+11 572, +10 800,
+  −25 200, +28 800 ticks at every loop of a looping media file, with the
+  PTS-derived PCR stepping −279 ms alongside). A drop leaves a pending
+  force-IDR and the frame counter for the next admitted frame; it counts in
+  `dropped_frames` and in `non_monotonic_frames_dropped` on the video encode
+  stats. A step of more than 1 s either way is a new epoch and passes. A
+  decoded frame without a PTS takes the last admitted PTS plus the
+  *measured* frame interval (not the per-field DTS step of a PAFF source).
+
+## Output PCR — the remux model
+
+Both replacers keep the **input's PCR timeline** and neither generates a
+PCR of its own. Every input PCR on the source PCR_PID — riding in a video
+payload packet or in an adaptation-field-only packet, on the video, the
+audio or a dedicated PID — leaves the chain at the same stream position,
+value and discontinuity_indicator unchanged, as an adaptation-field-only
+packet (on the video PID when video is re-encoded, on the audio PID when
+the PCR rides there). A trailing stage, `engine::ts_pcr_remux`, then
+delays that timeline by one **measured** transcode allowance `D`:
+output PCR = input PCR − `D`, at the same positions and the same cadence
+as the input's.
+
+`D` starts at 80 ms. The first re-encoded PES of each PID latches it to at
+least how late that PES arrived behind its own decode time plus 80 ms; a
+PES that is still late afterwards raises it again (DI on the next PCR,
+Warning `transcode_pcr_late`, `late_frames` on the stats). The margin is
+cut to keep the largest video lead within the 1 s T-STD residency, never
+below 40 ms. A source with no PCR gets one synthesised from the re-encoded
+video (Info `transcode_pcr_synthesized`). Full model, the epoch rules and
+the numbers it replaced: [`clocking.md`](clocking.md#transcoded-output-pcr-the-remux-model).
+
+**Behaviour change.** Output PCR used to be `video PTS × 300 − 80 ms`,
+floored on a decaying audio lag: a clock that ran ~15 500 ppm fast against
+its own PTS (a 40.6 ms PCR step per 40 ms frame on a PAFF source), with
+zero and backward steps and a PCR only once per frame. Now the PCR rate is
+the input's and the **PCR→PTS relationship of every transcoded TS output
+changes**: each re-encoded ES leads the PCR by its source lead plus `D`
+minus its own pipeline delay. PES PTS are untouched, so lip-sync is too.
+An **audio-only** transcode is now delayed as well — its PCR used to pass
+through unchanged, and the audio replacer (which emits PES *k* only when
+PES *k + 1* arrives) was late against it on 3 930 of Sky's 4 016 PES.
+
+**Stats.** `transcode_pcr` on the output's stats (and, for an ingress
+transcode, on the flow's, for the active input): `offset_ms`,
+`late_frames`, `offset_raises`, `stale_frames_dropped`,
+`synthesized_pcrs`, `epochs`.
 
 ### PCR_AC at the receiver — observed-rate pacing
 

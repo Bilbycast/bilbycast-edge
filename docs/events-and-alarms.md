@@ -686,6 +686,33 @@ as-is; the pin warnings mean the pinned PID is wrong for this source.
 `emit_pinned_pid_absent`), driven from `src/engine/ts_audio_replace.rs` and
 `src/engine/ts_video_replace.rs` (`handle_pmt_unit`, `poll_engage`).
 
+While a replacer waits for its program's PMT it forwards only PSI / SI and
+null packets (the pre-PMT gate — see
+[`transcoding.md`](transcoding.md#before-the-pmt-nothing-but-psi)); a PMT
+that never parses opens the gate after 5 s, and the `*_source_not_found`
+Warning above (`pmt_not_parsed` / `no_pat`) is what explains it. Packets
+dropped meanwhile count in `pre_pmt_dropped_packets` on the encode stats.
+
+### Transcode PCR (`audio_encode` / `video_encode` on TS)
+
+The trailing PCR stage of every TS transcode chain (`engine::ts_pcr_remux`)
+re-stamps the input's PCR delayed by a measured transcode allowance `D`
+(see [`clocking.md`](clocking.md#transcoded-output-pcr-the-remux-model)).
+Category `flow`, scoped like the engage events above (`output_id` /
+"Output '{id}'" on an output transcode, `input_id` / "Input '{id}'" on an
+ingress transcode). Counters on the `transcode_pcr` stats block.
+
+| `error_code` | Severity | Trigger | Details |
+|---|---|---|---|
+| `transcode_pcr_late` | Warning | A re-encoded PES arrived behind the output PCR after `D` had latched — the pipeline got deeper than it measured (an encoder lookahead change, a HW encoder's async depth, a long source PES). `D` is raised to the lateness + 80 ms and the next PCR carries DI = 1. At most one per 10 s; `since_last_report` counts the late PES in between. | `{ error_code, pid, late_ms, offset_ms, late_frames, since_last_report }` |
+| `transcode_pcr_residency_exceeded` | Warning | Keeping a re-encoded PES on time needs a `D` that puts the video's largest lead of the epoch past the 1 s T-STD residency (ISO/IEC 13818-1 §2.4.2.6). Lateness wins; a strict decoder may overflow its video buffer. Once per PCR epoch. | `{ error_code, pid, lateness_ms, offset_ms, video_residency_ms }` |
+| `transcode_pcr_synthesized` | Info | A re-encoded video PES on the PCR_PID arrived with no input PCR at all, or none for 100 ms of video decode time: PCR is synthesised from the video's decode timestamps (`DTS − D`, ≤ 35 ms apart) until one arrives, which ends synthesis with DI = 1. Once per stage. | `{ error_code }` |
+
+**Source**: `src/engine/ts_pcr_remux.rs` (`guard`, `warn_residency`,
+`check_synth_entry`), wired in `src/engine/transcode_chain.rs`
+(`build_for_output`) and `src/engine/input_transcode.rs`
+(`set_decode_stall_watchdog`).
+
 ### Muxer-mode clock rewriter (`passthrough_clock` unset)
 
 | `error_code` | Severity | Trigger | Details |
