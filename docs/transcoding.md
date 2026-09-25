@@ -803,6 +803,8 @@ the program-level rate descriptors, and the content-tracked version.
                              //           | "vaapi" | "rkmpp"
   "width":       1920,       // optional — see "Limitations"
   "height":      1080,       // optional — see "Limitations"
+  "scan":        "auto",     // optional; "auto" (default) | "progressive"
+                             // | "interlaced" — see "Scan" below
   "fps_num":     30,         // set to MATCH THE SOURCE; may be omitted on TS
                              // outputs (auto-detected). Not a resampler.
   "fps_den":     1,
@@ -841,6 +843,7 @@ the program-level rate descriptors, and the content-tracked version.
 | `tune` | backend-resolved: `zerolatency` on x264 / x265, **unset on every hardware backend** | The vocabularies are disjoint. x264 / x265 accept `zerolatency`, `film`, `animation`, `grain`, `stillimage`, `fastdecode`, `psnr`, `ssim`; NVENC accepts `hq`, `ll`, `ull`, `lossless`; QSV and VAAPI expose no `tune` option at all. Config validation is permissive over the union, because an `h264_auto` / `hevc_auto` output does not know its backend until flow start. A tune the resolved backend cannot accept is therefore **dropped** at flow start (`video_encode_util::sanitise_tune`), with a log line carrying `error_code = encoder_tune_not_supported` — a log line only, no manager event. Dropping matters: handing NVENC `zerolatency` makes `avcodec_open2` fail with `EINVAL (-22)`. An empty string means "unset — encoder chooses". |
 | `chroma` / `bit_depth` | `yuv420p` / `8` | Which backend can carry which combination is genuinely per-vendor; the matrix is later in this document rather than duplicated here. |
 | `source_video_pid` | unset | Pin the source video elementary PID instead of taking the first video stream in the active program's PMT (`stream_type` `0x01` / `0x02` / `0x1B` / `0x24`). Range `0x0010..=0x1FFE`, enforced at config load. Behaves exactly like `audio_encode.source_audio_pid` above, including the single-program rule and the fallback, which raises the Warning event `video_source_pid_not_found` — see that section for the MPTS recipe. |
+| `scan` | `auto` | Progressive or interlaced (field) coding of the output. `auto` field-codes an interlaced source on MPEG-TS re-encodes when the output is unscaled vertically and the resolved backend can; `progressive` is the pre-2026-09 behaviour; `interlaced` forces field coding (H.264 only). Capability `video-encode-scan`. See [Scan](#scan-interlaced-sources) below. |
 | `hw_decode` | `auto` | Which backend decodes the **source** ES before re-encode. `auto` walks VAAPI ≻ NVDEC ≻ QSV ≻ RKMPP ≻ CPU against the host's probed capabilities and the compiled-in `video-decoder-*` features; `cpu` forces software libavcodec, which is how you keep the host's HW decode sessions free for other flows. A forced backend the build or host cannot satisfy **does not fail the flow** — it logs `ts_video_replace: hw_decode preference … unavailable …; falling back to CPU` (a bare `warn`, no `error_code`, no manager event) and runs on CPU, and so does an edge whose startup probe never ran. That is deliberately unlike the display output, which raises `display_hw_decode_unavailable_falling_back`. Verification recipe: [`codec-matrix.md`](codec-matrix.md#verification-commands-per-host-class), item 4. |
 
 #### Colour metadata
@@ -857,6 +860,88 @@ though the pixels are not, and has no way to recover from.
 | `color_transfer` | unset | `bt709`, `smpte170m`, `smpte2084` (alias `pq`), `arib-std-b67` (alias `hlg`), `bt2020-10`, `bt2020-12` |
 | `color_matrix` | unset | `bt709`, `bt2020nc`, `bt2020c`, `smpte170m`, `smpte240m` |
 | `color_range` | unset | `tv` (aliases `limited`, `mpeg`) or `pc` (aliases `full`, `jpeg`). Unset really is unset — nothing is signalled and the encoder's own default stands. |
+
+### Scan: interlaced sources
+
+`video_encode.scan` (unset = `auto`) decides whether the re-encoded picture is
+coded progressive or as fields. Every release before this field coded
+progressive frames holding both fields woven together — `frame_mbs_only_flag`
+1, no `pic_struct`, the source's field order lost — and a vertical resize
+scaled the woven frame, blending its two fields into each other.
+
+It is settled once, when the encoder lazy-opens, from the frame in hand:
+
+| `scan` | Coded interlaced when | Otherwise |
+|---|---|---|
+| `auto` (default) | an MPEG-TS re-encode (TS outputs, the TS ingress transcoder) **and** the frame is a woven interlaced frame (an interlaced H.264 or MPEG-2 decode) **and** the output is not scaled vertically (`height` unset or equal to the source's) **and** the backend the resolver lands on can code fields on this host | progressive |
+| `progressive` | never | progressive — the old bitstream, byte for byte |
+| `interlaced` | always, on the first backend in the chain that can code fields — from a progressive source too (both fields from one instant, top first) | progressive with Warning `video_encode_interlace_unavailable` when no backend in the chain opens for fields, or the source's decoder hands out one field per picture |
+
+Field coding is **H.264 MBAFF** with `pic_struct` in the picture-timing SEI,
+in the source's field order (TFF / BFF, followed frame by frame across an
+input switch), on the backends FFmpeg gives an interlaced tool: **libx264**
+always, **h264_nvenc** and **h264_qsv** where the GPU allows it (the open is
+refused otherwise — an Intel Arrow Lake iGPU, for one, refuses QSV field encode). No HEVC
+encoder codes field pictures, and `h264_vaapi` / `h264_rkmpp` ignore the
+request, so validation refuses `interlaced` with those codecs. `auto` follows
+the backend the resolver lands on: on an Intel host whose `h264_auto` chain
+starts with a QSV that refuses fields, `auto` codes progressive on QSV rather
+than demoting to libx264 to get them; `interlaced` walks the chain for one
+that can. MBAFF costs libx264 roughly 20-30 % more CPU.
+
+With `interlaced`, a resize is done **per field**: each field is scaled on
+its own and the two are woven back, so a 1080i → 576i conversion keeps its
+fields apart; a 4:2:0 `height` must then be divisible by 4 (two fields of
+whole chroma rows — validated). `auto` does not field-code a scaled output,
+and a progressive resize of an interlaced source still scales the woven
+frame (the old behaviour); pin `scan: interlaced` for a field-correct
+interlaced conversion.
+
+Where it applies: `auto` field-codes only on MPEG-TS re-encodes — broadcast
+receivers display interlace natively. RTMP and CMAF honour an explicit
+`interlaced`; WebRTC refuses it (browsers display progressive only), and
+`webrtc_compatible` pins `progressive`. The raw-frame ingests (ST 2110-20 /
+-23, SDI, MXL) refuse `interlaced` — their frames carry no field order for
+the encoder to follow — and code progressive under `auto`.
+
+Not covered: an **HEVC field_seq** source (770_H's 1920x540 field pictures)
+decodes to one field per picture; weaving them back into frames is not done,
+so it is re-encoded as progressive 540-line pictures at the field rate
+(50 fps), with the source's SAR, exactly as before. Under `interlaced` it
+falls back to progressive with the Warning.
+
+Measured on the broadcast test captures (libx264, 8000 kbps, 2-minute
+captures): Sky Sports 1080i25 (PAFF)
+and Sky Witness (MBAFF) come out MBAFF, `pic_struct` signalled,
+`field_order=tt`, 25 fps; Spain (MPEG-2 720x576i) MBAFF at 64:45; with
+`interlaced` and 720x576 the 1080i source is scaled per field to 576i at
+64:45 (DAR 16:9); `auto` scaled to 1280x720 stays progressive; 770_H (HEVC
+field_seq) stays progressive 1920x540 at 50 fps. On Sky, MBAFF measured
+**+1.5 dB** mean PSNR over progressive at the same bitrate (38.5 vs
+37.0 dB, 1500 frames). Audio (gates 1, 6) is unchanged, and so is
+content-anchored lip-sync (within ±0.003 ms on the 2-minute capture — not
+the 30-minute gate 3 window).
+
+Behaviour change: an interlaced H.264 / MPEG-2 source on a TS transcode with
+no `scan` set now comes out MBAFF where the host's backend can code fields.
+Gate 7 (a professional IRD) has not been run on it — only ffmpeg decodes
+were checked; `scan: progressive` restores the old bitstream.
+
+### Sample aspect ratio
+
+The re-encode signals the source's sample aspect ratio in the VUI (nothing
+set it before, so every output left SAR-less and a receiver assumed square
+pixels: a 720x576 16:9 anamorphic service at 64:45 displayed at 5:4). The SAR
+comes from the frame the encoder opens on (the decoder's, when the frame
+carries none). Unscaled, it is the source's own; an unspecified source stays
+unspecified, so a square-pixel source is unchanged. Scaled, the **display
+aspect ratio** is kept: `out = src_sar × (src_w × dst_h) / (src_h × dst_w)`,
+reduced, with an unspecified source taken as square — 720x576 at 64:45 scaled
+to 1024x576 signals 1:1, and 1920x1080 scaled to 720x576 signals 64:45. It is
+decided at open; a later source with a different SAR keeps the first one.
+Every decode → encode path gets it (TS outputs and ingress, RTMP, WebRTC,
+CMAF); the raw-frame ingests (ST 2110, SDI, MXL) carry no SAR and signal
+none. There is no operator override yet.
 
 ### Backend availability
 
@@ -1111,7 +1196,32 @@ Same set as `audio_encode`:
   derived PTS past the next real one, which was then dropped as out of
   order — every real timestamp lost and the output 20 % fast. Now the first
   GOP or two can still lose their real frame while the interval is learned;
-  after that every real timestamp is admitted as it is.
+  after that every real timestamp is admitted as it is. A PES without a PTS
+  reaches the decoder without one (it used to go in as a real PTS of 0).
+- **The decoder opens on the SPS, seeded from it.** An H.264 source's decoder
+  is opened on the first PES that carries an SPS (PES before it are passed
+  over — nothing decodes before one; bounded at 300 PES), through
+  `VideoDecoder::open_opts` with `ReorderSeed::FromAccessUnit`: its reorder
+  depth (`has_b_frames`) starts at 0 when the SPS declares
+  `max_num_reorder_frames` (libavcodec then applies the declared depth, 0 for
+  IPPP — no added latency) and at 1 when it does not. libavcodec's default of 0
+  let a join on a non-IDR I picture mark the synthesised frame_num-gap
+  placeholders as recovered, and the join GOP read uninitialised memory (13-15
+  wrong frames per join on Sky Sports). Every other lazy decoder open in the
+  edge takes the same seed from the AU that triggered it (display, SDI, ST
+  2110-20, MXL, mosaic tiles, CMAF, RTMP, WebRTC, the warm thumbnail), and the
+  display / SDI outputs **drop and re-open** a seeded decoder on an input
+  switch instead of flushing it — a flush keeps the depth learned from the old
+  source and cannot re-apply a seed. Two residuals, documented rather than
+  fixed: a join on a stream whose true depth is 2+ and undeclared can still drop
+  1-3 decodable leading B-pictures once (seeding the level's DPB size would fix
+  it at the price of permanent latency), and an undeclared IPPP source now
+  carries one frame (40 ms at 25 fps) of decoder latency — which also moves the
+  transcoded output's mux interleave by that frame. NVDEC / QSV / RKMPP
+  decoders take no seed. Measured on Sky Sports played through a `media_player`
+  input (the capture starts mid-GOP): the first GOP of the re-encoded output used to
+  decode at 7.7 dB PSNR against the source (15 frames under 25 dB); seeded,
+  the minimum over 1500 frames is 34.3 dB.
 
 ## Output PCR — the remux model
 
@@ -1216,10 +1326,30 @@ commit message or release note and delete the bullet.
    `fps_num` / `fps_den` *declares* the rate rather than resampling to
    it. Where the value comes from differs by path:
    - **SRT / UDP / RTP / RIST outputs and the TS ingress transcoder**
-     (`engine::ts_video_replace`) measure the source rate from PES DTS
-     deltas and lock the encoder to it before it opens — but **only
-     when the field is unset**. Pinning suppresses the measurement
-     outright (`source_fps_locked`), so a wrong pin is never corrected.
+     (`engine::ts_video_replace`) measure the source rate from the
+     **decoded frames' PTS** — the pictures the encoder is actually
+     handed, once per call (`video_encode_util::FrameCadence`) — and lock
+     the encoder to it before it opens, **only when the field is unset**
+     (a pin is never overridden, only reported). Until 2026-09 the rate
+     came from the first PES DTS delta: that is the rate of *coded
+     pictures*, so a PAFF H.264 or MPEG-2 field-picture source, which
+     carries one field per PES 1800 ticks apart, locked 50 fps while the
+     decoder handed out 25 woven frames a second — the VUI said 50 fps, CBR
+     budgeted for 50 frames (the video came out at half the configured
+     bitrate) and the default GOP ran 4 s. The meter takes the mean of four
+     agreeing frame deltas, or from 12 deltas the median of 4-delta sums
+     over 4 (a 3:2 or 2:3:3:2 pulldown cadence measures 24000/1001, and one
+     dropped frame does not move it), snapped to a standard rate within
+     0.1 %. Frames decoded before the rate is known — about four at
+     startup — are dropped, since the encoder cannot open without it;
+     after 60 decoded frames with no usable PTS it opens at the PES DTS
+     step times the PES-per-frame ratio, else 30/1. An input switch with
+     the encoder already open drops nothing (its rate cannot change).
+     HEVC field_seq sources measure the field rate, 50/1, which is right
+     for the 540-line pictures they are coded as (see *Scan*). Measured on
+     Sky Sports 1080i25 with `bitrate_kbps: 8000`: the VUI went from
+     `time_scale` 100 (50 fps) to 50 (25 fps), the video ES from 4002 to
+     7981 kbps, and the IDR interval from 100 to 50 frames (2 s).
    - **RTMP, WebRTC and CMAF outputs have no auto-detect** and fall
      back to 30/1, so on those the field must be set to match the
      source. On RTMP it no longer affects A/V sync — FLV timestamps come
@@ -1232,7 +1362,10 @@ commit message or release note and delete the bullet.
    at the rate ratio times the configured value, the default GOP
    (`2 × fps`) spans the wrong duration, and the SPS VUI advertises the
    wrong rate. The edge logs `video_encode_fps_mismatch` once per
-   encoder run when it detects this.
+   source when the measured rate disagrees with the rate the encoder runs
+   at — a pin (`cause = "pinned"`), or on the TS path the rate an earlier
+   source opened it at (`cause = "input_switch"`; the encoder cannot
+   reopen at a new rate, so restart the output to lock the new one).
 3. **No rate-control tuning knobs.** We pass `bitrate_kbps` + a
    `tune=zerolatency` option and rely on defaults for VBV buffer size,
    CRF, look-ahead, etc. CBR-strict profiles (true constant-bitrate
@@ -1340,9 +1473,14 @@ only place it can be) — no relay change is needed.
   `ScalerDstFormat::{Yuvj420p, Yuv422p8, Yuv422p10le}`. The existing
   `VideoScaler::new()` constructor defaults to `Yuvj420p` and is
   behaviour-compatible.
-- **Source-driven frame-rate detection.** Parse the SPS / VPS during
-  decode-warm-up and feed detected fps into the encoder before first
-  frame. Avoids the default-30fps fallback above.
+- **Measured frame rate on RTMP, WebRTC and CMAF.** The TS paths lock the
+  encoder to the decoded-frame cadence (`FrameCadence`); these three still
+  open at a pinned rate or 30/1 — CMAF also forces a 60-frame GOP, 2.4 s at
+  25 fps. Same helper, deferred encoder open.
+- **HEVC field_seq weave.** Pair an HEVC field_seq source's top / bottom
+  field pictures back into frames (drop an orphan field, re-pair after a
+  reset), so it re-encodes as 1080i at the frame rate instead of 540-line
+  pictures at the field rate.
 - **`extradata` out-of-band for HLS.** HLS (still deferred) needs
   `global_header: true` and access to `VideoEncoder::extradata()`
   for the init segment / fMP4 moov. RTMP already uses this mode;
@@ -1435,6 +1573,7 @@ options the current binary cannot satisfy.
 | `video-encoder-qsv`         | Built with `--features video-encoder-qsv` (x86_64 only).       |
 | `video-encoder-vaapi`       | Built with `--features video-encoder-vaapi` (Linux).          |
 | `video-encoder-rkmpp`       | Built with `--features video-encoder-rkmpp` (aarch64 Rockchip only). |
+| `video-encode-scan`         | Always (this release on): `video_encode.scan` is honoured. An older edge ignores the field on a push and codes progressive, so a UI must gate the scan picker on it. |
 
 A follow-up will add an `st2110-video` capability flag so the manager
 UI can offer the ST 2110-20 / -23 pixel-format / partition-mode

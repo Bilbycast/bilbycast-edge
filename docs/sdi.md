@@ -665,7 +665,11 @@ against a real reference monitor.
   degrade.
 * **Bounded everywhere** — the hand-off channel drops rather than buffers
   latency; the playout write times out rather than hanging on a dead card;
-  input switches flush the decoder so they re-anchor on the next keyframe.
+  an input switch drops the decoder, which re-opens on the new input's first
+  keyframe with its H.264 reorder depth seeded from that AU's SPS (a flush
+  kept the old input's depth — this frame-threaded decoder cannot be
+  re-seeded — so a switch from an IPPP source to a deeper one showed a GOP
+  of garbage).
 
 **Not yet field-validated** (works in bring-up, needs hardware not on hand):
 

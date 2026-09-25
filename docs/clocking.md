@@ -373,7 +373,11 @@ after the first latch — lowering it would be another PCR step — and a
 latch that would move it by less than 10 ms leaves it alone (on Sky the
 first audio PES asked for 80.24 ms against the initial 80: a DI for a
 quarter of a millisecond). A PES more than 5 s late is taken to be stamped
-on another timeline and never moves `D`.
+on another timeline and never moves `D`. The H.264 decoder's reorder seed
+(`transcoding.md`, Engine internals) holds one frame on an IPPP source
+whose SPS declares no reorder depth; that frame is part of the lateness
+the first latch measures, not a later step — though an input switch from
+a declaring source to such a one can raise `D` by it once.
 
 **The residency cap.** The margin is cut (never below lateness + 40 ms)
 so the largest lead of the program's video observed in the epoch stays
