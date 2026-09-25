@@ -641,7 +641,7 @@ fn remux_ts_audio_inprocess(
     const TS_SYNC_BYTE: u8 = 0x47;
 
     use super::ts_pmt_edit::{
-        parse_pmt, pmt_index, rebuild_pmt_section, AudioTarget, EsEdit, PmtEdit, PsiUnitStage,
+        parse_pmt, pmt_index, rebuild_pmt_section_fitting, AudioTarget, EsEdit, PmtEdit, PsiUnitStage,
         TsFlavour,
     };
 
@@ -814,7 +814,7 @@ fn remux_ts_audio_inprocess(
                     encoded_frame_idx += 1;
 
                     // Build PES packet for this audio frame
-                    let pes = build_audio_pes(&ef.data, ef.pts);
+                    let pes = build_audio_pes(codec.ts_pes_stream_id(), &ef.data, ef.pts);
                     // Packetize PES into TS packets
                     let ts_pkts = packetize_ts(audio_pid, &pes, &mut audio_cc);
                     for ts_pkt in &ts_pkts {
@@ -831,18 +831,11 @@ fn remux_ts_audio_inprocess(
             // target's descriptor policy (source codec descriptors dropped).
             if let Some(mut unit) = pmt_stage.push(pkt, &mut output) {
                 if let Some(i) = pmt_index(unit.sections(), program_number, pmt_pid_shared) {
-                    let section = unit.sections()[i].clone();
-                    let rebuilt = rebuild_pmt_section(&section, &PmtEdit { es: &edit, ..Default::default() })
-                        .and_then(|full| {
-                            if unit.fits_source_packets_with(i, &full) {
-                                Some(full)
-                            } else {
-                                rebuild_pmt_section(
-                                    &section,
-                                    &PmtEdit { es: &edit, no_additions: true, ..Default::default() },
-                                )
-                            }
-                        });
+                    let rebuilt = rebuild_pmt_section_fitting(
+                        &unit,
+                        i,
+                        &PmtEdit { es: &edit, ..Default::default() },
+                    );
                     if let Some(new_section) = rebuilt {
                         unit.replace_section(i, new_section);
                     }
@@ -861,7 +854,7 @@ fn remux_ts_audio_inprocess(
     while encoded_frame_idx < encoded_frames.len() {
         let ef = &encoded_frames[encoded_frame_idx];
         encoded_frame_idx += 1;
-        let pes = build_audio_pes(&ef.data, ef.pts);
+        let pes = build_audio_pes(codec.ts_pes_stream_id(), &ef.data, ef.pts);
         let ts_pkts = packetize_ts(audio_pid, &pes, &mut audio_cc);
         for ts_pkt in &ts_pkts {
             output.extend_from_slice(ts_pkt);
@@ -1298,8 +1291,10 @@ fn encode_audio_pcm_aac(
 
 /// Build a PES packet wrapping an audio frame.
 #[cfg(feature = "media-codecs")]
-fn build_audio_pes(audio_data: &[u8], pts: u64) -> Vec<u8> {
-    // PES header: 0x000001 + stream_id(0xC0) + length + flags + PTS
+fn build_audio_pes(stream_id: u8, audio_data: &[u8], pts: u64) -> Vec<u8> {
+    // PES header: 0x000001 + stream_id + length + flags + PTS. stream_id is
+    // 0xC0 for MP2 / AAC and 0xBD (private_stream_1) for AC-3 — see
+    // `AudioCodec::ts_pes_stream_id`.
     let pes_header_len = 14; // 3 + 1 + 2 + 2 + 1 + 5
     let pes_len = 3 + 5 + audio_data.len(); // optional header + PTS + payload
 
@@ -1308,8 +1303,7 @@ fn build_audio_pes(audio_data: &[u8], pts: u64) -> Vec<u8> {
     pes.push(0x00);
     pes.push(0x00);
     pes.push(0x01);
-    // Stream ID: audio
-    pes.push(0xC0);
+    pes.push(stream_id);
     // PES packet length (0 = unbounded for video, but for audio we set it)
     let pkt_len = pes_len as u16;
     pes.push((pkt_len >> 8) as u8);
@@ -1625,7 +1619,7 @@ mod pmt_remux_tests {
             if len == 0 || off + len > ADTS.len() {
                 break;
             }
-            let pes = build_audio_pes(&ADTS[off..off + len], pts);
+            let pes = build_audio_pes(0xC0, &ADTS[off..off + len], pts);
             for p in packetize_ts(0x101, &pes, &mut cc) {
                 seg.extend_from_slice(&p);
             }
@@ -1648,5 +1642,14 @@ mod pmt_remux_tests {
         assert_eq!(a.stream_type, 0x81);
         let tags: Vec<u8> = descriptors(v.es_info(a)).map(|(t, _)| t).collect();
         assert_eq!(tags, vec![0x0A, 0x05], "7C dropped, AC-3 registration added");
+        // AC-3 rides private_stream_1 (0xBD), as A/52 Annex A and TS 101
+        // 154 require — the remux used to write the MPEG audio id 0xC0.
+        let ids: Vec<u8> = out
+            .chunks(188)
+            .filter(|p| crate::engine::ts_parse::ts_pid(p) == 0x101 && crate::engine::ts_parse::ts_pusi(p))
+            .map(|p| p[crate::engine::ts_parse::ts_payload_offset(p) + 3])
+            .collect();
+        assert!(!ids.is_empty(), "re-encoded audio in the segment");
+        assert!(ids.iter().all(|&id| id == 0xBD), "AC-3 PES stream_id: {ids:02X?}");
     }
 }

@@ -1149,7 +1149,19 @@ mod inner {
                 ) {
                     self.pmt_version.stamp(&mut new_section);
                     unit.replace_section(i, new_section);
+                    self.pmt_stage.emit(unit, output);
+                    return;
                 }
+            }
+            // Not re-encoding: once this stage has stamped a version, the
+            // passthrough PMT is stamped from the same sequence so it can
+            // never repeat a version the rebuilt PMT already carried (see
+            // `OutVersion::has_stamped`). Before any stamp it stays
+            // byte-identical.
+            if self.pmt_version.has_stamped() {
+                let mut passthrough = section;
+                self.pmt_version.stamp(&mut passthrough);
+                unit.replace_section(i, passthrough);
             }
             self.pmt_stage.emit(unit, output);
         }
@@ -2582,6 +2594,33 @@ mod tests {
         let ev = rx.try_recv().expect("event emitted");
         assert_eq!(ev.output_id.as_deref(), Some("out-v"));
         assert_eq!(ev.details.unwrap()["error_code"], "video_transcode_source_not_found");
+    }
+
+    /// The video counterpart of the audio stage's rule: after an input
+    /// switch to a source with no decodable video (VC-1 here), the
+    /// passthrough PMT gets a version from the stage's own sequence instead
+    /// of its source version — which equalled the version the previous
+    /// input's rebuilt PMT carried.
+    #[test]
+    fn a_passthrough_pmt_after_a_rebuilt_one_gets_a_new_version() {
+        use crate::engine::ts_test_fixtures::{packetize_sections, pmt_section};
+        let mpeg2 = pmt_section(1, 1, 0x100, &[], &[(0x02, 0x100, &[]), (0x0F, 0x101, &[])]);
+        let vc1 = pmt_section(1, 1, 0x100, &[], &[(0xEA, 0x100, &[]), (0x0F, 0x101, &[])]);
+        let ver = |s: &[u8]| (s[5] >> 1) & 0x1F;
+        let mut r = TsVideoReplacer::new(&cfg("x264"), None).unwrap();
+        let mut out = Vec::new();
+        r.process(&synth_pat(0x1000), &mut out);
+        out.clear();
+        r.process(&packetize_sections(0x1000, &[&mpeg2], 0)[0], &mut out);
+        let a = pmt_in(&out, 1);
+        assert_eq!(parse_pmt(&a).unwrap().es[0].stream_type, 0x1B);
+        r.external_reset_handle().store(true, Ordering::Relaxed);
+        out.clear();
+        r.process(&packetize_sections(0x1000, &[&vc1], 1)[0], &mut out);
+        let b = pmt_in(&out, 1);
+        assert_eq!(parse_pmt(&b).unwrap().es[0].stream_type, 0xEA, "content passed through");
+        assert_eq!(mpeg2_crc32(&b), 0);
+        assert_ne!(ver(&b), ver(&a));
     }
 
     #[test]

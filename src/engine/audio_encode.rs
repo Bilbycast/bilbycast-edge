@@ -108,6 +108,18 @@ impl AudioCodec {
         }
     }
 
+    /// PES `stream_id` for this codec in MPEG-TS: an MPEG audio stream id
+    /// (0xC0) for MP2 and ADTS AAC, `private_stream_1` (0xBD) for AC-3 —
+    /// ATSC A/52 Annex A and ETSI TS 101 154 both carry AC-3 in
+    /// private_stream_1, and FFmpeg's `mpegtsenc` does the same. (Opus has
+    /// no TS mapping on the outputs that use this.)
+    pub fn ts_pes_stream_id(self) -> u8 {
+        match self {
+            Self::Ac3 => 0xBD,
+            Self::AacLc | Self::HeAacV1 | Self::HeAacV2 | Self::Mp2 | Self::Opus => 0xC0,
+        }
+    }
+
     /// Wire identifier as it appears in tracing / event payloads.
     pub fn as_str(&self) -> &'static str {
         match self {

@@ -725,8 +725,19 @@ impl AudioFullState {
             let es_pid = (((section[i + 1] as u16) & 0x1F) << 8) | section[i + 2] as u16;
             let es_info_length =
                 (((section[i + 3] as usize) & 0x0F) << 8) | section[i + 4] as usize;
-            if is_audio_stream_type(stream_type) {
-                discovered.insert(es_pid, stream_type);
+            // DVB carries AC-3 / E-AC-3 / AAC-LATM / DTS on `stream_type
+            // 0x06` with a codec descriptor (the convention an AC-3
+            // `audio_encode` also emits for a DVB-flavoured source, see
+            // `ts_pmt_edit::TsFlavour`); resolve it to the ATSC-style type
+            // the decoder dispatch keys on, exactly as `ts_demux` does.
+            let effective = if stream_type == 0x06 {
+                let info_end = (i + 5 + es_info_length).min(body_end);
+                private_audio_stream_type(&section[i + 5..info_end])
+            } else {
+                Some(stream_type)
+            };
+            if let Some(st) = effective.filter(|st| is_audio_stream_type(*st)) {
+                discovered.insert(es_pid, st);
             }
             i += 5 + es_info_length;
         }
@@ -1155,7 +1166,9 @@ fn pes_payload_offset(payload: &[u8]) -> usize {
         return 0;
     }
     let stream_id = payload[3];
-    if !(0xC0..=0xEF).contains(&stream_id) {
+    // 0xC0–0xEF: MPEG audio / video stream ids. 0xBD: private_stream_1 —
+    // how DVB and ATSC carry AC-3 / E-AC-3 / DTS (same PES header layout).
+    if !((0xC0..=0xEF).contains(&stream_id) || stream_id == 0xBD) {
         return 0;
     }
     let hdr_len = payload[8] as usize;
@@ -1176,6 +1189,23 @@ fn ff_codec_for_stream_type_local(st: u8) -> Option<video_codec::AudioDecoderCod
 #[cfg(not(feature = "media-codecs"))]
 fn ff_codec_for_stream_type_local(_st: u8) -> Option<()> {
     None
+}
+
+/// Resolve a `stream_type 0x06` ES's descriptor loop to the ATSC-style
+/// audio stream_type this tier dispatches on, via the shared classifier
+/// `ts_parse::descriptor_audio_kind`. Opus, SMPTE 302M and AC-4 stay
+/// unmetered here, as before.
+fn private_audio_stream_type(descriptors: &[u8]) -> Option<u8> {
+    use crate::engine::ts_parse::{descriptor_audio_kind, PrivateEsAudioKind};
+    match descriptor_audio_kind(descriptors)? {
+        PrivateEsAudioKind::Ac3 => Some(0x81),
+        PrivateEsAudioKind::Eac3 => Some(0x87),
+        PrivateEsAudioKind::AacLatm => Some(0x11),
+        PrivateEsAudioKind::Dts => Some(0x82),
+        PrivateEsAudioKind::Opus | PrivateEsAudioKind::Smpte302m | PrivateEsAudioKind::Ac4 => {
+            None
+        }
+    }
 }
 
 fn is_audio_stream_type(st: u8) -> bool {
@@ -1213,5 +1243,48 @@ mod pmt_walk_tests {
         st.process_ts_packet(&vh1_pat_packet());
         st.process_ts_packet(&vh1_pmt_packet());
         assert!(st.audio_pids.contains_key(&0x0E10));
+    }
+
+    /// An ingress AC-3 `audio_encode` on a DVB-flavoured source (`auto`)
+    /// puts the audio on the flow as `0x06` + "AC-3" + AC-3_descriptor,
+    /// and its PES on private_stream_1 (0xBD). The audio_full tier used to
+    /// select audio by bare stream_type (no 0x06 arm) and strip only
+    /// 0xC0–0xEF PES headers, so it stopped metering such a flow — and
+    /// every DVB source carrying AC-3 that way.
+    #[test]
+    fn dvb_flavoured_ac3_from_an_ingress_transcode_is_metered() {
+        use crate::engine::ts_audio_replace::TsAudioReplacer;
+        use crate::engine::ts_test_fixtures::{packetize_sections, pat_packet, pmt_section};
+        let ae: crate::config::models::AudioEncodeConfig =
+            serde_json::from_value(serde_json::json!({ "codec": "ac3" })).unwrap();
+        let mut r = TsAudioReplacer::new(&ae, None).unwrap();
+        // Sky-Sports-shaped DVB source: AAC with an AAC_descriptor (0x7C).
+        let src = pmt_section(
+            1,
+            0,
+            0x100,
+            &[],
+            &[(0x1B, 0x100, &[]), (0x0F, 0x101, &[0x0A, 0x04, b'e', b'n', b'g', 0, 0x7C, 0x01, 0x51])],
+        );
+        let mut flow = Vec::new();
+        r.process(&pat_packet(&[(1, 0x1000)], 0, 0), &mut flow);
+        r.process(&packetize_sections(0x1000, &[&src], 0)[0], &mut flow);
+        let pmt_pkt = flow.chunks(TS_PACKET_SIZE).nth(1).expect("PMT on the flow");
+        let s = crate::engine::ts_parse::find_section_in_packet(pmt_pkt, 0x02, Some(1)).unwrap();
+        let v = crate::engine::ts_pmt_edit::parse_pmt(&pmt_pkt[s.start..s.end()]).unwrap();
+        assert_eq!(v.es[1].stream_type, 0x06, "DVB carriage on the flow");
+
+        let mut st = AudioFullState::new(AudioFullMode::Ts);
+        for p in flow.chunks(TS_PACKET_SIZE) {
+            st.process_ts_packet(p);
+        }
+        let a = st.audio_pids.get(&0x101).expect("audio PID metered");
+        assert_eq!(a.stream_type, 0x81, "resolved to AC-3");
+        assert_eq!(codec_name(a.stream_type), "ac3");
+
+        // The AC-3 PES header (private_stream_1) is stripped like an MPEG
+        // audio one.
+        let pes = [0x00, 0x00, 0x01, 0xBD, 0x00, 0x10, 0x84, 0x80, 0x05, 0x21, 0, 1, 0, 1, 0x0B, 0x77];
+        assert_eq!(pes_payload_offset(&pes), 14);
     }
 }

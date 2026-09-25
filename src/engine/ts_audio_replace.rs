@@ -66,7 +66,7 @@ use super::ts_parse::{
     TS_PACKET_SIZE, TS_SYNC_BYTE,
 };
 use super::ts_pmt_edit::{
-    detect_flavour, parse_pmt, pmt_index, rebuild_pmt_section, AudioTarget, EsEdit, OutVersion,
+    detect_flavour, parse_pmt, pmt_index, rebuild_pmt_section_fitting, AudioTarget, EsEdit, OutVersion,
     PmtEdit, PmtView, PsiUnit, PsiUnitStage, TsFlavour,
 };
 
@@ -880,27 +880,33 @@ impl TsAudioReplacer {
         {
             let target = self.audio_target();
             let edit = [EsEdit::Audio { pid: apid, target }];
-            let rebuilt = rebuild_pmt_section(&section, &PmtEdit { es: &edit, ..Default::default() })
-                .and_then(|full| {
-                    // Growth fallback: the AC-3 additions (registration +
-                    // 0x6A) are the only edit that grows a section. When the
-                    // grown unit would need more packets than the source's,
-                    // emit self-identifying 0x81 with no additions instead,
-                    // so a single-packet PMT stays single-packet for every
-                    // downstream single-packet parser.
-                    if unit.fits_source_packets_with(i, &full) {
-                        Some(full)
-                    } else {
-                        rebuild_pmt_section(
-                            &section,
-                            &PmtEdit { es: &edit, no_additions: true, ..Default::default() },
-                        )
-                    }
-                });
+            // Growth fallback: the AC-3 additions (registration + 0x6A) are
+            // the only edit that grows a section. When the grown unit would
+            // need more packets than the source's, or the grown section
+            // would overflow 1021 bytes, emit self-identifying 0x81 with no
+            // additions instead.
+            let rebuilt = rebuild_pmt_section_fitting(
+                &unit,
+                i,
+                &PmtEdit { es: &edit, ..Default::default() },
+            );
             if let Some(mut new_section) = rebuilt {
                 self.pmt_version.stamp(&mut new_section);
                 unit.replace_section(i, new_section);
+                self.pmt_stage.emit(unit, output);
+                return;
             }
+        }
+        // Not re-encoding (e.g. an input switch to a DTS-only source). Once
+        // this stage has stamped a version, the passthrough PMT is stamped
+        // from the same sequence (content unchanged): with its source
+        // version it could repeat the version the rebuilt PMT carried, and a
+        // receiver caching by version would keep the old stream_type / PID.
+        // Before any stamp the PMT stays byte-identical.
+        if self.pmt_version.has_stamped() {
+            let mut passthrough = section;
+            self.pmt_version.stamp(&mut passthrough);
+            unit.replace_section(i, passthrough);
         }
         self.pmt_stage.emit(unit, output);
     }
@@ -939,7 +945,7 @@ impl TsAudioReplacer {
                     let sr = enc.sample_rate();
                     for ef in frames {
                         let pts = self.next_output_pts_90k(sr);
-                        let pes = build_audio_pes(&ef.data, pts);
+                        let pes = build_audio_pes(self.codec.ts_pes_stream_id(), &ef.data, pts);
                         let pkts = packetize_ts(pid, &pes, &mut self.out_audio_cc);
                         for pkt in &pkts {
                             output.extend_from_slice(pkt);
@@ -1934,7 +1940,11 @@ impl TsAudioReplacer {
                             if let Some(h) = self.audio_pts_out.as_ref() {
                                 h.store(pts_for_pes, std::sync::atomic::Ordering::Relaxed);
                             }
-                            let pes = build_audio_pes(&encoded.bytes, pts_for_pes);
+                            let pes = build_audio_pes(
+                                self.codec.ts_pes_stream_id(),
+                                &encoded.bytes,
+                                pts_for_pes,
+                            );
                             let pkts = packetize_ts(audio_pid, &pes, &mut self.out_audio_cc);
                             for p in &pkts {
                                 output.extend_from_slice(p);
@@ -1987,7 +1997,11 @@ impl TsAudioReplacer {
                                 if let Some(h) = self.audio_pts_out.as_ref() {
                                     h.store(pts_for_pes, std::sync::atomic::Ordering::Relaxed);
                                 }
-                                let pes = build_audio_pes(&ef.data, pts_for_pes);
+                                let pes = build_audio_pes(
+                                    self.codec.ts_pes_stream_id(),
+                                    &ef.data,
+                                    pts_for_pes,
+                                );
                                 let pkts =
                                     packetize_ts(audio_pid, &pes, &mut self.out_audio_cc);
                                 for p in &pkts {
@@ -2225,11 +2239,13 @@ fn parse_pts(data: &[u8]) -> u64 {
 /// silently dropped pts bits 30 and 15 in the encoded output, which
 /// caused standard receivers (Appear, VLC, ffmpeg) to lose audio PTS
 /// lock once `pts` exceeded 32 768 ticks (~ 364 ms at 90 kHz).
-fn build_audio_pes(audio_data: &[u8], pts: u64) -> Vec<u8> {
+fn build_audio_pes(stream_id: u8, audio_data: &[u8], pts: u64) -> Vec<u8> {
     let pes_len = 3 + 5 + audio_data.len();
     let mut pes = Vec::with_capacity(14 + audio_data.len());
     pes.extend_from_slice(&[0x00, 0x00, 0x01]);
-    pes.push(0xC0); // audio stream_id
+    // 0xC0 (MPEG audio) for MP2 / AAC, 0xBD (private_stream_1) for AC-3 —
+    // see `AudioCodec::ts_pes_stream_id`.
+    pes.push(stream_id);
     pes.extend_from_slice(&(pes_len as u16).to_be_bytes());
     // Marker bits '10' + data_alignment_indicator=1. Each encoded
     // audio frame (one ADTS frame for AAC, one MP2/AC-3 frame) is
@@ -2751,7 +2767,7 @@ mod tests {
 
     #[test]
     fn build_audio_pes_has_pts_and_stream_id() {
-        let pes = build_audio_pes(&[1, 2, 3, 4], 0x1234_5678);
+        let pes = build_audio_pes(0xC0, &[1, 2, 3, 4], 0x1234_5678);
         assert_eq!(&pes[0..3], &[0x00, 0x00, 0x01]);
         assert_eq!(pes[3], 0xC0); // audio stream_id
         assert_eq!(pes[7], 0x80); // PTS flag
@@ -2765,7 +2781,7 @@ mod tests {
     /// §C.4 requires `data_alignment_indicator = 1` for broadcast.
     #[test]
     fn build_audio_pes_sets_data_alignment_indicator() {
-        let pes = build_audio_pes(&[0u8; 16], 0);
+        let pes = build_audio_pes(0xC0, &[0u8; 16], 0);
         // Byte 6 carries the marker + DAI flag. Bit 2 (0x04) is DAI.
         assert_eq!(pes[6] & 0x04, 0x04, "data_alignment_indicator must be 1");
     }
@@ -3039,6 +3055,50 @@ mod tests {
         assert_ne!(v1, v2);
     }
 
+    /// Output transcodes to AAC; an input switch brings a source whose only
+    /// audio is DTS, so its PMT passes through unedited. It used to keep
+    /// its SOURCE version — here 1, the very version the rebuilt PMT of the
+    /// previous input carried — and a receiver caching by version kept the
+    /// old PMT (AAC on the audio PID). Once the stage has stamped, the
+    /// passthrough PMT is stamped from the same sequence. Before any stamp
+    /// a passthrough PMT stays byte-identical.
+    #[test]
+    fn a_passthrough_pmt_after_a_rebuilt_one_gets_a_new_version() {
+        let aac = pmt_section(1, 1, 0x101, &[], &[(0x0F, 0x101, &[])]);
+        let dts = pmt_section(1, 1, 0x101, &[], &[(0x82, 0x101, &[])]);
+        let ver = |s: &[u8]| (s[5] >> 1) & 0x1F;
+
+        let mut r = TsAudioReplacer::new(&enc("aac_lc"), None).unwrap();
+        let mut out = Vec::new();
+        r.process(&synth_pat(0x1000), &mut out);
+        // Before any stamp: a DTS PMT is byte-identical, source version
+        // (here 5) and all.
+        out.clear();
+        let dts_v5 = pmt_section(1, 5, 0x101, &[], &[(0x82, 0x101, &[])]);
+        let dts_pkt = packetize_sections(0x1000, &[&dts_v5], 0)[0];
+        r.process(&dts_pkt, &mut out);
+        assert_eq!(out, dts_pkt.to_vec(), "untouched before the stage ever stamped");
+
+        // Input A (AAC): rebuilt and stamped.
+        out.clear();
+        r.process(&packetize_sections(0x1000, &[&aac], 1)[0], &mut out);
+        let a = pmt_in(&out, 1);
+        assert_eq!(parse_pmt(&a).unwrap().es[0].stream_type, 0x0F);
+        // Switch to input B (DTS only): passthrough, but a fresh version.
+        r.external_reset_handle().store(true, Ordering::Relaxed);
+        let mut vs = Vec::new();
+        for cc in 2..5u8 {
+            out.clear();
+            r.process(&packetize_sections(0x1000, &[&dts], cc)[0], &mut out);
+            let b = pmt_in(&out, 1);
+            assert_eq!(mpeg2_crc32(&b), 0);
+            assert_eq!(parse_pmt(&b).unwrap().es[0].stream_type, 0x82, "content passed through");
+            vs.push(ver(&b));
+        }
+        assert_ne!(vs[0], ver(&a), "B's PMT must not repeat A's version");
+        assert!(vs.iter().all(|v| *v == vs[0]), "and holds while B repeats: {vs:?}");
+    }
+
     #[test]
     fn flavour_is_latched_across_a_dvb_to_atsc_switch() {
         let mut r = TsAudioReplacer::new(&enc("ac3"), None).unwrap();
@@ -3073,7 +3133,7 @@ mod tests {
         demux.demux(&synth_pat(0x1000));
         demux.demux(&out);
         assert_eq!(demux.audio_pid(), Some(0x0101));
-        let pes = build_audio_pes(&[0x0B, 0x77, 1, 2, 3, 4, 5, 6], 90_000);
+        let pes = build_audio_pes(0xBD, &[0x0B, 0x77, 1, 2, 3, 4, 5, 6], 90_000);
         let mut cc = 0u8;
         let mut frames = Vec::new();
         for _ in 0..2 {
@@ -3085,6 +3145,43 @@ mod tests {
             frames.iter().any(|f| matches!(f, DemuxedFrame::OtherAudio { stream_type: 0x81, .. })),
             "AC-3 PES surfaced on the 0x81 arm"
         );
+    }
+
+    /// The re-encoded AC-3 ES rides PES private_stream_1 (0xBD) — ATSC A/52
+    /// Annex A and ETSI TS 101 154 both require it for AC-3, and DVB
+    /// carriage signals the ES as private data (0x06) — while MP2 / AAC
+    /// keep the MPEG audio id 0xC0. Every AC-3 PES used to go out as 0xC0.
+    #[cfg(all(feature = "media-codecs", feature = "fdk-aac"))]
+    #[test]
+    fn re_encoded_pes_use_the_codec_stream_id() {
+        const ADTS: &[u8] = include_bytes!("testdata/sine1k_aac_lc_48k_stereo.adts");
+        for (codec, want) in [("ac3", 0xBDu8), ("mp2", 0xC0)] {
+            let mut r = TsAudioReplacer::new(&enc(codec), None).unwrap();
+            let mut out = Vec::new();
+            r.process(&synth_pat(0x1000), &mut out);
+            r.process(&synth_pmt_audio(0x1000, 0x0101, 0x0F), &mut out);
+            let (mut off, mut pts, mut cc) = (0usize, 90_000u64, 0u8);
+            while off + 7 <= ADTS.len() {
+                let len = (((ADTS[off + 3] as usize) & 0x03) << 11)
+                    | ((ADTS[off + 4] as usize) << 3)
+                    | ((ADTS[off + 5] as usize) >> 5);
+                if len == 0 || off + len > ADTS.len() {
+                    break;
+                }
+                for p in packetize_ts(0x0101, &build_audio_pes(0xC0, &ADTS[off..off + len], pts), &mut cc) {
+                    r.process(&p, &mut out);
+                }
+                pts += 1920;
+                off += len;
+            }
+            let ids: Vec<u8> = out
+                .chunks(TS_PACKET_SIZE)
+                .filter(|p| ts_pid(p) == 0x0101 && ts_pusi(p))
+                .map(|p| p[ts_payload_offset(p) + 3])
+                .collect();
+            assert!(!ids.is_empty(), "{codec}: re-encoded audio emitted");
+            assert!(ids.iter().all(|&id| id == want), "{codec}: PES stream_id {ids:02X?}");
+        }
     }
 
     #[test]
@@ -3345,7 +3442,7 @@ mod tests {
         // Build a PES with a valid PTS but ES bytes that don't pass any
         // ADTS / AC-3 / MP2 / LATM splitter — so `decoded_frames` stays
         // empty and `source_samples_in_pes` stays 0.
-        let pes = build_audio_pes(&[0u8; 32], 1_100_000);
+        let pes = build_audio_pes(0xC0, &[0u8; 32], 1_100_000);
         let mut out = Vec::new();
         let _ = r.consume_pes(&pes, &mut out);
 
@@ -3409,7 +3506,7 @@ mod tests {
         r.source_stream_type = 0x0F;
 
         let src_pts = 1_234_567u64;
-        let pes = build_audio_pes(&[0u8; 32], src_pts);
+        let pes = build_audio_pes(0xC0, &[0u8; 32], src_pts);
         let mut out = Vec::new();
         let _ = r.consume_pes(&pes, &mut out);
 
@@ -3452,11 +3549,11 @@ mod tests {
         sig_a.fetch_add(35_991_000, Ordering::Release);
 
         // Replacer A consumes its signal → pending_silence non-zero.
-        let _ = r_a.consume_pes(&build_audio_pes(&[0u8; 32], 1), &mut Vec::new());
+        let _ = r_a.consume_pes(&build_audio_pes(0xC0, &[0u8; 32], 1), &mut Vec::new());
         assert_eq!(r_a.pending_silence_27mhz, 35_991_000);
 
         // Replacer B consumes its independent signal → pending stays 0.
-        let _ = r_b.consume_pes(&build_audio_pes(&[0u8; 32], 2), &mut Vec::new());
+        let _ = r_b.consume_pes(&build_audio_pes(0xC0, &[0u8; 32], 2), &mut Vec::new());
         assert_eq!(
             r_b.pending_silence_27mhz, 0,
             "passive input B must NOT receive input A's loop-wrap signal — \
@@ -3469,8 +3566,8 @@ mod tests {
         assert_eq!(sig_a.load(Ordering::Acquire), 0);
         assert_eq!(sig_b.load(Ordering::Acquire), 0);
         sig_b.fetch_add(21_384_000, Ordering::Release);
-        let _ = r_a.consume_pes(&build_audio_pes(&[0u8; 32], 3), &mut Vec::new());
-        let _ = r_b.consume_pes(&build_audio_pes(&[0u8; 32], 4), &mut Vec::new());
+        let _ = r_a.consume_pes(&build_audio_pes(0xC0, &[0u8; 32], 3), &mut Vec::new());
+        let _ = r_b.consume_pes(&build_audio_pes(0xC0, &[0u8; 32], 4), &mut Vec::new());
         assert_eq!(
             r_a.pending_silence_27mhz, 35_991_000,
             "no double-charge on A — B's signal must NOT reach A"
@@ -3490,7 +3587,7 @@ mod tests {
         r.source_stream_type = 0x0F;
 
         sig.fetch_add(35_991_000, Ordering::Release);
-        let _ = r.consume_pes(&build_audio_pes(&[0u8; 32], 100), &mut Vec::new());
+        let _ = r.consume_pes(&build_audio_pes(0xC0, &[0u8; 32], 100), &mut Vec::new());
         assert_eq!(r.pending_silence_27mhz, 35_991_000);
         // Signal drained — `swap(0)` semantics.
         assert_eq!(sig.load(Ordering::Acquire), 0);
@@ -3548,7 +3645,7 @@ mod tests {
         r.audio_pid = Some(0x0101);
         r.source_stream_type = 0x0F;
         // Prime the anchor + expected_next_src_pts via a first PES.
-        let _ = r.consume_pes(&build_audio_pes(&[0u8; 32], 90_000), &mut Vec::new());
+        let _ = r.consume_pes(&build_audio_pes(0xC0, &[0u8; 32], 90_000), &mut Vec::new());
         assert!(r.out_pts_anchored);
         let out_after_first = r.out_pts_90k;
         let expected_after_first = r
@@ -3558,7 +3655,7 @@ mod tests {
         // the typical Sky Witness loop-splice forward jump.
         let jump_90k: u64 = 24_120;
         let next_pts = expected_after_first.wrapping_add(jump_90k);
-        let _ = r.consume_pes(&build_audio_pes(&[0u8; 32], next_pts), &mut Vec::new());
+        let _ = r.consume_pes(&build_audio_pes(0xC0, &[0u8; 32], next_pts), &mut Vec::new());
         // Delta = jump_90k > 5 ms deadband → tracked via anchor relabel,
         // NOT silence.
         assert_eq!(
@@ -3581,11 +3678,11 @@ mod tests {
         let mut r = TsAudioReplacer::new(&enc("aac_lc"), None).unwrap();
         r.audio_pid = Some(0x0101);
         r.source_stream_type = 0x0F;
-        let _ = r.consume_pes(&build_audio_pes(&[0u8; 32], 100_000), &mut Vec::new());
+        let _ = r.consume_pes(&build_audio_pes(0xC0, &[0u8; 32], 100_000), &mut Vec::new());
         let expected = r.expected_next_src_pts_90k.unwrap();
         // 80 ms = 7200 ticks — exactly the threshold.
         let next_pts = expected.wrapping_add(7_200);
-        let _ = r.consume_pes(&build_audio_pes(&[0u8; 32], next_pts), &mut Vec::new());
+        let _ = r.consume_pes(&build_audio_pes(0xC0, &[0u8; 32], next_pts), &mut Vec::new());
         assert_eq!(
             r.pending_silence_27mhz, 0,
             "exactly-80ms forward jump must NOT queue silence — threshold is strict `>`"
@@ -3600,11 +3697,11 @@ mod tests {
         let mut r = TsAudioReplacer::new(&enc("aac_lc"), None).unwrap();
         r.audio_pid = Some(0x0101);
         r.source_stream_type = 0x0F;
-        let _ = r.consume_pes(&build_audio_pes(&[0u8; 32], 200_000), &mut Vec::new());
+        let _ = r.consume_pes(&build_audio_pes(0xC0, &[0u8; 32], 200_000), &mut Vec::new());
         let expected = r.expected_next_src_pts_90k.unwrap();
         // 200 ms backward.
         let next_pts = expected.wrapping_sub(18_000);
-        let _ = r.consume_pes(&build_audio_pes(&[0u8; 32], next_pts), &mut Vec::new());
+        let _ = r.consume_pes(&build_audio_pes(0xC0, &[0u8; 32], next_pts), &mut Vec::new());
         assert_eq!(
             r.pending_silence_27mhz, 0,
             "backward source-PTS jump must NOT queue silence — silence only catches up forward drift"
@@ -3622,11 +3719,11 @@ mod tests {
         let mut r = TsAudioReplacer::new(&enc("aac_lc"), None).unwrap();
         r.audio_pid = Some(0x0101);
         r.source_stream_type = 0x0F;
-        let _ = r.consume_pes(&build_audio_pes(&[0u8; 32], 300_000), &mut Vec::new());
+        let _ = r.consume_pes(&build_audio_pes(0xC0, &[0u8; 32], 300_000), &mut Vec::new());
         let expected = r.expected_next_src_pts_90k.unwrap();
         // 600 ms = 54 000 ticks — past the 500 ms threshold.
         let next_pts = expected.wrapping_add(54_000);
-        let _ = r.consume_pes(&build_audio_pes(&[0u8; 32], next_pts), &mut Vec::new());
+        let _ = r.consume_pes(&build_audio_pes(0xC0, &[0u8; 32], next_pts), &mut Vec::new());
         assert_eq!(
             r.pending_silence_27mhz, 0,
             "> 500ms jump must use the catastrophic re-anchor branch, not silence-pad"
@@ -3655,7 +3752,7 @@ mod tests {
         // is BEHIND current effective (1_068_700) so forward_delta < 0. The
         // pre-fix guard suppressed here; the fix re-anchors on the positive
         // source delta.
-        let _ = r.consume_pes(&build_audio_pes(&[0u8; 32], 1_060_000), &mut Vec::new());
+        let _ = r.consume_pes(&build_audio_pes(0xC0, &[0u8; 32], 1_060_000), &mut Vec::new());
         assert_eq!(
             r.out_pts_90k, 1_060_000,
             "forward source discontinuity must re-anchor out_pts_90k to the source PTS \
@@ -3682,7 +3779,7 @@ mod tests {
         r.samples_since_anchor = 0;
         r.expected_next_src_pts_90k = Some(1_060_000);
         // Backward jump: source PTS resets to 1_000_000 (delta = -60 000).
-        let _ = r.consume_pes(&build_audio_pes(&[0u8; 32], 1_000_000), &mut Vec::new());
+        let _ = r.consume_pes(&build_audio_pes(0xC0, &[0u8; 32], 1_000_000), &mut Vec::new());
         assert_eq!(
             r.out_pts_90k, 2_000_000,
             "backward source reset must NOT re-anchor (suppress to keep output PTS monotonic)"
@@ -3712,7 +3809,7 @@ mod tests {
         let out_before = r.out_pts_90k;
         let step_90k: u64 = 4_500; // 50 ms forward splice step
         let _ = r.consume_pes(
-            &build_audio_pes(&[0u8; 32], 1_000_000 + step_90k),
+            &build_audio_pes(0xC0, &[0u8; 32], 1_000_000 + step_90k),
             &mut Vec::new(),
         );
         assert_eq!(
@@ -3756,7 +3853,7 @@ mod tests {
         let out_before = r.out_pts_90k;
         // 100 ms forward (> 80 ms threshold).
         let _ = r.consume_pes(
-            &build_audio_pes(&[0u8; 32], 1_000_000 + 9_000),
+            &build_audio_pes(0xC0, &[0u8; 32], 1_000_000 + 9_000),
             &mut Vec::new(),
         );
         assert!(
@@ -3878,7 +3975,7 @@ mod tests {
         r.source_stream_type = 0x0F;
         assert!(r.first_pes_master_27mhz.is_none());
         assert!(r.first_pes_src_pts_90k.is_none());
-        let _ = r.consume_pes(&build_audio_pes(&[0u8; 32], 1_234_567), &mut Vec::new());
+        let _ = r.consume_pes(&build_audio_pes(0xC0, &[0u8; 32], 1_234_567), &mut Vec::new());
         assert!(r.first_pes_master_27mhz.is_some(), "master anchor must be recorded on first PES");
         assert_eq!(
             r.first_pes_src_pts_90k,
@@ -3896,7 +3993,7 @@ mod tests {
         let mut r = TsAudioReplacer::new(&enc("aac_lc"), None).unwrap();
         r.audio_pid = Some(0x0101);
         r.source_stream_type = 0x0F;
-        let _ = r.consume_pes(&build_audio_pes(&[0u8; 32], 1_234_567), &mut Vec::new());
+        let _ = r.consume_pes(&build_audio_pes(0xC0, &[0u8; 32], 1_234_567), &mut Vec::new());
         assert!(r.first_pes_master_27mhz.is_none());
         assert!(r.first_pes_src_pts_90k.is_none());
     }
@@ -3921,7 +4018,7 @@ mod tests {
         r.audio_pid = Some(0x0101);
         r.source_stream_type = 0x0F;
         // First PES seeds the catch-up anchors.
-        let _ = r.consume_pes(&build_audio_pes(&[0u8; 32], 100_000), &mut Vec::new());
+        let _ = r.consume_pes(&build_audio_pes(0xC0, &[0u8; 32], 100_000), &mut Vec::new());
         let original_master = r.first_pes_master_27mhz;
         let original_src_pts = r.first_pes_src_pts_90k;
         // Force the output to be sitting somewhere — the > 500 ms
@@ -3936,7 +4033,7 @@ mod tests {
         // Sleep a tiny bit so master clock advances and we can verify
         // it's been refreshed.
         std::thread::sleep(std::time::Duration::from_millis(2));
-        let _ = r.consume_pes(&build_audio_pes(&[0u8; 32], 100_000 + 90_000), &mut Vec::new());
+        let _ = r.consume_pes(&build_audio_pes(0xC0, &[0u8; 32], 100_000 + 90_000), &mut Vec::new());
         // Both catch-up anchors must have been refreshed (master moved
         // forward by at least 2 ms = 54 000 27 MHz ticks).
         assert_ne!(
@@ -3996,7 +4093,7 @@ mod tests {
         // Process a PES with pts close to expected — discontinuity
         // guard inert, but catch-up sees ~500 ms master_elapsed and
         // 0 output_elapsed → lag ≈ 500 ms, > 200 ms threshold.
-        let _ = r.consume_pes(&build_audio_pes(&[0u8; 32], 2_160), &mut Vec::new());
+        let _ = r.consume_pes(&build_audio_pes(0xC0, &[0u8; 32], 2_160), &mut Vec::new());
         // Catch-up FIRES (master lag ~500 ms > the 200 ms threshold) but the
         // queued silence is CAPPED at one frame per fire (commit 0944ab1:
         // "cap catch-up silence per fire to one AC-3 frame") so a large lag is
@@ -4050,7 +4147,7 @@ mod tests {
         r.resolved_sample_rate = 48_000;
         r.expected_next_src_pts_90k = Some(2_160);
         let pending_before = r.pending_silence_27mhz;
-        let _ = r.consume_pes(&build_audio_pes(&[0u8; 32], 2_160), &mut Vec::new());
+        let _ = r.consume_pes(&build_audio_pes(0xC0, &[0u8; 32], 2_160), &mut Vec::new());
         assert_eq!(
             r.pending_silence_27mhz, pending_before,
             "lag > sanity ceiling must NOT queue silence — caller's master clock or anchors are pathological"
@@ -4089,7 +4186,7 @@ mod tests {
         r.resolved_sample_rate = 48_000;
         r.expected_next_src_pts_90k = Some(2_160);
         let pending_before = r.pending_silence_27mhz;
-        let _ = r.consume_pes(&build_audio_pes(&[0u8; 32], 2_160), &mut Vec::new());
+        let _ = r.consume_pes(&build_audio_pes(0xC0, &[0u8; 32], 2_160), &mut Vec::new());
         assert_eq!(
             r.pending_silence_27mhz, pending_before,
             "lag ≈ 0 (within 200 ms threshold) must NOT queue silence — \

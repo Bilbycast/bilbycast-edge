@@ -465,6 +465,23 @@ pub fn rebuild_pmt_section(section: &[u8], edit: &PmtEdit<'_>) -> Option<Vec<u8>
     Some(out)
 }
 
+/// Rebuild section `i` of `unit` per `edit`, falling back to the
+/// growth-free edit (`no_additions`: an AC-3 target signalled as
+/// self-identifying 0x81 with no added descriptors) whenever the full edit
+/// does not work out — either the grown unit would need more packets than
+/// the source's (so a single-packet PMT stays single-packet for every
+/// downstream single-packet parser), or the grown section would exceed the
+/// 1021-byte PMT limit, when [`rebuild_pmt_section`] refuses it outright.
+/// The fallback used to hang off the full rebuild's success, so the
+/// overflow case — the one it exists for — emitted the source PMT
+/// untouched (the old stream_type over a re-encoded ES).
+pub fn rebuild_pmt_section_fitting(unit: &PsiUnit, i: usize, edit: &PmtEdit<'_>) -> Option<Vec<u8>> {
+    let section = &unit.sections()[i];
+    rebuild_pmt_section(section, edit)
+        .filter(|full| unit.fits_source_packets_with(i, full))
+        .or_else(|| rebuild_pmt_section(section, &PmtEdit { no_additions: true, ..edit.clone() }))
+}
+
 fn push_loop_len(body: &mut Vec<u8>, reserved_src: u8, len: usize) {
     body.push((reserved_src & 0xF0) | ((len >> 8) as u8 & 0x0F));
     body.push(len as u8);
@@ -487,8 +504,11 @@ pub fn recompute_crc(section: &mut [u8]) {
 /// [`Self::stamp`] compares the rebuilt section — minus its version bits
 /// and CRC — with the last one it stamped and bumps (mod 32) when they
 /// differ; an unchanged section keeps its version, so a PMT repeated a
-/// hundred times does not flap. [`Self::bump`] forces a bump on the next
-/// stamp (a source reset). Because each stage compares its own
+/// hundred times does not flap. Once a stage has stamped (see
+/// [`Self::has_stamped`]) it stamps the PMTs it passes through unedited
+/// too, so rebuilt and passthrough PMTs share one version sequence.
+/// [`Self::bump`] forces a bump on the next stamp (a source reset).
+/// Because each stage compares its own
 /// input-derived output, a chained video stage sees the audio stage's
 /// changed stream_type and bumps too: chained stages compose.
 #[derive(Clone, Debug)]
@@ -520,6 +540,16 @@ impl OutVersion {
         self.pending_bump = true;
     }
 
+    /// True once any section has been stamped. From then on every PMT the
+    /// stage emits for its program — rebuilt or passed through — must be
+    /// stamped, so the output carries one version sequence: a passthrough
+    /// PMT keeping its source version could repeat the version a rebuilt
+    /// one already used (a receiver caching by version would then never
+    /// re-parse the new content).
+    pub fn has_stamped(&self) -> bool {
+        self.last_body.is_some()
+    }
+
     /// Stamp the version into a complete long-form section and recompute
     /// its CRC. Bumps first when the content changed or a bump is pending.
     pub fn stamp(&mut self, section: &mut [u8]) {
@@ -549,7 +579,12 @@ const MAX_UNIT_PACKETS: usize = 32;
 /// every complete section that started in it.
 #[derive(Debug)]
 pub struct PsiUnit {
+    /// The unit's payload-carrying packets (the re-layout templates).
     packets: Vec<[u8; TS_PACKET_SIZE]>,
+    /// Adaptation-field-only packets that arrived while the unit was held,
+    /// each with the number of payload packets that preceded it — so they
+    /// go out in their source position rather than ahead of the unit.
+    af_only: Vec<(usize, [u8; TS_PACKET_SIZE])>,
     sections: Vec<Vec<u8>>,
     changed: bool,
 }
@@ -610,10 +645,17 @@ impl PsiUnit {
 ///   (or packets are dropped) the stage owns the CC on this PID from then
 ///   on. A surplus source packet whose adaptation field carries data is
 ///   re-emitted adaptation-field-only.
-/// - Packets without payload pass straight through.
+/// - Packets without payload pass straight through when no unit is held;
+///   while one is held they wait in their source position (an
+///   adaptation-field-only packet — a PCR on the PMT PID — must follow the
+///   payload packet whose CC it repeats, not overtake the held unit) and go
+///   out with it, or on their own if the unit is dropped.
 #[derive(Debug)]
 pub struct PsiUnitStage {
     held: Vec<[u8; TS_PACKET_SIZE]>,
+    /// Payload-less packets received while `held` is non-empty, with the
+    /// count of held payload packets ahead of each.
+    held_af: Vec<(usize, [u8; TS_PACKET_SIZE])>,
     sections: Vec<Vec<u8>>,
     inflight: Vec<u8>,
     inflight_active: bool,
@@ -633,6 +675,7 @@ impl PsiUnitStage {
     pub fn new(what: &'static str) -> Self {
         Self {
             held: Vec::new(),
+            held_af: Vec::new(),
             sections: Vec::new(),
             inflight: Vec::new(),
             inflight_active: false,
@@ -652,13 +695,14 @@ impl PsiUnitStage {
         self.dropped_packets
     }
 
-    fn drop_held(&mut self, reason: &str, extra: u64) {
+    fn drop_held(&mut self, reason: &str, extra: u64, out: &mut Vec<u8>) {
         let n = self.held.len() as u64 + extra;
         self.held.clear();
         self.sections.clear();
         self.inflight.clear();
         self.inflight_active = false;
         if n == 0 {
+            self.flush_held_af(out);
             return;
         }
         self.dropped_packets += n;
@@ -668,12 +712,23 @@ impl PsiUnitStage {
         if self.last_out_cc.is_some() {
             self.owned_cc = true;
         }
+        // Payload-less packets held behind the dropped unit carry no PSI
+        // (a PCR, private AF data): they still go out.
+        self.flush_held_af(out);
         if !self.warned {
             self.warned = true;
             tracing::warn!(
                 "{}: dropped {n} PMT-PID packet(s) — {reason}; further drops are counted silently",
                 self.what
             );
+        }
+    }
+
+    /// Write out the payload-less packets held behind a unit that will not
+    /// be emitted, in their source order.
+    fn flush_held_af(&mut self, out: &mut Vec<u8>) {
+        for (_, p) in std::mem::take(&mut self.held_af) {
+            self.write_packet(&p, out);
         }
     }
 
@@ -724,11 +779,11 @@ impl PsiUnitStage {
     /// unit. A long-form section reassembled across packets must carry a
     /// valid CRC_32 — that, not the CC, is what proves no packet was lost
     /// or damaged (some muxers never advance the CC on PSI at all).
-    fn finish_inflight(&mut self, total: usize) -> bool {
+    fn finish_inflight(&mut self, total: usize, out: &mut Vec<u8>) -> bool {
         self.inflight.truncate(total);
         let long_form = self.inflight.len() > 1 && self.inflight[1] & 0x80 != 0;
         if long_form && mpeg2_crc32(&self.inflight) != 0 {
-            self.drop_held("a section reassembled across packets failed its CRC", 0);
+            self.drop_held("a section reassembled across packets failed its CRC", 0, out);
             return false;
         }
         let s = std::mem::take(&mut self.inflight);
@@ -748,7 +803,16 @@ impl PsiUnitStage {
         let has_payload = (pkt[3] >> 4) & 0x01 != 0;
         let off = ts_payload_offset(pkt);
         if !has_payload || off >= TS_PACKET_SIZE {
-            self.write_packet(pkt, out);
+            if self.held.is_empty() {
+                self.write_packet(pkt, out);
+            } else {
+                // Emitting it now would put it ahead of the held unit: a
+                // PCR moved in front of the PMT bytes, and an AF-only CC
+                // that no longer repeats the payload CC before it.
+                let mut p = [0u8; TS_PACKET_SIZE];
+                p.copy_from_slice(pkt);
+                self.held_af.push((self.held.len(), p));
+            }
             return None;
         }
         let cc = ts_cc(pkt);
@@ -768,7 +832,7 @@ impl PsiUnitStage {
         if pusi {
             let sec_start = 1 + payload[0] as usize;
             if sec_start > payload.len() {
-                self.drop_held("pointer_field points past the packet", 1);
+                self.drop_held("pointer_field points past the packet", 1, out);
                 return None;
             }
             if self.inflight_active {
@@ -777,9 +841,9 @@ impl PsiUnitStage {
                 self.inflight.extend_from_slice(&payload[1..sec_start]);
                 match self.inflight_needed() {
                     Ok(Some(total)) if total == self.inflight.len() => {
-                        self.finish_inflight(total);
+                        self.finish_inflight(total, out);
                     }
-                    _ => self.drop_held("section truncated by the next unit start", 0),
+                    _ => self.drop_held("section truncated by the next unit start", 0, out),
                 }
             }
             self.held.push(buf);
@@ -797,24 +861,25 @@ impl PsiUnitStage {
             self.inflight.extend_from_slice(payload);
             match self.inflight_needed() {
                 Ok(Some(total)) if self.inflight.len() >= total => {
-                    if !self.finish_inflight(total) {
+                    if !self.finish_inflight(total, out) {
                         return None;
                     }
                 }
                 Ok(_) => {}
                 Err(()) => {
-                    self.drop_held("invalid section header", 0);
+                    self.drop_held("invalid section header", 0, out);
                     return None;
                 }
             }
         }
         if self.held.len() > MAX_UNIT_PACKETS {
-            self.drop_held("unit longer than 32 packets", 0);
+            self.drop_held("unit longer than 32 packets", 0, out);
             return None;
         }
         if !self.inflight_active && !self.held.is_empty() {
             return Some(PsiUnit {
                 packets: std::mem::take(&mut self.held),
+                af_only: std::mem::take(&mut self.held_af),
                 sections: std::mem::take(&mut self.sections),
                 changed: false,
             });
@@ -822,28 +887,48 @@ impl PsiUnitStage {
         None
     }
 
-    /// Emit a unit returned by [`Self::push`].
+    /// Emit a unit returned by [`Self::push`]. Payload-less packets held
+    /// with the unit go out in their source position: behind the payload
+    /// packet they followed (output packet `k - 1` for one that followed
+    /// `k` payload packets), repeating its CC.
     pub fn emit(&mut self, unit: PsiUnit, out: &mut Vec<u8>) {
+        let mut af = unit.af_only.into_iter().peekable();
         if !unit.changed {
-            for p in &unit.packets {
+            for (j, p) in unit.packets.iter().enumerate() {
+                while let Some((_, a)) = af.next_if(|(k, _)| *k <= j) {
+                    self.write_packet(&a, out);
+                }
                 self.write_packet(p, out);
+            }
+            for (_, a) in af {
+                self.write_packet(&a, out);
             }
             return;
         }
         let refs: Vec<&[u8]> = unit.sections.iter().map(|s| s.as_slice()).collect();
-        let mut pkts = layout(&refs, &unit.packets);
+        let pkts = layout(&refs, &unit.packets);
         if pkts.len() != unit.packets.len() {
             self.owned_cc = true;
         }
+        for (j, p) in pkts.iter().enumerate() {
+            while let Some((_, a)) = af.next_if(|(k, _)| *k <= j) {
+                self.write_packet(&a, out);
+            }
+            self.write_packet(p, out);
+        }
         // Surplus source packets carrying adaptation-field data (a PCR on
-        // the PMT PID, private data) survive as AF-only packets.
-        for src in unit.packets.iter().skip(pkts.len()) {
+        // the PMT PID, private data) survive as AF-only packets, in source
+        // order with the held payload-less packets around them.
+        for (j, src) in unit.packets.iter().enumerate().skip(pkts.len()) {
+            while let Some((_, a)) = af.next_if(|(k, _)| *k <= j) {
+                self.write_packet(&a, out);
+            }
             if let Some(af_only) = af_only_copy(src) {
-                pkts.push(af_only);
+                self.write_packet(&af_only, out);
             }
         }
-        for p in &pkts {
-            self.write_packet(p, out);
+        for (_, a) in af {
+            self.write_packet(&a, out);
         }
     }
 
@@ -1505,6 +1590,95 @@ mod tests {
         assert_eq!(&out[0][..VH1_PMT_OFFSET], &vh1[..VH1_PMT_OFFSET]);
         assert_eq!((out[0][VH1_PMT_OFFSET + 5] >> 1) & 0x1F, 4);
         assert!(verify_psi_crc(&out[0], VH1_PMT_OFFSET));
+    }
+
+    /// An AF-only packet on the PMT PID (a PCR) arriving between the
+    /// packets of a held two-packet unit. It repeats the CC of the payload
+    /// packet before it, so it must go out right behind that packet: the
+    /// stage used to write it at once, ahead of the held unit — a CC error
+    /// at the receiver on every repetition and the PCR moved in front of
+    /// the PMT bytes.
+    #[test]
+    fn af_only_packets_keep_their_place_behind_a_held_unit() {
+        let (sec, target) = two_packet_pmt(7, 1);
+        let pkts = packetize_sections(0x40, &[&sec], 3);
+        let mut pcr = [0xFFu8; TS_PACKET_SIZE];
+        pcr[0] = TS_SYNC_BYTE;
+        pcr[1] = 0x00;
+        pcr[2] = 0x40;
+        pcr[3] = 0x20 | (pkts[0][3] & 0x0F); // AF only, CC of the packet before it
+        pcr[4] = 183;
+        pcr[5] = 0x10; // PCR flag
+        pcr[6..12].copy_from_slice(&[1, 2, 3, 4, 0x7E, 5]);
+        let src = [pkts[0], pcr, pkts[1]];
+
+        // Unchanged unit: byte-identical, in source order.
+        let mut stage = PsiUnitStage::new("test");
+        let out = run_stage(&mut stage, &src, |_| {});
+        assert_eq!(out, src.concat(), "source order");
+
+        // Edited unit (same packet count, source CCs kept): the AF-only
+        // packet still follows the first packet and repeats its CC.
+        let mut stage = PsiUnitStage::new("test");
+        let out = run_stage(&mut stage, &src, |u| {
+            let new = rebuild_pmt_section(
+                &u.sections()[0],
+                &PmtEdit { es: &[EsEdit::Audio { pid: target, target: AudioTarget::Aac }], ..Default::default() },
+            )
+            .unwrap();
+            u.replace_section(0, new);
+        });
+        let p: Vec<&[u8]> = out.chunks(TS_PACKET_SIZE).collect();
+        assert_eq!(p.len(), 3);
+        assert_eq!(p[1], &pcr[..], "the PCR packet in second place, unchanged");
+        assert_eq!(p[0][3] & 0x0F, p[1][3] & 0x0F, "AF-only repeats the payload CC before it");
+        assert_eq!((p[1][3] + 1) & 0x0F, p[2][3] & 0x0F);
+
+        // Unit dropped (damaged continuation): the PCR packet still goes out.
+        let mut bad = pkts[1];
+        bad[6] ^= 0x01;
+        let mut stage = PsiUnitStage::new("test");
+        let out = run_stage(&mut stage, &[pkts[0], pcr, bad], |_| {});
+        assert_eq!(out, pcr.to_vec());
+    }
+
+    /// The AC-3 growth fallback must also cover a section the additions
+    /// push past the 1021-byte PMT limit: `rebuild_pmt_section` refuses the
+    /// grown section outright, and the fallback used to hang off its
+    /// success, so the source PMT went out untouched — the old stream_type
+    /// over a re-encoded ES.
+    #[test]
+    fn growth_fallback_covers_a_section_that_would_overflow() {
+        // A PMT with section_length 1016, whose AAC ES the AC-3 additions
+        // (6 + 3 bytes) would push to 1025 > 1021.
+        let fill = vec![0x0A, 0x04, b'e', b'n', b'g', 0x00, 0x52, 0x01, 0x07];
+        let mut es: Vec<(u8, u16, &[u8])> = vec![(0x0F, 0x101, &[0x0A, 0x04, b'e', b'n', b'g', 0x00])];
+        for i in 0..70u16 {
+            es.push((0x06, 0x200 + i, fill.as_slice()));
+        }
+        let mut sec = pmt_section(1, 0, 0x100, &[], &es);
+        let pad = 1016 - (sec.len() - 3);
+        // Top up with a private program-level descriptor to hit 1016 exactly.
+        let mut pinfo = vec![0xFE, (pad - 2) as u8];
+        pinfo.extend(std::iter::repeat_n(0u8, pad - 2));
+        sec = pmt_section(1, 0, 0x100, &pinfo, &es);
+        assert_eq!(sec.len(), 3 + 1016);
+        let edit = [EsEdit::Audio { pid: 0x101, target: AudioTarget::Ac3 { flavour: TsFlavour::Dvb } }];
+        assert!(
+            rebuild_pmt_section(&sec, &PmtEdit { es: &edit, ..Default::default() }).is_none(),
+            "the full edit overflows"
+        );
+        let pkts = packetize_sections(0x40, &[&sec], 0);
+        let mut stage = PsiUnitStage::new("test");
+        let mut rebuilt = None;
+        run_stage(&mut stage, &pkts, |u| {
+            rebuilt = rebuild_pmt_section_fitting(u, 0, &PmtEdit { es: &edit, ..Default::default() });
+        });
+        let rebuilt = rebuilt.expect("fallback taken");
+        assert!(crc_ok(&rebuilt));
+        let v = parse_pmt(&rebuilt).unwrap();
+        assert_eq!(v.es[0].stream_type, 0x81, "self-identifying ATSC AC-3, no additions");
+        assert_eq!(es_descs(&v, 0x101), vec![(0x0A, b"eng\0".to_vec())]);
     }
 
     #[test]

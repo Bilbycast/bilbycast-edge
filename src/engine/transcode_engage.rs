@@ -120,7 +120,13 @@ pub struct TranscodeEngageWatch {
     /// An ES of this kind exists but its codec is not replaceable.
     unsupported_candidate: bool,
     locked: bool,
+    /// The Warning has fired in the current window (one per window).
     warned: bool,
+    /// A Warning is still unanswered by an Info. Unlike `warned` it
+    /// survives [`Self::on_reset`], so a Warning raised for one source is
+    /// closed by the first lock after an input switch too, rather than
+    /// being left as the last word on the Events page.
+    owes_found: bool,
 }
 
 impl TranscodeEngageWatch {
@@ -140,14 +146,18 @@ impl TranscodeEngageWatch {
             unsupported_candidate: false,
             locked: false,
             warned: false,
+            owes_found: false,
         }
     }
 
     /// Restart the watch (source reset / input switch). Everything learned
     /// about the previous source is forgotten and the clock restarts on the
-    /// next [`Self::tick`].
+    /// next [`Self::tick`] — except an unanswered Warning, which the next
+    /// lock still answers with `*_transcode_source_found`.
     pub fn on_reset(&mut self) {
+        let owes_found = self.owes_found;
         *self = Self::new(self.kind, self.pinned_pid);
+        self.owes_found = owes_found;
     }
 
     /// Count TS packets handed to the replacer.
@@ -189,10 +199,11 @@ impl TranscodeEngageWatch {
             return None;
         }
         self.locked = true;
-        if !self.warned {
+        if !self.owes_found {
             return None;
         }
         self.warned = false;
+        self.owes_found = false;
         Some(EngageEvent::Found {
             details: serde_json::json!({
                 "error_code": format!("{}_transcode_source_found", self.kind.noun()),
@@ -241,6 +252,7 @@ impl TranscodeEngageWatch {
             return None;
         }
         self.warned = true;
+        self.owes_found = true;
         let reason = self.reason();
         let es: Vec<serde_json::Value> = self
             .es
@@ -441,5 +453,51 @@ mod tests {
         }
         assert!(w.tick(later + Duration::from_secs(4)).is_none());
         assert_eq!(not_found_reason(w.tick(later + Duration::from_secs(5))), Some("pmt_not_parsed"));
+    }
+
+    /// A Warning for one source followed by an input switch (a reset) and
+    /// a lock on the new source must still be answered by the Info — the
+    /// reset used to forget the Warning, leaving it the last word on the
+    /// Events page although transcoding had resumed. A second Warning for
+    /// a second failing source still fires, and one Info closes both.
+    #[test]
+    fn a_warning_is_answered_by_the_first_lock_after_a_reset() {
+        let start = t0();
+        let mut w = TranscodeEngageWatch::new(TranscodeKind::Audio, None);
+        w.tick(start);
+        w.note_pat(1, 0x100);
+        for _ in 0..10 {
+            w.note_pmt_pusi();
+        }
+        w.note_pmt_parsed(vec![(0x101, 0x82)], true);
+        assert_eq!(
+            not_found_reason(w.tick(start + Duration::from_secs(5))),
+            Some("codec_not_replaceable")
+        );
+        w.on_reset();
+        w.note_pat(1, 0x100);
+        w.note_pmt_parsed(vec![(0x101, 0x0F)], false);
+        match w.note_locked(0x101, 0x0F) {
+            Some(EngageEvent::Found { details }) => {
+                assert_eq!(details["error_code"], "audio_transcode_source_found")
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(w.note_locked(0x101, 0x0F).is_none(), "answered once");
+
+        // Two failing sources in a row: two Warnings, one Info.
+        let mut w = TranscodeEngageWatch::new(TranscodeKind::Audio, None);
+        let t = start + Duration::from_secs(100);
+        for k in 0..2u64 {
+            let t = t + Duration::from_secs(20 * k);
+            w.tick(t);
+            w.note_pat(1, 0x100);
+            for _ in 0..10 {
+                w.note_pmt_pusi();
+            }
+            assert!(not_found_reason(w.tick(t + Duration::from_secs(5))).is_some(), "source {k}");
+            w.on_reset();
+        }
+        assert!(matches!(w.note_locked(0x101, 0x0F), Some(EngageEvent::Found { .. })));
     }
 }
