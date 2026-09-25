@@ -1220,6 +1220,12 @@ impl OutputStatsAccumulator {
         let _ = self.av_skew.set(r);
     }
 
+    /// This output's own edge-added A/V skew (its transcode stages), `None`
+    /// when it re-encodes nothing.
+    pub fn av_skew_snapshot(&self) -> Option<crate::stats::models::AvSkewStats> {
+        self.av_skew.get().map(|r| r.snapshot())
+    }
+
     /// Register this output's transcode PCR stage counters (set by
     /// `transcode_chain::build_for_output`). First call wins.
     pub fn set_transcode_pcr_stats(
@@ -4103,6 +4109,17 @@ impl FlowStatsAccumulator {
         self.av_skew_reporters
             .get(&active)
             .map(|r| r.value().snapshot())
+    }
+
+    /// Every output's own edge-added A/V skew, `(output_id, snapshot)`, for
+    /// the per-flow quality watcher: an output that re-encodes shifts its
+    /// audio / video independently of the input path, and reports it on
+    /// `OutputStats.av_skew` rather than on the flow's.
+    pub fn output_av_skew_snapshots(&self) -> Vec<(String, crate::stats::models::AvSkewStats)> {
+        self.output_stats
+            .iter()
+            .filter_map(|e| e.value().av_skew_snapshot().map(|s| (e.key().clone(), s)))
+            .collect()
     }
 
     /// Worst per-output A/V interleave windowed p95 across all outputs
