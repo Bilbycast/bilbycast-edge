@@ -577,17 +577,27 @@ impl SpsOpenGate {
 /// `sar_height`.
 const SAR_TERM_MAX: u64 = 65_535;
 
+/// Consecutive frames a changed source sample aspect ratio must hold before
+/// an open encoder follows it (see `ScaledVideoEncoder::follow_sar`).
+#[cfg(feature = "media-codecs")]
+const SAR_CHANGE_FRAMES: u32 = 3;
+
 /// The sample aspect ratio to signal on an encode of a `src` picture into
 /// `dst`, preserving the source's **display** aspect ratio.
 ///
-/// Unscaled, it is the source's own SAR — `None` (unspecified, read as
-/// square pixels) stays `None`, which is what every encode signalled
-/// before, so a square-pixel source is byte-for-byte unchanged. Scaled,
-/// `out = src_sar × (src_w × dst_h) / (src_h × dst_w)`, reduced, with an
-/// unspecified source SAR taken as 1:1; a square result from an
-/// unspecified source stays unspecified. A term that will not fit the
-/// 16-bit VUI fields is approximated (best rational with both terms
-/// ≤ 65535), never dropped.
+/// Only a ratio the source actually signalled is carried: `None`
+/// (unspecified) stays `None`, scaled or not — exactly what every encode
+/// signalled before, so an unspecified source is unchanged. It is not taken
+/// as square: a raw SD capture (SDI, ST 2110) signals nothing and is
+/// anamorphic, so 720x576 scaled to 1920x1080 "as if square" signalled
+/// 45:64 and displayed a 16:9 picture at 5:4. Unscaled, a signalled SAR is
+/// the source's own; scaled, `out = src_sar × (src_w × dst_h) / (src_h ×
+/// dst_w)`, reduced. A term that will not fit the 16-bit VUI fields is
+/// approximated (best rational with both terms ≤ 65535), never dropped.
+///
+/// `src` is the geometry the source's SAR describes — the frame, which for
+/// a single-field source is twice the height of each picture (see
+/// [`sar_geometry`]).
 ///
 /// 720x576 at 64:45 (16:9 anamorphic SD) unscaled stays 64:45 — it used to
 /// leave SAR-less and display at 5:4 — and scaled to 1024x576 becomes 1:1;
@@ -597,18 +607,27 @@ pub fn output_sar(
     (src_w, src_h): (u32, u32),
     (dst_w, dst_h): (u32, u32),
 ) -> Option<(u32, u32)> {
-    let src_sar = src_sar.filter(|(n, d)| *n > 0 && *d > 0);
+    let (sn, sd) = src_sar.filter(|(n, d)| *n > 0 && *d > 0)?;
     if (src_w, src_h) == (dst_w, dst_h) || src_w == 0 || src_h == 0 || dst_w == 0 || dst_h == 0 {
-        return src_sar.map(|(n, d)| bounded_ratio(n as u64, d as u64));
+        return Some(bounded_ratio(sn as u64, sd as u64));
     }
-    let (sn, sd) = src_sar.unwrap_or((1, 1));
     let num = sn as u64 * src_w as u64 * dst_h as u64;
     let den = sd as u64 * src_h as u64 * dst_w as u64;
-    let (n, d) = bounded_ratio(num, den);
-    if src_sar.is_none() && n == d {
-        return None;
+    Some(bounded_ratio(num, den))
+}
+
+/// The geometry a decoded picture's sample aspect ratio describes: the
+/// picture itself, except a single field (an HEVC field_seq decode, one
+/// 1920x540 field per picture) whose SAR is the frame's — a 1080i service
+/// signals 1:1 on its 540-line fields. Read per field, a 1920x540 1:1
+/// source displayed at 32:9; as the frame it is 16:9, so an unscaled
+/// 540-line output signals 1:2 and one scaled to 1920x1080 signals 1:1.
+#[cfg(feature = "media-codecs")]
+pub fn sar_geometry((w, h): (u32, u32), scan: SourceScan) -> (u32, u32) {
+    match scan {
+        SourceScan::SingleField => (w, h.saturating_mul(2)),
+        SourceScan::Progressive | SourceScan::Woven(_) => (w, h),
     }
-    Some((n, d))
 }
 
 /// `num / den` reduced, and if either term still exceeds
@@ -748,10 +767,18 @@ pub struct ScaledVideoEncoder {
     /// wrong is not cosmetic: libx264's VBV rate control reads 90 kHz ticks
     /// against a 1/fps timebase as "frames minutes apart" and **segfaults**.
     pts_90k: bool,
-    /// Source sample aspect ratio to use when the first decoded frame
-    /// carries none — the decoder context's, set by the call site. See
+    /// Source sample aspect ratio to use when a decoded frame carries
+    /// none — the decoder context's, set by the call site. See
     /// [`Self::set_source_sar_fallback`].
     sar_fallback: Option<(u32, u32)>,
+    /// Sample aspect ratio the open encoder signals, and a different one
+    /// the source has held for fewer than [`SAR_CHANGE_FRAMES`] frames.
+    /// See [`Self::follow_sar`].
+    sar_signalled: Option<(u32, u32)>,
+    sar_pending: Option<(Option<(u32, u32)>, u32)>,
+    /// The backend fixed its ratio at open (or refused a change): the
+    /// pipeline stops asking, having said so once.
+    sar_fixed: bool,
     /// `scan: auto` may field-code on this pipeline (a TS output's
     /// re-encode). See [`Self::allow_auto_field_coding`].
     auto_field_coding: bool,
@@ -922,6 +949,9 @@ impl ScaledVideoEncoder {
             async_depth: 0,
             pts_90k: false,
             sar_fallback: None,
+            sar_signalled: None,
+            sar_pending: None,
+            sar_fixed: false,
             auto_field_coding: false,
             source_weaves_fields: false,
             field_order: None,
@@ -993,8 +1023,9 @@ impl ScaledVideoEncoder {
     }
 
     /// The sample aspect ratio the decoder parsed from the bitstream
-    /// (`VideoDecoder::sample_aspect_ratio`), used when the frame the
-    /// encoder opens on carries none. Only read at lazy-open.
+    /// (`VideoDecoder::sample_aspect_ratio`), used for a frame that carries
+    /// none. Call it per frame (or at least whenever the decoder changes):
+    /// it is read for every frame encoded.
     pub fn set_source_sar_fallback(&mut self, sar: Option<(u32, u32)>) {
         self.sar_fallback = sar;
     }
@@ -1113,8 +1144,8 @@ impl ScaledVideoEncoder {
         } else {
             SourceScan::SingleField
         };
+        let src_sar = frame_ref.sample_aspect_ratio().or(self.sar_fallback);
         if self.encoder.is_none() {
-            let src_sar = frame_ref.sample_aspect_ratio().or(self.sar_fallback);
             self.lazy_open(src_w, src_h, src_pix_fmt, src_sar, source_scan)?;
         } else if src_w != self.src_w
             || src_h != self.src_h
@@ -1134,6 +1165,15 @@ impl ScaledVideoEncoder {
             self.src_pix_fmt = src_pix_fmt;
             self.scaler = self.try_build_scaler(src_w, src_h, src_pix_fmt);
         }
+        // Follow the source's sample aspect ratio: an in-band aspect
+        // change (an SD service's 16:9 programme and 4:3 insert) or an
+        // input switch to a source of another shape or size.
+        let want = output_sar(
+            src_sar,
+            sar_geometry((src_w, src_h), source_scan),
+            (self.dst_w, self.dst_h),
+        );
+        self.follow_sar(want);
 
         let enc = self.encoder.as_mut().unwrap();
 
@@ -1240,8 +1280,9 @@ impl ScaledVideoEncoder {
         pts: Option<i64>,
     ) -> Result<Vec<video_codec::EncodedVideoFrame>, String> {
         if self.encoder.is_none() {
-            // Raw planes carry no sample aspect ratio (square, as before)
-            // and no field order (progressive to `scan: auto`).
+            // Raw planes carry no sample aspect ratio (an SD capture is
+            // anamorphic, not square: none is signalled, as before) and no
+            // field order (progressive to `scan: auto`).
             self.lazy_open(src_w, src_h, src_pix_fmt, None, SourceScan::Progressive)?;
         } else if src_w != self.src_w
             || src_h != self.src_h
@@ -1326,8 +1367,11 @@ impl ScaledVideoEncoder {
             // DAR-preserving one scaled. Nothing set this before, so an
             // anamorphic source (720x576 16:9 = 64:45) left SAR-less and
             // displayed squeezed.
-            enc_cfg.sample_aspect_ratio =
-                output_sar(src_sar, (src_w, src_h), (enc_cfg.width, enc_cfg.height));
+            enc_cfg.sample_aspect_ratio = output_sar(
+                src_sar,
+                sar_geometry((src_w, src_h), source_scan),
+                (enc_cfg.width, enc_cfg.height),
+            );
             enc_cfg.field_order = field_order;
             if self.pts_90k {
                 enc_cfg.time_base_num = 1;
@@ -1389,6 +1433,8 @@ impl ScaledVideoEncoder {
                             None => String::new(),
                         },
                     );
+                    self.sar_signalled = encoder.sample_aspect_ratio();
+                    self.sar_pending = None;
                     self.encoder = Some(encoder);
                     if let Some(sink) = &self.resolved_backend_sink {
                         sink.store(candidate);
@@ -1429,6 +1475,79 @@ impl ScaledVideoEncoder {
             "encoder open failed: every backend in the resolver chain refused open ({} attempt(s)). Last: {}",
             total, last_err,
         ))
+    }
+
+    /// Re-signal the sample aspect ratio when the source's changes: the
+    /// ratio fixed at open is wrong for everything after an in-band aspect
+    /// change (an SD service switching between a 16:9 programme at 64:45
+    /// and a 4:3 insert at 16:15) or an input switch to a source of another
+    /// shape. A change is followed once the source has held it for
+    /// [`SAR_CHANGE_FRAMES`] frames, so a stray frame does not cost an IDR.
+    ///
+    /// libx264 follows (`VideoEncoder::set_sample_aspect_ratio`, which
+    /// forces an IDR so the new SPS goes out at once); every other backend
+    /// fixes the ratio at open, which is logged once and kept. A pipeline
+    /// with out-of-band headers (`global_header`: the RTMP sequence header)
+    /// keeps its open-time ratio too — the receiver has the SPS already.
+    /// libx264 cannot withdraw a ratio, so a source that stops signalling
+    /// one after one that did is signalled 1:1, which a receiver reads the
+    /// same way as unspecified.
+    fn follow_sar(&mut self, want: Option<(u32, u32)>) {
+        if self.global_header || self.sar_fixed {
+            return;
+        }
+        let want = want.or(self.sar_signalled.map(|_| (1, 1)));
+        if want == self.sar_signalled {
+            self.sar_pending = None;
+            return;
+        }
+        let held = match self.sar_pending {
+            Some((pending, n)) if pending == want => n + 1,
+            _ => 1,
+        };
+        if held < SAR_CHANGE_FRAMES {
+            self.sar_pending = Some((want, held));
+            return;
+        }
+        self.sar_pending = None;
+        let Some(enc) = self.encoder.as_mut() else {
+            return;
+        };
+        let show = |sar: Option<(u32, u32)>| match sar {
+            Some((n, d)) => format!("{n}:{d}"),
+            None => "unspecified".to_string(),
+        };
+        match enc.set_sample_aspect_ratio(want) {
+            Ok(true) => {
+                tracing::info!(
+                    "{}: source sample aspect ratio changed — signalling {} (was {}) from an IDR",
+                    self.log_tag,
+                    show(want),
+                    show(self.sar_signalled),
+                );
+                self.sar_signalled = enc.sample_aspect_ratio();
+            }
+            Ok(false) => {
+                tracing::warn!(
+                    "{}: source sample aspect ratio changed to {}, but {} fixes it at open — \
+                     the output keeps signalling {} until it restarts",
+                    self.log_tag,
+                    show(want),
+                    enc.codec().ffmpeg_name(),
+                    show(self.sar_signalled),
+                );
+                self.sar_fixed = true;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "{}: sample aspect ratio {} refused ({e}); keeping {}",
+                    self.log_tag,
+                    show(want),
+                    show(self.sar_signalled),
+                );
+                self.sar_fixed = true;
+            }
+        }
     }
 
     /// Record (and log) that an explicit `scan: interlaced` is coding
@@ -1950,14 +2069,40 @@ mod sar_tests {
     fn scaling_preserves_the_display_aspect_ratio() {
         // 16:9 anamorphic SD to square-pixel 16:9.
         assert_eq!(output_sar(Some((64, 45)), (720, 576), (1024, 576)), Some((1, 1)));
-        // Square HD to 16:9 anamorphic SD, specified or not.
+        // Square HD to 16:9 anamorphic SD.
         assert_eq!(output_sar(Some((1, 1)), (1920, 1080), (720, 576)), Some((64, 45)));
-        assert_eq!(output_sar(None, (1920, 1080), (720, 576)), Some((64, 45)));
-        // Square stays square; an unspecified square source stays unspecified.
+        // Square stays square.
         assert_eq!(output_sar(Some((1, 1)), (1920, 1080), (1280, 720)), Some((1, 1)));
-        assert_eq!(output_sar(None, (1920, 1080), (1280, 720)), None);
         // VH1: 528x480 at 40:33 (4:3) widened to 720x480 is 8:9, still 4:3.
         assert_eq!(output_sar(Some((40, 33)), (528, 480), (720, 480)), Some((8, 9)));
+    }
+
+    /// An unspecified source is not taken as square: a raw SD capture (SDI,
+    /// ST 2110) signals nothing and is anamorphic, and 720x576 upconverted
+    /// to 1920x1080 "as if square" signalled 45:64 — a 16:9 picture shown
+    /// at 5:4. It stays unspecified, scaled or not, as every encode did.
+    #[test]
+    fn an_unspecified_source_stays_unspecified_when_scaled() {
+        assert_eq!(output_sar(None, (720, 576), (1920, 1080)), None);
+        assert_eq!(output_sar(None, (1920, 1080), (720, 576)), None);
+        assert_eq!(output_sar(None, (1920, 1080), (1280, 720)), None);
+    }
+
+    /// An HEVC field_seq source's SAR describes the frame its fields make:
+    /// 1920x540 fields at 1:1 are a 16:9 picture. Read per field they were
+    /// 32:9 — and scaled to 1920x1080, "keeping" that shape signalled 2:1.
+    #[cfg(feature = "media-codecs")]
+    #[test]
+    fn a_single_field_source_keeps_its_frame_shape() {
+        use super::{sar_geometry, SourceScan};
+        let field = sar_geometry((1920, 540), SourceScan::SingleField);
+        assert_eq!(field, (1920, 1080));
+        assert_eq!(output_sar(Some((1, 1)), field, (1920, 1080)), Some((1, 1)));
+        assert_eq!(output_sar(Some((1, 1)), field, (1920, 540)), Some((1, 2)));
+        // A woven or progressive picture is its own geometry.
+        let woven = sar_geometry((1920, 1080), SourceScan::Woven(video_codec::VideoFieldOrder::Tff));
+        assert_eq!(woven, (1920, 1080));
+        assert_eq!(sar_geometry((720, 576), SourceScan::Progressive), (720, 576));
     }
 
     #[test]
@@ -2103,6 +2248,24 @@ mod scan_x264_tests {
         assert_eq!(p.field_order(), None);
         assert!(p.take_interlace_notice().unwrap().contains("field_seq"));
         assert_eq!(p.take_interlace_notice(), None);
+    }
+
+    /// An SDI 625-line capture (720x576 raw planes, which carry no SAR)
+    /// upconverted to 1920x1080 signals no SAR — not the 45:64 a source
+    /// taken as square would get, which shows a 16:9 picture at 5:4.
+    #[test]
+    fn raw_sd_planes_scaled_to_hd_signal_no_sar() {
+        let cfg: VideoEncodeConfig = serde_json::from_value(serde_json::json!({
+            "codec": "x264", "width": 1920, "height": 1080
+        }))
+        .unwrap();
+        let mut p = ScaledVideoEncoder::new(cfg, VideoEncoderCodec::X264, 25, 1, false, "test");
+        let (w, h) = (720usize, 576usize);
+        let fmt = video_engine::av_pix_fmt_for_yuv(video_codec::VideoChroma::Yuv420, 8).unwrap();
+        let (y, c) = (vec![100u8; w * h], vec![128u8; w / 2 * h / 2]);
+        p.encode_raw_planes(720, 576, fmt, &y, w, &c, w / 2, &c, w / 2, Some(0)).unwrap();
+        assert_eq!(p.dst_dimensions(), (1920, 1080));
+        assert_eq!(p.encoder.as_ref().unwrap().sample_aspect_ratio(), None);
     }
 
     /// The same frames from an H.264 decoder are woven: field-coded.

@@ -1596,10 +1596,9 @@ mod inner {
                 if force_idr_now {
                     self.pipeline.force_next_keyframe();
                 }
-                if !self.pipeline.is_open()
-                    && let Some(dec) = self.decoder.as_ref()
-                {
-                    // The decoder's SAR, for a frame that carries none.
+                if let Some(dec) = self.decoder.as_ref() {
+                    // The decoder's SAR, for a frame that carries none —
+                    // this decoder's, so an input switch's new one counts.
                     self.pipeline.set_source_sar_fallback(dec.sample_aspect_ratio());
                 }
 
@@ -3205,6 +3204,29 @@ mod tests {
             let mut r = TsVideoReplacer::new(&cfg("x264"), None).unwrap();
             let out = run(&mut r, &ts_of(&aus, 900_000, false, &mut cc));
             assert_eq!(first_sps(&out).sample_aspect_ratio, None);
+        }
+
+        /// An SD service switching between a 16:9 programme (64:45) and a
+        /// 4:3 insert (16:15) mid-stream: the output follows each change
+        /// (an IDR carrying the new SPS a few frames in). The ratio fixed
+        /// when the encoder opened used to be signalled for the rest of the
+        /// run — after a join during a 4:3 insert, every later 16:9
+        /// programme displayed squeezed.
+        #[test]
+        fn the_sample_aspect_ratio_follows_an_in_band_change() {
+            let mut aus = x264_aus(12, (720, 576), None, Some((64, 45)));
+            aus.extend(x264_aus(12, (720, 576), None, Some((16, 15))));
+            aus.extend(x264_aus(12, (720, 576), None, Some((64, 45))));
+            let mut cc = 0u8;
+            let mut r = TsVideoReplacer::new(&cfg("x264"), None).unwrap();
+            let out = run(&mut r, &ts_of(&aus, 900_000, false, &mut cc));
+            let mut sars: Vec<_> = out_pes(&out)
+                .iter()
+                .filter_map(|(es, _)| video_engine::find_h264_sps(es))
+                .map(|sps| sps.sample_aspect_ratio)
+                .collect();
+            sars.dedup();
+            assert_eq!(sars, [Some((64, 45)), Some((16, 15)), Some((64, 45))]);
         }
 
         /// Decode the re-encoded video: per frame (interlaced, top field

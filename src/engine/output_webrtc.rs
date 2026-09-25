@@ -319,6 +319,10 @@ fn open_webrtc_video_active(
         format!("WebRTC output '{}'", output_id),
     );
     pipeline.set_resolved_backend_sink(stats_handle.resolved_backend.clone());
+    // An interlaced frame from this decoder is a woven frame (H.264) or a
+    // single field (HEVC field_seq) — which sets the geometry its sample
+    // aspect ratio describes.
+    pipeline.set_source_codec(source_codec);
     WebrtcVideoEncoderState::Active(Box::new(WebrtcVideoActive {
         decoder,
         pipeline,
