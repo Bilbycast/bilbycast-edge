@@ -77,7 +77,11 @@
 //!
 //! ## Properties
 //!
-//! - **Monotonic by construction** — output PCR + PTS only advance.
+//! - **Monotonic by construction** — output PCR + PTS only advance, except
+//!   across a backward source PCR step under 500 ms, which is the source's
+//!   own and passes through as the step it is (DI and all when the source
+//!   set one — an ingress transcode raising its PCR delay steps only its PCR
+//!   back, and bridging that would move every PES timestamp forward).
 //! - **Rate-preserving** — output PCR rate = source PCR rate during
 //!   continuous segments.
 //! - **PCR→PTS delta preserved** — output stream's apparent T-STD
@@ -120,6 +124,12 @@
 //!   rewriter passes the source clock through instead (DI=1, Warning
 //!   `clock_rewrite_pmt_not_learned`) so PCR and PTS never sit on two
 //!   different timelines, and resumes regeneration once a PMT arrives.
+//! - **No PES before the anchor, for at most 2 s.** A PES that starts
+//!   before the first PCR (or before the PMT) is dropped whole rather than
+//!   sent with its source timestamps. When 2 s of PES (or wall) time pass
+//!   with no PCR on a PCR PID — an audio-only RTMP publish whose PMT names
+//!   an absent video PID as PCR_PID — PES pass on the source clock
+//!   (Warning `clock_rewrite_no_pcr`) until a PCR establishes the anchor.
 //! - **PCR repetition rate** (TR 101 290 §PCR_RR ≤ 40 ms): not
 //!   enforced. If the source emits PCR sparsely, the output is
 //!   sparse too. A future enhancement could inject PCR padding when
@@ -453,8 +463,39 @@ pub struct TsPtsRewriter {
     /// dropped whole — it would otherwise leave with its SOURCE timestamps
     /// on a stream whose PCR is regenerated (7a: a flow-start PES ~20 550 s
     /// off the live timeline, and a spurious DI from the source-
-    /// discontinuity watch). `(dropping, CC renumbering)`.
-    pes_gate: HashMap<u16, (bool, CcRenumber)>,
+    /// discontinuity watch). Bounded: see [`PES_HOLD_WINDOW_27MHZ`].
+    pes_gate: HashMap<u16, PesGate>,
+    /// Wall time of the first PES the gate held since it last let one
+    /// through — the gate's wall-clock bound.
+    pes_hold_since: Option<std::time::Instant>,
+    /// Set when the PES gate held [`PES_HOLD_WINDOW_27MHZ`] of PES and no
+    /// PCR on a PCR PID established the anchor: there is no PCR to
+    /// regenerate from, so PES leave with their source timestamps (as they
+    /// would with no rewriter at all) until one arrives, when the anchor is
+    /// established with DI=1 and regeneration starts.
+    clock_passthrough_no_pcr: bool,
+}
+
+/// How much PES time (per PID, forward steps only, each capped at 1 s) or
+/// wall time the PES gate may hold before it gives up waiting. The first
+/// PCR normally follows a mid-GOP join within 40-100 ms; a stream whose
+/// PCR_PID carries none — an audio-only RTMP publish, whose muxer names the
+/// absent video PID as PCR_PID, or a PMT with PCR_PID 0x1FFF and no PCR
+/// anywhere — would otherwise have every PES dropped for good. Same 2 s as
+/// the roles-unlearned window.
+const PES_HOLD_WINDOW_27MHZ: u64 = ROLES_UNLEARNED_WINDOW_27MHZ;
+
+/// Per-PID state of the PES gate.
+#[derive(Debug, Default)]
+struct PesGate {
+    /// The current PES is being dropped.
+    dropping: bool,
+    /// Renumbering for the payload packets dropped on this PID.
+    cc: CcRenumber,
+    /// Timestamp (DTS, else PTS; 90 kHz) of the last PES held here, and the
+    /// PES time held so far.
+    last_held_90k: Option<u64>,
+    held_27mhz: u64,
 }
 
 impl TsPtsRewriter {
@@ -487,6 +528,8 @@ impl TsPtsRewriter {
             av_skew: None,
             av_skew_last: None,
             pes_gate: HashMap::new(),
+            pes_hold_since: None,
+            clock_passthrough_no_pcr: false,
         }
     }
 
@@ -643,8 +686,7 @@ impl TsPtsRewriter {
                     }
                 } else if is_pcr_pid {
                     buf.copy_from_slice(pkt);
-                    let (new_pcr, set_di) =
-                        self.rewrite_pcr_value(src_pcr, ts_discontinuity_indicator(pkt));
+                    let (new_pcr, set_di) = self.rewrite_pcr_value(src_pcr);
                     let set_di = set_di || std::mem::take(&mut self.pending_di);
                     if write_pcr_field_in_packet(&mut buf, new_pcr).is_some() {
                         rewritten = true;
@@ -721,34 +763,43 @@ impl TsPtsRewriter {
             // on a regenerated-PCR stream. A dropped packet that carries a
             // PCR or DI survives adaptation-field-only; later packets on
             // the PID are renumbered so the CC stays continuous. Not in
-            // the source-clock fallback, where PCR and PES agree anyway.
+            // the source-clock fallbacks, where PCR and PES agree anyway,
+            // and never for longer than `PES_HOLD_WINDOW_27MHZ`.
             let mut stripped = false;
             if self.gates_pes(pid, on_pmt_pid) {
                 if ts_pusi(pkt) && super::ts_parse::pes_payload_offset(pkt).is_some() {
                     // Only a PES with a timestamp has anything to leak.
-                    let hold = extract_pes_pts(pkt).is_some()
+                    let ts = extract_pes_dts(pkt).or_else(|| extract_pes_pts(pkt));
+                    let hold = ts.is_some()
                         && !self.clock_passthrough_unlearned
-                        && !(self.anchor.established && self.pmt_learned);
+                        && !self.clock_passthrough_no_pcr
+                        && !(self.anchor.established && self.pmt_learned)
+                        && !self.pes_hold_expired(pid, ts);
                     if hold {
-                        self.pes_gate.entry(pid).or_default().0 = true;
+                        self.pes_gate.entry(pid).or_default().dropping = true;
                     } else if let Some(g) = self.pes_gate.get_mut(&pid) {
-                        g.0 = false;
+                        g.dropping = false;
+                        g.last_held_90k = None;
+                        g.held_27mhz = 0;
+                    }
+                    if !hold {
+                        self.pes_hold_since = None;
                     }
                 }
                 if let Some(g) = self.pes_gate.get_mut(&pid)
-                    && g.0
+                    && g.dropping
                     && ts_has_payload(pkt)
                 {
                     let keeps_af = extract_pcr(pkt).is_some() || ts_discontinuity_indicator(pkt);
                     if !keeps_af {
-                        g.1.drop_payload();
+                        g.cc.drop_payload();
                         continue;
                     }
                     if !rewritten {
                         buf.copy_from_slice(pkt);
                     }
                     if !strip_to_af_only(&mut buf) {
-                        g.1.drop_payload();
+                        g.cc.drop_payload();
                         continue;
                     }
                     rewritten = true;
@@ -767,8 +818,13 @@ impl TsPtsRewriter {
             // on every compliant receiver. Section-carrying PIDs
             // (`Sections`) are excluded; unlearned PIDs pass through, and
             // so does everything while the source clock is passed through
-            // (PCR and PES must stay on one timeline).
-            if ts_pusi(pkt) && !stripped && !self.clock_passthrough_unlearned {
+            // (PCR and PES must stay on one timeline) or no PCR has
+            // established the anchor (nothing to map onto).
+            if ts_pusi(pkt)
+                && !stripped
+                && !self.clock_passthrough_unlearned
+                && self.anchor.established
+            {
                 let role = self.pid_role.get(&pid).copied();
                 if matches!(
                     role,
@@ -814,14 +870,14 @@ impl TsPtsRewriter {
 
             // Renumber the CC of a PID the PES gate has dropped packets on.
             if let Some(g) = self.pes_gate.get_mut(&pid) {
-                if g.1.rewrites(stripped) {
+                if g.cc.rewrites(stripped) {
                     if !rewritten {
                         buf.copy_from_slice(pkt);
                         rewritten = true;
                     }
-                    g.1.emit(&mut buf, stripped);
+                    g.cc.emit(&mut buf, stripped);
                 } else {
-                    g.1.emitted_unchanged();
+                    g.cc.emitted_unchanged();
                 }
             }
 
@@ -857,6 +913,76 @@ impl TsPtsRewriter {
             && pid != NULL_PID
             && !on_pmt_pid
             && !matches!(self.pid_role.get(&pid), Some(PidRole::Sections))
+    }
+
+    /// The PES gate is about to hold a PES on `pid` stamped `ts_90k`
+    /// (DTS, else PTS). Account it, and when the gate has now held
+    /// [`PES_HOLD_WINDOW_27MHZ`] of PES time on this PID — forward steps
+    /// only, each capped at 1 s, so neither a wrap nor a jump expires it on
+    /// its own — or of wall time, give up waiting: with no anchor, pass PES
+    /// on the source clock until a PCR arrives; with an anchor but no PMT,
+    /// take the same source-clock fallback a PCR-timed expiry takes.
+    /// Returns `true` when this PES must pass.
+    fn pes_hold_expired(&mut self, pid: u16, ts_90k: Option<u64>) -> bool {
+        let now = std::time::Instant::now();
+        let since = *self.pes_hold_since.get_or_insert(now);
+        let g = self.pes_gate.entry(pid).or_default();
+        if let Some(ts) = ts_90k {
+            if let Some(prev) = g.last_held_90k {
+                let step = (ts + (1 << 33) - prev) % (1 << 33);
+                if step < (1 << 32) {
+                    g.held_27mhz += (step * 300).min(27_000_000);
+                }
+            }
+            g.last_held_90k = Some(ts);
+        }
+        let expired = g.held_27mhz >= PES_HOLD_WINDOW_27MHZ
+            || now.duration_since(since).as_nanos() as u64 * 27 / 1_000 >= PES_HOLD_WINDOW_27MHZ;
+        if !expired {
+            return false;
+        }
+        for g in self.pes_gate.values_mut() {
+            g.last_held_90k = None;
+            g.held_27mhz = 0;
+        }
+        self.pes_hold_since = None;
+        if self.anchor.established {
+            self.fall_back_unlearned();
+        } else {
+            self.fall_back_no_pcr();
+        }
+        true
+    }
+
+    /// No PCR on a PCR PID arrived while the PES gate held
+    /// [`PES_HOLD_WINDOW_27MHZ`]: PES pass with their source timestamps —
+    /// there is no regenerated PCR for them to disagree with — until a PCR
+    /// establishes the anchor, which then carries DI=1. Warning
+    /// `clock_rewrite_no_pcr`.
+    fn fall_back_no_pcr(&mut self) {
+        self.clock_passthrough_no_pcr = true;
+        self.pending_di = true;
+        let mut pcr_pids: Vec<u16> = self.pcr_pids.iter().copied().collect();
+        pcr_pids.sort_unstable();
+        let message = format!(
+            "no PCR arrived on the program's PCR PID within {} ms of held PES — passing PES \
+             timestamps through on the source clock until one does",
+            PES_HOLD_WINDOW_27MHZ / 27_000
+        );
+        tracing::warn!(?pcr_pids, error_code = "clock_rewrite_no_pcr", "ts_pts_rewriter: {message}");
+        if let Some((sender, input_id)) = self.event_sink.as_ref() {
+            sender.emit_input_with_details(
+                crate::manager::events::EventSeverity::Warning,
+                crate::manager::events::category::FLOW,
+                format!("Input '{input_id}': {message}"),
+                input_id,
+                serde_json::json!({
+                    "error_code": "clock_rewrite_no_pcr",
+                    "pcr_pids": pcr_pids,
+                    "waited_ms": PES_HOLD_WINDOW_27MHZ / 27_000,
+                }),
+            );
+        }
     }
 
     /// Anchor offset in 90 kHz ticks (= (anchor.out_27mhz -
@@ -1006,11 +1132,15 @@ impl TsPtsRewriter {
     /// source-delta.
     ///
     /// A >500 ms **backward** source jump re-anchors with a master-delta
-    /// bridge so output stays monotonic, DI=1 — and so does a backward step
-    /// of any size that the source flagged with DI: an upstream transcode
-    /// chain raising its PCR delay (`ts_pcr_remux`) steps its PCR back by
-    /// tens of ms with DI, and passing that into muxer mode would make the
-    /// "monotonic by construction" output step back too.
+    /// bridge so output stays monotonic, DI=1. A smaller backward step is
+    /// the source's own and passes through as the step it is — DI and all
+    /// when the source set it. That is deliberate for an upstream transcode
+    /// chain raising its PCR delay (`ts_pcr_remux`): it steps only its PCR
+    /// back, with DI, and keeps every PES timestamp continuous. Bridging
+    /// that step would keep the output PCR monotonic only by moving every
+    /// PES timestamp on the flow forward by the raise instead — an audio
+    /// hole and a held frame on every PTS-driven output (HLS, CMAF, WebRTC,
+    /// RTMP, display).
     ///
     /// A >500 ms **forward** jump splits two ways on whether the wall clock
     /// witnessed it. If real elapsed time accounts for the jump (a live edit
@@ -1023,10 +1153,16 @@ impl TsPtsRewriter {
     /// presentation timeline and the display sheds frames to absorb it. Both
     /// bridges are clamped — see [`MAX_BRIDGE_ADVANCE_27MHZ`] for the
     /// trade-off that clamp makes. DI=1 on every discontinuity either way.
-    fn rewrite_pcr_value(&mut self, src_pcr_27mhz: u64, src_di: bool) -> (u64, bool) {
+    fn rewrite_pcr_value(&mut self, src_pcr_27mhz: u64) -> (u64, bool) {
         let master_now = self.pacer.now_27mhz();
 
         if !self.anchor.established {
+            if std::mem::take(&mut self.clock_passthrough_no_pcr) {
+                tracing::info!(
+                    "ts_pts_rewriter: first PCR after the no-PCR fallback — regenerating PCR / \
+                     PES timestamps from here (DI=1)"
+                );
+            }
             self.anchor.src_27mhz = src_pcr_27mhz;
             self.anchor.out_27mhz = master_now.wrapping_sub(PCR_PREROLL_27MHZ);
             self.anchor.last_src_pcr_27mhz = src_pcr_27mhz;
@@ -1063,7 +1199,7 @@ impl TsPtsRewriter {
         //
         // - **Continuous segment** (|delta_src| ≤ 500 ms): anchor stays
         //   put, source-delta drives output, no DI.
-        if delta_src < -(DISCONTINUITY_THRESHOLD_27MHZ as i64) || (src_di && delta_src < 0) {
+        if delta_src < -(DISCONTINUITY_THRESHOLD_27MHZ as i64) {
             let out_at_last = self.anchor.out_27mhz.wrapping_add(
                 self.anchor.last_src_pcr_27mhz.wrapping_sub(self.anchor.src_27mhz),
             );
@@ -1402,6 +1538,16 @@ impl TsPtsRewriter {
         }
         self.unlearned_last_pcr = Some(src_pcr);
         if self.unlearned_src_27mhz < ROLES_UNLEARNED_WINDOW_27MHZ {
+            return;
+        }
+        self.fall_back_unlearned();
+    }
+
+    /// The roles-unlearned window expired — on source-PCR time, or on the
+    /// PES gate's PES / wall time: pass the source clock through and raise
+    /// `clock_rewrite_pmt_not_learned`.
+    fn fall_back_unlearned(&mut self) {
+        if self.clock_passthrough_unlearned {
             return;
         }
         self.clock_passthrough_unlearned = true;
@@ -2681,7 +2827,7 @@ mod tests {
         );
 
         // Establish anchor via a PCR packet.
-        let _ = r.rewrite_pcr_value(123_456_789, false);
+        let _ = r.rewrite_pcr_value(123_456_789);
 
         // Build a SCTE-35 splice_info packet with known pts_adjustment.
         let src_pts_adj: u64 = 0x1_2345_6789;
@@ -2786,36 +2932,159 @@ mod tests {
         assert_eq!(ccs, vec![5, 6, 7], "AF-only then payload, continuous");
     }
 
-    /// A small backward PCR step the source flags with DI — an upstream
-    /// transcode chain raising its PCR delay — is bridged, so muxer-mode
-    /// output stays monotonic; DI goes out with it.
+    /// A small backward PCR step is the source's own and passes through as
+    /// the step it is — with its DI when the source set one (an upstream
+    /// transcode chain raising its PCR delay). Bridging it would move every
+    /// PES timestamp forward instead.
     #[test]
-    fn a_backward_pcr_step_with_di_is_bridged() {
+    fn a_small_backward_pcr_step_passes_through_with_its_di() {
+        for di in [true, false] {
+            let mut r = TsPtsRewriter::new(make_wallclock_pacer());
+            let mut out = Vec::new();
+            r.process(&build_psi(0x100, 0x101), &mut out);
+            let t = 2_000_000_000u64;
+            out.clear();
+            r.process(&build_pcr_packet(0x100, t), &mut out);
+            let first = extract_pcr(&out[out.len() - TS_PACKET_SIZE..]).unwrap();
+            let mut step = build_pcr_packet(0x100, t - 10 * 27_000);
+            if di {
+                set_discontinuity_indicator(&mut step);
+            }
+            out.clear();
+            r.process(&step, &mut out);
+            let p = &out[out.len() - TS_PACKET_SIZE..];
+            assert_eq!(first - extract_pcr(p).unwrap(), 10 * 27_000, "di {di}");
+            assert_eq!(ts_discontinuity_indicator(p), di, "the source's DI, and only that");
+        }
+    }
+
+    /// An ingress transcode raising its PCR delay (`ts_pcr_remux`) steps
+    /// only its PCR back, with DI. Through the muxer-mode rewriter that
+    /// stays a PCR step: every PES timestamp keeps one offset from its
+    /// source value across the raise, so PTS-driven outputs see no gap.
+    #[test]
+    fn an_ingress_pcr_delay_raise_keeps_pes_timestamps_continuous() {
+        use crate::engine::ts_parse::pcr_only_packet;
+        use crate::engine::ts_pcr_remux::TsPcrRemux;
+        use crate::engine::ts_test_fixtures::pes_start_packet;
+        const MS: u64 = 27_000;
+        let (v, a) = (0x100u16, 0x101u16);
+        let t0 = 900_000_000u64;
+        let mut input = build_psi(v, a);
+        let mut src_pes = Vec::new();
+        let (mut vcc, mut acc) = (0u8, 0u8);
+        for k in 0..40u64 {
+            let t = t0 + k * 40 * MS;
+            input.extend_from_slice(&pcr_only_packet(v, vcc.wrapping_sub(1) & 0x0F, t, false));
+            let apts = (t + 100 * MS) / 300;
+            input.extend_from_slice(&pes_start_packet(a, acc, 0xC0, apts, None));
+            acc = (acc + 1) & 0x0F;
+            // Re-encoded video 50 ms ahead of its PCR — except frame 20,
+            // 150 ms late: the guard raises D from 80 to 230 ms.
+            let vdts = (if k == 20 { t - 150 * MS } else { t + 50 * MS }) / 300;
+            input.extend_from_slice(&pes_start_packet(v, vcc, 0xE0, vdts, Some(vdts)));
+            vcc = (vcc + 1) & 0x0F;
+            src_pes.push(apts);
+            src_pes.push(vdts);
+        }
+        let mut remux = TsPcrRemux::new();
+        remux.set_replaced_pids(None, Some(v));
+        let mut mid = Vec::new();
+        remux.process(&input, &mut mid);
+        assert_eq!(remux.offset_27mhz(), 230 * MS, "the guard raised D");
         let mut r = TsPtsRewriter::new(make_wallclock_pacer());
         let mut out = Vec::new();
-        r.process(&build_psi(0x100, 0x101), &mut out);
-        let t = 2_000_000_000u64;
-        out.clear();
-        r.process(&build_pcr_packet(0x100, t), &mut out);
-        let first = extract_pcr(&out[out.len() - TS_PACKET_SIZE..]).unwrap();
-        let mut step = build_pcr_packet(0x100, t + 40 * 27_000 - 50 * 27_000);
-        set_discontinuity_indicator(&mut step);
-        out.clear();
-        r.process(&step, &mut out);
-        let p = &out[out.len() - TS_PACKET_SIZE..];
-        let second = extract_pcr(p).unwrap();
-        assert!(second > first, "output PCR stays monotonic across the -10 ms DI step");
-        assert!(ts_discontinuity_indicator(p));
-        // Without DI the same step is the source's own clock and passes.
+        r.process(&mid, &mut out);
+        let mut pes = Vec::new();
+        let mut pcrs = Vec::new();
+        for p in out.chunks(TS_PACKET_SIZE) {
+            if let Some(v) = extract_pcr(p) {
+                pcrs.push((v, ts_discontinuity_indicator(p)));
+            }
+            if ts_pusi(p)
+                && let Some(pts) = extract_pes_pts(p)
+            {
+                pes.push(pts);
+            }
+        }
+        assert_eq!(pes.len(), src_pes.len(), "no PES dropped");
+        let off = |o: u64, s: u64| (o + (1 << 33) - s) % (1 << 33);
+        let first = off(pes[0], src_pes[0]);
+        for (i, (o, s)) in pes.iter().zip(&src_pes).enumerate() {
+            assert_eq!(off(*o, *s), first, "PES {i}: one offset across the raise");
+        }
+        // The raise is one DI'd PCR step back of 150 − 40 = 110 ms.
+        let steps: Vec<(i64, bool)> =
+            pcrs.windows(2).map(|w| (w[1].0 as i64 - w[0].0 as i64, w[1].1)).collect();
+        assert_eq!(steps.iter().filter(|s| s.1).count(), 1, "one DI");
+        let back = steps.iter().find(|s| s.1).unwrap();
+        assert_eq!(back.0, -110 * MS as i64);
+        assert!(steps.iter().filter(|s| !s.1).all(|s| s.0 == 40 * MS as i64));
+    }
+
+    /// PES on a program whose PCR_PID never carries a PCR — an audio-only
+    /// RTMP publish (the muxer names the absent video PID) — are held for
+    /// at most 2 s of PES time, then pass on the source clock with
+    /// `clock_rewrite_no_pcr`. A PCR arriving later starts regeneration,
+    /// with DI.
+    #[test]
+    fn pes_with_no_pcr_on_the_pcr_pid_pass_after_the_hold_window() {
+        use crate::engine::ts_test_fixtures::pes_start_packet;
         let mut r = TsPtsRewriter::new(make_wallclock_pacer());
+        let (tx, mut rx) = crate::manager::events::event_channel();
+        r.set_event_sink(tx, "in-1");
+        let mut out = Vec::new();
         r.process(&build_psi(0x100, 0x101), &mut out);
         out.clear();
-        r.process(&build_pcr_packet(0x100, t), &mut out);
-        let first = extract_pcr(&out[out.len() - TS_PACKET_SIZE..]).unwrap();
+        // 3 s of AAC frames (1920 ticks = 21.3 ms) on the audio PID.
+        let pts0 = 1_000_000u64;
+        let frames: Vec<u64> = (0..141u64).map(|k| pts0 + k * 1_920).collect();
+        for (k, pts) in frames.iter().enumerate() {
+            r.process(&pes_start_packet(0x101, k as u8, 0xC0, *pts, None), &mut out);
+        }
+        let got: Vec<u64> = out.chunks(TS_PACKET_SIZE).filter_map(extract_pes_pts).collect();
+        assert!(!got.is_empty(), "the gate opened");
+        // The PES that expired the window passes; so does everything after.
+        let first = got[0];
+        // 94 steps of 1920 ticks are the first to reach 2 s.
+        assert_eq!(first, pts0 + 94 * 1_920, "2 s of PES time held");
+        let at = frames.iter().position(|p| *p == first).unwrap();
+        assert_eq!(got, frames[at..].to_vec(), "source timestamps, unchanged");
+        let ev = rx.try_recv().expect("warning emitted");
+        assert_eq!(ev.details.unwrap()["error_code"], "clock_rewrite_no_pcr");
+        // A PCR on the PCR PID: the anchor is established, with DI, and the
+        // next PES are regenerated against it.
         out.clear();
-        r.process(&build_pcr_packet(0x100, t - 10 * 27_000), &mut out);
-        let second = extract_pcr(&out[out.len() - TS_PACKET_SIZE..]).unwrap();
-        assert_eq!(first - second, 10 * 27_000);
+        let src_pcr = (pts0 + 141 * 1_920) * 300;
+        r.process(&build_pcr_packet(0x100, src_pcr), &mut out);
+        assert!(ts_discontinuity_indicator(&out[out.len() - TS_PACKET_SIZE..]));
+        let out_pcr = extract_pcr(&out[out.len() - TS_PACKET_SIZE..]).unwrap();
+        out.clear();
+        let pts = pts0 + 142 * 1_920;
+        r.process(&pes_start_packet(0x101, 1, 0xC0, pts, None), &mut out);
+        let rewritten = extract_pes_pts(&out[out.len() - TS_PACKET_SIZE..]).unwrap();
+        assert_eq!(rewritten, (out_pcr / 300 + 1_920) & ((1 << 33) - 1));
+    }
+
+    /// A PMT whose PCR_PID is 0x1FFF over a stream with no PCR anywhere
+    /// still emits its PES once the hold window expires.
+    #[test]
+    fn a_pmt_with_pcr_pid_1fff_and_no_pcr_still_emits_pes() {
+        use crate::engine::ts_test_fixtures::{
+            packetize_sections, pat_packet, pes_start_packet, pmt_section,
+        };
+        let mut r = TsPtsRewriter::new(make_wallclock_pacer());
+        let mut out = Vec::new();
+        r.process(&pat_packet(&[(1, 0x1000)], 0, 0), &mut out);
+        let pmt = pmt_section(1, 0, 0x1FFF, &[], &[(0x0F, 0x101, &[])]);
+        r.process(&packetize_sections(0x1000, &[&pmt], 0)[0], &mut out);
+        assert!(r.pmt_learned && r.pcr_pids.is_empty());
+        out.clear();
+        for k in 0..200u64 {
+            r.process(&pes_start_packet(0x101, k as u8, 0xC0, 90_000 + k * 1_920, None), &mut out);
+        }
+        let n = out.chunks(TS_PACKET_SIZE).filter(|p| extract_pes_pts(p).is_some()).count();
+        assert!(n > 100, "PES flow after the window: {n}");
     }
 
     /// After PCR anchor, PES PTS rewrites preserve source PCR→PTS delta.
@@ -2827,7 +3096,7 @@ mod tests {
 
         let src_pcr: u64 = 10_000_000; // 27 MHz
         let src_pcr_90k = src_pcr / 300;
-        let _ = r.rewrite_pcr_value(src_pcr, false); // anchor
+        let _ = r.rewrite_pcr_value(src_pcr); // anchor
 
         // PES PTS at src_pcr_90k + 7200 (80 ms ahead = standard pre-roll)
         let src_pts = src_pcr_90k + 7200;
@@ -2851,7 +3120,7 @@ mod tests {
         let mut buf = Vec::new();
         r.process(&build_psi(0x100, 0x101), &mut buf);
         // Anchor with PCR.
-        let _ = r.rewrite_pcr_value(5_000_000, false);
+        let _ = r.rewrite_pcr_value(5_000_000);
         let src_pts: u64 = 5_000_000 / 300 + 9000; // 100 ms after PCR
         let src_dts: u64 = src_pts - 3600; // DTS leads PTS by 40 ms
         let (new_pts, new_dts) = r.rewrite_pes_values(src_pts, Some(src_dts), false);
@@ -2874,7 +3143,7 @@ mod tests {
         let mut r = TsPtsRewriter::new(make_wallclock_pacer());
         let mut buf = Vec::new();
         r.process(&build_psi(0x100, 0x101), &mut buf);
-        let _ = r.rewrite_pcr_value(5_000_000, false); // anchor
+        let _ = r.rewrite_pcr_value(5_000_000); // anchor
 
         let src_pts: u64 = 5_000_000 / 300 + 9000; // 100 ms after PCR
         let src_dts: u64 = src_pts - 3600; // DTS leads PTS by 40 ms
@@ -2930,7 +3199,7 @@ mod tests {
         let mut r = TsPtsRewriter::new(pacer);
         let mut buf = Vec::new();
         r.process(&build_psi(0x100, 0x101), &mut buf);
-        let _ = r.rewrite_pcr_value(10_000_000, false);
+        let _ = r.rewrite_pcr_value(10_000_000);
         let src_pts: u64 = 33_333 + 7_200; // some PTS in the future
         let (audio_pts, _) = r.rewrite_pes_values(src_pts, None, true);
         let (video_pts, _) = r.rewrite_pes_values(src_pts, None, false);

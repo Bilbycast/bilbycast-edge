@@ -88,6 +88,11 @@ pub fn spawn_rtsp_input(
             pcr_jump_signal: Some(&pcr_jump_signal),
             av_skew: Some(&av_skew_for_post),
         });
+        // The muxer-mode rewriter's input-scoped Warnings
+        // (`clock_rewrite_no_pcr` when the PCR_PID carries no PCR).
+        if let Some(p) = post.as_mut() {
+            p.set_event_sender(&event_sender, &input_id);
+        }
         if let Some(ref _p) = post {
             tracing::info!(
                 "RTSP input: ingress post-process active (passthrough_clock={passthrough_clock})"
