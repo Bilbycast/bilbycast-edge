@@ -275,6 +275,9 @@ pub fn build_encoder_config(
         // critical ingest call sites (ST 2110-20/-23) override this via
         // `ScaledVideoEncoder::set_async_depth` at lazy-open.
         async_depth: 0,
+        // Progressive, square-pixel signalling unless a caller sets them.
+        field_order: None,
+        sample_aspect_ratio: None,
     }
 }
 
