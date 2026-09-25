@@ -738,6 +738,86 @@ pub(crate) fn ac3_frame_size(buf: &[u8]) -> Option<usize> {
     }
 }
 
+/// Decodes one TS audio PID to PCM, access unit by access unit, for the
+/// paths that only measure or monitor it (content analysis, the display's
+/// level bars).
+///
+/// The AUs are cut across PES boundaries by the TS audio replacer's cutter
+/// (`engine::audio_au`), fed whole TS packets (continuity checked). Parsing
+/// each PES on its own — at the next PUSI, stopping at the first byte that
+/// was not a sync word — lost an AU that straddled two PES and, the next PES
+/// then opening on its tail, every AU of the next PES; it also never found
+/// an ADTS sync in AAC-LATM, which is now decoded through libavcodec.
+pub struct PidAudioDecoder {
+    stream_type: u8,
+    cutter: crate::engine::audio_au::AuCutter,
+    /// ADTS: the decoder and the header config it was built for.
+    aac: Option<(AacDecoder, (u8, u8, u8))>,
+    #[cfg(feature = "media-codecs")]
+    ff: Option<video_engine::AudioDecoder>,
+}
+
+impl PidAudioDecoder {
+    /// A decoder for `stream_type`, or `None` for one this framing does not
+    /// cover (Opus on 0x06, AC-4, LPCM).
+    pub fn new(stream_type: u8) -> Option<Self> {
+        let fmt = crate::engine::audio_au::AuFormat::for_stream_type(stream_type)?;
+        Some(Self {
+            stream_type,
+            cutter: crate::engine::audio_au::AuCutter::new(fmt),
+            aac: None,
+            #[cfg(feature = "media-codecs")]
+            ff: None,
+        })
+    }
+
+    /// Feed one whole TS packet of the PID; `pcm` gets the planar PCM and
+    /// sample rate of every AU it completes.
+    pub fn push_packet(&mut self, pkt: &[u8], mut pcm: impl FnMut(&[Vec<f32>], u32)) {
+        if !self.cutter.push_packet(pkt) {
+            return;
+        }
+        while let Some(au) = self.cutter.next(false) {
+            self.decode(&au.data, &mut pcm);
+        }
+    }
+
+    fn decode(&mut self, au: &[u8], pcm: &mut impl FnMut(&[Vec<f32>], u32)) {
+        if self.stream_type == 0x0F {
+            if au.len() < 9 {
+                return;
+            }
+            let header_len = if au[1] & 0x01 != 0 { 7 } else { 9 };
+            let cfg = ((au[2] >> 6) & 0x03, (au[2] >> 2) & 0x0F, ((au[2] & 0x01) << 2) | ((au[3] >> 6) & 0x03));
+            if self.aac.as_ref().is_none_or(|(_, c)| *c != cfg) {
+                self.aac = AacDecoder::from_adts_config(cfg.0, cfg.1, cfg.2).ok().map(|d| (d, cfg));
+            }
+            if let Some((dec, _)) = self.aac.as_mut()
+                && let Ok(planar) = dec.decode_frame(&au[header_len..])
+            {
+                pcm(&planar, dec.sample_rate());
+            }
+            return;
+        }
+        #[cfg(feature = "media-codecs")]
+        {
+            let Some(codec) = ff_codec_for_stream_type(self.stream_type) else {
+                return;
+            };
+            if self.ff.is_none() {
+                self.ff = open_ff_decoder(codec).ok();
+            }
+            if let Some(dec) = self.ff.as_mut()
+                && dec.send_packet(au, 0).is_ok()
+            {
+                while let Ok(frame) = dec.receive_frame() {
+                    pcm(&frame.planar, frame.sample_rate);
+                }
+            }
+        }
+    }
+}
+
 // ══════════════════════════════════════════════════════════════════════════════
 // fdk-aac backend (default)
 // ══════════════════════════════════════════════════════════════════════════════
@@ -1067,6 +1147,122 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every access unit of an encoded 1 kHz tone, as the encoder framed it:
+    /// ADTS or LOAS AAC (fdk-aac), MP2 or AC-3 (libavcodec).
+    #[cfg(all(feature = "fdk-aac", feature = "media-codecs"))]
+    fn encoded_aus(stream_type: u8, n: usize) -> Vec<Vec<u8>> {
+        let tone = |len: usize, at: usize| -> Vec<Vec<f32>> {
+            let c: Vec<f32> = (at..at + len)
+                .map(|k| 0.3 * (2.0 * std::f32::consts::PI * 1000.0 * k as f32 / 48_000.0).sin())
+                .collect();
+            vec![c.clone(), c]
+        };
+        let mut aus = Vec::new();
+        match stream_type {
+            0x0F | 0x11 => {
+                let mut e = aac_audio::AacEncoder::open(&aac_codec::EncoderConfig {
+                    profile: aac_codec::AacProfile::AacLc,
+                    sample_rate: 48_000,
+                    channels: 2,
+                    bitrate: 128_000,
+                    afterburner: true,
+                    sbr_signaling: aac_codec::SbrSignaling::default(),
+                    transport: if stream_type == 0x0F {
+                        aac_codec::TransportType::Adts
+                    } else {
+                        aac_codec::TransportType::Latm
+                    },
+                })
+                .unwrap();
+                let mut at = 0;
+                while aus.len() < n {
+                    let ed = e.encode_frame(&tone(1024, at)).unwrap();
+                    at += 1024;
+                    if !ed.bytes.is_empty() {
+                        aus.push(ed.bytes);
+                    }
+                }
+            }
+            _ => {
+                let codec = if stream_type == 0x03 {
+                    video_codec::AudioCodecType::Mp2
+                } else {
+                    video_codec::AudioCodecType::Ac3
+                };
+                let mut e = video_engine::AudioEncoder::open(&video_codec::AudioEncoderConfig {
+                    codec,
+                    sample_rate: 48_000,
+                    channels: 2,
+                    bitrate_kbps: 192,
+                })
+                .unwrap();
+                let fs = e.frame_size();
+                let mut at = 0;
+                while aus.len() < n {
+                    aus.extend(e.encode_frame(&tone(fs, at)).unwrap().into_iter().map(|f| f.data.to_vec()));
+                    at += fs;
+                }
+                aus.truncate(n);
+            }
+        }
+        aus
+    }
+
+    /// `PidAudioDecoder` decodes every AU of a stream whose PES cut through
+    /// AUs (700-byte PES regardless of framing): as many samples as the
+    /// same AUs fed to a decoder one by one. The per-PES parses it replaced
+    /// in content analysis and the display's level bars lost each AU that
+    /// straddled two PES (and, for ADTS, resynced through the next PES's
+    /// head byte by byte); AAC-LATM was never decoded by content analysis
+    /// at all.
+    #[cfg(all(feature = "fdk-aac", feature = "media-codecs"))]
+    #[test]
+    fn pid_audio_decoder_decodes_every_au_across_pes_boundaries() {
+        for st in [0x0F_u8, 0x11, 0x03, 0x81] {
+            let aus = encoded_aus(st, 40);
+            // Reference: the AUs decoded one by one.
+            let mut reference = 0usize;
+            if st == 0x0F {
+                let mut d = aac_audio::AacDecoder::open_adts().unwrap();
+                for au in &aus {
+                    reference += d.decode_frame(au).map_or(0, |f| f.planar[0].len());
+                }
+            } else {
+                let mut d = open_ff_decoder(ff_codec_for_stream_type(st).unwrap()).unwrap();
+                for au in &aus {
+                    if d.send_packet(au, 0).is_ok() {
+                        while let Ok(f) = d.receive_frame() {
+                            reference += f.planar[0].len();
+                        }
+                    }
+                }
+            }
+            assert!(reference > 0, "0x{st:02X}: reference decode");
+            let es: Vec<u8> = aus.concat();
+            let mut cc = 0u8;
+            let mut ts = Vec::new();
+            for (k, chunk) in es.chunks(700).enumerate() {
+                ts.extend(crate::engine::ts_test_fixtures::pes_packets(
+                    0x101,
+                    0xC0,
+                    chunk,
+                    900_000 + k as u64 * 1_000,
+                    &mut cc,
+                ));
+            }
+            let mut d = PidAudioDecoder::new(st).expect("a framed format");
+            let mut decoded = 0usize;
+            for p in ts.chunks(188) {
+                d.push_packet(p, |planar, rate| {
+                    assert_eq!(rate, 48_000);
+                    decoded += planar[0].len();
+                });
+            }
+            assert_eq!(decoded, reference, "0x{st:02X}: every AU decoded");
+        }
+        assert!(PidAudioDecoder::new(0x06).is_none(), "Opus is framed per PES elsewhere");
+    }
 
     #[test]
     fn sample_rate_table_known_values() {

@@ -25,7 +25,6 @@ use tokio_util::sync::CancellationToken;
 
 use video_engine::AudioDecoder as FfAudioDecoder;
 
-use crate::engine::audio_decode::AacDecoder;
 use crate::engine::packet::RtpPacket;
 use crate::engine::ts_parse::{
     ts_adaptation_field_control, ts_has_payload, ts_pid, ts_pusi, PAT_PID, RTP_HEADER_MIN_SIZE,
@@ -252,7 +251,7 @@ impl MeterState {
             return;
         }
         if let Some(pid_state) = self.audio_pids.get_mut(&pid) {
-            pid_state.observe_ts(pusi, payload, publisher);
+            pid_state.observe_ts(pkt, pusi, payload, publisher);
         }
     }
 
@@ -394,7 +393,10 @@ struct MeterPidState {
     pid: u16,
     stream_type: u8,
     codec_label: &'static str,
-    aac_decoder: Option<AacDecoder>,
+    /// AAC (ADTS / LATM), MP2, AC-3 / E-AC-3: access units cut across PES
+    /// boundaries and decoded one by one (`PidAudioDecoder`).
+    decoder: Option<crate::engine::audio_decode::PidAudioDecoder>,
+    /// Opus (0x06): whole PES, split per Opus frame.
     ff_decoder: Option<FfAudioDecoder>,
     pes_buf: Vec<u8>,
     capturing_pes: bool,
@@ -406,7 +408,7 @@ impl MeterPidState {
             pid,
             stream_type,
             codec_label: codec_label(stream_type),
-            aac_decoder: None,
+            decoder: crate::engine::audio_decode::PidAudioDecoder::new(stream_type),
             ff_decoder: None,
             pes_buf: Vec::with_capacity(16_384),
             capturing_pes: false,
@@ -415,10 +417,16 @@ impl MeterPidState {
 
     fn observe_ts(
         &mut self,
+        pkt: &[u8],
         pusi: bool,
         ts_payload: &[u8],
         publisher: &mut MeterPublisher,
     ) {
+        if let Some(d) = self.decoder.as_mut() {
+            let (pid, label) = (self.pid, self.codec_label);
+            d.push_packet(pkt, |planar, _| update_levels(planar, pid, label, publisher));
+            return;
+        }
         if pusi {
             // The next PES is starting — drain whatever the previous PES
             // accumulated. MP2 / AC-3 / E-AC-3 frames routinely span
@@ -447,71 +455,12 @@ impl MeterPidState {
     }
 
     fn drain(&mut self, publisher: &mut MeterPublisher) {
-        match self.stream_type {
-            // ADTS-framed AAC — fdk-aac via the in-house `AacDecoder`.
-            0x0F => self.drain_aac(publisher),
-            // LATM/LOAS-framed AAC — libavcodec's `AAC_LATM` decoder.
-            // ADTS sync `0xFFF` never appears at LATM frame boundaries
-            // (sync is `0x2B7` → bytes `0x56 0xE0…`), so routing 0x11
-            // through `drain_aac` would walk the PES byte-by-byte
-            // forever and never publish a level — bars stay empty for
-            // every Brazilian / Asian / Australian DVB-T AAC service.
-            0x11 => self.drain_ff(publisher),
-            // Opus on `stream_type = 0x06` — `parse_pmt` only routes
-            // 0x06 here when the registration descriptor flagged it as
-            // Opus (DVB AC-3 / E-AC-3 are remapped to 0x81 / 0x87 in
-            // the PMT pass). drain_ff dispatches via Opus.
-            0x06 => self.drain_ff(publisher),
-            0x03 | 0x04 | 0x80 | 0x81 | 0x82 | 0x83 | 0x84 | 0x85 | 0x87 | 0x88 | 0x8A
-            | 0xC1 | 0xC2 => self.drain_ff(publisher),
-            _ => {}
-        }
-    }
-
-    fn drain_aac(&mut self, publisher: &mut MeterPublisher) {
-        let mut consume = 0;
-        loop {
-            let buf = &self.pes_buf[consume..];
-            if buf.len() < 7 {
-                break;
-            }
-            if !(buf[0] == 0xFF && (buf[1] & 0xF0) == 0xF0) {
-                consume += 1;
-                continue;
-            }
-            let frame_len = (((buf[3] as usize) & 0x03) << 11)
-                | ((buf[4] as usize) << 3)
-                | ((buf[5] as usize) >> 5);
-            if frame_len < 7 || frame_len > buf.len() {
-                break;
-            }
-            let has_crc = (buf[1] & 0x01) == 0;
-            let header_len = if has_crc { 9 } else { 7 };
-            if frame_len <= header_len {
-                consume += frame_len;
-                continue;
-            }
-            let profile = (buf[2] >> 6) & 0x03;
-            let sr_index = (buf[2] >> 2) & 0x0F;
-            let channel_config = ((buf[2] & 0x01) << 2) | ((buf[3] >> 6) & 0x03);
-
-            if self.aac_decoder.is_none()
-                && (1..=7).contains(&channel_config)
-                && let Ok(dec) = AacDecoder::from_adts_config(profile, sr_index, channel_config)
-            {
-                self.aac_decoder = Some(dec);
-            }
-
-            let frame = &buf[header_len..frame_len];
-            if let Some(ref mut dec) = self.aac_decoder
-                && let Ok(planar) = dec.decode_frame(frame)
-            {
-                update_levels(&planar, self.pid, self.codec_label, publisher);
-            }
-            consume += frame_len;
-        }
-        if consume > 0 {
-            self.pes_buf.drain(..consume);
+        // Opus on `stream_type = 0x06` — `parse_pmt` only routes 0x06 here
+        // when the registration descriptor flagged it as Opus (DVB AC-3 /
+        // E-AC-3 are remapped to 0x81 / 0x87 in the PMT pass, and every
+        // format the AU cutter frames goes through `decoder`).
+        if self.stream_type == 0x06 {
+            self.drain_ff(publisher);
         }
     }
 

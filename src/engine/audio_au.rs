@@ -1,7 +1,10 @@
 // Copyright (c) 2026 Softside Tech Pty Ltd. All rights reserved.
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Audio access-unit framing for the TS audio replacer.
+//! Audio access-unit framing, shared by every path that decodes TS audio:
+//! the TS audio replacer, the demuxer (`ts_demux`) behind the display, SDI,
+//! CMAF, RTMP, WebRTC and ST 2110-30 outputs, the HLS in-process remux, and
+//! the meters (`audio_decode::PidAudioDecoder`).
 //!
 //! [`AuCutter`] rebuilds the elementary stream of one audio PID from its TS
 //! packets and cuts whole access units (AUs) out of it **as soon as each
@@ -355,6 +358,10 @@ pub struct AuCutter {
     /// Bytes discarded (resync, truncated AUs, overflow) since the last
     /// [`Self::take_discarded`].
     discarded: u64,
+    /// Continuity counter and payload of the last packet taken by
+    /// [`Self::push_packet`].
+    cc: Option<u8>,
+    last_payload: Vec<u8>,
 }
 
 impl AuCutter {
@@ -371,7 +378,47 @@ impl AuCutter {
             chained: None,
             last_key: None,
             discarded: 0,
+            cc: None,
+            last_payload: Vec::with_capacity(184),
         }
+    }
+
+    /// Feed one whole TS packet of the audio PID: its payload, after a
+    /// continuity check. A counter that skips is a lost packet
+    /// ([`Self::mark_discontinuity`]); a packet with the counter and payload
+    /// of the one before is a duplicate (ISO/IEC 13818-1 §2.4.3.3) and is
+    /// dropped. `false` for a packet that brought nothing (no payload, a
+    /// duplicate).
+    pub fn push_packet(&mut self, pkt: &[u8]) -> bool {
+        use super::ts_parse::{ts_cc, ts_has_payload, ts_payload_offset, ts_pusi, TS_PACKET_SIZE};
+        if !ts_has_payload(pkt) {
+            return false;
+        }
+        let payload_start = ts_payload_offset(pkt);
+        if payload_start >= TS_PACKET_SIZE || payload_start >= pkt.len() {
+            return false;
+        }
+        let payload = &pkt[payload_start..];
+        let cc = ts_cc(pkt);
+        if let Some(last) = self.cc {
+            if cc == last && payload == self.last_payload.as_slice() {
+                return false;
+            }
+            if cc != (last + 1) & 0x0F {
+                self.mark_discontinuity();
+            }
+        }
+        self.cc = Some(cc);
+        self.last_payload.clear();
+        self.last_payload.extend_from_slice(payload);
+        self.push(ts_pusi(pkt), payload);
+        true
+    }
+
+    /// ES bytes held that no AU has been cut from yet: 0 when everything
+    /// that arrived is out (a PES ended on an AU boundary).
+    pub fn buffered(&self) -> usize {
+        self.buf.len()
     }
 
     pub fn format(&self) -> AuFormat {

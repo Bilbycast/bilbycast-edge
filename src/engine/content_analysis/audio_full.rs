@@ -31,7 +31,6 @@ use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-use crate::engine::audio_decode::{sample_rate_from_index, AacDecoder};
 use crate::manager::events::{Event, EventSender, EventSeverity};
 use crate::stats::collector::ContentAnalysisAccumulator;
 
@@ -178,18 +177,10 @@ struct AudioPidState {
     window_bytes: u64,
     last_bitrate_bps: f64,
 
-    /// AAC decoder, lazily constructed once we've seen the first ADTS
-    /// frame. Mutually exclusive with `ff_decoder`.
-    aac_decoder: Option<AacDecoder>,
-    /// FFmpeg-backed decoder for MP2 / AC-3 / E-AC-3 PIDs, lazily
-    /// constructed on the first PES flush. Mutually exclusive with
-    /// `aac_decoder`.
-    #[cfg(feature = "media-codecs")]
-    ff_decoder: Option<video_engine::AudioDecoder>,
-    /// PES reassembly buffer keyed by PUSI. Sized for 1 s of 320 kbps —
-    /// comfortably larger than the largest realistic audio PES.
-    pes_buf: Vec<u8>,
-    capturing_pes: bool,
+    /// The PID's decoder: access units cut across PES boundaries, AAC
+    /// (ADTS) through fdk-aac, MP2 / AC-3 / E-AC-3 / AAC-LATM through
+    /// libavcodec. `None` for a codec this tier does not decode.
+    decoder: Option<crate::engine::audio_decode::PidAudioDecoder>,
 
     /// EBU R128 state, initialised once the decoder tells us sample
     /// rate + channels. Feed PCM frames into `add_frames_f32_planar`
@@ -246,11 +237,7 @@ impl AudioPidState {
             window_start: Instant::now(),
             window_bytes: 0,
             last_bitrate_bps: 0.0,
-            aac_decoder: None,
-            #[cfg(feature = "media-codecs")]
-            ff_decoder: None,
-            pes_buf: Vec::with_capacity(16_384),
-            capturing_pes: false,
+            decoder: crate::engine::audio_decode::PidAudioDecoder::new(stream_type),
             r128: None,
             r128_sample_rate: 0,
             r128_channels: 0,
@@ -272,7 +259,7 @@ impl AudioPidState {
         }
     }
 
-    fn observe_ts(&mut self, pusi: bool, ts_payload: &[u8]) {
+    fn observe_ts(&mut self, pkt: &[u8], ts_payload: &[u8]) {
         self.packets += 1;
         self.bytes += ts_payload.len() as u64;
         self.window_bytes += ts_payload.len() as u64;
@@ -284,173 +271,31 @@ impl AudioPidState {
             self.window_bytes = 0;
         }
 
-        // Skip PES buffering for non-decodable codec families (e.g.
-        // SMPTE 302M `0x06` LPCM — counted in bitrate, no R128 yet).
-        let is_aac = self.stream_type == 0x0F || self.stream_type == 0x11;
-        let is_ff_codec = ff_codec_for_stream_type_local(self.stream_type).is_some();
-        if !is_aac && !is_ff_codec {
-            return;
-        }
-
-        if pusi {
-            // Drain whatever the previous PES gave us before resetting.
-            if self.capturing_pes && !self.pes_buf.is_empty() {
-                if is_aac {
-                    self.drain_adts_frames();
-                } else {
-                    self.drain_ff_frames();
-                }
-            }
-            // Skip PES header before appending.
-            let start = pes_payload_offset(ts_payload);
-            self.pes_buf.clear();
-            self.capturing_pes = true;
-            if start < ts_payload.len() {
-                self.pes_buf.extend_from_slice(&ts_payload[start..]);
-            }
-        } else if self.capturing_pes {
-            self.pes_buf.extend_from_slice(ts_payload);
-        }
-
-        if is_aac {
-            self.drain_adts_frames();
-        }
-        // Non-AAC PES are drained on the next PUSI (above) — codec sync
-        // words appear mid-PES, and feeding partial AUs to libavcodec
-        // would force re-syncs every TS packet.
-    }
-
-    /// Decode one whole non-AAC PES through the FFmpeg-backed decoder,
-    /// running R128 + mute / clip / silence on every emitted PCM block.
-    /// Lazy-builds the decoder + ebur128 state from the first frame's
-    /// reported sample rate / channels.
-    #[cfg(feature = "media-codecs")]
-    fn drain_ff_frames(&mut self) {
-        let Some(codec) = ff_codec_for_stream_type_local(self.stream_type) else {
-            self.pes_buf.clear();
+        // Non-decodable codec families (e.g. SMPTE 302M `0x06` LPCM, DTS)
+        // are counted in bitrate, no R128 yet.
+        let Some(mut decoder) = self.decoder.take() else {
             return;
         };
-        if self.ff_decoder.is_none() {
-            match crate::engine::audio_decode::open_ff_decoder(codec) {
-                Ok(d) => self.ff_decoder = Some(d),
-                Err(_) => {
-                    self.pes_buf.clear();
-                    return;
-                }
-            }
-        }
-        // Take ownership of the buffer so the immutable reborrows for
-        // `split_audio_codec_frames` don't fight the `&mut self` calls
-        // for `feed_pcm`.
-        let pes_data = std::mem::take(&mut self.pes_buf);
-        for au in
-            crate::engine::audio_decode::split_audio_codec_frames(&pes_data, codec)
-        {
-            let dec = self.ff_decoder.as_mut().unwrap();
-            if dec.send_packet(au, 0).is_err() {
-                continue;
-            }
-            let mut emitted: Vec<(Vec<Vec<f32>>, u32, u32)> = Vec::new();
-            while let Ok(frame) = dec.receive_frame() {
-                emitted.push((frame.planar, frame.sample_rate, frame.channels as u32));
-            }
-            for (planar, sr, ch) in emitted {
-                if self.r128.is_none() && sr > 0 && ch > 0 {
-                    self.r128_sample_rate = sr;
-                    self.r128_channels = ch;
-                    if let Ok(r128) = EbuR128::new(
-                        ch,
-                        sr,
-                        R128Mode::I
-                            | R128Mode::M
-                            | R128Mode::S
-                            | R128Mode::LRA
-                            | R128Mode::TRUE_PEAK,
-                    ) {
-                        self.r128 = Some(r128);
-                    }
-                }
-                self.feed_pcm(&planar);
-            }
-        }
-        self.pes_buf.clear();
+        decoder.push_packet(pkt, |planar, sample_rate| self.on_pcm(planar, sample_rate));
+        self.decoder = Some(decoder);
     }
 
-    #[cfg(not(feature = "media-codecs"))]
-    fn drain_ff_frames(&mut self) {
-        // No libavcodec in this build → drop the buffered bytes.
-        self.pes_buf.clear();
-    }
-
-    fn drain_adts_frames(&mut self) {
-        let mut consume = 0;
-        loop {
-            let buf = &self.pes_buf[consume..];
-            if buf.len() < 7 {
-                break;
+    /// Meter one decoded block: R128 + mute / clip / silence. The loudness
+    /// state is built from the first block's rate and channel count.
+    fn on_pcm(&mut self, planar: &[Vec<f32>], sample_rate: u32) {
+        let ch = planar.len() as u32;
+        if self.r128.is_none() && sample_rate > 0 && ch > 0 {
+            self.r128_sample_rate = sample_rate;
+            self.r128_channels = ch;
+            if let Ok(r128) = EbuR128::new(
+                ch,
+                sample_rate,
+                R128Mode::I | R128Mode::M | R128Mode::S | R128Mode::LRA | R128Mode::TRUE_PEAK,
+            ) {
+                self.r128 = Some(r128);
             }
-            // ADTS sync: 12 bits of 1s
-            if !(buf[0] == 0xFF && (buf[1] & 0xF0) == 0xF0) {
-                // Lost sync — walk forward one byte at a time looking
-                // for the next sync word.
-                consume += 1;
-                continue;
-            }
-            let frame_len = (((buf[3] as usize) & 0x03) << 11)
-                | ((buf[4] as usize) << 3)
-                | ((buf[5] as usize) >> 5);
-            if frame_len < 7 || frame_len > buf.len() {
-                break;
-            }
-            let has_crc = (buf[1] & 0x01) == 0;
-            let header_len = if has_crc { 9 } else { 7 };
-            if frame_len <= header_len {
-                consume += frame_len;
-                continue;
-            }
-            // Extract config bits
-            let profile = (buf[2] >> 6) & 0x03;
-            let sr_index = (buf[2] >> 2) & 0x0F;
-            let channel_config = ((buf[2] & 0x01) << 2) | ((buf[3] >> 6) & 0x03);
-
-            // Initialise decoder lazily once we have a valid config.
-            if self.aac_decoder.is_none()
-                && let Some(sr) = sample_rate_from_index(sr_index)
-                    && (1..=7).contains(&channel_config)
-                        && let Ok(dec) =
-                            AacDecoder::from_adts_config(profile, sr_index, channel_config)
-                    {
-                        self.aac_decoder = Some(dec);
-                        self.r128_sample_rate = sr;
-                        self.r128_channels = channel_config.min(7) as u32;
-                        if let Ok(r128) = EbuR128::new(
-                            self.r128_channels,
-                            self.r128_sample_rate,
-                            R128Mode::I
-                                | R128Mode::M
-                                | R128Mode::S
-                                | R128Mode::LRA
-                                | R128Mode::TRUE_PEAK,
-                        ) {
-                            self.r128 = Some(r128);
-                        }
-                    }
-            let frame = &buf[header_len..frame_len];
-            if let Some(ref mut dec) = self.aac_decoder {
-                match dec.decode_frame(frame) {
-                    Ok(planar) => {
-                        self.feed_pcm(&planar);
-                    }
-                    Err(_e) => {
-                        // decode error — ignore, next frame
-                    }
-                }
-            }
-            consume += frame_len;
         }
-        if consume > 0 {
-            self.pes_buf.drain(..consume);
-        }
+        self.feed_pcm(planar);
     }
 
     fn feed_pcm(&mut self, planar: &[Vec<f32>]) {
@@ -658,7 +503,7 @@ impl AudioFullState {
             return;
         }
         if let Some(audio_state) = self.audio_pids.get_mut(&pid) {
-            audio_state.observe_ts(pusi, payload);
+            audio_state.observe_ts(pkt, payload);
         }
     }
 
@@ -776,7 +621,7 @@ impl AudioFullState {
             .audio_pids
             .values()
             .map(|p| {
-                let decoded = p.aac_decoder.is_some();
+                let decoded = p.r128_sample_rate > 0;
                 let lufs_i = p.last_lufs_i.filter(|v| v.is_finite());
                 let lufs_m = p.last_lufs_m.filter(|v| v.is_finite());
                 let lufs_s = p.last_lufs_s.filter(|v| v.is_finite());
@@ -1158,39 +1003,6 @@ fn strip_rtp_header(packet: &RtpPacket) -> &[u8] {
     &data[offset..]
 }
 
-fn pes_payload_offset(payload: &[u8]) -> usize {
-    if payload.len() < 9 {
-        return 0;
-    }
-    if payload[0] != 0 || payload[1] != 0 || payload[2] != 1 {
-        return 0;
-    }
-    let stream_id = payload[3];
-    // 0xC0–0xEF: MPEG audio / video stream ids. 0xBD: private_stream_1 —
-    // how DVB and ATSC carry AC-3 / E-AC-3 / DTS (same PES header layout).
-    if !((0xC0..=0xEF).contains(&stream_id) || stream_id == 0xBD) {
-        return 0;
-    }
-    let hdr_len = payload[8] as usize;
-    let es_start = 9 + hdr_len;
-    if es_start > payload.len() {
-        return payload.len();
-    }
-    es_start
-}
-
-/// Local indirection over the public `ff_codec_for_stream_type` helper
-/// so the rest of this file can call it on every build, returning
-/// `None` when the `media-codecs` feature is off.
-#[cfg(feature = "media-codecs")]
-fn ff_codec_for_stream_type_local(st: u8) -> Option<video_codec::AudioDecoderCodec> {
-    crate::engine::audio_decode::ff_codec_for_stream_type(st)
-}
-#[cfg(not(feature = "media-codecs"))]
-fn ff_codec_for_stream_type_local(_st: u8) -> Option<()> {
-    None
-}
-
 /// Resolve a `stream_type 0x06` ES's descriptor loop to the ATSC-style
 /// audio stream_type this tier dispatches on, via the shared classifier
 /// `ts_parse::descriptor_audio_kind`. Opus, SMPTE 302M and AC-4 stay
@@ -1282,9 +1094,6 @@ mod pmt_walk_tests {
         assert_eq!(a.stream_type, 0x81, "resolved to AC-3");
         assert_eq!(codec_name(a.stream_type), "ac3");
 
-        // The AC-3 PES header (private_stream_1) is stripped like an MPEG
-        // audio one.
-        let pes = [0x00, 0x00, 0x01, 0xBD, 0x00, 0x10, 0x84, 0x80, 0x05, 0x21, 0, 1, 0, 1, 0x0B, 0x77];
-        assert_eq!(pes_payload_offset(&pes), 14);
+        assert!(a.decoder.is_some(), "and decoded");
     }
 }

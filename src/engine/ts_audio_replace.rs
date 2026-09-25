@@ -89,7 +89,7 @@ use super::transcode_engage::{
     EngageEvent, PassthroughCc, PrePmtGate, TranscodeEngageWatch, TranscodeKind,
 };
 use super::ts_parse::{
-    extract_pcr, parse_pat_programs, pcr_only_packet, ts_cc, ts_discontinuity_indicator,
+    extract_pcr, parse_pat_programs, pcr_only_packet, ts_discontinuity_indicator,
     ts_has_payload, ts_payload_offset, ts_pid, ts_pusi, PAT_PID, TS_PACKET_SIZE, TS_SYNC_BYTE,
 };
 use super::ts_pmt_edit::{
@@ -388,13 +388,11 @@ pub struct TsAudioReplacer {
     /// Access-unit cutter over the source audio PID's elementary stream
     /// (`audio_au`): whole AUs as soon as each is complete, across PES
     /// boundaries, each PES's PTS attached to the first AU that commences in
-    /// it. Built for the locked source's framing; dropped on a reset.
+    /// it. Built for the locked source's framing; dropped on a reset. It
+    /// checks the packets' continuity itself (`AuCutter::push_packet`): a
+    /// duplicate packet is dropped, a lost one marks the AU in flight as
+    /// possibly damaged.
     cutter: Option<AuCutter>,
-    /// Continuity counter and payload of the last source audio packet: a
-    /// duplicate packet is dropped, a lost one tells the cutter the AU in
-    /// flight may be damaged.
-    audio_cc_in: Option<u8>,
-    last_audio_payload: Vec<u8>,
 
     /// Continuity counter for the output audio PID. Increments per emitted
     /// audio TS packet.
@@ -591,8 +589,6 @@ impl TsAudioReplacer {
             engage: TranscodeEngageWatch::new(TranscodeKind::Audio, cfg.source_audio_pid),
             event_sink: None,
             cutter: None,
-            audio_cc_in: None,
-            last_audio_payload: Vec::with_capacity(TS_PACKET_SIZE),
             out_audio_cc: 0,
             pmt_version: OutVersion::new(),
             out_pts_90k: 0,
@@ -1263,8 +1259,6 @@ impl TsAudioReplacer {
         );
         // Bytes of the old input must never be glued onto the new one.
         self.cutter = None;
-        self.audio_cc_in = None;
-        self.last_audio_payload.clear();
         // Re-anchor output PTS to the new input's first PES so the
         // audio stays aligned with the video replacer, which also
         // re-anchors on the video-PID codec swap.
@@ -1333,25 +1327,14 @@ impl TsAudioReplacer {
         let Some(fmt) = AuFormat::for_stream_type(self.source_stream_type) else {
             return;
         };
-        let payload = &pkt[payload_start..];
-        let cc = ts_cc(pkt);
         if self.cutter.as_ref().is_none_or(|c| c.format() != fmt) {
             self.cutter = Some(AuCutter::new(fmt));
         }
         let cutter = self.cutter.as_mut().expect("cutter just built");
-        if let Some(last) = self.audio_cc_in {
-            if cc == last && payload == self.last_audio_payload.as_slice() {
-                // A duplicate packet (ISO/IEC 13818-1 §2.4.3.3): nothing new.
-                return;
-            }
-            if cc != (last + 1) & 0x0F {
-                cutter.mark_discontinuity();
-            }
+        // A lost packet marks a discontinuity; a duplicate brings nothing.
+        if !cutter.push_packet(pkt) {
+            return;
         }
-        self.audio_cc_in = Some(cc);
-        self.last_audio_payload.clear();
-        self.last_audio_payload.extend_from_slice(payload);
-        cutter.push(ts_pusi(pkt), payload);
         self.drain_cutter(false, output);
     }
 
@@ -3224,6 +3207,7 @@ mod tests {
     /// lock it as AC-3 and surface its PES as `OtherAudio { 0x81 }` — the arm
     /// `replay::export_mp4` builds its AC-3 track from, and the one the
     /// display / RTMP / WebRTC paths decode.
+    #[cfg(feature = "media-codecs")]
     #[test]
     fn dvb_flavoured_ac3_output_demuxes_as_ac3() {
         use crate::engine::ts_demux::{DemuxedFrame, TsDemuxer};
@@ -3237,7 +3221,16 @@ mod tests {
         demux.demux(&synth_pat(0x1000));
         demux.demux(&out);
         assert_eq!(demux.audio_pid(), Some(0x0101));
-        let pes = build_audio_pes(0xBD, &[0x0B, 0x77, 1, 2, 3, 4, 5, 6], 90_000);
+        // A real syncframe: the demuxer cuts whole, validated AUs now.
+        let mut e = video_engine::AudioEncoder::open(&video_codec::AudioEncoderConfig {
+            codec: video_codec::AudioCodecType::Ac3,
+            sample_rate: 48_000,
+            channels: 2,
+            bitrate_kbps: 192,
+        })
+        .unwrap();
+        let frame = e.encode_frame(&[vec![0.0f32; 1536], vec![0.0f32; 1536]]).unwrap().remove(0).data;
+        let pes = build_audio_pes(0xBD, &frame, 90_000);
         let mut cc = 0u8;
         let mut frames = Vec::new();
         for _ in 0..2 {
