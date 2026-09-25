@@ -1343,6 +1343,18 @@ impl CcRenumber {
         }
     }
 
+    /// Whether [`Self::emit`] would change a packet (a strip, or an offset
+    /// pending) — lets a caller skip copying one that goes out unchanged,
+    /// via [`Self::emitted_unchanged`].
+    pub fn rewrites(&self, stripped: bool) -> bool {
+        stripped || self.off != 0
+    }
+
+    /// A packet went out unchanged (`rewrites` was false).
+    pub fn emitted_unchanged(&mut self) {
+        self.emitted = true;
+    }
+
     /// `pkt` goes out; `stripped` = it lost its payload on the way (it was a
     /// payload packet in the source). Rewrites its CC.
     pub fn emit(&mut self, pkt: &mut [u8], stripped: bool) {
