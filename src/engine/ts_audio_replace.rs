@@ -173,12 +173,15 @@ fn pts_diff(a: u64, b: u64) -> i64 {
 /// every decoded sample, plus inserted silence, minus dropped samples — each
 /// counted when it is queued, so a correction is never counted twice. The
 /// content therefore ends at `base_90k + samples / rate`, and the PTS of the
-/// first AU of each PES says where it should end.
+/// first AU of each PES says where it should end. The count is signed: an
+/// overlap found just after an anchor can queue a drop larger than what has
+/// been placed since (a PES stamped up to 500 ms before the anchor), and the
+/// content then ends before `base_90k` until that much has been decoded.
 #[derive(Clone, Debug, Default)]
 struct Timeline {
     anchored: bool,
     base_90k: u64,
-    samples: u64,
+    samples: i64,
     /// Decoded sample rate; 0 until the first decode after an anchor.
     rate: u32,
     /// The current run of same-signed offsets below [`IMMEDIATE_90K`]: its
@@ -210,8 +213,8 @@ impl Timeline {
         if self.rate == 0 {
             return self.base_90k;
         }
-        let span = self.samples as u128 * 90_000 / self.rate as u128;
-        self.base_90k.wrapping_add(span as u64) & PTS_MASK
+        let span = (self.samples as i128 * 90_000).div_euclid(self.rate as i128);
+        (self.base_90k as i128 + span).rem_euclid(PTS_MASK as i128 + 1) as u64
     }
 
     fn clear_run(&mut self) {
@@ -220,7 +223,11 @@ impl Timeline {
     }
 
     /// Judge the PTS `pts` of a PES's first AU against the content's end.
-    fn check(&mut self, pts: u64) -> TimelineAction {
+    /// With [`GapFill::Relabel`] a forward offset beyond the deadband is
+    /// acted on at once: a file source's timestamps carry no jitter to
+    /// filter, and a splice step left for 150 ms would present that much
+    /// audio early by the step.
+    fn check(&mut self, pts: u64, gap_fill: GapFill) -> TimelineAction {
         if !self.anchored || self.rate == 0 {
             return TimelineAction::Anchor;
         }
@@ -232,6 +239,10 @@ impl Timeline {
         if magnitude <= DEADBAND_90K {
             self.clear_run();
             return TimelineAction::Hold;
+        }
+        if off > 0 && gap_fill == GapFill::Relabel {
+            self.clear_run();
+            return TimelineAction::Gap(off);
         }
         let sign = off.signum() as i8;
         if sign != self.run_sign {
@@ -1299,7 +1310,7 @@ impl TsAudioReplacer {
     /// Hold the content to the source timeline at a PES PTS (see
     /// [`Timeline::check`]), then publish `av_skew`.
     fn on_pes_pts(&mut self, pts: u64, output: &mut Vec<u8>) {
-        match self.timeline.check(pts) {
+        match self.timeline.check(pts, self.gap_fill) {
             TimelineAction::Anchor => {
                 // Nothing decoded since the anchor: it follows the PES PTS
                 // until content arrives.
@@ -1356,7 +1367,7 @@ impl TsAudioReplacer {
                     "ts_audio_replace: source timeline gap filled with silence"
                 );
                 self.insert_silence(n, output);
-                self.timeline.samples += n;
+                self.timeline.samples += n as i64;
             }
             GapFill::Relabel => {
                 tracing::debug!(
@@ -1381,7 +1392,7 @@ impl TsAudioReplacer {
         self.stats.timeline_corrections.fetch_add(1, Ordering::Relaxed);
         self.stats.dropped_samples.fetch_add(n, Ordering::Relaxed);
         self.pending_drop += n;
-        self.timeline.samples = self.timeline.samples.saturating_sub(n);
+        self.timeline.samples -= n as i64;
     }
 
     /// An access unit that did not decode: silence of its nominal length in
@@ -1398,7 +1409,7 @@ impl TsAudioReplacer {
         }
         let n = (h.samples as u128 * self.timeline.rate as u128 / h.sample_rate as u128) as u64;
         self.insert_silence(n, output);
-        self.timeline.samples += n;
+        self.timeline.samples += n as i64;
     }
 
     /// Decode one access unit.
@@ -1460,7 +1471,7 @@ impl TsAudioReplacer {
             if fill > 0 {
                 let k = (fill as u128 * d.sample_rate as u128 / 90_000) as u64;
                 self.insert_silence(k, output);
-                self.timeline.samples += k;
+                self.timeline.samples += k as i64;
             }
         } else if self.timeline.rate != d.sample_rate {
             // The source changed rate in-band: the content so far ends
@@ -1469,7 +1480,7 @@ impl TsAudioReplacer {
             self.timeline.samples = 0;
             self.timeline.rate = d.sample_rate;
         }
-        self.timeline.samples += n;
+        self.timeline.samples += n as i64;
         self.push_content(d.planar, output);
     }
 
@@ -3294,11 +3305,11 @@ mod tests {
         match a {
             TimelineAction::Hold => false,
             TimelineAction::Gap(off) => {
-                t.samples += (off as u128 * 48_000 / 90_000) as u64;
+                t.samples += (off as i128 * 48_000 / 90_000) as i64;
                 true
             }
             TimelineAction::Overlap(off) => {
-                t.samples -= (off.unsigned_abs() as u128 * 48_000 / 90_000) as u64;
+                t.samples -= (off.unsigned_abs() as u128 * 48_000 / 90_000) as i64;
                 true
             }
             TimelineAction::Reanchor | TimelineAction::Anchor => {
@@ -3318,7 +3329,7 @@ mod tests {
             let pts = pts_of(k);
             let off = pts_diff(pts, t.end_90k()).unsigned_abs();
             worst = worst.max(off);
-            let a = t.check(pts);
+            let a = t.check(pts, GapFill::Silence);
             if apply(&mut t, a, pts) {
                 corrections += 1;
             }
@@ -3354,13 +3365,13 @@ mod tests {
             let mut fixed_at = None;
             for pes in 0..40u64 {
                 let pts = 1_000_000 + k * AU_TICKS + if pes >= 5 { 1_800 } else { 0 };
-                let a = t.check(pts);
+                let a = t.check(pts, GapFill::Silence);
                 if let TimelineAction::Gap(off) = a {
                     assert_eq!(off, 1_800);
                     fixed_at.get_or_insert(pes);
                 }
                 apply(&mut t, a, pts);
-                t.samples += 1024 * aus_per_pes;
+                t.samples += 1024 * aus_per_pes as i64;
                 k += aus_per_pes;
             }
             let fixed_at = fixed_at.expect("the gap is filled");
@@ -3374,12 +3385,12 @@ mod tests {
         let mut t = anchored_timeline();
         t.samples = 1024 * 10;
         let end = t.end_90k();
-        assert_eq!(t.check(end + 9_000), TimelineAction::Gap(9_000));
+        assert_eq!(t.check(end + 9_000, GapFill::Silence), TimelineAction::Gap(9_000));
         let mut t = anchored_timeline();
         t.samples = 1024 * 10;
-        assert_eq!(t.check(end - 900), TimelineAction::Hold, "one PES is not enough");
+        assert_eq!(t.check(end - 900, GapFill::Silence), TimelineAction::Hold, "one PES is not enough");
         t.samples += 1024 * 8; // 170 ms later
-        assert_eq!(t.check(t.end_90k() - 900), TimelineAction::Overlap(-900));
+        assert_eq!(t.check(t.end_90k() - 900, GapFill::Silence), TimelineAction::Overlap(-900));
     }
 
     /// A step of more than 500 ms re-anchors in either direction: the PCR
@@ -3389,9 +3400,40 @@ mod tests {
         let mut t = anchored_timeline();
         t.samples = 1024 * 10;
         let end = t.end_90k();
-        assert_eq!(t.check(end + 45_001), TimelineAction::Reanchor);
-        assert_eq!(t.check(end - 45_001), TimelineAction::Reanchor);
-        assert_eq!(t.check(end - 45_000), TimelineAction::Overlap(-45_000), "500 ms back is an overlap");
+        assert_eq!(t.check(end + 45_001, GapFill::Silence), TimelineAction::Reanchor);
+        assert_eq!(t.check(end - 45_001, GapFill::Silence), TimelineAction::Reanchor);
+        assert_eq!(t.check(end - 45_000, GapFill::Silence), TimelineAction::Overlap(-45_000), "500 ms back is an overlap");
+    }
+
+    /// A drop larger than the content placed since the anchor takes the
+    /// count below zero rather than to zero: the content's end stays where
+    /// it is (before the anchor), and nothing is dropped twice.
+    #[test]
+    fn a_count_below_zero_keeps_the_content_end() {
+        let mut t = anchored_timeline();
+        t.samples = 1024 - 7_200;
+        assert_eq!(t.end_90k(), 1_000_000 - 11_580);
+        t.samples += 7_200;
+        assert_eq!(t.check(1_000_000 + 1_920, GapFill::Silence), TimelineAction::Hold);
+        let mut t = Timeline { anchored: true, base_90k: 100, rate: 48_000, samples: -960, ..Timeline::default() };
+        assert_eq!(t.end_90k(), PTS_MASK + 1 + 100 - 1_800, "wraps below zero");
+        assert_eq!(t.check(PTS_MASK - 1_699, GapFill::Silence), TimelineAction::Hold);
+    }
+
+    /// On a file source (`GapFill::Relabel`) a forward step beyond the
+    /// deadband is stepped over at the PES that shows it; a live source
+    /// waits for it to persist, and an overlap waits either way.
+    #[test]
+    fn a_relabel_steps_at_the_first_pes_that_shows_it() {
+        let mut t = anchored_timeline();
+        t.samples = 1024 * 10;
+        let end = t.end_90k();
+        assert_eq!(t.check(end + 6_840, GapFill::Relabel), TimelineAction::Gap(6_840));
+        assert_eq!(t.check(end + 6_840, GapFill::Silence), TimelineAction::Hold, "one PES is not enough");
+        let mut t = anchored_timeline();
+        t.samples = 1024 * 10;
+        assert_eq!(t.check(end + 450, GapFill::Relabel), TimelineAction::Hold, "within the deadband");
+        assert_eq!(t.check(end - 900, GapFill::Relabel), TimelineAction::Hold, "an overlap persists first");
     }
 
     /// A 4.5 ms forward step every 10 s "loop" (the Sky Witness file-splice
@@ -3872,6 +3914,32 @@ mod tests {
         assert!(e.abs() <= 3.0, "{e}");
     }
 
+    /// **AT-3.** An overlap larger than the content placed since the anchor:
+    /// one AU after the anchor, the next PES is stamped 150 ms before where
+    /// it ends. Exactly 150 ms is dropped and the audio after it is on
+    /// time. Counting the content with a floor at zero forgot 128.7 ms of
+    /// that drop, read the next PES as a new overlap, dropped 6176 more
+    /// samples and put the audio 128.7 ms early for good.
+    #[cfg(all(feature = "media-codecs", feature = "fdk-aac"))]
+    #[test]
+    fn an_overlap_larger_than_the_content_since_the_anchor_is_dropped_once() {
+        use e2e::*;
+        let at = 48_000 * 2 + 50;
+        let pcm = content(at, 48_000 * 3);
+        let mut aus = encode_source(Src::Aac, &pcm);
+        for au in aus.iter_mut().skip(1) {
+            au.1 -= 13_500;
+        }
+        let ts = mux(0x0F, &pack(&aus, 1));
+        let mut r = replacer("aac_lc", None, None);
+        let out = run(&mut r, &ts);
+        let s = r.stats_handle();
+        assert_eq!(s.dropped_samples.load(Ordering::Relaxed), 7_200);
+        assert_eq!(s.timeline_corrections.load(Ordering::Relaxed), 1);
+        let e = err_samples("aac_lc", &out, src_time(at) - 13_500.0, 48_000);
+        assert!(e.abs() <= 3.0, "{e}");
+    }
+
     /// **AT-3.** `media_player`'s gap fill steps the output PTS over a
     /// splice instead of inserting silence: the decoded audio is untouched
     /// and the audio after the step is on time.
@@ -3895,6 +3963,31 @@ mod tests {
         let steps: Vec<u64> = audio_pes(&out).windows(2).map(|w| w[1].0 - w[0].0).filter(|&d| d != 1920).collect();
         assert_eq!(steps, vec![1920 + 4_500], "one PTS step, no silence");
         let e = err_samples("aac_lc", &out, src_time(at) + 4_500.0, 48_000);
+        assert!(e.abs() <= 3.0, "{e}");
+    }
+
+    /// **AT-3.** A `media_player` splice step (76 ms, the Sky Witness loop)
+    /// is stepped over at the first PES that shows it: audio a few AUs
+    /// after the step is on time. Waiting for the step to persist 150 ms
+    /// presented that audio 76 ms early at every loop.
+    #[cfg(all(feature = "media-codecs", feature = "fdk-aac"))]
+    #[test]
+    fn relabel_steps_at_the_first_pes_that_shows_the_step() {
+        use e2e::*;
+        let at = 40 * 1024 + 1_500;
+        let pcm = content(at, 48_000 * 2);
+        let mut aus = encode_source(Src::Aac, &pcm);
+        // Encoder priming: AU k carries content from 2048 samples earlier,
+        // so the content at `at` rides AU 43.
+        for au in aus.iter_mut().skip(40) {
+            au.1 += 6_840;
+        }
+        let ts = mux(0x0F, &pack(&aus, 1));
+        let mut r = replacer("aac_lc", None, None);
+        r.set_gap_fill(GapFill::Relabel);
+        let out = run(&mut r, &ts);
+        assert_eq!(r.stats_handle().timeline_corrections.load(Ordering::Relaxed), 1);
+        let e = err_samples("aac_lc", &out, src_time(at) + 6_840.0, 48_000);
         assert!(e.abs() <= 3.0, "{e}");
     }
 
@@ -3936,26 +4029,42 @@ mod tests {
         }
     }
 
-    /// No clock is read: the same bytes give the same output however they
-    /// are chunked and however late they arrive.
+    /// **AT-3.** The only time the replacer is given is the `Instant` its
+    /// caller passes with each chunk (for the pre-PMT gate and the engage
+    /// watchdog). A feed in which a second of that time passes before every
+    /// audio PES — the codec thread held up by host load, encoder warm-up
+    /// or wire backpressure, what made the removed wallclock catch-up pad
+    /// silence — gives the same bytes out as one that stalls nowhere, with
+    /// no silence inserted, and so does a feed in one chunk.
     #[cfg(all(feature = "media-codecs", feature = "fdk-aac"))]
     #[test]
-    fn the_output_depends_on_the_bytes_only() {
+    fn a_stalled_feed_gives_the_same_output() {
         use e2e::*;
-        let pcm = content(20_000, 48_000);
-        let ts = mux(0x0F, &pack(&encode_source(Src::Aac, &pcm), 7));
-        let mut a = replacer("ac3", None, None);
-        let mut whole = Vec::new();
-        a.process(&ts, &mut whole);
-        let mut b = replacer("ac3", None, None);
-        let mut slow = Vec::new();
-        for (i, p) in ts.chunks(TS_PACKET_SIZE).enumerate() {
-            if i % 50 == 0 {
-                std::thread::sleep(std::time::Duration::from_millis(5));
-            }
-            b.process(p, &mut slow);
+        let pcm = content(20_000, 48_000 * 2);
+        let ts = mux(0x0F, &pack(&encode_source(Src::Aac, &pcm), 3));
+        let t0 = std::time::Instant::now();
+        let mut steady = replacer("ac3", None, None);
+        let mut a = Vec::new();
+        for p in ts.chunks(TS_PACKET_SIZE) {
+            steady.process_at(p, &mut a, t0);
         }
-        assert_eq!(whole, slow);
+        let mut stalled = replacer("ac3", None, None);
+        let mut b = Vec::new();
+        let mut now = t0;
+        for p in ts.chunks(TS_PACKET_SIZE) {
+            if ts_pid(p) == 0x0101 && ts_pusi(p) {
+                now += std::time::Duration::from_secs(1);
+            }
+            stalled.process_at(p, &mut b, now);
+        }
+        let mut whole_r = replacer("ac3", None, None);
+        let mut whole = Vec::new();
+        whole_r.process_at(&ts, &mut whole, t0);
+        assert!(!audio_pes(&a).is_empty());
+        assert_eq!(stalled.stats_handle().silence_inserted_samples.load(Ordering::Relaxed), 0);
+        assert_eq!(stalled.stats_handle().timeline_corrections.load(Ordering::Relaxed), 0);
+        assert_eq!(a, b, "a stall between PES changes nothing");
+        assert_eq!(a, whole, "nor does the chunking");
     }
 
     // ── PCR on the audio PID (defect x) and the pre-PMT gate (4) ──
