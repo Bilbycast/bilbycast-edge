@@ -257,8 +257,13 @@ every PMT-PID packet. The rewriter used to read only the pointer-target
 table, never learned a role on such a stream, and so re-anchored every
 PCR while leaving every PES timestamp in the source timeline — VH1.ts
 came out with a constant −12.6 h PTS−PCR on every output, transcoded or
-not. A PMT spanning two packets is learned too, and the rewriter now
-owns the CC on a PMT's continuation packets as well as its first.
+not. A PMT spanning two packets is learned too — also from a muxer that
+never advances the CC on PSI, whose same-CC continuation the assembler
+takes CRC-gated. Once the rewriter has stamped a PSI PID (the PAT or a
+PMT PID) it owns the CC of **every** packet on it — continuation packets
+whether or not the assembler still has their section in flight, and
+adaptation-field-only packets, which repeat the last payload CC — so a
+PSI PID never mixes rewriter-owned and source CCs.
 
 **PCR is never regenerated for long without roles.** PCR re-anchoring
 starts at the first PCR, before the PMT is known. If no PMT has been
@@ -270,7 +275,13 @@ Warning `clock_rewrite_pmt_not_learned` (input-scoped; see
 [`events-and-alarms.md`](events-and-alarms.md)). When a PMT is learned
 later, the anchor is re-established on the next PCR, again with DI=1,
 and regeneration resumes. A stream with parseable PSI never reaches
-this path.
+this path. The window is not a one-shot per rewriter: when the PAT drops
+the PMT PID a PMT was learned from — a media-player playlist item or a
+re-muxed upstream moving to a new program, including a spliced PAT that
+changes its PMT PID without bumping its version (it counts only when its
+CRC verifies) — the rewriter forgets that program's PCR PID and PES roles
+and re-arms the window for the new one. While the source clock passes
+through, no PES / SCTE-35 timestamp is re-anchored either.
 
 ## Module map
 

@@ -256,7 +256,7 @@ and every other section on the PMT PID, is copied byte-for-byte.
 | `ts_signalling` | AC-3 carriage |
 |---|---|
 | `auto` (default when unset) | follows the **first** source PMT the output sees: DVB carriage if the source is DVB-flavoured, otherwise ATSC. Evidence, in order: an audio ES already carried `0x06` + 0x6A / 0x7A / 0x7C ⇒ DVB; `stream_type` 0x81 / 0x87, ATSC descriptor tags 0x81 / 0x86 / 0xCC / 0xA3, or a "GA94" registration ⇒ ATSC; DVB descriptor tags (0x45, 0x46, 0x52, 0x56, 0x59, 0x5F, 0x66, 0x6A, 0x7A, 0x7B, 0x7C, 0x7F) ⇒ DVB; nothing ⇒ ATSC. A user-private table_id on the PMT PID is deliberately not evidence. |
-| `dvb` | `stream_type 0x06` + "AC-3" registration + AC-3_descriptor `6A 01 00` (ETSI EN 300 468 / TS 101 154) — what strict DVB IRDs want. |
+| `dvb` | `stream_type 0x06` + "AC-3" registration + AC-3_descriptor `6A 01 00` — the carriage ETSI EN 300 468 / TS 101 154 specify for AC-3. **Not yet verified on a professional DVB IRD** (broadcast gate 7 has not been run on it). |
 | `atsc` | `stream_type 0x81` + "AC-3" registration (ATSC A/52 Annex A). The optional ATSC AC-3 audio descriptor (tag 0x81) is not generated. |
 
   The flavour is latched **once per output lifetime** and never follows
@@ -268,11 +268,30 @@ and every other section on the PMT PID, is copied byte-for-byte.
   refused on any codec but `ac3`, on HLS (always ATSC — what Apple HLS and
   hls.js expect in TS segments) and on PCM inputs (their TS comes from
   the shared muxer).
+
+  The HLS pin covers HLS's **own** `audio_encode` remux only. An HLS
+  output without `audio_encode` segments whatever the flow carries, so
+  behind an **ingress** AC-3 transcode (`audio_encode` on the input) of a
+  DVB source it ships `0x06` + "AC-3" + 0x6A — exactly as it would for a
+  DVB source that carries AC-3 that way natively. Whether an HLS player
+  accepts that carriage is player-specific (it has not been tested here);
+  set `ts_signalling: "atsc"` on the input if a player needs `0x81`. The edge's own consumers of the flow — the shared demuxer
+  (RTMP / WebRTC / CMAF / display / SDI / thumbnails / replay export), the
+  display audio meter and the `audio_full` content-analysis tier —
+  resolve `0x06` + 0x6A to AC-3 (`audio_full` used to ignore `0x06`
+  audio altogether, so it metered no DVB-carried AC-3 at all).
+- **PES stream_id**: re-encoded AC-3 rides PES `private_stream_1`
+  (`0xBD`) in both carriages, as ATSC A/52 Annex A and ETSI TS 101 154
+  require and FFmpeg's `mpegtsenc` does; MP2 and AAC keep the MPEG audio
+  id `0xC0`. **Behaviour change:** every release before this one wrote
+  AC-3 PES with `0xC0`. The same applies to the HLS remux.
 - **Growth fallback**: the AC-3 additions are the only edit that grows a
   section. When the grown PMT would need more TS packets than the
-  source's, the output falls back to `0x81` with no additions (still
-  self-identifying), so a single-packet PMT stays single-packet for every
-  single-packet parser downstream.
+  source's, or would exceed the 1021-byte PMT limit, the output falls back
+  to `0x81` with no additions (still self-identifying), so a single-packet
+  PMT stays single-packet for every single-packet parser downstream. (The
+  overflow case used to skip the fallback and emit the source PMT
+  untouched — the old stream_type over the re-encoded ES.)
 - **Program level**: once any ES of the program is re-encoded,
   multiplex_buffer_utilization (0x0C), maximum_bitrate (0x0E),
   smoothing_buffer (0x10) and STD (0x11) are dropped from program_info —
@@ -285,7 +304,13 @@ and every other section on the PMT PID, is copied byte-for-byte.
   and video replacers each track their own input-derived output, so in a
   chain the video stage sees the audio stage's changed section and bumps
   too (it used to re-stamp its own unchanged counter over the audio
-  stage's bump).
+  stage's bump). Once a replacer has stamped a PMT it also stamps the ones
+  it passes through unedited — an input switch to a source it cannot
+  decode (DTS-only audio, VC-1 video) — so the output carries one version
+  sequence. A passthrough PMT used to keep its source version, which could
+  equal the version the rebuilt PMT had carried, and a receiver caching by
+  version then kept the previous input's PMT. Until a replacer's first
+  stamp, a passthrough PMT stays byte-identical.
 - **Damaged PMTs** (a CRC that does not verify) are never learned from or
   rebuilt; they pass through untouched.
 
@@ -304,15 +329,22 @@ discarded the whole PMT. Details: a unit is held until every section that
 started in it is complete (PMT packets are delayed by their own span); a
 long-form section reassembled across packets must pass its CRC or the
 unit is dropped (counted, logged once) — the CRC rather than the CC is the
-gate because some muxers never advance the CC on PSI; an unchanged unit is
-re-emitted byte-identical; a changed one is laid out with a pointer_field
-and PUSI on every packet in which a section starts and 0xFF stuffing,
-reusing each source packet's header bits and adaptation field. Source CCs
-are kept while the packet count is unchanged; once it changes the stage
-owns the CC on that PID. The program's PMT is matched on its
+gate because some muxers never advance the CC on PSI (the shared
+`SectionAssembler::push_packet` used by the PTS rewriter, the PSI catalog,
+the continuity fixer and HLS takes a same-CC continuation the same way,
+CRC-gated); an unchanged unit is re-emitted byte-identical; a changed one
+is laid out with a pointer_field and PUSI on every packet in which a
+section starts and 0xFF stuffing, reusing each source packet's header
+bits and adaptation field. A payload-less packet on the PMT PID (a PCR in
+an adaptation-field-only packet) that arrives while a unit is held keeps
+its place behind the payload packet it followed, repeating that packet's
+CC — it used to overtake the held unit, a CC error on every repetition.
+Source CCs are kept while the packet count is unchanged; once it changes
+the stage owns the CC on that PID. The program's PMT is matched on its
 `program_number` (two programs sharing one PMT PID each get their own);
 on a PID the PAT maps to one program only, the first PMT section is
-accepted too, as before.
+accepted too, as before — the rule the shared demuxer and the display
+audio meter apply as well.
 
 ### When the transcoder finds nothing to re-encode
 
@@ -329,8 +361,9 @@ passed. `details.reason` says why: `no_pat`, `pmt_not_parsed` (with
 `first_table_id` — what the PID does carry), `no_supported_es`, or
 `codec_not_replaceable` (the program has audio / video, but only in a
 codec the replacer cannot decode: DTS, Opus, AC-4, SMPTE 302M, VC-1,
-JPEG XS, …). A later lock raises the Info `*_transcode_source_found`; a
-PMT update that removes the ES re-arms the watch. Catalogue:
+JPEG XS, …). A later lock raises the Info `*_transcode_source_found` —
+including the first lock after an input switch, which used to close the
+Warning silently; a PMT update that removes the ES re-arms the watch. Catalogue:
 [`events-and-alarms.md`](events-and-alarms.md) ("Transcode engage").
 
 ### Opus-specific options
