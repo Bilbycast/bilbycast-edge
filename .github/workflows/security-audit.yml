@@ -115,7 +115,12 @@ jobs:
         with:
           path: bilbycast-edge
 
-      - uses: EmbarkStudios/cargo-deny-action@v2
+      # Pinned to the commit tag v2.1.1 points at, not the moving `v2` tag, so
+      # a retagged major cannot swap the Dockerfile and entrypoint this job
+      # builds and runs. The trailing `# vX.Y.Z` is the form Dependabot reads:
+      # it bumps the SHA and the comment together, so this pin keeps moving
+      # with upstream releases.
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
         with:
           command: check ${{ matrix.checks }}
           manifest-path: ./bilbycast-edge/Cargo.toml

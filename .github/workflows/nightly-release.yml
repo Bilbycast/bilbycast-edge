@@ -517,8 +517,27 @@ jobs:
           echo "librga version: ${RGA_VER}"
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        # Pinned to a commit, not `@stable`. dtolnay/rust-toolchain is
+        # versioned by branch, not tag, and `stable` is an unprotected branch
+        # its maintainer rewrites by force-push (master plus one commit), so
+        # `@stable` ran whatever that branch held on the day of the release,
+        # inside the job that builds the binaries every deployed edge upgrades
+        # to. This is the commit `stable` held on 2026-09-25.
+        #
+        # Only the action's code is pinned. `toolchain: stable` still installs
+        # the current stable Rust, as before; it is spelled out because the
+        # input defaults to `stable` only on the `stable` branch, and is
+        # required on a `master` commit.
+        #
+        # To bump: `gh api repos/dtolnay/rust-toolchain/branches/stable --jq
+        # .commit.sha`, read the diff from the SHA below, and replace it here
+        # and in ci.yml. Dependabot watches this repository's actions but will
+        # not move this pin: for an untagged commit it follows the branch that
+        # contains it, and once `stable` is rewritten no branch does. An old
+        # SHA keeps resolving, so a stale pin still builds.
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable as of 2026-09-25
         with:
+          toolchain: stable
           targets: ${{ matrix.target }}
 
       - name: Cache cargo registry and build

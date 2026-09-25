@@ -148,7 +148,17 @@ jobs:
             libssl-dev g++ libasound2-dev nasm libx264-dev
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        # Pinned to a commit, not `@stable`: that ref is an unprotected branch
+        # its maintainer rewrites by force-push, so `@stable` ran whatever it
+        # held that day. Only the action's code is pinned — `toolchain: stable`
+        # still installs the current stable Rust, so a new clippy can still
+        # redden `main` untouched, exactly as before. The input is spelled out
+        # because it defaults to `stable` only on the `stable` branch. Bumped
+        # by hand together with nightly-release.yml, whose copy of this step
+        # says how and why Dependabot will not do it.
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable as of 2026-09-25
+        with:
+          toolchain: stable
 
       # The vendored FFmpeg build dominates a cold run. Keyed on Cargo.lock with
       # a prefix restore-key so an unrelated dep bump still reuses the C build.
