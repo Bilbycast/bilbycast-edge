@@ -1747,6 +1747,22 @@ impl TsAudioReplacer {
         let tail = std::mem::take(&mut self.tail);
         self.send_pcm(tail, output);
         self.run_out_stage(output);
+        // The new stage's zero history is dropped from the head of what it
+        // produces (`keep_stage_output`), and `stage_offset_90k` counts it
+        // as held until then. Both assume its first chunk's output covers
+        // it — true for `sinc_len <= 256` at `SRC_CHUNK_FRAMES` = 256 (see
+        // `audio_transcode::STREAM_CHUNK_FRAMES`). A longer filter would leave
+        // `av_skew` and a re-anchor inside that first chunk a few samples
+        // off.
+        if let Some(t) = stage.as_ref() {
+            debug_assert!(
+                t.output_delay() as u128
+                    <= (SRC_CHUNK_FRAMES as u128 * t.out_sample_rate() as u128)
+                        / t.in_sample_rate().max(1) as u128,
+                "the replacement stage's delay ({}) outlasts its first chunk's output",
+                t.output_delay()
+            );
+        }
         self.stage_skip = stage.as_ref().map_or(0, |t| t.output_delay() as u64);
         self.transcoder = stage;
         self.stage_in = (rate, channels);

@@ -420,6 +420,10 @@ pub struct AudioEncoder {
     /// Shared lock-free counters exposed to the parent
     /// [`OutputStatsAccumulator`] via [`Self::stats_handle`].
     encode_stats: Arc<EncodeStats>,
+    /// Delay of the stages in front of this encoder (a channel / rate
+    /// stage), in 90 kHz ticks: taken off at the anchor with the codec's
+    /// own delay and its resampler's. See [`Self::set_upstream_delay`].
+    upstream_delay_90k: u64,
 }
 
 /// A sample-rate converter in front of an in-process encoder, fed planar PCM
@@ -467,6 +471,16 @@ impl PcmResampler {
             pending: vec![Vec::with_capacity(chunk * 2); channels],
             out: (0..channels).map(|_| vec![0.0f32; max_out]).collect(),
         })
+    }
+
+    /// The filter's delay in output frames: content at input frame `j`
+    /// comes out at output frame `j * to / from + delay()`. rubato's figure
+    /// for the filter it built (about `sinc_len / 2` scaled by the ratio —
+    /// 32 frames at 44.1 → 48 kHz here, 0.7 ms), constant because the
+    /// resampler is built once and fed fixed chunks.
+    fn delay(&self) -> usize {
+        use rubato::Resampler;
+        self.inner.output_delay()
     }
 
     /// Forget queued input and the filter's history: a new anchor starts
@@ -719,6 +733,7 @@ impl AudioEncoder {
                 pack_scratch: BytesMut::new(),
             },
             encode_stats,
+            upstream_delay_90k: 0,
         })
     }
 
@@ -782,6 +797,7 @@ impl AudioEncoder {
                 resampler,
             },
             encode_stats,
+            upstream_delay_90k: 0,
         })
     }
 
@@ -877,6 +893,7 @@ impl AudioEncoder {
                 resampler,
             },
             encode_stats,
+            upstream_delay_90k: 0,
         })
     }
 
@@ -973,9 +990,12 @@ impl AudioEncoder {
                     // sees as a constant audio-late offset per encode
                     // hop (the 2026-06-12 2110 chain carried two hops
                     // ≈ +108 ms of its +160 ms).
+                    // Its resampler, when the input is at another rate,
+                    // delays the content by its filter's length too.
                     let sr = self.params.target_sample_rate.max(1) as u64;
-                    let delay_ticks =
-                        (encoder.codec_delay_samples() as u64) * 90_000 / sr;
+                    let delay = encoder.codec_delay_samples() as u64
+                        + resampler.as_ref().map_or(0, |r| r.delay() as u64);
+                    let delay_ticks = delay * 90_000 / sr + self.upstream_delay_90k;
                     *pts_90k = pts.saturating_sub(delay_ticks);
                     *samples_since_anchor = 0;
                     *pts_anchor_set = true;
@@ -1054,7 +1074,9 @@ impl AudioEncoder {
                     // an anchor at the raw input PTS would present every
                     // frame that much late.
                     let sr = (encoder.sample_rate() as u64).max(1);
-                    let delay_ticks = encoder.initial_padding() as u64 * 90_000 / sr;
+                    let delay = encoder.initial_padding() as u64
+                        + resampler.as_ref().map_or(0, |r| r.delay() as u64);
+                    let delay_ticks = delay * 90_000 / sr + self.upstream_delay_90k;
                     *pts_90k = pts.saturating_sub(delay_ticks);
                     *samples_since_anchor = 0;
                     *pts_anchor_set = true;
@@ -1112,6 +1134,16 @@ impl AudioEncoder {
                 true
             }
         }
+    }
+
+    /// Declare the delay of what feeds this encoder — a channel / rate
+    /// stage (`audio_transcode::EncoderStage`) whose resampler places input
+    /// frame `j` at output frame `j * ratio + frames` — so the stamps take
+    /// it off with the codec's own delay: `frames` at `rate`, the rate the
+    /// stage emits (this encoder's input rate). Applied at the next anchor
+    /// (the first submit, or the first after [`Self::reanchor_pts`]).
+    pub fn set_upstream_delay(&mut self, frames: usize, rate: u32) {
+        self.upstream_delay_90k = frames as u64 * 90_000 / rate.max(1) as u64;
     }
 
     /// Re-anchor the output timeline at the next submitted PTS.
@@ -3027,5 +3059,122 @@ mod tests {
             !frames.is_empty(),
             "HE-AAC v1 should produce encoded frames after accumulating enough samples"
         );
+    }
+
+    /// Where a burst the encoder was fed at input sample `at` (input clock
+    /// `in_rate`, first submit stamped `P0`) is presented after a decode, as
+    /// an error in output samples. Each decoded sample is timed from its own
+    /// frame's stamp.
+    #[cfg(all(feature = "fdk-aac", feature = "media-codecs"))]
+    fn burst_error_samples(enc: &mut AudioEncoder, in_rate: u32, upstream: Option<(usize, u32)>) -> f64 {
+        const P0: u64 = 900_000;
+        let burst = |rate: u32| -> Vec<f32> {
+            let n = (rate / 100) as usize;
+            (0..n)
+                .map(|k| {
+                    let w = 0.5 - 0.5 * (2.0 * std::f32::consts::PI * k as f32 / (n - 1) as f32).cos();
+                    0.5 * w * (2.0 * std::f32::consts::PI * 1000.0 * k as f32 / rate as f32).sin()
+                })
+                .collect()
+        };
+        if let Some((frames, rate)) = upstream {
+            enc.set_upstream_delay(frames, rate);
+        }
+        let at = in_rate as usize + 333;
+        let mut pcm = vec![0.0f32; in_rate as usize * 3];
+        let b = burst(in_rate);
+        pcm[at..at + b.len()].copy_from_slice(&b);
+        let mut submitted = 0u64;
+        let mut frames = Vec::new();
+        for chunk in pcm.chunks(1000) {
+            let pts = P0 + submitted * 90_000 / in_rate as u64;
+            assert!(enc.submit_planar(&[chunk.to_vec(), chunk.to_vec()], pts));
+            submitted += chunk.len() as u64;
+            frames.extend(enc.drain());
+        }
+        let out_rate = enc.params().target_sample_rate;
+        let mut times = Vec::new();
+        let mut decoded = Vec::new();
+        match enc.params().codec {
+            AudioCodec::AacLc => {
+                let mut d = aac_audio::AacDecoder::open_adts().unwrap();
+                for f in &frames {
+                    let p = d.decode_frame(&f.data).unwrap().planar[0].clone();
+                    times.extend((0..p.len()).map(|i| f.pts as f64 + i as f64 * 90_000.0 / out_rate as f64));
+                    decoded.extend(p);
+                }
+            }
+            codec => {
+                let c = match codec {
+                    AudioCodec::Mp2 => video_codec::AudioDecoderCodec::Mp2,
+                    _ => video_codec::AudioDecoderCodec::Ac3,
+                };
+                let mut d = video_engine::AudioDecoder::open(c).unwrap();
+                for f in &frames {
+                    d.send_packet(&f.data, 0).unwrap();
+                    while let Ok(o) = d.receive_frame() {
+                        let p = o.planar[0].clone();
+                        times.extend((0..p.len()).map(|i| f.pts as f64 + i as f64 * 90_000.0 / out_rate as f64));
+                        decoded.extend(p);
+                    }
+                }
+            }
+        }
+        let expected = P0 as f64 + at as f64 * 90_000.0 / in_rate as f64;
+        let b = burst(out_rate);
+        let best = (0..decoded.len() - b.len())
+            .max_by(|&x, &y| {
+                let s = |k: usize| -> f32 { b.iter().zip(&decoded[k..]).map(|(p, q)| p * q).sum() };
+                s(x).total_cmp(&s(y))
+            })
+            .unwrap();
+        (times[best] - expected) * out_rate as f64 / 90_000.0
+    }
+
+    #[cfg(all(feature = "fdk-aac", feature = "media-codecs"))]
+    fn resampling_encoder(codec: AudioCodec, in_rate: u32, out_rate: u32) -> AudioEncoder {
+        let params = EncoderParams {
+            codec,
+            sample_rate: in_rate,
+            channels: 2,
+            target_bitrate_kbps: 192,
+            target_sample_rate: out_rate,
+            target_channels: 2,
+            opus_vbr_mode: None,
+            opus_fec: false,
+            opus_dtx: false,
+            opus_frame_duration_ms: None,
+        };
+        let stats = Arc::new(OutputStatsAccumulator::new("t".into(), "t".into(), "cmaf".into()));
+        AudioEncoder::spawn(params, CancellationToken::new(), "f".into(), "o".into(), stats, None).unwrap()
+    }
+
+    /// The encoder's own resampler (input at another rate than the target)
+    /// delays the content by its filter's length — 32 frames and more,
+    /// 0.7 ms — which the stamps now take off with the codec's priming.
+    /// Before, a 44.1 kHz source re-encoded at 48 kHz presented that much
+    /// late.
+    #[cfg(all(feature = "fdk-aac", feature = "media-codecs"))]
+    #[test]
+    fn the_encoder_resampler_delay_is_taken_off_the_stamps() {
+        for codec in [AudioCodec::AacLc, AudioCodec::Mp2, AudioCodec::Ac3] {
+            for (in_rate, out_rate) in [(44_100, 48_000), (48_000, 44_100), (48_000, 32_000)] {
+                let mut enc = resampling_encoder(codec, in_rate, out_rate);
+                let e = burst_error_samples(&mut enc, in_rate, None);
+                assert!(e.abs() <= 2.0, "{codec:?} {in_rate} -> {out_rate}: {e:.1} samples off");
+            }
+        }
+    }
+
+    /// A stage in front of the encoder (`set_upstream_delay`) is taken off
+    /// too: a burst fed 128 frames late by it is presented on time.
+    #[cfg(all(feature = "fdk-aac", feature = "media-codecs"))]
+    #[test]
+    fn an_upstream_delay_is_taken_off_the_stamps() {
+        let mut enc = resampling_encoder(AudioCodec::AacLc, 48_000, 48_000);
+        let e = burst_error_samples(&mut enc, 48_000, Some((128, 48_000)));
+        // The burst went in on time; declaring 128 frames of upstream delay
+        // presents it 128 early.
+        assert!((e + 128.0).abs() <= 2.0, "{e:.1}");
     }
 }
