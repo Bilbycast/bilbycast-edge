@@ -30,6 +30,14 @@ on:
     branches: [main]
   workflow_dispatch:
 
+# Read-only, and no checkout below persists its credential: nothing in this
+# workflow pushes, and a persisted one would sit on disk for every build.rs,
+# proc-macro and test that runs after it. For the private DeckLink SDK
+# checkout it also means the deploy key is deleted from the runner as soon as
+# the headers are fetched, not kept through the build. actions/checkout
+# fetches `submodules:` before it removes its credential, and the separate
+# ffmpeg-video-rs submodule step talks only to git.ffmpeg.org and
+# gitlab.xiph.org, which never saw it.
 permissions:
   contents: read
 
@@ -56,6 +64,7 @@ jobs:
         with:
           repository: Bilbycast/bilbycast-libsrt-rs
           path: bilbycast-libsrt-rs
+          persist-credentials: false
           submodules: recursive
 
       - name: Checkout bilbycast-fdk-aac-rs (path dependency)
@@ -63,6 +72,7 @@ jobs:
         with:
           repository: Bilbycast/bilbycast-fdk-aac-rs
           path: bilbycast-fdk-aac-rs
+          persist-credentials: false
           submodules: recursive
 
       # Submodules are fetched in a separate retry step below, not by the
@@ -77,6 +87,7 @@ jobs:
         with:
           repository: Bilbycast/bilbycast-ffmpeg-video-rs
           path: bilbycast-ffmpeg-video-rs
+          persist-credentials: false
           fetch-depth: 0
 
       - name: Fetch bilbycast-ffmpeg-video-rs submodules (with retry)
@@ -101,6 +112,7 @@ jobs:
         with:
           repository: Bilbycast/bilbycast-rist
           path: bilbycast-rist
+          persist-credentials: false
           submodules: recursive
 
       - name: Checkout bilbycast-bonding (path dependency)
@@ -108,12 +120,14 @@ jobs:
         with:
           repository: Bilbycast/bilbycast-bonding
           path: bilbycast-bonding
+          persist-credentials: false
 
       - name: Checkout bilbycast-mxl-rs (path dependency)
         uses: actions/checkout@v7
         with:
           repository: Bilbycast/bilbycast-mxl-rs
           path: bilbycast-mxl-rs
+          persist-credentials: false
           submodules: recursive
 
       - name: Checkout bilbycast-decklink-rs (path dependency)
@@ -121,17 +135,20 @@ jobs:
         with:
           repository: Bilbycast/bilbycast-decklink-rs
           path: bilbycast-decklink-rs
+          persist-credentials: false
 
       - name: Checkout bilbycast-rga-rs (path dependency)
         uses: actions/checkout@v7
         with:
           repository: Bilbycast/bilbycast-rga-rs
           path: bilbycast-rga-rs
+          persist-credentials: false
 
       - name: Checkout bilbycast-edge
         uses: actions/checkout@v7
         with:
           path: bilbycast-edge
+          persist-credentials: false
 
       - name: Install build dependencies
         run: |
@@ -236,6 +253,7 @@ jobs:
           ssh-key: ${{ secrets.DECKLINK_SDK_DEPLOY_KEY }}
           token: ${{ secrets.DECKLINK_SDK_TOKEN || github.token }}
           path: decklink-sdk
+          persist-credentials: false
 
       - name: cargo check (sdi-decklink)
         if: env.HAS_DECKLINK_SDK == 'true'

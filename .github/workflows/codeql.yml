@@ -28,8 +28,13 @@ jobs:
             build-mode: none
 
     steps:
+      # Nothing here pushes: the CodeQL action uploads its results with its
+      # own `token` input (github.token by default), not the git credential,
+      # so the checkout keeps none for the extractor and queries to find.
       - name: Checkout repository
         uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
       - name: Initialize CodeQL
         uses: github/codeql-action/init@v4
