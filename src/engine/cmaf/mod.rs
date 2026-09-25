@@ -1648,7 +1648,7 @@ async fn run(
     }
 
     if let Some(enc_cfg) = &config.video_encode {
-        match VideoReencoder::new(enc_cfg, &config.id) {
+        match VideoReencoder::new(enc_cfg, &config.id, Some(config.segment_duration_secs)) {
             Ok(reenc) => {
                 tracing::info!(
                     "CMAF output '{}': video re-encode active codec={}",
@@ -2075,9 +2075,11 @@ async fn handle_video(
     // Phase 3: video_encode hooks here. For passthrough we forward the
     // NALs directly to the segmenter; with `video_encode`, we run them
     // through the re-encoder (block_in_place around the codec call) and
-    // forward the encoded NALs instead.
-    let pushed_nalus: Vec<Vec<u8>>;
-    let pushed_is_keyframe: bool;
+    // forward every frame it hands back instead — none while it fills, and
+    // each stamped with its own picture's source PTS. Stamping the output
+    // with the access unit being fed dated every picture by the one the
+    // decoder was reading at the time: a pipeline's depth late, and out of
+    // order on a source with B-frames.
     if let Some(reenc) = state.video_reencoder.as_mut() {
         let recoded = crate::timed_block_in_place!(
             "cmaf.video_reencoder",
@@ -2085,24 +2087,54 @@ async fn handle_video(
             { reenc.encode_frame(&nalus, pts, is_keyframe, codec) }
         );
         match recoded {
-            Ok(Some(out)) => {
-                pushed_nalus = out.nalus;
-                pushed_is_keyframe = out.is_keyframe;
+            Ok(frames) => {
+                for out in frames {
+                    push_video_sample(
+                        state, codec, out.nalus, out.pts.unwrap_or(pts), out.is_keyframe, config,
+                        base_url, init_url, init_name, m3u8_url, mpd_url, publish_hls, publish_dash,
+                        stats, event_sender, flow_id, recv_time_us,
+                    )
+                    .await;
+                }
             }
-            Ok(None) => return, // encoder buffered the frame
             Err(e) => {
                 tracing::warn!(
                     "CMAF output '{}': video re-encode failed: {e}",
                     config.id,
                 );
-                return;
             }
         }
-    } else {
-        pushed_nalus = nalus;
-        pushed_is_keyframe = is_keyframe;
+        return;
     }
+    push_video_sample(
+        state, codec, nalus, pts, is_keyframe, config, base_url, init_url, init_name, m3u8_url,
+        mpd_url, publish_hls, publish_dash, stats, event_sender, flow_id, recv_time_us,
+    )
+    .await;
+}
 
+/// One access unit into the video segmenter — the source's own, or one the
+/// re-encoder handed back — and everything a closing segment sets off.
+#[allow(clippy::too_many_arguments)]
+async fn push_video_sample(
+    state: &mut CmafState,
+    codec: VideoCodec,
+    pushed_nalus: Vec<Vec<u8>>,
+    pts: u64,
+    pushed_is_keyframe: bool,
+    config: &CmafOutputConfig,
+    base_url: &str,
+    init_url: &str,
+    init_name: &str,
+    m3u8_url: &str,
+    mpd_url: &str,
+    publish_hls: bool,
+    publish_dash: bool,
+    stats: &OutputStatsAccumulator,
+    event_sender: &EventSender,
+    flow_id: &str,
+    recv_time_us: u64,
+) {
     // The re-encoder is opened with `global_header = false`, so every IDR it
     // emits carries its SPS/PPS in-band. Those are the parameter sets that
     // actually describe these samples, so the track is built from them. They

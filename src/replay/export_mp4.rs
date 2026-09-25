@@ -737,27 +737,35 @@ fn align_tracks(
     (drop_audio, drop_video)
 }
 
-/// The typical gap between one frame and the next, in 90 kHz ticks.
+/// The typical gap between one picture and the next, in 90 kHz ticks, from
+/// display-order `labels` ([`display_order_labels`]); 3600 (25 fps) when
+/// there is none.
 ///
 /// A median rather than a mean: the source drops frames when the link is
-/// lossy, and one long gap must not stretch the cadence used to time the
-/// frames the encoder was still holding at the end.
-fn median_step(frames: &[(u64, Vec<Vec<u8>>, bool)]) -> Option<u64> {
-    if frames.len() < 2 {
-        return None;
-    }
-    let mut gaps: Vec<u64> = frames.windows(2).map(|w| w[1].0.saturating_sub(w[0].0)).collect();
+/// lossy, and one long gap must not stretch the cadence a frame whose PTS
+/// the decoder lost is placed by.
+#[cfg(any(feature = "media-codecs", test))]
+fn display_order_step(labels: &[u64]) -> u64 {
+    let mut gaps: Vec<u64> = labels.windows(2).map(|w| w[1].saturating_sub(w[0])).filter(|g| *g > 0).collect();
     gaps.sort_unstable();
-    Some(gaps[gaps.len() / 2]).filter(|g| *g > 0)
+    gaps.get(gaps.len() / 2).copied().unwrap_or(3600)
 }
 
 /// Re-encode a cut so every frame is an IDR.
 ///
 /// `frames` must be in the order the transport carried them — decode order —
 /// because that is the only order a decoder accepts. What comes back is in
-/// display order, labelled with the source's own timestamps: a decoder emits
-/// pictures in display order, so the k-th picture out carries the k-th
-/// smallest PTS that went in. See [`display_order_labels`].
+/// display order, each frame labelled with its own picture's source PTS as
+/// the decoder propagated it through its reorder queue.
+///
+/// Labelling the k-th picture out with the k-th smallest PTS in (the index
+/// into [`display_order_labels`]) assumed the decoder emits every picture it
+/// is given. It does not: a clip that opens on an open-GOP random access
+/// point (an HEVC CRA) carries leading pictures that reference the GOP
+/// before the cut, and the decoder drops them — so every later frame took
+/// the label of the picture ahead of it, the whole clip shifted by the
+/// number of pictures dropped, and the audio aligned against the shifted
+/// labels.
 ///
 /// The track description is built from the **encoder's** parameter sets, not
 /// the source's: the SPS/PPS change with the encode, and an `avcC` carrying
@@ -805,6 +813,7 @@ fn reencode_all_intra(
         bail!("no keyframe to start from");
     }
     let labels = display_order_labels(frames);
+    let label_step = display_order_step(&labels);
 
     // Measured on the TRIMMED list, and that matters: taking the span across
     // the frames that were about to be dropped and then applying it to the
@@ -856,28 +865,38 @@ fn reencode_all_intra(
         scan: None,
     };
 
-    let mut enc = VideoReencoder::new(&cfg, "clip-export")?;
+    let mut enc = VideoReencoder::new(&cfg, "clip-export", None)?;
     let mut out: Vec<(u64, Vec<Vec<u8>>, bool)> = Vec::with_capacity(frames.len());
     let mut rejected = 0usize;
     let mut emitted_bytes = 0usize;
+    // Every frame keeps the PTS its picture was demuxed with — the decoder
+    // carries it through its reorder queue — never a re-stamp on an even
+    // step: the source drops frames when the link is lossy, so an even step
+    // spread 749 frames across the 31.4s they really covered and every clip
+    // came out longer than it was asked for. A frame whose PTS the decoder
+    // lost continues the cadence of the one before it.
+    let mut keep = |f: crate::engine::cmaf::encode::VideoOutFrame,
+                    out: &mut Vec<(u64, Vec<Vec<u8>>, bool)>|
+     -> Result<()> {
+        emitted_bytes += f.nalus.iter().map(Vec::len).sum::<usize>();
+        if emitted_bytes > budget_bytes {
+            return Err(EssenceOverCap.into());
+        }
+        let label = f
+            .pts
+            .unwrap_or_else(|| out.last().map_or(labels[0], |prev| prev.0 + label_step));
+        out.push((label, f.nalus, true));
+        Ok(())
+    };
     for (pts, nalus, is_key) in frames {
-        // The picture that comes out of this call, if one does, is the next
-        // one in display order — not the one that went in. On a source with
-        // B-frames the decoder holds pictures back until their references
-        // have arrived, so labelling its output with the input's PTS put the
-        // wrong time on every frame. The label is looked up ahead of the
-        // call so the encoder is stamped with it too.
-        let label = labels.get(out.len()).copied().unwrap_or(*pts);
-        match enc.encode_frame(nalus, label, *is_key, src_codec) {
-            Ok(Some(f)) => {
-                emitted_bytes += f.nalus.iter().map(Vec::len).sum::<usize>();
-                if emitted_bytes > budget_bytes {
-                    return Err(EssenceOverCap.into());
+        match enc.encode_frame(nalus, *pts, *is_key, src_codec) {
+            // None while the decoder and encoder fill; they hand those back
+            // later, or on flush.
+            Ok(done) => {
+                for f in done {
+                    keep(f, &mut out)?;
                 }
-                out.push((label, f.nalus, true));
             }
-            // Buffered. The encoder will hand it back later, or on flush.
-            Ok(None) => {}
             // One bad frame is not worth losing the clip over — a dropped
             // frame is a blink, an abandoned re-encode is a clip that cannot
             // be stepped through at all. Counted so it is not silent.
@@ -887,24 +906,10 @@ fn reencode_all_intra(
     if rejected > 0 {
         tracing::debug!(rejected, of = frames.len(), "replay export: frames the decoder refused");
     }
-    // Anything the encoder is still holding. Without this the tail of every
-    // clip is missing, by however deep the encoder buffers.
-    //
-    // These come back with no timestamp of their own, so they continue the
-    // cadence of the frames that did. Everything else keeps the PTS it was
-    // demuxed with — re-stamping the lot on an even step was wrong: the
-    // source drops frames when the link is lossy, so an even step spread 749
-    // frames across the 31.4s they really covered and every clip came out
-    // longer than it was asked for.
-    let step = median_step(&out).unwrap_or(3600);
-    let mut next = out.last().map(|f| f.0 + step).unwrap_or(0);
+    // Anything the decoder and encoder are still holding. Without this the
+    // tail of every clip is missing, by however deep they buffer.
     for f in enc.flush()? {
-        emitted_bytes += f.nalus.iter().map(Vec::len).sum::<usize>();
-        if emitted_bytes > budget_bytes {
-            return Err(EssenceOverCap.into());
-        }
-        out.push((next, f.nalus, true));
-        next += step;
+        keep(f, &mut out)?;
     }
     if out.is_empty() {
         bail!("the encoder produced no frames");
@@ -960,13 +965,12 @@ impl std::fmt::Display for EssenceOverCap {
 
 impl std::error::Error for EssenceOverCap {}
 
-/// The timestamps a decoder's output will carry, in the order it emits them.
-///
-/// A decoder takes frames in decode order and hands pictures back in display
-/// order, so the k-th picture out is the one with the k-th smallest PTS that
-/// went in. On a source with no B-frames the two orders are the same and this
-/// is the input list; on one with B-frames it is the input list sorted. Either
-/// way it also absorbs the minor reordering a PES boundary can introduce.
+/// The cut's source timestamps in display order — the input list sorted,
+/// since a decoder takes frames in decode order and hands pictures back in
+/// display order. The span the clip covers and its typical frame step are
+/// measured on it. It is not the labels of the decoder's output, frame for
+/// frame: a decoder drops the pictures it cannot decode (see
+/// [`reencode_all_intra`]).
 #[cfg(any(feature = "media-codecs", test))]
 fn display_order_labels(frames: &[(u64, Vec<Vec<u8>>, bool)]) -> Vec<u64> {
     let mut labels: Vec<u64> = frames.iter().map(|f| f.0).collect();
@@ -1289,9 +1293,10 @@ mod tests {
     /// A decoder emits pictures in display order whatever order they went in.
     ///
     /// On a source with B-frames the transport carries I P B B; the decoder
-    /// hands back I B B P. Labelling each output with the input it arrived
-    /// with put the P's time on the first B and so on; the labels are the
-    /// sorted input times, one per picture out.
+    /// hands back I B B P. The display-order list the clip's span and frame
+    /// step are measured on is the sorted input times (each output frame is
+    /// labelled with its own picture's decoder PTS — see
+    /// `an_open_gop_clip_keeps_every_frame_on_its_own_pts`).
     #[test]
     fn display_order_labels_are_the_sorted_input_times() {
         let f = |pts: u64, key: bool| (pts, vec![vec![0u8; 4]], key);
@@ -1343,5 +1348,100 @@ mod tests {
         );
 
         clear_cache();
+    }
+}
+
+#[cfg(all(test, feature = "video-encoder-x264", feature = "video-encoder-x265"))]
+mod open_gop_tests {
+    use super::*;
+    use video_codec::{VideoEncoderCodec, VideoEncoderConfig, VideoPreset};
+
+    /// HEVC decode-order access units `(pts, NAL units, IRAP)` from x265
+    /// with B-frames and its default open GOP: every GOP after the first
+    /// opens on a CRA followed, in decode order, by leading pictures shown
+    /// before it.
+    fn open_gop_hevc(frames: usize) -> Vec<(u64, Vec<Vec<u8>>, bool)> {
+        let (w, h) = (320usize, 240usize);
+        let mut enc = video_engine::VideoEncoder::open(&VideoEncoderConfig {
+            codec: VideoEncoderCodec::X265,
+            width: w as u32,
+            height: h as u32,
+            fps_num: 25,
+            fps_den: 1,
+            gop_size: 12,
+            max_b_frames: 3,
+            // `zerolatency` would turn the B-frames off.
+            tune: String::new(),
+            preset: VideoPreset::Veryfast,
+            global_header: false,
+            ..VideoEncoderConfig::default()
+        })
+        .unwrap();
+        let mut coded = Vec::new();
+        for i in 0..frames {
+            // A still gradient with a small block moving across it — nothing
+            // a scene-cut decision would start a GOP early on.
+            let y: Vec<u8> = (0..w * h)
+                .map(|k| {
+                    let (x, row) = (k % w, k / w);
+                    if (100..116).contains(&row) && (4 * i..4 * i + 16).contains(&x) {
+                        235
+                    } else {
+                        (40 + x / 2) as u8
+                    }
+                })
+                .collect();
+            let c = vec![128u8; w / 2 * h / 2];
+            coded.extend(enc.encode_frame(&y, w, &c, w / 2, &c, w / 2, Some(i as i64)).unwrap());
+        }
+        coded.extend(enc.flush().unwrap());
+        coded
+            .into_iter()
+            .map(|f| {
+                let nalus = crate::engine::ts_demux::split_annex_b_nalus(&f.data);
+                let irap = nalus.iter().any(|n| matches!((n[0] >> 1) & 0x3F, 16..=21));
+                (900_000 + f.pts as u64 * 3_600, nalus, irap)
+            })
+            .collect()
+    }
+
+    fn hevc_demux() -> TsDemuxer {
+        use crate::engine::ts_test_fixtures::{packetize_sections, pat_packet, pmt_section};
+        let mut demux = TsDemuxer::new(None);
+        let pmt = pmt_section(1, 0, 0x100, &[], &[(STREAM_TYPE_H265, 0x100, &[])]);
+        let mut ts = pat_packet(&[(1, 0x1000)], 0, 0).to_vec();
+        ts.extend_from_slice(&packetize_sections(0x1000, &[&pmt], 0)[0]);
+        let _ = demux.demux(&ts);
+        assert_eq!(demux.video_stream_type(), STREAM_TYPE_H265);
+        demux
+    }
+
+    /// A clip that opens on a CRA: its leading pictures reference the GOP
+    /// before the cut, and the decoder drops them. Every frame that comes
+    /// back must still carry its own picture's PTS. Labelling output `k`
+    /// with the `k`-th smallest PTS in shifted every frame by the pictures
+    /// dropped — the whole clip, and the audio aligned against it.
+    #[test]
+    fn an_open_gop_clip_keeps_every_frame_on_its_own_pts() {
+        let aus = open_gop_hevc(40);
+        let cra = aus.iter().skip(1).position(|f| f.2).expect("a second GOP") + 1;
+        let cra_pts = aus[cra].0;
+        let clip = &aus[cra..];
+        let leading = clip.iter().filter(|f| f.0 < cra_pts).count();
+        assert!(leading > 0, "fixture: the CRA has leading pictures");
+        let track = VideoTrack {
+            codec: CmafVideoCodec::H265,
+            sps: Vec::new(),
+            pps: Vec::new(),
+            vps: Vec::new(),
+            timescale: 90_000,
+            width: 320,
+            height: 240,
+        };
+        let (out, _) = reencode_all_intra(clip, &track, &hevc_demux(), usize::MAX).unwrap();
+        let mut want: Vec<u64> = clip.iter().map(|f| f.0).filter(|p| *p >= cra_pts).collect();
+        want.sort_unstable();
+        let got: Vec<u64> = out.iter().map(|f| f.0).collect();
+        assert_eq!(got, want, "{leading} leading pictures dropped, nothing shifted");
     }
 }

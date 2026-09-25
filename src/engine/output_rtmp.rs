@@ -123,9 +123,12 @@ struct VideoActive {
     /// They still open the encoder (rate control, VBV, default GOP, SPS VUI)
     /// but they no longer reach the FLV timestamp — that comes from the source
     /// clock — and keeping a copy invited the next reader to use it again.
+    /// The one nominal frame step substituted when the source PTS is unusable
+    /// is read off the pipeline's rate as it is needed.
     last_wire_pts_90k: Option<u64>,
-    /// One nominal frame step, substituted when the source PTS is unusable.
-    nominal_step_90k: u64,
+    /// The encoder rate — pinned, or measured from the decoded frames before
+    /// the encoder opens (it used to open at a flat 30/1).
+    rate: crate::engine::video_encode_util::EncoderRateLock,
     /// Cached FLV sequence-header payload built from the encoder's
     /// `extradata` on first-encoder-open. `None` until the encoder opens
     /// and emits its out-of-band SPS/PPS (or VPS/SPS/PPS).
@@ -1593,9 +1596,11 @@ fn open_video_active(
     // RTMP FLV sequence header is out-of-band: the encoder must emit
     // extradata (SPS/PPS or VPS/SPS/PPS) so we can build the FLV header
     // before any frame tags go on the wire. Hence `global_header = true`.
-    let (fps_num, fps_den) = match (cfg.fps_num, cfg.fps_den) {
-        (Some(n), Some(d)) => (n, d),
-        _ => (30, 1),
+    // Unpinned, the encoder opens at the source's measured rate: the
+    // placeholder here is replaced when `EncoderRateLock` locks.
+    let (pinned, (fps_num, fps_den)) = match (cfg.fps_num, cfg.fps_den) {
+        (Some(n), Some(d)) => (true, (n, d)),
+        _ => (false, crate::engine::video_encode_util::RATE_LOCK_FALLBACK),
     };
     // B-frames are pinned off on this path. FLV carries DTS in the tag
     // timestamp and the two tag writers hard-code CTS = 0 (the Enhanced-RTMP
@@ -1634,9 +1639,7 @@ fn open_video_active(
         target_family,
         src_pts_queue: std::collections::VecDeque::with_capacity(64),
         last_wire_pts_90k: None,
-        // One frame period in 90 kHz ticks, from the declared rate. Only used
-        // as a substitute step when the source PTS is unusable.
-        nominal_step_90k: (90_000u64 * fps_den.max(1) as u64) / fps_num.max(1) as u64,
+        rate: crate::engine::video_encode_util::EncoderRateLock::new(pinned),
         sequence_header_tag: None,
         sequence_header_sent: false,
         out_frame_count: 0,
@@ -1674,80 +1677,10 @@ async fn encode_one_frame(
     // tokio reactor isn't held while we spend single-digit milliseconds
     // per frame.
     let annex_b = nalus_to_annex_b(src.nalus());
-    let block_result: Result<Vec<(Vec<u8>, bool, i64)>, String> = crate::timed_block_in_place!(
+    let block_result = crate::timed_block_in_place!(
         "output_rtmp.video_encoder",
         crate::engine::perf::TRANSCODE_BLOCK_WARN_MS,
-        {
-            active.stats.input_frames.fetch_add(1, Ordering::Relaxed);
-            // Feed the source PTS in so libavcodec can echo it back per
-            // decoded frame. `send_packet` (no pts) threw it away at the door,
-            // which is why the emit path had nothing but a frame counter to
-            // work from.
-            if let Err(e) = active.decoder.send_packet_with_pts(&annex_b, pts_90k as i64) {
-                tracing::debug!("RTMP output '{}': decoder send_packet: {e:?}", config.id);
-            }
-            let mut out = Vec::new();
-            loop {
-                let frame = match active.decoder.receive_frame() {
-                    Ok(f) => f,
-                    Err(_) => break,
-                };
-                // Display-order source PTS for this frame, straight from the
-                // decoder's reorder queue. Falls back to the access unit's own
-                // PTS when the source PES carried none.
-                let src_pts_for_frame = match frame.pts() {
-                    Some(p) if p >= 0 => p as u64,
-                    _ => pts_90k,
-                };
-                active.src_pts_queue.push_back(src_pts_for_frame);
-
-                let was_open = active.pipeline.is_open();
-                // The encoder still gets the monotonic frame counter — it wants
-                // a rate-control tick, not a clock, and passing 90 kHz ticks
-                // against a 1/fps timebase is the documented VBV hazard.
-                let encoded = match active.pipeline.encode(&frame, Some(active.out_frame_count)) {
-                    Ok(frames) => frames,
-                    Err(e) => {
-                        if !active.pipeline.is_open() {
-                            // Terminal: encoder open failed.
-                            return Err(format!("encoder open failed: {e}"));
-                        }
-                        tracing::debug!("RTMP output '{}': encode error: {e}", config.id);
-                        active.stats.dropped_frames.fetch_add(1, Ordering::Relaxed);
-                        // Keep the FIFO balanced: this frame produced no output.
-                        active.src_pts_queue.pop_back();
-                        continue;
-                    }
-                };
-                // First time the pipeline reported itself open, capture
-                // its extradata and build the FLV sequence header —
-                // classic AVC for H.264, Enhanced RTMP hvcC for HEVC.
-                if !was_open && active.pipeline.is_open()
-                    && let Some(ed) = active.pipeline.extradata() {
-                        active.sequence_header_tag = Some(match active.target_family {
-                            video_codec::VideoCodec::H264 => {
-                                build_avc_sequence_header_from_avcc(&ed)
-                            }
-                            video_codec::VideoCodec::Hevc => {
-                                build_hevc_sequence_header_from_hvcc(&ed)
-                            }
-                            // Unreachable — `target_family` is the encoder
-                            // output, validation rejects Mpeg2 here. Treat
-                            // it as h264 so we don't panic on a phantom
-                            // bitstream.
-                            video_codec::VideoCodec::Mpeg2 => {
-                                build_avc_sequence_header_from_avcc(&ed)
-                            }
-                        });
-                    }
-                active.out_frame_count += 1;
-                for ef in encoded {
-                    out.push((ef.data, ef.keyframe, ef.pts));
-                    active.stats.output_frames.fetch_add(1, Ordering::Relaxed);
-                }
-            }
-            Ok(out)
-        }
+        { transcode_access_unit(active, &annex_b, pts_90k, &config.id) }
     );
 
     // Only encoder *open* failure flips us to Failed. Decoder priming —
@@ -1786,7 +1719,12 @@ async fn encode_one_frame(
     // a publisher whose DTS goes backwards) and forced not to leap, so a source
     // discontinuity does not split video away from an audio timeline that
     // cannot follow it.
-    let step = active.nominal_step_90k.max(1);
+    // One frame period in 90 kHz ticks at the encoder's rate — only a
+    // substitute step for an unusable source PTS.
+    let step = {
+        let (num, den) = active.pipeline.fps();
+        (90_000 * u64::from(den.max(1)) / u64::from(num.max(1))).max(1)
+    };
     for (annex_b_encoded, keyframe, _enc_pts) in encoded {
         let wire_pts = next_wire_pts_90k(
             &mut active.src_pts_queue,
@@ -1830,6 +1768,95 @@ async fn encode_one_frame(
         stats.record_latency(recv_time_us);
     }
     Ok(true)
+}
+
+/// The codec half of [`encode_one_frame`]: one source access unit through
+/// the decoder, the rate lock and the encoder. Returns every encoded frame
+/// as `(Annex B, keyframe, encoder pts)`; `Err` only when the encoder failed
+/// to open (terminal).
+#[cfg(feature = "media-codecs")]
+fn transcode_access_unit(
+    active: &mut VideoActive,
+    annex_b: &[u8],
+    pts_90k: u64,
+    output_id: &str,
+) -> Result<Vec<(Vec<u8>, bool, i64)>, String> {
+    active.stats.input_frames.fetch_add(1, Ordering::Relaxed);
+    // Feed the source PTS in so libavcodec can echo it back per
+    // decoded frame. `send_packet` (no pts) threw it away at the door,
+    // which is why the emit path had nothing but a frame counter to
+    // work from.
+    if let Err(e) = active.decoder.send_packet_with_pts(annex_b, pts_90k as i64) {
+        tracing::debug!("RTMP output '{}': decoder send_packet: {e:?}", output_id);
+    }
+    let mut out = Vec::new();
+    loop {
+        let frame = match active.decoder.receive_frame() {
+            Ok(f) => f,
+            Err(_) => break,
+        };
+        // The encoder rate, from the decoded frames' own cadence
+        // unless pinned. Until it is known the encoder cannot open
+        // (its time base is fixed at open), so the frame is dropped
+        // before it reaches the PTS queue.
+        if !active.rate.admit(frame.pts(), &mut active.pipeline) {
+            continue;
+        }
+        // Display-order source PTS for this frame, straight from the
+        // decoder's reorder queue. Falls back to the access unit's own
+        // PTS when the source PES carried none.
+        let src_pts_for_frame = match frame.pts() {
+            Some(p) if p >= 0 => p as u64,
+            _ => pts_90k,
+        };
+        active.src_pts_queue.push_back(src_pts_for_frame);
+
+        let was_open = active.pipeline.is_open();
+        // The encoder still gets the monotonic frame counter — it wants
+        // a rate-control tick, not a clock, and passing 90 kHz ticks
+        // against a 1/fps timebase is the documented VBV hazard.
+        let encoded = match active.pipeline.encode(&frame, Some(active.out_frame_count)) {
+            Ok(frames) => frames,
+            Err(e) => {
+                if !active.pipeline.is_open() {
+                    // Terminal: encoder open failed.
+                    return Err(format!("encoder open failed: {e}"));
+                }
+                tracing::debug!("RTMP output '{}': encode error: {e}", output_id);
+                active.stats.dropped_frames.fetch_add(1, Ordering::Relaxed);
+                // Keep the FIFO balanced: this frame produced no output.
+                active.src_pts_queue.pop_back();
+                continue;
+            }
+        };
+        // First time the pipeline reported itself open, capture
+        // its extradata and build the FLV sequence header —
+        // classic AVC for H.264, Enhanced RTMP hvcC for HEVC.
+        if !was_open && active.pipeline.is_open()
+            && let Some(ed) = active.pipeline.extradata() {
+                active.sequence_header_tag = Some(match active.target_family {
+                    video_codec::VideoCodec::H264 => {
+                        build_avc_sequence_header_from_avcc(&ed)
+                    }
+                    video_codec::VideoCodec::Hevc => {
+                        build_hevc_sequence_header_from_hvcc(&ed)
+                    }
+                    // Unreachable — `target_family` is the encoder
+                    // output, validation rejects Mpeg2 here. Treat
+                    // it as h264 so we don't panic on a phantom
+                    // bitstream.
+                    video_codec::VideoCodec::Mpeg2 => {
+                        build_avc_sequence_header_from_avcc(&ed)
+                    }
+                });
+            }
+        active.out_frame_count += 1;
+        for ef in encoded {
+            out.push((ef.data, ef.keyframe, ef.pts));
+            active.stats.output_frames.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    Ok(out)
 }
 
 /// Build an AAC sequence header FLV audio tag (AudioSpecificConfig).
@@ -2562,6 +2589,94 @@ fn rtmp_output_event(
         flow_id: Some(flow_id.to_string()),
         input_id: None,
         output_id: Some(config.id.clone()),
+    }
+}
+
+/// An x264 source at 25 fps (IPPP, SPS on the first AU), as Annex B access
+/// units with their 90 kHz PTS. Shared by the RTMP and WebRTC rate tests.
+#[cfg(all(test, feature = "video-encoder-x264"))]
+pub(crate) fn x264_test_source(frames: usize, step_90k: u64) -> Vec<(Vec<u8>, u64)> {
+    use video_codec::{VideoEncoderCodec, VideoEncoderConfig, VideoPreset};
+    let (w, h) = (320usize, 240usize);
+    let mut enc = video_engine::VideoEncoder::open(&VideoEncoderConfig {
+        codec: VideoEncoderCodec::X264,
+        width: w as u32,
+        height: h as u32,
+        fps_num: 25,
+        fps_den: 1,
+        gop_size: 50,
+        preset: VideoPreset::Veryfast,
+        global_header: false,
+        ..VideoEncoderConfig::default()
+    })
+    .unwrap();
+    let mut aus = Vec::new();
+    for i in 0..frames {
+        let y: Vec<u8> = (0..w * h).map(|k| ((k % w + 5 * i) % 200) as u8 + 20).collect();
+        let c = vec![128u8; w / 2 * h / 2];
+        aus.extend(enc.encode_frame(&y, w, &c, w / 2, &c, w / 2, Some(i as i64)).unwrap());
+    }
+    aus.extend(enc.flush().unwrap());
+    assert_eq!(aus.len(), frames);
+    aus.into_iter().map(|f| (f.data, 900_000 + f.pts as u64 * step_90k)).collect()
+}
+
+#[cfg(all(test, feature = "video-encoder-x264"))]
+mod rate_tests {
+    use super::*;
+
+    fn run(cfg: serde_json::Value, step_90k: u64) -> (VideoEncoderState, usize) {
+        let cfg: VideoEncodeConfig = serde_json::from_value(cfg).unwrap();
+        let config: RtmpOutputConfig = serde_json::from_value(serde_json::json!({
+            "id": "o", "name": "o", "dest_url": "rtmp://127.0.0.1/live", "stream_key": "k"
+        }))
+        .unwrap();
+        let stats = Arc::new(OutputStatsAccumulator::new("o".into(), "o".into(), "rtmp".into()));
+        let (events, _rx) = crate::manager::events::event_channel();
+        let aus = x264_test_source(40, step_90k);
+        let mut state = open_video_active(&cfg, true, &aus[0].0, &config, &stats, &events);
+        let mut encoded = 0;
+        for (au, pts) in &aus {
+            let VideoEncoderState::Active(active) = &mut state else { panic!("not active") };
+            encoded += transcode_access_unit(active, au, *pts, "o").unwrap().len();
+        }
+        (state, encoded)
+    }
+
+    fn vui_timing(state: &VideoEncoderState) -> Option<(u32, u32)> {
+        let VideoEncoderState::Active(active) = state else { return None };
+        let extradata = active.pipeline.extradata()?;
+        video_engine::find_h264_sps(&extradata)?.timing.map(|(n, t, _)| (n, t))
+    }
+
+    /// Unpinned, the encoder opens at the source's measured rate — it used
+    /// to open at a flat 30/1, so a 25 fps source's VUI said 30 fps and CBR
+    /// budgeted 25/30 of the configured bitrate. The frames decoded while
+    /// the rate is measured are dropped (four here).
+    #[test]
+    fn an_unpinned_rtmp_encode_opens_at_the_source_rate() {
+        let (state, encoded) = run(serde_json::json!({"codec": "x264", "preset": "veryfast"}), 3_600);
+        let VideoEncoderState::Active(active) = &state else { panic!("not active") };
+        assert_eq!(active.pipeline.fps(), (25, 1));
+        assert_eq!(vui_timing(&state), Some((1, 50)), "VUI 25 fps");
+        assert_eq!(encoded, 40 - 4);
+        // 29.97 fps (3003-tick steps).
+        let (state, _) = run(serde_json::json!({"codec": "x264", "preset": "veryfast"}), 3_003);
+        let VideoEncoderState::Active(active) = &state else { panic!("not active") };
+        assert_eq!(active.pipeline.fps(), (30_000, 1001));
+        assert_eq!(vui_timing(&state), Some((1001, 60_000)));
+    }
+
+    /// A pinned rate is used as it is, from the first frame.
+    #[test]
+    fn a_pinned_rtmp_rate_encodes_every_frame() {
+        let (state, encoded) = run(
+            serde_json::json!({"codec": "x264", "preset": "veryfast", "fps_num": 50, "fps_den": 1}),
+            3_600,
+        );
+        let VideoEncoderState::Active(active) = &state else { panic!("not active") };
+        assert_eq!(active.pipeline.fps(), (50, 1));
+        assert_eq!(encoded, 40);
     }
 }
 

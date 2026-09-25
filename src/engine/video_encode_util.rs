@@ -512,6 +512,144 @@ fn gcd(mut a: u64, mut b: u64) -> u64 {
     a.max(1)
 }
 
+/// Decoded frames an unpinned encoder waits for [`FrameCadence`] to measure
+/// the source's rate before it opens at the fallback ([`RATE_LOCK_FALLBACK`])
+/// — a source whose frames carry no usable PTS still gets an encoder.
+pub const RATE_LOCK_FRAME_CAP: u32 = 60;
+
+/// The rate an unpinned encoder opens at when the cadence cannot be
+/// measured.
+pub const RATE_LOCK_FALLBACK: (u32, u32) = (30, 1);
+
+/// The encoder rate of a decode→encode output whose operator pinned no
+/// `video_encode.fps_num` / `fps_den` — RTMP, WebRTC and CMAF — measured
+/// from the decoded frames' own PTS as the TS video replacer measures it
+/// (whose lock, `ts_video_replace::Inner::try_lock_rate`, also knows the PES
+/// DTS step it falls back on).
+///
+/// These outputs used to open their encoder at a flat 30/1 whatever the
+/// source ran at: a 25 fps source's SPS VUI said 30 fps, CBR budgeted
+/// 25/30 of the configured bitrate, and the default GOP ran 20 % longer
+/// than asked. The encoder's time base is fixed at open, so the frames
+/// decoded before the rate is known are dropped — about four at start-up,
+/// which is what the TS path drops too.
+#[derive(Debug)]
+pub struct EncoderRateLock {
+    cadence: FrameCadence,
+    locked: bool,
+    unlocked_frames: u32,
+}
+
+/// What to do with a decoded frame, from [`EncoderRateLock::observe`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RateStep {
+    /// The rate is not known yet: drop the frame — the encoder cannot open
+    /// without one.
+    Wait,
+    /// The rate is known as of this frame: open the encoder at
+    /// `num / den`, then encode the frame. `measured` is false for the
+    /// fallback.
+    Lock { num: u32, den: u32, measured: bool },
+    /// Encode the frame.
+    Encode,
+}
+
+impl EncoderRateLock {
+    /// `pinned`: the operator set the rate, so there is nothing to measure
+    /// and every frame is encoded.
+    pub fn new(pinned: bool) -> Self {
+        Self { cadence: FrameCadence::new(), locked: pinned, unlocked_frames: 0 }
+    }
+
+    /// Feed one decoded frame's PTS (90 kHz, display order, as the decoder
+    /// returned it — the caller must hand the decoder each access unit's
+    /// PTS).
+    pub fn observe(&mut self, frame_pts: Option<i64>) -> RateStep {
+        if self.locked {
+            return RateStep::Encode;
+        }
+        self.cadence.observe(frame_pts);
+        self.unlocked_frames += 1;
+        let (num, den, measured) = match self.cadence.rate() {
+            Some((n, d)) => (n, d, true),
+            None if self.unlocked_frames >= RATE_LOCK_FRAME_CAP => {
+                (RATE_LOCK_FALLBACK.0, RATE_LOCK_FALLBACK.1, false)
+            }
+            None => return RateStep::Wait,
+        };
+        self.locked = true;
+        RateStep::Lock { num, den, measured }
+    }
+
+    /// [`Self::observe`] for a frame about to go to `pipeline`: sets the
+    /// rate the encoder opens at when it locks, and says whether to encode
+    /// the frame.
+    pub fn admit(&mut self, frame_pts: Option<i64>, pipeline: &mut ScaledVideoEncoder) -> bool {
+        match self.observe(frame_pts) {
+            RateStep::Wait => false,
+            RateStep::Encode => true,
+            RateStep::Lock { num, den, measured } => {
+                let applied = pipeline.set_fps_if_unopened(num, den);
+                if measured {
+                    tracing::info!(
+                        "{}: source frame rate {num}/{den} ({:.3} fps) from the decoded-frame \
+                         cadence — encoder {}",
+                        pipeline.log_tag,
+                        num as f64 / den as f64,
+                        if applied { "opens at it" } else { "already open" },
+                    );
+                } else {
+                    tracing::warn!(
+                        "{}: source frame rate not measurable from {RATE_LOCK_FRAME_CAP} decoded \
+                         frames (no usable frame PTS) — opening the encoder at {num}/{den}",
+                        pipeline.log_tag,
+                    );
+                }
+                true
+            }
+        }
+    }
+}
+
+/// Which picture an encoded frame codes: the source PTS of every frame handed
+/// to an encoder, keyed by the frame counter it was stamped with (the
+/// encoder's 1 / fps pts, which it echoes on its output), until the encoder
+/// hands the frame back. A decoder returns pictures in display order, as
+/// many or as few per access unit as it has, so the access unit being fed
+/// when a frame comes out is not the picture it codes.
+#[derive(Debug, Default)]
+pub struct EncodedPtsMap {
+    in_flight: std::collections::VecDeque<(i64, Option<u64>)>,
+}
+
+impl EncodedPtsMap {
+    /// A frame stamped `counter` goes to the encoder; `pts` is its decoded
+    /// picture's source PTS (90 kHz), if it has one.
+    pub fn push(&mut self, counter: i64, pts: Option<u64>) {
+        self.in_flight.push_back((counter, pts));
+    }
+
+    /// The frame pushed last never reached the encoder (its encode failed).
+    pub fn cancel_last(&mut self) {
+        self.in_flight.pop_back();
+    }
+
+    /// The source PTS of the frame the encoder handed back stamped
+    /// `counter`. Older entries were frames the encoder dropped.
+    pub fn take(&mut self, counter: i64) -> Option<u64> {
+        while let Some(&(c, pts)) = self.in_flight.front() {
+            if c > counter {
+                break;
+            }
+            self.in_flight.pop_front();
+            if c == counter {
+                return pts;
+            }
+        }
+        None
+    }
+}
+
 // ───────────────────── Lazy H.264 decoder open ─────────────────────
 
 /// Access units a lazy H.264 decoder open passes over waiting for one that
@@ -1157,6 +1295,24 @@ impl ScaledVideoEncoder {
     /// The rate the encoder opens (or opened) at, `(num, den)`.
     pub fn fps(&self) -> (u32, u32) {
         (self.fps_num, self.fps_den)
+    }
+
+    /// Set the GOP the encoder opens with when the operator set none — for a
+    /// caller whose default depends on the rate it only learns at the lock
+    /// (CMAF: one segment's worth). A no-op once the encoder is open or when
+    /// `video_encode.gop_size` is set.
+    pub fn set_default_gop_if_unopened(&mut self, gop: u32) -> bool {
+        if self.encoder.is_some() || self.encode_cfg.gop_size.is_some() {
+            return false;
+        }
+        self.encode_cfg.gop_size = Some(gop);
+        true
+    }
+
+    /// The GOP the encoder opens (or opened) with, when one is set; `None`
+    /// is `build_encoder_config`'s default of two seconds' worth.
+    pub fn gop_size(&self) -> Option<u32> {
+        self.encode_cfg.gop_size
     }
 
     /// Resolved output dimensions. Zero until [`Self::encode`] has been

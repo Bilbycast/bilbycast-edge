@@ -489,8 +489,9 @@ mod inner {
     const DECODE_STALL_INPUT_FRAMES: u64 = 200;
 
     /// Decoded frames the replacer waits for a measurable rate before it
-    /// opens the encoder at the fallback rate (~2 s of broadcast video).
-    const UNLOCKED_FRAME_CAP: u32 = 60;
+    /// opens the encoder at the fallback rate (~2 s of broadcast video) —
+    /// the same wait the RTMP / WebRTC / CMAF encoders take.
+    const UNLOCKED_FRAME_CAP: u32 = crate::engine::video_encode_util::RATE_LOCK_FRAME_CAP;
 
     /// Where the encoder's rate came from.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1751,7 +1752,7 @@ mod inner {
                         step as f64 * per_frame,
                     )
                 }
-                None => (30, 1),
+                None => crate::engine::video_encode_util::RATE_LOCK_FALLBACK,
             }
         }
 
