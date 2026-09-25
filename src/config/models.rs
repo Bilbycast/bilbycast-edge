@@ -6187,6 +6187,31 @@ pub struct AudioEncodeConfig {
     /// Ignored for non-Opus.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub opus_frame_duration_ms: Option<u8>,
+    /// **AC-3 on MPEG-TS only.** How the re-encoded AC-3 ES is signalled in
+    /// the output PMT. `auto` (the default when unset) follows the source:
+    /// a DVB-flavoured source PMT gets DVB carriage (`stream_type 0x06` +
+    /// "AC-3" registration + AC-3_descriptor 0x6A), anything else ATSC
+    /// carriage (`stream_type 0x81` + "AC-3" registration). `dvb` / `atsc`
+    /// pin it. Latched once per output lifetime — an input switch between a
+    /// DVB and an ATSC source never flips the signalling. Only valid with
+    /// `codec = ac3` on the TS outputs (SRT / RIST / UDP / RTP) and on
+    /// TS-carrying inputs; HLS always uses ATSC carriage (what Apple HLS
+    /// and hls.js expect).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ts_signalling: Option<TsAudioSignalling>,
+}
+
+/// AC-3 PMT carriage convention — see [`AudioEncodeConfig::ts_signalling`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TsAudioSignalling {
+    /// Follow the source PMT's convention (DVB evidence ⇒ DVB, else ATSC).
+    #[default]
+    Auto,
+    /// ETSI EN 300 468 / TS 101 154: `0x06` + "AC-3" registration + 0x6A.
+    Dvb,
+    /// ATSC A/52 Annex A: `0x81` + "AC-3" registration.
+    Atsc,
 }
 
 fn is_false(b: &bool) -> bool {

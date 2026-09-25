@@ -7,9 +7,13 @@
 //! video / PAT / null / other elementary streams through unchanged, and
 //! transparently rewrites the audio ES:
 //!
-//! 1. On the first PMT seen, the replacer discovers the audio PID and its
-//!    source stream_type. It rewrites the PMT in-place with the target
-//!    stream_type (and recomputes the section CRC).
+//! 1. Every PMT-PID packet goes through the reassembling
+//!    `ts_pmt_edit::PsiUnitStage`. From the program's PMT section (found
+//!    by program_number, wherever it sits in the unit — VH1 carries a 0xC0
+//!    table ahead of it) the replacer learns the audio PID and its source
+//!    stream_type, and rebuilds that section: target stream_type, the
+//!    target's descriptor policy, a content-tracked version and a valid
+//!    CRC, also when the PMT spans packets. See `ts_pmt_edit`.
 //! 2. On each audio TS packet, bytes are buffered into a PES. When a new
 //!    PES begins (PUSI), the previous PES is decoded (AAC-LC ADTS → PCM),
 //!    fed to the target encoder, and the resulting encoded audio frames
@@ -56,10 +60,14 @@ use crate::config::models::AudioEncodeConfig;
 
 use super::audio_encode::AudioCodec;
 use super::audio_transcode::{PlanarAudioTranscoder, TranscodeJson};
+use super::transcode_engage::{EngageEvent, TranscodeEngageWatch, TranscodeKind};
 use super::ts_parse::{
-    mpeg2_crc32, parse_pat_programs, psi_crc_offset, ts_has_adaptation, ts_has_payload,
-    ts_payload_offset, ts_pid,
-    ts_pusi, PAT_PID, TS_PACKET_SIZE, TS_SYNC_BYTE,
+    parse_pat_programs, ts_has_payload, ts_payload_offset, ts_pid, ts_pusi, PAT_PID,
+    TS_PACKET_SIZE, TS_SYNC_BYTE,
+};
+use super::ts_pmt_edit::{
+    detect_flavour, parse_pmt, pmt_index, rebuild_pmt_section, AudioTarget, EsEdit, OutVersion,
+    PmtEdit, PmtView, PsiUnit, PsiUnitStage, TsFlavour,
 };
 
 // ────────────────────────── Public surface ──────────────────────────
@@ -108,6 +116,17 @@ pub struct TsAudioReplacer {
     /// Discovered PMT PID (the PAT's first program's PMT). `None` before
     /// the PAT has been seen.
     pmt_pid: Option<u16>,
+    /// program_number of that program. The PMT section is matched on it,
+    /// so a PMT PID shared by several programs, or carrying other tables
+    /// ahead of the PMT (VH1's 0xC0 section), resolves to the right one.
+    program_number: Option<u16>,
+    /// The PAT maps another program to the same PMT PID (then only an
+    /// exact program_number match counts — see `ts_pmt_edit::pmt_index`).
+    pmt_pid_shared: bool,
+    /// Reassembling PMT-PID stage: single-packet, multi-section and
+    /// multi-packet PMTs all reach [`Self::handle_pmt_unit`] complete, and
+    /// an edited PMT is re-packetised with a valid CRC.
+    pmt_stage: PsiUnitStage,
     /// Discovered audio PID. `None` before the PMT has been parsed. The
     /// replacer drops the original audio TS packets on this PID and
     /// emits re-encoded packets on the same PID; any operator PID rename
@@ -163,8 +182,19 @@ pub struct TsAudioReplacer {
     /// Source audio stream_type (0x0F = AAC-ADTS, etc.). Used to decide
     /// which decoder to instantiate.
     source_stream_type: u8,
-    /// Target audio stream_type written into the rewritten PMT.
-    target_stream_type: u8,
+    /// Operator's AC-3 carriage choice (`audio_encode.ts_signalling`).
+    ts_signalling: crate::config::models::TsAudioSignalling,
+    /// AC-3 carriage convention, latched ONCE per replacer lifetime from
+    /// the first source PMT (or pinned by `ts_signalling`). Never cleared
+    /// on a source reset: output signalling must not flip 0x81 ↔ 0x06
+    /// every time the flow switches between a DVB and an ATSC input.
+    flavour: Option<TsFlavour>,
+    /// "Configured but never engaged" watchdog (`audio_transcode_source_*`).
+    engage: TranscodeEngageWatch,
+    /// Event sink for the engage watchdog and the pinned-PID warning:
+    /// `(sender, entity id, input_scope)`. `None` in tests / callers that
+    /// do not wire events.
+    event_sink: Option<(crate::manager::events::EventSender, String, bool)>,
 
     /// PES bytes accumulated for the current audio packet (since the
     /// previous PUSI). Flushed on the next PUSI.
@@ -176,14 +206,13 @@ pub struct TsAudioReplacer {
     /// audio TS packet.
     out_audio_cc: u8,
 
-    /// Monotonic 5-bit PMT version counter for the rewritten PMT.
-    /// Initialized at 1; bumped (mod 32) on every `reset_source_state()`.
-    /// Stamped onto every emitted PMT via
-    /// [`crate::engine::ts_parse::set_psi_version`] so receivers always
-    /// see a different version when the rewrite changes audio
-    /// stream_type — without it, an `A → B → A` round-trip leaves
-    /// receivers' cached PMT pointing at the wrong codec.
-    out_psi_version: u8,
+    /// Output PMT `version_number`, derived from content: bumps whenever
+    /// the rebuilt PMT differs from the last one (a source PMT update that
+    /// adds an ES, a codec change) and on every `reset_source_state()`,
+    /// and otherwise holds. Receivers that cache by version therefore
+    /// always re-parse a changed PMT — including after an `A → B → A`
+    /// round trip — and never see a flapping version on an unchanged one.
+    pmt_version: OutVersion,
 
     /// Output PTS anchor in 90 kHz ticks — the PTS of the first output
     /// sample emitted since the last anchor reset. Combined with
@@ -367,13 +396,6 @@ impl TsAudioReplacer {
             return Err(TsAudioReplaceError::UnsupportedCodec(cfg.codec.clone()));
         }
 
-        let target_stream_type = match codec {
-            AudioCodec::AacLc | AudioCodec::HeAacV1 | AudioCodec::HeAacV2 => 0x0F,
-            AudioCodec::Mp2 => 0x03,
-            AudioCodec::Ac3 => 0x81,
-            AudioCodec::Opus => unreachable!(),
-        };
-
         let bitrate_kbps = cfg.bitrate_kbps.unwrap_or_else(|| codec.default_bitrate_kbps());
 
         Ok(Self {
@@ -382,6 +404,9 @@ impl TsAudioReplacer {
             sample_rate_override: cfg.sample_rate,
             channels_override: cfg.channels,
             pmt_pid: None,
+            program_number: None,
+            pmt_pid_shared: false,
+            pmt_stage: PsiUnitStage::new("ts_audio_replace"),
             audio_pid: None,
             source_audio_pid_pin: cfg.source_audio_pid,
             last_pinned_warn: None,
@@ -391,11 +416,14 @@ impl TsAudioReplacer {
             output_stats: None,
             input_decode_handle: None,
             source_stream_type: 0,
-            target_stream_type,
+            ts_signalling: cfg.ts_signalling.unwrap_or_default(),
+            flavour: None,
+            engage: TranscodeEngageWatch::new(TranscodeKind::Audio, cfg.source_audio_pid),
+            event_sink: None,
             pes_buffer: Vec::with_capacity(16 * 1024),
             pes_started: false,
             out_audio_cc: 0,
-            out_psi_version: 1,
+            pmt_version: OutVersion::new(),
             out_pts_90k: 0,
             out_pts_anchored: false,
             samples_since_anchor: 0,
@@ -475,6 +503,23 @@ impl TsAudioReplacer {
         signal: Arc<std::sync::atomic::AtomicI64>,
     ) {
         self.pcr_jump_signal = Some(signal);
+    }
+
+    /// Wire the manager event sender so the replacer can report that it
+    /// is configured but has found nothing to re-encode
+    /// (`audio_transcode_source_not_found`, then `_found` on a later lock)
+    /// and that an operator-pinned `source_audio_pid` is absent
+    /// (`audio_source_pid_not_found`). `input_scope` selects input- vs
+    /// output-scoped events, exactly like the video replacer's
+    /// decode-stall watchdog. Safe to call zero or one time before
+    /// `process()` runs.
+    pub fn set_event_watchdog(
+        &mut self,
+        event_sender: crate::manager::events::EventSender,
+        id: impl Into<String>,
+        input_scope: bool,
+    ) {
+        self.event_sink = Some((event_sender, id.into(), input_scope));
     }
 
     /// Shared handle to the one-shot "input was switched" request flag.
@@ -641,109 +686,43 @@ impl TsAudioReplacer {
                 let mut programs = parse_pat_programs(pkt);
                 if !programs.is_empty() {
                     programs.sort_by_key(|(num, _)| *num);
-                    let new_pmt_pid = programs[0].1;
-                    if self.pmt_pid != Some(new_pmt_pid) {
+                    let (new_program, new_pmt_pid) = programs[0];
+                    self.pmt_pid_shared =
+                        programs.iter().filter(|(_, p)| *p == new_pmt_pid).count() > 1;
+                    self.engage.note_pat(new_program, new_pmt_pid);
+                    if self.pmt_pid != Some(new_pmt_pid)
+                        || self.program_number != Some(new_program)
+                    {
                         if self.pmt_pid.is_some() {
                             self.audio_pid = None;
                             self.source_stream_type = 0;
                             self.reset_source_state("PMT PID changed");
                         }
+                        if self.pmt_pid != Some(new_pmt_pid) {
+                            self.pmt_stage = PsiUnitStage::new("ts_audio_replace");
+                        }
                         self.pmt_pid = Some(new_pmt_pid);
+                        self.program_number = Some(new_program);
                     }
                 }
             }
 
-            // Once we know the PMT PID, parse it (and rewrite the
-            // broadcast copy) on every PUSI. Re-read audio_pid and
-            // source_stream_type on every PMT so input switches
-            // between inputs with different audio codecs / PIDs are
-            // handled seamlessly.
-            if let Some(pmt_pid) = self.pmt_pid
-                && pid == pmt_pid && ts_pusi(pkt) {
-                    if let Some((apid, ast)) = parse_pmt_audio(pkt, self.source_audio_pid_pin) {
-                        // Operator pinned a specific PID but the PMT
-                        // resolved to a different one — they got the
-                        // first-match fallback. Warn loudly once per
-                        // distinct (pinned, actual) pair so log review
-                        // surfaces the misconfiguration; the warning
-                        // recurs on PMT-version bumps where the pin is
-                        // still missing.
-                        if let Some(pin) = self.source_audio_pid_pin {
-                            if pin != apid && self.last_pinned_warn != Some((pin, apid)) {
-                                tracing::warn!(
-                                    error_code = "audio_source_pid_not_found",
-                                    pinned_pid = format!("0x{pin:04X}"),
-                                    actual_pid = format!("0x{apid:04X}"),
-                                    actual_stream_type = format!("0x{ast:02X}"),
-                                    "audio_encode.source_audio_pid pin not present in PMT — falling back to first-matching-codec audio (pinned 0x{pin:04X} → actual 0x{apid:04X})"
-                                );
-                                self.last_pinned_warn = Some((pin, apid));
-                            } else if pin == apid && self.last_pinned_warn.is_some() {
-                                // Pin re-found (e.g. after an upstream
-                                // PMT change) — clear the suppression
-                                // so a future drop-out warns again.
-                                self.last_pinned_warn = None;
-                            }
-                        }
-                        let codec_changed =
-                            self.source_stream_type != 0 && self.source_stream_type != ast;
-                        let pid_changed =
-                            self.audio_pid.is_some() && self.audio_pid != Some(apid);
-                        if codec_changed || pid_changed {
-                            self.reset_source_state(&format!(
-                                "source changed: stream_type {:#04x} -> {:#04x}, pid {:?} -> {}",
-                                self.source_stream_type, ast, self.audio_pid, apid
-                            ));
-                        }
-                        self.audio_pid = Some(apid);
-                        self.source_stream_type = ast;
-                        // Surface for the manager UI's "(from PID 0x0101)"
-                        // badge. Updated on every PMT discovery so input
-                        // swaps and PMT-version bumps that change the
-                        // discovered audio PID are visible immediately.
-                        self.stats.source_pid.store(apid, Ordering::Relaxed);
-                        self.stats.source_stream_type.store(ast, Ordering::Relaxed);
-                        self.refresh_decode_stats_label();
-                    }
-                    // Rewrite the PMT stream_type whenever the source codec
-                    // is one we can replace (AAC family via fdk-aac, or
-                    // MP2/AC-3/E-AC-3 via the FFmpeg-backed audio decoder).
-                    // Anything else falls through to passthrough, with the
-                    // PMT preserved so downstream decoders see the truth.
-                    let can_replace = source_replaceable(self.source_stream_type);
-                    if can_replace {
-                        let mut rewritten = pkt.to_vec();
-                        if let Some(apid) = self.audio_pid {
-                            // Neutralise the AAC descriptor (0x7C) when re-encoding
-                            // to an AAC-family target — the source descriptor's
-                            // profile/level may not match the encoder we run, and
-                            // a strict broadcast decoder (e.g. Appear) refuses to
-                            // bring up audio on the mismatch.
-                            let aac_pal = match self.codec {
-                                AudioCodec::AacLc
-                                | AudioCodec::HeAacV1
-                                | AudioCodec::HeAacV2 => Some(0xFE),
-                                _ => None,
-                            };
-                            rewrite_pmt_audio_stream_type(
-                                &mut rewritten,
-                                apid,
-                                self.target_stream_type,
-                                aac_pal,
-                            );
-                            // Stamp the per-replacer monotonic version so
-                            // receivers re-parse on every codec change.
-                            crate::engine::ts_parse::set_psi_version(
-                                &mut rewritten,
-                                self.out_psi_version,
-                            );
-                        }
-                        output.extend_from_slice(&rewritten);
-                    } else {
-                        output.extend_from_slice(pkt);
-                    }
-                    continue;
+            // Every packet on the PMT PID goes through the reassembling
+            // stage. A complete unit is inspected (re-reading audio_pid and
+            // source_stream_type on every PMT, so input switches between
+            // inputs with different audio codecs / PIDs are handled
+            // seamlessly) and, when this replacer re-encodes, the program's
+            // PMT section is rebuilt; other sections on the PID (a 0xC0
+            // table ahead of the PMT, other programs) stay byte-identical.
+            if Some(pid) == self.pmt_pid {
+                if ts_pusi(pkt) {
+                    self.engage.note_pmt_pusi();
                 }
+                if let Some(unit) = self.pmt_stage.push(pkt, output) {
+                    self.handle_pmt_unit(unit, output);
+                }
+                continue;
+            }
 
             // Audio packets: route to the PES accumulator only when the
             // source codec is one we can actually decode. Anything else
@@ -757,6 +736,173 @@ impl TsAudioReplacer {
             // Everything else: passthrough.
             output.extend_from_slice(pkt);
         }
+
+        self.engage.note_packets((input_ts.len() / TS_PACKET_SIZE) as u64);
+        self.poll_engage(std::time::Instant::now());
+    }
+
+    /// Advance the engage watchdog and emit whatever it raises. Returns the
+    /// event for tests (which drive the clock explicitly).
+    fn poll_engage(&mut self, now: std::time::Instant) -> Option<EngageEvent> {
+        let ev = self.engage.tick(now)?;
+        self.emit_engage(&ev);
+        Some(ev)
+    }
+
+    fn emit_engage(&self, ev: &EngageEvent) {
+        if let Some((sender, id, input_scope)) = self.event_sink.as_ref() {
+            self.engage.emit(ev, sender, id, *input_scope);
+        }
+    }
+
+    /// The configured target as a PMT signalling target. MP2 at 16 / 22.05
+    /// / 24 kHz is MPEG-2 LSF (stream_type 0x04); the output rate is the
+    /// resolved one once the first frame decoded, the configured override
+    /// before that.
+    fn audio_target(&self) -> AudioTarget {
+        match self.codec {
+            AudioCodec::AacLc | AudioCodec::HeAacV1 | AudioCodec::HeAacV2 => AudioTarget::Aac,
+            AudioCodec::Mp2 => {
+                let rate = if self.resolved_sample_rate != 0 {
+                    self.resolved_sample_rate
+                } else {
+                    self.sample_rate_override.unwrap_or(0)
+                };
+                AudioTarget::Mp2 { lsf: matches!(rate, 16_000 | 22_050 | 24_000) }
+            }
+            AudioCodec::Ac3 => AudioTarget::Ac3 {
+                flavour: self.flavour.unwrap_or(TsFlavour::Atsc),
+            },
+            AudioCodec::Opus => unreachable!("rejected in new()"),
+        }
+    }
+
+    /// Inspect one complete PMT-PID unit, learn the audio ES of our
+    /// program, rebuild that program's PMT when re-encoding, and emit.
+    fn handle_pmt_unit(&mut self, mut unit: PsiUnit, output: &mut Vec<u8>) {
+        self.engage.note_pmt_unit(unit.first_table_id());
+        let idx = self
+            .program_number
+            .and_then(|p| pmt_index(unit.sections(), p, self.pmt_pid_shared));
+        let Some(i) = idx else {
+            self.pmt_stage.emit(unit, output);
+            return;
+        };
+        let section = unit.sections()[i].clone();
+        // Never learn from, or rebuild (and so re-CRC), a damaged PMT.
+        let Some(view) = parse_pmt(&section)
+            .filter(|_| crate::engine::ts_parse::mpeg2_crc32(&section) == 0)
+        else {
+            self.pmt_stage.emit(unit, output);
+            return;
+        };
+        if self.flavour.is_none() {
+            use crate::config::models::TsAudioSignalling;
+            self.flavour = Some(match self.ts_signalling {
+                TsAudioSignalling::Dvb => TsFlavour::Dvb,
+                TsAudioSignalling::Atsc => TsFlavour::Atsc,
+                TsAudioSignalling::Auto => detect_flavour(&view),
+            });
+        }
+        let sel = select_audio_es(&view, self.source_audio_pid_pin);
+        self.engage.note_pmt_parsed(sel.es.clone(), sel.unsupported_candidate);
+        if let Some((apid, ast)) = sel.chosen {
+            // Operator pinned a specific PID but the PMT resolved to a
+            // different one — they got the first-match fallback. Warn
+            // loudly once per distinct (pinned, actual) pair so log review
+            // and the manager's Events page surface the misconfiguration.
+            if let Some(pin) = self.source_audio_pid_pin {
+                if pin != apid && self.last_pinned_warn != Some((pin, apid)) {
+                    tracing::warn!(
+                        error_code = "audio_source_pid_not_found",
+                        pinned_pid = format!("0x{pin:04X}"),
+                        actual_pid = format!("0x{apid:04X}"),
+                        actual_stream_type = format!("0x{ast:02X}"),
+                        "audio_encode.source_audio_pid pin not present in PMT — falling back to first-matching-codec audio (pinned 0x{pin:04X} → actual 0x{apid:04X})"
+                    );
+                    if let Some((sender, id, input_scope)) = self.event_sink.as_ref() {
+                        crate::engine::transcode_engage::emit_pinned_pid_absent(
+                            TranscodeKind::Audio,
+                            sender,
+                            id,
+                            *input_scope,
+                            pin,
+                            apid,
+                            ast,
+                        );
+                    }
+                    self.last_pinned_warn = Some((pin, apid));
+                } else if pin == apid && self.last_pinned_warn.is_some() {
+                    // Pin re-found (e.g. after an upstream PMT change) —
+                    // clear the suppression so a future drop-out warns again.
+                    self.last_pinned_warn = None;
+                }
+            }
+            let codec_changed = self.source_stream_type != 0 && self.source_stream_type != ast;
+            let pid_changed = self.audio_pid.is_some() && self.audio_pid != Some(apid);
+            if codec_changed || pid_changed {
+                self.reset_source_state(&format!(
+                    "source changed: stream_type {:#04x} -> {:#04x}, pid {:?} -> {}",
+                    self.source_stream_type, ast, self.audio_pid, apid
+                ));
+            }
+            self.audio_pid = Some(apid);
+            self.source_stream_type = ast;
+            // Surface for the manager UI's "(from PID 0x0101)" badge.
+            // Updated on every PMT discovery so input swaps and PMT-version
+            // bumps that change the discovered audio PID are visible
+            // immediately.
+            self.stats.source_pid.store(apid, Ordering::Relaxed);
+            self.stats.source_stream_type.store(ast, Ordering::Relaxed);
+            self.refresh_decode_stats_label();
+            if let Some(ev) = self.engage.note_locked(apid, ast) {
+                self.emit_engage(&ev);
+            }
+        } else {
+            // The program no longer carries decodable audio: stop
+            // re-encoding (the ES, if any, passes through) and re-arm the
+            // engage watchdog.
+            if self.audio_pid.is_some() {
+                self.reset_source_state("PMT no longer carries decodable audio");
+                self.audio_pid = None;
+                self.source_stream_type = 0;
+            }
+            self.engage.note_unlocked(std::time::Instant::now());
+        }
+
+        // Rebuild the PMT whenever the source codec is one we replace
+        // (AAC family via fdk-aac, or MP2/AC-3/E-AC-3 via the FFmpeg-backed
+        // decoder): new stream_type, the target's descriptor policy, a
+        // content-tracked version. Anything else keeps the PMT untouched so
+        // downstream decoders see the truth.
+        if let Some(apid) = self.audio_pid
+            && source_replaceable(self.source_stream_type)
+        {
+            let target = self.audio_target();
+            let edit = [EsEdit::Audio { pid: apid, target }];
+            let rebuilt = rebuild_pmt_section(&section, &PmtEdit { es: &edit, ..Default::default() })
+                .and_then(|full| {
+                    // Growth fallback: the AC-3 additions (registration +
+                    // 0x6A) are the only edit that grows a section. When the
+                    // grown unit would need more packets than the source's,
+                    // emit self-identifying 0x81 with no additions instead,
+                    // so a single-packet PMT stays single-packet for every
+                    // downstream single-packet parser.
+                    if unit.fits_source_packets_with(i, &full) {
+                        Some(full)
+                    } else {
+                        rebuild_pmt_section(
+                            &section,
+                            &PmtEdit { es: &edit, no_additions: true, ..Default::default() },
+                        )
+                    }
+                });
+            if let Some(mut new_section) = rebuilt {
+                self.pmt_version.stamp(&mut new_section);
+                unit.replace_section(i, new_section);
+            }
+        }
+        self.pmt_stage.emit(unit, output);
     }
 
     /// Flush any buffered PES + encoder state. Call once on graceful
@@ -892,7 +1038,7 @@ impl TsAudioReplacer {
     /// between inputs with different audio codecs, or a PAT/PMT
     /// program re-layout).
     ///
-    /// The target codec itself (`self.codec` / `self.target_stream_type`)
+    /// The target codec itself (`self.codec`)
     /// is preserved — that's the output's configured codec, which
     /// never changes.
     fn reset_source_state(&mut self, reason: &str) {
@@ -947,11 +1093,12 @@ impl TsAudioReplacer {
         self.resolved_sample_rate = 0;
         self.codecs_ready = false;
         // Bump the rewritten-PMT version (mod 32) so receivers see a
-        // distinct version on the next PMT and re-parse — without this,
-        // `A → B → A` round-trips leave the receiver's cached PMT
-        // pointing at B's audio codec when A was already the cached
-        // version_number.
-        self.out_psi_version = (self.out_psi_version.wrapping_add(1)) & 0x1F;
+        // distinct version on the next PMT and re-parse. Content changes
+        // bump on their own (see `pmt_version`); this covers a reset whose
+        // PMT happens to be byte-identical to the previous source's.
+        self.pmt_version.bump();
+        // A new source gets a fresh engage window.
+        self.engage.on_reset();
     }
 
     /// Route one audio TS packet into the PES accumulator, flushing the
@@ -1873,7 +2020,7 @@ impl TsAudioReplacer {
 ///
 /// DVB-style audio with `stream_type = 0x06` (`private_data`) is
 /// resolved via [`resolve_private_audio_stream_type`] in
-/// [`parse_pmt_audio`] *before* this gate fires, so e.g. a DVB AC-3
+/// [`select_audio_es`] *before* this gate fires, so e.g. a DVB AC-3
 /// stream (0x06 + descriptor 0x6A) arrives here as the synthesised
 /// 0x81 and lights up exactly like its ATSC sibling.
 ///
@@ -1930,213 +2077,79 @@ fn resolve_private_audio_stream_type(descriptors: &[u8]) -> Option<u8> {
     }
 }
 
-/// Parse the PMT for an audio stream. Returns `(audio_pid, stream_type)`.
+/// How one PMT ES entry relates to this replacer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AudioClass {
+    /// Audio we can decode; carries the (DVB-resolved) stream_type the rest
+    /// of the replacer keys on.
+    Replaceable(u8),
+    /// Audio, but a codec the replacer cannot decode (DTS, Opus, AC-4,
+    /// SMPTE 302M, MPEG-4 raw audio, TrueHD, …).
+    Unsupported,
+    NotAudio,
+}
+
+fn classify_audio_entry(stream_type: u8, es_info: &[u8]) -> AudioClass {
+    match stream_type {
+        0x06 => match resolve_private_audio_stream_type(es_info) {
+            Some(st) => AudioClass::Replaceable(st),
+            None if crate::engine::ts_parse::descriptor_audio_kind(es_info).is_some() => {
+                AudioClass::Unsupported
+            }
+            None => AudioClass::NotAudio,
+        },
+        0x0F | 0x11 | 0x03 | 0x04 | 0x80 | 0x81 | 0x87 | 0xC1 | 0xC2 => {
+            AudioClass::Replaceable(stream_type)
+        }
+        0x1C | 0x82..=0x85 | 0x88 | 0xA1 | 0xA2 => AudioClass::Unsupported,
+        _ => AudioClass::NotAudio,
+    }
+}
+
+/// The audio ES this replacer should lock onto, plus what the engage
+/// watchdog needs to explain a miss.
+#[derive(Debug, Default)]
+struct AudioSelection {
+    /// `(audio_pid, resolved stream_type)`.
+    chosen: Option<(u16, u8)>,
+    /// The program carries audio, but none of it decodable.
+    unsupported_candidate: bool,
+    /// Every ES entry: `(pid, stream_type)`.
+    es: Vec<(u16, u8)>,
+}
+
+/// Select the audio ES to re-encode from a parsed PMT.
 ///
 /// `pinned_pid`:
 /// - `Some(pid)` — the operator pinned a specific source PID via
-///   `audio_encode.source_audio_pid`. Walk the PMT looking for that PID
-///   and return it (with its real stream_type) only if it carries a
-///   recognised audio codec. If the pinned PID is missing OR carries an
-///   unsupported codec, fall through to the first-match behaviour and
-///   the caller is expected to log a `audio_source_pid_not_found`
-///   warning event.
-/// - `None` — legacy first-match behaviour: lock onto the first audio
-///   ES whose stream_type is one of AAC(0x0F) / MPEG-1(0x03) /
-///   MPEG-2(0x04) / AC-3(0x81) / private(0x06).
-fn parse_pmt_audio(pkt: &[u8], pinned_pid: Option<u16>) -> Option<(u16, u8)> {
-    let mut offset = 4;
-    if ts_has_adaptation(pkt) {
-        let af_len = pkt[4] as usize;
-        offset = 5 + af_len;
-    }
-    if offset >= TS_PACKET_SIZE {
-        return None;
-    }
-
-    let pointer = pkt[offset] as usize;
-    offset += 1 + pointer;
-    if offset + 12 > TS_PACKET_SIZE || pkt[offset] != 0x02 {
-        return None;
-    }
-
-    let section_length = (((pkt[offset + 1] & 0x0F) as usize) << 8) | (pkt[offset + 2] as usize);
-    let program_info_length =
-        (((pkt[offset + 10] & 0x0F) as usize) << 8) | (pkt[offset + 11] as usize);
-    let data_start = offset + 12 + program_info_length;
-    let data_end = (offset + 3 + section_length)
-        .min(TS_PACKET_SIZE)
-        .saturating_sub(4);
-
-    // Walk one ES entry. Returns `(es_pid, Option<resolved_stream_type>,
-    // next_pos)` — `Some` when the entry is one we can decode (with
-    // DVB-style `0x06` resolved via [`resolve_private_audio_stream_type`]
-    // to the canonical AC-3 / E-AC-3 / AAC stream_type the rest of the
-    // replacer already handles), `None` for entries we should walk past
-    // (video, subtitles, unrecognised private streams). Returns the
-    // outer `None` when the table is malformed or we ran past the end.
-    let classify_entry = |pos: usize| -> Option<(u16, Option<u8>, usize)> {
-        if pos + 5 > data_end {
-            return None;
-        }
-        let st = pkt[pos];
-        let es_pid = ((pkt[pos + 1] as u16 & 0x1F) << 8) | pkt[pos + 2] as u16;
-        let es_info_len =
-            (((pkt[pos + 3] & 0x0F) as usize) << 8) | (pkt[pos + 4] as usize);
-        let next = pos + 5 + es_info_len;
-        if next > data_end {
-            return None;
-        }
-        let resolved_st = match st {
-            0x06 => resolve_private_audio_stream_type(
-                &pkt[pos + 5..pos + 5 + es_info_len],
-            ),
-            0x0F | 0x11 | 0x03 | 0x04 | 0x80 | 0x81 | 0x87 | 0xC1 | 0xC2 => Some(st),
-            _ => None,
-        };
-        Some((es_pid, resolved_st, next))
-    };
-
-    // First pass: when a PID is pinned, look for that exact PID.
-    if let Some(target) = pinned_pid {
-        let mut pos = data_start;
-        while let Some((es_pid, resolved_st, next)) = classify_entry(pos) {
-            if es_pid == target {
-                if let Some(st) = resolved_st {
-                    return Some((es_pid, st));
+///   `audio_encode.source_audio_pid`. Return it (with its resolved
+///   stream_type) when it carries a decodable codec. If the pinned PID is
+///   missing OR carries an unsupported codec, fall through to the
+///   first-match behaviour; the caller raises `audio_source_pid_not_found`.
+/// - `None` — first-match: the first ES that is decodable audio
+///   (AAC 0x0F / LATM 0x11, MPEG-1/2 0x03 / 0x04, AC-3 0x80 / 0x81 / 0xC1,
+///   E-AC-3 0x87 / 0xC2, or DVB-style 0x06 resolved by its descriptor).
+fn select_audio_es(view: &PmtView<'_>, pinned_pid: Option<u16>) -> AudioSelection {
+    let mut sel = AudioSelection::default();
+    let mut first: Option<(u16, u8)> = None;
+    let mut pinned_hit: Option<(u16, u8)> = None;
+    for es in &view.es {
+        sel.es.push((es.pid, es.stream_type));
+        match classify_audio_entry(es.stream_type, view.es_info(es)) {
+            AudioClass::Replaceable(st) => {
+                if first.is_none() {
+                    first = Some((es.pid, st));
                 }
-                // Pinned PID matched but its codec isn't one we can
-                // decode — drop out and let the first-match fallback
-                // pick a different audio PID.
-                break;
+                if pinned_pid == Some(es.pid) {
+                    pinned_hit = Some((es.pid, st));
+                }
             }
-            pos = next;
+            AudioClass::Unsupported => sel.unsupported_candidate = true,
+            AudioClass::NotAudio => {}
         }
-        // Pinned PID missing or wrong codec — fall through to first-match
-        // for graceful degradation. Caller emits the warning event.
     }
-
-    // Default: first audio ES with a recognised stream_type.
-    let mut pos = data_start;
-    while let Some((es_pid, resolved_st, next)) = classify_entry(pos) {
-        if let Some(st) = resolved_st {
-            return Some((es_pid, st));
-        }
-        pos = next;
-    }
-    None
-}
-
-/// Rewrite the audio stream_type in a PMT TS packet in place and
-/// recompute the section CRC32.
-///
-/// When `new_aac_profile_and_level` is `Some`, additionally walk the
-/// audio ES descriptor list and rewrite the body of any AAC descriptor
-/// (tag 0x7C, ETSI TS 101 154 Annex G) to that value. The audio
-/// re-encoder targets a fixed codec, but the source PMT's descriptor
-/// is inherited verbatim from the input — when those don't agree (e.g.
-/// source advertises HE-AAC but we re-encode to AAC-LC), strict
-/// broadcast decoders refuse the audio output. Callers pass `0xFE`
-/// ("no audio profile and level defined") to neutralise the descriptor;
-/// decoders then fall back to the ADTS sync header inside the ES.
-///
-/// ALSO: when transitioning to a new codec family, any inherited
-/// `registration_descriptor` (tag `0x05`) with a `format_identifier`
-/// that doesn't match the new stream_type is neutralised by zeroing
-/// the format_identifier bytes. Without this, strict decoders trust
-/// the registration descriptor (e.g. `"AC-3"`) over the rewritten
-/// stream_type byte and try to feed AAC bytes into the AC-3 decoder,
-/// producing `invalid bitstream id` errors and audible breakage.
-fn rewrite_pmt_audio_stream_type(
-    pkt: &mut [u8],
-    audio_pid: u16,
-    new_stream_type: u8,
-    new_aac_profile_and_level: Option<u8>,
-) {
-    let mut offset = 4;
-    if ts_has_adaptation(pkt) {
-        let af_len = pkt[4] as usize;
-        offset = 5 + af_len;
-    }
-    if offset >= TS_PACKET_SIZE {
-        return;
-    }
-
-    let pointer = pkt[offset] as usize;
-    offset += 1 + pointer;
-    if offset + 12 > TS_PACKET_SIZE || pkt[offset] != 0x02 {
-        return;
-    }
-
-    let section_start = offset;
-    let section_length =
-        (((pkt[offset + 1] & 0x0F) as usize) << 8) | (pkt[offset + 2] as usize);
-    let program_info_length =
-        (((pkt[offset + 10] & 0x0F) as usize) << 8) | (pkt[offset + 11] as usize);
-    let data_start = offset + 12 + program_info_length;
-    let data_end = (offset + 3 + section_length)
-        .min(TS_PACKET_SIZE)
-        .saturating_sub(4);
-
-    // The format_identifier expected for the rewritten stream_type.
-    // AC-3 = "AC-3", E-AC-3 = "EAC3"; AAC family + MP2 have no
-    // canonical registration_descriptor ident, so any inherited one is
-    // a mismatch and gets neutralised.
-    let expected_ident: Option<&[u8]> = match new_stream_type {
-        0x81 | 0x80 | 0xC1 => Some(b"AC-3"),
-        0x87 | 0xC2 => Some(b"EAC3"),
-        _ => None,
-    };
-
-    let mut pos = data_start;
-    while pos + 5 <= data_end {
-        let es_pid = ((pkt[pos + 1] as u16 & 0x1F) << 8) | pkt[pos + 2] as u16;
-        let es_info_len = (((pkt[pos + 3] & 0x0F) as usize) << 8) | (pkt[pos + 4] as usize);
-        if es_pid == audio_pid {
-            pkt[pos] = new_stream_type;
-            let desc_start = pos + 5;
-            let desc_end = (desc_start + es_info_len).min(data_end);
-            let mut dpos = desc_start;
-            while dpos + 2 <= desc_end {
-                let tag = pkt[dpos];
-                let dlen = pkt[dpos + 1] as usize;
-                if dpos + 2 + dlen > desc_end {
-                    break;
-                }
-                // AAC profile_and_level rewrite (tag 0x7C, AAC family
-                // descriptor — ETSI TS 101 154 Annex G).
-                if tag == 0x7C && dlen >= 1
-                    && let Some(pal) = new_aac_profile_and_level {
-                        pkt[dpos + 2] = pal;
-                    }
-                // registration_descriptor (tag 0x05) — neutralise
-                // when the inherited format_identifier doesn't match
-                // the rewritten stream_type. Zeroing the body keeps
-                // section_length / CRC offsets stable while making
-                // the descriptor effectively a no-op.
-                if tag == 0x05 && dlen >= 4 {
-                    let ident_matches = match expected_ident {
-                        Some(want) => &pkt[dpos + 2..dpos + 6] == want,
-                        None => false,
-                    };
-                    if !ident_matches {
-                        for b in dpos + 2..dpos + 2 + dlen {
-                            pkt[b] = 0;
-                        }
-                    }
-                }
-                dpos += 2 + dlen;
-            }
-        }
-        pos += 5 + es_info_len;
-    }
-
-    if let Some(crc_offset) = psi_crc_offset(section_start, section_length) {
-        let crc = mpeg2_crc32(&pkt[section_start..crc_offset]);
-        pkt[crc_offset] = (crc >> 24) as u8;
-        pkt[crc_offset + 1] = (crc >> 16) as u8;
-        pkt[crc_offset + 2] = (crc >> 8) as u8;
-        pkt[crc_offset + 3] = crc as u8;
-    }
+    sel.chosen = pinned_hit.or(first);
+    sel
 }
 
 /// Audio output PTS anchor target. **Always returns `src_pts`.**
@@ -2298,6 +2311,8 @@ fn packetize_ts(pid: u16, pes: &[u8], cc: &mut u8) -> Vec<[u8; 188]> {
 mod tests {
     use super::*;
     use crate::config::models::AudioEncodeConfig;
+    use crate::engine::ts_parse::mpeg2_crc32;
+    use crate::engine::ts_pmt_edit::is_pmt_for;
 
     fn enc(codec: &str) -> AudioEncodeConfig {
         AudioEncodeConfig {
@@ -2311,6 +2326,7 @@ mod tests {
             opus_dtx: false,
             opus_frame_duration_ms: None,
              source_audio_pid: None,
+             ts_signalling: None,
         }
     }
 
@@ -2446,6 +2462,14 @@ mod tests {
         pkt
     }
 
+    /// Packet-level wrapper over [`select_audio_es`] for the synth helpers:
+    /// locate the PMT section with the shared walker, parse, select.
+    fn parse_pmt_audio(pkt: &[u8], pinned: Option<u16>) -> Option<(u16, u8)> {
+        let s = crate::engine::ts_parse::find_section_in_packet(pkt, 0x02, None)?;
+        let view = parse_pmt(&pkt[s.start..s.end()])?;
+        select_audio_es(&view, pinned).chosen
+    }
+
     #[test]
     fn synth_pat_round_trips_through_parser() {
         let pkt = synth_pat(0x1000);
@@ -2579,7 +2603,7 @@ mod tests {
     /// audio. The replacer would otherwise try to decode raw Opus
     /// frames with the libavcodec AC-3 decoder. Note: Opus is the one
     /// codec whose downstream path *does* accept stream_type 0x06, but
-    /// only when routed there explicitly — `parse_pmt_audio` is the
+    /// only when routed there explicitly — `select_audio_es` is the
     /// re-encode gate and Opus isn't a re-encodable target on this
     /// MPEG-TS surface.
     #[test]
@@ -2841,11 +2865,13 @@ mod tests {
         assert_eq!(computed, stored, "CRC32 must match after descriptor rewrite");
     }
 
-    /// Re-encoding to a non-AAC target (MP2 / AC-3) must NOT touch the
-    /// AAC descriptor body — the descriptor is irrelevant to a non-AAC
-    /// stream_type but we still preserve the source bytes verbatim.
+    /// Re-encoding to a non-AAC target (MP2 / AC-3) must DROP the source's
+    /// AAC descriptor: a 0x7C on an MP2 or AC-3 ES is non-conformant
+    /// (EN 300 468 / TS 101 154). This test used to pin the stale
+    /// descriptor as intent. The source here is DVB-flavoured (0x7C), so
+    /// AC-3 goes out as 0x06 + "AC-3" registration + 0x6A.
     #[test]
-    fn pmt_aac_descriptor_left_alone_for_non_aac_target() {
+    fn pmt_aac_descriptor_dropped_for_non_aac_target() {
         let mut r = TsAudioReplacer::new(&enc("ac3"), None).unwrap();
         let mut out = Vec::new();
         r.process(&synth_pat(0x1000), &mut out);
@@ -2853,7 +2879,334 @@ mod tests {
         let pmt = synth_pmt_audio_with_aac_desc(0x1000, 0x0101, 0x0F, 0x51);
         r.process(&pmt, &mut out);
         assert_eq!(out.len(), 188);
-        assert_eq!(out[5 + 25], 0x51, "non-AAC target leaves descriptor body intact");
+        let s = crate::engine::ts_parse::find_section_in_packet(&out, 0x02, Some(1)).unwrap();
+        let sec = &out[s.start..s.end()];
+        assert_eq!(mpeg2_crc32(sec), 0, "CRC valid");
+        let v = parse_pmt(sec).unwrap();
+        assert_eq!(v.es[0].stream_type, 0x06);
+        let tags: Vec<u8> =
+            crate::engine::ts_pmt_edit::descriptors(v.es_info(&v.es[0])).map(|(t, _)| t).collect();
+        assert_eq!(tags, vec![0x0A, 0x05, 0x6A], "7C dropped; AC-3 registration + 6A added");
+
+        // MP2 target: 0x03, 7C gone, language kept.
+        let mut r = TsAudioReplacer::new(&enc("mp2"), None).unwrap();
+        let mut out = Vec::new();
+        r.process(&synth_pat(0x1000), &mut out);
+        out.clear();
+        r.process(&pmt, &mut out);
+        let s = crate::engine::ts_parse::find_section_in_packet(&out, 0x02, Some(1)).unwrap();
+        let v = parse_pmt(&out[s.start..s.end()]).unwrap();
+        assert_eq!(v.es[0].stream_type, 0x03);
+        let tags: Vec<u8> =
+            crate::engine::ts_pmt_edit::descriptors(v.es_info(&v.es[0])).map(|(t, _)| t).collect();
+        assert_eq!(tags, vec![0x0A]);
+    }
+
+    // ── multi-section / multi-packet PMT (defects 6 / 6c) ─────────────
+
+    use crate::engine::ts_test_fixtures::{
+        packetize_sections, pat_packet, pmt_section, two_packet_pmt, vh1_pat_packet,
+        vh1_pmt_packet, VH1_PMT_OFFSET, VH1_PROGRAM,
+    };
+
+    fn pmt_in(out: &[u8], program: u16) -> Vec<u8> {
+        let mut asm = crate::engine::ts_parse::SectionAssembler::new();
+        let mut found = None;
+        for p in out.chunks(TS_PACKET_SIZE) {
+            for sec in asm.feed(ts_pusi(p), &p[ts_payload_offset(p)..]) {
+                if is_pmt_for(sec, program) {
+                    found = Some(sec.to_vec());
+                }
+            }
+        }
+        found.expect("PMT in output")
+    }
+
+    #[test]
+    fn vh1_pmt_is_learned_and_rewritten_behind_the_private_section() {
+        // AAC target, pinned to the AC-3 audio 0x0E10 like the e2e run.
+        let mut cfg = enc("aac_lc");
+        cfg.source_audio_pid = Some(0x0E10);
+        let mut r = TsAudioReplacer::new(&cfg, None).unwrap();
+        let mut out = Vec::new();
+        r.process(&vh1_pat_packet(), &mut out);
+        out.clear();
+        let pmt = vh1_pmt_packet();
+        r.process(&pmt, &mut out);
+        assert_eq!(r.audio_pid, Some(0x0E10));
+        assert_eq!(r.source_stream_type, 0x81);
+        assert_eq!(out.len(), 188, "same packet count");
+        assert_eq!(&out[..VH1_PMT_OFFSET], &pmt[..VH1_PMT_OFFSET], "0xC0 section byte-identical");
+        assert!(crate::engine::ts_parse::verify_psi_crc(&out, VH1_PMT_OFFSET));
+        let v_out = pmt_in(&out, VH1_PROGRAM);
+        let v = parse_pmt(&v_out).unwrap();
+        let a = v.es.iter().find(|e| e.pid == 0x0E10).unwrap();
+        assert_eq!(a.stream_type, 0x0F);
+        // Every other ES entry untouched.
+        assert_eq!(v.es.len(), 6);
+    }
+
+    #[test]
+    fn target_in_the_second_packet_of_a_pmt_is_learned_and_crc_valid() {
+        let (sec, target) = two_packet_pmt(1, 4);
+        let pkts = packetize_sections(0x1000, &[&sec], 0);
+        let mut r = TsAudioReplacer::new(&enc("aac_lc"), None).unwrap();
+        let mut out = Vec::new();
+        r.process(&synth_pat(0x1000), &mut out);
+        out.clear();
+        for p in &pkts {
+            r.process(p, &mut out);
+        }
+        assert_eq!(r.audio_pid, Some(target), "ES beyond the first packet is found");
+        assert_eq!(out.len(), 2 * 188);
+        let got = pmt_in(&out, 1);
+        assert_eq!(mpeg2_crc32(&got), 0, "one valid-CRC section");
+        let v = parse_pmt(&got).unwrap();
+        assert_eq!(v.es.iter().find(|e| e.pid == target).unwrap().stream_type, 0x0F);
+        assert_eq!(out[3] & 0x0F, 0);
+        assert_eq!(out[188 + 3] & 0x0F, 1, "CC continuous");
+    }
+
+    #[test]
+    fn two_programs_sharing_a_pmt_pid_match_on_program_number() {
+        // Program 2's PMT first in the packet, program 1's second; the
+        // replacer follows the lowest program number from the PAT.
+        let p2 = pmt_section(2, 0, 0x200, &[], &[(0x03, 0x201, &[])]);
+        let p1 = pmt_section(1, 0, 0x100, &[], &[(0x0F, 0x101, &[])]);
+        let pkts = packetize_sections(0x1000, &[&p2, &p1], 0);
+        assert_eq!(pkts.len(), 1);
+        let mut r = TsAudioReplacer::new(&enc("mp2"), None).unwrap();
+        let mut out = Vec::new();
+        r.process(&pat_packet(&[(1, 0x1000), (2, 0x1000)], 0, 0), &mut out);
+        out.clear();
+        r.process(&pkts[0], &mut out);
+        assert_eq!(r.audio_pid, Some(0x101));
+        let untouched = pmt_in(&out, 2);
+        assert_eq!(untouched, p2, "the other program's PMT is byte-identical");
+    }
+
+    #[test]
+    fn output_version_tracks_source_content_without_a_reset() {
+        let mut r = TsAudioReplacer::new(&enc("aac_lc"), None).unwrap();
+        let mut out = Vec::new();
+        r.process(&synth_pat(0x1000), &mut out);
+        let v1 = pmt_section(1, 0, 0x101, &[], &[(0x0F, 0x101, &[])]);
+        let v2 = pmt_section(1, 1, 0x101, &[], &[(0x0F, 0x101, &[]), (0x06, 0x102, &[0x56, 0x00])]);
+        let mut versions = Vec::new();
+        for (i, sec) in [&v1, &v1, &v1, &v2, &v2].iter().enumerate() {
+            out.clear();
+            r.process(&packetize_sections(0x1000, &[sec], i as u8)[0], &mut out);
+            let got = pmt_in(&out, 1);
+            versions.push((got[5] >> 1) & 0x1F);
+        }
+        assert_eq!(versions[0], versions[2], "repeated PMT: constant version");
+        assert_ne!(versions[2], versions[3], "an added ES bumps the version");
+        assert_eq!(versions[3], versions[4]);
+    }
+
+    /// A PMT whose CRC does not verify is never learned from or rebuilt
+    /// (rebuilding would give the damaged bytes a fresh, valid CRC).
+    #[test]
+    fn a_damaged_pmt_is_neither_learned_nor_rebuilt() {
+        let mut r = TsAudioReplacer::new(&enc("mp2"), None).unwrap();
+        let mut out = Vec::new();
+        r.process(&synth_pat(0x1000), &mut out);
+        out.clear();
+        let mut pmt = synth_pmt_audio(0x1000, 0x0101, 0x0F);
+        pmt[5 + 14] ^= 0x01; // flip a bit of the audio PID
+        r.process(&pmt, &mut out);
+        assert_eq!(r.audio_pid, None);
+        assert_eq!(out, pmt.to_vec(), "passed through untouched");
+    }
+
+    /// An input switch bumps the output version even when the rebuilt PMT
+    /// is byte-identical, so a receiver that cached the previous source's
+    /// PMT re-parses after an `A → B → A` round trip.
+    #[test]
+    fn an_input_switch_bumps_the_output_version() {
+        let mut r = TsAudioReplacer::new(&enc("aac_lc"), None).unwrap();
+        let mut out = Vec::new();
+        r.process(&synth_pat(0x1000), &mut out);
+        out.clear();
+        r.process(&synth_pmt_audio(0x1000, 0x0101, 0x0F), &mut out);
+        let v1 = (pmt_in(&out, 1)[5] >> 1) & 0x1F;
+        r.external_reset_handle().store(true, Ordering::Relaxed);
+        out.clear();
+        let mut pmt = synth_pmt_audio(0x1000, 0x0101, 0x0F);
+        pmt[3] = 0x11;
+        r.process(&pmt, &mut out);
+        let v2 = (pmt_in(&out, 1)[5] >> 1) & 0x1F;
+        assert_ne!(v1, v2);
+    }
+
+    #[test]
+    fn flavour_is_latched_across_a_dvb_to_atsc_switch() {
+        let mut r = TsAudioReplacer::new(&enc("ac3"), None).unwrap();
+        let mut out = Vec::new();
+        r.process(&synth_pat(0x1000), &mut out);
+        // DVB source first (0x7C on the AAC ES).
+        out.clear();
+        r.process(&synth_pmt_audio_with_aac_desc(0x1000, 0x0101, 0x0F, 0x51), &mut out);
+        assert_eq!(parse_pmt(&pmt_in(&out, 1)).unwrap().es[0].stream_type, 0x06);
+        // Switch to an ATSC-looking input: signalling must not flip.
+        r.external_reset_handle().store(true, Ordering::Relaxed);
+        out.clear();
+        r.process(&synth_pmt_audio(0x1000, 0x0101, 0x81), &mut out);
+        assert_eq!(parse_pmt(&pmt_in(&out, 1)).unwrap().es[0].stream_type, 0x06);
+    }
+
+    /// A DVB-flavoured AC-3 output (0x06 + "AC-3" + 0x6A) of an ingress
+    /// transcode becomes the flow's broadcast: the shared demuxer must still
+    /// lock it as AC-3 and surface its PES as `OtherAudio { 0x81 }` — the arm
+    /// `replay::export_mp4` builds its AC-3 track from, and the one the
+    /// display / RTMP / WebRTC paths decode.
+    #[test]
+    fn dvb_flavoured_ac3_output_demuxes_as_ac3() {
+        use crate::engine::ts_demux::{DemuxedFrame, TsDemuxer};
+        let mut r = TsAudioReplacer::new(&enc("ac3"), None).unwrap();
+        let mut out = Vec::new();
+        r.process(&synth_pat(0x1000), &mut out);
+        out.clear();
+        r.process(&synth_pmt_audio_with_aac_desc(0x1000, 0x0101, 0x0F, 0x51), &mut out);
+        assert_eq!(parse_pmt(&pmt_in(&out, 1)).unwrap().es[0].stream_type, 0x06);
+        let mut demux = TsDemuxer::new(None);
+        demux.demux(&synth_pat(0x1000));
+        demux.demux(&out);
+        assert_eq!(demux.audio_pid(), Some(0x0101));
+        let pes = build_audio_pes(&[0x0B, 0x77, 1, 2, 3, 4, 5, 6], 90_000);
+        let mut cc = 0u8;
+        let mut frames = Vec::new();
+        for _ in 0..2 {
+            for p in packetize_ts(0x0101, &pes, &mut cc) {
+                frames.extend(demux.demux(&p));
+            }
+        }
+        assert!(
+            frames.iter().any(|f| matches!(f, DemuxedFrame::OtherAudio { stream_type: 0x81, .. })),
+            "AC-3 PES surfaced on the 0x81 arm"
+        );
+    }
+
+    #[test]
+    fn ts_signalling_override_pins_the_flavour() {
+        let mut cfg = enc("ac3");
+        cfg.ts_signalling = Some(crate::config::models::TsAudioSignalling::Atsc);
+        let mut r = TsAudioReplacer::new(&cfg, None).unwrap();
+        let mut out = Vec::new();
+        r.process(&synth_pat(0x1000), &mut out);
+        out.clear();
+        r.process(&synth_pmt_audio_with_aac_desc(0x1000, 0x0101, 0x0F, 0x51), &mut out);
+        let got = pmt_in(&out, 1);
+        let v = parse_pmt(&got).unwrap();
+        assert_eq!(v.es[0].stream_type, 0x81);
+        let tags: Vec<u8> =
+            crate::engine::ts_pmt_edit::descriptors(v.es_info(&v.es[0])).map(|(t, _)| t).collect();
+        assert_eq!(tags, vec![0x0A, 0x05]);
+    }
+
+    // ── engage watchdog (defect 6b) ──
+
+    fn future(secs: u64) -> std::time::Instant {
+        std::time::Instant::now() + std::time::Duration::from_secs(secs)
+    }
+
+    #[test]
+    fn dts_only_program_raises_codec_not_replaceable_once() {
+        let mut r = TsAudioReplacer::new(&enc("aac_lc"), None).unwrap();
+        let (tx, mut rx) = crate::manager::events::event_channel();
+        r.set_event_watchdog(tx, "out-1", false);
+        let dts = pmt_section(1, 0, 0x100, &[], &[(0x1B, 0x100, &[]), (0x06, 0x101, &[0x7B, 0x00])]);
+        let mut out = Vec::new();
+        for i in 0..12u8 {
+            r.process(&synth_pat(0x1000), &mut out);
+            r.process(&packetize_sections(0x1000, &[&dts], i)[0], &mut out);
+        }
+        assert!(r.audio_pid.is_none());
+        match r.poll_engage(future(6)) {
+            Some(EngageEvent::NotFound { reason, .. }) => {
+                assert_eq!(reason.as_str(), "codec_not_replaceable")
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(r.poll_engage(future(30)).is_none(), "exactly once");
+        let ev = rx.try_recv().expect("event emitted");
+        assert_eq!(ev.output_id.as_deref(), Some("out-1"));
+        assert_eq!(ev.details.unwrap()["error_code"], "audio_transcode_source_not_found");
+    }
+
+    /// A PMT PID that carries only a user-private table (what the replacer
+    /// saw on VH1 before the section walker): reason `pmt_not_parsed`, with
+    /// the table it did find.
+    #[test]
+    fn a_pmt_pid_without_a_pmt_raises_pmt_not_parsed() {
+        let mut r = TsAudioReplacer::new(&enc("aac_lc"), None).unwrap();
+        let c0 = [0xC0u8, 0x00, 0x05, 1, 2, 3, 4, 5];
+        let mut out = Vec::new();
+        for i in 0..12u8 {
+            r.process(&synth_pat(0x1000), &mut out);
+            r.process(&packetize_sections(0x1000, &[&c0], i)[0], &mut out);
+        }
+        match r.poll_engage(future(6)) {
+            Some(EngageEvent::NotFound { reason, details }) => {
+                assert_eq!(reason.as_str(), "pmt_not_parsed");
+                assert_eq!(details["first_table_id"], 0xC0);
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// No PAT at all: nothing fires until 10 s and 1000 packets.
+    #[test]
+    fn a_stream_without_a_pat_raises_no_pat() {
+        let mut r = TsAudioReplacer::new(&enc("aac_lc"), None).unwrap();
+        let mut es = [0xFFu8; TS_PACKET_SIZE];
+        es[0] = TS_SYNC_BYTE;
+        es[1] = 0x01;
+        es[2] = 0x00;
+        es[3] = 0x10;
+        let chunk: Vec<u8> = std::iter::repeat_n(es, 100).flatten().collect();
+        let mut out = Vec::new();
+        for _ in 0..11 {
+            r.process(&chunk, &mut out);
+        }
+        assert!(r.poll_engage(future(6)).is_none(), "5 s is not enough without PMT evidence");
+        match r.poll_engage(future(11)) {
+            Some(EngageEvent::NotFound { reason, .. }) => assert_eq!(reason.as_str(), "no_pat"),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_normal_pmt_raises_nothing() {
+        let mut r = TsAudioReplacer::new(&enc("aac_lc"), None).unwrap();
+        let mut out = Vec::new();
+        for i in 0..12u8 {
+            r.process(&synth_pat(0x1000), &mut out);
+            let mut pmt = synth_pmt_audio(0x1000, 0x0101, 0x0F);
+            pmt[3] = 0x10 | (i & 0x0F);
+            r.process(&pmt, &mut out);
+        }
+        assert!(r.poll_engage(future(60)).is_none());
+    }
+
+    #[test]
+    fn a_pinned_but_absent_pid_warns_without_the_timer() {
+        let mut cfg = enc("aac_lc");
+        cfg.source_audio_pid = Some(0x0999);
+        let mut r = TsAudioReplacer::new(&cfg, None).unwrap();
+        let (tx, mut rx) = crate::manager::events::event_channel();
+        r.set_event_watchdog(tx, "in-1", true);
+        let mut out = Vec::new();
+        r.process(&synth_pat(0x1000), &mut out);
+        r.process(&synth_pmt_audio(0x1000, 0x0101, 0x0F), &mut out);
+        let ev = rx.try_recv().expect("pinned warning emitted at parse time");
+        assert_eq!(ev.input_id.as_deref(), Some("in-1"));
+        assert_eq!(ev.details.unwrap()["error_code"], "audio_source_pid_not_found");
+        // Deduped: the same (pinned, actual) pair does not warn again.
+        let mut pmt = synth_pmt_audio(0x1000, 0x0101, 0x0F);
+        pmt[3] = 0x11;
+        r.process(&pmt, &mut out);
+        assert!(rx.try_recv().is_err());
     }
 
     // ── PTS sample-anchor regression tests ──

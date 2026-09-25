@@ -606,6 +606,7 @@ mod tests {
             opus_dtx: false,
             opus_frame_duration_ms: None,
              source_audio_pid: None,
+             ts_signalling: None,
         };
         let err = match PcmInputProcessor::new(48_000, 24, 2, Some(&tj), Some(&ae), 0, 0, 0) {
             Err(e) => e,
@@ -630,6 +631,7 @@ mod tests {
             opus_dtx: false,
             opus_frame_duration_ms: None,
              source_audio_pid: None,
+             ts_signalling: None,
         };
         let err = match PcmInputProcessor::new(48_000, 24, 2, None, Some(&ae), 0, 0, 0) {
             Err(e) => e,
@@ -654,6 +656,7 @@ mod tests {
             opus_dtx: false,
             opus_frame_duration_ms: None,
              source_audio_pid: None,
+             ts_signalling: None,
         };
         let p = PcmInputProcessor::new(48_000, 24, 2, None, Some(&ae), 0, 0, 0)
             .expect("construct")
@@ -674,6 +677,7 @@ mod tests {
             opus_dtx: false,
             opus_frame_duration_ms: None,
              source_audio_pid: None,
+             ts_signalling: None,
         };
         let err = match PcmInputProcessor::new(48_000, 24, 2, None, Some(&ae), 0, 0, 0) {
             Err(e) => e,

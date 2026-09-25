@@ -216,18 +216,30 @@ impl InputTranscoder {
         }
     }
 
-    /// Wire the decode-stall watchdog onto the inner video replacer so an
-    /// ingress video transcode whose decoder consumes input but produces no
-    /// frames surfaces a one-shot `video_transcode_decode_stalled` Warning
-    /// (input-scoped) instead of silently shipping audio-only TS — the field
-    /// report's `media_player` input + `video_encode` QSV-decode-fails case.
-    /// No-op when this input has no video stage. Mirrors the output-side wiring
-    /// in `transcode_chain::build_for_output`.
+    /// Wire the event watchdogs (all input-scoped) onto both stages:
+    ///
+    /// - the video replacer's decode-stall watchdog, so an ingress video
+    ///   transcode whose decoder consumes input but produces no frames
+    ///   surfaces a one-shot `video_transcode_decode_stalled` Warning instead
+    ///   of silently shipping audio-only TS — the field report's
+    ///   `media_player` input + `video_encode` QSV-decode-fails case — and
+    ///   its engage watchdog (`video_transcode_source_not_found` / `_found`,
+    ///   `video_source_pid_not_found`);
+    /// - the audio replacer's engage watchdog
+    ///   (`audio_transcode_source_not_found` / `_found`,
+    ///   `audio_source_pid_not_found`).
+    ///
+    /// Each is a no-op when the stage is absent. Mirrors the output-side
+    /// wiring in `transcode_chain::build_for_output`.
     pub fn set_decode_stall_watchdog(
         &mut self,
         event_sender: crate::manager::events::EventSender,
         input_id: impl Into<String>,
     ) {
+        let input_id = input_id.into();
+        if let Some(a) = self.audio.as_mut() {
+            a.set_event_watchdog(event_sender.clone(), input_id.clone(), true);
+        }
         if let Some(v) = self.video.as_mut() {
             v.set_decode_stall_watchdog_input(event_sender, input_id);
         }
@@ -749,6 +761,7 @@ mod tests {
             opus_dtx: false,
             opus_frame_duration_ms: None,
              source_audio_pid: None,
+             ts_signalling: None,
         };
         let mut t = InputTranscoder::new(Some(&ae), None, None, None)
             .expect("construct")
@@ -795,6 +808,7 @@ mod tests {
             opus_dtx: false,
             opus_frame_duration_ms: None,
             source_audio_pid: None,
+            ts_signalling: None,
         };
         let mut overrides = TsPidOverridesMap::new();
         overrides.insert(

@@ -82,8 +82,12 @@ struct PidCcState {
 struct InputPsiCache {
     /// Cached latest PAT packet (188 bytes) from this input.
     cached_pat: Option<[u8; TS_PACKET_SIZE]>,
-    /// Cached latest PMT packets keyed by PMT PID from this input.
-    cached_pmts: HashMap<u16, [u8; TS_PACKET_SIZE]>,
+    /// Cached latest complete PMT-PID unit (every packet of it — a PMT may
+    /// span packets) keyed by PMT PID from this input.
+    cached_pmts: HashMap<u16, Vec<[u8; TS_PACKET_SIZE]>>,
+    /// Unit being collected per PMT PID, and the assembler that says when
+    /// no section is in flight any more (the unit is complete).
+    pmt_pending: HashMap<u16, (SectionAssembler, Vec<[u8; TS_PACKET_SIZE]>)>,
     /// PMT PIDs discovered from this input's most recent PAT.
     pmt_pids: HashSet<u16>,
 }
@@ -93,6 +97,7 @@ impl InputPsiCache {
         Self {
             cached_pat: None,
             cached_pmts: HashMap::new(),
+            pmt_pending: HashMap::new(),
             pmt_pids: HashSet::new(),
         }
     }
@@ -110,11 +115,26 @@ impl InputPsiCache {
             let pmt_pids: HashSet<u16> = parse_pat_pmt_pids(pkt).into_iter().collect();
             // Remove stale PMT cache entries for PIDs no longer in the PAT.
             self.cached_pmts.retain(|k, _| pmt_pids.contains(k));
+            self.pmt_pending.retain(|k, _| pmt_pids.contains(k));
             self.pmt_pids = pmt_pids;
-        } else if self.pmt_pids.contains(&pid) && ts_pusi(pkt) {
+        } else if self.pmt_pids.contains(&pid) {
+            // Collect the whole unit: a PMT that spans packets is only
+            // useful to inject complete.
+            let (asm, pending) = self.pmt_pending.entry(pid).or_default();
+            if ts_pusi(pkt) {
+                pending.clear();
+            } else if pending.is_empty() {
+                return; // joined mid-unit
+            }
             let mut cached = [0u8; TS_PACKET_SIZE];
             cached.copy_from_slice(pkt);
-            self.cached_pmts.insert(pid, cached);
+            pending.push(cached);
+            let _ = asm.push_packet(pkt).count();
+            if !asm.in_flight() {
+                self.cached_pmts.insert(pid, std::mem::take(pending));
+            } else if pending.len() > 32 {
+                pending.clear();
+            }
         }
     }
 }
@@ -246,8 +266,11 @@ impl TsContinuityFixer {
                 sender_timestamp_us: None,
             });
         }
-        for mut pmt in cache.cached_pmts.values().copied() {
-            set_psi_version(&mut pmt, stamp);
+        for pmt in cache
+            .cached_pmts
+            .values()
+            .flat_map(|unit| super::ts_pmt_edit::restamp_pmt_unit(unit, stamp))
+        {
             out.push(RtpPacket {
                 data: Bytes::copy_from_slice(&pmt),
                 sequence_number: 0,
@@ -345,7 +368,7 @@ impl TsContinuityFixer {
         let (cached_pat, cached_pmts) = match self.input_psi.get(new_input_id) {
             Some(psi) => (
                 psi.cached_pat,
-                psi.cached_pmts.values().copied().collect::<Vec<_>>(),
+                psi.cached_pmts.values().cloned().collect::<Vec<_>>(),
             ),
             None => {
                 tracing::warn!(
@@ -381,8 +404,10 @@ impl TsContinuityFixer {
         }
 
         // Inject PMTs from the new input's cache with the same stamp.
-        for mut pmt in cached_pmts {
-            set_psi_version(&mut pmt, stamp);
+        for pmt in cached_pmts
+            .iter()
+            .flat_map(|unit| super::ts_pmt_edit::restamp_pmt_unit(unit, stamp))
+        {
             injected.push(RtpPacket {
                 data: Bytes::copy_from_slice(&pmt),
                 sequence_number: 0,
@@ -677,6 +702,55 @@ mod tests {
     }
 
     // ── Tests ───────────────────────────────────────────────────────────
+
+    /// A PMT spanning two packets is cached as a whole unit and injected
+    /// complete, with the monotonic version stamped into the section (whose
+    /// CRC lives in the second packet) — it used to inject the first packet
+    /// alone, which no receiver can use.
+    #[test]
+    fn on_switch_injects_a_two_packet_pmt_whole_and_stamped() {
+        use crate::engine::ts_test_fixtures::{packetize_sections, pat_packet, two_packet_pmt};
+        let (sec, _) = two_packet_pmt(1, 0);
+        let pmt = packetize_sections(0x40, &[&sec], 0);
+        let mut data = pat_packet(&[(1, 0x40)], 0, 0).to_vec();
+        data.extend_from_slice(&pmt[0]);
+        data.extend_from_slice(&pmt[1]);
+        let mut fixer = TsContinuityFixer::new();
+        fixer.observe_passive("b", &make_rtp_packet(&data));
+        let injected = fixer.on_switch("b");
+        assert_eq!(injected.len(), 3, "PAT + both PMT packets");
+        let mut asm = SectionAssembler::new();
+        let mut secs = Vec::new();
+        for p in &injected[1..] {
+            secs.extend(asm.push_packet(&p.data).map(|s| s.to_vec()));
+        }
+        assert_eq!(secs.len(), 1);
+        assert_eq!((secs[0][5] >> 1) & 0x1F, 1, "stamped");
+        assert_eq!(mpeg2_crc32(&secs[0]), 0, "valid CRC");
+    }
+
+    /// VH1.ts: the pointer target on the PMT PID is a short-form 0xC0
+    /// section; the PMT sits at offset 29. The phantom PMT injected on a
+    /// switch used to be "stamped" at the pointer target — a data byte and
+    /// the last four bytes of the 0xC0 table overwritten, the real PMT's
+    /// version never bumped, defeating the re-parse the fixer exists for.
+    #[test]
+    fn on_switch_stamps_the_pmt_behind_a_private_section() {
+        use crate::engine::ts_test_fixtures::{vh1_pat_packet, vh1_pmt_packet, VH1_PMT_OFFSET};
+        let mut fixer = TsContinuityFixer::new();
+        let pmt = vh1_pmt_packet();
+        let mut data = vh1_pat_packet().to_vec();
+        data.extend_from_slice(&pmt);
+        fixer.observe_passive("b", &make_rtp_packet(&data));
+        let injected = fixer.on_switch("b");
+        assert_eq!(injected.len(), 2);
+        let out = &injected[1].data;
+        assert_eq!(&out[..VH1_PMT_OFFSET], &pmt[..VH1_PMT_OFFSET], "0xC0 section untouched");
+        let old_v = (pmt[VH1_PMT_OFFSET + 5] >> 1) & 0x1F;
+        let new_v = (out[VH1_PMT_OFFSET + 5] >> 1) & 0x1F;
+        assert_eq!(new_v, 1, "monotonic stamp (was {old_v})");
+        assert!(verify_psi_crc(out, VH1_PMT_OFFSET), "PMT CRC valid");
+    }
 
     #[test]
     fn no_switch_returns_none() {

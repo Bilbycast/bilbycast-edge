@@ -9,10 +9,14 @@
 //! feature-gated `VideoEncoder` backend (libx264 / libx265 / NVENC), and
 //! muxes the result back into the output TS:
 //!
-//! - PAT is observed to learn `pmt_pid`.
-//! - PMT is observed to learn `video_pid` + source `stream_type`.
-//! - PMT is rewritten in-place when the target codec family differs
-//!   from the source (H.264 ↔ HEVC), with a recomputed CRC32.
+//! - PAT is observed to learn `pmt_pid` and the program_number.
+//! - Every PMT-PID packet goes through the reassembling
+//!   `ts_pmt_edit::PsiUnitStage`; the program's PMT section (found by
+//!   program_number, wherever it sits in the unit) teaches `video_pid` +
+//!   source `stream_type`.
+//! - That PMT is rebuilt: target stream_type, `PCR_PID` = video PID, the
+//!   video descriptor policy, a content-tracked version and a valid CRC —
+//!   also when the PMT spans packets.
 //! - Video PID packets are buffered into PES, flushed on each PUSI,
 //!   fed to the decoder, the resulting frames go through the encoder,
 //!   and the encoded bitstream is repacketized as fresh TS.
@@ -43,9 +47,8 @@ use std::sync::Arc;
 use crate::config::models::VideoEncodeConfig;
 
 use super::ts_parse::{
-    extract_pes_pts, mpeg2_crc32, parse_pat_programs, psi_crc_offset, ts_has_adaptation,
-    ts_has_payload,
-    ts_payload_offset, ts_pid, ts_pusi, PAT_PID, TS_PACKET_SIZE, TS_SYNC_BYTE,
+    extract_pes_pts, parse_pat_programs, ts_has_payload, ts_payload_offset, ts_pid, ts_pusi,
+    PAT_PID, TS_PACKET_SIZE, TS_SYNC_BYTE,
 };
 
 /// PCR pre-roll behind PTS in 27 MHz ticks (80 ms × 27 000 000 / 1000).
@@ -431,6 +434,11 @@ impl TsVideoReplacer {
 #[cfg(feature = "media-codecs")]
 mod inner {
     use super::*;
+    use crate::engine::transcode_engage::{EngageEvent, TranscodeEngageWatch, TranscodeKind};
+    use crate::engine::ts_pmt_edit::{
+        parse_pmt, pmt_index, rebuild_pmt_section, EsEdit, OutVersion, PmtEdit, PsiUnit,
+        PsiUnitStage,
+    };
     use crate::engine::video_encode_util::ScaledVideoEncoder;
     use video_codec::{VideoCodec, VideoEncoderCodec};
     use video_engine::VideoDecoder;
@@ -529,6 +537,16 @@ mod inner {
         fps_den: Option<u32>,
 
         pmt_pid: Option<u16>,
+        /// program_number of the program the replacer follows (the lowest
+        /// in the PAT). PMT sections are matched on it.
+        program_number: Option<u16>,
+        /// The PAT maps another program to the same PMT PID.
+        pmt_pid_shared: bool,
+        /// Reassembling PMT-PID stage — see `ts_pmt_edit::PsiUnitStage`.
+        pmt_stage: PsiUnitStage,
+        /// "Configured but never engaged" watchdog
+        /// (`video_transcode_source_*`).
+        engage: TranscodeEngageWatch,
         video_pid: Option<u16>,
         /// Operator-pinned source video PID (`video_encode.source_video_pid`).
         /// When `Some`, PMT discovery looks for this PID specifically; when
@@ -700,18 +718,13 @@ mod inner {
         pub input_decode_handle:
             Option<Arc<crate::stats::collector::VideoDecodeStatsHandle>>,
 
-        /// Monotonic 5-bit PMT version counter for the rewritten PMT.
-        /// Initialized at 1; bumped (mod 32) every time we run
-        /// `reset_source_state()` (codec change, PID change, or external
-        /// input switch). Stamped onto every emitted PMT via
-        /// [`crate::engine::ts_parse::set_psi_version`] so receivers
-        /// always see a different version when the rewrite changes
-        /// stream_type — without it, an `A → B → A` round-trip leaves
-        /// receivers' cached PMT pointing at the wrong codec because
-        /// the source's natural version is identical across the round
-        /// trip. Mirrors the pattern in
-        /// `TsContinuityFixer::next_psi_version`.
-        out_psi_version: u8,
+        /// Output PMT `version_number`, derived from content: bumps when
+        /// the rebuilt PMT differs from the last one — including when the
+        /// audio replacer ahead of this stage changed its stream_type, so
+        /// chained stages compose instead of this one re-stamping over the
+        /// audio stage's bump — and on every `reset_source_state()`;
+        /// otherwise holds, so an unchanged PMT never flaps.
+        pmt_version: OutVersion,
     }
 
     impl Inner {
@@ -795,6 +808,10 @@ mod inner {
                 fps_num: cfg.fps_num,
                 fps_den: cfg.fps_den,
                 pmt_pid: None,
+                program_number: None,
+                pmt_pid_shared: false,
+                pmt_stage: PsiUnitStage::new("ts_video_replace"),
+                engage: TranscodeEngageWatch::new(TranscodeKind::Video, source_video_pid_pin),
                 video_pid: None,
                 source_video_pid_pin,
                 last_pinned_warn: None,
@@ -829,7 +846,7 @@ mod inner {
                 audio_pids: std::collections::HashSet::new(),
                 passthrough_audio_pts: 0,
                 input_decode_handle: None,
-                out_psi_version: 1,
+                pmt_version: OutVersion::new(),
                 event_sender: None,
                 output_id: String::new(),
                 decode_stall_input_scope: false,
@@ -901,11 +918,12 @@ mod inner {
             // get a clean entry point right at the switch boundary.
             self.force_idr.store(true, Ordering::Relaxed);
             // Bump the rewritten-PMT version (mod 32) so receivers see a
-            // distinct version on the next PMT and re-parse — without
-            // this, `A → B → A` round-trips leave the receiver's cached
-            // PMT pointing at B's codec when A was already the cached
-            // version_number. Mirrors `TsContinuityFixer::on_switch`.
-            self.out_psi_version = (self.out_psi_version.wrapping_add(1)) & 0x1F;
+            // distinct version on the next PMT and re-parse. Content
+            // changes bump on their own; this covers a reset whose PMT is
+            // byte-identical to the previous source's.
+            self.pmt_version.bump();
+            // A new source gets a fresh engage window.
+            self.engage.on_reset();
         }
 
         pub fn process(&mut self, input_ts: &[u8], output: &mut Vec<u8>) {
@@ -943,8 +961,13 @@ mod inner {
                     let mut programs = parse_pat_programs(pkt);
                     if !programs.is_empty() {
                         programs.sort_by_key(|(num, _)| *num);
-                        let new_pmt_pid = programs[0].1;
-                        if self.pmt_pid != Some(new_pmt_pid) {
+                        let (new_program, new_pmt_pid) = programs[0];
+                    self.pmt_pid_shared =
+                        programs.iter().filter(|(_, p)| *p == new_pmt_pid).count() > 1;
+                        self.engage.note_pat(new_program, new_pmt_pid);
+                        if self.pmt_pid != Some(new_pmt_pid)
+                            || self.program_number != Some(new_program)
+                        {
                             if self.pmt_pid.is_some() {
                                 // Input switched and chose a different PMT
                                 // PID — anything cached about the old
@@ -953,99 +976,30 @@ mod inner {
                                 self.source_stream_type = 0;
                                 self.reset_source_state("PMT PID changed");
                             }
+                            if self.pmt_pid != Some(new_pmt_pid) {
+                                self.pmt_stage = PsiUnitStage::new("ts_video_replace");
+                            }
                             self.pmt_pid = Some(new_pmt_pid);
+                            self.program_number = Some(new_program);
                         }
                     }
                 }
 
-                if let Some(pmt_pid) = self.pmt_pid
-                    && pid == pmt_pid && ts_pusi(pkt) {
-                        // Learn the audio PIDs so the PCR can be floored on
-                        // PASSTHROUGH audio when this is a video-only transcode.
-                        if let Ok(arr) = <&[u8; TS_PACKET_SIZE]>::try_from(pkt) {
-                            crate::engine::input_media_player::refresh_audio_pids_from_pmt(
-                                arr,
-                                &mut self.audio_pids,
-                            );
-                        }
-                        if let Some((vpid, vst)) = parse_pmt_video(pkt, self.source_video_pid_pin) {
-                            // Operator-pinned PID not in PMT — warn
-                            // once per distinct (pinned, actual) pair.
-                            // De-duplication clears when the pin reappears.
-                            if let Some(pin) = self.source_video_pid_pin {
-                                if pin != vpid && self.last_pinned_warn != Some((pin, vpid)) {
-                                    tracing::warn!(
-                                        error_code = "video_source_pid_not_found",
-                                        pinned_pid = format!("0x{pin:04X}"),
-                                        actual_pid = format!("0x{vpid:04X}"),
-                                        actual_stream_type = format!("0x{vst:02X}"),
-                                        "video_encode.source_video_pid pin not present in PMT — falling back to first-matching-codec video (pinned 0x{pin:04X} → actual 0x{vpid:04X})"
-                                    );
-                                    self.last_pinned_warn = Some((pin, vpid));
-                                } else if pin == vpid && self.last_pinned_warn.is_some() {
-                                    self.last_pinned_warn = None;
-                                }
-                            }
-                            let codec_changed =
-                                self.source_stream_type != 0 && self.source_stream_type != vst;
-                            let pid_changed =
-                                self.video_pid.is_some() && self.video_pid != Some(vpid);
-                            if codec_changed || pid_changed {
-                                self.reset_source_state(&format!(
-                                    "source changed: stream_type {:#04x} -> {:#04x}, pid {:?} -> {}",
-                                    self.source_stream_type, vst, self.video_pid, vpid
-                                ));
-                            }
-                            self.video_pid = Some(vpid);
-                            self.source_stream_type = vst;
-                            // Surface for stats / UI badge: which source PID
-                            // is the transcoder actually transcoding?
-                            // Updated on every PMT discovery so input swaps
-                            // (re-discovery on a different PID) are visible
-                            // immediately on the next snapshot.
-                            self.stats.source_pid.store(vpid, Ordering::Relaxed);
-                            self.stats.source_stream_type.store(vst, Ordering::Relaxed);
-                            // Refresh the input-side video_decode_stats
-                            // handle's codec label so the manager's
-                            // inputs-live snapshot flips from the empty
-                            // placeholder to e.g. "H.264" / "HEVC". No-op
-                            // on output-side replacers (no handle).
-                            self.refresh_input_decode_label();
-                        }
-                        // Always run the PMT rewrite once we know the video
-                        // PID — the rewrite enforces both the target
-                        // stream_type AND PCR_PID = video_pid. When the
-                        // source PMT already matches both, the byte-level
-                        // edit and CRC recompute produce an output PMT
-                        // identical to the input, so receivers see no
-                        // version flap. When either differs, the rewrite
-                        // is required (e.g. H.264 → HEVC needs the new
-                        // stream_type, and any source whose PMT pointed
-                        // PCR_PID at a separate dedicated PCR PID needs
-                        // PCR_PID re-pointed at the rebuilt video PID).
-                        if let Some(video_pid) = self.video_pid {
-                            let mut rewritten = pkt.to_vec();
-                            rewrite_pmt_video_stream_type(
-                                &mut rewritten,
-                                video_pid,
-                                self.target_stream_type,
-                            );
-                            // Stamp the per-replacer monotonic version so
-                            // receivers re-parse on every codec change.
-                            // `set_psi_version` is a no-op on PUSI=0, which
-                            // is fine here because we only land in this
-                            // branch on PUSI PMT packets; CRC is recomputed
-                            // by the same call.
-                            crate::engine::ts_parse::set_psi_version(
-                                &mut rewritten,
-                                self.out_psi_version,
-                            );
-                            output.extend_from_slice(&rewritten);
-                        } else {
-                            output.extend_from_slice(pkt);
-                        }
-                        continue;
+                // Every packet on the PMT PID goes through the reassembling
+                // stage; a complete unit is inspected and, once the video
+                // PID is known, the program's PMT is rebuilt (target
+                // stream_type, video descriptor policy, PCR_PID = video PID,
+                // content-tracked version). Other sections on the PID stay
+                // byte-identical.
+                if Some(pid) == self.pmt_pid {
+                    if ts_pusi(pkt) {
+                        self.engage.note_pmt_pusi();
                     }
+                    if let Some(unit) = self.pmt_stage.push(pkt, output) {
+                        self.handle_pmt_unit(unit, output);
+                    }
+                    continue;
+                }
 
                 if Some(pid) == self.video_pid {
                     self.feed_video_packet(pkt, output);
@@ -1066,6 +1020,138 @@ mod inner {
             // consumes input but never produces frames (decode_errors
             // saturating, or a broken HW decode backend on this host).
             self.check_decode_stall();
+            // ...and the silent "never engaged" one: no video PID learned
+            // at all, so the decoder never even sees input.
+            self.engage.note_packets((input_ts.len() / TS_PACKET_SIZE) as u64);
+            self.poll_engage(std::time::Instant::now());
+        }
+
+        /// Advance the engage watchdog and emit whatever it raises (on the
+        /// decode-stall watchdog's sender, with the same scoping). Returns
+        /// the event for tests.
+        pub(super) fn poll_engage(&mut self, now: std::time::Instant) -> Option<EngageEvent> {
+            let ev = self.engage.tick(now)?;
+            self.emit_engage(&ev);
+            Some(ev)
+        }
+
+        fn emit_engage(&self, ev: &EngageEvent) {
+            if let Some(es) = self.event_sender.as_ref() {
+                self.engage.emit(ev, es, &self.output_id, self.decode_stall_input_scope);
+            }
+        }
+
+        /// Inspect one complete PMT-PID unit, learn the video ES (and the
+        /// audio PIDs for the passthrough PCR floor), rebuild the program's
+        /// PMT, and emit.
+        fn handle_pmt_unit(&mut self, mut unit: PsiUnit, output: &mut Vec<u8>) {
+            self.engage.note_pmt_unit(unit.first_table_id());
+            let idx = self
+                .program_number
+                .and_then(|p| pmt_index(unit.sections(), p, self.pmt_pid_shared));
+            let Some(i) = idx else {
+                self.pmt_stage.emit(unit, output);
+                return;
+            };
+            let section = unit.sections()[i].clone();
+            // Never learn from, or rebuild (and so re-CRC), a damaged PMT.
+            let Some(view) = parse_pmt(&section)
+                .filter(|_| crate::engine::ts_parse::mpeg2_crc32(&section) == 0)
+            else {
+                self.pmt_stage.emit(unit, output);
+                return;
+            };
+            // Learn the audio PIDs so the PCR can be floored on
+            // PASSTHROUGH audio when this is a video-only transcode.
+            self.audio_pids.clear();
+            for es in &view.es {
+                if crate::engine::input_media_player::es_carries_audio(
+                    es.stream_type,
+                    view.es_info(es),
+                ) {
+                    self.audio_pids.insert(es.pid);
+                }
+            }
+            let sel = select_video_es(&view, self.source_video_pid_pin);
+            self.engage.note_pmt_parsed(sel.es.clone(), sel.unsupported_candidate);
+            if let Some((vpid, vst)) = sel.chosen {
+                // Operator-pinned PID not in PMT — warn once per distinct
+                // (pinned, actual) pair. De-duplication clears when the pin
+                // reappears.
+                if let Some(pin) = self.source_video_pid_pin {
+                    if pin != vpid && self.last_pinned_warn != Some((pin, vpid)) {
+                        tracing::warn!(
+                            error_code = "video_source_pid_not_found",
+                            pinned_pid = format!("0x{pin:04X}"),
+                            actual_pid = format!("0x{vpid:04X}"),
+                            actual_stream_type = format!("0x{vst:02X}"),
+                            "video_encode.source_video_pid pin not present in PMT — falling back to first-matching-codec video (pinned 0x{pin:04X} → actual 0x{vpid:04X})"
+                        );
+                        if let Some(es) = self.event_sender.as_ref() {
+                            crate::engine::transcode_engage::emit_pinned_pid_absent(
+                                TranscodeKind::Video,
+                                es,
+                                &self.output_id,
+                                self.decode_stall_input_scope,
+                                pin,
+                                vpid,
+                                vst,
+                            );
+                        }
+                        self.last_pinned_warn = Some((pin, vpid));
+                    } else if pin == vpid && self.last_pinned_warn.is_some() {
+                        self.last_pinned_warn = None;
+                    }
+                }
+                let codec_changed =
+                    self.source_stream_type != 0 && self.source_stream_type != vst;
+                let pid_changed = self.video_pid.is_some() && self.video_pid != Some(vpid);
+                if codec_changed || pid_changed {
+                    self.reset_source_state(&format!(
+                        "source changed: stream_type {:#04x} -> {:#04x}, pid {:?} -> {}",
+                        self.source_stream_type, vst, self.video_pid, vpid
+                    ));
+                }
+                self.video_pid = Some(vpid);
+                self.source_stream_type = vst;
+                // Surface for stats / UI badge: which source PID is the
+                // transcoder actually transcoding? Updated on every PMT
+                // discovery so input swaps are visible immediately.
+                self.stats.source_pid.store(vpid, Ordering::Relaxed);
+                self.stats.source_stream_type.store(vst, Ordering::Relaxed);
+                // Refresh the input-side video_decode_stats handle's codec
+                // label ("H.264" / "HEVC"). No-op on output-side replacers.
+                self.refresh_input_decode_label();
+                if let Some(ev) = self.engage.note_locked(vpid, vst) {
+                    self.emit_engage(&ev);
+                }
+            } else {
+                if self.video_pid.is_some() {
+                    self.reset_source_state("PMT no longer carries decodable video");
+                    self.video_pid = None;
+                    self.source_stream_type = 0;
+                }
+                self.engage.note_unlocked(std::time::Instant::now());
+            }
+            // Rebuild the PMT once we know the video PID: target
+            // stream_type, video descriptor policy, and PCR_PID = video_pid
+            // (where this module emits PCR — a source whose PMT pointed
+            // PCR_PID at a dedicated PCR PID would otherwise advertise PCR
+            // somewhere nothing carries it, a TR 101 290 P1.6 violation).
+            // When the source PMT already matches, only the version stamp
+            // can differ, and it is content-tracked, so receivers see no
+            // version flap.
+            if let Some(video_pid) = self.video_pid {
+                let edit = [EsEdit::Video { pid: video_pid, stream_type: self.target_stream_type }];
+                if let Some(mut new_section) = rebuild_pmt_section(
+                    &section,
+                    &PmtEdit { es: &edit, pcr_pid: Some(video_pid), ..Default::default() },
+                ) {
+                    self.pmt_version.stamp(&mut new_section);
+                    unit.replace_section(i, new_section);
+                }
+            }
+            self.pmt_stage.emit(unit, output);
         }
 
         /// One-shot decode-stall watchdog.
@@ -1657,136 +1743,63 @@ mod inner {
 
 // ─────────────────────────── Shared helpers ───────────────────────────
 
-/// Parse the PMT for a video stream. Returns `(video_pid, stream_type)`
-/// or `None` if no recognised video ES is present.
-///
-/// `pinned_pid` (`Some(pid)`): operator-pinned source PID via
-/// `video_encode.source_video_pid`. Look for that exact PID + verify
-/// the stream_type is recognised; on mismatch fall through to first-
-/// match for graceful degradation. Caller emits the warning event.
-///
-/// `None`: legacy first-match — first ES with stream_type in
-/// `{0x01 MPEG-1, 0x02 MPEG-2, 0x1B H.264, 0x24 H.265}`.
+/// The video ES the replacer should lock onto, plus what the engage
+/// watchdog needs to explain a miss.
 #[cfg(feature = "media-codecs")]
-fn parse_pmt_video(pkt: &[u8], pinned_pid: Option<u16>) -> Option<(u16, u8)> {
-    let mut offset = 4;
-    if ts_has_adaptation(pkt) {
-        let af_len = pkt[4] as usize;
-        offset = 5 + af_len;
-    }
-    if offset >= TS_PACKET_SIZE {
-        return None;
-    }
-
-    let pointer = pkt[offset] as usize;
-    offset += 1 + pointer;
-    if offset + 12 > TS_PACKET_SIZE || pkt[offset] != 0x02 {
-        return None;
-    }
-
-    let section_length =
-        (((pkt[offset + 1] & 0x0F) as usize) << 8) | (pkt[offset + 2] as usize);
-    let program_info_length =
-        (((pkt[offset + 10] & 0x0F) as usize) << 8) | (pkt[offset + 11] as usize);
-    let data_start = offset + 12 + program_info_length;
-    let data_end = (offset + 3 + section_length)
-        .min(TS_PACKET_SIZE)
-        .saturating_sub(4);
-
-    if let Some(target) = pinned_pid {
-        let mut pos = data_start;
-        while pos + 5 <= data_end {
-            let st = pkt[pos];
-            let es_pid = ((pkt[pos + 1] as u16 & 0x1F) << 8) | pkt[pos + 2] as u16;
-            let es_info_len = (((pkt[pos + 3] & 0x0F) as usize) << 8) | (pkt[pos + 4] as usize);
-            if es_pid == target && matches!(st, 0x01 | 0x02 | 0x1B | 0x24) {
-                return Some((es_pid, st));
-            }
-            pos += 5 + es_info_len;
-        }
-        // Pinned PID missing or wrong codec — fall through.
-    }
-
-    let mut pos = data_start;
-    while pos + 5 <= data_end {
-        let st = pkt[pos];
-        let es_pid = ((pkt[pos + 1] as u16 & 0x1F) << 8) | pkt[pos + 2] as u16;
-        let es_info_len = (((pkt[pos + 3] & 0x0F) as usize) << 8) | (pkt[pos + 4] as usize);
-
-        if matches!(st, 0x01 | 0x02 | 0x1B | 0x24) {
-            return Some((es_pid, st));
-        }
-        pos += 5 + es_info_len;
-    }
-    None
+#[derive(Debug, Default)]
+struct VideoSelection {
+    chosen: Option<(u16, u8)>,
+    /// The program carries video, but only in a codec the decoder does not
+    /// handle (MPEG-4 part 2, AVS, VC-1, JPEG 2000 / XS, VVC, SVC / MVC
+    /// sub-bitstreams, …).
+    unsupported_candidate: bool,
+    es: Vec<(u16, u8)>,
 }
 
-/// Rewrite the video stream_type in a PMT TS packet in place, force the
-/// PMT's `PCR_PID` to match the rebuilt video PID (where this module
-/// emits PCR fields), and recompute the section CRC32.
-///
-/// The PCR_PID field lives at section_start + 8..=9 (top 3 bits reserved,
-/// bottom 13 bits = PID). Without this rewrite, sources whose PMT pointed
-/// PCR_PID at a separate dedicated PCR PID would leave us emitting PCR
-/// on the video PID while the PMT advertises PCR somewhere else — a
-/// mismatch professional decoders treat as a TR 101 290 P1.6 violation.
+/// Decodable video stream_types: MPEG-1 / MPEG-2 / H.264 / H.265.
 #[cfg(feature = "media-codecs")]
-fn rewrite_pmt_video_stream_type(
-    pkt: &mut [u8],
-    video_pid: u16,
-    new_stream_type: u8,
-) {
-    let mut offset = 4;
-    if ts_has_adaptation(pkt) {
-        let af_len = pkt[4] as usize;
-        offset = 5 + af_len;
-    }
-    if offset >= TS_PACKET_SIZE {
-        return;
-    }
+fn video_replaceable(st: u8) -> bool {
+    matches!(st, 0x01 | 0x02 | 0x1B | 0x24)
+}
 
-    let pointer = pkt[offset] as usize;
-    offset += 1 + pointer;
-    if offset + 12 > TS_PACKET_SIZE || pkt[offset] != 0x02 {
-        return;
-    }
+/// Video stream_types the decoder cannot handle.
+#[cfg(feature = "media-codecs")]
+fn video_unsupported(st: u8) -> bool {
+    matches!(st, 0x10 | 0x1E..=0x21 | 0x28..=0x33 | 0x42 | 0x61 | 0xD1 | 0xEA)
+}
 
-    let section_start = offset;
-    let section_length =
-        (((pkt[offset + 1] & 0x0F) as usize) << 8) | (pkt[offset + 2] as usize);
-    // Force PCR_PID to point at the source video PID — that's where this
-    // module actually emits PCR. Top 3 bits remain reserved (set to 1
-    // per ISO 13818-1). A downstream `TsPidOverridesRewriter` walks the
-    // PCR_PID field again whenever the operator renamed the video PID
-    // (see `rewrite_pmt`), so the on-wire PMT ends up consistent with
-    // the rewriter's final PID layout.
-    pkt[section_start + 8] =
-        (pkt[section_start + 8] & 0xE0) | (((video_pid >> 8) as u8) & 0x1F);
-    pkt[section_start + 9] = (video_pid & 0xFF) as u8;
-    let program_info_length =
-        (((pkt[offset + 10] & 0x0F) as usize) << 8) | (pkt[offset + 11] as usize);
-    let data_start = offset + 12 + program_info_length;
-    let data_end = (offset + 3 + section_length)
-        .min(TS_PACKET_SIZE)
-        .saturating_sub(4);
-
-    let mut pos = data_start;
-    while pos + 5 <= data_end {
-        let es_pid = ((pkt[pos + 1] as u16 & 0x1F) << 8) | pkt[pos + 2] as u16;
-        let es_info_len = (((pkt[pos + 3] & 0x0F) as usize) << 8) | (pkt[pos + 4] as usize);
-        if es_pid == video_pid {
-            pkt[pos] = new_stream_type;
+/// Select the video ES from a parsed PMT.
+///
+/// `pinned_pid` (`Some(pid)`): operator-pinned source PID via
+/// `video_encode.source_video_pid`. Use that exact PID when its
+/// stream_type is decodable; otherwise fall through to first-match for
+/// graceful degradation (the caller raises `video_source_pid_not_found`).
+///
+/// `None`: first-match — first ES with stream_type in
+/// `{0x01 MPEG-1, 0x02 MPEG-2, 0x1B H.264, 0x24 H.265}`.
+#[cfg(feature = "media-codecs")]
+fn select_video_es(
+    view: &crate::engine::ts_pmt_edit::PmtView<'_>,
+    pinned_pid: Option<u16>,
+) -> VideoSelection {
+    let mut sel = VideoSelection::default();
+    let mut first = None;
+    let mut pinned_hit = None;
+    for es in &view.es {
+        sel.es.push((es.pid, es.stream_type));
+        if video_replaceable(es.stream_type) {
+            if first.is_none() {
+                first = Some((es.pid, es.stream_type));
+            }
+            if pinned_pid == Some(es.pid) {
+                pinned_hit = Some((es.pid, es.stream_type));
+            }
+        } else if video_unsupported(es.stream_type) {
+            sel.unsupported_candidate = true;
         }
-        pos += 5 + es_info_len;
     }
-
-    if let Some(crc_offset) = psi_crc_offset(section_start, section_length) {
-        let crc = mpeg2_crc32(&pkt[section_start..crc_offset]);
-        pkt[crc_offset] = (crc >> 24) as u8;
-        pkt[crc_offset + 1] = (crc >> 16) as u8;
-        pkt[crc_offset + 2] = (crc >> 8) as u8;
-        pkt[crc_offset + 3] = crc as u8;
-    }
+    sel.chosen = pinned_hit.or(first);
+    sel
 }
 
 /// Extract the ES payload and PTS from a complete PES packet.
@@ -2041,6 +2054,29 @@ fn packetize_ts(
 #[cfg(all(test, feature = "media-codecs"))]
 mod tests {
     use super::*;
+    use crate::engine::ts_parse::mpeg2_crc32;
+    use crate::engine::ts_pmt_edit::{is_pmt_for, parse_pmt};
+
+    /// Packet-level wrapper over `select_video_es` for the synth helpers.
+    fn parse_pmt_video(pkt: &[u8], pinned: Option<u16>) -> Option<(u16, u8)> {
+        let s = crate::engine::ts_parse::find_section_in_packet(pkt, 0x02, None)?;
+        let view = parse_pmt(&pkt[s.start..s.end()])?;
+        select_video_es(&view, pinned).chosen
+    }
+
+    /// The program's PMT section in an output buffer.
+    fn pmt_in(out: &[u8], program: u16) -> Vec<u8> {
+        let mut asm = crate::engine::ts_parse::SectionAssembler::new();
+        let mut found = None;
+        for p in out.chunks(TS_PACKET_SIZE) {
+            for sec in asm.feed(ts_pusi(p), &p[ts_payload_offset(p)..]) {
+                if is_pmt_for(sec, program) {
+                    found = Some(sec.to_vec());
+                }
+            }
+        }
+        found.expect("PMT in output")
+    }
 
     fn cfg(codec: &str) -> VideoEncodeConfig {
         VideoEncodeConfig {
@@ -2478,29 +2514,120 @@ mod tests {
         let section_length = (((pkt[5 + 1] & 0x0F) as usize) << 8) | (pkt[5 + 2] as usize);
         let crc_offset = 5 + 3 + section_length - 4;
         let new_crc = mpeg2_crc32(&pkt[5..crc_offset]);
-        pkt[crc_offset] = (new_crc >> 24) as u8;
-        pkt[crc_offset + 1] = (new_crc >> 16) as u8;
-        pkt[crc_offset + 2] = (new_crc >> 8) as u8;
-        pkt[crc_offset + 3] = new_crc as u8;
+        pkt[crc_offset..crc_offset + 4].copy_from_slice(&new_crc.to_be_bytes());
         // Sanity: confirm the synth setup before exercising the rewrite.
         let pcr_pid_before = ((pkt[5 + 8] as u16 & 0x1F) << 8) | pkt[5 + 9] as u16;
         assert_eq!(pcr_pid_before, 0x1234);
 
-        // Run the rewrite. Target stream_type matches source (0x1B) so
-        // only the PCR_PID change drives the edit.
-        rewrite_pmt_video_stream_type(&mut pkt, 0x0100, 0x1B);
+        // Run it through the replacer. Target stream_type matches source
+        // (0x1B) so only the PCR_PID change drives the edit.
+        let mut r = TsVideoReplacer::new(&cfg("x264"), None).unwrap();
+        let mut out = Vec::new();
+        r.process(&synth_pat(0x1000), &mut out);
+        out.clear();
+        r.process(&pkt, &mut out);
+        let sec = pmt_in(&out, 1);
+        let v = parse_pmt(&sec).expect("valid PMT");
+        assert_eq!(v.pcr_pid, 0x0100, "PCR_PID must be re-pointed at video PID");
+        assert_eq!(mpeg2_crc32(&sec), 0, "CRC must validate after rewrite");
+    }
 
-        let pcr_pid_after = ((pkt[5 + 8] as u16 & 0x1F) << 8) | pkt[5 + 9] as u16;
-        assert_eq!(pcr_pid_after, 0x0100, "PCR_PID must be re-pointed at video PID");
+    /// VH1.ts: the PMT sits behind a 0xC0 section. The replacer learns the
+    /// MPEG-2 video PID, rewrites it to H.264 and drops the MPEG-2-only
+    /// descriptors, keeps PCR_PID on the video PID, and leaves the 0xC0
+    /// section and the packet count untouched.
+    #[test]
+    fn vh1_pmt_is_learned_and_rewritten_behind_the_private_section() {
+        use crate::engine::ts_test_fixtures::{
+            vh1_pat_packet, vh1_pmt_packet, VH1_PMT_OFFSET, VH1_PROGRAM,
+        };
+        let mut r = TsVideoReplacer::new(&cfg("x264"), None).unwrap();
+        let mut out = Vec::new();
+        r.process(&vh1_pat_packet(), &mut out);
+        out.clear();
+        let pmt = vh1_pmt_packet();
+        r.process(&pmt, &mut out);
+        assert_eq!(r.stats_handle().source_pid.load(Ordering::Relaxed), 0x0E0F);
+        assert_eq!(out.len(), TS_PACKET_SIZE);
+        assert_eq!(&out[..VH1_PMT_OFFSET], &pmt[..VH1_PMT_OFFSET]);
+        let sec = pmt_in(&out, VH1_PROGRAM);
+        assert_eq!(mpeg2_crc32(&sec), 0);
+        let v = parse_pmt(&sec).unwrap();
+        assert_eq!(v.pcr_pid, 0x0E0F);
+        assert_eq!(v.es[0].stream_type, 0x1B);
+        // The audio PID is learned for the passthrough PCR floor.
+        assert!(r.inner.audio_pids.contains(&0x0E10));
+    }
 
-        // CRC must still validate after the rewrite.
-        let new_section_length = (((pkt[5 + 1] & 0x0F) as usize) << 8) | (pkt[5 + 2] as usize);
-        let new_crc_offset = 5 + 3 + new_section_length - 4;
-        let computed = mpeg2_crc32(&pkt[5..new_crc_offset]);
-        let stored = ((pkt[new_crc_offset] as u32) << 24)
-            | ((pkt[new_crc_offset + 1] as u32) << 16)
-            | ((pkt[new_crc_offset + 2] as u32) << 8)
-            | (pkt[new_crc_offset + 3] as u32);
-        assert_eq!(computed, stored, "CRC must validate after rewrite");
+    /// `video_encode` on an audio-only program: the engage watchdog says
+    /// so (`no_supported_es`) on the output's event feed.
+    #[test]
+    fn an_audio_only_program_raises_video_no_supported_es() {
+        let mut r = TsVideoReplacer::new(&cfg("x264"), None).unwrap();
+        let (tx, mut rx) = crate::manager::events::event_channel();
+        r.set_decode_stall_watchdog(tx, "out-v");
+        let pmt = crate::engine::ts_test_fixtures::pmt_section(1, 0, 0x101, &[], &[(0x0F, 0x101, &[])]);
+        let mut out = Vec::new();
+        for i in 0..12u8 {
+            r.process(&synth_pat(0x1000), &mut out);
+            r.process(&crate::engine::ts_test_fixtures::packetize_sections(0x1000, &[&pmt], i)[0], &mut out);
+        }
+        let later = std::time::Instant::now() + std::time::Duration::from_secs(6);
+        match r.inner.poll_engage(later) {
+            Some(crate::engine::transcode_engage::EngageEvent::NotFound { reason, .. }) => {
+                assert_eq!(reason.as_str(), "no_supported_es")
+            }
+            other => panic!("{other:?}"),
+        }
+        let ev = rx.try_recv().expect("event emitted");
+        assert_eq!(ev.output_id.as_deref(), Some("out-v"));
+        assert_eq!(ev.details.unwrap()["error_code"], "video_transcode_source_not_found");
+    }
+
+    #[test]
+    fn video_version_follows_the_audio_stage() {
+        // Audio stage then video stage, as in transcode_chain: an audio
+        // codec change must change the FINAL output PMT version, which the
+        // video stage used to overwrite with its own unchanged counter.
+        let mut audio = crate::engine::ts_audio_replace::TsAudioReplacer::new(
+            &serde_json::from_value(serde_json::json!({ "codec": "aac_lc" })).unwrap(),
+            None,
+        )
+        .unwrap();
+        let mut video = TsVideoReplacer::new(&cfg("x264"), None).unwrap();
+        let chain = |a: &mut crate::engine::ts_audio_replace::TsAudioReplacer,
+                     v: &mut TsVideoReplacer,
+                     input: &[u8]| {
+            let mut mid = Vec::new();
+            a.process(input, &mut mid);
+            let mut out = Vec::new();
+            v.process(&mid, &mut out);
+            out
+        };
+        let pat = synth_pat(0x1000);
+        chain(&mut audio, &mut video, &pat);
+        let pmt = |apid: u16, cc: u8| {
+            let sec = crate::engine::ts_test_fixtures::pmt_section(
+                1,
+                0,
+                0x100,
+                &[],
+                &[(0x1B, 0x100, &[]), (0x0F, apid, &[])],
+            );
+            crate::engine::ts_test_fixtures::packetize_sections(0x1000, &[&sec], cc)[0]
+        };
+        let ver = |s: &[u8]| (s[5] >> 1) & 0x1F;
+        let v1 = pmt_in(&chain(&mut audio, &mut video, &pmt(0x101, 0)), 1);
+        let v1b = pmt_in(&chain(&mut audio, &mut video, &pmt(0x101, 1)), 1);
+        assert_eq!(v1, v1b, "unchanged: no flap");
+        // An audio-only source change (the audio PID moves): only the audio
+        // stage resets, but the final PMT content changed, so the final
+        // version must change. The video stage used to re-stamp its own
+        // unchanged counter over the audio stage's bump.
+        let v2 = pmt_in(&chain(&mut audio, &mut video, &pmt(0x102, 2)), 1);
+        assert_eq!(parse_pmt(&v2).unwrap().es[1].pid, 0x102);
+        assert_ne!(ver(&v2), ver(&v1), "final output version changed");
+        let v2b = pmt_in(&chain(&mut audio, &mut video, &pmt(0x102, 3)), 1);
+        assert_eq!(ver(&v2b), ver(&v2), "and holds afterwards");
     }
 }

@@ -65,9 +65,9 @@ use crate::config::models::{TsPidOverridesEntry, TsPidOverridesMap};
 use super::packet::RtpPacket;
 use super::ts_parse::{
     descriptor_audio_kind, descriptors_indicate_text_service, mpeg2_crc32, parse_pat_programs,
-    psi_crc_offset,
-    ts_has_adaptation, ts_pid, ts_pusi, PAT_PID, TS_PACKET_SIZE, TS_SYNC_BYTE,
+    psi_crc_offset, ts_has_adaptation, ts_pid, ts_pusi, PAT_PID, TS_PACKET_SIZE, TS_SYNC_BYTE,
 };
+use super::ts_pmt_edit::{parse_pmt, rebuild_pmt_section, EsEdit, PmtEdit, PsiUnit, PsiUnitStage};
 
 /// RTP fixed-header minimum size (no CSRCs, no extension). Mirrors the
 /// constant in `ts_pid_remapper`.
@@ -100,6 +100,18 @@ pub struct TsPidOverridesRewriter {
     programs: HashMap<u16, ProgramState>,
     /// Source `pmt_pid → program_number` lookup, populated from PAT.
     pmt_pid_to_program: HashMap<u16, u16>,
+    /// PMT PIDs the PAT maps to more than one program — on those only a
+    /// PMT section's own program_number identifies its program.
+    shared_pmt_pids: std::collections::HashSet<u16>,
+    /// Reassembling PSI stage per source PMT PID: every section of every
+    /// unit is visible (a PMT behind a user-private table, several
+    /// programs' PMTs on one PID, a PMT spanning packets), and an edited
+    /// PMT is re-packetised with a valid CRC — the in-place single-packet
+    /// rewrite left a multi-packet PMT's CRC stale and its continuation
+    /// packets on the source PMT PID.
+    pmt_stages: HashMap<u16, PsiUnitStage>,
+    /// Scratch for one PMT-PID packet's stage output.
+    pmt_scratch: Vec<u8>,
     /// Source PIDs that we have a rewrite for, for the fast-path TS-header
     /// rewrite. Populated lazily as PMTs are observed. Sentinel
     /// `NO_REMAP = 0xFFFF` means "pass through unchanged".
@@ -131,6 +143,9 @@ impl TsPidOverridesRewriter {
             overrides: overrides.clone(),
             programs: HashMap::new(),
             pmt_pid_to_program: HashMap::new(),
+            shared_pmt_pids: std::collections::HashSet::new(),
+            pmt_stages: HashMap::new(),
+            pmt_scratch: Vec::with_capacity(4 * TS_PACKET_SIZE),
             pid_remap_table: Box::new([NO_REMAP; 8192]),
             has_any_remap: false,
             last_pat_version: None,
@@ -211,11 +226,26 @@ impl TsPidOverridesRewriter {
                     self.observe_pat(pkt);
                 }
                 self.emit_pat(pkt, out);
-            } else if let Some(&program_number) = self.pmt_pid_to_program.get(&pid) {
-                if ts_pusi(pkt) {
-                    self.observe_pmt(pkt, program_number);
+            } else if self.pmt_pid_to_program.contains_key(&pid) {
+                self.pmt_scratch.clear();
+                let mut scratch = std::mem::take(&mut self.pmt_scratch);
+                let unit = self
+                    .pmt_stages
+                    .entry(pid)
+                    .or_insert_with(|| PsiUnitStage::new("ts_pid_overrides_rewriter"))
+                    .push(pkt, &mut scratch);
+                if let Some(unit) = unit {
+                    let unit = self.edit_pmt_unit(pid, unit);
+                    if let Some(stage) = self.pmt_stages.get_mut(&pid) {
+                        stage.emit(unit, &mut scratch);
+                    }
                 }
-                self.emit_pmt(pkt, program_number, out);
+                // Every packet the stage emits rides the (possibly
+                // overridden) PMT PID — continuation packets included.
+                for p in scratch.chunks_exact(TS_PACKET_SIZE) {
+                    self.emit_es(p, out);
+                }
+                self.pmt_scratch = scratch;
             } else {
                 self.emit_es(pkt, out);
             }
@@ -233,6 +263,11 @@ impl TsPidOverridesRewriter {
         self.last_pat_version = version;
         self.pmt_pid_to_program.clear();
         let pat_programs = parse_pat_programs(pkt);
+        self.shared_pmt_pids = pat_programs
+            .iter()
+            .filter(|(_, pid)| pat_programs.iter().filter(|(_, p)| p == pid).count() > 1)
+            .map(|(_, pid)| *pid)
+            .collect();
         // Override keys that match no program in the observed PAT are a
         // silent no-op: discovery never runs for them, the ES stays on
         // its source PIDs, and any assembly slot keyed on the override's
@@ -283,16 +318,22 @@ impl TsPidOverridesRewriter {
 
     /// Parse a PMT for the named program, learn its ES + PCR PIDs, and
     /// seed remaps for video / audio / PCR overrides.
-    fn observe_pmt(&mut self, pkt: &[u8], program_number: u16) {
+    fn observe_pmt(&mut self, section: &[u8], program_number: u16) {
         let Some(o) = self.overrides.get(&program_number).cloned() else {
             // Program not in override map — discovery is a no-op.
             return;
         };
         // Parse the PMT body.
-        let Some((source_pcr_pid, streams)) = parse_pmt_body(pkt) else {
+        let Some(view) = parse_pmt(section) else {
             return;
         };
-        let version = pmt_version(pkt);
+        let source_pcr_pid = view.pcr_pid;
+        let streams: Vec<(u16, u8, Vec<u8>)> = view
+            .es
+            .iter()
+            .map(|es| (es.pid, es.stream_type, view.es_info(es).to_vec()))
+            .collect();
+        let version = Some(view.version);
         let state = self.programs.entry(program_number).or_insert_with(|| {
             ProgramState {
                 source_pmt_pid: 0,
@@ -423,19 +464,42 @@ impl TsPidOverridesRewriter {
         out.extend_from_slice(&rewritten);
     }
 
-    /// Emit a (possibly-rewritten) PMT for the named program.
-    fn emit_pmt(&self, pkt: &[u8], program_number: u16, out: &mut Vec<u8>) {
-        let Some(o) = self.overrides.get(&program_number) else {
-            // No override for this program — pass through unchanged.
-            out.extend_from_slice(pkt);
-            return;
-        };
-        let state = self.programs.get(&program_number);
-        let Some(rewritten) = rewrite_pmt(pkt, o, state) else {
-            out.extend_from_slice(pkt);
-            return;
-        };
-        out.extend_from_slice(&rewritten);
+    /// Learn from, and rewrite, every PMT section of a unit whose program
+    /// is in the override map. Other sections (other programs, user-private
+    /// tables on the PID) stay byte-identical.
+    ///
+    /// A section's program is its own program_number when the override
+    /// map names it; otherwise, on a PMT PID the PAT maps to exactly one
+    /// program, that program — as before, so a mux whose PMT
+    /// program_number disagrees with its PAT keeps working.
+    fn edit_pmt_unit(&mut self, pmt_pid: u16, mut unit: PsiUnit) -> PsiUnit {
+        let pat_program = (!self.shared_pmt_pids.contains(&pmt_pid))
+            .then(|| self.pmt_pid_to_program.get(&pmt_pid).copied())
+            .flatten();
+        for i in 0..unit.sections().len() {
+            let section = unit.sections()[i].clone();
+            if section.len() < 5 || section[0] != 0x02 || section[1] & 0x80 == 0 {
+                continue;
+            }
+            let own = u16::from_be_bytes([section[3], section[4]]);
+            let Some(program_number) = [Some(own), pat_program]
+                .into_iter()
+                .flatten()
+                .find(|p| self.overrides.contains_key(p))
+            else {
+                continue;
+            };
+            self.observe_pmt(&section, program_number);
+            let (Some(o), state) =
+                (self.overrides.get(&program_number), self.programs.get(&program_number))
+            else {
+                continue;
+            };
+            if let Some(rewritten) = rewrite_pmt_section(&section, o, state) {
+                unit.replace_section(i, rewritten);
+            }
+        }
+        unit
     }
 
     /// Emit a (possibly-rewritten) ES packet — fast-path TS header PID
@@ -461,49 +525,6 @@ impl TsPidOverridesRewriter {
 }
 
 // ────────────────────────────── helpers ──────────────────────────────
-
-/// Walk PMT entries; returns `(pcr_pid, [(es_pid, stream_type,
-/// es_info_descriptors), ...])`. The descriptor bytes are copied out so
-/// the singular-`audio_pid` selection can discriminate DVB 0x06 audio
-/// (AC-3 / E-AC-3 / AAC-LATM by descriptor) from teletext / subtitling
-/// on the same stream_type. Cold path — runs only on PMT version bumps.
-fn parse_pmt_body(pkt: &[u8]) -> Option<(u16, Vec<(u16, u8, Vec<u8>)>)> {
-    let mut offset = 4;
-    if ts_has_adaptation(pkt) {
-        let af_len = pkt[4] as usize;
-        offset = 5 + af_len;
-    }
-    if offset >= TS_PACKET_SIZE {
-        return None;
-    }
-    let pointer = pkt[offset] as usize;
-    offset += 1 + pointer;
-    if offset + 12 > TS_PACKET_SIZE || pkt[offset] != 0x02 {
-        return None;
-    }
-    let section_length =
-        (((pkt[offset + 1] & 0x0F) as usize) << 8) | (pkt[offset + 2] as usize);
-    let pcr_pid = (((pkt[offset + 8] & 0x1F) as u16) << 8) | (pkt[offset + 9] as u16);
-    let program_info_length =
-        (((pkt[offset + 10] & 0x0F) as usize) << 8) | (pkt[offset + 11] as usize);
-    let data_start = offset + 12 + program_info_length;
-    let data_end = (offset + 3 + section_length)
-        .min(TS_PACKET_SIZE)
-        .saturating_sub(4);
-
-    let mut streams = Vec::new();
-    let mut pos = data_start;
-    while pos + 5 <= data_end {
-        let st = pkt[pos];
-        let es_pid = ((pkt[pos + 1] as u16 & 0x1F) << 8) | pkt[pos + 2] as u16;
-        let es_info_len = (((pkt[pos + 3] & 0x0F) as usize) << 8) | (pkt[pos + 4] as usize);
-        let es_info_end = (pos + 5 + es_info_len).min(data_end);
-        let es_info = pkt[pos + 5..es_info_end].to_vec();
-        streams.push((es_pid, st, es_info));
-        pos += 5 + es_info_len;
-    }
-    Some((pcr_pid, streams))
-}
 
 /// True for video stream_types we recognise (H.264 / H.265 / MPEG-2).
 fn is_video_stream_type(st: u8) -> bool {
@@ -531,11 +552,6 @@ fn is_unambiguous_audio_stream_type(st: u8) -> bool {
 /// Read PAT `version_number` (5 bits, 0..=31) when PUSI is set, or `None`.
 fn pat_version(pkt: &[u8]) -> Option<u8> {
     psi_version(pkt, 0x00)
-}
-
-/// Read PMT `version_number` (5 bits, 0..=31) when PUSI is set, or `None`.
-fn pmt_version(pkt: &[u8]) -> Option<u8> {
-    psi_version(pkt, 0x02)
 }
 
 fn psi_version(pkt: &[u8], expect_table_id: u8) -> Option<u8> {
@@ -610,42 +626,17 @@ fn rewrite_pat(pkt: &[u8], overrides: &TsPidOverridesMap) -> Option<Vec<u8>> {
     Some(buf)
 }
 
-/// Rewrite a PMT in place with new PCR_PID + ES PIDs from the override entry.
-fn rewrite_pmt(
-    pkt: &[u8],
+/// Rebuild a complete PMT section with new PCR_PID + ES PIDs from the
+/// override entry. Returns `None` when nothing changes (the section is then
+/// emitted byte-identical) or the section does not parse. The TS-header
+/// PID of the PMT packets (an overridden `pmt_pid`) is applied separately,
+/// to every packet the PMT-PID stage emits.
+fn rewrite_pmt_section(
+    section: &[u8],
     o: &TsPidOverridesEntry,
     state: Option<&ProgramState>,
 ) -> Option<Vec<u8>> {
-    let mut buf = pkt.to_vec();
-    // First, if the operator overrode the PMT PID, rewrite the TS-header PID.
-    if let Some(new_pmt) = o.pmt_pid {
-        buf[1] = (buf[1] & 0xE0) | (((new_pmt >> 8) as u8) & 0x1F);
-        buf[2] = (new_pmt & 0xFF) as u8;
-    }
-    // Now walk the PMT body and rewrite PCR_PID + ES PIDs.
-    let mut offset = 4;
-    if ts_has_adaptation(&buf) {
-        let af_len = buf[4] as usize;
-        offset = 5 + af_len;
-    }
-    if offset >= TS_PACKET_SIZE {
-        return None;
-    }
-    let pointer = buf[offset] as usize;
-    offset += 1 + pointer;
-    if offset + 12 > TS_PACKET_SIZE || buf[offset] != 0x02 {
-        return None;
-    }
-    let section_start = offset;
-    let section_length =
-        (((buf[offset + 1] & 0x0F) as usize) << 8) | (buf[offset + 2] as usize);
-    let program_info_length =
-        (((buf[offset + 10] & 0x0F) as usize) << 8) | (buf[offset + 11] as usize);
-    let data_start = offset + 12 + program_info_length;
-    let data_end = (offset + 3 + section_length)
-        .min(TS_PACKET_SIZE)
-        .saturating_sub(4);
-
+    let view = parse_pmt(section)?;
     // Build the per-stream rewrite plan from cached state + overrides.
     // Two specific roles to honour: video, audio. PCR is handled via the
     // PCR_PID field below.
@@ -655,8 +646,6 @@ fn rewrite_pmt(
     let audio_remap: &BTreeMap<u16, u16> = state
         .map(|s| &s.audio_remap)
         .unwrap_or(&EMPTY_AUDIO_REMAP);
-
-    let mut changed = o.pmt_pid.is_some();
 
     // PCR_PID rewrite. The operator's pcr_pid (when set) is what the PMT
     // should advertise. If they didn't set pcr_pid but they did remap the
@@ -676,43 +665,27 @@ fn rewrite_pmt(
     } else {
         None
     };
-    if let Some(new_pcr) = new_pcr_pid {
-        buf[section_start + 8] =
-            (buf[section_start + 8] & 0xE0) | (((new_pcr >> 8) as u8) & 0x1F);
-        buf[section_start + 9] = (new_pcr & 0xFF) as u8;
-        changed = true;
-    }
 
     // ES PID rewrites — first matching video, plus every audio PID with
     // a resolved remap (single-language → 1 entry; multi-language → N).
-    let mut pos = data_start;
-    while pos + 5 <= data_end {
-        let es_pid = ((buf[pos + 1] as u16 & 0x1F) << 8) | buf[pos + 2] as u16;
-        let es_info_len = (((buf[pos + 3] & 0x0F) as usize) << 8) | (buf[pos + 4] as usize);
+    let mut edits: Vec<EsEdit> = Vec::new();
+    for es in &view.es {
         if let Some((src, dst)) = video_remap
-            && es_pid == src {
-                buf[pos + 1] = (buf[pos + 1] & 0xE0) | (((dst >> 8) as u8) & 0x1F);
-                buf[pos + 2] = (dst & 0xFF) as u8;
-                changed = true;
-            }
-        if let Some(&dst) = audio_remap.get(&es_pid) {
-            buf[pos + 1] = (buf[pos + 1] & 0xE0) | (((dst >> 8) as u8) & 0x1F);
-            buf[pos + 2] = (dst & 0xFF) as u8;
-            changed = true;
+            && es.pid == src
+        {
+            edits.push(EsEdit::Repid { pid: src, new_pid: dst });
+        } else if let Some(&dst) = audio_remap.get(&es.pid) {
+            edits.push(EsEdit::Repid { pid: es.pid, new_pid: dst });
         }
-        pos += 5 + es_info_len;
     }
-
-    if changed
-        && let Some(crc_offset) = psi_crc_offset(section_start, section_length)
-    {
-        let crc = mpeg2_crc32(&buf[section_start..crc_offset]);
-        buf[crc_offset] = (crc >> 24) as u8;
-        buf[crc_offset + 1] = (crc >> 16) as u8;
-        buf[crc_offset + 2] = (crc >> 8) as u8;
-        buf[crc_offset + 3] = crc as u8;
+    let pcr_changed = new_pcr_pid.is_some_and(|p| p != view.pcr_pid);
+    if edits.is_empty() && !pcr_changed {
+        return None;
     }
-    Some(buf)
+    rebuild_pmt_section(
+        section,
+        &PmtEdit { es: &edits, pcr_pid: new_pcr_pid, ..Default::default() },
+    )
 }
 
 #[cfg(test)]
@@ -721,6 +694,71 @@ mod tests {
 
     fn empty_map() -> TsPidOverridesMap {
         TsPidOverridesMap::new()
+    }
+
+    fn sections_on(out: &[u8], pid: u16) -> Vec<Vec<u8>> {
+        let mut asm = crate::engine::ts_parse::SectionAssembler::new();
+        let mut got = Vec::new();
+        for p in out.chunks(TS_PACKET_SIZE).filter(|p| ts_pid(p) == pid) {
+            got.extend(asm.push_packet(p).map(|s| s.to_vec()));
+        }
+        got
+    }
+
+    /// VH1.ts: the PMT sits behind a 0xC0 section on its PID. The override
+    /// rewriter used to find no PMT there, so nothing was ever renamed.
+    #[test]
+    fn overrides_apply_to_a_pmt_behind_a_private_section() {
+        use crate::engine::ts_test_fixtures::{vh1_pat_packet, vh1_pmt_packet};
+        let mut m = TsPidOverridesMap::new();
+        m.insert(
+            2010,
+            TsPidOverridesEntry { pmt_pid: Some(0x1000), video_pid: Some(0x100), ..Default::default() },
+        );
+        let mut r = TsPidOverridesRewriter::new(&m);
+        let mut out = Vec::new();
+        r.process(&vh1_pat_packet(), &mut out);
+        out.clear();
+        let pmt = vh1_pmt_packet();
+        r.process(&pmt, &mut out);
+        assert_eq!(out.len(), TS_PACKET_SIZE);
+        assert_eq!(ts_pid(&out), 0x1000, "PMT carried on the overridden PID");
+        assert_eq!(&out[4..29], &pmt[4..29], "0xC0 section byte-identical");
+        let secs = sections_on(&out, 0x1000);
+        let v = crate::engine::ts_pmt_edit::parse_pmt(&secs[1]).unwrap();
+        assert_eq!(v.es[0].pid, 0x100);
+        assert_eq!(v.pcr_pid, 0x100, "PCR_PID follows the renamed video PID");
+        assert_eq!(mpeg2_crc32(&secs[1]), 0);
+    }
+
+    /// A PMT spanning two packets: the renamed audio ES lives in the second
+    /// packet, the rebuilt section's CRC is valid, and BOTH packets move to
+    /// the overridden PMT PID (continuations used to keep the source PID).
+    #[test]
+    fn overrides_apply_across_a_two_packet_pmt() {
+        use crate::engine::ts_test_fixtures::{packetize_sections, pat_packet, two_packet_pmt};
+        let (sec, target) = two_packet_pmt(1, 0);
+        let pkts = packetize_sections(0x40, &[&sec], 0);
+        let mut m = TsPidOverridesMap::new();
+        let mut audio = BTreeMap::new();
+        audio.insert(target, 0x0300);
+        m.insert(
+            1,
+            TsPidOverridesEntry { pmt_pid: Some(0x50), audio_pids: Some(audio), ..Default::default() },
+        );
+        let mut r = TsPidOverridesRewriter::new(&m);
+        let mut out = Vec::new();
+        r.process(&pat_packet(&[(1, 0x40)], 0, 0), &mut out);
+        out.clear();
+        r.process(&[pkts[0], pkts[1]].concat(), &mut out);
+        assert_eq!(out.len(), 2 * TS_PACKET_SIZE);
+        assert!(out.chunks(TS_PACKET_SIZE).all(|p| ts_pid(p) == 0x50));
+        let secs = sections_on(&out, 0x50);
+        assert_eq!(secs.len(), 1);
+        assert_eq!(mpeg2_crc32(&secs[0]), 0);
+        let v = crate::engine::ts_pmt_edit::parse_pmt(&secs[0]).unwrap();
+        assert!(v.es.iter().any(|e| e.pid == 0x0300));
+        assert!(!v.es.iter().any(|e| e.pid == target));
     }
 
     #[test]

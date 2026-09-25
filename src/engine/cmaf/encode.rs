@@ -893,6 +893,7 @@ mod reencoder_tests {
             opus_dtx: false,
             opus_frame_duration_ms: None,
              source_audio_pid: None,
+             ts_signalling: None,
         }
     }
 

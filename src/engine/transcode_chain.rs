@@ -386,6 +386,15 @@ pub fn build_for_output(
                 r.set_av_sync_pacer(p.clone());
             }
             r.set_av_skew_reporter(av_skew.clone());
+            // Wire the engage watchdog so an audio_encode that never finds
+            // a decodable audio ES (no PAT, an unparseable PMT, only DTS /
+            // Opus / AC-4 audio, …) raises `audio_transcode_source_not_found`
+            // instead of silently passing the source audio through, and a
+            // missing `source_audio_pid` pin raises
+            // `audio_source_pid_not_found`. Output-scoped.
+            if let Some(es) = event_sender {
+                r.set_event_watchdog(es.clone(), output_id, false);
+            }
             // Hook the audio replacer's "output stats accumulator"
             // reference so it can refresh source-codec labels on PMT
             // updates — identical to today's inline construction.
@@ -429,7 +438,9 @@ pub fn build_for_output(
             // produces no frames surfaces a Warning instead of silently
             // shipping audio-only output (field report: QSV H.264 decode
             // failed for every frame during transcode while the SRT output
-            // showed Running with video_bitrate_bps == 0).
+            // showed Running with video_bitrate_bps == 0). The same sender
+            // carries the engage watchdog (`video_transcode_source_*`,
+            // `video_source_pid_not_found`).
             if let Some(es) = event_sender {
                 r.set_decode_stall_watchdog(es.clone(), output_id);
             }
@@ -594,6 +605,7 @@ mod tests {
             opus_fec: false,
             opus_dtx: false,
             opus_frame_duration_ms: None,
+            ts_signalling: None,
         };
         let audio = TsAudioReplacer::new(&cfg, None).expect("audio replacer build");
         TranscodeChain::new("test-audio-only", Some(audio), None, None)

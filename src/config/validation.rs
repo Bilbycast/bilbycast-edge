@@ -2514,6 +2514,11 @@ fn validate_st2110_audio_input(c: &St2110AudioInputConfig, profile: St2110Profil
                     PCM_INPUT_AUDIO_CODECS,
                     &format!("{label} input"),
                 )?;
+                reject_ts_signalling(
+                    ae,
+                    &format!("{label} input"),
+                    "a PCM input's MPEG-TS is built by the shared muxer",
+                )?;
             }
         }
     }
@@ -3062,6 +3067,11 @@ fn validate_rtp_audio_input(c: &RtpAudioInputConfig) -> Result<()> {
     }
     if let Some(ref ae) = c.audio_encode {
         validate_audio_encode(ae, PCM_INPUT_AUDIO_CODECS, "rtp_audio input")?;
+        reject_ts_signalling(
+            ae,
+            "rtp_audio input",
+            "a PCM input's MPEG-TS is built by the shared muxer",
+        )?;
     }
     Ok(())
 }
@@ -4821,6 +4831,15 @@ fn validate_audio_encode(
                 "{context}: audio_encode.opus_frame_duration_ms must be one of 5, 10, 20, 40, 60, got {d}"
             );
         }
+    // AC-3 PMT carriage choice: meaningful for an AC-3 target only.
+    // Accepting it on another codec would be a silent no-op.
+    if enc.ts_signalling.is_some() && enc.codec != "ac3" {
+        bail!(
+            "{context}: audio_encode.ts_signalling only applies to codec=ac3 (it selects \
+             the AC-3 PMT carriage), got codec={}",
+            enc.codec
+        );
+    }
     // Source PID override: must sit in the user-PID range; reserved
     // system PIDs (0x0000..=0x000F) and the NULL PID (0x1FFF) refused.
     if let Some(pid) = enc.source_audio_pid
@@ -4829,6 +4848,21 @@ fn validate_audio_encode(
                 "{context}: audio_encode.source_audio_pid 0x{pid:04X} out of range; must be in 0x0010..=0x1FFE"
             );
         }
+    Ok(())
+}
+
+/// Refuse `audio_encode.ts_signalling` where no TS audio replacer runs, so
+/// the setting cannot be saved as a silent no-op: HLS always signals AC-3
+/// the ATSC way (Apple HLS / hls.js expect 0x81), and PCM inputs build
+/// their TS with the shared muxer rather than the replacer.
+fn reject_ts_signalling(
+    enc: &crate::config::models::AudioEncodeConfig,
+    context: &str,
+    why: &str,
+) -> Result<()> {
+    if enc.ts_signalling.is_some() {
+        bail!("{context}: audio_encode.ts_signalling is not supported here — {why}");
+    }
     Ok(())
 }
 
@@ -5748,6 +5782,12 @@ pub fn validate_output_with_input(
                     enc,
                     &["aac_lc", "he_aac_v1", "he_aac_v2", "mp2", "ac3"],
                     &format!("HLS output '{}'", hls.id),
+                )?;
+                reject_ts_signalling(
+                    enc,
+                    &format!("HLS output '{}'", hls.id),
+                    "HLS always signals AC-3 the ATSC way (stream_type 0x81), which is what \
+                     Apple HLS and hls.js expect",
                 )?;
             }
             if let Some(ref tj) = hls.transcode {
@@ -11762,6 +11802,7 @@ mod tests {
             opus_dtx: false,
             opus_frame_duration_ms: None,
              source_audio_pid: None,
+             ts_signalling: None,
         }
     }
 
@@ -11789,6 +11830,38 @@ mod tests {
         // None (unset) accepted.
         enc.source_audio_pid = None;
         assert!(validate_audio_encode(&enc, &["aac_lc"], "test").is_ok());
+    }
+
+    #[test]
+    fn validate_audio_encode_ts_signalling_only_for_ac3() {
+        use crate::config::models::TsAudioSignalling;
+        let mut enc = make_audio_encode("ac3");
+        for v in [TsAudioSignalling::Auto, TsAudioSignalling::Dvb, TsAudioSignalling::Atsc] {
+            enc.ts_signalling = Some(v);
+            assert!(validate_audio_encode(&enc, &["ac3"], "test").is_ok());
+        }
+        let mut enc = make_audio_encode("mp2");
+        enc.ts_signalling = Some(TsAudioSignalling::Dvb);
+        let err = validate_audio_encode(&enc, &["mp2"], "test").unwrap_err().to_string();
+        assert!(err.contains("ts_signalling"), "{err}");
+        // Where no TS replacer runs, even an AC-3 value is refused.
+        let mut enc = make_audio_encode("ac3");
+        enc.ts_signalling = Some(TsAudioSignalling::Atsc);
+        assert!(reject_ts_signalling(&enc, "HLS output 'h'", "x").is_err());
+        enc.ts_signalling = None;
+        assert!(reject_ts_signalling(&enc, "HLS output 'h'", "x").is_ok());
+        // Serde: lowercase values; anything else is refused at parse time.
+        let parsed: crate::config::models::AudioEncodeConfig =
+            serde_json::from_value(serde_json::json!({"codec": "ac3", "ts_signalling": "dvb"}))
+                .unwrap();
+        assert_eq!(parsed.ts_signalling, Some(TsAudioSignalling::Dvb));
+        assert!(serde_json::from_value::<crate::config::models::AudioEncodeConfig>(
+            serde_json::json!({"codec": "ac3", "ts_signalling": "isdb"})
+        )
+        .is_err());
+        // Unset stays unset on the wire.
+        let v = serde_json::to_value(make_audio_encode("ac3")).unwrap();
+        assert!(v.get("ts_signalling").is_none());
     }
 
     #[test]
@@ -11921,6 +11994,7 @@ mod tests {
                 opus_dtx: false,
                 opus_frame_duration_ms: None,
                  source_audio_pid: None,
+                 ts_signalling: None,
             }),
             transcode: None,
             video_encode: None,
@@ -11961,6 +12035,7 @@ mod tests {
                 opus_dtx: false,
                 opus_frame_duration_ms: None,
                  source_audio_pid: None,
+                 ts_signalling: None,
             }),
             transcode: None,
         });
@@ -12153,6 +12228,7 @@ mod tests {
                 opus_dtx: false,
                 opus_frame_duration_ms: None,
                  source_audio_pid: None,
+                 ts_signalling: None,
             }),
             transcode: None,
             video_encode: None,
@@ -12420,6 +12496,7 @@ mod tests {
             silent_fallback: false,
             opus_vbr_mode: None, opus_fec: false, opus_dtx: false, opus_frame_duration_ms: None,
             source_audio_pid: None,
+            ts_signalling: None,
         };
         // Multi-program + audio_encode → rejected.
         assert!(check_multi_program_transcode_combo(Some(&multi), Some(&ae), None, "ctx").is_err());

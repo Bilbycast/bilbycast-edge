@@ -52,8 +52,13 @@ pub struct TsPidRemapper {
     pmt_pids: HashSet<u16>,
     /// Last PAT version we've observed; skips reparse of duplicates.
     last_pat_version: Option<u8>,
-    /// Last PMT version per PMT PID; skips reparse of duplicates.
-    last_pmt_versions: HashMap<u16, u8>,
+    /// Reassembling PSI stage per PMT PID (source PID space). Every section
+    /// of a unit is visible — a PMT behind a user-private table, several
+    /// programs' PMTs on one PID, a PMT spanning packets — and a rewritten
+    /// PMT is re-packetised with a valid CRC. The old in-place rewrite
+    /// wrote a "CRC" into the first packet of a multi-packet PMT, over
+    /// section data.
+    pmt_stages: HashMap<u16, super::ts_pmt_edit::PsiUnitStage>,
 }
 
 impl TsPidRemapper {
@@ -68,7 +73,7 @@ impl TsPidRemapper {
             remap,
             pmt_pids: HashSet::new(),
             last_pat_version: None,
-            last_pmt_versions: HashMap::new(),
+            pmt_stages: HashMap::new(),
         }
     }
 
@@ -120,9 +125,6 @@ impl TsPidRemapper {
             } else if self.pmt_pids.contains(&original_pid) {
                 // PMT: rewrite pcr_pid + elementary_PIDs, and remap header PID
                 // if this PMT PID is itself being moved.
-                if ts_pusi(pkt) {
-                    self.observe_pmt(original_pid, pkt);
-                }
                 self.emit_pmt(original_pid, pkt, out);
             } else if self.is_mapped(original_pid) {
                 // Ordinary PID remap — rewrite header PID field only.
@@ -205,22 +207,10 @@ impl TsPidRemapper {
 
         let programs = parse_pat_programs(pkt);
         self.pmt_pids.clear();
-        self.last_pmt_versions.clear();
         for (_, pmt_pid) in programs {
             self.pmt_pids.insert(pmt_pid);
         }
-    }
-
-    /// Parse a PMT — we don't cache its contents, only version-gate reparse.
-    fn observe_pmt(&mut self, pmt_pid: u16, pkt: &[u8]) {
-        if let Some(version) = pmt_version(pkt) {
-            let prev = self.last_pmt_versions.insert(pmt_pid, version);
-            if prev == Some(version) {
-                // Version unchanged — nothing to do. (Re-emission still
-                // happens in emit_pmt; this only avoids repeated log/work
-                // when we later grow to cache PMT contents.)
-            }
-        }
+        self.pmt_stages.retain(|pid, _| self.pmt_pids.contains(pid));
     }
 
     /// Emit a PAT packet, rewriting `program_map_PID` fields for any PMT
@@ -291,91 +281,55 @@ impl TsPidRemapper {
         out.extend_from_slice(&buf);
     }
 
-    /// Emit a PMT packet, rewriting `PCR_PID` + elementary `PID` fields
-    /// that are in the remap set, recomputing CRC, and rewriting the TS
-    /// header PID if the PMT PID itself is remapped.
-    fn emit_pmt(&self, pmt_pid: u16, pkt: &[u8], out: &mut Vec<u8>) {
-        let mut buf = [0u8; TS_PACKET_SIZE];
-        buf.copy_from_slice(pkt);
-
-        // Walk to the section start.
-        let mut sec_off = 4;
-        if ts_has_adaptation(&buf) {
-            let af_len = buf[4] as usize;
-            sec_off = 5 + af_len;
+    /// Emit a PMT-PID packet through the PID's reassembling stage,
+    /// rewriting `PCR_PID` + elementary `PID` fields that are in the remap
+    /// set in every PMT section of a completed unit (CRC recomputed), and
+    /// rewriting the TS header PID of every emitted packet if this PMT PID
+    /// is itself being moved.
+    fn emit_pmt(&mut self, pmt_pid: u16, pkt: &[u8], out: &mut Vec<u8>) {
+        let mut scratch = Vec::with_capacity(TS_PACKET_SIZE);
+        let unit = self
+            .pmt_stages
+            .entry(pmt_pid)
+            .or_insert_with(|| super::ts_pmt_edit::PsiUnitStage::new("ts_pid_remapper"))
+            .push(pkt, &mut scratch);
+        if let Some(mut unit) = unit {
+            for i in 0..unit.sections().len() {
+                if let Some(new) = self.remap_pmt_section(&unit.sections()[i]) {
+                    unit.replace_section(i, new);
+                }
+            }
+            if let Some(stage) = self.pmt_stages.get_mut(&pmt_pid) {
+                stage.emit(unit, &mut scratch);
+            }
         }
-        if sec_off >= TS_PACKET_SIZE {
-            // Malformed — just retag header PID and emit.
+        for p in scratch.chunks_exact(TS_PACKET_SIZE) {
+            let mut buf = [0u8; TS_PACKET_SIZE];
+            buf.copy_from_slice(p);
             if self.is_mapped(pmt_pid) {
                 write_pid(&mut buf, self.target(pmt_pid));
             }
             out.extend_from_slice(&buf);
-            return;
         }
-        let pointer = buf[sec_off] as usize;
-        sec_off += 1 + pointer;
-        if sec_off + 12 > TS_PACKET_SIZE {
-            if self.is_mapped(pmt_pid) {
-                write_pid(&mut buf, self.target(pmt_pid));
-            }
-            out.extend_from_slice(&buf);
-            return;
-        }
-        if buf[sec_off] != 0x02 {
-            // Not actually a PMT — leave alone.
-            if self.is_mapped(pmt_pid) {
-                write_pid(&mut buf, self.target(pmt_pid));
-            }
-            out.extend_from_slice(&buf);
-            return;
-        }
+    }
 
-        let section_length =
-            (((buf[sec_off + 1] & 0x0F) as usize) << 8) | (buf[sec_off + 2] as usize);
-
-        // Rewrite PCR_PID (13 bits at sec_off+8..+9).
-        let pcr_pid = ((buf[sec_off + 8] as u16 & 0x1F) << 8) | buf[sec_off + 9] as u16;
-        if self.is_mapped(pcr_pid) {
-            let new_pid = self.target(pcr_pid);
-            buf[sec_off + 8] = 0xE0 | (((new_pid >> 8) & 0x1F) as u8);
-            buf[sec_off + 9] = (new_pid & 0xFF) as u8;
+    /// Rebuild one PMT section with mapped `PCR_PID` / ES PIDs, or `None`
+    /// when it is not a PMT or nothing in it is mapped (it then stays
+    /// byte-identical).
+    fn remap_pmt_section(&self, section: &[u8]) -> Option<Vec<u8>> {
+        use super::ts_pmt_edit::{parse_pmt, rebuild_pmt_section, EsEdit, PmtEdit};
+        let view = parse_pmt(section)?;
+        let edits: Vec<EsEdit> = view
+            .es
+            .iter()
+            .filter(|es| self.is_mapped(es.pid))
+            .map(|es| EsEdit::Repid { pid: es.pid, new_pid: self.target(es.pid) })
+            .collect();
+        let pcr_pid = self.is_mapped(view.pcr_pid).then(|| self.target(view.pcr_pid));
+        if edits.is_empty() && pcr_pid.is_none() {
+            return None;
         }
-
-        let program_info_length =
-            (((buf[sec_off + 10] & 0x0F) as usize) << 8) | (buf[sec_off + 11] as usize);
-        let data_start = sec_off + 12 + program_info_length;
-        let data_end = (sec_off + 3 + section_length).min(TS_PACKET_SIZE).saturating_sub(4);
-
-        // Per-stream entries: stream_type(1) + reserved+PID(2) + reserved+es_info_len(2).
-        let mut pos = data_start;
-        while pos + 5 <= data_end {
-            let es_pid = ((buf[pos + 1] as u16 & 0x1F) << 8) | buf[pos + 2] as u16;
-            if self.is_mapped(es_pid) {
-                let new_pid = self.target(es_pid);
-                buf[pos + 1] = 0xE0 | (((new_pid >> 8) & 0x1F) as u8);
-                buf[pos + 2] = (new_pid & 0xFF) as u8;
-            }
-            let es_info_length =
-                (((buf[pos + 3] & 0x0F) as usize) << 8) | (buf[pos + 4] as usize);
-            pos += 5 + es_info_length;
-        }
-
-        // Recompute PMT CRC.
-        let crc_start = sec_off;
-        let crc_end = data_end;
-        if crc_end + 4 <= TS_PACKET_SIZE && crc_end >= crc_start {
-            let crc = mpeg2_crc32(&buf[crc_start..crc_end]);
-            buf[crc_end] = (crc >> 24) as u8;
-            buf[crc_end + 1] = (crc >> 16) as u8;
-            buf[crc_end + 2] = (crc >> 8) as u8;
-            buf[crc_end + 3] = crc as u8;
-        }
-
-        // Finally, rewrite TS header PID if this PMT PID itself is remapped.
-        if self.is_mapped(pmt_pid) {
-            write_pid(&mut buf, self.target(pmt_pid));
-        }
-        out.extend_from_slice(&buf);
+        rebuild_pmt_section(section, &PmtEdit { es: &edits, pcr_pid, ..Default::default() })
     }
 }
 
@@ -386,27 +340,6 @@ fn write_pid(pkt: &mut [u8; TS_PACKET_SIZE], pid: u16) {
     let pid = pid & 0x1FFF;
     pkt[1] = (pkt[1] & 0xE0) | ((pid >> 8) as u8 & 0x1F);
     pkt[2] = (pid & 0xFF) as u8;
-}
-
-/// Extract the `version_number` (5 bits) from a PMT section payload.
-fn pmt_version(pkt: &[u8]) -> Option<u8> {
-    let mut sec_off = 4;
-    if ts_has_adaptation(pkt) {
-        let af_len = pkt[4] as usize;
-        sec_off = 5 + af_len;
-    }
-    if sec_off >= TS_PACKET_SIZE {
-        return None;
-    }
-    let pointer = pkt[sec_off] as usize;
-    sec_off += 1 + pointer;
-    if sec_off + 6 > TS_PACKET_SIZE {
-        return None;
-    }
-    if pkt[sec_off] != 0x02 {
-        return None;
-    }
-    Some((pkt[sec_off + 5] >> 1) & 0x1F)
 }
 
 #[cfg(test)]
@@ -494,6 +427,55 @@ mod tests {
         pkt[2] = (pid & 0xFF) as u8;
         pkt[3] = 0x10 | (cc & 0x0F);
         pkt
+    }
+
+    /// VH1.ts: the PMT sits behind a 0xC0 section on its PID; the remap
+    /// must reach it and leave the 0xC0 table byte-identical.
+    #[test]
+    fn remaps_a_pmt_behind_a_private_section() {
+        use crate::engine::ts_test_fixtures::{vh1_pat_packet, vh1_pmt_packet, VH1_PMT_OFFSET};
+        let mut map = BTreeMap::new();
+        map.insert(0x0E10u16, 0x0101u16);
+        let mut r = TsPidRemapper::new(&map);
+        let mut out = Vec::new();
+        r.process(&vh1_pat_packet(), &mut out);
+        out.clear();
+        let pmt = vh1_pmt_packet();
+        r.process(&pmt, &mut out);
+        assert_eq!(out.len(), TS_PACKET_SIZE);
+        assert_eq!(&out[..VH1_PMT_OFFSET], &pmt[..VH1_PMT_OFFSET]);
+        assert!(verify_psi_crc(&out, VH1_PMT_OFFSET));
+        let s = find_section_in_packet(&out, 0x02, None).unwrap();
+        let v = crate::engine::ts_pmt_edit::parse_pmt(&out[s.start..s.end()]).unwrap();
+        assert_eq!(v.es[1].pid, 0x0101);
+    }
+
+    /// A PMT spanning two packets: the in-place rewrite used to write a
+    /// "CRC" over section data in the first packet.
+    #[test]
+    fn remaps_a_two_packet_pmt_with_a_valid_crc() {
+        use crate::engine::ts_test_fixtures::{packetize_sections, pat_packet, two_packet_pmt};
+        let (sec, target) = two_packet_pmt(1, 0);
+        let pkts = packetize_sections(0x40, &[&sec], 0);
+        let mut map = BTreeMap::new();
+        map.insert(target, 0x0300u16);
+        map.insert(0x40u16, 0x0050u16);
+        let mut r = TsPidRemapper::new(&map);
+        let mut out = Vec::new();
+        r.process(&pat_packet(&[(1, 0x40)], 0, 0), &mut out);
+        out.clear();
+        r.process(&[pkts[0], pkts[1]].concat(), &mut out);
+        assert_eq!(out.len(), 2 * TS_PACKET_SIZE);
+        assert!(out.chunks(TS_PACKET_SIZE).all(|p| ts_pid(p) == 0x50));
+        let mut asm = SectionAssembler::new();
+        let mut secs = Vec::new();
+        for p in out.chunks(TS_PACKET_SIZE) {
+            secs.extend(asm.push_packet(p).map(|s| s.to_vec()));
+        }
+        assert_eq!(secs.len(), 1);
+        assert_eq!(mpeg2_crc32(&secs[0]), 0);
+        let v = crate::engine::ts_pmt_edit::parse_pmt(&secs[0]).unwrap();
+        assert!(v.es.iter().any(|e| e.pid == 0x0300));
     }
 
     #[test]

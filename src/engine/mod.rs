@@ -121,6 +121,9 @@ pub mod resource_monitor;
 pub mod rtmp;
 pub mod scte35_encode;
 pub mod thumbnail;
+/// "Configured but never engaged" watchdog shared by the audio and video
+/// transcode replacers (`*_transcode_source_not_found` events).
+pub mod transcode_engage;
 pub mod tr101290;
 /// Phase 5 PID-bus SPTS assembler: subscribes to elementary streams on
 /// [`ts_es_bus::NodeEsBus`], rewrites PIDs, stamps per-out-PID continuity,
@@ -145,6 +148,12 @@ pub mod ts_es_bus;
 pub mod ts_es_hitless;
 pub mod ts_null_padder;
 pub mod ts_parse;
+/// Shared PMT editing: section rebuild with per-target descriptor policy,
+/// content-tracked version stamping, and the reassembling PMT-PID stage
+/// that edits single-packet, multi-section and multi-packet PMTs on one
+/// code path. Used by both transcode replacers, the PID rewriters and the
+/// HLS audio remux.
+pub mod ts_pmt_edit;
 pub mod ts_pid_overrides_rewriter;
 pub mod ts_pid_remapper;
 pub mod ts_program_filter;

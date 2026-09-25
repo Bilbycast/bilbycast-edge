@@ -453,6 +453,16 @@ pub struct PsiSectionRef {
     pub complete: bool,
 }
 
+impl PsiSectionRef {
+    /// Offset one past the section's last byte (may lie beyond the buffer
+    /// when `!complete`).
+    #[cfg(test)]
+    #[inline]
+    pub fn end(&self) -> usize {
+        self.start + 3 + self.section_length
+    }
+}
+
 /// Iterator over the PSI sections that START in one buffer, walking from
 /// the pointer_field target in steps of `3 + section_length`. Stops at
 /// 0xFF stuffing, at the first section that runs off the buffer (which it
@@ -706,6 +716,12 @@ impl SectionAssembler {
         self.buf.clear();
         self.assembling = false;
         self.last_cc = None;
+    }
+
+    /// True while a section has started but not completed — the next
+    /// continuation packet on this PID carries its bytes.
+    pub fn in_flight(&self) -> bool {
+        self.assembling
     }
 
     fn completed(&self) -> CompletedSections<'_> {

@@ -640,11 +640,23 @@ fn remux_ts_audio_inprocess(
     const TS_PACKET_SIZE: usize = 188;
     const TS_SYNC_BYTE: u8 = 0x47;
 
+    use super::ts_pmt_edit::{
+        parse_pmt, pmt_index, rebuild_pmt_section, AudioTarget, EsEdit, PmtEdit, PsiUnitStage,
+        TsFlavour,
+    };
+
     // ── Pass 1: Find PIDs from PAT/PMT ──
+    //
+    // PMT sections are reassembled, so a PMT spanning packets or sitting
+    // behind a user-private table on its PID (ATSC / DigiCipher 0xC0) is
+    // found — the pointer-target-only read used to fail the whole segment
+    // remux ("no audio PID found") on such streams.
     let mut pmt_pid: Option<u16> = None;
+    let mut program: Option<(u16, bool)> = None; // (program_number, pid_shared)
     let mut video_pid: Option<u16> = None;
     let mut audio_pid: Option<u16> = None;
     let mut audio_stream_type: u8 = 0;
+    let mut pmt_asm = super::ts_parse::SectionAssembler::new();
 
     let mut offset = 0;
     while offset + TS_PACKET_SIZE <= segment.len() {
@@ -660,13 +672,19 @@ fn remux_ts_audio_inprocess(
             let mut programs = parse_pat_programs(pkt);
             if !programs.is_empty() {
                 programs.sort_by_key(|(num, _)| *num);
-                pmt_pid = Some(programs[0].1);
+                let (pn, ppid) = programs[0];
+                pmt_pid = Some(ppid);
+                program = Some((pn, programs.iter().filter(|(_, p)| *p == ppid).count() > 1));
             }
         }
 
-        if Some(pid) == pmt_pid && ts_pusi(pkt) && video_pid.is_none() {
-            // Parse PMT for video + audio PIDs
-            if let Some((vpid, apid, ast)) = parse_pmt_av_pids(pkt) {
+        if Some(pid) == pmt_pid && video_pid.is_none() {
+            let sections: Vec<Vec<u8>> = pmt_asm.push_packet(pkt).map(|s| s.to_vec()).collect();
+            if let Some((pn, shared)) = program
+                && let Some(i) = pmt_index(&sections, pn, shared)
+                && let Some(view) = parse_pmt(&sections[i])
+                && let Some((vpid, apid, ast)) = pmt_av_pids(&view)
+            {
                 video_pid = Some(vpid);
                 audio_pid = Some(apid);
                 audio_stream_type = ast;
@@ -682,14 +700,10 @@ fn remux_ts_audio_inprocess(
     let audio_pid = audio_pid.ok_or("no audio PID found in segment")?;
     let _video_pid = video_pid.ok_or("no video PID found in segment")?;
     let pmt_pid = pmt_pid.ok_or("no PMT PID found in segment")?;
-
-    // ── Determine target audio stream type for PMT ──
-    let target_stream_type: u8 = match codec {
-        AudioCodec::AacLc | AudioCodec::HeAacV1 | AudioCodec::HeAacV2 => 0x0F, // ADTS
-        AudioCodec::Mp2 => 0x03, // MPEG audio
-        AudioCodec::Ac3 => 0x81, // AC-3
-        AudioCodec::Opus => return Err("Opus not supported on HLS".into()),
-    };
+    let (program_number, pmt_pid_shared) = program.ok_or("no program in the PAT")?;
+    if matches!(codec, AudioCodec::Opus) {
+        return Err("Opus not supported on HLS".into());
+    }
 
     // ── Collect audio PES data and determine source format ──
     let mut audio_pes_list: Vec<(Vec<u8>, u64)> = Vec::new(); // (PES data, PTS)
@@ -749,6 +763,28 @@ fn remux_ts_audio_inprocess(
         transcode.as_ref(),
     )?;
 
+    // ── Target signalling for the PMT ──
+    //
+    // HLS is always ATSC-flavoured for AC-3 (0x81 + "AC-3" registration):
+    // that is what Apple HLS and hls.js expect in TS segments, whatever the
+    // source's convention. MP2 at 16 / 22.05 / 24 kHz is MPEG-2 LSF (0x04).
+    let target = match codec {
+        AudioCodec::AacLc | AudioCodec::HeAacV1 | AudioCodec::HeAacV2 => AudioTarget::Aac,
+        AudioCodec::Mp2 => {
+            let out_sr = transcode
+                .as_ref()
+                .and_then(|t| t.sample_rate)
+                .or(sample_rate_override)
+                .or_else(|| decoded_pcm.first().map(|f| f.sample_rate))
+                .unwrap_or(0);
+            AudioTarget::Mp2 { lsf: matches!(out_sr, 16_000 | 22_050 | 24_000) }
+        }
+        AudioCodec::Ac3 => AudioTarget::Ac3 { flavour: TsFlavour::Atsc },
+        AudioCodec::Opus => unreachable!("rejected above"),
+    };
+    let edit = [EsEdit::Audio { pid: audio_pid, target }];
+    let mut pmt_stage = PsiUnitStage::new("hls_audio_remux");
+
     // ── Build output segment ──
     // Copy all non-audio TS packets, rewrite PMT, insert new audio packets
     let mut output = Vec::with_capacity(segment.len());
@@ -790,11 +826,29 @@ fn remux_ts_audio_inprocess(
             continue;
         }
 
-        if pid == pmt_pid && ts_pusi(pkt) {
-            // Rewrite PMT with new audio stream type
-            let mut rewritten = pkt.to_vec();
-            rewrite_pmt_audio_stream_type(&mut rewritten, audio_pid, target_stream_type);
-            output.extend_from_slice(&rewritten);
+        if pid == pmt_pid {
+            // Rewrite the program's PMT: new audio stream_type and the
+            // target's descriptor policy (source codec descriptors dropped).
+            if let Some(mut unit) = pmt_stage.push(pkt, &mut output) {
+                if let Some(i) = pmt_index(unit.sections(), program_number, pmt_pid_shared) {
+                    let section = unit.sections()[i].clone();
+                    let rebuilt = rebuild_pmt_section(&section, &PmtEdit { es: &edit, ..Default::default() })
+                        .and_then(|full| {
+                            if unit.fits_source_packets_with(i, &full) {
+                                Some(full)
+                            } else {
+                                rebuild_pmt_section(
+                                    &section,
+                                    &PmtEdit { es: &edit, no_additions: true, ..Default::default() },
+                                )
+                            }
+                        });
+                    if let Some(new_section) = rebuilt {
+                        unit.replace_section(i, new_section);
+                    }
+                }
+                pmt_stage.emit(unit, &mut output);
+            }
             continue;
         }
 
@@ -817,51 +871,24 @@ fn remux_ts_audio_inprocess(
     Ok(output)
 }
 
-/// Parse PMT to find both video and audio PIDs.
-/// Returns (video_pid, audio_pid, audio_stream_type).
+/// Video and audio PIDs of a parsed PMT (the last H.264 / HEVC ES and the
+/// last MPEG / AAC / AC-3 / private ES, as this remux always picked).
+/// Returns `(video_pid, audio_pid, audio_stream_type)`.
 #[cfg(feature = "media-codecs")]
-fn parse_pmt_av_pids(pkt: &[u8]) -> Option<(u16, u16, u8)> {
-    use super::ts_parse::ts_has_adaptation;
-    const TS_PACKET_SIZE: usize = 188;
-
-    let mut offset = 4;
-    if ts_has_adaptation(pkt) {
-        let af_len = pkt[4] as usize;
-        offset = 5 + af_len;
-    }
-    if offset >= TS_PACKET_SIZE { return None; }
-
-    let pointer = pkt[offset] as usize;
-    offset += 1 + pointer;
-    if offset + 12 > TS_PACKET_SIZE || pkt[offset] != 0x02 { return None; }
-
-    let section_length = (((pkt[offset + 1] & 0x0F) as usize) << 8) | (pkt[offset + 2] as usize);
-    let program_info_length = (((pkt[offset + 10] & 0x0F) as usize) << 8) | (pkt[offset + 11] as usize);
-    let data_start = offset + 12 + program_info_length;
-    let data_end = (offset + 3 + section_length).min(TS_PACKET_SIZE).saturating_sub(4);
-
+fn pmt_av_pids(view: &super::ts_pmt_edit::PmtView<'_>) -> Option<(u16, u16, u8)> {
     let mut video_pid = None;
-    let mut audio_pid = None;
-    let mut audio_st = 0u8;
-
-    let mut pos = data_start;
-    while pos + 5 <= data_end {
-        let st = pkt[pos];
-        let es_pid = ((pkt[pos + 1] as u16 & 0x1F) << 8) | pkt[pos + 2] as u16;
-        let es_info_len = (((pkt[pos + 3] & 0x0F) as usize) << 8) | (pkt[pos + 4] as usize);
-
+    let mut audio: Option<(u16, u8)> = None;
+    for es in &view.es {
+        let st = es.stream_type;
         if st == 0x1B || st == 0x24 {
-            video_pid = Some(es_pid);
+            video_pid = Some(es.pid);
         }
         if st == 0x0F || st == 0x03 || st == 0x04 || st == 0x81 || st == 0x06 {
-            audio_pid = Some(es_pid);
-            audio_st = st;
+            audio = Some((es.pid, st));
         }
-        pos += 5 + es_info_len;
     }
-
-    match (video_pid, audio_pid) {
-        (Some(v), Some(a)) => Some((v, a, audio_st)),
+    match (video_pid, audio) {
+        (Some(v), Some((a, st))) => Some((v, a, st)),
         _ => None,
     }
 }
@@ -1365,53 +1392,6 @@ fn packetize_ts(pid: u16, pes: &[u8], cc: &mut u8) -> Vec<[u8; 188]> {
     packets
 }
 
-/// Rewrite the audio stream_type in a PMT TS packet and recalculate CRC.
-#[cfg(feature = "media-codecs")]
-fn rewrite_pmt_audio_stream_type(pkt: &mut [u8], audio_pid: u16, new_stream_type: u8) {
-    use super::ts_parse::{ts_has_adaptation, mpeg2_crc32, psi_crc_offset};
-    const TS_PACKET_SIZE: usize = 188;
-
-    let mut offset = 4;
-    if ts_has_adaptation(pkt) {
-        let af_len = pkt[4] as usize;
-        offset = 5 + af_len;
-    }
-    if offset >= TS_PACKET_SIZE { return; }
-
-    let pointer = pkt[offset] as usize;
-    offset += 1 + pointer;
-
-    if offset + 12 > TS_PACKET_SIZE || pkt[offset] != 0x02 { return; }
-
-    let section_start = offset;
-    let section_length = (((pkt[offset + 1] & 0x0F) as usize) << 8) | (pkt[offset + 2] as usize);
-    let program_info_length = (((pkt[offset + 10] & 0x0F) as usize) << 8) | (pkt[offset + 11] as usize);
-    let data_start = offset + 12 + program_info_length;
-    let data_end = (offset + 3 + section_length).min(TS_PACKET_SIZE).saturating_sub(4);
-
-    // Find and rewrite the audio stream entry
-    let mut pos = data_start;
-    while pos + 5 <= data_end {
-        let es_pid = ((pkt[pos + 1] as u16 & 0x1F) << 8) | pkt[pos + 2] as u16;
-        let es_info_len = (((pkt[pos + 3] & 0x0F) as usize) << 8) | (pkt[pos + 4] as usize);
-
-        if es_pid == audio_pid {
-            pkt[pos] = new_stream_type;
-        }
-
-        pos += 5 + es_info_len;
-    }
-
-    // Recalculate CRC32 over the section (excluding the CRC bytes themselves)
-    if let Some(crc_offset) = psi_crc_offset(section_start, section_length) {
-        let crc = mpeg2_crc32(&pkt[section_start..crc_offset]);
-        pkt[crc_offset] = (crc >> 24) as u8;
-        pkt[crc_offset + 1] = (crc >> 16) as u8;
-        pkt[crc_offset + 2] = (crc >> 8) as u8;
-        pkt[crc_offset + 3] = crc as u8;
-    }
-}
-
 // ════════════════════════════════════════════════════════════════════════
 // ffmpeg subprocess fallback (when media-codecs feature is disabled)
 // ════════════════════════════════════════════════════════════════════════
@@ -1532,6 +1512,7 @@ mod tests {
             opus_dtx: false,
             opus_frame_duration_ms: None,
             source_audio_pid: None,
+            ts_signalling: None,
         }
     }
 
@@ -1606,5 +1587,66 @@ mod tests {
         assert!(j.contains("-b:a 96k"));
         assert!(j.contains("-ar 44100"));
         assert!(j.contains("-ac 1"));
+    }
+}
+
+#[cfg(all(test, feature = "media-codecs", feature = "fdk-aac"))]
+mod pmt_remux_tests {
+    use super::*;
+    use crate::engine::ts_pmt_edit::{descriptors, is_pmt_for, parse_pmt};
+    use crate::engine::ts_test_fixtures::{packetize_sections, pat_packet, pmt_section};
+
+    /// A segment whose PMT PID carries a short-form 0xC0 section ahead of
+    /// the PMT (ATSC / DigiCipher shape) and an AAC ES with an AAC
+    /// descriptor. The AC-3 remux must find the PMT, signal ATSC (0x81 +
+    /// "AC-3" registration — what Apple HLS / hls.js expect, whatever the
+    /// source flavour), drop the stale AAC descriptor, and keep the 0xC0
+    /// section byte-identical.
+    #[test]
+    fn ac3_remux_is_atsc_signalled_behind_a_private_section() {
+        const ADTS: &[u8] = include_bytes!("testdata/sine1k_aac_lc_48k_stereo.adts");
+        let c0 = vec![0xC0, 0x00, 0x05, 1, 2, 3, 4, 5];
+        let pmt = pmt_section(
+            1,
+            0,
+            0x100,
+            &[],
+            &[(0x1B, 0x100, &[]), (0x0F, 0x101, &[0x0A, 0x04, b'e', b'n', b'g', 0, 0x7C, 0x01, 0x58])],
+        );
+        let mut seg = pat_packet(&[(1, 0x1000)], 0, 0).to_vec();
+        seg.extend_from_slice(&packetize_sections(0x1000, &[&c0, &pmt], 0)[0]);
+        let mut cc = 0u8;
+        let mut off = 0usize;
+        let mut pts = 90_000u64;
+        while off + 7 <= ADTS.len() {
+            let len = (((ADTS[off + 3] as usize) & 0x03) << 11)
+                | ((ADTS[off + 4] as usize) << 3)
+                | ((ADTS[off + 5] as usize) >> 5);
+            if len == 0 || off + len > ADTS.len() {
+                break;
+            }
+            let pes = build_audio_pes(&ADTS[off..off + len], pts);
+            for p in packetize_ts(0x101, &pes, &mut cc) {
+                seg.extend_from_slice(&p);
+            }
+            pts += 1920;
+            off += len;
+        }
+        let out = remux_ts_audio_inprocess(&seg, AudioCodec::Ac3, 192, None, None, None)
+            .expect("remux");
+        let pmt_pkt = out
+            .chunks(188)
+            .find(|p| crate::engine::ts_parse::ts_pid(p) == 0x1000)
+            .expect("PMT packet in the output");
+        assert_eq!(&pmt_pkt[5..5 + c0.len()], &c0[..], "0xC0 section byte-identical");
+        let s = crate::engine::ts_parse::find_section_in_packet(pmt_pkt, 0x02, Some(1)).unwrap();
+        let sec = &pmt_pkt[s.start..s.end()];
+        assert!(is_pmt_for(sec, 1));
+        assert_eq!(crate::engine::ts_parse::mpeg2_crc32(sec), 0);
+        let v = parse_pmt(sec).unwrap();
+        let a = v.es.iter().find(|e| e.pid == 0x101).unwrap();
+        assert_eq!(a.stream_type, 0x81);
+        let tags: Vec<u8> = descriptors(v.es_info(a)).map(|(t, _)| t).collect();
+        assert_eq!(tags, vec![0x0A, 0x05], "7C dropped, AC-3 registration added");
     }
 }
