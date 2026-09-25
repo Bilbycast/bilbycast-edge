@@ -501,3 +501,83 @@ mod tests {
         assert!(matches!(w.note_locked(0x101, 0x0F), Some(EngageEvent::Found { .. })));
     }
 }
+
+/// How long [`PrePmtGate`] holds a replacer's output to PSI before it gives
+/// up and falls back to passthrough.
+pub const PRE_PMT_GATE: Duration = Duration::from_secs(5);
+
+/// The replacers' pre-PMT gate (defect 4). Until the program's PMT has been
+/// parsed a replacer forwards only PSI / SI (PIDs 0x00–0x1F, and the PMT PID
+/// it routes before asking) and null packets: source ES ahead of the PMT
+/// would reach the wire untranscoded — raw timestamps, no SPS / PPS, source
+/// PCRs — and the replacer's first packet on the PID would then jump its CC.
+/// Nothing ahead of the PMT is decodable anyway. A PMT that never parses
+/// opens the gate after [`PRE_PMT_GATE`] (today's passthrough — the engage
+/// watchdog's `*_transcode_source_not_found` says why). Re-armed when the
+/// PAT moves the program to a new PMT PID.
+#[derive(Debug, Default)]
+pub struct PrePmtGate {
+    pmt_parsed: bool,
+    started: Option<Instant>,
+    fallback: bool,
+}
+
+impl PrePmtGate {
+    /// The program's PMT parsed: the gate opens.
+    pub fn open(&mut self) {
+        self.pmt_parsed = true;
+    }
+
+    /// A new program (PMT PID change): closed until its PMT parses.
+    pub fn rearm(&mut self, now: Instant) {
+        *self = Self { started: Some(now), ..Self::default() };
+    }
+
+    /// Whether `pid` must be dropped now. The timer arms on the first packet
+    /// of any kind.
+    pub fn drops(&mut self, pid: u16, now: Instant, what: &str) -> bool {
+        if self.pmt_parsed || self.fallback {
+            return false;
+        }
+        let started = *self.started.get_or_insert(now);
+        if pid <= 0x1F || pid == 0x1FFF {
+            return false;
+        }
+        if now.saturating_duration_since(started) >= PRE_PMT_GATE {
+            self.fallback = true;
+            tracing::warn!(
+                "{what}: no PMT for the program within {} s — passing the stream through \
+                 untranscoded until one parses",
+                PRE_PMT_GATE.as_secs()
+            );
+            return false;
+        }
+        true
+    }
+}
+
+/// Last passthrough continuity counter per PID, so a replacer that takes a
+/// PID over continues its CC sequence. One 8 KiB table per replacer,
+/// allocated once (`0xFF` = never seen).
+pub struct PassthroughCc(Box<[u8; 8192]>);
+
+impl Default for PassthroughCc {
+    fn default() -> Self {
+        Self(Box::new([0xFF; 8192]))
+    }
+}
+
+impl PassthroughCc {
+    /// Record the CC of a packet that went out untouched.
+    pub fn note(&mut self, pid: u16, pkt: &[u8]) {
+        self.0[(pid & 0x1FFF) as usize] = pkt[3] & 0x0F;
+    }
+
+    /// The CC the replacer's first payload packet on `pid` should carry.
+    pub fn next_after(&self, pid: u16) -> Option<u8> {
+        match self.0[(pid & 0x1FFF) as usize] {
+            0xFF => None,
+            cc => Some((cc + 1) & 0x0F),
+        }
+    }
+}

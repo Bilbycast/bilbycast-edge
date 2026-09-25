@@ -1516,16 +1516,17 @@ impl OutputStatsAccumulator {
             // as 0 (no replacer in their data path); the snapshot's
             // serde-skip_serializing_if_zero handlers hide them in JSON
             // so the manager UI just sees `source_pid: undefined`.
-            let (src_pid, src_stream_type) = self
+            let (src_pid, src_stream_type, pre_pmt_dropped) = self
                 .audio_replacer_stats
                 .get()
                 .map(|s| {
                     (
                         s.source_pid.load(Ordering::Relaxed),
                         s.source_stream_type.load(Ordering::Relaxed),
+                        s.pre_pmt_dropped_packets.load(Ordering::Relaxed),
                     )
                 })
-                .unwrap_or((0, 0));
+                .unwrap_or((0, 0, 0));
             crate::stats::models::EncodeStatsSnapshot {
                 pcm_frames_submitted: h.stats.pcm_frames_submitted.load(Ordering::Relaxed),
                 pcm_frames_dropped: h.stats.pcm_frames_dropped.load(Ordering::Relaxed),
@@ -1537,6 +1538,7 @@ impl OutputStatsAccumulator {
                 target_bitrate_kbps: h.target_bitrate_kbps,
                 source_pid: src_pid,
                 source_stream_type: src_stream_type,
+                pre_pmt_dropped_packets: pre_pmt_dropped,
             }
         });
         let video_decode_stats = self.video_decode_stats.get().map(|h| h.snapshot());
@@ -1565,6 +1567,7 @@ impl OutputStatsAccumulator {
                 supervisor_restarts: h.stats.supervisor_restarts.load(Ordering::Relaxed),
                 source_pid: h.stats.source_pid.load(Ordering::Relaxed),
                 source_stream_type: h.stats.source_stream_type.load(Ordering::Relaxed),
+                pre_pmt_dropped_packets: h.stats.pre_pmt_dropped_packets.load(Ordering::Relaxed),
             }
         });
         // Audio-only stall on a display output: the decode stage delivered
@@ -4669,6 +4672,7 @@ impl FlowStatsAccumulator {
                         target_bitrate_kbps: h.target_bitrate_kbps,
                         source_pid: 0,
                         source_stream_type: 0,
+                        pre_pmt_dropped_packets: 0,
                     }
                 });
                 let in_video_decode = self
@@ -4700,6 +4704,10 @@ impl FlowStatsAccumulator {
                         supervisor_restarts: h.stats.supervisor_restarts.load(Ordering::Relaxed),
                         source_pid: h.stats.source_pid.load(Ordering::Relaxed),
                         source_stream_type: h.stats.source_stream_type.load(Ordering::Relaxed),
+                        pre_pmt_dropped_packets: h
+                            .stats
+                            .pre_pmt_dropped_packets
+                            .load(Ordering::Relaxed),
                     }
                 });
                 let ingress_static_snap = self

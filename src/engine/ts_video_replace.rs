@@ -17,6 +17,11 @@
 //! - That PMT is rebuilt: target stream_type, `PCR_PID` = video PID, the
 //!   video descriptor policy, a content-tracked version and a valid CRC —
 //!   also when the PMT spans packets.
+//! - Until that PMT has been parsed only PSI / SI (PIDs ≤ 0x1F and the PMT
+//!   PID) is forwarded: source video, audio and PCRs ahead of it would go
+//!   out untranscoded, with a CC jump when the replacer took the PID over.
+//!   A PMT that never parses opens the gate after 5 s (today's
+//!   passthrough; the engage watchdog says why).
 //! - Every input PCR on the source PCR_PID — inside a video payload packet
 //!   too — leaves as an adaptation-field-only packet on the video PID at
 //!   the same stream position, value and DI unchanged. The re-encoded PES
@@ -75,6 +80,8 @@ pub struct VideoEncodeStats {
     pub last_latency_us: AtomicU64,
     /// Number of times the encoder supervisor restarted the backend.
     pub supervisor_restarts: AtomicU64,
+    /// Non-PSI packets dropped before the program's PMT was parsed.
+    pub pre_pmt_dropped_packets: AtomicU64,
     /// Source video PID the replacer locked onto (discovered from the PMT
     /// or pinned via `video_encode.source_video_pid`). `0` means "not
     /// yet known" — the replacer hasn't seen the PMT yet on this run.
@@ -404,7 +411,9 @@ impl TsVideoReplacer {
 #[cfg(feature = "media-codecs")]
 mod inner {
     use super::*;
-    use crate::engine::transcode_engage::{EngageEvent, TranscodeEngageWatch, TranscodeKind};
+    use crate::engine::transcode_engage::{
+        EngageEvent, PassthroughCc, PrePmtGate, TranscodeEngageWatch, TranscodeKind,
+    };
     use crate::engine::ts_pmt_edit::{
         parse_pmt, pmt_index, rebuild_pmt_section, EsEdit, OutVersion, PmtEdit, PsiUnit,
         PsiUnitStage,
@@ -432,9 +441,13 @@ mod inner {
         /// program_number of the program the replacer follows (the lowest
         /// in the PAT). PMT sections are matched on it.
         program_number: Option<u16>,
+        /// Pre-PMT gate: PSI only until the program's PMT parses.
+        gate: PrePmtGate,
         /// Source PCR_PID from the program's PMT, before the rebuild points
         /// it at the video PID. `None` for 0x1FFF.
         pub(super) source_pcr_pid: Option<u16>,
+        /// Last passthrough CC per PID (seeds `out_video_cc` on takeover).
+        passthrough_cc: PassthroughCc,
         /// The PAT maps another program to the same PMT PID.
         pmt_pid_shared: bool,
         /// Reassembling PMT-PID stage — see `ts_pmt_edit::PsiUnitStage`.
@@ -659,7 +672,9 @@ mod inner {
                 fps_den: cfg.fps_den,
                 pmt_pid: None,
                 program_number: None,
+                gate: PrePmtGate::default(),
                 source_pcr_pid: None,
+                passthrough_cc: PassthroughCc::default(),
                 pmt_pid_shared: false,
                 pmt_stage: PsiUnitStage::new("ts_video_replace"),
                 engage: TranscodeEngageWatch::new(TranscodeKind::Video, source_video_pid_pin),
@@ -809,10 +824,12 @@ mod inner {
                             if self.pmt_pid.is_some() {
                                 // Input switched and chose a different PMT
                                 // PID — anything cached about the old
-                                // program is stale.
+                                // program is stale, and the gate re-arms
+                                // until the new program's PMT parses.
                                 self.video_pid = None;
                                 self.source_stream_type = 0;
                                 self.reset_source_state("PMT PID changed");
+                                self.gate.rearm(now);
                                 self.source_pcr_pid = None;
                             }
                             if self.pmt_pid != Some(new_pmt_pid) {
@@ -837,6 +854,16 @@ mod inner {
                     if let Some(unit) = self.pmt_stage.push(pkt, output) {
                         self.handle_pmt_unit(unit, output);
                     }
+                    continue;
+                }
+
+                // Pre-PMT gate: PSI / SI (PIDs 0x00-0x1F — PAT, NIT, SDT,
+                // EIT, TDT) and null stuffing only. Source video, audio and
+                // PCRs ahead of the PMT would reach the wire untranscoded,
+                // with raw timestamps and a CC jump once the replacer took
+                // over.
+                if self.gate.drops(pid, now, "ts_video_replace") {
+                    self.stats.pre_pmt_dropped_packets.fetch_add(1, Ordering::Relaxed);
                     continue;
                 }
 
@@ -865,6 +892,7 @@ mod inner {
                     continue;
                 }
 
+                self.passthrough_cc.note(pid, pkt);
                 output.extend_from_slice(pkt);
             }
 
@@ -912,8 +940,10 @@ mod inner {
                 self.pmt_stage.emit(unit, output);
                 return;
             };
-            // The input PCR is followed on the source PCR_PID (before the
+            // The program's PMT is known: the pre-PMT gate opens, and the
+            // input PCR is followed on the source PCR_PID (before the
             // rebuild below points PCR_PID at the video PID).
+            self.gate.open();
             self.source_pcr_pid = (view.pcr_pid != 0x1FFF).then_some(view.pcr_pid);
             let sel = select_video_es(&view, self.source_video_pid_pin);
             self.engage.note_pmt_parsed(sel.es.clone(), sel.unsupported_candidate);
@@ -954,6 +984,14 @@ mod inner {
                         "source changed: stream_type {:#04x} -> {:#04x}, pid {:?} -> {}",
                         self.source_stream_type, vst, self.video_pid, vpid
                     ));
+                }
+                if self.video_pid != Some(vpid) {
+                    // Taking the PID over: continue the CC sequence of
+                    // whatever was passed through on it (the gate
+                    // fallback, or a previous program layout).
+                    if let Some(cc) = self.passthrough_cc.next_after(vpid) {
+                        self.out_video_cc = cc;
+                    }
                 }
                 self.video_pid = Some(vpid);
                 self.source_stream_type = vst;
@@ -2173,7 +2211,7 @@ mod tests {
         assert_eq!(ver(&v2b), ver(&v2), "and holds afterwards");
     }
 
-    // ── PCR carry (defects 3 / x) ──
+    // ── PCR carry (defect 3 / x), pre-PMT gate (4) ──
 
     const MS27: u64 = 27_000;
 
@@ -2289,5 +2327,70 @@ mod tests {
         assert_eq!(ts_pid(&got[0]), 0x100);
         assert_eq!(crate::engine::ts_parse::extract_pcr(&got[0]), Some(27_000_000));
         assert_eq!(got[1], src, "the source PCR packet passes through untouched");
+    }
+
+    #[test]
+    fn nothing_but_psi_passes_before_the_pmt() {
+        let mut r = TsVideoReplacer::new(&cfg("x264"), None).unwrap();
+        let mut out = Vec::new();
+        let mut sdt = crate::engine::ts_test_fixtures::payload_packet(0x11, 0);
+        sdt[1] |= 0x40;
+        let before = [
+            pcr_payload_packet(0x100, 0, 27_000_000, true),
+            crate::engine::ts_test_fixtures::pes_start_packet(0x101, 0, 0xC0, 90_000, None),
+            synth_pat(0x1000),
+            sdt,
+            crate::engine::ts_test_fixtures::payload_packet(0x100, 1),
+        ];
+        for p in &before {
+            r.process(p, &mut out);
+        }
+        let got = pkts(&out);
+        assert_eq!(got, vec![synth_pat(0x1000), sdt], "only PAT and SI");
+        assert_eq!(r.stats_handle().pre_pmt_dropped_packets.load(Ordering::Relaxed), 3);
+        // Once the PMT parsed, audio passes through.
+        out.clear();
+        r.process(&two_es_pmt(0x100), &mut out);
+        out.clear();
+        let audio = crate::engine::ts_test_fixtures::pes_start_packet(0x101, 1, 0xC0, 93_600, None);
+        r.process(&audio, &mut out);
+        assert_eq!(out, audio.to_vec());
+    }
+
+    #[test]
+    fn no_pmt_in_five_seconds_falls_back_to_passthrough() {
+        let mut r = TsVideoReplacer::new(&cfg("x264"), None).unwrap();
+        let t0 = std::time::Instant::now();
+        let mut out = Vec::new();
+        let audio = crate::engine::ts_test_fixtures::pes_start_packet(0x101, 0, 0xC0, 90_000, None);
+        r.inner.process_at(&audio, &mut out, t0);
+        assert!(out.is_empty());
+        r.inner
+            .process_at(&audio, &mut out, t0 + std::time::Duration::from_millis(4_900));
+        assert!(out.is_empty());
+        r.inner.process_at(&audio, &mut out, t0 + std::time::Duration::from_secs(5));
+        assert_eq!(out, audio.to_vec(), "the gate gave up: today's passthrough");
+    }
+
+    #[test]
+    fn a_takeover_continues_the_passthrough_cc() {
+        let mut r = TsVideoReplacer::new(&cfg("x264"), None).unwrap();
+        let t0 = std::time::Instant::now();
+        let late = t0 + std::time::Duration::from_secs(6);
+        let mut out = Vec::new();
+        r.inner.process_at(&synth_pat(0x1000), &mut out, t0);
+        // No PMT for 6 s: the video passes through, CC 0..=6.
+        for cc in 0..7u8 {
+            let p = crate::engine::ts_test_fixtures::payload_packet(0x100, cc);
+            r.inner.process_at(&p, &mut out, late);
+        }
+        r.inner.process_at(&two_es_pmt(0x100), &mut out, late);
+        out.clear();
+        r.inner
+            .process_at(&pcr_payload_packet(0x100, 7, 27_000_000, false), &mut out, late);
+        let got = pkts(&out);
+        assert_eq!(got.len(), 1);
+        assert_eq!(ts_cc(&got[0]), 6, "AF-only repeats the last CC on the wire");
+        assert_eq!(r.inner.out_video_cc, 7, "the first re-encoded payload continues at 7");
     }
 }

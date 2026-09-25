@@ -54,13 +54,17 @@ pub struct TsAudioReplacerStats {
     /// Source audio stream_type byte (`0x0F` AAC, `0x03/0x04` MPEG-1/2,
     /// `0x81` AC-3, `0x06` private). `0` = unknown.
     pub source_stream_type: AtomicU8,
+    /// Non-PSI packets dropped before the program's PMT was parsed.
+    pub pre_pmt_dropped_packets: std::sync::atomic::AtomicU64,
 }
 
 use crate::config::models::AudioEncodeConfig;
 
 use super::audio_encode::AudioCodec;
 use super::audio_transcode::{PlanarAudioTranscoder, TranscodeJson};
-use super::transcode_engage::{EngageEvent, TranscodeEngageWatch, TranscodeKind};
+use super::transcode_engage::{
+    EngageEvent, PassthroughCc, PrePmtGate, TranscodeEngageWatch, TranscodeKind,
+};
 use super::ts_parse::{
     extract_pcr, parse_pat_programs, pcr_only_packet, ts_discontinuity_indicator, ts_has_payload,
     ts_payload_offset, ts_pid, ts_pusi, PAT_PID, TS_PACKET_SIZE, TS_SYNC_BYTE,
@@ -127,6 +131,11 @@ pub struct TsAudioReplacer {
     /// multi-packet PMTs all reach [`Self::handle_pmt_unit`] complete, and
     /// an edited PMT is re-packetised with a valid CRC.
     pmt_stage: PsiUnitStage,
+    /// Pre-PMT gate: PSI only until the program's PMT parses (see
+    /// [`Self::process`]).
+    gate: PrePmtGate,
+    /// Last passthrough CC per PID (seeds `out_audio_cc` on takeover).
+    passthrough_cc: PassthroughCc,
     /// Discovered audio PID. `None` before the PMT has been parsed. The
     /// replacer drops the original audio TS packets on this PID and
     /// emits re-encoded packets on the same PID; any operator PID rename
@@ -400,6 +409,8 @@ impl TsAudioReplacer {
             program_number: None,
             pmt_pid_shared: false,
             pmt_stage: PsiUnitStage::new("ts_audio_replace"),
+            gate: PrePmtGate::default(),
+            passthrough_cc: PassthroughCc::default(),
             audio_pid: None,
             source_audio_pid_pin: cfg.source_audio_pid,
             last_pinned_warn: None,
@@ -635,6 +646,12 @@ impl TsAudioReplacer {
     /// `input_ts` must be 188-byte aligned (caller is responsible for TS
     /// sync recovery). Output TS bytes are appended to `output`. On bad
     /// input (not TS-aligned) the chunk is appended unchanged.
+    ///
+    /// Until the program's PMT has been parsed only PSI / SI (PIDs ≤ 0x1F,
+    /// the PMT PID) and null packets are forwarded: source audio ahead of
+    /// the PMT would go out untranscoded, and the replacer's first packet
+    /// on the PID would then jump its CC. A PMT that never parses opens the
+    /// gate after 5 s (passthrough; the engage watchdog says why).
     pub fn process(&mut self, input_ts: &[u8], output: &mut Vec<u8>) {
         self.process_at(input_ts, output, std::time::Instant::now());
     }
@@ -690,6 +707,8 @@ impl TsAudioReplacer {
                             self.audio_pid = None;
                             self.source_stream_type = 0;
                             self.reset_source_state("PMT PID changed");
+                            // A new program: gate until its PMT parses.
+                            self.gate.rearm(now);
                         }
                         if self.pmt_pid != Some(new_pmt_pid) {
                             self.pmt_stage = PsiUnitStage::new("ts_audio_replace");
@@ -714,6 +733,11 @@ impl TsAudioReplacer {
                 if let Some(unit) = self.pmt_stage.push(pkt, output) {
                     self.handle_pmt_unit(unit, output);
                 }
+                continue;
+            }
+
+            if self.gate.drops(pid, now, "ts_audio_replace") {
+                self.stats.pre_pmt_dropped_packets.fetch_add(1, Ordering::Relaxed);
                 continue;
             }
 
@@ -742,6 +766,7 @@ impl TsAudioReplacer {
             }
 
             // Everything else: passthrough.
+            self.passthrough_cc.note(pid, pkt);
             output.extend_from_slice(pkt);
         }
 
@@ -804,6 +829,9 @@ impl TsAudioReplacer {
             self.pmt_stage.emit(unit, output);
             return;
         };
+        // The program's PMT is known: the pre-PMT gate opens.
+        self.gate.open();
+        let was_replacing = self.replaced_pid();
         if self.flavour.is_none() {
             use crate::config::models::TsAudioSignalling;
             self.flavour = Some(match self.ts_signalling {
@@ -856,6 +884,14 @@ impl TsAudioReplacer {
             }
             self.audio_pid = Some(apid);
             self.source_stream_type = ast;
+            // Starting to re-encode a PID (first lock, a PID move, or a
+            // switch from a codec that passed through): continue the CC
+            // sequence of whatever went out on it before.
+            if self.replaced_pid() != was_replacing
+                && let Some(cc) = self.passthrough_cc.next_after(apid)
+            {
+                self.out_audio_cc = cc;
+            }
             // Surface for the manager UI's "(from PID 0x0101)" badge.
             // Updated on every PMT discovery so input swaps and PMT-version
             // bumps that change the discovered audio PID are visible
@@ -4269,7 +4305,7 @@ mod tests {
         );
     }
 
-    // ── PCR on the audio PID (defect x) ──
+    // ── PCR on the audio PID (defect x) and the pre-PMT gate (4) ──
 
     fn adts_frames() -> Vec<&'static [u8]> {
         const ADTS: &[u8] = include_bytes!("testdata/sine1k_aac_lc_48k_stereo.adts");
@@ -4353,5 +4389,58 @@ mod tests {
             }
         }
         assert!(payload > 0, "re-encoded audio emitted");
+    }
+
+    #[test]
+    fn nothing_but_psi_passes_before_the_pmt() {
+        let mut r = TsAudioReplacer::new(&enc("aac_lc"), None).unwrap();
+        let mut out = Vec::new();
+        let early = build_audio_pes(0xC0, &[0xFF, 0xF1, 0, 0, 0, 0, 0], 90_000);
+        let mut cc = 0u8;
+        for p in packetize_ts(0x0101, &early, &mut cc) {
+            r.process(&p, &mut out);
+        }
+        r.process(&synth_pat(0x1000), &mut out);
+        assert_eq!(out, synth_pat(0x1000).to_vec(), "the source audio never went out");
+        assert_eq!(r.stats_handle().pre_pmt_dropped_packets.load(Ordering::Relaxed), 1);
+        out.clear();
+        r.process(&synth_pmt_audio(0x1000, 0x0101, 0x0F), &mut out);
+        assert!(!out.is_empty(), "the PMT itself goes out");
+        // A non-replaced PID now passes through.
+        out.clear();
+        let other = {
+            let mut p = [0xAAu8; 188];
+            p[0] = TS_SYNC_BYTE;
+            p[1] = 0x02;
+            p[2] = 0x00;
+            p[3] = 0x10;
+            p
+        };
+        r.process(&other, &mut out);
+        assert_eq!(out, other.to_vec());
+    }
+
+    #[test]
+    fn a_takeover_continues_the_passthrough_cc() {
+        // DTS first (not replaceable: its PID passes through), then an
+        // input switch to AAC on the same PID: the replacer's first packet
+        // continues the CC the passthrough left on the wire.
+        use crate::engine::ts_parse::{pcr_only_packet, ts_cc};
+        let mut r = TsAudioReplacer::new(&enc("mp2"), None).unwrap();
+        let mut out = Vec::new();
+        r.process(&synth_pat(0x1000), &mut out);
+        r.process(&synth_pmt_audio(0x1000, 0x0101, 0x82), &mut out);
+        let mut cc = 0u8;
+        for p in packetize_ts(0x0101, &build_audio_pes(0xC0, &[0x7F; 300], 90_000), &mut cc) {
+            r.process(&p, &mut out);
+        }
+        assert_eq!(cc, 2, "two passthrough packets, CC 0 and 1");
+        r.process(&synth_pmt_audio(0x1000, 0x0101, 0x0F), &mut out);
+        out.clear();
+        r.process(&pcr_only_packet(0x0101, 5, 27_000_000, false), &mut out);
+        let got: Vec<&[u8]> = out.chunks(188).collect();
+        assert_eq!(got.len(), 1);
+        assert_eq!(ts_cc(got[0]), 1, "the AF-only carrier repeats the last CC on the wire");
+        assert_eq!(r.out_audio_cc, 2, "the first re-encoded payload continues at 2");
     }
 }

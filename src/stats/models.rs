@@ -1675,6 +1675,10 @@ pub struct EncodeStatsSnapshot {
     /// `0x81` AC-3, `0x06` private). `0` = unknown.
     #[serde(default, skip_serializing_if = "is_zero_u8")]
     pub source_stream_type: u8,
+    /// Non-PSI packets the `TsAudioReplacer` dropped before the program's
+    /// PMT was parsed (the pre-PMT gate). Absent when 0.
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub pre_pmt_dropped_packets: u64,
 }
 
 /// Per-output video encode snapshot. Mirrors `engine::ts_video_replace::VideoEncodeStats`
@@ -1719,6 +1723,10 @@ pub struct VideoEncodeStatsSnapshot {
     /// `0` means unknown.
     #[serde(default, skip_serializing_if = "is_zero_u8")]
     pub source_stream_type: u8,
+    /// Non-PSI packets dropped before the program's PMT was parsed (the
+    /// pre-PMT gate). Absent when 0.
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub pre_pmt_dropped_packets: u64,
 }
 
 /// Per-input or per-output video decode snapshot. Mirrors
