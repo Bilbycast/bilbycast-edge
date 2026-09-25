@@ -24,7 +24,7 @@ applicable / by design.
 | **ST 2110-30 / `rtp_audio`** | ✅ (auto via compressed-audio bridge) | ✅ (native PCM transcode, bit-depth + SRC + shuffle) | ❌ | Uncompressed PCM outputs; transcode is first-class here. |
 | **ST 2110-31** | ✅ | ❌ (AES3 opaque — channel labels inside SMPTE 337M payload, not addressable from the pipeline) | ❌ | |
 | **ST 2110-40** | ❌ | ❌ | ❌ | Ancillary data — no codec concept. |
-| **CMAF / CMAF-LL** | ✅ (AAC family only) | ✅ (requires `audio_encode`) | ✅ | fMP4 / CMAF segments with HLS m3u8 + DASH MPD; the operator's `gop_size` is honoured when `video_encode` is set (60 when unset) and segments cut on that GOP's IDRs, so choose one that divides `segment_duration × fps`. Codec work runs in `block_in_place`. See [`docs/cmaf.md`](cmaf.md) for the full reference. |
+| **CMAF / CMAF-LL** | ✅ (AAC family only) | ✅ (requires `audio_encode`) | ✅ | fMP4 / CMAF segments with HLS m3u8 + DASH MPD; the operator's `gop_size` is honoured when `video_encode` is set, and segments cut on that GOP's IDRs, so a set one should divide `segment_duration × fps`; unset, the GOP tiles the segment at the measured source rate (at most 2 s per GOP — 50 frames for 2 s segments at 25 fps, 60 at 29.97). Codec work runs in `block_in_place`. See [`docs/cmaf.md`](cmaf.md) for the full reference. |
 
 ---
 
@@ -809,7 +809,8 @@ the program-level rate descriptors, and the content-tracked version.
                              // outputs (auto-detected). Not a resampler.
   "fps_den":     1,
   "bitrate_kbps": 4000,      // optional, default 4000; range 100–100000
-  "gop_size":    60,         // optional, default 2 × fps_num
+  "gop_size":    60,         // optional, default 2 × fps_num (CMAF: tiles
+                             // the segment — see "Frame rate" below)
   "preset":      "medium",   // optional, default medium; `ultrafast`..`veryslow`
   "profile":     "high",     // optional, auto if unset; `baseline` / `main` / `high`
 
@@ -1402,11 +1403,57 @@ commit message or release note and delete the bullet.
      Sky Sports 1080i25 with `bitrate_kbps: 8000`: the VUI went from
      `time_scale` 100 (50 fps) to 50 (25 fps), the video ES from 4002 to
      7981 kbps, and the IDR interval from 100 to 50 frames (2 s).
-   - **RTMP, WebRTC and CMAF outputs have no auto-detect** and fall
-     back to 30/1, so on those the field must be set to match the
-     source. On RTMP it no longer affects A/V sync — FLV timestamps come
-     from the source clock — but it still mistunes rate control, the
-     default GOP and the SPS VUI.
+   - **RTMP, WebRTC and CMAF outputs** lock the same way, **only when
+     the field is unset**: the decoded frames' PTS go through the same
+     `FrameCadence` meter (`video_encode_util::EncoderRateLock`), the
+     frames decoded before it can say (about four) are dropped, and after
+     60 decoded frames with no usable PTS the encoder opens at 30/1. They
+     used to open at a flat 30/1 whatever the source ran at: a 25 fps
+     source's SPS VUI said 30 fps, CBR budgeted 25/30 of the configured
+     bitrate and the default GOP ran 20 % long. The WebRTC decoder is now
+     handed each access unit's PTS (it had none to measure). On RTMP the
+     rate never affected A/V sync — FLV timestamps come from the source
+     clock. These paths have no fallback on the PES DTS step and raise no
+     `video_encode_fps_mismatch`: a pin there is used as it is. Measured
+     (release build, unpinned x264): Sky Sports 1080i25 (PAFF) locks 25/1
+     on all three — SPS VUI `time_scale` 50 with `num_units_in_tick` 1,
+     where the same build before the change signalled 30 fps
+     (`time_scale` 60); a 29.97 fps H.264 source locks 30000/1001 (VUI
+     1001 / 60000, was 30 fps).
+   - **Every re-encoded WebRTC and CMAF frame carries its own picture's
+     source PTS** — the decoder propagates each access unit's PTS through
+     its reorder queue, and the encoder's output is matched back to it by
+     the frame counter it echoes (`video_encode_util::EncodedPtsMap`).
+     Both used to stamp whatever came out with the PTS of the access unit
+     being fed at the time: a pipeline's depth late, and out of order on a
+     source with B-frames — Sky Sports re-encoded to WebRTC arrived with
+     RTP timestamps stepping +160 / -80 ms, and CMAF samples carried
+     decode-order times (a 29.97 source's CMAF track measured 0.1 fps from
+     its timestamps). WebRTC now sends each encoded frame as its own RTP
+     frame with its own marker bit (several frames handed back by one call
+     used to share one timestamp and one marker). RTMP already stamped
+     from the source PTS (a FIFO; its encoder never reorders).
+   - **CMAF's default GOP tiles the segment** at the rate the encoder
+     opens at (`cmaf::encode::cmaf_default_gop`): the fewest GOPs of at
+     most 2 s that cover `segment_duration_secs`, each rounded **up** to a
+     whole frame — 50 frames for 2 s segments at 25 fps, 60 at 29.97 and
+     30, 48 at 23.976, three 2 s GOPs in a 6 s segment. The segmenter cuts
+     on the first IDR at or after the target, so the segment's last GOP
+     ending at or just past it closes the segment on time; one ending a
+     frame short would run it on to the next IDR. It used to force 60
+     frames at any rate — 2.4 s at 25 fps, so a 2 s target cut 2.4 s
+     segments. A set `gop_size` is honoured as it is. Either way an IDR is
+     **forced on every GOP boundary** of the encoded-frame count: x264
+     codes a scene cut as an IDR and restarts its GOP count there, so
+     without it the next natural IDR — and the segment boundary — landed a
+     partial GOP late (on Sky Sports, 3.2 s and 3.56 s segments among the
+     2 s ones). Scene-cut IDRs in between stay; they cost bits, never a
+     boundary. (The RKMPP encoders ignore a forced IDR — see
+     `force_next_keyframe` in the sibling crate.) Measured: Sky Sports
+     with 2 s segments — 30 of 30 segments `EXTINF:2.0`, 50 frames each,
+     every one opening on an IDR, `#EXT-X-TARGETDURATION:2` (before:
+     2.0-4.36 s, target 4); the 29.97 fps source — 29 of 29 at 2.002 s,
+     60 frames each (before: 2.0-3.84 s).
 
    A pin that disagrees with the source does **not** cause a
    proportional lipsync drift on the TS path (output PES PTS carry the
@@ -1529,10 +1576,9 @@ only place it can be) — no relay change is needed.
   `ScalerDstFormat::{Yuvj420p, Yuv422p8, Yuv422p10le}`. The existing
   `VideoScaler::new()` constructor defaults to `Yuvj420p` and is
   behaviour-compatible.
-- **Measured frame rate on RTMP, WebRTC and CMAF.** The TS paths lock the
-  encoder to the decoded-frame cadence (`FrameCadence`); these three still
-  open at a pinned rate or 30/1 — CMAF also forces a 60-frame GOP, 2.4 s at
-  25 fps. Same helper, deferred encoder open.
+- **~~Measured frame rate on RTMP, WebRTC and CMAF.~~** Done
+  (`video_encode_util::EncoderRateLock`, see *Frame rate* above); CMAF's
+  default GOP now tiles the segment at that rate.
 - **HEVC field_seq weave.** Pair an HEVC field_seq source's top / bottom
   field pictures back into frames (drop an orphan field, re-pair after a
   reset), so it re-encodes as 1080i at the frame rate instead of 540-line

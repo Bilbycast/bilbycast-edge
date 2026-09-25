@@ -278,6 +278,18 @@ whether or not the assembler still has their section in flight, and
 adaptation-field-only packets, which repeat the last payload CC — so a
 PSI PID never mixes rewriter-owned and source CCs.
 
+**PSI repetition re-emits a whole PMT.** When no PSI has flowed for 500 ms
+(TR 101 290 PAT_error / PMT_error) the rewriter injects its cached PAT and
+PMTs ahead of the next packet, each on the next owned CC. The PMT cache
+holds the **whole payload unit** the PMT arrived in — every packet of a PMT
+that spans packets — replaced only by a later unit in which a PMT with a
+valid CRC_32 completed and nothing aborted it (a CC gap mid-unit, a failed
+CRC), the rule the TS continuity fixer's switch cache already followed; both
+now share `ts_parse::PmtUnitCollector`. It used to cache only the PMT's
+first packet, so on a multi-packet PMT (a broadcast MPTS program with a
+dozen ES and their descriptors) the repetition was a lone first packet no
+receiver could complete.
+
 **PCR is never regenerated for long without roles.** PCR re-anchoring
 starts at the first PCR, before the PMT is known. If no PMT has been
 learned after 2 s of source-PCR time (four times TR 101 290's 500 ms
@@ -316,9 +328,14 @@ The hold is bounded. Once it has held 2 s of PES time on a PID (forward
 steps only, each capped at 1 s) or 2 s of wall time, it gives up waiting:
 
 - **No PCR has established the anchor** — a program whose PCR_PID never
-  carries one, like an audio-only RTMP publish (the ingest muxer names the
-  absent video PID as PCR_PID), or a PMT with PCR_PID 0x1FFF and no PCR
-  anywhere. PES then pass with their **source** timestamps, as they would
+  carries one, like a PMT with PCR_PID 0x1FFF and no PCR anywhere. (An
+  audio-only RTMP publish was the common case until 2026-09: its ingest muxer
+  named the absent video PID as PCR_PID. It now names the audio PID and
+  carries the PCR on the audio — see *RTMP Input* in
+  `configuration-guide.md` — so the anchor is established on the first
+  audio packet and nothing is held; a publish with no `onMetaData` is taken
+  as audio-only after 1 s of audio with no video, and only that first second
+  is held.) PES then pass with their **source** timestamps, as they would
   with no rewriter at all — there is no regenerated PCR for them to
   disagree with — and the Warning `clock_rewrite_no_pcr` (input-scoped)
   says so. The first PCR that does arrive on a PCR PID establishes the

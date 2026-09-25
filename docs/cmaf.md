@@ -102,9 +102,25 @@ the window rather than from the config precisely so that stays legal; see
 the flow has produced).
 
 For re-encoded video (`video_encode` block set), the operator's `gop_size`
-is honoured (60 when unset) and segment boundaries land on that GOP's IDRs,
-so choose one that divides `segment_duration_secs * fps` — nothing forces
-the GOP to the segment length. (`gop_size: 1` is how the DVR proxy asks for
+is honoured and segment boundaries land on that GOP's IDRs, so a set one
+should divide `segment_duration_secs * fps`. Unset, the GOP **tiles the
+segment** at the rate the encoder opens at (`cmaf_default_gop`): the fewest
+GOPs of at most 2 s that cover `segment_duration_secs`, each rounded up to a
+whole frame — 50 frames for 2 s segments at 25 fps, 60 at 29.97 and 30, three
+2 s GOPs in a 6 s segment. The segmenter cuts on the first IDR at or after the
+target, so the last GOP of a segment ending at or just past it closes the
+segment on time (29.97 fps: 2.002 s). An IDR is forced on every GOP boundary
+of the encoded-frame count (a set `gop_size` too), because x264 restarts its
+GOP count at every scene-cut IDR: without it the next natural IDR, and the
+segment boundary, landed a partial GOP late — 3.2 s segments among the 2 s
+ones on Sky Sports. It used to force 60 frames whatever the
+rate — 2.4 s at 25 fps, so every 2 s segment ran 2.4 s. The encoder opens at
+the source's measured frame rate unless `fps_num` / `fps_den` pin one (it used
+to open at 30/1 — see [`transcoding.md`](transcoding.md), *Frame rate*), and
+every re-encoded sample carries **its own picture's** source PTS, as the
+decoder propagated it: samples used to be stamped with the access unit being
+fed when the encoder handed them back — a pipeline's depth late, and out of
+order on a source with B-frames. (`gop_size: 1` is how the DVR proxy asks for
 all-intra; see [the proxy section](#why-the-proxy-rendition-is-x264-on-nvidia-hosts).)
 
 ## Playlist window (`dvr_window_secs`)
