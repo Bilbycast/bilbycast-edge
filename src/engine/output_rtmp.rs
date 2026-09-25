@@ -1596,6 +1596,9 @@ fn open_video_active(
         format!("RTMP output '{}'", config.id),
     );
     pipeline.set_resolved_backend_sink(stats_handle.resolved_backend.clone());
+    // An explicit `scan: interlaced` needs to know an interlaced frame from
+    // this decoder is woven (H.264) or a single field (HEVC field_seq).
+    pipeline.set_source_codec(source_codec);
     VideoEncoderState::Active(Box::new(VideoActive {
         decoder,
         pipeline,

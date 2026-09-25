@@ -6011,6 +6011,46 @@ pub struct VideoEncodeConfig {
     /// HW display playout also gets HW transcode decode "for free".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hw_decode: Option<HwDecodePreference>,
+    /// Progressive or interlaced (field) coding of the re-encoded picture.
+    /// `None` = [`VideoScan::Auto`]. See [`VideoScan`]; capability
+    /// `video-encode-scan` says an edge honours it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scan: Option<VideoScan>,
+}
+
+/// `video_encode.scan` — whether a re-encode codes interlaced (field)
+/// pictures.
+///
+/// Wire shape: `"auto"` (the default when unset), `"progressive"`,
+/// `"interlaced"`.
+///
+/// - `Auto`: on MPEG-TS re-encodes (TS outputs and the TS ingress
+///   transcoder), code interlaced — H.264 MBAFF, in the source's field
+///   order — when the frame the encoder opens on is a woven interlaced
+///   frame (an interlaced H.264 or MPEG-2 source), the output is not
+///   scaled vertically, and the backend the resolver lands on can code
+///   fields on this host (libx264, h264_nvenc, h264_qsv where the GPU
+///   allows it). Otherwise progressive. RTMP, WebRTC and CMAF, whose
+///   audiences are mostly progressive displays, treat `auto` as
+///   progressive. Decided once, when the encoder opens.
+/// - `Progressive`: always frame coding — what every release before this
+///   field did. A woven interlaced source is carried as progressive frames
+///   holding both fields.
+/// - `Interlaced`: always field coding, on the first backend in the chain
+///   that can; an H.264 target only (validation refuses HEVC and the
+///   VAAPI / RKMPP H.264 encoders), and only where the edge decodes and
+///   re-encodes. Scaling is done per field and the fields woven back, so a
+///   1080i → 576i conversion keeps its fields apart. A source whose decoder
+///   hands out single fields (HEVC field_seq) or a chain with no backend
+///   that can code fields falls back to progressive with a Warning
+///   (`video_encode_interlace_unavailable`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum VideoScan {
+    #[default]
+    Auto,
+    Progressive,
+    Interlaced,
 }
 
 /// Build a browser-safe ("WebRTC-compatible") [`VideoEncodeConfig`] from an
@@ -6036,6 +6076,8 @@ pub struct VideoEncodeConfig {
 ///   forced (which would needlessly cost quality).
 /// * **`zerolatency` tune** — low latency, and independently disables
 ///   B-frames in x264.
+/// * **Progressive** — `scan` is pinned to `progressive`, so `auto` never
+///   field-codes an interlaced source for a browser.
 ///
 /// SPS/PPS travel in-band on every IDR because the re-encode call sites
 /// (`output_webrtc` / `ts_video_replace`) already open the encoder with
@@ -6076,6 +6118,7 @@ pub fn webrtc_safe_video_encode(existing: Option<&VideoEncodeConfig>) -> VideoEn
             color_matrix: None,
             color_range: None,
             hw_decode: None,
+            scan: None,
         },
     };
     // Force H.264 — browsers decode H.264 only.
@@ -6099,6 +6142,11 @@ pub fn webrtc_safe_video_encode(existing: Option<&VideoEncodeConfig>) -> VideoEn
     if enc.tune.is_none() {
         enc.tune = Some("zerolatency".to_string());
     }
+    // Progressive: browsers deinterlace nothing, and RFC 7742's Constrained
+    // Baseline has no interlaced tools. Pinned so `scan: auto` on a TS
+    // output with this flag cannot field-code an interlaced source.
+    // Validation refuses an explicit `scan: interlaced` next to the flag.
+    enc.scan = Some(VideoScan::Progressive);
     enc
 }
 

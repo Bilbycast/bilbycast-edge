@@ -2923,6 +2923,7 @@ fn validate_st2110_video_input(c: &St2110VideoInputConfig) -> Result<()> {
         validate_red_blue_bind(red, &c.bind_addr, &format!("{LABEL} redundancy"))?;
     }
     validate_video_encode(&c.video_encode, LABEL)?;
+    refuse_interlaced_raw_ingest(&c.video_encode, LABEL)?;
     Ok(())
 }
 
@@ -2995,6 +2996,7 @@ fn validate_st2110_23_input(c: &St2110_23InputConfig) -> Result<()> {
     validate_video_dims(c.width, c.height, c.frame_rate_num, c.frame_rate_den, LABEL)?;
     validate_clock_domain(c.clock_domain, LABEL)?;
     validate_video_encode(&c.video_encode, LABEL)?;
+    refuse_interlaced_raw_ingest(&c.video_encode, LABEL)?;
     Ok(())
 }
 
@@ -4267,6 +4269,7 @@ fn validate_webrtc_compatible(
                 ve.codec
             );
         }
+    refuse_interlaced_for_browsers(video_encode, context)?;
     // Validate the browser-safe re-encode the edge will actually synthesise,
     // which also confirms an H.264 encoder backend is compiled in.
     let effective = crate::config::models::webrtc_safe_video_encode(video_encode);
@@ -4282,6 +4285,40 @@ fn validate_webrtc_compatible(
 /// doc has always said so — and once the wall started honouring the value
 /// (#129) an unrecognised one had to be refused at save time here rather than
 /// surfacing as a flow that will not start.
+/// Refuse `video_encode.scan: interlaced` where the encoder is fed raw
+/// frames rather than decoded ones — ST 2110-20 / -23, SDI and MXL ingest.
+/// Those frames carry no field order for the encoder to follow, so field
+/// coding there would either guess the order or silently code progressive.
+/// `auto` is progressive on those paths and `progressive` is what it says.
+fn refuse_interlaced_raw_ingest(
+    enc: &crate::config::models::VideoEncodeConfig,
+    context: &str,
+) -> anyhow::Result<()> {
+    if enc.scan == Some(crate::config::models::VideoScan::Interlaced) {
+        bail!(
+            "{context}: video_encode.scan=interlaced is not supported on this input — it hands \
+             the encoder raw frames with no field order; use auto or progressive"
+        );
+    }
+    Ok(())
+}
+
+/// Refuse `video_encode.scan: interlaced` on a WebRTC re-encode: browsers
+/// display progressive, and the `webrtc_compatible` re-encode pins
+/// `scan` to progressive, which would silently override the request.
+fn refuse_interlaced_for_browsers(
+    enc: Option<&crate::config::models::VideoEncodeConfig>,
+    context: &str,
+) -> anyhow::Result<()> {
+    if enc.and_then(|e| e.scan) == Some(crate::config::models::VideoScan::Interlaced) {
+        bail!(
+            "{context}: video_encode.scan=interlaced cannot reach a WebRTC viewer — browsers \
+             display progressive only; use auto or progressive"
+        );
+    }
+    Ok(())
+}
+
 pub(crate) fn validate_encoder_codec_name(codec: &str, context: &str) -> anyhow::Result<()> {
     match codec {
         "x264" | "x265" | "h264_nvenc" | "hevc_nvenc" | "h264_qsv" | "hevc_qsv"
@@ -4600,6 +4637,39 @@ fn validate_video_encode(
             "{context}: video_encode.profile=main422-10 requires bit_depth=10"
         ),
         _ => {}
+    }
+    // ── scan ──────────────────────────────────────────────────────────
+    // `interlaced` field-codes on H.264 only, and only on the backends
+    // FFmpeg gives an interlaced tool (libx264 MBAFF, h264_nvenc, h264_qsv).
+    // `h264_auto` / `auto` are accepted: the resolver chain is walked for
+    // the first backend that can, and falls back to progressive with a
+    // Warning when none on the host can. An explicit backend that cannot
+    // is refused here rather than failing every frame at flow start.
+    if enc.scan == Some(crate::config::models::VideoScan::Interlaced) {
+        match enc.codec.as_str() {
+            "x264" | "h264_nvenc" | "h264_qsv" | "h264_auto" | "auto" => {}
+            "h264_vaapi" | "h264_rkmpp" => bail!(
+                "{context}: video_encode.scan=interlaced needs a backend that codes fields — \
+                 {} ignores interlacing and would code progressive frames; use x264, \
+                 h264_nvenc, h264_qsv or h264_auto",
+                enc.codec
+            ),
+            other => bail!(
+                "{context}: video_encode.scan=interlaced is H.264 only (no HEVC encoder \
+                 codes field pictures), got codec '{other}'; use x264, h264_nvenc, \
+                 h264_qsv or h264_auto"
+            ),
+        }
+        // Each field of a 4:2:0 frame needs a whole number of chroma rows.
+        let multiple = if chroma_str.unwrap_or("yuv420p") == "yuv420p" { 4 } else { 2 };
+        if let Some(h) = enc.height
+            && h % multiple != 0
+        {
+            bail!(
+                "{context}: video_encode.scan=interlaced needs a height divisible by {multiple} \
+                 (two fields of whole chroma rows), got {h}"
+            );
+        }
     }
     // ── rate control ──────────────────────────────────────────────────
     if let Some(ref rc) = enc.rate_control {
@@ -6191,6 +6261,10 @@ pub fn validate_output_with_input(
                     ve,
                     &format!("WebRTC output '{}'", webrtc.id),
                 )?;
+                refuse_interlaced_for_browsers(
+                    Some(ve),
+                    &format!("WebRTC output '{}'", webrtc.id),
+                )?;
             }
             validate_webrtc_compatible(
                 webrtc.webrtc_compatible,
@@ -6807,6 +6881,7 @@ fn validate_sdi_input(c: &crate::config::models::SdiInputConfig) -> Result<()> {
     }
     // video_encode is mandatory for SDI — same as MXL video / ST 2110-20.
     validate_video_encode(&c.video_encode, &ctx)?;
+    refuse_interlaced_raw_ingest(&c.video_encode, &ctx)?;
 
     // SDI capture is 8-bit 4:2:2 (`uyvy422`), and `sdi_io::unpack_uyvy422`
     // writes straight into the encoder's plane layout to skip a libswscale
@@ -6898,6 +6973,7 @@ fn validate_mxl_video_input(c: &crate::config::models::MxlVideoInputConfig) -> R
     // video_encode is mandatory for MXL video input at v1.0 — same
     // pattern as ST 2110-20.
     validate_video_encode(&c.video_encode, &ctx)?;
+    refuse_interlaced_raw_ingest(&c.video_encode, &ctx)?;
     Ok(())
 }
 
@@ -12284,6 +12360,7 @@ mod tests {
             color_matrix: None,
             color_range: None,
             hw_decode: None,
+            scan: None,
         };
         let safe = webrtc_safe_video_encode(Some(&hevc));
         assert_eq!(safe.codec, "h264_auto", "HEVC must be replaced with H.264");
@@ -12305,6 +12382,96 @@ mod tests {
         assert_eq!(safe2.codec, "x264");
         assert_eq!(safe2.profile.as_deref(), Some("high"));
         assert_eq!(safe2.bframes, Some(0));
+    }
+
+    #[test]
+    fn video_encode_scan_is_validated() {
+        use crate::config::models::{VideoEncodeConfig, VideoScan};
+        let ve = |v: serde_json::Value| -> VideoEncodeConfig { serde_json::from_value(v).unwrap() };
+        // Wire shape: absent = auto, and absent stays absent on the way out.
+        let plain = ve(serde_json::json!({ "codec": "h264_auto" }));
+        assert_eq!(plain.scan, None);
+        assert!(serde_json::to_value(&plain).unwrap().get("scan").is_none());
+        for (s, v) in [("auto", VideoScan::Auto), ("progressive", VideoScan::Progressive), ("interlaced", VideoScan::Interlaced)] {
+            assert_eq!(ve(serde_json::json!({ "codec": "h264_auto", "scan": s })).scan, Some(v));
+        }
+        assert!(serde_json::from_value::<VideoEncodeConfig>(
+            serde_json::json!({ "codec": "h264_auto", "scan": "bob" })
+        )
+        .is_err());
+
+        let interlaced = |codec: &str| ve(serde_json::json!({ "codec": codec, "scan": "interlaced" }));
+        // `h264_auto` itself needs an H.264 encoder in the build; the scan
+        // rules below are checked where it has one.
+        let auto_ok = validate_video_encode(&plain, "ctx").is_ok();
+        let hevc_ok = validate_video_encode(&ve(serde_json::json!({ "codec": "hevc_auto" })), "ctx").is_ok();
+        assert_eq!(validate_video_encode(&interlaced("h264_auto"), "ctx").is_ok(), auto_ok);
+        assert_eq!(validate_video_encode(&interlaced("auto"), "ctx").is_ok(), auto_ok);
+        let err = validate_video_encode(&interlaced("hevc_auto"), "ctx").unwrap_err().to_string();
+        if hevc_ok {
+            assert!(err.contains("H.264 only"), "{err}");
+        }
+        // Every build refuses these; with the backend compiled in, the
+        // refusal is the scan one.
+        for codec in ["h264_vaapi", "h264_rkmpp", "x265"] {
+            assert!(validate_video_encode(&interlaced(codec), "ctx").is_err(), "{codec}");
+        }
+        #[cfg(feature = "video-encoder-x265")]
+        assert!(validate_video_encode(&interlaced("x265"), "ctx")
+            .unwrap_err()
+            .to_string()
+            .contains("H.264 only"));
+        #[cfg(feature = "video-encoder-vaapi")]
+        assert!(validate_video_encode(&interlaced("h264_vaapi"), "ctx")
+            .unwrap_err()
+            .to_string()
+            .contains("codes fields"));
+        // Progressive and auto are fine on HEVC.
+        for s in ["auto", "progressive"] {
+            assert_eq!(
+                validate_video_encode(&ve(serde_json::json!({ "codec": "hevc_auto", "scan": s })), "ctx").is_ok(),
+                hevc_ok
+            );
+        }
+        // A 4:2:0 field needs whole chroma rows: height % 4.
+        let tall = ve(serde_json::json!({ "codec": "h264_auto", "scan": "interlaced", "height": 578 }));
+        let err = validate_video_encode(&tall, "ctx").unwrap_err().to_string();
+        if auto_ok {
+            assert!(err.contains("divisible by 4"), "{err}");
+        }
+        assert_eq!(
+            validate_video_encode(
+                &ve(serde_json::json!({ "codec": "h264_auto", "scan": "interlaced", "height": 576 })),
+                "ctx"
+            )
+            .is_ok(),
+            auto_ok
+        );
+        assert_eq!(
+            validate_video_encode(
+                &ve(serde_json::json!({ "codec": "h264_auto", "scan": "progressive", "height": 578 })),
+                "ctx"
+            )
+            .is_ok(),
+            auto_ok
+        );
+
+        // Raw-frame ingest has no field order to follow.
+        assert!(refuse_interlaced_raw_ingest(&interlaced("h264_auto"), "ST 2110-20 input").is_err());
+        assert!(refuse_interlaced_raw_ingest(&plain, "ST 2110-20 input").is_ok());
+        // Browsers display progressive; the webrtc-safe re-encode pins it.
+        let err = validate_webrtc_compatible(true, Some(&interlaced("h264_auto")), "SRT output 'x'")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("WebRTC"), "{err}");
+        assert_eq!(
+            crate::config::models::webrtc_safe_video_encode(Some(&plain)).scan,
+            Some(VideoScan::Progressive)
+        );
+        assert_eq!(
+            crate::config::models::webrtc_safe_video_encode(None).scan,
+            Some(VideoScan::Progressive)
+        );
     }
 
     #[test]
@@ -12370,6 +12537,7 @@ mod tests {
                 color_matrix: None,
                 color_range: None,
                 hw_decode: None,
+                scan: None,
                  source_video_pid: None,
             }),
             pid_overrides: None,
@@ -12463,6 +12631,7 @@ mod tests {
             color_matrix: None,
             color_range: None,
             hw_decode: None,
+            scan: None,
              source_video_pid: None,
         };
         // Odd dimensions must be rejected in EVERY build. With x264 compiled
@@ -12521,7 +12690,7 @@ mod tests {
             chroma: None, bit_depth: None, rate_control: None, crf: None,
             max_bitrate_kbps: None, bframes: None, refs: None, level: None,
             tune: None, color_primaries: None, color_transfer: None,
-            color_matrix: None, color_range: None, hw_decode: None,
+            color_matrix: None, color_range: None, hw_decode: None, scan: None,
             source_video_pid: pid,
         };
         // 0x0000 — PAT.
@@ -12573,6 +12742,7 @@ mod tests {
             color_matrix: None,
             color_range: None,
             hw_decode: None,
+            scan: None,
              source_video_pid: None,
         };
         let assert_recognised = |result: Result<(), anyhow::Error>, label: &str| match result {

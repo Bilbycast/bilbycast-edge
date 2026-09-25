@@ -737,6 +737,10 @@ mod inner {
                 "ts_video_replace",
             );
             pipeline.set_resolved_backend_sink(stats.resolved_backend.clone());
+            // An MPEG-TS re-encode feeds broadcast receivers, which display
+            // interlace natively: `scan: auto` field-codes an interlaced
+            // source here (see `VideoScan`).
+            pipeline.allow_auto_field_coding();
 
             Ok(Self {
                 target_family,
@@ -1434,6 +1438,9 @@ mod inner {
                             );
                         }
                         self.decoder = Some(d);
+                        // Whether an interlaced frame from it is a woven
+                        // frame (H.264, MPEG-2) or a single field (HEVC).
+                        self.pipeline.set_source_codec(src_codec);
                     }
                     Err(e) => {
                         tracing::error!("ts_video_replace: failed to open decoder: {e}");
@@ -1548,6 +1555,9 @@ mod inner {
                     }
                 };
                 self.out_frame_count += 1;
+                if let Some(why) = self.pipeline.take_interlace_notice() {
+                    self.emit_interlace_unavailable(&why);
+                }
 
                 // Encoded packets always ride the source video PID. Any
                 // operator PID rename lands on the downstream
@@ -1563,6 +1573,33 @@ mod inner {
             }
 
             Ok(())
+        }
+
+        /// One Warning per open: an explicit `video_encode.scan:
+        /// interlaced` is coding progressive (no backend in the chain could
+        /// open for field coding, or the source hands out single fields).
+        pub(super) fn emit_interlace_unavailable(&self, why: &str) {
+            let Some(es) = self.event_sender.as_ref() else {
+                return;
+            };
+            let noun = if self.decode_stall_input_scope { "Input" } else { "Output" };
+            let message = format!(
+                "{noun} '{}': video_encode.scan=interlaced cannot be honoured — {why}; \
+                 encoding progressive",
+                self.output_id,
+            );
+            let details = serde_json::json!({
+                "error_code": "video_encode_interlace_unavailable",
+                "reason": why,
+                "source_stream_type": self.source_stream_type,
+            });
+            let severity = crate::manager::events::EventSeverity::Warning;
+            let category = crate::manager::events::category::VIDEO_ENCODE;
+            if self.decode_stall_input_scope {
+                es.emit_input_with_details(severity, category, message, &self.output_id, details);
+            } else {
+                es.emit_output_with_details(severity, category, message, &self.output_id, details);
+            }
         }
 
         /// Video PES per decoded frame since the last reset — 2 on a
@@ -2009,6 +2046,7 @@ mod tests {
             color_range: None,
             hw_decode: None,
              source_video_pid: None,
+            scan: None,
         }
     }
 
@@ -2718,6 +2756,22 @@ mod tests {
         assert_eq!(r.inner.fallback_rate(), (30_000, 1001));
     }
 
+    /// An explicit `scan: interlaced` that has to code progressive says so
+    /// as a Warning on the replacer's scope.
+    #[test]
+    fn interlace_unavailable_is_a_warning_event() {
+        let mut r = TsVideoReplacer::new(&cfg("x264"), None).unwrap();
+        let (tx, mut rx) = crate::manager::events::event_channel();
+        r.set_decode_stall_watchdog(tx, "out-i");
+        r.inner.emit_interlace_unavailable("no backend could");
+        let ev = rx.try_recv().expect("event");
+        assert_eq!(ev.output_id.as_deref(), Some("out-i"));
+        assert_eq!(ev.category, crate::manager::events::category::VIDEO_ENCODE);
+        let d = ev.details.unwrap();
+        assert_eq!(d["error_code"], "video_encode_interlace_unavailable");
+        assert_eq!(d["reason"], "no backend could");
+    }
+
     // ── Encoder rate from decoded frames (5a) and friends, through a real
     //    decoder and libx264 ──
 
@@ -2902,6 +2956,125 @@ mod tests {
             let mut r = TsVideoReplacer::new(&cfg("x264"), None).unwrap();
             let out = run(&mut r, &ts_of(&aus, 900_000, false, &mut cc));
             assert_eq!(first_sps(&out).sample_aspect_ratio, None);
+        }
+
+        /// Decode the re-encoded video: per frame (interlaced, top field
+        /// first, mean luma of even rows, mean luma of odd rows).
+        pub(super) fn decode_out(out: &[u8]) -> Vec<(bool, bool, f64, f64)> {
+            let mut dec = video_engine::VideoDecoder::open(video_codec::VideoCodec::H264).unwrap();
+            let mut frames = Vec::new();
+            let mut take = |dec: &mut video_engine::VideoDecoder| {
+                while let Ok(f) = dec.receive_frame() {
+                    let (y, ys, ..) = f.yuv_planes().expect("planar");
+                    let (w, h) = (f.width() as usize, f.height() as usize);
+                    let mean = |parity: usize| {
+                        let rows: Vec<usize> = (0..h).filter(|r| r % 2 == parity).collect();
+                        let sum: u64 = rows
+                            .iter()
+                            .map(|r| y[r * ys..r * ys + w].iter().map(|&b| b as u64).sum::<u64>())
+                            .sum();
+                        sum as f64 / (rows.len() * w) as f64
+                    };
+                    frames.push((f.is_interlaced(), f.top_field_first(), mean(0), mean(1)));
+                }
+            };
+            for (es, pts) in out_pes(out) {
+                dec.send_packet_with_pts(&es, pts as i64).unwrap();
+                take(&mut dec);
+            }
+            dec.send_flush().unwrap();
+            take(&mut dec);
+            frames
+        }
+
+        /// The Sky Sports case, end to end: a field-coded 1080i-style
+        /// source (one PES per field) with `scan` unset (auto), unscaled,
+        /// comes out 25 fps, MBAFF, pic_struct signalled, in the source's
+        /// field order — top first here, bottom first for a BFF source.
+        #[test]
+        fn auto_codes_an_interlaced_source_interlaced_in_its_field_order() {
+            for order in [VideoFieldOrder::Tff, VideoFieldOrder::Bff] {
+                let aus = x264_aus(16, (320, 240), Some(order), None);
+                let mut cc = 0u8;
+                let mut r = TsVideoReplacer::new(&cfg("x264"), None).unwrap();
+                let out = run(&mut r, &ts_of(&aus, 900_000, true, &mut cc));
+                let sps = first_sps(&out);
+                assert!(!sps.frame_mbs_only && sps.mb_adaptive_frame_field, "{order:?}: MBAFF");
+                assert!(sps.pic_struct_present, "{order:?}: pic_struct");
+                assert_eq!(sps.timing.map(|(n, t, _)| (n, t)), Some((1, 50)), "{order:?}: 25 fps");
+                assert_eq!(r.inner.pipeline.field_order(), Some(order));
+                let frames = decode_out(&out);
+                assert!(frames.len() >= 8);
+                for (interlaced, tff, ..) in frames {
+                    assert!(interlaced, "{order:?}: decoded interlaced");
+                    assert_eq!(tff, order.is_top_field_first(), "{order:?}: field order kept");
+                }
+            }
+        }
+
+        /// `progressive` keeps today's frame coding; `auto` does too when
+        /// the output is scaled vertically, or the source is progressive.
+        #[test]
+        fn progressive_scaled_or_progressive_source_stays_frame_coded() {
+            let interlaced = x264_aus(10, (320, 240), Some(VideoFieldOrder::Tff), None);
+            let progressive = x264_aus(10, (320, 240), None, None);
+            let mut forced = cfg("x264");
+            forced.scan = Some(crate::config::models::VideoScan::Progressive);
+            let mut scaled = cfg("x264");
+            scaled.height = Some(160);
+            for (c, aus) in [(forced, &interlaced), (scaled, &interlaced), (cfg("x264"), &progressive)] {
+                let mut cc = 0u8;
+                let mut r = TsVideoReplacer::new(&c, None).unwrap();
+                let out = run(&mut r, &ts_of(aus, 900_000, false, &mut cc));
+                assert!(first_sps(&out).frame_mbs_only, "{:?}", c.scan);
+                assert_eq!(r.inner.pipeline.field_order(), None);
+            }
+        }
+
+        /// A source whose top field is dark and bottom field bright, both
+        /// flat: `scan: interlaced` scaled 240 -> 160 lines keeps the two
+        /// fields apart (each scaled on its own, then woven), where
+        /// scaling the woven frame would have averaged them to grey.
+        #[test]
+        fn interlaced_scaling_never_blends_the_fields() {
+            let (w, h) = (320usize, 240usize);
+            let mut enc = video_engine::VideoEncoder::open(&VideoEncoderConfig {
+                codec: VideoEncoderCodec::X264,
+                width: w as u32,
+                height: h as u32,
+                fps_num: 25,
+                fps_den: 1,
+                bitrate_kbps: 4_000,
+                gop_size: 25,
+                preset: VideoPreset::Veryfast,
+                global_header: false,
+                field_order: Some(VideoFieldOrder::Tff),
+                ..VideoEncoderConfig::default()
+            })
+            .unwrap();
+            let y: Vec<u8> = (0..w * h).map(|k| if (k / w) % 2 == 0 { 60 } else { 180 }).collect();
+            let c = vec![128u8; w / 2 * h / 2];
+            let mut aus = Vec::new();
+            for i in 0..10 {
+                aus.extend(enc.encode_frame(&y, w, &c, w / 2, &c, w / 2, Some(i)).unwrap().into_iter().map(|f| f.data));
+            }
+            aus.extend(enc.flush().unwrap().into_iter().map(|f| f.data));
+
+            let mut scaled = cfg("x264");
+            scaled.height = Some(160);
+            scaled.scan = Some(crate::config::models::VideoScan::Interlaced);
+            let mut cc = 0u8;
+            let mut r = TsVideoReplacer::new(&scaled, None).unwrap();
+            let out = run(&mut r, &ts_of(&aus, 900_000, false, &mut cc));
+            let sps = first_sps(&out);
+            assert_eq!((sps.width, sps.height), (320, 160));
+            assert!(!sps.frame_mbs_only);
+            let frames = decode_out(&out);
+            assert!(frames.len() >= 5);
+            for (interlaced, tff, even, odd) in frames {
+                assert!(interlaced && tff);
+                assert!((even - 60.0).abs() < 8.0 && (odd - 180.0).abs() < 8.0, "{even} / {odd}");
+            }
         }
 
         /// A frame-coded source keeps its rate: one PES per frame.

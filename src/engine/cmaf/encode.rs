@@ -749,6 +749,9 @@ impl VideoReencoder {
             let dec = video_engine::VideoDecoder::open(src_codec)
                 .map_err(|e| anyhow::anyhow!("VideoDecoder open failed: {e}"))?;
             self.decoder = Some(dec);
+            // Woven (H.264) or single-field (HEVC) interlaced frames — what
+            // an explicit `scan: interlaced` needs to know.
+            self.pipeline.set_source_codec(src_codec);
         }
         let dec = self.decoder.as_mut().unwrap();
         dec.send_packet(&self.annex_b_scratch)

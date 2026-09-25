@@ -164,6 +164,7 @@ async fn encode_loop(
         color_range: None,
         source_video_pid: None,
         hw_decode: None,
+        scan: None,
     };
 
     let mut encoder = build_image_encoder(
@@ -491,6 +492,7 @@ mod tests {
             color_range: None,
             source_video_pid: None,
             hw_decode: None,
+            scan: None,
         }
     }
 

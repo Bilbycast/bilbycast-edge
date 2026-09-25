@@ -1204,6 +1204,7 @@ pub(crate) fn mosaic_video_encode_config(
         color_range: None,
         source_video_pid: None,
         hw_decode: None,
+        scan: None,
     }
 }
 

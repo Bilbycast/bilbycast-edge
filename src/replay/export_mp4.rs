@@ -853,6 +853,7 @@ fn reencode_all_intra(
         color_matrix: None,
         color_range: None,
         hw_decode: None,
+        scan: None,
     };
 
     let mut enc = VideoReencoder::new(&cfg, "clip-export")?;

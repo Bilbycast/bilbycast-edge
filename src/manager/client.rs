@@ -1431,6 +1431,14 @@ pub fn edge_capabilities() -> Vec<&'static str> {
         // route. Manager UI gates the per-tunnel uplink picker on this so the
         // fields are never pushed to an older edge that would ignore them.
         "tunnel-nic-pin",
+        // `video_encode.scan` (`auto` | `progressive` | `interlaced`) is
+        // honoured: `auto` codes an interlaced H.264 / MPEG-2 source as
+        // H.264 MBAFF on TS re-encodes (in the source's field order, when
+        // unscaled and the resolved backend can), `interlaced` forces it.
+        // An edge WITHOUT this bit ignores the field on a push (serde
+        // unknown-field tolerance) and codes progressive, which looks like
+        // success — so the manager UI must gate the scan picker on it.
+        "video-encode-scan",
     ];
     // Strict mode (`SO_BINDTODEVICE`) requires `CAP_NET_RAW`. Probed
     // once at startup; advertised only when the setsockopt actually
@@ -8710,6 +8718,14 @@ mod multiviewer_capability_gate {
     fn clip_export_is_advertised_under_the_name_the_manager_reads() {
         let caps = super::edge_capabilities();
         assert!(caps.contains(&"clip-export"), "caps = {caps:?}");
+    }
+
+    /// `video_encode.scan` is gated on this string in the manager UI; an
+    /// edge that honours the field must say so under exactly this name.
+    #[test]
+    fn video_encode_scan_is_advertised() {
+        let caps = super::edge_capabilities();
+        assert!(caps.contains(&"video-encode-scan"), "caps = {caps:?}");
     }
 
     #[cfg(feature = "multiviewer")]

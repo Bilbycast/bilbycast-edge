@@ -21,10 +21,10 @@
 
 use std::sync::atomic::{AtomicU8, Ordering};
 
-use crate::config::models::VideoEncodeConfig;
+use crate::config::models::{VideoEncodeConfig, VideoScan};
 use video_codec::{
-    VideoChroma, VideoEncoderCodec, VideoEncoderConfig, VideoPreset, VideoProfile,
-    VideoRateControl,
+    VideoChroma, VideoEncoderCodec, VideoEncoderConfig, VideoFieldOrder, VideoPreset,
+    VideoProfile, VideoRateControl,
 };
 
 /// Lock-free cell that publishes the backend a [`ScaledVideoEncoder`]
@@ -617,6 +617,15 @@ pub fn select_scaler_dst_format(
 /// ST 2110 ingest reaches the encoder through a different shape (raw
 /// RFC 4175 planes, no upstream decoder), so it uses
 /// [`ScaledVideoEncoder::encode_raw_planes`] instead.
+///
+/// **Scan** (`video_encode.scan`, see [`VideoScan`]) is settled at the same
+/// lazy-open, from the frame in hand: whether it is a woven interlaced
+/// frame and in which field order, whether the output is scaled
+/// vertically, and which backend in the chain opens with field coding
+/// (see [`field_coding_plan`] / [`open_attempts`]). A field-coded encoder
+/// follows the source's field order frame by frame, and scales each field
+/// on its own and weaves them back — a woven frame is never scaled
+/// vertically as one picture, which would blend its two fields.
 #[cfg(feature = "media-codecs")]
 pub struct ScaledVideoEncoder {
     encode_cfg: VideoEncodeConfig,
@@ -665,6 +674,119 @@ pub struct ScaledVideoEncoder {
     /// carries none — the decoder context's, set by the call site. See
     /// [`Self::set_source_sar_fallback`].
     sar_fallback: Option<(u32, u32)>,
+    /// `scan: auto` may field-code on this pipeline (MPEG-TS re-encodes).
+    /// See [`Self::allow_auto_field_coding`].
+    auto_field_coding: bool,
+    /// The call site's decoder weaves the two fields of an interlaced
+    /// picture into one frame (H.264, MPEG-2) rather than handing out one
+    /// field per picture (HEVC field_seq). See [`Self::set_source_codec`].
+    source_weaves_fields: bool,
+    /// Field order the open encoder codes, `None` = progressive.
+    field_order: Option<VideoFieldOrder>,
+    /// The scaler (when there is one) works on single fields: each field
+    /// is scaled on its own and the two are woven back into `weave_buf`.
+    field_split: bool,
+    weave_buf: [Vec<u8>; 3],
+    /// Why an explicit `scan: interlaced` could not be honoured, for the
+    /// call site to raise as an event. See [`Self::take_interlace_notice`].
+    interlace_notice: Option<String>,
+}
+
+/// What the frame an encoder opens on says about its fields.
+#[cfg(feature = "media-codecs")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourceScan {
+    Progressive,
+    /// Both fields woven into one frame (an interlaced H.264 / MPEG-2
+    /// decode), temporally first field as given.
+    Woven(VideoFieldOrder),
+    /// One field per picture (an HEVC field_seq decode): half-height
+    /// pictures at the field rate.
+    SingleField,
+}
+
+/// The field order to open the encoder with, whether that was asked for
+/// explicitly (`scan: interlaced`, which falls through the whole chain for
+/// a backend that can before giving up) — and, when an explicit request
+/// cannot be met at all, why.
+#[cfg(feature = "media-codecs")]
+pub fn field_coding_plan(
+    scan: VideoScan,
+    source: SourceScan,
+    auto_allowed: bool,
+    vertical_scaling: bool,
+) -> (Option<VideoFieldOrder>, bool, Option<&'static str>) {
+    match scan {
+        VideoScan::Progressive => (None, false, None),
+        VideoScan::Auto => match source {
+            SourceScan::Woven(order) if auto_allowed && !vertical_scaling => {
+                (Some(order), false, None)
+            }
+            _ => (None, false, None),
+        },
+        VideoScan::Interlaced => match source {
+            SourceScan::Woven(order) => (Some(order), true, None),
+            // Progressive content carried as interlaced: both fields from
+            // one instant, top first.
+            SourceScan::Progressive => (Some(VideoFieldOrder::Tff), true, None),
+            SourceScan::SingleField => (
+                None,
+                false,
+                Some(
+                    "the source's decoder hands out one field per picture (HEVC field_seq), \
+                     and weaving fields back into frames is not supported",
+                ),
+            ),
+        },
+    }
+}
+
+/// Every `(backend, field order)` open to try, in order. Progressive: the
+/// chain as given. `auto` wanting fields: each backend that can code fields
+/// is tried interlaced and then, if the host refuses (h264_qsv on a GPU
+/// without field encode), progressive — `auto` follows the backend the
+/// resolver lands on and never demotes to another backend to get fields.
+/// `interlaced`: every backend that can code fields, in chain order, then
+/// the whole chain progressive as the last resort.
+#[cfg(feature = "media-codecs")]
+pub fn open_attempts(
+    chain: &[VideoEncoderCodec],
+    field_order: Option<VideoFieldOrder>,
+    explicit: bool,
+) -> Vec<(VideoEncoderCodec, Option<VideoFieldOrder>)> {
+    let Some(order) = field_order else {
+        return chain.iter().map(|&c| (c, None)).collect();
+    };
+    let mut out = Vec::new();
+    if explicit {
+        out.extend(chain.iter().filter(|c| c.supports_field_coding()).map(|&c| (c, Some(order))));
+        out.extend(chain.iter().map(|&c| (c, None)));
+    } else {
+        for &c in chain {
+            if c.supports_field_coding() {
+                out.push((c, Some(order)));
+            }
+            out.push((c, None));
+        }
+    }
+    out
+}
+
+/// A decoded (sysmem) frame's planes as `(bytes, stride)`: three for a
+/// planar layout, two (luma, interleaved chroma) for NV12 / NV16 / P010 /
+/// P210.
+#[cfg(feature = "media-codecs")]
+fn frame_planes(f: &video_engine::DecodedFrame) -> Option<Vec<(&[u8], usize)>> {
+    if let Some((y, ys, u, us, v, vs)) = f.yuv_planes() {
+        return Some(vec![(y, ys), (u, us), (v, vs)]);
+    }
+    if let Some((y, ys, uv, uvs)) = f.nv12_planes().or_else(|| f.nv16_planes()) {
+        return Some(vec![(y, ys), (uv, uvs)]);
+    }
+    if let Some((y, ys, uv, uvs, _)) = f.p01x_planes().or_else(|| f.p21x_planes()) {
+        return Some(vec![(y, ys), (uv, uvs)]);
+    }
+    None
 }
 
 #[cfg(feature = "media-codecs")]
@@ -722,7 +844,45 @@ impl ScaledVideoEncoder {
             async_depth: 0,
             pts_90k: false,
             sar_fallback: None,
+            auto_field_coding: false,
+            source_weaves_fields: false,
+            field_order: None,
+            field_split: false,
+            weave_buf: [Vec::new(), Vec::new(), Vec::new()],
+            interlace_notice: None,
         }
+    }
+
+    /// Let `video_encode.scan: auto` field-code an interlaced source on
+    /// this pipeline. MPEG-TS re-encodes call it — their audience is
+    /// broadcast receivers, which display interlace natively; RTMP, WebRTC
+    /// and CMAF (mostly progressive displays) leave `auto` progressive.
+    /// Only read at lazy-open.
+    pub fn allow_auto_field_coding(&mut self) {
+        self.auto_field_coding = true;
+    }
+
+    /// The codec the caller decodes. An interlaced-flagged frame is a woven
+    /// frame (both fields) from an H.264 or MPEG-2 decoder, but a single
+    /// field from an HEVC field_seq decoder, which must not be field-coded
+    /// as if it were a frame. Until this is called no frame counts as
+    /// woven. Only read at lazy-open.
+    pub fn set_source_codec(&mut self, codec: video_codec::VideoCodec) {
+        self.source_weaves_fields = codec != video_codec::VideoCodec::Hevc;
+    }
+
+    /// The field order the open encoder codes (`None` = progressive, or
+    /// not open yet). Test-only (the encoder tests need libx264), like
+    /// [`Self::is_pts_90k`].
+    #[cfg(all(test, feature = "video-encoder-x264"))]
+    pub fn field_order(&self) -> Option<VideoFieldOrder> {
+        self.field_order
+    }
+
+    /// Why an explicit `scan: interlaced` fell back to progressive, once —
+    /// for the call site to raise `video_encode_interlace_unavailable`.
+    pub fn take_interlace_notice(&mut self) -> Option<String> {
+        self.interlace_notice.take()
     }
 
     /// Request pipelined HW submission (`depth` frames in flight) at
@@ -867,9 +1027,16 @@ impl ScaledVideoEncoder {
         let src_h = frame_ref.height();
         let src_pix_fmt = frame_ref.pixel_format();
 
+        let source_scan = if !frame_ref.is_interlaced() {
+            SourceScan::Progressive
+        } else if self.source_weaves_fields {
+            SourceScan::Woven(VideoFieldOrder::from_top_field_first(frame_ref.top_field_first()))
+        } else {
+            SourceScan::SingleField
+        };
         if self.encoder.is_none() {
             let src_sar = frame_ref.sample_aspect_ratio().or(self.sar_fallback);
-            self.lazy_open(src_w, src_h, src_pix_fmt, src_sar)?;
+            self.lazy_open(src_w, src_h, src_pix_fmt, src_sar, source_scan)?;
         } else if src_w != self.src_w
             || src_h != self.src_h
             || src_pix_fmt != self.src_pix_fmt
@@ -890,6 +1057,62 @@ impl ScaledVideoEncoder {
         }
 
         let enc = self.encoder.as_mut().unwrap();
+
+        // Follow the source's field order frame by frame (a switch from a
+        // TFF feed to a BFF one); a progressive-flagged frame keeps the
+        // last order. Progressive vs interlaced is fixed at open.
+        if let (Some(current), SourceScan::Woven(order)) = (self.field_order, source_scan)
+            && current != order
+        {
+            enc.set_frame_field_order(order)
+                .map_err(|e| format!("encoder field order change failed: {e}"))?;
+            self.field_order = Some(order);
+        }
+
+        if self.field_split
+            && let Some(scaler) = self.scaler.as_ref()
+        {
+            // Scale each field on its own and weave them back: scaling the
+            // woven frame would filter across both fields.
+            let planes =
+                frame_planes(frame_ref).ok_or_else(|| "decoded frame has no planes".to_string())?;
+            let chroma = resolve_chroma(self.encode_cfg.chroma.as_deref());
+            let bps = if self.encode_cfg.bit_depth.unwrap_or(8) > 8 { 2 } else { 1 };
+            let (dw, dh) = (self.dst_w as usize, self.dst_h as usize);
+            let (cw, ch) = match chroma {
+                VideoChroma::Yuv420 => (dw / 2, dh / 2),
+                VideoChroma::Yuv422 => (dw / 2, dh),
+                VideoChroma::Yuv444 => (dw, dh),
+            };
+            let geom = [(dw * bps, dh), (cw * bps, ch), (cw * bps, ch)];
+            for (buf, (row, rows)) in self.weave_buf.iter_mut().zip(geom) {
+                buf.resize(row * rows, 0);
+            }
+            for field in 0..2 {
+                let view = |i: usize| {
+                    let (p, stride) = planes[i.min(planes.len() - 1)];
+                    (&p[(field * stride).min(p.len())..], stride * 2)
+                };
+                let ((y, ys), (u, us), (v, vs)) = (view(0), view(1), view(2));
+                let scaled = scaler
+                    .scale_raw_planes(src_w, src_h / 2, src_pix_fmt, y, ys, u, us, v, vs)
+                    .map_err(|e| format!("field scaler failed: {e}"))?;
+                for (i, (row, rows)) in geom.into_iter().enumerate() {
+                    let (sp, ss) = scaled
+                        .plane(i)
+                        .ok_or_else(|| format!("scaled field missing plane {i}"))?;
+                    let dst = &mut self.weave_buf[i];
+                    for r in 0..rows / 2 {
+                        let d = (2 * r + field) * row;
+                        dst[d..d + row].copy_from_slice(&sp[r * ss..r * ss + row]);
+                    }
+                }
+            }
+            let [y, u, v] = &self.weave_buf;
+            return enc
+                .encode_frame(y, geom[0].0, u, geom[1].0, v, geom[2].0, pts)
+                .map_err(|e| format!("encoder encode_frame failed: {e}"));
+        }
 
         if let Some(scaler) = self.scaler.as_ref() {
             let scaled = scaler
@@ -938,8 +1161,9 @@ impl ScaledVideoEncoder {
         pts: Option<i64>,
     ) -> Result<Vec<video_codec::EncodedVideoFrame>, String> {
         if self.encoder.is_none() {
-            // Raw planes carry no sample aspect ratio: square, as before.
-            self.lazy_open(src_w, src_h, src_pix_fmt, None)?;
+            // Raw planes carry no sample aspect ratio (square, as before)
+            // and no field order (progressive to `scan: auto`).
+            self.lazy_open(src_w, src_h, src_pix_fmt, None, SourceScan::Progressive)?;
         } else if src_w != self.src_w
             || src_h != self.src_h
             || src_pix_fmt != self.src_pix_fmt
@@ -987,6 +1211,7 @@ impl ScaledVideoEncoder {
         src_h: u32,
         src_pix_fmt: i32,
         src_sar: Option<(u32, u32)>,
+        source_scan: SourceScan,
     ) -> Result<(), String> {
         if self.backend_chain.is_empty() {
             return Err(
@@ -995,9 +1220,19 @@ impl ScaledVideoEncoder {
             );
         }
 
+        let scan = self.encode_cfg.scan.unwrap_or_default();
+        let vertical_scaling = self.encode_cfg.height.is_some_and(|h| h != src_h);
+        let (want, explicit, refusal) =
+            field_coding_plan(scan, source_scan, self.auto_field_coding, vertical_scaling);
+        if let Some(why) = refusal {
+            self.note_interlace_unavailable(why.to_string());
+        }
+        let attempts = open_attempts(&self.backend_chain, want, explicit);
+
         let mut last_err = String::new();
-        let total = self.backend_chain.len();
-        for (idx, &candidate) in self.backend_chain.iter().enumerate() {
+        let mut field_refusal = String::new();
+        let total = attempts.len();
+        for (idx, &(candidate, field_order)) in attempts.iter().enumerate() {
             let mut enc_cfg = build_encoder_config(
                 &self.encode_cfg,
                 candidate,
@@ -1014,39 +1249,76 @@ impl ScaledVideoEncoder {
             // displayed squeezed.
             enc_cfg.sample_aspect_ratio =
                 output_sar(src_sar, (src_w, src_h), (enc_cfg.width, enc_cfg.height));
+            enc_cfg.field_order = field_order;
             if self.pts_90k {
                 enc_cfg.time_base_num = 1;
                 enc_cfg.time_base_den = 90_000;
             }
             let dst_w = enc_cfg.width;
             let dst_h = enc_cfg.height;
+            let scan_label = match field_order {
+                Some(VideoFieldOrder::Tff) => "interlaced (fields, top first)",
+                Some(VideoFieldOrder::Bff) => "interlaced (fields, bottom first)",
+                None => "progressive",
+            };
             match video_engine::VideoEncoder::open(&enc_cfg) {
                 Ok(encoder) => {
-                    if idx > 0 {
-                        // We fell through at least one backend in the
-                        // Auto chain. Surface the demote loudly so the
+                    let fell_back_for_fields = idx > 0
+                        && attempts[idx - 1].0 == candidate
+                        && attempts[idx - 1].1.is_some()
+                        && field_order.is_none();
+                    if fell_back_for_fields && !explicit {
+                        // `auto`: the backend the resolver landed on cannot
+                        // code fields on this host — progressive, on it.
+                        tracing::info!(
+                            "{}: {} cannot code interlaced on this host ({field_refusal}); \
+                             encoding progressive",
+                            self.log_tag,
+                            candidate.ffmpeg_name(),
+                        );
+                    } else if idx > 0 {
+                        // We fell through at least one attempt in the
+                        // chain. Surface the demote loudly so the
                         // operator can see in the field that QSV /
                         // NVENC went sideways and we landed on the
                         // fallback — matches the `display_atomic_unavailable`
                         // pattern on the display output.
                         tracing::warn!(
-                            "{}: video_encode resolver demoted to {} after {} failed open(s); reason: {}",
+                            "{}: video_encode resolver demoted to {} ({scan_label}) after {} failed open(s); reason: {}",
                             self.log_tag,
                             candidate.ffmpeg_name(),
                             idx,
                             last_err,
                         );
-                    } else {
-                        tracing::debug!(
-                            "{}: video_encode opened with {}",
-                            self.log_tag,
-                            candidate.ffmpeg_name(),
-                        );
                     }
+                    if explicit && field_order.is_none() {
+                        self.note_interlace_unavailable(format!(
+                            "no backend in the chain could open for field coding on this host \
+                             (last refusal: {field_refusal})"
+                        ));
+                    }
+                    tracing::info!(
+                        "{}: video_encode opened with {}, {scan_label}, {}x{} at {}/{}{}",
+                        self.log_tag,
+                        candidate.ffmpeg_name(),
+                        dst_w,
+                        dst_h,
+                        self.fps_num,
+                        self.fps_den,
+                        match enc_cfg.sample_aspect_ratio {
+                            Some((n, d)) => format!(", SAR {n}:{d}"),
+                            None => String::new(),
+                        },
+                    );
                     self.encoder = Some(encoder);
                     if let Some(sink) = &self.resolved_backend_sink {
                         sink.store(candidate);
                     }
+                    self.field_order = field_order;
+                    // Only a woven source has two fields to keep apart; a
+                    // progressive picture coded as fields scales whole.
+                    self.field_split =
+                        field_order.is_some() && matches!(source_scan, SourceScan::Woven(_));
                     self.src_w = src_w;
                     self.src_h = src_h;
                     self.src_pix_fmt = src_pix_fmt;
@@ -1056,7 +1328,10 @@ impl ScaledVideoEncoder {
                     return Ok(());
                 }
                 Err(e) => {
-                    last_err = format!("{} open failed: {e}", candidate.ffmpeg_name());
+                    last_err = format!("{} ({scan_label}) open failed: {e}", candidate.ffmpeg_name());
+                    if field_order.is_some() {
+                        field_refusal = last_err.clone();
+                    }
                     if idx + 1 < total {
                         // More candidates to try — log at info so the
                         // demote chain is visible without flooding warn
@@ -1072,9 +1347,20 @@ impl ScaledVideoEncoder {
         }
 
         Err(format!(
-            "encoder open failed: every backend in the resolver chain refused open ({} candidate(s)). Last: {}",
+            "encoder open failed: every backend in the resolver chain refused open ({} attempt(s)). Last: {}",
             total, last_err,
         ))
+    }
+
+    /// Record (and log) that an explicit `scan: interlaced` is coding
+    /// progressive; the call site raises it as an event.
+    fn note_interlace_unavailable(&mut self, why: String) {
+        tracing::warn!(
+            error_code = "video_encode_interlace_unavailable",
+            "{}: video_encode.scan=interlaced cannot be honoured — {why}; encoding progressive",
+            self.log_tag,
+        );
+        self.interlace_notice = Some(why);
     }
 
     fn try_build_scaler(
@@ -1112,21 +1398,28 @@ impl ScaledVideoEncoder {
         if dims_match && layout_matches {
             return None;
         }
+        // A field-coded woven source is scaled one field at a time.
+        let (src_h, dst_h) = if self.field_split {
+            (src_h / 2, self.dst_h / 2)
+        } else {
+            (src_h, self.dst_h)
+        };
         let Some(dst_fmt) = select_scaler_dst_format(chroma, bit_depth) else {
             tracing::warn!(
                 "{}: video_encode target {:?} {}-bit is not supported by VideoScaler; \
                  encoder will crop instead of scaling (source {}x{} -> requested {}x{})",
-                self.log_tag, chroma, bit_depth, src_w, src_h, self.dst_w, self.dst_h,
+                self.log_tag, chroma, bit_depth, src_w, src_h, self.dst_w, dst_h,
             );
             return None;
         };
         match video_engine::VideoScaler::new_with_dst_format(
-            src_w, src_h, src_pix_fmt, self.dst_w, self.dst_h, dst_fmt,
+            src_w, src_h, src_pix_fmt, self.dst_w, dst_h, dst_fmt,
         ) {
             Ok(s) => {
                 tracing::info!(
-                    "{}: scaling {}x{}(pix_fmt={}) -> {}x{} ({:?})",
-                    self.log_tag, src_w, src_h, src_pix_fmt, self.dst_w, self.dst_h, dst_fmt,
+                    "{}: scaling {}x{}(pix_fmt={}) -> {}x{} ({:?}){}",
+                    self.log_tag, src_w, src_h, src_pix_fmt, self.dst_w, dst_h, dst_fmt,
+                    if self.field_split { " per field" } else { "" },
                 );
                 Some(s)
             }
@@ -1134,7 +1427,7 @@ impl ScaledVideoEncoder {
                 tracing::warn!(
                     "{}: failed to build VideoScaler for {}x{} -> {}x{}: {e}; \
                      encoder will crop instead of scaling",
-                    self.log_tag, src_w, src_h, self.dst_w, self.dst_h,
+                    self.log_tag, src_w, src_h, self.dst_w, dst_h,
                 );
                 None
             }
@@ -1523,5 +1816,166 @@ mod sar_tests {
         let err = (n as f64 / d as f64 - 100_003.0 / 99_991.0).abs();
         assert!(err < 1e-8, "{n}:{d} off by {err}");
         assert_eq!(bounded_ratio(10_000_000, 1), (65_535, 1));
+    }
+}
+
+#[cfg(all(test, feature = "media-codecs"))]
+mod scan_tests {
+    use super::{field_coding_plan, open_attempts, SourceScan};
+    use crate::config::models::VideoScan;
+    use video_codec::VideoEncoderCodec::*;
+    use video_codec::VideoFieldOrder::{Bff, Tff};
+
+    #[test]
+    fn auto_field_codes_only_a_woven_source_on_a_ts_path_unscaled() {
+        let woven = SourceScan::Woven(Bff);
+        assert_eq!(field_coding_plan(VideoScan::Auto, woven, true, false), (Some(Bff), false, None));
+        // Scaled vertically, not a TS path, or not woven: progressive.
+        assert_eq!(field_coding_plan(VideoScan::Auto, woven, true, true), (None, false, None));
+        assert_eq!(field_coding_plan(VideoScan::Auto, woven, false, false), (None, false, None));
+        for src in [SourceScan::Progressive, SourceScan::SingleField] {
+            assert_eq!(field_coding_plan(VideoScan::Auto, src, true, false), (None, false, None));
+        }
+        assert_eq!(
+            field_coding_plan(VideoScan::Progressive, woven, true, false),
+            (None, false, None)
+        );
+    }
+
+    #[test]
+    fn interlaced_field_codes_whatever_it_can() {
+        let woven = SourceScan::Woven(Tff);
+        // Scaling does not stop it (the fields are scaled apart), nor a
+        // non-TS path.
+        assert_eq!(field_coding_plan(VideoScan::Interlaced, woven, false, true), (Some(Tff), true, None));
+        assert_eq!(
+            field_coding_plan(VideoScan::Interlaced, SourceScan::Progressive, false, false),
+            (Some(Tff), true, None)
+        );
+        // A single field per picture cannot be coded as a frame of two.
+        let (order, explicit, why) =
+            field_coding_plan(VideoScan::Interlaced, SourceScan::SingleField, true, false);
+        assert_eq!((order, explicit), (None, false));
+        assert!(why.unwrap().contains("field_seq"));
+    }
+
+    #[test]
+    fn attempts_follow_the_resolved_backend_for_auto_and_the_whole_chain_for_interlaced() {
+        let chain = [H264Qsv, H264Vaapi, X264];
+        assert_eq!(
+            open_attempts(&chain, None, false),
+            vec![(H264Qsv, None), (H264Vaapi, None), (X264, None)]
+        );
+        // auto: QSV interlaced, then QSV progressive before anything else —
+        // never a demotion to libx264 just to get fields.
+        assert_eq!(
+            open_attempts(&chain, Some(Tff), false),
+            vec![
+                (H264Qsv, Some(Tff)),
+                (H264Qsv, None),
+                (H264Vaapi, None),
+                (X264, Some(Tff)),
+                (X264, None)
+            ]
+        );
+        // interlaced: every backend that can, then progressive as a last
+        // resort.
+        assert_eq!(
+            open_attempts(&chain, Some(Bff), true),
+            vec![
+                (H264Qsv, Some(Bff)),
+                (X264, Some(Bff)),
+                (H264Qsv, None),
+                (H264Vaapi, None),
+                (X264, None)
+            ]
+        );
+        // HEVC cannot code fields at all.
+        assert_eq!(open_attempts(&[X265], Some(Tff), false), vec![(X265, None)]);
+    }
+}
+
+#[cfg(all(test, feature = "video-encoder-x264"))]
+mod scan_x264_tests {
+    use super::ScaledVideoEncoder;
+    use crate::config::models::{VideoEncodeConfig, VideoScan};
+    use video_codec::{VideoCodec, VideoEncoderCodec, VideoEncoderConfig, VideoFieldOrder};
+
+    /// Decoded frames of a small MBAFF (top field first) stream.
+    fn with_interlaced_frames(mut f: impl FnMut(&video_engine::DecodedFrame)) {
+        let (w, h) = (320usize, 240usize);
+        let mut enc = video_engine::VideoEncoder::open(&VideoEncoderConfig {
+            codec: VideoEncoderCodec::X264,
+            width: w as u32,
+            height: h as u32,
+            fps_num: 25,
+            fps_den: 1,
+            global_header: false,
+            field_order: Some(VideoFieldOrder::Tff),
+            ..VideoEncoderConfig::default()
+        })
+        .unwrap();
+        let mut dec = video_engine::VideoDecoder::open(VideoCodec::H264).unwrap();
+        let y = vec![100u8; w * h];
+        let c = vec![128u8; w / 2 * h / 2];
+        for i in 0..4 {
+            for ef in enc.encode_frame(&y, w, &c, w / 2, &c, w / 2, Some(i)).unwrap() {
+                dec.send_packet(&ef.data).unwrap();
+                while let Ok(fr) = dec.receive_frame() {
+                    f(&fr);
+                }
+            }
+        }
+    }
+
+    fn pipeline(scan: VideoScan) -> ScaledVideoEncoder {
+        let cfg: VideoEncodeConfig =
+            serde_json::from_value(serde_json::json!({ "codec": "x264" })).unwrap();
+        let cfg = VideoEncodeConfig { scan: Some(scan), ..cfg };
+        ScaledVideoEncoder::new(cfg, VideoEncoderCodec::X264, 25, 1, false, "test")
+    }
+
+    /// An HEVC field_seq decoder hands out one field per picture, flagged
+    /// interlaced: coding it as a woven frame would be wrong, so an
+    /// explicit `interlaced` codes progressive and leaves the reason for
+    /// the call site's Warning — once.
+    #[test]
+    fn interlaced_on_single_field_pictures_codes_progressive_and_says_why() {
+        let mut p = pipeline(VideoScan::Interlaced);
+        p.set_source_codec(VideoCodec::Hevc);
+        with_interlaced_frames(|f| {
+            assert!(f.is_interlaced());
+            p.encode(f, Some(0)).unwrap();
+        });
+        assert!(p.is_open());
+        assert_eq!(p.field_order(), None);
+        assert!(p.take_interlace_notice().unwrap().contains("field_seq"));
+        assert_eq!(p.take_interlace_notice(), None);
+    }
+
+    /// The same frames from an H.264 decoder are woven: field-coded.
+    #[test]
+    fn woven_frames_are_field_coded_when_asked() {
+        let mut p = pipeline(VideoScan::Interlaced);
+        p.set_source_codec(VideoCodec::H264);
+        with_interlaced_frames(|f| {
+            p.encode(f, Some(0)).unwrap();
+        });
+        assert_eq!(p.field_order(), Some(VideoFieldOrder::Tff));
+        assert_eq!(p.take_interlace_notice(), None);
+        // `auto` off a TS path (RTMP / WebRTC / CMAF) stays progressive.
+        let mut p = pipeline(VideoScan::Auto);
+        p.set_source_codec(VideoCodec::H264);
+        with_interlaced_frames(|f| {
+            p.encode(f, Some(0)).unwrap();
+        });
+        assert_eq!(p.field_order(), None);
+        let mut p = pipeline(VideoScan::Auto);
+        p.set_source_codec(VideoCodec::H264);
+        p.allow_auto_field_coding();
+        with_interlaced_frames(|f| {
+            p.encode(f, Some(0)).unwrap();
+        });
+        assert_eq!(p.field_order(), Some(VideoFieldOrder::Tff));
     }
 }
