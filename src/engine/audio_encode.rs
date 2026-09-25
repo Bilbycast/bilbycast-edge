@@ -965,7 +965,9 @@ impl AudioEncoder {
                     // Content-true anchoring: the decoded content of
                     // each output frame starts `codec_delay` samples
                     // earlier than the input submitted for it (fdk
-                    // AAC-LC ≈ 2600 samples ≈ 54 ms at 48 kHz).
+                    // AAC-LC 2048 samples = 1600 + the 448-sample metadata
+                    // round-up, 42.7 ms at 48 kHz — the library's own
+                    // figure, read at runtime).
                     // Anchoring at the raw input PTS labels every frame
                     // late by exactly that, which a lip-sync measure
                     // sees as a constant audio-late offset per encode
@@ -1045,7 +1047,15 @@ impl AudioEncoder {
                 ..
             } => {
                 if !*pts_anchor_set {
-                    *pts_90k = pts;
+                    // Content-true anchoring, exactly as the fdk branch:
+                    // libavcodec primes `initial_padding` samples (MP2 481,
+                    // AC-3 256, libopus 312 at 48 kHz) — it stamps its own
+                    // packets `pts - initial_padding` for that reason — so
+                    // an anchor at the raw input PTS would present every
+                    // frame that much late.
+                    let sr = (encoder.sample_rate() as u64).max(1);
+                    let delay_ticks = encoder.initial_padding() as u64 * 90_000 / sr;
+                    *pts_90k = pts.saturating_sub(delay_ticks);
                     *samples_since_anchor = 0;
                     *pts_anchor_set = true;
                 }
@@ -1117,10 +1127,11 @@ impl AudioEncoder {
     /// video moves, for the life of the flow. A caller that has seen the
     /// jump calls this; the partial frame in the accumulator belongs to the
     /// old timeline and is dropped with it. What is not dropped is the
-    /// codec's own delay line — fdk holds ~2 600 samples (54 ms at 48 kHz)
-    /// of the previous programme, which come out first under the new
-    /// anchor; after a silence burst that is 54 ms of silence, after a
-    /// splice the tail of what preceded it.
+    /// codec's own delay line — fdk AAC-LC holds 2048 samples (42.7 ms at
+    /// 48 kHz), libavcodec its `initial_padding`, of the previous programme,
+    /// which come out first under the new anchor; after a silence burst
+    /// that is 42.7 ms of silence, after a splice the tail of what preceded
+    /// it.
     ///
     /// The ffmpeg subprocess backend cannot be re-anchored: it discards the
     /// PTS on every chunk and stamps from a framer anchored at zero, so its
@@ -2931,6 +2942,48 @@ mod tests {
             _ => unreachable!(),
         };
         assert_eq!(after[0].pts, 50_000_000 - delay * 90_000 / 44_100);
+    }
+
+    /// The libavcodec backend (WebRTC Opus, RTMP / CMAF MP2 / AC-3) anchors
+    /// at the submitted PTS minus the encoder's `initial_padding`, as the fdk
+    /// backend does with its delay: libavcodec's output presents input
+    /// sample `n` at output sample `n + initial_padding`, so stamping from
+    /// the raw input PTS presented MP2 10.0 ms, AC-3 5.3 ms and Opus 6.5 ms
+    /// late.
+    #[cfg(feature = "media-codecs")]
+    #[test]
+    fn in_process_libav_anchors_at_pts_minus_initial_padding() {
+        for (codec, padding) in [(AudioCodec::Mp2, 481u64), (AudioCodec::Ac3, 256), (AudioCodec::Opus, 312)] {
+            let params = EncoderParams {
+                codec,
+                sample_rate: 48_000,
+                channels: 2,
+                target_bitrate_kbps: 128,
+                target_sample_rate: 48_000,
+                target_channels: 2,
+                opus_vbr_mode: None,
+                opus_fec: false,
+                opus_dtx: false,
+                opus_frame_duration_ms: None,
+            };
+            let stats = Arc::new(OutputStatsAccumulator::new(
+                "test-output".into(),
+                "test output".into(),
+                "cmaf".into(),
+            ));
+            let mut enc = AudioEncoder::spawn(
+                params, CancellationToken::new(), "test-flow".into(), "test-output".into(), stats, None,
+            )
+            .expect("in-process libavcodec encoder should open");
+            assert!(matches!(&enc.backend, EncoderBackend::InProcessLibav { .. }), "{codec:?}");
+            let silence = vec![vec![0.0f32; 960]; 2];
+            for _ in 0..12 {
+                assert!(enc.submit_planar(&silence, 1_000_000));
+            }
+            let frames = enc.drain();
+            assert!(!frames.is_empty(), "{codec:?}");
+            assert_eq!(frames[0].pts, 1_000_000 - padding * 90_000 / 48_000, "{codec:?}");
+        }
     }
 
     /// Test that HE-AAC v1 uses the in-process path when fdk-aac is enabled.
