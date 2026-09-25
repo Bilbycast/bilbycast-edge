@@ -361,6 +361,19 @@ impl InputTranscoder {
         }
     }
 
+    /// Attach the registered input-side `AudioEncodeStatsHandle` to the
+    /// audio replacer, which publishes its resolved output format there
+    /// (the configured `sample_rate` / `channels` are 0 when they follow
+    /// the source).
+    pub fn attach_input_audio_encode_handle(
+        &mut self,
+        handle: Arc<crate::stats::collector::AudioEncodeStatsHandle>,
+    ) {
+        if let Some(a) = self.audio.as_mut() {
+            a.with_input_encode_handle(handle);
+        }
+    }
+
     /// Attach the registered input-side `VideoDecodeStatsHandle` to the
     /// video replacer so it can refresh the source-codec label whenever
     /// the PMT learns a new stream_type. No-op when no video stage is
@@ -476,7 +489,7 @@ pub fn register_ingress_stats(
                 0,
             );
             t.attach_input_audio_decode_handle(audio_handle);
-            let _ = flow_stats.set_input_encode_stats(
+            let encode_handle = flow_stats.set_input_encode_stats(
                 input_id,
                 encode_handle_stats,
                 target_codec.to_string(),
@@ -484,6 +497,7 @@ pub fn register_ingress_stats(
                 target_ch,
                 target_br,
             );
+            t.attach_input_audio_encode_handle(encode_handle);
         }
 
         // ── Video: register decode + encode handles when a video stage

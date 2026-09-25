@@ -364,6 +364,10 @@ pub struct TsAudioReplacer {
     /// with the flow stats accumulator. `None` on output-side replacers,
     /// which refresh via `output_stats` instead.
     input_decode_handle: Option<Arc<crate::stats::collector::AudioDecodeStatsHandle>>,
+    /// The input-side `audio_encode_stats` entry, where the resolved output
+    /// format is published (see [`Self::with_input_encode_handle`]).
+    /// Output-side replacers reach theirs through `output_stats`.
+    input_encode_handle: Option<Arc<crate::stats::collector::AudioEncodeStatsHandle>>,
     /// Source audio stream_type (0x0F = AAC-ADTS, etc.). Used to decide
     /// which decoder to instantiate.
     source_stream_type: u8,
@@ -571,6 +575,7 @@ impl TsAudioReplacer {
             encode_stats: Arc::new(crate::engine::audio_encode::EncodeStats::new()),
             output_stats: None,
             input_decode_handle: None,
+            input_encode_handle: None,
             source_stream_type: 0,
             ts_signalling: cfg.ts_signalling.unwrap_or_default(),
             flavour: None,
@@ -718,16 +723,30 @@ impl TsAudioReplacer {
         self.input_decode_handle = Some(handle);
         // Push whatever we know right now (placeholder until the PMT is
         // observed) so the UI doesn't lag a tick.
-        self.refresh_decode_stats_label();
+        self.refresh_stats_labels();
     }
 
-    /// Best-effort label refresh on the registered audio-decode handle.
-    /// Called whenever `self.source_stream_type` / `self.resolved_*`
-    /// change. Refreshes both the output-side handle (when
-    /// [`Self::with_output_stats`] was attached) and the input-side
-    /// handle (when [`Self::with_input_decode_handle`] was attached).
-    /// Either or both may be `None`.
-    fn refresh_decode_stats_label(&self) {
+    /// Attach the input-side `AudioEncodeStatsHandle`, registered with the
+    /// configured target: `audio_encode.sample_rate` / `channels` are 0
+    /// there when they follow the source, and the replacer publishes the
+    /// format it resolved once the first frame decodes.
+    pub fn with_input_encode_handle(
+        &mut self,
+        handle: Arc<crate::stats::collector::AudioEncodeStatsHandle>,
+    ) {
+        self.input_encode_handle = Some(handle);
+        self.refresh_stats_labels();
+    }
+
+    /// Best-effort refresh of the registered stats handles, whenever
+    /// `self.source_stream_type`, the decoded format or the resolved output
+    /// format changes: the audio-decode handle gets the source codec label
+    /// and the decoded PCM shape, the audio-encode handle the output format
+    /// the encoder was opened at. Output-side handles are reached through
+    /// [`Self::with_output_stats`], input-side ones were attached with
+    /// [`Self::with_input_decode_handle`] / [`Self::with_input_encode_handle`];
+    /// any may be absent.
+    fn refresh_stats_labels(&self) {
         let codec_label: &'static str = match self.source_stream_type {
             0x0F | 0x11 => "AAC",
             0x03 | 0x04 => "MP2",
@@ -738,15 +757,24 @@ impl TsAudioReplacer {
         // Output-side path: look the handle up through the per-output
         // accumulator. Same lookup as before — kept for backward compat
         // with output-side TS replacers.
-        if let Some(stats) = self.output_stats.as_ref()
-            && let Some(h) = stats.audio_decode_stats_handle() {
+        let decoded = self.stage_in;
+        let resolved = (self.resolved_sample_rate, self.resolved_channels);
+        if let Some(stats) = self.output_stats.as_ref() {
+            if let Some(h) = stats.audio_decode_stats_handle() {
                 if !codec_label.is_empty() {
                     h.set_input_codec(codec_label);
                 }
-                if self.resolved_sample_rate != 0 && self.resolved_channels != 0 {
-                    h.set_output_shape(self.resolved_sample_rate, self.resolved_channels);
+                if decoded.0 != 0 && decoded.1 != 0 {
+                    h.set_output_shape(decoded.0, decoded.1);
                 }
             }
+            if let Some(h) = stats.audio_encode_stats_handle()
+                && resolved.0 != 0
+                && resolved.1 != 0
+            {
+                h.set_target_shape(resolved.0, resolved.1);
+            }
+        }
         // Input-side path: handle held directly. Skips the
         // accumulator-level indirection because ingress-side handles are
         // keyed by `input_id` and the replacer never sees the flow-stats
@@ -755,9 +783,15 @@ impl TsAudioReplacer {
             if !codec_label.is_empty() {
                 h.set_input_codec(codec_label);
             }
-            if self.resolved_sample_rate != 0 && self.resolved_channels != 0 {
-                h.set_output_shape(self.resolved_sample_rate, self.resolved_channels);
+            if decoded.0 != 0 && decoded.1 != 0 {
+                h.set_output_shape(decoded.0, decoded.1);
             }
+        }
+        if let Some(h) = self.input_encode_handle.as_ref()
+            && resolved.0 != 0
+            && resolved.1 != 0
+        {
+            h.set_target_shape(resolved.0, resolved.1);
         }
     }
 
@@ -1040,7 +1074,7 @@ impl TsAudioReplacer {
             // immediately.
             self.stats.source_pid.store(apid, Ordering::Relaxed);
             self.stats.source_stream_type.store(ast, Ordering::Relaxed);
-            self.refresh_decode_stats_label();
+            self.refresh_stats_labels();
             if let Some(ev) = self.engage.note_locked(apid, ast) {
                 self.emit_engage(&ev);
             }
@@ -1623,7 +1657,7 @@ impl TsAudioReplacer {
         self.fade_in_left = 0;
         self.latch_latency(sample_rate);
         self.codecs_ready = true;
-        self.refresh_decode_stats_label();
+        self.refresh_stats_labels();
         Ok(())
     }
 
@@ -1676,7 +1710,7 @@ impl TsAudioReplacer {
         self.xf_len = (rate / 500) as usize;
         self.tail = vec![Vec::new(); channels as usize];
         self.fade_in_left = self.fade_in_left.min(self.xf_len);
-        self.refresh_decode_stats_label();
+        self.refresh_stats_labels();
         Ok(())
     }
 
@@ -4387,6 +4421,58 @@ mod tests {
         assert_eq!(r.stats_handle().timeline_corrections.load(Ordering::Relaxed), 1);
         let e = err_samples("aac_lc", &out, src_time(96_000) - 13_500.0, 48_000);
         assert!(e.abs() <= 4.0, "{e}");
+    }
+
+    /// The stats snapshot says what the replacer resolved: the output's
+    /// `audio_encode_stats` carry the format the encoder was opened at (the
+    /// configuration's 0 = "follows the source" was rendered "0 Hz 0ch"),
+    /// the `audio_decode_stats` the decoded source format (it carried the
+    /// output's). Input side too, through the handles `InputTranscoder`
+    /// attaches.
+    #[cfg(all(feature = "media-codecs", feature = "fdk-aac"))]
+    #[test]
+    fn the_stats_carry_the_decoded_and_the_resolved_format() {
+        use e2e::*;
+        let ts = mux(0x0F, &pack(&encode_source(Src::Aac, &content(1_000, 48_000)), 3));
+        let mut cfg = enc("aac_lc");
+        cfg.channels = Some(1);
+        // Output side, registered as transcode_chain::build_for_output does.
+        let acc = Arc::new(crate::stats::collector::OutputStatsAccumulator::new(
+            "o".into(),
+            "o".into(),
+            "udp".into(),
+        ));
+        let r = TsAudioReplacer::new(&cfg, None).unwrap();
+        acc.set_decode_stats(r.decode_stats_handle(), "", 0, 0);
+        acc.set_encode_stats(r.encode_stats_handle(), "aac_lc", 0, 0, r.bitrate_kbps());
+        let mut r = r.with_output_stats(acc.clone());
+        run(&mut r, &ts);
+        let snap = acc.snapshot();
+        let de = snap.audio_decode_stats.expect("decode stats");
+        let en = snap.audio_encode_stats.expect("encode stats");
+        assert_eq!((de.input_codec.as_str(), de.output_sample_rate_hz, de.output_channels), ("AAC", 48_000, 2));
+        assert_eq!((en.target_sample_rate_hz, en.target_channels), (48_000, 1));
+        // Input side.
+        let mut r = TsAudioReplacer::new(&cfg, None).unwrap();
+        let dh = Arc::new(crate::stats::collector::AudioDecodeStatsHandle::new(r.decode_stats_handle(), "", 0, 0));
+        let eh = Arc::new(crate::stats::collector::AudioEncodeStatsHandle::new(
+            r.encode_stats_handle(),
+            "aac_lc",
+            0,
+            0,
+            r.bitrate_kbps(),
+        ));
+        r.with_input_decode_handle(dh.clone());
+        r.with_input_encode_handle(eh.clone());
+        run(&mut r, &ts);
+        assert_eq!(
+            (dh.output_sample_rate_hz.load(Ordering::Relaxed), dh.output_channels.load(Ordering::Relaxed)),
+            (48_000, 2)
+        );
+        assert_eq!(
+            (eh.target_sample_rate_hz.load(Ordering::Relaxed), eh.target_channels.load(Ordering::Relaxed)),
+            (48_000, 1)
+        );
     }
 
     // ── PCR on the audio PID (defect x) and the pre-PMT gate (4) ──

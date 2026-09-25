@@ -381,7 +381,10 @@ pub fn build_for_output(
             // The encode snapshot is what carries the replacer's own
             // counters (source PID, pre-PMT drops, timeline corrections):
             // without this registration they never reached the output's
-            // stats. 0 = follows the source.
+            // stats. A rate / channel count left to follow the source is
+            // registered as 0 and published by the replacer once its first
+            // frame resolves it (and the decode handle gets the decoded
+            // format).
             stats.set_encode_stats(
                 r.encode_stats_handle(),
                 enc.codec.clone(),

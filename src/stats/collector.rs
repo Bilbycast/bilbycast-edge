@@ -334,13 +334,41 @@ impl AudioDecodeStatsHandle {
 }
 
 /// Registered handle to a per-output encode stage's counters plus the
-/// resolved target codec / format descriptors.
+/// resolved target codec / format descriptors. The rate and channel count
+/// are atomics: a stage whose output follows the source registers 0 and
+/// publishes the format once its first frame resolves it (the TS audio
+/// replacer, [`Self::set_target_shape`]).
 pub struct AudioEncodeStatsHandle {
     pub stats: Arc<crate::engine::audio_encode::EncodeStats>,
     pub output_codec: String,
-    pub target_sample_rate_hz: u32,
-    pub target_channels: u8,
+    pub target_sample_rate_hz: std::sync::atomic::AtomicU32,
+    pub target_channels: std::sync::atomic::AtomicU8,
     pub target_bitrate_kbps: u32,
+}
+
+impl AudioEncodeStatsHandle {
+    pub fn new(
+        stats: Arc<crate::engine::audio_encode::EncodeStats>,
+        output_codec: impl Into<String>,
+        target_sample_rate_hz: u32,
+        target_channels: u8,
+        target_bitrate_kbps: u32,
+    ) -> Self {
+        Self {
+            stats,
+            output_codec: output_codec.into(),
+            target_sample_rate_hz: std::sync::atomic::AtomicU32::new(target_sample_rate_hz),
+            target_channels: std::sync::atomic::AtomicU8::new(target_channels),
+            target_bitrate_kbps,
+        }
+    }
+
+    /// The encoder's resolved output format.
+    pub fn set_target_shape(&self, sample_rate_hz: u32, channels: u8) {
+        use std::sync::atomic::Ordering;
+        self.target_sample_rate_hz.store(sample_rate_hz, Ordering::Relaxed);
+        self.target_channels.store(channels, Ordering::Relaxed);
+    }
 }
 
 /// Registered handle to a per-output video encode stage's counters plus the
@@ -1292,6 +1320,12 @@ impl OutputStatsAccumulator {
         self.audio_decode_stats.get()
     }
 
+    /// The registered audio encode stats handle, if any: a stage whose
+    /// output format follows the source publishes it here once resolved.
+    pub fn audio_encode_stats_handle(&self) -> Option<&AudioEncodeStatsHandle> {
+        self.audio_encode_stats.get()
+    }
+
     /// Register the per-output audio encode stats handle. Called once at
     /// output startup by outputs that spawn an [`crate::engine::audio_encode::AudioEncoder`].
     /// Subsequent calls are no-ops (first wins).
@@ -1303,13 +1337,13 @@ impl OutputStatsAccumulator {
         target_channels: u8,
         target_bitrate_kbps: u32,
     ) {
-        let _ = self.audio_encode_stats.set(AudioEncodeStatsHandle {
+        let _ = self.audio_encode_stats.set(AudioEncodeStatsHandle::new(
             stats,
-            output_codec: output_codec.into(),
+            output_codec,
             target_sample_rate_hz,
             target_channels,
             target_bitrate_kbps,
-        });
+        ));
     }
 
     /// Register the per-output `TsAudioReplacer` source-PID stats
@@ -1540,8 +1574,8 @@ impl OutputStatsAccumulator {
                 encoded_frames_out: h.stats.encoded_frames_out.load(Ordering::Relaxed),
                 supervisor_restarts: h.stats.supervisor_restarts.load(Ordering::Relaxed),
                 output_codec: h.output_codec.clone(),
-                target_sample_rate_hz: h.target_sample_rate_hz,
-                target_channels: h.target_channels,
+                target_sample_rate_hz: h.target_sample_rate_hz.load(Ordering::Relaxed),
+                target_channels: h.target_channels.load(Ordering::Relaxed),
                 target_bitrate_kbps: h.target_bitrate_kbps,
                 source_pid: src_pid,
                 source_stream_type: src_stream_type,
@@ -3998,13 +4032,13 @@ impl FlowStatsAccumulator {
         target_channels: u8,
         target_bitrate_kbps: u32,
     ) -> Arc<AudioEncodeStatsHandle> {
-        let handle = Arc::new(AudioEncodeStatsHandle {
+        let handle = Arc::new(AudioEncodeStatsHandle::new(
             stats,
-            output_codec: output_codec.into(),
+            output_codec,
             target_sample_rate_hz,
             target_channels,
             target_bitrate_kbps,
-        });
+        ));
         self.input_audio_encode_stats
             .insert(input_id.to_string(), handle.clone());
         handle
@@ -4692,8 +4726,8 @@ impl FlowStatsAccumulator {
                         encoded_frames_out: h.stats.encoded_frames_out.load(Ordering::Relaxed),
                         supervisor_restarts: h.stats.supervisor_restarts.load(Ordering::Relaxed),
                         output_codec: h.output_codec.clone(),
-                        target_sample_rate_hz: h.target_sample_rate_hz,
-                        target_channels: h.target_channels,
+                        target_sample_rate_hz: h.target_sample_rate_hz.load(Ordering::Relaxed),
+                        target_channels: h.target_channels.load(Ordering::Relaxed),
                         target_bitrate_kbps: h.target_bitrate_kbps,
                         source_pid: 0,
                         source_stream_type: 0,
