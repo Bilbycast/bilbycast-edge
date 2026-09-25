@@ -185,14 +185,23 @@ Two distinct numbers the old single "A/V sync" card conflated (split
   number EBU R37 thresholds apply to. `mode: "passthrough"` means no
   stage touches PTS and the source A/V relationship is preserved
   bit-exactly — skew 0 by construction, not by measurement.
-  *Honesty caveats*: the audio-replacer delta compensates the PCM
-  accumulator partial but remains approximate to within the encoder's
-  internal buffering (< 1 target frame); encoder PRIMING (content
-  emitted late by the codec's startup delay) is NOT visible to this PTS
-  bookkeeping — and the absolute source lip-sync (camera/upstream) is
-  not measurable inline. Verify end-to-end with the trusted flash/beep
-  source (`testbed/av-trusted-2026-06-05`); live cross-check 2026-06-06:
-  metric 0 ms vs decoded truth +8.6 ms on the AC-3 re-encode path.
+  The audio-replacer delta counts everything placed but not yet in an
+  emitted frame (encoder accumulator, resampler queue, crossfade tail)
+  and the codec pipeline's **declared** latency — the source decoder's,
+  the resampler's and the encoder's priming — less what the output
+  stamps subtract, which is that same latency; a healthy re-encode reads
+  0. *Honesty caveats*: the latency term is what fdk-aac (`nDelay`,
+  `outputDelay`), libavcodec (`initial_padding`) and rubato
+  (`output_delay`) declare, not a measurement — the unit tests pin those
+  declarations against decoded round trips for every source × target
+  pair, so a library whose declaration drifts fails the build, but a
+  wrong declaration at runtime would read 0 here while the audio is off
+  by the difference. The absolute source lip-sync (camera / upstream) is
+  not measurable inline. Verify end-to-end with the content-anchored
+  `avsync.py` measurement or the trusted flash/beep source
+  (`testbed/av-trusted-2026-06-05`). Until 2026-09 the delta left codec
+  latency out altogether and read 0 on the Sky AAC re-encodes that were
+  presented 79.0 / 46.4 / 41.6 ms late (AAC / MP2 / AC-3 targets).
 
 - **A/V mux interleave** ([`stats/av_interleave.rs`](../src/stats/av_interleave.rs))
   — `video_PES_PTS − audio_PES_PTS` at mux position. NOT lip-sync; a

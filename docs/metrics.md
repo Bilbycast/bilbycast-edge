@@ -347,12 +347,29 @@ the edge shifted the audio↔video PTS relationship vs the source:
 | `mode` | `"passthrough"` (no PTS-modifying stage active — source A/V preserved bit-exactly, skew 0 by construction) or `"measured"`. |
 
 Contributing stages: `engine::ts_pts_rewriter` (single shared anchor → only
-the lipsync trim), `engine::ts_audio_replace` (re-encode sample clock —
-where loop-seam drift historically lived), `engine::ts_video_replace`
-(source-PTS queue → 0 by design, reported for regression visibility).
+the lipsync trim), `engine::ts_audio_replace` (re-encode sample clock),
+`engine::ts_video_replace` (source-PTS queue → 0 by design, reported for
+regression visibility).
+
+The audio replacer's figure, published at the first AU of every source PES
+(not in the first second after an anchor), is **where that AU's first
+sample will be presented minus its source PTS**: the timeline bookkeeping
+(a correction still to be applied, a backward source step the output did
+not follow) **plus the codec pipeline's declared latency** — the source
+decoder's, the resampler's and the encoder's priming — **minus what the
+output stamps subtract**. The stamps subtract exactly the declared latency
+(see [transcoding.md](transcoding.md#audio-timing-in-the-ts-audio-replacer)),
+so a healthy re-encode reads 0 and the figure moves with gaps, overlaps and
+drift. Until 2026-09 the metric left codec latency out entirely — "0 by
+construction whenever no gap or pad occurred" — while every AAC / MP2 /
+AC-3 re-encode of an AAC source was presented 79.0 / 46.4 / 41.6 ms late;
+the dashboard showed 0 through all of it.
+
 `FlowStats.av_skew` covers the ACTIVE input's path; `OutputStats.av_skew`
 appears additionally on outputs with their own `audio_encode` /
-`video_encode`. Capability bit: `av-skew`.
+`video_encode`. Both are alarmed (`av_skew_exceeded`, flow-scoped for the
+input path, output-scoped with `output_id` for an output). Capability bit:
+`av-skew`.
 
 **Source:** `src/stats/av_skew.rs`.
 

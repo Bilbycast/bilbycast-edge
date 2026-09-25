@@ -581,18 +581,20 @@ pub fn spawn_xxx_output(
 ```
 
 There is no fixed arity beyond that prefix: the output spawn functions run
-from 4 to 9 parameters, each appending the plumbing it actually needs.
+from 4 to 8 parameters, each appending the plumbing it actually needs.
 `spawn_st2110_40_output` is the minimum (the prefix alone);
-`spawn_udp_output` and `spawn_rist_output` are the widest at nine;
+`spawn_udp_output`, `spawn_rist_output`, `spawn_display_output` and
+`spawn_webrtc_output` are the widest at eight;
 `spawn_srt_output` packs its extras into a single `SrtOutputCtx` struct
 rather than growing the list. The two near-universal extras are
 `flow_id: String` and an event sender —
 `event_sender: EventSender`, spelled `events` on the UDP path and carried
-inside `SrtOutputCtx` on SRT. The pacing trio
-`frame_rate_rx: Option<watch::Receiver<Option<f64>>>`,
-`av_sync_pacer: Option<Arc<AvSyncPacer>>` and
+inside `SrtOutputCtx` on SRT. The pacing pair
+`frame_rate_rx: Option<watch::Receiver<Option<f64>>>` and
 `active_input_rx: watch::Receiver<String>` reaches only the three wire-paced
-TS outputs (`udp`, `rtp`, `rist`); `input_format: Option<InputFormat>` only
+TS outputs (`udp`, `rtp`, `rist`); no output takes the flow's
+`AvSyncPacer` — the transcode chains read no clock (2026-09);
+`input_format: Option<InputFormat>` only
 the four that need the upstream audio shape (`udp`, `rtp_audio`,
 `st2110_30`, `st2110_31`). Take an event sender unless the output will never
 raise an operational event — `spawn_rtp_audio_output` and the

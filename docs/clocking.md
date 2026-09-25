@@ -89,8 +89,9 @@ file, looping playout, SCTE-35 splices, encoder restarts. Once the PLL
 has failed, source-tracking is already lost, so the fallback prefers the
 node's PTP clock (clean, cross-edge-coherent) over bare wallclock, with
 `Wallclock` only as the always-locked floor. The encoder-style PES PTS
-regenerators (`engine::ts_pts_rewriter`, `TsAudioReplacer::set_av_sync_pacer`)
-anchor against whichever rung is active.
+regenerator (`engine::ts_pts_rewriter`) anchors against whichever rung is
+active. The TS transcode replacers read no clock at all: they stamp
+source-relative PTS and leave the one master anchor to this rewriter.
 
 Operators who run on PTP-disciplined or clean-PCR contribution
 sources and want cross-edge coherence opt in to the PLL via the new
@@ -168,16 +169,16 @@ per-PES master_now jitter injection) while making absolute PTS
 values master-clock-derived. DTS preserves the source PTS-DTS delta
 so H.264 / HEVC B-frame reorder still decodes correctly.
 
-A **10 s safety check** on the anchor candidate falls back to the
-raw source PTS when master and source are wildly uncorrelated
-(Wallclock master + small-offset encoder PTS — the common case
-today): preserves the existing anchor-to-source behaviour when the
-master clock can't help, kicks in only when the two agree to within
-10 s (PTP master + PTP-disciplined source, or a locked
-`SourcePcrPll` master).
+There is no safety fallback: the master clock is used only for the anchor
+and for deltas across discontinuities, never compared with source absolute
+values, so the model works however the two compare.
 
-The transcoded path landed the same model in
-[`engine::ts_audio_replace::TsAudioReplacer::set_av_sync_pacer`](../src/engine/ts_audio_replace.rs).
+The TS transcode replacers do **not** use this model. There is one anchor
+per pipeline: the replacers stamp source-relative PTS — the audio replacer
+from its sample-count model held to the source PES PTS (see
+[transcoding.md](transcoding.md#audio-timing-in-the-ts-audio-replacer)) —
+and this rewriter, downstream on the input or upstream of an output's
+chain, applies the master anchor to every PID uniformly.
 ### PCR discontinuity bridging (and what the clamp costs)
 
 `engine::ts_pts_rewriter::rewrite_pcr_value` handles a source PCR
@@ -200,7 +201,12 @@ discontinuity in three ways, and the third is the one worth knowing about.
 * **Forward jump the wall clock witnessed** — pass through, DI=1. A live
   edit point or SCTE-35 splice is a real gap in the content, and passing it
   through preserves PCR_FO rate accuracy (TR 101 290, ±30 ppm). The
-  `pcr_jump_signal` tells that input's audio replacer to silence-pad it.
+  `pcr_jump_signal` tells that input's audio replacer, which folds it into
+  its source-timeline check; any offset beyond 500 ms re-anchors at the
+  audio's own PTS, so the re-encoded audio follows its source PTS across
+  the jump — a single gap when the audio PTS carry it, none when they do
+  not (the rewriter maps the audio PTS through the same anchor as the
+  PCR, so audio that did not jump needs no pad).
 * **Forward jump the wall clock did *not* witness** — bridge it. A file loop
   wrap leaps a whole programme duration in milliseconds of real time; passed
   through, that leap lands in the presentation timeline and the display sheds
@@ -221,29 +227,15 @@ until the frame queue was shedding continuously. What is given up is absolute
 wall-clock alignment across a long gap, not stream validity. Pinned by
 `bridge_clamp_charges_a_long_outage_only_one_pcr_rr_interval`.
 
-On first PES + every >500 ms source-PTS discontinuity, the audio
-replacer anchors via the same `anchor_target` helper with the same
-10 s safety. Wired through
-[`engine::transcode_chain::build_for_output`](../src/engine/transcode_chain.rs)
-and
-[`engine::input_transcode::InputTranscoder::set_av_sync_pacer`](../src/engine/input_transcode.rs).
-The video replacer takes no pacer: it generates no PCR.
-
-**When does the rewriter actually rewrite?** Only when the
-`anchor_target` 10 s safety lets it. On a flow with a `Wallclock`
-master (switcher / file / replay / WebRTC / test-pattern) and a
-typical encoder-relative source PTS, the safety triggers and the
-anchor falls back to source PTS — effectively a no-op (output
-PTS == source PTS). To actually see
-master-clock-derived PTS output, the flow needs either:
-
-- `master_clock.kind = "ptp"` with PTP-disciplined sources, OR
-- `master_clock.kind = "contribution"` (or legacy `source_pcr_pll`)
-  AND the PLL has locked.
-
-This matches the existing pre-rewriter behaviour for the safe path,
-and unlocks the master-clock anchor path for the genuinely
-clock-coherent configurations where it improves output quality.
+Neither TS transcode replacer takes the flow's `AvSyncPacer`. The video
+replacer generates no PCR (`ts_pcr_remux` re-stamps the input's). The audio
+replacer anchors on the source PES PTS — on the first PES and on every
+>500 ms forward step — and holds its content to the source PTS timeline by
+comparing PTS with decoded samples only. Its old wallclock catch-up
+compared the master clock at the moment the codec thread reached a PES with
+the samples emitted, which measured host load and wire backpressure rather
+than lip-sync, and inserted 32 ms of silence at a time under load; it is
+gone, together with the pacer plumbing into the transcode chains.
 
 **Which PIDs are rewritten.** Every PES-bearing ES learned from the
 PMT — audio, video, AND other PES carriers (DVB teletext, DVB
@@ -602,10 +594,11 @@ pass with the master-clock work in.
 
 - **AudioMaster** (ALSA local-display master) is reserved but not
   implemented; the kind tag falls through to Wallclock.
-- **Lipsync trim** applies to the PES PTS rewriter
-  (`engine::ts_pts_rewriter`) and the audio replacer
-  (`TsAudioReplacer::set_av_sync_pacer`); it is **not** yet applied
-  to the transcoded video replacer's output PTS values.
+- **Lipsync trim** is applied by the PES PTS rewriter
+  (`engine::ts_pts_rewriter`), to audio PIDs only. The TS audio replacer
+  stamps from the PES PTS it is handed, so an output transcode keeps the
+  trim the input's rewriter applied, and an input transcode's re-encoded
+  audio gets it from the rewriter that follows it.
 - **PCR pre-roll** is hard-coded at 80 ms; a future enhancement could
   expose it per-flow for low-latency contribution where 40 ms is
   preferable.

@@ -495,15 +495,125 @@ field set from the compressed codecs and validation checks it apart:
 - `audio_encode` + SMPTE 2022-1 FEC encode (RTP).
 - `audio_encode` + SRT FEC (`packet_filter`).
 
+### Audio timing in the TS audio replacer
+
+On the TS outputs (SRT / UDP / RTP / RIST) and on TS-carrying inputs the
+`TsAudioReplacer` keeps the re-encoded audio on its source's timeline, to
+the sample:
+
+- **Per access unit, across PES boundaries.** The audio PID's payload is
+  reassembled into one continuous elementary stream and cut into access
+  units (ADTS / LOAS / MPEG audio / AC-3 / E-AC-3 headers) as soon as each
+  is complete; a PES's PTS belongs to the first AU that *commences* in it
+  (ISO/IEC 13818-1 §2.4.3.7). An AU that straddles two PES packets — legal
+  whenever `data_alignment_indicator` is 0, and Sky Sports Arena does it
+  three times a loop — decodes like any other. It used to be lost together
+  with the whole next PES: 149 ms of audio replaced by 128 ms of silence,
+  moving the audio 21.3 ms early for good at every event. A header is
+  trusted where the previous AU ended; anywhere else (the first AU, after a
+  resync, after a TS continuity-counter break) only once its successor is a
+  consistent header or it ends on a PES boundary, so a sync pattern inside a
+  payload is never decoded. An AU into which a new PES begins with a header
+  of its own was cut short upstream (a file's truncated last PES at a loop
+  wrap) and is dropped, never glued to the next PES. A duplicate TS packet
+  (same CC, same payload) is dropped.
+- **Latency.** Audio leaves the replacer about one AU after its last byte
+  arrives instead of one PES — which on sources packing seven AUs per PES
+  was up to 150 ms, and made an audio-only transcode's first AU of every PES
+  late against a passthrough PCR. The replacer holds the last 2 ms of
+  decoded audio back so a correction (below) can crossfade into it, which
+  can delay an output frame by one more source AU.
+- **Stamps cancel the codec pipeline's latency.** Output PTS come from a
+  sample-count model anchored on the source PTS (one rounding per frame, so
+  44.1 kHz never drifts), **minus the latency the libraries declare for this
+  pipeline**, latched when it opens:
+  - the source decoder's: none — fdk-aac is opened with noise-substitution
+    concealment and the PCM limiter off (`bilbycast-fdk-aac-rs`), and the
+    libavcodec decoders add none;
+  - the resampler's, when the rate changes (rubato's `output_delay`, half
+    its sinc length scaled to the output rate: 117 samples for 48 → 44.1 kHz
+    at `src_quality: high`);
+  - the encoder's priming: fdk-aac `nDelay` (AAC-LC 2048 samples = 42.7 ms
+    at 48 kHz; HE-AAC's includes the decoder's SBR delay) or libavcodec
+    `initial_padding` (MP2 481, AC-3 256).
+
+  A receiver therefore presents each sample at its source PTS. Before, an
+  AAC source re-encoded to AAC-LC / MP2 / AC-3 presented its audio **79.0 /
+  46.4 / 41.6 ms late** (measured on Sky): fdk-aac's default decoder delay
+  of 1744 samples (one frame of energy-interpolation concealment plus the
+  limiter's 15 ms lookahead) plus the encoder priming. The Info log line
+  `ts_audio_replace: re-encoded audio stamped earlier by the codec
+  pipeline's declared latency` gives the latched figure. An HE-AAC
+  *source's* SBR delay is left in: the source's own timestamps already
+  assume a reference decoder that has it.
+- **Held to the source PTS, without a clock.** At the first AU of every PES
+  the replacer compares the PES PTS with where the decoded content ends
+  (samples decoded, plus silence inserted, minus samples dropped, since the
+  anchor):
+  - within ±5 ms: nothing (PES timestamp jitter);
+  - a **gap** of 100 ms or more, or one over 5 ms that has kept its sign for
+    150 ms (and at least two PES) — time in which nothing was decoded: lost
+    or undecodable AUs, an off-air stretch, a splice: exactly that much
+    silence, inserted at the source rate ahead of the PES's audio and
+    passed through the rate / channel stage; on a `media_player` input the
+    output PTS step over the gap instead, because its file splices step PTS
+    over audio that is continuous;
+  - an **overlap**, by the same rules: that much audio dropped from the
+    head of what follows;
+  - a forward step over 500 ms: re-anchor at the new PTS; a backward one:
+    the output keeps its monotonic trajectory and the source is measured
+    from its new origin.
+
+  Insertions and drops crossfade over 2 ms. An AU that fails to decode is
+  replaced by silence of its nominal length where it stood. Nothing in it
+  reads a clock, so host load, encoder warm-up and wire backpressure can no
+  longer move the audio: the **master-clock catch-up** that did — it
+  compared the master clock at the moment the codec thread reached a PES
+  with the samples emitted, inserted 32 ms of silence per firing (7 times
+  in 200 s at load average 40 on an AC-3 output, a gate-1 failure), and
+  counted a real gap twice — is removed, and so is the per-flow pacer
+  plumbing into the transcode chains. A source whose audio clock is not
+  locked to its PCR is held within ~5 ms by one short insert or drop about
+  every 100 s at 50 ppm; `timeline_corrections`, `silence_inserted_samples`
+  and `dropped_samples` on the output's `audio_encode_stats` count them.
+- **`audio_encode.sample_rate` / `channels` convert even without a
+  `transcode` block.** The encoder is opened at those values; the decoded
+  PCM used to reach it unconverted, so a 48 kHz source through
+  `sample_rate: 44100` played 8.8 % slow, and `channels: 2` on a 5.1 source
+  kept L and R and lost the centre. The replacer now builds the conversion
+  itself: rubato SRC, and for channel counts the standard downmix (ITU-R
+  BS.775 for 5.1 / 7.1 → stereo, Lt/Rt for quad → stereo, the transcode
+  stage's defaults for mono ↔ stereo; any other pair keeps the channels in
+  order, silence for the missing ones).
+- **`av_skew`** on the output (or, for an input transcode, the flow) reports
+  what remains: where each PES's first sample will be presented minus its
+  source PTS — the declared latency the stamps do not cancel plus any
+  correction still pending. See [metrics.md](metrics.md#edge-added-av-skew-flowstatsav_skew-outputstatsav_skew).
+
+**Release note — every fdk-aac decode is 36.3 ms earlier.** The decoder
+change above is in `bilbycast-fdk-aac-rs` and applies to every AAC decode in
+the edge: this replacer, the display output, SDI, CMAF, RTMP, WebRTC,
+ST 2110-30, HLS and content analysis all get AAC audio 1744 samples
+(36.3 ms at 48 kHz, 1685 at 44.1 kHz) earlier than before, i.e. on time.
+Operator-calibrated `audio_offset_ms` trims on SDI outputs shift by that
+much. With the limiter off, a sample reconstructed past full scale
+hard-clips instead of being soft-limited, and a stream carrying MPEG-4
+`prog_ref_level` other than -24 dB now decodes at its encoded level instead
+of being re-levelled, so `audio_full` loudness readings change for such
+streams.
+
 ### Engine internals
 
-- Core stage: `src/engine/ts_audio_replace.rs` (streaming `TsAudioReplacer`).
+- Core stage: `src/engine/ts_audio_replace.rs` (streaming `TsAudioReplacer`);
+  access-unit framing and the continuous-ES cutter: `src/engine/audio_au.rs`.
 - PMT: `src/engine/ts_pmt_edit.rs` (`PsiUnitStage`, `rebuild_pmt_section`,
   `OutVersion`, `detect_flavour`); the engage watchdog is
   `src/engine/transcode_engage.rs`.
 - Wiring: `output_udp.rs`, `output_rtp.rs`, `output_srt.rs` insert a
   `block_in_place` call between the program filter and the egress buffer.
-- Decoder: `bilbycast-fdk-aac-rs::AacDecoder::open_adts` (Fraunhofer FDK AAC).
+- Decoder: `bilbycast-fdk-aac-rs::AacDecoder::open_adts` (Fraunhofer FDK
+  AAC, opened with no added delay) for ADTS; libavcodec for LATM / MP2 /
+  AC-3 / E-AC-3.
 - Encoder: `bilbycast-fdk-aac-rs::AacEncoder` for AAC family;
   `video-engine::AudioEncoder` (libavcodec) for MP2 / AC-3. Opus uses
   libopus in the same crate; unused on TS outputs.
@@ -555,6 +665,9 @@ When both blocks set the same field, `transcode` wins. `audio_encode`'s
 - `audio_encode.sample_rate = 44100` + `transcode.sample_rate` unset →
   encoder ingests at 44100 Hz (fallback).
 - Neither set → encoder follows the source.
+- No `transcode` block, `audio_encode.sample_rate` / `channels` differing
+  from the source → on the TS outputs and TS inputs the audio replacer
+  converts to them itself (see "Audio timing in the TS audio replacer").
 
 On WebRTC: Opus is always 48 kHz on the wire. `transcode.sample_rate`
 only chooses the PCM rate the encoder ingests; Opus resamples
@@ -571,7 +684,12 @@ channel count; if unset, the Opus encoder follows the source.
   matrix-only when rates match, matrix+rubato otherwise.
 - Wiring:
   - TS outputs (SRT / UDP / RTP / RIST): inserted inside
-    `ts_audio_replace::TsAudioReplacer` between decoder and encoder.
+    `ts_audio_replace::TsAudioReplacer` between decoder and encoder, in
+    **streaming mode** (`with_fixed_chunk`): the resampler runs on fixed
+    256-frame chunks from a queue, so it is built once and its delay is a
+    constant the output stamps cancel. The default mode rebuilds it (and
+    restarts its delay line, a dropout) whenever the decoder's frame size
+    changes; RTMP / HLS / WebRTC still use that mode.
   - RTMP: `EncoderState::Active.transcoder`; disables the same-codec
     fast path because PCM must be decoded to apply the shuffle.
   - HLS: constructed fresh per segment inside `remux_ts_audio_inprocess`.
