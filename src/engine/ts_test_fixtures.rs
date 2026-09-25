@@ -238,3 +238,61 @@ pub fn payload_packet(pid: u16, cc: u8) -> [u8; TS_PACKET_SIZE] {
     pkt[3] = 0x10 | (cc & 0x0F);
     pkt
 }
+
+/// The TS packets of one PES on `pid` carrying `es` with `pts`
+/// (`stream_id`, PES_packet_length set, data_alignment_indicator 0), the
+/// last one padded with adaptation-field stuffing; CC counted on from `cc`.
+pub fn pes_packets(pid: u16, stream_id: u8, es: &[u8], pts: u64, cc: &mut u8) -> Vec<u8> {
+    let mut pes = vec![0x00, 0x00, 0x01, stream_id];
+    pes.extend_from_slice(&((8 + es.len()) as u16).to_be_bytes());
+    pes.extend_from_slice(&[0x80, 0x80, 0x05]);
+    let mut ts = [0u8; 5];
+    put_ts(&mut ts, 0x2, pts);
+    pes.extend_from_slice(&ts);
+    pes.extend_from_slice(es);
+    let mut out = Vec::new();
+    for (i, chunk) in pes.chunks(184).enumerate() {
+        let mut pkt = vec![
+            TS_SYNC_BYTE,
+            if i == 0 { 0x40 } else { 0x00 } | ((pid >> 8) as u8 & 0x1F),
+            pid as u8,
+        ];
+        let stuffing = 184 - chunk.len();
+        if stuffing == 0 {
+            pkt.push(0x10 | (*cc & 0x0F));
+        } else {
+            pkt.push(0x30 | (*cc & 0x0F));
+            pkt.push((stuffing - 1) as u8);
+            if stuffing > 1 {
+                pkt.push(0x00);
+                pkt.extend(std::iter::repeat_n(0xFF, stuffing - 2));
+            }
+        }
+        pkt.extend_from_slice(chunk);
+        *cc = (*cc + 1) & 0x0F;
+        out.extend_from_slice(&pkt);
+    }
+    out
+}
+
+/// A one-program TS (PAT, PMT with H.264 on 0x100 and AAC ADTS on 0x101)
+/// carrying the ADTS frames of `adts`, one PES per frame — enough for a
+/// demuxer to lock the audio PID and cache its AAC config.
+pub fn aac_program_ts(adts: &[u8]) -> Vec<u8> {
+    let pmt = pmt_section(1, 0, 0x100, &[], &[(0x1B, 0x100, &[]), (0x0F, 0x101, &[])]);
+    let mut ts = pat_packet(&[(1, 0x1000)], 0, 0).to_vec();
+    ts.extend_from_slice(&packetize_sections(0x1000, &[&pmt], 0)[0]);
+    let (mut off, mut cc, mut pts) = (0usize, 0u8, 90_000u64);
+    while off + 7 <= adts.len() {
+        let len = (((adts[off + 3] as usize) & 0x03) << 11)
+            | ((adts[off + 4] as usize) << 3)
+            | ((adts[off + 5] as usize) >> 5);
+        if len < 7 || off + len > adts.len() {
+            break;
+        }
+        ts.extend(pes_packets(0x101, 0xC0, &adts[off..off + len], pts, &mut cc));
+        off += len;
+        pts += 1920;
+    }
+    ts
+}

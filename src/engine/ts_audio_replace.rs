@@ -159,7 +159,7 @@ const PERSIST_90K: i64 = 13_500; // 150 ms
 /// `av_skew` is not published for this long after an anchor.
 const AV_SKEW_HOLDOFF_90K: u64 = 90_000; // 1 s
 /// Resampler chunk (input frames) of the replacer's rate conversion.
-const SRC_CHUNK_FRAMES: usize = 256;
+const SRC_CHUNK_FRAMES: usize = super::audio_transcode::STREAM_CHUNK_FRAMES;
 
 /// Signed difference `a − b` of two 33-bit PTS values, wrap-aware.
 fn pts_diff(a: u64, b: u64) -> i64 {
@@ -1618,53 +1618,22 @@ impl TsAudioReplacer {
 
     /// The channel / rate stage from decoded `(rate, channels)`: to `out`,
     /// the output format, once the encoder is open; before that, to what
-    /// the configuration asks. A transcode block wins, with
-    /// audio_encode.sample_rate / channels folding in for the fields it
-    /// leaves unset; without one, those two alone still need a conversion
-    /// when they differ from the source — the encoder is opened at them, and
-    /// PCM at another rate would play at the wrong speed, another channel
-    /// count would be truncated. A block whose routing is for another
-    /// layout than a later format (a 5.1 preset over a stereo stretch) gives
-    /// way to the default conversion. `Ok(None)`: no conversion.
+    /// the configuration asks — the rule every re-encoding output shares
+    /// (`audio_transcode::encoder_stage`). `Ok(None)`: no conversion.
     fn build_stage(
         &self,
         rate: u32,
         channels: u8,
         out: Option<(u32, u8)>,
     ) -> Result<Option<PlanarAudioTranscoder>, String> {
-        let (want_rate, want_channels) = match out {
-            Some((r, c)) => (Some(r), Some(c)),
-            None => (self.sample_rate_override, self.channels_override),
-        };
-        let open = |json: &TranscodeJson| {
-            PlanarAudioTranscoder::new(rate, channels, json)
-                .and_then(|t| t.with_fixed_chunk(SRC_CHUNK_FRAMES))
-        };
-        let default = || {
-            override_transcode(
-                channels,
-                want_rate.filter(|&r| r != rate),
-                want_channels.filter(|&c| c != channels),
-            )
-            .map(|tj| TranscodeJson {
-                src_quality: self.transcode_cfg.as_ref().and_then(|b| b.src_quality),
-                ..tj
-            })
-        };
-        let Some(block) = self.transcode_cfg.as_ref() else {
-            return default().map(|json| open(&json)).transpose();
-        };
-        let json = TranscodeJson {
-            sample_rate: out.map(|o| o.0).or(block.sample_rate).or(self.sample_rate_override),
-            channels: out.map(|o| o.1).or(block.channels).or(self.channels_override),
-            ..block.clone()
-        };
-        match (open(&json), out) {
-            (Ok(t), None) => Ok(Some(t)),
-            (Ok(t), Some(o)) if (t.out_sample_rate(), t.out_channels()) == o => Ok(Some(t)),
-            (Err(e), None) => Err(e),
-            (_, Some(_)) => default().map(|json| open(&json)).transpose(),
-        }
+        super::audio_transcode::encoder_stage(
+            self.transcode_cfg.as_ref(),
+            self.sample_rate_override,
+            self.channels_override,
+            rate,
+            channels,
+            out,
+        )
     }
 
     /// Open the channel / rate stage and the encoder for the first decoded
@@ -2352,46 +2321,6 @@ fn select_audio_es(view: &PmtView<'_>, pinned_pid: Option<u16>) -> AudioSelectio
     }
     sel.chosen = pinned_hit.or(first);
     sel
-}
-
-/// The conversion `audio_encode.sample_rate` / `channels` need when no
-/// `transcode` block is set, as one: `sample_rate` / `channels` are the
-/// overrides that differ from the decoded format (`None` = no change). A
-/// multichannel source going to stereo gets the standard downmix (ITU-R
-/// BS.775 for 5.1 / 7.1, Lt/Rt for quad), mono ↔ stereo the transcode
-/// stage's own default; anything else keeps the channels in order and
-/// silence for the missing ones. `None` when neither differs.
-fn override_transcode(
-    in_channels: u8,
-    sample_rate: Option<u32>,
-    channels: Option<u8>,
-) -> Option<TranscodeJson> {
-    if sample_rate.is_none() && channels.is_none() {
-        return None;
-    }
-    let mut tj = TranscodeJson { sample_rate, channels, ..Default::default() };
-    if let Some(out) = channels {
-        match (in_channels, out) {
-            (6, 2) => tj.channel_map_preset = Some("5_1_to_stereo_bs775".into()),
-            (8, 2) => tj.channel_map_preset = Some("7_1_to_stereo_bs775".into()),
-            (4, 2) => tj.channel_map_preset = Some("4ch_to_stereo_lt_rt".into()),
-            (1, 2) | (2, 1) => {}
-            _ => {
-                tj.channel_map_with_gain = Some(
-                    (0..out)
-                        .map(|o| {
-                            if o < in_channels {
-                                vec![[o as f64, 1.0]]
-                            } else {
-                                vec![[0.0, 0.0]]
-                            }
-                        })
-                        .collect(),
-                );
-            }
-        }
-    }
-    Some(tj)
 }
 
 /// Wrap an encoded audio frame in a PES packet with a PTS header.
@@ -3753,23 +3682,6 @@ mod tests {
             });
             assert!(worst <= 470, "{ppm} ppm: worst {worst} ticks");
             assert!((15..=20).contains(&c), "{ppm} ppm: {c} corrections");
-        }
-    }
-
-    #[test]
-    fn override_transcode_downmixes_and_resamples() {
-        assert_eq!(override_transcode(2, None, None), None);
-        let tj = override_transcode(6, None, Some(2)).unwrap();
-        assert_eq!(tj.channel_map_preset.as_deref(), Some("5_1_to_stereo_bs775"));
-        let tj = override_transcode(2, Some(44_100), None).unwrap();
-        assert_eq!((tj.sample_rate, tj.channels), (Some(44_100), None));
-        let tj = override_transcode(3, None, Some(4)).unwrap();
-        let map = tj.channel_map_with_gain.unwrap();
-        assert_eq!(map, vec![vec![[0.0, 1.0]], vec![[1.0, 1.0]], vec![[2.0, 1.0]], vec![[0.0, 0.0]]]);
-        // Every one builds.
-        for (i, o) in [(6u8, 2u8), (8, 2), (4, 2), (1, 2), (2, 1), (3, 4)] {
-            let tj = override_transcode(i, Some(44_100), Some(o)).unwrap();
-            assert!(PlanarAudioTranscoder::new(48_000, i, &tj).is_ok(), "{i} -> {o}");
         }
     }
 

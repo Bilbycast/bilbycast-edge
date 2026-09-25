@@ -1822,6 +1822,267 @@ impl PlanarAudioTranscoder {
     }
 }
 
+// ── The channel / rate stage in front of an encoder ─────────────────────────
+
+/// Input frames per resampler call of a streaming stage
+/// ([`PlanarAudioTranscoder::with_fixed_chunk`]). Every encoder-input stage
+/// uses it.
+///
+/// A stage that replaces another mid-stream (an in-band format change in
+/// the TS audio replacer) drops the new resampler's zero history from the
+/// head of what it produces, which is exact only while one chunk's output
+/// covers that history: rubato's delay is about `sinc_len * ratio / 2`
+/// output frames, so it holds for `sinc_len <= 256` — both
+/// [`SrcQuality`]s (256 and 64). A longer filter needs a longer chunk.
+pub const STREAM_CHUNK_FRAMES: usize = 256;
+
+/// The conversion `audio_encode.sample_rate` / `channels` ask for when no
+/// `transcode` block is set, as a block: `sample_rate` / `channels` are the
+/// overrides that differ from the decoded format (`None` = no change). A
+/// multichannel source going to stereo gets the standard downmix (ITU-R
+/// BS.775 for 5.1 / 7.1, Lt/Rt for quad), mono ↔ stereo the transcode
+/// stage's own default; anything else keeps the channels in order and
+/// silence for the missing ones. `None` when neither differs.
+pub fn override_conversion(
+    in_channels: u8,
+    sample_rate: Option<u32>,
+    channels: Option<u8>,
+) -> Option<TranscodeJson> {
+    if sample_rate.is_none() && channels.is_none() {
+        return None;
+    }
+    let mut tj = TranscodeJson { sample_rate, channels, ..Default::default() };
+    if let Some(out) = channels {
+        match (in_channels, out) {
+            (6, 2) => tj.channel_map_preset = Some("5_1_to_stereo_bs775".into()),
+            (8, 2) => tj.channel_map_preset = Some("7_1_to_stereo_bs775".into()),
+            (4, 2) => tj.channel_map_preset = Some("4ch_to_stereo_lt_rt".into()),
+            (1, 2) | (2, 1) => {}
+            _ => {
+                tj.channel_map_with_gain = Some(
+                    (0..out)
+                        .map(|o| {
+                            if o < in_channels {
+                                vec![[o as f64, 1.0]]
+                            } else {
+                                vec![[0.0, 0.0]]
+                            }
+                        })
+                        .collect(),
+                );
+            }
+        }
+    }
+    Some(tj)
+}
+
+/// The channel / rate stage between a decoder producing `(rate, channels)`
+/// and an encoder, in streaming mode — one rule for every output and input
+/// that re-encodes audio:
+///
+/// - A `transcode` block wins, with `audio_encode.sample_rate` /
+///   `channels` (`sample_rate` / `channels` here) folded in for the fields
+///   it leaves unset.
+/// - Without one, those two alone still need a conversion when they differ
+///   from the source: the encoder is opened at them, and PCM at another
+///   rate played at the wrong speed (48 kHz through `sample_rate: 44100`
+///   ran 8.8 % slow), another channel count was truncated or refused.
+///   [`override_conversion`] builds it.
+/// - `out`, once an encoder is open at that format, pins the stage to it: a
+///   source that changes format in-band is converted to what the encoder
+///   takes, and a block whose routing is for another layout (a 5.1 preset
+///   over a stereo stretch) gives way to the default conversion.
+///
+/// `Ok(None)`: the decoded PCM goes to the encoder as it is.
+pub fn encoder_stage(
+    block: Option<&TranscodeJson>,
+    sample_rate: Option<u32>,
+    channels: Option<u8>,
+    rate: u32,
+    in_channels: u8,
+    out: Option<(u32, u8)>,
+) -> Result<Option<PlanarAudioTranscoder>, String> {
+    let (want_rate, want_channels) = match out {
+        Some((r, c)) => (Some(r), Some(c)),
+        None => (sample_rate, channels),
+    };
+    let open = |json: &TranscodeJson| {
+        PlanarAudioTranscoder::new(rate, in_channels, json)
+            .and_then(|t| t.with_fixed_chunk(STREAM_CHUNK_FRAMES))
+    };
+    let default = || {
+        override_conversion(
+            in_channels,
+            want_rate.filter(|&r| r != rate),
+            want_channels.filter(|&c| c != in_channels),
+        )
+        .map(|tj| TranscodeJson { src_quality: block.and_then(|b| b.src_quality), ..tj })
+    };
+    let Some(block) = block else {
+        return default().map(|json| open(&json)).transpose();
+    };
+    let json = TranscodeJson {
+        sample_rate: out.map(|o| o.0).or(block.sample_rate).or(sample_rate),
+        channels: out.map(|o| o.1).or(block.channels).or(channels),
+        ..block.clone()
+    };
+    match (open(&json), out) {
+        (Ok(t), None) => Ok(Some(t)),
+        (Ok(t), Some(o)) if (t.out_sample_rate(), t.out_channels()) == o => Ok(Some(t)),
+        (Err(e), None) => Err(e),
+        (_, Some(_)) => default().map(|json| open(&json)).transpose(),
+    }
+}
+
+/// The output format [`encoder_stage`] converts `(rate, channels)` to for
+/// these settings, without keeping the stage.
+pub fn encoder_stage_format(
+    block: Option<&TranscodeJson>,
+    sample_rate: Option<u32>,
+    channels: Option<u8>,
+    rate: u32,
+    in_channels: u8,
+) -> Result<(u32, u8), String> {
+    Ok(encoder_stage(block, sample_rate, channels, rate, in_channels, None)?
+        .map_or((rate, in_channels), |t| (t.out_sample_rate(), t.out_channels())))
+}
+
+/// An [`encoder_stage`] that follows its source through format changes,
+/// for an output whose encoder stays open at one format: built on the first
+/// decoded frame, rebuilt (pinned to the output format) when the decoded
+/// rate or channel count changes. Its [`Self::delay`] is the constant the
+/// caller's stamps take off; a rebuild restarts the resampler, so the
+/// samples queued in the old one (at most one chunk plus its delay line,
+/// ~8 ms) are lost at such a change — the TS audio replacer runs them out
+/// exactly, these outputs accept the gap.
+pub struct EncoderStage {
+    block: Option<TranscodeJson>,
+    sample_rate: Option<u32>,
+    channels: Option<u8>,
+    /// Output format, fixed by the first build (or pinned by the caller).
+    out: Option<(u32, u8)>,
+    input: (u32, u8),
+    stage: Option<PlanarAudioTranscoder>,
+    built: bool,
+}
+
+impl EncoderStage {
+    pub fn new(block: Option<TranscodeJson>, sample_rate: Option<u32>, channels: Option<u8>) -> Self {
+        Self { block, sample_rate, channels, out: None, input: (0, 0), stage: None, built: false }
+    }
+
+    /// Pin the output format to what an already open encoder takes (an
+    /// encoder built before any source audio, for a silent fallback).
+    pub fn pin_output(&mut self, rate: u32, channels: u8) {
+        self.out = Some((rate, channels));
+    }
+
+    /// Build (or rebuild, on a format change) for decoded `(rate, channels)`
+    /// and return the output format.
+    pub fn prepare(&mut self, rate: u32, channels: u8) -> Result<(u32, u8), String> {
+        if !self.built || self.input != (rate, channels) {
+            let stage = encoder_stage(
+                self.block.as_ref(),
+                self.sample_rate,
+                self.channels,
+                rate,
+                channels,
+                self.out,
+            )?;
+            let out = stage
+                .as_ref()
+                .map_or((rate, channels), |t| (t.out_sample_rate(), t.out_channels()));
+            self.out.get_or_insert(out);
+            self.stage = stage;
+            self.input = (rate, channels);
+            self.built = true;
+        }
+        Ok(self.out.unwrap_or((rate, channels)))
+    }
+
+    /// Convert decoded PCM at `rate` (planar, its channel count) to the
+    /// output format.
+    pub fn process(&mut self, planar: &[Vec<f32>], rate: u32) -> Result<Vec<Vec<f32>>, String> {
+        self.prepare(rate, planar.len() as u8)?;
+        match self.stage.as_mut() {
+            Some(t) => t.process(planar),
+            None => Ok(planar.to_vec()),
+        }
+    }
+
+    /// The stage's constant delay in output frames (0 without a rate
+    /// change, or before it is built).
+    pub fn delay(&self) -> usize {
+        self.stage.as_ref().map_or(0, |t| t.output_delay())
+    }
+
+    /// The output format, once built or pinned.
+    pub fn output(&self) -> Option<(u32, u8)> {
+        self.out
+    }
+}
+
+/// An [`encoder_stage`] for one batch of PCM (an HLS segment, re-encoded on
+/// its own): its output lines up with its input sample for sample — the
+/// resampler's zero history is dropped at the head and its queue and delay
+/// line are run out at [`Self::finish`] — so the batch's stamps need no
+/// correction for it.
+pub struct BatchStage {
+    stage: Option<PlanarAudioTranscoder>,
+    skip: usize,
+    fed: u64,
+    kept: u64,
+}
+
+impl BatchStage {
+    pub fn new(stage: Option<PlanarAudioTranscoder>) -> Self {
+        let skip = stage.as_ref().map_or(0, |t| t.output_delay());
+        Self { stage, skip, fed: 0, kept: 0 }
+    }
+
+    pub fn process(&mut self, planar: &[Vec<f32>]) -> Result<Vec<Vec<f32>>, String> {
+        let Some(t) = self.stage.as_mut() else {
+            return Ok(planar.to_vec());
+        };
+        let out = t.process(planar)?;
+        self.fed += planar.first().map_or(0, |c| c.len()) as u64;
+        Ok(self.keep(out, u64::MAX))
+    }
+
+    /// What the stage still holds of the content it was given.
+    pub fn finish(&mut self) -> Result<Vec<Vec<f32>>, String> {
+        let Some(t) = self.stage.as_mut() else {
+            return Ok(Vec::new());
+        };
+        let (in_rate, out_rate) = (t.in_sample_rate() as u128, t.out_sample_rate() as u128);
+        let end = ((self.fed as u128 * out_rate + in_rate / 2) / in_rate) as u64;
+        let zeros = vec![vec![0.0f32; STREAM_CHUNK_FRAMES]; t.in_channels() as usize];
+        let mut out: Vec<Vec<f32>> = vec![Vec::new(); t.out_channels() as usize];
+        // A few chunks run out the queue and the delay line; the bound only
+        // guards against a resampler that stops producing.
+        for _ in 0..16 {
+            if self.kept >= end || in_rate == out_rate {
+                break;
+            }
+            let pcm = self.stage.as_mut().expect("checked").process(&zeros)?;
+            let kept = self.keep(pcm, end - self.kept);
+            for (o, k) in out.iter_mut().zip(kept) {
+                o.extend(k);
+            }
+        }
+        Ok(out)
+    }
+
+    fn keep(&mut self, pcm: Vec<Vec<f32>>, limit: u64) -> Vec<Vec<f32>> {
+        let n = pcm.first().map_or(0, |c| c.len());
+        let skip = self.skip.min(n);
+        let keep = ((n - skip) as u64).min(limit) as usize;
+        self.skip -= skip;
+        self.kept += keep as u64;
+        pcm.into_iter().map(|c| c[skip..skip + keep].to_vec()).collect()
+    }
+}
+
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
 fn sinc_params_for(quality: SrcQuality) -> SincInterpolationParameters {
@@ -1877,6 +2138,24 @@ fn current_micros() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn override_conversion_downmixes_and_resamples() {
+        assert_eq!(override_conversion(2, None, None), None);
+        let tj = override_conversion(6, None, Some(2)).unwrap();
+        assert_eq!(tj.channel_map_preset.as_deref(), Some("5_1_to_stereo_bs775"));
+        let tj = override_conversion(2, Some(44_100), None).unwrap();
+        assert_eq!((tj.sample_rate, tj.channels), (Some(44_100), None));
+        let tj = override_conversion(3, None, Some(4)).unwrap();
+        let map = tj.channel_map_with_gain.unwrap();
+        assert_eq!(map, vec![vec![[0.0, 1.0]], vec![[1.0, 1.0]], vec![[2.0, 1.0]], vec![[0.0, 0.0]]]);
+        // Every one builds.
+        for (i, o) in [(6u8, 2u8), (8, 2), (4, 2), (1, 2), (2, 1), (3, 4)] {
+            let tj = override_conversion(i, Some(44_100), Some(o)).unwrap();
+            assert!(PlanarAudioTranscoder::new(48_000, i, &tj).is_ok(), "{i} -> {o}");
+        }
+    }
+
 
     fn static_source(matrix: ChannelMatrix) -> MatrixSource {
         MatrixSource::static_(matrix)
@@ -2632,6 +2911,146 @@ mod tests {
             .with_fixed_chunk(256)
             .unwrap();
         assert_eq!(same.output_delay(), 0);
+    }
+
+    /// A Hann-windowed 1 kHz burst of 10 ms at `rate`, placed at `at` in
+    /// `len` samples of silence.
+    fn burst_signal(rate: u32, at: usize, len: usize) -> Vec<f32> {
+        let n = (rate / 100) as usize;
+        let mut s = vec![0.0f32; len];
+        for k in 0..n {
+            let w = 0.5 - 0.5 * (2.0 * std::f32::consts::PI * k as f32 / (n - 1) as f32).cos();
+            s[at + k] = 0.5 * w * (2.0 * std::f32::consts::PI * 1000.0 * k as f32 / rate as f32).sin();
+        }
+        s
+    }
+
+    /// Centre of energy of `x`, in samples.
+    fn energy_centre(x: &[f32]) -> f64 {
+        let e: Vec<f64> = x.iter().map(|v| (*v as f64).powi(2)).collect();
+        let t: f64 = e.iter().sum();
+        e.iter().enumerate().map(|(i, v)| i as f64 * v).sum::<f64>() / t
+    }
+
+    /// The one rule every re-encoding output applies: a transcode block
+    /// wins with audio_encode's fields folded in; without one, those alone
+    /// convert when they differ from the source (they used to open the
+    /// encoder at the new format over PCM left at the old); neither = no
+    /// stage. A pinned output format overrides both, and a block whose
+    /// routing does not fit the layout gives way to the default conversion.
+    #[test]
+    fn encoder_stage_resolves_one_rule() {
+        // No block: the overrides alone.
+        let t = encoder_stage(None, Some(44_100), None, 48_000, 2, None).unwrap().unwrap();
+        assert_eq!((t.out_sample_rate(), t.out_channels()), (44_100, 2));
+        assert!(t.output_delay() > 0, "streaming mode: the resampler is built, its delay known");
+        let t = encoder_stage(None, None, Some(2), 48_000, 6, None).unwrap().unwrap();
+        assert_eq!((t.out_sample_rate(), t.out_channels()), (48_000, 2));
+        assert!(encoder_stage(None, Some(48_000), Some(2), 48_000, 2, None).unwrap().is_none());
+        assert!(encoder_stage(None, None, None, 48_000, 2, None).unwrap().is_none());
+        // A block wins, audio_encode's fields fill what it leaves unset.
+        let block = TranscodeJson { channels: Some(1), ..Default::default() };
+        let t = encoder_stage(Some(&block), Some(32_000), Some(2), 48_000, 2, None).unwrap().unwrap();
+        assert_eq!((t.out_sample_rate(), t.out_channels()), (32_000, 1));
+        assert_eq!(encoder_stage_format(Some(&block), Some(32_000), Some(2), 48_000, 2).unwrap(), (32_000, 1));
+        // Pinned: a 5.1 preset over a stereo stretch gives way to the
+        // default conversion to the pinned format.
+        let preset = TranscodeJson {
+            channels: Some(2),
+            channel_map_preset: Some("5_1_to_stereo_bs775".into()),
+            ..Default::default()
+        };
+        let t = encoder_stage(Some(&preset), None, None, 44_100, 2, Some((48_000, 2))).unwrap().unwrap();
+        assert_eq!((t.in_sample_rate(), t.out_sample_rate(), t.out_channels()), (44_100, 48_000, 2));
+        assert!(encoder_stage(Some(&preset), None, None, 48_000, 2, None).is_err(), "unpinned it is an error");
+    }
+
+    /// **B3.** The stage every RTMP / HLS / WebRTC / TS re-encode runs is in
+    /// streaming mode: decoded frames of any size (AC-3 1536 next to E-AC-3
+    /// 256, an MP2 1152) go through one resampler whose delay never
+    /// restarts, so the output is the same sample for sample as a steady
+    /// feed and the delay the stamps take off holds. The default mode
+    /// those outputs used rebuilt the resampler whenever the frame size
+    /// changed: a dropout each time, and a burst after it moved.
+    #[test]
+    fn the_encoder_stage_is_unchanged_by_the_decoders_frame_sizes() {
+        let signal = burst_signal(48_000, 30_000, 48_000);
+        let run = |sizes: &[usize]| -> Vec<f32> {
+            let mut st = EncoderStage::new(None, Some(44_100), None);
+            let mut out = Vec::new();
+            let (mut pos, mut i) = (0, 0);
+            while pos < signal.len() {
+                let n = sizes[i % sizes.len()].min(signal.len() - pos);
+                out.extend(st.process(&[signal[pos..pos + n].to_vec()], 48_000).unwrap().remove(0));
+                pos += n;
+                i += 1;
+            }
+            out
+        };
+        let steady = run(&[1536]);
+        let mixed = run(&[1536, 256, 1152, 1536, 768]);
+        assert_eq!(steady, mixed, "the frame sizes change nothing");
+        let mut st = EncoderStage::new(None, Some(44_100), None);
+        assert_eq!(st.prepare(48_000, 1).unwrap(), (44_100, 1));
+        let expected = (30_000.0 + 239.5) * 44_100.0 / 48_000.0 + st.delay() as f64;
+        let c = energy_centre(&steady);
+        assert!((c - expected).abs() < 1.5, "centre {c:.1}, expected {expected:.1} (constant delay)");
+        // The default mode, for contrast: the burst moves.
+        let mut dm = PlanarAudioTranscoder::new(48_000, 1, &TranscodeJson { sample_rate: Some(44_100), ..Default::default() }).unwrap();
+        let mut out = Vec::new();
+        let (mut pos, mut i) = (0, 0);
+        let sizes = [1536usize, 256, 1152, 1536, 768];
+        while pos < signal.len() {
+            let n = sizes[i % sizes.len()].min(signal.len() - pos);
+            out.extend(dm.process(&[signal[pos..pos + n].to_vec()]).unwrap().remove(0));
+            pos += n;
+            i += 1;
+        }
+        assert!(out != steady, "the rebuilding mode does not reproduce it");
+    }
+
+    /// An `EncoderStage` follows its source through a format change, to the
+    /// output format fixed by its first build.
+    #[test]
+    fn the_encoder_stage_converts_an_in_band_change_to_its_output_format() {
+        let mut st = EncoderStage::new(None, None, Some(2));
+        assert_eq!(st.prepare(48_000, 6).unwrap(), (48_000, 2));
+        let six: Vec<Vec<f32>> = (0..6).map(|_| vec![0.1f32; 1536]).collect();
+        assert_eq!(st.process(&six, 48_000).unwrap().len(), 2);
+        // The source goes to stereo at 44.1 kHz: still 48 kHz stereo out.
+        let two = vec![vec![0.1f32; 1024]; 2];
+        let out = st.process(&two, 44_100).unwrap();
+        assert_eq!(out.len(), 2);
+        assert_eq!(st.output(), Some((48_000, 2)));
+        assert!(st.delay() > 0, "a resampler now");
+        // Pinned before any source: converts to the pinned format.
+        let mut pinned = EncoderStage::new(None, None, None);
+        pinned.pin_output(48_000, 1);
+        assert_eq!(pinned.prepare(44_100, 2).unwrap(), (48_000, 1));
+    }
+
+    /// A `BatchStage` (one HLS segment re-encoded on its own) lines its
+    /// output up with its input: every input sample comes out, at its scaled
+    /// position, with no resampler delay to take off the stamps.
+    #[test]
+    fn a_batch_stage_lines_its_output_up_with_its_input() {
+        let signal = burst_signal(48_000, 30_000, 96_000);
+        let stage = encoder_stage(None, Some(44_100), None, 48_000, 1, None).unwrap();
+        assert!(stage.as_ref().unwrap().output_delay() > 0);
+        let mut b = BatchStage::new(stage);
+        let mut out = Vec::new();
+        for c in signal.chunks(1536) {
+            out.extend(b.process(&[c.to_vec()]).unwrap().remove(0));
+        }
+        out.extend(b.finish().unwrap().remove(0));
+        assert_eq!(out.len(), 88_200, "exactly the input's length at the new rate");
+        let expected = (30_000.0 + 239.5) * 44_100.0 / 48_000.0;
+        let c = energy_centre(&out);
+        assert!((c - expected).abs() < 1.5, "centre {c:.1}, expected {expected:.1}");
+        // No conversion: a pass-through.
+        let mut p = BatchStage::new(None);
+        assert_eq!(p.process(&[vec![1.0, 2.0]]).unwrap(), vec![vec![1.0, 2.0]]);
+        assert!(p.finish().unwrap().is_empty());
     }
 
     /// `channel_map_with_gain` is an entirely separate code path from
