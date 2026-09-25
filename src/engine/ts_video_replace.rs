@@ -1552,24 +1552,32 @@ mod inner {
                 self.frames_since_reset += 1;
                 self.pes_at_first_frame.get_or_insert(self.pes_since_reset);
 
+                // The rate meter sees every decoded frame, its own PTS or
+                // none, admitted or not: it measures the decoder's cadence,
+                // and a span between two stamped frames is divided by the
+                // frames decoded across it. Fed only admitted frames, it
+                // missed a real timestamp admission dropped while its
+                // PTS-less neighbours still counted — on a source stamping
+                // every 12th picture the first span read 36 frames as 34.
+                let decoder_pts = frame.pts();
+                self.cadence.observe(decoder_pts);
+
                 // Monotonic admission BEFORE anything else: a frame whose
                 // PTS does not advance past the last admitted one (within
                 // 1 s) is a splice's out-of-order leading picture. Dropping
                 // it here keeps the PTS queue balanced (never pushed), and
                 // leaves a pending force-IDR and the frame counter for the
                 // next admitted frame.
-                let decoder_pts = frame.pts();
                 let Some(src_pts_for_frame) = self.admit_decoded(decoder_pts) else {
                     continue;
                 };
 
-                // The encoder rate: measured from the frames the encoder is
+                // The encoder rate, measured from the frames the encoder is
                 // handed, once per frame. Until it is known the encoder
                 // cannot open (libavcodec's time base is fixed at open), so
                 // the frame is dropped; the force-IDR request (raised at
                 // construction and on every reset) waits for the first
                 // frame encoded after the lock.
-                self.cadence.observe(decoder_pts);
                 if !self.source_fps_locked {
                     if !self.try_lock_rate() {
                         continue;
@@ -3100,16 +3108,22 @@ mod tests {
         }
 
         /// A 29.97 fps source that stamps a PTS on every 12th picture only,
-        /// no fps pinned: the encoder locks 30000/1001 from the span
-        /// between two stamped frames over the frames decoded across it.
-        /// Taken as one frame, that span (36 036 ticks) locked 2500/1001 —
-        /// CBR budgeting 12x the bitrate per frame, a 4-frame GOP.
+        /// no fps pinned: the encoder locks 30000/1001 from the decoded-frame
+        /// cadence, at the fifth stamped picture — the span between two
+        /// stamped frames over the frames decoded across it. Taken as one
+        /// frame, that span (36 036 ticks) locked 2500/1001 — CBR budgeting
+        /// 12x the bitrate per frame, a 4-frame GOP. Frame admission drops
+        /// the stamped pictures 12 and 24 here (the PTS-less frames before
+        /// them step by the 25 fps default until the interval is learned);
+        /// the meter counts them all the same.
         #[test]
         fn a_source_stamping_every_12th_picture_locks_its_frame_rate() {
+            use super::super::inner::RateOrigin;
             let aus = x264_aus(72, (320, 240), None, None);
             let mut cc = 0u8;
             let mut r = TsVideoReplacer::new(&cfg("x264"), None).unwrap();
             let out = run(&mut r, &ts_sparse(&aus, 12, 3_003, &mut cc));
+            assert_eq!(r.inner.rate_origin, Some(RateOrigin::Cadence), "not the fallback");
             assert_eq!(r.inner.pipeline.fps(), (30_000, 1001));
             assert_eq!(first_sps(&out).timing.map(|(n, t, _)| (n, t)), Some((1001, 60_000)));
             assert!(!r.inner.fps_mismatch_warned);
