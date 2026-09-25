@@ -41,17 +41,35 @@
 //! the next PCR carries DI = 1, `late_frames` counts it and a rate-limited
 //! Warning (`transcode_pcr_late`) says so. `D` only ever grows after the
 //! first latch — a lowered `D` would be another PCR step. The margin is cut
-//! (never below lateness + 40 ms) so the largest video lead observed in the
-//! epoch stays within the 1 s T-STD residency (ISO/IEC 13818-1 §2.4.2.6);
-//! when even that cannot be met the stage keeps the PES on time and says so
-//! (`transcode_pcr_residency_exceeded`).
+//! (never below lateness + 40 ms) so the largest lead of the program's video
+//! observed in the epoch stays within the 1 s T-STD residency (ISO/IEC
+//! 13818-1 §2.4.2.6); when even that cannot be met the stage keeps the PES
+//! on time and says so (`transcode_pcr_residency_exceeded`). The cap is
+//! re-checked every time a larger video lead is seen: before anything
+//! re-encoded has been measured `D` is lowered to it, after that the
+//! Warning is raised instead.
 //!
-//! **Epochs.** An input PCR that steps backward, jumps more than 100 ms, or
-//! carries DI starts an epoch: DI goes on the next output PCR and every PID
-//! latches again. On a jump of more than 1 s the re-encoded PES still in
-//! flight from the previous epoch are recognised by being closer to the old
-//! timeline than to the new one and are dropped (their continuity counters
-//! renumbered), so they neither reach the wire behind the DI nor drive `D`.
+//! Lateness is the pipeline's, not the source's: a stretch in which the
+//! input carried no PCR at all — a paused or variable-frame-rate source
+//! whose muxer stamps a PCR per frame (the RTMP / RTSP / WebRTC ingest
+//! muxer) — is a *gap*, and the part of it beyond the input's usual PCR
+//! step is taken off the lateness of a PES decoded before it. Frames that
+//! were in the pipeline when the source paused still reach the wire late,
+//! but they do not raise `D` for every frame after them.
+//!
+//! **Nothing re-encoded.** While neither replacer re-encodes (its codec
+//! cannot be decoded, a replacer fell back to passthrough) the stage leaves
+//! every byte alone — no `D` at all.
+//!
+//! **Epochs.** An input PCR that steps backward or carries DI starts an
+//! epoch: DI goes on the next output PCR and every PID latches again. A
+//! forward step without DI is the input's own clock, however long — a
+//! PCR-per-frame source at 5 fps steps 200 ms every frame, at 0.5 fps two
+//! seconds — and passes as the step it is. On an epoch of more than 1 s
+//! the re-encoded PES still in flight from the previous epoch are
+//! recognised by being closer to the old timeline than to the new one and
+//! are dropped (their continuity counters renumbered), so they neither
+//! reach the wire behind the DI nor drive `D`.
 //!
 //! **No input PCR.** When a re-encoded video PES on the PCR_PID arrives and
 //! no input PCR has been seen, or none for 100 ms of video decode time, the
@@ -90,9 +108,16 @@ const LATCH_TOLERANCE_27MHZ: i64 = 10 * 27_000;
 /// ISO/IEC 13818-1 §2.4.2.6: data leaves the elementary-stream buffer within
 /// one second.
 const MAX_RESIDENCY_27MHZ: i64 = 27_000_000;
-/// An input PCR step larger than this (or backward, or DI) starts an epoch.
-/// MPEG-TS requires a PCR at least every 100 ms.
-const EPOCH_STEP_27MHZ: i64 = 100 * 27_000;
+/// A forward input PCR step is a gap (see module doc) when it exceeds twice
+/// the input's usual step and this — MPEG-TS asks for a PCR at least every
+/// 100 ms.
+const GAP_MIN_27MHZ: i64 = 100 * 27_000;
+/// Continuous input PCR steps the usual step is the median of.
+const CADENCE_STEPS: usize = 8;
+/// Gaps remembered, and for how long (in input PCR time): a PES decoded
+/// longer ago than the lateness bound never reaches `D` anyway.
+const MAX_GAPS: usize = 32;
+const GAP_MEMORY_27MHZ: i64 = 2 * MAX_LATENESS_27MHZ;
 /// An epoch jump beyond this makes frames in flight "stale" (see module doc).
 const STALE_EPOCH_27MHZ: i64 = 27_000_000;
 /// Video leads beyond this are off any timeline; the residency cap ignores
@@ -193,6 +218,9 @@ pub struct TsPcrRemux {
     pmt_asm: SectionAssembler,
     /// Output PCR_PID; `None` before the PMT or when it is 0x1FFF.
     pcr_pid: Option<u16>,
+    /// The program's ES PIDs (from the same PMT): only their video leads
+    /// count toward the residency cap.
+    program_es: Vec<u16>,
     /// `[audio, video]` PIDs the replacers re-encode.
     checked: [Option<Checked>; 2],
     /// `D`, 27 MHz ticks, never negative.
@@ -204,8 +232,15 @@ pub struct TsPcrRemux {
     pending_di: bool,
     /// Last input PCR of the previous epoch, while stale PES may still come.
     old_epoch_pcr: Option<u64>,
-    /// Largest video `DTS − input PCR` of the epoch.
+    /// Largest `DTS − input PCR` of the program's video in the epoch.
     max_video_lead: Option<i64>,
+    /// Recent continuous input PCR steps (a ring) — the usual step.
+    steps: [i64; CADENCE_STEPS],
+    steps_len: usize,
+    steps_next: usize,
+    /// Input PCR gaps of the epoch: `(input PCR after the gap, the part of
+    /// the step beyond the usual one)`.
+    gaps: std::collections::VecDeque<(u64, i64)>,
     ever_input_pcr: bool,
     /// DTS (27 MHz) of the first re-encoded video PES since the last input
     /// PCR — measures how long the input has gone without one.
@@ -245,6 +280,7 @@ impl TsPcrRemux {
             pmt_pid_shared: false,
             pmt_asm: SectionAssembler::new(),
             pcr_pid: None,
+            program_es: Vec::new(),
             checked: [None, None],
             offset: MARGIN_27MHZ,
             latched_once: false,
@@ -253,6 +289,10 @@ impl TsPcrRemux {
             pending_di: false,
             old_epoch_pcr: None,
             max_video_lead: None,
+            steps: [0; CADENCE_STEPS],
+            steps_len: 0,
+            steps_next: 0,
+            gaps: std::collections::VecDeque::new(),
             ever_input_pcr: false,
             video_since_pcr: None,
             synth: Synth::default(),
@@ -260,10 +300,7 @@ impl TsPcrRemux {
             last_late_warn: None,
             late_since_warn: 0,
             residency_warned: false,
-            stats: Arc::new(PcrRemuxStats {
-                offset_27mhz: AtomicU64::new(MARGIN_27MHZ as u64),
-                ..PcrRemuxStats::default()
-            }),
+            stats: Arc::new(PcrRemuxStats::default()),
             event_sink: None,
         }
     }
@@ -287,6 +324,7 @@ impl TsPcrRemux {
     /// The PIDs whose PES the replacers produce (`None` = that stage is
     /// absent or not re-encoding). Called before every [`Self::process`].
     pub fn set_replaced_pids(&mut self, audio: Option<u16>, video: Option<u16>) {
+        let before = self.applied();
         for (slot, pid) in self.checked.iter_mut().zip([audio, video]) {
             match (slot.as_ref().map(|c| c.pid), pid) {
                 (Some(a), Some(b)) if a == b => {}
@@ -294,12 +332,29 @@ impl TsPcrRemux {
                 (_, None) => *slot = None,
             }
         }
+        let after = self.applied();
+        self.stats.offset_27mhz.store(after as u64, Ordering::Relaxed);
+        if after != before && self.last_out_pcr.is_some() {
+            // Re-encoding started or stopped: the PCR steps by `D`.
+            self.pending_di = true;
+        }
     }
 
-    /// The current delay in 27 MHz ticks.
+    /// Whether a replacer re-encodes anything.
+    fn engaged(&self) -> bool {
+        self.checked.iter().any(Option::is_some)
+    }
+
+    /// The delay applied to the PCR: `D` while something is re-encoded,
+    /// none otherwise (the stream then passes untouched).
+    fn applied(&self) -> i64 {
+        if self.engaged() { self.offset } else { 0 }
+    }
+
+    /// The applied delay in 27 MHz ticks.
     #[cfg(test)]
     pub fn offset_27mhz(&self) -> u64 {
-        self.offset as u64
+        self.applied() as u64
     }
 
     fn checked_index(&self, pid: u16) -> Option<usize> {
@@ -307,8 +362,8 @@ impl TsPcrRemux {
     }
 
     fn shift(&self, pcr: u64) -> u64 {
-        (pcr % PCR_MODULUS_27MHZ + PCR_MODULUS_27MHZ - self.offset as u64 % PCR_MODULUS_27MHZ)
-            % PCR_MODULUS_27MHZ
+        let d = self.applied() as u64 % PCR_MODULUS_27MHZ;
+        (pcr % PCR_MODULUS_27MHZ + PCR_MODULUS_27MHZ - d) % PCR_MODULUS_27MHZ
     }
 
     /// Process one chunk of 188-byte-aligned TS, appending to `out`.
@@ -391,11 +446,12 @@ impl TsPcrRemux {
                 && mpeg2_crc32(sec) == 0
                 && let Some(v) = parse_pmt(sec)
             {
-                found = Some(v.pcr_pid);
+                found = Some((v.pcr_pid, v.es.iter().map(|e| e.pid).collect::<Vec<_>>()));
             }
         }
-        if let Some(p) = found {
+        if let Some((p, es)) = found {
             self.pcr_pid = (p != 0x1FFF).then_some(p);
+            self.program_es = es;
         }
     }
 
@@ -410,6 +466,9 @@ impl TsPcrRemux {
         }
         self.old_epoch_pcr = old;
         self.max_video_lead = None;
+        self.steps_len = 0;
+        self.steps_next = 0;
+        self.gaps.clear();
         self.residency_warned = false;
         self.stats.epochs.fetch_add(1, Ordering::Relaxed);
     }
@@ -422,9 +481,11 @@ impl TsPcrRemux {
             tracing::info!("ts_pcr_remux: input PCR present again — synthesis stops");
         } else if let Some(last) = self.last_in_pcr {
             let step = pcr_diff_27mhz(pcr, last);
-            if ts_discontinuity_indicator(pkt) || !(0..=EPOCH_STEP_27MHZ).contains(&step) {
+            if ts_discontinuity_indicator(pkt) || step < 0 {
                 let stale = step.abs() > STALE_EPOCH_27MHZ;
                 self.epoch_change(stale.then_some(last));
+            } else {
+                self.note_step(pcr, step);
             }
         }
         self.last_in_pcr = Some(pcr);
@@ -465,8 +526,13 @@ impl TsPcrRemux {
             return true;
         };
         let lead = pcr_diff_27mhz(dts27, in_pcr);
-        if video && lead.abs() < SANE_27MHZ {
-            self.max_video_lead = Some(self.max_video_lead.map_or(lead, |m| m.max(lead)));
+        if video
+            && lead.abs() < SANE_27MHZ
+            && self.program_es.contains(&pid)
+            && self.max_video_lead.is_none_or(|m| lead > m)
+        {
+            self.max_video_lead = Some(lead);
+            self.check_residency(pid);
         }
         let Some(i) = ci else {
             return true;
@@ -485,7 +551,9 @@ impl TsPcrRemux {
                 c.stale = false;
             }
         }
-        let lateness = -lead;
+        // What an input PCR gap after this PES's decode time added is the
+        // source's pause, not the pipeline's lateness.
+        let lateness = -lead - self.gap_excess(dts27, in_pcr);
         if lateness >= MAX_LATENESS_27MHZ || lateness <= -SANE_27MHZ {
             return true;
         }
@@ -503,6 +571,68 @@ impl TsPcrRemux {
     /// Largest `D` the 1 s residency allows for the epoch's video, if known.
     fn residency_cap(&self) -> Option<i64> {
         self.max_video_lead.map(|l| MAX_RESIDENCY_27MHZ - l)
+    }
+
+    /// The program's largest video lead just grew: re-check the cap. Before
+    /// anything re-encoded has been measured `D` is lowered to it (a PCR
+    /// step, DI); after that `D` stays — lowering it would make the measured
+    /// PES late — and the residency Warning says so.
+    fn check_residency(&mut self, pid: u16) {
+        let Some(cap) = self.residency_cap() else {
+            return;
+        };
+        if !self.engaged() || self.offset <= cap {
+            return;
+        }
+        if !self.latched_once {
+            let d = cap.max(0);
+            if self.offset - d >= LATCH_TOLERANCE_27MHZ {
+                self.set_offset(d, "the video's lead grew past the residency cap");
+            }
+        } else {
+            self.warn_residency(pid, None);
+        }
+    }
+
+    /// A continuous forward input PCR step: note a gap when it is well
+    /// beyond the usual step (the median of the last few), and remember the
+    /// step.
+    fn note_step(&mut self, pcr: u64, step: i64) {
+        if let Some(usual) = self.usual_step()
+            && step > (2 * usual).max(GAP_MIN_27MHZ)
+        {
+            if self.gaps.len() == MAX_GAPS {
+                self.gaps.pop_front();
+            }
+            self.gaps.push_back((pcr, step - usual));
+        }
+        while self.gaps.front().is_some_and(|(g, _)| pcr_diff_27mhz(pcr, *g) > GAP_MEMORY_27MHZ) {
+            self.gaps.pop_front();
+        }
+        self.steps[self.steps_next] = step;
+        self.steps_next = (self.steps_next + 1) % CADENCE_STEPS;
+        self.steps_len = (self.steps_len + 1).min(CADENCE_STEPS);
+    }
+
+    /// Median of the recent continuous input PCR steps.
+    fn usual_step(&self) -> Option<i64> {
+        if self.steps_len == 0 {
+            return None;
+        }
+        let mut s = self.steps;
+        let s = &mut s[..self.steps_len];
+        s.sort_unstable();
+        Some(s[s.len() / 2])
+    }
+
+    /// Input PCR time the gaps between a PES's decode time and the input
+    /// PCR it is measured against added beyond the usual step.
+    fn gap_excess(&self, dts27: u64, in_pcr: u64) -> i64 {
+        self.gaps
+            .iter()
+            .filter(|(g, _)| pcr_diff_27mhz(*g, dts27) > 0 && pcr_diff_27mhz(*g, in_pcr) <= 0)
+            .map(|(_, e)| *e)
+            .sum()
     }
 
     /// `(D, capped)`: `lateness + margin`, the margin cut to respect the
@@ -545,7 +675,7 @@ impl TsPcrRemux {
             self.set_offset(d, "latched on the first re-encoded PES");
         }
         if capped {
-            self.warn_residency(pid, lateness);
+            self.warn_residency(pid, Some(lateness));
         }
     }
 
@@ -559,7 +689,7 @@ impl TsPcrRemux {
             self.set_offset(d, "a re-encoded PES was late");
         }
         if capped {
-            self.warn_residency(pid, lateness);
+            self.warn_residency(pid, Some(lateness));
         }
         self.late_since_warn += 1;
         let now = Instant::now();
@@ -590,27 +720,38 @@ impl TsPcrRemux {
         );
     }
 
-    fn warn_residency(&mut self, pid: u16, lateness: i64) {
+    /// `lateness` is the re-encoded PES's when a latch or a guard raise hit
+    /// the cap; `None` when the video's lead grew past it later (`pid` is
+    /// then the video PID).
+    fn warn_residency(&mut self, pid: u16, lateness: Option<i64>) {
         if self.residency_warned {
             return;
         }
         self.residency_warned = true;
         let lead_ms = self.max_video_lead.unwrap_or(0) as f64 / 27_000.0;
-        let residency_ms = lead_ms + self.offset as f64 / 27_000.0;
-        let message = format!(
-            "keeping PID 0x{pid:04X} on time needs a transcode PCR delay of {:.0} ms, which puts \
-             the video's largest lead at {residency_ms:.0} ms — past the 1 s T-STD residency. \
-             Lateness wins; a strict decoder may overflow its video buffer",
-            self.offset as f64 / 27_000.0
-        );
+        let offset_ms = self.offset as f64 / 27_000.0;
+        let residency_ms = lead_ms + offset_ms;
+        let message = match lateness {
+            Some(_) => format!(
+                "keeping PID 0x{pid:04X} on time needs a transcode PCR delay of {offset_ms:.0} ms, \
+                 which puts the video's largest lead at {residency_ms:.0} ms — past the 1 s T-STD \
+                 residency. Lateness wins; a strict decoder may overflow its video buffer"
+            ),
+            None => format!(
+                "the video on PID 0x{pid:04X} now leads the PCR by {lead_ms:.0} ms, which with the \
+                 {offset_ms:.0} ms transcode PCR delay puts it {residency_ms:.0} ms ahead — past the \
+                 1 s T-STD residency. The delay is not lowered once re-encoded PES were measured \
+                 against it; a strict decoder may overflow its video buffer"
+            ),
+        };
         self.emit(
             crate::manager::events::EventSeverity::Warning,
             &message,
             serde_json::json!({
                 "error_code": "transcode_pcr_residency_exceeded",
                 "pid": pid,
-                "lateness_ms": lateness as f64 / 27_000.0,
-                "offset_ms": self.offset as f64 / 27_000.0,
+                "lateness_ms": lateness.map(|l| l as f64 / 27_000.0),
+                "offset_ms": offset_ms,
                 "video_residency_ms": residency_ms,
             }),
         );
@@ -936,8 +1077,10 @@ mod tests {
         assert_eq!(s.stats.late_frames.load(Ordering::Relaxed), 0);
     }
 
+    /// While nothing is re-encoded (a codec the replacers cannot decode, a
+    /// replacer's passthrough fallback) the stage leaves every byte alone.
     #[test]
-    fn nothing_re_encoded_only_shifts_pcr_by_the_initial_80_ms() {
+    fn nothing_re_encoded_leaves_the_stream_byte_identical() {
         let mut s = TsPcrRemux::new();
         let src = Src { t: 27_000_000, cc: 0 };
         let mut input = psi(V);
@@ -948,18 +1091,121 @@ mod tests {
         let mut out = Vec::new();
         s.set_replaced_pids(None, None);
         s.process(&input, &mut out);
-        assert_eq!(out.len(), input.len());
-        for (i, o) in input.chunks(TS_PACKET_SIZE).zip(out.chunks(TS_PACKET_SIZE)) {
-            match extract_pcr(i) {
-                Some(v) => {
-                    assert_eq!(extract_pcr(o), Some(v - 80 * MS));
-                    assert!(!ts_discontinuity_indicator(o));
-                    assert_eq!(i[..6], o[..6]);
-                    assert_eq!(i[12..], o[12..]);
+        assert_eq!(out, input);
+        assert_eq!(s.offset_27mhz(), 0);
+        assert_eq!(s.stats.snapshot().offset_ms, 0.0);
+    }
+
+    /// The re-encoded frame `k` of a PCR-per-frame source (PCR = DTS, the
+    /// RTMP / RTSP / WebRTC ingest muxer) leaves after frame `k + 1`'s PCR.
+    /// At 5 fps every step is 200 ms and at 0.5 fps two seconds: the
+    /// input's own clock, not an epoch — no DI per PCR, one latch, nothing
+    /// dropped as stale.
+    #[test]
+    fn a_pcr_per_frame_source_at_low_frame_rates_is_one_timeline() {
+        for (interval_ms, d_ms) in [(200u64, 280u64), (2_000, 2_080)] {
+            let mut s = TsPcrRemux::new();
+            let mut src = Src { t: 27_000_000, cc: 0 };
+            let mut input = psi(V);
+            for k in 0..12u64 {
+                let t = src.t + k * interval_ms * MS;
+                input.extend_from_slice(&src.pcr(t));
+                if k > 0 {
+                    input.extend(src.frame(t - interval_ms * MS));
                 }
-                None => assert_eq!(i, o, "every non-PCR byte is untouched"),
+            }
+            let out = run(&mut s, &input);
+            let case = format!("{interval_ms} ms per frame");
+            let st = s.stats.snapshot();
+            assert_eq!(st.epochs, 0, "{case}");
+            assert_eq!(st.stale_frames_dropped, 0, "{case}");
+            assert_eq!(st.late_frames, 0, "{case}");
+            assert_eq!(s.offset_27mhz(), d_ms * MS, "{case}: one frame + 80 ms");
+            let di = pcr_pkts(&out, V).iter().filter(|p| p.1).count();
+            assert_eq!(di, 1, "{case}: the latch's DI only");
+            let pes = out.chunks(TS_PACKET_SIZE).filter(|p| ts_pid(p) == V && ts_pusi(p)).count();
+            assert_eq!(pes, 11, "{case}: every frame kept");
+        }
+    }
+
+    /// A source that pauses 900 ms (no PCR, no frames) sends the frame that
+    /// was in the pipeline after the pause, 940 ms behind its decode time.
+    /// The pause is the source's: `D` does not grow by it.
+    #[test]
+    fn a_source_pause_does_not_ratchet_d() {
+        let mut s = TsPcrRemux::new();
+        let mut src = Src { t: 27_000_000, cc: 0 };
+        let mut input = psi(V);
+        let at = |k: u64| src.t + k * 40 * MS + if k >= 16 { 900 * MS } else { 0 };
+        let times: Vec<u64> = (0..30).map(at).collect();
+        for k in 0..30usize {
+            input.extend_from_slice(&src.pcr(times[k]));
+            if k > 0 {
+                input.extend(src.frame(times[k - 1]));
             }
         }
+        let out = run(&mut s, &input);
+        assert_eq!(s.offset_27mhz(), 120 * MS, "one frame + 80 ms, latched once");
+        let st = s.stats.snapshot();
+        assert_eq!((st.epochs, st.offset_raises, st.late_frames), (0, 0, 0));
+        assert_eq!(pcr_pkts(&out, V).iter().filter(|p| p.1).count(), 1);
+    }
+
+    /// The largest video lead is re-checked as it grows: before anything
+    /// re-encoded was measured `D` drops to the cap; after, the residency
+    /// Warning says what it cannot fix.
+    #[test]
+    fn a_growing_video_lead_is_held_to_the_residency_cap() {
+        let t0 = 27_000_000u64;
+        // Before any re-encoded audio: D follows the cap down.
+        let mut s = TsPcrRemux::new();
+        let mut input = psi(V);
+        input.extend_from_slice(&pcr_only_packet(V, 15, t0, false));
+        input.extend_from_slice(&pes_start_packet(V, 0, 0xE0, (t0 + 943 * MS) / 300, None));
+        let mut out = Vec::new();
+        s.set_replaced_pids(Some(A), None);
+        s.process(&input, &mut out);
+        assert_eq!(s.offset_27mhz(), 57 * MS);
+        // After the audio latched at 80 ms against a 500 ms lead, the lead
+        // grows to 943 ms: D stays, the Warning fires once.
+        let mut s = TsPcrRemux::new();
+        let (tx, mut rx) = crate::manager::events::event_channel();
+        s.set_event_sink(tx, "out-1", false);
+        let mut input = psi(V);
+        input.extend_from_slice(&pcr_only_packet(V, 15, t0, false));
+        input.extend_from_slice(&pes_start_packet(V, 0, 0xE0, (t0 + 500 * MS) / 300, None));
+        input.extend_from_slice(&pes_start_packet(A, 0, 0xC0, (t0 - 5 * MS) / 300, None));
+        input.extend_from_slice(&pcr_only_packet(V, 0, t0 + 30 * MS, false));
+        input.extend_from_slice(&pes_start_packet(V, 1, 0xE0, (t0 + 973 * MS) / 300, None));
+        input.extend_from_slice(&pes_start_packet(V, 2, 0xE0, (t0 + 980 * MS) / 300, None));
+        let mut out = Vec::new();
+        s.set_replaced_pids(Some(A), None);
+        s.process(&input, &mut out);
+        assert_eq!(s.offset_27mhz(), 80 * MS);
+        let ev = rx.try_recv().expect("residency Warning");
+        let d = ev.details.unwrap();
+        assert_eq!(d["error_code"], "transcode_pcr_residency_exceeded");
+        assert!(d["lateness_ms"].is_null());
+        assert!(rx.try_recv().is_err(), "once per epoch");
+    }
+
+    /// Only the followed program's video counts toward the cap: another
+    /// program's video on an MPTS output leaves `D` alone.
+    #[test]
+    fn another_programs_video_does_not_count_toward_the_cap() {
+        let t0 = 27_000_000u64;
+        let mut s = TsPcrRemux::new();
+        let mut input = pat_packet(&[(1, PMT), (2, 0x2000)], 0, 0).to_vec();
+        let pmt = pmt_section(1, 0, V, &[], &[(0x1B, V, &[]), (0x0F, A, &[])]);
+        input.extend_from_slice(&packetize_sections(PMT, &[&pmt], 0)[0]);
+        input.extend_from_slice(&pcr_only_packet(V, 15, t0, false));
+        input.extend_from_slice(&pes_start_packet(0x200, 0, 0xE0, (t0 + 990 * MS) / 300, None));
+        input.extend_from_slice(&pes_start_packet(A, 0, 0xC0, (t0 - 5 * MS) / 300, None));
+        let mut out = Vec::new();
+        s.set_replaced_pids(Some(A), None);
+        s.process(&input, &mut out);
+        assert_eq!(s.offset_27mhz(), 80 * MS);
+        assert!(s.max_video_lead.is_none());
     }
 
     #[test]
