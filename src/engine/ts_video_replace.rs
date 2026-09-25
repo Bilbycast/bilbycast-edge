@@ -582,10 +582,12 @@ mod inner {
         /// PES-per-frame ratio below.
         last_input_dts: Option<u64>,
         pub(super) pes_dts_step_90k: Option<u64>,
-        /// Video PES consumed and frames decoded since the last source
-        /// reset: their ratio is 2 on a field-coded source.
+        /// Video PES fed to the decoder and frames decoded since the last
+        /// source reset, and the PES count when the first frame came out:
+        /// PES per frame after it is 2 on a field-coded source.
         pub(super) pes_since_reset: u64,
         pub(super) frames_since_reset: u64,
+        pub(super) pes_at_first_frame: Option<u64>,
         /// H.264 PES passed over while waiting for one that carries the
         /// SPS to open the decoder on (bounded by [`SPS_WAIT_PES`]).
         pub(super) pes_awaiting_sps: u32,
@@ -789,6 +791,7 @@ mod inner {
                 pes_dts_step_90k: None,
                 pes_since_reset: 0,
                 frames_since_reset: 0,
+                pes_at_first_frame: None,
                 pes_awaiting_sps: 0,
                 fps_mismatch_warned: false,
                 description,
@@ -873,6 +876,7 @@ mod inner {
             self.pes_dts_step_90k = None;
             self.pes_since_reset = 0;
             self.frames_since_reset = 0;
+            self.pes_at_first_frame = None;
             self.pes_awaiting_sps = 0;
             self.fps_mismatch_warned = false;
             // First post-switch encoded frame must be an IDR so receivers
@@ -1517,6 +1521,7 @@ mod inner {
                 };
                 self.decode_stats.inc_output();
                 self.frames_since_reset += 1;
+                self.pes_at_first_frame.get_or_insert(self.pes_since_reset);
 
                 // Monotonic admission BEFORE anything else: a frame whose
                 // PTS does not advance past the last admitted one (within
@@ -1640,10 +1645,20 @@ mod inner {
             }
         }
 
-        /// Video PES per decoded frame since the last reset — 2 on a
-        /// field-coded (PAFF / field-picture) source, 1 otherwise.
+        /// Video PES per decoded frame since the first frame after the
+        /// last reset — 2 on a field-coded (PAFF / field-picture) source,
+        /// 1 otherwise. Counted from the first frame so the decoder's
+        /// start-up (the PES it needs before its first picture) does not
+        /// inflate it.
         fn pes_per_frame(&self) -> f64 {
-            self.pes_since_reset as f64 / self.frames_since_reset.max(1) as f64
+            let Some(first) = self.pes_at_first_frame else {
+                return 1.0;
+            };
+            let frames = self.frames_since_reset.saturating_sub(1);
+            if frames == 0 {
+                return 1.0;
+            }
+            self.pes_since_reset.saturating_sub(first) as f64 / frames as f64
         }
 
         /// Lock the encoder rate for an unpinned source once
@@ -2785,10 +2800,17 @@ mod tests {
         let mut r = TsVideoReplacer::new(&cfg("x264"), None).unwrap();
         assert_eq!(r.inner.fallback_rate(), (30, 1));
         r.inner.pes_dts_step_90k = Some(1_800);
-        r.inner.pes_since_reset = 121;
+        // First frame out after 5 PES (decoder start-up), then two PES per
+        // frame: a field per PES.
+        r.inner.pes_at_first_frame = Some(5);
+        r.inner.pes_since_reset = 5 + 2 * 59;
         r.inner.frames_since_reset = 60;
         assert_eq!(r.inner.fallback_rate(), (25, 1));
-        r.inner.pes_since_reset = 62;
+        // One PES per frame after a long start-up (40 PES before the first
+        // picture): 50p, not a start-up-inflated ratio (99 / 60) rounded up
+        // to 2.
+        r.inner.pes_at_first_frame = Some(40);
+        r.inner.pes_since_reset = 40 + 59;
         assert_eq!(r.inner.fallback_rate(), (50, 1), "one PES per frame: 50p");
         r.inner.pes_dts_step_90k = Some(3_003);
         assert_eq!(r.inner.fallback_rate(), (30_000, 1001));
