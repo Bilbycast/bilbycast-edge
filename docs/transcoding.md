@@ -178,6 +178,9 @@ codec listed in the matrix below works regardless of source codec.
   "sample_rate":  48000,     // optional; defaults to source
   "channels":     2,         // optional; defaults to source
   "silent_fallback": false,  // optional; RTMP / WebRTC / CMAF only
+  "ts_signalling": "auto",   // optional; codec = "ac3" on TS outputs / TS
+                             // inputs only: "auto" | "dvb" | "atsc" — see
+                             // "What the output PMT says"
 
   // Opus only — REFUSED at validation on any other codec (see below):
   "opus_vbr_mode":          "cbr",  // optional; unset | "vbr" | "cbr"
@@ -203,16 +206,17 @@ PMT. Range `0x0010..=0x1FFE`; anything outside that is rejected at
 config load (`source_audio_pid … out of range`), so the reserved
 system PIDs and the NULL PID cannot be named.
 
-If the pinned PID is **absent from the live PMT** the replacer does not
-fail — it falls back to first-matching-codec and logs a
-`tracing::warn!` carrying `error_code = audio_source_pid_not_found`
-plus `pinned_pid` / `actual_pid` / `actual_stream_type`. The warning is
-de-duplicated per distinct (pinned, actual) pair and re-arms when the
-pin reappears. **It is a log line only** — no manager WS event is
-raised, so a mis-typed pin never reaches the Events page and silently
-transcodes the wrong track. It is catalogued with the other
-log-only diagnostics under "Encoder runtime diagnostics" in
-[`events-and-alarms.md`](events-and-alarms.md), not with the WS events.
+If the pinned PID is **absent from the live PMT** (or carries a codec
+the replacer cannot decode) the replacer does not fail — it falls back
+to first-matching-codec and raises a **Warning event**,
+`audio_source_pid_not_found` (category `flow`, output-scoped on an
+output, input-scoped on an input transcode), with `details` =
+`{ error_code, pinned_pid, actual_pid, actual_stream_type }`, plus the
+matching `tracing::warn!` line. It fires at PMT parse time — no timer —
+once per distinct (pinned, actual) pair, and re-arms when the pin
+reappears. Until this release it was a log line only, so a mis-typed
+pin silently transcoded the wrong track; see
+[`events-and-alarms.md`](events-and-alarms.md) ("Transcode engage").
 
 **The in-place transcoder is single-program**, so one output transcodes
 exactly one audio PID. To pull two tracks out of an MPTS — say an
@@ -221,6 +225,113 @@ track**, each with its own `program_number` filter *and* its own
 `source_audio_pid` pin. The validator refuses multi-program
 `pid_overrides` combined with `audio_encode` / `video_encode` on the
 same output.
+
+### What the output PMT says
+
+The replacer does not flip the `stream_type` byte in place any more. It
+**rebuilds** the program's PMT section — new ES_info loop, new
+`section_length`, new CRC — through `engine::ts_pmt_edit`, and applies a
+per-target descriptor policy to the re-encoded ES only. Every other ES,
+and every other section on the PMT PID, is copied byte-for-byte.
+
+- **Kept** on the re-encoded ES: everything that does not describe the
+  codec — ISO 639 language (0x0A), stream_identifier (0x52), a DVB
+  private_data_specifier (0x5F) and the private descriptors it governs,
+  supplementary_audio and other non-codec 0x7F extensions. Order is
+  preserved.
+- **Dropped**: maximum_bitrate (0x0E — it describes the source rate), an
+  ES-level CA descriptor (0x09 — a re-encoded ES leaves in the clear),
+  and every codec-identity descriptor that does not describe the target:
+  0x03, 0x6A, 0x7A, 0x7B, 0x7C, 0x7F ext {DTS-HD, DTS Neural, AC-4,
+  DTS-UHD}, ATSC 0x81 / 0xCC / 0xAC (unless a private_data_specifier
+  governs them), and any registration (0x05) that is not the target's.
+  The tag set is the one `ts_parse::descriptor_audio_kind` classifies
+  with, so the rewriter and the classifier cannot drift.
+- **Per target**: AAC → `stream_type 0x0F`, an existing 0x7C normalised to
+  `7C 01 FE` (never added). MP2 → `0x03` (`0x04` at 16 / 22.05 / 24 kHz,
+  MPEG-2 LSF), an existing 0x03 rewritten to `03 01 67` (`03 01 27` for
+  LSF). AC-3 → always the "AC-3" registration (0x05), and the carriage
+  `ts_signalling` selects:
+
+| `ts_signalling` | AC-3 carriage |
+|---|---|
+| `auto` (default when unset) | follows the **first** source PMT the output sees: DVB carriage if the source is DVB-flavoured, otherwise ATSC. Evidence, in order: an audio ES already carried `0x06` + 0x6A / 0x7A / 0x7C ⇒ DVB; `stream_type` 0x81 / 0x87, ATSC descriptor tags 0x81 / 0x86 / 0xCC / 0xA3, or a "GA94" registration ⇒ ATSC; DVB descriptor tags (0x45, 0x46, 0x52, 0x56, 0x59, 0x5F, 0x66, 0x6A, 0x7A, 0x7B, 0x7C, 0x7F) ⇒ DVB; nothing ⇒ ATSC. A user-private table_id on the PMT PID is deliberately not evidence. |
+| `dvb` | `stream_type 0x06` + "AC-3" registration + AC-3_descriptor `6A 01 00` (ETSI EN 300 468 / TS 101 154) — what strict DVB IRDs want. |
+| `atsc` | `stream_type 0x81` + "AC-3" registration (ATSC A/52 Annex A). The optional ATSC AC-3 audio descriptor (tag 0x81) is not generated. |
+
+  The flavour is latched **once per output lifetime** and never follows
+  an input switch, so a flow switching between a DVB and an ATSC input
+  does not flip its AC-3 signalling 0x81 ↔ 0x06. **Behaviour change:** an
+  AC-3 output of a DVB source used to go out as `0x81` with no
+  descriptors; under `auto` it is now `0x06` + "AC-3" + 0x6A. Set
+  `ts_signalling: "atsc"` to keep the old stream_type. `ts_signalling` is
+  refused on any codec but `ac3`, on HLS (always ATSC — what Apple HLS and
+  hls.js expect in TS segments) and on PCM inputs (their TS comes from
+  the shared muxer).
+- **Growth fallback**: the AC-3 additions are the only edit that grows a
+  section. When the grown PMT would need more TS packets than the
+  source's, the output falls back to `0x81` with no additions (still
+  self-identifying), so a single-packet PMT stays single-packet for every
+  single-packet parser downstream.
+- **Program level**: once any ES of the program is re-encoded,
+  multiplex_buffer_utilization (0x0C), maximum_bitrate (0x0E),
+  smoothing_buffer (0x10) and STD (0x11) are dropped from program_info —
+  an audio 128 → 448 kbps change invalidates them as much as a video
+  re-encode does.
+- **Version**: the output `version_number` is derived from content. It
+  bumps whenever the rebuilt PMT differs from the last one (a source PMT
+  update that adds an ES, a codec or PID change) and on every source
+  reset, and otherwise holds — an unchanged PMT never flaps. The audio
+  and video replacers each track their own input-derived output, so in a
+  chain the video stage sees the audio stage's changed section and bumps
+  too (it used to re-stamp its own unchanged counter over the audio
+  stage's bump).
+- **Damaged PMTs** (a CRC that does not verify) are never learned from or
+  rebuilt; they pass through untouched.
+
+**Multi-section and multi-packet PMTs.** Every packet on the PMT PID goes
+through a reassembling stage (`ts_pmt_edit::PsiUnitStage`). A PMT PID may
+carry several sections per payload unit, and tables other than the PMT —
+ATSC / DigiCipher muxes put a 0xC0 section ahead of the PMT in every
+PMT-PID packet (VH1: the PMT sits at packet offset 29). The replacer used
+to read only the section at the pointer target, found no PMT, learned no
+audio PID and silently passed everything through. The stage also
+reassembles a PMT that spans packets: a target ES in the second packet is
+found, and an edited multi-packet PMT is re-packetised with a valid CRC —
+the old in-place edit changed the stream_type in the first packet and
+left the CRC, which lives in the continuation packet, stale, so receivers
+discarded the whole PMT. Details: a unit is held until every section that
+started in it is complete (PMT packets are delayed by their own span); a
+long-form section reassembled across packets must pass its CRC or the
+unit is dropped (counted, logged once) — the CRC rather than the CC is the
+gate because some muxers never advance the CC on PSI; an unchanged unit is
+re-emitted byte-identical; a changed one is laid out with a pointer_field
+and PUSI on every packet in which a section starts and 0xFF stuffing,
+reusing each source packet's header bits and adaptation field. Source CCs
+are kept while the packet count is unchanged; once it changes the stage
+owns the CC on that PID. The program's PMT is matched on its
+`program_number` (two programs sharing one PMT PID each get their own);
+on a PID the PAT maps to one program only, the first PMT section is
+accepted too, as before.
+
+### When the transcoder finds nothing to re-encode
+
+Passing the source ES through is the intended fallback when there is
+nothing the replacer can decode, but it is no longer silent. Each
+replacer runs an engage watchdog on its codec thread (no timers — it is
+evaluated on every `process()` call). It starts on the first call and
+again on every source reset / input switch, and raises **one** Warning —
+`audio_transcode_source_not_found` / `video_transcode_source_not_found`
+(category `flow`, scoped like `video_transcode_decode_stalled`) — when,
+5 s in, the replacer has still not locked and either the PMT PID has
+carried at least 10 PUSI packets, or 10 s and 1000 TS packets have
+passed. `details.reason` says why: `no_pat`, `pmt_not_parsed` (with
+`first_table_id` — what the PID does carry), `no_supported_es`, or
+`codec_not_replaceable` (the program has audio / video, but only in a
+codec the replacer cannot decode: DTS, Opus, AC-4, SMPTE 302M, VC-1,
+JPEG XS, …). A later lock raises the Info `*_transcode_source_found`; a
+PMT update that removes the ES re-arms the watch. Catalogue:
+[`events-and-alarms.md`](events-and-alarms.md) ("Transcode engage").
 
 ### Opus-specific options
 
@@ -339,6 +450,9 @@ field set from the compressed codecs and validation checks it apart:
 ### Engine internals
 
 - Core stage: `src/engine/ts_audio_replace.rs` (streaming `TsAudioReplacer`).
+- PMT: `src/engine/ts_pmt_edit.rs` (`PsiUnitStage`, `rebuild_pmt_section`,
+  `OutVersion`, `detect_flavour`); the engage watchdog is
+  `src/engine/transcode_engage.rs`.
 - Wiring: `output_udp.rs`, `output_rtp.rs`, `output_srt.rs` insert a
   `block_in_place` call between the program filter and the egress buffer.
 - Decoder: `bilbycast-fdk-aac-rs::AacDecoder::open_adts` (Fraunhofer FDK AAC).
@@ -450,10 +564,16 @@ without `video_encode`** (deferred — see below).
 
 Decodes the source video ES (H.264 or HEVC) in-process via
 `video-engine::VideoDecoder`, re-encodes via a feature-gated backend,
-and muxes the new bitstream back into the output TS. When the target
-codec family differs from the source (H.264 ↔ HEVC), the PMT is
-rewritten in place with a recomputed CRC32; same-family transcodes
-leave the PMT untouched.
+and muxes the new bitstream back into the output TS. The program's PMT
+is rebuilt through the same `ts_pmt_edit` stage as the audio replacer
+(see "What the output PMT says" above): the target `stream_type`,
+`PCR_PID` forced to the video PID (this module carries the PCR), and the
+video descriptor policy on the re-encoded ES — the source codec's video
+descriptors (MPEG-2 0x02, MPEG-4 0x1B, AVC 0x28 / 0x2A, HEVC 0x38),
+maximum_bitrate (0x0E), an ES-level CA descriptor (0x09) and a
+registration that is not the target's ("HEVC" on an HEVC → H.264
+transcode) are dropped; 0x52, 0x0A, 0x06 and the rest are kept — plus
+the program-level rate descriptors, and the content-tracked version.
 
 ### Schema
 
@@ -504,7 +624,7 @@ leave the PMT untouched.
 | `level` | unset | Codec level, e.g. `"3.0"`, `"4.0"`, `"5.1"`. Unset lets the encoder pick from resolution / bitrate / frame rate. |
 | `tune` | backend-resolved: `zerolatency` on x264 / x265, **unset on every hardware backend** | The vocabularies are disjoint. x264 / x265 accept `zerolatency`, `film`, `animation`, `grain`, `stillimage`, `fastdecode`, `psnr`, `ssim`; NVENC accepts `hq`, `ll`, `ull`, `lossless`; QSV and VAAPI expose no `tune` option at all. Config validation is permissive over the union, because an `h264_auto` / `hevc_auto` output does not know its backend until flow start. A tune the resolved backend cannot accept is therefore **dropped** at flow start (`video_encode_util::sanitise_tune`), with a log line carrying `error_code = encoder_tune_not_supported` — a log line only, no manager event. Dropping matters: handing NVENC `zerolatency` makes `avcodec_open2` fail with `EINVAL (-22)`. An empty string means "unset — encoder chooses". |
 | `chroma` / `bit_depth` | `yuv420p` / `8` | Which backend can carry which combination is genuinely per-vendor; the matrix is later in this document rather than duplicated here. |
-| `source_video_pid` | unset | Pin the source video elementary PID instead of taking the first video stream in the active program's PMT (`stream_type` `0x01` / `0x02` / `0x1B` / `0x24`). Range `0x0010..=0x1FFE`, enforced at config load. Behaves exactly like `audio_encode.source_audio_pid` above, including the single-program rule and the log-only `error_code = video_source_pid_not_found` fallback — see that section for the MPTS recipe. |
+| `source_video_pid` | unset | Pin the source video elementary PID instead of taking the first video stream in the active program's PMT (`stream_type` `0x01` / `0x02` / `0x1B` / `0x24`). Range `0x0010..=0x1FFE`, enforced at config load. Behaves exactly like `audio_encode.source_audio_pid` above, including the single-program rule and the fallback, which raises the Warning event `video_source_pid_not_found` — see that section for the MPTS recipe. |
 | `hw_decode` | `auto` | Which backend decodes the **source** ES before re-encode. `auto` walks VAAPI ≻ NVDEC ≻ QSV ≻ RKMPP ≻ CPU against the host's probed capabilities and the compiled-in `video-decoder-*` features; `cpu` forces software libavcodec, which is how you keep the host's HW decode sessions free for other flows. A forced backend the build or host cannot satisfy **does not fail the flow** — it logs `ts_video_replace: hw_decode preference … unavailable …; falling back to CPU` (a bare `warn`, no `error_code`, no manager event) and runs on CPU, and so does an edge whose startup probe never ran. That is deliberately unlike the display output, which raises `display_hw_decode_unavailable_falling_back`. Verification recipe: [`codec-matrix.md`](codec-matrix.md#verification-commands-per-host-class), item 4. |
 
 #### Colour metadata

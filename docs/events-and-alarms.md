@@ -651,10 +651,49 @@ without parsing the human-readable message.
 | `video_encode_fps_mismatch` | warn | `engine::ts_video_replace::TsVideoReplacer` measures the source frame rate from DTS deltas and finds it disagrees with `video_encode.fps_num` / `fps_den` by more than 0.1 % (one-shot per encoder run). | `measured_fps`, `pinned_fps_num`, `pinned_fps_den`, `pinned_fps`, `drift_pct`, `bitrate_multiplier` | The encoder runs at the operator's pinned time_base while frames arrive at the source rate. This does **not** cause a proportional lipsync drift on this path — every source frame is still encoded and output PES PTS still carry the source clock — but the encoder is mistuned: actual bitrate runs `bitrate_multiplier` times the configured value, the default GOP (2 × pinned fps) spans the wrong duration instead of the intended 2 s, and the SPS VUI advertises the wrong rate. Common case: NTSC source (29.97 fps = 30000/1001) into a `25/1` pinned encoder. Either remove the pin (the encoder auto-locks to the measured source rate when unpinned) or set it to the source rate explicitly. `drift_pct` is retained as a published field name for out-of-tree alerting rules; an earlier version of this row read it as a lipsync drift, which it is not. |
 | `encoder_tune_not_supported` | warn | `video_encode.tune` names a tune the resolved backend does not accept (`sanitise_tune`). The tune is **dropped** — the encoder opens without it rather than failing `avcodec_open2` with `EINVAL`. | none beyond the message (the tune, the backend label and the accepted list are interpolated) | Your `tune` is a no-op on this backend. Either pick one the backend lists or leave it unset. |
 | `encoder_preset_not_supported` | warn | `video_encode.preset` names a preset the resolved backend does not accept (`sanitise_preset`). Unlike `tune`, the preset is **mapped to the nearest legal value** rather than dropped, again to avoid an `EINVAL` open failure. | none beyond the message (requested preset, backend label and substituted preset are interpolated) | The encoder is not running at the preset you configured — it is running at the substituted one, with the speed/quality trade-off that implies. |
-| `audio_source_pid_not_found` | warn | `audio_encode.source_audio_pid` pins a PID that is not in the PMT, so the replacer fell back to first-matching-codec audio. De-duplicated per distinct `(pinned, actual)` pair and re-armed when the pin reappears, so it recurs on a PMT-version bump where the pin is still missing. | `pinned_pid`, `actual_pid`, `actual_stream_type` | The stream being transcoded is **not** the one the operator pinned. On an MPTS or a multi-language SPTS that silently transcodes the wrong track. |
-| `video_source_pid_not_found` | warn | Same as above for `video_encode.source_video_pid` (`src/engine/ts_video_replace.rs`). | `pinned_pid`, `actual_pid`, `actual_stream_type` | Same consequence on the video side. |
 
-**Source**: `src/engine/st2110_video_io.rs` (chroma resolver), `src/engine/ts_video_replace.rs` (fps mismatch, video PID pin), `src/engine/video_encode_util.rs` (tune / preset sanitisers), `src/engine/ts_audio_replace.rs` (audio PID pin).
+`audio_source_pid_not_found` / `video_source_pid_not_found` used to be
+listed here as log-only. They are now WS events as well — see
+"Transcode engage" below.
+
+**Source**: `src/engine/st2110_video_io.rs` (chroma resolver), `src/engine/ts_video_replace.rs` (fps mismatch), `src/engine/video_encode_util.rs` (tune / preset sanitisers).
+
+### Transcode engage (`audio_encode` / `video_encode` on TS)
+
+A TS transcode replacer (`TsAudioReplacer` / `TsVideoReplacer`) that cannot
+find what it is configured to re-encode falls back to passing the source ES
+through. These events make that visible. All are category `flow`, scoped
+exactly like `video_transcode_decode_stalled`: `output_id` + "Output '{id}'"
+wording on an output transcode (`transcode_chain::build_for_output`),
+`input_id` + "Input '{id}'" wording on an ingress transcode
+(`input_transcode::register_ingress_stats`). Each also rides a
+`tracing::warn!` / `info!` line.
+
+| `error_code` | Severity | Trigger | Details |
+|---|---|---|---|
+| `audio_transcode_source_not_found` / `video_transcode_source_not_found` | Warning | The engage watchdog (evaluated on every `process()` call, no timers) has not locked 5 s after the replacer started — or after its last source reset / input switch, or after a PMT update removed its ES — **and** either the PMT PID has carried ≥ 10 PUSI packets, or ≥ 10 s and ≥ 1000 TS packets have passed (which covers a source with no PAT and a PMT PID that never carries a PMT). One-shot per waiting period. `reason`: `no_pat`, `pmt_not_parsed` (`first_table_id` names what the PMT PID does carry), `no_supported_es`, `codec_not_replaceable` (the program has audio / video, but only in a codec the replacer cannot decode — DTS, Opus, AC-4, SMPTE 302M, VC-1, JPEG XS, …). The ES passes through unchanged while it stands. | `{ error_code, reason, pmt_pid, program_number, first_table_id, es: [{ pid, stream_type }], pinned_pid, waited_ms }` |
+| `audio_transcode_source_found` / `video_transcode_source_found` | Info | The replacer locked onto a decodable ES after a `*_source_not_found` Warning. Only follows a Warning. | `{ error_code, source_pid, source_stream_type, pmt_pid, program_number }` |
+| `audio_source_pid_not_found` / `video_source_pid_not_found` | Warning | `audio_encode.source_audio_pid` / `video_encode.source_video_pid` pins a PID that is not in the PMT (or is not a decodable stream of that kind), so the replacer fell back to the first decodable one. Raised at PMT parse time — not by the watchdog timer — once per distinct `(pinned, actual)` pair, re-armed when the pin reappears. Used to be a log line only, which let a mis-typed pin silently transcode the wrong track. | `{ error_code, pinned_pid, actual_pid, actual_stream_type }` |
+
+What the operator should do: `pmt_not_parsed` with a sane `first_table_id`
+means a PMT the edge cannot read — capture it and file it; `no_supported_es`
+means the configured transcode has nothing to work on (e.g. `video_encode`
+on a radio service) — remove the block; `codec_not_replaceable` means the
+source codec is outside the decoder set — the output carries the source ES
+as-is; the pin warnings mean the pinned PID is wrong for this source.
+
+**Source**: `src/engine/transcode_engage.rs` (`TranscodeEngageWatch`,
+`emit_pinned_pid_absent`), driven from `src/engine/ts_audio_replace.rs` and
+`src/engine/ts_video_replace.rs` (`handle_pmt_unit`, `poll_engage`).
+
+### Muxer-mode clock rewriter (`passthrough_clock` unset)
+
+| `error_code` | Severity | Trigger | Details |
+|---|---|---|---|
+| `clock_rewrite_pmt_not_learned` | Warning | The per-input `TsPtsRewriter` regenerated PCR for 2 s of source-PCR time without learning a PMT, so it could not re-anchor any PES timestamp: PCR on the master timeline over PTS in the source timeline (VH1 showed a constant −12.6 h PTS−PCR before the PMT walker fix). It now falls back to the **source clock** — PCR passes through unchanged, with DI=1 on the first one — so PCR and PTS agree. If a PMT is learned later, regeneration resumes on the next PCR, again with DI=1. Input-scoped. Wired on UDP / SRT / RTP / RIST / media-player / replay inputs (the others build their TS with the shared muxer). | `{ error_code, pmt_pids, waited_ms }` |
+
+**Source**: `src/engine/ts_pts_rewriter.rs` (`note_unlearned_pcr`),
+`src/engine/input_post_process.rs` (`set_event_sender`).
 
 ---
 

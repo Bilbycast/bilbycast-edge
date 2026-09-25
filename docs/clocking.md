@@ -248,6 +248,30 @@ only bare-`stream_type` audio/video was rewritten, which left
 DVB-0x06 AC-3 PES at source PTS hours away from the regenerated PCR —
 silent audio on every compliant receiver (the "Network TEN" bug).
 
+**How the PMT is found.** Every packet on a PMT PID goes through a
+section assembler, and every section it completes is considered, not
+just the one at the pointer_field target. A payload unit may carry
+several sections, and a PMT PID may carry other tables: ATSC /
+DigiCipher muxes put a short-form 0xC0 section ahead of the PMT in
+every PMT-PID packet. The rewriter used to read only the pointer-target
+table, never learned a role on such a stream, and so re-anchored every
+PCR while leaving every PES timestamp in the source timeline — VH1.ts
+came out with a constant −12.6 h PTS−PCR on every output, transcoded or
+not. A PMT spanning two packets is learned too, and the rewriter now
+owns the CC on a PMT's continuation packets as well as its first.
+
+**PCR is never regenerated for long without roles.** PCR re-anchoring
+starts at the first PCR, before the PMT is known. If no PMT has been
+learned after 2 s of source-PCR time (four times TR 101 290's 500 ms
+PSI repetition), the rewriter stops regenerating PCR and passes the
+**source clock** through — PCR and the untouched PES timestamps then
+agree — with DI=1 on the first passed-through PCR, and raises the
+Warning `clock_rewrite_pmt_not_learned` (input-scoped; see
+[`events-and-alarms.md`](events-and-alarms.md)). When a PMT is learned
+later, the anchor is re-established on the next PCR, again with DI=1,
+and regeneration resumes. A stream with parseable PSI never reaches
+this path.
+
 ## Module map
 
 | Module | What it does |
