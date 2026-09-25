@@ -1570,9 +1570,10 @@ async fn play_ts_file(
         }
     }
     let mut splice = TsFileSplice::new(target_pts_90k, head_info.video);
-    // Packets held until the first anchor PCR (7a). Bounded: a file whose
-    // first PCR is further in than this plays as before, its held ES
-    // dropped rather than sent with raw timestamps.
+    // Packets held until the first anchor PCR (7a). Bounded: past this the
+    // held ES are dropped rather than sent with raw timestamps, the packets
+    // after them stream raw until the first PCR arrives, and that PCR still
+    // fixes the splice offset for the rest of the file.
     const HOLD_MAX_PACKETS: usize = 4096;
     let mut held: Vec<[u8; TS_PACKET]> = Vec::new();
     let mut hold_overflowed = false;
@@ -1656,8 +1657,9 @@ async fn play_ts_file(
             None
         };
 
-        if splice.splice_offset_27m.is_none() && !hold_overflowed {
+        if splice.splice_offset_27m.is_none() {
             match raw_pcr {
+                None if hold_overflowed => {}
                 None if held.len() < HOLD_MAX_PACKETS => {
                     held.push(packet);
                     continue 'packets;
@@ -1665,11 +1667,13 @@ async fn play_ts_file(
                 None => {
                     // No PCR this far in: keep the PSI, drop the held ES
                     // (their raw timestamps are what 7a keeps off the
-                    // wire) and play the rest as before.
+                    // wire) and stream on until the first PCR, which still
+                    // anchors the offset below.
                     hold_overflowed = true;
                     tracing::warn!(
                         "media-player: no PCR in the first {HOLD_MAX_PACKETS} packets of {} — \
-                         dropped the elementary-stream packets ahead of it",
+                         dropped the elementary-stream packets held so far; the rest streams \
+                         unshifted until the first PCR",
                         path.display()
                     );
                     let psi_pids = held_psi_pids(&held);
@@ -2329,6 +2333,9 @@ impl VideoRapGate {
     }
 
     /// Learn the video ES (from the in-stream PMT when the head had none).
+    /// The search starts *dropping*: a file cut mid-PES opens with
+    /// continuation packets, and passed on they would be appended to the
+    /// previous file's truncated last PES at the splice.
     pub(super) fn set_video(&mut self, pid: u16, stream_type: u8) {
         if self.pid.is_some() || !rap_gated_stream_type(stream_type) {
             return;
@@ -2336,6 +2343,7 @@ impl VideoRapGate {
         self.pid = Some(pid);
         self.stream_type = stream_type;
         self.state = RapGateState::Searching;
+        self.dropping = true;
     }
 
     /// Drop a packet — unless it carries a PCR or DI, which leaves
@@ -3721,6 +3729,8 @@ fn run_paced_emitter(
             next_target_wall = t.max(now).saturating_add(bundle_period_ns);
             t
         };
+        #[cfg(test)]
+        pacer_trace::record(&thread_name, target_ns, &msg.pkt.data);
         // How far the pacer has already fallen behind this bundle's own
         // deadline, in ms. `0` when on schedule or running ahead. The
         // closest signal the media player has to "am I keeping up with the
@@ -3788,6 +3798,39 @@ fn shuffle_indices(order: &mut [usize]) {
     use rand::seq::SliceRandom;
     let mut rng = rand::rng();
     order.shuffle(&mut rng);
+}
+
+/// Test-only record of the deadline the OS-thread pacer sleeps to for each
+/// message, per pacer thread (`media-pacer-<file name>`), for the threads a
+/// test asked to watch. Lets a test assert the schedule itself instead of
+/// receive-time wall stamps, which carry whatever scheduling stall a
+/// loaded test run adds.
+#[cfg(test)]
+pub(super) mod pacer_trace {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+
+    type Trace = Vec<(u64, bytes::Bytes)>;
+    static TRACES: Mutex<Option<HashMap<String, Trace>>> = Mutex::new(None);
+
+    /// Start recording the pacer thread named `thread`.
+    pub fn watch(thread: &str) {
+        let mut t = TRACES.lock().unwrap();
+        t.get_or_insert_with(HashMap::new).insert(thread.to_string(), Vec::new());
+    }
+
+    pub(super) fn record(thread: &str, target_ns: u64, data: &bytes::Bytes) {
+        let mut t = TRACES.lock().unwrap();
+        if let Some(v) = t.as_mut().and_then(|m| m.get_mut(thread)) {
+            v.push((target_ns, data.clone()));
+        }
+    }
+
+    /// `(deadline ns, message bytes)` in emission order; stops recording.
+    pub fn take(thread: &str) -> Trace {
+        let mut t = TRACES.lock().unwrap();
+        t.as_mut().and_then(|m| m.remove(thread)).unwrap_or_default()
+    }
 }
 
 #[cfg(test)]
@@ -5033,6 +5076,109 @@ mod tests {
         assert_eq!(g.state, RapGateState::Done);
     }
 
+    /// A file cut mid-PES opens with continuation packets of a PES whose
+    /// start is not in the file. The search drops them — kept, they would
+    /// be appended to the previous file's truncated last PES at the splice
+    /// — except a PCR one carries, which leaves adaptation-field-only.
+    #[test]
+    fn a_file_cut_mid_pes_drops_its_leading_continuation_packets() {
+        use crate::engine::ts_parse::{extract_pcr, extract_pes_pts, ts_adaptation_field_control};
+        let mut g = VideoRapGate::new(Some((0x100, 0x1B)));
+        let mut out = Vec::new();
+        let cont = |cc| crate::engine::ts_test_fixtures::payload_packet(0x100, cc);
+        g.feed(cont(5), &mut out);
+        g.feed(with_pcr(cont(6), 27_000_000), &mut out);
+        g.feed(video_pes(0x100, 7, 90_000, None, SPS), &mut out);
+        assert_eq!(out.len(), 2);
+        assert_eq!(extract_pcr(&out[0]), Some(27_000_000));
+        assert_eq!(ts_adaptation_field_control(&out[0]), 0b10, "the PCR survives AF-only");
+        assert_eq!(extract_pes_pts(&out[1]), Some(90_000), "then the RAP");
+    }
+
+    /// A file whose first PCR lies past the 4096-packet hold: the held ES
+    /// are dropped, what follows streams raw until that PCR — and the PCR
+    /// still fixes the splice offset for the rest of the file.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_first_pcr_past_the_hold_still_sets_the_splice_offset() {
+        use crate::engine::ts_parse::{extract_pes_pts, pcr_only_packet};
+        use crate::engine::ts_test_fixtures::{packetize_sections, pat_packet, pes_start_packet, pmt_section};
+        use std::io::Write;
+        const N: u64 = 4_200;
+        let pts0 = 1_000_000u64;
+        let mut bytes = pat_packet(&[(1, 0x1000)], 0, 0).to_vec();
+        let pmt = pmt_section(1, 0, 0x100, &[], &[(0x0F, 0x101, &[])]);
+        bytes.extend_from_slice(&packetize_sections(0x1000, &[&pmt], 0)[0]);
+        for k in 0..N {
+            bytes.extend_from_slice(&pes_start_packet(0x101, k as u8, 0xC0, pts0 + k * 1_920, None));
+        }
+        // The first PCR, 100 ms ahead of the next audio frame.
+        let pcr = (pts0 + N * 1_920 - 9_000) * 300;
+        bytes.extend_from_slice(&pcr_only_packet(0x100, 0, pcr, false));
+        for k in N..N + 10 {
+            bytes.extend_from_slice(&pes_start_packet(0x101, k as u8, 0xC0, pts0 + k * 1_920, None));
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("late-pcr.ts");
+        std::fs::File::create(&path).unwrap().write_all(&bytes).unwrap();
+
+        let (tx, mut rx) = broadcast::channel::<RtpPacket>(4096);
+        let receiver = tokio::spawn(async move {
+            let mut got = Vec::new();
+            while let Ok(b) = rx.recv().await {
+                got.push(b);
+            }
+            got
+        });
+        let stats = std::sync::Arc::new(FlowStatsAccumulator::new(
+            "f".into(),
+            "f".into(),
+            "media_player".into(),
+        ));
+        let cancel = CancellationToken::new();
+        let mut seq_num: u16 = 0;
+        let mut cont = SpliceContinuity::default();
+        let mut transcoder: Option<crate::engine::input_transcode::InputTranscoder> = None;
+        let (events, _events_rx) = crate::manager::events::event_channel();
+        let media_stats = std::sync::Arc::new(MediaPlayerStats::default());
+        let mut demux_cache = DemuxCacheField::default();
+        cont.open_file("late-pcr.ts");
+        let mut session = PlayerSession {
+            seq_num: &mut seq_num,
+            per_input_tx: &tx,
+            stats: &stats,
+            cancel: &cancel,
+            cont: &mut cont,
+            transcoder: &mut transcoder,
+            pid_overrides: None,
+            post: &mut None,
+            splice_gap_signal: None,
+            bundle_size: BUNDLE_SIZE,
+            pcr_deadlines: false,
+            media_stats: &media_stats,
+            events: &events,
+            flow_id: "f",
+            input_id: "i",
+            demux_cache: &mut demux_cache,
+        };
+        play_ts_file(&path, Some(1_000_000_000), None, &mut session).await.unwrap();
+        drop(tx);
+        let got = receiver.await.unwrap();
+        let audio: Vec<u64> = got
+            .iter()
+            .flat_map(|b| b.data.chunks(TS_PACKET).map(|p| p.to_vec()).collect::<Vec<_>>())
+            .filter(|p| ((p[1] as u16 & 0x1F) << 8 | p[2] as u16) == 0x101)
+            .filter_map(|p| extract_pes_pts(&p))
+            .collect();
+        // Held: PAT, PMT and 4094 audio packets — the ES dropped. Then the
+        // rest of the stretch raw, then the offset: the cold-start target
+        // (0) − the first PCR, so the frame 100 ms past it lands at 100 ms.
+        assert_eq!(audio.len() as u64, N - 4_094 + 10);
+        assert_eq!(audio[0], pts0 + 4_094 * 1_920, "raw until the PCR");
+        let after: Vec<u64> = audio[audio.len() - 10..].to_vec();
+        let want: Vec<u64> = (0..10).map(|k| 9_000 + k * 1_920).collect();
+        assert_eq!(after, want, "offset from the first PCR on");
+    }
+
     #[test]
     fn ts_loop_carry_matches_the_wall_gap_to_the_pcr_gap() {
         const MS: u64 = 27_000;
@@ -5094,19 +5240,15 @@ mod tests {
         use crate::engine::ts_parse::{extract_pcr, extract_pes_dts, extract_pes_pts};
         use std::io::Write;
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("loop.ts");
+        let path = dir.path().join("loop-3d.ts");
         std::fs::File::create(&path).unwrap().write_all(&loop_fixture()).unwrap();
 
-        let (tx, mut rx) = broadcast::channel::<RtpPacket>(4096);
-        // Stamp every bundle as it arrives: the wall clock across the splice
-        // is what 3d is about.
-        let receiver = tokio::spawn(async move {
-            let mut got = Vec::new();
-            while let Ok(b) = rx.recv().await {
-                got.push((b, std::time::Instant::now()));
-            }
-            got
-        });
+        // The wall clock across the splice is what 3d is about: take it from
+        // the deadline the pacer sleeps to for each message, not from when a
+        // receiver task happened to run (a loaded test run stalls that by
+        // tens of ms).
+        pacer_trace::watch("media-pacer-loop-3d.ts");
+        let (tx, _rx) = broadcast::channel::<RtpPacket>(4096);
         let stats = std::sync::Arc::new(FlowStatsAccumulator::new(
             "f".into(),
             "f".into(),
@@ -5120,7 +5262,7 @@ mod tests {
         let media_stats = std::sync::Arc::new(MediaPlayerStats::default());
         let mut demux_cache = DemuxCacheField::default();
         for _ in 0..2 {
-            cont.open_file("loop.ts");
+            cont.open_file("loop-3d.ts");
             let mut session = PlayerSession {
                 seq_num: &mut seq_num,
                 per_input_tx: &tx,
@@ -5142,15 +5284,14 @@ mod tests {
             play_ts_file(&path, None, None, &mut session).await.unwrap();
         }
         drop(tx);
-        let got = receiver.await.unwrap();
-        let t0 = got[0].1;
+        let got = pacer_trace::take("media-pacer-loop-3d.ts");
+        let t0 = got[0].0;
         let mut video = Vec::new(); // (pts, dts)
         let mut pcrs = Vec::new(); // (pcr, wall_us)
         let mut filler_bundles = 0;
-        for (b, _) in &got {
+        for (_, b) in &got {
             // A filler datagram: one AF-only PCR then six null packets.
             let pids: Vec<u16> = b
-                .data
                 .chunks(TS_PACKET)
                 .map(|p| ((p[1] as u16 & 0x1F) << 8) | p[2] as u16)
                 .collect();
@@ -5158,14 +5299,14 @@ mod tests {
                 filler_bundles += 1;
             }
         }
-        for (b, at) in &got {
-            for p in b.data.chunks(TS_PACKET) {
+        for (at, b) in &got {
+            for p in b.chunks(TS_PACKET) {
                 let pid = ((p[1] as u16 & 0x1F) << 8) | p[2] as u16;
                 if pid != 0x100 {
                     continue;
                 }
                 if let Some(v) = extract_pcr(p) {
-                    pcrs.push((v, at.duration_since(t0).as_micros() as u64));
+                    pcrs.push((v, at.saturating_sub(t0) / 1_000));
                 }
                 if p[1] & 0x40 != 0
                     && let Some(pts) = extract_pes_pts(p)
