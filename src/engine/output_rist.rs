@@ -53,7 +53,6 @@ pub fn spawn_rist_output(
     frame_rate_rx: Option<tokio::sync::watch::Receiver<Option<f64>>>,
     event_sender: EventSender,
     flow_id: String,
-    av_sync_pacer: Option<Arc<crate::engine::av_sync_mux::AvSyncPacer>>,
     active_input_rx: tokio::sync::watch::Receiver<String>,
 ) -> JoinHandle<()> {
     // Apply interface_binding (loose only on RIST in Phase 1) for the
@@ -125,7 +124,6 @@ pub fn spawn_rist_output(
             frame_rate_rx,
             &event_sender,
             &flow_id,
-            av_sync_pacer,
             active_input_rx,
         )
         .await
@@ -226,7 +224,6 @@ async fn rist_output_loop(
     frame_rate_rx: Option<tokio::sync::watch::Receiver<Option<f64>>>,
     events: &EventSender,
     flow_id: &str,
-    av_sync_pacer: Option<Arc<crate::engine::av_sync_mux::AvSyncPacer>>,
     active_input_rx: tokio::sync::watch::Receiver<String>,
 ) -> anyhow::Result<()> {
     let remote: SocketAddr = config.remote_addr.parse()?;
@@ -311,7 +308,6 @@ async fn rist_output_loop(
         config.video_encode.as_ref(),
         config.transcode.clone(),
         &stats,
-        av_sync_pacer.as_ref(),
         None, // RIST backpressure not yet wired
         Some(events),
     ) {

@@ -117,9 +117,6 @@ pub fn spawn_rtmp_input(
                 None
             }
         };
-        if let (Some(t), Some(p)) = (transcoder.as_mut(), av_sync_pacer.as_ref()) {
-            t.set_av_sync_pacer(p.clone());
-        }
         // **Per-input** PCR forward-jump signal — same shape as input_srt.
         let pcr_jump_signal: std::sync::Arc<std::sync::atomic::AtomicI64> =
             std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0));

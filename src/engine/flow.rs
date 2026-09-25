@@ -585,11 +585,6 @@ struct OutputFlowCtx<'a> {
     frame_rate_rx: Option<tokio::sync::watch::Receiver<Option<f64>>>,
     #[cfg(all(feature = "display", target_os = "linux"))]
     display_claim_registry: &'a Arc<crate::display::claim_registry::DisplayClaimRegistry>,
-    /// Per-flow A/V sync pacer. Threaded into UDP/RTP/SRT/RIST outputs that
-    /// build a TsVideoReplacer so output PCR is generated from the master
-    /// clock instead of pts × 300 − preroll. `None` keeps the legacy
-    /// PTS-derived behaviour.
-    av_sync_pacer: Option<Arc<crate::engine::av_sync_mux::AvSyncPacer>>,
     /// Subscriber to the flow's `active_input_tx` watch channel. Output spawn
     /// functions that build TsVideoReplacer / TsAudioReplacer use this to flip
     /// the replacers' external reset flag on every active-input change,
@@ -1421,7 +1416,6 @@ impl FlowRuntime {
                     frame_rate_rx: frame_rate_rx.clone(),
                     #[cfg(all(feature = "display", target_os = "linux"))]
                     display_claim_registry: &display_claim_registry,
-                    av_sync_pacer: av_sync_pacer.clone(),
                     active_input_rx: active_input_tx.subscribe(),
                     master_clock: &master_clock,
                 },
@@ -2252,7 +2246,6 @@ impl FlowRuntime {
             frame_rate_rx,
             #[cfg(all(feature = "display", target_os = "linux"))]
             display_claim_registry,
-            av_sync_pacer,
             active_input_rx,
             master_clock,
         } = ctx;
@@ -2282,7 +2275,6 @@ impl FlowRuntime {
                     output_cancel.clone(),
                     frame_rate_rx,
                     event_sender.clone(),
-                    av_sync_pacer.clone(),
                     active_input_rx.clone(),
                 );
 
@@ -2315,7 +2307,6 @@ impl FlowRuntime {
                     input_audio_format,
                     frame_rate_rx,
                     event_sender.clone(),
-                    av_sync_pacer.clone(),
                     active_input_rx.clone(),
                 );
 
@@ -2344,7 +2335,7 @@ impl FlowRuntime {
                         ));
                 }
 
-                let handle = spawn_srt_output(srt_config, broadcast_tx, output_stats.clone(), output_cancel.clone(), crate::engine::output_srt::SrtOutputCtx { event_sender: event_sender.clone(), flow_id: flow_id.to_string(), input_format: input_audio_format, compressed_audio_input, frame_rate_rx, av_sync_pacer: av_sync_pacer.clone(), active_input_rx: active_input_rx.clone() });
+                let handle = spawn_srt_output(srt_config, broadcast_tx, output_stats.clone(), output_cancel.clone(), crate::engine::output_srt::SrtOutputCtx { event_sender: event_sender.clone(), flow_id: flow_id.to_string(), input_format: input_audio_format, compressed_audio_input, frame_rate_rx, active_input_rx: active_input_rx.clone() });
 
                 Ok(OutputRuntime {
                     handle,
@@ -2367,7 +2358,6 @@ impl FlowRuntime {
                     frame_rate_rx,
                     event_sender.clone(),
                     flow_id.to_string(),
-                    av_sync_pacer.clone(),
                     active_input_rx.clone(),
                 );
 
@@ -2720,7 +2710,7 @@ impl FlowRuntime {
             }
             #[cfg(feature = "mxl")]
             OutputConfig::MxlVideo(c) => {
-                let _ = (frame_rate_rx, av_sync_pacer, active_input_rx);
+                let _ = (frame_rate_rx, active_input_rx);
                 let domain_mgr = super::mxl::domain::global().ok_or_else(|| {
                     anyhow::anyhow!(
                         "MXL video output '{}' refused: libmxl probe failed at boot \
@@ -2744,7 +2734,7 @@ impl FlowRuntime {
             }
             #[cfg(feature = "mxl")]
             OutputConfig::MxlAudio(c) => {
-                let _ = (frame_rate_rx, av_sync_pacer, active_input_rx, input_audio_format);
+                let _ = (frame_rate_rx, active_input_rx, input_audio_format);
                 let domain_mgr = super::mxl::domain::global().ok_or_else(|| {
                     anyhow::anyhow!(
                         "MXL audio output '{}' refused: libmxl probe failed at boot \
@@ -2768,7 +2758,7 @@ impl FlowRuntime {
             }
             #[cfg(feature = "mxl")]
             OutputConfig::MxlAnc(c) => {
-                let _ = (frame_rate_rx, av_sync_pacer, active_input_rx);
+                let _ = (frame_rate_rx, active_input_rx);
                 let domain_mgr = super::mxl::domain::global().ok_or_else(|| {
                     anyhow::anyhow!(
                         "MXL ANC output '{}' refused: libmxl probe failed at boot \
@@ -2794,7 +2784,7 @@ impl FlowRuntime {
             OutputConfig::MxlVideo(_)
             | OutputConfig::MxlAudio(_)
             | OutputConfig::MxlAnc(_) => {
-                let _ = (broadcast_tx, frame_rate_rx, av_sync_pacer, active_input_rx,
+                let _ = (broadcast_tx, frame_rate_rx, active_input_rx,
                          input_audio_format, output_cancel, event_sender, flow_id, flow_stats);
                 anyhow::bail!(
                     "MXL output requires the `mxl` Cargo feature, which was not compiled in \
@@ -2853,9 +2843,6 @@ impl FlowRuntime {
                 .iter()
                 .any(|d| matches!(d.config, crate::config::models::InputConfig::Bonded(_)))
         };
-        let av_sync_pacer = Some(Arc::new(
-            crate::engine::av_sync_mux::AvSyncPacer::new(self.master_clock.clone()),
-        ));
         let output_rt = Self::start_output(
             &output_config,
             &self.broadcast_tx,
@@ -2872,7 +2859,6 @@ impl FlowRuntime {
                 frame_rate_rx: self.frame_rate_rx.clone(),
                 #[cfg(all(feature = "display", target_os = "linux"))]
                 display_claim_registry: &self.display_claim_registry,
-                av_sync_pacer,
                 active_input_rx: self.active_input_tx.subscribe(),
                 master_clock: &self.master_clock,
             },
@@ -3737,7 +3723,6 @@ fn spawn_single_input(
                 webrtc_config.clone(), flow_id.to_string(), input_id.clone(),
                 per_input_tx.clone(), flow_stats.clone(), input_cancel.clone(),
                 session_rx, event_sender.clone(), force_idr.clone(),
-                av_sync_pacer.clone(),
             )
         }
         #[cfg(not(feature = "webrtc"))]
@@ -3752,7 +3737,7 @@ fn spawn_single_input(
         InputConfig::Whep(whep_config) => super::input_webrtc::spawn_whep_input(
             whep_config.clone(), per_input_tx.clone(), flow_stats.clone(),
             input_cancel.clone(), event_sender.clone(), flow_id.to_string(),
-            input_id.clone(), force_idr.clone(), av_sync_pacer.clone(),
+            input_id.clone(), force_idr.clone(),
         ),
         #[cfg(not(feature = "webrtc"))]
         InputConfig::Whep(_) => {

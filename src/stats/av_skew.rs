@@ -14,11 +14,13 @@
 //! - [`engine::ts_pts_rewriter`] uses ONE shared `ClockAnchor` for all
 //!   PIDs, so it preserves A/V by construction; its only contribution is
 //!   the deliberate operator lipsync trim (audio-only, ±200 ms).
-//! - [`engine::ts_audio_replace`] re-encodes audio on a free-running
-//!   sample clock; its `(assigned output PTS − source PTS)` delta is the
-//!   exact audio-path shift (this is where the historical Sky-Witness
-//!   −27 ms/min loop drift lived — with this reporter the dashboard
-//!   would have shown it directly).
+//! - [`engine::ts_audio_replace`] re-encodes audio on a sample-count
+//!   clock held to the source PTS; its delta is where each source PES's
+//!   first sample will be *presented* minus its source PTS — the timeline
+//!   bookkeeping plus the codec pipeline's declared latency (decoder,
+//!   resampler, encoder priming) less what its output stamps subtract.
+//!   Before 2026-09 the latency was left out, and the delta read 0 on AAC
+//!   / MP2 / AC-3 re-encodes presented 79 / 46 / 42 ms late.
 //! - [`engine::ts_video_replace`] re-stamps encoded frames with PTS
 //!   dequeued from its `src_pts_queue`, so its video delta is 0 by
 //!   design; it reports anyway so a future regression is visible.
@@ -47,8 +49,8 @@ pub struct AvSkewReporter {
     /// only). 0 when the rewriter is inactive or trim unset.
     rewriter_trim_90k: AtomicI64,
     rewriter_active: AtomicBool,
-    /// Audio transcode stage: (assigned output PTS − source PTS) for the
-    /// most recent source PES.
+    /// Audio transcode stage: presentation time of the most recent source
+    /// PES's first sample minus its source PTS.
     audio_delta_90k: AtomicI64,
     audio_active: AtomicBool,
     /// Video transcode stage: same definition (0 by design today).
@@ -72,8 +74,8 @@ impl AvSkewReporter {
         self.fold_worst();
     }
 
-    /// Called by `TsAudioReplacer` at each source PES: the delta between
-    /// the output PTS its content will carry and the source PTS it had.
+    /// Called by `TsAudioReplacer` at each source PES: the time its first
+    /// sample will be presented at minus the source PTS it had.
     pub fn set_audio_delta(&self, delta_90k: i64) {
         self.audio_delta_90k.store(delta_90k, Ordering::Relaxed);
         self.audio_active.store(true, Ordering::Relaxed);

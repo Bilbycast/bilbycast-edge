@@ -304,22 +304,11 @@ async fn run(
         Arc::new(std::sync::atomic::AtomicI64::new(0));
     if let Some(t) = transcoder.as_mut() {
         t.set_pcr_jump_signal(pcr_jump_signal.clone());
-        // NB: `av_sync_pacer` is intentionally NOT wired here. Every
-        // catch-up configuration tested in this session (50 ms cap +
-        // 100 ms threshold, 32 ms cap + 100 ms threshold, 32 ms cap +
-        // 35 ms threshold) made wire audio drift seconds AHEAD of wire
-        // PCR within 5 minutes — fires per second far exceeded what
-        // `lag = master_elapsed - output_pts_elapsed` would predict.
-        // The per-fire output advance (one extra encoded silence
-        // frame) is reflected in `samples_since_anchor`, but somehow
-        // the resulting wire PES PTS lands further ahead of wire PCR
-        // than the silence amount alone explains. Until that
-        // accounting gap is closed (probably requires tracing what
-        // `pts_rewriter` writes for each emitted PES vs what
-        // `samples_since_anchor` says), the safer default is to skip
-        // the catch-up here and accept the natural source-asymmetry
-        // drift (~3 ms/sec for CNEWS = ~5 minutes within VLC's 1 s
-        // tolerance, ~3 minutes within broadcast ±500 ms).
+        // A loop splice steps the file's PTS forward over audio that is
+        // continuous content: the audio replacer steps its output PTS with
+        // it instead of inserting silence (which would put a gap into the
+        // programme audio every loop).
+        t.set_audio_gap_fill(crate::engine::ts_audio_replace::GapFill::Relabel);
     }
     crate::engine::input_transcode::register_ingress_stats(
         stats.as_ref(),

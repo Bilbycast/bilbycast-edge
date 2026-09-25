@@ -1516,17 +1516,18 @@ impl OutputStatsAccumulator {
             // as 0 (no replacer in their data path); the snapshot's
             // serde-skip_serializing_if_zero handlers hide them in JSON
             // so the manager UI just sees `source_pid: undefined`.
-            let (src_pid, src_stream_type, pre_pmt_dropped) = self
-                .audio_replacer_stats
-                .get()
+            let replacer = self.audio_replacer_stats.get();
+            let load = |f: fn(&crate::engine::ts_audio_replace::TsAudioReplacerStats) -> u64| {
+                replacer.map_or(0, |s| f(s))
+            };
+            let (src_pid, src_stream_type) = replacer
                 .map(|s| {
                     (
                         s.source_pid.load(Ordering::Relaxed),
                         s.source_stream_type.load(Ordering::Relaxed),
-                        s.pre_pmt_dropped_packets.load(Ordering::Relaxed),
                     )
                 })
-                .unwrap_or((0, 0, 0));
+                .unwrap_or((0, 0));
             crate::stats::models::EncodeStatsSnapshot {
                 pcm_frames_submitted: h.stats.pcm_frames_submitted.load(Ordering::Relaxed),
                 pcm_frames_dropped: h.stats.pcm_frames_dropped.load(Ordering::Relaxed),
@@ -1538,7 +1539,10 @@ impl OutputStatsAccumulator {
                 target_bitrate_kbps: h.target_bitrate_kbps,
                 source_pid: src_pid,
                 source_stream_type: src_stream_type,
-                pre_pmt_dropped_packets: pre_pmt_dropped,
+                pre_pmt_dropped_packets: load(|s| s.pre_pmt_dropped_packets.load(Ordering::Relaxed)),
+                timeline_corrections: load(|s| s.timeline_corrections.load(Ordering::Relaxed)),
+                silence_inserted_samples: load(|s| s.silence_inserted_samples.load(Ordering::Relaxed)),
+                dropped_samples: load(|s| s.dropped_samples.load(Ordering::Relaxed)),
             }
         });
         let video_decode_stats = self.video_decode_stats.get().map(|h| h.snapshot());
@@ -4677,6 +4681,9 @@ impl FlowStatsAccumulator {
                         source_pid: 0,
                         source_stream_type: 0,
                         pre_pmt_dropped_packets: 0,
+                        timeline_corrections: 0,
+                        silence_inserted_samples: 0,
+                        dropped_samples: 0,
                     }
                 });
                 let in_video_decode = self

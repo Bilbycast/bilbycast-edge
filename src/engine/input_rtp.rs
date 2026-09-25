@@ -126,9 +126,6 @@ pub fn spawn_rtp_input(
                 None
             }
         };
-        if let (Some(t), Some(p)) = (transcoder.as_mut(), av_sync_pacer.as_ref()) {
-            t.set_av_sync_pacer(p.clone());
-        }
         // **Per-input** PCR forward-jump signal — same shape as input_srt.
         // Required so source-side discontinuities (reconnect, re-anchor,
         // upstream encoder restart) silence-pad input-side audio_encode

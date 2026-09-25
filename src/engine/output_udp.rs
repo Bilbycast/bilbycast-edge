@@ -58,7 +58,6 @@ pub fn spawn_udp_output(
     input_format: Option<InputFormat>,
     frame_rate_rx: Option<tokio::sync::watch::Receiver<Option<f64>>>,
     events: EventSender,
-    av_sync_pacer: Option<Arc<crate::engine::av_sync_mux::AvSyncPacer>>,
     active_input_rx: tokio::sync::watch::Receiver<String>,
 ) -> JoinHandle<()> {
     let mut rx = broadcast_tx.subscribe();
@@ -95,7 +94,7 @@ pub fn spawn_udp_output(
                     config.id
                 );
             }
-        } else if let Err(e) = udp_output_loop(&config, &mut rx, output_stats, cancel, frame_rate_rx, &events, av_sync_pacer, active_input_rx).await {
+        } else if let Err(e) = udp_output_loop(&config, &mut rx, output_stats, cancel, frame_rate_rx, &events, active_input_rx).await {
             tracing::error!("UDP output '{}' exited with error: {e}", config.id);
         }
     })
@@ -131,7 +130,7 @@ async fn udp_output_loop_302m(
                  falling back to passthrough TS",
                 config.id
             );
-            return udp_output_loop(config, rx, stats, cancel, None, events, None, active_input_rx).await;
+            return udp_output_loop(config, rx, stats, cancel, None, events, active_input_rx).await;
         }
     };
 
@@ -231,7 +230,6 @@ async fn udp_output_loop(
     cancel: CancellationToken,
     frame_rate_rx: Option<tokio::sync::watch::Receiver<Option<f64>>>,
     events: &EventSender,
-    av_sync_pacer: Option<Arc<crate::engine::av_sync_mux::AvSyncPacer>>,
     active_input_rx: tokio::sync::watch::Receiver<String>,
 ) -> anyhow::Result<()> {
     let (socket, dest) =
@@ -357,7 +355,6 @@ async fn udp_output_loop(
         config.video_encode.as_ref(),
         config.transcode.clone(),
         &stats,
-        av_sync_pacer.as_ref(),
         backpressure,
         Some(events),
     ) {

@@ -440,7 +440,6 @@ pub struct SrtOutputCtx {
     pub input_format: Option<InputFormat>,
     pub compressed_audio_input: bool,
     pub frame_rate_rx: Option<tokio::sync::watch::Receiver<Option<f64>>>,
-    pub av_sync_pacer: Option<Arc<crate::engine::av_sync_mux::AvSyncPacer>>,
     pub active_input_rx: tokio::sync::watch::Receiver<String>,
 }
 
@@ -458,7 +457,6 @@ pub fn spawn_srt_output(
         input_format,
         compressed_audio_input,
         frame_rate_rx,
-        av_sync_pacer,
         active_input_rx,
     } = params;
 
@@ -508,11 +506,11 @@ pub fn spawn_srt_output(
 
     tokio::spawn(async move {
         let result = if config.bonding.is_some() {
-            srt_output_bonded_loop(&config, &broadcast_tx, output_stats, cancel, &event_sender, &flow_id, input_format, compressed_audio_input, frame_rate_rx, av_sync_pacer, active_input_rx).await
+            srt_output_bonded_loop(&config, &broadcast_tx, output_stats, cancel, &event_sender, &flow_id, input_format, compressed_audio_input, frame_rate_rx, active_input_rx).await
         } else if config.redundancy.is_some() {
-            srt_output_redundant_loop(&config, &broadcast_tx, output_stats, cancel, &event_sender, &flow_id, frame_rate_rx, av_sync_pacer, active_input_rx).await
+            srt_output_redundant_loop(&config, &broadcast_tx, output_stats, cancel, &event_sender, &flow_id, frame_rate_rx, active_input_rx).await
         } else {
-            srt_output_loop(&config, &broadcast_tx, output_stats, cancel, &event_sender, &flow_id, input_format, compressed_audio_input, frame_rate_rx, av_sync_pacer, active_input_rx).await
+            srt_output_loop(&config, &broadcast_tx, output_stats, cancel, &event_sender, &flow_id, input_format, compressed_audio_input, frame_rate_rx, active_input_rx).await
         };
         if let Err(e) = result {
             tracing::error!("SRT output '{}' exited with error: {e}", config.id);
@@ -540,12 +538,11 @@ async fn srt_output_loop(
     input_format: Option<InputFormat>,
     compressed_audio_input: bool,
     frame_rate_rx: Option<tokio::sync::watch::Receiver<Option<f64>>>,
-    av_sync_pacer: Option<Arc<crate::engine::av_sync_mux::AvSyncPacer>>,
     active_input_rx: tokio::sync::watch::Receiver<String>,
 ) -> anyhow::Result<()> {
     match config.mode {
-        SrtMode::Listener => srt_output_listener_loop(config, broadcast_tx, stats, cancel, events, flow_id, input_format, compressed_audio_input, frame_rate_rx, av_sync_pacer, active_input_rx).await,
-        _ => srt_output_caller_loop(config, broadcast_tx, stats, cancel, events, flow_id, input_format, compressed_audio_input, frame_rate_rx, av_sync_pacer, active_input_rx).await,
+        SrtMode::Listener => srt_output_listener_loop(config, broadcast_tx, stats, cancel, events, flow_id, input_format, compressed_audio_input, frame_rate_rx, active_input_rx).await,
+        _ => srt_output_caller_loop(config, broadcast_tx, stats, cancel, events, flow_id, input_format, compressed_audio_input, frame_rate_rx, active_input_rx).await,
     }
 }
 
@@ -562,7 +559,6 @@ async fn srt_output_listener_loop(
     input_format: Option<InputFormat>,
     compressed_audio_input: bool,
     frame_rate_rx: Option<tokio::sync::watch::Receiver<Option<f64>>>,
-    av_sync_pacer: Option<Arc<crate::engine::av_sync_mux::AvSyncPacer>>,
     active_input_rx: tokio::sync::watch::Receiver<String>,
 ) -> anyhow::Result<()> {
     let mut listener = bind_srt_listener_for_output(config).await?;
@@ -576,7 +572,7 @@ async fn srt_output_listener_loop(
     let mut pid_remapper = build_pid_remapper(config);
     let mut pid_overrides_rewriter = build_pid_overrides_rewriter(config);
     let mut transcode_chain =
-        build_transcode_chain_for_srt(config, events, &stats, av_sync_pacer.as_ref());
+        build_transcode_chain_for_srt(config, events, &stats);
     let mut null_padder = config
         .cbr_pad_to_kbps
         .map(crate::engine::ts_null_padder::TsNullPadder::new);
@@ -732,7 +728,6 @@ async fn srt_output_caller_loop(
     input_format: Option<InputFormat>,
     compressed_audio_input: bool,
     frame_rate_rx: Option<tokio::sync::watch::Receiver<Option<f64>>>,
-    av_sync_pacer: Option<Arc<crate::engine::av_sync_mux::AvSyncPacer>>,
     active_input_rx: tokio::sync::watch::Receiver<String>,
 ) -> anyhow::Result<()> {
     let mut program_filter = config.program_number.map(|n| {
@@ -745,7 +740,7 @@ async fn srt_output_caller_loop(
     let mut pid_remapper = build_pid_remapper(config);
     let mut pid_overrides_rewriter = build_pid_overrides_rewriter(config);
     let mut transcode_chain =
-        build_transcode_chain_for_srt(config, events, &stats, av_sync_pacer.as_ref());
+        build_transcode_chain_for_srt(config, events, &stats);
     let mut null_padder = config
         .cbr_pad_to_kbps
         .map(crate::engine::ts_null_padder::TsNullPadder::new);
@@ -958,7 +953,6 @@ fn build_transcode_chain_for_srt(
     config: &SrtOutputConfig,
     events: &EventSender,
     stats: &Arc<OutputStatsAccumulator>,
-    av_sync_pacer: Option<&Arc<crate::engine::av_sync_mux::AvSyncPacer>>,
 ) -> Option<crate::engine::transcode_chain::TranscodeChain> {
     match crate::engine::transcode_chain::build_for_output(
         &config.id,
@@ -966,7 +960,6 @@ fn build_transcode_chain_for_srt(
         config.video_encode.as_ref(),
         config.transcode.clone(),
         stats,
-        av_sync_pacer,
         None, // SRT has its own protocol-layer pacing, no wire_emit
         Some(events),
     ) {
@@ -1525,16 +1518,10 @@ async fn srt_output_redundant_loop(
     events: &EventSender,
     _flow_id: &str,
     frame_rate_rx: Option<tokio::sync::watch::Receiver<Option<f64>>>,
-    av_sync_pacer: Option<Arc<crate::engine::av_sync_mux::AvSyncPacer>>,
     // Redundant 2022-7 path is passthrough-only (no replacers); kept
     // for signature parity with the single-leg loop.
     _active_input_rx: tokio::sync::watch::Receiver<String>,
 ) -> anyhow::Result<()> {
-    // 2022-7 dual-leg forwarder doesn't itself transcode video — both
-    // legs ship identical bytes from the broadcast channel — so the
-    // av_sync_pacer is currently unused here. Held to keep the call-
-    // site signature consistent across all SRT loop variants.
-    let _ = av_sync_pacer;
     let redundancy = config
         .redundancy
         .as_ref()
@@ -2152,7 +2139,6 @@ async fn srt_output_bonded_loop(
     input_format: Option<InputFormat>,
     compressed_audio_input: bool,
     frame_rate_rx: Option<tokio::sync::watch::Receiver<Option<f64>>>,
-    av_sync_pacer: Option<Arc<crate::engine::av_sync_mux::AvSyncPacer>>,
     active_input_rx: tokio::sync::watch::Receiver<String>,
 ) -> anyhow::Result<()> {
     let bond = config
@@ -2173,7 +2159,7 @@ async fn srt_output_bonded_loop(
     let mut pid_remapper = build_pid_remapper(config);
     let mut pid_overrides_rewriter = build_pid_overrides_rewriter(config);
     let mut transcode_chain =
-        build_transcode_chain_for_srt(config, events, &stats, av_sync_pacer.as_ref());
+        build_transcode_chain_for_srt(config, events, &stats);
     let mut null_padder = config
         .cbr_pad_to_kbps
         .map(crate::engine::ts_null_padder::TsNullPadder::new);

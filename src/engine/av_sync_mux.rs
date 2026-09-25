@@ -6,7 +6,9 @@
 //! [`AvSyncPacer`] carries a clone of the flow's `MasterClockHandle` into
 //! the stages that need the master clock: the ingress `ts_pts_rewriter`
 //! (muxer-mode anchor, and the `assembler_owned` hand-off for PID-bus
-//! flows) and the `TsAudioReplacer`'s wallclock-aware catch-up.
+//! flows) and the PID-bus assembler. The TS transcode replacers take none:
+//! they stamp source-relative PTS (the `TsAudioReplacer`'s wallclock
+//! catch-up, which measured host load rather than lip-sync, is gone).
 //!
 //! It does **not** generate PCR. The transcode path used to derive PCR
 //! from the re-encoded video PTS (`pcr_for_emit`, `pts × 300 − 80 ms`,
@@ -30,8 +32,8 @@ pub const PCR_PREROLL_27MHZ: u64 = 2_160_000;
 /// Lightweight pacer carrying a clone of the flow's master-clock handle.
 ///
 /// Cheap to clone (Arc only). Threaded into the input post-process
-/// (`ts_pts_rewriter`) and the `TsAudioReplacer` via setters that default
-/// to `None`, so tests and non-mastered code paths work without it.
+/// (`ts_pts_rewriter`) and the assembler as an `Option`, so tests and
+/// non-mastered code paths work without it.
 ///
 /// `assembler_owned` is a flow-level signal: when set, the per-input
 /// `ts_pts_rewriter` skips itself because the assembler will run its

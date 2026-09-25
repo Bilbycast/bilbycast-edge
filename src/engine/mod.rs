@@ -19,11 +19,8 @@
 //! - **Redundancy merge** on SRT input (SMPTE 2022-7 de-duplication)
 //! - **Redundancy duplicate** on SRT output (SMPTE 2022-7 dual-leg send)
 
-/// Per-flow A/V sync mux — master-clock-driven PCR pacing helper
-/// consumed by the TS replacers and per-output emit code. See
-/// [`av_sync_mux`] for the architectural rationale (operator chose
-/// "per-output replacer keeps current shape; mux only governs PCR /
-/// emission timing" over the heavier per-flow producer).
+/// Per-flow A/V sync pacer — a handle on the flow's master clock for the
+/// ingress PES PTS rewriter and the PID-bus assembler. See [`av_sync_mux`].
 pub mod av_quality_watch;
 pub mod av_sync_mux;
 pub mod bandwidth_monitor;
@@ -280,6 +277,11 @@ pub mod audio_transcode;
 /// SMPTE 302M). Pure Rust via `symphonia-codec-aac`. AAC-LC mono/stereo only;
 /// HE-AAC and multichannel AAC are rejected with a clear error.
 pub mod audio_decode;
+
+/// Audio access-unit framing (ADTS / LOAS / MPEG audio / AC-3 / E-AC-3
+/// headers) and the continuous-ES cutter the TS audio replacer decodes from:
+/// whole AUs as soon as they are complete, across PES boundaries.
+pub mod audio_au;
 
 /// Lock-free counters for the video-decode stage. Shared between
 /// [`ts_video_replace::TsVideoReplacer`] (paired with `VideoEncodeStats` for

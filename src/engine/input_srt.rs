@@ -273,9 +273,6 @@ pub fn spawn_srt_input(
                 None
             }
         };
-        if let (Some(t), Some(p)) = (transcoder.as_mut(), av_sync_pacer.as_ref()) {
-            t.set_av_sync_pacer(p.clone());
-        }
         // **Per-input** PCR forward-jump signal channel. Built once
         // here in the input pipeline and shared with the input's
         // audio replacer (via `InputTranscoder::set_pcr_jump_signal`)

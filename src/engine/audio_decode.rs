@@ -405,73 +405,23 @@ pub fn split_loas_frames(buf: &[u8]) -> Vec<&[u8]> {
 /// MPEG-1 layer 2 / 1 frame splitter that honours the `frame_size`
 /// computed from the header instead of scanning for the next sync — the
 /// scanning approach trips on `0xFF` bytes inside the audio payload and
-/// produces misaligned slices.
+/// produces misaligned slices. The header arithmetic (MPEG-1 only; free
+/// format and reserved indices rejected) is
+/// [`super::audio_au::mpa_header`], shared with the TS audio replacer.
 #[cfg(feature = "media-codecs")]
 fn split_mp2_frames(buf: &[u8]) -> Vec<&[u8]> {
-    /// MPEG-1 layer II bitrate index (kbps) — ISO/IEC 11172-3 § 2.4.2.3,
-    /// table B.211. Index 0 = "free format", index 15 = "bad". We treat
-    /// both as unparseable and resync on the next valid header.
-    const MP1_L2_BITRATES: [u32; 15] = [
-        0, 32, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 384,
-    ];
-    /// MPEG-1 layer I bitrate index (kbps).
-    const MP1_L1_BITRATES: [u32; 15] = [
-        0, 32, 64, 96, 128, 160, 192, 224, 256, 288, 320, 352, 384, 416, 448,
-    ];
-    /// MPEG-1 sample-rate index (Hz).
-    const MP1_SAMPLE_RATES: [u32; 3] = [44_100, 48_000, 32_000];
-
+    use super::audio_au::{mpa_header, Head};
     let mut out: Vec<&[u8]> = Vec::with_capacity(8);
     let mut i = 0;
     while i + 4 <= buf.len() {
-        // 12-bit sync `0xFFF` — byte 0 == 0xFF and bits [7:4] of byte 1
-        // are all 1. The full MPEG-1 header is 32 bits; we need byte 2
-        // for bitrate + sample-rate.
-        if buf[i] != 0xFF || (buf[i + 1] & 0xF0) != 0xF0 {
-            i += 1;
-            continue;
-        }
-        let header2 = buf[i + 1];
-        let header3 = buf[i + 2];
-        // MPEG version: bits [4:3] of byte 1. `11` = MPEG-1 (the only
-        // version DVB / ATSC carry as MP2). Anything else: skip and
-        // resync — MPEG-2 layer II uses a different bitrate table and we
-        // don't see it on broadcast.
-        let version_id = (header2 >> 3) & 0x03;
-        if version_id != 0b11 {
-            i += 1;
-            continue;
-        }
-        // Layer: bits [2:1] of byte 1. `10` = layer II, `11` = layer I.
-        let layer = (header2 >> 1) & 0x03;
-        let bitrate_idx = ((header3 >> 4) & 0x0F) as usize;
-        let sr_idx = ((header3 >> 2) & 0x03) as usize;
-        let padding = ((header3 >> 1) & 0x01) as u32;
-        if bitrate_idx == 0 || bitrate_idx == 15 || sr_idx == 3 {
-            i += 1;
-            continue;
-        }
-        let sr = MP1_SAMPLE_RATES[sr_idx];
-        // frame_size = floor(samples_per_frame * bitrate / sample_rate) + padding
-        // Layer I: 384 samples, slot = 4 bytes, so frame = (12 * br / sr + pad) * 4.
-        // Layer II: 1152 samples, slot = 1 byte, so frame = 144 * br / sr + pad.
-        let frame_size = match layer {
-            0b10 => {
-                // Layer II
-                let br = MP1_L2_BITRATES[bitrate_idx] * 1000;
-                144 * br / sr + padding
-            }
-            0b11 => {
-                // Layer I
-                let br = MP1_L1_BITRATES[bitrate_idx] * 1000;
-                (12 * br / sr + padding) * 4
-            }
+        let frame_size = match mpa_header(&buf[i..]) {
+            Head::Valid(h) => h.len,
             _ => {
                 i += 1;
                 continue;
             }
-        } as usize;
-        if frame_size < 4 || i + frame_size > buf.len() {
+        };
+        if i + frame_size > buf.len() {
             // Truncated tail — leave it for the next PES to resync. We
             // deliberately *do not* emit a partial frame to libavcodec;
             // that's what was producing `Header missing` on the matrix.
@@ -615,14 +565,13 @@ fn split_ac3_frames(buf: &[u8]) -> Vec<&[u8]> {
 /// Smallest syncinfo we can parse: 16 bits syncword + bsi bytes through
 /// the `bsid` field (byte 5). Anything shorter is treated as a sync
 /// candidate that we can't validate yet — caller falls through.
-const AC3_MIN_HEADER_BYTES: usize = 6;
+pub(crate) const AC3_MIN_HEADER_BYTES: usize = 6;
 
 /// AC-3 frame size table from ATSC A/52 § 5.4.1.4 Table 5.18 — entries
 /// are in 16-bit words; the caller multiplies by 2 to get bytes. Indexed
 /// by `frmsizecod` (0..=37); inner index is the sample-rate code
 /// (0 = 48 kHz, 1 = 44.1 kHz, 2 = 32 kHz). `fscod = 0b11` is reserved
 /// and bails out before this table is consulted.
-#[cfg(feature = "media-codecs")]
 const AC3_FRMSIZ_WORDS: [[u16; 3]; 38] = [
     [64, 69, 96],     // 32 kbps
     [64, 70, 96],
@@ -668,8 +617,7 @@ const AC3_FRMSIZ_WORDS: [[u16; 3]; 38] = [
 /// total frame length in bytes. Returns `None` if the header is invalid
 /// (reserved `fscod`, out-of-range `frmsizecod`, or reserved `bsid`),
 /// which signals the caller to step one byte and resync.
-#[cfg(feature = "media-codecs")]
-fn ac3_frame_size(buf: &[u8]) -> Option<usize> {
+pub(crate) fn ac3_frame_size(buf: &[u8]) -> Option<usize> {
     if buf.len() < AC3_MIN_HEADER_BYTES {
         return None;
     }

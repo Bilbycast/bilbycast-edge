@@ -110,7 +110,6 @@ pub fn spawn_rtp_output(
     cancel: CancellationToken,
     frame_rate_rx: Option<tokio::sync::watch::Receiver<Option<f64>>>,
     events: EventSender,
-    av_sync_pacer: Option<Arc<crate::engine::av_sync_mux::AvSyncPacer>>,
     active_input_rx: tokio::sync::watch::Receiver<String>,
 ) -> JoinHandle<()> {
     let mut rx = broadcast_tx.subscribe();
@@ -132,9 +131,9 @@ pub fn spawn_rtp_output(
 
     tokio::spawn(async move {
         let result = if config.redundancy.is_some() {
-            rtp_output_redundant_loop(&config, &mut rx, output_stats, cancel, frame_rate_rx, av_sync_pacer, active_input_rx).await
+            rtp_output_redundant_loop(&config, &mut rx, output_stats, cancel, frame_rate_rx, active_input_rx).await
         } else {
-            rtp_output_loop(&config, &mut rx, output_stats, cancel, frame_rate_rx, &events, av_sync_pacer, active_input_rx).await
+            rtp_output_loop(&config, &mut rx, output_stats, cancel, frame_rate_rx, &events, active_input_rx).await
         };
         if let Err(e) = result {
             tracing::error!("RTP output '{}' exited with error: {e}", config.id);
@@ -164,7 +163,6 @@ async fn rtp_output_loop(
     cancel: CancellationToken,
     frame_rate_rx: Option<tokio::sync::watch::Receiver<Option<f64>>>,
     events: &EventSender,
-    av_sync_pacer: Option<Arc<crate::engine::av_sync_mux::AvSyncPacer>>,
     active_input_rx: tokio::sync::watch::Receiver<String>,
 ) -> anyhow::Result<()> {
     let (socket, dest) =
@@ -299,7 +297,6 @@ async fn rtp_output_loop(
         config.video_encode.as_ref(),
         config.transcode.clone(),
         &stats,
-        av_sync_pacer.as_ref(),
         None, // RTP backpressure not yet wired
         Some(events),
     ) {
@@ -734,7 +731,6 @@ async fn rtp_output_redundant_loop(
     stats: Arc<OutputStatsAccumulator>,
     cancel: CancellationToken,
     frame_rate_rx: Option<tokio::sync::watch::Receiver<Option<f64>>>,
-    _av_sync_pacer: Option<Arc<crate::engine::av_sync_mux::AvSyncPacer>>,
     // Redundant 2022-7 path is passthrough-only (no replacers); the
     // input-switch watcher would have nothing to flip. Accepted for
     // signature parity with `rtp_output_loop`.

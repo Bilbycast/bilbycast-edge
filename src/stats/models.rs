@@ -1679,6 +1679,22 @@ pub struct EncodeStatsSnapshot {
     /// PMT was parsed (the pre-PMT gate). Absent when 0.
     #[serde(default, skip_serializing_if = "is_zero_u64")]
     pub pre_pmt_dropped_packets: u64,
+    /// Corrections the `TsAudioReplacer`'s source-timeline tracker applied
+    /// to hold the re-encoded audio to its source PTS: a gap filled with
+    /// silence (or a timestamp step on `media_player`), an overlap dropped.
+    /// A steady count on a live source means its audio clock is not locked
+    /// to its PCR. Absent when 0.
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub timeline_corrections: u64,
+    /// Samples (per channel, at the decoded rate) of silence the replacer
+    /// inserted: timeline gaps and access units that failed to decode.
+    /// Absent when 0.
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub silence_inserted_samples: u64,
+    /// Samples (per channel, at the decoded rate) the replacer dropped where
+    /// the source timeline overlapped audio already placed. Absent when 0.
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub dropped_samples: u64,
 }
 
 /// Per-output video encode snapshot. Mirrors `engine::ts_video_replace::VideoEncodeStats`

@@ -1522,8 +1522,8 @@ pub fn select_master_kind_for_input(
     // The previous default was `Passthrough` — a wallclock-equivalent
     // backend with a different tag. The new explicit Wallclock default
     // pairs with the encoder-style PTS regeneration work
-    // (`engine::ts_pts_rewriter` + `TsAudioReplacer::set_av_sync_pacer`):
-    // those callers anchor against `master.now_27mhz()` and need a
+    // (`engine::ts_pts_rewriter`): it anchors against
+    // `master.now_27mhz()` and needs a
     // monotonic, always-locked master. Wallclock satisfies both,
     // without a PLL that fails to lock on loop-every-30s contribution
     // sources (the failure mode that motivated this work — see

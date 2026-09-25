@@ -30,7 +30,7 @@ use std::sync::Arc;
 use crate::config::models::{AudioEncodeConfig, VideoEncodeConfig};
 
 use super::audio_transcode::TranscodeJson;
-use super::ts_audio_replace::{TsAudioReplaceError, TsAudioReplacer};
+use super::ts_audio_replace::{GapFill, TsAudioReplaceError, TsAudioReplacer};
 use super::ts_pcr_remux::TsPcrRemux;
 use super::ts_video_replace::{TsVideoReplaceError, TsVideoReplacer, VideoEncodeStats};
 
@@ -165,18 +165,16 @@ impl InputTranscoder {
         }))
     }
 
-    /// Attach the per-flow A/V sync pacer onto the audio replacer (no-op
-    /// without an audio stage), which uses the master clock for its
-    /// wallclock-aware catch-up. The video replacer takes no pacer: it
-    /// generates no PCR — the `ts_pcr_remux` stage re-stamps the input's
-    /// PCR, and the input's `ts_pts_rewriter` then anchors the whole stream
-    /// to the master clock in muxer mode.
-    pub fn set_av_sync_pacer(
-        &mut self,
-        pacer: Arc<crate::engine::av_sync_mux::AvSyncPacer>,
-    ) {
+    /// How the audio replacer fills a forward gap in the source audio
+    /// timeline (no-op without an audio stage). Only `media_player` asks
+    /// for [`GapFill::Relabel`]: its file splices step the PTS over
+    /// continuous content. Neither replacer takes the flow's A/V sync
+    /// pacer: they stamp source-relative PTS, the `ts_pcr_remux` stage
+    /// re-stamps the input's PCR, and the input's `ts_pts_rewriter` then
+    /// anchors the whole stream to the master clock in muxer mode.
+    pub fn set_audio_gap_fill(&mut self, fill: GapFill) {
         if let Some(a) = self.audio.as_mut() {
-            a.set_av_sync_pacer(pacer);
+            a.set_gap_fill(fill);
         }
     }
 
@@ -976,12 +974,14 @@ mod tests {
         assert_eq!(out_video_pid, 256, "video PID must be renamed to 256");
     }
 
-    /// Audio-only transcode (video and its PCR pass through): the replacer
-    /// emits PES k only when PES k+1 arrives, so against an unshifted PCR
-    /// its first frame would be late — measured on Sky, 3930 of 4016 PES.
-    /// The trailing PCR stage delays the PCR by the measured lateness plus
-    /// margin: no re-encoded PES is ever behind the PCR, and the PCR keeps
-    /// the input's positions and cadence.
+    /// Audio-only transcode (video and its PCR pass through). The replacer
+    /// used to emit PES k only when PES k+1 arrived, so against an unshifted
+    /// PCR its first frame was late — measured on Sky, 3930 of 4016 PES —
+    /// and the trailing PCR stage had to delay the PCR by that lateness. It
+    /// now re-encodes each AU as soon as it is complete, so the PES keep
+    /// their source lead and the PCR stage never needs more than its
+    /// initial 80 ms: no re-encoded PES is ever behind the PCR, and the PCR
+    /// keeps the input's positions and cadence.
     #[test]
     fn audio_only_transcode_keeps_every_re_encoded_pes_ahead_of_the_pcr() {
         use crate::engine::ts_parse::{
@@ -1031,7 +1031,7 @@ mod tests {
             events.push((at, vec![pcr_only_packet(0x100, 0, at, false)]));
         }
         // 7 AAC frames per PES (149.3 ms), each PES 100 ms ahead of the PCR:
-        // emitted when the next PES arrives, the first frame is ~50 ms late
+        // emitted when the next PES arrived, the first frame was ~50 ms late
         // against an unshifted PCR.
         let pes_27 = 7 * 1024 * 27_000_000u64 / 48_000;
         let mut acc = 0u8;
@@ -1055,7 +1055,7 @@ mod tests {
         }
 
         let d = t.pcr_stats().offset_27mhz.load(std::sync::atomic::Ordering::Relaxed);
-        assert!(d > 80 * MS, "the audio needed more than the initial 80 ms: {} ms", d / MS);
+        assert_eq!(d, 80 * MS, "the audio needs no more than the initial 80 ms: {} ms", d / MS);
         let mut last_pcr = None;
         let mut pcrs_out = Vec::new();
         let mut audio_pes = 0;

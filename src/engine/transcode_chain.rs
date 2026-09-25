@@ -340,9 +340,9 @@ impl TranscodeChain {
 }
 
 /// Build a `TranscodeChain` (if at least one of `audio_encode` /
-/// `video_encode` is set) and wire all the per-output stats handles
-/// + the optional A/V sync pacer through to the wrapped replacers
-/// **before** they move into the codec thread.
+/// `video_encode` is set) and wire all the per-output stats handles and
+/// event sinks through to the wrapped replacers **before** they move into
+/// the codec thread.
 ///
 /// Returns:
 /// - `Ok(None)` — neither audio_encode nor video_encode configured;
@@ -361,7 +361,6 @@ pub fn build_for_output(
     video_encode: Option<&crate::config::models::VideoEncodeConfig>,
     transcode: Option<crate::engine::audio_transcode::TranscodeJson>,
     stats: &Arc<crate::stats::collector::OutputStatsAccumulator>,
-    av_sync_pacer: Option<&Arc<crate::engine::av_sync_mux::AvSyncPacer>>,
     backpressure: Option<WireBackpressure>,
     event_sender: Option<&crate::manager::events::EventSender>,
 ) -> Result<Option<TranscodeChain>, TranscodeChainError> {
@@ -379,17 +378,17 @@ pub fn build_for_output(
             let mut r = TsAudioReplacer::new(enc, transcode)?;
             stats.set_audio_replacer_stats(r.stats_handle());
             stats.set_decode_stats(r.decode_stats_handle(), "", 0, 0);
-            // Attach the per-flow A/V sync pacer so the audio anchor on
-            // first PES + every >500 ms source-PTS discontinuity re-anchor
-            // pulls from the master clock instead of the raw source PTS.
-            // Mirrors the video wiring below; the 10 s safety check
-            // inside `TsAudioReplacer::anchor_target` keeps the existing
-            // anchor-to-source behaviour intact when master and source
-            // clocks are wildly uncorrelated (Wallclock master vs
-            // encoder-relative source PTS, PLL pre-lock garbage).
-            if let Some(p) = av_sync_pacer {
-                r.set_av_sync_pacer(p.clone());
-            }
+            // The encode snapshot is what carries the replacer's own
+            // counters (source PID, pre-PMT drops, timeline corrections):
+            // without this registration they never reached the output's
+            // stats. 0 = follows the source.
+            stats.set_encode_stats(
+                r.encode_stats_handle(),
+                enc.codec.clone(),
+                enc.sample_rate.unwrap_or(0),
+                enc.channels.unwrap_or(0),
+                r.bitrate_kbps(),
+            );
             r.set_av_skew_reporter(av_skew.clone());
             // Wire the engage watchdog so an audio_encode that never finds
             // a decodable audio ES (no PAT, an unparseable PMT, only DTS /
@@ -627,6 +626,41 @@ mod tests {
         };
         let audio = TsAudioReplacer::new(&cfg, None).expect("audio replacer build");
         TranscodeChain::new("test-audio-only", Some(audio), None, TsPcrRemux::new(), None)
+    }
+
+    /// An output that re-encodes audio surfaces the replacer's own counters
+    /// — source PID, pre-PMT drops, timeline corrections — on its
+    /// `audio_encode_stats` snapshot. Nothing registered that snapshot for
+    /// the TS outputs, so none of them ever reached the manager.
+    #[test]
+    fn a_re_encoding_output_surfaces_the_replacer_counters() {
+        let stats = Arc::new(crate::stats::collector::OutputStatsAccumulator::new(
+            "out".into(),
+            "out".into(),
+            "udp".into(),
+        ));
+        let cfg = AudioEncodeConfig {
+            codec: "mp2".to_string(),
+            bitrate_kbps: None,
+            sample_rate: Some(48_000),
+            channels: None,
+            silent_fallback: false,
+            source_audio_pid: None,
+            opus_vbr_mode: None,
+            opus_fec: false,
+            opus_dtx: false,
+            opus_frame_duration_ms: None,
+            ts_signalling: None,
+        };
+        let chain = build_for_output("out", Some(&cfg), None, None, &stats, None, None)
+            .unwrap()
+            .expect("an audio chain");
+        let ae = stats.snapshot().audio_encode_stats.expect("registered");
+        assert_eq!(ae.output_codec, "mp2");
+        assert_eq!(ae.target_sample_rate_hz, 48_000);
+        assert_eq!(ae.target_bitrate_kbps, 192, "the codec default");
+        assert_eq!(ae.timeline_corrections, 0);
+        drop(chain);
     }
 
     /// Construct + immediately drop. Verifies the codec thread sees
