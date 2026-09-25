@@ -330,6 +330,169 @@ pub fn resolve_rate_control(s: Option<&str>) -> VideoRateControl {
     }
 }
 
+// ───────────────────── Frame-rate measurement ─────────────────────
+
+/// Standard frame rates a measured cadence snaps to, as `(num, den)`.
+const STANDARD_FRAME_RATES: &[(u32, u32)] = &[
+    (24_000, 1001),
+    (24, 1),
+    (25, 1),
+    (30_000, 1001),
+    (30, 1),
+    (48, 1),
+    (50, 1),
+    (60_000, 1001),
+    (60, 1),
+    (100, 1),
+    (120_000, 1001),
+    (120, 1),
+    (25, 2),
+    (15, 1),
+    (12, 1),
+    (10, 1),
+];
+
+/// Relative distance within which a measured rate is taken to be a
+/// [`STANDARD_FRAME_RATES`] entry (0.1 %).
+const CADENCE_SNAP_TOLERANCE: f64 = 0.001;
+/// Deltas the meter keeps (the newest win).
+const CADENCE_WINDOW: usize = 32;
+/// Consecutive deltas the fast path needs to agree on.
+const CADENCE_FAST_DELTAS: usize = 4;
+/// Deltas the cadence path needs before it answers.
+const CADENCE_MIN_DELTAS: usize = 12;
+/// 33-bit PTS space.
+const PTS_MASK_33B: u64 = (1u64 << 33) - 1;
+
+/// Frame-rate meter over the presentation timestamps of **decoded
+/// frames** — the pictures an encoder is actually handed, one call per
+/// frame.
+///
+/// The TS video replacer used to take its encoder rate from the first
+/// PES DTS delta. That is the rate of *coded pictures*, which is the frame
+/// rate only when every picture is a frame: a PAFF H.264 or an MPEG-2
+/// field-picture source carries one field per PES, 1800 ticks apart at
+/// 25 Hz, while the decoder weaves each pair into one frame and the
+/// encoder is called 25 times a second. Locked at 50/1, libx264 then
+/// signalled 50 fps in the VUI, budgeted CBR for 50 frames a second (half
+/// the configured bitrate) and ran a 4 s default GOP.
+///
+/// Estimator, over the deltas between consecutive observed PTS (masked to
+/// 33 bits; a delta outside 90..=90 000 ticks is a discontinuity and is
+/// skipped):
+///
+/// - **fast path** — the last [`CADENCE_FAST_DELTAS`] deltas agree within
+///   `max(2 ticks, 0.5 %)`: their mean.
+/// - **cadence path** — otherwise, with at least [`CADENCE_MIN_DELTAS`]
+///   deltas: the median of the sums of every 4 consecutive deltas, over 4.
+///   A 4-delta window spans a whole 3:2 (period 2) or 2:3:3:2 (period 4)
+///   pulldown cycle, so soft-telecined film measures 24000/1001 rather
+///   than whichever of its 2- or 3-field steps came first; and one dropped
+///   frame moves only the 4 windows that contain it, which the median
+///   ignores.
+///
+/// The mean frame duration then snaps to the nearest
+/// [`STANDARD_FRAME_RATES`] entry within 0.1 %, else it is reported as
+/// `90000 / round(duration)`, reduced — a genuinely non-standard rate is
+/// never forced onto a standard one.
+///
+/// Only a decoder-carried timestamp is evidence: a frame without one (and
+/// a negative one) is ignored rather than stepped by a guess, which would
+/// only confirm the guess.
+#[derive(Debug, Clone, Default)]
+pub struct FrameCadence {
+    last_pts: Option<u64>,
+    deltas: std::collections::VecDeque<u64>,
+}
+
+impl FrameCadence {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Forget everything — a new source.
+    pub fn reset(&mut self) {
+        self.last_pts = None;
+        self.deltas.clear();
+    }
+
+    /// Feed one decoded frame's PTS (90 kHz, display order), exactly as
+    /// the decoder returned it: `None` (no timestamp) is ignored.
+    pub fn observe(&mut self, pts: Option<i64>) {
+        let Some(p) = pts.filter(|p| *p >= 0) else {
+            return;
+        };
+        let p = p as u64 & PTS_MASK_33B;
+        if let Some(last) = self.last_pts {
+            let delta = p.wrapping_sub(last) & PTS_MASK_33B;
+            if (90..=90_000).contains(&delta) {
+                if self.deltas.len() == CADENCE_WINDOW {
+                    self.deltas.pop_front();
+                }
+                self.deltas.push_back(delta);
+            }
+        }
+        self.last_pts = Some(p);
+    }
+
+    /// Deltas measured so far (at most [`CADENCE_WINDOW`]).
+    #[cfg(test)]
+    pub fn deltas_seen(&self) -> usize {
+        self.deltas.len()
+    }
+
+    /// Mean frame duration in 90 kHz ticks, or `None` until the meter can
+    /// say.
+    pub fn frame_duration_90k(&self) -> Option<f64> {
+        let n = self.deltas.len();
+        if n >= CADENCE_FAST_DELTAS {
+            let last: Vec<u64> = self.deltas.iter().skip(n - CADENCE_FAST_DELTAS).copied().collect();
+            let lo = *last.iter().min().expect("non-empty");
+            let hi = *last.iter().max().expect("non-empty");
+            let mean = last.iter().sum::<u64>() as f64 / CADENCE_FAST_DELTAS as f64;
+            if (hi - lo) as f64 <= (mean * 0.005).max(2.0) {
+                return Some(mean);
+            }
+        }
+        if n >= CADENCE_MIN_DELTAS {
+            let d: Vec<u64> = self.deltas.iter().copied().collect();
+            let mut sums: Vec<u64> = d.windows(4).map(|w| w.iter().sum()).collect();
+            sums.sort_unstable();
+            return Some(sums[sums.len() / 2] as f64 / 4.0);
+        }
+        None
+    }
+
+    /// The measured rate as `(num, den)`, snapped to a standard rate —
+    /// or `None` until the meter can say.
+    pub fn rate(&self) -> Option<(u32, u32)> {
+        self.frame_duration_90k().map(rate_from_frame_duration)
+    }
+}
+
+/// `90000 / duration_90k` as a frame rate: the nearest
+/// [`STANDARD_FRAME_RATES`] entry within [`CADENCE_SNAP_TOLERANCE`], else
+/// `90000 / round(duration)` reduced.
+pub fn rate_from_frame_duration(duration_90k: f64) -> (u32, u32) {
+    let fps = 90_000.0 / duration_90k;
+    if let Some(&(n, d)) = STANDARD_FRAME_RATES.iter().find(|(n, d)| {
+        let std = *n as f64 / *d as f64;
+        ((fps - std) / std).abs() <= CADENCE_SNAP_TOLERANCE
+    }) {
+        return (n, d);
+    }
+    let den = (duration_90k.round() as u64).max(1);
+    let g = gcd(90_000, den);
+    ((90_000 / g) as u32, (den / g) as u32)
+}
+
+fn gcd(mut a: u64, mut b: u64) -> u64 {
+    while b != 0 {
+        (a, b) = (b, a % b);
+    }
+    a.max(1)
+}
+
 /// Pick the [`video_codec::ScalerDstFormat`] that matches the encoder's
 /// configured chroma + bit depth, so the scaler's output is feedable
 /// directly into `VideoEncoder::encode_frame` without an extra repack.
@@ -536,6 +699,11 @@ impl ScaledVideoEncoder {
         self.fps_num = fps_num;
         self.fps_den = fps_den;
         true
+    }
+
+    /// The rate the encoder opens (or opened) at, `(num, den)`.
+    pub fn fps(&self) -> (u32, u32) {
+        (self.fps_num, self.fps_den)
     }
 
     /// Resolved output dimensions. Zero until [`Self::encode`] has been
@@ -1105,5 +1273,116 @@ mod preset_tests {
         for &p in &[Veryfast, Faster, Fast, Medium, Slow, Slower, Veryslow] {
             assert_eq!(sanitise_preset(H264Qsv, p), p);
         }
+    }
+}
+
+#[cfg(test)]
+mod cadence_tests {
+    use super::{rate_from_frame_duration, FrameCadence};
+
+    fn meter(steps: impl IntoIterator<Item = u64>, start: u64) -> FrameCadence {
+        let mut m = FrameCadence::new();
+        let mut pts = start;
+        m.observe(Some(pts as i64));
+        for s in steps {
+            pts = (pts + s) & ((1u64 << 33) - 1);
+            m.observe(Some(pts as i64));
+        }
+        m
+    }
+
+    /// The PAFF case: one PES per field (DTS step 1800) but the decoder
+    /// hands out one woven frame per field pair, 3600 ticks apart. The meter
+    /// sees only the frames, so it says 25, not 50.
+    #[test]
+    fn woven_field_pairs_measure_the_frame_rate() {
+        assert_eq!(meter([3_600; 4], 900_000).rate(), Some((25, 1)));
+        // Four deltas are the minimum: three say nothing yet.
+        assert_eq!(meter([3_600; 3], 900_000).rate(), None);
+    }
+
+    #[test]
+    fn standard_rates_snap() {
+        assert_eq!(meter([3_003; 6], 0).rate(), Some((30_000, 1001)));
+        assert_eq!(meter([1_800; 6], 0).rate(), Some((50, 1)), "HEVC field pictures");
+        assert_eq!(meter([1_501, 1_502, 1_501, 1_502, 1_501], 0).rate(), Some((60_000, 1001)));
+        assert_eq!(meter([3_753, 3_754, 3_754, 3_753], 0).rate(), Some((24_000, 1001)));
+        assert_eq!(meter([7_200; 5], 0).rate(), Some((25, 2)));
+    }
+
+    /// Soft-telecined film: decoded frames alternate a 3-field and a
+    /// 2-field display duration. The first delta alone would say 19.98 or
+    /// 29.97 (the old DTS lock's failure); the 4-delta windows say 23.976.
+    #[test]
+    fn pulldown_cadences_measure_the_film_rate() {
+        let three_two = [3_003u64, 4_505].iter().copied().cycle().take(13);
+        let m = meter(three_two, 1_000);
+        assert_eq!(m.rate(), Some((24_000, 1001)));
+        let two_three_three_two = [3_003u64, 4_505, 4_505, 3_003].iter().copied().cycle().take(13);
+        assert_eq!(meter(two_three_three_two, 1_000).rate(), Some((24_000, 1001)));
+        // Not enough of a pulldown cadence to call it yet.
+        let short = [3_003u64, 4_505].iter().copied().cycle().take(11);
+        assert_eq!(meter(short, 1_000).rate(), None);
+    }
+
+    /// One dropped frame (a 7200 step) inside a 25 fps run moves only the
+    /// windows that contain it.
+    #[test]
+    fn a_single_gap_does_not_move_the_rate() {
+        let mut steps = vec![3_600u64; 6];
+        steps.push(7_200);
+        steps.extend([3_600u64; 2]);
+        // The gap is inside the last four deltas: the fast path declines,
+        // the cadence path does not have 12 deltas yet.
+        assert_eq!(meter(steps.clone(), 0).rate(), None);
+        // Twelve deltas with the gap still among the last four: the
+        // cadence path's median ignores the two windows that hold it.
+        let mut steps = vec![3_600u64; 10];
+        steps.extend([7_200, 3_600]);
+        let m = meter(steps.clone(), 0);
+        assert_eq!(m.frame_duration_90k(), Some(3_600.0));
+        assert_eq!(m.rate(), Some((25, 1)));
+        // ...and once past it, four agreeing deltas answer at once.
+        steps.extend([3_600u64; 3]);
+        assert_eq!(meter(steps, 0).rate(), Some((25, 1)));
+    }
+
+    #[test]
+    fn a_wrap_across_2_pow_33_is_a_forward_step() {
+        let top = (1u64 << 33) - 5_000;
+        let m = meter([3_600; 5], top);
+        assert_eq!(m.deltas_seen(), 5);
+        assert_eq!(m.rate(), Some((25, 1)));
+    }
+
+    /// Constant, zero, backward and missing timestamps are not evidence.
+    #[test]
+    fn no_rate_without_real_advancing_timestamps() {
+        assert_eq!(meter([0; 20], 90_000).rate(), None, "constant PTS");
+        let mut m = FrameCadence::new();
+        for _ in 0..60 {
+            m.observe(None);
+            m.observe(Some(-1));
+        }
+        assert_eq!(m.rate(), None, "NOPTS frames");
+        assert_eq!(m.deltas_seen(), 0);
+        // A step back or one over a second is a discontinuity, skipped.
+        let mut m = meter([3_600; 3], 900_000);
+        m.observe(Some(10));
+        m.observe(Some(10 + 200_000));
+        assert_eq!(m.deltas_seen(), 3);
+        assert_eq!(m.rate(), None);
+        m.reset();
+        assert_eq!(m.deltas_seen(), 0);
+    }
+
+    /// A rate no standard is within 0.1 % of is reported as measured.
+    #[test]
+    fn a_non_standard_rate_is_not_forced() {
+        assert_eq!(rate_from_frame_duration(7_000.0), (90, 7));
+        assert_eq!(meter([6_000; 4], 0).rate(), Some((15, 1)));
+        assert_eq!(meter([5_000; 4], 0).rate(), Some((18, 1)));
+        // 0.2 % off 25 fps: not snapped.
+        assert_eq!(rate_from_frame_duration(3_608.0), (11_250, 451));
     }
 }

@@ -424,7 +424,7 @@ mod inner {
         parse_pmt, pmt_index, rebuild_pmt_section, EsEdit, OutVersion, PmtEdit, PsiUnit,
         PsiUnitStage,
     };
-    use crate::engine::video_encode_util::ScaledVideoEncoder;
+    use crate::engine::video_encode_util::{FrameCadence, ScaledVideoEncoder};
     use video_codec::{VideoCodec, VideoEncoderCodec};
     use video_engine::VideoDecoder;
 
@@ -469,10 +469,15 @@ mod inner {
     /// before [`Inner::check_decode_stall`] declares a decode stall. Sized
     /// comfortably above every legitimate transient where output lags input
     /// (first-IDR wait, B-frame reorder, the deferred-encoder-open window of
-    /// ~60 PES) so the watchdog never false-fires at startup or across an
-    /// input switch. Matches the ST 2110 egress watchdog's precedent
-    /// (`EGRESS_DECODE_STALL_AUS = 200`): ~4 s at 50 fps, ~8 s at 25 fps.
+    /// at most [`UNLOCKED_FRAME_CAP`] frames) so the watchdog never
+    /// false-fires at startup or across an input switch. Matches the ST 2110
+    /// egress watchdog's precedent (`EGRESS_DECODE_STALL_AUS = 200`): ~4 s at
+    /// 50 fps, ~8 s at 25 fps.
     const DECODE_STALL_INPUT_FRAMES: u64 = 200;
+
+    /// Decoded frames the replacer waits for a measurable rate before it
+    /// opens the encoder at the fallback rate (~2 s of broadcast video).
+    const UNLOCKED_FRAME_CAP: u32 = 60;
 
     pub struct Inner {
         #[allow(dead_code)]
@@ -520,7 +525,7 @@ mod inner {
         /// handles the `video_encode.width` / `.height` override by
         /// scaling the decoded frame to the target resolution instead
         /// of letting libavcodec silently crop.
-        pipeline: ScaledVideoEncoder,
+        pub(super) pipeline: ScaledVideoEncoder,
 
         pub(super) out_video_cc: u8,
         /// PTS anchor in the encoder time base (1 / fps_num).
@@ -530,7 +535,6 @@ mod inner {
         /// is empty (e.g. encoder catch-up bursts).
         pts_90k: u64,
         pts_anchored: bool,
-        pub(super) pts_step_90k: u64,
         /// Source PES PTSes pending output, one entry per source decoded
         /// frame fed into the encoder. Drained in FIFO order on each
         /// emitted output frame, so output PES PTS values track source's
@@ -545,27 +549,40 @@ mod inner {
         /// frame's `dts`-ordered position).
         pub(super) src_pts_queue: std::collections::VecDeque<u64>,
 
-        /// Last input PES DTS, used to derive the natural source
-        /// inter-frame delta in decode order. DTS stays monotonic
-        /// across the input PES stream even when the source has
-        /// B-frames (PTS reorders, DTS does not), so the delta is
-        /// the source frame rate.
+        /// Frame-rate meter over the decoder's frame PTS — what the
+        /// encoder is actually called with, once per frame. The rate
+        /// is never taken from PES DTS: a field-coded source (PAFF
+        /// H.264, MPEG-2 field pictures) carries one field per PES, so
+        /// its DTS step is the FIELD rate while the decoder hands out
+        /// woven frames at half of it. See [`FrameCadence`].
+        cadence: FrameCadence,
+        /// True once the encoder rate is known — pinned by the
+        /// operator, measured by [`Self::cadence`], or the encoder is
+        /// already open (an input switch: libavcodec's time base cannot
+        /// change). Until then decoded frames are dropped before the
+        /// encoder, which cannot open without a rate.
+        pub(super) source_fps_locked: bool,
+        /// Decoded frames dropped while the rate was unknown. After
+        /// [`UNLOCKED_FRAME_CAP`] the fallback rate is taken, so a source
+        /// whose frames carry no usable PTS still gets an encoder.
+        unlocked_frames: u32,
+        /// Last input PES DTS (or PTS when the PES has no DTS) and the
+        /// last delta between two within 90..=90 000 ticks — the coded
+        /// PICTURE rate, used only by the fallback, divided by the
+        /// PES-per-frame ratio below.
         last_input_dts: Option<u64>,
-        /// True once we've measured the source fps and pushed it into
-        /// the encoder pipeline (a no-op once the encoder has opened).
-        source_fps_locked: bool,
-        /// One-shot guard against log spam when the measured source
-        /// rate disagrees with the operator-pinned
-        /// `video_encode.fps_num` / `fps_den`. The mismatch is
+        pub(super) pes_dts_step_90k: Option<u64>,
+        /// Video PES consumed and frames decoded since the last source
+        /// reset: their ratio is 2 on a field-coded source.
+        pub(super) pes_since_reset: u64,
+        pub(super) frames_since_reset: u64,
+        /// One-shot guard for `video_encode_fps_mismatch` (the measured
+        /// rate disagrees with the rate the encoder runs at: a pinned
+        /// `video_encode.fps_num` / `fps_den`, or the rate an earlier
+        /// source opened it at). Re-armed per source. The mismatch is
         /// load-bearing — A/V sync drift on cellPTP24 (ESPN.ts NTSC
-        /// 29.97 fps + pinned 25/1) traced to this. Emitted at most
-        /// once per encoder run.
+        /// 29.97 fps + pinned 25/1) traced to it.
         fps_mismatch_warned: bool,
-        /// PES frames consumed without yet locking the source rate.
-        /// After a hard cap we accept the placeholder rate so a
-        /// pathological source (no DTS, all-zero PTS) can't stall the
-        /// encoder forever.
-        unlocked_pes_count: u32,
 
         description: String,
         stats: Arc<VideoEncodeStats>,
@@ -747,12 +764,15 @@ mod inner {
                 out_frame_count: 0,
                 pts_90k: 0,
                 pts_anchored: false,
-                pts_step_90k: 3000, // 30 fps default until we learn otherwise
                 src_pts_queue: std::collections::VecDeque::with_capacity(64),
-                last_input_dts: None,
+                cadence: FrameCadence::new(),
                 source_fps_locked: cfg.fps_num.is_some() && cfg.fps_den.is_some(),
+                unlocked_frames: 0,
+                last_input_dts: None,
+                pes_dts_step_90k: None,
+                pes_since_reset: 0,
+                frames_since_reset: 0,
                 fps_mismatch_warned: false,
-                unlocked_pes_count: 0,
                 description,
                 stats,
                 decode_stats,
@@ -822,9 +842,20 @@ mod inner {
             // re-anchor on the audio-PID codec swap).
             self.pts_anchored = false;
             self.src_pts_queue.clear();
+            // A new source measures its own rate. An encoder that is
+            // already open keeps the rate it opened at (libavcodec's time
+            // base is fixed), so its frames flow at once; the meter keeps
+            // running and `check_rate` says so if the new source's rate
+            // differs.
+            self.cadence.reset();
+            self.source_fps_locked =
+                (self.fps_num.is_some() && self.fps_den.is_some()) || self.pipeline.is_open();
+            self.unlocked_frames = 0;
             self.last_input_dts = None;
-            self.source_fps_locked = self.fps_num.is_some() && self.fps_den.is_some();
-            self.unlocked_pes_count = 0;
+            self.pes_dts_step_90k = None;
+            self.pes_since_reset = 0;
+            self.frames_since_reset = 0;
+            self.fps_mismatch_warned = false;
             // First post-switch encoded frame must be an IDR so receivers
             // get a clean entry point right at the switch boundary.
             self.force_idr.store(true, Ordering::Relaxed);
@@ -1215,7 +1246,7 @@ mod inner {
 
         /// Step a PTS-less frame advances by: the measured interval between
         /// admitted frames, else the pinned frame rate, else 25 fps. Never
-        /// `pts_step_90k`, which is the per-FIELD DTS delta on PAFF.
+        /// the PES DTS step, which is the per-FIELD delta on PAFF.
         fn frame_interval_90k(&self) -> u64 {
             if let Some(i) = self.decoded_interval_90k {
                 return i;
@@ -1333,107 +1364,28 @@ mod inner {
                     return Err(());
                 }
             };
-            // When source has no DTS (PTS_DTS_flags = 0b10), PTS itself
-            // is monotonic — no B-frame reorder — so use it for the rate
-            // measurement.
-            let pes_dts = pes_dts.or(Some(pts));
-            self.pending_pts = Some(pts);
+            // When the source has no DTS (PTS_DTS_flags = 0b10), PTS itself
+            // is the decode timestamp.
+            let pes_dts = pes_dts.or(pts);
+            self.pending_pts = pts;
             let pes_arrived_us = crate::util::time::now_us();
 
-            if !self.pts_anchored {
-                self.pts_90k = pts;
+            if !self.pts_anchored
+                && let Some(p) = pts
+            {
+                self.pts_90k = p;
                 self.pts_anchored = true;
             }
 
-            // Measure the natural source frame interval from DTS deltas.
-            // DTS is monotonic in the input PES stream even when the
-            // source has B-frames (PTS reorders, DTS does not), so the
-            // first valid delta = the source frame rate. Lock that into
-            // the encoder's fps before it lazy-opens — libavcodec's
-            // time-base is immutable post-open — so the encoded output's
-            // CFR spacing matches the source. Without this, the encoder
-            // ran at a 30 fps default for any source whose rate the
-            // operator didn't pin in `video_encode.fps_num`, which is
-            // what produced the user-visible jitter and frame skipping
-            // on 25 fps and 50 fps DVB feeds.
+            // The coded-picture step, for the fallback rate only (see
+            // `fallback_rate`): on a field-coded source it is the FIELD
+            // step. The encoder rate is measured from decoded frames.
+            self.pes_since_reset += 1;
             if let Some(dts) = pes_dts {
-                if let Some(prev_dts) = self.last_input_dts {
-                    let delta = dts.wrapping_sub(prev_dts);
+                if let Some(prev) = self.last_input_dts {
+                    let delta = dts.wrapping_sub(prev) & PTS_MASK_33B;
                     if (90..=90_000).contains(&delta) {
-                        self.pts_step_90k = delta;
-                        if !self.source_fps_locked {
-                            let fps_num = 90_000u32;
-                            let fps_den = delta as u32;
-                            let locked = self.pipeline.set_fps_if_unopened(fps_num, fps_den);
-                            tracing::info!(
-                                "ts_video_replace: source fps measured {}/{} ({:.3} fps) from DTS delta {} — encoder lock {}",
-                                fps_num,
-                                fps_den,
-                                fps_num as f64 / fps_den as f64,
-                                delta,
-                                if locked { "ACQUIRED" } else { "MISSED (encoder already opened)" },
-                            );
-                            self.source_fps_locked = true;
-                        } else if let (Some(n), Some(d)) = (self.fps_num, self.fps_den) {
-                            // Operator pinned `video_encode.fps_num` /
-                            // `fps_den` — but the measured source rate
-                            // (DTS delta) disagrees. The encoder runs at
-                            // the operator's time_base; the wire PES PTS
-                            // values come from `src_pts_queue` (= source
-                            // rate). When they disagree, A/V sync drifts
-                            // by the rate ratio bias — observed on
-                            // ESPN.ts NTSC 29.97 fps with operator-pinned
-                            // 25 fps (cellPTP24 / v3 report). One-shot
-                            // log per encoder run when the mismatch is
-                            // outside 0.1 % to avoid log spam on
-                            // VFR sources with steady-state jitter.
-                            let measured_fps = 90_000.0_f64 / delta as f64;
-                            let pinned_fps = n as f64 / d.max(1) as f64;
-                            let ratio = measured_fps / pinned_fps;
-                            let off_pct = (ratio - 1.0).abs() * 100.0;
-                            if off_pct > 0.1 && !self.fps_mismatch_warned {
-                                // Default GOP when the operator left
-                                // `gop_size` unset — mirrors
-                                // `video_encode_util::build_encoder_config`
-                                // exactly, integer division included.
-                                let default_gop_frames = 2 * (n / d.max(1)).max(1);
-                                tracing::warn!(
-                                    error_code = "video_encode_fps_mismatch",
-                                    measured_fps = format!("{:.3}", measured_fps),
-                                    pinned_fps_num = n,
-                                    pinned_fps_den = d,
-                                    pinned_fps = format!("{:.3}", pinned_fps),
-                                    // Field name is published in
-                                    // docs/events-and-alarms.md and may back
-                                    // out-of-tree alerting rules — do not
-                                    // rename it. `bitrate_multiplier` is
-                                    // additive alongside it.
-                                    drift_pct = format!("{:.2}", off_pct),
-                                    bitrate_multiplier = format!("{:.2}", ratio),
-                                    "ts_video_replace: source fps ({:.3}) disagrees \
-                                     with `video_encode.fps_num`/`fps_den` \
-                                     ({}/{} = {:.3}). Every source frame is still \
-                                     encoded and output PES PTS still carry the \
-                                     source clock, so this does not cause a \
-                                     proportional lipsync drift on this path — but \
-                                     the encoder is tuned for the wrong rate: actual \
-                                     bitrate runs ~{:.2}x the configured value, and \
-                                     a default GOP of {} frames spans {:.2}s instead \
-                                     of the intended 2s. Remove the pinned fps to let \
-                                     the encoder auto-lock to the source rate, or \
-                                     set it to match the source (e.g. 30000/1001 \
-                                     for NTSC 29.97).",
-                                    measured_fps,
-                                    n,
-                                    d,
-                                    pinned_fps,
-                                    ratio,
-                                    default_gop_frames,
-                                    default_gop_frames as f64 / measured_fps,
-                                );
-                                self.fps_mismatch_warned = true;
-                            }
-                        }
+                        self.pes_dts_step_90k = Some(delta);
                     }
                 }
                 self.last_input_dts = Some(dts);
@@ -1497,56 +1449,18 @@ mod inner {
                 // it back via `frame.pts()`. That lets the encoder-side
                 // queue tag every output PES with the matching source
                 // PTS instead of the sample-counted anchor — see the
-                // src_pts_queue field for the rationale.
+                // src_pts_queue field for the rationale. A PES without a
+                // PTS goes in without one, so its frame carries none and
+                // is neither measured nor admitted as a real timestamp.
                 self.decode_stats.inc_input();
-                if let Err(e) = dec.send_packet_with_pts(&es_data, pts as i64) {
+                let sent = match pts {
+                    Some(p) => dec.send_packet_with_pts(&es_data, p as i64),
+                    None => dec.send_packet(&es_data),
+                };
+                if let Err(e) = sent {
                     // Partial/invalid packet — keep going.
                     self.decode_stats.inc_error();
                     tracing::debug!("ts_video_replace: send_packet: {e:?}");
-                }
-            }
-
-            // If the operator pinned an fps in the config, that wins
-            // over the measured delta — keep the step in lock-step
-            // with whatever rate the encoder was opened at. (When the
-            // operator left fps_num/fps_den unset, `pts_step_90k` was
-            // already updated above from the observed source delta.)
-            if let (Some(n), Some(d)) = (self.fps_num, self.fps_den) {
-                self.pts_step_90k = (90_000u64 * d as u64) / (n.max(1) as u64);
-            }
-
-            // Defer the encoder drain until we have either an operator
-            // override or two source DTS samples — the second sample is
-            // what lets us lock libavcodec's time-base before the
-            // encoder lazy-opens (post-open, the time-base is immutable
-            // and we'd be stuck at the 30 fps placeholder forever).
-            // We still pull frames out of the decoder so its DPB doesn't
-            // back up — discarding the first frame or two is fine, the
-            // encoder force-IDR flag (already raised on construction +
-            // every input switch) ensures the first encoded frame at
-            // post-lock time is a clean entry point.
-            if !self.source_fps_locked {
-                self.unlocked_pes_count = self.unlocked_pes_count.saturating_add(1);
-                // Hard fallback: a pathological source with no DTS and
-                // bogus PTS would keep us from ever locking. After 60
-                // PES (~2 s of typical broadcast video) accept the
-                // 30 fps placeholder so the encoder finally opens and
-                // the operator gets visible output instead of silent
-                // black. Logged loudly so the symptom — "30 fps output
-                // for an N fps source" — is searchable in the field.
-                if self.unlocked_pes_count >= 60 {
-                    tracing::warn!(
-                        "ts_video_replace: source rate not measurable from {} input PES (no usable DTS / PTS deltas) — falling back to 30 fps placeholder; output cadence will not track source",
-                        self.unlocked_pes_count,
-                    );
-                    self.source_fps_locked = true;
-                } else {
-                    if let Some(dec) = self.decoder.as_mut() {
-                        while dec.receive_frame().is_ok() {
-                            self.decode_stats.inc_output();
-                        }
-                    }
-                    return Ok(());
                 }
             }
 
@@ -1557,6 +1471,7 @@ mod inner {
                     Err(_) => break,
                 };
                 self.decode_stats.inc_output();
+                self.frames_since_reset += 1;
 
                 // Monotonic admission BEFORE anything else: a frame whose
                 // PTS does not advance past the last admitted one (within
@@ -1564,9 +1479,26 @@ mod inner {
                 // it here keeps the PTS queue balanced (never pushed), and
                 // leaves a pending force-IDR and the frame counter for the
                 // next admitted frame.
-                let Some(src_pts_for_frame) = self.admit_decoded(frame.pts()) else {
+                let decoder_pts = frame.pts();
+                let Some(src_pts_for_frame) = self.admit_decoded(decoder_pts) else {
                     continue;
                 };
+
+                // The encoder rate: measured from the frames the encoder is
+                // handed, once per frame. Until it is known the encoder
+                // cannot open (libavcodec's time base is fixed at open), so
+                // the frame is dropped; the force-IDR request (raised at
+                // construction and on every reset) waits for the first
+                // frame encoded after the lock.
+                self.cadence.observe(decoder_pts);
+                if !self.source_fps_locked {
+                    if !self.try_lock_rate() {
+                        continue;
+                    }
+                } else {
+                    self.check_rate();
+                }
+
                 // Push the source PTS into the FIFO queue so the emit
                 // path can pop it for each output PES. The decoder
                 // propagates `pkt.pts → frame.pts` through its reorder
@@ -1625,6 +1557,154 @@ mod inner {
             }
 
             Ok(())
+        }
+
+        /// Video PES per decoded frame since the last reset — 2 on a
+        /// field-coded (PAFF / field-picture) source, 1 otherwise.
+        fn pes_per_frame(&self) -> f64 {
+            self.pes_since_reset as f64 / self.frames_since_reset.max(1) as f64
+        }
+
+        /// Lock the encoder rate for an unpinned source once
+        /// [`FrameCadence`] can say it, or at the fallback after
+        /// [`UNLOCKED_FRAME_CAP`] decoded frames. Returns whether the rate
+        /// is now locked (the frame in hand is then the first one
+        /// encoded).
+        pub(super) fn try_lock_rate(&mut self) -> bool {
+            self.unlocked_frames = self.unlocked_frames.saturating_add(1);
+            let (n, d, from) = match self.cadence.rate() {
+                Some((n, d)) => (n, d, "decoded-frame cadence"),
+                None if self.unlocked_frames >= UNLOCKED_FRAME_CAP => {
+                    let (n, d) = self.fallback_rate();
+                    tracing::warn!(
+                        "ts_video_replace: source frame rate not measurable from {} decoded \
+                         frames (no usable frame PTS) — opening the encoder at {n}/{d}, {} \
+                         (output cadence may not track the source)",
+                        self.unlocked_frames,
+                        if self.pes_dts_step_90k.is_some() {
+                            "the PES DTS step over the PES-per-frame ratio"
+                        } else {
+                            "the 30 fps placeholder"
+                        },
+                    );
+                    (n, d, "fallback")
+                }
+                None => return false,
+            };
+            let acquired = self.pipeline.set_fps_if_unopened(n, d);
+            let pes_per_frame = self.pes_per_frame();
+            tracing::info!(
+                "ts_video_replace: source fps {n}/{d} ({:.3} fps) from {from}, {pes_per_frame:.2} \
+                 PES per decoded frame{} — encoder lock {}",
+                n as f64 / d.max(1) as f64,
+                if pes_per_frame > 1.5 { " (field-coded: one field per PES)" } else { "" },
+                if acquired { "ACQUIRED" } else { "MISSED (encoder already open)" },
+            );
+            self.source_fps_locked = true;
+            true
+        }
+
+        /// The rate when the cadence cannot be measured: the PES DTS step
+        /// times the rounded PES-per-frame ratio (a field-coded source's
+        /// step is a field), else 30/1.
+        pub(super) fn fallback_rate(&self) -> (u32, u32) {
+            match self.pes_dts_step_90k {
+                Some(step) => {
+                    let per_frame = self.pes_per_frame().round().max(1.0);
+                    crate::engine::video_encode_util::rate_from_frame_duration(
+                        step as f64 * per_frame,
+                    )
+                }
+                None => (30, 1),
+            }
+        }
+
+        /// The measured rate against the rate the encoder runs at — a
+        /// pinned `fps_num` / `fps_den`, or the rate an earlier source
+        /// opened it at (an input switch cannot reopen it). One warning
+        /// per source when they differ by more than 0.1 %.
+        pub(super) fn check_rate(&mut self) {
+            if self.fps_mismatch_warned {
+                return;
+            }
+            let Some((mn, md)) = self.cadence.rate() else {
+                return;
+            };
+            let (en, ed) = self.pipeline.fps();
+            let measured_fps = mn as f64 / md.max(1) as f64;
+            let encoder_fps = en as f64 / ed.max(1) as f64;
+            let ratio = measured_fps / encoder_fps;
+            let off_pct = (ratio - 1.0).abs() * 100.0;
+            if off_pct <= 0.1 {
+                return;
+            }
+            self.fps_mismatch_warned = true;
+            // Default GOP when the operator left `gop_size` unset — mirrors
+            // `video_encode_util::build_encoder_config` exactly, integer
+            // division included.
+            let default_gop_frames = 2 * (en / ed.max(1)).max(1);
+            if let (Some(n), Some(d)) = (self.fps_num, self.fps_den) {
+                // Operator pinned `video_encode.fps_num` / `fps_den` — but
+                // the measured source rate disagrees. The encoder runs at
+                // the operator's time_base; the wire PES PTS values come
+                // from `src_pts_queue` (= source rate). Observed on ESPN.ts
+                // NTSC 29.97 fps with operator-pinned 25 fps (cellPTP24 / v3
+                // report).
+                tracing::warn!(
+                    error_code = "video_encode_fps_mismatch",
+                    cause = "pinned",
+                    measured_fps = format!("{:.3}", measured_fps),
+                    pinned_fps_num = n,
+                    pinned_fps_den = d,
+                    pinned_fps = format!("{:.3}", encoder_fps),
+                    // Field name is published in docs/events-and-alarms.md
+                    // and may back out-of-tree alerting rules — do not
+                    // rename it. `bitrate_multiplier` is additive alongside
+                    // it.
+                    drift_pct = format!("{:.2}", off_pct),
+                    bitrate_multiplier = format!("{:.2}", ratio),
+                    "ts_video_replace: source fps ({:.3}) disagrees \
+                     with `video_encode.fps_num`/`fps_den` \
+                     ({}/{} = {:.3}). Every source frame is still \
+                     encoded and output PES PTS still carry the \
+                     source clock, so this does not cause a \
+                     proportional lipsync drift on this path — but \
+                     the encoder is tuned for the wrong rate: actual \
+                     bitrate runs ~{:.2}x the configured value, and \
+                     a default GOP of {} frames spans {:.2}s instead \
+                     of the intended 2s. Remove the pinned fps to let \
+                     the encoder auto-lock to the source rate, or \
+                     set it to match the source (e.g. 30000/1001 \
+                     for NTSC 29.97).",
+                    measured_fps,
+                    n,
+                    d,
+                    encoder_fps,
+                    ratio,
+                    default_gop_frames,
+                    default_gop_frames as f64 / measured_fps,
+                );
+            } else {
+                tracing::warn!(
+                    error_code = "video_encode_fps_mismatch",
+                    cause = "input_switch",
+                    measured_fps = format!("{:.3}", measured_fps),
+                    encoder_fps_num = en,
+                    encoder_fps_den = ed,
+                    drift_pct = format!("{:.2}", off_pct),
+                    bitrate_multiplier = format!("{:.2}", ratio),
+                    "ts_video_replace: encoder lock MISSED — this source runs at {:.3} fps but \
+                     the encoder opened at {en}/{ed} ({:.3} fps) for an earlier one and cannot \
+                     reopen at a new rate. Every frame is still encoded and output PES PTS \
+                     carry the source clock, but the bitrate runs ~{:.2}x the configured value \
+                     and the SPS VUI advertises {:.3} fps. Restart the output to lock the new \
+                     rate, or pin video_encode.fps_num / fps_den.",
+                    measured_fps,
+                    encoder_fps,
+                    ratio,
+                    encoder_fps,
+                );
+            }
         }
     }
 
@@ -1707,9 +1787,11 @@ fn select_video_es(
     sel
 }
 
-/// Extract the ES payload and PTS from a complete PES packet.
+/// Extract the ES payload, PTS and DTS from a complete PES packet. The PTS
+/// is `None` when the PES carries none (PTS_DTS_flags `0b00`): it must not
+/// reach the decoder as a real timestamp of 0.
 #[cfg(feature = "media-codecs")]
-fn extract_pes_video(pes: &[u8]) -> Option<(Vec<u8>, u64, Option<u64>)> {
+fn extract_pes_video(pes: &[u8]) -> Option<(Vec<u8>, Option<u64>, Option<u64>)> {
     if pes.len() < 9 || pes[0] != 0x00 || pes[1] != 0x00 || pes[2] != 0x01 {
         return None;
     }
@@ -1719,11 +1801,7 @@ fn extract_pes_video(pes: &[u8]) -> Option<(Vec<u8>, u64, Option<u64>)> {
         return None;
     }
     let pts_dts_flags = (pes[7] >> 6) & 0x03;
-    let pts = if pts_dts_flags >= 2 && pes.len() >= 14 {
-        parse_pts(&pes[9..14])
-    } else {
-        0
-    };
+    let pts = (pts_dts_flags >= 2 && pes.len() >= 14).then(|| parse_pts(&pes[9..14]));
     // PTS_DTS_flags == 0b11 means PTS+DTS both present; DTS sits at
     // bytes 14..19. Otherwise DTS == PTS (monotonic, no B-frames in
     // source) — return None so the caller doesn't double-count the
@@ -2570,7 +2648,6 @@ mod tests {
         assert_eq!(st.dropped_frames.load(Ordering::Relaxed), 1);
         // A PTS-less frame steps by the measured frame interval (3600, not
         // the per-field DTS delta).
-        r.inner.pts_step_90k = 1_800;
         assert_eq!(r.inner.admit_decoded(None), Some(97_200));
     }
 
@@ -2603,5 +2680,225 @@ mod tests {
             r.inner.admit_decoded(Some(p));
         }
         assert_eq!(r.inner.admit_decoded(None), Some(97_200 + 45_000 + 3_600));
+    }
+
+    /// A PES without a PTS (PTS_DTS_flags 0b00) must not reach the decoder
+    /// as a real timestamp of 0: the frame would carry PTS 0, which both the
+    /// rate meter and frame admission read as a real timestamp.
+    #[test]
+    fn a_pes_without_pts_has_no_pts() {
+        let pes = [0x00, 0x00, 0x01, 0xE0, 0, 0, 0x80, 0x00, 0x00, 0, 0, 0, 1, 0x09, 0xF0];
+        let (es, pts, dts) = extract_pes_video(&pes).unwrap();
+        assert_eq!((pts, dts), (None, None));
+        assert_eq!(es, &pes[9..]);
+        let with = build_video_pes(&[0, 0, 0, 1, 0x09, 0xF0], 123_456);
+        assert_eq!(extract_pes_video(&with).unwrap().1, Some(123_456));
+    }
+
+    /// The fallback when frames carry no usable PTS: the PES DTS step is a
+    /// field on a field-coded source, so it is multiplied by the rounded
+    /// PES-per-frame ratio; with no DTS either, 30 fps.
+    #[test]
+    fn the_fallback_rate_turns_a_field_step_into_a_frame_rate() {
+        let mut r = TsVideoReplacer::new(&cfg("x264"), None).unwrap();
+        assert_eq!(r.inner.fallback_rate(), (30, 1));
+        r.inner.pes_dts_step_90k = Some(1_800);
+        r.inner.pes_since_reset = 121;
+        r.inner.frames_since_reset = 60;
+        assert_eq!(r.inner.fallback_rate(), (25, 1));
+        r.inner.pes_since_reset = 62;
+        assert_eq!(r.inner.fallback_rate(), (50, 1), "one PES per frame: 50p");
+        r.inner.pes_dts_step_90k = Some(3_003);
+        assert_eq!(r.inner.fallback_rate(), (30_000, 1001));
+    }
+
+    // ── Encoder rate from decoded frames (5a) and friends, through a real
+    //    decoder and libx264 ──
+
+    #[cfg(feature = "video-encoder-x264")]
+    mod x264 {
+        use super::*;
+        use video_codec::{VideoEncoderCodec, VideoEncoderConfig, VideoFieldOrder, VideoPreset};
+
+        /// `n` libx264 access units (Annex B, SPS/PPS in-band on every IDR)
+        /// of a moving pattern at 25 fps.
+        pub(super) fn x264_aus(
+            n: usize,
+            (w, h): (u32, u32),
+            field_order: Option<VideoFieldOrder>,
+            sar: Option<(u32, u32)>,
+        ) -> Vec<Vec<u8>> {
+            let mut enc = video_engine::VideoEncoder::open(&VideoEncoderConfig {
+                codec: VideoEncoderCodec::X264,
+                width: w,
+                height: h,
+                fps_num: 25,
+                fps_den: 1,
+                bitrate_kbps: 1_500,
+                gop_size: 25,
+                preset: VideoPreset::Veryfast,
+                global_header: false,
+                field_order,
+                sample_aspect_ratio: sar,
+                ..VideoEncoderConfig::default()
+            })
+            .expect("libx264 opens");
+            let (wu, hu) = (w as usize, h as usize);
+            let mut aus = Vec::new();
+            for i in 0..n {
+                // Lines of the two fields differ, and move, so a woven
+                // frame is not accidentally progressive content.
+                let y: Vec<u8> = (0..wu * hu)
+                    .map(|k| {
+                        let (x, row) = (k % wu, k / wu);
+                        ((x + 3 * i + if row % 2 == 1 { 40 } else { 0 }) % 220) as u8 + 16
+                    })
+                    .collect();
+                let c = vec![128u8; wu / 2 * hu / 2];
+                for ef in enc.encode_frame(&y, wu, &c, wu / 2, &c, wu / 2, Some(i as i64)).unwrap() {
+                    aus.push(ef.data);
+                }
+            }
+            for ef in enc.flush().unwrap() {
+                aus.push(ef.data);
+            }
+            aus
+        }
+
+        /// TS: PAT, PMT (H.264 on 0x100), then one PES per access unit at
+        /// 25 fps. With `field_pes`, every picture is followed by a second
+        /// PES 1800 ticks later carrying only an access-unit delimiter —
+        /// the PES cadence of a PAFF source (one field per PES) while the
+        /// decoder hands out one frame per pair.
+        pub(super) fn ts_of(aus: &[Vec<u8>], base: u64, field_pes: bool, cc: &mut u8) -> Vec<u8> {
+            let mut ts = Vec::new();
+            ts.extend_from_slice(&synth_pat(0x1000));
+            ts.extend_from_slice(&synth_pmt(0x1000, 0x100, 0x1B));
+            for (i, au) in aus.iter().enumerate() {
+                let pts = base + i as u64 * 3_600;
+                for p in packetize_ts(0x100, &build_video_pes(au, pts), cc) {
+                    ts.extend_from_slice(&p);
+                }
+                if field_pes {
+                    let aud = [0u8, 0, 0, 1, 0x09, 0xF0];
+                    for p in packetize_ts(0x100, &build_video_pes(&aud, pts + 1_800), cc) {
+                        ts.extend_from_slice(&p);
+                    }
+                }
+            }
+            ts
+        }
+
+        /// The re-encoded video PES (ES bytes, PTS) on PID 0x100.
+        pub(super) fn out_pes(out: &[u8]) -> Vec<(Vec<u8>, u64)> {
+            let mut bufs: Vec<Vec<u8>> = Vec::new();
+            for p in out.chunks(TS_PACKET_SIZE) {
+                if ts_pid(p) != 0x100 || !ts_has_payload(p) {
+                    continue;
+                }
+                if ts_pusi(p) {
+                    bufs.push(Vec::new());
+                }
+                if let Some(b) = bufs.last_mut() {
+                    b.extend_from_slice(&p[ts_payload_offset(p)..]);
+                }
+            }
+            bufs.iter()
+                .filter_map(|b| extract_pes_video(b))
+                .map(|(es, pts, _)| (es, pts.expect("re-encoded PES carry a PTS")))
+                .collect()
+        }
+
+        pub(super) fn run(r: &mut TsVideoReplacer, ts: &[u8]) -> Vec<u8> {
+            let mut out = Vec::new();
+            for chunk in ts.chunks(TS_PACKET_SIZE * 7) {
+                r.process(chunk, &mut out);
+            }
+            out
+        }
+
+        pub(super) fn first_sps(out: &[u8]) -> video_engine::H264SpsInfo {
+            out_pes(out)
+                .iter()
+                .find_map(|(es, _)| video_engine::find_h264_sps(es))
+                .expect("an SPS in the re-encoded video")
+        }
+
+        /// Defect 5a. A field-coded source sends one PES per field, 1800
+        /// ticks apart, but the decoder hands the encoder one frame per
+        /// pair: the encoder must open at 25 fps (VUI time_scale 50 with
+        /// num_units_in_tick 1), not the 50 the PES DTS step says.
+        #[test]
+        fn a_field_per_pes_source_encodes_at_the_frame_rate() {
+            let aus = x264_aus(20, (320, 240), None, None);
+            let mut cc = 0u8;
+            let mut ts = ts_of(&aus, 900_000, true, &mut cc);
+            // A trailing PES start flushes the last one.
+            ts.extend_from_slice(&packetize_ts(0x100, &build_video_pes(&[0, 0, 0, 1, 0x09, 0xF0], 0), &mut cc)[0]);
+            let mut r = TsVideoReplacer::new(&cfg("x264"), None).unwrap();
+            let out = run(&mut r, &ts);
+            let sps = first_sps(&out);
+            assert_eq!(sps.timing.map(|(n, t, _)| (n, t)), Some((1, 50)), "25 fps, not 50");
+            assert_eq!(r.inner.pipeline.fps(), (25, 1));
+            // Every encoded frame carries its own source PTS, a frame apart.
+            let pts: Vec<u64> = out_pes(&out).iter().map(|(_, p)| *p).collect();
+            assert!(pts.len() >= 10, "{} frames encoded", pts.len());
+            assert!(pts.windows(2).all(|w| w[1] - w[0] == 3_600), "{pts:?}");
+        }
+
+        /// Frames without any timestamp: nothing to measure, so the
+        /// encoder opens at the fallback once 60 frames have gone by.
+        #[test]
+        fn a_source_without_timestamps_opens_at_the_fallback() {
+            let aus = x264_aus(70, (320, 240), None, None);
+            let mut cc = 0u8;
+            let mut ts = Vec::new();
+            ts.extend_from_slice(&synth_pat(0x1000));
+            ts.extend_from_slice(&synth_pmt(0x1000, 0x100, 0x1B));
+            for au in &aus {
+                let mut pes = vec![0x00, 0x00, 0x01, 0xE0, 0, 0, 0x80, 0x00, 0x00];
+                pes.extend_from_slice(au);
+                for p in packetize_ts(0x100, &pes, &mut cc) {
+                    ts.extend_from_slice(&p);
+                }
+            }
+            let mut r = TsVideoReplacer::new(&cfg("x264"), None).unwrap();
+            let out = run(&mut r, &ts);
+            assert_eq!(r.inner.pipeline.fps(), (30, 1));
+            assert_eq!(first_sps(&out).timing.map(|(n, t, _)| (n, t)), Some((1, 60)));
+        }
+
+        /// A frame-coded source keeps its rate: one PES per frame.
+        #[test]
+        fn a_frame_per_pes_source_is_unchanged() {
+            let aus = x264_aus(12, (320, 240), None, None);
+            let mut cc = 0u8;
+            let ts = ts_of(&aus, 900_000, false, &mut cc);
+            let mut r = TsVideoReplacer::new(&cfg("x264"), None).unwrap();
+            let out = run(&mut r, &ts);
+            assert_eq!(first_sps(&out).timing.map(|(n, t, _)| (n, t)), Some((1, 50)));
+        }
+
+        /// After an input switch the encoder is already open at a fixed
+        /// rate, so the new source's frames flow at once — nothing waits
+        /// for a rate the encoder can no longer take.
+        #[test]
+        fn an_input_switch_with_the_encoder_open_drops_no_frames() {
+            let aus = x264_aus(12, (320, 240), None, None);
+            let mut cc = 0u8;
+            let mut r = TsVideoReplacer::new(&cfg("x264"), None).unwrap();
+            let _ = run(&mut r, &ts_of(&aus, 900_000, false, &mut cc));
+            assert!(r.inner.pipeline.is_open());
+            r.external_reset_handle().store(true, Ordering::Relaxed);
+            let before = r.stats_handle().output_frames.load(Ordering::Relaxed);
+            let decoded_before = r.decode_stats_handle().output_frames.load(Ordering::Relaxed);
+            let _ = run(&mut r, &ts_of(&aus, 5_000_000, false, &mut cc));
+            let encoded = r.stats_handle().output_frames.load(Ordering::Relaxed) - before;
+            let decoded =
+                r.decode_stats_handle().output_frames.load(Ordering::Relaxed) - decoded_before;
+            assert!(decoded >= 8, "{decoded} decoded");
+            assert!(r.inner.source_fps_locked);
+            assert_eq!(encoded, decoded, "every decoded frame of the new source encoded");
+        }
     }
 }
