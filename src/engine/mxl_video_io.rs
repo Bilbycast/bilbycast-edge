@@ -526,9 +526,22 @@ fn decode_v210_worker(
             _ => continue,
         };
         let codec = if is_h264 { VideoCodec::H264 } else { VideoCodec::Hevc };
+        let mut nalu_bytes = Vec::new();
+        for nalu in nalus {
+            nalu_bytes.extend_from_slice(&[0, 0, 0, 1]);
+            nalu_bytes.extend_from_slice(&nalu);
+        }
         if current_codec != Some(codec) {
             current_codec = Some(codec);
-            decoder = Some(match VideoDecoder::open(codec) {
+            // Seeded from the access unit that triggered the open: an H.264
+            // decoder's reorder depth comes from its SPS (`ReorderSeed`).
+            decoder = Some(match VideoDecoder::open_opts(
+                codec,
+                video_engine::DecoderOptions {
+                    reorder_seed: video_engine::ReorderSeed::FromAccessUnit(&nalu_bytes),
+                    ..Default::default()
+                },
+            ) {
                 Ok(d) => d,
                 Err(e) => {
                     tracing::error!(target: "mxl.video.out", "{ctx}: decoder open failed: {e}");
@@ -538,12 +551,6 @@ fn decode_v210_worker(
             scaler = None;
         }
         let dec = decoder.as_mut().unwrap();
-
-        let mut nalu_bytes = Vec::new();
-        for nalu in nalus {
-            nalu_bytes.extend_from_slice(&[0, 0, 0, 1]);
-            nalu_bytes.extend_from_slice(&nalu);
-        }
 
         if let Err(e) = dec.send_packet_with_pts(&nalu_bytes, pts as i64) {
             debug!(target: "mxl.video.out", "{ctx}: decoder send_packet error: {e}");

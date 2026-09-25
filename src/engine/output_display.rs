@@ -1202,6 +1202,7 @@ fn demux_decode_loop(
                     &mut last_video_pts,
                     &mut keyframe_gate,
                     &frame_gen,
+                    &prime_cache_stale,
                     "lagged",
                 );
                 let now = std::time::Instant::now();
@@ -1525,6 +1526,7 @@ fn demux_decode_loop(
                         &mut last_video_pts,
                         &mut keyframe_gate,
                         &frame_gen,
+                        &prime_cache_stale,
                         "switch",
                     );
                     acquiring_since = Some(std::time::Instant::now());
@@ -2250,8 +2252,25 @@ fn decoder_label_for_backend(backend: DecoderBackend) -> DisplayDecoderLabel {
 ///
 /// On the CPU branch (operator-chosen or post-fallback) we open once
 /// with no sleep; CPU decoder open is cheap and never contends.
+/// Open `codec` on `backend`, single-threaded, seeding an H.264 decoder's
+/// reorder depth from `au` — the access unit that triggered the open (see
+/// `video_engine::ReorderSeed`: without it a join on a non-IDR I picture
+/// showed a GOP of garbage on Sky Sports-style PAFF feeds). Only H.264 on
+/// the CPU and VAAPI backends reads the seed.
+fn open_seeded(codec: VideoCodec, backend: DecoderBackend, au: &[u8]) -> Result<VideoDecoder, video_codec::VideoError> {
+    VideoDecoder::open_opts(
+        codec,
+        video_engine::DecoderOptions {
+            backend,
+            reorder_seed: video_engine::ReorderSeed::FromAccessUnit(au),
+            ..Default::default()
+        },
+    )
+}
+
 fn open_video_decoder_with_retry(
     codec: VideoCodec,
+    au: &[u8],
     state: &mut HwOpenState,
     counters: &DisplayStatsCounters,
     event_sender: &EventSender,
@@ -2268,7 +2287,7 @@ fn open_video_decoder_with_retry(
         } else {
             DisplayDecoderLabel::Cpu
         });
-        return VideoDecoder::open_with_backend(codec, DecoderBackend::Cpu).ok();
+        return open_seeded(codec, DecoderBackend::Cpu, au).ok();
     }
 
     // MPEG-2 → CPU decode on the backends that still need it. Which ones, and
@@ -2292,7 +2311,7 @@ fn open_video_decoder_with_retry(
     // Falls through to the HW path if the CPU open itself fails (then the
     // normal retry+demote handles it).
     if mpeg2_pin_active(codec, state.backend, state.mpeg2_cpu_pinned, state.mpeg2_cpu_override)
-        && let Ok(d) = VideoDecoder::open_with_backend(codec, DecoderBackend::Cpu) {
+        && let Ok(d) = open_seeded(codec, DecoderBackend::Cpu, au) {
             // MPEG-2 on CPU while `state.backend` stays HW for other
             // codecs — plain `Cpu`, not a failure. This is the report
             // that used to lie as `vaapi-zerocopy`/`rkmpp-zerocopy`.
@@ -2308,7 +2327,7 @@ fn open_video_decoder_with_retry(
         if delay_ms > 0 {
             std::thread::sleep(std::time::Duration::from_millis(delay_ms));
         }
-        match VideoDecoder::open_with_backend(codec, state.backend) {
+        match open_seeded(codec, state.backend, au) {
             Ok(mut d) => {
                 if attempt_idx > 0 {
                     tracing::info!(
@@ -2374,13 +2393,14 @@ fn open_video_decoder_with_retry(
             }),
         );
     }
-    VideoDecoder::open_with_backend(codec, DecoderBackend::Cpu).ok()
+    open_seeded(codec, DecoderBackend::Cpu, au).ok()
 }
 
 fn ensure_video_decoder(
     slot: &mut Option<VideoDecoder>,
     current: &mut Option<VideoCodec>,
     desired: VideoCodec,
+    au: &[u8],
     state: &mut HwOpenState,
     counters: &DisplayStatsCounters,
     event_sender: &EventSender,
@@ -2391,7 +2411,7 @@ fn ensure_video_decoder(
         return;
     }
     *current = Some(desired);
-    *slot = open_video_decoder_with_retry(desired, state, counters, event_sender, flow_id, output_id);
+    *slot = open_video_decoder_with_retry(desired, au, state, counters, event_sender, flow_id, output_id);
     if slot.is_some() {
         // Fresh decoder — re-arm the watchdog/error window. The watchdog
         // gates on `first_send_after_open` being set, so leaving it None
@@ -2636,9 +2656,25 @@ fn flush_decoders_for_switch(
     last_video_pts: &mut Option<u64>,
     keyframe_gate: &mut KeyframeGate,
     frame_gen: &AtomicU64,
+    prime_cache_stale: &AtomicBool,
     reason: &'static str,
 ) {
-    if let Some(d) = video_decoder.as_mut() {
+    if let Some(d) = video_decoder.as_ref()
+        && switch_drops_decoder(reason, d.codec(), d.backend())
+    {
+        // A different source may be on the other side: drop the decoder
+        // so the next keyframe AU re-opens it seeded from the new SPS. A
+        // flush keeps the reorder depth libavcodec learned from the old
+        // source and cannot re-apply a seed, so a switch from an IPPP
+        // source to a Sky Sports-style one showed a GOP of garbage, and one
+        // the other way kept the deeper latency for good.
+        if d.backend() == DecoderBackend::Vaapi {
+            // A re-opened VAAPI pool has fresh DMA-BUF identities (#94).
+            prime_cache_stale.store(true, Ordering::Relaxed);
+        }
+        *video_decoder = None;
+        reset_decoder_open_window(state, counters);
+    } else if let Some(d) = video_decoder.as_mut() {
         d.flush();
         reset_decoder_open_window(state, counters);
     }
@@ -2666,6 +2702,19 @@ fn flush_decoders_for_switch(
     // the old gen and get dropped by the display/audio loops).
     frame_gen.fetch_add(1, Ordering::Relaxed);
     tracing::debug!(reason = reason, "display decoder flush");
+}
+
+/// Whether [`flush_decoders_for_switch`] drops the video decoder (re-opened
+/// on the next keyframe, its H.264 reorder depth seeded from that AU)
+/// instead of flushing it. Only where a seed applies — H.264 on the CPU or
+/// VAAPI backend (see `video_engine::ReorderSeed`) — and only when the
+/// stream may have changed underneath: an operator switch or a PTS jump.
+/// A subscriber lag is the same source with packets missing, and a flush
+/// is all it needs.
+fn switch_drops_decoder(reason: &str, codec: VideoCodec, backend: DecoderBackend) -> bool {
+    reason != "lagged"
+        && codec == VideoCodec::H264
+        && matches!(backend, DecoderBackend::Cpu | DecoderBackend::Vaapi)
 }
 
 /// Switch the active decoder from a HW backend to CPU mid-flight.
@@ -3052,6 +3101,7 @@ fn handle_video_au(
             last_video_pts,
             keyframe_gate,
             frame_gen,
+            prime_cache_stale,
             "pts_jump",
         );
     }
@@ -3091,10 +3141,12 @@ fn handle_video_au(
     // (above) are tracked on `aus_skipped_awaiting_keyframe` instead —
     // they never reach the decoder.
     video_decode_counters.inc_input();
+    let au = access_unit_bytes(nalus, codec);
     ensure_video_decoder(
         video_decoder,
         current_video_codec,
         codec,
+        &au,
         hw_open_state,
         counters,
         event_sender,
@@ -3115,9 +3167,8 @@ fn handle_video_au(
     let decode_start = Instant::now();
     feed_video_decoder(
         decoder,
-        nalus,
+        &au,
         pts,
-        codec,
         hw_open_state,
         counters,
         flow_id,
@@ -3443,30 +3494,15 @@ fn prime_scanout_permanently_rejected(err_msg: &str) -> bool {
         && !err_msg.contains("receive_events")
 }
 
-fn feed_video_decoder(
-    decoder: &mut VideoDecoder,
-    nalus: &[Vec<u8>],
-    pts_90k: u64,
-    codec: VideoCodec,
-    state: &mut HwOpenState,
-    counters: &DisplayStatsCounters,
-    flow_id: &str,
-    output_id: &str,
-) {
-    // H.264 / HEVC: concatenate NAL units back into Annex-B form
-    // (start codes between each NALU). The demuxer already strips
-    // start codes, so we re-add the standard `0x00 0x00 0x00 0x01`
-    // prefix.
-    //
-    // MPEG-2: the demuxer surfaces the elementary stream verbatim
-    // already framed by `0x000001XX` start codes — feeding it through
-    // the Annex-B prefix would inject a synthetic empty slice
-    // (`0x000001 + 0x01 = slice_start_code 0x01`) which the libavcodec
-    // mpeg2video decoder mis-parses. Pass the bytes through unchanged.
-    //
-    // PTS is attached to the input packet so FFmpeg's reorder queue
-    // can hand the matching display-order PTS back on `receive_frame`.
-    let buf = match codec {
+/// The access unit as the decoder takes it. H.264 / HEVC: the NAL units
+/// back into Annex-B form (the demuxer strips start codes, so the standard
+/// `0x00 0x00 0x00 0x01` prefix is re-added). MPEG-2: the demuxer surfaces
+/// the elementary stream verbatim, already framed by `0x000001XX` start
+/// codes — feeding it through the Annex-B prefix would inject a synthetic
+/// empty slice (`0x000001 + 0x01 = slice_start_code 0x01`) which the
+/// libavcodec mpeg2video decoder mis-parses — so its bytes pass unchanged.
+fn access_unit_bytes(nalus: &[Vec<u8>], codec: VideoCodec) -> Vec<u8> {
+    match codec {
         VideoCodec::Mpeg2 => {
             let total = nalus.iter().map(|n| n.len()).sum::<usize>();
             let mut buf = Vec::with_capacity(total);
@@ -3484,8 +3520,21 @@ fn feed_video_decoder(
             }
             buf
         }
-    };
-    match decoder.send_packet_with_pts(&buf, pts_90k as i64) {
+    }
+}
+
+fn feed_video_decoder(
+    decoder: &mut VideoDecoder,
+    buf: &[u8],
+    pts_90k: u64,
+    state: &mut HwOpenState,
+    counters: &DisplayStatsCounters,
+    flow_id: &str,
+    output_id: &str,
+) {
+    // PTS is attached to the input packet so FFmpeg's reorder queue
+    // can hand the matching display-order PTS back on `receive_frame`.
+    match decoder.send_packet_with_pts(buf, pts_90k as i64) {
         Ok(()) => {
             if state.first_send_after_open.is_none() {
                 // Watchdog arms only after the FIRST successful send,
@@ -6941,6 +6990,36 @@ fn emit_event(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A display decoder opened on an access unit is seeded from it: H.264
+    /// on the CPU backend starts at reorder depth 1 when the AU declares
+    /// none (here, carries no SPS at all) — the depth that keeps a
+    /// non-IDR join from showing a GOP of garbage — and HEVC is untouched.
+    #[test]
+    fn display_decoders_open_seeded_from_the_access_unit() {
+        let d = open_seeded(VideoCodec::H264, DecoderBackend::Cpu, &[0, 0, 0, 1, 0x09, 0xF0]).unwrap();
+        assert_eq!(d.reorder_depth(), 1);
+        let d = open_seeded(VideoCodec::Hevc, DecoderBackend::Cpu, &[]).unwrap();
+        assert_eq!(d.reorder_depth(), 0);
+    }
+
+    /// A switch or PTS jump drops a seeded (H.264, CPU / VAAPI) decoder so
+    /// the next keyframe re-seeds it; a lag, and every other decoder, is
+    /// flushed as before.
+    #[test]
+    fn a_switch_drops_only_a_seeded_decoder() {
+        use DecoderBackend::*;
+        for reason in ["switch", "pts_jump"] {
+            assert!(switch_drops_decoder(reason, VideoCodec::H264, Cpu));
+            assert!(switch_drops_decoder(reason, VideoCodec::H264, Vaapi));
+            for b in [Nvdec, Qsv, Rkmpp] {
+                assert!(!switch_drops_decoder(reason, VideoCodec::H264, b));
+            }
+            assert!(!switch_drops_decoder(reason, VideoCodec::Hevc, Cpu));
+            assert!(!switch_drops_decoder(reason, VideoCodec::Mpeg2, Cpu));
+        }
+        assert!(!switch_drops_decoder("lagged", VideoCodec::H264, Cpu));
+    }
 
     // MPEG-2 stays pinned to software decode on VAAPI (hardware decode
     // works but presents ~7 fps worse — see the predicate's doc), QSV

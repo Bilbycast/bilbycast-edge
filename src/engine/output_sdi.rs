@@ -524,10 +524,10 @@ fn playout_worker(
     let mut grid = FrameGrid::new(fr_num, fr_den);
 
     let mut decoder: Option<VideoDecoder> = None;
-    let mut current_codec: Option<VideoCodec> = None;
     // Decoders need a parameter set before anything decodes; feeding P-frames
-    // first just produces reference errors, so gate on the first keyframe.
-    let mut seen_keyframe = false;
+    // first just produces reference errors, so the decoder opens on the first
+    // keyframe (and stays `None` until then).
+    let mut current_codec: Option<VideoCodec> = None;
     // Per-output SDI playout telemetry, surfaced on `OutputStats.sdi_stats`.
     // The card's late/dropped counters are cumulative per playout session, so
     // both bases reset to 0 on a device re-open (below).
@@ -631,10 +631,13 @@ fn playout_worker(
                 // frame-grid guard re-maps the epoch onto the next free slot.
                 // Either way both essences keep reading the same anchor, so a
                 // switch cannot pull them apart.
-                if let Some(d) = decoder.as_mut() {
-                    d.flush();
-                }
-                seen_keyframe = false;
+                // Dropped, not flushed: the new input's decoder is opened on
+                // its first keyframe, seeded from that AU's SPS. A flush
+                // keeps the reorder depth libavcodec learned from the old
+                // input, and this frame-threaded decoder cannot be re-seeded
+                // (its workers never re-read it): a switch from an IPPP
+                // source to a deeper one then showed a GOP of garbage.
+                decoder = None;
                 aac_dec = None;
                 ff_dec = None;
                 audio_pos = None;
@@ -673,14 +676,28 @@ fn playout_worker(
         // unseen and strand every later PTS a full lap out.
         let au_pts = timeline.unwrap_pts(au.pts);
 
-        // (Re)open the decoder on first use and on codec change.
+        // (Re)open the decoder on first use, on a codec change and after an
+        // input switch — on a keyframe, so the H.264 reorder depth is seeded
+        // from the AU that carries the new source's SPS (see
+        // `video_engine::ReorderSeed`). Until then there is nothing a fresh
+        // decoder could reference.
         if current_codec != Some(au.codec) {
-            match VideoDecoder::open_threaded(au.codec) {
-                Ok(d) => {
-                    decoder = Some(d);
-                    current_codec = Some(au.codec);
-                    seen_keyframe = false;
-                }
+            decoder = None;
+            current_codec = Some(au.codec);
+        }
+        if decoder.is_none() {
+            if !au.is_keyframe {
+                continue;
+            }
+            match VideoDecoder::open_opts(
+                au.codec,
+                video_engine::DecoderOptions {
+                    threading: video_engine::DecoderThreading::Auto,
+                    reorder_seed: video_engine::ReorderSeed::FromAccessUnit(&au.annexb),
+                    ..Default::default()
+                },
+            ) {
+                Ok(d) => decoder = Some(d),
                 Err(e) => {
                     throttled(&mut last_decode_warn, || {
                         warn!(target: "sdi.out", "{ctx}: decoder open failed: {e}");
@@ -699,12 +716,6 @@ fn playout_worker(
                     continue;
                 }
             }
-        }
-        if !seen_keyframe {
-            if !au.is_keyframe {
-                continue;
-            }
-            seen_keyframe = true;
         }
         let dec = decoder.as_mut().expect("decoder opened above");
 

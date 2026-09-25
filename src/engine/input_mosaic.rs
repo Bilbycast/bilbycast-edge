@@ -559,7 +559,17 @@ fn spawn_tile_decoder(
                             // H.264 decoder produces a wedged tile rather than
                             // a loud failure.
                             if decoder_codec != Some(codec) {
-                                decoder = video_engine::VideoDecoder::open(codec).ok();
+                                // Seeded from this access unit: an H.264
+                                // decoder's reorder depth comes from its
+                                // SPS (`video_engine::ReorderSeed`).
+                                decoder = video_engine::VideoDecoder::open_opts(
+                                    codec,
+                                    video_engine::DecoderOptions {
+                                        reorder_seed: video_engine::ReorderSeed::FromAccessUnit(&es),
+                                        ..Default::default()
+                                    },
+                                )
+                                .ok();
                                 decoder_codec = decoder.as_ref().map(|_| codec);
                             }
                             let Some(dec) = decoder.as_mut() else {

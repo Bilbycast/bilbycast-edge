@@ -897,12 +897,17 @@ fn warm_decode_loop(
 ) {
     video_engine::silence_ffmpeg_logs();
     let mut demuxer = TsDemuxer::new(program_number);
-    let mut decoder = match video_engine::VideoDecoder::open(codec) {
-        Ok(d) => d,
-        Err(e) => {
-            tracing::warn!("Warm thumbnail decoder: open failed: {e}");
-            return;
-        }
+    // Opened on the first access unit, so an H.264 decoder's reorder depth
+    // is seeded from it (`video_engine::ReorderSeed`), as is every re-open.
+    let mut decoder: Option<video_engine::VideoDecoder> = None;
+    let open_on = |codec: video_codec::VideoCodec, au: &[u8]| {
+        video_engine::VideoDecoder::open_opts(
+            codec,
+            video_engine::DecoderOptions {
+                reorder_seed: video_engine::ReorderSeed::FromAccessUnit(au),
+                ..Default::default()
+            },
+        )
     };
     // Scaler cached by source dims; rebuilt on a resolution change.
     let mut scaler: Option<(video_engine::VideoScaler, u32, u32)> = None;
@@ -945,7 +950,18 @@ fn warm_decode_loop(
             // main loop stops serving the stale frame until the new one decodes.
             let boundary = is_source_boundary(frame_codec, current_codec, pts, last_pts);
             last_pts = Some(pts);
-            if boundary {
+            if decoder.is_none() && !boundary {
+                match open_on(frame_codec, &au) {
+                    Ok(d) => {
+                        decoder = Some(d);
+                        current_codec = frame_codec;
+                    }
+                    Err(e) => {
+                        tracing::warn!("Warm thumbnail decoder: open failed: {e}");
+                        return;
+                    }
+                }
+            } else if boundary {
                 // Drop the cached frame BEFORE attempting the re-open, not
                 // inside its success arm. The frame belongs to the source we
                 // have just left, so it is stale the moment the boundary is
@@ -955,9 +971,9 @@ fn warm_decode_loop(
                 // indefinitely. That is exactly the frozen-thumbnail failure
                 // this re-open exists to prevent, surviving on the error path.
                 *latest.lock().unwrap() = None;
-                match video_engine::VideoDecoder::open(frame_codec) {
+                match open_on(frame_codec, &au) {
                     Ok(d) => {
-                        decoder = d;
+                        decoder = Some(d);
                         current_codec = frame_codec;
                         scaler = None;
                         last_encode = None;
@@ -967,6 +983,9 @@ fn warm_decode_loop(
                     }
                 }
             }
+            let Some(decoder) = decoder.as_mut() else {
+                continue;
+            };
             if decoder.send_packet_with_pts(&au, pts as i64).is_err() {
                 continue;
             }

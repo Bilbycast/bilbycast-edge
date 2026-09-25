@@ -1409,6 +1409,24 @@ fn decode_worker(
             }
         }
         let codec = codec_override.unwrap_or(labeled);
+        let mut nalu_bytes = Vec::new();
+        for nalu in nalus {
+            nalu_bytes.extend_from_slice(&[0, 0, 0, 1]);
+            nalu_bytes.extend_from_slice(&nalu);
+        }
+        // Every open takes the access unit that triggered it: an H.264
+        // decoder's reorder depth is seeded from its SPS (`ReorderSeed`).
+        let seeded = |backend, threading| {
+            VideoDecoder::open_opts(
+                codec,
+                video_engine::DecoderOptions {
+                    backend,
+                    threading,
+                    reorder_seed: video_engine::ReorderSeed::FromAccessUnit(&nalu_bytes),
+                },
+            )
+        };
+        let threaded_cpu = || seeded(video_engine::DecoderBackend::Cpu, video_engine::DecoderThreading::Auto);
         if current_codec != Some(codec) {
             current_codec = Some(codec);
             aus_since_open = 0;
@@ -1476,9 +1494,9 @@ fn decode_worker(
                 }
             };
             let opened = if matches!(backend, video_engine::DecoderBackend::Cpu) {
-                VideoDecoder::open_threaded(codec)
+                threaded_cpu()
             } else {
-                match VideoDecoder::open_with_backend(codec, backend) {
+                match seeded(backend, video_engine::DecoderThreading::Single) {
                     Ok(d) => {
                         tracing::info!(
                             ?backend,
@@ -1492,7 +1510,7 @@ fn decode_worker(
                             error = %e,
                             "ST 2110-20 output: HW decoder open failed — falling back to threaded software decode"
                         );
-                        VideoDecoder::open_threaded(codec)
+                        threaded_cpu()
                     }
                 }
             };
@@ -1507,17 +1525,12 @@ fn decode_worker(
         }
         let dec = decoder.as_mut().unwrap();
 
-        // Feed NALUs as annex-B to decoder. Attach the source PES PTS
-        // so the decoder propagates it (in presentation order, after
-        // B-frame reorder) onto each output frame's `pts()`. Without
-        // this, the RFC 4175 wire timestamp would inherit the
+        // Feed the NALUs (as annex-B, built above) to the decoder. Attach
+        // the source PES PTS so the decoder propagates it (in presentation
+        // order, after B-frame reorder) onto each output frame's `pts()`.
+        // Without this, the RFC 4175 wire timestamp would inherit the
         // most-recently-sent packet's decode-order PTS — non-monotonic
         // on streams with B-frames, which RFC 4175 § 4.1 forbids.
-        let mut nalu_bytes = Vec::new();
-        for nalu in nalus {
-            nalu_bytes.extend_from_slice(&[0, 0, 0, 1]);
-            nalu_bytes.extend_from_slice(&nalu);
-        }
         // `DemuxedFrame::H264::pts` is u64 (TS PES PTS in 90 kHz, 33-bit).
         // libavcodec wants i64; the high bit is always 0 for a 33-bit
         // value, so a plain cast is safe.

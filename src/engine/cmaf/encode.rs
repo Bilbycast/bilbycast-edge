@@ -634,6 +634,9 @@ pub struct VideoReencoder {
     /// Source codec pinned at first observed frame; changing codec is
     /// rejected (operator must restart the flow).
     source_codec: Option<CmafVideoCodec>,
+    /// The last pts handed to the encoder — the step-off point for the
+    /// frames [`Self::flush`] drains from the decoder.
+    last_pts: Option<i64>,
 }
 
 #[cfg(not(feature = "media-codecs"))]
@@ -712,6 +715,7 @@ impl VideoReencoder {
             output_id: output_id.to_string(),
             annex_b_scratch: Vec::with_capacity(256 * 1024),
             source_codec: None,
+            last_pts: None,
         })
     }
 
@@ -746,8 +750,16 @@ impl VideoReencoder {
                 CmafVideoCodec::H264 => video_codec::VideoCodec::H264,
                 CmafVideoCodec::H265 => video_codec::VideoCodec::Hevc,
             };
-            let dec = video_engine::VideoDecoder::open(src_codec)
-                .map_err(|e| anyhow::anyhow!("VideoDecoder open failed: {e}"))?;
+            // Seeded from the access unit that triggered the open: an H.264
+            // decoder's reorder depth comes from its SPS (`ReorderSeed`).
+            let dec = video_engine::VideoDecoder::open_opts(
+                src_codec,
+                video_engine::DecoderOptions {
+                    reorder_seed: video_engine::ReorderSeed::FromAccessUnit(&self.annex_b_scratch),
+                    ..Default::default()
+                },
+            )
+            .map_err(|e| anyhow::anyhow!("VideoDecoder open failed: {e}"))?;
             self.decoder = Some(dec);
             // Woven (H.264) or single-field (HEVC) interlaced frames — what
             // an explicit `scan: interlaced` needs to know.
@@ -761,6 +773,7 @@ impl VideoReencoder {
             Err(_e) => return Ok(None), // encoder buffered
         };
 
+        self.last_pts = Some(pts as i64);
         let was_open = self.pipeline.is_open();
         let encoded = self
             .pipeline
@@ -797,17 +810,34 @@ impl VideoReencoder {
         }))
     }
 
-    /// Drain whatever the encoder is still holding.
+    /// Drain whatever the decoder and then the encoder are still holding.
     ///
-    /// Encoders buffer, so the last frames handed in are not the last frames
+    /// Both buffer, so the last frames handed in are not the last frames
     /// out. A live output never notices — it runs until it is stopped — but a
     /// clip has an end, and without this the tail of every export is short by
-    /// however deep the encoder happens to buffer.
+    /// however deep the decoder reorders (its B-frame depth, or the one frame
+    /// an H.264 decoder seeded for a join holds on an IPPP source) plus
+    /// however deep the encoder buffers. The decoder is drained first, its
+    /// frames encoded, and only then the encoder flushed.
     pub fn flush(&mut self) -> Result<Vec<VideoOutFrame>> {
-        let encoded = self
-            .pipeline
-            .flush()
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let mut encoded = Vec::new();
+        if let Some(dec) = self.decoder.as_mut()
+            && dec.send_flush().is_ok()
+        {
+            while let Ok(decoded) = dec.receive_frame() {
+                // Held-back frames carry no label of their own (the caller
+                // stamps flushed frames itself); the encoder only needs a
+                // monotonic one.
+                let pts = self.last_pts.map_or(0, |p| p + 1);
+                self.last_pts = Some(pts);
+                encoded.extend(
+                    self.pipeline
+                        .encode(&decoded, Some(pts))
+                        .map_err(|e| anyhow::anyhow!("VideoEncoder encode_frame failed: {e}"))?,
+                );
+            }
+        }
+        encoded.extend(self.pipeline.flush().map_err(|e| anyhow::anyhow!("{e}"))?);
         let mut out = Vec::new();
         for frame in &encoded {
             let mut nalus = Vec::new();
@@ -1151,5 +1181,65 @@ mod tests {
         assert_eq!(out.len(), 2);
         assert_eq!(out[0], vec![0x67, 0x42]);
         assert_eq!(out[1], vec![0x68, 0xCE]);
+    }
+}
+
+#[cfg(all(test, feature = "video-encoder-x264"))]
+mod flush_tests {
+    use super::*;
+    use video_codec::{VideoEncoderCodec, VideoEncoderConfig, VideoPreset};
+
+    /// A clip re-encode (`export_mp4::reencode_all_intra`) gets every frame
+    /// back: the decoder's held-back pictures — its reorder depth on a
+    /// B-frame source — are drained and encoded on flush, not only the
+    /// encoder's. They used to be lost from the tail of every clip.
+    #[test]
+    fn flush_returns_the_frames_the_decoder_held_back() {
+        let (w, h, n) = (320usize, 240usize, 30usize);
+        let mut enc = video_engine::VideoEncoder::open(&VideoEncoderConfig {
+            codec: VideoEncoderCodec::X264,
+            width: w as u32,
+            height: h as u32,
+            fps_num: 25,
+            fps_den: 1,
+            gop_size: 30,
+            max_b_frames: 2,
+            // `zerolatency` would turn the B-frames off.
+            tune: String::new(),
+            preset: VideoPreset::Veryfast,
+            global_header: false,
+            ..VideoEncoderConfig::default()
+        })
+        .unwrap();
+        let mut aus = Vec::new();
+        for i in 0..n {
+            let y: Vec<u8> = (0..w * h).map(|k| ((k % w + 5 * i) % 200) as u8 + 20).collect();
+            let c = vec![128u8; w / 2 * h / 2];
+            aus.extend(enc.encode_frame(&y, w, &c, w / 2, &c, w / 2, Some(i as i64)).unwrap());
+        }
+        aus.extend(enc.flush().unwrap());
+        assert_eq!(aus.len(), n);
+        assert!(aus.iter().any(|f| f.pts != f.dts), "the source reorders");
+
+        let cfg: VideoEncodeConfig = serde_json::from_value(serde_json::json!({
+            "codec": "x264", "gop_size": 1, "bframes": 0, "preset": "veryfast"
+        }))
+        .unwrap();
+        let mut re = VideoReencoder::new(&cfg, "clip-test").unwrap();
+        let mut out = 0usize;
+        for (i, au) in aus.iter().enumerate() {
+            let mut nalus = Vec::new();
+            split_annex_b_to_nalus(&au.data, &mut nalus);
+            if re
+                .encode_frame(&nalus, i as u64 * 3_600, false, CmafVideoCodec::H264)
+                .unwrap()
+                .is_some()
+            {
+                out += 1;
+            }
+        }
+        let held = re.flush().unwrap().len();
+        assert!(held >= 1, "the decoder held pictures back");
+        assert_eq!(out + held, n, "every source frame comes back");
     }
 }

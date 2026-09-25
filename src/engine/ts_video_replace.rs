@@ -479,6 +479,16 @@ mod inner {
     /// opens the encoder at the fallback rate (~2 s of broadcast video).
     const UNLOCKED_FRAME_CAP: u32 = 60;
 
+    /// H.264 PES the replacer passes over waiting for one that carries an
+    /// SPS to open the decoder on, before opening on whatever arrives
+    /// (~6-12 s; broadcast repeats the SPS every GOP).
+    const SPS_WAIT_PES: u32 = 300;
+
+    /// Whether an Annex B access unit carries an H.264 SPS NAL unit.
+    fn carries_h264_sps(au: &[u8]) -> bool {
+        video_engine::annexb_nal_units(au).any(|n| n.first().is_some_and(|b| b & 0x1F == 7))
+    }
+
     pub struct Inner {
         #[allow(dead_code)]
         target_family: VideoCodec,
@@ -519,7 +529,7 @@ mod inner {
         pes_started: bool,
         pending_pts: Option<u64>,
 
-        decoder: Option<VideoDecoder>,
+        pub(super) decoder: Option<VideoDecoder>,
         /// Shared encoder pipeline — wraps `VideoEncoder` + optional
         /// `VideoScaler`. Lazy-opens on the first decoded frame and
         /// handles the `video_encode.width` / `.height` override by
@@ -576,6 +586,9 @@ mod inner {
         /// reset: their ratio is 2 on a field-coded source.
         pub(super) pes_since_reset: u64,
         pub(super) frames_since_reset: u64,
+        /// H.264 PES passed over while waiting for one that carries the
+        /// SPS to open the decoder on (bounded by [`SPS_WAIT_PES`]).
+        pub(super) pes_awaiting_sps: u32,
         /// One-shot guard for `video_encode_fps_mismatch` (the measured
         /// rate disagrees with the rate the encoder runs at: a pinned
         /// `video_encode.fps_num` / `fps_den`, or the rate an earlier
@@ -776,6 +789,7 @@ mod inner {
                 pes_dts_step_90k: None,
                 pes_since_reset: 0,
                 frames_since_reset: 0,
+                pes_awaiting_sps: 0,
                 fps_mismatch_warned: false,
                 description,
                 stats,
@@ -859,6 +873,7 @@ mod inner {
             self.pes_dts_step_90k = None;
             self.pes_since_reset = 0;
             self.frames_since_reset = 0;
+            self.pes_awaiting_sps = 0;
             self.fps_mismatch_warned = false;
             // First post-switch encoded frame must be an IDR so receivers
             // get a clean entry point right at the switch boundary.
@@ -1384,7 +1399,6 @@ mod inner {
             // The coded-picture step, for the fallback rate only (see
             // `fallback_rate`): on a field-coded source it is the FIELD
             // step. The encoder rate is measured from decoded frames.
-            self.pes_since_reset += 1;
             if let Some(dts) = pes_dts {
                 if let Some(prev) = self.last_input_dts {
                     let delta = dts.wrapping_sub(prev) & PTS_MASK_33B;
@@ -1429,7 +1443,30 @@ mod inner {
                     }
                     None => video_engine::DecoderBackend::Cpu,
                 };
-                match VideoDecoder::open_with_backend(src_codec, decoder_backend) {
+                // H.264: open on the PES that carries the SPS. Nothing
+                // decodes before one anyway, and the decoder's reorder depth
+                // is seeded from the AU it opens on (`ReorderSeed`): 0 when
+                // the SPS declares it (libavcodec then applies the declared
+                // depth, 0 for IPPP), else 1, which keeps a join on a non-IDR
+                // I picture from showing a GOP of garbage. Opening on a PES
+                // without the SPS would cost a declaring IPPP source a frame
+                // of latency for good. Bounded, for a stream whose SPS never
+                // shows as a NAL unit here.
+                if src_codec == VideoCodec::H264
+                    && !carries_h264_sps(&es_data)
+                    && self.pes_awaiting_sps < SPS_WAIT_PES
+                {
+                    self.pes_awaiting_sps += 1;
+                    return Ok(());
+                }
+                match VideoDecoder::open_opts(
+                    src_codec,
+                    video_engine::DecoderOptions {
+                        backend: decoder_backend,
+                        reorder_seed: video_engine::ReorderSeed::FromAccessUnit(&es_data),
+                        ..Default::default()
+                    },
+                ) {
                     Ok(d) => {
                         if !matches!(decoder_backend, video_engine::DecoderBackend::Cpu) {
                             tracing::info!(
@@ -1460,6 +1497,7 @@ mod inner {
                 // PTS goes in without one, so its frame carries none and
                 // is neither measured nor admitted as a real timestamp.
                 self.decode_stats.inc_input();
+                self.pes_since_reset += 1;
                 let sent = match pts {
                     Some(p) => dec.send_packet_with_pts(&es_data, p as i64),
                     None => dec.send_packet(&es_data),
@@ -2772,6 +2810,31 @@ mod tests {
         assert_eq!(d["reason"], "no backend could");
     }
 
+    /// An H.264 source whose SPS never shows: after `SPS_WAIT_PES` PES the
+    /// decoder opens anyway, seeded from the AU in hand — an undeclared
+    /// reorder depth, so 1 (the depth that keeps a non-IDR join clean).
+    #[test]
+    fn without_an_sps_the_decoder_opens_seeded_after_the_wait() {
+        let mut r = TsVideoReplacer::new(&cfg("x264"), None).unwrap();
+        let mut out = Vec::new();
+        r.process(&synth_pat(0x1000), &mut out);
+        r.process(&synth_pmt(0x1000, 0x100, 0x1B), &mut out);
+        let mut cc = 0u8;
+        let mut feed = |r: &mut TsVideoReplacer, n: u64| {
+            for i in 0..n {
+                let pes = build_video_pes(&[0, 0, 0, 1, 0x09, 0xF0], 90_000 + i * 3_600);
+                for p in packetize_ts(0x100, &pes, &mut cc) {
+                    r.process(&p, &mut out);
+                }
+            }
+        };
+        feed(&mut r, 300);
+        assert!(r.inner.decoder.is_none(), "still waiting for an SPS");
+        feed(&mut r, 3);
+        let dec = r.inner.decoder.as_ref().expect("opened after the wait");
+        assert_eq!(dec.reorder_depth(), 1);
+    }
+
     // ── Encoder rate from decoded frames (5a) and friends, through a real
     //    decoder and libx264 ──
 
@@ -3075,6 +3138,30 @@ mod tests {
                 assert!(interlaced && tff);
                 assert!((even - 60.0).abs() < 8.0 && (odd - 180.0).abs() < 8.0, "{even} / {odd}");
             }
+        }
+
+        /// Joined mid-GOP, the decoder opens on the IDR that carries the
+        /// SPS, not the first PES: libx264 declares its reorder depth (0),
+        /// which the seed then leaves to libavcodec — zero added latency.
+        /// Opened on a P picture instead, it would have been seeded 1 and
+        /// held a frame for good.
+        #[test]
+        fn the_decoder_opens_on_the_pes_that_carries_the_sps() {
+            let aus = x264_aus(40, (320, 240), None, None);
+            let has_sps = |au: &Vec<u8>| video_engine::find_h264_sps(au).is_some();
+            let start = (1..aus.len()).find(|&i| !has_sps(&aus[i])).expect("a P picture");
+            let skipped = aus[start..].iter().take_while(|au| !has_sps(au)).count();
+            assert!(skipped >= 1 && start + skipped < aus.len() - 10);
+            let mut cc = 0u8;
+            let mut r = TsVideoReplacer::new(&cfg("x264"), None).unwrap();
+            let out = run(&mut r, &ts_of(&aus[start..], 900_000, false, &mut cc));
+            assert_eq!(
+                r.inner.pes_awaiting_sps as usize, skipped,
+                "the P pictures before the next SPS are passed over"
+            );
+            let dec = r.inner.decoder.as_ref().expect("opened");
+            assert_eq!(dec.reorder_depth(), 0);
+            assert!(out_pes(&out).len() >= 10);
         }
 
         /// A frame-coded source keeps its rate: one PES per frame.

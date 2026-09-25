@@ -321,7 +321,11 @@ fn decode_and_metrics(
     if decoder.send_packet(&annex_b).is_err() {
         return (None, None);
     }
-    let _ = decoder.send_packet(&[]); // signal EOS so receive_frame flushes
+    // End of stream, so receive_frame hands back what the decoder holds. An
+    // empty `send_packet` is not that — it is refused as `EmptyInput` — and
+    // a decoder holding pictures for its reorder depth (declared in the SPS
+    // of a B-frame stream) then returned nothing for this sample at all.
+    let _ = decoder.send_flush();
     // Iterate through all frames returned — decode until we have the
     // most recent one or the decoder signals need-more-input / EOF.
     let mut latest: Option<video_engine::DecodedFrame> = None;
@@ -744,5 +748,59 @@ mod pmt_walk_tests {
     fn first_video_found_behind_a_private_section() {
         let pkt = crate::engine::ts_test_fixtures::vh1_pmt_packet();
         assert_eq!(parse_pmt_first_video(&pkt[4..]), Some((0x0E0F, 0x02)));
+    }
+}
+
+#[cfg(all(test, feature = "video-encoder-x264"))]
+mod eos_tests {
+    use super::*;
+    use crate::engine::ts_parse::{TS_PACKET_SIZE, TS_SYNC_BYTE};
+    use video_codec::{VideoEncoderCodec, VideoEncoderConfig};
+
+    /// One IDR from a stream whose SPS declares a reorder depth (libx264
+    /// with B-frames): the decoder holds it until end of stream, which
+    /// `send_flush` signals. The empty `send_packet` this used was refused
+    /// before reaching libavcodec, and the sample decoded to nothing.
+    #[test]
+    fn a_sample_from_a_reordering_stream_decodes() {
+        let (w, h) = (320usize, 240usize);
+        let mut enc = video_engine::VideoEncoder::open(&VideoEncoderConfig {
+            codec: VideoEncoderCodec::X264,
+            width: w as u32,
+            height: h as u32,
+            fps_num: 25,
+            fps_den: 1,
+            max_b_frames: 2,
+            tune: String::new(),
+            global_header: false,
+            ..VideoEncoderConfig::default()
+        })
+        .unwrap();
+        let y: Vec<u8> = (0..w * h).map(|k| (k % 200) as u8 + 20).collect();
+        let c = vec![128u8; w / 2 * h / 2];
+        let mut aus = enc.encode_frame(&y, w, &c, w / 2, &c, w / 2, Some(0)).unwrap();
+        aus.extend(enc.flush().unwrap());
+        let idr = &aus[0].data;
+        assert!(video_engine::h264_declared_reorder_depth(idr).is_some_and(|d| d >= 1));
+
+        let mut ts = Vec::new();
+        let pat = crate::engine::ts_test_fixtures::pat_section(&[(1, 0x1000)], 0);
+        ts.extend(crate::engine::ts_test_fixtures::packetize_sections(0, &[&pat], 0).concat());
+        let pmt = crate::engine::ts_test_fixtures::pmt_section(1, 0, 0x100, &[], &[(0x1B, 0x100, &[])]);
+        ts.extend(crate::engine::ts_test_fixtures::packetize_sections(0x1000, &[&pmt], 0).concat());
+        // PES (no timestamps), zero-padded to whole packets — trailing zero
+        // bytes are legal Annex B stuffing.
+        let mut pes = vec![0, 0, 1, 0xE0, 0, 0, 0x80, 0x00, 0x00];
+        pes.extend_from_slice(idr);
+        pes.resize(pes.len().div_ceil(184) * 184, 0);
+        for (i, chunk) in pes.chunks(184).enumerate() {
+            let mut p = vec![TS_SYNC_BYTE, if i == 0 { 0x41 } else { 0x01 }, 0x00, 0x10 | (i as u8 & 0x0F)];
+            p.extend_from_slice(chunk);
+            assert_eq!(p.len(), TS_PACKET_SIZE);
+            ts.extend(p);
+        }
+        let (metrics, y_plane) = decode_and_metrics(&ts, None);
+        assert!(metrics.is_some(), "the held IDR comes out at end of stream");
+        assert_eq!(y_plane.map(|p| (p.width, p.height)), Some((320, 240)));
     }
 }

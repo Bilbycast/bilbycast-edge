@@ -223,6 +223,7 @@ fn init_webrtc_video_encoder_state(
 fn open_webrtc_video_active(
     cfg: &VideoEncodeConfig,
     source_is_h264: bool,
+    first_au: &[u8],
     output_id: &str,
     flow_id: &str,
     output_stats: &Arc<OutputStatsAccumulator>,
@@ -237,7 +238,15 @@ fn open_webrtc_video_active(
     } else {
         video_codec::VideoCodec::Hevc
     };
-    let decoder = match video_engine::VideoDecoder::open(source_codec) {
+    // Seeded from the access unit that triggered the open: an H.264
+    // decoder's reorder depth comes from its SPS (`ReorderSeed`).
+    let decoder = match video_engine::VideoDecoder::open_opts(
+        source_codec,
+        video_engine::DecoderOptions {
+            reorder_seed: video_engine::ReorderSeed::FromAccessUnit(first_au),
+            ..Default::default()
+        },
+    ) {
         Ok(d) => d,
         Err(e) => {
             let msg = format!(
@@ -434,7 +443,13 @@ async fn handle_webrtc_video_frame(
             _ => unreachable!(),
         };
         *video_state = open_webrtc_video_active(
-            &cfg, source_is_h264, output_id, flow_id, stats, events,
+            &cfg,
+            source_is_h264,
+            &nalus_to_annex_b_webrtc(nalus),
+            output_id,
+            flow_id,
+            stats,
+            events,
         );
         if matches!(video_state, WebrtcVideoEncoderState::Failed) {
             return;
