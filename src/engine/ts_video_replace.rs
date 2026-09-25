@@ -158,13 +158,16 @@ impl SourceClockWatch {
         self.since_pcr_90k >= PCR_STARVED_90K
     }
 
-    /// A video payload packet, ahead of any PCR it carries. At a PES start
-    /// the silence since the previous video packet is measured, and the
-    /// hold total at which the PES it completes had all its data — before
-    /// that silence — is returned.
-    pub(crate) fn on_video_payload(&mut self, pusi: bool) -> i64 {
+    /// A video payload packet, ahead of [`Self::on_pcr`] for the PCR it
+    /// carries (`own_pcr`). At a PES start the silence since the previous
+    /// video packet is measured — up to this packet's own PCR when it has
+    /// one: the first packet after a pause often carries the PCR that shows
+    /// it (a media-player MPTS loop, PCR on the video PID) — and the hold
+    /// total at which the PES it completes had all its data, before that
+    /// silence, is returned.
+    pub(crate) fn on_video_payload(&mut self, pusi: bool, own_pcr: Option<u64>) -> i64 {
         let complete_at = self.silence_total;
-        if pusi && let (Some(now), Some(at)) = (self.last_pcr, self.pcr_at_video) {
+        if pusi && let (Some(now), Some(at)) = (own_pcr.or(self.last_pcr), self.pcr_at_video) {
             let silence = crate::engine::ts_parse::pcr_diff_27mhz(now, at).max(0);
             if let Some(usual) = self.usual_silence()
                 && silence > (2 * usual).max(SILENCE_MIN_27MHZ)
@@ -1488,7 +1491,7 @@ mod inner {
         pub fn flush(&mut self, output: &mut Vec<u8>) {
             if self.pes_started && !self.pes_buffer.is_empty() {
                 let pes = std::mem::take(&mut self.pes_buffer);
-                self.consuming_complete_at = self.clock.on_video_payload(false);
+                self.consuming_complete_at = self.clock.on_video_payload(false, None);
                 let _ = self.consume_pes(&pes, output);
                 self.pes_started = false;
             }
@@ -1591,7 +1594,8 @@ mod inner {
             }
             let payload = &pkt[payload_start..];
 
-            let complete_at = self.clock.on_video_payload(pusi);
+            let own_pcr = if Some(ts_pid(pkt)) == self.source_pcr_pid { extract_pcr(pkt) } else { None };
+            let complete_at = self.clock.on_video_payload(pusi, own_pcr);
             if pusi {
                 self.clock.on_pes_start(
                     crate::engine::ts_parse::extract_pes_dts(pkt)
@@ -3013,7 +3017,7 @@ mod tests {
             w.on_pcr(pcr, false);
             pcr += 40 * ms;
             for k in 0..4 {
-                let at = w.on_video_payload(k == 0);
+                let at = w.on_video_payload(k == 0, None);
                 if k == 0 {
                     w.pes_consumed(pts - 3_600, at);
                     w.frame_out(pts - 7_200);
@@ -3031,18 +3035,32 @@ mod tests {
         // and the frame the decoder held back (pts − 7200) leaves, then that
         // one; both sat through the silence. The next file's own frame did
         // not.
-        let at = w.on_video_payload(true);
+        let at = w.on_video_payload(true, None);
         w.pes_consumed(pts - 3_600, at);
         w.frame_out(pts - 7_200);
         w.frame_out(pts - 3_600);
         w.on_pcr(pcr, false);
-        let later = w.on_video_payload(true);
+        let later = w.on_video_payload(true, None);
         w.pes_consumed(pts + 60_000, later);
         w.frame_out(pts + 60_000);
         // The silence (680 ms since the last video packet) beyond the
         // usual 40 ms.
         let hold = 640 * ms as i64;
         assert_eq!(w.take_holds(), vec![(pts - 7_200, hold), (pts - 3_600, hold)]);
+        // The same silence shown only by the PCR the next PES start itself
+        // carries (no filler PCRs across it) is the same hold.
+        let mut w2 = SourceClockWatch::default();
+        let mut pcr = 27_000_000u64;
+        for k in 0..20u64 {
+            let at = w2.on_video_payload(true, Some(pcr));
+            w2.pes_consumed(900_000 + k * 3_600, at);
+            w2.on_pcr(pcr, true);
+            pcr += 40 * ms;
+        }
+        let at = w2.on_video_payload(true, Some(pcr + 640 * ms));
+        w2.pes_consumed(900_000 + 20 * 3_600, at);
+        w2.frame_out(900_000 + 19 * 3_600);
+        assert_eq!(w2.take_holds(), vec![(900_000 + 19 * 3_600, 640 * ms as i64)]);
     }
 
     #[test]

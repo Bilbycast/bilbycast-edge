@@ -48,8 +48,9 @@
 //! (`transcode_pcr_residency_exceeded`). The cap is re-checked every time a
 //! larger video lead is seen: before anything re-encoded has been measured
 //! `D` is lowered to it; after that it is lowered **once per epoch**, to the
-//! cap but never below the largest lateness measured in the epoch + 40 ms
-//! (one forward PCR step, DI), and the Warning covers the rest.
+//! cap less 20 ms of headroom but never below the largest lateness measured
+//! in the epoch + 40 ms (one forward PCR step, DI), and the Warning covers
+//! the rest.
 //!
 //! Lateness is the pipeline's, not the source's: a stretch in which the
 //! input carried no PCR at all — a paused or variable-frame-rate source
@@ -127,6 +128,12 @@ const LATCH_TOLERANCE_27MHZ: i64 = 10 * 27_000;
 /// ISO/IEC 13818-1 §2.4.2.6: data leaves the elementary-stream buffer within
 /// one second.
 const MAX_RESIDENCY_27MHZ: i64 = 27_000_000;
+/// The one post-latch lowering of `D` goes this far below the residency
+/// cap: room for the video's lead to grow a little more before the
+/// Warning, and a step always worth its DI (never a few ms over the cap
+/// left standing because the step would have been under
+/// [`LATCH_TOLERANCE_27MHZ`] — VH1 sat at 1 002–1 008 ms that way).
+const RESIDENCY_HEADROOM_27MHZ: i64 = 20 * 27_000;
 /// A forward input PCR step is a gap (see module doc) when it exceeds twice
 /// the input's usual step and this — MPEG-TS asks for a PCR at least every
 /// 100 ms.
@@ -700,14 +707,15 @@ impl TsPcrRemux {
             }
             return;
         }
-        // Once per epoch `D` may still come down — to the cap, but never
-        // below the largest lateness measured this epoch plus the minimum
-        // margin, so every PES already measured stays on time. One forward
-        // PCR step, DI; after it the Warning says what is left.
+        // Once per epoch `D` may still come down — to the cap less a little
+        // headroom, but never below the largest lateness measured this
+        // epoch plus the minimum margin, so every PES already measured
+        // stays on time. One forward PCR step, DI; after it the Warning
+        // says what is left.
         if !self.lowered_in_epoch
             && let Some(l) = self.max_lateness
         {
-            let d = cap.max(l + MIN_MARGIN_27MHZ).max(0);
+            let d = (cap - RESIDENCY_HEADROOM_27MHZ).max(l + MIN_MARGIN_27MHZ).max(0);
             if self.offset - d >= LATCH_TOLERANCE_27MHZ {
                 self.lowered_in_epoch = true;
                 self.set_offset(d, "lowered once to hold the video within the 1 s residency");
@@ -1362,8 +1370,9 @@ mod tests {
 
     /// A4(a), Sky audio-only: the audio's smallest lead is 61.8 ms and the
     /// passthrough video's lead reaches 943 ms after the audio latched. `D`
-    /// comes down once to the 57 ms cap — one forward PCR step, DI — the
-    /// video's residency is back to 1 s and nothing warns.
+    /// comes down once to the 57 ms cap less 20 ms of headroom — one forward
+    /// PCR step, DI — so the video's residency is 980 ms; a lead that grows
+    /// past what the headroom absorbs is only warned about.
     #[test]
     fn a_video_lead_past_the_cap_after_the_latch_lowers_d_once() {
         let t0 = 27_000_000u64;
@@ -1378,18 +1387,18 @@ mod tests {
         input.extend_from_slice(&pes_start_packet(A, 1, 0xC0, (t0 + 30 * MS + 70 * MS) / 300, None));
         input.extend_from_slice(&pes_start_packet(V, 1, 0xE0, (t0 + 30 * MS + 943 * MS) / 300, None));
         input.extend_from_slice(&pcr_only_packet(V, 1, t0 + 60 * MS, false));
-        input.extend_from_slice(&pes_start_packet(V, 2, 0xE0, (t0 + 60 * MS + 960 * MS) / 300, None));
+        input.extend_from_slice(&pes_start_packet(V, 2, 0xE0, (t0 + 60 * MS + 970 * MS) / 300, None));
         input.extend_from_slice(&pcr_only_packet(V, 2, t0 + 90 * MS, false));
         let mut out = Vec::new();
         s.set_replaced_pids(Some(A), None);
         s.process(&input, &mut out);
-        assert_eq!(s.offset_27mhz(), 57 * MS, "the cap: 1 s − 943 ms");
+        assert_eq!(s.offset_27mhz(), 37 * MS, "the cap (1 s − 943 ms) less 20 ms");
         let pcrs = pcr_pkts(&out, V);
         assert_eq!(pcrs.iter().filter(|p| p.1).count(), 1, "one step");
-        assert_eq!(pcrs[2].0 - pcrs[1].0, (30 + 23) * MS, "forward by 80 − 57 ms");
-        // The later 960 ms lead is past the lowered cap: no second step,
-        // the Warning instead.
-        let ev = rx.try_recv().expect("residency Warning for the 960 ms lead");
+        assert_eq!(pcrs[2].0 - pcrs[1].0, (30 + 43) * MS, "forward by 80 − 37 ms");
+        // The later 970 ms lead is past what the headroom absorbs: no second
+        // step, the Warning instead.
+        let ev = rx.try_recv().expect("residency Warning for the 970 ms lead");
         assert_eq!(ev.details.unwrap()["error_code"], "transcode_pcr_residency_exceeded");
         assert!(rx.try_recv().is_err());
         assert_eq!(s.stats.offset_raises.load(Ordering::Relaxed), 0);
