@@ -226,21 +226,6 @@ impl InputTranscoder {
         }
     }
 
-    /// Wire the **per-input** PCR forward-jump signal channel onto
-    /// the audio replacer (the video replacer doesn't silence-pad —
-    /// video PES values follow the source PCR jump). The
-    /// `TsPtsRewriter` in this SAME input's pipeline must share the
-    /// same `Arc<AtomicI64>` — typically constructed alongside this
-    /// transcoder and passed to both via the input's spawn function.
-    pub fn set_pcr_jump_signal(
-        &mut self,
-        signal: Arc<std::sync::atomic::AtomicI64>,
-    ) {
-        if let Some(a) = self.audio.as_mut() {
-            a.set_pcr_jump_signal(signal);
-        }
-    }
-
     /// Pass one chunk of raw 188-byte-aligned TS through the audio stage, then
     /// the video stage. Returns the transformed output as a borrowed slice of
     /// the internal scratch buffer. The slice is valid until the next call to
@@ -829,7 +814,6 @@ mod tests {
             pid_map: None,
             passthrough_clock: false,
             av_sync_pacer: None,
-            pcr_jump_signal: None,
             av_skew: None,
         })
         .expect("rewriter active");
@@ -1090,5 +1074,108 @@ mod tests {
         for (o, i) in pcrs_out.iter().zip(&pcrs_in).skip(20) {
             assert_eq!(*o, i - d);
         }
+    }
+
+    /// A source that restarts with its PCR and PTS reset 60 s back (an
+    /// encoder restart, an ffmpeg `-stream_loop` wrap): the re-encoded
+    /// audio follows it onto the new timeline. Held on the old one, the PCR
+    /// stage took every re-encoded PES after the reset for a frame of the
+    /// previous epoch and dropped it, for as long as the reset was deep
+    /// (a loop's length, for good on a looping source).
+    #[test]
+    fn re_encoded_audio_follows_a_backward_source_reset() {
+        use crate::engine::ts_parse::{extract_pcr, extract_pes_pts, pcr_only_packet, ts_pid, ts_pusi};
+        use crate::engine::ts_test_fixtures::{packetize_sections, pat_packet, pmt_section};
+        const ADTS: &[u8] = include_bytes!("testdata/sine1k_aac_lc_48k_stereo.adts");
+        let mut frames = Vec::new();
+        let mut off = 0usize;
+        while off + 7 <= ADTS.len() {
+            let len = (((ADTS[off + 3] as usize) & 0x03) << 11)
+                | ((ADTS[off + 4] as usize) << 3)
+                | ((ADTS[off + 5] as usize) >> 5);
+            if len == 0 || off + len > ADTS.len() {
+                break;
+            }
+            frames.push(&ADTS[off..off + len]);
+            off += len;
+        }
+        let ae = AudioEncodeConfig {
+            codec: "mp2".to_string(),
+            bitrate_kbps: Some(192),
+            sample_rate: None,
+            channels: None,
+            silent_fallback: false,
+            opus_vbr_mode: None,
+            opus_fec: false,
+            opus_dtx: false,
+            opus_frame_duration_ms: None,
+            source_audio_pid: None,
+            ts_signalling: None,
+        };
+        let mut t = InputTranscoder::new(Some(&ae), None, None, None).unwrap().unwrap();
+
+        const MS: u64 = 27_000;
+        const RESET: u64 = 60_000 * MS;
+        let t0 = 100 * 27_000_000u64;
+        let pes_27 = 7 * 1024 * 27_000_000u64 / 48_000;
+        // From this stream time on, the source's clock reads 60 s less.
+        let t_reset = t0 + 10 * pes_27;
+        let clock = |at: u64| if at >= t_reset { at - RESET } else { at };
+        let mut events: Vec<(u64, Vec<[u8; 188]>)> = Vec::new();
+        let mut psi = vec![pat_packet(&[(1, 0x1000)], 0, 0)];
+        let pmt = pmt_section(1, 0, 0x100, &[], &[(0x1B, 0x100, &[]), (0x0F, 0x101, &[])]);
+        psi.extend(packetize_sections(0x1000, &[&pmt], 0));
+        events.push((t0, psi));
+        for k in 0..100u64 {
+            let at = t0 + 1 + k * 30 * MS;
+            events.push((at, vec![pcr_only_packet(0x100, 0, clock(at), false)]));
+        }
+        let mut acc = 0u8;
+        for j in 0..19u64 {
+            let at = t0 + 2 + j * pes_27;
+            let mut es = Vec::new();
+            for i in 0..7 {
+                es.extend_from_slice(frames[(j as usize * 7 + i) % frames.len()]);
+            }
+            let pts = (clock(at) + 100 * MS) / 300;
+            let pes = crate::engine::ts_audio_replace::test_build_audio_pes(&es, pts);
+            events.push((at, crate::engine::ts_audio_replace::test_packetize(0x101, &pes, &mut acc)));
+        }
+        events.sort_by_key(|(at, _)| *at);
+        let input: Vec<u8> = events
+            .iter()
+            .flat_map(|(_, p)| p.iter().flat_map(|q| q.iter().copied()))
+            .collect();
+        let mut out = Vec::new();
+        for chunk in input.chunks(7 * 188) {
+            out.extend_from_slice(t.process(chunk));
+        }
+
+        let stale = t.pcr_stats().stale_frames_dropped.load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(stale, 0, "no re-encoded PES taken for the previous epoch's");
+        // Every re-encoded PES after the reset's first PCR is on the new
+        // timeline: its PTS within a second of the PCR ahead of it.
+        let (mut last_pcr, mut after_reset) = (None, 0);
+        for p in out.chunks(188) {
+            if ts_pid(p) == 0x100
+                && let Some(v) = extract_pcr(p)
+            {
+                last_pcr = Some(v);
+            }
+            if ts_pid(p) == 0x101 && ts_pusi(p) {
+                let pcr = last_pcr.expect("a PCR first");
+                if pcr < t0 {
+                    let pts27 = extract_pes_pts(p).unwrap() * 300;
+                    assert!(
+                        pts27.abs_diff(pcr) < 1_000 * MS,
+                        "PES {} ms off the PCR",
+                        pts27.abs_diff(pcr) / MS
+                    );
+                    after_reset += 1;
+                }
+            }
+        }
+        // Nine PES of seven AAC frames after the reset: 56 MP2 frames.
+        assert!(after_reset >= 50, "re-encoded audio after the reset: {after_reset} PES");
     }
 }

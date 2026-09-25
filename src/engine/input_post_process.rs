@@ -63,16 +63,6 @@ pub struct InputPostProcessConfig<'a> {
     /// the muxer-mode rewriter; `None` disables it regardless of
     /// `passthrough_clock`.
     pub av_sync_pacer: Option<&'a Arc<AvSyncPacer>>,
-    /// **Per-input** PCR forward-jump signal channel. When set, the
-    /// rewriter `fetch_add`s the magnitude of every forward PCR jump
-    /// > 500 ms onto this `Arc<AtomicI64>`. The `TsAudioReplacer` on
-    /// the SAME input's pipeline must share the same `Arc` to read +
-    /// silence-pad. Per-input by design — passive inputs use their
-    /// own counters so cross-input loop wraps can't pollute the
-    /// active input's audio. `None` disables the mechanism (audio
-    /// passthrough or test setup).
-    pub pcr_jump_signal:
-        Option<&'a Arc<std::sync::atomic::AtomicI64>>,
     /// **Per-input** edge-added A/V skew reporter (`stats::av_skew`).
     /// The muxer-mode rewriter reports its lipsync-trim contribution
     /// here. Obtain via
@@ -136,16 +126,6 @@ impl InputPostProcess {
                     None
                 } else {
                     let mut r = TsPtsRewriter::new(p.clone());
-                    // Wire the per-input PCR forward-jump signal —
-                    // the audio replacer in this SAME input's
-                    // pipeline shares the same `Arc<AtomicI64>` and
-                    // silence-pads its accumulator when the rewriter
-                    // bumps it. Each input owns its own counter so
-                    // passive inputs' loop wraps can't pollute the
-                    // active input's audio.
-                    if let Some(s) = cfg.pcr_jump_signal {
-                        r.set_pcr_jump_signal(s.clone());
-                    }
                     if let Some(rep) = cfg.av_skew {
                         r.set_av_skew_reporter(rep.clone());
                     }
@@ -382,7 +362,6 @@ mod tests {
             pid_map: None,
             passthrough_clock: false,
             av_sync_pacer: None,
-            pcr_jump_signal: None,
             av_skew: None,
         })
         .expect("rewriter must be built when pid_overrides is non-empty");
@@ -491,7 +470,6 @@ mod tests {
             pid_map: None,
             passthrough_clock: false,
             av_sync_pacer: Some(&pacer),
-            pcr_jump_signal: None,
             av_skew: None,
         });
         assert!(
@@ -514,7 +492,6 @@ mod tests {
             pid_map: None,
             passthrough_clock: false,
             av_sync_pacer: Some(&pacer),
-            pcr_jump_signal: None,
             av_skew: None,
         });
         assert!(

@@ -388,29 +388,6 @@ pub struct TsPtsRewriter {
     /// be rewritten under muxer mode so splice events fire at the
     /// correct moment downstream relative to the regenerated PCR.
     scte35_pids: HashSet<u16>,
-    /// **Per-input** signal channel for PCR forward-jump events.
-    /// Shared `Arc<AtomicI64>` with the `TsAudioReplacer` on this
-    /// SAME input's pipeline. On a forward PCR jump > 500 ms, this
-    /// rewriter `fetch_add`s the magnitude (in 27 MHz ticks) so the
-    /// audio replacer can silence-pad its accumulator to keep
-    /// output audio PTS aligned with the (jumped) PCR.
-    ///
-    /// **Why per-input, not per-flow.** A flow may have N inputs all
-    /// running their full rewriter pipelines (passive inputs run
-    /// pipelines to keep PSI cache + clock-anchor state warm for
-    /// input switches). If the signal channel were shared per-flow,
-    /// every passive input's ffmpeg-loop wrap would pollute the
-    /// active input's audio replacer with phantom silence-pad
-    /// requests — output audio would be drowned in silence. Each
-    /// input owning its own counter solves this by construction:
-    /// only the active input's rewriter + audio replacer pair
-    /// communicate, passive inputs' state is local to their own
-    /// pipeline. Wired by each input's spawn function.
-    ///
-    /// `None` disables the signal — used in tests and on inputs
-    /// whose audio is passthrough (no replacer in the pipeline to
-    /// receive the signal).
-    pcr_jump_signal: Option<Arc<std::sync::atomic::AtomicI64>>,
     /// **MPTS guard latch.** Set on the first PAT observation that
     /// shows > 1 program. When set, every subsequent `process()` call
     /// becomes a verbatim passthrough: no PCR rewriting, no PES PTS
@@ -523,7 +500,6 @@ impl TsPtsRewriter {
             psi_emit_cc: HashMap::new(),
             last_psi_emit_master_27mhz: None,
             scte35_pids: HashSet::new(),
-            pcr_jump_signal: None,
             mpts_passthrough_latch: false,
             av_skew: None,
             av_skew_last: None,
@@ -531,20 +507,6 @@ impl TsPtsRewriter {
             pes_hold_since: None,
             clock_passthrough_no_pcr: false,
         }
-    }
-
-    /// Attach a per-input PCR forward-jump signal `Arc<AtomicI64>`.
-    /// The `TsAudioReplacer` on this SAME input's pipeline must share
-    /// the same `Arc`. On every forward PCR jump > 500 ms, this
-    /// rewriter `fetch_add`s the magnitude so the audio replacer can
-    /// silence-pad its accumulator to keep output audio PTS aligned
-    /// with the (jumped) PCR. See the field's doc-comment for the
-    /// per-input rationale. Idempotent; calling twice overwrites.
-    pub fn set_pcr_jump_signal(
-        &mut self,
-        signal: Arc<std::sync::atomic::AtomicI64>,
-    ) {
-        self.pcr_jump_signal = Some(signal);
     }
 
     /// Wire the manager event sender so the rewriter can report that it
@@ -1145,8 +1107,9 @@ impl TsPtsRewriter {
     /// A >500 ms **forward** jump splits two ways on whether the wall clock
     /// witnessed it. If real elapsed time accounts for the jump (a live edit
     /// point, a splice), it passes through — that preserves PCR_FO rate
-    /// accuracy — and the `pcr_jump_signal` tells this input's audio replacer
-    /// to silence-pad the gap. If the jump is *unwitnessed* by more than
+    /// accuracy; an upstream audio re-encode follows the jump on its own
+    /// PES PTS (`ts_audio_replace` re-anchors on any step over 500 ms), so
+    /// nothing needs telling. If the jump is *unwitnessed* by more than
     /// 500 ms (a file loop wrap: source PCR leaps a whole programme duration
     /// while only milliseconds of wall clock passed), it is bridged like the
     /// backward case, because passing it through injects that leap into the
@@ -1243,14 +1206,13 @@ impl TsPtsRewriter {
             // output wall-clock-true, exactly as the backward-jump arm
             // above already does.
             //
-            // Why this never showed on audio-bearing sources: the
-            // `pcr_jump_signal` below makes the audio replacer
-            // silence-pad the gap, so the audio clock advances in step
-            // and the audio-mastered display stays consistent. Video-only
-            // sources emit the signal but nothing consumes it, leaving
-            // the drift uncorrected. The jump is also smaller than the
-            // display's 5 s `pts_jump` re-anchor threshold, so it never
-            // trips a discontinuity reset — it just accumulates silently.
+            // It first showed on a video-only clip: at the time an input
+            // audio re-encode silence-padded every such jump, which kept
+            // an audio-mastered display in step on sources with audio
+            // (that pad is gone — the re-encoded audio follows its own
+            // PES PTS). The jump is also smaller than the display's 5 s
+            // `pts_jump` re-anchor threshold, so it never trips a
+            // discontinuity reset — it just accumulates silently.
             let delta_master = master_now.wrapping_sub(self.anchor.last_master_27mhz);
             let unwitnessed = (delta_src as u64).saturating_sub(delta_master);
             if unwitnessed > DISCONTINUITY_THRESHOLD_27MHZ {
@@ -1268,29 +1230,10 @@ impl TsPtsRewriter {
                     "ts_pts_rewriter: unwitnessed forward PCR jump bridged (DI=1)"
                 );
             } else {
-                // Signal the audio replacer on this SAME input's pipeline
-                // to silence-pad the gap. Only meaningful on the
-                // pass-through arm: the bridge above removes the gap from
-                // the output timeline entirely, so padding it would
-                // re-introduce the very drift the bridge just cancelled.
-                //
-                // **Per-input signal**: this Arc is shared with ONE audio
-                // replacer (the one in this input's pipeline). Passive
-                // inputs have their own separate Arc — no cross-input
-                // pollution. See the field's doc-comment for rationale.
-                // `None` = no replacer paired (audio passthrough or test
-                // setup); the signal is silently dropped.
-                let signalled = if let Some(s) = self.pcr_jump_signal.as_ref() {
-                    s.fetch_add(delta_src, std::sync::atomic::Ordering::Release);
-                    true
-                } else {
-                    false
-                };
                 tracing::info!(
                     src_pcr_27mhz,
                     delta_src_27mhz = delta_src,
                     delta_master_27mhz = delta_master,
-                    signalled,
                     "ts_pts_rewriter: forward PCR discontinuity passed through (DI=1)"
                 );
             }

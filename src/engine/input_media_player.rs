@@ -285,29 +285,14 @@ async fn run(
             None
         }
     };
-    // **Per-input** PCR forward-jump signal channel. Built once here in
-    // the input pipeline and shared with the input's audio replacer
-    // (via `InputTranscoder::set_pcr_jump_signal`) and its
-    // `TsPtsRewriter` (via `InputPostProcessConfig.pcr_jump_signal`).
-    // Each input owns its own counter so cross-input loop wraps can't
-    // pollute the active input's audio (the bug that motivated this
-    // design — see `bilbycast-edge` commit 48ea5dc 0.84.0 v2).
-    //
-    // Critical for media_player: every loop boundary in a multi-source
-    // playlist (or single-source loop) emits a forward PCR jump as the
-    // splice re-anchors. Without this signal, an input-side audio
-    // re-encoder runs through the jump verbatim — its `samples_since_
-    // anchor` keeps advancing while the wire-time clock leaps ahead,
-    // and output audio falls progressively behind video by the
-    // cumulative loop-wrap distance.
-    let pcr_jump_signal: Arc<std::sync::atomic::AtomicI64> =
-        Arc::new(std::sync::atomic::AtomicI64::new(0));
     if let Some(t) = transcoder.as_mut() {
-        t.set_pcr_jump_signal(pcr_jump_signal.clone());
         // A loop splice steps the file's PTS forward over audio that is
         // continuous content: the audio replacer steps its output PTS with
-        // it instead of inserting silence (which would put a gap into the
-        // programme audio every loop).
+        // the audio's own PES PTS instead of inserting silence (which would
+        // put a gap into the programme audio every loop). Every stream of
+        // the next file moves by the same splice offset, so following the
+        // audio PTS keeps the file's own A/V relationship, as passthrough
+        // does.
         t.set_audio_gap_fill(crate::engine::ts_audio_replace::GapFill::Relabel);
     }
     crate::engine::input_transcode::register_ingress_stats(
@@ -332,7 +317,6 @@ async fn run(
             pid_map: config.pid_map.as_ref(),
             passthrough_clock,
             av_sync_pacer: av_sync_pacer.as_ref(),
-            pcr_jump_signal: Some(&pcr_jump_signal),
             av_skew: Some(&av_skew_for_post),
         },
     );
@@ -377,7 +361,7 @@ async fn run(
             run_controlled(
                 &config, &per_input_tx, &stats, &cancel, &events, &flow_id, &input_id,
                 &mut seq_num, &mut cont, &mut transcoder, &mut post, &mut demux_cache,
-                &media_stats, &pcr_jump_signal, cmd_rx,
+                &media_stats, cmd_rx,
             )
             .await;
             return;
@@ -399,11 +383,6 @@ async fn run(
                 return;
             }
             let source = &config.sources[idx];
-            let gap_signal = if transcoder.is_some() {
-                Some(&pcr_jump_signal)
-            } else {
-                None
-            };
             media_stats.current_source_index.store(idx as u64, Ordering::Relaxed);
             media_stats.state.store(media_player_state::STARTING, Ordering::Relaxed);
             // Phase 5 transport: the next item is the following playlist entry,
@@ -426,7 +405,6 @@ async fn run(
                 transcoder: &mut transcoder,
                 pid_overrides: config.pid_overrides.as_ref(),
                 post: &mut post,
-                splice_gap_signal: gap_signal,
                 bundle_size,
                 pcr_deadlines: controller::pcr_deadlines_enabled(config.pcr_deadlines),
                 media_stats: &media_stats,
@@ -502,12 +480,6 @@ pub(super) struct PlayerSession<'a> {
     /// pid_map) applied to every emitted TS chunk before publishing onto
     /// the broadcast channel. None ⇒ no post-processing (zero cost).
     pub(super) post: &'a mut Option<crate::engine::input_post_process::InputPostProcess>,
-    /// Per-input PCR-jump signal shared with the `TsAudioReplacer` on
-    /// this input's pipeline. `play_ts_file` writes the splice-boundary
-    /// video-audio gap here so the audio replacer can silence-pad its
-    /// output PTS to match the video timeline at the loop boundary.
-    /// `None` in tests or when no transcoder is active.
-    pub(super) splice_gap_signal: Option<&'a std::sync::Arc<std::sync::atomic::AtomicI64>>,
     /// Maximum size in bytes of each emitted datagram (`RtpPacket`) — always
     /// an integer multiple of 188 (the TS packet size). Set once from
     /// [`crate::config::models::MediaPlayerInputConfig::ts_packets_per_datagram`]
@@ -969,7 +941,6 @@ async fn run_controlled(
     post: &mut Option<crate::engine::input_post_process::InputPostProcess>,
     demux_cache: &mut DemuxCacheField,
     media_stats: &Arc<MediaPlayerStats>,
-    pcr_jump_signal: &Arc<std::sync::atomic::AtomicI64>,
     mut cmd_rx: tokio::sync::mpsc::Receiver<controller::MediaPlayerCommand>,
 ) {
     use transition::{NextOutcome, NextRequest, TransitionMachine, TransitionTrigger};
@@ -1005,7 +976,6 @@ async fn run_controlled(
         let active = sm.active_index();
         let cfg_idx = order[active];
         let source = &config.sources[cfg_idx];
-        let gap_signal = if transcoder.is_some() { Some(pcr_jump_signal) } else { None };
         media_stats.current_source_index.store(cfg_idx as u64, Ordering::Relaxed);
         media_stats.generation.store(sm.generation(), Ordering::Relaxed);
         media_stats.state.store(media_player_state::STARTING, Ordering::Relaxed);
@@ -1035,7 +1005,6 @@ async fn run_controlled(
             transcoder: &mut *transcoder,
             pid_overrides: config.pid_overrides.as_ref(),
             post: &mut *post,
-            splice_gap_signal: gap_signal,
             bundle_size,
             pcr_deadlines: controller::pcr_deadlines_enabled(config.pcr_deadlines),
             media_stats,
@@ -1935,47 +1904,6 @@ async fn play_ts_file(
         Some(a) => a.max(splice.max_emitted_pcr_90k),
         None => splice.max_emitted_pts_90k.max(splice.max_emitted_pcr_90k),
     };
-
-    // Signal the splice-boundary video-audio gap to the TsAudioReplacer
-    // so it can silence-pad output audio PTS to match the video timeline.
-    //
-    // On real broadcast captures (Sky Witness, Seven, etc.) the file ends
-    // with `pcr_max > audio_max` by ~200 ms (video mux look-ahead). The
-    // splice anchor is `max(audio_max, pcr_max) + GUARD`, so the next
-    // loop's first audio PES starts ~(pcr_max − audio_max + GUARD) past
-    // this loop's last audio PES — but the TsAudioReplacer's encoder
-    // stamps output at steady sample-rate cadence and only sees a ~4.5 ms
-    // audio-PES gap. Without this signal, audio PTS falls behind video
-    // PTS by ~(pcr_max − audio_max) per loop (~-7 ms/min on Sky Witness).
-    //
-    // The signal rides on the same `pcr_jump_signal` channel that
-    // `TsPtsRewriter` uses for > 500 ms PCR jumps. `TsAudioReplacer`
-    // drains it via `swap(0)` on the next `consume_pes` and routes the
-    // value through `pending_silence_27mhz` → silence frames → encoder
-    // sample advance → output PTS catches up. No changes needed in
-    // `ts_audio_replace.rs`.
-    // Signal the per-loop video-audio gap to the TsAudioReplacer.
-    // The signal value is delivered into `pending_silence_27mhz` on
-    // the audio replacer's next `consume_pes`. The PES that arrives
-    // on the next call (loop 2's first audio PES, jumped forward by
-    // `next_target − audio_max + audio_offset`) triggers the > 500 ms
-    // forward-PTS discontinuity branch — re-anchor sets `out_pts_90k`
-    // to the new source PTS and resets `samples_since_anchor = 0` so
-    // the monotonicity guard sees the pristine state, NOT the
-    // post-silence-pad state. Then the pending silence drains into
-    // the accumulator: the encoder emits silence frames at the new
-    // anchor, filling the per-loop audio-video gap. Audio output
-    // resumes in sync with PCR every loop.
-    if let Some(signal) = session.splice_gap_signal.as_ref() {
-        let audio_max = splice
-            .max_emitted_audio_pts_90k
-            .unwrap_or(splice.max_emitted_pts_90k);
-        if splice.max_emitted_pcr_90k > audio_max {
-            let gap_90k = splice.max_emitted_pcr_90k - audio_max;
-            let gap_27m = (gap_90k as i64).saturating_mul(300);
-            signal.fetch_add(gap_27m, std::sync::atomic::Ordering::Release);
-        }
-    }
 
     // 3d: the last anchor PCR's deadline and output value, so the next TS
     // file starts `PCR gap` after it on the wall clock. Only when this file
@@ -4003,7 +3931,6 @@ mod tests {
             transcoder: &mut transcoder,
             pid_overrides: None,
             post: &mut post,
-            splice_gap_signal: None,
             bundle_size: BUNDLE_SIZE,
             pcr_deadlines: true,
             media_stats: &media_stats,
@@ -4487,7 +4414,6 @@ mod tests {
                 transcoder: &mut transcoder,
                 pid_overrides: None,
                 post: &mut None,
-                splice_gap_signal: None,
                 bundle_size: BUNDLE_SIZE,
                 pcr_deadlines: true,
                 media_stats: &media_stats,
@@ -4716,7 +4642,6 @@ mod tests {
                 transcoder: &mut transcoder,
                 pid_overrides: None,
                 post: &mut None,
-                splice_gap_signal: None,
                 bundle_size: BUNDLE_SIZE,
                 pcr_deadlines: true,
                 media_stats: &media_stats,
@@ -4740,7 +4665,6 @@ mod tests {
                 transcoder: &mut transcoder,
                 pid_overrides: None,
                 post: &mut None,
-                splice_gap_signal: None,
                 bundle_size: BUNDLE_SIZE,
                 pcr_deadlines: true,
                 media_stats: &media_stats,
@@ -5140,7 +5064,6 @@ mod tests {
             transcoder: &mut transcoder,
             pid_overrides: None,
             post: &mut None,
-            splice_gap_signal: None,
             bundle_size: BUNDLE_SIZE,
             pcr_deadlines: false,
             media_stats: &media_stats,
@@ -5261,7 +5184,6 @@ mod tests {
                 transcoder: &mut transcoder,
                 pid_overrides: None,
                 post: &mut None,
-                splice_gap_signal: None,
                 bundle_size: BUNDLE_SIZE,
                 pcr_deadlines: true,
                 media_stats: &media_stats,

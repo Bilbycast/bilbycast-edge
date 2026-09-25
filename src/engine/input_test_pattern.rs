@@ -148,7 +148,6 @@ async fn run_inner(
             pid_map: config.pid_map.as_ref(),
             passthrough_clock: false,
             av_sync_pacer: None,
-            pcr_jump_signal: None,
             av_skew: Some(&av_skew_for_post),
         },
     );

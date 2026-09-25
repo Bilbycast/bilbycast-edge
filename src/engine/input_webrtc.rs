@@ -89,7 +89,6 @@ pub fn spawn_whip_input(
             pid_map: config.pid_map.as_ref(),
             passthrough_clock: false,
             av_sync_pacer: None,
-            pcr_jump_signal: None,
             av_skew: Some(&av_skew_for_post),
         });
         if let Some(ref _p) = post {
@@ -347,7 +346,6 @@ pub fn spawn_whep_input(
             pid_map: config.pid_map.as_ref(),
             passthrough_clock: false,
             av_sync_pacer: None,
-            pcr_jump_signal: None,
             av_skew: Some(&av_skew_for_post),
         });
         if let Some(ref _p) = post {

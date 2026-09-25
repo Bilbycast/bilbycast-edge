@@ -46,7 +46,7 @@
 //! single-digit milliseconds per frame and must not run inline on a
 //! single-threaded runtime.
 
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU16, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 
 /// Lock-free per-instance counters surfaced to the manager via the
@@ -144,9 +144,10 @@ pub enum GapFill {
 
 /// 33-bit PTS arithmetic.
 const PTS_MASK: u64 = 0x1_FFFF_FFFF;
-/// A source-timeline offset beyond this re-anchors (forward) or is absorbed
-/// into the bias (backward): a restart, a splice across seconds, a file
-/// loop that resets its PTS.
+/// A source-timeline offset beyond this, either way, re-anchors the output
+/// at the new PTS: a restart, a splice across seconds, a file loop that
+/// resets its PTS. The PCR and the video follow the source across such a
+/// step, so the audio must too.
 const REANCHOR_90K: i64 = 45_000; // 500 ms
 /// An offset this large is corrected at the PES that shows it.
 const IMMEDIATE_90K: u64 = 9_000; // 100 ms
@@ -180,10 +181,6 @@ struct Timeline {
     samples: u64,
     /// Decoded sample rate; 0 until the first decode after an anchor.
     rate: u32,
-    /// Added to a source PTS to put it on the content timeline: a backward
-    /// source step the output did not follow, and the rewriter's forward PCR
-    /// jump signal.
-    bias_90k: i64,
     /// The current run of same-signed offsets below [`IMMEDIATE_90K`]: its
     /// sign (0 = none), the PTS it started at and its length in PES.
     run_sign: i8,
@@ -198,11 +195,9 @@ enum TimelineAction {
     Anchor,
     /// Within tolerance.
     Hold,
-    /// A forward step of more than 500 ms: re-anchor the output here.
+    /// A step of more than 500 ms, forward or back: re-anchor the output
+    /// here.
     Reanchor,
-    /// A backward step of more than 500 ms: keep the output monotonic and
-    /// measure the source from its new origin (offset in 90 kHz ticks).
-    Backward(i64),
     /// A gap of this many ticks before this PES's audio.
     Gap(i64),
     /// This PES's audio starts this many ticks before the content's end.
@@ -229,14 +224,9 @@ impl Timeline {
         if !self.anchored || self.rate == 0 {
             return TimelineAction::Anchor;
         }
-        let target = pts.wrapping_add(self.bias_90k as u64) & PTS_MASK;
-        let off = pts_diff(target, self.end_90k());
-        if off > REANCHOR_90K {
+        let off = pts_diff(pts, self.end_90k());
+        if off.abs() > REANCHOR_90K {
             return TimelineAction::Reanchor;
-        }
-        if off < -REANCHOR_90K {
-            self.clear_run();
-            return TimelineAction::Backward(off);
         }
         let magnitude = off.unsigned_abs();
         if magnitude <= DEADBAND_90K {
@@ -445,22 +435,11 @@ pub struct TsAudioReplacer {
     /// Edge-added A/V skew reporter (`stats::av_skew`). At the first AU of
     /// each PES this replacer publishes where that AU's audio will be
     /// presented minus its source PTS: the timeline bookkeeping (a
-    /// correction still pending, a backward step the output did not
-    /// follow) plus any latency the stamps do not cancel.
+    /// correction still pending) plus any latency the stamps do not
+    /// cancel.
     av_skew: Option<Arc<crate::stats::av_skew::AvSkewReporter>>,
     /// Publication of `av_skew` resumes at this source PTS after an anchor.
     av_skew_from_90k: Option<u64>,
-
-    /// **Per-input** signal from the `TsPtsRewriter` on this same input's
-    /// pipeline: the magnitude (27 MHz) of each forward PCR jump it passed
-    /// through. Drained at every PES PTS into the timeline bias, so a jump
-    /// the source audio PTS did not carry opens a gap of that size. When
-    /// the audio PTS carried it too, the doubled offset re-anchors — a
-    /// single gap either way. Per-input (vs per-flow) by design: passive
-    /// inputs run their own pipelines with their own counters, so
-    /// cross-input loop wraps cannot pollute the active input's audio.
-    /// `None` disables the mechanism (output-side replacers, tests).
-    pcr_jump_signal: Option<Arc<AtomicI64>>,
 
     /// Lazily constructed AAC-LC / ADTS decoder. Opened on the first PES
     /// flush once we know the source is AAC.
@@ -587,7 +566,6 @@ impl TsAudioReplacer {
             init_failure_reported: false,
             av_skew: None,
             av_skew_from_90k: None,
-            pcr_jump_signal: None,
             #[cfg(feature = "fdk-aac")]
             aac_decoder: None,
             #[cfg(feature = "media-codecs")]
@@ -620,16 +598,6 @@ impl TsAudioReplacer {
         reporter: Arc<crate::stats::av_skew::AvSkewReporter>,
     ) {
         self.av_skew = Some(reporter);
-    }
-
-    /// Attach a per-input PCR forward-jump signal `Arc<AtomicI64>`,
-    /// shared with the `TsPtsRewriter` on this SAME input's pipeline. The
-    /// rewriter adds the magnitude of every forward PCR jump > 500 ms it
-    /// passes through; this replacer drains it at each PES PTS into its
-    /// source-timeline bias. See the `pcr_jump_signal` field for the
-    /// rationale. Idempotent; calling twice overwrites.
-    pub fn set_pcr_jump_signal(&mut self, signal: Arc<AtomicI64>) {
-        self.pcr_jump_signal = Some(signal);
     }
 
     /// Wire the manager event sender so the replacer can report that it
@@ -1235,11 +1203,6 @@ impl TsAudioReplacer {
         self.latency = Latency::default();
         self.init_failure_reported = false;
         self.samples_since_anchor = 0;
-        // A stale loop-wrap signal means nothing to the new source. `swap(0)`
-        // is atomic, so this does not race the rewriter on the same input.
-        if let Some(s) = self.pcr_jump_signal.as_ref() {
-            s.swap(0, Ordering::AcqRel);
-        }
         self.resolved_channels = 0;
         self.resolved_sample_rate = 0;
         self.codecs_ready = false;
@@ -1336,12 +1299,6 @@ impl TsAudioReplacer {
     /// Hold the content to the source timeline at a PES PTS (see
     /// [`Timeline::check`]), then publish `av_skew`.
     fn on_pes_pts(&mut self, pts: u64, output: &mut Vec<u8>) {
-        if let Some(s) = self.pcr_jump_signal.as_ref() {
-            let drained = s.swap(0, Ordering::AcqRel);
-            if drained > 0 && self.timeline.anchored {
-                self.timeline.bias_90k = self.timeline.bias_90k.saturating_add(drained / 300);
-            }
-        }
         match self.timeline.check(pts) {
             TimelineAction::Anchor => {
                 // Nothing decoded since the anchor: it follows the PES PTS
@@ -1351,21 +1308,15 @@ impl TsAudioReplacer {
             }
             TimelineAction::Hold => {}
             TimelineAction::Reanchor => {
+                let content_end = self.timeline.end_90k();
                 tracing::info!(
                     pts,
-                    content_end = self.timeline.end_90k(),
-                    "ts_audio_replace: source PTS jumped forward by more than 500 ms; \
+                    content_end,
+                    step_90k = pts_diff(pts, content_end),
+                    "ts_audio_replace: source PTS stepped by more than 500 ms; \
                      re-anchoring audio output PTS"
                 );
                 self.anchor_at(pts);
-            }
-            TimelineAction::Backward(off) => {
-                tracing::info!(
-                    pts,
-                    offset_90k = off,
-                    "ts_audio_replace: BACKWARD source PTS reset; output PTS stay monotonic"
-                );
-                self.timeline.bias_90k = self.timeline.bias_90k.saturating_sub(off);
             }
             TimelineAction::Gap(off) => self.fill_gap(off, output),
             TimelineAction::Overlap(off) => self.drop_overlap(off),
@@ -1390,10 +1341,6 @@ impl TsAudioReplacer {
         self.pending_drop = 0;
         self.pending_fill_90k = 0;
         self.av_skew_from_90k = Some(pts.wrapping_add(AV_SKEW_HOLDOFF_90K) & PTS_MASK);
-        // A loop-wrap signal that preceded the re-anchor is part of it.
-        if let Some(s) = self.pcr_jump_signal.as_ref() {
-            s.swap(0, Ordering::AcqRel);
-        }
     }
 
     /// A gap of `off` ticks before this PES's audio: silence, or a
@@ -3354,10 +3301,6 @@ mod tests {
                 t.samples -= (off.unsigned_abs() as u128 * 48_000 / 90_000) as u64;
                 true
             }
-            TimelineAction::Backward(off) => {
-                t.bias_90k -= off;
-                true
-            }
             TimelineAction::Reanchor | TimelineAction::Anchor => {
                 *t = Timeline { anchored: true, base_90k: pts, rate: 48_000, ..Timeline::default() };
                 true
@@ -3373,7 +3316,7 @@ mod tests {
         let (mut corrections, mut worst) = (0, 0);
         for k in 0..n {
             let pts = pts_of(k);
-            let off = pts_diff((pts as i64 + t.bias_90k) as u64, t.end_90k()).unsigned_abs();
+            let off = pts_diff(pts, t.end_90k()).unsigned_abs();
             worst = worst.max(off);
             let a = t.check(pts);
             if apply(&mut t, a, pts) {
@@ -3439,16 +3382,16 @@ mod tests {
         assert_eq!(t.check(t.end_90k() - 900), TimelineAction::Overlap(-900));
     }
 
+    /// A step of more than 500 ms re-anchors in either direction: the PCR
+    /// and the video follow a source that resets back, so the audio does.
     #[test]
-    fn a_step_beyond_500_ms_reanchors_forward_and_biases_backward() {
+    fn a_step_beyond_500_ms_reanchors_either_way() {
         let mut t = anchored_timeline();
         t.samples = 1024 * 10;
         let end = t.end_90k();
         assert_eq!(t.check(end + 45_001), TimelineAction::Reanchor);
-        assert_eq!(t.check(end - 54_000), TimelineAction::Backward(-54_000));
-        t.bias_90k += 54_000;
-        t.samples += 1024;
-        assert_eq!(t.check(end - 54_000 + AU_TICKS), TimelineAction::Hold, "measured from the new origin");
+        assert_eq!(t.check(end - 45_001), TimelineAction::Reanchor);
+        assert_eq!(t.check(end - 45_000), TimelineAction::Overlap(-45_000), "500 ms back is an overlap");
     }
 
     /// A 4.5 ms forward step every 10 s "loop" (the Sky Witness file-splice
@@ -3474,43 +3417,6 @@ mod tests {
             assert!(worst <= 470, "{ppm} ppm: worst {worst} ticks");
             assert!((15..=20).contains(&c), "{ppm} ppm: {c} corrections");
         }
-    }
-
-    // ── Per-input PCR forward-jump signal ──
-
-    /// Two replacers with INDEPENDENT signal Arcs must not see each
-    /// other's jumps (0.84.0's shared counter padded one input's audio for
-    /// every passive input's loop wrap).
-    #[test]
-    fn pcr_jump_signal_is_per_input_not_shared() {
-        let sig_a = Arc::new(AtomicI64::new(0));
-        let sig_b = Arc::new(AtomicI64::new(0));
-        let mut r_a = TsAudioReplacer::new(&enc("aac_lc"), None).unwrap();
-        let mut r_b = TsAudioReplacer::new(&enc("mp2"), None).unwrap();
-        r_a.set_pcr_jump_signal(sig_a.clone());
-        r_b.set_pcr_jump_signal(sig_b.clone());
-        for r in [&mut r_a, &mut r_b] {
-            r.timeline = Timeline { anchored: true, base_90k: 0, rate: 48_000, ..Timeline::default() };
-        }
-        sig_a.fetch_add(27_000_000, Ordering::Release);
-        r_a.on_pes_pts(0, &mut Vec::new());
-        r_b.on_pes_pts(0, &mut Vec::new());
-        assert_eq!(sig_a.load(Ordering::Acquire), 0, "drained");
-        assert_eq!(r_b.timeline.bias_90k, 0, "B never sees A's jump");
-        // A's 1 s jump with no audio PTS jump re-anchored A there.
-        assert_eq!(r_a.timeline.bias_90k, 0);
-        assert_eq!(r_a.timeline.base_90k, 0);
-    }
-
-    /// `reset_source_state` drains the shared signal so the new source
-    /// doesn't inherit stale loop-wrap jumps.
-    #[test]
-    fn reset_source_state_drains_pcr_jump_signal() {
-        let sig = Arc::new(AtomicI64::new(99_999_999));
-        let mut r = TsAudioReplacer::new(&enc("aac_lc"), None).unwrap();
-        r.set_pcr_jump_signal(sig.clone());
-        r.reset_source_state("test");
-        assert_eq!(sig.load(Ordering::Acquire), 0);
     }
 
     #[test]
@@ -3992,50 +3898,41 @@ mod tests {
         assert!(e.abs() <= 3.0, "{e}");
     }
 
-    /// **AT-3.** A forward step of more than 500 ms re-anchors: the audio
-    /// after it lands exactly at its PTS, with the encoder accumulator part
-    /// full (MP2's 1152-sample frames against 1024-sample AAC AUs), with
-    /// and without 48 → 44.1 kHz rate conversion. A PCR jump the rewriter
-    /// signals together with the same audio PTS jump (and two lost AUs)
-    /// gives that single re-anchor, not an extra pad.
+    /// **AT-3.** A step of more than 500 ms re-anchors, forward or back:
+    /// the audio after it lands exactly at its PTS, with the encoder
+    /// accumulator part full (MP2's 1152-sample frames against 1024-sample
+    /// AAC AUs), with and without 48 → 44.1 kHz rate conversion, and with
+    /// two AUs lost at the step (a single re-anchor, no extra pad).
     #[cfg(all(feature = "media-codecs", feature = "fdk-aac"))]
     #[test]
-    fn a_forward_step_over_500_ms_reanchors_at_the_pts() {
+    fn a_step_over_500_ms_reanchors_at_the_pts() {
         use e2e::*;
         let at = 48_000 * 2 + 50;
         let pcm = content(at, 48_000 * 3);
         let aus = encode_source(Src::Aac, &pcm);
-        for (target, sr, out_rate, signal) in [
-            ("mp2", None, 48_000, false),
-            ("mp2", Some(44_100), 44_100, false),
-            ("aac_lc", None, 48_000, true),
+        for (target, sr, out_rate, step, lost) in [
+            ("mp2", None, 48_000, 90_000i64, false),
+            ("mp2", Some(44_100), 44_100, 90_000, false),
+            ("aac_lc", None, 48_000, 90_000, true),
+            ("mp2", None, 48_000, -90_000, false),
+            ("aac_lc", Some(44_100), 44_100, -90_000, true),
         ] {
             let mut stepped = aus.clone();
             for au in stepped.iter_mut().skip(40) {
-                au.1 += 90_000;
+                au.1 = au.1.wrapping_add_signed(step);
             }
-            if signal {
+            if lost {
                 stepped.drain(40..42);
             }
             let ts = mux(0x0F, &pack(&stepped, 1));
             let mut r = replacer(target, sr, None);
-            let sig = Arc::new(AtomicI64::new(0));
-            r.set_pcr_jump_signal(sig.clone());
-            let pkts: Vec<&[u8]> = ts.chunks(TS_PACKET_SIZE).collect();
-            let mut out = Vec::new();
-            let mut pes_seen = 0;
-            for p in &pkts {
-                if ts_pid(p) == 0x0101 && ts_pusi(p) {
-                    if signal && pes_seen == 40 {
-                        sig.fetch_add(27_000_000, Ordering::Release);
-                    }
-                    pes_seen += 1;
-                }
-                r.process(p, &mut out);
-            }
+            let out = run(&mut r, &ts);
             assert_eq!(r.stats_handle().silence_inserted_samples.load(Ordering::Relaxed), 0);
-            let e = err_samples(target, &out, src_time(at) + 90_000.0, out_rate);
-            assert!(e.abs() <= 3.0, "{target} @ {out_rate} (signal {signal}): {e}");
+            let e = err_samples(target, &out, src_time(at) + step as f64, out_rate);
+            // Within 4 samples (0.09 ms): the resampler's delay line holds
+            // a fraction of a sample more or less than its nominal delay
+            // at the moment of the step.
+            assert!(e.abs() <= 4.0, "{target} @ {out_rate} (step {step}, lost {lost}): {e}");
         }
     }
 

@@ -121,12 +121,6 @@ pub fn spawn_rist_input(
                 None
             }
         };
-        // **Per-input** PCR forward-jump signal — same shape as input_srt.
-        let pcr_jump_signal: std::sync::Arc<std::sync::atomic::AtomicI64> =
-            std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0));
-        if let Some(t) = transcoder.as_mut() {
-            t.set_pcr_jump_signal(pcr_jump_signal.clone());
-        }
         super::input_transcode::register_ingress_stats(
             stats.as_ref(),
             &input_id,
@@ -143,7 +137,6 @@ pub fn spawn_rist_input(
             pid_map: config.pid_map.as_ref(),
             passthrough_clock,
             av_sync_pacer: av_sync_pacer.as_ref(),
-            pcr_jump_signal: Some(&pcr_jump_signal),
             av_skew: Some(&av_skew_for_post),
         });
         // The muxer-mode clock rewriter reports a source-clock fallback
