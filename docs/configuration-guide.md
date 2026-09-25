@@ -63,13 +63,18 @@ Complete reference for the bilbycast-edge JSON configuration file. This guide co
   the licence-gated `video-encoder-*` Cargo features (x264, x265,
   NVENC), Linux build instructions, and the running list of Phase 4
   deferred items. Note `video_encode.scan` (`auto` | `progressive` |
-  `interlaced`, unset = `auto`): on a TS re-encode, `auto` codes an
-  interlaced source as H.264 MBAFF in its own field order when the output
-  is unscaled and the backend can — set `progressive` for the frame-coded
-  output every earlier release produced. Capability `video-encode-scan`;
-  see [`transcoding.md` — Scan](transcoding.md#scan-interlaced-sources).
-  A re-encode also signals the source's sample aspect ratio now, keeping
-  the display aspect ratio when scaling.
+  `interlaced`, unset = `auto`): on a TS output's re-encode, `auto` codes
+  an interlaced source as H.264 MBAFF in its own field order when the
+  output is unscaled and the backend can — set `progressive` for the
+  frame-coded output every earlier release produced. An input's
+  `video_encode` (the ingress transcoder) keeps `auto` progressive, since
+  its output also feeds browser-facing passthrough outputs; set
+  `interlaced` there to field-code. Capability `video-encode-scan`; see
+  [`transcoding.md` — Scan](transcoding.md#scan-interlaced-sources). A
+  re-encode also signals the source's sample aspect ratio now (only one
+  the source signals — an SDI / ST 2110 capture carries none, and none is
+  invented), keeping the display aspect ratio when scaling, and follows a
+  change mid-stream on libx264.
 - **Multi-path bonding (`bonded` input / output type)** — see
   [`bonding.md`](bonding.md) for the full config schema (paths, scheduler,
   per-transport options for UDP / QUIC / RIST), worked edge-to-edge

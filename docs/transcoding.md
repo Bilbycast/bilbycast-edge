@@ -873,7 +873,7 @@ It is settled once, when the encoder lazy-opens, from the frame in hand:
 
 | `scan` | Coded interlaced when | Otherwise |
 |---|---|---|
-| `auto` (default) | an MPEG-TS re-encode (TS outputs, the TS ingress transcoder) **and** the frame is a woven interlaced frame (an interlaced H.264 or MPEG-2 decode) **and** the output is not scaled vertically (`height` unset or equal to the source's) **and** the backend the resolver lands on can code fields on this host | progressive |
+| `auto` (default) | a TS **output**'s re-encode (SRT / UDP / RTP / RIST — not the TS ingress transcoder, see below) **and** the frame is a woven interlaced frame (an interlaced H.264 or MPEG-2 decode) **and** the output is not scaled vertically (`height` unset or equal to the source's) **and** the backend the resolver lands on can code fields on this host | progressive |
 | `progressive` | never | progressive — the old bitstream, byte for byte |
 | `interlaced` | always, on the first backend in the chain that can code fields — from a progressive source too (both fields from one instant, top first) | progressive with Warning `video_encode_interlace_unavailable` when no backend in the chain opens for fields, or the source's decoder hands out one field per picture |
 
@@ -897,18 +897,27 @@ and a progressive resize of an interlaced source still scales the woven
 frame (the old behaviour); pin `scan: interlaced` for a field-correct
 interlaced conversion.
 
-Where it applies: `auto` field-codes only on MPEG-TS re-encodes — broadcast
-receivers display interlace natively. RTMP and CMAF honour an explicit
-`interlaced`; WebRTC refuses it (browsers display progressive only), and
-`webrtc_compatible` pins `progressive`. The raw-frame ingests (ST 2110-20 /
--23, SDI, MXL) refuse `interlaced` — their frames carry no field order for
-the encoder to follow — and code progressive under `auto`.
+Where it applies: `auto` field-codes only on a TS output's re-encode —
+broadcast receivers display interlace natively. The **TS ingress
+transcoder** (an input's `video_encode`) treats `auto` as progressive: its
+output is the flow's source for every output on it, and a browser-facing
+passthrough output — WebRTC / WHIP (and the relay's WHEP SFU and DVR origin
+it feeds), RTMP, HLS / CMAF without a `video_encode` of their own — would
+hand MBAFF to decoders that cannot take it (OpenH264 has no interlaced
+tools). Pin `scan: interlaced` on the input to field-code there anyway. RTMP
+and CMAF honour an explicit `interlaced`; WebRTC refuses it (browsers
+display progressive only), and `webrtc_compatible` pins `progressive`. The
+raw-frame ingests (ST 2110-20 / -23, SDI, MXL) refuse `interlaced` — their
+frames carry no field order for the encoder to follow — and code
+progressive under `auto`.
 
 Not covered: an **HEVC field_seq** source (770_H's 1920x540 field pictures)
 decodes to one field per picture; weaving them back into frames is not done,
 so it is re-encoded as progressive 540-line pictures at the field rate
-(50 fps), with the source's SAR, exactly as before. Under `interlaced` it
-falls back to progressive with the Warning.
+(50 fps). Its SAR describes the frame the fields make (see *Sample aspect
+ratio*), so the 540-line output signals 1:2 and displays at 16:9 — it used
+to leave SAR-less and display at 32:9. Under `interlaced` it falls back to
+progressive with the Warning.
 
 Measured on the broadcast test captures (libx264, 8000 kbps, 2-minute
 captures): Sky Sports 1080i25 (PAFF)
@@ -922,26 +931,50 @@ field_seq) stays progressive 1920x540 at 50 fps. On Sky, MBAFF measured
 content-anchored lip-sync (within ±0.003 ms on the 2-minute capture — not
 the 30-minute gate 3 window).
 
-Behaviour change: an interlaced H.264 / MPEG-2 source on a TS transcode with
-no `scan` set now comes out MBAFF where the host's backend can code fields.
-Gate 7 (a professional IRD) has not been run on it — only ffmpeg decodes
-were checked; `scan: progressive` restores the old bitstream.
+Behaviour change: an interlaced H.264 / MPEG-2 source on a TS output's
+transcode with no `scan` set now comes out MBAFF where the host's backend can
+code fields (an input's transcode is unchanged). Gate 7 (a professional IRD)
+has not been run on it — only ffmpeg decodes were checked; `scan:
+progressive` restores the old bitstream.
 
 ### Sample aspect ratio
 
 The re-encode signals the source's sample aspect ratio in the VUI (nothing
 set it before, so every output left SAR-less and a receiver assumed square
 pixels: a 720x576 16:9 anamorphic service at 64:45 displayed at 5:4). The SAR
-comes from the frame the encoder opens on (the decoder's, when the frame
-carries none). Unscaled, it is the source's own; an unspecified source stays
-unspecified, so a square-pixel source is unchanged. Scaled, the **display
-aspect ratio** is kept: `out = src_sar × (src_w × dst_h) / (src_h × dst_w)`,
-reduced, with an unspecified source taken as square — 720x576 at 64:45 scaled
-to 1024x576 signals 1:1, and 1920x1080 scaled to 720x576 signals 64:45. It is
-decided at open; a later source with a different SAR keeps the first one.
+is the decoded frame's (the decoder's, when the frame carries none).
+
+- **Only a signalled ratio is carried.** An unspecified source stays
+  unspecified, scaled or not — what every encode signalled before. It is not
+  taken as square: the raw-frame ingests (ST 2110, SDI, MXL) carry no SAR
+  and an SD capture is anamorphic, so a 720x576 16:9 SDI source upconverted
+  to 1920x1080 "as if square" would signal 45:64 and show at 5:4.
+- **Scaled, the display aspect ratio is kept**: `out = src_sar × (src_w ×
+  dst_h) / (src_h × dst_w)`, reduced — 720x576 at 64:45 scaled to 1024x576
+  signals 1:1, and 1920x1080 at 1:1 scaled to 720x576 signals 64:45.
+- **A single-field source's SAR is its frame's.** An HEVC field_seq decode
+  hands out 1920x540 fields that signal 1:1 for the 1920x1080 frame they
+  make, so the geometry is taken as 1920x1080: an unscaled (540-line)
+  output signals 1:2, one scaled to 1920x1080 signals 1:1 — both 16:9.
+- **It follows the source.** An in-band aspect change (an SD DVB service
+  switching between 16:9 programmes and 4:3 inserts, 64:45 ↔ 16:15) or an
+  input switch to a source of another shape or size is followed once the new
+  ratio has held for 3 frames, with an IDR so the new SPS goes out at once —
+  on **libx264** (`VideoEncoder::set_sample_aspect_ratio`). Every other
+  backend (x265, NVENC, QSV, VAAPI, RKMPP) fixes the ratio at open: the
+  output keeps it, with a warning log, until it restarts. So does RTMP,
+  whose SPS travels once in the FLV sequence header. libx264 cannot
+  withdraw a ratio, so a later source that signals none is signalled 1:1,
+  which a receiver reads the same way.
+
+Measured (libx264, 40 s captures): 770_H's 1920x540 field pictures come out
+SAR 1:2, DAR 16:9 (they were SAR-less, 32:9), and with `height: 1080`
+1920x1080 at 1:1, DAR 16:9 (the first cut of this signalled 2:1, 32:9);
+Spain stays 720x576 at 64:45 and Sky Sports at 1:1, with no ratio change
+logged on any of the three.
+
 Every decode → encode path gets it (TS outputs and ingress, RTMP, WebRTC,
-CMAF); the raw-frame ingests (ST 2110, SDI, MXL) carry no SAR and signal
-none. There is no operator override yet.
+CMAF). There is no operator override yet.
 
 ### Backend availability
 
@@ -1208,11 +1241,22 @@ Same set as `audio_encode`:
   let a join on a non-IDR I picture mark the synthesised frame_num-gap
   placeholders as recovered, and the join GOP read uninitialised memory (13-15
   wrong frames per join on Sky Sports). Every other lazy decoder open in the
-  edge takes the same seed from the AU that triggered it (display, SDI, ST
-  2110-20, MXL, mosaic tiles, CMAF, RTMP, WebRTC, the warm thumbnail), and the
-  display / SDI outputs **drop and re-open** a seeded decoder on an input
-  switch instead of flushing it — a flush keeps the depth learned from the old
-  source and cannot re-apply a seed. Two residuals, documented rather than
+  edge takes the same seed from the AU it opens on, and waits for an AU that
+  can give it one: the RTMP, WebRTC and CMAF re-encoders (the DVR clip
+  exporter included), the ST 2110-20 / -23 and MXL egress decoders and the
+  mosaic tiles open on the first AU that carries an SPS, bounded at 300 AUs
+  (`video_encode_util::SpsOpenGate`), and the display and SDI outputs on a
+  keyframe. Opened on whatever AU came first — a P picture, at almost any
+  join — a source that declares no reordering (x264 `zerolatency`, the edge's
+  own encodes, most contribution encoders) was seeded 1, and libavcodec never
+  lowers the depth: a frame held for the life of the output. Only the warm
+  thumbnail opens on the first AU, where a frame of latency is immaterial.
+  The display / SDI outputs **drop and re-open** a seeded decoder on an
+  operator switch instead of flushing it — a flush keeps the depth learned
+  from the old source and cannot re-apply a seed; a display PTS jump (an SRT
+  FEC repair out of order, a media-player loop: the same source) still only
+  flushes, so a source change upstream that arrives without a PMT version
+  bump keeps the old depth. Two residuals, documented rather than
   fixed: a join on a stream whose true depth is 2+ and undeclared can still drop
   1-3 decodable leading B-pictures once (seeding the level's DPB size would fix
   it at the price of permanent latency), and an undeclared IPPP source now
@@ -1340,11 +1384,19 @@ commit message or release note and delete the bullet.
      agreeing frame deltas, or from 12 deltas the median of 4-delta sums
      over 4 (a 3:2 or 2:3:3:2 pulldown cadence measures 24000/1001, and one
      dropped frame does not move it), snapped to a standard rate within
-     0.1 %. Frames decoded before the rate is known — about four at
-     startup — are dropped, since the encoder cannot open without it;
-     after 60 decoded frames with no usable PTS it opens at the PES DTS
-     step times the PES-per-frame ratio, else 30/1. An input switch with
-     the encoder already open drops nothing (its rate cannot change).
+     0.1 %. A frame the decoder hands out without a PTS measures nothing
+     but is counted: MPEG-TS needs a PTS only every 700 ms, and a source
+     that stamps every Nth picture (or only its I pictures) measures the
+     span between two stamped frames over the frames decoded across it —
+     taken as one frame, a 29.97 fps source stamping every 12th picture
+     locked 2500/1001 fps (CBR budgeting 12x the bitrate per frame, a
+     4-frame GOP). Frames decoded before the rate is known — about four at
+     startup, four stamped spans on a sparse source — are dropped, since
+     the encoder cannot open without it; after 60 decoded frames with no
+     usable PTS it opens at the PES DTS step (a span over PES without a
+     timestamp divided by the PES it covers) times the PES-per-frame
+     ratio, else 30/1. An input switch with the encoder already open drops
+     nothing (its rate cannot change).
      HEVC field_seq sources measure the field rate, 50/1, which is right
      for the 540-line pictures they are coded as (see *Scan*). Measured on
      Sky Sports 1080i25 with `bitrate_kbps: 8000`: the VUI went from
@@ -1363,9 +1415,13 @@ commit message or release note and delete the bullet.
    (`2 × fps`) spans the wrong duration, and the SPS VUI advertises the
    wrong rate. The edge logs `video_encode_fps_mismatch` once per
    source when the measured rate disagrees with the rate the encoder runs
-   at — a pin (`cause = "pinned"`), or on the TS path the rate an earlier
-   source opened it at (`cause = "input_switch"`; the encoder cannot
-   reopen at a new rate, so restart the output to lock the new one).
+   at, and `cause` says why it runs at that rate: a pin (`pinned`); on
+   the TS path an earlier source's rate kept across a source reset
+   (`input_switch`), the fallback taken because the first decoded frames
+   carried no usable PTS (`fallback`), or this same source's cadence
+   having changed since the lock (`cadence_change` — video to film, a
+   playlist item at another rate). The encoder cannot reopen at a new
+   rate, so restart the output to lock the measured one.
 3. **No rate-control tuning knobs.** We pass `bitrate_kbps` + a
    `tune=zerolatency` option and rely on defaults for VBV buffer size,
    CRF, look-ahead, etc. CBR-strict profiles (true constant-bitrate
