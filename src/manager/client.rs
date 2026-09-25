@@ -1043,13 +1043,12 @@ pub(crate) fn build_health_payload(
     #[cfg(feature = "sdi-decklink")]
     {
         let ports = crate::engine::decklink::status::cached();
-        if !ports.is_empty() {
-            if let Ok(json) = serde_json::to_value(ports.as_slice()) {
+        if !ports.is_empty()
+            && let Ok(json) = serde_json::to_value(ports.as_slice()) {
                 payload
                     .as_object_mut()
                     .map(|o| o.insert("sdi_devices".into(), json));
             }
-        }
     }
     // System-clock discipline (adjtimex read). Inserted only when probe()
     // returns Some — non-Linux hosts and seccomp-blocked adjtimex omit the
