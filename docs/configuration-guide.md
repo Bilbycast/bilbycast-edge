@@ -1392,12 +1392,18 @@ loop, each playlist transition — continues one wire timeline:
   raw timestamps (Sky's first video PES sits at packet 14, its first PCR at
   23): ~20 550 s off the live timeline, and a DI downstream at every loop.
   A file with no PCR in its first 4096 packets keeps only its PSI from that
-  stretch and plays the rest as before.
+  stretch, streams on with raw timestamps until its first PCR, and from that
+  PCR on plays with the offset like any other file (the offset used to stay
+  unset for the whole file). The input's muxer-mode clock rewriter holds a
+  PES that starts before its own first PCR for at most 2 s of PES time, then
+  passes it on the source clock (`clock_rewrite_no_pcr`).
 - Video starts at a random-access point. Video PES are dropped until an
   H.264 SPS / IDR, HEVC VPS / SPS / IRAP, MPEG-2 sequence header or a
   `random_access_indicator`, then the open-GOP leading pictures presented
   before it. Broadcast captures start mid-GOP; played from byte 0 those
-  pictures decoded against the previous loop's references. A dropped packet
+  pictures decoded against the previous loop's references. The search
+  starts dropping, so the continuation packets a file cut mid-PES opens
+  with never join the previous file's truncated last PES. A dropped packet
   that carries a PCR stays as an adaptation-field-only packet. After 3 s
   without one the gate gives up and passes the video. The video PID comes
   from the file's first 512 KiB (2 MiB with `program_number`); when its PMT

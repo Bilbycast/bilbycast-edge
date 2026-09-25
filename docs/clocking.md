@@ -183,14 +183,20 @@ The transcoded path landed the same model in
 `engine::ts_pts_rewriter::rewrite_pcr_value` handles a source PCR
 discontinuity in three ways, and the third is the one worth knowing about.
 
-* **Backward jump** (source PCR goes back > 500 ms, or back by any amount
-  with DI=1 on the source PCR) — re-anchor and bridge with master elapsed
-  so output PCR never moves backwards. PCR going backwards is a clock fault
-  to every receiver. The DI case is an ingress transcode raising its PCR
-  delay (`ts_pcr_remux` steps its PCR back by tens of ms, flagged): passed
-  into muxer mode, that step made the "monotonic by construction" output
-  step back too. A small backward step *without* DI is still the source's
-  own clock and passes. Pinned by `a_backward_pcr_step_with_di_is_bridged`.
+* **Backward jump** (source PCR goes back > 500 ms) — re-anchor and bridge
+  with master elapsed so output PCR never moves backwards across it. A
+  **smaller** backward step is the source's own and passes through as the
+  step it is, DI and all when the source set one — so muxer-mode output is
+  monotonic except across such a step. That is deliberate for the one
+  source that makes it routinely: an ingress transcode raising its PCR
+  delay (`ts_pcr_remux`) steps only its PCR back, with DI, and keeps every
+  PES timestamp continuous. Bridging that step would keep the output PCR
+  monotonic only by moving every PES timestamp on the flow forward by the
+  raise — an audio hole and a held frame on every PTS-driven output (HLS,
+  CMAF, WebRTC, RTMP, the display). Receivers re-lock on the DI; `wire_emit`
+  re-anchors its pacing on any backward step. Pinned by
+  `a_small_backward_pcr_step_passes_through_with_its_di` and
+  `an_ingress_pcr_delay_raise_keeps_pes_timestamps_continuous`.
 * **Forward jump the wall clock witnessed** — pass through, DI=1. A live
   edit point or SCTE-35 splice is a real gap in the content, and passing it
   through preserves PCR_FO rate accuracy (TR 101 290, ±30 ppm). The
@@ -309,6 +315,25 @@ anything. In the source-clock fallback above nothing is dropped (PCR and
 PES agree there). Pinned by
 `a_pes_started_before_the_first_pcr_is_dropped_whole`.
 
+The hold is bounded. Once it has held 2 s of PES time on a PID (forward
+steps only, each capped at 1 s) or 2 s of wall time, it gives up waiting:
+
+- **No PCR has established the anchor** — a program whose PCR_PID never
+  carries one, like an audio-only RTMP publish (the ingest muxer names the
+  absent video PID as PCR_PID), or a PMT with PCR_PID 0x1FFF and no PCR
+  anywhere. PES then pass with their **source** timestamps, as they would
+  with no rewriter at all — there is no regenerated PCR for them to
+  disagree with — and the Warning `clock_rewrite_no_pcr` (input-scoped)
+  says so. The first PCR that does arrive on a PCR PID establishes the
+  anchor, with DI=1, and regeneration starts from there. Without the bound
+  every PES of such a stream was dropped for good and every output of the
+  flow went silent.
+- **An anchor but no PMT** — the same source-clock fallback the PCR-timed
+  window above takes, `clock_rewrite_pmt_not_learned`.
+
+Pinned by `pes_with_no_pcr_on_the_pcr_pid_pass_after_the_hold_window` and
+`a_pmt_with_pcr_pid_1fff_and_no_pcr_still_emits_pes`.
+
 ## Transcoded output PCR (the remux model)
 
 Every TS transcode chain — each output's `transcode_chain` and each
@@ -351,18 +376,55 @@ after the first latch — lowering it would be another PCR step — and a
 latch that would move it by less than 10 ms leaves it alone (on Sky the
 first audio PES asked for 80.24 ms against the initial 80: a DI for a
 quarter of a millisecond). A PES more than 5 s late is taken to be stamped
-on another timeline and never moves `D`. The margin is cut (never below
-lateness + 40 ms) so the largest video lead of the epoch stays within the
-1 s T-STD residency (ISO/IEC 13818-1 §2.4.2.6); when even that cannot be
-met the PES is kept on time and `transcode_pcr_residency_exceeded` says
-so.
+on another timeline and never moves `D`.
 
-**Epochs.** An input PCR that steps backward, jumps more than 100 ms, or
-carries DI starts an epoch: DI on the next output PCR, every PID latches
-again (raise-only). On a jump of more than 1 s the re-encoded PES still in
-flight from the previous epoch — closer to the old timeline than to the
-new one — are dropped, their CC renumbered, so they neither reach the
-wire behind the DI nor drive `D`.
+**The residency cap.** The margin is cut (never below lateness + 40 ms)
+so the largest lead of the program's video observed in the epoch stays
+within the 1 s T-STD residency (ISO/IEC 13818-1 §2.4.2.6); when even that
+cannot be met the PES is kept on time and
+`transcode_pcr_residency_exceeded` says so. Only the video ES of the
+program the stage follows count — on an MPTS output another program's
+video, whose PCR this stage never shifts, is ignored. The cap is re-checked
+every time a larger lead is seen, not only at a latch: before anything
+re-encoded has been measured `D` is lowered to it (one PCR step, DI);
+after that `D` stays — lowering it would make the PES already measured
+late — and the Warning fires instead (its `lateness_ms` is then null). An
+audio-only transcode over a long-lead passthrough video is the case: on
+Sky the audio latches within the first ~100 ms, against the few hundred
+ms of video lead seen so far, and the 943 ms leads come later.
+
+**Gaps are the source's.** Lateness is measured against the input PCR at
+the PES's position, and a PCR-per-frame source (the RTMP / RTSP / WebRTC
+ingest muxer writes PCR = DTS on each frame's first packet) that pauses —
+or runs at a variable frame rate — puts a long PCR step between a frame
+and the next one it is emitted after. The part of such a step beyond the
+input's usual step (the median of its last eight continuous steps; a gap
+is a step over twice that and over 100 ms) is taken off the lateness of
+every PES decoded before it. The frames that were in the pipeline when the
+source paused still reach the wire late — nothing can undo a pause — but
+they no longer raise `D` for every frame after them: a single 900 ms
+pause used to add a second of latency for good. A steady low frame rate is
+not a gap: at 5 fps a re-encoded frame that leaves after the next frame's
+PCR is 200 ms late every time, and `D` latches once to that. Pinned by
+`a_source_pause_does_not_ratchet_d` and
+`a_pcr_per_frame_source_at_low_frame_rates_is_one_timeline`.
+
+**Nothing re-encoded.** While neither replacer re-encodes — its codec
+cannot be decoded, a replacer fell back to passthrough — the stage applies
+no `D` at all and the stream passes byte-identical, as it did before the
+remux model. Re-encoding starting or stopping steps the PCR by `D`, with
+DI.
+
+**Epochs.** An input PCR that steps backward or carries DI starts an
+epoch: DI on the next output PCR, every PID latches again (raise-only).
+A forward step without DI is the input's own clock however long it is —
+5 fps steps 200 ms per frame, 0.5 fps two seconds — and passes as the step
+it is; it used to start an epoch past 100 ms, which put DI on every output
+PCR of a low-frame-rate source, re-latched `D` up to its largest frame gap,
+and past 1 s dropped the frame in flight as stale. On an epoch of more than
+1 s the re-encoded PES still in flight from the previous epoch — closer to
+the old timeline than to the new one — are dropped, their CC renumbered,
+so they neither reach the wire behind the DI nor drive `D`.
 
 **No input PCR.** When a re-encoded video PES on the PCR_PID arrives and
 no input PCR has been seen — or none for 100 ms of video decode time — the
@@ -382,7 +444,11 @@ emits PES *k* only when PES *k + 1* arrives, and against an unshifted PCR
 delay.
 
 **Where it does not reach.** HLS / CMAF / RTMP / WebRTC use PES
-timestamps only. `epoch_lock` forbids transcoding. On a PID-bus
+timestamps only. A `D` raise on an **ingress** transcode reaches the
+input's muxer-mode rewriter as a DI'd backward PCR step, which it passes
+through as such (see [PCR discontinuity bridging](#pcr-discontinuity-bridging-and-what-the-clamp-costs))
+so PES timestamps stay continuous on every output; at flow start the first
+latch usually makes one such step. `epoch_lock` forbids transcoding. On a PID-bus
 assembled flow an ingress transcode's `D` reaches the wire only when that
 input is the program's `pcr_source`; the assembler re-anchors otherwise —
 as before. Wire pacing in the default `auto` (forward) egress mode still
@@ -519,9 +585,12 @@ Lib-level tests cover:
 - `AvSyncPacer`: wallclock pacer always locked, PCR emit trails master
   by pre-roll, modular wrap when master_now < pre-roll.
 - `TsPcrRemux`: output PCR = input − D at the input positions, the
-  latch and the guard, the residency cap, stale frames across an epoch
-  jump, synthesis without an input PCR; and the audio-only chain end to
-  end (`audio_only_transcode_keeps_every_re_encoded_pes_ahead_of_the_pcr`).
+  latch and the guard, the residency cap (at a latch and as the video lead
+  grows, the followed program's video only), stale frames across an epoch
+  jump, a PCR-per-frame source at 5 and 0.5 fps as one timeline, a source
+  pause that does not raise `D`, a byte-identical stream with nothing
+  re-encoded, synthesis without an input PCR; and the audio-only chain end
+  to end (`audio_only_transcode_keeps_every_re_encoded_pes_ahead_of_the_pcr`).
 - `PcrIngressSampler`: raw-TS sampling, RTP header skip with CSRC +
   extension, no-sync-byte payload silently dropped.
 - `PtpMasterClock`: unavailable defaults, telemetry kind tag.

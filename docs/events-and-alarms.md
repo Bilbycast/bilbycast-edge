@@ -705,11 +705,11 @@ ingress transcode). Counters on the `transcode_pcr` stats block.
 | `error_code` | Severity | Trigger | Details |
 |---|---|---|---|
 | `transcode_pcr_late` | Warning | A re-encoded PES arrived behind the output PCR after `D` had latched — the pipeline got deeper than it measured (an encoder lookahead change, a HW encoder's async depth, a long source PES). `D` is raised to the lateness + 80 ms and the next PCR carries DI = 1. At most one per 10 s; `since_last_report` counts the late PES in between. | `{ error_code, pid, late_ms, offset_ms, late_frames, since_last_report }` |
-| `transcode_pcr_residency_exceeded` | Warning | Keeping a re-encoded PES on time needs a `D` that puts the video's largest lead of the epoch past the 1 s T-STD residency (ISO/IEC 13818-1 §2.4.2.6). Lateness wins; a strict decoder may overflow its video buffer. Once per PCR epoch. | `{ error_code, pid, lateness_ms, offset_ms, video_residency_ms }` |
+| `transcode_pcr_residency_exceeded` | Warning | The largest lead of the program's video in the epoch plus `D` is past the 1 s T-STD residency (ISO/IEC 13818-1 §2.4.2.6); a strict decoder may overflow its video buffer. Two ways in: keeping a re-encoded PES on time needs a `D` that high (a latch or a guard raise — lateness wins; `pid` is the re-encoded one), or the video's lead grew past the cap after re-encoded PES had been measured against `D`, which is then not lowered (`pid` is the video's, `lateness_ms` null). Before anything re-encoded is measured `D` is lowered to the cap instead, with no event. Only the followed program's video counts. Once per PCR epoch. | `{ error_code, pid, lateness_ms, offset_ms, video_residency_ms }` |
 | `transcode_pcr_synthesized` | Info | A re-encoded video PES on the PCR_PID arrived with no input PCR at all, or none for 100 ms of video decode time: PCR is synthesised from the video's decode timestamps (`DTS − D`, ≤ 35 ms apart) until one arrives, which ends synthesis with DI = 1. Once per stage. | `{ error_code }` |
 
-**Source**: `src/engine/ts_pcr_remux.rs` (`guard`, `warn_residency`,
-`check_synth_entry`), wired in `src/engine/transcode_chain.rs`
+**Source**: `src/engine/ts_pcr_remux.rs` (`guard`, `check_residency`,
+`warn_residency`, `check_synth_entry`), wired in `src/engine/transcode_chain.rs`
 (`build_for_output`) and `src/engine/input_transcode.rs`
 (`set_decode_stall_watchdog`).
 
@@ -717,9 +717,11 @@ ingress transcode). Counters on the `transcode_pcr` stats block.
 
 | `error_code` | Severity | Trigger | Details |
 |---|---|---|---|
-| `clock_rewrite_pmt_not_learned` | Warning | The per-input `TsPtsRewriter` regenerated PCR for 2 s of source-PCR time without learning a PMT, so it could not re-anchor any PES timestamp: PCR on the master timeline over PTS in the source timeline (VH1 showed a constant −12.6 h PTS−PCR before the PMT walker fix). It now falls back to the **source clock** — PCR passes through unchanged, with DI=1 on the first one — so PCR and PTS agree. If a PMT is learned later, regeneration resumes on the next PCR, again with DI=1. The window re-arms when the PAT drops the program whose PMT was learned (a playlist item or a re-muxed upstream moving to a new PMT PID), so it can fire again later in a flow's life. Input-scoped. Wired on UDP / SRT / RTP / RIST / media-player / replay inputs (the others build their TS with the shared muxer). | `{ error_code, pmt_pids, waited_ms }` |
+| `clock_rewrite_pmt_not_learned` | Warning | The per-input `TsPtsRewriter` regenerated PCR for 2 s of source-PCR time without learning a PMT, so it could not re-anchor any PES timestamp: PCR on the master timeline over PTS in the source timeline (VH1 showed a constant −12.6 h PTS−PCR before the PMT walker fix). It now falls back to the **source clock** — PCR passes through unchanged, with DI=1 on the first one — so PCR and PTS agree. If a PMT is learned later, regeneration resumes on the next PCR, again with DI=1. The window re-arms when the PAT drops the program whose PMT was learned (a playlist item or a re-muxed upstream moving to a new PMT PID), so it can fire again later in a flow's life. The PES gate's 2 s of held PES / wall time (below) also expires into this fallback when an anchor exists but no PMT. Input-scoped. Wired on UDP / SRT / RTP / RIST / RTMP / RTSP / media-player / replay inputs (WebRTC runs no muxer-mode rewriter). | `{ error_code, pmt_pids, waited_ms }` |
+| `clock_rewrite_no_pcr` | Warning | The per-input `TsPtsRewriter` held PES waiting for the first PCR to establish its clock anchor (a PES before the anchor would leave with its source timestamps on a regenerated-PCR stream) and none arrived on the program's PCR PID within 2 s of held PES time (per PID, forward steps only) or 2 s of wall time. PES now pass with their **source** timestamps — there is no regenerated PCR for them to disagree with. The first PCR that does arrive on a PCR PID establishes the anchor, with DI=1, and regeneration starts. Typical cause: an audio-only RTMP publish, whose ingest muxer names the absent video PID as PCR_PID, or a PMT with PCR_PID 0x1FFF over a stream with no PCR. Before this fallback every PES of such a stream was dropped for good and every output of the flow went silent. Input-scoped; wired where `clock_rewrite_pmt_not_learned` is. | `{ error_code, pcr_pids, waited_ms }` |
 
-**Source**: `src/engine/ts_pts_rewriter.rs` (`note_unlearned_pcr`),
+**Source**: `src/engine/ts_pts_rewriter.rs` (`note_unlearned_pcr`,
+`pes_hold_expired`, `fall_back_unlearned`, `fall_back_no_pcr`),
 `src/engine/input_post_process.rs` (`set_event_sender`).
 
 ---

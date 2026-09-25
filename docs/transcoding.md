@@ -935,6 +935,16 @@ Same set as `audio_encode`:
   stats. A step of more than 1 s either way is a new epoch and passes. A
   decoded frame without a PTS takes the last admitted PTS plus the
   *measured* frame interval (not the per-field DTS step of a PAFF source).
+  That interval is learned from decoder PTS only — the span between two
+  frames that carried one, divided by the frames decoded across it, within
+  10–200 fps — never from a PTS it derived itself, and otherwise falls back
+  to the pinned `fps_num` / `fps_den`, else 25 fps. Learning from derived
+  steps confirmed whatever guess it started from: on a 29.97 fps source
+  that stamps only every 12th picture, the 25 fps default ran each run of
+  derived PTS past the next real one, which was then dropped as out of
+  order — every real timestamp lost and the output 20 % fast. Now the first
+  GOP or two can still lose their real frame while the interval is learned;
+  after that every real timestamp is admitted as it is.
 
 ## Output PCR — the remux model
 
@@ -952,11 +962,25 @@ as the input's.
 `D` starts at 80 ms. The first re-encoded PES of each PID latches it to at
 least how late that PES arrived behind its own decode time plus 80 ms; a
 PES that is still late afterwards raises it again (DI on the next PCR,
-Warning `transcode_pcr_late`, `late_frames` on the stats). The margin is
-cut to keep the largest video lead within the 1 s T-STD residency, never
-below 40 ms. A source with no PCR gets one synthesised from the re-encoded
-video (Info `transcode_pcr_synthesized`). Full model, the epoch rules and
-the numbers it replaced: [`clocking.md`](clocking.md#transcoded-output-pcr-the-remux-model).
+Warning `transcode_pcr_late`, `late_frames` on the stats). Lateness that a
+pause in the source's own PCR explains — a paused or variable-frame-rate
+ingest that stamps a PCR per frame — does not raise it. The margin is cut
+to keep the program's largest video lead within the 1 s T-STD residency,
+never below 40 ms, re-checked as that lead grows (Warning
+`transcode_pcr_residency_exceeded` when it cannot). A forward input PCR
+step without DI is the input's clock however long — a 5 fps or 0.5 fps
+PCR-per-frame source is one timeline, not an epoch per frame. While
+nothing is re-encoded (a codec the replacers cannot decode) the stream
+passes byte-identical, with no `D`. A source with no PCR gets one
+synthesised from the re-encoded video (Info `transcode_pcr_synthesized`).
+Full model, the epoch rules and the numbers it replaced:
+[`clocking.md`](clocking.md#transcoded-output-pcr-the-remux-model).
+
+On an **ingress** transcode a raise of `D` reaches the input's muxer-mode
+clock rewriter as a backward PCR step with DI, and passes through it as
+that — PES timestamps stay continuous on every output, so HLS / CMAF /
+WebRTC / RTMP / display see no gap; at flow start the first latch usually
+makes one such step.
 
 **Behaviour change.** Output PCR used to be `video PTS × 300 − 80 ms`,
 floored on a decaying audio lag: a clock that ran ~15 500 ppm fast against
