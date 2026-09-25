@@ -646,6 +646,10 @@ pub const PSI_SECTION_CAP: usize = 3 + PRIVATE_MAX_SECTION_LENGTH;
 /// [`Self::push_packet`] is the CC-checked variant: a continuity gap aborts
 /// the section in flight rather than splicing unrelated bytes into it, and
 /// a duplicate continuation packet (same CC, byte-identical) is ignored.
+/// A same-CC packet that is NOT a duplicate, arriving while a long-form
+/// section is in flight, is taken as its continuation (some muxers never
+/// advance the CC on PSI — the rule `ts_pmt_edit::PsiUnitStage` applies
+/// too); that section must then pass its CRC_32 to be delivered.
 pub struct SectionAssembler {
     /// Bytes of the section in flight (from its `table_id`).
     buf: Vec<u8>,
@@ -661,6 +665,9 @@ pub struct SectionAssembler {
     /// can be told from a CC error.
     last_cc: Option<u8>,
     last_digest: u32,
+    /// The in-flight section accepted a same-CC continuation: deliver it
+    /// only if its CRC_32 verifies.
+    crc_gate: bool,
 }
 
 impl Default for SectionAssembler {
@@ -709,6 +716,7 @@ impl SectionAssembler {
             done_spanned: Vec::new(),
             last_cc: None,
             last_digest: 0,
+            crc_gate: false,
         }
     }
 
@@ -716,6 +724,7 @@ impl SectionAssembler {
         self.buf.clear();
         self.assembling = false;
         self.last_cc = None;
+        self.crc_gate = false;
     }
 
     /// True while a section has started but not completed — the next
@@ -752,18 +761,29 @@ impl SectionAssembler {
     fn try_finish(&mut self) {
         match self.needed() {
             Ok(Some(total)) if self.buf.len() >= total => {
-                self.done.extend_from_slice(&self.buf[..total]);
-                self.done_ends.push(self.done.len());
-                self.done_spanned.push(true);
+                let long_form = self.buf[1] & 0x80 != 0;
+                if !(self.crc_gate && long_form && mpeg2_crc32(&self.buf[..total]) != 0) {
+                    self.done.extend_from_slice(&self.buf[..total]);
+                    self.done_ends.push(self.done.len());
+                    self.done_spanned.push(true);
+                }
                 self.buf.clear();
                 self.assembling = false;
+                self.crc_gate = false;
             }
             Ok(_) => {}
             Err(()) => {
                 self.buf.clear();
                 self.assembling = false;
+                self.crc_gate = false;
             }
         }
+    }
+
+    /// A long-form section (section_syntax_indicator 1, so it carries a
+    /// CRC_32) is in flight.
+    fn long_form_in_flight(&self) -> bool {
+        self.assembling && self.buf.len() >= 2 && self.buf[1] & 0x80 != 0
     }
 
     /// Walk the sections that start at `from` inside `payload`.
@@ -773,6 +793,7 @@ impl SectionAssembler {
                 return; // stuffing to the end of the packet
             }
             self.buf.clear();
+            self.crc_gate = false;
             let remaining = payload.len() - pos;
             if remaining < 3 {
                 // Header split across packets.
@@ -837,6 +858,7 @@ impl SectionAssembler {
             // Whatever was in flight and did not complete is truncated.
             self.buf.clear();
             self.assembling = false;
+            self.crc_gate = false;
             self.start_sections(payload, sec_start);
         } else {
             if !self.assembling {
@@ -845,6 +867,7 @@ impl SectionAssembler {
             if self.buf.len() + payload.len() > PSI_SECTION_CAP + TS_PACKET_SIZE {
                 self.buf.clear();
                 self.assembling = false;
+                self.crc_gate = false;
                 return;
             }
             self.buf.extend_from_slice(payload);
@@ -876,6 +899,15 @@ impl SectionAssembler {
             Some(prev) if prev == cc && digest == self.last_digest && !pusi => {
                 return self.completed();
             }
+            // Same CC, different bytes, a long-form section in flight: a
+            // muxer that never advances the CC on PSI. Take it as the
+            // continuation and let the section's CRC decide — which also
+            // rejects the one real loss this admits, a run of exactly 16
+            // lost packets.
+            Some(prev) if prev == cc && digest != self.last_digest && self.long_form_in_flight() => {
+                self.crc_gate = true;
+                true
+            }
             Some(prev) => (prev + 1) & 0x0F == cc,
             None => false,
         };
@@ -885,6 +917,7 @@ impl SectionAssembler {
             // Lost a middle packet — the in-flight section is garbage.
             self.buf.clear();
             self.assembling = false;
+            self.crc_gate = false;
             return self.completed();
         }
         self.feed_inner(pusi, &pkt[off..TS_PACKET_SIZE], contiguous);
@@ -1546,6 +1579,36 @@ mod tests {
         assert_eq!(asm.push_packet(&pkts[1]).count(), 0, "duplicate continuation ignored");
         let got: Vec<Vec<u8>> = asm.push_packet(&pkts[2]).map(|s| s.to_vec()).collect();
         assert_eq!(got, vec![huge]);
+    }
+
+    /// A muxer that never advances the CC on PSI: the continuation of a
+    /// two-packet PMT repeats the PUSI packet's CC. It is taken as the
+    /// continuation (the rule `PsiUnitStage` applies) and the CRC decides:
+    /// intact, the section is delivered; damaged, it is not. The CC-strict
+    /// assembler used to abort the section, so the PTS rewriter, the PSI
+    /// catalog, the continuity fixer and HLS pass 1 never learned such a
+    /// PMT.
+    #[test]
+    fn same_cc_continuation_is_accepted_when_the_crc_verifies() {
+        let (sec, _) = two_packet_pmt(7, 1);
+        let mut pkts = packetize_sections(0x40, &[&sec], 5);
+        pkts[1][3] = (pkts[1][3] & 0xF0) | ts_cc(&pkts[0]);
+        let mut asm = SectionAssembler::new();
+        assert_eq!(asm.push_packet(&pkts[0]).count(), 0);
+        let got: Vec<Vec<u8>> = asm.push_packet(&pkts[1]).map(|s| s.to_vec()).collect();
+        assert_eq!(got, vec![sec.clone()], "never-advancing CC: delivered");
+
+        // Same CC, different bytes that do NOT belong to the section (a run
+        // of 16 lost packets looks exactly like this): the CRC rejects it.
+        let mut bad = pkts[1];
+        bad[5] ^= 0xFF; // inside the 6 section bytes this packet carries
+        let mut asm = SectionAssembler::new();
+        assert_eq!(asm.push_packet(&pkts[0]).count(), 0);
+        assert_eq!(asm.push_packet(&bad).count(), 0, "damaged: CRC rejects it");
+        // The next unit is unaffected.
+        assert_eq!(asm.push_packet(&pkts[0]).count(), 0);
+        let got: Vec<Vec<u8>> = asm.push_packet(&pkts[1]).map(|s| s.to_vec()).collect();
+        assert_eq!(got, vec![sec]);
     }
 
     #[test]

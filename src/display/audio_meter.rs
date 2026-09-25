@@ -140,6 +140,10 @@ struct MeterState {
     /// program_number of the selected program — PMT sections are matched
     /// on it, since one PMT PID may carry several programs' PMTs.
     selected_program: Option<u16>,
+    /// True when the PAT maps more than one program to the selected PMT
+    /// PID; only then must the PMT's program_number match exactly (see
+    /// `ts_pmt_edit::pmt_index`).
+    selected_pmt_pid_shared: bool,
     /// Per-PID metering state (decoder + PES buffer + codec label).
     audio_pids: HashMap<u16, MeterPidState>,
     /// Cross-packet section reassembly for the PAT / selected PMT.
@@ -154,6 +158,7 @@ impl MeterState {
             pmt_pids: HashMap::new(),
             selected_pmt_pid: None,
             selected_program: None,
+            selected_pmt_pid_shared: false,
             audio_pids: HashMap::new(),
             pat_section: SectionAssembler::new(),
             pmt_section: SectionAssembler::new(),
@@ -223,19 +228,26 @@ impl MeterState {
             return;
         }
         if Some(pid) == self.selected_pmt_pid {
-            let program = self.selected_program;
+            // The program's PMT is chosen as everywhere else
+            // (`ts_pmt_edit::pmt_index`): an exact program_number match
+            // wins, and on a PID the PAT gives to no other program the
+            // first PMT is accepted too.
             let sections: Vec<Vec<u8>> = self
                 .pmt_section
                 .feed(pusi, payload)
-                .filter(|s| {
-                    s.first() == Some(&0x02)
-                        && s.len() >= 5
-                        && program.is_none_or(|p| u16::from_be_bytes([s[3], s[4]]) == p)
-                })
+                .filter(|s| s.first() == Some(&0x02))
                 .map(|s| s.to_vec())
                 .collect();
-            for section in sections {
-                self.parse_pmt(&section, publisher);
+            let chosen = match self.selected_program {
+                Some(p) => crate::engine::ts_pmt_edit::pmt_index(
+                    &sections,
+                    p,
+                    self.selected_pmt_pid_shared,
+                ),
+                None => (!sections.is_empty()).then_some(0),
+            };
+            if let Some(i) = chosen {
+                self.parse_pmt(&sections[i], publisher);
             }
             return;
         }
@@ -272,6 +284,8 @@ impl MeterState {
         };
         let chosen = chosen_program.and_then(|prog| self.pmt_pids.get(&prog).copied());
         self.selected_program = chosen_program;
+        self.selected_pmt_pid_shared = chosen
+            .is_some_and(|pmt| self.pmt_pids.values().filter(|&&p| p == pmt).count() > 1);
         if chosen != self.selected_pmt_pid {
             // Program changed (or first lock) — drop all per-PID state
             // so the new PMT can repopulate cleanly. The published
@@ -823,6 +837,29 @@ mod tests {
         state.process_ts_packet(&pat, &mut publisher);
         state.process_ts_packet(&pmt, &mut publisher);
         assert!(state.audio_pids.contains_key(&0x0E10), "AC-3 audio learned");
+    }
+
+    /// A PMT whose program_number disagrees with the PAT is still the
+    /// program's PMT when the PAT gives its PID to no other program — the
+    /// meter used to demand an exact match and stay blank on such muxes.
+    /// On a shared PID only an exact match counts.
+    #[test]
+    fn pmt_program_number_mismatch_falls_back_on_an_unshared_pid() {
+        use crate::engine::ts_test_fixtures::{packetize_sections, pat_packet, pmt_section};
+        let pmt = pmt_section(2, 0, 0x101, &[], &[(0x1B, 0x101, &[]), (0x03, 0x102, &[])]);
+        let pmt_pkt = packetize_sections(0x100, &[&pmt], 0)[0];
+
+        let mut state = MeterState::new(None);
+        let mut publisher = MeterPublisher::new(new_shared_meter());
+        state.process_ts_packet(&pat_packet(&[(1, 0x100)], 0, 0), &mut publisher);
+        state.process_ts_packet(&pmt_pkt, &mut publisher);
+        assert!(state.audio_pids.contains_key(&0x102), "unshared PID: first PMT accepted");
+
+        let mut state = MeterState::new(None);
+        let mut publisher = MeterPublisher::new(new_shared_meter());
+        state.process_ts_packet(&pat_packet(&[(1, 0x100), (3, 0x100)], 0, 0), &mut publisher);
+        state.process_ts_packet(&pmt_pkt, &mut publisher);
+        assert!(state.audio_pids.is_empty(), "shared PID: exact match only");
     }
 
     /// AC-3 / E-AC-3 / DTS ride PES private_stream_1 (0xBD); the header

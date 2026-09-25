@@ -85,11 +85,21 @@ struct InputPsiCache {
     /// Cached latest complete PMT-PID unit (every packet of it — a PMT may
     /// span packets) keyed by PMT PID from this input.
     cached_pmts: HashMap<u16, Vec<[u8; TS_PACKET_SIZE]>>,
-    /// Unit being collected per PMT PID, and the assembler that says when
-    /// no section is in flight any more (the unit is complete).
-    pmt_pending: HashMap<u16, (SectionAssembler, Vec<[u8; TS_PACKET_SIZE]>)>,
+    /// Unit being collected per PMT PID (see [`PendingPmtUnit`]).
+    pmt_pending: HashMap<u16, PendingPmtUnit>,
     /// PMT PIDs discovered from this input's most recent PAT.
     pmt_pids: HashSet<u16>,
+}
+
+/// A PMT-PID payload unit being collected for the switch cache.
+#[derive(Default)]
+struct PendingPmtUnit {
+    /// Says when no section is in flight any more (the unit is complete)
+    /// and when a CC gap aborted one.
+    asm: SectionAssembler,
+    packets: Vec<[u8; TS_PACKET_SIZE]>,
+    /// A PMT section with a valid CRC_32 completed in this unit.
+    pmt_ok: bool,
 }
 
 impl InputPsiCache {
@@ -119,21 +129,60 @@ impl InputPsiCache {
             self.pmt_pids = pmt_pids;
         } else if self.pmt_pids.contains(&pid) {
             // Collect the whole unit: a PMT that spans packets is only
-            // useful to inject complete.
-            let (asm, pending) = self.pmt_pending.entry(pid).or_default();
-            if ts_pusi(pkt) {
-                pending.clear();
-            } else if pending.is_empty() {
-                return; // joined mid-unit
+            // useful to inject complete. The unit replaces the cached one
+            // only when a PMT section with a valid CRC completed in it and
+            // nothing aborted it — a CC gap mid-unit used to cache the
+            // truncated [PUSI, gapped continuation] over the last good
+            // unit, which the switch then injected corrupt and unstamped.
+            let pusi = ts_pusi(pkt);
+            let unit = self.pmt_pending.entry(pid).or_default();
+            let was_in_flight = unit.asm.in_flight();
+            // `tail_done`: the section in flight completed in this packet.
+            // A valid PMT counts for the unit it started in.
+            let (mut tail_done, mut pmt_tail, mut pmt_here) = (false, false, false);
+            for (sec, spanned) in unit.asm.push_packet(pkt).with_span() {
+                let pmt_ok = sec.first() == Some(&0x02) && mpeg2_crc32(sec) == 0;
+                if spanned {
+                    tail_done = true;
+                    pmt_tail |= pmt_ok;
+                } else {
+                    pmt_here |= pmt_ok;
+                }
             }
             let mut cached = [0u8; TS_PACKET_SIZE];
             cached.copy_from_slice(pkt);
-            pending.push(cached);
-            let _ = asm.push_packet(pkt).count();
-            if !asm.in_flight() {
-                self.cached_pmts.insert(pid, std::mem::take(pending));
-            } else if pending.len() > 32 {
-                pending.clear();
+            let mut aborted = false;
+            if pusi && !(was_in_flight && tail_done) {
+                // A new unit. (Had a section been in flight, the pointer
+                // tail truncated it: the previous unit is abandoned.)
+                unit.packets.clear();
+                unit.packets.push(cached);
+                unit.pmt_ok = pmt_here;
+            } else if pusi {
+                // The pointer tail finished the section in flight: this
+                // packet belongs to the same unit (as in `PsiUnitStage`).
+                unit.packets.push(cached);
+                unit.pmt_ok |= pmt_tail || pmt_here;
+            } else {
+                if unit.packets.is_empty() {
+                    return; // joined mid-unit
+                }
+                unit.packets.push(cached);
+                unit.pmt_ok |= pmt_tail;
+                // The section in flight ended without completing: the
+                // assembler aborted it (CC gap, bad header, failed CRC).
+                aborted = was_in_flight && !tail_done && !unit.asm.in_flight();
+            }
+            if unit.asm.in_flight() {
+                if unit.packets.len() > 32 {
+                    unit.packets.clear();
+                    unit.pmt_ok = false;
+                }
+                return;
+            }
+            let packets = std::mem::take(&mut unit.packets);
+            if std::mem::take(&mut unit.pmt_ok) && !aborted {
+                self.cached_pmts.insert(pid, packets);
             }
         }
     }
@@ -685,6 +734,10 @@ mod tests {
             pkt[pos + 4] = 0x00;
             pos += 5;
         }
+        // A real PMT carries a CRC_32; the switch cache only keeps PMTs
+        // whose CRC verifies.
+        let crc = mpeg2_crc32(&pkt[5..pos]);
+        pkt[pos..pos + 4].copy_from_slice(&crc.to_be_bytes());
         pkt
     }
 
@@ -727,6 +780,127 @@ mod tests {
         assert_eq!(secs.len(), 1);
         assert_eq!((secs[0][5] >> 1) & 0x1F, 1, "stamped");
         assert_eq!(mpeg2_crc32(&secs[0]), 0, "valid CRC");
+    }
+
+    /// A CC gap that aborts a later unit mid-way must not replace the last
+    /// good cached unit: the fixer used to cache [PUSI, gapped
+    /// continuation] as soon as the assembler stopped being in flight, and
+    /// the next switch injected that truncated, unstampable PMT.
+    #[test]
+    fn a_unit_aborted_by_a_cc_gap_does_not_replace_the_cached_pmt() {
+        use crate::engine::ts_test_fixtures::{packetize_sections, pat_packet, pmt_section};
+        // A PMT spanning three packets.
+        let descs: Vec<Vec<u8>> =
+            (0..30u8).map(|i| vec![0x0A, 0x04, b'e', b'n', b'a' + i % 26, 0, 0x52, 0x01, i]).collect();
+        let es: Vec<(u8, u16, &[u8])> =
+            descs.iter().enumerate().map(|(i, d)| (0x06, 0x200 + i as u16, d.as_slice())).collect();
+        let sec = pmt_section(1, 0, 0x200, &[], &es);
+        let good = packetize_sections(0x40, &[&sec], 0);
+        assert_eq!(good.len(), 3);
+        // The next repetition loses its middle packet: P1 (CC 3), P3 (CC 5).
+        let later = packetize_sections(0x40, &[&sec], 3);
+        let mut data = pat_packet(&[(1, 0x40)], 0, 0).to_vec();
+        for p in [good[0], good[1], good[2], later[0], later[2]] {
+            data.extend_from_slice(&p);
+        }
+        let mut fixer = TsContinuityFixer::new();
+        fixer.observe_passive("b", &make_rtp_packet(&data));
+        let injected = fixer.on_switch("b");
+        assert_eq!(injected.len(), 4, "PAT + the good three-packet PMT");
+        let mut asm = SectionAssembler::new();
+        let mut secs = Vec::new();
+        for p in &injected[1..] {
+            secs.extend(asm.push_packet(&p.data).map(|s| s.to_vec()));
+        }
+        assert_eq!(secs.len(), 1, "the injected unit reassembles");
+        assert_eq!(mpeg2_crc32(&secs[0]), 0, "valid CRC");
+        assert_eq!((secs[0][5] >> 1) & 0x1F, 1, "and is stamped");
+    }
+
+    /// A unit whose PMT is complete in its first packet but whose next
+    /// section (a long private table) loses a packet: the unit is aborted
+    /// as a whole and the last good one stays cached. Committing it would
+    /// have cached [PUSI, gapped continuation], which the switch then
+    /// injected unstamped and unreassemblable.
+    #[test]
+    fn a_unit_aborted_after_its_pmt_completed_is_not_cached() {
+        use crate::engine::ts_test_fixtures::{packetize_sections, pat_packet, pmt_section};
+        let pmt = pmt_section(1, 0, 0x100, &[], &[(0x1B, 0x100, &[]), (0x0F, 0x101, &[])]);
+        // A long-form private section (table 0xC1) spanning into two more
+        // packets.
+        let len = 5 + 400 + 4;
+        let mut private = vec![0xC1, 0xB0 | (len >> 8) as u8, len as u8, 0, 1, 0xC1, 0, 0];
+        private.resize(3 + len - 4, 0x5A);
+        let crc = mpeg2_crc32(&private);
+        private.extend_from_slice(&crc.to_be_bytes());
+        let good = packetize_sections(0x40, &[&pmt, &private], 0);
+        assert_eq!(good.len(), 3);
+        let later = packetize_sections(0x40, &[&pmt, &private], 3);
+        let mut data = pat_packet(&[(1, 0x40)], 0, 0).to_vec();
+        for p in [good[0], good[1], good[2], later[0], later[2]] {
+            data.extend_from_slice(&p);
+        }
+        let mut fixer = TsContinuityFixer::new();
+        fixer.observe_passive("b", &make_rtp_packet(&data));
+        let injected = fixer.on_switch("b");
+        assert_eq!(injected.len(), 4, "PAT + the good three-packet unit");
+        let mut asm = SectionAssembler::new();
+        let mut tables = Vec::new();
+        for p in &injected[1..] {
+            tables.extend(asm.push_packet(&p.data).map(|s| s[0]));
+        }
+        assert_eq!(tables, vec![0x02, 0xC1]);
+    }
+
+    /// A PMT that ends in the next unit's PUSI packet, before its
+    /// pointer_field target, belongs to the unit it started in: both
+    /// packets are cached as one unit (the rule `PsiUnitStage` applies).
+    /// Clearing the unit at every PUSI kept only the second packet — the
+    /// tail of the program's PMT, which the switch could not inject.
+    #[test]
+    fn a_pmt_finishing_in_the_next_pointer_tail_is_cached_whole() {
+        use crate::engine::ts_test_fixtures::{packetize_sections, pat_packet, pmt_section};
+        let a = pmt_section(1, 0, 0x100, &[0u8; 170], &[(0x1B, 0x100, &[])]);
+        let b = pmt_section(2, 0, 0x200, &[], &[(0x0F, 0x201, &[])]);
+        let pkts = packetize_sections(0x31, &[&a, &b], 0);
+        assert_eq!(pkts.len(), 2);
+        assert!(ts_pusi(&pkts[1]) && pkts[1][4] > 0, "tail before the pointer");
+        let mut data = pat_packet(&[(1, 0x31)], 0, 0).to_vec();
+        data.extend_from_slice(&pkts[0]);
+        data.extend_from_slice(&pkts[1]);
+        let mut fixer = TsContinuityFixer::new();
+        fixer.observe_passive("b", &make_rtp_packet(&data));
+        let injected = fixer.on_switch("b");
+        assert_eq!(injected.len(), 3, "PAT + both packets of the unit");
+        let mut asm = SectionAssembler::new();
+        let mut programs = Vec::new();
+        for p in &injected[1..] {
+            for sec in asm.push_packet(&p.data) {
+                assert_eq!(mpeg2_crc32(sec), 0);
+                programs.push(u16::from_be_bytes([sec[3], sec[4]]));
+            }
+        }
+        assert_eq!(programs, vec![1, 2]);
+    }
+
+    /// A PMT whose CRC does not verify must not replace the cached one
+    /// either: the switch re-stamps the cached PMT's version, which
+    /// recomputes its CRC, so a damaged PMT would go out looking valid.
+    #[test]
+    fn a_pmt_failing_its_crc_does_not_replace_the_cached_pmt() {
+        let good = build_pmt(0x1000, &[(0x1B, 0x100), (0x0F, 0x101)], 0);
+        let mut bad = build_pmt(0x1000, &[(0x1B, 0x100), (0x0F, 0x101)], 1);
+        bad[22] = 0x03; // the audio stream_type, CRC left as it was
+        let mut data = build_pat(&[(1, 0x1000)], 0).to_vec();
+        data.extend_from_slice(&good);
+        data.extend_from_slice(&bad);
+        let mut fixer = TsContinuityFixer::new();
+        fixer.observe_passive("b", &make_rtp_packet(&data));
+        let injected = fixer.on_switch("b");
+        assert_eq!(injected.len(), 2);
+        let pmt = &injected[1].data;
+        assert_eq!(pmt[22], 0x0F, "the last good PMT is injected");
+        assert!(verify_psi_crc(pmt, 5));
     }
 
     /// VH1.ts: the pointer target on the PMT PID is a short-form 0xC0

@@ -340,6 +340,11 @@ pub struct TsDemuxer {
     /// program_number of the locked program (PMT sections are matched on
     /// it; a PMT PID may be shared by several programs).
     selected_program: Option<u16>,
+    /// True when the PAT maps more than one program to the selected PMT
+    /// PID. Only then must a PMT's program_number match exactly; on an
+    /// unshared PID the first PMT is accepted as before (a mux whose PMT
+    /// program_number disagrees with its PAT keeps working).
+    selected_pmt_pid_shared: bool,
     scte35_section: crate::engine::ts_parse::SectionAssembler,
 }
 
@@ -373,6 +378,7 @@ impl TsDemuxer {
             pat_section: crate::engine::ts_parse::SectionAssembler::new(),
             pmt_section: crate::engine::ts_parse::SectionAssembler::new(),
             selected_program: None,
+            selected_pmt_pid_shared: false,
             scte35_section: crate::engine::ts_parse::SectionAssembler::new(),
         }
     }
@@ -407,6 +413,7 @@ impl TsDemuxer {
             pat_section: crate::engine::ts_parse::SectionAssembler::new(),
             pmt_section: crate::engine::ts_parse::SectionAssembler::new(),
             selected_program: None,
+            selected_pmt_pid_shared: false,
             scte35_section: crate::engine::ts_parse::SectionAssembler::new(),
         }
     }
@@ -562,6 +569,8 @@ impl TsDemuxer {
             };
             self.selected_program = selected.map(|(num, _)| num);
             let new_pmt_pid = selected.map(|(_, pid)| pid);
+            self.selected_pmt_pid_shared = new_pmt_pid
+                .is_some_and(|pmt| programs.iter().filter(|(_, p)| *p == pmt).count() > 1);
             if new_pmt_pid != self.selected_pmt_pid {
                 if let Some(new_pid) = new_pmt_pid {
                     tracing::info!(
@@ -593,22 +602,28 @@ impl TsDemuxer {
 
         // PMT — only honour the PMT for our locked program. The PID may
         // carry other tables ahead of it (ATSC / DigiCipher 0xC0 sections)
-        // and other programs' PMTs, so match table_id AND program_number.
+        // and other programs' PMTs. The program's PMT is chosen exactly as
+        // the transcode stages choose it (`ts_pmt_edit::pmt_index`): an
+        // exact program_number match wins; on a PID the PAT gives to no
+        // other program the first PMT is accepted too.
         if Some(pid) == self.selected_pmt_pid {
             if let Some(payload) = Self::psi_payload(pkt) {
-                let program = self.selected_program;
                 let sections: Vec<Vec<u8>> = self
                     .pmt_section
                     .feed(ts_pusi(pkt), payload)
-                    .filter(|s| {
-                        s.first() == Some(&0x02)
-                            && s.len() >= 5
-                            && program.is_none_or(|p| u16::from_be_bytes([s[3], s[4]]) == p)
-                    })
+                    .filter(|s| s.first() == Some(&0x02))
                     .map(|s| s.to_vec())
                     .collect();
-                for section in sections {
-                    self.parse_pmt(&section);
+                let chosen = match self.selected_program {
+                    Some(p) => crate::engine::ts_pmt_edit::pmt_index(
+                        &sections,
+                        p,
+                        self.selected_pmt_pid_shared,
+                    ),
+                    None => (!sections.is_empty()).then_some(0),
+                };
+                if let Some(i) = chosen {
+                    self.parse_pmt(&sections[i]);
                 }
             }
             return Vec::new();
@@ -1302,6 +1317,34 @@ mod tests {
         demux.demux(&ts);
         assert_eq!(demux.video_pid(), Some(0x0E0F));
         assert_eq!(demux.audio_pid(), Some(0x0E10));
+    }
+
+    /// A single-program mux whose PMT carries a program_number other than
+    /// the one its PAT names (remuxed / misconfigured encoders) must still
+    /// demux: the PMT PID is not shared, so the first PMT on it is the
+    /// program's — the rule `ts_pmt_edit::pmt_index` applies everywhere
+    /// else. On a PID the PAT shares between programs, only an exact match
+    /// counts.
+    #[test]
+    fn pmt_program_number_mismatch_falls_back_on_an_unshared_pid() {
+        use crate::engine::ts_test_fixtures::{packetize_sections, pat_packet, pmt_section};
+        let pmt = pmt_section(2, 0, 0x101, &[], &[(0x1B, 0x101, &[]), (0x0F, 0x102, &[])]);
+        let pmt_pkt = packetize_sections(0x100, &[&pmt], 0)[0];
+
+        let mut demux = TsDemuxer::new(None);
+        let mut ts = pat_packet(&[(1, 0x100)], 0, 0).to_vec();
+        ts.extend_from_slice(&pmt_pkt);
+        demux.demux(&ts);
+        assert_eq!(demux.video_pid(), Some(0x101), "unshared PID: first PMT accepted");
+        assert_eq!(demux.audio_pid(), Some(0x102));
+
+        // Shared PID (programs 1 and 3 both on 0x100): program 2's PMT is
+        // no one's.
+        let mut demux = TsDemuxer::new(None);
+        let mut ts = pat_packet(&[(1, 0x100), (3, 0x100)], 0, 0).to_vec();
+        ts.extend_from_slice(&pmt_pkt);
+        demux.demux(&ts);
+        assert_eq!(demux.video_pid(), None, "shared PID: exact match only");
     }
 
     /// H.264 parameter sets + IDR (SPS 0x67 / PPS 0x68 / IDR 0x65)
