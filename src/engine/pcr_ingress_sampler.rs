@@ -157,14 +157,18 @@ pub fn spawn_pcr_ingress_sampler_with_rx(
 /// event regardless of rate-limit suppression, so the manager UI's
 /// cumulative chip reflects the true rate.
 ///
-/// **Auto-fix**: when `fixer_tx` is provided, each detected
+/// **Auto-fix**: when `fixer_tx` is provided, each detected **PCR**
 /// discontinuity sends a one-shot
-/// `FixerCommand::SignalSourceDiscontinuity` to the per-flow
-/// `TsContinuityFixer`, which OR's the bit into its existing
-/// `pending_di_on_pcr` flag and stamps the MPEG-TS adaptation-field
-/// `discontinuity_indicator` on the next PCR-bearing packet. Same
-/// one-shot mechanism the operator-input-switch path uses; receivers
-/// see DI=1 and flush STC. This is the receiver-side fix for the
+/// `FixerCommand::SignalSourceDiscontinuity` naming the PCR PID that
+/// jumped to the per-flow `TsContinuityFixer`, which stamps the MPEG-TS
+/// adaptation-field `discontinuity_indicator` on that PID's next PCR.
+/// Receivers see DI=1 and flush STC. A PTS / DTS jump alone raises its
+/// event and counter but no DI: DI on a PCR packet announces a new
+/// system time base, and a PES timestamp that jumps while the PCR runs on
+/// is not one (the Spain capture's teletext PIDs step back ~650 ms at 73 s
+/// with a continuous PCR, and put DI on an unrelated PCR every loop). A
+/// loop or a restart that steps the time base steps the PCR too, which is
+/// what carries the DI. This is the receiver-side fix for the
 /// upstream-file-loop case (ffmpeg `-stream_loop -1 -c copy`) — the
 /// edge can't undo the jump in the bytes, but it can tell the
 /// receiver "fresh anchor, forget your old STC tracking" so
@@ -209,7 +213,7 @@ pub(crate) fn spawn_source_discontinuity_watch(
                                     if let Some(tx) = fixer_tx.as_ref() {
                                         let _ = tx.try_send(
                                             crate::engine::flow::FixerCommand::SignalSourceDiscontinuity {
-                                                pcr_pid: Some(pid),
+                                                pcr_pid: pid,
                                             },
                                         );
                                     }
@@ -250,11 +254,6 @@ pub(crate) fn spawn_source_discontinuity_watch(
                                         if gap.unsigned_abs() > DISCONTINUITY_THRESHOLD_90KHZ {
                                             flow_stats.source_discontinuities
                                                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                            if let Some(tx) = fixer_tx.as_ref() {
-                                                let _ = tx.try_send(
-                                                    crate::engine::flow::FixerCommand::SignalSourceDiscontinuity { pcr_pid: None },
-                                                );
-                                            }
                                             let should_emit = match last_event_pts {
                                                 None => true,
                                                 Some(t) => t.elapsed() >= DISCONTINUITY_EVENT_MIN_INTERVAL,
@@ -291,11 +290,6 @@ pub(crate) fn spawn_source_discontinuity_watch(
                                         if gap.unsigned_abs() > DISCONTINUITY_THRESHOLD_90KHZ {
                                             flow_stats.source_discontinuities
                                                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                            if let Some(tx) = fixer_tx.as_ref() {
-                                                let _ = tx.try_send(
-                                                    crate::engine::flow::FixerCommand::SignalSourceDiscontinuity { pcr_pid: None },
-                                                );
-                                            }
                                             let should_emit = match last_event_dts {
                                                 None => true,
                                                 Some(t) => t.elapsed() >= DISCONTINUITY_EVENT_MIN_INTERVAL,
@@ -705,6 +699,69 @@ mod tests {
         assert_eq!(w.observe(0x101, back), Some((base[1] + 199 * 30 * ms, -5_920 * ms as i64)));
         assert_eq!(w.observe(0x100, base[0] + 200 * 30 * ms), None);
         assert_eq!(w.observe(0x101, back + 30 * ms), None);
+    }
+
+    /// A PES timestamp that jumps while the PCR runs on (the Spain capture's
+    /// teletext PIDs step back ~650 ms at 73 s) is an event, not a new time
+    /// base: no DI is armed. A PCR jump arms DI on that PCR's PID.
+    #[tokio::test]
+    async fn only_a_pcr_jump_arms_a_di() {
+        use crate::engine::ts_test_fixtures::pes_start_packet;
+        let (tx, _keep) = broadcast::channel::<RtpPacket>(64);
+        let (fixer_tx, mut fixer_rx) = tokio::sync::mpsc::channel(16);
+        let (events, _events_rx) = crate::manager::events::event_channel();
+        let stats = Arc::new(crate::stats::collector::FlowStatsAccumulator::new(
+            "f".into(),
+            "f".into(),
+            "udp".into(),
+        ));
+        let (_active_tx, active_rx) = tokio::sync::watch::channel("i".to_string());
+        let cancel = CancellationToken::new();
+        let task = spawn_source_discontinuity_watch(
+            &tx,
+            "f".into(),
+            active_rx,
+            events,
+            stats.clone(),
+            Some(fixer_tx),
+            cancel.clone(),
+        );
+        let send = |p: &[u8]| {
+            let _ = tx.send(RtpPacket {
+                data: Bytes::copy_from_slice(p),
+                sequence_number: 0,
+                rtp_timestamp: 0,
+                recv_time_us: 0,
+                is_raw_ts: true,
+                upstream_seq: None,
+                upstream_leg_id: None,
+                sender_timestamp_us: None,
+            });
+        };
+        let pcr = |pid: u16, ms: u64| {
+            crate::engine::ts_parse::pcr_only_packet(pid, 0, ms * 27_000, false)
+        };
+        for k in 0..5u64 {
+            send(&pcr(0x100, 1_000 + k * 30));
+            send(&pes_start_packet(0x104, k as u8, 0xBD, (10_000 + k * 40) * 90, None));
+        }
+        // Teletext steps back 650 ms; the PCR runs on.
+        send(&pes_start_packet(0x104, 5, 0xBD, (10_000 + 4 * 40 - 650) * 90, None));
+        send(&pcr(0x100, 1_150));
+        // Then the PCR itself jumps.
+        send(&pcr(0x100, 9_000));
+        let cmd = tokio::time::timeout(std::time::Duration::from_secs(2), fixer_rx.recv())
+            .await
+            .expect("a command")
+            .expect("open");
+        assert!(matches!(
+            cmd,
+            crate::engine::flow::FixerCommand::SignalSourceDiscontinuity { pcr_pid: 0x100 }
+        ));
+        assert!(fixer_rx.try_recv().is_err(), "the PTS jump armed nothing");
+        assert_eq!(stats.source_discontinuities.load(std::sync::atomic::Ordering::Relaxed), 2);
+        cancel.cancel();
+        let _ = task.await;
     }
 
     #[test]

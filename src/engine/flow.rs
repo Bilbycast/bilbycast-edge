@@ -4643,21 +4643,15 @@ pub(crate) enum FixerCommand {
     /// Emit a keepalive NULL datagram to keep downstream sockets alive
     /// during a silent active input.
     Keepalive,
-    /// The source-discontinuity watcher detected an upstream PCR / PTS / DTS
-    /// backward jump on the active input's stream (e.g. an ffmpeg
-    /// `-stream_loop -1 -c copy` file-loop boundary, an encoder restart, a
-    /// decoder reseat). Signal the fixer to set the MPEG-TS
-    /// `discontinuity_indicator` bit on the **next** PCR-bearing packet it
-    /// forwards — same one-shot mechanism the operator-input-switch path
-    /// uses. Receivers see DI=1 and flush their STC cleanly instead of
-    /// silently sliding A/V over the jump.
-    ///
-    /// One-shot: the fixer ORs the flag with its existing
-    /// `pending_di_on_pcr`; consumed on the next PCR.
-    ///
-    /// `pcr_pid` is the PCR PID whose clock jumped (a PCR jump); `None` for
-    /// a PTS / DTS jump. On an MPTS the DI goes on that program's PCR.
-    SignalSourceDiscontinuity { pcr_pid: Option<u16> },
+    /// The source-discontinuity watcher detected an upstream PCR jump on
+    /// the active input's stream (e.g. an ffmpeg `-stream_loop -1 -c copy`
+    /// file-loop boundary, an encoder restart, a decoder reseat). Signal the
+    /// fixer to set the MPEG-TS `discontinuity_indicator` bit on the **next**
+    /// PCR of `pcr_pid` — the PID whose clock jumped; on an MPTS, that
+    /// program's. Receivers see DI=1 and flush their STC cleanly instead of
+    /// silently sliding A/V over the jump. One-shot per PID. (A PTS / DTS
+    /// jump alone signals nothing — the time base did not move.)
+    SignalSourceDiscontinuity { pcr_pid: u16 },
     /// An input has been hot-removed from the flow. Drop its cached
     /// PAT/PMT so a later hot-add of an input under the same id doesn't
     /// re-inject stale PSI on the next switch.
@@ -4731,11 +4725,9 @@ async fn ts_fixer_task(
                     }
                 }
                 Some(FixerCommand::SignalSourceDiscontinuity { pcr_pid }) => {
-                    // The watcher saw an upstream backward PCR/PTS/DTS
-                    // jump. Set the DI flag so the next PCR-bearing
-                    // packet that flows through the fixer gets
-                    // `discontinuity_indicator` set. One-shot;
-                    // consumed inside `process_packet`.
+                    // The watcher saw an upstream PCR jump on `pcr_pid`.
+                    // Arm DI for that PID's next PCR through the fixer.
+                    // One-shot; consumed inside `process_packet`.
                     fixer.signal_source_discontinuity(pcr_pid);
                 }
                 Some(FixerCommand::DropInputPsi { input_id }) => {

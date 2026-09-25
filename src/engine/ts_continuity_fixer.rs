@@ -245,35 +245,25 @@ impl TsContinuityFixer {
         }
     }
 
-    /// Signal an upstream-source-side discontinuity (PCR / PTS / DTS
-    /// backward jump observed by `pcr_ingress_sampler::spawn_source_
-    /// discontinuity_watch`). Sets the one-shot `discontinuity_indicator`
-    /// flag so the next PCR-bearing packet the fixer forwards carries
-    /// DI=1 — telling receivers "the next PCR is a fresh STC anchor,
-    /// flush old timestamp tracking". Without this, professional and
-    /// prosumer decoders treat the backward jump as a clock fault and
-    /// either silently slide A/V or stall.
+    /// Signal an upstream-source-side discontinuity (a PCR jump observed
+    /// by `pcr_ingress_sampler::spawn_source_discontinuity_watch`). Arms
+    /// the one-shot `discontinuity_indicator` for that PCR PID's next PCR
+    /// through the fixer — DI=1, telling receivers "this PCR is a fresh STC
+    /// anchor, flush old timestamp tracking". Without this, professional
+    /// and prosumer decoders treat the backward jump as a clock fault and
+    /// either silently slide A/V or stall. Only that PID's PCR takes it: on
+    /// an MPTS each program has its own clock.
     ///
-    /// Same mechanism the operator-input-switch path uses; OR'd in so
-    /// a switch happening concurrently with a source discontinuity
-    /// doesn't lose either signal.
+    /// Kept apart from the operator-input-switch flag, so a switch
+    /// happening concurrently with a source discontinuity loses neither.
     ///
     /// Also flips `ever_switched` so the post-switch processing path
     /// (which is what applies DI to packets) takes over even when
     /// the operator never manually switched — a chronic source-loop
     /// without any operator action still gets DI=1 on every jump.
-    ///
-    /// `pcr_pid` names the PCR PID whose clock jumped: DI then goes on that
-    /// PID's next PCR only. `None` (a PTS / DTS jump, which names no clock)
-    /// keeps the old behaviour — the next PCR on any PID.
-    pub fn signal_source_discontinuity(&mut self, pcr_pid: Option<u16>) {
-        match pcr_pid {
-            Some(pid) => {
-                if !self.pending_di_pids.contains(&pid) {
-                    self.pending_di_pids.push(pid);
-                }
-            }
-            None => self.pending_di_on_pcr = true,
+    pub fn signal_source_discontinuity(&mut self, pcr_pid: u16) {
+        if !self.pending_di_pids.contains(&pcr_pid) {
+            self.pending_di_pids.push(pcr_pid);
         }
         self.ever_switched = true;
     }
@@ -1608,7 +1598,7 @@ mod tests {
     fn a_pcr_jump_signal_lands_on_its_own_pid() {
         let mut fixer = TsContinuityFixer::new();
         fixer.process_packet("a", &make_rtp_packet(&build_ts_packet(0x100, 0)));
-        fixer.signal_source_discontinuity(Some(0x200));
+        fixer.signal_source_discontinuity(0x200);
         let other = build_pcr_packet(0x100, 1, 27_000_000);
         let bytes = fixer.process_packet("a", &make_rtp_packet(&other)).unwrap_rewritten();
         assert!(!ts_discontinuity_indicator(&bytes[..TS_PACKET_SIZE]), "not another program's PCR");
@@ -1618,11 +1608,6 @@ mod tests {
         let again = build_pcr_packet(0x200, 1, 99_810_000);
         let bytes = fixer.process_packet("a", &make_rtp_packet(&again)).unwrap_rewritten();
         assert!(!ts_discontinuity_indicator(&bytes[..TS_PACKET_SIZE]), "one-shot");
-        // A PTS / DTS jump names no clock: the next PCR on any PID.
-        fixer.signal_source_discontinuity(None);
-        let any = build_pcr_packet(0x100, 2, 28_000_000);
-        let bytes = fixer.process_packet("a", &make_rtp_packet(&any)).unwrap_rewritten();
-        assert!(ts_discontinuity_indicator(&bytes[..TS_PACKET_SIZE]));
     }
 
     /// Each new switch re-arms the flag, so back-and-forth A↔B always
