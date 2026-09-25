@@ -1517,6 +1517,12 @@ mod inner {
                 if force_idr_now {
                     self.pipeline.force_next_keyframe();
                 }
+                if !self.pipeline.is_open()
+                    && let Some(dec) = self.decoder.as_ref()
+                {
+                    // The decoder's SAR, for a frame that carries none.
+                    self.pipeline.set_source_sar_fallback(dec.sample_aspect_ratio());
+                }
 
                 let encoded = match self.pipeline.encode(&frame, Some(self.out_frame_count)) {
                     Ok(frames) => frames,
@@ -2866,6 +2872,36 @@ mod tests {
             let out = run(&mut r, &ts);
             assert_eq!(r.inner.pipeline.fps(), (30, 1));
             assert_eq!(first_sps(&out).timing.map(|(n, t, _)| (n, t)), Some((1, 60)));
+        }
+
+        /// The source's sample aspect ratio reaches the output VUI:
+        /// 720x576 16:9 anamorphic SD (64:45) used to leave SAR-less and
+        /// display at 5:4. Scaled, the display aspect ratio is kept.
+        #[test]
+        fn the_source_sample_aspect_ratio_survives() {
+            let aus = x264_aus(10, (720, 576), None, Some((64, 45)));
+            let mut cc = 0u8;
+            let ts = ts_of(&aus, 900_000, false, &mut cc);
+            let mut r = TsVideoReplacer::new(&cfg("x264"), None).unwrap();
+            let out = run(&mut r, &ts);
+            let sps = first_sps(&out);
+            assert_eq!((sps.width, sps.height), (720, 576));
+            assert_eq!(sps.sample_aspect_ratio, Some((64, 45)));
+
+            let mut scaled = cfg("x264");
+            scaled.width = Some(1024);
+            scaled.height = Some(576);
+            let mut r = TsVideoReplacer::new(&scaled, None).unwrap();
+            let out = run(&mut r, &ts_of(&aus, 900_000, false, &mut cc));
+            let sps = first_sps(&out);
+            assert_eq!((sps.width, sps.height), (1024, 576));
+            assert_eq!(sps.sample_aspect_ratio, Some((1, 1)));
+
+            // A square-pixel source that never said so stays unspecified.
+            let aus = x264_aus(10, (320, 240), None, None);
+            let mut r = TsVideoReplacer::new(&cfg("x264"), None).unwrap();
+            let out = run(&mut r, &ts_of(&aus, 900_000, false, &mut cc));
+            assert_eq!(first_sps(&out).sample_aspect_ratio, None);
         }
 
         /// A frame-coded source keeps its rate: one PES per frame.

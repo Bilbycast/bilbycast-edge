@@ -493,6 +493,81 @@ fn gcd(mut a: u64, mut b: u64) -> u64 {
     a.max(1)
 }
 
+// ───────────────────── Sample aspect ratio ─────────────────────
+
+/// Largest term the H.264 / HEVC VUI can carry for `sar_width` /
+/// `sar_height`.
+const SAR_TERM_MAX: u64 = 65_535;
+
+/// The sample aspect ratio to signal on an encode of a `src` picture into
+/// `dst`, preserving the source's **display** aspect ratio.
+///
+/// Unscaled, it is the source's own SAR — `None` (unspecified, read as
+/// square pixels) stays `None`, which is what every encode signalled
+/// before, so a square-pixel source is byte-for-byte unchanged. Scaled,
+/// `out = src_sar × (src_w × dst_h) / (src_h × dst_w)`, reduced, with an
+/// unspecified source SAR taken as 1:1; a square result from an
+/// unspecified source stays unspecified. A term that will not fit the
+/// 16-bit VUI fields is approximated (best rational with both terms
+/// ≤ 65535), never dropped.
+///
+/// 720x576 at 64:45 (16:9 anamorphic SD) unscaled stays 64:45 — it used to
+/// leave SAR-less and display at 5:4 — and scaled to 1024x576 becomes 1:1;
+/// 1920x1080 1:1 to 720x576 becomes 64:45.
+pub fn output_sar(
+    src_sar: Option<(u32, u32)>,
+    (src_w, src_h): (u32, u32),
+    (dst_w, dst_h): (u32, u32),
+) -> Option<(u32, u32)> {
+    let src_sar = src_sar.filter(|(n, d)| *n > 0 && *d > 0);
+    if (src_w, src_h) == (dst_w, dst_h) || src_w == 0 || src_h == 0 || dst_w == 0 || dst_h == 0 {
+        return src_sar.map(|(n, d)| bounded_ratio(n as u64, d as u64));
+    }
+    let (sn, sd) = src_sar.unwrap_or((1, 1));
+    let num = sn as u64 * src_w as u64 * dst_h as u64;
+    let den = sd as u64 * src_h as u64 * dst_w as u64;
+    let (n, d) = bounded_ratio(num, den);
+    if src_sar.is_none() && n == d {
+        return None;
+    }
+    Some((n, d))
+}
+
+/// `num / den` reduced, and if either term still exceeds
+/// [`SAR_TERM_MAX`], the closest fraction whose terms both fit
+/// (continued-fraction convergents / semiconvergents).
+fn bounded_ratio(num: u64, den: u64) -> (u32, u32) {
+    let g = gcd(num, den);
+    let (num, den) = (num / g, den / g);
+    if num <= SAR_TERM_MAX && den <= SAR_TERM_MAX {
+        return (num as u32, den as u32);
+    }
+    // Best approximation with both terms bounded: walk the continued
+    // fraction, keeping the last convergent inside the bound, then try the
+    // best semiconvergent past it.
+    let (mut p0, mut q0, mut p1, mut q1) = (0u64, 1u64, 1u64, 0u64);
+    let (mut n, mut d) = (num, den);
+    while d != 0 {
+        let a = n / d;
+        let (p2, q2) = (a * p1 + p0, a * q1 + q0);
+        if p2 > SAR_TERM_MAX || q2 > SAR_TERM_MAX {
+            let k_p = if p1 == 0 { u64::MAX } else { (SAR_TERM_MAX - p0) / p1 };
+            let k_q = if q1 == 0 { u64::MAX } else { (SAR_TERM_MAX - q0) / q1 };
+            let k = k_p.min(k_q);
+            let (ps, qs) = (k * p1 + p0, k * q1 + q0);
+            let target = num as f64 / den as f64;
+            let err = |p: u64, q: u64| (p as f64 / q as f64 - target).abs();
+            if qs > 0 && ps > 0 && err(ps, qs) < err(p1, q1) {
+                return (ps as u32, qs as u32);
+            }
+            break;
+        }
+        (p0, q0, p1, q1) = (p1, q1, p2, q2);
+        (n, d) = (d, n % d);
+    }
+    ((p1.max(1)) as u32, (q1.max(1)) as u32)
+}
+
 /// Pick the [`video_codec::ScalerDstFormat`] that matches the encoder's
 /// configured chroma + bit depth, so the scaler's output is feedable
 /// directly into `VideoEncoder::encode_frame` without an extra repack.
@@ -586,6 +661,10 @@ pub struct ScaledVideoEncoder {
     /// wrong is not cosmetic: libx264's VBV rate control reads 90 kHz ticks
     /// against a 1/fps timebase as "frames minutes apart" and **segfaults**.
     pts_90k: bool,
+    /// Source sample aspect ratio to use when the first decoded frame
+    /// carries none — the decoder context's, set by the call site. See
+    /// [`Self::set_source_sar_fallback`].
+    sar_fallback: Option<(u32, u32)>,
 }
 
 #[cfg(feature = "media-codecs")]
@@ -642,6 +721,7 @@ impl ScaledVideoEncoder {
             resolved_backend_sink: None,
             async_depth: 0,
             pts_90k: false,
+            sar_fallback: None,
         }
     }
 
@@ -671,6 +751,13 @@ impl ScaledVideoEncoder {
     #[cfg(test)]
     pub fn is_pts_90k(&self) -> bool {
         self.pts_90k
+    }
+
+    /// The sample aspect ratio the decoder parsed from the bitstream
+    /// (`VideoDecoder::sample_aspect_ratio`), used when the frame the
+    /// encoder opens on carries none. Only read at lazy-open.
+    pub fn set_source_sar_fallback(&mut self, sar: Option<(u32, u32)>) {
+        self.sar_fallback = sar;
     }
 
     /// Plumb a [`ResolvedBackendCell`] that the encoder writes to on
@@ -781,7 +868,8 @@ impl ScaledVideoEncoder {
         let src_pix_fmt = frame_ref.pixel_format();
 
         if self.encoder.is_none() {
-            self.lazy_open(src_w, src_h, src_pix_fmt)?;
+            let src_sar = frame_ref.sample_aspect_ratio().or(self.sar_fallback);
+            self.lazy_open(src_w, src_h, src_pix_fmt, src_sar)?;
         } else if src_w != self.src_w
             || src_h != self.src_h
             || src_pix_fmt != self.src_pix_fmt
@@ -850,7 +938,8 @@ impl ScaledVideoEncoder {
         pts: Option<i64>,
     ) -> Result<Vec<video_codec::EncodedVideoFrame>, String> {
         if self.encoder.is_none() {
-            self.lazy_open(src_w, src_h, src_pix_fmt)?;
+            // Raw planes carry no sample aspect ratio: square, as before.
+            self.lazy_open(src_w, src_h, src_pix_fmt, None)?;
         } else if src_w != self.src_w
             || src_h != self.src_h
             || src_pix_fmt != self.src_pix_fmt
@@ -892,7 +981,13 @@ impl ScaledVideoEncoder {
         }
     }
 
-    fn lazy_open(&mut self, src_w: u32, src_h: u32, src_pix_fmt: i32) -> Result<(), String> {
+    fn lazy_open(
+        &mut self,
+        src_w: u32,
+        src_h: u32,
+        src_pix_fmt: i32,
+        src_sar: Option<(u32, u32)>,
+    ) -> Result<(), String> {
         if self.backend_chain.is_empty() {
             return Err(
                 "encoder open failed: backend chain is empty (no candidates passed by the resolver)"
@@ -913,6 +1008,12 @@ impl ScaledVideoEncoder {
                 self.global_header,
             );
             enc_cfg.async_depth = self.async_depth;
+            // Keep the source's display shape: its own SAR unscaled, the
+            // DAR-preserving one scaled. Nothing set this before, so an
+            // anamorphic source (720x576 16:9 = 64:45) left SAR-less and
+            // displayed squeezed.
+            enc_cfg.sample_aspect_ratio =
+                output_sar(src_sar, (src_w, src_h), (enc_cfg.width, enc_cfg.height));
             if self.pts_90k {
                 enc_cfg.time_base_num = 1;
                 enc_cfg.time_base_den = 90_000;
@@ -1384,5 +1485,43 @@ mod cadence_tests {
         assert_eq!(meter([5_000; 4], 0).rate(), Some((18, 1)));
         // 0.2 % off 25 fps: not snapped.
         assert_eq!(rate_from_frame_duration(3_608.0), (11_250, 451));
+    }
+}
+
+#[cfg(test)]
+mod sar_tests {
+    use super::{bounded_ratio, output_sar};
+
+    #[test]
+    fn unscaled_keeps_the_source_sar_and_unspecified_stays_unspecified() {
+        assert_eq!(output_sar(Some((64, 45)), (720, 576), (720, 576)), Some((64, 45)));
+        assert_eq!(output_sar(Some((10, 11)), (704, 480), (704, 480)), Some((10, 11)));
+        assert_eq!(output_sar(Some((128, 90)), (720, 576), (720, 576)), Some((64, 45)));
+        assert_eq!(output_sar(None, (1920, 1080), (1920, 1080)), None);
+        assert_eq!(output_sar(Some((0, 1)), (1920, 1080), (1920, 1080)), None);
+    }
+
+    #[test]
+    fn scaling_preserves_the_display_aspect_ratio() {
+        // 16:9 anamorphic SD to square-pixel 16:9.
+        assert_eq!(output_sar(Some((64, 45)), (720, 576), (1024, 576)), Some((1, 1)));
+        // Square HD to 16:9 anamorphic SD, specified or not.
+        assert_eq!(output_sar(Some((1, 1)), (1920, 1080), (720, 576)), Some((64, 45)));
+        assert_eq!(output_sar(None, (1920, 1080), (720, 576)), Some((64, 45)));
+        // Square stays square; an unspecified square source stays unspecified.
+        assert_eq!(output_sar(Some((1, 1)), (1920, 1080), (1280, 720)), Some((1, 1)));
+        assert_eq!(output_sar(None, (1920, 1080), (1280, 720)), None);
+        // VH1: 528x480 at 40:33 (4:3) widened to 720x480 is 8:9, still 4:3.
+        assert_eq!(output_sar(Some((40, 33)), (528, 480), (720, 480)), Some((8, 9)));
+    }
+
+    #[test]
+    fn a_ratio_past_16_bits_is_approximated_not_dropped() {
+        assert_eq!(bounded_ratio(128, 90), (64, 45));
+        let (n, d) = bounded_ratio(100_003, 99_991);
+        assert!(n <= 65_535 && d <= 65_535, "{n}:{d}");
+        let err = (n as f64 / d as f64 - 100_003.0 / 99_991.0).abs();
+        assert!(err < 1e-8, "{n}:{d} off by {err}");
+        assert_eq!(bounded_ratio(10_000_000, 1), (65_535, 1));
     }
 }
