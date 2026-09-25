@@ -21,15 +21,22 @@ on:
     - cron: "0 21 * * *"
   workflow_dispatch:
 
+# Read-only by default. `issues: write` and `checks: write` belong to
+# rustsec/audit-check, which opens an issue per advisory on the scheduled run
+# and posts a check run on every other trigger, so they are granted to
+# `cargo-audit` alone. At workflow level they also reached `cargo-deny`, which
+# runs a third-party container, and `vendored-c-libs`; neither calls the API.
 permissions:
   contents: read
-  issues: write
-  checks: write
 
 jobs:
   cargo-audit:
     name: cargo audit
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+      checks: write
     steps:
       # The action reports through its `token` input, not the git credential,
       # so the checkout keeps none.
