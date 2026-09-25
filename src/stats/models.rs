@@ -95,6 +95,11 @@ pub struct FlowStats {
     /// [`AvSkewStats`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub av_skew: Option<AvSkewStats>,
+    /// The ACTIVE input's ingress transcode PCR stage (`audio_encode` /
+    /// `video_encode` on the input). Absent when that input transcodes
+    /// nothing. See [`TranscodePcrStats`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transcode_pcr: Option<TranscodePcrStats>,
     /// In-depth content-analysis snapshot. Populated when the flow has
     /// `content_analysis.lite | audio_full | video_full` enabled. Each
     /// sub-field is independently optional so a partial selection (e.g.
@@ -1133,6 +1138,10 @@ pub struct OutputStats {
     /// `FlowStats.av_skew` then covers the whole path.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub av_skew: Option<AvSkewStats>,
+    /// This output's transcode PCR stage. Absent when the output
+    /// transcodes nothing. See [`TranscodePcrStats`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transcode_pcr: Option<TranscodePcrStats>,
     /// Per-output local-display stats. Populated only when the output
     /// type is `display`; absent on every network-egress output.
     /// Backward-compatible additive field — old managers ignore it.
@@ -1539,6 +1548,30 @@ pub struct AvSkewStats {
     pub lipsync_trim_ms: i64,
     /// "passthrough" | "measured"
     pub mode: String,
+}
+
+/// The trailing PCR stage of a TS transcode chain
+/// (`engine::ts_pcr_remux`): output PCR = input PCR − `offset_ms`, the
+/// transcode delay the stage measured on the first re-encoded PES and raises
+/// whenever one arrives late.
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct TranscodePcrStats {
+    /// Current delay of the output PCR behind the input PCR, ms.
+    pub offset_ms: f64,
+    /// Re-encoded PES that arrived behind the output PCR (each raised the
+    /// delay; a strict T-STD decoder would have dropped it otherwise).
+    pub late_frames: u64,
+    /// Times the delay was raised after its first latch — each one is a
+    /// PCR discontinuity (DI = 1).
+    pub offset_raises: u64,
+    /// Re-encoded PES from a previous clock epoch dropped after an input
+    /// PCR jump of more than 1 s.
+    pub stale_frames_dropped: u64,
+    /// PCRs synthesised from the re-encoded video because the input
+    /// carried none.
+    pub synthesized_pcrs: u64,
+    /// Input PCR discontinuities (epochs) seen.
+    pub epochs: u64,
 }
 
 /// Per-output end-to-end latency statistics for the last reporting window.

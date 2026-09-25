@@ -154,6 +154,10 @@ pub mod ts_parse;
 /// code path. Used by both transcode replacers, the PID rewriters and the
 /// HLS audio remux.
 pub mod ts_pmt_edit;
+/// Trailing PCR stage of every TS transcode chain (output and ingress):
+/// re-stamps the input PCR the replacers carried through, delayed by one
+/// measured transcode allowance, and guards re-encoded PES against it.
+pub mod ts_pcr_remux;
 pub mod ts_pid_overrides_rewriter;
 pub mod ts_pid_remapper;
 pub mod ts_program_filter;

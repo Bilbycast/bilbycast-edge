@@ -17,6 +17,11 @@
 //! - That PMT is rebuilt: target stream_type, `PCR_PID` = video PID, the
 //!   video descriptor policy, a content-tracked version and a valid CRC —
 //!   also when the PMT spans packets.
+//! - Every input PCR on the source PCR_PID — inside a video payload packet
+//!   too — leaves as an adaptation-field-only packet on the video PID at
+//!   the same stream position, value and DI unchanged. The re-encoded PES
+//!   carry no PCR: `engine::ts_pcr_remux`, after this stage, delays the
+//!   input's PCR timeline by one measured transcode allowance.
 //! - Video PID packets are buffered into PES, flushed on each PUSI,
 //!   fed to the decoder, the resulting frames go through the encoder,
 //!   and the encoded bitstream is repacketized as fresh TS.
@@ -47,22 +52,9 @@ use std::sync::Arc;
 use crate::config::models::VideoEncodeConfig;
 
 use super::ts_parse::{
-    extract_pes_pts, parse_pat_programs, ts_has_payload, ts_payload_offset, ts_pid, ts_pusi,
-    PAT_PID, TS_PACKET_SIZE, TS_SYNC_BYTE,
+    extract_pcr, parse_pat_programs, pcr_only_packet, ts_discontinuity_indicator, ts_has_payload,
+    ts_payload_offset, ts_pid, ts_pusi, PAT_PID, TS_PACKET_SIZE, TS_SYNC_BYTE,
 };
-
-/// PCR pre-roll behind PTS in 27 MHz ticks (80 ms × 27 000 000 / 1000).
-///
-/// ISO/IEC 13818-1 Annex L (T-STD model) requires PCR to arrive earlier
-/// than the corresponding frame's PTS by the decoder's transport-buffer
-/// + CPB pre-roll. 80 ms matches FFmpeg's mpegts muxer default for VBR
-/// contribution streams. Phase 4 of the sync-mux work moved actual PCR
-/// generation to consult `engine::av_sync_mux::pcr_for_emit`, which
-/// uses the master clock when a flow-wide pacer is attached and falls
-/// back to `pts × 300 − preroll` otherwise. The constant is retained
-/// for tests that exercise the legacy derivation directly.
-#[allow(dead_code)]
-const PCR_PREROLL_27MHZ: u64 = 2_160_000;
 
 /// Lock-free runtime counters for the streaming TS video replacer.
 ///
@@ -181,24 +173,6 @@ pub struct TsVideoReplacer {
 }
 
 impl TsVideoReplacer {
-    /// Attach a per-flow A/V sync pacer. Output PCR is then derived from
-    /// the pacer's master clock instead of `pts × 300 − preroll`. Safe
-    /// to call zero or one time before `process()` runs; calling twice
-    /// silently overwrites the existing pacer.
-    pub fn set_av_sync_pacer(
-        &mut self,
-        pacer: Arc<crate::engine::av_sync_mux::AvSyncPacer>,
-    ) {
-        #[cfg(feature = "media-codecs")]
-        {
-            self.inner.av_sync_pacer = Some(pacer);
-        }
-        #[cfg(not(feature = "media-codecs"))]
-        {
-            let _ = pacer;
-        }
-    }
-
     /// Attach the per-input edge-added A/V skew reporter. See the inner
     /// `av_skew` field doc-comment.
     pub fn set_av_skew_reporter(
@@ -212,23 +186,6 @@ impl TsVideoReplacer {
         #[cfg(not(feature = "media-codecs"))]
         {
             let _ = reporter;
-        }
-    }
-
-    /// Wire the shared latest-emitted-audio-PTS handle so the regenerated PCR
-    /// can be floored on `min(video_pts, audio_pts)` (see the field doc). The
-    /// co-running `TsAudioReplacer` writes the same `Arc`.
-    pub fn set_audio_pts_floor(
-        &mut self,
-        floor: Arc<std::sync::atomic::AtomicU64>,
-    ) {
-        #[cfg(feature = "media-codecs")]
-        {
-            self.inner.audio_pts_floor = Some(floor);
-        }
-        #[cfg(not(feature = "media-codecs"))]
-        {
-            let _ = floor;
         }
     }
 
@@ -419,6 +376,19 @@ impl TsVideoReplacer {
         }
     }
 
+    /// The video PID whose PES this replacer re-encodes, once locked —
+    /// what the chain's trailing PCR stage checks against its PCR.
+    pub fn replaced_pid(&self) -> Option<u16> {
+        #[cfg(feature = "media-codecs")]
+        {
+            self.inner.video_pid
+        }
+        #[cfg(not(feature = "media-codecs"))]
+        {
+            None
+        }
+    }
+
     /// Drain buffered PES / encoder state. Call on graceful shutdown.
     #[allow(dead_code, unused_variables)]
     pub fn flush(&mut self, output: &mut Vec<u8>) {
@@ -443,84 +413,6 @@ mod inner {
     use video_codec::{VideoCodec, VideoEncoderCodec};
     use video_engine::VideoDecoder;
 
-    /// PTS modulus (33-bit space, MPEG-TS spec).
-    const PTS_MODULUS_90K: u64 = 1u64 << 33;
-    /// Mask for 33-bit PTS values.
-    const PTS_MASK_33B: u64 = PTS_MODULUS_90K - 1;
-    /// PTS delta above which we treat the gap as an epoch-crossing
-    /// discontinuity and stamp `discontinuity_indicator=1` on the
-    /// PCR-bearing TS packet. 90 000 = 1 second @ 90 kHz. Switching
-    /// between two unrelated source feeds typically produces deltas
-    /// orders of magnitude larger than this; legitimate frame-rate
-    /// hiccups are sub-100 ms.
-    const PTS_JUMP_THRESHOLD_90K: u64 = 90_000;
-
-    /// Upper bound on how far the PCR may be floored behind the video PTS to
-    /// keep ahead of audio (5 s @ 90 kHz). A well-muxed contribution feed sits
-    /// audio a few ms–few-hundred-ms behind video; anything beyond a few
-    /// seconds is a pathological source or a stale/epoch-jumped audio
-    /// reference. Clamping here means neither a 33-bit PTS wrap nor an
-    /// input-switch epoch jump can drive the PCR backward by more than a
-    /// bounded, recoverable amount (a 5 s step the receiver re-buffers past)
-    /// instead of the ~26.5 h corruption a raw signed delta would produce.
-    const MAX_AUDIO_LAG_90K: u64 = 5 * 90_000;
-
-    /// Two-way modular distance between two 33-bit PTS values, in 90 kHz
-    /// ticks. Returns the smaller of the forward and backward distances
-    /// across the modulus, so a legitimate PTS wrap (which only happens
-    /// every ~26.5 hours) doesn't get misclassified as an input-switch
-    /// epoch jump.
-    fn pts_distance_90k(a: u64, b: u64) -> u64 {
-        let am = a & PTS_MASK_33B;
-        let bm = b & PTS_MASK_33B;
-        let fwd = (am + PTS_MODULUS_90K - bm) % PTS_MODULUS_90K;
-        let bwd = (bm + PTS_MODULUS_90K - am) % PTS_MODULUS_90K;
-        fwd.min(bwd)
-    }
-
-    /// How far the audio PTS sits BEHIND this video PTS, in 90 kHz ticks,
-    /// for the PCR floor — wrap-safe and clamped. Masks both operands into
-    /// 33-bit PTS space and takes the modular FORWARD distance audio→video;
-    /// when that exceeds half the modulus the audio actually LEADS the video
-    /// (or the two straddle a ~26.5 h wrap such that "behind" is ambiguous),
-    /// so the lag is 0 — no floor needed. The result is clamped to
-    /// `max_90k`. A raw `(video as i64).wrapping_sub(audio as i64)` is NOT
-    /// wrap-safe: across a wrap it balloons to ~2^33 and, once latched into
-    /// the smoothed lag, floors the PCR backward by hours.
-    pub(super) fn audio_lag_90k(video_pts: u64, audio_pts: u64, max_90k: u64) -> u64 {
-        let vm = video_pts & PTS_MASK_33B;
-        let am = audio_pts & PTS_MASK_33B;
-        let fwd = (vm + PTS_MODULUS_90K - am) % PTS_MODULUS_90K;
-        if fwd <= PTS_MODULUS_90K / 2 {
-            fwd.min(max_90k)
-        } else {
-            0
-        }
-    }
-
-    /// Compute the `discontinuity_indicator` flag for the next emitted
-    /// PCR-bearing packet given the previous emit's PTS and this emit's
-    /// PTS. Updates the previous-emit slot to this emit's PTS as a
-    /// side effect.
-    ///
-    /// Race-immune by construction: the signal is derived from the PTS
-    /// values being emitted, not from a side-channel flag, so it
-    /// doesn't matter whether A's tail residual emits before or after
-    /// the reset, or whether the reset fired before or after B's
-    /// first emit reaches the encoder. Whichever packet actually
-    /// crosses the epoch boundary trips DI.
-    pub(super) fn compute_discontinuity_flag(
-        last_emitted_pts_90k: &mut Option<u64>,
-        cur_pts_90k: u64,
-    ) -> bool {
-        let di = match *last_emitted_pts_90k {
-            Some(prev) => pts_distance_90k(cur_pts_90k, prev) > PTS_JUMP_THRESHOLD_90K,
-            None => false, // first emit ever — no prior anchor to compare against
-        };
-        *last_emitted_pts_90k = Some(cur_pts_90k);
-        di
-    }
-
     /// Input frames the decoder may consume with **zero** decoded output
     /// before [`Inner::check_decode_stall`] declares a decode stall. Sized
     /// comfortably above every legitimate transient where output lags input
@@ -540,6 +432,9 @@ mod inner {
         /// program_number of the program the replacer follows (the lowest
         /// in the PAT). PMT sections are matched on it.
         program_number: Option<u16>,
+        /// Source PCR_PID from the program's PMT, before the rebuild points
+        /// it at the video PID. `None` for 0x1FFF.
+        pub(super) source_pcr_pid: Option<u16>,
         /// The PAT maps another program to the same PMT PID.
         pmt_pid_shared: bool,
         /// Reassembling PMT-PID stage — see `ts_pmt_edit::PsiUnitStage`.
@@ -547,7 +442,7 @@ mod inner {
         /// "Configured but never engaged" watchdog
         /// (`video_transcode_source_*`).
         engage: TranscodeEngageWatch,
-        video_pid: Option<u16>,
+        pub(super) video_pid: Option<u16>,
         /// Operator-pinned source video PID (`video_encode.source_video_pid`).
         /// When `Some`, PMT discovery looks for this PID specifically; when
         /// `None`, the legacy first-matching-codec rule applies.
@@ -571,7 +466,7 @@ mod inner {
         /// of letting libavcodec silently crop.
         pipeline: ScaledVideoEncoder,
 
-        out_video_cc: u8,
+        pub(super) out_video_cc: u8,
         /// PTS anchor in the encoder time base (1 / fps_num).
         out_frame_count: i64,
         /// 90 kHz PTS for the next emitted PES, anchored to the first
@@ -650,19 +545,6 @@ mod inner {
         /// `input_frames` value when output last advanced; the stall window
         /// is `current input_frames − this`.
         input_frames_at_last_output: u64,
-        /// PTS (90 kHz) of the previous emitted output frame. Used to
-        /// detect epoch jumps — when the next emit's PTS differs from
-        /// this by more than `PTS_JUMP_THRESHOLD_90K`, the
-        /// adaptation-field `discontinuity_indicator` is stamped on
-        /// that PCR-bearing packet so the receiver re-anchors its STC
-        /// instead of treating the jump as a clock fault.
-        ///
-        /// Survives `reset_source_state()` deliberately — without that,
-        /// race conditions where A's tail frames emit after a reset
-        /// would consume the discontinuity signal before B's first
-        /// frame ever shows up.
-        last_emitted_pts_90k: Option<u64>,
-
         /// Operator's hardware-decoder preference for the input decode
         /// side of this transcode. Defaults to `Auto` (VAAPI ≻ NVDEC ≻
         /// QSV ≻ CPU per host capabilities). Resolved on the first
@@ -670,44 +552,12 @@ mod inner {
         /// guaranteed installed.
         hw_decode_pref: crate::config::models::HwDecodePreference,
 
-        /// Optional per-flow A/V sync pacer. When set, output PCR is
-        /// `master.now_27mhz() − PCR_PREROLL_27MHZ` (modular-aware)
-        /// instead of `pts × 300 − preroll`. PTS values still come
-        /// from `src_pts_queue`, so A/V offset versus source is
-        /// preserved. Phase 4 of the sync-mux work.
-        pub av_sync_pacer: Option<Arc<crate::engine::av_sync_mux::AvSyncPacer>>,
         /// Edge-added A/V skew reporter (`stats::av_skew`). The video
         /// replacer stamps emitted PES with PTS dequeued from
         /// `src_pts_queue` (= source values), so its delta is 0 by
         /// design — reported anyway so a future regression in this
         /// invariant becomes visible on the dashboard immediately.
         pub av_skew: Option<Arc<crate::stats::av_skew::AvSkewReporter>>,
-
-        /// Shared latest-emitted-audio-output-PTS (90 kHz), written by the
-        /// co-running `TsAudioReplacer`. Used to FLOOR the regenerated PCR on
-        /// `min(video_pts, audio_pts)`: when the source muxes audio behind its
-        /// video by more than the 80 ms pre-roll, a video-only PCR
-        /// (`video_pts − preroll`) overtakes the audio (`audio_pts < PCR`) and
-        /// a strict T-STD decoder drops it. Flooring keeps `audio_pts ≥ PCR`
-        /// without moving any PES PTS, so lipsync is untouched. `None` (or a
-        /// stored 0 = unset) ⇒ PCR is byte-identical to the video-only path.
-        pub audio_pts_floor: Option<Arc<std::sync::atomic::AtomicU64>>,
-
-        /// Smoothed audio-behind-video lag (90 kHz) used to lower the PCR
-        /// without coupling it to the jittery per-frame audio PTS. Jumps UP
-        /// immediately to the current lag (so PCR never overtakes the audio)
-        /// and decays SLOWLY (so the PCR rate stays smooth → PCR_AC stays
-        /// tier-2). PCR = video_pts − this; equals video_pts when audio leads.
-        pub pcr_audio_lag_90k: u64,
-
-        /// Audio PIDs learned from the PMT — used to floor the PCR on
-        /// PASSTHROUGH audio (video-only transcode, where no `TsAudioReplacer`
-        /// publishes via `audio_pts_floor`). For both-transcode the shared
-        /// atomic is authoritative and this is ignored.
-        pub audio_pids: std::collections::HashSet<u16>,
-        /// Latest passthrough audio PES PTS (90 kHz) on an `audio_pids` PID;
-        /// feeds the PCR floor when `audio_pts_floor` is unset.
-        pub passthrough_audio_pts: u64,
 
         /// Optional input-side `video_decode_stats` handle the replacer
         /// keeps refreshing as the PMT learns the source codec / geometry.
@@ -809,6 +659,7 @@ mod inner {
                 fps_den: cfg.fps_den,
                 pmt_pid: None,
                 program_number: None,
+                source_pcr_pid: None,
                 pmt_pid_shared: false,
                 pmt_stage: PsiUnitStage::new("ts_video_replace"),
                 engage: TranscodeEngageWatch::new(TranscodeKind::Video, source_video_pid_pin),
@@ -837,14 +688,8 @@ mod inner {
                 decode_stats,
                 force_idr,
                 external_reset,
-                last_emitted_pts_90k: None,
                 hw_decode_pref: cfg.hw_decode.unwrap_or_default(),
-                av_sync_pacer: None,
                 av_skew: None,
-                audio_pts_floor: None,
-                pcr_audio_lag_90k: 0,
-                audio_pids: std::collections::HashSet::new(),
-                passthrough_audio_pts: 0,
                 input_decode_handle: None,
                 pmt_version: OutVersion::new(),
                 event_sender: None,
@@ -892,20 +737,6 @@ mod inner {
             self.pes_started = false;
             self.pending_pts = None;
             self.decoder = None;
-            // The new source re-advertises its audio PIDs via PMT; drop the
-            // old set + PCR-floor state so a switch can't floor on stale audio.
-            self.audio_pids.clear();
-            self.passthrough_audio_pts = 0;
-            self.pcr_audio_lag_90k = 0;
-            // NOTE: `last_emitted_pts_90k` is intentionally NOT reset.
-            // Output PCR derives from source PTS, so on a switch the new
-            // input's first emit will land in a different epoch — the
-            // emit-time jump detector compares against the previous
-            // emit's PTS and stamps `discontinuity_indicator=1` on the
-            // packet that crosses, which is what tells the receiver to
-            // re-anchor its STC. Clearing the field here would let A's
-            // tail residual encoded frame fall into the "first emit ever"
-            // branch and skip DI, leaving VLC stuck on the next jump.
             // Re-anchor PTS to the new input's first frame so downstream
             // A/V stays in sync with the audio replacer (which will also
             // re-anchor on the audio-PID codec swap).
@@ -927,6 +758,15 @@ mod inner {
         }
 
         pub fn process(&mut self, input_ts: &[u8], output: &mut Vec<u8>) {
+            self.process_at(input_ts, output, std::time::Instant::now());
+        }
+
+        pub(super) fn process_at(
+            &mut self,
+            input_ts: &[u8],
+            output: &mut Vec<u8>,
+            now: std::time::Instant,
+        ) {
             if input_ts.is_empty() {
                 return;
             }
@@ -934,9 +774,7 @@ mod inner {
             // per-output switch watcher when `active_input_rx` changes.
             // Same-codec same-PID swaps don't fire the codec/PID-change
             // reset path below, so without this hook the replacer keeps
-            // its previous PTS anchor and the receiver sees PTS values
-            // that no longer line up with the master-clock-generated
-            // output PCR.
+            // its previous PTS anchor and the decoder its old references.
             if self.external_reset.swap(false, Ordering::Relaxed) {
                 self.reset_source_state("input switched");
             }
@@ -962,8 +800,8 @@ mod inner {
                     if !programs.is_empty() {
                         programs.sort_by_key(|(num, _)| *num);
                         let (new_program, new_pmt_pid) = programs[0];
-                    self.pmt_pid_shared =
-                        programs.iter().filter(|(_, p)| *p == new_pmt_pid).count() > 1;
+                        self.pmt_pid_shared =
+                            programs.iter().filter(|(_, p)| *p == new_pmt_pid).count() > 1;
                         self.engage.note_pat(new_program, new_pmt_pid);
                         if self.pmt_pid != Some(new_pmt_pid)
                             || self.program_number != Some(new_program)
@@ -975,6 +813,7 @@ mod inner {
                                 self.video_pid = None;
                                 self.source_stream_type = 0;
                                 self.reset_source_state("PMT PID changed");
+                                self.source_pcr_pid = None;
                             }
                             if self.pmt_pid != Some(new_pmt_pid) {
                                 self.pmt_stage = PsiUnitStage::new("ts_video_replace");
@@ -1001,18 +840,31 @@ mod inner {
                     continue;
                 }
 
+                // Every input PCR keeps its stream position as an
+                // adaptation-field-only packet on the video PID — taken
+                // before `feed_video_packet` swallows the packet it rides
+                // in. Value and DI unchanged: the chain's trailing
+                // `ts_pcr_remux` stage owns the delay. CC repeats the last
+                // payload CC on the PID (the one before the first payload
+                // before any).
+                if let Some(vpid) = self.video_pid
+                    && Some(pid) == self.source_pcr_pid
+                    && let Some(pcr) = extract_pcr(pkt)
+                {
+                    let cc = self.out_video_cc.wrapping_sub(1) & 0x0F;
+                    output.extend_from_slice(&pcr_only_packet(
+                        vpid,
+                        cc,
+                        pcr,
+                        ts_discontinuity_indicator(pkt),
+                    ));
+                }
+
                 if Some(pid) == self.video_pid {
                     self.feed_video_packet(pkt, output);
                     continue;
                 }
 
-                // Passthrough. Track passthrough audio PES PTS so the PCR can
-                // be floored on it (video-only transcode, where no audio
-                // replacer publishes via `audio_pts_floor`).
-                if ts_pusi(pkt) && self.audio_pids.contains(&pid)
-                    && let Some(apts) = extract_pes_pts(pkt) {
-                        self.passthrough_audio_pts = apts;
-                    }
                 output.extend_from_slice(pkt);
             }
 
@@ -1023,7 +875,7 @@ mod inner {
             // ...and the silent "never engaged" one: no video PID learned
             // at all, so the decoder never even sees input.
             self.engage.note_packets((input_ts.len() / TS_PACKET_SIZE) as u64);
-            self.poll_engage(std::time::Instant::now());
+            self.poll_engage(now);
         }
 
         /// Advance the engage watchdog and emit whatever it raises (on the
@@ -1041,9 +893,8 @@ mod inner {
             }
         }
 
-        /// Inspect one complete PMT-PID unit, learn the video ES (and the
-        /// audio PIDs for the passthrough PCR floor), rebuild the program's
-        /// PMT, and emit.
+        /// Inspect one complete PMT-PID unit, learn the video ES and the
+        /// source PCR_PID, rebuild the program's PMT, and emit.
         fn handle_pmt_unit(&mut self, mut unit: PsiUnit, output: &mut Vec<u8>) {
             self.engage.note_pmt_unit(unit.first_table_id());
             let idx = self
@@ -1061,17 +912,9 @@ mod inner {
                 self.pmt_stage.emit(unit, output);
                 return;
             };
-            // Learn the audio PIDs so the PCR can be floored on
-            // PASSTHROUGH audio when this is a video-only transcode.
-            self.audio_pids.clear();
-            for es in &view.es {
-                if crate::engine::input_media_player::es_carries_audio(
-                    es.stream_type,
-                    view.es_info(es),
-                ) {
-                    self.audio_pids.insert(es.pid);
-                }
-            }
+            // The input PCR is followed on the source PCR_PID (before the
+            // rebuild below points PCR_PID at the video PID).
+            self.source_pcr_pid = (view.pcr_pid != 0x1FFF).then_some(view.pcr_pid);
             let sel = select_video_es(&view, self.source_video_pid_pin);
             self.engage.note_pmt_parsed(sel.es.clone(), sel.unsupported_candidate);
             if let Some((vpid, vst)) = sel.chosen {
@@ -1256,47 +1099,39 @@ mod inner {
                 self.pes_started = false;
             }
             if self.pipeline.is_open()
-                && let Ok(frames) = self.pipeline.flush() {
-                    let vpid = match self.video_pid {
-                        Some(p) => p,
-                        None => return,
-                    };
-                    for ef in frames {
-                        let queued = self.src_pts_queue.pop_front();
-                        if queued.is_some()
-                            && let Some(rep) = self.av_skew.as_ref() {
-                                rep.set_video_delta(0); // PTS == source value
-                            }
-                        let pts_for_pes = queued.unwrap_or(self.pts_90k);
-                        let pes = build_video_pes(&ef.data, pts_for_pes);
-                        // PCR is derived from the source PES PTS —
-                        // `pcr_for_emit` takes the pacer for API
-                        // stability and ignores it (sampling the master
-                        // clock at the encoder boundary measured stdev
-                        // 176 ms of PCR jitter; see its doc comment).
-                        // The argument is retained rather than dropped
-                        // because non-PCR uses of the pacer are planned.
-                        let pcr_27mhz = crate::engine::av_sync_mux::pcr_for_emit(
-                            self.av_sync_pacer.as_ref(),
-                            pts_for_pes,
-                        );
-                        let di = compute_discontinuity_flag(
-                            &mut self.last_emitted_pts_90k,
-                            pts_for_pes,
-                        );
-                        let pkts = packetize_ts(
-                            vpid,
-                            &pes,
-                            &mut self.out_video_cc,
-                            Some(pcr_27mhz),
-                            di,
-                        );
-                        for p in &pkts {
-                            output.extend_from_slice(p);
-                        }
-                        self.pts_90k = pts_for_pes.wrapping_add(self.pts_step_90k);
-                    }
+                && let Ok(frames) = self.pipeline.flush()
+            {
+                let Some(vpid) = self.video_pid else {
+                    return;
+                };
+                for ef in frames {
+                    self.emit_encoded_frame(vpid, &ef.data, output);
                 }
+            }
+        }
+
+        /// Packetise one encoded frame with the next queued source PTS
+        /// (DTS = PTS: the in-process encoders emit no B-frames). No PCR —
+        /// the input's PCR positions travel as their own packets.
+        fn emit_encoded_frame(&mut self, vpid: u16, data: &[u8], output: &mut Vec<u8>) {
+            // Prefer the source PTS from the queue; fall back to the
+            // running anchor when an encoder catch-up burst emits more
+            // frames than were pushed since the last drain.
+            let queued = self.src_pts_queue.pop_front();
+            if queued.is_some()
+                && let Some(rep) = self.av_skew.as_ref()
+            {
+                rep.set_video_delta(0); // PTS == source value
+            }
+            let pts_for_pes = queued.unwrap_or(self.pts_90k);
+            let pes = build_video_pes(data, pts_for_pes);
+            for p in &packetize_ts(vpid, &pes, &mut self.out_video_cc) {
+                output.extend_from_slice(p);
+            }
+            // Keep the fallback anchor monotonic from the latest emitted
+            // PTS so a later queue-exhausted emit still advances.
+            self.pts_90k = pts_for_pes.wrapping_add(self.pts_step_90k);
+            self.stats.output_frames.fetch_add(1, Ordering::Relaxed);
         }
 
         fn feed_video_packet(&mut self, pkt: &[u8], output: &mut Vec<u8>) {
@@ -1627,105 +1462,7 @@ mod inner {
                 // and rename consistently.
                 let vpid = self.video_pid.unwrap();
                 for ef in encoded {
-                    // Prefer source PTS from the queue; fall back to the
-                    // sample-counted anchor when the queue is exhausted
-                    // (encoder catch-up burst emitting more frames than
-                    // we've pushed inputs for since the last drain).
-                    let queued = self.src_pts_queue.pop_front();
-                    if queued.is_some()
-                        && let Some(rep) = self.av_skew.as_ref() {
-                            rep.set_video_delta(0); // PTS == source value
-                        }
-                    let pts_for_pes = queued.unwrap_or(self.pts_90k);
-                    let pes = build_video_pes(&ef.data, pts_for_pes);
-                    // PCR sits PCR_PREROLL_27MHZ behind the master clock
-                    // (or PTS-derived clock if no pacer is attached) so
-                    // the receiver's T-STD buffer model has room. With
-                    // a pacer attached, PCR cadence is locked to the
-                    // master clock — every output of the flow emits an
-                    // identical PCR sequence regardless of internal
-                    // pipeline depth, and multi-edge plants on the same
-                    // PTP/source PCR stay coherent.
-                    // Floor the PCR on min(video_pts, latest_audio_pts) so it
-                    // never overtakes the audio. When the source muxes audio
-                    // behind video by more than the 80 ms pre-roll, a
-                    // video-only PCR makes audio_pts < PCR ⇒ the audio is
-                    // dropped by a strict T-STD decoder. Flooring moves only
-                    // the PCR (receiver STC reference), not any PES PTS, so
-                    // lipsync is unchanged; on the common audio-leads case
-                    // min == video_pts and the PCR is byte-identical to before.
-                    // Signed-delta compare is 33-bit-wrap-safe.
-                    // Audio reference for the PCR floor: the shared atomic
-                    // (authoritative for both-transcode — the audio replacer
-                    // publishes its emitted PTS there) when wired, otherwise
-                    // the passthrough audio PTS we track from the PMT-learned
-                    // audio PIDs (video-only transcode).
-                    let a = match self.audio_pts_floor.as_ref() {
-                        Some(h) => h.load(std::sync::atomic::Ordering::Relaxed),
-                        None => self.passthrough_audio_pts,
-                    };
-                    let pcr_pts = if a != 0 {
-                        // How far is the audio behind THIS video frame (≥ 0;
-                        // 0 when audio leads). Wrap-safe + clamped — see
-                        // `audio_lag_90k` (a raw signed wrapping_sub is NOT
-                        // wrap-safe and would floor the PCR back by ~26.5 h
-                        // across a PTS wrap).
-                        let cur_lag = audio_lag_90k(pts_for_pes, a, MAX_AUDIO_LAG_90K);
-                        // Jump up to cur_lag immediately (PCR never overtakes
-                        // audio); decay slowly so the PCR rate stays smooth
-                        // (PCR_AC tier-2). ~1/32 frame per frame.
-                        let decay = (self.pts_step_90k / 32).max(1);
-                        self.pcr_audio_lag_90k =
-                            self.pcr_audio_lag_90k.saturating_sub(decay).max(cur_lag);
-                        // Mask back into 33-bit PTS space: the subtraction can
-                        // underflow when video is just past a wrap, and
-                        // pcr_for_emit expects a 33-bit PTS (it wrapping_mul's
-                        // by 300).
-                        pts_for_pes.wrapping_sub(self.pcr_audio_lag_90k) & PTS_MASK_33B
-                    } else {
-                        pts_for_pes
-                    };
-                    let pcr_27mhz = crate::engine::av_sync_mux::pcr_for_emit(
-                        self.av_sync_pacer.as_ref(),
-                        pcr_pts,
-                    );
-                    // Inter-PCR cadence here is whatever the encoder's
-                    // PUSI cadence gives us — at typical broadcast frame
-                    // rates (≥ 24 fps) this stays well under DVB's 100 ms
-                    // P1.7 ceiling. A previous attempt to inject AF-only
-                    // PCR carriers at a 40 ms wallclock cadence was
-                    // reverted: the carrier carried the same `pcr_27mhz`
-                    // as the immediately-following frame packet, so
-                    // receivers saw two consecutive PCRs ~µs apart with
-                    // identical 27 MHz values — broadcast decoders
-                    // interpreted that as a PCR-frequency-zero signal
-                    // and dropped the stream. Without `wire_emit` re-
-                    // stamping PCR at egress (which itself was reverted
-                    // because PTS-PCR offsets must remain coherent — see
-                    // memory/feedback_no_pcr_restamp.md), there is no
-                    // safe way to inject an AF-only PCR carrier with a
-                    // distinct PCR value. Long-GOP / low-fps streams
-                    // that need sub-100ms PCR cadence should use a
-                    // smaller GOP at the encoder instead.
-                    let di = compute_discontinuity_flag(
-                        &mut self.last_emitted_pts_90k,
-                        pts_for_pes,
-                    );
-                    let pkts = packetize_ts(
-                        vpid,
-                        &pes,
-                        &mut self.out_video_cc,
-                        Some(pcr_27mhz),
-                        di,
-                    );
-                    for p in &pkts {
-                        output.extend_from_slice(p);
-                    }
-                    // Keep the fallback anchor monotonic from the latest
-                    // emitted PTS so a later queue-exhausted emit still
-                    // produces a sensible (non-decreasing) value.
-                    self.pts_90k = pts_for_pes.wrapping_add(self.pts_step_90k);
-                    self.stats.output_frames.fetch_add(1, Ordering::Relaxed);
+                    self.emit_encoded_frame(vpid, &ef.data, output);
                 }
                 let lat = crate::util::time::now_us().saturating_sub(pes_arrived_us);
                 self.stats.last_latency_us.store(lat, Ordering::Relaxed);
@@ -1929,36 +1666,13 @@ fn build_video_pes_with_dts(video_data: &[u8], pts: u64, dts: u64) -> Vec<u8> {
     pes
 }
 
-/// Encode a 6-byte PCR field per ISO/IEC 13818-1 §2.4.3.5.
-///
-/// The 42-bit PCR splits into a 33-bit base @ 90 kHz and a 9-bit extension
-/// @ 27 MHz: `pcr_27mhz = base * 300 + ext`. Bytes 0..3 carry the high 32
-/// bits of base; byte 4 packs the LSB of base + 6 reserved 1-bits + the top
-/// bit of ext; byte 5 carries the low 8 bits of ext.
-fn write_pcr_field(buf: &mut [u8; 6], pcr_27mhz: u64) {
-    let base = (pcr_27mhz / 300) & 0x1_FFFF_FFFF; // 33-bit
-    let ext = (pcr_27mhz % 300) as u32; // 9-bit
-    buf[0] = ((base >> 25) & 0xFF) as u8;
-    buf[1] = ((base >> 17) & 0xFF) as u8;
-    buf[2] = ((base >> 9) & 0xFF) as u8;
-    buf[3] = ((base >> 1) & 0xFF) as u8;
-    buf[4] = (((base & 1) << 7) as u8) | 0x7E | (((ext >> 8) & 0x01) as u8);
-    buf[5] = (ext & 0xFF) as u8;
-}
-
-/// Pack a PES into 188-byte TS packets on `pid`. When `pcr_27mhz` is `Some`,
-/// the PUSI start packet carries an adaptation field with `PCR_flag = 1` —
-/// this is what makes the rebuilt video PID a valid PCR carrier so the
-/// downstream stream complies with TR 101 290 P1.5 / P1.7. (Without it,
-/// software re-mux paths emit a stream with PMT-declared PCR_PID = video
-/// PID but no PCR fields anywhere, which professional decoders reject.)
-fn packetize_ts(
-    pid: u16,
-    pes: &[u8],
-    cc: &mut u8,
-    pcr_27mhz: Option<u64>,
-    discontinuity: bool,
-) -> Vec<[u8; 188]> {
+/// Pack a PES into 188-byte TS packets on `pid`, advancing `cc` per packet.
+/// No packet carries a PCR: the replacer forwards the input's PCRs at their
+/// own stream positions as adaptation-field-only packets, and the chain's
+/// trailing `ts_pcr_remux` stage re-stamps them (the old per-frame PCR,
+/// derived from the PTS it described, ran ~15 500 ppm fast and could only
+/// appear once per frame).
+fn packetize_ts(pid: u16, pes: &[u8], cc: &mut u8) -> Vec<[u8; 188]> {
     let mut packets = Vec::new();
     let mut offset = 0;
     let mut is_first = true;
@@ -1974,86 +1688,25 @@ fn packetize_ts(
         pkt[2] = pid as u8;
 
         let remaining = pes.len() - offset;
-
-        // PCR-carrying PUSI start: build adaptation field (8 bytes:
-        // 1 length + 1 flags + 6 PCR), then payload fills the rest.
-        // af_length = 7 (excludes the length byte itself).
-        if is_first && let Some(pcr_value) = pcr_27mhz {
-            const AF_BYTES_AFTER_LEN: usize = 7; // flags(1) + PCR(6)
-            const AF_TOTAL: usize = AF_BYTES_AFTER_LEN + 1; // + length byte
-            let payload_capacity = TS_PACKET_SIZE - 4 - AF_TOTAL;
-            pkt[3] = 0x30 | current_cc; // AFC = both
-            pkt[4] = AF_BYTES_AFTER_LEN as u8;
-            // PCR_flag (bit 4 = 0x10) plus discontinuity_indicator
-            // (bit 7 = 0x80) when the caller signalled an epoch jump
-            // (see `compute_discontinuity_flag` in the `inner` mod for
-            // how we detect it). DI=1 tells the receiver "the next PCR
-            // is a fresh STC anchor, throw away your old timestamp
-            // tracking" — without it, decoders see the post-switch
-            // PCR jump as a fault and lock up.
-            pkt[5] = if discontinuity { 0x90 } else { 0x10 };
-            let mut pcr_buf = [0u8; 6];
-            write_pcr_field(&mut pcr_buf, pcr_value);
-            pkt[6..12].copy_from_slice(&pcr_buf);
-            let take = remaining.min(payload_capacity);
-            pkt[4 + AF_TOTAL..4 + AF_TOTAL + take]
-                .copy_from_slice(&pes[offset..offset + take]);
-            // If the PES is short enough to fit entirely in this PCR-carrying
-            // packet, pad the trailing bytes back into the adaptation field.
-            // We do this by extending af_length and stuffing 0xFF, so the
-            // payload still ends at byte 187. This case is rare for video
-            // PES (frames are kilobytes) — handled here only to avoid
-            // truncation if a tiny frame ever shows up.
-            if take < payload_capacity {
-                let stuff = payload_capacity - take;
-                let new_af_len = AF_BYTES_AFTER_LEN + stuff;
-                pkt[4] = new_af_len as u8;
-                // Move the (small) payload to the end of the packet.
-                let payload_start_old = 4 + AF_TOTAL;
-                let payload_start_new = TS_PACKET_SIZE - take;
-                if take > 0 {
-                    pkt.copy_within(
-                        payload_start_old..payload_start_old + take,
-                        payload_start_new,
-                    );
-                }
-                // Fill the new stuffing bytes with 0xFF.
-                for b in pkt
-                    .iter_mut()
-                    .take(payload_start_new)
-                    .skip(4 + AF_TOTAL)
-                {
+        let payload_capacity = TS_PACKET_SIZE - 4;
+        if remaining >= payload_capacity {
+            pkt[3] = 0x10 | current_cc;
+            pkt[4..TS_PACKET_SIZE].copy_from_slice(&pes[offset..offset + payload_capacity]);
+            offset += payload_capacity;
+        } else {
+            // Short tail: an adaptation field of stuffing pads the payload
+            // to the end of the packet.
+            let stuff_len = payload_capacity - remaining;
+            pkt[3] = 0x30 | current_cc;
+            pkt[4] = (stuff_len - 1) as u8;
+            if stuff_len > 1 {
+                pkt[5] = 0x00;
+                for b in &mut pkt[6..4 + stuff_len] {
                     *b = 0xFF;
                 }
             }
-            offset += take;
-        } else {
-            let payload_capacity = TS_PACKET_SIZE - 4;
-            if remaining >= payload_capacity {
-                pkt[3] = 0x10 | current_cc;
-                pkt[4..TS_PACKET_SIZE]
-                    .copy_from_slice(&pes[offset..offset + payload_capacity]);
-                offset += payload_capacity;
-            } else {
-                let stuff_len = payload_capacity - remaining;
-                if stuff_len == 1 {
-                    pkt[3] = 0x30 | current_cc;
-                    pkt[4] = 0;
-                    pkt[5..5 + remaining].copy_from_slice(&pes[offset..]);
-                } else {
-                    pkt[3] = 0x30 | current_cc;
-                    pkt[4] = (stuff_len - 1) as u8;
-                    if stuff_len > 1 {
-                        pkt[5] = 0x00;
-                        for i in 6..4 + stuff_len {
-                            pkt[i] = 0xFF;
-                        }
-                    }
-                    pkt[4 + stuff_len..4 + stuff_len + remaining]
-                        .copy_from_slice(&pes[offset..]);
-                }
-                offset += remaining;
-            }
+            pkt[4 + stuff_len..4 + stuff_len + remaining].copy_from_slice(&pes[offset..]);
+            offset += remaining;
         }
         is_first = false;
         packets.push(pkt);
@@ -2066,7 +1719,7 @@ fn packetize_ts(
 #[cfg(all(test, feature = "media-codecs"))]
 mod tests {
     use super::*;
-    use crate::engine::ts_parse::mpeg2_crc32;
+    use crate::engine::ts_parse::{mpeg2_crc32, ts_cc};
     use crate::engine::ts_pmt_edit::{is_pmt_for, parse_pmt};
 
     /// Packet-level wrapper over `select_video_es` for the synth helpers.
@@ -2358,156 +2011,6 @@ mod tests {
         assert_eq!(parsed_dts, dts);
     }
 
-    /// PCR pre-roll: the PCR field on a PUSI start packet must be
-    /// strictly less than the PES PTS (in 27 MHz units) by
-    /// [`PCR_PREROLL_27MHZ`]. This is the bug that caused VLC and Appear
-    /// hardware decoders to play a few buffered frames at startup and
-    /// then stutter — without the pre-roll, every frame's PTS coincides
-    /// with the receiver's STC and the decoder pipeline has zero time
-    /// to dequeue + decode + render.
-    #[test]
-    fn packetize_ts_pcr_trails_pts_by_preroll() {
-        let pts_90k: u64 = 90_000; // 1 s into the source clock
-        let pcr_27mhz = pts_90k.saturating_mul(300).saturating_sub(PCR_PREROLL_27MHZ);
-        // PCR trails PTS by exactly PCR_PREROLL_27MHZ ticks (80 ms × 27 MHz).
-        assert_eq!(pcr_27mhz, 90_000 * 300 - PCR_PREROLL_27MHZ);
-        assert!(pcr_27mhz < pts_90k * 300);
-        assert_eq!(pts_90k * 300 - pcr_27mhz, PCR_PREROLL_27MHZ);
-
-        // Mux a tiny PES with that PCR and verify the PCR field readback.
-        let pes = build_video_pes(&[0, 0, 0, 1, 0x09, 0x10], pts_90k);
-        let mut cc = 0u8;
-        let pkts = packetize_ts(0x100, &pes, &mut cc, Some(pcr_27mhz), false);
-        assert!(!pkts.is_empty());
-        let first = &pkts[0];
-        // PUSI bit set on first packet.
-        assert_eq!(first[1] & 0x40, 0x40);
-        // Adaptation+payload (AFC = 0b11).
-        assert_eq!(first[3] & 0x30, 0x30);
-        // af_length >= 7 (1 byte flags + 6 byte PCR).
-        assert!(first[4] >= 7);
-        // PCR_flag bit set.
-        assert_eq!(first[5] & 0x10, 0x10);
-
-        // Decode the 6-byte PCR field and confirm round-trip equality.
-        let base = ((first[6] as u64) << 25)
-            | ((first[7] as u64) << 17)
-            | ((first[8] as u64) << 9)
-            | ((first[9] as u64) << 1)
-            | (((first[10] >> 7) as u64) & 0x01);
-        let ext = (((first[10] as u64) & 0x01) << 8) | (first[11] as u64);
-        let read_pcr_27mhz = base * 300 + ext;
-        assert_eq!(read_pcr_27mhz, pcr_27mhz);
-    }
-
-    /// `discontinuity=true` lights the AF flags `discontinuity_indicator`
-    /// bit (0x80) on the PCR-bearing TS packet. The receiver uses this
-    /// to know "PCR jumped, re-anchor the STC" instead of treating the
-    /// jump as a clock fault. Without this, post-input-switch transcoded
-    /// outputs strand decoders permanently (VLC's "stuck after switch"
-    /// symptom).
-    #[test]
-    fn packetize_ts_discontinuity_indicator_lights_in_pcr_packet() {
-        let pts_90k: u64 = 90_000;
-        let pcr_27mhz = pts_90k * 300 - PCR_PREROLL_27MHZ;
-        let pes = build_video_pes(&[0, 0, 0, 1, 0x09, 0x10], pts_90k);
-        let mut cc = 0u8;
-
-        // discontinuity=false → DI bit clear, PCR_flag set.
-        let pkts0 = packetize_ts(0x100, &pes, &mut cc, Some(pcr_27mhz), false);
-        assert!(!pkts0.is_empty());
-        assert_eq!(pkts0[0][5] & 0x80, 0x00, "DI bit should be clear");
-        assert_eq!(pkts0[0][5] & 0x10, 0x10, "PCR_flag should be set");
-
-        // discontinuity=true → DI bit set AND PCR_flag still set.
-        let mut cc2 = 0u8;
-        let pkts1 = packetize_ts(0x100, &pes, &mut cc2, Some(pcr_27mhz), true);
-        assert!(!pkts1.is_empty());
-        assert_eq!(pkts1[0][5] & 0x80, 0x80, "DI bit should be set");
-        assert_eq!(pkts1[0][5] & 0x10, 0x10, "PCR_flag should still be set");
-    }
-
-    /// `compute_discontinuity_flag` returns `true` when the new PTS is
-    /// further than 1 second from the previous emit's PTS, `false`
-    /// otherwise. The previous-emit slot is updated as a side effect
-    /// regardless. First emit ever (`None` slot) returns `false`.
-    /// Modular distance picks the short way around the 33-bit wrap so
-    /// a legitimate PTS wraparound doesn't get misclassified.
-    #[test]
-    fn pts_jump_detection_lights_di_on_epoch_crossover() {
-        use super::inner::compute_discontinuity_flag;
-
-        // First emit ever: no prior anchor, no DI.
-        let mut last: Option<u64> = None;
-        assert!(!compute_discontinuity_flag(&mut last, 1_000_000));
-        assert_eq!(last, Some(1_000_000));
-
-        // Small forward delta (< 1 s): no DI.
-        assert!(!compute_discontinuity_flag(&mut last, 1_003_000)); // +33 ms
-        assert_eq!(last, Some(1_003_000));
-
-        // Big forward jump (>> 1 s): DI fires.
-        assert!(compute_discontinuity_flag(&mut last, 50_000_000)); // +~9 minutes
-        assert_eq!(last, Some(50_000_000));
-
-        // Big backward jump (a switch back to a stream with smaller
-        // PTSes): DI fires.
-        assert!(compute_discontinuity_flag(&mut last, 1_000_000));
-        assert_eq!(last, Some(1_000_000));
-
-        // Wrap-around: 33-bit modulus = 1<<33 = 8_589_934_592. A jump
-        // of just 100 ticks across the wrap should NOT light DI — the
-        // modular short-way distance is 100, not (modulus - 100).
-        const PTS_MODULUS_90K: u64 = 1u64 << 33;
-        let mut wrap_last: Option<u64> = Some(PTS_MODULUS_90K - 50);
-        assert!(
-            !compute_discontinuity_flag(&mut wrap_last, 50),
-            "wrap should pick the short way (100 ticks), not (modulus - 100)"
-        );
-
-        // 1 second exact: at the threshold, NOT exceeding → no DI.
-        let mut threshold_last: Option<u64> = Some(0);
-        assert!(!compute_discontinuity_flag(&mut threshold_last, 90_000));
-        // 1 s + 1 tick: just over → DI.
-        let mut over_last: Option<u64> = Some(0);
-        assert!(compute_discontinuity_flag(&mut over_last, 90_001));
-    }
-
-    /// `audio_lag_90k` is the wrap-safe PCR-floor lag (replaces a raw signed
-    /// `wrapping_sub` that floored the PCR back by ~26.5 h across a PTS wrap).
-    #[test]
-    fn audio_lag_is_wrap_safe_and_clamped() {
-        use super::inner::audio_lag_90k;
-        const MOD: u64 = 1u64 << 33;
-        const MASK: u64 = MOD - 1;
-        const MAX: u64 = 5 * 90_000; // 5 s clamp (MAX_AUDIO_LAG_90K)
-
-        // Normal: audio 100 ms behind video → lag = 9000.
-        assert_eq!(audio_lag_90k(1_000_000, 1_000_000 - 9_000, MAX), 9_000);
-
-        // Audio LEADS video (audio_pts > video_pts) → no floor.
-        assert_eq!(audio_lag_90k(1_000_000, 1_009_000, MAX), 0);
-
-        // Pathological 10 s behind → clamped to the 5 s ceiling, NOT 10 s.
-        assert_eq!(audio_lag_90k(10_000_000, 10_000_000 - 900_000, MAX), MAX);
-
-        // THE BUG THIS GUARDS: video ~50 ms before the 33-bit wrap, audio
-        // ~50 ms after it (audio leads across the wrap). A raw signed
-        // wrapping_sub would return ~2^33 here and floor the PCR back by
-        // hours; the modular forward distance is the long way (> MOD/2) so
-        // the lag is correctly 0.
-        assert_eq!(audio_lag_90k(MASK - 4_500, 4_500, MAX), 0);
-
-        // Audio genuinely ~100 ms behind, straddling the wrap (video just
-        // after, audio just before) → lag ≈ 9000, bounded — not a huge value.
-        assert_eq!(audio_lag_90k(4_500, MASK - 4_500 + 1, MAX), 9_000);
-
-        // Unmasked inputs (> 33-bit, e.g. an accumulated fallback PTS) are
-        // masked before the compare, so an out-of-range operand can't escape
-        // the modular logic.
-        assert_eq!(audio_lag_90k(MOD + 1_000_000, MOD + 1_000_000 - 9_000, MAX), 9_000);
-    }
-
     /// PMT rewrite must force PCR_PID to the rebuilt video PID — even
     /// when the source's PMT pointed PCR_PID at a separate dedicated
     /// PCR PID. Without this the rebuilt stream emits PCR on the video
@@ -2567,8 +2070,8 @@ mod tests {
         let v = parse_pmt(&sec).unwrap();
         assert_eq!(v.pcr_pid, 0x0E0F);
         assert_eq!(v.es[0].stream_type, 0x1B);
-        // The audio PID is learned for the passthrough PCR floor.
-        assert!(r.inner.audio_pids.contains(&0x0E10));
+        // The input PCR is followed on the source PCR_PID (here the video).
+        assert_eq!(r.inner.source_pcr_pid, Some(0x0E0F));
     }
 
     /// `video_encode` on an audio-only program: the engage watchdog says
@@ -2668,5 +2171,123 @@ mod tests {
         assert_ne!(ver(&v2), ver(&v1), "final output version changed");
         let v2b = pmt_in(&chain(&mut audio, &mut video, &pmt(0x102, 3)), 1);
         assert_eq!(ver(&v2b), ver(&v2), "and holds afterwards");
+    }
+
+    // ── PCR carry (defects 3 / x) ──
+
+    const MS27: u64 = 27_000;
+
+    /// A video-PID packet carrying a PCR in its adaptation field AND
+    /// payload (AFC = 11) — how Sky carries 3 220 of its 3 362 PCRs.
+    fn pcr_payload_packet(pid: u16, cc: u8, pcr: u64, pusi: bool) -> [u8; 188] {
+        let mut p = crate::engine::ts_parse::pcr_only_packet(pid, cc, pcr, false);
+        p[3] = 0x30 | (cc & 0x0F);
+        p[4] = 7;
+        if pusi {
+            p[1] |= 0x40;
+            p[12..16].copy_from_slice(&[0, 0, 1, 0xE0]);
+            p[16] = 0;
+            p[17] = 0;
+            p[18] = 0x80;
+            p[19] = 0x80;
+            p[20] = 5;
+            p[21..26].copy_from_slice(&[0x21, 0, 1, 0, 1]);
+        } else {
+            for b in &mut p[12..] {
+                *b = 0x55;
+            }
+        }
+        p
+    }
+
+    fn pkts(out: &[u8]) -> Vec<[u8; 188]> {
+        out.chunks(188)
+            .map(|c| {
+                let mut p = [0u8; 188];
+                p.copy_from_slice(c);
+                p
+            })
+            .collect()
+    }
+
+    fn two_es_pmt(pcr_pid: u16) -> [u8; 188] {
+        let sec = crate::engine::ts_test_fixtures::pmt_section(
+            1,
+            0,
+            pcr_pid,
+            &[],
+            &[(0x1B, 0x100, &[]), (0x0F, 0x101, &[])],
+        );
+        crate::engine::ts_test_fixtures::packetize_sections(0x1000, &[&sec], 0)[0]
+    }
+
+    #[test]
+    fn packetize_ts_carries_no_pcr_and_advances_cc() {
+        let pes = build_video_pes(&[0xAB; 400], 90_000);
+        let mut cc = 14u8;
+        let out = packetize_ts(0x100, &pes, &mut cc);
+        assert_eq!(out.len(), 3);
+        assert_eq!(cc, 1, "three payload packets: 14, 15, 0");
+        assert!(ts_pusi(&out[0]) && !ts_pusi(&out[1]));
+        for (i, p) in out.iter().enumerate() {
+            assert_eq!(crate::engine::ts_parse::extract_pcr(p), None);
+            assert_eq!(ts_cc(p), (14 + i as u8) & 0x0F);
+        }
+        // The short tail is padded with adaptation-field stuffing, payload
+        // ending at byte 187.
+        assert_eq!(out[2][3] & 0x30, 0x30);
+        assert_eq!(out[2][187], 0xAB);
+    }
+
+    #[test]
+    fn every_input_pcr_leaves_as_an_af_only_packet_on_the_video_pid() {
+        let mut r = TsVideoReplacer::new(&cfg("x264"), None).unwrap();
+        let mut out = Vec::new();
+        r.process(&synth_pat(0x1000), &mut out);
+        r.process(&two_es_pmt(0x100), &mut out);
+        out.clear();
+        // PCR inside a PUSI payload packet, then in a continuation packet.
+        let t0 = 5_000 * 27_000_000u64;
+        let mut input = pcr_payload_packet(0x100, 3, t0, true).to_vec();
+        input.extend_from_slice(&pcr_payload_packet(0x100, 4, t0 + 30 * MS27, false));
+        let mut di = pcr_payload_packet(0x100, 5, t0 + 5_000 * MS27, false);
+        crate::engine::ts_parse::set_discontinuity_indicator(&mut di);
+        input.extend_from_slice(&di);
+        r.process(&input, &mut out);
+        let got: Vec<[u8; 188]> = pkts(&out).into_iter().filter(|p| ts_pid(p) == 0x100).collect();
+        assert_eq!(got.len(), 3, "one AF-only packet per input PCR, no source payload");
+        let pcrs: Vec<u64> = got
+            .iter()
+            .map(|p| crate::engine::ts_parse::extract_pcr(p).unwrap())
+            .collect();
+        assert_eq!(pcrs, vec![t0, t0 + 30 * MS27, t0 + 5_000 * MS27], "values unchanged");
+        for p in &got {
+            assert_eq!(crate::engine::ts_parse::ts_adaptation_field_control(p), 0b10);
+            assert!(!ts_pusi(p));
+            // No payload has been emitted on the PID yet: CC 15, so the
+            // replacer's first payload packet (CC 0) follows.
+            assert_eq!(ts_cc(p), 15);
+        }
+        assert!(!crate::engine::ts_parse::ts_discontinuity_indicator(&got[1]));
+        assert!(crate::engine::ts_parse::ts_discontinuity_indicator(&got[2]), "DI copied");
+    }
+
+    #[test]
+    fn a_dedicated_pcr_pid_is_carried_onto_the_video_pid() {
+        let mut r = TsVideoReplacer::new(&cfg("x264"), None).unwrap();
+        let mut out = Vec::new();
+        r.process(&synth_pat(0x1000), &mut out);
+        out.clear();
+        r.process(&two_es_pmt(0x1FF), &mut out);
+        let sec = pmt_in(&out, 1);
+        assert_eq!(parse_pmt(&sec).unwrap().pcr_pid, 0x100, "PCR_PID re-pointed at the video");
+        out.clear();
+        let src = crate::engine::ts_parse::pcr_only_packet(0x1FF, 9, 27_000_000, false);
+        r.process(&src, &mut out);
+        let got = pkts(&out);
+        assert_eq!(got.len(), 2);
+        assert_eq!(ts_pid(&got[0]), 0x100);
+        assert_eq!(crate::engine::ts_parse::extract_pcr(&got[0]), Some(27_000_000));
+        assert_eq!(got[1], src, "the source PCR packet passes through untouched");
     }
 }

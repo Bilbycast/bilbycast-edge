@@ -140,6 +140,11 @@ pub struct OutputStatsAccumulator {
     // passthrough outputs (flow-level av_skew covers those).
     av_skew: std::sync::OnceLock<std::sync::Arc<crate::stats::av_skew::AvSkewReporter>>,
 
+    // ── Per-output transcode PCR stage (`engine::ts_pcr_remux`) ──────
+    // Set once by transcode_chain::build_for_output when this output
+    // re-encodes audio and/or video. Absent on plain passthrough outputs.
+    transcode_pcr: std::sync::OnceLock<std::sync::Arc<crate::engine::ts_pcr_remux::PcrRemuxStats>>,
+
     // ── Wire pacing: tier + late-drop counter ────────────────────────
     // The active release-path tier for this output. Set once at output
     // startup by `engine::wire_emit::spawn_wire_emitter`. One of:
@@ -1042,6 +1047,7 @@ impl OutputStatsAccumulator {
             pcr_trust: crate::stats::pcr_trust::PcrTrustSampler::new(),
             av_interleave: crate::stats::av_interleave::AvInterleaveSampler::new(),
             av_skew: std::sync::OnceLock::new(),
+            transcode_pcr: std::sync::OnceLock::new(),
             wire_pacing_tier: OnceLock::new(),
             egress_pacing_effective: OnceLock::new(),
             wire_pacing_late: AtomicU64::new(0),
@@ -1212,6 +1218,15 @@ impl OutputStatsAccumulator {
     /// audio and/or video). First call wins.
     pub fn set_av_skew_reporter(&self, r: std::sync::Arc<crate::stats::av_skew::AvSkewReporter>) {
         let _ = self.av_skew.set(r);
+    }
+
+    /// Register this output's transcode PCR stage counters (set by
+    /// `transcode_chain::build_for_output`). First call wins.
+    pub fn set_transcode_pcr_stats(
+        &self,
+        s: std::sync::Arc<crate::engine::ts_pcr_remux::PcrRemuxStats>,
+    ) {
+        let _ = self.transcode_pcr.set(s);
     }
 
     /// Register the per-output transcoder stats handle. Called once at
@@ -1787,6 +1802,7 @@ impl OutputStatsAccumulator {
             pcr_trust: self.pcr_trust.snapshot(),
             av_interleave: self.av_interleave.snapshot(),
             av_skew: self.av_skew.get().map(|r| r.snapshot()),
+            transcode_pcr: self.transcode_pcr.get().map(|s| s.snapshot()),
             display_stats,
             sdi_stats: self.sdi_playout_stats.get().map(|h| h.snapshot()),
             wire_pacing_tier: self.wire_pacing_tier.get().cloned(),
@@ -3632,6 +3648,9 @@ pub struct FlowStatsAccumulator {
     /// transcode) publish their (output − source) PTS deltas here; the
     /// snapshot reads the entry keyed by `active_input_id`.
     av_skew_reporters: DashMap<String, Arc<crate::stats::av_skew::AvSkewReporter>>,
+    /// Per-input-id ingress transcode PCR stage counters
+    /// (`engine::ts_pcr_remux`); the snapshot reads the active input's.
+    input_transcode_pcr: DashMap<String, Arc<crate::engine::ts_pcr_remux::PcrRemuxStats>>,
     /// Per-input-id map of AAC decode stage handles + descriptors. Wrapped
     /// in `Arc` so the owning ingress replacer can keep a clone and refresh
     /// the source-codec label whenever the PMT learns a new stream_type
@@ -3805,6 +3824,7 @@ impl FlowStatsAccumulator {
             red_blue_stats: OnceLock::new(),
             active_input_id: std::sync::RwLock::new(String::new()),
             av_skew_reporters: DashMap::new(),
+            input_transcode_pcr: DashMap::new(),
             input_transcode_stats: DashMap::new(),
             input_audio_decode_stats: DashMap::new(),
             input_audio_encode_stats: DashMap::new(),
@@ -4088,13 +4108,26 @@ impl FlowStatsAccumulator {
         worst
     }
 
-    /// Drop an input's edge-added A/V skew reporter. Called by
+    /// Drop an input's edge-added A/V skew reporter (and its ingress
+    /// transcode PCR stage counters, for the same reason). Called by
     /// `FlowRuntime::remove_input` — without this, re-adding the same
     /// input id with its transcode stage removed resurrects the old
     /// incarnation's frozen `mode="measured"` skew forever (adversarial
     /// review 2026-06-06).
     pub fn remove_av_skew_reporter(&self, input_id: &str) {
         self.av_skew_reporters.remove(input_id);
+        self.input_transcode_pcr.remove(input_id);
+    }
+
+    /// Register an input's ingress transcode PCR stage counters. Replaces
+    /// any previous registration for the same input id (a restarted input
+    /// builds a fresh transcoder).
+    pub fn set_input_transcode_pcr_stats(
+        &self,
+        input_id: &str,
+        s: Arc<crate::engine::ts_pcr_remux::PcrRemuxStats>,
+    ) {
+        self.input_transcode_pcr.insert(input_id.to_string(), s);
     }
 
     /// Get-or-create the edge-added A/V skew reporter for an input.
@@ -4569,6 +4602,16 @@ impl FlowStatsAccumulator {
                 .get(&active)
                 .map(|r| r.value().snapshot())
         };
+        let transcode_pcr = {
+            let active = self
+                .active_input_id
+                .read()
+                .map(|g| g.clone())
+                .unwrap_or_default();
+            self.input_transcode_pcr
+                .get(&active)
+                .map(|s| s.value().snapshot())
+        };
 
         FlowStats {
             flow_id: self.flow_id.clone(),
@@ -4769,6 +4812,7 @@ impl FlowStatsAccumulator {
             pcr_trust_flow,
             av_interleave_flow,
             av_skew,
+            transcode_pcr,
             content_analysis: self.content_analysis.get().map(|acc| acc.snapshot()),
             #[cfg(feature = "replay")]
             recording: self.recording_stats.get().map(|s| {

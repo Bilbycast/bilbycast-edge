@@ -31,6 +31,7 @@ use crate::config::models::{AudioEncodeConfig, VideoEncodeConfig};
 
 use super::audio_transcode::TranscodeJson;
 use super::ts_audio_replace::{TsAudioReplaceError, TsAudioReplacer};
+use super::ts_pcr_remux::TsPcrRemux;
 use super::ts_video_replace::{TsVideoReplaceError, TsVideoReplacer, VideoEncodeStats};
 
 /// Errors raised when constructing an [`InputTranscoder`].
@@ -80,10 +81,16 @@ pub struct InputTranscoder {
     /// ticks to avoid steady-state allocations.
     scratch_a: Vec<u8>,
     /// Scratch buffer that holds the video-replacer output (input to the
-    /// A/V realign stage, or the final output when no realigner is active).
+    /// PCR stage).
     scratch_b: Vec<u8>,
+    /// Scratch buffer that holds the PCR stage's output (input to the A/V
+    /// realign stage, or the final output when no realigner is active).
+    scratch_p: Vec<u8>,
     /// Scratch buffer that holds the final output after A/V realignment.
     scratch_c: Vec<u8>,
+    /// Trailing PCR stage: the output PCR is the input's, delayed by one
+    /// measured transcode allowance (`ts_pcr_remux`).
+    pcr: TsPcrRemux,
     /// A/V emission realigner. `Some` only when the **video** ES is
     /// transcoded — the deep video encode pipeline is what pushes audio
     /// ahead of video, so there's nothing to realign on an audio-only
@@ -113,29 +120,14 @@ impl InputTranscoder {
             return Ok(None);
         }
 
-        let mut audio = match audio_encode {
+        let audio = match audio_encode {
             Some(ae) => Some(TsAudioReplacer::new(ae, transcode.cloned())?),
             None => None,
         };
-        let mut video = match video_encode {
+        let video = match video_encode {
             Some(ve) => Some(TsVideoReplacer::new(ve, force_idr)?),
             None => None,
         };
-
-        // Floor the regenerated PCR on min(video_pts, audio_pts) so the audio
-        // is never stamped behind PCR (a strict T-STD decoder drops late
-        // audio). This only matters when BOTH stages transcode: the video
-        // stage regenerates the PCR (video_pts − preroll), and when the source
-        // muxes audio behind its video by more than the 80 ms pre-roll the PCR
-        // overtakes the audio. The shared handle lets the audio stage publish
-        // its emitted PTS so the video stage can floor on it. Moves only the
-        // PCR, not any PES PTS — lipsync unchanged; byte-identical when audio
-        // leads. (Root-caused via the broadcast-readiness codec matrix.)
-        if let (Some(a), Some(v)) = (audio.as_mut(), video.as_mut()) {
-            let floor = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
-            a.set_audio_pts_floor(floor.clone());
-            v.set_audio_pts_floor(floor);
-        }
 
         // If `transcode` is set but `audio_encode` is not, the transcode block
         // has no encoder to feed — ignore silently to match the output-side
@@ -166,37 +158,25 @@ impl InputTranscoder {
             video,
             scratch_a: Vec::with_capacity(32 * 1024),
             scratch_b: Vec::with_capacity(32 * 1024),
+            scratch_p: Vec::with_capacity(32 * 1024),
             scratch_c: Vec::with_capacity(32 * 1024),
+            pcr: TsPcrRemux::new(),
             realign,
         }))
     }
 
-    /// Attach the per-flow A/V sync pacer onto the inner audio and
-    /// video replacers (no-op for whichever stage is absent).
-    /// Master-clocked PCR + PTS generation is the same path as the
-    /// output-side replacers — once attached, ingress-emitted bytes
-    /// carry the flow's master-clock PCR + PES PTS sequence instead of
-    /// the source-derived values. Outputs that consume the broadcast
-    /// channel (HLS, CMAF, RTMP, WebRTC, plus passthrough TS-native
-    /// outputs) inherit the master-clocked cadence.
-    ///
-    /// The audio wire is symmetric with the video wire: the audio
-    /// replacer's first-PES anchor + every discontinuity re-anchor
-    /// targets `master.now_27mhz()/300 + PCR_PREROLL + lipsync`.
-    /// Industry-standard muxer-mode behaviour — uses master clock for
-    /// the anchor only; per-sample advance still tracks source rate
-    /// via `samples_since_anchor`, so source-rate fidelity is
-    /// preserved regardless of how master and source absolute values
-    /// compare.
+    /// Attach the per-flow A/V sync pacer onto the audio replacer (no-op
+    /// without an audio stage), which uses the master clock for its
+    /// wallclock-aware catch-up. The video replacer takes no pacer: it
+    /// generates no PCR — the `ts_pcr_remux` stage re-stamps the input's
+    /// PCR, and the input's `ts_pts_rewriter` then anchors the whole stream
+    /// to the master clock in muxer mode.
     pub fn set_av_sync_pacer(
         &mut self,
         pacer: Arc<crate::engine::av_sync_mux::AvSyncPacer>,
     ) {
         if let Some(a) = self.audio.as_mut() {
-            a.set_av_sync_pacer(pacer.clone());
-        }
-        if let Some(v) = self.video.as_mut() {
-            v.set_av_sync_pacer(pacer);
+            a.set_av_sync_pacer(pacer);
         }
     }
 
@@ -227,7 +207,9 @@ impl InputTranscoder {
     ///   `video_source_pid_not_found`);
     /// - the audio replacer's engage watchdog
     ///   (`audio_transcode_source_not_found` / `_found`,
-    ///   `audio_source_pid_not_found`).
+    ///   `audio_source_pid_not_found`);
+    /// - the PCR stage's `transcode_pcr_late`,
+    ///   `transcode_pcr_residency_exceeded` and `transcode_pcr_synthesized`.
     ///
     /// Each is a no-op when the stage is absent. Mirrors the output-side
     /// wiring in `transcode_chain::build_for_output`.
@@ -237,6 +219,7 @@ impl InputTranscoder {
         input_id: impl Into<String>,
     ) {
         let input_id = input_id.into();
+        self.pcr.set_event_sink(event_sender.clone(), input_id.clone(), true);
         if let Some(a) = self.audio.as_mut() {
             a.set_event_watchdog(event_sender.clone(), input_id.clone(), true);
         }
@@ -293,15 +276,24 @@ impl InputTranscoder {
             None => after_audio,
         };
 
-        // Stage 3: A/V emission realign (only present when video is
+        // Stage 3: PCR re-stamp — the input's PCR delayed by the measured
+        // transcode allowance, checked against the re-encoded PES.
+        self.pcr.set_replaced_pids(
+            self.audio.as_ref().and_then(TsAudioReplacer::replaced_pid),
+            self.video.as_ref().and_then(TsVideoReplacer::replaced_pid),
+        );
+        self.scratch_p.clear();
+        self.pcr.process(after_video, &mut self.scratch_p);
+
+        // Stage 4: A/V emission realign (only present when video is
         // transcoded). Holds audio until the video PID's PTS catches up so
-        // they leave together; PTS/CC untouched. Absent ⇒ return stage-2 out.
+        // they leave together; PTS/CC untouched. Absent ⇒ return stage-3 out.
         match self.realign.as_mut() {
             Some(r) => {
-                r.process(after_video, &mut self.scratch_c);
+                r.process(&self.scratch_p, &mut self.scratch_c);
                 &self.scratch_c
             }
-            None => after_video,
+            None => &self.scratch_p,
         }
     }
 
@@ -309,25 +301,32 @@ impl InputTranscoder {
     /// shutdown. No-op for unset stages.
     #[allow(dead_code)]
     pub fn flush(&mut self, output: &mut Vec<u8>) {
+        let mut tail = Vec::new();
         if let Some(a) = self.audio.as_mut() {
             let mut tmp = Vec::new();
             a.flush(&mut tmp);
             // Feed the drained audio bytes through the video stage too.
             if let Some(v) = self.video.as_mut() {
-                v.process(&tmp, output);
+                v.process(&tmp, &mut tail);
             } else {
-                output.extend_from_slice(&tmp);
+                tail.extend_from_slice(&tmp);
             }
         }
         if let Some(v) = self.video.as_mut() {
-            v.flush(output);
+            v.flush(&mut tail);
         }
+        self.pcr.process(&tail, output);
         // Emit any audio the realigner is still holding so shutdown loses
         // no samples (ordering relative to the just-flushed tail is moot at
         // teardown — the stream is ending).
         if let Some(r) = self.realign.as_mut() {
             r.flush(output);
         }
+    }
+
+    /// Shared handle to the PCR stage's counters (always present).
+    pub fn pcr_stats(&self) -> Arc<crate::engine::ts_pcr_remux::PcrRemuxStats> {
+        self.pcr.stats_handle()
     }
 
     /// Returns a shared handle to the video-encode stats counters if a video
@@ -466,6 +465,7 @@ pub fn register_ingress_stats(
         has_audio_stage_via_transcoder = t.has_audio();
         has_video_stage_via_transcoder = t.has_video();
         t.set_av_skew_reporter(av_skew.clone());
+        flow_stats.set_input_transcode_pcr_stats(input_id, t.pcr_stats());
         // Wire the decode-stall watchdog (input-scoped) so a silent ingress
         // video-decode failure raises a `video_transcode_decode_stalled`
         // Warning instead of shipping audio only. No-op without a video stage.
@@ -974,5 +974,121 @@ mod tests {
             (((rewritten_pmt[18] & 0x1F) as u16) << 8) | (rewritten_pmt[19] as u16);
         assert_eq!(out_video_st, 0x1B, "video stream_type must passthrough");
         assert_eq!(out_video_pid, 256, "video PID must be renamed to 256");
+    }
+
+    /// Audio-only transcode (video and its PCR pass through): the replacer
+    /// emits PES k only when PES k+1 arrives, so against an unshifted PCR
+    /// its first frame would be late — measured on Sky, 3930 of 4016 PES.
+    /// The trailing PCR stage delays the PCR by the measured lateness plus
+    /// margin: no re-encoded PES is ever behind the PCR, and the PCR keeps
+    /// the input's positions and cadence.
+    #[test]
+    fn audio_only_transcode_keeps_every_re_encoded_pes_ahead_of_the_pcr() {
+        use crate::engine::ts_parse::{
+            extract_pcr, extract_pes_pts, pcr_only_packet, ts_cc, ts_has_payload, ts_pid, ts_pusi,
+        };
+        use crate::engine::ts_test_fixtures::{packetize_sections, pat_packet, pmt_section};
+        const ADTS: &[u8] = include_bytes!("testdata/sine1k_aac_lc_48k_stereo.adts");
+        let mut frames = Vec::new();
+        let mut off = 0usize;
+        while off + 7 <= ADTS.len() {
+            let len = (((ADTS[off + 3] as usize) & 0x03) << 11)
+                | ((ADTS[off + 4] as usize) << 3)
+                | ((ADTS[off + 5] as usize) >> 5);
+            if len == 0 || off + len > ADTS.len() {
+                break;
+            }
+            frames.push(&ADTS[off..off + len]);
+            off += len;
+        }
+        let ae = AudioEncodeConfig {
+            codec: "mp2".to_string(),
+            bitrate_kbps: Some(192),
+            sample_rate: None,
+            channels: None,
+            silent_fallback: false,
+            opus_vbr_mode: None,
+            opus_fec: false,
+            opus_dtx: false,
+            opus_frame_duration_ms: None,
+            source_audio_pid: None,
+            ts_signalling: None,
+        };
+        let mut t = InputTranscoder::new(Some(&ae), None, None, None).unwrap().unwrap();
+
+        const MS: u64 = 27_000;
+        let t0 = 100 * 27_000_000u64;
+        // Events in stream order: (time, packets).
+        let mut events: Vec<(u64, Vec<[u8; 188]>)> = Vec::new();
+        let mut psi = vec![pat_packet(&[(1, 0x1000)], 0, 0)];
+        let pmt = pmt_section(1, 0, 0x100, &[], &[(0x1B, 0x100, &[]), (0x0F, 0x101, &[])]);
+        psi.extend(packetize_sections(0x1000, &[&pmt], 0));
+        events.push((t0, psi));
+        let mut pcrs_in = Vec::new();
+        for k in 0..100u64 {
+            let at = t0 + 1 + k * 30 * MS;
+            pcrs_in.push(at);
+            events.push((at, vec![pcr_only_packet(0x100, 0, at, false)]));
+        }
+        // 7 AAC frames per PES (149.3 ms), each PES 100 ms ahead of the PCR:
+        // emitted when the next PES arrives, the first frame is ~50 ms late
+        // against an unshifted PCR.
+        let pes_27 = 7 * 1024 * 27_000_000u64 / 48_000;
+        let mut acc = 0u8;
+        for j in 0..19u64 {
+            let at = t0 + 2 + j * pes_27;
+            let mut es = Vec::new();
+            for i in 0..7 {
+                es.extend_from_slice(frames[(j as usize * 7 + i) % frames.len()]);
+            }
+            let pes = crate::engine::ts_audio_replace::test_build_audio_pes(&es, (at + 100 * MS) / 300);
+            events.push((at, crate::engine::ts_audio_replace::test_packetize(0x101, &pes, &mut acc)));
+        }
+        events.sort_by_key(|(at, _)| *at);
+        let input: Vec<u8> = events
+            .iter()
+            .flat_map(|(_, p)| p.iter().flat_map(|q| q.iter().copied()))
+            .collect();
+        let mut out = Vec::new();
+        for chunk in input.chunks(7 * 188) {
+            out.extend_from_slice(t.process(chunk));
+        }
+
+        let d = t.pcr_stats().offset_27mhz.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(d > 80 * MS, "the audio needed more than the initial 80 ms: {} ms", d / MS);
+        let mut last_pcr = None;
+        let mut pcrs_out = Vec::new();
+        let mut audio_pes = 0;
+        let mut last_audio_cc: Option<u8> = None;
+        for p in out.chunks(188) {
+            if ts_pid(p) == 0x100
+                && let Some(v) = extract_pcr(p)
+            {
+                last_pcr = Some(v);
+                pcrs_out.push(v);
+            }
+            if ts_pid(p) == 0x101 && ts_has_payload(p) {
+                if let Some(prev) = last_audio_cc {
+                    assert_eq!(ts_cc(p), (prev + 1) & 0x0F, "audio CC continuous");
+                }
+                last_audio_cc = Some(ts_cc(p));
+                if ts_pusi(p) {
+                    let pts27 = extract_pes_pts(p).unwrap() * 300;
+                    let pcr = last_pcr.expect("a PCR precedes the first re-encoded PES");
+                    assert!(
+                        pts27 > pcr,
+                        "re-encoded PES {audio_pes} is {} ms behind the PCR",
+                        (pcr - pts27) / MS
+                    );
+                    audio_pes += 1;
+                }
+            }
+        }
+        assert!(audio_pes >= 80, "re-encoded audio emitted: {audio_pes} PES");
+        assert_eq!(pcrs_out.len(), pcrs_in.len(), "one output PCR per input PCR");
+        // After the latch every PCR is the input's minus D.
+        for (o, i) in pcrs_out.iter().zip(&pcrs_in).skip(20) {
+            assert_eq!(*o, i - d);
+        }
     }
 }

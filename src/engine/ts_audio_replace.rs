@@ -62,8 +62,8 @@ use super::audio_encode::AudioCodec;
 use super::audio_transcode::{PlanarAudioTranscoder, TranscodeJson};
 use super::transcode_engage::{EngageEvent, TranscodeEngageWatch, TranscodeKind};
 use super::ts_parse::{
-    parse_pat_programs, ts_has_payload, ts_payload_offset, ts_pid, ts_pusi, PAT_PID,
-    TS_PACKET_SIZE, TS_SYNC_BYTE,
+    extract_pcr, parse_pat_programs, pcr_only_packet, ts_discontinuity_indicator, ts_has_payload,
+    ts_payload_offset, ts_pid, ts_pusi, PAT_PID, TS_PACKET_SIZE, TS_SYNC_BYTE,
 };
 use super::ts_pmt_edit::{
     detect_flavour, parse_pmt, pmt_index, rebuild_pmt_section_fitting, AudioTarget, EsEdit, OutVersion,
@@ -358,13 +358,6 @@ pub struct TsAudioReplacer {
     /// master vs uncorrelated source, or PLL pre-lock garbage) — the
     /// re-anchor only kicks in when the two agree to within 10 s.
     av_sync_pacer: Option<Arc<crate::engine::av_sync_mux::AvSyncPacer>>,
-
-    /// Shared latest-emitted-audio-output-PTS (90 kHz), read by the co-running
-    /// `TsVideoReplacer` to floor the regenerated PCR on min(video, audio) so
-    /// the audio is never stamped behind PCR (T-STD late ⇒ dropped). Written
-    /// here on every emitted audio PES. `None` ⇒ no PCR flooring (audio-only
-    /// transcode / video passthrough needs none).
-    audio_pts_out: Option<Arc<std::sync::atomic::AtomicU64>>,
 }
 
 impl TsAudioReplacer {
@@ -450,7 +443,6 @@ impl TsAudioReplacer {
             transcoder: None,
             external_reset: Arc::new(AtomicBool::new(false)),
             av_sync_pacer: None,
-            audio_pts_out: None,
         })
     }
 
@@ -476,16 +468,6 @@ impl TsAudioReplacer {
         reporter: Arc<crate::stats::av_skew::AvSkewReporter>,
     ) {
         self.av_skew = Some(reporter);
-    }
-
-    /// Wire the shared latest-emitted-audio-PTS handle the co-running
-    /// `TsVideoReplacer` reads to floor its regenerated PCR on
-    /// min(video, audio). Both replacers get the same `Arc`.
-    pub fn set_audio_pts_floor(
-        &mut self,
-        floor: Arc<std::sync::atomic::AtomicU64>,
-    ) {
-        self.audio_pts_out = Some(floor);
     }
 
     /// Attach a per-input PCR forward-jump signal `Arc<AtomicI64>`,
@@ -641,12 +623,23 @@ impl TsAudioReplacer {
         )
     }
 
+    /// The audio PID whose PES this replacer re-encodes (`None` while it
+    /// passes the source through) — what the chain's trailing PCR stage
+    /// checks against its PCR.
+    pub fn replaced_pid(&self) -> Option<u16> {
+        self.audio_pid.filter(|_| source_replaceable(self.source_stream_type))
+    }
+
     /// Process one chunk of raw MPEG-TS bytes.
     ///
     /// `input_ts` must be 188-byte aligned (caller is responsible for TS
     /// sync recovery). Output TS bytes are appended to `output`. On bad
     /// input (not TS-aligned) the chunk is appended unchanged.
     pub fn process(&mut self, input_ts: &[u8], output: &mut Vec<u8>) {
+        self.process_at(input_ts, output, std::time::Instant::now());
+    }
+
+    fn process_at(&mut self, input_ts: &[u8], output: &mut Vec<u8>, now: std::time::Instant) {
         if input_ts.is_empty() {
             return;
         }
@@ -729,6 +722,21 @@ impl TsAudioReplacer {
             // falls through to the passthrough branch below — losing the
             // re-encode is preferable to dropping audio entirely.
             if Some(pid) == self.audio_pid && source_replaceable(self.source_stream_type) {
+                // A PCR on the audio PID (radio services, some SD
+                // programmes) keeps its stream position as an
+                // adaptation-field-only packet — value and DI unchanged,
+                // CC repeating the last payload CC — instead of vanishing
+                // with the source payload. The chain's `ts_pcr_remux`
+                // stage owns the delay.
+                if let Some(pcr) = extract_pcr(pkt) {
+                    let cc = self.out_audio_cc.wrapping_sub(1) & 0x0F;
+                    output.extend_from_slice(&pcr_only_packet(
+                        pid,
+                        cc,
+                        pcr,
+                        ts_discontinuity_indicator(pkt),
+                    ));
+                }
                 self.feed_audio_packet(pkt, output);
                 continue;
             }
@@ -738,7 +746,7 @@ impl TsAudioReplacer {
         }
 
         self.engage.note_packets((input_ts.len() / TS_PACKET_SIZE) as u64);
-        self.poll_engage(std::time::Instant::now());
+        self.poll_engage(now);
     }
 
     /// Advance the engage watchdog and emit whatever it raises. Returns the
@@ -1936,10 +1944,6 @@ impl TsAudioReplacer {
                                         / sr as u64,
                                 )
                             };
-                            // Publish for the video replacer's PCR floor.
-                            if let Some(h) = self.audio_pts_out.as_ref() {
-                                h.store(pts_for_pes, std::sync::atomic::Ordering::Relaxed);
-                            }
                             let pes = build_audio_pes(
                                 self.codec.ts_pes_stream_id(),
                                 &encoded.bytes,
@@ -1993,10 +1997,6 @@ impl TsAudioReplacer {
                                             / sr as u64,
                                     )
                                 };
-                                // Publish for the video replacer's PCR floor.
-                                if let Some(h) = self.audio_pts_out.as_ref() {
-                                    h.store(pts_for_pes, std::sync::atomic::Ordering::Relaxed);
-                                }
                                 let pes = build_audio_pes(
                                     self.codec.ts_pes_stream_id(),
                                     &ef.data,
@@ -2321,6 +2321,18 @@ fn packetize_ts(pid: u16, pes: &[u8], cc: &mut u8) -> Vec<[u8; 188]> {
     }
 
     packets
+}
+
+/// Test builders for other modules' chain tests: an MPEG audio PES (stream
+/// id 0xC0) and its TS packetisation.
+#[cfg(test)]
+pub(crate) fn test_build_audio_pes(es: &[u8], pts: u64) -> Vec<u8> {
+    build_audio_pes(0xC0, es, pts)
+}
+
+#[cfg(test)]
+pub(crate) fn test_packetize(pid: u16, pes: &[u8], cc: &mut u8) -> Vec<[u8; 188]> {
+    packetize_ts(pid, pes, cc)
 }
 
 #[cfg(test)]
@@ -4255,5 +4267,91 @@ mod tests {
             r.accumulator[0].len() < FRAME,
             "leftover silence samples in accumulator (< 1024) finishes catch-up on next PES"
         );
+    }
+
+    // ── PCR on the audio PID (defect x) ──
+
+    fn adts_frames() -> Vec<&'static [u8]> {
+        const ADTS: &[u8] = include_bytes!("testdata/sine1k_aac_lc_48k_stereo.adts");
+        let mut v = Vec::new();
+        let mut off = 0usize;
+        while off + 7 <= ADTS.len() {
+            let len = (((ADTS[off + 3] as usize) & 0x03) << 11)
+                | ((ADTS[off + 4] as usize) << 3)
+                | ((ADTS[off + 5] as usize) >> 5);
+            if len == 0 || off + len > ADTS.len() {
+                break;
+            }
+            v.push(&ADTS[off..off + len]);
+            off += len;
+        }
+        v
+    }
+
+    /// Put a PCR into a packet's stuffing adaptation field (≥ 7 bytes).
+    fn put_pcr_in_stuffing(pkt: &mut [u8; 188], pcr: u64) -> bool {
+        if pkt[3] & 0x20 == 0 || pkt[4] < 7 {
+            return false;
+        }
+        pkt[5] = 0x10;
+        crate::engine::ts_parse::write_pcr(pkt, pcr)
+    }
+
+    #[test]
+    fn a_pcr_on_the_audio_pid_survives_as_af_only_with_continuous_cc() {
+        use crate::engine::ts_parse::{extract_pcr, pcr_only_packet, ts_cc};
+        let mut r = TsAudioReplacer::new(&enc("mp2"), None).unwrap();
+        let mut out = Vec::new();
+        r.process(&synth_pat(0x1000), &mut out);
+        // PCR_PID = the audio PID (a radio service).
+        r.process(&synth_pmt_audio(0x1000, 0x0101, 0x0F), &mut out);
+        out.clear();
+        let (mut pts, mut cc) = (900_000u64, 0u8);
+        let mut pcrs_in = Vec::new();
+        let mut in_payload = 0;
+        for (i, f) in adts_frames().iter().enumerate() {
+            let pcr = pts * 300 - 100 * 27_000;
+            let mut pkts = packetize_ts(0x0101, &build_audio_pes(0xC0, f, pts), &mut cc);
+            // The PCR rides in the PES's last (payload) packet when its
+            // stuffing has room; otherwise, and on every even frame, in an
+            // AF-only carrier ahead of the PES (DI on the fourth frame).
+            let last = pkts.len() - 1;
+            if i % 2 == 1 && put_pcr_in_stuffing(&mut pkts[last], pcr) {
+                in_payload += 1;
+                pcrs_in.push((pcr, false));
+            } else {
+                let p = pcr_only_packet(0x0101, cc.wrapping_sub(pkts.len() as u8 + 1) & 0x0F, pcr, i == 4);
+                r.process(&p, &mut out);
+                pcrs_in.push((pcr, i == 4));
+            }
+            for p in &pkts {
+                r.process(p, &mut out);
+            }
+            pts += 1920;
+        }
+        let audio: Vec<&[u8]> = out.chunks(188).filter(|p| ts_pid(p) == 0x0101).collect();
+        let pcrs_out: Vec<(u64, bool)> = audio
+            .iter()
+            .filter_map(|p| {
+                extract_pcr(p).map(|v| (v, crate::engine::ts_parse::ts_discontinuity_indicator(p)))
+            })
+            .collect();
+        assert!(in_payload >= 3, "some PCRs rode in payload packets: {in_payload}");
+        assert_eq!(pcrs_out, pcrs_in, "every input PCR, value and DI unchanged");
+        let mut payload = 0;
+        let mut last_payload_cc: Option<u8> = None;
+        for p in &audio {
+            if ts_has_payload(p) {
+                assert!(extract_pcr(p).is_none(), "re-encoded PES carry no PCR");
+                if let Some(prev) = last_payload_cc {
+                    assert_eq!(ts_cc(p), (prev + 1) & 0x0F, "payload CC continuous");
+                }
+                last_payload_cc = Some(ts_cc(p));
+                payload += 1;
+            } else {
+                assert_eq!(ts_cc(p), last_payload_cc.unwrap_or(15), "AF-only repeats the payload CC");
+            }
+        }
+        assert!(payload > 0, "re-encoded audio emitted");
     }
 }

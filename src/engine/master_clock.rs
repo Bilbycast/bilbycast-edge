@@ -122,8 +122,9 @@ pub enum MasterClockKind {
     AudioMaster,
     /// **By-design** wallclock: this flow doesn't need a recovered
     /// source clock because output PCR comes from the source bytes
-    /// directly (passthrough) or from source PTS (transcoded paths
-    /// via [`crate::engine::av_sync_mux::pcr_for_emit`]). The runtime
+    /// directly (passthrough) or from the input PCR delayed by a measured
+    /// transcode allowance (transcoded paths, via
+    /// [`crate::engine::ts_pcr_remux`]). The runtime
     /// backing is identical to [`Self::Wallclock`] — what's different
     /// is that no PLL is spawned, no fallback watcher runs, and no
     /// "fallback" alarm ever fires. Telemetry reports `kind:
@@ -1430,8 +1431,9 @@ pub fn clock_identity_for_input(
 ///    assembled stream's clock tracks the contribution source.
 /// 4. **Passthrough for everything else** — most contribution-to-
 ///    distribution flows. Output PCR comes from the source bytes
-///    directly (passthrough outputs) or from source PTS (transcoded
-///    outputs via `av_sync_mux::pcr_for_emit`). The master clock is
+///    directly (passthrough outputs) or from the input PCR delayed by a
+///    measured transcode allowance (transcoded outputs via
+///    `ts_pcr_remux`). The master clock is
 ///    informational; running the PLL would only generate misleading
 ///    fallback alarms on legitimate sources that have ms-scale PCR
 ///    arrival jitter (typical for internet contribution over SRT/RIST).

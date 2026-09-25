@@ -182,3 +182,59 @@ pub fn two_packet_pmt(program_number: u16, version: u8) -> (Vec<u8>, u16) {
     assert!(sec.len() > TS_PACKET_SIZE - 5, "fixture must span two packets");
     (sec, 0x020B)
 }
+
+/// Write a 5-byte PES timestamp (`marker` = 0x2 PTS-only, 0x3 PTS with DTS
+/// following, 0x1 DTS).
+fn put_ts(dst: &mut [u8], marker: u8, v: u64) {
+    let v = v & 0x1_FFFF_FFFF;
+    dst[0] = (marker << 4) | (((v >> 29) as u8) & 0x0E) | 0x01;
+    dst[1] = (v >> 22) as u8;
+    dst[2] = (((v >> 14) as u8) & 0xFE) | 0x01;
+    dst[3] = (v >> 7) as u8;
+    dst[4] = (((v << 1) as u8) & 0xFE) | 0x01;
+}
+
+/// A PUSI packet starting a PES on `pid` (payload only, CC `cc`) with
+/// `stream_id`, a PTS and an optional DTS; the rest of the packet is 0xAA
+/// ES bytes.
+pub fn pes_start_packet(
+    pid: u16,
+    cc: u8,
+    stream_id: u8,
+    pts: u64,
+    dts: Option<u64>,
+) -> [u8; TS_PACKET_SIZE] {
+    let mut pkt = [0xAAu8; TS_PACKET_SIZE];
+    pkt[0] = TS_SYNC_BYTE;
+    pkt[1] = 0x40 | ((pid >> 8) as u8 & 0x1F);
+    pkt[2] = pid as u8;
+    pkt[3] = 0x10 | (cc & 0x0F);
+    pkt[4..8].copy_from_slice(&[0x00, 0x00, 0x01, stream_id]);
+    pkt[8] = 0x00;
+    pkt[9] = 0x00;
+    pkt[10] = 0x80;
+    match dts {
+        Some(d) => {
+            pkt[11] = 0xC0;
+            pkt[12] = 10;
+            put_ts(&mut pkt[13..18], 0x3, pts);
+            put_ts(&mut pkt[18..23], 0x1, d);
+        }
+        None => {
+            pkt[11] = 0x80;
+            pkt[12] = 5;
+            put_ts(&mut pkt[13..18], 0x2, pts);
+        }
+    }
+    pkt
+}
+
+/// A payload-only continuation packet on `pid` (0xAA bytes), CC `cc`.
+pub fn payload_packet(pid: u16, cc: u8) -> [u8; TS_PACKET_SIZE] {
+    let mut pkt = [0xAAu8; TS_PACKET_SIZE];
+    pkt[0] = TS_SYNC_BYTE;
+    pkt[1] = (pid >> 8) as u8 & 0x1F;
+    pkt[2] = pid as u8;
+    pkt[3] = 0x10 | (cc & 0x0F);
+    pkt
+}

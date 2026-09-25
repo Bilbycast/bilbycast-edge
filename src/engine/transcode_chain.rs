@@ -34,11 +34,14 @@
 //!   filtered TS bytes  ──submit──▶  [codec thread:
 //!                                       audio_replacer.process(in, scratch_a)
 //!                                       video_replacer.process(scratch_a, scratch_b)
+//!                                       pcr_remux.process(scratch_b, scratch_c)
 //!                                    ]  ──recv──▶  transcoded TS bytes
 //! ```
 //!
 //! If only one of audio/video is configured, the other stage is a
-//! pass-through. The chain takes care of holding the scratch buffers
+//! pass-through. The trailing `ts_pcr_remux` stage always runs: it owns the
+//! output PCR (the input's, delayed by one measured transcode allowance —
+//! see that module). The chain takes care of holding the scratch buffers
 //! across iterations so we don't reallocate.
 //!
 //! ## Drop semantics
@@ -76,6 +79,7 @@ use crate::engine::codec_thread::{spawn_codec_thread, CodecThreadConfig};
 use crate::engine::ts_audio_replace::{
     TsAudioReplaceError, TsAudioReplacer,
 };
+use crate::engine::ts_pcr_remux::TsPcrRemux;
 use crate::engine::ts_video_replace::{TsVideoReplaceError, TsVideoReplacer};
 
 /// Bounded depth of the input channel. Matches the Standard tier of
@@ -232,6 +236,7 @@ impl TranscodeChain {
         who: impl Into<String>,
         audio: Option<TsAudioReplacer>,
         video: Option<TsVideoReplacer>,
+        pcr: TsPcrRemux,
         backpressure: Option<WireBackpressure>,
     ) -> Self {
         debug_assert!(
@@ -271,7 +276,7 @@ impl TranscodeChain {
         // transfer.
         let thread = spawn_codec_thread(
             CodecThreadConfig::realtime(format!("transcode-{}", who.clone())),
-            move || run_chain(input_rx, output_tx, audio, video, backpressure),
+            move || run_chain(input_rx, output_tx, audio, video, pcr, backpressure),
         );
 
         tracing::info!(
@@ -431,9 +436,6 @@ pub fn build_for_output(
                 backend,
             );
             stats.set_video_decode_stats(r.decode_stats_handle(), "", 0, 0, 0.0);
-            if let Some(p) = av_sync_pacer {
-                r.set_av_sync_pacer(p.clone());
-            }
             // Wire the decode-stall watchdog so a transcode whose decoder
             // produces no frames surfaces a Warning instead of silently
             // shipping audio-only output (field report: QSV H.264 decode
@@ -453,7 +455,14 @@ pub fn build_for_output(
     if audio.is_none() && video.is_none() {
         return Ok(None);
     }
-    Ok(Some(TranscodeChain::new(output_id, audio, video, backpressure)))
+    // The chain's trailing PCR stage: the output PCR is the input's,
+    // delayed by one measured transcode allowance (`ts_pcr_remux`).
+    let mut pcr = TsPcrRemux::new();
+    stats.set_transcode_pcr_stats(pcr.stats_handle());
+    if let Some(es) = event_sender {
+        pcr.set_event_sink(es.clone(), output_id, false);
+    }
+    Ok(Some(TranscodeChain::new(output_id, audio, video, pcr, backpressure)))
 }
 
 impl Drop for TranscodeChain {
@@ -473,13 +482,14 @@ impl Drop for TranscodeChain {
     }
 }
 
-/// Codec-thread body. Owns both replacers + scratch buffers for the
-/// chain's lifetime.
+/// Codec-thread body. Owns both replacers, the PCR stage and the scratch
+/// buffers for the chain's lifetime.
 fn run_chain(
     mut input_rx: mpsc::Receiver<Bytes>,
     output_tx: mpsc::Sender<Bytes>,
     mut audio: Option<TsAudioReplacer>,
     mut video: Option<TsVideoReplacer>,
+    mut pcr: TsPcrRemux,
     backpressure: Option<WireBackpressure>,
 ) {
     // Scratch buffers persist across iterations so we don't reallocate
@@ -488,6 +498,7 @@ fn run_chain(
     // without reallocation.
     let mut after_audio_scratch: Vec<u8> = Vec::with_capacity(64 * 1024);
     let mut after_video_scratch: Vec<u8> = Vec::with_capacity(64 * 1024);
+    let mut after_pcr_scratch: Vec<u8> = Vec::with_capacity(64 * 1024);
 
     loop {
         // Codec → wire_emit backpressure. When the wire_tx queue is
@@ -508,33 +519,34 @@ fn run_chain(
             Some(b) => b,
             None => {
                 // Input channel closed — drain replacer trailing state
-                // (PES buffer, encoder pipeline residue) and forward
-                // before exiting. Use `try_send` (not `blocking_send`)
-                // because the receiver may already be gone on
-                // shutdown — `blocking_send` would deadlock.
+                // (PES buffer, encoder pipeline residue) through the rest
+                // of the chain and forward before exiting. Use `try_send`
+                // (not `blocking_send`) because the receiver may already
+                // be gone on shutdown — `blocking_send` would deadlock.
+                after_audio_scratch.clear();
                 if let Some(ref mut a) = audio {
-                    after_audio_scratch.clear();
                     a.flush(&mut after_audio_scratch);
-                    if !after_audio_scratch.is_empty() {
-                        let drained = Bytes::copy_from_slice(&after_audio_scratch);
-                        let _ = output_tx.try_send(drained);
-                    }
                 }
-                if let Some(ref mut v) = video {
-                    after_video_scratch.clear();
-                    v.flush(&mut after_video_scratch);
-                    if !after_video_scratch.is_empty() {
-                        let drained = Bytes::copy_from_slice(&after_video_scratch);
-                        let _ = output_tx.try_send(drained);
+                after_video_scratch.clear();
+                match video {
+                    Some(ref mut v) => {
+                        if !after_audio_scratch.is_empty() {
+                            v.process(&after_audio_scratch, &mut after_video_scratch);
+                        }
+                        v.flush(&mut after_video_scratch);
                     }
+                    None => after_video_scratch.extend_from_slice(&after_audio_scratch),
+                }
+                after_pcr_scratch.clear();
+                pcr.process(&after_video_scratch, &mut after_pcr_scratch);
+                if !after_pcr_scratch.is_empty() {
+                    let _ = output_tx.try_send(Bytes::copy_from_slice(&after_pcr_scratch));
                 }
                 break;
             }
         };
 
         // Audio replace (if configured) — otherwise pass through.
-        // Holds the slice borrow into one of the scratch buffers; we
-        // re-borrow into `after_video_scratch` for the next stage.
         let after_audio: &[u8] = if let Some(ref mut a) = audio {
             after_audio_scratch.clear();
             a.process(&input, &mut after_audio_scratch);
@@ -544,24 +556,30 @@ fn run_chain(
         };
 
         // Video replace (if configured) — otherwise pass through.
-        let result: Bytes = if let Some(ref mut v) = video {
+        let after_video: &[u8] = if let Some(ref mut v) = video {
             after_video_scratch.clear();
             v.process(after_audio, &mut after_video_scratch);
-            if after_video_scratch.is_empty() {
-                // Encoder may legitimately emit 0 bytes on a single
-                // input chunk (the input was non-video, e.g. PAT
-                // synth, or the encoder is still in its B-frame
-                // reorder window). Skip this iteration; the encoder
-                // will produce output on a later input chunk.
-                continue;
-            }
-            Bytes::copy_from_slice(&after_video_scratch)
-        } else if !after_audio.is_empty() {
-            // Audio-only chain: forward what the audio stage produced.
-            Bytes::copy_from_slice(after_audio)
+            &after_video_scratch
         } else {
-            continue;
+            after_audio
         };
+
+        // PCR re-stamp: every PCR on the output PCR_PID becomes the
+        // input's minus the measured delay, checked against the PES the
+        // replacers re-encode.
+        pcr.set_replaced_pids(
+            audio.as_ref().and_then(TsAudioReplacer::replaced_pid),
+            video.as_ref().and_then(TsVideoReplacer::replaced_pid),
+        );
+        after_pcr_scratch.clear();
+        pcr.process(after_video, &mut after_pcr_scratch);
+        if after_pcr_scratch.is_empty() {
+            // The replacers may legitimately emit 0 bytes on a single
+            // input chunk (PES still accumulating, the encoder in its
+            // reorder window, the pre-PMT gate). Skip this iteration.
+            continue;
+        }
+        let result = Bytes::copy_from_slice(&after_pcr_scratch);
 
         // Drop-on-full: live broadcast never wants to buffer past the
         // configured depth. The output task's per-flow stats accumulator
@@ -608,7 +626,7 @@ mod tests {
             ts_signalling: None,
         };
         let audio = TsAudioReplacer::new(&cfg, None).expect("audio replacer build");
-        TranscodeChain::new("test-audio-only", Some(audio), None, None)
+        TranscodeChain::new("test-audio-only", Some(audio), None, TsPcrRemux::new(), None)
     }
 
     /// Construct + immediately drop. Verifies the codec thread sees

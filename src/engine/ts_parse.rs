@@ -1233,6 +1233,215 @@ pub fn ts_payload_offset(pkt: &[u8]) -> usize {
     offset
 }
 
+// ── PCR / adaptation-field-only packet helpers ───────────────────────────
+
+/// The 42-bit PCR space in 27 MHz ticks (33-bit base × 300).
+pub const PCR_MODULUS_27MHZ: u64 = (1u64 << 33) * 300;
+
+/// `a − b` in the modular PCR space, as a signed value in
+/// `(−PCR_MODULUS_27MHZ / 2, PCR_MODULUS_27MHZ / 2]`. Both operands are
+/// reduced first, so a 33-bit PTS multiplied by 300 compares cleanly with a
+/// PCR across the ~26.5 h wrap.
+pub fn pcr_diff_27mhz(a: u64, b: u64) -> i64 {
+    let d = (a % PCR_MODULUS_27MHZ + PCR_MODULUS_27MHZ - b % PCR_MODULUS_27MHZ) % PCR_MODULUS_27MHZ;
+    if d > PCR_MODULUS_27MHZ / 2 {
+        d as i64 - PCR_MODULUS_27MHZ as i64
+    } else {
+        d as i64
+    }
+}
+
+/// Overwrite the PCR of a packet that already carries one (PCR_flag set in
+/// an adaptation field of at least 7 bytes). Returns `false` — and leaves
+/// the packet untouched — when it has no PCR field.
+pub fn write_pcr(pkt: &mut [u8], pcr_27mhz: u64) -> bool {
+    if pkt.len() < TS_PACKET_SIZE || !ts_has_adaptation(pkt) || (pkt[4] as usize) < 7 {
+        return false;
+    }
+    if pkt[5] & 0x10 == 0 {
+        return false;
+    }
+    let v = pcr_27mhz % PCR_MODULUS_27MHZ;
+    let base = v / 300;
+    let ext = v % 300;
+    pkt[6] = (base >> 25) as u8;
+    pkt[7] = (base >> 17) as u8;
+    pkt[8] = (base >> 9) as u8;
+    pkt[9] = (base >> 1) as u8;
+    pkt[10] = (((base & 1) as u8) << 7) | 0x7E | ((ext >> 8) as u8 & 0x01);
+    pkt[11] = ext as u8;
+    true
+}
+
+/// An adaptation-field-only packet (AFC = `10`, adaptation_field_length
+/// 183, 0xFF stuffing) carrying `pcr_27mhz` on `pid`, with
+/// `discontinuity_indicator` when `discontinuity`.
+///
+/// `cc` must be the continuity_counter of the last payload packet sent on
+/// `pid` — ISO/IEC 13818-1 §2.4.3.3: a packet without payload does not
+/// advance it. Before any payload on the PID, pass the CC *preceding* the
+/// first payload packet's, so the sequence stays continuous.
+pub fn pcr_only_packet(pid: u16, cc: u8, pcr_27mhz: u64, discontinuity: bool) -> [u8; TS_PACKET_SIZE] {
+    let mut pkt = [0xFFu8; TS_PACKET_SIZE];
+    pkt[0] = TS_SYNC_BYTE;
+    pkt[1] = ((pid >> 8) as u8) & 0x1F;
+    pkt[2] = pid as u8;
+    pkt[3] = 0x20 | (cc & 0x0F);
+    pkt[4] = 183;
+    pkt[5] = if discontinuity { 0x90 } else { 0x10 };
+    write_pcr(&mut pkt, pcr_27mhz);
+    pkt
+}
+
+/// Turn a packet into an adaptation-field-only packet: keep its adaptation
+/// field (PCR, discontinuity / random-access flags, private data) and drop
+/// the payload, stuffing the field to 183 bytes and clearing PUSI. The CC
+/// is left to the caller — the packet no longer carries payload, so it
+/// must repeat the previous payload CC on the PID.
+///
+/// Returns `false` (packet untouched) when there is no adaptation field
+/// with a flags byte to keep: such a packet carries nothing but payload
+/// and can simply be dropped.
+pub fn strip_to_af_only(pkt: &mut [u8]) -> bool {
+    if pkt.len() < TS_PACKET_SIZE || !ts_has_adaptation(pkt) {
+        return false;
+    }
+    let af_len = pkt[4] as usize;
+    if af_len == 0 || 5 + af_len > TS_PACKET_SIZE {
+        return false;
+    }
+    for b in &mut pkt[5 + af_len..TS_PACKET_SIZE] {
+        *b = 0xFF;
+    }
+    pkt[1] &= !0x40;
+    pkt[3] = (pkt[3] & 0xCF) | 0x20;
+    pkt[4] = 183;
+    true
+}
+
+/// Continuity-counter bookkeeping for one PID on which a stage drops
+/// payload packets: every later packet's CC is lowered by the number dropped,
+/// so the sequence the receiver sees stays continuous (ISO/IEC 13818-1
+/// §2.4.3.3). Adaptation-field-only packets repeat the previous payload CC
+/// in the source and therefore come out right under the same offset.
+///
+/// Drops before anything went out on the PID are free: the receiver has no
+/// sequence to continue yet. A packet stripped to adaptation-field-only
+/// (keeping a PCR) always counts, because it is the first packet the
+/// receiver's sequence continues from.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct CcRenumber {
+    off: u8,
+    emitted: bool,
+}
+
+impl CcRenumber {
+    /// A payload packet on the PID was dropped.
+    pub fn drop_payload(&mut self) {
+        if self.emitted {
+            self.off = (self.off + 1) & 0x0F;
+        }
+    }
+
+    /// `pkt` goes out; `stripped` = it lost its payload on the way (it was a
+    /// payload packet in the source). Rewrites its CC.
+    pub fn emit(&mut self, pkt: &mut [u8], stripped: bool) {
+        if stripped {
+            self.off = (self.off + 1) & 0x0F;
+        }
+        if self.off != 0 {
+            pkt[3] = (pkt[3] & 0xF0) | (ts_cc(pkt).wrapping_sub(self.off) & 0x0F);
+        }
+        self.emitted = true;
+    }
+}
+
+#[cfg(test)]
+mod pcr_helper_tests {
+    use super::*;
+
+    #[test]
+    fn pcr_only_packet_round_trips_and_is_af_only() {
+        let p = pcr_only_packet(0x100, 7, 123_456_789_012, true);
+        assert_eq!(ts_pid(&p), 0x100);
+        assert_eq!(ts_adaptation_field_control(&p), 0b10);
+        assert_eq!(ts_cc(&p), 7);
+        assert_eq!(p[4], 183);
+        assert!(ts_discontinuity_indicator(&p));
+        assert_eq!(extract_pcr(&p), Some(123_456_789_012));
+        assert!(p[12..].iter().all(|&b| b == 0xFF));
+        let q = pcr_only_packet(0x100, 7, PCR_MODULUS_27MHZ + 5, false);
+        assert!(!ts_discontinuity_indicator(&q));
+        assert_eq!(extract_pcr(&q), Some(5), "reduced into the 42-bit space");
+    }
+
+    #[test]
+    fn cc_renumber_keeps_the_sequence_continuous_across_drops() {
+        fn pkt(cc: u8, payload: bool) -> [u8; TS_PACKET_SIZE] {
+            let mut p = [0xFFu8; TS_PACKET_SIZE];
+            p[0] = TS_SYNC_BYTE;
+            p[3] = if payload { 0x10 } else { 0x20 } | cc;
+            p
+        }
+        let mut r = CcRenumber::default();
+        // Two drops before anything went out: free.
+        r.drop_payload();
+        r.drop_payload();
+        let mut out = Vec::new();
+        for (cc, payload, drop) in [(2, true, false), (3, true, true), (4, true, true), (4, false, false), (5, true, false), (6, true, false)] {
+            let mut p = pkt(cc, payload);
+            if drop {
+                r.drop_payload();
+                continue;
+            }
+            r.emit(&mut p, false);
+            out.push((ts_cc(&p), payload));
+        }
+        assert_eq!(out, vec![(2, true), (2, false), (3, true), (4, true)]);
+        // A stripped first packet: the payload after it continues from it.
+        let mut r = CcRenumber::default();
+        let mut stripped = pkt(9, true);
+        r.emit(&mut stripped, true);
+        assert_eq!(ts_cc(&stripped), 8);
+        r.drop_payload();
+        let mut next = pkt(11, true);
+        r.emit(&mut next, false);
+        assert_eq!(ts_cc(&next), 9);
+    }
+
+    #[test]
+    fn pcr_diff_is_signed_and_wrap_aware() {
+        assert_eq!(pcr_diff_27mhz(100, 40), 60);
+        assert_eq!(pcr_diff_27mhz(40, 100), -60);
+        assert_eq!(pcr_diff_27mhz(10, PCR_MODULUS_27MHZ - 10), 20);
+        assert_eq!(pcr_diff_27mhz(PCR_MODULUS_27MHZ - 10, 10), -20);
+    }
+
+    #[test]
+    fn strip_to_af_only_keeps_the_pcr_and_drops_the_payload() {
+        let mut p = pcr_only_packet(0x44, 3, 27_000_000, false);
+        // Make it a PUSI payload packet with an 8-byte AF (flags + PCR).
+        p[1] |= 0x40;
+        p[3] = 0x33;
+        p[4] = 7;
+        for (i, b) in p[12..].iter_mut().enumerate() {
+            *b = i as u8;
+        }
+        assert!(strip_to_af_only(&mut p));
+        assert!(!ts_pusi(&p));
+        assert_eq!(ts_adaptation_field_control(&p), 0b10);
+        assert_eq!(ts_cc(&p), 3);
+        assert_eq!(p[4], 183);
+        assert_eq!(extract_pcr(&p), Some(27_000_000));
+        assert!(p[12..].iter().all(|&b| b == 0xFF));
+        // No adaptation field: nothing to keep.
+        let mut q = [0xFFu8; TS_PACKET_SIZE];
+        q[0] = TS_SYNC_BYTE;
+        q[3] = 0x10;
+        assert!(!strip_to_af_only(&mut q));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
