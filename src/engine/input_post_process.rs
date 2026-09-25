@@ -174,6 +174,20 @@ impl InputPostProcess {
         })
     }
 
+    /// Wire the manager event sender into the muxer-mode clock rewriter
+    /// (when present) so it can report falling back to the source clock
+    /// because no PMT could be learned (`clock_rewrite_pmt_not_learned`,
+    /// input-scoped). No-op without a rewriter stage.
+    pub fn set_event_sender(
+        &mut self,
+        sender: &crate::manager::events::EventSender,
+        input_id: &str,
+    ) {
+        if let Some(r) = self.pts_rewriter.as_mut() {
+            r.set_event_sink(sender.clone(), input_id);
+        }
+    }
+
     /// Run the chain on one chunk of 188-byte-aligned TS bytes. Returns
     /// a borrowed slice valid until the next call.
     ///

@@ -149,6 +149,11 @@ pub fn spawn_rist_input(
             pcr_jump_signal: Some(&pcr_jump_signal),
             av_skew: Some(&av_skew_for_post),
         });
+        // The muxer-mode clock rewriter reports a source-clock fallback
+        // (no PMT learned) as `clock_rewrite_pmt_not_learned`.
+        if let Some(p) = post.as_mut() {
+            p.set_event_sender(&event_sender, &input_id);
+        }
         if let Some(ref _p) = post {
             tracing::info!(
                 "RIST input '{input_id}': ingress post-process active (program_filter={} pid_overrides={} pid_map={} passthrough_clock={})",

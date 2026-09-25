@@ -112,6 +112,14 @@
 //!   start anchors at a different master_now value. Cross-input
 //!   PES-aligned splice expects roughly-coherent PTS values across
 //!   inputs; late-joiners may need a flow restart to align.
+//! - **Roles come from the PMT.** PCR is regenerated from the first PCR,
+//!   but a PES timestamp only once the PMT described its PID. The PMT is
+//!   found by walking every section on the PMT PID (a user-private table
+//!   may precede it — VH1's 0xC0 section) and reassembled when it spans
+//!   packets. If no PMT is learned within 2 s of source-PCR time the
+//!   rewriter passes the source clock through instead (DI=1, Warning
+//!   `clock_rewrite_pmt_not_learned`) so PCR and PTS never sit on two
+//!   different timelines, and resumes regeneration once a PMT arrives.
 //! - **PCR repetition rate** (TR 101 290 §PCR_RR ≤ 40 ms): not
 //!   enforced. If the source emits PCR sparsely, the output is
 //!   sparse too. A future enhancement could inject PCR padding when
@@ -123,8 +131,8 @@ use std::sync::Arc;
 use super::av_sync_mux::AvSyncPacer;
 use super::ts_parse::{
     descriptor_audio_kind, extract_pcr, extract_pes_dts, extract_pes_pts, mpeg2_crc32,
-    parse_pat_programs, set_discontinuity_indicator, ts_has_adaptation, ts_pid, ts_pusi, PAT_PID,
-    TS_PACKET_SIZE, TS_SYNC_BYTE,
+    parse_pat_programs, set_discontinuity_indicator, ts_has_adaptation, ts_pid, ts_pusi,
+    SectionAssembler, PAT_PID, TS_PACKET_SIZE, TS_SYNC_BYTE,
 };
 
 /// PCR pre-roll in 27 MHz ticks. Matches `av_sync_mux::PCR_PREROLL_27MHZ`.
@@ -197,6 +205,17 @@ const MAX_BRIDGE_ADVANCE_27MHZ: u64 = PCR_RR_MAX_27MHZ;
 /// least every 500 ms (else the receiver alarms). We inject cached
 /// PAT + all PMTs when no PSI has flowed in this window.
 const PSI_RR_MAX_27MHZ: u64 = 500 * 27_000;
+
+/// How much source-PCR time may pass, re-anchoring PCR, before the
+/// rewriter must have learned the PES roles from a PMT. PCR is regenerated
+/// from the first PCR on, but PES timestamps only on PIDs the PMT
+/// described — so a stream whose PMT the rewriter cannot parse would carry
+/// master-clock PCR over source-clock PTS forever (VH1: a constant −12.6 h
+/// PTS−PCR). 2 s is four times the 500 ms PSI repetition TR 101 290 asks
+/// for; when it expires unlearned the rewriter hands the SOURCE clock
+/// through (PCR and PTS then agree) and raises
+/// `clock_rewrite_pmt_not_learned`.
+const ROLES_UNLEARNED_WINDOW_27MHZ: u64 = 2 * 27_000_000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PidRole {
@@ -308,6 +327,25 @@ pub struct TsPtsRewriter {
     cached_pat: Option<[u8; TS_PACKET_SIZE]>,
     /// Cached most-recent PMT packets keyed by PMT PID.
     cached_pmts: HashMap<u16, [u8; TS_PACKET_SIZE]>,
+    /// Section reassembly per PMT PID. Every section a packet completes is
+    /// considered — a PMT PID may carry other tables ahead of the PMT
+    /// (ATSC / DigiCipher 0xC0 sections), and a PMT may span packets.
+    pmt_asm: HashMap<u16, SectionAssembler>,
+    /// True once a PMT section has been parsed (roles learned).
+    pmt_learned: bool,
+    /// Source-PCR time (27 MHz) observed since the first PCR while no PMT
+    /// was learned, and the last PCR it was measured from.
+    unlearned_src_27mhz: u64,
+    unlearned_last_pcr: Option<u64>,
+    /// Set when [`ROLES_UNLEARNED_WINDOW_27MHZ`] expired with no PMT: PCR
+    /// passes through with the source clock (so it agrees with the
+    /// untouched PES timestamps) until a PMT is learned, when the anchor
+    /// is re-established on the next PCR with DI=1.
+    clock_passthrough_unlearned: bool,
+    /// One-shot DI=1 owed to the next emitted PCR (clock domain change).
+    pending_di: bool,
+    /// Event sink for `clock_rewrite_pmt_not_learned`: `(sender, input_id)`.
+    event_sink: Option<(crate::manager::events::EventSender, String)>,
     /// Per-PID continuity counter the rewriter has emitted on PSI PIDs
     /// (PAT + every learned PMT PID). The rewriter takes ownership of
     /// CC on these PIDs so PSI_RR injection of cached PAT/PMT bytes
@@ -414,6 +452,13 @@ impl TsPtsRewriter {
             last_cc_on_pcr_pid: HashMap::new(),
             cached_pat: None,
             cached_pmts: HashMap::new(),
+            pmt_asm: HashMap::new(),
+            pmt_learned: false,
+            unlearned_src_27mhz: 0,
+            unlearned_last_pcr: None,
+            clock_passthrough_unlearned: false,
+            pending_di: false,
+            event_sink: None,
             psi_emit_cc: HashMap::new(),
             last_psi_emit_master_27mhz: None,
             scte35_pids: HashSet::new(),
@@ -438,6 +483,17 @@ impl TsPtsRewriter {
         self.pcr_jump_signal = Some(signal);
     }
 
+    /// Wire the manager event sender so the rewriter can report that it
+    /// fell back to the source clock because no PMT could be learned
+    /// (`clock_rewrite_pmt_not_learned`, input-scoped).
+    pub fn set_event_sink(
+        &mut self,
+        sender: crate::manager::events::EventSender,
+        input_id: impl Into<String>,
+    ) {
+        self.event_sink = Some((sender, input_id.into()));
+    }
+
     /// Attach the per-input edge-added A/V skew reporter. The rewriter
     /// reports its lipsync-trim contribution + active state; see the
     /// `av_skew` field doc-comment.
@@ -454,7 +510,9 @@ impl TsPtsRewriter {
         let Some(reporter) = self.av_skew.as_ref() else {
             return;
         };
-        let active = self.anchor.established && !self.mpts_passthrough_latch;
+        let active = self.anchor.established
+            && !self.mpts_passthrough_latch
+            && !self.clock_passthrough_unlearned;
         let trim = self.pacer.lipsync_offset_90k();
         if self.av_skew_last != Some((trim, active)) {
             reporter.set_rewriter(trim, active);
@@ -511,7 +569,17 @@ impl TsPtsRewriter {
             // ahead of this packet. The current packet being PSI itself
             // resets the timer in observe_pat / observe_pmt; non-PSI
             // packets fall through here so the guard can fire.
-            let is_psi = (pid == PAT_PID || self.pmt_pids.contains(&pid)) && ts_pusi(pkt);
+            //
+            // A continuation packet that carries the rest of an in-flight
+            // PMT section counts as PSI too, so an injection never lands
+            // between a section's first packet and the rest of it, and the
+            // rewriter's CC ownership covers the whole section.
+            let on_pmt_pid = self.pmt_pids.contains(&pid);
+            let pmt_continuation = on_pmt_pid
+                && !ts_pusi(pkt)
+                && self.pmt_asm.get(&pid).is_some_and(|a| a.in_flight());
+            let is_psi =
+                ((pid == PAT_PID || on_pmt_pid) && ts_pusi(pkt)) || pmt_continuation;
             if !is_psi {
                 self.maybe_inject_psi_padding(out);
             }
@@ -519,9 +587,12 @@ impl TsPtsRewriter {
             if pid == PAT_PID && ts_pusi(pkt) {
                 self.observe_pat(pkt);
                 self.note_psi_emitted();
-            } else if self.pmt_pids.contains(&pid) && ts_pusi(pkt) {
+            } else if on_pmt_pid {
+                if ts_pusi(pkt) {
+                    self.cache_pmt_packet(pkt);
+                    self.note_psi_emitted();
+                }
                 self.observe_pmt(pkt);
-                self.note_psi_emitted();
             }
 
             // Rewrite PCR if this packet carries one on a learned PCR_PID
@@ -533,12 +604,26 @@ impl TsPtsRewriter {
             if let Some(src_pcr) = extract_pcr(pkt) {
                 // Only rewrite PCRs on learned PCR_PIDs once PMT is
                 // observed. Before PMT, treat every PCR as anchor candidate
-                // (covers initial sync window).
+                // (covers initial sync window) — but never for longer than
+                // the roles-unlearned window: see `note_unlearned_pcr`.
                 let is_pcr_pid =
                     self.pcr_pids.is_empty() || self.pcr_pids.contains(&pid);
-                if is_pcr_pid {
+                if is_pcr_pid && !self.pmt_learned {
+                    self.note_unlearned_pcr(src_pcr);
+                }
+                if is_pcr_pid && self.clock_passthrough_unlearned {
+                    // Source clock through, unchanged apart from the one
+                    // DI=1 that marks the switch away from the master
+                    // timeline.
+                    if std::mem::take(&mut self.pending_di) {
+                        buf.copy_from_slice(pkt);
+                        set_discontinuity_indicator(&mut buf);
+                        rewritten = true;
+                    }
+                } else if is_pcr_pid {
                     buf.copy_from_slice(pkt);
                     let (new_pcr, set_di) = self.rewrite_pcr_value(src_pcr);
+                    let set_di = set_di || std::mem::take(&mut self.pending_di);
                     if write_pcr_field_in_packet(&mut buf, new_pcr).is_some() {
                         rewritten = true;
                         if set_di {
@@ -1064,66 +1149,63 @@ impl TsPtsRewriter {
         for pid in lost {
             self.last_pmt_versions.remove(&pid);
             self.cached_pmts.remove(&pid);
+            self.pmt_asm.remove(&pid);
         }
         self.pmt_pids = new_pmt_pids;
     }
 
-    fn observe_pmt(&mut self, pkt: &[u8]) {
-        // Cache PMT bytes for PSI_RR injection.
-        let pmt_pid_hdr = ts_pid(pkt);
+    /// Cache the latest PUSI packet on a PMT PID for PSI_RR injection.
+    fn cache_pmt_packet(&mut self, pkt: &[u8]) {
         let mut cached = [0u8; TS_PACKET_SIZE];
         cached.copy_from_slice(pkt);
-        self.cached_pmts.insert(pmt_pid_hdr, cached);
+        self.cached_pmts.insert(ts_pid(pkt), cached);
+    }
 
-        let mut sec_off: usize = 4;
-        if ts_has_adaptation(pkt) {
-            let af_len = pkt[4] as usize;
-            sec_off = 5 + af_len;
-        }
-        if sec_off >= TS_PACKET_SIZE {
-            return;
-        }
-        let pointer = pkt[sec_off] as usize;
-        sec_off += 1 + pointer;
-        if sec_off + 12 > TS_PACKET_SIZE {
-            return;
-        }
-        if pkt[sec_off] != 0x02 {
-            return;
-        }
-        let version = (pkt[sec_off + 5] >> 1) & 0x1F;
+    /// Feed one packet on a PMT PID through its section assembler and learn
+    /// PCR PIDs and ES roles from every complete PMT section. Walking every
+    /// section (not just the one at the pointer target) is what finds a
+    /// PMT sitting behind a user-private table on its PID.
+    fn observe_pmt(&mut self, pkt: &[u8]) {
         let pmt_pid = ts_pid(pkt);
-        if self.last_pmt_versions.get(&pmt_pid) == Some(&version) {
+        let sections: Vec<Vec<u8>> = self
+            .pmt_asm
+            .entry(pmt_pid)
+            .or_default()
+            .push_packet(pkt)
+            .filter(|s| s.first() == Some(&0x02) && s.len() >= 16)
+            .map(|s| s.to_vec())
+            .collect();
+        for section in sections {
+            self.learn_pmt_section(pmt_pid, &section);
+        }
+    }
+
+    fn learn_pmt_section(&mut self, pmt_pid: u16, sec: &[u8]) {
+        let version = (sec[5] >> 1) & 0x1F;
+        if self.pmt_learned && self.last_pmt_versions.get(&pmt_pid) == Some(&version) {
             return;
         }
         self.last_pmt_versions.insert(pmt_pid, version);
-
-        let section_length =
-            (((pkt[sec_off + 1] & 0x0F) as usize) << 8) | (pkt[sec_off + 2] as usize);
-        let data_end = (sec_off + 3 + section_length)
-            .min(TS_PACKET_SIZE)
-            .saturating_sub(4);
-        // PCR_PID at bytes sec_off+8..10 (13-bit, top 3 reserved).
-        let pcr_pid = (((pkt[sec_off + 8] & 0x1F) as u16) << 8) | (pkt[sec_off + 9] as u16);
+        let section_length = (((sec[1] & 0x0F) as usize) << 8) | (sec[2] as usize);
+        let data_end = (3 + section_length).min(sec.len()).saturating_sub(4);
+        // PCR_PID at bytes 8..10 (13-bit, top 3 reserved).
+        let pcr_pid = (((sec[8] & 0x1F) as u16) << 8) | (sec[9] as u16);
         if pcr_pid != 0x1FFF {
             self.pcr_pids.insert(pcr_pid);
         }
-        let program_info_length =
-            (((pkt[sec_off + 10] & 0x0F) as usize) << 8) | (pkt[sec_off + 11] as usize);
-        let mut pos = sec_off + 12 + program_info_length;
+        let program_info_length = (((sec[10] & 0x0F) as usize) << 8) | (sec[11] as usize);
+        let mut pos = 12 + program_info_length;
         while pos + 5 <= data_end {
-            let stream_type = pkt[pos];
-            let es_pid = (((pkt[pos + 1] & 0x1F) as u16) << 8) | (pkt[pos + 2] as u16);
-            let es_info_length =
-                (((pkt[pos + 3] & 0x0F) as usize) << 8) | (pkt[pos + 4] as usize);
+            let stream_type = sec[pos];
+            let es_pid = (((sec[pos + 1] & 0x1F) as u16) << 8) | (sec[pos + 2] as u16);
+            let es_info_length = (((sec[pos + 3] & 0x0F) as usize) << 8) | (sec[pos + 4] as usize);
             // ES-info descriptor loop (clamped to the section bounds) —
             // discriminates DVB 0x06 audio (AC-3/E-AC-3/AAC-LATM/DTS by
             // descriptor) from teletext / subtitling on the same
             // stream_type.
             let es_info_end = (pos + 5 + es_info_length).min(data_end);
-            let es_info = &pkt[pos + 5..es_info_end];
-            self.pid_role
-                .insert(es_pid, classify_es(stream_type, es_info));
+            let es_info = &sec[pos + 5..es_info_end];
+            self.pid_role.insert(es_pid, classify_es(stream_type, es_info));
             // SCTE-35 splice-info PID: stream_type 0x86 (per SCTE 35 §6).
             // Track separately so the rewriter can adjust pts_adjustment
             // under muxer mode (otherwise splice events fire at the wrong
@@ -1132,6 +1214,70 @@ impl TsPtsRewriter {
                 self.scte35_pids.insert(es_pid);
             }
             pos += 5 + es_info_length;
+        }
+        if !self.pmt_learned {
+            self.pmt_learned = true;
+            if self.clock_passthrough_unlearned {
+                // Roles known at last: regenerate from here. The anchor
+                // re-establishes on the next PCR, which carries DI=1 for
+                // the switch back onto the master timeline.
+                self.clock_passthrough_unlearned = false;
+                self.anchor = ClockAnchor::default();
+                self.last_emitted_out_pcr_27mhz = None;
+                self.pending_di = true;
+                tracing::info!(
+                    pmt_pid,
+                    "ts_pts_rewriter: PMT learned after the source-clock fallback — \
+                     regenerating PCR / PES timestamps from the next PCR (DI=1)"
+                );
+            }
+        }
+    }
+
+    /// Account source time while PCR is being rewritten without a learned
+    /// PMT, and fall back to the source clock once
+    /// [`ROLES_UNLEARNED_WINDOW_27MHZ`] expires.
+    fn note_unlearned_pcr(&mut self, src_pcr: u64) {
+        if self.clock_passthrough_unlearned {
+            return;
+        }
+        if let Some(prev) = self.unlearned_last_pcr {
+            let delta = (src_pcr + PCR_MODULUS_27MHZ - prev) % PCR_MODULUS_27MHZ;
+            // Forward steps only, each capped at 1 s, so a discontinuity or
+            // a wrap cannot expire the window on its own.
+            if delta < PCR_MODULUS_27MHZ / 2 {
+                self.unlearned_src_27mhz += delta.min(27_000_000);
+            }
+        }
+        self.unlearned_last_pcr = Some(src_pcr);
+        if self.unlearned_src_27mhz < ROLES_UNLEARNED_WINDOW_27MHZ {
+            return;
+        }
+        self.clock_passthrough_unlearned = true;
+        self.pending_di = self.anchor.established;
+        let pmt_pids: Vec<u16> = {
+            let mut v: Vec<u16> = self.pmt_pids.iter().copied().collect();
+            v.sort_unstable();
+            v
+        };
+        let message = format!(
+            "no PMT could be parsed within {} ms of the first PCR — passing the source clock \
+             through (PCR / PTS not regenerated) so PCR and PES timestamps stay consistent",
+            ROLES_UNLEARNED_WINDOW_27MHZ / 27_000
+        );
+        tracing::warn!(?pmt_pids, error_code = "clock_rewrite_pmt_not_learned", "ts_pts_rewriter: {message}");
+        if let Some((sender, input_id)) = self.event_sink.as_ref() {
+            sender.emit_input_with_details(
+                crate::manager::events::EventSeverity::Warning,
+                crate::manager::events::category::FLOW,
+                format!("Input '{input_id}': {message}"),
+                input_id,
+                serde_json::json!({
+                    "error_code": "clock_rewrite_pmt_not_learned",
+                    "pmt_pids": pmt_pids,
+                    "waited_ms": ROLES_UNLEARNED_WINDOW_27MHZ / 27_000,
+                }),
+            );
         }
     }
 }
@@ -1604,6 +1750,92 @@ mod tests {
             MasterClockKind::Wallclock,
         );
         Arc::new(AvSyncPacer::new(handle))
+    }
+
+    /// VH1.ts: the PMT sits behind a 0xC0 section on its PID. The rewriter
+    /// used to give up on the pointer-target table, re-anchor every PCR and
+    /// leave every PES timestamp in the source timeline (−12.6 h PTS−PCR).
+    #[test]
+    fn vh1_pmt_behind_a_private_section_learns_roles() {
+        use crate::engine::ts_test_fixtures::{vh1_pat_packet, vh1_pmt_packet};
+        let mut r = TsPtsRewriter::new(make_wallclock_pacer());
+        let mut out = Vec::new();
+        r.process(&vh1_pat_packet(), &mut out);
+        r.process(&vh1_pmt_packet(), &mut out);
+        assert!(r.pcr_pids.contains(&0x0E0F));
+        assert_eq!(r.pid_role.get(&0x0E0F), Some(&PidRole::Video));
+        assert_eq!(r.pid_role.get(&0x0E10), Some(&PidRole::Audio));
+        assert_eq!(r.pid_role.get(&0x0E11), Some(&PidRole::Sections));
+        assert!(r.scte35_pids.contains(&0x0E11));
+        assert!(r.pmt_learned);
+    }
+
+    /// A PMT spanning two packets is learned too (continuation packets go
+    /// through the assembler), and the rewriter owns the CC on BOTH PMT
+    /// packets rather than leaving the continuation on the source's CC.
+    #[test]
+    fn two_packet_pmt_is_learned_and_cc_owned() {
+        use crate::engine::ts_test_fixtures::{packetize_sections, pat_packet, two_packet_pmt};
+        let (sec, target) = two_packet_pmt(1, 0);
+        let pmt = packetize_sections(0x100, &[&sec], 7);
+        let mut r = TsPtsRewriter::new(make_wallclock_pacer());
+        let mut out = Vec::new();
+        r.process(&pat_packet(&[(1, 0x100)], 0, 0), &mut out);
+        out.clear();
+        // The same unit twice (a looping source repeats its CCs): the
+        // rewriter's own counter must run across both packets of each unit.
+        r.process(&[pmt[0], pmt[1]].concat(), &mut out);
+        r.process(&[pmt[0], pmt[1]].concat(), &mut out);
+        assert_eq!(r.pid_role.get(&target), Some(&PidRole::Audio));
+        assert_eq!(out.len(), 4 * TS_PACKET_SIZE);
+        let ccs: Vec<u8> = out.chunks(TS_PACKET_SIZE).map(|p| p[3] & 0x0F).collect();
+        for w in ccs.windows(2) {
+            assert_eq!((w[0] + 1) & 0x0F, w[1], "continuous PMT CC: {ccs:?}");
+        }
+    }
+
+    /// No PMT learned within 2 s of source PCR time: the rewriter stops
+    /// regenerating PCR (source clock through, DI=1 on the switch) so PCR
+    /// and the untouched PES agree; a PMT learned later brings
+    /// regeneration back with DI=1 on the re-anchoring PCR.
+    #[test]
+    fn unlearned_pmt_falls_back_to_the_source_clock_and_recovers() {
+        let mut r = TsPtsRewriter::new(make_wallclock_pacer());
+        let (tx, mut rx) = crate::manager::events::event_channel();
+        r.set_event_sink(tx, "in-1");
+        let base: u64 = 5_000_000_000;
+        let step = 40 * 27_000; // 40 ms
+        let mut last_out = Vec::new();
+        let mut first_passthrough = None;
+        for i in 0..60u64 {
+            let src = base + i * step;
+            let mut out = Vec::new();
+            r.process(&build_pcr_packet(0x200, src), &mut out);
+            let got = extract_pcr(&out[out.len() - TS_PACKET_SIZE..]).unwrap();
+            if got == src && first_passthrough.is_none() {
+                first_passthrough = Some(i);
+                assert!(
+                    crate::engine::ts_parse::ts_discontinuity_indicator(&out[out.len() - TS_PACKET_SIZE..]),
+                    "DI=1 on the switch to the source clock"
+                );
+            }
+            last_out = out;
+        }
+        let at = first_passthrough.expect("source clock passed through");
+        assert!((50..=52).contains(&at), "after ~2 s of source time, got PCR #{at}");
+        assert_eq!(extract_pcr(&last_out).unwrap(), base + 59 * step);
+        let ev = rx.try_recv().expect("warning emitted");
+        assert_eq!(ev.details.unwrap()["error_code"], "clock_rewrite_pmt_not_learned");
+
+        // PSI arrives late: the next PCR is regenerated again, with DI=1.
+        let mut out = Vec::new();
+        r.process(&build_psi(0x200, 0x201), &mut out);
+        let mut out = Vec::new();
+        let src = base + 60 * step;
+        r.process(&build_pcr_packet(0x200, src), &mut out);
+        let pkt = &out[out.len() - TS_PACKET_SIZE..];
+        assert_ne!(extract_pcr(pkt).unwrap(), src, "regenerated again");
+        assert!(crate::engine::ts_parse::ts_discontinuity_indicator(pkt));
     }
 
     /// PSI passes through unchanged.
