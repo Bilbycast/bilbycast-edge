@@ -592,6 +592,12 @@ pub(super) struct SpliceContinuity {
     /// kind of file, or a byte-rate-paced one.
     ts_last_pcr: Option<(u64, u64, u16)>,
 
+    /// The previous TS file's last output PCR on every *other* PCR PID — the
+    /// other programs of an MPTS played whole. Their fillers across the
+    /// splice ride the anchor's (see `ts_loop_carry`); without them each
+    /// such program went the whole splice gap with no PCR at all.
+    ts_last_other_pcrs: Vec<(u16, u64)>,
+
     /// The previous TS file's last emitted video DTS (output domain, 90 kHz)
     /// and its DTS step. The next TS file raises its target PTS so its
     /// first kept video DTS lands past it (defect 7b: the next loop's first
@@ -717,6 +723,7 @@ impl SpliceContinuity {
         last_deadline_ns: u64,
     ) {
         self.ts_last_pcr = None;
+        self.ts_last_other_pcrs.clear();
         self.last_video_dts = None;
         self.last_scheduled_deadline_ns = last_deadline_ns;
         self.last_emitted_output_pts_90k = last_pts_90k;
@@ -737,10 +744,14 @@ impl SpliceContinuity {
         last_pts_90k: u64,
         last_pcr: Option<(u64, u64, u16)>,
         last_video_dts: Option<(u64, u64)>,
+        last_other_pcrs: Vec<(u16, u64)>,
     ) {
         self.close_file(last_pts_90k);
         self.ts_last_pcr = last_pcr;
         self.last_video_dts = last_video_dts;
+        if last_pcr.is_some() {
+            self.ts_last_other_pcrs = last_other_pcrs;
+        }
     }
 
     /// Update [`Self::last_layout`]; if it changed, bump `pmt_version`.
@@ -1539,6 +1550,7 @@ async fn play_ts_file(
     // The TS carry from a previous TS file (3d), and this file's last
     // anchor PCR deadline for the next one.
     let carried = session.cont.ts_last_pcr;
+    let carried_others = session.cont.ts_last_other_pcrs.clone();
 
     'packets: loop {
         if session.cancel.is_cancelled() {
@@ -1644,8 +1656,8 @@ async fn play_ts_file(
                 }
                 Some(pcr) => {
                     // The file's first anchor PCR: fix the splice offset.
-                    splice.splice_offset_27m =
-                        Some((target_pts_90k as i128 * 300 - pcr as i128) as i64);
+                    let splice_offset = (target_pts_90k as i128 * 300 - pcr as i128) as i64;
+                    splice.splice_offset_27m = Some(splice_offset);
                     // 3d: continue the previous TS file's wall timeline.
                     if pcr_deadlines_enabled
                         && let Some((deadline, out_pcr, pid)) = carried
@@ -1663,21 +1675,41 @@ async fn play_ts_file(
                                 );
                             }
                             pacer_epoch_ns = Some(epoch);
+                            // Every other program's PCR PID (an MPTS played
+                            // whole) gets fillers across the same gap, on its
+                            // own clock (see `splice_fillers`); without them
+                            // 770_H program 4030 went the whole splice with
+                            // no PCR.
+                            let gap_ns = epoch.saturating_sub(deadline);
+                            let others: Vec<(u16, u64, u64)> = carried_others
+                                .iter()
+                                .filter_map(|(p, last)| {
+                                    let raw = head_info.first_pcrs.iter().find(|(q, _)| q == p)?.1;
+                                    let first = (raw as i128 + splice_offset as i128)
+                                        .rem_euclid(crate::engine::ts_parse::PCR_MODULUS_27MHZ as i128)
+                                        as u64;
+                                    Some((*p, *last, first))
+                                })
+                                .collect();
                             // PCRs across the gap (TR 101 290 PCR_RR),
-                            // already in output values: CC only. Each goes
-                            // out as a full 1316-byte datagram — the PCR
-                            // then six null packets — because the UDP / RTP
-                            // / SRT outputs re-chunk to 7 packets per
-                            // datagram and would hold a lone 188-byte packet
-                            // until the next file's data arrived (the loop
-                            // diag saw every filler bunched 62 ms late).
-                            for (v, at) in fillers {
-                                let mut p =
-                                    crate::engine::ts_parse::pcr_only_packet(pid, 0, v, false);
-                                rewrite_cc(&mut p, session.cont);
+                            // already in output values: CC only. Each group
+                            // goes out as full 1316-byte datagrams — the PCRs
+                            // then null packets — because the UDP / RTP / SRT
+                            // outputs re-chunk to 7 packets per datagram and
+                            // would hold a lone 188-byte packet until the next
+                            // file's data arrived (the loop diag saw every
+                            // filler bunched 62 ms late).
+                            for (at, pcrs) in
+                                splice_fillers(pid, &fillers, deadline, gap_ns, &others, now)
+                            {
                                 let mut data = BytesMut::with_capacity(7 * TS_PACKET);
-                                data.extend_from_slice(&p);
-                                for _ in 0..6 {
+                                for (fpid, v) in pcrs {
+                                    let mut p =
+                                        crate::engine::ts_parse::pcr_only_packet(fpid, 0, v, false);
+                                    rewrite_cc(&mut p, session.cont);
+                                    data.extend_from_slice(&p);
+                                }
+                                while !data.len().is_multiple_of(7 * TS_PACKET) {
                                     data.extend_from_slice(&TS_NULL_PACKET);
                                 }
                                 let data = data.freeze();
@@ -1926,7 +1958,7 @@ async fn play_ts_file(
     let video_carry = splice
         .max_video_dts_90k
         .map(|d| (d, splice.video_dts_step_90k.unwrap_or(3_600)));
-    session.cont.close_ts_file(anchor_pts, ts_carry, video_carry);
+    session.cont.close_ts_file(anchor_pts, ts_carry, video_carry, std::mem::take(&mut splice.other_pcrs));
     Ok(())
 }
 
@@ -1964,11 +1996,19 @@ struct TsFileSplice {
     /// rewriter's 500 ms threshold, and the wire pacer falls behind at
     /// ~1000 ppm.
     max_emitted_pcr_90k: u64,
-    /// Audio PIDs from the program's PMT (the PMT PID comes from the
-    /// PAT's first program), rebuilt on every PMT so version bumps that
-    /// add / remove tracks are tracked.
-    pat_first_pmt_pid: Option<u16>,
+    /// Audio PIDs of the anchor PCR's program — the PMT whose PCR_PID is
+    /// the anchor PID; the PAT's first program until that PMT is seen —
+    /// rebuilt on every such PMT so version bumps that add / remove tracks
+    /// are tracked. On an MPTS played whole the PAT's first program is not
+    /// necessarily the anchor's: 770_H's first program (4010) runs 1.2 s
+    /// ahead of the anchor PCR's (4070), and its audio high-water mark put
+    /// every loop's target 1.27 s out — a 1.27 s gap in every program.
+    pat_pmt_pids: Vec<u16>,
+    audio_from_anchor: bool,
     audio_pids: HashSet<u16>,
+    /// Last output PCR of every PCR PID but the anchor — carried to the
+    /// next file for its filler PCRs.
+    other_pcrs: Vec<(u16, u64)>,
     gate: VideoRapGate,
     /// Highest emitted video DTS (output domain) and the last DTS step —
     /// the next file's video term (7b).
@@ -1989,8 +2029,10 @@ impl TsFileSplice {
             max_emitted_pts_90k: target_pts_90k,
             max_emitted_audio_pts_90k: None,
             max_emitted_pcr_90k: target_pts_90k,
-            pat_first_pmt_pid: None,
+            pat_pmt_pids: Vec::new(),
+            audio_from_anchor: false,
             audio_pids: HashSet::with_capacity(4),
+            other_pcrs: Vec::new(),
             gate: VideoRapGate::new(video),
             max_video_dts_90k: None,
             video_dts_step_90k: None,
@@ -2003,7 +2045,7 @@ impl TsFileSplice {
     /// Run one packet through the splice path, appending what goes out.
     fn push(
         &mut self,
-        mut packet: [u8; TS_PACKET],
+        packet: [u8; TS_PACKET],
         anchor_pcr_pid: Option<u16>,
         cont: &mut SpliceContinuity,
         out: &mut Vec<[u8; TS_PACKET]>,
@@ -2014,25 +2056,43 @@ impl TsFileSplice {
         let pkt_pusi = (packet[1] & 0x40) != 0;
         if pkt_pid == 0x0000 && pkt_pusi {
             let programs = crate::engine::ts_parse::parse_pat_programs(&packet);
-            if let Some((_, pmt_pid)) = programs.first() {
-                self.pat_first_pmt_pid = Some(*pmt_pid);
+            if !programs.is_empty() {
+                self.pat_pmt_pids = programs.iter().map(|(_, p)| *p).collect();
             }
-        } else if let Some(pmt_pid) = self.pat_first_pmt_pid
-            && pkt_pid == pmt_pid
-            && pkt_pusi
-        {
-            refresh_audio_pids_from_pmt(&packet, &mut self.audio_pids);
+        } else if pkt_pusi && self.pat_pmt_pids.contains(&pkt_pid) {
+            let anchors = anchor_pcr_pid.is_some() && pmt_pcr_pid(&packet) == anchor_pcr_pid;
+            let first = self.pat_pmt_pids.first() == Some(&pkt_pid);
+            if anchors && !self.audio_from_anchor {
+                // The first program's audio no longer counts.
+                self.audio_from_anchor = true;
+                self.max_emitted_audio_pts_90k = None;
+            }
+            if anchors || (first && !self.audio_from_anchor) {
+                refresh_audio_pids_from_pmt(&packet, &mut self.audio_pids);
+            }
             // The head did not show the video ES: gate it from here only if
             // none of it has gone out yet — gating a GOP already under way
-            // would drop pictures and fix nothing.
-            if let Some((vpid, st)) = pmt_video_es(&packet)
+            // would drop pictures and fix nothing. Only the anchor's
+            // program's video (the only one on an SPTS).
+            if (anchors || self.pat_pmt_pids.len() == 1)
+                && let Some((vpid, st)) = pmt_video_es(&packet)
                 && !self.seen_pids[(vpid & 0x1FFF) as usize]
             {
                 self.gate.set_video(vpid, st);
             }
         }
         self.seen_pids[(pkt_pid & 0x1FFF) as usize] = true;
+        self.push_gated(packet, anchor_pcr_pid, cont, out);
+    }
 
+    /// The gate and everything after it (see [`Self::push`]).
+    fn push_gated(
+        &mut self,
+        mut packet: [u8; TS_PACKET],
+        anchor_pcr_pid: Option<u16>,
+        cont: &mut SpliceContinuity,
+        out: &mut Vec<[u8; TS_PACKET]>,
+    ) {
         let mut gated = std::mem::take(&mut self.gated);
         gated.clear();
         self.gate.feed(packet, &mut gated);
@@ -2046,12 +2106,17 @@ impl TsFileSplice {
                 // MPTS guard: only track the PCR high-water mark on the
                 // anchor PCR PID — other programs' clocks are not
                 // comparable.
-                if anchor_pcr_pid == Some(pid)
-                    && let Some(out_pcr_27m) = extract_pcr_27mhz(&packet)
-                {
-                    let out_pcr_90k = (out_pcr_27m / 300) & 0x1_FFFF_FFFF;
-                    if out_pcr_90k > self.max_emitted_pcr_90k {
-                        self.max_emitted_pcr_90k = out_pcr_90k;
+                if let Some(out_pcr_27m) = extract_pcr_27mhz(&packet) {
+                    if anchor_pcr_pid == Some(pid) {
+                        let out_pcr_90k = (out_pcr_27m / 300) & 0x1_FFFF_FFFF;
+                        if out_pcr_90k > self.max_emitted_pcr_90k {
+                            self.max_emitted_pcr_90k = out_pcr_90k;
+                        }
+                    } else {
+                        match self.other_pcrs.iter_mut().find(|(p, _)| *p == pid) {
+                            Some(e) => e.1 = out_pcr_27m,
+                            None => self.other_pcrs.push((pid, out_pcr_27m)),
+                        }
                     }
                 }
                 let off_90k = off_27m / 300;
@@ -2090,6 +2155,14 @@ impl TsFileSplice {
         }
         self.gated = gated;
     }
+}
+
+/// The PCR_PID of the PMT starting in `pkt`.
+fn pmt_pcr_pid(pkt: &[u8; TS_PACKET]) -> Option<u16> {
+    let off = crate::engine::ts_parse::pmt_section_offset(pkt, None)?;
+    let section_length = (((pkt[off + 1] & 0x0F) as usize) << 8) | pkt[off + 2] as usize;
+    let end = (off + 3 + section_length).min(TS_PACKET);
+    crate::engine::ts_pmt_edit::parse_pmt(&pkt[off..end]).map(|v| v.pcr_pid)
 }
 
 /// The first MPEG-1 / 2, H.264 or HEVC ES of the PMT starting in `pkt`.
@@ -2394,19 +2467,26 @@ impl VideoRapGate {
     }
 }
 
-/// What the file head says before streaming starts: the video ES, the
-/// first PCR (the anchor-PID rule: the first PCR-bearing packet) and the
-/// DTS of the random-access point the gate will open on.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+/// What the file head says before streaming starts: the video ES of the
+/// anchor PCR's program, the first PCR (the anchor-PID rule: the first
+/// PCR-bearing packet), the DTS of the random-access point the gate will
+/// open on, and the first PCR of every PCR PID (an MPTS played whole: the
+/// other programs' filler PCRs across a splice stop short of them).
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub(super) struct TsHeadInfo {
     pub(super) video: Option<(u16, u8)>,
     pub(super) first_pcr: Option<(u16, u64)>,
     pub(super) first_rap_dts_90k: Option<u64>,
+    pub(super) first_pcrs: Vec<(u16, u64)>,
 }
 
 /// Scan the (program-filtered) head for [`TsHeadInfo`]. Two passes: the
-/// PMT first, then the gate from byte 0, so it judges the same PES the
-/// in-stream gate will.
+/// PMTs first, then the gate from byte 0, so it judges the same PES the
+/// in-stream gate will. The video is the anchor PCR's program's — the PMT
+/// whose PCR_PID carries the first PCR — else the PAT's first program's:
+/// on an MPTS played whole those differ (770_H: 4010 first, 4070 anchor),
+/// and a video term taken from another program's DTS against the anchor's
+/// PCR is off by the programs' clock skew.
 pub(super) fn scan_ts_head(head: &[u8], stride: usize, program: Option<u16>) -> TsHeadInfo {
     let packets = || {
         let mut filter = program.map(super::ts_program_filter::TsProgramFilter::new);
@@ -2435,32 +2515,54 @@ pub(super) fn scan_ts_head(head: &[u8], stride: usize, program: Option<u16>) -> 
         })
     };
     let mut info = TsHeadInfo::default();
-    let mut pmt_pid = None;
-    let mut asm = crate::engine::ts_parse::SectionAssembler::new();
+    let mut pmt_pids: Vec<u16> = Vec::new();
+    let mut asms: Vec<(u16, crate::engine::ts_parse::SectionAssembler)> = Vec::new();
+    // (PMT PID, PCR_PID, video ES) of each program whose PMT parsed.
+    let mut programs: Vec<(u16, u16, Option<(u16, u8)>)> = Vec::new();
     for pkt in packets() {
         let pid = ((pkt[1] as u16 & 0x1F) << 8) | pkt[2] as u16;
-        if info.first_pcr.is_none()
-            && let Some(pcr) = crate::engine::ts_parse::extract_pcr(&pkt)
-        {
-            info.first_pcr = Some((pid, pcr));
+        if let Some(pcr) = crate::engine::ts_parse::extract_pcr(&pkt) {
+            if info.first_pcr.is_none() {
+                info.first_pcr = Some((pid, pcr));
+            }
+            if !info.first_pcrs.iter().any(|(p, _)| *p == pid) {
+                info.first_pcrs.push((pid, pcr));
+            }
         }
         if pid == 0 && pkt[1] & 0x40 != 0 {
-            if let Some((_, p)) = crate::engine::ts_parse::parse_pat_programs(&pkt).first() {
-                pmt_pid = Some(*p);
+            if pmt_pids.is_empty() {
+                pmt_pids = crate::engine::ts_parse::parse_pat_programs(&pkt)
+                    .iter()
+                    .map(|(_, p)| *p)
+                    .collect();
+                asms = pmt_pids
+                    .iter()
+                    .map(|p| (*p, crate::engine::ts_parse::SectionAssembler::new()))
+                    .collect();
             }
-        } else if Some(pid) == pmt_pid && info.video.is_none() {
+        } else if let Some((_, asm)) = asms.iter_mut().find(|(p, _)| *p == pid)
+            && !programs.iter().any(|(p, _, _)| *p == pid)
+        {
             for sec in asm.push_packet(&pkt) {
-                if let Some(v) = crate::engine::ts_pmt_edit::parse_pmt(sec)
-                    && let Some(es) = v.es.iter().find(|e| rap_gated_stream_type(e.stream_type))
-                {
-                    info.video = Some((es.pid, es.stream_type));
+                if let Some(v) = crate::engine::ts_pmt_edit::parse_pmt(sec) {
+                    let video = v
+                        .es
+                        .iter()
+                        .find(|e| rap_gated_stream_type(e.stream_type))
+                        .map(|e| (e.pid, e.stream_type));
+                    programs.push((pid, v.pcr_pid, video));
                 }
             }
         }
-        if info.video.is_some() && info.first_pcr.is_some() {
-            break;
-        }
     }
+    info.video = info
+        .first_pcr
+        .and_then(|(anchor, _)| programs.iter().find(|(_, pcr, _)| *pcr == anchor))
+        .or_else(|| {
+            let first = pmt_pids.first()?;
+            programs.iter().find(|(p, _, _)| p == first)
+        })
+        .and_then(|(_, _, video)| *video);
     if info.video.is_some() {
         let mut gate = VideoRapGate::new(info.video);
         gate.log = false;
@@ -2486,7 +2588,13 @@ pub(super) fn scan_ts_head(head: &[u8], stride: usize, program: Option<u16>) -> 
 /// output PCR. Returns `None` (cold start) when the gap is not a forward
 /// step under 2 s, else `(epoch_ns, fillers)`: `epoch_ns` is clamped to
 /// `now_ns` (a slow file open), and every filler is `(output PCR, deadline)`
-/// interpolated at most 35 ms apart, those already past dropped.
+/// interpolated at most 35 ms apart. Fillers already due go out at `now_ns`
+/// rather than not at all — every one of them when the open overran the
+/// whole gap: the previous file's pacer drains its queue before the next
+/// file opens, and the data after its last PCR usually outlasts the first
+/// slot. Skipped, a due slot left a ~53 ms PCR step at every loop, and an
+/// overrun the whole gap (TR 101 290 PCR_RR is 40 ms); sent together they
+/// keep the PCR values continuous, early on the wall by what the open cost.
 pub(super) fn ts_loop_carry(
     carried_deadline_ns: u64,
     carried_out_pcr_27m: u64,
@@ -2500,23 +2608,66 @@ pub(super) fn ts_loop_carry(
     }
     let gap = gap as u64;
     let to_ns = |t27: u64| t27 * 1_000 / 27;
-    let epoch = carried_deadline_ns.saturating_add(to_ns(gap));
-    if epoch <= now_ns {
-        return Some((now_ns, Vec::new()));
-    }
+    let epoch = carried_deadline_ns.saturating_add(to_ns(gap)).max(now_ns);
     let steps = gap.div_ceil(SPACING_27M);
     let mut fillers = Vec::new();
     for k in 1..steps {
         let dv = gap * k / steps;
         let deadline = carried_deadline_ns + to_ns(dv);
-        if deadline > now_ns {
-            fillers.push((
-                (carried_out_pcr_27m + dv) % crate::engine::ts_parse::PCR_MODULUS_27MHZ,
-                deadline,
-            ));
-        }
+        fillers.push((
+            (carried_out_pcr_27m + dv) % crate::engine::ts_parse::PCR_MODULUS_27MHZ,
+            deadline.max(now_ns),
+        ));
     }
     Some((epoch, fillers))
+}
+
+/// 3d on an MPTS played whole: the filler PCRs of every PCR PID across a
+/// splice, grouped by pacing deadline in deadline order.
+///
+/// `anchor_fillers` are [`ts_loop_carry`]'s `(output PCR, deadline)` for the
+/// anchor PID; the anchor's gap runs `gap_ns` of wall time from
+/// `deadline_ns`, its last PCR's. Each other PCR PID `(pid, last output PCR,
+/// first output PCR in the next file)` gets its own gap cut into equal steps
+/// of at most 35 ms, spread over the same wall time. The splice offset is one
+/// flat shift, so every program keeps its clock's relation to the anchor's;
+/// a program whose own gap differs from the anchor's by the file's structure
+/// (770_H program 4030: +29 ms) has it spread over the gap rather than left
+/// as one step past TR 101 290's 40 ms. A program that steps back, or more
+/// than 2 s forward, gets none. Fillers already due go out at `now_ns`, like
+/// the anchor's.
+pub(super) fn splice_fillers(
+    anchor_pid: u16,
+    anchor_fillers: &[(u64, u64)],
+    deadline_ns: u64,
+    gap_ns: u64,
+    others: &[(u16, u64, u64)],
+    now_ns: u64,
+) -> Vec<(u64, Vec<(u16, u64)>)> {
+    const SPACING_27M: i64 = 35 * 27_000;
+    let mut all: Vec<(u64, u16, u64)> =
+        anchor_fillers.iter().map(|(v, at)| (*at, anchor_pid, *v)).collect();
+    for (pid, last, first) in others {
+        let gap = crate::engine::ts_parse::pcr_diff_27mhz(*first, *last);
+        if gap <= 0 || gap > 2 * 27_000_000 {
+            continue;
+        }
+        let n = (gap as u64).div_ceil(SPACING_27M as u64);
+        for j in 1..n {
+            let v = (*last + gap as u64 * j / n) % crate::engine::ts_parse::PCR_MODULUS_27MHZ;
+            let at = deadline_ns + (gap_ns as u128 * j as u128 / n as u128) as u64;
+            all.push((at.max(now_ns), *pid, v));
+        }
+    }
+    all.sort_by_key(|(at, pid, _)| (*at, *pid != anchor_pid));
+    let mut out: Vec<(u64, Vec<(u16, u64)>)> = Vec::new();
+    for (at, pid, v) in all {
+        match out.last_mut() {
+            Some((t, g)) if *t == at => g.push((pid, v)),
+            _ => out.push((at, vec![(pid, v)])),
+        }
+    }
+    out
 }
 
 /// Walk a PMT TS packet's program-element loop, returning the set of
@@ -5102,13 +5253,18 @@ mod tests {
         assert_eq!(fillers.len(), 2, "87 ms in three ≤ 35 ms steps");
         assert_eq!(fillers[0], (out_pcr + 29 * MS, dl + 29_000_000));
         assert_eq!(fillers[1], (out_pcr + 58 * MS, dl + 58_000_000));
-        // Fillers already in the past are skipped.
+        // Fillers already due go out now (skipped, they left a PCR step
+        // past 40 ms at every loop).
         let (_, late) = ts_loop_carry(dl, out_pcr, out_pcr + 87 * MS, dl + 40_000_000).unwrap();
-        assert_eq!(late, vec![(out_pcr + 58 * MS, dl + 58_000_000)]);
-        // A file open that overran the gap starts now, without fillers.
         assert_eq!(
-            ts_loop_carry(dl, out_pcr, out_pcr + 87 * MS, dl + 100_000_000),
-            Some((dl + 100_000_000, vec![]))
+            late,
+            vec![(out_pcr + 29 * MS, dl + 40_000_000), (out_pcr + 58 * MS, dl + 58_000_000)]
+        );
+        // A file open that overran the gap starts now, every filler with it.
+        let now = dl + 100_000_000;
+        assert_eq!(
+            ts_loop_carry(dl, out_pcr, out_pcr + 87 * MS, now),
+            Some((now, vec![(out_pcr + 29 * MS, now), (out_pcr + 58 * MS, now)]))
         );
         // No carry: cold start, a backward step, a gap over 2 s.
         assert_eq!(ts_loop_carry(0, out_pcr, out_pcr + MS, dl), None);
@@ -5201,13 +5357,16 @@ mod tests {
         let mut pcrs = Vec::new(); // (pcr, wall_us)
         let mut filler_bundles = 0;
         for (_, b) in &got {
-            // A filler datagram: one AF-only PCR then six null packets.
+            // A filler datagram: AF-only PCRs (one; more when slots already
+            // due go out together) padded with null packets to a multiple of
+            // seven packets.
             let pids: Vec<u16> = b
                 .chunks(TS_PACKET)
                 .map(|p| ((p[1] as u16 & 0x1F) << 8) | p[2] as u16)
                 .collect();
-            if pids.len() == 7 && pids[0] == 0x100 && pids[1..].iter().all(|p| *p == 0x1FFF) {
-                filler_bundles += 1;
+            let pcrs = pids.iter().take_while(|p| **p == 0x100).count();
+            if pids.len().is_multiple_of(7) && pcrs > 0 && pids[pcrs..].iter().all(|p| *p == 0x1FFF) {
+                filler_bundles += pcrs;
             }
         }
         for (at, b) in &got {
@@ -5263,20 +5422,191 @@ mod tests {
         let wall_ms = (later_wall as i64 - last1_wall as i64) / 1_000;
         assert!((wall_ms - pcr_ms).abs() < 60, "{wall_ms} ms of wall for {pcr_ms} ms of PCR");
         // Filler PCRs cover the gap, each sent at its own deadline: on the
-        // wall clock they advance exactly as their values do. (Slots already
-        // past when the file reopened are skipped.)
+        // wall clock they advance exactly as their values do. (A slot already
+        // past when the file reopened goes out at once — only the first one
+        // can be, so its step is not measured.)
         let fillers: Vec<(u64, u64)> =
             splice.iter().copied().filter(|(v, _)| *v < first2_expected).collect();
         assert!(fillers.len() >= 5, "PCRs across the {pcr_gap_ms} ms gap: {}", fillers.len());
-        assert_eq!(filler_bundles, fillers.len(), "each filler fills a 1316-byte datagram");
+        assert_eq!(filler_bundles, fillers.len(), "fillers go out in full 1316-byte datagrams");
         // (The pacer's floor spaces a message by half its own content
         // period — 26 ms for a 1316-byte datagram at this fixture's
         // ~200 kbps — so allow that much on each step.)
+        assert!(fillers[0].0 - last1 <= 35 * 27_000, "no slot skipped");
+        // Slots already due went out together at the reopen; from the first
+        // one sent on its own schedule, the wall follows the values.
+        let on_time = fillers
+            .windows(2)
+            .position(|w| w[1].1 > w[0].1)
+            .map_or(fillers.len(), |i| i + 1);
         for w in fillers.windows(2) {
+            assert!(w[1].0 - w[0].0 <= 35 * 27_000 && w[1].1 >= w[0].1);
+        }
+        for w in fillers[on_time.min(fillers.len())..].windows(2) {
             let dv = (w[1].0 - w[0].0) as i64 / 27;
             let dw = (w[1].1 - w[0].1) as i64;
             assert!((dv - dw).abs() < 10_000, "filler step {dw} us on the wall for {dv} us of PCR");
-            assert!(w[1].0 - w[0].0 <= 35 * 27_000);
+        }
+    }
+
+    /// An MPTS whose first PAT program (1, PCR 0x100) runs 1.2 s ahead of the
+    /// program whose PCR comes first in the file (2, PCR 0x200 — the
+    /// anchor): 1 s of both, PCR every 20 ms, audio every 20 ms, video every
+    /// 40 ms (100 ms lead, the first frame an SPS / IDR).
+    fn mpts_fixture() -> Vec<u8> {
+        use crate::engine::ts_test_fixtures::{packetize_sections, pat_packet, pes_start_packet, pmt_section};
+        const T0: u64 = 10_000; // ms
+        let mut ev: Vec<(u64, u8, [u8; TS_PACKET])> = Vec::new();
+        ev.push((0, 0, pat_packet(&[(1, 0x1000), (2, 0x1100)], 0, 0)));
+        for (prog, pmt, v, a) in [(1u16, 0x1000u16, 0x100u16, 0x101u16), (2, 0x1100, 0x200, 0x201)] {
+            let sec = pmt_section(prog, 0, v, &[], &[(0x1B, v, &[]), (0x0F, a, &[])]);
+            ev.push((0, 1, packetize_sections(pmt, &[&sec], 0)[0]));
+        }
+        // Program 2 first on every tick: its PCR is the file's first.
+        for (skew, v, a, o) in [(0u64, 0x200u16, 0x201u16, 0u8), (1_200, 0x100, 0x101, 4)] {
+            for k in 0..50u64 {
+                let t = k * 20;
+                let c = T0 + skew + t;
+                ev.push((t, 2 + o, crate::engine::ts_parse::pcr_only_packet(v, 0, c * 27_000, false)));
+                ev.push((t, 3 + o, pes_start_packet(a, 0, 0xC0, (c + 50) * 90, None)));
+            }
+            for k in 0..25u64 {
+                let t = k * 40;
+                let d = (T0 + skew + t + 100) * 90;
+                let es = if k == 0 { SPS } else { P_SLICE };
+                ev.push((t, 4 + o, video_pes(v, 0, d, Some(d), es)));
+            }
+        }
+        ev.sort_by_key(|(t, o, _)| (*t, *o));
+        ev.iter().flat_map(|(_, _, p)| p.iter().copied()).collect()
+    }
+
+    /// The head scan takes the video of the program whose PCR comes first
+    /// (the anchor's), not the PAT's first program's, and records every PCR
+    /// PID's first PCR.
+    #[test]
+    fn the_head_scan_takes_the_anchor_programs_video() {
+        let info = scan_ts_head(&mpts_fixture(), TS_PACKET, None);
+        assert_eq!(info.first_pcr.map(|(p, _)| p), Some(0x200));
+        assert_eq!(info.video, Some((0x200, 0x1B)));
+        assert_eq!(
+            info.first_pcrs,
+            vec![(0x200, 10_000 * 27_000), (0x100, 11_200 * 27_000)]
+        );
+    }
+
+    /// Every other PCR PID's gap is cut into equal steps of at most 35 ms
+    /// over the anchor's wall gap — its own gap 29 ms longer than the
+    /// anchor's included — and stops short of its first PCR in the next
+    /// file; a program that steps back gets none.
+    #[test]
+    fn splice_fillers_spread_every_programs_gap() {
+        let ms = 27_000u64;
+        let (deadline, now) = (1_000_000_000u64, 1_000_000_000u64);
+        let (epoch, anchor) = ts_loop_carry(deadline, 5_000 * ms, 5_300 * ms, now).unwrap();
+        let gap_ns = epoch - deadline;
+        let others = [(0x100u16, 9_000 * ms, 9_329 * ms), (0x300, 7_000 * ms, 6_990 * ms)];
+        let groups = splice_fillers(0x200, &anchor, deadline, gap_ns, &others, now);
+        assert!(groups.windows(2).all(|w| w[0].0 < w[1].0), "deadline order");
+        assert!(groups.iter().all(|(at, _)| *at > deadline && *at < epoch));
+        let of = |pid: u16| -> Vec<u64> {
+            groups.iter().flat_map(|(_, g)| g.iter().filter(|(p, _)| *p == pid).map(|(_, v)| *v)).collect()
+        };
+        assert_eq!(of(0x200), anchor.iter().map(|(v, _)| *v).collect::<Vec<_>>());
+        let p = of(0x100);
+        let mut chain = vec![9_000 * ms];
+        chain.extend(&p);
+        chain.push(9_329 * ms);
+        assert!(chain.windows(2).all(|w| w[1] > w[0] && w[1] - w[0] <= 35 * ms), "{p:?}");
+        assert!(of(0x300).is_empty(), "a step back gets no fillers");
+    }
+
+    /// An MPTS played whole, looped (the shape of the 770_H rig source). The
+    /// splice anchor follows the anchor PCR's program: its audio and video,
+    /// not the 1.2 s-ahead audio of the PAT's first program, which put the
+    /// next loop 1.2 s out in every program. And every program's PCR keeps
+    /// stepping by at most 40 ms across the splice — the anchor's through
+    /// its fillers, program 1's through its own.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn looping_an_mpts_keeps_every_programs_pcr_within_40_ms() {
+        use crate::engine::ts_parse::extract_pcr;
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("loop-mpts.ts");
+        std::fs::File::create(&path).unwrap().write_all(&mpts_fixture()).unwrap();
+        pacer_trace::watch("media-pacer-loop-mpts.ts");
+        let (tx, _rx) = broadcast::channel::<RtpPacket>(4096);
+        let stats = std::sync::Arc::new(FlowStatsAccumulator::new(
+            "f".into(),
+            "f".into(),
+            "media_player".into(),
+        ));
+        let cancel = CancellationToken::new();
+        let mut seq_num: u16 = 0;
+        let mut cont = SpliceContinuity::default();
+        let mut transcoder: Option<crate::engine::input_transcode::InputTranscoder> = None;
+        let (events, _events_rx) = crate::manager::events::event_channel();
+        let media_stats = std::sync::Arc::new(MediaPlayerStats::default());
+        let mut demux_cache = DemuxCacheField::default();
+        for _ in 0..2 {
+            cont.open_file("loop-mpts.ts");
+            let mut session = PlayerSession {
+                seq_num: &mut seq_num,
+                per_input_tx: &tx,
+                stats: &stats,
+                cancel: &cancel,
+                cont: &mut cont,
+                transcoder: &mut transcoder,
+                pid_overrides: None,
+                post: &mut None,
+                bundle_size: BUNDLE_SIZE,
+                pcr_deadlines: true,
+                media_stats: &media_stats,
+                events: &events,
+                flow_id: "f",
+                input_id: "i",
+                demux_cache: &mut demux_cache,
+            };
+            play_ts_file(&path, None, None, &mut session).await.unwrap();
+        }
+        drop(tx);
+        let got = pacer_trace::take("media-pacer-loop-mpts.ts");
+        let mut pcrs: std::collections::BTreeMap<u16, Vec<u64>> = Default::default();
+        // The file's own anchor PCRs, fillers left out (a filler datagram
+        // holds nothing but adaptation-field-only PCRs and null packets).
+        let mut file_anchor = Vec::new();
+        for (_, b) in &got {
+            let filler = b.chunks(TS_PACKET).all(|p| {
+                let pid = ((p[1] as u16 & 0x1F) << 8) | p[2] as u16;
+                pid == 0x1FFF || (p[3] & 0x30 == 0x20 && extract_pcr(p).is_some())
+            });
+            for p in b.chunks(TS_PACKET) {
+                let pid = ((p[1] as u16 & 0x1F) << 8) | p[2] as u16;
+                if let Some(v) = extract_pcr(p) {
+                    pcrs.entry(pid).or_default().push(v);
+                    if pid == 0x200 && !filler {
+                        file_anchor.push(v);
+                    }
+                }
+            }
+        }
+        let anchor = &pcrs[&0x200];
+        let other = &pcrs[&0x100];
+        assert!(anchor.len() >= 100 && other.len() >= 100, "{} / {}", anchor.len(), other.len());
+        // Loop 1 ends at anchor PCR 980 ms; the anchor program's audio ends
+        // at 1030 ms and its video (DTS 1060 ms, lead 100 ms) asks for 1000:
+        // loop 2 starts at 1060 ms — not past program 1's audio, 1.2 s ahead.
+        let first2 = *file_anchor.iter().find(|v| **v > 980 * 27_000).unwrap();
+        assert_eq!(first2, 1_060 * 27_000, "loop 2 starts {} ms in", first2 / 27_000);
+        let step: u64 = anchor.windows(2).map(|w| w[1] - w[0]).max().unwrap();
+        assert!(step <= 35 * 27_000, "anchor steps within 35 ms (max {} ms)", step / 27_000);
+        for w in other.windows(2) {
+            assert!(
+                w[1] > w[0] && w[1] - w[0] <= 40 * 27_000,
+                "program 1 PCR {} -> {} ms",
+                w[0] / 27_000,
+                w[1] / 27_000
+            );
         }
     }
 }
