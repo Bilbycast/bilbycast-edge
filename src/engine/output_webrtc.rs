@@ -83,9 +83,14 @@ enum WebrtcVideoEncoderState {
     /// `video_encode` unset. Passthrough H.264, drop HEVC (pre-Phase 4d).
     Disabled,
     /// `video_encode` set; decoder+encoder will be built on the first
-    /// source access unit.
+    /// source access unit that can open them — for H.264, the first that
+    /// carries the SPS (`SpsOpenGate`), so the decoder's reorder depth is
+    /// seeded from it.
     #[cfg(feature = "media-codecs")]
-    Lazy { cfg: VideoEncodeConfig },
+    Lazy {
+        cfg: VideoEncodeConfig,
+        sps_gate: crate::engine::video_encode_util::SpsOpenGate,
+    },
     /// Decode → re-encode pipeline is live.
     #[cfg(feature = "media-codecs")]
     Active(Box<WebrtcVideoActive>),
@@ -210,7 +215,10 @@ fn init_webrtc_video_encoder_state(
     match video_encode {
         None => WebrtcVideoEncoderState::Disabled,
         #[cfg(feature = "media-codecs")]
-        Some(cfg) => WebrtcVideoEncoderState::Lazy { cfg: cfg.clone() },
+        Some(cfg) => WebrtcVideoEncoderState::Lazy {
+            cfg: cfg.clone(),
+            sps_gate: crate::engine::video_encode_util::SpsOpenGate::new(),
+        },
         #[cfg(not(feature = "media-codecs"))]
         Some(_) => WebrtcVideoEncoderState::Failed,
     }
@@ -435,17 +443,25 @@ async fn handle_webrtc_video_frame(
     }
 
     // Lazy-open the decoder + encoder scaffolding on the first video
-    // access unit. Falls through to the encode path on the same frame.
+    // access unit that can open them (an H.264 one waits for the SPS,
+    // which seeds the decoder's reorder depth). Falls through to the
+    // encode path on the same frame.
     #[cfg(feature = "media-codecs")]
-    if matches!(video_state, WebrtcVideoEncoderState::Lazy { .. }) {
-        let cfg = match video_state {
-            WebrtcVideoEncoderState::Lazy { cfg } => cfg.clone(),
-            _ => unreachable!(),
+    if let WebrtcVideoEncoderState::Lazy { cfg, sps_gate } = video_state {
+        let au = nalus_to_annex_b_webrtc(nalus);
+        let codec = if source_is_h264 {
+            video_codec::VideoCodec::H264
+        } else {
+            video_codec::VideoCodec::Hevc
         };
+        if !sps_gate.admits(codec, &au) {
+            return;
+        }
+        let cfg = cfg.clone();
         *video_state = open_webrtc_video_active(
             &cfg,
             source_is_h264,
-            &nalus_to_annex_b_webrtc(nalus),
+            &au,
             output_id,
             flow_id,
             stats,

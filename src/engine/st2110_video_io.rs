@@ -1226,6 +1226,9 @@ fn decode_worker(
 
     let mut current_codec: Option<VideoCodec> = None;
     let mut decoder: Option<VideoDecoder> = None;
+    // An H.264 (re)open waits for an access unit that carries the SPS,
+    // which seeds the decoder's reorder depth (`SpsOpenGate`).
+    let mut sps_gate = crate::engine::video_encode_util::SpsOpenGate::new();
     let mut scaler: Option<VideoScaler> = None;
 
     // ── PMT-vs-bitstream codec mismatch detection ────────────────────
@@ -1428,6 +1431,12 @@ fn decode_worker(
         };
         let threaded_cpu = || seeded(video_engine::DecoderBackend::Cpu, video_engine::DecoderThreading::Auto);
         if current_codec != Some(codec) {
+            // Nothing decodes before the SPS; opened on a P picture at a
+            // mid-GOP join, a source that declares no reordering would be
+            // held a frame for good.
+            if !sps_gate.admits(codec, &nalu_bytes) {
+                continue;
+            }
             current_codec = Some(codec);
             aus_since_open = 0;
             frames_since_open = 0;

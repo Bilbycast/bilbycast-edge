@@ -424,7 +424,7 @@ mod inner {
         parse_pmt, pmt_index, rebuild_pmt_section, EsEdit, OutVersion, PmtEdit, PsiUnit,
         PsiUnitStage,
     };
-    use crate::engine::video_encode_util::{FrameCadence, ScaledVideoEncoder};
+    use crate::engine::video_encode_util::{FrameCadence, ScaledVideoEncoder, SpsOpenGate};
     use video_codec::{VideoCodec, VideoEncoderCodec};
     use video_engine::VideoDecoder;
 
@@ -478,16 +478,6 @@ mod inner {
     /// Decoded frames the replacer waits for a measurable rate before it
     /// opens the encoder at the fallback rate (~2 s of broadcast video).
     const UNLOCKED_FRAME_CAP: u32 = 60;
-
-    /// H.264 PES the replacer passes over waiting for one that carries an
-    /// SPS to open the decoder on, before opening on whatever arrives
-    /// (~6-12 s; broadcast repeats the SPS every GOP).
-    const SPS_WAIT_PES: u32 = 300;
-
-    /// Whether an Annex B access unit carries an H.264 SPS NAL unit.
-    fn carries_h264_sps(au: &[u8]) -> bool {
-        video_engine::annexb_nal_units(au).any(|n| n.first().is_some_and(|b| b & 0x1F == 7))
-    }
 
     /// Where the encoder's rate came from.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -602,9 +592,9 @@ mod inner {
         pub(super) pes_since_reset: u64,
         pub(super) frames_since_reset: u64,
         pub(super) pes_at_first_frame: Option<u64>,
-        /// H.264 PES passed over while waiting for one that carries the
-        /// SPS to open the decoder on (bounded by [`SPS_WAIT_PES`]).
-        pub(super) pes_awaiting_sps: u32,
+        /// Holds the H.264 decoder open back until a PES carries the SPS
+        /// (bounded — see [`SpsOpenGate`]).
+        sps_gate: SpsOpenGate,
         /// Where the rate the encoder runs at came from, and whether a
         /// source reset has happened since it opened — what
         /// `video_encode_fps_mismatch` blames (`cause`) when a later
@@ -814,7 +804,7 @@ mod inner {
                 pes_since_reset: 0,
                 frames_since_reset: 0,
                 pes_at_first_frame: None,
-                pes_awaiting_sps: 0,
+                sps_gate: SpsOpenGate::new(),
                 rate_origin: pinned.then_some(RateOrigin::Pinned),
                 reset_since_open: false,
                 fps_mismatch_warned: false,
@@ -903,7 +893,7 @@ mod inner {
             self.pes_since_reset = 0;
             self.frames_since_reset = 0;
             self.pes_at_first_frame = None;
-            self.pes_awaiting_sps = 0;
+            self.sps_gate = SpsOpenGate::new();
             self.fps_mismatch_warned = false;
             // First post-switch encoded frame must be an IDR so receivers
             // get a clean entry point right at the switch boundary.
@@ -1490,11 +1480,7 @@ mod inner {
                 // without the SPS would cost a declaring IPPP source a frame
                 // of latency for good. Bounded, for a stream whose SPS never
                 // shows as a NAL unit here.
-                if src_codec == VideoCodec::H264
-                    && !carries_h264_sps(&es_data)
-                    && self.pes_awaiting_sps < SPS_WAIT_PES
-                {
-                    self.pes_awaiting_sps += 1;
+                if !self.sps_gate.admits(src_codec, &es_data) {
                     return Ok(());
                 }
                 match VideoDecoder::open_opts(
@@ -2901,7 +2887,7 @@ mod tests {
         assert_eq!(d["reason"], "no backend could");
     }
 
-    /// An H.264 source whose SPS never shows: after `SPS_WAIT_PES` PES the
+    /// An H.264 source whose SPS never shows: after `SPS_OPEN_WAIT_AUS` PES the
     /// decoder opens anyway, seeded from the AU in hand — an undeclared
     /// reorder depth, so 1 (the depth that keeps a non-IDR join clean).
     #[test]
@@ -3345,11 +3331,18 @@ mod tests {
             assert!(skipped >= 1 && start + skipped < aus.len() - 10);
             let mut cc = 0u8;
             let mut r = TsVideoReplacer::new(&cfg("x264"), None).unwrap();
-            let out = run(&mut r, &ts_of(&aus[start..], 900_000, false, &mut cc));
-            assert_eq!(
-                r.inner.pes_awaiting_sps as usize, skipped,
-                "the P pictures before the next SPS are passed over"
-            );
+            let mut out = Vec::new();
+            r.process(&synth_pat(0x1000), &mut out);
+            r.process(&synth_pmt(0x1000, 0x100, 0x1B), &mut out);
+            for (i, au) in aus[start..].iter().enumerate() {
+                for p in packetize_ts(0x100, &build_video_pes(au, 900_000 + i as u64 * 3_600), &mut cc) {
+                    r.process(&p, &mut out);
+                }
+                // PES i - 1 is complete once PES i starts.
+                if i <= skipped {
+                    assert!(r.inner.decoder.is_none(), "PES {i} - 1 carries no SPS: passed over");
+                }
+            }
             let dec = r.inner.decoder.as_ref().expect("opened");
             assert_eq!(dec.reorder_depth(), 0);
             assert!(out_pes(&out).len() >= 10);

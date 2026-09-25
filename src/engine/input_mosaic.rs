@@ -492,6 +492,9 @@ fn spawn_tile_decoder(
             let mut demuxer = TsDemuxer::new(None);
             let mut decoder: Option<video_engine::VideoDecoder> = None;
             let mut decoder_codec: Option<video_engine::VideoCodec> = None;
+            // An H.264 (re)open waits for an access unit that carries the
+            // SPS, which seeds the decoder's reorder depth (`SpsOpenGate`).
+            let mut sps_gate = crate::engine::video_encode_util::SpsOpenGate::new();
             // Rebuilt when the source changes shape — a source switch mid-show
             // is ordinary, and a stale scaler would produce a wrong-sized patch.
             let mut scaler: Option<(u32, u32, i32, u32, u32, video_engine::VideoScaler)> = None;
@@ -559,9 +562,14 @@ fn spawn_tile_decoder(
                             // H.264 decoder produces a wedged tile rather than
                             // a loud failure.
                             if decoder_codec != Some(codec) {
-                                // Seeded from this access unit: an H.264
+                                // Opened on the first access unit that
+                                // carries the SPS (nothing decodes before
+                                // one) and seeded from it: an H.264
                                 // decoder's reorder depth comes from its
                                 // SPS (`video_engine::ReorderSeed`).
+                                if !sps_gate.admits(codec, &es) {
+                                    continue;
+                                }
                                 decoder = video_engine::VideoDecoder::open_opts(
                                     codec,
                                     video_engine::DecoderOptions {

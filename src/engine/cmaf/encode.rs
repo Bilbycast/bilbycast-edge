@@ -637,6 +637,9 @@ pub struct VideoReencoder {
     /// The last pts handed to the encoder — the step-off point for the
     /// frames [`Self::flush`] drains from the decoder.
     last_pts: Option<i64>,
+    /// Holds an H.264 decoder open back until an access unit carries the
+    /// SPS, which seeds its reorder depth (`SpsOpenGate`).
+    sps_gate: crate::engine::video_encode_util::SpsOpenGate,
 }
 
 #[cfg(not(feature = "media-codecs"))]
@@ -716,6 +719,7 @@ impl VideoReencoder {
             annex_b_scratch: Vec::with_capacity(256 * 1024),
             source_codec: None,
             last_pts: None,
+            sps_gate: crate::engine::video_encode_util::SpsOpenGate::new(),
         })
     }
 
@@ -750,8 +754,14 @@ impl VideoReencoder {
                 CmafVideoCodec::H264 => video_codec::VideoCodec::H264,
                 CmafVideoCodec::H265 => video_codec::VideoCodec::Hevc,
             };
-            // Seeded from the access unit that triggered the open: an H.264
-            // decoder's reorder depth comes from its SPS (`ReorderSeed`).
+            // Opened on the first access unit that carries the SPS (nothing
+            // decodes before one), and seeded from it: an H.264 decoder's
+            // reorder depth comes from its SPS (`ReorderSeed`). Opened on a
+            // P picture at a mid-GOP join, a source that declares no
+            // reordering would hold a frame for good.
+            if !self.sps_gate.admits(src_codec, &self.annex_b_scratch) {
+                return Ok(None);
+            }
             let dec = video_engine::VideoDecoder::open_opts(
                 src_codec,
                 video_engine::DecoderOptions {
@@ -1241,5 +1251,62 @@ mod flush_tests {
         let held = re.flush().unwrap().len();
         assert!(held >= 1, "the decoder held pictures back");
         assert_eq!(out + held, n, "every source frame comes back");
+    }
+
+    /// A live output joining mid-GOP on a source that declares no
+    /// reordering (x264 `zerolatency`, as the edge's own encodes are) opens
+    /// its decoder on the next access unit that carries the SPS, seeded 0 —
+    /// not on the P picture it joined on, seeded 1, which libavcodec never
+    /// lowers: a frame held for the life of the output.
+    #[test]
+    fn a_mid_gop_join_opens_the_decoder_on_the_sps() {
+        let (w, h) = (320usize, 240usize);
+        let mut enc = video_engine::VideoEncoder::open(&VideoEncoderConfig {
+            codec: VideoEncoderCodec::X264,
+            width: w as u32,
+            height: h as u32,
+            fps_num: 25,
+            fps_den: 1,
+            gop_size: 25,
+            preset: VideoPreset::Veryfast,
+            global_header: false,
+            ..VideoEncoderConfig::default()
+        })
+        .unwrap();
+        let mut aus = Vec::new();
+        for i in 0..40 {
+            let y: Vec<u8> = (0..w * h).map(|k| ((k % w + 5 * i) % 200) as u8 + 20).collect();
+            let c = vec![128u8; w / 2 * h / 2];
+            aus.extend(enc.encode_frame(&y, w, &c, w / 2, &c, w / 2, Some(i as i64)).unwrap());
+        }
+        aus.extend(enc.flush().unwrap());
+        let has_sps = |i: usize| crate::engine::video_encode_util::carries_h264_sps(&aus[i].data);
+        let join = 3;
+        assert!(!has_sps(join), "joined on a P picture");
+        let next_sps = (join..aus.len()).find(|&i| has_sps(i)).expect("a second IDR");
+
+        let cfg: VideoEncodeConfig = serde_json::from_value(serde_json::json!({
+            "codec": "x264", "preset": "veryfast"
+        }))
+        .unwrap();
+        let mut re = VideoReencoder::new(&cfg, "join-test").unwrap();
+        let mut out = 0usize;
+        for (i, au) in aus.iter().enumerate().skip(join) {
+            let mut nalus = Vec::new();
+            split_annex_b_to_nalus(&au.data, &mut nalus);
+            if re
+                .encode_frame(&nalus, i as u64 * 3_600, false, CmafVideoCodec::H264)
+                .unwrap()
+                .is_some()
+            {
+                out += 1;
+            }
+            if i < next_sps {
+                assert!(re.decoder.is_none(), "AU {i} carries no SPS: passed over");
+            }
+        }
+        let dec = re.decoder.as_ref().expect("opened on the SPS");
+        assert_eq!(dec.reorder_depth(), 0, "a declared IPPP source holds no frame");
+        assert!(out >= 10, "{out} frames re-encoded");
     }
 }

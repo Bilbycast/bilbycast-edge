@@ -512,6 +512,65 @@ fn gcd(mut a: u64, mut b: u64) -> u64 {
     a.max(1)
 }
 
+// ───────────────────── Lazy H.264 decoder open ─────────────────────
+
+/// Access units a lazy H.264 decoder open passes over waiting for one that
+/// carries an SPS, before it opens on whatever arrives (~6-12 s; broadcast
+/// repeats the SPS every GOP).
+pub const SPS_OPEN_WAIT_AUS: u32 = 300;
+
+/// Whether an Annex B access unit carries an H.264 SPS NAL unit.
+pub fn carries_h264_sps(au: &[u8]) -> bool {
+    video_engine::annexb_nal_units(au).any(|n| n.first().is_some_and(|b| b & 0x1F == 7))
+}
+
+/// Holds a lazy H.264 decoder open back until an access unit that carries
+/// an SPS arrives, bounded by [`SPS_OPEN_WAIT_AUS`].
+///
+/// A decoder opened with `ReorderSeed::FromAccessUnit` takes its reorder
+/// depth from the AU it opens on: 0 when that AU's SPS declares one
+/// (libavcodec then applies the declared depth — 0 for the IPPP streams
+/// x264 `zerolatency` and most contribution encoders produce), 1 otherwise.
+/// libavcodec only ever raises the depth, so a decoder opened on an AU
+/// without the SPS — any join mid-GOP — holds one frame (40 ms at 25 fps)
+/// for good on a source that declares none, where waiting for the SPS
+/// costs nothing: no picture decodes before one anyway. The TS video
+/// replacer has always waited; the RTMP, WebRTC, CMAF, ST 2110-20 / -23,
+/// MXL and mosaic-tile decoders wait through this. Other codecs pass at
+/// once.
+#[derive(Debug, Clone, Default)]
+pub struct SpsOpenGate {
+    passed_over: u32,
+}
+
+impl SpsOpenGate {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Whether a decoder for `codec` may open on `au` (Annex B) now: any
+    /// codec but H.264, an AU carrying an SPS, or any AU once
+    /// [`SPS_OPEN_WAIT_AUS`] have been passed over. The count restarts on
+    /// the AU it admits, so a later re-open waits afresh.
+    pub fn admits(&mut self, codec: video_codec::VideoCodec, au: &[u8]) -> bool {
+        if codec != video_codec::VideoCodec::H264
+            || self.passed_over >= SPS_OPEN_WAIT_AUS
+            || carries_h264_sps(au)
+        {
+            self.passed_over = 0;
+            return true;
+        }
+        self.passed_over += 1;
+        false
+    }
+
+    /// AUs passed over in the current wait.
+    #[cfg(test)]
+    pub fn passed_over(&self) -> u32 {
+        self.passed_over
+    }
+}
+
 // ───────────────────── Sample aspect ratio ─────────────────────
 
 /// Largest term the H.264 / HEVC VUI can carry for `sar_width` /
@@ -1834,6 +1893,42 @@ mod cadence_tests {
         assert_eq!(meter([5_000; 4], 0).rate(), Some((18, 1)));
         // 0.2 % off 25 fps: not snapped.
         assert_eq!(rate_from_frame_duration(3_608.0), (11_250, 451));
+    }
+}
+
+#[cfg(test)]
+mod sps_gate_tests {
+    use super::{SpsOpenGate, SPS_OPEN_WAIT_AUS};
+    use video_codec::VideoCodec;
+
+    /// AUD, SPS, PPS, IDR slice.
+    const WITH_SPS: &[u8] = &[
+        0, 0, 0, 1, 0x09, 0xF0, 0, 0, 0, 1, 0x67, 0x42, 0, 0x1E, 0, 0, 0, 1, 0x68, 0xCE, 0, 0, 1,
+        0x65, 0x88,
+    ];
+    /// AUD, non-IDR slice.
+    const P_PICTURE: &[u8] = &[0, 0, 0, 1, 0x09, 0xF0, 0, 0, 0, 1, 0x41, 0x9A];
+
+    #[test]
+    fn an_h264_open_waits_for_an_sps_but_not_for_ever() {
+        let mut g = SpsOpenGate::new();
+        assert!(!g.admits(VideoCodec::H264, P_PICTURE));
+        assert!(!g.admits(VideoCodec::H264, P_PICTURE));
+        assert_eq!(g.passed_over(), 2);
+        assert!(g.admits(VideoCodec::H264, WITH_SPS));
+        assert_eq!(g.passed_over(), 0, "a later re-open waits afresh");
+        for _ in 0..SPS_OPEN_WAIT_AUS {
+            assert!(!g.admits(VideoCodec::H264, P_PICTURE));
+        }
+        assert!(g.admits(VideoCodec::H264, P_PICTURE), "bounded");
+    }
+
+    #[test]
+    fn other_codecs_open_at_once() {
+        let mut g = SpsOpenGate::new();
+        assert!(g.admits(VideoCodec::Hevc, P_PICTURE));
+        assert!(g.admits(VideoCodec::Mpeg2, &[0, 0, 1, 0xB3]));
+        assert_eq!(g.passed_over(), 0);
     }
 }
 

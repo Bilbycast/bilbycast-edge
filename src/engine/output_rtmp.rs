@@ -84,8 +84,13 @@ enum VideoEncoderState {
     /// via classic FLV, HEVC via Enhanced RTMP).
     Disabled,
     /// `video_encode` is set; we haven't built the decoder + encoder yet.
+    /// An H.264 decoder waits for an access unit that carries the SPS
+    /// (`SpsOpenGate`), so its reorder depth is seeded from it.
     #[cfg(feature = "media-codecs")]
-    Lazy { cfg: VideoEncodeConfig },
+    Lazy {
+        cfg: VideoEncodeConfig,
+        sps_gate: crate::engine::video_encode_util::SpsOpenGate,
+    },
     /// `video_encode` pipeline is live.
     #[cfg(feature = "media-codecs")]
     Active(Box<VideoActive>),
@@ -1120,7 +1125,10 @@ fn init_video_encoder_state(
     let _ = (stats, flow_id, event_sender);
     #[cfg(feature = "media-codecs")]
     {
-        VideoEncoderState::Lazy { cfg: enc_cfg.clone() }
+        VideoEncoderState::Lazy {
+            cfg: enc_cfg.clone(),
+            sps_gate: crate::engine::video_encode_util::SpsOpenGate::new(),
+        }
     }
     #[cfg(not(feature = "media-codecs"))]
     {
@@ -1270,12 +1278,23 @@ async fn process_video_frame(
             Ok(true)
         }
         #[cfg(feature = "media-codecs")]
-        VideoEncoderState::Lazy { cfg } => {
+        VideoEncoderState::Lazy { cfg, sps_gate } => {
+            let au = nalus_to_annex_b(src.nalus());
+            let codec = if src.is_h264() {
+                video_codec::VideoCodec::H264
+            } else {
+                video_codec::VideoCodec::Hevc
+            };
+            // Nothing decodes before the SPS; opening on it seeds the
+            // decoder's reorder depth from it (`SpsOpenGate`).
+            if !sps_gate.admits(codec, &au) {
+                return Ok(true);
+            }
             let cfg = cfg.clone();
             *video_state = open_video_active(
                 &cfg,
                 src.is_h264(),
-                &nalus_to_annex_b(src.nalus()),
+                &au,
                 config,
                 stats,
                 event_sender,

@@ -509,6 +509,9 @@ fn decode_v210_worker(
 
     let mut current_codec: Option<VideoCodec> = None;
     let mut decoder: Option<VideoDecoder> = None;
+    // An H.264 (re)open waits for an access unit that carries the SPS,
+    // which seeds the decoder's reorder depth (`SpsOpenGate`).
+    let mut sps_gate = crate::engine::video_encode_util::SpsOpenGate::new();
     let mut scaler: Option<VideoScaler> = None;
     let mut synth_pts: i64 = 0;
     let mut grain_index: u64 = 0;
@@ -532,9 +535,13 @@ fn decode_v210_worker(
             nalu_bytes.extend_from_slice(&nalu);
         }
         if current_codec != Some(codec) {
+            // Opened on the first access unit that carries the SPS (nothing
+            // decodes before one) and seeded from it: an H.264 decoder's
+            // reorder depth comes from its SPS (`ReorderSeed`).
+            if !sps_gate.admits(codec, &nalu_bytes) {
+                continue;
+            }
             current_codec = Some(codec);
-            // Seeded from the access unit that triggered the open: an H.264
-            // decoder's reorder depth comes from its SPS (`ReorderSeed`).
             decoder = Some(match VideoDecoder::open_opts(
                 codec,
                 video_engine::DecoderOptions {
