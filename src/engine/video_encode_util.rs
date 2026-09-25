@@ -752,8 +752,8 @@ pub struct ScaledVideoEncoder {
     /// carries none — the decoder context's, set by the call site. See
     /// [`Self::set_source_sar_fallback`].
     sar_fallback: Option<(u32, u32)>,
-    /// `scan: auto` may field-code on this pipeline (MPEG-TS re-encodes).
-    /// See [`Self::allow_auto_field_coding`].
+    /// `scan: auto` may field-code on this pipeline (a TS output's
+    /// re-encode). See [`Self::allow_auto_field_coding`].
     auto_field_coding: bool,
     /// The call site's decoder weaves the two fields of an interlaced
     /// picture into one frame (H.264, MPEG-2) rather than handing out one
@@ -932,10 +932,11 @@ impl ScaledVideoEncoder {
     }
 
     /// Let `video_encode.scan: auto` field-code an interlaced source on
-    /// this pipeline. MPEG-TS re-encodes call it — their audience is
-    /// broadcast receivers, which display interlace natively; RTMP, WebRTC
-    /// and CMAF (mostly progressive displays) leave `auto` progressive.
-    /// Only read at lazy-open.
+    /// this pipeline. A TS output's re-encode calls it — its audience is
+    /// broadcast receivers, which display interlace natively; RTMP, WebRTC,
+    /// CMAF (mostly progressive displays) and the TS ingress transcoder
+    /// (whose output feeds browser-facing passthrough outputs too) leave
+    /// `auto` progressive. Only read at lazy-open.
     pub fn allow_auto_field_coding(&mut self) {
         self.auto_field_coding = true;
     }

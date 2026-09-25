@@ -6024,15 +6024,18 @@ pub struct VideoEncodeConfig {
 /// Wire shape: `"auto"` (the default when unset), `"progressive"`,
 /// `"interlaced"`.
 ///
-/// - `Auto`: on MPEG-TS re-encodes (TS outputs and the TS ingress
-///   transcoder), code interlaced — H.264 MBAFF, in the source's field
-///   order — when the frame the encoder opens on is a woven interlaced
-///   frame (an interlaced H.264 or MPEG-2 source), the output is not
-///   scaled vertically, and the backend the resolver lands on can code
-///   fields on this host (libx264, h264_nvenc, h264_qsv where the GPU
-///   allows it). Otherwise progressive. RTMP, WebRTC and CMAF, whose
-///   audiences are mostly progressive displays, treat `auto` as
-///   progressive. Decided once, when the encoder opens.
+/// - `Auto`: on a TS **output**'s re-encode (SRT / UDP / RTP / RIST),
+///   code interlaced — H.264 MBAFF, in the source's field order — when
+///   the frame the encoder opens on is a woven interlaced frame (an
+///   interlaced H.264 or MPEG-2 source), the output is not scaled
+///   vertically, and the backend the resolver lands on can code fields on
+///   this host (libx264, h264_nvenc, h264_qsv where the GPU allows it).
+///   Otherwise progressive. RTMP, WebRTC and CMAF, whose audiences are
+///   mostly progressive displays, treat `auto` as progressive — and so
+///   does the TS **ingress** transcoder (an input's `video_encode`): its
+///   output is the flow's source for every output, browser-facing
+///   passthrough ones (WebRTC / WHIP, RTMP, HLS / CMAF) included, which
+///   cannot decode MBAFF. Decided once, when the encoder opens.
 /// - `Progressive`: always frame coding — what every release before this
 ///   field did. A woven interlaced source is carried as progressive frames
 ///   holding both fields.

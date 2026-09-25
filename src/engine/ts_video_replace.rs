@@ -223,6 +223,19 @@ impl TsVideoReplacer {
         }
     }
 
+    /// Let `video_encode.scan: auto` field-code an interlaced source. An
+    /// **output**'s re-encode calls it (`transcode_chain::output_video_replacer`):
+    /// its audience is the TS receiver it feeds, which displays interlace
+    /// natively. The ingress transcoder does not — its output is the flow's
+    /// source for every output on it, browser-facing passthrough WebRTC /
+    /// WHIP / RTMP / HLS / CMAF included, which cannot decode MBAFF — so there
+    /// `auto` codes progressive, as every release before `scan` did. An
+    /// explicit `scan: interlaced` is honoured on both.
+    pub fn allow_auto_field_coding(&mut self) {
+        #[cfg(feature = "media-codecs")]
+        self.inner.pipeline.allow_auto_field_coding();
+    }
+
     /// Ingress variant of [`Self::set_decode_stall_watchdog`]. Wires the same
     /// one-shot decode-stall watchdog but emits the Warning **input-scoped**
     /// (keyed on `input_id`) so the manager attributes a silent ingress
@@ -762,10 +775,6 @@ mod inner {
                 "ts_video_replace",
             );
             pipeline.set_resolved_backend_sink(stats.resolved_backend.clone());
-            // An MPEG-TS re-encode feeds broadcast receivers, which display
-            // interlace natively: `scan: auto` field-codes an interlaced
-            // source here (see `VideoScan`).
-            pipeline.allow_auto_field_coding();
             let pinned = cfg.fps_num.is_some() && cfg.fps_den.is_some();
 
             Ok(Self {
@@ -3229,14 +3238,15 @@ mod tests {
 
         /// The Sky Sports case, end to end: a field-coded 1080i-style
         /// source (one PES per field) with `scan` unset (auto), unscaled,
-        /// comes out 25 fps, MBAFF, pic_struct signalled, in the source's
-        /// field order — top first here, bottom first for a BFF source.
+        /// through an output's replacer, comes out 25 fps, MBAFF,
+        /// pic_struct signalled, in the source's field order — top first
+        /// here, bottom first for a BFF source.
         #[test]
         fn auto_codes_an_interlaced_source_interlaced_in_its_field_order() {
             for order in [VideoFieldOrder::Tff, VideoFieldOrder::Bff] {
                 let aus = x264_aus(16, (320, 240), Some(order), None);
                 let mut cc = 0u8;
-                let mut r = TsVideoReplacer::new(&cfg("x264"), None).unwrap();
+                let mut r = crate::engine::transcode_chain::output_video_replacer(&cfg("x264")).unwrap();
                 let out = run(&mut r, &ts_of(&aus, 900_000, true, &mut cc));
                 let sps = first_sps(&out);
                 assert!(!sps.frame_mbs_only && sps.mb_adaptive_frame_field, "{order:?}: MBAFF");
@@ -3264,10 +3274,33 @@ mod tests {
             scaled.height = Some(160);
             for (c, aus) in [(forced, &interlaced), (scaled, &interlaced), (cfg("x264"), &progressive)] {
                 let mut cc = 0u8;
-                let mut r = TsVideoReplacer::new(&c, None).unwrap();
+                let mut r = crate::engine::transcode_chain::output_video_replacer(&c).unwrap();
                 let out = run(&mut r, &ts_of(aus, 900_000, false, &mut cc));
                 assert!(first_sps(&out).frame_mbs_only, "{:?}", c.scan);
                 assert_eq!(r.inner.pipeline.field_order(), None);
+            }
+        }
+
+        /// The ingress transcoder's output is every output's source,
+        /// browser-facing passthrough (WebRTC / WHIP, RTMP, HLS / CMAF)
+        /// included, which cannot decode MBAFF: under `auto` it keeps an
+        /// interlaced source frame-coded, as before `scan` existed. An
+        /// explicit `interlaced` is still honoured there.
+        #[test]
+        fn the_ingress_transcoder_keeps_auto_progressive() {
+            let aus = x264_aus(16, (320, 240), Some(VideoFieldOrder::Tff), None);
+            let mut forced = cfg("x264");
+            forced.scan = Some(crate::config::models::VideoScan::Interlaced);
+            for (c, field_coded) in [(cfg("x264"), false), (forced, true)] {
+                let mut t = crate::engine::input_transcode::InputTranscoder::new(None, None, Some(&c), None)
+                    .unwrap()
+                    .expect("a video stage");
+                let mut cc = 0u8;
+                let mut out = Vec::new();
+                for chunk in ts_of(&aus, 900_000, true, &mut cc).chunks(TS_PACKET_SIZE * 7) {
+                    out.extend_from_slice(t.process(chunk));
+                }
+                assert_eq!(!first_sps(&out).frame_mbs_only, field_coded, "{:?}", c.scan);
             }
         }
 

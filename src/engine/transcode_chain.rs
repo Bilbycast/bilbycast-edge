@@ -413,7 +413,7 @@ pub fn build_for_output(
 
     let video = match video_encode {
         Some(enc) => {
-            let mut r = TsVideoReplacer::new(enc, None)?;
+            let mut r = output_video_replacer(enc)?;
             let backend = match enc.codec.as_str() {
                 "x264" | "x265" => enc.codec.clone(),
                 "h264_nvenc" | "hevc_nvenc" => "nvenc".to_string(),
@@ -465,6 +465,19 @@ pub fn build_for_output(
         pcr.set_event_sink(es.clone(), output_id, false);
     }
     Ok(Some(TranscodeChain::new(output_id, audio, video, pcr, backpressure)))
+}
+
+/// An output's TS video replacer: the one the ingress transcoder
+/// (`input_transcode::InputTranscoder`) builds, plus `scan: auto` field
+/// coding — an output's audience is the TS receiver it feeds, which
+/// displays interlace natively (see
+/// [`TsVideoReplacer::allow_auto_field_coding`]).
+pub(crate) fn output_video_replacer(
+    enc: &crate::config::models::VideoEncodeConfig,
+) -> Result<TsVideoReplacer, TranscodeChainError> {
+    let mut r = TsVideoReplacer::new(enc, None)?;
+    r.allow_auto_field_coding();
+    Ok(r)
 }
 
 impl Drop for TranscodeChain {
