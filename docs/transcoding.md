@@ -513,9 +513,20 @@ the sample:
   trusted where the previous AU ended; anywhere else (the first AU, after a
   resync, after a TS continuity-counter break) only once its successor is a
   consistent header or it ends on a PES boundary, so a sync pattern inside a
-  payload is never decoded. An AU into which a new PES begins with a header
-  of its own was cut short upstream (a file's truncated last PES at a loop
-  wrap) and is dropped, never glued to the next PES. A duplicate TS packet
+  payload is never decoded. A candidate a scan finds (after a break) whose
+  stream parameters differ from the last AU's, and which no PES begins
+  with, is dropped at once rather than waited out for the length it claims
+  (up to 8 KB of ADTS: half a second of audio that would then leave in a
+  burst, late against the PCR, and raise the PCR stage's delay for good);
+  every PES start inside a candidate is looked at. An AU into which a new
+  PES begins with a header of its own was cut short upstream (a file's
+  truncated last PES at a loop wrap) and is dropped, never glued to the next
+  PES — also when the next PES is a stream of other parameters (a playlist
+  moving to a 5.1 or 44.1 kHz file, a splice), once that header's own
+  successor agrees. AC-3 and E-AC-3 frames are one stream: an AC-3 core
+  followed by E-AC-3 dependent substreams (Annex E's backward-compatible
+  7.1) is cut frame by frame and the core decoded — every core used to be
+  discarded as a false sync, leaving no audio at all. A duplicate TS packet
   (same CC, same payload) is dropped.
 - **Latency.** Audio leaves the replacer about one AU after its last byte
   arrives instead of one PES — which on sources packing seven AUs per PES
@@ -557,12 +568,21 @@ the sample:
     silence, inserted at the source rate ahead of the PES's audio and
     passed through the rate / channel stage; on a `media_player` input the
     output PTS step over the gap instead, because its file splices step PTS
-    over audio that is continuous;
+    over audio that is continuous — at the PES that shows the step, since a
+    file's timestamps carry no jitter to wait out (waiting 150 ms presented
+    that much audio early by the step at every loop);
   - an **overlap**, by the same rules: that much audio dropped from the
-    head of what follows;
-  - a forward step over 500 ms: re-anchor at the new PTS; a backward one:
-    the output keeps its monotonic trajectory and the source is measured
-    from its new origin.
+    head of what follows (the count of placed content may go below the
+    anchor: a PES stamped 150 ms behind one AU after an anchor drops
+    exactly 150 ms);
+  - a step over 500 ms, **either way**: re-anchor at the new PTS. A source
+    that resets its clock back (an encoder restart, an ffmpeg
+    `-stream_loop` wrap) takes its PCR and its video back with it, and the
+    transcode chain's PCR stage drops re-encoded PES left on the old
+    timeline after a step back of over 1 s as frames of the previous epoch
+    — before 2026-09 the audio kept its old, monotonic PTS there and was
+    dropped for as long as the reset was deep (for good on a looping
+    source).
 
   Insertions and drops crossfade over 2 ms. An AU that fails to decode is
   replaced by silence of its nominal length where it stood. Nothing in it
@@ -572,7 +592,13 @@ the sample:
   with the samples emitted, inserted 32 ms of silence per firing (7 times
   in 200 s at load average 40 on an AC-3 output, a gate-1 failure), and
   counted a real gap twice — is removed, and so is the per-flow pacer
-  plumbing into the transcode chains. A source whose audio clock is not
+  plumbing into the transcode chains. So is the **PCR-jump signal** from
+  the input's clock rewriter (and the media player's per-loop splice-gap
+  signal on the same channel): the replacer follows its audio's own PTS
+  across any step, as passthrough does, and the signal either re-anchored
+  where nothing had moved (discarding a pending drop) or, from the media
+  player, put the re-encoded audio later by the loop's video/audio end gap
+  at every loop. A source whose audio clock is not
   locked to its PCR is held within ~5 ms by one short insert or drop about
   every 100 s at 50 ppm; `timeline_corrections`, `silence_inserted_samples`
   and `dropped_samples` on the output's `audio_encode_stats` count them.
@@ -585,10 +611,33 @@ the sample:
   BS.775 for 5.1 / 7.1 → stereo, Lt/Rt for quad → stereo, the transcode
   stage's defaults for mono ↔ stereo; any other pair keeps the channels in
   order, silence for the missing ones).
+- **A format change in-band is converted to the output's.** The output
+  format — the configured `sample_rate` / `channels`, else the source's at
+  the first decoded frame — is fixed for the stream: the encoder stays
+  open and the PMT unchanged. When the source changes channel count or rate
+  mid-stream (AC-3 and AAC decoders follow acmod / channel_config frame by
+  frame; broadcast services switch 5.1 ↔ 2.0 between programme and ads) the
+  channel / rate stage is rebuilt to convert the new format to it — the
+  `transcode` block pinned to the output format, or, when its routing is
+  for another layout (a 5.1 preset over a stereo stretch), the default
+  conversion above. What the old stage holds (the crossfade tail, its
+  resampler's queue and delay line) goes out first, up to exactly the
+  content it was given, and the new resampler's zero history is dropped, so
+  no sample moves and the stamps keep their latency. Before 2026-09 a
+  downmix built for 5.1 refused the stereo frames that followed (the output
+  went silent until the source returned to 5.1); without a conversion,
+  frames of a new channel count bypassed the timeline's drops and a new
+  rate reached the encoder unconverted.
 - **`av_skew`** on the output (or, for an input transcode, the flow) reports
   what remains: where each PES's first sample will be presented minus its
   source PTS — the declared latency the stamps do not cancel plus any
   correction still pending. See [metrics.md](metrics.md#edge-added-av-skew-flowstatsav_skew-outputstatsav_skew).
+- **Stats.** `audio_encode_stats.target_sample_rate_hz` / `target_channels`
+  carry the format the encoder was opened at — registered as 0 when
+  `audio_encode` leaves them to follow the source, and published once the
+  first frame resolves them — and `audio_decode_stats.output_sample_rate_hz`
+  / `output_channels` the decoded source format (they used to carry the
+  output's).
 
 **Release note — every fdk-aac decode is 36.3 ms earlier.** The decoder
 change above is in `bilbycast-fdk-aac-rs` and applies to every AAC decode in

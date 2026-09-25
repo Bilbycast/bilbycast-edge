@@ -200,13 +200,16 @@ discontinuity in three ways, and the third is the one worth knowing about.
   `an_ingress_pcr_delay_raise_keeps_pes_timestamps_continuous`.
 * **Forward jump the wall clock witnessed** — pass through, DI=1. A live
   edit point or SCTE-35 splice is a real gap in the content, and passing it
-  through preserves PCR_FO rate accuracy (TR 101 290, ±30 ppm). The
-  `pcr_jump_signal` tells that input's audio replacer, which folds it into
-  its source-timeline check; any offset beyond 500 ms re-anchors at the
-  audio's own PTS, so the re-encoded audio follows its source PTS across
-  the jump — a single gap when the audio PTS carry it, none when they do
-  not (the rewriter maps the audio PTS through the same anchor as the
-  PCR, so audio that did not jump needs no pad).
+  through preserves PCR_FO rate accuracy (TR 101 290, ±30 ppm). An input
+  audio re-encode upstream of the rewriter needs no telling: it follows its
+  audio's own PES PTS across any step over 500 ms, as passthrough does (a
+  single gap when the audio PTS carry the jump, none when they do not —
+  the rewriter maps the audio PTS through the same anchor as the PCR).
+  The per-input `pcr_jump_signal` that used to tell it was removed in
+  2026-09: it only ever forced a second re-anchor at the audio's own PTS
+  (discarding a drop still pending), and the media player's per-loop
+  splice-gap signal on the same channel put the re-encoded audio later by
+  the loop's video/audio end gap every loop.
 * **Forward jump the wall clock did *not* witness** — bridge it. A file loop
   wrap leaps a whole programme duration in milliseconds of real time; passed
   through, that leap lands in the presentation timeline and the display sheds
@@ -230,8 +233,10 @@ wall-clock alignment across a long gap, not stream validity. Pinned by
 Neither TS transcode replacer takes the flow's `AvSyncPacer`. The video
 replacer generates no PCR (`ts_pcr_remux` re-stamps the input's). The audio
 replacer anchors on the source PES PTS — on the first PES and on every
->500 ms forward step — and holds its content to the source PTS timeline by
-comparing PTS with decoded samples only. Its old wallclock catch-up
+step over 500 ms, forward or back (a source resetting its clock back takes
+its PCR and video with it, and the PCR remux drops re-encoded PES left on
+the old timeline after a step back of over 1 s) — and holds its content to
+the source PTS timeline by comparing PTS with decoded samples only. Its old wallclock catch-up
 compared the master clock at the moment the codec thread reached a PES with
 the samples emitted, which measured host load and wire backpressure rather
 than lip-sync, and inserted 32 ms of silence at a time under load; it is
@@ -430,10 +435,12 @@ transcoded TS output moves: a re-encoded ES now leads the PCR by its
 source lead plus `D` minus its pipeline delay (Sky 1080i25 through x264:
 ~0.3–1.05 s of video lead, against 0.4–1.0 s under the PTS-derived PCR).
 PES PTS are not moved, so lip-sync is untouched. An audio-only transcode
-(video and PCR passing through) is now delayed too: the audio replacer
-emits PES *k* only when PES *k + 1* arrives, and against an unshifted PCR
-3 930 of Sky's 4 016 re-encoded audio PES were late before any encoder
-delay.
+(video and PCR passing through) is now delayed too: when the audio
+replacer decoded per PES it emitted PES *k* only when PES *k + 1* arrived,
+and against an unshifted PCR 3 930 of Sky's 4 016 re-encoded audio PES were
+late before any encoder delay. It now emits each access unit as it
+completes, and the initial 80 ms of `D` covers it (Sky: audio PTS − PCR
+116–148 ms).
 
 **Where it does not reach.** HLS / CMAF / RTMP / WebRTC use PES
 timestamps only. A `D` raise on an **ingress** transcode reaches the

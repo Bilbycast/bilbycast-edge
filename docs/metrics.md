@@ -354,10 +354,11 @@ regression visibility).
 The audio replacer's figure, published at the first AU of every source PES
 (not in the first second after an anchor), is **where that AU's first
 sample will be presented minus its source PTS**: the timeline bookkeeping
-(a correction still to be applied, a backward source step the output did
-not follow) **plus the codec pipeline's declared latency** — the source
-decoder's, the resampler's and the encoder's priming — **minus what the
-output stamps subtract**. The stamps subtract exactly the declared latency
+(a correction still to be applied) **plus the codec pipeline's declared
+latency** — the source decoder's, the resampler's and the encoder's
+priming, with a conversion stage rebuilt for an in-band format change
+counted at its own resampler delay — **minus what the output stamps
+subtract**. The stamps subtract exactly the declared latency
 (see [transcoding.md](transcoding.md#audio-timing-in-the-ts-audio-replacer)),
 so a healthy re-encode reads 0 and the figure moves with gaps, overlaps and
 drift. Until 2026-09 the metric left codec latency out entirely — "0 by
