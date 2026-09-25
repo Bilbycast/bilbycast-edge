@@ -604,9 +604,14 @@ mod inner {
         /// PTS (90 kHz) of the last decoded frame admitted to the encoder —
         /// see [`admit_pts`]. Reset with the source.
         last_admitted_pts_90k: Option<u64>,
-        /// Measured interval between consecutive admitted frames (90 kHz):
-        /// the step a PTS-less frame advances by. Frame, not field, units.
+        /// Measured frame interval (90 kHz): the step a PTS-less frame
+        /// advances by. Frame, not field, units. Learned only from frames
+        /// that carried a decoder PTS — see [`Inner::admit_decoded`].
         decoded_interval_90k: Option<u64>,
+        /// PTS of the last decoded frame that carried one, and the frames
+        /// decoded since it.
+        last_real_pts_90k: Option<u64>,
+        frames_since_real_pts: u32,
 
         /// Operator's hardware-decoder preference for the input decode
         /// side of this transcode. Defaults to `Auto` (VAAPI ≻ NVDEC ≻
@@ -755,6 +760,8 @@ mod inner {
                 external_reset,
                 last_admitted_pts_90k: None,
                 decoded_interval_90k: None,
+                last_real_pts_90k: None,
+                frames_since_real_pts: 0,
                 hw_decode_pref: cfg.hw_decode.unwrap_or_default(),
                 av_skew: None,
                 input_decode_handle: None,
@@ -808,6 +815,8 @@ mod inner {
             // across the switch is a new source, not a reordered picture.
             self.last_admitted_pts_90k = None;
             self.decoded_interval_90k = None;
+            self.last_real_pts_90k = None;
+            self.frames_since_real_pts = 0;
             // Re-anchor PTS to the new input's first frame so downstream
             // A/V stays in sync with the audio replacer (which will also
             // re-anchor on the audio-PID codec swap).
@@ -1221,8 +1230,29 @@ mod inner {
         /// decoded frame, or `None` to drop it before the encoder. A drop
         /// touches nothing else — not the PTS queue, the force-IDR request
         /// or the frame counter — so the next admitted frame takes them.
+        ///
+        /// The interval a PTS-less frame steps by is learned from decoder
+        /// PTS only: the span between two frames that carried one, divided
+        /// by the frames decoded across it, and only within 10-200 fps. A
+        /// derived PTS never teaches it — it would only confirm the guess it
+        /// was derived from, and a guess above the true interval runs every
+        /// derived frame past the next real PTS, which then drops as out of
+        /// order (a source stamping every 12th picture at 29.97 fps lost
+        /// every real timestamp and ran 20 % fast on the 25 fps default).
         pub(super) fn admit_decoded(&mut self, frame_pts: Option<i64>) -> Option<u64> {
-            let pts = frame_pts.filter(|p| *p >= 0).map(|p| p as u64);
+            let pts = frame_pts.filter(|p| *p >= 0).map(|p| p as u64 & PTS_MASK_33B);
+            self.frames_since_real_pts = self.frames_since_real_pts.saturating_add(1);
+            if let Some(p) = pts {
+                if let Some(prev) = self.last_real_pts_90k {
+                    let span = (p + PTS_MODULUS_90K - prev) % PTS_MODULUS_90K;
+                    let step = span / u64::from(self.frames_since_real_pts);
+                    if (450..=9_000).contains(&step) {
+                        self.decoded_interval_90k = Some(step);
+                    }
+                }
+                self.last_real_pts_90k = Some(p);
+                self.frames_since_real_pts = 0;
+            }
             let last = self.last_admitted_pts_90k;
             let Some(admitted) = admit_pts(last, pts, self.frame_interval_90k(), self.pts_90k)
             else {
@@ -1230,12 +1260,6 @@ mod inner {
                 self.stats.non_monotonic_frames_dropped.fetch_add(1, Ordering::Relaxed);
                 return None;
             };
-            if let Some(l) = last {
-                let step = (admitted + PTS_MODULUS_90K - l) % PTS_MODULUS_90K;
-                if (90..=90_000).contains(&step) {
-                    self.decoded_interval_90k = Some(step);
-                }
-            }
             self.last_admitted_pts_90k = Some(admitted);
             Some(admitted)
         }
@@ -2548,5 +2572,36 @@ mod tests {
         // the per-field DTS delta).
         r.inner.pts_step_90k = 1_800;
         assert_eq!(r.inner.admit_decoded(None), Some(97_200));
+    }
+
+    /// A 29.97 fps source whose PES carry a PTS on every 12th picture only,
+    /// no fps pinned: the interval is learned from the real timestamps
+    /// (36 036 ticks over 12 frames), never from the derived ones, so after
+    /// the first GOPs every real timestamp is admitted as it is and the
+    /// output keeps the source's rate. A single 0.5 s gap between two real
+    /// timestamps is not a frame interval either.
+    #[test]
+    fn a_pts_less_frame_steps_by_the_interval_real_timestamps_show() {
+        let mut r = TsVideoReplacer::new(&cfg("x264"), None).unwrap();
+        let p0 = 900_000u64;
+        let mut admitted = Vec::new();
+        for n in 0..120u64 {
+            let pts = (n % 12 == 0).then_some((p0 + n * 3_003) as i64);
+            admitted.push((n, pts, r.inner.admit_decoded(pts)));
+        }
+        for (n, pts, a) in &admitted {
+            if *n >= 36
+                && let Some(p) = pts
+            {
+                assert_eq!(*a, Some(*p as u64), "real PTS of frame {n} admitted as is");
+            }
+        }
+        assert_eq!(admitted.last().unwrap().2, Some(p0 + 119 * 3_003), "no drift");
+        // Frame-rate steps teach it; a 0.5 s hole does not.
+        let mut r = TsVideoReplacer::new(&cfg("x264"), None).unwrap();
+        for p in [90_000i64, 93_600, 97_200, 97_200 + 45_000] {
+            r.inner.admit_decoded(Some(p));
+        }
+        assert_eq!(r.inner.admit_decoded(None), Some(97_200 + 45_000 + 3_600));
     }
 }
