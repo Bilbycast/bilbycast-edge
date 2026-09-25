@@ -1585,6 +1585,12 @@ pub struct PlanarAudioTranscoder {
     resample_out_scratch: Vec<Vec<f32>>,
     resampler_chunk_in: usize,
     src_quality: SrcQuality,
+    /// Streaming mode ([`Self::with_fixed_chunk`]): the resampler runs on
+    /// exactly this many input frames per call, fed from `fifo`, so it is
+    /// built once and its delay line is never restarted.
+    fixed_chunk: Option<usize>,
+    /// Routed input frames waiting for a whole chunk (streaming mode).
+    fifo: Vec<Vec<f32>>,
 }
 
 impl PlanarAudioTranscoder {
@@ -1630,7 +1636,67 @@ impl PlanarAudioTranscoder {
             resample_out_scratch: Vec::new(),
             resampler_chunk_in: 0,
             src_quality: cfg.src_quality,
+            fixed_chunk: None,
+            fifo: vec![Vec::new(); cfg.out_channels as usize],
         })
+    }
+
+    /// Switch to streaming mode for a continuous source: input of any length
+    /// is queued and resampled `frames` at a time, and the resampler is
+    /// built now, once.
+    ///
+    /// The default mode builds the resampler for the first call's length
+    /// and **rebuilds** it whenever the length changes, which restarts its
+    /// delay line — a dropout, and a delay that is not a constant. A caller
+    /// that stamps output from a constant pipeline delay (the TS audio
+    /// replacer) needs [`Self::output_delay`] to hold for the stream's
+    /// life, whatever frame sizes the decoder produces (AC-3 1536 next to
+    /// E-AC-3 256, an AAC-LC / HE-AAC switch). Without rate conversion this
+    /// changes nothing.
+    pub fn with_fixed_chunk(mut self, frames: usize) -> Result<Self, String> {
+        let frames = frames.max(1);
+        self.fixed_chunk = Some(frames);
+        if !self.rate_unchanged {
+            self.build_resampler(frames)?;
+        }
+        Ok(self)
+    }
+
+    /// Delay the sample-rate converter adds, in output frames: content at
+    /// input frame `j` comes out at output frame `j * out/in + delay`. 0
+    /// without rate conversion. Constant only in streaming mode.
+    pub fn output_delay(&self) -> usize {
+        if self.rate_unchanged {
+            return 0;
+        }
+        self.resampler.as_ref().map(|r| r.output_delay()).unwrap_or(0)
+    }
+
+    /// Input frames queued for the next chunk (streaming mode), not yet
+    /// resampled.
+    pub fn buffered_frames(&self) -> usize {
+        self.fifo.first().map(|c| c.len()).unwrap_or(0)
+    }
+
+    fn build_resampler(&mut self, chunk: usize) -> Result<(), String> {
+        let ratio = self.out_rate as f64 / self.in_rate as f64;
+        let params = sinc_params_for(self.src_quality);
+        let r = Async::<f32>::new_sinc(
+            ratio,
+            2.0,
+            &params,
+            chunk,
+            self.out_channels as usize,
+            FixedAsync::Input,
+        )
+        .map_err(|e| format!("PlanarAudioTranscoder: rubato init failed: {e}"))?;
+        let max_out = r.output_frames_max();
+        self.resample_out_scratch = (0..self.out_channels as usize)
+            .map(|_| vec![0.0f32; max_out])
+            .collect();
+        self.resampler = Some(r);
+        self.resampler_chunk_in = chunk;
+        Ok(())
     }
 
     pub fn out_sample_rate(&self) -> u32 {
@@ -1696,52 +1762,63 @@ impl PlanarAudioTranscoder {
             return Ok(self.routed_scratch.to_vec());
         }
 
+        // Streaming mode: queue, and resample whole chunks only.
+        if let Some(chunk) = self.fixed_chunk {
+            for (q, src) in self.fifo.iter_mut().zip(self.routed_scratch.iter()) {
+                q.extend_from_slice(src);
+            }
+            let mut out: Vec<Vec<f32>> = vec![Vec::new(); self.out_channels as usize];
+            while self.buffered_frames() >= chunk {
+                let block: Vec<Vec<f32>> =
+                    self.fifo.iter_mut().map(|q| q.drain(..chunk).collect()).collect();
+                let written = self.resample_block(&block, chunk)?;
+                for (o, c) in out.iter_mut().zip(self.resample_out_scratch.iter()) {
+                    o.extend_from_slice(&c[..written]);
+                }
+            }
+            return Ok(out);
+        }
+
         // Rubato SRC: lazy construct (input chunk size comes from the first
         // call; rebuilt on any chunk-size change).
         if self.resampler.is_none() || self.resampler_chunk_in != n_in {
-            let ratio = self.out_rate as f64 / self.in_rate as f64;
-            let params = sinc_params_for(self.src_quality);
-            let r = Async::<f32>::new_sinc(
-                ratio,
-                2.0,
-                &params,
-                n_in,
-                self.out_channels as usize,
-                FixedAsync::Input,
-            )
-            .map_err(|e| format!("PlanarAudioTranscoder: rubato init failed: {e}"))?;
-            let max_out = r.output_frames_max();
-            self.resample_out_scratch = (0..self.out_channels as usize)
-                .map(|_| vec![0.0f32; max_out])
-                .collect();
-            self.resampler = Some(r);
-            self.resampler_chunk_in = n_in;
+            self.build_resampler(n_in)?;
         }
-        let r = self.resampler.as_mut().unwrap();
+        let block = std::mem::take(&mut self.routed_scratch);
+        let written = self.resample_block(&block, n_in);
+        self.routed_scratch = block;
+        let written = written?;
+        Ok(self
+            .resample_out_scratch
+            .iter()
+            .map(|c| c[..written].to_vec())
+            .collect())
+    }
+
+    /// Resample one `n_in`-frame block (the resampler's chunk size) into
+    /// `resample_out_scratch`; returns the frames written.
+    fn resample_block(&mut self, block: &[Vec<f32>], n_in: usize) -> Result<usize, String> {
+        let r = self
+            .resampler
+            .as_mut()
+            .ok_or("PlanarAudioTranscoder: resampler not built")?;
         let channels = self.out_channels as usize;
         let out_frames_max = self
             .resample_out_scratch
             .first()
             .map(|v| v.len())
             .unwrap_or(0);
-        let in_adapter =
-            SequentialSliceOfVecs::new(self.routed_scratch.as_slice(), channels, n_in)
-                .map_err(|e| format!("PlanarAudioTranscoder: in adapter: {e}"))?;
+        let in_adapter = SequentialSliceOfVecs::new(block, channels, n_in)
+            .map_err(|e| format!("PlanarAudioTranscoder: in adapter: {e}"))?;
         let mut out_adapter = SequentialSliceOfVecs::new_mut(
             self.resample_out_scratch.as_mut_slice(),
             channels,
             out_frames_max,
         )
         .map_err(|e| format!("PlanarAudioTranscoder: out adapter: {e}"))?;
-        let written = r
-            .process_into_buffer(&in_adapter, &mut out_adapter, None)
+        r.process_into_buffer(&in_adapter, &mut out_adapter, None)
             .map(|(_used, w)| w)
-            .map_err(|e| format!("PlanarAudioTranscoder: rubato process: {e}"))?;
-        Ok(self
-            .resample_out_scratch
-            .iter()
-            .map(|c| c[..written].to_vec())
-            .collect())
+            .map_err(|e| format!("PlanarAudioTranscoder: rubato process: {e}"))
     }
 }
 
@@ -2500,6 +2577,61 @@ mod tests {
             rms >= lo && rms <= hi,
             "SRC output RMS {rms:.4} outside [{lo:.4}, {hi:.4}] — signal not preserved"
         );
+    }
+
+    /// Streaming mode resamples whole fixed chunks from a queue, so the
+    /// output does not depend on how the input was chunked and the delay is
+    /// the constant `output_delay()`: a burst at input frame `at` comes out
+    /// at `at * 44.1/48 + output_delay()`. The default mode rebuilds the
+    /// resampler (and restarts its delay line) whenever the chunk length
+    /// changes — the AC-3 1536 / E-AC-3 256 / AAC 1024 frames a decoder
+    /// hands over.
+    #[test]
+    fn planar_transcoder_streaming_mode_has_a_constant_delay() {
+        let tj = TranscodeJson { sample_rate: Some(44_100), ..TranscodeJson::default() };
+        let at = 20_000usize;
+        let burst: Vec<f32> = (0..480)
+            .map(|k| {
+                let w = 0.5 - 0.5 * (2.0 * std::f32::consts::PI * k as f32 / 479.0).cos();
+                0.5 * w * (2.0 * std::f32::consts::PI * 1000.0 * k as f32 / 48_000.0).sin()
+            })
+            .collect();
+        let mut signal = vec![0.0f32; 48_000];
+        signal[at..at + burst.len()].copy_from_slice(&burst);
+        let run = |sizes: &[usize]| -> (Vec<f32>, usize) {
+            let mut tc = PlanarAudioTranscoder::new(48_000, 1, &tj)
+                .unwrap()
+                .with_fixed_chunk(256)
+                .unwrap();
+            let delay = tc.output_delay();
+            let mut out = Vec::new();
+            let mut pos = 0;
+            let mut i = 0;
+            while pos < signal.len() {
+                let n = sizes[i % sizes.len()].min(signal.len() - pos);
+                out.extend_from_slice(&tc.process(&[signal[pos..pos + n].to_vec()]).unwrap()[0]);
+                assert!(tc.buffered_frames() < 256);
+                pos += n;
+                i += 1;
+            }
+            (out, delay)
+        };
+        let (a, delay) = run(&[1024]);
+        let (b, _) = run(&[1536, 256, 1152, 2048, 7]);
+        assert_eq!(a, b, "the chunking of the input changes nothing");
+        assert!(delay > 0);
+        // The burst's centre of energy lands at the scaled position plus the delay.
+        let energy: Vec<f64> = a.iter().map(|s| (*s as f64).powi(2)).collect();
+        let total: f64 = energy.iter().sum();
+        let centre = energy.iter().enumerate().map(|(i, e)| i as f64 * e).sum::<f64>() / total;
+        let expected = (at as f64 + 239.5) * 44_100.0 / 48_000.0 + delay as f64;
+        assert!((centre - expected).abs() < 1.5, "centre {centre:.1}, expected {expected:.1}");
+        // No rate conversion: no delay.
+        let same = PlanarAudioTranscoder::new(48_000, 2, &TranscodeJson::default())
+            .unwrap()
+            .with_fixed_chunk(256)
+            .unwrap();
+        assert_eq!(same.output_delay(), 0);
     }
 
     /// `channel_map_with_gain` is an entirely separate code path from
