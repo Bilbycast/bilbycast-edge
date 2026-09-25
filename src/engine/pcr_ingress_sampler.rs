@@ -180,7 +180,7 @@ pub(crate) fn spawn_source_discontinuity_watch(
 ) -> tokio::task::JoinHandle<()> {
     let mut rx = broadcast_tx.subscribe();
     tokio::spawn(async move {
-        let mut last_pcr_27mhz: Option<u64> = None;
+        let mut pcr_watch = PcrJumpWatch::default();
         let mut last_pts_per_pid: HashMap<u16, u64> = HashMap::new();
         let mut last_dts_per_pid: HashMap<u16, u64> = HashMap::new();
         let mut last_event_pcr: Option<Instant> = None;
@@ -192,55 +192,54 @@ pub(crate) fn spawn_source_discontinuity_watch(
                 msg = rx.recv() => {
                     match msg {
                         Ok(pkt) => {
-                            // ── PCR jump detection ──
-                            for pcr in scan_all_pcr_values(&pkt) {
-                                if let Some(prev) = last_pcr_27mhz {
-                                    let gap = pcr_gap_27mhz(prev, pcr);
-                                    if gap.unsigned_abs() > DISCONTINUITY_THRESHOLD_27MHZ {
-                                        flow_stats.source_discontinuities
-                                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                        // Auto-fix: tell the fixer to set
-                                        // DI=1 on the next PCR-bearing
-                                        // packet (one-shot). Sent on
-                                        // every detected jump regardless
-                                        // of the per-code event rate-
-                                        // limit so receivers get the
-                                        // signal on every loop boundary,
-                                        // not just the first one in a
-                                        // 30 s window.
-                                        if let Some(tx) = fixer_tx.as_ref() {
-                                            let _ = tx.try_send(
-                                                crate::engine::flow::FixerCommand::SignalSourceDiscontinuity,
-                                            );
-                                        }
-                                        let should_emit = match last_event_pcr {
-                                            None => true,
-                                            Some(t) => t.elapsed() >= DISCONTINUITY_EVENT_MIN_INTERVAL,
-                                        };
-                                        if should_emit {
-                                            last_event_pcr = Some(Instant::now());
-                                            let input_id = active_input_rx.borrow().clone();
-                                            events.emit_flow_with_details(
-                                                EventSeverity::Warning,
-                                                category::FLOW,
-                                                format!(
-                                                    "source PCR discontinuity on flow '{}' \
-                                                     (input '{}'): {:.3} ms jump",
-                                                    flow_id, input_id, gap as f64 / 27_000.0,
-                                                ),
-                                                &flow_id,
-                                                serde_json::json!({
-                                                    "error_code": "source_pcr_discontinuity",
-                                                    "input_id": input_id,
-                                                    "prev_pcr_27mhz": prev,
-                                                    "new_pcr_27mhz": pcr,
-                                                    "gap_ms": gap as f64 / 27_000.0,
-                                                }),
-                                            );
-                                        }
+                            // ── PCR jump detection (per PCR PID) ──
+                            for (pid, pcr) in scan_all_pcr_values(&pkt) {
+                                if let Some((prev, gap)) = pcr_watch.observe(pid, pcr) {
+                                    flow_stats.source_discontinuities
+                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    // Auto-fix: tell the fixer to set
+                                    // DI=1 on the next PCR-bearing
+                                    // packet (one-shot). Sent on
+                                    // every detected jump regardless
+                                    // of the per-code event rate-
+                                    // limit so receivers get the
+                                    // signal on every loop boundary,
+                                    // not just the first one in a
+                                    // 30 s window.
+                                    if let Some(tx) = fixer_tx.as_ref() {
+                                        let _ = tx.try_send(
+                                            crate::engine::flow::FixerCommand::SignalSourceDiscontinuity {
+                                                pcr_pid: Some(pid),
+                                            },
+                                        );
+                                    }
+                                    let should_emit = match last_event_pcr {
+                                        None => true,
+                                        Some(t) => t.elapsed() >= DISCONTINUITY_EVENT_MIN_INTERVAL,
+                                    };
+                                    if should_emit {
+                                        last_event_pcr = Some(Instant::now());
+                                        let input_id = active_input_rx.borrow().clone();
+                                        events.emit_flow_with_details(
+                                            EventSeverity::Warning,
+                                            category::FLOW,
+                                            format!(
+                                                "source PCR discontinuity on flow '{}' \
+                                                 (input '{}'): {:.3} ms jump",
+                                                flow_id, input_id, gap as f64 / 27_000.0,
+                                            ),
+                                            &flow_id,
+                                            serde_json::json!({
+                                                "error_code": "source_pcr_discontinuity",
+                                                "input_id": input_id,
+                                                "pcr_pid": pid,
+                                                "prev_pcr_27mhz": prev,
+                                                "new_pcr_27mhz": pcr,
+                                                "gap_ms": gap as f64 / 27_000.0,
+                                            }),
+                                        );
                                     }
                                 }
-                                last_pcr_27mhz = Some(pcr);
                             }
 
                             // ── PTS / DTS jump detection (per-PID) ──
@@ -253,7 +252,7 @@ pub(crate) fn spawn_source_discontinuity_watch(
                                                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                             if let Some(tx) = fixer_tx.as_ref() {
                                                 let _ = tx.try_send(
-                                                    crate::engine::flow::FixerCommand::SignalSourceDiscontinuity,
+                                                    crate::engine::flow::FixerCommand::SignalSourceDiscontinuity { pcr_pid: None },
                                                 );
                                             }
                                             let should_emit = match last_event_pts {
@@ -294,7 +293,7 @@ pub(crate) fn spawn_source_discontinuity_watch(
                                                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                             if let Some(tx) = fixer_tx.as_ref() {
                                                 let _ = tx.try_send(
-                                                    crate::engine::flow::FixerCommand::SignalSourceDiscontinuity,
+                                                    crate::engine::flow::FixerCommand::SignalSourceDiscontinuity { pcr_pid: None },
                                                 );
                                             }
                                             let should_emit = match last_event_dts {
@@ -338,11 +337,37 @@ pub(crate) fn spawn_source_discontinuity_watch(
     })
 }
 
-/// Pure scanner — returns every PCR value found in the datagram, in
+/// PCR continuity per PCR PID for [`spawn_source_discontinuity_watch`].
+///
+/// An MPTS carries one independent 27 MHz clock per program, usually
+/// seconds apart. Judged against a single "last PCR" of the whole stream,
+/// every PCR that follows one of another program's looked like a jump of
+/// the inter-program skew: on a media-player MPTS (Spain, six programs;
+/// 770_H, ten) the watcher counted a discontinuity on almost every PCR and
+/// had the continuity fixer stamp DI on ~91 % of the output PCRs, of every
+/// program, on passthrough and transcoded outputs alike (and on v0.111.0).
+/// Each PID is now judged against its own previous PCR only.
+#[derive(Debug, Default)]
+struct PcrJumpWatch {
+    last: HashMap<u16, u64>,
+}
+
+impl PcrJumpWatch {
+    /// Record `pcr` on `pid`; `Some((previous PCR, signed gap))` when it
+    /// jumped more than [`DISCONTINUITY_THRESHOLD_27MHZ`] from that PID's
+    /// previous PCR. A PID's first PCR is never a jump.
+    fn observe(&mut self, pid: u16, pcr: u64) -> Option<(u64, i64)> {
+        let prev = self.last.insert(pid, pcr)?;
+        let gap = pcr_gap_27mhz(prev, pcr);
+        (gap.unsigned_abs() > DISCONTINUITY_THRESHOLD_27MHZ).then_some((prev, gap))
+    }
+}
+
+/// Pure scanner — returns every `(PID, PCR)` found in the datagram, in
 /// order. Used by [`spawn_source_discontinuity_watch`] which doesn't
 /// have an `SourcePcrPllMaster` to push samples into. Mirrors the
 /// `sample_packet` walk minus the PLL feed.
-fn scan_all_pcr_values(pkt: &RtpPacket) -> Vec<u64> {
+fn scan_all_pcr_values(pkt: &RtpPacket) -> Vec<(u16, u64)> {
     let bytes = pkt.data.as_ref();
     let payload = if pkt.is_raw_ts { bytes } else { skip_rtp_header(bytes) };
     let mut out = Vec::new();
@@ -354,7 +379,7 @@ fn scan_all_pcr_values(pkt: &RtpPacket) -> Vec<u64> {
         let ts_pkt = &payload[i..i + TS_PACKET_SIZE];
         if ts_pkt[0] == TS_SYNC_BYTE {
             if let Some(pcr) = extract_pcr(ts_pkt) {
-                out.push(pcr);
+                out.push((ts_pid(ts_pkt), pcr));
             }
             i += TS_PACKET_SIZE;
         } else {
@@ -444,15 +469,14 @@ fn pts_gap_90khz(prev: u64, cur: u64) -> i64 {
 /// ahead of `prev`, negative = backward). Handles wrap at
 /// `PCR_MODULUS_27MHZ`. Used by the discontinuity gate to recognise
 /// either direction of jump.
+///
+/// It used to take `cur.wrapping_sub(prev) % PCR_MODULUS_27MHZ`, which is
+/// only a modular difference for a power-of-two modulus: the PCR's
+/// (2^33 × 300) is not one, so every backward step — a 30 ms one included —
+/// came out as a jump of about −16 500 s, and was flagged (and DI'd) as a
+/// discontinuity with that `gap_ms`.
 fn pcr_gap_27mhz(prev: u64, cur: u64) -> i64 {
-    const HALF_MODULUS: u64 =
-        crate::engine::pcr_pll::PCR_MODULUS_27MHZ / 2;
-    let forward = cur.wrapping_sub(prev) % crate::engine::pcr_pll::PCR_MODULUS_27MHZ;
-    if forward <= HALF_MODULUS {
-        forward as i64
-    } else {
-        -((crate::engine::pcr_pll::PCR_MODULUS_27MHZ - forward) as i64)
-    }
+    crate::engine::ts_parse::pcr_diff_27mhz(cur, prev)
 }
 
 /// Scan a single `RtpPacket` for PCR samples, feeding the master's PLL
@@ -652,6 +676,35 @@ mod tests {
         sample_packet(&master, &pkt);
         let t = master.pll().telemetry();
         assert_eq!(t.samples, 0);
+    }
+
+    /// R3: an MPTS interleaves one clock per program, seconds apart. Only a
+    /// PID's own previous PCR says whether it jumped — the inter-program
+    /// skew is not a discontinuity.
+    #[test]
+    fn interleaved_program_clocks_are_not_discontinuities() {
+        let mut w = PcrJumpWatch::default();
+        let ms = 27_000u64;
+        // Three programs, 13 s and 42 s apart, PCR every 30 ms each.
+        let base = [100_000 * ms, 113_000 * ms, 58_000 * ms];
+        let mut jumps = Vec::new();
+        for k in 0..200u64 {
+            for (i, b) in base.iter().enumerate() {
+                if let Some(j) = w.observe(0x100 + i as u16, b + k * 30 * ms) {
+                    jumps.push(j);
+                }
+            }
+        }
+        assert!(jumps.is_empty(), "{jumps:?}");
+        // A small step back is not a discontinuity (it used to read as
+        // −16 500 s through a non-modular subtraction).
+        assert_eq!(pcr_gap_27mhz(base[2] + 30 * ms, base[2]), -30 * ms as i64);
+        assert_eq!(w.observe(0x102, base[2] + 199 * 30 * ms - 30 * ms), None);
+        // A real jump on one program is seen, once, on that PID only.
+        let back = base[1] + 50 * ms;
+        assert_eq!(w.observe(0x101, back), Some((base[1] + 199 * 30 * ms, -5_920 * ms as i64)));
+        assert_eq!(w.observe(0x100, base[0] + 200 * 30 * ms), None);
+        assert_eq!(w.observe(0x101, back + 30 * ms), None);
     }
 
     #[test]

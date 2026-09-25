@@ -223,6 +223,11 @@ pub struct TsContinuityFixer {
     /// so the next real packet picks it up regardless of which input
     /// finally produces data first.
     pending_di_on_pcr: bool,
+    /// PCR PIDs whose next PCR must carry DI — a source discontinuity the
+    /// watcher saw on that PID's own clock. On an MPTS each program has its
+    /// own PCR, so the DI belongs on the program that jumped, not on
+    /// whichever PCR happens to come next.
+    pending_di_pids: Vec<u16>,
 }
 
 impl TsContinuityFixer {
@@ -236,6 +241,7 @@ impl TsContinuityFixer {
             // version 0 to 1" behaviour on the first switch.
             next_psi_version: 0,
             pending_di_on_pcr: false,
+            pending_di_pids: Vec::new(),
         }
     }
 
@@ -256,9 +262,33 @@ impl TsContinuityFixer {
     /// (which is what applies DI to packets) takes over even when
     /// the operator never manually switched — a chronic source-loop
     /// without any operator action still gets DI=1 on every jump.
-    pub fn signal_source_discontinuity(&mut self) {
-        self.pending_di_on_pcr = true;
+    ///
+    /// `pcr_pid` names the PCR PID whose clock jumped: DI then goes on that
+    /// PID's next PCR only. `None` (a PTS / DTS jump, which names no clock)
+    /// keeps the old behaviour — the next PCR on any PID.
+    pub fn signal_source_discontinuity(&mut self, pcr_pid: Option<u16>) {
+        match pcr_pid {
+            Some(pid) => {
+                if !self.pending_di_pids.contains(&pid) {
+                    self.pending_di_pids.push(pid);
+                }
+            }
+            None => self.pending_di_on_pcr = true,
+        }
         self.ever_switched = true;
+    }
+
+    /// Whether a PCR-bearing packet on `pid` takes a pending DI, and
+    /// consume it if so.
+    fn take_pending_di(&mut self, pid: u16) -> bool {
+        let targeted = match self.pending_di_pids.iter().position(|p| *p == pid) {
+            Some(i) => {
+                self.pending_di_pids.swap_remove(i);
+                true
+            }
+            None => false,
+        };
+        std::mem::take(&mut self.pending_di_on_pcr) || targeted
     }
 
     /// Forget the per-input PSI cache for `input_id`.
@@ -559,7 +589,7 @@ impl TsContinuityFixer {
             // that decouple PCR cadence from ES boundaries) — check both
             // paths. Only consume the flag when DI is actually applied,
             // so an AF-only packet without PCR doesn't burn the one-shot.
-            let needs_di = self.pending_di_on_pcr && extract_pcr(pkt).is_some();
+            let needs_di = extract_pcr(pkt).is_some() && self.take_pending_di(pid);
 
             if !ts_has_payload(pkt) {
                 // Adaptation-only packets: CC MUST NOT increment per
@@ -583,7 +613,6 @@ impl TsContinuityFixer {
                 }
                 if needs_di {
                     set_discontinuity_indicator(&mut ts_pkt);
-                    self.pending_di_on_pcr = false;
                     modified = true;
                 }
                 out.extend_from_slice(&ts_pkt);
@@ -610,7 +639,6 @@ impl TsContinuityFixer {
 
             if needs_di {
                 set_discontinuity_indicator(&mut ts_pkt);
-                self.pending_di_on_pcr = false;
             }
 
             out.extend_from_slice(&ts_pkt);
@@ -1571,6 +1599,30 @@ mod tests {
             ts_discontinuity_indicator(&bytes[..TS_PACKET_SIZE]),
             "DI flag survives across non-PCR packets after a switch"
         );
+    }
+
+    /// A source discontinuity the watcher saw on one PCR PID puts DI on that
+    /// PID's next PCR — not on another program's PCR that happens to come
+    /// first (an MPTS carries one clock per program).
+    #[test]
+    fn a_pcr_jump_signal_lands_on_its_own_pid() {
+        let mut fixer = TsContinuityFixer::new();
+        fixer.process_packet("a", &make_rtp_packet(&build_ts_packet(0x100, 0)));
+        fixer.signal_source_discontinuity(Some(0x200));
+        let other = build_pcr_packet(0x100, 1, 27_000_000);
+        let bytes = fixer.process_packet("a", &make_rtp_packet(&other)).unwrap_rewritten();
+        assert!(!ts_discontinuity_indicator(&bytes[..TS_PACKET_SIZE]), "not another program's PCR");
+        let own = build_pcr_packet(0x200, 0, 99_000_000);
+        let bytes = fixer.process_packet("a", &make_rtp_packet(&own)).unwrap_rewritten();
+        assert!(ts_discontinuity_indicator(&bytes[..TS_PACKET_SIZE]), "the jumped PID's next PCR");
+        let again = build_pcr_packet(0x200, 1, 99_810_000);
+        let bytes = fixer.process_packet("a", &make_rtp_packet(&again)).unwrap_rewritten();
+        assert!(!ts_discontinuity_indicator(&bytes[..TS_PACKET_SIZE]), "one-shot");
+        // A PTS / DTS jump names no clock: the next PCR on any PID.
+        fixer.signal_source_discontinuity(None);
+        let any = build_pcr_packet(0x100, 2, 28_000_000);
+        let bytes = fixer.process_packet("a", &make_rtp_packet(&any)).unwrap_rewritten();
+        assert!(ts_discontinuity_indicator(&bytes[..TS_PACKET_SIZE]));
     }
 
     /// Each new switch re-arms the flag, so back-and-forth A↔B always

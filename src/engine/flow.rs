@@ -4654,7 +4654,10 @@ pub(crate) enum FixerCommand {
     ///
     /// One-shot: the fixer ORs the flag with its existing
     /// `pending_di_on_pcr`; consumed on the next PCR.
-    SignalSourceDiscontinuity,
+    ///
+    /// `pcr_pid` is the PCR PID whose clock jumped (a PCR jump); `None` for
+    /// a PTS / DTS jump. On an MPTS the DI goes on that program's PCR.
+    SignalSourceDiscontinuity { pcr_pid: Option<u16> },
     /// An input has been hot-removed from the flow. Drop its cached
     /// PAT/PMT so a later hot-add of an input under the same id doesn't
     /// re-inject stale PSI on the next switch.
@@ -4727,13 +4730,13 @@ async fn ts_fixer_task(
                         FIXER_OUT_NO_RECEIVERS.fetch_add(1, Ordering::Relaxed);
                     }
                 }
-                Some(FixerCommand::SignalSourceDiscontinuity) => {
+                Some(FixerCommand::SignalSourceDiscontinuity { pcr_pid }) => {
                     // The watcher saw an upstream backward PCR/PTS/DTS
                     // jump. Set the DI flag so the next PCR-bearing
                     // packet that flows through the fixer gets
                     // `discontinuity_indicator` set. One-shot;
                     // consumed inside `process_packet`.
-                    fixer.signal_source_discontinuity();
+                    fixer.signal_source_discontinuity(pcr_pid);
                 }
                 Some(FixerCommand::DropInputPsi { input_id }) => {
                     // An input was hot-removed. Drop its cached PAT/PMT
