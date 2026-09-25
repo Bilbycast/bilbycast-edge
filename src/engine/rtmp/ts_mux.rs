@@ -95,6 +95,9 @@ pub struct TsMuxer {
     pat_pmt_counter: u32,
     /// Whether PAT/PMT have been emitted at least once.
     pat_pmt_sent: bool,
+    /// The program layout changed after PAT/PMT went out
+    /// ([`Self::change_has_video`]): the next mux call re-emits them at once.
+    psi_due: bool,
     /// Wall-clock instant of the last PAT/PMT emission. Used to enforce
     /// the [`PAT_PMT_INTERVAL`] cadence required by TR-101290 P1.
     /// `None` means we have not emitted yet.
@@ -148,6 +151,7 @@ impl TsMuxer {
             audio_registration: None,
             pat_pmt_counter: 0,
             pat_pmt_sent: false,
+            psi_due: false,
             last_pat_pmt_at: None,
             last_audio_pts_90khz: None,
             pmt_version: 0,
@@ -263,6 +267,25 @@ impl TsMuxer {
         self.has_video = has;
     }
 
+    /// Change whether the stream carries video once muxing has begun — an
+    /// RTMP publish, whose layout is known only from its `onMetaData` and
+    /// its tags. With no video the PMT lists none and names the audio PID
+    /// as PCR_PID, and the audio carries the PCR. A change after PAT/PMT
+    /// went out bumps the PMT version and makes the next mux call re-emit
+    /// them at once, so a receiver re-reads the ES list and the PCR PID
+    /// together. Returns whether anything changed.
+    pub fn change_has_video(&mut self, has: bool) -> bool {
+        if self.has_video == has {
+            return false;
+        }
+        self.has_video = has;
+        if self.pat_pmt_sent {
+            self.pmt_version = (self.pmt_version + 1) & 0x1F;
+            self.psi_due = true;
+        }
+        true
+    }
+
     /// Set whether the stream has audio (affects PMT).
     pub fn set_has_audio(&mut self, has: bool) {
         self.has_audio = has;
@@ -327,6 +350,7 @@ impl TsMuxer {
     /// This is called from both `mux_video()` and `mux_audio()` so that
     /// audio-only streams still get valid program tables.
     fn maybe_emit_pat_pmt(&mut self, force: bool) -> Vec<Bytes> {
+        let force = force || std::mem::take(&mut self.psi_due);
         self.pat_pmt_counter = self.pat_pmt_counter.saturating_add(1);
         let now = Instant::now();
         let elapsed_due = match self.last_pat_pmt_at {
@@ -397,9 +421,23 @@ impl TsMuxer {
         let adts_frame = build_adts_frame(raw_aac, sample_rate_idx, channels);
         let pes = build_pes_packet(0xC0, &adts_frame, pts_90khz, None);
         let audio_pid = self.audio_pid;
-        packets.extend(self.packetize(audio_pid, &pes, true, false, None, false));
+        // Audio-only (an RTMP publish with no video): the PMT names the
+        // audio PID as PCR_PID, so the audio carries the PCR — see
+        // `audio_carries_pcr`. With video present nothing changes.
+        let write_pcr = self.audio_carries_pcr();
+        let pcr = write_pcr.then_some(pts_90khz);
+        packets.extend(self.packetize(audio_pid, &pes, true, write_pcr, pcr, false));
 
         packets
+    }
+
+    /// Whether the audio PES carry the PCR: no video, and the PCR PID the
+    /// PMT names is the audio PID. Gated on the *effective* PCR PID, not on
+    /// the audio PID directly: a caller that set `pcr_pid_override` to
+    /// another PID has declared PCR there, and writing it on the audio as
+    /// well would put PCR on a PID the PMT does not name.
+    fn audio_carries_pcr(&self) -> bool {
+        !self.has_video && self.pcr_pid_override.unwrap_or(self.audio_pid) == self.audio_pid
     }
 
     /// Mux a pre-ADTS-framed AAC frame into TS packets.
@@ -434,8 +472,7 @@ impl TsMuxer {
         // caller that set `pcr_pid_override` has declared PCR on some other
         // PID in the PMT, and writing it here as well would put PCR on a PID
         // the PMT does not name — the same PCR_error in the other direction.
-        let pcr_pid = self.pcr_pid_override.unwrap_or(audio_pid);
-        let write_pcr = !self.has_video && pcr_pid == audio_pid;
+        let write_pcr = self.audio_carries_pcr();
         let pcr = if write_pcr { Some(pts_90khz) } else { None };
         packets.extend(self.packetize(audio_pid, &pes, true, write_pcr, pcr, false));
         packets
@@ -484,7 +521,9 @@ impl TsMuxer {
         // stream_id 0xBD (private_stream_1) is required for stream_type 0x06.
         let pes = build_pes_packet(0xBD, &au, pts_90khz, None);
         let audio_pid = self.audio_pid;
-        packets.extend(self.packetize(audio_pid, &pes, true, false, None, false));
+        let write_pcr = self.audio_carries_pcr();
+        let pcr = write_pcr.then_some(pts_90khz);
+        packets.extend(self.packetize(audio_pid, &pes, true, write_pcr, pcr, false));
         packets
     }
 
@@ -570,6 +609,19 @@ impl TsMuxer {
                 pos += 1;
                 pkt[pos] = 0x00;
                 pos += 1; // extension
+                // A PES that ends in this packet short of filling it is
+                // padded with adaptation-field stuffing after the PCR. It
+                // used to be left to the 0xFF fill after the payload — bytes
+                // inside the payload of a PES-carrying packet, which only
+                // PSI may stuff. A small AAC frame (silence) or a skip-frame
+                // P picture hit it.
+                let room = TS_PACKET_SIZE - pos;
+                let remaining = pes_data.len() - offset;
+                if remaining < room {
+                    let stuff = room - remaining;
+                    pkt[pos..pos + stuff].fill(0xFF);
+                    pos += stuff;
+                }
                 // Set adaptation_field_length = bytes after the length byte
                 pkt[af_start] = (pos - af_start - 1) as u8;
                 // AFC = 0b11 (adaptation + payload)
@@ -1395,5 +1447,76 @@ mod tests {
             !audio_has_pcr,
             "pcr_pid_override declared another PCR PID — audio must not carry PCR"
         );
+    }
+
+    /// `mux_audio` (the RTMP input's raw-AAC path) on an audio-only stream
+    /// carries the PCR on the audio PID, as the other audio entry points
+    /// do, and with video present leaves the audio exactly as before.
+    #[test]
+    fn mux_audio_carries_the_pcr_only_when_there_is_no_video() {
+        let raw = vec![0x21u8; 300];
+        let mut audio_only = TsMuxer::new();
+        audio_only.set_has_video(false);
+        audio_only.set_has_audio(true);
+        let ts = audio_only.mux_audio(&raw, 90_000, 3, 2);
+        let pcrs: Vec<u64> = ts
+            .iter()
+            .filter(|p| ts_pid(p) == AUDIO_PID)
+            .filter_map(|p| crate::engine::ts_parse::extract_pcr(p))
+            .collect();
+        assert_eq!(pcrs, vec![90_000 * 300], "one PCR, the PES's PTS, on its first packet");
+        let pmt = ts.iter().find(|p| ts_pid(p) == DEFAULT_PMT_PID).unwrap();
+        let pcr_pid = ((pmt[13] as u16 & 0x1F) << 8) | pmt[14] as u16;
+        assert_eq!(pcr_pid, AUDIO_PID);
+
+        let mut av = TsMuxer::new();
+        av.set_has_audio(true);
+        let ts = av.mux_audio(&raw, 90_000, 3, 2);
+        assert!(!ts.iter().any(|p| ts_packet_has_pcr(p)), "video carries the PCR");
+    }
+
+    /// A PES that ends in its PCR-bearing first packet is padded with
+    /// adaptation-field stuffing after the PCR, so the payload is exactly
+    /// the PES. It used to be followed by 0xFF fill inside the payload of a
+    /// PES-carrying packet.
+    #[test]
+    fn a_short_pes_behind_a_pcr_is_padded_in_the_adaptation_field() {
+        let mut muxer = TsMuxer::new();
+        muxer.set_has_video(false);
+        muxer.set_has_audio(true);
+        let raw = vec![0x21u8; 20];
+        let ts = muxer.mux_audio(&raw, 90_000, 3, 2);
+        let audio: Vec<&Bytes> = ts.iter().filter(|p| ts_pid(p) == AUDIO_PID).collect();
+        assert_eq!(audio.len(), 1);
+        let pkt = audio[0];
+        let pes = build_pes_packet(0xC0, &build_adts_frame(&raw, 3, 2), 90_000, None);
+        assert_eq!(pkt[3] >> 4 & 0b11, 0b11, "adaptation field and payload");
+        let af_len = pkt[4] as usize;
+        assert_eq!(5 + af_len + pes.len(), TS_PACKET_SIZE, "the payload is the PES, no more");
+        assert_eq!(&pkt[5 + af_len..], &pes[..]);
+        assert!(pkt[12..5 + af_len].iter().all(|&b| b == 0xFF), "stuffing after the PCR");
+        assert!(crate::engine::ts_parse::extract_pcr(pkt).is_some());
+    }
+
+    /// A layout change after PAT/PMT went out bumps the PMT version and
+    /// re-emits PAT/PMT on the next mux call, PCR PID with it.
+    #[test]
+    fn change_has_video_reissues_the_pmt() {
+        fn pmt_of(ts: &[Bytes]) -> Option<(u8, u16)> {
+            ts.iter().find(|p| ts_pid(p) == DEFAULT_PMT_PID).map(|p| {
+                ((p[10] >> 1) & 0x1F, ((p[13] as u16 & 0x1F) << 8) | p[14] as u16)
+            })
+        }
+        let mut muxer = TsMuxer::new();
+        muxer.set_has_audio(true);
+        let raw = vec![0x21u8; 300];
+        assert_eq!(pmt_of(&muxer.mux_audio(&raw, 0, 3, 2)), Some((0, VIDEO_PID)));
+        assert_eq!(pmt_of(&muxer.mux_audio(&raw, 1920, 3, 2)), None);
+        assert!(!muxer.change_has_video(true), "no change, nothing re-issued");
+        assert!(muxer.change_has_video(false));
+        assert_eq!(pmt_of(&muxer.mux_audio(&raw, 3840, 3, 2)), Some((1, AUDIO_PID)));
+        assert!(muxer.change_has_video(true));
+        let ts = muxer.mux_video(&[0, 0, 0, 1, 0x41, 0x9A], 5760, 5760, false);
+        assert_eq!(pmt_of(&ts), Some((2, VIDEO_PID)), "re-issued on a non-keyframe too");
     }
 }

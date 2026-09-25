@@ -366,12 +366,11 @@ mod tests {
     #[test]
     fn realistic_large_on_metadata_is_still_accepted() {
         // Guards `decode_all` against over-tightening, using the largest AMF0
-        // payload that exists anywhere as the yardstick. Note it is NOT
-        // evidence about the server's `onMetaData` handling: the RTMP server
-        // never AMF0-decodes DATA_AMF0 at all (`receive_media_loop` sends
-        // `RtmpMediaMessage::Metadata` and drops the payload). The callers this
-        // protects are the server's COMMAND_AMF0 path and the outbound client's
-        // `_result` decode.
+        // payload that exists anywhere as the yardstick. The callers this
+        // protects are the server's COMMAND_AMF0 path, its DATA_AMF0 decode
+        // (`receive_media_loop` reads what an `onMetaData` declares about
+        // video — `server::metadata_declares_video`) and the outbound
+        // client's `_result` decode.
         //
         // A live publisher's onMetaData is ~20 values. The biggest AMF0
         // payload that exists anywhere is a VOD keyframe index; build one at
