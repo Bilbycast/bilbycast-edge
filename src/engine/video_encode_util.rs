@@ -377,8 +377,9 @@ const PTS_MASK_33B: u64 = (1u64 << 33) - 1;
 /// signalled 50 fps in the VUI, budgeted CBR for 50 frames a second (half
 /// the configured bitrate) and ran a 4 s default GOP.
 ///
-/// Estimator, over the deltas between consecutive observed PTS (masked to
-/// 33 bits; a delta outside 90..=90 000 ticks is a discontinuity and is
+/// Estimator, over the per-frame deltas between consecutive stamped
+/// frames (masked to 33 bits, the span divided by the frames it covers —
+/// see below; a delta outside 90..=90 000 ticks is a discontinuity and is
 /// skipped):
 ///
 /// - **fast path** — the last [`CADENCE_FAST_DELTAS`] deltas agree within
@@ -397,12 +398,22 @@ const PTS_MASK_33B: u64 = (1u64 << 33) - 1;
 /// never forced onto a standard one.
 ///
 /// Only a decoder-carried timestamp is evidence: a frame without one (and
-/// a negative one) is ignored rather than stepped by a guess, which would
-/// only confirm the guess.
+/// a negative one) is never stepped by a guess, which would only confirm
+/// the guess — but it is **counted**. MPEG-TS needs a PTS only every
+/// 700 ms, and some encoders stamp only every Nth picture or only the I
+/// pictures, so the span between two stamped frames covers every frame
+/// decoded across it: one delta of `span / frames`. Taken as one frame, a
+/// source stamping every 12th picture at 29.97 fps measured 36 036 ticks —
+/// an encoder opened at 2500/1001 fps, CBR budgeting 12x the bitrate per
+/// frame, a 4-frame GOP.
 #[derive(Debug, Clone, Default)]
 pub struct FrameCadence {
     last_pts: Option<u64>,
-    deltas: std::collections::VecDeque<u64>,
+    /// Frames observed without a timestamp since `last_pts`.
+    frames_since_pts: u32,
+    /// Per-frame deltas (90 kHz ticks), fractional where a span over
+    /// several frames does not divide evenly.
+    deltas: std::collections::VecDeque<f64>,
 }
 
 impl FrameCadence {
@@ -413,19 +424,26 @@ impl FrameCadence {
     /// Forget everything — a new source.
     pub fn reset(&mut self) {
         self.last_pts = None;
+        self.frames_since_pts = 0;
         self.deltas.clear();
     }
 
     /// Feed one decoded frame's PTS (90 kHz, display order), exactly as
-    /// the decoder returned it: `None` (no timestamp) is ignored.
+    /// the decoder returned it. `None` (no timestamp) measures nothing but
+    /// counts a frame towards the next stamped one's span.
     pub fn observe(&mut self, pts: Option<i64>) {
         let Some(p) = pts.filter(|p| *p >= 0) else {
+            if self.last_pts.is_some() {
+                self.frames_since_pts = self.frames_since_pts.saturating_add(1);
+            }
             return;
         };
         let p = p as u64 & PTS_MASK_33B;
         if let Some(last) = self.last_pts {
-            let delta = p.wrapping_sub(last) & PTS_MASK_33B;
-            if (90..=90_000).contains(&delta) {
+            let span = p.wrapping_sub(last) & PTS_MASK_33B;
+            // A span past half the PTS space is a step back.
+            let delta = span as f64 / f64::from(self.frames_since_pts.saturating_add(1));
+            if span < 1 << 32 && (90.0..=90_000.0).contains(&delta) {
                 if self.deltas.len() == CADENCE_WINDOW {
                     self.deltas.pop_front();
                 }
@@ -433,6 +451,7 @@ impl FrameCadence {
             }
         }
         self.last_pts = Some(p);
+        self.frames_since_pts = 0;
     }
 
     /// Deltas measured so far (at most [`CADENCE_WINDOW`]).
@@ -446,19 +465,19 @@ impl FrameCadence {
     pub fn frame_duration_90k(&self) -> Option<f64> {
         let n = self.deltas.len();
         if n >= CADENCE_FAST_DELTAS {
-            let last: Vec<u64> = self.deltas.iter().skip(n - CADENCE_FAST_DELTAS).copied().collect();
-            let lo = *last.iter().min().expect("non-empty");
-            let hi = *last.iter().max().expect("non-empty");
-            let mean = last.iter().sum::<u64>() as f64 / CADENCE_FAST_DELTAS as f64;
-            if (hi - lo) as f64 <= (mean * 0.005).max(2.0) {
+            let last = self.deltas.iter().skip(n - CADENCE_FAST_DELTAS);
+            let lo = last.clone().copied().fold(f64::INFINITY, f64::min);
+            let hi = last.clone().copied().fold(f64::NEG_INFINITY, f64::max);
+            let mean = last.sum::<f64>() / CADENCE_FAST_DELTAS as f64;
+            if hi - lo <= (mean * 0.005).max(2.0) {
                 return Some(mean);
             }
         }
         if n >= CADENCE_MIN_DELTAS {
-            let d: Vec<u64> = self.deltas.iter().copied().collect();
-            let mut sums: Vec<u64> = d.windows(4).map(|w| w.iter().sum()).collect();
-            sums.sort_unstable();
-            return Some(sums[sums.len() / 2] as f64 / 4.0);
+            let d: Vec<f64> = self.deltas.iter().copied().collect();
+            let mut sums: Vec<f64> = d.windows(4).map(|w| w.iter().sum()).collect();
+            sums.sort_unstable_by(f64::total_cmp);
+            return Some(sums[sums.len() / 2] / 4.0);
         }
         None
     }
@@ -1739,6 +1758,43 @@ mod cadence_tests {
         // ...and once past it, four agreeing deltas answer at once.
         steps.extend([3_600u64; 3]);
         assert_eq!(meter(steps, 0).rate(), Some((25, 1)));
+    }
+
+    /// A source that stamps a PTS on every 12th picture only (29.97 fps):
+    /// the span between two stamped frames covers the twelve frames decoded
+    /// across it — 3003 ticks a frame, not one 36 036-tick frame (which
+    /// measured 2500/1001 fps).
+    #[test]
+    fn a_span_over_unstamped_frames_is_divided_by_its_frames() {
+        let sparse = |every: u64, step: u64, frames: u64| {
+            let mut m = FrameCadence::new();
+            for n in 0..frames {
+                m.observe((n % every == 0).then_some((900_000 + n * step) as i64));
+            }
+            m
+        };
+        let m = sparse(12, 3_003, 49);
+        assert_eq!(m.deltas_seen(), 4);
+        assert_eq!(m.rate(), Some((30_000, 1001)));
+        // Every other picture at 59.94 (1501.5 a frame) and at 25 fps.
+        assert_eq!(sparse(2, 1_501, 11).rate(), Some((60_000, 1001)));
+        assert_eq!(sparse(2, 3_600, 11).rate(), Some((25, 1)));
+        // PTS on the I pictures of a 2 s GOP only: 180 000 ticks a span,
+        // past a one-frame delta's ceiling, 3600 a frame.
+        assert_eq!(sparse(50, 3_600, 201).rate(), Some((25, 1)));
+        // Unstamped frames before the first stamped one measure nothing.
+        let mut m = FrameCadence::new();
+        for _ in 0..5 {
+            m.observe(None);
+        }
+        m.observe(Some(0));
+        m.observe(Some(3_600));
+        assert_eq!(m.frame_duration_90k(), None);
+        assert_eq!(m.deltas_seen(), 1);
+        for p in [7_200, 10_800, 14_400] {
+            m.observe(Some(p));
+        }
+        assert_eq!(m.frame_duration_90k(), Some(3_600.0));
     }
 
     #[test]
