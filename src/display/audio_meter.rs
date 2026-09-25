@@ -137,6 +137,9 @@ struct MeterState {
     /// Selected program (lowest in PAT when `target_program` is None,
     /// otherwise the requested program). `None` until a PAT is parsed.
     selected_pmt_pid: Option<u16>,
+    /// program_number of the selected program — PMT sections are matched
+    /// on it, since one PMT PID may carry several programs' PMTs.
+    selected_program: Option<u16>,
     /// Per-PID metering state (decoder + PES buffer + codec label).
     audio_pids: HashMap<u16, MeterPidState>,
     /// Cross-packet section reassembly for the PAT / selected PMT.
@@ -150,6 +153,7 @@ impl MeterState {
             target_program,
             pmt_pids: HashMap::new(),
             selected_pmt_pid: None,
+            selected_program: None,
             audio_pids: HashMap::new(),
             pat_section: SectionAssembler::new(),
             pmt_section: SectionAssembler::new(),
@@ -203,16 +207,34 @@ impl MeterState {
             return;
         }
         let payload = &pkt[payload_offset..];
+        // The assembler yields EVERY section a packet completes; a PMT PID
+        // may carry other tables (ATSC / DigiCipher 0xC0) ahead of the PMT,
+        // so filter on table_id rather than taking the first section.
         if pid == PAT_PID {
-            if let Some(section) = self.pat_section.feed(pusi, payload) {
-                let section = section.to_vec();
+            let sections: Vec<Vec<u8>> = self
+                .pat_section
+                .feed(pusi, payload)
+                .filter(|s| s.first() == Some(&0x00))
+                .map(|s| s.to_vec())
+                .collect();
+            for section in sections {
                 self.parse_pat(&section, publisher);
             }
             return;
         }
         if Some(pid) == self.selected_pmt_pid {
-            if let Some(section) = self.pmt_section.feed(pusi, payload) {
-                let section = section.to_vec();
+            let program = self.selected_program;
+            let sections: Vec<Vec<u8>> = self
+                .pmt_section
+                .feed(pusi, payload)
+                .filter(|s| {
+                    s.first() == Some(&0x02)
+                        && s.len() >= 5
+                        && program.is_none_or(|p| u16::from_be_bytes([s[3], s[4]]) == p)
+                })
+                .map(|s| s.to_vec())
+                .collect();
+            for section in sections {
                 self.parse_pmt(&section, publisher);
             }
             return;
@@ -244,14 +266,12 @@ impl MeterState {
             i += 4;
         }
         // Pick the program: requested, or the lowest if unspecified.
-        let chosen = match self.target_program {
-            Some(prog) => self.pmt_pids.get(&prog).copied(),
-            None => self
-                .pmt_pids
-                .iter()
-                .min_by_key(|(prog, _)| *prog)
-                .map(|(_, pid)| *pid),
+        let chosen_program = match self.target_program {
+            Some(prog) => self.pmt_pids.contains_key(&prog).then_some(prog),
+            None => self.pmt_pids.keys().min().copied(),
         };
+        let chosen = chosen_program.and_then(|prog| self.pmt_pids.get(&prog).copied());
+        self.selected_program = chosen_program;
         if chosen != self.selected_pmt_pid {
             // Program changed (or first lock) — drop all per-PID state
             // so the new PMT can repopulate cleanly. The published
@@ -773,9 +793,9 @@ mod tests {
         // PUSI packet carries pointer_field 0 + first 183 bytes.
         let mut first = vec![0u8];
         first.extend_from_slice(&section[..183]);
-        assert!(asm.feed(true, &first).is_none());
+        assert_eq!(asm.feed(true, &first).count(), 0);
         // Continuation completes it.
-        let got = asm.feed(false, &section[183..]).expect("complete").to_vec();
+        let got = asm.feed(false, &section[183..]).next().expect("complete").to_vec();
         assert_eq!(got.len(), 303);
         assert_eq!(got[..3], section[..3]);
 
@@ -783,12 +803,26 @@ mod tests {
         let small = pmt_section(0x0F, 0x101);
         let mut pkt = vec![0u8];
         pkt.extend_from_slice(&small);
-        let got = asm.feed(true, &pkt).expect("single-packet complete");
+        let got = asm.feed(true, &pkt).next().expect("single-packet complete").to_vec();
         assert_eq!(got.len(), small.len());
 
         // Continuation without a PUSI start is ignored.
         asm.reset();
-        assert!(asm.feed(false, &[0xAB; 100]).is_none());
+        assert_eq!(asm.feed(false, &[0xAB; 100]).count(), 0);
+    }
+
+    /// VH1-shaped PMT PID: a 0xC0 section sits at the pointer target and
+    /// the PMT behind it. The meter used to take the first section only
+    /// and never learned an audio PID on such a stream.
+    #[test]
+    fn pmt_behind_a_private_section_is_metered() {
+        let mut state = MeterState::new(None);
+        let mut publisher = MeterPublisher::new(new_shared_meter());
+        let pat = crate::engine::ts_test_fixtures::vh1_pat_packet();
+        let pmt = crate::engine::ts_test_fixtures::vh1_pmt_packet();
+        state.process_ts_packet(&pat, &mut publisher);
+        state.process_ts_packet(&pmt, &mut publisher);
+        assert!(state.audio_pids.contains_key(&0x0E10), "AC-3 audio learned");
     }
 
     /// AC-3 / E-AC-3 / DTS ride PES private_stream_1 (0xBD); the header

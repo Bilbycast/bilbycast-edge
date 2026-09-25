@@ -224,20 +224,10 @@ pub fn extract_video_dims(
 // ── PMT parser ───────────────────────────────────────────────────────────
 
 fn parse_pmt_packet(pkt: &[u8]) -> Option<PmtScanResult> {
-    let mut offset = 4;
-    if ts_has_adaptation(pkt) {
-        let af_len = pkt[4] as usize;
-        offset = 5 + af_len;
-    }
-    if offset >= TS_PACKET_SIZE {
-        return None;
-    }
-    let pointer = pkt[offset] as usize;
-    offset = offset.checked_add(1 + pointer)?;
+    // Located with the shared section walker: the PMT PID may carry other
+    // tables ahead of the PMT (ATSC / DigiCipher 0xC0 sections).
+    let offset = crate::engine::ts_parse::pmt_section_offset(pkt, None)?;
     if offset + 12 > TS_PACKET_SIZE {
-        return None;
-    }
-    if pkt[offset] != 0x02 {
         return None;
     }
     let section_length =
@@ -675,6 +665,17 @@ fn skip_profile_tier_level(br: &mut BitReader, max_sub_layers_minus1: u8) -> boo
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// VH1.ts: the PMT sits behind a 0xC0 section on its PID; the media
+    /// library probe used to report no streams for such a file.
+    #[test]
+    fn pmt_behind_a_private_section_is_scanned() {
+        let pkt = crate::engine::ts_test_fixtures::vh1_pmt_packet();
+        let res = scan_pmt_in_buf(&pkt, 188, 0, 0x31);
+        assert_eq!(res.pcr_pid, Some(0x0E0F));
+        assert_eq!(res.video_streams.iter().map(|v| v.pid).collect::<Vec<_>>(), vec![0x0E0F]);
+        assert_eq!(res.audio_streams.iter().map(|a| a.pid).collect::<Vec<_>>(), vec![0x0E10]);
+    }
 
     /// Build a minimal PMT packet with the given (stream_type, es_pid) entries.
     /// PCR_PID is set to the first ES PID. CRC is left as buffer fill.

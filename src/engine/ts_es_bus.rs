@@ -526,20 +526,12 @@ impl TsEsDemuxer {
     }
 
     fn ingest_pmt(&mut self, pmt_pid: u16, pkt: &[u8]) {
-        let mut sec_off = 4;
-        if ts_has_adaptation(pkt) {
-            let af_len = pkt[4] as usize;
-            sec_off = 5 + af_len;
-        }
-        if sec_off >= TS_PACKET_SIZE {
+        // The PMT is found with the shared section walker — a PMT PID may
+        // carry other tables ahead of it (ATSC / DigiCipher 0xC0 sections).
+        let Some(sec_off) = super::ts_parse::pmt_section_offset(pkt, None) else {
             return;
-        }
-        let pointer = pkt[sec_off] as usize;
-        sec_off += 1 + pointer;
+        };
         if sec_off + 12 > TS_PACKET_SIZE {
-            return;
-        }
-        if pkt[sec_off] != 0x02 {
             return;
         }
         let version = (pkt[sec_off + 5] >> 1) & 0x1F;
@@ -677,6 +669,21 @@ mod tests {
         let a = rx_audio.try_recv().expect("audio packet");
         assert_eq!(a.source_pid, 0x102);
         assert_eq!(a.stream_type, 0x0F);
+    }
+
+    /// VH1.ts: the PMT sits behind a 0xC0 section on its PID. The bus used
+    /// to publish every ES with stream_type 0 (undeclared).
+    #[test]
+    fn pmt_behind_a_private_section_declares_stream_types() {
+        use crate::engine::ts_test_fixtures::{vh1_pat_packet, vh1_pmt_packet};
+        let bus = Arc::new(NodeEsBus::new());
+        let mut demux = TsEsDemuxer::new("in-a", bus.clone());
+        let mut rx = bus.subscribe("in-a", 0x0E10);
+        let mut buf = vh1_pat_packet().to_vec();
+        buf.extend_from_slice(&vh1_pmt_packet());
+        buf.extend_from_slice(&build_es(0x0E10, 0));
+        demux.process(&wrap(buf));
+        assert_eq!(rx.try_recv().expect("audio packet").stream_type, 0x81);
     }
 
     /// The published payload must be the exact 188 bytes of the source TS

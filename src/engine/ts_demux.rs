@@ -337,6 +337,9 @@ pub struct TsDemuxer {
     pat_section: crate::engine::ts_parse::SectionAssembler,
     /// Cross-packet section reassembly for the selected PMT.
     pmt_section: crate::engine::ts_parse::SectionAssembler,
+    /// program_number of the locked program (PMT sections are matched on
+    /// it; a PMT PID may be shared by several programs).
+    selected_program: Option<u16>,
     scte35_section: crate::engine::ts_parse::SectionAssembler,
 }
 
@@ -369,6 +372,7 @@ impl TsDemuxer {
             pending_discontinuity: false,
             pat_section: crate::engine::ts_parse::SectionAssembler::new(),
             pmt_section: crate::engine::ts_parse::SectionAssembler::new(),
+            selected_program: None,
             scte35_section: crate::engine::ts_parse::SectionAssembler::new(),
         }
     }
@@ -402,6 +406,7 @@ impl TsDemuxer {
             pending_discontinuity: false,
             pat_section: crate::engine::ts_parse::SectionAssembler::new(),
             pmt_section: crate::engine::ts_parse::SectionAssembler::new(),
+            selected_program: None,
             scte35_section: crate::engine::ts_parse::SectionAssembler::new(),
         }
     }
@@ -534,24 +539,29 @@ impl TsDemuxer {
             let Some(payload) = Self::psi_payload(pkt) else {
                 return Vec::new();
             };
-            let Some(section) = self.pat_section.feed(ts_pusi(pkt), payload) else {
+            // The assembler yields every section the packet completed;
+            // keep the last complete PAT.
+            let Some(mut programs) = self
+                .pat_section
+                .feed(ts_pusi(pkt), payload)
+                .filter(|s| s.first() == Some(&0x00))
+                .map(crate::engine::ts_parse::parse_pat_section_programs)
+                .last()
+            else {
                 return Vec::new();
             };
-            let mut programs =
-                crate::engine::ts_parse::parse_pat_section_programs(section);
             if programs.is_empty() {
                 return Vec::new();
             }
             // Sort by program_number ascending so the default (lowest) is
             // deterministic across runs.
             programs.sort_by_key(|(num, _)| *num);
-            let new_pmt_pid = match self.target_program {
-                Some(target) => programs
-                    .iter()
-                    .find(|(num, _)| *num == target)
-                    .map(|(_, pid)| *pid),
-                None => programs.first().map(|(_, pid)| *pid),
+            let selected = match self.target_program {
+                Some(target) => programs.iter().find(|(num, _)| *num == target).copied(),
+                None => programs.first().copied(),
             };
+            self.selected_program = selected.map(|(num, _)| num);
+            let new_pmt_pid = selected.map(|(_, pid)| pid);
             if new_pmt_pid != self.selected_pmt_pid {
                 if let Some(new_pid) = new_pmt_pid {
                     tracing::info!(
@@ -581,13 +591,26 @@ impl TsDemuxer {
             return Vec::new();
         }
 
-        // PMT — only honour the PMT for our locked program.
+        // PMT — only honour the PMT for our locked program. The PID may
+        // carry other tables ahead of it (ATSC / DigiCipher 0xC0 sections)
+        // and other programs' PMTs, so match table_id AND program_number.
         if Some(pid) == self.selected_pmt_pid {
-            if let Some(payload) = Self::psi_payload(pkt)
-                && let Some(section) = self.pmt_section.feed(ts_pusi(pkt), payload) {
-                    let section = section.to_vec();
+            if let Some(payload) = Self::psi_payload(pkt) {
+                let program = self.selected_program;
+                let sections: Vec<Vec<u8>> = self
+                    .pmt_section
+                    .feed(ts_pusi(pkt), payload)
+                    .filter(|s| {
+                        s.first() == Some(&0x02)
+                            && s.len() >= 5
+                            && program.is_none_or(|p| u16::from_be_bytes([s[3], s[4]]) == p)
+                    })
+                    .map(|s| s.to_vec())
+                    .collect();
+                for section in sections {
                     self.parse_pmt(&section);
                 }
+            }
             return Vec::new();
         }
 
@@ -606,8 +629,8 @@ impl TsDemuxer {
             return self.scte35_section
                 .feed(ts_pusi(pkt), payload)
                 .filter(|section| section.first() == Some(&0xfc))
-                .map(|section| vec![DemuxedFrame::Scte35(section.to_vec())])
-                .unwrap_or_default();
+                .map(|section| DemuxedFrame::Scte35(section.to_vec()))
+                .collect();
         }
 
         Vec::new()
@@ -1265,6 +1288,21 @@ fn parse_pts(data: &[u8]) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// VH1.ts: a 0xC0 section sits at the pointer target of every PMT-PID
+    /// packet, the PMT behind it. The demuxer (RTMP / WebRTC / display /
+    /// SDI / 2110 egress / thumbnails) used to take the first section only
+    /// and never found an ES.
+    #[test]
+    fn pmt_behind_a_private_section_is_demuxed() {
+        use crate::engine::ts_test_fixtures::{vh1_pat_packet, vh1_pmt_packet};
+        let mut demux = TsDemuxer::new(None);
+        let mut ts = vh1_pat_packet().to_vec();
+        ts.extend_from_slice(&vh1_pmt_packet());
+        demux.demux(&ts);
+        assert_eq!(demux.video_pid(), Some(0x0E0F));
+        assert_eq!(demux.audio_pid(), Some(0x0E10));
+    }
 
     /// H.264 parameter sets + IDR (SPS 0x67 / PPS 0x68 / IDR 0x65)
     /// sniff decisively as H.264; HEVC VPS/SPS/PPS (0x40/0x42/0x44 with

@@ -619,24 +619,11 @@ fn detect_video_pid(ts: &[u8]) -> Option<u16> {
         return None;
     }
     // The PID could be the PMT for any program. Without the PAT we
-    // can't be sure, so accept any section with table_id == 0x02.
-    let af_ctrl = (ts[3] >> 4) & 0x3;
-    let mut idx = 4usize;
-    if af_ctrl == 0x2 || af_ctrl == 0x3 {
-        let af_len = ts[4] as usize;
-        idx = 5 + af_len;
-    }
-    if idx >= TS_PACKET {
-        return None;
-    }
-    // Pointer field for new section.
-    let pointer = ts[idx] as usize;
-    idx = idx.saturating_add(1).saturating_add(pointer);
+    // can't be sure, so accept any section with table_id == 0x02 — found
+    // with the shared section walker, since the PMT need not be the first
+    // section in the packet (ATSC / DigiCipher 0xC0 sections precede it).
+    let idx = crate::engine::ts_parse::pmt_section_offset(ts, None)?;
     if idx + 12 >= TS_PACKET {
-        return None;
-    }
-    let table_id = ts[idx];
-    if table_id != 0x02 {
         return None;
     }
     let section_length = (((ts[idx + 1] as usize) & 0x0F) << 8) | (ts[idx + 2] as usize);
@@ -869,4 +856,17 @@ fn now_micros() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_micros() as u64)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// VH1.ts: the PMT sits behind a 0xC0 section; replay pacing used to
+    /// find no video PID on such a recording.
+    #[test]
+    fn video_pid_found_behind_a_private_section() {
+        let pkt = crate::engine::ts_test_fixtures::vh1_pmt_packet();
+        assert_eq!(detect_video_pid(&pkt), Some(0x0E0F));
+    }
 }

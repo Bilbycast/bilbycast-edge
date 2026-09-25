@@ -695,14 +695,17 @@ impl AudioFullState {
         if payload.is_empty() {
             return;
         }
-        let pointer = payload[0] as usize;
-        if 1 + pointer + 12 > payload.len() {
+        // The PMT need not be the section at the pointer target: a PMT PID may
+        // carry other tables ahead of it (ATSC / DigiCipher 0xC0 sections).
+        let Some(found) =
+            crate::engine::ts_parse::find_section_in_payload(payload, 0x02, None)
+        else {
+            return;
+        };
+        if found.start + 12 > payload.len() {
             return;
         }
-        let section = &payload[1 + pointer..];
-        if section.is_empty() || section[0] != 0x02 {
-            return;
-        }
+        let section = &payload[found.start..];
         let section_length = (((section[1] as usize) & 0x0F) << 8) | section[2] as usize;
         if 3 + section_length > section.len() || section_length < 13 {
             return;
@@ -1193,5 +1196,22 @@ fn codec_name(stream_type: u8) -> &'static str {
         0x83 => "lpcm",
         0x87 | 0xC2 => "eac3",
         _ => "unknown",
+    }
+}
+
+#[cfg(test)]
+mod pmt_walk_tests {
+    use super::*;
+
+    /// VH1.ts: the PMT sits behind a 0xC0 section on its PID. The audio
+    /// analyzer used to take the pointer-target table only and meter
+    /// nothing on such a stream.
+    #[test]
+    fn pmt_behind_a_private_section_registers_the_audio_pid() {
+        use crate::engine::ts_test_fixtures::{vh1_pat_packet, vh1_pmt_packet};
+        let mut st = AudioFullState::new(AudioFullMode::Ts);
+        st.process_ts_packet(&vh1_pat_packet());
+        st.process_ts_packet(&vh1_pmt_packet());
+        assert!(st.audio_pids.contains_key(&0x0E10));
     }
 }

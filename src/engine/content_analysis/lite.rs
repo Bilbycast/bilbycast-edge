@@ -363,14 +363,17 @@ impl LiteState {
         if payload.is_empty() {
             return;
         }
-        let pointer = payload[0] as usize;
-        if 1 + pointer + 12 > payload.len() {
+        // The PMT need not be the section at the pointer target: a PMT PID may
+        // carry other tables ahead of it (ATSC / DigiCipher 0xC0 sections).
+        let Some(found) =
+            crate::engine::ts_parse::find_section_in_payload(payload, 0x02, None)
+        else {
+            return;
+        };
+        if found.start + 12 > payload.len() {
             return;
         }
-        let section = &payload[1 + pointer..];
-        if section.is_empty() || section[0] != 0x02 {
-            return;
-        }
+        let section = &payload[found.start..];
         let section_length = (((section[1] as usize) & 0x0F) << 8) | section[2] as usize;
         if 3 + section_length > section.len() {
             return;
@@ -594,3 +597,21 @@ fn is_video_stream_type(st: u8) -> bool {
 
 // Sub-module snapshot impls live next to each tracker. This file only
 // orchestrates task lifecycle + dispatch.
+
+#[cfg(test)]
+mod pmt_walk_tests {
+    use super::*;
+
+    /// VH1.ts: the PMT sits behind a 0xC0 section on its PID. The lite
+    /// analyzer used to find no video PID and no SCTE-35 PID there.
+    #[test]
+    fn pmt_behind_a_private_section_is_parsed() {
+        use crate::engine::ts_test_fixtures::{vh1_pat_packet, vh1_pmt_packet};
+        let (events, _rx) = crate::manager::events::event_channel();
+        let mut st = LiteState::new();
+        st.process_ts_packet(&vh1_pat_packet(), "f", &events);
+        st.process_ts_packet(&vh1_pmt_packet(), "f", &events);
+        assert_eq!(st.video_pid, Some(0x0E0F));
+        assert!(st.scte35_pids.contains(&0x0E11));
+    }
+}

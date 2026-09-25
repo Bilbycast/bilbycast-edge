@@ -470,14 +470,13 @@ fn parse_pmt_first_video(payload: &[u8]) -> Option<(u16, u8)> {
     if payload.is_empty() {
         return None;
     }
-    let pointer = payload[0] as usize;
-    if 1 + pointer + 12 > payload.len() {
+    // The PMT need not be the section at the pointer target: a PMT PID may
+    // carry other tables ahead of it (ATSC / DigiCipher 0xC0 sections).
+    let found = crate::engine::ts_parse::find_section_in_payload(payload, 0x02, None)?;
+    if found.start + 12 > payload.len() {
         return None;
     }
-    let section = &payload[1 + pointer..];
-    if section.is_empty() || section[0] != 0x02 {
-        return None;
-    }
+    let section = &payload[found.start..];
     let section_length = (((section[1] as usize) & 0x0F) << 8) | section[2] as usize;
     if 3 + section_length > section.len() || section_length < 13 {
         return None;
@@ -734,4 +733,16 @@ fn detect_colour_bars(y: &[u8], w: usize, h: usize) -> bool {
     }
     // Colour bar has ALL columns nearly uniform; require ≥ 80 %.
     total_sampled > 0 && low_variance_cols * 10 >= total_sampled * 8
+}
+
+#[cfg(all(test, feature = "media-codecs"))]
+mod pmt_walk_tests {
+    use super::*;
+
+    /// VH1.ts: the PMT sits behind a 0xC0 section on its PID.
+    #[test]
+    fn first_video_found_behind_a_private_section() {
+        let pkt = crate::engine::ts_test_fixtures::vh1_pmt_packet();
+        assert_eq!(parse_pmt_first_video(&pkt[4..]), Some((0x0E0F, 0x02)));
+    }
 }

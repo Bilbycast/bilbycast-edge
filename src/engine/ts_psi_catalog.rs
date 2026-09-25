@@ -290,27 +290,18 @@ struct ObserverState {
     /// Latest per-PMT version seen, keyed by PMT PID. `None` means not
     /// yet observed on the wire.
     pmt_versions: std::collections::HashMap<u16, u8>,
-    /// In-flight cross-packet PMT sections, keyed by PMT PID. A PMT for a
-    /// real DVB program (video + several audio + subs + teletext, each
-    /// with descriptors) routinely exceeds the 184-byte single-packet
-    /// payload — without reassembly those programs sat in the catalogue
-    /// with an empty stream list FOREVER (periodic re-emission never
-    /// helps; the section never fits in one packet).
-    pmt_partials: std::collections::HashMap<u16, PartialPmtSection>,
+    /// Cross-packet section reassembly per PMT PID. A PMT for a real DVB
+    /// program (video + several audio + subs + teletext, each with
+    /// descriptors) routinely exceeds the 184-byte single-packet payload —
+    /// without reassembly those programs sat in the catalogue with an
+    /// empty stream list FOREVER (periodic re-emission never helps; the
+    /// section never fits in one packet). A CC gap aborts the section in
+    /// flight: latching a stream list assembled across a loss would be
+    /// worse than staying empty until the next emission.
+    pmt_asm: std::collections::HashMap<u16, SectionAssembler>,
     /// Partial catalog accumulated as each PMT arrives. Published when
     /// it changes.
     current: PsiCatalog,
-}
-
-/// One PMT section mid-reassembly: bytes from `table_id` onward, the total
-/// length promised by the 3-byte section header, and the continuity
-/// counter of the last packet folded in (a CC gap aborts the partial —
-/// latching a stream list assembled across a loss would be worse than
-/// staying empty until the next emission).
-struct PartialPmtSection {
-    buf: Vec<u8>,
-    needed: usize,
-    last_cc: u8,
 }
 
 fn observe_packet(pkt: &RtpPacket, state: &mut ObserverState, store: &PsiCatalogStore) {
@@ -386,83 +377,32 @@ fn handle_pat(pkt: &[u8], state: &mut ObserverState, store: &PsiCatalogStore) {
     let live: std::collections::HashSet<u16> =
         state.pmt_by_program.iter().map(|(_, pid)| *pid).collect();
     state.pmt_versions.retain(|pid, _| live.contains(pid));
-    state.pmt_partials.retain(|pid, _| live.contains(pid));
+    state.pmt_asm.retain(|pid, _| live.contains(pid));
 
     store.store(state.current.clone());
 }
 
 /// Route one TS packet on a PMT PID into the section reassembler.
+///
+/// The shared CC-checked [`SectionAssembler`] yields EVERY section the
+/// packet completes — the tail before the pointer target first, then each
+/// section after it — so a PMT sitting behind another table on its PID
+/// (ATSC / DigiCipher 0xC0 sections) is found, not just the section at the
+/// pointer target. Sections that fit in one packet complete without CRC
+/// enforcement (historical behaviour); reassembled ones are CRC-checked.
 fn handle_pmt_packet(pkt: &[u8], pmt_pid: u16, state: &mut ObserverState, store: &PsiCatalogStore) {
-    if !ts_has_payload(pkt) {
-        return;
-    }
-    let cc = ts_cc(pkt);
-    let off = ts_payload_offset(pkt);
-    if off >= TS_PACKET_SIZE {
-        state.pmt_partials.remove(&pmt_pid);
-        return;
-    }
-
-    if ts_pusi(pkt) {
-        let pointer = pkt[off] as usize;
-        let tail_start = off + 1;
-        let sec_start = tail_start + pointer;
-        if sec_start > TS_PACKET_SIZE {
-            state.pmt_partials.remove(&pmt_pid);
-            return;
-        }
-        // Bytes before the pointer target are the TAIL of the previous
-        // section — fold them into an in-flight partial if CC is contiguous.
-        if let Some(mut part) = state.pmt_partials.remove(&pmt_pid)
-            && pointer > 0 && cc == ((part.last_cc + 1) & 0x0F) {
-                part.buf.extend_from_slice(&pkt[tail_start..sec_start]);
-                if part.buf.len() >= part.needed {
-                    complete_pmt_section(part.buf, part.needed, true, pmt_pid, state, store);
-                }
-            }
-            // CC gap or no tail → the partial is unrecoverable; drop it.
-        start_pmt_section(&pkt[sec_start..TS_PACKET_SIZE], cc, pmt_pid, state, store);
-    } else if let Some(part) = state.pmt_partials.get_mut(&pmt_pid) {
-        if cc != ((part.last_cc + 1) & 0x0F) {
-            // Lost a middle packet — abort rather than latch garbage.
-            state.pmt_partials.remove(&pmt_pid);
-            return;
-        }
-        part.last_cc = cc;
-        part.buf.extend_from_slice(&pkt[off..TS_PACKET_SIZE]);
-        if part.buf.len() >= part.needed {
-            let part = state
-                .pmt_partials
-                .remove(&pmt_pid)
-                .expect("partial present — just mutated");
-            complete_pmt_section(part.buf, part.needed, true, pmt_pid, state, store);
-        }
-    }
-}
-
-/// Begin a fresh section at a PUSI packet's pointer target. Sections that
-/// fit entirely in this packet complete immediately (the pre-reassembly
-/// fast path, CRC not enforced to match historical behaviour); longer ones
-/// are stashed for the continuation packets.
-fn start_pmt_section(
-    sec: &[u8],
-    cc: u8,
-    pmt_pid: u16,
-    state: &mut ObserverState,
-    store: &PsiCatalogStore,
-) {
-    if sec.len() < 3 || sec[0] != 0x02 {
-        return;
-    }
-    let section_length = (((sec[1] & 0x0F) as usize) << 8) | sec[2] as usize;
-    let needed = 3 + section_length;
-    if needed <= sec.len() {
-        complete_pmt_section(sec[..needed].to_vec(), needed, false, pmt_pid, state, store);
-    } else {
-        state.pmt_partials.insert(
-            pmt_pid,
-            PartialPmtSection { buf: sec.to_vec(), needed, last_cc: cc },
-        );
+    let completed: Vec<(Vec<u8>, bool)> = state
+        .pmt_asm
+        .entry(pmt_pid)
+        .or_default()
+        .push_packet(pkt)
+        .with_span()
+        .filter(|(s, _)| s.first() == Some(&0x02))
+        .map(|(s, spanned)| (s.to_vec(), spanned))
+        .collect();
+    for (section, spanned) in completed {
+        let needed = section.len();
+        complete_pmt_section(section, needed, spanned, pmt_pid, state, store);
     }
 }
 
@@ -731,6 +671,26 @@ mod tests {
             sender_timestamp_us: None,
         };
         observe_packet(&pkt, state, store);
+    }
+
+    /// VH1.ts: every PMT-PID packet carries a 0xC0 section at the pointer
+    /// target and the PMT behind it. The catalogue listed the program with
+    /// no streams (g12-vh1 `psi_catalog`: programs only).
+    #[test]
+    fn pmt_behind_a_private_section_is_catalogued() {
+        use crate::engine::ts_test_fixtures::{vh1_pat_packet, vh1_pmt_packet};
+        let mut state = ObserverState::default();
+        let store = PsiCatalogStore::new();
+        let mut buf = vh1_pat_packet().to_vec();
+        buf.extend_from_slice(&vh1_pmt_packet());
+        drive(&mut state, &store, &buf);
+        let cat = store.load().expect("catalog present");
+        assert_eq!(cat.programs.len(), 1);
+        let p = &cat.programs[0];
+        assert_eq!(p.program_number, 2010);
+        assert_eq!(p.pcr_pid, Some(0x0E0F));
+        let pids: Vec<u16> = p.streams.iter().map(|s| s.pid).collect();
+        assert_eq!(pids, vec![0x0E0F, 0x0E10, 0x0E11, 0x0E12, 0x0E13, 0x0E14]);
     }
 
     #[test]

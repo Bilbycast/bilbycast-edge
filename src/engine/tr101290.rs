@@ -364,12 +364,20 @@ fn process_ts_packet(
         if ts_pusi(pkt) {
             stats.pmt_count.fetch_add(1, Ordering::Relaxed);
 
-            // CRC-32 verification (Priority 2)
-            if let Some(section_start) = psi_section_start(pkt)
-                && !verify_psi_crc(pkt, section_start) {
+            // CRC-32 verification (Priority 2). A PMT PID may carry several
+            // sections per packet, including user-private SHORT-form ones
+            // (ATSC / DigiCipher 0xC0 — no CRC at all) ahead of the PMT, and
+            // a PMT may continue into the next packet. Check every
+            // long-form section that completes in this packet; the
+            // pointer-target-only check counted a CRC error on every PMT
+            // packet of such streams (the 0xC0 table has no CRC to match,
+            // and a multi-packet PMT's CRC is not in its first packet).
+            for sec in crate::engine::ts_parse::sections_in_packet(pkt) {
+                if sec.ssi && sec.complete && !verify_psi_crc(pkt, sec.start) {
                     stats.crc_errors.fetch_add(1, Ordering::Relaxed);
                     stats.window_crc_errors.fetch_add(1, Ordering::Relaxed);
                 }
+            }
 
             // Extract ES PIDs from PMT for PID error tracking (Priority 1)
             extract_es_pids_from_pmt(pkt, state);
@@ -663,23 +671,12 @@ fn extract_es_pids_from_pmt(pkt: &[u8], state: &mut crate::stats::collector::Tr1
         return;
     }
 
-    let mut offset = 4;
-    if ts_has_adaptation(pkt) {
-        let af_len = pkt[4] as usize;
-        offset = 5 + af_len;
-    }
-    if offset >= TS_PACKET_SIZE {
+    // The PMT is located with the shared section walker: a PMT PID may
+    // carry other tables (ATSC / DigiCipher 0xC0) ahead of the PMT.
+    let Some(offset) = crate::engine::ts_parse::pmt_section_offset(pkt, None) else {
         return;
-    }
-
-    let pointer = pkt[offset] as usize;
-    offset += 1 + pointer;
-
+    };
     if offset + 12 > TS_PACKET_SIZE {
-        return;
-    }
-    let table_id = pkt[offset];
-    if table_id != 0x02 {
         return;
     }
     let section_length =
@@ -768,27 +765,12 @@ fn detect_jpeg_xs_in_pmt(pkt: &[u8], state: &mut crate::stats::collector::Tr1012
         return;
     }
 
-    let mut offset = 4;
-    if ts_has_adaptation(pkt) {
-        let af_len = pkt[4] as usize;
-        offset = 5 + af_len;
-    }
-    if offset >= TS_PACKET_SIZE {
+    // The PMT is located with the shared section walker: a PMT PID may
+    // carry other tables (ATSC / DigiCipher 0xC0) ahead of the PMT.
+    let Some(offset) = crate::engine::ts_parse::pmt_section_offset(pkt, None) else {
         return;
-    }
-
-    // pointer_field
-    let pointer = pkt[offset] as usize;
-    offset += 1 + pointer;
-
-    // PMT header: table_id(1) + flags+length(2) + program_number(2) +
-    // version(1) + section_number(1) + last_section(1) + pcr_pid(2) +
-    // program_info_length(2) = 12 bytes
+    };
     if offset + 12 > TS_PACKET_SIZE {
-        return;
-    }
-    let table_id = pkt[offset];
-    if table_id != 0x02 {
         return;
     }
     let section_length =
@@ -1063,6 +1045,29 @@ mod tests {
     fn test_tei_detection() {
         let pkt = make_ts_packet_tei(0x0100, 0);
         assert!(ts_tei(&pkt));
+    }
+
+    /// VH1.ts: every PMT-PID packet carries a short-form 0xC0 section
+    /// (no CRC) at the pointer target and the PMT behind it. The analyzer
+    /// used to CRC-check the 0xC0 table — a CRC error on every PMT — and to
+    /// learn no ES PIDs.
+    #[test]
+    fn pmt_behind_a_private_section_has_no_crc_error_and_registers_es() {
+        use crate::engine::ts_test_fixtures::{vh1_pat_packet, vh1_pmt_packet};
+        let stats = Arc::new(Tr101290Accumulator::new());
+        let now = Instant::now();
+        let mut state = stats.state.lock().unwrap();
+        process_ts_packet(&vh1_pat_packet(), now, &stats, &mut state);
+        process_ts_packet(&vh1_pmt_packet(), now, &stats, &mut state);
+        assert_eq!(stats.crc_errors.load(Ordering::Relaxed), 0);
+        assert!(state.es_pids.contains_key(&0x0E0F));
+        assert!(state.es_pids.contains_key(&0x0E10));
+        // A genuinely damaged PMT is still caught.
+        let mut bad = vh1_pmt_packet();
+        bad[40] ^= 0x01;
+        bad[3] = (bad[3] & 0xF0) | ((bad[3] + 1) & 0x0F);
+        process_ts_packet(&bad, now, &stats, &mut state);
+        assert_eq!(stats.crc_errors.load(Ordering::Relaxed), 1);
     }
 
     #[test]

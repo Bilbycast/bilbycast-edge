@@ -439,11 +439,15 @@ fn process_ts_packet(pkt: &[u8], state: &mut MediaAnalysisState) {
         state.programs.sort_by_key(|p| p.program_number);
     }
 
-    // PMT handling — find the program owning this PID and update its streams.
-    if ts_pusi(pkt)
-        && let Some(program_idx) = state.programs.iter().position(|p| p.pmt_pid == pid) {
-            parse_pmt_streams(pkt, &mut state.programs[program_idx]);
+    // PMT handling — update every program whose PMT rides this PID (a PMT
+    // PID may be shared by several programs; each is matched on its
+    // program_number).
+    if ts_pusi(pkt) {
+        let shared = state.programs.iter().filter(|p| p.pmt_pid == pid).count() > 1;
+        for program in state.programs.iter_mut().filter(|p| p.pmt_pid == pid) {
+            parse_pmt_streams(pkt, program, shared);
         }
+    }
 
     // PES header detection for codec detail extraction
     if ts_pusi(pkt) && ts_has_payload(pkt) && pid != PAT_PID {
@@ -476,24 +480,17 @@ fn process_ts_packet(pkt: &[u8], state: &mut MediaAnalysisState) {
 // ── PMT Stream Extraction ────────────────────────────────────────────────
 
 /// Parse a PMT section to extract all elementary stream entries for one program.
-fn parse_pmt_streams(pkt: &[u8], program: &mut ProgramState) {
-    let mut offset = 4;
-    if ts_has_adaptation(pkt) {
-        let af_len = pkt[4] as usize;
-        offset = 5 + af_len;
-    }
-    if offset >= TS_PACKET_SIZE {
+///
+/// The section is located with the shared walker: the pointer target of a
+/// PMT-PID packet is not necessarily the PMT (ATSC / DigiCipher muxes put a
+/// 0xC0 section first), and a shared PMT PID carries other programs' PMTs.
+fn parse_pmt_streams(pkt: &[u8], program: &mut ProgramState, pid_shared: bool) {
+    let Some(offset) =
+        crate::engine::ts_parse::pmt_section_offset_for(pkt, program.program_number, pid_shared)
+    else {
         return;
-    }
-
-    let pointer = pkt[offset] as usize;
-    offset += 1 + pointer;
-
+    };
     if offset + 12 > TS_PACKET_SIZE {
-        return;
-    }
-    let table_id = pkt[offset];
-    if table_id != 0x02 {
         return;
     }
 
@@ -2252,6 +2249,29 @@ fn remove_emulation_prevention(data: &[u8]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// VH1.ts: every PMT-PID packet carries a 0xC0 section ahead of the
+    /// PMT. The analyzer used to list program 2010 with no streams.
+    #[test]
+    fn pmt_behind_a_private_section_is_analysed() {
+        use crate::engine::ts_test_fixtures::{vh1_pat_packet, vh1_pmt_packet};
+        let acc = MediaAnalysisAccumulator::new(
+            "udp".into(),
+            "raw_ts".into(),
+            false,
+            None,
+            false,
+            None,
+        );
+        let mut state = acc.state.lock().unwrap();
+        process_ts_packet(&vh1_pat_packet(), &mut state);
+        process_ts_packet(&vh1_pmt_packet(), &mut state);
+        assert_eq!(state.programs.len(), 1);
+        let p = &state.programs[0];
+        assert_eq!(p.program_number, 2010);
+        assert_eq!(p.video_streams.iter().map(|v| v.pid).collect::<Vec<_>>(), vec![0x0E0F]);
+        assert_eq!(p.audio_streams.iter().map(|a| a.pid).collect::<Vec<_>>(), vec![0x0E10]);
+    }
 
     #[test]
     fn test_adts_header_44100_stereo() {

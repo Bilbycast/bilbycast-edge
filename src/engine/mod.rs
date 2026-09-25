@@ -148,6 +148,8 @@ pub mod ts_parse;
 pub mod ts_pid_overrides_rewriter;
 pub mod ts_pid_remapper;
 pub mod ts_program_filter;
+#[cfg(test)]
+pub(crate) mod ts_test_fixtures;
 pub mod ts_psi_catalog;
 /// Encoder-style PES PTS/DTS rewriter — byte-level, no decode. Gated
 /// per-input by [`crate::config::models::RtpInputConfig::passthrough_clock`].

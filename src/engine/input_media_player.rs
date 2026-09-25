@@ -1909,26 +1909,16 @@ async fn play_ts_file(
 /// add or remove audio tracks are tracked. No allocations on the steady
 /// state — `HashSet::clear` keeps the existing capacity.
 pub(crate) fn refresh_audio_pids_from_pmt(pkt: &[u8; TS_PACKET], out: &mut HashSet<u16>) {
-    let mut offset = 4usize;
-    if (pkt[3] >> 4) & 0b11 == 0b11 {
-        // adaptation_field present — skip it
-        let af_len = pkt[4] as usize;
-        offset = 5 + af_len;
-    }
-    if offset >= TS_PACKET {
+    // The PMT is found with the shared section walker: a PMT PID may carry
+    // other tables ahead of the PMT (ATSC / DigiCipher 0xC0 sections), so
+    // the pointer target is not necessarily the PMT. When no PMT starts in
+    // this packet (a PMT-version bump shifted the section across packets
+    // and the second packet arrived first), leave the audio set as-is and
+    // re-discover on the next PUSI=1 PMT.
+    let Some(offset) = crate::engine::ts_parse::pmt_section_offset(pkt, None) else {
         return;
-    }
-    // PSI pointer_field
-    let pointer = pkt[offset] as usize;
-    offset += 1 + pointer;
+    };
     if offset + 12 > TS_PACKET {
-        return;
-    }
-    if pkt[offset] != 0x02 {
-        // Not a PMT (table_id 0x02). Could happen if a PMT-version
-        // bump shifts the section across packets and the second packet
-        // arrives first — leave the audio set as-is and re-discover
-        // on the next PUSI=1 PMT.
         return;
     }
     let section_length =
@@ -1945,19 +1935,23 @@ pub(crate) fn refresh_audio_pids_from_pmt(pkt: &[u8; TS_PACKET], out: &mut HashS
         let stream_type = pkt[pos];
         let es_pid = ((pkt[pos + 1] as u16 & 0x1F) << 8) | pkt[pos + 2] as u16;
         let es_info_len = (((pkt[pos + 3] & 0x0F) as usize) << 8) | (pkt[pos + 4] as usize);
-        let is_audio = match stream_type {
-            0x03 | 0x04 | 0x0F | 0x11 | 0x81 | 0x82 | 0x87 | 0x88 => true,
-            0x06 => private_es_descriptors_indicate_audio(
-                pkt,
-                pos + 5,
-                (pos + 5 + es_info_len).min(data_end),
-            ),
-            _ => false,
-        };
-        if is_audio {
+        let info_end = (pos + 5 + es_info_len).min(data_end);
+        if es_carries_audio(stream_type, &pkt[(pos + 5).min(info_end)..info_end]) {
             out.insert(es_pid);
         }
         pos += 5 + es_info_len;
+    }
+}
+
+/// Whether a PMT ES entry carries audio, for the PCR-floor / A/V
+/// bookkeeping: MPEG-1 / 2 audio (0x03 / 0x04), AAC ADTS / LATM (0x0F /
+/// 0x11), AC-3 (0x81), DTS (0x82), E-AC-3 (0x87), DTS-HD (0x88), and a
+/// private 0x06 ES whose descriptors mark AC-3 / E-AC-3.
+pub(crate) fn es_carries_audio(stream_type: u8, es_info: &[u8]) -> bool {
+    match stream_type {
+        0x03 | 0x04 | 0x0F | 0x11 | 0x81 | 0x82 | 0x87 | 0x88 => true,
+        0x06 => private_es_descriptors_indicate_audio(es_info),
+        _ => false,
     }
 }
 
@@ -1966,22 +1960,18 @@ pub(crate) fn refresh_audio_pids_from_pmt(pkt: &[u8; TS_PACKET], out: &mut HashS
 /// AC-3 / E-AC-3 (DVB tags `0x6A` / `0x7A`, or a `registration_descriptor`
 /// 0x05 with format_identifier `"AC-3"` / `"EAC3"`). Returns `false` for
 /// teletext / subtitle private streams which also use type 0x06.
-fn private_es_descriptors_indicate_audio(
-    pkt: &[u8; TS_PACKET],
-    start: usize,
-    end: usize,
-) -> bool {
-    let mut p = start;
-    while p + 2 <= end {
-        let tag = pkt[p];
-        let len = pkt[p + 1] as usize;
-        if p + 2 + len > end {
+fn private_es_descriptors_indicate_audio(desc: &[u8]) -> bool {
+    let mut p = 0;
+    while p + 2 <= desc.len() {
+        let tag = desc[p];
+        let len = desc[p + 1] as usize;
+        if p + 2 + len > desc.len() {
             return false;
         }
         match tag {
             0x6A | 0x7A => return true,
             0x05 if len == 4 => {
-                let fmt = &pkt[p + 2..p + 6];
+                let fmt = &desc[p + 2..p + 6];
                 if fmt == b"AC-3" || fmt == b"EAC3" {
                     return true;
                 }
@@ -4212,6 +4202,15 @@ mod tests {
         refresh_audio_pids_from_pmt(&pkt2, &mut out);
         assert!(out.contains(&0x0100));
         assert!(!out.contains(&0x0101), "removed audio PID must not linger");
+    }
+
+    /// VH1.ts: the PMT sits behind a 0xC0 section in the same packet.
+    #[test]
+    fn pmt_audio_pid_discovery_finds_a_pmt_behind_a_private_section() {
+        let pkt = crate::engine::ts_test_fixtures::vh1_pmt_packet();
+        let mut out: HashSet<u16> = HashSet::new();
+        refresh_audio_pids_from_pmt(&pkt, &mut out);
+        assert_eq!(out, HashSet::from([0x0E10]));
     }
 
 }

@@ -37,6 +37,9 @@ pub struct TsProgramFilter {
     target_program: u16,
     /// PMT PID for the target program (set after the first PAT seen).
     target_pmt_pid: Option<u16>,
+    /// The PAT maps another program to the same PMT PID — only a PMT
+    /// section with the target's program_number counts then.
+    target_pmt_pid_shared: bool,
     /// Allowed pass-through PIDs (PMT PID + each ES PID + PCR PID).
     /// PID 0 (PAT) is handled specially and never appears in this set.
     allowed_pids: HashSet<u16>,
@@ -60,6 +63,7 @@ impl TsProgramFilter {
         Self {
             target_program,
             target_pmt_pid: None,
+            target_pmt_pid_shared: false,
             allowed_pids: HashSet::new(),
             last_pat_version: None,
             last_pmt_version: None,
@@ -194,6 +198,8 @@ impl TsProgramFilter {
             .iter()
             .find(|(num, _)| *num == self.target_program)
             .map(|(_, pid)| *pid);
+        self.target_pmt_pid_shared = pmt_pid
+            .is_some_and(|p| programs.iter().filter(|(_, pid)| *pid == p).count() > 1);
 
         // If the target disappeared from the PAT, drop the cached PAT
         // and clear allowed_pids so subsequent ES packets get filtered out
@@ -233,7 +239,9 @@ impl TsProgramFilter {
     }
 
     fn handle_pmt(&mut self, pkt: &[u8]) {
-        if let Some((es_pids, pcr_pid, version)) = extract_pmt_streams(pkt) {
+        if let Some((es_pids, pcr_pid, version)) =
+            extract_pmt_streams(pkt, self.target_program, self.target_pmt_pid_shared)
+        {
             if self.last_pmt_version == Some(version) {
                 return;
             }
@@ -307,21 +315,18 @@ impl TsProgramFilter {
 /// Parse a single-packet PMT and extract its (es_pids, pcr_pid, version_number).
 /// Mirrors the logic in `media_analysis::parse_pmt_streams` but stays local
 /// to avoid coupling. Returns None if the packet is malformed.
-fn extract_pmt_streams(pkt: &[u8]) -> Option<(Vec<u16>, Option<u16>, u8)> {
-    let mut sec_off = 4;
-    if ts_has_adaptation(pkt) {
-        let af_len = pkt[4] as usize;
-        sec_off = 5 + af_len;
-    }
-    if sec_off >= TS_PACKET_SIZE {
-        return None;
-    }
-    let pointer = pkt[sec_off] as usize;
-    sec_off += 1 + pointer;
+///
+/// The PMT for `program` is located with the shared section walker: a PMT
+/// PID may carry other tables ahead of the PMT (ATSC / DigiCipher 0xC0
+/// sections) and other programs' PMTs, and the old "the pointer target is
+/// the PMT" read left an ATSC MPTS → SPTS output carrying PAT and PMT only.
+fn extract_pmt_streams(
+    pkt: &[u8],
+    program: u16,
+    pid_shared: bool,
+) -> Option<(Vec<u16>, Option<u16>, u8)> {
+    let sec_off = super::ts_parse::pmt_section_offset_for(pkt, program, pid_shared)?;
     if sec_off + 12 > TS_PACKET_SIZE {
-        return None;
-    }
-    if pkt[sec_off] != 0x02 {
         return None;
     }
     let section_length =
@@ -463,6 +468,42 @@ mod tests {
         // Throw in an unrelated PID that should be filtered away too.
         buf.extend_from_slice(&build_es_packet(0x1700, 0));
         buf
+    }
+
+    /// VH1.ts (ATSC / DigiCipher): the PMT sits behind a 0xC0 section on
+    /// its PID. The filter used to read only the pointer-target table, so
+    /// an MPTS → SPTS output of such a program carried PAT and PMT only.
+    #[test]
+    fn pmt_behind_a_private_section_allows_its_es() {
+        use crate::engine::ts_test_fixtures::{vh1_pat_packet, vh1_pmt_packet};
+        let mut filter = TsProgramFilter::new(2010);
+        let mut input = vh1_pat_packet().to_vec();
+        input.extend_from_slice(&vh1_pmt_packet());
+        for pid in [0x0E0Fu16, 0x0E10, 0x0E11, 0x0999] {
+            input.extend_from_slice(&build_es_packet(pid, 0));
+        }
+        let mut out = Vec::new();
+        filter.filter_into(&input, &mut out);
+        let pids: Vec<u16> = out.chunks(TS_PACKET_SIZE).map(ts_pid).collect();
+        assert_eq!(pids, vec![0, 0x31, 0x0E0F, 0x0E10, 0x0E11]);
+    }
+
+    /// Two programs sharing one PMT PID: each program's filter follows its
+    /// own PMT section, not whichever comes first in the packet.
+    #[test]
+    fn shared_pmt_pid_matches_on_program_number() {
+        use crate::engine::ts_test_fixtures::{packetize_sections, pat_packet, pmt_section};
+        let p1 = pmt_section(1, 0, 0x101, &[], &[(0x1B, 0x101, &[])]);
+        let p2 = pmt_section(2, 0, 0x201, &[], &[(0x1B, 0x201, &[])]);
+        let mut input = pat_packet(&[(1, 0x40), (2, 0x40)], 0, 0).to_vec();
+        input.extend_from_slice(&packetize_sections(0x40, &[&p1, &p2], 0)[0]);
+        input.extend_from_slice(&build_es_packet(0x101, 0));
+        input.extend_from_slice(&build_es_packet(0x201, 0));
+        let mut filter = TsProgramFilter::new(2);
+        let mut out = Vec::new();
+        filter.filter_into(&input, &mut out);
+        let pids: Vec<u16> = out.chunks(TS_PACKET_SIZE).map(ts_pid).collect();
+        assert_eq!(pids, vec![0, 0x40, 0x201]);
     }
 
     #[test]

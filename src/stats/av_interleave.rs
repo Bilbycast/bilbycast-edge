@@ -210,7 +210,7 @@ impl AvInterleaveSampler {
         // PMT — learn video/audio PIDs
         if let Some(pmt_pid) = state.pmt_pid
             && pid == pmt_pid && ts_parse::ts_pusi(pkt) {
-                if let Some(version) = psi_version(pkt) {
+                if let Some(version) = pmt_version(pkt) {
                     if state.last_pmt_version == Some(version) {
                         return;
                     }
@@ -460,24 +460,23 @@ fn psi_version(pkt: &[u8]) -> Option<u8> {
     Some((b >> 1) & 0x1F)
 }
 
-/// Walk a PMT section to extract `(es_pid, stream_type)` pairs.
+/// `version_number` of the PMT section in a PUSI packet — found with the
+/// shared walker, because a PMT PID may carry a user-private table (ATSC /
+/// DigiCipher 0xC0, short-form, no version field at all) at the pointer
+/// target, ahead of the PMT.
+fn pmt_version(pkt: &[u8]) -> Option<u8> {
+    let offset = ts_parse::pmt_section_offset(pkt, None)?;
+    let b = *pkt.get(offset + 5)?;
+    Some((b >> 1) & 0x1F)
+}
+
 /// Walk PMT ES entries; returns `(es_pid, stream_type, es_info)` with
 /// the descriptor bytes copied out so the audio-PID pick can
 /// discriminate DVB 0x06 audio from teletext / subtitling. Cold path —
 /// runs only on PMT version bumps.
 fn parse_pmt_streams(pkt: &[u8]) -> Option<Vec<(u16, u8, Vec<u8>)>> {
-    let mut offset = 4usize;
-    if ts_parse::ts_has_adaptation(pkt) {
-        let af_len = pkt[4] as usize;
-        offset = 5 + af_len;
-    }
-    if offset >= ts_parse::TS_PACKET_SIZE {
-        return None;
-    }
-    let pointer = pkt[offset] as usize;
-    offset += 1 + pointer;
-    // table_id must be 0x02 (PMT)
-    if offset + 12 > ts_parse::TS_PACKET_SIZE || pkt[offset] != 0x02 {
+    let offset = ts_parse::pmt_section_offset(pkt, None)?;
+    if offset + 12 > ts_parse::TS_PACKET_SIZE {
         return None;
     }
     let section_length =
@@ -641,6 +640,19 @@ mod tests {
     fn empty_state_returns_none() {
         let s = AvInterleaveSampler::new();
         assert!(s.snapshot().is_none());
+    }
+
+    /// VH1.ts: the PMT sits behind a 0xC0 section on its PID.
+    #[test]
+    fn pmt_behind_a_private_section_is_discovered() {
+        use crate::engine::ts_test_fixtures::{vh1_pat_packet, vh1_pmt_packet};
+        let s = AvInterleaveSampler::new();
+        s.observe_packet(&vh1_pat_packet());
+        s.observe_packet(&vh1_pmt_packet());
+        s.observe_packet(&build_pes_with_pts(0x0E0F, 90_000));
+        s.observe_packet(&build_pes_with_pts(0x0E10, 90_000));
+        let snap = s.snapshot().expect("A/V PIDs learned");
+        assert_eq!((snap.video_pid, snap.audio_pid), (0x0E0F, 0x0E10));
     }
 
     #[test]
