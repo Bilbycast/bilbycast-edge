@@ -1218,17 +1218,17 @@ fn decode_worker(
 ) {
     use video_codec::{ScalerDstFormat, VideoCodec};
     use video_engine::{VideoDecoder, VideoScaler};
+    use crate::engine::video_encode_util::{DecoderFor, LazyDecoder};
 
     let dst_fmt = match fmt {
         PgroupFormat::Yuv422_8bit => ScalerDstFormat::Yuv422p8,
         PgroupFormat::Yuv422_10bit => ScalerDstFormat::Yuv422p10le,
     };
 
-    let mut current_codec: Option<VideoCodec> = None;
-    let mut decoder: Option<VideoDecoder> = None;
-    // An H.264 (re)open waits for an access unit that carries the SPS,
-    // which seeds the decoder's reorder depth (`SpsOpenGate`).
-    let mut sps_gate = crate::engine::video_encode_util::SpsOpenGate::new();
+    // The decoder and the codec it is open for, recorded only once an open
+    // succeeds. An H.264 (re)open waits for an access unit that carries the
+    // SPS, which seeds the decoder's reorder depth (`SpsOpenGate`).
+    let mut decoder: LazyDecoder<VideoDecoder> = LazyDecoder::new();
     let mut scaler: Option<VideoScaler> = None;
 
     // ── PMT-vs-bitstream codec mismatch detection ────────────────────
@@ -1430,18 +1430,13 @@ fn decode_worker(
             )
         };
         let threaded_cpu = || seeded(video_engine::DecoderBackend::Cpu, video_engine::DecoderThreading::Auto);
-        if current_codec != Some(codec) {
-            // Nothing decodes before the SPS; opened on a P picture at a
-            // mid-GOP join, a source that declares no reordering would be
-            // held a frame for good.
-            if !sps_gate.admits(codec, &nalu_bytes) {
-                continue;
-            }
-            current_codec = Some(codec);
-            aus_since_open = 0;
-            frames_since_open = 0;
-            keyframe_fed_since_open = false;
-            stalled = false;
+        // Nothing decodes before the SPS; opened on a P picture at a mid-GOP
+        // join, a source that declares no reordering would be held a frame
+        // for good. The codec counts as open only once an open succeeds: a
+        // failed open leaves no decoder and is retried after a back-off
+        // (`LazyDecoder`) — it used to leave the codec recorded as open over
+        // an empty slot, and the next access unit panicked unwrapping it.
+        let dec = match decoder.decoder_for(codec, &nalu_bytes, || {
             // Resolve the operator's `hw_decode` preference (unset =
             // Auto: VAAPI ≻ NVDEC ≻ QSV ≻ CPU against the startup probe):
             // 2160p50 HEVC software decode is the egress throughput
@@ -1502,7 +1497,7 @@ fn decode_worker(
                     None => video_engine::DecoderBackend::Cpu,
                 }
             };
-            let opened = if matches!(backend, video_engine::DecoderBackend::Cpu) {
+            if matches!(backend, video_engine::DecoderBackend::Cpu) {
                 threaded_cpu()
             } else {
                 match seeded(backend, video_engine::DecoderThreading::Single) {
@@ -1522,17 +1517,24 @@ fn decode_worker(
                         threaded_cpu()
                     }
                 }
-            };
-            decoder = Some(match opened {
-                Ok(d) => d,
-                Err(e) => {
-                    tracing::error!(error = %e, "ST 2110-20 output decoder open failed");
-                    continue;
+            }
+        }) {
+            DecoderFor::Ready { decoder, fresh } => {
+                if fresh {
+                    aus_since_open = 0;
+                    frames_since_open = 0;
+                    keyframe_fed_since_open = false;
+                    stalled = false;
+                    scaler = None;
                 }
-            });
-            scaler = None;
-        }
-        let dec = decoder.as_mut().unwrap();
+                decoder
+            }
+            DecoderFor::Waiting => continue,
+            DecoderFor::Failed(e) => {
+                tracing::error!(error = %e, "ST 2110-20 output decoder open failed");
+                continue;
+            }
+        };
 
         // Feed the NALUs (as annex-B, built above) to the decoder. Attach
         // the source PES PTS so the decoder propagates it (in presentation
@@ -1705,8 +1707,7 @@ fn decode_worker(
             if !cpu_retry_done {
                 cpu_retry_done = true;
                 force_cpu_fallback = true;
-                current_codec = None; // force reopen on the next AU
-                decoder = None;
+                decoder.close(); // force reopen on the next AU
                 scaler = None;
                 tracing::warn!(
                     output_id = %output_id,
@@ -1733,8 +1734,7 @@ fn decode_worker(
                 if retry != codec {
                     codec_override = Some(retry);
                     force_cpu_fallback = false; // let the HW backend re-resolve
-                    current_codec = None;
-                    decoder = None;
+                    decoder.close();
                     scaler = None;
                     tracing::warn!(
                         output_id = %output_id,

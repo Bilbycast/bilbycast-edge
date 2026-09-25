@@ -571,6 +571,102 @@ impl SpsOpenGate {
     }
 }
 
+/// Access units a [`LazyDecoder`] whose open failed passes over before it
+/// tries again (1-2 s of video), so a decoder that cannot open is not
+/// re-attempted — and logged — on every access unit.
+pub const DECODER_REOPEN_BACKOFF_AUS: u32 = 50;
+
+/// A lazily opened decoder and the codec it decodes, for a decode worker fed
+/// access units whose codec can change under it (a PMT change, a sniffed
+/// codec override, an input switch).
+///
+/// The codec counts as open only once its open has **succeeded**. The MXL
+/// and ST 2110-20 / -23 egress workers used to record the codec before
+/// opening: a failed first open left no decoder while the codec said one
+/// was open, so the next access unit skipped the open and panicked on
+/// `decoder.as_mut().unwrap()`; a failed open on a codec change left the
+/// previous codec's decoder in place to be fed the new codec's access
+/// units. Here a codec change drops the old decoder before the new one is
+/// tried, a failed open leaves none, and the next attempt waits
+/// [`DECODER_REOPEN_BACKOFF_AUS`] access units and then the [`SpsOpenGate`]
+/// as usual.
+pub struct LazyDecoder<D> {
+    codec: Option<video_codec::VideoCodec>,
+    decoder: Option<D>,
+    gate: SpsOpenGate,
+    backoff: u32,
+}
+
+/// What [`LazyDecoder::decoder_for`] has for an access unit.
+pub enum DecoderFor<'a, D, E> {
+    /// The decoder open for the access unit's codec; `fresh` on the access
+    /// unit that opened it (the caller resets its per-decoder state).
+    Ready { decoder: &'a mut D, fresh: bool },
+    /// No decoder for this access unit: an H.264 open is waiting for an SPS,
+    /// or a failed open is backing off.
+    Waiting,
+    /// The open this access unit triggered failed; no decoder is open.
+    Failed(E),
+}
+
+impl<D> Default for LazyDecoder<D> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<D> LazyDecoder<D> {
+    pub fn new() -> Self {
+        Self { codec: None, decoder: None, gate: SpsOpenGate::new(), backoff: 0 }
+    }
+
+    /// The decoder for an access unit `au` (Annex B) of `codec`. When none
+    /// is open for `codec`, any other codec's decoder is dropped and — once
+    /// the back-off has run out and the SPS gate admits `au` — `open` is
+    /// called: seed it from `au`.
+    pub fn decoder_for<E>(
+        &mut self,
+        codec: video_codec::VideoCodec,
+        au: &[u8],
+        open: impl FnOnce() -> Result<D, E>,
+    ) -> DecoderFor<'_, D, E> {
+        let mut fresh = false;
+        if self.codec != Some(codec) {
+            self.codec = None;
+            self.decoder = None;
+            if self.backoff > 0 {
+                self.backoff -= 1;
+                return DecoderFor::Waiting;
+            }
+            if !self.gate.admits(codec, au) {
+                return DecoderFor::Waiting;
+            }
+            match open() {
+                Ok(d) => {
+                    self.decoder = Some(d);
+                    self.codec = Some(codec);
+                    fresh = true;
+                }
+                Err(e) => {
+                    self.backoff = DECODER_REOPEN_BACKOFF_AUS;
+                    return DecoderFor::Failed(e);
+                }
+            }
+        }
+        match self.decoder.as_mut() {
+            Some(decoder) => DecoderFor::Ready { decoder, fresh },
+            None => DecoderFor::Waiting,
+        }
+    }
+
+    /// Drop the decoder: the next access unit re-opens one (through the SPS
+    /// gate).
+    pub fn close(&mut self) {
+        self.codec = None;
+        self.decoder = None;
+    }
+}
+
 // ───────────────────── Sample aspect ratio ─────────────────────
 
 /// Largest term the H.264 / HEVC VUI can carry for `sar_width` /
@@ -2049,6 +2145,95 @@ mod sps_gate_tests {
         assert!(g.admits(VideoCodec::Hevc, P_PICTURE));
         assert!(g.admits(VideoCodec::Mpeg2, &[0, 0, 1, 0xB3]));
         assert_eq!(g.passed_over(), 0);
+    }
+}
+
+#[cfg(test)]
+mod lazy_decoder_tests {
+    use super::{DecoderFor, LazyDecoder, DECODER_REOPEN_BACKOFF_AUS};
+    use video_codec::VideoCodec;
+
+    /// A "decoder" that remembers the codec it was opened for.
+    #[derive(Debug, PartialEq)]
+    struct Fake(VideoCodec);
+
+    /// One access unit through `lazy`; `open_ok` decides what an open does.
+    /// Returns the codec of the decoder handed back (with its `fresh` flag),
+    /// `Err(true)` for a failed open, `Err(false)` for waiting, and counts
+    /// the opens attempted.
+    fn feed(
+        lazy: &mut LazyDecoder<Fake>,
+        codec: VideoCodec,
+        open_ok: bool,
+        opens: &mut u32,
+    ) -> Result<(VideoCodec, bool), bool> {
+        let result = lazy.decoder_for(codec, &[0, 0, 1, 0x40], || {
+            *opens += 1;
+            if open_ok { Ok(Fake(codec)) } else { Err("no decoder") }
+        });
+        match result {
+            DecoderFor::Ready { decoder, fresh } => Ok((decoder.0, fresh)),
+            DecoderFor::Failed(_) => Err(true),
+            DecoderFor::Waiting => Err(false),
+        }
+    }
+
+    /// The MXL / ST 2110 egress panic: the first open fails and the next
+    /// access unit found the codec recorded as open with no decoder behind
+    /// it. Here it waits out the back-off, retries, and opens.
+    #[test]
+    fn a_failed_open_leaves_no_decoder_and_is_retried_after_the_back_off() {
+        let mut lazy = LazyDecoder::new();
+        let mut opens = 0;
+        assert_eq!(feed(&mut lazy, VideoCodec::Hevc, false, &mut opens), Err(true));
+        for _ in 0..DECODER_REOPEN_BACKOFF_AUS {
+            assert_eq!(
+                feed(&mut lazy, VideoCodec::Hevc, true, &mut opens),
+                Err(false),
+                "no decoder while the failed open backs off",
+            );
+        }
+        assert_eq!(opens, 1, "not retried on every access unit");
+        assert_eq!(feed(&mut lazy, VideoCodec::Hevc, true, &mut opens), Ok((VideoCodec::Hevc, true)));
+        assert_eq!(feed(&mut lazy, VideoCodec::Hevc, true, &mut opens), Ok((VideoCodec::Hevc, false)));
+        assert_eq!(opens, 2);
+    }
+
+    /// A failed open on a codec change must not leave the previous codec's
+    /// decoder to be fed the new codec's access units.
+    #[test]
+    fn a_failed_open_on_a_codec_change_drops_the_old_decoder() {
+        let mut lazy = LazyDecoder::new();
+        let mut opens = 0;
+        assert_eq!(feed(&mut lazy, VideoCodec::Hevc, true, &mut opens), Ok((VideoCodec::Hevc, true)));
+        assert_eq!(feed(&mut lazy, VideoCodec::Mpeg2, false, &mut opens), Err(true));
+        assert_eq!(feed(&mut lazy, VideoCodec::Mpeg2, true, &mut opens), Err(false));
+    }
+
+    /// An H.264 open still waits for an access unit that carries the SPS;
+    /// `close` forces a fresh open through the gate.
+    #[test]
+    fn an_h264_open_waits_for_the_sps_and_close_reopens() {
+        const WITH_SPS: &[u8] = &[0, 0, 0, 1, 0x67, 0x42, 0, 0x1E, 0, 0, 0, 1, 0x65, 0x88];
+        const P_PICTURE: &[u8] = &[0, 0, 0, 1, 0x41, 0x9A];
+        let mut lazy: LazyDecoder<Fake> = LazyDecoder::new();
+        let mut opens = 0;
+        let mut open = |au: &[u8], lazy: &mut LazyDecoder<Fake>| {
+            match lazy.decoder_for(VideoCodec::H264, au, || {
+                opens += 1;
+                Ok::<_, ()>(Fake(VideoCodec::H264))
+            }) {
+                DecoderFor::Ready { fresh, .. } => Some(fresh),
+                _ => None,
+            }
+        };
+        assert_eq!(open(P_PICTURE, &mut lazy), None);
+        assert_eq!(open(WITH_SPS, &mut lazy), Some(true));
+        assert_eq!(open(P_PICTURE, &mut lazy), Some(false));
+        lazy.close();
+        assert_eq!(open(P_PICTURE, &mut lazy), None, "a re-open waits for the SPS again");
+        assert_eq!(open(WITH_SPS, &mut lazy), Some(true));
+        assert_eq!(opens, 2);
     }
 }
 
