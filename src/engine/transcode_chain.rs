@@ -586,6 +586,10 @@ fn run_chain(
             audio.as_ref().and_then(TsAudioReplacer::replaced_pid),
             video.as_ref().and_then(TsVideoReplacer::replaced_pid),
         );
+        if let Some(v) = video.as_mut() {
+            pcr.set_input_pcr_starved(v.input_pcr_starved());
+            pcr.note_source_holds(v.take_source_holds());
+        }
         after_pcr_scratch.clear();
         pcr.process(after_video, &mut after_pcr_scratch);
         if after_pcr_scratch.is_empty() {

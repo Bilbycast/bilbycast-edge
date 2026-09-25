@@ -63,6 +63,161 @@ use super::ts_parse::{
     ts_payload_offset, ts_pid, ts_pusi, PAT_PID, TS_PACKET_SIZE, TS_SYNC_BYTE,
 };
 
+/// Input video decode time without an input PCR after which the input is
+/// taken to carry none, so the trailing `ts_pcr_remux` stage synthesises one
+/// (R1). MPEG-TS asks for a PCR at least every 100 ms, but a source mux
+/// bunches small pictures between two PCRs (VH1: four PES, 100 ms of DTS,
+/// between PCRs 33 ms apart), so the bound is ten times that.
+const PCR_STARVED_90K: u64 = 90_000;
+/// A per-PES input DTS step above this is a jump (a splice, an input
+/// switch), not decode time, and does not count toward [`PCR_STARVED_90K`].
+const DTS_STEP_MAX_90K: u64 = 45_000;
+/// A video silence — input PCR time between the last packet of a video PES
+/// and the start of the next — is a *hold* when it is over twice the
+/// input's usual one and over this (MPEG-TS's longest PCR interval).
+const SILENCE_MIN_27MHZ: i64 = 100 * 27_000;
+/// Silences the usual one is the median of.
+const SILENCE_STEPS: usize = 8;
+/// Consumed video PES remembered until their frame leaves (a frame the
+/// decoder or admission drops leaves its entry to age out).
+const IN_FLIGHT_MAX: usize = 64;
+
+/// What the input's own clock says about the video PID — two things the
+/// chain's trailing `ts_pcr_remux` stage cannot see, because every video
+/// packet it gets is re-encoded output leaving the codec in bursts.
+///
+/// - **PCR starvation (R1).** The remux used to call an input PCR-less
+///   when a re-encoded video DTS ran 100 ms past the first one since the
+///   last input PCR — which a burst of four frames at 29.97 fps does. It
+///   then synthesised a PCR from the video (DI, a forward jump of the
+///   video's lead), latched the audio against it and raised `D` by ~0.9 s
+///   for good. Here the input's own video decode time since its last PCR
+///   is counted, PES by PES as they arrive.
+/// - **Holds (R2).** A video PES ends only where the next one starts, and a
+///   B-frame source's decoder keeps a picture back until the next one is
+///   decoded. When the input's video goes silent while its clock runs on —
+///   the tail of a media-player file, whose next loop starts ~600 ms of
+///   stream later — the frames still in that pipeline wait for the source,
+///   not for the codec. The silence beyond the usual one is summed; each
+///   frame that leaves is told how much of it it sat through, and the
+///   remux drops such a frame when it is late rather than raising `D` for
+///   every frame after it.
+#[derive(Debug, Default)]
+#[cfg_attr(not(feature = "media-codecs"), allow(dead_code))]
+pub(crate) struct SourceClockWatch {
+    /// Last input PCR on the source PCR PID (27 MHz).
+    last_pcr: Option<u64>,
+    /// DTS (or PTS) of the last input video PES start, and the input decode
+    /// time summed PES by PES since the last input PCR.
+    last_dts: Option<u64>,
+    since_pcr_90k: u64,
+    /// Input PCR when the last video payload packet arrived.
+    pcr_at_video: Option<u64>,
+    /// Recent inter-PES silences (a ring) — the usual one is their median.
+    silences: [i64; SILENCE_STEPS],
+    silences_len: usize,
+    silences_next: usize,
+    /// Every hold so far, summed (27 MHz).
+    silence_total: i64,
+    /// Consumed PES: `(PTS, silence_total when its data was complete)`.
+    in_flight: std::collections::VecDeque<(u64, i64)>,
+    /// Frames that left having sat through a hold: `(PTS, hold)`.
+    holds: Vec<(u64, i64)>,
+}
+
+#[cfg_attr(not(feature = "media-codecs"), allow(dead_code))]
+impl SourceClockWatch {
+    /// An input PCR on the source PCR PID. `on_video_payload`: it rode a
+    /// video payload packet — that packet's data arrived at it.
+    pub(crate) fn on_pcr(&mut self, pcr: u64, on_video_payload: bool) {
+        self.last_pcr = Some(pcr);
+        self.since_pcr_90k = 0;
+        if on_video_payload {
+            self.pcr_at_video = Some(pcr);
+        }
+    }
+
+    /// An input video PES starts with this DTS (or PTS). `carries_pcr`: its
+    /// first packet also carries a PCR, which resets the count anyway.
+    pub(crate) fn on_pes_start(&mut self, dts: Option<u64>, carries_pcr: bool) {
+        let Some(d) = dts else {
+            return;
+        };
+        if let Some(prev) = self.last_dts {
+            let step = d.wrapping_sub(prev) & 0x1_FFFF_FFFF;
+            if !carries_pcr && (1..=DTS_STEP_MAX_90K).contains(&step) {
+                self.since_pcr_90k += step;
+            }
+        }
+        self.last_dts = Some(d);
+    }
+
+    /// The input has gone [`PCR_STARVED_90K`] of video decode time without
+    /// a PCR.
+    pub(crate) fn starved(&self) -> bool {
+        self.since_pcr_90k >= PCR_STARVED_90K
+    }
+
+    /// A video payload packet, ahead of any PCR it carries. At a PES start
+    /// the silence since the previous video packet is measured, and the
+    /// hold total at which the PES it completes had all its data — before
+    /// that silence — is returned.
+    pub(crate) fn on_video_payload(&mut self, pusi: bool) -> i64 {
+        let complete_at = self.silence_total;
+        if pusi && let (Some(now), Some(at)) = (self.last_pcr, self.pcr_at_video) {
+            let silence = crate::engine::ts_parse::pcr_diff_27mhz(now, at).max(0);
+            if let Some(usual) = self.usual_silence()
+                && silence > (2 * usual).max(SILENCE_MIN_27MHZ)
+            {
+                self.silence_total += silence - usual;
+            }
+            self.silences[self.silences_next] = silence;
+            self.silences_next = (self.silences_next + 1) % SILENCE_STEPS;
+            self.silences_len = (self.silences_len + 1).min(SILENCE_STEPS);
+        }
+        self.pcr_at_video = self.last_pcr;
+        complete_at
+    }
+
+    fn usual_silence(&self) -> Option<i64> {
+        if self.silences_len == 0 {
+            return None;
+        }
+        let mut s = self.silences;
+        let s = &mut s[..self.silences_len];
+        s.sort_unstable();
+        Some(s[s.len() / 2])
+    }
+
+    /// A PES with this PTS goes to the decoder; its data was complete at
+    /// hold total `complete_at`.
+    pub(crate) fn pes_consumed(&mut self, pts: u64, complete_at: i64) {
+        if self.in_flight.len() == IN_FLIGHT_MAX {
+            self.in_flight.pop_front();
+        }
+        self.in_flight.push_back((pts, complete_at));
+    }
+
+    /// A re-encoded frame stamped with source PTS `pts` leaves: the holds
+    /// since its PES was complete are what it sat through.
+    pub(crate) fn frame_out(&mut self, pts: u64) {
+        let Some(i) = self.in_flight.iter().position(|(p, _)| *p == pts) else {
+            return;
+        };
+        let (_, at) = self.in_flight.remove(i).unwrap_or_default();
+        let hold = self.silence_total - at;
+        if hold > 0 {
+            self.holds.push((pts, hold));
+        }
+    }
+
+    /// The `(PTS, hold)` of frames that left having sat through a hold,
+    /// since the last call.
+    pub(crate) fn take_holds(&mut self) -> Vec<(u64, i64)> {
+        std::mem::take(&mut self.holds)
+    }
+}
+
 /// Lock-free runtime counters for the streaming TS video replacer.
 ///
 /// Each counter is incremented by the replacer hot path and read once per
@@ -415,6 +570,34 @@ impl TsVideoReplacer {
         }
     }
 
+    /// Whether the input has gone a second of video decode time without a
+    /// PCR — what the chain's `ts_pcr_remux` synthesises a PCR on (see
+    /// [`SourceClockWatch`]).
+    pub fn input_pcr_starved(&self) -> bool {
+        #[cfg(feature = "media-codecs")]
+        {
+            self.inner.clock.starved()
+        }
+        #[cfg(not(feature = "media-codecs"))]
+        {
+            false
+        }
+    }
+
+    /// `(PTS, hold in 27 MHz)` of every re-encoded frame that left since
+    /// the last call having waited on a silent input video PID (see
+    /// [`SourceClockWatch`]) — for the chain's `ts_pcr_remux`.
+    pub fn take_source_holds(&mut self) -> Vec<(u64, i64)> {
+        #[cfg(feature = "media-codecs")]
+        {
+            self.inner.clock.take_holds()
+        }
+        #[cfg(not(feature = "media-codecs"))]
+        {
+            Vec::new()
+        }
+    }
+
     /// Drain buffered PES / encoder state. Call on graceful shutdown.
     #[allow(dead_code, unused_variables)]
     pub fn flush(&mut self, output: &mut Vec<u8>) {
@@ -543,6 +726,11 @@ mod inner {
         pes_buffer: Vec<u8>,
         pes_started: bool,
         pending_pts: Option<u64>,
+        /// The input's own clock against its video: PCR starvation and the
+        /// holds of a silent video PID. See [`SourceClockWatch`].
+        pub(super) clock: SourceClockWatch,
+        /// Hold total at which the PES being consumed had all its data.
+        consuming_complete_at: i64,
 
         pub(super) decoder: Option<VideoDecoder>,
         /// Shared encoder pipeline — wraps `VideoEncoder` + optional
@@ -798,6 +986,8 @@ mod inner {
                 pes_started: false,
                 pending_pts: None,
                 decoder: None,
+                clock: SourceClockWatch::default(),
+                consuming_complete_at: 0,
                 pipeline,
                 out_video_cc: 0,
                 out_frame_count: 0,
@@ -875,6 +1065,7 @@ mod inner {
             self.pes_started = false;
             self.pending_pts = None;
             self.decoder = None;
+            self.clock = SourceClockWatch::default();
             // The new source's frames are admitted afresh; a backward step
             // across the switch is a new source, not a reordered picture.
             self.last_admitted_pts_90k = None;
@@ -1012,28 +1203,36 @@ mod inner {
                 }
 
                 // Every input PCR keeps its stream position as an
-                // adaptation-field-only packet on the video PID — taken
-                // before `feed_video_packet` swallows the packet it rides
-                // in. Value and DI unchanged: the chain's trailing
-                // `ts_pcr_remux` stage owns the delay. CC repeats the last
-                // payload CC on the PID (the one before the first payload
-                // before any).
-                if let Some(vpid) = self.video_pid
-                    && Some(pid) == self.source_pcr_pid
-                    && let Some(pcr) = extract_pcr(pkt)
-                {
-                    let cc = self.out_video_cc.wrapping_sub(1) & 0x0F;
-                    output.extend_from_slice(&pcr_only_packet(
-                        vpid,
-                        cc,
-                        pcr,
-                        ts_discontinuity_indicator(pkt),
-                    ));
-                }
+                // adaptation-field-only packet on the video PID. Value and
+                // DI unchanged: the chain's trailing `ts_pcr_remux` stage
+                // owns the delay. CC repeats the last payload CC on the PID
+                // (the one before the first payload before any).
+                //
+                // On a video packet the carrier goes out *after* whatever
+                // re-encoded output that packet released: a PUSI completes
+                // the previous PES, whose frame belongs before the PCR the
+                // new one's first packet carries. Emitted ahead of it, a
+                // PCR-per-frame source (the RTMP / RTSP / WebRTC ingest
+                // muxer: PCR = DTS on each frame's first packet) had every
+                // frame measured against the NEXT frame's PCR, and `D`
+                // latched a whole frame interval too high — 200 ms at
+                // 5 fps, 2 s at 0.5 fps.
+                let pcr_here = self
+                    .video_pid
+                    .filter(|_| Some(pid) == self.source_pcr_pid)
+                    .zip(extract_pcr(pkt));
 
                 if Some(pid) == self.video_pid {
                     self.feed_video_packet(pkt, output);
+                    if let Some((vpid, pcr)) = pcr_here {
+                        self.emit_pcr_carrier(vpid, pcr, pkt, output);
+                        self.clock.on_pcr(pcr, ts_has_payload(pkt));
+                    }
                     continue;
+                }
+                if let Some((vpid, pcr)) = pcr_here {
+                    self.emit_pcr_carrier(vpid, pcr, pkt, output);
+                    self.clock.on_pcr(pcr, false);
                 }
 
                 self.passthrough_cc.note(pid, pkt);
@@ -1048,6 +1247,18 @@ mod inner {
             // at all, so the decoder never even sees input.
             self.engage.note_packets((input_ts.len() / TS_PACKET_SIZE) as u64);
             self.poll_engage(now);
+        }
+
+        /// The adaptation-field-only packet that keeps an input PCR's stream
+        /// position on the video PID.
+        fn emit_pcr_carrier(&self, vpid: u16, pcr: u64, pkt: &[u8], output: &mut Vec<u8>) {
+            let cc = self.out_video_cc.wrapping_sub(1) & 0x0F;
+            output.extend_from_slice(&pcr_only_packet(
+                vpid,
+                cc,
+                pcr,
+                ts_discontinuity_indicator(pkt),
+            ));
         }
 
         /// Advance the engage watchdog and emit whatever it raises (on the
@@ -1277,6 +1488,7 @@ mod inner {
         pub fn flush(&mut self, output: &mut Vec<u8>) {
             if self.pes_started && !self.pes_buffer.is_empty() {
                 let pes = std::mem::take(&mut self.pes_buffer);
+                self.consuming_complete_at = self.clock.on_video_payload(false);
                 let _ = self.consume_pes(&pes, output);
                 self.pes_started = false;
             }
@@ -1357,6 +1569,7 @@ mod inner {
                 rep.set_video_delta(0); // PTS == source value
             }
             let pts_for_pes = queued.unwrap_or(self.pts_90k);
+            self.clock.frame_out(pts_for_pes);
             let pes = build_video_pes(data, pts_for_pes);
             for p in &packetize_ts(vpid, &pes, &mut self.out_video_cc) {
                 output.extend_from_slice(p);
@@ -1378,9 +1591,16 @@ mod inner {
             }
             let payload = &pkt[payload_start..];
 
+            let complete_at = self.clock.on_video_payload(pusi);
             if pusi {
+                self.clock.on_pes_start(
+                    crate::engine::ts_parse::extract_pes_dts(pkt)
+                        .or_else(|| crate::engine::ts_parse::extract_pes_pts(pkt)),
+                    extract_pcr(pkt).is_some(),
+                );
                 if self.pes_started && !self.pes_buffer.is_empty() {
                     let pes = std::mem::take(&mut self.pes_buffer);
+                    self.consuming_complete_at = complete_at;
                     let _ = self.consume_pes(&pes, output);
                 }
                 self.pes_buffer.clear();
@@ -1416,6 +1636,9 @@ mod inner {
             // is the decode timestamp.
             let pes_dts = pes_dts.or(pts);
             self.pending_pts = pts;
+            if let Some(p) = pts {
+                self.clock.pes_consumed(p, self.consuming_complete_at);
+            }
             let pes_arrived_us = crate::util::time::now_us();
 
             if !self.pts_anchored
@@ -2736,6 +2959,92 @@ mod tests {
         assert_eq!(out, audio.to_vec(), "the gate gave up: today's passthrough");
     }
 
+    /// R1. The input's own video decode time since its last PCR is what
+    /// says it carries none — bursts of PES between two PCRs (VH1: four
+    /// PES, 100 ms of DTS, between PCRs 33 ms apart) are not; a second of
+    /// it with no PCR is; a PCR clears it. A PES whose first packet carries
+    /// the PCR, and a DTS jump, add nothing.
+    #[test]
+    fn starvation_is_a_second_of_input_decode_time_without_a_pcr() {
+        let mut w = SourceClockWatch::default();
+        let step = 3_003u64;
+        let mut dts = 900_000u64;
+        for n in 0..300u64 {
+            w.on_pcr(27_000_000 + n * 33 * 27_000, false);
+            for _ in 0..if n % 4 == 3 { 4 } else { 0 } {
+                w.on_pes_start(Some(dts), false);
+                dts += step;
+            }
+            assert!(!w.starved(), "bursts between PCRs at PCR {n}");
+        }
+        w.on_pcr(30_000_000_000, false);
+        for k in 0..30u64 {
+            assert!(!w.starved(), "{k} PES without a PCR");
+            w.on_pes_start(Some(dts), false);
+            dts += step;
+        }
+        assert!(w.starved(), "30 × 3003 ticks ≥ 1 s without a PCR");
+        w.on_pcr(40_000_000_000, false);
+        assert!(!w.starved());
+        // A PCR on the PES's own first packet, and a jump, are not decode
+        // time without a PCR.
+        for _ in 0..40 {
+            w.on_pes_start(Some(dts), true);
+            dts += step;
+        }
+        w.on_pes_start(Some(dts + 20 * 90_000), false);
+        assert!(!w.starved());
+    }
+
+    /// R2. The PES the input left pending when its video went silent (the
+    /// tail of a media-player file) — and every frame still in the pipeline
+    /// with it — sat through that silence beyond the usual one: that is the
+    /// hold each such frame reports when it leaves. A frame whose PES was
+    /// complete only after the silence reports none.
+    #[test]
+    fn a_frame_that_waited_on_a_silent_video_pid_reports_its_hold() {
+        let mut w = SourceClockWatch::default();
+        let ms = 27_000u64;
+        let mut pcr = 27_000_000u64;
+        let mut pts = 900_000u64;
+        // Steady: a PES every 40 ms, its 4 packets back to back after an
+        // AF-only PCR — so the usual silence before a PES start is 40 ms.
+        for _ in 0..20 {
+            w.on_pcr(pcr, false);
+            pcr += 40 * ms;
+            for k in 0..4 {
+                let at = w.on_video_payload(k == 0);
+                if k == 0 {
+                    w.pes_consumed(pts - 3_600, at);
+                    w.frame_out(pts - 7_200);
+                }
+            }
+            pts += 3_600;
+        }
+        assert!(w.take_holds().is_empty(), "no silence, no hold");
+        // 680 ms of input clock with no video (AF-only filler PCRs).
+        for _ in 0..17 {
+            w.on_pcr(pcr, false);
+            pcr += 40 * ms;
+        }
+        // The next file's first PES: the last one (pts − 3600) completes,
+        // and the frame the decoder held back (pts − 7200) leaves, then that
+        // one; both sat through the silence. The next file's own frame did
+        // not.
+        let at = w.on_video_payload(true);
+        w.pes_consumed(pts - 3_600, at);
+        w.frame_out(pts - 7_200);
+        w.frame_out(pts - 3_600);
+        w.on_pcr(pcr, false);
+        let later = w.on_video_payload(true);
+        w.pes_consumed(pts + 60_000, later);
+        w.frame_out(pts + 60_000);
+        // The silence (680 ms since the last video packet) beyond the
+        // usual 40 ms.
+        let hold = 640 * ms as i64;
+        assert_eq!(w.take_holds(), vec![(pts - 7_200, hold), (pts - 3_600, hold)]);
+    }
+
     #[test]
     fn a_takeover_continues_the_passthrough_cc() {
         let mut r = TsVideoReplacer::new(&cfg("x264"), None).unwrap();
@@ -3415,6 +3724,167 @@ mod tests {
             let dec = r.inner.decoder.as_ref().expect("opened");
             assert_eq!(dec.reorder_depth(), 0);
             assert!(out_pes(&out).len() >= 10);
+        }
+
+        /// Run `ts` through the replacer and a trailing `TsPcrRemux` the
+        /// way `transcode_chain` does, chunk by chunk.
+        fn chain(
+            r: &mut TsVideoReplacer,
+            pcr: &mut crate::engine::ts_pcr_remux::TsPcrRemux,
+            ts: &[u8],
+        ) -> Vec<u8> {
+            let mut out = Vec::new();
+            for chunk in ts.chunks(TS_PACKET_SIZE * 7) {
+                let mut v = Vec::new();
+                r.process(chunk, &mut v);
+                pcr.set_replaced_pids(None, r.replaced_pid());
+                pcr.set_input_pcr_starved(r.input_pcr_starved());
+                pcr.note_source_holds(r.take_source_holds());
+                pcr.process(&v, &mut out);
+            }
+            out
+        }
+
+        /// Every re-encoded video PES on 0x100 against the output PCR in
+        /// force where it starts: `(DTS, PCR)`, both 27 MHz.
+        fn video_vs_pcr(out: &[u8]) -> Vec<(u64, u64)> {
+            let mut last = None;
+            let mut v = Vec::new();
+            for p in out.chunks(TS_PACKET_SIZE) {
+                if ts_pid(p) != 0x100 {
+                    continue;
+                }
+                if let Some(pcr) = extract_pcr(p) {
+                    last = Some(pcr);
+                }
+                if ts_pusi(p)
+                    && let (Some(ts), Some(pcr)) = (crate::engine::ts_parse::extract_pes_pts(p), last)
+                {
+                    v.push((ts * 300, pcr));
+                }
+            }
+            v
+        }
+
+        /// A4(b). The RTMP / RTSP / WebRTC ingest muxer writes PCR = DTS in
+        /// the first packet of every frame. That packet completes the
+        /// previous frame's PES; the carrier of its PCR now leaves after the
+        /// frame it released, so each frame is measured against its own PCR
+        /// and `D` stays at its 80 ms. (Carried first, every frame read a
+        /// frame interval late and `D` latched 120 ms at 25 fps — 280 ms at
+        /// 5 fps, 2 s at 0.5 fps.)
+        #[test]
+        fn a_pcr_per_frame_source_latches_no_frame_interval() {
+            let aus = x264_aus(40, (320, 240), None, None);
+            let mut mux = crate::engine::rtmp::ts_mux::TsMuxer::new();
+            let mut ts = Vec::new();
+            for (i, au) in aus.iter().enumerate() {
+                let t = 900_000 + i as u64 * 3_600;
+                for b in mux.mux_video(au, t, t, i % 25 == 0) {
+                    ts.extend_from_slice(&b);
+                }
+            }
+            let mut r = TsVideoReplacer::new(&cfg("x264"), None).unwrap();
+            let mut pcr = crate::engine::ts_pcr_remux::TsPcrRemux::new();
+            let out = chain(&mut r, &mut pcr, &ts);
+            assert!(r.stats_handle().output_frames.load(Ordering::Relaxed) >= 20);
+            assert_eq!(pcr.offset_27mhz(), 80 * 27_000, "no frame interval latched");
+            let st = pcr.stats_handle().snapshot();
+            assert_eq!((st.late_frames, st.offset_raises, st.synthesized_pcrs), (0, 0, 0));
+            let di = out
+                .chunks(TS_PACKET_SIZE)
+                .filter(|p| extract_pcr(p).is_some() && ts_discontinuity_indicator(p))
+                .count();
+            assert_eq!(di, 0);
+        }
+
+        /// R2, through a real decoder and libx264. A B-frame source (its
+        /// decoder holds a picture back) is looped the way the media player
+        /// does: the file's video ends, its clock runs on with filler PCRs
+        /// only, and the next file starts at an IDR 640 ms of that clock
+        /// later. The pending PES and the picture the decoder held leave
+        /// only with the next file's first video, ~300 ms behind their
+        /// decode time. They waited on the source: dropped as stale, `D`
+        /// never raised, nothing on the wire behind its PCR.
+        #[test]
+        fn a_media_player_loop_tail_never_raises_d() {
+            use video_codec::VideoEncoderConfig;
+            let mkaus = |n: usize| {
+                let mut enc = video_engine::VideoEncoder::open(&VideoEncoderConfig {
+                    codec: VideoEncoderCodec::X264,
+                    width: 320,
+                    height: 240,
+                    fps_num: 25,
+                    fps_den: 1,
+                    bitrate_kbps: 1_500,
+                    gop_size: 25,
+                    preset: VideoPreset::Veryfast,
+                    global_header: false,
+                    max_b_frames: 2,
+                    tune: String::new(),
+                    ..VideoEncoderConfig::default()
+                })
+                .expect("libx264 opens");
+                let mut aus = Vec::new();
+                for i in 0..n {
+                    let y: Vec<u8> =
+                        (0..320 * 240).map(|k| ((k % 320 + i / 2) % 200) as u8 + 16).collect();
+                    let c = vec![128u8; 160 * 120];
+                    aus.extend(enc.encode_frame(&y, 320, &c, 160, &c, 160, Some(i as i64)).unwrap());
+                }
+                aus.extend(enc.flush().unwrap());
+                aus
+            };
+            let lead = 27_000u64; // 300 ms, 90 kHz
+            let seg = |ts: &mut Vec<u8>, aus: &[video_codec::EncodedVideoFrame], base: u64, cc: &mut u8| {
+                let mut last = 0;
+                for au in aus {
+                    let pts = base + (au.pts + 2) as u64 * 3_600;
+                    let dts = base + (au.dts + 2) as u64 * 3_600;
+                    ts.extend_from_slice(&crate::engine::ts_parse::pcr_only_packet(
+                        0x100,
+                        cc.wrapping_sub(1) & 0x0F,
+                        (dts - lead) * 300,
+                        false,
+                    ));
+                    for p in packetize_ts(0x100, &build_video_pes_with_dts(&au.data, pts, dts), cc) {
+                        ts.extend_from_slice(&p);
+                    }
+                    last = dts;
+                }
+                last
+            };
+            let a = mkaus(50);
+            assert!(a.iter().any(|f| f.pts != f.dts), "the source has B-frames");
+            let mut ts = Vec::new();
+            ts.extend_from_slice(&synth_pat(0x1000));
+            ts.extend_from_slice(&synth_pmt(0x1000, 0x100, 0x1B));
+            let mut cc = 0u8;
+            let last = seg(&mut ts, &a, 900_000, &mut cc);
+            let mut t = last - lead;
+            for _ in 0..20 {
+                t += 2_700;
+                ts.extend_from_slice(&crate::engine::ts_parse::pcr_only_packet(
+                    0x100,
+                    cc.wrapping_sub(1) & 0x0F,
+                    t * 300,
+                    false,
+                ));
+            }
+            let _ = seg(&mut ts, &mkaus(25), last + 3_600 + 54_000, &mut cc);
+
+            let mut r = TsVideoReplacer::new(&cfg("x264"), None).unwrap();
+            let mut pcr = crate::engine::ts_pcr_remux::TsPcrRemux::new();
+            let out = chain(&mut r, &mut pcr, &ts);
+            let st = pcr.stats_handle().snapshot();
+            assert_eq!(pcr.offset_27mhz(), 80 * 27_000);
+            assert_eq!((st.offset_raises, st.late_frames, st.epochs), (0, 0, 0));
+            assert!(st.stale_frames_dropped >= 1, "the tail was dropped: {st:?}");
+            let pes = video_vs_pcr(&out);
+            assert!(pes.len() >= 60, "{} frames out", pes.len());
+            for (dts, pcr) in pes {
+                assert!(dts >= pcr, "a frame {} ms behind its PCR", (pcr - dts) / 27_000);
+            }
         }
 
         /// A frame-coded source keeps its rate: one PES per frame.

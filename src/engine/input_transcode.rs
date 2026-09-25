@@ -265,6 +265,10 @@ impl InputTranscoder {
             self.audio.as_ref().and_then(TsAudioReplacer::replaced_pid),
             self.video.as_ref().and_then(TsVideoReplacer::replaced_pid),
         );
+        if let Some(v) = self.video.as_mut() {
+            self.pcr.set_input_pcr_starved(v.input_pcr_starved());
+            self.pcr.note_source_holds(v.take_source_holds());
+        }
         self.scratch_p.clear();
         self.pcr.process(after_video, &mut self.scratch_p);
 
