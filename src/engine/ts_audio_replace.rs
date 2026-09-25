@@ -888,7 +888,8 @@ impl TsAudioReplacer {
             // switch from a codec that passed through): continue the CC
             // sequence of whatever went out on it before.
             if self.replaced_pid() != was_replacing
-                && let Some(cc) = self.passthrough_cc.next_after(apid)
+                && self.replaced_pid() == Some(apid)
+                && let Some(cc) = self.passthrough_cc.take_next_after(apid)
             {
                 self.out_audio_cc = cc;
             }
@@ -4442,5 +4443,13 @@ mod tests {
         assert_eq!(got.len(), 1);
         assert_eq!(ts_cc(got[0]), 1, "the AF-only carrier repeats the last CC on the wire");
         assert_eq!(r.out_audio_cc, 2, "the first re-encoded payload continues at 2");
+        // The replacer carries the PID (CC 2..=8 out), then an input switch
+        // moves the PMT PID with the audio still on 0x0101: nothing passed
+        // through since the takeover, so its own CC carries on.
+        r.out_audio_cc = 9;
+        r.process(&synth_pat(0x1001), &mut out);
+        r.process(&synth_pmt_audio(0x1001, 0x0101, 0x0F), &mut out);
+        assert_eq!(r.replaced_pid(), Some(0x0101));
+        assert_eq!(r.out_audio_cc, 9, "no rewind to a stale passthrough CC");
     }
 }

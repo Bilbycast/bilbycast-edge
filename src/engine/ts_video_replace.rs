@@ -1045,7 +1045,7 @@ mod inner {
                     // Taking the PID over: continue the CC sequence of
                     // whatever was passed through on it (the gate
                     // fallback, or a previous program layout).
-                    if let Some(cc) = self.passthrough_cc.next_after(vpid) {
+                    if let Some(cc) = self.passthrough_cc.take_next_after(vpid) {
                         self.out_video_cc = cc;
                     }
                 }
@@ -2486,6 +2486,23 @@ mod tests {
         assert_eq!(got.len(), 1);
         assert_eq!(ts_cc(&got[0]), 6, "AF-only repeats the last CC on the wire");
         assert_eq!(r.inner.out_video_cc, 7, "the first re-encoded payload continues at 7");
+        // The replacer then carries the PID for a while (CC 7..=11 out), an
+        // input switch moves the PMT PID and the new PMT keeps video on
+        // 0x100: nothing passed through since the takeover, so the CC
+        // carries on from the replacer's own — not back to 7.
+        r.inner.out_video_cc = 12;
+        r.inner.process_at(&synth_pat(0x1001), &mut out, late);
+        let sec = crate::engine::ts_test_fixtures::pmt_section(
+            1,
+            1,
+            0x100,
+            &[],
+            &[(0x1B, 0x100, &[]), (0x0F, 0x101, &[])],
+        );
+        let pmt = crate::engine::ts_test_fixtures::packetize_sections(0x1001, &[&sec], 0)[0];
+        r.inner.process_at(&pmt, &mut out, late);
+        assert_eq!(r.inner.video_pid, Some(0x100));
+        assert_eq!(r.inner.out_video_cc, 12, "no rewind to a stale passthrough CC");
     }
 
     #[test]

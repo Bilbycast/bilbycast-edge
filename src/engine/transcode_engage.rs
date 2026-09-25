@@ -558,7 +558,8 @@ impl PrePmtGate {
 
 /// Last passthrough continuity counter per PID, so a replacer that takes a
 /// PID over continues its CC sequence. One 8 KiB table per replacer,
-/// allocated once (`0xFF` = never seen).
+/// allocated once (`0xFF` = nothing passed through since the replacer last
+/// took the PID over).
 pub struct PassthroughCc(Box<[u8; 8192]>);
 
 impl Default for PassthroughCc {
@@ -573,9 +574,13 @@ impl PassthroughCc {
         self.0[(pid & 0x1FFF) as usize] = pkt[3] & 0x0F;
     }
 
-    /// The CC the replacer's first payload packet on `pid` should carry.
-    pub fn next_after(&self, pid: u16) -> Option<u8> {
-        match self.0[(pid & 0x1FFF) as usize] {
+    /// The replacer takes `pid` over: the CC its first payload packet
+    /// should carry, when packets passed through on the PID since it last
+    /// held it. Consumes the entry — from here the replacer's own counter
+    /// is the last CC on the wire, and a later takeover (after a program
+    /// re-layout the gate held back) must not rewind to this one.
+    pub fn take_next_after(&mut self, pid: u16) -> Option<u8> {
+        match std::mem::replace(&mut self.0[(pid & 0x1FFF) as usize], 0xFF) {
             0xFF => None,
             cc => Some((cc + 1) & 0x0F),
         }
