@@ -2344,14 +2344,8 @@ fn open_video_decoder_with_retry(
                     d.set_rkmpp_zero_copy(true);
                 }
                 counters.set_active_decoder_label(decoder_label_for_backend(state.backend));
-                // Hardware is genuinely back in the decode path, so the
-                // re-promotion clock is spent. `maybe_repromote_hw_decode`
-                // leaves it armed across the probe precisely so that a
-                // *failed* open (the demote at the bottom of this function,
-                // which stamps nothing) still re-tests later.
                 if !matches!(state.backend, DecoderBackend::Cpu) {
-                    state.demoted_at = None;
-                    state.hw_repromoted_at = Some(Instant::now());
+                    note_hw_open(state, Instant::now());
                 }
                 return Some(d);
             }
@@ -2394,6 +2388,23 @@ fn open_video_decoder_with_retry(
         );
     }
     open_seeded(codec, DecoderBackend::Cpu, au).ok()
+}
+
+/// A hardware decoder opened. When it is a re-promotion's open —
+/// `demoted_at` is still armed: `maybe_repromote_hw_decode` leaves it so
+/// across the probe precisely so that a *failed* open (the demote at the
+/// bottom of [`open_video_decoder_with_retry`], which stamps nothing) still
+/// re-tests later — hardware is genuinely back, so the re-promotion clock is
+/// spent and the session's start is stamped for the #96 decay
+/// ([`repromotion_held`]). Any other open — the first, a codec change, the
+/// drop-and-reopen an operator switch does — stamps nothing: re-stamping on
+/// each restarted the clock at every switch, so on a switcher cutting more
+/// often than [`HW_REPROMOTE_BACKOFF_MAX`] a re-promotion that held was
+/// never credited and the backoff ratcheted to its ceiling.
+fn note_hw_open(state: &mut HwOpenState, now: Instant) {
+    if state.demoted_at.take().is_some() {
+        state.hw_repromoted_at = Some(now);
+    }
 }
 
 fn ensure_video_decoder(
@@ -2707,12 +2718,14 @@ fn flush_decoders_for_switch(
 /// Whether [`flush_decoders_for_switch`] drops the video decoder (re-opened
 /// on the next keyframe, its H.264 reorder depth seeded from that AU)
 /// instead of flushing it. Only where a seed applies — H.264 on the CPU or
-/// VAAPI backend (see `video_engine::ReorderSeed`) — and only when the
-/// stream may have changed underneath: an operator switch or a PTS jump.
-/// A subscriber lag is the same source with packets missing, and a flush
-/// is all it needs.
+/// VAAPI backend (see `video_engine::ReorderSeed`) — and only on an
+/// operator switch, when another source is on the other side. A PTS jump
+/// (an SRT FEC repair out of order, a media-player loop) and a subscriber
+/// lag are the same source, whose depth the decoder has right: a flush is
+/// all they need, and a re-open would cost a VAAPI context, its surface
+/// pool and the PRIME framebuffer cache on every one.
 fn switch_drops_decoder(reason: &str, codec: VideoCodec, backend: DecoderBackend) -> bool {
-    reason != "lagged"
+    reason == "switch"
         && codec == VideoCodec::H264
         && matches!(backend, DecoderBackend::Cpu | DecoderBackend::Vaapi)
 }
@@ -7003,22 +7016,53 @@ mod tests {
         assert_eq!(d.reorder_depth(), 0);
     }
 
-    /// A switch or PTS jump drops a seeded (H.264, CPU / VAAPI) decoder so
-    /// the next keyframe re-seeds it; a lag, and every other decoder, is
-    /// flushed as before.
+    /// An operator switch drops a seeded (H.264, CPU / VAAPI) decoder so
+    /// the next keyframe re-seeds it from the new source; a PTS jump and a
+    /// lag (the same source), and every other decoder, are flushed as
+    /// before.
     #[test]
     fn a_switch_drops_only_a_seeded_decoder() {
         use DecoderBackend::*;
-        for reason in ["switch", "pts_jump"] {
-            assert!(switch_drops_decoder(reason, VideoCodec::H264, Cpu));
-            assert!(switch_drops_decoder(reason, VideoCodec::H264, Vaapi));
-            for b in [Nvdec, Qsv, Rkmpp] {
-                assert!(!switch_drops_decoder(reason, VideoCodec::H264, b));
-            }
-            assert!(!switch_drops_decoder(reason, VideoCodec::Hevc, Cpu));
-            assert!(!switch_drops_decoder(reason, VideoCodec::Mpeg2, Cpu));
+        assert!(switch_drops_decoder("switch", VideoCodec::H264, Cpu));
+        assert!(switch_drops_decoder("switch", VideoCodec::H264, Vaapi));
+        for b in [Nvdec, Qsv, Rkmpp] {
+            assert!(!switch_drops_decoder("switch", VideoCodec::H264, b));
         }
-        assert!(!switch_drops_decoder("lagged", VideoCodec::H264, Cpu));
+        assert!(!switch_drops_decoder("switch", VideoCodec::Hevc, Cpu));
+        assert!(!switch_drops_decoder("switch", VideoCodec::Mpeg2, Cpu));
+        for reason in ["pts_jump", "lagged"] {
+            assert!(!switch_drops_decoder(reason, VideoCodec::H264, Cpu), "{reason}");
+            assert!(!switch_drops_decoder(reason, VideoCodec::H264, Vaapi), "{reason}");
+        }
+    }
+
+    /// The #96 decay credits a re-promotion that held for the whole backoff
+    /// ladder. The re-open an operator switch does is not a re-promotion:
+    /// it must not restart that session's clock (it did — so on a switcher
+    /// cutting more often than the ladder, no recovery was ever credited),
+    /// and a first open stamps nothing at all.
+    #[test]
+    fn only_a_re_promotion_open_stamps_the_session() {
+        let now = Instant::now();
+        let mut state = demoted_state();
+        assert!(fire_repromote(&mut state));
+        let probe_opened = now - (HW_REPROMOTE_BACKOFF_MAX + Duration::from_secs(1));
+        note_hw_open(&mut state, probe_opened);
+        assert_eq!(state.demoted_at, None, "the clock is spent");
+        assert_eq!(state.hw_repromoted_at, Some(probe_opened));
+        // Switches re-open the decoder every 30 s: the session still dates
+        // from the probe, so a later demote credits the recovery.
+        for _ in 0..3 {
+            note_hw_open(&mut state, now);
+        }
+        assert_eq!(state.hw_repromoted_at, Some(probe_opened));
+        assert!(repromotion_held(state.hw_repromoted_at.map(|t| now - t)));
+        // A first open (never demoted) is not a re-promotion.
+        let mut fresh = demoted_state();
+        fresh.demoted_at = None;
+        fresh.hw_repromoted_at = None;
+        note_hw_open(&mut fresh, now);
+        assert_eq!(fresh.hw_repromoted_at, None);
     }
 
     // MPEG-2 stays pinned to software decode on VAAPI (hardware decode
