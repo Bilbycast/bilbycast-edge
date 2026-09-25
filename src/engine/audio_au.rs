@@ -24,10 +24,16 @@
 //! first AU, after a resync, after a continuity-counter break — a candidate
 //! is only cut once its successor is a consistent header too, or it ends
 //! exactly on a PES boundary; otherwise it is a false sync inside a payload
-//! and the cutter moves on a byte. An AU into which a new PES begins with a
-//! consistent header of its own was cut short upstream (the truncated last
-//! PES of a file at a loop wrap) and is discarded, never glued to the next
-//! PES's bytes.
+//! and the cutter moves on a byte. A candidate a scan found (not where an AU
+//! ended, not at a PES start) with other parameters than the stream's last
+//! AU is dropped at once, without waiting for the length it claims. An AU
+//! into which a new PES begins with a header of its own — of the same
+//! parameters, or of others with a consistent successor (a playlist item or
+//! a splice with another configuration) — was cut short upstream (the
+//! truncated last PES of a file at a loop wrap) and is discarded, never
+//! glued to the next PES's bytes. AC-3 and E-AC-3 frames share a key: an
+//! AC-3 core followed by E-AC-3 dependent substreams (Annex E) is one
+//! stream.
 
 use std::collections::VecDeque;
 
@@ -65,8 +71,10 @@ pub struct AuHeader {
     pub len: usize,
     /// Stream parameters that stay constant from one AU to the next (ADTS
     /// profile + sampling frequency + channel configuration, MPEG audio layer
-    /// + rate, AC-3 / E-AC-3 kind + rate). A "successor" with another key is
-    /// not the next AU.
+    /// + rate, the AC-3 / E-AC-3 rate). A "successor" with another key is
+    /// not the next AU, and a candidate the chain does not vouch for whose
+    /// key differs from the stream's last AU is a false sync unless a PES
+    /// begins with it (see [`AuCutter::next`]).
     pub key: u32,
     /// Nominal duration in samples at [`Self::sample_rate`]; 0 when the
     /// header does not carry it (LOAS, an E-AC-3 dependent substream).
@@ -221,6 +229,11 @@ fn ac3_header(buf: &[u8]) -> Head {
         return Head::Invalid;
     }
     const RATES: [u32; 3] = [48_000, 44_100, 32_000];
+    // The key is the sample-rate code alone: AC-3 and E-AC-3 syncframes
+    // interleave legally in one stream (Annex E: an AC-3 core as
+    // independent substream 0, E-AC-3 dependent substreams extending it to
+    // 7.1), so the bitstream family must not make a frame's successor look
+    // like another stream's.
     let fscod = buf[4] >> 6;
     let bsid = buf[5] >> 3;
     if bsid <= 10 {
@@ -238,18 +251,18 @@ fn ac3_header(buf: &[u8]) -> Head {
     if strmtyp == 3 {
         return Head::Invalid;
     }
-    let (sample_rate, blocks) = if fscod == 3 {
+    let (key, sample_rate, blocks) = if fscod == 3 {
         let fscod2 = (buf[4] >> 4) & 0x03;
         if fscod2 == 3 {
             return Head::Invalid;
         }
-        ([24_000, 22_050, 16_000][fscod2 as usize], 6)
+        (3 + fscod2 as u32, [24_000, 22_050, 16_000][fscod2 as usize], 6)
     } else {
-        (RATES[fscod as usize], [1, 2, 3, 6][((buf[4] >> 4) & 0x03) as usize])
+        (fscod as u32, RATES[fscod as usize], [1, 2, 3, 6][((buf[4] >> 4) & 0x03) as usize])
     };
     Head::Valid(AuHeader {
         len,
-        key: 0x100 | fscod as u32,
+        key,
         samples: if strmtyp == 1 { 0 } else { 256 * blocks },
         sample_rate,
     })
@@ -285,6 +298,17 @@ pub struct CutAu {
 struct Mark {
     offset: u64,
     pts: Option<u64>,
+}
+
+/// What [`AuCutter::pes_inside`] found.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Inside {
+    /// No PES starts inside with a header of its own.
+    None,
+    /// One does, `rel` bytes in, with this key.
+    Header { rel: usize, key: u32 },
+    /// A PES starts inside, but the bytes to judge it have not arrived.
+    Wait,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -324,6 +348,10 @@ pub struct AuCutter {
     /// `Some(key)` while the head of `buf` is exactly where the last cut AU
     /// (of that key) ended, with no byte lost in between.
     chained: Option<u32>,
+    /// Key of the last AU cut, kept across resyncs (only a new cutter
+    /// forgets it): the stream's parameters, which a candidate found by
+    /// scanning must share unless a PES begins with it.
+    last_key: Option<u32>,
     /// Bytes discarded (resync, truncated AUs, overflow) since the last
     /// [`Self::take_discarded`].
     discarded: u64,
@@ -341,6 +369,7 @@ impl AuCutter {
             pes_left: None,
             pes_end: None,
             chained: None,
+            last_key: None,
             discarded: 0,
         }
     }
@@ -450,6 +479,52 @@ impl AuCutter {
         self.discard(skip);
     }
 
+    /// Whether a PES begins inside the AU at `start..end` (of key `key`)
+    /// with an AU header of its own. One of the AU's own key is taken at its
+    /// word; one of another key (the next PES is another stream: a playlist
+    /// item or a splice with another configuration) only once its own
+    /// successor agrees or it ends on a PES boundary, since the continuation
+    /// of an AU straddling into that PES could look like a header by chance.
+    /// Every PES start inside is looked at, not only the first: the first
+    /// can open with such a continuation.
+    fn pes_inside(&self, start: u64, end: u64, key: u32, at_end: bool) -> Inside {
+        for m in self.marks.iter().filter(|m| m.offset > start && m.offset < end) {
+            let rel = (m.offset - start) as usize;
+            let Some(bytes) = self.buf.get(rel..) else {
+                break;
+            };
+            match parse_header(self.fmt, bytes) {
+                Head::Valid(next) if next.key == key => {
+                    return Inside::Header { rel, key };
+                }
+                Head::Valid(next) => match self.confirmed(rel, next, at_end) {
+                    Some(true) => return Inside::Header { rel, key: next.key },
+                    Some(false) => {}
+                    None => return Inside::Wait,
+                },
+                Head::NeedMore if !at_end => return Inside::Wait,
+                _ => {}
+            }
+        }
+        Inside::None
+    }
+
+    /// Whether the header `h` found `rel` bytes into the buffer has a
+    /// consistent successor: a header of its key right after it, or a PES
+    /// boundary there. `None` until the bytes to judge have arrived.
+    fn confirmed(&self, rel: usize, h: AuHeader, at_end: bool) -> Option<bool> {
+        let after = rel + h.len;
+        let abs = self.base + after as u64;
+        if self.pes_end == Some(abs) || self.marks.iter().any(|m| m.offset == abs) {
+            return Some(true);
+        }
+        match self.buf.get(after..).map(|b| parse_header(self.fmt, b)) {
+            Some(Head::Valid(n)) => Some(n.key == h.key),
+            Some(Head::Invalid) => Some(false),
+            Some(Head::NeedMore) | None => at_end.then_some(true),
+        }
+    }
+
     /// The next complete, validated AU, if one is ready. `at_end` (a
     /// shutdown flush) accepts an AU whose successor has not arrived and
     /// discards an incomplete tail.
@@ -473,22 +548,40 @@ impl AuCutter {
             };
             let start = self.base;
             let end = start + h.len as u64;
-            // A PES that begins inside this AU with a consistent header of
-            // its own: this AU was cut short upstream (a file's truncated
-            // last PES at a loop wrap). Drop it and continue at that PES.
-            if let Some(m) = self.marks.iter().find(|m| m.offset > start && m.offset < end) {
-                let rel = (m.offset - start) as usize;
-                match self.buf.get(rel..).map(|b| parse_header(self.fmt, b)) {
-                    Some(Head::Valid(next)) if next.key == h.key => {
-                        self.discard(rel);
-                        // A header at a PES start is the stream's own
-                        // alignment: trust it.
-                        self.chained = Some(h.key);
-                        continue;
-                    }
-                    Some(Head::NeedMore) | None if !at_end => return None,
-                    _ => {}
+            // Where this candidate stands: where the last AU ended, or at
+            // the start of a PES — the stream's own alignment — or somewhere
+            // a scan for a sync landed.
+            let aligned =
+                self.chained.is_some() || self.marks.iter().any(|m| m.offset == start);
+            // A scanned candidate with other stream parameters than the
+            // stream's last AU is a false sync inside a payload: move on now
+            // instead of waiting out the length it claims (up to 8 KB of
+            // ADTS, half a second of audio that would then leave in a burst,
+            // late against the PCR).
+            if !aligned && self.last_key.is_some_and(|k| k != h.key) {
+                self.discard(1);
+                continue;
+            }
+            // A PES that begins inside this AU with a header of its own.
+            match self.pes_inside(start, end, h.key, at_end) {
+                Inside::Header { rel, key } if aligned => {
+                    // This AU was cut short upstream (a file's truncated
+                    // last PES at a loop wrap, a splice): drop it and go on
+                    // at that PES, whose header is the stream's own
+                    // alignment.
+                    self.discard(rel);
+                    self.chained = Some(key);
+                    continue;
                 }
+                Inside::Header { .. } => {
+                    // A scanned candidate spanning a real AU: a false sync.
+                    // Scanning on (rather than jumping to the PES) keeps any
+                    // real AU between the two.
+                    self.discard(1);
+                    continue;
+                }
+                Inside::Wait => return None,
+                Inside::None => {}
             }
             if h.len > self.buf.len() {
                 if at_end {
@@ -515,6 +608,7 @@ impl AuCutter {
             let data: Vec<u8> = self.buf.drain(..h.len).collect();
             self.base = end;
             self.chained = Some(h.key);
+            self.last_key = Some(h.key);
             let mut pes_start = false;
             let mut pts = None;
             while let Some(m) = self.marks.front().copied() {
@@ -730,6 +824,154 @@ mod tests {
         aus.extend(std::iter::from_fn(|| c.next(true)));
         assert_eq!(aus.len(), 2);
         assert_eq!(aus[0].pts, Some(12_345));
+    }
+
+    /// An ADTS frame of `len` bytes with the given sampling-frequency index
+    /// and channel configuration.
+    fn adts_with(len: usize, fill: u8, sfi: u8, channel_config: u8) -> Vec<u8> {
+        let mut f = adts(len, fill);
+        f[2] = (1 << 6) | (sfi << 2) | ((channel_config >> 2) & 0x01);
+        f[3] = ((channel_config & 0x03) << 6) | ((len >> 11) as u8 & 0x03);
+        f
+    }
+
+    /// Feed `es` as TS payload continuing the open PES (no PUSI).
+    fn feed_more(c: &mut AuCutter, es: &[u8]) -> Vec<CutAu> {
+        let mut out = Vec::new();
+        for chunk in es.chunks(184) {
+            c.push(false, chunk);
+            while let Some(au) = c.next(false) {
+                out.push(au);
+            }
+        }
+        out
+    }
+
+    /// A PES whose PES_packet_length is 0 (unbounded, as on video PIDs and
+    /// some audio muxers): more ES can follow in non-PUSI packets.
+    fn open_pes(es: &[u8], pts: Option<u64>) -> Vec<u8> {
+        let mut p = pes(es, pts);
+        p[4] = 0;
+        p[5] = 0;
+        p
+    }
+
+    /// A file's truncated last PES followed by a PES of another stream
+    /// (a playlist moving from a stereo file to a 5.1 one): the partial AU
+    /// is dropped, not glued to the new PES's first AU, and the new PES's
+    /// PTS goes to that AU.
+    #[test]
+    fn a_truncated_au_is_dropped_before_a_pes_of_other_parameters() {
+        let a1 = adts_with(300, 0x11, 3, 2);
+        let a2 = adts_with(400, 0x22, 3, 2);
+        let mut es = a1.clone();
+        es.extend_from_slice(&a2[..200]);
+        let mut c = AuCutter::new(AuFormat::Adts);
+        let mut aus = feed(&mut c, &pes(&es, Some(1_000)));
+        let b: Vec<Vec<u8>> = (0..3).map(|i| adts_with(500, 0x33 + i, 3, 6)).collect();
+        aus.extend(feed(&mut c, &pes(&b[..2].concat(), Some(90_000))));
+        aus.extend(feed(&mut c, &pes(&b[2], Some(92_000))));
+        aus.extend(std::iter::from_fn(|| c.next(true)));
+        let got: Vec<&[u8]> = aus.iter().map(|a| a.data.as_slice()).collect();
+        assert_eq!(got, vec![&a1[..], &b[0][..], &b[1][..], &b[2][..]]);
+        assert_eq!((aus[1].pes_start, aus[1].pts), (true, Some(90_000)));
+        assert_eq!(c.take_discarded(), 200, "exactly the partial AU");
+    }
+
+    /// An AU whose continuation into the next PES happens to parse as a
+    /// header of other parameters is still cut whole: another stream's
+    /// header counts only with a consistent successor.
+    #[test]
+    fn a_straddle_whose_continuation_looks_like_a_foreign_header_is_cut_whole() {
+        let frames: Vec<Vec<u8>> = (0..4).map(|i| adts(400, 0x40 + i)).collect();
+        let mut es = frames.concat();
+        // Frame 1's bytes 250.. open PES 2 and begin like a 44.1 kHz ADTS
+        // header of 64 bytes, whose "successor" is more of frame 1.
+        es[400 + 250..400 + 257].copy_from_slice(&adts_with(64, 0, 4, 2)[..7]);
+        let mut c = AuCutter::new(AuFormat::Adts);
+        let mut aus = feed(&mut c, &pes(&es[..650], Some(0)));
+        aus.extend(feed(&mut c, &pes(&es[650..], Some(3_840))));
+        aus.extend(std::iter::from_fn(|| c.next(true)));
+        assert_eq!(aus.len(), 4);
+        assert_eq!(aus[1].data, es[400..800]);
+        assert_eq!((aus[2].pes_start, aus[2].pts), (true, Some(3_840)));
+        assert_eq!(c.take_discarded(), 0);
+    }
+
+    /// E-AC-3's backward-compatible 7.1 (Annex E): an AC-3 core frame
+    /// (bsid 8) followed by an E-AC-3 dependent substream frame (bsid 16).
+    /// Both are cut, every PES; the core is not a "false sync" for having
+    /// a successor of the other bitstream family.
+    #[test]
+    fn an_ac3_core_with_e_ac3_dependent_substreams_is_cut_whole() {
+        let core = |fill: u8| {
+            let mut f = vec![fill; 1792];
+            f[..6].copy_from_slice(&[0x0B, 0x77, 0, 0, 30, 8 << 3]);
+            f
+        };
+        let dep = |fill: u8| {
+            let mut f = vec![fill; 768];
+            f[..6].copy_from_slice(&[0x0B, 0x77, 0x40 | 0x01, 0x7F, 0x30, 16 << 3]);
+            f
+        };
+        let mut c = AuCutter::new(AuFormat::Ac3);
+        let mut aus = Vec::new();
+        for k in 0..6u8 {
+            let es = [core(0x10 + k), dep(0x80 + k)].concat();
+            aus.extend(feed(&mut c, &pes(&es, Some(90_000 + k as u64 * 2_880))));
+        }
+        aus.extend(std::iter::from_fn(|| c.next(true)));
+        let lens: Vec<usize> = aus.iter().map(|a| a.data.len()).collect();
+        assert_eq!(lens, [1792, 768].repeat(6), "every core and every dependent frame");
+        assert_eq!(c.take_discarded(), 0);
+        assert!(aus.iter().step_by(2).all(|a| a.pes_start), "each PES's PTS on its core");
+    }
+
+    /// After a continuity break, a false sync of other stream parameters
+    /// inside the damaged AU claiming 6000 bytes is dropped at once: the
+    /// next real AU is cut as soon as it is complete, not 6000 bytes later.
+    #[test]
+    fn a_foreign_false_sync_after_a_break_is_dropped_at_once() {
+        let f: Vec<Vec<u8>> = (0..6).map(|i| adts(300, 0x20 + i)).collect();
+        let mut head = [f[0].clone(), f[1].clone()].concat();
+        head.extend_from_slice(&f[2][..150]);
+        let mut damaged = f[2][190..].to_vec();
+        // 44.1 kHz mono, 6000 bytes: not this stream's parameters.
+        damaged[10..17].copy_from_slice(&adts_with(6000, 0, 4, 1)[..7]);
+        let mut c = AuCutter::new(AuFormat::Adts);
+        let mut aus = feed(&mut c, &open_pes(&head, Some(0)));
+        c.mark_discontinuity();
+        aus.extend(feed_more(&mut c, &damaged));
+        aus.extend(feed_more(&mut c, &[f[3].clone(), f[4].clone(), f[5].clone()].concat()));
+        let got: Vec<u8> = aus.iter().map(|a| a.data[7]).collect();
+        assert_eq!(got, vec![0x20, 0x21, 0x23, 0x24, 0x25], "frame 3 on out without waiting");
+    }
+
+    /// A false sync of the stream's own parameters claiming 6000 bytes
+    /// spans two PES starts: the first opens with the continuation of a
+    /// straddling AU, the second with a real header. Every PES start is
+    /// looked at, so the real AUs come out without waiting 6000 bytes.
+    #[test]
+    fn every_pes_start_inside_a_false_sync_is_looked_at() {
+        let f: Vec<Vec<u8>> = (0..9).map(|i| adts(300, 0x20 + i)).collect();
+        let mut head = [f[0].clone(), f[1].clone()].concat();
+        head.extend_from_slice(&f[2][..150]);
+        let mut damaged = f[2][190..].to_vec();
+        damaged[10..17].copy_from_slice(&adts(6000, 0)[..7]);
+        let mut c = AuCutter::new(AuFormat::Adts);
+        let mut aus = feed(&mut c, &open_pes(&head, Some(0)));
+        c.mark_discontinuity();
+        aus.extend(feed_more(&mut c, &damaged));
+        // Frame 3 straddles into PES 2, which carries frames 4 and 5.
+        aus.extend(feed_more(&mut c, &f[3][..100]));
+        let mut es2 = f[3][100..].to_vec();
+        es2.extend_from_slice(&[f[4].clone(), f[5].clone()].concat());
+        aus.extend(feed(&mut c, &open_pes(&es2, Some(9_000))));
+        aus.extend(feed(&mut c, &open_pes(&[f[6].clone(), f[7].clone(), f[8].clone()].concat(), Some(18_000))));
+        let got: Vec<u8> = aus.iter().map(|a| a.data[7]).collect();
+        assert_eq!(got, vec![0x20, 0x21, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28]);
+        assert_eq!((aus[3].pes_start, aus[3].pts), (true, Some(9_000)));
+        assert_eq!((aus[5].pes_start, aus[5].pts), (true, Some(18_000)));
     }
 
     /// Straddles are cut the same way for the libavcodec formats.
