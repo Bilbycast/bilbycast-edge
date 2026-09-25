@@ -1096,7 +1096,7 @@ async fn whep_viewer_loop(
                                         continue;
                                     };
                                     if ff_audio_codec != Some(codec) {
-                                        ff_audio_decoder = video_engine::AudioDecoder::open(codec).ok();
+                                        ff_audio_decoder = crate::engine::audio_decode::open_ff_decoder(codec).ok();
                                         ff_audio_codec = Some(codec);
                                     }
                                     let Some(dec) = ff_audio_decoder.as_mut() else {
@@ -1592,7 +1592,7 @@ async fn whip_client_loop(
                                             continue;
                                         };
                                         if ff_audio_codec != Some(codec) {
-                                            ff_audio_decoder = video_engine::AudioDecoder::open(codec).ok();
+                                            ff_audio_decoder = crate::engine::audio_decode::open_ff_decoder(codec).ok();
                                             ff_audio_codec = Some(codec);
                                         }
                                         let Some(dec) = ff_audio_decoder.as_mut() else {

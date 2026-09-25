@@ -476,6 +476,15 @@ pub struct TsAudioReplacer {
     /// Lazily constructed libavcodec encoder for MP2 / AC-3 targets.
     #[cfg(feature = "media-codecs")]
     av_encoder: Option<video_engine::AudioEncoder>,
+    /// The source's AC-3 / E-AC-3 `dialnorm` (dB), from its latest AU
+    /// that carries one, and what an AC-3 encoder has been told. The
+    /// dialogue level a receiver normalises to: writing libavcodec's
+    /// default -31 over a -24 dB programme made the transcode play 7 dB
+    /// louder than its source on every receiver that honours it.
+    #[cfg(feature = "media-codecs")]
+    source_dialnorm: Option<i8>,
+    #[cfg(feature = "media-codecs")]
+    encoder_dialnorm: Option<i8>,
 
     /// Per-channel PCM accumulator (f32, planar). Grown by successful
     /// decodes, drained in `frame_size`-sized chunks into the encoder.
@@ -607,6 +616,10 @@ impl TsAudioReplacer {
             aac_encoder: None,
             #[cfg(feature = "media-codecs")]
             av_encoder: None,
+            #[cfg(feature = "media-codecs")]
+            source_dialnorm: None,
+            #[cfg(feature = "media-codecs")]
+            encoder_dialnorm: None,
             accumulator: Vec::new(),
             resolved_channels: 0,
             resolved_sample_rate: 0,
@@ -1278,6 +1291,8 @@ impl TsAudioReplacer {
         #[cfg(feature = "media-codecs")]
         {
             self.av_encoder = None;
+            self.source_dialnorm = None;
+            self.encoder_dialnorm = None;
         }
         self.transcoder = None;
         self.stage_in = (0, 0);
@@ -1371,6 +1386,8 @@ impl TsAudioReplacer {
             // PES that carry no PTS.
             return;
         }
+        #[cfg(feature = "media-codecs")]
+        self.follow_dialnorm(&au);
         self.decode_stats.inc_input();
         match self.decode_au(&au.data) {
             Ok(frames) => {
@@ -1382,6 +1399,35 @@ impl TsAudioReplacer {
             Err(()) => {
                 self.decode_stats.inc_error();
                 self.fill_lost_au(&au.header, output);
+            }
+        }
+    }
+
+    /// Track the source's AC-3 / E-AC-3 `dialnorm` and pass a change on to
+    /// an open AC-3 encoder, which was opened with `per_frame_metadata` for
+    /// it (programme and advertising often carry different values). The
+    /// change reaches the output with the encoder's next frame, within one
+    /// frame plus the pipeline's latency of where the source made it.
+    #[cfg(feature = "media-codecs")]
+    fn follow_dialnorm(&mut self, au: &CutAu) {
+        if self.cutter.as_ref().map(|c| c.format()) != Some(AuFormat::Ac3) {
+            return;
+        }
+        let Some(d) = crate::engine::audio_decode::ac3_dialnorm(&au.data) else {
+            return;
+        };
+        self.source_dialnorm = Some(d);
+        if self.encoder_dialnorm.is_none_or(|e| e == d) {
+            return;
+        }
+        if let Some(enc) = self.av_encoder.as_mut() {
+            match enc.set_option("dialnorm", &d.to_string()) {
+                Ok(()) => self.encoder_dialnorm = Some(d),
+                Err(e) => {
+                    tracing::warn!("TsAudioReplacer: could not carry dialnorm {d} dB: {e}");
+                    // Once: the encoder keeps the value it has.
+                    self.encoder_dialnorm = Some(d);
+                }
             }
         }
     }
@@ -1514,7 +1560,7 @@ impl TsAudioReplacer {
         {
             if self.ff_decoder.is_none() {
                 self.ff_decoder =
-                    Some(video_engine::AudioDecoder::open(ff_codec).map_err(|_| ())?);
+                    Some(crate::engine::audio_decode::open_ff_decoder(ff_codec).map_err(|_| ())?);
             }
             let decoder = self.ff_decoder.as_mut().expect("opened above");
             decoder.send_packet(au, 0).map_err(|_| ())?;
@@ -2011,8 +2057,24 @@ impl TsAudioReplacer {
                         channels: target_ch,
                         bitrate_kbps: self.bitrate_kbps,
                     };
-                    self.av_encoder =
-                        Some(video_engine::AudioEncoder::open(&cfg).map_err(|_| ())?);
+                    // An AC-3 source's dialogue level goes into the AC-3
+                    // it is re-encoded to, and follows it (see
+                    // `follow_dialnorm`); any other source keeps
+                    // libavcodec's defaults, as before.
+                    let dialnorm = self.source_dialnorm.map(|d| d.to_string());
+                    let mut opts: Vec<(&str, &str)> = Vec::new();
+                    if codec_type == video_codec::AudioCodecType::Ac3
+                        && let Some(d) = dialnorm.as_deref()
+                    {
+                        opts.push(("dialnorm", d));
+                        opts.push(("per_frame_metadata", "1"));
+                    }
+                    self.av_encoder = Some(
+                        video_engine::AudioEncoder::open_with_options(&cfg, &opts)
+                            .map_err(|_| ())?,
+                    );
+                    self.encoder_dialnorm =
+                        if opts.is_empty() { None } else { self.source_dialnorm };
                     Ok(())
                 }
                 #[cfg(not(feature = "media-codecs"))]
@@ -3955,6 +4017,105 @@ mod tests {
         pub fn err_samples(target: &str, out: &[u8], expected: f64, out_rate: u32) -> f64 {
             (burst_time(target, out, expected) - expected) * out_rate as f64 / 90_000.0
         }
+    }
+
+    /// **B5.** An AC-3 source's `dialnorm` goes into the AC-3 it is
+    /// re-encoded to, and follows a change (programme to ads). libavcodec's
+    /// default -31 was written over every source: a -24 dB programme's
+    /// transcode played 7 dB louder than its source on any receiver that
+    /// normalises to dialnorm. An MP2 / AAC source keeps the default.
+    #[cfg(all(feature = "media-codecs", feature = "fdk-aac"))]
+    #[test]
+    fn an_ac3_sources_dialnorm_is_carried_into_the_ac3_re_encode() {
+        use e2e::*;
+        let pcm = content(48_000 + 333, 48_000 * 3);
+        let mut e = video_engine::AudioEncoder::open_with_options(
+            &video_codec::AudioEncoderConfig {
+                codec: video_codec::AudioCodecType::Ac3,
+                sample_rate: 48_000,
+                channels: 2,
+                bitrate_kbps: 384,
+            },
+            &[("dialnorm", "-24"), ("per_frame_metadata", "1")],
+        )
+        .unwrap();
+        let mut aus = Vec::new();
+        for (k, chunk) in pcm.chunks(1536).enumerate() {
+            if k == 60 {
+                e.set_option("dialnorm", "-27").unwrap();
+            }
+            let mut c = chunk.to_vec();
+            c.resize(1536, 0.0);
+            for f in e.encode_frame(&[c.clone(), c]).unwrap() {
+                aus.push((f.data.to_vec(), (P0 as i64 + f.pts * 90_000 / 48_000) as u64));
+            }
+        }
+        let ts = mux(0x81, &pack(&aus, 2));
+        let mut r = replacer("ac3", None, None);
+        let out = run(&mut r, &ts);
+        let d: Vec<i8> = audio_pes(&out)
+            .iter()
+            .map(|(_, es)| crate::engine::audio_decode::ac3_dialnorm(es).expect("an AC-3 frame"))
+            .collect();
+        assert!(d.len() > 80, "{} frames out", d.len());
+        assert!(d[..50].iter().all(|&v| v == -24), "the source's level: {:?}", &d[..50]);
+        assert!(d[d.len() - 10..].iter().all(|&v| v == -27), "and its change: {:?}", &d[d.len() - 10..]);
+        // An MP2 source has none to carry: the default.
+        let mp2 = encode_source(Src::Mp2, &pcm);
+        let out = run(&mut replacer("ac3", None, None), &mux(0x03, &pack(&mp2, 2)));
+        let d: Vec<i8> = audio_pes(&out)
+            .iter()
+            .filter_map(|(_, es)| crate::engine::audio_decode::ac3_dialnorm(es))
+            .collect();
+        assert!(!d.is_empty() && d.iter().all(|&v| v == -31));
+    }
+
+    /// **B5.** Every libavcodec audio decode in the edge opens AC-3 / E-AC-3
+    /// without dynamic-range compression and with the dither seeded from
+    /// each frame, so a frame decodes to the same PCM whatever came before
+    /// it — the reference a gate-6 comparison of an AC-3 → AC-3 transcode
+    /// needs (two decodes of one 192 kbps source differed at 33.5 dB).
+    #[cfg(feature = "media-codecs")]
+    #[test]
+    fn ac3_decodes_without_drc_and_with_consistent_dither() {
+        use video_codec::AudioDecoderCodec;
+        for codec in [AudioDecoderCodec::Ac3, AudioDecoderCodec::Eac3] {
+            let o = crate::engine::audio_decode::ff_decoder_options(codec);
+            assert!(o.contains(&("drc_scale", "0")) && o.contains(&("cons_noisegen", "1")), "{codec}");
+        }
+        assert!(crate::engine::audio_decode::ff_decoder_options(AudioDecoderCodec::Mp2).is_empty());
+        // Low-bitrate noise leaves mantissas at zero bits, which the decoder
+        // fills with dither.
+        let mut e = video_engine::AudioEncoder::open(&video_codec::AudioEncoderConfig {
+            codec: video_codec::AudioCodecType::Ac3,
+            sample_rate: 48_000,
+            channels: 2,
+            bitrate_kbps: 64,
+        })
+        .unwrap();
+        let mut seed = 7u32;
+        let mut frames = Vec::new();
+        while frames.len() < 6 {
+            let c: Vec<f32> = (0..1536)
+                .map(|_| {
+                    seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                    (seed >> 8) as f32 / (1u32 << 24) as f32 * 0.05 - 0.025
+                })
+                .collect();
+            frames.extend(e.encode_frame(&[c.clone(), c]).unwrap().into_iter().map(|f| f.data.to_vec()));
+        }
+        let last = |from: usize| -> Vec<f32> {
+            let mut d = crate::engine::audio_decode::open_ff_decoder(AudioDecoderCodec::Ac3).unwrap();
+            let mut last = Vec::new();
+            for f in &frames[from..] {
+                d.send_packet(f, 0).unwrap();
+                while let Ok(o) = d.receive_frame() {
+                    last = o.planar[0].clone();
+                }
+            }
+            last
+        };
+        assert_eq!(last(0), last(3), "the last frame decodes the same from either start");
     }
 
     /// **AT-1.** A burst at a known source PTS is presented at that PTS

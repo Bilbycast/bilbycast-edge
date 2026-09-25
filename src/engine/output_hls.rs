@@ -1027,7 +1027,7 @@ fn decode_audio_pes_ffmpeg(
     pes_list: &[(Vec<u8>, u64)],
     codec: video_codec::AudioDecoderCodec,
 ) -> Result<Vec<PcmFrame>, String> {
-    let mut decoder = video_engine::AudioDecoder::open(codec)
+    let mut decoder = crate::engine::audio_decode::open_ff_decoder(codec)
         .map_err(|e| format!("FFmpeg audio decoder init failed: {e}"))?;
     let mut pcm_frames = Vec::new();
 

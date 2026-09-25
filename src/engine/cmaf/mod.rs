@@ -1886,7 +1886,7 @@ fn handle_other_audio_frame(
         return;
     };
     if state.ff_audio_decoder.is_none() {
-        match video_engine::AudioDecoder::open(codec) {
+        match crate::engine::audio_decode::open_ff_decoder(codec) {
             Ok(d) => state.ff_audio_decoder = Some(d),
             Err(_) => return,
         }

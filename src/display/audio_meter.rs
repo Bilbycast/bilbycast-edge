@@ -523,7 +523,7 @@ impl MeterPidState {
             return;
         };
         if self.ff_decoder.is_none() {
-            match FfAudioDecoder::open(codec) {
+            match crate::engine::audio_decode::open_ff_decoder(codec) {
                 Ok(d) => self.ff_decoder = Some(d),
                 Err(_) => return,
             }

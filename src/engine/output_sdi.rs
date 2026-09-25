@@ -1115,7 +1115,7 @@ fn decode_and_schedule_audio(
         }
         AudioPayload::Ff { codec, data } => {
             if ff_dec.as_ref().map(|(c, _)| *c) != Some(codec) {
-                *ff_dec = FfAudioDecoder::open(codec).ok().map(|d| (codec, d));
+                *ff_dec = crate::engine::audio_decode::open_ff_decoder(codec).ok().map(|d| (codec, d));
             }
             let Some((_, d)) = ff_dec.as_mut() else {
                 throttled(last_warn, || {

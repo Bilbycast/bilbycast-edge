@@ -316,6 +316,93 @@ pub fn ff_codec_for_stream_type(stream_type: u8) -> Option<video_codec::AudioDec
     }
 }
 
+/// Private options every libavcodec audio decode in the edge opens with.
+///
+/// AC-3 / E-AC-3 only (the others take none):
+/// - `drc_scale` 0 — no dynamic-range compression. libavcodec applies the
+///   bitstream's line-mode `dynrng` gains by default (`drc_scale` 1), so a
+///   re-encode carried the compressed programme, and the receiver — which
+///   would have chosen line, RF or no compression from the metadata — could
+///   no longer choose: the edge's encoders do not write `dynrng`. A 448 kbps
+///   5.1 source that carries it (ESPN) decodes 24.7 dB SNR apart with and
+///   without it. Loudness measurement (BS.1770) and baseband playout (SDI,
+///   ST 2110-30, the display) want the uncompressed programme too.
+/// - `cons_noisegen` 1 — the dither that fills zero-bit mantissas is seeded
+///   from each frame instead of running on across frames, so a frame always
+///   decodes to the same PCM. Two decodes of one 192 kbps stereo source
+///   differ at 33.5 dB SNR otherwise, which is what capped the gate-6
+///   measurement of an AC-3 → AC-3 transcode at 39 dB.
+#[cfg(feature = "media-codecs")]
+pub fn ff_decoder_options(
+    codec: video_codec::AudioDecoderCodec,
+) -> &'static [(&'static str, &'static str)] {
+    use video_codec::AudioDecoderCodec;
+    match codec {
+        AudioDecoderCodec::Ac3 | AudioDecoderCodec::Eac3 => {
+            &[("drc_scale", "0"), ("cons_noisegen", "1")]
+        }
+        _ => &[],
+    }
+}
+
+/// Open the libavcodec decoder for `codec` with [`ff_decoder_options`].
+#[cfg(feature = "media-codecs")]
+pub fn open_ff_decoder(
+    codec: video_codec::AudioDecoderCodec,
+) -> Result<video_engine::AudioDecoder, video_codec::AudioError> {
+    video_engine::AudioDecoder::open_with_options(codec, ff_decoder_options(codec))
+}
+
+/// `dialnorm` of an AC-3 syncframe or of an E-AC-3 independent substream 0
+/// frame, in dB (-31..=-1; the reserved 0 reads as -31, as decoders take
+/// it). `None` for anything else — a dependent or other substream, a
+/// truncated or invalid header.
+#[cfg(feature = "media-codecs")]
+pub(crate) fn ac3_dialnorm(buf: &[u8]) -> Option<i8> {
+    if buf.len() < 8 || buf[0] != 0x0B || buf[1] != 0x77 {
+        return None;
+    }
+    let bit = |i: usize| (buf[i / 8] >> (7 - i % 8)) & 1;
+    let bits = |at: usize, n: usize| (0..n).fold(0u8, |v, k| (v << 1) | bit(at + k));
+    let bsid = buf[5] >> 3;
+    let at = if bsid <= 10 {
+        // A/52 §5.3.2: syncword 16, crc1 16, fscod 2, frmsizecod 6, bsid 5,
+        // bsmod 3, acmod 3, then cmixlev / surmixlev / dsurmod by acmod,
+        // lfeon 1.
+        let acmod = bits(48, 3);
+        let mut at = 51;
+        if acmod & 1 != 0 && acmod != 1 {
+            at += 2;
+        }
+        if acmod & 4 != 0 {
+            at += 2;
+        }
+        if acmod == 2 {
+            at += 2;
+        }
+        at + 1
+    } else if bsid <= 16 {
+        // Annex E §E.1.2.2: strmtyp 2, substreamid 3 — an independent
+        // substream 0 (strmtyp 0 or 2) only — frmsiz 11, fscod 2,
+        // fscod2 / numblkscod 2, acmod 3, lfeon 1, bsid 5.
+        let strmtyp = buf[2] >> 6;
+        let substreamid = (buf[2] >> 3) & 0x07;
+        if strmtyp == 1 || strmtyp == 3 || substreamid != 0 {
+            return None;
+        }
+        45
+    } else {
+        return None;
+    };
+    if buf.len() * 8 < at + 5 {
+        return None;
+    }
+    Some(match bits(at, 5) {
+        0 => -31,
+        d => -(d as i8),
+    })
+}
+
 /// Split a concatenated codec-frame buffer so each `avcodec_send_packet`
 /// sees exactly one access unit.
 ///
