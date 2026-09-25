@@ -1567,6 +1567,10 @@ impl OutputStatsAccumulator {
                 supervisor_restarts: h.stats.supervisor_restarts.load(Ordering::Relaxed),
                 source_pid: h.stats.source_pid.load(Ordering::Relaxed),
                 source_stream_type: h.stats.source_stream_type.load(Ordering::Relaxed),
+                non_monotonic_frames_dropped: h
+                    .stats
+                    .non_monotonic_frames_dropped
+                    .load(Ordering::Relaxed),
                 pre_pmt_dropped_packets: h.stats.pre_pmt_dropped_packets.load(Ordering::Relaxed),
             }
         });
@@ -4704,6 +4708,10 @@ impl FlowStatsAccumulator {
                         supervisor_restarts: h.stats.supervisor_restarts.load(Ordering::Relaxed),
                         source_pid: h.stats.source_pid.load(Ordering::Relaxed),
                         source_stream_type: h.stats.source_stream_type.load(Ordering::Relaxed),
+                        non_monotonic_frames_dropped: h
+                            .stats
+                            .non_monotonic_frames_dropped
+                            .load(Ordering::Relaxed),
                         pre_pmt_dropped_packets: h
                             .stats
                             .pre_pmt_dropped_packets

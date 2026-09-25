@@ -1723,6 +1723,11 @@ pub struct VideoEncodeStatsSnapshot {
     /// `0` means unknown.
     #[serde(default, skip_serializing_if = "is_zero_u8")]
     pub source_stream_type: u8,
+    /// Decoded frames dropped before the encoder because their PTS did not
+    /// advance past the last one admitted (a splice without a clean
+    /// random-access point). Also in `dropped_frames`. Absent when 0.
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub non_monotonic_frames_dropped: u64,
     /// Non-PSI packets dropped before the program's PMT was parsed (the
     /// pre-PMT gate). Absent when 0.
     #[serde(default, skip_serializing_if = "is_zero_u64")]

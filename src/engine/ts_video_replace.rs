@@ -29,7 +29,9 @@
 //!   input's PCR timeline by one measured transcode allowance.
 //! - Video PID packets are buffered into PES, flushed on each PUSI,
 //!   fed to the decoder, the resulting frames go through the encoder,
-//!   and the encoded bitstream is repacketized as fresh TS.
+//!   and the encoded bitstream is repacketized as fresh TS. A decoded
+//!   frame whose PTS does not advance past the last one admitted (within
+//!   1 s) is dropped before the encoder, so output DTS never steps back.
 //! - Every other PID (audio, PAT, null, etc.) is forwarded unchanged.
 //!
 //! # Scaling
@@ -80,6 +82,10 @@ pub struct VideoEncodeStats {
     pub last_latency_us: AtomicU64,
     /// Number of times the encoder supervisor restarted the backend.
     pub supervisor_restarts: AtomicU64,
+    /// Decoded frames dropped before the encoder because their PTS did not
+    /// advance past the last admitted frame (a splice without a clean
+    /// random-access point). Also counted in `dropped_frames`.
+    pub non_monotonic_frames_dropped: AtomicU64,
     /// Non-PSI packets dropped before the program's PMT was parsed.
     pub pre_pmt_dropped_packets: AtomicU64,
     /// Source video PID the replacer locked onto (discovered from the PMT
@@ -422,6 +428,43 @@ mod inner {
     use video_codec::{VideoCodec, VideoEncoderCodec};
     use video_engine::VideoDecoder;
 
+    /// PTS modulus (33-bit space, MPEG-TS spec).
+    const PTS_MODULUS_90K: u64 = 1u64 << 33;
+    /// Mask for 33-bit PTS values.
+    const PTS_MASK_33B: u64 = PTS_MODULUS_90K - 1;
+    /// Backward PTS step within which a decoded frame is taken to be out of
+    /// order (and dropped) rather than the start of a new epoch: 1 s at
+    /// 90 kHz. A larger step either way is an epoch change and passes.
+    const PTS_JUMP_THRESHOLD_90K: u64 = 90_000;
+
+    /// Frame-admission verdict for one decoded frame (defect 7c): the PTS to
+    /// stamp, or `None` when the frame must be dropped before the encoder.
+    ///
+    /// `last` is the last admitted PTS. A frame whose PTS is at or behind it
+    /// by at most [`PTS_JUMP_THRESHOLD_90K`] is out of order — FFmpeg's H.264
+    /// decoder emits leading pictures of a splice without a clean random
+    /// access point that way — and is dropped. A frame without a PTS gets
+    /// `last + interval`, or `anchor` before any frame was admitted.
+    pub(super) fn admit_pts(
+        last: Option<u64>,
+        frame_pts: Option<u64>,
+        interval_90k: u64,
+        anchor: u64,
+    ) -> Option<u64> {
+        let pts = match (frame_pts, last) {
+            (Some(p), _) => p & PTS_MASK_33B,
+            (None, Some(l)) => l.wrapping_add(interval_90k) & PTS_MASK_33B,
+            (None, None) => anchor & PTS_MASK_33B,
+        };
+        if let Some(l) = last {
+            let back = (l + PTS_MODULUS_90K - pts) % PTS_MODULUS_90K;
+            if back <= PTS_JUMP_THRESHOLD_90K {
+                return None;
+            }
+        }
+        Some(pts)
+    }
+
     /// Input frames the decoder may consume with **zero** decoded output
     /// before [`Inner::check_decode_stall`] declares a decode stall. Sized
     /// comfortably above every legitimate transient where output lags input
@@ -487,7 +530,7 @@ mod inner {
         /// is empty (e.g. encoder catch-up bursts).
         pts_90k: u64,
         pts_anchored: bool,
-        pts_step_90k: u64,
+        pub(super) pts_step_90k: u64,
         /// Source PES PTSes pending output, one entry per source decoded
         /// frame fed into the encoder. Drained in FIFO order on each
         /// emitted output frame, so output PES PTS values track source's
@@ -500,7 +543,7 @@ mod inner {
         /// FIFO queue gives the right pts. Once B-frame encoding is
         /// wired in, this should become DTS-aware (push/pop by encoded
         /// frame's `dts`-ordered position).
-        src_pts_queue: std::collections::VecDeque<u64>,
+        pub(super) src_pts_queue: std::collections::VecDeque<u64>,
 
         /// Last input PES DTS, used to derive the natural source
         /// inter-frame delta in decode order. DTS stays monotonic
@@ -558,6 +601,13 @@ mod inner {
         /// `input_frames` value when output last advanced; the stall window
         /// is `current input_frames − this`.
         input_frames_at_last_output: u64,
+        /// PTS (90 kHz) of the last decoded frame admitted to the encoder —
+        /// see [`admit_pts`]. Reset with the source.
+        last_admitted_pts_90k: Option<u64>,
+        /// Measured interval between consecutive admitted frames (90 kHz):
+        /// the step a PTS-less frame advances by. Frame, not field, units.
+        decoded_interval_90k: Option<u64>,
+
         /// Operator's hardware-decoder preference for the input decode
         /// side of this transcode. Defaults to `Auto` (VAAPI ≻ NVDEC ≻
         /// QSV ≻ CPU per host capabilities). Resolved on the first
@@ -703,6 +753,8 @@ mod inner {
                 decode_stats,
                 force_idr,
                 external_reset,
+                last_admitted_pts_90k: None,
+                decoded_interval_90k: None,
                 hw_decode_pref: cfg.hw_decode.unwrap_or_default(),
                 av_skew: None,
                 input_decode_handle: None,
@@ -752,6 +804,10 @@ mod inner {
             self.pes_started = false;
             self.pending_pts = None;
             self.decoder = None;
+            // The new source's frames are admitted afresh; a backward step
+            // across the switch is a new source, not a reordered picture.
+            self.last_admitted_pts_90k = None;
+            self.decoded_interval_90k = None;
             // Re-anchor PTS to the new input's first frame so downstream
             // A/V stays in sync with the audio replacer (which will also
             // re-anchor on the audio-PID codec swap).
@@ -1148,6 +1204,42 @@ mod inner {
             }
         }
 
+        /// Step a PTS-less frame advances by: the measured interval between
+        /// admitted frames, else the pinned frame rate, else 25 fps. Never
+        /// `pts_step_90k`, which is the per-FIELD DTS delta on PAFF.
+        fn frame_interval_90k(&self) -> u64 {
+            if let Some(i) = self.decoded_interval_90k {
+                return i;
+            }
+            match (self.fps_num, self.fps_den) {
+                (Some(n), Some(d)) if n > 0 => (90_000u64 * d as u64 / n as u64).max(1),
+                _ => 3_600,
+            }
+        }
+
+        /// Frame admission (see [`admit_pts`]): the PTS to stamp on this
+        /// decoded frame, or `None` to drop it before the encoder. A drop
+        /// touches nothing else — not the PTS queue, the force-IDR request
+        /// or the frame counter — so the next admitted frame takes them.
+        pub(super) fn admit_decoded(&mut self, frame_pts: Option<i64>) -> Option<u64> {
+            let pts = frame_pts.filter(|p| *p >= 0).map(|p| p as u64);
+            let last = self.last_admitted_pts_90k;
+            let Some(admitted) = admit_pts(last, pts, self.frame_interval_90k(), self.pts_90k)
+            else {
+                self.stats.dropped_frames.fetch_add(1, Ordering::Relaxed);
+                self.stats.non_monotonic_frames_dropped.fetch_add(1, Ordering::Relaxed);
+                return None;
+            };
+            if let Some(l) = last {
+                let step = (admitted + PTS_MODULUS_90K - l) % PTS_MODULUS_90K;
+                if (90..=90_000).contains(&step) {
+                    self.decoded_interval_90k = Some(step);
+                }
+            }
+            self.last_admitted_pts_90k = Some(admitted);
+            Some(admitted)
+        }
+
         /// Packetise one encoded frame with the next queued source PTS
         /// (DTS = PTS: the in-process encoders emit no B-frames). No PCR —
         /// the input's PCR positions travel as their own packets.
@@ -1168,7 +1260,7 @@ mod inner {
             }
             // Keep the fallback anchor monotonic from the latest emitted
             // PTS so a later queue-exhausted emit still advances.
-            self.pts_90k = pts_for_pes.wrapping_add(self.pts_step_90k);
+            self.pts_90k = pts_for_pes.wrapping_add(self.frame_interval_90k()) & PTS_MASK_33B;
             self.stats.output_frames.fetch_add(1, Ordering::Relaxed);
         }
 
@@ -1442,18 +1534,20 @@ mod inner {
                 };
                 self.decode_stats.inc_output();
 
+                // Monotonic admission BEFORE anything else: a frame whose
+                // PTS does not advance past the last admitted one (within
+                // 1 s) is a splice's out-of-order leading picture. Dropping
+                // it here keeps the PTS queue balanced (never pushed), and
+                // leaves a pending force-IDR and the frame counter for the
+                // next admitted frame.
+                let Some(src_pts_for_frame) = self.admit_decoded(frame.pts()) else {
+                    continue;
+                };
                 // Push the source PTS into the FIFO queue so the emit
                 // path can pop it for each output PES. The decoder
                 // propagates `pkt.pts → frame.pts` through its reorder
                 // window, so for B-frame source streams we get the
-                // display-order PTS automatically. Fall back to the
-                // sample-counted anchor when the decoder didn't have a
-                // PTS to attach (e.g. an early frame whose source PES
-                // had `pts_dts_flags = 0`).
-                let src_pts_for_frame = match frame.pts() {
-                    Some(p) if p >= 0 => p as u64,
-                    _ => self.pts_90k,
-                };
+                // display-order PTS automatically.
                 self.src_pts_queue.push_back(src_pts_for_frame);
 
                 // One-shot IDR request (forwarder signals on flow switch).
@@ -2211,7 +2305,7 @@ mod tests {
         assert_eq!(ver(&v2b), ver(&v2), "and holds afterwards");
     }
 
-    // ── PCR carry (defect 3 / x), pre-PMT gate (4) ──
+    // ── PCR carry (defect 3 / x), pre-PMT gate (4), admission (7c) ──
 
     const MS27: u64 = 27_000;
 
@@ -2392,5 +2486,50 @@ mod tests {
         assert_eq!(got.len(), 1);
         assert_eq!(ts_cc(&got[0]), 6, "AF-only repeats the last CC on the wire");
         assert_eq!(r.inner.out_video_cc, 7, "the first re-encoded payload continues at 7");
+    }
+
+    #[test]
+    fn admission_drops_the_r3_splice_leading_pictures() {
+        use super::inner::admit_pts;
+        let x = 7_052_804_052u64 & ((1 << 33) - 1);
+        let seq = [x, x + 11_572, x + 22_372, x - 2_828, x + 25_972, x + 29_572, x + 33_172];
+        let mut last = None;
+        let mut out = Vec::new();
+        for p in seq {
+            if let Some(a) = admit_pts(last, Some(p), 3_600, 0) {
+                out.push(a);
+                last = Some(a);
+            }
+        }
+        assert_eq!(out, vec![x, x + 11_572, x + 22_372, x + 25_972, x + 29_572, x + 33_172]);
+        // A repeated PTS is dropped too; a 2 s step back is a new epoch.
+        assert_eq!(admit_pts(Some(x), Some(x), 3_600, 0), None);
+        assert_eq!(admit_pts(Some(x), Some(x - 180_000), 3_600, 0), Some(x - 180_000));
+        assert_eq!(admit_pts(Some(x), Some(x - 90_000), 3_600, 0), None);
+        // Across the 33-bit wrap, forward is forward.
+        let top = (1u64 << 33) - 1_800;
+        assert_eq!(admit_pts(Some(top), Some(1_800), 3_600, 0), Some(1_800));
+        // A frame without PTS advances by the frame interval.
+        assert_eq!(admit_pts(Some(x), None, 3_600, 0), Some(x + 3_600));
+        assert_eq!(admit_pts(None, None, 3_600, 42), Some(42));
+    }
+
+    #[test]
+    fn a_dropped_frame_leaves_the_idr_request_and_the_queue_alone() {
+        let mut r = TsVideoReplacer::new(&cfg("x264"), None).unwrap();
+        let idr = r.force_idr_handle();
+        idr.store(true, Ordering::Relaxed);
+        assert_eq!(r.inner.admit_decoded(Some(90_000)), Some(90_000));
+        assert_eq!(r.inner.admit_decoded(Some(93_600)), Some(93_600));
+        assert_eq!(r.inner.admit_decoded(Some(86_400)), None);
+        assert!(idr.load(Ordering::Relaxed), "the IDR request waits for an admitted frame");
+        assert!(r.inner.src_pts_queue.is_empty());
+        let st = r.stats_handle();
+        assert_eq!(st.non_monotonic_frames_dropped.load(Ordering::Relaxed), 1);
+        assert_eq!(st.dropped_frames.load(Ordering::Relaxed), 1);
+        // A PTS-less frame steps by the measured frame interval (3600, not
+        // the per-field DTS delta).
+        r.inner.pts_step_90k = 1_800;
+        assert_eq!(r.inner.admit_decoded(None), Some(97_200));
     }
 }
