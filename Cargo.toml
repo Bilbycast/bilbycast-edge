@@ -55,8 +55,9 @@ identity_op = "allow"
 # about, not "this division might trap".
 manual_checked_ops = "allow"
 # New in clippy 1.98, and it turned `main` red on a toolchain bump alone — CI
-# tracks `dtolnay/rust-toolchain@stable`, so 32 pre-existing call sites became
-# errors under `-D warnings` with no commit touching them.
+# installs the current stable toolchain (`toolchain: stable`), so 32
+# pre-existing call sites became errors under `-D warnings` with no commit
+# touching them.
 #
 # The suggestion is not a rename. `chunks_exact(TS_PACKET_SIZE)` yields
 # `&[u8]`; `as_chunks::<TS_PACKET_SIZE>().0` yields `&[[u8; 188]]`, so every
