@@ -191,11 +191,11 @@ async fn whip_input_loop(
                 ts_muxer.set_pids(entry.pmt_pid, entry.video_pid, entry.audio_pid, entry.pcr_pid);
             }
         ts_muxer.set_audio_stream(0x06, Some(*b"Opus"));
+        // The tracks' frames onto one TS (`WhipMux`): one timeline for
+        // both, the parameter sets ahead of every IDR, no payload-less
+        // frame.
+        let mut whip = WhipMux::new(ts_muxer);
         let mut seq_num: u16 = 0;
-        let mut last_audio_pts_90khz: u64 = 0;
-        // One timeline for both tracks (`WhipClock`): each track's RTP
-        // timestamps start at an unrelated random base.
-        let mut clock = WhipClock::default();
         // The publish's layout — which of video and audio its offer carried
         // — is settled from the session's tracks on the first media
         // (`WhipLayout`). The muxer used to assume video and no audio: an
@@ -203,7 +203,6 @@ async fn whip_input_loop(
         // carried no PCR at all, and an A/V publish's Opus never reached the
         // PMT.
         let mut layout = WhipLayout::default();
-        let mut param_sets = H264ParamSets::default();
 
         // Receive media from the WebRTC session
         loop {
@@ -214,80 +213,45 @@ async fn whip_input_loop(
                     // Determine if this is video or audio
                     let is_video = session.video_mid == Some(mid);
                     let is_audio_stream = session.audio_mid == Some(mid);
+                    if !is_video && !is_audio_stream {
+                        continue;
+                    }
                     layout.apply(
-                        &mut ts_muxer,
+                        &mut whip.muxer,
                         session.video_mid.is_some(),
                         session.audio_mid.is_some(),
                         flow_id,
                     );
-
-                    if is_audio_stream {
-                        // Opus-over-WHIP audio: the RTP timestamp on the
-                        // Opus clock (48 kHz, carried in MediaTime.denom)
-                        // onto the publish's 90 kHz timeline (`WhipClock`),
-                        // then muxed via the FFmpeg-compatible Opus-in-TS
-                        // path.
-                        let denom = rtp_time.denom() as u64;
-                        let pts_90khz = if denom == 0 {
-                            last_audio_pts_90khz
-                        } else {
-                            clock.pts_90k(false, rtp_time.numer(), denom, network_time)
+                    let Some((ts_chunks, pts_90khz)) = whip.frame(
+                        !is_audio_stream,
+                        &data,
+                        rtp_time.numer(),
+                        rtp_time.denom() as u64,
+                        network_time,
+                    ) else {
+                        continue;
+                    };
+                    for ts_data in ts_chunks {
+                        let pkt = RtpPacket {
+                            data: ts_data,
+                            sequence_number: seq_num,
+                            rtp_timestamp: pts_90khz as u32,
+                            recv_time_us: std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_micros() as u64,
+                            is_raw_ts: true,
+                            upstream_seq: None,
+                            upstream_leg_id: None,
+                            sender_timestamp_us: None,
                         };
-                        last_audio_pts_90khz = pts_90khz;
-                        let ts_chunks = ts_muxer.mux_audio_opus(&data, pts_90khz);
-                        for ts_data in ts_chunks {
-                            let pkt = RtpPacket {
-                                data: ts_data,
-                                sequence_number: seq_num,
-                                rtp_timestamp: pts_90khz as u32,
-                                recv_time_us: std::time::SystemTime::now()
-                                    .duration_since(std::time::UNIX_EPOCH)
-                                    .unwrap_or_default()
-                                    .as_micros() as u64,
-                                is_raw_ts: true,
-                                upstream_seq: None,
-                                upstream_leg_id: None,
-                                sender_timestamp_us: None,
-                            };
-                            seq_num = seq_num.wrapping_add(1);
-                            stats.input_packets.fetch_add(1, Ordering::Relaxed);
-                            stats.input_bytes.fetch_add(pkt.data.len() as u64, Ordering::Relaxed);
-                            if !stats.bandwidth_blocked.load(Ordering::Relaxed) {
-                                publish_input_packet_with_post(transcoder, post, &broadcast_tx, pkt);
-                            } else {
-                                stats.input_filtered.fetch_add(1, Ordering::Relaxed);
-                            }
-                        }
-                    } else if is_video {
-                        // A depayloaded access unit, Annex B, with the
-                        // parameter sets ahead of every IDR
-                        // (`H264ParamSets`).
-                        let pts_90khz = clock.pts_90k(true, rtp_time.numer(), rtp_time.denom() as u64, network_time);
-                        let (annex_b, is_keyframe) = param_sets.access_unit(&data);
-                        let ts_chunks = ts_muxer.mux_video(&annex_b, pts_90khz, pts_90khz, is_keyframe);
-
-                        for ts_data in ts_chunks {
-                            let pkt = RtpPacket {
-                                data: ts_data,
-                                sequence_number: seq_num,
-                                rtp_timestamp: pts_90khz as u32,
-                                recv_time_us: std::time::SystemTime::now()
-                                    .duration_since(std::time::UNIX_EPOCH)
-                                    .unwrap_or_default()
-                                    .as_micros() as u64,
-                                is_raw_ts: true,
-                                upstream_seq: None,
-                                upstream_leg_id: None,
-                                sender_timestamp_us: None,
-                            };
-                            seq_num = seq_num.wrapping_add(1);
-                            stats.input_packets.fetch_add(1, Ordering::Relaxed);
-                            stats.input_bytes.fetch_add(pkt.data.len() as u64, Ordering::Relaxed);
-                            if !stats.bandwidth_blocked.load(Ordering::Relaxed) {
-                                publish_input_packet_with_post(transcoder, post, &broadcast_tx, pkt);
-                            } else {
-                                stats.input_filtered.fetch_add(1, Ordering::Relaxed);
-                            }
+                        seq_num = seq_num.wrapping_add(1);
+                        stats.input_packets.fetch_add(1, Ordering::Relaxed);
+                        stats.input_bytes.fetch_add(pkt.data.len() as u64, Ordering::Relaxed);
+                        if !stats.bandwidth_blocked.load(Ordering::Relaxed) {
+                            publish_input_packet_with_post(transcoder, post, &broadcast_tx, pkt);
+                        } else {
+                            stats.input_filtered.fetch_add(1, Ordering::Relaxed);
                         }
                     }
                 }
@@ -295,7 +259,7 @@ async fn whip_input_loop(
                     // A track negotiated after media began: the layout
                     // follows (a PMT version bump, PCR moving with video).
                     layout.renegotiated(
-                        &mut ts_muxer,
+                        &mut whip.muxer,
                         session.video_mid.is_some(),
                         session.audio_mid.is_some(),
                         flow_id,
@@ -518,7 +482,9 @@ async fn whep_input_loop(
             let event = session.poll_event(&cancel).await;
             match event {
                 SessionEvent::MediaData { mid, data, rtp_time, .. } => {
-                    if session.video_mid == Some(mid) {
+                    // A payload-less frame (RTP padding, a sender's
+                    // bandwidth probe) is no access unit (see `WhipMux`).
+                    if session.video_mid == Some(mid) && !data.is_empty() {
                         let pts_90khz = rtp_time.numer();
                         let (annex_b, is_keyframe) = param_sets.access_unit(&data);
                         let ts_chunks = ts_muxer.mux_video(&annex_b, pts_90khz, pts_90khz, is_keyframe);
@@ -618,6 +584,73 @@ impl WhipLayout {
         }
         if muxer.change_has_video(has_video) {
             tracing::info!(flow_id, has_video, "WHIP: the publish renegotiated its video track");
+        }
+    }
+}
+
+/// A WHIP publish's depayloaded frames onto its TS: one timeline for both
+/// tracks ([`WhipClock`]), the parameter sets ahead of every IDR
+/// ([`H264ParamSets`]), Opus in the FFmpeg-compatible carriage.
+///
+/// A frame with no payload is no access unit and goes nowhere. A browser
+/// publisher's RTP padding-only packets — Chromium sends three every 5 s as
+/// bandwidth probes on the audio SSRC — reach the input as empty media, and
+/// each one was muxed as a zero-length Opus AU: 33 of 2964 AUs on the rig,
+/// every one failed by ffmpeg ("Error parsing the packet header"). RFC 6716
+/// §3.4 [R1]: an Opus packet is at least one byte. Nor does such a frame
+/// anchor the timeline.
+#[cfg(any(feature = "webrtc", test))]
+struct WhipMux {
+    muxer: crate::engine::rtmp::ts_mux::TsMuxer,
+    clock: WhipClock,
+    param_sets: H264ParamSets,
+    /// The last audio PTS: a frame whose RTP clock rate is unknown (0)
+    /// takes it.
+    last_audio_pts_90khz: u64,
+}
+
+#[cfg(any(feature = "webrtc", test))]
+impl WhipMux {
+    fn new(muxer: crate::engine::rtmp::ts_mux::TsMuxer) -> Self {
+        Self {
+            muxer,
+            clock: WhipClock::default(),
+            param_sets: H264ParamSets::default(),
+            last_audio_pts_90khz: 0,
+        }
+    }
+
+    /// One depayloaded frame of the video (`video`) or the audio track —
+    /// RTP timestamp `rtp` on a `rate` Hz clock, arrived at `arrival` — as
+    /// TS packets and the PTS it was stamped at; `None` for a frame with no
+    /// payload.
+    fn frame(
+        &mut self,
+        video: bool,
+        data: &[u8],
+        rtp: u64,
+        rate: u64,
+        arrival: std::time::Instant,
+    ) -> Option<(Vec<bytes::Bytes>, u64)> {
+        if data.is_empty() {
+            return None;
+        }
+        if video {
+            // A depayloaded access unit, Annex B, with the parameter sets
+            // ahead of every IDR (`H264ParamSets`).
+            let pts = self.clock.pts_90k(true, rtp, rate, arrival);
+            let (annex_b, is_keyframe) = self.param_sets.access_unit(data);
+            Some((self.muxer.mux_video(&annex_b, pts, pts, is_keyframe), pts))
+        } else {
+            // Opus: the RTP timestamp on the Opus clock (48 kHz, carried in
+            // MediaTime.denom) onto the publish's 90 kHz timeline.
+            let pts = if rate == 0 {
+                self.last_audio_pts_90khz
+            } else {
+                self.clock.pts_90k(false, rtp, rate, arrival)
+            };
+            self.last_audio_pts_90khz = pts;
+            Some((self.muxer.mux_audio_opus(data, pts), pts))
         }
     }
 }
@@ -810,6 +843,39 @@ mod tests {
         let mut ts = mux.mux_video(&[0, 0, 0, 1, 0x65, 0x88], 90_000, 90_000, true);
         ts.extend(mux.mux_audio_opus(&[0xFC; 80], 90_000));
         assert_eq!(layout_of(&ts), ((0x0100, vec![(0x1B, 0x0100), (0x06, 0x0101)]), vec![0x0100]));
+    }
+
+    /// A browser publisher's RTP padding-only packets — Chromium's bandwidth
+    /// probes, three every 5 s on the audio SSRC — reach the input as empty
+    /// media. Each was muxed as a zero-length Opus AU (33 of 2964 on the
+    /// rig, every one failed by ffmpeg) or an empty video PES. They are no
+    /// access unit, and a probe ahead of the media anchors no timeline.
+    #[test]
+    fn a_payload_less_frame_is_no_access_unit() {
+        use super::WhipMux;
+        use crate::engine::rtmp::ts_mux::{PCR_LEAD_90K as LEAD, TsMuxer};
+        use std::time::{Duration, Instant};
+        let t0 = Instant::now();
+        let mut mux = TsMuxer::new();
+        mux.set_audio_stream(0x06, Some(*b"Opus"));
+        let mut w = WhipMux::new(mux);
+        assert!(w.frame(false, &[], 123_456, 48_000, t0).is_none(), "a probe on the audio");
+        assert!(w.frame(true, &[], 3_000_000_000, 90_000, t0).is_none(), "and on the video");
+        // The media, 40 ms on: the publish's timeline opens at its first
+        // frame, not at the probes.
+        let at = t0 + Duration::from_millis(40);
+        let (ts, pts) = w.frame(true, &[0, 0, 0, 1, 0x65, 0x88], 3_000_003_600, 90_000, at).unwrap();
+        assert_eq!(pts, LEAD);
+        assert!(!ts.is_empty());
+        let (ts, pts) = w.frame(false, &[0xFC; 80], 123_456 + 1_920, 48_000, at).unwrap();
+        assert_eq!(pts, LEAD);
+        // The Opus AU carries its 80 bytes: control header 0x7F 0xE0, then
+        // au_size.
+        let pkt = ts.iter().flat_map(|b| b.chunks(188)).find(|p| (p[1] & 0x40) != 0 && ((p[1] as u16 & 0x1F) << 8 | p[2] as u16) == 0x0101);
+        let pkt = pkt.expect("the audio PES");
+        let es = crate::engine::ts_parse::pes_payload_offset(pkt).expect("a PES header");
+        assert_eq!(&pkt[es..es + 3], &[0x7F, 0xE0, 80]);
+        assert!(w.frame(false, &[], 123_456 + 3_840, 48_000, at).is_none(), "a probe mid-stream");
     }
 
     fn nal_types(annex_b: &[u8]) -> Vec<u8> {

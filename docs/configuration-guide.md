@@ -1416,7 +1416,13 @@ video. The Opus rides the Opus-in-TS carriage with the control header
 ffmpeg writes and parses (`0x7F 0xE0`, prefix `0x3FF`); it was written as
 `0xFF 0xE0`, which every standard demuxer took for a raw Opus packet and
 failed on — no WHIP publish's audio decoded outside the edge (the edge's own
-demuxer still takes that older header).
+demuxer still takes that older header). A frame with no payload is dropped
+before the muxer and anchors no timeline: a browser publisher's RTP
+padding-only packets (Chromium's bandwidth probes, three every 5 s on the
+audio SSRC) arrive as empty media, and each went out as a zero-length Opus
+access unit — 33 of 2964 on the rig, every one failed by ffmpeg ("Error
+parsing the packet header"). An Opus packet is at least one byte (RFC 6716
+§3.4). The WHEP input drops a payload-less video frame the same way.
 
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
