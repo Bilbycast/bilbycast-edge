@@ -1422,13 +1422,18 @@ loop, each playlist transition — continues one wire timeline:
   out with the file's offset applied. They used to leave with the file's
   raw timestamps (Sky's first video PES sits at packet 14, its first PCR at
   23): ~20 550 s off the live timeline, and a DI downstream at every loop.
-  A file with no PCR in its first 4096 packets keeps only its PSI from that
-  stretch and goes on dropping its elementary streams until its first PCR,
-  which fixes the offset for the rest of the file (UHD at 62 Mbps with 100 ms
-  PCR spacing overruns the hold; it used to stream its opening IDR with the
-  file's own timestamps at every loop). Only a file that shows no PCR at all
-  — a second of one PID's PES time without one, which MPEG-TS never allows —
-  streams on unshifted, and a PCR arriving after that still sets the offset.
+  The hold covers 100 ms — the longest MPEG-TS lets a PCR go unrepeated —
+  of the fastest file the player paces (200 Mbps): 13 298 packets, 2.5 MB.
+  It held 4096 packets, 99 ms of a 62 Mbps UHD file with 100 ms PCR
+  spacing, and past that the file's opening IDR was either streamed with its
+  own timestamps or, later, dropped — the video then waited a GOP for the
+  next random-access point at every loop. A file that runs a second of one
+  PID's PES time without a PCR carries none (MPEG-TS never allows it): that
+  ends the hold at once, the elementary-stream packets held so far are
+  dropped (its PSI goes on) and the rest streams unshifted; a PCR arriving
+  after that still sets the offset. A file whose first PCR lies past the
+  hold within that second keeps only its PSI up to the PCR, which fixes the
+  offset for the rest of the file.
   The input's muxer-mode clock rewriter holds a PES that starts before its
   own first PCR for at most 2 s of PES time, then
   passes it on the source clock (`clock_rewrite_no_pcr`).
