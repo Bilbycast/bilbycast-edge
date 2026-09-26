@@ -757,6 +757,10 @@ pub(super) struct SpliceContinuity {
     /// `play_ts_file`'s splice target).
     ts_last_es: Vec<(u16, u64, u64)>,
 
+    /// The previous TS file's audio access-unit lengths, `(PID, samples,
+    /// rate)` — the grid `whole_audio_frames` keeps each audio PID on.
+    ts_last_audio_au: Vec<(u16, u32, u32)>,
+
     /// The previous TS file's last emitted video DTS (output domain, 90 kHz)
     /// and its DTS step. The next TS file raises its target PTS so its
     /// first kept video DTS lands past it (defect 7b: the next loop's first
@@ -888,6 +892,7 @@ impl SpliceContinuity {
         self.ts_last_pcr = None;
         self.ts_last_other_pcrs.clear();
         self.ts_last_es.clear();
+        self.ts_last_audio_au.clear();
         self.last_video_dts = None;
         self.last_scheduled_deadline_ns = last_deadline_ns;
         self.last_emitted_output_pts_90k = last_pts_90k;
@@ -910,11 +915,13 @@ impl SpliceContinuity {
         last_video_dts: Option<(u64, u64)>,
         last_other_pcrs: Vec<(u16, u64)>,
         last_es: Vec<(u16, u64, u64)>,
+        last_audio_au: Vec<(u16, u32, u32)>,
     ) {
         self.close_file(last_pts_90k);
         self.ts_last_pcr = last_pcr;
         self.last_video_dts = last_video_dts;
         self.ts_last_es = last_es;
+        self.ts_last_audio_au = last_audio_au;
         if last_pcr.is_some() {
             self.ts_last_other_pcrs = last_other_pcrs;
         }
@@ -1735,6 +1742,15 @@ async fn play_ts_file(
             }
         }
     }
+    // Whole audio frames across the splice (see `whole_audio_frames`).
+    let delta = splice_whole_frames(session.cont, &head_info, target_pts_90k);
+    if delta > 0 {
+        tracing::debug!(
+            "media-player: loop target raised {:.1} ms so the audio gap across the splice is whole frames",
+            delta as f64 / 90.0
+        );
+        target_pts_90k = (target_pts_90k + delta) & 0x1_FFFF_FFFF;
+    }
     let mut splice = TsFileSplice::new(target_pts_90k, head_info.video);
     // Packets held until the first anchor PCR (7a) and replayed through the
     // offset path once it arrives. The hold covers 100 ms — the longest
@@ -2235,6 +2251,7 @@ async fn play_ts_file(
         video_carry,
         std::mem::take(&mut splice.other_pcrs),
         es_carry,
+        std::mem::take(&mut splice.audio_au),
     );
     Ok(())
 }
@@ -2400,6 +2417,11 @@ struct TsFileSplice {
     /// first timestamp on it must move past ([`EsLast`]).
     es_kinds: Vec<(u16, bool)>,
     es_last: Vec<EsLast>,
+    /// Every audio ES whose access units can be cut (from the PMTs), and
+    /// each one's access-unit length `(samples, rate)` read off its first
+    /// PES — carried to the next file for `whole_audio_frames`.
+    audio_fmt: Vec<(u16, crate::engine::audio_au::AuFormat)>,
+    audio_au: Vec<(u16, u32, u32)>,
     gate: VideoRapGate,
     /// Highest emitted video DTS (output domain) and the last DTS step —
     /// the next file's video term (7b).
@@ -2427,6 +2449,8 @@ impl TsFileSplice {
             other_pcrs: Vec::new(),
             es_kinds: Vec::new(),
             es_last: Vec::new(),
+            audio_fmt: Vec::new(),
+            audio_au: Vec::new(),
             gate: VideoRapGate::new(video),
             max_video_dts_90k: None,
             video_dts_step_90k: None,
@@ -2503,6 +2527,13 @@ impl TsFileSplice {
                 self.es_kinds.push((pid, video));
             }
         }
+        for e in &view.es {
+            if let Some(fmt) = au_format_of(e.stream_type, view.es_info(e))
+                && !self.audio_fmt.iter().any(|(p, _)| *p == e.pid)
+            {
+                self.audio_fmt.push((e.pid, fmt));
+            }
+        }
         // The head did not show the video ES: gate it from here only if
         // none of it has gone out yet — gating a GOP already under way
         // would drop pictures and fix nothing. Only the anchor's
@@ -2554,6 +2585,18 @@ impl TsFileSplice {
                 // audio PIDs separately. `close_file` prefers the audio
                 // high-water mark — see `SpliceContinuity::close_file`.
                 if let Some(new_pts) = rewrite_pes_timestamps_in_place(&mut packet, off_90k) {
+                    // An audio PID's access-unit length, off its first PES
+                    // whose payload opens on a frame header.
+                    if let Some(&(_, fmt)) = self.audio_fmt.iter().find(|(p, _)| *p == pid)
+                        && !self.audio_au.iter().any(|(p, _, _)| *p == pid)
+                        && let Some(es) = crate::engine::ts_parse::pes_payload_offset(&packet)
+                        && let crate::engine::audio_au::Head::Valid(h) =
+                            crate::engine::audio_au::parse_header(fmt, &packet[es..])
+                        && h.samples > 0
+                        && h.sample_rate > 0
+                    {
+                        self.audio_au.push((pid, h.samples, h.sample_rate));
+                    }
                     if new_pts > self.max_emitted_pts_90k {
                         self.max_emitted_pts_90k = new_pts;
                     }
@@ -2930,6 +2973,93 @@ pub(super) struct TsHeadInfo {
     pub(super) first_pcrs: Vec<(u16, u64)>,
     /// First PES timestamp (DTS, else PTS) of every PID in the head.
     pub(super) first_es: Vec<(u16, u64)>,
+    /// Every audio ES whose first access unit the head shows: its duration,
+    /// `(PID, samples, sample rate)`.
+    pub(super) audio_au: Vec<(u16, u32, u32)>,
+}
+
+/// The access-unit framing of an audio ES (a DVB `0x06` one by its
+/// descriptors), or `None`.
+fn au_format_of(stream_type: u8, es_info: &[u8]) -> Option<crate::engine::audio_au::AuFormat> {
+    use crate::engine::ts_parse::PrivateEsAudioKind;
+    let st = match stream_type {
+        0x06 => match crate::engine::ts_parse::descriptor_audio_kind(es_info)? {
+            PrivateEsAudioKind::Ac3 => 0x81,
+            PrivateEsAudioKind::Eac3 => 0x87,
+            _ => return None,
+        },
+        st => st,
+    };
+    crate::engine::audio_au::AuFormat::for_stream_type(st)
+}
+
+/// How far to move a loop's splice target so each audio PID's step across
+/// the splice — its last PES's PTS to the next file's first — is a whole
+/// number of its access units, and so is the gap that leaves after the
+/// last PES's frames: `gaps` are `(step, access-unit duration)` in 90 kHz
+/// ticks (the duration may be fractional: 1024 samples at 44.1 kHz). The
+/// move is the smallest that makes the most of them whole, always under one
+/// access unit; `0` when none can be.
+///
+/// A gap that is not whole access units turns a re-encoder's frame grid
+/// against the source's at every loop: each re-encoded frame leaves when
+/// the source frame holding its last sample arrives, and that wait moves by
+/// the gap's remainder. MP2 → MP2 on Spain (a 244 ms gap, 192 samples over
+/// ten frames) stepped the output's arrival-minus-media by −18 to −22 ms at
+/// each loop — Gate 2 4b; Sky AAC by −8 ms. A whole number of source frames
+/// keeps the source's grid where it was, so nothing turns.
+pub(super) fn whole_audio_frames(gaps: &[(i64, f64)]) -> u64 {
+    let fits = |gap: f64, au: f64| {
+        let r = gap.rem_euclid(au);
+        r < 1.0 || au - r < 1.0
+    };
+    let mut best: (usize, u64) = (0, 0);
+    for &(gap, au) in gaps {
+        if au.is_nan() || au < 1.0 || gap < 0 {
+            continue;
+        }
+        let r = (gap as f64).rem_euclid(au);
+        let delta = if r < 1.0 || au - r < 1.0 { 0 } else { (au - r).ceil() as u64 };
+        let n = gaps
+            .iter()
+            .filter(|&&(g, a)| g >= 0 && a >= 1.0 && fits((g as u64 + delta) as f64, a))
+            .count();
+        if n > best.0 || (n == best.0 && n > 0 && delta < best.1) {
+            best = (n, delta);
+        }
+    }
+    best.1
+}
+
+/// The move of a loop's splice `target` (90 kHz) that makes each audio PID's
+/// step across it whole access units ([`whole_audio_frames`]): each PID's
+/// last PES start in the previous file (`cont.ts_last_es`), its first in
+/// this file's head (`head.first_es`, against the head's first PCR), and its
+/// access-unit length — as the previous file played it
+/// (`cont.ts_last_audio_au`), else off this file's head. The previous file
+/// is the one that knows it: a broadcast MPTS's first PAT can lie past the
+/// head (Spain's, 368 ms in, at 915 KB), and with no PMT the head knows no
+/// audio at all.
+pub(super) fn splice_whole_frames(cont: &SpliceContinuity, head: &TsHeadInfo, target: u64) -> u64 {
+    let Some((_, first_pcr)) = head.first_pcr else {
+        return 0;
+    };
+    let base = (first_pcr / 300) as i128;
+    let gaps: Vec<(i64, f64)> = cont
+        .ts_last_es
+        .iter()
+        .filter_map(|(pid, last, _)| {
+            let &(_, samples, rate) =
+                cont.ts_last_audio_au.iter().chain(head.audio_au.iter()).find(|(p, _, _)| p == pid)?;
+            let first = head.first_es.iter().find(|(p, _)| p == pid)?.1;
+            // Where the file's first PES would land right on the last
+            // one's start: the step between the two must be whole frames.
+            let on_last = (base + *last as i128 - first as i128).rem_euclid(1 << 33) as u64;
+            let step = pts_diff_90k(target, on_last);
+            (0..10 * 90_000).contains(&step).then_some((step, samples as f64 * 90_000.0 / rate as f64))
+        })
+        .collect();
+    whole_audio_frames(&gaps)
 }
 
 /// Scan the (program-filtered) head for [`TsHeadInfo`]. Two passes: the
@@ -2971,6 +3101,8 @@ pub(super) fn scan_ts_head(head: &[u8], stride: usize, program: Option<u16>) -> 
     let mut asms: Vec<(u16, crate::engine::ts_parse::SectionAssembler)> = Vec::new();
     // (PMT PID, PCR_PID, video ES) of each program whose PMT parsed.
     let mut programs: Vec<(u16, u16, Option<(u16, u8)>)> = Vec::new();
+    // Every program's audio ES whose access units can be cut.
+    let mut audio: Vec<(u16, crate::engine::audio_au::AuFormat)> = Vec::new();
     for pkt in packets() {
         let pid = ((pkt[1] as u16 & 0x1F) << 8) | pkt[2] as u16;
         if let Some(pcr) = crate::engine::ts_parse::extract_pcr(&pkt) {
@@ -3010,7 +3142,36 @@ pub(super) fn scan_ts_head(head: &[u8], stride: usize, program: Option<u16>) -> 
                         .find(|e| rap_gated_stream_type(e.stream_type))
                         .map(|e| (e.pid, e.stream_type));
                     programs.push((pid, v.pcr_pid, video));
+                    for e in &v.es {
+                        if let Some(fmt) = au_format_of(e.stream_type, v.es_info(e))
+                            && !audio.iter().any(|(p, _)| *p == e.pid)
+                        {
+                            audio.push((e.pid, fmt));
+                        }
+                    }
                 }
+            }
+        }
+    }
+    // Each audio ES's first access unit: its duration.
+    if !audio.is_empty() {
+        for pkt in packets() {
+            let pid = ((pkt[1] as u16 & 0x1F) << 8) | pkt[2] as u16;
+            let Some(&(_, fmt)) = audio.iter().find(|(p, _)| *p == pid) else {
+                continue;
+            };
+            if pkt[1] & 0x40 == 0 || info.audio_au.iter().any(|(p, _, _)| *p == pid) {
+                continue;
+            }
+            let Some(es) = crate::engine::ts_parse::pes_payload_offset(&pkt) else {
+                continue;
+            };
+            if let crate::engine::audio_au::Head::Valid(h) =
+                crate::engine::audio_au::parse_header(fmt, &pkt[es..])
+                && h.samples > 0
+                && h.sample_rate > 0
+            {
+                info.audio_au.push((pid, h.samples, h.sample_rate));
             }
         }
     }
@@ -6197,6 +6358,119 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn looping_repeats_the_pat_and_pmt_across_the_splice() {
         assert_psi_repeated(&loop_ts_twice("psi-head.ts", &loop_fixture_sparse_psi([300, 700], 0)).await);
+    }
+
+    /// Whole access units across a splice: the smallest move that makes the
+    /// most audio gaps whole, under one access unit.
+    #[test]
+    fn whole_audio_frames_moves_the_least_for_the_most_pids() {
+        let mp2 = 2_160.0; // 1152 samples at 48 kHz
+        let aac = 1_920.0; // 1024
+        assert_eq!(whole_audio_frames(&[]), 0);
+        assert_eq!(whole_audio_frames(&[(19_800, mp2)]), 1_800, "220 ms -> 240 ms: ten frames");
+        assert_eq!(whole_audio_frames(&[(21_600, mp2)]), 0, "already ten frames");
+        // Spain: eighteen MP2 PIDs, one gap — one move serves them all.
+        assert_eq!(whole_audio_frames(&vec![(19_800, mp2); 18]), 1_800);
+        // Two codecs no one move can serve: the smaller.
+        assert_eq!(whole_audio_frames(&[(19_800, mp2), (19_800, aac)]), 1_320);
+        // Two PIDs of one codec over one of another: the two.
+        assert_eq!(whole_audio_frames(&[(19_800, mp2), (19_800, mp2), (19_200, aac)]), 1_800);
+        // 1024 samples at 44.1 kHz is 2089.8 ticks: whole to the tick.
+        let d = whole_audio_frames(&[(10_000, 2_089.795_918)]);
+        assert!(((10_000 + d) as f64 / 2_089.795_918 - 5.0).abs() < 1.0 / 2_089.0, "{d}");
+    }
+
+    /// The access-unit length the previous file played with keeps the grid
+    /// when this file's head shows no PMT (Spain's PAT lies past its head):
+    /// the head's own is only the fallback.
+    #[test]
+    fn the_splice_keeps_the_grid_the_previous_file_played() {
+        // Last audio PES at output 100 000; this file's first at raw
+        // 50 000, its first PCR raw 45 000 (90 kHz).
+        let mut cont =
+            SpliceContinuity { ts_last_es: vec![(0x44F, 100_000, 10_800)], ..SpliceContinuity::default() };
+        let head = TsHeadInfo {
+            first_pcr: Some((0x44D, 45_000 * 300)),
+            first_es: vec![(0x44F, 50_000)],
+            ..TsHeadInfo::default()
+        };
+        // Target 115 000: the first PES lands at 120 000, 20 000 after the
+        // last — 9.26 MP2 frames.
+        assert_eq!(splice_whole_frames(&cont, &head, 115_000), 0, "no length known: no move");
+        cont.ts_last_audio_au = vec![(0x44F, 1_152, 48_000)];
+        assert_eq!(splice_whole_frames(&cont, &head, 115_000), 1_600, "to 21 600: ten frames");
+        let aac_head = TsHeadInfo { audio_au: vec![(0x44F, 1_024, 48_000)], ..head.clone() };
+        assert_eq!(splice_whole_frames(&cont, &aac_head, 115_000), 1_600, "the played length first");
+        cont.ts_last_audio_au.clear();
+        assert_eq!(splice_whole_frames(&cont, &aac_head, 115_000), 1_120, "else the head's: 21 120, 11 AAC frames");
+    }
+
+    /// A file records each audio PID's access-unit length as it plays (off
+    /// its first PES that opens on a frame header), for the next splice.
+    #[test]
+    fn a_playing_file_records_its_audio_frame_length() {
+        use crate::engine::ts_test_fixtures::{packetize_sections, pat_packet, pes_start_packet, pmt_section};
+        let mut cont = SpliceContinuity::default();
+        let mut splice = TsFileSplice::new(0, None);
+        splice.splice_offset_27m = Some(0);
+        let mut out = Vec::new();
+        splice.push(pat_packet(&[(1, 0x1000)], 0, 0), None, &mut cont, &mut out);
+        let pmt = pmt_section(1, 0, 0x100, &[], &[(0x1B, 0x100, &[]), (0x03, 0x101, &[])]);
+        splice.push(packetize_sections(0x1000, &[&pmt], 0)[0], None, &mut cont, &mut out);
+        let mut a = pes_start_packet(0x101, 0, 0xC0, 90_000, None);
+        let es = crate::engine::ts_parse::pes_payload_offset(&a).unwrap();
+        // Not a frame header yet (a PES opening mid-frame): nothing learned.
+        splice.push(a, None, &mut cont, &mut out);
+        assert!(splice.audio_au.is_empty());
+        a[es..es + 4].copy_from_slice(&[0xFF, 0xFC, 0xA4, 0x00]);
+        splice.push(a, None, &mut cont, &mut out);
+        assert_eq!(splice.audio_au, vec![(0x101, 1_152, 48_000)]);
+    }
+
+    /// [`loop_fixture`] with real MP2 frame headers in its audio (a PES per
+    /// 24 ms frame, stream_type 0x03), so the head shows the frame length.
+    fn loop_fixture_mp2() -> Vec<u8> {
+        let mut ts = loop_fixture();
+        for p in ts.chunks_mut(TS_PACKET) {
+            let pid = ((p[1] as u16 & 0x1F) << 8) | p[2] as u16;
+            if pid == 0x1000 && p[1] & 0x40 != 0 {
+                // The PMT: audio 0x0F -> 0x03, CRC again.
+                let s = 5 + p[4] as usize;
+                let len = (((p[s + 1] & 0x0F) as usize) << 8) | p[s + 2] as usize;
+                let mut i = s + 12 + ((((p[s + 10] & 0x0F) as usize) << 8) | p[s + 11] as usize);
+                while i + 5 <= s + 3 + len - 4 {
+                    if ((p[i + 1] as u16 & 0x1F) << 8 | p[i + 2] as u16) == 0x101 {
+                        p[i] = 0x03;
+                    }
+                    i += 5 + ((((p[i + 3] & 0x0F) as usize) << 8) | p[i + 4] as usize);
+                }
+                let crc = crate::engine::ts_parse::mpeg2_crc32(&p[s..s + 3 + len - 4]);
+                p[s + 3 + len - 4..s + 3 + len].copy_from_slice(&crc.to_be_bytes());
+            }
+            if pid == 0x101 && p[1] & 0x40 != 0 {
+                let es = crate::engine::ts_parse::pes_payload_offset(p).unwrap();
+                p[es..es + 4].copy_from_slice(&[0xFF, 0xFD, 0xA4, 0x00]);
+            }
+        }
+        ts
+    }
+
+    /// Across a loop, the audio's gap is a whole number of its frames: the
+    /// re-encoder's frame grid then stays where the source's is (see
+    /// `whole_audio_frames`). The fixture's audio would otherwise step
+    /// 20 ms of PES time plus the splice's remainder.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_loop_leaves_whole_audio_frames_between_its_files() {
+        let ts = loop_fixture_mp2();
+        let head = scan_ts_head(&ts, TS_PACKET, None);
+        assert_eq!(head.audio_au, vec![(0x101, 1_152, 48_000)]);
+        let trace = loop_ts_twice("mp2-loop.ts", &ts).await;
+        let pts = pes_pts_of(&trace, 0x101);
+        let steps: Vec<i64> = pts.windows(2).map(|w| pts_diff_90k(w[1], w[0])).collect();
+        let splice: Vec<i64> = steps.iter().copied().filter(|s| *s != 1_800).collect();
+        assert_eq!(splice.len(), 1, "one splice: {steps:?}");
+        assert!(splice[0] > 1_800, "{splice:?}");
+        assert_eq!(splice[0] % 2_160, 0, "step {} ticks", splice[0]);
     }
 
     /// The splice guard's bookkeeping: a table owed goes out again once
