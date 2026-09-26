@@ -287,8 +287,8 @@ const CLOCK_FILL_MAX_90K: i64 = REANCHOR_90K;
 /// and the longest stretch without the content end moving.
 #[derive(Clone, Copy, Debug, Default)]
 struct FillSecond {
-    /// Program clock second (90 kHz / 90 000) this bucket holds; `None`
-    /// unused.
+    /// Program clock second this bucket holds, on the unwrapped clock
+    /// ([`ClockFill::ext_pcr_90k`]); `None` unused.
     sec: Option<u64>,
     floor_90k: i64,
     quiet_90k: i64,
@@ -329,8 +329,15 @@ struct ClockFill {
     pkts: u64,
     tpp_q16: u64,
     step_90k: i64,
-    /// The first clock reading since the timeline anchored: the warm-up's
-    /// start.
+    /// The last PCR unwrapped: its 33-bit value plus the laps the clock has
+    /// run since this time base began. The window's seconds and the
+    /// warm-up are counted on it — the 33-bit value wraps every 26.5 h,
+    /// and keyed on it the window forgot everything at the wrap (the
+    /// second jumps 95 443 -> 0) and filled the next PES's wait with
+    /// silence.
+    ext_pcr_90k: u64,
+    /// The first clock reading since the timeline anchored (unwrapped):
+    /// the warm-up's start.
     since_90k: Option<u64>,
     /// Where the content ended at the previous reading, and the clock at
     /// which the source last moved it; whether the current stretch ends in
@@ -354,6 +361,7 @@ impl ClockFill {
             pkts: self.pkts,
             tpp_q16: self.tpp_q16,
             step_90k: self.step_90k,
+            ext_pcr_90k: self.ext_pcr_90k,
             ..ClockFill::default()
         };
     }
@@ -364,8 +372,12 @@ impl ClockFill {
         let prev = self.last_pcr_90k.replace(c);
         let step = prev.map(|p| pts_diff(c, p));
         if di || step.is_some_and(|s| !(0..=90_000).contains(&s)) {
-            *self = ClockFill { last_pcr_90k: Some(c), ..ClockFill::default() };
+            *self = ClockFill { last_pcr_90k: Some(c), ext_pcr_90k: c, ..ClockFill::default() };
             return false;
+        }
+        match step {
+            Some(s) => self.ext_pcr_90k += s as u64,
+            None => self.ext_pcr_90k = c,
         }
         if let Some(s) = step
             && self.pkts >= 4
@@ -384,6 +396,15 @@ impl ClockFill {
         let c = self.last_pcr_90k?;
         let ahead = ((self.pkts * self.tpp_q16) >> 16).min(self.step_90k.max(0) as u64);
         Some((c + ahead) & PTS_MASK)
+    }
+
+    /// A clock reading `c` (the last PCR or later) unwrapped, see
+    /// [`Self::ext_pcr_90k`].
+    fn unwrapped(&self, c: u64) -> u64 {
+        match self.last_pcr_90k {
+            Some(last) => self.ext_pcr_90k + pts_diff(c, last).max(0) as u64,
+            None => c,
+        }
     }
 
     /// The window's lowest headroom and longest stretch, over the seconds
@@ -1610,8 +1631,9 @@ impl TsAudioReplacer {
             return;
         }
         let end = self.timeline.end_90k();
-        let sec = c / 90_000;
         let f = &mut self.clock_fill;
+        let at = f.unwrapped(c);
+        let sec = at / 90_000;
         if f.last_end_90k != Some(end) {
             // The source moved the content end since the last reading. A
             // stretch that ended in a correction, or in the middle of a
@@ -1632,10 +1654,10 @@ impl TsAudioReplacer {
             f.last_end_90k = Some(end);
         }
         let headroom = pts_diff(end, c);
-        let since = *f.since_90k.get_or_insert(c);
+        let since = *f.since_90k.get_or_insert(at);
         let quiet = pts_diff(c, f.moved_at_90k.unwrap_or(c));
         if !f.active {
-            let warm = pts_diff(c, since) >= CLOCK_FILL_WARMUP_90K;
+            let warm = at.saturating_sub(since) >= CLOCK_FILL_WARMUP_90K as u64;
             let window = f.window_at(sec);
             let (floor, quiet_max) = match window {
                 Some(w) if warm => w,
@@ -1711,10 +1733,11 @@ impl TsAudioReplacer {
                     self.drop_overlap(off);
                     // The audio came back with less lead than the window's
                     // floor: the source's floor is that much lower.
-                    if let Some(c) = self.clock_fill.now()
-                        && let Some((floor, _)) = self.clock_fill.window_at(c / 90_000)
-                    {
-                        self.clock_fill.record(c / 90_000, Some(floor + off), None);
+                    if let Some(c) = self.clock_fill.now() {
+                        let sec = self.clock_fill.unwrapped(c) / 90_000;
+                        if let Some((floor, _)) = self.clock_fill.window_at(sec) {
+                            self.clock_fill.record(sec, Some(floor + off), None);
+                        }
                     }
                 }
                 self.clock_fill.corrected = true;
@@ -4464,6 +4487,79 @@ mod tests {
         assert!((360 * 48 - 1_152..=360 * 48 + 1_152).contains(&silence), "{silence} samples");
         assert_eq!(pcr.offset_raises, 0, "{pcr:?}");
         assert!(pcr.offset_ms <= 80.0, "{pcr:?}");
+    }
+
+    /// `ts` with every PCR and PES PTS moved `by` ticks (90 kHz) on, mod
+    /// 2^33.
+    #[cfg(all(feature = "media-codecs", feature = "fdk-aac"))]
+    fn shift_clock(ts: &[u8], by: u64) -> Vec<u8> {
+        let mut out = ts.to_vec();
+        for p in out.chunks_mut(TS_PACKET_SIZE) {
+            if let Some(v) = extract_pcr(p) {
+                crate::engine::ts_parse::write_pcr(p, v + by * 300);
+            }
+            if ts_pusi(p)
+                && let Some(pts) = crate::engine::ts_parse::extract_pes_pts(p)
+            {
+                let o = ts_payload_offset(p) + 9;
+                let v = (pts + by) & PTS_MASK;
+                p[o] = 0x21 | ((v >> 29) as u8 & 0x0E);
+                p[o + 1] = (v >> 22) as u8;
+                p[o + 2] = ((v >> 14) as u8 & 0xFE) | 1;
+                p[o + 3] = (v >> 7) as u8;
+                p[o + 4] = ((v << 1) as u8 & 0xFE) | 1;
+            }
+        }
+        out
+    }
+
+    /// The program clock wrapping 2^33 -> 0 (every 26.5 h) is nothing to
+    /// the fill: a steady source of 120 ms PES arriving whole, run across
+    /// the wrap, gets no silence. Keyed on the 33-bit clock, the window
+    /// forgot every second before the wrap, took the first reading after
+    /// it as the source's floor and filled the next PES's wait — its
+    /// audio then dropped as overlap, once a day on every 24/7 flow.
+    #[cfg(all(feature = "media-codecs", feature = "fdk-aac"))]
+    #[test]
+    fn a_program_clock_wrap_is_never_filled() {
+        // The wrap about 5 s into a 12 s source (the fill is warm from 2 s),
+        // at points across a PES interval: the forgetting shows only when
+        // the source stands still well past the wrap.
+        for (spread, extra) in [false, true].into_iter().flat_map(|s| [0u64, 2_700, 5_400, 8_100].map(|e| (s, e))) {
+            let by = (1u64 << 33) - e2e::P0 - 5 * 90_000 + extra;
+            let src = clock_fill_source(|_| 100, None, 48_000, 12, spread);
+            let ts = shift_clock(&src, by);
+            let mut r = e2e::replacer("mp2", None, None);
+            let stats = r.stats_handle();
+            let out = e2e::run(&mut r, &ts);
+            assert!(
+                e2e::audio_pes(&out).iter().any(|(pts, _)| *pts < 90_000),
+                "the output ran past the wrap"
+            );
+            assert_eq!(stats.timeline_corrections.load(Ordering::Relaxed), 0, "spread {spread} +{extra}");
+            assert_eq!(stats.silence_inserted_samples.load(Ordering::Relaxed), 0, "spread {spread} +{extra}");
+            assert_eq!(stats.dropped_samples.load(Ordering::Relaxed), 0, "spread {spread} +{extra}");
+        }
+    }
+
+    /// The window's seconds run on through a wrap of the 33-bit clock.
+    #[test]
+    fn the_clock_fill_window_runs_on_through_a_clock_wrap() {
+        let mut f = ClockFill::default();
+        let near = (1u64 << 33) - 3 * 90_000;
+        assert!(f.note_pcr(near, false));
+        let before = f.unwrapped(near) / 90_000;
+        f.record(before, Some(9_000), Some(10_800));
+        let mut c = near;
+        for _ in 0..200 {
+            c = (c + 2_700) & PTS_MASK;
+            f.pkts = 30;
+            assert!(f.note_pcr(c, false), "a 30 ms step across the wrap");
+        }
+        assert_eq!(c, 270_000, "wrapped");
+        let now = f.unwrapped(c) / 90_000;
+        assert_eq!(now - before, 6, "six seconds on");
+        assert_eq!(f.window_at(now), Some((9_000, 10_800)), "the pre-wrap second is still in the window");
     }
 
     /// The source's own packing — 120 ms PES arriving whole — is no gap:
