@@ -651,15 +651,56 @@ the sample:
   and after every packet compares it with where the decoded content ends
   (the *headroom*). Over the last 10 s of that clock it keeps the lowest
   headroom the source left and the longest stretch its content end stood
-  still. When the content end has stood still 10 ms longer than that
-  stretch and the headroom has fallen 10 ms below that floor, the source is
-  missing audio it always had by now: silence is placed, as the clock goes
-  on, to keep the headroom at the floor, until the audio returns, which then
-  settles what is left at once (a gap filled, an overlap dropped — the
-  150 ms persistence rule is for timestamp jitter, not this). Each silent
-  frame so leaves where, and against the same PCR, a source frame would have
-  at the source's worst; nothing is placed ahead of audio a source keeping
-  its own lead still has to send. The first 2 s after an anchor are watched,
+  still, and the longest the clock went unread within such a stretch. When
+  the content end has stood still 10 ms longer than that stretch and the
+  headroom has fallen 10 ms below that floor, the source is missing audio it
+  always had by now. Through a pause in the whole stream (a `media_player`
+  loop: only the PCR goes on) the clock is read only at the PCRs, 30 ms
+  apart, further apart than in any of the source's own stretches; both tests
+  are then judged ahead by the difference, at this reading rather than a
+  reading later. (Judged a whole reading interval ahead always, a radio
+  service — read only at its PES and PCRs — filled the stretch after a PES
+  60 ms early; the threshold can't be above the floor either: at the fill's
+  target it filled 18 stretches per loop of Spain that had lead to spare,
+  dropping audio that arrived on time.) Silence is then placed, as the clock goes
+  on, to keep the headroom **one output frame and one clock reading above
+  the floor**, until the audio returns, which then settles what is left at
+  once (a gap filled, an overlap dropped — the 150 ms persistence rule is
+  for timestamp jitter, not this). An output frame leaves once the content
+  end passes its end: the extra frame lets each silent frame leave no later
+  than a source frame did at the floor, the extra reading lets the one that
+  falls due before the next reading leave at this one. The fill used to
+  hold the headroom at the floor, and judge the pause a reading late, so
+  every silent frame left at the worst phase of the re-framing, and later
+  still through a pause: re-encoding Spain program 186 (MP2 in
+  120 ms PES) to AAC-LC, the silence of each loop left up to 2.2 ms behind
+  the PCR and completed up to 15.1 ms past its PTS, a T-STD underflow — the
+  MP2 and AC-3 outputs of the same flow, whose own lead was larger, kept
+  ahead. The price is speculation of that frame and reading: when the
+  audio returns at its own lead the fill has run that far ahead of it, and
+  the returning audio loses at most that much as overlap, settled to the
+  sample (no 5 ms deadband: the fill ends a few ms from the returning audio
+  so often that a remainder left under it kept a Spain loop's MP2 re-encode
+  4.45 ms off lip-sync and its frame grid a fraction of a frame off the
+  source's, its lead stepping by a frame at every loop), and the lead it
+  returns with is a headroom of the source's own (the overlap is no
+  shortfall: taken as one, it lowered the floor by what the fill ran ahead)
+  — an output frame
+  (21.3 ms of AAC-LC, 24 ms MP2, 32 ms AC-3, 42.7 ms HE-AAC) plus a reading
+  (a few ms; up to the PCR interval through a pause) of the new loop's first
+  audio at a `media_player` loop, and the same after a real outage.
+  Pinned by `a_loop_gap_re_encoded_to_aac_keeps_every_pes_ahead_of_the_pcr`
+  and `a_long_stretch_with_lead_to_spare_is_not_filled`. Measured on that
+  Spain cell over 4 loops (value-based, the PCR interpolated by packet
+  index): no AAC PES behind the PCR (the worst +5.0 ms; before, 4 behind and
+  28 incomplete by their PTS, the worst 15.1 ms late), and no clock fill but
+  the 4 loops'. What remains is the first silent frame, which leaves at the
+  first clock reading past the source's longest stretch: through the pause
+  the readings are the PCR fillers', 30–35 ms apart, so its lead lies up to
+  a reading below the source's own worst — one PES of the 4 loops finished
+  1.5 ms past its PTS. The MP2 / AC-3 / whole-MPTS MP2 outputs kept +30.6 /
+  +27.4 / +45.5 ms, lip-sync stayed within 0.1 ms and `D` at 80 ms.
+  The first 2 s after an anchor are watched,
   not acted on; a PCR that steps back, jumps over 1 s or carries DI starts
   the learning over; past 500 ms of such silence the audio has stopped
   rather than paused, and its return re-anchors. The 10 s window and the

@@ -271,9 +271,12 @@ const CLOCK_FILL_WARMUP_90K: i64 = 180_000; // 2 s
 /// program clock: long enough to hold every stretch of its packing, short
 /// enough to forget a flow start's or a splice's transient.
 const CLOCK_FILL_WINDOW_S: usize = 10;
-/// How far the headroom may drop below the lowest the source left in the
-/// window before a gap is filled — the silence then brings it back to that
-/// floor.
+/// How far the headroom must have fallen below the lowest the source left in
+/// the window before a gap is filled. Not above the floor: a source that ran
+/// a longer stretch than any in the window with lead to spare is not late —
+/// a trigger at the fill's target (a frame and a reading above the floor)
+/// filled 18 such stretches per loop of Spain, and dropped the audio that
+/// then arrived on time as overlap.
 const CLOCK_FILL_TOL_90K: i64 = 900; // 10 ms
 /// How much longer than any stretch of the source's own in the window the
 /// content end must stand still before it is a gap and not the source's
@@ -283,8 +286,9 @@ const CLOCK_FILL_QUIET_TOL_90K: i64 = 900; // 10 ms
 /// audio has stopped rather than paused, and its return re-anchors.
 const CLOCK_FILL_MAX_90K: i64 = REANCHOR_90K;
 
-/// One second of what the source did against its clock: the lowest headroom
-/// and the longest stretch without the content end moving.
+/// One second of what the source did against its clock: the lowest headroom,
+/// the longest stretch without the content end moving, and the longest the
+/// clock went unread within one of its stretches.
 #[derive(Clone, Copy, Debug, Default)]
 struct FillSecond {
     /// Program clock second this bucket holds, on the unwrapped clock
@@ -292,6 +296,7 @@ struct FillSecond {
     sec: Option<u64>,
     floor_90k: i64,
     quiet_90k: i64,
+    reading_90k: i64,
 }
 
 /// Clock-driven gap fill: silence for a gap in the source audio placed
@@ -310,16 +315,27 @@ struct FillSecond {
 /// ends minus the program clock — after every packet, the clock read from
 /// the program's PCRs and interpolated between them by packet count, as a
 /// T-STD model does. Over the last [`CLOCK_FILL_WINDOW_S`] seconds it keeps
-/// the lowest headroom the source left and the longest stretch its content
-/// end stood still. When the content end has stood still longer than that
-/// and the headroom has fallen [`CLOCK_FILL_TOL_90K`] below its floor, the
-/// source is missing audio it always had by now: silence is placed up to
-/// the floor as the clock goes on, until the audio returns. Each silent
-/// frame therefore leaves where, and against the same PCR, a source frame
-/// would have at the source's worst. Nothing is speculated: a source that
-/// keeps its own lead never sees silence placed ahead of audio still to
-/// come. The returning audio settles what remains at once — a gap filled,
-/// an overlap dropped.
+/// the lowest headroom the source left (its floor), the longest stretch its
+/// content end stood still, and the longest the clock went unread within
+/// such a stretch. When the content end has stood still
+/// [`CLOCK_FILL_QUIET_TOL_90K`] longer than any stretch and the headroom has
+/// fallen [`CLOCK_FILL_TOL_90K`] below the floor, the source is missing audio
+/// it always had by now. A stream that pauses (a media-player loop: only the
+/// PCR goes on) is read only at its PCRs, 30 ms apart, further apart than in
+/// any of the source's own stretches; the tests are then judged ahead by the
+/// difference, at this reading rather than the next. Silence is then placed
+/// as the clock goes on, until the audio returns, keeping the content end
+/// one output frame and one clock reading above the floor. An output frame
+/// goes out once the content end passes its end: kept at the floor, every
+/// silent frame went out at the worst phase of the re-framing, and a reading
+/// late on a sparse clock. The extra frame lets each leave no later than a
+/// source frame did at the floor, the extra reading lets the one that falls
+/// due before the next reading leave at this one. Filled to the floor, the
+/// silence of a Spain loop (MP2 in 120 ms PES to AAC-LC) left 2 ms behind
+/// the PCR and completed up to 15 ms past its PTS. The price is speculation
+/// of that frame and reading: the returning audio settles what remains at
+/// once — a gap filled, an overlap dropped — and when it returns at its own
+/// lead the overlap is at most what the fill ran ahead.
 #[derive(Clone, Debug, Default)]
 struct ClockFill {
     /// The program's last PCR (90 kHz), the packets since, the clock one
@@ -339,6 +355,10 @@ struct ClockFill {
     /// The first clock reading since the timeline anchored (unwrapped):
     /// the warm-up's start.
     since_90k: Option<u64>,
+    /// The previous clock reading: how far apart the readings come; and the
+    /// longest the clock has gone unread in the current stretch.
+    last_reading_90k: Option<u64>,
+    stretch_reading_90k: i64,
     /// Where the content ended at the previous reading, and the clock at
     /// which the source last moved it; whether the current stretch ends in
     /// a timeline correction (then it was no stretch of the source's).
@@ -362,6 +382,7 @@ impl ClockFill {
             tpp_q16: self.tpp_q16,
             step_90k: self.step_90k,
             ext_pcr_90k: self.ext_pcr_90k,
+            last_reading_90k: self.last_reading_90k,
             ..ClockFill::default()
         };
     }
@@ -420,11 +441,30 @@ impl ClockFill {
         }))
     }
 
+    /// The longest the clock went unread within a stretch of the source's
+    /// own, over the window's seconds up to `sec`.
+    fn window_reading_at(&self, sec: u64) -> i64 {
+        self.window
+            .iter()
+            .filter(|b| b.sec.is_some_and(|s| sec.wrapping_sub(s) < CLOCK_FILL_WINDOW_S as u64))
+            .map(|b| b.reading_90k)
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// Record the longest reading interval of a stretch of the source's own
+    /// in the bucket of second `sec`.
+    fn record_reading(&mut self, sec: u64, reading: i64) {
+        self.record(sec, None, None);
+        let b = &mut self.window[(sec % CLOCK_FILL_WINDOW_S as u64) as usize];
+        b.reading_90k = b.reading_90k.max(reading);
+    }
+
     /// Record a headroom and / or a stretch in the bucket of second `sec`.
     fn record(&mut self, sec: u64, headroom: Option<i64>, quiet: Option<i64>) {
         let b = &mut self.window[(sec % CLOCK_FILL_WINDOW_S as u64) as usize];
         if b.sec != Some(sec) {
-            *b = FillSecond { sec: Some(sec), floor_90k: i64::MAX, quiet_90k: 0 };
+            *b = FillSecond { sec: Some(sec), floor_90k: i64::MAX, quiet_90k: 0, reading_90k: 0 };
         }
         if let Some(h) = headroom {
             b.floor_90k = b.floor_90k.min(h);
@@ -1611,6 +1651,24 @@ impl TsAudioReplacer {
         }
     }
 
+    /// One output frame of the target codec, in 90 kHz ticks (0 before its
+    /// encoder opens).
+    fn out_frame_90k(&self) -> i64 {
+        let rate = self.resolved_sample_rate as i64;
+        if rate == 0 {
+            return 0;
+        }
+        #[cfg(all(feature = "media-codecs", feature = "fdk-aac"))]
+        if let Some(e) = self.aac_encoder.as_ref() {
+            return e.frame_size() as i64 * 90_000 / rate;
+        }
+        #[cfg(feature = "media-codecs")]
+        if let Some(e) = self.av_encoder.as_ref() {
+            return e.frame_size() as i64 * 90_000 / rate;
+        }
+        0
+    }
+
     /// A PCR on the program's PCR_PID went out: note the clock, then run
     /// the clock fill on it.
     fn on_program_pcr(&mut self, pcr_27mhz: u64, di: bool, output: &mut Vec<u8>) {
@@ -1631,9 +1689,17 @@ impl TsAudioReplacer {
             return;
         }
         let end = self.timeline.end_90k();
+        let frame = self.out_frame_90k();
         let f = &mut self.clock_fill;
         let at = f.unwrapped(c);
         let sec = at / 90_000;
+        // How far apart the clock is read: every few packets on a program
+        // that carries video, only at its PCRs through a pause in it.
+        let tick = f
+            .last_reading_90k
+            .replace(c)
+            .map_or(0, |l| pts_diff(c, l).clamp(0, 9_000));
+        f.stretch_reading_90k = f.stretch_reading_90k.max(tick);
         if f.last_end_90k != Some(end) {
             // The source moved the content end since the last reading. A
             // stretch that ended in a correction, or in the middle of a
@@ -1648,7 +1714,10 @@ impl TsAudioReplacer {
             {
                 let q = pts_diff(c, m);
                 f.record(sec, None, Some(q));
+                let r = f.stretch_reading_90k;
+                f.record_reading(sec, r);
             }
+            f.stretch_reading_90k = 0;
             f.moved_at_90k = Some(c);
             f.corrected = false;
             f.last_end_90k = Some(end);
@@ -1656,6 +1725,11 @@ impl TsAudioReplacer {
         let headroom = pts_diff(end, c);
         let since = *f.since_90k.get_or_insert(at);
         let quiet = pts_diff(c, f.moved_at_90k.unwrap_or(c));
+        // How far past the floor the fill keeps the content end: an output
+        // frame, so the frame it completes leaves no later than the source's
+        // own did at its floor, and one reading more, so the frame that falls
+        // due before the next reading has left at this one.
+        let lookahead = frame + tick;
         if !f.active {
             let warm = at.saturating_sub(since) >= CLOCK_FILL_WARMUP_90K as u64;
             let window = f.window_at(sec);
@@ -1666,12 +1740,19 @@ impl TsAudioReplacer {
                     return;
                 }
             };
-            if quiet <= quiet_max + CLOCK_FILL_QUIET_TOL_90K {
+            // A clock read further apart than it ever was within the source's
+            // own stretches: the stream itself has paused (only the PCR goes
+            // on), and waiting for the next reading would take the tests
+            // below that much past their thresholds. They are judged at
+            // this reading instead. A source always read that sparsely (a
+            // radio service: its PES, then only PCRs) gains nothing.
+            let ahead = (tick - f.window_reading_at(sec)).max(0);
+            if quiet <= quiet_max || quiet + ahead <= quiet_max + CLOCK_FILL_QUIET_TOL_90K {
                 // The source's own stretch: its headroom is the source's.
                 f.record(sec, Some(headroom), None);
                 return;
             }
-            if headroom >= floor - CLOCK_FILL_TOL_90K || f.outage {
+            if headroom - ahead >= floor - CLOCK_FILL_TOL_90K || f.outage {
                 return;
             }
             f.active = true;
@@ -1687,7 +1768,7 @@ impl TsAudioReplacer {
         }
         let f = &mut self.clock_fill;
         let floor = f.window_at(sec).map_or(0, |(fl, _)| fl);
-        let need = floor - headroom;
+        let need = floor + lookahead - headroom;
         if need <= 0 {
             return;
         }
@@ -1727,18 +1808,29 @@ impl TsAudioReplacer {
                     "ts_audio_replace: source audio back after a gap filled on the program clock"
                 );
                 self.timeline.clear_run();
-                if off > DEADBAND_90K as i64 {
+                // Exactly, to the sample: no deadband here. The fill runs
+                // ahead of the floor, so the audio often returns within a
+                // few ms of where it left the content end; left under the
+                // 5 ms deadband, that remainder kept the returning audio
+                // off its PTS for good — a Spain loop's MP2 re-encode
+                // 4.45 ms off lip-sync, its frame grid a fraction of a frame
+                // off the source's, and its lead stepping by a frame at
+                // every loop.
+                let rate = self.timeline.rate.max(1) as i64;
+                let sample = (90_000 + rate - 1) / rate;
+                if off >= sample {
                     self.fill_gap(off, output);
-                } else if off < -(DEADBAND_90K as i64) {
+                } else if off <= -sample {
                     self.drop_overlap(off);
-                    // The audio came back with less lead than the window's
-                    // floor: the source's floor is that much lower.
-                    if let Some(c) = self.clock_fill.now() {
-                        let sec = self.clock_fill.unwrapped(c) / 90_000;
-                        if let Some((floor, _)) = self.clock_fill.window_at(sec) {
-                            self.clock_fill.record(sec, Some(floor + off), None);
-                        }
-                    }
+                }
+                // The lead the audio came back with is a headroom of the
+                // source's own (the PES's PTS is where the content ends as
+                // it arrives): under the window's floor, the floor is that
+                // much lower. Not the overlap: the fill ran a frame and a
+                // reading past the floor, so an overlap is no shortfall.
+                if let Some(c) = self.clock_fill.now() {
+                    let sec = self.clock_fill.unwrapped(c) / 90_000;
+                    self.clock_fill.record(sec, Some(pts_diff(pts, c)), None);
                 }
                 self.clock_fill.corrected = true;
                 self.publish_av_skew(pts);
@@ -4344,6 +4436,236 @@ mod tests {
         ev.into_iter().flat_map(|(_, _, p)| p.into_iter().flatten()).collect()
     }
 
+    /// A media-player loop as the program sees it: PCR every 30 ms on 0x100
+    /// throughout, video packets every millisecond (none with `video`
+    /// false: a radio service) and MP2 audio in 120 ms PES each arriving
+    /// `lead(source ms)` ms ahead of its PTS — `whole`, or spread over the
+    /// 120 ms before that — and a pause: audio PES starting in the source
+    /// span `hole` (ms after P0, length) are missing, and so is everything
+    /// but the PCR for the same length of wall time.
+    #[cfg(all(feature = "media-codecs", feature = "fdk-aac"))]
+    fn loop_gap_source(
+        lead: impl Fn(u64) -> u64,
+        hole: Option<(u64, u64)>,
+        secs: u64,
+        whole: bool,
+        video: bool,
+    ) -> Vec<u8> {
+        loop_gap_source_with(lead, hole, secs, whole, video, 48_000)
+    }
+
+    /// [`loop_gap_source`] with its content's burst at sample `burst_at`.
+    #[cfg(all(feature = "media-codecs", feature = "fdk-aac"))]
+    fn loop_gap_source_with(
+        lead: impl Fn(u64) -> u64,
+        hole: Option<(u64, u64)>,
+        secs: u64,
+        whole: bool,
+        video: bool,
+        burst_at: usize,
+    ) -> Vec<u8> {
+        use crate::engine::ts_test_fixtures::{packetize_sections, pat_packet, pmt_section};
+        use e2e::*;
+        let aus = encode_source(Src::Mp2, &content(burst_at, 48_000 * (secs as usize + 1)));
+        let mut ev: Vec<(u64, u8, Vec<[u8; TS_PACKET_SIZE]>)> = Vec::new();
+        let start = P0 / 90 - 500;
+        ev.push((start * 1_000, 0, vec![pat_packet(&[(1, 0x1000)], 0, 0)]));
+        let pmt = pmt_section(1, 0, 0x100, &[], &[(0x1B, 0x100, &[]), (0x03, 0x101, &[])]);
+        ev.push((start * 1_000, 1, packetize_sections(0x1000, &[&pmt], 0)));
+        let end = P0 / 90 + secs * 1_000 - 500;
+        for t in (start..end).step_by(30) {
+            ev.push((t * 1_000, 2, vec![crate::engine::ts_parse::pcr_only_packet(0x100, 0, t * 27_000, false)]));
+        }
+        // The wall-time pause: from the last PES before the hole's arrival
+        // to the first after it.
+        let (from, len) = hole.unwrap_or((u64::MAX / 4, 0));
+        let spread = if whole { 0 } else { 120 };
+        let pause = hole.map_or((0, 0), |_| {
+            (P0 / 90 + from - lead(from) - spread, P0 / 90 + from + len - lead(from + len) - spread)
+        });
+        for (k, t) in (start..end).enumerate() {
+            if !video || (pause.0..pause.1).contains(&t) {
+                continue;
+            }
+            let mut v = [0xAAu8; TS_PACKET_SIZE];
+            v[..4].copy_from_slice(&[TS_SYNC_BYTE, 0x01, 0x00, 0x10 | (k & 0x0F) as u8]);
+            ev.push((t * 1_000 + 500, 4, vec![v]));
+        }
+        let mut cc = 0u8;
+        let mut sent_until = 0u64;
+        for (es, pts) in e2e::pack(&aus, 5) {
+            let pts = pts.unwrap();
+            let src_ms = (pts / 90) as i64 - (P0 / 90) as i64;
+            if src_ms >= from as i64 && src_ms < (from + len) as i64 {
+                continue;
+            }
+            let at = pts / 90 - lead(src_ms.max(0) as u64);
+            if at >= end + 400 {
+                break;
+            }
+            let pkts = packetize_ts(0x0101, &build_audio_pes(0xC0, &es, pts), &mut cc);
+            let n = pkts.len() as u64;
+            if whole {
+                ev.push((at * 1_000, 3, pkts));
+                continue;
+            }
+            let from_us = ((at - 120) * 1_000).max(sent_until);
+            let span = (at * 1_000).saturating_sub(from_us).max(n);
+            for (j, p) in pkts.into_iter().enumerate() {
+                ev.push((from_us + (j as u64 + 1) * span / n, 3, vec![p]));
+            }
+            sent_until = from_us + span;
+        }
+        ev.sort_by_key(|(t, o, _)| (*t, *o));
+        ev.into_iter().flat_map(|(_, _, p)| p.into_iter().flatten()).collect()
+    }
+
+    /// Every audio PES on the wire: (PTS, its first packet's lead, its last
+    /// packet's lead, ms) against the PCR interpolated by packet index
+    /// between the PCRs either side — what a PCR-paced output delivers.
+    #[cfg(all(feature = "media-codecs", feature = "fdk-aac"))]
+    fn wire_leads_interpolated(wire: &[u8]) -> Vec<(u64, f64, f64)> {
+        let pkts: Vec<&[u8]> = wire.chunks(TS_PACKET_SIZE).collect();
+        let pcrs: Vec<(usize, u64)> = pkts
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| ts_pid(p) == 0x100)
+            .filter_map(|(i, p)| extract_pcr(p).map(|v| (i, v / 300)))
+            .collect();
+        let clock = |i: usize| -> Option<f64> {
+            let k = pcrs.partition_point(|(j, _)| *j <= i);
+            let (&(i0, c0), &(i1, c1)) = (pcrs.get(k.checked_sub(1)?)?, pcrs.get(k)?);
+            Some(c0 as f64 + pts_diff(c1, c0) as f64 * (i - i0) as f64 / (i1 - i0) as f64)
+        };
+        let mut out = Vec::new();
+        let mut cur: Option<(u64, usize, usize)> = None;
+        let close = |c: Option<(u64, usize, usize)>, out: &mut Vec<(u64, f64, f64)>| {
+            if let Some((pts, a, b)) = c
+                && let (Some(ca), Some(cb)) = (clock(a), clock(b))
+            {
+                out.push((pts, (pts as f64 - ca) / 90.0, (pts as f64 - cb) / 90.0));
+            }
+        };
+        for (i, p) in pkts.iter().enumerate() {
+            if ts_pid(p) != 0x0101 || !ts_has_payload(p) {
+                continue;
+            }
+            if ts_pusi(p) {
+                close(cur.take(), &mut out);
+                if let Some(pts) = crate::engine::ts_parse::extract_pes_pts(p) {
+                    cur = Some((pts, i, i));
+                }
+            } else if let Some(c) = cur.as_mut() {
+                c.2 = i;
+            }
+        }
+        close(cur, &mut out);
+        out
+    }
+
+    /// **The loop-gap T-STD regression.** A 120 ms-PES MP2 source (Spain
+    /// program 186's packing, each PES arriving whole 20 ms ahead of its PTS)
+    /// re-encoded to AAC-LC, across a media-player loop's pause: 240 ms of
+    /// audio missing and nothing but the PCR on the wire for as long. Every
+    /// PES — the source's own and the silence the clock fills the pause
+    /// with — starts ahead of the (packet-interpolated) PCR and is whole by
+    /// its PTS, the fill no more than a few ms behind the source's own
+    /// worst, and the PCR stage never raises its delay.
+    ///
+    /// The fill used to start 10 ms below the lowest headroom the source
+    /// left, and to hold the content end at that floor, so each silent
+    /// frame completed at the source's worst phase, 10 ms late on top, and
+    /// through the pause — where the clock is read only at the PCRs, 30 ms
+    /// apart — up to a reading later still: the first silent PES began
+    /// 2.7 ms behind the PCR, the next ones finished up to 12.7 ms past
+    /// their PTS, and the PCR stage raised `D` (Spain on the rig: 28 PES
+    /// late over 4 loops, the worst 15.1 ms). It now fires at the first
+    /// reading past the source's longest stretch when the next one would
+    /// be past its tolerance, and holds the content end one output frame
+    /// and one reading past the floor.
+    ///
+    /// And the audio that returns — here with 20 ms more lead than it left
+    /// with, as a file's head may carry — lands at its PTS to the sample:
+    /// the fill ends a few ms from it, and a remainder under the 5 ms
+    /// deadband was left, the returning audio that far off for good.
+    #[cfg(all(feature = "media-codecs", feature = "fdk-aac"))]
+    #[test]
+    fn a_loop_gap_re_encoded_to_aac_keeps_every_pes_ahead_of_the_pcr() {
+        let at = 48_000 * 4 + 400 * 48;
+        let src = loop_gap_source_with(|ms| if ms < 4_240 { 20 } else { 40 }, Some((4_000, 240)), 7, true, true, at);
+        let mut r = e2e::replacer("aac_lc", None, None);
+        let out = e2e::run(&mut r, &src);
+        let err = e2e::err_samples("aac_lc", &out, e2e::src_time(at), 48_000);
+        assert!(err.abs() <= 24.0, "the audio after the gap is {err} samples off its source time");
+        // Nor did the return lower the source's floor: it came back with
+        // more lead than it left with. (Taken as a shortfall, the overlap —
+        // what the fill ran ahead — lowered it by as much, and the next gap
+        // in the window was filled that much later.)
+        let floor = |r: &TsAudioReplacer| {
+            let c = r.clock_fill.now().unwrap();
+            r.clock_fill.window_at(r.clock_fill.unwrapped(c) / 90_000).unwrap().0
+        };
+        let mut clean = e2e::replacer("aac_lc", None, None);
+        let _ = e2e::run(&mut clean, &loop_gap_source_with(|ms| if ms < 4_240 { 20 } else { 40 }, None, 7, true, true, at));
+        assert!((floor(&r) - floor(&clean)).abs() <= 90, "floor {} against {} without the gap", floor(&r), floor(&clean));
+        let src = loop_gap_source(|_| 20, Some((4_000, 240)), 7, true, true);
+        let mut r = e2e::replacer("aac_lc", None, None);
+        let stats = r.stats_handle();
+        let out = e2e::run(&mut r, &src);
+        let mut remux = crate::engine::ts_pcr_remux::TsPcrRemux::new();
+        remux.set_replaced_pids(Some(0x0101), None);
+        let mut wire = Vec::new();
+        for p in out.chunks(TS_PACKET_SIZE) {
+            remux.process(p, &mut wire);
+        }
+        let pcr = remux.stats_handle().snapshot();
+        assert_eq!((pcr.offset_raises, pcr.late_frames), (0, 0), "{pcr:?}");
+        let leads = wire_leads_interpolated(&wire);
+        let p0 = e2e::P0 as i64;
+        let ms = |pts: u64| (pts as i64 - p0) / 90;
+        let late: Vec<_> = leads.iter().filter(|(p, a, b)| ms(*p) > 2_500 && (*a < 0.0 || *b < 0.0)).collect();
+        assert!(late.is_empty(), "PES behind the PCR or not whole by their PTS: {late:?}");
+        let worst = |hole: bool| {
+            leads
+                .iter()
+                .filter(|(p, _, _)| ms(*p) > 3_000 && (3_900..4_400).contains(&ms(*p)) == hole)
+                .map(|(_, a, b)| a.min(*b))
+                .fold(f64::MAX, f64::min)
+        };
+        let (fill, own) = (worst(true), worst(false));
+        assert!(fill >= own - 10.0, "the fill's worst {fill:.1} ms, the source's own {own:.1} ms");
+        let silence = stats.silence_inserted_samples.load(Ordering::Relaxed);
+        assert!((240 * 48..=240 * 48 + 1_024 + 1_440).contains(&silence), "{silence} samples");
+        // The returning audio loses what the fill ran ahead of it: at most
+        // the frame and the reading.
+        let dropped = stats.dropped_samples.load(Ordering::Relaxed);
+        assert!(dropped <= 1_024 + 1_440, "{dropped} samples");
+    }
+
+    /// A source that ran one stretch longer than any in the window — one
+    /// PES early, the next on time — with lead to spare is not late:
+    /// nothing is filled, no audio dropped. A trigger at the fill's target
+    /// (a frame and a reading above the floor) filled 18 such stretches per
+    /// loop of Spain and dropped the audio that arrived on time as overlap.
+    /// Nor does a radio service, whose clock is only ever read at its PES and
+    /// PCRs, 30 ms apart, gain anything from the reading interval — it is
+    /// its own — where judging every reading a whole interval early filled
+    /// the stretch after a PES 60 ms early.
+    #[cfg(all(feature = "media-codecs", feature = "fdk-aac"))]
+    #[test]
+    fn a_long_stretch_with_lead_to_spare_is_not_filled() {
+        for (video, early_ms) in [(true, 30), (false, 60)] {
+            let early = move |ms: u64| if (5_000..5_120).contains(&ms) { 40 + early_ms } else { 40 };
+            let src = loop_gap_source(early, None, 8, true, video);
+            let mut r = e2e::replacer("aac_lc", None, None);
+            let stats = r.stats_handle();
+            let _ = e2e::run(&mut r, &src);
+            let s = |c: &AtomicU64| c.load(Ordering::Relaxed);
+            assert_eq!(s(&stats.silence_inserted_samples), 0, "video {video}");
+            assert_eq!(s(&stats.dropped_samples), 0, "video {video}");
+        }
+    }
+
     /// Run `ts` through an MP2 replacer and the chain's PCR stage behind it.
     #[cfg(all(feature = "media-codecs", feature = "fdk-aac"))]
     fn clock_fill_chain(
@@ -4430,8 +4752,11 @@ mod tests {
         let (stats, pcr, out) = clock_fill_chain(&clock_fill_source(|_| 100, Some((4_000, 360)), at, 7, true));
         assert_fill_on_time(&out, 4_070, 360, 25.0);
         let silence = stats.silence_inserted_samples.load(Ordering::Relaxed);
-        assert!((360 * 48 - 1_152..=360 * 48 + 1_152).contains(&silence), "{silence} samples");
-        assert_eq!(stats.dropped_samples.load(Ordering::Relaxed), 0, "nothing placed ahead of the audio");
+        assert!((360 * 48 - 1_152..=360 * 48 + 2 * 1_152).contains(&silence), "{silence} samples");
+        // The fill runs an output frame and a reading ahead of the floor;
+        // the returning audio loses at most that.
+        let dropped = stats.dropped_samples.load(Ordering::Relaxed);
+        assert!(dropped <= 1_152 + 48, "{dropped} samples placed ahead of the audio");
         let err = e2e::err_samples("mp2", &out, e2e::src_time(at), 48_000);
         assert!(err.abs() <= 48.0, "the audio after the hole is {err} samples off its source time");
         assert_eq!(pcr.offset_raises, 0, "{pcr:?}");
