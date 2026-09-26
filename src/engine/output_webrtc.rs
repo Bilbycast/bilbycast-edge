@@ -45,8 +45,9 @@ enum WebrtcEncoderState {
     ///
     /// When `silent_fallback` is set, the encoder is built eagerly at
     /// session startup (before any source audio arrives) and the decoder
-    /// / transcoder are filled lazily on the first real AAC frame —
-    /// hence both are `Option`.
+    /// is filled lazily on the first real AAC frame — hence it is an
+    /// `Option`; the stage, pinned to the encoder's format, is built with
+    /// the encoder.
     Active {
         /// `None` until the first real AAC frame arrives (silent-fallback
         /// builds the encoder ahead of any source audio).
@@ -1891,8 +1892,9 @@ fn build_webrtc_encoder_state(
 ///   input PCM at 48 kHz (the Opus internal clock) and the declared
 ///   channel count (defaulting to stereo).
 /// - A real source AAC frame arriving later triggers lazy construction
-///   of the AAC decoder + a resampler to project its native rate onto
-///   48 kHz so the encoder sees a consistent PCM format.
+///   of the AAC decoder ([`webrtc_lazy_build_decoder`]); the encoder's
+///   stage, pinned to 48 kHz and the declared channel count, converts its
+///   native format so the encoder sees a consistent PCM format.
 #[cfg(feature = "webrtc")]
 fn build_webrtc_encoder_state_eager_for_silent_fallback(
     audio_encode: Option<&crate::config::models::AudioEncodeConfig>,

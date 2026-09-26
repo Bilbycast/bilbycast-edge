@@ -42,8 +42,9 @@ enum EncoderState {
     /// Decoder + encoder are running. Each AAC frame goes through them.
     /// When `silent_fallback` is set we build the encoder eagerly (with
     /// declared target params) before any source audio arrives, so the
-    /// decoder and transcoder are lazily filled the first time real AAC
-    /// shows up — hence both are `Option`.
+    /// decoder is filled lazily the first time real AAC shows up — hence
+    /// it is an `Option`; the stage, pinned to the encoder's format, is
+    /// built with the encoder.
     Active {
         /// `None` until the first real AAC frame arrives (silent-fallback
         /// builds the encoder ahead of any source audio).
@@ -2238,9 +2239,9 @@ async fn emit_silence_if_needed(
 /// its output target. This lets us spin up the encoder at output
 /// startup — before any source AAC frame has been seen — so the
 /// silence generator has somewhere to submit its zero-filled chunks.
-/// The source decoder + optional resampling transcoder are built
-/// lazily on the first real AAC frame (via
-/// [`lazy_build_decoder_and_transcoder`]).
+/// The source decoder is built lazily on the first real AAC frame (via
+/// [`lazy_build_decoder`]); the encoder's stage, pinned to the declared
+/// format here, converts whatever the source turns out to be.
 fn build_encoder_state_eager_for_silent_fallback(
     config: &RtmpOutputConfig,
     cancel: &CancellationToken,
