@@ -349,6 +349,15 @@ impl InputTranscoder {
         self.audio.as_ref().map(|a| a.encode_stats_handle())
     }
 
+    /// Shared handle to the audio replacer's own counters (source PID and
+    /// stream type, the pre-PMT drops and the timeline corrections, silence
+    /// inserted and samples dropped), if the audio stage is active.
+    pub fn audio_replacer_stats(
+        &self,
+    ) -> Option<Arc<crate::engine::ts_audio_replace::TsAudioReplacerStats>> {
+        self.audio.as_ref().map(|a| a.stats_handle())
+    }
+
     /// Shared handle to the video replacer's internal decode counters, if
     /// the video stage is active.
     pub fn video_decode_stats(
@@ -471,6 +480,7 @@ pub fn register_ingress_stats(
         has_video_stage_via_transcoder = t.has_video();
         t.set_av_skew_reporter(av_skew.clone());
         flow_stats.set_input_transcode_pcr_stats(input_id, t.pcr_stats());
+        flow_stats.set_input_audio_replacer_stats(input_id, t.audio_replacer_stats());
         // Wire the decode-stall watchdog (input-scoped) so a silent ingress
         // video-decode failure raises a `video_transcode_decode_stalled`
         // Warning instead of shipping audio only. No-op without a video stage.

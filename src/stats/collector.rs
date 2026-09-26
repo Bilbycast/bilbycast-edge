@@ -3702,6 +3702,11 @@ pub struct FlowStatsAccumulator {
     /// Per-input-id ingress transcode PCR stage counters
     /// (`engine::ts_pcr_remux`); the snapshot reads the active input's.
     input_transcode_pcr: DashMap<String, Arc<crate::engine::ts_pcr_remux::PcrRemuxStats>>,
+    /// Per-input ingress audio replacer counters (`engine::ts_audio_replace`):
+    /// the source PID / stream type and the timeline counters of the input
+    /// snapshot's `audio_encode_stats`, as `audio_replacer_stats` feeds the
+    /// output's.
+    input_audio_replacer: DashMap<String, Arc<crate::engine::ts_audio_replace::TsAudioReplacerStats>>,
     /// Per-input-id map of AAC decode stage handles + descriptors. Wrapped
     /// in `Arc` so the owning ingress replacer can keep a clone and refresh
     /// the source-codec label whenever the PMT learns a new stream_type
@@ -3876,6 +3881,7 @@ impl FlowStatsAccumulator {
             active_input_id: std::sync::RwLock::new(String::new()),
             av_skew_reporters: DashMap::new(),
             input_transcode_pcr: DashMap::new(),
+            input_audio_replacer: DashMap::new(),
             input_transcode_stats: DashMap::new(),
             input_audio_decode_stats: DashMap::new(),
             input_audio_encode_stats: DashMap::new(),
@@ -4179,6 +4185,25 @@ impl FlowStatsAccumulator {
     pub fn remove_av_skew_reporter(&self, input_id: &str) {
         self.av_skew_reporters.remove(input_id);
         self.input_transcode_pcr.remove(input_id);
+        self.input_audio_replacer.remove(input_id);
+    }
+
+    /// Register (`Some`) or clear (`None`, no audio stage) an input's
+    /// ingress audio replacer counters. A restarted input replaces its
+    /// previous registration.
+    pub fn set_input_audio_replacer_stats(
+        &self,
+        input_id: &str,
+        s: Option<Arc<crate::engine::ts_audio_replace::TsAudioReplacerStats>>,
+    ) {
+        match s {
+            Some(s) => {
+                self.input_audio_replacer.insert(input_id.to_string(), s);
+            }
+            None => {
+                self.input_audio_replacer.remove(input_id);
+            }
+        }
     }
 
     /// Register an input's ingress transcode PCR stage counters. Replaces
@@ -4715,11 +4740,24 @@ impl FlowStatsAccumulator {
                     }
                 });
                 let in_audio_encode = self.input_audio_encode_stats.get(active_key).map(|h| {
-                    // Input-side source-PID telemetry isn't wired yet
-                    // (no per-input audio replacer stats handle on
-                    // FlowStatsAccumulator). Surface zeros so the
-                    // snapshot serialises consistently with the
-                    // output-side variant — manager UI sees no badge.
+                    // The source PID and the timeline counters come from
+                    // the input's audio replacer, as on an output. (They
+                    // were written as zeros — and hidden, being zero —
+                    // so an ingress re-encode inserting silence for an
+                    // unlocked source audio clock said nothing.)
+                    let replacer = self.input_audio_replacer.get(active_key);
+                    let load = |f: fn(&crate::engine::ts_audio_replace::TsAudioReplacerStats) -> u64| {
+                        replacer.as_ref().map_or(0, |s| f(s.value()))
+                    };
+                    let (source_pid, source_stream_type) = replacer
+                        .as_ref()
+                        .map(|s| {
+                            (
+                                s.source_pid.load(Ordering::Relaxed),
+                                s.source_stream_type.load(Ordering::Relaxed),
+                            )
+                        })
+                        .unwrap_or((0, 0));
                     crate::stats::models::EncodeStatsSnapshot {
                         pcm_frames_submitted: h.stats.pcm_frames_submitted.load(Ordering::Relaxed),
                         pcm_frames_dropped: h.stats.pcm_frames_dropped.load(Ordering::Relaxed),
@@ -4729,12 +4767,12 @@ impl FlowStatsAccumulator {
                         target_sample_rate_hz: h.target_sample_rate_hz.load(Ordering::Relaxed),
                         target_channels: h.target_channels.load(Ordering::Relaxed),
                         target_bitrate_kbps: h.target_bitrate_kbps,
-                        source_pid: 0,
-                        source_stream_type: 0,
-                        pre_pmt_dropped_packets: 0,
-                        timeline_corrections: 0,
-                        silence_inserted_samples: 0,
-                        dropped_samples: 0,
+                        source_pid,
+                        source_stream_type,
+                        pre_pmt_dropped_packets: load(|s| s.pre_pmt_dropped_packets.load(Ordering::Relaxed)),
+                        timeline_corrections: load(|s| s.timeline_corrections.load(Ordering::Relaxed)),
+                        silence_inserted_samples: load(|s| s.silence_inserted_samples.load(Ordering::Relaxed)),
+                        dropped_samples: load(|s| s.dropped_samples.load(Ordering::Relaxed)),
                     }
                 });
                 let in_video_decode = self
@@ -6192,5 +6230,46 @@ mod display_decoder_label_accessor_tests {
         // never mistakes it for a demoted display decoder.
         flow.register_output("u1".to_string(), "udp".to_string(), "udp".to_string());
         assert_eq!(flow.active_display_decoder_label("u1"), None);
+    }
+}
+
+#[cfg(test)]
+mod input_audio_replacer_stats_tests {
+    use super::*;
+
+    /// An ingress audio re-encode reports its replacer's counters — source
+    /// PID, pre-PMT drops, timeline corrections, silence inserted, samples
+    /// dropped — on the input snapshot's `audio_encode_stats`, as an
+    /// output's does. They were written as literal zeros.
+    #[test]
+    fn the_input_snapshot_carries_the_ingress_audio_replacer_counters() {
+        let flow = FlowStatsAccumulator::new("f1".to_string(), "flow-1".to_string(), "srt".to_string());
+        flow.set_active_input_id("in-1");
+        flow.set_input_encode_stats(
+            "in-1",
+            Arc::new(crate::engine::audio_encode::EncodeStats::default()),
+            "aac_lc",
+            48_000,
+            2,
+            128,
+        );
+        let r = Arc::new(crate::engine::ts_audio_replace::TsAudioReplacerStats::default());
+        r.source_pid.store(0x101, Ordering::Relaxed);
+        r.source_stream_type.store(0x03, Ordering::Relaxed);
+        r.pre_pmt_dropped_packets.store(7, Ordering::Relaxed);
+        r.timeline_corrections.store(3, Ordering::Relaxed);
+        r.silence_inserted_samples.store(1_152, Ordering::Relaxed);
+        r.dropped_samples.store(480, Ordering::Relaxed);
+        flow.set_input_audio_replacer_stats("in-1", Some(r));
+        let e = flow.snapshot().input.audio_encode_stats.expect("an ingress audio encode");
+        assert_eq!((e.source_pid, e.source_stream_type), (0x101, 0x03));
+        assert_eq!(e.pre_pmt_dropped_packets, 7);
+        assert_eq!(e.timeline_corrections, 3);
+        assert_eq!(e.silence_inserted_samples, 1_152);
+        assert_eq!(e.dropped_samples, 480);
+        // Removed with the input.
+        flow.remove_av_skew_reporter("in-1");
+        let e = flow.snapshot().input.audio_encode_stats.expect("the encode handle stays");
+        assert_eq!(e.timeline_corrections, 0);
     }
 }
