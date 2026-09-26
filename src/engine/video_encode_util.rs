@@ -759,30 +759,55 @@ impl EncodedPtsMap {
 /// The source PTS each decoded picture goes out on: the decoder's, else —
 /// the picture of an access unit its PES carried no PTS for (MPEG-TS needs
 /// one only every 700 ms; some encoders stamp only their I pictures) — the
-/// last picture's that had one plus a frame at the encoder's rate for each
-/// picture since, as the TS video replacer stamps them (`admit_pts`). Fed
-/// every decoded picture in display order, the ones the rate lock drops too,
-/// so the count is right. `None` before any picture carried a PTS.
+/// last picture's that had one plus a frame for each picture since. The
+/// frame is measured from decoder PTS only, as the TS video replacer learns
+/// the interval it steps by (`ts_video_replace::Inner::admit_decoded`): the
+/// last span between two pictures that carried one, over the pictures it
+/// covers, when that is a frame at 10–200 fps. Until a span is known it is
+/// one frame at the encoder's rate — which is a pin, the 30 fps fallback,
+/// or an earlier input's rate (an input switch cannot reopen the encoder),
+/// so it can be far off the source: stepped by it for good, a 50 fps source
+/// stamping every 25th picture, on an encoder at 30/1, stamped each GOP's
+/// last picture 27 000 ticks past the next real PTS, and the timeline
+/// stepped back once a GOP (zero-duration CMAF samples, RTP timestamps
+/// going backwards). A derived PTS never teaches the interval. Fed every
+/// decoded picture in display order, the ones the rate lock drops too, so
+/// the count is right. `None` before any picture carried a PTS.
 #[derive(Debug, Default)]
 pub struct FramePtsStamper {
     last: Option<u64>,
     since: u64,
+    /// The last span between two stamped pictures and the pictures it
+    /// covers, when that is a frame at 10–200 fps.
+    span: Option<(u64, u64)>,
 }
 
 impl FramePtsStamper {
     /// Stamp one decoded picture: `frame_pts` as the decoder returned it,
-    /// `interval_90k` one frame at the encoder's rate.
-    pub fn stamp(&mut self, frame_pts: Option<i64>, interval_90k: u64) -> Option<u64> {
+    /// `fallback_interval_90k` one frame at the encoder's rate — used only
+    /// until a span between two real PTS has been measured.
+    pub fn stamp(&mut self, frame_pts: Option<i64>, fallback_interval_90k: u64) -> Option<u64> {
         match frame_pts.filter(|p| *p >= 0) {
             Some(p) => {
                 let p = p as u64 & PTS_MASK_33B;
+                if let Some(last) = self.last {
+                    let span = p.wrapping_sub(last) & PTS_MASK_33B;
+                    let pictures = self.since + 1;
+                    if (450..=9_000).contains(&(span / pictures)) {
+                        self.span = Some((span, pictures));
+                    }
+                }
                 self.last = Some(p);
                 self.since = 0;
                 Some(p)
             }
             None => {
                 self.since += 1;
-                self.last.map(|l| l.wrapping_add(interval_90k * self.since) & PTS_MASK_33B)
+                let advance = match self.span {
+                    Some((span, pictures)) => span * self.since / pictures,
+                    None => fallback_interval_90k * self.since,
+                };
+                self.last.map(|l| l.wrapping_add(advance) & PTS_MASK_33B)
             }
         }
     }
@@ -2491,6 +2516,39 @@ mod frame_pts_stamper_tests {
         let top = (1i64 << 33) - 1_800;
         assert_eq!(s.stamp(Some(top), 3_600), Some(top as u64));
         assert_eq!(s.stamp(None, 3_600), Some(1_800));
+    }
+
+    /// A 50 fps source stamping every 25th picture, on an encoder whose
+    /// rate is 30/1 (the fallback, a pin, an earlier input's): once a span
+    /// between two real PTS is known, the pictures between step by the
+    /// source's frame — 1800 — and the next real PTS lands one frame past
+    /// the last derived one. Stepped by the encoder's 3000 they ran 27 000
+    /// ticks past it: the timeline stepped back once a GOP.
+    #[test]
+    fn unstamped_pictures_step_by_the_measured_frame_not_the_encoders() {
+        let mut s = FramePtsStamper::default();
+        let mut out = Vec::new();
+        for n in 0..101u64 {
+            let pts = (n % 25 == 0).then_some((900_000 + n * 1_800) as i64);
+            out.push(s.stamp(pts, 3_000).unwrap());
+        }
+        // The first span is stepped by the encoder's rate: nothing measured
+        // yet. Every picture after the second real PTS is a frame apart.
+        for (n, w) in out.windows(2).enumerate().skip(25) {
+            assert_eq!(w[1] - w[0], 1_800, "picture {}", n + 1);
+        }
+        // An uneven span (59.94: 1501.5 a frame) is spread exactly.
+        let mut s = FramePtsStamper::default();
+        s.stamp(Some(0), 3_600);
+        s.stamp(None, 3_600);
+        assert_eq!(s.stamp(Some(3_003), 3_600), Some(3_003));
+        assert_eq!(s.stamp(None, 3_600), Some(3_003 + 1_501));
+        assert_eq!(s.stamp(None, 3_600), Some(3_003 + 3_003));
+        // A span that is no frame (a jump) teaches nothing.
+        let mut s = FramePtsStamper::default();
+        s.stamp(Some(0), 3_600);
+        s.stamp(Some(900_000), 3_600);
+        assert_eq!(s.stamp(None, 3_600), Some(903_600));
     }
 }
 

@@ -1647,8 +1647,16 @@ commit message or release note and delete the bullet.
      access unit whose PES carried no PTS goes to the decoder without one
      (`DemuxedFrame::{H264, H265}::pts_known`), so its picture is
      counted, not measured, as on the TS path; and each such picture is
-     stamped from the last one that had a PTS plus a frame at the encoder's
-     rate for each since (`video_encode_util::FramePtsStamper`). The
+     stamped from the last one that had a PTS plus a frame for each since
+     (`video_encode_util::FramePtsStamper`) — the frame measured from
+     decoder PTS only, the last span between two stamped pictures over the
+     pictures it covers (10–200 fps), as the TS replacer learns it; the
+     encoder's rate only until a span is known. Stepped by the encoder's
+     rate throughout (a pin, the 30/1 fallback, an earlier input's rate),
+     a 50 fps source stamping every 25th picture on an encoder at 30/1
+     stamped each GOP's last picture 27 000 ticks past the next real PTS —
+     the timeline stepped back once a GOP (zero-duration CMAF samples, RTP
+     timestamps going backwards). The
      demuxer used to hand these paths PTS 0 for it: the pictures of a
      source stamping only its I pictures came back stamped 0, the meter
      never measured (60 frames — 2.4 s at 25 fps — dropped, then 30/1), and
