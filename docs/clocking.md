@@ -202,10 +202,15 @@ discontinuity in three ways, and the third is the one worth knowing about.
   PES timestamp continuous. Bridging that step would keep the output PCR
   monotonic only by moving every PES timestamp on the flow forward by the
   raise — an audio hole and a held frame on every PTS-driven output (HLS,
-  CMAF, WebRTC, RTMP, the display). Receivers re-lock on the DI; `wire_emit`
+  CMAF, WebRTC, RTMP, the display). A raise can pass 500 ms (a deep encoder
+  pipeline's first latch), so the ingress transcode names each step of its
+  own (`note_upstream_pcr_steps`) and the rewriter takes it out of the step
+  it judges: that step passes whatever its size, while an unnamed one past
+  500 ms is still bridged. Receivers re-lock on the DI; `wire_emit`
   re-anchors its pacing on any backward step. Pinned by
-  `a_small_backward_pcr_step_passes_through_with_its_di` and
-  `an_ingress_pcr_delay_raise_keeps_pes_timestamps_continuous`.
+  `a_small_backward_pcr_step_passes_through_with_its_di`,
+  `an_ingress_pcr_delay_raise_keeps_pes_timestamps_continuous` (a 150 ms
+  and a 1 s late frame) and `an_unreported_pcr_step_past_500_ms_is_bridged`.
 * **Forward jump the wall clock witnessed** — pass through, DI=1. A live
   edit point or SCTE-35 splice is a real gap in the content, and passing it
   through preserves PCR_FO rate accuracy (TR 101 290, ±30 ppm). An input
@@ -614,7 +619,18 @@ timestamps only. A `D` raise on an **ingress** transcode reaches the
 input's muxer-mode rewriter as a DI'd backward PCR step, which it passes
 through as such (see [PCR discontinuity bridging](#pcr-discontinuity-bridging-and-what-the-clamp-costs))
 so PES timestamps stay continuous on every output; at flow start the first
-latch usually makes one such step. `epoch_lock` forbids transcoding. On a PID-bus
+latch usually makes one such step. The stage names each step of its own to
+the rewriter with the chunk that carries it (`TsPcrRemux::take_pcr_steps`
+→ `TsPtsRewriter::note_upstream_pcr_steps`, handed over in
+`process_input_packet_with_post`), and the rewriter takes it out before it
+judges the step, so it passes whatever its size. The rewriter's own
+threshold passed only steps under 500 ms: a deep encoder pipeline's first
+latch (x264 with lookahead, NVENC / QSV lookahead, an encode stall under
+load — `D` latched at lateness + 80 ms, 1.58 s in the stage's own tests)
+stepped the PCR back further, was bridged as a source discontinuity, and
+moved every PES on the flow on by the step instead — a 1.2 s forward PTS
+jump in the passthrough audio already flowing, on every output. The once-
+per-epoch residency lowering is a forward step and passes the same way. `epoch_lock` forbids transcoding. On a PID-bus
 assembled flow an ingress transcode's `D` reaches the wire only when that
 input is the program's `pcr_source`; the assembler re-anchors otherwise —
 as before. Wire pacing in the default `auto` (forward) egress mode still
@@ -691,7 +707,12 @@ first PCR PID's clock alone, and still ends the wait after 2 s of it (a
 stream with no PAT at all then passes its source clock, as before). The
 PES the gate was dropping when the MPTS latch fired go on being dropped to
 the PID's next PES start, and the PIDs it dropped packets on keep their CC
-renumbered, so the latch leaves no continuity error either. Pinned by
+renumbered, so the latch leaves no continuity error either. A dropped
+packet whose adaptation field carries a PCR or DI goes on
+adaptation-field-only, as it does before the latch: dropped whole, the
+program's PCR (Sky carries 3 220 of its 3 362 PCRs in video payload
+packets) went missing until the PID's next PES start — a PCR step past
+40 ms at flow start. Pinned by
 `an_mpts_sends_no_pcr_before_its_pat_and_only_source_pcrs_after`,
 `the_unlearned_window_runs_on_one_programs_clock` and
 `unlearned_pmt_falls_back_to_the_source_clock_and_recovers`.

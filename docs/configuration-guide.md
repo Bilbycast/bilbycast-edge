@@ -1251,6 +1251,17 @@ the path paces its own samples (the media player's MP4). A publish's RTMP
 timestamps, which start at 0, are carried from 100 ms (the RTSP input's,
 the test pattern's and a media player's first MP4 or image file's timelines
 likewise), so the first PCR is 0 rather than just below the 33-bit wrap.
+The timelines whose timestamps go through an encoder before the muxer —
+SDI, ST 2110-20 / -23 (without a flow-shared media timeline), MXL, the
+multiviewer canvas and the ST 2110-30 PCM synth — start 1.1 s in instead:
+an encoder stamps its first output its first input's time less its delay (a
+B-frame reorder, AAC priming), which from the lead itself still put the
+first PCR-clocked timestamp inside it. They started at 0 after the lead
+came in, so their first PCR sat just below the 33-bit wrap and stepped back
+to ~0 a few frames in — counted as a PCR discontinuity by the flow's TR 101
+290 analyser and taken as a backward step by the UDP / RTP pacing on every
+flow start. Wherever a timeline still starts inside the lead (up to 1 s
+below 0), the muxer holds its PCR at 0 until the timestamps pass the lead.
 Every IDR carries the SPS and PPS of the publish's AVC sequence header when
 it does not bring its own: they went ahead of a publish's *first* IDR only,
 so a receiver that joined any output of the flow after it never decoded a
@@ -1327,6 +1338,16 @@ is honoured as it is, which leaves an audio-only publish without a PCR.
 
 Pulls H.264 or H.265/HEVC video and AAC audio from RTSP sources (IP cameras, media servers). Uses the `retina` pure-Rust RTSP client with automatic reconnection. Produces MPEG-TS with proper PAT/PMT program tables. Audio-only streams are supported (PAT/PMT are emitted even without video).
 
+Each frame's PES timestamp is its time since the stream's start, rescaled
+from the stream's RTP clock to 90 kHz, from the muxer's 100 ms PCR lead.
+Video runs at 90 kHz, but AAC over RTSP (RFC 3640) runs at its sample
+rate: taken as 90 kHz, a 48 kHz camera's audio advanced 0.533 s of PTS a
+second — 4.7 s behind the picture after 10 s — and an audio-only session's
+PCR, derived from those PTS, ran at 0.53x the wall clock. With video and
+audio both set up, retina requires the PLAY response's `RTP-Info` `rtptime`
+for every stream, so each stream's start is the same point in time and the
+two stay aligned.
+
 ```json
 {
   "type": "rtsp",
@@ -1368,12 +1389,20 @@ then the PMT lists the Opus alone, names it as PCR_PID, and the Opus carries
 the PCR, 100 ms behind each PES as on an audio-only RTMP publish. The muxer
 used to assume video and no audio: the Opus of an A/V publish never reached
 the PMT, and an audio-only publish named an absent video PID as PCR_PID and
-carried no PCR. Each track's PES carry its own RTP timestamps (the Opus
-clock scaled to 90 kHz). RTP clocks start at independent offsets (RFC 3550
-§5.1) and the RTCP sender reports that relate them are not used, so a
-publish's audio and picture are not in sync — known limitation: an edge's
-own WHIP output looped back into this input put the Opus 280–930 ms behind
-the picture (and behind the PCR the video carries). Every IDR carries an SPS and PPS
+carried no PCR. Each track's RTP timestamps start at a random base of the
+sender's (RFC 3550 §5.1; libwebrtc picks one per SSRC), so muxed as they
+came — the video's raw 90 kHz, the Opus's scaled to 90 kHz — the two were an
+arbitrary distance apart, up to hours, and an A/V publish carried its audio
+that far from the picture and the PCR (an RTMP restream clamped every audio
+tag to the first one's time; a TS or CMAF receiver found the audio hours off
+its clock). Both tracks now run on one timeline: the publish's first frame
+of either track at the muxer's 100 ms lead, the other track's first frame as
+much later as it arrived later, each on its own RTP clock from there
+(`WhipClock`). Audio and picture are then as far apart as their first
+frames' arrival — the sender's capture-to-send difference and the network's,
+typically tens of milliseconds — not arbitrarily; the RTCP sender reports'
+NTP ↔ RTP mapping, which would take out even that, is not used yet (known
+limitation). Every IDR carries an SPS and PPS
 — the last ones the stream sent — when the sender did not repeat them (only
 libwebrtc does so reliably), and IDRs are marked keyframes (PAT/PMT ahead of
 each, the random-access flag set): the frame was read as a NAL from the
@@ -1538,7 +1567,11 @@ loop, each playlist transition — continues one wire timeline:
   PES of up to 350 ms, 183 ms of AAC-LC at 128 kbps, which a step bounded
   at a video frame's 100 ms missed; and the longest recent step, not the
   last, covers a muxer alternating two- and three-frame PES that ends on the
-  longer), a frame for video, 1 ms for a PCR. Each program's PMT is reassembled
+  longer — but a step more than twice the PID's median step is a hole in the
+  audio, a dropout at a capture's end or an ad splice, not a PES, and does
+  not count: the offset is one shift for every program, so a 520 ms hole
+  among 120 ms PES paused every program, the anchor's video included, for
+  it at every loop), a frame for video, 1 ms for a PCR. Each program's PMT is reassembled
   across packets: a broadcast MPTS PMT past ~180 bytes (a dozen ES with
   their descriptors), read off one packet, named no PCR_PID and no ES, and
   the splice fell back to the PAT's first program. The terms used to come
@@ -1599,7 +1632,16 @@ loop, each playlist transition — continues one wire timeline:
   (Spain program 186's copies arrived up to 131 ms after their deadline
   when due at 400 ms).
   Within a file nothing is added. A playlist file whose PAT drops a PMT PID
-  drops that table at once. Byte-rate mode (`pcr_deadlines: false`) has no
+  drops that table at once. A table the new file has started to send is
+  not repeated until that unit is through — a copy of the old one landing
+  between the packets of a multi-packet PMT on the same PID cut the new
+  section short, and the receiver kept the old PMT for a whole interval.
+  Only a TS file's own tables are repeated, and only into the TS file after
+  it: an MP4 or image file (whose TS this input muxes itself) forgets them.
+  Kept across one, the last TS file's PAT and PMT — seconds old, so due at
+  once — went out at the next TS file's head describing neither, and a
+  receiver version-keyed on that PMT ignored the new file's own when it
+  carried the same version. Byte-rate mode (`pcr_deadlines: false`) has no
   deadlines to time it by and does not repeat.
 - **Continuity at flow start.** Before any payload has gone out on a PID,
   the first adaptation-field-only packet's CC starts that PID's sequence.

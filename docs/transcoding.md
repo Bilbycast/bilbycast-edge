@@ -630,7 +630,13 @@ the sample:
   at every loop. A source whose audio clock is not
   locked to its PCR is held within ~5 ms by one short insert or drop about
   every 100 s at 50 ppm; `timeline_corrections`, `silence_inserted_samples`
-  and `dropped_samples` on the output's `audio_encode_stats` count them.
+  and `dropped_samples` on the output's `audio_encode_stats` count them —
+  and on the input's, for an input-side `audio_encode` (the flow stats'
+  `input.audio_encode_stats`, the active input's, with the replacer's
+  `source_pid` / `source_stream_type` and `pre_pmt_dropped_packets`). The
+  input snapshot used to write all of them as literal zeros, which the
+  stats serialiser then hid, so an ingress re-encode inserting silence for
+  an unlocked source audio clock said nothing.
 - **A gap is filled as the program's clock passes it, not when the audio
   returns.** Found only at the next PES's PTS, a gap's silence used to be
   encoded in one burst when the audio came back, stamped for when the gap
@@ -656,7 +662,15 @@ the sample:
   its own lead still has to send. The first 2 s after an anchor are watched,
   not acted on; a PCR that steps back, jumps over 1 s or carries DI starts
   the learning over; past 500 ms of such silence the audio has stopped
-  rather than paused, and its return re-anchors. Silence placed this way is
+  rather than paused, and its return re-anchors. The 10 s window and the
+  2 s warm-up run on the program clock *unwrapped* — the PCR's laps of the
+  33-bit clock counted — so its wrap every 26.5 h is nothing to them. Keyed
+  on the 33-bit value, the window forgot every second at the wrap (its
+  second number jumps 95 443 → 0), took the first reading after it for the
+  source's floor and filled the next PES's wait with silence, the real
+  audio after it then dropped as overlap — once a day on every 24/7
+  transcoded output; and 13.25 h into each lap the warm-up read negative and
+  switched the fill off until the wrap. Silence placed this way is
   counted in `silence_inserted_samples`, each run once in
   `timeline_corrections`; the Info log line `ts_audio_replace: source audio
   back after a gap filled on the program clock` gives each run's length and
@@ -917,7 +931,17 @@ output takes it off its stamps:
   it, the last ~2048 samples of a segment come out at the head of the next
   on their own PTS, and the audio timeline runs across the cuts with no gap
   and no overlap. A source whose PTS jumps re-anchors the encoder (a frame
-  more than 2000 ticks from where its input is), as on CMAF. The stage
+  more than 2000 ticks from where its input is), as on CMAF — and so does a
+  source whose audio moves to another PID or codec (an input switch): the
+  cutter and decoder start afresh and the running encoder re-anchors on
+  their first frame. It used to re-anchor only when the chain still held an
+  anchor, which the change had just cleared, so the encoder went on
+  stamping the old source's timeline — from then on every frame matched the
+  new anchor and nothing ever re-anchored it — and the rendition's A/V sync
+  was gone for good. A PCR riding the audio PID (radio, a PCR_PID that is
+  the audio's) stays where it was, adaptation-field-only, with the CC of the
+  audio payload packet before it: the re-encoded packets carry no PCR, and
+  dropping the source's left such a segment with no PCR at all. The stage
   follows a source that changes format in-band (rebuilt, pinned to the
   rendition's format), and the rendition keeps the format its first frame
   resolved: a playlist cannot signal a channel count or rate changing
@@ -1554,7 +1578,13 @@ On an **ingress** transcode a raise of `D` reaches the input's muxer-mode
 clock rewriter as a backward PCR step with DI, and passes through it as
 that — PES timestamps stay continuous on every output, so HLS / CMAF /
 WebRTC / RTMP / display see no gap; at flow start the first latch usually
-makes one such step.
+makes one such step. The stage names each such step to the rewriter
+(`note_upstream_pcr_steps`), so it passes whatever its size: the rewriter
+bridged any backward step past 500 ms as a source discontinuity, and a deep
+encoder pipeline's first latch (D = lateness + 80 ms, over a second behind
+x264's or a hardware encoder's lookahead) moved every PES on the flow on by
+the step instead — a forward jump in the passthrough audio on every
+output.
 
 **Behaviour change.** Output PCR used to be `video PTS × 300 − 80 ms`,
 floored on a decaying audio lag: a clock that ran ~15 500 ppm fast against

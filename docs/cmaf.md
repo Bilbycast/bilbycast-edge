@@ -137,21 +137,56 @@ DVR proxy asks for all-intra; see [the proxy section](#why-the-proxy-rendition-i
 
 ### One media timeline, whatever the source does
 
-Every source timestamp goes through the output's own timeline
+Every source timestamp goes through the output's timeline
 (`cmaf::timeline::CmafTimeline`) before anything else sees it — the
 re-encoders, the silence fill, the segmenters. It is the source's timestamp
 plus an offset, 0 until the source first jumps, so a clean source is
 published exactly as before. A timestamp is taken as it is when it is
 continuous with its own track (within 1 s of the newest the track has had,
 either way — a B-frame source's decode-order PTS included) or within 3 s of
-the other track's newest (a track that paused and came back on the
-programme's clock is a gap, kept, in sync). Otherwise the offsets already in
-use are tried — the other track may have met the same jump first, or the
-source may be coming back from a short excursion — and only when none makes
-it continuous does a new offset place it one step (the track's smallest
-recent step) after the track's newest timestamp. Audio arriving at or before
-what is already buffered — a source coming back over audio sent during an
-excursion — is dropped rather than given a zero duration.
+the other track's newest *moving forward* (a track that paused and came back
+on the programme's clock is a gap, kept, in sync). Otherwise the offsets
+already in use are tried — the other track may have met the same jump first,
+or the source may be coming back from a short excursion — and only when none
+makes it continuous does a new offset place it one step (the track's
+smallest recent step) after the track's newest timestamp. Audio arriving at
+or before what is already buffered — a source coming back over audio sent
+during an excursion — is dropped rather than given a zero duration.
+
+**One timeline per flow, not per output.** The offsets are shared by every
+CMAF output of the flow (`CmafTimeline::for_flow`), as the wall-clock epoch
+is ([flow clock](#a-re-anchor-is-declared-not-absorbed)). A DVR session's
+main and all-intra proxy, or any two CMAF outputs of one flow, must publish
+one media timeline, and with an offset per output they did not once one was
+restarted: a config edit to its bitrate restarts that output alone, and after
+a source jump (an input switch to a backup on an unrelated clock) the
+restarted output began again at offset 0 — the source's raw timestamps —
+while its sibling kept the offset it had absorbed, hours apart. Both fed the
+one flow clock, so each rendition's implied epoch re-anchored the other on
+every segment: `#EXT-X-DISCONTINUITY` on every row, alternating dates and the
+"re-anchoring repeatedly" warning, and main / proxy jog positions that no
+longer lined up. A track's first timestamp now takes the offset the flow is
+on — the one the output furthest along the (common) output timeline last
+moved onto, so a restarted output lands where its siblings are and a
+sibling a few frames behind, still meeting an old excursion, does not steer
+it — and a jump one output meets first is taken up by the others as the
+same offset. A flow whose CMAF outputs have all stopped starts over at 0.
+
+**Backward steps.** Within its own 1 s window a track keeps its offset
+stepping back: that is a B-frame source's presentation order (the video is
+mapped by PTS in decode order), and on audio an overlap the output drops,
+keeping the A/V relation. The cross window takes a *backward* step only from
+a track on an excursion it opened itself — audio stamped 60 s back that
+returns to the video's clock behind the audio just published. A track on the
+programme's clock that steps back further than its own window is a source
+jump: both tracks of a switch to a feed 1.5 s behind, or a 2 s clip looping
+from its start, used to pass as "within 3 s of the other track" and publish
+1.5–2 s backwards on both tracks — a zero-length sample, a segment 1.5 s
+long, a `tfdt` overlapping the segment before, 1.5 s of audio dropped as
+overlap. The first track to see such a step now opens an offset and the
+other track takes it: both run on, in their relation. A synchronised step
+back of *less* than 1 s still passes as before (the video cannot tell it
+from reordering at that sample).
 
 It used to take the source's timestamps as they came. At a `media_player`
 loop of the 29.97 fps VH1 clip the flow carried a second of audio stamped
