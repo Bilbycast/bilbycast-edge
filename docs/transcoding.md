@@ -1605,7 +1605,9 @@ commit message or release note and delete the bullet.
      decoder handed out 25 woven frames a second — the VUI said 50 fps, CBR
      budgeted for 50 frames (the video came out at half the configured
      bitrate) and the default GOP ran 4 s. The meter takes the mean of four
-     agreeing frame deltas, or from 12 deltas the span of the deltas over
+     agreeing frame deltas (of two, on a source stamping only every Nth
+     picture: each of its spans is already a mean over N frames), or from
+     12 deltas the span of the deltas over
      the frames they cover (how many each covers read off the median of
      4-delta sums, so one dropped frame does not move it): the median over
      windows of 12 (24 once there are that many) — whole cycles of a 3:2
@@ -1628,11 +1630,17 @@ commit message or release note and delete the bullet.
      taken as one frame, a 29.97 fps source stamping every 12th picture
      locked 2500/1001 fps (CBR budgeting 12x the bitrate per frame, a
      4-frame GOP). Frames decoded before the rate is known — about four at
-     startup, four stamped spans on a sparse source — are dropped, since
+     startup, two stamped spans on a sparse source — are dropped, since
      the encoder cannot open without it; after 60 decoded frames with no
      usable PTS it opens at the PES DTS step (a span over PES without a
      timestamp divided by the PES it covers) times the PES-per-frame
-     ratio, else 30/1. An input switch with the encoder already open drops
+     ratio, else 30/1. On a sparse source the wait runs past its first
+     stamp for three of its spans (at most 120 frames past it:
+     `FrameCadence::lock_wait_frames`), which covers a PTS every 700 ms —
+     MPEG-TS's limit — at 60 fps joined anywhere, and a 2 s GOP at 25 fps.
+     It used to take four spans within 60 frames, so a source stamping its
+     I pictures every 15 or more frames (a 1 s GOP at 25 fps, every 25th
+     picture at 50 fps) opened at the fallback before its rate was known. An input switch with the encoder already open drops
      nothing (its rate cannot change).
      HEVC field_seq sources measure the field rate, 50/1, which is right
      for the 540-line pictures they are coded as (see *Scan*). Measured on
@@ -1642,8 +1650,12 @@ commit message or release note and delete the bullet.
    - **RTMP, WebRTC and CMAF outputs** lock the same way, **only when
      the field is unset**: the decoded frames' PTS go through the same
      `FrameCadence` meter (`video_encode_util::EncoderRateLock`), the
-     frames decoded before it can say (about four) are dropped, and after
-     60 decoded frames with no usable PTS the encoder opens at 30/1. An
+     frames decoded before it can say (about four; two stamped spans on a
+     sparse source, which extends the wait as above) are dropped, and
+     after 60 decoded frames with no usable PTS the encoder opens at 30/1
+     — these paths have no DTS fallback, so a sparse source that ran out
+     the flat 60 frames opened at 30/1: VUI 30 fps, CBR 25/30 or 50/30 off,
+     a 60-frame CMAF GOP. An
      access unit whose PES carried no PTS goes to the decoder without one
      (`DemuxedFrame::{H264, H265}::pts_known`), so its picture is
      counted, not measured, as on the TS path; and each such picture is

@@ -365,8 +365,22 @@ const CADENCE_SNAP_TOLERANCE_MAX: f64 = 0.05;
 const CADENCE_WINDOW_UNIT: usize = 12;
 /// Deltas the meter keeps (the newest win).
 const CADENCE_WINDOW: usize = 32;
-/// Consecutive deltas the fast path needs to agree on.
+/// Most consecutive deltas the fast path needs to agree on: four one-frame
+/// deltas.
 const CADENCE_FAST_DELTAS: usize = 4;
+/// Frames the fast path's agreeing deltas must cover between them — four
+/// one-frame deltas, or as few as two spans of a source that stamps only
+/// every Nth picture (each already a mean over its N frames).
+const CADENCE_FAST_FRAMES: u32 = 4;
+/// Stamped spans of a sparse source an unpinned encoder waits for past its
+/// first stamp before opening at the fallback: the fast path's two, and one
+/// for the stamp it joined partway through.
+const SPARSE_LOCK_SPANS: u32 = 3;
+/// The most frames past a sparse source's first stamp that wait may run
+/// (see [`FrameCadence::lock_wait_frames`]): enough for a PTS every 700 ms
+/// — MPEG-TS's limit — at 60 fps, joined anywhere; a source that stamps
+/// once and never again waits this long, not for ever.
+const SPARSE_LOCK_EXTRA_MAX: u32 = 2 * RATE_LOCK_FRAME_CAP;
 /// Deltas the cadence path needs before it answers.
 const CADENCE_MIN_DELTAS: usize = 12;
 /// 33-bit PTS space.
@@ -390,8 +404,9 @@ const PTS_MASK_33B: u64 = (1u64 << 33) - 1;
 /// see below; a delta outside 90..=90 000 ticks is a discontinuity and is
 /// skipped):
 ///
-/// - **fast path** — the last [`CADENCE_FAST_DELTAS`] deltas agree within
-///   `max(2 ticks, 0.5 %)`: their mean.
+/// - **fast path** — the newest deltas covering [`CADENCE_FAST_FRAMES`]
+///   frames (four one-frame deltas; two spans of a source stamping only
+///   every Nth picture) agree within `max(2 ticks, 0.5 %)`: their mean.
 /// - **cadence path** — otherwise, with at least [`CADENCE_MIN_DELTAS`]
 ///   deltas. The median of the sums of every 4 consecutive deltas, over 4,
 ///   says roughly how long a frame is, and so how many frames each delta
@@ -424,7 +439,8 @@ const PTS_MASK_33B: u64 = (1u64 << 33) - 1;
 /// decoded across it: one delta of `span / frames`. Taken as one frame, a
 /// source stamping every 12th picture at 29.97 fps measured 36 036 ticks —
 /// an encoder opened at 2500/1001 fps, CBR budgeting 12x the bitrate per
-/// frame, a 4-frame GOP.
+/// frame, a 4-frame GOP. How long an encoder waits for such a source is
+/// [`Self::lock_wait_frames`].
 #[derive(Debug, Clone, Default)]
 pub struct FrameCadence {
     last_pts: Option<u64>,
@@ -433,6 +449,14 @@ pub struct FrameCadence {
     /// Per-frame deltas (90 kHz ticks), fractional where a span over
     /// several frames does not divide evenly.
     deltas: std::collections::VecDeque<f64>,
+    /// The frames each of `deltas` covers.
+    delta_frames: std::collections::VecDeque<u32>,
+    /// Frames observed since the reset, and how many had been when the
+    /// first one with a timestamp came.
+    observed: u32,
+    first_stamp_at: Option<u32>,
+    /// The most frames one measured delta has covered.
+    widest_span_frames: u32,
 }
 
 impl FrameCadence {
@@ -442,35 +466,58 @@ impl FrameCadence {
 
     /// Forget everything — a new source.
     pub fn reset(&mut self) {
-        self.last_pts = None;
-        self.frames_since_pts = 0;
-        self.deltas.clear();
+        *self = Self::default();
     }
 
     /// Feed one decoded frame's PTS (90 kHz, display order), exactly as
     /// the decoder returned it. `None` (no timestamp) measures nothing but
     /// counts a frame towards the next stamped one's span.
     pub fn observe(&mut self, pts: Option<i64>) {
+        self.observed = self.observed.saturating_add(1);
         let Some(p) = pts.filter(|p| *p >= 0) else {
             if self.last_pts.is_some() {
                 self.frames_since_pts = self.frames_since_pts.saturating_add(1);
             }
             return;
         };
+        self.first_stamp_at.get_or_insert(self.observed);
         let p = p as u64 & PTS_MASK_33B;
         if let Some(last) = self.last_pts {
             let span = p.wrapping_sub(last) & PTS_MASK_33B;
             // A span past half the PTS space is a step back.
-            let delta = span as f64 / f64::from(self.frames_since_pts.saturating_add(1));
+            let frames = self.frames_since_pts.saturating_add(1);
+            let delta = span as f64 / f64::from(frames);
             if span < 1 << 32 && (90.0..=90_000.0).contains(&delta) {
                 if self.deltas.len() == CADENCE_WINDOW {
                     self.deltas.pop_front();
+                    self.delta_frames.pop_front();
                 }
                 self.deltas.push_back(delta);
+                self.delta_frames.push_back(frames);
+                self.widest_span_frames = self.widest_span_frames.max(frames);
             }
         }
         self.last_pts = Some(p);
         self.frames_since_pts = 0;
+    }
+
+    /// Decoded frames (counted from the reset, as [`Self::observe`] saw
+    /// them) an unpinned encoder waits for a rate before opening at a
+    /// fallback: [`RATE_LOCK_FRAME_CAP`] — or, when the source stamps only
+    /// every Nth picture, long enough past its first stamp for
+    /// [`SPARSE_LOCK_SPANS`] such spans (the widest measured, or the one in
+    /// progress), at most [`SPARSE_LOCK_EXTRA_MAX`] past it. Each span is
+    /// one delta, and a flat 60 frames held only four spans of 14 pictures:
+    /// a source stamping its I pictures every 15 or more (a 25 fps source
+    /// with a 1 s GOP, a 50 fps one stamping every 25th picture) opened at
+    /// 30/1 before its rate could be measured.
+    pub fn lock_wait_frames(&self) -> u32 {
+        let Some(first) = self.first_stamp_at else {
+            return RATE_LOCK_FRAME_CAP;
+        };
+        let span = self.widest_span_frames.max(self.frames_since_pts.saturating_add(1));
+        let sparse = first.saturating_add((SPARSE_LOCK_SPANS * span).min(SPARSE_LOCK_EXTRA_MAX));
+        sparse.max(RATE_LOCK_FRAME_CAP)
     }
 
     /// Deltas measured so far (at most [`CADENCE_WINDOW`]).
@@ -495,12 +542,25 @@ impl FrameCadence {
     /// `(mean frame duration, snap tolerance)` — see [`FrameCadence`].
     fn measure(&self) -> Option<(f64, f64)> {
         let n = self.deltas.len();
-        if n >= CADENCE_FAST_DELTAS {
-            let last: Vec<f64> = self.deltas.iter().skip(n - CADENCE_FAST_DELTAS).copied().collect();
+        // The newest deltas covering CADENCE_FAST_FRAMES frames: four
+        // one-frame deltas, two spans of a sparse source.
+        let mut covered = 0;
+        let fast = self
+            .delta_frames
+            .iter()
+            .rev()
+            .take(CADENCE_FAST_DELTAS)
+            .position(|f| {
+                covered += f;
+                covered >= CADENCE_FAST_FRAMES
+            })
+            .map(|i| (i + 1).max(2));
+        if let Some(k) = fast.filter(|k| *k <= n) {
+            let last: Vec<f64> = self.deltas.iter().skip(n - k).copied().collect();
             let lo = last.iter().copied().fold(f64::INFINITY, f64::min);
             let hi = last.iter().copied().fold(f64::NEG_INFINITY, f64::max);
             let span: f64 = last.iter().sum();
-            let mean = span / CADENCE_FAST_DELTAS as f64;
+            let mean = span / k as f64;
             if hi - lo <= (mean * 0.005).max(2.0) {
                 if !millisecond_stamps(&last) {
                     return Some((mean, CADENCE_SNAP_TOLERANCE));
@@ -667,7 +727,7 @@ impl EncoderRateLock {
         self.unlocked_frames += 1;
         let (num, den, measured) = match self.cadence.rate() {
             Some((n, d)) => (n, d, true),
-            None if self.unlocked_frames >= RATE_LOCK_FRAME_CAP => {
+            None if self.unlocked_frames >= self.cadence.lock_wait_frames() => {
                 (RATE_LOCK_FALLBACK.0, RATE_LOCK_FALLBACK.1, false)
             }
             None => return RateStep::Wait,
@@ -695,9 +755,10 @@ impl EncoderRateLock {
                     );
                 } else {
                     tracing::warn!(
-                        "{}: source frame rate not measurable from {RATE_LOCK_FRAME_CAP} decoded \
-                         frames (no usable frame PTS) — opening the encoder at {num}/{den}",
+                        "{}: source frame rate not measurable from {} decoded frames (no \
+                         usable frame PTS) — opening the encoder at {num}/{den}",
                         pipeline.log_tag,
+                        self.unlocked_frames,
                     );
                 }
                 true
@@ -2394,6 +2455,59 @@ mod cadence_tests {
             m.observe(Some(p));
         }
         assert_eq!(m.frame_duration_90k(), Some(3_600.0));
+    }
+
+    /// A source stamping only every Nth picture — its I pictures — locks
+    /// its own rate through the encoder's lock, measured, not the 30/1
+    /// fallback, at any GOP up to MPEG-TS's 700 ms between PTS (and a 2 s
+    /// one): two stamped spans that agree (each already a mean over its N
+    /// frames) are enough, and the lock waits past the first stamp for
+    /// them. It needed four spans within 60 frames, so a stamp every 15 or
+    /// more pictures fell back to 30/1: VUI 30 fps, a CBR budget 25/30 or
+    /// 50/30 off, a 60-frame CMAF GOP.
+    #[test]
+    fn a_source_stamping_every_nth_picture_locks_its_rate() {
+        use super::{EncoderRateLock, RateStep};
+        let lock = |(num, den): (u32, u32), every: u64, join: u64| {
+            let step = 90_000.0 * den as f64 / num as f64;
+            let mut l = EncoderRateLock::new(false);
+            for n in 0..400u64 {
+                let k = n + join;
+                let pts = k.is_multiple_of(every).then(|| (900_000.0 + k as f64 * step).round() as i64);
+                if let RateStep::Lock { num, den, measured } = l.observe(pts) {
+                    return (num, den, measured, n + 1);
+                }
+            }
+            panic!("never locked");
+        };
+        for (rate, every, join) in [
+            ((25, 1), 15, 0),
+            ((25, 1), 25, 0),
+            ((25, 1), 25, 9),
+            ((30, 1), 30, 0),
+            ((50, 1), 25, 3),
+            ((60, 1), 42, 41),
+            ((60_000, 1001), 42, 1),
+            ((30_000, 1001), 12, 0),
+            ((25, 1), 50, 0),
+        ] {
+            let (num, den, measured, at) = lock(rate, every, join);
+            assert!(measured, "{rate:?} every {every}: the fallback at frame {at}");
+            assert_eq!((num, den), rate, "{rate:?} every {every}");
+        }
+        // Dense stamps and none at all keep the 60-frame wait.
+        let mut m = FrameCadence::new();
+        assert_eq!(m.lock_wait_frames(), 60);
+        m.observe(Some(0));
+        m.observe(Some(3_600));
+        assert_eq!(m.lock_wait_frames(), 60);
+        // A source that stamps once and never again waits a bounded while.
+        let mut m = FrameCadence::new();
+        m.observe(Some(0));
+        for _ in 0..500 {
+            m.observe(None);
+        }
+        assert_eq!(m.lock_wait_frames(), 1 + 120);
     }
 
     #[test]

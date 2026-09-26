@@ -699,17 +699,14 @@ mod inner {
     /// Input frames the decoder may consume with **zero** decoded output
     /// before [`Inner::check_decode_stall`] declares a decode stall. Sized
     /// comfortably above every legitimate transient where output lags input
-    /// (first-IDR wait, B-frame reorder, the deferred-encoder-open window of
-    /// at most [`UNLOCKED_FRAME_CAP`] frames) so the watchdog never
+    /// (first-IDR wait, B-frame reorder, the deferred-encoder-open window —
+    /// 60 decoded frames, up to 180 on a source stamping only every Nth
+    /// picture, `FrameCadence::lock_wait_frames` — which decodes all the
+    /// same) so the watchdog never
     /// false-fires at startup or across an input switch. Matches the ST 2110
     /// egress watchdog's precedent (`EGRESS_DECODE_STALL_AUS = 200`): ~4 s at
     /// 50 fps, ~8 s at 25 fps.
     const DECODE_STALL_INPUT_FRAMES: u64 = 200;
-
-    /// Decoded frames the replacer waits for a measurable rate before it
-    /// opens the encoder at the fallback rate (~2 s of broadcast video) —
-    /// the same wait the RTMP / WebRTC / CMAF encoders take.
-    const UNLOCKED_FRAME_CAP: u32 = crate::engine::video_encode_util::RATE_LOCK_FRAME_CAP;
 
     /// Where the encoder's rate came from.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -718,8 +715,8 @@ mod inner {
         Pinned,
         /// This source's decoded-frame cadence.
         Cadence,
-        /// The fallback: no usable frame PTS in the first
-        /// [`UNLOCKED_FRAME_CAP`] decoded frames.
+        /// The fallback: no rate measured within the frames
+        /// `FrameCadence::lock_wait_frames` allows.
         Fallback,
     }
 
@@ -815,8 +812,10 @@ mod inner {
         /// change). Until then decoded frames are dropped before the
         /// encoder, which cannot open without a rate.
         pub(super) source_fps_locked: bool,
-        /// Decoded frames dropped while the rate was unknown. After
-        /// [`UNLOCKED_FRAME_CAP`] the fallback rate is taken, so a source
+        /// Decoded frames dropped while the rate was unknown. Past
+        /// `FrameCadence::lock_wait_frames` — 60, the same wait the RTMP /
+        /// WebRTC / CMAF encoders take, longer for a source stamping only
+        /// every Nth picture — the fallback rate is taken, so a source
         /// whose frames carry no usable PTS still gets an encoder.
         unlocked_frames: u32,
         /// Last input PES DTS (or PTS when the PES has no DTS) and the
@@ -1997,14 +1996,14 @@ mod inner {
 
         /// Lock the encoder rate for an unpinned source once
         /// [`FrameCadence`] can say it, or at the fallback after
-        /// [`UNLOCKED_FRAME_CAP`] decoded frames. Returns whether the rate
+        /// `FrameCadence::lock_wait_frames` decoded frames. Returns whether the rate
         /// is now locked (the frame in hand is then the first one
         /// encoded).
         pub(super) fn try_lock_rate(&mut self) -> bool {
             self.unlocked_frames = self.unlocked_frames.saturating_add(1);
             let (n, d, from) = match self.cadence.rate() {
                 Some((n, d)) => (n, d, "decoded-frame cadence"),
-                None if self.unlocked_frames >= UNLOCKED_FRAME_CAP => {
+                None if self.unlocked_frames >= self.cadence.lock_wait_frames() => {
                     let (n, d) = self.fallback_rate();
                     tracing::warn!(
                         "ts_video_replace: source frame rate not measurable from {} decoded \
@@ -3507,8 +3506,8 @@ mod tests {
 
         /// A 29.97 fps source that stamps a PTS on every 12th picture only,
         /// no fps pinned: the encoder locks 30000/1001 from the decoded-frame
-        /// cadence, at the fifth stamped picture — the span between two
-        /// stamped frames over the frames decoded across it. Taken as one
+        /// cadence, at the third stamped picture — two spans between stamped
+        /// frames, each over the frames decoded across it, that agree. Taken as one
         /// frame, that span (36 036 ticks) locked 2500/1001 — CBR budgeting
         /// 12x the bitrate per frame, a 4-frame GOP. Frame admission drops
         /// the stamped pictures 12 and 24 here (the PTS-less frames before
@@ -3527,16 +3526,50 @@ mod tests {
             assert!(!r.inner.fps_mismatch_warned);
         }
 
-        /// Stamped on every 16th picture, the cadence has only three spans
-        /// when the 60-frame fallback fires: the PES DTS step it uses is
-        /// the span over the PES it covers (3003), not the span itself
-        /// (48 048 ticks, 1875/1001 fps).
+        /// A 25 fps source stamping only its I pictures, a 1 s GOP apart: two
+        /// spans are measured by frame 51 and agree, so the rate comes from
+        /// the cadence. Four spans used to be needed within 60 frames, and
+        /// the rate came from the PES DTS fallback instead.
+        #[test]
+        fn a_source_stamping_its_i_pictures_a_second_apart_locks_from_the_cadence() {
+            use super::super::inner::RateOrigin;
+            let aus = x264_aus(80, (320, 240), None, None);
+            let mut cc = 0u8;
+            let mut r = TsVideoReplacer::new(&cfg("x264"), None).unwrap();
+            let _ = run(&mut r, &ts_sparse(&aus, 25, 3_600, &mut cc));
+            assert_eq!(r.inner.rate_origin, Some(RateOrigin::Cadence), "not the fallback");
+            assert_eq!(r.inner.pipeline.fps(), (25, 1));
+        }
+
+        /// Stamped on pictures 0, 16, 32 and 48 only, with spans that do not
+        /// agree (3003, 3040 and 3003 ticks a frame, 1.2 % apart), the
+        /// cadence cannot call a rate and the 60-frame fallback fires: the
+        /// PES DTS step it uses is the last span over the PES it covers
+        /// (3003), not the span itself (48 048 ticks, 1875/1001 fps).
         #[test]
         fn the_fallback_divides_a_sparse_dts_span_by_its_pes() {
             let aus = x264_aus(72, (320, 240), None, None);
             let mut cc = 0u8;
+            let mut ts = Vec::new();
+            ts.extend_from_slice(&synth_pat(0x1000));
+            ts.extend_from_slice(&synth_pmt(0x1000, 0x100, 0x1B));
+            let mut pts = 900_000u64;
+            for (i, au) in aus.iter().enumerate() {
+                let pes = if i % 16 == 0 && i <= 48 {
+                    let p = build_video_pes(au, pts);
+                    pts += if i == 16 { 16 * 3_040 } else { 16 * 3_003 };
+                    p
+                } else {
+                    let mut pes = vec![0x00, 0x00, 0x01, 0xE0, 0, 0, 0x80, 0x00, 0x00];
+                    pes.extend_from_slice(au);
+                    pes
+                };
+                for p in packetize_ts(0x100, &pes, &mut cc) {
+                    ts.extend_from_slice(&p);
+                }
+            }
             let mut r = TsVideoReplacer::new(&cfg("x264"), None).unwrap();
-            let _ = run(&mut r, &ts_sparse(&aus, 16, 3_003, &mut cc));
+            let _ = run(&mut r, &ts);
             assert_eq!(r.inner.pes_dts_step_90k, Some(3_003));
             assert_eq!(r.inner.pipeline.fps(), (30_000, 1001));
             assert_eq!(r.inner.rate_origin, Some(super::super::inner::RateOrigin::Fallback));
