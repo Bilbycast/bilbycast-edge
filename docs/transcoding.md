@@ -1605,19 +1605,33 @@ commit message or release note and delete the bullet.
      decoder handed out 25 woven frames a second — the VUI said 50 fps, CBR
      budgeted for 50 frames (the video came out at half the configured
      bitrate) and the default GOP ran 4 s. The meter takes the mean of four
-     agreeing frame deltas (of two, on a source stamping only every Nth
-     picture: each of its spans is already a mean over N frames), or from
-     12 deltas the span of the deltas over
-     the frames they cover (how many each covers read off the median of
-     4-delta sums, so one dropped frame does not move it): the median over
-     windows of 12 (24 once there are that many) — whole cycles of a 3:2
-     or 2:3:3:2 pulldown, which measures exactly 24000/1001 — or, for
-     millisecond timestamps (an RTMP-ingest source), the least-squares
-     slope of the stamps over the frames. It snaps to the **nearest**
-     standard rate within 0.1 %, or within what the stamps can resolve
-     when that is more — a millisecond's rounding, or half the spread of
-     the per-frame deltas (browser capture jitter), over the span measured,
-     at most 5 %. The median of 4-delta sums alone read an RTMP publish's
+     frame deltas that agree within 0.1 % with every delta seen so far (of
+     two, on a source stamping only every Nth picture: each of its spans
+     is already a mean over N frames), or from 12 deltas the span of the
+     deltas over the frames they cover (how many each covers read off the
+     median of 4-delta sums, so one dropped frame does not move it — a
+     delta counts as two frames only when it stands clear of the others'
+     spread): for a steady or periodic cadence the median over windows of
+     12 (24 once there are that many) — whole cycles of a 3:2 or 2:3:3:2
+     pulldown, which measures exactly 24000/1001 — or, for uneven
+     millisecond timestamps (an RTMP-ingest source) and jittered stamps
+     (a browser's capture clock), the least-squares slope of the stamps
+     over the frames. It snaps to the **nearest** standard rate within
+     0.1 %, or within what the stamps resolve when that is more — a
+     millisecond's rounding over the span, or 4.5 standard errors of the
+     slope — and says nothing yet while that tolerance is past 5 % or holds
+     two rate families (24 and 25, 48 and 50). Jittered stamps wait for 16
+     deltas and lock only a standard rate: the encoder opens at the
+     meter's first answer, and the first dozen deltas of ±8 ms stamps move
+     the estimate by up to 4 % — the meter used to snap within half the
+     per-frame spread there, and over 2000 starts 25 fps locked 24/1 in
+     7 % and a non-standard rate in 9 %, 60 fps a non-standard rate in
+     81 %, 50 fps 48/1 in 22 %, and ±0.5 ms stamps (four agreeing within
+     0.5 % now and then) a non-standard rate in 7-16 %. Now each locks its
+     own rate family (one start in 2000 at 50 fps ±8 ms took 48/1), at
+     frame 17 (about 21 at 50 / 60 fps ±8 ms). A stamp that jitter puts
+     within a millisecond of the one before is counted as a frame whose time
+     joins the next span, not dropped as a discontinuity. The median of 4-delta sums alone read an RTMP publish's
      33 / 33 / 34 ms steps at 30 fps as 2992.5 ticks and opened the encoder
      at 90000/2993 (30.07 fps; 60 fps at 22500/377, 24 fps at 24000/1001).
      A dozen millisecond stamps cannot tell 30/1 from 30000/1001 (they

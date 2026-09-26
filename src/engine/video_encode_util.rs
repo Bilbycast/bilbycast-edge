@@ -356,9 +356,22 @@ const STANDARD_FRAME_RATES: &[(u32, u32)] = &[
 /// [`STANDARD_FRAME_RATES`] entry (0.1 %) — widened by what the timestamps
 /// can resolve (see [`FrameCadence`]).
 const CADENCE_SNAP_TOLERANCE: f64 = 0.001;
-/// The widest the snap tolerance gets for noisy timestamps (5 %: half the
-/// distance from 25 to 24 fps).
+/// The widest snap tolerance the meter answers with: past it (5 %) the
+/// stamps are too noisy yet to say.
 const CADENCE_SNAP_TOLERANCE_MAX: f64 = 0.05;
+/// Relative spread within which two standard rates are one family — a rate
+/// and its 1001 neighbour (0.1 % apart). 24 and 25, 48 and 50 are 4 % apart:
+/// two families.
+const CADENCE_FAMILY: f64 = 0.002;
+/// How far two deltas — the fast path's, or a periodic cadence's — may
+/// differ and still agree: 0.1 %, at least 2 ticks (90 kHz rounding).
+const CADENCE_FAST_AGREEMENT: f64 = 0.001;
+/// Standard errors of the least-squares slope the snap tolerance spans on
+/// uneven stamps.
+const CADENCE_JITTER_SIGMAS: f64 = 4.5;
+/// Deltas jittered stamps need before the meter answers: a dozen at ±8 ms
+/// swing the slope by up to 4 % — 25 fps read as 24.
+const CADENCE_JITTER_MIN_DELTAS: usize = 16;
 /// Deltas the cadence path averages over together: whole cycles of every
 /// periodic cadence — 3:2 (period 2), 2:3:3:2 (4), and the 33 / 33 / 34 ms
 /// pattern millisecond timestamps give 30 and 60 fps (3).
@@ -401,35 +414,56 @@ const PTS_MASK_33B: u64 = (1u64 << 33) - 1;
 ///
 /// Estimator, over the per-frame deltas between consecutive stamped
 /// frames (masked to 33 bits, the span divided by the frames it covers —
-/// see below; a delta outside 90..=90 000 ticks is a discontinuity and is
-/// skipped):
+/// see below; a step back or a delta past 90 000 ticks is a discontinuity
+/// and is skipped; a stamp jitter put within a millisecond of the last is a
+/// frame whose time joins the next span):
 ///
 /// - **fast path** — the newest deltas covering [`CADENCE_FAST_FRAMES`]
 ///   frames (four one-frame deltas; two spans of a source stamping only
-///   every Nth picture) agree within `max(2 ticks, 0.5 %)`: their mean.
+///   every Nth picture) agree within `max(2 ticks, 0.1 %)`, and — unless
+///   they are millisecond steps — so does every delta measured so far (one
+///   over a dropped frame as the frames it covers): their mean. Four
+///   deltas of jittered stamps agree now and then, and their mean is off by
+///   up to half the jitter.
 /// - **cadence path** — otherwise, with at least [`CADENCE_MIN_DELTAS`]
 ///   deltas. The median of the sums of every 4 consecutive deltas, over 4,
 ///   says roughly how long a frame is, and so how many frames each delta
-///   covers (a dropped frame's delta, two). The duration is then the span
-///   of the deltas over the frames they cover: over windows of 12 deltas
-///   (24 once there are that many) — whole cycles of a 3:2 or 2:3:3:2
-///   pulldown, so soft-telecined film measures exactly 24000/1001 — the
-///   median window; or, for millisecond timestamps, the least-squares slope
-///   of the stamps over the frames, whose rounding errors average out.
-///   The median of 4-delta sums on its own read the 33 / 33 / 34 ms steps of
-///   an RTMP publish at 30 fps as 2992.5 ticks: an encoder opened at
-///   90000/2993 (30.07 fps).
+///   covers (a dropped frame's delta, two — when it stands clear of the
+///   other deltas' spread). A steady or periodic cadence (every delta, or
+///   every 2nd / 3rd / 4th, agreeing: 3:2 or 2:3:3:2 pulldown, even
+///   millisecond steps) is measured over windows of 12 deltas (24 once
+///   there are that many) — whole cycles, so soft-telecined film measures
+///   exactly 24000/1001 — as the median window, to 0.1 % (a millisecond's
+///   rounding over the span for millisecond steps). Uneven millisecond
+///   steps and jittered stamps take the least-squares slope of the stamps
+///   over the frames, which averages the rounding or the jitter out, to
+///   [`CADENCE_JITTER_SIGMAS`] standard errors of that slope (from the
+///   scatter about it, or the per-frame deltas', whichever says more).
+///   Jittered stamps wait for [`CADENCE_JITTER_MIN_DELTAS`] deltas, answer
+///   only with a standard rate, and not while the tolerance is past
+///   [`CADENCE_SNAP_TOLERANCE_MAX`]. The median of 4-delta sums on its own
+///   read the 33 / 33 / 34 ms steps of an RTMP publish at 30 fps as 2992.5
+///   ticks: an encoder opened at 90000/2993 (30.07 fps).
 ///
-/// The mean frame duration then snaps to the **nearest**
-/// [`STANDARD_FRAME_RATES`] entry within a tolerance: 0.1 %, or what the
-/// timestamps can resolve when that is more — a millisecond's rounding, or
-/// half the spread of the per-frame deltas (browser capture jitter), over
-/// the span measured, up to [`CADENCE_SNAP_TOLERANCE_MAX`]. Otherwise it is
-/// reported as `90000 / round(duration)`, reduced — a genuinely
-/// non-standard rate is never forced onto a standard one. At the lock, a
-/// dozen millisecond stamps cannot tell 30000/1001 from 30/1 (they drift a
-/// millisecond apart per second): such a source may lock at the other one,
-/// 0.1 % off.
+/// The duration then snaps to the **nearest** [`STANDARD_FRAME_RATES`]
+/// entry within that tolerance — or, while two rate families (24 and 25,
+/// 48 and 50; a rate and its 1001 neighbour are one) both lie within it,
+/// the meter cannot say yet. Otherwise it is reported as
+/// `90000 / round(duration)`, reduced — a genuinely non-standard rate
+/// measured from clean stamps is never forced onto a standard one. The
+/// encoder locks at the meter's **first** answer, so an answer must be
+/// right when it comes. The meter used to answer jittered stamps from the
+/// first dozen deltas (or four that happened to agree within 0.5 %), whose
+/// estimate the jitter moves by up to 4 %, snapped within half the
+/// per-frame spread over the span: over 2000 starts, 25 fps at ±8 ms locked
+/// 24/1 in 7 % and a non-standard rate in 9 %, 30 fps a non-standard rate
+/// in 11 %, 60 fps in 81 %, 50 fps 48/1 in 22 %, and even ±0.5 ms stamps a
+/// non-standard rate in 7 % (30 fps) to 16 % (25 fps). Now all of those
+/// lock their own family (one start in 2000 at 50 fps ±8 ms — jitter of
+/// 40 % of a frame — took 48/1), at frame 17 (21 at 50 / 60 fps ±8 ms)
+/// instead of 13. At the lock, a dozen millisecond stamps
+/// cannot tell 30000/1001 from 30/1 (they drift a millisecond apart per
+/// second): such a source may lock at the other one, 0.1 % off.
 ///
 /// Only a decoder-carried timestamp is evidence: a frame without one (and
 /// a negative one) is never stepped by a guess, which would only confirm
@@ -487,6 +521,15 @@ impl FrameCadence {
             // A span past half the PTS space is a step back.
             let frames = self.frames_since_pts.saturating_add(1);
             let delta = span as f64 / f64::from(frames);
+            if span > 0 && span < 1 << 32 && delta < 90.0 {
+                // Jitter put this stamp within a millisecond of the last:
+                // the frame joins the next span, as one without a stamp
+                // does. Dropped with its stamp as a discontinuity, it took a
+                // frame out of the count and its time with it, and the next
+                // span read a frame long (60 fps at ±8 ms locked 56.5).
+                self.frames_since_pts = frames;
+                return;
+            }
             if span < 1 << 32 && (90.0..=90_000.0).contains(&delta) {
                 if self.deltas.len() == CADENCE_WINDOW {
                     self.deltas.pop_front();
@@ -530,17 +573,35 @@ impl FrameCadence {
     /// say.
     #[cfg(test)]
     pub fn frame_duration_90k(&self) -> Option<f64> {
-        self.measure().map(|(d, _)| d)
+        self.measure().map(|m| m.duration)
     }
 
     /// The measured rate as `(num, den)`, snapped to a standard rate —
-    /// or `None` until the meter can say.
+    /// or `None` until the meter can say. It cannot while two rate
+    /// families (24 / 25, 48 / 50: a rate and its 1001 neighbour are one
+    /// family) both lie within what the stamps resolve, nor — for jittered
+    /// stamps — while no standard rate does.
     pub fn rate(&self) -> Option<(u32, u32)> {
-        self.measure().map(|(d, tolerance)| snap_frame_duration(d, tolerance))
+        let m = self.measure()?;
+        let fps = 90_000.0 / m.duration;
+        let mut within = STANDARD_FRAME_RATES
+            .iter()
+            .map(|&(n, d)| n as f64 / d as f64)
+            .filter(|std| ((fps - std) / std).abs() <= m.tolerance);
+        if let Some(first) = within.next()
+            && within.any(|other| ((other - first) / first).abs() > CADENCE_FAMILY)
+        {
+            return None;
+        }
+        match nearest_standard_rate(m.duration, m.tolerance) {
+            Some(r) => Some(r),
+            None if m.standard_only => None,
+            None => Some(snap_frame_duration(m.duration, m.tolerance)),
+        }
     }
 
-    /// `(mean frame duration, snap tolerance)` — see [`FrameCadence`].
-    fn measure(&self) -> Option<(f64, f64)> {
+    /// See [`FrameCadence`].
+    fn measure(&self) -> Option<Measured> {
         let n = self.deltas.len();
         // The newest deltas covering CADENCE_FAST_FRAMES frames: four
         // one-frame deltas, two spans of a sparse source.
@@ -561,16 +622,29 @@ impl FrameCadence {
             let hi = last.iter().copied().fold(f64::NEG_INFINITY, f64::max);
             let span: f64 = last.iter().sum();
             let mean = span / k as f64;
-            if hi - lo <= (mean * 0.005).max(2.0) {
+            let agree = (mean * CADENCE_FAST_AGREEMENT).max(2.0);
+            if hi - lo <= agree {
                 if !millisecond_stamps(&last) {
-                    return Some((mean, CADENCE_SNAP_TOLERANCE));
-                }
-                // Four agreeing millisecond steps can sit half a millisecond
-                // off the rate (42 ms for 41.7): taken only when that still
-                // names a standard rate, else left to the cadence path.
-                let tolerance = (90.0 / span).max(CADENCE_SNAP_TOLERANCE);
-                if nearest_standard_rate(mean, tolerance).is_some() {
-                    return Some((mean, tolerance));
+                    // Every delta so far agrees too (one over a dropped
+                    // frame as the frames it covers): four deltas of
+                    // jittered stamps agree now and then, and their mean
+                    // is off by up to half the jitter.
+                    let steady = self.deltas.iter().all(|x| {
+                        let frames = (x / mean).round().max(1.0);
+                        (x / frames - mean).abs() <= agree
+                    });
+                    if steady {
+                        return Some(Measured::exact(mean, CADENCE_SNAP_TOLERANCE));
+                    }
+                } else {
+                    // Four agreeing millisecond steps can sit half a
+                    // millisecond off the rate (42 ms for 41.7): taken only
+                    // when that still names a standard rate, else left to
+                    // the cadence path.
+                    let tolerance = (90.0 / span).max(CADENCE_SNAP_TOLERANCE);
+                    if nearest_standard_rate(mean, tolerance).is_some() {
+                        return Some(Measured::exact(mean, tolerance));
+                    }
                 }
             }
         }
@@ -581,31 +655,33 @@ impl FrameCadence {
         let mut sums: Vec<f64> = d.windows(4).map(|w| w.iter().sum()).collect();
         sums.sort_unstable_by(f64::total_cmp);
         let coarse = sums[sums.len() / 2] / 4.0;
-        // Frames each delta covers: a dropped frame's delta covers two.
-        let frames: Vec<f64> = d.iter().map(|x| (x / coarse).round().max(1.0)).collect();
-        let per_frame = d.iter().zip(&frames).map(|(x, f)| x / f);
-        let lo = per_frame.clone().fold(f64::INFINITY, f64::min);
-        let hi = per_frame.fold(f64::NEG_INFINITY, f64::max);
+        // Frames each delta covers: a dropped frame's delta covers two —
+        // when it stands clear of the jitter. Past 1.5 frames and further
+        // from a frame than twice the widest spread of the one-frame deltas;
+        // otherwise a jittered delta (±8 ms at 50 fps swings one to 1.6
+        // frames) was read as a dropped frame and moved the slope 4 %.
+        let spread = d
+            .iter()
+            .filter(|x| **x < 1.5 * coarse)
+            .map(|x| (x - coarse).abs())
+            .fold(0.0f64, f64::max);
+        let frames: Vec<f64> = d
+            .iter()
+            .map(|&x| if x >= 1.5 * coarse && x - coarse > 2.0 * spread { (x / coarse).round() } else { 1.0 })
+            .collect();
+        let per_frame: Vec<f64> = d.iter().zip(&frames).map(|(x, f)| x / f).collect();
+        let lo = per_frame.iter().copied().fold(f64::INFINITY, f64::min);
+        let hi = per_frame.iter().copied().fold(f64::NEG_INFINITY, f64::max);
         let quantised = millisecond_stamps(&d);
-        // Uneven millisecond steps: their rounding is what the slope
-        // averages out (even ones the windows measure exactly).
-        let (duration, span) = if quantised && hi > lo {
-            // Least squares of the stamps over the frames they are.
-            let mut at = (0.0f64, 0.0f64);
-            let points: Vec<(f64, f64)> = std::iter::once(at)
-                .chain(d.iter().zip(&frames).map(|(x, f)| {
-                    at = (at.0 + f, at.1 + x);
-                    at
-                }))
-                .collect();
-            let m = points.len() as f64;
-            let (kx, ty) = points.iter().fold((0.0, 0.0), |(a, b), (k, t)| (a + k, b + t));
-            let (kx, ty) = (kx / m, ty / m);
-            let (num, den) = points
+        // A steady or periodic cadence (3:2, 2:3:3:2 pulldown; even
+        // millisecond steps): windows of whole cycles measure it exactly.
+        let periodic = (1..=4).any(|p| {
+            per_frame
                 .iter()
-                .fold((0.0, 0.0), |(a, b), (k, t)| (a + (k - kx) * (t - ty), b + (k - kx) * (k - kx)));
-            (num / den, at.1)
-        } else {
+                .zip(per_frame.iter().skip(p))
+                .all(|(a, b)| (a - b).abs() <= (a * CADENCE_FAST_AGREEMENT).max(2.0))
+        });
+        if (quantised && hi <= lo) || (!quantised && periodic) {
             let w = n / CADENCE_WINDOW_UNIT * CADENCE_WINDOW_UNIT;
             let mut windows: Vec<(f64, f64)> = (0..=n - w)
                 .map(|i| {
@@ -614,11 +690,69 @@ impl FrameCadence {
                 })
                 .collect();
             windows.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
-            windows[windows.len() / 2]
-        };
-        let noise = ((hi - lo) / 2.0).max(if quantised { 90.0 } else { 0.0 });
-        let tolerance = (noise / span).clamp(CADENCE_SNAP_TOLERANCE, CADENCE_SNAP_TOLERANCE_MAX);
-        Some((duration, tolerance))
+            let (duration, span) = windows[windows.len() / 2];
+            let tolerance = if quantised { 90.0 / span } else { 0.0 };
+            return Some(Measured::exact(duration, tolerance.max(CADENCE_SNAP_TOLERANCE)));
+        }
+        // Uneven millisecond steps (their rounding) or jittered stamps: the
+        // least-squares slope of the stamps over the frames they are, which
+        // averages both out. Jittered stamps wait for more deltas: a dozen
+        // swing the slope by up to 4 % at ±8 ms.
+        let jittered = !quantised || hi - lo > 90.0;
+        if jittered && n < CADENCE_JITTER_MIN_DELTAS {
+            return None;
+        }
+        let mut at = (0.0f64, 0.0f64);
+        let points: Vec<(f64, f64)> = std::iter::once(at)
+            .chain(d.iter().zip(&frames).map(|(x, f)| {
+                at = (at.0 + f, at.1 + x);
+                at
+            }))
+            .collect();
+        let m = points.len() as f64;
+        let (kx, ty) = points.iter().fold((0.0, 0.0), |(a, b), (k, t)| (a + k, b + t));
+        let (kx, ty) = (kx / m, ty / m);
+        let (num, sxx) = points
+            .iter()
+            .fold((0.0, 0.0), |(a, b), (k, t)| (a + (k - kx) * (t - ty), b + (k - kx) * (k - kx)));
+        let duration = num / sxx;
+        // The slope's standard error, from the stamps' scatter about it or
+        // the per-frame deltas' (each the difference of two stamps' jitter),
+        // whichever says more: a dozen residuals can look quiet by chance.
+        let residual = points
+            .iter()
+            .map(|(k, t)| (t - ty - duration * (k - kx)).powi(2))
+            .sum::<f64>()
+            / (m - 2.0);
+        let mean_frame = per_frame.iter().sum::<f64>() / per_frame.len() as f64;
+        let frame_var = per_frame.iter().map(|x| (x - mean_frame).powi(2)).sum::<f64>()
+            / per_frame.len() as f64
+            / 2.0;
+        let stderr = (residual.max(frame_var) / sxx).sqrt();
+        let mut tolerance = (CADENCE_JITTER_SIGMAS * stderr / duration).max(CADENCE_SNAP_TOLERANCE);
+        if quantised {
+            tolerance = tolerance.max(90.0 / at.1);
+        }
+        if tolerance > CADENCE_SNAP_TOLERANCE_MAX {
+            return None;
+        }
+        Some(Measured { duration, tolerance, standard_only: jittered })
+    }
+}
+
+/// What [`FrameCadence::measure`] found: a mean frame duration (90 kHz),
+/// the relative tolerance the stamps resolve it to, and whether only a
+/// standard rate may be read from it (jittered stamps: a non-standard rate
+/// within their noise is more likely a standard one measured badly).
+struct Measured {
+    duration: f64,
+    tolerance: f64,
+    standard_only: bool,
+}
+
+impl Measured {
+    fn exact(duration: f64, tolerance: f64) -> Self {
+        Self { duration, tolerance, standard_only: false }
     }
 }
 
@@ -2580,24 +2714,68 @@ mod cadence_tests {
         }
     }
 
-    /// Capture timestamps with jitter (a browser's WHIP publish, ±8 ms
-    /// around 30 fps) snap to a standard rate within what the jitter lets
-    /// the window resolve, rather than locking a rate like 29.8 fps.
+    /// Capture timestamps with jitter (a browser's WHIP publish, ±8 ms or
+    /// ±2 ms around 25, 30 or 60 fps): the encoder's rate — the lock's
+    /// **first** answer, which the encoder opens at for good — is the
+    /// source's rate or its 1001 neighbour, never a neighbouring family nor
+    /// a rate like 28.9 fps, and it comes within the 60-frame wait. The
+    /// noise-widened snap used to answer at the first dozen deltas, whose
+    /// endpoint-to-endpoint estimate the jitter moves by up to 4 %, and
+    /// snapped within that: 30 fps ±8 ms locked 90000/3113, 90000/3089 or
+    /// 6000/193 in 3 runs of 20, 25 fps locked 24/1 (and 24 locked 25/1)
+    /// in about 4 %, and 60 fps mostly locked a non-standard rate.
     #[test]
-    fn jittered_timestamps_snap_within_their_noise() {
+    fn jittered_timestamps_lock_their_own_rate_family() {
+        use super::{EncoderRateLock, RateStep};
         let mut seed = 12_345u32;
-        let mut jitter = || {
+        let mut next = move || {
             seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
-            (seed >> 8) as f64 / (1u32 << 24) as f64 * 1_440.0 - 720.0
+            (seed >> 8) as f64 / (1u32 << 24) as f64
         };
-        for _ in 0..20 {
-            let mut m = FrameCadence::new();
-            for k in 0..=32u64 {
-                m.observe(Some((900_000.0 + k as f64 * 3_000.0 + jitter()) as i64));
+        for (rate, neighbour, jitter_ms) in [
+            ((25, 1), (25, 1), 8.0),
+            ((24, 1), (24_000, 1001), 8.0),
+            ((30, 1), (30_000, 1001), 8.0),
+            ((60, 1), (60_000, 1001), 8.0),
+            ((50, 1), (50, 1), 8.0),
+            ((30, 1), (30_000, 1001), 2.0),
+            ((25, 1), (25, 1), 2.0),
+            ((30, 1), (30_000, 1001), 0.5),
+            ((60_000, 1001), (60, 1), 8.0),
+        ] {
+            let step = 90_000.0 * rate.1 as f64 / rate.0 as f64;
+            let j = jitter_ms * 90.0;
+            for run in 0..400 {
+                let mut l = EncoderRateLock::new(false);
+                let mut got = None;
+                for k in 0..200u64 {
+                    let pts = 900_000.0 + k as f64 * step + (next() * 2.0 - 1.0) * j;
+                    if let RateStep::Lock { num, den, measured } = l.observe(Some(pts as i64)) {
+                        got = Some(((num, den), measured, k + 1));
+                        break;
+                    }
+                }
+                let (r, measured, at) = got.unwrap();
+                assert!(measured, "{rate:?} ±{jitter_ms} ms run {run}: fallback at {at}");
+                assert!(r == rate || r == neighbour, "{rate:?} ±{jitter_ms} ms run {run}: locked {r:?} at {at}");
             }
-            let r = m.rate().unwrap();
-            assert!(r == (30, 1) || r == (30_000, 1001), "{r:?}");
         }
+    }
+
+    /// A stamp that jitter put within a millisecond of the one before (40
+    /// ticks, at 60 fps) is a frame, not a discontinuity: it joins the next
+    /// span, which covers two frames, and the cadence stays exact. Dropped
+    /// with its stamp, it took a frame out of the count and the next span
+    /// read as one frame of 2960 ticks.
+    #[test]
+    fn a_stamp_within_a_millisecond_of_the_last_is_a_frame() {
+        let mut m = FrameCadence::new();
+        for k in 0..40u64 {
+            let pts = if k == 20 { 19 * 1_500 + 40 } else { k * 1_500 };
+            m.observe(Some(900_000 + pts as i64));
+        }
+        assert_eq!(m.frame_duration_90k(), Some(1_500.0));
+        assert_eq!(m.rate(), Some((60, 1)));
     }
 
     /// A rate no standard is within 0.1 % of is reported as measured.
