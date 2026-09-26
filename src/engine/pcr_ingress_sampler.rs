@@ -489,13 +489,73 @@ const PLL_PID_SILENCE_US: u64 = 1_000_000;
 /// for the discontinuity watch, and the media player's and `wire_emit`'s
 /// anchor-PID rule avoid for pacing. The first PID to carry a PCR is
 /// followed, like theirs; another takes over only after it has been silent
-/// for [`PLL_PID_SILENCE_US`].
+/// for [`PLL_PID_SILENCE_US`] — or at once when the PMT that named the
+/// followed PID as its PCR_PID names another ([`Self::pmt`]).
 #[derive(Debug, Default)]
 struct PllPcrPid {
     followed: Option<(u16, u64)>,
+    /// The PMT PIDs of the last PAT, and each program's PCR_PID as its PMT
+    /// last named it.
+    pmt_pids: Vec<u16>,
+    pcr_pid_of: Vec<(u16, u16)>,
 }
 
 impl PllPcrPid {
+    /// A PAT or a PMT went by: learn the PMT PIDs, and each program's
+    /// PCR_PID. Returns `true` when that moved the PLL to another PID.
+    fn psi(&mut self, pkt: &[u8], recv_us: u64) -> bool {
+        if !ts_pusi(pkt) {
+            return false;
+        }
+        let pid = ts_pid(pkt);
+        if pid == 0 {
+            let programs = crate::engine::ts_parse::parse_pat_programs(pkt);
+            if !programs.is_empty() {
+                self.pmt_pids = programs.iter().map(|(_, p)| *p).collect();
+            }
+            return false;
+        }
+        if !self.pmt_pids.contains(&pid) {
+            return false;
+        }
+        let Some(sec) = crate::engine::ts_parse::find_section_in_packet(pkt, 0x02, None) else {
+            return false;
+        };
+        if !sec.complete || !crate::engine::ts_parse::verify_psi_crc(pkt, sec.start) {
+            return false;
+        }
+        let at = sec.start;
+        let program = u16::from_be_bytes([pkt[at + 3], pkt[at + 4]]);
+        let pcr_pid = ((pkt[at + 8] as u16 & 0x1F) << 8) | pkt[at + 9] as u16;
+        self.pmt(program, pcr_pid, recv_us)
+    }
+
+    /// `program`'s PMT names `pcr_pid` as its PCR_PID. When it named the
+    /// followed PID before and names another now, the PLL follows the new
+    /// one at once (returns `true`): the programme's clock moved PID
+    /// deliberately. `TsMuxer::change_has_video` does exactly that when an
+    /// RTMP or WHIP publish flips between audio-only and A/V — the PCR goes
+    /// from the audio PID to the video PID or back, the PMT's version bumped
+    /// ahead of it — and the old PID then carries no PCR: waiting out
+    /// [`PLL_PID_SILENCE_US`] for it left the PLL a second without a
+    /// sample at every flip.
+    fn pmt(&mut self, program: u16, pcr_pid: u16, recv_us: u64) -> bool {
+        let before = match self.pcr_pid_of.iter_mut().find(|(p, _)| *p == program) {
+            Some(e) => Some(std::mem::replace(&mut e.1, pcr_pid)),
+            None => {
+                self.pcr_pid_of.push((program, pcr_pid));
+                None
+            }
+        };
+        match self.followed {
+            Some((f, _)) if before == Some(f) && pcr_pid != f && pcr_pid != 0x1FFF => {
+                self.followed = Some((pcr_pid, recv_us));
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// A PCR on `pid` received at `recv_us`: `(feeds the PLL, the PLL moved
     /// to this PID from another)`.
     fn admit(&mut self, pid: u16, recv_us: u64) -> (bool, bool) {
@@ -564,6 +624,11 @@ fn sample_packet(
     while i + TS_PACKET_SIZE <= payload.len() {
         let ts_pkt = &payload[i..i + TS_PACKET_SIZE];
         if ts_pkt[0] == TS_SYNC_BYTE {
+            if follow.psi(ts_pkt, recv_time_us) {
+                // The programme's PMT moved its PCR to another PID: the
+                // new PID's values may sit a few ms off the old one's.
+                master.reset_anchor();
+            }
             if let Some(pcr_27mhz) = extract_pcr(ts_pkt) {
                 let (feeds, moved) = follow.admit(ts_pid(ts_pkt), recv_time_us);
                 if moved {
@@ -741,6 +806,64 @@ mod tests {
         assert_eq!(f.admit(0x4B1, 900_000), (false, false), "0x515 spoke 870 ms ago");
         assert_eq!(f.admit(0x4B1, 1_030_001), (true, true), "silent for a second: handed over");
         assert_eq!(f.admit(0x515, 1_040_000), (false, false));
+    }
+
+    /// An RTMP / WHIP publish that flips between audio-only and A/V has its
+    /// muxer move the PCR between the audio and the video PID
+    /// (`TsMuxer::change_has_video`, the PMT version bumped ahead of it).
+    /// The PLL follows the PMT's new PCR_PID at once; it used to wait for a
+    /// second without a PCR on the old one, with no sample in between.
+    #[test]
+    fn a_pmt_that_moves_the_pcr_moves_the_pll_at_once() {
+        use crate::engine::rtmp::ts_mux::TsMuxer;
+        let master = Arc::new(SourcePcrPllMaster::new("test"));
+        let mut follow = PllPcrPid::default();
+        let mut mux = TsMuxer::new();
+        mux.set_audio_stream(0x06, Some(*b"Opus"));
+        mux.set_has_audio(true);
+        mux.set_has_video(false);
+        let feed = |chunks: Vec<Bytes>, us: u64, follow: &mut PllPcrPid| {
+            for data in chunks {
+                let pkt = RtpPacket {
+                    data,
+                    sequence_number: 0,
+                    rtp_timestamp: 0,
+                    recv_time_us: us,
+                    is_raw_ts: true,
+                    upstream_seq: None,
+                    upstream_leg_id: None,
+                    sender_timestamp_us: None,
+                };
+                sample_packet(&master, &pkt, follow);
+            }
+        };
+        let followed = |f: &PllPcrPid| f.followed.map(|(p, _)| p);
+        let mut us = 1_000_000u64;
+        let mut pts = 900_000u64;
+        for _ in 0..50 {
+            feed(mux.mux_audio_opus(&[0xFC; 80], pts), us, &mut follow);
+            (us, pts) = (us + 20_000, pts + 1_800);
+        }
+        assert_eq!(followed(&follow), Some(0x0101), "audio-only: the PCR rides the audio");
+        // Video arrives: the muxer moves the PCR to the video PID.
+        assert!(mux.change_has_video(true));
+        feed(mux.mux_video(&[0, 0, 0, 1, 0x65, 0x88], pts, pts, true), us, &mut follow);
+        assert_eq!(followed(&follow), Some(0x0100), "followed from the new PMT, not a second later");
+        assert_eq!(follow.followed.map(|(_, at)| at), Some(us), "and fed");
+        for _ in 0..10 {
+            (us, pts) = (us + 40_000, pts + 3_600);
+            feed(mux.mux_video(&[0, 0, 0, 1, 0x41, 0x9A], pts, pts, false), us, &mut follow);
+            feed(mux.mux_audio_opus(&[0xFC; 80], pts), us, &mut follow);
+        }
+        // And back to audio-only.
+        assert!(mux.change_has_video(false));
+        (us, pts) = (us + 20_000, pts + 1_800);
+        feed(mux.mux_audio_opus(&[0xFC; 80], pts), us, &mut follow);
+        assert_eq!(followed(&follow), Some(0x0101));
+        // Another program's PMT naming another PCR_PID moves nothing.
+        assert!(!follow.pmt(7, 0x0700, us));
+        assert!(!follow.pmt(7, 0x0701, us));
+        assert_eq!(followed(&follow), Some(0x0101));
     }
 
     /// Fed every program's PCR, the PLL read the inter-program skew as a

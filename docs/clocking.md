@@ -721,8 +721,16 @@ PID — the first to carry a PCR, the anchor-PID rule the media player's
 pacing and `wire_emit` already use — and hands over to another only after
 the followed PID has carried no PCR for 1 s of receive time (an input
 switch to a stream whose PCR rides another PID), re-anchoring the PLL
-there. Pinned by `the_pll_follows_one_pcr_pid` and
-`an_mpts_feeds_the_pll_one_programs_clock`.
+there — or at once, re-anchoring too, when the PMT that named the followed
+PID as its PCR_PID names another. That is a deliberate move of one
+programme's clock: `TsMuxer::change_has_video` makes it whenever an RTMP or
+WHIP publish flips between audio-only and A/V (the PCR goes from the audio
+PID to the video PID or back, behind a PMT version bump), and waiting out
+the silence rule left the PLL without a sample for a second at every flip.
+The sampler reads the PAT and each complete, CRC-valid single-packet PMT
+section for this; a PMT spanning packets names nothing to it. Pinned by
+`the_pll_follows_one_pcr_pid`, `an_mpts_feeds_the_pll_one_programs_clock`
+and `a_pmt_that_moves_the_pcr_moves_the_pll_at_once`.
 
 ### No PCR before the PAT
 
@@ -764,7 +772,7 @@ packets) went missing until the PID's next PES start — a PCR step past
 |--------|--------------|
 | `engine/master_clock.rs` | The `MasterClock` trait, `MasterClockKind` enum, `MasterClockHandle` (Arc + tag + clamped lipsync trim), `WallclockMaster`, `SourcePcrPllMaster`, `PtpMasterClock`, and the auto-select policy |
 | `engine/pcr_pll.rs` | Software PI-controller PLL recovering source's 27 MHz from incoming PCR samples. PI loop on `(Δpcr_ticks, Δwall_ns)` with re-anchor on every accepted sample. Discontinuity filter mirrors `pcr_trust.rs` (gaps > 500 ms reset the anchor). Sticky lock-state hysteresis (enter at p99 < 100 µs, exit at > 500 µs). `now_27mhz(wall_ns)` projects forward from the anchor at the recovered rate so PCR generation never quantises to the ingress PCR cadence. |
-| `engine/pcr_ingress_sampler.rs` | Per-flow ingress PCR sampler. Sibling broadcast subscriber (drop-on-Lagged) that scans every `RtpPacket` for adaptation-field PCRs and feeds the master's PLL — those of one PCR PID (`PllPcrPid`: the first to carry one; another after 1 s of silence on it). Handles both raw TS and RTP-wrapped TS via best-effort RTP header skip. Passive observer — never blocks the data path. |
+| `engine/pcr_ingress_sampler.rs` | Per-flow ingress PCR sampler. Sibling broadcast subscriber (drop-on-Lagged) that scans every `RtpPacket` for adaptation-field PCRs and feeds the master's PLL — those of one PCR PID (`PllPcrPid`: the first to carry one; another after 1 s of silence on it, or at once when the PMT that named it names another). Handles both raw TS and RTP-wrapped TS via best-effort RTP header skip. Passive observer — never blocks the data path. |
 | `engine/av_sync_mux.rs` | `AvSyncPacer` — thin wrapper around `MasterClockHandle` that exposes `is_locked()`, the lipsync trim, the `assembler_owned` hand-off, and `pcr_27mhz_for_emit()` (master_now − PCR_PREROLL_27MHZ, modular-aware); that last one is `#[allow(dead_code)]`, called only from tests, and on no production path. It generates no PCR: the transcoded path's old `pcr_for_emit` (`pts × 300 − preroll`) is gone. |
 | `engine/ts_pcr_remux.rs` | The trailing PCR stage of every transcode chain: output PCR = input PCR − a measured transcode delay, the lateness guard, epochs, stale-frame drop, PCR synthesis when the input has none. See [Transcoded output PCR](#transcoded-output-pcr-the-remux-model). |
 | `engine/ts_pts_rewriter.rs` | Encoder-style byte-level PES PTS/DTS rewriter, per-PID anchor + source-delta model. Plugs into `input_post_process::InputPostProcess` as a fourth optional stage; on by default (muxer mode) unless per-input `passthrough_clock: true` opts out, plus an attached `AvSyncPacer`. See the "Encoder-style PES PTS regeneration" section above for the model. |
