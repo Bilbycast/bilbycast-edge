@@ -38,6 +38,7 @@ mod segmenter;
 // encoding rather than duplicating them, so it exists only when `replay` does.
 #[cfg(feature = "replay")]
 mod thumbnails;
+mod timeline;
 mod upload;
 
 use std::collections::{HashMap, VecDeque};
@@ -864,6 +865,17 @@ struct CmafState {
     /// (MP2 / AC-3 / E-AC-3). Opened on first `OtherAudio`.
     #[cfg(feature = "media-codecs")]
     ff_audio_decoder: Option<video_engine::AudioDecoder>,
+    /// The output's own media timeline (`timeline`): every source
+    /// timestamp goes through it before anything else sees it, so a source
+    /// that jumps is published as one continuous timeline.
+    timeline: timeline::CmafTimeline,
+    /// The newest audio timestamp buffered for the segmenter. A frame at or
+    /// before it — audio returning from an excursion over what was already
+    /// published — is dropped rather than given a zero duration.
+    last_audio_buffered_90k: Option<u64>,
+    /// Source jumps absorbed by `timeline`, and when the last was logged.
+    timeline_jumps: u64,
+    timeline_jump_logged: Option<std::time::Instant>,
     /// An MPEG-2 video source with no `video_encode` has been reported.
     mpeg2_warned: bool,
 }
@@ -1315,8 +1327,36 @@ impl CmafState {
             cenc: None,
             #[cfg(feature = "media-codecs")]
             ff_audio_decoder: None,
+            timeline: timeline::CmafTimeline::default(),
+            last_audio_buffered_90k: None,
+            timeline_jumps: 0,
+            timeline_jump_logged: None,
             mpeg2_warned: false,
         }
+    }
+
+    /// A source timestamp of `track` on this output's timeline
+    /// (`timeline::CmafTimeline`), logging a jump it absorbed — the first,
+    /// then at most one a minute with the count since.
+    fn map_timestamp(&mut self, track: timeline::Track, pts: u64, output_id: &str) -> u64 {
+        let mapped = self.timeline.map(track, pts);
+        if let Some(jump) = mapped.jump {
+            self.timeline_jumps += 1;
+            let due = self
+                .timeline_jump_logged
+                .is_none_or(|t| t.elapsed() >= std::time::Duration::from_secs(60));
+            if due {
+                self.timeline_jump_logged = Some(std::time::Instant::now());
+                tracing::info!(
+                    output_id,
+                    track = ?track,
+                    jump_s = jump as f64 / 90_000.0,
+                    jumps = self.timeline_jumps,
+                    "CMAF output: the source's timestamps jumped; the output timeline continues across it"
+                );
+            }
+        }
+        mapped.ts
     }
 
     /// The `#EXT-X-TARGETDURATION` to publish for `entries`, never below one
@@ -1802,6 +1842,39 @@ async fn handle_frame(
     flow_id: &str,
     recv_time_us: u64,
 ) {
+    // Every source timestamp onto the output's own timeline first
+    // (`timeline`): a source that jumps is published as one timeline, where
+    // the jump used to become a sample hours long. A picture whose PES
+    // carried no PTS keeps its 0 and its flag, for the re-encoder to stamp.
+    let frame = match frame {
+        DemuxedFrame::H264 { nalus, pts, is_keyframe, pts_known } => DemuxedFrame::H264 {
+            pts: if pts_known { state.map_timestamp(timeline::Track::Video, pts, &config.id) } else { pts },
+            nalus,
+            is_keyframe,
+            pts_known,
+        },
+        DemuxedFrame::H265 { nalus, pts, is_keyframe, pts_known } => DemuxedFrame::H265 {
+            pts: if pts_known { state.map_timestamp(timeline::Track::Video, pts, &config.id) } else { pts },
+            nalus,
+            is_keyframe,
+            pts_known,
+        },
+        DemuxedFrame::Aac { data, pts } => {
+            DemuxedFrame::Aac { pts: state.map_timestamp(timeline::Track::Audio, pts, &config.id), data }
+        }
+        DemuxedFrame::OtherAudio { stream_type, data, pts } => DemuxedFrame::OtherAudio {
+            pts: state.map_timestamp(timeline::Track::Audio, pts, &config.id),
+            stream_type,
+            data,
+        },
+        DemuxedFrame::Mpeg2 { es, pts, is_keyframe, pts_known } => DemuxedFrame::Mpeg2 {
+            pts: if pts_known { state.map_timestamp(timeline::Track::Video, pts, &config.id) } else { pts },
+            es,
+            is_keyframe,
+            pts_known,
+        },
+        other => other,
+    };
     match frame {
         DemuxedFrame::H264 { nalus, pts, is_keyframe, pts_known } => {
             handle_video(
@@ -2519,6 +2592,16 @@ fn buffer_audio_frames<I: IntoIterator<Item = (Vec<u8>, u64)>>(
     };
     let mut shed_90k = 0u64;
     for (data, pts) in frames {
+        // Audio at or before what is already buffered — a source coming
+        // back over audio it sent from an excursion (`timeline`) — would
+        // be a zero-duration sample: dropped, and the track stays monotonic.
+        if state
+            .last_audio_buffered_90k
+            .is_some_and(|last| (pts.wrapping_sub(last) & ((1 << 33) - 1)) >= 1 << 32 || pts == last)
+        {
+            continue;
+        }
+        state.last_audio_buffered_90k = Some(pts);
         if let Some(dropped) = seg.push(&data, pts) {
             shed_90k += dropped.duration_90k;
         }
