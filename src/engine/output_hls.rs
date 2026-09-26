@@ -768,6 +768,7 @@ impl HlsAudioChain {
     let mut program: Option<(u16, bool)> = None; // (program_number, pid_shared)
     let mut audio_pid: Option<u16> = None;
     let mut audio_stream_type: u8 = 0;
+    let mut pcr_pid: Option<u16> = None;
     let mut pmt_asm = super::ts_parse::SectionAssembler::new();
 
     let mut offset = 0;
@@ -799,6 +800,7 @@ impl HlsAudioChain {
             {
                 audio_pid = Some(apid);
                 audio_stream_type = ast;
+                pcr_pid = Some(view.pcr_pid);
             }
         }
 
@@ -832,6 +834,9 @@ impl HlsAudioChain {
         }
         self.ff_decoder = None;
         self.running_pts = None;
+        // The encoder (if one is running) re-anchors on the first frame
+        // decoded from the new source: `submit` sees no anchor and a
+        // running encoder.
         self.in_anchor = None;
     }
 
@@ -959,6 +964,23 @@ impl HlsAudioChain {
         let pid = ts_pid(pkt);
 
         if pid == audio_pid {
+            // The program's PCR riding the audio PID (radio, or a PCR_PID
+            // that is the audio's) stays where it was, adaptation-field
+            // only, with the CC of the audio payload packet before it: the
+            // re-encoded packets carry none, and dropping the source's
+            // left the segment without a PCR at all.
+            if Some(pid) == pcr_pid
+                && (super::ts_parse::extract_pcr(pkt).is_some()
+                    || super::ts_parse::ts_discontinuity_indicator(pkt))
+            {
+                let mut af = [0u8; TS_PACKET_SIZE];
+                af.copy_from_slice(pkt);
+                let has_payload = ts_has_payload(&af);
+                if !has_payload || super::ts_parse::strip_to_af_only(&mut af) {
+                    af[3] = (af[3] & 0xF0) | (audio_cc.wrapping_sub(1) & 0x0F);
+                    output.extend_from_slice(&af);
+                }
+            }
             // Replace first audio packet position with re-encoded audio
             if !last_audio_position {
                 last_audio_position = true;
@@ -1092,7 +1114,8 @@ impl HlsAudioChain {
         if n == 0 || frame.sample_rate == 0 {
             return Ok(());
         }
-        if self.encoder.is_none() {
+        let fresh = self.encoder.is_none();
+        if fresh {
             let (sr, ch) = self.stage.prepare(frame.sample_rate, frame.planar.len() as u8)?;
             let params = super::audio_encode::EncoderParams {
                 codec: self.codec,
@@ -1136,7 +1159,13 @@ impl HlsAudioChain {
             .map(|a| a + self.in_samples * 90_000 / self.in_rate.max(1) as u64);
         let enc = self.encoder.as_mut().expect("built above");
         if expected.is_none_or(|x| x.abs_diff(frame.pts) > HLS_SOURCE_PTS_SLACK_90K) {
-            if self.in_anchor.is_some() {
+            // A running encoder re-anchors — also when the source's audio
+            // PID or codec changed, which clears `in_anchor`: keyed on the
+            // anchor alone, that case kept the old source's timeline for
+            // the rest of the flow (every frame after matched the new
+            // anchor, so nothing ever re-anchored). Only an encoder just
+            // built anchors on its first frame by itself.
+            if !fresh {
                 tracing::debug!(
                     "HLS output '{}': audio source PTS {} is not where the encoder's input is \
                      ({expected:?}); re-anchoring",
@@ -2000,6 +2029,89 @@ mod pmt_remux_tests {
         // Its second of audio at 48 kHz, plus the first segment's tail from
         // the delay line, less this one's.
         assert!((samples as i64 - 48_000).abs() <= 4 * 1024, "{samples} samples");
+    }
+
+    /// A segment (PAT, PMT naming `pcr_pid`: H.264 0x100 + AAC on `apid`)
+    /// carrying `aus`, one PES each, and an adaptation-field-only PCR on
+    /// `pcr_pid` ahead of each PES from `pcrs` (the PES's PTS less 100 ms).
+    fn aac_segment_on(apid: u16, pcr_pid: u16, aus: &[(Vec<u8>, u64)], pcrs: bool) -> Vec<u8> {
+        let pmt = pmt_section(1, 0, pcr_pid, &[], &[(0x1B, 0x100, &[]), (0x0F, apid, &[])]);
+        let mut seg = pat_packet(&[(1, 0x1000)], 0, 0).to_vec();
+        seg.extend_from_slice(&packetize_sections(0x1000, &[&pmt], 0)[0]);
+        let mut cc = 0u8;
+        for (au, pts) in aus {
+            if pcrs {
+                seg.extend_from_slice(&crate::engine::ts_parse::pcr_only_packet(
+                    pcr_pid,
+                    cc.wrapping_sub(1) & 0x0F,
+                    (pts - 9_000) * 300,
+                    false,
+                ));
+            }
+            seg.extend(crate::engine::ts_test_fixtures::pes_packets(apid, 0xC0, au, *pts, &mut cc));
+        }
+        seg
+    }
+
+    /// PES PTS on `pid` in `out`, in order.
+    fn pes_pts_on(out: &[u8], pid: u16) -> Vec<u64> {
+        out.chunks(188)
+            .filter(|p| crate::engine::ts_parse::ts_pid(p) == pid && crate::engine::ts_parse::ts_pusi(p))
+            .filter_map(crate::engine::ts_parse::extract_pes_pts)
+            .collect()
+    }
+
+    /// A later segment whose audio moved to another PID on another clock
+    /// (an input switch) is re-encoded on the new source's PTS. The chain
+    /// cleared its anchor on the change but re-anchored only when it had
+    /// one, so the running encoder went on stamping the old source's
+    /// timeline — 15 minutes off the new video here — for good.
+    #[test]
+    fn a_new_audio_source_re_anchors_the_running_encoder() {
+        let mut c = chain(AudioCodec::AacLc, 128, None, None, None);
+        c.remux(&aac_segment_on(0x101, 0x100, &aac_frames(48_000, 2, 0.5, 900_000), false)).unwrap();
+        let base = 90_000_000u64;
+        let out = c.remux(&aac_segment_on(0x102, 0x100, &aac_frames(48_000, 2, 1.0, base), false)).unwrap();
+        let pts = pes_pts_on(&out, 0x102);
+        assert!(!pts.is_empty());
+        let last = *pts.last().unwrap();
+        assert!(
+            (base..base + 90_000).contains(&last),
+            "the new source's timeline: last PTS {last}, source {base}..{}",
+            base + 90_000
+        );
+    }
+
+    /// A PCR riding the audio PID survives the audio re-encode, value
+    /// unchanged, adaptation-field-only: the segment kept no PCR at all.
+    #[test]
+    fn a_pcr_on_the_audio_pid_survives_the_re_encode() {
+        let aus = aac_frames(48_000, 2, 0.5, 900_000);
+        let seg = aac_segment_on(0x101, 0x101, &aus, true);
+        let src: Vec<u64> = seg.chunks(188).filter_map(crate::engine::ts_parse::extract_pcr).collect();
+        assert!(src.len() > 20);
+        let out = remux_ts_audio_inprocess(&seg, AudioCodec::AacLc, 128, None, None, None).unwrap();
+        let mut last_cc: Option<u8> = None;
+        let mut pcrs = Vec::new();
+        for p in out.chunks(188) {
+            if crate::engine::ts_parse::ts_pid(p) != 0x101 {
+                continue;
+            }
+            let cc = p[3] & 0x0F;
+            if let Some(v) = crate::engine::ts_parse::extract_pcr(p) {
+                assert_eq!(p[3] & 0x30, 0x20, "adaptation-field-only");
+                if let Some(l) = last_cc {
+                    assert_eq!(cc, l, "the CC of the payload packet before it");
+                }
+                pcrs.push(v);
+            } else {
+                if let Some(l) = last_cc {
+                    assert_eq!(cc, (l + 1) & 0x0F, "payload CC continuous");
+                }
+                last_cc = Some(cc);
+            }
+        }
+        assert_eq!(pcrs, src, "every source PCR, in order");
     }
 
 }
