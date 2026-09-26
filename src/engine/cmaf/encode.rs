@@ -1501,21 +1501,17 @@ mod flush_tests {
     /// An MPEG-2 video source is re-encoded (CMAF carries H.264 / HEVC): its
     /// ES goes to an MPEG-2 decoder as it is, and every picture comes back as
     /// H.264 on its own PTS, the first an IDR carrying its SPS. MPEG-2 used
-    /// to be dropped whatever `video_encode` said. Needs the `ffmpeg` CLI to
-    /// make the source (skipped, and says so, without it).
+    /// to be dropped whatever `video_encode` said.
+    ///
+    /// The source is a vendored 13 kB ES — 40 pictures of `testsrc` at
+    /// 176x144, 25 fps, GOP 12, no B-frames, `-q:v 31` (made with
+    /// `ffmpeg -f lavfi -i testsrc=size=176x144:rate=25 -frames:v 40
+    /// -c:v mpeg2video -g 12 -bf 0 -q:v 31 -f mpeg2video`). It used to be
+    /// made at test time by the `ffmpeg` CLI, and the test passed without
+    /// running wherever that was absent — CI's runner among them.
     #[test]
     fn an_mpeg2_source_is_re_encoded() {
-        let made = std::process::Command::new("ffmpeg")
-            .args([
-                "-v", "error", "-f", "lavfi", "-i", "testsrc=size=176x144:rate=25", "-frames:v", "40",
-                "-c:v", "mpeg2video", "-g", "12", "-bf", "0", "-f", "mpeg2video", "pipe:1",
-            ])
-            .output();
-        let Some(made) = made.ok().filter(|o| o.status.success()) else {
-            eprintln!("an_mpeg2_source_is_re_encoded: no ffmpeg CLI, skipped");
-            return;
-        };
-        let es = made.stdout;
+        let es: &[u8] = include_bytes!("../testdata/mpeg2_176x144_25p_40f.m2v");
         // One access unit per picture: each picture start code (00 00 01 00),
         // with the sequence / GOP headers before it.
         let mut cuts = vec![0usize];
