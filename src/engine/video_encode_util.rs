@@ -712,10 +712,21 @@ impl EncoderRateLock {
 /// hands the frame back. A decoder returns pictures in display order, as
 /// many or as few per access unit as it has, so the access unit being fed
 /// when a frame comes out is not the picture it codes.
+///
+/// An encoder with B-frames hands frames back in decode order (counters 0,
+/// 3, 1, 2, …): each is found by its counter, and an entry
+/// [`ENCODED_PTS_REORDER_WINDOW`] frames behind the counter coming back is
+/// one the encoder dropped. Popping everything up to the echoed counter
+/// took 1 and 2 as dropped when 3 came back, and every B-frame lost its
+/// PTS.
 #[derive(Debug, Default)]
 pub struct EncodedPtsMap {
     in_flight: std::collections::VecDeque<(i64, Option<u64>)>,
 }
+
+/// Frames an encoder may hand a picture back behind the newest one (its
+/// B-frame reordering; `video_encode.bframes` is at most 16).
+pub const ENCODED_PTS_REORDER_WINDOW: i64 = 32;
 
 impl EncodedPtsMap {
     /// A frame stamped `counter` goes to the encoder; `pts` is its decoded
@@ -730,18 +741,18 @@ impl EncodedPtsMap {
     }
 
     /// The source PTS of the frame the encoder handed back stamped
-    /// `counter`. Older entries were frames the encoder dropped.
+    /// `counter`. Entries more than [`ENCODED_PTS_REORDER_WINDOW`] behind it
+    /// were frames the encoder dropped.
     pub fn take(&mut self, counter: i64) -> Option<u64> {
-        while let Some(&(c, pts)) = self.in_flight.front() {
-            if c > counter {
-                break;
-            }
+        while self
+            .in_flight
+            .front()
+            .is_some_and(|(c, _)| *c < counter - ENCODED_PTS_REORDER_WINDOW)
+        {
             self.in_flight.pop_front();
-            if c == counter {
-                return pts;
-            }
         }
-        None
+        let i = self.in_flight.iter().position(|(c, _)| *c == counter)?;
+        self.in_flight.remove(i).and_then(|(_, pts)| pts)
     }
 }
 
@@ -2421,6 +2432,32 @@ mod cadence_tests {
         assert_eq!(meter([5_000; 4], 0).rate(), Some((18, 1)));
         // 0.2 % off 25 fps: not snapped.
         assert_eq!(rate_from_frame_duration(3_608.0), (11_250, 451));
+    }
+}
+
+#[cfg(test)]
+mod encoded_pts_map_tests {
+    use super::EncodedPtsMap;
+
+    /// An encoder with B-frames hands frames back in decode order: each
+    /// still finds its own picture's PTS. A frame the encoder dropped is
+    /// forgotten once the counters have moved well past it.
+    #[test]
+    fn frames_handed_back_in_decode_order_keep_their_pts() {
+        let mut m = EncodedPtsMap::default();
+        for c in 0..9i64 {
+            m.push(c, Some(1_000 + c as u64 * 3_600));
+        }
+        for c in [0i64, 3, 1, 2, 6, 4, 5] {
+            assert_eq!(m.take(c), Some(1_000 + c as u64 * 3_600), "counter {c}");
+        }
+        // 7 never came back; 8 did, and 7 is still held (it may yet)...
+        assert_eq!(m.take(8), Some(1_000 + 8 * 3_600));
+        assert_eq!(m.in_flight.len(), 1);
+        // ...until the encoder is a reorder window past it.
+        m.push(60, None);
+        assert_eq!(m.take(60), None);
+        assert!(m.in_flight.is_empty());
     }
 }
 

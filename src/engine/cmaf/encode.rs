@@ -782,6 +782,22 @@ impl VideoReencoder {
             (Some(n), Some(d)) => (true, (n, d)),
             _ => (false, crate::engine::video_encode_util::RATE_LOCK_FALLBACK),
         };
+        // B-frames are pinned off, as on RTMP: the segmenter takes each
+        // pushed timestamp as the sample's decode time and writes no
+        // composition offsets, so an encoder that reordered (x264 without
+        // `zerolatency`, or any hardware encoder asked for `bframes`) gave
+        // it display-order stamps in decode order — a timeline stepping
+        // back and sample durations of zero.
+        let mut cfg = cfg.clone();
+        if cfg.bframes.unwrap_or(0) != 0 {
+            tracing::warn!(
+                error_code = "cmaf_bframes_unsupported",
+                requested = cfg.bframes.unwrap_or(0),
+                "CMAF output '{output_id}': video_encode.bframes is not supported on the CMAF \
+                 re-encode (its samples carry no composition offsets) — encoding with bframes = 0"
+            );
+            cfg.bframes = Some(0);
+        }
         // CMAF-LL segments are self-contained (DASH/HLS tune-in); SPS/PPS
         // rides in-band on every IDR, so `global_header = false`. An unset
         // GOP is sized to the segment once the rate is known
@@ -1517,6 +1533,58 @@ mod flush_tests {
         let pts: Vec<u64> = out.iter().map(|f| f.pts.unwrap()).collect();
         assert!(pts.windows(2).all(|w| w[1] - w[0] == 3_600), "{pts:?}");
         assert!(out.len() + 8 >= aus.len(), "{} of {} frames", out.len(), aus.len());
+    }
+
+    /// `bframes` on the CMAF re-encode is pinned to 0: with B-frames (x264
+    /// with a tune that honours them) the encoder handed frames back in
+    /// decode order, each B-frame lost its PTS and was stamped with the
+    /// access unit being fed — and the segmenter, which takes a stamp as the
+    /// decode time, saw its timeline step back. Every frame comes back on
+    /// its own picture's PTS, in order.
+    #[test]
+    fn b_frames_are_pinned_off_on_the_cmaf_re_encode() {
+        // A texture panning a pixel a frame, which x264 codes with B-frames
+        // when it may (the plain gradient of `x264_test_source` it does not).
+        let (w, h) = (320usize, 240usize);
+        let mut src = video_engine::VideoEncoder::open(&VideoEncoderConfig {
+            codec: VideoEncoderCodec::X264,
+            width: w as u32,
+            height: h as u32,
+            fps_num: 25,
+            fps_den: 1,
+            gop_size: 50,
+            preset: VideoPreset::Veryfast,
+            global_header: false,
+            ..VideoEncoderConfig::default()
+        })
+        .unwrap();
+        let mut aus = Vec::new();
+        for i in 0..40usize {
+            let y: Vec<u8> = (0..w * h)
+                .map(|k| (((k % w + i) * 7919 + (k / w) * 104_729) % 181) as u8 + 30)
+                .collect();
+            let c = vec![128u8; w / 2 * h / 2];
+            aus.extend(src.encode_frame(&y, w, &c, w / 2, &c, w / 2, Some(i as i64)).unwrap());
+        }
+        aus.extend(src.flush().unwrap());
+        let aus: Vec<(Vec<u8>, u64)> =
+            aus.into_iter().map(|f| (f.data, 900_000 + f.pts as u64 * 3_600)).collect();
+        let cfg: VideoEncodeConfig = serde_json::from_value(serde_json::json!({
+            "codec": "x264", "preset": "veryfast", "tune": "fastdecode", "bframes": 2,
+            "fps_num": 25, "fps_den": 1
+        }))
+        .unwrap();
+        let mut re = VideoReencoder::new(&cfg, "bframe-test", Some(2.0)).unwrap();
+        let mut out = Vec::new();
+        for (au, pts) in &aus {
+            let mut nalus = Vec::new();
+            split_annex_b_to_nalus(au, &mut nalus);
+            out.extend(re.encode_frame(&nalus, *pts, false, CmafVideoCodec::H264).unwrap());
+        }
+        out.extend(re.flush().unwrap());
+        let pts: Vec<u64> = out.iter().map(|f| f.pts.expect("its own picture's PTS")).collect();
+        assert!(pts.len() >= 30, "{} frames", pts.len());
+        assert!(pts.windows(2).all(|w| w[1] == w[0] + 3_600), "{pts:?}");
     }
 
     /// An encoder that buffers (x264 with its lookahead, not `zerolatency`)
