@@ -562,7 +562,22 @@ PCR of a low-frame-rate source, re-latched `D` up to its largest frame gap,
 and past 1 s dropped the frame in flight as stale. On an epoch of more than
 1 s the re-encoded PES still in flight from the previous epoch — closer to
 the old timeline than to the new one — are dropped, their CC renumbered,
-so they neither reach the wire behind the DI nor drive `D`.
+so they neither reach the wire behind the DI nor drive `D`. That holds only
+where the PID's own PES moved with the PCR. The stage watches each
+re-encoded PID's *input* PES ahead of the replacers
+(`TsPcrRemux::observe_input`, called in both the output `transcode_chain`
+and the ingress `InputTranscoder`): when the PID's first PES after the step
+carries straight on from the one before (within 1 s), the PCR stepped alone
+and nothing is stale. That is the shape of an upstream transcode's own `D`
+change — the ingress stage's raise, which the flow's rewriter passes through
+as a named step (below), or a residency lowering — and judged by the PCR
+alone every re-encoded PES for as long as the step was "closer to the old
+timeline": ~1.5 s of re-encoded media dropped on every transcoding output
+behind a deep ingress encoder's first latch (60 MP2 frames, 1.44 s, in
+`transcode_chain::a_pcr_step_from_an_ingress_transcode_drops_no_re_encoded_audio`).
+A step the PID's PES follow (an input switch) still drops the frames in
+flight; until the PID's first PES after the step is seen the old test
+applies.
 
 **No input PCR.** When a re-encoded video PES on the PCR_PID arrives and
 no input PCR has ever been seen — or the video replacer has counted a

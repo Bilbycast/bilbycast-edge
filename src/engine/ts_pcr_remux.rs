@@ -85,7 +85,17 @@
 //! more than 1 s the re-encoded PES still in flight from the previous epoch
 //! are recognised by being closer to the old timeline than to the new one
 //! and are dropped (their continuity counters renumbered), so they neither
-//! reach the wire behind the DI nor drive `D`.
+//! reach the wire behind the DI nor drive `D`. That holds only where the
+//! PID's own PES moved with the PCR: the stage watches each re-encoded
+//! PID's *input* PES ahead of the replacers ([`TsPcrRemux::observe_input`]),
+//! and when its next PES after the step carries straight on from the one
+//! before, the PCR stepped alone and nothing is stale. Such a step is an
+//! upstream transcode's own `D` raise or lowering — an ingress transcode
+//! ahead of this output's, whose muxer-mode rewriter passes the step
+//! through (`TsPtsRewriter::note_upstream_pcr_steps`) — and judged by the
+//! PCR alone it made every re-encoded PES "closer to the old timeline" for
+//! as long as the step, ~1.5 s of re-encoded media dropped behind a deep
+//! ingress encoder's first latch.
 //!
 //! **No input PCR.** When a re-encoded video PES on the PCR_PID arrives and
 //! no input PCR has ever been seen, or the video replacer counted a second
@@ -151,6 +161,8 @@ const MAX_GAPS: usize = 32;
 const GAP_MEMORY_27MHZ: i64 = 2 * MAX_LATENESS_27MHZ;
 /// An epoch jump beyond this makes frames in flight "stale" (see module doc).
 const STALE_EPOCH_27MHZ: i64 = 27_000_000;
+/// Input PCR steps past [`STALE_EPOCH_27MHZ`] remembered by the input watch.
+const INPUT_EPOCHS_KEPT: usize = 8;
 /// Video leads beyond this are off any timeline; the residency cap ignores
 /// them.
 const SANE_27MHZ: i64 = 10 * 27_000_000;
@@ -247,6 +259,23 @@ struct Synth {
     announced: bool,
 }
 
+/// Each re-encoded PID's own PES timeline on the *input*, ahead of the
+/// replacers ([`TsPcrRemux::observe_input`]): whether it moved with a PCR
+/// step past [`STALE_EPOCH_27MHZ`] or went straight on.
+#[derive(Debug, Default)]
+struct InputPesWatch {
+    /// Last input PCR on the PCR PID.
+    last_pcr: Option<u64>,
+    /// `(PID, decode time 90 kHz)` of the last input PES per checked slot.
+    last_ts: [Option<(u16, u64)>; 2],
+    /// Input PCR steps past [`STALE_EPOCH_27MHZ`], newest last: `(the PCR
+    /// after the step, per checked slot whether its PES moved with it)` —
+    /// `Some(false)` when its next PES continued the one before, `Some(true)`
+    /// when it jumped too or there was nothing before it to continue,
+    /// `None` until that PES comes.
+    epochs: std::collections::VecDeque<(u64, [Option<bool>; 2])>,
+}
+
 /// The trailing PCR stage. See the module docs.
 pub struct TsPcrRemux {
     program: Option<u16>,
@@ -279,6 +308,10 @@ pub struct TsPcrRemux {
     pending_di: bool,
     /// Last input PCR of the previous epoch, while stale PES may still come.
     old_epoch_pcr: Option<u64>,
+    /// The input PCR that started that epoch — the key of its entry in
+    /// [`InputPesWatch::epochs`].
+    stale_epoch_at: Option<u64>,
+    input_watch: InputPesWatch,
     /// Largest `DTS − input PCR` of the program's video in the epoch.
     max_video_lead: Option<i64>,
     /// Recent continuous input PCR steps (a ring) — the usual step.
@@ -348,6 +381,8 @@ impl TsPcrRemux {
             pcr_steps: Vec::new(),
             pending_di: false,
             old_epoch_pcr: None,
+            stale_epoch_at: None,
+            input_watch: InputPesWatch::default(),
             max_video_lead: None,
             steps: [0; CADENCE_STEPS],
             steps_len: 0,
@@ -418,6 +453,71 @@ impl TsPcrRemux {
         input_scope: bool,
     ) {
         self.event_sink = Some((sender, id.into(), input_scope));
+    }
+
+    /// The chunk about to go through the replacers, before they re-encode
+    /// it: the input's own PES of each re-encoded PID are watched across an
+    /// input PCR step past [`STALE_EPOCH_27MHZ`], so a step of the PCR alone
+    /// (the PID's next PES carries straight on) makes nothing stale. See
+    /// the module doc's **Epochs**. Called before the replacers on every
+    /// chunk.
+    pub fn observe_input(&mut self, ts: &[u8]) {
+        if !ts.len().is_multiple_of(TS_PACKET_SIZE) {
+            return;
+        }
+        for pkt in ts.chunks_exact(TS_PACKET_SIZE) {
+            if pkt[0] != TS_SYNC_BYTE {
+                continue;
+            }
+            let pid = ts_pid(pkt);
+            let w = &mut self.input_watch;
+            if Some(pid) == self.pcr_pid
+                && let Some(pcr) = extract_pcr(pkt)
+            {
+                if let Some(last) = w.last_pcr
+                    && pcr_diff_27mhz(pcr, last).abs() > STALE_EPOCH_27MHZ
+                {
+                    if w.epochs.len() == INPUT_EPOCHS_KEPT {
+                        w.epochs.pop_front();
+                    }
+                    // Nothing before it to continue: taken as moved.
+                    let slot = |t: Option<(u16, u64)>| t.is_none().then_some(true);
+                    w.epochs.push_back((pcr, [slot(w.last_ts[0]), slot(w.last_ts[1])]));
+                }
+                w.last_pcr = Some(pcr);
+            }
+            let Some(i) = self.checked_index(pid) else {
+                continue;
+            };
+            if !(ts_pusi(pkt) && ts_has_payload(pkt)) {
+                continue;
+            }
+            let Some((_, ts90)) = pes_decode_ts(pkt) else {
+                continue;
+            };
+            let ts90 = ts90 & 0x1_FFFF_FFFF;
+            let w = &mut self.input_watch;
+            // A PES within a second of its PID's previous one carries its
+            // timeline on.
+            let prev = w.last_ts[i].filter(|(p, _)| *p == pid).map(|(_, t)| t);
+            let moved_now =
+                prev.is_none_or(|t| pcr_diff_27mhz(ts90 * 300, t * 300).abs() > STALE_EPOCH_27MHZ);
+            for (_, moved) in w.epochs.iter_mut() {
+                if moved[i].is_none() {
+                    moved[i] = Some(moved_now);
+                }
+            }
+            w.last_ts[i] = Some((pid, ts90));
+        }
+    }
+
+    /// Whether checked slot `i`'s input PES moved with the PCR at the step
+    /// that started the current stale epoch (see [`Self::observe_input`]):
+    /// `None` until its next PES is seen.
+    fn input_pes_moved(&self, i: usize) -> Option<bool> {
+        let at = self.stale_epoch_at?;
+        let (_, moved) = self.input_watch.epochs.iter().rev().find(|(v, _)| *v == at)?;
+        moved[i]
     }
 
     /// The PIDs whose PES the replacers produce (`None` = that stage is
@@ -596,6 +696,7 @@ impl TsPcrRemux {
             c.stale = old.is_some();
         }
         self.old_epoch_pcr = old;
+        self.stale_epoch_at = None;
         self.max_video_lead = None;
         self.max_lateness = None;
         self.lowered_in_epoch = false;
@@ -625,6 +726,7 @@ impl TsPcrRemux {
             if step < 0 || (ts_discontinuity_indicator(pkt) && !self.continues(step)) {
                 let stale = step.abs() > STALE_EPOCH_27MHZ;
                 self.epoch_change(stale.then_some(last));
+                self.stale_epoch_at = stale.then_some(pcr);
                 epoch = true;
             } else {
                 self.note_step(pcr, step);
@@ -695,7 +797,10 @@ impl TsPcrRemux {
             return true;
         };
         if c.stale {
+            // In flight from the old epoch — unless this PID's own input PES
+            // carried straight on across the step: then only the PCR moved.
             if let Some(old) = self.old_epoch_pcr
+                && self.input_pes_moved(i) != Some(false)
                 && pcr_diff_27mhz(dts27, old).abs() < lead.abs()
             {
                 self.stats.stale_frames_dropped.fetch_add(1, Ordering::Relaxed);
@@ -1566,6 +1671,83 @@ mod tests {
         let ccs: Vec<u8> = v.iter().map(|p| ts_cc(p)).collect();
         // The last payload before the switch had CC 19 & 15 = 3.
         assert_eq!(ccs, vec![3, 4, 5]);
+    }
+
+    /// The input PCR steps 1.5 s back (an upstream transcode raising its
+    /// delay: DI, the PES running straight on) or 1.5 s forward (lowering
+    /// it). The re-encoded PID's own input PES, seen ahead of the replacer,
+    /// carry on across it, so the step is the PCR's alone and nothing is
+    /// stale: every frame goes out. Judged by the PCR alone, every frame for
+    /// as long as the step was "closer to the old timeline" and dropped.
+    #[test]
+    fn a_pcr_that_steps_alone_makes_nothing_stale() {
+        for step_ms in [-1_500i64, 1_500] {
+            let mut s = TsPcrRemux::new();
+            let mut src = Src { t: 60 * 27_000_000, cc: 0 };
+            let feed = |s: &mut TsPcrRemux, input: &[u8]| {
+                // The replacer re-encodes in place: its input carries the
+                // PES the stage then sees, at the same times.
+                s.observe_input(input);
+                run(s, input)
+            };
+            feed(&mut s, &psi(V));
+            for k in 0..10u64 {
+                let mut chunk = src.pcr(src.t + k * 40 * MS).to_vec();
+                chunk.extend(src.frame(src.t + k * 40 * MS + 200 * MS));
+                feed(&mut s, &chunk);
+            }
+            let mut frames = 0;
+            let mut out = Vec::new();
+            for k in 10..60u64 {
+                let mut chunk = Vec::new();
+                let t = (src.t + k * 40 * MS).wrapping_add_signed(step_ms * MS as i64);
+                let mut p = src.pcr(t);
+                if k == 10 {
+                    set_discontinuity_indicator(&mut p);
+                }
+                chunk.extend_from_slice(&p);
+                chunk.extend(src.frame(src.t + k * 40 * MS + 200 * MS));
+                frames += 1;
+                out.extend(feed(&mut s, &chunk));
+            }
+            let st = s.stats.snapshot();
+            assert_eq!(st.stale_frames_dropped, 0, "{step_ms}: nothing stale");
+            assert_eq!(st.epochs, 1, "{step_ms}");
+            let kept = out.chunks(TS_PACKET_SIZE).filter(|p| ts_pid(p) == V && ts_pusi(p)).count();
+            assert_eq!(kept, frames, "{step_ms}: every frame out");
+        }
+    }
+
+    /// The same jump as [`an_epoch_jump_drops_stale_frames_without_moving_d`]
+    /// with the input watched: the replacer's input PES move with the PCR
+    /// (a switch to another source), so the frames still in its encoder
+    /// from the old epoch are stale and dropped as before.
+    #[test]
+    fn an_epoch_jump_the_input_pes_follow_still_drops_the_frames_in_flight() {
+        let mut s = TsPcrRemux::new();
+        let mut src = Src { t: 60 * 27_000_000, cc: 0 };
+        for k in 0..10u64 {
+            let mut chunk = if k == 0 { psi(V) } else { Vec::new() };
+            chunk.extend_from_slice(&src.pcr(src.t + k * 40 * MS));
+            chunk.extend(src.frame(src.t + k * 40 * MS + 200 * MS));
+            s.observe_input(&chunk);
+            run(&mut s, &chunk);
+        }
+        let t1 = src.t - 5_000 * MS;
+        let mut p = src.pcr(t1);
+        set_discontinuity_indicator(&mut p);
+        // What reached the replacer: the PCR, then the new source's PES.
+        let mut seen = p.to_vec();
+        seen.extend(Src { t: 0, cc: 4 }.frame(t1 + 240 * MS));
+        s.observe_input(&seen);
+        // What leaves it: two frames of the old epoch, then a new one.
+        let mut input = p.to_vec();
+        input.extend(src.frame(src.t + 10 * 40 * MS + 200 * MS));
+        input.extend(src.frame(src.t + 11 * 40 * MS + 200 * MS));
+        input.extend(src.frame(t1 + 200 * MS));
+        run(&mut s, &input);
+        assert_eq!(s.stats.stale_frames_dropped.load(Ordering::Relaxed), 2);
+        assert_eq!(s.offset_27mhz(), 80 * MS, "stale frames never drive D");
     }
 
     #[test]

@@ -1584,7 +1584,13 @@ bridged any backward step past 500 ms as a source discontinuity, and a deep
 encoder pipeline's first latch (D = lateness + 80 ms, over a second behind
 x264's or a hardware encoder's lookahead) moved every PES on the flow on by
 the step instead — a forward jump in the passthrough audio on every
-output.
+output. An output that re-encodes again behind such a step (its own audio
+or video transcode), or the next edge's ingress transcode fed the flow over
+SRT, sees a PCR step of more than a second with DI and every PES running
+straight on; its PCR stage watches its input PES ahead of its replacers
+and takes that for the PCR's step alone, so no re-encoded frame is dropped
+as stale — it used to drop ~1.5 s of them (see
+[`clocking.md`](clocking.md#transcoded-output-pcr-the-remux-model)).
 
 **Behaviour change.** Output PCR used to be `video PTS × 300 − 80 ms`,
 floored on a decaying audio lag: a clock that ran ~15 500 ppm fast against

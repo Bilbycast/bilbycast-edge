@@ -564,6 +564,12 @@ fn run_chain(
             }
         };
 
+        // The PCR stage sees the input's own PES ahead of the replacers:
+        // an input PCR step they carry straight on across is the PCR's
+        // alone (an upstream transcode's delay change) and makes nothing
+        // stale (`TsPcrRemux::observe_input`).
+        pcr.observe_input(&input);
+
         // Audio replace (if configured) — otherwise pass through.
         let after_audio: &[u8] = if let Some(ref mut a) = audio {
             after_audio_scratch.clear();
@@ -684,6 +690,188 @@ mod tests {
         assert_eq!(ae.target_bitrate_kbps, 192, "the codec default");
         assert_eq!(ae.timeline_corrections, 0);
         drop(chain);
+    }
+
+    /// MP2 audio at 48 kHz: 1 152-sample frames, 2 160 ticks each.
+    #[cfg(feature = "media-codecs")]
+    const MP2_FRAME_90K: u64 = 2_160;
+
+    /// A flow as an ingress transcode leaves it when a deep video encoder's
+    /// first frame came 1.5 s late: the ingress PCR stage raises its delay
+    /// and the flow's PCR steps ~1.46 s back with DI while every PES runs
+    /// straight on (the ingress rewriter passes the step through,
+    /// `TsPtsRewriter::note_upstream_pcr_steps`). 4 s of MP2 on PID 0x101,
+    /// its PCR on the video PID 0x100; chunk by chunk, and the MP2 frames.
+    #[cfg(feature = "media-codecs")]
+    fn a_flow_behind_an_ingress_pcr_step() -> (Vec<Vec<u8>>, usize) {
+        use crate::engine::av_sync_mux::AvSyncPacer;
+        use crate::engine::master_clock::{MasterClockHandle, MasterClockKind, WallclockMaster};
+        use crate::engine::ts_parse::pcr_only_packet;
+        use crate::engine::ts_test_fixtures::pes_start_packet;
+        const V: u16 = 0x100;
+        const A: u16 = 0x101;
+        const MS: u64 = 27_000;
+        let mut enc = video_engine::AudioEncoder::open(&video_codec::AudioEncoderConfig {
+            codec: video_codec::AudioCodecType::Mp2,
+            sample_rate: 48_000,
+            channels: 2,
+            bitrate_kbps: 192,
+        })
+        .unwrap();
+        let fs = enc.frame_size();
+        assert_eq!(fs as u64 * 90_000 / 48_000, MP2_FRAME_90K);
+        let mut frames = Vec::new();
+        for k in 0..4 * 48_000 / fs {
+            let pcm: Vec<f32> = (0..fs).map(|i| ((k * fs + i) as f32 * 0.0625).sin() * 0.25).collect();
+            for f in enc.encode_frame(&[pcm.clone(), pcm]).unwrap() {
+                frames.push(f.data.to_vec());
+            }
+        }
+        // The ingress chain's input: a PCR every 40 ms on the video PID, its
+        // re-encoded video 50 ms ahead of it — frame 30 1.5 s late — and the
+        // MP2 100 ms ahead.
+        let mut mux = crate::engine::rtmp::ts_mux::TsMuxer::new();
+        mux.set_pids(None, Some(V), Some(A), Some(V));
+        mux.set_has_audio(true);
+        mux.set_audio_stream(0x03, None);
+        let t0 = 900_000_000u64;
+        let a0 = t0 / 300 + 9_000;
+        let (mut next, mut vcc) = (0usize, 0u8);
+        // The ingress chain: its PCR stage (reporting its own steps), then
+        // the flow's muxer-mode rewriter.
+        let mut remux = TsPcrRemux::new();
+        remux.report_pcr_steps();
+        let pacer = Arc::new(AvSyncPacer::new(MasterClockHandle::new(
+            Arc::new(WallclockMaster::new()),
+            MasterClockKind::Wallclock,
+        )));
+        let mut rewriter = crate::engine::ts_pts_rewriter::TsPtsRewriter::new(pacer);
+        let mut flow = Vec::new();
+        for k in 0..100u64 {
+            let t = t0 + k * 40 * MS;
+            let mut c = pcr_only_packet(V, vcc.wrapping_sub(1) & 0x0F, t, false).to_vec();
+            let vdts = (if k == 30 { t - 1_500 * MS } else { t + 50 * MS }) / 300;
+            c.extend_from_slice(&pes_start_packet(V, vcc, 0xE0, vdts, Some(vdts)));
+            vcc = (vcc + 1) & 0x0F;
+            while next < frames.len() && a0 + next as u64 * MP2_FRAME_90K <= t / 300 + 9_000 {
+                for p in mux.mux_audio_pre_adts(&frames[next], a0 + next as u64 * MP2_FRAME_90K) {
+                    c.extend_from_slice(&p);
+                }
+                next += 1;
+            }
+            remux.set_replaced_pids(None, Some(V));
+            let mut mid = Vec::new();
+            remux.process(&c, &mut mid);
+            rewriter.note_upstream_pcr_steps(remux.take_pcr_steps());
+            let mut out = Vec::new();
+            rewriter.process(&mid, &mut out);
+            if !out.is_empty() {
+                flow.push(out);
+            }
+        }
+        assert!(remux.offset_27mhz() > 1_500 * MS, "the ingress raised its delay past a second");
+        (flow, next)
+    }
+
+    /// Every re-encoded MP2 frame of `frames` in `wire`, one after another.
+    #[cfg(feature = "media-codecs")]
+    fn assert_all_mp2_out(wire: &[u8], frames: usize) {
+        use crate::engine::ts_parse::{extract_pes_pts, ts_pid, ts_pusi, TS_PACKET_SIZE};
+        let pts: Vec<u64> = wire
+            .chunks(TS_PACKET_SIZE)
+            .filter(|p| ts_pid(p) == 0x101 && ts_pusi(p))
+            .filter_map(extract_pes_pts)
+            .collect();
+        assert!(pts.len() + 4 >= frames, "{} of {frames} frames out", pts.len());
+        for w in pts.windows(2) {
+            let d = (w[1] + (1 << 33) - w[0]) % (1 << 33);
+            assert!(d <= 2 * MP2_FRAME_90K, "a {d}-tick gap in the re-encoded audio");
+        }
+    }
+
+    #[cfg(feature = "media-codecs")]
+    fn mp2_config() -> AudioEncodeConfig {
+        AudioEncodeConfig {
+            codec: "mp2".to_string(),
+            bitrate_kbps: None,
+            sample_rate: Some(48_000),
+            channels: None,
+            silent_fallback: false,
+            source_audio_pid: None,
+            opus_vbr_mode: None,
+            opus_fec: false,
+            opus_dtx: false,
+            opus_frame_duration_ms: None,
+            ts_signalling: None,
+        }
+    }
+
+    /// An output that re-encodes the audio of that flow keeps every frame
+    /// across the step: its PCR stage watches the audio ahead of the
+    /// replacer (`TsPcrRemux::observe_input`) and takes the step for the
+    /// PCR's alone. Taken for an epoch of more than a second, every
+    /// re-encoded frame for as long as the step was "closer to the old
+    /// timeline" and dropped — 60 frames, 1.44 s of audio, on every
+    /// transcoding output, at flow start and at any later raise past a
+    /// second.
+    #[cfg(feature = "media-codecs")]
+    #[test]
+    fn a_pcr_step_from_an_ingress_transcode_drops_no_re_encoded_audio() {
+        let (flow, frames) = a_flow_behind_an_ingress_pcr_step();
+        let stats = Arc::new(crate::stats::collector::OutputStatsAccumulator::new(
+            "out".into(),
+            "out".into(),
+            "udp".into(),
+        ));
+        let mut chain = build_for_output("out", Some(&mp2_config()), None, None, &stats, None, None)
+            .unwrap()
+            .expect("an audio chain");
+        let mut wire = Vec::new();
+        for c in flow {
+            let mut b = Bytes::from(c);
+            while let Err(back) = chain.try_submit(b) {
+                b = back;
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            while let Some(o) = chain.try_recv() {
+                wire.extend_from_slice(&o);
+            }
+        }
+        let mut quiet = std::time::Instant::now();
+        while quiet.elapsed() < std::time::Duration::from_millis(500) {
+            match chain.try_recv() {
+                Some(o) => {
+                    wire.extend_from_slice(&o);
+                    quiet = std::time::Instant::now();
+                }
+                None => std::thread::sleep(std::time::Duration::from_millis(5)),
+            }
+        }
+        let pcr = stats.snapshot().transcode_pcr.expect("the chain's PCR stage");
+        assert!(pcr.epochs >= 1, "the output met the step");
+        assert_eq!(pcr.stale_frames_dropped, 0, "no re-encoded frame taken for stale");
+        assert_all_mp2_out(&wire, frames);
+    }
+
+    /// The same flow into another edge's ingress audio re-encode (carried
+    /// there over SRT, say): its PCR stage watches its own input the same
+    /// way, and keeps every frame.
+    #[cfg(feature = "media-codecs")]
+    #[test]
+    fn a_pcr_step_from_an_upstream_ingress_transcode_drops_nothing_at_the_next_ingress() {
+        let (flow, frames) = a_flow_behind_an_ingress_pcr_step();
+        let cfg = mp2_config();
+        let mut t = crate::engine::input_transcode::InputTranscoder::new(Some(&cfg), None, None, None)
+            .unwrap()
+            .expect("an ingress audio re-encode");
+        let mut wire = Vec::new();
+        for c in &flow {
+            wire.extend_from_slice(t.process(c));
+        }
+        let pcr = t.pcr_stats().snapshot();
+        assert!(pcr.epochs >= 1, "the ingress met the step");
+        assert_eq!(pcr.stale_frames_dropped, 0, "no re-encoded frame taken for stale");
+        assert_all_mp2_out(&wire, frames);
     }
 
     /// Construct + immediately drop. Verifies the codec thread sees

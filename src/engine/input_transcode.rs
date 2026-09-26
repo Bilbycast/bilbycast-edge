@@ -250,6 +250,11 @@ impl InputTranscoder {
         self.scratch_b.clear();
         self.scratch_c.clear();
 
+        // The PCR stage sees the input's own PES ahead of the replacers
+        // (`TsPcrRemux::observe_input`): a PCR step they carry straight on
+        // across makes nothing stale.
+        self.pcr.observe_input(input_ts);
+
         // Stage 1: audio. When absent, pass the input through unchanged.
         let after_audio: &[u8] = match self.audio.as_mut() {
             Some(a) => {
