@@ -31,8 +31,11 @@
 //! the source timeline by comparing, at the first AU of every PES, the PES
 //! PTS with where the decoded content ends: a gap is filled (silence on a
 //! live source, a timestamp step on `media_player`), an overlap is dropped,
-//! a >500 ms step re-anchors. Nothing in it reads a clock, so host load and
-//! backpressure cannot move the audio.
+//! a >500 ms step re-anchors. Nothing in it reads the host's clock, so host
+//! load and backpressure cannot move the audio. The one clock it reads is
+//! the program's own PCR: a gap in the source audio is filled with silence
+//! as that clock passes it, not in a burst when the audio returns (see
+//! [`ClockFill`]).
 //!
 //! This is the streaming variant of the HLS segment-level remuxer in
 //! `output_hls.rs`. State is kept across chunks (ES cutter, decoder,
@@ -261,6 +264,156 @@ impl Timeline {
     }
 }
 
+/// Clock fill (see [`ClockFill`]): nothing is filled until the source has
+/// been watched this long since its timeline anchored.
+const CLOCK_FILL_WARMUP_90K: i64 = 180_000; // 2 s
+/// What the source does is judged over its last this many seconds of
+/// program clock: long enough to hold every stretch of its packing, short
+/// enough to forget a flow start's or a splice's transient.
+const CLOCK_FILL_WINDOW_S: usize = 10;
+/// How far the headroom may drop below the lowest the source left in the
+/// window before a gap is filled — the silence then brings it back to that
+/// floor.
+const CLOCK_FILL_TOL_90K: i64 = 900; // 10 ms
+/// How much longer than any stretch of the source's own in the window the
+/// content end must stand still before it is a gap and not the source's
+/// packing.
+const CLOCK_FILL_QUIET_TOL_90K: i64 = 900; // 10 ms
+/// Most silence the clock places before the audio returns: past this the
+/// audio has stopped rather than paused, and its return re-anchors.
+const CLOCK_FILL_MAX_90K: i64 = REANCHOR_90K;
+
+/// One second of what the source did against its clock: the lowest headroom
+/// and the longest stretch without the content end moving.
+#[derive(Clone, Copy, Debug, Default)]
+struct FillSecond {
+    /// Program clock second (90 kHz / 90 000) this bucket holds; `None`
+    /// unused.
+    sec: Option<u64>,
+    floor_90k: i64,
+    quiet_90k: i64,
+}
+
+/// Clock-driven gap fill: silence for a gap in the source audio placed
+/// while the program's clock runs through it, not when the audio returns.
+///
+/// A gap is found at the next PES's PTS ([`Timeline::check`]) — so its
+/// silence used to be encoded all at once when the audio came back, stamped
+/// for the time the gap began: a burst of frames up to the whole gap behind
+/// the program's PCR. At a media-player loop of an MPTS played whole the
+/// program's audio pauses as long as the most demanding program needs (Spain
+/// 244 ms, 770_H 464 ms); the burst arrived up to 203 ms late and the
+/// transcode PCR stage raised its delay `D` by 163–290 ms at every loop,
+/// pushing the video's T-STD residency past 1 s.
+///
+/// Instead the replacer watches the headroom — where the decoded content
+/// ends minus the program clock — after every packet, the clock read from
+/// the program's PCRs and interpolated between them by packet count, as a
+/// T-STD model does. Over the last [`CLOCK_FILL_WINDOW_S`] seconds it keeps
+/// the lowest headroom the source left and the longest stretch its content
+/// end stood still. When the content end has stood still longer than that
+/// and the headroom has fallen [`CLOCK_FILL_TOL_90K`] below its floor, the
+/// source is missing audio it always had by now: silence is placed up to
+/// the floor as the clock goes on, until the audio returns. Each silent
+/// frame therefore leaves where, and against the same PCR, a source frame
+/// would have at the source's worst. Nothing is speculated: a source that
+/// keeps its own lead never sees silence placed ahead of audio still to
+/// come. The returning audio settles what remains at once — a gap filled,
+/// an overlap dropped.
+#[derive(Clone, Debug, Default)]
+struct ClockFill {
+    /// The program's last PCR (90 kHz), the packets since, the clock one
+    /// packet stood for over the last PCR interval (90 kHz × 2^16) and that
+    /// interval — the interpolation never runs past it.
+    last_pcr_90k: Option<u64>,
+    pkts: u64,
+    tpp_q16: u64,
+    step_90k: i64,
+    /// The first clock reading since the timeline anchored: the warm-up's
+    /// start.
+    since_90k: Option<u64>,
+    /// Where the content ended at the previous reading, and the clock at
+    /// which the source last moved it; whether the current stretch ends in
+    /// a timeline correction (then it was no stretch of the source's).
+    last_end_90k: Option<u64>,
+    moved_at_90k: Option<u64>,
+    corrected: bool,
+    window: [FillSecond; CLOCK_FILL_WINDOW_S],
+    /// Filling: the clock placed `filled_90k` of silence since the source
+    /// audio last arrived; `outage` once that reached the cap.
+    active: bool,
+    filled_90k: i64,
+    outage: bool,
+}
+
+impl ClockFill {
+    /// Forget what was learned (a new timeline), keeping the clock.
+    fn relearn(&mut self) {
+        *self = ClockFill {
+            last_pcr_90k: self.last_pcr_90k,
+            pkts: self.pkts,
+            tpp_q16: self.tpp_q16,
+            step_90k: self.step_90k,
+            ..ClockFill::default()
+        };
+    }
+
+    /// A PCR on the program's PCR_PID: `false` (and everything learned
+    /// dropped) when it starts a new time base.
+    fn note_pcr(&mut self, c: u64, di: bool) -> bool {
+        let prev = self.last_pcr_90k.replace(c);
+        let step = prev.map(|p| pts_diff(c, p));
+        if di || step.is_some_and(|s| !(0..=90_000).contains(&s)) {
+            *self = ClockFill { last_pcr_90k: Some(c), ..ClockFill::default() };
+            return false;
+        }
+        if let Some(s) = step
+            && self.pkts >= 4
+            && (1..=9_000).contains(&s)
+        {
+            self.tpp_q16 = ((s as u64) << 16) / self.pkts;
+            self.step_90k = s;
+        }
+        self.pkts = 0;
+        true
+    }
+
+    /// The program clock now: the last PCR plus the packets since, never
+    /// past one PCR interval.
+    fn now(&self) -> Option<u64> {
+        let c = self.last_pcr_90k?;
+        let ahead = ((self.pkts * self.tpp_q16) >> 16).min(self.step_90k.max(0) as u64);
+        Some((c + ahead) & PTS_MASK)
+    }
+
+    /// The window's lowest headroom and longest stretch, over the seconds
+    /// up to `sec`.
+    fn window_at(&self, sec: u64) -> Option<(i64, i64)> {
+        let mut it = self
+            .window
+            .iter()
+            .filter(|b| b.sec.is_some_and(|s| sec.wrapping_sub(s) < CLOCK_FILL_WINDOW_S as u64));
+        let first = it.next()?;
+        Some(it.fold((first.floor_90k, first.quiet_90k), |(f, q), b| {
+            (f.min(b.floor_90k), q.max(b.quiet_90k))
+        }))
+    }
+
+    /// Record a headroom and / or a stretch in the bucket of second `sec`.
+    fn record(&mut self, sec: u64, headroom: Option<i64>, quiet: Option<i64>) {
+        let b = &mut self.window[(sec % CLOCK_FILL_WINDOW_S as u64) as usize];
+        if b.sec != Some(sec) {
+            *b = FillSecond { sec: Some(sec), floor_90k: i64::MAX, quiet_90k: 0 };
+        }
+        if let Some(h) = headroom {
+            b.floor_90k = b.floor_90k.min(h);
+        }
+        if let Some(q) = quiet {
+            b.quiet_90k = b.quiet_90k.max(q);
+        }
+    }
+}
+
 /// The codec pipeline's latency, declared by the libraries.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct Latency {
@@ -421,6 +574,10 @@ pub struct TsAudioReplacer {
     timeline: Timeline,
     /// How a forward gap in that timeline is filled.
     gap_fill: GapFill,
+    /// The program's PCR_PID, from its PMT: the clock [`ClockFill`] runs on.
+    pcr_pid: Option<u16>,
+    /// Silence for a gap placed as the program clock passes it.
+    clock_fill: ClockFill,
     /// Source samples still to drop from the head of the decoded PCM (an
     /// overlap the timeline found).
     pending_drop: u64,
@@ -595,6 +752,8 @@ impl TsAudioReplacer {
             samples_since_anchor: 0,
             timeline: Timeline::default(),
             gap_fill: GapFill::default(),
+            pcr_pid: None,
+            clock_fill: ClockFill::default(),
             pending_drop: 0,
             pending_fill_90k: 0,
             tail: Vec::new(),
@@ -859,103 +1018,117 @@ impl TsAudioReplacer {
             return;
         }
 
-        let mut offset = 0;
-        while offset + TS_PACKET_SIZE <= input_ts.len() {
-            let pkt = &input_ts[offset..offset + TS_PACKET_SIZE];
-            offset += TS_PACKET_SIZE;
-
-            if pkt[0] != TS_SYNC_BYTE {
-                // Lost alignment — emit as-is and move on.
-                output.extend_from_slice(pkt);
-                continue;
+        for pkt in input_ts.chunks_exact(TS_PACKET_SIZE) {
+            // A PCR on the program's PCR_PID, whatever else the packet is:
+            // after the packet has gone out, the clock fill runs on it.
+            let clock = (pkt[0] == TS_SYNC_BYTE && Some(ts_pid(pkt)) == self.pcr_pid)
+                .then(|| extract_pcr(pkt).map(|v| (v, ts_discontinuity_indicator(pkt))))
+                .flatten();
+            self.process_packet(pkt, output, now);
+            self.clock_fill.pkts += 1;
+            if let Some((pcr, di)) = clock {
+                self.on_program_pcr(pcr, di, output);
             }
-
-            let pid = ts_pid(pkt);
-
-            // Learn the PMT PID from every PAT. A PMT-PID change means
-            // the input switched to an input with a different program
-            // layout — reset source-side state so the pipeline
-            // re-learns everything from the new program.
-            if pid == PAT_PID && ts_pusi(pkt) {
-                let mut programs = parse_pat_programs(pkt);
-                if !programs.is_empty() {
-                    programs.sort_by_key(|(num, _)| *num);
-                    let (new_program, new_pmt_pid) = programs[0];
-                    self.pmt_pid_shared =
-                        programs.iter().filter(|(_, p)| *p == new_pmt_pid).count() > 1;
-                    self.engage.note_pat(new_program, new_pmt_pid);
-                    if self.pmt_pid != Some(new_pmt_pid)
-                        || self.program_number != Some(new_program)
-                    {
-                        if self.pmt_pid.is_some() {
-                            self.audio_pid = None;
-                            self.source_stream_type = 0;
-                            self.reset_source_state("PMT PID changed");
-                            // A new program: gate until its PMT parses.
-                            self.gate.rearm(now);
-                        }
-                        if self.pmt_pid != Some(new_pmt_pid) {
-                            self.pmt_stage = PsiUnitStage::new("ts_audio_replace");
-                        }
-                        self.pmt_pid = Some(new_pmt_pid);
-                        self.program_number = Some(new_program);
-                    }
-                }
-            }
-
-            // Every packet on the PMT PID goes through the reassembling
-            // stage. A complete unit is inspected (re-reading audio_pid and
-            // source_stream_type on every PMT, so input switches between
-            // inputs with different audio codecs / PIDs are handled
-            // seamlessly) and, when this replacer re-encodes, the program's
-            // PMT section is rebuilt; other sections on the PID (a 0xC0
-            // table ahead of the PMT, other programs) stay byte-identical.
-            if Some(pid) == self.pmt_pid {
-                if ts_pusi(pkt) {
-                    self.engage.note_pmt_pusi();
-                }
-                if let Some(unit) = self.pmt_stage.push(pkt, output) {
-                    self.handle_pmt_unit(unit, output);
-                }
-                continue;
-            }
-
-            if self.gate.drops(pid, now, "ts_audio_replace") {
-                self.stats.pre_pmt_dropped_packets.fetch_add(1, Ordering::Relaxed);
-                continue;
-            }
-
-            // Audio packets: route to the PES accumulator only when the
-            // source codec is one we can actually decode. Anything else
-            // falls through to the passthrough branch below — losing the
-            // re-encode is preferable to dropping audio entirely.
-            if Some(pid) == self.audio_pid && source_replaceable(self.source_stream_type) {
-                // A PCR on the audio PID (radio services, some SD
-                // programmes) keeps its stream position as an
-                // adaptation-field-only packet — value and DI unchanged,
-                // CC repeating the last payload CC — instead of vanishing
-                // with the source payload. The chain's `ts_pcr_remux`
-                // stage owns the delay.
-                if let Some(pcr) = extract_pcr(pkt) {
-                    let cc = self.out_audio_cc.wrapping_sub(1) & 0x0F;
-                    output.extend_from_slice(&pcr_only_packet(
-                        pid,
-                        cc,
-                        pcr,
-                        ts_discontinuity_indicator(pkt),
-                    ));
-                }
-                self.feed_audio_packet(pkt, output);
-                continue;
-            }
-
-            // Everything else: passthrough.
-            self.passthrough_cc.note(pid, pkt);
-            output.extend_from_slice(pkt);
+        }
+        // And on the clock where this chunk leaves it.
+        if let Some(c) = self.clock_fill.now() {
+            self.clock_tick(c, output);
         }
 
         self.engage.note_packets((input_ts.len() / TS_PACKET_SIZE) as u64);
         self.poll_engage(now);
+    }
+
+    /// One 188-byte packet of [`Self::process_at`].
+    fn process_packet(&mut self, pkt: &[u8], output: &mut Vec<u8>, now: std::time::Instant) {
+        if pkt[0] != TS_SYNC_BYTE {
+            // Lost alignment — emit as-is and move on.
+            output.extend_from_slice(pkt);
+            return;
+        }
+
+        let pid = ts_pid(pkt);
+
+        // Learn the PMT PID from every PAT. A PMT-PID change means
+        // the input switched to an input with a different program
+        // layout — reset source-side state so the pipeline
+        // re-learns everything from the new program.
+        if pid == PAT_PID && ts_pusi(pkt) {
+            let mut programs = parse_pat_programs(pkt);
+            if !programs.is_empty() {
+                programs.sort_by_key(|(num, _)| *num);
+                let (new_program, new_pmt_pid) = programs[0];
+                self.pmt_pid_shared =
+                    programs.iter().filter(|(_, p)| *p == new_pmt_pid).count() > 1;
+                self.engage.note_pat(new_program, new_pmt_pid);
+                if self.pmt_pid != Some(new_pmt_pid)
+                    || self.program_number != Some(new_program)
+                {
+                    if self.pmt_pid.is_some() {
+                        self.audio_pid = None;
+                        self.source_stream_type = 0;
+                        self.reset_source_state("PMT PID changed");
+                        // A new program: gate until its PMT parses.
+                        self.gate.rearm(now);
+                    }
+                    if self.pmt_pid != Some(new_pmt_pid) {
+                        self.pmt_stage = PsiUnitStage::new("ts_audio_replace");
+                    }
+                    self.pmt_pid = Some(new_pmt_pid);
+                    self.program_number = Some(new_program);
+                }
+            }
+        }
+
+        // Every packet on the PMT PID goes through the reassembling
+        // stage. A complete unit is inspected (re-reading audio_pid and
+        // source_stream_type on every PMT, so input switches between
+        // inputs with different audio codecs / PIDs are handled
+        // seamlessly) and, when this replacer re-encodes, the program's
+        // PMT section is rebuilt; other sections on the PID (a 0xC0
+        // table ahead of the PMT, other programs) stay byte-identical.
+        if Some(pid) == self.pmt_pid {
+            if ts_pusi(pkt) {
+                self.engage.note_pmt_pusi();
+            }
+            if let Some(unit) = self.pmt_stage.push(pkt, output) {
+                self.handle_pmt_unit(unit, output);
+            }
+            return;
+        }
+
+        if self.gate.drops(pid, now, "ts_audio_replace") {
+            self.stats.pre_pmt_dropped_packets.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+
+        // Audio packets: route to the PES accumulator only when the
+        // source codec is one we can actually decode. Anything else
+        // falls through to the passthrough branch below — losing the
+        // re-encode is preferable to dropping audio entirely.
+        if Some(pid) == self.audio_pid && source_replaceable(self.source_stream_type) {
+            // A PCR on the audio PID (radio services, some SD
+            // programmes) keeps its stream position as an
+            // adaptation-field-only packet — value and DI unchanged,
+            // CC repeating the last payload CC — instead of vanishing
+            // with the source payload. The chain's `ts_pcr_remux`
+            // stage owns the delay.
+            if let Some(pcr) = extract_pcr(pkt) {
+                let cc = self.out_audio_cc.wrapping_sub(1) & 0x0F;
+                output.extend_from_slice(&pcr_only_packet(
+                    pid,
+                    cc,
+                    pcr,
+                    ts_discontinuity_indicator(pkt),
+                ));
+            }
+            self.feed_audio_packet(pkt, output);
+            return;
+        }
+
+        // Everything else: passthrough.
+        self.passthrough_cc.note(pid, pkt);
+        output.extend_from_slice(pkt);
     }
 
     /// Advance the engage watchdog and emit whatever it raises. Returns the
@@ -1015,6 +1188,7 @@ impl TsAudioReplacer {
         };
         // The program's PMT is known: the pre-PMT gate opens.
         self.gate.open();
+        self.pcr_pid = (view.pcr_pid != 0x1FFF).then_some(view.pcr_pid);
         let was_replacing = self.replaced_pid();
         if self.flavour.is_none() {
             use crate::config::models::TsAudioSignalling;
@@ -1263,6 +1437,7 @@ impl TsAudioReplacer {
         // audio stays aligned with the video replacer, which also
         // re-anchors on the video-PID codec swap.
         self.timeline = Timeline::default();
+        self.clock_fill = ClockFill::default();
         self.pending_drop = 0;
         self.pending_fill_90k = 0;
         self.av_skew_from_90k = None;
@@ -1415,9 +1590,138 @@ impl TsAudioReplacer {
         }
     }
 
+    /// A PCR on the program's PCR_PID went out: note the clock, then run
+    /// the clock fill on it.
+    fn on_program_pcr(&mut self, pcr_27mhz: u64, di: bool, output: &mut Vec<u8>) {
+        let c = (pcr_27mhz / 300) & PTS_MASK;
+        if self.clock_fill.note_pcr(c, di) {
+            self.clock_tick(c, output);
+        }
+    }
+
+    /// Learn how the source's audio runs against the program clock `c`, and
+    /// fill a gap in it as the clock passes (see [`ClockFill`]).
+    fn clock_tick(&mut self, c: u64, output: &mut Vec<u8>) {
+        if self.gap_fill != GapFill::Silence
+            || !self.timeline.anchored
+            || self.timeline.rate == 0
+            || !self.codecs_ready
+        {
+            return;
+        }
+        let end = self.timeline.end_90k();
+        let sec = c / 90_000;
+        let f = &mut self.clock_fill;
+        if f.last_end_90k != Some(end) {
+            // The source moved the content end since the last reading. A
+            // stretch that ended in a correction, or in the middle of a
+            // fill, is no stretch of the source's own. (Audio with no PES
+            // start of its own during a fill — the rest of a PES that
+            // stalled, a file's leading continuation — goes on after the
+            // silence and leaves the fill running: it fills only below the
+            // floor, and the next PES's PTS settles what is left.)
+            if let (Some(_), Some(m)) = (f.last_end_90k, f.moved_at_90k)
+                && !f.corrected
+                && !f.active
+            {
+                let q = pts_diff(c, m);
+                f.record(sec, None, Some(q));
+            }
+            f.moved_at_90k = Some(c);
+            f.corrected = false;
+            f.last_end_90k = Some(end);
+        }
+        let headroom = pts_diff(end, c);
+        let since = *f.since_90k.get_or_insert(c);
+        let quiet = pts_diff(c, f.moved_at_90k.unwrap_or(c));
+        if !f.active {
+            let warm = pts_diff(c, since) >= CLOCK_FILL_WARMUP_90K;
+            let window = f.window_at(sec);
+            let (floor, quiet_max) = match window {
+                Some(w) if warm => w,
+                _ => {
+                    f.record(sec, Some(headroom), None);
+                    return;
+                }
+            };
+            if quiet <= quiet_max + CLOCK_FILL_QUIET_TOL_90K {
+                // The source's own stretch: its headroom is the source's.
+                f.record(sec, Some(headroom), None);
+                return;
+            }
+            if headroom >= floor - CLOCK_FILL_TOL_90K || f.outage {
+                return;
+            }
+            f.active = true;
+            f.filled_90k = 0;
+            tracing::debug!(
+                quiet_ms = quiet / 90,
+                quiet_max_ms = quiet_max / 90,
+                headroom_ms = headroom / 90,
+                floor_ms = floor / 90,
+                "ts_audio_replace: source audio missing past its own worst; filling on the program clock"
+            );
+            self.stats.timeline_corrections.fetch_add(1, Ordering::Relaxed);
+        }
+        let f = &mut self.clock_fill;
+        let floor = f.window_at(sec).map_or(0, |(fl, _)| fl);
+        let need = floor - headroom;
+        if need <= 0 {
+            return;
+        }
+        if f.filled_90k + need > CLOCK_FILL_MAX_90K {
+            // The audio stopped rather than paused: its return re-anchors.
+            f.outage = true;
+            return;
+        }
+        let rate = self.timeline.rate as i128;
+        let n = (need as i128 * rate / 90_000) as u64;
+        if n == 0 {
+            return;
+        }
+        self.insert_silence(n, output);
+        self.timeline.samples += n as i64;
+        let end = self.timeline.end_90k();
+        let f = &mut self.clock_fill;
+        f.filled_90k += (n as i128 * 90_000 / rate) as i64;
+        // The clock moved the content end, not the source.
+        f.last_end_90k = Some(end);
+    }
+
     /// Hold the content to the source timeline at a PES PTS (see
     /// [`Timeline::check`]), then publish `av_skew`.
     fn on_pes_pts(&mut self, pts: u64, output: &mut Vec<u8>) {
+        if std::mem::take(&mut self.clock_fill.active) {
+            // The audio is back after a gap the clock filled: settle what
+            // is left at once — the persistence rule is for timestamp
+            // jitter, and this is no jitter.
+            let off = pts_diff(pts, self.timeline.end_90k());
+            let filled = std::mem::take(&mut self.clock_fill.filled_90k);
+            self.clock_fill.outage = false;
+            if off.abs() <= REANCHOR_90K {
+                tracing::info!(
+                    clock_filled_ms = filled / 90,
+                    remainder_ms = off / 90,
+                    "ts_audio_replace: source audio back after a gap filled on the program clock"
+                );
+                self.timeline.clear_run();
+                if off > DEADBAND_90K as i64 {
+                    self.fill_gap(off, output);
+                } else if off < -(DEADBAND_90K as i64) {
+                    self.drop_overlap(off);
+                    // The audio came back with less lead than the window's
+                    // floor: the source's floor is that much lower.
+                    if let Some(c) = self.clock_fill.now()
+                        && let Some((floor, _)) = self.clock_fill.window_at(c / 90_000)
+                    {
+                        self.clock_fill.record(c / 90_000, Some(floor + off), None);
+                    }
+                }
+                self.clock_fill.corrected = true;
+                self.publish_av_skew(pts);
+                return;
+            }
+        }
         match self.timeline.check(pts, self.gap_fill) {
             TimelineAction::Anchor => {
                 // Nothing decoded since the anchor: it follows the PES PTS
@@ -1437,8 +1741,14 @@ impl TsAudioReplacer {
                 );
                 self.anchor_at(pts);
             }
-            TimelineAction::Gap(off) => self.fill_gap(off, output),
-            TimelineAction::Overlap(off) => self.drop_overlap(off),
+            TimelineAction::Gap(off) => {
+                self.clock_fill.corrected = true;
+                self.fill_gap(off, output);
+            }
+            TimelineAction::Overlap(off) => {
+                self.clock_fill.corrected = true;
+                self.drop_overlap(off);
+            }
         }
         self.publish_av_skew(pts);
     }
@@ -1460,6 +1770,9 @@ impl TsAudioReplacer {
         self.pending_drop = 0;
         self.pending_fill_90k = 0;
         self.av_skew_from_90k = Some(pts.wrapping_add(AV_SKEW_HOLDOFF_90K) & PTS_MASK);
+        // A new timeline: what the source does against the clock is
+        // learned again.
+        self.clock_fill.relearn();
     }
 
     /// A gap of `off` ticks before this PES's audio: silence, or a
@@ -3938,6 +4251,237 @@ mod tests {
         pub fn err_samples(target: &str, out: &[u8], expected: f64, out_rate: u32) -> f64 {
             (burst_time(target, out, expected) - expected) * out_rate as f64 / 90_000.0
         }
+    }
+
+    /// A program (video PID 0x100 carrying the PCR every 30 ms, MP2 audio on
+    /// 0x101 in 120 ms PES, each arriving `lead(source ms)` ms ahead of its
+    /// PTS, all at once) whose audio has a hole `hole` (source ms after P0,
+    /// length ms), as a media-player MPTS loop leaves it: the PCR runs on
+    /// through it. The content is a burst at sample `burst_at`. `spread`:
+    /// a constant-rate mux — each PES's packets spread over the 120 ms
+    /// before it is due (less where the one before it still runs: a PES's
+    /// packets never interleave with another's), and a video packet on
+    /// 0x100 every millisecond, as a broadcast program runs — instead of
+    /// each PES all at once.
+    #[cfg(all(feature = "media-codecs", feature = "fdk-aac"))]
+    fn clock_fill_source(
+        lead: impl Fn(u64) -> u64,
+        hole: Option<(u64, u64)>,
+        burst_at: usize,
+        secs: u64,
+        spread: bool,
+    ) -> Vec<u8> {
+        use crate::engine::ts_test_fixtures::{packetize_sections, pat_packet, pmt_section};
+        use e2e::*;
+        let aus = encode_source(Src::Mp2, &content(burst_at, 48_000 * (secs as usize + 1)));
+        // (µs, order, packets)
+        let mut ev: Vec<(u64, u8, Vec<[u8; TS_PACKET_SIZE]>)> = Vec::new();
+        let start = P0 / 90 - 500;
+        ev.push((start * 1_000, 0, vec![pat_packet(&[(1, 0x1000)], 0, 0)]));
+        let pmt = pmt_section(1, 0, 0x100, &[], &[(0x1B, 0x100, &[]), (0x03, 0x101, &[])]);
+        ev.push((start * 1_000, 1, packetize_sections(0x1000, &[&pmt], 0)));
+        let end = P0 / 90 + secs * 1_000 - 500;
+        for t in (start..end).step_by(30) {
+            ev.push((t * 1_000, 2, vec![crate::engine::ts_parse::pcr_only_packet(0x100, 0, t * 27_000, false)]));
+        }
+        if spread {
+            for (k, t) in (start..end).enumerate() {
+                let mut v = [0xAAu8; TS_PACKET_SIZE];
+                v[..4].copy_from_slice(&[TS_SYNC_BYTE, 0x01, 0x00, 0x10 | (k & 0x0F) as u8]);
+                ev.push((t * 1_000 + 500, 4, vec![v]));
+            }
+        }
+        let mut cc = 0u8;
+        let mut sent_until = 0u64;
+        for (es, pts) in e2e::pack(&aus, 5) {
+            let pts = pts.unwrap();
+            let src_ms = (pts / 90) as i64 - (P0 / 90) as i64;
+            if hole.is_some_and(|(from, len)| src_ms >= from as i64 && src_ms < (from + len) as i64) {
+                continue;
+            }
+            let at = pts / 90 - lead(src_ms.max(0) as u64);
+            // The audio runs 400 ms past the last PCR: no gap at the end.
+            if at >= end + 400 {
+                break;
+            }
+            let pkts = packetize_ts(0x0101, &build_audio_pes(0xC0, &es, pts), &mut cc);
+            if spread {
+                let n = pkts.len() as u64;
+                let from = ((at - 120) * 1_000).max(sent_until);
+                let span = (at * 1_000).saturating_sub(from).max(n);
+                for (j, p) in pkts.into_iter().enumerate() {
+                    ev.push((from + (j as u64 + 1) * span / n, 3, vec![p]));
+                }
+                sent_until = from + span;
+            } else {
+                ev.push((at * 1_000, 3, pkts));
+            }
+        }
+        ev.sort_by_key(|(t, o, _)| (*t, *o));
+        ev.into_iter().flat_map(|(_, _, p)| p.into_iter().flatten()).collect()
+    }
+
+    /// Run `ts` through an MP2 replacer and the chain's PCR stage behind it.
+    #[cfg(all(feature = "media-codecs", feature = "fdk-aac"))]
+    fn clock_fill_chain(
+        ts: &[u8],
+    ) -> (Arc<TsAudioReplacerStats>, crate::stats::models::TranscodePcrStats, Vec<u8>) {
+        let mut r = e2e::replacer("mp2", None, None);
+        let stats = r.stats_handle();
+        let out = e2e::run(&mut r, ts);
+        let mut remux = crate::engine::ts_pcr_remux::TsPcrRemux::new();
+        remux.set_replaced_pids(Some(0x0101), None);
+        let mut wire = Vec::new();
+        for p in out.chunks(TS_PACKET_SIZE) {
+            remux.process(p, &mut wire);
+        }
+        (stats, remux.stats_handle().snapshot(), wire)
+    }
+
+    /// Every audio PES on the wire: (PTS, PTS minus the PCR before it, ms)
+    /// — its T-STD lead.
+    #[cfg(all(feature = "media-codecs", feature = "fdk-aac"))]
+    fn wire_leads(wire: &[u8]) -> Vec<(u64, f64)> {
+        let mut pcr = None;
+        let mut out = Vec::new();
+        for p in wire.chunks(TS_PACKET_SIZE) {
+            if ts_pid(p) == 0x100
+                && let Some(v) = extract_pcr(p)
+            {
+                pcr = Some(v / 300);
+            }
+            if ts_pid(p) == 0x0101
+                && ts_pusi(p)
+                && let (Some(c), Some(pts)) = (pcr, crate::engine::ts_parse::extract_pes_pts(p))
+            {
+                out.push((pts, pts_diff(pts, c) as f64 / 90.0));
+            }
+        }
+        out
+    }
+
+    /// The silent frames placed for a hole (source ms `from`, `len` long)
+    /// leave with a T-STD lead no worse than the source's own frames' worst
+    /// less `slack` ms: on a constant-rate mux the trigger's tolerance and
+    /// an output frame (25 ms).
+    #[cfg(all(feature = "media-codecs", feature = "fdk-aac"))]
+    fn assert_fill_on_time(wire: &[u8], from: u64, len: u64, slack: f64) {
+        let p0 = e2e::P0 as i64;
+        let in_hole = |pts: u64| {
+            let ms = (pts as i64 - p0) / 90;
+            ms >= from as i64 && ms < (from + len) as i64
+        };
+        let leads = wire_leads(wire);
+        // The source's own frames: 200 ms clear of the hole either side (a
+        // frame at its edge holds silence as well as audio).
+        let near = |pts: u64| {
+            let ms = (pts as i64 - p0) / 90;
+            ms >= from as i64 - 200 && ms < (from + len) as i64 + 200
+        };
+        let worst = |fill: bool| {
+            leads
+                .iter()
+                .filter(|(pts, _)| if fill { in_hole(*pts) } else { !near(*pts) })
+                .filter(|(pts, _)| (*pts as i64 - p0) / 90 > 3_000)
+                .map(|(_, l)| *l)
+                .fold(f64::MAX, f64::min)
+        };
+        let (fill, own) = (worst(true), worst(false));
+        assert!(fill < f64::MAX && own < f64::MAX);
+        assert!(fill >= own - slack, "silent frames lead {fill:.1} ms at worst, the source's own {own:.1} ms");
+    }
+
+    /// A 360 ms hole in a program's audio while its PCR runs on (a
+    /// media-player MPTS loop): the silence is placed as the clock passes
+    /// the hole, every frame of it on time, so the PCR stage behind never
+    /// raises its delay. Found only when the audio returned, the whole
+    /// hole's silence was encoded in one burst stamped for when the hole
+    /// began — ~260 ms behind the output PCR here, a `D` raise with a DI at
+    /// every loop (Spain +163 ms, 770_H +290 ms on the rig).
+    #[cfg(all(feature = "media-codecs", feature = "fdk-aac"))]
+    #[test]
+    fn a_hole_in_the_audio_is_filled_on_the_program_clock() {
+        // A burst in the first PES after the hole (the hole takes the three
+        // whole PES that start in it): presented at its source time.
+        let at = 48_000 * 4 + 560 * 48;
+        let (stats, pcr, out) = clock_fill_chain(&clock_fill_source(|_| 100, Some((4_000, 360)), at, 7, true));
+        assert_fill_on_time(&out, 4_070, 360, 25.0);
+        let silence = stats.silence_inserted_samples.load(Ordering::Relaxed);
+        assert!((360 * 48 - 1_152..=360 * 48 + 1_152).contains(&silence), "{silence} samples");
+        assert_eq!(stats.dropped_samples.load(Ordering::Relaxed), 0, "nothing placed ahead of the audio");
+        let err = e2e::err_samples("mp2", &out, e2e::src_time(at), 48_000);
+        assert!(err.abs() <= 48.0, "the audio after the hole is {err} samples off its source time");
+        assert_eq!(pcr.offset_raises, 0, "{pcr:?}");
+        assert_eq!(pcr.late_frames, 0, "{pcr:?}");
+        assert_eq!(pcr.offset_ms, 80.0, "{pcr:?}");
+        // A mux that sends each PES whole, nothing between them but PCRs:
+        // the clock is read at the PCRs alone, still on time.
+        let (stats, pcr, _) = clock_fill_chain(&clock_fill_source(|_| 100, Some((4_000, 360)), at, 7, false));
+        let silence = stats.silence_inserted_samples.load(Ordering::Relaxed);
+        assert!((360 * 48 - 1_152..=360 * 48 + 1_152).contains(&silence), "{silence} samples");
+        assert_eq!((pcr.offset_raises, pcr.late_frames), (0, 0), "{pcr:?}");
+    }
+
+    /// The clock between two PCRs is the last PCR plus the packets since, at
+    /// the rate the last interval showed, and never past one interval; a
+    /// PCR that steps back, jumps over a second or carries DI starts over.
+    #[test]
+    fn the_clock_fill_reads_the_program_clock_between_pcrs() {
+        let mut f = ClockFill::default();
+        assert_eq!(f.now(), None);
+        assert!(f.note_pcr(900_000, false));
+        f.pkts = 30;
+        assert!(f.note_pcr(902_700, false), "30 ms, 30 packets");
+        assert_eq!(f.now(), Some(902_700));
+        f.pkts = 15;
+        assert_eq!(f.now(), Some(902_700 + 1_350), "15 packets: 15 ms on");
+        f.pkts = 300;
+        assert_eq!(f.now(), Some(902_700 + 2_700), "never past one interval");
+        f.pkts = 2;
+        assert!(f.note_pcr(905_400, false), "too few packets to rate");
+        f.pkts = 15;
+        assert_eq!(f.now(), Some(905_400 + 1_350), "the last good rate");
+        f.record(10, Some(5), Some(7));
+        assert!(!f.note_pcr(905_400 + 100_000, false), "a jump over a second");
+        assert_eq!(f.window_at(10), None, "starts over");
+        assert!(!f.note_pcr(905_400 + 100_000 + 2_700, true), "a DI");
+        assert!(!f.note_pcr(905_400, false), "a step back");
+    }
+
+    /// What the source did more than ten seconds ago does not set the fill:
+    /// a flow start whose audio arrived with 10 ms of lead, then 100 ms from
+    /// 2 s on, fills a hole at 14 s from the 100 ms it keeps now. Judged since
+    /// the anchor, the start's floor put the fill 90 ms later — on the rig
+    /// (Spain, a startup floor of −9 ms under a steady ~50 ms) that was
+    /// still a `D` raise.
+    #[cfg(all(feature = "media-codecs", feature = "fdk-aac"))]
+    #[test]
+    fn a_hole_is_filled_from_what_the_source_does_now() {
+        let lead = |ms: u64| if ms < 2_000 { 10 } else { 100 };
+        let (stats, pcr, wire) = clock_fill_chain(&clock_fill_source(lead, Some((14_000, 360)), 48_000, 16, true));
+        assert_fill_on_time(&wire, 14_070, 360, 25.0);
+        let silence = stats.silence_inserted_samples.load(Ordering::Relaxed);
+        assert!((360 * 48 - 1_152..=360 * 48 + 1_152).contains(&silence), "{silence} samples");
+        assert_eq!(pcr.offset_raises, 0, "{pcr:?}");
+        assert!(pcr.offset_ms <= 80.0, "{pcr:?}");
+    }
+
+    /// The source's own packing — 120 ms PES arriving whole — is no gap:
+    /// in seven seconds the clock places nothing.
+    #[cfg(all(feature = "media-codecs", feature = "fdk-aac"))]
+    #[test]
+    fn a_source_s_own_packing_is_never_filled() {
+        for (lead, spread) in [(40, false), (100, false), (400, false), (40, true), (100, true)] {
+            let (stats, pcr, _) = clock_fill_chain(&clock_fill_source(|_| lead, None, 48_000, 7, spread));
+            assert_eq!(stats.silence_inserted_samples.load(Ordering::Relaxed), 0, "lead {lead} {spread}");
+            assert_eq!(stats.timeline_corrections.load(Ordering::Relaxed), 0, "lead {lead} {spread}");
+            assert_eq!(pcr.offset_raises, 0, "lead {lead} {spread}: {pcr:?}");
+        }
+        // A lead that shrinks, 100 ms to 40 ms over the run: each new low
+        // comes with the source's own stretch, never a longer one — no gap.
+        let (stats, _, _) = clock_fill_chain(&clock_fill_source(|ms| 100 - ms.min(6_000) / 100, None, 48_000, 7, false));
+        assert_eq!(stats.silence_inserted_samples.load(Ordering::Relaxed), 0);
+        assert_eq!(stats.dropped_samples.load(Ordering::Relaxed), 0);
     }
 
     /// **B5.** An AC-3 source's `dialnorm` goes into the AC-3 it is
