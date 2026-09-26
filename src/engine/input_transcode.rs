@@ -153,7 +153,11 @@ impl InputTranscoder {
         // future PTS-ordered-merge implementation. See ts_av_realign.rs.
         let realign: Option<crate::engine::ts_av_realign::TsAvRealigner> = None;
 
-        let pcr = TsPcrRemux::new();
+        let mut pcr = TsPcrRemux::new();
+        // The input's muxer-mode rewriter is told of this stage's own PCR
+        // steps (`take_pcr_steps`, handed over in
+        // `process_input_packet_with_post`).
+        pcr.report_pcr_steps();
         let mut video = video;
         if let Some(v) = video.as_mut() {
             v.set_pcr_remux_stats(pcr.stats_handle());
@@ -319,6 +323,12 @@ impl InputTranscoder {
     /// Shared handle to the PCR stage's counters (always present).
     pub fn pcr_stats(&self) -> Arc<crate::engine::ts_pcr_remux::PcrRemuxStats> {
         self.pcr.stats_handle()
+    }
+
+    /// The PCR stage's own steps in the chunks processed since the last
+    /// call (`TsPcrRemux::take_pcr_steps`).
+    pub fn take_pcr_steps(&mut self) -> Vec<(u64, i64)> {
+        self.pcr.take_pcr_steps()
     }
 
     /// Returns a shared handle to the video-encode stats counters if a video
@@ -711,6 +721,10 @@ pub fn process_input_packet_with_post(
         let after_transcode_owned: Option<Vec<u8>> = transcoder.as_mut().map(|t| {
             t.process(ts_in).to_vec()
         });
+        // The transcode's own PCR steps go to the muxer-mode rewriter with
+        // the chunk that carries them: it passes them through as the PCR
+        // steps they are, not as source discontinuities.
+        let pcr_steps = transcoder.as_mut().map(InputTranscoder::take_pcr_steps).unwrap_or_default();
         let after_transcode: &[u8] = match after_transcode_owned {
             Some(ref v) => v.as_slice(),
             None => ts_in,
@@ -719,7 +733,10 @@ pub fn process_input_packet_with_post(
             return Vec::new();
         }
         match post.as_mut() {
-            Some(p) => p.process(after_transcode).to_vec(),
+            Some(p) => {
+                p.note_upstream_pcr_steps(pcr_steps);
+                p.process(after_transcode).to_vec()
+            }
             None => after_transcode.to_vec(),
         }
     });

@@ -127,6 +127,9 @@ const MIN_MARGIN_27MHZ: i64 = 40 * 27_000;
 /// is still tens of ms early (measured on Sky: the first audio PES latched
 /// 80.24 ms against the initial 80 — a DI for a quarter of a millisecond).
 const LATCH_TOLERANCE_27MHZ: i64 = 10 * 27_000;
+/// Steps of this stage's own kept for [`TsPcrRemux::take_pcr_steps`]
+/// between two reads (a chunk rarely carries more than one).
+const PCR_STEPS_KEPT: usize = 16;
 /// ISO/IEC 13818-1 §2.4.2.6: data leaves the elementary-stream buffer within
 /// one second.
 const MAX_RESIDENCY_27MHZ: i64 = 27_000_000;
@@ -263,6 +266,16 @@ pub struct TsPcrRemux {
     /// Last input (unshifted) PCR — the synthetic clock while synthesising.
     last_in_pcr: Option<u64>,
     last_out_pcr: Option<u64>,
+    /// The delay the last output PCR carried on the input's own timeline
+    /// (`None` after a synthesised one): a PCR carrying another is a step
+    /// of this stage's, recorded in `pcr_steps` when they are reported.
+    applied_at_last_out: Option<i64>,
+    /// Whether [`Self::take_pcr_steps`] is read (an ingress chain, whose
+    /// muxer-mode rewriter must tell this stage's steps from the source's).
+    report_steps: bool,
+    /// `(output PCR, delay added there)` of each output PCR that stepped
+    /// because `D` changed, since the last [`Self::take_pcr_steps`].
+    pcr_steps: Vec<(u64, i64)>,
     pending_di: bool,
     /// Last input PCR of the previous epoch, while stale PES may still come.
     old_epoch_pcr: Option<u64>,
@@ -330,6 +343,9 @@ impl TsPcrRemux {
             latched_once: false,
             last_in_pcr: None,
             last_out_pcr: None,
+            applied_at_last_out: None,
+            report_steps: false,
+            pcr_steps: Vec::new(),
             pending_di: false,
             old_epoch_pcr: None,
             max_video_lead: None,
@@ -355,6 +371,42 @@ impl TsPcrRemux {
     /// Shared counters for the stats snapshot.
     pub fn stats_handle(&self) -> Arc<PcrRemuxStats> {
         self.stats.clone()
+    }
+
+    /// Record every step of this stage's own — an output PCR that moved
+    /// because `D` changed, not because the input's did — for
+    /// [`Self::take_pcr_steps`].
+    pub fn report_pcr_steps(&mut self) {
+        self.report_steps = true;
+    }
+
+    /// The steps of this stage's own since the last call, as `(output PCR
+    /// value, delay added there)` in 27 MHz ticks: that PCR stepped back by
+    /// the delay added (forward when it is negative) while the input's
+    /// clock ran on. An ingress chain hands them to the muxer-mode
+    /// rewriter behind it (`TsPtsRewriter::note_upstream_pcr_steps`),
+    /// which passes such a step through as a PCR step whatever its size —
+    /// bridged as a source discontinuity, a step past 500 ms moved every
+    /// PES timestamp on the flow by the step instead.
+    pub fn take_pcr_steps(&mut self) -> Vec<(u64, i64)> {
+        std::mem::take(&mut self.pcr_steps)
+    }
+
+    /// The output PCR `out_pcr` goes out on the input's timeline (`epoch`:
+    /// it starts a new one): note a step of this stage's own.
+    fn note_out_pcr_delay(&mut self, out_pcr: u64, epoch: bool) {
+        let applied = self.applied();
+        if self.report_steps
+            && !epoch
+            && let Some(prev) = self.applied_at_last_out
+            && prev != applied
+        {
+            if self.pcr_steps.len() == PCR_STEPS_KEPT {
+                self.pcr_steps.remove(0);
+            }
+            self.pcr_steps.push((out_pcr, applied - prev));
+        }
+        self.applied_at_last_out = Some(applied);
     }
 
     /// Where the Warnings / Info go: `input_scope` selects input- vs
@@ -555,10 +607,12 @@ impl TsPcrRemux {
     }
 
     fn on_input_pcr(&mut self, pkt: &mut [u8; TS_PACKET_SIZE], pcr: u64) {
+        let mut epoch = false;
         if self.synth.active {
             // Back to the input's timeline — a new clock for the receiver.
             self.synth = Synth { announced: self.synth.announced, ..Synth::default() };
             self.epoch_change(None);
+            epoch = true;
             tracing::info!("ts_pcr_remux: input PCR present again — synthesis stops");
         } else if let Some(last) = self.last_in_pcr {
             let step = pcr_diff_27mhz(pcr, last);
@@ -571,6 +625,7 @@ impl TsPcrRemux {
             if step < 0 || (ts_discontinuity_indicator(pkt) && !self.continues(step)) {
                 let stale = step.abs() > STALE_EPOCH_27MHZ;
                 self.epoch_change(stale.then_some(last));
+                epoch = true;
             } else {
                 self.note_step(pcr, step);
             }
@@ -583,6 +638,7 @@ impl TsPcrRemux {
             set_discontinuity_indicator(pkt);
         }
         self.last_out_pcr = Some(out_pcr);
+        self.note_out_pcr_delay(out_pcr, epoch);
     }
 
     /// A PES starts in `pkt`. Returns whether to keep it.
@@ -1001,6 +1057,7 @@ impl TsPcrRemux {
         let di = std::mem::take(&mut self.pending_di);
         out.extend_from_slice(&pcr_only_packet(c.pid, cc, out_pcr, di));
         self.last_out_pcr = Some(out_pcr);
+        self.applied_at_last_out = None;
         self.stats.synthesized_pcrs.fetch_add(1, Ordering::Relaxed);
         match self.synth.rate {
             Some((dv, dp)) => {
@@ -1070,6 +1127,7 @@ impl TsPcrRemux {
         let di = std::mem::take(&mut self.pending_di);
         out.extend_from_slice(&pcr_only_packet(pid, cc, out_pcr, di));
         self.last_out_pcr = Some(out_pcr);
+        self.applied_at_last_out = None;
         self.stats.synthesized_pcrs.fetch_add(1, Ordering::Relaxed);
         let every = ((SYNTH_SPACING_27MHZ as u128 * dp as u128) / dv as u128).max(1) as u64;
         self.synth.next_at = Some(at + every);

@@ -168,6 +168,15 @@ impl InputPostProcess {
         }
     }
 
+    /// The input transcode's own PCR steps in the chunk about to be
+    /// processed (`TsPcrRemux::take_pcr_steps`), for the muxer-mode clock
+    /// rewriter. No-op without a rewriter stage.
+    pub fn note_upstream_pcr_steps(&mut self, steps: Vec<(u64, i64)>) {
+        if let Some(r) = self.pts_rewriter.as_mut() {
+            r.note_upstream_pcr_steps(steps);
+        }
+    }
+
     /// Run the chain on one chunk of 188-byte-aligned TS bytes. Returns
     /// a borrowed slice valid until the next call.
     ///
