@@ -156,7 +156,7 @@ async fn hls_output_loop(
     };
 
     let mut segment_buf: Vec<u8> = Vec::with_capacity(2 * 1024 * 1024); // 2 MB initial
-    let mut segment_start_us: Option<u64> = None;
+    let mut segment_clock = SegmentClock::default();
     let mut segment_seq: u64 = 0;
 
     // Optional MPTS → SPTS program filter. When set, every TS chunk is
@@ -209,9 +209,8 @@ async fn hls_output_loop(
                             continue;
                         };
 
-                        // Initialise segment timing from the first packet.
-                        let start = segment_start_us.get_or_insert(packet.recv_time_us);
-                        let elapsed_us = packet.recv_time_us.saturating_sub(*start);
+                        // Segment timing, on the packets' receive clock.
+                        let elapsed_us = segment_clock.elapsed(packet.recv_time_us);
 
                         // Apply program filter if configured: feed only the
                         // selected program's TS bytes into the segment buffer.
@@ -266,7 +265,7 @@ async fn hls_output_loop(
                                             format!("HLS output '{}': segment {} remux failed: {e}", config.id, segment_seq),
                                             flow_id,
                                         );
-                                        segment_start_us = None;
+                                        segment_clock.restart();
                                         continue;
                                     }
                                 }
@@ -287,7 +286,7 @@ async fn hls_output_loop(
                                     stats.bytes_sent.fetch_add(segment_bytes, Ordering::Relaxed);
                                     // Use the segment start time as the latency base — this
                                     // captures both the segment accumulation time and the upload time.
-                                    if let Some(seg_start) = segment_start_us {
+                                    if let Some(seg_start) = segment_clock.start_us {
                                         stats.record_latency(seg_start);
                                     }
                                     tracing::debug!(
@@ -343,7 +342,7 @@ async fn hls_output_loop(
                             }
 
                             // Reset for the next segment.
-                            segment_start_us = None;
+                            segment_clock.restart();
                         }
                     }
                     Err(broadcast::error::RecvError::Lagged(n)) => {
@@ -363,6 +362,64 @@ async fn hls_output_loop(
     }
 
     Ok(())
+}
+
+/// When the open segment started, on the receive clock of the packets that
+/// fill it (`RtpPacket::recv_time_us`).
+///
+/// A packet the flow makes itself carries no receive time (0): the
+/// keepalive nulls it sends while the input is silent — which it does as
+/// the flow starts — and the PSI a switch injects. Taken as the first
+/// packet's time, 0 put the segment's start at the process's, so the next
+/// real packet found it seconds old and the first segment was cut at once
+/// with a packet or two in it: no PAT, no PMT, and with `audio_encode`
+/// "segment 1 audio remux failed: no audio PID found in segment; skipping"
+/// (v0.111.0 too: Sky and VH1 on the rig). Such a packet neither starts a
+/// segment nor moves one on.
+#[derive(Debug, Default)]
+struct SegmentClock {
+    start_us: Option<u64>,
+}
+
+impl SegmentClock {
+    /// A packet received at `recv_time_us` joined the segment: how long the
+    /// segment has now run (0 for a packet with no receive time).
+    fn elapsed(&mut self, recv_time_us: u64) -> u64 {
+        if recv_time_us == 0 {
+            return 0;
+        }
+        let start = *self.start_us.get_or_insert(recv_time_us);
+        recv_time_us.saturating_sub(start)
+    }
+
+    /// The segment was cut (or dropped): the next packet starts another.
+    fn restart(&mut self) {
+        self.start_us = None;
+    }
+}
+
+#[cfg(test)]
+mod segment_clock_tests {
+    use super::SegmentClock;
+
+    /// The first segment is timed from the first packet with a receive
+    /// time. A keepalive ahead of the flow's media (receive time 0) started
+    /// it at the process's start, and the first media packet then cut it
+    /// with the keepalive alone in it: "segment 1 audio remux failed: no
+    /// audio PID found in segment" on Sky and VH1, v0.111.0 included.
+    #[test]
+    fn a_packet_with_no_receive_time_neither_starts_nor_moves_a_segment() {
+        let mut c = SegmentClock::default();
+        assert_eq!(c.elapsed(0), 0, "the flow's keepalive");
+        assert_eq!(c.elapsed(5_000_000), 0, "the first media packet starts the segment");
+        assert_eq!(c.elapsed(0), 0, "a switch's injected PSI");
+        assert_eq!(c.elapsed(6_999_999), 1_999_999);
+        assert_eq!(c.elapsed(7_000_000), 2_000_000);
+        assert_eq!(c.start_us, Some(5_000_000));
+        c.restart();
+        assert_eq!(c.elapsed(0), 0);
+        assert_eq!(c.elapsed(7_100_000), 0, "the next segment starts at the next media packet");
+    }
 }
 
 /// Generate an HLS M3U8 playlist from the rolling segment list.

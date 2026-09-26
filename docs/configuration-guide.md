@@ -2407,6 +2407,15 @@ Segments MPEG-2 TS data and uploads via HTTP for HLS ingest (e.g., YouTube HLS).
 | `program_number` | integer | No | `null` | MPTS → SPTS program filter. `null` = each segment carries the full MPTS; `Some(N)` = each segment carries only program N as a rewritten single-program TS. Must be `> 0`. See [MPTS → SPTS filtering](#mpts--spts-filtering). |
 | `audio_encode` | object | No | `null` | Optional per-segment audio re-encode. On any build carrying the default `media-codecs` feature each segment is remuxed **in-process** via libavcodec / FDK AAC — no `ffmpeg` binary is involved. Allowed `codec`: `aac_lc`, `he_aac_v1`, `he_aac_v2`, `mp2`, `ac3` (`opus` is rejected on HLS-TS); HE-AAC v1/v2 additionally need the `fdk-aac` feature. Only a build with `media-codecs` compiled out pipes each segment through `ffmpeg -i pipe:0 -c:v copy -c:a {codec} -f mpegts pipe:1` and refuses to start when ffmpeg is missing. See the [`audio_encode` block](#the-audio_encode-block-phase-b) below. |
 
+Segments are cut on the receive time of the packets that fill them. A
+packet the flow makes itself carries none — the keepalive nulls it sends
+while its input is silent, as it does at flow start, and the PSI a switch
+injects — and neither starts a segment nor moves one on. Taken as the first
+packet's time it dated the segment from the process's start, so the first
+media packet cut it at once with nothing in it: no PAT / PMT, and with
+`audio_encode` a Warning "segment 1 audio remux failed: no audio PID found
+in segment; skipping" at every flow start (v0.111.0 too).
+
 **Limitations:**
 - Output only. Segment-based transport inherently adds 1-4 seconds of latency.
 
