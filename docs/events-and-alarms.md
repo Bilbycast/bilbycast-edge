@@ -439,6 +439,7 @@ bad / expired / duplicate key is reported as a publish rejection.
 | critical | RTMP output '{id}' — the server rejected the publish ({code}) — the stream key is most likely wrong, expired, or already streaming elsewhere | Server returned an `onStatus` error (e.g. `NetStream.Publish.BadName`) or an `_error` to the `publish` command | `{ error_code: "rtmp_publish_rejected", dest_url, server_code, detail }` |
 | critical | RTMP output '{id}' — the server rejected the connection ({code}) — check the destination URL and app path | Server returned `_error` to the `connect` command (wrong app / denied) | `{ error_code: "rtmp_connect_rejected", dest_url, detail }` |
 | critical | RTMP output '{id}' gave up after {n} failed connection attempts to {url} | `max_reconnect_attempts` exhausted (only when the operator sets a finite limit; default is unlimited) | `{ error_code: "rtmp_output_gave_up", dest_url, max_reconnect_attempts }` |
+| warning | RTMP output '{id}': the source's {what} cannot be carried over RTMP (H.264 / HEVC and AAC only) without `{block}`; its {video / audio} is dropped | An MPEG-2 video source with no `video_encode`, or an MP2 / AC-3 / E-AC-3 source with no `audio_encode`. **Once per connection per essence.** Both used to be dropped without a word — an MPEG-2 + AC-3 source published an empty stream. Set the block named and the essence is re-encoded. | `{ error_code: "codec_needs_encode", essence, source_codec, needs, flow_id }` |
 
 One further code rides the log rather than the WS event stream, in the same
 shape as the encoder events below (structured `tracing::warn!` with an
@@ -502,6 +503,7 @@ are the exception and do carry `error_code`.
 | warning | CMAF output '{id}': mpd upload failed: {error} | Non-LL `manifest.mpd` PUT failed. |
 | warning | CMAF output '{id}': thumbnail capture failed ({error}); the scrub preview will be missing | The filmstrip/scrub thumbnail capture rejected the stream (e.g. no video). **Latched once per output** — a stream with no video yields nothing on every tick. |
 | warning | CMAF output '{id}': the tracks changed across the restart — the DVR window is kept, and playback across the join is a discontinuity | The window restore read back rows published under a different init than this run builds (`#EXT-X-BILBYCAST-INIT` mismatch). This run publishes its init as a new generation (`init-{n}.mp4`) rather than over the object the restored rows decode against, so the history stays playable; the first own row carries `#EXT-X-DISCONTINUITY`. See `docs/cmaf.md`, Init generations. |
+| warning | CMAF output '{id}': the source's MPEG-2 video cannot be carried in CMAF (H.264 / HEVC only) without `video_encode`; nothing is published | An MPEG-2 video source on an output with no `video_encode`. **Once per output.** Carries `error_code: "codec_needs_encode"`, `details.output_id`, `details.essence`, `details.source_codec`, `details.needs`. It used to publish nothing without a word (the audio shed for want of a video segment); with `video_encode` the source is decoded and re-encoded. |
 | warning | CMAF output '{id}': the source changed codec family to {codec}; restart the output to follow it | The video PID switched between H.264 and HEVC under a running output. The init's sample entry is committed with the track list and no playlist tag moves a browser between families, so the new samples are not published. **Once per output.** |
 | warning | CMAF output '{id}': the source's parameter sets changed ({w}x{h} -> {w}x{h}); cutting the open segment and publishing a new init so what is written stays decodable | Log only (no event). The SPS/PPS changed at an IDR — an encoder swap upstream. A new init generation opens; see `docs/cmaf.md`, Init generations. |
 | warning | CMAF output '{id}': LL seg {n} did not reach the origin and is not advertised | Log only. The low-latency segment's chunked PUT failed or carried nothing, so its row is withheld rather than advertising a hole. The `LL PUT failed` event above fires once per failure episode, not per segment. |
@@ -530,6 +532,7 @@ are the exception and do carry `error_code`.
 | warning | WHEP signaling failed: {error} | WHEP client input SDP POST returned non-201 or the connect failed; {error} carries the HTTP status + body, or the connect error |
 | warning | WebRTC session failed: {error} | ICE failure, DTLS error, or session creation error |
 | warning | WebRTC session creation failed: {error} | Output session could not be created |
+| warning | WebRTC output '{id}': the source's MPEG-2 video cannot be carried over WebRTC (H.264 only) without `video_encode`; its video is dropped | An MPEG-2 video source on an output with no `video_encode`. **Once per session.** Carries `error_code: "codec_needs_encode"`, `details.output_id`, `details.essence`, `details.source_codec`, `details.needs`. With `video_encode` the source is decoded and re-encoded to H.264. |
 
 **Source**: `src/engine/input_webrtc.rs`, `src/engine/output_webrtc.rs`
 
@@ -1080,10 +1083,10 @@ These are generated server-side in `bilbycast-manager/crates/manager-server/src/
 | `bandwidth` | 4 | Per-flow bandwidth monitoring (alarm, block, recovery) |
 | `srt` | 9 | SRT input and output connection state (now with structured details) |
 | `redundancy` | 5 | SMPTE 2022-7 dual-leg status + raw-TS active-leg failover (`redundancy_failover_mode`) + leg SSRC mismatch (`redundancy_ssrc_mismatch`) |
-| `rtmp` | 3 | RTMP publisher connections |
+| `rtmp` | 3 + 7 | RTMP publisher connections (input) + output connection lifecycle and `codec_needs_encode` |
 | `rtsp` | 2 | RTSP input state (now with structured details) |
 | `hls` | 2 | HLS output failures |
-| `webrtc` | 8 | WHIP/WHEP session lifecycle |
+| `webrtc` | 9 | WHIP/WHEP session lifecycle + `codec_needs_encode` |
 | `audio_encode` | 9 | Audio encoder lifecycle — ffmpeg sidecar (RTMP/HLS/WebRTC) + in-process TsAudioReplacer (SRT/RIST/RTP/UDP) |
 | `video_encode` | 2 | Video transcoder lifecycle — in-process TsVideoReplacer (SRT/RIST/RTP/UDP) |
 | `tunnel` | 11 | Tunnel connection state (now with structured details) + AEAD decrypt failure (`tunnel_decrypt_failure`) + direct-listener register refusal (`tunnel_register_refused`) |

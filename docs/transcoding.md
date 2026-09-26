@@ -18,13 +18,13 @@ applicable / by design.
 | **UDP**    | ✅              | ✅ (requires `audio_encode`) | ✅ | Same as SRT. |
 | **RTP**    | ✅              | ✅ (requires `audio_encode`) | ✅ | Strips source RTP framing, rewraps with fresh RFC 2250 headers. |
 | **RIST**   | ✅              | ✅ (requires `audio_encode`) | ✅ | TS-carrying; same plumbing as SRT/UDP/RTP. |
-| **RTMP**   | ✅              | ✅ (requires `audio_encode`) | ✅ | H.264 target rides classic FLV; HEVC target rides [Enhanced RTMP v2](https://veovera.org/docs/enhanced/enhanced-rtmp-v2) with FourCC `hvc1`. Transcode disables the same-codec AAC passthrough fast-path. HEVC passthrough (no `video_encode` set) also emits E-RTMP tags. |
+| **RTMP**   | ✅              | ✅ (requires `audio_encode`) | ✅ | H.264 target rides classic FLV; HEVC target rides [Enhanced RTMP v2](https://veovera.org/docs/enhanced/enhanced-rtmp-v2) with FourCC `hvc1`. Transcode disables the same-codec AAC passthrough fast-path. HEVC passthrough (no `video_encode` set) also emits E-RTMP tags. An MP2 / AC-3 / E-AC-3 source's `audio_encode` is opened at the format the source decodes to (it waited for an AAC config such a source never has, and dropped the audio unless `silent_fallback` was set). An MPEG-2 video source is decoded and re-encoded with `video_encode` (it was dropped whatever the config said); without `video_encode` — or an MP2 / AC-3 / E-AC-3 source without `audio_encode` — the essence is dropped and a Warning `codec_needs_encode` says so once per connection. |
 | **HLS**    | ✅              | ✅ (in-process remux only) | ⏳ | `media-codecs` feature required for transcode; subprocess fallback ignores it with a warning. |
-| **WebRTC** | ✅              | ✅ (`transcode.channels` overrides Opus channel count; unset keeps source) | ✅ | H.264 target only (browsers do not decode HEVC); SPS/PPS emitted in-band on every IDR via `global_header = false`. HEVC sources are decoded and re-encoded to H.264 automatically. No scaling / no force-IDR on PLI yet (encoder GOP cadence drives keyframes). |
+| **WebRTC** | ✅              | ✅ (`transcode.channels` overrides Opus channel count; unset keeps source) | ✅ | H.264 target only (browsers do not decode HEVC); SPS/PPS emitted in-band on every IDR via `global_header = false`. HEVC sources are decoded and re-encoded to H.264 automatically, and so are MPEG-2 sources (dropped until 2026-09; without `video_encode` an MPEG-2 source's picture is dropped with a Warning `codec_needs_encode` per session). An MP2 / AC-3 / E-AC-3 source's Opus encoder is opened at the format the source decodes to (it waited for an AAC config such a source never has). No scaling / no force-IDR on PLI yet (encoder GOP cadence drives keyframes). |
 | **ST 2110-30 / `rtp_audio`** | ✅ (auto via compressed-audio bridge) | ✅ (native PCM transcode, bit-depth + SRC + shuffle) | ❌ | Uncompressed PCM outputs; transcode is first-class here. |
 | **ST 2110-31** | ✅ | ❌ (AES3 opaque — channel labels inside SMPTE 337M payload, not addressable from the pipeline) | ❌ | |
 | **ST 2110-40** | ❌ | ❌ | ❌ | Ancillary data — no codec concept. |
-| **CMAF / CMAF-LL** | ✅ (AAC family only) | ✅ (requires `audio_encode`; channel routing in the stage, the rate in the encoder's resampler — accepted and ignored before 2026-09) | ✅ | fMP4 / CMAF segments with HLS m3u8 + DASH MPD; the operator's `gop_size` is honoured when `video_encode` is set, and segments cut on that GOP's IDRs, so a set one should divide `segment_duration × fps`; unset, the GOP tiles the segment at the measured source rate (at most 2 s per GOP — 50 frames for 2 s segments at 25 fps, 60 at 29.97). Codec work runs in `block_in_place`. See [`docs/cmaf.md`](cmaf.md) for the full reference. |
+| **CMAF / CMAF-LL** | ✅ (AAC family only) | ✅ (requires `audio_encode`; channel routing in the stage, the rate in the encoder's resampler — accepted and ignored before 2026-09) | ✅ | fMP4 / CMAF segments with HLS m3u8 + DASH MPD; the operator's `gop_size` is honoured when `video_encode` is set, and segments cut on that GOP's IDRs, so a set one should divide `segment_duration × fps`; unset, the GOP tiles the segment at the measured source rate (at most 2 s per GOP — 50 frames for 2 s segments at 25 fps, 60 at 29.97). An MPEG-2 video source is decoded and re-encoded with `video_encode` (dropped until 2026-09 — the output published nothing, its audio shed for want of a video segment; without `video_encode` a Warning `codec_needs_encode` says so). Codec work runs in `block_in_place`. See [`docs/cmaf.md`](cmaf.md) for the full reference. |
 
 ---
 
@@ -869,20 +869,29 @@ output takes it off its stamps:
   encoder (a silent fallback's, on the first real frame) or rebuilt for
   another source format gains its resampler late, and declared once at
   build time (as 0) its delay stayed on every stamp.
-- HLS: each segment is re-encoded on its own, through a
-  `BatchStage` that drops the resampler's zero history at the head and runs
-  its queue and delay line out at the end, so the segment's audio lines up
-  with its source sample for sample and needs no correction. A segment
-  whose source changes format in-band is converted stretch by stretch — a
-  `BatchStage` per run of frames in one decoded format, each pinned to the
-  segment's output format — and the rendition keeps the format its first
-  segment resolved (`ResolvedAudioEncode::out_format`): a playlist cannot
-  signal a channel count or rate changing between segments. The one stage
-  built for a segment's first frame used to refuse every frame of another
-  layout (a 5.1 programme into a stereo break with `channels: 2` lost the
-  rest of the segment, up to 6 s of silence at every such switch) or, with
-  no override, feed 44.1 kHz PCM to an encoder opened at 48 kHz (the
-  wrong speed until the segment ended).
+- HLS: one re-encode chain runs across the output's segments
+  (`output_hls::HlsAudioChain`) — the AU cutter, the decoder, the stage and
+  the same `AudioEncoder` RTMP and WebRTC use, so its delay comes off the
+  stamps the same way. Each segment used to get a fresh chain: a new
+  encoder whose priming (AAC-LC 2048 samples, MP2 481, AC-3 256) opened
+  every segment, stamped at the segment's first source PTS so the content
+  presented that late; the fdk delay line was never flushed, so the tail of
+  every segment's audio was never emitted; an AU straddling two segments
+  was lost; and the audio PID's continuity counter restarted at 0 in every
+  segment. Now the stream has one priming (stamped ahead of the content),
+  the frames the encoder hands back while a segment is processed go into
+  it, the last ~2048 samples of a segment come out at the head of the next
+  on their own PTS, and the audio timeline runs across the cuts with no gap
+  and no overlap. A source whose PTS jumps re-anchors the encoder (a frame
+  more than 2000 ticks from where its input is), as on CMAF. The stage
+  follows a source that changes format in-band (rebuilt, pinned to the
+  rendition's format), and the rendition keeps the format its first frame
+  resolved: a playlist cannot signal a channel count or rate changing
+  between segments. The re-encoded audio PES also carries the PTS it was
+  built with: bits 32..30 and 29..15 of the field were each written one
+  place short, so every HLS audio PES read back a PTS 2^15-granular garbage
+  away from its own (900 000 read 441 248) — the audio of every HLS
+  re-encode presented at the wrong time. Fixed 2026-09.
 - CMAF: the stage routes channels only, at the source's rate; the rate
   goes to the encoder's own resampler (next bullet).
 
@@ -930,9 +939,9 @@ channel count; if unset, the Opus encoder follows the source.
     line, are lost at such a change), for AAC and for MP2 / AC-3 /
     E-AC-3 sources alike; disables the same-codec fast path because PCM
     must be decoded to apply the shuffle.
-  - HLS: `audio_transcode::BatchStage`s, fresh per segment — one per run of
-    frames in one decoded format — inside `remux_ts_audio_inprocess_pinned`,
-    converting to the rendition's format.
+  - HLS: `output_hls::HlsAudioChain`'s `audio_transcode::EncoderStage`,
+    one for the output's life across its segments, converting to the
+    rendition's format (fixed by its first frame).
   - WebRTC: `WebrtcEncoderState::Active.stage`, on both the WHEP viewer
     loop and the WHIP client loop.
   - CMAF: `cmaf::encode::AudioReencoder`, channel routing only (the rate
@@ -1002,8 +1011,11 @@ the program-level rate descriptors, and the content-tracked version.
                              // outputs (auto-detected). Not a resampler.
   "fps_den":     1,
   "bitrate_kbps": 4000,      // optional, default 4000; range 100–100000
-  "gop_size":    60,         // optional, default 2 × fps_num (CMAF: tiles
-                             // the segment — see "Frame rate" below)
+  "gop_size":    60,         // optional, default two seconds of pictures
+                             // rounded to a frame (60 at 29.97, 120 at
+                             // 59.94, 48 at 23.976 — it truncated to 58 /
+                             // 118 / 46 before 2026-09); CMAF: tiles the
+                             // segment — see "Frame rate" below
   "preset":      "medium",   // optional, default medium; `ultrafast`..`veryslow`
   "profile":     "high",     // optional, auto if unset; `baseline` / `main` / `high`
 
@@ -1560,18 +1572,6 @@ commit message or release note and delete the bullet.
 
 ### Audio re-encode gaps found in 2026-09 (not fixed)
 
-- **HLS re-encodes each segment on its own.** Every segment's encoder
-  starts from priming (AAC-LC 2048 samples, MP2 481, AC-3 256) and the
-  segment's audio is stamped from its first source PTS, so the content
-  presents that much late; the fdk AAC path never flushes the encoder, so
-  the samples in its delay line at the segment's end are not emitted. The
-  channel / rate stage lines up exactly (`BatchStage`); the encoder does
-  not. A continuous encoder across segments is the fix.
-- **RTMP (and WebRTC) `audio_encode` on an MP2 / AC-3 / E-AC-3 source
-  without `silent_fallback`** never builds its encoder — it is built from
-  the demuxer's cached ADTS config, which such a source never provides —
-  so the output carries no audio. With `silent_fallback` the eager encoder
-  takes the source through the stage.
 - **The SDI input ignores `audio_encode.sample_rate` / `channels`** (the
   encoder is opened at the capture's format).
 
@@ -1801,10 +1801,15 @@ plugs in via those paths rather than the TS-stream replacer.
 - **WebRTC: done** — see `engine::output_webrtc::WebrtcVideoEncoderState`.
   H.264-only target (WebRTC browsers do not decode HEVC; validation
   rejects `x265` / `hevc_nvenc`). The encoder is opened with
-  `global_header = false` so SPS / PPS travel in-band on every IDR;
-  `engine::webrtc::rtp_h264::H264Packetizer` forwards them as ordinary
-  NAL units. HEVC source streams are decoded and re-encoded to H.264
-  automatically. Remaining MVP limitation: PLI / FIR from the receiver
+  `global_header = false` so SPS / PPS travel in-band on every IDR, and
+  each access unit is handed to str0m whole, as Annex B, for it to
+  packetize (STAP-A for the SPS / PPS, FU-A past its MTU). HEVC and MPEG-2
+  source streams are decoded and re-encoded to H.264 automatically. Until
+  2026-09 the output packetized each NAL itself (`webrtc::rtp_h264`,
+  removed) and wrote every RTP payload to str0m as a frame of its own:
+  str0m fragmented the FU-A fragments again, so a receiver got type-28
+  NAL units out of every IDR and large P slice and decoded nothing from
+  them — the frame loss a WHIP loopback showed in 2026-09. Remaining MVP limitation: PLI / FIR from the receiver
   is still logged-and-ignored — the encoder's configured GOP
   (default 2× fps) drives keyframe cadence. Force-IDR on PLI is tracked
   under a follow-up.
@@ -1876,8 +1881,8 @@ only place it can be) — no relay change is needed.
   `global_header: true` and access to `VideoEncoder::extradata()`
   for the init segment / fMP4 moov. RTMP already uses this mode;
   WebRTC uses `global_header: false` by design (SPS/PPS in-band per
-  IDR is the standard RFC 6184 approach and handled natively by
-  `H264Packetizer`).
+  IDR is the standard RFC 6184 approach, and str0m's packetizer sends
+  them STAP-A ahead of the IDR).
 - **Feature forwarding to bilbycast-manager UI.** The operator UI
   currently exposes `audio_encode` but not `video_encode`. Manager
   schema update + form rendering needed before non-CLI operators can

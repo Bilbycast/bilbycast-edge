@@ -85,9 +85,15 @@ CMAF segments must begin with an IDR / RAP. The segmenter:
 
 1. Tracks the media-timeline DTS (the source's unwrapped 90 kHz PTS) of
    the first sample of the current segment (`segment_base_dts`).
-2. On each arriving IDR / RAP, checks whether `dts - base >=
-   target_duration_90k`. If yes, closes the current segment and opens
-   a new one at this sample.
+2. On each arriving IDR / RAP, checks whether the segment has reached
+   the target — within a frame of it: `dts - base + frame >
+   target_duration_90k`, `frame` the median step between the segment's
+   samples. If yes, closes the current segment and opens a new one at this
+   sample. The frame of tolerance is for a source whose timeline lost part
+   of one (a `media_player` loop splice came 20 ms short of
+   frame-contiguous): the re-encode's tiling IDR landed just under the
+   target and the segment ran on to the next one — 3.98 s, two GOPs, at a
+   29.97 fps loop. An IDR a whole frame or more short still does not cut.
 3. Samples before the first IDR are dropped (can't start decoding
    mid-GoP).
 
@@ -128,6 +134,54 @@ so the stamps never overrun the next real PTS. `video_encode.bframes` is pinned 
 (warning `cmaf_bframes_unsupported`): the segmenter takes a sample's stamp as
 its decode time and writes no composition offsets. (`gop_size: 1` is how the
 DVR proxy asks for all-intra; see [the proxy section](#why-the-proxy-rendition-is-x264-on-nvidia-hosts).)
+
+### One media timeline, whatever the source does
+
+Every source timestamp goes through the output's own timeline
+(`cmaf::timeline::CmafTimeline`) before anything else sees it — the
+re-encoders, the silence fill, the segmenters. It is the source's timestamp
+plus an offset, 0 until the source first jumps, so a clean source is
+published exactly as before. A timestamp is taken as it is when it is
+continuous with its own track (within 1 s of the newest the track has had,
+either way — a B-frame source's decode-order PTS included) or within 3 s of
+the other track's newest (a track that paused and came back on the
+programme's clock is a gap, kept, in sync). Otherwise the offsets already in
+use are tried — the other track may have met the same jump first, or the
+source may be coming back from a short excursion — and only when none makes
+it continuous does a new offset place it one step (the track's smallest
+recent step) after the track's newest timestamp. Audio arriving at or before
+what is already buffered — a source coming back over audio sent during an
+excursion — is dropped rather than given a zero duration.
+
+It used to take the source's timestamps as they came. At a `media_player`
+loop of the 29.97 fps VH1 clip the flow carried a second of audio stamped
+60 s back and the loop's first picture 16 543 s back; the output published a
+video sample 16 543.6 s long, an IDR repeating the previous frame's PTS, an
+audio sample 58.9 s long (v0.111.0 did the same at every loop) and a 3.98 s
+segment with two IDRs, with no `#EXT-X-DISCONTINUITY` to excuse any of it — a
+fragment carrying both sides of a jump cannot be described by a tag that
+applies between segments. Measured on the same clip across two loops
+(`runs/p4r-cmaf-vh1-r2`): every re-encoded segment 1.969–2.035 s, `tfdt`
+continuous on both tracks, the longest video sample 33.4 ms and audio 61 ms,
+ffmpeg decoding the whole window with no error — two warnings remain, one per
+loop, where the splice put a picture 13 ms after the one before it (the
+source's timeline across the loop is 20 ms short of frame-contiguous).
+
+A new offset is a seam: the content on either side is joined end to end, so
+a real gap in the source across a discontinuity is closed on the media
+timeline. The published dates still carry it: the flow clock sees the wall
+clock move on where the media timeline did not, re-anchors, and the row is
+tagged `#EXT-X-DISCONTINUITY` (see [A re-anchor is declared, not
+absorbed](#a-re-anchor-is-declared-not-absorbed)). A loop or a
+wrong-clock excursion — the timeline jumping where the wall clock did not —
+is absorbed, and no longer re-anchors the dates.
+
+An MPEG-2 video source is decoded and re-encoded with `video_encode`
+(`VideoReencoder::encode_mpeg2`; the decoder takes the ES as the PES carried
+it). It used to be dropped whatever the config said, so an MPEG-2 source
+published nothing at all — its audio shed for want of a video segment to carry
+it. Without `video_encode` the output says so once (Warning
+`codec_needs_encode`).
 
 ## Playlist window (`dvr_window_secs`)
 
@@ -646,9 +700,14 @@ samples — permanently, on every flow, on the one path a browser decodes.
 Two things move the published dates discontinuously, and neither is a fault to
 be removed:
 
-* **A source restart or PTS discontinuity.** The implied epoch moves by the
-  whole elapsed time, crosses `EPOCH_REANCHOR_SECS` (10 s), and the clock
-  re-anchors on the new sample.
+* **A source restart or PTS discontinuity** — once it reaches the flow clock.
+  The implied epoch moves by the whole elapsed time, crosses
+  `EPOCH_REANCHOR_SECS` (10 s), and the clock re-anchors on the new sample.
+  Since the output keeps one media timeline (see [One media timeline,
+  whatever the source does](#one-media-timeline-whatever-the-source-does)) a
+  jump in the source's timestamps reaches the clock only as the wall-clock
+  gap it came with: a source that was away for minutes re-anchors, a loop or
+  an excursion on a wrong clock does not.
 * **A source outside the slew band.** The epoch corrects by at most 5 ms per
   segment — about 2500 ppm at 2 s segments — so a source further out than that
   falls behind until the error crosses the same 10 s and snaps. Simulated, a
@@ -1322,6 +1381,15 @@ should set up a URL-rewriting reverse proxy in front of their ingest.
 
 ## Known limitations
 
+- **Passthrough of a source with B-frames is not decodable in order.** The
+  demuxer hands the segmenter each access unit's PTS only, and the segmenter
+  takes it as the decode time (`VideoSegmenter::push`): a reordering source's
+  decode-order PTS steps back at every B picture, so its samples get zero
+  durations and its fragments' `tfdt` fall back 1.4 s at each cut on the
+  29.97 fps VH1 clip (ffmpeg: 1 174 non-monotonic DTS in 140 s). Measured in
+  2026-09, on v0.111.0 too; it wants the PES DTS carried to the segmenter
+  and written as the decode time, with composition offsets. `video_encode`
+  (B-frames pinned off) is the workaround.
 - **`EXT-X-PART` rows are emitted after their own segment's `#EXTINF`.**
   RFC 8216bis §4.4.4.9 places a segment's partial-segment rows *before*
   its `#EXTINF`; trailing parts belong to the next, not-yet-complete
