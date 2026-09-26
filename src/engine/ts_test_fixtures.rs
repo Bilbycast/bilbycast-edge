@@ -296,3 +296,32 @@ pub fn aac_program_ts(adts: &[u8]) -> Vec<u8> {
     }
     ts
 }
+
+/// One second of a 1 kHz tone (and 440 Hz on the right) as HE-AAC ADTS
+/// frames — v1 (SBR) or v2 (SBR + PS) at 48 kHz stereo — from the fdk
+/// encoder. ADTS signals SBR implicitly: every header carries the AAC-LC
+/// profile and the 24 kHz core rate, and v2's mono core.
+#[cfg(feature = "fdk-aac")]
+pub fn he_aac_adts(v2: bool) -> Vec<u8> {
+    let mut enc = aac_audio::AacEncoder::open(&aac_codec::EncoderConfig {
+        profile: if v2 { aac_codec::AacProfile::HeAacV2 } else { aac_codec::AacProfile::HeAacV1 },
+        sample_rate: 48_000,
+        channels: 2,
+        bitrate: if v2 { 32_000 } else { 64_000 },
+        afterburner: true,
+        sbr_signaling: aac_codec::SbrSignaling::Implicit,
+        transport: aac_codec::TransportType::Adts,
+    })
+    .expect("fdk HE-AAC encoder");
+    let n = enc.frame_size() as usize;
+    let mut out = Vec::new();
+    for k in 0..48_000 / n {
+        let tone = |f: f32| -> Vec<f32> {
+            (0..n)
+                .map(|i| 0.3 * (2.0 * std::f32::consts::PI * f * (k * n + i) as f32 / 48_000.0).sin())
+                .collect()
+        };
+        out.extend(enc.encode_frame(&[tone(1_000.0), tone(440.0)]).expect("encode").bytes);
+    }
+    out
+}

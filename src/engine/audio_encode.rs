@@ -1146,6 +1146,27 @@ impl AudioEncoder {
         self.upstream_delay_90k = frames as u64 * 90_000 / rate.max(1) as u64;
     }
 
+    /// Convert decoded PCM (`planar` at `rate`) through `stage` to this
+    /// encoder's format and submit it at `pts` — declaring the stage's delay
+    /// as it stands first ([`Self::set_upstream_delay`]). A stage built
+    /// lazily (a silent fallback's, on the first real frame) or rebuilt for
+    /// another source format gains or loses a resampler after the encoder
+    /// was built; declared once at build time, its delay stayed on every
+    /// stamp. It takes effect at the encoder's next anchor.
+    pub fn submit_through(
+        &mut self,
+        stage: &mut crate::engine::audio_transcode::EncoderStage,
+        planar: &[Vec<f32>],
+        rate: u32,
+        pts: u64,
+    ) -> Result<bool, String> {
+        let pcm = stage.process(planar, rate)?;
+        if let Some((out_rate, _)) = stage.output() {
+            self.set_upstream_delay(stage.delay(), out_rate);
+        }
+        Ok(self.submit_planar(&pcm, pts))
+    }
+
     /// Re-anchor the output timeline at the next submitted PTS.
     ///
     /// The in-process backends anchor once, at the first submit, and then
@@ -3164,6 +3185,24 @@ mod tests {
                 assert!(e.abs() <= 2.0, "{codec:?} {in_rate} -> {out_rate}: {e:.1} samples off");
             }
         }
+    }
+
+    /// A stage that gains its resampler after the encoder was built (a
+    /// silent fallback's, pinned to 48 kHz, meeting a 44.1 kHz source on its
+    /// first real frame) has that delay declared on the submit that goes
+    /// through it — it used to be declared once, as 0, when the encoder was
+    /// built, and stayed on every stamp.
+    #[cfg(all(feature = "fdk-aac", feature = "media-codecs"))]
+    #[test]
+    fn a_stage_built_after_the_encoder_declares_its_delay() {
+        let mut enc = resampling_encoder(AudioCodec::AacLc, 48_000, 48_000);
+        let mut stage = crate::engine::audio_transcode::EncoderStage::new(None, None, None);
+        stage.pin_output(48_000, 2);
+        assert_eq!(enc.upstream_delay_90k, 0);
+        let pcm = vec![vec![0.1f32; 1_000]; 2];
+        assert!(enc.submit_through(&mut stage, &pcm, 44_100, 900_000).unwrap());
+        assert!(stage.delay() > 0, "the stage resamples");
+        assert_eq!(enc.upstream_delay_90k, stage.delay() as u64 * 90_000 / 48_000);
     }
 
     /// A stage in front of the encoder (`set_upstream_delay`) is taken off

@@ -852,6 +852,26 @@ impl std::fmt::Debug for AacDecoder {
     }
 }
 
+/// The PCM format an [`AacDecoder`] built from this ADTS config produces
+/// for `frame` (an ADTS-stripped access unit): the header's rate and
+/// channel count describe the AAC core, which is not what HE-AAC decodes
+/// to — SBR doubles the rate (a 48 kHz service carries 24000 in its
+/// header) and PS widens v2's mono core to stereo. `None` when the frame
+/// does not decode (the next one may).
+pub fn aac_decoded_format(
+    profile: u8,
+    sample_rate_index: u8,
+    channel_config: u8,
+    frame: &[u8],
+) -> Option<(u32, u8)> {
+    let mut d = AacDecoder::from_adts_config(profile, sample_rate_index, channel_config).ok()?;
+    let planar = d.decode_frame(frame).ok()?;
+    if planar.first().is_none_or(|c| c.is_empty()) {
+        return None;
+    }
+    Some((d.sample_rate(), planar.len() as u8))
+}
+
 #[cfg(feature = "fdk-aac")]
 impl AacDecoder {
     /// Construct an AAC decoder from the demuxer-cached ADTS config.

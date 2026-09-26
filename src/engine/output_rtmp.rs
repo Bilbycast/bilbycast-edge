@@ -508,6 +508,7 @@ async fn publish_loop(
                         encoder_state = build_encoder_state(
                             config,
                             &demuxer,
+                            Some(&data),
                             compressed_audio_input,
                             cancel,
                             stats,
@@ -593,10 +594,8 @@ async fn publish_loop(
                             match dec.decode_frame(&data) {
                                 Ok(planar) => {
                                     decode_stats.inc_output();
-                                    match stage.process(&planar, dec.sample_rate()) {
-                                        Ok(pcm) => {
-                                            encoder.submit_planar(&pcm, pts);
-                                        }
+                                    match encoder.submit_through(stage, &planar, dec.sample_rate(), pts) {
+                                        Ok(_) => {}
                                         Err(e) => {
                                             tracing::debug!(
                                                 "RTMP output '{}': transcode failed: {e}",
@@ -667,6 +666,7 @@ async fn publish_loop(
                         encoder_state = build_encoder_state(
                             config,
                             &demuxer,
+                            None,
                             compressed_audio_input,
                             cancel,
                             stats,
@@ -725,10 +725,8 @@ async fn publish_loop(
                             // To the encoder's format: MP2 at another rate
                             // was encoded as if at the encoder's (and ran
                             // at the wrong speed), 5.1 AC-3 refused.
-                            match stage.process(&frame.planar, frame.sample_rate) {
-                                Ok(pcm) => {
-                                    encoder.submit_planar(&pcm, pts);
-                                }
+                            match encoder.submit_through(stage, &frame.planar, frame.sample_rate, pts) {
+                                Ok(_) => {}
                                 Err(e) => {
                                     tracing::debug!(
                                         "RTMP output '{}': transcode failed: {e}",
@@ -1922,6 +1920,7 @@ async fn wait_or_cancel(cancel: &CancellationToken, secs: u64) {
 fn build_encoder_state(
     config: &RtmpOutputConfig,
     demuxer: &TsDemuxer,
+    first_frame: Option<&[u8]>,
     compressed_audio_input: bool,
     cancel: &CancellationToken,
     stats: &Arc<OutputStatsAccumulator>,
@@ -1971,17 +1970,16 @@ fn build_encoder_state(
         return EncoderState::Failed;
     }
 
-    let Some(input_sr) = sample_rate_from_index(sr_idx) else {
+    if sample_rate_from_index(sr_idx).is_none() {
         tracing::error!(
             "RTMP output '{}': audio_encode rejected unsupported AAC sample_rate_index={sr_idx}",
             config.id
         );
         return EncoderState::Failed;
-    };
-    let input_ch = ch_cfg;
-    if input_ch == 0 || input_ch > 2 {
+    }
+    if ch_cfg == 0 || ch_cfg > 2 {
         tracing::error!(
-            "RTMP output '{}': audio_encode rejected unsupported AAC channel_config={input_ch}",
+            "RTMP output '{}': audio_encode rejected unsupported AAC channel_config={ch_cfg}",
             config.id
         );
         return EncoderState::Failed;
@@ -2005,10 +2003,27 @@ fn build_encoder_state(
     if codec == AudioCodec::AacLc && no_overrides && config.transcode.is_none() {
         tracing::info!(
             "RTMP output '{}': audio_encode same-codec passthrough (AAC-LC {} Hz {} ch)",
-            config.id, input_sr, input_ch
+            config.id,
+            sample_rate_from_index(sr_idx).unwrap_or(0),
+            ch_cfg
         );
         return EncoderState::Transparent;
     }
+
+    // What the decoder really hands out: an HE-AAC header gives the core's
+    // rate (24 kHz for a 48 kHz service) and v2's mono core, which SBR and
+    // PS double. Resolved from the header, the stage and the encoder were
+    // pinned to the core's format — 48 kHz decoded PCM resampled to 24 kHz
+    // (a 12 kHz audio bandwidth) and v2's stereo mixed to mono.
+    let Some((input_sr, input_ch)) = first_frame
+        .and_then(|f| super::audio_decode::aac_decoded_format(profile, sr_idx, ch_cfg, f))
+    else {
+        tracing::debug!(
+            "RTMP output '{}': audio_encode waits for an AAC frame that decodes",
+            config.id
+        );
+        return EncoderState::Lazy;
+    };
 
     // Resolve the encoder's input shape: the channel / rate stage converts
     // the source to it — the transcode block when set (audio_encode's
@@ -2261,11 +2276,16 @@ fn build_encoder_state_eager_for_silent_fallback(
         return EncoderState::Failed;
     };
 
-    // Declared encoder params. These are also the silence generator's
-    // PCM format — so real audio arriving later with different params
-    // is run through a resampler (lazily built on first real frame).
-    let target_sr = enc_cfg.sample_rate.unwrap_or(48_000);
-    let target_ch = enc_cfg.channels.unwrap_or(2).clamp(1, 2);
+    // Declared encoder params — a transcode block's first, as on every
+    // other build of this stage (`audio_transcode::encoder_stage`). These
+    // are also the silence generator's PCM format, and the stage below is
+    // pinned to them: real audio arriving later is converted to them. Sized
+    // from `audio_encode` alone, a block's `channels: 1` (with its routing)
+    // met an encoder opened in stereo, and the stage fell back to the
+    // default conversion — stereo out, the operator's routing dropped.
+    let block = config.transcode.as_ref();
+    let target_sr = block.and_then(|b| b.sample_rate).or(enc_cfg.sample_rate).unwrap_or(48_000);
+    let target_ch = block.and_then(|b| b.channels).or(enc_cfg.channels).unwrap_or(2).clamp(1, 2);
     let target_br = enc_cfg.bitrate_kbps.unwrap_or_else(|| codec.default_bitrate_kbps());
 
     let params = EncoderParams {
@@ -2779,7 +2799,8 @@ mod tests {
         assert_eq!(demux.cached_aac_config(), Some((1, 3, 2)), "a stereo 48 kHz source");
         let (events, _rx) = crate::manager::events::event_channel();
         let stats = Arc::new(OutputStatsAccumulator::new("r1".into(), "r1".into(), "rtmp".into()));
-        let st = build_encoder_state(&cfg, &demux, true, &CancellationToken::new(), &stats, "f", &events);
+        let first = first_aac_frame(&mut TsDemuxer::new(None), &crate::engine::ts_test_fixtures::aac_program_ts(ADTS));
+        let st = build_encoder_state(&cfg, &demux, Some(&first), true, &CancellationToken::new(), &stats, "f", &events);
         let EncoderState::Active { encoder, mut stage, .. } = st else {
             panic!("the output must re-encode, not fail");
         };
@@ -2789,6 +2810,94 @@ mod tests {
         let out = stage.process(&[vec![0.1f32; 1024], vec![0.1f32; 1024]], 48_000).unwrap();
         assert_eq!(out.len(), 1, "the stage mixes to mono");
         assert!(stage.delay() > 0, "and resamples, in streaming mode");
+    }
+
+    /// The first `Aac` frame `demux` hands out for `ts`.
+    #[cfg(feature = "fdk-aac")]
+    fn first_aac_frame(demux: &mut TsDemuxer, ts: &[u8]) -> Vec<u8> {
+        demux
+            .demux(ts)
+            .into_iter()
+            .find_map(|f| match f {
+                DemuxedFrame::Aac { data, .. } => Some(data),
+                _ => None,
+            })
+            .expect("an AAC frame")
+    }
+
+    /// An HE-AAC source's ADTS header says 24 kHz (the core) and, for v2,
+    /// mono (the core under PS). The re-encode is set up from what the
+    /// decoder hands out — 48 kHz stereo — not from that: pinned to the
+    /// header, it resampled the decoded 48 kHz to 24 kHz (a 12 kHz audio
+    /// bandwidth) and mixed v2's stereo to mono.
+    #[cfg(feature = "fdk-aac")]
+    #[test]
+    fn an_he_aac_source_is_re_encoded_at_its_decoded_format() {
+        let cfg: RtmpOutputConfig = serde_json::from_value(serde_json::json!({
+            "id": "r1", "name": "r1", "dest_url": "rtmp://127.0.0.1/app", "stream_key": "k",
+            "audio_encode": { "codec": "aac_lc", "bitrate_kbps": 128 }
+        }))
+        .unwrap();
+        for (v2, ch_cfg) in [(false, 2u8), (true, 1)] {
+            let ts = crate::engine::ts_test_fixtures::aac_program_ts(
+                &crate::engine::ts_test_fixtures::he_aac_adts(v2),
+            );
+            let mut demux = TsDemuxer::new(None);
+            let first = first_aac_frame(&mut demux, &ts);
+            assert_eq!(demux.cached_aac_config(), Some((1, 6, ch_cfg)), "v2 {v2}: LC, 24 kHz core");
+            let (events, _rx) = crate::manager::events::event_channel();
+            let stats = Arc::new(OutputStatsAccumulator::new("r1".into(), "r1".into(), "rtmp".into()));
+            let st = build_encoder_state(
+                &cfg,
+                &demux,
+                Some(&first),
+                true,
+                &CancellationToken::new(),
+                &stats,
+                "f",
+                &events,
+            );
+            let EncoderState::Active { encoder, mut stage, .. } = st else {
+                panic!("v2 {v2}: the output must re-encode");
+            };
+            let p = encoder.params();
+            assert_eq!((p.sample_rate, p.channels), (48_000, 2), "v2 {v2}: the decoded format");
+            let out = stage.process(&[vec![0.1f32; 2048], vec![0.1f32; 2048]], 48_000).unwrap();
+            assert_eq!((out.len(), out[0].len()), (2, 2048), "v2 {v2}: nothing to convert");
+            assert_eq!(stage.delay(), 0);
+        }
+    }
+
+    /// A silent-fallback encoder, built before any source audio, is sized
+    /// from the transcode block first — its `channels: 1` and routing (left
+    /// only, here) — then `audio_encode`. Sized from `audio_encode` alone it
+    /// opened in stereo, the stage pinned to that found the block's mono
+    /// did not fit and fell back to the default conversion: stereo out, the
+    /// routing dropped.
+    #[test]
+    fn a_silent_fallback_encoder_takes_the_transcode_blocks_format() {
+        let cfg: RtmpOutputConfig = serde_json::from_value(serde_json::json!({
+            "id": "r1", "name": "r1", "dest_url": "rtmp://127.0.0.1/app", "stream_key": "k",
+            "audio_encode": { "codec": "aac_lc", "silent_fallback": true },
+            "transcode": { "channels": 1, "channel_map_with_gain": [[[0, 1.0]]] }
+        }))
+        .unwrap();
+        let (events, _rx) = crate::manager::events::event_channel();
+        let stats = Arc::new(OutputStatsAccumulator::new("r1".into(), "r1".into(), "rtmp".into()));
+        let st = build_encoder_state_eager_for_silent_fallback(
+            &cfg,
+            &CancellationToken::new(),
+            &stats,
+            "f",
+            &events,
+        );
+        let EncoderState::Active { encoder, mut stage, .. } = st else {
+            panic!("silent fallback builds eagerly");
+        };
+        assert_eq!((encoder.params().sample_rate, encoder.params().channels), (48_000, 1));
+        let out = stage.process(&[vec![0.5f32; 1024], vec![0.0f32; 1024]], 48_000).unwrap();
+        assert_eq!(out.len(), 1, "mono");
+        assert!((out[0][512] - 0.5).abs() < 1e-6, "the block's routing: left only, {}", out[0][512]);
     }
 
     /// Verify the exponential backoff schedule matches the docstring above.
