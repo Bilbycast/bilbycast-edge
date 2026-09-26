@@ -108,7 +108,12 @@ async fn hls_output_loop(
 
     // Resolve audio_encode at startup.
     let mut audio_encode_config: Option<ResolvedAudioEncode> = match &config.audio_encode {
-        Some(enc) => match resolve_audio_encode(enc, config.transcode.clone(), &config.id) {
+        Some(enc) => match resolve_audio_encode(
+            enc,
+            config.transcode.clone(),
+            &config.id,
+            EncoderCtxParts { cancel: &cancel, stats: &stats, flow_id, events: Some(event_sender) },
+        ) {
             Ok(resolved) => {
                 tracing::info!(
                     "HLS output '{}': audio_encode active codec={} bitrate={:?}k sr={:?} ch={:?}",
@@ -514,12 +519,14 @@ struct ResolvedAudioEncode {
     /// remux path (`media-codecs` feature); the subprocess fallback
     /// logs a warning and ignores it.
     transcode: Option<super::audio_transcode::TranscodeJson>,
-    /// The (rate, channels) the first re-encoded segment resolved to: every
-    /// later segment is converted to it, so the rendition keeps one format
-    /// when its source changes format in-band (a playlist has no way to
-    /// signal a change of channel count or rate between segments).
+    /// The re-encode chain the output's segments run through, one after the
+    /// other (`HlsAudioChain`); taken out while a segment is on the
+    /// blocking pool. Its stage fixes the rendition's (rate, channels) at the
+    /// first frame, so the rendition keeps one format when its source
+    /// changes format in-band (a playlist has no way to signal a change of
+    /// channel count or rate between segments).
     #[cfg(feature = "media-codecs")]
-    out_format: Option<(u32, u8)>,
+    chain: Option<HlsAudioChain>,
     /// Pre-built ffmpeg args (only used for subprocess fallback).
     #[cfg(not(feature = "media-codecs"))]
     ffmpeg_args: Vec<String>,
@@ -531,6 +538,7 @@ fn resolve_audio_encode(
     enc: &AudioEncodeConfig,
     transcode: Option<super::audio_transcode::TranscodeJson>,
     output_id: &str,
+    #[cfg_attr(not(feature = "media-codecs"), allow(unused_variables))] ctx: EncoderCtxParts<'_>,
 ) -> Result<ResolvedAudioEncode, String> {
     let codec = AudioCodec::parse(&enc.codec)
         .ok_or_else(|| format!("unknown codec '{}'", enc.codec))?;
@@ -581,15 +589,37 @@ fn resolve_audio_encode(
             );
         }
 
-        Ok(ResolvedAudioEncode {
+        let mut resolved = ResolvedAudioEncode {
             codec,
             bitrate_kbps,
             sample_rate: enc.sample_rate,
             channels: enc.channels,
             transcode,
-            out_format: None,
-        })
+            chain: None,
+        };
+        resolved.chain = Some(HlsAudioChain::new(
+            &resolved,
+            HlsEncoderCtx {
+                cancel: ctx.cancel.clone(),
+                stats: ctx.stats.clone(),
+                flow_id: ctx.flow_id.to_string(),
+                output_id: output_id.to_string(),
+                events: ctx.events.cloned(),
+            },
+        ));
+        Ok(resolved)
     }
+}
+
+/// What an HLS output's loop hands [`resolve_audio_encode`] for the encoder
+/// it opens: its cancel token, stats, flow and events.
+#[derive(Clone, Copy)]
+#[cfg_attr(not(feature = "media-codecs"), allow(dead_code))]
+struct EncoderCtxParts<'a> {
+    cancel: &'a CancellationToken,
+    stats: &'a Arc<OutputStatsAccumulator>,
+    flow_id: &'a str,
+    events: Option<&'a EventSender>,
 }
 
 /// Remux a TS segment with audio re-encoding. Dispatches to in-process
@@ -600,32 +630,20 @@ async fn remux_segment_audio(
 ) -> Result<Vec<u8>, String> {
     #[cfg(feature = "media-codecs")]
     {
-        // Run in-process on a blocking thread (C codec calls are synchronous)
+        // Run in-process on a blocking thread (C codec calls are
+        // synchronous), the chain moved there and back.
         let segment_owned = segment.to_vec();
-        let codec = enc.codec;
-        let bitrate_kbps = enc.bitrate_kbps;
-        let sample_rate = enc.sample_rate;
-        let channels = enc.channels;
-        let transcode = enc.transcode.clone();
-        let pinned = enc.out_format;
-
-        let (data, out_format) = tokio::task::spawn_blocking(move || {
-            remux_ts_audio_inprocess_pinned(
-                &segment_owned,
-                codec,
-                bitrate_kbps,
-                sample_rate,
-                channels,
-                transcode,
-                pinned,
-            )
+        let Some(mut chain) = enc.chain.take() else {
+            return Err("the audio re-encode chain was lost with a panicked segment".into());
+        };
+        let (chain, data) = tokio::task::spawn_blocking(move || {
+            let data = chain.remux(&segment_owned);
+            (chain, data)
         })
         .await
-        .map_err(|e| format!("remux task panicked: {e}"))??;
-        if out_format.is_some() {
-            enc.out_format = out_format;
-        }
-        Ok(data)
+        .map_err(|e| format!("remux task panicked: {e}"))?;
+        enc.chain = Some(chain);
+        data
     }
 
     #[cfg(not(feature = "media-codecs"))]
@@ -638,43 +656,97 @@ async fn remux_segment_audio(
 // In-process TS audio remuxer (media-codecs feature)
 // ════════════════════════════════════════════════════════════════════════
 
-/// [`remux_ts_audio_inprocess_pinned`] for one segment on its own (no
-/// format carried from an earlier one).
-#[cfg(all(test, feature = "media-codecs"))]
-fn remux_ts_audio_inprocess(
-    segment: &[u8],
-    codec: AudioCodec,
-    bitrate_kbps: u32,
-    sample_rate_override: Option<u32>,
-    channels_override: Option<u8>,
-    transcode: Option<super::audio_transcode::TranscodeJson>,
-) -> Result<Vec<u8>, String> {
-    remux_ts_audio_inprocess_pinned(
-        segment,
-        codec,
-        bitrate_kbps,
-        sample_rate_override,
-        channels_override,
-        transcode,
-        None,
-    )
-    .map(|(data, _)| data)
+/// What an HLS output's audio re-encode needs from its loop to open an
+/// encoder: the same accounting every other re-encoding output registers.
+#[cfg(feature = "media-codecs")]
+struct HlsEncoderCtx {
+    cancel: CancellationToken,
+    stats: Arc<OutputStatsAccumulator>,
+    flow_id: String,
+    output_id: String,
+    events: Option<EventSender>,
 }
 
-/// Re-encode a segment's audio in process. `pinned`: the output format an
-/// earlier segment resolved (see `ResolvedAudioEncode::out_format`). Returns
-/// the segment and the output format its audio was encoded at (`None` when
-/// it carried no audio).
+/// How far (90 kHz) a decoded frame's PTS may sit from where the encoder's
+/// input is before the encoder's timeline is re-anchored on it: one 48 kHz
+/// frame plus rounding, as on CMAF (`SOURCE_PTS_SLACK_TICKS`).
 #[cfg(feature = "media-codecs")]
-fn remux_ts_audio_inprocess_pinned(
-    segment: &[u8],
+const HLS_SOURCE_PTS_SLACK_90K: u64 = 2_000;
+
+/// An HLS output's audio re-encode, kept across its segments.
+///
+/// Each segment used to be re-encoded by a fresh chain: a new encoder whose
+/// priming (2048 samples of AAC-LC) opened every segment, stamped at the
+/// segment's first source PTS so the content presented that late; its delay
+/// line was never flushed, so the tail of every segment's audio (the
+/// priming's worth, plus the partial frame) was never emitted; a new AU
+/// cutter lost an AU straddling two segments; and the audio PID's continuity
+/// counter restarted at 0 in every segment. One chain now runs across them:
+/// the cutter, the decoder, the channel / rate stage (streaming — its
+/// constant delay comes off the stamps) and the encoder (the one every
+/// re-encoding output uses, `audio_encode::AudioEncoder`: content-true
+/// anchoring, codec delay off the stamps, one anchor and a running sample
+/// count) all carry on, so the audio of consecutive segments is one
+/// continuous stream. The frames the encoder hands back while a segment is
+/// processed go into that segment; the last ~2048 samples of it are still in
+/// the encoder's delay line and come out in the next segment — each on its
+/// own PTS, so the rendition's audio timeline has no gap and no overlap.
+/// A source whose PTS jumps (a splice, a loop) re-anchors the encoder on
+/// the new PTS, as on CMAF.
+#[cfg(feature = "media-codecs")]
+struct HlsAudioChain {
     codec: AudioCodec,
     bitrate_kbps: u32,
-    sample_rate_override: Option<u32>,
-    channels_override: Option<u8>,
-    transcode: Option<super::audio_transcode::TranscodeJson>,
-    pinned: Option<(u32, u8)>,
-) -> Result<(Vec<u8>, Option<(u32, u8)>), String> {
+    stage: super::audio_transcode::EncoderStage,
+    ctx: HlsEncoderCtx,
+    /// The source audio PID and stream type the cutter and decoder follow.
+    source: Option<(u16, u8)>,
+    cutter: Option<super::audio_au::AuCutter>,
+    #[cfg(feature = "fdk-aac")]
+    aac_decoder: Option<aac_audio::AacDecoder>,
+    ff_decoder: Option<(video_codec::AudioDecoderCodec, video_engine::AudioDecoder)>,
+    /// PTS the next decoded frame follows on from when its AU carried none.
+    running_pts: Option<u64>,
+    encoder: Option<super::audio_encode::AudioEncoder>,
+    /// Where the encoder's input is on the source timeline: the PTS it was
+    /// (re-)anchored at and the samples it has taken since, at `in_rate`.
+    in_anchor: Option<u64>,
+    in_samples: u64,
+    in_rate: u32,
+    /// The source's AC-3 / E-AC-3 dialogue level last carried into an
+    /// AC-3 re-encode.
+    encoder_dialnorm: Option<i8>,
+    source_dialnorm: Option<i8>,
+    /// Continuity counter of the audio PID across segments.
+    audio_cc: u8,
+}
+
+#[cfg(feature = "media-codecs")]
+impl HlsAudioChain {
+    fn new(enc: &ResolvedAudioEncode, ctx: HlsEncoderCtx) -> Self {
+        Self {
+            codec: enc.codec,
+            bitrate_kbps: enc.bitrate_kbps,
+            stage: super::audio_transcode::EncoderStage::new(enc.transcode.clone(), enc.sample_rate, enc.channels),
+            ctx,
+            source: None,
+            cutter: None,
+            #[cfg(feature = "fdk-aac")]
+            aac_decoder: None,
+            ff_decoder: None,
+            running_pts: None,
+            encoder: None,
+            in_anchor: None,
+            in_samples: 0,
+            in_rate: 0,
+            encoder_dialnorm: None,
+            source_dialnorm: None,
+            audio_cc: 0,
+        }
+    }
+
+    /// Re-encode one segment's audio (see the type doc).
+    fn remux(&mut self, segment: &[u8]) -> Result<Vec<u8>, String> {
     use super::ts_parse::{ts_pid, ts_pusi, ts_has_payload, ts_payload_offset,
                           parse_pat_programs, PAT_PID};
 
@@ -694,7 +766,6 @@ fn remux_ts_audio_inprocess_pinned(
     // remux ("no audio PID found") on such streams.
     let mut pmt_pid: Option<u16> = None;
     let mut program: Option<(u16, bool)> = None; // (program_number, pid_shared)
-    let mut video_pid: Option<u16> = None;
     let mut audio_pid: Option<u16> = None;
     let mut audio_stream_type: u8 = 0;
     let mut pmt_asm = super::ts_parse::SectionAssembler::new();
@@ -719,62 +790,71 @@ fn remux_ts_audio_inprocess_pinned(
             }
         }
 
-        if Some(pid) == pmt_pid && video_pid.is_none() {
+        if Some(pid) == pmt_pid && audio_pid.is_none() {
             let sections: Vec<Vec<u8>> = pmt_asm.push_packet(pkt).map(|s| s.to_vec()).collect();
             if let Some((pn, shared)) = program
                 && let Some(i) = pmt_index(&sections, pn, shared)
                 && let Some(view) = parse_pmt(&sections[i])
-                && let Some((vpid, apid, ast)) = pmt_av_pids(&view)
+                && let Some((apid, ast)) = pmt_audio_pid(&view)
             {
-                video_pid = Some(vpid);
                 audio_pid = Some(apid);
                 audio_stream_type = ast;
             }
         }
 
-        if video_pid.is_some() && audio_pid.is_some() {
+        if audio_pid.is_some() {
             break;
         }
         offset += TS_PACKET_SIZE;
     }
 
     let audio_pid = audio_pid.ok_or("no audio PID found in segment")?;
-    let _video_pid = video_pid.ok_or("no video PID found in segment")?;
     let pmt_pid = pmt_pid.ok_or("no PMT PID found in segment")?;
     let (program_number, pmt_pid_shared) = program.ok_or("no program in the PAT")?;
+    let codec = self.codec;
     if matches!(codec, AudioCodec::Opus) {
         return Err("Opus not supported on HLS".into());
+    }
+    #[cfg(not(feature = "fdk-aac"))]
+    if matches!(codec, AudioCodec::AacLc | AudioCodec::HeAacV1 | AudioCodec::HeAacV2) {
+        return Err(format!("unsupported codec for in-process HLS remux: {}", codec.as_str()));
+    }
+
+    // A new audio PID or codec: the cutter and decoder start afresh, and
+    // the encoder re-anchors on the first frame they decode.
+    if self.source != Some((audio_pid, audio_stream_type)) {
+        self.source = Some((audio_pid, audio_stream_type));
+        self.cutter = super::audio_au::AuFormat::for_stream_type(audio_stream_type)
+            .map(super::audio_au::AuCutter::new);
+        #[cfg(feature = "fdk-aac")]
+        {
+            self.aac_decoder = None;
+        }
+        self.ff_decoder = None;
+        self.running_pts = None;
+        self.in_anchor = None;
     }
 
     // ── Cut the audio into access units ──
     //
-    // Across PES boundaries, not per PES: an AU that straddles two PES
-    // (legal whenever data_alignment_indicator is 0, and done by some
-    // broadcast muxers) was lost, and with it — the next PES then opening
-    // on its tail — every AU of the next PES. The cutter is the TS audio
-    // replacer's (`engine::audio_au`).
+    // Across PES boundaries and across segments: the cutter runs on, so
+    // an AU that straddles two PES (legal whenever data_alignment_indicator
+    // is 0, and done by some broadcast muxers) or two segments is cut
+    // whole. The cutter is the TS audio replacer's (`engine::audio_au`).
     let mut aus: Vec<(Vec<u8>, Option<u64>)> = Vec::new();
-    match super::audio_au::AuFormat::for_stream_type(audio_stream_type) {
-        Some(fmt) => {
-            let mut cutter = super::audio_au::AuCutter::new(fmt);
+    match self.cutter.as_mut() {
+        Some(cutter) => {
             offset = 0;
             while offset + TS_PACKET_SIZE <= segment.len() {
                 let pkt = &segment[offset..offset + TS_PACKET_SIZE];
                 offset += TS_PACKET_SIZE;
-                if pkt[0] != TS_SYNC_BYTE || ts_pid(pkt) != audio_pid || !ts_has_payload(pkt) {
+                if pkt[0] != TS_SYNC_BYTE || ts_pid(pkt) != audio_pid {
                     continue;
                 }
-                let payload_start = ts_payload_offset(pkt);
-                if payload_start >= TS_PACKET_SIZE {
-                    continue;
-                }
-                cutter.push(ts_pusi(pkt), &pkt[payload_start..]);
+                cutter.push_packet(pkt);
                 while let Some(au) = cutter.next(false) {
                     aus.push((au.data, au.pts.filter(|_| au.pes_start)));
                 }
-            }
-            while let Some(au) = cutter.next(true) {
-                aus.push((au.data, au.pts.filter(|_| au.pes_start)));
             }
         }
         None => {
@@ -826,32 +906,25 @@ fn remux_ts_audio_inprocess_pinned(
         }
     }
 
-    if aus.is_empty() {
-        // No audio to re-encode — return original segment unchanged
-        return Ok((segment.to_vec(), None));
-    }
 
     // The source's AC-3 / E-AC-3 dialogue level, carried into an AC-3
     // re-encode (libavcodec writes -31 otherwise).
-    let dialnorm = aus
-        .iter()
-        .find_map(|(au, _)| crate::engine::audio_decode::ac3_dialnorm(au));
+    if let Some(d) = aus.iter().rev().find_map(|(au, _)| crate::engine::audio_decode::ac3_dialnorm(au)) {
+        self.source_dialnorm = Some(d);
+    }
 
-    // ── Decode all audio AUs → PCM ──
-    let decoded_pcm = decode_audio_aus(&aus, audio_stream_type)?;
-
-    // ── Re-encode PCM → target codec ──
-    let (encoded_frames, out_format) = encode_audio_pcm(
-        &decoded_pcm,
-        codec,
-        bitrate_kbps,
-        sample_rate_override,
-        channels_override,
-        transcode.as_ref(),
-        dialnorm,
-        pinned,
-    )?;
-    let out_sr = out_format.map_or(0, |f| f.0);
+    // ── Decode → stage → encode, one chain across segments ──
+    let decoded = self.decode(&aus, audio_stream_type)?;
+    for frame in decoded {
+        self.submit(frame)?;
+    }
+    let encoded_frames: Vec<RemuxEncodedFrame> = self
+        .encoder
+        .as_mut()
+        .map(|e| e.drain().into_iter().map(|f| RemuxEncodedFrame { data: f.data.to_vec(), pts: f.pts }).collect())
+        .unwrap_or_default();
+    let out_sr = self.stage.output().map_or(0, |f| f.0);
+    let mut audio_cc = self.audio_cc;
 
     // ── Target signalling for the PMT ──
     //
@@ -870,7 +943,6 @@ fn remux_ts_audio_inprocess_pinned(
     // ── Build output segment ──
     // Copy all non-audio TS packets, rewrite PMT, insert new audio packets
     let mut output = Vec::with_capacity(segment.len());
-    let mut audio_cc: u8 = 0;
     let mut encoded_frame_idx = 0;
     let mut last_audio_position = false;
 
@@ -943,29 +1015,177 @@ fn remux_ts_audio_inprocess_pinned(
         }
     }
 
-    Ok((output, out_format))
+    self.audio_cc = audio_cc;
+    Ok(output)
+    }
+
+    /// Decode the segment's AUs with the chain's decoder: AAC (0x0F) via
+    /// fdk-aac, MP2 / AC-3 / E-AC-3 / LATM via libavcodec. An AU carrying its
+    /// PES's PTS is timed by it; the rest follow on from the samples decoded
+    /// before them — across segments too.
+    fn decode(&mut self, aus: &[(Vec<u8>, Option<u64>)], stream_type: u8) -> Result<Vec<PcmFrame>, String> {
+        let mut out = Vec::new();
+        if stream_type == 0x0F {
+            #[cfg(feature = "fdk-aac")]
+            {
+                if self.aac_decoder.is_none() {
+                    self.aac_decoder = Some(
+                        aac_audio::AacDecoder::open_adts().map_err(|e| format!("AAC decoder init failed: {e}"))?,
+                    );
+                }
+                let decoder = self.aac_decoder.as_mut().expect("opened above");
+                for (au, au_pts) in aus {
+                    let pts = next_pts(*au_pts, &mut self.running_pts);
+                    match decoder.decode_frame(au) {
+                        Ok(decoded) => {
+                            let sr = decoder.sample_rate().unwrap_or(48_000);
+                            if let Some(p) = pts {
+                                if sr > 0 {
+                                    self.running_pts = Some(p + (decoded.frame_size as u64) * 90_000 / sr as u64);
+                                }
+                                out.push(PcmFrame { planar: decoded.planar, pts: p, sample_rate: sr });
+                            }
+                        }
+                        Err(e) => tracing::debug!("AAC decode error in HLS remux: {e}"),
+                    }
+                }
+                return Ok(out);
+            }
+            #[cfg(not(feature = "fdk-aac"))]
+            return Err("AAC decoding requires the fdk-aac feature".into());
+        }
+        let Some(codec) = crate::engine::audio_decode::ff_codec_for_stream_type(stream_type) else {
+            return Err(format!("unsupported input audio stream type 0x{stream_type:02X} for re-encoding"));
+        };
+        if self.ff_decoder.as_ref().is_none_or(|(c, _)| *c != codec) {
+            let d = crate::engine::audio_decode::open_ff_decoder(codec)
+                .map_err(|e| format!("FFmpeg audio decoder init failed: {e}"))?;
+            self.ff_decoder = Some((codec, d));
+        }
+        let (_, decoder) = self.ff_decoder.as_mut().expect("opened above");
+        for (au, au_pts) in aus {
+            next_pts(*au_pts, &mut self.running_pts);
+            if decoder.send_packet(au, 0).is_err() {
+                continue;
+            }
+            while let Ok(frame) = decoder.receive_frame() {
+                let Some(p) = self.running_pts else {
+                    continue;
+                };
+                let sr = frame.sample_rate;
+                let n = frame.planar.first().map_or(0, |c| c.len());
+                if sr > 0 {
+                    self.running_pts = Some(p + n as u64 * 90_000 / sr as u64);
+                }
+                out.push(PcmFrame { planar: frame.planar, pts: p, sample_rate: sr });
+            }
+        }
+        Ok(out)
+    }
+
+    /// One decoded frame into the encoder, building it on the first (at the
+    /// format the stage resolves — the rendition keeps it: a playlist cannot
+    /// signal a change of rate or channel count between segments) and
+    /// re-anchoring it when the source's PTS is not where its input is.
+    fn submit(&mut self, frame: PcmFrame) -> Result<(), String> {
+        let n = frame.planar.first().map_or(0, |c| c.len()) as u64;
+        if n == 0 || frame.sample_rate == 0 {
+            return Ok(());
+        }
+        if self.encoder.is_none() {
+            let (sr, ch) = self.stage.prepare(frame.sample_rate, frame.planar.len() as u8)?;
+            let params = super::audio_encode::EncoderParams {
+                codec: self.codec,
+                sample_rate: sr,
+                channels: ch,
+                target_bitrate_kbps: self.bitrate_kbps,
+                target_sample_rate: sr,
+                target_channels: ch,
+                opus_vbr_mode: None,
+                opus_fec: false,
+                opus_dtx: false,
+                opus_frame_duration_ms: None,
+            };
+            let encoder = super::audio_encode::AudioEncoder::spawn(
+                params,
+                self.ctx.cancel.child_token(),
+                self.ctx.flow_id.clone(),
+                self.ctx.output_id.clone(),
+                self.ctx.stats.clone(),
+                self.ctx.events.clone(),
+            )
+            .map_err(|e| format!("audio encoder open failed: {e}"))?;
+            self.encoder = Some(encoder);
+            self.encoder_dialnorm = None;
+        }
+        // An AC-3 re-encode carries the source's dialogue level, and follows
+        // a change of it.
+        if self.codec == AudioCodec::Ac3
+            && let Some(d) = self.source_dialnorm
+            && self.encoder_dialnorm != Some(d)
+            && let Some(enc) = self.encoder.as_mut()
+        {
+            if let Err(e) = enc.set_codec_option("dialnorm", &d.to_string()) {
+                tracing::warn!("HLS output '{}': could not carry dialnorm {d} dB: {e}", self.ctx.output_id);
+            }
+            self.encoder_dialnorm = Some(d);
+        }
+        let expected = self
+            .in_anchor
+            .filter(|_| self.in_rate == frame.sample_rate)
+            .map(|a| a + self.in_samples * 90_000 / self.in_rate.max(1) as u64);
+        let enc = self.encoder.as_mut().expect("built above");
+        if expected.is_none_or(|x| x.abs_diff(frame.pts) > HLS_SOURCE_PTS_SLACK_90K) {
+            if self.in_anchor.is_some() {
+                tracing::debug!(
+                    "HLS output '{}': audio source PTS {} is not where the encoder's input is \
+                     ({expected:?}); re-anchoring",
+                    self.ctx.output_id, frame.pts,
+                );
+                enc.reanchor_pts();
+            }
+            self.in_anchor = Some(frame.pts);
+            self.in_samples = 0;
+            self.in_rate = frame.sample_rate;
+        }
+        enc.submit_through(&mut self.stage, &frame.planar, frame.sample_rate, frame.pts)?;
+        self.in_samples += n;
+        Ok(())
+    }
 }
 
-/// Video and audio PIDs of a parsed PMT (the last H.264 / HEVC ES and the
-/// last MPEG / AAC / AC-3 / private ES, as this remux always picked).
-/// Returns `(video_pid, audio_pid, audio_stream_type)`.
+/// The audio ES of a parsed PMT this remux re-encodes — the last one it can
+/// decode, as it always picked — and the stream type it decodes as: an AAC
+/// ADTS / LATM, MPEG audio, ATSC AC-3 / E-AC-3 stream type, or a private
+/// (0x06) ES whose descriptors name AC-3, E-AC-3, LATM or Opus (decoded as
+/// 0x81 / 0x87 / 0x11 / 0x06).
+///
+/// It used to require an H.264 / HEVC video ES beside it, which the remux
+/// never uses: an MPEG-2 video source (VH1) failed every segment with "no
+/// audio PID found" and the output published nothing. And it took every
+/// 0x06 ES for audio, so a later teletext or subtitle PID was re-encoded in
+/// place of the programme's sound.
 #[cfg(feature = "media-codecs")]
-fn pmt_av_pids(view: &super::ts_pmt_edit::PmtView<'_>) -> Option<(u16, u16, u8)> {
-    let mut video_pid = None;
+fn pmt_audio_pid(view: &super::ts_pmt_edit::PmtView<'_>) -> Option<(u16, u8)> {
+    use super::ts_parse::{descriptor_audio_kind, PrivateEsAudioKind};
     let mut audio: Option<(u16, u8)> = None;
     for es in &view.es {
-        let st = es.stream_type;
-        if st == 0x1B || st == 0x24 {
-            video_pid = Some(es.pid);
-        }
-        if st == 0x0F || st == 0x03 || st == 0x04 || st == 0x81 || st == 0x06 {
+        let decode_as = match es.stream_type {
+            st @ (0x0F | 0x11 | 0x03 | 0x04 | 0x80 | 0x81 | 0xC1 | 0x87 | 0xC2) => Some(st),
+            0x06 => match descriptor_audio_kind(view.es_info(es)) {
+                Some(PrivateEsAudioKind::Ac3) => Some(0x81),
+                Some(PrivateEsAudioKind::Eac3) => Some(0x87),
+                Some(PrivateEsAudioKind::AacLatm) => Some(0x11),
+                Some(PrivateEsAudioKind::Opus) => Some(0x06),
+                _ => None,
+            },
+            _ => None,
+        };
+        if let Some(st) = decode_as {
             audio = Some((es.pid, st));
         }
     }
-    match (video_pid, audio) {
-        (Some(v), Some((a, st))) => Some((v, a, st)),
-        _ => None,
-    }
+    audio
 }
 
 /// Extract elementary stream data and PTS from a PES packet.
@@ -1019,28 +1239,6 @@ struct RemuxEncodedFrame {
     pts: u64,
 }
 
-/// Decode audio access units to PCM frames: AAC (stream_type 0x0F) via
-/// fdk-aac, MP2 / AC-3 / E-AC-3 (0x03/0x04, 0x80/0x81/0xC1, 0x87/0xC2) via
-/// the FFmpeg-backed decoder. An AU carrying its PES's PTS is timed by it;
-/// the rest follow on from the samples decoded before them.
-#[cfg(feature = "media-codecs")]
-fn decode_audio_aus(
-    aus: &[(Vec<u8>, Option<u64>)],
-    audio_stream_type: u8,
-) -> Result<Vec<PcmFrame>, String> {
-    if audio_stream_type == 0x0F {
-        return decode_audio_aus_aac(aus);
-    }
-    if let Some(codec) = crate::engine::audio_decode::ff_codec_for_stream_type(
-        audio_stream_type,
-    ) {
-        return decode_audio_aus_ffmpeg(aus, codec);
-    }
-    Err(format!(
-        "unsupported input audio stream type 0x{audio_stream_type:02X} for re-encoding"
-    ))
-}
-
 /// The PTS of the next decoded frame: its AU's own, or where the previous
 /// frame ended.
 #[cfg(feature = "media-codecs")]
@@ -1049,304 +1247,6 @@ fn next_pts(au_pts: Option<u64>, running: &mut Option<u64>) -> Option<u64> {
         *running = au_pts;
     }
     *running
-}
-
-#[cfg(all(feature = "media-codecs", feature = "fdk-aac"))]
-fn decode_audio_aus_aac(aus: &[(Vec<u8>, Option<u64>)]) -> Result<Vec<PcmFrame>, String> {
-    let mut decoder = aac_audio::AacDecoder::open_adts()
-        .map_err(|e| format!("AAC decoder init failed: {e}"))?;
-    let mut pcm_frames = Vec::new();
-    let mut running = None;
-    for (au, au_pts) in aus {
-        let pts = next_pts(*au_pts, &mut running);
-        match decoder.decode_frame(au) {
-            Ok(decoded) => {
-                let sr = decoder.sample_rate().unwrap_or(48000);
-                if let Some(p) = pts {
-                    pcm_frames.push(PcmFrame { planar: decoded.planar, pts: p, sample_rate: sr });
-                    if sr > 0 {
-                        running = Some(p + (decoded.frame_size as u64) * 90_000 / sr as u64);
-                    }
-                }
-            }
-            Err(e) => {
-                tracing::debug!("AAC decode error in HLS remux: {e}");
-            }
-        }
-    }
-    Ok(pcm_frames)
-}
-
-#[cfg(all(feature = "media-codecs", not(feature = "fdk-aac")))]
-fn decode_audio_aus_aac(_aus: &[(Vec<u8>, Option<u64>)]) -> Result<Vec<PcmFrame>, String> {
-    Err("AAC decoding requires the fdk-aac feature".into())
-}
-
-#[cfg(feature = "media-codecs")]
-fn decode_audio_aus_ffmpeg(
-    aus: &[(Vec<u8>, Option<u64>)],
-    codec: video_codec::AudioDecoderCodec,
-) -> Result<Vec<PcmFrame>, String> {
-    let mut decoder = crate::engine::audio_decode::open_ff_decoder(codec)
-        .map_err(|e| format!("FFmpeg audio decoder init failed: {e}"))?;
-    let mut pcm_frames = Vec::new();
-    let mut running = None;
-    for (au, au_pts) in aus {
-        next_pts(*au_pts, &mut running);
-        if decoder.send_packet(au, 0).is_err() {
-            continue;
-        }
-        while let Ok(frame) = decoder.receive_frame() {
-            let Some(p) = running else {
-                continue;
-            };
-            let sr = frame.sample_rate;
-            let n_samples = frame.planar.first().map(|p| p.len()).unwrap_or(0);
-            pcm_frames.push(PcmFrame {
-                planar: frame.planar,
-                pts: p,
-                sample_rate: sr,
-            });
-            if sr > 0 {
-                running = Some(p + (n_samples as u64) * 90_000 / sr as u64);
-            }
-        }
-    }
-    Ok(pcm_frames)
-}
-
-/// Re-encode PCM frames to the target codec. Returns the frames and the
-/// output (rate, channels) — `None` for no frames.
-///
-/// The channel / rate stage in front of the encoder follows the rule every
-/// re-encoding output shares (`audio_transcode::encoder_stage`): the
-/// `transcode` block with `audio_encode`'s fields folded in, or those two
-/// alone when they differ from the source. Without a block the encoder was
-/// opened at `audio_encode.sample_rate` and fed PCM at the source's rate —
-/// 48 kHz through `sample_rate: 44100` played 8.8 % slow — and a channel
-/// count other than the source's was truncated or padded.
-///
-/// The output format is resolved from the segment's first frame (or
-/// `pinned`, an earlier segment's), and every frame is converted to it (see
-/// [`convert_segment_pcm`]): a source that changes format in-band keeps the
-/// rendition's format rather than breaking it.
-#[cfg(feature = "media-codecs")]
-#[allow(clippy::too_many_arguments)]
-fn encode_audio_pcm(
-    pcm_frames: &[PcmFrame],
-    codec: AudioCodec,
-    bitrate_kbps: u32,
-    sample_rate_override: Option<u32>,
-    channels_override: Option<u8>,
-    transcode: Option<&super::audio_transcode::TranscodeJson>,
-    dialnorm: Option<i8>,
-    pinned: Option<(u32, u8)>,
-) -> Result<(Vec<RemuxEncodedFrame>, Option<(u32, u8)>), String> {
-    let Some(first) = pcm_frames.first() else {
-        return Ok((Vec::new(), None));
-    };
-    let out = match pinned {
-        Some(o) => o,
-        None => super::audio_transcode::encoder_stage_format(
-            transcode,
-            sample_rate_override,
-            channels_override,
-            first.sample_rate,
-            first.planar.len() as u8,
-        )
-        .map_err(|e| format!("transcode build failed: {e}"))?,
-    };
-    let (target_sr, target_ch) = out;
-    let pcm = convert_segment_pcm(pcm_frames, transcode, sample_rate_override, channels_override, out);
-    let first_pts = first.pts;
-
-    // For AAC codecs, use fdk-aac directly
-    #[cfg(feature = "fdk-aac")]
-    if matches!(codec, AudioCodec::AacLc | AudioCodec::HeAacV1 | AudioCodec::HeAacV2) {
-        return encode_audio_pcm_aac(&pcm, first_pts, codec, bitrate_kbps, target_sr, target_ch)
-            .map(|f| (f, Some(out)));
-    }
-
-    // For Opus/MP2/AC-3, use the video-engine AudioEncoder
-    let codec_type = match codec {
-        AudioCodec::Mp2 => video_codec::AudioCodecType::Mp2,
-        AudioCodec::Ac3 => video_codec::AudioCodecType::Ac3,
-        AudioCodec::Opus => return Err("Opus not supported on HLS".into()),
-        _ => return Err(format!("unsupported codec for in-process HLS remux: {}", codec.as_str())),
-    };
-
-    let config = video_codec::AudioEncoderConfig {
-        codec: codec_type,
-        sample_rate: target_sr,
-        channels: target_ch,
-        bitrate_kbps,
-    };
-    let dialnorm = dialnorm.map(|d| d.to_string());
-    let opts: Vec<(&str, &str)> = match (codec_type, dialnorm.as_deref()) {
-        (video_codec::AudioCodecType::Ac3, Some(d)) => vec![("dialnorm", d)],
-        _ => Vec::new(),
-    };
-
-    let mut encoder = video_engine::AudioEncoder::open_with_options(&config, &opts)
-        .map_err(|e| format!("audio encoder open failed: {e}"))?;
-
-    let frame_size = encoder.frame_size();
-    let mut encoded_frames = Vec::new();
-    let mut pts_90k = first_pts;
-    let mut push = |frames: Vec<video_engine::audio_encoder::EncodedAudioFrame>, encoder: &video_engine::AudioEncoder| {
-        for ef in frames {
-            encoded_frames.push(RemuxEncodedFrame { data: ef.data.to_vec(), pts: pts_90k });
-            let sr = encoder.sample_rate() as u64;
-            if sr > 0 {
-                pts_90k += (ef.num_samples as u64) * 90_000 / sr;
-            }
-        }
-    };
-    let total = pcm.first().map_or(0, |c| c.len());
-    let mut at = 0;
-    while at + frame_size <= total {
-        let frame_planar: Vec<Vec<f32>> = pcm.iter().map(|ch| ch[at..at + frame_size].to_vec()).collect();
-        at += frame_size;
-        match encoder.encode_frame(&frame_planar) {
-            Ok(frames) => push(frames, &encoder),
-            Err(e) => tracing::debug!("audio encode error in HLS remux: {e}"),
-        }
-    }
-    // Flush encoder
-    if let Ok(frames) = encoder.flush() {
-        push(frames, &encoder);
-    }
-
-    Ok((encoded_frames, Some(out)))
-}
-
-/// The segment's decoded PCM at `out` (rate, channels), converted run by
-/// run: each stretch of frames in one decoded format through its own batch
-/// stage ([`super::audio_transcode::BatchStage`] around an `encoder_stage`
-/// pinned to `out`: resampled in fixed chunks, its output lined up with its
-/// input, its tail run out where the stretch ends). A source that changed
-/// format in-band mid-segment was fed to the one stage built for the first
-/// frame: a 5.1 programme going to a stereo break lost the rest of the
-/// segment's audio ("expected 6 input channels, got 2"), a 48 → 44.1 kHz
-/// splice was encoded at 48 kHz and played at the wrong speed.
-#[cfg(feature = "media-codecs")]
-fn convert_segment_pcm(
-    pcm_frames: &[PcmFrame],
-    transcode: Option<&super::audio_transcode::TranscodeJson>,
-    sample_rate_override: Option<u32>,
-    channels_override: Option<u8>,
-    out: (u32, u8),
-) -> Vec<Vec<f32>> {
-    use super::audio_transcode::{encoder_stage, BatchStage};
-    let mut acc: Vec<Vec<f32>> = vec![Vec::new(); out.1 as usize];
-    let mut run: Option<((u32, u8), BatchStage)> = None;
-    // A stretch ends: what its stage still holds goes out.
-    fn end_run(run: &mut Option<((u32, u8), BatchStage)>, acc: &mut [Vec<f32>]) {
-        if let Some((_, mut stage)) = run.take()
-            && let Ok(tail) = stage.finish()
-        {
-            accumulate(acc, &tail);
-        }
-    }
-    for pcm in pcm_frames {
-        let format = (pcm.sample_rate, pcm.planar.len() as u8);
-        if run.as_ref().is_none_or(|(f, _)| *f != format) {
-            end_run(&mut run, &mut acc);
-            match encoder_stage(
-                transcode,
-                sample_rate_override,
-                channels_override,
-                format.0,
-                format.1,
-                Some(out),
-            ) {
-                Ok(stage) => run = Some((format, BatchStage::new(stage))),
-                Err(e) => {
-                    tracing::debug!("transcode build failed in HLS remux: {e}");
-                    continue;
-                }
-            }
-        }
-        let Some((_, stage)) = run.as_mut() else {
-            continue;
-        };
-        match stage.process(&pcm.planar) {
-            Ok(p) => accumulate(&mut acc, &p),
-            Err(e) => tracing::debug!("transcode failed in HLS remux: {e}"),
-        }
-    }
-    end_run(&mut run, &mut acc);
-    acc
-}
-
-/// Append converted PCM to the encoder's accumulator: a channel it lacks is
-/// silence (the stage produces the target layout; this only guards a frame
-/// of another format that went through unconverted).
-#[cfg(feature = "media-codecs")]
-fn accumulate(accumulator: &mut [Vec<f32>], planar: &[Vec<f32>]) {
-    let n = planar.first().map_or(0, |c| c.len());
-    for (ch, acc) in accumulator.iter_mut().enumerate() {
-        match planar.get(ch) {
-            Some(src) => acc.extend_from_slice(src),
-            None => acc.extend(std::iter::repeat_n(0.0f32, n)),
-        }
-    }
-}
-
-/// Re-encode converted PCM (`pcm`, at `target_sr` × `target_ch`, the first
-/// sample at `first_pts`) to AAC using fdk-aac.
-#[cfg(all(feature = "media-codecs", feature = "fdk-aac"))]
-fn encode_audio_pcm_aac(
-    pcm: &[Vec<f32>],
-    first_pts: u64,
-    codec: AudioCodec,
-    bitrate_kbps: u32,
-    target_sr: u32,
-    target_ch: u8,
-) -> Result<Vec<RemuxEncodedFrame>, String> {
-    let profile = match codec {
-        AudioCodec::AacLc => aac_codec::AacProfile::AacLc,
-        AudioCodec::HeAacV1 => aac_codec::AacProfile::HeAacV1,
-        AudioCodec::HeAacV2 => aac_codec::AacProfile::HeAacV2,
-        _ => unreachable!(),
-    };
-
-    let config = aac_codec::EncoderConfig {
-        profile,
-        sample_rate: target_sr,
-        channels: target_ch,
-        bitrate: bitrate_kbps * 1000,
-        afterburner: true,
-        sbr_signaling: aac_codec::SbrSignaling::default(),
-        transport: aac_codec::TransportType::Adts,
-    };
-
-    let mut encoder = aac_audio::AacEncoder::open(&config)
-        .map_err(|e| format!("AAC encoder open failed: {e}"))?;
-
-    let frame_size = encoder.frame_size() as usize;
-    let mut encoded_frames = Vec::new();
-    let mut pts_90k = first_pts;
-    let total = pcm.first().map_or(0, |c| c.len());
-    let mut at = 0;
-    while at + frame_size <= total {
-        let frame_planar: Vec<Vec<f32>> = pcm.iter().map(|ch| ch[at..at + frame_size].to_vec()).collect();
-        at += frame_size;
-        match encoder.encode_frame(&frame_planar) {
-            Ok(encoded) => {
-                encoded_frames.push(RemuxEncodedFrame { data: encoded.bytes, pts: pts_90k });
-                let sr = target_sr as u64;
-                if sr > 0 {
-                    pts_90k += (encoded.num_samples as u64) * 90_000 / sr;
-                }
-            }
-            Err(e) => {
-                tracing::debug!("AAC encode error in HLS remux: {e}");
-            }
-        }
-    }
-
-    Ok(encoded_frames)
 }
 
 /// Build a PES packet wrapping an audio frame.
@@ -1374,11 +1274,15 @@ fn build_audio_pes(stream_id: u8, audio_data: &[u8], pts: u64) -> Vec<u8> {
     // PES header data length
     pes.push(5); // 5 bytes for PTS
 
-    // PTS (5 bytes)
+    // PTS (5 bytes): '0010', PTS[32..30], marker, PTS[29..15], marker,
+    // PTS[14..0], marker. Bits 32..30 and 29..15 were each written one
+    // place short (shifted by 30 and 15 where the field needs 29 and 14),
+    // so every re-encoded audio PES carried a PTS that read back
+    // 2^15-granular garbage: 900 000 read 441 248, 5.1 s early.
     let pts = pts & 0x1_FFFF_FFFF; // 33 bits
-    pes.push(0x21 | (((pts >> 30) as u8) & 0x0E));
+    pes.push(0x21 | (((pts >> 29) as u8) & 0x0E));
     pes.push((pts >> 22) as u8);
-    pes.push(0x01 | (((pts >> 15) as u8) & 0xFE));
+    pes.push(0x01 | (((pts >> 14) as u8) & 0xFE));
     pes.push((pts >> 7) as u8);
     pes.push(0x01 | (((pts as u8) & 0x7F) << 1));
 
@@ -1656,6 +1560,39 @@ mod pmt_remux_tests {
     /// "AC-3" registration — what Apple HLS / hls.js expect, whatever the
     /// source flavour), drop the stale AAC descriptor, and keep the 0xC0
     /// section byte-identical.
+    /// A chain as an HLS output builds it, for `codec` with these overrides.
+    fn chain(
+        codec: AudioCodec,
+        bitrate_kbps: u32,
+        sample_rate: Option<u32>,
+        channels: Option<u8>,
+        transcode: Option<crate::engine::audio_transcode::TranscodeJson>,
+    ) -> HlsAudioChain {
+        let resolved = ResolvedAudioEncode { codec, bitrate_kbps, sample_rate, channels, transcode, chain: None };
+        HlsAudioChain::new(
+            &resolved,
+            HlsEncoderCtx {
+                cancel: CancellationToken::new(),
+                stats: Arc::new(OutputStatsAccumulator::new("hls".into(), "hls".into(), "hls".into())),
+                flow_id: "f".into(),
+                output_id: "hls".into(),
+                events: None,
+            },
+        )
+    }
+
+    /// One segment through a fresh chain.
+    fn remux_ts_audio_inprocess(
+        segment: &[u8],
+        codec: AudioCodec,
+        bitrate_kbps: u32,
+        sample_rate: Option<u32>,
+        channels: Option<u8>,
+        transcode: Option<crate::engine::audio_transcode::TranscodeJson>,
+    ) -> Result<Vec<u8>, String> {
+        chain(codec, bitrate_kbps, sample_rate, channels, transcode).remux(segment)
+    }
+
     #[test]
     fn ac3_remux_is_atsc_signalled_behind_a_private_section() {
         const ADTS: &[u8] = include_bytes!("testdata/sine1k_aac_lc_48k_stereo.adts");
@@ -1809,9 +1746,9 @@ mod pmt_remux_tests {
     /// **B1 / B2 / B3 on HLS.** `audio_encode.sample_rate` with no
     /// `transcode` block resamples, and the audio PES that cut through AUs
     /// lose none of them: the burst comes out at its scaled position (plus
-    /// only the encoder's priming, which the per-segment re-encode starts
-    /// every segment with), in 44.1 kHz ADTS. Before, the encoder was opened
-    /// at 44.1 kHz and fed the 48 kHz PCM as it was — the burst at its
+    /// the stream's one encoder priming and the resampler's constant delay,
+    /// both taken off the stamps), in 44.1 kHz ADTS. Before, the encoder was
+    /// opened at 44.1 kHz and fed the 48 kHz PCM as it was — the burst at its
     /// unscaled index, the audio 8.8 % slow — and each straddling AU (with
     /// the rest of its next PES) was lost, moving the burst earlier.
     #[test]
@@ -1822,11 +1759,16 @@ mod pmt_remux_tests {
             .expect("remux");
         let (rate, pcm) = decode_audio(&out);
         assert_eq!(rate, 44_100, "the stream is 44.1 kHz");
-        // 2 s of source → ~88 200 samples (whole encoder frames).
-        assert!((pcm.len() as i64 - 88_200).abs() <= 2 * 1024, "{} samples: not the 48 kHz count", pcm.len());
+        // 2 s of source → ~88 200 samples (whole encoder frames), less what
+        // the chain holds for the next segment: the encoder's delay line and
+        // a partial frame.
+        assert!((88_200 - 4 * 1024..=88_200).contains(&(pcm.len() as i64)), "{} samples: not the 48 kHz count", pcm.len());
         // The source's own AAC priming is decoded too (2048 samples at
-        // 48 kHz, before the scaling), then the re-encode's (2048 at 44.1).
-        let expected = (at as f64 + 2048.0) * 44_100.0 / 48_000.0 + 2048.0;
+        // 48 kHz, before the scaling), then the resampler's delay and the
+        // re-encode's priming (2048 at 44.1).
+        let mut stage = crate::engine::audio_transcode::EncoderStage::new(None, Some(44_100), None);
+        stage.prepare(48_000, 2).unwrap();
+        let expected = (at as f64 + 2048.0) * 44_100.0 / 48_000.0 + stage.delay() as f64 + 2048.0;
         let got = burst_index(&pcm, 44_100) as f64;
         assert!((got - expected).abs() <= 3.0, "burst at {got}, expected {expected:.1}");
     }
@@ -1843,6 +1785,68 @@ mod pmt_remux_tests {
         let got = burst_index(&pcm, 48_000) as i64;
         // The source's priming and the re-encode's, 2048 samples each.
         assert!((got - (at as i64 + 4096)).abs() <= 2, "burst at {got}");
+    }
+
+    /// A re-encoded audio PES reads back the PTS it was built with, across
+    /// the whole 33-bit range.
+    #[test]
+    fn an_audio_pes_carries_its_pts() {
+        for pts in [0u64, 900_000, 1 << 15, (1 << 30) + 12_345, (1 << 33) - 1] {
+            let pes = build_audio_pes(0xC0, &[0xFF, 0xF1, 0, 0], pts);
+            let mut cc = 0;
+            let pkt = packetize_ts(0x101, &pes, &mut cc).remove(0);
+            assert_eq!(crate::engine::ts_parse::extract_pes_pts(&pkt), Some(pts));
+        }
+    }
+
+    /// The PES PTS and continuity counters of the re-encoded audio in `out`.
+    fn audio_pes_pts_and_ccs(out: &[u8]) -> (Vec<u64>, Vec<u8>) {
+        let mut pts = Vec::new();
+        let mut ccs = Vec::new();
+        for p in out.chunks(188) {
+            if crate::engine::ts_parse::ts_pid(p) != 0x101 {
+                continue;
+            }
+            ccs.push(p[3] & 0x0F);
+            if crate::engine::ts_parse::ts_pusi(p)
+                && let Some(v) = crate::engine::ts_parse::extract_pes_pts(p)
+            {
+                pts.push(v);
+            }
+        }
+        (pts, ccs)
+    }
+
+    /// Consecutive segments run through one encoder: the audio of the
+    /// second picks up exactly where the first's ended — every frame one
+    /// 1024-sample step after the one before, across the cut — with one
+    /// priming for the stream (stamped ahead of the content, 2048 samples
+    /// before the first source PTS) and the continuity counter carried on.
+    /// Each segment used to get a fresh encoder: its own priming, stamped at
+    /// the segment's first source PTS (the content presented 42.7 ms late),
+    /// the tail in the delay line never emitted (a gap at every cut), and
+    /// the counter back at 0.
+    #[test]
+    fn consecutive_segments_are_one_continuous_encode() {
+        let aus = aac_frames(48_000, 2, 2.0, 900_000);
+        let half = aus.len() / 2;
+        let mut c = chain(AudioCodec::AacLc, 128, None, None, None);
+        let one = c.remux(&aac_segment(&aus[..half])).expect("remux 1");
+        let two = c.remux(&aac_segment(&aus[half..])).expect("remux 2");
+        let (p1, cc1) = audio_pes_pts_and_ccs(&one);
+        let (p2, cc2) = audio_pes_pts_and_ccs(&two);
+        assert!(!p1.is_empty() && !p2.is_empty());
+        // The source's own AAC priming decodes too, so the source content
+        // starts at its first PTS; the re-encode's priming sits before it.
+        assert_eq!(p1[0], 900_000 - 2048 * 90_000 / 48_000, "one priming, ahead of the content");
+        let all: Vec<u64> = p1.iter().chain(&p2).copied().collect();
+        for (k, w) in all.windows(2).enumerate() {
+            assert!(w[1].abs_diff(w[0]) <= 1_921 && w[1] > w[0], "step {k}: {} -> {}", w[0], w[1]);
+        }
+        let ccs: Vec<u8> = cc1.iter().chain(&cc2).copied().collect();
+        for w in ccs.windows(2) {
+            assert_eq!(w[1], (w[0] + 1) & 0x0F, "the audio CC runs on across the cut");
+        }
     }
 
     /// `secs` of a tone as AAC-LC ADTS frames at `rate` × `channels`, each
@@ -1927,7 +1931,7 @@ mod pmt_remux_tests {
             .expect("remux");
         let (rate, channels, samples) = decoded_shape(&out);
         assert_eq!((rate, channels), (48_000, 2));
-        assert!((samples as i64 - 96_000).abs() <= 3 * 1024, "{samples} samples: both halves");
+        assert!((samples as i64 - 96_000).abs() <= 4 * 1024, "{samples} samples: both halves");
 
         let first = aac_frames(48_000, 2, 1.0, 900_000);
         let at = first.last().unwrap().1 + 1_920;
@@ -1937,7 +1941,47 @@ mod pmt_remux_tests {
             .expect("remux");
         let (rate, _, samples) = decoded_shape(&out);
         assert_eq!(rate, 48_000);
-        assert!((samples as i64 - 96_000).abs() <= 3 * 1024, "{samples} samples: 44.1 kHz resampled");
+        assert!((samples as i64 - 96_000).abs() <= 4 * 1024, "{samples} samples: 44.1 kHz resampled");
+    }
+
+    /// The audio is found beside an MPEG-2 video ES, and a private-data
+    /// (0x06) ES after it is not taken for it. The remux required an H.264
+    /// / HEVC video ES — an MPEG-2 source (VH1) failed every segment with
+    /// "no audio PID found" and the output published nothing — and took the
+    /// last 0x06 ES (teletext here) for the audio.
+    #[test]
+    fn the_audio_is_found_beside_mpeg2_video_and_private_data() {
+        let aus = aac_frames(48_000, 2, 0.5, 900_000);
+        let pmt = pmt_section(
+            1,
+            0,
+            0x100,
+            &[],
+            &[(0x02, 0x100, &[]), (0x0F, 0x101, &[]), (0x06, 0x102, &[0x56, 0x05, b'e', b'n', b'g', 0x09, 0x00])],
+        );
+        let mut seg = pat_packet(&[(1, 0x1000)], 0, 0).to_vec();
+        seg.extend_from_slice(&packetize_sections(0x1000, &[&pmt], 0)[0]);
+        let mut cc = 0u8;
+        for (au, pts) in &aus {
+            seg.extend(crate::engine::ts_test_fixtures::pes_packets(0x101, 0xC0, au, *pts, &mut cc));
+        }
+        let out = remux_ts_audio_inprocess(&seg, AudioCodec::Ac3, 192, None, None, None).expect("remux");
+        // The AAC ES is the one re-encoded (to AC-3), and the PMT says so;
+        // the teletext ES is left alone.
+        let pmt_pkt = out.chunks(188).find(|p| crate::engine::ts_parse::ts_pid(p) == 0x1000).expect("PMT");
+        let s = crate::engine::ts_parse::find_section_in_packet(pmt_pkt, 0x02, Some(1)).unwrap();
+        let v = parse_pmt(&pmt_pkt[s.start..s.end()]).unwrap();
+        let types: Vec<(u16, u8)> = v.es.iter().map(|e| (e.pid, e.stream_type)).collect();
+        assert_eq!(types, vec![(0x100, 0x02), (0x101, 0x81), (0x102, 0x06)]);
+        let ac3 = out
+            .chunks(188)
+            .filter(|p| crate::engine::ts_parse::ts_pid(p) == 0x101 && crate::engine::ts_parse::ts_pusi(p))
+            .filter(|p| {
+                let o = crate::engine::ts_parse::ts_payload_offset(p);
+                p[o + 9 + p[o + 8] as usize..].starts_with(&[0x0B, 0x77])
+            })
+            .count();
+        assert!(ac3 > 10, "{ac3} AC-3 PES on the audio PID");
     }
 
     /// The rendition keeps the format its first segment resolved: a later
@@ -1946,30 +1990,16 @@ mod pmt_remux_tests {
     /// playlist cannot signal.
     #[test]
     fn a_later_segment_keeps_the_renditions_format() {
-        let (_, fmt) = remux_ts_audio_inprocess_pinned(
-            &aac_segment(&aac_frames(48_000, 2, 0.5, 900_000)),
-            AudioCodec::AacLc,
-            128,
-            None,
-            None,
-            None,
-            None,
-        )
-        .unwrap();
-        assert_eq!(fmt, Some((48_000, 2)));
-        let (out, fmt) = remux_ts_audio_inprocess_pinned(
-            &aac_segment(&aac_frames(44_100, 2, 1.0, 950_000)),
-            AudioCodec::AacLc,
-            128,
-            None,
-            None,
-            None,
-            fmt,
-        )
-        .unwrap();
-        assert_eq!(fmt, Some((48_000, 2)));
+        let mut c = chain(AudioCodec::AacLc, 128, None, None, None);
+        c.remux(&aac_segment(&aac_frames(48_000, 2, 0.5, 900_000))).unwrap();
+        assert_eq!(c.stage.output(), Some((48_000, 2)));
+        let out = c.remux(&aac_segment(&aac_frames(44_100, 2, 1.0, 950_000))).unwrap();
+        assert_eq!(c.stage.output(), Some((48_000, 2)));
         let (rate, _, samples) = decoded_shape(&out);
         assert_eq!(rate, 48_000);
-        assert!((samples as i64 - 48_000).abs() <= 3 * 1024, "{samples} samples");
+        // Its second of audio at 48 kHz, plus the first segment's tail from
+        // the delay line, less this one's.
+        assert!((samples as i64 - 48_000).abs() <= 4 * 1024, "{samples} samples");
     }
+
 }

@@ -1233,7 +1233,29 @@ these are parent-level settings and apply to **all** members uniformly.
 ### RTMP Input
 
 Accepts incoming RTMP publish connections from OBS, ffmpeg, Wirecast, etc.
-H.264 video and AAC audio are remuxed into an SPTS (program 1). **Audio-only
+H.264 video and AAC audio are remuxed into an SPTS (program 1). With video,
+the PCR rides the video PID **100 ms behind each frame's DTS**, so every
+frame, and the audio interleaved a frame or so behind it, is in the
+decoder's buffer before it is due. It used to be the DTS itself: zero lead
+for the picture, and on an ffmpeg publish the audio PTS sat 0.5–39 ms
+*behind* the PCR on 4 228 of 4 241 PES — an underflow a strict IRD answers by
+dropping the audio, on the passthrough and every other output the ingress
+rewriter keeps that relation for. A frame step past 40 ms (23.976 / 24 fps
+and below, a dropped frame) gets PCR-only packets on the video PID so the
+PCR values never step past TR 101 290's limit; 25 fps (40 ms, the limit
+itself) and faster get none. The same lead and fillers apply wherever the
+edge muxes video itself — the RTSP and WebRTC inputs, the test pattern, the
+media player's MP4 and image files, SDI, ST 2110-20 / -23, MXL and the
+multiviewer — and the fillers leave at the instants their values name where
+the path paces its own samples (the media player's MP4). A publish's RTMP
+timestamps, which start at 0, are carried from 100 ms (the RTSP input's,
+the test pattern's and a media player's first MP4 or image file's timelines
+likewise), so the first PCR is 0 rather than just below the 33-bit wrap.
+Every IDR carries the SPS and PPS of the publish's AVC sequence header when
+it does not bring its own: they went ahead of a publish's *first* IDR only,
+so a receiver that joined any output of the flow after it never decoded a
+picture ("non-existing PPS 0 referenced" on every frame of a capture started
+3 s in). **Audio-only
 publishes** (a radio encoder, an AAC-only push) come out as an audio-only
 program: the PMT lists the audio alone, names it as PCR_PID, and the audio
 PES carry the PCR — 100 ms behind each PES's PTS, so every AU is in the
@@ -1339,6 +1361,28 @@ Accepts WebRTC contributions from publishers (OBS, browsers) via the WHIP protoc
 ```
 
 Publishers POST an SDP offer to `/api/v1/flows/{flow_id}/whip` and receive an SDP answer. The Bearer token (if configured) must be included in the `Authorization` header.
+
+The H.264 and Opus are remuxed into an SPTS (program 1) laid out from the
+tracks the offer negotiated: video and Opus, video alone, or **Opus alone** —
+then the PMT lists the Opus alone, names it as PCR_PID, and the Opus carries
+the PCR, 100 ms behind each PES as on an audio-only RTMP publish. The muxer
+used to assume video and no audio: the Opus of an A/V publish never reached
+the PMT, and an audio-only publish named an absent video PID as PCR_PID and
+carried no PCR. Each track's PES carry its own RTP timestamps (the Opus
+clock scaled to 90 kHz). RTP clocks start at independent offsets (RFC 3550
+§5.1) and the RTCP sender reports that relate them are not used, so a
+publish's audio and picture are not in sync — known limitation: an edge's
+own WHIP output looped back into this input put the Opus 280–930 ms behind
+the picture (and behind the PCR the video carries). Every IDR carries an SPS and PPS
+— the last ones the stream sent — when the sender did not repeat them (only
+libwebrtc does so reliably), and IDRs are marked keyframes (PAT/PMT ahead of
+each, the random-access flag set): the frame was read as a NAL from the
+start code's first byte, so none was. The WHEP input does the same for its
+video. The Opus rides the Opus-in-TS carriage with the control header
+ffmpeg writes and parses (`0x7F 0xE0`, prefix `0x3FF`); it was written as
+`0xFF 0xE0`, which every standard demuxer took for a raw Opus packet and
+failed on — no WHIP publish's audio decoded outside the edge (the edge's own
+demuxer still takes that older header).
 
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|

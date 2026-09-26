@@ -1251,6 +1251,7 @@ impl LiveState {
                     es,
                     pts,
                     is_keyframe,
+                    ..
                 } => {
                     self.codec = Some(video_codec::VideoCodec::Mpeg2);
                     // MPEG-2: an AU opening with `sequence_header`

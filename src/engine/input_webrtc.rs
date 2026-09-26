@@ -193,6 +193,14 @@ async fn whip_input_loop(
         ts_muxer.set_audio_stream(0x06, Some(*b"Opus"));
         let mut seq_num: u16 = 0;
         let mut last_audio_pts_90khz: u64 = 0;
+        // The publish's layout — which of video and audio its offer carried
+        // — is settled from the session's tracks on the first media
+        // (`WhipLayout`). The muxer used to assume video and no audio: an
+        // audio-only publish named an absent video PID as PCR_PID and
+        // carried no PCR at all, and an A/V publish's Opus never reached the
+        // PMT.
+        let mut layout = WhipLayout::default();
+        let mut param_sets = H264ParamSets::default();
 
         // Receive media from the WebRTC session
         loop {
@@ -203,6 +211,12 @@ async fn whip_input_loop(
                     // Determine if this is video or audio
                     let is_video = session.video_mid == Some(mid);
                     let is_audio_stream = session.audio_mid == Some(mid);
+                    layout.apply(
+                        &mut ts_muxer,
+                        session.video_mid.is_some(),
+                        session.audio_mid.is_some(),
+                        flow_id,
+                    );
 
                     if is_audio_stream {
                         // Opus-over-WHIP audio: convert the RTP timestamp
@@ -242,16 +256,11 @@ async fn whip_input_loop(
                             }
                         }
                     } else if is_video {
-                        // H.264 data from str0m is already depayloaded (complete NALUs)
-                        // Convert to Annex B and mux into TS
+                        // A depayloaded access unit, Annex B, with the
+                        // parameter sets ahead of every IDR
+                        // (`H264ParamSets`).
                         let pts_90khz = rtp_time.numer();
-
-                        // Prepend Annex B start codes and feed to TS muxer
-                        let mut annex_b = Vec::new();
-                        annex_b.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]);
-                        annex_b.extend_from_slice(&data);
-
-                        let is_keyframe = !data.is_empty() && (data[0] & 0x1F) == 5;
+                        let (annex_b, is_keyframe) = param_sets.access_unit(&data);
                         let ts_chunks = ts_muxer.mux_video(&annex_b, pts_90khz, pts_90khz, is_keyframe);
 
                         for ts_data in ts_chunks {
@@ -278,6 +287,16 @@ async fn whip_input_loop(
                             }
                         }
                     }
+                }
+                SessionEvent::MediaAdded { .. } => {
+                    // A track negotiated after media began: the layout
+                    // follows (a PMT version bump, PCR moving with video).
+                    layout.renegotiated(
+                        &mut ts_muxer,
+                        session.video_mid.is_some(),
+                        session.audio_mid.is_some(),
+                        flow_id,
+                    );
                 }
                 SessionEvent::Connected => {
                     tracing::info!("WHIP publisher connected on flow '{}'", flow_id);
@@ -489,6 +508,7 @@ async fn whep_input_loop(
                 ts_muxer.set_pids(entry.pmt_pid, entry.video_pid, entry.audio_pid, entry.pcr_pid);
             }
         let mut seq_num: u16 = 0;
+        let mut param_sets = H264ParamSets::default();
 
         // Receive loop
         loop {
@@ -497,11 +517,7 @@ async fn whep_input_loop(
                 SessionEvent::MediaData { mid, data, rtp_time, .. } => {
                     if session.video_mid == Some(mid) {
                         let pts_90khz = rtp_time.numer();
-                        let mut annex_b = Vec::new();
-                        annex_b.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]);
-                        annex_b.extend_from_slice(&data);
-
-                        let is_keyframe = !data.is_empty() && (data[0] & 0x1F) == 5;
+                        let (annex_b, is_keyframe) = param_sets.access_unit(&data);
                         let ts_chunks = ts_muxer.mux_video(&annex_b, pts_90khz, pts_90khz, is_keyframe);
 
                         for ts_data in ts_chunks {
@@ -537,5 +553,231 @@ async fn whep_input_loop(
                 _ => {}
             }
         }
+    }
+}
+
+/// Which tracks a WHIP publish carries, applied to its TS muxer once, on the
+/// first media — by then the offer's tracks have all been added
+/// (`SessionEvent::MediaAdded` comes out of the answer, before ICE).
+#[cfg(feature = "webrtc")]
+#[derive(Debug, Default)]
+struct WhipLayout {
+    applied: bool,
+}
+
+#[cfg(feature = "webrtc")]
+impl WhipLayout {
+    /// Set the muxer's layout from the session's tracks, once. With no video
+    /// the PMT lists the Opus alone, names it as PCR_PID, and it carries the
+    /// PCR (`TsMuxer::audio_pcr`).
+    fn apply(
+        &mut self,
+        muxer: &mut crate::engine::rtmp::ts_mux::TsMuxer,
+        has_video: bool,
+        has_audio: bool,
+        flow_id: &str,
+    ) {
+        if self.applied {
+            return;
+        }
+        self.applied = true;
+        muxer.set_has_video(has_video);
+        muxer.set_has_audio(has_audio);
+        tracing::info!(
+            flow_id,
+            has_video,
+            has_audio,
+            "WHIP: publish carries {}",
+            match (has_video, has_audio) {
+                (true, true) => "video and audio",
+                (true, false) => "video only",
+                (false, true) => "audio only — the PMT names the audio PID as PCR_PID",
+                (false, false) => "no media track",
+            }
+        );
+    }
+
+    /// A track added after the layout was applied: video moves the PCR
+    /// (`TsMuxer::change_has_video` bumps the PMT version); audio joins the
+    /// PMT on its next emission.
+    fn renegotiated(
+        &mut self,
+        muxer: &mut crate::engine::rtmp::ts_mux::TsMuxer,
+        has_video: bool,
+        has_audio: bool,
+        flow_id: &str,
+    ) {
+        if !self.applied {
+            return;
+        }
+        if has_audio {
+            muxer.set_has_audio(true);
+        }
+        if muxer.change_has_video(has_video) {
+            tracing::info!(flow_id, has_video, "WHIP: the publish renegotiated its video track");
+        }
+    }
+}
+
+/// The SPS and PPS an H.264 WebRTC stream carried in-band, put back ahead of
+/// every IDR that lacks them.
+///
+/// A WHIP / WHEP sender need not repeat its parameter sets with each IDR
+/// (only libwebrtc does so reliably), and the TS carries no out-of-band copy:
+/// a receiver that joined an output after the first IDR never decoded a
+/// picture. The frame str0m hands over is already Annex B, start codes
+/// included — the input used to prefix one more, and to read the IDR from the
+/// first byte, which is a start code's zero: no access unit was ever marked a
+/// keyframe, so PAT/PMT never led an IDR and no random-access flag was set.
+#[cfg(any(feature = "webrtc", test))]
+#[derive(Debug, Default)]
+struct H264ParamSets {
+    sps: Option<Vec<u8>>,
+    pps: Option<Vec<u8>>,
+}
+
+#[cfg(any(feature = "webrtc", test))]
+impl H264ParamSets {
+    /// `data` (one depayloaded access unit) as Annex B, with the cached SPS /
+    /// PPS ahead of an IDR that carries neither of its own, and whether it
+    /// holds an IDR slice. The unit's own parameter sets refresh the cache.
+    fn access_unit(&mut self, data: &[u8]) -> (Vec<u8>, bool) {
+        const START: [u8; 4] = [0x00, 0x00, 0x00, 0x01];
+        let starts_coded = data.starts_with(&[0, 0, 1]) || data.starts_with(&START);
+        let nalus = if starts_coded {
+            crate::engine::ts_demux::split_annex_b_nalus(data)
+        } else if data.is_empty() {
+            Vec::new()
+        } else {
+            vec![data.to_vec()]
+        };
+        let (mut idr, mut has_sps, mut has_pps) = (false, false, false);
+        for n in &nalus {
+            match n.first().map(|b| b & 0x1F) {
+                Some(5) => idr = true,
+                Some(7) => {
+                    has_sps = true;
+                    self.sps = Some(n.clone());
+                }
+                Some(8) => {
+                    has_pps = true;
+                    self.pps = Some(n.clone());
+                }
+                _ => {}
+            }
+        }
+        let mut out = Vec::with_capacity(data.len() + 64);
+        let mut rest = nalus.iter().peekable();
+        if let Some(aud) = rest.next_if(|n| n.first().map(|b| b & 0x1F) == Some(9)) {
+            out.extend_from_slice(&START);
+            out.extend_from_slice(aud);
+        }
+        if idr {
+            let sps = self.sps.as_ref().filter(|_| !has_sps);
+            let pps = self.pps.as_ref().filter(|_| !has_pps);
+            for ps in [sps, pps].into_iter().flatten() {
+                out.extend_from_slice(&START);
+                out.extend_from_slice(ps);
+            }
+        }
+        for n in rest {
+            out.extend_from_slice(&START);
+            out.extend_from_slice(n);
+        }
+        (out, idr)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::H264ParamSets;
+
+    /// The PMT of `ts` as `(PCR_PID, [(stream_type, PID)])`, and the PIDs
+    /// whose packets carry a PCR.
+    #[cfg(feature = "webrtc")]
+    fn layout_of(ts: &[bytes::Bytes]) -> ((u16, Vec<(u8, u16)>), Vec<u16>) {
+        use crate::engine::ts_parse::{extract_pcr, ts_pid};
+        let pmt = ts.iter().find(|p| ts_pid(p) == 0x1000).expect("a PMT");
+        let sec = &pmt[5..];
+        let len = (((sec[1] & 0x0F) as usize) << 8) | sec[2] as usize;
+        let mut es = Vec::new();
+        let mut pos = 12;
+        while pos + 5 <= 3 + len - 4 {
+            es.push((sec[pos], (((sec[pos + 1] & 0x1F) as u16) << 8) | sec[pos + 2] as u16));
+            pos += 5 + ((((sec[pos + 3] & 0x0F) as usize) << 8) | sec[pos + 4] as usize);
+        }
+        let pcr_pid = (((sec[8] & 0x1F) as u16) << 8) | sec[9] as u16;
+        let mut pcr_pids: Vec<u16> = ts.iter().filter(|p| extract_pcr(p).is_some()).map(|p| ts_pid(p)).collect();
+        pcr_pids.dedup();
+        ((pcr_pid, es), pcr_pids)
+    }
+
+    /// An audio-only WHIP publish: the PMT lists the Opus alone and names it
+    /// as PCR_PID, and the Opus carries the PCR. The muxer assumed video and
+    /// no audio: the PMT named an absent video PID as PCR_PID and listed no
+    /// audio, and no packet carried a PCR. An A/V publish lists both, with
+    /// the PCR on the video.
+    #[cfg(feature = "webrtc")]
+    #[test]
+    fn a_whip_publishs_layout_follows_its_tracks() {
+        let mut mux = crate::engine::rtmp::ts_mux::TsMuxer::new();
+        mux.set_audio_stream(0x06, Some(*b"Opus"));
+        let mut layout = super::WhipLayout::default();
+        layout.apply(&mut mux, false, true, "f");
+        let mut ts = Vec::new();
+        for k in 0..5u64 {
+            ts.extend(mux.mux_audio_opus(&[0xFC; 80], 90_000 + k * 1_800));
+        }
+        assert_eq!(layout_of(&ts), ((0x0101, vec![(0x06, 0x0101)]), vec![0x0101]));
+
+        let mut mux = crate::engine::rtmp::ts_mux::TsMuxer::new();
+        mux.set_audio_stream(0x06, Some(*b"Opus"));
+        let mut layout = super::WhipLayout::default();
+        layout.apply(&mut mux, true, true, "f");
+        let mut ts = mux.mux_video(&[0, 0, 0, 1, 0x65, 0x88], 90_000, 90_000, true);
+        ts.extend(mux.mux_audio_opus(&[0xFC; 80], 90_000));
+        assert_eq!(layout_of(&ts), ((0x0100, vec![(0x1B, 0x0100), (0x06, 0x0101)]), vec![0x0100]));
+    }
+
+    fn nal_types(annex_b: &[u8]) -> Vec<u8> {
+        crate::engine::ts_demux::split_annex_b_nalus(annex_b).iter().map(|n| n[0] & 0x1F).collect()
+    }
+
+    fn unit(types: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        for t in types {
+            out.extend_from_slice(&[0, 0, 0, 1, 0x60 | t, 0x11, 0x22]);
+        }
+        out
+    }
+
+    /// Every IDR goes out behind an SPS and a PPS — the last ones the stream
+    /// sent — whether or not the sender repeated them; a non-IDR gets none, an
+    /// access unit delimiter stays first, and the IDR is found past the start
+    /// code (it was read from the start code's first byte, so none was).
+    #[test]
+    fn every_idr_goes_out_behind_the_parameter_sets() {
+        let mut ps = H264ParamSets::default();
+        let (au, key) = ps.access_unit(&unit(&[7, 8, 5]));
+        assert!(key);
+        assert_eq!(nal_types(&au), vec![7, 8, 5], "carried its own: not doubled");
+        let (au, key) = ps.access_unit(&unit(&[1]));
+        assert!(!key);
+        assert_eq!(nal_types(&au), vec![1]);
+        let (au, key) = ps.access_unit(&unit(&[5]));
+        assert!(key);
+        assert_eq!(nal_types(&au), vec![7, 8, 5], "the cached sets go back in");
+        let (au, _) = ps.access_unit(&unit(&[9, 5]));
+        assert_eq!(nal_types(&au), vec![9, 7, 8, 5]);
+        assert!(!au.starts_with(&[0, 0, 0, 1, 0, 0]), "no doubled start code");
+    }
+
+    /// A unit handed over without a start code (one bare NAL) is framed once.
+    #[test]
+    fn a_bare_nal_is_framed() {
+        let mut ps = H264ParamSets::default();
+        let (au, key) = ps.access_unit(&[0x65, 0x11, 0x22]);
+        assert!(key);
+        assert_eq!(au, vec![0, 0, 0, 1, 0x65, 0x11, 0x22]);
     }
 }

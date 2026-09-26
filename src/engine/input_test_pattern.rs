@@ -287,7 +287,11 @@ async fn run_inner(
             _ = ticker.tick() => {}
         }
 
-        let pts_90khz = frame_idx.saturating_mul(90_000) / fps as u64;
+        // The timeline opens at the muxer's PCR lead, so the first PCR — that
+        // far behind the first frame's DTS — is 0 rather than just below the
+        // 33-bit wrap (the audio's counter starts there too).
+        let pts_90khz = crate::engine::rtmp::ts_mux::PCR_LEAD_90K
+            + frame_idx.saturating_mul(90_000) / fps as u64;
         let frame_in_second = frame_idx % fps as u64;
         let burst_active = config.av_sync_marker && frame_in_second < burst_frames;
 
@@ -958,7 +962,7 @@ fn build_audio_encoder(
         frame_size,
         accumulator: vec![Vec::with_capacity(frame_size); channels],
         accumulated: 0,
-        pts_90k: 0,
+        pts_90k: crate::engine::rtmp::ts_mux::PCR_LEAD_90K,
         ident,
     })
 }

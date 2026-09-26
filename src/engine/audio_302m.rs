@@ -662,7 +662,7 @@ impl S302mOutputPipeline {
             transcode,
             packetizer,
             ts_mux,
-            pts_90khz: crate::engine::rtmp::ts_mux::AUDIO_PCR_LEAD_90K,
+            pts_90khz: crate::engine::rtmp::ts_mux::PCR_LEAD_90K,
             out_channels,
             out_bit_depth,
             out_samples_per_block,

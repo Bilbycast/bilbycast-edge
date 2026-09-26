@@ -276,7 +276,15 @@ impl VideoSegmenter {
             let rotating = self.pending_track.is_some();
             if let Some(base) = self.segment_base_dts {
                 let elapsed = dts.saturating_sub(base);
-                if (elapsed >= self.target_duration_90k || rotating) && !self.samples.is_empty() {
+                // Within a frame of the target counts as at it: an IDR less
+                // than one frame short closes the segment. A source whose
+                // timeline lost part of a frame — a loop splice 20 ms short
+                // of frame-contiguous — put the re-encode's tiling IDR just
+                // under the target, and the segment ran on to the next one:
+                // 3.98 s at a 29.97 fps loop, two GOPs in one segment.
+                let frame = self.frame_step_90k();
+                let reached = elapsed + frame > self.target_duration_90k;
+                if (reached || rotating) && !self.samples.is_empty() {
                     let first_pending_dts_90k = self.samples[0].dts;
                     let (seq, sb, samples) = self.snapshot_samples(dts);
                     completed = Some(CompletedSegment {
@@ -331,6 +339,23 @@ impl VideoSegmenter {
             new_segment_started,
             completed_video_samples: completed_samples,
         }
+    }
+
+    /// One frame of the open segment (90 kHz): the median step between its
+    /// samples' timestamps — robust to the one short step a splice leaves —
+    /// 0 before it has two.
+    fn frame_step_90k(&self) -> u64 {
+        let mut steps: Vec<u64> = self
+            .samples
+            .windows(2)
+            .map(|w| w[1].dts.saturating_sub(w[0].dts))
+            .filter(|d| *d > 0)
+            .collect();
+        if steps.is_empty() {
+            return 0;
+        }
+        let mid = steps.len() / 2;
+        *steps.select_nth_unstable(mid).1
     }
 
     /// Build the `Sample` vector for the current pending samples
@@ -733,6 +758,35 @@ mod tests {
         assert!(outcome.new_segment_started);
         assert_eq!(seg.kind, SegmentKind::Video);
         assert_eq!(s.samples.len(), 1);
+    }
+
+    /// An IDR less than a frame short of the target closes the segment: a
+    /// 29.97 fps re-encode whose timeline lost 20 ms at a loop splice put its
+    /// 60-frame tiling IDR 1 809 ticks under 2 s, and the segment ran on to
+    /// the next — 3.98 s. An IDR a whole frame or more short still does not
+    /// cut (25 fps: the 49th frame of a 2 s segment).
+    #[test]
+    fn an_idr_within_a_frame_of_the_target_closes_the_segment() {
+        let v = VideoTrack::from_h264(vec![0x67, 0x42, 0xC0, 0x1E], vec![0x68, 0xCE]);
+        let idr = vec![vec![0x65, 0xB8]];
+        let p = vec![vec![0x41, 0x00]];
+        let mut s = VideoSegmenter::new(v, 2.0);
+        s.push(&idr, 0, true);
+        for i in 1..60u64 {
+            // Frame 20 came 1 809 ticks early: the splice.
+            let pts = i * 3_003 - if i >= 20 { 1_809 } else { 0 };
+            assert!(s.push(&p, pts, false).completed_video.is_none(), "frame {i}");
+        }
+        let seg = s.push(&idr, 60 * 3_003 - 1_809, true).completed_video.expect("cut at the tiling IDR");
+        assert_eq!(seg.duration_90k, 178_371);
+
+        let v = VideoTrack::from_h264(vec![0x67, 0x42, 0xC0, 0x1E], vec![0x68, 0xCE]);
+        let mut s = VideoSegmenter::new(v, 2.0);
+        s.push(&idr, 0, true);
+        for i in 1..49u64 {
+            s.push(&p, i * 3_600, false);
+        }
+        assert!(s.push(&idr, 49 * 3_600, true).completed_video.is_none(), "a frame short: no cut");
     }
 
     /// A track rotation cuts the open segment at the IDR that carries the new

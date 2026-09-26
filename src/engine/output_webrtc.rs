@@ -77,7 +77,7 @@ enum WebrtcEncoderState {
 /// rest of the session. RTMP's `VideoEncoderState` is the closest
 /// analogue, except RTMP builds an out-of-band FLV sequence header
 /// (`global_header = true`) while WebRTC emits SPS/PPS inline on every
-/// IDR (`global_header = false`) so H264Packetizer can feed them into
+/// IDR (`global_header = false`) so str0m's packetizer can feed them into
 /// RTP as ordinary NAL units.
 #[cfg(feature = "webrtc")]
 enum WebrtcVideoEncoderState {
@@ -239,7 +239,7 @@ fn init_webrtc_video_encoder_state(
 #[cfg(all(feature = "webrtc", feature = "media-codecs"))]
 fn open_webrtc_video_active(
     cfg: &VideoEncodeConfig,
-    source_is_h264: bool,
+    source_codec: video_codec::VideoCodec,
     first_au: &[u8],
     output_id: &str,
     flow_id: &str,
@@ -249,11 +249,6 @@ fn open_webrtc_video_active(
     let Some(backend) = resolve_webrtc_video_backend(cfg, output_id, flow_id, event_sender)
     else {
         return WebrtcVideoEncoderState::Failed;
-    };
-    let source_codec = if source_is_h264 {
-        video_codec::VideoCodec::H264
-    } else {
-        video_codec::VideoCodec::Hevc
     };
     // Seeded from the access unit that triggered the open: an H.264
     // decoder's reorder depth comes from its SPS (`ReorderSeed`).
@@ -366,7 +361,7 @@ fn nalus_to_annex_b_webrtc(nalus: &[Vec<u8>]) -> Vec<u8> {
 #[cfg(all(feature = "webrtc", feature = "media-codecs"))]
 fn encode_one_video_frame_webrtc(
     video_state: &mut WebrtcVideoEncoderState,
-    nalus: &[Vec<u8>],
+    annex_b: &[u8],
     pts: u64,
     pts_known: bool,
     output_id: &str,
@@ -375,7 +370,6 @@ fn encode_one_video_frame_webrtc(
         WebrtcVideoEncoderState::Active(a) => a,
         _ => return Vec::new(),
     };
-    let annex_b = nalus_to_annex_b_webrtc(nalus);
     let block_result: Result<Vec<(Vec<u8>, u64)>, String> = crate::timed_block_in_place!(
         "output_webrtc.video_encoder",
         crate::engine::perf::TRANSCODE_BLOCK_WARN_MS,
@@ -386,9 +380,9 @@ fn encode_one_video_frame_webrtc(
             // whose PES carried none goes in without (fed as 0, its picture
             // came back stamped 0).
             let fed = if pts_known {
-                active.decoder.send_packet_with_pts(&annex_b, pts as i64)
+                active.decoder.send_packet_with_pts(annex_b, pts as i64)
             } else {
-                active.decoder.send_packet(&annex_b)
+                active.decoder.send_packet(annex_b)
             };
             if let Err(e) = fed {
                 tracing::debug!("WebRTC output '{}': decoder send_packet: {e:?}", output_id);
@@ -448,6 +442,65 @@ fn encode_one_video_frame_webrtc(
     }
 }
 
+/// Tell the operator, once per session, that the source's MPEG-2 video
+/// reaches a WebRTC output only through `video_encode` (WebRTC carries
+/// H.264), so without one the picture is dropped.
+#[cfg(feature = "webrtc")]
+fn warn_mpeg2_needs_encode(output_id: &str, flow_id: &str, events: &EventSender) {
+    let msg = format!(
+        "WebRTC output '{output_id}': the source's MPEG-2 video cannot be carried over WebRTC \
+         (H.264 only) without `video_encode`; its video is dropped"
+    );
+    tracing::warn!("{msg}");
+    events.emit_flow_with_details(
+        EventSeverity::Warning,
+        category::WEBRTC,
+        msg,
+        flow_id,
+        serde_json::json!({
+            "error_code": "codec_needs_encode",
+            "output_id": output_id,
+            "essence": "video",
+            "source_codec": "MPEG-2 video",
+            "needs": "video_encode",
+        }),
+    );
+}
+
+/// One demuxed video access unit for a WebRTC output.
+#[cfg(feature = "webrtc")]
+#[derive(Clone, Copy)]
+enum WebrtcVideoSource<'a> {
+    H264(&'a [Vec<u8>]),
+    H265(&'a [Vec<u8>]),
+    /// An MPEG-2 access unit (its ES as the PES carried it). WebRTC carries
+    /// H.264, so it goes out only re-encoded; it used to be dropped whatever
+    /// `video_encode` said.
+    #[cfg_attr(not(feature = "media-codecs"), allow(dead_code))]
+    Mpeg2(&'a [u8]),
+}
+
+#[cfg(all(feature = "webrtc", feature = "media-codecs"))]
+impl<'a> WebrtcVideoSource<'a> {
+    fn codec(&self) -> video_codec::VideoCodec {
+        match self {
+            WebrtcVideoSource::H264(_) => video_codec::VideoCodec::H264,
+            WebrtcVideoSource::H265(_) => video_codec::VideoCodec::Hevc,
+            WebrtcVideoSource::Mpeg2(_) => video_codec::VideoCodec::Mpeg2,
+        }
+    }
+
+    /// The access unit as a decoder takes it: Annex B, or MPEG-2's ES.
+    fn decoder_input(&self) -> std::borrow::Cow<'a, [u8]> {
+        match self {
+            WebrtcVideoSource::H264(n) | WebrtcVideoSource::H265(n) => {
+                std::borrow::Cow::Owned(nalus_to_annex_b_webrtc(n))
+            }
+            WebrtcVideoSource::Mpeg2(es) => std::borrow::Cow::Borrowed(es),
+        }
+    }
+}
+
 /// Handle one demuxed video access unit: passthrough H.264, encode HEVC
 /// (or H.264 if `video_encode` is set), then RFC 6184 packetize and hand
 /// to str0m. Shared by the WHIP client loop and the WHEP per-viewer loop.
@@ -459,8 +512,7 @@ fn encode_one_video_frame_webrtc(
 #[cfg(feature = "webrtc")]
 #[allow(clippy::too_many_arguments)]
 async fn handle_webrtc_video_frame(
-    source_is_h264: bool,
-    nalus: &[Vec<u8>],
+    source: WebrtcVideoSource<'_>,
     pts: u64,
     #[cfg_attr(not(feature = "media-codecs"), allow(unused_variables))]
     pts_known: bool,
@@ -476,12 +528,15 @@ async fn handle_webrtc_video_frame(
     #[cfg_attr(not(feature = "media-codecs"), allow(unused_variables))]
     events: &EventSender,
 ) {
-    use super::webrtc::rtp_h264::H264Packetizer;
     use str0m::media::{Frequency, MediaTime};
     use std::time::Instant;
 
-    // Disabled + HEVC source → drop (pre-Phase 4d behaviour).
-    if matches!(video_state, WebrtcVideoEncoderState::Disabled) && !source_is_h264 {
+    // Disabled + HEVC / MPEG-2 source → drop (the loop reports MPEG-2 once).
+    let passthrough_nalus = match source {
+        WebrtcVideoSource::H264(nalus) => Some(nalus),
+        _ => None,
+    };
+    if matches!(video_state, WebrtcVideoEncoderState::Disabled) && passthrough_nalus.is_none() {
         return;
     }
     // Failed → drop video for the rest of the session.
@@ -494,20 +549,17 @@ async fn handle_webrtc_video_frame(
     // which seeds the decoder's reorder depth). Falls through to the
     // encode path on the same frame.
     #[cfg(feature = "media-codecs")]
+    let au = source.decoder_input();
+    #[cfg(feature = "media-codecs")]
     if let WebrtcVideoEncoderState::Lazy { cfg, sps_gate } = video_state {
-        let au = nalus_to_annex_b_webrtc(nalus);
-        let codec = if source_is_h264 {
-            video_codec::VideoCodec::H264
-        } else {
-            video_codec::VideoCodec::Hevc
-        };
+        let codec = source.codec();
         if !sps_gate.admits(codec, &au) {
             return;
         }
         let cfg = cfg.clone();
         *video_state = open_webrtc_video_active(
             &cfg,
-            source_is_h264,
+            codec,
             &au,
             output_id,
             flow_id,
@@ -529,7 +581,7 @@ async fn handle_webrtc_video_frame(
     #[cfg(feature = "media-codecs")]
     let frames: Vec<(std::borrow::Cow<'_, [Vec<u8>]>, u64)> =
         if matches!(video_state, WebrtcVideoEncoderState::Active(_)) {
-            let encoded = encode_one_video_frame_webrtc(video_state, nalus, pts, pts_known, output_id);
+            let encoded = encode_one_video_frame_webrtc(video_state, &au, pts, pts_known, output_id);
             if matches!(video_state, WebrtcVideoEncoderState::Failed) {
                 return;
             }
@@ -539,37 +591,48 @@ async fn handle_webrtc_video_frame(
                     (std::borrow::Cow::Owned(super::ts_demux::split_annex_b_nalus(&annex_b)), frame_pts)
                 })
                 .collect()
-        } else {
+        } else if let Some(nalus) = passthrough_nalus {
             vec![(std::borrow::Cow::Borrowed(nalus), pts)]
+        } else {
+            Vec::new()
         };
     #[cfg(not(feature = "media-codecs"))]
-    let frames: Vec<(std::borrow::Cow<'_, [Vec<u8>]>, u64)> = vec![(std::borrow::Cow::Borrowed(nalus), pts)];
+    let frames: Vec<(std::borrow::Cow<'_, [Vec<u8>]>, u64)> =
+        passthrough_nalus.map(|n| (std::borrow::Cow::Borrowed(n), pts)).into_iter().collect();
 
     for (send_nalus, frame_pts) in &frames {
-        let nalu_count = send_nalus.len();
-        for (i, nalu) in send_nalus.iter().enumerate() {
-            let is_last = i == nalu_count - 1;
-            let rtp_payloads = H264Packetizer::packetize(nalu, is_last);
-            for rtp_payload in &rtp_payloads {
-                let media_time = MediaTime::new(*frame_pts, Frequency::NINETY_KHZ);
-                if let Err(e) = session.write_media(
-                    video_mid,
-                    video_pt,
-                    Instant::now(),
-                    media_time,
-                    &rtp_payload.data,
-                ) {
-                    tracing::debug!("WebRTC output '{}' write error: {}", output_id, e);
-                }
-                // str0m requires poll_output between consecutive writes —
-                // drain or the next write_media is silently rejected.
-                session.drain_outputs().await;
-                stats.packets_sent.fetch_add(1, Ordering::Relaxed);
-                stats.bytes_sent.fetch_add(rtp_payload.data.len() as u64, Ordering::Relaxed);
-                stats.record_latency(recv_time_us);
-            }
+        // One access unit per write, Annex B: str0m's writer packetizes a
+        // frame itself (RFC 6184 — STAP-A for the SPS / PPS, FU-A past its
+        // MTU, the marker bit on the frame's last packet). Each NAL used to
+        // be packetized here first and every RTP payload written as a frame
+        // of its own: str0m took an FU-A fragment for a NAL and fragmented
+        // it again, so a receiver reassembled type-28 "NAL units" out of
+        // every IDR and large P slice — no picture decoded from them — and
+        // each fragment arrived as its own frame, every one marker-bit.
+        let au = annex_b_access_unit(send_nalus);
+        let media_time = MediaTime::new(*frame_pts, Frequency::NINETY_KHZ);
+        if let Err(e) = session.write_media(video_mid, video_pt, Instant::now(), media_time, &au) {
+            tracing::debug!("WebRTC output '{}' write error: {}", output_id, e);
         }
+        // str0m requires poll_output between consecutive writes —
+        // drain or the next write_media is silently rejected.
+        session.drain_outputs().await;
+        // RTP packets, approximately: the 1200-byte payloads a frame splits into.
+        stats.packets_sent.fetch_add(au.len().div_ceil(1_200) as u64, Ordering::Relaxed);
+        stats.bytes_sent.fetch_add(au.len() as u64, Ordering::Relaxed);
+        stats.record_latency(recv_time_us);
     }
+}
+
+/// An access unit's NAL units (start codes stripped) as one Annex B buffer.
+#[cfg(feature = "webrtc")]
+fn annex_b_access_unit(nalus: &[Vec<u8>]) -> Vec<u8> {
+    let mut au = Vec::with_capacity(nalus.iter().map(|n| n.len() + 4).sum());
+    for nalu in nalus {
+        au.extend_from_slice(&[0, 0, 0, 1]);
+        au.extend_from_slice(nalu);
+    }
+    au
 }
 
 /// Spawn a WebRTC output task (WHIP client or WHEP server depending on config mode).
@@ -905,6 +968,7 @@ async fn whep_viewer_loop(
     let mut ff_audio_codec: Option<video_codec::AudioDecoderCodec> = None;
     let mut video_encoder_state: WebrtcVideoEncoderState =
         init_webrtc_video_encoder_state(video_encode.as_ref());
+    let mut mpeg2_warned = false;
 
     // Send loop: demux TS → packetize H.264 → send via str0m.
     // Also processes incoming RTCP/STUN via drive_udp_io() to keep
@@ -945,8 +1009,7 @@ async fn whep_viewer_loop(
                             match frame {
                                 super::webrtc::ts_demux::DemuxedFrame::H264 { nalus, pts, pts_known, .. } => {
                                     handle_webrtc_video_frame(
-                                        true,
-                                        &nalus,
+                                        WebrtcVideoSource::H264(&nalus),
                                         pts,
                                         pts_known,
                                         recv_time_us,
@@ -962,8 +1025,7 @@ async fn whep_viewer_loop(
                                 }
                                 super::webrtc::ts_demux::DemuxedFrame::H265 { nalus, pts, pts_known, .. } => {
                                     handle_webrtc_video_frame(
-                                        false,
-                                        &nalus,
+                                        WebrtcVideoSource::H265(&nalus),
                                         pts,
                                         pts_known,
                                         recv_time_us,
@@ -1079,20 +1141,21 @@ async fn whep_viewer_loop(
                                 super::webrtc::ts_demux::DemuxedFrame::OtherAudio {
                                     stream_type, data, pts,
                                 } => {
-                                    if matches!(encoder_state, WebrtcEncoderState::Lazy) {
-                                        encoder_state = build_webrtc_encoder_state(
-                                            audio_encode.as_ref(),
-                                            transcode.as_ref(),
-                                            &demuxer,
-                                            None,
-                                            compressed_audio_input,
-                                            &cancel,
-                                            &stats,
-                                            flow_id,
-                                            output_id,
-                                            events,
-                                        );
-                                    }
+                                    let decoded = decode_other_audio_for_encode(
+                                        &mut encoder_state,
+                                        &mut ff_audio_decoder,
+                                        &mut ff_audio_codec,
+                                        stream_type,
+                                        &data,
+                                        pts,
+                                        audio_encode.as_ref(),
+                                        transcode.as_ref(),
+                                        &cancel,
+                                        &stats,
+                                        flow_id,
+                                        output_id,
+                                        events,
+                                    );
                                     let (
                                         WebrtcEncoderState::Active {
                                             encoder, silence, stage, ..
@@ -1103,37 +1166,14 @@ async fn whep_viewer_loop(
                                     else {
                                         continue;
                                     };
-                                    let Some(codec) =
-                                        crate::engine::audio_decode::ff_codec_for_stream_type(
-                                            stream_type,
-                                        )
-                                    else {
-                                        continue;
-                                    };
-                                    if ff_audio_codec != Some(codec) {
-                                        ff_audio_decoder = crate::engine::audio_decode::open_ff_decoder(codec).ok();
-                                        ff_audio_codec = Some(codec);
-                                    }
-                                    let Some(dec) = ff_audio_decoder.as_mut() else {
-                                        continue;
-                                    };
                                     if let Some(sg) = silence.as_mut() {
                                         sg.mark_real_audio(pts);
                                     }
-                                    for au in
-                                        crate::engine::audio_decode::split_audio_codec_frames(
-                                            &data, codec,
-                                        )
-                                    {
-                                        if dec.send_packet(au, pts as i64).is_err() {
-                                            continue;
-                                        }
-                                        while let Ok(frame) = dec.receive_frame() {
-                                            // To the encoder's format (a 5.1
-                                            // AC-3 source was refused, MP2 at
-                                            // another rate mislabelled).
-                                            let _ = encoder.submit_through(stage, &frame.planar, frame.sample_rate, pts);
-                                        }
+                                    for frame in &decoded {
+                                        // To the encoder's format (a 5.1
+                                        // AC-3 source was refused, MP2 at
+                                        // another rate mislabelled).
+                                        let _ = encoder.submit_through(stage, &frame.planar, frame.sample_rate, pts);
                                     }
                                     for frame in encoder.drain() {
                                         let media_time = MediaTime::new(
@@ -1160,10 +1200,34 @@ async fn whep_viewer_loop(
                                 }
                                 #[cfg(not(feature = "media-codecs"))]
                                 super::webrtc::ts_demux::DemuxedFrame::OtherAudio { .. } => {}
-                                // MPEG-2 video on a WebRTC output requires a
-                                // transcode hop we don't have today (WebRTC is
-                                // H.264 only). Drop the AU.
-                                super::webrtc::ts_demux::DemuxedFrame::Mpeg2 { .. } => {}
+                                // WebRTC carries H.264: MPEG-2 video goes out
+                                // re-encoded (`video_encode`), which the decoder
+                                // layer does; without one it is dropped and the
+                                // operator told once — it used to be dropped
+                                // either way, silently.
+                                super::webrtc::ts_demux::DemuxedFrame::Mpeg2 { es, pts, pts_known, .. } => {
+                                    if matches!(video_encoder_state, WebrtcVideoEncoderState::Disabled) {
+                                        if !mpeg2_warned {
+                                            mpeg2_warned = true;
+                                            warn_mpeg2_needs_encode(output_id, flow_id, events);
+                                        }
+                                        continue;
+                                    }
+                                    handle_webrtc_video_frame(
+                                        WebrtcVideoSource::Mpeg2(&es),
+                                        pts,
+                                        pts_known,
+                                        recv_time_us,
+                                        &mut video_encoder_state,
+                                        &mut session,
+                                        video_mid,
+                                        video_pt,
+                                        &stats,
+                                        output_id,
+                                        flow_id,
+                                        events,
+                                    ).await;
+                                }
                                 // Stream discontinuity is metadata for stateful
                                 // decoders; the WebRTC packetizer re-anchors on
                                 // the next IDR independently.
@@ -1407,6 +1471,7 @@ async fn whip_client_loop(
             };
         let mut video_encoder_state: WebrtcVideoEncoderState =
             init_webrtc_video_encoder_state(config.video_encode.as_ref());
+        let mut mpeg2_warned = false;
 
         // Send loop: demux TS → packetize H.264 → send via str0m.
         //
@@ -1450,8 +1515,7 @@ async fn whip_client_loop(
                                 match frame {
                                     super::webrtc::ts_demux::DemuxedFrame::H264 { nalus, pts, pts_known, .. } => {
                                         handle_webrtc_video_frame(
-                                            true,
-                                            &nalus,
+                                            WebrtcVideoSource::H264(&nalus),
                                             pts,
                                             pts_known,
                                             recv_time_us,
@@ -1467,8 +1531,7 @@ async fn whip_client_loop(
                                     }
                                     super::webrtc::ts_demux::DemuxedFrame::H265 { nalus, pts, pts_known, .. } => {
                                         handle_webrtc_video_frame(
-                                            false,
-                                            &nalus,
+                                            WebrtcVideoSource::H265(&nalus),
                                             pts,
                                             pts_known,
                                             recv_time_us,
@@ -1567,20 +1630,21 @@ async fn whip_client_loop(
                                     super::webrtc::ts_demux::DemuxedFrame::OtherAudio {
                                         stream_type, data, pts,
                                     } => {
-                                        if matches!(encoder_state, WebrtcEncoderState::Lazy) {
-                                            encoder_state = build_webrtc_encoder_state(
-                                                audio_encode.as_ref(),
-                                                transcode.as_ref(),
-                                                &demuxer,
-                                                None,
-                                                compressed_audio_input,
-                                                &cancel,
-                                                &stats,
-                                                flow_id,
-                                                &config.id,
-                                                events,
-                                            );
-                                        }
+                                        let decoded = decode_other_audio_for_encode(
+                                            &mut encoder_state,
+                                            &mut ff_audio_decoder,
+                                            &mut ff_audio_codec,
+                                            stream_type,
+                                            &data,
+                                            pts,
+                                            audio_encode.as_ref(),
+                                            transcode.as_ref(),
+                                            &cancel,
+                                            &stats,
+                                            flow_id,
+                                            &config.id,
+                                            events,
+                                        );
                                         let (
                                             WebrtcEncoderState::Active {
                                                 encoder, silence, stage, ..
@@ -1591,34 +1655,11 @@ async fn whip_client_loop(
                                         else {
                                             continue;
                                         };
-                                        let Some(codec) =
-                                            crate::engine::audio_decode::ff_codec_for_stream_type(
-                                                stream_type,
-                                            )
-                                        else {
-                                            continue;
-                                        };
-                                        if ff_audio_codec != Some(codec) {
-                                            ff_audio_decoder = crate::engine::audio_decode::open_ff_decoder(codec).ok();
-                                            ff_audio_codec = Some(codec);
-                                        }
-                                        let Some(dec) = ff_audio_decoder.as_mut() else {
-                                            continue;
-                                        };
                                         if let Some(sg) = silence.as_mut() {
                                             sg.mark_real_audio(pts);
                                         }
-                                        for au in
-                                            crate::engine::audio_decode::split_audio_codec_frames(
-                                                &data, codec,
-                                            )
-                                        {
-                                            if dec.send_packet(au, pts as i64).is_err() {
-                                                continue;
-                                            }
-                                            while let Ok(frame) = dec.receive_frame() {
-                                                let _ = encoder.submit_through(stage, &frame.planar, frame.sample_rate, pts);
-                                            }
+                                        for frame in &decoded {
+                                            let _ = encoder.submit_through(stage, &frame.planar, frame.sample_rate, pts);
                                         }
                                         for frame in encoder.drain() {
                                             let media_time = MediaTime::new(
@@ -1644,10 +1685,31 @@ async fn whip_client_loop(
                                     }
                                     #[cfg(not(feature = "media-codecs"))]
                                     super::webrtc::ts_demux::DemuxedFrame::OtherAudio { .. } => {}
-                                    // MPEG-2 video on a WebRTC output requires
-                                    // a transcode hop we don't have today
-                                    // (WebRTC is H.264 only). Drop the AU.
-                                    super::webrtc::ts_demux::DemuxedFrame::Mpeg2 { .. } => {}
+                                    // MPEG-2 video: re-encoded, or dropped
+                                    // and reported once (as on WHEP).
+                                    super::webrtc::ts_demux::DemuxedFrame::Mpeg2 { es, pts, pts_known, .. } => {
+                                        if matches!(video_encoder_state, WebrtcVideoEncoderState::Disabled) {
+                                            if !mpeg2_warned {
+                                                mpeg2_warned = true;
+                                                warn_mpeg2_needs_encode(&config.id, flow_id, events);
+                                            }
+                                            continue;
+                                        }
+                                        handle_webrtc_video_frame(
+                                            WebrtcVideoSource::Mpeg2(&es),
+                                            pts,
+                                            pts_known,
+                                            recv_time_us,
+                                            &mut video_encoder_state,
+                                            &mut session,
+                                            video_mid,
+                                            video_pt,
+                                            &stats,
+                                            &config.id,
+                                            flow_id,
+                                            events,
+                                        ).await;
+                                    }
                                     // Stream discontinuity is metadata for
                                     // stateful decoders; the WebRTC packetizer
                                     // re-anchors on the next IDR independently.
@@ -1703,9 +1765,9 @@ fn build_webrtc_encoder_state(
     output_id: &str,
     events: &EventSender,
 ) -> WebrtcEncoderState {
-    let Some(enc_cfg) = audio_encode else {
+    if audio_encode.is_none() {
         return WebrtcEncoderState::Disabled;
-    };
+    }
 
     if !compressed_audio_input {
         let msg = format!(
@@ -1765,6 +1827,55 @@ fn build_webrtc_encoder_state(
         return WebrtcEncoderState::Lazy;
     };
 
+    let decoder = match AacDecoder::from_adts_config(profile, sr_idx, ch_cfg) {
+        Ok(d) => d,
+        Err(e) => {
+            tracing::error!(
+                "WebRTC output '{}': audio_encode AacDecoder build failed: {e}",
+                output_id
+            );
+            return WebrtcEncoderState::Failed;
+        }
+    };
+    let decoded_as = (decoder.codec_name(), decoder.sample_rate(), decoder.channels());
+    build_webrtc_encoder_for_format(
+        audio_encode,
+        transcode,
+        input_sr,
+        input_ch,
+        Some(decoder),
+        decoded_as,
+        cancel,
+        stats,
+        flow_id,
+        output_id,
+        events,
+    )
+}
+
+/// The Opus encoder `audio_encode` asks for, opened for a source that
+/// decodes to `input_sr` × `input_ch`, behind the channel / rate stage every
+/// re-encoding output shares (`audio_transcode::EncoderStage`). `decoder` is
+/// an AAC source's; an MP2 / AC-3 / E-AC-3 source brings its own libavcodec
+/// decoder and passes `None`. `decoded_as` labels the decode stats.
+#[cfg(feature = "webrtc")]
+#[allow(clippy::too_many_arguments)]
+fn build_webrtc_encoder_for_format(
+    audio_encode: Option<&crate::config::models::AudioEncodeConfig>,
+    transcode: Option<&super::audio_transcode::TranscodeJson>,
+    input_sr: u32,
+    input_ch: u8,
+    decoder: Option<AacDecoder>,
+    decoded_as: (&str, u32, u8),
+    cancel: &CancellationToken,
+    stats: &Arc<OutputStatsAccumulator>,
+    flow_id: &str,
+    output_id: &str,
+    events: &EventSender,
+) -> WebrtcEncoderState {
+    let Some(enc_cfg) = audio_encode else {
+        return WebrtcEncoderState::Disabled;
+    };
     // Validation guarantees codec=opus for WebRTC; no need to handle others.
     let Some(codec) = AudioCodec::parse(&enc_cfg.codec) else {
         tracing::error!(
@@ -1826,17 +1937,6 @@ fn build_webrtc_encoder_state(
         opus_frame_duration_ms: enc_cfg.opus_frame_duration_ms,
     };
 
-    let decoder = match AacDecoder::from_adts_config(profile, sr_idx, ch_cfg) {
-        Ok(d) => d,
-        Err(e) => {
-            tracing::error!(
-                "WebRTC output '{}': audio_encode AacDecoder build failed: {e}",
-                output_id
-            );
-            return WebrtcEncoderState::Failed;
-        }
-    };
-
     let mut encoder = match AudioEncoder::spawn(
         params,
         cancel.child_token(),
@@ -1886,12 +1986,7 @@ fn build_webrtc_encoder_state(
 
     // Register decode + encode stats with the shared per-output accumulator.
     let decode_stats = Arc::new(DecodeStats::new());
-    stats.set_decode_stats(
-        decode_stats.clone(),
-        decoder.codec_name(),
-        decoder.sample_rate(),
-        decoder.channels(),
-    );
+    stats.set_decode_stats(decode_stats.clone(), decoded_as.0, decoded_as.1, decoded_as.2);
     stats.set_encode_stats(
         encoder.stats_handle(),
         encoder.params().codec.as_str().to_string(),
@@ -1901,12 +1996,79 @@ fn build_webrtc_encoder_state(
     );
 
     WebrtcEncoderState::Active {
-        decoder: Some(decoder),
+        decoder,
         encoder,
         decode_stats,
         stage,
         silence: None,
     }
+}
+
+/// Decode one MP2 / AC-3 / E-AC-3 PES (`stream_type`) for the Opus
+/// re-encode: with the session's libavcodec decoder (reopened when the codec
+/// changes), and — while the encoder is still `Lazy` — building it from the
+/// format the source decodes to ([`build_webrtc_encoder_for_format`]). It
+/// used to wait for an AAC config such a source never has, so its audio was
+/// dropped for good unless `silent_fallback` had built the encoder eagerly.
+/// Returns the decoded frames.
+#[cfg(all(feature = "webrtc", feature = "media-codecs"))]
+#[allow(clippy::too_many_arguments)]
+fn decode_other_audio_for_encode(
+    encoder_state: &mut WebrtcEncoderState,
+    decoder: &mut Option<video_engine::AudioDecoder>,
+    decoder_codec: &mut Option<video_codec::AudioDecoderCodec>,
+    stream_type: u8,
+    data: &[u8],
+    pts: u64,
+    audio_encode: Option<&crate::config::models::AudioEncodeConfig>,
+    transcode: Option<&super::audio_transcode::TranscodeJson>,
+    cancel: &CancellationToken,
+    stats: &Arc<OutputStatsAccumulator>,
+    flow_id: &str,
+    output_id: &str,
+    events: &EventSender,
+) -> Vec<video_engine::DecodedAudioFrame> {
+    if matches!(encoder_state, WebrtcEncoderState::Failed | WebrtcEncoderState::Disabled) {
+        return Vec::new();
+    }
+    let Some(codec) = crate::engine::audio_decode::ff_codec_for_stream_type(stream_type) else {
+        return Vec::new();
+    };
+    if *decoder_codec != Some(codec) {
+        *decoder = crate::engine::audio_decode::open_ff_decoder(codec).ok();
+        *decoder_codec = Some(codec);
+    }
+    let Some(dec) = decoder.as_mut() else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for au in crate::engine::audio_decode::split_audio_codec_frames(data, codec) {
+        if dec.send_packet(au, pts as i64).is_err() {
+            continue;
+        }
+        while let Ok(frame) = dec.receive_frame() {
+            out.push(frame);
+        }
+    }
+    if matches!(encoder_state, WebrtcEncoderState::Lazy)
+        && let Some(first) = out.first()
+    {
+        let channels = first.planar.len() as u8;
+        *encoder_state = build_webrtc_encoder_for_format(
+            audio_encode,
+            transcode,
+            first.sample_rate,
+            channels,
+            None,
+            (crate::engine::audio_decode::ff_codec_name(codec), first.sample_rate, channels),
+            cancel,
+            stats,
+            flow_id,
+            output_id,
+            events,
+        );
+    }
+    out
 }
 
 /// Eager encoder construction for `silent_fallback = true` on a WebRTC
@@ -2228,6 +2390,37 @@ mod stage_tests {
 
     /// The silent-fallback Opus encoder takes the transcode block's channel
     /// count (and so keeps its routing) before `audio_encode`'s.
+    /// An MP2 source builds the Opus encoder from what it decodes to (it
+    /// waited for an AAC config the source never has, and its audio was
+    /// dropped for good).
+    #[cfg(feature = "media-codecs")]
+    #[test]
+    fn an_mp2_source_builds_the_opus_encoder_from_its_decoded_format() {
+        let ae: crate::config::models::AudioEncodeConfig =
+            serde_json::from_value(serde_json::json!({ "codec": "opus" })).unwrap();
+        let (events, _rx) = crate::manager::events::event_channel();
+        let stats = Arc::new(OutputStatsAccumulator::new("w1".into(), "w1".into(), "webrtc".into()));
+        let cancel = CancellationToken::new();
+        let mut state = WebrtcEncoderState::Lazy;
+        let (mut dec, mut dec_codec) = (None, None);
+        let pes = crate::engine::output_rtmp::tests::mp2_pes(4);
+        let mut opus = 0usize;
+        for k in 0..20u64 {
+            let decoded = decode_other_audio_for_encode(
+                &mut state, &mut dec, &mut dec_codec, 0x03, &pes, 900_000 + k * 8_640,
+                Some(&ae), None, &cancel, &stats, "f", "w1", &events,
+            );
+            let WebrtcEncoderState::Active { encoder, stage, .. } = &mut state else {
+                panic!("the encoder is built on the first PES that decodes");
+            };
+            for f in decoded {
+                encoder.submit_through(stage, &f.planar, f.sample_rate, 900_000 + k * 8_640).unwrap();
+            }
+            opus += encoder.drain().len();
+        }
+        assert!(opus > 50, "{opus} Opus frames from 1.9 s of MP2");
+    }
+
     #[test]
     fn a_silent_fallback_session_takes_the_transcode_blocks_channels() {
         let enc: crate::config::models::AudioEncodeConfig =
@@ -2270,12 +2463,12 @@ mod rate_tests {
         let stats = Arc::new(OutputStatsAccumulator::new("o".into(), "o".into(), "webrtc".into()));
         let (events, _rx) = crate::manager::events::event_channel();
         let aus = crate::engine::output_rtmp::x264_test_source(40, 3_600);
-        let mut state = open_webrtc_video_active(&cfg, true, &aus[0].0, "o", "f", &stats, &events);
+        let mut state = open_webrtc_video_active(&cfg, video_codec::VideoCodec::H264, &aus[0].0, "o", "f", &stats, &events);
         let mut sps = None;
         let mut frames = 0;
         for (au, pts) in &aus {
             let nalus = crate::engine::ts_demux::split_annex_b_nalus(au);
-            for (out, _) in encode_one_video_frame_webrtc(&mut state, &nalus, *pts, true, "o") {
+            for (out, _) in encode_one_video_frame_webrtc(&mut state, &nalus_to_annex_b_webrtc(&nalus), *pts, true, "o") {
                 frames += 1;
                 sps = sps.or_else(|| video_engine::find_h264_sps(&out));
             }
@@ -2298,14 +2491,14 @@ mod rate_tests {
         let stats = Arc::new(OutputStatsAccumulator::new("o".into(), "o".into(), "webrtc".into()));
         let (events, _rx) = crate::manager::events::event_channel();
         let aus = crate::engine::output_rtmp::x264_test_source(80, 3_600);
-        let mut state = open_webrtc_video_active(&cfg, true, &aus[0].0, "o", "f", &stats, &events);
+        let mut state = open_webrtc_video_active(&cfg, video_codec::VideoCodec::H264, &aus[0].0, "o", "f", &stats, &events);
         let mut stamps = Vec::new();
         for (k, (au, pts)) in aus.iter().enumerate() {
             let nalus = crate::engine::ts_demux::split_annex_b_nalus(au);
             let known = k % 12 == 0;
             let fed = if known { *pts } else { 0 };
             stamps.extend(
-                encode_one_video_frame_webrtc(&mut state, &nalus, fed, known, "o").into_iter().map(|(_, p)| p),
+                encode_one_video_frame_webrtc(&mut state, &nalus_to_annex_b_webrtc(&nalus), fed, known, "o").into_iter().map(|(_, p)| p),
             );
         }
         let WebrtcVideoEncoderState::Active(active) = &state else { panic!("not active") };
@@ -2354,12 +2547,12 @@ mod rate_tests {
         .unwrap();
         let stats = Arc::new(OutputStatsAccumulator::new("o".into(), "o".into(), "webrtc".into()));
         let (events, _rx) = crate::manager::events::event_channel();
-        let mut state = open_webrtc_video_active(&cfg, true, &aus[0].data, "o", "f", &stats, &events);
+        let mut state = open_webrtc_video_active(&cfg, video_codec::VideoCodec::H264, &aus[0].data, "o", "f", &stats, &events);
         let mut stamps = Vec::new();
         for au in &aus {
             let nalus = crate::engine::ts_demux::split_annex_b_nalus(&au.data);
             let pts = 900_000 + au.pts as u64 * 3_600;
-            stamps.extend(encode_one_video_frame_webrtc(&mut state, &nalus, pts, true, "o").into_iter().map(|(_, p)| p));
+            stamps.extend(encode_one_video_frame_webrtc(&mut state, &nalus_to_annex_b_webrtc(&nalus), pts, true, "o").into_iter().map(|(_, p)| p));
         }
         assert!(stamps.len() >= n - 3, "{} frames", stamps.len());
         assert!(stamps.windows(2).all(|w| w[1] == w[0] + 3_600), "{stamps:?}");

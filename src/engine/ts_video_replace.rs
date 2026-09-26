@@ -2108,10 +2108,9 @@ mod inner {
                 return;
             }
             self.fps_mismatch_warned = true;
-            // Default GOP when the operator left `gop_size` unset — mirrors
-            // `video_encode_util::build_encoder_config` exactly, integer
-            // division included.
-            let default_gop_frames = 2 * (en / ed.max(1)).max(1);
+            // Default GOP when the operator left `gop_size` unset — the one
+            // `video_encode_util::build_encoder_config` opens with.
+            let default_gop_frames = crate::engine::video_encode_util::default_gop_frames(en, ed);
             if let (Some(n), Some(d)) = (self.fps_num, self.fps_den) {
                 // Operator pinned `video_encode.fps_num` / `fps_den` — but
                 // the measured source rate disagrees. The encoder runs at

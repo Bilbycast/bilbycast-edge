@@ -292,6 +292,18 @@ pub fn input_can_carry_ts_audio(input: &crate::config::models::InputConfig) -> b
 // Feeding the whole PES at once silently drops everything past the first
 // access unit (`avcodec_send_packet` decodes one AU per call).
 
+/// The name decode stats show for a libavcodec audio decoder's codec.
+#[cfg(feature = "media-codecs")]
+pub fn ff_codec_name(codec: video_codec::AudioDecoderCodec) -> &'static str {
+    match codec {
+        video_codec::AudioDecoderCodec::Mp2 => "MP2",
+        video_codec::AudioDecoderCodec::Ac3 => "AC-3",
+        video_codec::AudioDecoderCodec::Eac3 => "E-AC-3",
+        video_codec::AudioDecoderCodec::Opus => "Opus",
+        video_codec::AudioDecoderCodec::AacLatm => "AAC-LATM",
+    }
+}
+
 /// Map an MPEG-TS `stream_type` to the FFmpeg-backed audio decoder enum,
 /// or `None` for codecs that aren't routed through libavcodec (AAC has
 /// its own fdk-aac path).
@@ -522,12 +534,15 @@ fn split_mp2_frames(buf: &[u8]) -> Vec<&[u8]> {
 
 /// Walk an Opus-in-MPEG-TS PES payload and emit one slice per Opus
 /// access unit. Opus carriage in MPEG-TS prepends every Opus frame with
-/// a control header (`control_header_prefix = 0x3FF`, 11 bits of `1`,
-/// followed by `start_trim_flag` / `end_trim_flag` /
-/// `control_extension_flag`, an extensible `au_size` length field, and
-/// the optional control fields gated by the flags). The libopus decoder
-/// expects raw Opus packets, so the splitter strips the control header
-/// and yields the `au_size` bytes that follow.
+/// a control header (`control_header_prefix = 0x3FF` in 11 bits — `0111
+/// 1111 111`, so the header opens `0x7F`, then `0b111` — followed by
+/// `start_trim_flag` / `end_trim_flag` / `control_extension_flag`, an
+/// extensible `au_size` length field, and the optional control fields gated
+/// by the flags). The libopus decoder expects raw Opus packets, so the
+/// splitter strips the control header and yields the `au_size` bytes that
+/// follow. The prefix an edge's own muxer wrote until 2026-09 — eleven 1s,
+/// `0xFF` then `0b111` — is accepted too, so a stream from an older edge
+/// still decodes.
 ///
 /// Best-effort — malformed AUs cause a resync on the next valid prefix
 /// rather than aborting the PES.
@@ -536,10 +551,10 @@ pub fn split_opus_frames(buf: &[u8]) -> Vec<&[u8]> {
     let mut out: Vec<&[u8]> = Vec::with_capacity(2);
     let mut i = 0;
     while i + 2 <= buf.len() {
-        // 11-bit control_header_prefix = 0x3FF (= 11 bits all 1):
-        //   byte[i]       = 0xFF
-        //   byte[i+1]>>5  = 0b111
-        if buf[i] != 0xFF || (buf[i + 1] & 0xE0) != 0xE0 {
+        // 11-bit control_header_prefix = 0x3FF: byte[i] = 0x7F and
+        // byte[i+1] >> 5 = 0b111 (ffmpeg's `AV_RB16 >> 5 == 0x3ff`); or the
+        // older edge muxer's 0xFF there.
+        if !matches!(buf[i], 0x7F | 0xFF) || (buf[i + 1] & 0xE0) != 0xE0 {
             i += 1;
             continue;
         }
@@ -2002,18 +2017,21 @@ mod tests {
         }
     }
 
-    /// Opus-in-MPEG-TS access unit: control_header_prefix `0xFFE0` (top
-    /// 11 bits all 1), no flags, au_size = 7, then 7 bytes of Opus
-    /// payload. The splitter must skip the 3-byte header and emit the
-    /// 7-byte Opus packet.
+    /// Opus-in-MPEG-TS access unit: control_header_prefix 0x3FF (the
+    /// header opens `0x7F 0xE0`, as ffmpeg writes it), no flags, au_size =
+    /// 7, then 7 bytes of Opus payload. The splitter must skip the 3-byte
+    /// header and emit the 7-byte Opus packet — and take the `0xFF 0xE0`
+    /// an older edge's muxer wrote the same way.
     #[cfg(feature = "media-codecs")]
     #[test]
     fn opus_splitter_strips_control_header() {
-        let mut buf = vec![0xFF, 0xE0, 0x07];
-        buf.extend_from_slice(&[0x10, 0x20, 0x30, 0x40, 0x50, 0x60, 0x70]);
-        let frames = split_opus_frames(&buf);
-        assert_eq!(frames.len(), 1);
-        assert_eq!(frames[0], &[0x10, 0x20, 0x30, 0x40, 0x50, 0x60, 0x70]);
+        for first in [0x7F, 0xFF] {
+            let mut buf = vec![first, 0xE0, 0x07];
+            buf.extend_from_slice(&[0x10, 0x20, 0x30, 0x40, 0x50, 0x60, 0x70]);
+            let frames = split_opus_frames(&buf);
+            assert_eq!(frames.len(), 1);
+            assert_eq!(frames[0], &[0x10, 0x20, 0x30, 0x40, 0x50, 0x60, 0x70]);
+        }
     }
 
     /// `au_size` is variable-length: each `0xFF` byte adds 255 and

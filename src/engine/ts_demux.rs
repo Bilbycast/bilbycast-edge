@@ -117,12 +117,15 @@ pub enum DemuxedFrame {
         /// Raw elementary stream bytes — the payload after the PES
         /// header, with no further framing.
         es: Vec<u8>,
-        /// Presentation timestamp in 90 kHz clock ticks.
+        /// Presentation timestamp in 90 kHz clock ticks — 0 when the PES
+        /// carried none (see `pts_known`).
         pts: u64,
         /// `true` when this AU contains an I-picture
         /// (`picture_coding_type == 1` in the picture header). Drives
         /// thumbnail-anchor and replay-IDR-index selection.
         is_keyframe: bool,
+        /// Whether the PES carried a PTS (see `H264::pts_known`).
+        pts_known: bool,
     },
     /// Opus audio access unit, payload-bearing. Carries one or more
     /// Opus-in-MPEG-TS packetised frames (per the Opus-in-MPEG-TS spec —
@@ -1156,6 +1159,7 @@ impl TsDemuxer {
                     es: es_data.to_vec(),
                     pts: pts.unwrap_or(0),
                     is_keyframe,
+                    pts_known: pts.is_some(),
                 }]
             }
             STREAM_TYPE_H264 => {

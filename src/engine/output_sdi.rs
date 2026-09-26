@@ -338,7 +338,7 @@ async fn run_sdi_output(
                             }
                             // MPEG-2 ES is fed to the decoder verbatim — no
                             // NALU framing exists in this codec.
-                            DemuxedFrame::Mpeg2 { es, is_keyframe, pts } => {
+                            DemuxedFrame::Mpeg2 { es, is_keyframe, pts, .. } => {
                                 PlayoutAu::Video(VideoAu {
                                     annexb: es,
                                     codec: VideoCodec::Mpeg2,

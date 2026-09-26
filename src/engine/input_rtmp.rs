@@ -190,7 +190,6 @@ async fn process_media(
                 muxer.set_pids(entry.pmt_pid, entry.video_pid, entry.audio_pid, entry.pcr_pid);
             }
     let mut seq_num: u16 = 0;
-    let mut has_sent_sps_pps = false;
     let mut sps: Option<Vec<u8>> = None;
     let mut pps: Option<Vec<u8>> = None;
     let mut audio_sample_rate_idx: u8 = 4; // default 44.1kHz
@@ -274,15 +273,20 @@ async fn process_media(
                                 let dts_ms = timestamp_ms as i64;
                                 let pts_ms = dts_ms + composition_time as i64;
 
-                                let dts_90khz = (dts_ms * 90) as u64;
-                                let pts_90khz = (pts_ms.max(0) * 90) as u64;
+                                let dts_90khz = TIMELINE_START_90K + (dts_ms.max(0) * 90) as u64;
+                                let pts_90khz = TIMELINE_START_90K + (pts_ms.max(0) * 90) as u64;
 
-                                // Convert length-prefixed NALUs to Annex B
-                                let annex_b = length_prefixed_to_annex_b(&data[5..], &sps, &pps, is_keyframe && !has_sent_sps_pps);
-
-                                if is_keyframe && sps.is_some() {
-                                    has_sent_sps_pps = true;
-                                }
+                                // Convert length-prefixed NALUs to Annex B,
+                                // with the sequence header's SPS / PPS ahead
+                                // of every IDR that does not carry its own
+                                // (`parameter_sets_to_prepend`). They went
+                                // ahead of the first IDR of a publish only, so
+                                // a receiver joining any output of the flow
+                                // after it never decoded a picture ("non-
+                                // existing PPS 0 referenced").
+                                let (with_sps, with_pps) =
+                                    parameter_sets_to_prepend(&data[5..], is_keyframe, &sps, &pps);
+                                let annex_b = length_prefixed_to_annex_b(&data[5..], with_sps, with_pps);
 
                                 let ts_packets = muxer.mux_video(&annex_b, pts_90khz, dts_90khz, is_keyframe);
 
@@ -357,7 +361,7 @@ async fn process_media(
                                 // AAC frame duration apart at 90 kHz.
                                 let sample_rate_hz = aac_sample_rate_hz(audio_sample_rate_idx);
                                 let anchor = *audio_anchor_pts_90khz
-                                    .get_or_insert_with(|| (timestamp_ms as u64) * 90);
+                                    .get_or_insert_with(|| TIMELINE_START_90K + (timestamp_ms as u64) * 90);
                                 let pts_90khz = anchor
                                     + audio_frames_emitted * 1024 * 90_000 / sample_rate_hz as u64;
                                 audio_frames_emitted += 1;
@@ -411,7 +415,6 @@ async fn process_media(
                             "RTMP publisher disconnected",
                             &flow_id,
                         );
-                        has_sent_sps_pps = false;
                         // Reset audio anchor so the next publisher restarts
                         // the sample counter from its own RTMP wall time.
                         audio_anchor_pts_90khz = None;
@@ -430,6 +433,12 @@ async fn process_media(
         }
     }
 }
+
+/// Where a publish's timeline starts (90 kHz): its RTMP timestamps, which
+/// start at 0, are carried from the muxer's PCR lead, so the first PCR —
+/// that far behind the first timestamp — is 0 rather than just below the
+/// 33-bit wrap.
+const TIMELINE_START_90K: u64 = super::rtmp::ts_mux::PCR_LEAD_90K;
 
 /// Audio media time an RTMP publish may carry without a single H.264 tag
 /// before it is taken as audio-only (1 s). Publishers send the AVC sequence
@@ -614,43 +623,73 @@ fn parse_avc_decoder_config(data: &[u8]) -> Option<(Vec<u8>, Vec<u8>)> {
     }
 }
 
-/// Convert length-prefixed NALUs to Annex B format (start codes).
-/// Optionally prepend SPS/PPS for keyframes.
-fn length_prefixed_to_annex_b(
-    data: &[u8],
-    sps: &Option<Vec<u8>>,
-    pps: &Option<Vec<u8>>,
-    prepend_sps_pps: bool,
-) -> Vec<u8> {
-    let mut out = Vec::with_capacity(data.len() + 128);
-
-    // Prepend SPS/PPS with start codes before keyframes
-    if prepend_sps_pps {
-        if let Some(s) = sps {
-            out.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]);
-            out.extend_from_slice(s);
-        }
-        if let Some(p) = pps {
-            out.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]);
-            out.extend_from_slice(p);
-        }
-    }
-
-    // Convert each length-prefixed NALU to Annex B
+/// The length-prefixed NAL units of an AVC NALU tag, as slices.
+fn length_prefixed_nalus(data: &[u8]) -> impl Iterator<Item = &[u8]> {
     let mut pos = 0;
-    while pos + 4 <= data.len() {
-        let nalu_len = u32::from_be_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]) as usize;
-        pos += 4;
-
-        if pos + nalu_len > data.len() {
-            break;
+    std::iter::from_fn(move || {
+        if pos + 4 > data.len() {
+            return None;
         }
+        let len = u32::from_be_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]) as usize;
+        pos += 4;
+        if pos + len > data.len() {
+            pos = data.len();
+            return None;
+        }
+        let nal = &data[pos..pos + len];
+        pos += len;
+        Some(nal)
+    })
+}
 
-        out.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]);
-        out.extend_from_slice(&data[pos..pos + nalu_len]);
-        pos += nalu_len;
+/// The sequence header's SPS / PPS to put ahead of an access unit
+/// (length-prefixed `data`): each one the unit lacks, when it is a keyframe
+/// (the FLV frame type) or holds an IDR slice. An RTMP publisher sends the
+/// parameter sets once, in the AVC sequence header, and an encoder repeating
+/// them in-band keeps its own — those are never doubled.
+fn parameter_sets_to_prepend<'a>(
+    data: &[u8],
+    is_keyframe: bool,
+    sps: &'a Option<Vec<u8>>,
+    pps: &'a Option<Vec<u8>>,
+) -> (Option<&'a [u8]>, Option<&'a [u8]>) {
+    let (mut idr, mut has_sps, mut has_pps) = (false, false, false);
+    for nal in length_prefixed_nalus(data) {
+        match nal.first().map(|b| b & 0x1F) {
+            Some(5) => idr = true,
+            Some(7) => has_sps = true,
+            Some(8) => has_pps = true,
+            _ => {}
+        }
     }
+    if !(is_keyframe || idr) {
+        return (None, None);
+    }
+    (
+        sps.as_deref().filter(|_| !has_sps),
+        pps.as_deref().filter(|_| !has_pps),
+    )
+}
 
+/// Convert length-prefixed NALUs to Annex B format (start codes), with `sps`
+/// and `pps` ahead of the unit's slices — after its access unit delimiter,
+/// which must open the unit, when it starts with one.
+fn length_prefixed_to_annex_b(data: &[u8], sps: Option<&[u8]>, pps: Option<&[u8]>) -> Vec<u8> {
+    const START: [u8; 4] = [0x00, 0x00, 0x00, 0x01];
+    let mut out = Vec::with_capacity(data.len() + 128);
+    let mut nalus = length_prefixed_nalus(data).peekable();
+    if let Some(aud) = nalus.next_if(|n| n.first().map(|b| b & 0x1F) == Some(9)) {
+        out.extend_from_slice(&START);
+        out.extend_from_slice(aud);
+    }
+    for ps in [sps, pps].into_iter().flatten() {
+        out.extend_from_slice(&START);
+        out.extend_from_slice(ps);
+    }
+    for nal in nalus {
+        out.extend_from_slice(&START);
+        out.extend_from_slice(nal);
+    }
     out
 }
 
@@ -745,6 +784,94 @@ mod tests {
         data.extend_from_slice(&(nalu.len() as u32).to_be_bytes());
         data.extend_from_slice(&nalu);
         RtmpMediaMessage::Video { data: data.into(), timestamp_ms }
+    }
+
+    /// The video access units `process_media` published, as the Annex B ES of
+    /// each PES on the video PID (PES header stripped), in order.
+    async fn published_video_units(msgs: Vec<RtmpMediaMessage>) -> Vec<Vec<u8>> {
+        let (tx, rx) = mpsc::channel(8192);
+        for m in msgs {
+            tx.send(m).await.unwrap();
+        }
+        drop(tx);
+        let (btx, mut brx) = broadcast::channel(8192);
+        let stats = Arc::new(FlowStatsAccumulator::new("f".into(), "flow".into(), "rtmp".into()));
+        let cancel = CancellationToken::new();
+        let publisher = crate::engine::ingress_publisher::IngressPublisher::new(
+            Default::default(),
+            btx,
+            "in",
+            cancel.clone(),
+            stats.clone(),
+        );
+        let (events, _events_rx) = crate::manager::events::event_channel();
+        process_media(rx, publisher, stats, cancel, events, "flow".into(), &mut None, &mut None, None)
+            .await;
+        let mut pes: Vec<Vec<u8>> = Vec::new();
+        while let Ok(p) = brx.try_recv() {
+            for pkt in p.data.chunks(188) {
+                if ts_pid(pkt) != 0x0100 {
+                    continue;
+                }
+                let off = crate::engine::ts_parse::ts_payload_offset(pkt);
+                if off >= 188 {
+                    continue;
+                }
+                if ts_pusi(pkt) {
+                    pes.push(Vec::new());
+                }
+                if let Some(cur) = pes.last_mut() {
+                    cur.extend_from_slice(&pkt[off..]);
+                }
+            }
+        }
+        pes.into_iter().map(|p| p[9 + p[8] as usize..].to_vec()).collect()
+    }
+
+    fn nal_types(annex_b: &[u8]) -> Vec<u8> {
+        crate::engine::ts_demux::split_annex_b_nalus(annex_b).iter().map(|n| n[0] & 0x1F).collect()
+    }
+
+    fn avc_frame(timestamp_ms: u32, keyframe: bool, nal_types: &[u8]) -> RtmpMediaMessage {
+        let mut data = vec![if keyframe { 0x17 } else { 0x27 }, 0x01, 0, 0, 0];
+        for t in nal_types {
+            let mut nalu = vec![0x60 | t, 0x88, 0x84];
+            nalu.extend(std::iter::repeat_n(0x11, 40));
+            data.extend_from_slice(&(nalu.len() as u32).to_be_bytes());
+            data.extend_from_slice(&nalu);
+        }
+        RtmpMediaMessage::Video { data: data.into(), timestamp_ms }
+    }
+
+    /// Every IDR carries the SPS and PPS the sequence header gave, not only a
+    /// publish's first: a receiver that joins an output after that one could
+    /// never decode ("non-existing PPS 0 referenced"). A picture that is not
+    /// an IDR gets none, a unit that brings its own is not given a second
+    /// copy, and an access unit delimiter stays first.
+    #[tokio::test]
+    async fn every_idr_carries_the_parameter_sets() {
+        let msgs = vec![
+            avc_config(),
+            avc_frame(0, true, &[5]),
+            avc_frame(40, false, &[1]),
+            avc_frame(80, true, &[5]),
+            avc_frame(120, true, &[9, 5]),
+            avc_frame(160, true, &[7, 8, 5]),
+            avc_frame(200, false, &[1]),
+        ];
+        let units: Vec<Vec<u8>> =
+            published_video_units(msgs).await.iter().map(|u| nal_types(u)).collect();
+        assert_eq!(
+            units,
+            vec![
+                vec![7, 8, 5],
+                vec![1],
+                vec![7, 8, 5],
+                vec![9, 7, 8, 5],
+                vec![7, 8, 5],
+                vec![1],
+            ],
+        );
     }
 
     /// An audio-only publish (ffmpeg `-f flv` with no video writes no video
