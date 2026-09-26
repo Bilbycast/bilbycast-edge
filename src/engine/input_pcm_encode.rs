@@ -189,7 +189,20 @@ struct AacSynth {
     planar_scratch: Vec<Vec<f32>>,
     /// Monotonic 90 kHz PTS counter. Advances by `n_frames * 90_000 / sample_rate`
     /// per input PCM packet — mirrors the cadence the transcode stage uses.
+    /// Also the clock the filler PCRs are released on (`pcr_fillers`).
     pts_90khz: u64,
+    /// The filler PCRs across the last AU's span (the muxer's
+    /// `audio_pcr_fillers_after`), each with the input clock (`pts_90khz`)
+    /// it comes due at — the AU's own emission clock plus its offset. The
+    /// AUs leave as the input packet that completes them arrives, so a
+    /// filler sent with the next AU (the muxer's default) arrived up to one
+    /// AU early against its value: 21 ms of PCR jitter on HE-AAC at 48 kHz.
+    /// A new AU drops any not yet released: they would follow a later PCR.
+    pcr_fillers: Vec<(u64, Bytes)>,
+    /// One AU's duration (90 kHz): the codec's frame — 1024 samples for
+    /// AAC-LC, 2048 for HE-AAC (its SBR output rate) — at the sample rate.
+    /// The span each AU's fillers cover.
+    au_duration_90k: u64,
     /// Per-flow cross-essence media-timeline anchor (ST 2110 flows).
     /// When set, the first packet's RTP timestamp resolves the PES
     /// timeline origin onto the flow-shared timeline so the audio
@@ -465,6 +478,9 @@ fn build_synth(
     ts_mux.set_has_video(false);
     ts_mux.set_has_audio(true);
     ts_mux.set_audio_stream(0x0F, None);
+    // Each AU leaves as the input packet completing it arrives: its filler
+    // PCRs are released on the input clock (`AacSynth::pcr_fillers`).
+    ts_mux.clock_audio_pcr_fillers();
 
     let frame_size = input_fmt.channels as usize * input_fmt.bit_depth.wire_bytes();
     let planar_scratch: Vec<Vec<f32>> = (0..input_fmt.channels).map(|_| Vec::new()).collect();
@@ -487,6 +503,12 @@ fn build_synth(
         frame_size,
         planar_scratch,
         pts_90khz: 0,
+        pcr_fillers: Vec::new(),
+        au_duration_90k: match codec {
+            AudioCodec::HeAacV1 | AudioCodec::HeAacV2 => 2_048,
+            _ => 1_024,
+        } * 90_000
+            / u64::from(input_fmt.sample_rate.max(1)),
         media_timeline: None,
         anchored: false,
         cancel,
@@ -555,17 +577,25 @@ impl AacSynth {
                 .wrapping_add((n_frames as u64) * 90_000 / (self.sample_rate as u64));
         }
 
-        let encoded = self.encoder.drain();
-        if encoded.is_empty() {
-            return Vec::new();
-        }
+        // The input clock now stands at the end of this packet: the filler
+        // PCRs due by it go first, ahead of any AU this packet completes.
+        let now = self.pts_90khz;
+        let due = self.pcr_fillers.iter().take_while(|(at, _)| *at <= now).count();
+        let mut out: Vec<Bytes> = self.pcr_fillers.drain(..due).map(|(_, p)| p).collect();
 
-        let mut out: Vec<Bytes> = Vec::with_capacity(encoded.len() * 4);
+        let encoded = self.encoder.drain();
         for ef in encoded {
             // `ef.data` is a complete ADTS frame — feed it to the shared
             // muxer which wraps it in a PES and emits 188-byte TS packets.
             let ts_pkts = self.ts_mux.mux_audio_pre_adts(&ef.data, ef.pts);
             out.extend(ts_pkts);
+            self.pcr_fillers.clear();
+            self.pcr_fillers.extend(
+                self.ts_mux
+                    .audio_pcr_fillers_after(self.au_duration_90k)
+                    .into_iter()
+                    .map(|(off, p)| (now.wrapping_add(off), p)),
+            );
         }
         out
     }
@@ -723,5 +753,75 @@ mod tests {
             .expect("construct")
             .expect("stage");
         assert!(!p.shape_change());
+    }
+
+    /// HE-AAC at 48 kHz from 1 ms PCM packets: 42.7 ms AUs, so a filler PCR
+    /// crosses each AU's span, the first included. Each leaves with the
+    /// input packet at which the input clock reaches the instant its value
+    /// names — every PCR's value against the packet it left with is one
+    /// constant, to the two packets an AU and a filler can each round to —
+    /// and every step is within 35 ms. Put ahead of the next AU (the muxer's
+    /// default) a filler left with that AU, 21 ms early against its value.
+    #[cfg(feature = "fdk-aac")]
+    #[test]
+    fn an_aac_synths_filler_pcrs_leave_on_the_input_clock() {
+        let ae = AudioEncodeConfig {
+            codec: "he_aac_v1".to_string(),
+            bitrate_kbps: Some(64),
+            sample_rate: None,
+            channels: None,
+            silent_fallback: false,
+            opus_vbr_mode: None,
+            opus_fec: false,
+            opus_dtx: false,
+            opus_frame_duration_ms: None,
+            source_audio_pid: None,
+            ts_signalling: None,
+        };
+        let mut p = PcmInputProcessor::new(48_000, 24, 2, None, Some(&ae), 0, 0, 0)
+            .expect("construct")
+            .expect("synth");
+        // (packet index = input ms, PCR in 90 kHz) of every PCR out.
+        let mut pcrs: Vec<(u64, u64)> = Vec::new();
+        for ms in 0..2_000u64 {
+            let mut data = vec![0x80, 97, (ms >> 8) as u8, ms as u8];
+            data.extend_from_slice(&((ms * 48) as u32).to_be_bytes());
+            data.extend_from_slice(&[0, 0, 0, 1]);
+            for n in 0..48u64 {
+                let t = (ms * 48 + n) as f32 / 48_000.0;
+                let v = ((0.25 * (2.0 * std::f32::consts::PI * 997.0 * t).sin()) * 8_388_607.0) as i32;
+                for _ in 0..2 {
+                    data.extend_from_slice(&v.to_be_bytes()[1..]);
+                }
+            }
+            let pkt = RtpPacket {
+                data: Bytes::from(data),
+                sequence_number: ms as u16,
+                rtp_timestamp: (ms * 48) as u32,
+                recv_time_us: 0,
+                is_raw_ts: false,
+                upstream_seq: None,
+                upstream_leg_id: None,
+                sender_timestamp_us: None,
+            };
+            for ts in p.process(&pkt) {
+                for tp in ts.chunks(188) {
+                    if let Some(v) = crate::engine::ts_parse::extract_pcr(tp) {
+                        pcrs.push((ms, v / 300));
+                    }
+                }
+            }
+        }
+        assert!(pcrs.len() > 80, "{} PCRs from 2 s of HE-AAC", pcrs.len());
+        let fillers = pcrs.windows(2).filter(|w| w[1].0 != w[0].0).count();
+        assert!(fillers > 40);
+        const M: u64 = 1 << 33;
+        for w in pcrs.windows(2) {
+            let step = (w[1].1 + M - w[0].1) % M;
+            assert!(step > 0 && step <= 3_150, "PCR step {} ticks", step);
+            // Against the input clock (90 ticks a packet): within two packets.
+            let off = (w[1].0 - w[0].0) as i64 * 90 - step as i64;
+            assert!(off.abs() <= 180, "a PCR leaves {off} ticks off the instant its value names");
+        }
     }
 }

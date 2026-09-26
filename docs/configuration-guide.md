@@ -1240,7 +1240,20 @@ PES carry the PCR — 100 ms behind each PES's PTS, so every AU is in the
 decoder's buffer before it is due (at the PTS itself, as first shipped, each
 AU arrived as it was due to play), with PCR-only packets on the audio PID
 between AUs longer than 35 ms (HE-AAC at 48 kHz: 42.7 ms; AAC-LC at 16 kHz:
-64 ms) so the PCR never steps past TR 101 290's 40 ms. The other audio-only
+64 ms) so the PCR *values* never step past TR 101 290's 40 ms. When a filler
+leaves depends on the path. This input has no clock of its own and forwards
+each AU as it arrives, so a filler goes out with the next AU — up to one AU
+early against its value (21 ms on HE-AAC at 48 kHz, 32 ms on AAC-LC at
+16 kHz), which a PCR-jitter or arrival-based PCR_repetition measurement sees;
+the same holds for RTSP and WebRTC. The media player's audio-only MP4 and the
+PCM-encode input send each AU at its own instant, and each filler at the
+instant its value names (sent with the next AU, as first shipped, it put that
+jitter on a path that otherwise holds PCR accuracy at +0). On the wire, the
+UDP / RTP / SRT outputs send whole seven-packet datagrams, so a low-rate
+audio-only programme's PCRs leave as each datagram fills — about every 82 ms
+at 128 kbps — whatever the input did: arrival-based PCR_repetition and PCR
+jitter on such a programme are set by that re-chunking, not by the muxer.
+The other audio-only
 programmes `TsMuxer` builds (RTSP, the PCM-encode input, an audio-only MP4 in
 the media player, the WebRTC input's Opus, and the SMPTE 302M PES of an
 `audio_302m` SRT / UDP / `rtp_audio` output) carry their PCR the same way. The
