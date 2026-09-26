@@ -327,10 +327,15 @@ source-discontinuity watch into a DI. A dropped packet that carries the
 PCR or DI survives adaptation-field-only (on Sky the first PCR rides in
 a continuation packet of exactly such a PES), and the CC of every later
 packet on that PID is lowered by the number dropped so the sequence stays
-continuous. Nothing decodable is lost: the decoder needs PMT + PCR before
-anything. In the source-clock fallback above nothing is dropped (PCR and
-PES agree there). Pinned by
-`a_pes_started_before_the_first_pcr_is_dropped_whole`.
+continuous. That counts from the PID's first packet out, not its first held
+PES: a PID joined mid-PES sends the tail of a PES the flow never saw start,
+then has its next PES held, and a drop counted as "nothing sent yet" left
+one continuity error on each such PID at flow start (18 on Spain's MPTS,
+whose other programs run ahead of its PAT). Nothing decodable is lost: the
+decoder needs PMT + PCR before anything. In the source-clock fallback above
+nothing is dropped (PCR and PES agree there). Pinned by
+`a_pes_started_before_the_first_pcr_is_dropped_whole` and
+`a_pid_joined_mid_pes_keeps_its_cc_across_the_pes_the_gate_holds`.
 
 The hold is bounded. Once it has held 2 s of PES time on a PID (forward
 steps only, each capped at 1 s) or 2 s of wall time, it gives up waiting:

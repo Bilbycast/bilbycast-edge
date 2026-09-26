@@ -782,7 +782,8 @@ impl TsPtsRewriter {
             // the source-clock fallbacks, where PCR and PES agree anyway,
             // and never for longer than `PES_HOLD_WINDOW_27MHZ`.
             let mut stripped = false;
-            if self.gates_pes(pid, on_pmt_pid) {
+            let gated = self.gates_pes(pid, on_pmt_pid);
+            if gated {
                 if ts_pusi(pkt) && super::ts_parse::pes_payload_offset(pkt).is_some() {
                     // Only a PES with a timestamp has anything to leak.
                     let ts = extract_pes_dts(pkt).or_else(|| extract_pes_pts(pkt));
@@ -886,7 +887,19 @@ impl TsPtsRewriter {
             }
 
             // Renumber the CC of a PID the PES gate has dropped packets on.
-            if let Some(g) = self.pes_gate.get_mut(&pid) {
+            // Every packet a gated PID sends is accounted, not only those
+            // after its first held PES: a PID whose first packets are the
+            // tail of a PES begun before the flow (a mid-stream join, a
+            // media-player MPTS's other programs ahead of its PAT) sent
+            // them, then had its next PES held — a drop the renumbering
+            // skipped as "nothing sent yet", leaving one continuity error
+            // on each such PID at flow start (18 PIDs on Spain's MPTS).
+            let gate = if gated {
+                Some(self.pes_gate.entry(pid).or_default())
+            } else {
+                self.pes_gate.get_mut(&pid)
+            };
+            if let Some(g) = gate {
                 if g.cc.rewrites(stripped) {
                     if !rewritten {
                         buf.copy_from_slice(pkt);
@@ -3074,6 +3087,56 @@ mod tests {
         assert_eq!((pts_out + (1 << 33) - pcr_out) % (1 << 33), 9_000, "re-anchored");
         let ccs: Vec<u8> = v.iter().map(|p| p[3] & 0x0F).collect();
         assert_eq!(ccs, vec![5, 6, 7], "AF-only then payload, continuous");
+    }
+
+    /// A PID joined mid-PES sends that PES's tail before its first PES
+    /// start, which the gate then holds. The drop must be renumbered like
+    /// any other: counted as "nothing sent yet", it left one continuity
+    /// error at flow start on each such PID — every ES PID but the PMT's
+    /// on a media-player MPTS, whose other programs run ahead of its PAT.
+    #[test]
+    fn a_pid_joined_mid_pes_keeps_its_cc_across_the_pes_the_gate_holds() {
+        use crate::engine::ts_test_fixtures::{payload_packet, pes_start_packet};
+        let ccs_on = |out: &[u8], pid: u16| -> Vec<u8> {
+            out.chunks_exact(TS_PACKET_SIZE)
+                .filter(|p| ts_pid(p) == pid && ts_has_payload(p))
+                .map(|p| p[3] & 0x0F)
+                .collect()
+        };
+        // One program: the tail goes out, the PES started before the
+        // first PCR is held, the next passes once the PCR anchored.
+        let mut r = TsPtsRewriter::new(make_wallclock_pacer());
+        let mut out = Vec::new();
+        r.process(&build_psi(0x100, 0x101), &mut out);
+        out.clear();
+        let src_pcr = 900_000_000u64;
+        r.process(&payload_packet(0x101, 3), &mut out);
+        r.process(&payload_packet(0x101, 4), &mut out);
+        r.process(&pes_start_packet(0x101, 5, 0xC0, 12_345_678, None), &mut out);
+        r.process(&payload_packet(0x101, 6), &mut out);
+        r.process(&build_pcr_packet(0x100, src_pcr), &mut out);
+        r.process(&pes_start_packet(0x101, 7, 0xC0, src_pcr / 300 + 9_000, None), &mut out);
+        r.process(&payload_packet(0x101, 8), &mut out);
+        assert!(
+            out.chunks_exact(TS_PACKET_SIZE).all(|p| extract_pes_pts(p) != Some(12_345_678)),
+            "the PES started before the anchor is held"
+        );
+        assert_eq!(ccs_on(&out, 0x101), vec![3, 4, 5, 6], "SPTS: CC continuous");
+
+        // A media-player MPTS: the tail ahead of the PAT, the held PES,
+        // the latch into verbatim passthrough, the next PES.
+        let mut r = TsPtsRewriter::new(make_wallclock_pacer());
+        let mut out = Vec::new();
+        r.process(&payload_packet(0x44D, 0), &mut out);
+        r.process(&payload_packet(0x44D, 1), &mut out);
+        r.process(&pes_start_packet(0x44D, 2, 0xE0, 8_000_000, None), &mut out);
+        r.process(&payload_packet(0x44D, 3), &mut out);
+        r.process(&build_mpts_pat(6), &mut out);
+        assert!(r.mpts_passthrough_latch);
+        r.process(&payload_packet(0x44D, 4), &mut out);
+        r.process(&pes_start_packet(0x44D, 5, 0xE0, 8_003_600, None), &mut out);
+        r.process(&payload_packet(0x44D, 6), &mut out);
+        assert_eq!(ccs_on(&out, 0x44D), vec![0, 1, 2, 3], "MPTS: CC continuous");
     }
 
     /// A small backward PCR step is the source's own and passes through as
