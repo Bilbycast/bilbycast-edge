@@ -1840,9 +1840,10 @@ pub const STREAM_CHUNK_FRAMES: usize = 256;
 /// `transcode` block is set, as a block: `sample_rate` / `channels` are the
 /// overrides that differ from the decoded format (`None` = no change). A
 /// multichannel source going to stereo gets the standard downmix (ITU-R
-/// BS.775 for 5.1 / 7.1, Lt/Rt for quad), mono ↔ stereo the transcode
-/// stage's own default; anything else keeps the channels in order and
-/// silence for the missing ones. `None` when neither differs.
+/// BS.775 for 3.0 / 5.0 / 5.1 / 7.1, Lt/Rt for quad) and going to mono
+/// BS.775's mono downmix (see [`mono_downmix`]); mono ↔ stereo the
+/// transcode stage's own default; anything else keeps the channels in order
+/// and silence for the missing ones. `None` when neither differs.
 pub fn override_conversion(
     in_channels: u8,
     sample_rate: Option<u32>,
@@ -1857,7 +1858,9 @@ pub fn override_conversion(
             (6, 2) => tj.channel_map_preset = Some("5_1_to_stereo_bs775".into()),
             (8, 2) => tj.channel_map_preset = Some("7_1_to_stereo_bs775".into()),
             (4, 2) => tj.channel_map_preset = Some("4ch_to_stereo_lt_rt".into()),
+            (3 | 5, 2) => tj.channel_map_with_gain = Some(front_centre_stereo_downmix(in_channels)),
             (1, 2) | (2, 1) => {}
+            (n, 1) => tj.channel_map_with_gain = Some(vec![mono_downmix(n)]),
             _ => {
                 tj.channel_map_with_gain = Some(
                     (0..out)
@@ -1874,6 +1877,42 @@ pub fn override_conversion(
         }
     }
     Some(tj)
+}
+
+/// −3 dB (1/√2), the BS.775 downmix coefficient.
+const BS775_G3: f64 = std::f64::consts::FRAC_1_SQRT_2;
+
+/// ITU-R BS.775's downmix of a multichannel source to mono, as one
+/// `channel_map_with_gain` row, for the channel order every decoder here
+/// hands out (L, R, C, LFE, Ls, Rs, then the back pair): L and R at −3 dB,
+/// C at unity, each surround at −6 dB, the LFE left out — BS.775 feeds it to
+/// no full-range channel. 3.0 (L R C), quad (L R Ls Rs), 5.0 (L R C Ls Rs),
+/// 5.1 and 7.1 by that rule; any other layout, whose channels this cannot
+/// name, as the average of all of them. Taking channel 0 alone — the rule
+/// for every pair without a preset until now — kept front-left and dropped
+/// the centre, where the dialogue is.
+pub fn mono_downmix(in_channels: u8) -> Vec<[f64; 2]> {
+    let (l, r, c, s) = (BS775_G3, BS775_G3, 1.0, 0.5);
+    match in_channels {
+        3 => vec![[0.0, l], [1.0, r], [2.0, c]],
+        4 => vec![[0.0, l], [1.0, r], [2.0, s], [3.0, s]],
+        5 => vec![[0.0, l], [1.0, r], [2.0, c], [3.0, s], [4.0, s]],
+        6 => vec![[0.0, l], [1.0, r], [2.0, c], [4.0, s], [5.0, s]],
+        8 => vec![[0.0, l], [1.0, r], [2.0, c], [4.0, s], [5.0, s], [6.0, s], [7.0, s]],
+        n => (0..n).map(|i| [f64::from(i), 1.0 / f64::from(n.max(1))]).collect(),
+    }
+}
+
+/// BS.775's stereo downmix of 3.0 (L R C) and 5.0 (L R C Ls Rs): the
+/// centre at −3 dB into both sides, each surround at −3 dB into its own.
+fn front_centre_stereo_downmix(in_channels: u8) -> Vec<Vec<[f64; 2]>> {
+    let mut left = vec![[0.0, 1.0], [2.0, BS775_G3]];
+    let mut right = vec![[1.0, 1.0], [2.0, BS775_G3]];
+    if in_channels == 5 {
+        left.push([3.0, BS775_G3]);
+        right.push([4.0, BS775_G3]);
+    }
+    vec![left, right]
 }
 
 /// The channel / rate stage between a decoder producing `(rate, channels)`
@@ -2157,9 +2196,49 @@ mod tests {
         let map = tj.channel_map_with_gain.unwrap();
         assert_eq!(map, vec![vec![[0.0, 1.0]], vec![[1.0, 1.0]], vec![[2.0, 1.0]], vec![[0.0, 0.0]]]);
         // Every one builds.
-        for (i, o) in [(6u8, 2u8), (8, 2), (4, 2), (1, 2), (2, 1), (3, 4)] {
+        for (i, o) in [(6u8, 2u8), (8, 2), (4, 2), (3, 2), (5, 2), (1, 2), (2, 1), (3, 4), (7, 1)] {
             let tj = override_conversion(i, Some(44_100), Some(o)).unwrap();
             assert!(PlanarAudioTranscoder::new(48_000, i, &tj).is_ok(), "{i} -> {o}");
+        }
+    }
+
+    /// A multichannel source going to mono keeps its centre — the dialogue —
+    /// and its surrounds, by BS.775's mono downmix, and leaves the LFE out.
+    /// The generic rule took channel 0 alone: a 5.1 programme's mono output
+    /// was its front-left channel. 3.0 and 5.0 going to stereo keep the
+    /// centre too (they kept L and R only).
+    #[test]
+    fn a_downmix_to_mono_keeps_the_centre() {
+        let mono = |n: u8, feed: &[(usize, f32)]| -> f32 {
+            let mut planar = vec![vec![0.0f32; 1024]; n as usize];
+            for &(ch, v) in feed {
+                planar[ch].fill(v);
+            }
+            let mut st = EncoderStage::new(None, None, Some(1));
+            let out = st.process(&planar, 48_000).unwrap();
+            assert_eq!(out.len(), 1, "{n} channels to mono");
+            out[0][512]
+        };
+        let near = |a: f32, b: f32| (a - b).abs() < 1e-4;
+        // Dialogue on the centre only: all of it survives.
+        for n in [3u8, 5, 6, 8] {
+            assert!(near(mono(n, &[(2, 0.5)]), 0.5), "{n}: centre");
+        }
+        // L and R at -3 dB, surrounds at -6 dB, the LFE out.
+        assert!(near(mono(6, &[(0, 0.5), (1, 0.5)]), 0.5 * std::f32::consts::SQRT_2));
+        assert!(near(mono(6, &[(3, 0.5)]), 0.0), "LFE");
+        assert!(near(mono(6, &[(4, 0.4), (5, 0.4)]), 0.4));
+        assert!(near(mono(8, &[(6, 0.4), (7, 0.4)]), 0.4), "7.1 back pair");
+        assert!(near(mono(4, &[(2, 0.4), (3, 0.4)]), 0.4), "quad surrounds");
+        // A layout it cannot name: every channel counts.
+        assert!(near(mono(7, &[(6, 0.7)]), 0.1));
+        // 3.0 / 5.0 to stereo: the centre at -3 dB into both sides.
+        for n in [3u8, 5] {
+            let mut planar = vec![vec![0.0f32; 1024]; n as usize];
+            planar[2].fill(0.5);
+            let out = EncoderStage::new(None, None, Some(2)).process(&planar, 48_000).unwrap();
+            assert_eq!(out.len(), 2);
+            assert!(out.iter().all(|c| near(c[512], 0.5 * std::f32::consts::FRAC_1_SQRT_2)), "{n}");
         }
     }
 
