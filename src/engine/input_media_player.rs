@@ -575,6 +575,16 @@ const PSI_SPLICE_GUARD_NS: u64 = 3_000_000_000;
 /// [`PSI_SPLICE_REPEAT_NS`] has gone by — through the splice's filler PCRs
 /// and the new file's head, CC continued. Within a file nothing is added:
 /// its own cadence is what it is.
+///
+/// Only a TS file's own PSI is repeated, and only into the TS file after
+/// it: a file this input muxes itself (an MP4, an image slate) forgets the
+/// tables ([`Self::forget`]). Kept across one, the last TS file's PAT and
+/// PMT went out at the head of the next TS file — seconds stale, so due at
+/// once — describing a layout neither file had; a receiver version-keyed
+/// on that PMT then ignored the new file's own if it carried the same
+/// version. And a table the new file has started to send is not repeated
+/// until that unit is through: a copy of the old one landing between the
+/// packets of a multi-packet PMT on the same PID truncated the new section.
 #[derive(Default)]
 pub(super) struct PsiRepeat {
     tables: Vec<PsiTable>,
@@ -595,6 +605,8 @@ struct PsiTable {
     last_ns: u64,
     /// The current file has sent it itself: no repeating it any more.
     fresh: bool,
+    /// The current file has started a unit of it.
+    started: bool,
 }
 
 impl PsiRepeat {
@@ -603,7 +615,14 @@ impl PsiRepeat {
         self.opened_ns = None;
         for t in &mut self.tables {
             t.fresh = false;
+            t.started = false;
         }
+    }
+
+    /// A file whose PSI this does not see plays (one this input muxes
+    /// itself): nothing is owed to the file after it.
+    fn forget(&mut self) {
+        *self = Self::default();
     }
 
     /// Whether any table is still owed across the current splice.
@@ -642,6 +661,7 @@ impl PsiRepeat {
             return;
         }
         let t = self.table(pid);
+        t.started |= pusi;
         let unit = t
             .collector
             .get_or_insert_with(Default::default)
@@ -662,7 +682,14 @@ impl PsiRepeat {
         match self.tables.iter().position(|t| t.pid == pid) {
             Some(i) => &mut self.tables[i],
             None => {
-                self.tables.push(PsiTable { pid, collector: None, unit: Vec::new(), last_ns: 0, fresh: false });
+                self.tables.push(PsiTable {
+                    pid,
+                    collector: None,
+                    unit: Vec::new(),
+                    last_ns: 0,
+                    fresh: false,
+                    started: false,
+                });
                 self.tables.last_mut().expect("just pushed")
             }
         }
@@ -682,6 +709,11 @@ impl PsiRepeat {
         let mut out = Vec::new();
         for t in &mut self.tables {
             if t.fresh || t.unit.is_empty() || t.last_ns == 0 {
+                continue;
+            }
+            // The new file is part-way through its own unit on this PID:
+            // an old copy here would cut it short.
+            if t.started && t.collector.as_ref().is_some_and(|c| c.mid_unit()) {
                 continue;
             }
             if at_ns.saturating_sub(t.last_ns) >= PSI_SPLICE_REPEAT_NS {
@@ -861,6 +893,15 @@ impl SpliceContinuity {
         }
         self.last_source_id = Some(source_id.to_string());
         self.psi.open_file();
+    }
+
+    /// [`Self::open_file`] for a file whose TS this input muxes itself (an
+    /// MP4, an image slate): its PSI never passes [`PsiRepeat::observe`],
+    /// so the previous TS file's tables are forgotten rather than repeated
+    /// into the TS file after it (see [`PsiRepeat`]).
+    pub(super) fn open_muxed_file(&mut self, source_id: &str) {
+        self.open_file(source_id);
+        self.psi.forget();
     }
 
     /// Called by each per-format player at the end of a file to update
@@ -1392,7 +1433,12 @@ async fn play_source(
     // Source identity used by SpliceContinuity to distinguish a same-file
     // loop (no flag) from a real playlist transition (flag).
     let source_id = source_name_str(source).to_string();
-    session.cont.open_file(&source_id);
+    match source {
+        MediaPlayerSource::Ts { .. } => session.cont.open_file(&source_id),
+        MediaPlayerSource::Mp4 { .. } | MediaPlayerSource::Image { .. } => {
+            session.cont.open_muxed_file(&source_id)
+        }
+    }
 
     match source {
         MediaPlayerSource::Ts { name, program_number } => {
@@ -2383,13 +2429,25 @@ impl EsLast {
     /// the last step, it still overlapped a final PES longer than the one
     /// before it, and a PES past 100 ms (read as a video frame's bound)
     /// counted for nothing.
+    ///
+    /// An audio step more than twice the PID's (lower) median step is a
+    /// hole in the audio — a dropout at a capture's end, an ad splice —
+    /// not a PES, and never sets the carry: the splice offset is one shift
+    /// for every program, so taking a 520 ms hole among 120 ms PES as "one
+    /// PES" paused every program, the anchor's video included, for it at
+    /// every loop. A muxer's own variation (two- and three-frame PES, 1.5x)
+    /// stays inside the bound.
     fn carry(&self) -> u64 {
-        let longest = self.steps.iter().copied().max();
         if self.video {
-            longest.unwrap_or(3_600)
-        } else {
-            longest.map_or(SPLICE_GUARD_TICKS_90K, |s| s.max(SPLICE_GUARD_TICKS_90K))
+            return self.steps.iter().copied().max().unwrap_or(3_600);
         }
+        let mut sorted: Vec<u64> = self.steps.iter().copied().collect();
+        sorted.sort_unstable();
+        let Some(&median) = sorted.get(sorted.len().saturating_sub(1) / 2) else {
+            return SPLICE_GUARD_TICKS_90K;
+        };
+        let longest = sorted.into_iter().filter(|s| *s <= 2 * median).max().unwrap_or(median);
+        longest.max(SPLICE_GUARD_TICKS_90K)
     }
 }
 
@@ -6486,6 +6544,36 @@ mod tests {
         assert_eq!(splice[0] % 2_160, 0, "step {} ticks", splice[0]);
     }
 
+    /// An audio PID's carry is the longest of its recent PES steps — but a
+    /// hole among them (a 400 ms dropout between 120 ms PES) is no PES and
+    /// does not set it; a muxer's own two- / three-frame alternation does.
+    #[test]
+    fn an_audio_hole_is_not_carried_across_a_splice() {
+        let mut e = EsLast::new(0x101, false, 900_000);
+        let mut t = 900_000u64;
+        for k in 0..9 {
+            // Eight steps kept: seven PES of 120 ms and, fourth from the
+            // end, 120 ms of PES plus a 400 ms hole.
+            t += if k == 5 { 10_800 + 36_000 } else { 10_800 };
+            e.observe(t);
+        }
+        assert_eq!(e.carry(), 10_800, "the PES, not the hole");
+        // A muxer alternating two- and three-frame PES ends on either.
+        let mut e = EsLast::new(0x101, false, 900_000);
+        let mut t = 900_000u64;
+        for k in 0..8 {
+            t += if k % 2 == 0 { 3_840 } else { 5_760 };
+            e.observe(t);
+        }
+        assert_eq!(e.carry(), 5_760);
+        // One step known: it is all there is to go on.
+        let mut e = EsLast::new(0x101, false, 900_000);
+        e.observe(900_000 + 16_500);
+        assert_eq!(e.carry(), 16_500);
+        // None: the splice guard.
+        assert_eq!(EsLast::new(0x101, false, 900_000).carry(), SPLICE_GUARD_TICKS_90K);
+    }
+
     /// The splice guard's bookkeeping: a table owed goes out again once
     /// 300 ms went by, once per 300 ms, until the new file sends it; a
     /// playlist file whose PAT drops a PMT PID drops that table; nothing
@@ -6518,6 +6606,68 @@ mod tests {
         assert_eq!(r.due(2_701 * ms), vec![pat2]);
         assert!(r.due(5_401 * ms).is_empty(), "past the guard");
         assert!(!r.guarding());
+    }
+
+    /// A file this input muxes itself (an MP4, an image slate) between two
+    /// TS files: nothing of the first TS file's PSI is owed to the second.
+    /// Kept, the first file's PAT and PMT — seconds old, so due at once —
+    /// went out at the second's head, describing neither.
+    #[test]
+    fn a_muxed_file_between_two_ts_files_leaves_nothing_owed() {
+        use crate::engine::ts_test_fixtures::{packetize_sections, pat_packet, pmt_section};
+        let ms = 1_000_000u64;
+        let mut cont = SpliceContinuity::default();
+        cont.open_file("a.ts");
+        let pat = pat_packet(&[(1, 0x1000)], 0, 0);
+        let pmt = packetize_sections(0x1000, &[&pmt_section(1, 0, 0x100, &[], &[(0x1B, 0x100, &[])])], 0)[0];
+        cont.psi.observe(&pat, Some(1_000 * ms));
+        cont.psi.observe(&pmt, Some(1_000 * ms));
+        cont.close_file(900_000);
+        cont.open_muxed_file("b.mp4");
+        cont.close_file(1_800_000);
+        cont.open_file("c.ts");
+        assert!(!cont.psi.guarding(), "nothing owed to c.ts");
+        assert!(cont.psi.due(9_000 * ms).is_empty());
+        // TS to TS still repeats.
+        cont.psi.observe(&pat, Some(9_000 * ms));
+        cont.psi.observe(&pmt, Some(9_000 * ms));
+        cont.open_file("c.ts");
+        assert_eq!(cont.psi.due(9_400 * ms), vec![pat, pmt]);
+    }
+
+    /// The new file's PMT spans two packets and the old copy falls due
+    /// between them: it waits until the new unit is through (then the new
+    /// file has sent the table, and nothing is owed). Repeated there, the
+    /// old unit's PUSI cut the new section short.
+    #[test]
+    fn an_old_pmt_never_lands_inside_the_new_files_pmt() {
+        use crate::engine::ts_test_fixtures::{packetize_sections, pat_packet, pmt_section};
+        let ms = 1_000_000u64;
+        let mut r = PsiRepeat::default();
+        let pat = pat_packet(&[(1, 0x1000)], 0, 0);
+        let old = packetize_sections(0x1000, &[&pmt_section(1, 0, 0x100, &[], &[(0x1B, 0x100, &[])])], 0)[0];
+        r.observe(&pat, Some(1_000 * ms));
+        r.observe(&old, Some(1_000 * ms));
+        r.open_file();
+        // The new PMT: 200 bytes of descriptors on its video ES.
+        let mut desc = vec![0xF0u8, 198];
+        desc.resize(200, 0x55);
+        let new = packetize_sections(0x1000, &[&pmt_section(1, 1, 0x100, &[], &[(0x24, 0x100, &desc)])], 0);
+        assert_eq!(new.len(), 2, "a two-packet PMT");
+        r.observe(&pat, Some(1_250 * ms));
+        r.observe(&new[0], Some(1_250 * ms));
+        assert!(r.due(1_400 * ms).is_empty(), "the new unit is in flight");
+        r.observe(&new[1], Some(1_400 * ms));
+        assert!(!r.guarding(), "the new file sent its PMT");
+        assert!(r.due(1_800 * ms).is_empty());
+        // An old unit left mid-flight by the previous file does not hold
+        // the repeat back.
+        let mut r = PsiRepeat::default();
+        r.observe(&pat, Some(1_000 * ms));
+        r.observe(&old, Some(1_000 * ms));
+        r.observe(&new[0], Some(1_100 * ms));
+        r.open_file();
+        assert_eq!(r.due(1_400 * ms), vec![pat, old]);
     }
 
     /// As above with 400 ms of tail and a 300 ms splice: due 50 ms after

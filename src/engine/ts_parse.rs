@@ -955,6 +955,12 @@ pub struct PmtUnitCollector {
 }
 
 impl PmtUnitCollector {
+    /// A unit is being collected: its first packet has been fed and it has
+    /// neither completed nor been abandoned.
+    pub fn mid_unit(&self) -> bool {
+        !self.packets.is_empty()
+    }
+
     /// Feed one 188-byte packet on the PID. `on_section` sees every section
     /// the packet completes, whatever its table. Returns the unit's packets
     /// when this one completed a unit worth caching.
