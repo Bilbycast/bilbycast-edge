@@ -193,6 +193,9 @@ async fn whip_input_loop(
         ts_muxer.set_audio_stream(0x06, Some(*b"Opus"));
         let mut seq_num: u16 = 0;
         let mut last_audio_pts_90khz: u64 = 0;
+        // One timeline for both tracks (`WhipClock`): each track's RTP
+        // timestamps start at an unrelated random base.
+        let mut clock = WhipClock::default();
         // The publish's layout — which of video and audio its offer carried
         // — is settled from the session's tracks on the first media
         // (`WhipLayout`). The muxer used to assume video and no audio: an
@@ -207,7 +210,7 @@ async fn whip_input_loop(
             let event = session.poll_event(&child_cancel).await;
 
             match event {
-                SessionEvent::MediaData { mid, data, rtp_time, .. } => {
+                SessionEvent::MediaData { mid, data, rtp_time, network_time, .. } => {
                     // Determine if this is video or audio
                     let is_video = session.video_mid == Some(mid);
                     let is_audio_stream = session.audio_mid == Some(mid);
@@ -219,16 +222,16 @@ async fn whip_input_loop(
                     );
 
                     if is_audio_stream {
-                        // Opus-over-WHIP audio: convert the RTP timestamp
-                        // from the Opus clock (48 kHz, carried in
-                        // MediaTime.denom) to the TS 90 kHz clock, then
-                        // mux via the FFmpeg-compatible Opus-in-TS path.
-                        let numer = rtp_time.numer() as u128;
-                        let denom = rtp_time.denom() as u128;
+                        // Opus-over-WHIP audio: the RTP timestamp on the
+                        // Opus clock (48 kHz, carried in MediaTime.denom)
+                        // onto the publish's 90 kHz timeline (`WhipClock`),
+                        // then muxed via the FFmpeg-compatible Opus-in-TS
+                        // path.
+                        let denom = rtp_time.denom() as u64;
                         let pts_90khz = if denom == 0 {
                             last_audio_pts_90khz
                         } else {
-                            (numer.saturating_mul(90_000) / denom) as u64
+                            clock.pts_90k(false, rtp_time.numer(), denom, network_time)
                         };
                         last_audio_pts_90khz = pts_90khz;
                         let ts_chunks = ts_muxer.mux_audio_opus(&data, pts_90khz);
@@ -259,7 +262,7 @@ async fn whip_input_loop(
                         // A depayloaded access unit, Annex B, with the
                         // parameter sets ahead of every IDR
                         // (`H264ParamSets`).
-                        let pts_90khz = rtp_time.numer();
+                        let pts_90khz = clock.pts_90k(true, rtp_time.numer(), rtp_time.denom() as u64, network_time);
                         let (annex_b, is_keyframe) = param_sets.access_unit(&data);
                         let ts_chunks = ts_muxer.mux_video(&annex_b, pts_90khz, pts_90khz, is_keyframe);
 
@@ -619,6 +622,51 @@ impl WhipLayout {
     }
 }
 
+/// One 90 kHz timeline for a WHIP publish's video and audio.
+///
+/// Each track's RTP timestamps start at a random base of the sender's
+/// choosing (RFC 3550 §5.1; libwebrtc picks one per SSRC), so the video's
+/// raw 90 kHz timestamp and the Opus's scaled to 90 kHz were an arbitrary
+/// distance apart — up to hours. Once the Opus track reached the PMT an
+/// A/V publish carried its audio that far from the video and the PCR: an
+/// RTMP restream clamped every audio tag to the first one's time, and a TS
+/// or CMAF receiver found the audio hours off its clock.
+///
+/// Each track is anchored at its first frame's arrival instead: the first
+/// frame of any track is placed at the muxer's PCR lead, a track whose
+/// first frame arrives later starts that much later, and each track runs on
+/// its own RTP clock from there. Audio and video are then as far apart as
+/// their first frames' arrival — the sender's capture-to-send latency
+/// difference and the network's, tens of milliseconds — not an arbitrary
+/// distance. (The RTCP sender reports' NTP ↔ RTP mapping would take out
+/// even that; str0m exposes them and doing so is a follow-up.)
+#[cfg(any(feature = "webrtc", test))]
+#[derive(Debug, Default)]
+struct WhipClock {
+    /// When the publish's first frame of any track arrived.
+    origin: Option<std::time::Instant>,
+    /// Each track's first RTP timestamp and the PTS (90 kHz) it maps to.
+    video: Option<(u64, u64)>,
+    audio: Option<(u64, u64)>,
+}
+
+#[cfg(any(feature = "webrtc", test))]
+impl WhipClock {
+    /// The PTS (90 kHz, 33 bits) of a frame of the video or audio track:
+    /// its RTP timestamp `rtp` (unwrapped) on a `rate` Hz clock, arrived at
+    /// `arrival`.
+    fn pts_90k(&mut self, video: bool, rtp: u64, rate: u64, arrival: std::time::Instant) -> u64 {
+        let origin = *self.origin.get_or_insert(arrival);
+        let slot = if video { &mut self.video } else { &mut self.audio };
+        let (first, base) = *slot.get_or_insert_with(|| {
+            let late_us = arrival.saturating_duration_since(origin).as_micros() as u64;
+            (rtp, crate::engine::rtmp::ts_mux::PCR_LEAD_90K + late_us * 9 / 100)
+        });
+        let ticks = (rtp as i128 - first as i128) * 90_000 / rate.max(1) as i128;
+        ((base as i128 + ticks).max(0) as u64) & 0x1_FFFF_FFFF
+    }
+}
+
 /// The SPS and PPS an H.264 WebRTC stream carried in-band, put back ahead of
 /// every IDR that lacks them.
 ///
@@ -691,6 +739,31 @@ impl H264ParamSets {
 #[cfg(test)]
 mod tests {
     use super::H264ParamSets;
+
+    /// A WHIP publish's tracks share one timeline, set by when each track's
+    /// first frame arrived: the RTP bases (random per SSRC) drop out. The
+    /// video's raw RTP timestamp and the Opus's scaled one used to be muxed
+    /// as they were — an arbitrary distance apart.
+    #[test]
+    fn whip_tracks_share_one_timeline_from_their_first_arrival() {
+        use super::WhipClock;
+        use crate::engine::rtmp::ts_mux::PCR_LEAD_90K as LEAD;
+        use std::time::{Duration, Instant};
+        let t0 = Instant::now();
+        let ms = Duration::from_millis;
+        let mut c = WhipClock::default();
+        assert_eq!(c.pts_90k(true, 3_000_000_000, 90_000, t0), LEAD, "the first frame at the lead");
+        // The audio's first frame 20 ms later, on an unrelated base.
+        assert_eq!(c.pts_90k(false, 123_456, 48_000, t0 + ms(20)), LEAD + 1_800);
+        // A second of each: a second on, each on its own clock.
+        assert_eq!(c.pts_90k(true, 3_000_090_000, 90_000, t0 + ms(1_000)), LEAD + 90_000);
+        assert_eq!(c.pts_90k(false, 123_456 + 48_000, 48_000, t0 + ms(1_020)), LEAD + 1_800 + 90_000);
+        // Arrival jitter after the first frame moves nothing.
+        assert_eq!(c.pts_90k(false, 123_456 + 96_000, 48_000, t0 + ms(2_500)), LEAD + 1_800 + 180_000);
+        // An audio frame a little behind its first (a late reordered one)
+        // stays on the timeline.
+        assert_eq!(c.pts_90k(false, 123_456 - 960, 48_000, t0 + ms(30)), LEAD + 1_800 - 1_800);
+    }
 
     /// The PMT of `ts` as `(PCR_PID, [(stream_type, PID)])`, and the PIDs
     /// whose packets carry a PCR.

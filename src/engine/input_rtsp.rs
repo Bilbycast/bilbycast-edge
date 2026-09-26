@@ -276,7 +276,7 @@ async fn run_rtsp_session(
         match item {
             CodecItem::VideoFrame(frame) => {
                 let is_keyframe = frame.is_random_access_point();
-                let pts_90khz = rtsp_pts_90k(frame.timestamp().elapsed());
+                let pts_90khz = rtsp_pts_90k(frame.timestamp().elapsed(), frame.timestamp().clock_rate().get());
                 let data = frame.into_data();
 
                 // FrameFormat::SIMPLE gives Annex B — TsMuxer expects this
@@ -312,7 +312,7 @@ async fn run_rtsp_session(
                 }
             }
             CodecItem::AudioFrame(frame) => {
-                let pts_90khz = rtsp_pts_90k(frame.timestamp().elapsed());
+                let pts_90khz = rtsp_pts_90k(frame.timestamp().elapsed(), frame.timestamp().clock_rate().get());
                 let data = frame.data();
 
                 // retina with `FrameFormat::SIMPLE` (set above) returns
@@ -357,9 +357,40 @@ async fn run_rtsp_session(
     }
 }
 
-/// A retina frame's PES timestamp: its ticks since the session's first
-/// timestamp, from the muxer's PCR lead — the PCR runs that far behind the
+/// A retina frame's PES timestamp (90 kHz): its time since the stream's
+/// start, from the muxer's PCR lead — the PCR runs that far behind the
 /// timestamps, so from 0 the first one sat just below the 33-bit wrap.
-fn rtsp_pts_90k(elapsed: i64) -> u64 {
-    super::rtmp::ts_mux::PCR_LEAD_90K + elapsed.max(0) as u64
+///
+/// `elapsed` is in the stream's RTP clock (`clock_rate` Hz), not 90 kHz:
+/// video runs at 90 kHz, but AAC (RFC 3640) runs at its sample rate. Taken
+/// as 90 kHz, 48 kHz AAC advanced 0.533 s of PTS a second — 4.7 s behind
+/// the video after 10 s, and an audio-only session's PCR (derived from
+/// those PTS) ran at 0.53x the wall clock. With more than one stream set
+/// up retina requires the PLAY response's `RTP-Info` `rtptime` for every
+/// stream (`InitialTimestampPolicy::Default`), so each stream's start is
+/// the same NPT and the streams stay aligned.
+fn rtsp_pts_90k(elapsed: i64, clock_rate: u32) -> u64 {
+    let ticks = elapsed.max(0) as u128 * 90_000 / u128::from(clock_rate.max(1));
+    (super::rtmp::ts_mux::PCR_LEAD_90K + ticks as u64) & 0x1_FFFF_FFFF
+}
+
+#[cfg(test)]
+mod tests {
+    use super::rtsp_pts_90k;
+    use crate::engine::rtmp::ts_mux::PCR_LEAD_90K;
+
+    /// A second of any stream is 90 000 ticks of PTS, whatever its RTP
+    /// clock: 48 kHz AAC advanced 48 000 (0.533 s a second) when its clock
+    /// was taken for 90 kHz.
+    #[test]
+    fn a_second_of_any_rtp_clock_is_90000_ticks() {
+        for rate in [90_000u32, 48_000, 44_100, 16_000, 8_000] {
+            assert_eq!(rtsp_pts_90k(0, rate), PCR_LEAD_90K, "{rate} Hz");
+            assert_eq!(rtsp_pts_90k(i64::from(rate), rate), PCR_LEAD_90K + 90_000, "{rate} Hz");
+            assert_eq!(rtsp_pts_90k(i64::from(rate) * 3_600, rate), PCR_LEAD_90K + 3_600 * 90_000, "{rate} Hz");
+        }
+        // 1024 samples of 48 kHz AAC are 1920 ticks.
+        assert_eq!(rtsp_pts_90k(1_024, 48_000), PCR_LEAD_90K + 1_920);
+        assert_eq!(rtsp_pts_90k(-5, 48_000), PCR_LEAD_90K, "before the start: the start");
+    }
 }
