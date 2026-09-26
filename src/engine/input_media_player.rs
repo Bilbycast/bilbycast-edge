@@ -1580,12 +1580,18 @@ async fn play_ts_file(
     }
     let mut splice = TsFileSplice::new(target_pts_90k, head_info.video);
     // Packets held until the first anchor PCR (7a). Bounded: past this the
-    // held ES are dropped rather than sent with raw timestamps, the packets
-    // after them stream raw until the first PCR arrives, and that PCR still
-    // fixes the splice offset for the rest of the file.
+    // held ES are dropped rather than sent with raw timestamps, and so is
+    // every ES packet after them until the first PCR arrives, which fixes the
+    // splice offset (UHD at 62 Mbps with 100 ms PCR spacing overran the hold
+    // at every loop and streamed its opening IDR with the file's own
+    // timestamps). Only a file that shows no PCR at all — a second of its
+    // PES time without one, which MPEG-TS never allows (100 ms) — streams
+    // unshifted, as it always did.
     const HOLD_MAX_PACKETS: usize = 4096;
     let mut held: Vec<[u8; TS_PACKET]> = Vec::new();
     let mut hold_overflowed = false;
+    let mut pcr_less = false;
+    let mut pre_pcr = PrePcrClock::default();
     let mut ready: Vec<[u8; TS_PACKET]> = Vec::with_capacity(16);
     // The TS carry from a previous TS file (3d), and this file's last
     // anchor PCR deadline for the next one.
@@ -1667,25 +1673,56 @@ async fn play_ts_file(
             None
         };
 
+        // An ES packet ahead of the first PCR, past the hold (see above).
+        let mut drop_current = false;
         if splice.splice_offset_27m.is_none() {
             match raw_pcr {
-                None if hold_overflowed => {}
+                None if pcr_less => {}
+                None if hold_overflowed => {
+                    // Until the first PCR: the PSI goes on, the ES does not
+                    // (its raw timestamps are what 7a keeps off the wire) —
+                    // unless the file turns out to carry no PCR at all.
+                    let pid = ((packet[1] as u16 & 0x1F) << 8) | packet[2] as u16;
+                    let psi = pid <= 0x1F || pid == 0x1FFF || splice.pat_pmt_pids.contains(&pid);
+                    if !psi {
+                        if pre_pcr.observe(&packet) < PRE_PCR_GIVE_UP_90K {
+                            continue 'packets;
+                        }
+                        pcr_less = true;
+                        tracing::warn!(
+                            "media-player: no PCR in the first second of {} — the file carries \
+                             none; the rest streams unshifted",
+                            path.display()
+                        );
+                    }
+                }
                 None if held.len() < HOLD_MAX_PACKETS => {
+                    pre_pcr.observe(&packet);
                     held.push(packet);
                     continue 'packets;
                 }
                 None => {
                     // No PCR this far in: keep the PSI, drop the held ES
                     // (their raw timestamps are what 7a keeps off the
-                    // wire) and stream on until the first PCR, which still
-                    // anchors the offset below.
+                    // wire). The ES after them is dropped too until the
+                    // first PCR, which still anchors the offset below —
+                    // unless the file already shows it has none.
                     hold_overflowed = true;
-                    tracing::warn!(
-                        "media-player: no PCR in the first {HOLD_MAX_PACKETS} packets of {} — \
-                         dropped the elementary-stream packets held so far; the rest streams \
-                         unshifted until the first PCR",
-                        path.display()
-                    );
+                    pcr_less = pre_pcr.observe(&packet) >= PRE_PCR_GIVE_UP_90K;
+                    if pcr_less {
+                        tracing::warn!(
+                            "media-player: no PCR in the first second of {} — dropped the \
+                             elementary-stream packets held so far; the file carries none, the \
+                             rest streams unshifted",
+                            path.display()
+                        );
+                    } else {
+                        tracing::warn!(
+                            "media-player: no PCR in the first {HOLD_MAX_PACKETS} packets of {} — \
+                             dropping its elementary-stream packets until the first PCR",
+                            path.display()
+                        );
+                    }
                     let psi_pids = held_psi_pids(&held);
                     for p in std::mem::take(&mut held) {
                         let pid = ((p[1] as u16 & 0x1F) << 8) | p[2] as u16;
@@ -1693,6 +1730,9 @@ async fn play_ts_file(
                             splice.push(p, anchor_pcr_pid, session.cont, &mut ready);
                         }
                     }
+                    let pid = pcr_pid_early;
+                    drop_current = !pcr_less
+                        && !(pid <= 0x1F || pid == 0x1FFF || splice.pat_pmt_pids.contains(&pid));
                 }
                 Some(pcr) => {
                     // The file's first anchor PCR: fix the splice offset.
@@ -1866,7 +1906,9 @@ async fn play_ts_file(
         for p in held.drain(..) {
             splice.push(p, anchor_pcr_pid, session.cont, &mut ready);
         }
-        splice.push(packet, anchor_pcr_pid, session.cont, &mut ready);
+        if !drop_current {
+            splice.push(packet, anchor_pcr_pid, session.cont, &mut ready);
+        }
 
         for p in ready.drain(..) {
             bundle.extend_from_slice(&p);
@@ -1999,13 +2041,22 @@ async fn play_ts_file(
         .max_video_dts_90k
         .map(|d| (d, splice.video_dts_step_90k.unwrap_or(3_600)));
     // The step each ES needs past its last timestamp: a frame for video (its
-    // own, else 40 ms), the splice guard for audio.
+    // own, else 40 ms); for audio its own PES step — the last PES plays that
+    // long — or the splice guard, whichever is longer. The guard alone put
+    // the next file's first PES inside the last one whenever a PES ran past
+    // 30 ms: AC-3 (32 ms), HE-AAC (42.7 / 46.4 ms), a muxer packing two or
+    // three frames per PES — overlapping AUs at every loop.
     let es_carry = splice
         .es_last
         .iter()
         .map(|(pid, max, _, step)| {
             let video = splice.es_kinds.iter().any(|(p, v)| p == pid && *v);
-            (*pid, *max, if video { step.unwrap_or(3_600) } else { SPLICE_GUARD_TICKS_90K })
+            let past = if video {
+                step.unwrap_or(3_600)
+            } else {
+                step.map_or(SPLICE_GUARD_TICKS_90K, |s| s.max(SPLICE_GUARD_TICKS_90K))
+            };
+            (*pid, *max, past)
         })
         .collect();
     session.cont.close_ts_file(
@@ -2037,6 +2088,41 @@ fn held_psi_pids(held: &[[u8; TS_PACKET]]) -> HashSet<u16> {
         .collect()
 }
 
+/// PES time a TS file may run without a PCR before it is taken to carry
+/// none (MPEG-TS requires one every 100 ms): 1 s.
+const PRE_PCR_GIVE_UP_90K: u64 = 90_000;
+
+/// How far each PID's PES timestamps (DTS, else PTS) have advanced since its
+/// first in the file — the evidence, before any PCR, of how much stream time
+/// has gone by.
+#[derive(Default)]
+struct PrePcrClock {
+    first: Vec<(u16, u64)>,
+}
+
+impl PrePcrClock {
+    /// The advance of this packet's PID since its first timestamp (0 for a
+    /// packet that starts no PES, or a step back).
+    fn observe(&mut self, pkt: &[u8; TS_PACKET]) -> u64 {
+        if pkt[1] & 0x40 == 0 {
+            return 0;
+        }
+        let Some(ts) = crate::engine::ts_parse::extract_pes_dts(pkt)
+            .or_else(|| crate::engine::ts_parse::extract_pes_pts(pkt))
+        else {
+            return 0;
+        };
+        let pid = ((pkt[1] as u16 & 0x1F) << 8) | pkt[2] as u16;
+        match self.first.iter().find(|(p, _)| *p == pid) {
+            Some((_, first)) => pts_diff_90k(ts, *first).max(0) as u64,
+            None => {
+                self.first.push((pid, ts));
+                0
+            }
+        }
+    }
+}
+
 /// Per-file state of the `play_ts_file` splice path: everything one packet
 /// touches on its way out (file-start video gate → CC → PCR / PES offset →
 /// high-water marks → DI). Held packets (7a) take the same path.
@@ -2060,6 +2146,10 @@ struct TsFileSplice {
     /// ahead of the anchor PCR's (4070), and its audio high-water mark put
     /// every loop's target 1.27 s out — a 1.27 s gap in every program.
     pat_pmt_pids: Vec<u16>,
+    /// One section assembler per PMT PID: a PMT past ~180 bytes (an MPTS
+    /// program with a dozen ES and their descriptors) spans packets, and
+    /// read off one packet it named no PCR_PID and no ES at all.
+    pmt_asms: Vec<(u16, crate::engine::ts_parse::SectionAssembler)>,
     audio_from_anchor: bool,
     audio_pids: HashSet<u16>,
     /// Last output PCR of every PCR PID but the anchor — carried to the
@@ -2091,6 +2181,7 @@ impl TsFileSplice {
             max_emitted_audio_pts_90k: None,
             max_emitted_pcr_90k: target_pts_90k,
             pat_pmt_pids: Vec::new(),
+            pmt_asms: Vec::new(),
             audio_from_anchor: false,
             audio_pids: HashSet::with_capacity(4),
             other_pcrs: Vec::new(),
@@ -2121,36 +2212,67 @@ impl TsFileSplice {
             let programs = crate::engine::ts_parse::parse_pat_programs(&packet);
             if !programs.is_empty() {
                 self.pat_pmt_pids = programs.iter().map(|(_, p)| *p).collect();
-            }
-        } else if pkt_pusi && self.pat_pmt_pids.contains(&pkt_pid) {
-            let anchors = anchor_pcr_pid.is_some() && pmt_pcr_pid(&packet) == anchor_pcr_pid;
-            let first = self.pat_pmt_pids.first() == Some(&pkt_pid);
-            if anchors && !self.audio_from_anchor {
-                // The first program's audio no longer counts.
-                self.audio_from_anchor = true;
-                self.max_emitted_audio_pts_90k = None;
-            }
-            if anchors || (first && !self.audio_from_anchor) {
-                refresh_audio_pids_from_pmt(&packet, &mut self.audio_pids);
-            }
-            for (pid, video) in pmt_av_es(&packet) {
-                if !self.es_kinds.iter().any(|(p, _)| *p == pid) {
-                    self.es_kinds.push((pid, video));
+                let pids = &self.pat_pmt_pids;
+                self.pmt_asms.retain(|(p, _)| pids.contains(p));
+                for p in pids {
+                    if !self.pmt_asms.iter().any(|(q, _)| q == p) {
+                        self.pmt_asms
+                            .push((*p, crate::engine::ts_parse::SectionAssembler::new()));
+                    }
                 }
             }
-            // The head did not show the video ES: gate it from here only if
-            // none of it has gone out yet — gating a GOP already under way
-            // would drop pictures and fix nothing. Only the anchor's
-            // program's video (the only one on an SPTS).
-            if (anchors || self.pat_pmt_pids.len() == 1)
-                && let Some((vpid, st)) = pmt_video_es(&packet)
-                && !self.seen_pids[(vpid & 0x1FFF) as usize]
-            {
-                self.gate.set_video(vpid, st);
+        } else if let Some((_, asm)) = self.pmt_asms.iter_mut().find(|(p, _)| *p == pkt_pid) {
+            // Every PMT that completes in this packet, reassembled across
+            // packets and found among the other sections on its PID.
+            let sections: Vec<Vec<u8>> = asm
+                .push_packet(&packet)
+                .filter(|sec| sec.first() == Some(&0x02))
+                .map(<[u8]>::to_vec)
+                .collect();
+            for sec in &sections {
+                if let Some(view) = crate::engine::ts_pmt_edit::parse_pmt(sec) {
+                    self.learn_pmt(pkt_pid, &view, anchor_pcr_pid);
+                }
             }
         }
         self.seen_pids[(pkt_pid & 0x1FFF) as usize] = true;
         self.push_gated(packet, anchor_pcr_pid, cont, out);
+    }
+
+    /// What one PMT (on `pmt_pid`) tells the splice: the audio PIDs of the
+    /// anchor PCR's program, every program's audio / video ES, and the video
+    /// ES the gate opens on when the head did not show it.
+    fn learn_pmt(
+        &mut self,
+        pmt_pid: u16,
+        view: &crate::engine::ts_pmt_edit::PmtView<'_>,
+        anchor_pcr_pid: Option<u16>,
+    ) {
+        let anchors = anchor_pcr_pid == Some(view.pcr_pid);
+        let first = self.pat_pmt_pids.first() == Some(&pmt_pid);
+        if anchors && !self.audio_from_anchor {
+            // The first program's audio no longer counts.
+            self.audio_from_anchor = true;
+            self.max_emitted_audio_pts_90k = None;
+        }
+        if anchors || (first && !self.audio_from_anchor) {
+            audio_pids_from_pmt_view(view, &mut self.audio_pids);
+        }
+        for (pid, video) in pmt_view_av_es(view) {
+            if !self.es_kinds.iter().any(|(p, _)| *p == pid) {
+                self.es_kinds.push((pid, video));
+            }
+        }
+        // The head did not show the video ES: gate it from here only if
+        // none of it has gone out yet — gating a GOP already under way
+        // would drop pictures and fix nothing. Only the anchor's
+        // program's video (the only one on an SPTS).
+        if (anchors || self.pat_pmt_pids.len() == 1)
+            && let Some(e) = view.es.iter().find(|e| rap_gated_stream_type(e.stream_type))
+            && !self.seen_pids[(e.pid & 0x1FFF) as usize]
+        {
+            self.gate.set_video(e.pid, e.stream_type);
+        }
     }
 
     /// The gate and everything after it (see [`Self::push`]).
@@ -2247,16 +2369,8 @@ impl TsFileSplice {
     }
 }
 
-/// Every audio (`false`) and video (`true`) ES of the PMT starting in `pkt`.
-fn pmt_av_es(pkt: &[u8; TS_PACKET]) -> Vec<(u16, bool)> {
-    let Some(off) = crate::engine::ts_parse::pmt_section_offset(pkt, None) else {
-        return Vec::new();
-    };
-    let section_length = (((pkt[off + 1] & 0x0F) as usize) << 8) | pkt[off + 2] as usize;
-    let end = (off + 3 + section_length).min(TS_PACKET);
-    let Some(view) = crate::engine::ts_pmt_edit::parse_pmt(&pkt[off..end]) else {
-        return Vec::new();
-    };
+/// Every audio (`false`) and video (`true`) ES of a PMT.
+fn pmt_view_av_es(view: &crate::engine::ts_pmt_edit::PmtView<'_>) -> Vec<(u16, bool)> {
     view.es
         .iter()
         .filter_map(|e| {
@@ -2271,24 +2385,15 @@ fn pmt_av_es(pkt: &[u8; TS_PACKET]) -> Vec<(u16, bool)> {
         .collect()
 }
 
-/// The PCR_PID of the PMT starting in `pkt`.
-fn pmt_pcr_pid(pkt: &[u8; TS_PACKET]) -> Option<u16> {
-    let off = crate::engine::ts_parse::pmt_section_offset(pkt, None)?;
-    let section_length = (((pkt[off + 1] & 0x0F) as usize) << 8) | pkt[off + 2] as usize;
-    let end = (off + 3 + section_length).min(TS_PACKET);
-    crate::engine::ts_pmt_edit::parse_pmt(&pkt[off..end]).map(|v| v.pcr_pid)
-}
-
-/// The first MPEG-1 / 2, H.264 or HEVC ES of the PMT starting in `pkt`.
-fn pmt_video_es(pkt: &[u8; TS_PACKET]) -> Option<(u16, u8)> {
-    let off = crate::engine::ts_parse::pmt_section_offset(pkt, None)?;
-    let section_length = (((pkt[off + 1] & 0x0F) as usize) << 8) | pkt[off + 2] as usize;
-    let end = (off + 3 + section_length).min(TS_PACKET);
-    let view = crate::engine::ts_pmt_edit::parse_pmt(&pkt[off..end])?;
-    view.es
-        .iter()
-        .find(|e| rap_gated_stream_type(e.stream_type))
-        .map(|e| (e.pid, e.stream_type))
+/// The audio PIDs of a PMT (see [`es_carries_audio`]), replacing `out`.
+fn audio_pids_from_pmt_view(view: &crate::engine::ts_pmt_edit::PmtView<'_>, out: &mut HashSet<u16>) {
+    out.clear();
+    out.extend(
+        view.es
+            .iter()
+            .filter(|e| es_carries_audio(e.stream_type, view.es_info(e)))
+            .map(|e| e.pid),
+    );
 }
 
 // ── TS file start at a video random-access point (defect 7b) ──────────────
@@ -5282,9 +5387,11 @@ mod tests {
         assert_eq!(extract_pes_pts(&out[1]), Some(90_000), "then the RAP");
     }
 
-    /// A file whose first PCR lies past the 4096-packet hold: the held ES
-    /// are dropped, what follows streams raw until that PCR — and the PCR
-    /// still fixes the splice offset for the rest of the file.
+    /// A file whose first PCR lies past the 4096-packet hold *and* past a
+    /// second of its own PES time (87 s here — a file that carries no PCR,
+    /// as far as anyone can tell): the held ES are dropped, what follows
+    /// streams raw until that PCR — and the PCR still fixes the splice
+    /// offset for the rest of the file.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_first_pcr_past_the_hold_still_sets_the_splice_offset() {
         use crate::engine::ts_parse::{extract_pes_pts, pcr_only_packet};
@@ -5363,6 +5470,103 @@ mod tests {
         let after: Vec<u64> = audio[audio.len() - 10..].to_vec();
         let want: Vec<u64> = (0..10).map(|k| 9_000 + k * 1_920).collect();
         assert_eq!(after, want, "offset from the first PCR on");
+    }
+
+    /// A high-rate file whose first PCR lies past the 4096-packet hold but
+    /// well inside its first second (UHD at 62 Mbps, PCR every 100 ms): the
+    /// ES between the hold and the PCR is dropped like the held ES, so no
+    /// PES leaves with the file's own timestamps — it used to stream raw
+    /// until the PCR, at every loop.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_es_past_the_hold_waits_for_the_first_pcr() {
+        use crate::engine::ts_parse::{extract_pes_pts, pcr_only_packet};
+        use crate::engine::ts_test_fixtures::{
+            packetize_sections, pat_packet, payload_packet, pes_start_packet, pmt_section,
+        };
+        use std::io::Write;
+        // 4200 audio packets, a PES every 100 (42 PES, 20 ms of PTS apart:
+        // 840 ms in all — two of them past the hold), then the first PCR,
+        // then ten more PES.
+        const N: u64 = 4_200;
+        let pts0 = 1_000_000u64;
+        let mut bytes = pat_packet(&[(1, 0x1000)], 0, 0).to_vec();
+        let pmt = pmt_section(1, 0, 0x100, &[], &[(0x0F, 0x101, &[])]);
+        bytes.extend_from_slice(&packetize_sections(0x1000, &[&pmt], 0)[0]);
+        let pes_at = |k: u64| pts0 + k / 100 * 1_800;
+        for k in 0..N {
+            let p = if k % 100 == 0 {
+                pes_start_packet(0x101, k as u8, 0xC0, pes_at(k), None)
+            } else {
+                payload_packet(0x101, k as u8)
+            };
+            bytes.extend_from_slice(&p);
+        }
+        let next = pes_at(N);
+        bytes.extend_from_slice(&pcr_only_packet(0x100, 0, (next - 9_000) * 300, false));
+        for k in 0..10u64 {
+            bytes.extend_from_slice(&pes_start_packet(0x101, k as u8, 0xC0, next + k * 1_800, None));
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("late-pcr-fast.ts");
+        std::fs::File::create(&path).unwrap().write_all(&bytes).unwrap();
+
+        let (tx, mut rx) = broadcast::channel::<RtpPacket>(8192);
+        let receiver = tokio::spawn(async move {
+            let mut got = Vec::new();
+            while let Ok(b) = rx.recv().await {
+                got.push(b);
+            }
+            got
+        });
+        let stats = std::sync::Arc::new(FlowStatsAccumulator::new(
+            "f".into(),
+            "f".into(),
+            "media_player".into(),
+        ));
+        let cancel = CancellationToken::new();
+        let mut seq_num: u16 = 0;
+        let mut cont = SpliceContinuity::default();
+        let mut transcoder: Option<crate::engine::input_transcode::InputTranscoder> = None;
+        let (events, _events_rx) = crate::manager::events::event_channel();
+        let media_stats = std::sync::Arc::new(MediaPlayerStats::default());
+        let mut demux_cache = DemuxCacheField::default();
+        cont.open_file("late-pcr-fast.ts");
+        let mut session = PlayerSession {
+            seq_num: &mut seq_num,
+            per_input_tx: &tx,
+            stats: &stats,
+            cancel: &cancel,
+            cont: &mut cont,
+            transcoder: &mut transcoder,
+            pid_overrides: None,
+            post: &mut None,
+            bundle_size: BUNDLE_SIZE,
+            pcr_deadlines: false,
+            media_stats: &media_stats,
+            events: &events,
+            flow_id: "f",
+            input_id: "i",
+            demux_cache: &mut demux_cache,
+        };
+        play_ts_file(&path, Some(1_000_000_000), None, &mut session).await.unwrap();
+        drop(tx);
+        let got = receiver.await.unwrap();
+        let packets: Vec<Vec<u8>> = got
+            .iter()
+            .flat_map(|b| b.data.chunks(TS_PACKET).map(|p| p.to_vec()).collect::<Vec<_>>())
+            .collect();
+        assert!(packets.iter().all(|p| p.len() == TS_PACKET));
+        assert!(got.iter().all(|b| b.data.len() <= BUNDLE_SIZE), "datagrams stay 7 packets");
+        let audio: Vec<u64> = packets
+            .iter()
+            .filter(|p| ((p[1] as u16 & 0x1F) << 8 | p[2] as u16) == 0x101)
+            .filter_map(|p| extract_pes_pts(p))
+            .collect();
+        let want: Vec<u64> = (0..10).map(|k| 9_000 + k * 1_800).collect();
+        assert_eq!(audio, want, "only the PES after the PCR, on the output timeline");
+        // The PSI still went out ahead of it.
+        let first_pmt = packets.iter().position(|p| ((p[1] as u16 & 0x1F) << 8 | p[2] as u16) == 0x1000);
+        assert_eq!(first_pmt, Some(1), "PAT, PMT first");
     }
 
     #[test]
@@ -5577,33 +5781,61 @@ mod tests {
     /// anchor): 1 s of both, PCR every 20 ms, audio every 20 ms, video every
     /// 40 ms (100 ms lead, the first frame an SPS / IDR).
     fn mpts_fixture() -> Vec<u8> {
-        mpts_fixture_with(50)
+        mpts_fixture_with(MptsShape::default())
     }
 
-    /// [`mpts_fixture`] with program 1's audio running `p1_audio` PES (every
-    /// 20 ms) instead of 50.
-    fn mpts_fixture_with(p1_audio: u64) -> Vec<u8> {
+    /// What [`mpts_fixture_with`] varies.
+    #[derive(Clone, Copy)]
+    struct MptsShape {
+        /// Audio PES of program 1.
+        p1_audio: u64,
+        /// Audio PES step of both programs (90 kHz).
+        audio_step_90k: u64,
+        /// The anchor program's PMT carries ~200 bytes of ES descriptors,
+        /// so it spans two packets.
+        long_anchor_pmt: bool,
+    }
+
+    impl Default for MptsShape {
+        fn default() -> Self {
+            Self { p1_audio: 50, audio_step_90k: 1_800, long_anchor_pmt: false }
+        }
+    }
+
+    /// [`mpts_fixture`] reshaped: program 1's audio running `p1_audio` PES,
+    /// both programs' audio every `audio_step_90k`, the anchor PMT long.
+    fn mpts_fixture_with(shape: MptsShape) -> Vec<u8> {
         use crate::engine::ts_test_fixtures::{packetize_sections, pat_packet, pes_start_packet, pmt_section};
         const T0: u64 = 10_000; // ms
         let mut ev: Vec<(u64, u8, [u8; TS_PACKET])> = Vec::new();
         ev.push((0, 0, pat_packet(&[(1, 0x1000), (2, 0x1100)], 0, 0)));
+        // A user-private descriptor (tag 0xF0) of 100 bytes.
+        let pad: Vec<u8> = [0xF0, 100].into_iter().chain(std::iter::repeat_n(0xAB, 100)).collect();
         for (prog, pmt, v, a) in [(1u16, 0x1000u16, 0x100u16, 0x101u16), (2, 0x1100, 0x200, 0x201)] {
-            let sec = pmt_section(prog, 0, v, &[], &[(0x1B, v, &[]), (0x0F, a, &[])]);
-            ev.push((0, 1, packetize_sections(pmt, &[&sec], 0)[0]));
+            let info: &[u8] = if prog == 2 && shape.long_anchor_pmt { &pad } else { &[] };
+            let sec = pmt_section(prog, 0, v, &[], &[(0x1B, v, info), (0x0F, a, info)]);
+            let pkts = packetize_sections(pmt, &[&sec], 0);
+            assert_eq!(pkts.len(), if info.is_empty() { 1 } else { 2 });
+            for p in pkts {
+                ev.push((0, 1, p));
+            }
         }
         // Program 2 first on every tick: its PCR is the file's first.
         for (skew, v, a, o, na) in
-            [(0u64, 0x200u16, 0x201u16, 0u8, 50u64), (1_200, 0x100, 0x101, 4, p1_audio)]
+            [(0u64, 0x200u16, 0x201u16, 0u8, 50u64), (1_200, 0x100, 0x101, 4, shape.p1_audio)]
         {
             for k in 0..50u64 {
                 let t = k * 20;
                 let c = T0 + skew + t;
                 ev.push((t, 2 + o, crate::engine::ts_parse::pcr_only_packet(v, 0, c * 27_000, false)));
             }
+            // Program 2's audio covers the second whatever its step;
+            // program 1's runs its `p1_audio` PES at the same step.
+            let na = if o == 0 { 90_000 / shape.audio_step_90k } else { na };
             for k in 0..na {
-                let t = k * 20;
-                let c = T0 + skew + t;
-                ev.push((t, 3 + o, pes_start_packet(a, 0, 0xC0, (c + 50) * 90, None)));
+                let off = k * shape.audio_step_90k;
+                let t = off / 90;
+                ev.push((t, 3 + o, pes_start_packet(a, 0, 0xC0, (T0 + skew + 50) * 90 + off, None)));
             }
             for k in 0..25u64 {
                 let t = k * 40;
@@ -5614,6 +5846,63 @@ mod tests {
         }
         ev.sort_by_key(|(t, o, _)| (*t, *o));
         ev.iter().flat_map(|(_, _, p)| p.iter().copied()).collect()
+    }
+
+    /// Play `bytes` (a TS file named `name`) twice through one
+    /// `SpliceContinuity`, PCR-paced, and return what the pacer scheduled.
+    async fn loop_ts_twice(name: &str, bytes: &[u8]) -> Vec<(u64, bytes::Bytes)> {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(name);
+        std::fs::File::create(&path).unwrap().write_all(bytes).unwrap();
+        let thread = format!("media-pacer-{name}");
+        pacer_trace::watch(&thread);
+        let (tx, _rx) = broadcast::channel::<RtpPacket>(4096);
+        let stats = std::sync::Arc::new(FlowStatsAccumulator::new(
+            "f".into(),
+            "f".into(),
+            "media_player".into(),
+        ));
+        let cancel = CancellationToken::new();
+        let mut seq_num: u16 = 0;
+        let mut cont = SpliceContinuity::default();
+        let mut transcoder: Option<crate::engine::input_transcode::InputTranscoder> = None;
+        let (events, _events_rx) = crate::manager::events::event_channel();
+        let media_stats = std::sync::Arc::new(MediaPlayerStats::default());
+        let mut demux_cache = DemuxCacheField::default();
+        for _ in 0..2 {
+            cont.open_file(name);
+            let mut session = PlayerSession {
+                seq_num: &mut seq_num,
+                per_input_tx: &tx,
+                stats: &stats,
+                cancel: &cancel,
+                cont: &mut cont,
+                transcoder: &mut transcoder,
+                pid_overrides: None,
+                post: &mut None,
+                bundle_size: BUNDLE_SIZE,
+                pcr_deadlines: true,
+                media_stats: &media_stats,
+                events: &events,
+                flow_id: "f",
+                input_id: "i",
+                demux_cache: &mut demux_cache,
+            };
+            play_ts_file(&path, None, None, &mut session).await.unwrap();
+        }
+        drop(tx);
+        pacer_trace::take(&thread)
+    }
+
+    /// Every PES timestamp on `pid` in a pacer trace, in order.
+    fn pes_pts_of(trace: &[(u64, bytes::Bytes)], pid: u16) -> Vec<u64> {
+        trace
+            .iter()
+            .flat_map(|(_, b)| b.chunks(TS_PACKET))
+            .filter(|p| ((p[1] as u16 & 0x1F) << 8 | p[2] as u16) == pid && p[1] & 0x40 != 0)
+            .filter_map(crate::engine::ts_parse::extract_pes_pts)
+            .collect()
     }
 
     /// The head scan takes the video of the program whose PCR comes first
@@ -5664,53 +5953,31 @@ mod tests {
     /// its fillers, program 1's through its own.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn looping_an_mpts_keeps_every_programs_pcr_within_40_ms() {
+        let got = loop_ts_twice("loop-mpts.ts", &mpts_fixture()).await;
+        assert_mpts_loop_follows_the_anchor(&got);
+    }
+
+    /// The anchor program's PMT spans two packets (a dozen ES with their
+    /// descriptors on a broadcast MPTS): the splice reassembles it, so it
+    /// still names the anchor program and its ES. Read off one packet it
+    /// named neither, and the loop target followed program 1's audio, 1.2 s
+    /// ahead — loop 2 started at 2.28 s instead of 1.06 s.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_two_packet_anchor_pmt_still_anchors_the_mpts_splice() {
+        let shape = MptsShape { long_anchor_pmt: true, ..Default::default() };
+        let got = loop_ts_twice("loop-mpts-long-pmt.ts", &mpts_fixture_with(shape)).await;
+        assert_mpts_loop_follows_the_anchor(&got);
+    }
+
+    /// The loop of [`mpts_fixture`] follows the anchor program (see
+    /// `looping_an_mpts_keeps_every_programs_pcr_within_40_ms`).
+    fn assert_mpts_loop_follows_the_anchor(got: &[(u64, bytes::Bytes)]) {
         use crate::engine::ts_parse::extract_pcr;
-        use std::io::Write;
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("loop-mpts.ts");
-        std::fs::File::create(&path).unwrap().write_all(&mpts_fixture()).unwrap();
-        pacer_trace::watch("media-pacer-loop-mpts.ts");
-        let (tx, _rx) = broadcast::channel::<RtpPacket>(4096);
-        let stats = std::sync::Arc::new(FlowStatsAccumulator::new(
-            "f".into(),
-            "f".into(),
-            "media_player".into(),
-        ));
-        let cancel = CancellationToken::new();
-        let mut seq_num: u16 = 0;
-        let mut cont = SpliceContinuity::default();
-        let mut transcoder: Option<crate::engine::input_transcode::InputTranscoder> = None;
-        let (events, _events_rx) = crate::manager::events::event_channel();
-        let media_stats = std::sync::Arc::new(MediaPlayerStats::default());
-        let mut demux_cache = DemuxCacheField::default();
-        for _ in 0..2 {
-            cont.open_file("loop-mpts.ts");
-            let mut session = PlayerSession {
-                seq_num: &mut seq_num,
-                per_input_tx: &tx,
-                stats: &stats,
-                cancel: &cancel,
-                cont: &mut cont,
-                transcoder: &mut transcoder,
-                pid_overrides: None,
-                post: &mut None,
-                bundle_size: BUNDLE_SIZE,
-                pcr_deadlines: true,
-                media_stats: &media_stats,
-                events: &events,
-                flow_id: "f",
-                input_id: "i",
-                demux_cache: &mut demux_cache,
-            };
-            play_ts_file(&path, None, None, &mut session).await.unwrap();
-        }
-        drop(tx);
-        let got = pacer_trace::take("media-pacer-loop-mpts.ts");
         let mut pcrs: std::collections::BTreeMap<u16, Vec<u64>> = Default::default();
         // The file's own anchor PCRs, fillers left out (a filler datagram
         // holds nothing but adaptation-field-only PCRs and null packets).
         let mut file_anchor = Vec::new();
-        for (_, b) in &got {
+        for (_, b) in got {
             let filler = b.chunks(TS_PACKET).all(|p| {
                 let pid = ((p[1] as u16 & 0x1F) << 8) | p[2] as u16;
                 pid == 0x1FFF || (p[3] & 0x30 == 0x20 && extract_pcr(p).is_some())
@@ -5745,6 +6012,32 @@ mod tests {
         }
     }
 
+    /// Audio whose PES run longer than the 30 ms splice guard (HE-AAC at
+    /// 48 kHz: 42.67 ms, 3840 ticks): the next file's first PES on each PID
+    /// lands one PES step past the last — where the last one ends — not
+    /// 30 ms past its start, inside it. Program 1's audio runs longest, so
+    /// its term sets the offset.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn looping_moves_each_audio_pid_past_its_last_pes_end() {
+        let shape = MptsShape { p1_audio: 27, audio_step_90k: 3_840, ..Default::default() };
+        let got = loop_ts_twice("loop-mpts-he-aac.ts", &mpts_fixture_with(shape)).await;
+        for pid in [0x101u16, 0x201] {
+            let pts = pes_pts_of(&got, pid);
+            assert!(pts.len() >= 40, "0x{pid:x}: {} PES", pts.len());
+            for w in pts.windows(2) {
+                assert!(
+                    w[1] >= w[0] + 3_840,
+                    "0x{pid:x}: PES at {} ms starts inside the one at {} ms",
+                    w[1] / 90,
+                    w[0] / 90
+                );
+            }
+        }
+        let p1 = pes_pts_of(&got, 0x101);
+        let gap = p1.windows(2).map(|w| w[1] - w[0]).max().unwrap();
+        assert_eq!(gap, 3_840, "program 1 continues where its last PES ends");
+    }
+
     /// Program 1's audio runs 100 ms longer than the anchor program's: the
     /// splice offset follows it too, so program 1's audio moves 30 ms past
     /// its last PES at the loop — anchored on the anchor program alone it
@@ -5753,47 +6046,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn looping_an_mpts_keeps_every_programs_audio_moving_forward() {
         use crate::engine::ts_parse::extract_pes_pts;
-        use std::io::Write;
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("loop-mpts-audio.ts");
-        std::fs::File::create(&path).unwrap().write_all(&mpts_fixture_with(55)).unwrap();
-        pacer_trace::watch("media-pacer-loop-mpts-audio.ts");
-        let (tx, _rx) = broadcast::channel::<RtpPacket>(4096);
-        let stats = std::sync::Arc::new(FlowStatsAccumulator::new(
-            "f".into(),
-            "f".into(),
-            "media_player".into(),
-        ));
-        let cancel = CancellationToken::new();
-        let mut seq_num: u16 = 0;
-        let mut cont = SpliceContinuity::default();
-        let mut transcoder: Option<crate::engine::input_transcode::InputTranscoder> = None;
-        let (events, _events_rx) = crate::manager::events::event_channel();
-        let media_stats = std::sync::Arc::new(MediaPlayerStats::default());
-        let mut demux_cache = DemuxCacheField::default();
-        for _ in 0..2 {
-            cont.open_file("loop-mpts-audio.ts");
-            let mut session = PlayerSession {
-                seq_num: &mut seq_num,
-                per_input_tx: &tx,
-                stats: &stats,
-                cancel: &cancel,
-                cont: &mut cont,
-                transcoder: &mut transcoder,
-                pid_overrides: None,
-                post: &mut None,
-                bundle_size: BUNDLE_SIZE,
-                pcr_deadlines: true,
-                media_stats: &media_stats,
-                events: &events,
-                flow_id: "f",
-                input_id: "i",
-                demux_cache: &mut demux_cache,
-            };
-            play_ts_file(&path, None, None, &mut session).await.unwrap();
-        }
-        drop(tx);
-        let got = pacer_trace::take("media-pacer-loop-mpts-audio.ts");
+        let shape = MptsShape { p1_audio: 55, ..Default::default() };
+        let got = loop_ts_twice("loop-mpts-audio.ts", &mpts_fixture_with(shape)).await;
         let mut audio: std::collections::BTreeMap<u16, Vec<u64>> = Default::default();
         for (_, b) in &got {
             for p in b.chunks(TS_PACKET) {
