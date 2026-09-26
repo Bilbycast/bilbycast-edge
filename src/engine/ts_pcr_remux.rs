@@ -66,7 +66,9 @@
 //! first video). The video replacer measures that silence on the input and
 //! reports each frame that sat through it ([`TsPcrRemux::note_source_holds`]);
 //! its hold is taken off its lateness like a gap, and if it is still behind
-//! the output PCR it is dropped as stale — never a `D` raise.
+//! the output PCR it is dropped as stale — never a `D` raise. The replacer
+//! drops such a frame itself before the encoder when it can (it reads this
+//! stage's `D` through [`PcrRemuxStats`]); the drop here is the backstop.
 //!
 //! **Nothing re-encoded.** While neither replacer re-encodes (its codec
 //! cannot be decoded, a replacer fell back to passthrough) the stage leaves
@@ -79,10 +81,10 @@
 //! flow's discontinuity watch stamps its DI one PCR after the jump — and
 //! passes without one. A forward step without DI is the input's own clock,
 //! however long — a PCR-per-frame source at 5 fps steps 200 ms every frame,
-//! at 0.5 fps two seconds — and passes as the step it is. On an epoch of more than 1 s
-//! the re-encoded PES still in flight from the previous epoch are
-//! recognised by being closer to the old timeline than to the new one and
-//! are dropped (their continuity counters renumbered), so they neither
+//! at 0.5 fps two seconds — and passes as the step it is. On an epoch of
+//! more than 1 s the re-encoded PES still in flight from the previous epoch
+//! are recognised by being closer to the old timeline than to the new one
+//! and are dropped (their continuity counters renumbered), so they neither
 //! reach the wire behind the DI nor drive `D`.
 //!
 //! **No input PCR.** When a re-encoded video PES on the PCR_PID arrives and

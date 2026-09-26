@@ -368,8 +368,9 @@ lateness is how far the PES arrived behind its own decode time
 only as far as the residency cap demands. After that a PES that is still
 late is the exception path: `D` is raised to its lateness + 80 ms, the
 next PCR carries DI = 1, `late_frames` counts it, and the Warning
-`transcode_pcr_late` says so (at most once per 10 s). `D` only ever grows
-after the first latch — lowering it would be another PCR step — and a
+`transcode_pcr_late` says so (at most once per 10 s). After the first
+latch `D` only grows — a lowered `D` is another PCR step — except once per
+epoch for the residency cap (below); a
 latch that would move it by less than 10 ms leaves it alone (on Sky the
 first audio PES asked for 80.24 ms against the initial 80: a DI for a
 quarter of a millisecond). A PES more than 5 s late is taken to be stamped
@@ -387,12 +388,26 @@ cannot be met the PES is kept on time and
 program the stage follows count — on an MPTS output another program's
 video, whose PCR this stage never shifts, is ignored. The cap is re-checked
 every time a larger lead is seen, not only at a latch: before anything
-re-encoded has been measured `D` is lowered to it (one PCR step, DI);
-after that `D` stays — lowering it would make the PES already measured
-late — and the Warning fires instead (its `lateness_ms` is then null). An
-audio-only transcode over a long-lead passthrough video is the case: on
-Sky the audio latches within the first ~100 ms, against the few hundred
-ms of video lead seen so far, and the 943 ms leads come later.
+re-encoded has been measured `D` is lowered to it (one PCR step, DI).
+After that `D` comes down **once per epoch**, to the cap less 20 ms of
+headroom but never below the largest lateness measured this epoch plus the
+40 ms minimum margin — so every PES already measured stays on time — as one
+forward PCR step with DI; what that cannot cover, and any growth past the
+headroom, is the Warning (its `lateness_ms` then null). The headroom keeps
+the one step worth its DI: without it a lead a few ms past the cap asked
+for a step under the 10 ms tolerance and stayed there (VH1: 1 002–1 008 ms
+of residency, warned). An audio-only transcode over a long-lead
+passthrough video is the case: on Sky the audio latches within the first
+~100 ms, against the few hundred ms of video lead seen so far, and the
+943 ms leads come later. Its audio's smallest lead is ~62 ms, so the floor
+is far below the cap: measured on the rig, the video's lead first passed
+the cap at 929 ms (142.9 s into the run) and `D` came down from 80 to
+51.4 ms (the 71.4 ms cap less the headroom) in one DI'd forward step; the
+video's residency, which used to sit at 1 009–1 029 ms with the Warning, is
+980 ms after it (the one PES that showed the growth left at 1 018 ms). One
+step, not a staircase: a lead that grows past the headroom after it is
+only warned about. Pinned by
+`a_video_lead_past_the_cap_after_the_latch_lowers_d_once`.
 
 **Gaps are the source's.** Lateness is measured against the input PCR at
 the PES's position, and a PCR-per-frame source (the RTMP / RTSP / WebRTC
@@ -405,10 +420,59 @@ every PES decoded before it. The frames that were in the pipeline when the
 source paused still reach the wire late — nothing can undo a pause — but
 they no longer raise `D` for every frame after them: a single 900 ms
 pause used to add a second of latency for good. A steady low frame rate is
-not a gap: at 5 fps a re-encoded frame that leaves after the next frame's
-PCR is 200 ms late every time, and `D` latches once to that. Pinned by
-`a_source_pause_does_not_ratchet_d` and
+not a gap: a pipeline one frame deep (a decoder's reorder hold) at 5 fps
+makes every re-encoded frame 200 ms late, and `D` latches once to that.
+Pinned by `a_source_pause_does_not_ratchet_d` and
 `a_pcr_per_frame_source_at_low_frame_rates_is_one_timeline`.
+
+**A PCR is carried after the frame its packet releases.** A video PES
+ends only where the next one starts, so the packet that carries a
+PCR-per-frame source's PCR (on each frame's first packet) is also the one
+that completes the previous frame. The video replacer used to emit that
+PCR's adaptation-field-only carrier *before* the re-encoded frame the same
+packet released, so every frame was measured against the next frame's
+PCR and `D` latched a whole frame interval too high — 120 ms at 25 fps,
+280 ms at 5 fps, 2 080 ms at 0.5 fps, on every RTMP / RTSP / WebRTC
+ingest re-encode. The carrier now follows it: such a source latches only
+what its pipeline takes (80 ms for an IPPP x264 source). Pinned by
+`a_pcr_per_frame_source_latches_no_frame_interval` (`ts_video_replace`,
+through libx264). The audio replacer needs no such change: it cuts and
+re-encodes each access unit as its bytes complete, so a PCR on an audio
+PES's first packet never follows output that packet released (measured:
+the same `D` with the carrier on either side).
+
+**Holds are the source's too.** The other way a source keeps a frame
+waiting is a *silent video PID* while its clock runs on. At the end of a
+media-player file the last video PES is complete but only known to be
+when the next one starts, and a B-frame source's decoder holds a picture
+back until it decodes the next one: both wait for the next loop's first
+video, ~650 ms of stream later on Sky (the file ends with its audio and
+the player's filler PCRs), and used to leave 140 ms behind the output PCR
+— the guard raised `D` 80 → 261 ms with a DI'd PCR step back, which put
+the video's residency at 1 169 ms for the rest of the run (R2). The video
+replacer now watches the input's own clock against its video
+(`SourceClockWatch`): the silence before each PES start, beyond twice the
+usual one and 100 ms, is a *hold*, and each re-encoded frame that sat
+through one says so. The remux takes a hold off the frame's lateness like
+a gap (the larger of the two counts, they can be the same stretch) and,
+if the frame is still behind the output PCR, **drops it as stale**
+(`stale_frames_dropped`) rather than raising `D` for every frame after it
+or sending it late. The video replacer makes the same call first, before
+the frame reaches the encoder — it reads the chain's current `D` and has
+the input PCR — so the encoded stream never loses a reference picture
+(dropped after encoding, every picture predicted from it until the next
+IDR would decode against the wrong one); the remux's drop, with its CC
+renumbering, is the backstop. A loop costs its last picture or two —
+already a freeze there — and never moves `D`. A frame that waited on the
+source but is still on time goes out. Pinned by
+`a_frame_held_by_a_silent_source_is_dropped_and_d_stays` and, through a
+real decoder and libx264 with a B-frame source,
+`a_media_player_loop_tail_never_raises_d` (a 540 ms silence: the tail is
+dropped before the encoder, every encoded frame reaches the wire; a 162 ms
+one: the held tail is still on time and goes out). On the 30-minute Sky
+loop run `D` stays 80 ms through every loop (two stale drops, no raise, no
+DI, video lead ≤ 988 ms; it used to go 80 → 261 ms at the first loop with
+a DI'd PCR step back and 1 169 ms of video residency).
 
 **Nothing re-encoded.** While neither replacer re-encodes — its codec
 cannot be decoded, a replacer fell back to passthrough — the stage applies
@@ -416,8 +480,23 @@ no `D` at all and the stream passes byte-identical, as it did before the
 remux model. Re-encoding starting or stopping steps the PCR by `D`, with
 DI.
 
-**Epochs.** An input PCR that steps backward or carries DI starts an
-epoch: DI on the next output PCR, every PID latches again (raise-only).
+**Epochs.** An input PCR that steps backward, or carries DI on a step
+the input's cadence does not predict, starts an epoch: DI on the next
+output PCR, every PID latches again (raise-only). A **DI on a PCR the
+cadence predicts** — a forward step within twice the usual step, or
+within 100 ms while that is unknown — is not an epoch; the DI byte
+passes through unchanged. The epoch exists to re-measure `D` when the
+input's time base changes, and such a DI carries no change: the flow's
+source-discontinuity watch stamps its DI one PCR *after* the jump it saw,
+on a PCR continuous with the one before; a media-player playlist
+transition flags DI on a timeline it keeps continuous; and a media-player
+MPTS ingress used to flag ~91 % of its PCRs (the watch compared every
+program's PCR with the previous one of any program — fixed, see
+[Source discontinuities](#source-discontinuities-on-an-mpts)). Each such
+epoch re-latched every PID, raise-only, so `D` crept 80 → 199 ms on Spain
+with a DI and a re-latch on almost every PCR. A DI on a jump — backward,
+or forward past the cadence — is still an epoch. Pinned by
+`a_di_on_a_pcr_the_cadence_predicts_is_not_an_epoch`.
 A forward step without DI is the input's own clock however long it is —
 5 fps steps 200 ms per frame, 0.5 fps two seconds — and passes as the step
 it is; it used to start an epoch past 100 ms, which put DI on every output
@@ -428,11 +507,42 @@ the old timeline than to the new one — are dropped, their CC renumbered,
 so they neither reach the wire behind the DI nor drive `D`.
 
 **No input PCR.** When a re-encoded video PES on the PCR_PID arrives and
-no input PCR has been seen — or none for 100 ms of video decode time — the
-stage synthesises PCR from the video: `DTS − D` in an AF-only packet
-before every video PES, plus interpolated ones on the observed packet
-rate so no two are more than 35 ms apart. Info `transcode_pcr_synthesized`
-(once per stage). The next input PCR ends synthesis with DI.
+no input PCR has ever been seen — or the video replacer has counted a
+second of the input's **own** video decode time without one (its
+`SourceClockWatch`: the DTS steps of the input's video PES as they
+arrive, jumps over 500 ms not counted, reset by every input PCR) — the
+stage synthesises PCR from the video: `DTS − extra − D` in an AF-only
+packet before every video PES, plus interpolated ones on the observed
+packet rate so no two are more than 35 ms apart. Info
+`transcode_pcr_synthesized` (once per stage). The next input PCR ends
+synthesis with DI.
+
+Starvation used to be measured on the *re-encoded* DTS — 100 ms of it
+since the first re-encoded video PES after the last input PCR — and
+re-encoded frames leave the codec in bursts: four 29.97 fps frames (VH1),
+six at 50 fps (770_H HEVC), or a 25 fps encoder catching up after a
+206 ms stall (witness, three MBAFF outputs) crossed it between two input
+PCRs 30–37 ms apart. Each false entry was a DI and a forward PCR jump of
+the video's lead (0.8–1.1 s); the audio was then latched against the
+video's clock, `D` rose to ~1 s and, raise-only, stayed there; the next
+input PCR ended it with a −0.8 to −1.6 s step (R1: 7 / 52 / 373
+synthesised PCRs, video residency 1.8–2.05 s). A second of the input's
+own decode time is ten times MPEG-TS's longest PCR interval, and a mux
+bunching pictures between two PCRs (VH1: four PES, 100 ms of DTS,
+between PCRs 33 ms apart) stays far inside it.
+
+**The synthetic clock never moves `D`.** It is the video's own timeline,
+so nothing latches against it: the video is not measured (it leads the
+synthetic PCR by construction) and the other re-encoded PID — the audio,
+muxed behind the video on most sources — moves only the synthetic clock's
+own allowance (`extra`): when an audio PES would sit less than 80 ms ahead
+of the synthetic PCR, the synthetic clock is held that much further behind
+the video (DI), within the video's 1 s residency (`D + extra`; the
+residency Warning when that is not enough). `extra` is dropped when the
+input PCR returns, and the epoch that starts then re-latches against a
+real PCR. Pinned by `synthesis_holds_its_own_clock_back_and_never_moves_d`
+and `a_pcr_less_source_keeps_its_audio_ahead_of_the_synthesised_pcr`
+(a source with no PCR at all, its audio 600 ms behind its video).
 
 **What changes for a receiver.** The PCR→PTS relationship of every
 transcoded TS output moves: a re-encoded ES now leads the PCR by its
@@ -461,8 +571,37 @@ removes it.
 
 **Telemetry.** `transcode_pcr` on each transcoding output's stats and, for
 the active input's ingress transcode, on the flow's: `offset_ms` (the
-current `D`), `late_frames`, `offset_raises`, `stale_frames_dropped`,
-`synthesized_pcrs`, `epochs`.
+current `D`), `late_frames`, `offset_raises`, `stale_frames_dropped`
+(frames of a previous epoch, and frames a silent source held until they
+were late), `synthesized_pcrs`, `epochs`.
+
+### Source discontinuities on an MPTS
+
+The flow's source-discontinuity watch (`pcr_ingress_sampler::
+spawn_source_discontinuity_watch`) raises `source_pcr_discontinuity` on a
+PCR jump over 500 ms and has the flow's continuity fixer stamp DI on a
+later PCR. It compared each PCR with the previous PCR **of any PID**. An
+MPTS carries one independent clock per program, usually seconds apart, so
+on a media-player MPTS every PCR that followed another program's looked
+like a jump of the inter-program skew: DI on 735 of 803 PCRs of Spain
+program 186 and 656 of 710 of 770_H program 4030, on every program, on
+passthrough and transcoded outputs alike — and on v0.111.0. The source
+PCRs carry no DI and are monotonic per PID. Each PID is now judged
+against its own previous PCR, the DI goes on **that PID's** next PCR, and
+the event carries `pcr_pid`. A PES timestamp that jumps while the PCR runs
+on (`source_pts_discontinuity` / `source_dts_discontinuity`) still raises
+its event and counts, but arms no DI: DI on a PCR packet announces a new
+system time base, which a PTS jump is not — the Spain capture's teletext
+PIDs step back ~650 ms at 73 s with a continuous PCR, and put a DI on an
+unrelated PCR at every pass. A loop or a restart moves the PCR too, and
+that is what carries the DI. Its gap also used to be computed
+with `wrapping_sub % (2^33 × 300)`, which is not a modular difference for
+that modulus: every backward step, a 30 ms one included, read as a jump of
+about −16 500 s and was flagged. Pinned by
+`interleaved_program_clocks_are_not_discontinuities`,
+`a_pcr_jump_signal_lands_on_its_own_pid` and `only_a_pcr_jump_arms_a_di`. The watch still stamps its DI
+one PCR after the jump it saw (it observes the fixer's output); the remux
+treats such a DI as no epoch (above).
 
 ## Module map
 
@@ -592,10 +731,21 @@ Lib-level tests cover:
   grows, the followed program's video only), stale frames across an epoch
   jump, a PCR-per-frame source at 5 and 0.5 fps as one timeline, a source
   pause that does not raise `D`, a byte-identical stream with nothing
-  re-encoded, synthesis without an input PCR; and the audio-only chain end
-  to end (`audio_only_transcode_keeps_every_re_encoded_pes_ahead_of_the_pcr`).
+  re-encoded, synthesis without an input PCR (and a burst of re-encoded
+  frames between input PCRs that is not starvation; a synthetic clock that
+  never moves `D`), a frame held by a silent source dropped rather than
+  raising `D`, a DI on a predicted PCR that is no epoch, the one post-latch
+  lowering; and the audio-only chain end to end
+  (`audio_only_transcode_keeps_every_re_encoded_pes_ahead_of_the_pcr`).
+  Through a real decoder and libx264: a PCR-per-frame source that latches
+  no frame interval, and a media-player loop of a B-frame source that
+  never raises `D`.
+- `SourceClockWatch` (`ts_video_replace`): starvation as a second of the
+  input's own decode time without a PCR, and the hold of every frame a
+  silent video PID kept waiting.
 - `PcrIngressSampler`: raw-TS sampling, RTP header skip with CSRC +
-  extension, no-sync-byte payload silently dropped.
+  extension, no-sync-byte payload silently dropped; the discontinuity
+  watch per PCR PID, with a modular gap.
 - `PtpMasterClock`: unavailable defaults, telemetry kind tag.
 
 Run: `cargo test --features video-encoders-full`. All 993 lib tests

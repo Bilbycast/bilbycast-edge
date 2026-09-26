@@ -1431,9 +1431,36 @@ loop, each playlist transition — continues one wire timeline:
   1316-byte datagram (the PCR and six null packets), since the UDP / RTP /
   SRT outputs re-chunk to seven packets per datagram and would otherwise
   hold a lone PCR packet until the next file's data. Re-epoching at the
-  moment the file opened ran each loop ~70–85 ms ahead of real time. With
-  `pcr_deadlines: false` each file keeps its own epoch and this carry does
-  not apply.
+  moment the file opened ran each loop ~70–85 ms ahead of real time. A
+  filler whose slot passed while the previous file's pacer drained goes out
+  at once rather than not at all (skipped, it left a ~53 ms PCR step at
+  every loop). With `pcr_deadlines: false` each file keeps its own epoch and
+  this carry does not apply.
+- **An MPTS played whole** (no `program_number`) splices every program with
+  one flat offset, anchored on the program whose PCR comes first in the
+  file: its video starts at the random-access point. The offset is the
+  smallest that keeps **every** audio and video PID and every PCR PID of
+  every program moving forward past its last output timestamp — by 30 ms
+  for audio, a frame for video, 1 ms for a PCR. The terms used to come
+  from the PAT's first program alone — on 770_H program 4010, whose clock
+  runs 1.2 s ahead of the anchor's (4070) — which put every loop 1.2 s out,
+  a 1.27 s PCR gap in every program but the anchor; anchored on one
+  program, another whose audio ran longer overlapped itself at every loop.
+  Every other program's PCR PID gets its own filler PCRs across the splice,
+  its gap cut into steps of at most 35 ms over the same wall time (a
+  program whose gap differs from the anchor's by the file's structure —
+  770_H program 4030, +29 ms — has it spread, not left as one step past
+  40 ms). Measured on Spain (6 programs) and 770_H (10), passthrough:
+  every program's PCR steps ≤ 32.6 ms across the loop, with no DI at the
+  loop and no backward PTS / DTS. The price of one flat offset is a gap:
+  each program pauses for as long as the program that needs the most
+  (Spain program 186: its audio's next PES 340 ms after its last, 220 ms
+  of silence). A program **transcoded** out of such an MPTS still takes
+  one PCR-delay raise at each loop today: the output audio replacer fills
+  that gap with silence it can emit only when the next audio arrives, so
+  the fill is late (Spain +160 ms, 770_H +380 ms). To loop one program of
+  an MPTS, `program_number` on the input is the cleaner choice: the program
+  is then the anchor and nothing else constrains its splice.
 
 Expect up to about a second of held picture at each loop point of a
 capture that starts mid-GOP (the audio keeps playing) instead of corrupt

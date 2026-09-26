@@ -1285,15 +1285,28 @@ least how late that PES arrived behind its own decode time plus 80 ms; a
 PES that is still late afterwards raises it again (DI on the next PCR,
 Warning `transcode_pcr_late`, `late_frames` on the stats). Lateness that a
 pause in the source's own PCR explains — a paused or variable-frame-rate
-ingest that stamps a PCR per frame — does not raise it. The margin is cut
-to keep the program's largest video lead within the 1 s T-STD residency,
-never below 40 ms, re-checked as that lead grows (Warning
-`transcode_pcr_residency_exceeded` when it cannot). A forward input PCR
-step without DI is the input's clock however long — a 5 fps or 0.5 fps
-PCR-per-frame source is one timeline, not an epoch per frame. While
-nothing is re-encoded (a codec the replacers cannot decode) the stream
-passes byte-identical, with no `D`. A source with no PCR gets one
-synthesised from the re-encoded video (Info `transcode_pcr_synthesized`).
+ingest that stamps a PCR per frame — does not raise it; nor does the wait
+of a frame a **silent video PID** kept in the pipeline (the last picture
+or two of a media-player file, which wait for the next loop's first
+video): the video replacer reports that wait, and such a frame, if still
+late, is dropped as stale — before the encoder, so the encoded stream
+loses no reference picture — instead of raising `D` (a loop used to raise
+it 80 → 261 ms for the rest of the run). The margin is cut to keep the
+program's largest video lead within the 1 s T-STD residency, never below
+40 ms, re-checked as that lead grows — once per epoch `D` itself comes
+down to meet it with 20 ms to spare, never below the largest measured
+lateness + 40 ms (one forward PCR step, DI); Warning
+`transcode_pcr_residency_exceeded` for what is left. A forward input PCR step without DI is the input's clock however
+long — a 5 fps or 0.5 fps PCR-per-frame source is one timeline, not an
+epoch per frame — and a DI on a PCR the input's cadence predicts is no
+epoch either. The PCR carrier of a video packet leaves after the
+re-encoded frame that packet completed, so a PCR-per-frame source latches
+no frame interval into `D`. While nothing is re-encoded (a codec the
+replacers cannot decode) the stream passes byte-identical, with no `D`. A
+source with no PCR — none ever, or none for a second of the input's own
+video decode time — gets one synthesised from the re-encoded video (Info
+`transcode_pcr_synthesized`), on its own allowance: the synthetic clock
+never moves `D`.
 Full model, the epoch rules and the numbers it replaced:
 [`clocking.md`](clocking.md#transcoded-output-pcr-the-remux-model).
 
