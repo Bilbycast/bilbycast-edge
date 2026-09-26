@@ -1136,6 +1136,20 @@ impl AudioEncoder {
         }
     }
 
+    /// Set a libavcodec private option on the encoder (an AC-3 re-encode's
+    /// `dialnorm`, carried from its source). Only the in-process libavcodec
+    /// backend (MP2 / AC-3 / Opus) has options to set.
+    #[cfg_attr(not(feature = "media-codecs"), allow(unused_variables))]
+    pub fn set_codec_option(&mut self, name: &str, value: &str) -> Result<(), String> {
+        match &mut self.backend {
+            #[cfg(feature = "media-codecs")]
+            EncoderBackend::InProcessLibav { encoder, .. } => {
+                encoder.set_option(name, value).map_err(|e| e.to_string())
+            }
+            _ => Err(format!("the {} backend takes no codec options", self.params.codec.as_str())),
+        }
+    }
+
     /// Declare the delay of what feeds this encoder — a channel / rate
     /// stage (`audio_transcode::EncoderStage`) whose resampler places input
     /// frame `j` at output frame `j * ratio + frames` — so the stamps take

@@ -2068,67 +2068,6 @@ impl EncoderStage {
     }
 }
 
-/// An [`encoder_stage`] for one batch of PCM (an HLS segment, re-encoded on
-/// its own): its output lines up with its input sample for sample — the
-/// resampler's zero history is dropped at the head and its queue and delay
-/// line are run out at [`Self::finish`] — so the batch's stamps need no
-/// correction for it.
-pub struct BatchStage {
-    stage: Option<PlanarAudioTranscoder>,
-    skip: usize,
-    fed: u64,
-    kept: u64,
-}
-
-impl BatchStage {
-    pub fn new(stage: Option<PlanarAudioTranscoder>) -> Self {
-        let skip = stage.as_ref().map_or(0, |t| t.output_delay());
-        Self { stage, skip, fed: 0, kept: 0 }
-    }
-
-    pub fn process(&mut self, planar: &[Vec<f32>]) -> Result<Vec<Vec<f32>>, String> {
-        let Some(t) = self.stage.as_mut() else {
-            return Ok(planar.to_vec());
-        };
-        let out = t.process(planar)?;
-        self.fed += planar.first().map_or(0, |c| c.len()) as u64;
-        Ok(self.keep(out, u64::MAX))
-    }
-
-    /// What the stage still holds of the content it was given.
-    pub fn finish(&mut self) -> Result<Vec<Vec<f32>>, String> {
-        let Some(t) = self.stage.as_mut() else {
-            return Ok(Vec::new());
-        };
-        let (in_rate, out_rate) = (t.in_sample_rate() as u128, t.out_sample_rate() as u128);
-        let end = ((self.fed as u128 * out_rate + in_rate / 2) / in_rate) as u64;
-        let zeros = vec![vec![0.0f32; STREAM_CHUNK_FRAMES]; t.in_channels() as usize];
-        let mut out: Vec<Vec<f32>> = vec![Vec::new(); t.out_channels() as usize];
-        // A few chunks run out the queue and the delay line; the bound only
-        // guards against a resampler that stops producing.
-        for _ in 0..16 {
-            if self.kept >= end || in_rate == out_rate {
-                break;
-            }
-            let pcm = self.stage.as_mut().expect("checked").process(&zeros)?;
-            let kept = self.keep(pcm, end - self.kept);
-            for (o, k) in out.iter_mut().zip(kept) {
-                o.extend(k);
-            }
-        }
-        Ok(out)
-    }
-
-    fn keep(&mut self, pcm: Vec<Vec<f32>>, limit: u64) -> Vec<Vec<f32>> {
-        let n = pcm.first().map_or(0, |c| c.len());
-        let skip = self.skip.min(n);
-        let keep = ((n - skip) as u64).min(limit) as usize;
-        self.skip -= skip;
-        self.kept += keep as u64;
-        pcm.into_iter().map(|c| c[skip..skip + keep].to_vec()).collect()
-    }
-}
-
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
 fn sinc_params_for(quality: SrcQuality) -> SincInterpolationParameters {
@@ -3119,30 +3058,6 @@ mod tests {
         let mut pinned = EncoderStage::new(None, None, None);
         pinned.pin_output(48_000, 1);
         assert_eq!(pinned.prepare(44_100, 2).unwrap(), (48_000, 1));
-    }
-
-    /// A `BatchStage` (one HLS segment re-encoded on its own) lines its
-    /// output up with its input: every input sample comes out, at its scaled
-    /// position, with no resampler delay to take off the stamps.
-    #[test]
-    fn a_batch_stage_lines_its_output_up_with_its_input() {
-        let signal = burst_signal(48_000, 30_000, 96_000);
-        let stage = encoder_stage(None, Some(44_100), None, 48_000, 1, None).unwrap();
-        assert!(stage.as_ref().unwrap().output_delay() > 0);
-        let mut b = BatchStage::new(stage);
-        let mut out = Vec::new();
-        for c in signal.chunks(1536) {
-            out.extend(b.process(&[c.to_vec()]).unwrap().remove(0));
-        }
-        out.extend(b.finish().unwrap().remove(0));
-        assert_eq!(out.len(), 88_200, "exactly the input's length at the new rate");
-        let expected = (30_000.0 + 239.5) * 44_100.0 / 48_000.0;
-        let c = energy_centre(&out);
-        assert!((c - expected).abs() < 1.5, "centre {c:.1}, expected {expected:.1}");
-        // No conversion: a pass-through.
-        let mut p = BatchStage::new(None);
-        assert_eq!(p.process(&[vec![1.0, 2.0]]).unwrap(), vec![vec![1.0, 2.0]]);
-        assert!(p.finish().unwrap().is_empty());
     }
 
     /// `channel_map_with_gain` is an entirely separate code path from
