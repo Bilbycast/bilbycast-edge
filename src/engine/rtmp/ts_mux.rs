@@ -643,10 +643,15 @@ impl TsMuxer {
     /// packets using the FFmpeg-compatible Opus-in-MPEG-TS carriage.
     ///
     /// Wire format of each Opus AU inside the private PES:
-    /// - Control header prefix (11 bits, all 1s) + 1 bit start_trim_flag +
-    ///   1 bit end_trim_flag + 1 bit control_extension_flag + 2 reserved
-    ///   bits. With all flags clear this packs into the two bytes
-    ///   `0xFF 0xE0`.
+    /// - Control header prefix (11 bits, `0x3FF`: `0111 1111 111`) + 1 bit
+    ///   start_trim_flag + 1 bit end_trim_flag + 1 bit
+    ///   control_extension_flag + 2 reserved bits. With all flags clear this
+    ///   packs into the two bytes `0x7F 0xE0` — what ffmpeg writes and
+    ///   checks (`AV_RB16 >> 5 == 0x3ff`). It was written as eleven 1s
+    ///   (`0xFF 0xE0`) until 2026-09: ffmpeg's parser took the whole AU for a
+    ///   raw Opus packet and failed on every one ("Error parsing Opus packet
+    ///   header"), so a WHIP publish's audio decoded nowhere outside the
+    ///   edge.
     /// - `au_size` encoded byte-by-byte: each `0xFF` byte contributes 255
     ///   to the length and signals "continue"; one final non-0xFF byte
     ///   (0x00..=0xFE) supplies the remaining length. For a 150-byte
@@ -663,11 +668,12 @@ impl TsMuxer {
         let pts_90khz = self.clamp_audio_pts(pts_90khz);
         let mut packets = self.maybe_emit_pat_pmt(false);
 
-        // Control header: 11 bits '1'*11 + start_trim(1)=0 + end_trim(1)=0 + ctrl_ext(1)=0 + reserved(2)=00
-        // Bits:    1111_1111 1110_0000
-        // Bytes:       0xFF    0xE0
+        // Control header: prefix 0x3FF (11 bits) + start_trim(1)=0 +
+        // end_trim(1)=0 + ctrl_ext(1)=0 + reserved(2)=00
+        // Bits:    0111_1111 1110_0000
+        // Bytes:       0x7F    0xE0
         let mut au = Vec::with_capacity(4 + opus_packet.len());
-        au.push(0xFF);
+        au.push(0x7F);
         au.push(0xE0);
 
         // au_size: chained 0xFF bytes + final non-0xFF remainder.
@@ -1222,6 +1228,28 @@ mod tests {
         assert_eq!(pmt[es_start], 0x0F);
         let es_info_len = ((pmt[es_start + 3] & 0x0F) as usize) << 8 | pmt[es_start + 4] as usize;
         assert_eq!(es_info_len, 0);
+    }
+
+    /// An Opus AU goes into its private PES behind the Opus-in-TS control
+    /// header ffmpeg writes and parses — prefix 0x3FF, `0x7F 0xE0` — and
+    /// comes back out whole. It was `0xFF 0xE0`, which ffmpeg read as a raw
+    /// Opus packet and failed on, every AU.
+    #[cfg(feature = "media-codecs")]
+    #[test]
+    fn an_opus_au_carries_the_standard_control_header() {
+        let mut m = TsMuxer::new();
+        m.set_has_video(false);
+        m.set_has_audio(true);
+        m.set_audio_stream(0x06, Some(*b"Opus"));
+        let opus = vec![0xFCu8; 300];
+        let ts = m.mux_audio_opus(&opus, 900_000);
+        let mut pes = Vec::new();
+        for p in ts.iter().filter(|p| ts_pid(p) == AUDIO_PID) {
+            pes.extend_from_slice(&p[crate::engine::ts_parse::ts_payload_offset(p)..]);
+        }
+        let es = &pes[9 + pes[8] as usize..];
+        assert_eq!(&es[..2], &[0x7F, 0xE0]);
+        assert_eq!(crate::engine::audio_decode::split_opus_frames(es), vec![&opus[..]]);
     }
 
     /// Bug #11 (2026-04-09): RTMP-ingest → RTP transmux emitted
