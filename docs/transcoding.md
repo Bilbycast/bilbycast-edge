@@ -1788,7 +1788,15 @@ commit message or release note and delete the bullet.
    carried no usable PTS (`fallback`), or this same source's cadence
    having changed since the lock (`cadence_change` — video to film, a
    playlist item at another rate). The encoder cannot reopen at a new
-   rate, so restart the output to lock the measured one.
+   rate, so restart the output to lock the measured one. A splice is not
+   a cadence change: a step between two decoded frames more than four
+   times the frame the meter has measured (a media-player loop, a PTS
+   jump the source made) is left out of the measurement, and only two
+   such steps in a row start it afresh at the new cadence. Counted as
+   frames, a loop whose step is not a whole number of them (770_H at
+   50 fps steps 18.8 frames, the audio's whole frames setting it) read
+   50.083 fps and warned `cadence_change` on every output at the first
+   loop.
 3. **No rate-control tuning knobs.** We pass `bitrate_kbps` + a
    `tune=zerolatency` option and rely on defaults for VBV buffer size,
    CRF, look-ahead, etc. CBR-strict profiles (true constant-bitrate

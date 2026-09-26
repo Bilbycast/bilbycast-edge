@@ -396,6 +396,12 @@ const SPARSE_LOCK_SPANS: u32 = 3;
 const SPARSE_LOCK_EXTRA_MAX: u32 = 2 * RATE_LOCK_FRAME_CAP;
 /// Deltas the cadence path needs before it answers.
 const CADENCE_MIN_DELTAS: usize = 12;
+/// A delta more than this many times the median of those measured is a
+/// splice — a media-player loop, a PTS jump the source made — not frames,
+/// and is left out; two in a row are a new cadence, measured afresh. Taken
+/// as frames, 770_H's 18.8-frame loop step read as 19 and a 50 fps source
+/// measured 50.083 (see [`FrameCadence::observe`]).
+const CADENCE_GAP_FACTOR: f64 = 4.0;
 /// 33-bit PTS space.
 const PTS_MASK_33B: u64 = (1u64 << 33) - 1;
 
@@ -491,6 +497,8 @@ pub struct FrameCadence {
     first_stamp_at: Option<u32>,
     /// The most frames one measured delta has covered.
     widest_span_frames: u32,
+    /// Consecutive deltas left out as a splice ([`CADENCE_GAP_FACTOR`]).
+    gaps: u32,
 }
 
 impl FrameCadence {
@@ -531,6 +539,24 @@ impl FrameCadence {
                 return;
             }
             if span < 1 << 32 && (90.0..=90_000.0).contains(&delta) {
+                // A step many frames long is a splice (a media-player loop,
+                // whose step the audio's whole frames set, not the video's),
+                // not cadence: left out, the frames either side of it measure
+                // the rate. Two in a row are the cadence itself changing (a
+                // playlist item at another rate): measured afresh.
+                if self.deltas.len() >= CADENCE_FAST_DELTAS
+                    && delta > CADENCE_GAP_FACTOR * self.median_delta()
+                {
+                    self.gaps += 1;
+                    if self.gaps < 2 {
+                        self.last_pts = Some(p);
+                        self.frames_since_pts = 0;
+                        return;
+                    }
+                    self.deltas.clear();
+                    self.delta_frames.clear();
+                }
+                self.gaps = 0;
                 if self.deltas.len() == CADENCE_WINDOW {
                     self.deltas.pop_front();
                     self.delta_frames.pop_front();
@@ -542,6 +568,13 @@ impl FrameCadence {
         }
         self.last_pts = Some(p);
         self.frames_since_pts = 0;
+    }
+
+    /// The median of the per-frame deltas measured so far.
+    fn median_delta(&self) -> f64 {
+        let mut d: Vec<f64> = self.deltas.iter().copied().collect();
+        d.sort_unstable_by(f64::total_cmp);
+        d[d.len() / 2]
     }
 
     /// Decoded frames (counted from the reset, as [`Self::observe`] saw
@@ -2552,6 +2585,37 @@ mod cadence_tests {
         // ...and once past it, four agreeing deltas answer at once.
         steps.extend([3_600u64; 3]);
         assert_eq!(meter(steps, 0).rate(), Some((25, 1)));
+    }
+
+    /// A splice many frames long — a media-player loop, whose step the
+    /// audio's whole frames set, not the video's — is no cadence: 770_H
+    /// program 4030 at 50 fps stepped 33 840 ticks (18.8 frames) across its
+    /// loop, the cadence path read it as 19 frames, and the meter said
+    /// 50.083 fps: a `video_encode_fps_mismatch` warning on every output at
+    /// the first loop. The step is left out; the frames either side of it
+    /// measure the rate, as before it.
+    #[test]
+    fn a_splice_many_frames_long_is_not_cadence() {
+        for gap in [33_840u64, 32_400, 7_700, 180_000] {
+            let mut m = meter([1_800u64; 30], 0);
+            let mut pts = 30 * 1_800 + gap;
+            m.observe(Some(pts as i64));
+            for k in 0..40 {
+                assert_eq!(m.rate(), Some((50, 1)), "gap {gap}, frame {k} after it");
+                pts += 1_800;
+                m.observe(Some(pts as i64));
+            }
+        }
+        // A frame or two dropped still counts as the frames it covers.
+        let mut steps = vec![1_800u64; 20];
+        steps.push(5_400);
+        steps.extend([1_800u64; 3]);
+        assert_eq!(meter(steps, 0).rate(), Some((50, 1)));
+        // Steps that stay long are the cadence changing: a 10 fps slate
+        // after 50 fps video measures 10 fps.
+        let mut steps = vec![1_800u64; 30];
+        steps.extend([9_000u64; 6]);
+        assert_eq!(meter(steps, 0).rate(), Some((10, 1)));
     }
 
     /// A source that stamps a PTS on every 12th picture only (29.97 fps):

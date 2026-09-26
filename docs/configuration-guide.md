@@ -1533,7 +1533,12 @@ loop, each playlist transition — continues one wire timeline:
   leaves when the source frame holding its last sample arrives, and that
   wait moves by the gap's remainder — arrival minus media stepped −18 to
   −22 ms at each loop on Spain MP2 → MP2, and −8 ms on Sky AAC. At most one
-  frame (21–32 ms) of pause is added.
+  frame (21–32 ms) of pause is added. The video's step across the splice
+  is then not always whole video frames (770_H program 4030: 18.8 frames
+  at 50 fps, 16.8 between DTS) — a receiver presents the next file's
+  pictures on a phase shifted by part of a frame, which a re-encoder
+  ignores (its output PTS carry the source's). The transcoder's frame-rate
+  meter leaves such a step out rather than read it as a cadence change.
 - **PSI across a splice.** A file's PAT / PMT cadence stops at its last
   table and restarts at its first: the tail after the last, the splice and
   the head before the first left 893 ms of PAT on Spain (the file repeats
