@@ -79,8 +79,16 @@ const SILENCE_MIN_27MHZ: i64 = 100 * 27_000;
 /// Silences the usual one is the median of.
 const SILENCE_STEPS: usize = 8;
 /// Consumed video PES remembered until their frame leaves (a frame the
-/// decoder or admission drops leaves its entry to age out).
-const IN_FLIGHT_MAX: usize = 64;
+/// decoder or admission drops leaves its entry to age out). It must outlast
+/// what a splice pushes in ahead of the frames it held: the next file's
+/// leading pictures up to its first random-access point, which the decoder
+/// turns into no frames at all, and the codec's own depth. At 64, 770_H
+/// program 4030 (50 fps, its first IRAP 980 ms in: 49 such PES) aged out
+/// the entries of the twelve pictures x264 still held from the loop's
+/// tail; they left with no hold, 206 ms late, and the PCR stage raised its
+/// delay from 51 to 247 ms. 512 covers 60 fps with the gate's 3 s give-up
+/// and the deepest lookahead.
+const IN_FLIGHT_MAX: usize = 512;
 
 /// What the input's own clock says about the video PID — two things the
 /// chain's trailing `ts_pcr_remux` stage cannot see, because every video
@@ -119,6 +127,9 @@ pub(crate) struct SourceClockWatch {
     silences_next: usize,
     /// Every hold so far, summed (27 MHz).
     pub(crate) silence_total: i64,
+    /// The hold total the PES in progress was complete at, when a hold came
+    /// before its end was known (its next PES start).
+    pending_complete_at: Option<i64>,
     /// Consumed PES: `(PTS, silence_total when its data was complete)`.
     in_flight: std::collections::VecDeque<(u64, i64)>,
     /// Frames that left having sat through a hold: `(PTS, hold)`.
@@ -167,19 +178,35 @@ impl SourceClockWatch {
     /// silence, is returned.
     pub(crate) fn on_video_payload(&mut self, pusi: bool, own_pcr: Option<u64>) -> i64 {
         let complete_at = self.silence_total;
-        if pusi && let (Some(now), Some(at)) = (own_pcr.or(self.last_pcr), self.pcr_at_video) {
+        if let (Some(now), Some(at)) = (own_pcr.or(self.last_pcr), self.pcr_at_video) {
             let silence = crate::engine::ts_parse::pcr_diff_27mhz(now, at).max(0);
             if let Some(usual) = self.usual_silence()
                 && silence > (2 * usual).max(SILENCE_MIN_27MHZ)
             {
+                // Measured ahead of any payload packet, not only a PES
+                // start: a file cut mid-PES opens with the continuation
+                // packets of a PES begun before it, and at a splice they
+                // are the first video after the silence — measured only at
+                // the next PES start, the silence had already gone by.
                 self.silence_total += silence - usual;
+                if !pusi {
+                    // The PES in progress had its data before this silence;
+                    // it is known complete only at the next PES start.
+                    self.pending_complete_at.get_or_insert(complete_at);
+                }
             }
-            self.silences[self.silences_next] = silence;
-            self.silences_next = (self.silences_next + 1) % SILENCE_STEPS;
-            self.silences_len = (self.silences_len + 1).min(SILENCE_STEPS);
+            if pusi {
+                self.silences[self.silences_next] = silence;
+                self.silences_next = (self.silences_next + 1) % SILENCE_STEPS;
+                self.silences_len = (self.silences_len + 1).min(SILENCE_STEPS);
+            }
         }
         self.pcr_at_video = self.last_pcr;
-        complete_at
+        if pusi {
+            self.pending_complete_at.take().unwrap_or(complete_at)
+        } else {
+            complete_at
+        }
     }
 
     fn usual_silence(&self) -> Option<i64> {
@@ -1663,6 +1690,15 @@ mod inner {
 
             let own_pcr = if Some(ts_pid(pkt)) == self.source_pcr_pid { extract_pcr(pkt) } else { None };
             let complete_at = self.clock.on_video_payload(pusi, own_pcr);
+            if self.clock.silence_total != complete_at {
+                // The input's video just came back from a hold (a
+                // media-player splice). The pictures the codec still holds
+                // from before it may leave behind the output PCR and be
+                // dropped as stale by the PCR stage: the next picture
+                // encoded is an IDR, so nothing after the hold is predicted
+                // from one of them.
+                self.force_idr.store(true, Ordering::Relaxed);
+            }
             if pusi {
                 self.clock.on_pes_start(
                     crate::engine::ts_parse::extract_pes_dts(pkt)
@@ -3070,6 +3106,102 @@ mod tests {
         assert!(!w.starved());
     }
 
+    /// A splice's held pictures leave only when the codec gets new ones,
+    /// after the next file's leading pictures up to its first random-access
+    /// point — PES the decoder turns into nothing. Their holds outlast
+    /// those: at 64 remembered PES, 770_H's twelve held x264 pictures lost
+    /// theirs behind 49 leading PES and left 206 ms late with none.
+    #[test]
+    fn frames_held_through_a_splice_keep_their_hold_behind_the_next_files_leading_pictures() {
+        let mut w = SourceClockWatch::default();
+        let ms = 27_000u64;
+        let mut pcr = 27_000_000u64;
+        let mut pts = 900_000u64;
+        // A file's tail at 50 fps: twelve pictures consumed and not out yet
+        // (in the codec), after a steady run.
+        for i in 0..40u64 {
+            w.on_pcr(pcr, false);
+            pcr += 20 * ms;
+            let at = w.on_video_payload(true, None);
+            w.pes_consumed(pts, at);
+            if i < 28 {
+                w.frame_out(pts);
+            }
+            pts += 1_800;
+        }
+        let held: Vec<u64> = (28..40u64).map(|i| 900_000 + i * 1_800).collect();
+        // The file's truncated last PES and the pictures the decoder drops
+        // with it: consumed, never out.
+        for _ in 0..5 {
+            let at = w.on_video_payload(true, None);
+            w.pes_consumed(pts, at);
+            pts += 1_800;
+        }
+        // The splice: 400 ms of clock with no video.
+        for _ in 0..20 {
+            w.on_pcr(pcr, false);
+            pcr += 20 * ms;
+        }
+        // The next file's leading pictures up to its first random-access
+        // point: 49 PES that decode to nothing — then the held pictures
+        // leave.
+        for _ in 0..49 {
+            w.on_pcr(pcr, false);
+            pcr += 20 * ms;
+            let at = w.on_video_payload(true, None);
+            w.pes_consumed(pts + 900_000, at);
+            pts += 1_800;
+        }
+        for p in &held {
+            w.frame_out(*p);
+        }
+        let holds = w.take_holds();
+        assert_eq!(holds.len(), 12, "every held picture keeps its hold: {holds:?}");
+        assert!(holds.iter().all(|(_, h)| *h >= 350 * ms as i64), "{holds:?}");
+    }
+
+    /// A file cut mid-PES opens with the continuation packets of a PES begun
+    /// before it: at a splice they are the first video after the silence.
+    /// The hold is measured ahead of them, and the PES the input left
+    /// pending — known complete only at the next PES start, after them —
+    /// still counts as complete before the silence. Measured only at the
+    /// next PES start, 770_H program 4030's 373 ms splice was never a hold
+    /// at all, and eleven held pictures raised the PCR delay 51 -> 247 ms.
+    #[test]
+    fn a_silence_ahead_of_a_continuation_packet_is_a_hold() {
+        let mut w = SourceClockWatch::default();
+        let ms = 27_000u64;
+        let mut pcr = 27_000_000u64;
+        let mut pts = 900_000u64;
+        for _ in 0..20 {
+            w.on_pcr(pcr, false);
+            pcr += 20 * ms;
+            for k in 0..3 {
+                let at = w.on_video_payload(k == 0, None);
+                if k == 0 {
+                    w.pes_consumed(pts - 1_800, at);
+                    w.frame_out(pts - 1_800);
+                }
+            }
+            pts += 1_800;
+        }
+        // The file ends mid-way through the PES of `pts - 1800`; 380 ms of
+        // filler PCRs; the next file's leading continuation packets; then
+        // its first PES start completes the pending one.
+        for _ in 0..19 {
+            w.on_pcr(pcr, false);
+            pcr += 20 * ms;
+        }
+        let _ = w.on_video_payload(false, None);
+        let _ = w.on_video_payload(false, None);
+        let at = w.on_video_payload(true, None);
+        w.pes_consumed(pts - 1_800, at);
+        w.frame_out(pts - 1_800);
+        let holds = w.take_holds();
+        assert_eq!(holds.len(), 1, "{holds:?}");
+        assert!(holds[0].1 >= 350 * ms as i64, "{holds:?}");
+    }
+
     /// R2. The PES the input left pending when its video went silent (the
     /// tail of a media-player file) — and every frame still in the pipeline
     /// with it — sat through that silence beyond the usual one: that is the
@@ -3868,6 +4000,31 @@ mod tests {
             out
         }
 
+        /// Every video PES on 0x100 in `ts`: (PTS, ES bytes).
+        fn video_pes_with_pts(ts: &[u8]) -> Vec<(u64, Vec<u8>)> {
+            let mut pes: Vec<Vec<u8>> = Vec::new();
+            for p in ts.chunks(TS_PACKET_SIZE) {
+                if ts_pid(p) != 0x100 || !ts_has_payload(p) {
+                    continue;
+                }
+                let payload = &p[ts_payload_offset(p)..];
+                if ts_pusi(p) {
+                    pes.push(payload.to_vec());
+                } else if let Some(last) = pes.last_mut() {
+                    last.extend_from_slice(payload);
+                }
+            }
+            pes.into_iter()
+                .filter(|b| b.len() > 14 && b[7] & 0x80 != 0)
+                .map(|b| (crate::engine::audio_au::parse_pes_timestamp(&b[9..14]), b[9 + b[8] as usize..].to_vec()))
+                .collect()
+        }
+
+        /// An H.264 access unit holding an IDR slice.
+        fn has_idr(es: &[u8]) -> bool {
+            es.windows(4).any(|w| w[..3] == [0, 0, 1] && w[3] & 0x1F == 5)
+        }
+
         /// Video PES starts on 0x100 in `ts`.
         fn video_pes_count(ts: &[u8]) -> usize {
             ts.chunks(TS_PACKET_SIZE).filter(|p| ts_pid(p) == 0x100 && ts_pusi(p) && ts_has_payload(p)).count()
@@ -4022,6 +4179,15 @@ mod tests {
                 }
                 let encoded = r.stats_handle().output_frames.load(Ordering::Relaxed) as usize;
                 assert_eq!(video_pes_count(&out), encoded, "every encoded frame reached the wire");
+                // The first picture encoded after the hold is an IDR: a
+                // held one before it may have been dropped as stale, and
+                // nothing may be predicted from it. (The tail's last source
+                // picture is the first the decoder still held.)
+                let next = video_pes_with_pts(&out)
+                    .into_iter()
+                    .find(|(pts, _)| *pts >= last)
+                    .expect("pictures after the hold went out");
+                assert!(has_idr(&next.1), "the first picture after the hold is an IDR");
                 let pes = video_vs_pcr(&out);
                 assert!(pes.len() >= 60, "{} frames out", pes.len());
                 for (dts, pcr) in pes {
