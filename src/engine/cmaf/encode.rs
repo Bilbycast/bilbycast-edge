@@ -8,10 +8,11 @@
 //!
 //! # Audio re-encoder
 //!
-//! Source AAC frame → `AacDecoder` → optional PCM `transcode` →
-//! `AudioEncoder` → target AAC frame(s). For AAC-LC → AAC-LC with
-//! same sample-rate / channels / bitrate this is a passthrough; the
-//! encoder optimises out the round-trip.
+//! Source AAC frame → `AacDecoder` → channel stage (the `transcode`
+//! block's routing, or the standard downmix `audio_encode.channels` asks
+//! for; `audio_transcode::encoder_stage`) → `AudioEncoder`, which converts
+//! the rate (the block's `sample_rate`, else `audio_encode.sample_rate`)
+//! in its own resampler → target AAC frame(s).
 //!
 //! # Video re-encoder
 //!
@@ -42,8 +43,19 @@ pub struct AudioReencoder {
     encoder: Option<AudioEncoder>,
     target_codec: AudioCodec,
     target_bitrate_kbps: u32,
+    /// The output rate and channel count asked for: the `transcode`
+    /// block's, else `audio_encode`'s (`None` = the source's).
     target_sample_rate: Option<u32>,
     target_channels: Option<u8>,
+    /// The `transcode` block without its `sample_rate` (the encoder's
+    /// resampler converts the rate): what the channel stage routes by.
+    channel_block: Option<crate::engine::audio_transcode::TranscodeJson>,
+    /// The channel stage between decoder and encoder, rate-neutral, and the
+    /// decoded format it was built for. It replaced a mix that took L / R
+    /// of a 5.1 source (losing the centre) and averaged stereo to mono,
+    /// whatever the `transcode` block said — which was ignored.
+    layout: Option<crate::engine::audio_transcode::PlanarAudioTranscoder>,
+    layout_in: (u32, u8),
     lazy_init_params: LazyAudioInit,
     flow_id: String,
     output_id: String,
@@ -109,10 +121,14 @@ struct LazyAudioInit {
 impl AudioReencoder {
     pub fn new(
         cfg: &AudioEncodeConfig,
+        transcode: Option<&crate::engine::audio_transcode::TranscodeJson>,
         cancel: &CancellationToken,
         output_id: &str,
         flow_id: &str,
     ) -> Result<Self> {
+        // The block wins over audio_encode's fields, as on every output.
+        let target_sample_rate = transcode.and_then(|t| t.sample_rate).or(cfg.sample_rate);
+        let target_channels = transcode.and_then(|t| t.channels).or(cfg.channels);
         let target_codec = AudioCodec::parse(&cfg.codec)
             .ok_or_else(|| anyhow::anyhow!("unknown audio codec: {}", cfg.codec))?;
         // CMAF audio is AAC only in Phase 3 — reject exotic codecs
@@ -138,8 +154,8 @@ impl AudioReencoder {
         // any source audio ever shows up. The source decoder stays
         // `None` until the first real AAC frame arrives.
         let (encoder, silence) = if cfg.silent_fallback {
-            let sr = cfg.sample_rate.unwrap_or(48_000);
-            let ch = cfg.channels.unwrap_or(2).clamp(1, 2);
+            let sr = target_sample_rate.unwrap_or(48_000);
+            let ch = target_channels.unwrap_or(2).clamp(1, 2);
             let params = EncoderParams {
                 codec: target_codec,
                 sample_rate: sr,
@@ -174,8 +190,14 @@ impl AudioReencoder {
             encoder,
             target_codec,
             target_bitrate_kbps,
-            target_sample_rate: cfg.sample_rate,
-            target_channels: cfg.channels,
+            target_sample_rate,
+            target_channels,
+            channel_block: transcode.map(|t| crate::engine::audio_transcode::TranscodeJson {
+                sample_rate: None,
+                ..t.clone()
+            }),
+            layout: None,
+            layout_in: (0, 0),
             lazy_init_params: LazyAudioInit { adts_config: None },
             flow_id: flow_id.to_string(),
             output_id: output_id.to_string(),
@@ -392,9 +414,38 @@ impl AudioReencoder {
     ///
     /// The encoder's input layout is always its output layout — the
     /// in-process backends take no other, and refuse it at spawn — so a
-    /// source at another channel count is mixed on the way in
-    /// (`to_layout`), and only its rate decides whether to rebuild.
+    /// source at another channel count goes through the channel stage on
+    /// the way in (`ensure_layout`), and only its rate decides whether to
+    /// rebuild.
     fn ensure_encoder_for(&mut self, source_sr: u32, source_ch: u8, pts: u64) -> Result<()> {
+        self.ensure_encoder_rate(source_sr, source_ch, pts)?;
+        self.ensure_layout(source_sr, source_ch)
+    }
+
+    /// The channel stage for a decoded `(source_sr, source_ch)`, to the
+    /// encoder's input layout, at the source's rate.
+    fn ensure_layout(&mut self, source_sr: u32, source_ch: u8) -> Result<()> {
+        if self.layout_in == (source_sr, source_ch) {
+            return Ok(());
+        }
+        let enc_ch = self
+            .encoder
+            .as_ref()
+            .map_or(source_ch, |e| e.params().channels);
+        self.layout = crate::engine::audio_transcode::encoder_stage(
+            self.channel_block.as_ref(),
+            None,
+            self.target_channels,
+            source_sr,
+            source_ch,
+            Some((source_sr, enc_ch)),
+        )
+        .map_err(|e| anyhow::anyhow!("channel stage: {e}"))?;
+        self.layout_in = (source_sr, source_ch);
+        Ok(())
+    }
+
+    fn ensure_encoder_rate(&mut self, source_sr: u32, source_ch: u8, pts: u64) -> Result<()> {
         let matches = self
             .encoder
             .as_ref()
@@ -407,11 +458,20 @@ impl AudioReencoder {
             .as_ref()
             .map(|e| e.params().target_sample_rate)
             .unwrap_or_else(|| self.target_sample_rate.unwrap_or(source_sr));
-        let target_channels = self
-            .encoder
-            .as_ref()
-            .map(|e| e.params().target_channels)
-            .unwrap_or_else(|| self.target_channels.unwrap_or(source_ch));
+        // The layout the channel stage produces for this source: the
+        // block's routing or the standard downmix to the asked-for count.
+        let target_channels = match self.encoder.as_ref() {
+            Some(e) => e.params().target_channels,
+            None => crate::engine::audio_transcode::encoder_stage_format(
+                self.channel_block.as_ref(),
+                None,
+                self.target_channels,
+                source_sr,
+                source_ch,
+            )
+            .map_err(|e| anyhow::anyhow!("channel stage: {e}"))?
+            .1,
+        };
         let at = self.input_position();
         let params = EncoderParams {
             codec: self.target_codec,
@@ -466,28 +526,6 @@ impl AudioReencoder {
         self.input_since_anchor = 0;
         self.input_sr = source_sr;
         Ok(())
-    }
-
-    /// `planar` in the layout the encoder takes: its own when it already is,
-    /// otherwise mixed to it. Mono is duplicated to both channels, stereo
-    /// averaged to one, and more than two channels take the first two (L/R)
-    /// or their average — enough for the sources silent fallback exists for,
-    /// which are mono cameras and stereo encoders. The in-process encoders
-    /// index their accumulators by the target layout and take no other.
-    fn to_layout(planar: &[Vec<f32>], channels: usize) -> std::borrow::Cow<'_, [Vec<f32>]> {
-        use std::borrow::Cow;
-        if planar.len() == channels || planar.is_empty() || channels == 0 {
-            return Cow::Borrowed(planar);
-        }
-        let n = planar[0].len();
-        let mixed: Vec<Vec<f32>> = match (planar.len(), channels) {
-            (1, _) => vec![planar[0].clone(); channels],
-            (_, 1) => vec![(0..n)
-                .map(|i| planar.iter().map(|c| c[i]).sum::<f32>() / planar.len() as f32)
-                .collect()],
-            (_, c) => (0..c).map(|k| planar[k.min(planar.len() - 1)].clone()).collect(),
-        };
-        Cow::Owned(mixed)
     }
 
     /// Reset the drop watchdog on a real source AAC frame so silence goes
@@ -555,11 +593,12 @@ impl AudioReencoder {
             return Ok(out);
         }
         let n = planar.first().map_or(0, |c| c.len() as u64);
-        let channels = self
-            .encoder
-            .as_ref()
-            .map_or(planar.len(), |e| e.params().channels as usize);
-        let planar = Self::to_layout(planar, channels);
+        let planar: std::borrow::Cow<'_, [Vec<f32>]> = match self.layout.as_mut() {
+            Some(l) => std::borrow::Cow::Owned(
+                l.process(planar).map_err(|e| anyhow::anyhow!("channel stage: {e}"))?,
+            ),
+            None => std::borrow::Cow::Borrowed(planar),
+        };
         // At the input position, not the frame's PTS: equal on a first
         // anchor or a re-anchor, ignored once anchored, and after a rebuild
         // it is what puts the new encoder where the retired one left off
@@ -943,7 +982,7 @@ mod reencoder_tests {
     #[test]
     fn silent_fallback_off_defers_encoder() {
         let cancel = CancellationToken::new();
-        let r = AudioReencoder::new(&ae("aac_lc", false), &cancel, "out1", "flow1").unwrap();
+        let r = AudioReencoder::new(&ae("aac_lc", false), None, &cancel, "out1", "flow1").unwrap();
         assert!(!r.has_silent_fallback());
         assert!(r.silence_chunk_duration().is_none());
         assert!(r.silent_fallback_track().is_none());
@@ -956,7 +995,7 @@ mod reencoder_tests {
     )]
     fn silent_fallback_on_builds_eager_encoder() {
         let cancel = CancellationToken::new();
-        let r = AudioReencoder::new(&ae("aac_lc", true), &cancel, "out2", "flow2");
+        let r = AudioReencoder::new(&ae("aac_lc", true), None, &cancel, "out2", "flow2");
         // Accept ffmpeg-missing as a skip when no in-process backend is
         // compiled in — the edge surfaces the error at runtime.
         let r = match r {
@@ -994,7 +1033,7 @@ mod reencoder_tests {
     #[cfg(feature = "fdk-aac")]
     fn silence_fills_to_the_audio_and_real_audio_lands_where_it_ends() {
         let cancel = CancellationToken::new();
-        let mut r = AudioReencoder::new(&ae("aac_lc", true), &cancel, "out3", "flow3")
+        let mut r = AudioReencoder::new(&ae("aac_lc", true), None, &cancel, "out3", "flow3")
             .expect("fdk-aac in-process encoder");
         let frame = 1_920u64; // 1024 samples at 48 kHz, in 90 kHz ticks
 
@@ -1083,7 +1122,7 @@ mod reencoder_tests {
     #[cfg(feature = "fdk-aac")]
     fn a_source_at_another_rate_rebuilds_the_eager_encoder() {
         let cancel = CancellationToken::new();
-        let mut r = AudioReencoder::new(&ae("aac_lc", true), &cancel, "out4", "flow4")
+        let mut r = AudioReencoder::new(&ae("aac_lc", true), None, &cancel, "out4", "flow4")
             .expect("fdk-aac in-process encoder");
         assert_eq!(r.encoder.as_ref().unwrap().params().sample_rate, 48_000);
         let pcm = vec![vec![0.1f32; 1024]; 2];
@@ -1121,7 +1160,7 @@ mod reencoder_tests {
     #[cfg(feature = "fdk-aac")]
     fn a_mono_source_is_mixed_to_the_tracks_layout() {
         let cancel = CancellationToken::new();
-        let mut r = AudioReencoder::new(&ae("aac_lc", true), &cancel, "out5", "flow5")
+        let mut r = AudioReencoder::new(&ae("aac_lc", true), None, &cancel, "out5", "flow5")
             .expect("fdk-aac in-process encoder");
         let mono = vec![vec![0.25f32; 1024]];
         let mut out = Vec::new();
@@ -1135,18 +1174,48 @@ mod reencoder_tests {
         assert_eq!((p.channels, p.target_channels), (2, 2), "the encoder stays at the track's layout");
         assert!(!cancel.is_cancelled());
 
-        // The mapping itself.
-        let up = AudioReencoder::to_layout(&mono, 2);
-        assert_eq!(up.len(), 2);
-        assert_eq!(up[0], up[1]);
+    }
+
+    /// Mix of a decoded source by the channel stage the re-encoder builds:
+    /// `planar` (its channel count) at 48 kHz, to the encoder's layout.
+    #[cfg(feature = "fdk-aac")]
+    fn mix(transcode: Option<crate::engine::audio_transcode::TranscodeJson>, channels: Option<u8>, planar: &[Vec<f32>]) -> Vec<Vec<f32>> {
+        let cancel = CancellationToken::new();
+        let mut cfg = ae("aac_lc", false);
+        cfg.channels = channels;
+        let mut r = AudioReencoder::new(&cfg, transcode.as_ref(), &cancel, "out6", "flow6").unwrap();
+        r.ensure_encoder_for(48_000, planar.len() as u8, 0).unwrap();
+        match r.layout.as_mut() {
+            Some(l) => l.process(planar).unwrap(),
+            None => planar.to_vec(),
+        }
+    }
+
+    /// `audio_encode.channels` and a `transcode` block convert exactly as
+    /// they do on the TS outputs (`audio_transcode::encoder_stage`): a 5.1
+    /// source to stereo is the ITU-R BS.775 downmix — its centre in both
+    /// channels at -3 dB, where the old mix took L / R and lost it — and the
+    /// block's routing, which CMAF used to ignore, applies.
+    #[test]
+    #[cfg(feature = "fdk-aac")]
+    fn the_channel_stage_downmixes_and_honours_the_transcode_block() {
+        let centre: Vec<Vec<f32>> = (0..6).map(|k| vec![if k == 2 { 1.0 } else { 0.0 }; 4]).collect();
+        let lr = mix(None, Some(2), &centre);
+        assert_eq!(lr.len(), 2);
+        for c in &lr {
+            assert!((c[0] - std::f32::consts::FRAC_1_SQRT_2).abs() < 1e-3, "centre at -3 dB: {}", c[0]);
+        }
+        // The block's own routing: swap L and R.
+        let swap = crate::engine::audio_transcode::TranscodeJson {
+            channel_map: Some(vec![vec![1], vec![0]]),
+            ..Default::default()
+        };
         let stereo = vec![vec![1.0f32; 4], vec![0.0f32; 4]];
-        let down = AudioReencoder::to_layout(&stereo, 1);
-        assert_eq!(down.len(), 1);
-        assert!(down[0].iter().all(|v| (*v - 0.5).abs() < 1e-6));
-        let six: Vec<Vec<f32>> = (0..6).map(|k| vec![k as f32; 2]).collect();
-        let lr = AudioReencoder::to_layout(&six, 2);
-        assert_eq!((lr[0][0], lr[1][0]), (0.0, 1.0), "L/R of a 5.1 source");
-        assert!(matches!(AudioReencoder::to_layout(&stereo, 2), std::borrow::Cow::Borrowed(_)));
+        let out = mix(Some(swap), None, &stereo);
+        assert_eq!((out[0][0], out[1][0]), (0.0, 1.0));
+        // Mono to stereo duplicates.
+        let up = mix(None, Some(2), &[vec![0.5f32; 4]]);
+        assert_eq!(up[0], up[1]);
     }
 }
 

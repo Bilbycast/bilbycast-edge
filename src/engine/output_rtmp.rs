@@ -50,16 +50,14 @@ enum EncoderState {
         decoder: Option<AacDecoder>,
         encoder: AudioEncoder,
         decode_stats: Arc<DecodeStats>,
-        /// Optional planar PCM shuffle / resample stage between decoder and
-        /// encoder. `None` unless `config.transcode` was set. Passthrough
-        /// fast-paths inside `PlanarAudioTranscoder` mean an empty block is
-        /// effectively a clone.
-        transcoder: Option<super::audio_transcode::PlanarAudioTranscoder>,
-        /// Retained to re-plan the transcoder when silent-fallback sees
-        /// its first real AAC frame and needs to resample from the source
-        /// rate/channels to the encoder's declared input. `None` in the
-        /// legacy path (transcoder was already built against real params).
-        pending_transcode_cfg: Option<super::audio_transcode::TranscodeJson>,
+        /// The channel / rate stage between decoder and encoder — the
+        /// `transcode` block, or `audio_encode.sample_rate` / `channels`
+        /// alone when they differ from the source
+        /// (`audio_transcode::encoder_stage`) — converting to the format
+        /// the encoder was opened at, in streaming mode (a constant delay,
+        /// taken off the encoder's stamps). An MP2 / AC-3 / E-AC-3 source
+        /// goes through it too.
+        stage: super::audio_transcode::EncoderStage,
         /// Silent-PCM generator + audio-drop watchdog. `Some` iff
         /// `audio_encode.silent_fallback = true`.
         silence: Option<SilenceGenerator>,
@@ -558,23 +556,19 @@ async fn publish_loop(
                             decoder,
                             encoder,
                             decode_stats,
-                            transcoder,
-                            pending_transcode_cfg,
+                            stage,
                             silence,
                         } => {
-                            // Silent-fallback mode: lazily build decoder +
-                            // resampler against the source's real AAC
-                            // config on the first real frame.
+                            // Silent-fallback mode: lazily build the decoder
+                            // against the source's real AAC config on the
+                            // first real frame (the stage, pinned to the
+                            // encoder's format, converts whatever it is).
                             if decoder.is_none()
                                 && let Some((profile, sr_idx, ch_cfg)) =
                                     demuxer.cached_aac_config()
                                 {
-                                    let encoder_params = encoder.params().clone();
-                                    lazy_build_decoder_and_transcoder(
+                                    lazy_build_decoder(
                                         decoder,
-                                        transcoder,
-                                        pending_transcode_cfg,
-                                        &encoder_params,
                                         (profile, sr_idx, ch_cfg),
                                         &config.id,
                                     );
@@ -595,20 +589,16 @@ async fn publish_loop(
                             match dec.decode_frame(&data) {
                                 Ok(planar) => {
                                     decode_stats.inc_output();
-                                    if let Some(tc) = transcoder.as_mut() {
-                                        match tc.process(&planar) {
-                                            Ok(shuffled) => {
-                                                encoder.submit_planar(&shuffled, pts);
-                                            }
-                                            Err(e) => {
-                                                tracing::debug!(
-                                                    "RTMP output '{}': transcode failed: {e}",
-                                                    config.id
-                                                );
-                                            }
+                                    match stage.process(&planar, dec.sample_rate()) {
+                                        Ok(pcm) => {
+                                            encoder.submit_planar(&pcm, pts);
                                         }
-                                    } else {
-                                        encoder.submit_planar(&planar, pts);
+                                        Err(e) => {
+                                            tracing::debug!(
+                                                "RTMP output '{}': transcode failed: {e}",
+                                                config.id
+                                            );
+                                        }
                                     }
                                 }
                                 Err(e) => {
@@ -681,7 +671,7 @@ async fn publish_loop(
                         );
                     }
                     let EncoderState::Active {
-                        encoder, silence, ..
+                        encoder, silence, stage, ..
                     } = &mut encoder_state
                     else {
                         continue;
@@ -693,7 +683,7 @@ async fn publish_loop(
                         continue;
                     };
                     if ff_audio_codec != Some(codec) {
-                        ff_audio_decoder = video_engine::AudioDecoder::open(codec).ok();
+                        ff_audio_decoder = crate::engine::audio_decode::open_ff_decoder(codec).ok();
                         ff_audio_codec = Some(codec);
                     }
                     let Some(dec) = ff_audio_decoder.as_mut() else {
@@ -728,7 +718,20 @@ async fn publish_loop(
                             continue;
                         }
                         while let Ok(frame) = dec.receive_frame() {
-                            encoder.submit_planar(&frame.planar, pts);
+                            // To the encoder's format: MP2 at another rate
+                            // was encoded as if at the encoder's (and ran
+                            // at the wrong speed), 5.1 AC-3 refused.
+                            match stage.process(&frame.planar, frame.sample_rate) {
+                                Ok(pcm) => {
+                                    encoder.submit_planar(&pcm, pts);
+                                }
+                                Err(e) => {
+                                    tracing::debug!(
+                                        "RTMP output '{}': transcode failed: {e}",
+                                        config.id
+                                    );
+                                }
+                            }
                         }
                     }
                     let drained = encoder.drain();
@@ -1979,22 +1982,20 @@ fn build_encoder_state(
         return EncoderState::Transparent;
     }
 
-    // Resolve the encoder's input shape. When a transcode block is set it
-    // wins — fold any audio_encode overrides into it as fallbacks for fields
-    // the block leaves unset, build the transcoder, and use its output as
-    // the encoder input.
-    let (target_sr, target_ch, transcoder) = if let Some(tj_in) = config.transcode.as_ref() {
-        let merged = super::audio_transcode::TranscodeJson {
-            sample_rate: tj_in.sample_rate.or(enc_cfg.sample_rate),
-            channels: tj_in.channels.or(enc_cfg.channels),
-            ..tj_in.clone()
-        };
-        match super::audio_transcode::PlanarAudioTranscoder::new(
-            input_sr,
-            input_ch,
-            &merged,
-        ) {
-            Ok(tc) => (tc.out_sample_rate(), tc.out_channels(), Some(tc)),
+    // Resolve the encoder's input shape: the channel / rate stage converts
+    // the source to it — the transcode block when set (audio_encode's
+    // sample_rate / channels folded in for the fields it leaves unset),
+    // otherwise those two alone. Without a block they used to reach the
+    // encoder as bare parameters: the rate was converted by the encoder's
+    // own resampler, a channel count other than the source's refused.
+    let mut stage = super::audio_transcode::EncoderStage::new(
+        config.transcode.clone(),
+        enc_cfg.sample_rate,
+        enc_cfg.channels,
+    );
+    let (target_sr, target_ch) = {
+        match stage.prepare(input_sr, input_ch) {
+            Ok(out) => out,
             Err(e) => {
                 let msg = format!(
                     "RTMP output '{}': audio_encode transcode build failed: {e}",
@@ -2010,27 +2011,16 @@ fn build_encoder_state(
                 return EncoderState::Failed;
             }
         }
-    } else {
-        (
-            enc_cfg.sample_rate.unwrap_or(input_sr),
-            enc_cfg.channels.unwrap_or(input_ch),
-            None,
-        )
     };
     let target_br = enc_cfg.bitrate_kbps.unwrap_or_else(|| codec.default_bitrate_kbps());
 
-    // When a transcoder is in front of the encoder, it has already aligned
-    // the PCM to (target_sr, target_ch), so the encoder sees its target
-    // format as input and performs no internal SRC / channel mapping.
-    let (enc_in_sr, enc_in_ch) = if transcoder.is_some() {
-        (target_sr, target_ch)
-    } else {
-        (input_sr, input_ch)
-    };
+    // The stage has already aligned the PCM to (target_sr, target_ch), so
+    // the encoder sees its target format as input and performs no internal
+    // SRC / channel mapping.
     let params = EncoderParams {
         codec,
-        sample_rate: enc_in_sr,
-        channels: enc_in_ch,
+        sample_rate: target_sr,
+        channels: target_ch,
         target_bitrate_kbps: target_br,
         target_sample_rate: target_sr,
         target_channels: target_ch,
@@ -2051,7 +2041,7 @@ fn build_encoder_state(
         }
     };
 
-    let encoder = match AudioEncoder::spawn(
+    let mut encoder = match AudioEncoder::spawn(
         params,
         cancel.child_token(),
         flow_id.to_string(),
@@ -2090,6 +2080,9 @@ fn build_encoder_state(
         }
     };
 
+    // The stage's resampler delay comes off the stamps with the codec's.
+    encoder.set_upstream_delay(stage.delay(), target_sr);
+
     tracing::info!(
         "RTMP output '{}': audio_encode active codec={} {}->{} Hz {}->{} ch {} kbps",
         config.id,
@@ -2122,8 +2115,7 @@ fn build_encoder_state(
         decoder: Some(decoder),
         encoder,
         decode_stats,
-        transcoder,
-        pending_transcode_cfg: None,
+        stage,
         silence: None,
     }
 }
@@ -2318,26 +2310,31 @@ fn build_encoder_state_eager_for_silent_fallback(
         target_sr, target_ch, target_br,
     );
 
+    // Real audio, when it arrives, is converted to the format the silence
+    // opened the encoder at.
+    let mut stage = super::audio_transcode::EncoderStage::new(
+        config.transcode.clone(),
+        enc_cfg.sample_rate,
+        enc_cfg.channels,
+    );
+    stage.pin_output(target_sr, target_ch);
+
     EncoderState::Active {
         decoder: None,
         encoder,
         decode_stats,
-        transcoder: None,
-        pending_transcode_cfg: config.transcode.clone(),
+        stage,
         silence: Some(silence),
     }
 }
 
-/// Build the source AAC decoder + optional resampler on the first real
-/// AAC frame observed while the encoder is already running (the
-/// silent-fallback path). Mutates the passed `decoder` / `transcoder`
-/// fields in place; logs and sets `decoder = None` on failure so we
-/// keep producing silence instead of crashing the output.
-fn lazy_build_decoder_and_transcoder(
+/// Build the source AAC decoder on the first real AAC frame observed while
+/// the encoder is already running (the silent-fallback path). Logs and
+/// leaves `decoder = None` on failure so we keep producing silence instead
+/// of crashing the output. The encoder's stage (pinned to its format)
+/// converts whatever the source turns out to be.
+fn lazy_build_decoder(
     decoder: &mut Option<AacDecoder>,
-    transcoder: &mut Option<super::audio_transcode::PlanarAudioTranscoder>,
-    pending_transcode_cfg: &Option<super::audio_transcode::TranscodeJson>,
-    encoder_params: &EncoderParams,
     cached_aac: (u8, u8, u8),
     output_id: &str,
 ) {
@@ -2349,46 +2346,13 @@ fn lazy_build_decoder_and_transcoder(
         );
         return;
     }
-    let dec = match AacDecoder::from_adts_config(profile, sr_idx, ch_cfg) {
-        Ok(d) => d,
+    match AacDecoder::from_adts_config(profile, sr_idx, ch_cfg) {
+        Ok(d) => *decoder = Some(d),
         Err(e) => {
             tracing::warn!(
                 "RTMP output '{}': silent-fallback AacDecoder build failed: {e}; keeping silence track",
                 output_id
             );
-            return;
-        }
-    };
-    let source_sr = dec.sample_rate();
-    let source_ch = dec.channels();
-    *decoder = Some(dec);
-
-    let need_transcode = pending_transcode_cfg.is_some()
-        || source_sr != encoder_params.sample_rate
-        || source_ch != encoder_params.channels;
-    if !need_transcode {
-        *transcoder = None;
-        return;
-    }
-
-    let merged = super::audio_transcode::TranscodeJson {
-        sample_rate: Some(encoder_params.sample_rate),
-        channels: Some(encoder_params.channels),
-        ..pending_transcode_cfg.clone().unwrap_or_default()
-    };
-    match super::audio_transcode::PlanarAudioTranscoder::new(source_sr, source_ch, &merged) {
-        Ok(tc) => *transcoder = Some(tc),
-        Err(e) => {
-            tracing::warn!(
-                "RTMP output '{}': silent-fallback transcoder build failed: {e}; source audio will be dropped but silence continues",
-                output_id
-            );
-            // decoder stays set; without a transcoder, submitting
-            // planar at the wrong SR/channels would corrupt the
-            // encoder stream, so we drop real audio until a resample
-            // path can be built (next frame retries via this same
-            // helper because `transcoder.is_none()`).
-            *decoder = None;
         }
     }
 }
@@ -2677,6 +2641,39 @@ mod flv_timestamp_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **B1.** `audio_encode.sample_rate` / `channels` without a
+    /// `transcode` block go through the shared channel / rate stage: the
+    /// encoder is opened at the output format and fed PCM converted to it.
+    /// A channel override used to open the encoder with the source's layout
+    /// as input and the override as output, which the in-process backends
+    /// refuse — the output raised a Critical `audio_encode` event and
+    /// carried no audio.
+    #[cfg(feature = "fdk-aac")]
+    #[test]
+    fn a_rate_and_channel_override_without_a_transcode_block_converts() {
+        const ADTS: &[u8] = include_bytes!("testdata/sine1k_aac_lc_48k_stereo.adts");
+        let cfg: RtmpOutputConfig = serde_json::from_value(serde_json::json!({
+            "id": "r1", "name": "r1", "dest_url": "rtmp://127.0.0.1/app", "stream_key": "k",
+            "audio_encode": { "codec": "aac_lc", "channels": 1, "sample_rate": 44100 }
+        }))
+        .unwrap();
+        let mut demux = TsDemuxer::new(None);
+        demux.demux(&crate::engine::ts_test_fixtures::aac_program_ts(ADTS));
+        assert_eq!(demux.cached_aac_config(), Some((1, 3, 2)), "a stereo 48 kHz source");
+        let (events, _rx) = crate::manager::events::event_channel();
+        let stats = Arc::new(OutputStatsAccumulator::new("r1".into(), "r1".into(), "rtmp".into()));
+        let st = build_encoder_state(&cfg, &demux, true, &CancellationToken::new(), &stats, "f", &events);
+        let EncoderState::Active { encoder, mut stage, .. } = st else {
+            panic!("the output must re-encode, not fail");
+        };
+        let p = encoder.params();
+        assert_eq!((p.sample_rate, p.channels), (44_100, 1), "the encoder takes the output format");
+        assert_eq!((p.target_sample_rate, p.target_channels), (44_100, 1));
+        let out = stage.process(&[vec![0.1f32; 1024], vec![0.1f32; 1024]], 48_000).unwrap();
+        assert_eq!(out.len(), 1, "the stage mixes to mono");
+        assert!(stage.delay() > 0, "and resamples, in streaming mode");
+    }
 
     /// Verify the exponential backoff schedule matches the docstring above.
     #[test]

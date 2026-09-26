@@ -1600,7 +1600,7 @@ fn demux_decode_loop(
                         last_audio_codec_label = Some(codec_label);
                     }
                     if current_ff_codec != Some(codec) {
-                        ff_audio_decoder = FfAudioDecoder::open(codec).ok();
+                        ff_audio_decoder = crate::engine::audio_decode::open_ff_decoder(codec).ok();
                         current_ff_codec = Some(codec);
                     }
                     if let Some(decoder) = ff_audio_decoder.as_mut() {

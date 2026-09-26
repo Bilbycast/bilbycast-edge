@@ -1569,7 +1569,7 @@ async fn run(
 
     // Pre-flight Phase 3 re-encoders.
     if let Some(enc_cfg) = &config.audio_encode {
-        match AudioReencoder::new(enc_cfg, &cancel, &config.id, flow_id) {
+        match AudioReencoder::new(enc_cfg, config.transcode.as_ref(), &cancel, &config.id, flow_id) {
             Ok(reenc) => {
                 tracing::info!(
                     "CMAF output '{}': audio re-encode active codec={} silent_fallback={}",
@@ -1886,7 +1886,7 @@ fn handle_other_audio_frame(
         return;
     };
     if state.ff_audio_decoder.is_none() {
-        match video_engine::AudioDecoder::open(codec) {
+        match crate::engine::audio_decode::open_ff_decoder(codec) {
             Ok(d) => state.ff_audio_decoder = Some(d),
             Err(_) => return,
         }
@@ -1904,45 +1904,6 @@ fn handle_other_audio_frame(
     }
     if decoded.is_empty() {
         return;
-    }
-
-    // Lazy-build the audio track from the first decoded frame's params,
-    // resolved against any operator-supplied target on `audio_encode`.
-    if state.audio_seg.is_none() {
-        let (_, src_sr, src_ch) = decoded[0].clone();
-        let target_sr = config
-            .audio_encode
-            .as_ref()
-            .and_then(|e| e.sample_rate)
-            .unwrap_or(src_sr);
-        let target_ch = config
-            .audio_encode
-            .as_ref()
-            .and_then(|e| e.channels)
-            .unwrap_or(src_ch);
-        // AAC ASC: AOT=2 (LC), then sample-rate index + channel-config —
-        // mirrors `aac_audio_specific_config`'s layout.
-        let sr_idx = crate::engine::audio_decode::sr_index_from_hz(target_sr).unwrap_or(3);
-        let asc = aac_audio_specific_config(1, sr_idx, target_ch);
-        let track = AudioTrack::aac(
-            asc,
-            target_sr,
-            target_ch as u16,
-            config
-                .audio_encode
-                .as_ref()
-                .and_then(|e| e.bitrate_kbps)
-                .map(|k| k * 1000)
-                .unwrap_or(128_000),
-        );
-        state.audio_seg =
-                            Some(AudioSegmenter::new_from_seq(track, config.segment_duration_secs, state.resume_seq));
-        state.audio_ready = true;
-        tracing::info!(
-            "CMAF output '{}': audio track detected (re-encoded from \
-             stream_type 0x{:02X}) sr={} ch={}",
-            config.id, stream_type, target_sr, target_ch,
-        );
     }
 
     // CMAF wants AAC on the wire — without `audio_encode` we have no
@@ -1980,6 +1941,31 @@ fn handle_other_audio_frame(
                 );
             }
         }
+    }
+    // The track is the encoder's, built once the first frame has settled
+    // what it emits — the transcode block's rate and layout, or
+    // audio_encode's, or the source's — exactly as on the AAC path.
+    if state.audio_seg.is_none()
+        && let Some(reenc) = state.audio_reencoder.as_ref()
+        && let Some((profile, sr_idx, ch)) = reenc.encoder_track()
+    {
+        let sample_rate = codecs::sample_rate_from_index(sr_idx);
+        let bitrate = config
+            .audio_encode
+            .as_ref()
+            .and_then(|e| e.bitrate_kbps)
+            .map(|k| k * 1000)
+            .unwrap_or(128_000);
+        let track =
+            AudioTrack::aac(aac_audio_specific_config(profile, sr_idx, ch), sample_rate, ch as u16, bitrate);
+        state.audio_seg =
+            Some(AudioSegmenter::new_from_seq(track, config.segment_duration_secs, state.resume_seq));
+        state.audio_ready = true;
+        tracing::info!(
+            "CMAF output '{}': audio track detected (re-encoded from \
+             stream_type 0x{:02X}) sr={} ch={}",
+            config.id, stream_type, sample_rate, ch,
+        );
     }
     buffer_audio_frames(state, config, frames_to_buffer);
 }

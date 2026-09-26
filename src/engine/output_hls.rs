@@ -705,62 +705,109 @@ fn remux_ts_audio_inprocess(
         return Err("Opus not supported on HLS".into());
     }
 
-    // ── Collect audio PES data and determine source format ──
-    let mut audio_pes_list: Vec<(Vec<u8>, u64)> = Vec::new(); // (PES data, PTS)
-    let mut pes_buffer: Vec<u8> = Vec::with_capacity(16 * 1024);
-    let mut pes_started = false;
-
-    offset = 0;
-    while offset + TS_PACKET_SIZE <= segment.len() {
-        let pkt = &segment[offset..offset + TS_PACKET_SIZE];
-        offset += TS_PACKET_SIZE;
-
-        if pkt[0] != TS_SYNC_BYTE || ts_pid(pkt) != audio_pid || !ts_has_payload(pkt) {
-            continue;
-        }
-
-        let pusi = ts_pusi(pkt);
-        let payload_start = ts_payload_offset(pkt);
-        if payload_start >= TS_PACKET_SIZE {
-            continue;
-        }
-        let payload = &pkt[payload_start..];
-
-        if pusi {
-            // Flush previous PES
-            if pes_started && !pes_buffer.is_empty()
-                && let Some((es_data, pts)) = extract_pes_audio(&pes_buffer) {
-                    audio_pes_list.push((es_data, pts));
+    // ── Cut the audio into access units ──
+    //
+    // Across PES boundaries, not per PES: an AU that straddles two PES
+    // (legal whenever data_alignment_indicator is 0, and done by some
+    // broadcast muxers) was lost, and with it — the next PES then opening
+    // on its tail — every AU of the next PES. The cutter is the TS audio
+    // replacer's (`engine::audio_au`).
+    let mut aus: Vec<(Vec<u8>, Option<u64>)> = Vec::new();
+    match super::audio_au::AuFormat::for_stream_type(audio_stream_type) {
+        Some(fmt) => {
+            let mut cutter = super::audio_au::AuCutter::new(fmt);
+            offset = 0;
+            while offset + TS_PACKET_SIZE <= segment.len() {
+                let pkt = &segment[offset..offset + TS_PACKET_SIZE];
+                offset += TS_PACKET_SIZE;
+                if pkt[0] != TS_SYNC_BYTE || ts_pid(pkt) != audio_pid || !ts_has_payload(pkt) {
+                    continue;
                 }
-            pes_buffer.clear();
-            pes_buffer.extend_from_slice(payload);
-            pes_started = true;
-        } else if pes_started {
-            pes_buffer.extend_from_slice(payload);
+                let payload_start = ts_payload_offset(pkt);
+                if payload_start >= TS_PACKET_SIZE {
+                    continue;
+                }
+                cutter.push(ts_pusi(pkt), &pkt[payload_start..]);
+                while let Some(au) = cutter.next(false) {
+                    aus.push((au.data, au.pts.filter(|_| au.pes_start)));
+                }
+            }
+            while let Some(au) = cutter.next(true) {
+                aus.push((au.data, au.pts.filter(|_| au.pes_start)));
+            }
+        }
+        None => {
+            // A format the cutter does not frame (Opus on 0x06): whole PES,
+            // split per codec frame, the PES PTS on the first.
+            let mut pes_buffer: Vec<u8> = Vec::with_capacity(16 * 1024);
+            let mut pes_list: Vec<(Vec<u8>, u64)> = Vec::new();
+            let mut pes_started = false;
+            offset = 0;
+            while offset + TS_PACKET_SIZE <= segment.len() {
+                let pkt = &segment[offset..offset + TS_PACKET_SIZE];
+                offset += TS_PACKET_SIZE;
+                if pkt[0] != TS_SYNC_BYTE || ts_pid(pkt) != audio_pid || !ts_has_payload(pkt) {
+                    continue;
+                }
+                let payload_start = ts_payload_offset(pkt);
+                if payload_start >= TS_PACKET_SIZE {
+                    continue;
+                }
+                let payload = &pkt[payload_start..];
+                if ts_pusi(pkt) {
+                    if pes_started
+                        && let Some(p) = extract_pes_audio(&pes_buffer)
+                    {
+                        pes_list.push(p);
+                    }
+                    pes_buffer.clear();
+                    pes_buffer.extend_from_slice(payload);
+                    pes_started = true;
+                } else if pes_started {
+                    pes_buffer.extend_from_slice(payload);
+                }
+            }
+            if pes_started
+                && let Some(p) = extract_pes_audio(&pes_buffer)
+            {
+                pes_list.push(p);
+            }
+            if let Some(codec) = crate::engine::audio_decode::ff_codec_for_stream_type(audio_stream_type) {
+                for (es, pts) in &pes_list {
+                    for (k, f) in crate::engine::audio_decode::split_audio_codec_frames(es, codec)
+                        .into_iter()
+                        .enumerate()
+                    {
+                        aus.push((f.to_vec(), (k == 0).then_some(*pts)));
+                    }
+                }
+            }
         }
     }
-    // Flush last PES
-    if pes_started && !pes_buffer.is_empty()
-        && let Some((es_data, pts)) = extract_pes_audio(&pes_buffer) {
-            audio_pes_list.push((es_data, pts));
-        }
 
-    if audio_pes_list.is_empty() {
+    if aus.is_empty() {
         // No audio to re-encode — return original segment unchanged
         return Ok(segment.to_vec());
     }
 
-    // ── Decode all audio PES → PCM ──
-    let decoded_pcm = decode_audio_pes(&audio_pes_list, audio_stream_type)?;
+    // The source's AC-3 / E-AC-3 dialogue level, carried into an AC-3
+    // re-encode (libavcodec writes -31 otherwise).
+    let dialnorm = aus
+        .iter()
+        .find_map(|(au, _)| crate::engine::audio_decode::ac3_dialnorm(au));
+
+    // ── Decode all audio AUs → PCM ──
+    let decoded_pcm = decode_audio_aus(&aus, audio_stream_type)?;
 
     // ── Re-encode PCM → target codec ──
-    let encoded_frames = encode_audio_pcm(
+    let (encoded_frames, out_sr) = encode_audio_pcm(
         &decoded_pcm,
         codec,
         bitrate_kbps,
         sample_rate_override,
         channels_override,
         transcode.as_ref(),
+        dialnorm,
     )?;
 
     // ── Target signalling for the PMT ──
@@ -770,15 +817,7 @@ fn remux_ts_audio_inprocess(
     // source's convention. MP2 at 16 / 22.05 / 24 kHz is MPEG-2 LSF (0x04).
     let target = match codec {
         AudioCodec::AacLc | AudioCodec::HeAacV1 | AudioCodec::HeAacV2 => AudioTarget::Aac,
-        AudioCodec::Mp2 => {
-            let out_sr = transcode
-                .as_ref()
-                .and_then(|t| t.sample_rate)
-                .or(sample_rate_override)
-                .or_else(|| decoded_pcm.first().map(|f| f.sample_rate))
-                .unwrap_or(0);
-            AudioTarget::Mp2 { lsf: matches!(out_sr, 16_000 | 22_050 | 24_000) }
-        }
+        AudioCodec::Mp2 => AudioTarget::Mp2 { lsf: matches!(out_sr, 16_000 | 22_050 | 24_000) },
         AudioCodec::Ac3 => AudioTarget::Ac3 { flavour: TsFlavour::Atsc },
         AudioCodec::Opus => unreachable!("rejected above"),
     };
@@ -937,127 +976,118 @@ struct RemuxEncodedFrame {
     pts: u64,
 }
 
-/// Decode audio PES list to PCM frames. Handles AAC (stream_type 0x0F)
-/// via fdk-aac and MP2 / AC-3 / E-AC-3 (0x03/0x04, 0x80/0x81/0xC1,
-/// 0x87/0xC2) via the FFmpeg-backed audio decoder.
+/// Decode audio access units to PCM frames: AAC (stream_type 0x0F) via
+/// fdk-aac, MP2 / AC-3 / E-AC-3 (0x03/0x04, 0x80/0x81/0xC1, 0x87/0xC2) via
+/// the FFmpeg-backed decoder. An AU carrying its PES's PTS is timed by it;
+/// the rest follow on from the samples decoded before them.
 #[cfg(feature = "media-codecs")]
-fn decode_audio_pes(
-    pes_list: &[(Vec<u8>, u64)],
+fn decode_audio_aus(
+    aus: &[(Vec<u8>, Option<u64>)],
     audio_stream_type: u8,
 ) -> Result<Vec<PcmFrame>, String> {
     if audio_stream_type == 0x0F {
-        return decode_audio_pes_aac(pes_list);
+        return decode_audio_aus_aac(aus);
     }
     if let Some(codec) = crate::engine::audio_decode::ff_codec_for_stream_type(
         audio_stream_type,
     ) {
-        return decode_audio_pes_ffmpeg(pes_list, codec);
+        return decode_audio_aus_ffmpeg(aus, codec);
     }
     Err(format!(
         "unsupported input audio stream type 0x{audio_stream_type:02X} for re-encoding"
     ))
 }
 
+/// The PTS of the next decoded frame: its AU's own, or where the previous
+/// frame ended.
+#[cfg(feature = "media-codecs")]
+fn next_pts(au_pts: Option<u64>, running: &mut Option<u64>) -> Option<u64> {
+    if au_pts.is_some() {
+        *running = au_pts;
+    }
+    *running
+}
+
 #[cfg(all(feature = "media-codecs", feature = "fdk-aac"))]
-fn decode_audio_pes_aac(pes_list: &[(Vec<u8>, u64)]) -> Result<Vec<PcmFrame>, String> {
+fn decode_audio_aus_aac(aus: &[(Vec<u8>, Option<u64>)]) -> Result<Vec<PcmFrame>, String> {
     let mut decoder = aac_audio::AacDecoder::open_adts()
         .map_err(|e| format!("AAC decoder init failed: {e}"))?;
-
     let mut pcm_frames = Vec::new();
-
-    for (es_data, pts) in pes_list {
-        // es_data may contain multiple concatenated ADTS frames
-        let mut pos = 0;
-        let mut frame_pts = *pts;
-
-        while pos + 7 <= es_data.len() {
-            // Check ADTS sync word
-            if es_data[pos] != 0xFF || (es_data[pos + 1] & 0xF0) != 0xF0 {
-                break;
-            }
-
-            let protection_absent = (es_data[pos + 1] & 0x01) != 0;
-            let header_len = if protection_absent { 7 } else { 9 };
-            if pos + header_len > es_data.len() { break; }
-
-            // Frame length from ADTS header
-            let frame_len = (((es_data[pos + 3] & 0x03) as usize) << 11)
-                | ((es_data[pos + 4] as usize) << 3)
-                | ((es_data[pos + 5] as usize) >> 5);
-
-            if frame_len < header_len || pos + frame_len > es_data.len() {
-                break;
-            }
-
-            let adts_frame = &es_data[pos..pos + frame_len];
-            match decoder.decode_frame(adts_frame) {
-                Ok(decoded) => {
-                    let sr = decoder.sample_rate().unwrap_or(48000);
-                    let ch = decoder.channels().unwrap_or(2);
-                    pcm_frames.push(PcmFrame {
-                        planar: decoded.planar,
-                        pts: frame_pts,
-                        sample_rate: sr,
-                        channels: ch,
-                    });
-                    // Advance PTS
+    let mut running = None;
+    for (au, au_pts) in aus {
+        let pts = next_pts(*au_pts, &mut running);
+        match decoder.decode_frame(au) {
+            Ok(decoded) => {
+                let sr = decoder.sample_rate().unwrap_or(48000);
+                let ch = decoder.channels().unwrap_or(2);
+                if let Some(p) = pts {
+                    pcm_frames.push(PcmFrame { planar: decoded.planar, pts: p, sample_rate: sr, channels: ch });
                     if sr > 0 {
-                        frame_pts += (decoded.frame_size as u64) * 90_000 / sr as u64;
+                        running = Some(p + (decoded.frame_size as u64) * 90_000 / sr as u64);
                     }
                 }
-                Err(e) => {
-                    tracing::debug!("AAC decode error in HLS remux: {e}");
-                }
             }
-
-            pos += frame_len;
+            Err(e) => {
+                tracing::debug!("AAC decode error in HLS remux: {e}");
+            }
         }
     }
-
     Ok(pcm_frames)
 }
 
 #[cfg(all(feature = "media-codecs", not(feature = "fdk-aac")))]
-fn decode_audio_pes_aac(_pes_list: &[(Vec<u8>, u64)]) -> Result<Vec<PcmFrame>, String> {
+fn decode_audio_aus_aac(_aus: &[(Vec<u8>, Option<u64>)]) -> Result<Vec<PcmFrame>, String> {
     Err("AAC decoding requires the fdk-aac feature".into())
 }
 
 #[cfg(feature = "media-codecs")]
-fn decode_audio_pes_ffmpeg(
-    pes_list: &[(Vec<u8>, u64)],
+fn decode_audio_aus_ffmpeg(
+    aus: &[(Vec<u8>, Option<u64>)],
     codec: video_codec::AudioDecoderCodec,
 ) -> Result<Vec<PcmFrame>, String> {
-    let mut decoder = video_engine::AudioDecoder::open(codec)
+    let mut decoder = crate::engine::audio_decode::open_ff_decoder(codec)
         .map_err(|e| format!("FFmpeg audio decoder init failed: {e}"))?;
     let mut pcm_frames = Vec::new();
-
-    for (es_data, pts) in pes_list {
-        let mut frame_pts = *pts;
-        for au in crate::engine::audio_decode::split_audio_codec_frames(es_data, codec) {
-            if decoder.send_packet(au, frame_pts as i64).is_err() {
+    let mut running = None;
+    for (au, au_pts) in aus {
+        next_pts(*au_pts, &mut running);
+        if decoder.send_packet(au, 0).is_err() {
+            continue;
+        }
+        while let Ok(frame) = decoder.receive_frame() {
+            let Some(p) = running else {
                 continue;
-            }
-            while let Ok(frame) = decoder.receive_frame() {
-                let sr = frame.sample_rate;
-                let ch = frame.channels;
-                let n_samples = frame.planar.first().map(|p| p.len()).unwrap_or(0);
-                pcm_frames.push(PcmFrame {
-                    planar: frame.planar,
-                    pts: frame_pts,
-                    sample_rate: sr,
-                    channels: ch,
-                });
-                if sr > 0 {
-                    frame_pts += (n_samples as u64) * 90_000 / sr as u64;
-                }
+            };
+            let sr = frame.sample_rate;
+            let n_samples = frame.planar.first().map(|p| p.len()).unwrap_or(0);
+            pcm_frames.push(PcmFrame {
+                planar: frame.planar,
+                pts: p,
+                sample_rate: sr,
+                channels: frame.channels,
+            });
+            if sr > 0 {
+                running = Some(p + (n_samples as u64) * 90_000 / sr as u64);
             }
         }
     }
-
     Ok(pcm_frames)
 }
 
-/// Re-encode PCM frames to the target codec.
+/// Re-encode PCM frames to the target codec. Returns the frames and the
+/// output sample rate.
+///
+/// The channel / rate stage in front of the encoder follows the rule every
+/// re-encoding output shares (`audio_transcode::encoder_stage`): the
+/// `transcode` block with `audio_encode`'s fields folded in, or those two
+/// alone when they differ from the source. Without a block the encoder was
+/// opened at `audio_encode.sample_rate` and fed PCM at the source's rate —
+/// 48 kHz through `sample_rate: 44100` played 8.8 % slow — and a channel
+/// count other than the source's was truncated or padded. The stage runs
+/// on the segment as a batch ([`super::audio_transcode::BatchStage`]):
+/// resampled in fixed chunks (a resampler rebuilt whenever the decoder's
+/// frame size changed restarted its delay line, a dropout), its output
+/// lined up with its input, and its tail run out at the end.
 #[cfg(feature = "media-codecs")]
 fn encode_audio_pcm(
     pcm_frames: &[PcmFrame],
@@ -1066,48 +1096,34 @@ fn encode_audio_pcm(
     sample_rate_override: Option<u32>,
     channels_override: Option<u8>,
     transcode: Option<&super::audio_transcode::TranscodeJson>,
-) -> Result<Vec<RemuxEncodedFrame>, String> {
+    dialnorm: Option<i8>,
+) -> Result<(Vec<RemuxEncodedFrame>, u32), String> {
     if pcm_frames.is_empty() {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), 0));
     }
 
     let source_sr = pcm_frames[0].sample_rate;
     let source_ch = pcm_frames[0].channels;
 
-    // Resolve the encoder target. When transcode is set, it wins and folds
-    // any audio_encode overrides as fallbacks; the planar transcoder then
-    // aligns every decoded frame to (target_sr, target_ch) before the
-    // encoder runs.
-    let (target_sr, target_ch, mut transcoder) = if let Some(tj_in) = transcode {
-        let merged = super::audio_transcode::TranscodeJson {
-            sample_rate: tj_in.sample_rate.or(sample_rate_override),
-            channels: tj_in.channels.or(channels_override),
-            ..tj_in.clone()
-        };
-        let tc = super::audio_transcode::PlanarAudioTranscoder::new(
-            source_sr, source_ch, &merged,
-        )
-        .map_err(|e| format!("transcode build failed: {e}"))?;
-        (tc.out_sample_rate(), tc.out_channels(), Some(tc))
-    } else {
-        (
-            sample_rate_override.unwrap_or(source_sr),
-            channels_override.unwrap_or(source_ch),
-            None,
-        )
-    };
+    let stage = super::audio_transcode::encoder_stage(
+        transcode,
+        sample_rate_override,
+        channels_override,
+        source_sr,
+        source_ch,
+        None,
+    )
+    .map_err(|e| format!("transcode build failed: {e}"))?;
+    let (target_sr, target_ch) = stage
+        .as_ref()
+        .map_or((source_sr, source_ch), |t| (t.out_sample_rate(), t.out_channels()));
+    let mut stage = super::audio_transcode::BatchStage::new(stage);
 
     // For AAC codecs, use fdk-aac directly
     #[cfg(feature = "fdk-aac")]
     if matches!(codec, AudioCodec::AacLc | AudioCodec::HeAacV1 | AudioCodec::HeAacV2) {
-        return encode_audio_pcm_aac(
-            pcm_frames,
-            codec,
-            bitrate_kbps,
-            target_sr,
-            target_ch,
-            transcoder.as_mut(),
-        );
+        return encode_audio_pcm_aac(pcm_frames, codec, bitrate_kbps, target_sr, target_ch, &mut stage)
+            .map(|f| (f, target_sr));
     }
 
     // For Opus/MP2/AC-3, use the video-engine AudioEncoder
@@ -1124,8 +1140,13 @@ fn encode_audio_pcm(
         channels: target_ch,
         bitrate_kbps,
     };
+    let dialnorm = dialnorm.map(|d| d.to_string());
+    let opts: Vec<(&str, &str)> = match (codec_type, dialnorm.as_deref()) {
+        (video_codec::AudioCodecType::Ac3, Some(d)) => vec![("dialnorm", d)],
+        _ => Vec::new(),
+    };
 
-    let mut encoder = video_engine::AudioEncoder::open(&config)
+    let mut encoder = video_engine::AudioEncoder::open_with_options(&config, &opts)
         .map_err(|e| format!("audio encoder open failed: {e}"))?;
 
     let frame_size = encoder.frame_size();
@@ -1133,47 +1154,18 @@ fn encode_audio_pcm(
     let mut accumulator: Vec<Vec<f32>> = vec![Vec::new(); target_ch as usize];
     let mut pts_90k = pcm_frames.first().map(|f| f.pts).unwrap_or(0);
 
-    for pcm in pcm_frames {
-        // Apply the optional planar transcoder first; without one the
-        // source PCM is fed in directly (matching the pre-transcode path).
-        let planar_for_encoder: Vec<Vec<f32>> =
-            if let Some(tc) = transcoder.as_mut() {
-                match tc.process(&pcm.planar) {
-                    Ok(p) => p,
-                    Err(e) => {
-                        tracing::debug!("transcode failed in HLS remux: {e}");
-                        continue;
-                    }
-                }
-            } else {
-                pcm.planar.clone()
-            };
-        // Accumulate samples (handle channel count mismatch by truncating/padding)
-        for ch in 0..target_ch as usize {
-            if ch < planar_for_encoder.len() {
-                accumulator[ch].extend_from_slice(&planar_for_encoder[ch]);
-            } else if !planar_for_encoder.is_empty() {
-                // Pad missing channels with silence
-                accumulator[ch].extend(
-                    std::iter::repeat_n(0.0f32, planar_for_encoder[0].len()),
-                );
-            }
-        }
-
-        // Encode complete frames
+    let mut encode_ready = |accumulator: &mut Vec<Vec<f32>>,
+                            encoder: &mut video_engine::AudioEncoder,
+                            encoded_frames: &mut Vec<RemuxEncodedFrame>| {
         while accumulator[0].len() >= frame_size {
             let frame_planar: Vec<Vec<f32>> = accumulator
                 .iter_mut()
                 .map(|ch| ch.drain(..frame_size).collect())
                 .collect();
-
             match encoder.encode_frame(&frame_planar) {
                 Ok(frames) => {
                     for ef in frames {
-                        encoded_frames.push(RemuxEncodedFrame {
-                            data: ef.data.to_vec(),
-                            pts: pts_90k,
-                        });
+                        encoded_frames.push(RemuxEncodedFrame { data: ef.data.to_vec(), pts: pts_90k });
                         let sr = encoder.sample_rate() as u64;
                         if sr > 0 {
                             pts_90k += (ef.num_samples as u64) * 90_000 / sr;
@@ -1185,6 +1177,22 @@ fn encode_audio_pcm(
                 }
             }
         }
+    };
+
+    for pcm in pcm_frames {
+        let planar_for_encoder = match stage.process(&pcm.planar) {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::debug!("transcode failed in HLS remux: {e}");
+                continue;
+            }
+        };
+        accumulate(&mut accumulator, &planar_for_encoder);
+        encode_ready(&mut accumulator, &mut encoder, &mut encoded_frames);
+    }
+    if let Ok(tail) = stage.finish() {
+        accumulate(&mut accumulator, &tail);
+        encode_ready(&mut accumulator, &mut encoder, &mut encoded_frames);
     }
 
     // Flush encoder
@@ -1201,7 +1209,21 @@ fn encode_audio_pcm(
         }
     }
 
-    Ok(encoded_frames)
+    Ok((encoded_frames, target_sr))
+}
+
+/// Append converted PCM to the encoder's accumulator: a channel it lacks is
+/// silence (the stage produces the target layout; this only guards a frame
+/// of another format that went through unconverted).
+#[cfg(feature = "media-codecs")]
+fn accumulate(accumulator: &mut [Vec<f32>], planar: &[Vec<f32>]) {
+    let n = planar.first().map_or(0, |c| c.len());
+    for (ch, acc) in accumulator.iter_mut().enumerate() {
+        match planar.get(ch) {
+            Some(src) => acc.extend_from_slice(src),
+            None => acc.extend(std::iter::repeat_n(0.0f32, n)),
+        }
+    }
 }
 
 /// Re-encode PCM to AAC using fdk-aac.
@@ -1212,7 +1234,7 @@ fn encode_audio_pcm_aac(
     bitrate_kbps: u32,
     target_sr: u32,
     target_ch: u8,
-    mut transcoder: Option<&mut super::audio_transcode::PlanarAudioTranscoder>,
+    stage: &mut super::audio_transcode::BatchStage,
 ) -> Result<Vec<RemuxEncodedFrame>, String> {
     let profile = match codec {
         AudioCodec::AacLc => aac_codec::AacProfile::AacLc,
@@ -1239,41 +1261,17 @@ fn encode_audio_pcm_aac(
     let mut accumulator: Vec<Vec<f32>> = vec![Vec::new(); target_ch as usize];
     let mut pts_90k = pcm_frames.first().map(|f| f.pts).unwrap_or(0);
 
-    for pcm in pcm_frames {
-        let planar_for_encoder: Vec<Vec<f32>> =
-            if let Some(tc) = transcoder.as_deref_mut() {
-                match tc.process(&pcm.planar) {
-                    Ok(p) => p,
-                    Err(e) => {
-                        tracing::debug!("transcode failed in HLS AAC remux: {e}");
-                        continue;
-                    }
-                }
-            } else {
-                pcm.planar.clone()
-            };
-        for ch in 0..target_ch as usize {
-            if ch < planar_for_encoder.len() {
-                accumulator[ch].extend_from_slice(&planar_for_encoder[ch]);
-            } else if !planar_for_encoder.is_empty() {
-                accumulator[ch].extend(
-                    std::iter::repeat_n(0.0f32, planar_for_encoder[0].len()),
-                );
-            }
-        }
-
+    let mut encode_ready = |accumulator: &mut Vec<Vec<f32>>,
+                            encoder: &mut aac_audio::AacEncoder,
+                            encoded_frames: &mut Vec<RemuxEncodedFrame>| {
         while accumulator[0].len() >= frame_size {
             let frame_planar: Vec<Vec<f32>> = accumulator
                 .iter_mut()
                 .map(|ch| ch.drain(..frame_size).collect())
                 .collect();
-
             match encoder.encode_frame(&frame_planar) {
                 Ok(encoded) => {
-                    encoded_frames.push(RemuxEncodedFrame {
-                        data: encoded.bytes,
-                        pts: pts_90k,
-                    });
+                    encoded_frames.push(RemuxEncodedFrame { data: encoded.bytes, pts: pts_90k });
                     let sr = target_sr as u64;
                     if sr > 0 {
                         pts_90k += (encoded.num_samples as u64) * 90_000 / sr;
@@ -1284,6 +1282,22 @@ fn encode_audio_pcm_aac(
                 }
             }
         }
+    };
+
+    for pcm in pcm_frames {
+        let planar_for_encoder = match stage.process(&pcm.planar) {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::debug!("transcode failed in HLS AAC remux: {e}");
+                continue;
+            }
+        };
+        accumulate(&mut accumulator, &planar_for_encoder);
+        encode_ready(&mut accumulator, &mut encoder, &mut encoded_frames);
+    }
+    if let Ok(tail) = stage.finish() {
+        accumulate(&mut accumulator, &tail);
+        encode_ready(&mut accumulator, &mut encoder, &mut encoded_frames);
     }
 
     Ok(encoded_frames)
@@ -1651,5 +1665,137 @@ mod pmt_remux_tests {
             .collect();
         assert!(!ids.is_empty(), "re-encoded audio in the segment");
         assert!(ids.iter().all(|&id| id == 0xBD), "AC-3 PES stream_id: {ids:02X?}");
+    }
+
+    /// A 2 s 48 kHz stereo segment (PAT, PMT with H.264 + AAC, AAC-LC ADTS
+    /// with a 1 kHz burst at sample `at`) whose audio PES are cut every 700
+    /// bytes — through AUs — each stamped with the PTS of the first AU that
+    /// commences in it. `(segment, source AU count, samples per AU)`.
+    fn burst_segment(at: usize) -> Vec<u8> {
+        let rate = 48_000usize;
+        let n = rate / 100;
+        let mut pcm = vec![0.0f32; rate * 2];
+        for k in 0..n {
+            let w = 0.5 - 0.5 * (2.0 * std::f32::consts::PI * k as f32 / (n - 1) as f32).cos();
+            pcm[at + k] = 0.5 * w * (2.0 * std::f32::consts::PI * 1000.0 * k as f32 / rate as f32).sin();
+        }
+        let mut e = aac_audio::AacEncoder::open(&aac_codec::EncoderConfig {
+            profile: aac_codec::AacProfile::AacLc,
+            sample_rate: 48_000,
+            channels: 2,
+            bitrate: 128_000,
+            afterburner: true,
+            sbr_signaling: aac_codec::SbrSignaling::default(),
+            transport: aac_codec::TransportType::Adts,
+        })
+        .unwrap();
+        let delay = e.codec_delay_samples() as i64;
+        let mut aus: Vec<(Vec<u8>, u64)> = Vec::new();
+        for (i, c) in pcm.chunks(1024).enumerate() {
+            let ed = e.encode_frame(&[c.to_vec(), c.to_vec()]).unwrap();
+            if !ed.bytes.is_empty() {
+                let first = aus.len() as i64 * 1024 - delay;
+                let _ = i;
+                aus.push((ed.bytes, (900_000 + first * 90_000 / 48_000) as u64));
+            }
+        }
+        let starts: Vec<usize> = aus
+            .iter()
+            .scan(0usize, |o, (b, _)| {
+                let s = *o;
+                *o += b.len();
+                Some(s)
+            })
+            .collect();
+        let es: Vec<u8> = aus.iter().flat_map(|(b, _)| b.clone()).collect();
+        let pmt = pmt_section(1, 0, 0x100, &[], &[(0x1B, 0x100, &[]), (0x0F, 0x101, &[])]);
+        let mut seg = pat_packet(&[(1, 0x1000)], 0, 0).to_vec();
+        seg.extend_from_slice(&packetize_sections(0x1000, &[&pmt], 0)[0]);
+        let mut cc = 0u8;
+        for (k, chunk) in es.chunks(700).enumerate() {
+            let off = k * 700;
+            let first = starts.iter().position(|&s| s >= off).unwrap_or(aus.len() - 1);
+            seg.extend(crate::engine::ts_test_fixtures::pes_packets(0x101, 0xC0, chunk, aus[first].1, &mut cc));
+        }
+        seg
+    }
+
+    /// The re-encoded audio of `out`: sample rate and channel-0 PCM.
+    fn decode_audio(out: &[u8]) -> (u32, Vec<f32>) {
+        let mut pes: Vec<Vec<u8>> = Vec::new();
+        for p in out.chunks(188) {
+            if crate::engine::ts_parse::ts_pid(p) != 0x101 || !crate::engine::ts_parse::ts_has_payload(p) {
+                continue;
+            }
+            let payload = &p[crate::engine::ts_parse::ts_payload_offset(p)..];
+            if crate::engine::ts_parse::ts_pusi(p) {
+                pes.push(payload.to_vec());
+            } else if let Some(l) = pes.last_mut() {
+                l.extend_from_slice(payload);
+            }
+        }
+        let mut d = aac_audio::AacDecoder::open_adts().unwrap();
+        let mut pcm = Vec::new();
+        for b in &pes {
+            let es = &b[9 + b[8] as usize..];
+            pcm.extend_from_slice(&d.decode_frame(es).unwrap().planar[0]);
+        }
+        (d.sample_rate().unwrap(), pcm)
+    }
+
+    /// Where the burst is in `pcm` (a 10 ms 1 kHz burst at `rate`).
+    fn burst_index(pcm: &[f32], rate: u32) -> usize {
+        let n = (rate / 100) as usize;
+        let b: Vec<f32> = (0..n)
+            .map(|k| {
+                let w = 0.5 - 0.5 * (2.0 * std::f32::consts::PI * k as f32 / (n - 1) as f32).cos();
+                w * (2.0 * std::f32::consts::PI * 1000.0 * k as f32 / rate as f32).sin()
+            })
+            .collect();
+        (0..pcm.len() - n)
+            .max_by(|&x, &y| {
+                let s = |k: usize| -> f32 { b.iter().zip(&pcm[k..]).map(|(p, q)| p * q).sum() };
+                s(x).total_cmp(&s(y))
+            })
+            .unwrap()
+    }
+
+    /// **B1 / B2 / B3 on HLS.** `audio_encode.sample_rate` with no
+    /// `transcode` block resamples, and the audio PES that cut through AUs
+    /// lose none of them: the burst comes out at its scaled position (plus
+    /// only the encoder's priming, which the per-segment re-encode starts
+    /// every segment with), in 44.1 kHz ADTS. Before, the encoder was opened
+    /// at 44.1 kHz and fed the 48 kHz PCM as it was — the burst at its
+    /// unscaled index, the audio 8.8 % slow — and each straddling AU (with
+    /// the rest of its next PES) was lost, moving the burst earlier.
+    #[test]
+    fn a_rate_override_without_a_transcode_block_resamples_every_au() {
+        let at = 48_000 + 333;
+        let seg = burst_segment(at);
+        let out = remux_ts_audio_inprocess(&seg, AudioCodec::AacLc, 128, Some(44_100), None, None)
+            .expect("remux");
+        let (rate, pcm) = decode_audio(&out);
+        assert_eq!(rate, 44_100, "the stream is 44.1 kHz");
+        // 2 s of source → ~88 200 samples (whole encoder frames).
+        assert!((pcm.len() as i64 - 88_200).abs() <= 2 * 1024, "{} samples: not the 48 kHz count", pcm.len());
+        // The source's own AAC priming is decoded too (2048 samples at
+        // 48 kHz, before the scaling), then the re-encode's (2048 at 44.1).
+        let expected = (at as f64 + 2048.0) * 44_100.0 / 48_000.0 + 2048.0;
+        let got = burst_index(&pcm, 44_100) as f64;
+        assert!((got - expected).abs() <= 3.0, "burst at {got}, expected {expected:.1}");
+    }
+
+    /// The same segment without an override: 48 kHz, every AU, the burst at
+    /// its own index plus the priming.
+    #[test]
+    fn a_straddling_au_is_re_encoded_on_hls() {
+        let at = 48_000 + 333;
+        let seg = burst_segment(at);
+        let out = remux_ts_audio_inprocess(&seg, AudioCodec::AacLc, 128, None, None, None).expect("remux");
+        let (rate, pcm) = decode_audio(&out);
+        assert_eq!(rate, 48_000);
+        let got = burst_index(&pcm, 48_000) as i64;
+        // The source's priming and the re-encode's, 2048 samples each.
+        assert!((got - (at as i64 + 4096)).abs() <= 2, "burst at {got}");
     }
 }

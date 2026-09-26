@@ -24,7 +24,7 @@ applicable / by design.
 | **ST 2110-30 / `rtp_audio`** | ✅ (auto via compressed-audio bridge) | ✅ (native PCM transcode, bit-depth + SRC + shuffle) | ❌ | Uncompressed PCM outputs; transcode is first-class here. |
 | **ST 2110-31** | ✅ | ❌ (AES3 opaque — channel labels inside SMPTE 337M payload, not addressable from the pipeline) | ❌ | |
 | **ST 2110-40** | ❌ | ❌ | ❌ | Ancillary data — no codec concept. |
-| **CMAF / CMAF-LL** | ✅ (AAC family only) | ✅ (requires `audio_encode`) | ✅ | fMP4 / CMAF segments with HLS m3u8 + DASH MPD; the operator's `gop_size` is honoured when `video_encode` is set (60 when unset) and segments cut on that GOP's IDRs, so choose one that divides `segment_duration × fps`. Codec work runs in `block_in_place`. See [`docs/cmaf.md`](cmaf.md) for the full reference. |
+| **CMAF / CMAF-LL** | ✅ (AAC family only) | ✅ (requires `audio_encode`; channel routing in the stage, the rate in the encoder's resampler — accepted and ignored before 2026-09) | ✅ | fMP4 / CMAF segments with HLS m3u8 + DASH MPD; the operator's `gop_size` is honoured when `video_encode` is set (60 when unset) and segments cut on that GOP's IDRs, so choose one that divides `segment_duration × fps`. Codec work runs in `block_in_place`. See [`docs/cmaf.md`](cmaf.md) for the full reference. |
 
 ---
 
@@ -528,6 +528,22 @@ the sample:
   7.1) is cut frame by frame and the core decoded — every core used to be
   discarded as a false sync, leaving no audio at all. A duplicate TS packet
   (same CC, same payload) is dropped.
+  **The same cutter frames the audio on every other path that decodes
+  it** (2026-09): the shared demuxer (`ts_demux::TsDemuxer`, behind the
+  display, SDI, CMAF, RTMP, WebRTC, ST 2110-30, `rtp_audio` outputs and
+  replay export), the HLS in-process remux, and the meters (content
+  analysis `audio_full`, the display's level bars —
+  `audio_decode::PidAudioDecoder`). Each parsed every PES on its own: the
+  ADTS walk stopped at the first byte of a PES that was not a sync word,
+  so a straddling AU **and every AU of the next PES** were lost; the MP2 /
+  AC-3 / E-AC-3 / LATM splitters dropped the two halves of a straddling
+  AU; content analysis never decoded AAC-LATM at all (it looked for ADTS
+  syncs in it). The demuxer now emits an `Aac` frame per AU as soon as it
+  is complete, timed from its PES's PTS or from the samples before it,
+  and an `OtherAudio` per PES holding the whole AUs that commenced in it
+  (one straddling into the next PES included) under that PES's PTS —
+  emitted at the next PUSI when nothing is pending, as before, or once
+  the straddling AU is complete.
 - **Latency.** Audio leaves the replacer about one AU after its last byte
   arrives instead of one PES — which on sources packing seven AUs per PES
   was up to 150 ms, and made an audio-only transcode's first AU of every PES
@@ -651,6 +667,71 @@ hard-clips instead of being soft-limited, and a stream carrying MPEG-4
 of being re-levelled, so `audio_full` loudness readings change for such
 streams.
 
+### AC-3 / E-AC-3 sources: no dynamic-range compression, consistent dither, dialnorm carried
+
+Every libavcodec audio decode in the edge — the TS replacer, RTMP,
+WebRTC, HLS, CMAF, SDI, ST 2110-30, the display (and its level bars) and
+content analysis — opens AC-3 and E-AC-3 through
+`audio_decode::open_ff_decoder` with two private options
+(`audio_decode::ff_decoder_options`):
+
+- **`drc_scale` 0 — no dynamic-range compression.** libavcodec applies the
+  bitstream's line-mode `dynrng` gains by default (`drc_scale` 1). The
+  re-encoded AC-3 carries no `dynrng`, so the compression was baked into
+  the programme and the receiver — which chooses line, RF or no
+  compression from the metadata — could no longer choose. A source
+  carrying it (ESPN, 448 kbps 5.1) decodes 24.7 dB SNR apart with and
+  without it; on the rig the edge's AC-3 re-encode of it matched the
+  compressed programme (27.9 dB SNR against a `drc_scale` 1 reference,
+  18.5 dB against the uncompressed one) and now matches the uncompressed
+  one (28.2 dB against `drc_scale` 0, 18.1 dB against 1 — 28.2 dB is what
+  FFmpeg's own AC-3 encoder reaches re-encoding that reference at 448 kbps
+  offline: 28.5 dB). Sources without `dynrng` (VH1, Nine) decode
+  bit-identically either way. Loudness measurement (BS.1770 in content
+  analysis) and baseband playout (SDI, ST 2110-30, the display) want the
+  uncompressed programme too. A source's heavy-compression word
+  (`compr`, RF mode) was never applied (libavcodec's `heavy_compr` is off)
+  and is not carried.
+- **`cons_noisegen` 1 — the dither that fills zero-bit mantissas is seeded
+  from each frame.** Run on across frames, as libavcodec does by default,
+  it made two decodes of the same frame differ unless both started at the
+  same frame: two decodes of the 192 kbps VH1 source differ at 33.5 dB
+  SNR. Seeded per frame, a frame always decodes to the same PCM, so a
+  re-encode is reproducible whatever frame the edge joined at, and a
+  reference decoded with `-cons_noisegen 1` measures only the re-encode.
+  **Measurement note:** a gate-6 reference decoded with ffmpeg's defaults
+  (run-on dither) now reads 33.5 dB against a VH1 AC-3 → AC-3 output; the
+  39.3 dB phase-2 figure came from the edge and the reference both
+  starting at the file's first frame, so their run-on dither happened to
+  coincide. Decode AC-3 / E-AC-3 references with
+  `-drc_scale 0 -cons_noisegen 1`.
+
+**`dialnorm` is carried into an AC-3 re-encode.** The dialogue level a
+receiver normalises to (line mode: to -31 dBFS) was libavcodec's default
+-31 on every AC-3 the edge wrote, so a -24 dB programme's transcode played
+**7 dB louder than its source** on every receiver that honours it (VH1,
+ESPN and Nine all carry -24; the broadcast SPTS sample -23). The TS
+replacer reads it from each AC-3 / E-AC-3 AU of the source
+(`audio_decode::ac3_dialnorm`; an E-AC-3 independent substream 0) and
+opens the AC-3 encoder with it and `per_frame_metadata`, and a change
+(programme vs ads) follows through `AudioEncoder::set_option` from the
+encoder's next frame — within one frame plus the pipeline's latency of
+where the source changed. HLS writes the segment's first value. An MP2 /
+AAC source has none, and the default -31 stays. Not carried: `bsmod`,
+`dsurmod`, the mix levels, `dynrng` / `compr` (libavcodec's AC-3 encoder
+writes no DRC words); an AC-3 source re-encoded to AAC or MP2 loses its
+dialnorm, so such a transcode plays louder than its source by
+(-31 - dialnorm) dB on a receiver that normalised the source.
+
+**What the remaining VH1 gap is.** Phase 2 measured an AC-3 → AC-3
+transcode of VH1 at 39.3 dB against the 59 dB of MP2 / AAC → AC-3 cells.
+It is not DRC (VH1 carries none) and not the edge: against a
+`-drc_scale 0 -cons_noisegen 1` reference the edge's 448 kbps output
+reads 39.1 dB, and FFmpeg's AC-3 encoder re-encoding that same reference
+offline reads 39.25 dB (45.7 dB at 640 kbps). A 192 kbps AC-3 source is
+full of dither noise in its zero-bit bands, which a re-encode has to spend
+bits on; band-limited MP2 / AAC sources are not.
+
 ### Engine internals
 
 - Core stage: `src/engine/ts_audio_replace.rs` (streaming `TsAudioReplacer`);
@@ -705,18 +786,64 @@ The three channel-routing forms (`channel_map`, `channel_map_with_gain`,
 
 ### Resolution rule
 
-When both blocks set the same field, `transcode` wins. `audio_encode`'s
-`sample_rate` / `channels` are used as fallbacks for fields that
-`transcode` leaves unset. Example:
+One rule, on every output and input that re-encodes audio (the TS outputs
+and TS-carrying inputs through the audio replacer, RTMP, HLS, WebRTC,
+CMAF): the stage between the decoder and the encoder is
+`audio_transcode::encoder_stage`.
 
-- `audio_encode.channels = 2` + `transcode.channels = 1` → encoder sees
-  mono PCM (transcode wins).
-- `audio_encode.sample_rate = 44100` + `transcode.sample_rate` unset →
-  encoder ingests at 44100 Hz (fallback).
-- Neither set → encoder follows the source.
-- No `transcode` block, `audio_encode.sample_rate` / `channels` differing
-  from the source → on the TS outputs and TS inputs the audio replacer
-  converts to them itself (see "Audio timing in the TS audio replacer").
+- **A `transcode` block wins.** `audio_encode.sample_rate` / `channels`
+  fill the fields it leaves unset.
+  - `audio_encode.channels = 2` + `transcode.channels = 1` → the stage
+    mixes to mono (transcode wins).
+  - `audio_encode.sample_rate = 44100` + `transcode.sample_rate` unset →
+    the stage resamples to 44.1 kHz and the encoder takes 44.1 kHz PCM.
+- **No block: `audio_encode.sample_rate` / `channels` alone convert** when
+  they differ from the decoded source — rubato SRC for the rate; for the
+  channel count the standard downmix (ITU-R BS.775 for 5.1 / 7.1 →
+  stereo, Lt/Rt for quad → stereo), the transcode stage's defaults for
+  mono ↔ stereo, otherwise the channels in order with silence for any
+  missing. They used to be bare encoder parameters: the TS replacer and
+  HLS opened the encoder at the new rate and fed
+  it the source's PCM, so a 48 kHz source through `sample_rate: 44100`
+  played 8.13 % slow and through `32000` 33.3 % slow — the gate-2
+  arrival slope measured exactly that — while RTMP refused a channel
+  count other than the source's (a Critical `audio_encode` event, no
+  audio) and WebRTC dropped every frame (`planar channel count !=
+  configured`). CMAF took L / R of a 5.1 source and lost the centre, and
+  ignored a `transcode` block it accepted.
+- **Neither set → the encoder follows the source.**
+- **Once the encoder is open its format is fixed**; a source that changes
+  rate or channel count in-band is converted to it (a block whose routing
+  does not fit the new layout gives way to the default conversion).
+
+The stage always runs in **streaming mode** (fixed 256-frame resampler
+chunks, `STREAM_CHUNK_FRAMES`), so its delay is a constant, and each
+output takes it off its stamps:
+
+- TS outputs / TS inputs: latched with the codec pipeline's latency (see
+  "Audio timing in the TS audio replacer").
+- RTMP, WebRTC: `AudioEncoder::set_upstream_delay` — the encoder's anchor
+  (first submit, or first after a re-anchor) subtracts it with the codec's
+  priming.
+- HLS: each segment is re-encoded on its own, through a
+  `BatchStage` that drops the resampler's zero history at the head and runs
+  its queue and delay line out at the end, so the segment's audio lines up
+  with its source sample for sample and needs no correction.
+- CMAF: the stage routes channels only, at the source's rate; the rate
+  goes to the encoder's own resampler (next bullet).
+
+`AudioEncoder`'s own resampler (the rate conversion RTMP / WebRTC / CMAF
+reach when the encoder's input rate differs from its target, and Opus's
+44.1 → 48 kHz) now has its delay taken off the anchor too — rubato's
+figure for the sinc-64 filter, 32 output frames and more (0.7 ms at
+44.1 → 48 kHz), which presented the audio that much late.
+
+Exceptions that do not go through the stage: the PCM inputs (ST 2110-30,
+`rtp_audio`, MXL audio) refuse an AAC `audio_encode.sample_rate` /
+`channels` that differs from the input at bring-up
+(`AacSampleRateMismatch` / `AacChannelCountMismatch`), loudly; the SDI
+input opens its encoder at the capture's format and does not apply them
+(open item — the `sdi-decklink` build could not be compiled here).
 
 On WebRTC: Opus is always 48 kHz on the wire. `transcode.sample_rate`
 only chooses the PCM rate the encoder ingests; Opus resamples
@@ -731,19 +858,30 @@ channel count; if unset, the Opus encoder follows the source.
   ST 2110-30.
 - Fast paths: full passthrough when rate+channels+matrix are identity,
   matrix-only when rates match, matrix+rubato otherwise.
+- Built by `audio_transcode::encoder_stage` (the resolution rule above)
+  in **streaming mode** (`with_fixed_chunk`, `STREAM_CHUNK_FRAMES` = 256):
+  the resampler runs on fixed chunks from a queue, so it is built once and
+  its delay is a constant the stamps cancel. The default mode — which
+  RTMP, HLS and WebRTC used until 2026-09 — builds the resampler for the
+  first call's length and rebuilds it (restarting its delay line, a
+  dropout, and moving the audio by the delay) whenever the decoder's frame
+  size changes: AC-3 1536 next to E-AC-3 256-sample blocks, an MP2 1152,
+  an AAC-LC / HE-AAC switch.
 - Wiring:
-  - TS outputs (SRT / UDP / RTP / RIST): inserted inside
-    `ts_audio_replace::TsAudioReplacer` between decoder and encoder, in
-    **streaming mode** (`with_fixed_chunk`): the resampler runs on fixed
-    256-frame chunks from a queue, so it is built once and its delay is a
-    constant the output stamps cancel. The default mode rebuilds it (and
-    restarts its delay line, a dropout) whenever the decoder's frame size
-    changes; RTMP / HLS / WebRTC still use that mode.
-  - RTMP: `EncoderState::Active.transcoder`; disables the same-codec
-    fast path because PCM must be decoded to apply the shuffle.
-  - HLS: constructed fresh per segment inside `remux_ts_audio_inprocess`.
-  - WebRTC: `WebrtcEncoderState::Active.transcoder`, on both the WHEP
-    viewer loop and the WHIP client loop.
+  - TS outputs (SRT / UDP / RTP / RIST) and TS inputs: inside
+    `ts_audio_replace::TsAudioReplacer` between decoder and encoder.
+  - RTMP: `EncoderState::Active.stage` (`audio_transcode::EncoderStage`,
+    which follows an in-band format change to the output format; the
+    samples queued in the old resampler, at most a chunk plus its delay
+    line, are lost at such a change), for AAC and for MP2 / AC-3 /
+    E-AC-3 sources alike; disables the same-codec fast path because PCM
+    must be decoded to apply the shuffle.
+  - HLS: an `audio_transcode::BatchStage`, fresh per segment inside
+    `remux_ts_audio_inprocess`.
+  - WebRTC: `WebrtcEncoderState::Active.stage`, on both the WHEP viewer
+    loop and the WHIP client loop.
+  - CMAF: `cmaf::encode::AudioReencoder`, channel routing only (the rate
+    in the encoder's resampler).
 
 ### Example — downmix a 5.1 AAC source to stereo on an SRT TS output
 
@@ -1363,6 +1501,23 @@ covers the four-step opt-in procedure (qdisc → boot-time systemd unit
 
 Keep this list up to date. When something is addressed, move it to a
 commit message or release note and delete the bullet.
+
+### Audio re-encode gaps found in 2026-09 (not fixed)
+
+- **HLS re-encodes each segment on its own.** Every segment's encoder
+  starts from priming (AAC-LC 2048 samples, MP2 481, AC-3 256) and the
+  segment's audio is stamped from its first source PTS, so the content
+  presents that much late; the fdk AAC path never flushes the encoder, so
+  the samples in its delay line at the segment's end are not emitted. The
+  channel / rate stage lines up exactly (`BatchStage`); the encoder does
+  not. A continuous encoder across segments is the fix.
+- **RTMP (and WebRTC) `audio_encode` on an MP2 / AC-3 / E-AC-3 source
+  without `silent_fallback`** never builds its encoder — it is built from
+  the demuxer's cached ADTS config, which such a source never provides —
+  so the output carries no audio. With `silent_fallback` the eager encoder
+  takes the source through the stage.
+- **The SDI input ignores `audio_encode.sample_rate` / `channels`** (the
+  encoder is opened at the capture's format).
 
 ### MVP-era limits for `video_encode`
 

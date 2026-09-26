@@ -130,11 +130,15 @@ pub enum DemuxedFrame {
         #[cfg(all(feature = "display", target_os = "linux"))]
         pts: u64,
     },
-    /// AAC audio frame (raw, ADTS header stripped).
+    /// One AAC access unit (raw, ADTS header stripped), emitted as soon as
+    /// it is complete — cut across PES boundaries, so an AU that straddles
+    /// two PES is one frame like any other.
     Aac {
         /// Raw AAC frame data (without ADTS header).
         data: Vec<u8>,
-        /// Presentation timestamp in 90 kHz clock ticks.
+        /// Presentation timestamp in 90 kHz clock ticks: its PES's PTS when
+        /// it is the first AU that commences in that PES, else where the
+        /// samples before it end.
         pts: u64,
     },
     /// Non-AAC compressed audio frame (MP2 / AC-3 / E-AC-3 / AC-4) —
@@ -149,22 +153,17 @@ pub enum DemuxedFrame {
         /// 0x80/0x81/0xC1 = AC-3, 0x87/0xC2 = E-AC-3,
         /// 0xAC = AC-4 [synthetic — see [`SYNTHETIC_STREAM_TYPE_AC4`]]).
         stream_type: u8,
-        /// Concatenated codec frames extracted from the PES payload.
-        /// The receiver can split on codec sync words (0x0B 0x77 for
-        /// AC-3 / E-AC-3, MPEG-1 sync for MP2).
+        /// The whole access units that commenced in one PES —
+        /// concatenated, an AU that straddles into the next PES included,
+        /// never a fragment (MP2 / AC-3 / E-AC-3 / LATM, cut by the shared
+        /// `audio_au` cutter). AC-4 is the whole PES payload. The receiver
+        /// splits on codec sync words (0x0B 0x77 for AC-3 / E-AC-3,
+        /// MPEG-1 sync for MP2, LOAS sync for LATM).
         data: Vec<u8>,
-        /// Presentation timestamp in 90 kHz clock ticks.
+        /// Presentation timestamp in 90 kHz clock ticks: that PES's PTS.
         pts: u64,
     },
 }
-
-/// ADTS `sampling_frequency_index` → Hz (ISO/IEC 14496-3 Table 1.18).
-/// Indices 13–15 are reserved/escape (the 24-bit explicit-rate escape
-/// never appears in ADTS) — mapped to 0 so callers fall back.
-const ADTS_SAMPLE_RATES: [u32; 16] = [
-    96_000, 88_200, 64_000, 48_000, 44_100, 32_000, 24_000, 22_050, 16_000, 12_000, 11_025,
-    8_000, 7_350, 0, 0, 0,
-];
 
 /// Verdict of [`sniff_annexb_codec`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -244,6 +243,80 @@ pub fn sniff_annexb_codec(nalus: &[Vec<u8>]) -> Option<SniffedVideoCodec> {
     }
 }
 
+/// Access-unit framing of the selected audio PID, for the formats the
+/// shared cutter frames (ADTS, LATM / LOAS, MPEG-1 audio, AC-3 / E-AC-3).
+///
+/// The audio PES are not parsed one by one: an AU that straddles two PES
+/// (legal whenever `data_alignment_indicator` is 0, and done by some
+/// broadcast muxers — Sky Sports Arena three times a loop) was lost, and
+/// with it, the next PES then opening on its tail, every AU of the next PES
+/// (the ADTS walk stopped at the first byte that was not a sync word). The
+/// TS audio replacer's cutter (`engine::audio_au`) rebuilds the stream and
+/// cuts whole AUs across PES boundaries, for every consumer of this
+/// demuxer: the display, SDI, CMAF, RTMP, WebRTC, ST 2110-30 and replay
+/// export.
+struct AudioAuFramer {
+    stream_type: u8,
+    cutter: crate::engine::audio_au::AuCutter,
+    /// `OtherAudio`: the AUs that commenced in the current PES, not yet
+    /// emitted, and that PES's presentation time.
+    group: Vec<u8>,
+    group_pts: u64,
+    /// Where the next AU is presented: the last PES PTS, the samples since
+    /// it, at `rate` (0 = unknown — LATM does not say in its header).
+    anchor: Option<(u64, u64, u32)>,
+}
+
+impl AudioAuFramer {
+    fn new(stream_type: u8, fmt: crate::engine::audio_au::AuFormat) -> Self {
+        Self {
+            stream_type,
+            cutter: crate::engine::audio_au::AuCutter::new(fmt),
+            group: Vec::new(),
+            group_pts: 0,
+            anchor: None,
+        }
+    }
+
+    /// Presentation time of `au` — its PES's PTS when it is the first AU
+    /// that commences there, else where the samples before it end — and
+    /// count its samples on. 0 until a PTS has been seen, as a PES without
+    /// one always read.
+    fn place(&mut self, au: &crate::engine::audio_au::CutAu) -> u64 {
+        let h = au.header;
+        if au.pes_start
+            && let Some(pts) = au.pts
+        {
+            self.anchor = Some((pts, 0, h.sample_rate));
+        }
+        let Some((base, samples, rate)) = self.anchor.as_mut() else {
+            return 0;
+        };
+        if *rate != h.sample_rate && h.sample_rate != 0 {
+            // A rate change: count on from here at the new rate.
+            let at = if *rate == 0 { *base } else { *base + *samples * 90_000 / *rate as u64 };
+            *base = at;
+            *samples = 0;
+            *rate = h.sample_rate;
+        }
+        let pts = if *rate == 0 { *base } else { *base + *samples * 90_000 / *rate as u64 };
+        *samples += h.samples as u64;
+        pts & 0x1_FFFF_FFFF
+    }
+
+    /// The pending `OtherAudio` group, if any.
+    fn take_group(&mut self) -> Option<DemuxedFrame> {
+        if self.group.is_empty() {
+            return None;
+        }
+        Some(DemuxedFrame::OtherAudio {
+            stream_type: self.stream_type,
+            data: std::mem::take(&mut self.group),
+            pts: self.group_pts,
+        })
+    }
+}
+
 /// Per-PID PES reassembly state.
 struct PesAssembler {
     /// Accumulated PES data.
@@ -302,6 +375,9 @@ pub struct TsDemuxer {
     scte35_pid: Option<u16>,
     /// Per-PID PES reassembly.
     pes_assemblers: HashMap<u16, PesAssembler>,
+    /// AU framing of the audio PID, for the formats the shared cutter frames
+    /// (`None`: its PES go through `pes_assemblers`, as Opus and AC-4 do).
+    audio_au: Option<AudioAuFramer>,
     /// Cached SPS NALU for late joiners.
     cached_sps: Option<Vec<u8>>,
     /// Cached PPS NALU for late joiners.
@@ -367,6 +443,7 @@ impl TsDemuxer {
             audio_pid: None,
             scte35_pid: None,
             pes_assemblers: HashMap::new(),
+            audio_au: None,
             cached_sps: None,
             cached_pps: None,
             cached_h265_vps: None,
@@ -402,6 +479,7 @@ impl TsDemuxer {
             audio_pid: None,
             scte35_pid: None,
             pes_assemblers: HashMap::new(),
+            audio_au: None,
             cached_sps: None,
             cached_pps: None,
             cached_h265_vps: None,
@@ -592,6 +670,7 @@ impl TsDemuxer {
                 self.audio_pid = None;
                 self.scte35_pid = None;
                 self.pes_assemblers.clear();
+                self.audio_au = None;
                 self.pmt_version = None;
                 if was_locked {
                     self.pending_discontinuity = true;
@@ -636,6 +715,9 @@ impl TsDemuxer {
 
         // Audio PID
         if Some(pid) == self.audio_pid {
+            if self.audio_au.is_some() {
+                return self.process_audio_packet(pkt);
+            }
             return self.process_es_packet(pkt, pid);
         }
 
@@ -875,6 +957,8 @@ impl TsDemuxer {
                         .unwrap_or_default(),
                 );
                 self.audio_pid = Some(selected_pid);
+                self.audio_au = crate::engine::audio_au::AuFormat::for_stream_type(selected_type)
+                    .map(|fmt| AudioAuFramer::new(selected_type, fmt));
                 self.pes_assemblers.insert(
                     selected_pid,
                     PesAssembler {
@@ -918,6 +1002,51 @@ impl TsDemuxer {
             // path (PES would route to a decoder that can't open).
             PrivateEsAudioKind::Dts | PrivateEsAudioKind::Smpte302m => None,
         }
+    }
+
+    /// Process a TS packet of the audio PID through its AU framer: an
+    /// `Aac` frame per ADTS AU (header stripped) the moment it is complete,
+    /// and for the other formats an `OtherAudio` per PES — the whole AUs
+    /// that commenced in it, including one that straddled into the next —
+    /// with that PES's PTS.
+    fn process_audio_packet(&mut self, pkt: &[u8]) -> Vec<DemuxedFrame> {
+        let mut out = Vec::new();
+        let Some(a) = self.audio_au.as_mut() else {
+            return out;
+        };
+        // A PES boundary with nothing pending: every AU of the previous PES
+        // is out, so its group is complete (the latency a per-PES parse had).
+        if ts_has_payload(pkt) && ts_pusi(pkt) && a.cutter.buffered() == 0 {
+            out.extend(a.take_group());
+        }
+        if !a.cutter.push_packet(pkt) {
+            return out;
+        }
+        while let Some(au) = a.cutter.next(false) {
+            let pts = a.place(&au);
+            if a.stream_type == STREAM_TYPE_AAC_ADTS {
+                let d = &au.data;
+                let header_len = if d[1] & 0x01 != 0 { 7 } else { 9 };
+                let cfg = ((d[2] >> 6) & 0x03, (d[2] >> 2) & 0x0F, ((d[2] & 0x01) << 2) | ((d[3] >> 6) & 0x03));
+                if self.cached_aac_config != Some(cfg) {
+                    tracing::debug!(
+                        "AAC config: profile={}, sample_rate_idx={}, channels={}",
+                        cfg.0 + 1, cfg.1, cfg.2,
+                    );
+                    self.cached_aac_config = Some(cfg);
+                }
+                out.push(DemuxedFrame::Aac { data: d[header_len..].to_vec(), pts });
+            } else {
+                if au.pes_start {
+                    out.extend(a.take_group());
+                }
+                if a.group.is_empty() {
+                    a.group_pts = pts;
+                }
+                a.group.extend_from_slice(&au.data);
+            }
+        }
+        out
     }
 
     /// Process a TS packet belonging to a known ES PID (video or audio).
@@ -1061,21 +1190,13 @@ impl TsDemuxer {
                     pts: pts.unwrap_or(0),
                 }]
             }
-            STREAM_TYPE_AAC_ADTS if Some(pid) == self.audio_pid => {
-                // A single PES may contain multiple ADTS frames concatenated.
-                self.extract_aac_frames(es_data, pts.unwrap_or(0))
-            }
-            // MP2 (0x03/0x04), AC-3 (0x80/0x81/0xC1), E-AC-3 (0x87/0xC2),
-            // AAC-LATM (0x11), AC-4 (synthetic 0xAC — passthrough only,
-            // no decoder available) — surface the PES payload so consumers
-            // that handle these codecs (the local-display ALSA path) can
-            // decode them via libavcodec; AC-4 consumers must ignore the
-            // bytes and leave the audio track silent. Other consumers
-            // ignore the variant entirely.
-            0x03 | 0x04 | 0x80 | 0x81 | 0x87 | 0xC1 | 0xC2 | STREAM_TYPE_AAC_LATM
-            | SYNTHETIC_STREAM_TYPE_AC4
-                if Some(pid) == self.audio_pid =>
-            {
+            // ADTS, MP2, AC-3 / E-AC-3 and AAC-LATM never get here: the
+            // audio PID's AU framer cuts them across PES boundaries
+            // (`process_audio_packet`). AC-4 (synthetic 0xAC — passthrough
+            // only, no decoder available) is surfaced per PES so consumers
+            // can label it; they must ignore the bytes and leave the audio
+            // track silent.
+            SYNTHETIC_STREAM_TYPE_AC4 if Some(pid) == self.audio_pid => {
                 vec![DemuxedFrame::OtherAudio {
                     stream_type,
                     data: es_data.to_vec(),
@@ -1120,85 +1241,6 @@ impl TsDemuxer {
             nalus.push(nalu);
         }
         nalus
-    }
-
-    /// Extract all AAC frames from ADTS-wrapped data.
-    /// Strips ADTS headers and refreshes the cached audio config from every
-    /// ADTS header. A single PES may contain multiple concatenated ADTS frames.
-    fn extract_aac_frames(&mut self, data: &[u8], base_pts: u64) -> Vec<DemuxedFrame> {
-        let mut frames = Vec::new();
-        let mut offset = 0;
-        let mut frame_index = 0u32;
-
-        while offset + 7 <= data.len() {
-            // Check ADTS sync word: 0xFFF
-            if data[offset] != 0xFF || (data[offset + 1] & 0xF0) != 0xF0 {
-                break;
-            }
-
-            let protection_absent = (data[offset + 1] & 0x01) != 0;
-            let header_len = if protection_absent { 7 } else { 9 };
-
-            if offset + header_len > data.len() {
-                break;
-            }
-
-            // Refresh the AAC config from this header. Every ADTS frame
-            // carries the full parameter set, so always-overwrite is the
-            // simplest way to track parameter changes (e.g. sample-rate
-            // shifts on input switches) without separate state-machine
-            // logic.
-            let profile = (data[offset + 2] >> 6) & 0x03;
-            let sample_rate_idx = (data[offset + 2] >> 2) & 0x0F;
-            let channel_config = ((data[offset + 2] & 0x01) << 2) | ((data[offset + 3] >> 6) & 0x03);
-            let new_cfg = (profile, sample_rate_idx, channel_config);
-            if self.cached_aac_config != Some(new_cfg) {
-                tracing::debug!(
-                    "AAC config: profile={}, sample_rate_idx={}, channels={}",
-                    profile + 1, sample_rate_idx, channel_config,
-                );
-                self.cached_aac_config = Some(new_cfg);
-            }
-
-            // ADTS frame length (13 bits): includes header + raw frame
-            let frame_length = (((data[offset + 3] & 0x03) as usize) << 11)
-                | ((data[offset + 4] as usize) << 3)
-                | ((data[offset + 5] >> 5) as usize);
-
-            if frame_length < header_len || offset + frame_length > data.len() {
-                break;
-            }
-
-            let raw_start = offset + header_len;
-            let raw_end = offset + frame_length;
-
-            if raw_start < raw_end {
-                // PTS offset for subsequent frames in the same PES: one
-                // ADTS frame is 1024 samples at the header-signalled
-                // (core) rate — also correct for HE-AAC, whose SBR
-                // doubling scales rate and samples together. The old
-                // hardcoded 1920-tick step (48 kHz only) fed a
-                // sawtooth into consumers that pace off these values
-                // (the ST 2110-30 RTP-timestamp steering) on 44.1/32 kHz
-                // and HE-AAC sources.
-                let adts_rate = ADTS_SAMPLE_RATES
-                    .get(sample_rate_idx as usize)
-                    .copied()
-                    .filter(|&r| r > 0)
-                    .unwrap_or(48_000) as u64;
-                let frame_ticks = 1024 * 90_000 / adts_rate;
-                let pts = base_pts + (frame_index as u64) * frame_ticks;
-                frames.push(DemuxedFrame::Aac {
-                    data: data[raw_start..raw_end].to_vec(),
-                    pts,
-                });
-            }
-
-            offset += frame_length;
-            frame_index += 1;
-        }
-
-        frames
     }
 }
 
@@ -1924,5 +1966,151 @@ mod tests {
         let encoded = [b0, b1, b2, b3, b4];
         let decoded = parse_pts(&encoded);
         assert_eq!(decoded, 90000);
+    }
+
+    // ── Audio AUs across PES boundaries ──
+
+    /// PAT + PMT with one H.264 video PID and an audio PID of `audio_st`.
+    fn pat_pmt_with_audio(audio_st: u8) -> Vec<u8> {
+        let mut pmt = build_pmt(0x100, 0x200, 0x300, 0);
+        pmt[22] = audio_st;
+        let crc = mpeg2_crc32(&pmt[5..27]);
+        pmt[27..31].copy_from_slice(&crc.to_be_bytes());
+        let mut ts = build_pat(0x100).to_vec();
+        ts.extend_from_slice(&pmt);
+        ts
+    }
+
+    /// TS packets of one audio PES on PID 0x300 carrying `es` with `pts`.
+    fn audio_pes_packets(es: &[u8], pts: u64, cc: &mut u8) -> Vec<u8> {
+        crate::engine::ts_test_fixtures::pes_packets(0x300, 0xC0, es, pts, cc)
+    }
+
+    /// An AAC-LC 48 kHz stereo ADTS frame of `len` bytes, body `fill`.
+    fn adts(len: usize, fill: u8) -> Vec<u8> {
+        let mut f = vec![fill; len];
+        f[0] = 0xFF;
+        f[1] = 0xF1;
+        f[2] = (1 << 6) | (3 << 2);
+        f[3] = (2 << 6) | ((len >> 11) as u8 & 0x03);
+        f[4] = (len >> 3) as u8;
+        f[5] = ((len as u8) << 5) | 0x1F;
+        f[6] = 0xFC;
+        f
+    }
+
+    /// An MPEG-1 layer II 48 kHz 192 kbps stereo frame (576 bytes), body
+    /// `fill`.
+    fn mp2(fill: u8) -> Vec<u8> {
+        let mut f = vec![fill; 576];
+        f[..4].copy_from_slice(&[0xFF, 0xFD, 0xA4, 0x04]);
+        f
+    }
+
+    /// An ADTS frame that straddles two PES — its head in one, its tail
+    /// opening the next — is demuxed whole, and so is every frame after
+    /// it, each at its own presentation time. The per-PES walk stopped at
+    /// the first byte of each PES that was not a sync word: the straddling
+    /// frame and the whole next PES were lost, on every path that decodes
+    /// through this demuxer (display, SDI, CMAF, RTMP, WebRTC, ST 2110-30).
+    #[test]
+    fn an_adts_frame_straddling_two_pes_is_demuxed_with_the_rest() {
+        const P0: u64 = 900_000;
+        let frames: Vec<Vec<u8>> = (0..7).map(|k| adts(300 + 10 * k, 0x11 * (k as u8 + 1))).collect();
+        let es: Vec<u8> = frames.concat();
+        // PES 1: frames 0-2 and the head of 3; PES 2: the tail of 3, 4, 5;
+        // PES 3: frame 6.
+        let cut1 = frames[..3].iter().map(|f| f.len()).sum::<usize>() + 100;
+        let cut2 = frames[..6].iter().map(|f| f.len()).sum::<usize>();
+        let mut ts = pat_pmt_with_audio(0x0F);
+        let mut cc = 0;
+        ts.extend(audio_pes_packets(&es[..cut1], P0, &mut cc));
+        ts.extend(audio_pes_packets(&es[cut1..cut2], P0 + 4 * 1920, &mut cc));
+        ts.extend(audio_pes_packets(&es[cut2..], P0 + 6 * 1920, &mut cc));
+        let mut demux = TsDemuxer::new(None);
+        let out: Vec<(Vec<u8>, u64)> = ts
+            .chunks(TS_PACKET_SIZE)
+            .flat_map(|p| demux.demux(p))
+            .filter_map(|f| match f {
+                DemuxedFrame::Aac { data, pts } => Some((data, pts)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(out.len(), 7, "every frame, the straddling one included");
+        for (k, (data, pts)) in out.iter().enumerate() {
+            assert_eq!(data.as_slice(), &frames[k][7..], "frame {k}, ADTS header stripped");
+            assert_eq!(*pts, P0 + k as u64 * 1920, "frame {k} at its own time");
+        }
+        assert_eq!(demux.cached_aac_config(), Some((1, 3, 2)));
+    }
+
+    /// MP2 (and AC-3 / E-AC-3 / LATM) surface as one `OtherAudio` per PES:
+    /// the whole AUs that commenced in it — one that straddles into the next
+    /// PES included — under that PES's PTS. The per-PES parse handed on the
+    /// straddling AU in two pieces, and the consumers' frame splitters
+    /// dropped both.
+    #[test]
+    fn mp2_frames_are_grouped_whole_by_the_pes_they_commence_in() {
+        const P0: u64 = 900_000;
+        let frames: Vec<Vec<u8>> = (0..7).map(|k| mp2(0x10 + k as u8)).collect();
+        let es: Vec<u8> = frames.concat();
+        let cut1 = 2 * 576 + 200;
+        let cut2 = 4 * 576;
+        let mut ts = pat_pmt_with_audio(0x03);
+        let mut cc = 0;
+        ts.extend(audio_pes_packets(&es[..cut1], P0, &mut cc));
+        ts.extend(audio_pes_packets(&es[cut1..cut2], P0 + 3 * 2160, &mut cc));
+        ts.extend(audio_pes_packets(&es[cut2..6 * 576], P0 + 4 * 2160, &mut cc));
+        ts.extend(audio_pes_packets(&es[6 * 576..], P0 + 6 * 2160, &mut cc));
+        let mut demux = TsDemuxer::new(None);
+        let groups: Vec<(u8, Vec<u8>, u64)> = ts
+            .chunks(TS_PACKET_SIZE)
+            .flat_map(|p| demux.demux(p))
+            .filter_map(|f| match f {
+                DemuxedFrame::OtherAudio { stream_type, data, pts } => Some((stream_type, data, pts)),
+                _ => None,
+            })
+            .collect();
+        let expect = [
+            (frames[..3].concat(), P0),
+            (frames[3].clone(), P0 + 3 * 2160),
+            (frames[4..6].concat(), P0 + 4 * 2160),
+        ];
+        assert_eq!(groups.len(), expect.len(), "the last PES's group waits for the next");
+        for (k, ((st, data, pts), (want, want_pts))) in groups.iter().zip(expect.iter()).enumerate() {
+            assert_eq!(*st, 0x03);
+            assert!(data == want, "group {k}: whole AUs only ({} bytes vs {})", data.len(), want.len());
+            assert_eq!(pts, want_pts, "group {k}");
+        }
+    }
+
+    /// A lost TS packet on the audio PID does not glue the two halves of a
+    /// damaged AU together: the cutter drops it and resyncs on the next
+    /// header, and the frames around it come through.
+    #[test]
+    fn a_lost_audio_packet_costs_only_the_damaged_frame() {
+        const P0: u64 = 900_000;
+        let frames: Vec<Vec<u8>> = (0..6).map(|_| adts(400, 0x22)).collect();
+        let mut ts = pat_pmt_with_audio(0x0F);
+        let mut cc = 0;
+        let pes = audio_pes_packets(&frames[..3].concat(), P0, &mut cc);
+        // Lose the second packet of the first PES (inside frame 0 / 1).
+        for (i, p) in pes.chunks(TS_PACKET_SIZE).enumerate() {
+            if i != 2 {
+                ts.extend_from_slice(p);
+            }
+        }
+        ts.extend(audio_pes_packets(&frames[3..].concat(), P0 + 3 * 1920, &mut cc));
+        let mut demux = TsDemuxer::new(None);
+        let pts: Vec<u64> = ts
+            .chunks(TS_PACKET_SIZE)
+            .flat_map(|p| demux.demux(p))
+            .filter_map(|f| match f {
+                DemuxedFrame::Aac { pts, .. } => Some(pts),
+                _ => None,
+            })
+            .collect();
+        assert!(pts.ends_with(&[P0 + 3 * 1920, P0 + 4 * 1920, P0 + 5 * 1920]), "{pts:?}");
+        assert!(pts.len() < 6, "the damaged frame is not passed on: {pts:?}");
     }
 }

@@ -53,14 +53,14 @@ enum WebrtcEncoderState {
         decoder: Option<AacDecoder>,
         encoder: AudioEncoder,
         decode_stats: Arc<DecodeStats>,
-        /// Optional planar PCM shuffle / sample-rate stage between the
-        /// decoder and the Opus encoder. `None` unless `config.transcode`
-        /// was set. When `transcode.channels` is set it wins over the Opus
-        /// encoder's channel count (the encoder reconfigures to match).
-        transcoder: Option<super::audio_transcode::PlanarAudioTranscoder>,
-        /// Retained so the transcoder can be planned on the first real
-        /// AAC frame when silent-fallback built the encoder eagerly.
-        pending_transcode_cfg: Option<super::audio_transcode::TranscodeJson>,
+        /// The channel / rate stage between the decoder and the Opus
+        /// encoder (`audio_transcode::encoder_stage`): the `transcode`
+        /// block, or `audio_encode.sample_rate` / `channels` alone when
+        /// they differ from the source, converting to the format the
+        /// encoder was opened at, in streaming mode (its constant delay is
+        /// taken off the encoder's stamps). An MP2 / AC-3 / E-AC-3 source
+        /// goes through it too.
+        stage: super::audio_transcode::EncoderStage,
         /// Silent-PCM generator + audio-drop watchdog. `Some` iff
         /// `audio_encode.silent_fallback = true`.
         silence: Option<SilenceGenerator>,
@@ -986,8 +986,7 @@ async fn whep_viewer_loop(
                                             decoder,
                                             encoder,
                                             decode_stats,
-                                            transcoder,
-                                            pending_transcode_cfg,
+                                            stage,
                                             silence,
                                         },
                                         Some(audio_mid),
@@ -996,15 +995,7 @@ async fn whep_viewer_loop(
                                     {
                                         if decoder.is_none()
                                             && let Some(c) = demuxer.cached_aac_config() {
-                                                let ep = encoder.params().clone();
-                                                webrtc_lazy_build_decoder_and_transcoder(
-                                                    decoder,
-                                                    transcoder,
-                                                    pending_transcode_cfg,
-                                                    &ep,
-                                                    c,
-                                                    output_id,
-                                                );
+                                                webrtc_lazy_build_decoder(decoder, c, output_id);
                                             }
                                         if let Some(sg) = silence.as_mut() {
                                             sg.mark_real_audio(pts);
@@ -1016,20 +1007,16 @@ async fn whep_viewer_loop(
                                         match dec.decode_frame(&data) {
                                             Ok(planar) => {
                                                 decode_stats.inc_output();
-                                                if let Some(tc) = transcoder.as_mut() {
-                                                    match tc.process(&planar) {
-                                                        Ok(shuffled) => {
-                                                            encoder.submit_planar(&shuffled, pts);
-                                                        }
-                                                        Err(e) => {
-                                                            tracing::debug!(
-                                                                "WHEP viewer '{}' transcode failed: {}",
-                                                                session_id, e
-                                                            );
-                                                        }
+                                                match stage.process(&planar, dec.sample_rate()) {
+                                                    Ok(pcm) => {
+                                                        encoder.submit_planar(&pcm, pts);
                                                     }
-                                                } else {
-                                                    encoder.submit_planar(&planar, pts);
+                                                    Err(e) => {
+                                                        tracing::debug!(
+                                                            "WHEP viewer '{}' transcode failed: {}",
+                                                            session_id, e
+                                                        );
+                                                    }
                                                 }
                                             }
                                             Err(_) => {
@@ -1080,7 +1067,7 @@ async fn whep_viewer_loop(
                                     }
                                     let (
                                         WebrtcEncoderState::Active {
-                                            encoder, silence, ..
+                                            encoder, silence, stage, ..
                                         },
                                         Some(audio_mid),
                                         Some(audio_pt),
@@ -1096,7 +1083,7 @@ async fn whep_viewer_loop(
                                         continue;
                                     };
                                     if ff_audio_codec != Some(codec) {
-                                        ff_audio_decoder = video_engine::AudioDecoder::open(codec).ok();
+                                        ff_audio_decoder = crate::engine::audio_decode::open_ff_decoder(codec).ok();
                                         ff_audio_codec = Some(codec);
                                     }
                                     let Some(dec) = ff_audio_decoder.as_mut() else {
@@ -1114,7 +1101,12 @@ async fn whep_viewer_loop(
                                             continue;
                                         }
                                         while let Ok(frame) = dec.receive_frame() {
-                                            encoder.submit_planar(&frame.planar, pts);
+                                            // To the encoder's format (a 5.1
+                                            // AC-3 source was refused, MP2 at
+                                            // another rate mislabelled).
+                                            if let Ok(pcm) = stage.process(&frame.planar, frame.sample_rate) {
+                                                encoder.submit_planar(&pcm, pts);
+                                            }
                                         }
                                     }
                                     for frame in encoder.drain() {
@@ -1484,8 +1476,7 @@ async fn whip_client_loop(
                                                 decoder,
                                                 encoder,
                                                 decode_stats,
-                                                transcoder,
-                                                pending_transcode_cfg,
+                                                stage,
                                                 silence,
                                             },
                                             Some(audio_mid),
@@ -1494,15 +1485,7 @@ async fn whip_client_loop(
                                         {
                                             if decoder.is_none()
                                                 && let Some(c) = demuxer.cached_aac_config() {
-                                                    let ep = encoder.params().clone();
-                                                    webrtc_lazy_build_decoder_and_transcoder(
-                                                        decoder,
-                                                        transcoder,
-                                                        pending_transcode_cfg,
-                                                        &ep,
-                                                        c,
-                                                        &config.id,
-                                                    );
+                                                    webrtc_lazy_build_decoder(decoder, c, &config.id);
                                                 }
                                             if let Some(sg) = silence.as_mut() {
                                                 sg.mark_real_audio(pts);
@@ -1514,20 +1497,16 @@ async fn whip_client_loop(
                                             match dec.decode_frame(&data) {
                                                 Ok(planar) => {
                                                     decode_stats.inc_output();
-                                                    if let Some(tc) = transcoder.as_mut() {
-                                                        match tc.process(&planar) {
-                                                            Ok(shuffled) => {
-                                                                encoder.submit_planar(&shuffled, pts);
-                                                            }
-                                                            Err(e) => {
-                                                                tracing::debug!(
-                                                                    "WHIP '{}' transcode failed: {}",
-                                                                    config.id, e
-                                                                );
-                                                            }
+                                                    match stage.process(&planar, dec.sample_rate()) {
+                                                        Ok(pcm) => {
+                                                            encoder.submit_planar(&pcm, pts);
                                                         }
-                                                    } else {
-                                                        encoder.submit_planar(&planar, pts);
+                                                        Err(e) => {
+                                                            tracing::debug!(
+                                                                "WHIP '{}' transcode failed: {}",
+                                                                config.id, e
+                                                            );
+                                                        }
                                                     }
                                                 }
                                                 Err(_) => {
@@ -1576,7 +1555,7 @@ async fn whip_client_loop(
                                         }
                                         let (
                                             WebrtcEncoderState::Active {
-                                                encoder, silence, ..
+                                                encoder, silence, stage, ..
                                             },
                                             Some(audio_mid),
                                             Some(audio_pt),
@@ -1592,7 +1571,7 @@ async fn whip_client_loop(
                                             continue;
                                         };
                                         if ff_audio_codec != Some(codec) {
-                                            ff_audio_decoder = video_engine::AudioDecoder::open(codec).ok();
+                                            ff_audio_decoder = crate::engine::audio_decode::open_ff_decoder(codec).ok();
                                             ff_audio_codec = Some(codec);
                                         }
                                         let Some(dec) = ff_audio_decoder.as_mut() else {
@@ -1610,7 +1589,9 @@ async fn whip_client_loop(
                                                 continue;
                                             }
                                             while let Ok(frame) = dec.receive_frame() {
-                                                encoder.submit_planar(&frame.planar, pts);
+                                                if let Ok(pcm) = stage.process(&frame.planar, frame.sample_rate) {
+                                                    encoder.submit_planar(&pcm, pts);
+                                                }
                                             }
                                         }
                                         for frame in encoder.drain() {
@@ -1765,37 +1746,34 @@ fn build_webrtc_encoder_state(
         return WebrtcEncoderState::Failed;
     }
 
-    // When a transcode block is set it wins: transcode.channels overrides
-    // the Opus encoder's channel count, and transcode.sample_rate (if set)
-    // chooses the PCM rate the encoder ingests. When unset the Opus encoder
-    // follows the source, matching the pre-transcode behaviour.
+    // The channel / rate stage converts the source to what the Opus encoder
+    // ingests: the transcode block when set (audio_encode's sample_rate /
+    // channels folded in for the fields it leaves unset — transcode.channels
+    // wins over the Opus encoder's channel count, transcode.sample_rate
+    // chooses the PCM rate it ingests), otherwise those two alone. Without a
+    // block, audio_encode.channels used to open the encoder at a channel
+    // count the decoded PCM did not have, and every frame was dropped.
     // Opus on the wire is always 48 kHz regardless of either block.
-    let (enc_in_sr, target_ch, transcoder) = if let Some(tj_in) = transcode {
-        let merged = super::audio_transcode::TranscodeJson {
-            sample_rate: tj_in.sample_rate,
-            channels: tj_in.channels.or(enc_cfg.channels),
-            ..tj_in.clone()
-        };
-        match super::audio_transcode::PlanarAudioTranscoder::new(
-            input_sr, ch_cfg, &merged,
-        ) {
-            Ok(tc) => (tc.out_sample_rate(), tc.out_channels(), Some(tc)),
-            Err(e) => {
-                let msg = format!(
-                    "WebRTC output '{output_id}': audio_encode transcode build failed: {e}"
-                );
-                tracing::error!("{msg}");
-                events.emit_flow(
-                    EventSeverity::Critical,
-                    crate::manager::events::category::AUDIO_ENCODE,
-                    msg,
-                    flow_id,
-                );
-                return WebrtcEncoderState::Failed;
-            }
+    let mut stage = super::audio_transcode::EncoderStage::new(
+        transcode.cloned(),
+        enc_cfg.sample_rate,
+        enc_cfg.channels,
+    );
+    let (enc_in_sr, target_ch) = match stage.prepare(input_sr, ch_cfg) {
+        Ok(out) => out,
+        Err(e) => {
+            let msg = format!(
+                "WebRTC output '{output_id}': audio_encode transcode build failed: {e}"
+            );
+            tracing::error!("{msg}");
+            events.emit_flow(
+                EventSeverity::Critical,
+                crate::manager::events::category::AUDIO_ENCODE,
+                msg,
+                flow_id,
+            );
+            return WebrtcEncoderState::Failed;
         }
-    } else {
-        (input_sr, enc_cfg.channels.unwrap_or(ch_cfg), None)
     };
     let target_br = enc_cfg.bitrate_kbps.unwrap_or_else(|| codec.default_bitrate_kbps());
 
@@ -1824,7 +1802,7 @@ fn build_webrtc_encoder_state(
         }
     };
 
-    let encoder = match AudioEncoder::spawn(
+    let mut encoder = match AudioEncoder::spawn(
         params,
         cancel.child_token(),
         flow_id.to_string(),
@@ -1863,6 +1841,9 @@ fn build_webrtc_encoder_state(
         }
     };
 
+    // The stage's resampler delay comes off the stamps with the codec's.
+    encoder.set_upstream_delay(stage.delay(), enc_in_sr);
+
     tracing::info!(
         "WebRTC output '{}': audio_encode active (Opus, source {} Hz {} ch -> 48000 Hz {} ch, {} kbps)",
         output_id, input_sr, ch_cfg, target_ch, target_br,
@@ -1888,8 +1869,7 @@ fn build_webrtc_encoder_state(
         decoder: Some(decoder),
         encoder,
         decode_stats,
-        transcoder,
-        pending_transcode_cfg: None,
+        stage,
         silence: None,
     }
 }
@@ -2004,12 +1984,20 @@ fn build_webrtc_encoder_state_eager_for_silent_fallback(
         output_id, target_ch, target_br,
     );
 
+    // Real audio, when it arrives, is converted to the format the silence
+    // opened the encoder at (48 kHz, the declared channel count).
+    let mut stage = super::audio_transcode::EncoderStage::new(
+        pending_transcode_cfg.cloned(),
+        enc_cfg.sample_rate,
+        enc_cfg.channels,
+    );
+    stage.pin_output(target_sr, target_ch);
+
     WebrtcEncoderState::Active {
         decoder: None,
         encoder,
         decode_stats,
-        transcoder: None,
-        pending_transcode_cfg: pending_transcode_cfg.cloned(),
+        stage,
         silence: Some(silence),
     }
 }
@@ -2076,17 +2064,14 @@ async fn emit_webrtc_silence_if_needed(
     }
 }
 
-/// Lazy build of the AAC decoder + optional resampler on the first
-/// real source AAC frame observed while the WebRTC encoder is already
-/// running (the silent-fallback path). Mirrors the RTMP variant but
-/// always retargets the encoder's input format (48 kHz Opus internal
-/// clock, declared channel count).
+/// Lazy build of the AAC decoder on the first real source AAC frame
+/// observed while the WebRTC encoder is already running (the
+/// silent-fallback path). The encoder's stage, pinned to its format (48 kHz
+/// Opus input, the declared channel count), converts whatever the source
+/// turns out to be.
 #[cfg(feature = "webrtc")]
-fn webrtc_lazy_build_decoder_and_transcoder(
+fn webrtc_lazy_build_decoder(
     decoder: &mut Option<AacDecoder>,
-    transcoder: &mut Option<super::audio_transcode::PlanarAudioTranscoder>,
-    pending_transcode_cfg: &Option<super::audio_transcode::TranscodeJson>,
-    encoder_params: &EncoderParams,
     cached_aac: (u8, u8, u8),
     output_id: &str,
 ) {
@@ -2098,40 +2083,52 @@ fn webrtc_lazy_build_decoder_and_transcoder(
         );
         return;
     }
-    let dec = match AacDecoder::from_adts_config(profile, sr_idx, ch_cfg) {
-        Ok(d) => d,
+    match AacDecoder::from_adts_config(profile, sr_idx, ch_cfg) {
+        Ok(d) => *decoder = Some(d),
         Err(e) => {
             tracing::warn!(
                 "WebRTC output '{}': silent-fallback AacDecoder build failed: {e}",
                 output_id
             );
-            return;
         }
-    };
-    let source_sr = dec.sample_rate();
-    let source_ch = dec.channels();
-    *decoder = Some(dec);
-
-    let need_transcode = pending_transcode_cfg.is_some()
-        || source_sr != encoder_params.sample_rate
-        || source_ch != encoder_params.channels;
-    if !need_transcode {
-        *transcoder = None;
-        return;
     }
-    let merged = super::audio_transcode::TranscodeJson {
-        sample_rate: Some(encoder_params.sample_rate),
-        channels: Some(encoder_params.channels),
-        ..pending_transcode_cfg.clone().unwrap_or_default()
-    };
-    match super::audio_transcode::PlanarAudioTranscoder::new(source_sr, source_ch, &merged) {
-        Ok(tc) => *transcoder = Some(tc),
-        Err(e) => {
-            tracing::warn!(
-                "WebRTC output '{}': silent-fallback transcoder build failed: {e}; source audio dropped, silence continues",
-                output_id
-            );
-            *decoder = None;
-        }
+}
+
+#[cfg(all(test, feature = "webrtc", feature = "fdk-aac"))]
+mod stage_tests {
+    use super::*;
+
+    /// **B1.** `audio_encode.channels` without a `transcode` block on a
+    /// WebRTC output goes through the shared channel / rate stage. The Opus
+    /// encoder used to be opened at the override's channel count while the
+    /// decoded stereo PCM went to it unconverted, and every frame was
+    /// dropped (`planar channel count != configured`).
+    #[test]
+    fn a_channel_override_without_a_transcode_block_converts() {
+        const ADTS: &[u8] = include_bytes!("testdata/sine1k_aac_lc_48k_stereo.adts");
+        let enc: crate::config::models::AudioEncodeConfig =
+            serde_json::from_value(serde_json::json!({ "codec": "opus", "channels": 1 })).unwrap();
+        let mut demux = super::super::ts_demux::TsDemuxer::new(None);
+        demux.demux(&crate::engine::ts_test_fixtures::aac_program_ts(ADTS));
+        let (events, _rx) = crate::manager::events::event_channel();
+        let stats = Arc::new(OutputStatsAccumulator::new("w1".into(), "w1".into(), "webrtc".into()));
+        let st = build_webrtc_encoder_state(
+            Some(&enc),
+            None,
+            &demux,
+            true,
+            &CancellationToken::new(),
+            &stats,
+            "f",
+            "w1",
+            &events,
+        );
+        let WebrtcEncoderState::Active { mut encoder, mut stage, .. } = st else {
+            panic!("the session must re-encode");
+        };
+        assert_eq!((encoder.params().channels, encoder.params().target_channels), (1, 1));
+        let pcm = stage.process(&[vec![0.1f32; 1024], vec![0.1f32; 1024]], 48_000).unwrap();
+        assert_eq!(pcm.len(), 1, "the stage mixes to mono");
+        assert!(encoder.submit_planar(&pcm, 90_000), "and the encoder takes it");
     }
 }
