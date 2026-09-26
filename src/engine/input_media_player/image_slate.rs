@@ -24,7 +24,6 @@ use tokio::time::{Duration, Instant, MissedTickBehavior, interval_at};
 
 use super::{PlayerSession, emit_bundle};
 use crate::config::models::VideoEncodeConfig;
-use crate::engine::rtmp::ts_mux::TsMuxer;
 use crate::engine::video_encode_util::ScaledVideoEncoder;
 
 const STREAM_TYPE_AAC: u8 = 0x0F;
@@ -180,7 +179,7 @@ async fn encode_loop(
         None
     };
 
-    let mut ts_mux = TsMuxer::new();
+    let mut ts_mux = session.cont.ts_muxer();
     if let Some(po) = session.pid_overrides
         && let Some(entry) = po.get(&1) {
                 ts_mux.set_pids(entry.pmt_pid, entry.video_pid, entry.audio_pid, entry.pcr_pid);

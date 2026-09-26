@@ -85,6 +85,8 @@ pub(crate) const ENCODED_TIMELINE_START_90K: u64 = PCR_LEAD_90K + 90_000;
 /// the timestamps pass the lead, rather than starting it just below the
 /// wrap: 1 s, past any encoder's reorder delay, and short enough that a
 /// timeline which merely *happens* to start there is held for no longer.
+/// A muxer whose caller continues a timeline already on the wire
+/// ([`TsMuxer::continue_timeline`]) never holds.
 const PCR_START_HOLD_90K: u64 = 90_000;
 
 /// Longest step the PCR takes (90 kHz) when it is split: 35 ms, under
@@ -209,6 +211,9 @@ pub struct TsMuxer {
     /// held at 0 until the timestamps pass it (see
     /// [`PCR_START_HOLD_90K`]).
     pcr_start_hold: bool,
+    /// The timeline this muxer opens continues one already on the wire
+    /// ([`Self::continue_timeline`]): no start hold.
+    timeline_continues: bool,
     /// The caller releases the filler PCRs on its own clock
     /// ([`Self::clock_pcr_fillers`]); none go ahead of an access unit.
     pcr_fillers_clocked: bool,
@@ -247,6 +252,7 @@ impl TsMuxer {
             last_audio_pts_90khz: None,
             last_pcr_90khz: None,
             pcr_start_hold: false,
+            timeline_continues: false,
             pcr_fillers_clocked: false,
             pmt_version: 0,
         }
@@ -561,7 +567,7 @@ impl TsMuxer {
         // under it).
         let inside_lead = ts.wrapping_add(PCR_START_HOLD_90K) & MASK_33 < PCR_START_HOLD_90K + PCR_LEAD_90K;
         if self.last_pcr_90khz.is_none() {
-            self.pcr_start_hold = inside_lead;
+            self.pcr_start_hold = inside_lead && !self.timeline_continues;
         } else if !inside_lead {
             self.pcr_start_hold = false;
         }
@@ -588,6 +594,20 @@ impl TsMuxer {
             (pcr_90k & MASK_33) * 300,
             false,
         ))
+    }
+
+    /// The timeline this muxer opens continues one already on the wire —
+    /// a media-player file after the first, or a loop, muxed by a fresh
+    /// muxer from where the previous one left off: its PCR runs
+    /// [`PCR_LEAD_90K`] behind its timestamps from the first, as the
+    /// previous muxer's did. Without it a continuation whose first
+    /// timestamp landed within a second before a 33-bit wrap (every
+    /// 26.5 h) was taken for a timeline starting there and its PCR held at
+    /// 0 ([`PCR_START_HOLD_90K`]): a forward PCR jump without DI from the
+    /// previous file's, then every frame up to the wrap behind the PCR.
+    /// Call before the first `mux_*`.
+    pub fn continue_timeline(&mut self) {
+        self.timeline_continues = true;
     }
 
     /// Take the programme's filler PCRs into the caller's hands (see
@@ -1795,6 +1815,30 @@ mod tests {
         let wrap: Vec<u64> = (0..60u64).map(|k| ((1u64 << 33) - 180_000 + k * 3_600) & MASK_33).collect();
         let want: Vec<u64> = wrap.iter().map(|d| d.wrapping_sub(9_000) & MASK_33).collect();
         assert_eq!(pcrs(&wrap), want, "a running timeline keeps its lead across the wrap");
+    }
+
+    /// A fresh muxer continuing a timeline already on the wire (the media
+    /// player's next file, or a loop) keeps the PCR lead from its first
+    /// frame, also when that frame lands inside the hold window just before
+    /// a 33-bit wrap: the PCR is the timeline's, not held at 0 up to a
+    /// second ahead of the DTS.
+    #[test]
+    fn a_continued_timeline_is_never_held() {
+        for first in [(1u64 << 33) - 45_000, (1u64 << 33) - 3_600, 0, 4_000] {
+            let mut m = TsMuxer::new();
+            m.continue_timeline();
+            let dts: Vec<u64> = (0..30u64).map(|k| (first + k * 3_600) & MASK_33).collect();
+            let mut pcrs = Vec::new();
+            for d in &dts {
+                for p in m.mux_video(&[0, 0, 0, 1, 0x65, 0x88], *d, *d, true) {
+                    if let Some(v) = crate::engine::ts_parse::extract_pcr(&p) {
+                        pcrs.push(v / 300);
+                    }
+                }
+            }
+            let want: Vec<u64> = dts.iter().map(|d| d.wrapping_sub(PCR_LEAD_90K) & MASK_33).collect();
+            assert_eq!(pcrs, want, "first DTS {first}: the lead from the first frame");
+        }
     }
 
     /// Audio whose AUs are longer than 35 ms (HE-AAC at 48 kHz, AAC-LC at

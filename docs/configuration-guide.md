@@ -1261,7 +1261,12 @@ came in, so their first PCR sat just below the 33-bit wrap and stepped back
 to ~0 a few frames in — counted as a PCR discontinuity by the flow's TR 101
 290 analyser and taken as a backward step by the UDP / RTP pacing on every
 flow start. Wherever a timeline still starts inside the lead (up to 1 s
-below 0), the muxer holds its PCR at 0 until the timestamps pass the lead.
+below 0), the muxer holds its PCR at 0 until the timestamps pass the lead —
+a fresh timeline only: a media player's every muxed file after the first
+continues the timeline on the wire (`TsMuxer::continue_timeline`) and keeps
+the 100 ms lead from its first frame, also when it lands within a second
+before the 33-bit wrap (every 26.5 h of a looping slate), where the hold
+used to stand the PCR at 0 up to a second ahead of the frames.
 Every IDR carries the SPS and PPS of the publish's AVC sequence header when
 it does not bring its own: they went ahead of a publish's *first* IDR only,
 so a receiver that joined any output of the flow after it never decoded a

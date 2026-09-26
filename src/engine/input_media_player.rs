@@ -866,6 +866,23 @@ impl SpliceContinuity {
         }
     }
 
+    /// The muxer for a file whose TS this input muxes itself, started at
+    /// [`Self::muxed_start_pts_90k`]. After the first file that timeline
+    /// continues the one already on the wire, so the muxer is told so
+    /// (`TsMuxer::continue_timeline`): its PCR keeps the lead from the
+    /// first frame. A fresh muxer takes a first timestamp inside its PCR
+    /// lead for a timeline starting there and holds the PCR at 0 — right at
+    /// a cold start, wrong at a continuation that lands within a second
+    /// before the 33-bit wrap (every 26.5 h), where it held the PCR up to a
+    /// second ahead of the frames.
+    pub(super) fn ts_muxer(&self) -> crate::engine::rtmp::ts_mux::TsMuxer {
+        let mut m = crate::engine::rtmp::ts_mux::TsMuxer::new();
+        if self.has_played_at_least_one_file {
+            m.continue_timeline();
+        }
+        m
+    }
+
     /// Called by `play_source` before dispatching to the per-format
     /// player. Compares the new source against the previous one and
     /// arms `pending_discontinuity` if the layout (or the source itself)

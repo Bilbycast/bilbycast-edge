@@ -673,7 +673,7 @@ async fn play_demuxed(
 ) -> Result<()> {
     let has_video = d.video.is_some();
     let has_audio = d.audio.is_some();
-    let mut ts_mux = TsMuxer::new();
+    let mut ts_mux = session.cont.ts_muxer();
     if let Some(po) = session.pid_overrides
         && let Some(entry) = po.get(&1) {
                 ts_mux.set_pids(entry.pmt_pid, entry.video_pid, entry.audio_pid, entry.pcr_pid);
@@ -1206,7 +1206,7 @@ async fn play_incremental(
 ) -> Result<()> {
     let has_video = reader.video_meta().is_some();
     let has_audio = reader.audio_meta().is_some();
-    let mut ts_mux = TsMuxer::new();
+    let mut ts_mux = session.cont.ts_muxer();
     if let Some(po) = session.pid_overrides
         && let Some(entry) = po.get(&1) {
             ts_mux.set_pids(entry.pmt_pid, entry.video_pid, entry.audio_pid, entry.pcr_pid);
@@ -2378,6 +2378,84 @@ mod tests {
         }
         assert!(audio_leads.len() > 30);
         assert!(audio_leads.iter().all(|&l| l > 0 && l < 20_000), "{audio_leads:?}");
+    }
+
+    /// A file after the first continues the timeline already on the wire.
+    /// When that continuation starts half a second before the 33-bit wrap
+    /// (every 26.5 h of a looping slate or ident) its PCR keeps the 100 ms
+    /// lead from the first frame, across the wrap. A fresh muxer used to
+    /// take the first DTS for a timeline starting inside its PCR lead and
+    /// hold the PCR at 0 — a PCR jump forward from the previous file's
+    /// with no DI, then every frame up to the wrap behind the PCR.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_file_continuing_the_timeline_across_the_wrap_keeps_the_pcr_lead() {
+        let video = TrackData {
+            timescale: 90_000,
+            samples: (0..25u64).map(|k| avc_sample(300, k * 3_600, k == 0)).collect(),
+            extra: TrackExtra::Avc { sps: vec![0x67, 0x42, 0x00, 0x1E], pps: vec![0x68, 0xCE, 0x3C, 0x80] },
+        };
+        let demux = DemuxResult { video: Some(video), audio: None, duration_ms: 0 };
+        let name = "slate-at-the-wrap.mp4";
+        let thread = format!("media-pacer-{name}");
+        super::super::pacer_trace::watch(&thread);
+        let (tx, _rx) = broadcast::channel::<RtpPacket>(4096);
+        let stats = std::sync::Arc::new(crate::stats::collector::FlowStatsAccumulator::new(
+            "test-flow".into(),
+            "test-flow-name".into(),
+            "media_player".into(),
+        ));
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let mut seq_num: u16 = 0;
+        let mut cont = super::super::SpliceContinuity::default();
+        cont.open_file(name);
+        // The previous file (a lap of this one) ended half a second before
+        // the wrap.
+        const LAP: u64 = 1 << 33;
+        let first = LAP - 45_000;
+        cont.has_played_at_least_one_file = true;
+        cont.next_target_output_pts_90k = first;
+        let mut transcoder: Option<crate::engine::input_transcode::InputTranscoder> = None;
+        let (events, _events_rx) = crate::manager::events::event_channel();
+        let media_stats = std::sync::Arc::new(crate::stats::collector::MediaPlayerStats::default());
+        let mut demux_cache = super::super::DemuxCacheField::default();
+        {
+            let mut session = PlayerSession {
+                seq_num: &mut seq_num,
+                per_input_tx: &tx,
+                stats: &stats,
+                cancel: &cancel,
+                cont: &mut cont,
+                transcoder: &mut transcoder,
+                pid_overrides: None,
+                post: &mut None,
+                bundle_size: super::super::BUNDLE_SIZE,
+                pcr_deadlines: true,
+                media_stats: &media_stats,
+                events: &events,
+                flow_id: "test-flow",
+                input_id: "test-input",
+                demux_cache: &mut demux_cache,
+            };
+            play_demuxed(Path::new(name), &demux, None, &mut session).await.unwrap();
+        }
+        drop(tx);
+        let trace = super::super::pacer_trace::take(&thread);
+        let pcrs: Vec<(u64, u64)> = trace
+            .iter()
+            .flat_map(|(_, b)| b.chunks(188))
+            .filter(|p| ((p[1] as u16 & 0x1F) << 8 | p[2] as u16) == 0x0100)
+            .filter_map(|p| {
+                let pcr = crate::engine::ts_parse::extract_pcr(p)? / 300;
+                let dts = crate::engine::ts_parse::extract_pes_dts(p)
+                    .or_else(|| crate::engine::ts_parse::extract_pes_pts(p))?;
+                Some((pcr, dts))
+            })
+            .collect();
+        assert_eq!(pcrs.len(), 25, "a PCR on every frame");
+        assert_eq!(pcrs[0].1, first, "the file continues the timeline");
+        for (pcr, dts) in &pcrs {
+            assert_eq!((dts + LAP - pcr) % LAP, 9_000, "PCR 100 ms behind the DTS {dts}");
+        }
     }
 
     fn ffmpeg_available() -> bool {
