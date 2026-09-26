@@ -3262,14 +3262,16 @@ pub(super) fn rewrite_cc(
     let has_payload = afc == 0b01 || afc == 0b11;
     if !has_payload {
         // AF-only packet: CC must equal the previous payload's CC on
-        // this PID. If we've never seen a payload on this PID yet,
-        // leave the source CC alone (cold-start fallback — the next
-        // payload-bearing packet will anchor the sequence).
-        if let Some(prev) = cont.last_cc.get(&pid).copied() {
-            pkt[3] = (pkt[3] & 0xF0) | prev;
-            return Some(prev);
-        }
-        return None;
+        // this PID. Before any payload on the PID the first AF-only
+        // packet's own CC starts the sequence: every AF-only packet after
+        // it repeats it and the first payload packet follows it. Left
+        // alone instead, the file-start video gate's PCR carriers (the
+        // video PES it drops, stripped to their adaptation field) went out
+        // with their source CCs — 8, 12, 13, 1, … on Sky's video PID, 12
+        // continuity errors in the first half second of every flow start.
+        let cc = *cont.last_cc.entry(pid).or_insert(pkt[3] & 0x0F);
+        pkt[3] = (pkt[3] & 0xF0) | cc;
+        return Some(cc);
     }
     let next = match cont.last_cc.get(&pid).copied() {
         Some(prev) => (prev + 1) & 0x0F,
@@ -4561,11 +4563,33 @@ mod tests {
         let mut null_pkt = ts_payload_pkt(0x1FFF);
         assert!(rewrite_cc(&mut null_pkt, &mut cont).is_none());
 
-        // afc = 10 (adaptation only, no payload): CC must NOT advance.
+        // afc = 10 (adaptation only, no payload): CC must NOT advance. The
+        // first one on a PID starts the sequence with its own CC.
         let mut af_only = ts_payload_pkt(0x100);
         af_only[3] = 0x20 | 0x0F; // afc=10, original CC=15
-        assert!(rewrite_cc(&mut af_only, &mut cont).is_none());
+        assert_eq!(rewrite_cc(&mut af_only, &mut cont), Some(0x0F));
         assert_eq!(af_only[3] & 0x0F, 0x0F, "low nibble untouched");
+    }
+
+    /// The file-start video gate strips the video PES it drops to their PCR
+    /// carriers before any payload on the PID has gone out. Each carrier
+    /// must repeat the first one's CC and the first payload packet follow
+    /// it: with their source CCs they gave 12 continuity errors in the
+    /// first half second of every flow start on Sky's video PID.
+    #[test]
+    fn af_only_carriers_before_any_payload_keep_one_cc() {
+        let mut cont = SpliceContinuity::default();
+        let mut ccs = Vec::new();
+        for src in [8u8, 12, 13, 1, 1, 4] {
+            let mut af = ts_payload_pkt(0x65);
+            af[3] = 0x20 | src;
+            rewrite_cc(&mut af, &mut cont);
+            ccs.push(af[3] & 0x0F);
+        }
+        assert_eq!(ccs, vec![8; 6], "every carrier repeats the first CC");
+        let mut payload = ts_payload_pkt(0x65);
+        payload[3] = 0x10 | 7;
+        assert_eq!(rewrite_cc(&mut payload, &mut cont), Some(9), "the payload follows it");
     }
 
     #[test]
