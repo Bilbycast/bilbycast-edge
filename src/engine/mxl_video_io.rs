@@ -197,7 +197,9 @@ fn video_input_blocking_loop(
 
     let mut ts_mux = crate::engine::rtmp::ts_mux::TsMuxer::new();
     let pts_step = 90_000u64 * config.frame_rate_den as u64 / config.frame_rate_num as u64;
-    let mut pts: i64 = 0;
+    // Past the muxer's PCR lead (see `ts_mux::ENCODED_TIMELINE_START_90K`):
+    // from 0 the first PCR sat just below the 33-bit wrap.
+    let mut pts: i64 = crate::engine::rtmp::ts_mux::ENCODED_TIMELINE_START_90K as i64;
 
     let target_10bit = enc_cfg.bit_depth == 10;
     let bps: usize = if target_10bit { 2 } else { 1 };

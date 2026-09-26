@@ -69,6 +69,24 @@ const STREAM_TYPE_AAC: u8 = 0x0F;
 /// picture by up to 100 ms, within the decoder buffers of stereo AAC.
 pub(crate) const PCR_LEAD_90K: u64 = 9_000;
 
+/// Where a timeline whose timestamps pass through an encoder before this
+/// muxer starts (90 kHz): past the PCR lead by a second. An encoder stamps
+/// its first output its first input's time less its delay — a B-frame
+/// reorder of a frame or two, an AAC encoder's priming (HE-AAC: ~2 000
+/// samples) — so a timeline opened at the lead itself still put the first
+/// PCR-clocked timestamp inside it. SDI, MXL, ST 2110-20/-23 without a
+/// shared media timeline, the multiviewer canvas and the PCM synth open
+/// here.
+pub(crate) const ENCODED_TIMELINE_START_90K: u64 = PCR_LEAD_90K + 90_000;
+
+/// A programme whose first PCR-clocked timestamp sits less than
+/// [`PCR_LEAD_90K`] into the 33-bit clock — up to this far below 0 (an
+/// encoder's first DTS behind its first PTS) — holds its PCR at 0 until
+/// the timestamps pass the lead, rather than starting it just below the
+/// wrap: 1 s, past any encoder's reorder delay, and short enough that a
+/// timeline which merely *happens* to start there is held for no longer.
+const PCR_START_HOLD_90K: u64 = 90_000;
+
 /// Longest step the PCR takes (90 kHz) when it is split: 35 ms, under
 /// TR 101 290's 40 ms PCR repetition limit.
 ///
@@ -187,6 +205,10 @@ pub struct TsMuxer {
     /// The last PCR the programme carried (90 kHz), on whichever PID
     /// carries it.
     last_pcr_90khz: Option<u64>,
+    /// The programme's timeline started inside the PCR lead and its PCR is
+    /// held at 0 until the timestamps pass it (see
+    /// [`PCR_START_HOLD_90K`]).
+    pcr_start_hold: bool,
     /// The caller releases the filler PCRs on its own clock
     /// ([`Self::clock_pcr_fillers`]); none go ahead of an access unit.
     pcr_fillers_clocked: bool,
@@ -224,6 +246,7 @@ impl TsMuxer {
             last_pat_pmt_at: None,
             last_audio_pts_90khz: None,
             last_pcr_90khz: None,
+            pcr_start_hold: false,
             pcr_fillers_clocked: false,
             pmt_version: 0,
         }
@@ -532,7 +555,17 @@ impl TsMuxer {
         fill_after: u64,
         packets: &mut Vec<Bytes>,
     ) -> u64 {
-        let pcr = ts_90khz.wrapping_sub(PCR_LEAD_90K) & MASK_33;
+        let ts = ts_90khz & MASK_33;
+        // Below the lead by less than the hold window, modulo 2^33: a
+        // timeline started at 0 (or an encoder's first DTS a frame or two
+        // under it).
+        let inside_lead = ts.wrapping_add(PCR_START_HOLD_90K) & MASK_33 < PCR_START_HOLD_90K + PCR_LEAD_90K;
+        if self.last_pcr_90khz.is_none() {
+            self.pcr_start_hold = inside_lead;
+        } else if !inside_lead {
+            self.pcr_start_hold = false;
+        }
+        let pcr = if self.pcr_start_hold { 0 } else { ts.wrapping_sub(PCR_LEAD_90K) & MASK_33 };
         if let Some(last) = self.last_pcr_90khz
             && !self.pcr_fillers_clocked
         {
@@ -1727,6 +1760,41 @@ mod tests {
                 assert_eq!(pts.unwrap() - pcr, 9_000, "path {path}");
             }
         }
+    }
+
+    /// A timeline that starts inside the PCR lead — at 0, as the SDI, MXL
+    /// and ST 2110 encoders and the multiviewer did, or an encoder's first
+    /// DTS a frame or two below 0 — holds its PCR at 0 until the timestamps
+    /// pass the lead, instead of starting just below the 33-bit wrap (a
+    /// backward PCR step to ~0 three frames in, on every flow start). A
+    /// timeline anywhere else leads from its first PCR; a later wrap of a
+    /// running timeline is no start.
+    #[test]
+    fn a_timeline_started_inside_the_lead_never_puts_the_pcr_below_zero() {
+        let pcrs = |dts: &[u64]| -> Vec<u64> {
+            let mut m = TsMuxer::new();
+            let mut out = Vec::new();
+            for d in dts {
+                for p in m.mux_video(&[0, 0, 0, 1, 0x65, 0x88], *d & MASK_33, *d & MASK_33, true) {
+                    if let Some(v) = crate::engine::ts_parse::extract_pcr(&p) {
+                        out.push(v / 300);
+                    }
+                }
+            }
+            out
+        };
+        assert_eq!(pcrs(&[0, 3_600, 7_200, 10_800, 14_400]), vec![0, 0, 0, 1_800, 5_400]);
+        // A first DTS 80 ms below 0 (B-frame delay behind a PTS of 0).
+        let b: Vec<u64> = (0..6u64).map(|k| ((1u64 << 33) - 7_200 + k * 3_600) & MASK_33).collect();
+        assert_eq!(pcrs(&b), vec![0, 0, 0, 0, 0, 1_800]);
+        // From the lead: every PCR 100 ms behind, as before.
+        assert_eq!(pcrs(&[9_000, 12_600]), vec![0, 3_600]);
+        // A timeline elsewhere, and a running one that wraps: no hold.
+        let far = 5_000_000_000u64;
+        assert_eq!(pcrs(&[far, far + 3_600]), vec![far - 9_000, far - 5_400]);
+        let wrap: Vec<u64> = (0..60u64).map(|k| ((1u64 << 33) - 180_000 + k * 3_600) & MASK_33).collect();
+        let want: Vec<u64> = wrap.iter().map(|d| d.wrapping_sub(9_000) & MASK_33).collect();
+        assert_eq!(pcrs(&wrap), want, "a running timeline keeps its lead across the wrap");
     }
 
     /// Audio whose AUs are longer than 35 ms (HE-AAC at 48 kHz, AAC-LC at

@@ -615,8 +615,12 @@ fn sdi_input_blocking_loop(
         ts_mux.set_scte35_stream(crate::engine::rtmp::ts_mux::DEFAULT_SCTE35_PID);
     }
     let mut ts_audio_configured = false;
-    let mut pts: i64 = 0;
-    let mut audio_pts_90khz: u64 = 0;
+    // Video and audio start past the muxer's PCR lead (see
+    // `ts_mux::ENCODED_TIMELINE_START_90K`): its PCR runs that far behind
+    // the video DTS, so from 0 the first PCR sat just below the 33-bit wrap
+    // and stepped back to ~0 three frames in.
+    let mut pts: i64 = crate::engine::rtmp::ts_mux::ENCODED_TIMELINE_START_90K as i64;
+    let mut audio_pts_90khz: u64 = crate::engine::rtmp::ts_mux::ENCODED_TIMELINE_START_90K;
     let mut session: u64 = 0;
 
     // Telemetry the byte stream cannot express: signal lock, shim frame drops,

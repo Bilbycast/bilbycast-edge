@@ -739,7 +739,9 @@ fn encode_worker(
         && let Some(entry) = po.get(&1) {
                 ts_mux.set_pids(entry.pmt_pid, entry.video_pid, entry.audio_pid, entry.pcr_pid);
             }
-    let mut pts: i64 = 0;
+    // Past the muxer's PCR lead (see `ts_mux::ENCODED_TIMELINE_START_90K`):
+    // from 0 the first PCR sat just below the 33-bit wrap.
+    let mut pts: i64 = crate::engine::rtmp::ts_mux::ENCODED_TIMELINE_START_90K as i64;
     let mut last_rtp_ts: Option<u32> = None;
 
     // Target chroma / bit depth chosen by the operator via video_encode
@@ -895,7 +897,7 @@ fn encode_worker(
             // RTP already ticks at 90 kHz; its wrap modulus is 2³².
             pts = tl
                 .resolve(frame.pts_90k as i64, 4_294_967_296.0, "ST 2110-20 input")
-                .max(0);
+                .max(crate::engine::rtmp::ts_mux::ENCODED_TIMELINE_START_90K as i64);
         }
         last_rtp_ts = Some(frame.pts_90k);
         let enc_out = pipeline.encode_raw_planes(

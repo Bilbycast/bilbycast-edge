@@ -502,7 +502,10 @@ fn build_synth(
         sample_rate: input_fmt.sample_rate,
         frame_size,
         planar_scratch,
-        pts_90khz: 0,
+        // Past the muxer's PCR lead (`ts_mux::ENCODED_TIMELINE_START_90K`):
+        // this audio-only programme's PCR runs that far behind its PTS, so
+        // from 0 it started just below the 33-bit wrap.
+        pts_90khz: crate::engine::rtmp::ts_mux::ENCODED_TIMELINE_START_90K,
         pcr_fillers: Vec::new(),
         au_duration_90k: match codec {
             AudioCodec::HeAacV1 | AudioCodec::HeAacV2 => 2_048,
@@ -541,7 +544,7 @@ impl AacSynth {
         // timeline (2110 flows). The downstream AAC encoder latches the
         // FIRST submitted PTS as its framer anchor and self-advances by
         // sample count, so this one-shot anchor is the entire mapping.
-        // Legacy callers (no timeline) keep the historic 0 origin.
+        // Legacy callers (no timeline) start past the muxer's PCR lead.
         if !self.anchored {
             self.anchored = true;
             if let Some(tl) = &self.media_timeline {
@@ -551,7 +554,7 @@ impl AacSynth {
                 let raw_90k = (raw_ts as i128 * 90_000 / rate as i128) as i64;
                 let modulus_90k = 4_294_967_296.0 * 90_000.0 / rate as f64;
                 let pts0 = tl.resolve(raw_90k, modulus_90k, "ST 2110-30 input");
-                self.pts_90khz = pts0.max(0) as u64;
+                self.pts_90khz = pts0.max(crate::engine::rtmp::ts_mux::ENCODED_TIMELINE_START_90K as i64) as u64;
             }
         }
         let payload = &data[header_len..];
@@ -813,6 +816,9 @@ mod tests {
             }
         }
         assert!(pcrs.len() > 80, "{} PCRs from 2 s of HE-AAC", pcrs.len());
+        // The timeline opens past the PCR lead and the encoder's priming: the
+        // first PCR is not just below the 33-bit wrap (from 0 it was).
+        assert!(pcrs[0].1 < 1 << 32, "first PCR {} ticks", pcrs[0].1);
         let fillers = pcrs.windows(2).filter(|w| w[1].0 != w[0].0).count();
         assert!(fillers > 40);
         const M: u64 = 1 << 33;

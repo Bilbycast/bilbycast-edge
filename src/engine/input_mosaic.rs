@@ -715,6 +715,16 @@ fn scale_into_tile(
     Some(TileFrame { bgra, rect: fitted.rect })
 }
 
+/// The PTS (90 kHz) of canvas frame `frame_index` at `fps`: from past the
+/// muxer's PCR lead (`ts_mux::ENCODED_TIMELINE_START_90K`), which its PCR
+/// runs behind the video DTS — from 0 the wall's first PCR sat just below
+/// the 33-bit wrap and stepped back to ~0 three frames in, on every wall
+/// start, and from the lead itself an encoder's B-frame delay put the first
+/// DTS inside it.
+fn canvas_pts_90k(frame_index: i64, fps: u16) -> i64 {
+    crate::engine::rtmp::ts_mux::ENCODED_TIMELINE_START_90K as i64 + frame_index * 90_000 / i64::from(fps.max(1))
+}
+
 /// Flatten NAL units into an Annex-B elementary stream.
 #[cfg(feature = "media-codecs")]
 fn annexb(nalus: &[Vec<u8>]) -> Vec<u8> {
@@ -909,7 +919,7 @@ async fn run_compositor(
                 let (y, ys) = yuv.plane(0).ok_or(EncodeStep::MissingPlane("Y"))?;
                 let (u, us) = yuv.plane(1).ok_or(EncodeStep::MissingPlane("U"))?;
                 let (v, vs) = yuv.plane(2).ok_or(EncodeStep::MissingPlane("V"))?;
-                let pts_90k = frame_index * 90_000 / i64::from(config.fps.max(1));
+                let pts_90k = canvas_pts_90k(frame_index, config.fps);
                 // **The encode result, not `unwrap_or_default()`.**
                 //
                 // The encoder lazy-opens on this call, so the whole backend
@@ -1320,6 +1330,17 @@ mod tests {
     use super::*;
     use crate::config::models::MosaicTileConfig;
     use crate::engine::mosaic::TileState;
+
+    /// The canvas timeline starts past the PCR lead, not at 0.
+    #[test]
+    fn the_canvas_timeline_starts_past_the_pcr_lead() {
+        let lead = crate::engine::rtmp::ts_mux::ENCODED_TIMELINE_START_90K as i64;
+        assert!(lead > crate::engine::rtmp::ts_mux::PCR_LEAD_90K as i64);
+        assert_eq!(canvas_pts_90k(0, 25), lead);
+        assert_eq!(canvas_pts_90k(25, 25), lead + 90_000);
+        assert_eq!(canvas_pts_90k(1, 50), lead + 1_800);
+        assert_eq!(canvas_pts_90k(3, 0), lead + 270_000, "fps 0 is taken as 1");
+    }
 
     fn cfg(tiles: Vec<MosaicTileConfig>) -> MosaicInputConfig {
         MosaicInputConfig {
