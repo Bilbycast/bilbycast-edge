@@ -525,9 +525,20 @@ the sample:
   moving to a 5.1 or 44.1 kHz file, a splice), once that header's own
   successor agrees. AC-3 and E-AC-3 frames are one stream: an AC-3 core
   followed by E-AC-3 dependent substreams (Annex E's backward-compatible
-  7.1) is cut frame by frame and the core decoded — every core used to be
-  discarded as a false sync, leaving no audio at all. A duplicate TS packet
-  (same CC, same payload) is dropped.
+  7.1) is one stream — every core used to be discarded as a false sync,
+  leaving no audio at all. **A dependent substream frame is cut into the AU
+  of the independent frame before it**, one AU per time slot: libavcodec
+  merges a dependent frame only when it follows its independent frame in
+  the same packet and silently ignores one sent alone, and every decode
+  path sends one AU per packet — a 7.1 E-AC-3 programme decoded as its 5.1
+  core everywhere, with no error counted. The cutter holds an independent
+  frame until the bytes after it show no dependent frame follows (the next
+  header, or the end of its PES — so a slot that ends its PES goes out at
+  once); a dependent frame with no independent frame before it (a join)
+  goes out alone. The splitter behind the demuxer's `OtherAudio` consumers
+  (`audio_decode::split_audio_codec_frames`) keeps a dependent frame with
+  its independent frame the same way. A duplicate TS packet (same CC, same
+  payload) is dropped.
   **The same cutter frames the audio on every other path that decodes
   it** (2026-09): the shared demuxer (`ts_demux::TsDemuxer`, behind the
   display, SDI, CMAF, RTMP, WebRTC, ST 2110-30, `rtp_audio` outputs and
@@ -624,9 +635,10 @@ the sample:
   `sample_rate: 44100` played 8.8 % slow, and `channels: 2` on a 5.1 source
   kept L and R and lost the centre. The replacer now builds the conversion
   itself: rubato SRC, and for channel counts the standard downmix (ITU-R
-  BS.775 for 5.1 / 7.1 → stereo, Lt/Rt for quad → stereo, the transcode
-  stage's defaults for mono ↔ stereo; any other pair keeps the channels in
-  order, silence for the missing ones).
+  BS.775 for 3.0 / 5.0 / 5.1 / 7.1 → stereo and for any multichannel
+  layout → mono, Lt/Rt for quad → stereo, the transcode stage's defaults
+  for mono ↔ stereo; any other pair keeps the channels in order, silence
+  for the missing ones — see the resolution rule below).
 - **A format change in-band is converted to the output's.** The output
   format — the configured `sample_rate` / `channels`, else the source's at
   the first decoded frame — is fixed for the stream: the encoder stays
@@ -799,10 +811,22 @@ CMAF): the stage between the decoder and the encoder is
     the stage resamples to 44.1 kHz and the encoder takes 44.1 kHz PCM.
 - **No block: `audio_encode.sample_rate` / `channels` alone convert** when
   they differ from the decoded source — rubato SRC for the rate; for the
-  channel count the standard downmix (ITU-R BS.775 for 5.1 / 7.1 →
-  stereo, Lt/Rt for quad → stereo), the transcode stage's defaults for
-  mono ↔ stereo, otherwise the channels in order with silence for any
-  missing. They used to be bare encoder parameters: the TS replacer and
+  channel count the standard downmix, for the channel order every decoder
+  here hands out (L R C LFE Ls Rs, then the back pair):
+  - **→ stereo**: ITU-R BS.775 for 5.1 / 7.1 (and 3.0 / 5.0: the centre at
+    −3 dB into both sides, each surround at −3 dB into its own), Lt/Rt for
+    quad, the transcode stage's default for mono;
+  - **→ mono**: BS.775's mono downmix — L and R at −3 dB, C at unity, each
+    surround at −6 dB, the LFE left out (3.0, quad, 5.0, 5.1, 7.1); a
+    layout it cannot name is averaged over every channel; stereo is the
+    stage's `stereo_to_mono_3db`. Until 2026-09 every N → 1 took channel 0
+    alone: a 5.1 programme's mono output was its front-left channel, the
+    centre (the dialogue) dropped — on CMAF a regression from its own
+    average-to-mono, since CMAF shares this rule; 3.0 / 5.0 → stereo
+    dropped the centre the same way;
+  - otherwise the channels in order with silence for any missing.
+
+  They used to be bare encoder parameters: the TS replacer and
   HLS opened the encoder at the new rate and fed
   it the source's PCM, so a 48 kHz source through `sample_rate: 44100`
   played 8.13 % slow and through `32000` 33.3 % slow — the gate-2
@@ -815,6 +839,22 @@ CMAF): the stage between the decoder and the encoder is
 - **Once the encoder is open its format is fixed**; a source that changes
   rate or channel count in-band is converted to it (a block whose routing
   does not fit the new layout gives way to the default conversion).
+- **The source's format is what its decoder hands out.** RTMP and WebRTC
+  resolve the stage and open the encoder from the first AAC frame decoded,
+  not from the ADTS header: an HE-AAC header gives the core's rate (24 kHz
+  for a 48 kHz service, SBR doubles it) and HE-AAC v2's mono core (PS
+  widens it to stereo). Set up from the header, a DVB-T2 HE-AAC 48 kHz
+  stereo service re-encoded to AAC-LC went out at 24 kHz — a 12 kHz audio
+  bandwidth — and, for v2, in mono. (With no overrides and an `aac_lc`
+  target the frames pass untouched, as before.)
+- **A silent-fallback encoder takes the block's format first.** Built
+  before any source audio so the silence has somewhere to go, it is sized
+  from `transcode.channels` / `sample_rate`, then `audio_encode`'s, then
+  48 kHz stereo — the order every other build of the stage uses (CMAF did
+  since 2026-09; RTMP and WebRTC now too). Sized from `audio_encode` alone,
+  a block's `channels: 1` with its own routing met an encoder opened in
+  stereo, and the stage fell back to the default conversion: stereo out,
+  the routing dropped. (Opus stays at 48 kHz on the wire.)
 
 The stage always runs in **streaming mode** (fixed 256-frame resampler
 chunks, `STREAM_CHUNK_FRAMES`), so its delay is a constant, and each
@@ -824,11 +864,25 @@ output takes it off its stamps:
   "Audio timing in the TS audio replacer").
 - RTMP, WebRTC: `AudioEncoder::set_upstream_delay` — the encoder's anchor
   (first submit, or first after a re-anchor) subtracts it with the codec's
-  priming.
+  priming. Every submit goes through `AudioEncoder::submit_through`, which
+  declares the stage's delay as it stands first: a stage built after the
+  encoder (a silent fallback's, on the first real frame) or rebuilt for
+  another source format gains its resampler late, and declared once at
+  build time (as 0) its delay stayed on every stamp.
 - HLS: each segment is re-encoded on its own, through a
   `BatchStage` that drops the resampler's zero history at the head and runs
   its queue and delay line out at the end, so the segment's audio lines up
-  with its source sample for sample and needs no correction.
+  with its source sample for sample and needs no correction. A segment
+  whose source changes format in-band is converted stretch by stretch — a
+  `BatchStage` per run of frames in one decoded format, each pinned to the
+  segment's output format — and the rendition keeps the format its first
+  segment resolved (`ResolvedAudioEncode::out_format`): a playlist cannot
+  signal a channel count or rate changing between segments. The one stage
+  built for a segment's first frame used to refuse every frame of another
+  layout (a 5.1 programme into a stereo break with `channels: 2` lost the
+  rest of the segment, up to 6 s of silence at every such switch) or, with
+  no override, feed 44.1 kHz PCM to an encoder opened at 48 kHz (the
+  wrong speed until the segment ended).
 - CMAF: the stage routes channels only, at the source's rate; the rate
   goes to the encoder's own resampler (next bullet).
 
@@ -876,8 +930,9 @@ channel count; if unset, the Opus encoder follows the source.
     line, are lost at such a change), for AAC and for MP2 / AC-3 /
     E-AC-3 sources alike; disables the same-codec fast path because PCM
     must be decoded to apply the shuffle.
-  - HLS: an `audio_transcode::BatchStage`, fresh per segment inside
-    `remux_ts_audio_inprocess`.
+  - HLS: `audio_transcode::BatchStage`s, fresh per segment — one per run of
+    frames in one decoded format — inside `remux_ts_audio_inprocess_pinned`,
+    converting to the rendition's format.
   - WebRTC: `WebrtcEncoderState::Active.stage`, on both the WHEP viewer
     loop and the WHIP client loop.
   - CMAF: `cmaf::encode::AudioReencoder`, channel routing only (the rate
@@ -976,7 +1031,7 @@ the program-level rate descriptors, and the content-tracked version.
 | `rate_control` | `vbr` | One of `vbr`, `cbr`, `crf`, `abr`. In `crf` mode `bitrate_kbps` is ignored and `crf` drives quantisation instead. |
 | `crf` | unset | 0–51, lower is better quality; broadcast typical 18–28. Only meaningful with `rate_control: "crf"`. Translated to `cq` on NVENC. |
 | `max_bitrate_kbps` | unset | VBV ceiling in `vbr` / `abr` only: sets `rc_max_rate` plus a 2 s VBV buffer. **Ignored in `cbr`** — that mode pins `bit_rate` = `rc_min_rate` = `rc_max_rate` to `bitrate_kbps`, which is the ceiling — and ignored in `crf`. Validation still enforces 100–100 000 and `max_bitrate_kbps >= bitrate_kbps` in every mode. |
-| `bframes` | `0` | Consecutive B-frames, 0–16. **Not available on RTMP outputs** — see *No B-frames on RTMP* under "Known limitations"; the encoder is opened with 0 regardless and logs `rtmp_bframes_unsupported`. |
+| `bframes` | `0` | Consecutive B-frames, 0–16. **Not available on RTMP or CMAF outputs** — see *No B-frames on RTMP or CMAF* under "Known limitations"; the encoder is opened with 0 regardless and logs `rtmp_bframes_unsupported` / `cmaf_bframes_unsupported`. |
 | `refs` | unset | Reference frames, 1–16. The encoder's own default when unset. |
 | `level` | unset | Codec level, e.g. `"3.0"`, `"4.0"`, `"5.1"`. Unset lets the encoder pick from resolution / bitrate / frame rate. |
 | `tune` | backend-resolved: `zerolatency` on x264 / x265, **unset on every hardware backend** | The vocabularies are disjoint. x264 / x265 accept `zerolatency`, `film`, `animation`, `grain`, `stillimage`, `fastdecode`, `psnr`, `ssim`; NVENC accepts `hq`, `ll`, `ull`, `lossless`; QSV and VAAPI expose no `tune` option at all. Config validation is permissive over the union, because an `h264_auto` / `hevc_auto` output does not know its backend until flow start. A tune the resolved backend cannot accept is therefore **dropped** at flow start (`video_encode_util::sanitise_tune`), with a log line carrying `error_code = encoder_tune_not_supported` — a log line only, no manager event. Dropping matters: handing NVENC `zerolatency` makes `avcodec_open2` fail with `EINVAL (-22)`. An empty string means "unset — encoder chooses". |
@@ -1550,12 +1605,25 @@ commit message or release note and delete the bullet.
      decoder handed out 25 woven frames a second — the VUI said 50 fps, CBR
      budgeted for 50 frames (the video came out at half the configured
      bitrate) and the default GOP ran 4 s. The meter takes the mean of four
-     agreeing frame deltas, or from 12 deltas the median of 4-delta sums
-     over 4 (a 3:2 or 2:3:3:2 pulldown cadence measures 24000/1001, and one
-     dropped frame does not move it), snapped to a standard rate within
-     0.1 %. A frame the decoder hands out without a PTS measures nothing
-     but is counted: MPEG-TS needs a PTS only every 700 ms, and a source
-     that stamps every Nth picture (or only its I pictures) measures the
+     agreeing frame deltas, or from 12 deltas the span of the deltas over
+     the frames they cover (how many each covers read off the median of
+     4-delta sums, so one dropped frame does not move it): the median over
+     windows of 12 (24 once there are that many) — whole cycles of a 3:2
+     or 2:3:3:2 pulldown, which measures exactly 24000/1001 — or, for
+     millisecond timestamps (an RTMP-ingest source), the least-squares
+     slope of the stamps over the frames. It snaps to the **nearest**
+     standard rate within 0.1 %, or within what the stamps can resolve
+     when that is more — a millisecond's rounding, or half the spread of
+     the per-frame deltas (browser capture jitter), over the span measured,
+     at most 5 %. The median of 4-delta sums alone read an RTMP publish's
+     33 / 33 / 34 ms steps at 30 fps as 2992.5 ticks and opened the encoder
+     at 90000/2993 (30.07 fps; 60 fps at 22500/377, 24 fps at 24000/1001).
+     A dozen millisecond stamps cannot tell 30/1 from 30000/1001 (they
+     drift apart by a millisecond a second): an RTMP source may lock at
+     its rate's 1001 neighbour, 0.1 % off; a full window (32) tells them
+     apart. A frame the decoder hands
+     out without a PTS measures nothing but is counted: MPEG-TS needs a
+     PTS only every 700 ms, and a source that stamps every Nth picture (or only its I pictures) measures the
      span between two stamped frames over the frames decoded across it —
      taken as one frame, a 29.97 fps source stamping every 12th picture
      locked 2500/1001 fps (CBR budgeting 12x the bitrate per frame, a
@@ -1575,7 +1643,16 @@ commit message or release note and delete the bullet.
      the field is unset**: the decoded frames' PTS go through the same
      `FrameCadence` meter (`video_encode_util::EncoderRateLock`), the
      frames decoded before it can say (about four) are dropped, and after
-     60 decoded frames with no usable PTS the encoder opens at 30/1. They
+     60 decoded frames with no usable PTS the encoder opens at 30/1. An
+     access unit whose PES carried no PTS goes to the decoder without one
+     (`DemuxedFrame::{H264, H265}::pts_known`), so its picture is
+     counted, not measured, as on the TS path; and each such picture is
+     stamped from the last one that had a PTS plus a frame at the encoder's
+     rate for each since (`video_encode_util::FramePtsStamper`). The
+     demuxer used to hand these paths PTS 0 for it: the pictures of a
+     source stamping only its I pictures came back stamped 0, the meter
+     never measured (60 frames — 2.4 s at 25 fps — dropped, then 30/1), and
+     their WebRTC RTP timestamps and CMAF samples carried 0. They
      used to open at a flat 30/1 whatever the source ran at: a 25 fps
      source's SPS VUI said 30 fps, CBR budgeted 25/30 of the configured
      bitrate and the default GOP ran 20 % long. The WebRTC decoder is now
@@ -1600,7 +1677,14 @@ commit message or release note and delete the bullet.
      its timestamps). WebRTC now sends each encoded frame as its own RTP
      frame with its own marker bit (several frames handed back by one call
      used to share one timestamp and one marker). RTMP already stamped
-     from the source PTS (a FIFO; its encoder never reorders).
+     from the source PTS (a FIFO; its encoder never reorders). An encoder
+     that reorders hands frames back in decode order (counters 0, 3, 1, 2,
+     …): each is found by its counter, and an entry 32 frames behind the one
+     coming back is taken as dropped (all those behind it were, and every
+     B-frame lost its PTS). **CMAF pins `bframes` to 0**, as RTMP does, and
+     warns `cmaf_bframes_unsupported`: its segmenter takes each stamp as
+     the sample's decode time and writes no composition offsets, so
+     display-order stamps in decode order stepped its timeline back.
    - **CMAF's default GOP tiles the segment** at the rate the encoder
      opens at (`cmaf::encode::cmaf_default_gop`): the fewest GOPs of at
      most 2 s that cover `segment_duration_secs`, each rounded **up** to a
@@ -1641,14 +1725,17 @@ commit message or release note and delete the bullet.
    `tune=zerolatency` option and rely on defaults for VBV buffer size,
    CRF, look-ahead, etc. CBR-strict profiles (true constant-bitrate
    muxing) may need extra work for hard-rate contribution paths.
-4. **No B-frames on RTMP.** `bframes` is configurable (0–16) on the TS
-   paths, but the RTMP output pins it to 0 and warns
+4. **No B-frames on RTMP or CMAF.** `bframes` is configurable (0–16) on the
+   TS paths, but the RTMP output pins it to 0 and warns
    (`rtmp_bframes_unsupported`) if asked otherwise: FLV carries DTS in the
    tag timestamp and both tag writers hard-code the composition-time offset
    to 0 (the Enhanced-RTMP HEVC path has no CTS field at all), so a
    reordering encoder would drive DTS backwards and most ingests answer that
-   by dropping the publisher. Elsewhere `max_b_frames = 0` is the default to simplify
-   decoder interop. Enabling them later would improve quality at a
+   by dropping the publisher. The CMAF re-encode pins it too
+   (`cmaf_bframes_unsupported`): the segmenter takes each re-encoded
+   frame's stamp as its decode time and writes no composition offsets.
+   (WebRTC and clip export were already pinned.) Elsewhere
+   `max_b_frames = 0` is the default to simplify decoder interop. Enabling them later would improve quality at a
    given bitrate.
 5. **No keyframe alignment with source.** The encoder emits IDRs on
    its own GOP cadence, ignoring the source PES PTS alignment. This is

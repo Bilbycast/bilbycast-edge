@@ -120,8 +120,12 @@ to open at 30/1 — see [`transcoding.md`](transcoding.md), *Frame rate*), and
 every re-encoded sample carries **its own picture's** source PTS, as the
 decoder propagated it: samples used to be stamped with the access unit being
 fed when the encoder handed them back — a pipeline's depth late, and out of
-order on a source with B-frames. (`gop_size: 1` is how the DVR proxy asks for
-all-intra; see [the proxy section](#why-the-proxy-rendition-is-x264-on-nvidia-hosts).)
+order on a source with B-frames. A picture whose PES carried no PTS (a source
+stamping only its I pictures) is stamped from the one before it plus a frame
+— it used to carry 0. `video_encode.bframes` is pinned to 0 on this path
+(warning `cmaf_bframes_unsupported`): the segmenter takes a sample's stamp as
+its decode time and writes no composition offsets. (`gop_size: 1` is how the
+DVR proxy asks for all-intra; see [the proxy section](#why-the-proxy-rendition-is-x264-on-nvidia-hosts).)
 
 ## Playlist window (`dvr_window_secs`)
 

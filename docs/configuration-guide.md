@@ -1236,7 +1236,14 @@ Accepts incoming RTMP publish connections from OBS, ffmpeg, Wirecast, etc.
 H.264 video and AAC audio are remuxed into an SPTS (program 1). **Audio-only
 publishes** (a radio encoder, an AAC-only push) come out as an audio-only
 program: the PMT lists the audio alone, names it as PCR_PID, and the audio
-PES carry the PCR. Whether a publish carries video is read from its
+PES carry the PCR — 100 ms behind each PES's PTS, so every AU is in the
+decoder's buffer before it is due (at the PTS itself, as first shipped, each
+AU arrived as it was due to play), with PCR-only packets on the audio PID
+between AUs longer than 35 ms (HE-AAC at 48 kHz: 42.7 ms; AAC-LC at 16 kHz:
+64 ms) so the PCR never steps past TR 101 290's 40 ms. The other audio-only
+programmes `TsMuxer` builds (RTSP, the PCM-encode input, an audio-only MP4 in
+the media player, the WebRTC input's Opus) carry their PCR the same way.
+Whether a publish carries video is read from its
 `onMetaData` (RTMP carries no FLV file header): metadata describing audio and
 no video makes the program audio-only at once; with no metadata — or metadata
 naming a video codec this input does not remux — a publish whose audio runs 1 s
@@ -1416,10 +1423,14 @@ loop, each playlist transition — continues one wire timeline:
   raw timestamps (Sky's first video PES sits at packet 14, its first PCR at
   23): ~20 550 s off the live timeline, and a DI downstream at every loop.
   A file with no PCR in its first 4096 packets keeps only its PSI from that
-  stretch, streams on with raw timestamps until its first PCR, and from that
-  PCR on plays with the offset like any other file (the offset used to stay
-  unset for the whole file). The input's muxer-mode clock rewriter holds a
-  PES that starts before its own first PCR for at most 2 s of PES time, then
+  stretch and goes on dropping its elementary streams until its first PCR,
+  which fixes the offset for the rest of the file (UHD at 62 Mbps with 100 ms
+  PCR spacing overruns the hold; it used to stream its opening IDR with the
+  file's own timestamps at every loop). Only a file that shows no PCR at all
+  — a second of one PID's PES time without one, which MPEG-TS never allows —
+  streams on unshifted, and a PCR arriving after that still sets the offset.
+  The input's muxer-mode clock rewriter holds a PES that starts before its
+  own first PCR for at most 2 s of PES time, then
   passes it on the source clock (`clock_rewrite_no_pcr`).
 - Video starts at a random-access point. Video PES are dropped until an
   H.264 SPS / IDR, HEVC VPS / SPS / IRAP, MPEG-2 sequence header or a
@@ -1452,8 +1463,13 @@ loop, each playlist transition — continues one wire timeline:
   one flat offset, anchored on the program whose PCR comes first in the
   file: its video starts at the random-access point. The offset is the
   smallest that keeps **every** audio and video PID and every PCR PID of
-  every program moving forward past its last output timestamp — by 30 ms
-  for audio, a frame for video, 1 ms for a PCR. The terms used to come
+  every program moving forward past its last output timestamp — for audio
+  past the end of its last PES (its own PES step, 30 ms at the least: the
+  30 ms alone put the next file's first AC-3 / HE-AAC PES inside the last),
+  a frame for video, 1 ms for a PCR. Each program's PMT is reassembled
+  across packets: a broadcast MPTS PMT past ~180 bytes (a dozen ES with
+  their descriptors), read off one packet, named no PCR_PID and no ES, and
+  the splice fell back to the PAT's first program. The terms used to come
   from the PAT's first program alone — on 770_H program 4010, whose clock
   runs 1.2 s ahead of the anchor's (4070) — which put every loop 1.2 s out,
   a 1.27 s PCR gap in every program but the anchor; anchored on one
