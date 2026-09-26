@@ -623,9 +623,15 @@ pub fn split_opus_frames(buf: &[u8]) -> Vec<&[u8]> {
 /// two by `bsid` (AC-3: 0..=10, E-AC-3: 11..=16). Last-frame truncation
 /// is dropped — the next PES will re-resync — matching
 /// [`split_mp2_frames`]'s contract.
+///
+/// An E-AC-3 dependent substream frame (`strmtyp` 1) stays in the slice
+/// of the frame before it: libavcodec merges a dependent frame only when it
+/// follows its independent frame in the same packet, so 7.1 sent one
+/// syncframe per `send_packet` decoded as its 5.1 core.
 #[cfg(feature = "media-codecs")]
 fn split_ac3_frames(buf: &[u8]) -> Vec<&[u8]> {
-    let mut out: Vec<&[u8]> = Vec::with_capacity(8);
+    // (start, end) of each AU.
+    let mut out: Vec<(usize, usize)> = Vec::with_capacity(8);
     let mut i = 0;
     while i + AC3_MIN_HEADER_BYTES <= buf.len() {
         if buf[i] != 0x0B || buf[i + 1] != 0x77 {
@@ -643,10 +649,14 @@ fn split_ac3_frames(buf: &[u8]) -> Vec<&[u8]> {
             // Truncated tail — leave it for the next PES to resync on.
             break;
         }
-        out.push(&buf[i..i + frame_bytes]);
+        let dependent = (buf[i + 5] >> 3) > 10 && buf[i + 2] >> 6 == 1;
+        match out.last_mut() {
+            Some(prev) if dependent && prev.1 == i => prev.1 = i + frame_bytes,
+            _ => out.push((i, i + frame_bytes)),
+        }
         i += frame_bytes;
     }
-    out
+    out.into_iter().map(|(a, b)| &buf[a..b]).collect()
 }
 
 /// Smallest syncinfo we can parse: 16 bits syncword + bsi bytes through
@@ -1262,6 +1272,63 @@ mod tests {
             assert_eq!(decoded, reference, "0x{st:02X}: every AU decoded");
         }
         assert!(PidAudioDecoder::new(0x06).is_none(), "Opus is framed per PES elsewhere");
+    }
+
+    /// A 7.1 E-AC-3 stream (5.1 independent frame + a dependent frame
+    /// carrying the wide pair, per 32 ms slot) decodes to eight channels on
+    /// both framings the decode paths use: the AU cutter (here through
+    /// `PidAudioDecoder`, as the TS audio replacer, the demuxer and HLS cut
+    /// it) and the splitter behind the demuxer's `OtherAudio` consumers.
+    /// Sent one syncframe per packet, libavcodec ignored every dependent
+    /// frame ("Ignoring dependent frame without independent frame") and the
+    /// programme decoded as its 5.1 core, with no error anywhere.
+    #[cfg(feature = "media-codecs")]
+    #[test]
+    fn a_7_1_e_ac3_stream_decodes_to_eight_channels() {
+        use video_codec::AudioDecoderCodec;
+        const ES: &[u8] = include_bytes!("testdata/eac3_5_1_plus_dependent_48k.ec3");
+        let rms = |c: &[f32]| (c.iter().map(|v| v * v).sum::<f32>() / c.len() as f32).sqrt();
+        let check = |planar: &[Vec<f32>], rate: u32| {
+            assert_eq!((planar.len(), rate), (8, 48_000), "FL FR FC LFE SL SR WL WR");
+            assert_eq!(planar[0].len(), 1536);
+            assert!(planar[..6].iter().all(|c| rms(c) > 0.01), "the core's tones");
+            assert!(planar[6..].iter().all(|c| rms(c) < 1e-3), "the (silent) wide pair");
+        };
+        // Cut by the AU cutter, one slot per PES.
+        let mut ts = Vec::new();
+        let mut cc = 0u8;
+        for (k, slot) in ES.chunks(896).enumerate() {
+            ts.extend(crate::engine::ts_test_fixtures::pes_packets(
+                0x101,
+                0xBD,
+                slot,
+                900_000 + k as u64 * 2_880,
+                &mut cc,
+            ));
+        }
+        let mut d = PidAudioDecoder::new(0x87).expect("E-AC-3 is framed");
+        let mut frames = 0;
+        for p in ts.chunks(188) {
+            d.push_packet(p, |planar, rate| {
+                check(planar, rate);
+                frames += 1;
+            });
+        }
+        // The decoder hands a frame back one packet late.
+        assert!(frames >= 6, "{frames} frames");
+        // Split, as the demuxer's OtherAudio consumers do.
+        let aus = split_audio_codec_frames(ES, AudioDecoderCodec::Eac3);
+        assert_eq!(aus.iter().map(|a| a.len()).collect::<Vec<_>>(), [896; 7]);
+        let mut d = open_ff_decoder(AudioDecoderCodec::Eac3).unwrap();
+        let mut frames = 0;
+        for au in aus {
+            d.send_packet(au, 0).unwrap();
+            while let Ok(f) = d.receive_frame() {
+                check(&f.planar, f.sample_rate);
+                frames += 1;
+            }
+        }
+        assert!(frames >= 6, "{frames} frames");
     }
 
     #[test]

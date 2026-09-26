@@ -37,6 +37,17 @@
 //! glued to the next PES's bytes. AC-3 and E-AC-3 frames share a key: an
 //! AC-3 core followed by E-AC-3 dependent substreams (Annex E) is one
 //! stream.
+//!
+//! **E-AC-3 dependent substreams** (7.1 = a 5.1 independent frame plus a
+//! dependent frame with the other two channels) are cut *into* the
+//! independent frame before them: one AU carries the whole time slot.
+//! libavcodec merges a dependent frame only when it follows its independent
+//! frame in the same packet, and ignores one sent on its own — every decode
+//! path here sends one AU per `send_packet`, so 7.1 decoded as its 5.1 core.
+//! An independent frame is therefore held until the bytes after it show no
+//! dependent frame follows (the next header, or the end of its PES); a
+//! dependent frame with no independent frame before it (the first after a
+//! join) goes out as it came.
 
 use std::collections::VecDeque;
 
@@ -362,6 +373,9 @@ pub struct AuCutter {
     /// [`Self::push_packet`].
     cc: Option<u8>,
     last_payload: Vec<u8>,
+    /// An AC-3 / E-AC-3 independent frame waiting for the dependent
+    /// substream frames that may follow it (see the module doc).
+    held: Option<CutAu>,
 }
 
 impl AuCutter {
@@ -380,6 +394,7 @@ impl AuCutter {
             discarded: 0,
             cc: None,
             last_payload: Vec::with_capacity(184),
+            held: None,
         }
     }
 
@@ -415,10 +430,11 @@ impl AuCutter {
         true
     }
 
-    /// ES bytes held that no AU has been cut from yet: 0 when everything
-    /// that arrived is out (a PES ended on an AU boundary).
+    /// ES bytes held that no AU has been cut from yet, or that an AU not
+    /// handed out yet carries: 0 when everything that arrived is out (a PES
+    /// ended on an AU boundary).
     pub fn buffered(&self) -> usize {
-        self.buf.len()
+        self.buf.len() + self.held.as_ref().map_or(0, |h| h.data.len())
     }
 
     pub fn format(&self) -> AuFormat {
@@ -574,8 +590,56 @@ impl AuCutter {
 
     /// The next complete, validated AU, if one is ready. `at_end` (a
     /// shutdown flush) accepts an AU whose successor has not arrived and
-    /// discards an incomplete tail.
+    /// discards an incomplete tail. An AC-3 / E-AC-3 AU carries its
+    /// dependent substream frames (see the module doc).
     pub fn next(&mut self, at_end: bool) -> Option<CutAu> {
+        if self.fmt != AuFormat::Ac3 {
+            return self.next_frame(at_end);
+        }
+        loop {
+            match self.next_frame(at_end) {
+                // An E-AC-3 dependent substream frame: part of the time slot
+                // of the independent frame before it.
+                Some(au) if au.header.samples == 0 => match self.held.as_mut() {
+                    Some(h) => {
+                        h.data.extend_from_slice(&au.data);
+                        h.header.len = h.data.len();
+                        if !h.pes_start && au.pes_start {
+                            h.pes_start = true;
+                            h.pts = au.pts;
+                        }
+                    }
+                    None => return Some(au),
+                },
+                Some(au) => {
+                    if let Some(prev) = self.held.replace(au) {
+                        return Some(prev);
+                    }
+                }
+                None => {
+                    return if at_end || self.held_is_whole() { self.held.take() } else { None };
+                }
+            }
+        }
+    }
+
+    /// Whether no dependent frame can follow the held one any more: the
+    /// bytes after it open with anything but a dependent frame's header, or
+    /// its PES ended with it.
+    fn held_is_whole(&self) -> bool {
+        if self.held.is_none() {
+            return false;
+        }
+        match parse_header(self.fmt, &self.buf) {
+            Head::Valid(h) => h.samples != 0,
+            Head::Invalid => true,
+            Head::NeedMore => self.buf.is_empty() && self.pes_end == Some(self.base),
+        }
+    }
+
+    /// The next frame [`Self::next`] is built from: one syncframe for AC-3
+    /// / E-AC-3, the whole AU for the other formats.
+    fn next_frame(&mut self, at_end: bool) -> Option<CutAu> {
         loop {
             if self.buf.is_empty() {
                 return None;
@@ -969,9 +1033,44 @@ mod tests {
         }
         aus.extend(std::iter::from_fn(|| c.next(true)));
         let lens: Vec<usize> = aus.iter().map(|a| a.data.len()).collect();
-        assert_eq!(lens, [1792, 768].repeat(6), "every core and every dependent frame");
+        assert_eq!(lens, [1792 + 768].repeat(6), "every core with its dependent frame");
         assert_eq!(c.take_discarded(), 0);
-        assert!(aus.iter().step_by(2).all(|a| a.pes_start), "each PES's PTS on its core");
+        assert!(aus.iter().all(|a| a.pes_start && a.header.samples == 1536), "each PES's PTS on its core");
+        assert!(aus.iter().all(|a| a.header.len == a.data.len()));
+    }
+
+    /// A 7.1 E-AC-3 stream (a 5.1 independent frame and the dependent
+    /// frame with the other two channels per time slot): each slot is one
+    /// AU, handed out as soon as its PES ends — libavcodec merges a
+    /// dependent frame only when it arrives in the same packet as its
+    /// independent frame, and ignored the ones cut on their own. Several
+    /// slots in one PES are cut one by one, each released once the next
+    /// slot's header shows it is complete.
+    #[test]
+    fn a_7_1_e_ac3_time_slot_is_one_au() {
+        const ES: &[u8] = include_bytes!("testdata/eac3_5_1_plus_dependent_48k.ec3");
+        let slots: Vec<&[u8]> = ES.chunks(768 + 128).collect();
+        assert_eq!(slots.len(), 7);
+        // One slot per PES: out the moment its PES is complete.
+        let mut c = AuCutter::new(AuFormat::Ac3);
+        for (k, slot) in slots.iter().enumerate() {
+            let aus = feed(&mut c, &pes(slot, Some(90_000 + k as u64 * 2_880)));
+            assert_eq!(aus.len(), 1, "slot {k}");
+            assert_eq!(aus[0].data, *slot);
+            assert_eq!((aus[0].pes_start, aus[0].pts), (true, Some(90_000 + k as u64 * 2_880)));
+            assert_eq!(c.buffered(), 0);
+        }
+        // All seven in one PES.
+        let mut c = AuCutter::new(AuFormat::Ac3);
+        let mut aus = feed(&mut c, &pes(ES, Some(90_000)));
+        aus.extend(std::iter::from_fn(|| c.next(false)));
+        assert_eq!(aus.iter().map(|a| a.data.as_slice()).collect::<Vec<_>>(), slots);
+        assert_eq!(aus.iter().filter(|a| a.pes_start).count(), 1);
+        // A dependent frame with no independent frame ahead of it (a join
+        // mid-slot) goes out as it came.
+        let mut c = AuCutter::new(AuFormat::Ac3);
+        let aus = feed(&mut c, &pes(&ES[768..], Some(90_000)));
+        assert_eq!(aus.iter().map(|a| a.data.len()).collect::<Vec<_>>()[..2], [128, 896]);
     }
 
     /// After a continuity break, a false sync of other stream parameters
