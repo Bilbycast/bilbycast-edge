@@ -77,7 +77,7 @@ enum WebrtcEncoderState {
 /// rest of the session. RTMP's `VideoEncoderState` is the closest
 /// analogue, except RTMP builds an out-of-band FLV sequence header
 /// (`global_header = true`) while WebRTC emits SPS/PPS inline on every
-/// IDR (`global_header = false`) so H264Packetizer can feed them into
+/// IDR (`global_header = false`) so str0m's packetizer can feed them into
 /// RTP as ordinary NAL units.
 #[cfg(feature = "webrtc")]
 enum WebrtcVideoEncoderState {
@@ -528,7 +528,6 @@ async fn handle_webrtc_video_frame(
     #[cfg_attr(not(feature = "media-codecs"), allow(unused_variables))]
     events: &EventSender,
 ) {
-    use super::webrtc::rtp_h264::H264Packetizer;
     use str0m::media::{Frequency, MediaTime};
     use std::time::Instant;
 
@@ -602,30 +601,38 @@ async fn handle_webrtc_video_frame(
         passthrough_nalus.map(|n| (std::borrow::Cow::Borrowed(n), pts)).into_iter().collect();
 
     for (send_nalus, frame_pts) in &frames {
-        let nalu_count = send_nalus.len();
-        for (i, nalu) in send_nalus.iter().enumerate() {
-            let is_last = i == nalu_count - 1;
-            let rtp_payloads = H264Packetizer::packetize(nalu, is_last);
-            for rtp_payload in &rtp_payloads {
-                let media_time = MediaTime::new(*frame_pts, Frequency::NINETY_KHZ);
-                if let Err(e) = session.write_media(
-                    video_mid,
-                    video_pt,
-                    Instant::now(),
-                    media_time,
-                    &rtp_payload.data,
-                ) {
-                    tracing::debug!("WebRTC output '{}' write error: {}", output_id, e);
-                }
-                // str0m requires poll_output between consecutive writes —
-                // drain or the next write_media is silently rejected.
-                session.drain_outputs().await;
-                stats.packets_sent.fetch_add(1, Ordering::Relaxed);
-                stats.bytes_sent.fetch_add(rtp_payload.data.len() as u64, Ordering::Relaxed);
-                stats.record_latency(recv_time_us);
-            }
+        // One access unit per write, Annex B: str0m's writer packetizes a
+        // frame itself (RFC 6184 — STAP-A for the SPS / PPS, FU-A past its
+        // MTU, the marker bit on the frame's last packet). Each NAL used to
+        // be packetized here first and every RTP payload written as a frame
+        // of its own: str0m took an FU-A fragment for a NAL and fragmented
+        // it again, so a receiver reassembled type-28 "NAL units" out of
+        // every IDR and large P slice — no picture decoded from them — and
+        // each fragment arrived as its own frame, every one marker-bit.
+        let au = annex_b_access_unit(send_nalus);
+        let media_time = MediaTime::new(*frame_pts, Frequency::NINETY_KHZ);
+        if let Err(e) = session.write_media(video_mid, video_pt, Instant::now(), media_time, &au) {
+            tracing::debug!("WebRTC output '{}' write error: {}", output_id, e);
         }
+        // str0m requires poll_output between consecutive writes —
+        // drain or the next write_media is silently rejected.
+        session.drain_outputs().await;
+        // RTP packets, approximately: the 1200-byte payloads a frame splits into.
+        stats.packets_sent.fetch_add(au.len().div_ceil(1_200) as u64, Ordering::Relaxed);
+        stats.bytes_sent.fetch_add(au.len() as u64, Ordering::Relaxed);
+        stats.record_latency(recv_time_us);
     }
+}
+
+/// An access unit's NAL units (start codes stripped) as one Annex B buffer.
+#[cfg(feature = "webrtc")]
+fn annex_b_access_unit(nalus: &[Vec<u8>]) -> Vec<u8> {
+    let mut au = Vec::with_capacity(nalus.iter().map(|n| n.len() + 4).sum());
+    for nalu in nalus {
+        au.extend_from_slice(&[0, 0, 0, 1]);
+        au.extend_from_slice(nalu);
+    }
+    au
 }
 
 /// Spawn a WebRTC output task (WHIP client or WHEP server depending on config mode).
