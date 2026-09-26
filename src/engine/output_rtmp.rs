@@ -392,6 +392,10 @@ async fn publish_loop(
         flow_id,
         event_sender,
     );
+    // A source codec RTMP cannot carry without a re-encode has been
+    // reported (`warn_codec_needs_encode`), once per connection.
+    let mut mpeg2_warned = false;
+    let mut other_audio_warned = false;
     loop {
         // Silence tick → inject one zero-filled chunk into the encoder
         // if the watchdog says we should (no real audio within grace),
@@ -652,39 +656,39 @@ async fn publish_loop(
                 DemuxedFrame::OtherAudio { stream_type, data, pts } => {
                     let ts_ms = pts_to_ms(pts, &mut base_pts);
 
-                    // Re-encoding to AAC requires the encoder to be wired
-                    // up (`audio_encode: aac_lc/he_aac_v1/he_aac_v2`). On
-                    // a passthrough output, RTMP wants AAC bytes — MP2 /
-                    // AC-3 / E-AC-3 sources need `audio_encode` to land.
-                    if matches!(encoder_state, EncoderState::Lazy) {
-                        encoder_state = build_encoder_state(
-                            config,
-                            &demuxer,
-                            None,
-                            compressed_audio_input,
-                            cancel,
-                            stats,
-                            flow_id,
-                            event_sender,
-                        );
+                    // RTMP carries AAC: MP2 / AC-3 / E-AC-3 reach it only
+                    // re-encoded (`audio_encode`).
+                    if matches!(encoder_state, EncoderState::Disabled) {
+                        if !other_audio_warned {
+                            other_audio_warned = true;
+                            warn_codec_needs_encode(
+                                config,
+                                "audio",
+                                &format!("audio (stream_type 0x{stream_type:02X})"),
+                                "audio_encode",
+                                flow_id,
+                                event_sender,
+                            );
+                        }
+                        continue;
                     }
+                    let decoded = decode_other_audio_for_encode(
+                        &mut encoder_state,
+                        &mut ff_audio_decoder,
+                        &mut ff_audio_codec,
+                        stream_type,
+                        &data,
+                        pts,
+                        config,
+                        cancel,
+                        stats,
+                        flow_id,
+                        event_sender,
+                    );
                     let EncoderState::Active {
-                        encoder, silence, stage, ..
+                        encoder, silence, stage, decode_stats, ..
                     } = &mut encoder_state
                     else {
-                        continue;
-                    };
-
-                    let Some(codec) = crate::engine::audio_decode::ff_codec_for_stream_type(
-                        stream_type,
-                    ) else {
-                        continue;
-                    };
-                    if ff_audio_codec != Some(codec) {
-                        ff_audio_decoder = crate::engine::audio_decode::open_ff_decoder(codec).ok();
-                        ff_audio_codec = Some(codec);
-                    }
-                    let Some(dec) = ff_audio_decoder.as_mut() else {
                         continue;
                     };
                     if let Some(sg) = silence.as_mut() {
@@ -709,24 +713,18 @@ async fn publish_loop(
                         continue;
                     }
 
-                    for au in
-                        crate::engine::audio_decode::split_audio_codec_frames(&data, codec)
-                    {
-                        if dec.send_packet(au, pts as i64).is_err() {
-                            continue;
-                        }
-                        while let Ok(frame) = dec.receive_frame() {
-                            // To the encoder's format: MP2 at another rate
-                            // was encoded as if at the encoder's (and ran
-                            // at the wrong speed), 5.1 AC-3 refused.
-                            match encoder.submit_through(stage, &frame.planar, frame.sample_rate, pts) {
-                                Ok(_) => {}
-                                Err(e) => {
-                                    tracing::debug!(
-                                        "RTMP output '{}': transcode failed: {e}",
-                                        config.id
-                                    );
-                                }
+                    for frame in decoded {
+                        decode_stats.inc_output();
+                        // To the encoder's format: MP2 at another rate
+                        // was encoded as if at the encoder's (and ran
+                        // at the wrong speed), 5.1 AC-3 refused.
+                        match encoder.submit_through(stage, &frame.planar, frame.sample_rate, pts) {
+                            Ok(_) => {}
+                            Err(e) => {
+                                tracing::debug!(
+                                    "RTMP output '{}': transcode failed: {e}",
+                                    config.id
+                                );
                             }
                         }
                     }
@@ -749,9 +747,36 @@ async fn publish_loop(
                     // Build without `media-codecs` lacks the libavcodec
                     // bridge needed to decode MP2 / AC-3 / E-AC-3 — drop.
                 }
-                // RTMP carries H.264 / HEVC + AAC — MPEG-2 video would
-                // need a transcode hop we don't have on this output yet.
-                DemuxedFrame::Mpeg2 { .. } => {}
+                // RTMP carries H.264 / HEVC: MPEG-2 video goes out only
+                // re-encoded (`video_encode`), which the decoder layer
+                // does. Without one it is dropped, and the operator told
+                // once — it used to be dropped either way, silently.
+                DemuxedFrame::Mpeg2 { es, pts, is_keyframe, pts_known } => {
+                    if matches!(video_state, VideoEncoderState::Disabled) {
+                        if !mpeg2_warned {
+                            mpeg2_warned = true;
+                            warn_codec_needs_encode(config, "video", "MPEG-2 video", "video_encode", flow_id, event_sender);
+                        }
+                        continue;
+                    }
+                    let ts_ms = pts_to_ms(pts, &mut base_pts);
+                    process_video_frame(
+                        VideoFrameSource::Mpeg2 { es: &es, is_keyframe, pts_known },
+                        pts,
+                        ts_ms,
+                        &mut base_pts,
+                        recv_time_us,
+                        &demuxer,
+                        &mut sent_video_header,
+                        &mut video_state,
+                        client,
+                        config,
+                        stats,
+                        flow_id,
+                        event_sender,
+                    )
+                    .await?;
+                }
                 // Stream discontinuity is metadata for stateful consumers
                 // that own decoder state. RTMP is a forwarding output —
                 // the FLV writer re-anchors on the next IDR / AAC config
@@ -1088,32 +1113,84 @@ fn nalus_to_annex_b(nalus: &[Vec<u8>]) -> Vec<u8> {
 enum VideoFrameSource<'a> {
     H264 { nalus: &'a [Vec<u8>], is_keyframe: bool, pts_known: bool },
     H265 { nalus: &'a [Vec<u8>], is_keyframe: bool, pts_known: bool },
+    /// An MPEG-2 video access unit (the ES as the PES carried it): RTMP
+    /// carries H.264 / HEVC, so it reaches the wire only re-encoded. It used
+    /// to be dropped whatever `video_encode` said, silently.
+    #[cfg_attr(not(feature = "media-codecs"), allow(dead_code))]
+    Mpeg2 { es: &'a [u8], is_keyframe: bool, pts_known: bool },
 }
 
 impl<'a> VideoFrameSource<'a> {
-    fn nalus(&self) -> &'a [Vec<u8>] {
-        match self {
-            VideoFrameSource::H264 { nalus, .. } | VideoFrameSource::H265 { nalus, .. } => nalus,
-        }
-    }
     fn is_keyframe(&self) -> bool {
         match self {
             VideoFrameSource::H264 { is_keyframe, .. }
-            | VideoFrameSource::H265 { is_keyframe, .. } => *is_keyframe,
+            | VideoFrameSource::H265 { is_keyframe, .. }
+            | VideoFrameSource::Mpeg2 { is_keyframe, .. } => *is_keyframe,
         }
     }
-    fn is_h264(&self) -> bool {
-        matches!(self, VideoFrameSource::H264 { .. })
+    /// The codec a decoder for this access unit opens.
+    #[cfg(feature = "media-codecs")]
+    fn codec(&self) -> video_codec::VideoCodec {
+        match self {
+            VideoFrameSource::H264 { .. } => video_codec::VideoCodec::H264,
+            VideoFrameSource::H265 { .. } => video_codec::VideoCodec::Hevc,
+            VideoFrameSource::Mpeg2 { .. } => video_codec::VideoCodec::Mpeg2,
+        }
+    }
+    /// The access unit as a decoder takes it: Annex B for H.264 / HEVC, the
+    /// ES itself for MPEG-2 (the decoder finds its own start codes).
+    #[cfg(feature = "media-codecs")]
+    fn decoder_input(&self) -> std::borrow::Cow<'a, [u8]> {
+        match self {
+            VideoFrameSource::H264 { nalus, .. } | VideoFrameSource::H265 { nalus, .. } => {
+                std::borrow::Cow::Owned(nalus_to_annex_b(nalus))
+            }
+            VideoFrameSource::Mpeg2 { es, .. } => std::borrow::Cow::Borrowed(es),
+        }
     }
     /// Whether the access unit's PES carried a PTS.
     #[cfg(feature = "media-codecs")]
     fn pts_known(&self) -> bool {
         match self {
-            VideoFrameSource::H264 { pts_known, .. } | VideoFrameSource::H265 { pts_known, .. } => {
-                *pts_known
-            }
+            VideoFrameSource::H264 { pts_known, .. }
+            | VideoFrameSource::H265 { pts_known, .. }
+            | VideoFrameSource::Mpeg2 { pts_known, .. } => *pts_known,
         }
     }
+}
+
+/// Tell the operator, once, that the source's `what` (`kind`: "video" /
+/// "audio") reaches this RTMP output only through `block` — RTMP carries
+/// H.264 / HEVC and AAC — so without it the essence is dropped. It used to
+/// be dropped without a word: an MPEG-2 + AC-3 source (VH1) produced an
+/// RTMP publish with nothing in it and no event.
+fn warn_codec_needs_encode(
+    config: &RtmpOutputConfig,
+    kind: &str,
+    what: &str,
+    block: &str,
+    flow_id: &str,
+    event_sender: &EventSender,
+) {
+    let msg = format!(
+        "RTMP output '{}': the source's {what} cannot be carried over RTMP (H.264 / HEVC and AAC \
+         only) without `{block}`; its {kind} is dropped",
+        config.id
+    );
+    tracing::warn!("{msg}");
+    event_sender.emit_output_with_details(
+        EventSeverity::Warning,
+        category::RTMP,
+        msg,
+        &config.id,
+        serde_json::json!({
+            "error_code": "codec_needs_encode",
+            "essence": kind,
+            "source_codec": what,
+            "needs": block,
+            "flow_id": flow_id,
+        }),
+    );
 }
 
 /// Initialise the per-output video encoder state machine at startup.
@@ -1287,12 +1364,8 @@ async fn process_video_frame(
         }
         #[cfg(feature = "media-codecs")]
         VideoEncoderState::Lazy { cfg, sps_gate } => {
-            let au = nalus_to_annex_b(src.nalus());
-            let codec = if src.is_h264() {
-                video_codec::VideoCodec::H264
-            } else {
-                video_codec::VideoCodec::Hevc
-            };
+            let au = src.decoder_input();
+            let codec = src.codec();
             // Nothing decodes before the SPS; opening on it seeds the
             // decoder's reorder depth from it (`SpsOpenGate`).
             if !sps_gate.admits(codec, &au) {
@@ -1301,7 +1374,7 @@ async fn process_video_frame(
             let cfg = cfg.clone();
             *video_state = open_video_active(
                 &cfg,
-                src.is_h264(),
+                codec,
                 &au,
                 config,
                 stats,
@@ -1332,11 +1405,12 @@ async fn passthrough_video(
     config: &RtmpOutputConfig,
     stats: &Arc<OutputStatsAccumulator>,
 ) -> anyhow::Result<bool> {
-    let nalus = src.nalus();
     let is_keyframe = src.is_keyframe();
 
     match src {
-        VideoFrameSource::H264 { .. } => {
+        // Not carried without `video_encode` (the loop says so once).
+        VideoFrameSource::Mpeg2 { .. } => {}
+        VideoFrameSource::H264 { nalus, .. } => {
             // Send sequence header on the first frame where SPS/PPS are
             // cached. Real-world broadcast streams often use open-GOP /
             // recovery-point SEI signalling instead of true IDR (NAL
@@ -1368,7 +1442,7 @@ async fn passthrough_video(
             stats.bytes_sent.fetch_add(tag_len as u64, Ordering::Relaxed);
             stats.record_latency(recv_time_us);
         }
-        VideoFrameSource::H265 { .. } => {
+        VideoFrameSource::H265 { nalus, .. } => {
             // HEVC passthrough over Enhanced RTMP. Build hvcC from cached
             // VPS / SPS / PPS on the first frame where they're available.
             // Same rationale as the H.264 path: open-GOP broadcast streams
@@ -1498,7 +1572,7 @@ fn annex_b_to_avcc_filtered_h265(nalus: &[Vec<u8>]) -> Vec<u8> {
 #[cfg(feature = "media-codecs")]
 fn open_video_active(
     cfg: &VideoEncodeConfig,
-    source_is_h264: bool,
+    source_codec: video_codec::VideoCodec,
     first_au: &[u8],
     config: &RtmpOutputConfig,
     stats: &Arc<OutputStatsAccumulator>,
@@ -1514,11 +1588,6 @@ fn open_video_active(
     let backend = *backend_chain
         .first()
         .expect("resolver guaranteed at least one candidate");
-    let source_codec = if source_is_h264 {
-        video_codec::VideoCodec::H264
-    } else {
-        video_codec::VideoCodec::Hevc
-    };
     // Seeded from the access unit that triggered the open: an H.264
     // decoder's reorder depth comes from its SPS (`ReorderSeed`).
     let decoder = match video_engine::VideoDecoder::open_opts(
@@ -1682,7 +1751,7 @@ async fn encode_one_frame(
     // decoder. In-process codec work runs inside `block_in_place` so the
     // tokio reactor isn't held while we spend single-digit milliseconds
     // per frame.
-    let annex_b = nalus_to_annex_b(src.nalus());
+    let annex_b = src.decoder_input();
     let block_result = crate::timed_block_in_place!(
         "output_rtmp.video_encoder",
         crate::engine::perf::TRANSCODE_BLOCK_WARN_MS,
@@ -2056,6 +2125,126 @@ fn build_encoder_state(
         return EncoderState::Lazy;
     };
 
+    let decoder = match AacDecoder::from_adts_config(profile, sr_idx, ch_cfg) {
+        Ok(d) => d,
+        Err(e) => {
+            tracing::error!(
+                "RTMP output '{}': audio_encode AacDecoder build failed: {e}",
+                config.id
+            );
+            return EncoderState::Failed;
+        }
+    };
+    let decoded_as = (decoder.codec_name(), decoder.sample_rate(), decoder.channels());
+    build_encoder_for_format(
+        config,
+        input_sr,
+        input_ch,
+        Some(decoder),
+        decoded_as,
+        cancel,
+        stats,
+        flow_id,
+        event_sender,
+    )
+}
+
+/// Decode one MP2 / AC-3 / E-AC-3 PES (`stream_type`) for the AAC
+/// re-encode: with the output's libavcodec decoder (reopened when the codec
+/// changes), and — while the encoder is still `Lazy` — building it from the
+/// format the source decodes to ([`build_encoder_for_format`]). It used to
+/// be built only from the demuxer's AAC config, which such a source never
+/// has, so its audio was dropped for good unless `silent_fallback` had
+/// built the encoder eagerly. Returns the decoded frames (none when the
+/// encoder has failed or the PES decoded to nothing).
+#[cfg(feature = "media-codecs")]
+#[allow(clippy::too_many_arguments)]
+fn decode_other_audio_for_encode(
+    encoder_state: &mut EncoderState,
+    decoder: &mut Option<video_engine::AudioDecoder>,
+    decoder_codec: &mut Option<video_codec::AudioDecoderCodec>,
+    stream_type: u8,
+    data: &[u8],
+    pts: u64,
+    config: &RtmpOutputConfig,
+    cancel: &CancellationToken,
+    stats: &Arc<OutputStatsAccumulator>,
+    flow_id: &str,
+    event_sender: &EventSender,
+) -> Vec<video_engine::DecodedAudioFrame> {
+    if matches!(encoder_state, EncoderState::Failed | EncoderState::Disabled) {
+        return Vec::new();
+    }
+    let Some(codec) = crate::engine::audio_decode::ff_codec_for_stream_type(stream_type) else {
+        return Vec::new();
+    };
+    if *decoder_codec != Some(codec) {
+        *decoder = crate::engine::audio_decode::open_ff_decoder(codec).ok();
+        *decoder_codec = Some(codec);
+    }
+    let Some(dec) = decoder.as_mut() else {
+        return Vec::new();
+    };
+    let mut decoded = Vec::new();
+    for au in crate::engine::audio_decode::split_audio_codec_frames(data, codec) {
+        if dec.send_packet(au, pts as i64).is_err() {
+            continue;
+        }
+        while let Ok(frame) = dec.receive_frame() {
+            decoded.push(frame);
+        }
+    }
+    if matches!(encoder_state, EncoderState::Lazy)
+        && let Some(first) = decoded.first()
+    {
+        let channels = first.planar.len() as u8;
+        *encoder_state = build_encoder_for_format(
+            config,
+            first.sample_rate,
+            channels,
+            None,
+            (crate::engine::audio_decode::ff_codec_name(codec), first.sample_rate, channels),
+            cancel,
+            stats,
+            flow_id,
+            event_sender,
+        );
+    }
+    decoded
+}
+
+/// The encoder `audio_encode` asks for, opened for a source that decodes to
+/// `input_sr` × `input_ch`: the channel / rate stage in front of it follows
+/// the rule every re-encoding output shares (`audio_transcode::EncoderStage`
+/// — the `transcode` block with `audio_encode`'s fields folded in, or those
+/// two alone when they differ from the source). `decoder` is the AAC
+/// source's decoder; an MP2 / AC-3 / E-AC-3 source brings its own
+/// libavcodec decoder and passes `None`. `decoded_as` labels the decode
+/// stats (codec name, rate, channels).
+#[allow(clippy::too_many_arguments)]
+fn build_encoder_for_format(
+    config: &RtmpOutputConfig,
+    input_sr: u32,
+    input_ch: u8,
+    decoder: Option<AacDecoder>,
+    decoded_as: (&str, u32, u8),
+    cancel: &CancellationToken,
+    stats: &Arc<OutputStatsAccumulator>,
+    flow_id: &str,
+    event_sender: &EventSender,
+) -> EncoderState {
+    let Some(enc_cfg) = config.audio_encode.as_ref() else {
+        return EncoderState::Disabled;
+    };
+    let Some(codec) = AudioCodec::parse(&enc_cfg.codec) else {
+        tracing::error!(
+            "RTMP output '{}': audio_encode unknown codec '{}'",
+            config.id,
+            enc_cfg.codec
+        );
+        return EncoderState::Failed;
+    };
+
     // Resolve the encoder's input shape: the channel / rate stage converts
     // the source to it — the transcode block when set (audio_encode's
     // sample_rate / channels folded in for the fields it leaves unset),
@@ -2102,17 +2291,6 @@ fn build_encoder_state(
         opus_fec: enc_cfg.opus_fec,
         opus_dtx: enc_cfg.opus_dtx,
         opus_frame_duration_ms: enc_cfg.opus_frame_duration_ms,
-    };
-
-    let decoder = match AacDecoder::from_adts_config(profile, sr_idx, ch_cfg) {
-        Ok(d) => d,
-        Err(e) => {
-            tracing::error!(
-                "RTMP output '{}': audio_encode AacDecoder build failed: {e}",
-                config.id
-            );
-            return EncoderState::Failed;
-        }
     };
 
     let mut encoder = match AudioEncoder::spawn(
@@ -2171,12 +2349,7 @@ fn build_encoder_state(
     // manager UI. First-wins semantics: if the output has previously been
     // Lazy→Active cycled, this is a no-op.
     let decode_stats = Arc::new(DecodeStats::new());
-    stats.set_decode_stats(
-        decode_stats.clone(),
-        decoder.codec_name(),
-        decoder.sample_rate(),
-        decoder.channels(),
-    );
+    stats.set_decode_stats(decode_stats.clone(), decoded_as.0, decoded_as.1, decoded_as.2);
     stats.set_encode_stats(
         encoder.stats_handle(),
         encoder.params().codec.as_str().to_string(),
@@ -2186,7 +2359,7 @@ fn build_encoder_state(
     );
 
     EncoderState::Active {
-        decoder: Some(decoder),
+        decoder,
         encoder,
         decode_stats,
         stage,
@@ -2650,7 +2823,7 @@ mod rate_tests {
         let stats = Arc::new(OutputStatsAccumulator::new("o".into(), "o".into(), "rtmp".into()));
         let (events, _rx) = crate::manager::events::event_channel();
         let aus = x264_test_source(40, step_90k);
-        let mut state = open_video_active(&cfg, true, &aus[0].0, &config, &stats, &events);
+        let mut state = open_video_active(&cfg, video_codec::VideoCodec::H264, &aus[0].0, &config, &stats, &events);
         let mut encoded = 0;
         for (au, pts) in &aus {
             let VideoEncoderState::Active(active) = &mut state else { panic!("not active") };
@@ -2699,7 +2872,7 @@ mod rate_tests {
         let stats = Arc::new(OutputStatsAccumulator::new("o".into(), "o".into(), "rtmp".into()));
         let (events, _rx) = crate::manager::events::event_channel();
         let aus = x264_test_source(80, 3_600);
-        let mut state = open_video_active(&cfg, true, &aus[0].0, &config, &stats, &events);
+        let mut state = open_video_active(&cfg, video_codec::VideoCodec::H264, &aus[0].0, &config, &stats, &events);
         for (k, (au, pts)) in aus.iter().enumerate() {
             let VideoEncoderState::Active(active) = &mut state else { panic!("not active") };
             let known = k % 12 == 0;
@@ -2835,7 +3008,7 @@ mod flv_timestamp_tests {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// **B1.** `audio_encode.sample_rate` / `channels` without a
@@ -2988,6 +3161,66 @@ mod tests {
         let out = stage.process(&[vec![0.5f32; 1024], vec![0.0f32; 1024]], 48_000).unwrap();
         assert_eq!(out.len(), 1, "mono");
         assert!((out[0][512] - 0.5).abs() < 1e-6, "the block's routing: left only, {}", out[0][512]);
+    }
+
+    /// A PES of MP2 frames at 48 kHz stereo, `n` of them.
+    #[cfg(feature = "media-codecs")]
+    pub(crate) fn mp2_pes(n: usize) -> Vec<u8> {
+        let mut e = video_engine::AudioEncoder::open(&video_codec::AudioEncoderConfig {
+            codec: video_codec::AudioCodecType::Mp2,
+            sample_rate: 48_000,
+            channels: 2,
+            bitrate_kbps: 192,
+        })
+        .unwrap();
+        let fs = e.frame_size();
+        let mut out = Vec::new();
+        let mut k = 0usize;
+        while out.len() < n * 576 {
+            let tone: Vec<Vec<f32>> = (0..2)
+                .map(|_| (0..fs).map(|i| 0.25 * ((k + i) as f32 * 0.0654).sin()).collect())
+                .collect();
+            for f in e.encode_frame(&tone).unwrap() {
+                out.extend_from_slice(&f.data);
+            }
+            k += fs;
+        }
+        out
+    }
+
+    /// An MP2 source builds the AAC encoder from what it decodes to, and
+    /// its audio comes out re-encoded. The encoder was built only from the
+    /// demuxer's AAC config — which an MP2 / AC-3 / E-AC-3 source never has
+    /// — so it stayed `Lazy` and the audio was dropped for good.
+    #[cfg(all(feature = "media-codecs", feature = "fdk-aac"))]
+    #[test]
+    fn an_mp2_source_builds_the_aac_encoder_from_its_decoded_format() {
+        let cfg: RtmpOutputConfig = serde_json::from_value(serde_json::json!({
+            "id": "r1", "name": "r1", "dest_url": "rtmp://127.0.0.1/app", "stream_key": "k",
+            "audio_encode": { "codec": "aac_lc", "sample_rate": 44100, "channels": 1 }
+        }))
+        .unwrap();
+        let (events, _rx) = crate::manager::events::event_channel();
+        let stats = Arc::new(OutputStatsAccumulator::new("r1".into(), "r1".into(), "rtmp".into()));
+        let cancel = CancellationToken::new();
+        let mut state = EncoderState::Lazy;
+        let (mut dec, mut dec_codec) = (None, None);
+        let mut aac = 0usize;
+        for k in 0..20u64 {
+            let decoded = decode_other_audio_for_encode(
+                &mut state, &mut dec, &mut dec_codec, 0x03, &mp2_pes(4), 900_000 + k * 8_640,
+                &cfg, &cancel, &stats, "f", &events,
+            );
+            let EncoderState::Active { encoder, stage, .. } = &mut state else {
+                panic!("the encoder is built on the first PES that decodes");
+            };
+            assert_eq!((encoder.params().sample_rate, encoder.params().channels), (44_100, 1));
+            for f in decoded {
+                encoder.submit_through(stage, &f.planar, f.sample_rate, 900_000 + k * 8_640).unwrap();
+            }
+            aac += encoder.drain().len();
+        }
+        assert!(aac > 50, "{aac} AAC frames from 1.9 s of MP2");
     }
 
     /// Verify the exponential backoff schedule matches the docstring above.

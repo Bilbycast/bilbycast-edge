@@ -864,6 +864,8 @@ struct CmafState {
     /// (MP2 / AC-3 / E-AC-3). Opened on first `OtherAudio`.
     #[cfg(feature = "media-codecs")]
     ff_audio_decoder: Option<video_engine::AudioDecoder>,
+    /// An MPEG-2 video source with no `video_encode` has been reported.
+    mpeg2_warned: bool,
 }
 
 struct CencRuntime {
@@ -1313,6 +1315,7 @@ impl CmafState {
             cenc: None,
             #[cfg(feature = "media-codecs")]
             ff_audio_decoder: None,
+            mpeg2_warned: false,
         }
     }
 
@@ -1857,10 +1860,66 @@ async fn handle_frame(
                 state, config, stream_type, &data, pts, event_sender, flow_id,
             );
         }
-        // CMAF egress requires H.264 / HEVC. MPEG-2 input would need a
-        // transcode hop we don't have today; drop the AU so the audio
-        // path keeps working.
-        DemuxedFrame::Mpeg2 { .. } => {}
+        // CMAF carries H.264 / HEVC: MPEG-2 video goes out re-encoded
+        // (`video_encode`), which the decoder layer does. Without one it is
+        // dropped and the operator told once — it used to be dropped either
+        // way, silently, and an MPEG-2 source published nothing at all (the
+        // audio shed for want of a video segment to carry it).
+        DemuxedFrame::Mpeg2 { es, pts, pts_known, .. } => {
+            if state.video_reencoder.is_none() {
+                if !state.mpeg2_warned {
+                    state.mpeg2_warned = true;
+                    let msg = format!(
+                        "CMAF output '{}': the source's MPEG-2 video cannot be carried in CMAF \
+                         (H.264 / HEVC only) without `video_encode`; nothing is published",
+                        config.id
+                    );
+                    tracing::warn!("{msg}");
+                    event_sender.emit_flow_with_details(
+                        EventSeverity::Warning,
+                        category::CMAF,
+                        msg,
+                        flow_id,
+                        serde_json::json!({
+                            "error_code": "codec_needs_encode",
+                            "output_id": config.id,
+                            "essence": "video",
+                            "source_codec": "MPEG-2 video",
+                            "needs": "video_encode",
+                        }),
+                    );
+                }
+                return;
+            }
+            let recoded = match state.video_reencoder.as_mut() {
+                Some(reenc) => crate::timed_block_in_place!(
+                    "cmaf.video_reencoder",
+                    crate::engine::perf::TRANSCODE_BLOCK_WARN_MS,
+                    { reenc.encode_mpeg2(&es, pts_known.then_some(pts)) }
+                ),
+                None => return,
+            };
+            let family = config
+                .video_encode
+                .as_ref()
+                .and_then(|e| encode::encoded_codec_family(&e.codec))
+                .unwrap_or(VideoCodec::H264);
+            match recoded {
+                Ok(frames) => {
+                    for out in frames {
+                        push_video_sample(
+                            state, family, out.nalus, out.pts.unwrap_or(pts), out.is_keyframe, config,
+                            base_url, init_url, init_name, m3u8_url, mpd_url, publish_hls, publish_dash,
+                            stats, event_sender, flow_id, recv_time_us,
+                        )
+                        .await;
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("CMAF output '{}': video re-encode failed: {e}", config.id);
+                }
+            }
+        }
         // Stream discontinuity is metadata for stateful decoders; the
         // CMAF segmenter advances on its own GoP cadence and re-issues
         // an init segment on codec change.

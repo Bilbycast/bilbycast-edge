@@ -1331,7 +1331,7 @@ fn demux_decode_loop(
                         },
                     );
                 }
-                DemuxedFrame::Mpeg2 { es, pts, is_keyframe } => {
+                DemuxedFrame::Mpeg2 { es, pts, is_keyframe, .. } => {
                     // MPEG-2 has no NAL framing — wrap the ES in a single
                     // synthetic "NALU" so we reuse the existing
                     // PTS-jump / decoder-ensure / drain pipeline. The

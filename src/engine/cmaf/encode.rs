@@ -691,7 +691,7 @@ pub struct VideoReencoder {
     annex_b_scratch: Vec<u8>,
     /// Source codec pinned at first observed frame; changing codec is
     /// rejected (operator must restart the flow).
-    source_codec: Option<CmafVideoCodec>,
+    source_codec: Option<video_codec::VideoCodec>,
     /// Holds an H.264 decoder open back until an access unit carries the
     /// SPS, which seeds its reorder depth (`SpsOpenGate`).
     sps_gate: crate::engine::video_encode_util::SpsOpenGate,
@@ -838,14 +838,6 @@ impl VideoReencoder {
         _is_keyframe: bool,
         codec: CmafVideoCodec,
     ) -> Result<Vec<VideoOutFrame>> {
-        match self.source_codec {
-            None => self.source_codec = Some(codec),
-            Some(prev) if prev != codec => {
-                bail!("video re-encoder: source codec changed mid-flow");
-            }
-            _ => {}
-        }
-
         // Assemble Annex-B bitstream for the decoder. Each NAL unit in
         // `nalus` has start codes already stripped, so we re-prepend
         // 0x00000001.
@@ -854,12 +846,39 @@ impl VideoReencoder {
             self.annex_b_scratch.extend_from_slice(&[0, 0, 0, 1]);
             self.annex_b_scratch.extend_from_slice(nalu);
         }
+        let src_codec = match codec {
+            CmafVideoCodec::H264 => video_codec::VideoCodec::H264,
+            CmafVideoCodec::H265 => video_codec::VideoCodec::Hevc,
+        };
+        self.encode_scratch(src_codec, pts)
+    }
+
+    /// Encode one MPEG-2 video access unit — its ES, which the decoder takes
+    /// as it is — stamped `pts` (90 kHz), as [`Self::encode_frame`]. CMAF
+    /// carries H.264 / HEVC, so an MPEG-2 source reaches it only this way;
+    /// it used to be dropped whatever `video_encode` said.
+    pub fn encode_mpeg2(&mut self, es: &[u8], pts: Option<u64>) -> Result<Vec<VideoOutFrame>> {
+        self.annex_b_scratch.clear();
+        self.annex_b_scratch.extend_from_slice(es);
+        self.encode_scratch(video_codec::VideoCodec::Mpeg2, pts)
+    }
+
+    /// The access unit in `annex_b_scratch`, of `src_codec`, through the
+    /// decoder and the encoder.
+    fn encode_scratch(
+        &mut self,
+        src_codec: video_codec::VideoCodec,
+        pts: Option<u64>,
+    ) -> Result<Vec<VideoOutFrame>> {
+        match self.source_codec {
+            None => self.source_codec = Some(src_codec),
+            Some(prev) if prev != src_codec => {
+                bail!("video re-encoder: source codec changed mid-flow");
+            }
+            _ => {}
+        }
 
         if self.decoder.is_none() {
-            let src_codec = match codec {
-                CmafVideoCodec::H264 => video_codec::VideoCodec::H264,
-                CmafVideoCodec::H265 => video_codec::VideoCodec::Hevc,
-            };
             // Opened on the first access unit that carries the SPS (nothing
             // decodes before one), and seeded from it: an H.264 decoder's
             // reorder depth comes from its SPS (`ReorderSeed`). Opened on a
@@ -1023,10 +1042,14 @@ impl VideoReencoder {
     pub fn encode_frame(
         &mut self,
         _nalus: &[Vec<u8>],
-        _pts: u64,
+        _pts: Option<u64>,
         _is_keyframe: bool,
         _codec: CmafVideoCodec,
     ) -> Result<Vec<VideoOutFrame>> {
+        bail!("video_encode disabled at build time")
+    }
+
+    pub fn encode_mpeg2(&mut self, _es: &[u8], _pts: Option<u64>) -> Result<Vec<VideoOutFrame>> {
         bail!("video_encode disabled at build time")
     }
 }
@@ -1472,6 +1495,63 @@ mod flush_tests {
         // source went in I P B B.
         let pts: Vec<Option<u64>> = out.iter().map(|f| f.pts).collect();
         let want: Vec<Option<u64>> = (0..n as u64).map(|i| Some(i * 3_600)).collect();
+        assert_eq!(pts, want);
+    }
+
+    /// An MPEG-2 video source is re-encoded (CMAF carries H.264 / HEVC): its
+    /// ES goes to an MPEG-2 decoder as it is, and every picture comes back as
+    /// H.264 on its own PTS, the first an IDR carrying its SPS. MPEG-2 used
+    /// to be dropped whatever `video_encode` said. Needs the `ffmpeg` CLI to
+    /// make the source (skipped, and says so, without it).
+    #[test]
+    fn an_mpeg2_source_is_re_encoded() {
+        let made = std::process::Command::new("ffmpeg")
+            .args([
+                "-v", "error", "-f", "lavfi", "-i", "testsrc=size=176x144:rate=25", "-frames:v", "40",
+                "-c:v", "mpeg2video", "-g", "12", "-bf", "0", "-f", "mpeg2video", "pipe:1",
+            ])
+            .output();
+        let Some(made) = made.ok().filter(|o| o.status.success()) else {
+            eprintln!("an_mpeg2_source_is_re_encoded: no ffmpeg CLI, skipped");
+            return;
+        };
+        let es = made.stdout;
+        // One access unit per picture: each picture start code (00 00 01 00),
+        // with the sequence / GOP headers before it.
+        let mut cuts = vec![0usize];
+        let mut seen_picture = false;
+        for i in 0..es.len().saturating_sub(4) {
+            if es[i..i + 3] == [0, 0, 1] && es[i + 3] == 0x00 {
+                if seen_picture {
+                    // Start the next unit at any sequence / GOP header
+                    // directly ahead of this picture.
+                    let back = (cuts[cuts.len() - 1]..i)
+                        .rev()
+                        .find(|&j| es[j..j + 3] == [0, 0, 1] && matches!(es[j + 3], 0xB3 | 0xB8))
+                        .filter(|&j| es[j..i].windows(4).all(|w| !(w[..3] == [0, 0, 1] && w[3] == 0x01)));
+                    cuts.push(back.unwrap_or(i));
+                }
+                seen_picture = true;
+            }
+        }
+        cuts.push(es.len());
+        let aus: Vec<&[u8]> = cuts.windows(2).map(|w| &es[w[0]..w[1]]).collect();
+        assert_eq!(aus.len(), 40);
+        let cfg: VideoEncodeConfig = serde_json::from_value(serde_json::json!({
+            "codec": "x264", "preset": "veryfast", "bframes": 0, "fps_num": 25, "fps_den": 1
+        }))
+        .unwrap();
+        let mut re = VideoReencoder::new(&cfg, "mpeg2-test", None).unwrap();
+        let mut out = Vec::new();
+        for (i, au) in aus.iter().enumerate() {
+            out.extend(re.encode_mpeg2(au, Some(900_000 + i as u64 * 3_600)).unwrap());
+        }
+        out.extend(re.flush().unwrap());
+        assert_eq!(out.len(), 40, "every picture comes back");
+        assert!(out[0].is_keyframe);
+        assert!(out[0].nalus.iter().any(|n| n[0] & 0x1F == 7), "H.264, SPS on the IDR");
+        let pts: Vec<Option<u64>> = out.iter().map(|f| f.pts).collect();
+        let want: Vec<Option<u64>> = (0..40u64).map(|i| Some(900_000 + i * 3_600)).collect();
         assert_eq!(pts, want);
     }
 

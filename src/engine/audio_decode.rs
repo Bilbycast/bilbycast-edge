@@ -292,6 +292,18 @@ pub fn input_can_carry_ts_audio(input: &crate::config::models::InputConfig) -> b
 // Feeding the whole PES at once silently drops everything past the first
 // access unit (`avcodec_send_packet` decodes one AU per call).
 
+/// The name decode stats show for a libavcodec audio decoder's codec.
+#[cfg(feature = "media-codecs")]
+pub fn ff_codec_name(codec: video_codec::AudioDecoderCodec) -> &'static str {
+    match codec {
+        video_codec::AudioDecoderCodec::Mp2 => "MP2",
+        video_codec::AudioDecoderCodec::Ac3 => "AC-3",
+        video_codec::AudioDecoderCodec::Eac3 => "E-AC-3",
+        video_codec::AudioDecoderCodec::Opus => "Opus",
+        video_codec::AudioDecoderCodec::AacLatm => "AAC-LATM",
+    }
+}
+
 /// Map an MPEG-TS `stream_type` to the FFmpeg-backed audio decoder enum,
 /// or `None` for codecs that aren't routed through libavcodec (AAC has
 /// its own fdk-aac path).
