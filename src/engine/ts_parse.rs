@@ -1362,6 +1362,24 @@ pub fn write_pcr(pkt: &mut [u8], pcr_27mhz: u64) -> bool {
     true
 }
 
+/// Take the PCR out of a packet's adaptation field, keeping everything else
+/// — the flags, any OPCR / splice countdown / private data / extension (moved
+/// up by the six bytes) and the payload — and stuffing the field's end with
+/// 0xFF, so its length and the payload's position do not change. Returns
+/// `false`, the packet untouched, when it carries no PCR.
+pub fn clear_pcr(pkt: &mut [u8]) -> bool {
+    if extract_pcr(pkt).is_none() || pkt.len() < TS_PACKET_SIZE {
+        return false;
+    }
+    let af_end = (5 + pkt[4] as usize).min(TS_PACKET_SIZE);
+    pkt.copy_within(12..af_end, 6);
+    for b in &mut pkt[af_end - 6..af_end] {
+        *b = 0xFF;
+    }
+    pkt[5] &= !0x10;
+    true
+}
+
 /// An adaptation-field-only packet (AFC = `10`, adaptation_field_length
 /// 183, 0xFF stuffing) carrying `pcr_27mhz` on `pid`, with
 /// `discontinuity_indicator` when `discontinuity`.
@@ -1460,6 +1478,35 @@ impl CcRenumber {
 #[cfg(test)]
 mod pcr_helper_tests {
     use super::*;
+
+    #[test]
+    fn clear_pcr_keeps_the_rest_of_the_packet() {
+        let mut p = pcr_only_packet(0x100, 7, 123_456_789_012, true);
+        // An OPCR after the PCR, and a payload byte to keep.
+        p[5] |= 0x08;
+        p[12..18].copy_from_slice(&[1, 2, 3, 4, 5, 6]);
+        let mut q = p;
+        assert!(clear_pcr(&mut q));
+        assert_eq!(extract_pcr(&q), None);
+        assert_eq!(q[4], 183, "length unchanged");
+        assert_eq!(q[5], 0x88, "DI and OPCR flags kept, PCR flag cleared");
+        assert_eq!(&q[6..12], &[1, 2, 3, 4, 5, 6], "the OPCR moved up");
+        assert!(q[12..].iter().all(|&b| b == 0xFF));
+        assert!(!clear_pcr(&mut q), "nothing left to clear");
+        // A payload packet keeps its payload where it was.
+        let mut v = [0u8; TS_PACKET_SIZE];
+        v[0] = TS_SYNC_BYTE;
+        v[3] = 0x30;
+        v[4] = 7;
+        v[5] = 0x10;
+        v[12..].iter_mut().enumerate().for_each(|(i, b)| *b = i as u8);
+        let before = v;
+        assert!(clear_pcr(&mut v));
+        assert_eq!(&v[..5], &before[..5]);
+        assert_eq!(v[5], 0x00);
+        assert!(v[6..12].iter().all(|&b| b == 0xFF));
+        assert_eq!(&v[12..], &before[12..]);
+    }
 
     #[test]
     fn pcr_only_packet_round_trips_and_is_af_only() {

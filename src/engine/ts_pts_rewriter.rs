@@ -140,7 +140,7 @@ use std::sync::Arc;
 
 use super::av_sync_mux::AvSyncPacer;
 use super::ts_parse::{
-    descriptor_audio_kind, extract_pcr, extract_pes_dts, extract_pes_pts, mpeg2_crc32,
+    clear_pcr, descriptor_audio_kind, extract_pcr, extract_pes_dts, extract_pes_pts, mpeg2_crc32,
     parse_pat_programs, set_discontinuity_indicator, strip_to_af_only, ts_discontinuity_indicator,
     ts_has_adaptation, ts_has_payload, ts_pid, ts_pusi, CcRenumber,
     PmtUnitCollector, NULL_PID, PAT_PID, TS_PACKET_SIZE, TS_SYNC_BYTE,
@@ -358,6 +358,20 @@ pub struct TsPtsRewriter {
     /// was learned, and the last PCR it was measured from.
     unlearned_src_27mhz: u64,
     unlearned_last_pcr: Option<u64>,
+    /// The PCR PID that window is measured on: the first to carry a PCR
+    /// while no PMT names one. Every program of an MPTS has its own clock,
+    /// seconds from the others; summed across them, the forward steps
+    /// between programs expired the 2 s window within a few PCRs (Spain,
+    /// 4 ms after flow start).
+    unlearned_pcr_pid: Option<u16>,
+    /// A PAT has been parsed. Until then no PCR goes out, regenerated or
+    /// not: whether the stream is one program (regenerate) or several
+    /// (verbatim, `mpts_passthrough_latch`) is not known yet, and a PCR
+    /// regenerated on one anchor for several programs' clocks — then left
+    /// at its source value once the PAT latched verbatim passthrough — put
+    /// undeclared DIs and backward steps on every program of a media-player
+    /// MPTS in its first ~100 ms.
+    pat_seen: bool,
     /// Set when [`ROLES_UNLEARNED_WINDOW_27MHZ`] expired with no PMT: PCR
     /// passes through with the source clock (so it agrees with the
     /// untouched PES timestamps) until a PMT is learned, when the anchor
@@ -497,6 +511,8 @@ impl TsPtsRewriter {
             learned_by_pmt: HashMap::new(),
             unlearned_src_27mhz: 0,
             unlearned_last_pcr: None,
+            unlearned_pcr_pid: None,
+            pat_seen: false,
             clock_passthrough_unlearned: false,
             pending_di: false,
             event_sink: None,
@@ -589,6 +605,28 @@ impl TsPtsRewriter {
                 if pid == PAT_PID && ts_pusi(pkt) {
                     self.observe_pat(pkt);
                 }
+                // A PES the gate was dropping when the PAT latched keeps
+                // going until the PID's next PES starts, and the PIDs it
+                // dropped packets on keep their CC renumbered: verbatim
+                // from the latch, each such PID showed one continuity
+                // error at flow start.
+                if let Some(g) = self.pes_gate.get_mut(&pid) {
+                    if ts_pusi(pkt) {
+                        g.dropping = false;
+                    }
+                    if g.dropping && ts_has_payload(pkt) {
+                        g.cc.drop_payload();
+                        continue;
+                    }
+                    if g.cc.rewrites(false) {
+                        let mut buf = [0u8; TS_PACKET_SIZE];
+                        buf.copy_from_slice(pkt);
+                        g.cc.emit(&mut buf, false);
+                        out.extend_from_slice(&buf);
+                        continue;
+                    }
+                    g.cc.emitted_unchanged();
+                }
                 out.extend_from_slice(pkt);
                 continue;
             }
@@ -637,9 +675,23 @@ impl TsPtsRewriter {
                 let is_pcr_pid =
                     self.pcr_pids.is_empty() || self.pcr_pids.contains(&pid);
                 if is_pcr_pid && !self.pmt_learned {
-                    self.note_unlearned_pcr(src_pcr);
+                    self.note_unlearned_pcr(pid, src_pcr);
                 }
-                if is_pcr_pid && self.clock_passthrough_unlearned {
+                if !self.pat_seen
+                    && !self.clock_passthrough_unlearned
+                    && !self.clock_passthrough_no_pcr
+                {
+                    // No PAT yet: the PCR does not go out (see `pat_seen`).
+                    // An adaptation-field-only carrier goes with it — it
+                    // advances no CC; a payload packet loses the field and
+                    // keeps the rest.
+                    if !ts_has_payload(pkt) {
+                        continue;
+                    }
+                    buf.copy_from_slice(pkt);
+                    clear_pcr(&mut buf);
+                    rewritten = true;
+                } else if is_pcr_pid && self.clock_passthrough_unlearned {
                     // Source clock through, unchanged apart from the one
                     // DI=1 that marks the switch away from the master
                     // timeline.
@@ -754,7 +806,8 @@ impl TsPtsRewriter {
                     && g.dropping
                     && ts_has_payload(pkt)
                 {
-                    let keeps_af = extract_pcr(pkt).is_some() || ts_discontinuity_indicator(pkt);
+                    let cur: &[u8] = if rewritten { &buf } else { pkt };
+                    let keeps_af = extract_pcr(cur).is_some() || ts_discontinuity_indicator(cur);
                     if !keeps_af {
                         g.cc.drop_payload();
                         continue;
@@ -1306,6 +1359,9 @@ impl TsPtsRewriter {
         }
         let version = (pkt[sec_off + 5] >> 1) & 0x1F;
         let programs = parse_pat_programs(pkt);
+        if !programs.is_empty() {
+            self.pat_seen = true;
+        }
         if self.last_pat_version == Some(version) {
             // Same version is normally the same PAT. A spliced source — a
             // playlist of files that all carry version 0 — can move to a
@@ -1375,6 +1431,7 @@ impl TsPtsRewriter {
             self.pmt_learned = false;
             self.unlearned_src_27mhz = 0;
             self.unlearned_last_pcr = None;
+            self.unlearned_pcr_pid = None;
             tracing::info!(
                 pmt_pid,
                 "ts_pts_rewriter: the PAT dropped the learned program — re-learning roles \
@@ -1466,8 +1523,10 @@ impl TsPtsRewriter {
     /// Account source time while PCR is being rewritten without a learned
     /// PMT, and fall back to the source clock once
     /// [`ROLES_UNLEARNED_WINDOW_27MHZ`] expires.
-    fn note_unlearned_pcr(&mut self, src_pcr: u64) {
-        if self.clock_passthrough_unlearned {
+    fn note_unlearned_pcr(&mut self, pid: u16, src_pcr: u64) {
+        if self.clock_passthrough_unlearned
+            || *self.unlearned_pcr_pid.get_or_insert(pid) != pid
+        {
             return;
         }
         if let Some(prev) = self.unlearned_last_pcr {
@@ -2151,9 +2210,10 @@ mod tests {
         }
     }
 
-    /// No PMT learned within 2 s of source PCR time: the rewriter stops
-    /// regenerating PCR (source clock through, DI=1 on the switch) so PCR
-    /// and the untouched PES agree; a PMT learned later brings
+    /// No PAT and no PMT within 2 s of source PCR time: the PCR is withheld
+    /// until then (no PAT: one program or several is not known), then the
+    /// source clock passes through — the first PCR the receiver sees, so no
+    /// DI — so PCR and the untouched PES agree; a PMT learned later brings
     /// regeneration back with DI=1 on the re-anchoring PCR.
     #[test]
     fn unlearned_pmt_falls_back_to_the_source_clock_and_recovers() {
@@ -2168,12 +2228,16 @@ mod tests {
             let src = base + i * step;
             let mut out = Vec::new();
             r.process(&build_pcr_packet(0x200, src), &mut out);
-            let got = extract_pcr(&out[out.len() - TS_PACKET_SIZE..]).unwrap();
-            if got == src && first_passthrough.is_none() {
+            let Some(got) = extract_pcr(&out[out.len() - TS_PACKET_SIZE..]) else {
+                assert!(first_passthrough.is_none(), "withheld only until the fallback");
+                continue;
+            };
+            assert_eq!(got, src, "never regenerated without a PAT");
+            if first_passthrough.is_none() {
                 first_passthrough = Some(i);
                 assert!(
-                    crate::engine::ts_parse::ts_discontinuity_indicator(&out[out.len() - TS_PACKET_SIZE..]),
-                    "DI=1 on the switch to the source clock"
+                    !crate::engine::ts_parse::ts_discontinuity_indicator(&out[out.len() - TS_PACKET_SIZE..]),
+                    "the first PCR out needs no DI"
                 );
             }
             last_out = out;
@@ -2193,6 +2257,103 @@ mod tests {
         let pkt = &out[out.len() - TS_PACKET_SIZE..];
         assert_ne!(extract_pcr(pkt).unwrap(), src, "regenerated again");
         assert!(crate::engine::ts_parse::ts_discontinuity_indicator(pkt));
+    }
+
+    /// A media-player MPTS carries several programs' PCRs, seconds apart,
+    /// ahead of its first PAT (Spain: the PAT 368 ms in). None of them may
+    /// leave regenerated: the rewriter used to anchor the first, bridge the
+    /// others with DI=1 and, once the PAT latched verbatim passthrough, step
+    /// each program back to its source value with no DI at all. Nothing
+    /// goes out before the PAT; after it every PCR is the source's, and a
+    /// PES the gate was dropping at the latch goes on being dropped, its
+    /// CC continuous.
+    #[test]
+    fn an_mpts_sends_no_pcr_before_its_pat_and_only_source_pcrs_after() {
+        use crate::engine::ts_parse::ts_discontinuity_indicator;
+        use crate::engine::ts_test_fixtures::pes_start_packet;
+        let mut r = TsPtsRewriter::new(make_wallclock_pacer());
+        let ms = 27_000u64;
+        let clocks = [(0x515u16, 92_934_974 * ms), (0x44D, 92_934_939 * ms), (0x4B1, 92_892_909 * ms)];
+        let mut out = Vec::new();
+        // A video PES (with a PCR) starting on 0x44D ahead of the PAT, and
+        // two continuation packets of it.
+        let pes = pes_start_packet(0x44D, 3, 0xE0, 8_000_000, None);
+        let mut v = pes;
+        v[3] = 0x30 | 3;
+        v[4] = 7;
+        v[5] = 0x10;
+        v[12..].copy_from_slice(&pes[4..TS_PACKET_SIZE - 8]);
+        crate::engine::ts_parse::write_pcr(&mut v, clocks[1].1);
+        assert!(crate::engine::ts_parse::pes_payload_offset(&v).is_some());
+        r.process(&v, &mut out);
+        for k in 0..10u64 {
+            for (pid, c) in clocks {
+                r.process(&build_pcr_packet(pid, c + k * 30 * ms), &mut out);
+            }
+        }
+        assert!(
+            out.chunks_exact(TS_PACKET_SIZE).all(|p| extract_pcr(p).is_none() && ts_pid(p) != 0x44D),
+            "no PCR, and none of the gated PES, before the PAT"
+        );
+        let cont = |cc: u8| {
+            let mut p = [0xAAu8; TS_PACKET_SIZE];
+            p[0] = TS_SYNC_BYTE;
+            p[1] = 0x04;
+            p[2] = 0x4D;
+            p[3] = 0x10 | cc;
+            p
+        };
+        r.process(&cont(4), &mut out);
+        r.process(&build_mpts_pat(6), &mut out);
+        assert!(r.mpts_passthrough_latch);
+        r.process(&cont(5), &mut out);
+        let next = pes_start_packet(0x44D, 6, 0xE0, 8_003_600, None);
+        r.process(&next, &mut out);
+        r.process(&cont(7), &mut out);
+        for k in 10..20u64 {
+            for (pid, c) in clocks {
+                r.process(&build_pcr_packet(pid, c + k * 30 * ms), &mut out);
+            }
+        }
+        let mut last: std::collections::HashMap<u16, u64> = Default::default();
+        let mut ccs = Vec::new();
+        for p in out.chunks_exact(TS_PACKET_SIZE) {
+            let pid = ts_pid(p);
+            if let Some(v) = extract_pcr(p) {
+                assert!(!ts_discontinuity_indicator(p), "no DI on 0x{pid:X}");
+                let (_, base) = clocks.iter().find(|(q, _)| *q == pid).unwrap();
+                assert_eq!((v - base) % (30 * ms), 0, "a source value on 0x{pid:X}");
+                if let Some(prev) = last.insert(pid, v) {
+                    assert_eq!(v - prev, 30 * ms, "0x{pid:X} steps its own 30 ms");
+                }
+            }
+            if pid == 0x44D && p[3] & 0x10 != 0 && extract_pcr(p).is_none() {
+                ccs.push(p[3] & 0x0F);
+            }
+        }
+        assert_eq!(last.len(), 3);
+        assert_eq!(ccs.len(), 2, "the continuation of the dropped PES is dropped: {ccs:?}");
+        assert_eq!((ccs[0] + 1) & 0x0F, ccs[1], "CC continuous: {ccs:?}");
+    }
+
+    /// With no PMT yet, the 2 s roles-unlearned window runs on one PID's
+    /// clock. Summed over an MPTS's programs, the forward steps between
+    /// their clocks expired it within a few PCRs.
+    #[test]
+    fn the_unlearned_window_runs_on_one_programs_clock() {
+        let mut r = TsPtsRewriter::new(make_wallclock_pacer());
+        let ms = 27_000u64;
+        let clocks = [(0x515u16, 92_934_974 * ms), (0x4B1, 92_892_909 * ms), (0x579, 92_900_785 * ms)];
+        for k in 0..10u64 {
+            for (pid, c) in clocks {
+                r.note_unlearned_pcr(pid, c + k * 30 * ms);
+            }
+        }
+        assert!(!r.clock_passthrough_unlearned, "270 ms of one clock is not 2 s");
+        for k in 10..80u64 {
+            r.note_unlearned_pcr(0x515, clocks[0].1 + k * 30 * ms);
+        }
+        assert!(r.clock_passthrough_unlearned, "2.37 s of it is");
     }
 
     /// PSI passes through unchanged.
