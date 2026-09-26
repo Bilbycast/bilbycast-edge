@@ -115,12 +115,13 @@ pub fn spawn_pcr_ingress_sampler_with_rx(
             "BILBYCAST_PLL_CPUS",
         ),
         async move {
+            let mut follow = PllPcrPid::default();
             loop {
                 tokio::select! {
                     _ = cancel.cancelled() => break,
                     msg = rx.recv() => {
                         match msg {
-                            Ok(pkt) => { let _ = sample_packet(&master, &pkt); }
+                            Ok(pkt) => { let _ = sample_packet(&master, &pkt, &mut follow); }
                             Err(broadcast::error::RecvError::Lagged(_)) => continue,
                             Err(broadcast::error::RecvError::Closed) => break,
                         }
@@ -473,8 +474,52 @@ fn pcr_gap_27mhz(prev: u64, cur: u64) -> i64 {
     crate::engine::ts_parse::pcr_diff_27mhz(cur, prev)
 }
 
+/// A followed PCR PID that carried no PCR for this long (receive time) hands
+/// the PLL to whichever PID carries one next: an input switch to a stream
+/// whose PCR rides another PID. MPEG-TS asks for a PCR at least every
+/// 100 ms, so a second of silence is no program's own cadence.
+const PLL_PID_SILENCE_US: u64 = 1_000_000;
+
+/// The one PCR PID the PLL follows.
+///
+/// An MPTS carries one independent 27 MHz clock per program, usually
+/// seconds apart. Fed every PID's PCR, the PLL saw the inter-program skew
+/// as a > 500 ms discontinuity on almost every sample and re-anchored
+/// instead of tracking any of them — the same trap `PcrJumpWatch` closes
+/// for the discontinuity watch, and the media player's and `wire_emit`'s
+/// anchor-PID rule avoid for pacing. The first PID to carry a PCR is
+/// followed, like theirs; another takes over only after it has been silent
+/// for [`PLL_PID_SILENCE_US`].
+#[derive(Debug, Default)]
+struct PllPcrPid {
+    followed: Option<(u16, u64)>,
+}
+
+impl PllPcrPid {
+    /// A PCR on `pid` received at `recv_us`: `(feeds the PLL, the PLL moved
+    /// to this PID from another)`.
+    fn admit(&mut self, pid: u16, recv_us: u64) -> (bool, bool) {
+        match self.followed {
+            Some((p, _)) if p == pid => {
+                self.followed = Some((pid, recv_us));
+                (true, false)
+            }
+            Some((_, last)) if recv_us.saturating_sub(last) < PLL_PID_SILENCE_US => (false, false),
+            Some(_) => {
+                self.followed = Some((pid, recv_us));
+                (true, true)
+            }
+            None => {
+                self.followed = Some((pid, recv_us));
+                (true, false)
+            }
+        }
+    }
+}
+
 /// Scan a single `RtpPacket` for PCR samples, feeding the master's PLL
-/// for each one. Pure function — no I/O, no allocations on the hot path.
+/// for each one on the followed PCR PID ([`PllPcrPid`]). Pure function —
+/// no I/O, no allocations on the hot path.
 ///
 /// Crucially: every PCR found in this datagram is recorded against the
 /// datagram's `recv_time_us` (captured at the input task's UDP recv()
@@ -482,7 +527,11 @@ fn pcr_gap_27mhz(prev: u64, cur: u64) -> i64 {
 /// internal `epoch.elapsed()` here would bake broadcast-subscriber
 /// scheduling jitter into `Δwall_ns` and prevent lock against
 /// otherwise-clean sources.
-fn sample_packet(master: &SourcePcrPllMaster, pkt: &RtpPacket) -> Option<u64> {
+fn sample_packet(
+    master: &SourcePcrPllMaster,
+    pkt: &RtpPacket,
+    follow: &mut PllPcrPid,
+) -> Option<u64> {
     let recv_time_us = pkt.recv_time_us;
     // Sender-timestamp path: when the SRT/RIST input surfaced a
     // sender-set timestamp (libsrt's `SRT_MsgCtrl::srctime`), prefer
@@ -516,13 +565,21 @@ fn sample_packet(master: &SourcePcrPllMaster, pkt: &RtpPacket) -> Option<u64> {
         let ts_pkt = &payload[i..i + TS_PACKET_SIZE];
         if ts_pkt[0] == TS_SYNC_BYTE {
             if let Some(pcr_27mhz) = extract_pcr(ts_pkt) {
+                let (feeds, moved) = follow.admit(ts_pid(ts_pkt), recv_time_us);
+                if moved {
+                    // Another program's clock: anchor afresh rather than
+                    // read the step between the two as a discontinuity.
+                    master.reset_anchor();
+                }
                 // Only feed PCR to the PLL when srctime wasn't
                 // available — otherwise we'd mix two rate references
                 // in the jitter window and the PLL would never lock.
-                if pkt.sender_timestamp_us.is_none() {
-                    master.record_sample_at(pcr_27mhz, recv_time_us);
+                if feeds {
+                    if pkt.sender_timestamp_us.is_none() {
+                        master.record_sample_at(pcr_27mhz, recv_time_us);
+                    }
+                    latest_pcr = Some(pcr_27mhz);
                 }
-                latest_pcr = Some(pcr_27mhz);
             }
             i += TS_PACKET_SIZE;
         } else {
@@ -600,7 +657,7 @@ mod tests {
             upstream_leg_id: None,
             sender_timestamp_us: None,
         };
-        sample_packet(&master, &pkt);
+        sample_packet(&master, &pkt, &mut PllPcrPid::default());
         // First sample primes the PLL (no cumulative count yet).
         let t = master.pll().telemetry();
         assert_eq!(t.samples, 0);
@@ -638,7 +695,7 @@ mod tests {
             upstream_leg_id: None,
             sender_timestamp_us: None,
         };
-        sample_packet(&master, &pkt);
+        sample_packet(&master, &pkt, &mut PllPcrPid::default());
 
         // Pre-sample fallback returns process-monotonic ticks (small,
         // fluctuates per call). Post-prime, `now_27mhz` projects from
@@ -667,9 +724,50 @@ mod tests {
             upstream_leg_id: None,
             sender_timestamp_us: None,
         };
-        sample_packet(&master, &pkt);
+        sample_packet(&master, &pkt, &mut PllPcrPid::default());
         let t = master.pll().telemetry();
         assert_eq!(t.samples, 0);
+    }
+
+    /// An MPTS interleaves one clock per program, seconds apart: the PLL
+    /// follows the first PID that carries a PCR, and hands over to another
+    /// only after a second without one on it.
+    #[test]
+    fn the_pll_follows_one_pcr_pid() {
+        let mut f = PllPcrPid::default();
+        assert_eq!(f.admit(0x515, 0), (true, false));
+        assert_eq!(f.admit(0x44D, 5_000), (false, false));
+        assert_eq!(f.admit(0x515, 30_000), (true, false));
+        assert_eq!(f.admit(0x4B1, 900_000), (false, false), "0x515 spoke 870 ms ago");
+        assert_eq!(f.admit(0x4B1, 1_030_001), (true, true), "silent for a second: handed over");
+        assert_eq!(f.admit(0x515, 1_040_000), (false, false));
+    }
+
+    /// Fed every program's PCR, the PLL read the inter-program skew as a
+    /// discontinuity on every sample and never counted one; following one
+    /// PID it tracks that program's clock.
+    #[test]
+    fn an_mpts_feeds_the_pll_one_programs_clock() {
+        let master = Arc::new(SourcePcrPllMaster::new("test"));
+        let mut follow = PllPcrPid::default();
+        let ms = 27_000u64;
+        let pkt = |pid: u16, pcr: u64, us: u64| RtpPacket {
+            data: Bytes::copy_from_slice(&crate::engine::ts_parse::pcr_only_packet(pid, 0, pcr, false)),
+            sequence_number: 0,
+            rtp_timestamp: 0,
+            recv_time_us: us,
+            is_raw_ts: true,
+            upstream_seq: None,
+            upstream_leg_id: None,
+            sender_timestamp_us: None,
+        };
+        for k in 0..40u64 {
+            let us = 1_000_000 + k * 30_000;
+            sample_packet(&master, &pkt(0x515, 92_934_974 * ms + k * 30 * ms, us), &mut follow);
+            sample_packet(&master, &pkt(0x44D, 92_934_939 * ms + k * 30 * ms, us + 10_000), &mut follow);
+            sample_packet(&master, &pkt(0x4B1, 92_892_909 * ms + k * 30 * ms, us + 20_000), &mut follow);
+        }
+        assert!(master.pll().telemetry().samples >= 30, "{:?}", master.pll().telemetry());
     }
 
     /// R3: an MPTS interleaves one clock per program, seconds apart. Only a
