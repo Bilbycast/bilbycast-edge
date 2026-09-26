@@ -33,6 +33,35 @@
 //! its own a frame or two off. The price of a new offset is a seam: the
 //! content on either side is joined end to end, so a real gap in the source
 //! across a discontinuity is closed.
+//!
+//! The offsets are shared by every CMAF output of a flow
+//! ([`CmafTimeline::for_flow`]), not kept per output. The flow's renditions
+//! (a DVR session's main and all-intra proxy, any two CMAF outputs) share
+//! one wall-clock epoch keyed by flow (`FlowClock`), so they must publish
+//! one media timeline: an output restarted after a jump — a config edit to
+//! its bitrate restarts that output alone — started over at offset 0 and
+//! published the source's raw timestamps while its sibling kept the offset
+//! it had absorbed, hours apart; each then re-anchored the other's epoch on
+//! every segment. A track's first timestamp takes the offset the flow is on
+//! (the one the output furthest along last moved onto), so a restarted
+//! output lands where its siblings are, and a jump one output meets first is
+//! taken up by the others as theirs.
+//!
+//! **Backward steps.** A track may step back within [`OWN_WINDOW_90K`] of its
+//! newest timestamp and keep its offset: that is a B-frame source's
+//! presentation order (the video is mapped by PTS, in decode order), and on
+//! audio an overlap the output drops (`buffer_audio_frames`), keeping the
+//! A/V relation. The cross window, though, takes a *backward* step only from
+//! a track on an excursion it opened itself — audio stamped 60 s back that
+//! comes back to the video's clock behind the audio just published. A track
+//! on the programme's clock that steps back further than its own window is
+//! a source jump: both tracks of a switch to a feed 1.5 s behind, a 2 s clip
+//! looping from its start, used to pass as "within 3 s of the other track"
+//! and publish 1.5 s backwards; the first track to see one now opens an
+//! offset and the other takes it.
+
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, Weak};
 
 /// One lap of the 33-bit PTS clock.
 const LAP_90K: u64 = 1 << 33;
@@ -84,6 +113,11 @@ struct Line {
     /// Recent positive steps between source timestamps.
     steps: [u64; STEP_HISTORY],
     n_steps: usize,
+    /// The track is on an excursion it opened itself (it took a new
+    /// offset), and has not yet come back to the offset the other track is
+    /// on: only such a track may step back onto the other's clock through
+    /// the cross window.
+    excursion: bool,
 }
 
 impl Line {
@@ -115,20 +149,81 @@ pub struct Mapped {
     pub jump: Option<i64>,
 }
 
+/// The offsets a flow's CMAF outputs share.
+#[derive(Debug)]
+struct Offsets {
+    /// Every offset in use, newest last.
+    list: Vec<u64>,
+    /// The offset the flow is on now: the one the output furthest along
+    /// the (common) output timeline last moved onto, and where it did.
+    /// An output behind its siblings that meets an old jump moves too, but
+    /// at an earlier output time, so it does not take this over.
+    current: u64,
+    current_at: Option<u64>,
+}
+
+impl Default for Offsets {
+    fn default() -> Self {
+        Self { list: vec![0], current: 0, current_at: None }
+    }
+}
+
+impl Offsets {
+    /// A track moved onto `off` with its sample at output time `ts`.
+    fn moved(&mut self, off: u64, ts: u64) {
+        if self.current_at.is_none_or(|at| circ(ts, at) >= 0) {
+            self.current = off;
+            self.current_at = Some(ts);
+        }
+    }
+}
+
+type SharedOffsets = Arc<Mutex<Offsets>>;
+
+/// Every flow's shared offsets, held weakly: the flow's outputs own them, so
+/// a flow whose CMAF outputs have all stopped starts over at offset 0.
+static FLOW_OFFSETS: OnceLock<Mutex<HashMap<String, Weak<Mutex<Offsets>>>>> = OnceLock::new();
+
+/// Lock, recovering from poisoning: what sits behind these locks is a list
+/// of numbers every one of which is a valid offset.
+fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    match m.lock() {
+        Ok(g) => g,
+        Err(e) => e.into_inner(),
+    }
+}
+
 #[derive(Debug)]
 pub struct CmafTimeline {
     video: Line,
     audio: Line,
-    offsets: Vec<u64>,
+    offsets: SharedOffsets,
 }
 
 impl Default for CmafTimeline {
+    /// A timeline of its own, shared with nothing (tests).
     fn default() -> Self {
-        Self { video: Line::default(), audio: Line::default(), offsets: vec![0] }
+        Self { video: Line::default(), audio: Line::default(), offsets: Arc::default() }
     }
 }
 
 impl CmafTimeline {
+    /// A timeline for one CMAF output of `flow_id`, sharing its offsets with
+    /// every other CMAF output of that flow (see the module doc).
+    pub fn for_flow(flow_id: &str) -> Self {
+        let mut flows = lock(FLOW_OFFSETS.get_or_init(Default::default));
+        flows.retain(|_, w| w.strong_count() > 0);
+        let offsets = match flows.get(flow_id).and_then(Weak::upgrade) {
+            Some(o) => o,
+            None => {
+                let o: SharedOffsets = Arc::default();
+                flows.insert(flow_id.to_string(), Arc::downgrade(&o));
+                o
+            }
+        };
+        Self { video: Line::default(), audio: Line::default(), offsets }
+    }
+
     /// Map a source timestamp (90 kHz) of `track` onto the output timeline.
     pub fn map(&mut self, track: Track, src: u64) -> Mapped {
         let src = src & MASK_33;
@@ -138,42 +233,67 @@ impl CmafTimeline {
         };
         me.note_step(src);
         let Some(newest) = me.newest else {
-            // A track's first timestamp takes the newest offset in use: the
-            // other track may already have moved off the source's clock.
-            me.offset = *self.offsets.last().unwrap_or(&0);
+            // A track's first timestamp takes the offset the flow is on: the
+            // other track, or another output of the flow, may already have
+            // moved off the source's clock.
+            me.offset = lock(&self.offsets).current;
             let ts = (src + me.offset) & MASK_33;
             me.newest = Some(ts);
             return Mapped { ts, jump: None };
         };
         let other_newest = other.newest;
+        let excursion = me.excursion;
         let continuous = |off: u64| -> Option<u64> {
             let ts = (src + off) & MASK_33;
             let own = circ(ts, newest);
             let own_ok = (-OWN_WINDOW_90K..=OWN_WINDOW_90K).contains(&own);
-            let cross_ok = other_newest.is_some_and(|o| circ(ts, o).abs() <= CROSS_WINDOW_90K);
+            // Onto the other track's clock: forwards (a track that paused
+            // and came back), or back from an excursion this track opened.
+            let cross_ok = (own > 0 || excursion)
+                && other_newest.is_some_and(|o| circ(ts, o).abs() <= CROSS_WINDOW_90K);
             (own_ok || cross_ok).then_some(ts)
         };
         let own_offset = me.offset;
-        let found = std::iter::once(own_offset)
-            .chain(self.offsets.iter().rev().copied().filter(|o| *o != own_offset))
-            .find_map(|off| continuous(off).map(|ts| (off, ts)));
-        let (offset, ts, jump) = match found {
-            Some((off, ts)) => (off, ts, None),
+        let (offset, ts, jump) = match continuous(own_offset) {
+            Some(ts) => (own_offset, ts, None),
             None => {
-                let default_step = match track {
-                    Track::Video => 3_003,
-                    Track::Audio => 1_920,
-                };
-                let ts = (newest + me.step(default_step)) & MASK_33;
-                let off = ts.wrapping_sub(src) & MASK_33;
-                self.offsets.push(off);
-                if self.offsets.len() > MAX_OFFSETS {
-                    self.offsets.remove(0);
+                let mut offsets = lock(&self.offsets);
+                let found = offsets
+                    .list
+                    .iter()
+                    .rev()
+                    .copied()
+                    .filter(|o| *o != own_offset)
+                    .find_map(|off| continuous(off).map(|ts| (off, ts)));
+                match found {
+                    Some((off, ts)) => {
+                        offsets.moved(off, ts);
+                        (off, ts, None)
+                    }
+                    None => {
+                        let default_step = match track {
+                            Track::Video => 3_003,
+                            Track::Audio => 1_920,
+                        };
+                        let ts = (newest + me.step(default_step)) & MASK_33;
+                        let off = ts.wrapping_sub(src) & MASK_33;
+                        offsets.list.retain(|o| *o != off);
+                        offsets.list.push(off);
+                        if offsets.list.len() > MAX_OFFSETS {
+                            offsets.list.remove(0);
+                        }
+                        offsets.moved(off, ts);
+                        me.excursion = true;
+                        (off, ts, Some(circ((src + own_offset) & MASK_33, ts)))
+                    }
                 }
-                (off, ts, Some(circ((src + own_offset) & MASK_33, ts)))
             }
         };
         me.offset = offset;
+        if me.excursion && jump.is_none() && other.newest.is_some() && offset == other.offset {
+            // Back on the offset the other track is on.
+            me.excursion = false;
+        }
         if circ(ts, newest) > 0 {
             me.newest = Some(ts);
         }
@@ -282,6 +402,170 @@ mod tests {
         let a2 = tl.map(Track::Audio, a + jump);
         assert_eq!(a2.jump, None, "the audio takes the video's offset");
         assert_eq!(circ(v2.ts, a2.ts), circ(v, a), "the A/V relation is the source's");
+    }
+
+    /// Two CMAF outputs of one flow publish one timeline, one of them
+    /// started after the source jumped (an output restarted by a config
+    /// edit to its bitrate): it lands on the offset its sibling absorbed,
+    /// where it used to publish the source's raw timestamps, hours off, and
+    /// the two re-anchored the flow's shared epoch on every segment.
+    #[test]
+    fn an_output_started_after_a_jump_publishes_its_siblings_timeline() {
+        let flow = "timeline-test-restart";
+        let mut a = CmafTimeline::for_flow(flow);
+        let mut b = CmafTimeline::for_flow(flow);
+        let (mut v, mut aud) = (900_000u64, 896_000u64);
+        for _ in 0..30 {
+            for t in [&mut a, &mut b] {
+                t.map(Track::Video, v);
+                t.map(Track::Audio, aud);
+            }
+            v += 3_600;
+            aud += 1_920;
+        }
+        // An input switch to a feed on an unrelated clock.
+        let jump = 20_000 * 90_000u64;
+        let (mut v2, mut a2) = (v + jump, aud + jump);
+        for _ in 0..30 {
+            for t in [&mut a, &mut b] {
+                t.map(Track::Video, v2);
+                t.map(Track::Audio, a2);
+            }
+            v2 += 3_600;
+            a2 += 1_920;
+        }
+        // `b` restarts.
+        drop(b);
+        let mut b = CmafTimeline::for_flow(flow);
+        for _ in 0..30 {
+            let (va, vb) = (a.map(Track::Video, v2), b.map(Track::Video, v2));
+            let (aa, ab) = (a.map(Track::Audio, a2), b.map(Track::Audio, a2));
+            assert_eq!(va, vb, "one video timeline");
+            assert_eq!(aa, ab, "one audio timeline");
+            assert!(circ(va.ts, v2) != 0, "on the absorbed offset, not the source's clock");
+            v2 += 3_600;
+            a2 += 1_920;
+        }
+        // A flow whose outputs have all stopped starts over.
+        drop((a, b));
+        let mut c = CmafTimeline::for_flow(flow);
+        assert_eq!(c.map(Track::Video, v2).ts, v2);
+        // Another flow is its own.
+        let mut d = CmafTimeline::for_flow("timeline-test-other");
+        assert_eq!(d.map(Track::Video, 123_456).ts, 123_456);
+    }
+
+    /// A jump one output meets first is taken up by the other as the same
+    /// offset, even behind it by frames; and an output started while a
+    /// sibling behind the others is still meeting an old excursion takes
+    /// the offset the flow is on now, not the one that sibling just moved
+    /// onto.
+    #[test]
+    fn two_outputs_take_one_offset_for_one_jump() {
+        let flow = "timeline-test-lag";
+        let mut a = CmafTimeline::for_flow(flow);
+        let mut b = CmafTimeline::for_flow(flow);
+        // Five frames stamped on another clock, then back.
+        let src: Vec<u64> = (0..80u64)
+            .map(|k| if (30..35).contains(&k) { 5_000_000_000 + k * 3_600 } else { 900_000 + k * 3_600 })
+            .collect();
+        let (mut out_a, mut out_b, mut out_c) = (Vec::new(), Vec::new(), Vec::new());
+        let mut c: Option<CmafTimeline> = None;
+        for i in 0..src.len() + 10 {
+            if i < src.len() {
+                out_a.push(a.map(Track::Video, src[i]).ts);
+            }
+            // `b` runs ten frames behind.
+            if i >= 10 {
+                out_b.push(b.map(Track::Video, src[i - 10]).ts);
+            }
+            // `c` starts live at frame 42, while `b` is inside the excursion.
+            if (42..src.len()).contains(&i) {
+                let c = c.get_or_insert_with(|| CmafTimeline::for_flow(flow));
+                out_c.push(c.map(Track::Video, src[i]).ts);
+            }
+        }
+        assert_eq!(out_a, out_b);
+        assert!(out_a.windows(2).all(|w| circ(w[1], w[0]) == 3_600), "continuous across the excursion");
+        assert_eq!(out_c[..], out_a[42..], "the output started late lands on the flow's offset");
+    }
+
+    /// Both tracks jumping 1.5 s back together (a switch to a feed that far
+    /// behind) is a jump, not a step back onto the other track's clock:
+    /// neither track publishes backwards, and the A/V relation is kept. It
+    /// used to pass the cross window ("within 3 s of the other track") and
+    /// publish 1.5 s back on both tracks.
+    #[test]
+    fn a_synchronised_backward_jump_does_not_go_backwards() {
+        for back in [135_000u64, 180_000, 250_000] {
+            let mut tl = CmafTimeline::default();
+            let (mut v, mut a) = (900_000u64, 896_000u64);
+            let mut vo = Vec::new();
+            let mut ao = Vec::new();
+            for k in 0..150u64 {
+                if k == 75 {
+                    v -= back;
+                    a -= back;
+                }
+                vo.push(tl.map(Track::Video, v).ts);
+                ao.push(tl.map(Track::Audio, a).ts);
+                v += 3_600;
+                a += 3_600;
+            }
+            assert!(vo.windows(2).all(|w| circ(w[1], w[0]) > 0), "{back}: video forward");
+            assert!(ao.windows(2).all(|w| circ(w[1], w[0]) > 0), "{back}: audio forward");
+            assert!(
+                vo.iter().zip(&ao).all(|(v, a)| circ(*v, *a) == 4_000),
+                "{back}: the source's A/V relation throughout"
+            );
+        }
+    }
+
+    /// A 2 s clip looping from its own start, over and over.
+    #[test]
+    fn a_short_clip_looping_from_its_start_runs_on() {
+        let mut tl = CmafTimeline::default();
+        let mut vo = Vec::new();
+        let mut ao = Vec::new();
+        for lap in 0..6u64 {
+            for k in 0..50u64 {
+                vo.push(tl.map(Track::Video, 900_000 + k * 3_600).ts);
+                ao.push(tl.map(Track::Audio, 900_000 + k * 3_600 + 1_000).ts);
+            }
+            let _ = lap;
+        }
+        assert!(vo.windows(2).all(|w| circ(w[1], w[0]) == 3_600), "video one frame a step");
+        assert!(ao.windows(2).all(|w| circ(w[1], w[0]) == 3_600), "audio one step a step");
+        assert!(vo.iter().zip(&ao).all(|(v, a)| circ(*a, *v) == 1_000));
+    }
+
+    /// The loop excursion above with the audio coming back 1.1 s behind the
+    /// audio just published — past its own window, back through the cross
+    /// window onto the video's clock (the excursion was its own).
+    #[test]
+    fn audio_back_from_its_own_excursion_rejoins_the_video_past_its_window() {
+        let mut tl = CmafTimeline::default();
+        let mut v = 3_168_500_000u64;
+        let mut a = v - 4_000;
+        for _ in 0..50 {
+            tl.map(Track::Video, v);
+            tl.map(Track::Audio, a);
+            v += 3_003;
+            a += 1_920;
+        }
+        // 1.2 s of audio stamped 60 s back.
+        let excursion = a - 60 * 90_000;
+        for k in 0..56u64 {
+            tl.map(Track::Audio, excursion + k * 1_920);
+        }
+        for _ in 0..5 {
+            assert_eq!(tl.map(Track::Video, v).ts, v);
+            v += 3_003;
+        }
+        let back = a + 5 * 3_003;
+        let m = tl.map(Track::Audio, back);
+        assert_eq!(m, Mapped { ts: back, jump: None }, "back on the source's clock");
+        assert_eq!(tl.map(Track::Audio, back + 1_920).ts, back + 1_920);
     }
 
     /// A track that paused while the other ran on comes back on the

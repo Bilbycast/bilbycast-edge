@@ -865,9 +865,10 @@ struct CmafState {
     /// (MP2 / AC-3 / E-AC-3). Opened on first `OtherAudio`.
     #[cfg(feature = "media-codecs")]
     ff_audio_decoder: Option<video_engine::AudioDecoder>,
-    /// The output's own media timeline (`timeline`): every source
-    /// timestamp goes through it before anything else sees it, so a source
-    /// that jumps is published as one continuous timeline.
+    /// The output's media timeline (`timeline`), its offsets shared with
+    /// the flow's other CMAF outputs: every source timestamp goes through
+    /// it before anything else sees it, so a source that jumps is published
+    /// as one continuous timeline, the same on every rendition.
     timeline: timeline::CmafTimeline,
     /// The newest audio timestamp buffered for the segmenter. A frame at or
     /// before it — audio returning from an excursion over what was already
@@ -1555,6 +1556,10 @@ async fn run(
 
     let mut demuxer = TsDemuxer::new(config.program_number);
     let mut state = CmafState::new();
+    // One media timeline for every CMAF output of the flow: they share
+    // the flow's wall-clock epoch (`FlowClock`), so a jump one absorbs
+    // must be the others' too, a restarted one's included.
+    state.timeline = timeline::CmafTimeline::for_flow(flow_id);
 
     // Pick up the window this stream was already publishing.
     //
