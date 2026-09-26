@@ -60,7 +60,7 @@ const STREAM_TYPE_AAC: u8 = 0x0F;
 /// dropping the AU); the ingress rewriter keeps the PCR→PTS relation to
 /// every output. 100 ms covers a frame of every audio codec carried here
 /// (AAC-LC at 16 kHz: 64 ms) within the decoder buffers of stereo AAC.
-const AUDIO_PCR_LEAD_90K: u64 = 9_000;
+pub(crate) const AUDIO_PCR_LEAD_90K: u64 = 9_000;
 
 /// Longest step an audio-only programme's PCR takes (90 kHz): 35 ms, under
 /// TR 101 290's 40 ms PCR repetition limit. One PCR per AU stepped by the

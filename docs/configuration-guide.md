@@ -1258,7 +1258,9 @@ programmes `TsMuxer` builds (RTSP, the PCM-encode input, an audio-only MP4 in
 the media player, the WebRTC input's Opus, and the SMPTE 302M PES of an
 `audio_302m` SRT / UDP / `rtp_audio` output) carry their PCR the same way. The
 302M path was the last to carry PCR = PTS, and wrote it on the audio PID even
-when a `pcr_pid` override named another; it now follows the same rule.
+when a `pcr_pid` override named another; it now follows the same rule, and its
+PES timeline starts 100 ms in, so its first PCR is 0 rather than just below
+the 33-bit wrap (nothing re-stamps a 302M output's PCR before the wire).
 Whether a publish carries video is read from its
 `onMetaData` (RTMP carries no FLV file header): metadata describing audio and
 no video makes the program audio-only at once; with no metadata — or metadata

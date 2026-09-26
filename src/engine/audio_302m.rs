@@ -559,7 +559,10 @@ pub struct S302mOutputPipeline {
     packetizer: S302mPacketizer,
     ts_mux: TsMuxer,
     /// 90 kHz PTS counter, advances by `out_packet_time_us * 90 / 1000`
-    /// per emitted PES packet.
+    /// per emitted PES packet. Starts at the muxer's audio PCR lead, so the
+    /// PCR — 100 ms behind each PES's PTS — starts at 0: from a PTS of 0 it
+    /// started just below the 2^33 wrap and wrapped 100 ms in, on a wire
+    /// with no rewriter between this muxer and the receiver.
     pts_90khz: u64,
     /// Output channel count (2/4/6/8) — used to verify the transcoder
     /// produced the right shape on each call.
@@ -659,7 +662,7 @@ impl S302mOutputPipeline {
             transcode,
             packetizer,
             ts_mux,
-            pts_90khz: 0,
+            pts_90khz: crate::engine::rtmp::ts_mux::AUDIO_PCR_LEAD_90K,
             out_channels,
             out_bit_depth,
             out_samples_per_block,
@@ -1028,6 +1031,19 @@ mod tests {
             !datagrams.is_empty(),
             "expected at least one 1316-byte SRT datagram"
         );
+        // The PCR leads each PES by 100 ms and starts at 0, not just below
+        // the 2^33 wrap: the first PES's PTS is the lead.
+        let pcrs: Vec<(u64, u64)> = datagrams
+            .iter()
+            .flat_map(|d| d.chunks(188))
+            .filter_map(|p| {
+                let pcr = crate::engine::ts_parse::extract_pcr(p)?;
+                Some((pcr / 300, crate::engine::ts_parse::extract_pes_pts(p)?))
+            })
+            .collect();
+        assert!(!pcrs.is_empty());
+        assert_eq!(pcrs[0], (0, 9_000), "the first PCR is 0, its PES 100 ms on");
+        assert!(pcrs.iter().all(|(pcr, pts)| pts - pcr == 9_000));
         for d in &datagrams {
             assert_eq!(d.len(), SRT_TS_DATAGRAM_BYTES);
             // Each datagram should be 7 valid TS packets (sync byte at 0, 188, 376...).
