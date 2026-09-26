@@ -1511,12 +1511,53 @@ loop, each playlist transition — continues one wire timeline:
   loop and no backward PTS / DTS. The price of one flat offset is a gap:
   each program pauses for as long as the program that needs the most
   (Spain program 186: its audio's next PES 340 ms after its last, 220 ms
-  of silence). A program **transcoded** out of such an MPTS still takes
-  one PCR-delay raise at each loop today: the output audio replacer fills
-  that gap with silence it can emit only when the next audio arrives, so
-  the fill is late (Spain +160 ms, 770_H +380 ms). To loop one program of
-  an MPTS, `program_number` on the input is the cleaner choice: the program
-  is then the anchor and nothing else constrains its splice.
+  of silence — set there by program 190's video, whose decode time runs
+  254 ms further ahead of its PCR at the file's end than at its start;
+  per-program offsets would need per-program pacing, since every program
+  shares the one packet clock). A program **transcoded** out of such an
+  MPTS fills that pause with silence as its clock passes it (see
+  [transcoding](transcoding.md), "A gap is filled as the program's clock
+  passes it"): it used to be encoded in one late burst when the next audio
+  arrived, which raised the transcode PCR delay at every loop (Spain
+  +163–182 ms, 770_H +274–290 ms) and pushed the video's T-STD residency
+  past 1 s. To loop one program of an MPTS, `program_number` on the input
+  is still the cleaner choice: the program is then the anchor and nothing
+  else constrains its splice.
+- **Whole audio frames across a splice.** The splice target is then moved
+  by less than one audio frame so each audio PID's step across it — its
+  last PES start to the next file's first — is a whole number of that
+  PID's access units (the frame length as the previous file played it,
+  else off the next file's head; the move that serves the most PIDs, the
+  smallest such). A gap that is not whole frames turns a re-encoder's
+  frame grid against the source's at every loop: each re-encoded frame
+  leaves when the source frame holding its last sample arrives, and that
+  wait moves by the gap's remainder — arrival minus media stepped −18 to
+  −22 ms at each loop on Spain MP2 → MP2, and −8 ms on Sky AAC. At most one
+  frame (21–32 ms) of pause is added.
+- **PSI across a splice.** A file's PAT / PMT cadence stops at its last
+  table and restarts at its first: the tail after the last, the splice and
+  the head before the first left 893 ms of PAT on Spain (the file repeats
+  it every 475 ms) and 955 ms of PMT on 770_H, against TR 101 290's 500 ms.
+  The rewriter's PSI_RR guard cannot help — it latches off on an MPTS,
+  runs before an output's program filter and re-emits only after 500 ms
+  have passed. So from the moment a file opens until it sends a table
+  itself (3 s at most), the player sends that table's last copy again
+  whenever 300 ms have gone by since it last went out — in the splice's
+  filler datagrams or ahead of the next file's packets, CC continued. The
+  margin is the outputs': a program-filtered output keeps only its
+  program's packets of each filler datagram and re-chunks them into
+  7-packet datagrams, so across a splice a lone table waits for six more
+  (Spain program 186's copies arrived up to 131 ms after their deadline
+  when due at 400 ms).
+  Within a file nothing is added. A playlist file whose PAT drops a PMT PID
+  drops that table at once. Byte-rate mode (`pcr_deadlines: false`) has no
+  deadlines to time it by and does not repeat.
+- **Continuity at flow start.** Before any payload has gone out on a PID,
+  the first adaptation-field-only packet's CC starts that PID's sequence.
+  The file-start video gate's PCR carriers (the video PES it drops,
+  stripped to their adaptation field) used to keep their source CCs — 12
+  continuity errors on Sky's video PID in the first half second of every
+  flow start.
 
 Expect up to about a second of held picture at each loop point of a
 capture that starts mid-GOP (the audio keeps playing) instead of corrupt

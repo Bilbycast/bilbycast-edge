@@ -32,11 +32,19 @@ A single per-flow clock fixes this:
   ran ~15 500 ppm fast against the PTS it described.
   `AvSyncPacer::pcr_27mhz_for_emit`, the only function that samples the
   master per PCR, is `#[allow(dead_code)]` and has no production
-  caller. Both generators are deterministic in the input bytes, so
-  multiple outputs of the same flow still emit identical PCR sequences —
-  until one of them has to raise its transcode delay.
-- **PTS still flows from the source** via `src_pts_queue` in the audio
-  + video replacers, so A/V offset versus source is preserved.
+  caller. Both generators are deterministic in the input bytes, but
+  only the **passthrough** outputs of a flow share its PCR sequence. A
+  transcoded output emits the flow's PCR less its own transcode delay `D`
+  (`ts_pcr_remux::shift`), and each output latches its `D` from its own
+  measured pipeline lateness from the first re-encoded PES on — three
+  transcoded outputs of one VH1 flow ran 80, 65.9 and 100.3 ms. Within an
+  output the sequence is continuous; `D` moves only at the one lowering
+  the residency cap allows or a guard raise, each a declared DI.
+- **PTS follows the source.** The video replacer stamps each re-encoded
+  picture with its own source PTS (`src_pts_queue`); the audio replacer
+  stamps from a sample-count model anchored on the source PTS, less the
+  latency the codec pipeline declares, and holds the content to the
+  source timeline at every PES. A/V offset versus source is preserved.
 - **Cross-edge coherence is not free**, and sharing a source PCR or a
   PTP grandmaster does not buy it. In muxer mode the anchor is stamped
   when the *first PCR arrives at this node*, so emitted PCR carries that
@@ -491,6 +499,29 @@ loop run `D` stays 80 ms through every loop (two stale drops, no raise, no
 DI, video lead ≤ 988 ms; it used to go 80 → 261 ms at the first loop with
 a DI'd PCR step back and 1 169 ms of video residency).
 
+A splice's hold is measured ahead of **any** video payload packet, not
+only a PES start. A file cut mid-PES opens with the continuation packets of
+a PES begun before it (770_H program 4030, whose MPTS is played whole, so
+no file-start gate trims it): at a splice they are the first video after
+the silence, and measured only at the next PES start the 373 ms silence
+had already gone by — no hold at all. The PES the input left pending is
+then known complete only at that next PES start, after the silence, so it
+keeps the hold total it had before it. The replacer also remembers each
+consumed PES until its frame leaves in a ring of 512, not 64: the next
+file's leading pictures up to its first random-access point (980 ms of
+them on 770_H 4030) decode to nothing and had pushed the held pictures'
+entries out (78 were in flight). With both, 770_H's tail pictures still
+held by the codec are dropped before the encoder when late — eleven, the
+last 220 ms before the loop — instead of leaving 206 ms late and raising
+`D` from 51 to 247 ms at every run's first loop (masked until the audio's
+own late fill stopped raising it first). The first picture encoded after a
+hold is also forced to an IDR, so nothing after it is predicted from a
+held picture the PCR stage drops as stale. Pinned by
+`a_silence_ahead_of_a_continuation_packet_is_a_hold`,
+`frames_held_through_a_splice_keep_their_hold_behind_the_next_files_leading_pictures`
+and `a_media_player_loop_tail_never_raises_d` (the first picture after the
+hold is an IDR).
+
 **Nothing re-encoded.** While neither replacer re-encodes — its codec
 cannot be decoded, a replacer fell back to passthrough — the stage applies
 no `D` at all and the stream passes byte-identical, as it did before the
@@ -620,13 +651,53 @@ about −16 500 s and was flagged. Pinned by
 one PCR after the jump it saw (it observes the fixer's output); the remux
 treats such a DI as no epoch (above).
 
+The **PLL sampler** on the same broadcast (`sample_packet`) had the same
+fault: it fed every PID's PCR to the source-PCR PLL, which on an MPTS read
+the inter-program skew as a > 500 ms discontinuity on almost every sample
+and re-anchored instead of tracking any clock. It now follows **one** PCR
+PID — the first to carry a PCR, the anchor-PID rule the media player's
+pacing and `wire_emit` already use — and hands over to another only after
+the followed PID has carried no PCR for 1 s of receive time (an input
+switch to a stream whose PCR rides another PID), re-anchoring the PLL
+there. Pinned by `the_pll_follows_one_pcr_pid` and
+`an_mpts_feeds_the_pll_one_programs_clock`.
+
+### No PCR before the PAT
+
+Until the muxer-mode rewriter has parsed a PAT it does not know whether
+the stream is one program (regenerate) or several (verbatim, the MPTS
+latch below). It used to regenerate every PCR it saw before then on one
+anchor: a media-player MPTS carries every program's PCRs ahead of its
+first PAT (Spain: the PAT 368 ms into the file), so the first PCR anchored,
+each other program's bridged a "jump" of the inter-program skew with DI=1,
+and when the PAT latched verbatim passthrough each program stepped back to
+its source value with no DI at all — undeclared DIs 60–90 ms after flow
+start and a backward PCR step on 770_H programs 4030 / 4070 / 4100. Its
+roles-unlearned window, summing the forward steps between the programs'
+clocks, also expired within 4 ms of the first PCR. Now no PCR leaves before
+the first PAT: an adaptation-field-only carrier is dropped (it advances no
+CC), a payload packet loses the PCR field and keeps the rest
+(`ts_parse::clear_pcr`). After the PAT an MPTS passes verbatim — every
+PCR the receiver sees is the source's, none carries a DI — and an SPTS
+anchors on its first PCR after the PAT, as it always did when the PAT came
+first. The PES before the PAT were already dropped (no anchor yet), so an
+SPTS loses nothing it used to send. The roles-unlearned window runs on the
+first PCR PID's clock alone, and still ends the wait after 2 s of it (a
+stream with no PAT at all then passes its source clock, as before). The
+PES the gate was dropping when the MPTS latch fired go on being dropped to
+the PID's next PES start, and the PIDs it dropped packets on keep their CC
+renumbered, so the latch leaves no continuity error either. Pinned by
+`an_mpts_sends_no_pcr_before_its_pat_and_only_source_pcrs_after`,
+`the_unlearned_window_runs_on_one_programs_clock` and
+`unlearned_pmt_falls_back_to_the_source_clock_and_recovers`.
+
 ## Module map
 
 | Module | What it does |
 |--------|--------------|
 | `engine/master_clock.rs` | The `MasterClock` trait, `MasterClockKind` enum, `MasterClockHandle` (Arc + tag + clamped lipsync trim), `WallclockMaster`, `SourcePcrPllMaster`, `PtpMasterClock`, and the auto-select policy |
 | `engine/pcr_pll.rs` | Software PI-controller PLL recovering source's 27 MHz from incoming PCR samples. PI loop on `(Δpcr_ticks, Δwall_ns)` with re-anchor on every accepted sample. Discontinuity filter mirrors `pcr_trust.rs` (gaps > 500 ms reset the anchor). Sticky lock-state hysteresis (enter at p99 < 100 µs, exit at > 500 µs). `now_27mhz(wall_ns)` projects forward from the anchor at the recovered rate so PCR generation never quantises to the ingress PCR cadence. |
-| `engine/pcr_ingress_sampler.rs` | Per-flow ingress PCR sampler. Sibling broadcast subscriber (drop-on-Lagged) that scans every `RtpPacket` for adaptation-field PCRs and feeds the master's PLL. Handles both raw TS and RTP-wrapped TS via best-effort RTP header skip. Passive observer — never blocks the data path. |
+| `engine/pcr_ingress_sampler.rs` | Per-flow ingress PCR sampler. Sibling broadcast subscriber (drop-on-Lagged) that scans every `RtpPacket` for adaptation-field PCRs and feeds the master's PLL — those of one PCR PID (`PllPcrPid`: the first to carry one; another after 1 s of silence on it). Handles both raw TS and RTP-wrapped TS via best-effort RTP header skip. Passive observer — never blocks the data path. |
 | `engine/av_sync_mux.rs` | `AvSyncPacer` — thin wrapper around `MasterClockHandle` that exposes `is_locked()`, the lipsync trim, the `assembler_owned` hand-off, and `pcr_27mhz_for_emit()` (master_now − PCR_PREROLL_27MHZ, modular-aware); that last one is `#[allow(dead_code)]`, called only from tests, and on no production path. It generates no PCR: the transcoded path's old `pcr_for_emit` (`pts × 300 − preroll`) is gone. |
 | `engine/ts_pcr_remux.rs` | The trailing PCR stage of every transcode chain: output PCR = input PCR − a measured transcode delay, the lateness guard, epochs, stale-frame drop, PCR synthesis when the input has none. See [Transcoded output PCR](#transcoded-output-pcr-the-remux-model). |
 | `engine/ts_pts_rewriter.rs` | Encoder-style byte-level PES PTS/DTS rewriter, per-PID anchor + source-delta model. Plugs into `input_post_process::InputPostProcess` as a fourth optional stage; on by default (muxer mode) unless per-input `passthrough_clock: true` opts out, plus an attached `AvSyncPacer`. See the "Encoder-style PES PTS regeneration" section above for the model. |

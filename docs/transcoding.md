@@ -613,8 +613,10 @@ the sample:
 
   Insertions and drops crossfade over 2 ms. An AU that fails to decode is
   replaced by silence of its nominal length where it stood. Nothing in it
-  reads a clock, so host load, encoder warm-up and wire backpressure can no
-  longer move the audio: the **master-clock catch-up** that did — it
+  reads the host's clock (the one clock it reads is the program's own PCR,
+  for the gap fill below), so host load, encoder warm-up and wire
+  backpressure can no longer move the audio: the **master-clock catch-up**
+  that did — it
   compared the master clock at the moment the codec thread reached a PES
   with the samples emitted, inserted 32 ms of silence per firing (7 times
   in 200 s at load average 40 on an AC-3 output, a gate-1 failure), and
@@ -629,6 +631,38 @@ the sample:
   locked to its PCR is held within ~5 ms by one short insert or drop about
   every 100 s at 50 ppm; `timeline_corrections`, `silence_inserted_samples`
   and `dropped_samples` on the output's `audio_encode_stats` count them.
+- **A gap is filled as the program's clock passes it, not when the audio
+  returns.** Found only at the next PES's PTS, a gap's silence used to be
+  encoded in one burst when the audio came back, stamped for when the gap
+  began: frames up to the whole gap behind the program's PCR. At a
+  `media_player` loop of an MPTS played whole the program's audio pauses as
+  long as the most demanding program needs (Spain program 186: 244 ms,
+  770_H program 4030: 464 ms); the burst arrived up to 203 ms late, and the
+  transcode chain's PCR stage (`ts_pcr_remux`) raised its delay by 163–290 ms
+  with a DI at every loop, which pushed the video's T-STD residency past 1 s.
+  Now the replacer reads the program's clock — its PMT's PCR_PID, each PCR
+  interpolated by packet count up to the next, never past one PCR interval —
+  and after every packet compares it with where the decoded content ends
+  (the *headroom*). Over the last 10 s of that clock it keeps the lowest
+  headroom the source left and the longest stretch its content end stood
+  still. When the content end has stood still 10 ms longer than that
+  stretch and the headroom has fallen 10 ms below that floor, the source is
+  missing audio it always had by now: silence is placed, as the clock goes
+  on, to keep the headroom at the floor, until the audio returns, which then
+  settles what is left at once (a gap filled, an overlap dropped — the
+  150 ms persistence rule is for timestamp jitter, not this). Each silent
+  frame so leaves where, and against the same PCR, a source frame would have
+  at the source's worst; nothing is placed ahead of audio a source keeping
+  its own lead still has to send. The first 2 s after an anchor are watched,
+  not acted on; a PCR that steps back, jumps over 1 s or carries DI starts
+  the learning over; past 500 ms of such silence the audio has stopped
+  rather than paused, and its return re-anchors. Silence placed this way is
+  counted in `silence_inserted_samples`, each run once in
+  `timeline_corrections`; the Info log line `ts_audio_replace: source audio
+  back after a gap filled on the program clock` gives each run's length and
+  remainder. It applies to the gap-fill-by-silence mode only (TS outputs, and
+  input-side transcodes of live inputs); a `media_player` input's own
+  transcode steps its PTS over the gap instead.
 - **`audio_encode.sample_rate` / `channels` convert even without a
   `transcode` block.** The encoder is opened at those values; the decoded
   PCM used to reach it unconverted, so a 48 kHz source through
