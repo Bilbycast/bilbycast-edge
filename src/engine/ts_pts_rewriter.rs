@@ -143,8 +143,9 @@ use std::sync::Arc;
 use super::av_sync_mux::AvSyncPacer;
 use super::ts_parse::{
     clear_pcr, descriptor_audio_kind, extract_pcr, extract_pes_dts, extract_pes_pts, mpeg2_crc32,
-    parse_pat_programs, set_discontinuity_indicator, strip_to_af_only, ts_discontinuity_indicator,
-    ts_has_adaptation, ts_has_payload, ts_pid, ts_pusi, CcRenumber,
+    parse_pat_programs, pcr_add_27mhz, pcr_diff_27mhz, pcr_fwd_27mhz, set_discontinuity_indicator,
+    strip_to_af_only, ts_discontinuity_indicator, ts_has_adaptation, ts_has_payload, ts_pid, ts_pusi,
+    CcRenumber,
     PmtUnitCollector, NULL_PID, PAT_PID, TS_PACKET_SIZE, TS_SYNC_BYTE,
 };
 
@@ -1065,11 +1066,13 @@ impl TsPtsRewriter {
     /// splice events at the correct moment relative to the regenerated
     /// PCR.
     fn anchor_offset_90k(&self) -> u64 {
-        let off_27mhz = self
-            .anchor
-            .out_27mhz
-            .wrapping_sub(self.anchor.src_27mhz);
-        (off_27mhz / 300) & 0x1_FFFF_FFFF
+        (pcr_fwd_27mhz(self.anchor.out_27mhz, self.anchor.src_27mhz) / 300) & 0x1_FFFF_FFFF
+    }
+
+    /// The output value (27 MHz, reduced) of source value `src_27mhz` by
+    /// the anchor: `out + (src − anchor.src)` in the modular PCR space.
+    fn anchored_27mhz(&self, src_27mhz: u64) -> u64 {
+        anchored_27mhz(&self.anchor, src_27mhz)
     }
 
     /// Record that PSI (PAT or PMT) just flowed — resets the PSI_RR
@@ -1120,10 +1123,10 @@ impl TsPtsRewriter {
             return;
         }
         let master_now = self.pacer.now_27mhz();
-        let gap = master_now.wrapping_sub(last);
-        // Protect against backwards/huge gaps (Wallclock master can
-        // produce wrap-near values briefly; ignore those).
-        if !(PSI_RR_MAX_27MHZ..PCR_MODULUS_27MHZ / 2).contains(&gap) {
+        // The master clock wraps with the PCR space: the gap is modular. A
+        // backward one (a master that stepped) waits.
+        let gap = pcr_diff_27mhz(master_now, last);
+        if gap < PSI_RR_MAX_27MHZ as i64 {
             return;
         }
         // Rewrite CC on every cached PSI packet before emitting so the
@@ -1176,7 +1179,7 @@ impl TsPtsRewriter {
             Some(v) => v,
             None => return, // first PCR — nothing to pad against
         };
-        let gap = next_out_pcr_27mhz.wrapping_sub(last);
+        let gap = pcr_fwd_27mhz(next_out_pcr_27mhz, last);
         // Only pad forward gaps within sane bounds. Backward / huge
         // forward jumps already had `set_di` raised on the source
         // packet; don't pad those (would emit absurd counts of padding).
@@ -1240,18 +1243,30 @@ impl TsPtsRewriter {
                 );
             }
             self.anchor.src_27mhz = src_pcr_27mhz;
-            self.anchor.out_27mhz = master_now.wrapping_sub(PCR_PREROLL_27MHZ);
+            self.anchor.out_27mhz = pcr_add_27mhz(master_now, -(PCR_PREROLL_27MHZ as i64));
             self.anchor.last_src_pcr_27mhz = src_pcr_27mhz;
             self.anchor.last_master_27mhz = master_now;
             self.anchor.established = true;
-            return (self.anchor.out_27mhz % PCR_MODULUS_27MHZ, false);
+            return (self.anchor.out_27mhz, false);
         }
 
         // A step an input transcode's PCR stage made itself is taken out
         // before the step is judged (see `note_upstream_pcr_steps`): what
         // is left is the source's own, and the stage's passes through.
-        let delta_src = (src_pcr_27mhz as i64).wrapping_sub(self.anchor.last_src_pcr_27mhz as i64)
+        //
+        // Both clocks wrap every 26.5 h (2^33 × 300 ticks), and neither
+        // wrap is a discontinuity: every step and every anchored value is
+        // taken in the modular PCR space. The step used to be a plain
+        // difference, so a source's own wrap read as a backward jump of
+        // the whole modulus — bridged, with DI — and the anchored values
+        // were u64 sums, which across the wrap left `2^64 mod (2^33 × 300)`
+        // in them: a PES past the wrap from an anchor just below it went
+        // out 16 543.6 s back (the media-player loop's IDR, see
+        // `pcr_fwd_27mhz`).
+        let delta_src = pcr_diff_27mhz(src_pcr_27mhz, self.anchor.last_src_pcr_27mhz)
             + self.take_upstream_step(src_pcr_27mhz);
+        let delta_master =
+            pcr_diff_27mhz(master_now, self.anchor.last_master_27mhz).max(0) as u64;
         let mut set_di = false;
 
         // Industry-standard remux discontinuity handling:
@@ -1280,13 +1295,10 @@ impl TsPtsRewriter {
         // - **Continuous segment** (|delta_src| ≤ 500 ms): anchor stays
         //   put, source-delta drives output, no DI.
         if delta_src < -(DISCONTINUITY_THRESHOLD_27MHZ as i64) {
-            let out_at_last = self.anchor.out_27mhz.wrapping_add(
-                self.anchor.last_src_pcr_27mhz.wrapping_sub(self.anchor.src_27mhz),
-            );
-            let delta_master = master_now.wrapping_sub(self.anchor.last_master_27mhz);
+            let out_at_last = self.anchored_27mhz(self.anchor.last_src_pcr_27mhz);
             let bridge = delta_master.min(MAX_BRIDGE_ADVANCE_27MHZ);
             self.anchor.src_27mhz = src_pcr_27mhz;
-            self.anchor.out_27mhz = out_at_last.wrapping_add(bridge);
+            self.anchor.out_27mhz = pcr_add_27mhz(out_at_last, bridge as i64);
             set_di = true;
             tracing::info!(
                 src_pcr_27mhz,
@@ -1330,15 +1342,12 @@ impl TsPtsRewriter {
             // PES PTS). The jump is also smaller than the display's 5 s
             // `pts_jump` re-anchor threshold, so it never trips a
             // discontinuity reset — it just accumulates silently.
-            let delta_master = master_now.wrapping_sub(self.anchor.last_master_27mhz);
             let unwitnessed = (delta_src as u64).saturating_sub(delta_master);
             if unwitnessed > DISCONTINUITY_THRESHOLD_27MHZ {
-                let out_at_last = self.anchor.out_27mhz.wrapping_add(
-                    self.anchor.last_src_pcr_27mhz.wrapping_sub(self.anchor.src_27mhz),
-                );
+                let out_at_last = self.anchored_27mhz(self.anchor.last_src_pcr_27mhz);
                 let bridge = delta_master.min(MAX_BRIDGE_ADVANCE_27MHZ);
                 self.anchor.src_27mhz = src_pcr_27mhz;
-                self.anchor.out_27mhz = out_at_last.wrapping_add(bridge);
+                self.anchor.out_27mhz = pcr_add_27mhz(out_at_last, bridge as i64);
                 tracing::info!(
                     src_pcr_27mhz,
                     delta_src_27mhz = delta_src,
@@ -1359,11 +1368,7 @@ impl TsPtsRewriter {
         self.anchor.last_src_pcr_27mhz = src_pcr_27mhz;
         self.anchor.last_master_27mhz = master_now;
 
-        let out_27mhz = self
-            .anchor
-            .out_27mhz
-            .wrapping_add(src_pcr_27mhz.wrapping_sub(self.anchor.src_27mhz));
-        (out_27mhz % PCR_MODULUS_27MHZ, set_di)
+        (self.anchored_27mhz(src_pcr_27mhz), set_di)
     }
 
     /// Compute output PES PTS (and DTS if present) from input values
@@ -1640,12 +1645,17 @@ impl TsPtsRewriter {
     }
 }
 
+/// The output value (27 MHz, reduced) of source value `src_27mhz`:
+/// `anchor.out + (src − anchor.src)` in the modular PCR space — the forward
+/// distance, so an anchor held past half the modulus still maps right.
+fn anchored_27mhz(anchor: &ClockAnchor, src_27mhz: u64) -> u64 {
+    pcr_add_27mhz(anchor.out_27mhz, pcr_fwd_27mhz(src_27mhz, anchor.src_27mhz) as i64)
+}
+
 /// Anchored value computation — shared by PES PTS, DTS, and PCR paths.
 fn compute_anchored_value(anchor: &ClockAnchor, src_pts_90k: u64, lipsync_90k: i64) -> u64 {
-    let src_pts_27mhz = src_pts_90k.wrapping_mul(300);
-    let delta_27mhz = src_pts_27mhz.wrapping_sub(anchor.src_27mhz);
-    let out_pts_27mhz = anchor.out_27mhz.wrapping_add(delta_27mhz);
-    let out_pts_90k = (out_pts_27mhz / 300) & 0x1_FFFF_FFFF;
+    let src_pts_27mhz = (src_pts_90k & 0x1_FFFF_FFFF) * 300;
+    let out_pts_90k = anchored_27mhz(anchor, src_pts_27mhz) / 300;
     let with_lipsync = (out_pts_90k as i64).wrapping_add(lipsync_90k);
     (with_lipsync as u64) & 0x1_FFFF_FFFF
 }
@@ -2513,6 +2523,101 @@ mod tests {
         );
     }
 
+    /// A master clock the test steps by hand.
+    struct StepMaster(std::sync::atomic::AtomicU64);
+
+    impl crate::engine::master_clock::MasterClock for StepMaster {
+        fn now_27mhz(&self) -> u64 {
+            self.0.load(std::sync::atomic::Ordering::Relaxed)
+        }
+        fn source_id(&self) -> &str {
+            "step"
+        }
+        fn is_locked(&self) -> bool {
+            true
+        }
+    }
+
+    fn step_pacer(at_27mhz: u64) -> (Arc<StepMaster>, Arc<AvSyncPacer>) {
+        let master = Arc::new(StepMaster(std::sync::atomic::AtomicU64::new(at_27mhz)));
+        let handle = MasterClockHandle::new(master.clone(), MasterClockKind::Wallclock);
+        (master, Arc::new(AvSyncPacer::new(handle)))
+    }
+
+    /// The source's 33-bit clock wraps every 26.5 h, and the wrap is no
+    /// discontinuity: the output PCR steps by the source's step with no DI
+    /// and every PES keeps its lead over the PCR. The step used to be a
+    /// plain difference — the wrap read as a backward jump of the whole
+    /// modulus, bridged with DI — and the anchored values u64 sums, which
+    /// across the wrap carried `2^64 mod (2^33 × 300)`: a PES past the wrap
+    /// from an anchor below it came out 16 543.6 s back (the media-player
+    /// loop's IDR on the rig). The output timeline is kept well clear of
+    /// its own wrap here, so only the source's is crossed.
+    #[test]
+    fn a_source_clock_wrap_is_no_discontinuity() {
+        use crate::engine::ts_parse::{pcr_add_27mhz, pcr_fwd_27mhz, ts_discontinuity_indicator};
+        const MS: u64 = 27_000;
+        let (master, pacer) = step_pacer(5_000 * MS);
+        let mut r = TsPtsRewriter::new(pacer);
+        let mut out = Vec::new();
+        r.process(&build_psi(0x100, 0x101), &mut out);
+        let src0 = PCR_MODULUS_27MHZ - 3_000 * MS;
+        let mut last_pcr: Option<u64> = None;
+        let mut pes = 0;
+        for k in 0..200u64 {
+            let src = pcr_add_27mhz(src0, (k * 30 * MS) as i64);
+            master.0.fetch_add(30 * MS, std::sync::atomic::Ordering::Relaxed);
+            let mut o = Vec::new();
+            r.process(&build_pcr_packet(0x100, src), &mut o);
+            // Audio 100 ms ahead of the PCR, its PTS wrapping 100 ms before it.
+            let pts = (src / 300 + 9_000) & 0x1_FFFF_FFFF;
+            r.process(&build_pes_packet_pts_only(0x101, pts), &mut o);
+            for p in o.chunks(TS_PACKET_SIZE) {
+                if let Some(v) = extract_pcr(p) {
+                    assert!(!ts_discontinuity_indicator(p), "PCR {k}: DI at the source's wrap");
+                    if let Some(l) = last_pcr {
+                        assert_eq!(pcr_fwd_27mhz(v, l), 30 * MS, "PCR {k}: the source's step");
+                    }
+                    last_pcr = Some(v);
+                }
+                if ts_pid(p) == 0x101 && ts_pusi(p) {
+                    let out_pts = extract_pes_pts(p).unwrap();
+                    let lead = (out_pts + (1 << 33) - last_pcr.unwrap() / 300) % (1 << 33);
+                    assert_eq!(lead, 9_000, "PES {k}: 100 ms ahead of its PCR");
+                    pes += 1;
+                }
+            }
+        }
+        assert_eq!(pes, 200);
+    }
+
+    /// PSI_RR runs on the master clock, which wraps with the PCR space: a
+    /// wrap between two PSI emissions is still a gap to fill. Measured as a
+    /// u64 difference it read as a huge one and injected nothing, until the
+    /// source's own PSI next came by.
+    #[test]
+    fn psi_rr_injects_across_a_master_clock_wrap() {
+        use crate::engine::ts_parse::pcr_add_27mhz;
+        const MS: u64 = 27_000;
+        let (master, pacer) = step_pacer(PCR_MODULUS_27MHZ - 200 * MS);
+        let mut r = TsPtsRewriter::new(pacer);
+        let mut out = Vec::new();
+        r.process(&build_psi(0x100, 0x101), &mut out);
+        let mut injected_at = None;
+        for k in 1..=30u64 {
+            master
+                .0
+                .store(pcr_add_27mhz(PCR_MODULUS_27MHZ - 200 * MS, (k * 30 * MS) as i64), std::sync::atomic::Ordering::Relaxed);
+            let mut o = Vec::new();
+            r.process(&build_pcr_packet(0x100, 10_000 * MS + k * 30 * MS), &mut o);
+            if injected_at.is_none() && o.chunks(TS_PACKET_SIZE).any(|p| ts_pid(p) == 0) {
+                injected_at = Some(k * 30);
+            }
+        }
+        let at = injected_at.expect("a PAT injected once 500 ms went by");
+        assert!((500..=540).contains(&at), "injected {at} ms after the last PSI");
+    }
+
     /// A forward PCR jump the wall clock never witnessed is an artefact
     /// of the *source* timeline (a file looping in the media player),
     /// not a real gap in content, so it must be bridged rather than
@@ -2847,7 +2952,7 @@ mod tests {
 
         // Simulate 600 ms of non-PSI silence by walking the timer back.
         let master_now = pacer.now_27mhz();
-        r.last_psi_emit_master_27mhz = Some(master_now.wrapping_sub(600 * 27_000));
+        r.last_psi_emit_master_27mhz = Some(crate::engine::ts_parse::pcr_add_27mhz(master_now, -600 * 27_000));
 
         // Feed a single non-PSI packet (PCR-bearing on PCR_PID).
         let pcr_pkt = build_pcr_packet(0x100, 50_000_000);
@@ -2893,7 +2998,7 @@ mod tests {
         for expected_cc in 1u8..=5 {
             let master_now = pacer.now_27mhz();
             r.last_psi_emit_master_27mhz =
-                Some(master_now.wrapping_sub(600 * 27_000));
+                Some(crate::engine::ts_parse::pcr_add_27mhz(master_now, -600 * 27_000));
             let mut out = Vec::new();
             r.process(&pcr_pkt, &mut out);
             let pat = &out[..TS_PACKET_SIZE];
@@ -2933,7 +3038,7 @@ mod tests {
         // 2) Force an injection — PAT/PMT bumped to CC=1.
         let master_now = pacer.now_27mhz();
         r.last_psi_emit_master_27mhz =
-            Some(master_now.wrapping_sub(600 * 27_000));
+            Some(crate::engine::ts_parse::pcr_add_27mhz(master_now, -600 * 27_000));
         let mut out2 = Vec::new();
         r.process(&pcr_pkt, &mut out2);
         assert_eq!(out2[3] & 0x0F, 1, "injected PAT CC bumps to 1");
@@ -2982,7 +3087,7 @@ mod tests {
         r.process(&[cut[0], cut[1]].concat(), &mut natural);
         let last_natural_cc = natural[natural.len() - TS_PACKET_SIZE + 3] & 0x0F;
 
-        r.last_psi_emit_master_27mhz = Some(pacer.now_27mhz().wrapping_sub(600 * 27_000));
+        r.last_psi_emit_master_27mhz = Some(crate::engine::ts_parse::pcr_add_27mhz(pacer.now_27mhz(), -600 * 27_000));
         let mut out = Vec::new();
         r.process(&build_pcr_packet(0x100, 50_000_000), &mut out);
 

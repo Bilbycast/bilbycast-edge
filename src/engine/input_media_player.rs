@@ -1697,7 +1697,7 @@ async fn play_ts_file(
     // path uses (`PacerMsg::target_ns`), including its
     // `MIN_BUNDLE_SPACING_NS` clamp, and that path has never exhibited
     // this failure.
-    let mut pcr_epoch_27mhz: Option<u64> = None;
+    let mut pcr_span_27mhz: u64 = 0;
     let mut pacer_epoch_ns: Option<u64> = None;
     let mut last_pcr_target_ns: Option<u64> = None;
     let mut last_anchor_pcr_27mhz: Option<u64> = None;
@@ -2128,36 +2128,13 @@ async fn play_ts_file(
             // by the inter-program skew (often seconds) at every PID
             // switch — the same trap the bitrate estimator guards against.
             if pcr_deadlines_enabled && anchor_pcr_pid == Some(pcr_pid_early) {
-                let epoch = *pcr_epoch_27mhz.get_or_insert(pcr);
-                let e_ns = *pacer_epoch_ns.get_or_insert_with(
-                    crate::engine::wire_emit::monotonic_now_ns,
-                );
-                // Discontinuity is a property of the *step* between
-                // consecutive PCRs, not of the distance from the epoch.
-                // Testing the epoch span instead conflates two unrelated
-                // things: it calls a perfectly continuous PCR a
-                // discontinuity once an asset has simply played for long
-                // enough, and — far worse — it accepts a genuine forward
-                // splice of up to the span bound as a real deadline, so
-                // the pacer sleeps out the whole jump and playout freezes
-                // for its duration. Byte-rate mode could not do that.
-                //
-                // MPEG-TS requires a PCR at least every 100 ms, so a step
-                // beyond `PCR_STEP_DISCONTINUITY_27MHZ` is never the
-                // source's own clock advancing. Sign covers the 42-bit
-                // wrap (~26.5 h) and a backward splice in one test.
-                let continuous = last_anchor_pcr_27mhz.is_none_or(|prev| {
-                    let step = pcr.wrapping_sub(prev) as i64;
-                    (0..=PCR_STEP_DISCONTINUITY_27MHZ).contains(&step)
-                });
-                let d = pcr.wrapping_sub(epoch);
-                if continuous && (d as i64) >= 0 {
-                    last_pcr_target_ns = Some(e_ns.saturating_add((d / 27) * 1_000));
-                } else {
-                    pcr_epoch_27mhz = Some(pcr);
-                    pacer_epoch_ns = Some(crate::engine::wire_emit::monotonic_now_ns());
-                    last_pcr_target_ns = pacer_epoch_ns;
-                }
+                last_pcr_target_ns = Some(pcr_deadline_ns(
+                    pcr,
+                    last_anchor_pcr_27mhz,
+                    &mut pcr_span_27mhz,
+                    &mut pacer_epoch_ns,
+                    crate::engine::wire_emit::monotonic_now_ns(),
+                ));
                 last_anchor_pcr_27mhz = Some(pcr);
                 bytes_since_pcr = 0;
             }
@@ -3599,7 +3576,8 @@ fn scan_head_bitrate(buf: &[u8], stride: usize) -> Option<u64> {
     }
     let (_pid, first_pcr, first_pos) = first?;
     let (last_pcr, last_pos) = last_same_pid?;
-    let pcr_delta = last_pcr.wrapping_sub(first_pcr);
+    // Modular: a head that spans the PCR's wrap measures a rate too.
+    let pcr_delta = crate::engine::ts_parse::pcr_fwd_27mhz(last_pcr, first_pcr);
     let pcr_us = pcr_delta / 27;
     // Sanity: total head span must be ≥ 100 ms; covers > 3 inter-PCR
     // periods at a typical 40 ms cadence so the average is meaningful.
@@ -4007,7 +3985,7 @@ fn fake_rtp_ts(_session: &PlayerSession<'_>) -> u32 {
 /// own PCR timeline.
 ///
 /// `base` is the wall-clock instant the most recent PCR maps to (computed
-/// in [`play_ts_file`] from the `pcr_epoch_27mhz` / `pacer_epoch_ns` pair);
+/// in [`play_ts_file`] by [`pcr_deadline_ns`]);
 /// `bytes_since_pcr` is the content emitted since that PCR. The estimated
 /// rate therefore only interpolates *within* one PCR interval, so a rate
 /// overestimate can run ahead by at most one interval instead of
@@ -4022,6 +4000,52 @@ fn fake_rtp_ts(_session: &PlayerSession<'_>) -> u32 {
 /// mandates a PCR at least every 100 ms, so a legitimate step is an order
 /// of magnitude below this.
 const PCR_STEP_DISCONTINUITY_27MHZ: i64 = 13_500_000;
+
+/// The pacing deadline (ns) of an anchor-PID PCR `pcr` of a TS file, the
+/// previous one having been `last`: the epoch's deadline (`epoch_ns`, set to
+/// `now_ns` by the first PCR unless a splice carry set it before) plus the
+/// PCR time since the epoch (`span_27mhz`, the sum of the steps).
+///
+/// Discontinuity is a property of the *step* between consecutive PCRs, not
+/// of the distance from the epoch. Testing the epoch span instead conflates
+/// two unrelated things: it calls a perfectly continuous PCR a discontinuity
+/// once an asset has simply played for long enough, and — far worse — it
+/// accepts a genuine forward splice of up to the span bound as a real
+/// deadline, so the pacer sleeps out the whole jump and playout freezes for
+/// its duration. Byte-rate mode could not do that. MPEG-TS requires a PCR at
+/// least every 100 ms, so a step back, or on past
+/// [`PCR_STEP_DISCONTINUITY_27MHZ`], is never the source's own clock
+/// advancing: it starts a new epoch at `now_ns`.
+///
+/// The step is modular, and the span a sum of steps, so the PCR's own wrap
+/// (every 26.5 h, 2^33 × 300 ticks) paces straight on. Both were plain u64
+/// differences — from the epoch PCR — which read the wrap as a backward
+/// splice and re-epoched the pacer at it.
+fn pcr_deadline_ns(
+    pcr: u64,
+    last: Option<u64>,
+    span_27mhz: &mut u64,
+    epoch_ns: &mut Option<u64>,
+    now_ns: u64,
+) -> u64 {
+    let step = last.map(|prev| crate::engine::ts_parse::pcr_diff_27mhz(pcr, prev));
+    match step {
+        None => {
+            *span_27mhz = 0;
+            *epoch_ns.get_or_insert(now_ns)
+        }
+        Some(s) if (0..=PCR_STEP_DISCONTINUITY_27MHZ).contains(&s) => {
+            *span_27mhz += s as u64;
+            let e_ns = *epoch_ns.get_or_insert(now_ns);
+            e_ns.saturating_add((*span_27mhz / 27) * 1_000)
+        }
+        Some(_) => {
+            *span_27mhz = 0;
+            *epoch_ns = Some(now_ns);
+            now_ns
+        }
+    }
+}
 
 fn ts_bundle_deadline(
     base: Option<u64>,
@@ -4619,7 +4643,7 @@ mod ts_pacing_tests {
     //! All three decide when bytes hit the wire, so they are pinned here
     //! rather than left to a hardware soak to notice.
     use super::{
-        shift_deadline, ts_bundle_deadline, MAX_DEADLINE_LATENESS_NS,
+        pcr_deadline_ns, shift_deadline, ts_bundle_deadline, MAX_DEADLINE_LATENESS_NS,
         MAX_DEADLINE_LOOKAHEAD_NS, PCR_STEP_DISCONTINUITY_27MHZ,
     };
 
@@ -4698,12 +4722,14 @@ mod ts_pacing_tests {
         const { assert!(MAX_DEADLINE_LOOKAHEAD_NS < 2_000_000_000) };
     }
 
-    /// A PCR step is judged against the previous PCR, not the epoch. This
-    /// mirrors the predicate in `play_ts_file`; the boundary is what
-    /// separates "the source's clock advanced" from "the source spliced".
+    /// A PCR step is judged against the previous PCR, not the epoch: the
+    /// boundary is what separates "the source's clock advanced" from "the
+    /// source spliced". `true` when `pcr` after `prev` paces on from the
+    /// epoch rather than starting a new one at "now" (7 s).
     fn continuous(prev: u64, pcr: u64) -> bool {
-        let step = pcr.wrapping_sub(prev) as i64;
-        (0..=PCR_STEP_DISCONTINUITY_27MHZ).contains(&step)
+        let (mut span, mut epoch) = (0u64, Some(1_000));
+        let _ = pcr_deadline_ns(prev, None, &mut span, &mut epoch, 1_000);
+        pcr_deadline_ns(pcr, Some(prev), &mut span, &mut epoch, 7_000_000_000) != 7_000_000_000
     }
 
     #[test]
@@ -4727,10 +4753,47 @@ mod ts_pacing_tests {
     }
 
     #[test]
-    fn a_backward_step_and_a_wrap_are_discontinuities() {
+    fn a_backward_step_is_a_discontinuity() {
         assert!(!continuous(27_000_000 * 10, 27_000_000));
-        // 42-bit PCR wrap: tiny value after a near-maximal one.
-        assert!(!continuous((1u64 << 42) - 27_000_000, 1_000));
+        assert!(!continuous(27_000_000 * 10, 27_000_000 * 10 - 27_000));
+    }
+
+    /// The PCR's own wrap (every 26.5 h, 2^33 × 300 ticks) paces straight
+    /// on: the deadline after it is the one before plus the step. The step
+    /// and the span from the epoch were plain u64 differences, so the wrap
+    /// read as a backward splice and the pacer re-epoched at "now" — a burst
+    /// or a pause of up to the producer's lead once a day.
+    #[test]
+    fn the_pcr_wrap_paces_straight_on() {
+        let m = crate::engine::ts_parse::PCR_MODULUS_27MHZ;
+        assert!(continuous(m - 27_000 * 20, 27_000 * 20));
+        let (mut span, mut epoch) = (0u64, None);
+        let first = m - 27_000 * 70;
+        assert_eq!(pcr_deadline_ns(first, None, &mut span, &mut epoch, 5_000), 5_000);
+        let mut last = first;
+        for k in 1..=5u64 {
+            let pcr = (first + k * 40 * 27_000) % m;
+            let at = pcr_deadline_ns(pcr, Some(last), &mut span, &mut epoch, 99_000_000_000);
+            assert_eq!(at, 5_000 + k * 40_000_000, "PCR {k}, the wrap between 1 and 2");
+            last = pcr;
+        }
+    }
+
+    /// The head scan's rate is measured across the PCR's wrap too: a plain
+    /// u64 difference read the span as ~2^64 and gave no rate at all.
+    #[test]
+    fn the_head_bitrate_is_measured_across_the_pcr_wrap() {
+        let m = crate::engine::ts_parse::PCR_MODULUS_27MHZ;
+        let mut head = Vec::new();
+        // A PCR every 40 ms, 99 payload packets between: 18 612 B / 40 ms.
+        for k in 0..10u64 {
+            let pcr = (m - 27_000 * 200 + k * 40 * 27_000) % m;
+            head.extend_from_slice(&crate::engine::ts_parse::pcr_only_packet(0x100, 0, pcr, false));
+            for _ in 0..99 {
+                head.extend_from_slice(&super::TS_NULL_PACKET);
+            }
+        }
+        assert_eq!(super::scan_head_bitrate(&head, 188), Some(100 * 188 * 8 * 25));
     }
 
     /// A long asset must NOT be called discontinuous merely for having

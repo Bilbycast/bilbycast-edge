@@ -1894,9 +1894,14 @@ impl OutputStatsAccumulator {
 pub struct PcrState {
     /// Last PCR value in 27 MHz ticks.
     pub last_pcr_value: u64,
+    /// The last PCR unwrapped: the first PCR of the window plus every step
+    /// since, so the regression's line runs on across the 42-bit wrap
+    /// (every 26.5 h) instead of fitting a value that fell back by the
+    /// whole modulus.
+    pub ext_pcr: u64,
     /// Wall-clock time when the last PCR was received.
     pub last_pcr_wall_time: Instant,
-    /// Sliding window of (pcr_27mhz, wall_us_since_anchor) samples for the
+    /// Sliding window of (unwrapped pcr_27mhz, wall_us_since_anchor) samples for the
     /// regression-based PCR accuracy check. The first sample's wall time is
     /// the anchor (stored as the first element with wall_us_since_anchor=0).
     /// Capped at PCR_HISTORY_LEN entries; oldest sample is dropped on insert.

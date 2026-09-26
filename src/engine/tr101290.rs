@@ -405,23 +405,21 @@ fn process_ts_packet(
             state.pcr_tracker.remove(&pid);
         } else if let Some(prev) = state.pcr_tracker.get(&pid) {
             // ── Discontinuity check (jump > 100 ms or backwards) ──
-            if pcr_value >= prev.last_pcr_value {
-                let pcr_delta = pcr_value - prev.last_pcr_value;
-                if pcr_delta > PCR_DISCONTINUITY_THRESHOLD {
-                    stats
-                        .pcr_discontinuity_errors
-                        .fetch_add(1, Ordering::Relaxed);
-                    stats
-                        .window_pcr_discontinuity_errors
-                        .fetch_add(1, Ordering::Relaxed);
-                }
-            } else {
+            //
+            // The step is modular: the PCR wraps every 26.5 h (2^33 × 300
+            // ticks), and the wrap is no discontinuity. Compared as plain
+            // values it counted one on every 24/7 stream once a day.
+            let step = crate::engine::ts_parse::pcr_diff_27mhz(pcr_value, prev.last_pcr_value);
+            if !(0..=PCR_DISCONTINUITY_THRESHOLD as i64).contains(&step) {
                 stats
                     .pcr_discontinuity_errors
                     .fetch_add(1, Ordering::Relaxed);
                 stats
                     .window_pcr_discontinuity_errors
                     .fetch_add(1, Ordering::Relaxed);
+                // Nor does the regression window run across it: fitted
+                // over the jump, every residual was the jump.
+                state.pcr_tracker.remove(&pid);
             }
         }
 
@@ -435,14 +433,18 @@ fn process_ts_packet(
         // i.e. PCR_AC, modulo the wall-clock's own ~µs jitter.
         let entry = state.pcr_tracker.entry(pid).or_insert_with(|| PcrState {
             last_pcr_value: pcr_value,
+            ext_pcr: pcr_value,
             last_pcr_wall_time: now,
             history: std::collections::VecDeque::with_capacity(PCR_HISTORY_LEN),
             history_anchor: now,
         });
 
+        // The window runs on the unwrapped PCR (see `PcrState::ext_pcr`):
+        // steps here are forward and at most 100 ms.
+        entry.ext_pcr += crate::engine::ts_parse::pcr_fwd_27mhz(pcr_value, entry.last_pcr_value);
         let wall_us = now.duration_since(entry.history_anchor).as_micros() as u64;
         if entry.history.len() >= PCR_HISTORY_MIN && !discontinuity_expected
-            && let Some(residual_ns) = pcr_residual_ns(&entry.history, pcr_value, wall_us)
+            && let Some(residual_ns) = pcr_residual_ns(&entry.history, entry.ext_pcr, wall_us)
                 && residual_ns > PCR_JITTER_THRESHOLD_NS {
                     stats
                         .pcr_accuracy_errors
@@ -456,7 +458,7 @@ fn process_ts_packet(
         if entry.history.len() == PCR_HISTORY_LEN {
             entry.history.pop_front();
         }
-        entry.history.push_back((pcr_value, wall_us));
+        entry.history.push_back((entry.ext_pcr, wall_us));
         entry.last_pcr_value = pcr_value;
         entry.last_pcr_wall_time = now;
 
@@ -1269,6 +1271,33 @@ mod tests {
         with_crc.push((crc >> 8) as u8);
         with_crc.push(crc as u8);
         assert_eq!(mpeg2_crc32(&with_crc), 0, "CRC should be 0 when CRC bytes are appended");
+    }
+
+    /// The PCR wraps every 26.5 h (2^33 × 300 ticks): the wrap is neither a
+    /// discontinuity nor a break in the accuracy regression. Compared as
+    /// plain values it counted a discontinuity once a day, and a window of
+    /// raw values fitted a line through the fall of the whole modulus, so
+    /// for the 16 samples after it no accuracy error could be seen.
+    #[test]
+    fn a_pcr_wrap_is_no_discontinuity_and_keeps_the_accuracy_check() {
+        use crate::engine::ts_parse::{pcr_add_27mhz, pcr_only_packet, PCR_MODULUS_27MHZ};
+        let stats = Arc::new(Tr101290Accumulator::new());
+        let t0 = Instant::now();
+        let mut state = stats.state.lock().unwrap();
+        let ms = 27_000i64;
+        let first = PCR_MODULUS_27MHZ - 300 * ms as u64;
+        for k in 0..30i64 {
+            let pcr = pcr_add_27mhz(first, k * 30 * ms);
+            // One PCR arrives 150 ms late, five after the wrap.
+            let late = if k == 15 { 150 } else { 0 };
+            let now = t0 + Duration::from_millis((k * 30 + late) as u64);
+            process_ts_packet(&pcr_only_packet(0x100, 0, pcr, false), now, &stats, &mut state);
+        }
+        assert_eq!(stats.pcr_discontinuity_errors.load(Ordering::Relaxed), 0, "the wrap");
+        assert_eq!(stats.pcr_accuracy_errors.load(Ordering::Relaxed), 1, "the late PCR, seen");
+        // A real step back is still one.
+        process_ts_packet(&pcr_only_packet(0x100, 0, 1_000, false), t0 + Duration::from_millis(900), &stats, &mut state);
+        assert_eq!(stats.pcr_discontinuity_errors.load(Ordering::Relaxed), 1);
     }
 
     #[test]

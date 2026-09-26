@@ -1360,7 +1360,7 @@ impl TargetState {
                 // datagrams still interpolate across the interval instead
                 // of clumping on the anchor and bursting once per PCR.
                 if let Some(prev) = self.pcr_anchor {
-                    let delta_27 = pcr.wrapping_sub(prev) as i64;
+                    let delta_27 = crate::engine::ts_parse::pcr_diff_27mhz(pcr, prev);
                     if (0..=PCR_DISCONTINUITY_27MHZ).contains(&delta_27) {
                         let delta_ns = (delta_27 as u64) * 1000 / 27;
                         if delta_ns >= 1_000_000 && self.bytes_since_anchor > 0 {
@@ -1399,7 +1399,7 @@ impl TargetState {
             }
 
             if let Some(prev) = self.pcr_anchor {
-                let delta_27 = pcr.wrapping_sub(prev) as i64;
+                let delta_27 = crate::engine::ts_parse::pcr_diff_27mhz(pcr, prev);
                 // Discontinuity: backwards by any meaningful amount, or
                 // forward jump > 500 ms. Reset anchor to "now". Also
                 // reset `last_returned_ns` here so the outer monotonic
@@ -1588,7 +1588,7 @@ impl TargetState {
         if let Some(pcr) = datagram_pcr {
             match self.pcr_anchor {
                 Some(prev) => {
-                    let delta_27 = pcr.wrapping_sub(prev) as i64;
+                    let delta_27 = crate::engine::ts_parse::pcr_diff_27mhz(pcr, prev);
                     if (0..=PCR_DISCONTINUITY_27MHZ).contains(&delta_27) {
                         let delta_ns = (delta_27 as u64) * 1000 / 27;
                         if delta_ns >= 1_000_000 && self.bytes_since_anchor > 0 {
@@ -2464,6 +2464,41 @@ mod tests {
         // `wall_anchor` value they had before.
         assert!(t2 > t1, "between-PCR datagrams must spread across the interval, not clump");
         assert!(t1 > anchor, "first non-PCR datagram must be paced past the anchor, not emitted at it");
+    }
+
+    /// The PCR wraps every 26.5 h (2^33 × 300 ticks); the wrap is no
+    /// discontinuity. The step was a plain u64 difference, so the wrap read
+    /// as a backward jump: the classic path reset its pacing anchor to now,
+    /// and every path dropped the interval the next datagrams interpolate
+    /// across (the servo's and the epoch path's rate measurement too).
+    #[test]
+    fn a_pcr_wrap_keeps_the_pacing_anchor() {
+        let m = crate::engine::ts_parse::PCR_MODULUS_27MHZ;
+        let before = m - 20 * TICK_PER_MS;
+        let after = 20 * TICK_PER_MS; // 40 ms on, across the wrap
+        // Classic.
+        let mut s = TargetState::default();
+        let _ = s.derive_target(0, Some(before), 1316);
+        let anchor = s.wall_anchor_ns;
+        s.bytes_since_anchor = 50_000;
+        let target = s.derive_target(anchor + 100_000, Some(after), 1316);
+        assert_eq!(target, anchor + 40_000_000, "paced on across the wrap");
+        assert_eq!((s.prev_interval_bytes, s.prev_interval_ns), (50_000, 40_000_000));
+        // Servo: the interval across the wrap is measured.
+        let cfg = DejitterConfig::servo();
+        let mut v = warmed_servo_state(6_000_000, 1_000_000_000);
+        v.pcr_anchor = Some(before);
+        v.bytes_since_anchor = 50_000;
+        v.derive_target_servo(1_000_000_000, Some(after), 1316, 34, &cfg);
+        assert_eq!(v.observed_rate_bps, (3 * 6_000_000 + 10_000_000) / 4);
+        // Epoch lock: likewise.
+        let (_, mut group, now) = source_timeline();
+        group.pcr_27mhz = before;
+        let mut e = epoch_state(400, group);
+        let _ = e.derive_target(now, Some(before), 1316);
+        e.bytes_since_anchor = 50_000;
+        let _ = e.derive_target(now + 40_000_000, Some(after), 1316);
+        assert_eq!((e.prev_interval_bytes, e.prev_interval_ns), (50_000, 40_000_000));
     }
 
     #[test]

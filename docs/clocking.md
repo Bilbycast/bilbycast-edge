@@ -229,6 +229,32 @@ discontinuity in three ways, and the third is the one worth knowing about.
   frames indefinitely trying to absorb it (measured decaying from 30 fps
   presented to 10–17 fps on a video-only loop).
 
+**The 26.5 h wrap is none of these.** The PCR (2^33 × 300 ticks of 27 MHz)
+and the master clock, which wraps with it, roll over every 26.5 h, so a
+24/7 flow crosses the wrap daily. The rewriter takes every step — the
+source's `delta_src`, the master's `delta_master`, the PSI_RR and PCR_RR
+gaps — as a modular difference, and maps every value through its anchor as
+a modular forward distance (`ts_parse::pcr_fwd_27mhz` /
+`pcr_add_27mhz`). The step used to be a plain difference, so the source's
+wrap read as a backward jump of the whole modulus and was bridged with a
+DI; and the anchored values were u64 sums, which across the wrap carried
+`2^64 mod (2^33 × 300)` into them — a PES stamped past the wrap from an
+anchor just below it went out 16 543.6 s off (the media player's loop IDR
+on the rig). The
+master's wrap stopped PSI_RR injection until the source's own PSI came by.
+The same modular step now paces `wire_emit` (a wrap reset its pacing anchor
+to now, and dropped the interval its next datagrams interpolate across),
+judges TR 101 290's PCR discontinuity (a wrap counted one; its accuracy
+regression now runs on the unwrapped PCR, and restarts across a counted
+discontinuity rather than fitting a line through it), paces the media
+player's TS deadlines (a wrap re-epoched its pacer at "now") and measures
+its head bitrate. Pinned by `a_source_clock_wrap_is_no_discontinuity`,
+`psi_rr_injects_across_a_master_clock_wrap`,
+`a_pcr_wrap_keeps_the_pacing_anchor`,
+`a_pcr_wrap_is_no_discontinuity_and_keeps_the_accuracy_check`,
+`the_pcr_wrap_paces_straight_on` and
+`the_head_bitrate_is_measured_across_the_pcr_wrap`.
+
 Both bridges are clamped to `MAX_BRIDGE_ADVANCE_27MHZ` — 40 ms, the TR 101 290
 PCR repetition-rate ceiling. **The clamp does not distinguish an instantaneous
 seam from a long genuine outage.** An input that reconnects after 30 s is

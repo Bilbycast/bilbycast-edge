@@ -1346,6 +1346,24 @@ pub fn pcr_diff_27mhz(a: u64, b: u64) -> i64 {
     }
 }
 
+/// `a + d` in the modular PCR space (`d` of either sign), in
+/// `[0, PCR_MODULUS_27MHZ)`. `a` need not be reduced.
+pub fn pcr_add_27mhz(a: u64, d: i64) -> u64 {
+    (a as i128 + d as i128).rem_euclid(PCR_MODULUS_27MHZ as i128) as u64
+}
+
+/// How far `a` lies ahead of `b` in the modular PCR space, in
+/// `[0, PCR_MODULUS_27MHZ)`. The forward distance whatever the span: an
+/// anchor held for longer than half the modulus (13.25 h) still maps a
+/// value by it, where [`pcr_diff_27mhz`] would turn negative there. A value
+/// just behind `b` comes out just under the modulus, which adds back to the
+/// right place mod the modulus. u64 `wrapping_sub` is no substitute: the
+/// modulus is not a power of two, so across the 42-bit wrap it leaves
+/// `2^64 mod (2^33 × 300)` in the result — 16 543.6 s of PTS.
+pub fn pcr_fwd_27mhz(a: u64, b: u64) -> u64 {
+    (a % PCR_MODULUS_27MHZ + PCR_MODULUS_27MHZ - b % PCR_MODULUS_27MHZ) % PCR_MODULUS_27MHZ
+}
+
 /// Overwrite the PCR of a packet that already carries one (PCR_flag set in
 /// an adaptation field of at least 7 bytes). Returns `false` — and leaves
 /// the packet untouched — when it has no PCR field.
@@ -1569,6 +1587,21 @@ mod pcr_helper_tests {
         assert_eq!(pcr_diff_27mhz(40, 100), -60);
         assert_eq!(pcr_diff_27mhz(10, PCR_MODULUS_27MHZ - 10), 20);
         assert_eq!(pcr_diff_27mhz(PCR_MODULUS_27MHZ - 10, 10), -20);
+    }
+
+    /// The forward distance and the modular sum: across the wrap, past half
+    /// the modulus, and behind the base. u64 `wrapping_sub` leaves
+    /// `2^64 mod (2^33 × 300)` in a difference that crosses the wrap.
+    #[test]
+    fn pcr_fwd_and_add_are_modular() {
+        let m = PCR_MODULUS_27MHZ;
+        assert_eq!(pcr_fwd_27mhz(10, m - 10), 20);
+        assert_eq!(pcr_fwd_27mhz(m - 10, 10), m - 20, "just behind: just under the modulus");
+        assert_eq!(pcr_fwd_27mhz(m / 2 + 7, 0), m / 2 + 7, "past half the modulus, still forward");
+        assert_ne!(10u64.wrapping_sub(m - 10) % m, 20);
+        assert_eq!(pcr_add_27mhz(m - 10, 30), 20);
+        assert_eq!(pcr_add_27mhz(5, -10), m - 5);
+        assert_eq!(pcr_add_27mhz(pcr_add_27mhz(123, pcr_fwd_27mhz(7, m - 3) as i64), 0), 133);
     }
 
     #[test]
