@@ -514,6 +514,9 @@ fn run_chain(
     let mut after_audio_scratch: Vec<u8> = Vec::with_capacity(64 * 1024);
     let mut after_video_scratch: Vec<u8> = Vec::with_capacity(64 * 1024);
     let mut after_pcr_scratch: Vec<u8> = Vec::with_capacity(64 * 1024);
+    if let Some(v) = video.as_mut() {
+        v.set_pcr_remux_stats(pcr.stats_handle());
+    }
 
     loop {
         // Codec → wire_emit backpressure. When the wire_tx queue is

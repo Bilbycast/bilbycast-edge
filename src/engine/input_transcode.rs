@@ -153,6 +153,11 @@ impl InputTranscoder {
         // future PTS-ordered-merge implementation. See ts_av_realign.rs.
         let realign: Option<crate::engine::ts_av_realign::TsAvRealigner> = None;
 
+        let pcr = TsPcrRemux::new();
+        let mut video = video;
+        if let Some(v) = video.as_mut() {
+            v.set_pcr_remux_stats(pcr.stats_handle());
+        }
         Ok(Some(Self {
             audio,
             video,
@@ -160,7 +165,7 @@ impl InputTranscoder {
             scratch_b: Vec::with_capacity(32 * 1024),
             scratch_p: Vec::with_capacity(32 * 1024),
             scratch_c: Vec::with_capacity(32 * 1024),
-            pcr: TsPcrRemux::new(),
+            pcr,
             realign,
         }))
     }

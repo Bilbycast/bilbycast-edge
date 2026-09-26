@@ -118,7 +118,7 @@ pub(crate) struct SourceClockWatch {
     silences_len: usize,
     silences_next: usize,
     /// Every hold so far, summed (27 MHz).
-    silence_total: i64,
+    pub(crate) silence_total: i64,
     /// Consumed PES: `(PTS, silence_total when its data was complete)`.
     in_flight: std::collections::VecDeque<(u64, i64)>,
     /// Frames that left having sat through a hold: `(PTS, hold)`.
@@ -199,6 +199,27 @@ impl SourceClockWatch {
             self.in_flight.pop_front();
         }
         self.in_flight.push_back((pts, complete_at));
+    }
+
+    /// What the decoded frame stamped `pts` has sat through so far (0 when
+    /// its PES is not known).
+    pub(crate) fn hold_of(&self, pts: u64) -> i64 {
+        self.in_flight
+            .iter()
+            .find(|(p, _)| *p == pts)
+            .map_or(0, |(_, at)| self.silence_total - at)
+    }
+
+    /// A decoded frame that will never leave (dropped before the encoder).
+    pub(crate) fn forget(&mut self, pts: u64) {
+        if let Some(i) = self.in_flight.iter().position(|(p, _)| *p == pts) {
+            self.in_flight.remove(i);
+        }
+    }
+
+    /// The last input PCR on the source PCR PID.
+    pub(crate) fn last_pcr(&self) -> Option<u64> {
+        self.last_pcr
     }
 
     /// A re-encoded frame stamped with source PTS `pts` leaves: the holds
@@ -573,6 +594,17 @@ impl TsVideoReplacer {
         }
     }
 
+    /// The chain's trailing `ts_pcr_remux` counters: frames the source held
+    /// past its `D` are dropped before the encoder (see
+    /// [`SourceClockWatch`]).
+    #[allow(unused_variables)]
+    pub fn set_pcr_remux_stats(&mut self, stats: Arc<crate::engine::ts_pcr_remux::PcrRemuxStats>) {
+        #[cfg(feature = "media-codecs")]
+        {
+            self.inner.pcr_remux = Some(stats);
+        }
+    }
+
     /// Whether the input has gone a second of video decode time without a
     /// PCR — what the chain's `ts_pcr_remux` synthesises a PCR on (see
     /// [`SourceClockWatch`]).
@@ -734,6 +766,10 @@ mod inner {
         pub(super) clock: SourceClockWatch,
         /// Hold total at which the PES being consumed had all its data.
         consuming_complete_at: i64,
+        /// The chain's trailing `ts_pcr_remux` counters: its current `D`,
+        /// against which a frame the source held is judged stale before it
+        /// reaches the encoder (see [`Inner::stale_before_encode`]).
+        pub(super) pcr_remux: Option<Arc<crate::engine::ts_pcr_remux::PcrRemuxStats>>,
 
         pub(super) decoder: Option<VideoDecoder>,
         /// Shared encoder pipeline — wraps `VideoEncoder` + optional
@@ -991,6 +1027,7 @@ mod inner {
                 decoder: None,
                 clock: SourceClockWatch::default(),
                 consuming_complete_at: 0,
+                pcr_remux: None,
                 pipeline,
                 out_video_cc: 0,
                 out_frame_count: 0,
@@ -1558,6 +1595,36 @@ mod inner {
             Some(admitted)
         }
 
+        /// A decoded frame the source kept waiting (a hold: the tail of a
+        /// media-player file waiting for the next loop's first video) that
+        /// would already leave behind the output PCR — `input PCR − its PTS`
+        /// past the chain's `D` — is dropped here, before the encoder, and
+        /// counted as the remux's `stale_frames_dropped`. Dropped after
+        /// encoding (the remux's own backstop) it would take a reference
+        /// picture out of the encoded stream and every picture predicted from
+        /// it until the next IDR would decode against the wrong one.
+        pub(super) fn stale_before_encode(&mut self, pts_90k: u64) -> bool {
+            let (Some(remux), Some(pcr)) = (self.pcr_remux.as_ref(), self.clock.last_pcr()) else {
+                return false;
+            };
+            if self.clock.hold_of(pts_90k) <= 0 {
+                return false;
+            }
+            let late = crate::engine::ts_parse::pcr_diff_27mhz(pcr, (pts_90k & PTS_MASK_33B) * 300);
+            if late <= remux.offset_27mhz.load(Ordering::Relaxed) as i64 {
+                return false;
+            }
+            remux.stale_frames_dropped.fetch_add(1, Ordering::Relaxed);
+            self.stats.dropped_frames.fetch_add(1, Ordering::Relaxed);
+            self.clock.forget(pts_90k);
+            tracing::debug!(
+                "ts_video_replace: dropped a decoded frame the source held, {:.1} ms behind the \
+                 input PCR, before the encoder",
+                late as f64 / 27_000.0
+            );
+            true
+        }
+
         /// Packetise one encoded frame with the next queued source PTS
         /// (DTS = PTS: the in-process encoders emit no B-frames). No PCR —
         /// the input's PCR positions travel as their own packets.
@@ -1798,6 +1865,9 @@ mod inner {
                 let Some(src_pts_for_frame) = self.admit_decoded(decoder_pts) else {
                     continue;
                 };
+                if self.stale_before_encode(src_pts_for_frame) {
+                    continue;
+                }
 
                 // The encoder rate, measured from the frames the encoder is
                 // handed, once per frame. Until it is known the encoder
@@ -3751,6 +3821,7 @@ mod tests {
             pcr: &mut crate::engine::ts_pcr_remux::TsPcrRemux,
             ts: &[u8],
         ) -> Vec<u8> {
+            r.set_pcr_remux_stats(pcr.stats_handle());
             let mut out = Vec::new();
             for chunk in ts.chunks(TS_PACKET_SIZE * 7) {
                 let mut v = Vec::new();
@@ -3761,6 +3832,11 @@ mod tests {
                 pcr.process(&v, &mut out);
             }
             out
+        }
+
+        /// Video PES starts on 0x100 in `ts`.
+        fn video_pes_count(ts: &[u8]) -> usize {
+            ts.chunks(TS_PACKET_SIZE).filter(|p| ts_pid(p) == 0x100 && ts_pusi(p) && ts_has_payload(p)).count()
         }
 
         /// Every re-encoded video PES on 0x100 against the output PCR in
@@ -3820,10 +3896,11 @@ mod tests {
         /// decoder holds a picture back) is looped the way the media player
         /// does: the file's video ends, its clock runs on with filler PCRs
         /// only, and the next file starts at an IDR 640 ms of that clock
-        /// later. The pending PES and the picture the decoder held leave
+        /// later. The pending PES and the picture the decoder held come out
         /// only with the next file's first video, ~300 ms behind their
-        /// decode time. They waited on the source: dropped as stale, `D`
-        /// never raised, nothing on the wire behind its PCR.
+        /// decode time. They waited on the source: dropped as stale — before
+        /// the encoder, so the encoded stream loses no reference picture —
+        /// `D` never raised, nothing on the wire behind its PCR.
         #[test]
         fn a_media_player_loop_tail_never_raises_d() {
             use video_codec::VideoEncoderConfig;
@@ -3874,34 +3951,48 @@ mod tests {
             };
             let a = mkaus(50);
             assert!(a.iter().any(|f| f.pts != f.dts), "the source has B-frames");
-            let mut ts = Vec::new();
-            ts.extend_from_slice(&synth_pat(0x1000));
-            ts.extend_from_slice(&synth_pmt(0x1000, 0x100, 0x1B));
-            let mut cc = 0u8;
-            let last = seg(&mut ts, &a, 900_000, &mut cc);
-            let mut t = last - lead;
-            for _ in 0..20 {
-                t += 2_700;
-                ts.extend_from_slice(&crate::engine::ts_parse::pcr_only_packet(
-                    0x100,
-                    cc.wrapping_sub(1) & 0x0F,
-                    t * 300,
-                    false,
-                ));
-            }
-            let _ = seg(&mut ts, &mkaus(25), last + 3_600 + 54_000, &mut cc);
+            let b = mkaus(25);
+            // (filler PCRs 30 ms apart after the last frame, the next file's
+            // first DTS past the last one): a 540 ms silence the tail comes
+            // out of late, and a 162 ms one it comes out of still ahead of
+            // the output PCR — held either way, dropped only when late.
+            for (fillers, jump, late) in [(20u64, 57_600u64, true), (6, 19_800, false)] {
+                let mut ts = Vec::new();
+                ts.extend_from_slice(&synth_pat(0x1000));
+                ts.extend_from_slice(&synth_pmt(0x1000, 0x100, 0x1B));
+                let mut cc = 0u8;
+                let last = seg(&mut ts, &a, 900_000, &mut cc);
+                let mut t = last - lead;
+                for _ in 0..fillers {
+                    t += 2_700;
+                    ts.extend_from_slice(&crate::engine::ts_parse::pcr_only_packet(
+                        0x100,
+                        cc.wrapping_sub(1) & 0x0F,
+                        t * 300,
+                        false,
+                    ));
+                }
+                let _ = seg(&mut ts, &b, last + jump, &mut cc);
 
-            let mut r = TsVideoReplacer::new(&cfg("x264"), None).unwrap();
-            let mut pcr = crate::engine::ts_pcr_remux::TsPcrRemux::new();
-            let out = chain(&mut r, &mut pcr, &ts);
-            let st = pcr.stats_handle().snapshot();
-            assert_eq!(pcr.offset_27mhz(), 80 * 27_000);
-            assert_eq!((st.offset_raises, st.late_frames, st.epochs), (0, 0, 0));
-            assert!(st.stale_frames_dropped >= 1, "the tail was dropped: {st:?}");
-            let pes = video_vs_pcr(&out);
-            assert!(pes.len() >= 60, "{} frames out", pes.len());
-            for (dts, pcr) in pes {
-                assert!(dts >= pcr, "a frame {} ms behind its PCR", (pcr - dts) / 27_000);
+                let mut r = TsVideoReplacer::new(&cfg("x264"), None).unwrap();
+                let mut pcr = crate::engine::ts_pcr_remux::TsPcrRemux::new();
+                let out = chain(&mut r, &mut pcr, &ts);
+                let st = pcr.stats_handle().snapshot();
+                assert_eq!(pcr.offset_27mhz(), 80 * 27_000);
+                assert_eq!((st.offset_raises, st.late_frames, st.epochs), (0, 0, 0));
+                if late {
+                    assert!(st.stale_frames_dropped >= 1, "the tail was dropped: {st:?}");
+                } else {
+                    assert_eq!(st.stale_frames_dropped, 0, "a held frame still on time goes out");
+                    assert!(r.inner.clock.silence_total > 0, "the tail was held");
+                }
+                let encoded = r.stats_handle().output_frames.load(Ordering::Relaxed) as usize;
+                assert_eq!(video_pes_count(&out), encoded, "every encoded frame reached the wire");
+                let pes = video_vs_pcr(&out);
+                assert!(pes.len() >= 60, "{} frames out", pes.len());
+                for (dts, pcr) in pes {
+                    assert!(dts >= pcr, "a frame {} ms behind its PCR", (pcr - dts) / 27_000);
+                }
             }
         }
 
