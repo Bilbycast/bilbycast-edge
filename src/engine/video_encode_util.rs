@@ -210,6 +210,17 @@ fn sanitise_preset(backend: VideoEncoderCodec, preset: VideoPreset) -> VideoPres
     mapped
 }
 
+/// The GOP (frames) an encoder opened at `fps_num / fps_den` gets when
+/// `video_encode.gop_size` is unset: two seconds of pictures, **rounded** to
+/// the nearest frame. It was `2 * floor(fps)`, which truncates a fractional
+/// rate — 29.97 fps got 58 frames (1.935 s) and 59.94 got 118, where 60 and
+/// 120 are two seconds. Every transcoding output shares it (the CMAF
+/// re-encode sizes its own to tile the segment, `cmaf_default_gop`).
+pub fn default_gop_frames(fps_num: u32, fps_den: u32) -> u32 {
+    let den = u64::from(fps_den.max(1));
+    ((2 * u64::from(fps_num) + den / 2) / den).clamp(1, u64::from(u32::MAX)) as u32
+}
+
 /// Build a [`VideoEncoderConfig`] from the edge-side [`VideoEncodeConfig`],
 /// runtime-derived source dimensions, and the backend selected by the
 /// caller. `global_header` depends on the container — RTMP needs
@@ -234,9 +245,7 @@ pub fn build_encoder_config(
     let fps_num = cfg.fps_num.unwrap_or(src_fps_num.max(1));
     let fps_den = cfg.fps_den.unwrap_or(src_fps_den.max(1));
     let bitrate_kbps = cfg.bitrate_kbps.unwrap_or(8_000);
-    let gop_size = cfg
-        .gop_size
-        .unwrap_or_else(|| 2 * (fps_num / fps_den.max(1)).max(1));
+    let gop_size = cfg.gop_size.unwrap_or_else(|| default_gop_frames(fps_num, fps_den));
 
     VideoEncoderConfig {
         codec: backend,
@@ -2992,6 +3001,25 @@ mod lazy_decoder_tests {
         assert_eq!(open(P_PICTURE, &mut lazy), None, "a re-open waits for the SPS again");
         assert_eq!(open(WITH_SPS, &mut lazy), Some(true));
         assert_eq!(opens, 2);
+    }
+}
+
+#[cfg(test)]
+mod default_gop_tests {
+    use super::default_gop_frames;
+
+    /// Two seconds of pictures, rounded: `2 * floor(fps)` gave 58 frames at
+    /// 29.97 fps (1.935 s) and 118 at 59.94.
+    #[test]
+    fn the_default_gop_is_two_seconds_rounded_to_a_frame() {
+        assert_eq!(default_gop_frames(30_000, 1001), 60);
+        assert_eq!(default_gop_frames(60_000, 1001), 120);
+        assert_eq!(default_gop_frames(24_000, 1001), 48);
+        assert_eq!(default_gop_frames(25, 1), 50);
+        assert_eq!(default_gop_frames(30, 1), 60);
+        assert_eq!(default_gop_frames(50, 1), 100);
+        assert_eq!(default_gop_frames(1, 1), 2);
+        assert_eq!(default_gop_frames(0, 0), 1, "a zero rate still opens a GOP of one");
     }
 }
 
