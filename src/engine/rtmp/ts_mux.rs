@@ -52,46 +52,63 @@ pub const STREAM_TYPE_H265: u8 = 0x24;
 /// AAC stream type in PMT (ISO 13818-7).
 const STREAM_TYPE_AAC: u8 = 0x0F;
 
-/// How far an audio-only programme's PCR runs behind the PTS of the PES it
-/// rides on (90 kHz): 100 ms. The PCR is the arrival time of its byte, and
-/// an access unit must be whole in the T-STD buffer by its decode time —
-/// with the PCR at the PTS itself every AU arrived as it was due to play,
-/// and its later packets after (an underflow a strict IRD answers by
-/// dropping the AU); the ingress rewriter keeps the PCR→PTS relation to
-/// every output. 100 ms covers a frame of every audio codec carried here
-/// (AAC-LC at 16 kHz: 64 ms) within the decoder buffers of stereo AAC.
-pub(crate) const AUDIO_PCR_LEAD_90K: u64 = 9_000;
+/// How far the programme's PCR runs behind the timestamps it clocks (90 kHz):
+/// 100 ms — behind the DTS of each video access unit when the video carries
+/// the PCR, behind the PTS of each audio PES when the audio does (no video).
+/// The PCR is the arrival time of its byte, and an access unit must be whole
+/// in the T-STD buffer by its decode time: with the PCR at the DTS / PTS
+/// itself every AU arrived as it was due and its later packets after (an
+/// underflow a strict IRD answers by dropping it), and in an A/V programme
+/// the audio — interleaved a frame or so behind the picture — sat up to
+/// 39 ms *behind* the PCR on almost every PES of an RTMP publish. The
+/// ingress rewriter keeps the PCR→PTS relation to every output. 100 ms
+/// covers a video frame at 10 fps and above (a frame's bytes arrive between
+/// its PCR and the next, at most [`VIDEO_PCR_FILL_AFTER_90K`] apart, fillers
+/// included) and an audio frame of every codec carried here (AAC-LC at
+/// 16 kHz: 64 ms), and keeps the audio ahead of the PCR while it trails the
+/// picture by up to 100 ms, within the decoder buffers of stereo AAC.
+pub(crate) const PCR_LEAD_90K: u64 = 9_000;
 
-/// Longest step an audio-only programme's PCR takes (90 kHz): 35 ms, under
-/// TR 101 290's 40 ms PCR repetition limit. One PCR per AU stepped by the
-/// frame: 42.7 ms for HE-AAC at 48 kHz, 46.4 / 64 ms for AAC-LC at 22.05 /
-/// 16 kHz — a PCR_repetition_error on every output.
+/// Longest step the PCR takes (90 kHz) when it is split: 35 ms, under
+/// TR 101 290's 40 ms PCR repetition limit.
 ///
-/// The fillers that cut such a step are PCR-only packets on the audio PID.
+/// The fillers that cut a longer step are PCR-only packets on the PCR PID.
 /// Only the caller knows when a packet leaves: by default they go ahead of
-/// the next AU's packets — the PCR *values* then step within 35 ms, but the
-/// fillers arrive with that AU, up to one AU early against their values —
-/// which is all a caller without a clock of its own can do (the RTMP, RTSP
-/// and WebRTC inputs forward each AU as it arrives). A caller that sends
-/// each AU at its own instant takes them itself instead
-/// ([`TsMuxer::clock_audio_pcr_fillers`]) and sends each at the instant its
-/// value names (the media player's MP4 pacer, the PCM-encode input).
-const AUDIO_PCR_MAX_STEP_90K: u64 = 3_150;
+/// the next access unit's packets — the PCR *values* then step within 35 ms,
+/// but the fillers arrive with that unit, up to one unit early against their
+/// values — which is all a caller without a clock of its own can do (the
+/// RTMP, RTSP and WebRTC inputs forward each unit as it arrives, the test
+/// pattern each frame at its tick). A caller that sends each unit at its own
+/// instant takes them itself instead ([`TsMuxer::clock_pcr_fillers`]) and
+/// sends each at the instant its value names (the media player's MP4 pacer,
+/// the PCM-encode input).
+const PCR_MAX_STEP_90K: u64 = 3_150;
 
-/// A step longer than this (90 kHz, 1 s) is a gap in the publish, not a
+/// An audio PCR step longer than this is split (35 ms). One PCR per AU
+/// stepped by the frame: 42.7 ms for HE-AAC at 48 kHz, 46.4 / 64 ms for
+/// AAC-LC at 22.05 / 16 kHz — a PCR_repetition_error on every output.
+const AUDIO_PCR_FILL_AFTER_90K: u64 = 3_150;
+
+/// A video PCR step longer than this is split (40 ms, TR 101 290's limit):
+/// one PCR per frame steps 41.7 ms at 23.976 / 24 fps and more below them.
+/// 25 fps steps the limit itself and 30 fps and above steps under it: those
+/// get no filler — a PCR-only packet per frame on every 25 fps programme for
+/// a measurement it already passes.
+const VIDEO_PCR_FILL_AFTER_90K: u64 = 3_600;
+
+/// A step longer than this (90 kHz, 1 s) is a gap in the source, not a
 /// frame: it gets no filler PCRs.
-const AUDIO_PCR_FILL_MAX_GAP_90K: u64 = 90_000;
+const PCR_FILL_MAX_GAP_90K: u64 = 90_000;
 
 /// 33-bit PTS / PCR-base space.
 const MASK_33: u64 = (1 << 33) - 1;
 
-/// Where the filler PCRs across an audio PCR step of `gap` ticks fall: past
-/// its start, evenly spaced, every step within [`AUDIO_PCR_MAX_STEP_90K`];
-/// none for a step that is already that short or is a gap past
-/// [`AUDIO_PCR_FILL_MAX_GAP_90K`].
-fn audio_pcr_filler_offsets(gap: u64) -> impl Iterator<Item = u64> {
-    let steps = if gap > AUDIO_PCR_MAX_STEP_90K && gap <= AUDIO_PCR_FILL_MAX_GAP_90K {
-        gap.div_ceil(AUDIO_PCR_MAX_STEP_90K)
+/// Where the filler PCRs across a PCR step of `gap` ticks fall: past its
+/// start, evenly spaced, every step within [`PCR_MAX_STEP_90K`]; none for a
+/// step of `fill_after` or less, or a gap past [`PCR_FILL_MAX_GAP_90K`].
+fn pcr_filler_offsets(gap: u64, fill_after: u64) -> impl Iterator<Item = u64> {
+    let steps = if gap > fill_after && gap <= PCR_FILL_MAX_GAP_90K {
+        gap.div_ceil(PCR_MAX_STEP_90K)
     } else {
         1
     };
@@ -167,11 +184,12 @@ pub struct TsMuxer {
     /// upstream gets the protection without each one re-implementing
     /// the same state.
     last_audio_pts_90khz: Option<u64>,
-    /// The last PCR the audio carried (90 kHz), when it carries the PCR.
-    last_audio_pcr_90khz: Option<u64>,
-    /// The caller releases the audio-only filler PCRs on its own clock
-    /// ([`Self::clock_audio_pcr_fillers`]); none go ahead of an AU.
-    audio_pcr_fillers_clocked: bool,
+    /// The last PCR the programme carried (90 kHz), on whichever PID
+    /// carries it.
+    last_pcr_90khz: Option<u64>,
+    /// The caller releases the filler PCRs on its own clock
+    /// ([`Self::clock_pcr_fillers`]); none go ahead of an access unit.
+    pcr_fillers_clocked: bool,
     /// PMT `version_number` field (5 bits, `0..=31`). Bumped by the caller
     /// across a layout-change boundary (e.g. media-player playlist
     /// transition where the new file's codec/PID layout differs) so
@@ -205,8 +223,8 @@ impl TsMuxer {
             psi_due: false,
             last_pat_pmt_at: None,
             last_audio_pts_90khz: None,
-            last_audio_pcr_90khz: None,
-            audio_pcr_fillers_clocked: false,
+            last_pcr_90khz: None,
+            pcr_fillers_clocked: false,
             pmt_version: 0,
         }
     }
@@ -434,6 +452,11 @@ impl TsMuxer {
     /// cadence is ~40 ms; at 30 fps, ~33 ms. Cameras with long GOPs
     /// (e.g. 2 s default on Reolink) used to emit PCR only every 2 s,
     /// failing P2 — see Bug #3 in the 2026-04-09 test report.
+    ///
+    /// The PCR runs [`PCR_LEAD_90K`] behind the frame's DTS (it used to be
+    /// the DTS itself: a zero T-STD lead, with the audio behind the PCR), and
+    /// a step past 40 ms — 23.976 / 24 fps and below — is split by PCR-only
+    /// packets on the video PID ([`VIDEO_PCR_FILL_AFTER_90K`]).
     pub fn mux_video(
         &mut self,
         annex_b_data: &[u8],
@@ -449,7 +472,8 @@ impl TsMuxer {
         // Split PES into TS packets. Always write PCR (not just on
         // keyframes) for TR-101290 P2 compliance.
         let video_pid = self.video_pid;
-        let ts_pkts = self.packetize(video_pid, &pes, true, true, Some(dts_90khz), is_keyframe);
+        let pcr = self.programme_pcr(dts_90khz, video_pid, VIDEO_PCR_FILL_AFTER_90K, &mut packets);
+        let ts_pkts = self.packetize(video_pid, &pes, true, true, Some(pcr), is_keyframe);
         packets.extend(ts_pkts);
 
         packets
@@ -484,63 +508,88 @@ impl TsMuxer {
     }
 
     /// The PCR an audio PES at `pts_90khz` carries — `None` unless the audio
-    /// carries the PCR ([`Self::audio_carries_pcr`]) — [`AUDIO_PCR_LEAD_90K`]
+    /// carries the PCR ([`Self::audio_carries_pcr`]) — [`PCR_LEAD_90K`]
     /// behind its PTS; and, into `packets` unless the caller clocks them
-    /// ([`Self::clock_audio_pcr_fillers`]), the PCR-only packets on the audio
-    /// PID that keep every step since the last one within
-    /// [`AUDIO_PCR_MAX_STEP_90K`] (an AU longer than 35 ms), evenly spaced.
+    /// ([`Self::clock_pcr_fillers`]), the PCR-only packets on the audio PID
+    /// that keep every step since the last one within [`PCR_MAX_STEP_90K`]
+    /// (an AU longer than 35 ms), evenly spaced.
     fn audio_pcr(&mut self, pts_90khz: u64, packets: &mut Vec<Bytes>) -> Option<u64> {
         if !self.audio_carries_pcr() {
             return None;
         }
-        let pcr = pts_90khz.wrapping_sub(AUDIO_PCR_LEAD_90K) & MASK_33;
-        if let Some(last) = self.last_audio_pcr_90khz
-            && !self.audio_pcr_fillers_clocked
-        {
-            let gap = pcr.wrapping_sub(last) & MASK_33;
-            for off in audio_pcr_filler_offsets(gap) {
-                packets.push(self.audio_pcr_filler(last + off));
-            }
-        }
-        self.last_audio_pcr_90khz = Some(pcr);
-        Some(pcr)
+        let pid = self.audio_pid;
+        Some(self.programme_pcr(pts_90khz, pid, AUDIO_PCR_FILL_AFTER_90K, packets))
     }
 
-    /// A PCR-only packet on the audio PID carrying `pcr_90k`, with the CC of
-    /// the payload packet before it, as a packet without payload must.
-    fn audio_pcr_filler(&self, pcr_90k: u64) -> Bytes {
-        let cc = self.cc_audio.wrapping_sub(1) & 0x0F;
+    /// The PCR an access unit stamped `ts_90khz` (a video DTS, an audio-only
+    /// PTS) carries on `pid`: [`PCR_LEAD_90K`] behind it. Unless the caller
+    /// clocks them, the filler PCRs across a step since the last PCR longer
+    /// than `fill_after` go into `packets` ahead of it.
+    fn programme_pcr(
+        &mut self,
+        ts_90khz: u64,
+        pid: u16,
+        fill_after: u64,
+        packets: &mut Vec<Bytes>,
+    ) -> u64 {
+        let pcr = ts_90khz.wrapping_sub(PCR_LEAD_90K) & MASK_33;
+        if let Some(last) = self.last_pcr_90khz
+            && !self.pcr_fillers_clocked
+        {
+            let gap = pcr.wrapping_sub(last) & MASK_33;
+            for off in pcr_filler_offsets(gap, fill_after) {
+                packets.push(self.pcr_filler(pid, last + off));
+            }
+        }
+        self.last_pcr_90khz = Some(pcr);
+        pcr
+    }
+
+    /// A PCR-only packet on `pid` carrying `pcr_90k`, with the CC of the
+    /// payload packet before it, as a packet without payload must.
+    fn pcr_filler(&self, pid: u16, pcr_90k: u64) -> Bytes {
+        let next_cc = if pid == self.video_pid { self.cc_video } else { self.cc_audio };
         Bytes::copy_from_slice(&crate::engine::ts_parse::pcr_only_packet(
-            self.audio_pid,
-            cc,
+            pid,
+            next_cc.wrapping_sub(1) & 0x0F,
             (pcr_90k & MASK_33) * 300,
             false,
         ))
     }
 
-    /// Take an audio-only programme's filler PCRs into the caller's hands
-    /// (see [`AUDIO_PCR_MAX_STEP_90K`]): the audio mux calls stop putting
-    /// them ahead of each AU, and the caller asks for each AU's with
-    /// [`Self::audio_pcr_fillers_after`] and sends each at the instant its
-    /// value names. For a caller that sends each AU at its own instant —
-    /// ahead of the next AU a filler left with it, up to one AU early
-    /// against its value (21 ms of PCR jitter on HE-AAC, 32 ms on AAC-LC at
-    /// 16 kHz).
-    pub fn clock_audio_pcr_fillers(&mut self) {
-        self.audio_pcr_fillers_clocked = true;
+    /// Take the programme's filler PCRs into the caller's hands (see
+    /// [`PCR_MAX_STEP_90K`]): the mux calls stop putting them ahead of each
+    /// access unit, and the caller asks for each PCR-carrying unit's with
+    /// [`Self::pcr_fillers_after`] and sends each at the instant its value
+    /// names. For a caller that sends each unit at its own instant — ahead of
+    /// the next unit a filler left with it, up to one unit early against its
+    /// value (21 ms of PCR jitter on HE-AAC, 32 ms on AAC-LC at 16 kHz, 21 ms
+    /// on 23.976 fps video).
+    pub fn clock_pcr_fillers(&mut self) {
+        self.pcr_fillers_clocked = true;
     }
 
-    /// The filler PCRs across the AU just muxed, which runs
-    /// `au_duration_90k` to the next: each as `(ticks after that AU's PCR,
-    /// packet)`, for the caller to send that long after the AU's first
-    /// packet and before the next AU. None when the audio does not carry the
-    /// PCR, the AU is 35 ms or shorter, or the span is past a second.
-    pub fn audio_pcr_fillers_after(&self, au_duration_90k: u64) -> Vec<(u64, Bytes)> {
-        let Some(pcr) = self.last_audio_pcr_90khz.filter(|_| self.audio_carries_pcr()) else {
+    /// The filler PCRs across the PCR-carrying access unit just muxed — the
+    /// last video frame, or with no video the last audio AU — which runs
+    /// `duration_90k` to the next: each as `(ticks after that unit's PCR,
+    /// packet)`, for the caller to send that long after the unit's first
+    /// packet and before the next unit on that PID. None when the span is
+    /// short enough ([`VIDEO_PCR_FILL_AFTER_90K`], [`AUDIO_PCR_FILL_AFTER_90K`])
+    /// or past a second, or when the audio was muxed last and does not carry
+    /// the PCR.
+    pub fn pcr_fillers_after(&self, duration_90k: u64) -> Vec<(u64, Bytes)> {
+        let Some(pcr) = self.last_pcr_90khz else {
             return Vec::new();
         };
-        audio_pcr_filler_offsets(au_duration_90k)
-            .map(|off| (off, self.audio_pcr_filler(pcr + off)))
+        let (pid, fill_after) = if self.has_video {
+            (self.video_pid, VIDEO_PCR_FILL_AFTER_90K)
+        } else if self.audio_carries_pcr() {
+            (self.audio_pid, AUDIO_PCR_FILL_AFTER_90K)
+        } else {
+            return Vec::new();
+        };
+        pcr_filler_offsets(duration_90k, fill_after)
+            .map(|off| (off, self.pcr_filler(pid, pcr + off)))
             .collect()
     }
 
@@ -1699,7 +1748,7 @@ mod tests {
         let mut m = TsMuxer::new();
         m.set_has_video(false);
         m.set_has_audio(true);
-        m.clock_audio_pcr_fillers();
+        m.clock_pcr_fillers();
         let mut ts = Vec::new();
         for k in 0..10u64 {
             ts.extend(m.mux_audio(&raw, 900_000 + k * 5_760, 3, 2));
@@ -1707,23 +1756,134 @@ mod tests {
         assert_eq!(audio_pcrs(&ts).len(), 10, "one PCR per AU, no filler among them");
         let last_cc = ts.iter().rev().find(|p| ts_pid(p) == AUDIO_PID).unwrap()[3] & 0x0F;
         let pcr = 900_000 + 9 * 5_760 - 9_000;
-        let fillers = m.audio_pcr_fillers_after(5_760);
+        let fillers = m.pcr_fillers_after(5_760);
         assert_eq!(fillers.iter().map(|(off, _)| *off).collect::<Vec<_>>(), vec![2_880]);
         let f = &fillers[0].1;
         assert_eq!(ts_pid(f), AUDIO_PID);
         assert_eq!(f[3] & 0x30, 0x20, "adaptation field only");
         assert_eq!(f[3] & 0x0F, last_cc, "the CC of the AU's last packet");
         assert_eq!(crate::engine::ts_parse::extract_pcr(f), Some((pcr + 2_880) * 300));
-        let offs = |d| m.audio_pcr_fillers_after(d).into_iter().map(|(o, _)| o).collect::<Vec<_>>();
+        let offs = |d| m.pcr_fillers_after(d).into_iter().map(|(o, _)| o).collect::<Vec<_>>();
         assert_eq!(offs(3_840), vec![1_920], "HE-AAC at 48 kHz");
         assert_eq!(offs(9_000), vec![3_000, 6_000]);
         assert!(offs(3_150).is_empty() && offs(1_920).is_empty(), "35 ms or less");
         assert!(offs(90_001).is_empty(), "a gap");
         let mut av = TsMuxer::new();
         av.set_has_audio(true);
-        av.clock_audio_pcr_fillers();
+        av.clock_pcr_fillers();
         let _ = av.mux_audio(&raw, 900_000, 3, 2);
-        assert!(av.audio_pcr_fillers_after(5_760).is_empty(), "video carries the PCR");
+        assert!(av.pcr_fillers_after(5_760).is_empty(), "video carries the PCR");
+    }
+
+    /// The PCRs on the video PID of `ts`, in order, with the DTS of the PES
+    /// each rides (`None` for a PCR-only packet), and the packet's CC.
+    fn video_pcrs(ts: &[Bytes]) -> Vec<(u64, Option<u64>, u8)> {
+        ts.iter()
+            .filter(|p| ts_pid(p) == VIDEO_PID)
+            .filter_map(|p| {
+                let pcr = crate::engine::ts_parse::extract_pcr(p)?;
+                let dts = (p[1] & 0x40 != 0).then(|| crate::engine::ts_parse::extract_pes_dts(p)).flatten();
+                Some((pcr / 300, dts, p[3] & 0x0F))
+            })
+            .collect()
+    }
+
+    /// A programme with video: the PCR on each frame runs 100 ms behind the
+    /// frame's DTS, so every frame — and the audio interleaved with it, a
+    /// frame behind the picture — is ahead of the PCR. It used to be the DTS
+    /// itself: zero lead for the picture, and the audio of an RTMP A/V
+    /// publish 0.5-39 ms *behind* the PCR on nearly every PES.
+    #[test]
+    fn a_programme_with_video_leads_its_video_and_audio() {
+        let mut m = TsMuxer::new();
+        m.set_has_audio(true);
+        let raw = vec![0x21u8; 300];
+        let mut ts = Vec::new();
+        for k in 0..25u64 {
+            let dts = 900_000 + k * 3_600;
+            ts.extend(m.mux_video(&[0, 0, 0, 1, 0x41, 0x9A, 0x11], dts + 7_200, dts, k == 0));
+            // Audio trailing the picture by 39 ms, as the RTMP publish did.
+            ts.extend(m.mux_audio(&raw, dts - 3_510, 3, 2));
+        }
+        let pcrs = video_pcrs(&ts);
+        assert_eq!(pcrs.len(), 25, "one per frame at 25 fps, no filler at the 40 ms limit");
+        for (pcr, dts, _) in &pcrs {
+            assert_eq!(dts.unwrap() - pcr, 9_000);
+        }
+        // Each audio PES against the PCR last carried before it.
+        let mut last = None;
+        let mut leads = Vec::new();
+        for p in &ts {
+            if ts_pid(p) == VIDEO_PID
+                && let Some(pcr) = crate::engine::ts_parse::extract_pcr(p)
+            {
+                last = Some(pcr / 300);
+            }
+            if ts_pid(p) == AUDIO_PID
+                && let (Some(pcr), Some(pts)) = (last, crate::engine::ts_parse::extract_pes_pts(p))
+            {
+                leads.push(pts as i64 - pcr as i64);
+            }
+        }
+        assert_eq!(leads.len(), 25);
+        assert!(leads.iter().all(|&l| l == 9_000 - 3_510), "{leads:?}");
+    }
+
+    /// Video steps past 40 ms (23.976 / 24 fps, a dropped frame) get PCR-only
+    /// packets on the video PID so the PCR never steps past TR 101 290's
+    /// limit, each repeating the CC of the payload packet before it; 25 fps
+    /// (40 ms, the limit) and faster get none, and a gap past a second none.
+    #[test]
+    fn a_programme_with_video_repeats_its_pcr_within_40_ms() {
+        for (step, fillers_each) in [(3_754u64, 1usize), (3_600, 0), (3_003, 0), (7_200, 2)] {
+            let mut m = TsMuxer::new();
+            let mut ts = Vec::new();
+            for k in 0..10u64 {
+                let dts = 900_000 + k * step;
+                ts.extend(m.mux_video(&[0, 0, 0, 1, 0x41, 0x9A, 0x11], dts, dts, false));
+            }
+            let pcrs = video_pcrs(&ts);
+            assert_eq!(pcrs.len(), 10 + 9 * fillers_each, "{step}");
+            for w in pcrs.windows(2) {
+                assert!(w[1].0 > w[0].0 && w[1].0 - w[0].0 <= 3_600, "{step}: {:?} -> {:?}", w[0], w[1]);
+            }
+            let video: Vec<&Bytes> = ts.iter().filter(|p| ts_pid(p) == VIDEO_PID).collect();
+            for w in video.windows(2) {
+                if w[1][3] & 0x30 == 0x20 {
+                    assert_eq!(w[1][3] & 0x0F, w[0][3] & 0x0F, "{step}: AF-only CC");
+                }
+            }
+        }
+        let mut m = TsMuxer::new();
+        let mut ts = m.mux_video(&[0, 0, 0, 1, 0x41, 0x9A], 900_000, 900_000, false);
+        ts.extend(m.mux_video(&[0, 0, 0, 1, 0x41, 0x9A], 990_001, 990_001, false));
+        assert_eq!(video_pcrs(&ts).len(), 2, "no fillers across a gap past a second");
+    }
+
+    /// A caller clocking the fillers of a programme with video gets them for
+    /// the frame just muxed, on the video PID with the frame's last CC —
+    /// and none ahead of the next frame.
+    #[test]
+    fn clocked_video_fillers_come_back_with_their_offsets() {
+        let mut m = TsMuxer::new();
+        m.clock_pcr_fillers();
+        let mut ts = Vec::new();
+        for k in 0..5u64 {
+            let dts = 900_000 + k * 3_754;
+            ts.extend(m.mux_video(&[0, 0, 0, 1, 0x41, 0x9A, 0x11], dts, dts, false));
+        }
+        assert_eq!(video_pcrs(&ts).len(), 5, "none ahead of a frame");
+        let last_cc = ts.iter().rev().find(|p| ts_pid(p) == VIDEO_PID).unwrap()[3] & 0x0F;
+        let fillers = m.pcr_fillers_after(3_754);
+        assert_eq!(fillers.iter().map(|(o, _)| *o).collect::<Vec<_>>(), vec![1_877]);
+        let f = &fillers[0].1;
+        assert_eq!(ts_pid(f), VIDEO_PID);
+        assert_eq!(f[3] & 0x0F, last_cc);
+        assert_eq!(
+            crate::engine::ts_parse::extract_pcr(f),
+            Some((900_000 + 4 * 3_754 - 9_000 + 1_877) * 300)
+        );
+        assert!(m.pcr_fillers_after(3_600).is_empty(), "25 fps: the limit, no filler");
     }
 
     /// A layout change after PAT/PMT went out bumps the PMT version and

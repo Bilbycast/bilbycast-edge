@@ -218,7 +218,7 @@ async fn encode_loop(
     let cc_audio = session.cont.last_cc.get(&AUDIO_PID).copied().unwrap_or(0xFF);
     ts_mux.seed_cc(cc_pat, cc_pmt, cc_video, cc_audio);
     ts_mux.set_pmt_version(session.cont.pmt_version);
-    let pts_offset_90k = session.cont.next_target_output_pts_90k;
+    let pts_offset_90k = session.cont.muxed_start_pts_90k();
     let mut max_emitted_pts_90k: u64 = pts_offset_90k;
 
     let frame_duration = Duration::from_nanos(1_000_000_000 / fps.max(1) as u64);

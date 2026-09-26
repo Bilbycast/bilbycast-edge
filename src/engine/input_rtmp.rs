@@ -274,8 +274,8 @@ async fn process_media(
                                 let dts_ms = timestamp_ms as i64;
                                 let pts_ms = dts_ms + composition_time as i64;
 
-                                let dts_90khz = (dts_ms * 90) as u64;
-                                let pts_90khz = (pts_ms.max(0) * 90) as u64;
+                                let dts_90khz = TIMELINE_START_90K + (dts_ms.max(0) * 90) as u64;
+                                let pts_90khz = TIMELINE_START_90K + (pts_ms.max(0) * 90) as u64;
 
                                 // Convert length-prefixed NALUs to Annex B
                                 let annex_b = length_prefixed_to_annex_b(&data[5..], &sps, &pps, is_keyframe && !has_sent_sps_pps);
@@ -357,7 +357,7 @@ async fn process_media(
                                 // AAC frame duration apart at 90 kHz.
                                 let sample_rate_hz = aac_sample_rate_hz(audio_sample_rate_idx);
                                 let anchor = *audio_anchor_pts_90khz
-                                    .get_or_insert_with(|| (timestamp_ms as u64) * 90);
+                                    .get_or_insert_with(|| TIMELINE_START_90K + (timestamp_ms as u64) * 90);
                                 let pts_90khz = anchor
                                     + audio_frames_emitted * 1024 * 90_000 / sample_rate_hz as u64;
                                 audio_frames_emitted += 1;
@@ -430,6 +430,12 @@ async fn process_media(
         }
     }
 }
+
+/// Where a publish's timeline starts (90 kHz): its RTMP timestamps, which
+/// start at 0, are carried from the muxer's PCR lead, so the first PCR —
+/// that far behind the first timestamp — is 0 rather than just below the
+/// 33-bit wrap.
+const TIMELINE_START_90K: u64 = super::rtmp::ts_mux::PCR_LEAD_90K;
 
 /// Audio media time an RTMP publish may carry without a single H.264 tag
 /// before it is taken as audio-only (1 s). Publishers send the AVC sequence

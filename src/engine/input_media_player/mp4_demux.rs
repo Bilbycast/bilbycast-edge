@@ -688,9 +688,11 @@ async fn play_demuxed(
     } else {
         ts_mux.set_has_audio(false);
     }
-    // Audio-only: each AU leaves at its own sample time, so its filler PCRs
-    // are sent at theirs (`PcrFiller`), not ahead of the next AU.
-    ts_mux.clock_audio_pcr_fillers();
+    // Each sample leaves at its own time, so the filler PCRs across a
+    // PCR-carrying sample — a video frame past 40 ms (23.976 / 24 fps), an
+    // audio-only file's AU past 35 ms — are sent at theirs (`PcrFiller`),
+    // not ahead of the next sample.
+    ts_mux.clock_pcr_fillers();
 
     // ── Smooth-splice continuity ──────────────────────────────────────
     // Register this file's layout with the playlist-wide continuity. If
@@ -717,7 +719,7 @@ async fn play_demuxed(
     let cc_audio = session.cont.last_cc.get(&AUDIO_PID).copied().unwrap_or(0xFF);
     ts_mux.seed_cc(cc_pat, cc_pmt, cc_video, cc_audio);
     ts_mux.set_pmt_version(session.cont.pmt_version);
-    let pts_offset_90k = session.cont.next_target_output_pts_90k;
+    let pts_offset_90k = session.cont.muxed_start_pts_90k();
     let mut max_emitted_pts_90k: u64 = pts_offset_90k;
 
     // Pre-build SPS / PPS NALs in Annex-B form once — every IDR sample
@@ -895,6 +897,7 @@ async fn play_demuxed(
         audio_timescale,
         pts_offset_90k,
         epoch_ns,
+        pcr_on_video: has_video,
     };
 
     while let Some(it) = heap.pop() {
@@ -971,6 +974,8 @@ struct MuxParams<'a> {
     audio_timescale: u32,
     pts_offset_90k: u64,
     epoch_ns: u64,
+    /// The file has video, which carries the PCR; otherwise its audio does.
+    pcr_on_video: bool,
 }
 
 /// Mutable muxing/pacing state threaded through the sample emitter and carried
@@ -982,25 +987,30 @@ struct MuxRunState<'a> {
     max_emitted_pts_90k: &'a mut u64,
     last_scheduled_ns: &'a mut u64,
     pending_src_bytes: &'a mut u64,
-    /// An audio-only file's filler PCRs across the last AU's span, held
-    /// until the next AU confirms the span (see [`PcrFiller`]).
+    /// The filler PCRs across the last PCR-carrying sample's span, each held
+    /// until a later sample starts past it (see [`PcrFiller`]).
     pcr_fillers: &'a mut Vec<PcrFiller>,
 }
 
-/// One filler PCR of an audio-only MP4 (the muxer's
-/// `audio_pcr_fillers_after`): it goes out at `deadline_ns` — `offset_90k`
-/// after its AU's PCR-bearing first bundle, the instant its value names —
-/// ahead of the next AU, and only if that AU starts past it. The PCR-bearing
-/// packets of the AUs themselves leave at their sample times, so a filler
-/// sent with the next AU (the muxer's default) arrived up to one AU early
-/// against its value: 21 ms of PCR jitter on HE-AAC at 48 kHz, 32 ms on
-/// AAC-LC at 16 kHz, on a path that otherwise holds PCR accuracy at +0.
-/// At the file's end the fillers after the last AU are dropped: the next
-/// file's first PCR may fall inside that span.
+/// One filler PCR of an MP4 (the muxer's `pcr_fillers_after`) across a
+/// PCR-carrying sample — a video frame, or an audio-only file's AU: it goes
+/// out at `deadline_ns` — `offset_90k` after that sample's PCR-bearing first
+/// bundle, the instant its value names — ahead of the first later sample that
+/// starts past it: an audio sample of an A/V file between two frames, or the
+/// next PCR-carrying sample, which drops those it does not confirm (its span
+/// is shorter, or it starts before them). The PCR-bearing packets of the
+/// samples themselves leave at their sample times, so a filler sent with the
+/// next one (the muxer's default) arrived up to one sample early against its
+/// value: 21 ms of PCR jitter on HE-AAC at 48 kHz, 32 ms on AAC-LC at 16 kHz,
+/// 21 ms on 23.976 fps video, on a path that otherwise holds PCR accuracy at
+/// +0. At the file's end the fillers after the last sample are dropped: the
+/// next file's first PCR may fall inside that span.
 struct PcrFiller {
     deadline_ns: u64,
     offset_90k: u64,
-    au_pts_90k: u64,
+    /// The timestamp its PCR-carrying sample was muxed at (a video DTS, an
+    /// audio PTS), which a later such sample's span is taken from.
+    au_ts_90k: u64,
     packet: Bytes,
 }
 
@@ -1035,7 +1045,9 @@ async fn emit_sample(
     pacer_tx: &std::sync::mpsc::SyncSender<PacerMsg>,
     session: &mut PlayerSession<'_>,
 ) -> bool {
-    let mut audio_pts_90k = None;
+    // The timestamp this sample is muxed at, when it carries the PCR: a
+    // video frame's DTS, or an audio-only file's AU PTS.
+    let pcr_ts_90k;
     let chunks: Vec<bytes::Bytes> = if s.is_video {
         let pts_90 = (ts_to_90khz(
             s.start_time as i64 + s.rendering_offset as i64,
@@ -1055,6 +1067,7 @@ async fn emit_sample(
             .media_stats
             .largest_video_sample_bytes
             .fetch_max(annex_b.len() as u64, Ordering::Relaxed);
+        pcr_ts_90k = mux.pcr_on_video.then_some(dts_90);
         run.ts_mux.mux_video(&annex_b, pts_90, dts_90, s.is_sync)
     } else {
         let pts_90 = (ts_to_90khz(s.start_time as i64, mux.audio_timescale)
@@ -1068,7 +1081,7 @@ async fn emit_sample(
             *run.max_emitted_pts_90k = pts_90;
         }
         session.media_stats.audio_samples_read.fetch_add(1, Ordering::Relaxed);
-        audio_pts_90k = Some(pts_90);
+        pcr_ts_90k = (!mux.pcr_on_video).then_some(pts_90);
         run.ts_mux.mux_audio_pre_adts(&adts, pts_90)
     };
 
@@ -1105,22 +1118,30 @@ async fn emit_sample(
     let anchor_ns = mux.epoch_ns.saturating_add(s.wall_us.saturating_mul(1_000));
     let dur_ns = s.dur_us.saturating_mul(1_000);
     let spread_start_ns = anchor_ns.saturating_sub(dur_ns);
-    // An audio-only file: the previous AU's filler PCRs go out first, each
-    // at its own instant — those this AU confirms (it starts past them).
-    if let Some(pts) = audio_pts_90k {
-        for f in std::mem::take(run.pcr_fillers) {
-            let span = pts.wrapping_sub(f.au_pts_90k) & 0x1_FFFF_FFFF;
-            if f.offset_90k >= span || f.deadline_ns >= spread_start_ns {
-                continue;
+    // The filler PCRs this sample starts past go out first, each at its own
+    // instant (`PcrFiller`). Another PCR-carrying sample settles them all:
+    // one it does not confirm would follow its PCR. An audio sample between
+    // two frames leaves the rest for a later sample.
+    let mut still_pending = Vec::new();
+    for f in std::mem::take(run.pcr_fillers) {
+        if f.deadline_ns >= spread_start_ns {
+            if pcr_ts_90k.is_none() {
+                still_pending.push(f);
             }
-            let deadline_ns = f.deadline_ns.max(*run.last_scheduled_ns);
-            *run.last_scheduled_ns = deadline_ns;
-            if !emit_to_pacer(f.packet, session, pacer_tx, 0, run.pending_src_bytes, Some(deadline_ns)).await
-            {
-                return false;
-            }
+            continue;
+        }
+        if let Some(ts) = pcr_ts_90k
+            && f.offset_90k >= ts.wrapping_sub(f.au_ts_90k) & 0x1_FFFF_FFFF
+        {
+            continue;
+        }
+        let deadline_ns = f.deadline_ns.max(*run.last_scheduled_ns);
+        *run.last_scheduled_ns = deadline_ns;
+        if !emit_to_pacer(f.packet, session, pacer_tx, 0, run.pending_src_bytes, Some(deadline_ns)).await {
+            return false;
         }
     }
+    *run.pcr_fillers = still_pending;
     for (i, data) in sample_bundles.into_iter().enumerate() {
         let target_ns =
             spread_start_ns.saturating_add(dur_ns.saturating_mul(i as u64) / n.max(1));
@@ -1139,16 +1160,16 @@ async fn emit_sample(
         }
     }
 
-    if let Some(pts) = audio_pts_90k {
+    if let Some(ts) = pcr_ts_90k {
         let span_90k = s.dur_us.saturating_mul(90) / 1_000;
         *run.pcr_fillers = run
             .ts_mux
-            .audio_pcr_fillers_after(span_90k)
+            .pcr_fillers_after(span_90k)
             .into_iter()
             .map(|(offset_90k, packet)| PcrFiller {
                 deadline_ns: spread_start_ns.saturating_add(offset_90k * 1_000_000 / 90),
                 offset_90k,
-                au_pts_90k: pts,
+                au_ts_90k: ts,
                 packet,
             })
             .collect();
@@ -1200,9 +1221,11 @@ async fn play_incremental(
     } else {
         ts_mux.set_has_audio(false);
     }
-    // Audio-only: each AU leaves at its own sample time, so its filler PCRs
-    // are sent at theirs (`PcrFiller`), not ahead of the next AU.
-    ts_mux.clock_audio_pcr_fillers();
+    // Each sample leaves at its own time, so the filler PCRs across a
+    // PCR-carrying sample — a video frame past 40 ms (23.976 / 24 fps), an
+    // audio-only file's AU past 35 ms — are sent at theirs (`PcrFiller`),
+    // not ahead of the next sample.
+    ts_mux.clock_pcr_fillers();
 
     // ── Smooth-splice continuity ── (identical to play_demuxed)
     const VIDEO_PID: u16 = 0x0100;
@@ -1222,7 +1245,7 @@ async fn play_incremental(
     let cc_audio = session.cont.last_cc.get(&AUDIO_PID).copied().unwrap_or(0xFF);
     ts_mux.seed_cc(cc_pat, cc_pmt, cc_video, cc_audio);
     ts_mux.set_pmt_version(session.cont.pmt_version);
-    let pts_offset_90k = session.cont.next_target_output_pts_90k;
+    let pts_offset_90k = session.cont.muxed_start_pts_90k();
     let mut max_emitted_pts_90k: u64 = pts_offset_90k;
 
     let (sps_nal, pps_nal) = match reader.video_meta().map(|m| &m.extra) {
@@ -1283,6 +1306,7 @@ async fn play_incremental(
         audio_timescale,
         pts_offset_90k,
         epoch_ns,
+        pcr_on_video: has_video,
     };
 
     // ── 2-cursor bounded merge ─────────────────────────────────────────────
@@ -2088,10 +2112,15 @@ mod tests {
         let demux = DemuxResult { video: Some(video), audio: None, duration_ms: 0 };
 
         let (tx, mut rx) = broadcast::channel::<RtpPacket>(1024);
+        // The arrival of each frame's first bundle — the one opening its PES.
+        // The 90 ms steps also carry filler PCRs, each its own message
+        // between the frames.
         let reader = tokio::spawn(async move {
             let mut arrivals: Vec<std::time::Instant> = Vec::new();
-            while rx.recv().await.is_ok() {
-                arrivals.push(std::time::Instant::now());
+            while let Ok(p) = rx.recv().await {
+                if p.data.chunks(188).any(|c| c[1] & 0x40 != 0 && ((c[1] as u16 & 0x1F) << 8 | c[2] as u16) == 0x0100) {
+                    arrivals.push(std::time::Instant::now());
+                }
             }
             arrivals
         });
@@ -2234,6 +2263,121 @@ mod tests {
                 off_ns / 1_000_000
             );
         }
+    }
+
+    /// An A/V MP4 at 23.976 fps: the video carries the PCR, 100 ms behind
+    /// each frame's DTS (the timeline opens at that lead, so the first PCR
+    /// is 0), and the 41.7 ms frame steps get a filler PCR on the video PID
+    /// between frames — each sent on its own, at its instant, between its
+    /// frame and the next — and every audio PES is ahead of the PCR in force
+    /// when it leaves. The frames' PCR used to be the DTS (no lead: the
+    /// audio aligned with a frame sat exactly on it), stepping 41.7 ms, and
+    /// the first one just below the wrap.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_av_files_video_pcr_leads_and_repeats_on_its_own_clock() {
+        let video = TrackData {
+            timescale: 24_000,
+            samples: (0..24u64).map(|k| avc_sample(300, k * 1_001, k == 0)).collect(),
+            extra: TrackExtra::Avc { sps: vec![0x67, 0x42, 0x00, 0x1E], pps: vec![0x68, 0xCE, 0x3C, 0x80] },
+        };
+        let audio = TrackData {
+            timescale: 48_000,
+            samples: (0..45u64)
+                .map(|k| DemuxedSample { start_time: k * 1_024, rendering_offset: 0, is_sync: true, bytes: vec![0x21; 200] })
+                .collect(),
+            extra: TrackExtra::Aac { adts_profile: 1, sr_index: 3, ch_config: 2 },
+        };
+        let demux = DemuxResult { video: Some(video), audio: Some(audio), duration_ms: 0 };
+        let name = "av-23976.mp4";
+        let thread = format!("media-pacer-{name}");
+        super::super::pacer_trace::watch(&thread);
+        let (tx, _rx) = broadcast::channel::<RtpPacket>(4096);
+        let stats = std::sync::Arc::new(crate::stats::collector::FlowStatsAccumulator::new(
+            "test-flow".into(),
+            "test-flow-name".into(),
+            "media_player".into(),
+        ));
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let mut seq_num: u16 = 0;
+        let mut cont = super::super::SpliceContinuity::default();
+        let mut transcoder: Option<crate::engine::input_transcode::InputTranscoder> = None;
+        let (events, _events_rx) = crate::manager::events::event_channel();
+        let media_stats = std::sync::Arc::new(crate::stats::collector::MediaPlayerStats::default());
+        cont.open_file(name);
+        let mut demux_cache = super::super::DemuxCacheField::default();
+        {
+            let mut session = PlayerSession {
+                seq_num: &mut seq_num,
+                per_input_tx: &tx,
+                stats: &stats,
+                cancel: &cancel,
+                cont: &mut cont,
+                transcoder: &mut transcoder,
+                pid_overrides: None,
+                post: &mut None,
+                bundle_size: super::super::BUNDLE_SIZE,
+                pcr_deadlines: true,
+                media_stats: &media_stats,
+                events: &events,
+                flow_id: "test-flow",
+                input_id: "test-input",
+                demux_cache: &mut demux_cache,
+            };
+            play_demuxed(Path::new(name), &demux, None, &mut session).await.unwrap();
+        }
+        drop(tx);
+        let trace = super::super::pacer_trace::take(&thread);
+        const M: u64 = (1 << 33) * 300;
+        // (deadline ns, packet) in send order.
+        let pkts: Vec<(u64, &[u8])> =
+            trace.iter().flat_map(|(at, b)| b.chunks(188).map(move |p| (*at, p))).collect();
+        let pid = |p: &[u8]| ((p[1] as u16 & 0x1F) << 8) | p[2] as u16;
+        let pcrs: Vec<(u64, u64, Option<u64>)> = pkts
+            .iter()
+            .filter(|(_, p)| pid(p) == 0x0100)
+            .filter_map(|(at, p)| {
+                let pcr = crate::engine::ts_parse::extract_pcr(p)?;
+                Some((*at, pcr, crate::engine::ts_parse::extract_pes_dts(p).or_else(|| crate::engine::ts_parse::extract_pes_pts(p))))
+            })
+            .collect();
+        assert_eq!(pcrs.len(), 24 + 23, "24 frames, a filler across each of the first 23 spans");
+        for (_, pcr, dts) in &pcrs {
+            if let Some(dts) = dts {
+                assert_eq!((dts * 300 + M - pcr) % M, 9_000 * 300, "PCR 100 ms behind the DTS");
+            }
+        }
+        // A cold start opens the timeline at the PCR lead: the first PCR is 0,
+        // not just below the 33-bit wrap.
+        assert_eq!(pcrs[0].1, 0, "the first PCR");
+        for w in pcrs.windows(2) {
+            let step_ns = ((w[1].1 + M - w[0].1) % M) * 1_000 / 27;
+            assert!(step_ns <= 40_000_000, "PCR step {} ms", step_ns / 1_000_000);
+        }
+        // Each filler leaves on its own, after its frame and before the next
+        // frame: sent ahead of the next frame (the muxer's default) it shared
+        // that frame's deadline, up to a frame early against its value.
+        for w in pcrs.windows(3) {
+            if w[1].2.is_none() {
+                assert!(w[0].0 < w[1].0 && w[1].0 < w[2].0, "{w:?}");
+            }
+        }
+        // Every audio PES leads the PCR last sent before it.
+        let mut last_pcr = None;
+        let mut audio_leads = Vec::new();
+        for (_, p) in &pkts {
+            if pid(p) == 0x0100
+                && let Some(pcr) = crate::engine::ts_parse::extract_pcr(p)
+            {
+                last_pcr = Some(pcr / 300);
+            }
+            if pid(p) == 0x0101
+                && let (Some(pcr), Some(pts)) = (last_pcr, crate::engine::ts_parse::extract_pes_pts(p))
+            {
+                audio_leads.push(((pts + (1 << 33) - pcr) % (1 << 33)) as i64);
+            }
+        }
+        assert!(audio_leads.len() > 30);
+        assert!(audio_leads.iter().all(|&l| l > 0 && l < 20_000), "{audio_leads:?}");
     }
 
     fn ffmpeg_available() -> bool {

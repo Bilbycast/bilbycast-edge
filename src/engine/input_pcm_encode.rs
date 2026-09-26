@@ -192,7 +192,7 @@ struct AacSynth {
     /// Also the clock the filler PCRs are released on (`pcr_fillers`).
     pts_90khz: u64,
     /// The filler PCRs across the last AU's span (the muxer's
-    /// `audio_pcr_fillers_after`), each with the input clock (`pts_90khz`)
+    /// `pcr_fillers_after`), each with the input clock (`pts_90khz`)
     /// it comes due at — the AU's own emission clock plus its offset. The
     /// AUs leave as the input packet that completes them arrives, so a
     /// filler sent with the next AU (the muxer's default) arrived up to one
@@ -480,7 +480,7 @@ fn build_synth(
     ts_mux.set_audio_stream(0x0F, None);
     // Each AU leaves as the input packet completing it arrives: its filler
     // PCRs are released on the input clock (`AacSynth::pcr_fillers`).
-    ts_mux.clock_audio_pcr_fillers();
+    ts_mux.clock_pcr_fillers();
 
     let frame_size = input_fmt.channels as usize * input_fmt.bit_depth.wire_bytes();
     let planar_scratch: Vec<Vec<f32>> = (0..input_fmt.channels).map(|_| Vec::new()).collect();
@@ -592,7 +592,7 @@ impl AacSynth {
             self.pcr_fillers.clear();
             self.pcr_fillers.extend(
                 self.ts_mux
-                    .audio_pcr_fillers_after(self.au_duration_90k)
+                    .pcr_fillers_after(self.au_duration_90k)
                     .into_iter()
                     .map(|(off, p)| (now.wrapping_add(off), p)),
             );

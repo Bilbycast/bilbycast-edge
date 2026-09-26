@@ -276,7 +276,7 @@ async fn run_rtsp_session(
         match item {
             CodecItem::VideoFrame(frame) => {
                 let is_keyframe = frame.is_random_access_point();
-                let pts_90khz = frame.timestamp().elapsed().max(0) as u64;
+                let pts_90khz = rtsp_pts_90k(frame.timestamp().elapsed());
                 let data = frame.into_data();
 
                 // FrameFormat::SIMPLE gives Annex B — TsMuxer expects this
@@ -312,7 +312,7 @@ async fn run_rtsp_session(
                 }
             }
             CodecItem::AudioFrame(frame) => {
-                let pts_90khz = frame.timestamp().elapsed().max(0) as u64;
+                let pts_90khz = rtsp_pts_90k(frame.timestamp().elapsed());
                 let data = frame.data();
 
                 // retina with `FrameFormat::SIMPLE` (set above) returns
@@ -355,4 +355,11 @@ async fn run_rtsp_session(
             _ => {} // SenderReport, MessageFrame, etc.
         }
     }
+}
+
+/// A retina frame's PES timestamp: its ticks since the session's first
+/// timestamp, from the muxer's PCR lead — the PCR runs that far behind the
+/// timestamps, so from 0 the first one sat just below the 33-bit wrap.
+fn rtsp_pts_90k(elapsed: i64) -> u64 {
+    super::rtmp::ts_mux::PCR_LEAD_90K + elapsed.max(0) as u64
 }

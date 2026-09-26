@@ -661,6 +661,19 @@ pub(super) struct SpliceContinuity {
 }
 
 impl SpliceContinuity {
+    /// Where a file whose TS this input muxes itself (an MP4, an image
+    /// slate) starts its timeline: the previous file's continuation, or on
+    /// the flow's first file the muxer's PCR lead. The muxer's PCR runs that
+    /// far behind the first timestamp, so from 0 the first PCR sat just below
+    /// the 33-bit wrap and wrapped 100 ms in.
+    pub(super) fn muxed_start_pts_90k(&self) -> u64 {
+        if self.has_played_at_least_one_file {
+            self.next_target_output_pts_90k
+        } else {
+            self.next_target_output_pts_90k.max(crate::engine::rtmp::ts_mux::PCR_LEAD_90K)
+        }
+    }
+
     /// Called by `play_source` before dispatching to the per-format
     /// player. Compares the new source against the previous one and
     /// arms `pending_discontinuity` if the layout (or the source itself)
