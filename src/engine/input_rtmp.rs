@@ -215,6 +215,9 @@ async fn process_media(
     // muxer regardless of how it computes DTS.
     let mut audio_anchor_pts_90khz: Option<u64> = None;
     let mut audio_frames_emitted: u64 = 0;
+    // Whether this publish carries video — what the PMT lists and which PID
+    // carries the PCR. See `PublishLayout`.
+    let mut layout = PublishLayout::default();
 
     loop {
         tokio::select! {
@@ -237,6 +240,9 @@ async fn process_media(
                         if codec_id != 7 {
                             continue;
                         }
+                        // Video after all: a publish taken as audio-only
+                        // moves back (PMT version bump, PCR on video).
+                        apply_layout(&mut muxer, layout.on_video(), &flow_id);
 
                         match avc_packet_type {
                             0 => {
@@ -355,6 +361,9 @@ async fn process_media(
                                 let pts_90khz = anchor
                                     + audio_frames_emitted * 1024 * 90_000 / sample_rate_hz as u64;
                                 audio_frames_emitted += 1;
+                                if let Some(has_video) = layout.on_audio(pts_90khz) {
+                                    apply_layout(&mut muxer, has_video, &flow_id);
+                                }
 
                                 let ts_packets = muxer.mux_audio(raw_aac, pts_90khz, audio_sample_rate_idx, audio_channels);
 
@@ -388,9 +397,11 @@ async fn process_media(
                             _ => {}
                         }
                     }
-                    Some(RtmpMediaMessage::Metadata) => {
-                        // Could extract resolution, bitrate, etc. from onMetaData
-                        tracing::debug!("RTMP: received metadata");
+                    Some(RtmpMediaMessage::Metadata { declares_video }) => {
+                        tracing::debug!(?declares_video, "RTMP: received metadata");
+                        if let Some(has_video) = layout.on_metadata(declares_video) {
+                            apply_layout(&mut muxer, has_video, &flow_id);
+                        }
                     }
                     Some(RtmpMediaMessage::Disconnected) => {
                         tracing::info!("RTMP publisher disconnected, waiting for reconnection");
@@ -405,6 +416,9 @@ async fn process_media(
                         // the sample counter from its own RTMP wall time.
                         audio_anchor_pts_90khz = None;
                         audio_frames_emitted = 0;
+                        // The next publisher states its own layout. The
+                        // muxer keeps this one's until it does.
+                        layout = PublishLayout::default();
                     }
                     None => {
                         // Channel closed
@@ -414,6 +428,86 @@ async fn process_media(
                 }
             }
         }
+    }
+}
+
+/// Audio media time an RTMP publish may carry without a single H.264 tag
+/// before it is taken as audio-only (1 s). Publishers send the AVC sequence
+/// header straight after `onMetaData`, ahead of any audio of note.
+const AUDIO_ONLY_AFTER_90K: u64 = 90_000;
+
+/// Whether an RTMP publish carries video: what the TS muxer's PMT lists,
+/// and whether its PCR rides the video or the audio PID.
+///
+/// The muxer assumed video, so an audio-only publish (a radio encoder, an
+/// AAC-only push) went out with a PMT naming an absent video PID as PCR_PID
+/// and no PCR at all — every output of the flow unclocked, and the ingress
+/// PTS rewriter dropping its first 2 s of audio waiting for one. RTMP
+/// carries no FLV file header (`TypeFlagsAudio` / `TypeFlagsVideo` exist
+/// only in `.flv` files), so the answer comes from the publisher's
+/// `onMetaData` and from the tags:
+/// - `onMetaData` describing audio and no video → audio-only at once;
+/// - an H.264 tag → video for the rest of the publish, including after
+///   audio-only was decided (a late video tag: the muxer bumps the PMT
+///   version and PCR moves to the video PID);
+/// - audio for [`AUDIO_ONLY_AFTER_90K`] with no H.264 tag — no metadata, or
+///   metadata naming a video codec this input does not remux — →
+///   audio-only, and only a video tag reverses that.
+///
+/// Until one of those the muxer keeps what it had: video on a fresh input,
+/// the previous publisher's layout after a reconnect.
+#[derive(Debug, Default)]
+struct PublishLayout {
+    /// An H.264 tag arrived in this publish.
+    video_seen: bool,
+    /// Audio-only was decided from the tags (the audio ran on alone).
+    audio_only_by_tags: bool,
+    /// PTS of this publish's first audio frame.
+    first_audio_90k: Option<u64>,
+}
+
+impl PublishLayout {
+    /// `onMetaData` said `declares_video` (`None`: nothing). Returns the
+    /// video presence to apply. The tags outrank it: a publish that has
+    /// sent video, or whose audio already ran on alone, keeps its layout.
+    fn on_metadata(&mut self, declares_video: Option<bool>) -> Option<bool> {
+        if self.video_seen || self.audio_only_by_tags {
+            return None;
+        }
+        declares_video
+    }
+
+    /// An H.264 tag arrived: video.
+    fn on_video(&mut self) -> bool {
+        self.video_seen = true;
+        self.audio_only_by_tags = false;
+        true
+    }
+
+    /// An audio frame stamped `pts_90k`: audio-only once the audio has run
+    /// [`AUDIO_ONLY_AFTER_90K`] with no H.264 tag.
+    fn on_audio(&mut self, pts_90k: u64) -> Option<bool> {
+        if self.video_seen {
+            return None;
+        }
+        let first = *self.first_audio_90k.get_or_insert(pts_90k);
+        if pts_90k.saturating_sub(first) >= AUDIO_ONLY_AFTER_90K {
+            self.audio_only_by_tags = true;
+        }
+        self.audio_only_by_tags.then_some(false)
+    }
+}
+
+/// Apply a publish's video presence to the muxer, logging a real change.
+fn apply_layout(muxer: &mut TsMuxer, has_video: bool, flow_id: &str) {
+    if muxer.change_has_video(has_video) {
+        tracing::info!(
+            flow_id,
+            has_video,
+            "RTMP: publish {} — the PMT names the {} PID as PCR_PID",
+            if has_video { "carries video" } else { "is audio-only" },
+            if has_video { "video" } else { "audio" },
+        );
     }
 }
 
@@ -563,6 +657,164 @@ fn length_prefixed_to_annex_b(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::ts_parse::{extract_pcr, ts_pid, ts_pusi};
+
+    /// What `process_media` published for a sequence of RTMP messages: every
+    /// PMT as `(version, PCR_PID, ES PIDs)` in order, and the PIDs whose
+    /// packets carried a PCR, in order of the first PCR on each.
+    struct Published {
+        pmts: Vec<(u8, u16, Vec<u16>)>,
+        pcr_pids: Vec<u16>,
+        video_packets: usize,
+    }
+
+    async fn publish(msgs: Vec<RtmpMediaMessage>) -> Published {
+        let (tx, rx) = mpsc::channel(8192);
+        for m in msgs {
+            tx.send(m).await.unwrap();
+        }
+        drop(tx);
+        let (btx, mut brx) = broadcast::channel(8192);
+        let stats = Arc::new(FlowStatsAccumulator::new("f".into(), "flow".into(), "rtmp".into()));
+        let cancel = CancellationToken::new();
+        let publisher = crate::engine::ingress_publisher::IngressPublisher::new(
+            Default::default(),
+            btx,
+            "in",
+            cancel.clone(),
+            stats.clone(),
+        );
+        let (events, _events_rx) = crate::manager::events::event_channel();
+        process_media(rx, publisher, stats, cancel, events, "flow".into(), &mut None, &mut None, None)
+            .await;
+        let mut out = Published { pmts: Vec::new(), pcr_pids: Vec::new(), video_packets: 0 };
+        while let Ok(p) = brx.try_recv() {
+            for pkt in p.data.chunks(188) {
+                let pid = ts_pid(pkt);
+                if pid == 0x0100 {
+                    out.video_packets += 1;
+                }
+                if extract_pcr(pkt).is_some() && !out.pcr_pids.contains(&pid) {
+                    out.pcr_pids.push(pid);
+                }
+                if pid == 0x1000 && ts_pusi(pkt) {
+                    let sec = &pkt[5..];
+                    let len = (((sec[1] & 0x0F) as usize) << 8) | sec[2] as usize;
+                    let mut es = Vec::new();
+                    let mut pos = 12;
+                    while pos + 5 <= 3 + len - 4 {
+                        es.push((((sec[pos + 1] & 0x1F) as u16) << 8) | sec[pos + 2] as u16);
+                        pos += 5 + ((((sec[pos + 3] & 0x0F) as usize) << 8) | sec[pos + 4] as usize);
+                    }
+                    let pmt = ((sec[5] >> 1) & 0x1F, (((sec[8] & 0x1F) as u16) << 8) | sec[9] as u16, es);
+                    if out.pmts.last() != Some(&pmt) {
+                        out.pmts.push(pmt);
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    fn aac_config() -> RtmpMediaMessage {
+        // AAC-LC, 48 kHz, stereo.
+        RtmpMediaMessage::Audio { data: bytes::Bytes::from_static(&[0xAF, 0x00, 0x11, 0x90]), timestamp_ms: 0 }
+    }
+
+    fn aac_frames(n: u32, first_ms: u32) -> Vec<RtmpMediaMessage> {
+        (0..n)
+            .map(|i| {
+                let mut data = vec![0xAF, 0x01];
+                data.extend(std::iter::repeat_n(0x21, 300));
+                RtmpMediaMessage::Audio { data: data.into(), timestamp_ms: first_ms + i * 21 }
+            })
+            .collect()
+    }
+
+    fn avc_config() -> RtmpMediaMessage {
+        let mut data = vec![0x17, 0x00, 0, 0, 0, 1, 0x42, 0x00, 0x1E, 0xFF, 0xE1, 0x00, 0x04];
+        data.extend_from_slice(&[0x67, 0x42, 0x00, 0x1E]);
+        data.extend_from_slice(&[0x01, 0x00, 0x04, 0x68, 0xCE, 0x3C, 0x80]);
+        RtmpMediaMessage::Video { data: data.into(), timestamp_ms: 0 }
+    }
+
+    fn avc_idr(timestamp_ms: u32) -> RtmpMediaMessage {
+        let mut nalu = vec![0x65, 0x88, 0x84];
+        nalu.extend(std::iter::repeat_n(0x11, 400));
+        let mut data = vec![0x17, 0x01, 0, 0, 0];
+        data.extend_from_slice(&(nalu.len() as u32).to_be_bytes());
+        data.extend_from_slice(&nalu);
+        RtmpMediaMessage::Video { data: data.into(), timestamp_ms }
+    }
+
+    /// An audio-only publish (ffmpeg `-f flv` with no video writes no video
+    /// property into `onMetaData`): the PMT lists the audio alone and names
+    /// it as PCR_PID, and the audio carries the PCR. It used to name the
+    /// absent video PID and carry no PCR at all.
+    #[tokio::test]
+    async fn an_audio_only_publish_carries_its_pcr_on_the_audio() {
+        let mut msgs = vec![RtmpMediaMessage::Metadata { declares_video: Some(false) }, aac_config()];
+        msgs.extend(aac_frames(10, 0));
+        let out = publish(msgs).await;
+        assert_eq!(out.pmts, vec![(0, 0x0101, vec![0x0101])]);
+        assert_eq!(out.pcr_pids, vec![0x0101]);
+    }
+
+    /// With no `onMetaData` the publish is taken as audio-only once its
+    /// audio has run a second alone (PMT version 1); a video tag after that
+    /// moves it back (version 2, PCR on the video).
+    #[tokio::test]
+    async fn a_publish_without_metadata_follows_its_tags() {
+        let mut msgs = vec![aac_config()];
+        msgs.extend(aac_frames(60, 0));
+        msgs.push(avc_config());
+        msgs.push(avc_idr(1300));
+        msgs.extend(aac_frames(2, 1300));
+        let out = publish(msgs).await;
+        assert_eq!(
+            out.pmts,
+            vec![
+                (0, 0x0100, vec![0x0100, 0x0101]),
+                (1, 0x0101, vec![0x0101]),
+                (2, 0x0100, vec![0x0100, 0x0101]),
+            ],
+        );
+        assert_eq!(out.pcr_pids, vec![0x0101, 0x0100]);
+        assert!(out.video_packets > 0);
+    }
+
+    /// An A/V publish is unchanged: one PMT, PCR on the video.
+    #[tokio::test]
+    async fn an_av_publish_keeps_its_pcr_on_the_video() {
+        let mut msgs =
+            vec![RtmpMediaMessage::Metadata { declares_video: Some(true) }, avc_config(), aac_config()];
+        msgs.push(avc_idr(0));
+        msgs.extend(aac_frames(60, 0));
+        msgs.push(avc_idr(1300));
+        let out = publish(msgs).await;
+        assert_eq!(out.pmts, vec![(0, 0x0100, vec![0x0100, 0x0101])]);
+        assert_eq!(out.pcr_pids, vec![0x0100]);
+    }
+
+    /// Metadata cannot overrule the tags: once video has been sent, an
+    /// `onMetaData` without it changes nothing, and once the audio ran on
+    /// alone a later one declaring video does not either.
+    #[test]
+    fn the_tags_outrank_the_metadata() {
+        let mut l = PublishLayout::default();
+        assert_eq!(l.on_metadata(Some(false)), Some(false));
+        assert!(l.on_video());
+        assert_eq!(l.on_metadata(Some(false)), None);
+        assert_eq!(l.on_audio(10 * AUDIO_ONLY_AFTER_90K), None, "video was seen");
+
+        let mut l = PublishLayout::default();
+        assert_eq!(l.on_audio(1_000), None);
+        assert_eq!(l.on_audio(1_000 + AUDIO_ONLY_AFTER_90K - 1), None);
+        assert_eq!(l.on_audio(1_000 + AUDIO_ONLY_AFTER_90K), Some(false));
+        assert_eq!(l.on_metadata(Some(true)), None, "the audio ran on alone");
+        assert!(l.on_video());
+        assert_eq!(l.on_audio(1_000 + 3 * AUDIO_ONLY_AFTER_90K), None);
+    }
 
     /// Regression for Bug B (2026-04-09): RTMP packets must carry a
     /// monotonically advancing wall-clock `recv_time_us` so the HLS output

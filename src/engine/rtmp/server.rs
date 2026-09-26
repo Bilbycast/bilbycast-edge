@@ -75,10 +75,55 @@ pub enum RtmpMediaMessage {
         data: Bytes,
         timestamp_ms: u32,
     },
-    /// Metadata message (onMetaData).
-    Metadata,
+    /// Data message (`onMetaData`, `@setDataFrame`, …). `declares_video`
+    /// is what an `onMetaData` says about video — see
+    /// [`metadata_declares_video`]; `None` when the message is not one or
+    /// does not say.
+    Metadata { declares_video: Option<bool> },
     /// Publisher disconnected.
     Disconnected,
+}
+
+/// `onMetaData` properties that describe a video stream. ffmpeg's FLV muxer
+/// writes them only for one; OBS, Wirecast, vMix and hardware encoders do
+/// the same.
+const METADATA_VIDEO_KEYS: &[&str] =
+    &["videocodecid", "width", "height", "framerate", "videoframerate", "videodatarate"];
+
+/// `onMetaData` properties that describe an audio stream.
+const METADATA_AUDIO_KEYS: &[&str] = &[
+    "audiocodecid",
+    "audiosamplerate",
+    "audiosamplesize",
+    "audiodatarate",
+    "audiochannels",
+    "stereo",
+];
+
+/// Whether a publisher's data message is an `onMetaData` (bare, or behind
+/// `@setDataFrame`) that declares a video stream: `Some(true)` when any
+/// video property carries a value, `Some(false)` when it describes audio
+/// and no video, `None` when it is no `onMetaData` or says neither.
+///
+/// RTMP carries no FLV file header — its `TypeFlagsAudio` /
+/// `TypeFlagsVideo` exist only in `.flv` files — so this is the one
+/// up-front statement a publisher makes about its layout.
+pub fn metadata_declares_video(values: &[Amf0Value]) -> Option<bool> {
+    let at = values.iter().position(|v| v.as_str() == Some("onMetaData"))?;
+    let props = values[at + 1..].iter().find(|v| matches!(v, Amf0Value::Object(_)))?;
+    let has_value = |key: &&str| match props.get_property(key) {
+        Some(Amf0Value::Number(n)) => *n > 0.0,
+        Some(Amf0Value::String(s)) => !s.is_empty(),
+        Some(Amf0Value::Boolean(b)) => *b,
+        _ => false,
+    };
+    if METADATA_VIDEO_KEYS.iter().any(has_value) {
+        return Some(true);
+    }
+    METADATA_AUDIO_KEYS
+        .iter()
+        .any(|key| props.get_property(key).is_some())
+        .then_some(false)
 }
 
 /// Configuration for the RTMP server.
@@ -425,7 +470,13 @@ async fn receive_media_loop<S: AsyncRead + AsyncWrite + Unpin + Send>(
                 }).await;
             }
             msg_type::DATA_AMF0 => {
-                let _ = media_tx.send(RtmpMediaMessage::Metadata).await;
+                // Bounded like every AMF0 message this server decodes: the
+                // chunk reader caps DATA_AMF0 at `MAX_PREPUBLISH_MSG_LEN` and
+                // `decode_all` charges its value budget.
+                let declares_video = amf0::decode_all(&msg.payload)
+                    .ok()
+                    .and_then(|values| metadata_declares_video(&values));
+                let _ = media_tx.send(RtmpMediaMessage::Metadata { declares_video }).await;
             }
             msg_type::SET_CHUNK_SIZE => {
                 if msg.payload.len() >= 4 {
@@ -915,5 +966,59 @@ mod tests {
             !text.contains("s3cret-stream-keZ"),
             "a rejected stream key guess reached the log:\n{text}"
         );
+    }
+
+    /// ffmpeg's `-f flv` metadata, as `@setDataFrame onMetaData <ecma
+    /// array>`: an audio-only publish names no video property, an A/V one
+    /// does, and a data message that is no `onMetaData` says nothing.
+    #[test]
+    fn on_metadata_says_whether_the_publish_carries_video() {
+        let meta = |props: Vec<(&str, Amf0Value)>| {
+            vec![
+                Amf0Value::String("@setDataFrame".into()),
+                Amf0Value::String("onMetaData".into()),
+                Amf0Value::Object(props.into_iter().map(|(k, v)| (k.to_string(), v)).collect()),
+            ]
+        };
+        let audio_only = meta(vec![
+            ("duration", Amf0Value::Number(0.0)),
+            ("audiodatarate", Amf0Value::Number(125.0)),
+            ("audiosamplerate", Amf0Value::Number(48000.0)),
+            ("audiosamplesize", Amf0Value::Number(16.0)),
+            ("stereo", Amf0Value::Boolean(true)),
+            ("audiocodecid", Amf0Value::Number(10.0)),
+            ("encoder", Amf0Value::String("Lavf62.3.100".into())),
+        ]);
+        assert_eq!(metadata_declares_video(&audio_only), Some(false));
+        let av = meta(vec![
+            ("width", Amf0Value::Number(1920.0)),
+            ("height", Amf0Value::Number(1080.0)),
+            ("videocodecid", Amf0Value::Number(7.0)),
+            ("audiocodecid", Amf0Value::Number(10.0)),
+        ]);
+        assert_eq!(metadata_declares_video(&av), Some(true));
+        // Enhanced RTMP names the codec by FourCC.
+        let fourcc = meta(vec![("videocodecid", Amf0Value::String("hvc1".into()))]);
+        assert_eq!(metadata_declares_video(&fourcc), Some(true));
+        // A zero `videocodecid` beside audio properties is not a video stream.
+        let zero = meta(vec![
+            ("videocodecid", Amf0Value::Number(0.0)),
+            ("audiocodecid", Amf0Value::Number(10.0)),
+        ]);
+        assert_eq!(metadata_declares_video(&zero), Some(false));
+        assert_eq!(metadata_declares_video(&meta(vec![("encoder", Amf0Value::String("x".into()))])), None);
+        // A bare onMetaData (no @setDataFrame) round-trips through the wire
+        // encoding, ECMA array included.
+        let mut wire = vec![0x02, 0x00, 0x0A];
+        wire.extend_from_slice(b"onMetaData");
+        wire.extend_from_slice(&[0x08, 0, 0, 0, 1, 0x00, 0x0C]);
+        wire.extend_from_slice(b"audiocodecid");
+        wire.push(0x00);
+        wire.extend_from_slice(&10.0f64.to_be_bytes());
+        wire.extend_from_slice(&[0x00, 0x00, 0x09]);
+        let decoded = super::super::amf0::decode_all(&wire).unwrap();
+        assert_eq!(metadata_declares_video(&decoded), Some(false));
+        let other = vec![Amf0Value::String("onTextData".into()), Amf0Value::Object(vec![])];
+        assert_eq!(metadata_declares_video(&other), None);
     }
 }

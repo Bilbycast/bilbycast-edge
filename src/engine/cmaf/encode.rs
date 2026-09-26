@@ -18,8 +18,14 @@
 //!
 //! Source H.264/HEVC access unit → Annex-B framing → `VideoDecoder`
 //! → `VideoEncoder` (x264 / x265 / NVENC, feature-gated) → target
-//! H.264/HEVC NAL units. The operator's `gop_size` is honoured (60 when
-//! unset); CMAF segment boundaries land on that GOP's IDRs.
+//! H.264/HEVC NAL units. The encoder opens at the source's measured frame
+//! rate (`EncoderRateLock`) unless the operator pins one. The operator's
+//! `gop_size` is honoured; unset, the GOP tiles the CMAF segment at that
+//! rate (`cmaf_default_gop`), and an IDR is forced on every GOP boundary of
+//! the encoded-frame count, so every segment boundary lands on an IDR
+//! whatever scene cuts the encoder finds in between.
+//! Every output frame carries the source PTS of its own picture, as the
+//! decoder propagated it.
 
 use std::sync::Arc;
 
@@ -658,6 +664,17 @@ enum Placement {
 #[cfg(feature = "media-codecs")]
 pub struct VideoReencoder {
     decoder: Option<video_engine::VideoDecoder>,
+    /// The encoder rate, measured from the decoded frames unless pinned.
+    rate: crate::engine::video_encode_util::EncoderRateLock,
+    /// Segment duration the default GOP tiles (`cmaf_default_gop`); `None`
+    /// leaves the encoder's own default.
+    segment_secs: Option<f64>,
+    /// Frame counter the encoder is stamped with — its time base is
+    /// 1 / fps, and 90 kHz ticks against it are the VBV hazard
+    /// `ScaledVideoEncoder::set_pts_90k` documents.
+    next_frame: i64,
+    /// How an encoded frame finds its picture's source PTS.
+    in_flight: crate::engine::video_encode_util::EncodedPtsMap,
     /// Shared encoder pipeline — wraps `VideoEncoder` + optional
     /// `VideoScaler`. CMAF carries SPS/PPS inline on every IDR
     /// (segments are self-contained for DASH/HLS tune-in) so the
@@ -673,9 +690,6 @@ pub struct VideoReencoder {
     /// Source codec pinned at first observed frame; changing codec is
     /// rejected (operator must restart the flow).
     source_codec: Option<CmafVideoCodec>,
-    /// The last pts handed to the encoder — the step-off point for the
-    /// frames [`Self::flush`] drains from the decoder.
-    last_pts: Option<i64>,
     /// Holds an H.264 decoder open back until an access unit carries the
     /// SPS, which seeds its reorder depth (`SpsOpenGate`).
     sps_gate: crate::engine::video_encode_util::SpsOpenGate,
@@ -690,6 +704,35 @@ pub struct VideoReencoder {
 pub struct VideoOutFrame {
     pub nalus: Vec<Vec<u8>>,
     pub is_keyframe: bool,
+    /// Source PTS (90 kHz) of the picture this frame codes — the one the
+    /// decoder propagated through its reorder queue — or `None` when the
+    /// decoder lost it. Not the PTS of the access unit that was being fed
+    /// when the frame came out: a decoder hands pictures back in display
+    /// order, as many or as few per access unit as it has, and drops the
+    /// ones it cannot decode (an open-GOP clip's leading pictures).
+    pub pts: Option<u64>,
+}
+
+#[cfg(feature = "media-codecs")]
+/// Longest default GOP of a CMAF re-encode, in seconds: IDRs every ≤ 2 s,
+/// as Apple's HLS authoring spec asks and as the 60-frame default this
+/// replaced intended (2 s at 30 fps).
+const CMAF_MAX_DEFAULT_GOP_SECS: f64 = 2.0;
+
+/// The default GOP (frames) of a CMAF re-encode at `fps_num / fps_den` with
+/// `segment_secs` segments: the fewest GOPs of at most
+/// [`CMAF_MAX_DEFAULT_GOP_SECS`] that tile a segment, each rounded **up** to
+/// a whole frame. The segmenter cuts on the first IDR at or after the
+/// target, so a segment's last GOP ending at or just past it closes the
+/// segment on time; one ending short of it by a frame would run the
+/// segment on to the next IDR. A 2 s segment is one GOP: 50 frames at 25,
+/// 60 at 29.97 and 30, 48 at 23.976, 100 at 50. The flat 60 it replaced was
+/// 2.4 s at 25 fps, so a 2 s target cut 2.4 s segments.
+#[cfg(feature = "media-codecs")]
+pub fn cmaf_default_gop(segment_secs: f64, fps_num: u32, fps_den: u32) -> u32 {
+    let fps = fps_num as f64 / fps_den.max(1) as f64;
+    let gops = (segment_secs / CMAF_MAX_DEFAULT_GOP_SECS - 1e-9).ceil().max(1.0);
+    ((segment_secs * fps / gops - 1e-6).ceil() as u32).clamp(1, 600)
 }
 
 /// The codec family a `video_encode.codec` string produces.
@@ -715,7 +758,9 @@ pub fn encoded_codec_family(codec: &str) -> Option<CmafVideoCodec> {
 
 #[cfg(feature = "media-codecs")]
 impl VideoReencoder {
-    pub fn new(cfg: &VideoEncodeConfig, output_id: &str) -> Result<Self> {
+    /// `segment_secs`: the CMAF segment duration an unset `gop_size` is
+    /// sized to (`None` — clip export — keeps the encoder's default).
+    pub fn new(cfg: &VideoEncodeConfig, output_id: &str, segment_secs: Option<f64>) -> Result<Self> {
         let target_codec = match cfg.codec.as_str() {
             "x264" => video_codec::VideoEncoderCodec::X264,
             "x265" => video_codec::VideoEncoderCodec::X265,
@@ -729,22 +774,20 @@ impl VideoReencoder {
             "hevc_rkmpp" => video_codec::VideoEncoderCodec::HevcRkmpp,
             other => bail!("unknown video codec: {other}"),
         };
-        let (fps_num, fps_den) = match (cfg.fps_num, cfg.fps_den) {
-            (Some(n), Some(d)) => (n, d),
-            _ => (30, 1),
+        // Unpinned, the encoder opens at the source's measured rate (the
+        // placeholder below is replaced at the lock); it used to open at a
+        // flat 30/1 — a 25 fps source's VUI said 30 fps and CBR ran 5/6 of
+        // the configured bitrate.
+        let (pinned, (fps_num, fps_den)) = match (cfg.fps_num, cfg.fps_den) {
+            (Some(n), Some(d)) => (true, (n, d)),
+            _ => (false, crate::engine::video_encode_util::RATE_LOCK_FALLBACK),
         };
         // CMAF-LL segments are self-contained (DASH/HLS tune-in); SPS/PPS
-        // rides in-band on every IDR, so `global_header = false`. GOP
-        // size defaults to 60 (2s at 30 fps) when the operator didn't
-        // pick one — the pipeline's `build_encoder_config` applies
-        // `2 * fps` by default, but CMAF segmenters are happier with a
-        // steady 60-frame GoP regardless of fps.
-        let mut pipeline_cfg = cfg.clone();
-        if pipeline_cfg.gop_size.is_none() {
-            pipeline_cfg.gop_size = Some(60);
-        }
+        // rides in-band on every IDR, so `global_header = false`. An unset
+        // GOP is sized to the segment once the rate is known
+        // (`cmaf_default_gop`).
         let pipeline = crate::engine::video_encode_util::ScaledVideoEncoder::new(
-            pipeline_cfg,
+            cfg.clone(),
             target_codec,
             fps_num,
             fps_den,
@@ -753,24 +796,29 @@ impl VideoReencoder {
         );
         Ok(Self {
             decoder: None,
+            rate: crate::engine::video_encode_util::EncoderRateLock::new(pinned),
+            segment_secs,
+            next_frame: 0,
+            in_flight: Default::default(),
             pipeline,
             output_id: output_id.to_string(),
             annex_b_scratch: Vec::with_capacity(256 * 1024),
             source_codec: None,
-            last_pts: None,
             sps_gate: crate::engine::video_encode_util::SpsOpenGate::new(),
         })
     }
 
-    /// Encode one access unit. Returns the re-encoded NAL list +
-    /// keyframe flag, or `None` if the encoder buffered the frame.
+    /// Encode one access unit (decode order), stamped `pts` (90 kHz).
+    /// Returns every frame the encoder handed back — none while the decoder
+    /// and encoder fill, and while the rate is still being measured — each
+    /// carrying its own picture's source PTS.
     pub fn encode_frame(
         &mut self,
         nalus: &[Vec<u8>],
         pts: u64,
         _is_keyframe: bool,
         codec: CmafVideoCodec,
-    ) -> Result<Option<VideoOutFrame>> {
+    ) -> Result<Vec<VideoOutFrame>> {
         match self.source_codec {
             None => self.source_codec = Some(codec),
             Some(prev) if prev != codec => {
@@ -799,7 +847,7 @@ impl VideoReencoder {
             // P picture at a mid-GOP join, a source that declares no
             // reordering would hold a frame for good.
             if !self.sps_gate.admits(src_codec, &self.annex_b_scratch) {
-                return Ok(None);
+                return Ok(Vec::new());
             }
             let dec = video_engine::VideoDecoder::open_opts(
                 src_codec,
@@ -814,49 +862,96 @@ impl VideoReencoder {
             // an explicit `scan: interlaced` needs to know.
             self.pipeline.set_source_codec(src_codec);
         }
-        let dec = self.decoder.as_mut().unwrap();
-        dec.send_packet(&self.annex_b_scratch)
-            .map_err(|e| anyhow::anyhow!("VideoDecoder send_packet failed: {e}"))?;
-        let decoded = match dec.receive_frame() {
-            Ok(f) => f,
-            Err(_e) => return Ok(None), // encoder buffered
+        let Some(dec) = self.decoder.as_mut() else {
+            return Ok(Vec::new());
         };
+        // The PTS goes in with the access unit so the decoder hands each
+        // picture back with its own (display order).
+        dec.send_packet_with_pts(&self.annex_b_scratch, (pts & PTS_MASK_33B) as i64)
+            .map_err(|e| anyhow::anyhow!("VideoDecoder send_packet failed: {e}"))?;
+        let mut decoded = Vec::new();
+        while let Ok(frame) = dec.receive_frame() {
+            decoded.push(frame);
+        }
+        let mut out = Vec::new();
+        for frame in &decoded {
+            self.encode_decoded(frame, &mut out)?;
+        }
+        Ok(out)
+    }
 
-        self.last_pts = Some(pts as i64);
+    /// One decoded picture through the rate lock and the encoder.
+    fn encode_decoded(
+        &mut self,
+        decoded: &video_engine::DecodedFrame,
+        out: &mut Vec<VideoOutFrame>,
+    ) -> Result<()> {
+        let src_pts = decoded.pts().filter(|p| *p >= 0).map(|p| p as u64);
+        if !self.rate.admit(decoded.pts(), &mut self.pipeline) {
+            return Ok(());
+        }
+        if let Some(segment_secs) = self.segment_secs
+            && !self.pipeline.is_open()
+        {
+            let (n, d) = self.pipeline.fps();
+            self.pipeline.set_default_gop_if_unopened(cmaf_default_gop(segment_secs, n, d));
+        }
+        let counter = self.next_frame;
+        self.next_frame += 1;
+        // Live CMAF: an IDR on every GOP boundary of the encoded-frame count.
+        // The encoder's own GOP drifts off the tiling at the first scene
+        // cut: x264 codes a cut as an IDR and restarts its GOP count there,
+        // so the next natural IDR — and the segment boundary the segmenter
+        // cuts on — lands a partial GOP late (3.2 s segments where 2 s were
+        // asked, measured on Sky Sports). Scene-cut IDRs in between cost
+        // bits, never a boundary.
+        if self.segment_secs.is_some()
+            && let Some(gop) = self.pipeline.gop_size().filter(|g| *g > 1)
+            && counter > 0
+            && counter % i64::from(gop) == 0
+        {
+            self.pipeline.force_next_keyframe();
+        }
+        self.in_flight.push(counter, src_pts);
         let was_open = self.pipeline.is_open();
-        let encoded = self
-            .pipeline
-            .encode(&decoded, Some(pts as i64))
-            .map_err(|e| anyhow::anyhow!("VideoEncoder encode_frame failed: {e}"))?;
+        let encoded = match self.pipeline.encode(decoded, Some(counter)) {
+            Ok(encoded) => encoded,
+            Err(e) => {
+                self.in_flight.cancel_last();
+                bail!("VideoEncoder encode_frame failed: {e}");
+            }
+        };
         if !was_open && self.pipeline.is_open() {
             let (w, h) = self.pipeline.dst_dimensions();
+            let (n, d) = self.pipeline.fps();
             tracing::info!(
-                "CMAF output '{}': video re-encoder opened {}x{}",
-                self.output_id, w, h,
+                "CMAF output '{}': video re-encoder opened {}x{} at {n}/{d} fps, GOP {}",
+                self.output_id,
+                w,
+                h,
+                self.pipeline
+                    .gop_size()
+                    .map_or_else(|| "encoder default".to_string(), |g| format!("{g} frames")),
             );
         }
-        if encoded.is_empty() {
-            return Ok(None);
+        for frame in encoded {
+            self.push_encoded(frame, out);
         }
+        Ok(())
+    }
 
+    /// Hand an encoded frame back with its picture's source PTS, found by
+    /// the counter the encoder echoes.
+    fn push_encoded(&mut self, frame: video_codec::EncodedVideoFrame, out: &mut Vec<VideoOutFrame>) {
+        let pts = self.in_flight.take(frame.pts);
         // Convert Annex-B bitstream back to start-code-stripped NAL
         // units (CMAF samples carry length-prefixed NALs; the
         // segmenter re-applies length prefixes before packing).
-        let mut out_nalus = Vec::new();
-        let mut is_keyframe = false;
-        for frame in &encoded {
-            if frame.keyframe {
-                is_keyframe = true;
-            }
-            split_annex_b_to_nalus(&frame.data, &mut out_nalus);
+        let mut nalus = Vec::new();
+        split_annex_b_to_nalus(&frame.data, &mut nalus);
+        if !nalus.is_empty() {
+            out.push(VideoOutFrame { nalus, is_keyframe: frame.keyframe, pts });
         }
-        if out_nalus.is_empty() {
-            return Ok(None);
-        }
-        Ok(Some(VideoOutFrame {
-            nalus: out_nalus,
-            is_keyframe,
-        }))
     }
 
     /// Drain whatever the decoder and then the encoder are still holding.
@@ -867,41 +962,35 @@ impl VideoReencoder {
     /// however deep the decoder reorders (its B-frame depth, or the one frame
     /// an H.264 decoder seeded for a join holds on an IPPP source) plus
     /// however deep the encoder buffers. The decoder is drained first, its
-    /// frames encoded, and only then the encoder flushed.
+    /// frames encoded, and only then the encoder flushed. Each frame keeps
+    /// its own picture's PTS, as from [`Self::encode_frame`].
     pub fn flush(&mut self) -> Result<Vec<VideoOutFrame>> {
-        let mut encoded = Vec::new();
+        let mut decoded = Vec::new();
         if let Some(dec) = self.decoder.as_mut()
             && dec.send_flush().is_ok()
         {
-            while let Ok(decoded) = dec.receive_frame() {
-                // Held-back frames carry no label of their own (the caller
-                // stamps flushed frames itself); the encoder only needs a
-                // monotonic one.
-                let pts = self.last_pts.map_or(0, |p| p + 1);
-                self.last_pts = Some(pts);
-                encoded.extend(
-                    self.pipeline
-                        .encode(&decoded, Some(pts))
-                        .map_err(|e| anyhow::anyhow!("VideoEncoder encode_frame failed: {e}"))?,
-                );
+            while let Ok(frame) = dec.receive_frame() {
+                decoded.push(frame);
             }
         }
-        encoded.extend(self.pipeline.flush().map_err(|e| anyhow::anyhow!("{e}"))?);
         let mut out = Vec::new();
-        for frame in &encoded {
-            let mut nalus = Vec::new();
-            split_annex_b_to_nalus(&frame.data, &mut nalus);
-            if !nalus.is_empty() {
-                out.push(VideoOutFrame { nalus, is_keyframe: frame.keyframe });
-            }
+        for frame in &decoded {
+            self.encode_decoded(frame, &mut out)?;
+        }
+        for frame in self.pipeline.flush().map_err(|e| anyhow::anyhow!("{e}"))? {
+            self.push_encoded(frame, &mut out);
         }
         Ok(out)
     }
 }
 
+/// 33-bit MPEG-TS timestamp mask.
+#[cfg(feature = "media-codecs")]
+const PTS_MASK_33B: u64 = (1 << 33) - 1;
+
 #[cfg(not(feature = "media-codecs"))]
 impl VideoReencoder {
-    pub fn new(_cfg: &VideoEncodeConfig, output_id: &str) -> Result<Self> {
+    pub fn new(_cfg: &VideoEncodeConfig, output_id: &str, _segment_secs: Option<f64>) -> Result<Self> {
         bail!("video_encode requires the `media-codecs` feature (and a `video-encoder-*` backend) at build time")
     }
 
@@ -911,7 +1000,7 @@ impl VideoReencoder {
         _pts: u64,
         _is_keyframe: bool,
         _codec: CmafVideoCodec,
-    ) -> Result<Option<VideoOutFrame>> {
+    ) -> Result<Vec<VideoOutFrame>> {
         bail!("video_encode disabled at build time")
     }
 }
@@ -1263,6 +1352,37 @@ mod tests {
     }
 }
 
+#[cfg(all(test, feature = "media-codecs"))]
+mod gop_tests {
+    use super::cmaf_default_gop;
+
+    /// The default GOP tiles the segment at the measured rate, each GOP at
+    /// most 2 s and rounded up to a whole frame, so the segmenter's first
+    /// IDR at or past the target is the segment's own end.
+    #[test]
+    fn the_default_gop_tiles_the_segment() {
+        assert_eq!(cmaf_default_gop(2.0, 25, 1), 50);
+        assert_eq!(cmaf_default_gop(2.0, 30, 1), 60);
+        assert_eq!(cmaf_default_gop(2.0, 30_000, 1001), 60, "59.94 frames rounds up");
+        assert_eq!(cmaf_default_gop(2.0, 24_000, 1001), 48);
+        assert_eq!(cmaf_default_gop(2.0, 50, 1), 100);
+        assert_eq!(cmaf_default_gop(1.0, 25, 1), 25);
+        // 6 s: three 2 s GOPs; 29.97 fps: 3 x 60 frames (6.006 s).
+        assert_eq!(cmaf_default_gop(6.0, 25, 1), 50);
+        assert_eq!(cmaf_default_gop(6.0, 30_000, 1001), 60);
+        // 5 s: three GOPs of 1 2/3 s.
+        assert_eq!(cmaf_default_gop(5.0, 25, 1), 42);
+        assert_eq!(cmaf_default_gop(10.0, 60, 1), 120);
+        for (seg, num, den) in [(2.0, 25, 1), (5.0, 25, 1), (6.0, 30_000, 1001), (3.0, 24_000, 1001)] {
+            let gop = cmaf_default_gop(seg, num, den) as f64;
+            let gops = (seg / 2.0_f64).ceil();
+            let frame = den as f64 / num as f64;
+            assert!(gops * gop * frame >= seg - 1e-9, "the last GOP reaches the target");
+            assert!((gops - 1.0) * gop * frame < seg, "no earlier IDR does");
+        }
+    }
+}
+
 #[cfg(all(test, feature = "video-encoder-x264"))]
 mod flush_tests {
     use super::*;
@@ -1292,34 +1412,188 @@ mod flush_tests {
         .unwrap();
         let mut aus = Vec::new();
         for i in 0..n {
-            let y: Vec<u8> = (0..w * h).map(|k| ((k % w + 5 * i) % 200) as u8 + 20).collect();
+            // A texture panning a pixel a frame: x264 codes it with B-frames.
+            let y: Vec<u8> = (0..w * h)
+                .map(|k| (((k % w + i) * 7919 + (k / w) * 104_729) % 181) as u8 + 30)
+                .collect();
             let c = vec![128u8; w / 2 * h / 2];
             aus.extend(enc.encode_frame(&y, w, &c, w / 2, &c, w / 2, Some(i as i64)).unwrap());
         }
         aus.extend(enc.flush().unwrap());
         assert_eq!(aus.len(), n);
-        assert!(aus.iter().any(|f| f.pts != f.dts), "the source reorders");
+        assert!(aus.windows(2).any(|a| a[1].pts < a[0].pts), "the source reorders");
 
+        // Pinned, as the clip export pins it: no frame waits for a rate.
         let cfg: VideoEncodeConfig = serde_json::from_value(serde_json::json!({
-            "codec": "x264", "gop_size": 1, "bframes": 0, "preset": "veryfast"
+            "codec": "x264", "gop_size": 1, "bframes": 0, "preset": "veryfast",
+            "fps_num": 25, "fps_den": 1
         }))
         .unwrap();
-        let mut re = VideoReencoder::new(&cfg, "clip-test").unwrap();
-        let mut out = 0usize;
-        for (i, au) in aus.iter().enumerate() {
+        let mut re = VideoReencoder::new(&cfg, "clip-test", None).unwrap();
+        let mut out = Vec::new();
+        for au in &aus {
             let mut nalus = Vec::new();
             split_annex_b_to_nalus(&au.data, &mut nalus);
-            if re
-                .encode_frame(&nalus, i as u64 * 3_600, false, CmafVideoCodec::H264)
-                .unwrap()
-                .is_some()
-            {
-                out += 1;
-            }
+            out.extend(
+                re.encode_frame(&nalus, au.pts as u64 * 3_600, false, CmafVideoCodec::H264).unwrap(),
+            );
         }
-        let held = re.flush().unwrap().len();
-        assert!(held >= 1, "the decoder held pictures back");
-        assert_eq!(out + held, n, "every source frame comes back");
+        let before_flush = out.len();
+        out.extend(re.flush().unwrap());
+        assert!(out.len() > before_flush, "the decoder held pictures back");
+        assert_eq!(out.len(), n, "every source frame comes back");
+        // Each on its own picture's PTS, in display order — the B-frame
+        // source went in I P B B.
+        let pts: Vec<Option<u64>> = out.iter().map(|f| f.pts).collect();
+        let want: Vec<Option<u64>> = (0..n as u64).map(|i| Some(i * 3_600)).collect();
+        assert_eq!(pts, want);
+    }
+
+    /// Unpinned, the live re-encoder opens its encoder at the source's
+    /// measured rate — it used to open at a flat 30/1, so a 25 fps source's
+    /// VUI said 30 fps — and sizes the default GOP to the segment at that
+    /// rate: 50 frames for a 2 s segment at 25 fps (the flat 60 it replaced
+    /// was 2.4 s, so every 2 s segment ran 2.4 s).
+    #[test]
+    fn an_unpinned_encode_opens_at_the_measured_rate_and_tiles_the_segment() {
+        let (w, h) = (320usize, 240usize);
+        let mut enc = video_engine::VideoEncoder::open(&VideoEncoderConfig {
+            codec: VideoEncoderCodec::X264,
+            width: w as u32,
+            height: h as u32,
+            fps_num: 25,
+            fps_den: 1,
+            gop_size: 25,
+            preset: VideoPreset::Veryfast,
+            global_header: false,
+            ..VideoEncoderConfig::default()
+        })
+        .unwrap();
+        let mut aus = Vec::new();
+        for i in 0..130 {
+            // A still gradient with a small block moving across it: nothing
+            // x264's scene-cut detection would start a GOP early on.
+            let y: Vec<u8> = (0..w * h)
+                .map(|k| {
+                    let (x, row) = (k % w, k / w);
+                    if (100..116).contains(&row) && (2 * i..2 * i + 16).contains(&x) {
+                        235
+                    } else {
+                        (40 + x / 2) as u8
+                    }
+                })
+                .collect();
+            let c = vec![128u8; w / 2 * h / 2];
+            aus.extend(enc.encode_frame(&y, w, &c, w / 2, &c, w / 2, Some(i as i64)).unwrap());
+        }
+        let cfg: VideoEncodeConfig = serde_json::from_value(serde_json::json!({
+            "codec": "x264", "preset": "veryfast"
+        }))
+        .unwrap();
+        let mut re = VideoReencoder::new(&cfg, "rate-test", Some(2.0)).unwrap();
+        let mut out = Vec::new();
+        for au in &aus {
+            let mut nalus = Vec::new();
+            split_annex_b_to_nalus(&au.data, &mut nalus);
+            out.extend(
+                re.encode_frame(&nalus, 900_000 + au.pts as u64 * 3_600, false, CmafVideoCodec::H264)
+                    .unwrap(),
+            );
+        }
+        assert_eq!(re.pipeline.fps(), (25, 1));
+        assert_eq!(re.pipeline.gop_size(), Some(50));
+        let first = out.iter().position(|f| f.is_keyframe).unwrap();
+        let sps = out[first]
+            .nalus
+            .iter()
+            .find_map(|n| video_engine::find_h264_sps(&[&[0, 0, 0, 1][..], n].concat()))
+            .expect("the IDR carries its SPS");
+        assert_eq!(sps.timing.map(|(n, t, _)| (n, t)), Some((1, 50)), "VUI 25 fps");
+        let idrs: Vec<u64> = out.iter().filter(|f| f.is_keyframe).map(|f| f.pts.unwrap()).collect();
+        assert!(idrs.len() >= 2, "{idrs:?}");
+        assert!(idrs.windows(2).all(|w| w[1] - w[0] == 180_000), "an IDR every 2 s: {idrs:?}");
+        // The frames dropped while the rate was measured are the only ones
+        // missing: every later picture came back on its own PTS.
+        let pts: Vec<u64> = out.iter().map(|f| f.pts.unwrap()).collect();
+        assert!(pts.windows(2).all(|w| w[1] - w[0] == 3_600), "{pts:?}");
+        assert!(out.len() + 8 >= aus.len(), "{} of {} frames", out.len(), aus.len());
+    }
+
+    /// An encoder that buffers (x264 with its lookahead, not `zerolatency`)
+    /// hands frames back well after they went in; each still comes back on
+    /// its own picture's PTS, matched by the counter the encoder echoes —
+    /// not the PTS of whatever was fed last.
+    #[test]
+    fn a_buffering_encoder_keeps_each_frames_pts() {
+        let aus = crate::engine::output_rtmp::x264_test_source(40, 3_600);
+        let cfg: VideoEncodeConfig = serde_json::from_value(serde_json::json!({
+            "codec": "x264", "preset": "veryfast", "tune": "fastdecode", "fps_num": 25, "fps_den": 1
+        }))
+        .unwrap();
+        let mut re = VideoReencoder::new(&cfg, "lookahead-test", Some(2.0)).unwrap();
+        let mut out = Vec::new();
+        for (au, pts) in &aus {
+            let mut nalus = Vec::new();
+            split_annex_b_to_nalus(au, &mut nalus);
+            out.extend(re.encode_frame(&nalus, *pts, false, CmafVideoCodec::H264).unwrap());
+        }
+        let before_flush = out.len();
+        out.extend(re.flush().unwrap());
+        assert!(before_flush + 5 < out.len(), "the encoder buffered: {before_flush} of {}", out.len());
+        let pts: Vec<Option<u64>> = out.iter().map(|f| f.pts).collect();
+        let want: Vec<Option<u64>> = aus.iter().map(|(_, p)| Some(*p)).collect();
+        assert_eq!(pts, want);
+    }
+
+    /// Scene cuts do not move the segment boundaries: x264 codes a cut as
+    /// an IDR and restarts its GOP count there, so its next natural IDR —
+    /// the boundary the segmenter cuts on — landed a partial GOP late. An
+    /// IDR is forced on every GOP boundary of the encoded-frame count.
+    #[test]
+    fn scene_cuts_keep_the_idrs_on_the_segment_tiling() {
+        let (w, h) = (320usize, 240usize);
+        let mut enc = video_engine::VideoEncoder::open(&VideoEncoderConfig {
+            codec: VideoEncoderCodec::X264,
+            width: w as u32,
+            height: h as u32,
+            fps_num: 25,
+            fps_den: 1,
+            gop_size: 250,
+            preset: VideoPreset::Veryfast,
+            global_header: false,
+            ..VideoEncoderConfig::default()
+        })
+        .unwrap();
+        let mut aus = Vec::new();
+        for i in 0..160 {
+            // A hard cut every 30 frames: flat dark, then flat bright.
+            let base = if (i / 30) % 2 == 0 { 40u8 } else { 200u8 };
+            let y: Vec<u8> = (0..w * h)
+                .map(|k| if (100..116).contains(&(k / w)) && (2 * i..2 * i + 16).contains(&(k % w)) { 235 } else { base })
+                .collect();
+            let c = vec![128u8; w / 2 * h / 2];
+            aus.extend(enc.encode_frame(&y, w, &c, w / 2, &c, w / 2, Some(i as i64)).unwrap());
+        }
+        aus.extend(enc.flush().unwrap());
+        // Pinned, so no frame is dropped while a rate is measured: the
+        // encoded-frame count is the source frame index.
+        let cfg: VideoEncodeConfig = serde_json::from_value(serde_json::json!({
+            "codec": "x264", "preset": "veryfast", "fps_num": 25, "fps_den": 1
+        }))
+        .unwrap();
+        let mut re = VideoReencoder::new(&cfg, "cut-test", Some(2.0)).unwrap();
+        let mut out = Vec::new();
+        for au in &aus {
+            let mut nalus = Vec::new();
+            split_annex_b_to_nalus(&au.data, &mut nalus);
+            out.extend(re.encode_frame(&nalus, au.pts as u64 * 3_600, false, CmafVideoCodec::H264).unwrap());
+        }
+        assert_eq!(re.pipeline.gop_size(), Some(50));
+        let idrs: Vec<u64> = out.iter().filter(|f| f.is_keyframe).map(|f| f.pts.unwrap() / 3_600).collect();
+        assert!(idrs.contains(&30), "the fixture has a scene-cut IDR: {idrs:?}");
+        for boundary in [0, 50, 100, 150] {
+            assert!(idrs.contains(&boundary), "an IDR at frame {boundary}: {idrs:?}");
+        }
     }
 
     /// A live output joining mid-GOP on a source that declares no
@@ -1358,18 +1632,15 @@ mod flush_tests {
             "codec": "x264", "preset": "veryfast"
         }))
         .unwrap();
-        let mut re = VideoReencoder::new(&cfg, "join-test").unwrap();
+        let mut re = VideoReencoder::new(&cfg, "join-test", Some(2.0)).unwrap();
         let mut out = 0usize;
         for (i, au) in aus.iter().enumerate().skip(join) {
             let mut nalus = Vec::new();
             split_annex_b_to_nalus(&au.data, &mut nalus);
-            if re
+            out += re
                 .encode_frame(&nalus, i as u64 * 3_600, false, CmafVideoCodec::H264)
                 .unwrap()
-                .is_some()
-            {
-                out += 1;
-            }
+                .len();
             if i < next_sps {
                 assert!(re.decoder.is_none(), "AU {i} carries no SPS: passed over");
             }

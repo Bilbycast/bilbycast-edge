@@ -504,14 +504,14 @@ fn decode_v210_worker(
     output_stats: Arc<OutputStatsAccumulator>,
     cancel: CancellationToken,
 ) {
+    use crate::engine::video_encode_util::{DecoderFor, LazyDecoder};
     use video_codec::{ScalerDstFormat, VideoCodec};
     use video_engine::{VideoDecoder, VideoScaler};
 
-    let mut current_codec: Option<VideoCodec> = None;
-    let mut decoder: Option<VideoDecoder> = None;
-    // An H.264 (re)open waits for an access unit that carries the SPS,
-    // which seeds the decoder's reorder depth (`SpsOpenGate`).
-    let mut sps_gate = crate::engine::video_encode_util::SpsOpenGate::new();
+    // The decoder and the codec it is open for, recorded only once an open
+    // succeeds. An H.264 (re)open waits for an access unit that carries the
+    // SPS, which seeds the decoder's reorder depth (`SpsOpenGate`).
+    let mut decoder: LazyDecoder<VideoDecoder> = LazyDecoder::new();
     let mut scaler: Option<VideoScaler> = None;
     let mut synth_pts: i64 = 0;
     let mut grain_index: u64 = 0;
@@ -534,30 +534,31 @@ fn decode_v210_worker(
             nalu_bytes.extend_from_slice(&[0, 0, 0, 1]);
             nalu_bytes.extend_from_slice(&nalu);
         }
-        if current_codec != Some(codec) {
-            // Opened on the first access unit that carries the SPS (nothing
-            // decodes before one) and seeded from it: an H.264 decoder's
-            // reorder depth comes from its SPS (`ReorderSeed`).
-            if !sps_gate.admits(codec, &nalu_bytes) {
-                continue;
-            }
-            current_codec = Some(codec);
-            decoder = Some(match VideoDecoder::open_opts(
+        // Opened on the first access unit that carries the SPS (nothing
+        // decodes before one) and seeded from it: an H.264 decoder's reorder
+        // depth comes from its SPS (`ReorderSeed`). A failed open leaves no
+        // decoder and is retried after a back-off (`LazyDecoder`).
+        let dec = match decoder.decoder_for(codec, &nalu_bytes, || {
+            VideoDecoder::open_opts(
                 codec,
                 video_engine::DecoderOptions {
                     reorder_seed: video_engine::ReorderSeed::FromAccessUnit(&nalu_bytes),
                     ..Default::default()
                 },
-            ) {
-                Ok(d) => d,
-                Err(e) => {
-                    tracing::error!(target: "mxl.video.out", "{ctx}: decoder open failed: {e}");
-                    continue;
+            )
+        }) {
+            DecoderFor::Ready { decoder, fresh } => {
+                if fresh {
+                    scaler = None;
                 }
-            });
-            scaler = None;
-        }
-        let dec = decoder.as_mut().unwrap();
+                decoder
+            }
+            DecoderFor::Waiting => continue,
+            DecoderFor::Failed(e) => {
+                tracing::error!(target: "mxl.video.out", "{ctx}: decoder open failed: {e}");
+                continue;
+            }
+        };
 
         if let Err(e) = dec.send_packet_with_pts(&nalu_bytes, pts as i64) {
             debug!(target: "mxl.video.out", "{ctx}: decoder send_packet error: {e}");

@@ -85,21 +85,10 @@ struct InputPsiCache {
     /// Cached latest complete PMT-PID unit (every packet of it — a PMT may
     /// span packets) keyed by PMT PID from this input.
     cached_pmts: HashMap<u16, Vec<[u8; TS_PACKET_SIZE]>>,
-    /// Unit being collected per PMT PID (see [`PendingPmtUnit`]).
-    pmt_pending: HashMap<u16, PendingPmtUnit>,
+    /// Unit being collected per PMT PID (see [`PmtUnitCollector`]).
+    pmt_pending: HashMap<u16, PmtUnitCollector>,
     /// PMT PIDs discovered from this input's most recent PAT.
     pmt_pids: HashSet<u16>,
-}
-
-/// A PMT-PID payload unit being collected for the switch cache.
-#[derive(Default)]
-struct PendingPmtUnit {
-    /// Says when no section is in flight any more (the unit is complete)
-    /// and when a CC gap aborted one.
-    asm: SectionAssembler,
-    packets: Vec<[u8; TS_PACKET_SIZE]>,
-    /// A PMT section with a valid CRC_32 completed in this unit.
-    pmt_ok: bool,
 }
 
 impl InputPsiCache {
@@ -131,58 +120,9 @@ impl InputPsiCache {
             // Collect the whole unit: a PMT that spans packets is only
             // useful to inject complete. The unit replaces the cached one
             // only when a PMT section with a valid CRC completed in it and
-            // nothing aborted it — a CC gap mid-unit used to cache the
-            // truncated [PUSI, gapped continuation] over the last good
-            // unit, which the switch then injected corrupt and unstamped.
-            let pusi = ts_pusi(pkt);
-            let unit = self.pmt_pending.entry(pid).or_default();
-            let was_in_flight = unit.asm.in_flight();
-            // `tail_done`: the section in flight completed in this packet.
-            // A valid PMT counts for the unit it started in.
-            let (mut tail_done, mut pmt_tail, mut pmt_here) = (false, false, false);
-            for (sec, spanned) in unit.asm.push_packet(pkt).with_span() {
-                let pmt_ok = sec.first() == Some(&0x02) && mpeg2_crc32(sec) == 0;
-                if spanned {
-                    tail_done = true;
-                    pmt_tail |= pmt_ok;
-                } else {
-                    pmt_here |= pmt_ok;
-                }
-            }
-            let mut cached = [0u8; TS_PACKET_SIZE];
-            cached.copy_from_slice(pkt);
-            let mut aborted = false;
-            if pusi && !(was_in_flight && tail_done) {
-                // A new unit. (Had a section been in flight, the pointer
-                // tail truncated it: the previous unit is abandoned.)
-                unit.packets.clear();
-                unit.packets.push(cached);
-                unit.pmt_ok = pmt_here;
-            } else if pusi {
-                // The pointer tail finished the section in flight: this
-                // packet belongs to the same unit (as in `PsiUnitStage`).
-                unit.packets.push(cached);
-                unit.pmt_ok |= pmt_tail || pmt_here;
-            } else {
-                if unit.packets.is_empty() {
-                    return; // joined mid-unit
-                }
-                unit.packets.push(cached);
-                unit.pmt_ok |= pmt_tail;
-                // The section in flight ended without completing: the
-                // assembler aborted it (CC gap, bad header, failed CRC).
-                aborted = was_in_flight && !tail_done && !unit.asm.in_flight();
-            }
-            if unit.asm.in_flight() {
-                if unit.packets.len() > 32 {
-                    unit.packets.clear();
-                    unit.pmt_ok = false;
-                }
-                return;
-            }
-            let packets = std::mem::take(&mut unit.packets);
-            if std::mem::take(&mut unit.pmt_ok) && !aborted {
-                self.cached_pmts.insert(pid, packets);
+            // nothing aborted it (`PmtUnitCollector`).
+            if let Some(unit) = self.pmt_pending.entry(pid).or_default().push_packet(pkt, |_| {}) {
+                self.cached_pmts.insert(pid, unit);
             }
         }
     }

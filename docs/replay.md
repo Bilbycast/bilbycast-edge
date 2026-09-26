@@ -781,8 +781,14 @@ CRF 20, no B-frames, H.264 out whatever went in), because that is what makes a
 clip step; a build with no encoder falls back to the source's own GOP structure
 with a log line. See [The shape of the file](#the-shape-of-the-file) for why.
 The re-encode is fed in the order the transport carried the frames — decode
-order, the only order a decoder accepts — and its output is labelled in display
-order, so a source with B-frames comes out right. Only the no-encoder fallback
+order, the only order a decoder accepts — and each output frame is labelled with
+its own picture's PTS, which the decoder carries through its reorder queue, so a
+source with B-frames comes out right. It used to label the k-th picture out with
+the k-th smallest PTS in, which assumed the decoder emits every picture it is
+given: a clip opening on an open-GOP random access point (an HEVC CRA, whose
+leading pictures reference the GOP before the cut) has those pictures dropped by
+the decoder, so every later frame took the label of the one ahead of it and the
+whole clip — and the audio aligned against it — shifted by the pictures dropped. Only the no-encoder fallback
 assumes PTS == DTS (DTS recovery via PES parsing is a follow-up). The audio and
 video tracks are aligned **by PTS**: a transport stream muxes video ahead of
 its PTS by the VBV delay and audio by much less, so the first audio frame in a
@@ -899,7 +905,10 @@ when they are fed to the re-encoder. The cut therefore starts at the first real
 keyframe. Frames keep the PTS they were demuxed with rather than being
 re-stamped on an even step — the source drops frames when the link is lossy,
 and an even step spread 749 frames across the 31.4 s they really covered, so
-every clip came out longer than it was asked for.
+every clip came out longer than it was asked for. That holds for the frames the
+decoder and encoder were still holding at the end too: they come back on their
+own pictures' PTS (they used to be stamped on the median step after the last).
+A frame whose PTS the decoder lost continues the median display-order step.
 
 **Expect up to a GOP more than you asked for.** The range ends at the first
 index entry *past* the requested out-point, so the clip covers the window
