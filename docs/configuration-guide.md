@@ -1242,7 +1242,10 @@ AU arrived as it was due to play), with PCR-only packets on the audio PID
 between AUs longer than 35 ms (HE-AAC at 48 kHz: 42.7 ms; AAC-LC at 16 kHz:
 64 ms) so the PCR never steps past TR 101 290's 40 ms. The other audio-only
 programmes `TsMuxer` builds (RTSP, the PCM-encode input, an audio-only MP4 in
-the media player, the WebRTC input's Opus) carry their PCR the same way.
+the media player, the WebRTC input's Opus, and the SMPTE 302M PES of an
+`audio_302m` SRT / UDP / `rtp_audio` output) carry their PCR the same way. The
+302M path was the last to carry PCR = PTS, and wrote it on the audio PID even
+when a `pcr_pid` override named another; it now follows the same rule.
 Whether a publish carries video is read from its
 `onMetaData` (RTMP carries no FLV file header): metadata describing audio and
 no video makes the program audio-only at once; with no metadata — or metadata

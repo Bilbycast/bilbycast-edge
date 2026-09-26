@@ -907,22 +907,19 @@ impl TsMuxer {
     /// (private_stream_1). The caller supplies a complete PES payload — for
     /// 302M, that's a `S302mPacketizer::packetize_f32(...)` result.
     ///
-    /// `pts_90khz` is the presentation timestamp in 90 kHz ticks. PCR is
-    /// emitted on the audio PID (since this path is normally audio-only —
-    /// `has_video` should be `false`).
+    /// `pts_90khz` is the presentation timestamp in 90 kHz ticks. This path
+    /// is normally audio-only (`has_video` false), so the PCR rides the audio
+    /// PID as on every other audio entry point ([`Self::audio_pcr`]): 100 ms
+    /// behind the PES's PTS, and only when the PMT names the audio PID as
+    /// PCR_PID. It used to carry PCR = PTS — every 302M PES arrived as it
+    /// was due to play, the underflow the lead exists to avoid — and on the
+    /// audio PID even when a `pcr_pid` override named another.
     pub fn mux_private_audio(&mut self, pes_payload: &[u8], pts_90khz: u64) -> Vec<Bytes> {
         let mut packets = self.maybe_emit_pat_pmt(false);
         let pes = build_pes_packet(0xBD, pes_payload, pts_90khz, None);
-        // Audio-only TS: PCR rides the audio PID.
         let audio_pid = self.audio_pid;
-        packets.extend(self.packetize(
-            audio_pid,
-            &pes,
-            true,
-            !self.has_video,
-            Some(pts_90khz),
-            false,
-        ));
+        let pcr = self.audio_pcr(pts_90khz, &mut packets);
+        packets.extend(self.packetize(audio_pid, &pes, true, pcr.is_some(), pcr, false));
         packets
     }
 }
@@ -1492,7 +1489,9 @@ mod tests {
         muxer.set_audio_stream(0x0F, None); // AAC
         muxer.set_pids(Some(0x1000), None, Some(0x0101), Some(0x0200));
         let adts = vec![0xFF, 0xF1, 0x50, 0x80, 0x00, 0x1F, 0xFC, 0xDE, 0xAD];
-        let ts = muxer.mux_audio_pre_adts(&adts, 90_000);
+        let mut ts = muxer.mux_audio_pre_adts(&adts, 90_000);
+        // SMPTE 302M's private-PES path is gated the same way.
+        ts.extend(muxer.mux_private_audio(&[0u8; 64], 90_360));
         let audio_has_pcr = ts
             .iter()
             .any(|p| ts_pid(p) == 0x0101 && ts_packet_has_pcr(p));
@@ -1568,11 +1567,12 @@ mod tests {
     /// An audio-only programme's PCR leads each AU by 100 ms: the AU is in
     /// the decoder's buffer before it is due. The PCR used to equal the
     /// PTS — the AU arrived as it was due to play, its later packets after.
-    /// Every entry point that carries the PCR on the audio does it.
+    /// Every entry point that carries the PCR on the audio does it, SMPTE
+    /// 302M's `mux_private_audio` included.
     #[test]
     fn an_audio_only_programmes_pcr_leads_its_audio() {
         let raw = vec![0x21u8; 300];
-        for path in 0..3 {
+        for path in 0..4 {
             let mut m = TsMuxer::new();
             m.set_has_video(false);
             m.set_has_audio(true);
@@ -1582,7 +1582,8 @@ mod tests {
                 ts.extend(match path {
                     0 => m.mux_audio(&raw, pts, 3, 2),
                     1 => m.mux_audio_pre_adts(&build_adts_frame(&raw, 3, 2), pts),
-                    _ => m.mux_audio_opus(&raw, pts),
+                    2 => m.mux_audio_opus(&raw, pts),
+                    _ => m.mux_private_audio(&raw, pts),
                 });
             }
             let pcrs = audio_pcrs(&ts);
