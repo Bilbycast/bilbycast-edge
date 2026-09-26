@@ -1800,13 +1800,14 @@ async fn handle_frame(
     recv_time_us: u64,
 ) {
     match frame {
-        DemuxedFrame::H264 { nalus, pts, is_keyframe } => {
+        DemuxedFrame::H264 { nalus, pts, is_keyframe, pts_known } => {
             handle_video(
                 state,
                 demuxer,
                 VideoCodec::H264,
                 nalus,
                 pts,
+                pts_known,
                 is_keyframe,
                 config,
                 base_url,
@@ -1823,13 +1824,14 @@ async fn handle_frame(
             )
             .await;
         }
-        DemuxedFrame::H265 { nalus, pts, is_keyframe } => {
+        DemuxedFrame::H265 { nalus, pts, is_keyframe, pts_known } => {
             handle_video(
                 state,
                 demuxer,
                 VideoCodec::H265,
                 nalus,
                 pts,
+                pts_known,
                 is_keyframe,
                 config,
                 base_url,
@@ -1991,6 +1993,7 @@ async fn handle_video(
     codec: VideoCodec,
     nalus: Vec<Vec<u8>>,
     pts: u64,
+    pts_known: bool,
     is_keyframe: bool,
     config: &CmafOutputConfig,
     base_url: &str,
@@ -2070,7 +2073,7 @@ async fn handle_video(
         let recoded = crate::timed_block_in_place!(
             "cmaf.video_reencoder",
             crate::engine::perf::TRANSCODE_BLOCK_WARN_MS,
-            { reenc.encode_frame(&nalus, pts, is_keyframe, codec) }
+            { reenc.encode_frame(&nalus, pts_known.then_some(pts), is_keyframe, codec) }
         );
         match recoded {
             Ok(frames) => {

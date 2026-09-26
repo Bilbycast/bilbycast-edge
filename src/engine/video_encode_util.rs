@@ -756,6 +756,43 @@ impl EncodedPtsMap {
     }
 }
 
+/// The source PTS each decoded picture goes out on: the decoder's, else —
+/// the picture of an access unit its PES carried no PTS for (MPEG-TS needs
+/// one only every 700 ms; some encoders stamp only their I pictures) — the
+/// last picture's that had one plus a frame at the encoder's rate for each
+/// picture since, as the TS video replacer stamps them (`admit_pts`). Fed
+/// every decoded picture in display order, the ones the rate lock drops too,
+/// so the count is right. `None` before any picture carried a PTS.
+#[derive(Debug, Default)]
+pub struct FramePtsStamper {
+    last: Option<u64>,
+    since: u64,
+}
+
+impl FramePtsStamper {
+    /// Stamp one decoded picture: `frame_pts` as the decoder returned it,
+    /// `interval_90k` one frame at the encoder's rate.
+    pub fn stamp(&mut self, frame_pts: Option<i64>, interval_90k: u64) -> Option<u64> {
+        match frame_pts.filter(|p| *p >= 0) {
+            Some(p) => {
+                let p = p as u64 & PTS_MASK_33B;
+                self.last = Some(p);
+                self.since = 0;
+                Some(p)
+            }
+            None => {
+                self.since += 1;
+                self.last.map(|l| l.wrapping_add(interval_90k * self.since) & PTS_MASK_33B)
+            }
+        }
+    }
+}
+
+/// One frame at `(num, den)` fps, in 90 kHz ticks.
+pub fn frame_interval_90k((num, den): (u32, u32)) -> u64 {
+    (90_000 * u64::from(den.max(1)) / u64::from(num.max(1))).max(1)
+}
+
 // ───────────────────── Lazy H.264 decoder open ─────────────────────
 
 /// Access units a lazy H.264 decoder open passes over waiting for one that
@@ -2432,6 +2469,28 @@ mod cadence_tests {
         assert_eq!(meter([5_000; 4], 0).rate(), Some((18, 1)));
         // 0.2 % off 25 fps: not snapped.
         assert_eq!(rate_from_frame_duration(3_608.0), (11_250, 451));
+    }
+}
+
+#[cfg(test)]
+mod frame_pts_stamper_tests {
+    use super::FramePtsStamper;
+
+    /// A picture without a PTS is stamped from the last one that had one,
+    /// a frame per picture since; nothing before the first real PTS.
+    #[test]
+    fn unstamped_pictures_follow_the_last_stamped_one() {
+        let mut s = FramePtsStamper::default();
+        assert_eq!(s.stamp(None, 3_600), None);
+        assert_eq!(s.stamp(Some(900_000), 3_600), Some(900_000));
+        assert_eq!(s.stamp(None, 3_600), Some(903_600));
+        assert_eq!(s.stamp(Some(-1), 3_600), Some(907_200), "a negative PTS is none");
+        assert_eq!(s.stamp(Some(950_000), 3_600), Some(950_000));
+        assert_eq!(s.stamp(None, 1_800), Some(951_800));
+        // Across the 33-bit wrap.
+        let top = (1i64 << 33) - 1_800;
+        assert_eq!(s.stamp(Some(top), 3_600), Some(top as u64));
+        assert_eq!(s.stamp(None, 3_600), Some(1_800));
     }
 }
 

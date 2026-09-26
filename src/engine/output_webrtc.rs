@@ -120,6 +120,8 @@ struct WebrtcVideoActive {
     /// The source PTS of each frame in the encoder, by `out_frame_count`:
     /// what an encoded frame's RTP timestamp is.
     in_flight: crate::engine::video_encode_util::EncodedPtsMap,
+    /// The source PTS of each decoded picture (see `FramePtsStamper`).
+    stamper: crate::engine::video_encode_util::FramePtsStamper,
     stats: Arc<VideoEncodeStats>,
 }
 
@@ -338,6 +340,7 @@ fn open_webrtc_video_active(
         out_frame_count: 0,
         rate: crate::engine::video_encode_util::EncoderRateLock::new(pinned),
         in_flight: Default::default(),
+        stamper: Default::default(),
         stats: stats_handle,
     }))
 }
@@ -365,6 +368,7 @@ fn encode_one_video_frame_webrtc(
     video_state: &mut WebrtcVideoEncoderState,
     nalus: &[Vec<u8>],
     pts: u64,
+    pts_known: bool,
     output_id: &str,
 ) -> Vec<(Vec<u8>, u64)> {
     let active = match video_state {
@@ -378,8 +382,15 @@ fn encode_one_video_frame_webrtc(
         {
             active.stats.input_frames.fetch_add(1, Ordering::Relaxed);
             // The access unit's PTS goes in so each decoded frame carries its
-            // own — what the rate lock measures the source's cadence on.
-            if let Err(e) = active.decoder.send_packet_with_pts(&annex_b, pts as i64) {
+            // own — what the rate lock measures the source's cadence on. One
+            // whose PES carried none goes in without (fed as 0, its picture
+            // came back stamped 0).
+            let fed = if pts_known {
+                active.decoder.send_packet_with_pts(&annex_b, pts as i64)
+            } else {
+                active.decoder.send_packet(&annex_b)
+            };
+            if let Err(e) = fed {
                 tracing::debug!("WebRTC output '{}': decoder send_packet: {e:?}", output_id);
             }
             let mut out: Vec<(Vec<u8>, u64)> = Vec::new();
@@ -390,12 +401,16 @@ fn encode_one_video_frame_webrtc(
                 };
                 // Until the rate is known the encoder cannot open (its time
                 // base is fixed at open): the frame is dropped.
-                if !active.rate.admit(frame.pts(), &mut active.pipeline) {
+                let admitted = active.rate.admit(frame.pts(), &mut active.pipeline);
+                // The picture's own source PTS (display order), or from the
+                // pictures before it when its PES carried none.
+                let interval =
+                    crate::engine::video_encode_util::frame_interval_90k(active.pipeline.fps());
+                let stamped = active.stamper.stamp(frame.pts(), interval);
+                if !admitted {
                     continue;
                 }
-                // The picture's own source PTS (display order), falling back
-                // to the access unit's when the decoder lost it.
-                let frame_pts = frame.pts().filter(|p| *p >= 0).map_or(pts, |p| p as u64);
+                let frame_pts = stamped.unwrap_or(pts);
                 active.in_flight.push(active.out_frame_count, Some(frame_pts));
                 let encoded_frames = match active.pipeline.encode(&frame, Some(active.out_frame_count)) {
                     Ok(frames) => frames,
@@ -447,6 +462,8 @@ async fn handle_webrtc_video_frame(
     source_is_h264: bool,
     nalus: &[Vec<u8>],
     pts: u64,
+    #[cfg_attr(not(feature = "media-codecs"), allow(unused_variables))]
+    pts_known: bool,
     recv_time_us: u64,
     video_state: &mut WebrtcVideoEncoderState,
     session: &mut super::webrtc::session::WebrtcSession,
@@ -512,7 +529,7 @@ async fn handle_webrtc_video_frame(
     #[cfg(feature = "media-codecs")]
     let frames: Vec<(std::borrow::Cow<'_, [Vec<u8>]>, u64)> =
         if matches!(video_state, WebrtcVideoEncoderState::Active(_)) {
-            let encoded = encode_one_video_frame_webrtc(video_state, nalus, pts, output_id);
+            let encoded = encode_one_video_frame_webrtc(video_state, nalus, pts, pts_known, output_id);
             if matches!(video_state, WebrtcVideoEncoderState::Failed) {
                 return;
             }
@@ -926,11 +943,12 @@ async fn whep_viewer_loop(
                         let frames = demuxer.demux(payload);
                         for frame in frames {
                             match frame {
-                                super::webrtc::ts_demux::DemuxedFrame::H264 { nalus, pts, .. } => {
+                                super::webrtc::ts_demux::DemuxedFrame::H264 { nalus, pts, pts_known, .. } => {
                                     handle_webrtc_video_frame(
                                         true,
                                         &nalus,
                                         pts,
+                                        pts_known,
                                         recv_time_us,
                                         &mut video_encoder_state,
                                         &mut session,
@@ -942,11 +960,12 @@ async fn whep_viewer_loop(
                                         events,
                                     ).await;
                                 }
-                                super::webrtc::ts_demux::DemuxedFrame::H265 { nalus, pts, .. } => {
+                                super::webrtc::ts_demux::DemuxedFrame::H265 { nalus, pts, pts_known, .. } => {
                                     handle_webrtc_video_frame(
                                         false,
                                         &nalus,
                                         pts,
+                                        pts_known,
                                         recv_time_us,
                                         &mut video_encoder_state,
                                         &mut session,
@@ -1429,11 +1448,12 @@ async fn whip_client_loop(
                             let frames = demuxer.demux(payload);
                             for frame in frames {
                                 match frame {
-                                    super::webrtc::ts_demux::DemuxedFrame::H264 { nalus, pts, .. } => {
+                                    super::webrtc::ts_demux::DemuxedFrame::H264 { nalus, pts, pts_known, .. } => {
                                         handle_webrtc_video_frame(
                                             true,
                                             &nalus,
                                             pts,
+                                            pts_known,
                                             recv_time_us,
                                             &mut video_encoder_state,
                                             &mut session,
@@ -1445,11 +1465,12 @@ async fn whip_client_loop(
                                             events,
                                         ).await;
                                     }
-                                    super::webrtc::ts_demux::DemuxedFrame::H265 { nalus, pts, .. } => {
+                                    super::webrtc::ts_demux::DemuxedFrame::H265 { nalus, pts, pts_known, .. } => {
                                         handle_webrtc_video_frame(
                                             false,
                                             &nalus,
                                             pts,
+                                            pts_known,
                                             recv_time_us,
                                             &mut video_encoder_state,
                                             &mut session,
@@ -2254,7 +2275,7 @@ mod rate_tests {
         let mut frames = 0;
         for (au, pts) in &aus {
             let nalus = crate::engine::ts_demux::split_annex_b_nalus(au);
-            for (out, _) in encode_one_video_frame_webrtc(&mut state, &nalus, *pts, "o") {
+            for (out, _) in encode_one_video_frame_webrtc(&mut state, &nalus, *pts, true, "o") {
                 frames += 1;
                 sps = sps.or_else(|| video_engine::find_h264_sps(&out));
             }
@@ -2263,6 +2284,34 @@ mod rate_tests {
         assert_eq!(active.pipeline.fps(), (25, 1));
         assert_eq!(sps.and_then(|s| s.timing).map(|(n, t, _)| (n, t)), Some((1, 50)), "VUI 25 fps");
         assert_eq!(frames, 40 - 4);
+    }
+
+    /// A source stamping only every 12th picture: its unstamped access
+    /// units go to the decoder without a PTS, the rate is measured over
+    /// their pictures (25 fps), and each encoded frame's RTP time is its
+    /// picture's — the last stamped one plus a frame per picture since. Fed
+    /// PTS 0 they came back stamped 0 and the rate was never measured.
+    #[test]
+    fn a_sparse_pts_source_is_measured_and_stamped_on_webrtc() {
+        let cfg: VideoEncodeConfig =
+            serde_json::from_value(serde_json::json!({"codec": "x264", "preset": "veryfast"})).unwrap();
+        let stats = Arc::new(OutputStatsAccumulator::new("o".into(), "o".into(), "webrtc".into()));
+        let (events, _rx) = crate::manager::events::event_channel();
+        let aus = crate::engine::output_rtmp::x264_test_source(80, 3_600);
+        let mut state = open_webrtc_video_active(&cfg, true, &aus[0].0, "o", "f", &stats, &events);
+        let mut stamps = Vec::new();
+        for (k, (au, pts)) in aus.iter().enumerate() {
+            let nalus = crate::engine::ts_demux::split_annex_b_nalus(au);
+            let known = k % 12 == 0;
+            let fed = if known { *pts } else { 0 };
+            stamps.extend(
+                encode_one_video_frame_webrtc(&mut state, &nalus, fed, known, "o").into_iter().map(|(_, p)| p),
+            );
+        }
+        let WebrtcVideoEncoderState::Active(active) = &state else { panic!("not active") };
+        assert_eq!(active.pipeline.fps(), (25, 1));
+        assert!(stamps.len() >= 20, "{} frames", stamps.len());
+        assert!(stamps.windows(2).all(|w| w[1] == w[0] + 3_600), "{stamps:?}");
     }
 
     /// Every encoded frame goes out on its own picture's source PTS. A
@@ -2310,7 +2359,7 @@ mod rate_tests {
         for au in &aus {
             let nalus = crate::engine::ts_demux::split_annex_b_nalus(&au.data);
             let pts = 900_000 + au.pts as u64 * 3_600;
-            stamps.extend(encode_one_video_frame_webrtc(&mut state, &nalus, pts, "o").into_iter().map(|(_, p)| p));
+            stamps.extend(encode_one_video_frame_webrtc(&mut state, &nalus, pts, true, "o").into_iter().map(|(_, p)| p));
         }
         assert!(stamps.len() >= n - 3, "{} frames", stamps.len());
         assert!(stamps.windows(2).all(|w| w[1] == w[0] + 3_600), "{stamps:?}");

@@ -1249,7 +1249,7 @@ fn demux_decode_loop(
         let frames_before = counters.frames_received_since_open.load(Ordering::Relaxed);
         for frame in frames {
             match frame {
-                DemuxedFrame::H264 { nalus, pts, is_keyframe } => {
+                DemuxedFrame::H264 { nalus, pts, is_keyframe, .. } => {
                     let stream_ids = StreamIds {
                         video_pid: demuxer.video_pid(),
                         audio_pid: demuxer.audio_pid(),
@@ -1290,7 +1290,7 @@ fn demux_decode_loop(
                         },
                     );
                 }
-                DemuxedFrame::H265 { nalus, pts, is_keyframe } => {
+                DemuxedFrame::H265 { nalus, pts, is_keyframe, .. } => {
                     let stream_ids = StreamIds {
                         video_pid: demuxer.video_pid(),
                         audio_pid: demuxer.audio_pid(),

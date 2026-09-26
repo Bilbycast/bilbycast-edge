@@ -1341,8 +1341,8 @@ fn decode_worker(
             None => break,
         };
         let (nalus, is_h264, pts, au_is_keyframe) = match frame {
-            DemuxedFrame::H264 { nalus, pts, is_keyframe } => (nalus, true, pts, is_keyframe),
-            DemuxedFrame::H265 { nalus, pts, is_keyframe } => (nalus, false, pts, is_keyframe),
+            DemuxedFrame::H264 { nalus, pts, is_keyframe, .. } => (nalus, true, pts, is_keyframe),
+            DemuxedFrame::H265 { nalus, pts, is_keyframe, .. } => (nalus, false, pts, is_keyframe),
             _ => continue,
         };
         let labeled = if is_h264 { VideoCodec::H264 } else { VideoCodec::Hevc };

@@ -320,7 +320,7 @@ async fn run_sdi_output(
                     };
                     for frame in demuxer.demux(ts) {
                         let au = match frame {
-                            DemuxedFrame::H264 { nalus, is_keyframe, pts } => {
+                            DemuxedFrame::H264 { nalus, is_keyframe, pts, .. } => {
                                 PlayoutAu::Video(VideoAu {
                                     annexb: annexb(&nalus),
                                     codec: VideoCodec::H264,
@@ -328,7 +328,7 @@ async fn run_sdi_output(
                                     pts,
                                 })
                             }
-                            DemuxedFrame::H265 { nalus, is_keyframe, pts } => {
+                            DemuxedFrame::H265 { nalus, is_keyframe, pts, .. } => {
                                 PlayoutAu::Video(VideoAu {
                                     annexb: annexb(&nalus),
                                     codec: VideoCodec::Hevc,

@@ -83,19 +83,29 @@ pub enum DemuxedFrame {
         /// NAL units with 0x00000001 start codes stripped.
         /// Each entry is a single NALU (header byte + body).
         nalus: Vec<Vec<u8>>,
-        /// Presentation timestamp in 90 kHz clock ticks.
+        /// Presentation timestamp in 90 kHz clock ticks — 0 when the PES
+        /// carried none (see `pts_known`).
         pts: u64,
         /// Whether this is a keyframe (contains IDR NALU).
         is_keyframe: bool,
+        /// Whether the PES carried a PTS. MPEG-TS needs one only every
+        /// 700 ms, and some encoders stamp only their I pictures: a
+        /// decoder fed `pts` for such an AU hands its picture back stamped
+        /// 0, which is neither the picture's time nor a frame to measure a
+        /// rate on.
+        pts_known: bool,
     },
     /// Complete H.265 / HEVC access unit (one or more NALUs in Annex B format).
     H265 {
         /// NAL units with 0x00000001 start codes stripped.
         nalus: Vec<Vec<u8>>,
-        /// Presentation timestamp in 90 kHz clock ticks.
+        /// Presentation timestamp in 90 kHz clock ticks — 0 when the PES
+        /// carried none (see `pts_known`).
         pts: u64,
         /// Whether this is a keyframe (IDR_W_RADL, IDR_N_LP, or CRA_NUT).
         is_keyframe: bool,
+        /// Whether the PES carried a PTS (see `H264::pts_known`).
+        pts_known: bool,
     },
     /// Complete MPEG-1 / MPEG-2 video access unit. The bitstream is fed
     /// to the libavcodec `mpeg2video` decoder verbatim — there are no
@@ -1158,6 +1168,7 @@ impl TsDemuxer {
                     nalus,
                     pts: pts.unwrap_or(0),
                     is_keyframe,
+                    pts_known: pts.is_some(),
                 }]
             }
             STREAM_TYPE_H265 => {
@@ -1180,6 +1191,7 @@ impl TsDemuxer {
                     nalus,
                     pts: pts.unwrap_or(0),
                     is_keyframe,
+                    pts_known: pts.is_some(),
                 }]
             }
             STREAM_TYPE_PRIVATE if Some(pid) == self.audio_pid => {
@@ -1387,6 +1399,52 @@ mod tests {
         ts.extend_from_slice(&pmt_pkt);
         demux.demux(&ts);
         assert_eq!(demux.video_pid(), None, "shared PID: exact match only");
+    }
+
+    /// A video PES without a PTS (MPEG-TS needs one only every 700 ms; some
+    /// encoders stamp only their I pictures) is surfaced as such: `pts` 0
+    /// with `pts_known` false, where it used to be indistinguishable from a
+    /// picture stamped 0.
+    #[test]
+    fn a_video_pes_without_a_pts_says_so() {
+        use crate::engine::ts_test_fixtures::{packetize_sections, pat_packet, pmt_section};
+        let pmt = pmt_section(1, 0, 0x100, &[], &[(0x1B, 0x100, &[])]);
+        let mut ts = pat_packet(&[(1, 0x1000)], 0, 0).to_vec();
+        ts.extend_from_slice(&packetize_sections(0x1000, &[&pmt], 0)[0]);
+        let au: &[u8] = &[0, 0, 0, 1, 0x09, 0xF0, 0, 0, 0, 1, 0x41, 0x9A, 0x00];
+        for (cc, pts) in [Some(900_000u64), None, Some(907_200)].into_iter().enumerate() {
+            let mut pes = vec![0, 0, 1, 0xE0, 0, 0, 0x80];
+            match pts {
+                Some(p) => {
+                    pes.extend_from_slice(&[0x80, 5]);
+                    pes.extend_from_slice(&[
+                        0x21 | ((p >> 29) as u8 & 0x0E),
+                        (p >> 22) as u8,
+                        ((p >> 14) as u8 & 0xFE) | 1,
+                        (p >> 7) as u8,
+                        ((p << 1) as u8) | 1,
+                    ]);
+                }
+                None => pes.extend_from_slice(&[0x00, 0]),
+            }
+            pes.extend_from_slice(au);
+            // One packet: adaptation-field stuffing, then the PES.
+            let stuffing = 184 - pes.len();
+            let mut pkt = vec![0x47, 0x41, 0x00, 0x30 | cc as u8, (stuffing - 1) as u8, 0x00];
+            pkt.extend(std::iter::repeat_n(0xFF, stuffing - 2));
+            pkt.extend_from_slice(&pes);
+            ts.extend_from_slice(&pkt);
+        }
+        let mut demux = TsDemuxer::new(None);
+        let got: Vec<(u64, bool)> = demux
+            .demux(&ts)
+            .into_iter()
+            .filter_map(|f| match f {
+                DemuxedFrame::H264 { pts, pts_known, .. } => Some((pts, pts_known)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(got, vec![(900_000, true), (0, false)]);
     }
 
     /// H.264 parameter sets + IDR (SPS 0x67 / PPS 0x68 / IDR 0x65)

@@ -675,6 +675,8 @@ pub struct VideoReencoder {
     next_frame: i64,
     /// How an encoded frame finds its picture's source PTS.
     in_flight: crate::engine::video_encode_util::EncodedPtsMap,
+    /// The source PTS of each decoded picture (see `FramePtsStamper`).
+    stamper: crate::engine::video_encode_util::FramePtsStamper,
     /// Shared encoder pipeline — wraps `VideoEncoder` + optional
     /// `VideoScaler`. CMAF carries SPS/PPS inline on every IDR
     /// (segments are self-contained for DASH/HLS tune-in) so the
@@ -816,6 +818,7 @@ impl VideoReencoder {
             segment_secs,
             next_frame: 0,
             in_flight: Default::default(),
+            stamper: Default::default(),
             pipeline,
             output_id: output_id.to_string(),
             annex_b_scratch: Vec::with_capacity(256 * 1024),
@@ -831,7 +834,7 @@ impl VideoReencoder {
     pub fn encode_frame(
         &mut self,
         nalus: &[Vec<u8>],
-        pts: u64,
+        pts: Option<u64>,
         _is_keyframe: bool,
         codec: CmafVideoCodec,
     ) -> Result<Vec<VideoOutFrame>> {
@@ -882,9 +885,14 @@ impl VideoReencoder {
             return Ok(Vec::new());
         };
         // The PTS goes in with the access unit so the decoder hands each
-        // picture back with its own (display order).
-        dec.send_packet_with_pts(&self.annex_b_scratch, (pts & PTS_MASK_33B) as i64)
-            .map_err(|e| anyhow::anyhow!("VideoDecoder send_packet failed: {e}"))?;
+        // picture back with its own (display order); an access unit whose
+        // PES carried none goes in without (fed as 0, its picture came back
+        // stamped 0), and its picture is stamped from the ones before it.
+        match pts {
+            Some(pts) => dec.send_packet_with_pts(&self.annex_b_scratch, (pts & PTS_MASK_33B) as i64),
+            None => dec.send_packet(&self.annex_b_scratch),
+        }
+        .map_err(|e| anyhow::anyhow!("VideoDecoder send_packet failed: {e}"))?;
         let mut decoded = Vec::new();
         while let Ok(frame) = dec.receive_frame() {
             decoded.push(frame);
@@ -902,8 +910,10 @@ impl VideoReencoder {
         decoded: &video_engine::DecodedFrame,
         out: &mut Vec<VideoOutFrame>,
     ) -> Result<()> {
-        let src_pts = decoded.pts().filter(|p| *p >= 0).map(|p| p as u64);
-        if !self.rate.admit(decoded.pts(), &mut self.pipeline) {
+        let admitted = self.rate.admit(decoded.pts(), &mut self.pipeline);
+        let interval = crate::engine::video_encode_util::frame_interval_90k(self.pipeline.fps());
+        let src_pts = self.stamper.stamp(decoded.pts(), interval);
+        if !admitted {
             return Ok(());
         }
         if let Some(segment_secs) = self.segment_secs
@@ -1451,7 +1461,7 @@ mod flush_tests {
             let mut nalus = Vec::new();
             split_annex_b_to_nalus(&au.data, &mut nalus);
             out.extend(
-                re.encode_frame(&nalus, au.pts as u64 * 3_600, false, CmafVideoCodec::H264).unwrap(),
+                re.encode_frame(&nalus, Some(au.pts as u64 * 3_600), false, CmafVideoCodec::H264).unwrap(),
             );
         }
         let before_flush = out.len();
@@ -1512,7 +1522,7 @@ mod flush_tests {
             let mut nalus = Vec::new();
             split_annex_b_to_nalus(&au.data, &mut nalus);
             out.extend(
-                re.encode_frame(&nalus, 900_000 + au.pts as u64 * 3_600, false, CmafVideoCodec::H264)
+                re.encode_frame(&nalus, Some(900_000 + au.pts as u64 * 3_600), false, CmafVideoCodec::H264)
                     .unwrap(),
             );
         }
@@ -1533,6 +1543,32 @@ mod flush_tests {
         let pts: Vec<u64> = out.iter().map(|f| f.pts.unwrap()).collect();
         assert!(pts.windows(2).all(|w| w[1] - w[0] == 3_600), "{pts:?}");
         assert!(out.len() + 8 >= aus.len(), "{} of {} frames", out.len(), aus.len());
+    }
+
+    /// A source that stamps only every 12th picture (its I pictures, say):
+    /// the access units without a PTS go to the decoder without one, so the
+    /// rate lock counts their pictures and measures 25 fps, and each such
+    /// picture is stamped a frame past the one before it. Fed PTS 0 (the
+    /// demuxer's default), their pictures came back stamped 0: the meter
+    /// never measured — 60 frames dropped, then 30/1 — and the samples
+    /// carried 0.
+    #[test]
+    fn a_sparse_pts_source_measures_its_rate_and_stamps_every_picture() {
+        let aus = crate::engine::output_rtmp::x264_test_source(100, 3_600);
+        let cfg: VideoEncodeConfig =
+            serde_json::from_value(serde_json::json!({"codec": "x264", "preset": "veryfast"})).unwrap();
+        let mut re = VideoReencoder::new(&cfg, "sparse-test", Some(2.0)).unwrap();
+        let mut out = Vec::new();
+        for (k, (au, pts)) in aus.iter().enumerate() {
+            let mut nalus = Vec::new();
+            split_annex_b_to_nalus(au, &mut nalus);
+            let pts = (k % 12 == 0).then_some(*pts);
+            out.extend(re.encode_frame(&nalus, pts, false, CmafVideoCodec::H264).unwrap());
+        }
+        assert_eq!(re.pipeline.fps(), (25, 1), "measured over the unstamped pictures");
+        let pts: Vec<u64> = out.iter().map(|f| f.pts.expect("every picture stamped")).collect();
+        assert!(pts.len() >= 30, "{} frames", pts.len());
+        assert!(pts.windows(2).all(|w| w[1] == w[0] + 3_600), "{pts:?}");
     }
 
     /// `bframes` on the CMAF re-encode is pinned to 0: with B-frames (x264
@@ -1579,7 +1615,7 @@ mod flush_tests {
         for (au, pts) in &aus {
             let mut nalus = Vec::new();
             split_annex_b_to_nalus(au, &mut nalus);
-            out.extend(re.encode_frame(&nalus, *pts, false, CmafVideoCodec::H264).unwrap());
+            out.extend(re.encode_frame(&nalus, Some(*pts), false, CmafVideoCodec::H264).unwrap());
         }
         out.extend(re.flush().unwrap());
         let pts: Vec<u64> = out.iter().map(|f| f.pts.expect("its own picture's PTS")).collect();
@@ -1603,7 +1639,7 @@ mod flush_tests {
         for (au, pts) in &aus {
             let mut nalus = Vec::new();
             split_annex_b_to_nalus(au, &mut nalus);
-            out.extend(re.encode_frame(&nalus, *pts, false, CmafVideoCodec::H264).unwrap());
+            out.extend(re.encode_frame(&nalus, Some(*pts), false, CmafVideoCodec::H264).unwrap());
         }
         let before_flush = out.len();
         out.extend(re.flush().unwrap());
@@ -1654,7 +1690,7 @@ mod flush_tests {
         for au in &aus {
             let mut nalus = Vec::new();
             split_annex_b_to_nalus(&au.data, &mut nalus);
-            out.extend(re.encode_frame(&nalus, au.pts as u64 * 3_600, false, CmafVideoCodec::H264).unwrap());
+            out.extend(re.encode_frame(&nalus, Some(au.pts as u64 * 3_600), false, CmafVideoCodec::H264).unwrap());
         }
         assert_eq!(re.pipeline.gop_size(), Some(50));
         let idrs: Vec<u64> = out.iter().filter(|f| f.is_keyframe).map(|f| f.pts.unwrap() / 3_600).collect();
@@ -1706,7 +1742,7 @@ mod flush_tests {
             let mut nalus = Vec::new();
             split_annex_b_to_nalus(&au.data, &mut nalus);
             out += re
-                .encode_frame(&nalus, i as u64 * 3_600, false, CmafVideoCodec::H264)
+                .encode_frame(&nalus, Some(i as u64 * 3_600), false, CmafVideoCodec::H264)
                 .unwrap()
                 .len();
             if i < next_sps {

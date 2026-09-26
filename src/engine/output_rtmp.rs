@@ -116,6 +116,8 @@ struct VideoActive {
     /// obtained without discarding the source clock. Popped one per emitted
     /// frame. Same contract as `ts_video_replace`'s queue of the same name.
     src_pts_queue: std::collections::VecDeque<u64>,
+    /// The source PTS of each decoded picture (see `FramePtsStamper`).
+    stamper: crate::engine::video_encode_util::FramePtsStamper,
     /// Last wire PTS emitted, for the strictly-increasing guard.
     ///
     /// The encoder's `fps_num`/`fps_den` are deliberately no longer held here.
@@ -455,10 +457,10 @@ async fn publish_loop(
 
         for frame in frames {
             match frame {
-                DemuxedFrame::H264 { nalus, pts, is_keyframe } => {
+                DemuxedFrame::H264 { nalus, pts, is_keyframe, pts_known } => {
                     let ts_ms = pts_to_ms(pts, &mut base_pts);
                     if process_video_frame(
-                        VideoFrameSource::H264 { nalus: &nalus, is_keyframe },
+                        VideoFrameSource::H264 { nalus: &nalus, is_keyframe, pts_known },
                         pts,
                         ts_ms,
                         &mut base_pts,
@@ -477,10 +479,10 @@ async fn publish_loop(
                         // Success (or transient skip); nothing else to do.
                     }
                 }
-                DemuxedFrame::H265 { nalus, pts, is_keyframe } => {
+                DemuxedFrame::H265 { nalus, pts, is_keyframe, pts_known } => {
                     let ts_ms = pts_to_ms(pts, &mut base_pts);
                     if process_video_frame(
-                        VideoFrameSource::H265 { nalus: &nalus, is_keyframe },
+                        VideoFrameSource::H265 { nalus: &nalus, is_keyframe, pts_known },
                         pts,
                         ts_ms,
                         &mut base_pts,
@@ -1084,8 +1086,8 @@ fn nalus_to_annex_b(nalus: &[Vec<u8>]) -> Vec<u8> {
 
 /// Borrowed view of the source NAL units for one access unit.
 enum VideoFrameSource<'a> {
-    H264 { nalus: &'a [Vec<u8>], is_keyframe: bool },
-    H265 { nalus: &'a [Vec<u8>], is_keyframe: bool },
+    H264 { nalus: &'a [Vec<u8>], is_keyframe: bool, pts_known: bool },
+    H265 { nalus: &'a [Vec<u8>], is_keyframe: bool, pts_known: bool },
 }
 
 impl<'a> VideoFrameSource<'a> {
@@ -1102,6 +1104,15 @@ impl<'a> VideoFrameSource<'a> {
     }
     fn is_h264(&self) -> bool {
         matches!(self, VideoFrameSource::H264 { .. })
+    }
+    /// Whether the access unit's PES carried a PTS.
+    #[cfg(feature = "media-codecs")]
+    fn pts_known(&self) -> bool {
+        match self {
+            VideoFrameSource::H264 { pts_known, .. } | VideoFrameSource::H265 { pts_known, .. } => {
+                *pts_known
+            }
+        }
     }
 }
 
@@ -1632,6 +1643,7 @@ fn open_video_active(
         pipeline,
         target_family,
         src_pts_queue: std::collections::VecDeque::with_capacity(64),
+        stamper: Default::default(),
         last_wire_pts_90k: None,
         rate: crate::engine::video_encode_util::EncoderRateLock::new(pinned),
         sequence_header_tag: None,
@@ -1674,7 +1686,7 @@ async fn encode_one_frame(
     let block_result = crate::timed_block_in_place!(
         "output_rtmp.video_encoder",
         crate::engine::perf::TRANSCODE_BLOCK_WARN_MS,
-        { transcode_access_unit(active, &annex_b, pts_90k, &config.id) }
+        { transcode_access_unit(active, &annex_b, pts_90k, src.pts_known(), &config.id) }
     );
 
     // Only encoder *open* failure flips us to Failed. Decoder priming —
@@ -1773,14 +1785,22 @@ fn transcode_access_unit(
     active: &mut VideoActive,
     annex_b: &[u8],
     pts_90k: u64,
+    pts_known: bool,
     output_id: &str,
 ) -> Result<Vec<(Vec<u8>, bool, i64)>, String> {
     active.stats.input_frames.fetch_add(1, Ordering::Relaxed);
     // Feed the source PTS in so libavcodec can echo it back per
     // decoded frame. `send_packet` (no pts) threw it away at the door,
     // which is why the emit path had nothing but a frame counter to
-    // work from.
-    if let Err(e) = active.decoder.send_packet_with_pts(annex_b, pts_90k as i64) {
+    // work from. An access unit whose PES carried none goes in without one
+    // (fed as 0 it came back stamped 0): its picture is counted towards
+    // the rate and stamped from the pictures around it.
+    let fed = if pts_known {
+        active.decoder.send_packet_with_pts(annex_b, pts_90k as i64)
+    } else {
+        active.decoder.send_packet(annex_b)
+    };
+    if let Err(e) = fed {
         tracing::debug!("RTMP output '{}': decoder send_packet: {e:?}", output_id);
     }
     let mut out = Vec::new();
@@ -1793,16 +1813,16 @@ fn transcode_access_unit(
         // unless pinned. Until it is known the encoder cannot open
         // (its time base is fixed at open), so the frame is dropped
         // before it reaches the PTS queue.
-        if !active.rate.admit(frame.pts(), &mut active.pipeline) {
+        let admitted = active.rate.admit(frame.pts(), &mut active.pipeline);
+        // Display-order source PTS for this frame, straight from the
+        // decoder's reorder queue — or, for a picture whose PES carried
+        // none, from the pictures before it (`FramePtsStamper`).
+        let interval = crate::engine::video_encode_util::frame_interval_90k(active.pipeline.fps());
+        let stamped = active.stamper.stamp(frame.pts(), interval);
+        if !admitted {
             continue;
         }
-        // Display-order source PTS for this frame, straight from the
-        // decoder's reorder queue. Falls back to the access unit's own
-        // PTS when the source PES carried none.
-        let src_pts_for_frame = match frame.pts() {
-            Some(p) if p >= 0 => p as u64,
-            _ => pts_90k,
-        };
+        let src_pts_for_frame = stamped.unwrap_or(pts_90k);
         active.src_pts_queue.push_back(src_pts_for_frame);
 
         let was_open = active.pipeline.is_open();
@@ -2634,7 +2654,7 @@ mod rate_tests {
         let mut encoded = 0;
         for (au, pts) in &aus {
             let VideoEncoderState::Active(active) = &mut state else { panic!("not active") };
-            encoded += transcode_access_unit(active, au, *pts, "o").unwrap().len();
+            encoded += transcode_access_unit(active, au, *pts, true, "o").unwrap().len();
         }
         (state, encoded)
     }
@@ -2661,6 +2681,35 @@ mod rate_tests {
         let VideoEncoderState::Active(active) = &state else { panic!("not active") };
         assert_eq!(active.pipeline.fps(), (30_000, 1001));
         assert_eq!(vui_timing(&state), Some((1001, 60_000)));
+    }
+
+    /// A source stamping only every 12th picture: the access units without
+    /// a PTS go to the decoder without one, the rate is measured over their
+    /// pictures (25 fps, not the 30/1 fallback after 60 dropped frames), and
+    /// each picture is queued on its own time — the last stamped one plus a
+    /// frame per picture since — where it used to be queued at 0.
+    #[test]
+    fn a_sparse_pts_source_is_measured_and_stamped_on_rtmp() {
+        let cfg: VideoEncodeConfig =
+            serde_json::from_value(serde_json::json!({"codec": "x264", "preset": "veryfast"})).unwrap();
+        let config: RtmpOutputConfig = serde_json::from_value(serde_json::json!({
+            "id": "o", "name": "o", "dest_url": "rtmp://127.0.0.1/live", "stream_key": "k"
+        }))
+        .unwrap();
+        let stats = Arc::new(OutputStatsAccumulator::new("o".into(), "o".into(), "rtmp".into()));
+        let (events, _rx) = crate::manager::events::event_channel();
+        let aus = x264_test_source(80, 3_600);
+        let mut state = open_video_active(&cfg, true, &aus[0].0, &config, &stats, &events);
+        for (k, (au, pts)) in aus.iter().enumerate() {
+            let VideoEncoderState::Active(active) = &mut state else { panic!("not active") };
+            let known = k % 12 == 0;
+            transcode_access_unit(active, au, if known { *pts } else { 0 }, known, "o").unwrap();
+        }
+        let VideoEncoderState::Active(active) = &state else { panic!("not active") };
+        assert_eq!(active.pipeline.fps(), (25, 1));
+        let queued: Vec<u64> = active.src_pts_queue.iter().copied().collect();
+        assert!(!queued.is_empty());
+        assert!(queued.windows(2).all(|w| w[1] == w[0] + 3_600), "{queued:?}");
     }
 
     /// A pinned rate is used as it is, from the first frame.

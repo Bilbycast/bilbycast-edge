@@ -383,10 +383,10 @@ fn build_mp4_from_ts(ts: &[u8]) -> Result<Vec<u8>> {
     let mut other_audio: Vec<(u64, u8, Vec<u8>)> = Vec::new();
     for f in frames {
         match f {
-            DemuxedFrame::H264 { nalus, pts, is_keyframe } => {
+            DemuxedFrame::H264 { nalus, pts, is_keyframe, .. } => {
                 video_pts.push((pts, nalus, is_keyframe));
             }
-            DemuxedFrame::H265 { nalus, pts, is_keyframe } => {
+            DemuxedFrame::H265 { nalus, pts, is_keyframe, .. } => {
                 video_pts.push((pts, nalus, is_keyframe));
             }
             DemuxedFrame::Aac { data, pts } => {
@@ -889,7 +889,7 @@ fn reencode_all_intra(
         Ok(())
     };
     for (pts, nalus, is_key) in frames {
-        match enc.encode_frame(nalus, *pts, *is_key, src_codec) {
+        match enc.encode_frame(nalus, Some(*pts), *is_key, src_codec) {
             // None while the decoder and encoder fill; they hand those back
             // later, or on flush.
             Ok(done) => {

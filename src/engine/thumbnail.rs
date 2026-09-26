@@ -1202,6 +1202,7 @@ impl LiveState {
                     nalus,
                     pts,
                     is_keyframe,
+                    ..
                 } => {
                     self.codec = Some(video_codec::VideoCodec::H264);
                     // Classify two-tiered: codec-defined IDR (NAL 5) is
@@ -1225,6 +1226,7 @@ impl LiveState {
                     nalus,
                     pts,
                     is_keyframe,
+                    ..
                 } => {
                     self.codec = Some(video_codec::VideoCodec::Hevc);
                     // VPS (32) / SPS (33) / PPS (34) at GOP boundary —
