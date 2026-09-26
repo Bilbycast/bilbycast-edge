@@ -524,18 +524,10 @@ async fn publish_loop(
                     // the bitstream itself. This matches what `ffmpeg
                     // -c:a aac -profile:a aac_he -f flv` writes.
                     if !sent_audio_header
-                        && let Some((profile, sr_idx, ch_cfg)) = demuxer.cached_aac_config() {
-                            let _ = profile;
-                            let (asc_sr_idx, asc_ch_cfg) = match &encoder_state {
-                                EncoderState::Active { encoder, .. } => {
-                                    let p = encoder.params();
-                                    (
-                                        sr_index_from_hz(p.target_sample_rate).unwrap_or(sr_idx),
-                                        p.target_channels,
-                                    )
-                                }
-                                _ => (sr_idx, ch_cfg),
-                            };
+                        && let Some(cached) = demuxer.cached_aac_config()
+                        && let Some((asc_sr_idx, asc_ch_cfg)) =
+                            aac_sequence_header_format(&encoder_state, cached)
+                    {
                             let header = build_aac_sequence_header(1, asc_sr_idx, asc_ch_cfg);
                             client.send_audio(&header, ts_ms).await?;
                             sent_audio_header = true;
@@ -1861,6 +1853,25 @@ fn transcode_access_unit(
     Ok(out)
 }
 
+/// The `(sample_rate_index, channel_config)` the FLV AAC sequence header
+/// announces: the re-encoder's output format when audio is re-encoded, the
+/// source's ADTS config when it passes through — and nothing while the
+/// re-encoder is still waiting for a frame that decodes (`Lazy`): its format
+/// is the decoder's, which for HE-AAC is not the header's (24 kHz / mono
+/// core), and a header sent from the ADTS config then would announce the
+/// wrong rate and channels for the whole connection.
+fn aac_sequence_header_format(state: &EncoderState, cached: (u8, u8, u8)) -> Option<(u8, u8)> {
+    let (_, sr_idx, ch_cfg) = cached;
+    match state {
+        EncoderState::Active { encoder, .. } => {
+            let p = encoder.params();
+            Some((sr_index_from_hz(p.target_sample_rate).unwrap_or(sr_idx), p.target_channels))
+        }
+        EncoderState::Lazy => None,
+        _ => Some((sr_idx, ch_cfg)),
+    }
+}
+
 /// Build an AAC sequence header FLV audio tag (AudioSpecificConfig).
 fn build_aac_sequence_header(profile: u8, sample_rate_idx: u8, channel_config: u8) -> Vec<u8> {
     let mut buf = BytesMut::with_capacity(4);
@@ -2866,6 +2877,36 @@ mod tests {
             assert_eq!((out.len(), out[0].len()), (2, 2048), "v2 {v2}: nothing to convert");
             assert_eq!(stage.delay(), 0);
         }
+    }
+
+    /// No FLV AAC sequence header goes out while the re-encoder waits for a
+    /// frame that decodes: it would announce the ADTS header's format —
+    /// for HE-AAC the 24 kHz / mono core — not the 48 kHz stereo the
+    /// re-encode then carries. Passthrough announces the source's; a
+    /// re-encode, its output.
+    #[cfg(feature = "fdk-aac")]
+    #[test]
+    fn the_aac_sequence_header_waits_for_the_resolved_format() {
+        let he_aac_v2 = (1u8, 6u8, 1u8);
+        assert_eq!(aac_sequence_header_format(&EncoderState::Lazy, he_aac_v2), None);
+        assert_eq!(aac_sequence_header_format(&EncoderState::Transparent, he_aac_v2), Some((6, 1)));
+        let cfg: RtmpOutputConfig = serde_json::from_value(serde_json::json!({
+            "id": "r1", "name": "r1", "dest_url": "rtmp://127.0.0.1/app", "stream_key": "k",
+            "audio_encode": { "codec": "aac_lc", "bitrate_kbps": 128 }
+        }))
+        .unwrap();
+        let ts = crate::engine::ts_test_fixtures::aac_program_ts(
+            &crate::engine::ts_test_fixtures::he_aac_adts(true),
+        );
+        let mut demux = TsDemuxer::new(None);
+        let first = first_aac_frame(&mut demux, &ts);
+        let (events, _rx) = crate::manager::events::event_channel();
+        let stats = Arc::new(OutputStatsAccumulator::new("r1".into(), "r1".into(), "rtmp".into()));
+        let lazy = build_encoder_state(&cfg, &demux, Some(&[]), true, &CancellationToken::new(), &stats, "f", &events);
+        assert!(matches!(lazy, EncoderState::Lazy), "a frame that does not decode leaves it waiting");
+        assert_eq!(aac_sequence_header_format(&lazy, he_aac_v2), None);
+        let active = build_encoder_state(&cfg, &demux, Some(&first), true, &CancellationToken::new(), &stats, "f", &events);
+        assert_eq!(aac_sequence_header_format(&active, he_aac_v2), Some((3, 2)), "48 kHz stereo");
     }
 
     /// A silent-fallback encoder, built before any source audio, is sized
