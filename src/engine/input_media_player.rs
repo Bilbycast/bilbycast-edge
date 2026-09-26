@@ -540,6 +540,159 @@ pub(super) fn splice_guard_ns() -> u64 {
 }
 
 
+/// Longest a PAT or PMT may go without going out again across a splice
+/// before its last copy is repeated. TR 101 290 1.3 / 1.5 allow 500 ms. The
+/// check runs at every packet and every filler (fillers are at most 35 ms
+/// apart), and a table's deadline is its bundle's; the rest of the margin is
+/// the outputs'. A program-filtered output keeps one program's packets out
+/// of each filler datagram and re-chunks them into 7-packet datagrams, so
+/// across a splice a lone table waits for six more packets: Spain program
+/// 186's copies arrived up to 131 ms after their deadline, 531 ms after the
+/// last table, when they were due at 400 ms.
+const PSI_SPLICE_REPEAT_NS: u64 = 300_000_000;
+
+/// How long after a file opens its splice may still repeat the previous
+/// file's PSI. A playlist file whose PAT no longer lists a PMT PID drops it
+/// at once; this bounds the rest.
+const PSI_SPLICE_GUARD_NS: u64 = 3_000_000_000;
+
+/// PAT / PMT repetition across a splice (TR 101 290 1.3 PAT_error, 1.5
+/// PMT_error: each at least every 500 ms).
+///
+/// A looped file's PSI cadence stops at its last table and restarts at its
+/// first: the gap across a splice is the tail after the last table, the
+/// splice's wall gap, and the head before the first. On Spain that was
+/// 267 + ~257 + 368 ms = 893 ms of PAT (the file repeats it every 475 ms),
+/// 955 ms of PMT on 770_H. Nothing downstream repeats it: the ingress
+/// rewriter's PSI_RR guard latches off on an MPTS (verbatim passthrough) and
+/// runs before an output's program filter, and it re-emits only after 500 ms
+/// have already gone by.
+///
+/// So the player keeps each table's latest complete unit as it went out,
+/// with the pacing deadline it left at, and from the moment a file opens
+/// until that file sends the table itself (at most
+/// [`PSI_SPLICE_GUARD_NS`]) sends the last copy again whenever
+/// [`PSI_SPLICE_REPEAT_NS`] has gone by — through the splice's filler PCRs
+/// and the new file's head, CC continued. Within a file nothing is added:
+/// its own cadence is what it is.
+#[derive(Default)]
+pub(super) struct PsiRepeat {
+    tables: Vec<PsiTable>,
+    /// PMT PIDs of the latest PAT that went out.
+    pmt_pids: Vec<u16>,
+    /// Deadline of the first packet the current file scheduled.
+    opened_ns: Option<u64>,
+}
+
+struct PsiTable {
+    pid: u16,
+    /// Reassembly of a PMT unit (`None` on the PAT, taken whole from one
+    /// packet).
+    collector: Option<crate::engine::ts_parse::PmtUnitCollector>,
+    /// The latest complete unit, as it went out.
+    unit: Vec<[u8; TS_PACKET]>,
+    /// Pacing deadline it last went out at.
+    last_ns: u64,
+    /// The current file has sent it itself: no repeating it any more.
+    fresh: bool,
+}
+
+impl PsiRepeat {
+    /// A file opens: every table is owed until it sends it.
+    fn open_file(&mut self) {
+        self.opened_ns = None;
+        for t in &mut self.tables {
+            t.fresh = false;
+        }
+    }
+
+    /// Whether any table is still owed across the current splice.
+    fn guarding(&self) -> bool {
+        self.tables.iter().any(|t| !t.fresh && !t.unit.is_empty())
+    }
+
+    /// A packet of the file went out at `at_ns` (its bundle's deadline):
+    /// learn the PAT's PMT PIDs and each table's latest complete unit.
+    fn observe(&mut self, pkt: &[u8; TS_PACKET], at_ns: Option<u64>) {
+        let pid = ((pkt[1] as u16 & 0x1F) << 8) | pkt[2] as u16;
+        let pusi = pkt[1] & 0x40 != 0;
+        if at_ns.is_some() && self.opened_ns.is_none() {
+            self.opened_ns = at_ns;
+        }
+        if pid == 0 {
+            if !pusi {
+                return;
+            }
+            let programs = crate::engine::ts_parse::parse_pat_programs(pkt);
+            let off = crate::engine::ts_parse::ts_payload_offset(pkt);
+            let start = off + 1 + pkt.get(off).copied().unwrap_or(0xFF) as usize;
+            if programs.is_empty() || !crate::engine::ts_parse::verify_psi_crc(pkt, start) {
+                return;
+            }
+            self.pmt_pids = programs.iter().map(|(_, p)| *p).collect();
+            let pmts = &self.pmt_pids;
+            self.tables.retain(|t| t.pid == 0 || pmts.contains(&t.pid));
+            let t = self.table(0);
+            t.unit = vec![*pkt];
+            t.last_ns = at_ns.unwrap_or(0);
+            t.fresh = true;
+            return;
+        }
+        if !self.pmt_pids.contains(&pid) {
+            return;
+        }
+        let t = self.table(pid);
+        let unit = t
+            .collector
+            .get_or_insert_with(Default::default)
+            .push_packet(pkt, |_| {});
+        if let Some(unit) = unit {
+            t.unit = unit;
+            t.last_ns = at_ns.unwrap_or(0);
+            t.fresh = true;
+        }
+    }
+
+    /// Whether a packet on `pid` is PSI this repeats.
+    fn wants(&self, pid: u16) -> bool {
+        pid == 0 || self.pmt_pids.contains(&pid)
+    }
+
+    fn table(&mut self, pid: u16) -> &mut PsiTable {
+        match self.tables.iter().position(|t| t.pid == pid) {
+            Some(i) => &mut self.tables[i],
+            None => {
+                self.tables.push(PsiTable { pid, collector: None, unit: Vec::new(), last_ns: 0, fresh: false });
+                self.tables.last_mut().expect("just pushed")
+            }
+        }
+    }
+
+    /// Before something leaves at `at_ns` during a splice: the units of the
+    /// tables owed and not sent for [`PSI_SPLICE_REPEAT_NS`], PAT first, CC
+    /// still to be continued by the caller.
+    fn due(&mut self, at_ns: u64) -> Vec<[u8; TS_PACKET]> {
+        let opened = *self.opened_ns.get_or_insert(at_ns);
+        if at_ns.saturating_sub(opened) > PSI_SPLICE_GUARD_NS {
+            for t in &mut self.tables {
+                t.fresh = true;
+            }
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        for t in &mut self.tables {
+            if t.fresh || t.unit.is_empty() || t.last_ns == 0 {
+                continue;
+            }
+            if at_ns.saturating_sub(t.last_ns) >= PSI_SPLICE_REPEAT_NS {
+                out.extend_from_slice(&t.unit);
+                t.last_ns = at_ns;
+            }
+        }
+        out
+    }
+}
+
 /// Continuity state threaded through every `play_*_file` call so the wire
 /// stream stays smooth across loop and playlist boundaries.
 ///
@@ -610,6 +763,9 @@ pub(super) struct SpliceContinuity {
     /// video DTS used to land before the previous loop's last — the anchor
     /// considered only audio and PCR).
     last_video_dts: Option<(u64, u64)>,
+
+    /// PAT / PMT repetition across a splice (see [`PsiRepeat`]).
+    pub(super) psi: PsiRepeat,
 
     /// Identity of the previous file. Distinguishes a same-file loop
     /// (no real boundary, no need to flag) from a playlist transition
@@ -687,6 +843,7 @@ impl SpliceContinuity {
             self.pending_discontinuity = true;
         }
         self.last_source_id = Some(source_id.to_string());
+        self.psi.open_file();
     }
 
     /// Called by each per-format player at the end of a file to update
@@ -1791,6 +1948,12 @@ async fn play_ts_file(
                                 splice_fillers(pid, &fillers, deadline, gap_ns, &others, now)
                             {
                                 let mut data = BytesMut::with_capacity(7 * TS_PACKET);
+                                // A PAT / PMT owed across the splice rides
+                                // the filler that is due when it is.
+                                for mut p in session.cont.psi.due(at) {
+                                    rewrite_cc(&mut p, session.cont);
+                                    data.extend_from_slice(&p);
+                                }
                                 for (fpid, v) in pcrs {
                                     let mut p =
                                         crate::engine::ts_parse::pcr_only_packet(fpid, 0, v, false);
@@ -1908,6 +2071,17 @@ async fn play_ts_file(
             }
         }
 
+        // Across a splice, a PAT / PMT owed by now goes out ahead of this
+        // packet, in its bundle (see `PsiRepeat`).
+        if session.cont.psi.guarding()
+            && let Some(at) =
+                ts_bundle_deadline(last_pcr_target_ns, bytes_since_pcr, current_bitrate_bps)
+        {
+            for mut p in session.cont.psi.due(at) {
+                rewrite_cc(&mut p, session.cont);
+                bundle.extend_from_slice(&p);
+            }
+        }
         // Held packets first (in order), then this one — all through the
         // same splice path: file-start video gate, CC, PCR / PES offset,
         // high-water marks, DI.
@@ -1919,6 +2093,11 @@ async fn play_ts_file(
         }
 
         for p in ready.drain(..) {
+            let pid = ((p[1] as u16 & 0x1F) << 8) | p[2] as u16;
+            if session.cont.psi.wants(pid) {
+                let at = ts_bundle_deadline(last_pcr_target_ns, bytes_since_pcr, current_bitrate_bps);
+                session.cont.psi.observe(&p, at);
+            }
             bundle.extend_from_slice(&p);
             if bundle.len() >= session.bundle_size {
                 // Credit the exact bytes about to leave (== session.bundle_size at
@@ -5761,15 +5940,17 @@ mod tests {
         let mut pcrs = Vec::new(); // (pcr, wall_us)
         let mut filler_bundles = 0;
         for (_, b) in &got {
-            // A filler datagram: AF-only PCRs (one; more when slots already
-            // due go out together) padded with null packets to a multiple of
-            // seven packets.
+            // A filler datagram: the PAT / PMT when owed across the splice
+            // (see `PsiRepeat`), AF-only PCRs (one; more when slots already
+            // due go out together), padded with null packets to a multiple
+            // of seven packets.
             let pids: Vec<u16> = b
                 .chunks(TS_PACKET)
                 .map(|p| ((p[1] as u16 & 0x1F) << 8) | p[2] as u16)
+                .skip_while(|p| *p == 0 || *p == 0x1000)
                 .collect();
             let pcrs = pids.iter().take_while(|p| **p == 0x100).count();
-            if pids.len().is_multiple_of(7) && pcrs > 0 && pids[pcrs..].iter().all(|p| *p == 0x1FFF) {
+            if b.len().is_multiple_of(7 * TS_PACKET) && pcrs > 0 && pids[pcrs..].iter().all(|p| *p == 0x1FFF) {
                 filler_bundles += pcrs;
             }
         }
@@ -5978,6 +6159,117 @@ mod tests {
         pacer_trace::take(&thread)
     }
 
+    /// [`loop_fixture`] with its PAT and PMT at `psi_at` (ms) instead of at
+    /// the start, and its video's lead over the PCR growing by `lead_growth`
+    /// ms across the file (which the loop's video term turns into a splice
+    /// gap as long).
+    fn loop_fixture_sparse_psi(psi_at: [u64; 2], lead_growth: u64) -> Vec<u8> {
+        use crate::engine::ts_test_fixtures::{packetize_sections, pat_packet, pes_start_packet, pmt_section};
+        const T0: u64 = 10_000; // ms
+        let mut ev: Vec<(u64, u8, [u8; TS_PACKET])> = Vec::new();
+        let pmt = pmt_section(1, 0, 0x100, &[], &[(0x1B, 0x100, &[]), (0x0F, 0x101, &[])]);
+        for t in psi_at {
+            ev.push((t, 0, pat_packet(&[(1, 0x1000)], 0, 0)));
+            ev.push((t, 1, packetize_sections(0x1000, &[&pmt], 0)[0]));
+        }
+        for k in 0..50u64 {
+            let t = k * 20;
+            let pcr = crate::engine::ts_parse::pcr_only_packet(0x100, 0, (T0 + t) * 27_000, false);
+            ev.push((t, 3, pcr));
+            ev.push((t, 4, pes_start_packet(0x101, 0, 0xC0, (T0 + t + 50) * 90, None)));
+        }
+        for k in 0..25u64 {
+            let t = k * 40;
+            let ts = (T0 + t + 100 + k * lead_growth / 24) * 90;
+            let es = if k == 0 { SPS } else { P_SLICE };
+            ev.push((t, 5, video_pes(0x100, 0, ts, Some(ts), es)));
+        }
+        ev.sort_by_key(|(t, o, _)| (*t, *o));
+        ev.iter().flat_map(|(_, _, p)| p.iter().copied()).collect()
+    }
+
+    /// TR 101 290 1.3 / 1.5 across a loop: the file's last PAT / PMT is
+    /// 300 ms before its end and its first 300 ms after its start, so the
+    /// splice alone would leave ~650 ms without either. The last copies go
+    /// out again on time — PAT and PMT never more than 500 ms apart by
+    /// their pacing deadlines — CC continuous, bytes as they were. Due
+    /// 150 ms after the file's end, the copies ride the next file's head.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn looping_repeats_the_pat_and_pmt_across_the_splice() {
+        assert_psi_repeated(&loop_ts_twice("psi-head.ts", &loop_fixture_sparse_psi([300, 700], 0)).await);
+    }
+
+    /// The splice guard's bookkeeping: a table owed goes out again once
+    /// 300 ms went by, once per 300 ms, until the new file sends it; a
+    /// playlist file whose PAT drops a PMT PID drops that table; nothing
+    /// is repeated more than 3 s after the file opened.
+    #[test]
+    fn psi_repeat_owes_each_table_until_the_new_file_sends_it() {
+        use crate::engine::ts_test_fixtures::{packetize_sections, pat_packet, pmt_section};
+        let ms = 1_000_000u64;
+        let mut r = PsiRepeat::default();
+        let pat = pat_packet(&[(1, 0x1000)], 0, 0);
+        let pmt = packetize_sections(0x1000, &[&pmt_section(1, 0, 0x100, &[], &[(0x1B, 0x100, &[])])], 0)[0];
+        r.observe(&pat, Some(1_000 * ms));
+        r.observe(&pmt, Some(1_000 * ms));
+        assert!(!r.guarding(), "nothing owed within a file");
+        r.open_file();
+        assert!(r.guarding());
+        assert!(r.due(1_200 * ms).is_empty());
+        assert_eq!(r.due(1_301 * ms), vec![pat, pmt]);
+        assert!(r.due(1_600 * ms).is_empty());
+        assert_eq!(r.due(1_601 * ms), vec![pat, pmt]);
+        // The new file sends its PAT (the PMT PID moved): the old PMT is
+        // no longer owed, nor is the PAT.
+        let pat2 = pat_packet(&[(1, 0x2000)], 0, 0);
+        r.observe(&pat2, Some(1_850 * ms));
+        assert!(!r.guarding());
+        assert!(r.due(2_400 * ms).is_empty());
+        // Another splice that never sends its PSI: repeated for 3 s only.
+        r.open_file();
+        assert_eq!(r.due(2_400 * ms), vec![pat2]);
+        assert_eq!(r.due(2_701 * ms), vec![pat2]);
+        assert!(r.due(5_401 * ms).is_empty(), "past the guard");
+        assert!(!r.guarding());
+    }
+
+    /// As above with 400 ms of tail and a 300 ms splice: due 50 ms after
+    /// the file's end, the copies ride the splice's filler PCRs.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_pat_and_pmt_ride_the_splice_fillers_when_due() {
+        assert_psi_repeated(&loop_ts_twice("psi-gap.ts", &loop_fixture_sparse_psi([200, 600], 300)).await);
+    }
+
+    fn assert_psi_repeated(trace: &[(u64, bytes::Bytes)]) {
+        let mut at: std::collections::HashMap<u16, Vec<u64>> = Default::default();
+        let mut cc: std::collections::HashMap<u16, u8> = Default::default();
+        let mut pmts: Vec<Vec<u8>> = Vec::new();
+        for (deadline, b) in trace {
+            for p in b.chunks(TS_PACKET) {
+                let pid = (p[1] as u16 & 0x1F) << 8 | p[2] as u16;
+                if pid != 0 && pid != 0x1000 {
+                    continue;
+                }
+                if let Some(prev) = cc.insert(pid, p[3] & 0x0F) {
+                    assert_eq!((prev + 1) & 0x0F, p[3] & 0x0F, "CC on 0x{pid:X}");
+                }
+                if p[1] & 0x40 != 0 {
+                    at.entry(pid).or_default().push(*deadline);
+                }
+                if pid == 0x1000 {
+                    pmts.push(p[4..].to_vec());
+                }
+            }
+        }
+        for pid in [0u16, 0x1000] {
+            let t = &at[&pid];
+            assert!(t.len() >= 5, "0x{pid:X}: {} tables", t.len());
+            let worst = t.windows(2).map(|w| w[1].saturating_sub(w[0])).max().unwrap();
+            assert!(worst <= 500_000_000, "0x{pid:X}: {} ms without it", worst / 1_000_000);
+        }
+        assert!(pmts.windows(2).all(|w| w[0] == w[1]), "every PMT the same section");
+    }
+
     /// Every PES timestamp on `pid` in a pacer trace, in order.
     fn pes_pts_of(trace: &[(u64, bytes::Bytes)], pid: u16) -> Vec<u64> {
         trace
@@ -6058,12 +6350,17 @@ mod tests {
         use crate::engine::ts_parse::extract_pcr;
         let mut pcrs: std::collections::BTreeMap<u16, Vec<u64>> = Default::default();
         // The file's own anchor PCRs, fillers left out (a filler datagram
-        // holds nothing but adaptation-field-only PCRs and null packets).
+        // holds nothing but adaptation-field-only PCRs and null packets, and
+        // the PAT / PMT when they are owed across the splice).
         let mut file_anchor = Vec::new();
         for (_, b) in got {
             let filler = b.chunks(TS_PACKET).all(|p| {
                 let pid = ((p[1] as u16 & 0x1F) << 8) | p[2] as u16;
-                pid == 0x1FFF || (p[3] & 0x30 == 0x20 && extract_pcr(p).is_some())
+                pid == 0x1FFF
+                    || (p[3] & 0x30 == 0x20 && extract_pcr(p).is_some())
+                    || pid == 0
+                    || pid == 0x1000
+                    || pid == 0x1100
             });
             for p in b.chunks(TS_PACKET) {
                 let pid = ((p[1] as u16 & 0x1F) << 8) | p[2] as u16;
