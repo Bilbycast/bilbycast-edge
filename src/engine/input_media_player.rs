@@ -2270,10 +2270,7 @@ async fn play_ts_file(
     // tracks where audio and video end together `audio_max ≈ pcr_max`
     // so behaviour is unchanged. The next file adds its own video term
     // (see `target_pts_90k` above) once it knows where its video starts.
-    let anchor_pts = match splice.max_emitted_audio_pts_90k {
-        Some(a) => a.max(splice.max_emitted_pcr_90k),
-        None => splice.max_emitted_pts_90k.max(splice.max_emitted_pcr_90k),
-    };
+    let anchor_pts = splice.loop_anchor_pts_90k();
 
     // 3d: the last anchor PCR's deadline and output value, so the next TS
     // file starts `PCR gap` after it on the wall clock. Only when this file
@@ -2445,6 +2442,25 @@ impl EsLast {
     }
 }
 
+/// The later of two 33-bit timestamps — the one the other is behind,
+/// modularly.
+///
+/// The splice's high-water marks were plain `>` / `max`: a timestamp just
+/// under 2^33 beat every one after the wrap. A file's first-played copy
+/// starts its timeline at 0 (its first PCR, the cold-start target), so any
+/// PES it stamps before that PCR — the leading audio a muxer writes ahead of
+/// its first PCR, held and replayed on the offset — lands just below 2^33.
+/// That was the audio high-water mark for the whole file: the next loop's
+/// target came out a few ms before 0 (the video and ES terms raise it only
+/// by under 10 s), so every loop of a file longer than that restarted the
+/// timeline near 0 — a backward step of the whole file on every PID, which
+/// the ingress rewriter bridged with a DI while the new loop's leading PES,
+/// held ahead of its first PCR, went out on the stale anchor ~60 s back
+/// (vh1_h264_2997i.ts, every loop).
+fn later_90k(a: u64, b: u64) -> u64 {
+    if pts_diff_90k(a, b) > 0 { a } else { b }
+}
+
 /// Per-file state of the `play_ts_file` splice path: everything one packet
 /// touches on its way out (file-start video gate → CC → PCR / PES offset →
 /// high-water marks → DI). Held packets (7a) take the same path.
@@ -2522,6 +2538,16 @@ impl TsFileSplice {
             last_video_dts_90k: None,
             gated: Vec::with_capacity(RAP_GATE_HOLD_MAX + 1),
             seen_pids: Box::new([false; 8192]),
+        }
+    }
+
+    /// Where the next file's timeline continues from (see the hand-off in
+    /// `play_ts_file`): the later of the highest audio PTS and the highest
+    /// anchor PCR — of every PES timestamp and that PCR with no audio.
+    fn loop_anchor_pts_90k(&self) -> u64 {
+        match self.max_emitted_audio_pts_90k {
+            Some(a) => later_90k(a, self.max_emitted_pcr_90k),
+            None => later_90k(self.max_emitted_pts_90k, self.max_emitted_pcr_90k),
         }
     }
 
@@ -2635,9 +2661,7 @@ impl TsFileSplice {
                 if let Some(out_pcr_27m) = extract_pcr_27mhz(&packet) {
                     if anchor_pcr_pid == Some(pid) {
                         let out_pcr_90k = (out_pcr_27m / 300) & 0x1_FFFF_FFFF;
-                        if out_pcr_90k > self.max_emitted_pcr_90k {
-                            self.max_emitted_pcr_90k = out_pcr_90k;
-                        }
+                        self.max_emitted_pcr_90k = later_90k(out_pcr_90k, self.max_emitted_pcr_90k);
                     } else {
                         match self.other_pcrs.iter_mut().find(|(p, _)| *p == pid) {
                             Some(e) => e.1 = out_pcr_27m,
@@ -2662,14 +2686,11 @@ impl TsFileSplice {
                     {
                         self.audio_au.push((pid, h.samples, h.sample_rate));
                     }
-                    if new_pts > self.max_emitted_pts_90k {
-                        self.max_emitted_pts_90k = new_pts;
-                    }
+                    self.max_emitted_pts_90k = later_90k(new_pts, self.max_emitted_pts_90k);
                     if self.audio_pids.contains(&pid) {
-                        let cur = self.max_emitted_audio_pts_90k.unwrap_or(0);
-                        if new_pts > cur {
-                            self.max_emitted_audio_pts_90k = Some(new_pts);
-                        }
+                        self.max_emitted_audio_pts_90k = Some(
+                            self.max_emitted_audio_pts_90k.map_or(new_pts, |m| later_90k(new_pts, m)),
+                        );
                     }
                     if Some(pid) != self.gate.pid
                         && let Some(&(_, video)) = self.es_kinds.iter().find(|(p, _)| *p == pid)
@@ -6013,6 +6034,43 @@ mod tests {
             .filter(|p| ((p[1] as u16 & 0x1F) << 8 | p[2] as u16) == pid)
             .filter_map(|p| crate::engine::ts_parse::extract_pes_pts(p))
             .collect()
+    }
+
+    /// A file whose first audio PES goes ahead of its first PCR, stamped
+    /// 70 ms before it — `vh1_h264_2997i.ts` opens that way, as ffmpeg's
+    /// mpegts muxer writes. On its first play the offset maps that PCR to 0
+    /// (the cold-start target), so the held audio lands just below 2^33.
+    /// A plain `>` took that for the file's highest audio timestamp: the
+    /// next loop's target came out ~40 ms before 0, and the video / ES terms
+    /// raise a target by under 10 s only, so every loop of a longer file
+    /// restarted the timeline near 0 — on the rig the ingress rewriter
+    /// bridged each restart with a DI, and the next loop's own leading
+    /// audio, held ahead of its first PCR, went out on the stale anchor
+    /// 60 s back, then 59 s forward. The loop anchor is the latest of them
+    /// modularly: here the last PCR.
+    #[test]
+    fn leading_audio_stamped_below_the_wrap_does_not_set_the_loop_anchor() {
+        use crate::engine::ts_parse::pcr_only_packet;
+        use crate::engine::ts_test_fixtures::{packetize_sections, pat_packet, pes_start_packet, pmt_section};
+        const T0: u64 = 1_000; // ms: the file's first PCR
+        let mut cont = SpliceContinuity::default();
+        let mut splice = TsFileSplice::new(0, None);
+        let mut out = Vec::new();
+        let anchor = Some(0x100);
+        splice.push(pat_packet(&[(1, 0x1000)], 0, 0), anchor, &mut cont, &mut out);
+        let pmt = pmt_section(1, 0, 0x100, &[], &[(0x0F, 0x101, &[])]);
+        splice.push(packetize_sections(0x1000, &[&pmt], 0)[0], anchor, &mut cont, &mut out);
+        // The first PCR fixed the offset onto the cold-start target 0; the
+        // held audio goes out first.
+        splice.splice_offset_27m = Some(-((T0 * 27_000) as i64));
+        for k in 0..300u64 {
+            let t = T0 + k * 40;
+            splice.push(pes_start_packet(0x101, k as u8, 0xC0, (t - 70) * 90, None), anchor, &mut cont, &mut out);
+            splice.push(pcr_only_packet(0x100, 0, t * 27_000, false), anchor, &mut cont, &mut out);
+        }
+        assert_eq!(crate::engine::ts_parse::extract_pes_pts(&out[2]), Some((1 << 33) - 6_300));
+        assert_eq!(splice.max_emitted_audio_pts_90k, Some((299 * 40 - 70) * 90));
+        assert_eq!(splice.loop_anchor_pts_90k(), 299 * 40 * 90, "the last PCR");
     }
 
     /// A file whose first PCR lies past a second of its own PES time (87 s

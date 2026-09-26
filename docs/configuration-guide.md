@@ -1555,6 +1555,17 @@ loop, each playlist transition — continues one wire timeline:
   decode time, not only its last audio and PCR — a capture leads its PCR by
   more video at its end than at its start, which stepped video DTS back at
   every loop.
+- The previous file's last audio, PCR and PES timestamps are found
+  modulo 2^33. The flow's first file maps its first PCR to 0, so a PES it
+  holds from before that PCR — ffmpeg's muxer opens with audio 42 ms behind
+  its first PCR — goes out just below 2^33. A plain maximum took that for
+  the file's last audio: the next loop's timeline restarted a few
+  milliseconds before 0 on every loop of a file longer than 10 s (the video
+  and audio terms above move a target by less), the input's clock rewriter
+  bridged each restart with a DI, and the next loop's own held audio left on
+  the stale anchor, ~60 s back then ~59 s forward (`vh1_h264_2997i.ts`, and
+  on v0.111.0, which sent that audio with its raw timestamps). Loops now
+  continue one timeline.
 - With PCR deadlines (the default) the next file's first PCR is scheduled
   exactly the PCR gap after the previous file's last one on the wall clock,
   with PCRs at most 35 ms apart across the gap — each sent as a full
