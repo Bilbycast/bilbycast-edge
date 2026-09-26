@@ -1464,9 +1464,14 @@ loop, each playlist transition — continues one wire timeline:
   file: its video starts at the random-access point. The offset is the
   smallest that keeps **every** audio and video PID and every PCR PID of
   every program moving forward past its last output timestamp — for audio
-  past the end of its last PES (its own PES step, 30 ms at the least: the
-  30 ms alone put the next file's first AC-3 / HE-AAC PES inside the last),
-  a frame for video, 1 ms for a PCR. Each program's PMT is reassembled
+  past the end of its last PES (the longest of its last eight PES steps,
+  30 ms at the least: the 30 ms alone put the next file's first AC-3 /
+  HE-AAC PES inside the last; any step up to 700 ms, the longest MPEG-TS
+  lets a PTS go unrepeated, counts as one PES — ffmpeg's muxer packs audio
+  PES of up to 350 ms, 183 ms of AAC-LC at 128 kbps, which a step bounded
+  at a video frame's 100 ms missed; and the longest recent step, not the
+  last, covers a muxer alternating two- and three-frame PES that ends on the
+  longer), a frame for video, 1 ms for a PCR. Each program's PMT is reassembled
   across packets: a broadcast MPTS PMT past ~180 bytes (a dozen ES with
   their descriptors), read off one packet, named no PCR_PID and no ES, and
   the splice fell back to the PAT's first program. The terms used to come

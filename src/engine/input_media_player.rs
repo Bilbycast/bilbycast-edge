@@ -2040,25 +2040,8 @@ async fn play_ts_file(
     let video_carry = splice
         .max_video_dts_90k
         .map(|d| (d, splice.video_dts_step_90k.unwrap_or(3_600)));
-    // The step each ES needs past its last timestamp: a frame for video (its
-    // own, else 40 ms); for audio its own PES step — the last PES plays that
-    // long — or the splice guard, whichever is longer. The guard alone put
-    // the next file's first PES inside the last one whenever a PES ran past
-    // 30 ms: AC-3 (32 ms), HE-AAC (42.7 / 46.4 ms), a muxer packing two or
-    // three frames per PES — overlapping AUs at every loop.
-    let es_carry = splice
-        .es_last
-        .iter()
-        .map(|(pid, max, _, step)| {
-            let video = splice.es_kinds.iter().any(|(p, v)| p == pid && *v);
-            let past = if video {
-                step.unwrap_or(3_600)
-            } else {
-                step.map_or(SPLICE_GUARD_TICKS_90K, |s| s.max(SPLICE_GUARD_TICKS_90K))
-            };
-            (*pid, *max, past)
-        })
-        .collect();
+    // The step each ES needs past its last timestamp (see `EsLast::carry`).
+    let es_carry = splice.es_last.iter().map(|e| (e.pid, e.max, e.carry())).collect();
     session.cont.close_ts_file(
         anchor_pts,
         ts_carry,
@@ -2123,6 +2106,76 @@ impl PrePcrClock {
     }
 }
 
+/// Steps between PES starts an audio PID remembers for its carry across a
+/// splice (see [`EsLast::carry`]).
+const AUDIO_PES_STEPS_KEPT: usize = 8;
+
+/// Longest step between an audio PID's PES starts that is taken as one PES
+/// (90 kHz): 700 ms, the longest MPEG-TS lets a PTS go unrepeated. A muxer
+/// packs audio PES far past a video frame's 100 ms: ffmpeg's mpegtsenc fills
+/// one to 2930 bytes or half its 0.7 s mux delay (350 ms) — ~183 ms of
+/// AAC-LC at 128 kbps, 104 ms of MP2 at 192 kbps — and broadcast muxers put
+/// seven AAC frames (149 ms) in one. A longer step is a gap in the file.
+const AUDIO_PES_STEP_MAX_90K: i64 = 63_000;
+
+/// One audio / video PID of a TS file (not the gated video): its highest and
+/// last output timestamp (DTS for video) and the steps between its PES
+/// starts — what the next file's first timestamp on it must move past.
+struct EsLast {
+    pid: u16,
+    video: bool,
+    max: u64,
+    last: u64,
+    /// Video: the last step within 5–100 ms (a frame). Audio: the last
+    /// [`AUDIO_PES_STEPS_KEPT`] steps within 5 ms –
+    /// [`AUDIO_PES_STEP_MAX_90K`].
+    steps: std::collections::VecDeque<u64>,
+}
+
+impl EsLast {
+    fn new(pid: u16, video: bool, ts: u64) -> Self {
+        let keep = if video { 1 } else { AUDIO_PES_STEPS_KEPT };
+        Self { pid, video, max: ts, last: ts, steps: std::collections::VecDeque::with_capacity(keep) }
+    }
+
+    /// The next PES start on this PID, at output timestamp `ts`.
+    fn observe(&mut self, ts: u64) {
+        let step = pts_diff_90k(ts, self.last);
+        let (longest, keep) =
+            if self.video { (9_000, 1) } else { (AUDIO_PES_STEP_MAX_90K, AUDIO_PES_STEPS_KEPT) };
+        if (450..=longest).contains(&step) {
+            if self.steps.len() == keep {
+                self.steps.pop_front();
+            }
+            self.steps.push_back(step as u64);
+        }
+        if pts_diff_90k(ts, self.max) > 0 {
+            self.max = ts;
+        }
+        self.last = ts;
+    }
+
+    /// How far past [`Self::max`] the next file's first timestamp on this
+    /// PID must land. Video: a frame (its last step, else 40 ms). Audio: the
+    /// longest of its recent PES steps — the last PES plays about that long,
+    /// and a muxer alternating two- and three-frame PES may end on the
+    /// longer — or the 30 ms splice guard, whichever is longer. The guard
+    /// alone put the next file's first PES inside the last one whenever a
+    /// PES ran past 30 ms: AC-3 (32 ms), HE-AAC (42.7 / 46.4 ms), any muxer
+    /// packing several frames per PES — overlapping AUs at every loop. Only
+    /// the last step, it still overlapped a final PES longer than the one
+    /// before it, and a PES past 100 ms (read as a video frame's bound)
+    /// counted for nothing.
+    fn carry(&self) -> u64 {
+        let longest = self.steps.iter().copied().max();
+        if self.video {
+            longest.unwrap_or(3_600)
+        } else {
+            longest.map_or(SPLICE_GUARD_TICKS_90K, |s| s.max(SPLICE_GUARD_TICKS_90K))
+        }
+    }
+}
+
 /// Per-file state of the `play_ts_file` splice path: everything one packet
 /// touches on its way out (file-start video gate → CC → PCR / PES offset →
 /// high-water marks → DI). Held packets (7a) take the same path.
@@ -2156,10 +2209,10 @@ struct TsFileSplice {
     /// next file for its filler PCRs.
     other_pcrs: Vec<(u16, u64)>,
     /// Every audio / video ES of every program (`true` = video), from all
-    /// the PMTs, and per such PID but the gated video: `(highest output
-    /// timestamp, last one, last step)` — DTS for video.
+    /// the PMTs, and per such PID but the gated video what the next file's
+    /// first timestamp on it must move past ([`EsLast`]).
     es_kinds: Vec<(u16, bool)>,
-    es_last: Vec<(u16, u64, u64, Option<u64>)>,
+    es_last: Vec<EsLast>,
     gate: VideoRapGate,
     /// Highest emitted video DTS (output domain) and the last DTS step —
     /// the next file's video term (7b).
@@ -2331,18 +2384,9 @@ impl TsFileSplice {
                         } else {
                             new_pts
                         };
-                        match self.es_last.iter_mut().find(|e| e.0 == pid) {
-                            Some(e) => {
-                                let step = pts_diff_90k(ts, e.2);
-                                if (450..=9_000).contains(&step) {
-                                    e.3 = Some(step as u64);
-                                }
-                                if pts_diff_90k(ts, e.1) > 0 {
-                                    e.1 = ts;
-                                }
-                                e.2 = ts;
-                            }
-                            None => self.es_last.push((pid, ts, ts, None)),
+                        match self.es_last.iter_mut().find(|e| e.pid == pid) {
+                            Some(e) => e.observe(ts),
+                            None => self.es_last.push(EsLast::new(pid, video, ts)),
                         }
                     }
                     if Some(pid) == self.gate.pid {
@@ -5789,8 +5833,8 @@ mod tests {
     struct MptsShape {
         /// Audio PES of program 1.
         p1_audio: u64,
-        /// Audio PES step of both programs (90 kHz).
-        audio_step_90k: u64,
+        /// Audio PES steps of both programs (90 kHz), repeated in turn.
+        audio_steps: &'static [u64],
         /// The anchor program's PMT carries ~200 bytes of ES descriptors,
         /// so it spans two packets.
         long_anchor_pmt: bool,
@@ -5798,12 +5842,13 @@ mod tests {
 
     impl Default for MptsShape {
         fn default() -> Self {
-            Self { p1_audio: 50, audio_step_90k: 1_800, long_anchor_pmt: false }
+            Self { p1_audio: 50, audio_steps: &[1_800], long_anchor_pmt: false }
         }
     }
 
     /// [`mpts_fixture`] reshaped: program 1's audio running `p1_audio` PES,
-    /// both programs' audio every `audio_step_90k`, the anchor PMT long.
+    /// both programs' audio PES `audio_steps` apart in turn, the anchor PMT
+    /// long.
     fn mpts_fixture_with(shape: MptsShape) -> Vec<u8> {
         use crate::engine::ts_test_fixtures::{packetize_sections, pat_packet, pes_start_packet, pmt_section};
         const T0: u64 = 10_000; // ms
@@ -5829,11 +5874,16 @@ mod tests {
                 let c = T0 + skew + t;
                 ev.push((t, 2 + o, crate::engine::ts_parse::pcr_only_packet(v, 0, c * 27_000, false)));
             }
-            // Program 2's audio covers the second whatever its step;
-            // program 1's runs its `p1_audio` PES at the same step.
-            let na = if o == 0 { 90_000 / shape.audio_step_90k } else { na };
-            for k in 0..na {
-                let off = k * shape.audio_step_90k;
+            // Program 2's audio: the PES that end within the second, whatever
+            // their steps; program 1's runs its `p1_audio` PES, the same steps.
+            let step = |i: usize| shape.audio_steps[i % shape.audio_steps.len()];
+            let pes = std::iter::successors(Some((0u64, 0usize)), |&(off, i)| Some((off + step(i), i + 1)));
+            let offsets: Vec<u64> = if o == 0 {
+                pes.take_while(|&(off, i)| off + step(i) <= 90_000).map(|(off, _)| off).collect()
+            } else {
+                pes.take(na as usize).map(|(off, _)| off).collect()
+            };
+            for off in offsets {
                 let t = off / 90;
                 ev.push((t, 3 + o, pes_start_packet(a, 0, 0xC0, (T0 + skew + 50) * 90 + off, None)));
             }
@@ -6019,7 +6069,7 @@ mod tests {
     /// its term sets the offset.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn looping_moves_each_audio_pid_past_its_last_pes_end() {
-        let shape = MptsShape { p1_audio: 27, audio_step_90k: 3_840, ..Default::default() };
+        let shape = MptsShape { p1_audio: 27, audio_steps: &[3_840], ..Default::default() };
         let got = loop_ts_twice("loop-mpts-he-aac.ts", &mpts_fixture_with(shape)).await;
         for pid in [0x101u16, 0x201] {
             let pts = pes_pts_of(&got, pid);
@@ -6036,6 +6086,52 @@ mod tests {
         let p1 = pes_pts_of(&got, 0x101);
         let gap = p1.windows(2).map(|w| w[1] - w[0]).max().unwrap();
         assert_eq!(gap, 3_840, "program 1 continues where its last PES ends");
+    }
+
+    /// Audio PES far longer than a video frame: ffmpeg's mpegtsenc fills an
+    /// audio PES to 2930 bytes (half its 0.7 s mux delay at most) — 183 ms of
+    /// AAC-LC at 128 kbps, 16 500 ticks. A step was only recorded within a
+    /// video frame's 5–100 ms, so this one counted for nothing and the next
+    /// file's first PES started 30 ms past the last one's start — 153 ms
+    /// inside it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn looping_moves_audio_past_a_pes_longer_than_100_ms() {
+        let shape = MptsShape { p1_audio: 6, audio_steps: &[16_500], ..Default::default() };
+        let got = loop_ts_twice("loop-mpts-long-pes.ts", &mpts_fixture_with(shape)).await;
+        for pid in [0x101u16, 0x201] {
+            let pts = pes_pts_of(&got, pid);
+            assert!(pts.len() >= 10, "0x{pid:x}: {} PES", pts.len());
+            for w in pts.windows(2) {
+                assert!(
+                    w[1] >= w[0] + 16_500,
+                    "0x{pid:x}: PES at {} ms starts inside the one at {} ms",
+                    w[1] / 90,
+                    w[0] / 90
+                );
+            }
+        }
+        let p1 = pes_pts_of(&got, 0x101);
+        let gap = p1.windows(2).map(|w| w[1] - w[0]).max().unwrap();
+        assert_eq!(gap, 16_500, "program 1 continues where its last PES ends");
+    }
+
+    /// A muxer alternating two- and three-frame PES (AAC-LC at 48 kHz: 3840
+    /// and 5760 ticks) whose file ends on a three-frame PES after a two-frame
+    /// one: the carry is the longest recent step, so the next file starts
+    /// where that last PES ends. Carried by the last step alone (the length
+    /// of the PES before it), the next file's first PES started a frame
+    /// inside it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn looping_moves_audio_past_a_last_pes_longer_than_the_one_before() {
+        let shape = MptsShape { p1_audio: 26, audio_steps: &[3_840, 5_760], ..Default::default() };
+        let got = loop_ts_twice("loop-mpts-mixed-pes.ts", &mpts_fixture_with(shape)).await;
+        let p1 = pes_pts_of(&got, 0x101);
+        assert_eq!(p1.len(), 52, "two loops of 26 PES");
+        // Each PES runs until the next one within a loop: 3840, 5760, ...
+        for (i, w) in p1.windows(2).enumerate().filter(|(i, _)| *i != 25) {
+            assert_eq!(w[1] - w[0], [3_840, 5_760][i % 26 % 2], "PES {i}");
+        }
+        assert_eq!(p1[26] - p1[25], 5_760, "loop 2 starts where the last (three-frame) PES ends");
     }
 
     /// Program 1's audio runs 100 ms longer than the anchor program's: the
