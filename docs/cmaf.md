@@ -180,7 +180,15 @@ timestamp while this track came 3 s, the audio of a switch to a video-only
 backup — moves the programme alone. The flow's offset used to stay where
 both tracks were last together, so after that video met a jump on its own,
 an output started then (a bitrate edit, a DVR proxy provisioned beside an
-existing main) published the same video hours off its sibling. A second
+existing main) published the same video hours off its sibling. A move is
+stamped with where the output is, the furthest of its tracks, and the flow
+takes the furthest move: stamped with the sample that made it, the audio
+bringing the programme back onto a main feed whose video leads by 1.1 s sat
+1.1 s behind the picture that had moved it onto a video-only backup, was
+taken for an older move, and the flow's offset stayed on the backup's clock
+— every output started afterwards published the main feed 15 h off its
+sibling (49 of 820 backup-and-back scenarios: leads −0.5 to 2 s, backups of
+2 to 10 s, the backup between 3 s and 3 s plus the lead; none now). A second
 track whose first timestamp the programme's offset does not put within 3 s
 of its sibling (audio stamped 60 s back, met by an output started inside
 that excursion) takes the offset that does, as its siblings did. A jump one

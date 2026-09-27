@@ -278,8 +278,8 @@ impl Default for Offsets {
 }
 
 impl Offsets {
-    /// An output's programme moved onto `off` with the sample at output
-    /// time `ts`.
+    /// An output's programme moved onto `off` with the furthest of its
+    /// tracks at output time `ts`.
     fn moved(&mut self, off: u64, ts: u64) {
         if self.current_at.is_none_or(|at| circ(ts, at) >= 0) {
             self.current = off;
@@ -575,7 +575,20 @@ impl CmafTimeline {
         let alone = other_offset.is_none() || other_quiet;
         if (alone || other_offset == Some(offset)) && self.programme != Some(offset) {
             if self.programme.is_some() {
-                lock(&self.offsets).moved(offset, ts);
+                // Stamped with where the output is — the furthest of its
+                // tracks — not with this timestamp: the tracks run apart by
+                // the source's video lead, so an audio sample moving the
+                // programme back onto the main feed sat 1.1 s behind the
+                // picture that had moved it onto a video-only backup, was
+                // taken for an older move, and the flow's offset stayed on
+                // the backup's clock for good: every output started after
+                // that published the main feed 15 h off its sibling.
+                let furthest = [me.newest, other.newest]
+                    .into_iter()
+                    .flatten()
+                    .reduce(|a, b| if circ(b, a) > 0 { b } else { a })
+                    .unwrap_or(ts);
+                lock(&self.offsets).moved(offset, furthest);
             }
             self.programme = Some(offset);
         }
@@ -1539,6 +1552,40 @@ mod tests {
         let mut tl = CmafTimeline::default();
         for (_, track, src) in ev {
             assert_eq!(tl.map(track, src), Mapped { ts: src, jump: None }, "{track:?} at {src}");
+        }
+    }
+
+    /// The main feed, its video 1.1 s ahead of its audio (the witness
+    /// encoder), switches to a video-only backup on another clock for 3.2 s
+    /// and back. Three seconds in, the backup's video moves the flow's
+    /// programme alone (the audio has gone quiet); when the main feed comes
+    /// back, the audio sample that brings the programme back onto the
+    /// source's clock sits 1.1 s behind the picture that stamped the move
+    /// onto the backup's. Compared sample for sample, it was taken for an
+    /// older move and the flow's offset stayed on the backup's clock: an
+    /// output started afterwards (a bitrate edit, a DVR proxy) published the
+    /// main feed 5e9 ticks off its sibling. A move is stamped with the
+    /// output's furthest track.
+    #[test]
+    fn an_output_started_after_the_main_feed_came_back_lands_on_its_siblings_timeline() {
+        let feeds = [
+            Feed { frames: 150, base: 900_000, lead: 99_000 },
+            Feed { frames: 80, base: 5_000_000_000, lead: 0 },
+            Feed { frames: 200, base: 900_000, lead: 99_000 },
+        ];
+        for (k, (demux, audio_first)) in [(false, true), (true, false)].into_iter().enumerate() {
+            let flow = format!("timeline-test-backup-return-{k}");
+            let mut a = CmafTimeline::for_flow(&flow);
+            let events = if demux { demuxed(&feeds, audio_first) } else { wire(&feeds, audio_first) };
+            // The backup carries no audio.
+            for (track, src, _) in events.into_iter().filter(|e| !(e.0 == Track::Audio && e.2 == 1)) {
+                a.map(track, src);
+            }
+            let mut c = CmafTimeline::for_flow(&flow);
+            let end = 900_000 + 430 * 3_600;
+            let (v, au) = (end + 99_000, end);
+            assert_eq!(a.map(Track::Video, v).ts, c.map(Track::Video, v).ts, "{k}: one video timeline");
+            assert_eq!(a.map(Track::Audio, au).ts, c.map(Track::Audio, au).ts, "{k}: one audio timeline");
         }
     }
 }
