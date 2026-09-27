@@ -1242,6 +1242,20 @@ mod tests {
     use std::time::Duration;
     use tokio::sync::broadcast;
 
+    /// The wire-emit thread bumps `packets_sent` only after `send_to`
+    /// returns, so a test that has already received every datagram can read
+    /// the counter one increment short. Wait (bounded) for it to settle.
+    async fn settled(counter: &std::sync::atomic::AtomicU64, want: u64) -> u64 {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let v = counter.load(Ordering::Relaxed);
+            if v >= want || tokio::time::Instant::now() >= deadline {
+                return v;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
     /// Build a minimal RTP/PCM packet with a 4-frame stereo L24 payload.
     fn rtp_pcm_packet(seq: u16, ts: u32, pt: u8) -> Vec<u8> {
         let mut p = Vec::new();
@@ -1365,8 +1379,8 @@ mod tests {
         }
         assert_eq!(received, packets);
         // Stats checks.
-        assert_eq!(flow_stats.input_packets.load(Ordering::Relaxed), 3);
-        assert_eq!(out_stats.packets_sent.load(Ordering::Relaxed), 3);
+        assert_eq!(settled(&flow_stats.input_packets, 3).await, 3);
+        assert_eq!(settled(&out_stats.packets_sent, 3).await, 3);
 
         cancel.cancel();
         let _ = tokio::time::timeout(Duration::from_secs(2), in_handle).await;
@@ -1510,7 +1524,7 @@ mod tests {
                 .expect("recv error");
             assert_eq!(r.0, 12 + 48 * 2 * 3, "transcoded packet has wrong size");
         }
-        assert_eq!(out_stats.packets_sent.load(Ordering::Relaxed), 3);
+        assert_eq!(settled(&out_stats.packets_sent, 3).await, 3);
 
         cancel.cancel();
         let _ = tokio::time::timeout(Duration::from_secs(2), in_handle).await;
@@ -1617,8 +1631,8 @@ mod tests {
             received.push(buf[..r.0].to_vec());
         }
         assert_eq!(received, packets);
-        assert_eq!(flow_stats.input_packets.load(Ordering::Relaxed), 2);
-        assert_eq!(out_stats.packets_sent.load(Ordering::Relaxed), 2);
+        assert_eq!(settled(&flow_stats.input_packets, 2).await, 2);
+        assert_eq!(settled(&out_stats.packets_sent, 2).await, 2);
 
         cancel.cancel();
         let _ = tokio::time::timeout(Duration::from_secs(2), in_handle).await;
