@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "aac-audio"
-version = "0.1.4"
+version = "0.2.0"
 dependencies = [
  "aac-codec",
  "libfdk-aac-sys",
@@ -12,7 +12,7 @@ dependencies = [
 
 [[package]]
 name = "aac-codec"
-version = "0.1.5"
+version = "0.2.0"
 dependencies = [
  "thiserror 2.0.21",
 ]
@@ -475,7 +475,7 @@ checksum = "2af50177e190e07a26ab74f8b1efbfe2ef87da2116221318cb1c2e82baf7de06"
 
 [[package]]
 name = "bilbycast-edge"
-version = "0.111.1"
+version = "0.112.0"
 dependencies = [
  "aac-audio",
  "aac-codec",
@@ -2448,7 +2448,7 @@ dependencies = [
 
 [[package]]
 name = "libfdk-aac-sys"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "bindgen 0.73.2",
  "cmake",
@@ -5350,14 +5350,14 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "video-codec"
-version = "0.10.3"
+version = "0.11.0"
 dependencies = [
  "thiserror 2.0.21",
 ]
 
 [[package]]
 name = "video-engine"
-version = "0.17.0"
+version = "0.18.0"
 dependencies = [
  "bytes",
  "libffmpeg-video-sys",
