@@ -35,11 +35,14 @@ const PCR_DISCONTINUITY_THRESHOLD: u64 = 27_000_000 / 10; // 2_700_000
 /// over: 500 ms, the step the muxer-mode rewriter bridges as a discontinuity
 /// (`ts_pts_rewriter::DISCONTINUITY_THRESHOLD_27MHZ`). A forward step
 /// between 100 ms and this is a discontinuity by TR 101 290's count but no
-/// break in the line — a 150 ms PCR cadence, a PCR per frame at 5 fps, a
-/// PCR packet lost on the way — and the unwrapped PCR runs straight across
-/// it. Restarted at every counted discontinuity, the window of a stream whose
-/// every step is over 100 ms never held `PCR_HISTORY_MIN` samples, and its
-/// PCR accuracy went unchecked however late its PCRs arrived.
+/// break in the line when the wall clock went as far — a 150 ms PCR cadence,
+/// a PCR per frame at 5 fps, a PCR packet lost on the way — and the
+/// unwrapped PCR runs straight across it. Restarted at every counted
+/// discontinuity, the window of a stream whose every step is over 100 ms
+/// never held `PCR_HISTORY_MIN` samples, and its PCR accuracy went unchecked
+/// however late its PCRs arrived. A step that runs ahead of the wall clock
+/// by more than `PCR_DISCONTINUITY_THRESHOLD` is a break all the same, and
+/// starts the window over (see [`pcr_window_breaks`]).
 const PCR_WINDOW_RESET_THRESHOLD: u64 = 27_000_000 / 2; // 13_500_000
 /// PCR_AC residual threshold in nanoseconds. The TR-101290 §5.2.2 PCR_AC
 /// spec is ±500 ns — but that's the encoder's deviation against an
@@ -428,9 +431,10 @@ fn process_ts_packet(
                     .window_pcr_discontinuity_errors
                     .fetch_add(1, Ordering::Relaxed);
                 // Nor does the regression window run across a step no line
-                // fits (see `PCR_WINDOW_RESET_THRESHOLD`): fitted over the
-                // jump, every residual was the jump.
-                if !(0..=PCR_WINDOW_RESET_THRESHOLD as i64).contains(&step) {
+                // fits (see `pcr_window_breaks`): fitted over the jump, every
+                // residual was the jump.
+                let wall = now.saturating_duration_since(prev.last_pcr_wall_time);
+                if pcr_window_breaks(step, wall) {
                     state.pcr_tracker.remove(&pid);
                 }
             }
@@ -560,6 +564,25 @@ fn process_ts_packet(
             state.pts_tracker.insert(pid, (pts_value, now));
             state.pts_errored.remove(&pid);
         }
+}
+
+/// Whether a PCR step past `PCR_DISCONTINUITY_THRESHOLD` (27 MHz ticks),
+/// `wall` after the PCR before it, breaks the accuracy regression's line.
+///
+/// It does when it goes backwards or past `PCR_WINDOW_RESET_THRESHOLD`, and
+/// when it runs ahead of the wall clock by more than
+/// `PCR_DISCONTINUITY_THRESHOLD`: a splice that moves the source's clock
+/// forward without a `discontinuity_indicator` — a switch from a path of
+/// one encoder to a shorter one, a splicer that leaves the flag off. Fitted
+/// straight into the window, a 300 ms splice on a 40 ms cadence counted 7
+/// PCR accuracy errors while old samples aged out, a PCR_AC fault the
+/// encoder did not have. A step the wall clock explains is kept — a 150 ms
+/// cadence, a lost PCR packet — and so is one it more than explains: a PCR
+/// arriving late is what the accuracy check exists to see.
+fn pcr_window_breaks(step: i64, wall: Duration) -> bool {
+    let wall_ticks = i64::try_from(wall.as_micros()).unwrap_or(i64::MAX).saturating_mul(27);
+    !(0..=PCR_WINDOW_RESET_THRESHOLD as i64).contains(&step)
+        || step.saturating_sub(wall_ticks) > PCR_DISCONTINUITY_THRESHOLD as i64
 }
 
 /// Compute |residual_ns| of a new (pcr_27mhz, wall_us) sample against the
@@ -1345,6 +1368,54 @@ mod tests {
         }
         assert_eq!(stats.pcr_discontinuity_errors.load(Ordering::Relaxed), 29);
         assert_eq!(stats.pcr_accuracy_errors.load(Ordering::Relaxed), 1, "the 2 s step is not fitted");
+    }
+
+    /// A forward PCR splice the source makes without a
+    /// `discontinuity_indicator` — its clock 150-450 ms further on in one
+    /// 40 ms PCR interval (a switch between paths of one encoder, a splicer
+    /// that leaves the flag off) — is one discontinuity and no accuracy
+    /// error: the window starts over. Fitted straight into the regression
+    /// because the step was under 500 ms, it counted up to 12 accuracy
+    /// errors while the old samples aged out: a PCR_AC fault the encoder
+    /// did not have.
+    #[test]
+    fn a_forward_pcr_splice_starts_the_accuracy_window_over() {
+        use crate::engine::ts_parse::pcr_only_packet;
+        for splice_ms in [110u64, 150, 300, 400, 450] {
+            let stats = Arc::new(Tr101290Accumulator::new());
+            let t0 = Instant::now();
+            let mut state = stats.state.lock().unwrap();
+            let ms = 27_000u64;
+            let mut pcr = 1_000_000u64;
+            for k in 0..60u64 {
+                if k == 30 {
+                    pcr += splice_ms * ms;
+                }
+                process_ts_packet(&pcr_only_packet(0x100, 0, pcr, false), t0 + Duration::from_millis(k * 40), &stats, &mut state);
+                pcr += 40 * ms;
+            }
+            assert_eq!(stats.pcr_discontinuity_errors.load(Ordering::Relaxed), 1, "{splice_ms} ms: the splice");
+            assert_eq!(stats.pcr_accuracy_errors.load(Ordering::Relaxed), 0, "{splice_ms} ms: not fitted");
+        }
+    }
+
+    /// Which steps break the regression's line: backwards, past 500 ms, or
+    /// ahead of the wall clock by over 100 ms. A step the wall clock
+    /// explains — a 150 ms cadence, a lost PCR packet — or more than
+    /// explains (a PCR arriving late, the very thing the check measures) is
+    /// fitted.
+    #[test]
+    fn a_pcr_step_breaks_the_window_when_the_wall_clock_does_not_explain_it() {
+        let ms = |n: i64| n * 27_000;
+        let wall = Duration::from_millis;
+        assert!(pcr_window_breaks(ms(-150), wall(40)), "backwards");
+        assert!(pcr_window_breaks(ms(600), wall(600)), "past 500 ms");
+        assert!(pcr_window_breaks(ms(340), wall(40)), "a 300 ms splice");
+        assert!(!pcr_window_breaks(ms(150), wall(150)), "a 150 ms cadence");
+        assert!(!pcr_window_breaks(ms(160), wall(80)), "a lost PCR packet and some jitter");
+        assert!(!pcr_window_breaks(ms(150), wall(300)), "a PCR 150 ms late");
+        assert!(!pcr_window_breaks(ms(140), wall(40)), "100 ms ahead of the wall clock");
+        assert!(pcr_window_breaks(ms(141), wall(40)), "over 100 ms ahead of it");
     }
 
     #[test]

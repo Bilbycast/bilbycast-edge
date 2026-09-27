@@ -245,12 +245,19 @@ master's wrap stopped PSI_RR injection until the source's own PSI came by.
 The same modular step now paces `wire_emit` (a wrap reset its pacing anchor
 to now, and dropped the interval its next datagrams interpolate across),
 judges TR 101 290's PCR discontinuity (a wrap counted one; its accuracy
-regression now runs on the unwrapped PCR, and restarts across a step back or
-one past 500 ms rather than fitting a line through it — not across every
-counted discontinuity: a stream whose PCRs come more than 100 ms apart, a
-150 ms cadence or a PCR per frame at 5 fps, counts each step and still has
-its accuracy checked, where restarting at each left it never checked at
-all), and the same per ES of a PID-bus flow (`ts_es_analysis`, which
+regression now runs on the unwrapped PCR, and restarts across a step back,
+one past 500 ms, or one that runs more than 100 ms ahead of the wall clock
+since the PCR before, rather than fitting a line through it — a forward
+splice the source makes without a `discontinuity_indicator`, a switch to a
+shorter path from one encoder or a splicer that leaves the flag off: fitted,
+a 300 ms splice on a 40 ms cadence counted 7 PCR accuracy errors while the
+old samples aged out, a PCR_AC fault the encoder did not have. It does not
+restart across every counted discontinuity: a stream whose PCRs come more
+than 100 ms apart, a 150 ms cadence or a PCR per frame at 5 fps, counts each
+step and still has its accuracy checked, where restarting at each left it
+never checked at all; and a PCR arriving late is fitted however far behind
+the wall clock it is, since that lateness is what the check measures), and
+the same per ES of a PID-bus flow (`ts_es_analysis`, which
 counted one per ES at every wrap while the flow-level count did not), paces
 the media player's TS deadlines (a wrap re-epoched its pacer at "now") and
 measures its head bitrate. The local display takes its 5 s PTS-jump test on
@@ -264,6 +271,8 @@ discontinuity. Pinned by `a_source_clock_wrap_is_no_discontinuity`,
 `a_pcr_wrap_keeps_the_pacing_anchor`,
 `a_pcr_wrap_is_no_discontinuity_and_keeps_the_accuracy_check`,
 `a_pcr_cadence_over_100_ms_keeps_the_accuracy_check`,
+`a_forward_pcr_splice_starts_the_accuracy_window_over`,
+`a_pcr_step_breaks_the_window_when_the_wall_clock_does_not_explain_it`,
 `the_pcr_wrap_is_no_es_discontinuity`, `the_pts_wrap_is_no_jump`,
 `the_pcr_wrap_paces_straight_on` and
 `the_head_bitrate_is_measured_across_the_pcr_wrap`.
