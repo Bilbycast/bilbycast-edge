@@ -20,12 +20,14 @@
 //! published exactly as before). A timestamp is taken as it is when it is
 //! continuous with its own track — within [`OWN_WINDOW_90K`] of the newest
 //! one the track has had — or sits within [`CROSS_WINDOW_90K`] of the other
-//! track's newest (a track that paused and came back on the programme's
-//! clock is a gap, and stays one, in sync). Otherwise the offsets already in
-//! use are tried — the other track may have met the same jump first, or the
-//! source may be coming back from a short excursion — and only when none
-//! makes it continuous does a new offset place it one step (the track's
-//! smallest recent step) after the track's newest timestamp.
+//! track's newest where the offsets and the other track allow it (below; a
+//! track that paused while the other ran on and came back on the
+//! programme's clock is a gap, and stays one, in sync). Otherwise the
+//! offsets already in use are tried — the other track may have met the same
+//! jump first, or the source may be coming back from a short excursion —
+//! and only when none makes it continuous does a new offset place it one
+//! step (the track's smallest recent step) after the track's newest
+//! timestamp.
 //!
 //! Sharing offsets keeps audio and video together across a jump: a source
 //! that moves to another clock moves both tracks by the same amount, and the
@@ -49,33 +51,59 @@
 //! meets first is taken up by the others as theirs. One track's excursion
 //! moves no programme: an output started while a sibling's audio sat 60 s
 //! back used to take that audio's offset for its first picture and publish
-//! the video 60 s off its sibling. A second track whose first timestamp the
-//! programme's offset does not put near the first track's (audio stamped
-//! 60 s back, met by an output started inside the excursion) takes the
-//! offset that does, as its siblings did.
+//! the video 60 s off its sibling. A track whose sibling has gone quiet —
+//! no timestamp while this one came a cross window, the audio of a switch
+//! to a video-only backup — moves the programme alone: the flow's offset
+//! used to stay where both tracks last were, so an output started after the
+//! video met a jump on its own published it hours off its sibling. A second
+//! track whose first timestamp the programme's offset does not put near the
+//! first track's (audio stamped 60 s back, met by an output started inside
+//! the excursion) takes the offset that does, as its siblings did.
 //!
 //! **The cross window is directed.** A track may step back within
 //! [`OWN_WINDOW_90K`] of its newest timestamp and keep its offset: that is a
 //! B-frame source's presentation order (the video is mapped by PTS, in
 //! decode order), and on audio an overlap the output drops
-//! (`buffer_audio_frames`), keeping the A/V relation. Past its own window a
-//! track on its programme's offset takes the cross window only forwards — a
-//! track that paused and came back. A track on an offset of its own (a jump
-//! it met first, an excursion) takes it only onto the offset the other
-//! track is on, in either direction: audio stamped 60 s back comes back to
-//! the video's clock behind the audio just published, and one picture
-//! stamped 2 s back comes back with the next picture, where it used to stay
-//! on the offset it opened, 2 s ahead of the audio for good. "Its own" is a
-//! matter of offsets, not of which output opened one: a sibling output that
-//! found an excursion's offset rather than opening it comes back from it
-//! the same way (it used to open a bogus offset of its own, its audio 1 s
-//! off its sibling's). A track on the other's offset that steps back further
-//! than its own window is a source jump: both tracks of a switch to a feed
-//! 1.5 s behind, a 2 s clip looping from its start, used to pass as "within
-//! 3 s of the other track" and publish 1.5 s backwards; the first track to
-//! see one now opens an offset and the other takes it. A track goes on from
-//! where a move lands it, so a return well past its own window is measured
-//! from the return, not from the excursion's newest.
+//! (`buffer_audio_frames`), keeping the A/V relation. Past its own window:
+//!
+//! - Onto the offset the other track is on, from another — the other met
+//!   this jump first, or this track is coming back from an excursion — a
+//!   track may step forwards (a gap in it), and the audio backwards too:
+//!   audio stamped 60 s back comes back to the video's clock behind the
+//!   audio just published. The other track's offset is tried before a step
+//!   of the track's own: of both tracks jumping 2 s forward with the video
+//!   ahead in the mux, the video's step past the cross window opened an
+//!   offset and the audio's own step, still near the video, used to keep
+//!   its gap — A/V 2 s apart for good. "Its own" is a matter of offsets, not
+//!   of which output opened one: a sibling output that found an excursion's
+//!   offset comes back from it the same way.
+//! - The video never steps back past its own window: nothing drops a
+//!   picture, and one behind a picture already published is a zero-length
+//!   sample and an overlapping `tfdt`. An input switch the audio met first,
+//!   from a feed whose video ran 1.1 s ahead of its audio to a level one,
+//!   stepped the video back 1.04 s onto the audio's new offset. The video
+//!   takes a new offset instead, and with both tracks off the programme on
+//!   different offsets, the one behind joins the other: the new feed is
+//!   published in its own A/V relation.
+//! - On the programme's offset, a step forwards within the cross window is a
+//!   gap when the other track ran through it (a pause of this track) or
+//!   leapt too (a jump both meet). Otherwise it is in doubt (`Doubt`): one
+//!   picture or half a second of audio stamped 2 s ahead, and a jump of the
+//!   source's that the other track has yet to meet, look alike until the
+//!   track's next timestamps. The video places the picture one step on, and
+//!   goes on with the gap only when its next picture lands on as that one
+//!   did; the audio takes the gap, and steps back to where it was when the
+//!   source does, in its old relation to the video. A stray timestamp 2 s
+//!   ahead used to be taken as a gap, and its track published 2 s off the
+//!   other for good.
+//! - A track on the other's offset that steps back further than its own
+//!   window is a source jump: both tracks of a switch to a feed 1.5 s
+//!   behind, a 2 s clip looping from its start, used to pass as "within 3 s
+//!   of the other track" and publish 1.5 s backwards; the first track to see
+//!   one now opens an offset and the other track takes it.
+//!
+//! A track goes on from where a move lands it, so a return well past its
+//! own window is measured from the return, not from the excursion's newest.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, Weak};
@@ -130,6 +158,54 @@ struct Line {
     /// Recent positive steps between source timestamps.
     steps: [u64; STEP_HISTORY],
     n_steps: usize,
+    /// The furthest output timestamp the track has reached, and how far
+    /// (90 kHz) it has come in all: its progress, which audio stepping back
+    /// over audio it already sent does not count twice.
+    reach: Option<u64>,
+    advance: u64,
+    /// The other track's `advance` when this track last had a timestamp: how
+    /// far the other has come since is what a step of this track's past its
+    /// own window is measured against (a pause the other ran through), and
+    /// how far this track has come since the other last had one says whether
+    /// the other has gone quiet.
+    other_at_last: u64,
+    /// How many times the source has stepped this track forward further than
+    /// any frame, and the other track's count when this one last had a
+    /// timestamp: the other leaping meanwhile shows a step of this track's
+    /// past its own window to be a jump of the source's, which both meet.
+    leaps: u64,
+    other_leaps: u64,
+    /// A step past this track's own window that nothing yet shows to be the
+    /// source's (see [`Doubt`]).
+    doubt: Option<Doubt>,
+}
+
+/// A step of one track forward past its own window, on the programme's
+/// offset and near the other track, that the other track neither ran
+/// through (as it would a pause of this one) nor met (it has not leapt).
+/// It is a jump of the source's that the other track is about to meet — an
+/// outage of both, a switch to a feed on the same clock with another video
+/// lead — or a stray timestamp — one picture, or half a second of audio,
+/// stamped 2 s ahead — and only the track's next timestamps tell which.
+/// Taken as a jump the first leaves the track off the other by as much as
+/// the tracks' steps differ; taken as a gap the second leaves it 2 s ahead
+/// of the other for good, as it used to.
+///
+/// The video, which cannot step back, places the picture one step on (an
+/// offset of its own) and goes on to the programme's offset with the gap only
+/// when its next picture lands on as the first did, with the audio still
+/// there; a single picture stamped ahead is then passed without a trace. The
+/// audio, whose overlap the output drops (`buffer_audio_frames`), takes the
+/// gap, and steps back to where it was when the source comes back in the
+/// relation to the video it had before.
+#[derive(Debug, Clone, Copy)]
+struct Doubt {
+    /// The offset the step was on, and where on it the timestamp landed.
+    offset: u64,
+    landed: u64,
+    /// The track's newest less the other's before the step: the relation a
+    /// return of the audio finds again.
+    relation: i64,
 }
 
 impl Line {
@@ -148,6 +224,19 @@ impl Line {
     /// PES of audio), else `default`.
     fn step(&self, default: u64) -> u64 {
         self.steps[..self.n_steps.min(STEP_HISTORY)].iter().copied().min().unwrap_or(default)
+    }
+
+    /// The track's output reached `ts`: its progress goes on by however far
+    /// that is past anything it reached before.
+    fn reached(&mut self, ts: u64) {
+        match self.reach {
+            Some(r) if circ(ts, r) <= 0 => {}
+            Some(r) => {
+                self.advance = self.advance.saturating_add(circ(ts, r) as u64);
+                self.reach = Some(ts);
+            }
+            None => self.reach = Some(ts),
+        }
     }
 }
 
@@ -252,13 +341,23 @@ impl CmafTimeline {
     /// Map a source timestamp (90 kHz) of `track` onto the output timeline.
     pub fn map(&mut self, track: Track, src: u64) -> Mapped {
         let src = src & MASK_33;
+        let programme = self.programme;
         let (me, other) = match track {
-            Track::Video => (&mut self.video, &self.audio),
-            Track::Audio => (&mut self.audio, &self.video),
+            Track::Video => (&mut self.video, &mut self.audio),
+            Track::Audio => (&mut self.audio, &mut self.video),
         };
+        let leapt = me.last_src.is_some_and(|prev| circ(src, prev) > MAX_STEP_90K as i64);
+        let other_leapt = other.leaps > me.other_leaps;
         me.note_step(src);
-        let near_other =
-            |ts: u64| other.newest.is_some_and(|o| circ(ts, o).abs() <= CROSS_WINDOW_90K);
+        // How far the other track has come since this one last had a
+        // timestamp; and whether it has gone quiet — this track has come a
+        // cross window since the other last had one (the audio of a switch
+        // to a video-only backup).
+        let other_ran = other.advance.saturating_sub(me.other_at_last);
+        let other_quiet = other.newest.is_some()
+            && me.advance.saturating_sub(other.other_at_last) > CROSS_WINDOW_90K as u64;
+        let other_newest = other.newest;
+        let near_other = |ts: u64| other_newest.is_some_and(|o| circ(ts, o).abs() <= CROSS_WINDOW_90K);
         let Some(newest) = me.newest else {
             // A track's first timestamp takes the offset its programme is
             // on — the other track's, or on this output's first timestamp
@@ -267,8 +366,8 @@ impl CmafTimeline {
             // put it on the other track's clock it is on an excursion of
             // its own (audio stamped 60 s back, met by an output started
             // inside it), which another output may be on already.
-            me.offset = match self.programme {
-                Some(p) if other.newest.is_some() && !near_other((src + p) & MASK_33) => {
+            me.offset = match programme {
+                Some(p) if other_newest.is_some() && !near_other((src + p) & MASK_33) => {
                     let offsets = lock(&self.offsets);
                     let near = |off: &u64| near_other((src + off) & MASK_33);
                     offsets.list.iter().rev().copied().find(near).unwrap_or(p)
@@ -278,51 +377,146 @@ impl CmafTimeline {
             };
             let ts = (src + me.offset) & MASK_33;
             me.newest = Some(ts);
-            if other.newest.is_none() || me.offset == other.offset {
+            me.reached(ts);
+            me.other_at_last = other.advance;
+            me.other_leaps = other.leaps;
+            if other_newest.is_none() || me.offset == other.offset {
                 self.programme = Some(me.offset);
             }
             return Mapped { ts, jump: None };
         };
         let own_offset = me.offset;
-        let other_offset = other.newest.map(|_| other.offset);
-        // On an offset the programme is not on: a jump this track met first,
-        // or an excursion of its own.
-        let on_excursion = self.programme.is_some_and(|p| p != own_offset);
-        let continuous = |off: u64| -> Option<u64> {
+        let other_offset = other_newest.map(|_| other.offset);
+        // The other track's offset, unless it is there only in doubt (a
+        // picture placed one step on until its step shows real).
+        let other_settled = other_offset.filter(|_| other.doubt.is_none());
+        let on_programme = programme == Some(own_offset);
+        let doubt = me.doubt.take();
+        let in_own = |own: i64| (-OWN_WINDOW_90K..=OWN_WINDOW_90K).contains(&own);
+        // Past its own window, onto the offset the other track is on, from
+        // another: the other met this jump first, or this track is coming
+        // back from an excursion. Forwards, a gap in this track. Backwards
+        // only the audio — audio stamped 60 s back returning behind the
+        // audio just published, an overlap the output drops
+        // (`buffer_audio_frames`). Nothing drops a picture: behind one
+        // already published it is a zero-length sample and an overlapping
+        // `tfdt`, so the video takes a new offset instead.
+        let joins = |off: u64, ts: u64, own: i64| {
+            near_other(ts)
+                && other_offset == Some(off)
+                && other_offset != Some(own_offset)
+                && (own > 0 || track == Track::Audio)
+        };
+        let fits = |off: u64| -> Option<u64> {
             let ts = (src + off) & MASK_33;
             let own = circ(ts, newest);
-            if (-OWN_WINDOW_90K..=OWN_WINDOW_90K).contains(&own) {
-                return Some(ts);
-            }
-            let onto_other = other_offset == Some(off);
-            // The cross window: onto the other track's clock. Forwards, a
-            // track that paused and came back — onto any offset from the
-            // programme's, only onto the other track's from an excursion
-            // (an offset one picture 2 s back opened would take the video's
-            // return 2 s ahead of the audio for good). Backwards, only back
-            // onto the other track's offset from another: audio stamped
-            // 60 s back returning behind the audio just published. A track
-            // on the other's offset stepping back past its own window is a
-            // jump — both tracks of a switch to a feed 1.5 s behind.
-            let cross_ok = near_other(ts)
-                && if own > 0 {
-                    onto_other || !on_excursion
-                } else {
-                    onto_other && Some(own_offset) != other_offset
-                };
-            cross_ok.then_some(ts)
+            (in_own(own) || joins(off, ts, own)).then_some(ts)
         };
-        let (offset, ts, jump) = match continuous(own_offset) {
-            Some(ts) => (own_offset, ts, None),
+        // Among the offsets in use, also forwards from the programme's onto
+        // one neither track is on: the source back on a clock it left, with
+        // a gap.
+        let fits_listed = |off: u64| -> Option<u64> {
+            let ts = (src + off) & MASK_33;
+            let own = circ(ts, newest);
+            fits(off).or((own > 0 && on_programme && near_other(ts)).then_some(ts))
+        };
+        let mut new_doubt = None;
+        let mut placing_in_doubt = false;
+        let mut returned = false;
+        let chosen: Option<(u64, u64)> = 'choose: {
+            match doubt {
+                // The picture after one placed in doubt: landing on as that
+                // one did, with the audio still on the offset, the step was
+                // the source's, and the video goes on there with the gap.
+                Some(d) if track == Track::Video => {
+                    let ts = (src + d.offset) & MASK_33;
+                    let from_landed = circ(ts, d.landed).abs();
+                    if other_offset == Some(d.offset)
+                        && from_landed <= OWN_WINDOW_90K
+                        && circ(ts, newest) > 0
+                    {
+                        break 'choose Some((d.offset, ts));
+                    }
+                }
+                // The audio after a step taken in doubt: the source back
+                // where the audio was, and in the relation to the video it
+                // had then, the audio steps back there. A switch back to
+                // where the audio was is no return when the video meets it
+                // too: the video, which cannot step back with it, moved on.
+                Some(d) if track == Track::Audio && d.offset == own_offset => {
+                    let ts = (src + own_offset) & MASK_33;
+                    let related =
+                        other_newest.is_some_and(|o| (circ(ts, o) - d.relation).abs() <= OWN_WINDOW_90K);
+                    if circ(ts, newest) < -OWN_WINDOW_90K && related {
+                        returned = true;
+                        break 'choose Some((own_offset, ts));
+                    }
+                    new_doubt = Some(d);
+                }
+                _ => {}
+            }
+            // Both tracks off the programme, on different offsets: they met
+            // one jump and came out of it apart — the audio met an input
+            // switch first and opened an offset the video could only have
+            // taken by stepping back, so the video opened its own. The track
+            // behind joins the other (a gap in it), and the programme forms
+            // again on one offset, in the new feed's A/V relation.
+            if let (Some(p), Some(o)) = (programme, other_settled)
+                && !other_quiet
+                && o != own_offset
+                && o != p
+                && own_offset != p
+                && let Some(ts) = fits(o)
+            {
+                break 'choose Some((o, ts));
+            }
+            let ts = (src + own_offset) & MASK_33;
+            let own = circ(ts, newest);
+            if in_own(own) {
+                break 'choose Some((own_offset, ts));
+            }
+            // The other track may have met this jump first: onto its offset
+            // before any step of this track's own past its window. With the
+            // video ahead of the audio in the mux, both tracks jumping
+            // forward 2 s put the video on a new offset, and the audio's own
+            // step, 2 s but near the video, used to keep its gap: A/V apart
+            // by the jump for good.
+            if let Some(o) = other_settled.filter(|o| *o != own_offset)
+                && let Some(ts) = fits(o)
+            {
+                break 'choose Some((o, ts));
+            }
+            // Forwards past its own window on the programme's offset: a pause
+            // of this track that the other ran through, or a jump the other
+            // met too, is a gap. Anything else is in doubt (see `Doubt`).
+            if own > OWN_WINDOW_90K && on_programme && near_other(ts) {
+                let ran = i64::try_from(other_ran).unwrap_or(i64::MAX).saturating_add(OWN_WINDOW_90K);
+                if other_leapt || own <= ran {
+                    break 'choose Some((own_offset, ts));
+                }
+                let relation = other_newest.map_or(0, |o| circ(newest, o));
+                new_doubt = Some(Doubt { offset: own_offset, landed: ts, relation });
+                if track == Track::Audio {
+                    break 'choose Some((own_offset, ts));
+                }
+                placing_in_doubt = true;
+            }
+            fits(own_offset).map(|ts| (own_offset, ts))
+        };
+        let (offset, ts, jump) = match chosen {
+            Some((off, ts)) => (off, ts, None),
             None => {
                 let mut offsets = lock(&self.offsets);
+                // Not for a picture placed in doubt: its step is forward on
+                // the programme's clock, and an old offset that happens to
+                // take it would put it back on a clock the source has left.
                 let found = offsets
                     .list
                     .iter()
                     .rev()
                     .copied()
-                    .filter(|o| *o != own_offset)
-                    .find_map(|off| continuous(off).map(|ts| (off, ts)));
+                    .filter(|o| *o != own_offset && !placing_in_doubt)
+                    .find_map(|off| fits_listed(off).map(|ts| (off, ts)));
                 match found {
                     Some((off, ts)) => (off, ts, None),
                     None => {
@@ -343,22 +537,35 @@ impl CmafTimeline {
             }
         };
         // A track that stepped back through the cross window (a return from
-        // an excursion) goes on from where it landed: the samples after it
-        // are measured from there, not from the excursion's newest — a
-        // return more than a frame past its own window used to open an
-        // offset of its own one sample later. The overlap is the output's to
-        // drop (`buffer_audio_frames`). Any other step back keeps the newest,
-        // so an offset opened later still continues past everything out.
+        // an excursion, or from a step taken in doubt) goes on from where it
+        // landed: the samples after it are measured from there, not from the
+        // excursion's newest — a return more than a frame past its own
+        // window used to open an offset of its own one sample later. The
+        // overlap is the output's to drop (`buffer_audio_frames`). Any other
+        // step back keeps the newest, so an offset opened later still
+        // continues past everything out.
         let own = circ(ts, newest);
-        if own > 0 || (offset != own_offset && own < -OWN_WINDOW_90K) {
+        if own > 0 || (offset != own_offset && own < -OWN_WINDOW_90K) || returned {
             me.newest = Some(ts);
         }
+        me.reached(ts);
         me.offset = offset;
-        // The programme moves when both tracks are on one offset (or the
-        // only track moves), and the flow's with it: a track on an excursion
-        // of its own moves neither, so an output started meanwhile does not
-        // take the excursion for its programme.
-        if (other_offset.is_none() || other_offset == Some(offset)) && self.programme != Some(offset) {
+        me.other_at_last = other.advance;
+        me.leaps += u64::from(leapt);
+        me.other_leaps = other.leaps;
+        // A doubt lasts while its track stays where it was taken: the
+        // video's for its next picture, the audio's while it is on the
+        // step's offset.
+        me.doubt = new_doubt.filter(|d| track == Track::Video || d.offset == offset);
+        // The programme moves when both tracks are on one offset, or the
+        // track moves with no other beside it — the output has only this
+        // one, or the other has gone quiet — and the flow's with it. A track
+        // on an excursion of its own moves neither, so an output started
+        // meanwhile does not take the excursion for its programme; but an
+        // output whose audio has stopped follows its video onto a new feed,
+        // or an output started then would publish the video on the old one.
+        let alone = other_offset.is_none() || other_quiet;
+        if (alone || other_offset == Some(offset)) && self.programme != Some(offset) {
             if self.programme.is_some() {
                 lock(&self.offsets).moved(offset, ts);
             }
@@ -866,5 +1073,393 @@ mod tests {
         v += 3_600;
         assert_eq!(tl.map(Track::Video, v).ts, v, "the video back");
         assert_eq!(tl.map(Track::Audio, a + 1_800).ts, a + 1_800);
+    }
+
+    /// A feed on the wire: `frames` pictures at 25 fps and the audio beside
+    /// them in 1 920-tick frames, stamped `base` plus the arrival time, the
+    /// video `lead` ticks ahead of the audio in the mux.
+    #[derive(Clone, Copy)]
+    struct Feed {
+        frames: u64,
+        base: i64,
+        lead: i64,
+    }
+
+    /// Every timestamp of `feeds`, one feed after another, as it arrives —
+    /// the audio first at a tie when `audio_first` — with its feed.
+    fn wire(feeds: &[Feed], audio_first: bool) -> Vec<(Track, u64, usize)> {
+        let mut ev = Vec::new();
+        let mut t0 = 0i64;
+        for (i, f) in feeds.iter().enumerate() {
+            let len = f.frames as i64 * 3_600;
+            for t in (0..len).step_by(3_600) {
+                ev.push((t0 + t, Track::Video, (f.base + t0 + t + f.lead) as u64 & MASK_33, i));
+            }
+            for t in (0..len).step_by(1_920) {
+                ev.push((t0 + t, Track::Audio, (f.base + t0 + t) as u64 & MASK_33, i));
+            }
+            t0 += len;
+        }
+        ev.sort_by_key(|&(t, track, _, _)| (t, (track == Track::Video) == audio_first));
+        ev.into_iter().map(|(_, track, src, feed)| (track, src, feed)).collect()
+    }
+
+    /// `wire` through a timeline: (track, source, output, feed).
+    fn play(tl: &mut CmafTimeline, feeds: &[Feed], audio_first: bool) -> Vec<(Track, u64, u64, usize)> {
+        wire(feeds, audio_first)
+            .into_iter()
+            .map(|(track, src, feed)| (track, src, tl.map(track, src).ts, feed))
+            .collect()
+    }
+
+    /// Every picture after the one before it.
+    fn video_forward(out: &[(Track, u64, u64, usize)]) -> bool {
+        let v: Vec<u64> = out.iter().filter(|o| o.0 == Track::Video).map(|o| o.2).collect();
+        v.windows(2).all(|w| circ(w[1], w[0]) > 0)
+    }
+
+    /// The last picture's and the last audio's offsets from their source
+    /// (equal: the last feed's A/V relation is published as it came).
+    fn last_offsets(out: &[(Track, u64, u64, usize)]) -> (i64, i64) {
+        let last = |track| out.iter().rev().find(|o| o.0 == track).map(|o| circ(o.2, o.1)).unwrap();
+        (last(Track::Video), last(Track::Audio))
+    }
+
+    /// An input switch the audio meets first, from a feed whose video runs
+    /// 1.1 s ahead of its audio in the mux (the witness encoder) to one on
+    /// another clock whose tracks are level. The audio opens an offset
+    /// continuing its track; on it the video would land 1.04 s behind the
+    /// picture before, and it used to take it — the published video stepping
+    /// back 1.04 s, a zero-length sample and an overlapping `tfdt`, with
+    /// nothing to drop the overlap as the audio's is. The video continues
+    /// its own track instead, and the audio, behind, joins it: the new feed
+    /// is published in its own A/V relation. (A lead under 1 s lands the
+    /// video within its own window, where a step back cannot be told from
+    /// B-frame reordering, and is taken as before.)
+    #[test]
+    fn a_switch_the_audio_meets_first_never_steps_the_video_back() {
+        for lead in [99_000i64, 180_000] {
+            let mut tl = CmafTimeline::default();
+            let feeds = [
+                Feed { frames: 150, base: 900_000, lead },
+                Feed { frames: 200, base: 5_000_000_000, lead: 0 },
+            ];
+            let out = play(&mut tl, &feeds, true);
+            assert!(video_forward(&out), "{lead}: the video never steps back");
+            let (v, a) = last_offsets(&out);
+            assert_eq!(v, a, "{lead}: the new feed's A/V relation");
+        }
+    }
+
+    /// An output whose audio stopped (a switch to a video-only backup) and
+    /// whose video then met a jump on its own: once the audio has been quiet
+    /// a cross window, the programme — and the flow's offset — follow the
+    /// video. They used to stay on the old offset for good, so an output
+    /// started then (a bitrate edit, a DVR proxy provisioned beside a main)
+    /// published the same video 5 h off its sibling.
+    #[test]
+    fn an_output_started_after_its_siblings_audio_stopped_lands_on_its_video() {
+        let flow = "timeline-test-quiet-audio";
+        let mut a = CmafTimeline::for_flow(flow);
+        let (mut v, mut aud) = (900_000u64, 896_000u64);
+        for _ in 0..100 {
+            a.map(Track::Video, v);
+            a.map(Track::Audio, aud);
+            a.map(Track::Audio, aud + 1_800);
+            v += 3_600;
+            aud += 3_600;
+        }
+        let mut v2 = v + 5 * 3_600 * 90_000;
+        for _ in 0..200 {
+            a.map(Track::Video, v2);
+            v2 += 3_600;
+        }
+        let mut c = CmafTimeline::for_flow(flow);
+        assert_eq!(a.map(Track::Video, v2).ts, c.map(Track::Video, v2).ts, "one video timeline");
+    }
+
+    /// A single picture stamped 2 s ahead (a PES on the wrong clock; the
+    /// ingress rewriter maps PES timestamps as they come) is placed one step
+    /// on, and the video goes on on the programme's clock with the next
+    /// picture. It used to be taken as a gap, and the next picture, 1.96 s
+    /// behind it and on the audio's offset, opened another: the video
+    /// published 2 s off the audio for good.
+    #[test]
+    fn a_single_picture_two_seconds_ahead_leaves_the_video_on_the_programmes_clock() {
+        let mut tl = CmafTimeline::default();
+        let mut vo = Vec::new();
+        for k in 0..120u64 {
+            let (v, a) = av(k);
+            let m = tl.map(Track::Video, if k == 50 { v + 180_000 } else { v });
+            vo.push(m.ts);
+            if k != 50 {
+                assert_eq!(m.ts, v, "picture {k} on the source's clock");
+            }
+            for a in a {
+                assert_eq!(tl.map(Track::Audio, a).ts, a, "audio at {k} untouched");
+            }
+        }
+        assert!(vo.windows(2).all(|w| circ(w[1], w[0]) > 0), "the video never steps back");
+    }
+
+    /// Half a second of audio stamped 2 s ahead: the audio takes the step
+    /// and steps back to the video's clock when the source does (the
+    /// overlap is the output's to drop), where it used to stay 2 s ahead of
+    /// the video for good.
+    #[test]
+    fn half_a_second_of_audio_two_seconds_ahead_comes_back_to_the_programmes_clock() {
+        let mut tl = CmafTimeline::default();
+        for k in 0..120u64 {
+            let (v, a) = av(k);
+            assert_eq!(tl.map(Track::Video, v).ts, v, "video at {k} untouched");
+            for a in a {
+                let m = tl.map(Track::Audio, if (50..63).contains(&k) { a + 180_000 } else { a });
+                if k >= 63 {
+                    assert_eq!(m.ts, a, "audio at {k} back on the source's clock");
+                }
+            }
+        }
+    }
+
+    /// Both tracks jumping forward (an outage losing 2–4 s of both, or a
+    /// switch to a feed that far ahead) with the video ahead of the audio in
+    /// the mux: the video meets it first and, past the cross window, opens
+    /// an offset; the audio takes that offset. Its own step, still within
+    /// 3 s of the video, used to be taken as a gap: A/V apart by the jump
+    /// for good (−2.0 to −4.0 s at a 1.1 s lead).
+    #[test]
+    fn both_tracks_jumping_forward_keep_their_relation_with_the_video_ahead() {
+        for lead in [9_000i64, 45_000, 99_000] {
+            for jump in [180_000i64, 225_000, 247_500, 270_000, 315_000, 360_000] {
+                let mut tl = CmafTimeline::default();
+                let feeds = [
+                    Feed { frames: 100, base: 900_000, lead },
+                    Feed { frames: 300, base: 900_000 + jump, lead },
+                ];
+                let out = play(&mut tl, &feeds, false);
+                assert!(video_forward(&out), "lead {lead} jump {jump}: the video never steps back");
+                let (v, a) = last_offsets(&out);
+                assert_eq!(v, a, "lead {lead} jump {jump}: the A/V relation");
+            }
+        }
+    }
+
+    /// An outage of 2 s of both tracks, the video (0.5 s ahead in the mux)
+    /// back first: its first picture is placed in doubt, the next shows the
+    /// step real, and both tracks go on on the source's clock with the gap —
+    /// in sync, the gap kept as it was before this rule.
+    #[test]
+    fn an_outage_of_both_tracks_is_a_gap_in_both() {
+        let mut tl = CmafTimeline::default();
+        let feeds = [
+            Feed { frames: 150, base: 900_000, lead: 45_000 },
+            Feed { frames: 200, base: 900_000 + 180_000, lead: 45_000 },
+        ];
+        let out = play(&mut tl, &feeds, false);
+        assert!(video_forward(&out), "the video never steps back");
+        assert_eq!(last_offsets(&out), (0, 0), "the gap kept, on the source's clock");
+    }
+
+    /// A switch to a feed on the same clock whose video leads its audio by
+    /// 0.6 s where the old feed's trailed by 0.5 s: the video steps 1.1 s,
+    /// the audio 0.5 s. The video's step is placed in doubt and shown real
+    /// by the next picture; the new feed's relation is published.
+    #[test]
+    fn a_switch_moving_the_video_further_than_the_audio_takes_the_new_relation() {
+        let mut tl = CmafTimeline::default();
+        let feeds = [
+            Feed { frames: 150, base: 900_000, lead: -45_000 },
+            Feed { frames: 200, base: 945_000, lead: 9_000 },
+        ];
+        let out = play(&mut tl, &feeds, false);
+        assert!(video_forward(&out));
+        let (v, a) = last_offsets(&out);
+        assert_eq!(v, a, "the new feed's A/V relation");
+    }
+
+    /// The video pausing 2 s while the audio runs on: the picture after the
+    /// pause lands where the source put it, the gap before it, not one step
+    /// on (the audio ran through the pause, so the step is not in doubt).
+    #[test]
+    fn the_picture_after_a_pause_of_the_video_is_on_the_source_clock() {
+        let mut tl = CmafTimeline::default();
+        for k in 0..200u64 {
+            let (v, a) = av(k);
+            if !(100..150).contains(&k) {
+                assert_eq!(tl.map(Track::Video, v).ts, v, "picture {k}");
+            }
+            for a in a {
+                assert_eq!(tl.map(Track::Audio, a).ts, a, "audio at {k}");
+            }
+        }
+    }
+
+    /// A switch to a feed 3 s behind, and 0.4 s later to one 2 s ahead of
+    /// that: the picture in doubt at the second step is placed one step on,
+    /// not taken onto the offset the source left, which an old offset in the
+    /// list happened to fit 0.96 s behind the picture before.
+    #[test]
+    fn a_step_in_doubt_takes_no_old_offset() {
+        let mut tl = CmafTimeline::default();
+        let feeds = [
+            Feed { frames: 150, base: 900_000, lead: 0 },
+            Feed { frames: 10, base: 630_000, lead: 0 },
+            Feed { frames: 200, base: 810_000, lead: 0 },
+        ];
+        let out = play(&mut tl, &feeds, false);
+        assert!(video_forward(&out), "the video never steps back");
+        let (v, a) = last_offsets(&out);
+        assert_eq!(v, a);
+    }
+
+    /// A switch 3 s ahead, and back 1.5 s later to the clock the source
+    /// left: both tracks go back onto that clock's offset with a gap.
+    #[test]
+    fn the_source_back_on_a_clock_it_left_goes_back_on_its_offset() {
+        let mut tl = CmafTimeline::default();
+        let feeds = [
+            Feed { frames: 150, base: 900_000, lead: 0 },
+            Feed { frames: 10, base: 1_170_000, lead: 45_000 },
+            Feed { frames: 200, base: 1_035_000, lead: 0 },
+        ];
+        let out = play(&mut tl, &feeds, true);
+        assert!(video_forward(&out), "the video never steps back");
+        let (v, a) = last_offsets(&out);
+        assert_eq!(v, a);
+    }
+
+    /// The video leaping 0.94 s just before the audio steps 2 s (a switch
+    /// that changes the video lead by 1.1 s): the audio's step is the
+    /// source's, not a doubt, so a switch back 0.4 s later does not take the
+    /// audio back without the video.
+    #[test]
+    fn an_audio_step_the_video_leapt_before_is_no_doubt() {
+        let mut tl = CmafTimeline::default();
+        let feeds = [
+            Feed { frames: 150, base: 900_000, lead: 99_000 },
+            Feed { frames: 10, base: 1_080_000, lead: 0 },
+            Feed { frames: 200, base: 810_000, lead: 99_000 },
+        ];
+        let out = play(&mut tl, &feeds, false);
+        let (v, a) = last_offsets(&out);
+        assert_eq!(v, a, "the A/V relation");
+    }
+
+    /// Both tracks stepping 1.5 s forward (the audio first, in doubt), then
+    /// 1.5 s later 3 s back — to where the audio was. That is no return of
+    /// the audio's: the video, 2.96 s off where it stood against the audio
+    /// before, meets the switch too and cannot step back with it.
+    #[test]
+    fn a_switch_back_to_where_the_audio_was_is_no_return_of_the_audios() {
+        let mut tl = CmafTimeline::default();
+        let feeds = [
+            Feed { frames: 150, base: 900_000, lead: 0 },
+            Feed { frames: 37, base: 1_035_000, lead: 0 },
+            Feed { frames: 200, base: 765_000, lead: 0 },
+        ];
+        let out = play(&mut tl, &feeds, true);
+        let (v, a) = last_offsets(&out);
+        assert_eq!(v, a, "the A/V relation");
+    }
+
+    /// The audio does not join the offset a picture sits on in doubt: both
+    /// tracks stepping 1.5 s forward, the video first and in doubt, then 2 s
+    /// back — the audio would have taken the picture's placement and the
+    /// video, shown real, gone on without it.
+    #[test]
+    fn a_picture_in_doubt_is_no_offset_to_join() {
+        let mut tl = CmafTimeline::default();
+        let feeds = [
+            Feed { frames: 150, base: 900_000, lead: 0 },
+            Feed { frames: 10, base: 1_035_000, lead: 0 },
+            Feed { frames: 200, base: 855_000, lead: 0 },
+        ];
+        let out = play(&mut tl, &feeds, false);
+        assert!(video_forward(&out), "the video never steps back");
+    }
+
+    /// Two outputs of a flow, in lockstep and one twelve timestamps behind,
+    /// through three pictures stamped 1.1 s ahead: the step in doubt is
+    /// placed where each output's own history puts it, the same place, so
+    /// the renditions publish one timeline.
+    #[test]
+    fn two_outputs_place_a_step_in_doubt_alike() {
+        let mut ev = wire(&[Feed { frames: 400, base: 900_000, lead: 0 }], false);
+        let mut n = 0;
+        for e in ev.iter_mut().filter(|e| e.0 == Track::Video) {
+            n += 1;
+            if (151..154).contains(&n) {
+                e.1 += 100_000;
+            }
+        }
+        for lag in [0usize, 12] {
+            let flow = format!("timeline-test-doubt-{lag}");
+            let (mut a, mut b) = (CmafTimeline::for_flow(&flow), CmafTimeline::for_flow(&flow));
+            let (mut oa, mut ob) = (Vec::new(), Vec::new());
+            for i in 0..ev.len() + lag {
+                if let Some(&(track, src, _)) = ev.get(i) {
+                    oa.push(a.map(track, src).ts);
+                }
+                if let Some(&(track, src, _)) = i.checked_sub(lag).and_then(|j| ev.get(j)) {
+                    ob.push(b.map(track, src).ts);
+                }
+            }
+            assert_eq!(oa, ob, "lag {lag}: one timeline");
+        }
+    }
+
+    /// Twelve `media_player` loops, each with 1.2 s of audio stamped a
+    /// different way back: every excursion opens an offset, and after eight
+    /// the source's own offset had left the list, so the audio's return
+    /// found nothing and opened an offset of its own, off the video for
+    /// good. The return looks at the video's offset first.
+    #[test]
+    fn the_audio_comes_back_after_ever_more_excursions() {
+        let mut tl = CmafTimeline::default();
+        let mut v = 3_168_500_000u64;
+        for lap in 0..12u64 {
+            for _ in 0..50 {
+                assert_eq!(tl.map(Track::Video, v).ts, v, "lap {lap}");
+                assert_eq!(tl.map(Track::Audio, v - 4_000).ts, v - 4_000, "lap {lap}");
+                v += 3_003;
+            }
+            let excursion = v - 4_000 - (60 + 7 * lap) * 90_000;
+            for k in 0..37u64 {
+                tl.map(Track::Audio, excursion + k * 3_003);
+            }
+            for _ in 0..5 {
+                assert_eq!(tl.map(Track::Video, v).ts, v, "lap {lap}");
+                v += 3_003;
+            }
+        }
+    }
+
+    /// A B-frame source (decode order I P B B) with one picture stamped 2 s
+    /// back and, later, one 2 s ahead: the video is back on the source's
+    /// clock after each, the pictures around them in their own order. (A
+    /// rule that a picture moving to another offset lands past the newest
+    /// took a B-frame landing exactly on the stray picture's placement for a
+    /// step back and opened an offset, 2 frames off for good.)
+    #[test]
+    fn a_b_frame_source_passes_a_stray_picture_either_way() {
+        let mut tl = CmafTimeline::default();
+        let mut a = 900_000u64;
+        for k in 0..400u64 {
+            let reorder = [0u64, 3, 1, 2][(k % 4) as usize] * 3_600;
+            let v = 900_000 + k * 3_600 + reorder;
+            let stray = match k {
+                149 => v - 180_000,
+                251 => v + 180_000,
+                _ => v,
+            };
+            let m = tl.map(Track::Video, stray);
+            if !(149..=153).contains(&k) && !(251..=255).contains(&k) {
+                assert_eq!(m.ts, v, "picture {k}");
+            }
+            while a < 900_000 + (k + 1) * 3_600 {
+                assert_eq!(tl.map(Track::Audio, a).ts, a);
+                a += 1_920;
+            }
+        }
     }
 }

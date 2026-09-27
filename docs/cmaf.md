@@ -144,9 +144,10 @@ plus an offset, 0 until the source first jumps, so a clean source is
 published exactly as before. A timestamp is taken as it is when it is
 continuous with its own track (within 1 s of the newest the track has had,
 either way — a B-frame source's decode-order PTS included) or within 3 s of
-the other track's newest in a direction the offsets allow (see **The cross
-window is directed** below; a track that paused and came back on the
-programme's clock is a gap, kept, in sync). Otherwise the offsets
+the other track's newest where the offsets and the other track allow it (see
+**The cross window is directed** below; a track that paused while the other
+ran on and came back on the programme's clock is a gap, kept, in sync).
+Otherwise the offsets
 already in use are tried — the other track may have met the same jump first,
 or the source may be coming back from a short excursion — and only when none
 makes it continuous does a new offset place it one step (the track's
@@ -174,42 +175,88 @@ sibling a few frames behind, still meeting an old excursion, does not steer
 it, and neither does one track's excursion of its own: an output restarted
 while a sibling's audio sat on a loop's 60 s-back excursion took that audio's
 offset for its first picture and published its video 60 s off the sibling —
-the same epoch fight as above. A second track whose first timestamp the
-programme's offset does not put within 3 s of its sibling (audio stamped
-60 s back, met by an output started inside that excursion) takes the offset
-that does, as its siblings did. A jump one output meets first is taken up
-by the others as the same offset. A flow whose CMAF outputs have all
-stopped starts over at 0.
+the same epoch fight as above. A track whose sibling has gone quiet — no
+timestamp while this track came 3 s, the audio of a switch to a video-only
+backup — moves the programme alone. The flow's offset used to stay where
+both tracks were last together, so after that video met a jump on its own,
+an output started then (a bitrate edit, a DVR proxy provisioned beside an
+existing main) published the same video hours off its sibling. A second
+track whose first timestamp the programme's offset does not put within 3 s
+of its sibling (audio stamped 60 s back, met by an output started inside
+that excursion) takes the offset that does, as its siblings did. A jump one
+output meets first is taken up by the others as the same offset. A flow
+whose CMAF outputs have all stopped starts over at 0.
 
 **The cross window is directed.** Within its own 1 s window a track keeps
 its offset stepping back: that is a B-frame source's presentation order (the
 video is mapped by PTS in decode order), and on audio an overlap the output
-drops, keeping the A/V relation. Past that window, a track on its
-programme's offset takes the cross window only *forwards* (a track that
-paused and came back). A track on an offset of its own — a jump it met
-first, or an excursion — takes it only onto the offset the other track is
-on, in either direction: audio stamped 60 s back returns to the video's
-clock behind the audio just published, and a single picture (or half a
-second of audio) stamped 2 s back returns with the next sample on the
-source's clock. That second case used to stay on the offset it had opened,
-which the forward cross window still accepted, and published that track 2 s
-off the other for good. Which offset is "its own" is decided by offsets,
-not by which output opened one: of a DVR main and proxy meeting one audio
-excursion, the rendition that found the excursion's offset rather than
-opening it could not step back from it, opened a bogus offset of its own
-and published its audio 1.03 s off its own video and off its sibling, for
-good. A track goes on from where such a move lands it, so a return more
-than a frame past its own window is measured from the return, not from the
-excursion's newest (it used to open another offset one sample later). A
-track on the other's offset that steps back further than its own window is
-a source jump: both tracks of a switch to a feed 1.5 s behind, or a 2 s clip looping
-from its start, used to pass as "within 3 s of the other track" and publish
-1.5–2 s backwards on both tracks — a zero-length sample, a segment 1.5 s
-long, a `tfdt` overlapping the segment before, 1.5 s of audio dropped as
-overlap. The first track to see such a step now opens an offset and the
-other track takes it: both run on, in their relation. A synchronised step
-back of *less* than 1 s still passes as before (the video cannot tell it
-from reordering at that sample).
+drops, keeping the A/V relation. Past that window:
+
+- **Onto the other track's offset**, from another — the other met this jump
+  first, or this track is coming back from an excursion — a track may step
+  forwards (a gap in it), and the audio backwards too: audio stamped 60 s
+  back returns to the video's clock behind the audio just published, and a
+  single picture (or half a second of audio) stamped 2 s back returns with
+  the next sample on the source's clock. The other track's offset is tried
+  before a step of the track's own: when both tracks jumped 2–4 s forward
+  with the video ahead in the mux (the witness encoder's 1.1 s lead), the
+  video's step past the cross window opened an offset, and the audio's own
+  step, still within 3 s of the video, used to keep its gap — A/V 2–4 s
+  apart for good. Which offset is "its own" is decided by offsets, not by
+  which output opened one: of a DVR main and proxy meeting one audio
+  excursion, the rendition that found the excursion's offset rather than
+  opening it used to open a bogus offset of its own, its audio 1.03 s off
+  its own video and off its sibling, for good.
+- **The video never steps back past its own window.** Nothing drops a
+  picture, and one behind a picture already published is a zero-length
+  sample and an overlapping `tfdt`. An input switch the audio met first,
+  from a feed whose video ran 1.1 s ahead of its audio to a level feed on an
+  unrelated clock, stepped the video back 1.04 s onto the offset the audio
+  had opened. The video now takes a new offset instead; with both tracks off
+  the programme on different offsets, the track behind joins the other (a
+  gap in the audio), so the new feed is published in its own A/V relation.
+- **On the programme's offset**, a step forwards within 3 s of the other
+  track is a gap when the other track ran through it (a pause of this
+  track) or leapt too (a jump both meet). Anything else is *in doubt*: one
+  picture or half a second of audio stamped 2 s ahead (a source glitch the
+  ingress rewriter passes as it came) and a jump of the source's that the
+  other track has yet to meet — an outage of both, a switch to a feed on
+  the same clock with another video lead — look alike until the track's
+  next timestamps. The video places such a picture one step on, and goes on
+  with the gap only when its next picture lands on as that one did (with
+  the audio still on that offset); the audio takes the gap, and steps back
+  to where it was when the source does, in the relation to the video it
+  had (the overlap is dropped as above). A stray timestamp 2 s ahead used to
+  be taken as a gap, and its track published 2 s off the other for good.
+- **A step back on the other track's offset past the own window is a source
+  jump**: both tracks of a switch to a feed 1.5 s behind, or a 2 s clip
+  looping from its start, used to pass as "within 3 s of the other track"
+  and publish 1.5–2 s backwards on both tracks — a zero-length sample, a
+  segment 1.5 s long, a `tfdt` overlapping the segment before, 1.5 s of
+  audio dropped as overlap. The first track to see such a step now opens an
+  offset and the other track takes it: both run on, in their relation.
+
+A track goes on from where a move lands it, so a return more than a frame
+past its own window is measured from the return, not from the excursion's
+newest (it used to open another offset one sample later). A synchronised
+step back of *less* than 1 s still passes as before (the video cannot tell
+it from reordering at that sample), and so does a video landing less than
+1 s behind its newest on the offset the audio met a switch on.
+
+Measured against the rules before this change on 4 346 generated scenarios
+(switches between feeds with different video leads, 0.5–4 s apart or on
+unrelated clocks, the audio or the video first; outages; two switches in a
+row; stray timestamps; pauses; B-frame sources; each through two outputs of
+one flow, in lockstep and twelve timestamps behind), none comes out worse
+and 690 come out right that did not — no picture now steps back past its
+own window in any of them (it did in the switch the audio met first), and
+two renditions no longer part (they did in 40 of the two-switch scenarios).
+What still goes wrong, as before: a switch on which the video lands more
+than 1 s behind the picture before while the audio does not (a feed behind
+the old one, or one whose video lead is over 1 s shorter) leaves the tracks
+apart by the difference, because the video cannot step back to meet the
+audio; and three or more pictures stamped 1–3 s ahead are taken as the
+source's step, the video published that far off the audio.
 
 It used to take the source's timestamps as they came. At a `media_player`
 loop of the 29.97 fps VH1 clip the flow carried a second of audio stamped
