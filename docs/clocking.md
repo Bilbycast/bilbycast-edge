@@ -245,13 +245,18 @@ master's wrap stopped PSI_RR injection until the source's own PSI came by.
 The same modular step now paces `wire_emit` (a wrap reset its pacing anchor
 to now, and dropped the interval its next datagrams interpolate across),
 judges TR 101 290's PCR discontinuity (a wrap counted one; its accuracy
-regression now runs on the unwrapped PCR, and restarts across a counted
-discontinuity rather than fitting a line through it), paces the media
+regression now runs on the unwrapped PCR, and restarts across a step back or
+one past 500 ms rather than fitting a line through it — not across every
+counted discontinuity: a stream whose PCRs come more than 100 ms apart, a
+150 ms cadence or a PCR per frame at 5 fps, counts each step and still has
+its accuracy checked, where restarting at each left it never checked at
+all), paces the media
 player's TS deadlines (a wrap re-epoched its pacer at "now") and measures
 its head bitrate. Pinned by `a_source_clock_wrap_is_no_discontinuity`,
 `psi_rr_injects_across_a_master_clock_wrap`,
 `a_pcr_wrap_keeps_the_pacing_anchor`,
 `a_pcr_wrap_is_no_discontinuity_and_keeps_the_accuracy_check`,
+`a_pcr_cadence_over_100_ms_keeps_the_accuracy_check`,
 `the_pcr_wrap_paces_straight_on` and
 `the_head_bitrate_is_measured_across_the_pcr_wrap`.
 

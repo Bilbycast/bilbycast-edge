@@ -31,6 +31,16 @@ const SYNC_REGAIN_THRESHOLD: u32 = 5;
 
 /// Maximum allowed PCR discontinuity in 27 MHz ticks (100 ms).
 const PCR_DISCONTINUITY_THRESHOLD: u64 = 27_000_000 / 10; // 2_700_000
+/// The PCR step (27 MHz ticks) past which the accuracy regression starts
+/// over: 500 ms, the step the muxer-mode rewriter bridges as a discontinuity
+/// (`ts_pts_rewriter::DISCONTINUITY_THRESHOLD_27MHZ`). A forward step
+/// between 100 ms and this is a discontinuity by TR 101 290's count but no
+/// break in the line — a 150 ms PCR cadence, a PCR per frame at 5 fps, a
+/// PCR packet lost on the way — and the unwrapped PCR runs straight across
+/// it. Restarted at every counted discontinuity, the window of a stream whose
+/// every step is over 100 ms never held `PCR_HISTORY_MIN` samples, and its
+/// PCR accuracy went unchecked however late its PCRs arrived.
+const PCR_WINDOW_RESET_THRESHOLD: u64 = 27_000_000 / 2; // 13_500_000
 /// PCR_AC residual threshold in nanoseconds. The TR-101290 §5.2.2 PCR_AC
 /// spec is ±500 ns — but that's the encoder's deviation against an
 /// idealised 27 MHz reference clock, measured at the encoder bench. A
@@ -417,9 +427,12 @@ fn process_ts_packet(
                 stats
                     .window_pcr_discontinuity_errors
                     .fetch_add(1, Ordering::Relaxed);
-                // Nor does the regression window run across it: fitted
-                // over the jump, every residual was the jump.
-                state.pcr_tracker.remove(&pid);
+                // Nor does the regression window run across a step no line
+                // fits (see `PCR_WINDOW_RESET_THRESHOLD`): fitted over the
+                // jump, every residual was the jump.
+                if !(0..=PCR_WINDOW_RESET_THRESHOLD as i64).contains(&step) {
+                    state.pcr_tracker.remove(&pid);
+                }
             }
         }
 
@@ -440,7 +453,7 @@ fn process_ts_packet(
         });
 
         // The window runs on the unwrapped PCR (see `PcrState::ext_pcr`):
-        // steps here are forward and at most 100 ms.
+        // steps here are forward and at most 500 ms.
         entry.ext_pcr += crate::engine::ts_parse::pcr_fwd_27mhz(pcr_value, entry.last_pcr_value);
         let wall_us = now.duration_since(entry.history_anchor).as_micros() as u64;
         if entry.history.len() >= PCR_HISTORY_MIN && !discontinuity_expected
@@ -1298,6 +1311,40 @@ mod tests {
         // A real step back is still one.
         process_ts_packet(&pcr_only_packet(0x100, 0, 1_000, false), t0 + Duration::from_millis(900), &stats, &mut state);
         assert_eq!(stats.pcr_discontinuity_errors.load(Ordering::Relaxed), 1);
+    }
+
+    /// A stream whose every PCR step is over 100 ms (a 150 ms PCR cadence, a
+    /// PCR per frame at 5 fps) counts each step as a discontinuity and still
+    /// has its accuracy checked: the regression runs on across a forward step
+    /// under 500 ms. Restarted at every counted discontinuity, the window
+    /// never held the four samples the check needs, and a PCR 150 ms late
+    /// went unseen. A step past 500 ms still starts the window over rather
+    /// than being fitted.
+    #[test]
+    fn a_pcr_cadence_over_100_ms_keeps_the_accuracy_check() {
+        use crate::engine::ts_parse::pcr_only_packet;
+        let stats = Arc::new(Tr101290Accumulator::new());
+        let t0 = Instant::now();
+        let mut state = stats.state.lock().unwrap();
+        let ms = 27_000u64;
+        let mut pcr = 1_000_000u64;
+        for k in 0..20u64 {
+            // One PCR arrives 150 ms late.
+            let late = if k == 12 { 150 } else { 0 };
+            process_ts_packet(&pcr_only_packet(0x100, 0, pcr, false), t0 + Duration::from_millis(k * 150 + late), &stats, &mut state);
+            pcr += 150 * ms;
+        }
+        assert_eq!(stats.pcr_discontinuity_errors.load(Ordering::Relaxed), 19, "every 150 ms step");
+        assert_eq!(stats.pcr_accuracy_errors.load(Ordering::Relaxed), 1, "the late PCR, seen");
+        // The PCR 2 s on where the wall clock went 150 ms: a discontinuity,
+        // and the start of a new window, not a residual of 1.85 s.
+        pcr += 2_000 * ms;
+        for k in 20..30u64 {
+            process_ts_packet(&pcr_only_packet(0x100, 0, pcr, false), t0 + Duration::from_millis(k * 150), &stats, &mut state);
+            pcr += 150 * ms;
+        }
+        assert_eq!(stats.pcr_discontinuity_errors.load(Ordering::Relaxed), 29);
+        assert_eq!(stats.pcr_accuracy_errors.load(Ordering::Relaxed), 1, "the 2 s step is not fitted");
     }
 
     #[test]

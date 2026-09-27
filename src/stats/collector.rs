@@ -1895,9 +1895,9 @@ pub struct PcrState {
     /// Last PCR value in 27 MHz ticks.
     pub last_pcr_value: u64,
     /// The last PCR unwrapped: the first PCR of the window plus every step
-    /// since, so the regression's line runs on across the 42-bit wrap
-    /// (every 26.5 h) instead of fitting a value that fell back by the
-    /// whole modulus.
+    /// since, so the regression's line runs on across the wrap (2^33 × 300
+    /// ticks, every 26.5 h) and across a forward step under 500 ms, instead
+    /// of fitting a value that fell back by the whole modulus.
     pub ext_pcr: u64,
     /// Wall-clock time when the last PCR was received.
     pub last_pcr_wall_time: Instant,
