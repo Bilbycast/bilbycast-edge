@@ -118,14 +118,17 @@ fn process(pkt: &EsPacket, acc: &PerEsAccumulator) {
 
     // PCR discontinuity detection. Broadcast definition of
     // discontinuity: PCR advanced more than 100 ms (2_700_000 ticks) or
-    // went backwards. Matches the threshold the flow-level TR-101290
-    // analyzer uses for `pcr_discontinuity_errors`.
+    // went backwards. Matches the flow-level TR-101290 analyzer's
+    // `pcr_discontinuity_errors`, step and threshold both: the step is
+    // modular, so the PCR's wrap every 26.5 h (2^33 × 300 ticks) is no
+    // discontinuity. Compared as plain values it counted one per ES of
+    // every 24/7 PID-bus flow once a day, where the flow-level count did not.
     if pkt.has_pcr
         && let Some(pcr) = pkt.pcr {
-            const MAX_FORWARD_27MHZ: u64 = 100 * 27_000; // 100 ms in 27 MHz ticks
+            const MAX_FORWARD_27MHZ: i64 = 100 * 27_000; // 100 ms in 27 MHz ticks
             let prev = acc.last_pcr_27mhz.load(Ordering::Relaxed);
             if prev != u64::MAX
-                && (pcr < prev || (pcr - prev) > MAX_FORWARD_27MHZ) {
+                && !(0..=MAX_FORWARD_27MHZ).contains(&crate::engine::ts_parse::pcr_diff_27mhz(pcr, prev)) {
                     acc.pcr_discontinuity_errors.fetch_add(1, Ordering::Relaxed);
                 }
             acc.last_pcr_27mhz.store(pcr, Ordering::Relaxed);
@@ -201,5 +204,28 @@ mod tests {
         pkt.pcr = Some(500_000);
         process(&pkt, &acc);
         assert_eq!(acc.pcr_discontinuity_errors.load(Ordering::Relaxed), 1);
+    }
+
+    /// The PCR's wrap every 26.5 h (2^33 × 300 ticks) is no discontinuity,
+    /// as at the flow-level TR 101 290 analyzer; steps past 100 ms either
+    /// side of it still are.
+    #[test]
+    fn the_pcr_wrap_is_no_es_discontinuity() {
+        use crate::engine::ts_parse::{pcr_add_27mhz, PCR_MODULUS_27MHZ};
+        let acc = Arc::new(PerEsAccumulator::new("in".into(), 0x100));
+        let mut pkt = mk_ts_pkt(0x100, 0, 0x1);
+        pkt.has_pcr = true;
+        let first = PCR_MODULUS_27MHZ - 100 * 27_000;
+        for k in 0..10 {
+            pkt.pcr = Some(pcr_add_27mhz(first, k * 40 * 27_000));
+            process(&pkt, &acc);
+        }
+        assert_eq!(acc.pcr_discontinuity_errors.load(Ordering::Relaxed), 0, "the wrap");
+        pkt.pcr = Some(pcr_add_27mhz(first, 9 * 40 * 27_000 + 150 * 27_000));
+        process(&pkt, &acc);
+        assert_eq!(acc.pcr_discontinuity_errors.load(Ordering::Relaxed), 1, "150 ms on");
+        pkt.pcr = Some(PCR_MODULUS_27MHZ - 27_000);
+        process(&pkt, &acc);
+        assert_eq!(acc.pcr_discontinuity_errors.load(Ordering::Relaxed), 2, "back across the wrap");
     }
 }

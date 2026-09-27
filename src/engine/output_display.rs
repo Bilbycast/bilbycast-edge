@@ -3427,12 +3427,19 @@ fn handle_video_au(
 /// real stream event we don't want to mistake for a switch.
 const PTS_JUMP_THRESHOLD_90K: u64 = 450_000;
 
+/// The PTS is 33 bits (it wraps every 26.5 h).
+const PTS_MASK_33: u64 = (1 << 33) - 1;
+
 fn pts_jump(prev: Option<u64>, pts: u64) -> bool {
     let Some(p) = prev else {
         return false;
     };
-    let forward = pts.wrapping_sub(p);
-    let backward = p.wrapping_sub(pts);
+    // Both distances on the 33-bit circle. As plain u64 differences the wrap
+    // (`p` just below 2^33, `pts` just past 0) measured ~2^64 forward and
+    // ~2^33 back, a "jump" either way: the display flushed its decoder and
+    // re-anchored once a day on every 24/7 source.
+    let forward = pts.wrapping_sub(p) & PTS_MASK_33;
+    let backward = p.wrapping_sub(pts) & PTS_MASK_33;
     forward.min(backward) > PTS_JUMP_THRESHOLD_90K
 }
 
@@ -7014,6 +7021,21 @@ mod tests {
         assert_eq!(d.reorder_depth(), 1);
         let d = open_seeded(VideoCodec::Hevc, DecoderBackend::Cpu, &[]).unwrap();
         assert_eq!(d.reorder_depth(), 0);
+    }
+
+    /// The 33-bit PTS wrap is no jump: the display used to flush its decoder
+    /// and re-anchor there once every 26.5 h. A step of over 5 s either way,
+    /// across the wrap or not, still is one.
+    #[test]
+    fn the_pts_wrap_is_no_jump() {
+        let top = (1u64 << 33) - 1_500;
+        assert!(!pts_jump(Some(top), 1_500), "forwards across the wrap");
+        assert!(!pts_jump(Some(1_500), top), "back across the wrap");
+        assert!(!pts_jump(Some(900_000), 900_000 + 450_000), "5 s on");
+        assert!(pts_jump(Some(top), 450_000), "past 5 s across the wrap");
+        assert!(pts_jump(Some(900_000), 900_000 + 450_001), "past 5 s on");
+        assert!(pts_jump(Some(900_000 + 450_001), 900_000), "past 5 s back");
+        assert!(!pts_jump(None, 123), "nothing before it");
     }
 
     /// An operator switch drops a seeded (H.264, CPU / VAAPI) decoder so

@@ -250,13 +250,21 @@ one past 500 ms rather than fitting a line through it — not across every
 counted discontinuity: a stream whose PCRs come more than 100 ms apart, a
 150 ms cadence or a PCR per frame at 5 fps, counts each step and still has
 its accuracy checked, where restarting at each left it never checked at
-all), paces the media
-player's TS deadlines (a wrap re-epoched its pacer at "now") and measures
-its head bitrate. Pinned by `a_source_clock_wrap_is_no_discontinuity`,
+all), and the same per ES of a PID-bus flow (`ts_es_analysis`, which
+counted one per ES at every wrap while the flow-level count did not), paces
+the media player's TS deadlines (a wrap re-epoched its pacer at "now") and
+measures its head bitrate. The local display takes its 5 s PTS-jump test on
+the 33-bit circle too: it flushed its decoder and re-anchored at every wrap.
+Two rate measurements still start their window over at the wrap and lose
+one sample there, keeping the rate they had: the ingress de-jitter's
+recovered rate (one PCR interval) and the media player's running bitrate
+(its next estimate a second later). Nothing reports either as a
+discontinuity. Pinned by `a_source_clock_wrap_is_no_discontinuity`,
 `psi_rr_injects_across_a_master_clock_wrap`,
 `a_pcr_wrap_keeps_the_pacing_anchor`,
 `a_pcr_wrap_is_no_discontinuity_and_keeps_the_accuracy_check`,
 `a_pcr_cadence_over_100_ms_keeps_the_accuracy_check`,
+`the_pcr_wrap_is_no_es_discontinuity`, `the_pts_wrap_is_no_jump`,
 `the_pcr_wrap_paces_straight_on` and
 `the_head_bitrate_is_measured_across_the_pcr_wrap`.
 
