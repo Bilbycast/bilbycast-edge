@@ -242,8 +242,23 @@ drops, keeping the A/V relation. Past that window:
   with the gap only when its next picture lands on as that one did (with
   the audio still on that offset); the audio takes the gap, and steps back
   to where it was when the source does, in the relation to the video it
-  had (the overlap is dropped as above). A stray timestamp 2 s ahead used to
-  be taken as a gap, and its track published 2 s off the other for good.
+  had, with the video still on the offset (the overlap is dropped as above).
+  A stray timestamp 2 s ahead used to be taken as a gap, and its track
+  published 2 s off the other for good. The audio's doubt lasts while it
+  stays on the offset, and a return the video cannot follow is undone: when
+  the video then meets the same step back past its own window and opens an
+  offset, the return was a switch both met, and the audio goes on on the
+  video's offset, in the new feed's relation. A switch 1.25 s forward to a
+  feed whose video trails its audio by 0.5 s (the video's own step inside
+  its window) left the doubt armed for as long as that feed lasted — minutes,
+  on a switcher flow — and a switch back found the old relation within
+  reach: the audio stepped back 1.25 s alone, 1.25 s of it dropped as
+  overlap, while the video opened an offset, the two 1.25 s apart for good.
+  Ending the doubt instead — once the video leaps, or after 3 s of audio —
+  or asking the return for the old relation within 0.25 s each cost more
+  scenarios than it saved (2 256, 1 100 and 2 404 of the three-feed sweep
+  below, against 144, 52 and 156): where the video's step back stays inside
+  its window, the return is what keeps both tracks on one offset.
 - **A step back on the other track's offset past the own window is a source
   jump**: both tracks of a switch to a feed 1.5 s behind, or a 2 s clip
   looping from its start, used to pass as "within 3 s of the other track"
@@ -279,8 +294,30 @@ What still goes wrong, as before: a switch on which the video lands more
 than 1 s behind the picture before while the audio does not (a feed behind
 the old one, or one whose video lead is over 1 s shorter) leaves the tracks
 apart by the difference, because the video cannot step back to meet the
-audio; and three or more pictures stamped 1–3 s ahead are taken as the
-source's step, the video published that far off the audio.
+audio; the mirror of it — the audio stepping back past its window and the
+video inside its own, 1.5 s and 0.96 s — leaves them apart by the audio's
+continuation offset; and three or more pictures stamped 1–3 s ahead are
+taken as the source's step, the video published that far off the audio.
+
+That sweep switched once, and its "none worse" did not hold for two switches
+in a row. Three feeds (480 000 scenarios: each feed's video lead −0.5, 0, 0.5
+or 1.1 s; the second feed ±3 s from the first in 0.25 s steps and 0.4, 1.5
+or 6 s long; the third ±3 s from the first; wire and demuxer order, either
+track first) found 5 815 in sync at the end under the rules before those
+above and apart under them, every one with the video lead changing between
+feeds. 3 441 were the audio's doubt returning where the video could not
+follow: with the return undone they come out right, and none of the
+480 000 comes out worse. Of the 1 148 in sync at the end of every feed
+before those rules, with a 6 s middle feed, and apart at the end under
+them, none remains. The other 2 374 still end apart where the rules before
+them ended together; in all but 3 those rules had the tracks apart at the
+end of an earlier feed (in 642 stepping a picture back past its window as
+well). The three (a 2.75 s step, a 0.4 s
+middle feed, the video first) are the audio finding, through the list of
+offsets, the one a picture sits on in doubt. The same sweep from B-frame
+sources (129 792 scenarios): none worse, 1 337 right that were not. The
+one-switch scenarios and the rig's captured VH1 flow, replayed in the
+demuxer's order through two outputs of one flow, come out as before.
 
 It used to take the source's timestamps as they came. At a `media_player`
 loop of the 29.97 fps VH1 clip the flow carried a second of audio stamped
