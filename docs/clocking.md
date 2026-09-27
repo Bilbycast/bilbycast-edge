@@ -260,10 +260,20 @@ the wall clock it is, since that lateness is what the check measures), and
 the same per ES of a PID-bus flow (`ts_es_analysis`, which
 counted one per ES at every wrap while the flow-level count did not), paces
 the media player's TS deadlines (a wrap re-epoched its pacer at "now") and
-measures its head bitrate. The local display takes its 5 s PTS-jump test on
-the 33-bit circle too: it flushed its decoder and re-anchored at every wrap.
-Two rate measurements still start their window over at the wrap and lose
-one sample there, keeping the rate they had: the ingress de-jitter's
+measures its head bitrate. The local display takes its PTS on the 33-bit
+circle throughout: the demux side's 5 s PTS-jump test (it flushed the decoder
+and re-anchored at every wrap), and in the presentation loop the test for a
+stream change between frames, the picture's lead over the audio playout, the
+muted output's wall-clock anchor and both frame-period estimates. Only the
+jump test used to be: the loop took raw differences, and at every wrap it
+reset its wall-clock anchor, mode match, fps lock and frame period as if the
+source had changed, and for the frames around it read the audio playout
+26.5 h away — a picture past the wrap presented at once, one before it held
+for the full catch-up cap. The audio task still publishes no playout
+position for its ALSA delay (about 40 ms) after the wrap, well inside the
+clock's 120 ms interpolation. Two rate measurements still start their
+window over at the wrap and lose one sample there, keeping the rate they
+had: the ingress de-jitter's
 recovered rate (one PCR interval) and the media player's running bitrate
 (its next estimate a second later). Nothing reports either as a
 discontinuity. Pinned by `a_source_clock_wrap_is_no_discontinuity`,
@@ -274,6 +284,8 @@ discontinuity. Pinned by `a_source_clock_wrap_is_no_discontinuity`,
 `a_forward_pcr_splice_starts_the_accuracy_window_over`,
 `a_pcr_step_breaks_the_window_when_the_wall_clock_does_not_explain_it`,
 `the_pcr_wrap_is_no_es_discontinuity`, `the_pts_wrap_is_no_jump`,
+`the_display_loop_takes_the_pts_wrap_as_one_frame`,
+`the_upstream_frame_period_runs_on_across_the_pts_wrap`,
 `the_pcr_wrap_paces_straight_on` and
 `the_head_bitrate_is_measured_across_the_pcr_wrap`.
 

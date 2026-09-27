@@ -2482,7 +2482,7 @@ fn note_upstream_frame_period(counters: &DisplayStatsCounters, pts_90k: u64) {
     if prev == 0 {
         return;
     }
-    let forward = pts_90k.wrapping_sub(prev) as i64;
+    let forward = pts_circ_90k(pts_90k, prev);
     let dms = forward / 90;
     // Same window the display loop uses: 10..=200 ms covers 5-100 fps and
     // rejects a discontinuity or a reordered PTS rather than folding it in.
@@ -3430,6 +3430,34 @@ const PTS_JUMP_THRESHOLD_90K: u64 = 450_000;
 /// The PTS is 33 bits (it wraps every 26.5 h).
 const PTS_MASK_33: u64 = (1 << 33) - 1;
 
+/// `a - b` on the 33-bit PTS circle (the PTS wraps every 26.5 h), in
+/// `[-2^32, 2^32)`. Operands need not be reduced: a bob field stamped a
+/// half-frame on, or the audio clock interpolated forward, may sit past
+/// 2^33 just before the wrap. Plain `u64` / `i64` differences of the raw
+/// values came out near ±2^33 there, and the display loop took the wrap for
+/// a stream change or an audio clock 26.5 h away.
+fn pts_circ_90k(a: u64, b: u64) -> i64 {
+    let d = a.wrapping_sub(b) & PTS_MASK_33;
+    if d >= 1 << 32 { d as i64 - (1 << 33) } else { d as i64 }
+}
+
+/// The display loop's test for a stream change between one presented frame
+/// and the next: over 1 s either way on the PTS circle. As raw differences
+/// the wrap measured ~2^33 both ways, and the loop reset its wall-clock
+/// anchor, mode match, fps lock and frame-period estimate there once a day.
+fn frame_pts_discontinuous(prev: u64, pts: u64) -> bool {
+    pts_circ_90k(pts, prev).unsigned_abs() > 90_000
+}
+
+/// How far (ms) the frame stamped `video_pts` is ahead of the audio playout
+/// at `audio_pts`. Taken as a raw difference, a picture just past the wrap
+/// against audio just before it read ~95 443 s late (presented at once, the
+/// catch-up drain bypassed) and the other way round ~95 443 s early (each
+/// frame held for the full catch-up cap).
+fn video_ahead_of_audio_ms(video_pts: u64, audio_pts: u64) -> i64 {
+    pts_circ_90k(video_pts, audio_pts) / 90
+}
+
 fn pts_jump(prev: Option<u64>, pts: u64) -> bool {
     let Some(p) = prev else {
         return false;
@@ -3796,7 +3824,7 @@ fn drain_video_frames(
             // Track the source frame period off display-order PTS
             // deltas; half of it offsets the second bob field below.
             if let Some(prev) = deint.last_pts_90k {
-                let delta = pts_90k.wrapping_sub(prev);
+                let delta = u64::try_from(pts_circ_90k(pts_90k, prev)).unwrap_or(0);
                 // 10–100 ms of frame period covers 10–100 fps; a delta
                 // outside that is a PTS jump / reorder artefact — keep
                 // the previous estimate. Within range, adopt only after
@@ -5309,10 +5337,9 @@ fn display_loop(
         // cached previous frame and re-arm the resolution match for
         // the new source.
         if let Some(prev) = last_pts {
-            let forward = next.pts_90k.wrapping_sub(prev) as i64;
-            let backward = (prev.wrapping_sub(next.pts_90k)) as i64;
+            let forward = pts_circ_90k(next.pts_90k, prev);
             let dms = forward / 90;
-            if forward.unsigned_abs() > 90_000 && backward.unsigned_abs() > 90_000 {
+            if frame_pts_discontinuous(prev, next.pts_90k) {
                 frame_period_ms = 33.0;
                 matched_dims = None;
                 wall_anchor = None;
@@ -5403,7 +5430,7 @@ fn display_loop(
             clock.current_pts_90k_smoothed()
         {
             wall_anchor = None;
-            let raw = (next.pts_90k as i64 - audio_pts as i64) / 90;
+            let raw = video_ahead_of_audio_ms(next.pts_90k, audio_pts);
             #[cfg(feature = "rga-transfer")]
             {
                 if rga_transfer_active.load(Ordering::Relaxed) {
@@ -5466,7 +5493,7 @@ fn display_loop(
                     now + std::time::Duration::from_millis(lead_ms),
                 )
             });
-            let pts_delta_ms = (next.pts_90k.wrapping_sub(*anchor_pts) as i64) / 90;
+            let pts_delta_ms = pts_circ_90k(next.pts_90k, *anchor_pts) / 90;
             let wall_delta_ms = now.duration_since(*anchor_at).as_millis() as i64;
             let drift_ms = pts_delta_ms - wall_delta_ms;
             // Anchor servo. The source's PTS clock and the host wall
@@ -5534,24 +5561,23 @@ fn display_loop(
                 //    wall_anchor / frame-period EMA / mode match;
                 //    swallowing it here left a muted output pacing
                 //    against a stale anchor epoch for minutes.
-                let jump_fwd = newer.pts_90k.wrapping_sub(next.pts_90k);
-                let jump_back = next.pts_90k.wrapping_sub(newer.pts_90k);
                 if newer.frame_gen != next.frame_gen
                     || newer.width != next.width
                     || newer.height != next.height
                     || (newer.prime.is_none()
                         && (newer.width > SW_BLIT_MAX_W
                             || newer.height > SW_BLIT_MAX_H))
-                    || (jump_fwd > 90_000 && jump_back > 90_000)
+                    || frame_pts_discontinuous(next.pts_90k, newer.pts_90k)
                 {
                     pending = Some(newer);
                     break;
                 }
                 // Keep the frame-period EMA fed with real frame-to-frame
                 // deltas across the skip so the thresholds stay honest.
-                let dms = (newer.pts_90k.wrapping_sub(next.pts_90k) as i64) / 90;
+                let step_90k = pts_circ_90k(newer.pts_90k, next.pts_90k);
+                let dms = step_90k / 90;
                 if (10..=200).contains(&dms) {
-                    let dms_f = newer.pts_90k.wrapping_sub(next.pts_90k) as f64 / 90.0;
+                    let dms_f = step_90k as f64 / 90.0;
                     frame_period_ms = frame_period_ms * 0.875 + dms_f * 0.125;
                     frames_since_period_reset =
                         frames_since_period_reset.saturating_add(1);
@@ -5562,7 +5588,7 @@ fn display_loop(
                 raw_drift_ms = if let Some(audio_pts) =
                     clock.current_pts_90k_smoothed()
                 {
-                    let raw = (next.pts_90k as i64 - audio_pts as i64) / 90;
+                    let raw = video_ahead_of_audio_ms(next.pts_90k, audio_pts);
                     #[cfg(feature = "rga-transfer")]
                     let raw = if rga_transfer_active.load(Ordering::Relaxed) && rga_calibration_done {
                         raw + rga_latency_comp_ms
@@ -5571,7 +5597,7 @@ fn display_loop(
                     };
                     raw
                 } else if let Some((anchor_pts, anchor_at)) = wall_anchor.as_ref() {
-                    ((next.pts_90k.wrapping_sub(*anchor_pts) as i64) / 90)
+                    (pts_circ_90k(next.pts_90k, *anchor_pts) / 90)
                         - anchor_at.elapsed().as_millis() as i64
                 } else {
                     // Pacing reference vanished mid-drain (audio task
@@ -7036,6 +7062,48 @@ mod tests {
         assert!(pts_jump(Some(900_000), 900_000 + 450_001), "past 5 s on");
         assert!(pts_jump(Some(900_000 + 450_001), 900_000), "past 5 s back");
         assert!(!pts_jump(None, 123), "nothing before it");
+    }
+
+    /// The display loop's own PTS arithmetic across the 33-bit wrap. The
+    /// demux side's jump test was converted (above), but the loop still
+    /// took raw differences: at the wrap one frame on read as ~2^33 either
+    /// way, so the loop reset its wall-clock anchor, mode match, fps lock
+    /// and frame period as if the stream had changed; and the picture
+    /// against the audio playout read ~95 443 s off — a picture past the
+    /// wrap presented at once, one before it held the full catch-up cap.
+    #[test]
+    fn the_display_loop_takes_the_pts_wrap_as_one_frame() {
+        let lap = 1u64 << 33;
+        let top = lap - 1_800;
+        assert_eq!(pts_circ_90k(1_800, top), 3_600, "one frame on across the wrap");
+        assert_eq!(pts_circ_90k(top, 1_800), -3_600, "one frame back across it");
+        assert_eq!(pts_circ_90k(lap + 1_800, top), 3_600, "a bob field stamped past 2^33");
+        assert_eq!(pts_circ_90k(1_800, lap + 1_800 - 3_600), 3_600, "an interpolated clock past 2^33");
+        assert!(!frame_pts_discontinuous(top, 1_800), "no stream change at the wrap");
+        assert!(!frame_pts_discontinuous(1_800, top), "nor reordered back across it");
+        assert!(frame_pts_discontinuous(top, 90_000 - 1_800 + 1), "over 1 s on, across the wrap");
+        assert!(frame_pts_discontinuous(900_000, 900_000 - 90_001), "over 1 s back");
+        assert!(!frame_pts_discontinuous(900_000, 990_000), "1 s on");
+        assert_eq!(video_ahead_of_audio_ms(1_800, top), 40, "the picture past the wrap, audio before it");
+        assert_eq!(video_ahead_of_audio_ms(top, 1_800), -40, "the picture before the wrap, audio past it");
+        assert_eq!(video_ahead_of_audio_ms(903_600, 900_000), 40);
+        assert_eq!(video_ahead_of_audio_ms(900_000, 903_600), -40);
+    }
+
+    /// The upstream frame period (the vblank cadence's measure) runs on
+    /// across the wrap: the raw difference there fell outside 10-200 ms and
+    /// the estimate was dropped to 0, as at a source change.
+    #[test]
+    fn the_upstream_frame_period_runs_on_across_the_pts_wrap() {
+        let counters = DisplayStatsCounters::default();
+        let mut pts = (1u64 << 33) - 10 * 3_600;
+        for k in 0..20 {
+            note_upstream_frame_period(&counters, pts);
+            if k > 0 {
+                assert_eq!(counters.upstream_frame_period_us.load(Ordering::Relaxed), 40_000, "frame {k}");
+            }
+            pts = (pts + 3_600) & PTS_MASK_33;
+        }
     }
 
     /// An operator switch drops a seeded (H.264, CPU / VAAPI) decoder so
