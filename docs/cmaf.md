@@ -217,7 +217,15 @@ drops, keeping the A/V relation. Past that window:
   gap in the audio), so the new feed is published in its own A/V relation.
 - **On the programme's offset**, a step forwards within 3 s of the other
   track is a gap when the other track ran through it (a pause of this
-  track) or leapt too (a jump both meet). Anything else is *in doubt*: one
+  track) or leapt too (a jump both meet). Both are looked for over the
+  track's last *two* timestamps: the demuxer hands a picture over when the
+  next picture's PES begins, so the audio that ran through a gap in the
+  video — the looping VH1 clip's 1.2 s of audio before its first picture —
+  is mapped before the picture ahead of the gap. Looked for since the last
+  timestamp alone, the audio had not run through the video's 1.3 s step at
+  each loop, and the loop's first picture was placed in doubt, one step on
+  and 1.3 s early, before the next confirmed the step (measured on the rig,
+  below). Anything else is *in doubt*: one
   picture or half a second of audio stamped 2 s ahead (a source glitch the
   ingress rewriter passes as it came) and a jump of the source's that the
   other track has yet to meet — an outage of both, a switch to a feed on
@@ -251,6 +259,14 @@ one flow, in lockstep and twelve timestamps behind), none comes out worse
 and 690 come out right that did not — no picture now steps back past its
 own window in any of them (it did in the switch the audio met first), and
 two renditions no longer part (they did in 40 of the two-switch scenarios).
+The same scenarios handed over in the demuxer's order (a picture when the
+next picture's PES arrives): none worse, 512 right that were not. On the
+edge, the looping VH1 clip through two CMAF outputs of one flow (140 s, two
+loops) comes out identical to the timeline before this change in every
+measure the rig takes: no offset opened at either loop; the passthrough's
+video on the source's clock and its audio 0 ms off it wherever the capture
+holds the frame; every re-encoded fragment's `tfdt` continuous, the same
+segment and sample durations, no playlist discontinuity, no decode error.
 What still goes wrong, as before: a switch on which the video lands more
 than 1 s behind the picture before while the audio does not (a feed behind
 the old one, or one whose video lead is over 1 s shorter) leaves the tracks

@@ -163,18 +163,24 @@ struct Line {
     /// over audio it already sent does not count twice.
     reach: Option<u64>,
     advance: u64,
-    /// The other track's `advance` when this track last had a timestamp: how
-    /// far the other has come since is what a step of this track's past its
-    /// own window is measured against (a pause the other ran through), and
-    /// how far this track has come since the other last had one says whether
-    /// the other has gone quiet.
+    /// The other track's `advance` when this track last had a timestamp, and
+    /// when it had the one before: how far this track has come since the
+    /// other last had one says whether the other has gone quiet, and how far
+    /// the other has come since this track's last two is what a step of this
+    /// track's past its own window is measured against (a pause the other ran
+    /// through). Two, not one: the demuxer hands a picture over when the
+    /// next one's PES begins, so the audio that ran through a gap in the
+    /// video is mapped before the picture ahead of the gap.
     other_at_last: u64,
+    other_at_prev: u64,
     /// How many times the source has stepped this track forward further than
-    /// any frame, and the other track's count when this one last had a
-    /// timestamp: the other leaping meanwhile shows a step of this track's
-    /// past its own window to be a jump of the source's, which both meet.
+    /// any frame, and the other track's count when this one had its last
+    /// timestamp but one: the other leaping since shows a step of this
+    /// track's past its own window to be a jump of the source's, which both
+    /// meet.
     leaps: u64,
     other_leaps: u64,
+    other_leaps_prev: u64,
     /// A step past this track's own window that nothing yet shows to be the
     /// source's (see [`Doubt`]).
     doubt: Option<Doubt>,
@@ -347,13 +353,13 @@ impl CmafTimeline {
             Track::Audio => (&mut self.audio, &mut self.video),
         };
         let leapt = me.last_src.is_some_and(|prev| circ(src, prev) > MAX_STEP_90K as i64);
-        let other_leapt = other.leaps > me.other_leaps;
+        let other_leapt = other.leaps > me.other_leaps_prev;
         me.note_step(src);
-        // How far the other track has come since this one last had a
-        // timestamp; and whether it has gone quiet — this track has come a
+        // How far the other track has come since this one's last timestamp
+        // but one; and whether it has gone quiet — this track has come a
         // cross window since the other last had one (the audio of a switch
         // to a video-only backup).
-        let other_ran = other.advance.saturating_sub(me.other_at_last);
+        let other_ran = other.advance.saturating_sub(me.other_at_prev);
         let other_quiet = other.newest.is_some()
             && me.advance.saturating_sub(other.other_at_last) > CROSS_WINDOW_90K as u64;
         let other_newest = other.newest;
@@ -379,7 +385,9 @@ impl CmafTimeline {
             me.newest = Some(ts);
             me.reached(ts);
             me.other_at_last = other.advance;
+            me.other_at_prev = other.advance;
             me.other_leaps = other.leaps;
+            me.other_leaps_prev = other.leaps;
             if other_newest.is_none() || me.offset == other.offset {
                 self.programme = Some(me.offset);
             }
@@ -550,9 +558,9 @@ impl CmafTimeline {
         }
         me.reached(ts);
         me.offset = offset;
-        me.other_at_last = other.advance;
+        me.other_at_prev = std::mem::replace(&mut me.other_at_last, other.advance);
         me.leaps += u64::from(leapt);
-        me.other_leaps = other.leaps;
+        me.other_leaps_prev = std::mem::replace(&mut me.other_leaps, other.leaps);
         // A doubt lasts while its track stays where it was taken: the
         // video's for its next picture, the audio's while it is on the
         // step's offset.
@@ -1104,6 +1112,25 @@ mod tests {
         ev.into_iter().map(|(_, track, src, feed)| (track, src, feed)).collect()
     }
 
+    /// `wire` in the demuxer's order: a picture is handed over when the next
+    /// picture's PES arrives (the last a frame on), the audio as it comes.
+    fn demuxed(feeds: &[Feed], audio_first: bool) -> Vec<(Track, u64, usize)> {
+        let mut ev = Vec::new();
+        let mut t0 = 0i64;
+        for (i, f) in feeds.iter().enumerate() {
+            let len = f.frames as i64 * 3_600;
+            for t in (0..len).step_by(3_600) {
+                ev.push((t0 + t + 3_600, Track::Video, (f.base + t0 + t + f.lead) as u64 & MASK_33, i));
+            }
+            for t in (0..len).step_by(1_920) {
+                ev.push((t0 + t, Track::Audio, (f.base + t0 + t) as u64 & MASK_33, i));
+            }
+            t0 += len;
+        }
+        ev.sort_by_key(|&(t, track, _, _)| (t, (track == Track::Video) == audio_first));
+        ev.into_iter().map(|(_, track, src, feed)| (track, src, feed)).collect()
+    }
+
     /// `wire` through a timeline: (track, source, output, feed).
     fn play(tl: &mut CmafTimeline, feeds: &[Feed], audio_first: bool) -> Vec<(Track, u64, u64, usize)> {
         wire(feeds, audio_first)
@@ -1460,6 +1487,58 @@ mod tests {
                 assert_eq!(tl.map(Track::Audio, a).ts, a);
                 a += 1_920;
             }
+        }
+    }
+
+    /// Both tracks stepping forward at a switch to a feed 1.5 s ahead whose
+    /// video leads by 1.1 s, the audio first, in the demuxer's order: the
+    /// audio leaps before the picture ahead of the switch is handed over, and
+    /// the video's step of 2.6 s — past its own window, not the audio's 1.5 s
+    /// — is the source's jump, taken as a gap, not a step in doubt. Looked
+    /// for since the video's last timestamp only, the audio's leap was missed
+    /// and the picture placed one step on first.
+    #[test]
+    fn a_switch_both_tracks_meet_is_no_doubt_in_the_demuxers_order() {
+        let mut tl = CmafTimeline::default();
+        let feeds = [
+            Feed { frames: 150, base: 900_000, lead: 0 },
+            Feed { frames: 200, base: 1_035_000, lead: 99_000 },
+        ];
+        let out: Vec<_> = demuxed(&feeds, true)
+            .into_iter()
+            .map(|(track, src, feed)| {
+                let m = tl.map(track, src);
+                assert_eq!(m.jump, None, "{track:?} at {src}: no offset opened");
+                (track, src, m.ts, feed)
+            })
+            .collect();
+        assert!(video_forward(&out));
+        assert_eq!(last_offsets(&out), (0, 0), "both on the source's clock");
+    }
+
+    /// A gap in the video that the audio runs through — the rig's clip
+    /// looping with its 1.2 s of audio before the first picture — handed
+    /// over in the demuxer's order: a picture when the next one's PES
+    /// begins, so all the audio through the gap is mapped before the
+    /// picture ahead of it. The picture after the gap lands where the source
+    /// put it, the gap before it. Measured from the video's last timestamp
+    /// alone, which the audio had already passed, the audio had not run
+    /// through the step: the picture was placed in doubt, one step on and
+    /// 1.3 s early, at every loop.
+    #[test]
+    fn a_video_gap_the_audio_ran_through_is_a_gap_in_the_demuxers_order() {
+        let arrivals: Vec<u64> = (0..200u64).map(|k| k * 3_600 + if k >= 100 { 117_000 } else { 0 }).collect();
+        let mut ev: Vec<(u64, Track, u64)> = arrivals
+            .iter()
+            .enumerate()
+            .map(|(i, &t)| (arrivals.get(i + 1).copied().unwrap_or(t + 3_600), Track::Video, 900_000 + t))
+            .collect();
+        let end = *arrivals.last().unwrap();
+        ev.extend((0..=end).step_by(1_920).map(|t| (t, Track::Audio, 880_000 + t)));
+        ev.sort_by_key(|&(t, track, _)| (t, track == Track::Video));
+        let mut tl = CmafTimeline::default();
+        for (_, track, src) in ev {
+            assert_eq!(tl.map(track, src), Mapped { ts: src, jump: None }, "{track:?} at {src}");
         }
     }
 }
