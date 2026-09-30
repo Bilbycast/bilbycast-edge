@@ -1,0 +1,1 @@
+- **SDI** (DeckLink, `-full` artefacts): Blackmagic **Desktop Video** (kernel driver + `libDeckLinkAPI.so`) from https://www.blackmagicdesign.com/support/, needed only on hosts with a DeckLink card. The binary has no link-time dependency on it, so hosts without it run normally and just don't offer SDI.

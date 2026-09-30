@@ -339,3 +339,22 @@ jobs:
       - name: cargo test (multiviewer)
         working-directory: bilbycast-edge
         run: cargo test --locked --features "multiviewer video-encoder-x264" --lib --test mosaic_wire_shape
+
+  release-notes:
+    name: Release notes
+    runs-on: ubuntu-24.04
+    # The Release workflow renders .github/release-notes/ only after the
+    # build has run, the manifest is signed and the tag is pushed, so a
+    # template it cannot render is found at the point where fixing it costs a
+    # version number. render.sh refuses a missing, duplicated or misspelt
+    # placeholder; run it here, on both SDI variants, so that refusal lands on
+    # the PR instead.
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Render the release notes
+        run: |
+          echo "- example change (0000000)" > changes.md
+          bash .github/release-notes/render.sh 0.0.0 true changes.md > /dev/null
+          bash .github/release-notes/render.sh 0.0.0 false changes.md > /dev/null

@@ -1054,14 +1054,7 @@ jobs:
         run: |
           TAG="${{ needs.check-version.outputs.tag }}"
           VERSION="${{ needs.check-version.outputs.version }}"
-
-          if [ "${SDI_BUILT}" = "true" ]; then
-            SDI_NOTE="**SDI** (Blackmagic DeckLink capture + playout) is compiled into the two **\`-full\`** artefacts (x86_64 and aarch64). The **\`-rockchip\`** artefact does **not** include it — those boards are the embedded deployment, not a rack host with a PCIe DeckLink fitted. Autodetected at runtime exactly like NVENC: the edge \`dlopen\`s \`libDeckLinkAPI.so\` at boot and enumerates cards, so a host without Blackmagic **Desktop Video** installed — or with no DeckLink card fitted — simply does not advertise the \`sdi-decklink\` capability, and the manager UI hides the SDI input / output types for that node. There is nothing to configure and no separate build to install: fit a card, install Desktop Video, restart the edge, and SDI appears."
-            SDI_RUNTIME=" **For SDI (DeckLink)**: install Blackmagic **Desktop Video** (kernel driver + \`libDeckLinkAPI.so\`) from https://www.blackmagicdesign.com/support/ — needed only on hosts with a DeckLink card. The binary carries no link-time dependency on it, so hosts without it run normally and just don't offer SDI."
-          else
-            SDI_NOTE="**SDI** (Blackmagic DeckLink capture + playout) is **not** included in any artefact of this release. The Blackmagic SDK headers are EULA-gated and are not vendored into this repository, so the release workflow compiles SDI only when an SDK credential is configured — none was for this release. These binaries carry no \`sdi\` input or output type, do not advertise the \`sdi-decklink\` capability, and the manager UI hides SDI for nodes running them. To get SDI, build from source with \`--features sdi-decklink\` and \`DECKLINK_SDK_DIR\` pointing at the SDK's \`Linux/include\` — see the [SDI guide](https://docs.bilbycast.com/edge/sdi/). (The \`-rockchip\` artefact never includes SDI, by design.)"
-            SDI_RUNTIME=""
-          fi
+          REPO="${{ github.repository }}"
 
           # Skip tag creation when the workflow was triggered by a tag
           # push (the tag already exists in that case).
@@ -1070,53 +1063,42 @@ jobs:
               git -C bilbycast-edge push origin "${TAG}"
           fi
 
+          # What changed since the previous release: one line per non-merge
+          # commit, from GitHub's compare API (the checkout above is shallow).
+          # Best effort — any failure falls back to a link and never blocks
+          # the release. This release does not exist yet, so the newest
+          # published one is the previous release. The diff is linked by
+          # commit, not tag: the prune step below deletes old releases' tags,
+          # and a compare URL naming one then 404s. The API returns at most
+          # the newest 250 commits, so a longer range says how many it left
+          # out rather than looking complete.
+          PREV_TAG="$(gh release list --repo "${REPO}" --exclude-drafts --exclude-pre-releases \
+            --limit 1 --json tagName --jq '.[0].tagName // empty' || true)"
+          HEAD_SHA="$(git -C bilbycast-edge rev-parse HEAD)"
+          if [ -n "${PREV_TAG}" ] && [ "${PREV_TAG}" != "${TAG}" ] \
+              && gh api "repos/${REPO}/compare/${PREV_TAG}...${HEAD_SHA}" > compare.json \
+              && BASE_SHA="$(jq -er '.base_commit.sha' compare.json)" \
+              && jq -r '(.total_commits - (.commits | length)) as $n
+                  | (if $n > 0 then "- …and \($n) earlier commits, in the full diff below" else empty end),
+                    (.commits[] | select((.parents | length) == 1)
+                     | "- \(.commit.message | split("\n")[0]) (\(.sha[0:7]))")' \
+                  compare.json > changes.md; then
+            printf '\nFull diff: [%s...%s](https://github.com/%s/compare/%s...%s)\n' \
+              "${PREV_TAG}" "${TAG}" "${REPO}" "${BASE_SHA}" "${HEAD_SHA}" >> changes.md
+          else
+            printf 'See https://github.com/%s/commits/%s\n' "${REPO}" "${TAG}" > changes.md
+          fi
+
+          # The text lives in .github/release-notes/ as plain Markdown and is
+          # substituted as data; see render.sh for why it is not inline here.
+          bash bilbycast-edge/.github/release-notes/render.sh "${VERSION}" "${SDI_BUILT}" changes.md > notes.md
+          echo "── release notes ──"
+          cat notes.md
+
           gh release create "${TAG}" \
-            --repo "${{ github.repository }}" \
+            --repo "${REPO}" \
             --title "bilbycast-edge v${VERSION}" \
-            --notes "Release of bilbycast-edge version ${VERSION}.
-
-          ## Binaries
-
-          Asset filenames are versionless so \`https://github.com/Bilbycast/bilbycast-edge/releases/latest/download/<asset>\` always resolves to this release. The unpacked directory keeps the version (\`bilbycast-edge-${VERSION}-<arch>-linux-full/\`).
-
-          Bundles every video codec backend the edge knows about — encoders **and** HW decoders for the local-display output. **Encoders**: libx264 + libx265 + NVENC + VAAPI, plus QSV (Intel oneVPL) on x86_64. **Display HW decode**: NVDEC + VAAPI-decode, plus QSV-decode on x86_64. NVENC + NVDEC activate automatically on hosts with an NVIDIA driver; QSV (encode + decode) on hosts with an Intel iGPU + media driver; VAAPI on hosts with a working VAAPI driver (Mesa radeonsi for AMD, iHD for Intel); x264 / x265 + libavcodec software decode handle everything else. The aarch64 build omits QSV (Intel iGPU is x86_64-only). This binary is an **AGPL-3.0-or-later combined work** that bundles GPL-2.0-or-later code — see \`NOTICE\` inside the tarball.
-
-          - \`bilbycast-edge-x86_64-linux-full.tar.gz\` — Linux x86_64 (amd64) — encoders: x264 + x265 + NVENC + QSV + VAAPI; display HW decode: NVDEC + QSV + VAAPI
-          - \`bilbycast-edge-aarch64-linux-full.tar.gz\` — Linux ARM64 (aarch64) — encoders: x264 + x265 + NVENC + VAAPI; display HW decode: NVDEC + VAAPI
-          - \`bilbycast-edge-aarch64-linux-rockchip.tar.gz\` — Linux ARM64 **Rockchip RK3568/RK3588** (NanoPi R5S/R6S, Orange Pi 5, Radxa Rock 5B…) — adds the **RKMPP** hardware H.264/HEVC encoder (\`h264_rkmpp\` / \`hevc_rkmpp\`, 8-bit 4:2:0) on top of x264 + x265 CPU fallback; **no** NVENC/QSV/VAAPI (none exist on Rockchip). **Runtime prereqs:** a Rockchip **BSP kernel** exposing \`/dev/mpp_service\` plus the BSP's \`librockchip_mpp.so\` (this binary links it dynamically) and the running user in the \`video\` group. Edges compiled with rkmpp auto-select this artefact (upgrade variant \`rockchip\`). See \`docs/installation.md\` §ARM Rockchip.
-
-          **MXL** (Media eXchange Layer) support is compiled in. MXL is a shared-memory IPC protocol — the edge discovers the system-installed \`libmxl.so\` at runtime via \`dlopen\` and advertises MXL capabilities only when the library is present. Install MXL system-wide so all MXL-speaking applications on the host share the same library.
-
-          **Multiviewer** (mosaic compositor + stream head) is compiled into all three artefacts. A wall composites node-local inputs onto one canvas — up to 1920x1080 in this phase — and publishes it as an ordinary MPEG-TS flow source, so it restreams over SRT / RTP / UDP / WebRTC / CMAF, records, nests inside another wall and produces thumbnails with no extra output configuration. Unlike SDI and MXL there is nothing to install: every artefact already carries the encoder the canvas needs, so nodes running these binaries advertise the \`mv-compositor\` capability and the manager's wall surfaces appear automatically. Confirm with \`bilbycast-edge --print-capabilities\`. The canvas is encoded by whichever backend the **host** can actually open: the wall's \`codec\` (default \`h264_auto\`) resolves against the probed hardware, hardware first and CPU last, so QuickSync leads on an Intel host, NVENC on NVIDIA, VAAPI on AMD, RKMPP on RK3568/RK3588, and libx264 where there is no hardware encoder. Measured on an Intel Core Ultra 9 285HX: \`h264_auto\` → \`["h264_qsv", "h264_vaapi", "x264"]\`. Releases up to and including v0.105.0 encoded every wall on CPU libx264 whatever the host had, and silently ignored the requested codec (edge #129); both are fixed here.
-
-          ${SDI_NOTE}
-
-          ### Runtime dependencies
-          libx264 / libx265 are **statically linked** into this binary — no \`libx264\` / \`libx265\` runtime package is required, and the binary is not tied to a distro's ABI-versioned \`libx264.so.<build>\` / \`libx265.so.<build>\` SONAME (so it runs on Ubuntu 24.04, 26.04+, Debian, etc. without hunting for a matching \`libx264-NNN\` package). Install the remaining stable-SONAME runtime libraries before running: \`sudo apt install libva2 libva-drm2 libasound2t64\` (use \`libasound2\` on Ubuntu 22.04 / Debian 12). No extra packages needed for NVENC beyond the NVIDIA driver. **For QSV (x86_64 only)**: \`sudo apt install libvpl2 intel-media-va-driver-non-free\` (or \`intel-media-driver\`). **For VAAPI**: install a vendor driver — \`mesa-va-drivers\` for AMD or \`intel-media-va-driver-non-free\` for Intel — then add the running user to the \`render\` group so the edge can open \`/dev/dri/renderD*\`. (\`install-edge.sh\` installs these automatically.)${SDI_RUNTIME}
-
-          ## Verify checksums
-          \`\`\`
-          sha256sum -c *.sha256
-          \`\`\`
-
-          ## Licensing
-          bilbycast-edge is dual-licensed: AGPL-3.0-or-later for open-source use, commercial licence from Softside Tech Pty Ltd for OEM / SaaS / closed-source integration. See \`LICENSE\`, \`LICENSE.commercial\`, and the \`NOTICE\` file inside each tarball.
-
-          **Commercial-licence customers**: the Softside commercial licence covers bilbycast source only — it does not relicense libx264 / libx265, which remain GPL-2.0-or-later inside the binary. To avoid GPL copyleft entirely, build from source with \`video-encoder-nvenc\` only. See \`LICENSE.commercial\` for the scope statement.
-
-          **Patent notice**: H.264 / H.265 patent licensing (MPEG-LA, Access Advance, Velos Media) is separate from software copyright and is the operator's responsibility in commercial deployments. See \`NOTICE\` in the tarball.
-
-          ## Remote upgrade
-
-          This release is signed for keyless verification by the edge's auto-upgrade pipeline. Operators using the manager UI's \`Upgrade\` button consume \`manifest.json\` + \`manifest.sig.bundle\` automatically. To verify a release manually:
-          \`\`\`
-          cosign verify-blob \\\\
-              --bundle manifest.sig.bundle \\\\
-              --certificate-identity-regexp 'https://github.com/Bilbycast/bilbycast-edge/.github/workflows/nightly-release.yml@refs/tags/v.*' \\\\
-              --certificate-oidc-issuer https://token.actions.githubusercontent.com \\\\
-              manifest.json
-          \`\`\`
-          See \`bilbycast-edge/docs/upgrade.md\` for the full trust model." \
+            --notes-file notes.md \
             artifacts/bilbycast-edge-x86_64-linux-full.tar.gz \
             artifacts/bilbycast-edge-x86_64-linux-full.tar.gz.sha256 \
             artifacts/bilbycast-edge-aarch64-linux-full.tar.gz \
