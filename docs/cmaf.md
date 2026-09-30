@@ -347,7 +347,10 @@ An MPEG-2 video source is decoded and re-encoded with `video_encode`
 it). It used to be dropped whatever the config said, so an MPEG-2 source
 published nothing at all — its audio shed for want of a video segment to carry
 it. Without `video_encode` the output says so once (Warning
-`codec_needs_encode`).
+`codec_needs_encode`, output-scoped from edge 0.113.0). A non-AAC audio
+source (MP2 / AC-3 / E-AC-3 / AAC-LATM) reaches CMAF only through
+`audio_encode`; without it the audio is dropped, and — edge 0.113.0+ — the
+same Warning says so once, naming `audio_encode`.
 
 ## Playlist window (`dvr_window_secs`)
 

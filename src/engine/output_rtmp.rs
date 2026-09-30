@@ -656,15 +656,20 @@ async fn publish_loop(
                 DemuxedFrame::OtherAudio { stream_type, data, pts } => {
                     let ts_ms = pts_to_ms(pts, &mut base_pts);
 
-                    // RTMP carries AAC: MP2 / AC-3 / E-AC-3 reach it only
-                    // re-encoded (`audio_encode`).
+                    // RTMP carries AAC: MP2 / AC-3 / E-AC-3 / AAC-LATM reach
+                    // it only re-encoded (`audio_encode`). A source no
+                    // decoder here can read (AC-4) is dropped without the
+                    // Warning — naming `audio_encode` would not help it.
                     if matches!(encoder_state, EncoderState::Disabled) {
-                        if !other_audio_warned {
+                        if !other_audio_warned
+                            && let Some(what) =
+                                crate::engine::audio_decode::reencodable_audio_label(stream_type)
+                        {
                             other_audio_warned = true;
                             warn_codec_needs_encode(
                                 config,
                                 "audio",
-                                &format!("audio (stream_type 0x{stream_type:02X})"),
+                                &what,
                                 "audio_encode",
                                 flow_id,
                                 event_sender,
@@ -1757,6 +1762,17 @@ async fn encode_one_frame(
         crate::engine::perf::TRANSCODE_BLOCK_WARN_MS,
         { transcode_access_unit(active, &annex_b, pts_90k, src.pts_known(), &config.id) }
     );
+    // An explicit `scan: interlaced` the encoder could not open for: the
+    // pipeline logged it; tell the manager too, once per open.
+    if let Some(why) = active.pipeline.take_interlace_notice() {
+        crate::engine::video_encode_util::emit_output_interlace_unavailable(
+            event_sender,
+            "RTMP",
+            &config.id,
+            &why,
+            src.codec(),
+        );
+    }
 
     // Only encoder *open* failure flips us to Failed. Decoder priming —
     // when the H.264/HEVC decoder needs several access units before it

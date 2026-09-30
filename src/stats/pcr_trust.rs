@@ -48,7 +48,8 @@ pub const PCR_TRUST_RESERVOIR_SIZE: usize = 4096;
 pub const PCR_TRUST_WINDOW_SAMPLES: usize = 256;
 
 /// 33-bit PCR base × 300 — the full 27 MHz PCR modulus. Wraps every
-/// ~95 hours. Used to reduce inputs before computing drift deltas.
+/// 2^33 / 90 kHz ≈ 95 444 s ≈ 26.5 hours. Used to reduce inputs before
+/// computing drift deltas.
 pub const PCR_MODULUS_27MHZ: u64 = (1u64 << 33) * 300;
 
 /// Samples with apparent ΔPCR or Δwall larger than this are treated as
@@ -118,7 +119,7 @@ impl PcrTrustSampler {
     ///     PCR-bearing packets within a normal PCR cadence (≤ 100 ms
     ///     per broadcast standard).
     ///
-    /// PCR wrap-around (33-bit base × 300 → ≈ 95 hours) is handled via
+    /// PCR wrap-around (33-bit base × 300 → every ≈ 26.5 hours) is handled via
     /// proper modular subtraction in the PCR space: a genuine wrap
     /// produces a small forward delta; an actual backward jump (a
     /// discontinuity) produces an implausibly large forward delta in

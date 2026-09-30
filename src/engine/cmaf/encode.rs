@@ -695,6 +695,9 @@ pub struct VideoReencoder {
     /// Holds an H.264 decoder open back until an access unit carries the
     /// SPS, which seeds its reorder depth (`SpsOpenGate`).
     sps_gate: crate::engine::video_encode_util::SpsOpenGate,
+    /// Where `video_encode_interlace_unavailable` goes (the live output);
+    /// `None` (clip export) leaves it to the log line.
+    events: Option<crate::manager::events::EventSender>,
 }
 
 #[cfg(not(feature = "media-codecs"))]
@@ -824,7 +827,15 @@ impl VideoReencoder {
             annex_b_scratch: Vec::with_capacity(256 * 1024),
             source_codec: None,
             sps_gate: crate::engine::video_encode_util::SpsOpenGate::new(),
+            events: None,
         })
+    }
+
+    /// Raise `video_encode_interlace_unavailable` (an explicit `scan:
+    /// interlaced` coding progressive) on `events`, scoped to this output,
+    /// once per encoder open — as the TS and RTMP paths do.
+    pub fn set_event_sender(&mut self, events: crate::manager::events::EventSender) {
+        self.events = Some(events);
     }
 
     /// Encode one access unit (decode order), stamped `pts` (90 kHz).
@@ -966,6 +977,17 @@ impl VideoReencoder {
                 bail!("VideoEncoder encode_frame failed: {e}");
             }
         };
+        if let Some(why) = self.pipeline.take_interlace_notice()
+            && let (Some(events), Some(source)) = (self.events.as_ref(), self.source_codec)
+        {
+            crate::engine::video_encode_util::emit_output_interlace_unavailable(
+                events,
+                "CMAF",
+                &self.output_id,
+                &why,
+                source,
+            );
+        }
         if !was_open && self.pipeline.is_open() {
             let (w, h) = self.pipeline.dst_dimensions();
             let (n, d) = self.pipeline.fps();
@@ -1052,6 +1074,8 @@ impl VideoReencoder {
     pub fn encode_mpeg2(&mut self, _es: &[u8], _pts: Option<u64>) -> Result<Vec<VideoOutFrame>> {
         bail!("video_encode disabled at build time")
     }
+
+    pub fn set_event_sender(&mut self, _events: crate::manager::events::EventSender) {}
 }
 
 /// Split an Annex-B byte stream into NALU vectors with the start

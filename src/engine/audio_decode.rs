@@ -328,6 +328,20 @@ pub fn ff_codec_for_stream_type(stream_type: u8) -> Option<video_codec::AudioDec
     }
 }
 
+/// What a `codec_needs_encode` Warning calls a non-AAC source audio codec
+/// (`"AC-3 audio (stream_type 0x81)"`) — `Some` only for one the
+/// re-encoding outputs can decode into their encoder (MP2, AC-3, E-AC-3,
+/// AAC-LATM), so the Warning never names `audio_encode` for a source it
+/// cannot help: AC-4 (0xAC), DTS, an unknown type, or Opus-in-TS (0x06,
+/// which WebRTC cannot pass through and RTMP / CMAF cannot carry).
+#[cfg(feature = "media-codecs")]
+pub fn reencodable_audio_label(stream_type: u8) -> Option<String> {
+    match ff_codec_for_stream_type(stream_type)? {
+        video_codec::AudioDecoderCodec::Opus => None,
+        codec => Some(format!("{} audio (stream_type 0x{stream_type:02X})", ff_codec_name(codec))),
+    }
+}
+
 /// Private options every libavcodec audio decode in the edge opens with.
 ///
 /// AC-3 / E-AC-3 only (the others take none):
@@ -1192,6 +1206,20 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `codec_needs_encode` names `audio_encode` only for a source the
+    /// re-encode can decode: never AC-4, DTS, an unknown type or Opus.
+    #[cfg(feature = "media-codecs")]
+    #[test]
+    fn only_a_decodable_source_is_labelled_for_a_re_encode() {
+        assert_eq!(reencodable_audio_label(0x03).as_deref(), Some("MP2 audio (stream_type 0x03)"));
+        assert_eq!(reencodable_audio_label(0x81).as_deref(), Some("AC-3 audio (stream_type 0x81)"));
+        assert_eq!(reencodable_audio_label(0x87).as_deref(), Some("E-AC-3 audio (stream_type 0x87)"));
+        assert_eq!(reencodable_audio_label(0x11).as_deref(), Some("AAC-LATM audio (stream_type 0x11)"));
+        for st in [0xAC, 0x82, 0x85, 0x86, 0x8A, 0x06, 0x00] {
+            assert_eq!(reencodable_audio_label(st), None, "stream_type 0x{st:02X}");
+        }
+    }
 
     /// Every access unit of an encoded 1 kHz tone, as the encoder framed it:
     /// ADTS or LOAS AAC (fdk-aac), MP2 or AC-3 (libavcodec).

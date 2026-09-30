@@ -364,6 +364,15 @@ impl InputTranscoder {
         self.audio.as_ref().map(|a| a.encode_stats_handle())
     }
 
+    /// The audio stage's target bitrate in kbps — the configured one, or
+    /// the codec's default when `audio_encode.bitrate_kbps` is unset — if
+    /// the audio stage is active. What the output side registers too
+    /// (`TsAudioReplacer::bitrate_kbps`), so an unset bitrate reads as the
+    /// rate actually encoded rather than 0.
+    pub fn audio_bitrate_kbps(&self) -> Option<u32> {
+        self.audio.as_ref().map(|a| a.bitrate_kbps())
+    }
+
     /// Shared handle to the audio replacer's own counters (source PID and
     /// stream type, the pre-PMT drops and the timeline corrections, silence
     /// inserted and samples dropped), if the audio stage is active.
@@ -514,7 +523,13 @@ pub fn register_ingress_stats(
             let target_codec = ae.codec.as_str();
             let target_sr = ae.sample_rate.unwrap_or(0);
             let target_ch = ae.channels.unwrap_or(0);
-            let target_br = ae.bitrate_kbps.unwrap_or(0);
+            // The replacer's resolved bitrate (the codec default when
+            // unset), as the output side registers it. `bitrate_kbps` is
+            // not published later, so an unset one registered as 0 read
+            // "@ 0 kbps" for the life of the input.
+            let target_br = t
+                .audio_bitrate_kbps()
+                .unwrap_or_else(|| ae.bitrate_kbps.unwrap_or(0));
             let audio_handle = flow_stats.set_input_decode_stats(
                 input_id,
                 decode_handle_stats,
@@ -808,6 +823,55 @@ mod tests {
         let input = b"not a ts packet";
         let out = t.process(input);
         assert_eq!(out, input);
+    }
+
+    /// An ingress `audio_encode` with no `bitrate_kbps` registers the
+    /// bitrate it encodes at — the codec's default — as the output side
+    /// does, not 0: the target shape is published later but the bitrate
+    /// never is, so a 0 read "@ 0 kbps" for the life of the input.
+    #[test]
+    fn an_unset_ingress_audio_bitrate_registers_the_codec_default() {
+        let ae = AudioEncodeConfig {
+            codec: "aac_lc".to_string(),
+            bitrate_kbps: None,
+            sample_rate: None,
+            channels: None,
+            silent_fallback: false,
+            opus_vbr_mode: None,
+            opus_fec: false,
+            opus_dtx: false,
+            opus_frame_duration_ms: None,
+            source_audio_pid: None,
+            ts_signalling: None,
+        };
+        let mut t = InputTranscoder::new(Some(&ae), None, None, None)
+            .expect("construct")
+            .expect("stage");
+        assert_eq!(t.audio_bitrate_kbps(), Some(128));
+        let flow = crate::stats::collector::FlowStatsAccumulator::new(
+            "f1".to_string(),
+            "flow-1".to_string(),
+            "srt".to_string(),
+        );
+        flow.set_active_input_id("in-1");
+        let (tx, _rx) = crate::manager::events::event_channel();
+        register_ingress_stats(&flow, "in-1", Some(&mut t), Some(&ae), None, &tx);
+        let e = flow.snapshot().input.audio_encode_stats.expect("an ingress audio encode");
+        assert_eq!(e.target_bitrate_kbps, 128);
+        // Rate and channels still follow the source until the first frame.
+        assert_eq!((e.target_sample_rate_hz, e.target_channels), (0, 0));
+
+        // A configured bitrate is registered as configured.
+        let ae = AudioEncodeConfig { bitrate_kbps: Some(96), ..ae };
+        let mut t = InputTranscoder::new(Some(&ae), None, None, None).unwrap().unwrap();
+        let flow = crate::stats::collector::FlowStatsAccumulator::new(
+            "f2".to_string(),
+            "flow-2".to_string(),
+            "srt".to_string(),
+        );
+        flow.set_active_input_id("in-2");
+        register_ingress_stats(&flow, "in-2", Some(&mut t), Some(&ae), None, &tx);
+        assert_eq!(flow.snapshot().input.audio_encode_stats.unwrap().target_bitrate_kbps, 96);
     }
 
     /// End-to-end: `audio_encode: mp2` + `pid_overrides` keyed on a

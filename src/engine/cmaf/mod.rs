@@ -879,6 +879,9 @@ struct CmafState {
     timeline_jump_logged: Option<std::time::Instant>,
     /// An MPEG-2 video source with no `video_encode` has been reported.
     mpeg2_warned: bool,
+    /// A decodable non-AAC audio source with no `audio_encode` has been
+    /// reported.
+    audio_needs_encode_warned: bool,
 }
 
 struct CencRuntime {
@@ -1333,6 +1336,7 @@ impl CmafState {
             timeline_jumps: 0,
             timeline_jump_logged: None,
             mpeg2_warned: false,
+            audio_needs_encode_warned: false,
         }
     }
 
@@ -1697,11 +1701,12 @@ async fn run(
 
     if let Some(enc_cfg) = &config.video_encode {
         match VideoReencoder::new(enc_cfg, &config.id, Some(config.segment_duration_secs)) {
-            Ok(reenc) => {
+            Ok(mut reenc) => {
                 tracing::info!(
                     "CMAF output '{}': video re-encode active codec={}",
                     config.id, enc_cfg.codec
                 );
+                reenc.set_event_sender(event_sender.clone());
                 state.video_reencoder = Some(reenc);
             }
             Err(e) => {
@@ -1947,24 +1952,14 @@ async fn handle_frame(
             if state.video_reencoder.is_none() {
                 if !state.mpeg2_warned {
                     state.mpeg2_warned = true;
-                    let msg = format!(
-                        "CMAF output '{}': the source's MPEG-2 video cannot be carried in CMAF \
-                         (H.264 / HEVC only) without `video_encode`; nothing is published",
-                        config.id
-                    );
-                    tracing::warn!("{msg}");
-                    event_sender.emit_flow_with_details(
-                        EventSeverity::Warning,
-                        category::CMAF,
-                        msg,
+                    warn_codec_needs_encode(
+                        config,
+                        "video",
+                        "MPEG-2 video",
+                        "video_encode",
+                        "nothing is published",
+                        event_sender,
                         flow_id,
-                        serde_json::json!({
-                            "error_code": "codec_needs_encode",
-                            "output_id": config.id,
-                            "essence": "video",
-                            "source_codec": "MPEG-2 video",
-                            "needs": "video_encode",
-                        }),
                     );
                 }
                 return;
@@ -2005,10 +2000,46 @@ async fn handle_frame(
     }
 }
 
-/// Decode a non-AAC source audio PES (MP2 / AC-3 / E-AC-3) via FFmpeg
-/// and feed the resulting PCM to the AAC re-encoder, replicating the
-/// back half of [`handle_audio_frame`]. CMAF egress requires AAC, so
-/// without an `audio_encode` block we drop the frame.
+/// Tell the operator, once per output, that the source's `source_codec`
+/// reaches this CMAF output only through `needs` (CMAF carries H.264 /
+/// HEVC and AAC), and what happens without it (`consequence`).
+/// Output-scoped, with the flow in `details` — the shape RTMP and WebRTC
+/// raise it in.
+fn warn_codec_needs_encode(
+    config: &CmafOutputConfig,
+    essence: &str,
+    source_codec: &str,
+    needs: &str,
+    consequence: &str,
+    event_sender: &EventSender,
+    flow_id: &str,
+) {
+    let msg = format!(
+        "CMAF output '{}': the source's {source_codec} cannot be carried in CMAF (H.264 / HEVC \
+         and AAC only) without `{needs}`; {consequence}",
+        config.id
+    );
+    tracing::warn!("{msg}");
+    event_sender.emit_output_with_details(
+        EventSeverity::Warning,
+        category::CMAF,
+        msg,
+        &config.id,
+        serde_json::json!({
+            "error_code": "codec_needs_encode",
+            "essence": essence,
+            "source_codec": source_codec,
+            "needs": needs,
+            "flow_id": flow_id,
+        }),
+    );
+}
+
+/// Decode a non-AAC source audio PES (MP2 / AC-3 / E-AC-3 / AAC-LATM) via
+/// FFmpeg and feed the resulting PCM to the AAC re-encoder, replicating
+/// the back half of [`handle_audio_frame`]. CMAF egress requires AAC, so
+/// without an `audio_encode` block the frame is dropped undecoded — and
+/// the operator told once, when `audio_encode` could carry it.
 #[cfg(feature = "media-codecs")]
 fn handle_other_audio_frame(
     state: &mut CmafState,
@@ -2019,6 +2050,23 @@ fn handle_other_audio_frame(
     event_sender: &EventSender,
     flow_id: &str,
 ) {
+    if config.audio_encode.is_none() {
+        if !state.audio_needs_encode_warned
+            && let Some(what) = crate::engine::audio_decode::reencodable_audio_label(stream_type)
+        {
+            state.audio_needs_encode_warned = true;
+            warn_codec_needs_encode(
+                config,
+                "audio",
+                &what,
+                "audio_encode",
+                "its audio is dropped",
+                event_sender,
+                flow_id,
+            );
+        }
+        return;
+    }
     let Some(codec) =
         crate::engine::audio_decode::ff_codec_for_stream_type(stream_type)
     else {
@@ -5758,5 +5806,48 @@ seg-00042.m4s?token=abc
         // It only ever grows, and a trim that drops nothing changes nothing.
         state.trim_playlist(2);
         assert_eq!(state.discontinuities_trimmed, 1);
+    }
+
+    /// `codec_needs_encode` on CMAF is output-scoped, the flow in `details`
+    /// (it was flow-scoped, `output_id` only in `details`); a decodable
+    /// non-AAC audio source with no `audio_encode` raises it once per
+    /// output naming `audio_encode`, and an undecodable one (AC-4) not at
+    /// all.
+    #[cfg(feature = "media-codecs")]
+    #[test]
+    fn a_non_aac_source_with_no_audio_encode_is_reported_once_on_the_output() {
+        let config: CmafOutputConfig = serde_json::from_value(serde_json::json!({
+            "id": "cmaf-1",
+            "name": "CMAF",
+            "ingest_url": "https://origin.example/ingest/s1/",
+        }))
+        .expect("CMAF config fixture");
+        let (tx, mut rx) = crate::manager::events::event_channel();
+        let mut state = CmafState::new();
+        // AC-4 first: nothing — `audio_encode` could not help it.
+        handle_other_audio_frame(&mut state, &config, 0xAC, &[0; 8], 0, &tx, "flow-1");
+        assert!(rx.try_recv().is_err());
+        for _ in 0..3 {
+            handle_other_audio_frame(&mut state, &config, 0x81, &[0; 8], 0, &tx, "flow-1");
+        }
+        let ev = rx.try_recv().expect("one Warning");
+        assert!(rx.try_recv().is_err(), "once per output");
+        assert_eq!(ev.output_id.as_deref(), Some("cmaf-1"));
+        assert!(ev.flow_id.is_none());
+        assert_eq!(ev.category, category::CMAF);
+        let d = ev.details.unwrap();
+        assert_eq!(d["error_code"], "codec_needs_encode");
+        assert_eq!(d["essence"], "audio");
+        assert_eq!(d["needs"], "audio_encode");
+        assert_eq!(d["source_codec"], "AC-3 audio (stream_type 0x81)");
+        assert_eq!(d["flow_id"], "flow-1");
+        assert!(state.ff_audio_decoder.is_none(), "nothing decoded for a frame it drops");
+
+        // The MPEG-2 video Warning has the same shape.
+        warn_codec_needs_encode(&config, "video", "MPEG-2 video", "video_encode", "nothing is published", &tx, "flow-1");
+        let ev = rx.try_recv().unwrap();
+        assert_eq!(ev.output_id.as_deref(), Some("cmaf-1"));
+        let d = ev.details.unwrap();
+        assert_eq!((d["essence"].as_str(), d["needs"].as_str()), (Some("video"), Some("video_encode")));
     }
 }

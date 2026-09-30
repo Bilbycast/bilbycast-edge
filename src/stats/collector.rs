@@ -1616,6 +1616,7 @@ impl OutputStatsAccumulator {
                     .non_monotonic_frames_dropped
                     .load(Ordering::Relaxed),
                 pre_pmt_dropped_packets: h.stats.pre_pmt_dropped_packets.load(Ordering::Relaxed),
+                coded_scan: h.stats.resolved_backend.coded_scan().map(str::to_owned),
             }
         });
         // Audio-only stall on a display output: the decode stage delivered
@@ -4817,6 +4818,7 @@ impl FlowStatsAccumulator {
                             .stats
                             .pre_pmt_dropped_packets
                             .load(Ordering::Relaxed),
+                        coded_scan: h.stats.resolved_backend.coded_scan().map(str::to_owned),
                     }
                 });
                 let ingress_static_snap = self

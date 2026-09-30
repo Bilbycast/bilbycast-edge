@@ -230,11 +230,11 @@ pub mod video_encode_util;
 ///
 /// `ts_video_replace::VideoEncodeStats` holds an
 /// `Arc<ResolvedBackendCell>` unconditionally and `stats::collector` reads
-/// `.label()` off it, but the real cell stores a `video_codec::VideoEncoderCodec`
-/// and so cannot compile without the codec layer. Only `label()` is reachable
-/// from ungated code — `store()` is called solely by the encoder pipeline,
+/// `.label()` and `.coded_scan()` off it, but the real cell stores a
+/// `video_codec::VideoEncoderCodec` and so cannot compile without the codec
+/// layer. Only those two readers are reachable from ungated code — `store()` is called solely by the encoder pipeline,
 /// which does not exist in this configuration — so the stub answers "no encoder
-/// has opened", which is permanently true here.
+/// has opened" (and so no scan was coded), which is permanently true here.
 #[cfg(not(feature = "media-codecs"))]
 pub mod video_encode_util {
     #[derive(Default, Debug)]
@@ -242,6 +242,10 @@ pub mod video_encode_util {
 
     impl ResolvedBackendCell {
         pub fn label(&self) -> Option<&'static str> {
+            None
+        }
+
+        pub fn coded_scan(&self) -> Option<&'static str> {
             None
         }
     }

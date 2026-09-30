@@ -442,29 +442,79 @@ fn encode_one_video_frame_webrtc(
     }
 }
 
-/// Tell the operator, once per session, that the source's MPEG-2 video
-/// reaches a WebRTC output only through `video_encode` (WebRTC carries
-/// H.264), so without one the picture is dropped.
+/// Which `codec_needs_encode` Warnings a WebRTC session (a WHEP viewer, or
+/// one WHIP connection) has raised — each at most once per session.
 #[cfg(feature = "webrtc")]
-fn warn_mpeg2_needs_encode(output_id: &str, flow_id: &str, events: &EventSender) {
+#[derive(Default)]
+struct NeedsEncodeWarned {
+    /// MPEG-2 or HEVC video with no `video_encode`.
+    video: bool,
+    /// Decodable non-Opus audio with no `audio_encode`.
+    audio: bool,
+}
+
+/// Tell the operator, once per session, that the source's `source_codec`
+/// reaches a WebRTC output only through `needs` (WebRTC carries H.264 and
+/// Opus), so without it that essence is dropped. Output-scoped, with the
+/// flow in `details` — the shape RTMP raises it in.
+#[cfg(feature = "webrtc")]
+fn warn_codec_needs_encode(
+    output_id: &str,
+    flow_id: &str,
+    events: &EventSender,
+    essence: &str,
+    source_codec: &str,
+    needs: &str,
+) {
+    let (carries, block) = if essence == "video" {
+        ("H.264 only", "`video_encode` (or `webrtc_compatible`)")
+    } else {
+        ("Opus only", "`audio_encode`")
+    };
     let msg = format!(
-        "WebRTC output '{output_id}': the source's MPEG-2 video cannot be carried over WebRTC \
-         (H.264 only) without `video_encode`; its video is dropped"
+        "WebRTC output '{output_id}': the source's {source_codec} cannot be carried over WebRTC \
+         ({carries}) without {block}; its {essence} is dropped"
     );
     tracing::warn!("{msg}");
-    events.emit_flow_with_details(
+    events.emit_output_with_details(
         EventSeverity::Warning,
         category::WEBRTC,
         msg,
-        flow_id,
+        output_id,
         serde_json::json!({
             "error_code": "codec_needs_encode",
-            "output_id": output_id,
-            "essence": "video",
-            "source_codec": "MPEG-2 video",
-            "needs": "video_encode",
+            "essence": essence,
+            "source_codec": source_codec,
+            "needs": needs,
+            "flow_id": flow_id,
         }),
     );
+}
+
+/// The label a decodable non-Opus source audio frame gets in a
+/// `codec_needs_encode` Warning, when the session would carry audio
+/// (`audio_negotiated`) but has no `audio_encode` to make Opus of it —
+/// `None` when the Warning is not owed. AAC (ADTS) only when it is AAC-LC,
+/// the one profile the Opus re-encode takes.
+#[cfg(all(feature = "webrtc", feature = "media-codecs"))]
+fn audio_needs_encode_label(
+    frame: &super::ts_demux::DemuxedFrame,
+    demuxer: &super::ts_demux::TsDemuxer,
+    audio_encode_set: bool,
+    audio_negotiated: bool,
+) -> Option<String> {
+    if audio_encode_set || !audio_negotiated {
+        return None;
+    }
+    match frame {
+        super::ts_demux::DemuxedFrame::Aac { .. } => {
+            matches!(demuxer.cached_aac_config(), Some((1, _, _))).then(|| "AAC audio".to_string())
+        }
+        super::ts_demux::DemuxedFrame::OtherAudio { stream_type, .. } => {
+            crate::engine::audio_decode::reencodable_audio_label(*stream_type)
+        }
+        _ => None,
+    }
 }
 
 /// One demuxed video access unit for a WebRTC output.
@@ -531,7 +581,8 @@ async fn handle_webrtc_video_frame(
     use str0m::media::{Frequency, MediaTime};
     use std::time::Instant;
 
-    // Disabled + HEVC / MPEG-2 source → drop (the loop reports MPEG-2 once).
+    // Disabled + HEVC / MPEG-2 source → drop (the loops report it once per
+    // session, `codec_needs_encode`).
     let passthrough_nalus = match source {
         WebrtcVideoSource::H264(nalus) => Some(nalus),
         _ => None,
@@ -968,7 +1019,7 @@ async fn whep_viewer_loop(
     let mut ff_audio_codec: Option<video_codec::AudioDecoderCodec> = None;
     let mut video_encoder_state: WebrtcVideoEncoderState =
         init_webrtc_video_encoder_state(video_encode.as_ref());
-    let mut mpeg2_warned = false;
+    let mut needs_encode = NeedsEncodeWarned::default();
 
     // Send loop: demux TS → packetize H.264 → send via str0m.
     // Also processes incoming RTCP/STUN via drive_udp_io() to keep
@@ -1006,6 +1057,20 @@ async fn whep_viewer_loop(
 
                         let frames = demuxer.demux(payload);
                         for frame in frames {
+                            // Source audio this viewer would hear, dropped
+                            // for want of `audio_encode`: say so once.
+                            #[cfg(feature = "media-codecs")]
+                            if !needs_encode.audio
+                                && let Some(what) = audio_needs_encode_label(
+                                    &frame,
+                                    &demuxer,
+                                    audio_encode.is_some(),
+                                    audio_mid.is_some() && audio_pt.is_some(),
+                                )
+                            {
+                                needs_encode.audio = true;
+                                warn_codec_needs_encode(output_id, flow_id, events, "audio", &what, "audio_encode");
+                            }
                             match frame {
                                 super::webrtc::ts_demux::DemuxedFrame::H264 { nalus, pts, pts_known, .. } => {
                                     handle_webrtc_video_frame(
@@ -1024,6 +1089,15 @@ async fn whep_viewer_loop(
                                     ).await;
                                 }
                                 super::webrtc::ts_demux::DemuxedFrame::H265 { nalus, pts, pts_known, .. } => {
+                                    // WebRTC carries H.264: HEVC goes out
+                                    // re-encoded or not at all — said once.
+                                    if matches!(video_encoder_state, WebrtcVideoEncoderState::Disabled) {
+                                        if !needs_encode.video {
+                                            needs_encode.video = true;
+                                            warn_codec_needs_encode(output_id, flow_id, events, "video", "HEVC video", "video_encode");
+                                        }
+                                        continue;
+                                    }
                                     handle_webrtc_video_frame(
                                         WebrtcVideoSource::H265(&nalus),
                                         pts,
@@ -1207,9 +1281,9 @@ async fn whep_viewer_loop(
                                 // either way, silently.
                                 super::webrtc::ts_demux::DemuxedFrame::Mpeg2 { es, pts, pts_known, .. } => {
                                     if matches!(video_encoder_state, WebrtcVideoEncoderState::Disabled) {
-                                        if !mpeg2_warned {
-                                            mpeg2_warned = true;
-                                            warn_mpeg2_needs_encode(output_id, flow_id, events);
+                                        if !needs_encode.video {
+                                            needs_encode.video = true;
+                                            warn_codec_needs_encode(output_id, flow_id, events, "video", "MPEG-2 video", "video_encode");
                                         }
                                         continue;
                                     }
@@ -1471,7 +1545,7 @@ async fn whip_client_loop(
             };
         let mut video_encoder_state: WebrtcVideoEncoderState =
             init_webrtc_video_encoder_state(config.video_encode.as_ref());
-        let mut mpeg2_warned = false;
+        let mut needs_encode = NeedsEncodeWarned::default();
 
         // Send loop: demux TS → packetize H.264 → send via str0m.
         //
@@ -1512,6 +1586,20 @@ async fn whip_client_loop(
 
                             let frames = demuxer.demux(payload);
                             for frame in frames {
+                                // Source audio the peer would hear, dropped
+                                // for want of `audio_encode`: say so once.
+                                #[cfg(feature = "media-codecs")]
+                                if !needs_encode.audio
+                                    && let Some(what) = audio_needs_encode_label(
+                                        &frame,
+                                        &demuxer,
+                                        audio_encode.is_some(),
+                                        audio_mid.is_some() && audio_pt.is_some(),
+                                    )
+                                {
+                                    needs_encode.audio = true;
+                                    warn_codec_needs_encode(&config.id, flow_id, events, "audio", &what, "audio_encode");
+                                }
                                 match frame {
                                     super::webrtc::ts_demux::DemuxedFrame::H264 { nalus, pts, pts_known, .. } => {
                                         handle_webrtc_video_frame(
@@ -1530,6 +1618,15 @@ async fn whip_client_loop(
                                         ).await;
                                     }
                                     super::webrtc::ts_demux::DemuxedFrame::H265 { nalus, pts, pts_known, .. } => {
+                                        // WebRTC carries H.264: HEVC goes out
+                                        // re-encoded or not at all — said once.
+                                        if matches!(video_encoder_state, WebrtcVideoEncoderState::Disabled) {
+                                            if !needs_encode.video {
+                                                needs_encode.video = true;
+                                                warn_codec_needs_encode(&config.id, flow_id, events, "video", "HEVC video", "video_encode");
+                                            }
+                                            continue;
+                                        }
                                         handle_webrtc_video_frame(
                                             WebrtcVideoSource::H265(&nalus),
                                             pts,
@@ -1689,9 +1786,9 @@ async fn whip_client_loop(
                                     // and reported once (as on WHEP).
                                     super::webrtc::ts_demux::DemuxedFrame::Mpeg2 { es, pts, pts_known, .. } => {
                                         if matches!(video_encoder_state, WebrtcVideoEncoderState::Disabled) {
-                                            if !mpeg2_warned {
-                                                mpeg2_warned = true;
-                                                warn_mpeg2_needs_encode(&config.id, flow_id, events);
+                                            if !needs_encode.video {
+                                                needs_encode.video = true;
+                                                warn_codec_needs_encode(&config.id, flow_id, events, "video", "MPEG-2 video", "video_encode");
                                             }
                                             continue;
                                         }
@@ -2556,5 +2653,53 @@ mod rate_tests {
         }
         assert!(stamps.len() >= n - 3, "{} frames", stamps.len());
         assert!(stamps.windows(2).all(|w| w[1] == w[0] + 3_600), "{stamps:?}");
+    }
+}
+
+#[cfg(all(test, feature = "webrtc", feature = "media-codecs"))]
+mod needs_encode_tests {
+    use super::*;
+    use crate::engine::ts_demux::{DemuxedFrame, TsDemuxer};
+
+    /// `codec_needs_encode` on WebRTC is output-scoped with the flow in
+    /// `details` — the shape RTMP raises it in (it was flow-scoped, the
+    /// output only in `details`).
+    #[test]
+    fn the_warning_is_output_scoped() {
+        let (tx, mut rx) = crate::manager::events::event_channel();
+        warn_codec_needs_encode("out-w", "flow-w", &tx, "video", "HEVC video", "video_encode");
+        let ev = rx.try_recv().expect("event");
+        assert_eq!(ev.output_id.as_deref(), Some("out-w"));
+        assert!(ev.flow_id.is_none());
+        assert_eq!(ev.severity, EventSeverity::Warning);
+        assert_eq!(ev.category, category::WEBRTC);
+        let d = ev.details.unwrap();
+        assert_eq!(d["error_code"], "codec_needs_encode");
+        assert_eq!(d["essence"], "video");
+        assert_eq!(d["source_codec"], "HEVC video");
+        assert_eq!(d["needs"], "video_encode");
+        assert_eq!(d["flow_id"], "flow-w");
+        assert!(d.get("output_id").is_none());
+    }
+
+    /// Audio is reported only where `audio_encode` would help: a decodable
+    /// non-Opus source, a session that negotiated audio, no `audio_encode`.
+    #[test]
+    fn only_audio_an_opus_re_encode_could_carry_is_reported() {
+        let demuxer = TsDemuxer::new(None);
+        let other = |st: u8| DemuxedFrame::OtherAudio { stream_type: st, data: Vec::new(), pts: 0 };
+        let label = |f: &DemuxedFrame, set: bool, negotiated: bool| {
+            audio_needs_encode_label(f, &demuxer, set, negotiated)
+        };
+        assert_eq!(label(&other(0x81), false, true).as_deref(), Some("AC-3 audio (stream_type 0x81)"));
+        assert_eq!(label(&other(0x03), false, true).as_deref(), Some("MP2 audio (stream_type 0x03)"));
+        // AC-4: no decoder, so `audio_encode` could not help.
+        assert_eq!(label(&other(0xAC), false, true), None);
+        // `audio_encode` set, or a session with no audio (video_only): none.
+        assert_eq!(label(&other(0x81), true, true), None);
+        assert_eq!(label(&other(0x81), false, false), None);
+        // AAC whose profile the demuxer has not read: not claimed.
+        let aac = DemuxedFrame::Aac { data: Vec::new(), pts: 0 };
+        assert_eq!(label(&aac, false, true), None);
     }
 }

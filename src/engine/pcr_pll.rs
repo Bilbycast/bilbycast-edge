@@ -162,7 +162,7 @@ pub const DEFAULT_KP: f64 = 0.10;
 pub const DEFAULT_KI: f64 = 0.005;
 
 /// 33-bit PCR base × 300 — full 27 MHz PCR modulus. Wraps every
-/// ~95 hours.
+/// ≈ 26.5 hours (2^33 / 90 kHz ≈ 95 444 s).
 pub const PCR_MODULUS_27MHZ: u64 = (1u64 << 33) * 300;
 
 /// Tunable parameters for the PLL loop filter.

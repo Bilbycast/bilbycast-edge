@@ -28,17 +28,30 @@ use video_codec::{
 };
 
 /// Lock-free cell that publishes the backend a [`ScaledVideoEncoder`]
-/// actually opened with after lazy-open. `0` = unset (encoder not yet
-/// opened); `1..=10` map to the ten [`VideoEncoderCodec`] variants.
-/// Snapshot path maps the value back to the operator-facing label so
-/// the manager-UI badge tracks the resolved backend after Auto-chain
-/// demotion (e.g., NVENC → x264 fallback).
+/// actually opened with after lazy-open, and the scan it codes. Backend:
+/// `0` = unset (encoder not yet opened); `1..=10` map to the ten
+/// [`VideoEncoderCodec`] variants. Snapshot path maps the value back to
+/// the operator-facing label so the manager-UI badge tracks the resolved
+/// backend after Auto-chain demotion (e.g., NVENC → x264 fallback). Scan:
+/// `0` = unset, then progressive / top field first / bottom field first,
+/// rewritten on every (re)open — `video_encode_stats.coded_scan`.
 #[derive(Default, Debug)]
-pub struct ResolvedBackendCell(AtomicU8);
+pub struct ResolvedBackendCell {
+    backend: AtomicU8,
+    scan: AtomicU8,
+}
 
 impl ResolvedBackendCell {
-    pub fn store(&self, codec: VideoEncoderCodec) {
-        self.0.store(codec_to_u8(codec), Ordering::Relaxed);
+    /// Record an open: the backend and the field order it codes (`None` =
+    /// progressive).
+    pub fn store(&self, codec: VideoEncoderCodec, field_order: Option<VideoFieldOrder>) {
+        self.backend.store(codec_to_u8(codec), Ordering::Relaxed);
+        let scan = match field_order {
+            None => 1,
+            Some(VideoFieldOrder::Tff) => 2,
+            Some(VideoFieldOrder::Bff) => 3,
+        };
+        self.scan.store(scan, Ordering::Relaxed);
     }
 
     /// Returns `Some(label)` once the encoder has lazy-opened, where
@@ -47,7 +60,20 @@ impl ResolvedBackendCell {
     /// `"vaapi"`). `None` means the encoder hasn't opened yet, so the
     /// caller should keep using the requested-codec label.
     pub fn label(&self) -> Option<&'static str> {
-        u8_to_codec(self.0.load(Ordering::Relaxed)).map(backend_label)
+        u8_to_codec(self.backend.load(Ordering::Relaxed)).map(backend_label)
+    }
+
+    /// The scan the open encoder codes — `"progressive"`,
+    /// `"interlaced_tff"` or `"interlaced_bff"` — or `None` before the
+    /// first open. What `video_encode.scan` actually resolved to (`auto`
+    /// and a refused `interlaced` both land here as what was coded).
+    pub fn coded_scan(&self) -> Option<&'static str> {
+        match self.scan.load(Ordering::Relaxed) {
+            1 => Some("progressive"),
+            2 => Some("interlaced_tff"),
+            3 => Some("interlaced_bff"),
+            _ => None,
+        }
     }
 }
 
@@ -91,6 +117,42 @@ fn backend_label(c: VideoEncoderCodec) -> &'static str {
         VideoEncoderCodec::H264Vaapi | VideoEncoderCodec::HevcVaapi => "vaapi",
         VideoEncoderCodec::H264Rkmpp | VideoEncoderCodec::HevcRkmpp => "rkmpp",
     }
+}
+
+/// Raise `video_encode_interlace_unavailable` for a re-encoding RTMP or
+/// CMAF output (`kind`), from the notice its pipeline left at open
+/// ([`ScaledVideoEncoder::take_interlace_notice`]) — once per encoder open.
+/// Same Warning the TS replacer raises on its own scope: output-scoped,
+/// category `video_encode`, details `{error_code, reason,
+/// source_stream_type}`. These paths see a codec rather than a PMT, so
+/// `source_stream_type` is that codec's standard stream_type (H.264
+/// `0x1B`, HEVC `0x24`, MPEG-2 `0x02`).
+pub fn emit_output_interlace_unavailable(
+    events: &crate::manager::events::EventSender,
+    kind: &str,
+    output_id: &str,
+    why: &str,
+    source: video_codec::VideoCodec,
+) {
+    let source_stream_type: u8 = match source {
+        video_codec::VideoCodec::H264 => 0x1B,
+        video_codec::VideoCodec::Hevc => 0x24,
+        video_codec::VideoCodec::Mpeg2 => 0x02,
+    };
+    events.emit_output_with_details(
+        crate::manager::events::EventSeverity::Warning,
+        crate::manager::events::category::VIDEO_ENCODE,
+        format!(
+            "{kind} output '{output_id}': video_encode.scan=interlaced cannot be honoured — \
+             {why}; encoding progressive"
+        ),
+        output_id,
+        serde_json::json!({
+            "error_code": "video_encode_interlace_unavailable",
+            "reason": why,
+            "source_stream_type": source_stream_type,
+        }),
+    );
 }
 
 /// libx264 / libx265 tune vocabulary.
@@ -1673,7 +1735,8 @@ impl ScaledVideoEncoder {
     /// successful lazy-open. Call sites that surface a backend label
     /// in stats use this so the manager-UI badge tracks the actually-
     /// opened backend rather than the requested one (Auto-chain
-    /// demotion would otherwise show a stale label).
+    /// demotion would otherwise show a stale label), and so
+    /// `video_encode_stats.coded_scan` reports the scan it opened with.
     pub fn set_resolved_backend_sink(&mut self, sink: std::sync::Arc<ResolvedBackendCell>) {
         self.resolved_backend_sink = Some(sink);
     }
@@ -2094,7 +2157,7 @@ impl ScaledVideoEncoder {
                     self.sar_pending = None;
                     self.encoder = Some(encoder);
                     if let Some(sink) = &self.resolved_backend_sink {
-                        sink.store(candidate);
+                        sink.store(candidate, field_order);
                     }
                     self.field_order = field_order;
                     // Only a woven source has two fields to keep apart; a
@@ -3153,10 +3216,49 @@ mod sar_tests {
 
 #[cfg(all(test, feature = "media-codecs"))]
 mod scan_tests {
-    use super::{field_coding_plan, open_attempts, SourceScan};
+    use super::{field_coding_plan, open_attempts, ResolvedBackendCell, SourceScan};
     use crate::config::models::VideoScan;
     use video_codec::VideoEncoderCodec::*;
     use video_codec::VideoFieldOrder::{Bff, Tff};
+
+    /// RTMP / CMAF raise `video_encode_interlace_unavailable` with the TS
+    /// replacer's shape: output-scoped, category `video_encode`, the
+    /// source codec's stream_type.
+    #[test]
+    fn the_rtmp_and_cmaf_interlace_warning_has_the_ts_shape() {
+        let (tx, mut rx) = crate::manager::events::event_channel();
+        super::emit_output_interlace_unavailable(
+            &tx,
+            "RTMP",
+            "rtmp-1",
+            "no backend could",
+            video_codec::VideoCodec::Mpeg2,
+        );
+        let ev = rx.try_recv().expect("event");
+        assert_eq!(ev.output_id.as_deref(), Some("rtmp-1"));
+        assert!(ev.flow_id.is_none() && ev.input_id.is_none());
+        assert_eq!(ev.severity, crate::manager::events::EventSeverity::Warning);
+        assert_eq!(ev.category, crate::manager::events::category::VIDEO_ENCODE);
+        assert!(ev.message.starts_with("RTMP output 'rtmp-1': "), "{}", ev.message);
+        let d = ev.details.unwrap();
+        assert_eq!(d["error_code"], "video_encode_interlace_unavailable");
+        assert_eq!(d["reason"], "no backend could");
+        assert_eq!(d["source_stream_type"], 0x02);
+    }
+
+    /// `coded_scan` is unset until an open, then names the scan of the
+    /// latest (re)open — a reopen at another scan overwrites it.
+    #[test]
+    fn the_resolved_backend_cell_carries_the_coded_scan() {
+        let cell = ResolvedBackendCell::default();
+        assert_eq!((cell.label(), cell.coded_scan()), (None, None));
+        cell.store(H264Nvenc, Some(Bff));
+        assert_eq!((cell.label(), cell.coded_scan()), (Some("nvenc"), Some("interlaced_bff")));
+        cell.store(X264, Some(Tff));
+        assert_eq!((cell.label(), cell.coded_scan()), (Some("x264"), Some("interlaced_tff")));
+        cell.store(X264, None);
+        assert_eq!(cell.coded_scan(), Some("progressive"));
+    }
 
     #[test]
     fn auto_field_codes_only_a_woven_source_on_a_ts_path_unscaled() {
@@ -3313,13 +3415,19 @@ mod scan_x264_tests {
         });
         assert_eq!(p.field_order(), Some(VideoFieldOrder::Tff));
         assert_eq!(p.take_interlace_notice(), None);
-        // `auto` off a TS path (RTMP / WebRTC / CMAF) stays progressive.
+        // `auto` off a TS path (RTMP / WebRTC / CMAF) stays progressive —
+        // and the stats cell says what was coded, not what was asked.
         let mut p = pipeline(VideoScan::Auto);
+        let cell = std::sync::Arc::new(super::ResolvedBackendCell::default());
+        p.set_resolved_backend_sink(cell.clone());
+        assert_eq!(cell.coded_scan(), None, "nothing coded before the open");
         p.set_source_codec(VideoCodec::H264);
         with_interlaced_frames(|f| {
             p.encode(f, Some(0)).unwrap();
         });
         assert_eq!(p.field_order(), None);
+        assert_eq!(cell.coded_scan(), Some("progressive"));
+        assert_eq!(cell.label(), Some("x264"));
         let mut p = pipeline(VideoScan::Auto);
         p.set_source_codec(VideoCodec::H264);
         p.allow_auto_field_coding();
@@ -3327,5 +3435,19 @@ mod scan_x264_tests {
             p.encode(f, Some(0)).unwrap();
         });
         assert_eq!(p.field_order(), Some(VideoFieldOrder::Tff));
+    }
+
+    /// `video_encode_stats.coded_scan` reports a field-coded open with its
+    /// field order.
+    #[test]
+    fn the_stats_cell_reports_a_field_coded_open() {
+        let mut p = pipeline(VideoScan::Interlaced);
+        let cell = std::sync::Arc::new(super::ResolvedBackendCell::default());
+        p.set_resolved_backend_sink(cell.clone());
+        p.set_source_codec(VideoCodec::H264);
+        with_interlaced_frames(|f| {
+            p.encode(f, Some(0)).unwrap();
+        });
+        assert_eq!(cell.coded_scan(), Some("interlaced_tff"));
     }
 }

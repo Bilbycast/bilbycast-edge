@@ -2491,6 +2491,12 @@ fn validate_st2110_audio_input(c: &St2110AudioInputConfig, profile: St2110Profil
             // re-packetises AES3 bytes into a SMPTE 302M private PES with
             // no decode step (bit-for-bit preservation of 337M sub-frames).
             if let Some(ref ae) = c.audio_encode {
+                reject_ts_signalling(
+                    ae,
+                    &format!("{label} input"),
+                    "an AES3 input's MPEG-TS is built by the shared muxer (SMPTE 302M, \
+                     not AC-3)",
+                )?;
                 validate_audio_encode(
                     ae,
                     AES3_INPUT_AUDIO_CODECS,
@@ -4640,7 +4646,8 @@ fn validate_video_encode(
     }
     // ── scan ──────────────────────────────────────────────────────────
     // `interlaced` field-codes on H.264 only, and only on the backends
-    // FFmpeg gives an interlaced tool (libx264 MBAFF, h264_nvenc, h264_qsv).
+    // FFmpeg gives an interlaced tool (libx264 MBAFF, h264_nvenc / h264_qsv
+    // field pictures).
     // `h264_auto` / `auto` are accepted: the resolver chain is walked for
     // the first backend that can, and falls back to progressive with a
     // Warning when none on the host can. An explicit backend that cannot
@@ -4808,6 +4815,18 @@ fn validate_audio_encode(
         );
     }
 
+    // AC-3 PMT carriage choice: meaningful for an AC-3 target only.
+    // Accepting it on another codec would be a silent no-op. Checked ahead
+    // of the s302m branch below, which returns early: an s302m block with
+    // `ts_signalling` used to pass.
+    if enc.ts_signalling.is_some() && enc.codec != "ac3" {
+        bail!(
+            "{context}: audio_encode.ts_signalling only applies to codec=ac3 (it selects \
+             the AC-3 PMT carriage), got codec={}",
+            enc.codec
+        );
+    }
+
     // SMPTE 302M is a lossless wrap, not an encoder — it has a different
     // field set than the compressed codecs and must be checked apart.
     if enc.codec == "s302m" {
@@ -4901,15 +4920,6 @@ fn validate_audio_encode(
                 "{context}: audio_encode.opus_frame_duration_ms must be one of 5, 10, 20, 40, 60, got {d}"
             );
         }
-    // AC-3 PMT carriage choice: meaningful for an AC-3 target only.
-    // Accepting it on another codec would be a silent no-op.
-    if enc.ts_signalling.is_some() && enc.codec != "ac3" {
-        bail!(
-            "{context}: audio_encode.ts_signalling only applies to codec=ac3 (it selects \
-             the AC-3 PMT carriage), got codec={}",
-            enc.codec
-        );
-    }
     // Source PID override: must sit in the user-PID range; reserved
     // system PIDs (0x0000..=0x000F) and the NULL PID (0x1FFF) refused.
     if let Some(pid) = enc.source_audio_pid
@@ -4923,8 +4933,9 @@ fn validate_audio_encode(
 
 /// Refuse `audio_encode.ts_signalling` where no TS audio replacer runs, so
 /// the setting cannot be saved as a silent no-op: HLS always signals AC-3
-/// the ATSC way (Apple HLS / hls.js expect 0x81), and PCM inputs build
-/// their TS with the shared muxer rather than the replacer.
+/// the ATSC way (Apple HLS / hls.js expect 0x81), and the PCM inputs
+/// (ST 2110-30 / -31, `rtp_audio`, SDI, MXL audio) build their TS with the
+/// shared muxer rather than the replacer.
 fn reject_ts_signalling(
     enc: &crate::config::models::AudioEncodeConfig,
     context: &str,
@@ -6879,6 +6890,13 @@ fn validate_sdi_input(c: &crate::config::models::SdiInputConfig) -> Result<()> {
             "{ctx}: pixel_format=v210 (10-bit) is not implemented yet — use uyvy422"
         );
     }
+    if let Some(ref ae) = c.audio_encode {
+        reject_ts_signalling(
+            ae,
+            &ctx,
+            "an SDI input's MPEG-TS is built by the shared muxer",
+        )?;
+    }
     // video_encode is mandatory for SDI — same as MXL video / ST 2110-20.
     validate_video_encode(&c.video_encode, &ctx)?;
     refuse_interlaced_raw_ingest(&c.video_encode, &ctx)?;
@@ -6996,6 +7014,13 @@ fn validate_mxl_audio_input(c: &crate::config::models::MxlAudioInputConfig) -> R
     validate_mxl_clock_domain(c.clock_domain, &ctx)?;
     validate_mxl_channels(c.channels, &ctx)?;
     validate_mxl_packet_time_us(c.packet_time_us, &ctx)?;
+    if let Some(ref ae) = c.audio_encode {
+        reject_ts_signalling(
+            ae,
+            &ctx,
+            "an MXL audio input carries PCM; no MPEG-TS audio replacer runs on it",
+        )?;
+    }
     Ok(())
 }
 
@@ -11938,6 +11963,54 @@ mod tests {
         // Unset stays unset on the wire.
         let v = serde_json::to_value(make_audio_encode("ac3")).unwrap();
         assert!(v.get("ts_signalling").is_none());
+    }
+
+    /// The PCM inputs that accept `audio_encode` build their TS with the
+    /// shared muxer, so `ts_signalling` there would be saved and do
+    /// nothing: SDI, MXL audio and ST 2110-31 refuse it (ST 2110-30 and
+    /// `rtp_audio` already did). ST 2110-31 takes only `s302m`, whose
+    /// early return in `validate_audio_encode` used to skip the AC-3 check
+    /// — so an s302m block with `ts_signalling` is refused on any output
+    /// too.
+    #[test]
+    fn ts_signalling_is_refused_on_the_muxer_built_pcm_inputs() {
+        use crate::config::models::TsAudioSignalling;
+        let ac3 = |v| {
+            let mut e = make_audio_encode("ac3");
+            e.ts_signalling = Some(v);
+            e
+        };
+
+        let mut sdi = sdi_config("uyvy422", "x264", None, None);
+        sdi.audio_encode = Some(ac3(TsAudioSignalling::Dvb));
+        let e = super::validate_sdi_input(&sdi).unwrap_err().to_string();
+        assert!(e.contains("ts_signalling") && e.contains("SDI"), "{e}");
+
+        let mut mxl: crate::config::models::MxlAudioInputConfig =
+            serde_json::from_value(serde_json::json!({
+                "domain_path": "/dev/shm/mxl",
+                "flow_name": "audio-1",
+                "clock_domain": 0,
+            }))
+            .unwrap();
+        super::validate_mxl_audio_input(&mxl).expect("the fixture is valid");
+        mxl.audio_encode = Some(ac3(TsAudioSignalling::Atsc));
+        let e = super::validate_mxl_audio_input(&mxl).unwrap_err().to_string();
+        assert!(e.contains("ts_signalling") && e.contains("MXL"), "{e}");
+
+        let mut aes3 = st2110_30_input("239.10.10.1:5004");
+        let mut s302m = make_audio_encode("s302m");
+        aes3.audio_encode = Some(s302m.clone());
+        validate_st2110_audio_input(&aes3, St2110Profile::Aes3).expect("s302m on -31");
+        s302m.ts_signalling = Some(TsAudioSignalling::Dvb);
+        aes3.audio_encode = Some(s302m.clone());
+        let e = validate_st2110_audio_input(&aes3, St2110Profile::Aes3)
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("ts_signalling"), "{e}");
+        // The s302m early return no longer hides it anywhere.
+        let e = validate_audio_encode(&s302m, &["s302m"], "test").unwrap_err().to_string();
+        assert!(e.contains("ts_signalling"), "{e}");
     }
 
     #[test]

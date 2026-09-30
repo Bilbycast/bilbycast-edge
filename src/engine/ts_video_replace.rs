@@ -304,7 +304,8 @@ pub struct VideoEncodeStats {
     /// Source video stream_type byte (e.g. `0x1B` for H.264). Set
     /// alongside `source_pid` once the PMT is observed. `0` means unknown.
     pub source_stream_type: std::sync::atomic::AtomicU8,
-    /// Backend the encoder actually opened with after lazy-open. The
+    /// Backend the encoder actually opened with after lazy-open, and the
+    /// scan it codes (`coded_scan` on the snapshot). The
     /// snapshot path prefers this over the requested-codec label
     /// captured on the stats handle, so the manager-UI badge reflects
     /// Auto-chain demotion (e.g. NVENC → x264 fallback). The encoder
@@ -2152,6 +2153,17 @@ mod inner {
                     default_gop_frames,
                     default_gop_frames as f64 / measured_fps,
                 );
+                self.emit_fps_mismatch(
+                    "pinned",
+                    (mn, md),
+                    (en, ed),
+                    Some((n, d)),
+                    &format!(
+                        "the source measures {measured_fps:.3} fps but video_encode.fps_num / \
+                         fps_den pin {n}/{d} ({encoder_fps:.3} fps)"
+                    ),
+                    ratio,
+                );
             } else {
                 let cause = self.mismatch_cause();
                 let why = match cause {
@@ -2186,6 +2198,64 @@ mod inner {
                     ratio,
                     encoder_fps,
                 );
+                self.emit_fps_mismatch(cause, (mn, md), (en, ed), None, &why, ratio);
+            }
+        }
+
+        /// The manager-visible half of `video_encode_fps_mismatch`, raised
+        /// alongside the log line above and exactly as often: once per
+        /// source (`fps_mismatch_warned`, re-armed by a source reset).
+        /// Scoped like the decode-stall Warning — the output, or the input
+        /// on the ingress transcoder. `cause` is `pinned` / `input_switch`
+        /// / `fallback` / `cadence_change`; the rates are the measured
+        /// source rate and the rate the encoder runs at, plus the pin when
+        /// `cause` is `pinned`.
+        pub(super) fn emit_fps_mismatch(
+            &self,
+            cause: &str,
+            source: (u32, u32),
+            encoder: (u32, u32),
+            pinned: Option<(u32, u32)>,
+            why: &str,
+            ratio: f64,
+        ) {
+            let Some(es) = self.event_sender.as_ref() else {
+                return;
+            };
+            let noun = if self.decode_stall_input_scope { "Input" } else { "Output" };
+            let remedy = if pinned.is_some() {
+                "remove the pinned rate or set it to the source's".to_string()
+            } else {
+                format!(
+                    "restart the {} to lock the measured rate, or pin video_encode.fps_num / \
+                     fps_den",
+                    noun.to_ascii_lowercase()
+                )
+            };
+            let message = format!(
+                "{noun} '{}': video_encode frame rate mismatch ({cause}): {why}. Every frame is \
+                 still encoded on the source clock, but the bitrate runs ~{ratio:.2}x the \
+                 configured value and the stream advertises the encoder's rate — {remedy}",
+                self.output_id,
+            );
+            let mut details = serde_json::json!({
+                "error_code": "video_encode_fps_mismatch",
+                "cause": cause,
+                "source_fps_num": source.0,
+                "source_fps_den": source.1,
+                "encoder_fps_num": encoder.0,
+                "encoder_fps_den": encoder.1,
+            });
+            if let Some((n, d)) = pinned {
+                details["pinned_fps_num"] = n.into();
+                details["pinned_fps_den"] = d.into();
+            }
+            let severity = crate::manager::events::EventSeverity::Warning;
+            let category = crate::manager::events::category::VIDEO_ENCODE;
+            if self.decode_stall_input_scope {
+                es.emit_input_with_details(severity, category, message, &self.output_id, details);
+            } else {
+                es.emit_output_with_details(severity, category, message, &self.output_id, details);
             }
         }
 
@@ -3431,6 +3501,43 @@ mod tests {
         assert_eq!(d["reason"], "no backend could");
     }
 
+    /// `video_encode_fps_mismatch` reaches the manager as a Warning on the
+    /// replacer's scope (the output here, the input on the ingress path),
+    /// with the rates as integers and the pin only when `cause` is
+    /// `pinned`.
+    #[test]
+    fn fps_mismatch_is_a_warning_event_with_the_rates() {
+        let mut r = TsVideoReplacer::new(&cfg("x264"), None).unwrap();
+        let (tx, mut rx) = crate::manager::events::event_channel();
+        r.set_decode_stall_watchdog(tx, "out-f");
+        r.inner.emit_fps_mismatch("cadence_change", (25, 1), (30_000, 1001), None, "why", 1.2);
+        let ev = rx.try_recv().expect("event");
+        assert_eq!(ev.output_id.as_deref(), Some("out-f"));
+        assert!(ev.input_id.is_none() && ev.flow_id.is_none());
+        assert_eq!(ev.severity, crate::manager::events::EventSeverity::Warning);
+        assert_eq!(ev.category, crate::manager::events::category::VIDEO_ENCODE);
+        let d = ev.details.unwrap();
+        assert_eq!(d["error_code"], "video_encode_fps_mismatch");
+        assert_eq!(d["cause"], "cadence_change");
+        assert_eq!(d["source_fps_num"], 25);
+        assert_eq!(d["source_fps_den"], 1);
+        assert_eq!(d["encoder_fps_num"], 30_000);
+        assert_eq!(d["encoder_fps_den"], 1001);
+        assert!(d.get("pinned_fps_num").is_none() && d.get("pinned_fps_den").is_none());
+
+        let mut r = TsVideoReplacer::new(&cfg("x264"), None).unwrap();
+        let (tx, mut rx) = crate::manager::events::event_channel();
+        r.set_decode_stall_watchdog_input(tx, "in-f");
+        r.inner.emit_fps_mismatch("pinned", (30_000, 1001), (25, 1), Some((25, 1)), "why", 1.2);
+        let ev = rx.try_recv().expect("event");
+        assert_eq!(ev.input_id.as_deref(), Some("in-f"));
+        assert!(ev.output_id.is_none());
+        let d = ev.details.unwrap();
+        assert_eq!(d["cause"], "pinned");
+        assert_eq!(d["pinned_fps_num"], 25);
+        assert_eq!(d["pinned_fps_den"], 1);
+    }
+
     /// An H.264 source whose SPS never shows: after `SPS_OPEN_WAIT_AUS` PES the
     /// decoder opens anyway, seeded from the AU in hand — an undeclared
     /// reorder depth, so 1 (the depth that keeps a non-IDR join clean).
@@ -3733,10 +3840,26 @@ mod tests {
                 }
             }
             let mut r = TsVideoReplacer::new(&cfg("x264"), None).unwrap();
+            let (tx, mut rx) = crate::manager::events::event_channel();
+            r.set_decode_stall_watchdog(tx, "out-r");
             let _ = run(&mut r, &ts);
             assert_eq!(r.inner.pipeline.fps(), (30, 1));
             assert!(r.inner.fps_mismatch_warned, "25 fps measured against 30");
             assert_eq!(r.inner.mismatch_cause(), "fallback");
+            // The warning reached the manager, once, naming the same cause.
+            let mut mismatches = Vec::new();
+            while let Ok(ev) = rx.try_recv() {
+                let d = ev.details.unwrap_or_default();
+                if d["error_code"] == "video_encode_fps_mismatch" {
+                    mismatches.push(d);
+                }
+            }
+            assert_eq!(mismatches.len(), 1, "{mismatches:?}");
+            assert_eq!(mismatches[0]["cause"], "fallback");
+            assert_eq!(mismatches[0]["source_fps_num"], 25);
+            assert_eq!(mismatches[0]["source_fps_den"], 1);
+            assert_eq!(mismatches[0]["encoder_fps_num"], 30);
+            assert_eq!(mismatches[0]["encoder_fps_den"], 1);
 
             r.inner.rate_origin = Some(RateOrigin::Cadence);
             assert_eq!(r.inner.mismatch_cause(), "cadence_change");

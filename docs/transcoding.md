@@ -20,11 +20,11 @@ applicable / by design.
 | **RIST**   | ✅              | ✅ (requires `audio_encode`) | ✅ | TS-carrying; same plumbing as SRT/UDP/RTP. |
 | **RTMP**   | ✅              | ✅ (requires `audio_encode`) | ✅ | H.264 target rides classic FLV; HEVC target rides [Enhanced RTMP v2](https://veovera.org/docs/enhanced/enhanced-rtmp-v2) with FourCC `hvc1`. Transcode disables the same-codec AAC passthrough fast-path. HEVC passthrough (no `video_encode` set) also emits E-RTMP tags. An MP2 / AC-3 / E-AC-3 source's `audio_encode` is opened at the format the source decodes to (it waited for an AAC config such a source never has, and dropped the audio unless `silent_fallback` was set). An MPEG-2 video source is decoded and re-encoded with `video_encode` (it was dropped whatever the config said); without `video_encode` — or an MP2 / AC-3 / E-AC-3 source without `audio_encode` — the essence is dropped and a Warning `codec_needs_encode` says so once per connection. |
 | **HLS**    | ✅              | ✅ (in-process remux only) | ⏳ | `media-codecs` feature required for transcode; subprocess fallback ignores it with a warning. |
-| **WebRTC** | ✅              | ✅ (`transcode.channels` overrides Opus channel count; unset keeps source) | ✅ | H.264 target only (browsers do not decode HEVC); SPS/PPS emitted in-band on every IDR via `global_header = false`. HEVC sources are decoded and re-encoded to H.264 automatically, and so are MPEG-2 sources (dropped until 2026-09; without `video_encode` an MPEG-2 source's picture is dropped with a Warning `codec_needs_encode` per session). An MP2 / AC-3 / E-AC-3 source's Opus encoder is opened at the format the source decodes to (it waited for an AAC config such a source never has). No scaling / no force-IDR on PLI yet (encoder GOP cadence drives keyframes). |
+| **WebRTC** | ✅              | ✅ (`transcode.channels` overrides Opus channel count; unset keeps source) | ✅ | H.264 target only (browsers do not decode HEVC); SPS/PPS emitted in-band on every IDR via `global_header = false`. HEVC sources are decoded and re-encoded to H.264 when `video_encode` is set, and so are MPEG-2 sources (dropped until 2026-09). Without `video_encode` an MPEG-2 or HEVC source's picture is dropped with a Warning `codec_needs_encode` once per session (the HEVC case from edge 0.113.0), and so — edge 0.113.0+ — is the audio of an AAC-LC / MP2 / AC-3 / E-AC-3 / AAC-LATM source with no `audio_encode` on a session that carries audio. An MP2 / AC-3 / E-AC-3 source's Opus encoder is opened at the format the source decodes to (it waited for an AAC config such a source never has). No scaling / no force-IDR on PLI yet (encoder GOP cadence drives keyframes). |
 | **ST 2110-30 / `rtp_audio`** | ✅ (auto via compressed-audio bridge) | ✅ (native PCM transcode, bit-depth + SRC + shuffle) | ❌ | Uncompressed PCM outputs; transcode is first-class here. |
 | **ST 2110-31** | ✅ | ❌ (AES3 opaque — channel labels inside SMPTE 337M payload, not addressable from the pipeline) | ❌ | |
 | **ST 2110-40** | ❌ | ❌ | ❌ | Ancillary data — no codec concept. |
-| **CMAF / CMAF-LL** | ✅ (AAC family only) | ✅ (requires `audio_encode`; channel routing in the stage, the rate in the encoder's resampler — accepted and ignored before 2026-09) | ✅ | fMP4 / CMAF segments with HLS m3u8 + DASH MPD; the operator's `gop_size` is honoured when `video_encode` is set, and segments cut on that GOP's IDRs, so a set one should divide `segment_duration × fps`; unset, the GOP tiles the segment at the measured source rate (at most 2 s per GOP — 50 frames for 2 s segments at 25 fps, 60 at 29.97). An MPEG-2 video source is decoded and re-encoded with `video_encode` (dropped until 2026-09 — the output published nothing, its audio shed for want of a video segment; without `video_encode` a Warning `codec_needs_encode` says so). Codec work runs in `block_in_place`. See [`docs/cmaf.md`](cmaf.md) for the full reference. |
+| **CMAF / CMAF-LL** | ✅ (AAC family only) | ✅ (requires `audio_encode`; channel routing in the stage, the rate in the encoder's resampler — accepted and ignored before 2026-09) | ✅ | fMP4 / CMAF segments with HLS m3u8 + DASH MPD; the operator's `gop_size` is honoured when `video_encode` is set, and segments cut on that GOP's IDRs, so a set one should divide `segment_duration × fps`; unset, the GOP tiles the segment at the measured source rate (at most 2 s per GOP — 50 frames for 2 s segments at 25 fps, 60 at 29.97). An MPEG-2 video source is decoded and re-encoded with `video_encode` (dropped until 2026-09 — the output published nothing, its audio shed for want of a video segment; without `video_encode` a Warning `codec_needs_encode` says so, as it does — edge 0.113.0+ — for an MP2 / AC-3 / E-AC-3 / AAC-LATM audio source with no `audio_encode`). Codec work runs in `block_in_place`. See [`docs/cmaf.md`](cmaf.md) for the full reference. |
 
 ---
 
@@ -267,7 +267,10 @@ and every other section on the PMT PID, is copied byte-for-byte.
   `ts_signalling: "atsc"` to keep the old stream_type. `ts_signalling` is
   refused on any codec but `ac3`, on HLS (always ATSC — what Apple HLS and
   hls.js expect in TS segments) and on PCM inputs (their TS comes from
-  the shared muxer).
+  the shared muxer): ST 2110-30, `rtp_audio`, and — edge 0.113.0+, which
+  accepted and ignored it before — ST 2110-31 (`s302m`), SDI and MXL
+  audio. Capability `audio-ts-signalling` (edge 0.113.0+; 0.112.0 honours
+  the field but advertises only `video-encode-scan`).
 
   The HLS pin covers HLS's **own** `audio_encode` remux only. An HLS
   output without `audio_encode` segments whatever the flow carries, so
@@ -1182,17 +1185,23 @@ It is settled once, when the encoder lazy-opens, from the frame in hand:
 | `progressive` | never | progressive — the old bitstream, byte for byte |
 | `interlaced` | always, on the first backend in the chain that can code fields — from a progressive source too (both fields from one instant, top first) | progressive with Warning `video_encode_interlace_unavailable` when no backend in the chain opens for fields, or the source's decoder hands out one field per picture |
 
-Field coding is **H.264 MBAFF** with `pic_struct` in the picture-timing SEI,
-in the source's field order (TFF / BFF, followed frame by frame across an
-input switch), on the backends FFmpeg gives an interlaced tool: **libx264**
-always, **h264_nvenc** and **h264_qsv** where the GPU allows it (the open is
-refused otherwise — an Intel Arrow Lake iGPU, for one, refuses QSV field encode). No HEVC
-encoder codes field pictures, and `h264_vaapi` / `h264_rkmpp` ignore the
-request, so validation refuses `interlaced` with those codecs. `auto` follows
-the backend the resolver lands on: on an Intel host whose `h264_auto` chain
-starts with a QSV that refuses fields, `auto` codes progressive on QSV rather
-than demoting to libx264 to get them; `interlaced` walks the chain for one
-that can. MBAFF costs libx264 roughly 20-30 % more CPU.
+Field coding is H.264 in the source's field order (TFF / BFF, followed frame
+by frame across an input switch), on the backends FFmpeg gives an interlaced
+tool, and what it codes depends on the backend: **libx264** codes **MBAFF**
+(with `pic_struct` in the picture-timing SEI), always; **h264_nvenc** and
+**h264_qsv** code **field pictures** (not MBAFF), where the GPU supports
+field encoding — the open is refused otherwise, and many Intel GPUs cannot
+field-code at all (an Arrow Lake iGPU, for one, refuses QSV field encode), so
+on those `auto` stays progressive. No HEVC encoder codes field pictures, and
+`h264_vaapi` / `h264_rkmpp` ignore the request, so validation refuses
+`interlaced` with those codecs. `auto` follows the backend the resolver lands
+on: on an Intel host whose `h264_auto` chain starts with a QSV that refuses
+fields, `auto` codes progressive on QSV rather than demoting to libx264 to get
+them; `interlaced` walks the chain for one that can (with `h264_auto` on a
+VAAPI or Rockchip host that means libx264, on the CPU). MBAFF costs libx264
+roughly 20-30 % more CPU. What an encoder actually opened with is reported
+on its stats as `video_encode_stats.coded_scan` (`progressive`,
+`interlaced_tff`, `interlaced_bff`; edge 0.113.0+).
 
 With `interlaced`, a resize is done **per field**: each field is scaled on
 its own and the two are woven back, so a 1080i → 576i conversion keeps its
@@ -1237,8 +1246,9 @@ content-anchored lip-sync (within ±0.003 ms on the 2-minute capture — not
 the 30-minute gate 3 window).
 
 Behaviour change: an interlaced H.264 / MPEG-2 source on a TS output's
-transcode with no `scan` set now comes out MBAFF where the host's backend can
-code fields (an input's transcode is unchanged). Gate 7 (a professional IRD)
+transcode with no `scan` set now comes out field-coded where the host's
+backend can code fields — MBAFF on libx264, field pictures on h264_nvenc /
+h264_qsv (an input's transcode is unchanged). Gate 7 (a professional IRD)
 has not been run on it — only ffmpeg decodes were checked; `scan:
 progressive` restores the old bitstream.
 
@@ -1859,7 +1869,8 @@ commit message or release note and delete the bullet.
    (`2 × fps`) spans the wrong duration, and the SPS VUI advertises the
    wrong rate. The edge logs `video_encode_fps_mismatch` once per
    source when the measured rate disagrees with the rate the encoder runs
-   at, and `cause` says why it runs at that rate: a pin (`pinned`); on
+   at (and, edge 0.113.0+, raises it as a Warning event on the output or
+   input, with the rates in `details`), and `cause` says why it runs at that rate: a pin (`pinned`); on
    the TS path an earlier source's rate kept across a source reset
    (`input_switch`), the fallback taken because the first decoded frames
    carried no usable PTS (`fallback`), or this same source's cadence
@@ -2088,7 +2099,8 @@ options the current binary cannot satisfy.
 | `video-encoder-qsv`         | Built with `--features video-encoder-qsv` (x86_64 only).       |
 | `video-encoder-vaapi`       | Built with `--features video-encoder-vaapi` (Linux).          |
 | `video-encoder-rkmpp`       | Built with `--features video-encoder-rkmpp` (aarch64 Rockchip only). |
-| `video-encode-scan`         | Always (this release on): `video_encode.scan` is honoured. An older edge ignores the field on a push and codes progressive, so a UI must gate the scan picker on it. |
+| `video-encode-scan`         | Always (edge 0.112.0 on): `video_encode.scan` is honoured. An older edge ignores the field on a push and codes progressive, so a UI must gate the scan picker on it. |
+| `audio-ts-signalling`       | Always (edge 0.113.0 on): `audio_encode.ts_signalling` is honoured. The field shipped in 0.112.0, which advertises only `video-encode-scan` — so a UI gates the field on either bit. An older edge ignores it on a push and signals AC-3 as `0x81` (ATSC). |
 
 A follow-up will add an `st2110-video` capability flag so the manager
 UI can offer the ST 2110-20 / -23 pixel-format / partition-mode

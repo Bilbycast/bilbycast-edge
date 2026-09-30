@@ -1001,16 +1001,22 @@ impl TsPcrRemux {
         self.last_late_warn = Some(now);
         let count = std::mem::take(&mut self.late_since_warn);
         let late_ms = (lateness - before) as f64 / 27_000.0;
-        let message = format!(
-            "a re-encoded PES on PID 0x{pid:04X} arrived {late_ms:.1} ms behind the output PCR \
-             ({count} since the last report); the transcode PCR delay was raised from {:.0} ms to \
-             {:.0} ms with a PCR discontinuity",
+        tracing::warn!(
+            "ts_pcr_remux: a re-encoded PES on PID 0x{pid:04X} arrived {late_ms:.1} ms behind the \
+             output PCR ({count} since the last report); the transcode PCR delay was raised from \
+             {:.0} ms to {:.0} ms with a PCR discontinuity",
             before as f64 / 27_000.0,
             self.offset as f64 / 27_000.0
         );
-        self.emit(
+        // The event's message is constant — the numbers ride in `details`
+        // only — so the manager, which coalesces unacknowledged events on
+        // their message, keeps one row with a count per output instead of
+        // a new alarm every report (up to 360 an hour).
+        self.send_event(
             crate::manager::events::EventSeverity::Warning,
-            &message,
+            "re-encoded PES are arriving behind the output PCR; the transcode PCR delay is \
+             raised to cover them, each raise a PCR discontinuity (PID, lateness and delay in \
+             the details)",
             serde_json::json!({
                 "error_code": "transcode_pcr_late",
                 "pid": pid,
@@ -1059,6 +1065,7 @@ impl TsPcrRemux {
         );
     }
 
+    /// Log `message` and raise it as an event (see [`Self::send_event`]).
     fn emit(
         &self,
         severity: crate::manager::events::EventSeverity,
@@ -1069,6 +1076,17 @@ impl TsPcrRemux {
             crate::manager::events::EventSeverity::Info => tracing::info!("ts_pcr_remux: {message}"),
             _ => tracing::warn!("ts_pcr_remux: {message}"),
         }
+        self.send_event(severity, message, details);
+    }
+
+    /// Raise an event on the stage's scope (the output, or the input on
+    /// the ingress transcoder), without logging it.
+    fn send_event(
+        &self,
+        severity: crate::manager::events::EventSeverity,
+        message: &str,
+        details: serde_json::Value,
+    ) {
         let Some((sender, id, input_scope)) = self.event_sink.as_ref() else {
             return;
         };
@@ -1567,6 +1585,34 @@ mod tests {
         assert_eq!(ev.details.unwrap()["error_code"], "transcode_pcr_residency_exceeded");
         assert!(rx.try_recv().is_err());
         assert_eq!(s.stats.offset_raises.load(Ordering::Relaxed), 0);
+    }
+
+    /// `transcode_pcr_late`'s message is the same on every report — the
+    /// PID, lateness and delay ride in `details` — so the manager's
+    /// message-keyed coalescing keeps one row per output, not one per
+    /// report.
+    #[test]
+    fn the_late_warning_message_is_constant() {
+        let mut s = TsPcrRemux::new();
+        let (tx, mut rx) = crate::manager::events::event_channel();
+        s.set_event_sink(tx, "out-1", false);
+        s.guard(A, 30 * MS as i64);
+        s.last_late_warn = None; // past the rate limit
+        s.guard(V, 200 * MS as i64);
+        let a = rx.try_recv().expect("first report");
+        let b = rx.try_recv().expect("second report");
+        assert_eq!(a.message, b.message);
+        assert_eq!(a.output_id.as_deref(), Some("out-1"));
+        assert!(!a.message.contains(" ms"), "{}", a.message);
+        let (da, db) = (a.details.unwrap(), b.details.unwrap());
+        for d in [&da, &db] {
+            assert_eq!(d["error_code"], "transcode_pcr_late");
+            for k in ["pid", "late_ms", "offset_ms", "late_frames", "since_last_report"] {
+                assert!(d.get(k).is_some(), "{k} in {d}");
+            }
+        }
+        assert_eq!((da["pid"].as_u64(), db["pid"].as_u64()), (Some(A as u64), Some(V as u64)));
+        assert_ne!(da["late_ms"], db["late_ms"]);
     }
 
     /// Only the followed program's video counts toward the cap: another

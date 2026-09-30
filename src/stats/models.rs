@@ -1628,12 +1628,27 @@ pub struct DecodeStatsSnapshot {
     pub decode_errors: u64,
     /// Frames dropped because the decoder had not yet seen its init config.
     pub dropped_uninit: u64,
-    /// Wire identifier of the input codec the decoder is handling. Always
-    /// `"AAC-LC"` in Phase A.
+    /// Display label of the source codec the decoder is handling — not a
+    /// config name, and not one vocabulary. The TS audio replacers (TS
+    /// outputs' and inputs' `audio_encode`) label by the source
+    /// stream_type: `"AAC"` (ADTS or LATM), `"MP2"`, `"AC-3"`, `"E-AC-3"`,
+    /// or `""` until the PMT has named one. A path that labels from its
+    /// decoder (RTMP / WebRTC re-encode, the display output, the AAC paths
+    /// of SRT / RTP-audio / ST 2110) uses the AAC decoder's profile —
+    /// `"AAC-LC"`, `"HE-AAC v1"`, `"HE-AAC v2"`, `"AAC-LD"`, `"AAC-ELD"`,
+    /// `"AAC-Main"`, or `"AAC"` before the first decode — or libavcodec's
+    /// codec: `"MP2"`, `"AC-3"`, `"E-AC-3"`, `"Opus"`, `"AAC-LATM"`.
+    /// Compare with `EncodeStatsSnapshot::output_codec` (config names such
+    /// as `"aac_lc"`) by codec family, not string equality.
     pub input_codec: String,
-    /// Output PCM sample rate in Hz.
+    /// Sample rate of the **decoded source** in Hz — what the decoder
+    /// produced, before any `transcode` / `audio_encode` rate conversion.
+    /// `0` until the first frame decodes where the stage registers before
+    /// it (the TS replacers). (On edges before 0.112 an input's TS
+    /// replacer reported its target format here.)
     pub output_sample_rate_hz: u32,
-    /// Output PCM channel count (1 or 2).
+    /// Channel count of the decoded source (up to 8), before any channel
+    /// conversion; `0` until the first frame decodes, as above.
     pub output_channels: u8,
 }
 
@@ -1710,9 +1725,13 @@ pub struct VideoEncodeStatsSnapshot {
     /// Frames dropped inside the replacer (decode error, encoder backpressure,
     /// supervisor restart). Distinct from the broadcast-channel `packets_dropped`.
     pub dropped_frames: u64,
-    /// Wire identifier of the input codec (e.g. `"h264"`, `"hevc"`).
+    /// `"raw"` on the ST 2110-20 / -23 ingest encoders (uncompressed in);
+    /// `""` on every re-encode of a compressed source (TS outputs and
+    /// inputs, RTMP, WebRTC) — the source codec of those is on the paired
+    /// `video_decode_stats.input_codec`.
     pub input_codec: String,
-    /// Wire identifier of the target codec.
+    /// Target codec: `"h264"` / `"hevc"` where the path resolves the
+    /// family, otherwise the configured `video_encode.codec` as given.
     pub output_codec: String,
     /// Target frame width in pixels (0 if not yet known).
     pub output_width: u32,
@@ -1748,6 +1767,14 @@ pub struct VideoEncodeStatsSnapshot {
     /// pre-PMT gate). Absent when 0.
     #[serde(default, skip_serializing_if = "is_zero_u64")]
     pub pre_pmt_dropped_packets: u64,
+    /// The scan the encoder actually opened with, rewritten on every
+    /// (re)open: `"progressive"`, `"interlaced_tff"` (field-coded, top
+    /// field first) or `"interlaced_bff"` (bottom field first). What
+    /// `video_encode.scan` resolved to — `auto` and a refused `interlaced`
+    /// both show what was coded. Absent until the encoder first opens
+    /// (and on a stage that does not report its backend).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coded_scan: Option<String>,
 }
 
 /// Per-input or per-output video decode snapshot. Mirrors
@@ -1763,7 +1790,11 @@ pub struct VideoDecodeStatsSnapshot {
     pub output_frames: u64,
     /// Frames that failed to decode.
     pub decode_errors: u64,
-    /// Wire identifier of the source codec (e.g. `"h264"`, `"hevc"`).
+    /// Label of the source codec, `""` until known — two vocabularies: the
+    /// display output uses `"h264"` / `"hevc"` / `"mpeg2"`; an input's TS
+    /// video replacer (ingress `video_encode`) uses `"H.264"` / `"HEVC"` /
+    /// `"MPEG-2"`, from the source stream_type. An output's TS video
+    /// replacer registers `""` and does not fill it in.
     pub input_codec: String,
     /// Decoded frame width in pixels (0 if not yet known).
     pub output_width: u32,

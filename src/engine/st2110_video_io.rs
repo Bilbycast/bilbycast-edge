@@ -714,6 +714,9 @@ fn encode_worker(
     // was one flow-start away from that crash; the hardware backends merely
     // tolerated the mistake.
     pipeline.set_pts_90k();
+    // Publish what the encoder opens with (backend, scan) into this input's
+    // `video_encode_stats`, as every other encode stage with stats does.
+    pipeline.set_resolved_backend_sink(encode_stats.resolved_backend.clone());
     // ST 2110 ingest is a paced raster source — pipeline the HW encoder
     // on high-pixel-rate rasters so they sustain wire speed. A per-frame
     // submit-then-sync round trip caps hevc_qsv at ~30 fps for 2160p50

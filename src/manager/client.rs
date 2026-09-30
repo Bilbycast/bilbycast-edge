@@ -1431,13 +1431,22 @@ pub fn edge_capabilities() -> Vec<&'static str> {
         // fields are never pushed to an older edge that would ignore them.
         "tunnel-nic-pin",
         // `video_encode.scan` (`auto` | `progressive` | `interlaced`) is
-        // honoured: `auto` codes an interlaced H.264 / MPEG-2 source as
-        // H.264 MBAFF on TS re-encodes (in the source's field order, when
-        // unscaled and the resolved backend can), `interlaced` forces it.
+        // honoured: `auto` field-codes an interlaced H.264 / MPEG-2 source
+        // on TS re-encodes (in the source's field order, when unscaled and
+        // the resolved backend can — libx264 MBAFF, h264_nvenc / h264_qsv
+        // field pictures), `interlaced` forces it.
         // An edge WITHOUT this bit ignores the field on a push (serde
         // unknown-field tolerance) and codes progressive, which looks like
         // success — so the manager UI must gate the scan picker on it.
         "video-encode-scan",
+        // `audio_encode.ts_signalling` (`auto` | `dvb` | `atsc`) is
+        // honoured: under `auto` an AC-3 re-encode of a DVB-flavoured
+        // source goes out as stream_type 0x06 + AC-3 descriptor, `atsc`
+        // pins 0x81, `dvb` pins 0x06. The field shipped in the same
+        // release as `video-encode-scan`, so a manager may gate on either
+        // bit; this one names the feature it gates. An edge WITHOUT it
+        // ignores the field on a push and always signals 0x81.
+        "audio-ts-signalling",
     ];
     // Strict mode (`SO_BINDTODEVICE`) requires `CAP_NET_RAW`. Probed
     // once at startup; advertised only when the setsockopt actually
@@ -8725,6 +8734,16 @@ mod multiviewer_capability_gate {
     fn video_encode_scan_is_advertised() {
         let caps = super::edge_capabilities();
         assert!(caps.contains(&"video-encode-scan"), "caps = {caps:?}");
+    }
+
+    /// `audio_encode.ts_signalling` is gated on this string (or, for edges
+    /// of the 0.112 vintage, on `video-encode-scan`) in the manager UI; an
+    /// edge that honours the field must say so under exactly this name, on
+    /// every build — the field needs no optional feature.
+    #[test]
+    fn audio_ts_signalling_is_advertised() {
+        let caps = super::edge_capabilities();
+        assert!(caps.contains(&"audio-ts-signalling"), "caps = {caps:?}");
     }
 
     #[cfg(feature = "multiviewer")]
